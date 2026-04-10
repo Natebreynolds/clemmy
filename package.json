@@ -6,7 +6,7 @@
   "homepage": "https://github.com/Natebreynolds/clemmy",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Natebreynolds/clemmy.git"
+    "url": "git+https://github.com/Natebreynolds/clemmy.git"
   },
   "keywords": [
     "agent",
