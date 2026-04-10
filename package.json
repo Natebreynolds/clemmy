@@ -52,6 +52,7 @@
     "plugin": "tsx src/index.ts plugin"
   },
   "dependencies": {
+    "@inquirer/prompts": "^8.4.1",
     "@modelcontextprotocol/sdk": "^1.18.1",
     "@openai/agents": "^0.1.11",
     "better-sqlite3": "^11.7.0",
