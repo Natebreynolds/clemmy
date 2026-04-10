@@ -1,0 +1,74 @@
+{
+  "name": "clemmy",
+  "version": "0.1.0",
+  "description": "Lightweight background agent system — proactive, customizable, runs out of the box",
+  "license": "MIT",
+  "homepage": "https://github.com/Natebreynolds/clemmy",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Natebreynolds/clemmy.git"
+  },
+  "keywords": [
+    "agent",
+    "ai",
+    "assistant",
+    "openai",
+    "mcp",
+    "background",
+    "autonomous",
+    "cli"
+  ],
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "clementine": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    ".env.example"
+  ],
+  "scripts": {
+    "build": "tsc --outDir dist",
+    "typecheck": "tsc --noEmit",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
+    "prepack": "npm run build",
+    "pack:local": "npm pack",
+    "chat": "tsx src/index.ts chat",
+    "daemon": "tsx src/index.ts daemon",
+    "daemon:start": "tsx src/index.ts daemon start",
+    "daemon:stop": "tsx src/index.ts daemon stop",
+    "daemon:status": "tsx src/index.ts daemon status",
+    "daemon:logs": "tsx src/index.ts daemon logs",
+    "service": "tsx src/index.ts service",
+    "webhook": "tsx src/index.ts webhook",
+    "discord": "tsx src/index.ts discord",
+    "setup": "tsx src/index.ts setup",
+    "doctor": "tsx src/setup/doctor.ts",
+    "init-home": "tsx src/index.ts init-home",
+    "auth": "tsx src/index.ts auth",
+    "mcp": "tsx src/tools/mcp-server.ts",
+    "plugin": "tsx src/index.ts plugin"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.18.1",
+    "@openai/agents": "^0.1.11",
+    "better-sqlite3": "^11.7.0",
+    "discord.js": "^14.26.2",
+    "express": "^4.21.2",
+    "gray-matter": "^4.0.3",
+    "pino": "^9.6.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/express": "^5.0.3",
+    "@types/node": "^22.12.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
