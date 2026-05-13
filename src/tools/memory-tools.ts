@@ -2,6 +2,8 @@ import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { formatSearchHits, searchVault } from '../memory/search.js';
+import { recall as recallIndex } from '../memory/recall.js';
+import { FACT_KINDS, forgetFact, listActiveFacts, listAllFacts, rememberFact } from '../memory/facts.js';
 import { WORKING_MEMORY_FILE } from '../memory/vault.js';
 import { readText, replaceFile, resolveMemoryTarget, textResult } from './shared.js';
 
@@ -62,6 +64,90 @@ export function registerMemoryTools(server: McpServer): void {
 
       writeFileSync(WORKING_MEMORY_FILE, `${content.trim()}\n`, 'utf-8');
       return textResult('Working memory replaced.');
+    },
+  );
+
+  // ---------------------------------------------------------------------
+  // SQLite-backed memory: FTS recall + durable facts.
+  // ---------------------------------------------------------------------
+
+  server.tool(
+    'memory_recall',
+    'Recall vault chunks ranked by FTS5. Higher-fidelity replacement for memory_search when the index is warm.',
+    {
+      query: z.string().min(1),
+      limit: z.number().int().min(1).max(20).optional(),
+      pathPrefix: z.string().optional(),
+    },
+    async ({ query, limit, pathPrefix }) => {
+      const hits = recallIndex(query, { limit: limit ?? 6, pathPrefix });
+      if (hits.length === 0) {
+        return textResult('No vault hits.');
+      }
+      return textResult(formatSearchHits(hits, 3000));
+    },
+  );
+
+  server.tool(
+    'memory_remember',
+    'Record a durable fact in long-term memory. Use for user preferences (kind=user), project context (project), standing feedback (feedback), or external references (reference). Idempotent — re-recording the same fact bumps its score.',
+    {
+      kind: z.enum(FACT_KINDS as unknown as [string, ...string[]]),
+      content: z.string().min(3).max(800),
+      sessionId: z.string().optional(),
+      sourcePath: z.string().optional(),
+    },
+    async ({ kind, content, sessionId, sourcePath }) => {
+      try {
+        const fact = rememberFact({
+          kind: kind as (typeof FACT_KINDS)[number],
+          content,
+          sessionId,
+          path: sourcePath,
+        });
+        return textResult(`Remembered #${fact.id} (${fact.kind}, score ${fact.score.toFixed(2)}): ${fact.content}`);
+      } catch (err) {
+        return textResult(`memory_remember failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    },
+  );
+
+  server.tool(
+    'memory_list_facts',
+    'List durable facts. Defaults to top active facts by score; set includeInactive=true to see soft-deleted history.',
+    {
+      kind: z.enum(FACT_KINDS as unknown as [string, ...string[]]).optional(),
+      limit: z.number().int().min(1).max(100).optional(),
+      includeInactive: z.boolean().optional(),
+    },
+    async ({ kind, limit, includeInactive }) => {
+      const facts = includeInactive
+        ? listAllFacts(limit ?? 25).filter((fact) => !kind || fact.kind === kind)
+        : listActiveFacts({
+            limit: limit ?? 25,
+            kind: kind as (typeof FACT_KINDS)[number] | undefined,
+          });
+
+      if (facts.length === 0) return textResult('No facts recorded yet.');
+
+      const lines = facts.map((fact) => {
+        const flag = fact.active ? '' : ' [inactive]';
+        return `- #${fact.id} ${fact.kind} (${fact.score.toFixed(2)})${flag}: ${fact.content}`;
+      });
+      return textResult(lines.join('\n'));
+    },
+  );
+
+  server.tool(
+    'memory_forget',
+    'Soft-delete a fact by id (sets active=0). Pass hard=true to drop the row entirely.',
+    {
+      id: z.number().int().positive(),
+      hard: z.boolean().optional(),
+    },
+    async ({ id, hard }) => {
+      const ok = forgetFact(id, { hard });
+      return textResult(ok ? `Forgot fact #${id}${hard ? ' (hard delete)' : ''}.` : `No fact found with id ${id}.`);
     },
   );
 }
