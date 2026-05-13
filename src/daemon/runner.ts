@@ -6,6 +6,9 @@ import { ClementineAssistant } from '../assistant/core.js';
 import { processAgentAutonomy } from '../agents/autonomy.js';
 import { processMonitors } from '../agents/monitors.js';
 import { MODELS } from '../config.js';
+import { processExecutionController } from '../execution/controller.js';
+import { interruptStaleRunningBackgroundTasks, processBackgroundTasks } from '../execution/background-tasks.js';
+import { processMemoryMaintenance } from '../memory/maintenance.js';
 import {
   CRON_FILE,
   WORKFLOWS_DIR,
@@ -447,6 +450,10 @@ async function processNotificationDeliveries(): Promise<void> {
 export async function startDaemon(assistant: ClementineAssistant): Promise<void> {
   ensureDir(CRON_PROGRESS_DIR);
   const state = loadState();
+  const interrupted = interruptStaleRunningBackgroundTasks();
+  if (interrupted > 0) {
+    logger.warn({ interrupted }, 'Marked stale running background tasks as interrupted');
+  }
   logger.info('Daemon loop started');
 
   // Stagger monitor runs — don't run them every 15s tick
@@ -457,13 +464,16 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
     await processCronSchedules(assistant, state);
     await processCronTriggers(assistant);
     await processWorkflowRuns(assistant);
+    await processBackgroundTasks(assistant);
 
     // Run monitors every 4 ticks (~60s) — they have their own internal rate limiting
     if (tickCount % 4 === 0) {
       processMonitors();
     }
 
+    await processExecutionController(assistant);
     await processAgentAutonomy(assistant);
+    await processMemoryMaintenance(tickCount);
     await processNotificationDeliveries();
     await sleep(15_000);
   }
