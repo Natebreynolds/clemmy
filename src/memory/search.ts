@@ -2,7 +2,7 @@ import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import pino from 'pino';
 import { VAULT_DIR } from './vault.js';
-import { recall, recallIndexSize } from './recall.js';
+import { recall, recallHybrid, recallIndexSize } from './recall.js';
 import { reindexVault } from './indexer.js';
 import type { MemorySearchHit } from '../types.js';
 
@@ -41,6 +41,11 @@ function ensureIndexLazily(): void {
   }
 }
 
+/**
+ * Sync FTS-only search. Use for code paths that can't await — kept around
+ * mostly so legacy callers don't change shape. New callers should prefer
+ * `searchVaultAsync` which adds the embedding rerank when available.
+ */
 export function searchVault(query: string, limit = 5): MemorySearchHit[] {
   try {
     ensureIndexLazily();
@@ -48,6 +53,22 @@ export function searchVault(query: string, limit = 5): MemorySearchHit[] {
     if (hits.length > 0) return hits;
   } catch (err) {
     logger.warn({ err }, 'recall failed; using legacy search');
+  }
+  return searchVaultLegacy(query, limit);
+}
+
+/**
+ * Async search. Runs FTS5 then — when OPENAI_API_KEY is configured — does
+ * an embedding rerank over the candidate pool with reciprocal rank fusion.
+ * Silently falls back to FTS-only when embeddings are off or fail.
+ */
+export async function searchVaultAsync(query: string, limit = 5): Promise<MemorySearchHit[]> {
+  try {
+    ensureIndexLazily();
+    const hits = await recallHybrid(query, { limit });
+    if (hits.length > 0) return hits;
+  } catch (err) {
+    logger.warn({ err }, 'hybrid recall failed; using legacy search');
   }
   return searchVaultLegacy(query, limit);
 }

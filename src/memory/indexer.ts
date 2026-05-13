@@ -2,7 +2,8 @@ import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import path from 'node:path';
 import pino from 'pino';
-import { openMemoryDb } from './db.js';
+import { MEMORY_DB_PATH, openMemoryDb } from './db.js';
+import { isEmbeddingsEnabled, readEmbeddingStats } from './embeddings.js';
 import { VAULT_DIR } from './vault.js';
 
 /**
@@ -33,6 +34,23 @@ export interface IndexStats {
   skipped: number;
   errors: number;
   durationMs: number;
+}
+
+export interface MemoryIndexStatus {
+  dbPath: string;
+  dbPresent: boolean;
+  dbBytes: number;
+  indexedFiles: number;
+  chunks: number;
+  activeFacts: number;
+  totalFacts: number;
+  embeddingsEnabled: boolean;
+  embeddingsCount: number;
+  embeddingsModel: string | null;
+  embeddingsDim: number | null;
+  embeddingsCoverage: number; // 0..1
+  lastIndexedSourceMtime: number | null;
+  error?: string;
 }
 
 interface Chunk {
@@ -241,4 +259,63 @@ export function rebuildVaultIndex(vaultDir: string = VAULT_DIR): IndexStats {
   const db = openMemoryDb();
   db.exec('DELETE FROM vault_chunks');
   return reindexVault(vaultDir);
+}
+
+export function readMemoryIndexStatus(): MemoryIndexStatus {
+  const dbPresent = existsSync(MEMORY_DB_PATH);
+  const base: MemoryIndexStatus = {
+    dbPath: MEMORY_DB_PATH,
+    dbPresent,
+    dbBytes: dbPresent ? statSync(MEMORY_DB_PATH).size : 0,
+    indexedFiles: 0,
+    chunks: 0,
+    activeFacts: 0,
+    totalFacts: 0,
+    embeddingsEnabled: isEmbeddingsEnabled(),
+    embeddingsCount: 0,
+    embeddingsModel: null,
+    embeddingsDim: null,
+    embeddingsCoverage: 0,
+    lastIndexedSourceMtime: null,
+  };
+
+  try {
+    const db = openMemoryDb();
+    const chunkRow = db.prepare(`
+      SELECT
+        COUNT(*) AS chunks,
+        COUNT(DISTINCT path) AS files,
+        MAX(mtime) AS lastMtime
+      FROM vault_chunks
+    `).get() as { chunks: number; files: number; lastMtime: number | null };
+    const factRow = db.prepare(`
+      SELECT
+        COUNT(*) AS totalFacts,
+        SUM(CASE WHEN active = 1 THEN 1 ELSE 0 END) AS activeFacts
+      FROM consolidated_facts
+    `).get() as { totalFacts: number; activeFacts: number | null };
+    const emb = readEmbeddingStats();
+    const chunkTotal = chunkRow.chunks ?? 0;
+
+    return {
+      ...base,
+      dbPresent: existsSync(MEMORY_DB_PATH),
+      dbBytes: existsSync(MEMORY_DB_PATH) ? statSync(MEMORY_DB_PATH).size : 0,
+      indexedFiles: chunkRow.files ?? 0,
+      chunks: chunkTotal,
+      activeFacts: factRow.activeFacts ?? 0,
+      totalFacts: factRow.totalFacts ?? 0,
+      embeddingsEnabled: emb.enabled,
+      embeddingsCount: emb.count,
+      embeddingsModel: emb.model,
+      embeddingsDim: emb.dim,
+      embeddingsCoverage: chunkTotal > 0 ? Number((emb.count / chunkTotal).toFixed(3)) : 0,
+      lastIndexedSourceMtime: chunkRow.lastMtime ?? null,
+    };
+  } catch (err) {
+    return {
+      ...base,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
 }

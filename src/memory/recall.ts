@@ -1,23 +1,36 @@
 import path from 'node:path';
 import pino from 'pino';
 import { openMemoryDb } from './db.js';
+import {
+  cosine,
+  embedQuery,
+  isEmbeddingsEnabled,
+  loadEmbeddingsForChunks,
+} from './embeddings.js';
 import type { MemorySearchHit } from '../types.js';
 
 /**
  * Hybrid recall over the vault index.
  *
- * Day-one behavior:
- * - Run an FTS5 MATCH with BM25 ranking. Returns top-k chunks.
+ * Two entry points:
+ *   - recall()        — sync, FTS5 + BM25 only. Snappy, no network.
+ *   - recallHybrid()  — async, FTS narrows the candidate pool, then
+ *                       cosine similarity against query embedding reranks
+ *                       via reciprocal rank fusion. Falls back to FTS
+ *                       cleanly when embeddings are disabled or fail.
  *
- * Designed for: when embeddings land, recall() runs FTS to get a candidate
- * pool of ~3k, then reranks with cosine similarity and merges the two
- * orderings via reciprocal rank fusion. The public signature stays the same.
- *
- * Return shape mirrors `MemorySearchHit` so `formatSearchHits` and any
- * existing callers (vault-tools, prompt assembly) keep working unchanged.
+ * Public signature mirrors MemorySearchHit so `formatSearchHits` and
+ * existing callers (vault-tools, prompt assembly) don't change.
  */
 
 const logger = pino({ name: 'clementine-next.memory.recall' });
+
+/** Candidates pulled from FTS before rerank. Larger pool = better
+ *  rerank ceiling, but more work and more API tokens spent on the query. */
+const RERANK_CANDIDATE_POOL = 40;
+/** Reciprocal Rank Fusion constant. 60 is the standard from the IR
+ *  literature; small changes here barely move ordering. */
+const RRF_K = 60;
 
 interface RecallChunkRow {
   id: number;
@@ -68,14 +81,10 @@ export interface RecallOptions {
 }
 
 /**
- * Recall the top-k most relevant vault chunks for a query.
- *
- * Returns [] when the DB is empty (e.g. indexer hasn't run yet) or the
- * query produces no tokens after cleanup — callers can fall back to the
- * legacy `searchVault` path on empty results.
+ * Pull the top-N FTS candidates for a query. Internal — both `recall`
+ * and `recallHybrid` consume this.
  */
-export function recall(query: string, options: RecallOptions = {}): MemorySearchHit[] {
-  const limit = Math.max(1, options.limit ?? 6);
+function fetchFtsCandidates(query: string, options: RecallOptions, poolSize: number): RecallChunkRow[] {
   const fts = buildFtsQuery(query);
   if (!fts) return [];
 
@@ -83,9 +92,9 @@ export function recall(query: string, options: RecallOptions = {}): MemorySearch
 
   let sql = `
     SELECT
-      vc.id     AS id,
-      vc.path   AS path,
-      vc.title  AS title,
+      vc.id      AS id,
+      vc.path    AS path,
+      vc.title   AS title,
       vc.content AS content,
       bm25(vault_chunks_fts) AS rank,
       snippet(vault_chunks_fts, 0, '[', ']', ' … ', 12) AS snip
@@ -101,35 +110,113 @@ export function recall(query: string, options: RecallOptions = {}): MemorySearch
   }
 
   sql += ' ORDER BY rank LIMIT ?';
-  params.push(limit);
+  params.push(poolSize);
 
-  let rows: RecallChunkRow[] = [];
   try {
-    rows = db.prepare(sql).all(...params) as RecallChunkRow[];
+    return db.prepare(sql).all(...params) as RecallChunkRow[];
   } catch (err) {
     logger.warn({ err, query }, 'fts query failed');
     return [];
   }
+}
+
+function rowsToHits(rows: RecallChunkRow[]): MemorySearchHit[] {
+  if (rows.length === 0) return [];
 
   // BM25 returns negative scores in SQLite (lower = better). Normalize to a
   // positive 0..1-ish score so it composes with the legacy `searchVault`
   // scale that callers may already have UI for.
-  if (rows.length === 0) return [];
-
   const ranks = rows.map((r) => r.rank);
   const best = Math.min(...ranks);
   const worst = Math.max(...ranks);
   const spread = Math.max(0.0001, worst - best);
 
   return rows.map((row) => {
-    const normalized = 1 - (row.rank - best) / spread; // 1 = best, → 0 = worst
+    const normalized = 1 - (row.rank - best) / spread;
     return {
       filePath: row.path,
       title: deriveTitle(row),
       snippet: row.snip || row.content.slice(0, 240).replace(/\s+/g, ' '),
-      score: Number((normalized * 10).toFixed(3)), // keep order-of-magnitude similar to scoreContent
+      score: Number((normalized * 10).toFixed(3)),
     } satisfies MemorySearchHit;
   });
+}
+
+/**
+ * Sync FTS-only recall. Use when you don't have an event loop budget
+ * for embeddings (CLI prints, simple tool callbacks).
+ */
+export function recall(query: string, options: RecallOptions = {}): MemorySearchHit[] {
+  const limit = Math.max(1, options.limit ?? 6);
+  const rows = fetchFtsCandidates(query, options, limit);
+  return rowsToHits(rows);
+}
+
+/**
+ * Hybrid recall: FTS narrows the candidate pool, optional embedding
+ * rerank merges via Reciprocal Rank Fusion. Falls back to FTS-only
+ * silently if embeddings are disabled, the query embedding fails, or
+ * no candidates in the pool have stored embeddings.
+ */
+export async function recallHybrid(query: string, options: RecallOptions = {}): Promise<MemorySearchHit[]> {
+  const limit = Math.max(1, options.limit ?? 6);
+  const poolSize = Math.max(limit, RERANK_CANDIDATE_POOL);
+  const candidates = fetchFtsCandidates(query, options, poolSize);
+  if (candidates.length === 0) return [];
+
+  // FTS-only fast path when embeddings aren't available.
+  if (!isEmbeddingsEnabled()) {
+    return rowsToHits(candidates.slice(0, limit));
+  }
+
+  const stored = loadEmbeddingsForChunks(candidates.map((c) => c.id));
+  if (stored.size === 0) {
+    // Pool has no embeddings yet — return FTS order. The backfill task
+    // will fill them in over time and the next call benefits.
+    return rowsToHits(candidates.slice(0, limit));
+  }
+
+  const queryVector = await embedQuery(query);
+  if (!queryVector) {
+    return rowsToHits(candidates.slice(0, limit));
+  }
+
+  // Rank by FTS (already ordered) and by semantic similarity. Then fuse
+  // with reciprocal rank fusion. Chunks missing an embedding still
+  // participate via their FTS rank alone — they just don't get a
+  // semantic boost.
+  const ftsRankByChunk = new Map<number, number>();
+  candidates.forEach((c, idx) => ftsRankByChunk.set(c.id, idx + 1));
+
+  const semanticScored: Array<{ id: number; sim: number }> = [];
+  for (const candidate of candidates) {
+    const vec = stored.get(candidate.id);
+    if (!vec) continue;
+    semanticScored.push({ id: candidate.id, sim: cosine(queryVector, vec) });
+  }
+  semanticScored.sort((a, b) => b.sim - a.sim);
+
+  const semanticRankByChunk = new Map<number, number>();
+  semanticScored.forEach((entry, idx) => semanticRankByChunk.set(entry.id, idx + 1));
+
+  const fused = candidates.map((candidate) => {
+    const ftsRank = ftsRankByChunk.get(candidate.id) ?? candidates.length + 1;
+    const semRank = semanticRankByChunk.get(candidate.id);
+    const ftsScore = 1 / (RRF_K + ftsRank);
+    const semScore = semRank !== undefined ? 1 / (RRF_K + semRank) : 0;
+    return { candidate, score: ftsScore + semScore };
+  });
+
+  fused.sort((a, b) => b.score - a.score);
+  const top = fused.slice(0, limit).map((entry) => entry.candidate);
+  const hits = rowsToHits(top);
+
+  // Rescale scores using the fused order so callers see a sensible 0..10
+  // gradient consistent with the FTS-only path.
+  return hits.map((hit, idx) => ({
+    ...hit,
+    score: Number((10 - (idx * (10 / Math.max(1, hits.length)))).toFixed(3)),
+  }));
 }
 
 /**

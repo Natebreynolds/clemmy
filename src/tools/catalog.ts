@@ -6,6 +6,7 @@ export const LOCAL_MCP_TOOL_NAMES = [
   'memory_remember',
   'memory_list_facts',
   'memory_forget',
+  'memory_embed_backfill',
   'working_memory',
   'note_create',
   'note_take',

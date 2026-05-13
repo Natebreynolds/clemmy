@@ -1,8 +1,9 @@
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { formatSearchHits, searchVault } from '../memory/search.js';
-import { recall as recallIndex } from '../memory/recall.js';
+import { formatSearchHits, searchVaultAsync } from '../memory/search.js';
+import { recallHybrid } from '../memory/recall.js';
+import { embedMissingChunks, isEmbeddingsEnabled, readEmbeddingStats } from '../memory/embeddings.js';
 import { FACT_KINDS, forgetFact, listActiveFacts, listAllFacts, rememberFact } from '../memory/facts.js';
 import { WORKING_MEMORY_FILE } from '../memory/vault.js';
 import { readText, replaceFile, resolveMemoryTarget, textResult } from './shared.js';
@@ -10,10 +11,10 @@ import { readText, replaceFile, resolveMemoryTarget, textResult } from './shared
 export function registerMemoryTools(server: McpServer): void {
   server.tool(
     'memory_search',
-    'Search the local Clementine vault for relevant notes and memories.',
+    'Search the local Clementine vault for relevant notes and memories. Uses FTS5 and (when OPENAI_API_KEY is set) an embedding rerank.',
     { query: z.string().min(1) },
     async ({ query }) => {
-      const hits = searchVault(query, 8);
+      const hits = await searchVaultAsync(query, 8);
       const text = hits.length > 0 ? formatSearchHits(hits, 3000) : 'No relevant memory hits found.';
       return textResult(text);
     },
@@ -73,18 +74,38 @@ export function registerMemoryTools(server: McpServer): void {
 
   server.tool(
     'memory_recall',
-    'Recall vault chunks ranked by FTS5. Higher-fidelity replacement for memory_search when the index is warm.',
+    'Recall vault chunks. FTS5 narrows the pool; with an OPENAI_API_KEY an embedding rerank reorders via reciprocal rank fusion. Supports limit and pathPrefix filters.',
     {
       query: z.string().min(1),
       limit: z.number().int().min(1).max(20).optional(),
       pathPrefix: z.string().optional(),
     },
     async ({ query, limit, pathPrefix }) => {
-      const hits = recallIndex(query, { limit: limit ?? 6, pathPrefix });
+      const hits = await recallHybrid(query, { limit: limit ?? 6, pathPrefix });
       if (hits.length === 0) {
         return textResult('No vault hits.');
       }
       return textResult(formatSearchHits(hits, 3000));
+    },
+  );
+
+  server.tool(
+    'memory_embed_backfill',
+    'Compute embeddings for vault chunks that don\'t have one yet. Runs in small batches; safe to invoke repeatedly. No-ops when OPENAI_API_KEY is not set.',
+    {
+      maxChunks: z.number().int().min(1).max(2000).optional(),
+    },
+    async ({ maxChunks }) => {
+      if (!isEmbeddingsEnabled()) {
+        return textResult('Embeddings disabled (OPENAI_API_KEY not set).');
+      }
+      const stats = await embedMissingChunks({ maxChunks: maxChunks ?? 200 });
+      const embStats = readEmbeddingStats();
+      return textResult([
+        `Embedded ${stats.embedded} / ${stats.candidateChunks} candidate chunks in ${stats.durationMs}ms`,
+        `Batches: ${stats.batched}, failures: ${stats.failed}`,
+        `Total embeddings: ${embStats.count} (${embStats.model ?? '-'}, dim ${embStats.dim ?? '-'})`,
+      ].join('\n'));
     },
   );
 
