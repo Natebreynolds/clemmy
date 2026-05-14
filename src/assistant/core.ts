@@ -72,23 +72,43 @@ export class ClementineAssistant {
 	      sessionId: request.sessionId,
 	      userId: request.userId,
 	      channel: request.channel,
-	    }, request.runId ? {
+	    }, {
 	      shouldCancel: request.shouldCancel,
 	      onToolActivity: async (activity) => {
-	        addRunEvent(request.runId, {
-	          type: 'tool_started',
-	          message: `Using tool: ${activity.toolName}`,
-	          data: {
-	            toolName: activity.toolName,
-	            input: activity.input,
-	          },
-	        });
+	        if (request.runId) {
+	          addRunEvent(request.runId, {
+	            type: 'tool_started',
+	            message: `Using tool: ${activity.toolName}`,
+	            data: {
+	              toolName: activity.toolName,
+	              input: activity.input,
+	            },
+	          });
+	        }
 	        await request.onToolActivity?.(activity);
 	      },
+        onChunk: request.onChunk ? async (delta) => {
+          // Forward streaming deltas to the caller. Don't capture them
+          // into run events — the deltas accumulate, and the final text
+          // is already recorded after the run returns.
+          await request.onChunk?.(delta);
+        } : undefined,
+        onReasoning: async (text) => {
+          // Reasoning is captured into the run timeline regardless of
+          // whether the caller subscribed — it's the observability hook.
+          if (request.runId) {
+            addRunEvent(request.runId, {
+              type: 'status',
+              message: `Reasoning: ${text.slice(0, 200)}`,
+              data: { reasoningChars: text.length, preview: text.slice(0, 1000) },
+            });
+          }
+          await request.onReasoning?.(text);
+        },
       onText: async () => {
         // Final text is recorded by the gateway/background task after the run returns.
       },
-    } : undefined);
+    });
 
     if (executionPrompt) {
       const parsed = parseExecutionResponse(result.text);

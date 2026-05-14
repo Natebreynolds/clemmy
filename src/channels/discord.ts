@@ -1,24 +1,34 @@
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
 import pino from 'pino';
 import {
   ActionRowBuilder,
+  ActivityType,
   ButtonBuilder,
   ButtonStyle,
   ChannelType,
   Client,
   Events,
   GatewayIntentBits,
+  SlashCommandBuilder,
   type ButtonInteraction,
+  type ChatInputCommandInteraction,
   Partials,
   type Message,
 } from 'discord.js';
 import {
   DISCORD_ALLOWED_CHANNELS,
   ASSISTANT_NAME,
+  BASE_DIR,
   DISCORD_BOT_TOKEN,
+  DISCORD_CLIENT_ID,
+  DISCORD_DM_ALLOWED_USERS,
+  DISCORD_DM_POLL_INTERVAL_MS,
   DISCORD_ENABLED,
   DISCORD_REQUIRE_MENTION,
 } from '../config.js';
 import { ClementineAssistant } from '../assistant/core.js';
+import { ClementineGateway, type GatewayResponse } from '../gateway/router.js';
 import { getOrCreateDiscordSessionId } from './discord-store.js';
 import type { ApprovalResolutionResult, PendingApproval } from '../types.js';
 import {
@@ -28,6 +38,7 @@ import {
   markNotificationRead,
   requeueNotificationDelivery,
 } from '../runtime/notifications.js';
+import { buildDiscordInstallUrl } from './discord-install.js';
 
 const logger = pino({ name: 'clementine-next.discord' });
 
@@ -37,17 +48,310 @@ interface DiscordRuntimeStatus {
   userTag?: string;
   startedAt?: string;
   guildCount: number;
+  clientId?: string;
+  installUrl?: string;
 }
 
 const DISCORD_CUSTOM_ID_PREFIX = 'clementine';
+const DISCORD_DM_POLL_STATE_FILE = path.join(BASE_DIR, 'state', 'discord-dm-poll-state.json');
+const DISCORD_SLASH_COMMANDS = [
+  new SlashCommandBuilder()
+    .setName('ask')
+    .setDescription('Send a prompt to Clementine.')
+    .addStringOption((option) =>
+      option
+        .setName('prompt')
+        .setDescription('What you want Clementine to help with')
+        .setRequired(true),
+    ),
+  new SlashCommandBuilder()
+    .setName('ping')
+    .setDescription('Check whether the Discord transport is responding.'),
+  new SlashCommandBuilder()
+    .setName('status')
+    .setDescription('Show Discord runtime status, a background task, or a run timeline.')
+    .addStringOption((option) =>
+      option
+        .setName('target')
+        .setDescription('Optional background task id like bg-... or run id like run-...')
+        .setRequired(false),
+    ),
+  new SlashCommandBuilder()
+    .setName('tasks')
+    .setDescription('List recent background tasks.'),
+  new SlashCommandBuilder()
+    .setName('runs')
+    .setDescription('List recent assistant runs.'),
+  new SlashCommandBuilder()
+    .setName('help')
+    .setDescription('Show the available Discord commands.'),
+].map((command) => command.toJSON());
 
 let discordClient: Client | null = null;
 let startPromise: Promise<void> | null = null;
+let dmPollLoopPromise: Promise<void> | null = null;
+let dmPollLoopActive = false;
 let status: DiscordRuntimeStatus = {
   enabled: DISCORD_ENABLED,
   connected: false,
   guildCount: 0,
+  clientId: DISCORD_CLIENT_ID || undefined,
+  installUrl: DISCORD_CLIENT_ID ? buildDiscordInstallUrl(DISCORD_CLIENT_ID) : undefined,
 };
+
+interface DiscordDmPollState {
+  lastSeenByChannel: Record<string, string>;
+}
+
+interface DiscordRestDmChannel {
+  id: string;
+}
+
+interface DiscordRestMessage {
+  id: string;
+  content: string;
+  channel_id: string;
+  author: {
+    id: string;
+    bot?: boolean;
+    username?: string;
+  };
+  timestamp?: string;
+}
+
+interface DiscordRestSentMessage {
+  id: string;
+  channel_id: string;
+}
+
+function loadDiscordDmPollState(): DiscordDmPollState {
+  if (!existsSync(DISCORD_DM_POLL_STATE_FILE)) {
+    return { lastSeenByChannel: {} };
+  }
+
+  try {
+    const parsed = JSON.parse(readFileSync(DISCORD_DM_POLL_STATE_FILE, 'utf-8')) as Partial<DiscordDmPollState>;
+    return {
+      lastSeenByChannel: typeof parsed.lastSeenByChannel === 'object' && parsed.lastSeenByChannel
+        ? Object.fromEntries(
+          Object.entries(parsed.lastSeenByChannel)
+            .filter((entry): entry is [string, string] => typeof entry[0] === 'string' && typeof entry[1] === 'string'),
+        )
+        : {},
+    };
+  } catch {
+    return { lastSeenByChannel: {} };
+  }
+}
+
+function saveDiscordDmPollState(state: DiscordDmPollState): void {
+  mkdirSync(path.dirname(DISCORD_DM_POLL_STATE_FILE), { recursive: true });
+  writeFileSync(DISCORD_DM_POLL_STATE_FILE, JSON.stringify(state, null, 2), 'utf-8');
+}
+
+function compareSnowflakes(left: string, right: string): number {
+  const leftValue = BigInt(left);
+  const rightValue = BigInt(right);
+  if (leftValue === rightValue) return 0;
+  return leftValue < rightValue ? -1 : 1;
+}
+
+function latestSnowflake(values: string[]): string | null {
+  if (values.length === 0) return null;
+  return values.reduce((latest, current) => (compareSnowflakes(current, latest) > 0 ? current : latest));
+}
+
+function markDiscordDmMessageSeen(channelId: string, messageId: string): void {
+  const state = loadDiscordDmPollState();
+  const previous = state.lastSeenByChannel[channelId];
+  if (!previous || compareSnowflakes(messageId, previous) > 0) {
+    state.lastSeenByChannel[channelId] = messageId;
+    saveDiscordDmPollState(state);
+  }
+}
+
+async function discordApiJson<T>(path: string, init?: { method?: string; body?: unknown }): Promise<T> {
+  const response = await fetch(`https://discord.com/api/v10${path}`, {
+    method: init?.method ?? 'GET',
+    headers: {
+      Authorization: `Bot ${DISCORD_BOT_TOKEN}`,
+      'Content-Type': 'application/json',
+    },
+    body: init?.body === undefined ? undefined : JSON.stringify(init.body),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Discord API ${init?.method ?? 'GET'} ${path} failed with ${response.status}: ${await response.text()}`);
+  }
+
+  return response.json() as Promise<T>;
+}
+
+async function ensureDiscordDmChannel(userId: string): Promise<DiscordRestDmChannel> {
+  return discordApiJson<DiscordRestDmChannel>('/users/@me/channels', {
+    method: 'POST',
+    body: { recipient_id: userId },
+  });
+}
+
+async function listDiscordChannelMessages(channelId: string, limit = 15): Promise<DiscordRestMessage[]> {
+  return discordApiJson<DiscordRestMessage[]>(`/channels/${channelId}/messages?limit=${limit}`);
+}
+
+async function sendDiscordRestChunks(channelId: string, text: string): Promise<void> {
+  const chunks = splitMessage(text);
+  for (const [index, chunk] of chunks.entries()) {
+    const sent = await discordApiJson<DiscordRestSentMessage>(`/channels/${channelId}/messages`, {
+      method: 'POST',
+      body: { content: chunk },
+    });
+    logger.info({
+      channelId,
+      messageId: sent.id,
+      chunk: index + 1,
+      chunks: chunks.length,
+      contentLength: chunk.length,
+    }, 'Discord REST message sent');
+  }
+}
+
+/**
+ * Streaming handler for Discord DMs.
+ *
+ * Discord's API allows message-editing, which is how we surface streaming
+ * text without spamming new messages. The handler:
+ *
+ *   1. On the first chunk, creates a placeholder message with what's
+ *      buffered so far.
+ *   2. On subsequent chunks, edits that message — throttled to every
+ *      EDIT_INTERVAL_MS or every EDIT_CHAR_THRESHOLD chars (whichever
+ *      fires first) to stay under Discord's edit rate limits.
+ *   3. If the buffer overflows the message length cap (1900 chars,
+ *      same as splitMessage uses), commits the current message and
+ *      starts a new one — handles long answers gracefully.
+ *   4. `flush()` forces a final edit so the message reflects the
+ *      complete buffer before the caller appends approval suffixes.
+ *
+ * Returns:
+ *   onChunk(delta) — pass as the streaming callback
+ *   flush()        — call after the run completes to ensure the last
+ *                    delta landed
+ *   getMessageIds()— returns IDs of every message created during stream,
+ *                    so the caller can append/edit final-state suffixes
+ */
+interface DiscordStreamHandler {
+  onChunk(delta: string): Promise<void>;
+  flush(): Promise<void>;
+  getMessageIds(): string[];
+}
+
+function createDiscordStreamHandler(channelId: string): DiscordStreamHandler {
+  const MAX_CHARS_PER_MESSAGE = 1900;
+  const EDIT_INTERVAL_MS = 1500;
+  const EDIT_CHAR_THRESHOLD = 240;
+
+  const messageIds: string[] = [];
+  let buffer = '';                  // current message buffer
+  let currentMessageId: string | null = null;
+  let lastEditAt = 0;
+  let lastEditLength = 0;
+  let inFlight: Promise<void> = Promise.resolve();
+  let pendingEdit = false;
+
+  async function commitEdit(): Promise<void> {
+    if (!currentMessageId) return;
+    const content = buffer || '…';
+    try {
+      await discordApiJson<DiscordRestSentMessage>(
+        `/channels/${channelId}/messages/${currentMessageId}`,
+        { method: 'PATCH', body: { content } },
+      );
+      lastEditAt = Date.now();
+      lastEditLength = buffer.length;
+    } catch (err) {
+      logger.warn({ err, channelId, messageId: currentMessageId }, 'Discord stream edit failed');
+    }
+  }
+
+  async function createInitial(): Promise<void> {
+    try {
+      const sent = await discordApiJson<DiscordRestSentMessage>(
+        `/channels/${channelId}/messages`,
+        { method: 'POST', body: { content: buffer || '…' } },
+      );
+      currentMessageId = sent.id;
+      messageIds.push(sent.id);
+      lastEditAt = Date.now();
+      lastEditLength = buffer.length;
+      logger.info({ channelId, messageId: sent.id, contentLength: buffer.length }, 'Discord streaming message started');
+    } catch (err) {
+      logger.warn({ err, channelId }, 'Discord streaming initial post failed');
+    }
+  }
+
+  async function rollMessage(): Promise<void> {
+    // Current message is full — finalize it and start a fresh one.
+    await commitEdit();
+    currentMessageId = null;
+    buffer = '';
+    lastEditLength = 0;
+    lastEditAt = 0;
+  }
+
+  async function processDelta(delta: string): Promise<void> {
+    if (!delta) return;
+    buffer += delta;
+
+    // Overflow: roll to a new message before exceeding the cap.
+    if (buffer.length > MAX_CHARS_PER_MESSAGE) {
+      const carry = buffer.slice(MAX_CHARS_PER_MESSAGE);
+      buffer = buffer.slice(0, MAX_CHARS_PER_MESSAGE);
+      if (!currentMessageId) await createInitial();
+      else await commitEdit();
+      await rollMessage();
+      buffer = carry;
+      pendingEdit = true;
+      return;
+    }
+
+    if (!currentMessageId) {
+      // First chunk — wait for enough buffered text to look intentional
+      // before posting. Keeps "…" placeholders rare.
+      if (buffer.length < 40) {
+        pendingEdit = true;
+        return;
+      }
+      await createInitial();
+      return;
+    }
+
+    const now = Date.now();
+    const enoughTime = now - lastEditAt >= EDIT_INTERVAL_MS;
+    const enoughChars = buffer.length - lastEditLength >= EDIT_CHAR_THRESHOLD;
+    if (enoughTime || enoughChars) {
+      await commitEdit();
+      pendingEdit = false;
+    } else {
+      pendingEdit = true;
+    }
+  }
+
+  return {
+    onChunk: (delta: string) => {
+      // Serialize calls so we don't issue overlapping Discord edits.
+      inFlight = inFlight.then(() => processDelta(delta).catch((err) => {
+        logger.warn({ err, channelId }, 'Discord stream onChunk failed');
+      }));
+      return inFlight;
+    },
+    flush: async () => {
+      await inFlight;
+      if (!currentMessageId && buffer.length > 0) await createInitial();
+      else if (pendingEdit) await commitEdit();
+    },
+    getMessageIds: () => messageIds.slice(),
+  };
+}
 
 function splitMessage(text: string, maxLength = 1900): string[] {
   const normalized = text.trim();
@@ -77,6 +381,12 @@ function channelAllowed(message: Message): boolean {
   return DISCORD_ALLOWED_CHANNELS.includes(message.channelId);
 }
 
+function channelAllowedById(channelId: string, type: ChannelType | null): boolean {
+  if (type === ChannelType.DM) return true;
+  if (DISCORD_ALLOWED_CHANNELS.length === 0) return true;
+  return DISCORD_ALLOWED_CHANNELS.includes(channelId);
+}
+
 function extractPrompt(message: Message<boolean>): string {
   const mentionPattern = new RegExp(`<@!?${message.client.user?.id}>`, 'g');
   const stripped = message.content.replace(mentionPattern, '').trim();
@@ -96,10 +406,14 @@ function shouldRespond(message: Message<boolean>): boolean {
 }
 
 function buildChannelLabel(message: Message<boolean>): string {
-  if (message.guildId) {
-    return `discord:${message.guildId}:${message.channelId}`;
+  return buildChannelLabelFromParts(message.channelId, message.guildId);
+}
+
+function buildChannelLabelFromParts(channelId: string, guildId?: string | null): string {
+  if (guildId) {
+    return `discord:${guildId}:${channelId}`;
   }
-  return `discord:dm:${message.channelId}`;
+  return `discord:dm:${channelId}`;
 }
 
 function normalizeCommandText(input: string): string {
@@ -183,11 +497,17 @@ function renderNotificationList(userId: string): string {
   }).join('\n');
 }
 
-function renderDiscordStatus(message: Message<boolean>, assistant: ClementineAssistant): string {
+function renderDiscordStatusForContext(input: {
+  userId: string;
+  channelId: string;
+  guildId?: string | null;
+  assistant: ClementineAssistant;
+}): string {
   const discordStatus = getDiscordRuntimeStatus();
-  const ownedApprovals = relevantApprovalsForMessage(message, assistant.getRuntime().listPendingApprovals())
-    .filter((approval) => approval.userId === message.author.id || approval.channel === buildChannelLabel(message));
-  const userNotifications = relevantNotificationsForUser(message.author.id);
+  const channel = buildChannelLabelFromParts(input.channelId, input.guildId);
+  const ownedApprovals = input.assistant.getRuntime().listPendingApprovals()
+    .filter((approval) => approval.userId === input.userId || approval.channel === channel);
+  const userNotifications = relevantNotificationsForUser(input.userId);
   const queuedForUser = listQueuedNotificationDeliveries().filter((item) =>
     userNotifications.some((notification) => notification.id === item.notificationId),
   );
@@ -210,6 +530,33 @@ function approvalResultText(result: ApprovalResolutionResult): string {
   ].join('\n');
 }
 
+async function runGatewayPrompt(input: {
+  assistant: ClementineAssistant;
+  prompt: string;
+  channelId: string;
+  userId: string;
+  guildId?: string | null;
+  /** Streaming-text callback. Only fires when the underlying runtime
+   *  supports streaming (OpenAI Agents SDK path). Codex CLI bridge
+   *  ignores it — non-streaming users get the same one-shot reveal. */
+  onChunk?: (delta: string) => Promise<void> | void;
+}): Promise<GatewayResponse> {
+  const sessionId = getOrCreateDiscordSessionId({
+    channelId: input.channelId,
+    userId: input.userId,
+    guildId: input.guildId ?? undefined,
+  });
+
+  return new ClementineGateway(input.assistant).handleMessage({
+    message: input.prompt,
+    sessionId,
+    userId: input.userId,
+    channel: buildChannelLabelFromParts(input.channelId, input.guildId),
+    source: 'discord',
+    onChunk: input.onChunk,
+  });
+}
+
 async function handleDiscordCommand(message: Message<boolean>, assistant: ClementineAssistant, prompt: string): Promise<boolean> {
   const normalized = normalizeCommandText(prompt);
   const runtime = assistant.getRuntime();
@@ -221,6 +568,12 @@ async function handleDiscordCommand(message: Message<boolean>, assistant: Clemen
         'Discord commands:',
         '`help`',
         '`status`',
+        '`tasks`',
+        '`runs`',
+        '`status <task_id>`',
+        '`status <run_id>`',
+        '`stop <task_id>`',
+        '`resume <task_id>`',
         '`approvals`',
         '`approve <approval_id>`',
         '`reject <approval_id>`',
@@ -236,7 +589,12 @@ async function handleDiscordCommand(message: Message<boolean>, assistant: Clemen
   }
 
   if (/^status$/i.test(normalized)) {
-    await sendChunks(message.channel, renderDiscordStatus(message, assistant), message);
+    await sendChunks(message.channel, renderDiscordStatusForContext({
+      userId: message.author.id,
+      channelId: message.channelId,
+      guildId: message.guildId,
+      assistant,
+    }), message);
     return true;
   }
 
@@ -317,11 +675,7 @@ async function sendChunks(channel: Message['channel'], text: string, replyTo?: M
     throw new Error('Discord channel is not send-capable.');
   }
 
-  for (const [index, chunk] of chunks.entries()) {
-    if (index === 0 && replyTo) {
-      await replyTo.reply(chunk);
-      continue;
-    }
+  for (const chunk of chunks) {
     await channel.send(chunk);
   }
 }
@@ -334,6 +688,35 @@ async function sendComponentMessage(
     throw new Error('Discord channel is not send-capable.');
   }
   await channel.send(payload);
+}
+
+async function sendInteractionChunks(
+  interaction: ChatInputCommandInteraction,
+  text: string,
+  options?: { ephemeral?: boolean },
+): Promise<void> {
+  const chunks = splitMessage(text);
+  const firstChunk = chunks.shift() ?? 'Done.';
+  const ephemeral = options?.ephemeral ?? false;
+
+  if (interaction.deferred || interaction.replied) {
+    await interaction.editReply({ content: firstChunk });
+  } else {
+    await interaction.reply({ content: firstChunk, ephemeral });
+  }
+
+  for (const chunk of chunks) {
+    await interaction.followUp({ content: chunk, ephemeral });
+  }
+}
+
+async function registerSlashCommands(client: Client): Promise<void> {
+  if (!client.isReady()) return;
+
+  for (const guild of client.guilds.cache.values()) {
+    await guild.commands.set(DISCORD_SLASH_COMMANDS);
+    logger.info({ guildId: guild.id, guildName: guild.name, commandCount: DISCORD_SLASH_COMMANDS.length }, 'Registered Discord slash commands');
+  }
 }
 
 async function handleButtonInteraction(interaction: ButtonInteraction, assistant: ClementineAssistant): Promise<void> {
@@ -389,8 +772,144 @@ async function handleButtonInteraction(interaction: ButtonInteraction, assistant
   }
 }
 
+async function handleSlashCommand(interaction: ChatInputCommandInteraction, assistant: ClementineAssistant): Promise<void> {
+  logger.info({
+    command: interaction.commandName,
+    channelId: interaction.channelId,
+    guildId: interaction.guildId,
+    userId: interaction.user.id,
+  }, 'Discord slash command received');
+
+  if (!channelAllowedById(interaction.channelId, interaction.channel?.type ?? null)) {
+    await interaction.reply({
+      content: 'This channel is not allowed by `DISCORD_ALLOWED_CHANNELS`.',
+      ephemeral: true,
+    });
+    return;
+  }
+
+  try {
+    if (interaction.commandName === 'ping') {
+      await interaction.reply({ content: 'Pong. Discord transport is live.', ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'help') {
+      await interaction.reply({
+        content: [
+          'Discord slash commands:',
+          '`/ask prompt:<text>`',
+          '`/ping`',
+          '`/status`',
+          '`/tasks`',
+          '`/runs`',
+          '`/help`',
+        ].join('\n'),
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (interaction.commandName === 'status') {
+      const target = interaction.options.getString('target', false)?.trim();
+      if (target) {
+        const response = await runGatewayPrompt({
+          assistant,
+          prompt: `status ${target}`,
+          channelId: interaction.channelId,
+          userId: interaction.user.id,
+          guildId: interaction.guildId,
+        });
+        await sendInteractionChunks(interaction, response.text, { ephemeral: true });
+        return;
+      }
+
+      await interaction.reply({
+        content: renderDiscordStatusForContext({
+          userId: interaction.user.id,
+          channelId: interaction.channelId,
+          guildId: interaction.guildId,
+          assistant,
+        }),
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (interaction.commandName === 'tasks') {
+      const response = await runGatewayPrompt({
+        assistant,
+        prompt: 'tasks',
+        channelId: interaction.channelId,
+        userId: interaction.user.id,
+        guildId: interaction.guildId,
+      });
+      await sendInteractionChunks(interaction, response.text, { ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'runs') {
+      const response = await runGatewayPrompt({
+        assistant,
+        prompt: 'runs',
+        channelId: interaction.channelId,
+        userId: interaction.user.id,
+        guildId: interaction.guildId,
+      });
+      await sendInteractionChunks(interaction, response.text, { ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'ask') {
+      const prompt = interaction.options.getString('prompt', true).trim();
+      if (!prompt) {
+        await interaction.reply({ content: 'The prompt cannot be empty.', ephemeral: true });
+        return;
+      }
+
+      await interaction.deferReply();
+
+      const response = await runGatewayPrompt({
+        assistant,
+        prompt,
+        channelId: interaction.channelId,
+        userId: interaction.user.id,
+        guildId: interaction.guildId,
+      });
+      const suffix = response.pendingApprovalId
+        ? `\n\nApproval pending: \`${response.pendingApprovalId}\``
+        : '';
+      await sendInteractionChunks(interaction, `${response.text}${suffix}`);
+      return;
+    }
+
+    await interaction.reply({ content: 'Unknown command.', ephemeral: true });
+  } catch (error) {
+    logger.error({ err: error, command: interaction.commandName, userId: interaction.user.id }, 'Discord slash command failed');
+    const text = error instanceof Error
+      ? `I hit an error while handling that command: ${error.message}`
+      : 'I hit an internal error while handling that command.';
+    await sendInteractionChunks(interaction, text, { ephemeral: true });
+  }
+}
+
 async function handleMessage(message: Message<boolean>, assistant: ClementineAssistant): Promise<void> {
-  if (!shouldRespond(message)) return;
+  const shouldHandle = shouldRespond(message);
+  logger.info({
+    channelId: message.channelId,
+    guildId: message.guildId,
+    userId: message.author.id,
+    isDm: message.channel.type === ChannelType.DM,
+    mentioned: message.mentions.has(message.client.user?.id ?? ''),
+    contentLength: message.content.length,
+    shouldRespond: shouldHandle,
+  }, 'Discord message received');
+
+  if (message.channel.type === ChannelType.DM && !message.author.bot) {
+    markDiscordDmMessageSeen(message.channelId, message.id);
+  }
+
+  if (!shouldHandle) return;
 
   const prompt = extractPrompt(message);
   if (!prompt) return;
@@ -399,32 +918,188 @@ async function handleMessage(message: Message<boolean>, assistant: ClementineAss
     return;
   }
 
-  const sessionId = getOrCreateDiscordSessionId({
-    channelId: message.channelId,
-    userId: message.author.id,
-    guildId: message.guildId ?? undefined,
-  });
+  let progressCompleted = false;
+  let progressTimer: ReturnType<typeof setTimeout> | undefined;
 
   try {
     if ('sendTyping' in message.channel) {
       await message.channel.sendTyping();
     }
 
-    const response = await assistant.respond({
-      message: prompt,
-      sessionId,
+    progressTimer = setTimeout(() => {
+      if (progressCompleted) return;
+      void sendChunks(message.channel, 'Working on it. I’ll post the result here when the run finishes.', message)
+        .catch((error) => logger.warn({ err: error, channelId: message.channelId }, 'Discord progress message failed'));
+    }, 2500);
+
+    const response = await runGatewayPrompt({
+      assistant,
+      prompt,
+      channelId: message.channelId,
       userId: message.author.id,
-      channel: buildChannelLabel(message),
+      guildId: message.guildId,
     });
+    progressCompleted = true;
+    if (progressTimer) clearTimeout(progressTimer);
 
     const suffix = response.pendingApprovalId
       ? `\n\nApproval pending: \`${response.pendingApprovalId}\``
       : '';
-    await sendChunks(message.channel, `${response.text}${suffix}`, message);
+    const runSuffix = response.runId ? `\n\nRun: \`${response.runId}\`` : '';
+    await sendChunks(message.channel, `${response.text}${suffix}${runSuffix}`, message);
   } catch (error) {
     logger.error({ err: error, channelId: message.channelId, userId: message.author.id }, 'Discord message handling failed');
-    await sendChunks(message.channel, 'I hit an internal error while handling that message.', message);
+    await sendChunks(
+      message.channel,
+      error instanceof Error ? `I hit an error while handling that message: ${error.message}` : 'I hit an internal error while handling that message.',
+      message,
+    );
+  } finally {
+    progressCompleted = true;
+    if (progressTimer) clearTimeout(progressTimer);
   }
+}
+
+async function pollDiscordDirectMessages(client: Client, assistant: ClementineAssistant): Promise<void> {
+  if (!client.isReady()) return;
+  if (DISCORD_DM_ALLOWED_USERS.length === 0) return;
+
+  for (const userId of DISCORD_DM_ALLOWED_USERS) {
+    try {
+      const dm = await ensureDiscordDmChannel(userId);
+      const messages = await listDiscordChannelMessages(dm.id, 15);
+      if (messages.length === 0) {
+        continue;
+      }
+
+      const state = loadDiscordDmPollState();
+      const lastSeen = state.lastSeenByChannel[dm.id] ?? '';
+      if (!lastSeen) {
+        const seed = latestSnowflake(messages.map((message) => message.id));
+        if (seed) {
+          state.lastSeenByChannel[dm.id] = seed;
+          saveDiscordDmPollState(state);
+          logger.info({ userId, channelId: dm.id, lastSeenMessageId: seed }, 'Seeded Discord DM poll state');
+        }
+        continue;
+      }
+
+      const pending = messages
+        .filter((message) => !message.author.bot && compareSnowflakes(message.id, lastSeen) > 0)
+        .sort((left, right) => compareSnowflakes(left.id, right.id));
+
+      for (const message of pending) {
+        logger.info({
+          channelId: message.channel_id,
+          guildId: null,
+          userId: message.author.id,
+          isDm: true,
+          contentLength: message.content.length,
+        }, 'Discord DM polled message received');
+
+        const prompt = message.content.trim();
+        if (!prompt) {
+          markDiscordDmMessageSeen(dm.id, message.id);
+          continue;
+        }
+
+        let progressCompleted = false;
+        let progressTimer: ReturnType<typeof setTimeout> | undefined;
+        const streamHandler = createDiscordStreamHandler(dm.id);
+        let chunkSeen = false;
+
+        try {
+          progressTimer = setTimeout(() => {
+            if (progressCompleted || chunkSeen) return;
+            void sendDiscordRestChunks(dm.id, 'Working on it. I’ll post the result here when the run finishes.')
+              .catch((sendError) => logger.warn({ err: sendError, channelId: dm.id }, 'Discord DM progress message failed'));
+          }, 2500);
+
+          const response = await runGatewayPrompt({
+            assistant,
+            prompt,
+            channelId: dm.id,
+            userId: message.author.id,
+            guildId: null,
+            onChunk: async (delta) => {
+              chunkSeen = true;
+              if (progressTimer) { clearTimeout(progressTimer); progressTimer = undefined; }
+              await streamHandler.onChunk(delta);
+            },
+          });
+          progressCompleted = true;
+          if (progressTimer) clearTimeout(progressTimer);
+
+          // Flush any pending edit so the final delta lands before we
+          // append suffixes / fall back to a full send.
+          await streamHandler.flush();
+
+          const suffix = response.pendingApprovalId
+            ? `\n\nApproval pending: \`${response.pendingApprovalId}\``
+            : '';
+          const runSuffix = response.runId ? `\n\nRun: \`${response.runId}\`` : '';
+
+          if (chunkSeen) {
+            // Streaming already published the body. Send only the
+            // suffix(es), if any, as a follow-up message — keeps the
+            // streamed text intact and doesn't double-post the body.
+            const tail = `${suffix}${runSuffix}`.trim();
+            if (tail) await sendDiscordRestChunks(dm.id, tail);
+          } else {
+            // Non-streaming runtime (codex CLI bridge) — fall back to
+            // the original one-shot send.
+            await sendDiscordRestChunks(dm.id, `${response.text}${suffix}${runSuffix}`);
+          }
+
+          markDiscordDmMessageSeen(dm.id, message.id);
+        } catch (error) {
+          logger.error({ err: error, channelId: dm.id, userId: message.author.id }, 'Discord DM polled message handling failed');
+          await sendDiscordRestChunks(
+            dm.id,
+            error instanceof Error ? `I hit an error while handling that message: ${error.message}` : 'I hit an internal error while handling that message.',
+          );
+          markDiscordDmMessageSeen(dm.id, message.id);
+        } finally {
+          progressCompleted = true;
+          if (progressTimer) clearTimeout(progressTimer);
+        }
+      }
+    } catch (error) {
+      logger.error({ err: error, userId }, 'Discord DM polling failed');
+    }
+  }
+}
+
+async function runDiscordDmPollingLoop(client: Client, assistant: ClementineAssistant): Promise<void> {
+  while (dmPollLoopActive && discordClient === client && client.isReady()) {
+    try {
+      await pollDiscordDirectMessages(client, assistant);
+    } catch (error) {
+      logger.error({ err: error }, 'Discord DM polling loop iteration failed');
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, Math.max(DISCORD_DM_POLL_INTERVAL_MS, 1000)));
+  }
+}
+
+function startDiscordDmPolling(client: Client, assistant: ClementineAssistant): void {
+  if (dmPollLoopPromise || DISCORD_DM_ALLOWED_USERS.length === 0) {
+    return;
+  }
+
+  logger.info({
+    users: DISCORD_DM_ALLOWED_USERS,
+    intervalMs: DISCORD_DM_POLL_INTERVAL_MS,
+  }, 'Discord DM polling enabled');
+
+  dmPollLoopActive = true;
+  dmPollLoopPromise = runDiscordDmPollingLoop(client, assistant)
+    .catch((error) => {
+      logger.error({ err: error }, 'Discord DM polling loop crashed');
+    })
+    .finally(() => {
+      dmPollLoopPromise = null;
+    });
 }
 
 export async function startDiscordBot(assistant: ClementineAssistant): Promise<void> {
@@ -448,21 +1123,50 @@ export async function startDiscordBot(assistant: ClementineAssistant): Promise<v
         GatewayIntentBits.MessageContent,
       ],
       partials: [Partials.Channel],
+      presence: {
+        status: 'online',
+        activities: [
+          {
+            name: 'for messages',
+            type: ActivityType.Listening,
+          },
+        ],
+      },
     });
 
     client.on(Events.ClientReady, (readyClient) => {
+      readyClient.user.setPresence({
+        status: 'online',
+        activities: [
+          {
+            name: 'for messages',
+            type: ActivityType.Listening,
+          },
+        ],
+      });
       status = {
         enabled: true,
         connected: true,
         userTag: readyClient.user.tag,
         startedAt: new Date().toISOString(),
         guildCount: readyClient.guilds.cache.size,
+        clientId: readyClient.application.id,
+        installUrl: buildDiscordInstallUrl(readyClient.application.id),
       };
       logger.info({ user: readyClient.user.tag, guilds: readyClient.guilds.cache.size }, 'Discord bot ready');
+      void registerSlashCommands(readyClient).catch((error) => {
+        logger.error({ err: error }, 'Failed to register Discord slash commands');
+      });
+      startDiscordDmPolling(readyClient, assistant);
     });
 
-    client.on(Events.GuildCreate, () => {
+    client.on(Events.GuildCreate, (guild) => {
       status.guildCount = client.guilds.cache.size;
+      void guild.commands.set(DISCORD_SLASH_COMMANDS).then(() => {
+        logger.info({ guildId: guild.id, guildName: guild.name, commandCount: DISCORD_SLASH_COMMANDS.length }, 'Registered Discord slash commands for new guild');
+      }).catch((error) => {
+        logger.error({ err: error, guildId: guild.id }, 'Failed to register Discord slash commands for new guild');
+      });
     });
 
     client.on(Events.GuildDelete, () => {
@@ -474,8 +1178,13 @@ export async function startDiscordBot(assistant: ClementineAssistant): Promise<v
     });
 
     client.on(Events.InteractionCreate, async (interaction) => {
-      if (!interaction.isButton()) return;
-      await handleButtonInteraction(interaction, assistant);
+      if (interaction.isButton()) {
+        await handleButtonInteraction(interaction, assistant);
+        return;
+      }
+      if (interaction.isChatInputCommand()) {
+        await handleSlashCommand(interaction, assistant);
+      }
     });
 
     client.on(Events.Error, (error) => {
@@ -484,6 +1193,7 @@ export async function startDiscordBot(assistant: ClementineAssistant): Promise<v
 
     client.on(Events.ShardDisconnect, () => {
       status.connected = false;
+      dmPollLoopActive = false;
     });
 
     discordClient = client;
@@ -532,5 +1242,7 @@ export function getDiscordRuntimeStatus(): DiscordRuntimeStatus {
     ...status,
     connected: Boolean(discordClient?.isReady()),
     guildCount: discordClient?.guilds.cache.size ?? status.guildCount,
+    clientId: discordClient?.application?.id ?? status.clientId,
+    installUrl: discordClient?.application?.id ? buildDiscordInstallUrl(discordClient.application.id) : status.installUrl,
   };
 }
