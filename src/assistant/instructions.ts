@@ -66,12 +66,61 @@ function buildIntegrationsContext(): string {
   }
 }
 
-export function buildAssistantInstructions(context: MemoryContext): string {
+/**
+ * Channel-specific response style directives. Composes WITH the user's
+ * preferred tone — these tell the model about the surface, not the
+ * person. Discord renders poorly above ~1500 chars and butchers
+ * markdown headers; CLI is fine with any length and full markdown;
+ * webhooks usually want clean structured text.
+ *
+ * If the user's profile says terse and the channel is Discord, both
+ * agree → very tight reply. If the user's profile says verbose but
+ * the channel is Discord, the channel wins on length but the model
+ * keeps the user's voice preference for tone.
+ */
+export function renderChannelDirective(channel?: string): string {
+  const normalized = (channel ?? '').toLowerCase();
+  if (normalized.startsWith('discord')) {
+    return [
+      'Channel guidance — Discord:',
+      '- Keep replies tight. Aim under 500 characters unless the user explicitly asked for depth.',
+      '- Lead with the answer or status. No preamble. No "Here is what I found:" warmups.',
+      '- Avoid markdown headers (#, ##, ###) — Discord renders them awkwardly. Plain bold is fine.',
+      '- Code blocks ARE welcome for code or commands.',
+      '- If a substantive answer truly needs more than ~1500 chars, split into 2–3 short turns rather than one wall of text.',
+      '- Channel constraints take precedence over the user\'s verbose preference, but tone (casual/formal) still follows the profile.',
+    ].join('\n');
+  }
+  if (normalized.startsWith('cli') || normalized.startsWith('chat')) {
+    return [
+      'Channel guidance — CLI:',
+      '- Markdown renders cleanly here. Use it for structure when it helps.',
+      '- Length flexibility: match the user\'s tone preference. Be terse for routine answers, thorough when depth is asked for.',
+    ].join('\n');
+  }
+  if (normalized.startsWith('webhook') || normalized.startsWith('api')) {
+    return [
+      'Channel guidance — webhook/API:',
+      '- Prefer clean structured replies. The consumer is usually a downstream system or operator script.',
+      '- Skip pleasantries; lead with the deliverable.',
+    ].join('\n');
+  }
+  if (normalized === 'agent') {
+    // Autonomy cycles have their own input/instructions in autonomy-v2.ts.
+    // Suppress channel guidance here — autonomy-v2 already drives the
+    // shape of the output via outputType.
+    return '';
+  }
+  return '';
+}
+
+export function buildAssistantInstructions(context: MemoryContext, channel?: string): string {
   const owner = OWNER_NAME || 'the user';
   const goalsContext = buildGoalsContext();
   const integrationsContext = buildIntegrationsContext();
   const persistentFacts = renderFactsForInstructions(12);
   const userPreferences = renderProfileForInstructions();
+  const channelDirective = renderChannelDirective(channel);
 
   return [
     `You are ${ASSISTANT_NAME}, a high-agency executive AI assistant for ${owner}.`,
@@ -87,6 +136,7 @@ export function buildAssistantInstructions(context: MemoryContext): string {
     'Act like an operator with good judgment: pragmatic, calm, structured, and accountable.',
     'When the user shares a durable preference, persistent project context, or standing feedback, call `memory_remember` so the fact carries across sessions. Use `memory_forget` if the user retracts something.',
     'When the user tells you how they want to be addressed, what tone to use, their timezone, working hours, or other preferences about HOW you should communicate, call `user_profile_update` so that adapts permanently. Profile applies to every conversation, not just this one.',
+    channelDirective,
     section('User Preferences', userPreferences),
     section('Persistent Facts', persistentFacts),
     section('Session Continuity', context.sessionBrief),

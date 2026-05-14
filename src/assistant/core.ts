@@ -55,7 +55,7 @@ export class ClementineAssistant {
     const executionIntent = analyzeExecutionIntent(request.message, activeExecution);
     const executionPrompt = buildExecutionPromptBlock(executionIntent, activeExecution);
     const { memoryContext, retrievalText } = await assemblePromptContextAsync(request.sessionId, request.message, transcriptBeforeReply);
-    const instructions = buildAssistantInstructions(memoryContext);
+    const instructions = buildAssistantInstructions(memoryContext, request.channel);
 
     const promptParts = [
       request.channel ? `Channel: ${request.channel}` : '',
@@ -65,24 +65,26 @@ export class ClementineAssistant {
       `Latest user message:\n${request.message}`,
     ].filter(Boolean);
 
-    const result = await this.runtime.run({
-      instructions,
-      model: request.model ?? MODELS.primary,
-      prompt: promptParts.join('\n\n'),
-      sessionId: request.sessionId,
-      userId: request.userId,
-      channel: request.channel,
-    }, request.runId ? {
-      onToolActivity: async (activity) => {
-        addRunEvent(request.runId, {
-          type: 'tool_started',
-          message: `Using tool: ${activity.toolName}`,
-          data: {
-            toolName: activity.toolName,
-            input: activity.input,
-          },
-        });
-      },
+	    const result = await this.runtime.run({
+	      instructions,
+	      model: request.model ?? MODELS.primary,
+	      prompt: promptParts.join('\n\n'),
+	      sessionId: request.sessionId,
+	      userId: request.userId,
+	      channel: request.channel,
+	    }, request.runId ? {
+	      shouldCancel: request.shouldCancel,
+	      onToolActivity: async (activity) => {
+	        addRunEvent(request.runId, {
+	          type: 'tool_started',
+	          message: `Using tool: ${activity.toolName}`,
+	          data: {
+	            toolName: activity.toolName,
+	            input: activity.input,
+	          },
+	        });
+	        await request.onToolActivity?.(activity);
+	      },
       onText: async () => {
         // Final text is recorded by the gateway/background task after the run returns.
       },
