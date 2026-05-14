@@ -80,11 +80,11 @@ export function renderConsoleHtml(token: string): string {
         <span class="nav-key">05</span>
         <span class="nav-label">Projects</span>
       </button>
-      <button class="nav" data-panel="skills" disabled title="Coming next">
+      <button class="nav" data-panel="skills">
         <span class="nav-key">06</span>
         <span class="nav-label">Skills</span>
       </button>
-      <button class="nav" data-panel="settings" disabled title="Coming next">
+      <button class="nav" data-panel="settings">
         <span class="nav-key">07</span>
         <span class="nav-label">Settings</span>
       </button>
@@ -300,6 +300,184 @@ export function renderConsoleHtml(token: string): string {
             <div class="wf-empty">
               <div class="wf-empty-mark">⌗</div>
               <div class="wf-empty-text">SELECT A PROJECT</div>
+            </div>
+          </div>
+
+        </div>
+      </section>
+
+      <section class="panel-frame" data-section="skills" hidden>
+        <div class="panel-tag">PANEL · 06 · SKILLS</div>
+        <div class="panel-body skills-layout">
+
+          <div class="skills-header">
+            <div class="skills-intro">
+              <h3>Installed Skills</h3>
+              <p>Skills are plugins dropped into <code data-skills-dir>~/.clementine-next/plugins/</code>.
+                 Each plugin can register tools the agent calls just like built-in ones.</p>
+            </div>
+            <div class="skills-stats">
+              <div class="stat-card"><span>SKILLS</span><em data-skills-count>—</em></div>
+              <div class="stat-card"><span>TOOLS</span><em data-skills-tool-count>—</em></div>
+            </div>
+          </div>
+
+          <div class="skills-grid" data-skills-grid>
+            <div class="tools-empty">— loading —</div>
+          </div>
+
+        </div>
+      </section>
+
+      <section class="panel-frame" data-section="settings" hidden>
+        <div class="panel-tag">PANEL · 07 · SETTINGS</div>
+        <div class="panel-body settings-layout">
+
+          <div class="settings-col">
+            <div class="settings-block">
+              <div class="settings-block-head">USER PROFILE</div>
+              <form class="settings-form" data-settings-profile-form>
+                <div class="settings-field">
+                  <label>DISPLAY NAME</label>
+                  <input type="text" name="displayName" data-profile-field />
+                </div>
+                <div class="settings-field">
+                  <label>PREFERRED NAME (how the agent addresses you)</label>
+                  <input type="text" name="preferredName" data-profile-field />
+                </div>
+                <div class="settings-field">
+                  <label>ROLE</label>
+                  <input type="text" name="role" data-profile-field />
+                </div>
+                <div class="settings-grid-2">
+                  <div class="settings-field">
+                    <label>TIMEZONE</label>
+                    <input type="text" name="timezone" data-profile-field placeholder="America/Los_Angeles" />
+                  </div>
+                  <div class="settings-field">
+                    <label>URGENCY TOLERANCE</label>
+                    <select name="urgencyTolerance" data-profile-field>
+                      <option value="low">low — notify sparingly</option>
+                      <option value="normal">normal</option>
+                      <option value="high">high — frequent updates ok</option>
+                    </select>
+                  </div>
+                </div>
+                <div class="settings-grid-2">
+                  <div class="settings-field">
+                    <label>TONE</label>
+                    <select name="communicationTone" data-profile-field>
+                      <option value="terse">terse</option>
+                      <option value="balanced">balanced</option>
+                      <option value="verbose">verbose</option>
+                    </select>
+                  </div>
+                  <div class="settings-field">
+                    <label>FORMALITY</label>
+                    <select name="formality" data-profile-field>
+                      <option value="casual">casual</option>
+                      <option value="professional">professional</option>
+                      <option value="formal">formal</option>
+                    </select>
+                  </div>
+                </div>
+                <div class="settings-grid-2">
+                  <div class="settings-field">
+                    <label>WORKING HOURS START</label>
+                    <input type="text" name="workingHoursStart" data-profile-field placeholder="9:00" />
+                  </div>
+                  <div class="settings-field">
+                    <label>WORKING HOURS END</label>
+                    <input type="text" name="workingHoursEnd" data-profile-field placeholder="18:00" />
+                  </div>
+                </div>
+                <div class="settings-field">
+                  <label>NOTES (free-form context the agent should know)</label>
+                  <textarea name="notes" data-profile-field rows="3"></textarea>
+                </div>
+                <button type="submit" class="settings-save">SAVE PROFILE ✎</button>
+              </form>
+            </div>
+
+            <div class="settings-block">
+              <div class="settings-block-head">AUTH</div>
+              <div class="settings-info" data-settings-auth>—</div>
+            </div>
+          </div>
+
+          <div class="settings-col">
+            <div class="settings-block">
+              <div class="settings-block-head">PROACTIVITY POLICY</div>
+              <form class="settings-form" data-settings-policy-form>
+                <div class="settings-field">
+                  <label>ENABLED · the master switch for proactive work</label>
+                  <div class="settings-row">
+                    <label class="check-pill">
+                      <input type="checkbox" name="enabled" data-policy-field />
+                      <span>Proactive loops on</span>
+                    </label>
+                  </div>
+                </div>
+                <div class="settings-grid-2">
+                  <div class="settings-field">
+                    <label>MODE</label>
+                    <select name="mode" data-policy-field>
+                      <option value="watch">watch — observe + notify only</option>
+                      <option value="balanced">balanced</option>
+                      <option value="hands_on">hands_on — drive forward</option>
+                    </select>
+                  </div>
+                  <div class="settings-field">
+                    <label>CHECK-IN MINUTES</label>
+                    <input type="number" name="checkInMinutes" data-policy-field min="1" max="60" />
+                  </div>
+                </div>
+                <div class="settings-grid-2">
+                  <div class="settings-field">
+                    <label>DEFAULT LONG TASK (MIN)</label>
+                    <input type="number" name="defaultLongTaskMinutes" data-policy-field min="5" max="240" />
+                  </div>
+                  <div class="settings-field">
+                    <label>BRIEF CADENCE (MIN)</label>
+                    <input type="number" name="briefCadenceMinutes" data-policy-field min="10" max="1440" />
+                  </div>
+                </div>
+                <div class="settings-field">
+                  <label>QUIET HOURS</label>
+                  <div class="settings-row">
+                    <label class="check-pill">
+                      <input type="checkbox" name="quietHoursEnabled" data-policy-field />
+                      <span>Enabled</span>
+                    </label>
+                    <input type="text" name="quietHoursStart" data-policy-field placeholder="22:00" style="width:90px;" />
+                    <span style="color:var(--fg-3);">→</span>
+                    <input type="text" name="quietHoursEnd" data-policy-field placeholder="07:00" style="width:90px;" />
+                  </div>
+                </div>
+                <div class="settings-field">
+                  <label>CAPABILITY GATES</label>
+                  <div class="settings-row settings-gates">
+                    <label class="check-pill">
+                      <input type="checkbox" name="allowComputerActions" data-policy-field />
+                      <span>Computer</span>
+                    </label>
+                    <label class="check-pill">
+                      <input type="checkbox" name="allowComposioActions" data-policy-field />
+                      <span>Composio</span>
+                    </label>
+                    <label class="check-pill">
+                      <input type="checkbox" name="allowDiscordCheckIns" data-policy-field />
+                      <span>Discord</span>
+                    </label>
+                  </div>
+                </div>
+                <button type="submit" class="settings-save">SAVE POLICY ✎</button>
+              </form>
+            </div>
+
+            <div class="settings-block">
+              <div class="settings-block-head">MEMORY INDEX</div>
+              <div class="settings-info" data-settings-memory>—</div>
             </div>
           </div>
 
@@ -1692,6 +1870,251 @@ body {
 }
 .proj-entries .entry.dir { color: var(--accent-3); }
 
+/* ── Skills panel ────────────────────────────────────────────── */
+.skills-layout {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  gap: 14px;
+  overflow: hidden;
+}
+.skills-header {
+  display: grid;
+  grid-template-columns: 1fr 260px;
+  gap: 14px;
+}
+.skills-intro {
+  border: 1px solid var(--line);
+  background: var(--bg-2);
+  padding: 14px 16px;
+  font-size: 12px;
+  color: var(--fg-2);
+  line-height: 1.5;
+}
+.skills-intro h3 {
+  margin: 0 0 6px;
+  color: var(--fg);
+  font-size: 11px;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+}
+.skills-intro p { margin: 0; }
+.skills-intro code {
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  padding: 1px 6px;
+  color: var(--accent);
+  font-size: 11px;
+}
+.skills-stats {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0;
+  border: 1px solid var(--line);
+  background: var(--bg-2);
+}
+.stat-card {
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  color: var(--fg-3);
+}
+.stat-card:first-child { border-right: 1px solid var(--line); }
+.stat-card em {
+  font-style: normal;
+  font-size: 28px;
+  color: var(--accent);
+  letter-spacing: 0;
+}
+
+.skills-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 10px;
+  overflow-y: auto;
+  flex: 1;
+}
+.skill-card {
+  border: 1px solid var(--line);
+  background: var(--bg-2);
+  display: flex;
+  flex-direction: column;
+}
+.skill-card .skill-head {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-1);
+}
+.skill-card .skill-name {
+  color: var(--fg);
+  font-size: 12px;
+  letter-spacing: 0.02em;
+}
+.skill-card .skill-version {
+  color: var(--accent);
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  margin-left: 6px;
+}
+.skill-card .skill-desc {
+  padding: 10px 12px;
+  color: var(--fg-2);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.skill-card .skill-tools-head {
+  padding: 6px 12px;
+  background: var(--bg-1);
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  color: var(--fg-3);
+  display: flex;
+  justify-content: space-between;
+}
+.skill-card .skill-tools-head em { font-style: normal; color: var(--fg); }
+.skill-card .skill-tools {
+  padding: 8px 12px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.skill-card .skill-tool-pill {
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  padding: 2px 6px;
+  color: var(--fg-2);
+}
+
+/* ── Settings panel ──────────────────────────────────────────── */
+.settings-layout {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  height: 100%;
+  overflow: hidden;
+}
+.settings-col {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  overflow-y: auto;
+}
+.settings-block {
+  border: 1px solid var(--line);
+  background: var(--bg-2);
+}
+.settings-block-head {
+  padding: 8px 14px;
+  background: var(--bg-1);
+  border-bottom: 1px solid var(--line);
+  font-size: 10px;
+  letter-spacing: 0.2em;
+  color: var(--fg-3);
+}
+.settings-form { padding: 14px 16px; }
+.settings-field { margin-bottom: 12px; }
+.settings-field:last-child { margin-bottom: 0; }
+.settings-field label {
+  display: block;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  color: var(--fg-3);
+  margin-bottom: 5px;
+}
+.settings-field input[type="text"],
+.settings-field input[type="number"],
+.settings-field select,
+.settings-field textarea {
+  width: 100%;
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  color: var(--fg);
+  font: inherit;
+  font-size: 11px;
+  padding: 6px 8px;
+  outline: none;
+  transition: border-color 120ms;
+}
+.settings-field input[type="text"]:focus,
+.settings-field input[type="number"]:focus,
+.settings-field select:focus,
+.settings-field textarea:focus { border-color: var(--accent); }
+.settings-field textarea { resize: vertical; }
+.settings-grid-2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.settings-grid-2 .settings-field { margin-bottom: 0; }
+.settings-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.check-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--fg-2);
+  padding: 5px 10px;
+  border: 1px solid var(--line);
+  cursor: pointer;
+  user-select: none;
+  background: var(--bg-1);
+  transition: border-color 100ms;
+}
+.check-pill:hover { border-color: var(--line-bright); }
+.check-pill input { accent-color: var(--accent); }
+.settings-gates .check-pill { font-size: 10px; letter-spacing: 0.1em; }
+
+.settings-save {
+  background: var(--accent);
+  border: 0;
+  color: var(--bg-0);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  padding: 8px 16px;
+  cursor: pointer;
+  font-weight: 600;
+  margin-top: 4px;
+  transition: background 100ms;
+}
+.settings-save:hover { background: var(--accent-2); color: var(--bg-0); }
+.settings-save:disabled { background: var(--bg-3); color: var(--fg-mute); cursor: wait; }
+
+.settings-info {
+  padding: 14px 16px;
+  font-size: 11px;
+  color: var(--fg-2);
+  line-height: 1.6;
+}
+.settings-info .row {
+  display: flex;
+  justify-content: space-between;
+  border-bottom: 1px dashed var(--line);
+  padding: 4px 0;
+}
+.settings-info .row:last-child { border-bottom: 0; }
+.settings-info .row .k {
+  color: var(--fg-3);
+  font-size: 10px;
+  letter-spacing: 0.14em;
+}
+.settings-info .row .v { color: var(--fg); }
+.settings-info .row .v.on { color: var(--accent-2); }
+.settings-info .row .v.off { color: var(--fg-mute); }
+
 /* ── Foot bar ───────────────────────────────────────────────── */
 .foot-bar {
   display: flex;
@@ -1928,6 +2351,8 @@ const CONSOLE_JS = `
   let workflowsBooted = false;
   let toolsBooted = false;
   let projectsBooted = false;
+  let skillsBooted = false;
+  let settingsBooted = false;
 
   function switchPanel(name) {
     panelSections.forEach((s) => {
@@ -1946,6 +2371,10 @@ const CONSOLE_JS = `
       if (!toolsBooted) { toolsBooted = true; bootToolsPanel(); }
     } else if (name === 'projects') {
       if (!projectsBooted) { projectsBooted = true; bootProjectsPanel(); }
+    } else if (name === 'skills') {
+      if (!skillsBooted) { skillsBooted = true; bootSkillsPanel(); }
+    } else if (name === 'settings') {
+      if (!settingsBooted) { settingsBooted = true; bootSettingsPanel(); }
     }
   }
   navButtons.forEach((b) => {
@@ -2815,6 +3244,161 @@ const CONSOLE_JS = `
       proj.detail.innerHTML = '<div class="wf-empty"><div class="wf-empty-mark">!</div><div class="wf-empty-text">' + escMem(err.message || err) + '</div></div>';
     }
   }
+
+  // ─── Skills panel ─────────────────────────────────────────────
+
+  async function bootSkillsPanel() {
+    const dirEl   = document.querySelector('[data-skills-dir]');
+    const cntEl   = document.querySelector('[data-skills-count]');
+    const tcntEl  = document.querySelector('[data-skills-tool-count]');
+    const gridEl  = document.querySelector('[data-skills-grid]');
+    try {
+      const data = await fetchJSON('/api/console/skills');
+      if (data.pluginsDir) dirEl.textContent = data.pluginsDir;
+      const plugins = data.plugins || [];
+      cntEl.textContent = plugins.length;
+      tcntEl.textContent = plugins.reduce((s, p) => s + (p.toolCount || 0), 0);
+      if (plugins.length === 0) {
+        gridEl.innerHTML =
+          '<div class="tools-empty">— no skills installed —<br>'
+        + '<span style="color:var(--fg-mute);font-size:10px;letter-spacing:0.06em;">Drop a folder with index.js into '
+        + escMem(data.pluginsDir || '') + ' to install one. Use the plugin install command or build your own.</span></div>';
+        return;
+      }
+      gridEl.innerHTML = plugins.map((p) => [
+        '<div class="skill-card">',
+        '  <div class="skill-head">',
+        '    <span class="skill-name">' + escMem(p.name) + '</span>',
+        p.version ? '    <span class="skill-version">v' + escMem(p.version) + '</span>' : '',
+        '  </div>',
+        p.description ? '  <div class="skill-desc">' + escMem(p.description) + '</div>' : '',
+        '  <div class="skill-tools-head"><span>TOOLS</span><em>' + (p.toolCount || 0) + '</em></div>',
+        '  <div class="skill-tools">',
+           (p.tools || []).map((t) => '<span class="skill-tool-pill" title="' + escMem(t.description || '') + '">' + escMem(t.name) + '</span>').join('') || '<span style="color:var(--fg-mute);font-size:10px;">(no tools)</span>',
+        '  </div>',
+        '</div>',
+      ].join('')).join('');
+    } catch (err) {
+      gridEl.innerHTML = '<div class="tools-empty">— failed: ' + escMem(err.message || err) + ' —</div>';
+    }
+  }
+
+  // ─── Settings panel ───────────────────────────────────────────
+
+  const sett = {
+    profileForm: document.querySelector('[data-settings-profile-form]'),
+    policyForm:  document.querySelector('[data-settings-policy-form]'),
+    authBox:     document.querySelector('[data-settings-auth]'),
+    memoryBox:   document.querySelector('[data-settings-memory]'),
+  };
+
+  function setFormValue(form, name, value) {
+    const el = form.querySelector('[name="' + name + '"]');
+    if (!el) return;
+    if (el.type === 'checkbox') el.checked = Boolean(value);
+    else el.value = value ?? '';
+  }
+  function getFormPatch(form) {
+    const patch = {};
+    form.querySelectorAll('[data-profile-field], [data-policy-field]').forEach((el) => {
+      const name = el.getAttribute('name');
+      if (!name) return;
+      if (el.type === 'checkbox') patch[name] = el.checked;
+      else if (el.type === 'number') {
+        const n = parseInt(el.value, 10);
+        if (Number.isFinite(n)) patch[name] = n;
+      }
+      else patch[name] = el.value;
+    });
+    return patch;
+  }
+
+  async function bootSettingsPanel() {
+    try {
+      const s = await fetchJSON('/api/console/settings');
+      const profile = s.profile || {};
+      ['displayName','preferredName','role','timezone','urgencyTolerance','communicationTone','formality','workingHoursStart','workingHoursEnd','notes'].forEach((k) => setFormValue(sett.profileForm, k, profile[k]));
+
+      const policy = (s.proactivity && s.proactivity.policy) || {};
+      ['enabled','quietHoursEnabled','allowComputerActions','allowComposioActions','allowDiscordCheckIns'].forEach((k) => setFormValue(sett.policyForm, k, policy[k]));
+      ['mode','checkInMinutes','defaultLongTaskMinutes','briefCadenceMinutes','quietHoursStart','quietHoursEnd'].forEach((k) => setFormValue(sett.policyForm, k, policy[k]));
+
+      renderAuthInfo(s.auth);
+      renderMemoryInfo(s.memory);
+    } catch (err) {
+      sett.authBox.innerHTML = '<div style="color:var(--accent-fail);">Failed to load settings: ' + escMem(err.message || err) + '</div>';
+    }
+  }
+
+  function renderAuthInfo(auth) {
+    if (!auth) { sett.authBox.textContent = '—'; return; }
+    const rows = [
+      ['Mode',           auth.mode || '—'],
+      ['Has API key',    auth.hasOpenAiApiKey ? 'yes' : 'no'],
+      ['Codex auth',     auth.hasNativeOAuth || auth.hasImportedCodexAuth ? 'configured' : 'not configured'],
+    ];
+    sett.authBox.innerHTML = rows.map(([k, v]) =>
+      '<div class="row"><span class="k">' + escMem(k) + '</span><span class="v ' + (v === 'no' || v === 'not configured' ? 'off' : 'on') + '">' + escMem(String(v)) + '</span></div>',
+    ).join('');
+  }
+
+  function renderMemoryInfo(m) {
+    if (!m) { sett.memoryBox.textContent = '—'; return; }
+    const rows = [
+      ['Chunks',          m.chunks ?? '—'],
+      ['Files',           m.indexedFiles ?? '—'],
+      ['Active facts',    m.activeFacts ?? '—'],
+      ['Total facts',     m.totalFacts ?? '—'],
+      ['Embeddings',      m.embeddingsEnabled ? (m.embeddingsCount + ' vectors · ' + Math.round((m.embeddingsCoverage || 0) * 100) + '%') : 'disabled (set OPENAI_API_KEY)'],
+      ['DB size',         (m.dbBytes ?? 0) + ' bytes'],
+    ];
+    sett.memoryBox.innerHTML = rows.map(([k, v]) => {
+      const cls = (v === 'disabled (set OPENAI_API_KEY)') ? 'off' : 'on';
+      return '<div class="row"><span class="k">' + escMem(k) + '</span><span class="v ' + cls + '">' + escMem(String(v)) + '</span></div>';
+    }).join('');
+  }
+
+  sett.profileForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const btn = sett.profileForm.querySelector('button[type="submit"]');
+    btn.disabled = true;
+    try {
+      const patch = getFormPatch(sett.profileForm);
+      const r = await fetch(withToken('/api/console/settings/profile'), {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(patch),
+      });
+      btn.disabled = false;
+      btn.textContent = r.ok ? 'SAVED ✓' : 'FAILED';
+      setTimeout(() => { btn.textContent = 'SAVE PROFILE ✎'; }, 1400);
+    } catch (err) {
+      btn.disabled = false;
+      btn.textContent = 'FAILED';
+      setTimeout(() => { btn.textContent = 'SAVE PROFILE ✎'; }, 1400);
+    }
+  });
+
+  sett.policyForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const btn = sett.policyForm.querySelector('button[type="submit"]');
+    btn.disabled = true;
+    try {
+      const patch = getFormPatch(sett.policyForm);
+      const r = await fetch(withToken('/api/console/settings/policy'), {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(patch),
+      });
+      btn.disabled = false;
+      btn.textContent = r.ok ? 'SAVED ✓' : 'FAILED';
+      setTimeout(() => { btn.textContent = 'SAVE POLICY ✎'; }, 1400);
+    } catch (err) {
+      btn.disabled = false;
+      btn.textContent = 'FAILED';
+      setTimeout(() => { btn.textContent = 'SAVE POLICY ✎'; }, 1400);
+    }
+  });
 
   // Boot the loop.
   tick();

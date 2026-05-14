@@ -15,6 +15,10 @@ import type { ClementineAssistant } from '../assistant/core.js';
 import { LOCAL_MCP_TOOL_NAMES } from '../tools/catalog.js';
 import { getCoreTools } from '../tools/registry.js';
 import { discoverMcpServers } from '../runtime/mcp-config.js';
+import { loadPlugins, PLUGINS_DIR } from '../plugins/loader.js';
+import { loadUserProfile, saveUserProfile } from '../runtime/user-profile.js';
+import { getProactivityPolicySnapshot, saveProactivityPolicy } from '../agents/proactivity-policy.js';
+import { getAuthStatus } from '../runtime/auth-store.js';
 
 /**
  * Mounts the new Console dashboard at /console.
@@ -609,6 +613,60 @@ export function registerConsoleRoutes(
       } catch { /* ignore */ }
 
       res.json(result);
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // ─── Skills (plugins) ──────────────────────────────────────────
+
+  app.get('/api/console/skills', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const plugins = await loadPlugins();
+      const items = plugins.map((p) => ({
+        name: p.name,
+        version: p.version ?? null,
+        description: p.description ?? '',
+        toolCount: Array.isArray(p.tools) ? p.tools.length : 0,
+        tools: (p.tools ?? []).map((t) => ({ name: t.name, description: t.description })),
+      }));
+      res.json({ plugins: items, pluginsDir: PLUGINS_DIR });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // ─── Settings ──────────────────────────────────────────────────
+
+  app.get('/api/console/settings', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const profile = loadUserProfile();
+      const proactivity = getProactivityPolicySnapshot();
+      const auth = getAuthStatus();
+      const memory = readMemoryIndexStatus();
+      res.json({ profile, proactivity, auth, memory });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.patch('/api/console/settings/profile', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const updated = saveUserProfile(req.body ?? {});
+      res.json({ profile: updated });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.patch('/api/console/settings/policy', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const updated = saveProactivityPolicy(req.body ?? {});
+      res.json({ policy: updated });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
