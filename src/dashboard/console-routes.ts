@@ -20,6 +20,18 @@ import { loadUserProfile, saveUserProfile } from '../runtime/user-profile.js';
 import { getProactivityPolicySnapshot, saveProactivityPolicy } from '../agents/proactivity-policy.js';
 import { getAuthStatus } from '../runtime/auth-store.js';
 import { getSecretStore, listSecretDescriptors, type SecretName } from '../runtime/secrets/index.js';
+import {
+  createCheckInTemplate,
+  deleteCheckInTemplate,
+  ensureSeedTemplates,
+  getCheckInTemplate,
+  getTemplateState,
+  listCheckInTemplates,
+  testFireTemplate,
+  updateCheckInTemplate,
+  type TriggerKind,
+} from '../agents/check-in-templates.js';
+import type { CheckInUrgency } from '../agents/check-ins.js';
 
 /**
  * Mounts the new Console dashboard at /console.
@@ -770,5 +782,74 @@ export function registerConsoleRoutes(
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
+  });
+
+  // ─── Proactive check-in templates ──────────────────────────────
+
+  app.get('/api/console/check-in-templates', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      ensureSeedTemplates();
+      const items = listCheckInTemplates().map((t) => ({ ...t, state: getTemplateState(t.id) }));
+      res.json({ templates: items });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.get('/api/console/check-in-templates/:id', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const t = getCheckInTemplate(req.params.id);
+    if (!t) { res.status(404).json({ error: 'template not found' }); return; }
+    res.json({ template: t, state: getTemplateState(t.id) });
+  });
+
+  app.post('/api/console/check-in-templates', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const body = req.body ?? {};
+    if (!body.name || !body.trigger || !body.questionTemplate) {
+      res.status(400).json({ error: 'name, trigger, questionTemplate required' }); return;
+    }
+    try {
+      const created = createCheckInTemplate({
+        name: body.name,
+        description: body.description,
+        agentSlug: body.agentSlug,
+        trigger: body.trigger as TriggerKind,
+        schedule: body.schedule,
+        blockedHours: body.blockedHours,
+        staleDays: body.staleDays,
+        inboxThreshold: body.inboxThreshold,
+        questionTemplate: body.questionTemplate,
+        urgency: body.urgency as CheckInUrgency,
+        cooldownHours: body.cooldownHours,
+        enabled: body.enabled === true,
+      });
+      res.json({ template: created });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.patch('/api/console/check-in-templates/:id', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const updated = updateCheckInTemplate(req.params.id, req.body ?? {});
+    if (!updated) { res.status(404).json({ error: 'template not found' }); return; }
+    res.json({ template: updated });
+  });
+
+  app.delete('/api/console/check-in-templates/:id', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const ok = deleteCheckInTemplate(req.params.id);
+    if (!ok) { res.status(404).json({ error: 'template not found' }); return; }
+    res.json({ deleted: true });
+  });
+
+  app.post('/api/console/check-in-templates/:id/test', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const bypassCooldown = req.body?.bypassCooldown === true;
+    const result = testFireTemplate(req.params.id, { bypassCooldown });
+    if (!result.ok) { res.status(400).json(result); return; }
+    res.json(result);
   });
 }

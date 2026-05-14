@@ -8,6 +8,7 @@ import { processAgentAutonomyV2 } from '../agents/autonomy-v2.js';
 import { processMonitors } from '../agents/monitors.js';
 import { getProactivityPolicySnapshot } from '../agents/proactivity-policy.js';
 import { processProactiveBriefs } from '../agents/proactive-briefs.js';
+import { ensureSeedTemplates, processProactiveCheckIns } from '../agents/check-in-templates.js';
 import { MODELS } from '../config.js';
 import { processExecutionController } from '../execution/controller.js';
 import { interruptStaleRunningBackgroundTasks, processBackgroundTasks } from '../execution/background-tasks.js';
@@ -457,6 +458,11 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
   if (interrupted > 0) {
     logger.warn({ interrupted }, 'Marked stale running background tasks as interrupted');
   }
+  // First-tick init: ensure built-in proactive check-in templates
+  // exist on disk (disabled). Re-runs are no-ops because the seeder
+  // skips seededIds it already created.
+  ensureSeedTemplates();
+
   logger.info('Daemon loop started');
 
   // Stagger monitor runs — don't run them every 15s tick
@@ -484,6 +490,16 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
       // the cadence as not-yet-due and skips that agent.
       await processAgentAutonomyV2();
       await processProactiveBriefs(assistant);
+      // Evaluate user-defined check-in templates — fires open
+      // questions through the existing check-in path when their
+      // trigger (schedule / condition) is hot and cooldown elapsed.
+      const checkInResult = processProactiveCheckIns();
+      if (checkInResult.fired.length > 0) {
+        logger.info({
+          fired: checkInResult.fired.length,
+          checkInIds: checkInResult.fired,
+        }, 'proactive check-in templates fired');
+      }
     } else if (tickCount % 20 === 0) {
       logger.info({
         enabled: proactivity.policy.enabled,
