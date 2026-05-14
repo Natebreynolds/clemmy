@@ -7,6 +7,7 @@ import { getOpenAiApiKey, MODELS } from '../config.js';
 import { getCoreTools } from '../tools/registry.js';
 import { createConfiguredMcpServers } from '../runtime/mcp-servers.js';
 import { autonomyV2OutputGuardrails } from './autonomy-guardrails.js';
+import { getProactivityPolicySnapshot, type ProactivityPolicy } from './proactivity-policy.js';
 import type { RuntimeContextValue } from '../types.js';
 import {
   AGENT_INBOX_DIR,
@@ -270,13 +271,63 @@ function buildAgentInput(agent: TeamAgentRecord, inboxItems: AgentInboxItem[], s
     ? `Existing commitments:\n- ${state.commitments.join('\n- ')}`
     : 'Existing commitments: none';
 
+  const policySnapshot = getProactivityPolicySnapshot();
+  const policyText = buildPolicyText(policySnapshot.policy);
+
   return [
     `Context date: ${today}`,
+    policyText,
     commitments,
     goalsText ? `Active goals (push these forward):\n${goalsText}` : '',
     `Pending inbox items:\n${inboxText}`,
     `Relevant open tasks:\n${taskText}`,
   ].filter(Boolean).join('\n\n');
+}
+
+/**
+ * Render the current proactivity policy as a short directive block the
+ * agent can read. Three knobs matter most to a cycle:
+ *
+ *   mode — sets the bar for taking action. Watch = observe and surface
+ *          only, balanced = act on clear signals, hands_on = drive
+ *          things forward proactively.
+ *
+ *   allowed action categories — gates entire tool families. Don't try
+ *          a Composio call if allowComposioActions=false; the call will
+ *          fail and waste a turn.
+ *
+ *   checkInMinutes — informs a reasonable followUpMinutes default when
+ *          the agent doesn't have a specific reason to wake sooner.
+ */
+export function buildPolicyText(policy: ProactivityPolicy): string {
+  const modeGuidance: Record<ProactivityPolicy['mode'], string> = {
+    watch:    'Watch mode: prefer noop and notify_user. Only take side-effecting actions when there is a clear, urgent reason.',
+    balanced: 'Balanced mode: act on clear signals. Don\'t force action when nothing useful is queued.',
+    hands_on: 'Hands-on mode: drive things forward. If a goal or task has stalled, take initiative this cycle.',
+  };
+
+  const allowedCategories: string[] = [];
+  if (policy.allowComputerActions) allowedCategories.push('local computer tools (files, shell, git)');
+  if (policy.allowComposioActions) allowedCategories.push('Composio external actions (Gmail, Slack, etc.)');
+  if (policy.allowDiscordCheckIns) allowedCategories.push('Discord notifications');
+
+  const blockedCategories: string[] = [];
+  if (!policy.allowComputerActions) blockedCategories.push('computer actions');
+  if (!policy.allowComposioActions) blockedCategories.push('Composio actions');
+  if (!policy.allowDiscordCheckIns) blockedCategories.push('Discord notifications');
+
+  const lines = [
+    'Operating policy:',
+    `- ${modeGuidance[policy.mode]}`,
+    `- Default check-in cadence: ${policy.checkInMinutes} minute(s). Use this for followUpMinutes when you have no better reason.`,
+  ];
+  if (allowedCategories.length > 0) {
+    lines.push(`- Allowed action categories: ${allowedCategories.join(', ')}.`);
+  }
+  if (blockedCategories.length > 0) {
+    lines.push(`- Blocked: ${blockedCategories.join(', ')}. Do not attempt tools in these categories — they will fail.`);
+  }
+  return lines.join('\n');
 }
 
 function buildAgentInstructions(agent: TeamAgentRecord): string {
