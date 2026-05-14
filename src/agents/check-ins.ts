@@ -33,6 +33,77 @@ import { addNotification } from '../runtime/notifications.js';
 export const CHECK_INS_DIR = path.join(BASE_DIR, 'check-ins');
 const AGENT_INBOX_DIR = path.join(BASE_DIR, 'agents-inbox');
 
+// -------- Question quality validator --------
+//
+// "I want check-ins that are accurate." That means: the agent should
+// not ask low-value questions. A good check-in question is specific,
+// references information only the user has, and gives the user enough
+// context to answer without re-reading the conversation.
+//
+// Rejected shapes:
+//  - Too short to be specific (under 20 chars)
+//  - Generic punts ("what should I do?", "is this ok?")
+//  - Yes/no questions under 50 chars (almost always answerable
+//    without asking — and the agent should make the call)
+//  - Trivial confirmations ("can I proceed?", "should I start?")
+
+const GENERIC_PUNT_PATTERNS = [
+  /^what\s+should\s+i\s+do\??$/i,
+  /^what\s+next\??$/i,
+  /^what\s+now\??$/i,
+  /^is\s+(this|that|it)\s+(ok|okay|fine|right)\s*\??$/i,
+  /^are\s+you\s+sure\??$/i,
+  /^should\s+i\s+(proceed|continue|go\s+ahead|start)\s*\??$/i,
+  /^can\s+i\s+(proceed|continue|go\s+ahead|start)\s*\??$/i,
+  /^do\s+you\s+want\s+me\s+to\s+(continue|proceed|start)\??$/i,
+];
+
+const YES_NO_LEADERS = /^(is|are|can|could|should|would|will|do|does|did|may|might)\s/i;
+
+export interface CheckInValidation {
+  ok: boolean;
+  reason?: string;
+}
+
+export function validateCheckInQuestion(question: string, contextSummary?: string): CheckInValidation {
+  const trimmed = question.trim();
+
+  // Generic-punt match runs first so the rejection reason is the most
+  // useful — "what should I do" is a punt regardless of length.
+  for (const pattern of GENERIC_PUNT_PATTERNS) {
+    if (pattern.test(trimmed)) {
+      return {
+        ok: false,
+        reason: `"${trimmed.slice(0, 60)}" is a generic punt — the user can\'t answer this usefully. Ask for the specific decision, value, or preference you need. Example: "Which Stripe account should I sync to: the personal one (acct_...) or the company one (acct_...)?"`,
+      };
+    }
+  }
+
+  if (trimmed.length < 20) {
+    return {
+      ok: false,
+      reason: 'Question is too short to be specific. Spell out what decision or information you need from the user, and why you can\'t determine it yourself.',
+    };
+  }
+
+  // Yes/no questions under 50 chars are almost always trivial. The
+  // agent should make the call itself or rephrase as a substantive ask.
+  if (YES_NO_LEADERS.test(trimmed) && trimmed.length < 50) {
+    return {
+      ok: false,
+      reason: 'Short yes/no question. Either make the call yourself or rephrase to ask for the substantive information you actually need (e.g. an option choice, a value, a constraint).',
+    };
+  }
+
+  // A useful check-in often carries context. If neither the question
+  // itself nor the contextSummary mentions a concrete thing (project,
+  // execution, decision), warn but don't block — agents need leeway
+  // for genuinely simple questions.
+  // (No rejection here; soft guidance lives in the tool description.)
+
+  return { ok: true };
+}
+
 export type CheckInUrgency = 'low' | 'normal' | 'high';
 export type CheckInStatus = 'open' | 'answered' | 'closed';
 

@@ -1,7 +1,7 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { addNotification } from '../runtime/notifications.js';
-import { answerCheckIn, closeCheckIn, createCheckIn, listOpenCheckIns } from '../agents/check-ins.js';
+import { answerCheckIn, closeCheckIn, createCheckIn, listOpenCheckIns, validateCheckInQuestion } from '../agents/check-ins.js';
 import { textResult } from './shared.js';
 
 /**
@@ -57,6 +57,10 @@ export function registerAutonomyActionTools(server: McpServer): void {
       contextSummary: z.string().max(600).optional().describe('One-sentence reminder of what you were working on so the user has context when they answer.'),
     },
     async ({ agentSlug, question, urgency, contextExecutionId, contextSummary }) => {
+      const quality = validateCheckInQuestion(question, contextSummary);
+      if (!quality.ok) {
+        return textResult(`Question rejected: ${quality.reason}`);
+      }
       try {
         const record = createCheckIn({ agentSlug, question, urgency, contextExecutionId, contextSummary });
         return textResult(`Check-in created: ${record.id}. The user has been notified; you'll see their answer in your next cycle's inbox.`);

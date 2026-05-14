@@ -19,6 +19,7 @@ const {
   listCheckIns,
   listOpenCheckIns,
   renderOpenCheckInsForAgent,
+  validateCheckInQuestion,
 } = await import('./check-ins.js');
 
 const INBOX_DIR = path.join(TEST_HOME, 'agents-inbox');
@@ -189,4 +190,62 @@ test('listCheckIns status="all" includes answered + closed', () => {
 
   const all = listCheckIns({ status: 'all' });
   assert.equal(all.length, 3);
+});
+
+// ---------- validateCheckInQuestion ----------
+
+test('validate: rejects question shorter than 20 chars', () => {
+  const r = validateCheckInQuestion('too short?');
+  assert.equal(r.ok, false);
+  assert.match(r.reason ?? '', /too short/i);
+});
+
+test('validate: rejects generic punts (what should I do)', () => {
+  for (const q of ['What should I do?', 'what should I do', 'What now?', 'What next?']) {
+    const r = validateCheckInQuestion(q);
+    assert.equal(r.ok, false, `expected reject for "${q}"`);
+    assert.match(r.reason ?? '', /generic punt/);
+  }
+});
+
+test('validate: rejects trivial confirmation requests', () => {
+  for (const q of ['Should I proceed?', 'Can I continue?', 'Do you want me to start?', 'Is this ok?', 'Are you sure?']) {
+    const r = validateCheckInQuestion(q);
+    assert.equal(r.ok, false, `expected reject for "${q}"`);
+  }
+});
+
+test('validate: rejects short yes/no questions', () => {
+  for (const q of ['Should I retry?', 'Can I delete it?', 'Are we good?', 'Is this final?']) {
+    const r = validateCheckInQuestion(q);
+    assert.equal(r.ok, false, `expected reject for "${q}"`);
+  }
+});
+
+test('validate: accepts a specific yes/no IF long enough to carry context', () => {
+  const r = validateCheckInQuestion('Should I publish the v0.2.0 release notes draft now, or wait until after the Friday demo?');
+  assert.equal(r.ok, true);
+});
+
+test('validate: accepts open-ended specific questions', () => {
+  const cases = [
+    'Which Stripe account should I sync transactions from?',
+    'What budget cap should I set for the embeddings backfill?',
+    'Which of the three pricing options aligns with our Q3 strategy?',
+  ];
+  for (const q of cases) {
+    const r = validateCheckInQuestion(q);
+    assert.equal(r.ok, true, `expected accept for "${q}"`);
+  }
+});
+
+test('validate: trims whitespace before checking length', () => {
+  const r = validateCheckInQuestion('   short?   ');
+  assert.equal(r.ok, false);
+});
+
+test('validate: trailing question mark is ignored for pattern matching', () => {
+  // Some generic patterns end in `?` optionally — make sure both forms reject.
+  assert.equal(validateCheckInQuestion('what should i do').ok, false);
+  assert.equal(validateCheckInQuestion('what should i do?').ok, false);
 });
