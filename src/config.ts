@@ -52,8 +52,37 @@ export function getRuntimeEnv(key: string, fallback = ''): string {
   return process.env[key] ?? currentEnv[key] ?? fallback;
 }
 
+/**
+ * Sync fallback reader for the file-backed secrets vault.
+ *
+ * The SecretStore (src/runtime/secrets) is the canonical async path,
+ * but legacy sync call sites can call into this helper for a no-await
+ * lookup. Reads the same JSON file the FileSecretBackend writes to
+ * (~/.clementine-next/state/secrets-vault.json). Returns undefined
+ * cleanly when absent or unreadable — never throws.
+ */
+function readSecretFromFileVaultSync(name: string): string | undefined {
+  const vaultPath = path.join(BASE_DIR, 'state', 'secrets-vault.json');
+  if (!existsSync(vaultPath)) return undefined;
+  try {
+    const parsed = JSON.parse(readFileSync(vaultPath, 'utf-8')) as { version?: string; entries?: Record<string, string> };
+    if (parsed.version !== 'v1' || !parsed.entries) return undefined;
+    const value = parsed.entries[name];
+    return value && value.length > 0 ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export function getOpenAiApiKey(): string {
-  return getRuntimeEnv('OPENAI_API_KEY', '');
+  // Env wins (highest priority for the sync path) → file vault → empty.
+  // The composite SecretStore implements the full keychain-first read
+  // order asynchronously; this sync helper keeps existing call sites
+  // working without forcing async refactors.
+  const fromEnv = getRuntimeEnv('OPENAI_API_KEY', '');
+  if (fromEnv) return fromEnv;
+  const fromFile = readSecretFromFileVaultSync('openai_api_key');
+  return fromFile ?? '';
 }
 
 export const ASSISTANT_NAME = getEnv('ASSISTANT_NAME', 'Clementine');
