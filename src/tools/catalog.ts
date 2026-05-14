@@ -20,6 +20,8 @@ export const LOCAL_MCP_TOOL_NAMES = [
   'session_pause',
   'session_resume',
   'discover_work',
+  'check_capability',
+  'list_capabilities',
   'goal_create',
   'goal_update',
   'goal_list',

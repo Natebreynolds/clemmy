@@ -50,6 +50,10 @@ const PLANNER_TOOL_NAMES = new Set<string>([
   'agent_runs_recent',
   'agent_run_get',
   'discover_work',
+  // Pre-flight capability detection so the planner can verify a CLI
+  // exists before writing steps that depend on it.
+  'check_capability',
+  'list_capabilities',
 ]);
 
 function filterToolsByNames<T extends { name?: string }>(tools: T[], allow: Set<string>): T[] {
@@ -95,6 +99,7 @@ export function buildPlannerAgent(): Agent<RuntimeContextValue, typeof PlanSchem
       'You are the Planner. Your job is to turn a user request into a clear, inspectable plan — nothing more.',
       'You DO NOT execute. You DO NOT mutate state. You produce a plan and return.',
       'Use read-only tools to gather context first when the request references existing work, files, goals, memory, or workspace state. Don\'t plan blind.',
+      'PRE-FLIGHT capability check: if your plan will use any external CLI (sf, gh, gcloud, aws, kubectl, stripe, vercel, fly, supabase, doctl, heroku, sfdx, docker, etc.), call `check_capability` for that CLI BEFORE writing steps that depend on it. If the capability is missing, do ONE of the following:\n  (a) Populate `needsUserInput` with a question like "I don\'t see the Salesforce CLI installed — want me to install it via npm install -g @salesforce/cli, or do you have it at a non-standard path?" and either skip those steps or make them conditional on the answer.\n  (b) If the install is low-friction and the user clearly wants it, include the install command as the first step (e.g. "brew install gh") and add the dependent steps after.\nDo NOT write steps that assume a missing CLI will magically work. The user should never approve a plan that\'s doomed at step 1.',
       'Steps must be concrete. Bad: "set up the integration." Good: "Read src/integrations/composio/client.ts to confirm the current auth path, then add a `refreshToken` handler that calls /oauth/refresh on 401."',
       'Group trivial steps. Don\'t list "open the file" as a step. The reader is another LLM — they know.',
       'Each step needs a rationale: why this step, in this order, right now. If you can\'t state the rationale, the step is filler — drop it.',
