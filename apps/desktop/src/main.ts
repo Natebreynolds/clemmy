@@ -3,6 +3,18 @@ import path from 'node:path';
 import os from 'node:os';
 import { existsSync, readFileSync } from 'node:fs';
 import { DaemonSupervisor, locateDaemonProjectRoot, type SupervisorEvent } from './daemon-supervisor.js';
+import { needsSetup, hasCompletedSetup, writeSetupComplete, type SetupConfiguredSummary } from './setup-state.js';
+import { createSetupWindow } from './setup-window.js';
+import {
+  deleteCredential,
+  ensureWebhookSecret,
+  isKeychainAvailable,
+  listCredentialRows,
+  resetAllCredentials,
+  setCredential,
+  type CredentialName,
+} from './credentials-bridge.js';
+import { addWorkspaceDir, ensureHomeEnv, saveUserProfile } from './setup-bridge.js';
 
 /**
  * Clementine Desktop — Electron main process.
@@ -42,6 +54,7 @@ const LOG_FILE = path.join(LOG_DIR, 'supervisor.log');
 let supervisor: DaemonSupervisor | null = null;
 let mainWindow: BrowserWindow | null = null;
 let splashWindow: BrowserWindow | null = null;
+let setupWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let dashboardUrl = '';
 
@@ -142,18 +155,46 @@ function createMainWindow(url: string): BrowserWindow {
   return win;
 }
 
+/**
+ * Generate a 22×22 tray icon at runtime — no shipped image asset
+ * required. Renders a filled circle (orange = active) on a transparent
+ * background. Uses an inline SVG → nativeImage.createFromDataURL.
+ */
+function buildTrayIcon(active: boolean): Electron.NativeImage {
+  const color = active ? '#ff5a35' : '#666c7a';
+  const dot = active ? '#b9ff36' : '#3a3f4a';
+  // 22x22 is the Electron-recommended template size for menubar icons
+  // on macOS retina. We use a colored variant (not template mode)
+  // because the operational aesthetic wants the accent colors visible.
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 22 22">
+    <circle cx="11" cy="11" r="9" fill="${color}" opacity="0.18" />
+    <circle cx="11" cy="11" r="6" fill="none" stroke="${color}" stroke-width="1.4" />
+    <circle cx="11" cy="11" r="2.6" fill="${dot}" />
+  </svg>`;
+  const dataUrl = 'data:image/svg+xml;base64,' + Buffer.from(svg, 'utf-8').toString('base64');
+  const image = nativeImage.createFromDataURL(dataUrl);
+  // Don't mark template — we want the color to appear (some platforms
+  // render template mode as monochrome-by-system-theme).
+  image.setTemplateImage(false);
+  return image;
+}
+
 function setupTray(): void {
-  // Bundled icon would be ideal; for now use a 16x16 transparent PNG
-  // so the tray slot is reserved without shipping image assets in the
-  // scaffold commit.
-  const empty = nativeImage.createEmpty();
-  tray = new Tray(empty);
-  tray.setTitle('● Clementine');
+  tray = new Tray(buildTrayIcon(false));
+  tray.setTitle(''); // keep the menubar quiet — icon does the work
+  tray.setToolTip('Clementine');
   rebuildTrayMenu();
+}
+
+function refreshTrayIcon(): void {
+  if (!tray) return;
+  const running = supervisor?.isRunning() ?? false;
+  tray.setImage(buildTrayIcon(running));
 }
 
 function rebuildTrayMenu(): void {
   if (!tray) return;
+  refreshTrayIcon();
   const running = supervisor?.isRunning() ?? false;
   const menu = Menu.buildFromTemplate([
     {
@@ -208,7 +249,51 @@ function showSupervisorEventNotification(event: SupervisorEvent): void {
   }
 }
 
+function preloadPath(): string {
+  return path.join(path.dirname(new URL(import.meta.url).pathname), 'preload.js');
+}
+
+/**
+ * Boot flow:
+ *   1. If first-run (no credentials, no setup-complete marker) →
+ *      open setup wizard window. Don't start the daemon yet — the
+ *      wizard writes credentials BEFORE the daemon reads them.
+ *   2. Otherwise → splash → daemon → dashboard window.
+ *
+ * The setup wizard's "complete" handler kicks off step 2 by calling
+ * launchDaemon() once credentials are persisted.
+ */
 async function boot(): Promise<void> {
+  // Make sure a WEBHOOK_SECRET exists before anything else — both the
+  // daemon and the dashboard URL need it. ensureWebhookSecret() reads
+  // env first, then falls back to generating a new one stored in the
+  // file vault (which the daemon's SecretStore reads at boot).
+  await ensureWebhookSecret();
+
+  if (needsSetup()) {
+    openSetupWindow();
+  } else {
+    await launchDaemon();
+  }
+}
+
+function openSetupWindow(): void {
+  setupWindow = createSetupWindow({
+    preloadPath: preloadPath(),
+    onComplete: async (record) => {
+      // The IPC handler already wrote the setup-complete marker and
+      // closed this window — this callback fires from the wizard's
+      // setupComplete IPC handler chain.
+      await launchDaemon();
+    },
+    onSkip: async () => {
+      await launchDaemon();
+    },
+  });
+  setupWindow.on('closed', () => { setupWindow = null; });
+}
+
+async function launchDaemon(): Promise<void> {
   splashWindow = createSplashWindow();
 
   const daemonRoot = locateDaemonProjectRoot();
@@ -269,6 +354,79 @@ ipcMain.handle('clemmy:tail-log', (_, maxLines?: number) => {
 ipcMain.handle('clemmy:open-logs', async () => {
   await shell.openPath(LOG_FILE);
   return { opened: true };
+});
+
+// ─── Setup wizard IPC handlers ─────────────────────────────────────
+
+ipcMain.handle('clemmy:setup-status', async () => ({
+  needsSetup: needsSetup(),
+  hasCompleted: hasCompletedSetup(),
+  hasKeychain: await isKeychainAvailable(),
+}));
+
+ipcMain.handle('clemmy:credentials-list', async () => {
+  const rows = await listCredentialRows();
+  return { rows };
+});
+
+ipcMain.handle('clemmy:credentials-set', async (_evt, payload: { name: string; value: string }) => {
+  const knownNames: CredentialName[] = [
+    'openai_api_key', 'discord_bot_token', 'composio_api_key',
+    'codex_oauth_access_token', 'codex_oauth_refresh_token', 'webhook_secret',
+  ];
+  if (!knownNames.includes(payload.name as CredentialName)) {
+    throw new Error('unknown credential name: ' + payload.name);
+  }
+  return setCredential(payload.name as CredentialName, payload.value);
+});
+
+ipcMain.handle('clemmy:credentials-delete', async (_evt, payload: { name: string }) => {
+  const knownNames: CredentialName[] = [
+    'openai_api_key', 'discord_bot_token', 'composio_api_key',
+    'codex_oauth_access_token', 'codex_oauth_refresh_token', 'webhook_secret',
+  ];
+  if (!knownNames.includes(payload.name as CredentialName)) {
+    throw new Error('unknown credential name: ' + payload.name);
+  }
+  await deleteCredential(payload.name as CredentialName);
+  return { ok: true };
+});
+
+ipcMain.handle('clemmy:credentials-reset', async () => {
+  return resetAllCredentials();
+});
+
+ipcMain.handle('clemmy:setup-save-workspace', async (_evt, payload: { path: string }) => {
+  const p = (payload?.path ?? '').trim();
+  if (!p) throw new Error('path required');
+  addWorkspaceDir(p);
+  return { ok: true };
+});
+
+ipcMain.handle('clemmy:setup-save-profile', async (_evt, patch) => {
+  saveUserProfile(patch);
+  return { ok: true };
+});
+
+ipcMain.handle('clemmy:setup-complete', async (_evt, record: { configured: SetupConfiguredSummary }) => {
+  writeSetupComplete({ configured: record.configured });
+  // Close the wizard, kick the daemon, transition to dashboard.
+  const win = setupWindow;
+  setupWindow = null;
+  win?.close();
+  await launchDaemon();
+  return { ok: true };
+});
+
+ipcMain.handle('clemmy:setup-skip', async () => {
+  writeSetupComplete({
+    configured: { auth: 'skipped', discord: false, composio: false, workspaceCount: 0, profileSet: false },
+  });
+  const win = setupWindow;
+  setupWindow = null;
+  win?.close();
+  await launchDaemon();
+  return { ok: true };
 });
 
 // ─── App lifecycle ─────────────────────────────────────────────────

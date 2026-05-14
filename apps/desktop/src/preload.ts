@@ -36,6 +36,23 @@ const api = {
     window.addEventListener('supervisor', handler as EventListener);
     return () => window.removeEventListener('supervisor', handler as EventListener);
   },
+
+  // ─── Setup wizard (only used by the first-run window) ──────────
+  /** First-run state — { needsSetup, hasKeychain }. */
+  setupStatus: () => ipcRenderer.invoke('clemmy:setup-status') as Promise<{ needsSetup: boolean; hasKeychain: boolean }>,
+  /** Per-credential listing for the dashboard / wizard. */
+  credentialsList: () => ipcRenderer.invoke('clemmy:credentials-list') as Promise<{ rows: Array<Record<string, unknown>> }>,
+  /** Write a credential through main → SecretStore (keychain when
+   *  packaged, file vault otherwise). */
+  credentialsSet: (name: string, value: string) => ipcRenderer.invoke('clemmy:credentials-set', { name, value }) as Promise<Record<string, unknown>>,
+  /** Persist a workspace path to ~/.clementine-next/.env's WORKSPACE_DIRS. */
+  setupSaveWorkspace: (absPath: string) => ipcRenderer.invoke('clemmy:setup-save-workspace', { path: absPath }) as Promise<{ ok: boolean }>,
+  /** Persist a profile patch to ~/.clementine-next/state/user-profile.json. */
+  setupSaveProfile: (patch: Record<string, unknown>) => ipcRenderer.invoke('clemmy:setup-save-profile', patch) as Promise<{ ok: boolean }>,
+  /** Wizard finished — close setup window, signal main to boot dashboard. */
+  setupComplete: (record: Record<string, unknown>) => ipcRenderer.invoke('clemmy:setup-complete', record) as Promise<{ ok: boolean }>,
+  /** Wizard skipped — close + boot dashboard anyway. */
+  setupSkip: () => ipcRenderer.invoke('clemmy:setup-skip') as Promise<{ ok: boolean }>,
 };
 
 contextBridge.exposeInMainWorld('clemmy', api);

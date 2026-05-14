@@ -1,0 +1,380 @@
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+
+/**
+ * Credentials bridge — the Electron main process's direct path to the
+ * SecretStore's storage primitives.
+ *
+ * In dev mode we could import the parent project's compiled
+ * SecretStore directly. In packaged-Electron mode, the daemon's
+ * compiled source may not be loadable as ESM from the Electron main
+ * process (different module resolution rules, separate compiled
+ * outputs). So this module re-implements just the bits the wizard
+ * needs against the SAME file format the daemon's SecretStore uses:
+ *
+ *   ~/.clementine-next/state/secrets-vault.json
+ *     { "version": "v1", "entries": { "<name>": "<value>", ... } }
+ *
+ *   ~/.clementine-next/state/secrets-meta.json
+ *     { "version": "v1", "entries": { "<name>": SecretMetadata, ... } }
+ *
+ * The daemon's SecretStore is the canonical reader/writer at runtime;
+ * the wizard writes through this module BEFORE the daemon boots so
+ * the daemon picks up the values on its first read. Once the wizard
+ * is done and the daemon is up, future credential edits flow through
+ * the dashboard's /api/console/credentials/* routes (which call into
+ * the daemon's SecretStore).
+ *
+ * Keychain integration: also lazily loads keytar with the same
+ * service name (com.clemmy.desktop.v1) so the packaged Electron app
+ * writes to keychain by default. Falls through to the file vault
+ * when keytar isn't available.
+ */
+
+const HOME = os.homedir();
+const STATE_DIR = path.join(HOME, '.clementine-next', 'state');
+const VAULT_FILE = path.join(STATE_DIR, 'secrets-vault.json');
+const META_FILE = path.join(STATE_DIR, 'secrets-meta.json');
+
+const KEYCHAIN_SERVICE = 'com.clemmy.desktop.v1';
+
+export type CredentialStatus = 'connected' | 'missing' | 'env_only' | 'unreadable' | 'needs_repair';
+export type CredentialSource = 'keychain' | 'file' | 'env' | 'missing';
+export type CredentialName =
+  | 'openai_api_key'
+  | 'discord_bot_token'
+  | 'composio_api_key'
+  | 'codex_oauth_access_token'
+  | 'codex_oauth_refresh_token'
+  | 'webhook_secret';
+
+export interface CredentialDescriptor {
+  name: CredentialName;
+  envVarName: string;
+  description: string;
+  setupHint?: string;
+  required: boolean;
+}
+
+export const KNOWN_CREDENTIALS: readonly CredentialDescriptor[] = [
+  { name: 'openai_api_key',  envVarName: 'OPENAI_API_KEY',  description: 'OpenAI API key — unlocks streaming runtime + embeddings + structured outputs.', setupHint: 'Starts with sk- — get one at platform.openai.com/api-keys', required: false },
+  { name: 'discord_bot_token', envVarName: 'DISCORD_BOT_TOKEN', description: 'Discord bot token — enables Clementine on Discord.', setupHint: 'Create at discord.com/developers/applications', required: false },
+  { name: 'composio_api_key', envVarName: 'COMPOSIO_API_KEY', description: 'Composio API key — Gmail / Slack / Notion / GitHub / Linear / Drive / CRMs.', setupHint: 'Sign up at composio.dev', required: false },
+  { name: 'codex_oauth_access_token', envVarName: '', description: 'Codex OAuth access token (ChatGPT subscribers).', required: false },
+  { name: 'codex_oauth_refresh_token', envVarName: '', description: 'Codex OAuth refresh token (paired with access).', required: false },
+  { name: 'webhook_secret', envVarName: 'WEBHOOK_SECRET', description: 'Dashboard auth secret (URL token).', setupHint: 'Auto-generated on first launch.', required: true },
+];
+
+interface VaultShape { version: 'v1'; entries: Record<string, string>; }
+interface MetaShape  { version: 'v1'; entries: Record<string, CredentialMetadata>; }
+
+export interface CredentialMetadata {
+  name: CredentialName;
+  source: CredentialSource;
+  status: CredentialStatus;
+  lastSetAt?: string;
+  lastError?: string;
+  version: 'v1';
+}
+
+// ─── Keychain (lazy keytar) ──────────────────────────────────────
+
+interface KeytarLike {
+  getPassword(service: string, account: string): Promise<string | null>;
+  setPassword(service: string, account: string, password: string): Promise<void>;
+  deletePassword(service: string, account: string): Promise<boolean>;
+  findCredentials(service: string): Promise<Array<{ account: string; password: string }>>;
+}
+
+let keytarPromise: Promise<KeytarLike | null> | null = null;
+
+async function loadKeytar(): Promise<KeytarLike | null> {
+  if (keytarPromise) return keytarPromise;
+  keytarPromise = (async () => {
+    try {
+      const specifier = 'keytar';
+      const mod = (await import(specifier as string)) as unknown as KeytarLike | { default: KeytarLike };
+      return ('getPassword' in (mod as object)) ? (mod as KeytarLike) : (mod as { default: KeytarLike }).default;
+    } catch {
+      return null;
+    }
+  })();
+  return keytarPromise;
+}
+
+export async function isKeychainAvailable(): Promise<boolean> {
+  return Boolean(await loadKeytar());
+}
+
+// ─── File vault primitives ───────────────────────────────────────
+
+function ensureStateDir(): void {
+  if (!existsSync(STATE_DIR)) mkdirSync(STATE_DIR, { recursive: true });
+}
+
+function readVault(): VaultShape {
+  if (!existsSync(VAULT_FILE)) return { version: 'v1', entries: {} };
+  try {
+    const parsed = JSON.parse(readFileSync(VAULT_FILE, 'utf-8'));
+    if (parsed && parsed.version === 'v1' && parsed.entries) return parsed as VaultShape;
+  } catch { /* fall through */ }
+  return { version: 'v1', entries: {} };
+}
+
+function writeVault(vault: VaultShape): void {
+  ensureStateDir();
+  const tmp = `${VAULT_FILE}.${process.pid}.tmp`;
+  writeFileSync(tmp, JSON.stringify(vault, null, 2), { encoding: 'utf-8', mode: 0o600 });
+  renameSync(tmp, VAULT_FILE);
+  try { chmodSync(VAULT_FILE, 0o600); } catch { /* ignore */ }
+}
+
+function readMeta(): MetaShape {
+  if (!existsSync(META_FILE)) return { version: 'v1', entries: {} };
+  try {
+    const parsed = JSON.parse(readFileSync(META_FILE, 'utf-8'));
+    if (parsed && parsed.version === 'v1' && parsed.entries) return parsed as MetaShape;
+  } catch { /* fall through */ }
+  return { version: 'v1', entries: {} };
+}
+
+function writeMeta(meta: MetaShape): void {
+  ensureStateDir();
+  const tmp = `${META_FILE}.${process.pid}.tmp`;
+  writeFileSync(tmp, JSON.stringify(meta, null, 2), { encoding: 'utf-8', mode: 0o600 });
+  renameSync(tmp, META_FILE);
+  try { chmodSync(META_FILE, 0o600); } catch { /* ignore */ }
+}
+
+function updateMeta(name: CredentialName, patch: Partial<CredentialMetadata>): CredentialMetadata {
+  const meta = readMeta();
+  const existing = meta.entries[name];
+  const updated: CredentialMetadata = {
+    ...(existing ?? {}),
+    ...patch,
+    name,
+    source: patch.source ?? existing?.source ?? 'missing',
+    status: patch.status ?? existing?.status ?? 'missing',
+    version: 'v1',
+  };
+  meta.entries[name] = updated;
+  writeMeta(meta);
+  return updated;
+}
+
+// ─── Env reader (read-only fallback) ─────────────────────────────
+
+function readEnvVar(name: string): string | undefined {
+  if (process.env[name] && process.env[name]!.length > 0) return process.env[name];
+  const candidates = [
+    path.join(HOME, '.clementine-next', '.env'),
+    path.join(HOME, 'clementine-next', '.env'),
+    path.join(process.cwd(), '.env'),
+  ];
+  for (const file of candidates) {
+    if (!existsSync(file)) continue;
+    try {
+      for (const line of readFileSync(file, 'utf-8').split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith('#')) continue;
+        const eq = trimmed.indexOf('=');
+        if (eq === -1) continue;
+        const k = trimmed.slice(0, eq);
+        if (k !== name) continue;
+        let v = trimmed.slice(eq + 1).trim();
+        if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
+        if (v.length > 0) return v;
+      }
+    } catch { /* keep looking */ }
+  }
+  return undefined;
+}
+
+// ─── Public API ──────────────────────────────────────────────────
+
+export interface CredentialRow {
+  name: CredentialName;
+  source: CredentialSource;
+  status: CredentialStatus;
+  hasValue: boolean;
+  lastSetAt?: string;
+  envFallbackAvailable: boolean;
+  envVarName: string;
+  description: string;
+  setupHint?: string;
+}
+
+export async function listCredentialRows(): Promise<CredentialRow[]> {
+  const rows: CredentialRow[] = [];
+  const keychain = await loadKeytar();
+  const vault = readVault();
+  for (const d of KNOWN_CREDENTIALS) {
+    let source: CredentialSource = 'missing';
+    let status: CredentialStatus = 'missing';
+    let hasValue = false;
+
+    if (keychain) {
+      try {
+        const value = await keychain.getPassword(KEYCHAIN_SERVICE, d.name);
+        if (value && value.length > 0) {
+          source = 'keychain'; status = 'connected'; hasValue = true;
+        }
+      } catch {
+        source = 'keychain'; status = 'unreadable';
+      }
+    }
+
+    if (!hasValue && status !== 'unreadable') {
+      const fileValue = vault.entries[d.name];
+      if (fileValue && fileValue.length > 0) {
+        source = 'file'; status = 'connected'; hasValue = true;
+      }
+    }
+
+    if (!hasValue && status !== 'unreadable' && d.envVarName) {
+      const envValue = readEnvVar(d.envVarName);
+      if (envValue) {
+        source = 'env'; status = 'env_only'; hasValue = true;
+      }
+    }
+
+    const meta = readMeta().entries[d.name];
+    const envFallbackAvailable = Boolean(d.envVarName && readEnvVar(d.envVarName));
+
+    rows.push({
+      name: d.name,
+      source,
+      status,
+      hasValue,
+      lastSetAt: meta?.lastSetAt,
+      envFallbackAvailable,
+      envVarName: d.envVarName,
+      description: d.description,
+      setupHint: d.setupHint,
+    });
+  }
+  return rows;
+}
+
+/** Write a credential to keychain (when available) or the file vault.
+ *  Readback-verified — never records "connected" without confirming
+ *  the value is fetchable from the destination. */
+export async function setCredential(name: CredentialName, value: string): Promise<CredentialMetadata> {
+  if (!value) throw new Error('empty value');
+  const keychain = await loadKeytar();
+  if (keychain) {
+    await keychain.setPassword(KEYCHAIN_SERVICE, name, value);
+    let confirmed: string | null = null;
+    try { confirmed = await keychain.getPassword(KEYCHAIN_SERVICE, name); }
+    catch { confirmed = null; }
+    if (confirmed === value) {
+      return updateMeta(name, {
+        source: 'keychain',
+        status: 'connected',
+        lastSetAt: new Date().toISOString(),
+        lastError: undefined,
+      });
+    }
+    return updateMeta(name, {
+      source: 'keychain',
+      status: 'needs_repair',
+      lastError: 'set succeeded but keychain readback returned a different value',
+    });
+  }
+
+  // Fallback to file vault.
+  const vault = readVault();
+  vault.entries[name] = value;
+  writeVault(vault);
+  const confirmed = readVault().entries[name];
+  if (confirmed === value) {
+    return updateMeta(name, {
+      source: 'file',
+      status: 'connected',
+      lastSetAt: new Date().toISOString(),
+      lastError: undefined,
+    });
+  }
+  return updateMeta(name, {
+    source: 'file',
+    status: 'needs_repair',
+    lastError: 'set succeeded but file vault readback returned a different value',
+  });
+}
+
+/** Delete from keychain + file vault. Never touches .env. */
+export async function deleteCredential(name: CredentialName): Promise<void> {
+  const keychain = await loadKeytar();
+  if (keychain) {
+    try { await keychain.deletePassword(KEYCHAIN_SERVICE, name); } catch { /* ignore */ }
+  }
+  if (existsSync(VAULT_FILE)) {
+    const vault = readVault();
+    if (name in vault.entries) {
+      delete vault.entries[name];
+      if (Object.keys(vault.entries).length === 0) {
+        try { unlinkSync(VAULT_FILE); } catch { /* ignore */ }
+      } else {
+        writeVault(vault);
+      }
+    }
+  }
+  const meta = readMeta();
+  delete meta.entries[name];
+  writeMeta(meta);
+}
+
+/** Reset every Clementine-owned credential storage location. NEVER
+ *  touches user .env files. Used by the dashboard's Reset flow and
+ *  by the wizard's "start over" option. */
+export async function resetAllCredentials(): Promise<{ keychainDeleted: string[]; fileVaultDeleted: boolean; metaDeleted: boolean }> {
+  const keychainDeleted: string[] = [];
+  const keychain = await loadKeytar();
+  if (keychain) {
+    try {
+      const entries = await keychain.findCredentials(KEYCHAIN_SERVICE);
+      for (const { account } of entries) {
+        try { await keychain.deletePassword(KEYCHAIN_SERVICE, account); keychainDeleted.push(account); }
+        catch { /* ignore individual failures */ }
+      }
+    } catch { /* whole listing failed */ }
+  }
+  let fileVaultDeleted = false;
+  if (existsSync(VAULT_FILE)) {
+    try { unlinkSync(VAULT_FILE); fileVaultDeleted = true; } catch { /* ignore */ }
+  }
+  let metaDeleted = false;
+  if (existsSync(META_FILE)) {
+    try { unlinkSync(META_FILE); metaDeleted = true; } catch { /* ignore */ }
+  }
+  return { keychainDeleted, fileVaultDeleted, metaDeleted };
+}
+
+/**
+ * Ensure a webhook secret exists. The dashboard requires one to render
+ * any URL. If neither env nor file vault has one, generate a fresh
+ * value and store it so the rest of boot can use it.
+ */
+export async function ensureWebhookSecret(): Promise<string> {
+  // Already in env? Use that.
+  const fromEnv = readEnvVar('WEBHOOK_SECRET');
+  if (fromEnv) return fromEnv;
+
+  // Already in vault? Use that.
+  const vault = readVault();
+  if (vault.entries.webhook_secret) return vault.entries.webhook_secret;
+
+  // Generate one.
+  const generated = randomToken(24);
+  await setCredential('webhook_secret', generated);
+  return generated;
+}
+
+function randomToken(len: number): string {
+  const bytes = Buffer.alloc(len);
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const crypto = require('node:crypto') as typeof import('node:crypto');
+  crypto.randomFillSync(bytes);
+  return bytes.toString('hex').slice(0, len);
+}
