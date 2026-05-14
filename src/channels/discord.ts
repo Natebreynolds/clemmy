@@ -39,6 +39,8 @@ import {
   requeueNotificationDelivery,
 } from '../runtime/notifications.js';
 import { buildDiscordInstallUrl } from './discord-install.js';
+import { approvePlanProposal, getPlanProposal, rejectPlanProposal } from '../agents/plan-proposals.js';
+import { WEBHOOK_PORT, WEBHOOK_SECRET } from '../config.js';
 
 const logger = pino({ name: 'clementine-next.discord' });
 
@@ -623,6 +625,41 @@ function buildNotificationActions(notificationId: string, read: boolean) {
   ];
 }
 
+function buildPlanProposalActions(planProposalId: string) {
+  return [
+    new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`${DISCORD_CUSTOM_ID_PREFIX}:plan-approve:${planProposalId}`)
+        .setLabel('Approve & Proceed')
+        .setStyle(ButtonStyle.Success),
+      new ButtonBuilder()
+        .setCustomId(`${DISCORD_CUSTOM_ID_PREFIX}:plan-reject:${planProposalId}`)
+        .setLabel('Reject')
+        .setStyle(ButtonStyle.Danger),
+      new ButtonBuilder()
+        .setCustomId(`${DISCORD_CUSTOM_ID_PREFIX}:plan-view:${planProposalId}`)
+        .setLabel('View / Edit in Dashboard')
+        .setStyle(ButtonStyle.Secondary),
+    ),
+  ];
+}
+
+/**
+ * Resolve which ActionRow to attach to an outbound notification, based
+ * on the notification's metadata. The notification queue tags
+ * approval-kind items with either `approvalId` (SDK interrupt) or
+ * `planProposalId` (Plan Proposal). When neither is present we send
+ * the plain notification — no buttons to click.
+ */
+export function buildActionsForNotification(metadata: Record<string, unknown> | undefined): ActionRowBuilder<ButtonBuilder>[] | undefined {
+  if (!metadata || typeof metadata !== 'object') return undefined;
+  const planProposalId = typeof metadata.planProposalId === 'string' ? metadata.planProposalId : undefined;
+  if (planProposalId) return buildPlanProposalActions(planProposalId);
+  const approvalId = typeof metadata.approvalId === 'string' ? metadata.approvalId : undefined;
+  if (approvalId) return buildApprovalActions(approvalId);
+  return undefined;
+}
+
 function relevantApprovalsForMessage(message: Message<boolean>, approvals: PendingApproval[]): PendingApproval[] {
   const channel = buildChannelLabel(message);
   const owned = approvals.filter((approval) => approval.userId === message.author.id || approval.channel === channel);
@@ -911,6 +948,57 @@ async function handleButtonInteraction(interaction: ButtonInteraction, assistant
       const result = await assistant.getRuntime().resolveApproval(targetId, approved);
       await interaction.reply({
         content: approvalResultText(result),
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (action === 'plan-approve') {
+      const result = approvePlanProposal(targetId);
+      if (!result) {
+        await interaction.reply({ content: `Plan \`${targetId}\` was not found or already resolved.`, ephemeral: true });
+        return;
+      }
+      await interaction.reply({
+        content: [
+          `✓ Plan approved: **${result.plan.objective}**`,
+          'A 15-minute auto-approval window is open. The agent will proceed without per-command interrupts.',
+        ].join('\n'),
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (action === 'plan-reject') {
+      const result = rejectPlanProposal(targetId, 'rejected via Discord button');
+      if (!result) {
+        await interaction.reply({ content: `Plan \`${targetId}\` was not found.`, ephemeral: true });
+        return;
+      }
+      await interaction.reply({
+        content: `✗ Plan rejected: **${result.plan.objective}**\nThe agent will not proceed with this plan.`,
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (action === 'plan-view') {
+      const proposal = getPlanProposal(targetId);
+      if (!proposal) {
+        await interaction.reply({ content: `Plan \`${targetId}\` was not found.`, ephemeral: true });
+        return;
+      }
+      // Deep link to the dashboard plan list. Token in querystring is the
+      // dashboard's existing auth pattern.
+      const tokenPart = WEBHOOK_SECRET ? `?token=${encodeURIComponent(WEBHOOK_SECRET)}` : '';
+      const url = `http://localhost:${WEBHOOK_PORT}/console${tokenPart}`;
+      await interaction.reply({
+        content: [
+          `**${proposal.plan.objective}**`,
+          `Complexity: ${proposal.plan.estimatedComplexity}; ${proposal.plan.steps.length} step(s).`,
+          `Open the dashboard to view full steps, success criteria, risks, and edit before approving:`,
+          url,
+        ].join('\n'),
         ephemeral: true,
       });
       return;
@@ -1400,15 +1488,51 @@ export async function sendDiscordChannelMessage(channelId: string, text: string)
   }
 }
 
-export async function sendDiscordDirectMessage(userId: string, text: string): Promise<void> {
+export async function sendDiscordDirectMessage(
+  userId: string,
+  text: string,
+  options: { components?: ActionRowBuilder<ButtonBuilder>[] } = {},
+): Promise<void> {
   if (!discordClient?.isReady()) {
     throw new Error('Discord client is not connected in this process.');
   }
 
   const user = await discordClient.users.fetch(userId);
   const dm = await user.createDM();
-  for (const chunk of splitMessage(text)) {
-    await dm.send(chunk);
+  const chunks = splitMessage(text);
+  // Attach the action row to the LAST chunk only — Discord renders the
+  // buttons under the message they're attached to, and we want them
+  // visible below the full notification body.
+  for (let i = 0; i < chunks.length; i++) {
+    const isLast = i === chunks.length - 1;
+    if (isLast && options.components && options.components.length > 0) {
+      await dm.send({ content: chunks[i], components: options.components });
+    } else {
+      await dm.send(chunks[i]);
+    }
+  }
+}
+
+export async function sendDiscordChannelMessageWithComponents(
+  channelId: string,
+  text: string,
+  components: ActionRowBuilder<ButtonBuilder>[],
+): Promise<void> {
+  if (!discordClient?.isReady()) {
+    throw new Error('Discord client is not connected in this process.');
+  }
+  const channel = await discordClient.channels.fetch(channelId);
+  if (!channel?.isTextBased() || !('send' in channel)) {
+    throw new Error(`Discord channel ${channelId} is not text-based.`);
+  }
+  const chunks = splitMessage(text);
+  for (let i = 0; i < chunks.length; i++) {
+    const isLast = i === chunks.length - 1;
+    if (isLast && components.length > 0) {
+      await channel.send({ content: chunks[i], components });
+    } else {
+      await channel.send(chunks[i]);
+    }
   }
 }
 
