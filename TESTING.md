@@ -23,8 +23,9 @@ npx tsx --test src/**/*.test.ts
 | `src/agents/autonomy-guardrails.test.ts` | 11 | every guardrail's pass and trip cases |
 | `src/agents/run-tracking.test.ts` | 9 | start / record / finish lifecycle, list filtering, slug extraction |
 | `src/agents/autonomy-v2.test.ts` | 37 | `AgentDecisionSchema` validation, `buildPolicyText` per mode + allowed/blocked categories + check-in cadence, `categorizeToolForPolicy` + `filterToolsByPolicy` (composio gate, computer gate, both gates), `buildPolicyEvent` shape + data fields + JSON-serializability, `parseToolArguments` (JSON object / array / quoted string / non-JSON / empty / fallback), `looksLikeToolError` (Error/Failed prefix, common error vocabulary, HTTP codes, false positives ruled out) |
+| `src/agents/check-ins.test.ts` | 17 | `createCheckIn` write + persistence + validation, `getCheckIn` / `listCheckIns` filters + sort, `answerCheckIn` lifecycle + inbox enqueue + idempotency, `closeCheckIn` lifecycle, `renderOpenCheckInsForAgent` for the agent input, deletion + status='all' filtering |
 
-Total: **79 tests, ~1s runtime**.
+Total: **96 tests, ~1.8s runtime**.
 
 ## Adding tests
 

@@ -8,6 +8,7 @@ import { getCoreTools } from '../tools/registry.js';
 import { createConfiguredMcpServers } from '../runtime/mcp-servers.js';
 import { autonomyV2OutputGuardrails } from './autonomy-guardrails.js';
 import { getProactivityPolicySnapshot, type ProactivityPolicy, type ProactivityPolicySnapshot } from './proactivity-policy.js';
+import { renderOpenCheckInsForAgent } from './check-ins.js';
 import type { RuntimeContextValue } from '../types.js';
 import {
   AGENT_INBOX_DIR,
@@ -274,12 +275,14 @@ function buildAgentInput(agent: TeamAgentRecord, inboxItems: AgentInboxItem[], s
 
   const policy = policyOverride ?? getProactivityPolicySnapshot().policy;
   const policyText = buildPolicyText(policy);
+  const checkInsText = renderOpenCheckInsForAgent(agent.slug);
 
   return [
     `Context date: ${today}`,
     policyText,
     commitments,
     goalsText ? `Active goals (push these forward):\n${goalsText}` : '',
+    checkInsText,
     `Pending inbox items:\n${inboxText}`,
     `Relevant open tasks:\n${taskText}`,
   ].filter(Boolean).join('\n\n');
@@ -370,12 +373,14 @@ function buildAgentInstructions(agent: TeamAgentRecord): string {
     [
       'How to act:',
       '- Use tools directly to take action this cycle. Do NOT describe actions in your output — execute them.',
-      '- `notify_user` for meaningful updates, blockers, or anything the user genuinely wants to know.',
+      '- `notify_user` for meaningful updates the user should see, but does NOT need to respond to.',
+      '- `ask_user_question` ONLY when you genuinely cannot proceed without information the user has and you do not. Never re-ask something already open — open check-ins are listed in your input.',
       '- `task_add` / `task_update` to manage the tasks file. `goal_update` to log progress or change goal status.',
       '- `note_take` to append context to today\'s daily note.',
       '- `memory_remember` for durable preferences, project context, or standing feedback that should carry across sessions.',
       '- `memory_recall` to look something up before deciding.',
       '- If there\'s nothing useful to do this cycle, take no action and say so in your summary.',
+      '- If you receive an inbox item of type `check_in_answered`, the user just answered a question you previously asked. Pick up where you left off and use the answer to make progress.',
     ].join('\n'),
     'Multi-agent comms (messaging, delegation, replies) is not available in v2 yet — for now, leave those to v1 by surfacing the intent in your summary so the user can act.',
     'Output: return only `summary`, `commitments`, and optional `followUpMinutes`. Be specific and brief.',
