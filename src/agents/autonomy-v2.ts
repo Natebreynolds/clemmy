@@ -11,6 +11,7 @@ import { getProactivityPolicySnapshot, type ProactivityPolicy, type ProactivityP
 import { renderOpenCheckInsForAgent } from './check-ins.js';
 import { activeExecutionCountForSession, renderActiveExecutionsForAgent } from '../tools/execution-tools.js';
 import { renderProfileForInstructions } from '../runtime/user-profile.js';
+import { defaultOrchestratorHandoffs, isOrchestratorSlug } from './sub-agents.js';
 import type { RuntimeContextValue } from '../types.js';
 import {
   AGENT_INBOX_DIR,
@@ -396,6 +397,7 @@ export function chooseFollowUpMinutes(
 }
 
 function buildAgentInstructions(agent: TeamAgentRecord): string {
+  const orchestrator = isOrchestratorSlug(agent.slug);
   return [
     `You are ${agent.name} (${agent.slug}), an autonomous agent inside Clementine.`,
     agent.role ? `Role: ${agent.role}` : '',
@@ -403,6 +405,13 @@ function buildAgentInstructions(agent: TeamAgentRecord): string {
     agent.project ? `Bound project: ${agent.project}` : '',
     `Personality and operating guidance:\n${agent.personality}`,
     'You are proactive. If goals or tasks have stagnated, take initiative.',
+    orchestrator ? [
+      'You are the orchestrator. Two sub-agents are available via handoff:',
+      '- Researcher: read-only information gatherer. Hand off when you need facts from memory, files, the workspace, or session history before deciding. It cannot mutate state.',
+      '- Executor: does work. Hand off when a decision is made and there is concrete work to perform (tasks, executions, file writes, shell commands, notifications).',
+      'When to hand off vs. act directly: simple single-step actions you can take yourself. Multi-step work, especially when it involves both information gathering AND mutation, benefits from a handoff so the sub-agent stays focused.',
+      'When handing off, give the sub-agent a clear, scoped objective. They return when their part is done — you can then hand off again, finish, or take a final action yourself.',
+    ].join('\n') : '',
     [
       'How to act:',
       '- Use tools directly to take action this cycle. Do NOT describe actions in your output — execute them.',
@@ -534,6 +543,13 @@ function getAgent(record: TeamAgentRecord, policy: ProactivityPolicy): AutonomyA
   const allTools = getCoreTools();
   const tools = filterToolsByPolicy(allTools, policy);
 
+  // Orchestrator agents get handoffs configured so they can delegate
+  // focused work to specialized sub-agents (researcher, executor) via
+  // the SDK's native handoff flow — no disk polling, all in one run.
+  // The primary `clementine` agent is the orchestrator by default;
+  // other slugs can opt in via AUTONOMY_ORCHESTRATOR_SLUGS env var.
+  const handoffs = isOrchestratorSlug(record.slug) ? defaultOrchestratorHandoffs() : undefined;
+
   const agent: AutonomyAgent = new Agent({
     name: record.name,
     instructions: buildAgentInstructions(record),
@@ -541,6 +557,7 @@ function getAgent(record: TeamAgentRecord, policy: ProactivityPolicy): AutonomyA
     outputType: AgentDecisionSchema,
     outputGuardrails: autonomyV2OutputGuardrails,
     tools,
+    handoffs,
     mcpServers: createConfiguredMcpServers(),
   });
 

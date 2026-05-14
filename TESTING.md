@@ -24,9 +24,11 @@ npx tsx --test src/**/*.test.ts
 | `src/agents/run-tracking.test.ts` | 9 | start / record / finish lifecycle, list filtering, slug extraction |
 | `src/agents/autonomy-v2.test.ts` | 44 | `AgentDecisionSchema` validation, `buildPolicyText` per mode + allowed/blocked categories + check-in cadence, `categorizeToolForPolicy` + `filterToolsByPolicy`, `buildPolicyEvent` shape + data fields + JSON-serializability, `parseToolArguments` (JSON object / array / quoted string / non-JSON / empty / fallback), `looksLikeToolError` (vocabulary, HTTP codes, false positives), `chooseFollowUpMinutes` (agent pick wins, floor at 5, hands_on=base, balanced=2x, watch=3x with 15-min floor, 60-min cap) |
 | `src/agents/check-ins.test.ts` | 17 | `createCheckIn` write + persistence + validation, `getCheckIn` / `listCheckIns` filters + sort, `answerCheckIn` lifecycle + inbox enqueue + idempotency, `closeCheckIn` lifecycle, `renderOpenCheckInsForAgent` for the agent input, deletion + status='all' filtering |
-| `src/runtime/user-profile.test.ts` | 15 | `loadUserProfile` defaults, `saveUserProfile` persistence + partial-patch behavior + updatedAt advance, `normalizeUserProfile` validation (tone / formality / urgency / working hours format / workingDays type-filter / notes clamp), `renderProfileForInstructions` per-tone / per-formality / per-urgency guidance + working hours + preferred name |
+| `src/runtime/user-profile.test.ts` | 15 | `loadUserProfile` defaults, `saveUserProfile` persistence + partial-patch behavior + updatedAt advance, `normalizeUserProfile` validation, `renderProfileForInstructions` per-tone / per-formality / per-urgency / working hours / preferred name |
+| `src/assistant/instructions.test.ts` | 11 | `renderChannelDirective` — Discord (terse, no headers, chunk), CLI, webhook, agent (suppressed), case-insensitivity, discord:* prefix matching, undefined fallback |
+| `src/agents/sub-agents.test.ts` | 12 | `isOrchestratorSlug` (clementine default, env var opt-in), researcher allowlist is read-only, executor includes write tools + ask_user_question, researcher CANNOT ask user, builders return configured Agents with `handoffDescription`, sub-agents have no nested handoffs |
 
-Total: **118 tests, ~1.4s runtime**.
+Total: **149 tests, ~1.5s runtime**.
 
 ## Adding tests
 
