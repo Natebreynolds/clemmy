@@ -513,26 +513,91 @@ function getAgent(record: TeamAgentRecord, policy: ProactivityPolicy): AutonomyA
   return agent;
 }
 
+/** Safe JSON parse for tool argument strings. Returns the parsed value
+ *  when possible, otherwise the original string (useful when the tool
+ *  was invoked with non-JSON input). */
+export function parseToolArguments(argString: unknown): unknown {
+  if (typeof argString !== 'string') return argString;
+  const trimmed = argString.trim();
+  if (!trimmed) return {};
+  if (trimmed[0] !== '{' && trimmed[0] !== '[' && trimmed[0] !== '"') return trimmed;
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return trimmed;
+  }
+}
+
+/** Heuristic: does a tool result look like an error? Used to flag the
+ *  event type so the dashboard can render it red without us needing
+ *  the SDK to surface a per-tool success bit. False positives are
+ *  fine — the data field still has the raw result for inspection. */
+export function looksLikeToolError(result: string): boolean {
+  if (!result) return false;
+  const head = result.slice(0, 200).toLowerCase();
+  if (head.startsWith('error') || head.startsWith('failed') || head.startsWith('failure')) return true;
+  if (/\b(unauthorized|forbidden|not[ _]?found|bad request|timeout|denied|exception|traceback)\b/.test(head)) return true;
+  if (/\b(401|403|404|429|500|502|503|504)\b/.test(head)) return true;
+  return false;
+}
+
+const TOOL_RESULT_PREVIEW_CHARS = 1000;
+const TOOL_ARGS_PREVIEW_CHARS = 600;
+
+function truncate(value: string, max: number): string {
+  return value.length <= max ? value : `${value.slice(0, max)}…(+${value.length - max} chars)`;
+}
+
 function attachToolHooks(agent: AutonomyAgent): void {
-  agent.on('agent_tool_start', (_ctx, _agent, toolInfo) => {
+  // AgentHooks signature: agent_tool_start = (context, tool, details).
+  // We previously had this typed as (ctx, agent, tool) which silently
+  // looked at the wrong field. Now we read tool.name and parse
+  // details.toolCall.arguments for the input.
+  agent.on('agent_tool_start', (_ctx, tool, details) => {
     const runId = currentRunIdByAgent.get(agent);
     if (!runId) return;
-    const name = (toolInfo as { name?: string } | undefined)?.name ?? 'tool';
+    const toolRef = tool as { name?: string } | undefined;
+    const callRef = (details as { toolCall?: { name?: string; arguments?: string } } | undefined)?.toolCall;
+    const name = toolRef?.name ?? callRef?.name ?? 'tool';
+    const args = parseToolArguments(callRef?.arguments);
+    let argsPreview: unknown = args;
+    if (typeof args === 'object' && args !== null) {
+      const json = JSON.stringify(args);
+      if (json.length > TOOL_ARGS_PREVIEW_CHARS) {
+        argsPreview = `${json.slice(0, TOOL_ARGS_PREVIEW_CHARS)}…(+${json.length - TOOL_ARGS_PREVIEW_CHARS} chars)`;
+      }
+    }
+
     addRunEvent(runId, {
       type: 'tool_started',
       message: `Tool: ${name}`,
-      data: { toolName: name },
+      data: { toolName: name, input: argsPreview },
     });
   });
 
-  agent.on('agent_tool_end', (_ctx, _agent, toolInfo) => {
+  // AgentHooks signature: agent_tool_end = (context, tool, result, details).
+  agent.on('agent_tool_end', (_ctx, tool, result, details) => {
     const runId = currentRunIdByAgent.get(agent);
     if (!runId) return;
-    const name = (toolInfo as { name?: string } | undefined)?.name ?? 'tool';
+    const toolRef = tool as { name?: string } | undefined;
+    const callRef = (details as { toolCall?: { name?: string } } | undefined)?.toolCall;
+    const name = toolRef?.name ?? callRef?.name ?? 'tool';
+    const resultStr = typeof result === 'string' ? result : (() => {
+      try { return JSON.stringify(result); } catch { return String(result); }
+    })();
+    const hasError = looksLikeToolError(resultStr);
+
     addRunEvent(runId, {
       type: 'status',
-      message: `Tool finished: ${name}`,
-      data: { toolName: name },
+      message: hasError
+        ? `Tool ERRORED: ${name} — ${resultStr.slice(0, 160)}`
+        : `Tool finished: ${name}`,
+      data: {
+        toolName: name,
+        result: truncate(resultStr, TOOL_RESULT_PREVIEW_CHARS),
+        resultChars: resultStr.length,
+        looksLikeError: hasError,
+      },
     });
   });
 

@@ -3,7 +3,15 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { AgentDecisionSchema, buildPolicyEvent, buildPolicyText, categorizeToolForPolicy, filterToolsByPolicy } from './autonomy-v2.js';
+import {
+  AgentDecisionSchema,
+  buildPolicyEvent,
+  buildPolicyText,
+  categorizeToolForPolicy,
+  filterToolsByPolicy,
+  looksLikeToolError,
+  parseToolArguments,
+} from './autonomy-v2.js';
 import { DEFAULT_PROACTIVITY_POLICY, type ProactivityPolicySnapshot } from './proactivity-policy.js';
 
 test('AgentDecisionSchema accepts the minimal valid shape', () => {
@@ -226,4 +234,68 @@ test('buildPolicyEvent: data is JSON-serializable (no functions, no circular ref
   // Throws on circular structure or non-serializable values.
   const roundtripped = JSON.parse(JSON.stringify(event.data));
   assert.equal(roundtripped.mode, event.data.mode);
+});
+
+// ---------- parseToolArguments ----------
+
+test('parseToolArguments: parses JSON-object string', () => {
+  const r = parseToolArguments('{"title":"hi","body":"there"}');
+  assert.deepEqual(r, { title: 'hi', body: 'there' });
+});
+
+test('parseToolArguments: parses JSON-array string', () => {
+  const r = parseToolArguments('[1, 2, 3]');
+  assert.deepEqual(r, [1, 2, 3]);
+});
+
+test('parseToolArguments: parses quoted JSON string', () => {
+  const r = parseToolArguments('"plain text"');
+  assert.equal(r, 'plain text');
+});
+
+test('parseToolArguments: returns original string when not JSON-shaped', () => {
+  assert.equal(parseToolArguments('not json'), 'not json');
+});
+
+test('parseToolArguments: returns empty object for empty string', () => {
+  assert.deepEqual(parseToolArguments(''), {});
+});
+
+test('parseToolArguments: returns input unchanged for non-string', () => {
+  const arr = [1, 2];
+  assert.equal(parseToolArguments(arr as unknown), arr);
+});
+
+test('parseToolArguments: falls back to string when JSON parse fails', () => {
+  const broken = '{this is not valid json';
+  assert.equal(parseToolArguments(broken), broken);
+});
+
+// ---------- looksLikeToolError ----------
+
+test('looksLikeToolError: flags strings starting with Error / Failed / Failure', () => {
+  assert.equal(looksLikeToolError('Error: file not found'), true);
+  assert.equal(looksLikeToolError('Failed to send'), true);
+  assert.equal(looksLikeToolError('failure during composio call'), true);
+});
+
+test('looksLikeToolError: flags common error vocabulary', () => {
+  for (const phrase of ['Unauthorized', 'forbidden', 'not found', 'bad request', 'timeout', 'denied', 'exception thrown', 'Traceback']) {
+    assert.equal(looksLikeToolError(phrase), true, `expected ${phrase} → true`);
+  }
+});
+
+test('looksLikeToolError: flags HTTP-error-shaped codes', () => {
+  for (const code of ['401', '403', '404', '429', '500', '503']) {
+    assert.equal(looksLikeToolError(`got ${code} from upstream`), true, `expected ${code} → true`);
+  }
+});
+
+test('looksLikeToolError: empty string is not an error', () => {
+  assert.equal(looksLikeToolError(''), false);
+});
+
+test('looksLikeToolError: ordinary success output is not flagged', () => {
+  assert.equal(looksLikeToolError('Notification queued: abc'), false);
+  assert.equal(looksLikeToolError('Remembered #5 (user): Nathan prefers concise replies.'), false);
 });
