@@ -482,6 +482,23 @@ export function renderConsoleHtml(token: string): string {
 
             <div class="settings-block">
               <div class="settings-block-head">
+                PROACTIVE CHECK-INS
+                <span class="creds-meta" data-checkins-meta>—</span>
+              </div>
+              <div class="checkins-intro">
+                Autonomous reach-outs the agent fires on a schedule or when a condition is true.
+                Five seeded templates are installed and disabled — toggle the ones you want active. Cooldown prevents repeat-firing.
+              </div>
+              <div class="checkins-list" data-checkins-list>
+                <div class="settings-info">— loading —</div>
+              </div>
+              <div class="checkins-actions">
+                <button class="checkins-btn-new" data-checkins-new>+ NEW TEMPLATE</button>
+              </div>
+            </div>
+
+            <div class="settings-block">
+              <div class="settings-block-head">
                 CREDENTIALS HEALTH
                 <span class="creds-meta" data-creds-meta>—</span>
               </div>
@@ -2133,6 +2150,160 @@ body {
 .settings-info .row .v.on { color: var(--accent-2); }
 .settings-info .row .v.off { color: var(--fg-mute); }
 
+/* ── Proactive Check-ins (Settings sub-block) ─────────────────── */
+.checkins-intro {
+  padding: 10px 16px;
+  font-size: 11px;
+  color: var(--fg-2);
+  line-height: 1.55;
+  border-bottom: 1px solid var(--line);
+}
+.checkins-list {
+  display: flex;
+  flex-direction: column;
+}
+.checkin-row {
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--line);
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 10px;
+  align-items: center;
+}
+.checkin-row:last-child { border-bottom: 0; }
+.checkin-row .checkin-main { min-width: 0; }
+.checkin-row .checkin-name {
+  font-size: 12px;
+  color: var(--fg);
+  letter-spacing: 0.02em;
+}
+.checkin-row .checkin-meta {
+  margin-top: 4px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  color: var(--fg-3);
+}
+.checkin-row .checkin-meta .pill {
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  padding: 1px 6px;
+  border: 1px solid var(--line);
+}
+.checkin-row .checkin-meta .pill.trigger-schedule { color: var(--accent-3); border-color: var(--accent-3); }
+.checkin-row .checkin-meta .pill.trigger-execution_blocked { color: var(--accent-fail); border-color: var(--accent-fail); }
+.checkin-row .checkin-meta .pill.trigger-goal_stale { color: var(--accent-warn); border-color: var(--accent-warn); }
+.checkin-row .checkin-meta .pill.trigger-inbox_backed_up { color: var(--accent); border-color: var(--accent); }
+.checkin-row .checkin-desc {
+  margin-top: 6px;
+  font-size: 10px;
+  color: var(--fg-mute);
+  line-height: 1.5;
+  font-style: italic;
+}
+
+.checkin-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  align-items: stretch;
+  min-width: 130px;
+}
+.checkin-actions button {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  padding: 5px 10px;
+  cursor: pointer;
+  transition: background 100ms, color 100ms, border-color 100ms;
+}
+.checkin-actions button:hover { color: var(--fg); border-color: var(--line-bright); }
+.checkin-actions .toggle.on { color: var(--accent-2); border-color: var(--accent-2); }
+.checkin-actions .toggle.off { color: var(--fg-mute); }
+.checkin-actions .test { color: var(--accent-3); border-color: var(--accent-3); }
+.checkin-actions .test:hover { background: var(--accent-3); color: var(--bg-0); }
+.checkin-actions .edit { color: var(--accent); border-color: var(--accent); }
+.checkin-actions .edit:hover { background: var(--accent); color: var(--bg-0); }
+.checkin-actions .del { color: var(--accent-fail); border-color: var(--accent-fail); }
+.checkin-actions .del:hover { background: var(--accent-fail); color: var(--bg-0); }
+
+.checkin-editor {
+  grid-column: 1 / -1;
+  margin-top: 10px;
+  padding: 12px;
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  display: grid;
+  gap: 8px;
+}
+.checkin-editor label {
+  display: block;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  color: var(--fg-3);
+  margin-bottom: 4px;
+}
+.checkin-editor input,
+.checkin-editor select,
+.checkin-editor textarea {
+  width: 100%;
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  color: var(--fg);
+  font: inherit;
+  font-size: 11px;
+  padding: 6px 8px;
+  outline: none;
+}
+.checkin-editor input:focus, .checkin-editor select:focus, .checkin-editor textarea:focus { border-color: var(--accent); }
+.checkin-editor textarea { resize: vertical; min-height: 56px; }
+.checkin-editor .row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+.checkin-editor .editor-buttons {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+}
+.checkin-editor .editor-buttons button {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  padding: 6px 10px;
+  cursor: pointer;
+}
+.checkin-editor .editor-buttons .save { color: var(--accent-2); border-color: var(--accent-2); }
+.checkin-editor .editor-buttons .save:hover { background: var(--accent-2); color: var(--bg-0); }
+.checkin-editor .editor-buttons .cancel { color: var(--fg-3); }
+
+.checkins-actions {
+  padding: 12px 16px;
+  border-top: 1px solid var(--line);
+  background: var(--bg-1);
+}
+.checkins-btn-new {
+  background: transparent;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  padding: 6px 12px;
+  cursor: pointer;
+  transition: background 100ms, color 100ms;
+}
+.checkins-btn-new:hover { background: var(--accent); color: var(--bg-0); }
+
 /* ── Credentials Health (Settings sub-block) ──────────────────── */
 .creds-meta {
   margin-left: auto;
@@ -3510,10 +3681,223 @@ const CONSOLE_JS = `
 
       renderAuthInfo(s.auth);
       renderMemoryInfo(s.memory);
+      await refreshCheckIns();
       await refreshCredentialsHealth();
     } catch (err) {
       sett.authBox.innerHTML = '<div style="color:var(--accent-fail);">Failed to load settings: ' + escMem(err.message || err) + '</div>';
     }
+  }
+
+  // ─── Proactive check-ins (Settings sub-block) ─────────────────
+
+  let editingTemplateId = null;
+  let editingNew = false;
+
+  async function refreshCheckIns() {
+    const listEl = document.querySelector('[data-checkins-list]');
+    const metaEl = document.querySelector('[data-checkins-meta]');
+    if (!listEl || !metaEl) return;
+    try {
+      const data = await fetchJSON('/api/console/check-in-templates');
+      const items = data.templates || [];
+      const enabled = items.filter((t) => t.enabled).length;
+      metaEl.textContent = items.length + ' templates · ' + enabled + ' enabled';
+      if (items.length === 0) {
+        listEl.innerHTML = '<div class="settings-info">— no templates yet · click + NEW TEMPLATE to create one —</div>';
+        return;
+      }
+      listEl.innerHTML = items.map((t) => {
+        const state = t.state || {};
+        const lastFired = state.lastFiredAt ? state.lastFiredAt.slice(0, 16).replace('T', ' ') : 'never';
+        const triggerDetail = t.trigger === 'schedule'
+          ? ('cron: ' + escMem(t.schedule || '—'))
+          : t.trigger === 'execution_blocked' ? ('>' + (t.blockedHours ?? 24) + 'h blocked')
+          : t.trigger === 'goal_stale' ? ('>' + (t.staleDays ?? 7) + 'd stale')
+          : t.trigger === 'inbox_backed_up' ? ('>=' + (t.inboxThreshold ?? 10) + ' open') : '';
+        const editor = editingTemplateId === t.id ? renderEditor(t) : '';
+        return [
+          '<div class="checkin-row" data-checkin-row="' + escMem(t.id) + '">',
+          '  <div class="checkin-main">',
+          '    <div class="checkin-name">' + escMem(t.name) + '</div>',
+          '    <div class="checkin-meta">',
+          '      <span class="pill trigger-' + escMem(t.trigger) + '">' + escMem(t.trigger.toUpperCase().replace('_', ' ')) + '</span>',
+          '      <span>' + escMem(triggerDetail) + '</span>',
+          '      <span>cooldown ' + (t.cooldownHours ?? 0) + 'h</span>',
+          '      <span>last fired: ' + escMem(lastFired) + '</span>',
+          '      <span>urgency: ' + escMem(t.urgency) + '</span>',
+          '    </div>',
+          t.description ? '    <div class="checkin-desc">' + escMem(t.description) + '</div>' : '',
+          '  </div>',
+          '  <div class="checkin-actions">',
+          '    <button class="toggle ' + (t.enabled ? 'on' : 'off') + '" data-toggle="' + escMem(t.id) + '">' + (t.enabled ? '● ENABLED' : '○ DISABLED') + '</button>',
+          '    <button class="test" data-test="' + escMem(t.id) + '">TEST FIRE ⌗</button>',
+          '    <button class="edit" data-edit="' + escMem(t.id) + '">EDIT ✎</button>',
+          '    <button class="del" data-del="' + escMem(t.id) + '">DELETE ▣</button>',
+          '  </div>',
+               editor,
+          '</div>',
+        ].join('');
+      }).join('');
+
+      if (editingNew) {
+        listEl.insertAdjacentHTML('beforeend', renderEditor(null));
+      }
+
+      bindCheckInActions();
+    } catch (err) {
+      listEl.innerHTML = '<div class="settings-info" style="color:var(--accent-fail);">Failed: ' + escMem(err.message || err) + '</div>';
+    }
+  }
+
+  function renderEditor(t) {
+    const v = t || {
+      name: '', description: '', trigger: 'schedule',
+      schedule: '0 9 * * 1', blockedHours: 24, staleDays: 7, inboxThreshold: 10,
+      questionTemplate: '', urgency: 'normal', cooldownHours: 12,
+    };
+    return [
+      '<div class="checkin-editor" data-editor-for="' + escMem(t ? t.id : 'new') + '">',
+      '  <div><label>NAME</label><input type="text" data-f="name" value="' + escMem(v.name) + '" /></div>',
+      '  <div><label>DESCRIPTION</label><input type="text" data-f="description" value="' + escMem(v.description) + '" /></div>',
+      '  <div class="row">',
+      '    <div><label>TRIGGER</label><select data-f="trigger">',
+           ['schedule','execution_blocked','goal_stale','inbox_backed_up'].map((opt) =>
+             '<option value="' + opt + '"' + (v.trigger === opt ? ' selected' : '') + '>' + opt + '</option>'
+           ).join(''),
+      '    </select></div>',
+      '    <div><label>URGENCY</label><select data-f="urgency">',
+           ['low','normal','high'].map((opt) => '<option value="' + opt + '"' + (v.urgency === opt ? ' selected' : '') + '>' + opt + '</option>').join(''),
+      '    </select></div>',
+      '  </div>',
+      '  <div class="row">',
+      '    <div><label>SCHEDULE (cron, when trigger=schedule)</label><input type="text" data-f="schedule" value="' + escMem(v.schedule || '0 9 * * 1') + '" placeholder="0 9 * * 1" /></div>',
+      '    <div><label>COOLDOWN (HOURS)</label><input type="number" data-f="cooldownHours" value="' + (v.cooldownHours ?? 12) + '" /></div>',
+      '  </div>',
+      '  <div class="row">',
+      '    <div><label>BLOCKED HOURS (execution_blocked)</label><input type="number" data-f="blockedHours" value="' + (v.blockedHours ?? 24) + '" /></div>',
+      '    <div><label>STALE DAYS / INBOX THRESHOLD</label><input type="number" data-f="staleDays" value="' + (v.staleDays ?? v.inboxThreshold ?? 7) + '" /></div>',
+      '  </div>',
+      '  <div><label>QUESTION TEMPLATE</label><textarea data-f="questionTemplate" rows="3" placeholder="What is on your plate this week?">' + escMem(v.questionTemplate) + '</textarea></div>',
+      '  <div class="editor-buttons">',
+      '    <button class="save" data-save="' + escMem(t ? t.id : 'new') + '">' + (t ? 'SAVE' : 'CREATE') + '</button>',
+      '    <button class="cancel" data-cancel="' + escMem(t ? t.id : 'new') + '">CANCEL</button>',
+      '  </div>',
+      '</div>',
+    ].join('');
+  }
+
+  function bindCheckInActions() {
+    const root = document.querySelector('[data-checkins-list]');
+    if (!root) return;
+
+    root.querySelectorAll('[data-toggle]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const id = btn.getAttribute('data-toggle');
+        const isOn = btn.classList.contains('on');
+        try {
+          await fetch(withToken('/api/console/check-in-templates/' + encodeURIComponent(id)), {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ enabled: !isOn }),
+          });
+          await refreshCheckIns();
+        } catch (err) { alert('Toggle failed: ' + (err.message || err)); }
+      });
+    });
+    root.querySelectorAll('[data-test]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const id = btn.getAttribute('data-test');
+        if (!confirm('Fire this template now (bypassing cooldown)?\\nThe agent will create an open check-in immediately.')) return;
+        try {
+          const r = await fetch(withToken('/api/console/check-in-templates/' + encodeURIComponent(id) + '/test'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ bypassCooldown: true }),
+          });
+          const j = await r.json();
+          if (j.ok) alert('Fired. Check-in id: ' + j.checkInId);
+          else alert('Fire failed: ' + (j.reason || r.status));
+          await refreshCheckIns();
+        } catch (err) { alert('Fire failed: ' + (err.message || err)); }
+      });
+    });
+    root.querySelectorAll('[data-edit]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        editingTemplateId = btn.getAttribute('data-edit');
+        editingNew = false;
+        refreshCheckIns();
+      });
+    });
+    root.querySelectorAll('[data-del]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const id = btn.getAttribute('data-del');
+        if (!confirm('Delete this template? This cannot be undone.')) return;
+        try {
+          await fetch(withToken('/api/console/check-in-templates/' + encodeURIComponent(id)), { method: 'DELETE' });
+          await refreshCheckIns();
+        } catch (err) { alert('Delete failed: ' + (err.message || err)); }
+      });
+    });
+    root.querySelectorAll('[data-cancel]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        editingTemplateId = null;
+        editingNew = false;
+        refreshCheckIns();
+      });
+    });
+    root.querySelectorAll('[data-save]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const id = btn.getAttribute('data-save');
+        const editor = root.querySelector('[data-editor-for="' + id + '"]');
+        if (!editor) return;
+        const patch = {};
+        editor.querySelectorAll('[data-f]').forEach((el) => {
+          const field = el.getAttribute('data-f');
+          if (el.type === 'number') {
+            const n = parseInt(el.value, 10);
+            if (Number.isFinite(n)) patch[field] = n;
+          } else {
+            patch[field] = el.value;
+          }
+        });
+        // Normalize staleDays vs inboxThreshold based on trigger
+        if (patch.trigger === 'inbox_backed_up' && patch.staleDays !== undefined) {
+          patch.inboxThreshold = patch.staleDays;
+          delete patch.staleDays;
+        }
+
+        try {
+          if (id === 'new') {
+            if (!patch.name || !patch.questionTemplate) { alert('name + question required'); return; }
+            const r = await fetch(withToken('/api/console/check-in-templates'), {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(patch),
+            });
+            if (!r.ok) { const j = await r.json().catch(() => ({})); alert('Create failed: ' + (j.error || r.status)); return; }
+            editingNew = false;
+          } else {
+            await fetch(withToken('/api/console/check-in-templates/' + encodeURIComponent(id)), {
+              method: 'PATCH',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(patch),
+            });
+            editingTemplateId = null;
+          }
+          await refreshCheckIns();
+        } catch (err) { alert('Save failed: ' + (err.message || err)); }
+      });
+    });
+  }
+
+  // Top-level new-template button
+  const newCheckInBtn = document.querySelector('[data-checkins-new]');
+  if (newCheckInBtn) {
+    newCheckInBtn.addEventListener('click', () => {
+      editingNew = true;
+      editingTemplateId = null;
+      refreshCheckIns();
+    });
   }
 
   async function refreshCredentialsHealth() {
