@@ -9,6 +9,7 @@ import { createConfiguredMcpServers } from '../runtime/mcp-servers.js';
 import { autonomyV2OutputGuardrails } from './autonomy-guardrails.js';
 import { getProactivityPolicySnapshot, type ProactivityPolicy, type ProactivityPolicySnapshot } from './proactivity-policy.js';
 import { renderOpenCheckInsForAgent } from './check-ins.js';
+import { activeExecutionCountForSession, renderActiveExecutionsForAgent } from '../tools/execution-tools.js';
 import type { RuntimeContextValue } from '../types.js';
 import {
   AGENT_INBOX_DIR,
@@ -276,12 +277,14 @@ function buildAgentInput(agent: TeamAgentRecord, inboxItems: AgentInboxItem[], s
   const policy = policyOverride ?? getProactivityPolicySnapshot().policy;
   const policyText = buildPolicyText(policy);
   const checkInsText = renderOpenCheckInsForAgent(agent.slug);
+  const executionsText = renderActiveExecutionsForAgent(`agent:${agent.slug}`);
 
   return [
     `Context date: ${today}`,
     policyText,
     commitments,
     goalsText ? `Active goals (push these forward):\n${goalsText}` : '',
+    executionsText,
     checkInsText,
     `Pending inbox items:\n${inboxText}`,
     `Relevant open tasks:\n${taskText}`,
@@ -362,6 +365,33 @@ export function buildPolicyEvent(snapshot: ProactivityPolicySnapshot): {
   };
 }
 
+/**
+ * Decide the cycle's effective followUpMinutes. The agent's explicit
+ * pick always wins. When the agent omitted one AND there are active
+ * executions in flight, pick a tighter window than the user-configured
+ * cadence so the work compounds toward completion. With nothing
+ * active, return undefined → fall back to the agent's `cadenceMinutes`.
+ */
+export function chooseFollowUpMinutes(
+  agentChoice: number | undefined,
+  activeExecutionCount: number,
+  policy: ProactivityPolicy,
+): number | undefined {
+  if (typeof agentChoice === 'number' && agentChoice >= 5) {
+    return Math.max(5, agentChoice);
+  }
+  if (activeExecutionCount <= 0) return undefined;
+
+  // With work in flight, lean on the user's checkInMinutes setting but
+  // floor at 5 (the schema floor) and ceiling at 60 (don't hammer when
+  // mode=watch even if there's open work).
+  const base = Math.max(5, Math.min(60, policy.checkInMinutes ?? 5));
+  if (policy.mode === 'hands_on') return base;
+  if (policy.mode === 'balanced') return Math.max(base, base * 2);
+  // watch: even with active work, don't churn
+  return Math.max(base * 3, 15);
+}
+
 function buildAgentInstructions(agent: TeamAgentRecord): string {
   return [
     `You are ${agent.name} (${agent.slug}), an autonomous agent inside Clementine.`,
@@ -373,8 +403,10 @@ function buildAgentInstructions(agent: TeamAgentRecord): string {
     [
       'How to act:',
       '- Use tools directly to take action this cycle. Do NOT describe actions in your output — execute them.',
+      '- If you have active executions, your primary job each cycle is to ADVANCE them. Call `execution_update_step` after making progress; `execution_complete` when success criteria are met. Compound progress across cycles instead of starting over.',
       '- `notify_user` for meaningful updates the user should see, but does NOT need to respond to.',
       '- `ask_user_question` ONLY when you genuinely cannot proceed without information the user has and you do not. Never re-ask something already open — open check-ins are listed in your input.',
+      '- `execution_mark_blocked` when something external blocks you. If a user answer would unblock it, ALSO call `ask_user_question` with the contextExecutionId so the cycle resumes when they answer.',
       '- `task_add` / `task_update` to manage the tasks file. `goal_update` to log progress or change goal status.',
       '- `note_take` to append context to today\'s daily note.',
       '- `memory_remember` for durable preferences, project context, or standing feedback that should carry across sessions.',
@@ -673,6 +705,15 @@ async function runAgentCycleV2(record: TeamAgentRecord): Promise<{ runId: string
     });
 
     markInboxProcessed(record.slug, inboxItems.map((item) => item.id));
+
+    // When the agent is actively driving an execution, default to a
+    // tighter follow-up window than the user-configured cadence. This
+    // is the "never stops until done" knob — work in flight keeps
+    // waking up. Only applied when the agent didn't pick a specific
+    // followUpMinutes itself.
+    const activeExecs = activeExecutionCountForSession(`agent:${record.slug}`);
+    const effectiveFollowUp = chooseFollowUpMinutes(decision.followUpMinutes, activeExecs, policy);
+
     saveAgentState({
       slug: record.slug,
       engine: 'v2',
@@ -681,8 +722,8 @@ async function runAgentCycleV2(record: TeamAgentRecord): Promise<{ runId: string
       lastWakeReasons: wakeReasons,
       lastSummary: decision.summary,
       commitments: decision.commitments.slice(0, 8),
-      nextWakeAt: decision.followUpMinutes
-        ? new Date(Date.now() + Math.max(5, decision.followUpMinutes) * 60_000).toISOString()
+      nextWakeAt: effectiveFollowUp
+        ? new Date(Date.now() + effectiveFollowUp * 60_000).toISOString()
         : undefined,
     });
 

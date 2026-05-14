@@ -8,6 +8,7 @@ import {
   buildPolicyEvent,
   buildPolicyText,
   categorizeToolForPolicy,
+  chooseFollowUpMinutes,
   filterToolsByPolicy,
   looksLikeToolError,
   parseToolArguments,
@@ -298,4 +299,47 @@ test('looksLikeToolError: empty string is not an error', () => {
 test('looksLikeToolError: ordinary success output is not flagged', () => {
   assert.equal(looksLikeToolError('Notification queued: abc'), false);
   assert.equal(looksLikeToolError('Remembered #5 (user): Nathan prefers concise replies.'), false);
+});
+
+// ---------- chooseFollowUpMinutes ----------
+
+test('chooseFollowUpMinutes: agent explicit pick wins', () => {
+  const r = chooseFollowUpMinutes(42, 0, DEFAULT_PROACTIVITY_POLICY);
+  assert.equal(r, 42);
+});
+
+test('chooseFollowUpMinutes: floors agent pick at 5', () => {
+  const r = chooseFollowUpMinutes(2, 5, DEFAULT_PROACTIVITY_POLICY);
+  // Below schema floor → discarded, fall through to active-exec logic
+  // which uses checkInMinutes (3 default). 3 < 5 floor → 5. Then
+  // balanced multiplies by 2 → 10.
+  assert.equal(r, 10);
+});
+
+test('chooseFollowUpMinutes: no agent pick, no active execs → undefined (cadence applies)', () => {
+  const r = chooseFollowUpMinutes(undefined, 0, DEFAULT_PROACTIVITY_POLICY);
+  assert.equal(r, undefined);
+});
+
+test('chooseFollowUpMinutes: hands_on with active execs uses checkInMinutes directly', () => {
+  const r = chooseFollowUpMinutes(undefined, 1, { ...DEFAULT_PROACTIVITY_POLICY, mode: 'hands_on', checkInMinutes: 7 });
+  assert.equal(r, 7);
+});
+
+test('chooseFollowUpMinutes: balanced with active execs doubles the cadence', () => {
+  const r = chooseFollowUpMinutes(undefined, 1, { ...DEFAULT_PROACTIVITY_POLICY, mode: 'balanced', checkInMinutes: 6 });
+  assert.equal(r, 12);
+});
+
+test('chooseFollowUpMinutes: watch with active execs triples (or 15 min floor)', () => {
+  const r1 = chooseFollowUpMinutes(undefined, 1, { ...DEFAULT_PROACTIVITY_POLICY, mode: 'watch', checkInMinutes: 6 });
+  assert.equal(r1, 18);
+  // checkInMinutes=3 → base=5 (floored), 5*3=15. floor kicks in.
+  const r2 = chooseFollowUpMinutes(undefined, 1, { ...DEFAULT_PROACTIVITY_POLICY, mode: 'watch', checkInMinutes: 3 });
+  assert.equal(r2, 15);
+});
+
+test('chooseFollowUpMinutes: caps at 60 even with high checkInMinutes', () => {
+  const r = chooseFollowUpMinutes(undefined, 1, { ...DEFAULT_PROACTIVITY_POLICY, mode: 'hands_on', checkInMinutes: 999 });
+  assert.equal(r, 60);
 });
