@@ -433,6 +433,7 @@ function buildAgentInstructions(agent: TeamAgentRecord, policy: ProactivityPolic
       '- `note_take` to append context to today\'s daily note.',
       '- `memory_remember` for durable preferences, project context, or standing feedback that should carry across sessions.',
       '- `memory_recall` to look something up before deciding.',
+      '- `propose_check_in_template` when you notice a recurring rhythm in the user\'s work (weekly deploys, daily standups, monthly reviews) or a condition that should trigger a future nudge. DO NOT auto-install — the user approves from Settings → Proactive Check-Ins. Always include a clear `rationale` referencing the specific pattern you observed.',
       '- If there\'s nothing useful to do this cycle, take no action and say so in your summary.',
       '- If you receive an inbox item of type `check_in_answered`, the user just answered a question you previously asked. Pick up where you left off and use the answer to make progress.',
     ].join('\n'),

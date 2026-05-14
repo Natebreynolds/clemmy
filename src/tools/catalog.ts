@@ -58,6 +58,7 @@ export const LOCAL_MCP_TOOL_NAMES = [
   'ask_user_question',
   'list_pending_check_ins',
   'answer_check_in',
+  'propose_check_in_template',
   'execution_list',
   'execution_get',
   'execution_update_step',

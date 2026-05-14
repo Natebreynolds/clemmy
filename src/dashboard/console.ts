@@ -482,6 +482,19 @@ export function renderConsoleHtml(token: string): string {
 
             <div class="settings-block">
               <div class="settings-block-head">
+                PROPOSED BY AGENT
+                <span class="creds-meta" data-proposals-meta>—</span>
+              </div>
+              <div class="proposals-intro">
+                Templates the agent drafted from patterns it noticed. Review the rationale, then approve, edit, or reject. Approved proposals are installed as live templates.
+              </div>
+              <div class="proposals-list" data-proposals-list>
+                <div class="settings-info">— no pending proposals —</div>
+              </div>
+            </div>
+
+            <div class="settings-block">
+              <div class="settings-block-head">
                 PROACTIVE CHECK-INS
                 <span class="creds-meta" data-checkins-meta>—</span>
               </div>
@@ -2304,6 +2317,130 @@ body {
 }
 .checkins-btn-new:hover { background: var(--accent); color: var(--bg-0); }
 
+/* ── Agent-drafted proposals (Settings sub-block) ─────────────── */
+.proposals-intro {
+  padding: 10px 16px;
+  font-size: 11px;
+  color: var(--fg-2);
+  line-height: 1.55;
+  border-bottom: 1px solid var(--line);
+}
+.proposals-list {
+  display: flex;
+  flex-direction: column;
+}
+.proposal-row {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background:
+    linear-gradient(180deg, rgba(255, 170, 80, 0.04) 0%, transparent 28%),
+    var(--bg-1);
+  border-left: 2px solid var(--accent);
+}
+.proposal-row:last-child { border-bottom: 0; }
+.proposal-head { display: flex; flex-direction: column; gap: 4px; }
+.proposal-name {
+  font-size: 12px;
+  color: var(--fg);
+  letter-spacing: 0.02em;
+}
+.proposal-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  color: var(--fg-3);
+}
+.proposal-meta .pill {
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  padding: 1px 6px;
+  border: 1px solid var(--line);
+}
+.proposal-meta .pill.trigger-schedule { color: var(--accent-3); border-color: var(--accent-3); }
+.proposal-meta .pill.trigger-execution_blocked { color: var(--accent-fail); border-color: var(--accent-fail); }
+.proposal-meta .pill.trigger-goal_stale { color: var(--accent-warn); border-color: var(--accent-warn); }
+.proposal-meta .pill.trigger-inbox_backed_up { color: var(--accent); border-color: var(--accent); }
+
+.proposal-label {
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  color: var(--accent);
+  margin-right: 6px;
+}
+.proposal-rationale,
+.proposal-question,
+.proposal-desc {
+  font-size: 11px;
+  color: var(--fg-2);
+  line-height: 1.5;
+}
+.proposal-question { color: var(--fg); }
+.proposal-desc { color: var(--fg-mute); font-style: italic; }
+
+.proposal-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 2px;
+}
+.proposal-actions button {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  padding: 6px 12px;
+  cursor: pointer;
+  transition: background 100ms, color 100ms, border-color 100ms;
+}
+.proposal-actions .proposal-btn-approve { color: var(--accent-2); border-color: var(--accent-2); }
+.proposal-actions .proposal-btn-approve:hover { background: var(--accent-2); color: var(--bg-0); }
+.proposal-actions .proposal-btn-edit { color: var(--accent); border-color: var(--accent); }
+.proposal-actions .proposal-btn-edit:hover { background: var(--accent); color: var(--bg-0); }
+.proposal-actions .proposal-btn-reject { color: var(--accent-fail); border-color: var(--accent-fail); }
+.proposal-actions .proposal-btn-reject:hover { background: var(--accent-fail); color: var(--bg-0); }
+
+.proposal-editor {
+  margin-top: 4px;
+  padding: 12px;
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  display: grid;
+  gap: 8px;
+}
+.proposal-editor label {
+  display: block;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  color: var(--fg-3);
+  margin-bottom: 4px;
+}
+.proposal-editor input,
+.proposal-editor select,
+.proposal-editor textarea {
+  width: 100%;
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  color: var(--fg);
+  font: inherit;
+  font-size: 11px;
+  padding: 6px 8px;
+  outline: none;
+}
+.proposal-editor input:focus, .proposal-editor select:focus, .proposal-editor textarea:focus { border-color: var(--accent); }
+.proposal-editor textarea { resize: vertical; min-height: 48px; }
+.proposal-editor .row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
 /* ── Credentials Health (Settings sub-block) ──────────────────── */
 .creds-meta {
   margin-left: auto;
@@ -3681,11 +3818,146 @@ const CONSOLE_JS = `
 
       renderAuthInfo(s.auth);
       renderMemoryInfo(s.memory);
+      await refreshProposals();
       await refreshCheckIns();
       await refreshCredentialsHealth();
     } catch (err) {
       sett.authBox.innerHTML = '<div style="color:var(--accent-fail);">Failed to load settings: ' + escMem(err.message || err) + '</div>';
     }
+  }
+
+  // ─── Agent-drafted check-in proposals ─────────────────────────
+
+  async function refreshProposals() {
+    const listEl = document.querySelector('[data-proposals-list]');
+    const metaEl = document.querySelector('[data-proposals-meta]');
+    if (!listEl || !metaEl) return;
+    try {
+      const data = await fetchJSON('/api/console/check-in-proposals?status=pending');
+      const items = data.proposals || [];
+      metaEl.textContent = items.length === 0
+        ? 'no proposals'
+        : items.length + ' awaiting review';
+      if (items.length === 0) {
+        listEl.innerHTML = '<div class="settings-info">— no pending proposals · agent will propose new templates as it spots patterns —</div>';
+        return;
+      }
+      listEl.innerHTML = items.map((p) => {
+        const proposedAt = (p.proposedAt || '').slice(0, 16).replace('T', ' ');
+        const triggerDetail = p.trigger === 'schedule'
+          ? ('cron: ' + escMem(p.schedule || '—'))
+          : p.trigger === 'execution_blocked' ? ('>' + (p.blockedHours ?? 24) + 'h blocked')
+          : p.trigger === 'goal_stale' ? ('>' + (p.staleDays ?? 7) + 'd stale')
+          : p.trigger === 'inbox_backed_up' ? ('>=' + (p.inboxThreshold ?? 10) + ' open') : '';
+        const editMode = p.id === editingProposalId;
+        return [
+          '<div class="proposal-row" data-proposal-row="' + escMem(p.id) + '">',
+          '  <div class="proposal-head">',
+          '    <div class="proposal-name">' + escMem(p.name) + '</div>',
+          '    <div class="proposal-meta">',
+          '      <span class="pill trigger-' + escMem(p.trigger) + '">' + escMem(p.trigger.toUpperCase().replace(/_/g, ' ')) + '</span>',
+          '      <span>' + escMem(triggerDetail) + '</span>',
+          '      <span>urgency: ' + escMem(p.urgency || 'normal') + '</span>',
+          '      <span>proposed ' + escMem(proposedAt) + '</span>',
+          '    </div>',
+          '  </div>',
+          '  <div class="proposal-rationale"><span class="proposal-label">RATIONALE</span> ' + escMem(p.rationale) + '</div>',
+          '  <div class="proposal-question"><span class="proposal-label">QUESTION</span> ' + escMem(p.questionTemplate) + '</div>',
+          p.description ? '  <div class="proposal-desc"><span class="proposal-label">DESC</span> ' + escMem(p.description) + '</div>' : '',
+          editMode ? renderProposalEditor(p) : '',
+          '  <div class="proposal-actions">',
+          '    <button class="proposal-btn-approve" data-proposal-approve="' + escMem(p.id) + '">APPROVE & INSTALL ✓</button>',
+          '    <button class="proposal-btn-edit" data-proposal-edit="' + escMem(p.id) + '">' + (editMode ? 'CANCEL EDIT' : 'EDIT BEFORE APPROVE ✎') + '</button>',
+          '    <button class="proposal-btn-reject" data-proposal-reject="' + escMem(p.id) + '">REJECT ▣</button>',
+          '  </div>',
+          '</div>',
+        ].join('');
+      }).join('');
+
+      bindProposalActions();
+    } catch (err) {
+      listEl.innerHTML = '<div class="settings-info" style="color:var(--accent-fail);">Failed: ' + escMem(err.message || err) + '</div>';
+    }
+  }
+
+  let editingProposalId = null;
+
+  function renderProposalEditor(p) {
+    return [
+      '<div class="proposal-editor" data-proposal-editor-for="' + escMem(p.id) + '">',
+      '  <div><label>NAME</label><input type="text" data-pf="name" value="' + escMem(p.name) + '" /></div>',
+      '  <div><label>QUESTION TEMPLATE</label><textarea data-pf="questionTemplate" rows="2">' + escMem(p.questionTemplate) + '</textarea></div>',
+      '  <div class="row">',
+      '    <div><label>SCHEDULE (cron)</label><input type="text" data-pf="schedule" value="' + escMem(p.schedule || '') + '" /></div>',
+      '    <div><label>COOLDOWN (HOURS)</label><input type="number" data-pf="cooldownHours" value="' + (p.cooldownHours ?? 12) + '" /></div>',
+      '  </div>',
+      '  <div><label>URGENCY</label><select data-pf="urgency">',
+           ['low','normal','high'].map((opt) => '<option value="' + opt + '"' + ((p.urgency || 'normal') === opt ? ' selected' : '') + '>' + opt + '</option>').join(''),
+      '  </select></div>',
+      '</div>',
+    ].join('');
+  }
+
+  function bindProposalActions() {
+    const root = document.querySelector('[data-proposals-list]');
+    if (!root) return;
+
+    root.querySelectorAll('[data-proposal-edit]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const id = btn.getAttribute('data-proposal-edit');
+        editingProposalId = editingProposalId === id ? null : id;
+        refreshProposals();
+      });
+    });
+
+    root.querySelectorAll('[data-proposal-approve]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const id = btn.getAttribute('data-proposal-approve');
+        const editor = root.querySelector('[data-proposal-editor-for="' + id + '"]');
+        const overrides = {};
+        if (editor) {
+          editor.querySelectorAll('[data-pf]').forEach((el) => {
+            const field = el.getAttribute('data-pf');
+            if (el.type === 'number') {
+              const n = parseInt(el.value, 10);
+              if (Number.isFinite(n)) overrides[field] = n;
+            } else if (el.value !== '') {
+              overrides[field] = el.value;
+            }
+          });
+        }
+        try {
+          const r = await fetch(withToken('/api/console/check-in-proposals/' + encodeURIComponent(id) + '/approve'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ overrides, enabledOnInstall: true }),
+          });
+          if (!r.ok) {
+            const j = await r.json().catch(() => ({}));
+            alert('Approve failed: ' + (j.error || r.status));
+            return;
+          }
+          editingProposalId = null;
+          await refreshProposals();
+          await refreshCheckIns();
+        } catch (err) { alert('Approve failed: ' + (err.message || err)); }
+      });
+    });
+
+    root.querySelectorAll('[data-proposal-reject]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const id = btn.getAttribute('data-proposal-reject');
+        const reason = prompt('Reason for rejecting? (optional — helps the agent learn)') || '';
+        try {
+          await fetch(withToken('/api/console/check-in-proposals/' + encodeURIComponent(id) + '/reject'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ reason }),
+          });
+          await refreshProposals();
+        } catch (err) { alert('Reject failed: ' + (err.message || err)); }
+      });
+    });
   }
 
   // ─── Proactive check-ins (Settings sub-block) ─────────────────

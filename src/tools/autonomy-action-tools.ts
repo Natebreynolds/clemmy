@@ -2,6 +2,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { addNotification } from '../runtime/notifications.js';
 import { answerCheckIn, closeCheckIn, createCheckIn, listOpenCheckIns, validateCheckInQuestion } from '../agents/check-ins.js';
+import { proposeCheckInTemplate } from '../agents/check-in-proposals.js';
 import { textResult } from './shared.js';
 
 /**
@@ -108,6 +109,52 @@ export function registerAutonomyActionTools(server: McpServer): void {
       if (!resolved) return textResult(`No check-in found with id ${id}.`);
       if (resolved.status !== 'answered') return textResult(`Check-in ${id} was already in status ${resolved.status} — no change.`);
       return textResult(`Check-in ${id} answered. The agent (${resolved.agentSlug}) will pick this up on its next cycle.`);
+    },
+  );
+
+  server.tool(
+    'propose_check_in_template',
+    [
+      'Propose a NEW autonomous check-in template the user can approve.',
+      'Use when you notice a recurring rhythm in the user\'s work — weekly deploys,',
+      'daily standups, monthly reviews, or a condition that should trigger a nudge.',
+      'You DO NOT auto-install the template — the user reviews and approves from',
+      'Settings → Proactive Check-Ins. Frame the rationale clearly: what pattern',
+      'you noticed, why this template would help, when it would fire.',
+      '',
+      'Trigger kinds:',
+      '  - schedule          → fires on a 5-field cron expression (e.g. "0 9 * * 1" = Mon 9am)',
+      '  - execution_blocked → fires when a tracked execution has been blocked > blockedHours',
+      '  - goal_stale        → fires when a goal has not been updated in > staleDays',
+      '  - inbox_backed_up   → fires when open check-ins count >= inboxThreshold',
+    ].join(' '),
+    {
+      name: z.string().min(3).max(80),
+      description: z.string().max(400).optional(),
+      trigger: z.enum(['schedule', 'execution_blocked', 'goal_stale', 'inbox_backed_up']),
+      schedule: z.string().optional(),
+      blockedHours: z.number().int().min(1).max(720).optional(),
+      staleDays: z.number().int().min(1).max(365).optional(),
+      inboxThreshold: z.number().int().min(1).max(100).optional(),
+      questionTemplate: z.string().min(8).max(800).describe(
+        'The question shown to the user. Supports {{summary}}, {{date}}, {{time}}, {{executionTitle}}, {{blocker}}, {{goalTitle}}, {{count}} placeholders.',
+      ),
+      urgency: z.enum(['low', 'normal', 'high']).optional(),
+      cooldownHours: z.number().int().min(0).max(720).optional(),
+      rationale: z.string().min(8).max(800).describe('Explain WHY you think this template would help. Reference the specific pattern you saw.'),
+    },
+    async (input) => {
+      try {
+        const proposal = proposeCheckInTemplate(input);
+        return textResult([
+          `Proposal queued: ${proposal.id}.`,
+          `Name: ${proposal.name}`,
+          `Trigger: ${proposal.trigger}${proposal.schedule ? ` (cron: ${proposal.schedule})` : ''}`,
+          'The user has been notified and can approve from Settings → Proactive Check-Ins.',
+        ].join('\n'));
+      } catch (err) {
+        return textResult(`Propose failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
     },
   );
 }

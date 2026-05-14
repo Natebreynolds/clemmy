@@ -31,6 +31,13 @@ import {
   updateCheckInTemplate,
   type TriggerKind,
 } from '../agents/check-in-templates.js';
+import {
+  approveProposal,
+  deleteProposal,
+  getProposal,
+  listProposals,
+  rejectProposal,
+} from '../agents/check-in-proposals.js';
 import type { CheckInUrgency } from '../agents/check-ins.js';
 
 /**
@@ -851,5 +858,57 @@ export function registerConsoleRoutes(
     const result = testFireTemplate(req.params.id, { bypassCooldown });
     if (!result.ok) { res.status(400).json(result); return; }
     res.json(result);
+  });
+
+  // ─── Agent-drafted check-in proposals ──────────────────────────
+
+  app.get('/api/console/check-in-proposals', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const status = typeof req.query.status === 'string' ? req.query.status : undefined;
+    const wanted = (status === 'pending' || status === 'approved' || status === 'rejected' || status === 'all')
+      ? status : 'pending';
+    try {
+      const items = listProposals({ status: wanted, limit: 50 });
+      res.json({ proposals: items });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.get('/api/console/check-in-proposals/:id', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const p = getProposal(req.params.id);
+    if (!p) { res.status(404).json({ error: 'proposal not found' }); return; }
+    res.json({ proposal: p });
+  });
+
+  app.post('/api/console/check-in-proposals/:id/approve', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const body = req.body ?? {};
+    try {
+      const result = approveProposal(req.params.id, {
+        overrides: body.overrides && typeof body.overrides === 'object' ? body.overrides : undefined,
+        enabledOnInstall: typeof body.enabledOnInstall === 'boolean' ? body.enabledOnInstall : true,
+      });
+      if (!result) { res.status(404).json({ error: 'proposal not found or already resolved' }); return; }
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/check-in-proposals/:id/reject', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const reason = typeof req.body?.reason === 'string' ? req.body.reason : undefined;
+    const result = rejectProposal(req.params.id, reason);
+    if (!result) { res.status(404).json({ error: 'proposal not found' }); return; }
+    res.json({ proposal: result });
+  });
+
+  app.delete('/api/console/check-in-proposals/:id', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const ok = deleteProposal(req.params.id);
+    if (!ok) { res.status(404).json({ error: 'proposal not found' }); return; }
+    res.json({ deleted: true });
   });
 }
