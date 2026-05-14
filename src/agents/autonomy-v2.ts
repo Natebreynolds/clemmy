@@ -310,6 +310,14 @@ type AutonomyAgent = Agent<RuntimeContextValue, typeof AgentDecisionSchema>;
 const agentCache = new Map<string, { record: TeamAgentRecord; agent: AutonomyAgent }>();
 let runner: Runner | null = null;
 
+/**
+ * WeakMap from Agent instance → active runId for the current cycle.
+ * Hooks attached to a cached Agent read this to know which run to log
+ * into. Per-slug cycles run in parallel safely because each slug has
+ * its own cached Agent instance.
+ */
+const currentRunIdByAgent: WeakMap<AutonomyAgent, string> = new WeakMap();
+
 function getRunner(): Runner {
   if (runner) return runner;
   const key = getOpenAiApiKey();
@@ -346,15 +354,46 @@ function getAgent(record: TeamAgentRecord): AutonomyAgent {
     mcpServers: createConfiguredMcpServers(),
   });
 
-  // Per-tool lifecycle hooks (agent_tool_start, agent_tool_end) are
-  // intentionally not wired here in Phase 1. They require careful
-  // runId-per-cycle bookkeeping when agents run in parallel. The
-  // start / finish / decision events captured by the cycle function
-  // give us enough diagnostic surface for now. Phase 1.5 adds tool
-  // hooks via a runId-by-slug map.
+  // Per-tool lifecycle hooks. Resolve the active runId via WeakMap so
+  // parallel cycles for different agents stay isolated — each slug has
+  // its own cached Agent instance and its own WeakMap entry.
+  attachToolHooks(agent);
 
   agentCache.set(record.slug, { record, agent });
   return agent;
+}
+
+function attachToolHooks(agent: AutonomyAgent): void {
+  agent.on('agent_tool_start', (_ctx, _agent, toolInfo) => {
+    const runId = currentRunIdByAgent.get(agent);
+    if (!runId) return;
+    const name = (toolInfo as { name?: string } | undefined)?.name ?? 'tool';
+    addRunEvent(runId, {
+      type: 'tool_started',
+      message: `Tool: ${name}`,
+      data: { toolName: name },
+    });
+  });
+
+  agent.on('agent_tool_end', (_ctx, _agent, toolInfo) => {
+    const runId = currentRunIdByAgent.get(agent);
+    if (!runId) return;
+    const name = (toolInfo as { name?: string } | undefined)?.name ?? 'tool';
+    addRunEvent(runId, {
+      type: 'status',
+      message: `Tool finished: ${name}`,
+      data: { toolName: name },
+    });
+  });
+
+  agent.on('agent_end', (_ctx, output) => {
+    const runId = currentRunIdByAgent.get(agent);
+    if (!runId) return;
+    addRunEvent(runId, {
+      type: 'status',
+      message: `Agent finished (${typeof output === 'string' ? `${output.length} chars` : 'structured output'}).`,
+    });
+  });
 }
 
 // -------- Main cycle --------
@@ -387,10 +426,11 @@ async function runAgentCycleV2(record: TeamAgentRecord): Promise<{ runId: string
     message: `wake=${wakeReasons.join(',')} inbox=${inboxItems.length}`,
   });
 
-  try {
-    const agent = getAgent(record);
-    const input = buildAgentInput(record, inboxItems, state);
+  const agent = getAgent(record);
+  const input = buildAgentInput(record, inboxItems, state);
+  currentRunIdByAgent.set(agent, runId);
 
+  try {
     const result = await getRunner().run(agent, input, {
       context: { sessionId: `agent:${record.slug}`, userId: record.slug, channel: 'agent' },
       maxTurns: 8,
@@ -443,6 +483,10 @@ async function runAgentCycleV2(record: TeamAgentRecord): Promise<{ runId: string
     });
     finishRun(runId, { status: 'failed', message, error: message });
     return { runId, success: false, outcomes: [], error: message };
+  } finally {
+    // Always release the WeakMap binding so a stale runId can't leak
+    // into a future cycle if hooks fire after the run resolves.
+    currentRunIdByAgent.delete(agent);
   }
 }
 
