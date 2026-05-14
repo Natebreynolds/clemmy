@@ -47,6 +47,8 @@ export const LOCAL_MCP_TOOL_NAMES = [
   'workflow_run',
   'cron_progress_read',
   'cron_progress_write',
+  'agent_runs_recent',
+  'agent_run_get',
   'team_list',
   'team_message',
   'team_request',
