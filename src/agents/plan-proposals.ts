@@ -5,6 +5,7 @@ import pino from 'pino';
 import { BASE_DIR } from '../config.js';
 import { addNotification } from '../runtime/notifications.js';
 import type { Plan } from './planner.js';
+import { openPlanScope } from './plan-scope.js';
 
 /**
  * Plan proposals — agent-drafted plans surfaced for user review.
@@ -198,34 +199,68 @@ export interface ApprovePlanProposalOptions {
    * plan is preserved on the record for audit.
    */
   editedPlan?: Plan;
+  /**
+   * How long the plan-scope stays open after approval. Default 15 min.
+   * Capped at 1 hour by the scope module. Pass 0 to skip opening a
+   * scope entirely (every tool call still requires individual
+   * approval).
+   */
+  scopeTtlMs?: number;
+  /**
+   * Which tools the plan-scope auto-approves. Defaults to shell + file
+   * writes — the same surface that normally needs per-call approval.
+   * Pass an empty array to skip opening a scope.
+   */
+  allowedTools?: string[];
 }
 
 export function approvePlanProposal(id: string, options: ApprovePlanProposalOptions = {}): PlanProposal | null {
   const proposal = readProposal(id);
   if (!proposal) return null;
   if (proposal.status !== 'pending') return null;
+  const approvedPlan = options.editedPlan ?? proposal.plan;
   const resolved: PlanProposal = {
     ...proposal,
     status: 'approved',
     resolvedAt: new Date().toISOString(),
     resolvedBy: 'user',
-    approvedPlan: options.editedPlan ?? proposal.plan,
+    approvedPlan,
   };
   writeProposal(resolved);
+
+  // Open a plan-scope so the next batch of tool calls (run_shell_command,
+  // write_file) doesn't have to interrupt for per-call approval. The
+  // scope expires after the TTL even if the agent keeps running.
+  let scopeOpened = false;
+  let scopeExpiresAt: string | undefined;
+  if (proposal.sessionId && options.allowedTools?.length !== 0) {
+    const scope = openPlanScope({
+      sessionId: proposal.sessionId,
+      planProposalId: proposal.id,
+      approvedPlanObjective: approvedPlan.objective,
+      ttlMs: options.scopeTtlMs,
+      allowedTools: options.allowedTools,
+    });
+    scopeOpened = true;
+    scopeExpiresAt = scope.expiresAt;
+  }
 
   addNotification({
     id: `${Date.now()}-plan-proposal-${proposal.id}-approved`,
     kind: 'system',
     title: `Plan approved: ${proposal.plan.objective.slice(0, 80)}`,
-    body: options.editedPlan
-      ? 'Plan approved with edits. The agent will execute against the edited plan.'
-      : 'Plan approved. The agent will proceed.',
+    body: [
+      options.editedPlan ? 'Plan approved with edits.' : 'Plan approved.',
+      scopeOpened
+        ? `Auto-approval window open until ${scopeExpiresAt} for shell + file-write actions inside this plan. You can revoke from the dashboard.`
+        : 'The agent will continue to ask before each shell or file-write action.',
+    ].join(' '),
     createdAt: new Date().toISOString(),
     read: false,
     metadata: { planProposalId: proposal.id, sessionId: proposal.sessionId, kind: 'plan_proposal' },
   });
 
-  logger.info({ proposalId: proposal.id, edited: Boolean(options.editedPlan) }, 'plan proposal approved');
+  logger.info({ proposalId: proposal.id, edited: Boolean(options.editedPlan), scopeOpened }, 'plan proposal approved');
   return resolved;
 }
 

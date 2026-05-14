@@ -46,6 +46,7 @@ import {
   rejectPlanProposal,
 } from '../agents/plan-proposals.js';
 import { PlanSchema } from '../agents/planner.js';
+import { closePlanScope, listActiveScopes, listAllScopes } from '../agents/plan-scope.js';
 import type { CheckInUrgency } from '../agents/check-ins.js';
 
 /**
@@ -954,7 +955,9 @@ export function registerConsoleRoutes(
       }
       editedPlan = parsed.data;
     }
-    const result = approvePlanProposal(req.params.id, { editedPlan });
+    const scopeTtlMs = typeof body.scopeTtlMs === 'number' && body.scopeTtlMs >= 0 ? body.scopeTtlMs : undefined;
+    const allowedTools = Array.isArray(body.allowedTools) ? body.allowedTools.filter((t: unknown) => typeof t === 'string') : undefined;
+    const result = approvePlanProposal(req.params.id, { editedPlan, scopeTtlMs, allowedTools });
     if (!result) { res.status(404).json({ error: 'plan proposal not found or already resolved' }); return; }
     res.json({ proposal: result });
   });
@@ -972,5 +975,22 @@ export function registerConsoleRoutes(
     const ok = deletePlanProposal(req.params.id);
     if (!ok) { res.status(404).json({ error: 'plan proposal not found' }); return; }
     res.json({ deleted: true });
+  });
+
+  // ─── Plan scopes (active auto-approval windows) ────────────────
+
+  app.get('/api/console/plan-scopes', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const includeClosed = req.query.includeClosed === 'true' || req.query.includeClosed === '1';
+    const scopes = includeClosed ? listAllScopes() : listActiveScopes();
+    res.json({ scopes });
+  });
+
+  app.post('/api/console/plan-scopes/:sessionId/close', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const reason = typeof req.body?.reason === 'string' ? req.body.reason : 'revoked by user';
+    const scope = closePlanScope(req.params.sessionId, reason);
+    if (!scope) { res.status(404).json({ error: 'no scope for that session' }); return; }
+    res.json({ scope });
   });
 }

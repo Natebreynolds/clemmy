@@ -7,6 +7,37 @@ import { z } from 'zod';
 import { BASE_DIR } from '../config.js';
 import type { RuntimeContextValue } from '../types.js';
 import { getWorkspaceDirs } from './shared.js';
+import { isAutoApprovedByScope, recordAutoApproval, summarizeToolArgs } from '../agents/plan-scope.js';
+
+/**
+ * Plan-scope check used by the per-tool needsApproval gates below.
+ * Returns true → SDK pauses for human approval. Returns false → call
+ * runs immediately.
+ *
+ * If the session has an open, unexpired PlanScope that covers this
+ * tool name, we auto-approve and log the call against the scope for
+ * audit. Otherwise we fall back to the legacy "always requires
+ * approval" behavior.
+ *
+ * Pure function shape so unit tests can target it cheaply.
+ */
+function extractSessionId(runContext: unknown): string | undefined {
+  if (!runContext || typeof runContext !== 'object') return undefined;
+  const ctx = (runContext as { context?: unknown }).context;
+  if (!ctx || typeof ctx !== 'object') return undefined;
+  const sid = (ctx as { sessionId?: unknown }).sessionId;
+  return typeof sid === 'string' ? sid : undefined;
+}
+
+function needsApprovalUnlessInPlanScope(toolName: string) {
+  return async (runContext: unknown, input: unknown): Promise<boolean> => {
+    const sessionId = extractSessionId(runContext);
+    if (!sessionId) return true;
+    if (!isAutoApprovedByScope(sessionId, toolName)) return true;
+    recordAutoApproval(sessionId, toolName, summarizeToolArgs(toolName, input));
+    return false;
+  };
+}
 
 const MAX_COMMAND_OUTPUT_CHARS = 12000;
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -152,12 +183,12 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
 
   const write_file = tool({
     name: 'write_file',
-    description: 'Write a UTF-8 file inside an allowed workspace. Requires approval because it modifies disk.',
+    description: 'Write a UTF-8 file inside an allowed workspace. Requires approval because it modifies disk. Auto-approved if the session has an open PlanScope covering write_file.',
     parameters: z.object({
       path: z.string().min(1),
       content: z.string(),
     }),
-    needsApproval: true,
+    needsApproval: needsApprovalUnlessInPlanScope('write_file'),
     execute: async (input) => {
       const filePath = resolveAllowedPath(input.path);
       mkdirSync(path.dirname(filePath), { recursive: true });
@@ -168,13 +199,13 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
 
   const run_shell_command = tool({
     name: 'run_shell_command',
-    description: 'Run a shell command in an allowed workspace directory. Requires approval and has output/time limits.',
+    description: 'Run a shell command in an allowed workspace directory. Requires per-call approval UNLESS the session has an open PlanScope (the user pre-approved a plan covering this kind of work). Has output and time limits.',
     parameters: z.object({
       command: z.string().min(1),
       cwd: z.string().nullable(),
       timeout_ms: z.number().min(1000).max(120000).nullable(),
     }),
-    needsApproval: true,
+    needsApproval: needsApprovalUnlessInPlanScope('run_shell_command'),
     execute: async (input) => {
       const cwd = resolveAllowedCwd(input.cwd ?? undefined);
       return runCommand(input.command, cwd, input.timeout_ms ?? DEFAULT_TIMEOUT_MS);
