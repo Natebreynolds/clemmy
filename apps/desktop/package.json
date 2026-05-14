@@ -70,7 +70,7 @@
       "gatekeeperAssess": false,
       "entitlements": "build/entitlements.mac.plist",
       "entitlementsInherit": "build/entitlements.mac.plist",
-      "identity": "Developer ID Application: Nathan Reynolds (4AR3Y8XD72)",
+      "identity": "Nathan Reynolds (4AR3Y8XD72)",
       "notarize": false,
       "target": [
         {
