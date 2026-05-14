@@ -19,6 +19,7 @@ import { loadPlugins, PLUGINS_DIR } from '../plugins/loader.js';
 import { loadUserProfile, saveUserProfile } from '../runtime/user-profile.js';
 import { getProactivityPolicySnapshot, saveProactivityPolicy } from '../agents/proactivity-policy.js';
 import { getAuthStatus } from '../runtime/auth-store.js';
+import { getSecretStore, listSecretDescriptors, type SecretName } from '../runtime/secrets/index.js';
 
 /**
  * Mounts the new Console dashboard at /console.
@@ -667,6 +668,105 @@ export function registerConsoleRoutes(
     try {
       const updated = saveProactivityPolicy(req.body ?? {});
       res.json({ policy: updated });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // ─── Credentials health + management ───────────────────────────
+  //
+  // Backed by the SecretStore abstraction (src/runtime/secrets). The
+  // dashboard never sees raw secret values for env-only or already-
+  // stored credentials — only their existence, source, and status.
+  //
+  // POST endpoints accept a raw value once (when the user enters it)
+  // and write it through the store. Migrations and resets call into
+  // the existing methods.
+
+  app.get('/api/console/credentials', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const store = await getSecretStore();
+      const rows = await store.health();
+      const descriptors = listSecretDescriptors().reduce<Record<string, { description: string; setupHint?: string; required: boolean; envVarName: string }>>(
+        (acc, d) => { acc[d.name] = { description: d.description, setupHint: d.setupHint, required: d.required, envVarName: d.envVarName }; return acc; },
+        {},
+      );
+      res.json({ rows, descriptors });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/credentials/set', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const body = req.body ?? {};
+    const name = typeof body.name === 'string' ? body.name : '';
+    const value = typeof body.value === 'string' ? body.value : '';
+    const known = listSecretDescriptors().map((d) => d.name as string);
+    if (!known.includes(name)) { res.status(400).json({ error: 'unknown credential name' }); return; }
+    if (!value) { res.status(400).json({ error: 'value required' }); return; }
+    try {
+      const store = await getSecretStore();
+      const result = await store.set(name as SecretName, value);
+      res.json({ name: result.name, source: result.source, status: result.status });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/credentials/migrate', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const body = req.body ?? {};
+    const name = typeof body.name === 'string' ? body.name : '';
+    const from = body.from === 'env' || body.from === 'file' ? body.from : null;
+    const to = body.to === 'keychain' || body.to === 'file' ? body.to : null;
+    if (!name || !from || !to) { res.status(400).json({ error: 'name, from, to required' }); return; }
+    try {
+      const store = await getSecretStore();
+      const result = await store.migrate(name as SecretName, from, to);
+      res.json({ name: result.name, source: result.source, status: result.status });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/credentials/repair-keychain', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const store = await getSecretStore();
+      const report = await store.repairKeychain();
+      res.json(report);
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/credentials/reset', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const body = req.body ?? {};
+    if (body.confirm !== true) {
+      res.status(400).json({ error: 'confirm: true required — this deletes all clementine-owned credentials' });
+      return;
+    }
+    try {
+      const store = await getSecretStore();
+      const report = await store.resetAll();
+      res.json(report);
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.delete('/api/console/credentials/:name', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const name = req.params.name;
+    const known = listSecretDescriptors().map((d) => d.name as string);
+    if (!known.includes(name)) { res.status(400).json({ error: 'unknown credential name' }); return; }
+    try {
+      const store = await getSecretStore();
+      await store.delete(name as SecretName);
+      res.json({ deleted: true });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

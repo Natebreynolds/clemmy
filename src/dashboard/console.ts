@@ -479,6 +479,24 @@ export function renderConsoleHtml(token: string): string {
               <div class="settings-block-head">MEMORY INDEX</div>
               <div class="settings-info" data-settings-memory>—</div>
             </div>
+
+            <div class="settings-block">
+              <div class="settings-block-head">
+                CREDENTIALS HEALTH
+                <span class="creds-meta" data-creds-meta>—</span>
+              </div>
+              <div class="creds-list" data-creds-list>
+                <div class="settings-info">— loading —</div>
+              </div>
+              <div class="creds-actions">
+                <button class="creds-btn-repair" data-creds-repair>REPAIR KEYCHAIN ⟲</button>
+                <button class="creds-btn-reset" data-creds-reset>RESET CREDENTIALS ▣</button>
+              </div>
+              <div class="creds-footnote">
+                Reset only deletes entries under <code>com.clemmy.desktop.v1</code> and the local file vault.
+                Your <code>.env</code> is never touched.
+              </div>
+            </div>
           </div>
 
         </div>
@@ -2115,6 +2133,173 @@ body {
 .settings-info .row .v.on { color: var(--accent-2); }
 .settings-info .row .v.off { color: var(--fg-mute); }
 
+/* ── Credentials Health (Settings sub-block) ──────────────────── */
+.creds-meta {
+  margin-left: auto;
+  font-size: 9px;
+  color: var(--fg-mute);
+  letter-spacing: 0.14em;
+}
+.creds-list {
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+.cred-row {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--line);
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
+  align-items: start;
+}
+.cred-row:last-child { border-bottom: 0; }
+.cred-row .cred-main { min-width: 0; }
+.cred-row .cred-name {
+  font-size: 11px;
+  color: var(--fg);
+  letter-spacing: 0.06em;
+}
+.cred-row .cred-meta {
+  margin-top: 3px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  color: var(--fg-3);
+}
+.cred-status {
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  padding: 1px 6px;
+  border: 1px solid var(--line);
+}
+.cred-status.connected { color: var(--accent-2); border-color: var(--accent-2); }
+.cred-status.missing { color: var(--fg-mute); }
+.cred-status.env_only { color: var(--accent-warn); border-color: var(--accent-warn); }
+.cred-status.unreadable { color: var(--accent-fail); border-color: var(--accent-fail); }
+.cred-status.needs_repair { color: var(--accent-fail); border-color: var(--accent-fail); }
+
+.cred-source {
+  font-size: 9px;
+  letter-spacing: 0.16em;
+}
+.cred-source.keychain { color: var(--accent-3); }
+.cred-source.file { color: var(--accent); }
+.cred-source.env { color: var(--accent-warn); }
+.cred-source.missing { color: var(--fg-mute); }
+
+.cred-desc {
+  margin-top: 6px;
+  font-size: 10px;
+  color: var(--fg-3);
+  line-height: 1.5;
+}
+.cred-hint {
+  margin-top: 4px;
+  font-size: 10px;
+  color: var(--fg-mute);
+  letter-spacing: 0.02em;
+}
+
+.cred-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  align-items: stretch;
+  min-width: 130px;
+}
+.cred-actions button {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  padding: 5px 8px;
+  cursor: pointer;
+  transition: background 100ms, color 100ms, border-color 100ms;
+}
+.cred-actions button:hover { color: var(--fg); border-color: var(--line-bright); }
+.cred-actions .cred-set { color: var(--accent); border-color: var(--accent); }
+.cred-actions .cred-set:hover { background: var(--accent); color: var(--bg-0); }
+.cred-actions .cred-migrate { color: var(--accent-3); border-color: var(--accent-3); }
+.cred-actions .cred-migrate:hover { background: var(--accent-3); color: var(--bg-0); }
+.cred-actions .cred-delete { color: var(--accent-fail); border-color: var(--accent-fail); }
+.cred-actions .cred-delete:hover { background: var(--accent-fail); color: var(--bg-0); }
+
+.cred-set-input-wrap {
+  margin-top: 8px;
+  display: none;
+  gap: 6px;
+  flex-direction: column;
+}
+.cred-set-input-wrap.open { display: flex; }
+.cred-set-input {
+  width: 100%;
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  color: var(--fg);
+  font: inherit;
+  font-size: 11px;
+  padding: 6px 8px;
+  outline: none;
+  transition: border-color 120ms;
+}
+.cred-set-input:focus { border-color: var(--accent); }
+.cred-set-buttons { display: flex; gap: 4px; }
+.cred-set-buttons button {
+  flex: 1;
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  padding: 4px 8px;
+  cursor: pointer;
+}
+.cred-set-buttons .save { color: var(--accent-2); border-color: var(--accent-2); }
+.cred-set-buttons .save:hover { background: var(--accent-2); color: var(--bg-0); }
+
+.creds-actions {
+  display: flex;
+  gap: 8px;
+  padding: 12px 16px;
+  border-top: 1px solid var(--line);
+  background: var(--bg-1);
+}
+.creds-actions button {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  padding: 6px 12px;
+  cursor: pointer;
+  transition: background 100ms, color 100ms, border-color 100ms;
+}
+.creds-btn-repair { color: var(--accent-3) !important; border-color: var(--accent-3) !important; }
+.creds-btn-repair:hover { background: var(--accent-3); color: var(--bg-0) !important; }
+.creds-btn-reset { color: var(--accent-fail) !important; border-color: var(--accent-fail) !important; margin-left: auto; }
+.creds-btn-reset:hover { background: var(--accent-fail); color: var(--bg-0) !important; }
+
+.creds-footnote {
+  padding: 8px 16px 14px;
+  font-size: 10px;
+  color: var(--fg-mute);
+  line-height: 1.55;
+}
+.creds-footnote code {
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  padding: 1px 5px;
+  color: var(--accent);
+  font-size: 10px;
+}
+
 /* ── Foot bar ───────────────────────────────────────────────── */
 .foot-bar {
   display: flex;
@@ -3325,9 +3510,179 @@ const CONSOLE_JS = `
 
       renderAuthInfo(s.auth);
       renderMemoryInfo(s.memory);
+      await refreshCredentialsHealth();
     } catch (err) {
       sett.authBox.innerHTML = '<div style="color:var(--accent-fail);">Failed to load settings: ' + escMem(err.message || err) + '</div>';
     }
+  }
+
+  async function refreshCredentialsHealth() {
+    const listEl = document.querySelector('[data-creds-list]');
+    const metaEl = document.querySelector('[data-creds-meta]');
+    if (!listEl || !metaEl) return;
+    try {
+      const data = await fetchJSON('/api/console/credentials');
+      const rows = data.rows || [];
+      const descriptors = data.descriptors || {};
+      const connected = rows.filter((r) => r.status === 'connected').length;
+      const envOnly = rows.filter((r) => r.status === 'env_only').length;
+      const missing = rows.filter((r) => r.status === 'missing').length;
+      const unreadable = rows.filter((r) => r.status === 'unreadable' || r.status === 'needs_repair').length;
+      metaEl.textContent = connected + ' connected · ' + envOnly + ' env-only · ' + missing + ' missing' + (unreadable ? ' · ' + unreadable + ' need repair' : '');
+
+      listEl.innerHTML = rows.map((r) => {
+        const d = descriptors[r.name] || {};
+        return [
+          '<div class="cred-row" data-cred-row="' + escMem(r.name) + '">',
+          '  <div class="cred-main">',
+          '    <div class="cred-name">' + escMem(r.name) + '</div>',
+          '    <div class="cred-meta">',
+          '      <span class="cred-status ' + escMem(r.status) + '">' + escMem(r.status.toUpperCase().replace('_', ' ')) + '</span>',
+          '      <span class="cred-source ' + escMem(r.source) + '">' + escMem(r.source.toUpperCase()) + '</span>',
+          r.lastSetAt ? '      <span>set ' + escMem(r.lastSetAt.slice(0, 16).replace("T", " ")) + '</span>' : '',
+          d.envVarName ? '      <span>env: ' + escMem(d.envVarName) + '</span>' : '',
+          '    </div>',
+          d.description ? '    <div class="cred-desc">' + escMem(d.description) + '</div>' : '',
+          d.setupHint ? '    <div class="cred-hint">' + escMem(d.setupHint) + '</div>' : '',
+          '    <div class="cred-set-input-wrap" data-cred-set-wrap="' + escMem(r.name) + '">',
+          '      <input type="password" class="cred-set-input" data-cred-set-input="' + escMem(r.name) + '" placeholder="paste value…" autocomplete="off" />',
+          '      <div class="cred-set-buttons">',
+          '        <button class="cancel" type="button" data-cred-set-cancel="' + escMem(r.name) + '">CANCEL</button>',
+          '        <button class="save" type="button" data-cred-set-save="' + escMem(r.name) + '">SAVE</button>',
+          '      </div>',
+          '    </div>',
+          '  </div>',
+          '  <div class="cred-actions">',
+          '    <button class="cred-set" type="button" data-cred-set="' + escMem(r.name) + '">' + (r.hasValue ? 'REPLACE' : 'SET') + ' ✎</button>',
+          (r.status === 'env_only')
+            ? '    <button class="cred-migrate" type="button" data-cred-migrate="' + escMem(r.name) + '">MOVE TO VAULT ⇢</button>'
+            : '',
+          r.hasValue ? '    <button class="cred-delete" type="button" data-cred-delete="' + escMem(r.name) + '">DELETE ▣</button>' : '',
+          '  </div>',
+          '</div>',
+        ].join('');
+      }).join('');
+      bindCredentialActions();
+    } catch (err) {
+      listEl.innerHTML = '<div class="settings-info" style="color:var(--accent-fail);">Failed: ' + escMem(err.message || err) + '</div>';
+    }
+  }
+
+  function bindCredentialActions() {
+    const root = document.querySelector('[data-creds-list]');
+    if (!root) return;
+
+    root.querySelectorAll('[data-cred-set]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const name = btn.getAttribute('data-cred-set');
+        const wrap = root.querySelector('[data-cred-set-wrap="' + name + '"]');
+        if (wrap) {
+          wrap.classList.add('open');
+          const input = wrap.querySelector('input');
+          if (input) input.focus();
+        }
+      });
+    });
+    root.querySelectorAll('[data-cred-set-cancel]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const name = btn.getAttribute('data-cred-set-cancel');
+        const wrap = root.querySelector('[data-cred-set-wrap="' + name + '"]');
+        if (wrap) wrap.classList.remove('open');
+      });
+    });
+    root.querySelectorAll('[data-cred-set-save]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const name = btn.getAttribute('data-cred-set-save');
+        const input = root.querySelector('[data-cred-set-input="' + name + '"]');
+        const value = input?.value?.trim();
+        if (!name || !value) return;
+        btn.textContent = 'SAVING…';
+        try {
+          const r = await fetch(withToken('/api/console/credentials/set'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name, value }),
+          });
+          if (!r.ok) {
+            const j = await r.json().catch(() => ({}));
+            alert('Save failed: ' + (j.error || r.status));
+            btn.textContent = 'SAVE';
+            return;
+          }
+          await refreshCredentialsHealth();
+        } catch (err) {
+          alert('Save failed: ' + (err.message || err));
+          btn.textContent = 'SAVE';
+        }
+      });
+    });
+    root.querySelectorAll('[data-cred-migrate]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const name = btn.getAttribute('data-cred-migrate');
+        if (!confirm('Move ' + name + ' from .env into the local vault?\\n\\nYour .env stays intact — the vault gets the value as its new primary source.')) return;
+        try {
+          const r = await fetch(withToken('/api/console/credentials/migrate'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name, from: 'env', to: 'file' }),
+          });
+          if (!r.ok) { const j = await r.json().catch(() => ({})); alert('Migrate failed: ' + (j.error || r.status)); return; }
+          await refreshCredentialsHealth();
+        } catch (err) { alert('Migrate failed: ' + (err.message || err)); }
+      });
+    });
+    root.querySelectorAll('[data-cred-delete]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const name = btn.getAttribute('data-cred-delete');
+        if (!confirm('Delete ' + name + ' from vault + keychain?\\n\\nYour .env (if set) is never touched.')) return;
+        try {
+          await fetch(withToken('/api/console/credentials/' + encodeURIComponent(name)), { method: 'DELETE' });
+          await refreshCredentialsHealth();
+        } catch (err) { alert('Delete failed: ' + (err.message || err)); }
+      });
+    });
+  }
+
+  const repairBtn = document.querySelector('[data-creds-repair]');
+  const resetBtn  = document.querySelector('[data-creds-reset]');
+  if (repairBtn) {
+    repairBtn.addEventListener('click', async () => {
+      repairBtn.textContent = 'REPAIRING…';
+      try {
+        const r = await fetch(withToken('/api/console/credentials/repair-keychain'), { method: 'POST' });
+        const j = await r.json();
+        if (!j.probed) {
+          alert('Keychain not available — keytar is not installed in this build.\\nThis is expected for the daemon-only / CLI install; install the desktop app to use Keychain.');
+        } else {
+          alert('Keychain repair complete. Tested ' + j.tested + ' credentials, recovered ' + (j.recovered?.length || 0) + ' to keychain status.');
+        }
+        await refreshCredentialsHealth();
+      } catch (err) {
+        alert('Repair failed: ' + (err.message || err));
+      } finally {
+        repairBtn.textContent = 'REPAIR KEYCHAIN ⟲';
+      }
+    });
+  }
+  if (resetBtn) {
+    resetBtn.addEventListener('click', async () => {
+      if (!confirm('Reset ALL Clementine credentials?\\n\\nThis deletes:\\n  • all keychain entries under com.clemmy.desktop.v1\\n  • the local file vault (~/.clementine-next/state/secrets-vault.json)\\n  • the credentials metadata file\\n\\nYour .env files are NEVER touched.\\nProceed?')) return;
+      resetBtn.textContent = 'RESETTING…';
+      try {
+        const r = await fetch(withToken('/api/console/credentials/reset'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ confirm: true }),
+        });
+        const j = await r.json();
+        alert('Reset complete.\\n\\nKeychain entries removed: ' + (j.keychainDeleted?.length || 0) + '\\nFile vault deleted: ' + j.fileVaultDeleted + '\\nMetadata deleted: ' + j.metaDeleted);
+        await refreshCredentialsHealth();
+      } catch (err) {
+        alert('Reset failed: ' + (err.message || err));
+      } finally {
+        resetBtn.textContent = 'RESET CREDENTIALS ▣';
+      }
+    });
   }
 
   function renderAuthInfo(auth) {
