@@ -6,6 +6,7 @@ import path from 'node:path';
 import { getOpenAiApiKey, MODELS } from '../config.js';
 import { getCoreTools } from '../tools/registry.js';
 import { createConfiguredMcpServers } from '../runtime/mcp-servers.js';
+import { autonomyV2OutputGuardrails } from './autonomy-guardrails.js';
 import type { RuntimeContextValue } from '../types.js';
 import {
   AGENT_INBOX_DIR,
@@ -350,6 +351,7 @@ function getAgent(record: TeamAgentRecord): AutonomyAgent {
     instructions: buildAgentInstructions(record),
     model: record.model ?? MODELS.fast,
     outputType: AgentDecisionSchema,
+    outputGuardrails: autonomyV2OutputGuardrails,
     tools: getCoreTools(),
     mcpServers: createConfiguredMcpServers(),
   });
