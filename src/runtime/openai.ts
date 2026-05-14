@@ -15,6 +15,7 @@ import { getCoreTools } from '../tools/registry.js';
 import { createConfiguredMcpServers } from './mcp-servers.js';
 import { addNotification } from './notifications.js';
 import { defaultOrchestratorHandoffs } from '../agents/sub-agents.js';
+import { buildPlannerTool } from '../agents/planner.js';
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -103,7 +104,10 @@ export class OpenAIRuntime implements AgentRuntime {
         request.instructions ||
         'You are Clementine, a persistent executive assistant. Be concise, accurate, and action-oriented.',
       model: request.model || MODELS.primary,
-      tools: getCoreTools(),
+      // Core tool surface plus the Planner-as-tool — the orchestrator
+      // can invoke `draft_plan` to think before executing on complex
+      // multi-step work without transferring control.
+      tools: [...getCoreTools(), buildPlannerTool()],
       // Chat path runs as the orchestrator: it can hand off to specialized
       // sub-agents (Researcher / Writer / Reviewer / Executor / Deployer)
       // exactly like the autonomy path. The Executor + Deployer handoffs

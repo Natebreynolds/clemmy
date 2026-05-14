@@ -10,6 +10,7 @@ import { autonomyV2OutputGuardrails } from './autonomy-guardrails.js';
 import { getProactivityPolicySnapshot, type ProactivityPolicy, type ProactivityPolicySnapshot } from './proactivity-policy.js';
 import { renderOpenCheckInsForAgent } from './check-ins.js';
 import { getProposalFeedback, renderProposalFeedback } from './proposal-feedback.js';
+import { buildPlannerTool } from './planner.js';
 import { activeExecutionCountForSession, renderActiveExecutionsForAgent } from '../tools/execution-tools.js';
 import { renderProfileForInstructions } from '../runtime/user-profile.js';
 import { defaultOrchestratorHandoffs, isOrchestratorSlug } from './sub-agents.js';
@@ -436,6 +437,7 @@ function buildAgentInstructions(agent: TeamAgentRecord, policy: ProactivityPolic
       '- `memory_remember` for durable preferences, project context, or standing feedback that should carry across sessions.',
       '- `memory_recall` to look something up before deciding.',
       '- `propose_check_in_template` when you notice a recurring rhythm in the user\'s work (weekly deploys, daily standups, monthly reviews) or a condition that should trigger a future nudge. DO NOT auto-install — the user approves from Settings → Proactive Check-Ins. Always include a clear `rationale` referencing the specific pattern you observed.',
+      '- `draft_plan` BEFORE you act on complex multi-step work — it returns a structured plan (objective, steps, risks, needsUserInput, recommendsTrackedExecution) without mutating anything. Skip it for trivial actions. After the plan returns, honor `needsUserInput` (ask_user_question) and `recommendsTrackedExecution` (surface to the user for promotion).',
       '- If there\'s nothing useful to do this cycle, take no action and say so in your summary.',
       '- If you receive an inbox item of type `check_in_answered`, the user just answered a question you previously asked. Pick up where you left off and use the answer to make progress.',
     ].join('\n'),
@@ -555,7 +557,10 @@ function getAgent(record: TeamAgentRecord, policy: ProactivityPolicy): AutonomyA
     return cached.agent;
   }
 
-  const allTools = getCoreTools();
+  // Include the Planner-as-tool so autonomy cycles can think before
+  // they act, exactly like the chat path. The Planner is read-only so
+  // it always passes policy filters.
+  const allTools = [...getCoreTools(), buildPlannerTool()];
   const tools = filterToolsByPolicy(allTools, policy);
 
   // Orchestrator agents get handoffs configured so they can delegate

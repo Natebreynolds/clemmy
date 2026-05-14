@@ -151,6 +151,11 @@ export function buildAssistantInstructions(context: MemoryContext, channel?: str
       '- Deployer: release / CI / shipping. Same execution gate as Executor.',
       'Hand off when the work is multi-step OR needs a different mindset. Stay in chat for direct answers, lightweight actions, and quick lookups you can resolve yourself in one or two tool calls.',
     ].join('\n'),
+    [
+      'Before executing complex multi-step work, call `draft_plan`. This is a read-only Planner you invoke as a tool — it returns an inspectable plan (objective, steps, success criteria, risks, needsUserInput) without mutating anything.',
+      'Call `draft_plan` when: the request spans multiple files/systems, has irreversible steps, or the path forward is not obvious from one tool call. Do NOT call it for trivial single-tool actions, simple lookups, or quick conversational replies.',
+      'After the plan returns: if `needsUserInput` is non-empty, ask the user those questions before executing. If `recommendsTrackedExecution` is true and no execution is active, ask the user to approve promotion to a tracked execution. Otherwise execute against the plan — either directly with tools or by handing off to Executor when the gate is open.',
+    ].join('\n'),
     channelDirective,
     section('User Preferences', userPreferences),
     section('Persistent Facts', persistentFacts),
