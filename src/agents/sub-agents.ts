@@ -41,7 +41,13 @@ import type { RuntimeContextValue } from '../types.js';
  */
 
 type SubAgent = Agent<RuntimeContextValue>;
-type OrchestratorHandoff = SubAgent | Handoff<RuntimeContextValue>;
+// Handoff's second generic is the *parent* agent's output type, so a
+// concrete value here would force the orchestrator to share that
+// output shape. We keep it open so the same handoffs work for both
+// the autonomy parent (structured Zod output) and the chat parent
+// (text output).
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type OrchestratorHandoff = SubAgent | Handoff<RuntimeContextValue, any>;
 
 export interface OrchestratorHandoffOptions {
   requireWorkflowApprovalForExecution?: boolean;

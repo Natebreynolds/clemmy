@@ -1,13 +1,84 @@
 import { randomUUID } from 'node:crypto';
 import { Agent, RunState, Runner, setDefaultOpenAIKey } from '@openai/agents';
 import { ASSISTANT_NAME, MODELS, OPENAI_API_KEY } from '../config.js';
-import type { ApprovalResolutionResult, PendingApproval, RunRequest, RunResult } from '../types.js';
+import type {
+  ApprovalResolutionResult,
+  PendingApproval,
+  RunRequest,
+  RunResult,
+  RuntimeContextValue,
+  ToolActivity,
+} from '../types.js';
 import { AgentRuntimeCancelledError, type AgentRuntime, type AgentRuntimeCallbacks } from './provider.js';
-import type { RuntimeContextValue } from '../types.js';
 import { ApprovalStore } from './approval-store.js';
 import { getCoreTools } from '../tools/registry.js';
 import { createConfiguredMcpServers } from './mcp-servers.js';
 import { addNotification } from './notifications.js';
+import { defaultOrchestratorHandoffs } from '../agents/sub-agents.js';
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function parseToolInput(value: unknown): Record<string, unknown> {
+  if (!value) return {};
+  if (typeof value === 'string') {
+    if (!value.trim()) return {};
+    try {
+      const parsed = JSON.parse(value);
+      return asRecord(parsed) ?? { value };
+    } catch {
+      return { value };
+    }
+  }
+
+  return asRecord(value) ?? {};
+}
+
+function runItemToJson(item: unknown): Record<string, unknown> | undefined {
+  const toJSON = asRecord(item)?.toJSON;
+  if (typeof toJSON !== 'function') return undefined;
+
+  try {
+    return asRecord(toJSON.call(item));
+  } catch {
+    return undefined;
+  }
+}
+
+function toolActivityFromRunItem(item: unknown): ToolActivity | null {
+  const itemRecord = asRecord(item);
+  const jsonRecord = runItemToJson(item);
+  const rawItem = asRecord(itemRecord?.rawItem) ?? asRecord(jsonRecord?.rawItem);
+  const itemType = typeof itemRecord?.type === 'string'
+    ? itemRecord.type
+    : typeof jsonRecord?.type === 'string'
+      ? jsonRecord.type
+      : '';
+  const rawType = typeof rawItem?.type === 'string' ? rawItem.type : '';
+  const toolName = typeof rawItem?.name === 'string'
+    ? rawItem.name
+    : typeof itemRecord?.name === 'string'
+      ? itemRecord.name
+      : rawType || itemType || 'tool';
+
+  const isToolCall =
+    itemType === 'tool_call_item' ||
+    itemType === 'tool_approval_item' ||
+    itemType === 'handoff_call_item' ||
+    rawType === 'function_call' ||
+    rawType === 'hosted_tool_call' ||
+    rawType === 'computer_call';
+
+  if (!isToolCall) return null;
+
+  return {
+    toolName,
+    input: parseToolInput(rawItem?.arguments ?? rawItem?.input ?? rawItem?.action ?? itemRecord?.input),
+  };
+}
 
 export class OpenAIRuntime implements AgentRuntime {
   private readonly runner: Runner;
@@ -33,6 +104,12 @@ export class OpenAIRuntime implements AgentRuntime {
         'You are Clementine, a persistent executive assistant. Be concise, accurate, and action-oriented.',
       model: request.model || MODELS.primary,
       tools: getCoreTools(),
+      // Chat path runs as the orchestrator: it can hand off to specialized
+      // sub-agents (Researcher / Writer / Reviewer / Executor / Deployer)
+      // exactly like the autonomy path. The Executor + Deployer handoffs
+      // are gated behind an active tracked execution so risky mutations
+      // require the user to promote work into a tracked task first.
+      handoffs: defaultOrchestratorHandoffs({ requireWorkflowApprovalForExecution: true }),
       mcpServers: this.mcpServers,
     });
   }
@@ -178,10 +255,10 @@ export class OpenAIRuntime implements AgentRuntime {
       channel: request.channel,
     };
 
-      // Stream when the caller subscribed to onChunk OR onReasoning.
+      // Stream when the caller subscribed to text, reasoning, or tool events.
       // Falls back to non-streaming when neither is subscribed — keeps
       // the simpler path for callers that don't care about deltas.
-      const wantsStream = Boolean(callbacks?.onChunk || callbacks?.onReasoning);
+      const wantsStream = Boolean(callbacks?.onChunk || callbacks?.onReasoning || callbacks?.onToolActivity);
 
       const result = wantsStream
         ? await this.runStreamed(agent, request.prompt, context, callbacks)
@@ -258,6 +335,8 @@ export class OpenAIRuntime implements AgentRuntime {
       stream: true,
     });
 
+    const emittedToolKeys = new Set<string>();
+
     for await (const event of streamed) {
       // raw_model_stream_event = wraps a provider-level StreamEvent
       if (event.type === 'raw_model_stream_event') {
@@ -271,14 +350,28 @@ export class OpenAIRuntime implements AgentRuntime {
       }
 
       // run_item_stream_event = high-level item lifecycle (messages,
-      // tool calls, reasoning, handoffs). We capture reasoning here.
-      if (event.type === 'run_item_stream_event' && event.name === 'reasoning_item_created') {
-        const item = event.item as { rawItem?: { content?: Array<{ text?: string }> } };
-        const chunks = item.rawItem?.content ?? [];
-        const text = chunks.map((c) => c.text ?? '').filter(Boolean).join('\n').trim();
-        if (text) {
-          if (callbacks?.onReasoning) {
-            try { await callbacks.onReasoning(text); } catch { /* tolerate consumer errors */ }
+      // tool calls, reasoning, handoffs). We capture tool starts and
+      // reasoning here so channel UIs can show actual progress.
+      if (event.type === 'run_item_stream_event') {
+        if (callbacks?.onToolActivity && (event.name === 'tool_called' || event.name === 'tool_approval_requested')) {
+          const activity = toolActivityFromRunItem(event.item);
+          if (activity) {
+            const key = `${activity.toolName}:${JSON.stringify(activity.input)}`;
+            if (!emittedToolKeys.has(key)) {
+              emittedToolKeys.add(key);
+              try { await callbacks.onToolActivity(activity); } catch { /* tolerate consumer errors */ }
+            }
+          }
+        }
+
+        if (event.name === 'reasoning_item_created') {
+          const item = event.item as { rawItem?: { content?: Array<{ text?: string }> } };
+          const chunks = item.rawItem?.content ?? [];
+          const text = chunks.map((c) => c.text ?? '').filter(Boolean).join('\n').trim();
+          if (text) {
+            if (callbacks?.onReasoning) {
+              try { await callbacks.onReasoning(text); } catch { /* tolerate consumer errors */ }
+            }
           }
         }
       }

@@ -12,6 +12,13 @@ import { refineActivePlanFromMessage } from '../planning/refinement.js';
 import { buildAssistantInstructions } from './instructions.js';
 import type { AgentRuntime } from '../runtime/provider.js';
 import { addRunEvent } from '../runtime/run-events.js';
+import { isUserFacingSession, looksLikeInternalPrompt } from '../execution/scope.js';
+import { classifyMessageIntent } from './message-intent.js';
+
+function shouldUseExecutionTracking(request: AssistantRequest): boolean {
+  return isUserFacingSession(request.sessionId, request.channel) &&
+    !looksLikeInternalPrompt(request.message);
+}
 
 export class ClementineAssistant {
   constructor(
@@ -41,7 +48,10 @@ export class ClementineAssistant {
       request.channel,
     );
     refineActivePlanFromMessage(request.sessionId, request.message);
-    const activeExecutionBeforeReply = this.executions.getActiveForSession(request.sessionId);
+    const executionTrackingEnabled = shouldUseExecutionTracking(request);
+    const activeExecutionBeforeReply = executionTrackingEnabled
+      ? this.executions.getActiveForSession(request.sessionId)
+      : undefined;
     if (activeExecutionBeforeReply?.planId) {
       const plan = this.plans.get(activeExecutionBeforeReply.planId);
       if (plan) {
@@ -50,10 +60,25 @@ export class ClementineAssistant {
     }
     refreshSessionBrief(sessionBeforeReply);
 
-    const transcriptBeforeReply = this.sessions.recentTranscript(request.sessionId);
-    const activeExecution = this.executions.getActiveForSession(request.sessionId);
-    const executionIntent = analyzeExecutionIntent(request.message, activeExecution);
-    const executionPrompt = buildExecutionPromptBlock(executionIntent, activeExecution);
+    const messageIntent = classifyMessageIntent(request.message);
+    const casualCheckIn = messageIntent.intent === 'casual';
+    const lightContext = casualCheckIn || messageIntent.intent === 'meta_clarify';
+    const transcriptDepth = casualCheckIn ? 1 : messageIntent.intent === 'meta_clarify' ? 3 : 12;
+    const transcriptBeforeReply = this.sessions.recentTranscript(request.sessionId, transcriptDepth);
+    const activeExecution = executionTrackingEnabled
+      ? this.executions.getActiveForSession(request.sessionId)
+      : undefined;
+    // ExecutionIntent only matters when the user is asking for action
+    // or continuing tracked work. Skip the keyword scoring entirely
+    // for casual / lookup / meta turns — saves a scan and avoids
+    // false-positive execution wrapping.
+    const shouldAnalyzeExecution = executionTrackingEnabled
+      && !lightContext
+      && (messageIntent.intent === 'action' || messageIntent.intent === 'tool_intent' || activeExecution);
+    const executionIntent = shouldAnalyzeExecution
+      ? analyzeExecutionIntent(request.message, activeExecution)
+      : undefined;
+    const executionPrompt = executionIntent ? buildExecutionPromptBlock(executionIntent, activeExecution) : '';
     const { memoryContext, retrievalText } = await assemblePromptContextAsync(request.sessionId, request.message, transcriptBeforeReply);
     const instructions = buildAssistantInstructions(memoryContext, request.channel);
 
@@ -110,7 +135,7 @@ export class ClementineAssistant {
       },
     });
 
-    if (executionPrompt) {
+    if (executionPrompt && executionIntent) {
       const parsed = parseExecutionResponse(result.text);
       const shouldPersistExecution = executionIntent.shouldTrack && parsed.steps.length >= 3;
       let execution = activeExecution;
