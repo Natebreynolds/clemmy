@@ -241,7 +241,7 @@ function isCadenceDue(agent: TeamAgentRecord, state: AgentStateRecord): boolean 
 // prompt anymore — outputType handles structure, the tool descriptions
 // handle "what can I do". Big reduction in prompt tokens too.
 
-function buildAgentInput(agent: TeamAgentRecord, inboxItems: AgentInboxItem[], state: AgentStateRecord): string {
+function buildAgentInput(agent: TeamAgentRecord, inboxItems: AgentInboxItem[], state: AgentStateRecord, policyOverride?: ProactivityPolicy): string {
   ensureTasksFile();
   const tasks = parseTasks(readFileSync(TASKS_FILE, 'utf-8'))
     .filter((task) => task.status === 'pending')
@@ -271,8 +271,8 @@ function buildAgentInput(agent: TeamAgentRecord, inboxItems: AgentInboxItem[], s
     ? `Existing commitments:\n- ${state.commitments.join('\n- ')}`
     : 'Existing commitments: none';
 
-  const policySnapshot = getProactivityPolicySnapshot();
-  const policyText = buildPolicyText(policySnapshot.policy);
+  const policy = policyOverride ?? getProactivityPolicySnapshot().policy;
+  const policyText = buildPolicyText(policy);
 
   return [
     `Context date: ${today}`,
@@ -359,7 +359,13 @@ function buildAgentInstructions(agent: TeamAgentRecord): string {
 
 type AutonomyAgent = Agent<RuntimeContextValue, typeof AgentDecisionSchema>;
 
-const agentCache = new Map<string, { record: TeamAgentRecord; agent: AutonomyAgent }>();
+interface AgentCacheEntry {
+  record: TeamAgentRecord;
+  policyFingerprint: string;
+  agent: AutonomyAgent;
+}
+
+const agentCache = new Map<string, AgentCacheEntry>();
 let runner: Runner | null = null;
 
 /**
@@ -390,12 +396,74 @@ function recordHash(record: TeamAgentRecord): string {
   });
 }
 
-function getAgent(record: TeamAgentRecord): AutonomyAgent {
+/**
+ * Hash the policy fields that affect the agent's tool list or
+ * instructions. Any field included here invalidates the agent cache
+ * when it changes — the next cycle builds a fresh Agent with the new
+ * tool set or guidance.
+ */
+function policyFingerprint(policy: ProactivityPolicy): string {
+  return JSON.stringify({
+    mode: policy.mode,
+    cs: policy.allowComputerActions,
+    cm: policy.allowComposioActions,
+    dc: policy.allowDiscordCheckIns,
+  });
+}
+
+/**
+ * Categorize a tool by name for policy-based filtering. Mirrors the
+ * categories in src/dashboard/state.ts but lives here so the runtime
+ * filter doesn't depend on the dashboard module.
+ */
+export function categorizeToolForPolicy(name: string): 'composio' | 'computer' | 'other' {
+  if (name.startsWith('composio_')) return 'composio';
+  if ([
+    'run_shell_command',
+    'write_file',
+    'read_file',
+    'list_files',
+    'git_status',
+    'workspace_config',
+    'workspace_list',
+    'workspace_info',
+    'workspace_roots',
+  ].includes(name)) return 'computer';
+  return 'other';
+}
+
+interface PolicyFilterableTool {
+  name?: string;
+  // The SDK Tool shape is broader, but for filtering we only need .name.
+}
+
+/**
+ * Filter a list of tools according to the current proactivity policy.
+ * Returns a new array; never mutates the input. When the policy allows
+ * everything (the default), this is a near-no-op pass-through.
+ */
+export function filterToolsByPolicy<T extends PolicyFilterableTool>(
+  tools: T[],
+  policy: ProactivityPolicy,
+): T[] {
+  return tools.filter((tool) => {
+    const category = categorizeToolForPolicy(tool.name ?? '');
+    if (category === 'composio' && !policy.allowComposioActions) return false;
+    if (category === 'computer' && !policy.allowComputerActions) return false;
+    return true;
+  });
+}
+
+function getAgent(record: TeamAgentRecord, policy: ProactivityPolicy): AutonomyAgent {
   const cached = agentCache.get(record.slug);
-  const fingerprint = recordHash(record);
-  if (cached && recordHash(cached.record) === fingerprint) {
+  const recFp = recordHash(record);
+  const polFp = policyFingerprint(policy);
+  if (cached && recordHash(cached.record) === recFp && cached.policyFingerprint === polFp) {
     return cached.agent;
   }
+
+  const allTools = getCoreTools();
+  const tools = filterToolsByPolicy(allTools, policy);
 
   const agent: AutonomyAgent = new Agent({
     name: record.name,
@@ -403,7 +471,7 @@ function getAgent(record: TeamAgentRecord): AutonomyAgent {
     model: record.model ?? MODELS.fast,
     outputType: AgentDecisionSchema,
     outputGuardrails: autonomyV2OutputGuardrails,
-    tools: getCoreTools(),
+    tools,
     mcpServers: createConfiguredMcpServers(),
   });
 
@@ -412,7 +480,7 @@ function getAgent(record: TeamAgentRecord): AutonomyAgent {
   // its own cached Agent instance and its own WeakMap entry.
   attachToolHooks(agent);
 
-  agentCache.set(record.slug, { record, agent });
+  agentCache.set(record.slug, { record, policyFingerprint: polFp, agent });
   return agent;
 }
 
@@ -479,8 +547,12 @@ async function runAgentCycleV2(record: TeamAgentRecord): Promise<{ runId: string
     message: `wake=${wakeReasons.join(',')} inbox=${inboxItems.length}`,
   });
 
-  const agent = getAgent(record);
-  const input = buildAgentInput(record, inboxItems, state);
+  // Read policy once per cycle so the agent build and the input use
+  // the same snapshot — avoids the agent's tools and the policy text
+  // disagreeing if the user toggles a setting mid-cycle.
+  const policy = getProactivityPolicySnapshot().policy;
+  const agent = getAgent(record, policy);
+  const input = buildAgentInput(record, inboxItems, state, policy);
   currentRunIdByAgent.set(agent, runId);
 
   try {

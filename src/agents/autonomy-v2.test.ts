@@ -3,7 +3,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { AgentDecisionSchema, buildPolicyText } from './autonomy-v2.js';
+import { AgentDecisionSchema, buildPolicyText, categorizeToolForPolicy, filterToolsByPolicy } from './autonomy-v2.js';
 import { DEFAULT_PROACTIVITY_POLICY } from './proactivity-policy.js';
 
 test('AgentDecisionSchema accepts the minimal valid shape', () => {
@@ -92,4 +92,79 @@ test('buildPolicyText handles all-allowed without blocked section', () => {
     allowDiscordCheckIns: true,
   });
   assert.doesNotMatch(text, /Blocked:/);
+});
+
+test('categorizeToolForPolicy: composio_* → composio', () => {
+  assert.equal(categorizeToolForPolicy('composio_status'), 'composio');
+  assert.equal(categorizeToolForPolicy('composio_execute_tool'), 'composio');
+});
+
+test('categorizeToolForPolicy: known shell/fs tools → computer', () => {
+  for (const name of ['run_shell_command', 'write_file', 'read_file', 'list_files', 'git_status', 'workspace_info']) {
+    assert.equal(categorizeToolForPolicy(name), 'computer', `${name} should be computer`);
+  }
+});
+
+test('categorizeToolForPolicy: safe tools → other', () => {
+  for (const name of ['memory_recall', 'memory_remember', 'task_add', 'notify_user', 'goal_update', 'note_take', 'agent_runs_recent']) {
+    assert.equal(categorizeToolForPolicy(name), 'other', `${name} should be other`);
+  }
+});
+
+test('filterToolsByPolicy: default policy keeps all tools', () => {
+  const tools = [
+    { name: 'composio_execute_tool' },
+    { name: 'run_shell_command' },
+    { name: 'memory_recall' },
+  ];
+  const filtered = filterToolsByPolicy(tools, DEFAULT_PROACTIVITY_POLICY);
+  assert.equal(filtered.length, 3);
+});
+
+test('filterToolsByPolicy: allowComposioActions=false drops composio_* tools', () => {
+  const tools = [
+    { name: 'composio_status' },
+    { name: 'composio_execute_tool' },
+    { name: 'memory_recall' },
+    { name: 'run_shell_command' },
+  ];
+  const filtered = filterToolsByPolicy(tools, { ...DEFAULT_PROACTIVITY_POLICY, allowComposioActions: false });
+  const names = filtered.map((t) => t.name);
+  assert.deepEqual(names, ['memory_recall', 'run_shell_command']);
+});
+
+test('filterToolsByPolicy: allowComputerActions=false drops shell/fs tools', () => {
+  const tools = [
+    { name: 'run_shell_command' },
+    { name: 'write_file' },
+    { name: 'read_file' },
+    { name: 'memory_recall' },
+    { name: 'composio_status' },
+  ];
+  const filtered = filterToolsByPolicy(tools, { ...DEFAULT_PROACTIVITY_POLICY, allowComputerActions: false });
+  const names = filtered.map((t) => t.name);
+  assert.deepEqual(names, ['memory_recall', 'composio_status']);
+});
+
+test('filterToolsByPolicy: both gates off keeps only safe tools', () => {
+  const tools = [
+    { name: 'run_shell_command' },
+    { name: 'composio_execute_tool' },
+    { name: 'memory_recall' },
+    { name: 'notify_user' },
+  ];
+  const filtered = filterToolsByPolicy(tools, {
+    ...DEFAULT_PROACTIVITY_POLICY,
+    allowComputerActions: false,
+    allowComposioActions: false,
+  });
+  const names = filtered.map((t) => t.name);
+  assert.deepEqual(names, ['memory_recall', 'notify_user']);
+});
+
+test('filterToolsByPolicy: does not mutate input array', () => {
+  const tools = [{ name: 'composio_status' }, { name: 'memory_recall' }];
+  const before = tools.length;
+  filterToolsByPolicy(tools, { ...DEFAULT_PROACTIVITY_POLICY, allowComposioActions: false });
+  assert.equal(tools.length, before, 'input array length unchanged');
 });

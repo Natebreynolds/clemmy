@@ -22,9 +22,9 @@ npx tsx --test src/**/*.test.ts
 | `src/memory/facts.test.ts` | 8 | `rememberFact` dedup (whitespace + case), distinct kinds, soft + hard delete, render ordering, score-bumping list order |
 | `src/agents/autonomy-guardrails.test.ts` | 11 | every guardrail's pass and trip cases |
 | `src/agents/run-tracking.test.ts` | 9 | start / record / finish lifecycle, list filtering, slug extraction |
-| `src/agents/autonomy-v2.test.ts` | 11 | `AgentDecisionSchema` validation, `buildPolicyText` per mode + allowed/blocked categories + check-in cadence |
+| `src/agents/autonomy-v2.test.ts` | 19 | `AgentDecisionSchema` validation, `buildPolicyText` per mode + allowed/blocked categories + check-in cadence, `categorizeToolForPolicy` + `filterToolsByPolicy` (composio gate, computer gate, both gates) |
 
-Total: **53 tests, ~800ms runtime**.
+Total: **61 tests, ~1s runtime**.
 
 ## Adding tests
 
