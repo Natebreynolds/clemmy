@@ -11,6 +11,7 @@ import { registerAdminTools } from './admin-tools.js';
 import { registerTeamTools } from './team-tools.js';
 import { registerOrchestrationTools } from './orchestration-tools.js';
 import { registerAgentRunsTools } from './agent-runs-tools.js';
+import { registerAutonomyActionTools } from './autonomy-action-tools.js';
 import { ensureToolDirectories, textResult } from './shared.js';
 import { loadPlugins } from '../plugins/loader.js';
 import type { PluginTool } from '../plugins/types.js';
@@ -26,6 +27,7 @@ registerAdminTools(server);
 registerTeamTools(server);
 registerOrchestrationTools(server);
 registerAgentRunsTools(server);
+registerAutonomyActionTools(server);
 registerDynamicTools(server);
 
 server.tool('ping', 'Basic health-check tool for the local MCP server.', {}, async () => textResult('pong'));

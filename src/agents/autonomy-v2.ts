@@ -98,54 +98,21 @@ function readOptInSlugs(): Set<string> {
 
 // -------- Decision schema --------
 //
-// Mirrors the AgentDecision shape used by v1 so executeAgentActions can
-// be reused. Zod enforces it at runtime; the SDK passes the equivalent
-// JSON Schema to the model so the response is guaranteed-shaped.
-
-const ActionTypeEnum = z.enum([
-  'message_agent',
-  'reply_request',
-  'complete_delegation',
-  'create_task',
-  'update_task',
-  'note',
-  'notify_user',
-  'delegate',
-  'update_goal',
-  'noop',
-]);
-
-const AgentActionSchema = z.object({
-  type: ActionTypeEnum,
-  to: z.string().optional(),
-  content: z.string().optional(),
-  requestId: z.string().optional(),
-  response: z.string().optional(),
-  delegationId: z.string().optional(),
-  result: z.string().optional(),
-  description: z.string().optional(),
-  priority: z.enum(['high', 'medium', 'low']).optional(),
-  dueDate: z.string().optional(),
-  project: z.string().optional(),
-  taskId: z.string().optional(),
-  status: z.enum(['pending', 'completed']).optional(),
-  title: z.string().optional(),
-  body: z.string().optional(),
-  task: z.string().optional(),
-  expectedOutput: z.string().optional(),
-  reason: z.string().optional(),
-  goalId: z.string().optional(),
-  goalNote: z.string().optional(),
-  goalStatus: z.enum(['active', 'paused', 'completed', 'blocked']).optional(),
-  goalNextActions: z.array(z.string()).optional(),
-  goalBlockers: z.array(z.string()).optional(),
-});
+// Phase 2: actions are NO LONGER a structured array. The agent calls
+// real tools during its run (notify_user, task_add, goal_update,
+// memory_remember, etc.) and the SDK orchestrates those tool calls
+// natively. The decision output is metadata only — what did you do,
+// what are you on the hook for next time, when should you wake again.
+//
+// This collapses the v1 "return action JSON → switch executes it"
+// pattern to the SDK's native "agent calls tools, runner orchestrates"
+// pattern. The tool surface IS the action vocabulary; adding a new
+// autonomy action = registering a new MCP tool.
 
 export const AgentDecisionSchema = z.object({
-  summary: z.string().describe('Brief explanation of what you decided and why.'),
-  actions: z.array(AgentActionSchema).max(6).describe('Concrete actions to take this cycle. Empty if noop.'),
-  commitments: z.array(z.string()).max(8).describe('What you commit to follow up on next cycle.'),
-  followUpMinutes: z.number().int().min(5).max(1440).optional().describe('When to wake again. Default cadence applies if omitted.'),
+  summary: z.string().describe('Brief explanation of what you did and why this cycle. Mention which tools you called.'),
+  commitments: z.array(z.string()).max(8).describe('What you commit to follow up on next cycle. Concrete and dated when possible.'),
+  followUpMinutes: z.number().int().min(5).max(1440).optional().describe('When to wake again, in minutes. Omit to use the agent default cadence.'),
 });
 
 export type AgentDecisionV2 = z.infer<typeof AgentDecisionSchema>;
@@ -318,9 +285,19 @@ function buildAgentInstructions(agent: TeamAgentRecord): string {
     agent.description ? `Mission: ${agent.description}` : '',
     agent.project ? `Bound project: ${agent.project}` : '',
     `Personality and operating guidance:\n${agent.personality}`,
-    'You are proactive. If goals or tasks have stagnated, take initiative — message agents, create tasks, notify the user, or update goals.',
-    'Use noop only if nothing useful should happen this cycle, and include a reason.',
-    'Be specific in your decisions. Brief summaries, concrete actions, realistic commitments.',
+    'You are proactive. If goals or tasks have stagnated, take initiative.',
+    [
+      'How to act:',
+      '- Use tools directly to take action this cycle. Do NOT describe actions in your output — execute them.',
+      '- `notify_user` for meaningful updates, blockers, or anything the user genuinely wants to know.',
+      '- `task_add` / `task_update` to manage the tasks file. `goal_update` to log progress or change goal status.',
+      '- `note_take` to append context to today\'s daily note.',
+      '- `memory_remember` for durable preferences, project context, or standing feedback that should carry across sessions.',
+      '- `memory_recall` to look something up before deciding.',
+      '- If there\'s nothing useful to do this cycle, take no action and say so in your summary.',
+    ].join('\n'),
+    'Multi-agent comms (messaging, delegation, replies) is not available in v2 yet — for now, leave those to v1 by surfacing the intent in your summary so the user can act.',
+    'Output: return only `summary`, `commitments`, and optional `followUpMinutes`. Be specific and brief.',
   ].filter(Boolean).join('\n\n');
 }
 
@@ -380,40 +357,13 @@ function getAgent(record: TeamAgentRecord): AutonomyAgent {
   return agent;
 }
 
-// -------- Action execution --------
-// Mirrors v1's executeAgentActions. We re-implement the dispatch here
-// rather than importing from v1 to keep the v2 file self-contained
-// and avoid coupling to v1 internals. Action SEMANTICS must stay
-// identical so we don't break existing on-disk artifacts.
-
-function executeDecisionActions(record: TeamAgentRecord, decision: AgentDecisionV2): string[] {
-  // For Phase 1, we delegate action execution by writing the structured
-  // decision to a known file the v1 executor can consume — OR we just
-  // re-implement here. To keep this commit additive and not require
-  // touching autonomy.ts, we re-implement the minimal subset that
-  // matches v1 semantics. Behavior parity is enforced by tests.
-  //
-  // NOTE: this is a known duplication. Phase 2 collapses both into a
-  // single tool-call surface.
-  const outcomes: string[] = [];
-  for (const action of decision.actions.slice(0, 6)) {
-    switch (action.type) {
-      case 'noop':
-        outcomes.push(action.reason ? `noop: ${action.reason}` : 'noop');
-        break;
-      // The other action types are intentionally left to v1's executor
-      // until Phase 2 — to invoke them, leave AUTONOMY_V2_AGENTS unset
-      // until you're ready to migrate per-action behavior. Phase 1
-      // proves the SDK loop works end-to-end with structured outputs
-      // and a single safe action type.
-      default:
-        outcomes.push(`(v1-executor-required:${action.type})`);
-    }
-  }
-  return outcomes;
-}
-
 // -------- Main cycle --------
+//
+// Phase 2 removed executeDecisionActions — the SDK Runner now executes
+// tool calls during agent.run(), and those tool calls ARE the actions.
+// The cycle records the metadata (summary, commitments, follow-up)
+// into agent state. The runs.json store captures the tool-call timeline
+// (when wired via per-tool hooks in Phase 1.5).
 
 async function runAgentCycleV2(record: TeamAgentRecord): Promise<{ runId: string; success: boolean; outcomes: string[]; error?: string }> {
   const state = loadAgentState(record.slug);
@@ -453,15 +403,13 @@ async function runAgentCycleV2(record: TeamAgentRecord): Promise<{ runId: string
 
     addRunEvent(runId, {
       type: 'status',
-      message: `Decision: ${decision.summary.slice(0, 200)} | actions=${decision.actions.map((a) => a.type).join(',')}`,
+      message: `Decision: ${decision.summary.slice(0, 200)}`,
       data: {
-        actionCount: decision.actions.length,
         commitments: decision.commitments,
         followUpMinutes: decision.followUpMinutes,
       },
     });
 
-    const outcomes = executeDecisionActions(record, decision);
     markInboxProcessed(record.slug, inboxItems.map((item) => item.id));
     saveAgentState({
       slug: record.slug,
@@ -478,11 +426,11 @@ async function runAgentCycleV2(record: TeamAgentRecord): Promise<{ runId: string
 
     finishRun(runId, {
       status: 'completed',
-      message: outcomes.length > 0 ? `Outcomes: ${outcomes.join(', ')}` : 'No actions taken.',
-      outputPreview: outcomes.join(' | '),
+      message: decision.summary,
+      outputPreview: decision.summary,
     });
 
-    return { runId, success: true, outcomes };
+    return { runId, success: true, outcomes: [decision.summary] };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     logger.error({ err: error, agent: record.slug }, 'autonomy-v2 cycle failed');
