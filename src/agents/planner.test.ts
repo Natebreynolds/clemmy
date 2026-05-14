@@ -70,7 +70,6 @@ test('PlanSchema: rejects bad complexity enum', () => {
     steps: [{ n: 1, action: 'do thing', rationale: 'why' }],
     successCriteria: ['it works'],
     risks: [],
-    // @ts-expect-error — bad value on purpose
     estimatedComplexity: 'small',
     recommendsTrackedExecution: false,
     needsUserInput: [],

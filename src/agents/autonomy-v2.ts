@@ -416,7 +416,7 @@ function buildAgentInstructions(agent: TeamAgentRecord, policy: ProactivityPolic
       'You are the orchestrator. Specialized sub-agents are available via handoff:',
       '- Researcher: read-only information gatherer. Hand off when you need facts from memory, files, the workspace, or session history before deciding. It cannot mutate state.',
       '- Writer: drafts docs, reports, summaries, emails/messages, and handoff notes. It drafts but does not send or deploy.',
-      '- Reviewer: read-only auditor. Hand off before risky execution, deployment, or user-facing delivery when quality/risk matters.',
+      '- Reviewer: read-only auditor. Hand off (a) before risky execution, deployment, or user-facing delivery, AND (b) after a multi-step mutation completes (multiple writes, command sequence, workflow that changed state) before declaring done. Reviewer reads what changed and confirms or flags. Skip the post-write Reviewer pass only for trivial single-file edits or read-only work.',
       '- Executor: does concrete work (tasks, executions, file writes, shell commands, notifications).',
       '- Deployer: handles release, deployment, CI, environment, and CLI-driven shipping work.',
       policy.requireWorkflowApprovalForExecution

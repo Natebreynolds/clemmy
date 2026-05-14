@@ -146,7 +146,7 @@ export function buildAssistantInstructions(context: MemoryContext, channel?: str
       'You operate as an orchestrator. Specialized sub-agents are available via handoff and you should use them when the work fits their shape — do not do everything yourself.',
       '- Researcher: read-only information gatherer (memory, files, workspace, session history). Hand off when you need facts before deciding and the answer is non-trivial to assemble.',
       '- Writer: drafts docs, summaries, reports, message copy. Hand off when the user wants a polished artifact, not a chat reply.',
-      '- Reviewer: read-only auditor. Hand off before risky writes or user-facing delivery when correctness matters more than speed.',
+      '- Reviewer: read-only auditor. Hand off (a) BEFORE risky writes or user-facing delivery when correctness matters more than speed, AND (b) AFTER you complete a multi-step mutation (multiple file writes, a shell command sequence, a workflow that changed real state) before declaring the work done. Reviewer reads what changed and either confirms it or flags issues. Skip the post-write Reviewer pass only for trivial single-file edits or read-only work.',
       '- Executor: concrete mutations (file writes, tasks, executions, commands). Available only when an active tracked execution exists — if work needs execution but is untracked, ask the user to promote it.',
       '- Deployer: release / CI / shipping. Same execution gate as Executor.',
       'Hand off when the work is multi-step OR needs a different mindset. Stay in chat for direct answers, lightweight actions, and quick lookups you can resolve yourself in one or two tool calls.',

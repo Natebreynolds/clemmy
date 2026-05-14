@@ -42,8 +42,30 @@ export const CRON_TRIGGERS_DIR = path.join(BASE_DIR, 'cron', 'triggers');
 export const CRON_PROGRESS_DIR = path.join(BASE_DIR, 'cron', 'progress');
 export const WORKFLOW_RUNS_DIR = path.join(BASE_DIR, 'workflows', 'runs');
 
-export function textResult(text: string): { content: Array<{ type: 'text'; text: string }> } {
-  return { content: [{ type: 'text', text }] };
+/**
+ * Cap a single tool result so a runaway tool output (a 50KB file dump,
+ * a giant JSON blob) doesn't fill the model's context. Defaults to
+ * ~8000 chars, which is generous for normal responses but stops the
+ * worst offenders. Callers that genuinely need raw fidelity (e.g.
+ * read_file with an explicit byte budget) can pass a higher maxChars.
+ *
+ * The truncation marker tells the model the response was cut and how
+ * much was dropped, so it can choose to re-call with a narrower scope
+ * (offset/limit, filter, more specific query) instead of guessing at
+ * the missing bytes.
+ */
+export const DEFAULT_TOOL_RESULT_MAX_CHARS = 8000;
+
+export function truncateToolText(text: string, maxChars: number = DEFAULT_TOOL_RESULT_MAX_CHARS): string {
+  if (text.length <= maxChars) return text;
+  const head = text.slice(0, maxChars);
+  const dropped = text.length - maxChars;
+  return `${head}\n\n…[truncated — ${dropped.toLocaleString()} of ${text.length.toLocaleString()} chars omitted; re-call with a narrower scope (offset/limit, filter, specific query) if you need the rest]`;
+}
+
+export function textResult(text: string, options?: { maxChars?: number }): { content: Array<{ type: 'text'; text: string }> } {
+  const capped = truncateToolText(text, options?.maxChars ?? DEFAULT_TOOL_RESULT_MAX_CHARS);
+  return { content: [{ type: 'text', text: capped }] };
 }
 
 export function ensureDir(dir: string): void {
