@@ -30,7 +30,7 @@ import {
 import { ClementineAssistant } from '../assistant/core.js';
 import { ClementineGateway, type GatewayResponse } from '../gateway/router.js';
 import { getOrCreateDiscordSessionId } from './discord-store.js';
-import type { ApprovalResolutionResult, PendingApproval } from '../types.js';
+import type { ApprovalResolutionResult, PendingApproval, ToolActivity } from '../types.js';
 import {
   getNotification,
   listNotifications,
@@ -187,6 +187,21 @@ async function discordApiJson<T>(path: string, init?: { method?: string; body?: 
   return response.json() as Promise<T>;
 }
 
+async function discordApiVoid(path: string, init?: { method?: string; body?: unknown }): Promise<void> {
+  const response = await fetch(`https://discord.com/api/v10${path}`, {
+    method: init?.method ?? 'GET',
+    headers: {
+      Authorization: `Bot ${DISCORD_BOT_TOKEN}`,
+      'Content-Type': 'application/json',
+    },
+    body: init?.body === undefined ? undefined : JSON.stringify(init.body),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Discord API ${init?.method ?? 'GET'} ${path} failed with ${response.status}: ${await response.text()}`);
+  }
+}
+
 async function ensureDiscordDmChannel(userId: string): Promise<DiscordRestDmChannel> {
   return discordApiJson<DiscordRestDmChannel>('/users/@me/channels', {
     method: 'POST',
@@ -215,8 +230,33 @@ async function sendDiscordRestChunks(channelId: string, text: string): Promise<v
   }
 }
 
+async function sendDiscordRestTyping(channelId: string): Promise<void> {
+  await discordApiVoid(`/channels/${channelId}/typing`, { method: 'POST' });
+}
+
+function startDiscordTypingLoop(input: {
+  channelId: string;
+  sendTyping: () => Promise<unknown>;
+}): () => void {
+  let stopped = false;
+  const tick = () => {
+    if (stopped) return;
+    input.sendTyping().catch((error) => {
+      logger.warn({ err: error, channelId: input.channelId }, 'Discord typing indicator failed');
+    });
+  };
+  tick();
+  const timer = setInterval(tick, 8_000);
+  timer.unref?.();
+
+  return () => {
+    stopped = true;
+    clearInterval(timer);
+  };
+}
+
 /**
- * Streaming handler for Discord DMs.
+ * Streaming handler for Discord channels and DMs.
  *
  * Discord's API allows message-editing, which is how we surface streaming
  * text without spamming new messages. The handler:
@@ -350,6 +390,125 @@ function createDiscordStreamHandler(channelId: string): DiscordStreamHandler {
       else if (pendingEdit) await commitEdit();
     },
     getMessageIds: () => messageIds.slice(),
+  };
+}
+
+interface DiscordLiveActivityHandler {
+  onToolActivity(activity: ToolActivity): Promise<void>;
+  flush(): Promise<void>;
+}
+
+const TOOL_ACTIVITY_LABELS: Record<string, string> = {
+  composio_execute_tool: 'using a connected app',
+  composio_list_tools: 'checking available app actions',
+  composio_status: 'checking connected apps',
+  git_status: 'checking git status',
+  list_files: 'listing files',
+  ping: 'checking tool runtime',
+  read_file: 'reading a file',
+  request_destructive_action: 'requesting approval',
+  run_shell_command: 'preparing a shell command',
+  workspace_roots: 'checking workspace access',
+  write_file: 'preparing a file edit',
+};
+
+function readableToolName(toolName: string): string {
+  return TOOL_ACTIVITY_LABELS[toolName] ?? `using ${toolName.replace(/[_-]+/g, ' ')}`;
+}
+
+function activityTarget(input: Record<string, unknown>): string {
+  const keys = [
+    'path',
+    'directory',
+    'command',
+    'query',
+    'url',
+    'tool_slug',
+    'toolkit_slug',
+    'cwd',
+    'title',
+    'action',
+  ];
+
+  for (const key of keys) {
+    const value = input[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+    if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  }
+
+  return '';
+}
+
+function renderToolActivityLine(activity: ToolActivity): string {
+  const target = activityTarget(activity.input);
+  if (!target) return readableToolName(activity.toolName);
+  return `${readableToolName(activity.toolName)}: \`${truncate(target.replace(/`/g, "'"), 90)}\``;
+}
+
+function renderLiveActivity(lines: string[]): string {
+  return [
+    '**Live activity**',
+    ...lines.slice(-8).map((line) => `- ${line}`),
+  ].join('\n').slice(0, 1900);
+}
+
+function createDiscordLiveActivityHandler(channelId: string): DiscordLiveActivityHandler {
+  const EDIT_INTERVAL_MS = 1000;
+  const lines: string[] = [];
+  const seen = new Set<string>();
+  let messageId: string | null = null;
+  let lastEditAt = 0;
+  let pendingEdit = false;
+  let inFlight: Promise<void> = Promise.resolve();
+
+  async function commit(): Promise<void> {
+    if (lines.length === 0) return;
+    const content = renderLiveActivity(lines);
+    try {
+      if (!messageId) {
+        const sent = await discordApiJson<DiscordRestSentMessage>(
+          `/channels/${channelId}/messages`,
+          { method: 'POST', body: { content } },
+        );
+        messageId = sent.id;
+      } else {
+        await discordApiJson<DiscordRestSentMessage>(
+          `/channels/${channelId}/messages/${messageId}`,
+          { method: 'PATCH', body: { content } },
+        );
+      }
+      lastEditAt = Date.now();
+      pendingEdit = false;
+    } catch (error) {
+      logger.warn({ err: error, channelId, messageId }, 'Discord live activity update failed');
+    }
+  }
+
+  async function processActivity(activity: ToolActivity): Promise<void> {
+    const line = renderToolActivityLine(activity);
+    if (seen.has(line)) return;
+    seen.add(line);
+    lines.push(line);
+
+    if (!messageId || Date.now() - lastEditAt >= EDIT_INTERVAL_MS) {
+      await commit();
+      return;
+    }
+
+    pendingEdit = true;
+  }
+
+  return {
+    onToolActivity: (activity: ToolActivity) => {
+      inFlight = inFlight.then(() => processActivity(activity).catch((error) => {
+        logger.warn({ err: error, channelId, toolName: activity.toolName }, 'Discord live activity handler failed');
+      }));
+      return inFlight;
+    },
+    flush: async () => {
+      await inFlight;
+      if (pendingEdit) await commit();
+    },
   };
 }
 
@@ -530,6 +689,19 @@ function approvalResultText(result: ApprovalResolutionResult): string {
   ].join('\n');
 }
 
+function renderGatewayTail(response: GatewayResponse): string {
+  // Surface ONLY signal the user can act on. Run IDs are debug
+  // telemetry — they belong in the dashboard activity panel, not
+  // appended to every chat reply.
+  return [
+    response.pendingApprovalId ? `Approval pending: \`${response.pendingApprovalId}\`` : '',
+  ].filter(Boolean).join('\n\n');
+}
+
+function appendGatewayTail(text: string, tail: string): string {
+  return tail ? `${text}\n\n${tail}` : text;
+}
+
 async function runGatewayPrompt(input: {
   assistant: ClementineAssistant;
   prompt: string;
@@ -540,6 +712,8 @@ async function runGatewayPrompt(input: {
    *  supports streaming (OpenAI Agents SDK path). Codex CLI bridge
    *  ignores it — non-streaming users get the same one-shot reveal. */
   onChunk?: (delta: string) => Promise<void> | void;
+  /** Tool activity callback surfaced by the runtime when tools start. */
+  onToolActivity?: (activity: ToolActivity) => Promise<void> | void;
 }): Promise<GatewayResponse> {
   const sessionId = getOrCreateDiscordSessionId({
     channelId: input.channelId,
@@ -554,6 +728,7 @@ async function runGatewayPrompt(input: {
     channel: buildChannelLabelFromParts(input.channelId, input.guildId),
     source: 'discord',
     onChunk: input.onChunk,
+    onToolActivity: input.onToolActivity,
   });
 }
 
@@ -918,35 +1093,43 @@ async function handleMessage(message: Message<boolean>, assistant: ClementineAss
     return;
   }
 
-  let progressCompleted = false;
-  let progressTimer: ReturnType<typeof setTimeout> | undefined;
+  const streamHandler = createDiscordStreamHandler(message.channelId);
+  const activityHandler = createDiscordLiveActivityHandler(message.channelId);
+  let chunkSeen = false;
+  const stopTyping = startDiscordTypingLoop({
+    channelId: message.channelId,
+    sendTyping: async () => {
+      if ('sendTyping' in message.channel) {
+        await message.channel.sendTyping();
+      }
+    },
+  });
 
   try {
-    if ('sendTyping' in message.channel) {
-      await message.channel.sendTyping();
-    }
-
-    progressTimer = setTimeout(() => {
-      if (progressCompleted) return;
-      void sendChunks(message.channel, 'Working on it. I’ll post the result here when the run finishes.', message)
-        .catch((error) => logger.warn({ err: error, channelId: message.channelId }, 'Discord progress message failed'));
-    }, 2500);
-
     const response = await runGatewayPrompt({
       assistant,
       prompt,
       channelId: message.channelId,
       userId: message.author.id,
       guildId: message.guildId,
+      onChunk: async (delta) => {
+        chunkSeen = true;
+        await streamHandler.onChunk(delta);
+      },
+      onToolActivity: async (activity) => {
+        await activityHandler.onToolActivity(activity);
+      },
     });
-    progressCompleted = true;
-    if (progressTimer) clearTimeout(progressTimer);
 
-    const suffix = response.pendingApprovalId
-      ? `\n\nApproval pending: \`${response.pendingApprovalId}\``
-      : '';
-    const runSuffix = response.runId ? `\n\nRun: \`${response.runId}\`` : '';
-    await sendChunks(message.channel, `${response.text}${suffix}${runSuffix}`, message);
+    await streamHandler.flush();
+    await activityHandler.flush();
+
+    const tail = renderGatewayTail(response);
+    if (chunkSeen) {
+      if (tail) await sendChunks(message.channel, tail, message);
+    } else {
+      await sendChunks(message.channel, appendGatewayTail(response.text, tail), message);
+    }
   } catch (error) {
     logger.error({ err: error, channelId: message.channelId, userId: message.author.id }, 'Discord message handling failed');
     await sendChunks(
@@ -955,8 +1138,7 @@ async function handleMessage(message: Message<boolean>, assistant: ClementineAss
       message,
     );
   } finally {
-    progressCompleted = true;
-    if (progressTimer) clearTimeout(progressTimer);
+    stopTyping();
   }
 }
 
@@ -1003,18 +1185,15 @@ async function pollDiscordDirectMessages(client: Client, assistant: ClementineAs
           continue;
         }
 
-        let progressCompleted = false;
-        let progressTimer: ReturnType<typeof setTimeout> | undefined;
         const streamHandler = createDiscordStreamHandler(dm.id);
+        const activityHandler = createDiscordLiveActivityHandler(dm.id);
         let chunkSeen = false;
+        const stopTyping = startDiscordTypingLoop({
+          channelId: dm.id,
+          sendTyping: () => sendDiscordRestTyping(dm.id),
+        });
 
         try {
-          progressTimer = setTimeout(() => {
-            if (progressCompleted || chunkSeen) return;
-            void sendDiscordRestChunks(dm.id, 'Working on it. I’ll post the result here when the run finishes.')
-              .catch((sendError) => logger.warn({ err: sendError, channelId: dm.id }, 'Discord DM progress message failed'));
-          }, 2500);
-
           const response = await runGatewayPrompt({
             assistant,
             prompt,
@@ -1023,32 +1202,29 @@ async function pollDiscordDirectMessages(client: Client, assistant: ClementineAs
             guildId: null,
             onChunk: async (delta) => {
               chunkSeen = true;
-              if (progressTimer) { clearTimeout(progressTimer); progressTimer = undefined; }
               await streamHandler.onChunk(delta);
             },
+            onToolActivity: async (activity) => {
+              await activityHandler.onToolActivity(activity);
+            },
           });
-          progressCompleted = true;
-          if (progressTimer) clearTimeout(progressTimer);
 
           // Flush any pending edit so the final delta lands before we
           // append suffixes / fall back to a full send.
           await streamHandler.flush();
+          await activityHandler.flush();
 
-          const suffix = response.pendingApprovalId
-            ? `\n\nApproval pending: \`${response.pendingApprovalId}\``
-            : '';
-          const runSuffix = response.runId ? `\n\nRun: \`${response.runId}\`` : '';
+          const tail = renderGatewayTail(response);
 
           if (chunkSeen) {
             // Streaming already published the body. Send only the
             // suffix(es), if any, as a follow-up message — keeps the
             // streamed text intact and doesn't double-post the body.
-            const tail = `${suffix}${runSuffix}`.trim();
             if (tail) await sendDiscordRestChunks(dm.id, tail);
           } else {
             // Non-streaming runtime (codex CLI bridge) — fall back to
             // the original one-shot send.
-            await sendDiscordRestChunks(dm.id, `${response.text}${suffix}${runSuffix}`);
+            await sendDiscordRestChunks(dm.id, appendGatewayTail(response.text, tail));
           }
 
           markDiscordDmMessageSeen(dm.id, message.id);
@@ -1060,8 +1236,7 @@ async function pollDiscordDirectMessages(client: Client, assistant: ClementineAs
           );
           markDiscordDmMessageSeen(dm.id, message.id);
         } finally {
-          progressCompleted = true;
-          if (progressTimer) clearTimeout(progressTimer);
+          stopTyping();
         }
       }
     } catch (error) {
