@@ -4,6 +4,7 @@ import matter from 'gray-matter';
 import pino from 'pino';
 import { ClementineAssistant } from '../assistant/core.js';
 import { processAgentAutonomy } from '../agents/autonomy.js';
+import { processAgentAutonomyV2 } from '../agents/autonomy-v2.js';
 import { processMonitors } from '../agents/monitors.js';
 import { MODELS } from '../config.js';
 import { processExecutionController } from '../execution/controller.js';
@@ -473,6 +474,11 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
 
     await processExecutionController(assistant);
     await processAgentAutonomy(assistant);
+    // v2 runs in parallel with v1 — each agent is owned by exactly one
+    // engine. v2 processes agents listed in AUTONOMY_V2_AGENTS env var;
+    // v1 handles the rest. After a v2 cycle marks lastRunAt, v1 sees
+    // the cadence as not-yet-due and skips that agent.
+    await processAgentAutonomyV2();
     await processMemoryMaintenance(tickCount);
     await processNotificationDeliveries();
     await sleep(15_000);
