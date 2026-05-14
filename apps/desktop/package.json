@@ -10,13 +10,17 @@
     "typecheck": "tsc -p . --noEmit",
     "dev": "tsx src/main.ts",
     "start": "electron .",
-    "package:mac": "electron-builder --mac --dir",
-    "package:dist": "electron-builder"
+    "build:daemon": "cd ../.. && npm run build",
+    "package:mac": "npm run build && npm run build:daemon && electron-builder --mac",
+    "package:mac:unsigned": "APPLE_NOTARIZE_SKIP=true CSC_IDENTITY_AUTO_DISCOVERY=false npm run build && npm run build:daemon && electron-builder --mac",
+    "package:dist": "npm run build && npm run build:daemon && electron-builder",
+    "release": "npm run build && npm run build:daemon && electron-builder --mac --publish always"
   },
   "dependencies": {
     "keytar": "^7.9.0"
   },
   "devDependencies": {
+    "@electron/notarize": "^2.5.0",
     "@types/node": "^22.12.0",
     "electron": "^33.0.0",
     "electron-builder": "^25.0.0",
@@ -37,21 +41,93 @@
     "extraResources": [
       {
         "from": "../../dist",
-        "to": "daemon",
-        "filter": ["**/*"]
+        "to": "daemon/dist",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "../../package.json",
+        "to": "daemon/package.json"
+      },
+      {
+        "from": "../../node_modules",
+        "to": "daemon/node_modules",
+        "filter": [
+          "**/*",
+          "!**/*.{ts,map,d.ts}",
+          "!**/test/**",
+          "!**/tests/**",
+          "!**/.bin/**"
+        ]
       }
     ],
+    "afterSign": "build/notarize.cjs",
     "mac": {
       "category": "public.app-category.developer-tools",
+      "icon": "build/icon.icns",
       "hardenedRuntime": true,
       "gatekeeperAssess": false,
-      "target": ["dmg", "zip"]
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist",
+      "identity": "Developer ID Application: Nathan Reynolds (4AR3Y8XD72)",
+      "notarize": false,
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        }
+      ]
+    },
+    "dmg": {
+      "title": "${productName} ${version}",
+      "iconSize": 100,
+      "contents": [
+        {
+          "x": 130,
+          "y": 220
+        },
+        {
+          "x": 410,
+          "y": 220,
+          "type": "link",
+          "path": "/Applications"
+        }
+      ],
+      "window": {
+        "width": 540,
+        "height": 400
+      }
     },
     "win": {
-      "target": ["nsis"]
+      "icon": "build/icon.ico",
+      "target": [
+        "nsis"
+      ]
     },
     "linux": {
-      "target": ["AppImage"]
-    }
+      "icon": "build/icon.png",
+      "target": [
+        "AppImage"
+      ]
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "Natebreynolds",
+        "repo": "clementine-next",
+        "releaseType": "release"
+      }
+    ]
   }
 }

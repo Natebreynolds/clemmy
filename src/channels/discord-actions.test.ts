@@ -61,8 +61,6 @@ test('buildActionsForNotification: planProposalId beats approvalId when both pre
 });
 
 test('buildActionsForNotification: ignores non-string ids', () => {
-  // @ts-expect-error — testing defensive coercion
-  assert.equal(buildActionsForNotification({ planProposalId: 42 }), undefined);
-  // @ts-expect-error — testing defensive coercion
-  assert.equal(buildActionsForNotification({ approvalId: null }), undefined);
+  assert.equal(buildActionsForNotification({ planProposalId: 42 as unknown as string }), undefined);
+  assert.equal(buildActionsForNotification({ approvalId: null as unknown as string }), undefined);
 });

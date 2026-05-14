@@ -1,0 +1,62 @@
+name: Release Desktop App
+
+# Builds, signs, notarizes, and publishes the Clementine .dmg + zip
+# to GitHub Releases whenever a tag matching `v*` is pushed.
+#
+# Required repository secrets:
+#   APPLE_ID                  natebreynolds@icloud.com
+#   APPLE_APP_PASSWORD        16-char app-specific password from appleid.apple.com
+#   APPLE_TEAM_ID             4AR3Y8XD72
+#   CSC_LINK                  base64-encoded Developer ID Application .p12
+#   CSC_KEY_PASSWORD          password used when exporting the .p12
+#   GITHUB_TOKEN              auto-provided by Actions; lets electron-builder
+#                             upload the .dmg to the release.
+#
+# To export your cert as .p12 for CSC_LINK:
+#   1. Open Keychain Access on the machine where the cert lives
+#   2. Find "Developer ID Application: Nathan Reynolds (4AR3Y8XD72)"
+#   3. Right-click → Export → format = "Personal Information Exchange (.p12)"
+#   4. Set a strong export password — that's the CSC_KEY_PASSWORD value
+#   5. base64 -i cert.p12 -o cert.p12.b64 → paste the contents as CSC_LINK
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch: {}
+
+jobs:
+  release-mac:
+    runs-on: macos-14   # arm64 runner so we can build native arm64 + cross-compile x64
+    permissions:
+      contents: write   # required to upload release assets
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install daemon deps + build
+        run: |
+          npm ci
+          npm run build
+
+      - name: Install desktop deps
+        working-directory: apps/desktop
+        run: npm ci
+
+      - name: Build + sign + notarize + publish
+        working-directory: apps/desktop
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm run release

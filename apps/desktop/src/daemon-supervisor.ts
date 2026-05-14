@@ -1,8 +1,9 @@
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { spawn, type ChildProcessByStdio } from 'node:child_process';
 import { createServer } from 'node:net';
 import { createWriteStream, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import type { Readable } from 'node:stream';
 
 /**
  * Daemon supervisor — owns the lifecycle of the local Clementine daemon
@@ -55,7 +56,7 @@ const RESTART_BASE_MS = 1_000;
 const RESTART_MAX_MS = 30_000;
 
 export class DaemonSupervisor {
-  private child: ChildProcessWithoutNullStreams | null = null;
+  private child: ChildProcessByStdio<null, Readable, Readable> | null = null;
   private logStream: ReturnType<typeof createWriteStream> | null = null;
   private shuttingDown = false;
   private restartAttempts = 0;
@@ -91,14 +92,22 @@ export class DaemonSupervisor {
 
     this.emit({ type: 'starting', port: this.chosenPort, attempt: this.restartAttempts });
 
+    const { command, args, runAsNode } = this.resolveDaemonCommand();
+
     const env: NodeJS.ProcessEnv = {
       ...process.env,
       ...this.opts.envOverrides,
       WEBHOOK_ENABLED: 'true',
       WEBHOOK_PORT: String(this.chosenPort),
     };
+    // In a packaged Electron build, process.execPath is the Electron
+    // executable itself. To run it as a plain Node.js, we set
+    // ELECTRON_RUN_AS_NODE=1 — Electron honors this and skips the
+    // browser bootstrap, behaving like a normal Node interpreter.
+    if (runAsNode) {
+      env.ELECTRON_RUN_AS_NODE = '1';
+    }
 
-    const { command, args } = this.resolveDaemonCommand();
     this.child = spawn(command, args, {
       cwd: this.opts.daemonProjectRoot,
       env,
@@ -203,23 +212,27 @@ export class DaemonSupervisor {
     this.opts.onEvent?.(event);
   }
 
-  private resolveDaemonCommand(): { command: string; args: string[] } {
+  private resolveDaemonCommand(): { command: string; args: string[]; runAsNode: boolean } {
     // Dev mode: project root has src/index.ts — run via tsx.
     const tsEntry = path.join(this.opts.daemonProjectRoot, 'src', 'index.ts');
     const jsEntry = path.join(this.opts.daemonProjectRoot, 'dist', 'index.js');
 
     if (existsSync(jsEntry)) {
-      return { command: process.execPath, args: [jsEntry, 'service'] };
+      // In a packaged Electron app, process.execPath is Electron itself.
+      // ELECTRON_RUN_AS_NODE=1 (set in the spawn env) makes it behave
+      // like Node. In dev (running under tsx), process.execPath is the
+      // real Node binary — runAsNode=true is harmless there.
+      return { command: process.execPath, args: [jsEntry, 'service'], runAsNode: true };
     }
     if (existsSync(tsEntry)) {
       // Use tsx from the daemon project's node_modules so versions
       // match the rest of the project.
       const localTsx = path.join(this.opts.daemonProjectRoot, 'node_modules', '.bin', 'tsx');
       if (existsSync(localTsx)) {
-        return { command: localTsx, args: [tsEntry, 'service'] };
+        return { command: localTsx, args: [tsEntry, 'service'], runAsNode: false };
       }
       // Fallback to npx (slower first run, but works).
-      return { command: 'npx', args: ['tsx', tsEntry, 'service'] };
+      return { command: 'npx', args: ['tsx', tsEntry, 'service'], runAsNode: false };
     }
     throw new Error(`No daemon entry found in ${this.opts.daemonProjectRoot} (expected dist/index.js or src/index.ts)`);
   }
@@ -291,7 +304,8 @@ export function locateDaemonProjectRoot(): string {
     return devCandidate;
   }
   // Packaged: resources/daemon next to the executable.
-  const packagedCandidate = path.join(process.resourcesPath ?? '', 'daemon');
+  const resourcesPath = (process as NodeJS.Process & { resourcesPath?: string }).resourcesPath;
+  const packagedCandidate = path.join(resourcesPath ?? '', 'daemon');
   if (existsSync(packagedCandidate)) return packagedCandidate;
   // Last resort: user's repo clone under ~/clementine-next.
   const homeCandidate = path.join(os.homedir(), 'clementine-next');

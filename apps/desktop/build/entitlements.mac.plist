@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Required for hardened runtime + a Node.js / Electron app that spawns
+       the bundled daemon as a child process. -->
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+  <true/>
+  <key>com.apple.security.cs.disable-library-validation</key>
+  <true/>
+  <!-- Spawning the bundled daemon binary as a child of Electron. -->
+  <key>com.apple.security.cs.allow-dyld-environment-variables</key>
+  <true/>
+  <!-- Outbound network so the daemon can talk to OpenAI, Discord, Composio. -->
+  <key>com.apple.security.network.client</key>
+  <true/>
+  <!-- Daemon listens on localhost for the console; users may also expose
+       a webhook. Server entitlement keeps everything happy. -->
+  <key>com.apple.security.network.server</key>
+  <true/>
+  <!-- User selects files/folders during setup (workspaces, vault). -->
+  <key>com.apple.security.files.user-selected.read-write</key>
+  <true/>
+  <!-- The daemon supervises subprocesses (`sf`, `gh`, etc.) on the user's
+       behalf when plan-scope auto-approval is open. -->
+  <key>com.apple.security.inherit</key>
+  <true/>
+</dict>
+</plist>
