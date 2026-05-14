@@ -58,6 +58,8 @@ export const LOCAL_MCP_TOOL_NAMES = [
   'execution_update_step',
   'execution_mark_blocked',
   'execution_complete',
+  'user_profile_read',
+  'user_profile_update',
   'team_list',
   'team_message',
   'team_request',

@@ -10,6 +10,7 @@ import { autonomyV2OutputGuardrails } from './autonomy-guardrails.js';
 import { getProactivityPolicySnapshot, type ProactivityPolicy, type ProactivityPolicySnapshot } from './proactivity-policy.js';
 import { renderOpenCheckInsForAgent } from './check-ins.js';
 import { activeExecutionCountForSession, renderActiveExecutionsForAgent } from '../tools/execution-tools.js';
+import { renderProfileForInstructions } from '../runtime/user-profile.js';
 import type { RuntimeContextValue } from '../types.js';
 import {
   AGENT_INBOX_DIR,
@@ -276,11 +277,13 @@ function buildAgentInput(agent: TeamAgentRecord, inboxItems: AgentInboxItem[], s
 
   const policy = policyOverride ?? getProactivityPolicySnapshot().policy;
   const policyText = buildPolicyText(policy);
+  const profileText = renderProfileForInstructions();
   const checkInsText = renderOpenCheckInsForAgent(agent.slug);
   const executionsText = renderActiveExecutionsForAgent(`agent:${agent.slug}`);
 
   return [
     `Context date: ${today}`,
+    profileText ? `User preferences:\n${profileText}` : '',
     policyText,
     commitments,
     goalsText ? `Active goals (push these forward):\n${goalsText}` : '',

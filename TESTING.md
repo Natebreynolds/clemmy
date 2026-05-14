@@ -24,8 +24,9 @@ npx tsx --test src/**/*.test.ts
 | `src/agents/run-tracking.test.ts` | 9 | start / record / finish lifecycle, list filtering, slug extraction |
 | `src/agents/autonomy-v2.test.ts` | 44 | `AgentDecisionSchema` validation, `buildPolicyText` per mode + allowed/blocked categories + check-in cadence, `categorizeToolForPolicy` + `filterToolsByPolicy`, `buildPolicyEvent` shape + data fields + JSON-serializability, `parseToolArguments` (JSON object / array / quoted string / non-JSON / empty / fallback), `looksLikeToolError` (vocabulary, HTTP codes, false positives), `chooseFollowUpMinutes` (agent pick wins, floor at 5, hands_on=base, balanced=2x, watch=3x with 15-min floor, 60-min cap) |
 | `src/agents/check-ins.test.ts` | 17 | `createCheckIn` write + persistence + validation, `getCheckIn` / `listCheckIns` filters + sort, `answerCheckIn` lifecycle + inbox enqueue + idempotency, `closeCheckIn` lifecycle, `renderOpenCheckInsForAgent` for the agent input, deletion + status='all' filtering |
+| `src/runtime/user-profile.test.ts` | 15 | `loadUserProfile` defaults, `saveUserProfile` persistence + partial-patch behavior + updatedAt advance, `normalizeUserProfile` validation (tone / formality / urgency / working hours format / workingDays type-filter / notes clamp), `renderProfileForInstructions` per-tone / per-formality / per-urgency guidance + working hours + preferred name |
 
-Total: **103 tests, ~1s runtime**.
+Total: **118 tests, ~1.4s runtime**.
 
 ## Adding tests
 

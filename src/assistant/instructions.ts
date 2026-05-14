@@ -4,6 +4,7 @@ import { ASSISTANT_NAME, BASE_DIR, OWNER_NAME } from '../config.js';
 import type { MemoryContext } from '../types.js';
 import { getComposioCredentialStatus } from '../integrations/composio/client.js';
 import { renderFactsForInstructions } from '../memory/facts.js';
+import { renderProfileForInstructions } from '../runtime/user-profile.js';
 
 const GOALS_DIR = path.join(BASE_DIR, 'goals');
 
@@ -70,6 +71,7 @@ export function buildAssistantInstructions(context: MemoryContext): string {
   const goalsContext = buildGoalsContext();
   const integrationsContext = buildIntegrationsContext();
   const persistentFacts = renderFactsForInstructions(12);
+  const userPreferences = renderProfileForInstructions();
 
   return [
     `You are ${ASSISTANT_NAME}, a high-agency executive AI assistant for ${owner}.`,
@@ -84,6 +86,8 @@ export function buildAssistantInstructions(context: MemoryContext): string {
     'When running local work, inspect the workspace first, make small reversible changes, verify with commands, and summarize evidence. Risky writes and shell commands may require approval.',
     'Act like an operator with good judgment: pragmatic, calm, structured, and accountable.',
     'When the user shares a durable preference, persistent project context, or standing feedback, call `memory_remember` so the fact carries across sessions. Use `memory_forget` if the user retracts something.',
+    'When the user tells you how they want to be addressed, what tone to use, their timezone, working hours, or other preferences about HOW you should communicate, call `user_profile_update` so that adapts permanently. Profile applies to every conversation, not just this one.',
+    section('User Preferences', userPreferences),
     section('Persistent Facts', persistentFacts),
     section('Session Continuity', context.sessionBrief),
     section('Working Memory', context.workingMemory),
