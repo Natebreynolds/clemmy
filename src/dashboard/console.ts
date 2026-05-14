@@ -64,7 +64,7 @@ export function renderConsoleHtml(token: string): string {
         <span class="nav-key">01</span>
         <span class="nav-label">Activity</span>
       </button>
-      <button class="nav" data-panel="memory" disabled title="Coming next">
+      <button class="nav" data-panel="memory">
         <span class="nav-key">02</span>
         <span class="nav-label">Memory</span>
       </button>
@@ -123,6 +123,66 @@ export function renderConsoleHtml(token: string): string {
               <p class="hint">Select a run to inspect its event timeline.</p>
             </div>
           </aside>
+
+        </div>
+      </section>
+
+      <section class="panel-frame" data-section="memory" hidden>
+        <div class="panel-tag">PANEL · 02 · MEMORY NAVIGATOR</div>
+
+        <div class="panel-body memory-layout">
+
+          <aside class="mem-sidebar">
+            <div class="mem-stats" data-mem-stats>
+              <div class="mem-stat"><span>CHUNKS</span><em data-mem-chunks>—</em></div>
+              <div class="mem-stat"><span>FILES</span><em data-mem-files>—</em></div>
+              <div class="mem-stat"><span>FACTS</span><em data-mem-facts>—</em></div>
+              <div class="mem-stat"><span>EMBED</span><em data-mem-embed>—</em></div>
+            </div>
+
+            <div class="mem-section">
+              <div class="mem-section-head">
+                <span>INDEXED FILES</span>
+                <em data-mem-files-count>—</em>
+              </div>
+              <ol class="mem-file-list" data-mem-file-list>
+                <li class="empty">— loading —</li>
+              </ol>
+            </div>
+
+            <div class="mem-section">
+              <div class="mem-section-head">
+                <span>DURABLE FACTS</span>
+                <em data-mem-facts-count>—</em>
+              </div>
+              <div class="mem-fact-kinds" data-mem-fact-kinds>
+                <button class="kind-pill active" data-kind="">ALL</button>
+                <button class="kind-pill" data-kind="user">USER</button>
+                <button class="kind-pill" data-kind="project">PROJECT</button>
+                <button class="kind-pill" data-kind="feedback">FEEDBACK</button>
+                <button class="kind-pill" data-kind="reference">REFERENCE</button>
+              </div>
+              <ol class="mem-fact-list" data-mem-fact-list>
+                <li class="empty">— loading —</li>
+              </ol>
+            </div>
+          </aside>
+
+          <div class="mem-main">
+            <div class="mem-search">
+              <input type="search" class="mem-search-input" data-mem-search
+                placeholder="search vault · FTS + embedding rerank · ⏎ to query"
+                autocomplete="off" spellcheck="false" />
+              <span class="mem-search-meta" data-mem-search-meta>—</span>
+            </div>
+
+            <div class="mem-viewer" data-mem-viewer>
+              <div class="mem-empty">
+                <div class="mem-empty-mark">▢</div>
+                <div class="mem-empty-text">SEARCH OR SELECT A FILE / FACT</div>
+              </div>
+            </div>
+          </div>
 
         </div>
       </section>
@@ -501,6 +561,315 @@ body {
 .detail-event[data-type="queued_background"] .ev-type { color: var(--accent-warn); }
 .detail-event .ev-msg { color: var(--fg); }
 
+/* ── Memory panel ────────────────────────────────────────────── */
+.memory-layout {
+  display: grid;
+  grid-template-columns: 320px 1fr;
+  gap: 18px;
+  height: 100%;
+  overflow: hidden;
+}
+.mem-sidebar {
+  border: 1px solid var(--line);
+  background: var(--bg-2);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.mem-stats {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-1);
+}
+.mem-stat {
+  padding: 8px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  border-right: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  color: var(--fg-3);
+}
+.mem-stat:nth-child(2n) { border-right: 0; }
+.mem-stat:nth-last-child(-n+2) { border-bottom: 0; }
+.mem-stat em { font-style: normal; color: var(--fg); font-size: 14px; letter-spacing: 0.04em; }
+
+.mem-section {
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.mem-section:last-child { border-bottom: 0; flex: 1; }
+.mem-section-head {
+  padding: 8px 12px;
+  background: var(--bg-1);
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  color: var(--fg-3);
+}
+.mem-section-head em { font-style: normal; color: var(--fg); }
+
+.mem-file-list,
+.mem-fact-list {
+  list-style: none;
+  margin: 0; padding: 0;
+  overflow-y: auto;
+  font-size: 11px;
+  flex: 1;
+  min-height: 80px;
+  max-height: 240px;
+}
+.mem-file-list .empty,
+.mem-fact-list .empty {
+  padding: 18px;
+  text-align: center;
+  color: var(--fg-mute);
+  letter-spacing: 0.1em;
+}
+.mem-file-list li.file,
+.mem-fact-list li.fact {
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--line);
+  cursor: pointer;
+  transition: background 100ms;
+}
+.mem-file-list li.file:hover,
+.mem-fact-list li.fact:hover { background: var(--bg-3); }
+.mem-file-list li.file.selected,
+.mem-fact-list li.fact.selected {
+  background: var(--bg-3);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+.mem-file-list .name {
+  color: var(--fg);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: block;
+}
+.mem-file-list .meta {
+  color: var(--fg-3);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  display: block;
+  margin-top: 2px;
+}
+.mem-fact-list li.fact .kind {
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  color: var(--accent);
+  margin-right: 6px;
+}
+.mem-fact-list li.fact .body {
+  color: var(--fg);
+  display: block;
+}
+.mem-fact-list li.fact .body-extra {
+  display: block;
+  font-size: 10px;
+  color: var(--fg-3);
+  margin-top: 2px;
+}
+
+.mem-fact-kinds {
+  display: flex;
+  gap: 4px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-1);
+}
+.kind-pill {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-3);
+  font: inherit;
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  padding: 3px 7px;
+  cursor: pointer;
+  transition: background 100ms, color 100ms, border-color 100ms;
+}
+.kind-pill:hover { color: var(--fg); border-color: var(--line-bright); }
+.kind-pill.active {
+  background: var(--accent);
+  color: var(--bg-0);
+  border-color: var(--accent);
+}
+
+.mem-main {
+  border: 1px solid var(--line);
+  background: var(--bg-2);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.mem-search {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-1);
+}
+.mem-search-input {
+  flex: 1;
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  color: var(--fg);
+  padding: 7px 10px;
+  font: inherit;
+  letter-spacing: 0.04em;
+  outline: none;
+  transition: border-color 120ms;
+}
+.mem-search-input:focus { border-color: var(--accent); }
+.mem-search-input::placeholder { color: var(--fg-mute); letter-spacing: 0.06em; }
+.mem-search-meta {
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  color: var(--fg-3);
+}
+
+.mem-viewer {
+  flex: 1;
+  overflow-y: auto;
+  padding: 14px;
+  font-size: 12px;
+}
+.mem-empty {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  color: var(--fg-mute);
+  letter-spacing: 0.16em;
+  font-size: 10px;
+}
+.mem-empty-mark { font-size: 38px; color: var(--line-bright); }
+
+.search-result {
+  border: 1px solid var(--line);
+  background: var(--bg-1);
+  margin-bottom: 10px;
+}
+.search-result-head {
+  padding: 7px 12px;
+  background: var(--bg-2);
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  color: var(--fg-3);
+}
+.search-result-head .title { color: var(--fg); font-size: 11px; }
+.search-result-head .score { color: var(--accent-2); }
+.search-result-body {
+  padding: 10px 12px;
+}
+.search-result-body pre {
+  margin: 0;
+  font: 11px/1.55 var(--mono);
+  color: var(--fg-2);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.search-result-body .hit-token {
+  color: var(--accent);
+  background: rgba(255, 90, 53, 0.15);
+  padding: 0 2px;
+}
+.search-result-path {
+  color: var(--fg-mute);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  word-break: break-all;
+}
+
+.file-viewer {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.file-viewer-head {
+  border: 1px solid var(--line);
+  background: var(--bg-1);
+  padding: 10px 12px;
+}
+.file-viewer-head .path { color: var(--accent); font-size: 11px; word-break: break-all; }
+.file-viewer-head .stats { color: var(--fg-3); font-size: 10px; letter-spacing: 0.14em; margin-top: 4px; }
+.file-chunk {
+  border: 1px solid var(--line);
+  background: var(--bg-1);
+}
+.file-chunk-head {
+  padding: 6px 12px;
+  background: var(--bg-2);
+  border-bottom: 1px solid var(--line);
+  color: var(--fg-3);
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  display: flex;
+  justify-content: space-between;
+}
+.file-chunk-head em { font-style: normal; color: var(--fg); }
+.file-chunk-body {
+  padding: 8px 12px;
+}
+.file-chunk-body pre {
+  margin: 0;
+  font: 11px/1.55 var(--mono);
+  color: var(--fg-2);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.fact-viewer {
+  border: 1px solid var(--line);
+  background: var(--bg-1);
+  padding: 14px;
+}
+.fact-viewer .kind {
+  color: var(--accent);
+  font-size: 10px;
+  letter-spacing: 0.18em;
+}
+.fact-viewer .body {
+  margin: 8px 0;
+  font-size: 13px;
+  color: var(--fg);
+  line-height: 1.5;
+}
+.fact-viewer .meta {
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  color: var(--fg-3);
+}
+.fact-viewer .forget {
+  margin-top: 14px;
+  background: transparent;
+  border: 1px solid var(--accent-fail);
+  color: var(--accent-fail);
+  padding: 6px 12px;
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  cursor: pointer;
+  transition: background 100ms, color 100ms;
+}
+.fact-viewer .forget:hover { background: var(--accent-fail); color: var(--bg-0); }
+
 /* ── Foot bar ───────────────────────────────────────────────── */
 .foot-bar {
   display: flex;
@@ -723,6 +1092,256 @@ const CONSOLE_JS = `
       setOnline(false);
       els.lastSync.textContent = 'stalled';
     }
+  }
+
+  // ─── Panel routing ────────────────────────────────────────────
+  //
+  // Click a sidebar nav button → show its panel-frame, hide the rest.
+  // Activity is the default. Memory boots lazily the first time it's
+  // shown.
+
+  const navButtons = Array.from(document.querySelectorAll('.nav[data-panel]'));
+  const panelSections = Array.from(document.querySelectorAll('.panel-frame[data-section]'));
+  let memoryBooted = false;
+
+  function switchPanel(name) {
+    panelSections.forEach((s) => {
+      const match = s.getAttribute('data-section') === name;
+      if (match) s.removeAttribute('hidden');
+      else s.setAttribute('hidden', '');
+    });
+    navButtons.forEach((b) => b.classList.toggle('active', b.getAttribute('data-panel') === name));
+    if (name === 'memory' && !memoryBooted) {
+      memoryBooted = true;
+      bootMemoryPanel();
+    } else if (name === 'memory') {
+      refreshMemoryPanel();
+    }
+  }
+  navButtons.forEach((b) => {
+    b.addEventListener('click', () => {
+      if (b.hasAttribute('disabled')) return;
+      switchPanel(b.getAttribute('data-panel'));
+    });
+  });
+
+  // ─── Memory panel ─────────────────────────────────────────────
+
+  const mem = {
+    chunks:     document.querySelector('[data-mem-chunks]'),
+    files:      document.querySelector('[data-mem-files]'),
+    facts:      document.querySelector('[data-mem-facts]'),
+    embed:      document.querySelector('[data-mem-embed]'),
+    fileList:   document.querySelector('[data-mem-file-list]'),
+    factList:   document.querySelector('[data-mem-fact-list]'),
+    fileCount:  document.querySelector('[data-mem-files-count]'),
+    factCount:  document.querySelector('[data-mem-facts-count]'),
+    kinds:      document.querySelector('[data-mem-fact-kinds]'),
+    search:     document.querySelector('[data-mem-search]'),
+    searchMeta: document.querySelector('[data-mem-search-meta]'),
+    viewer:     document.querySelector('[data-mem-viewer]'),
+  };
+  let memSelectedFile = null;
+  let memSelectedFact = null;
+  let memActiveKind = '';
+  let memSearchSeq = 0;
+
+  function escMem(s) {
+    if (s === null || s === undefined) return '';
+    return String(s).replace(/[<>&]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]));
+  }
+
+  function fmtMtime(ms) {
+    if (!ms) return '—';
+    const d = new Date(ms);
+    return d.toLocaleDateString() + ' ' + d.toLocaleTimeString();
+  }
+
+  function shortenPath(full) {
+    const parts = full.split('/');
+    if (parts.length <= 3) return full;
+    return '…/' + parts.slice(-3).join('/');
+  }
+
+  async function bootMemoryPanel() {
+    await Promise.all([refreshMemoryStatus(), refreshFileList(), refreshFactList()]);
+  }
+  async function refreshMemoryPanel() {
+    await Promise.all([refreshMemoryStatus(), refreshFileList(), refreshFactList()]);
+  }
+
+  async function refreshMemoryStatus() {
+    try {
+      const snap = await fetchJSON('/api/dashboard');
+      const idx = snap.memoryIndex || {};
+      mem.chunks.textContent = idx.chunks ?? '—';
+      mem.files.textContent  = idx.indexedFiles ?? '—';
+      mem.facts.textContent  = idx.activeFacts ?? '—';
+      mem.embed.textContent  = idx.embeddingsEnabled
+        ? Math.round((idx.embeddingsCoverage || 0) * 100) + '%'
+        : 'off';
+    } catch (_) { /* tolerate offline */ }
+  }
+
+  async function refreshFileList() {
+    try {
+      const data = await fetchJSON('/api/console/memory/files');
+      const files = data.files || [];
+      mem.fileCount.textContent = files.length;
+      if (files.length === 0) {
+        mem.fileList.innerHTML = '<li class="empty">— no indexed files —</li>';
+        return;
+      }
+      mem.fileList.innerHTML = files.slice(0, 60).map((f) => {
+        const cls = memSelectedFile === f.path ? 'file selected' : 'file';
+        return [
+          '<li class="' + cls + '" data-file-path="' + escMem(f.path) + '">',
+          '  <span class="name" title="' + escMem(f.path) + '">' + escMem(shortenPath(f.path)) + '</span>',
+          '  <span class="meta">' + f.chunks + ' chunks · ' + fmtMtime(f.mtime) + '</span>',
+          '</li>',
+        ].join('');
+      }).join('');
+      Array.from(mem.fileList.querySelectorAll('li.file')).forEach((li) => {
+        li.addEventListener('click', () => {
+          memSelectedFile = li.getAttribute('data-file-path');
+          memSelectedFact = null;
+          Array.from(mem.fileList.querySelectorAll('li.file')).forEach((el) => el.classList.toggle('selected', el === li));
+          Array.from(mem.factList.querySelectorAll('li.fact')).forEach((el) => el.classList.remove('selected'));
+          loadFileViewer(memSelectedFile);
+        });
+      });
+    } catch (err) {
+      mem.fileList.innerHTML = '<li class="empty">— failed: ' + escMem(err.message || err) + ' —</li>';
+    }
+  }
+
+  async function refreshFactList() {
+    try {
+      const url = memActiveKind ? '/api/console/memory/facts?kind=' + encodeURIComponent(memActiveKind) : '/api/console/memory/facts';
+      const data = await fetchJSON(url);
+      const facts = data.facts || [];
+      mem.factCount.textContent = facts.length;
+      if (facts.length === 0) {
+        mem.factList.innerHTML = '<li class="empty">— no facts in this kind —</li>';
+        return;
+      }
+      mem.factList.innerHTML = facts.map((f) => {
+        const cls = memSelectedFact === f.id ? 'fact selected' : 'fact';
+        return [
+          '<li class="' + cls + '" data-fact-id="' + f.id + '">',
+          '  <span class="kind">' + escMem(f.kind.toUpperCase()) + '</span>',
+          '  <span class="body">' + escMem(f.content) + '</span>',
+          '  <span class="body-extra">score ' + (f.score || 1).toFixed(2) + ' · updated ' + (f.updatedAt ? f.updatedAt.slice(0, 10) : '—') + '</span>',
+          '</li>',
+        ].join('');
+      }).join('');
+      Array.from(mem.factList.querySelectorAll('li.fact')).forEach((li) => {
+        li.addEventListener('click', () => {
+          memSelectedFact = Number(li.getAttribute('data-fact-id'));
+          memSelectedFile = null;
+          Array.from(mem.factList.querySelectorAll('li.fact')).forEach((el) => el.classList.toggle('selected', el === li));
+          Array.from(mem.fileList.querySelectorAll('li.file')).forEach((el) => el.classList.remove('selected'));
+          const fact = facts.find((f) => f.id === memSelectedFact);
+          if (fact) renderFactViewer(fact);
+        });
+      });
+    } catch (err) {
+      mem.factList.innerHTML = '<li class="empty">— failed: ' + escMem(err.message || err) + ' —</li>';
+    }
+  }
+
+  mem.kinds.querySelectorAll('.kind-pill').forEach((pill) => {
+    pill.addEventListener('click', () => {
+      memActiveKind = pill.getAttribute('data-kind') || '';
+      mem.kinds.querySelectorAll('.kind-pill').forEach((p) => p.classList.toggle('active', p === pill));
+      refreshFactList();
+    });
+  });
+
+  mem.search.addEventListener('keydown', async (e) => {
+    if (e.key !== 'Enter') return;
+    const q = mem.search.value.trim();
+    if (!q) return;
+    const seq = ++memSearchSeq;
+    mem.searchMeta.textContent = 'searching…';
+    try {
+      const data = await fetchJSON('/api/console/memory/search?q=' + encodeURIComponent(q) + '&limit=10');
+      if (seq !== memSearchSeq) return;
+      renderSearchResults(q, data.hits || []);
+    } catch (err) {
+      mem.searchMeta.textContent = 'search failed';
+      mem.viewer.innerHTML = '<div class="mem-empty"><div class="mem-empty-mark">!</div><div class="mem-empty-text">' + escMem(err.message || err) + '</div></div>';
+    }
+  });
+
+  function renderSearchResults(query, hits) {
+    mem.searchMeta.textContent = hits.length + ' HIT' + (hits.length === 1 ? '' : 'S');
+    if (hits.length === 0) {
+      mem.viewer.innerHTML = '<div class="mem-empty"><div class="mem-empty-mark">∅</div><div class="mem-empty-text">NO RESULTS FOR &ldquo;' + escMem(query) + '&rdquo;</div></div>';
+      return;
+    }
+    mem.viewer.innerHTML = hits.map((hit) => {
+      // Highlight bracketed tokens from FTS snippet rendering ([token])
+      const snippetHtml = escMem(hit.snippet || '').replace(/\\[(.+?)\\]/g, '<span class="hit-token">$1</span>');
+      return [
+        '<div class="search-result">',
+        '  <div class="search-result-head">',
+        '    <span class="title">' + escMem(hit.title || '(untitled)') + '</span>',
+        '    <span class="score">' + (typeof hit.score === 'number' ? hit.score.toFixed(2) : '—') + '</span>',
+        '  </div>',
+        '  <div class="search-result-body">',
+        '    <pre>' + snippetHtml + '</pre>',
+        '    <div class="search-result-path">' + escMem(hit.filePath || '') + '</div>',
+        '  </div>',
+        '</div>',
+      ].join('');
+    }).join('');
+  }
+
+  async function loadFileViewer(path) {
+    if (!path) return;
+    try {
+      const data = await fetchJSON('/api/console/memory/file?path=' + encodeURIComponent(path));
+      const chunks = data.chunks || [];
+      const totalBytes = chunks.reduce((s, c) => s + (c.byteSize || 0), 0);
+      const stats = chunks.length + ' chunks · ' + totalBytes + ' bytes';
+      const head = '<div class="file-viewer-head"><div class="path">' + escMem(path) + '</div><div class="stats">' + stats + '</div></div>';
+      const body = chunks.map((c) => [
+        '<div class="file-chunk">',
+        '  <div class="file-chunk-head"><span>CHUNK #' + c.chunkIndex + '</span><em>' + escMem(c.title || '(no title)') + '</em></div>',
+        '  <div class="file-chunk-body"><pre>' + escMem(c.content) + '</pre></div>',
+        '</div>',
+      ].join('')).join('');
+      mem.viewer.innerHTML = '<div class="file-viewer">' + head + body + '</div>';
+    } catch (err) {
+      mem.viewer.innerHTML = '<div class="mem-empty"><div class="mem-empty-mark">!</div><div class="mem-empty-text">' + escMem(err.message || err) + '</div></div>';
+    }
+  }
+
+  function renderFactViewer(fact) {
+    const html = [
+      '<div class="fact-viewer">',
+      '  <div class="kind">' + escMem(fact.kind.toUpperCase()) + ' · #' + fact.id + '</div>',
+      '  <div class="body">' + escMem(fact.content) + '</div>',
+      '  <div class="meta">score ' + (fact.score || 1).toFixed(2)
+         + ' · created ' + (fact.createdAt ? fact.createdAt.slice(0, 19).replace('T', ' ') : '—')
+         + ' · updated ' + (fact.updatedAt ? fact.updatedAt.slice(0, 19).replace('T', ' ') : '—') + '</div>',
+      '  <button class="forget" data-forget-id="' + fact.id + '">FORGET ▣</button>',
+      '</div>',
+    ].join('');
+    mem.viewer.innerHTML = html;
+    const btn = mem.viewer.querySelector('.forget');
+    btn.addEventListener('click', async () => {
+      if (!confirm('Soft-delete fact #' + fact.id + '?')) return;
+      try {
+        await fetch(withToken('/api/console/memory/facts/' + fact.id + '/forget'), { method: 'POST' });
+        await refreshFactList();
+        await refreshMemoryStatus();
+        mem.viewer.innerHTML = '<div class="mem-empty"><div class="mem-empty-mark">▢</div><div class="mem-empty-text">FACT FORGOTTEN</div></div>';
+      } catch (err) {
+        alert('Forget failed: ' + (err.message || err));
+      }
+    });
   }
 
   // Boot the loop.
