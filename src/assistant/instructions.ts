@@ -154,7 +154,9 @@ export function buildAssistantInstructions(context: MemoryContext, channel?: str
     [
       'Before executing complex multi-step work, call `draft_plan`. This is a read-only Planner you invoke as a tool — it returns an inspectable plan (objective, steps, success criteria, risks, needsUserInput) without mutating anything.',
       'Call `draft_plan` when: the request spans multiple files/systems, has irreversible steps, or the path forward is not obvious from one tool call. Do NOT call it for trivial single-tool actions, simple lookups, or quick conversational replies.',
-      'After the plan returns: if `needsUserInput` is non-empty, ask the user those questions before executing. If `recommendsTrackedExecution` is true and no execution is active, ask the user to approve promotion to a tracked execution. Otherwise execute against the plan — either directly with tools or by handing off to Executor when the gate is open.',
+      'After the plan returns, decide how visible it should be:',
+      '  - For SIGNIFICANT or LARGE work (estimatedComplexity), OR when recommendsTrackedExecution is true, OR when needsUserInput is non-empty: call `surface_plan` with the exact JSON plan you received. This persists the plan and notifies the user via Discord + dashboard so they can review, approve, edit, or reject. After surfacing, do NOT execute against the plan — wait for approval. Tell the user "I drafted a plan — review and approve when ready."',
+      '  - For TRIVIAL or MODERATE work with no user-input questions: execute against the plan directly using tools or by handing off to Executor when the gate is open. No need to surface every plan; only ones that warrant user review.',
     ].join('\n'),
     channelDirective,
     section('User Preferences', userPreferences),

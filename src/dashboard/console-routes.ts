@@ -38,6 +38,14 @@ import {
   listProposals,
   rejectProposal,
 } from '../agents/check-in-proposals.js';
+import {
+  approvePlanProposal,
+  deletePlanProposal,
+  getPlanProposal,
+  listPlanProposals,
+  rejectPlanProposal,
+} from '../agents/plan-proposals.js';
+import { PlanSchema } from '../agents/planner.js';
 import type { CheckInUrgency } from '../agents/check-ins.js';
 
 /**
@@ -909,6 +917,60 @@ export function registerConsoleRoutes(
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const ok = deleteProposal(req.params.id);
     if (!ok) { res.status(404).json({ error: 'proposal not found' }); return; }
+    res.json({ deleted: true });
+  });
+
+  // ─── Plan proposals (Planner sub-agent → user review) ──────────
+
+  app.get('/api/console/plan-proposals', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const status = typeof req.query.status === 'string' ? req.query.status : undefined;
+    const wanted = (status === 'pending' || status === 'approved' || status === 'rejected' || status === 'superseded' || status === 'all')
+      ? status : 'pending';
+    try {
+      const items = listPlanProposals({ status: wanted, limit: 50 });
+      res.json({ proposals: items });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.get('/api/console/plan-proposals/:id', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const p = getPlanProposal(req.params.id);
+    if (!p) { res.status(404).json({ error: 'plan proposal not found' }); return; }
+    res.json({ proposal: p });
+  });
+
+  app.post('/api/console/plan-proposals/:id/approve', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const body = req.body ?? {};
+    let editedPlan: ReturnType<typeof PlanSchema.parse> | undefined;
+    if (body.editedPlan && typeof body.editedPlan === 'object') {
+      const parsed = PlanSchema.safeParse(body.editedPlan);
+      if (!parsed.success) {
+        res.status(400).json({ error: 'editedPlan did not match PlanSchema', details: parsed.error.message });
+        return;
+      }
+      editedPlan = parsed.data;
+    }
+    const result = approvePlanProposal(req.params.id, { editedPlan });
+    if (!result) { res.status(404).json({ error: 'plan proposal not found or already resolved' }); return; }
+    res.json({ proposal: result });
+  });
+
+  app.post('/api/console/plan-proposals/:id/reject', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const reason = typeof req.body?.reason === 'string' ? req.body.reason : undefined;
+    const result = rejectPlanProposal(req.params.id, reason);
+    if (!result) { res.status(404).json({ error: 'plan proposal not found' }); return; }
+    res.json({ proposal: result });
+  });
+
+  app.delete('/api/console/plan-proposals/:id', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const ok = deletePlanProposal(req.params.id);
+    if (!ok) { res.status(404).json({ error: 'plan proposal not found' }); return; }
     res.json({ deleted: true });
   });
 }

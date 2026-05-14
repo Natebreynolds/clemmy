@@ -482,6 +482,19 @@ export function renderConsoleHtml(token: string): string {
 
             <div class="settings-block">
               <div class="settings-block-head">
+                PROPOSED PLANS
+                <span class="creds-meta" data-plan-proposals-meta>—</span>
+              </div>
+              <div class="proposals-intro">
+                Plans the agent drafted before mutating anything. Review the objective, steps, and risks. Approve to let the agent proceed, edit to change the plan first, or reject to abandon.
+              </div>
+              <div class="plan-proposals-list" data-plan-proposals-list>
+                <div class="settings-info">— no pending plans —</div>
+              </div>
+            </div>
+
+            <div class="settings-block">
+              <div class="settings-block-head">
                 PROPOSED BY AGENT
                 <span class="creds-meta" data-proposals-meta>—</span>
               </div>
@@ -2317,6 +2330,118 @@ body {
 }
 .checkins-btn-new:hover { background: var(--accent); color: var(--bg-0); }
 
+/* ── Plan proposals (Settings sub-block) ──────────────────────── */
+.plan-proposals-list {
+  display: flex;
+  flex-direction: column;
+}
+.plan-proposal-row {
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  background:
+    linear-gradient(180deg, rgba(80, 200, 230, 0.05) 0%, transparent 32%),
+    var(--bg-1);
+  border-left: 2px solid var(--accent-3);
+}
+.plan-proposal-row:last-child { border-bottom: 0; }
+.plan-head { display: flex; flex-direction: column; gap: 4px; }
+.plan-objective {
+  font-size: 13px;
+  color: var(--fg);
+  letter-spacing: 0.01em;
+  font-weight: 500;
+}
+.plan-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  color: var(--fg-3);
+}
+.plan-meta .pill {
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  padding: 1px 6px;
+  border: 1px solid var(--line);
+}
+.plan-meta .pill.complexity-trivial { color: var(--fg-mute); border-color: var(--fg-mute); }
+.plan-meta .pill.complexity-moderate { color: var(--accent-2); border-color: var(--accent-2); }
+.plan-meta .pill.complexity-significant { color: var(--accent-warn); border-color: var(--accent-warn); }
+.plan-meta .pill.complexity-large { color: var(--accent-fail); border-color: var(--accent-fail); }
+.plan-meta .pill.plan-tracked { color: var(--accent-3); border-color: var(--accent-3); }
+
+.plan-label {
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  color: var(--accent-3);
+  margin-right: 6px;
+}
+.plan-context, .plan-request {
+  font-size: 11px;
+  color: var(--fg-2);
+  line-height: 1.5;
+}
+.plan-request { color: var(--fg-mute); font-style: italic; }
+
+.plan-section { font-size: 11px; line-height: 1.55; color: var(--fg-2); }
+.plan-section ol, .plan-section ul {
+  margin: 4px 0 0 4px;
+  padding: 0;
+  list-style: none;
+}
+.plan-section li {
+  padding: 4px 0;
+  border-left: 1px dotted var(--line);
+  padding-left: 10px;
+  margin-left: 6px;
+}
+.plan-step-n {
+  font-family: var(--font-mono, monospace);
+  color: var(--accent-3);
+  margin-right: 4px;
+}
+.plan-step-action { color: var(--fg); }
+.plan-step-rationale {
+  margin-top: 2px;
+  font-size: 10px;
+  color: var(--fg-mute);
+  font-style: italic;
+}
+.plan-step-verify {
+  margin-top: 2px;
+  font-size: 10px;
+  color: var(--accent-2);
+  font-family: var(--font-mono, monospace);
+}
+.plan-risks li { color: var(--accent-warn); }
+.plan-questions li { color: var(--accent); }
+
+.plan-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 4px;
+}
+.plan-actions button {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  padding: 6px 12px;
+  cursor: pointer;
+  transition: background 100ms, color 100ms, border-color 100ms;
+}
+.plan-actions .plan-btn-approve { color: var(--accent-2); border-color: var(--accent-2); }
+.plan-actions .plan-btn-approve:hover { background: var(--accent-2); color: var(--bg-0); }
+.plan-actions .plan-btn-reject { color: var(--accent-fail); border-color: var(--accent-fail); }
+.plan-actions .plan-btn-reject:hover { background: var(--accent-fail); color: var(--bg-0); }
+
 /* ── Agent-drafted proposals (Settings sub-block) ─────────────── */
 .proposals-intro {
   padding: 10px 16px;
@@ -3818,12 +3943,117 @@ const CONSOLE_JS = `
 
       renderAuthInfo(s.auth);
       renderMemoryInfo(s.memory);
+      await refreshPlanProposals();
       await refreshProposals();
       await refreshCheckIns();
       await refreshCredentialsHealth();
     } catch (err) {
       sett.authBox.innerHTML = '<div style="color:var(--accent-fail);">Failed to load settings: ' + escMem(err.message || err) + '</div>';
     }
+  }
+
+  // ─── Plan proposals (draft_plan → user review) ────────────────
+
+  async function refreshPlanProposals() {
+    const listEl = document.querySelector('[data-plan-proposals-list]');
+    const metaEl = document.querySelector('[data-plan-proposals-meta]');
+    if (!listEl || !metaEl) return;
+    try {
+      const data = await fetchJSON('/api/console/plan-proposals?status=pending');
+      const items = data.proposals || [];
+      metaEl.textContent = items.length === 0 ? 'no plans' : items.length + ' awaiting review';
+      if (items.length === 0) {
+        listEl.innerHTML = '<div class="settings-info">— no pending plans · agent will surface plans for significant work before mutating —</div>';
+        return;
+      }
+      listEl.innerHTML = items.map((p) => {
+        const plan = p.plan || {};
+        const proposedAt = (p.proposedAt || '').slice(0, 16).replace('T', ' ');
+        const steps = (plan.steps || []).map((s) => (
+          '<li><span class="plan-step-n">' + s.n + '.</span> ' +
+          '<span class="plan-step-action">' + escMem(s.action) + '</span>' +
+          (s.rationale ? '<div class="plan-step-rationale">' + escMem(s.rationale) + '</div>' : '') +
+          (s.verification ? '<div class="plan-step-verify">verify: ' + escMem(s.verification) + '</div>' : '') +
+          '</li>'
+        )).join('');
+        const successCriteria = (plan.successCriteria || []).map((c) => '<li>' + escMem(c) + '</li>').join('');
+        const risks = (plan.risks || []).length > 0
+          ? '<div class="plan-section"><span class="plan-label">RISKS</span><ul class="plan-risks">' + plan.risks.map((r) => '<li>' + escMem(r) + '</li>').join('') + '</ul></div>'
+          : '';
+        const questions = (plan.needsUserInput || []).length > 0
+          ? '<div class="plan-section"><span class="plan-label">QUESTIONS</span><ul class="plan-questions">' + plan.needsUserInput.map((q) => '<li>' + escMem(q) + '</li>').join('') + '</ul></div>'
+          : '';
+        const trackedPill = plan.recommendsTrackedExecution
+          ? '<span class="pill plan-tracked">RECOMMENDS TRACKED EXECUTION</span>'
+          : '';
+        return [
+          '<div class="plan-proposal-row" data-plan-row="' + escMem(p.id) + '">',
+          '  <div class="plan-head">',
+          '    <div class="plan-objective">' + escMem(plan.objective || '(no objective)') + '</div>',
+          '    <div class="plan-meta">',
+          '      <span class="pill complexity-' + escMem(plan.estimatedComplexity || 'unknown') + '">' + escMem((plan.estimatedComplexity || 'unknown').toUpperCase()) + '</span>',
+          '      ' + trackedPill,
+          '      <span>' + ((plan.steps || []).length) + ' step' + ((plan.steps || []).length === 1 ? '' : 's') + '</span>',
+          '      <span>proposed ' + escMem(proposedAt) + '</span>',
+          '    </div>',
+          '  </div>',
+          p.context ? '  <div class="plan-context"><span class="plan-label">CONTEXT</span> ' + escMem(p.context) + '</div>' : '',
+          '  <div class="plan-request"><span class="plan-label">FROM</span> ' + escMem(p.originatingRequest) + '</div>',
+          '  <div class="plan-section"><span class="plan-label">STEPS</span><ol class="plan-steps">' + steps + '</ol></div>',
+          '  <div class="plan-section"><span class="plan-label">SUCCESS</span><ul class="plan-success">' + successCriteria + '</ul></div>',
+          risks,
+          questions,
+          '  <div class="plan-actions">',
+          '    <button class="plan-btn-approve" data-plan-approve="' + escMem(p.id) + '">APPROVE & PROCEED ✓</button>',
+          '    <button class="plan-btn-reject" data-plan-reject="' + escMem(p.id) + '">REJECT ▣</button>',
+          '  </div>',
+          '</div>',
+        ].join('');
+      }).join('');
+
+      bindPlanProposalActions();
+    } catch (err) {
+      listEl.innerHTML = '<div class="settings-info" style="color:var(--accent-fail);">Failed: ' + escMem(err.message || err) + '</div>';
+    }
+  }
+
+  function bindPlanProposalActions() {
+    const root = document.querySelector('[data-plan-proposals-list]');
+    if (!root) return;
+
+    root.querySelectorAll('[data-plan-approve]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const id = btn.getAttribute('data-plan-approve');
+        try {
+          const r = await fetch(withToken('/api/console/plan-proposals/' + encodeURIComponent(id) + '/approve'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({}),
+          });
+          if (!r.ok) {
+            const j = await r.json().catch(() => ({}));
+            alert('Approve failed: ' + (j.error || r.status));
+            return;
+          }
+          await refreshPlanProposals();
+        } catch (err) { alert('Approve failed: ' + (err.message || err)); }
+      });
+    });
+
+    root.querySelectorAll('[data-plan-reject]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const id = btn.getAttribute('data-plan-reject');
+        const reason = prompt('Why are you rejecting this plan? (optional — helps the agent learn)') || '';
+        try {
+          await fetch(withToken('/api/console/plan-proposals/' + encodeURIComponent(id) + '/reject'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ reason }),
+          });
+          await refreshPlanProposals();
+        } catch (err) { alert('Reject failed: ' + (err.message || err)); }
+      });
+    });
   }
 
   // ─── Agent-drafted check-in proposals ─────────────────────────
