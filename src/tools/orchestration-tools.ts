@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto';
-import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import matter from 'gray-matter';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -367,6 +367,163 @@ export function registerOrchestrationTools(server: McpServer): void {
       );
 
       return textResult(`Queued workflow "${name}" (run ${id}).`);
+    },
+  );
+
+  server.tool(
+    'workflow_get',
+    'Fetch the full definition of a single workflow by name. Includes description, trigger, every step with its prompt + dependencies, declared inputs, and synthesis prompt.',
+    {
+      name: z.string().min(1),
+    },
+    async ({ name }) => {
+      const entry = listWorkflowFiles().find((w) => w.data.name === name);
+      if (!entry) return textResult(`Workflow "${name}" not found.`);
+      const w = entry.data;
+      const stepsBlock = w.steps.map((step) => {
+        const deps = step.dependsOn && step.dependsOn.length > 0 ? ` (depends on: ${step.dependsOn.join(', ')})` : '';
+        const model = step.model ? ` model=${step.model}` : '';
+        return `  ${step.id}${deps}${model}\n    ${step.prompt.slice(0, 600).replace(/\n+/g, ' ')}`;
+      }).join('\n');
+      const inputsBlock = w.inputs && Object.keys(w.inputs).length > 0
+        ? Object.entries(w.inputs).map(([k, meta]) => `  - ${k}: ${meta.type ?? 'string'}${meta.default !== undefined ? ` (default: ${meta.default})` : ''}${meta.description ? ` — ${meta.description}` : ''}`).join('\n')
+        : '  (none)';
+      const trigger = w.trigger.schedule ? `schedule: ${w.trigger.schedule}` : (w.trigger.manual ? 'manual only' : 'manual');
+      return textResult([
+        `**${w.name}** [${w.enabled ? 'enabled' : 'disabled'}]`,
+        `File: ${entry.file}`,
+        `${w.description || '(no description)'}`,
+        `Trigger: ${trigger}`,
+        `Steps (${w.steps.length}):`,
+        stepsBlock,
+        `Inputs:`,
+        inputsBlock,
+        w.synthesis?.prompt ? `Synthesis: ${w.synthesis.prompt.slice(0, 600)}` : '',
+      ].filter(Boolean).join('\n'));
+    },
+  );
+
+  server.tool(
+    'workflow_set_enabled',
+    'Approve or disable a workflow. Sub-agents (Executor / Deployer) only fire approved workflows. Use enabled=true to approve a workflow for autonomous execution; enabled=false to pause it without deleting.',
+    {
+      name: z.string().min(1),
+      enabled: z.boolean(),
+    },
+    async ({ name, enabled }) => {
+      const entry = listWorkflowFiles().find((w) => w.data.name === name);
+      if (!entry) return textResult(`Workflow "${name}" not found.`);
+      const filePath = path.join(WORKFLOWS_DIR, entry.file);
+      const raw = readFileSync(filePath, 'utf-8');
+      const parsed = matter(raw);
+      const nextFrontmatter = { ...parsed.data, enabled };
+      writeFileSync(filePath, matter.stringify(parsed.content, nextFrontmatter), 'utf-8');
+      return textResult(`Workflow "${name}" is now ${enabled ? 'approved (enabled)' : 'disabled'}.`);
+    },
+  );
+
+  server.tool(
+    'workflow_update',
+    'Modify an existing workflow: update description, trigger schedule, steps, inputs, or synthesis. Pass only the fields you want to change — others are preserved. Step IDs and dependencies are re-validated.',
+    {
+      name: z.string().min(1),
+      description: z.string().optional(),
+      steps: z.array(z.object({
+        id: z.string().min(1),
+        prompt: z.string().min(1),
+        dependsOn: z.array(z.string()).optional(),
+        model: z.string().optional(),
+        tier: z.number().optional(),
+        maxTurns: z.number().optional(),
+      })).optional(),
+      trigger_schedule: z.string().optional(),
+      clear_trigger_schedule: z.boolean().optional().describe('Pass true to remove an existing schedule (e.g. switch back to manual-only).'),
+      inputs: z.record(z.string(), z.object({
+        type: z.enum(['string', 'number']).optional(),
+        default: z.string().optional(),
+        description: z.string().optional(),
+      })).optional(),
+      synthesis_prompt: z.string().optional(),
+    },
+    async ({ name, description, steps, trigger_schedule, clear_trigger_schedule, inputs, synthesis_prompt }) => {
+      const entry = listWorkflowFiles().find((w) => w.data.name === name);
+      if (!entry) return textResult(`Workflow "${name}" not found.`);
+
+      if (steps) {
+        const ids = new Set(steps.map((s) => s.id));
+        if (ids.size !== steps.length) return textResult('Duplicate workflow step IDs in update.');
+        for (const step of steps) {
+          for (const dep of step.dependsOn ?? []) {
+            if (!ids.has(dep)) return textResult(`Step "${step.id}" depends on unknown step "${dep}".`);
+          }
+        }
+      }
+      if (trigger_schedule && !validateCronExpression(trigger_schedule)) {
+        return textResult(`Invalid cron expression: "${trigger_schedule}"`);
+      }
+
+      const filePath = path.join(WORKFLOWS_DIR, entry.file);
+      const raw = readFileSync(filePath, 'utf-8');
+      const parsed = matter(raw);
+      const next: Record<string, unknown> = { ...parsed.data };
+      if (description !== undefined) next.description = description;
+      if (steps) next.steps = steps;
+      if (inputs) next.inputs = inputs;
+      if (synthesis_prompt !== undefined) next.synthesis = { prompt: synthesis_prompt };
+
+      const currentTrigger = (typeof next.trigger === 'object' && next.trigger ? next.trigger : { manual: true }) as Record<string, unknown>;
+      if (clear_trigger_schedule) {
+        delete currentTrigger.schedule;
+        next.trigger = { ...currentTrigger, manual: true };
+      } else if (trigger_schedule !== undefined) {
+        next.trigger = { ...currentTrigger, schedule: trigger_schedule, manual: currentTrigger.manual ?? true };
+      }
+
+      writeFileSync(filePath, matter.stringify(parsed.content, next), 'utf-8');
+      return textResult(`Workflow "${name}" updated.`);
+    },
+  );
+
+  server.tool(
+    'workflow_delete',
+    'Permanently delete a workflow definition file. Pending queued runs are NOT cancelled — call workflow_run_status on any in-flight runs first.',
+    {
+      name: z.string().min(1),
+      confirm: z.boolean().describe('Must be true to proceed. Guard against accidental deletion.'),
+    },
+    async ({ name, confirm }) => {
+      if (!confirm) return textResult('Refusing to delete: pass confirm=true.');
+      const entry = listWorkflowFiles().find((w) => w.data.name === name);
+      if (!entry) return textResult(`Workflow "${name}" not found.`);
+      unlinkSync(path.join(WORKFLOWS_DIR, entry.file));
+      return textResult(`Workflow "${name}" deleted (${entry.file}).`);
+    },
+  );
+
+  server.tool(
+    'workflow_run_status',
+    'Check the status of a queued or completed workflow run by id. Returns the run record (status, inputs, createdAt, completion info).',
+    {
+      run_id: z.string().min(1),
+    },
+    async ({ run_id }) => {
+      const filePath = path.join(WORKFLOW_RUNS_DIR, `${run_id}.json`);
+      if (!existsSync(filePath)) return textResult(`Workflow run "${run_id}" not found.`);
+      try {
+        const record = JSON.parse(readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
+        const lines = [
+          `Run ${run_id}`,
+          `Workflow: ${record.workflow ?? '(unknown)'}`,
+          `Status: ${record.status ?? '(unknown)'}`,
+          record.createdAt ? `Created: ${record.createdAt}` : '',
+          record.completedAt ? `Completed: ${record.completedAt}` : '',
+          record.inputs && Object.keys(record.inputs).length > 0 ? `Inputs: ${JSON.stringify(record.inputs)}` : '',
+          record.error ? `Error: ${record.error}` : '',
+        ].filter(Boolean);
+        return textResult(lines.join('\n'));
+      } catch (err) {
+        return textResult(`Failed to read run ${run_id}: ${err instanceof Error ? err.message : String(err)}`);
+      }
     },
   );
 
