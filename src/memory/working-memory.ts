@@ -1,5 +1,7 @@
 import { existsSync, writeFileSync } from 'node:fs';
+import { ExecutionStore, renderExecutionSummary } from '../execution/store.js';
 import { WORKING_MEMORY_FILE } from './vault.js';
+import { loadSessionBrief } from './session-briefs.js';
 import type { SessionRecord } from '../types.js';
 import { PlanStore } from '../planning/plan-store.js';
 
@@ -14,8 +16,8 @@ function buildSessionSummary(session: SessionRecord): string {
     .join('\n');
 }
 
-function buildPlanSummary(): string {
-  const plans = new PlanStore().list(3);
+function buildPlanSummary(sessionId: string): string {
+  const plans = new PlanStore().list(3, sessionId);
   if (plans.length === 0) return 'No active plans.';
 
   return plans.map((plan) => {
@@ -25,8 +27,13 @@ function buildPlanSummary(): string {
   }).join('\n');
 }
 
-function buildActiveTaskFocus(): string {
-  const active = new PlanStore().getActive();
+function buildActiveTaskFocus(session: SessionRecord): string {
+  const execution = new ExecutionStore().getActiveForSession(session.id);
+  if (execution) {
+    return `Tracked execution: ${renderExecutionSummary(execution)}`;
+  }
+
+  const active = new PlanStore().getActive(session.id);
   if (!active) {
     return 'No active deep task. Keep the next useful move visible.';
   }
@@ -39,6 +46,22 @@ function buildActiveTaskFocus(): string {
   return `Active deep task: ${active.title}. Current step: ${currentStep.text}`;
 }
 
+function buildSessionHandoff(session: SessionRecord): string {
+  const brief = loadSessionBrief(session.id);
+  if (!brief?.manual) {
+    return 'No manual handoff recorded for this session.';
+  }
+
+  const lines = [`Last saved handoff: ${brief.manual.pausedAt}`];
+  if (brief.manual.remaining.length > 0) {
+    lines.push(...brief.manual.remaining.slice(0, 4).map((item) => `- [ ] ${item}`));
+  }
+  if (brief.manual.blockers.length > 0) {
+    lines.push(...brief.manual.blockers.slice(0, 3).map((item) => `- blocker: ${item}`));
+  }
+  return lines.join('\n');
+}
+
 export function refreshWorkingMemory(session: SessionRecord): void {
   const sections = [
     '# Working Memory',
@@ -47,10 +70,13 @@ export function refreshWorkingMemory(session: SessionRecord): void {
     buildSessionSummary(session),
     '',
     '## Active Plans',
-    buildPlanSummary(),
+    buildPlanSummary(session.id),
+    '',
+    '## Session Handoff',
+    buildSessionHandoff(session),
     '',
     '## Focus',
-    buildActiveTaskFocus(),
+    buildActiveTaskFocus(session),
     '',
   ];
 

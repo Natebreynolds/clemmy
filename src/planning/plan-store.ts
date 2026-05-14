@@ -37,12 +37,14 @@ function buildSteps(items: string[]): PlanStep[] {
 }
 
 export class PlanStore {
-  create(title: string, steps: string[]): PlanRecord {
+  create(title: string, steps: string[], options?: { sessionId?: string; source?: PlanRecord['source'] }): PlanRecord {
     const plans = loadPlans();
     const now = new Date().toISOString();
     const plan: PlanRecord = {
       id: randomUUID(),
       title: title.trim(),
+      sessionId: options?.sessionId,
+      source: options?.source ?? 'manual',
       createdAt: now,
       updatedAt: now,
       steps: buildSteps(steps.filter(Boolean)),
@@ -52,8 +54,9 @@ export class PlanStore {
     return plan;
   }
 
-  list(limit = 10): PlanRecord[] {
+  list(limit = 10, sessionId?: string): PlanRecord[] {
     return loadPlans()
+      .filter((plan) => !sessionId || plan.sessionId === sessionId)
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
       .slice(0, limit);
   }
@@ -62,8 +65,8 @@ export class PlanStore {
     return loadPlans().find((plan) => plan.id === id);
   }
 
-  getActive(): PlanRecord | undefined {
-    return this.list(20).find((plan) => plan.steps.some((step) => step.status === 'in_progress'));
+  getActive(sessionId?: string): PlanRecord | undefined {
+    return this.list(20, sessionId).find((plan) => plan.steps.some((step) => step.status === 'in_progress'));
   }
 
   updateStep(planId: string, stepId: string, status: PlanStep['status']): PlanRecord | undefined {

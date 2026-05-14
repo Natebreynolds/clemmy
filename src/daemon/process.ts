@@ -59,7 +59,11 @@ export function stopDaemon(): { stopped: boolean; pid: number | null } {
 export function spawnDaemonProcess(): number {
   ensureLogDir();
   const logFd = openSync(DAEMON_LOG_FILE, 'a');
-  const child = spawn(process.execPath, [process.argv[1], 'daemon', '--foreground'], {
+  const entrypoint = process.argv[1];
+  const childArgs = entrypoint.endsWith('.ts')
+    ? ['--import', 'tsx', entrypoint, 'daemon', '--foreground']
+    : [entrypoint, 'daemon', '--foreground'];
+  const child = spawn(process.execPath, childArgs, {
     detached: true,
     stdio: ['ignore', logFd, logFd],
     env: { ...process.env, CLEMENTINE_DAEMON: '1' },

@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { Agent, RunState, Runner, setDefaultOpenAIKey } from '@openai/agents';
 import { ASSISTANT_NAME, MODELS, OPENAI_API_KEY } from '../config.js';
 import type { ApprovalResolutionResult, PendingApproval, RunRequest, RunResult } from '../types.js';
-import type { AgentRuntime, AgentRuntimeCallbacks } from './provider.js';
+import { AgentRuntimeCancelledError, type AgentRuntime, type AgentRuntimeCallbacks } from './provider.js';
 import type { RuntimeContextValue } from '../types.js';
 import { ApprovalStore } from './approval-store.js';
 import { getCoreTools } from '../tools/registry.js';
@@ -166,8 +166,11 @@ export class OpenAIRuntime implements AgentRuntime {
     return outcome;
   }
 
-  async run(request: RunRequest, callbacks?: AgentRuntimeCallbacks): Promise<RunResult> {
-    const agent = this.createAgent(request);
+	  async run(request: RunRequest, callbacks?: AgentRuntimeCallbacks): Promise<RunResult> {
+	    if (await callbacks?.shouldCancel?.()) {
+	      throw new AgentRuntimeCancelledError();
+	    }
+	    const agent = this.createAgent(request);
 
     const context: RuntimeContextValue = {
       sessionId: request.sessionId ?? randomUUID(),
@@ -175,10 +178,21 @@ export class OpenAIRuntime implements AgentRuntime {
       channel: request.channel,
     };
 
-    const result = await this.runner.run(agent, request.prompt, {
-      context,
-      maxTurns: 12,
-    });
+      // Stream when the caller subscribed to onChunk OR onReasoning.
+      // Falls back to non-streaming when neither is subscribed — keeps
+      // the simpler path for callers that don't care about deltas.
+      const wantsStream = Boolean(callbacks?.onChunk || callbacks?.onReasoning);
+
+      const result = wantsStream
+        ? await this.runStreamed(agent, request.prompt, context, callbacks)
+        : await this.runner.run(agent, request.prompt, {
+            context,
+            maxTurns: 12,
+          });
+
+	    if (await callbacks?.shouldCancel?.()) {
+	      throw new AgentRuntimeCancelledError();
+	    }
     const text = typeof result.finalOutput === 'string' ? result.finalOutput : JSON.stringify(result.finalOutput);
 
     const approval = result.interruptions[0];
@@ -216,5 +230,62 @@ export class OpenAIRuntime implements AgentRuntime {
       sessionId: context.sessionId,
       raw: result,
     };
+  }
+
+  /**
+   * Streaming variant of runner.run that fires per-delta callbacks.
+   *
+   * Iterates the SDK's StreamedRunResult and dispatches:
+   *   - raw_model_stream_event of type 'output_text_delta' → onChunk(delta)
+   *   - run_item_stream_event of name 'reasoning_item_created' →
+   *     onReasoning(joined text) + addRunEvent for the run timeline
+   *
+   * After iteration, awaits completion so callers can read finalOutput
+   * and interruptions the same way as the non-streaming path.
+   *
+   * Errors during streaming are surfaced via result.error — we rethrow
+   * so the outer run() error path handles it identically.
+   */
+  private async runStreamed(
+    agent: Agent<RuntimeContextValue>,
+    input: string,
+    context: RuntimeContextValue,
+    callbacks?: AgentRuntimeCallbacks,
+  ) {
+    const streamed = await this.runner.run(agent, input, {
+      context,
+      maxTurns: 12,
+      stream: true,
+    });
+
+    for await (const event of streamed) {
+      // raw_model_stream_event = wraps a provider-level StreamEvent
+      if (event.type === 'raw_model_stream_event') {
+        const data = event.data as { type?: string; delta?: string };
+        if (data.type === 'output_text_delta' && typeof data.delta === 'string' && data.delta.length > 0) {
+          if (callbacks?.onChunk) {
+            try { await callbacks.onChunk(data.delta); } catch { /* never let consumer errors abort the stream */ }
+          }
+        }
+        continue;
+      }
+
+      // run_item_stream_event = high-level item lifecycle (messages,
+      // tool calls, reasoning, handoffs). We capture reasoning here.
+      if (event.type === 'run_item_stream_event' && event.name === 'reasoning_item_created') {
+        const item = event.item as { rawItem?: { content?: Array<{ text?: string }> } };
+        const chunks = item.rawItem?.content ?? [];
+        const text = chunks.map((c) => c.text ?? '').filter(Boolean).join('\n').trim();
+        if (text) {
+          if (callbacks?.onReasoning) {
+            try { await callbacks.onReasoning(text); } catch { /* tolerate consumer errors */ }
+          }
+        }
+      }
+    }
+
+    await streamed.completed;
+    if (streamed.error) throw streamed.error;
+    return streamed;
   }
 }

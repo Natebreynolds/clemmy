@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
-import { AUTH_MODE, BASE_DIR, CODEX_AUTH_SOURCE_FILE, CODEX_EXECUTABLE, CODEX_INSTALL_PACKAGE, OPENAI_API_KEY } from '../config.js';
+import { AUTH_MODE, BASE_DIR, CODEX_AUTH_SOURCE_FILE, CODEX_EXECUTABLE, CODEX_INSTALL_PACKAGE, getOpenAiApiKey } from '../config.js';
 import type { AuthStatus } from '../types.js';
 import { loginWithNativeCodexOAuth, refreshNativeCodexTokens } from './codex-native-oauth.js';
 
@@ -31,6 +31,14 @@ interface LocalAuthState {
   };
 }
 
+export interface StoredCodexOAuthTokens {
+  accessToken?: string;
+  refreshToken?: string;
+  idToken?: string;
+  accountId?: string;
+  lastRefresh?: string;
+}
+
 interface CodexBootstrapState {
   localCodex?: NonNullable<LocalAuthState['codexOauth']>;
   codexCli?: NonNullable<CodexCliAuthFile['tokens']>;
@@ -51,6 +59,32 @@ function loadLocalAuthState(): LocalAuthState {
   } catch {
     return {};
   }
+}
+
+export function getStoredCodexOAuthTokens(): StoredCodexOAuthTokens | null {
+  const local = loadLocalAuthState();
+  if (local.codexOauth?.accessToken && local.codexOauth?.refreshToken) {
+    return {
+      accessToken: local.codexOauth.accessToken,
+      refreshToken: local.codexOauth.refreshToken,
+      idToken: local.codexOauth.idToken,
+      accountId: local.codexOauth.accountId,
+      lastRefresh: local.codexOauth.lastRefresh,
+    };
+  }
+
+  const cli = loadCodexCliAuth();
+  if (cli?.tokens?.access_token && cli.tokens.refresh_token) {
+    return {
+      accessToken: cli.tokens.access_token,
+      refreshToken: cli.tokens.refresh_token,
+      idToken: cli.tokens.id_token,
+      accountId: cli.tokens.account_id,
+      lastRefresh: cli.last_refresh,
+    };
+  }
+
+  return null;
 }
 
 function saveLocalAuthState(state: LocalAuthState): void {
@@ -331,7 +365,7 @@ export function getAuthStatus(): AuthStatus {
   const local = loadLocalAuthState();
   const codexCli = loadCodexCliAuth();
   const localCodex = local.codexOauth;
-  const openaiApiKeyPresent = Boolean(OPENAI_API_KEY);
+  const openaiApiKeyPresent = Boolean(getOpenAiApiKey());
   const codexOauthPresent = Boolean(localCodex?.accessToken && localCodex?.refreshToken);
 
   if (AUTH_MODE === 'api_key') {

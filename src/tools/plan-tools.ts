@@ -9,9 +9,10 @@ export function registerPlanTools(server: McpServer): void {
     {
       title: z.string().min(1),
       steps: z.array(z.string().min(1)).min(1).max(12),
+      session_id: z.string().min(1).optional(),
     },
-    async ({ title, steps }) => {
-      const plan = plans.create(title, steps);
+    async ({ title, steps, session_id }) => {
+      const plan = plans.create(title, steps, { sessionId: session_id, source: 'manual' });
       return textResult(`Created plan ${plan.id} with ${plan.steps.length} steps.`);
     },
   );

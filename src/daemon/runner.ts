@@ -4,8 +4,14 @@ import matter from 'gray-matter';
 import pino from 'pino';
 import { ClementineAssistant } from '../assistant/core.js';
 import { processAgentAutonomy } from '../agents/autonomy.js';
+import { processAgentAutonomyV2 } from '../agents/autonomy-v2.js';
 import { processMonitors } from '../agents/monitors.js';
+import { getProactivityPolicySnapshot } from '../agents/proactivity-policy.js';
+import { processProactiveBriefs } from '../agents/proactive-briefs.js';
 import { MODELS } from '../config.js';
+import { processExecutionController } from '../execution/controller.js';
+import { interruptStaleRunningBackgroundTasks, processBackgroundTasks } from '../execution/background-tasks.js';
+import { processMemoryMaintenance } from '../memory/maintenance.js';
 import {
   CRON_FILE,
   WORKFLOWS_DIR,
@@ -447,6 +453,10 @@ async function processNotificationDeliveries(): Promise<void> {
 export async function startDaemon(assistant: ClementineAssistant): Promise<void> {
   ensureDir(CRON_PROGRESS_DIR);
   const state = loadState();
+  const interrupted = interruptStaleRunningBackgroundTasks();
+  if (interrupted > 0) {
+    logger.warn({ interrupted }, 'Marked stale running background tasks as interrupted');
+  }
   logger.info('Daemon loop started');
 
   // Stagger monitor runs — don't run them every 15s tick
@@ -457,13 +467,30 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
     await processCronSchedules(assistant, state);
     await processCronTriggers(assistant);
     await processWorkflowRuns(assistant);
+    await processBackgroundTasks(assistant);
+    const proactivity = getProactivityPolicySnapshot();
 
-    // Run monitors every 4 ticks (~60s) — they have their own internal rate limiting
-    if (tickCount % 4 === 0) {
+    // Run monitors every 4 ticks (~60s) - they have their own internal rate limiting.
+    if (proactivity.proactiveWorkAllowed && tickCount % 4 === 0) {
       processMonitors();
     }
 
-    await processAgentAutonomy(assistant);
+    if (proactivity.proactiveWorkAllowed) {
+      await processExecutionController(assistant);
+      await processAgentAutonomy(assistant);
+      // v2 runs in parallel with v1 - each agent is owned by exactly one
+      // engine. v2 processes agents listed in AUTONOMY_V2_AGENTS env var;
+      // v1 handles the rest. After a v2 cycle marks lastRunAt, v1 sees
+      // the cadence as not-yet-due and skips that agent.
+      await processAgentAutonomyV2();
+      await processProactiveBriefs(assistant);
+    } else if (tickCount % 20 === 0) {
+      logger.info({
+        enabled: proactivity.policy.enabled,
+        quietHoursActive: proactivity.quietHoursActive,
+      }, 'Proactive daemon work is paused by policy');
+    }
+    await processMemoryMaintenance(tickCount);
     await processNotificationDeliveries();
     await sleep(15_000);
   }

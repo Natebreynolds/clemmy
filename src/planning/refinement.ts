@@ -29,9 +29,9 @@ function userIndicatesNextStep(message: string): boolean {
   ].some((phrase) => lower.includes(phrase));
 }
 
-export function refineActivePlanFromMessage(message: string): PlanRecord | undefined {
+export function refineActivePlanFromMessage(sessionId: string, message: string): PlanRecord | undefined {
   const store = new PlanStore();
-  const active = store.getActive();
+  const active = store.getActive(sessionId);
   if (!active) return undefined;
 
   const currentStep = active.steps.find((step) => step.status === 'in_progress');

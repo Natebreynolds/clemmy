@@ -3,7 +3,8 @@ import { appendFileSync, existsSync, readFileSync, readdirSync, writeFileSync } 
 import path from 'node:path';
 import pino from 'pino';
 import { ClementineAssistant } from '../assistant/core.js';
-import { MODELS } from '../config.js';
+import { MODELS, getRuntimeEnv } from '../config.js';
+import { ExecutionStore } from '../execution/store.js';
 import { addNotification } from '../runtime/notifications.js';
 import {
   AGENT_INBOX_DIR,
@@ -23,6 +24,7 @@ import {
 } from '../tools/shared.js';
 
 const logger = pino({ name: 'clementine-next.agents' });
+const AUTONOMY_V2_AGENTS_ENV = 'AUTONOMY_V2_AGENTS';
 
 type InboxItemType = 'message' | 'request' | 'delegation' | 'task_review' | 'daily_review' | 'system';
 
@@ -178,7 +180,7 @@ interface DelegationRecord {
   updatedAt: string;
 }
 
-const DEFAULT_WAKE_TRIGGERS = ['inbox', 'delegation', 'request', 'stale_tasks', 'daily_review'];
+const DEFAULT_WAKE_TRIGGERS = ['inbox', 'delegation', 'request', 'stale_tasks', 'daily_review', 'execution_review'];
 
 function inboxFilePath(slug: string): string {
   return path.join(AGENT_INBOX_DIR, `${slug}.json`);
@@ -343,6 +345,15 @@ function listAutonomyAgents(): TeamAgentRecord[] {
   return agents;
 }
 
+function readV2OwnedAgentSlugs(): Set<string> {
+  return new Set(
+    getRuntimeEnv(AUTONOMY_V2_AGENTS_ENV, '')
+      .split(',')
+      .map((slug) => slug.trim())
+      .filter(Boolean),
+  );
+}
+
 function normalizeWakeTriggers(agent: TeamAgentRecord): string[] {
   return agent.wakeTriggers && agent.wakeTriggers.length > 0 ? agent.wakeTriggers : DEFAULT_WAKE_TRIGGERS;
 }
@@ -444,6 +455,30 @@ function syncDailyReviewsToInbox(agents: TeamAgentRecord[]): void {
   }
 }
 
+function syncExecutionReviewsToInbox(agents: TeamAgentRecord[]): void {
+  const executions = new ExecutionStore()
+    .list(12)
+    .filter((execution) => execution.status === 'active' || execution.status === 'blocked');
+
+  for (const execution of executions) {
+    const ageMinutes = Math.floor((Date.now() - new Date(execution.lastActivityAt).getTime()) / 60_000);
+    if (ageMinutes < 30) continue;
+
+    enqueueInboxItem('clementine', {
+      type: 'system',
+      sourceKey: `execution-review:${execution.id}:${execution.updatedAt}`,
+      content: `Review tracked execution "${execution.title}" and decide the next move.`,
+      metadata: {
+        executionId: execution.id,
+        objective: execution.objective,
+        nextStep: execution.nextStep,
+        ageMinutes,
+        status: execution.status,
+      },
+    });
+  }
+}
+
 function syncAutonomyInputs(): TeamAgentRecord[] {
   const agents = listAutonomyAgents();
   syncMessagesToInbox(agents);
@@ -451,7 +486,9 @@ function syncAutonomyInputs(): TeamAgentRecord[] {
   syncDelegationsToInbox(agents);
   syncTaskReviewsToInbox(agents);
   syncDailyReviewsToInbox(agents);
-  return agents;
+  syncExecutionReviewsToInbox(agents);
+  const v2Owned = readV2OwnedAgentSlugs();
+  return agents.filter((agent) => !v2Owned.has(agent.slug));
 }
 
 function isCadenceDue(agent: TeamAgentRecord, state: AgentStateRecord): boolean {
@@ -524,6 +561,17 @@ function buildAgentPrompt(agent: TeamAgentRecord, inboxItems: AgentInboxItem[], 
       return `- [${g.id}] ${g.title} (${g.priority}${due}${next}${blocker})`;
     }).join('\n');
 
+  const activeExecutions = agent.slug === 'clementine'
+    ? new ExecutionStore()
+      .list(8)
+      .filter((execution) => execution.status === 'active' || execution.status === 'blocked')
+    : [];
+  const executionText = activeExecutions.length === 0
+    ? ''
+    : activeExecutions
+      .map((execution) => `- [${execution.id}] ${execution.title} (${execution.status}) | next: ${execution.nextStep ?? 'decide next step'} | objective: ${execution.objective}`)
+      .join('\n');
+
   const today = new Date().toISOString().slice(0, 10);
   const timeOfDay = (() => {
     const h = new Date().getHours();
@@ -543,6 +591,7 @@ function buildAgentPrompt(agent: TeamAgentRecord, inboxItems: AgentInboxItem[], 
     `Current context: ${today}, ${timeOfDay}`,
     state.commitments && state.commitments.length > 0 ? `Existing commitments:\n- ${state.commitments.join('\n- ')}` : 'Existing commitments: none',
     goalsText ? `Active goals (you should proactively advance these):\n${goalsText}` : '',
+    executionText ? `Active tracked executions (push these forward proactively):\n${executionText}` : '',
     inboxItems.length > 0 ? `Pending inbox items:\n${inboxText}` : 'Pending inbox items: none',
     `Relevant open tasks:\n${taskText}`,
     'You are proactive. If you see stagnant goals or tasks without recent progress, take initiative to move them forward — create tasks, add notes, send messages, or notify the user.',

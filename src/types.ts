@@ -42,11 +42,40 @@ export interface SessionRecord {
   turns: ConversationTurn[];
 }
 
+export interface SessionAutoBrief {
+  summary: string;
+  recentUserRequests: string[];
+  recentAssistantActions: string[];
+  openQuestions: string[];
+  activePlan?: string;
+  nextStep?: string;
+}
+
+export interface SessionManualHandoff {
+  pausedAt: string;
+  completed: string[];
+  remaining: string[];
+  decisions: string[];
+  blockers: string[];
+  context: string;
+}
+
+export interface SessionBriefRecord {
+  sessionId: string;
+  userId?: string;
+  channel?: string;
+  createdAt: string;
+  updatedAt: string;
+  auto: SessionAutoBrief;
+  manual?: SessionManualHandoff;
+}
+
 export interface MemoryContext {
   soul?: string;
   memory?: string;
   identity?: string;
   workingMemory?: string;
+  sessionBrief?: string;
 }
 
 export interface MemorySearchHit {
@@ -67,6 +96,18 @@ export interface AssistantRequest {
   userId?: string;
   channel?: string;
   model?: string;
+  runId?: string;
+  onToolActivity?: (activity: ToolActivity) => Promise<void> | void;
+  /** Fired per output-text delta when the runtime supports streaming.
+   *  The runtime fires this in addition to (not instead of) the final
+   *  text in the response. Callers that don't pass it get the same
+   *  non-streaming behavior as before. */
+  onChunk?: (delta: string) => Promise<void> | void;
+  /** Fired per reasoning chunk (o-series models). Captured for
+   *  observability in the run timeline; not intended for end-user
+   *  display by default. */
+  onReasoning?: (text: string) => Promise<void> | void;
+  shouldCancel?: () => boolean | Promise<boolean>;
 }
 
 export interface AssistantResponse {
@@ -109,9 +150,82 @@ export interface PlanStep {
 export interface PlanRecord {
   id: string;
   title: string;
+  sessionId?: string;
+  source?: 'manual' | 'deep_task' | 'execution';
   createdAt: string;
   updatedAt: string;
   steps: PlanStep[];
+}
+
+export interface ExecutionRecord {
+  id: string;
+  sessionId: string;
+  userId?: string;
+  channel?: string;
+  title: string;
+  objective: string;
+  reason: string;
+  status: 'active' | 'paused' | 'blocked' | 'completed';
+  createdAt: string;
+  updatedAt: string;
+  lastActivityAt: string;
+  startedFromMessage: string;
+  planId?: string;
+  nextStep?: string;
+  successCriteria?: string;
+  lastAssistantSummary?: string;
+  nextReviewAt?: string;
+  lastControllerRunAt?: string;
+  blocker?: string;
+  autoAdvance?: boolean;
+  taskBindings?: Array<{
+    taskId: string;
+    planStepId?: string;
+    description?: string;
+    status: 'pending' | 'completed';
+    createdAt: string;
+    completedAt?: string;
+  }>;
+  workflowBindings?: Array<{
+    runId: string;
+    workflow: string;
+    status: 'queued' | 'running' | 'completed' | 'error';
+    createdAt: string;
+    updatedAt: string;
+  }>;
+  delegationBindings?: Array<{
+    delegationId: string;
+    toAgent: string;
+    task: string;
+    expectedOutput: string;
+    planStepId?: string;
+    status: 'pending' | 'in_progress' | 'completed';
+    createdAt: string;
+    updatedAt: string;
+    result?: string;
+  }>;
+  activity?: Array<{
+    id: string;
+    key: string;
+    type:
+      | 'task_created'
+      | 'task_completed'
+      | 'workflow_queued'
+      | 'workflow_completed'
+      | 'workflow_failed'
+      | 'delegation_created'
+      | 'delegation_completed'
+      | 'synthesis'
+      | 'blocked'
+      | 'completed'
+      | 'status';
+    message: string;
+    createdAt: string;
+    metadata?: Record<string, unknown>;
+  }>;
+  lastSynthesisAt?: string;
+  confidence: number;
+  reasons: string[];
 }
 
 export interface ManagedMcpServer {

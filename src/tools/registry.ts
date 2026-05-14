@@ -1,6 +1,9 @@
 import { z } from 'zod';
 import { tool, type Tool } from '@openai/agents';
 import type { RuntimeContextValue } from '../types.js';
+import { getComputerTools } from './computer-tools.js';
+import { getComposioRuntimeTools } from './composio-tools.js';
+import { getLocalRuntimeTools } from './local-runtime-tools.js';
 
 export function getCoreTools(): Tool<RuntimeContextValue>[] {
   const request_destructive_action = tool({
@@ -16,5 +19,10 @@ export function getCoreTools(): Tool<RuntimeContextValue>[] {
     },
   });
 
-  return [request_destructive_action];
+  return [
+    request_destructive_action,
+    ...getLocalRuntimeTools(),
+    ...getComputerTools(),
+    ...getComposioRuntimeTools(),
+  ];
 }
