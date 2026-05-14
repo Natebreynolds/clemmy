@@ -6,7 +6,7 @@
   "main": "dist/main.js",
   "type": "module",
   "scripts": {
-    "build": "tsc -p .",
+    "build": "tsc -p . && tsc -p tsconfig.preload.json && mv dist/preload.js dist/preload.cjs",
     "typecheck": "tsc -p . --noEmit",
     "dev": "tsx src/main.ts",
     "start": "electron .",

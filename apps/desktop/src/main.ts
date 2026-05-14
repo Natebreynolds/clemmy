@@ -1,4 +1,16 @@
-import { app, BrowserWindow, dialog, Menu, shell, Tray, Notification, ipcMain, nativeImage } from 'electron';
+import {
+  app,
+  BrowserWindow,
+  dialog,
+  ipcMain,
+  Menu,
+  nativeImage,
+  Notification,
+  shell,
+  Tray,
+  type IpcMainInvokeEvent,
+  type NativeImage,
+} from 'electron';
 import path from 'node:path';
 import os from 'node:os';
 import { existsSync, readFileSync } from 'node:fs';
@@ -14,7 +26,7 @@ import {
   setCredential,
   type CredentialName,
 } from './credentials-bridge.js';
-import { addWorkspaceDir, ensureHomeEnv, saveUserProfile } from './setup-bridge.js';
+import { addWorkspaceDir, ensureHomeEnv, saveUserProfile, type ProfilePatch } from './setup-bridge.js';
 
 /**
  * Clementine Desktop — Electron main process.
@@ -137,14 +149,14 @@ function createMainWindow(url: string): BrowserWindow {
     backgroundColor: '#07070a',
     titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
     webPreferences: {
-      preload: path.join(path.dirname(new URL(import.meta.url).pathname), 'preload.js'),
+      preload: path.join(path.dirname(new URL(import.meta.url).pathname), 'preload.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
     },
   });
   win.loadURL(url);
-  win.on('close', (event) => {
+  win.on('close', (event: { preventDefault(): void }) => {
     // On macOS we keep the app alive in the tray. Hide instead of
     // quit; cmd-Q exits explicitly.
     if (process.platform === 'darwin' && !(app as { isQuitting?: boolean }).isQuitting) {
@@ -160,7 +172,7 @@ function createMainWindow(url: string): BrowserWindow {
  * required. Renders a filled circle (orange = active) on a transparent
  * background. Uses an inline SVG → nativeImage.createFromDataURL.
  */
-function buildTrayIcon(active: boolean): Electron.NativeImage {
+function buildTrayIcon(active: boolean): NativeImage {
   const color = active ? '#ff5a35' : '#666c7a';
   const dot = active ? '#b9ff36' : '#3a3f4a';
   // 22x22 is the Electron-recommended template size for menubar icons
@@ -250,7 +262,7 @@ function showSupervisorEventNotification(event: SupervisorEvent): void {
 }
 
 function preloadPath(): string {
-  return path.join(path.dirname(new URL(import.meta.url).pathname), 'preload.js');
+  return path.join(path.dirname(new URL(import.meta.url).pathname), 'preload.cjs');
 }
 
 /**
@@ -347,7 +359,7 @@ ipcMain.handle('clemmy:restart-daemon', async () => {
   return { ok: true };
 });
 
-ipcMain.handle('clemmy:tail-log', (_, maxLines?: number) => {
+ipcMain.handle('clemmy:tail-log', (_evt: IpcMainInvokeEvent, maxLines?: number) => {
   return { lines: supervisor?.tailLog(maxLines ?? 200) ?? [] };
 });
 
@@ -369,7 +381,7 @@ ipcMain.handle('clemmy:credentials-list', async () => {
   return { rows };
 });
 
-ipcMain.handle('clemmy:credentials-set', async (_evt, payload: { name: string; value: string }) => {
+ipcMain.handle('clemmy:credentials-set', async (_evt: IpcMainInvokeEvent, payload: { name: string; value: string }) => {
   const knownNames: CredentialName[] = [
     'openai_api_key', 'discord_bot_token', 'composio_api_key',
     'codex_oauth_access_token', 'codex_oauth_refresh_token', 'webhook_secret',
@@ -380,7 +392,7 @@ ipcMain.handle('clemmy:credentials-set', async (_evt, payload: { name: string; v
   return setCredential(payload.name as CredentialName, payload.value);
 });
 
-ipcMain.handle('clemmy:credentials-delete', async (_evt, payload: { name: string }) => {
+ipcMain.handle('clemmy:credentials-delete', async (_evt: IpcMainInvokeEvent, payload: { name: string }) => {
   const knownNames: CredentialName[] = [
     'openai_api_key', 'discord_bot_token', 'composio_api_key',
     'codex_oauth_access_token', 'codex_oauth_refresh_token', 'webhook_secret',
@@ -396,19 +408,19 @@ ipcMain.handle('clemmy:credentials-reset', async () => {
   return resetAllCredentials();
 });
 
-ipcMain.handle('clemmy:setup-save-workspace', async (_evt, payload: { path: string }) => {
+ipcMain.handle('clemmy:setup-save-workspace', async (_evt: IpcMainInvokeEvent, payload: { path: string }) => {
   const p = (payload?.path ?? '').trim();
   if (!p) throw new Error('path required');
   addWorkspaceDir(p);
   return { ok: true };
 });
 
-ipcMain.handle('clemmy:setup-save-profile', async (_evt, patch) => {
+ipcMain.handle('clemmy:setup-save-profile', async (_evt: IpcMainInvokeEvent, patch: ProfilePatch) => {
   saveUserProfile(patch);
   return { ok: true };
 });
 
-ipcMain.handle('clemmy:setup-complete', async (_evt, record: { configured: SetupConfiguredSummary }) => {
+ipcMain.handle('clemmy:setup-complete', async (_evt: IpcMainInvokeEvent, record: { configured: SetupConfiguredSummary }) => {
   writeSetupComplete({ configured: record.configured });
   // Close the wizard, kick the daemon, transition to dashboard.
   const win = setupWindow;
