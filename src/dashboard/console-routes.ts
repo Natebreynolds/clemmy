@@ -10,8 +10,11 @@ import { forgetFact, listActiveFacts, listAllFacts } from '../memory/facts.js';
 import { openMemoryDb } from '../memory/db.js';
 import { readMemoryIndexStatus } from '../memory/indexer.js';
 import { WORKFLOWS_DIR } from '../memory/vault.js';
-import { ensureDir, WORKFLOW_RUNS_DIR } from '../tools/shared.js';
+import { ensureDir, getWorkspaceDirs, listWorkspaceProjects, WORKFLOW_RUNS_DIR } from '../tools/shared.js';
 import type { ClementineAssistant } from '../assistant/core.js';
+import { LOCAL_MCP_TOOL_NAMES } from '../tools/catalog.js';
+import { getCoreTools } from '../tools/registry.js';
+import { discoverMcpServers } from '../runtime/mcp-config.js';
 
 /**
  * Mounts the new Console dashboard at /console.
@@ -461,6 +464,151 @@ export function registerConsoleRoutes(
         userId: 'console',
       });
       res.json({ text: response.text });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // ─── Tools catalog ────────────────────────────────────────────
+
+  /** Map a tool name to a UI-friendly category. Mirrors the runtime
+   *  categories used by autonomy-v2's policy filter + the dashboard
+   *  state's toolCategory. Kept here so the console doesn't depend on
+   *  the dashboard module. */
+  function categorizeTool(name: string): string {
+    if (name.startsWith('memory_') || name === 'working_memory' || name.startsWith('note_')) return 'Memory';
+    if (name.startsWith('task_') || name === 'create_plan' || name === 'list_plans' || name === 'update_plan_step' || name === 'discover_work' || name.startsWith('goal_')) return 'Planning';
+    if (name.startsWith('execution_')) return 'Executions';
+    if (name.startsWith('check_in') || name === 'ask_user_question' || name === 'list_pending_check_ins' || name === 'answer_check_in') return 'Check-ins';
+    if (name === 'notify_user') return 'Notifications';
+    if (name.startsWith('agent_run') || name.startsWith('user_profile') || name.startsWith('team_') || name.startsWith('create_agent') || name.startsWith('update_agent') || name.startsWith('delete_agent') || name.startsWith('delegate') || name === 'check_delegation') return 'Agents';
+    if (name === 'set_timer' || name.startsWith('cron_') || name.startsWith('workflow_') || name === 'trigger_cron_job' || name === 'add_cron_job') return 'Automation';
+    if (name === 'workspace_config' || name === 'workspace_list' || name === 'workspace_info' || name === 'workspace_roots' || name === 'list_files' || name === 'read_file' || name === 'write_file' || name === 'run_shell_command' || name === 'git_status') return 'Computer';
+    if (name.startsWith('composio_')) return 'Connected Apps';
+    if (name === 'session_history' || name === 'session_pause' || name === 'session_resume') return 'Sessions';
+    if (name === 'create_tool') return 'Meta';
+    if (name === 'ping') return 'System';
+    if (name === 'request_destructive_action') return 'System';
+    return 'Other';
+  }
+
+  app.get('/api/console/tools', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      // Local MCP tools — from the catalog (string names) plus the
+      // SDK-native tools registered in registry.ts (have full schema).
+      const sdkTools = getCoreTools()
+        .filter((tool) => tool.type === 'function')
+        .map((tool) => ({
+          name: tool.name,
+          description: tool.description ?? '',
+          category: categorizeTool(tool.name),
+          source: 'sdk' as const,
+          needsApproval: Boolean((tool as { needsApproval?: unknown }).needsApproval),
+        }));
+
+      const sdkNames = new Set(sdkTools.map((t) => t.name));
+      const mcpOnlyTools = LOCAL_MCP_TOOL_NAMES
+        .filter((name) => !sdkNames.has(name))
+        .map((name) => ({
+          name,
+          description: '',
+          category: categorizeTool(name),
+          source: 'mcp' as const,
+          needsApproval: false,
+        }));
+
+      const allTools = [...sdkTools, ...mcpOnlyTools].sort((a, b) =>
+        a.category.localeCompare(b.category) || a.name.localeCompare(b.name),
+      );
+
+      // Discovered MCP servers (firecrawl, playwright, etc.) — what
+      // ELSE the agent has access to from the user's Claude Desktop /
+      // Claude Code config.
+      const mcpServers = discoverMcpServers().map((server) => ({
+        name: server.name,
+        description: server.description ?? '',
+        enabled: server.enabled !== false,
+        source: server.source,
+        transport: server.type,
+        command: server.command,
+        url: server.url,
+      }));
+
+      res.json({ tools: allTools, mcpServers });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // ─── Projects (workspace) ─────────────────────────────────────
+
+  app.get('/api/console/projects', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const dirs = getWorkspaceDirs();
+      const projects = listWorkspaceProjects() || [];
+      res.json({ workspaceDirs: dirs, projects });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /** Inspect one project deeply: README, CLAUDE.md, package.json snippet
+   *  to surface relevant metadata for the user without exposing the
+   *  whole filesystem. */
+  app.get('/api/console/projects/inspect', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const root = typeof req.query.path === 'string' ? req.query.path : '';
+    if (!root || !existsSync(root)) { res.status(404).json({ error: 'path not found' }); return; }
+    try {
+      const result: Record<string, unknown> = { path: root };
+
+      // README in any common form.
+      for (const name of ['README.md', 'readme.md', 'README', 'README.markdown']) {
+        const candidate = path.join(root, name);
+        if (existsSync(candidate)) {
+          try { result.readme = readFileSync(candidate, 'utf-8').slice(0, 8000); }
+          catch { /* ignore */ }
+          break;
+        }
+      }
+
+      // CLAUDE.md — both root and .claude/ subdir.
+      for (const candidate of [path.join(root, 'CLAUDE.md'), path.join(root, '.claude', 'CLAUDE.md')]) {
+        if (existsSync(candidate)) {
+          try { result.claudeMd = readFileSync(candidate, 'utf-8').slice(0, 8000); }
+          catch { /* ignore */ }
+          break;
+        }
+      }
+
+      // package.json — pull a structured snippet.
+      const pkgPath = path.join(root, 'package.json');
+      if (existsSync(pkgPath)) {
+        try {
+          const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
+          result.package = {
+            name: pkg.name,
+            version: pkg.version,
+            description: pkg.description,
+            scripts: pkg.scripts ?? {},
+            dependencies: pkg.dependencies ? Object.keys(pkg.dependencies) : [],
+            devDependencies: pkg.devDependencies ? Object.keys(pkg.devDependencies) : [],
+          };
+        } catch { /* ignore */ }
+      }
+
+      // Top-level entries.
+      try {
+        const entries = readdirSync(root, { withFileTypes: true })
+          .filter((e) => !e.name.startsWith('.'))
+          .slice(0, 80)
+          .map((e) => ({ name: e.name, isDir: e.isDirectory() }));
+        result.entries = entries;
+      } catch { /* ignore */ }
+
+      res.json(result);
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

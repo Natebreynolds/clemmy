@@ -72,11 +72,11 @@ export function renderConsoleHtml(token: string): string {
         <span class="nav-key">03</span>
         <span class="nav-label">Workflows</span>
       </button>
-      <button class="nav" data-panel="tools" disabled title="Coming next">
+      <button class="nav" data-panel="tools">
         <span class="nav-key">04</span>
         <span class="nav-label">Tools</span>
       </button>
-      <button class="nav" data-panel="projects" disabled title="Coming next">
+      <button class="nav" data-panel="projects">
         <span class="nav-key">05</span>
         <span class="nav-label">Projects</span>
       </button>
@@ -232,6 +232,76 @@ export function renderConsoleHtml(token: string): string {
               <button type="submit" class="wf-chat-send" data-wf-chat-send>SEND ▸</button>
             </form>
           </aside>
+
+        </div>
+      </section>
+
+      <section class="panel-frame" data-section="tools" hidden>
+        <div class="panel-tag">PANEL · 04 · TOOLS CATALOG</div>
+        <div class="panel-body tools-layout">
+
+          <aside class="tools-side">
+            <div class="tools-filter">
+              <input class="tools-search" data-tools-search type="search" placeholder="filter tools · category, name…" />
+              <span class="tools-count" data-tools-count>—</span>
+            </div>
+            <div class="tools-categories" data-tools-categories>
+              <!-- pills populated by JS -->
+            </div>
+          </aside>
+
+          <div class="tools-main">
+            <div class="tools-section">
+              <div class="tools-section-head">
+                <span>REGISTERED TOOLS</span>
+                <em data-tools-shown>—</em>
+              </div>
+              <div class="tools-grid" data-tools-grid>
+                <div class="tools-empty">— loading —</div>
+              </div>
+            </div>
+
+            <div class="tools-section">
+              <div class="tools-section-head">
+                <span>DISCOVERED MCP SERVERS</span>
+                <em data-mcp-count>—</em>
+              </div>
+              <div class="mcp-grid" data-mcp-grid>
+                <div class="tools-empty">— loading —</div>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </section>
+
+      <section class="panel-frame" data-section="projects" hidden>
+        <div class="panel-tag">PANEL · 05 · PROJECTS</div>
+        <div class="panel-body projects-layout">
+
+          <aside class="proj-side">
+            <div class="proj-side-head">
+              <span>WORKSPACES</span>
+              <em data-proj-workspaces-count>—</em>
+            </div>
+            <ul class="proj-ws-list" data-proj-ws-list>
+              <li class="empty">— loading —</li>
+            </ul>
+            <div class="proj-side-head">
+              <span>DETECTED PROJECTS</span>
+              <em data-proj-list-count>—</em>
+            </div>
+            <ol class="proj-list" data-proj-list>
+              <li class="empty">— loading —</li>
+            </ol>
+          </aside>
+
+          <div class="proj-detail" data-proj-detail>
+            <div class="wf-empty">
+              <div class="wf-empty-mark">⌗</div>
+              <div class="wf-empty-text">SELECT A PROJECT</div>
+            </div>
+          </div>
 
         </div>
       </section>
@@ -1320,6 +1390,308 @@ body {
   cursor: wait;
 }
 
+/* ── Tools panel ─────────────────────────────────────────────── */
+.tools-layout {
+  display: grid;
+  grid-template-columns: 240px 1fr;
+  gap: 14px;
+  height: 100%;
+  overflow: hidden;
+}
+.tools-side {
+  border: 1px solid var(--line);
+  background: var(--bg-2);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.tools-filter {
+  padding: 10px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-1);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.tools-search {
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  color: var(--fg);
+  font: inherit;
+  font-size: 11px;
+  padding: 6px 8px;
+  outline: none;
+}
+.tools-search:focus { border-color: var(--accent); }
+.tools-count {
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  color: var(--fg-3);
+}
+.tools-count em { font-style: normal; color: var(--fg); }
+.tools-categories {
+  padding: 8px;
+  overflow-y: auto;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.cat-pill {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  padding: 6px 8px;
+  text-align: left;
+  cursor: pointer;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  transition: background 100ms, color 100ms, border-color 100ms;
+}
+.cat-pill:hover { color: var(--fg); border-color: var(--line-bright); }
+.cat-pill.active {
+  background: var(--accent);
+  color: var(--bg-0);
+  border-color: var(--accent);
+}
+.cat-pill .cat-count {
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  opacity: 0.7;
+}
+
+.tools-main {
+  border: 1px solid var(--line);
+  background: var(--bg-2);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.tools-section {
+  display: flex;
+  flex-direction: column;
+  border-bottom: 1px solid var(--line);
+  min-height: 0;
+}
+.tools-section:last-child { border-bottom: 0; }
+.tools-section-head {
+  padding: 8px 14px;
+  background: var(--bg-1);
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  color: var(--fg-3);
+}
+.tools-section-head em { font-style: normal; color: var(--fg); }
+
+.tools-grid,
+.mcp-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 8px;
+  padding: 12px;
+  overflow-y: auto;
+  flex: 1;
+  font-size: 11px;
+}
+.tools-empty { color: var(--fg-mute); padding: 14px; letter-spacing: 0.12em; }
+
+.tool-card {
+  border: 1px solid var(--line);
+  background: var(--bg-1);
+  padding: 8px 10px;
+  transition: border-color 100ms, background 100ms;
+}
+.tool-card:hover { border-color: var(--line-bright); background: var(--bg-3); }
+.tool-card .tool-name {
+  color: var(--fg);
+  font-size: 11px;
+  word-break: break-word;
+}
+.tool-card .tool-meta {
+  margin-top: 4px;
+  display: flex;
+  gap: 6px;
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  color: var(--fg-3);
+}
+.tool-card .tool-cat { color: var(--accent); }
+.tool-card .tool-src { color: var(--accent-3); }
+.tool-card .tool-src.mcp { color: var(--accent-warn); }
+.tool-card .tool-approval { color: var(--accent-fail); }
+.tool-card .tool-desc {
+  margin-top: 6px;
+  color: var(--fg-2);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.mcp-card {
+  border: 1px solid var(--line);
+  background: var(--bg-1);
+  padding: 10px 12px;
+}
+.mcp-card .mcp-name {
+  color: var(--fg);
+  font-size: 12px;
+}
+.mcp-card .mcp-meta {
+  margin-top: 4px;
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  color: var(--fg-3);
+}
+.mcp-card .mcp-meta em { color: var(--accent-2); font-style: normal; }
+.mcp-card .mcp-meta .off { color: var(--fg-mute); }
+.mcp-card .mcp-desc {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--fg-2);
+}
+.mcp-card .mcp-cmd {
+  margin-top: 4px;
+  font-size: 10px;
+  color: var(--fg-mute);
+  word-break: break-all;
+}
+
+/* ── Projects panel ──────────────────────────────────────────── */
+.projects-layout {
+  display: grid;
+  grid-template-columns: 320px 1fr;
+  gap: 14px;
+  height: 100%;
+  overflow: hidden;
+}
+.proj-side {
+  border: 1px solid var(--line);
+  background: var(--bg-2);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.proj-side-head {
+  padding: 8px 12px;
+  background: var(--bg-1);
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  color: var(--fg-3);
+}
+.proj-side-head em { font-style: normal; color: var(--fg); }
+.proj-ws-list,
+.proj-list {
+  list-style: none;
+  margin: 0; padding: 0;
+  overflow-y: auto;
+  font-size: 11px;
+  max-height: 240px;
+}
+.proj-list { flex: 1; max-height: none; }
+.proj-ws-list li,
+.proj-list li {
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--line);
+}
+.proj-ws-list li { color: var(--fg-2); font-size: 10px; word-break: break-all; letter-spacing: 0.04em; }
+.proj-list li.proj {
+  cursor: pointer;
+  transition: background 100ms;
+}
+.proj-list li.proj:hover { background: var(--bg-3); }
+.proj-list li.proj.selected { background: var(--bg-3); box-shadow: inset 2px 0 0 var(--accent); }
+.proj-list li.proj .pname {
+  color: var(--fg);
+  display: block;
+}
+.proj-list li.proj .ppath {
+  display: block;
+  margin-top: 2px;
+  color: var(--fg-mute);
+  font-size: 9px;
+  word-break: break-all;
+}
+.proj-list .empty,
+.proj-ws-list .empty {
+  padding: 14px; color: var(--fg-mute); letter-spacing: 0.12em; text-align: center;
+}
+
+.proj-detail {
+  border: 1px solid var(--line);
+  background: var(--bg-2);
+  overflow-y: auto;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  font-size: 11px;
+}
+.proj-block {
+  border: 1px solid var(--line);
+  background: var(--bg-1);
+}
+.proj-block-head {
+  padding: 6px 12px;
+  background: var(--bg-2);
+  border-bottom: 1px solid var(--line);
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  color: var(--fg-3);
+  display: flex;
+  justify-content: space-between;
+}
+.proj-block-head em { font-style: normal; color: var(--accent); }
+.proj-block-body {
+  padding: 10px 12px;
+}
+.proj-block-body pre {
+  margin: 0;
+  font: 11px/1.5 var(--mono);
+  color: var(--fg);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 320px;
+  overflow-y: auto;
+}
+.proj-pkg-grid {
+  display: grid;
+  grid-template-columns: 100px 1fr;
+  gap: 4px 12px;
+  font-size: 11px;
+}
+.proj-pkg-grid dt {
+  color: var(--fg-3);
+  letter-spacing: 0.1em;
+  font-size: 10px;
+  text-transform: uppercase;
+}
+.proj-pkg-grid dd { margin: 0; color: var(--fg); }
+.proj-entries {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 4px;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+}
+.proj-entries .entry {
+  padding: 3px 6px;
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+}
+.proj-entries .entry.dir { color: var(--accent-3); }
+
 /* ── Foot bar ───────────────────────────────────────────────── */
 .foot-bar {
   display: flex;
@@ -1554,6 +1926,8 @@ const CONSOLE_JS = `
   const panelSections = Array.from(document.querySelectorAll('.panel-frame[data-section]'));
   let memoryBooted = false;
   let workflowsBooted = false;
+  let toolsBooted = false;
+  let projectsBooted = false;
 
   function switchPanel(name) {
     panelSections.forEach((s) => {
@@ -1568,6 +1942,10 @@ const CONSOLE_JS = `
     } else if (name === 'workflows') {
       if (!workflowsBooted) { workflowsBooted = true; bootWorkflowsPanel(); }
       else refreshWorkflowList();
+    } else if (name === 'tools') {
+      if (!toolsBooted) { toolsBooted = true; bootToolsPanel(); }
+    } else if (name === 'projects') {
+      if (!projectsBooted) { projectsBooted = true; bootProjectsPanel(); }
     }
   }
   navButtons.forEach((b) => {
@@ -2238,6 +2616,205 @@ const CONSOLE_JS = `
       wf.chatForm.dispatchEvent(new Event('submit', { cancelable: true }));
     }
   });
+
+  // ─── Tools panel ──────────────────────────────────────────────
+
+  const tools = {
+    search:     document.querySelector('[data-tools-search]'),
+    count:      document.querySelector('[data-tools-count]'),
+    categories: document.querySelector('[data-tools-categories]'),
+    grid:       document.querySelector('[data-tools-grid]'),
+    shown:      document.querySelector('[data-tools-shown]'),
+    mcpGrid:    document.querySelector('[data-mcp-grid]'),
+    mcpCount:   document.querySelector('[data-mcp-count]'),
+  };
+  let toolsData = null;
+  let toolsActiveCategory = '';
+
+  async function bootToolsPanel() {
+    try {
+      toolsData = await fetchJSON('/api/console/tools');
+      renderToolsCategories();
+      renderToolsGrid();
+      renderMcpGrid();
+    } catch (err) {
+      tools.grid.innerHTML = '<div class="tools-empty">— failed: ' + escMem(err.message || err) + ' —</div>';
+    }
+  }
+
+  function renderToolsCategories() {
+    const counts = new Map();
+    toolsData.tools.forEach((t) => counts.set(t.category, (counts.get(t.category) || 0) + 1));
+    const total = toolsData.tools.length;
+    const cats = Array.from(counts.entries()).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+    const pills = [
+      '<button class="cat-pill ' + (toolsActiveCategory === '' ? 'active' : '') + '" data-cat="">'
+        + '<span>ALL</span><span class="cat-count">' + total + '</span></button>',
+    ].concat(cats.map(([c, n]) =>
+      '<button class="cat-pill ' + (toolsActiveCategory === c ? 'active' : '') + '" data-cat="' + escMem(c) + '">'
+        + '<span>' + escMem(c).toUpperCase() + '</span><span class="cat-count">' + n + '</span></button>',
+    ));
+    tools.categories.innerHTML = pills.join('');
+    tools.count.innerHTML = 'TOTAL · <em>' + total + '</em>';
+    Array.from(tools.categories.querySelectorAll('.cat-pill')).forEach((p) => {
+      p.addEventListener('click', () => {
+        toolsActiveCategory = p.getAttribute('data-cat') || '';
+        Array.from(tools.categories.querySelectorAll('.cat-pill')).forEach((el) => el.classList.toggle('active', el === p));
+        renderToolsGrid();
+      });
+    });
+  }
+
+  function renderToolsGrid() {
+    if (!toolsData) return;
+    const q = (tools.search.value || '').trim().toLowerCase();
+    const filtered = toolsData.tools.filter((t) =>
+      (toolsActiveCategory === '' || t.category === toolsActiveCategory) &&
+      (q === '' || t.name.toLowerCase().includes(q) || (t.description || '').toLowerCase().includes(q) || t.category.toLowerCase().includes(q)),
+    );
+    tools.shown.textContent = filtered.length + ' shown';
+    if (filtered.length === 0) {
+      tools.grid.innerHTML = '<div class="tools-empty">— no tools match the filter —</div>';
+      return;
+    }
+    tools.grid.innerHTML = filtered.map((t) => [
+      '<div class="tool-card">',
+      '  <div class="tool-name">' + escMem(t.name) + '</div>',
+      '  <div class="tool-meta">',
+      '    <span class="tool-cat">' + escMem(t.category).toUpperCase() + '</span>',
+      '    <span class="tool-src ' + escMem(t.source) + '">' + escMem(t.source).toUpperCase() + '</span>',
+      t.needsApproval ? '    <span class="tool-approval">APPROVAL</span>' : '',
+      '  </div>',
+      t.description ? '  <div class="tool-desc">' + escMem(t.description) + '</div>' : '',
+      '</div>',
+    ].join('')).join('');
+  }
+
+  function renderMcpGrid() {
+    if (!toolsData) return;
+    const list = toolsData.mcpServers || [];
+    tools.mcpCount.textContent = list.length;
+    if (list.length === 0) {
+      tools.mcpGrid.innerHTML = '<div class="tools-empty">— no MCP servers discovered. Add one to your Claude Desktop / Code config to expose more tools. —</div>';
+      return;
+    }
+    tools.mcpGrid.innerHTML = list.map((s) => [
+      '<div class="mcp-card">',
+      '  <div class="mcp-name">' + escMem(s.name) + '</div>',
+      '  <div class="mcp-meta">',
+      '    <em>' + (s.enabled ? '● ENABLED' : '<span class="off">○ DISABLED</span>') + '</em>',
+      '    · ' + escMem(s.transport || 'stdio').toUpperCase(),
+      '    · ' + escMem(s.source || 'config'),
+      '  </div>',
+      s.description ? '  <div class="mcp-desc">' + escMem(s.description) + '</div>' : '',
+      s.command ? '  <div class="mcp-cmd">$ ' + escMem(s.command) + '</div>' : '',
+      s.url ? '  <div class="mcp-cmd">' + escMem(s.url) + '</div>' : '',
+      '</div>',
+    ].join('')).join('');
+  }
+
+  tools.search.addEventListener('input', () => renderToolsGrid());
+
+  // ─── Projects panel ────────────────────────────────────────────
+
+  const proj = {
+    wsList:     document.querySelector('[data-proj-ws-list]'),
+    wsCount:    document.querySelector('[data-proj-workspaces-count]'),
+    list:       document.querySelector('[data-proj-list]'),
+    count:      document.querySelector('[data-proj-list-count]'),
+    detail:     document.querySelector('[data-proj-detail]'),
+  };
+  let projData = null;
+  let projSelectedPath = null;
+
+  async function bootProjectsPanel() {
+    try {
+      projData = await fetchJSON('/api/console/projects');
+      renderWorkspaces();
+      renderProjects();
+    } catch (err) {
+      proj.list.innerHTML = '<li class="empty">— failed: ' + escMem(err.message || err) + ' —</li>';
+    }
+  }
+
+  function renderWorkspaces() {
+    const dirs = (projData && projData.workspaceDirs) || [];
+    proj.wsCount.textContent = dirs.length;
+    if (dirs.length === 0) {
+      proj.wsList.innerHTML = '<li class="empty">— no workspaces configured · use the workspace_config tool to add one —</li>';
+      return;
+    }
+    proj.wsList.innerHTML = dirs.map((d) => '<li>' + escMem(d) + '</li>').join('');
+  }
+
+  function renderProjects() {
+    const items = (projData && projData.projects) || [];
+    proj.count.textContent = items.length;
+    if (items.length === 0) {
+      proj.list.innerHTML = '<li class="empty">— no projects detected in configured workspaces —</li>';
+      return;
+    }
+    proj.list.innerHTML = items.map((p) => {
+      const cls = (projSelectedPath === p.path) ? 'proj selected' : 'proj';
+      return [
+        '<li class="' + cls + '" data-proj-path="' + escMem(p.path) + '">',
+        '  <span class="pname">' + escMem(p.name || p.path.split("/").pop()) + '</span>',
+        '  <span class="ppath">' + escMem(p.path) + '</span>',
+        '</li>',
+      ].join('');
+    }).join('');
+    Array.from(proj.list.querySelectorAll('li.proj')).forEach((li) => {
+      li.addEventListener('click', () => {
+        projSelectedPath = li.getAttribute('data-proj-path');
+        Array.from(proj.list.querySelectorAll('li.proj')).forEach((el) => el.classList.toggle('selected', el === li));
+        loadProjectDetail(projSelectedPath);
+      });
+    });
+  }
+
+  async function loadProjectDetail(p) {
+    if (!p) return;
+    proj.detail.innerHTML = '<div class="wf-empty"><div class="wf-empty-mark">⌛</div><div class="wf-empty-text">LOADING…</div></div>';
+    try {
+      const data = await fetchJSON('/api/console/projects/inspect?path=' + encodeURIComponent(p));
+      const parts = [];
+      parts.push('<div class="proj-block"><div class="proj-block-head"><span>PATH</span></div><div class="proj-block-body"><pre>' + escMem(data.path) + '</pre></div></div>');
+
+      if (data.package) {
+        const pkg = data.package;
+        const scripts = Object.entries(pkg.scripts || {}).slice(0, 12)
+          .map(([k, v]) => '<dt>' + escMem(k) + '</dt><dd>' + escMem(String(v)) + '</dd>').join('');
+        parts.push([
+          '<div class="proj-block"><div class="proj-block-head"><span>PACKAGE.JSON</span><em>' + escMem(pkg.name || '') + ' ' + escMem(pkg.version || '') + '</em></div>',
+          '<div class="proj-block-body">',
+          pkg.description ? '<div style="color:var(--fg-2);margin-bottom:8px;">' + escMem(pkg.description) + '</div>' : '',
+          scripts ? '<div style="font-size:10px;letter-spacing:0.14em;color:var(--fg-3);margin-bottom:4px;">SCRIPTS</div><dl class="proj-pkg-grid">' + scripts + '</dl>' : '',
+          (pkg.dependencies || []).length > 0
+            ? '<div style="margin-top:8px;font-size:10px;letter-spacing:0.14em;color:var(--fg-3);">DEPS (' + pkg.dependencies.length + ')</div><div style="font-size:10px;color:var(--fg-2);">' + escMem(pkg.dependencies.slice(0, 24).join(", ")) + (pkg.dependencies.length > 24 ? " …" : "") + '</div>'
+            : '',
+          '</div></div>',
+        ].join(''));
+      }
+
+      if (data.claudeMd) {
+        parts.push('<div class="proj-block"><div class="proj-block-head"><span>CLAUDE.MD</span></div><div class="proj-block-body"><pre>' + escMem(data.claudeMd) + '</pre></div></div>');
+      }
+      if (data.readme) {
+        parts.push('<div class="proj-block"><div class="proj-block-head"><span>README</span></div><div class="proj-block-body"><pre>' + escMem(data.readme) + '</pre></div></div>');
+      }
+      if (Array.isArray(data.entries) && data.entries.length > 0) {
+        parts.push([
+          '<div class="proj-block"><div class="proj-block-head"><span>TOP-LEVEL · ' + data.entries.length + '</span></div>',
+          '<div class="proj-block-body"><div class="proj-entries">',
+          data.entries.map((e) => '<span class="entry ' + (e.isDir ? 'dir' : '') + '">' + escMem(e.name) + (e.isDir ? '/' : '') + '</span>').join(''),
+          '</div></div></div>',
+        ].join(''));
+      }
+      proj.detail.innerHTML = parts.join('');
+    } catch (err) {
+      proj.detail.innerHTML = '<div class="wf-empty"><div class="wf-empty-mark">!</div><div class="wf-empty-text">' + escMem(err.message || err) + '</div></div>';
+    }
+  }
 
   // Boot the loop.
   tick();
