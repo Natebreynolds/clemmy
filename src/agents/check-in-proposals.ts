@@ -64,6 +64,12 @@ export interface CheckInTemplateProposal {
   resolvedBy?: 'user' | 'system';
   resolvedTemplateId?: string;
   rejectionReason?: string;
+  /**
+   * Fields the user changed at approval time, e.g. {schedule: '0 10 * * 1'}.
+   * Only populated when overrides differ from the proposal as drafted.
+   * This is the learning signal: "user wanted this idea but adjusted X".
+   */
+  appliedEdits?: Record<string, string | number>;
   version: 'v1';
 }
 
@@ -258,12 +264,19 @@ export function approveProposal(id: string, options: ApproveOptions = {}): { pro
     enabled: options.enabledOnInstall ?? true,
   });
 
+  const appliedEdits: Record<string, string | number> = {};
+  for (const [key, value] of Object.entries(overrides)) {
+    if (value === undefined) continue;
+    const before = (proposal as unknown as Record<string, unknown>)[key];
+    if (value !== before) appliedEdits[key] = value as string | number;
+  }
   const resolved: CheckInTemplateProposal = {
     ...proposal,
     status: 'approved',
     resolvedAt: new Date().toISOString(),
     resolvedBy: 'user',
     resolvedTemplateId: template.id,
+    appliedEdits: Object.keys(appliedEdits).length > 0 ? appliedEdits : undefined,
   };
   writeProposal(resolved);
 

@@ -5,6 +5,7 @@ import type { MemoryContext } from '../types.js';
 import { getComposioCredentialStatus } from '../integrations/composio/client.js';
 import { renderFactsForInstructions } from '../memory/facts.js';
 import { renderProfileForInstructions } from '../runtime/user-profile.js';
+import { getProposalFeedback, renderProposalFeedback } from '../agents/proposal-feedback.js';
 
 const GOALS_DIR = path.join(BASE_DIR, 'goals');
 
@@ -121,6 +122,7 @@ export function buildAssistantInstructions(context: MemoryContext, channel?: str
   const persistentFacts = renderFactsForInstructions(12);
   const userPreferences = renderProfileForInstructions();
   const channelDirective = renderChannelDirective(channel);
+  const proposalFeedback = renderProposalFeedback(getProposalFeedback({ windowDays: 30 }));
 
   return [
     `You are ${ASSISTANT_NAME}, a high-agency executive AI assistant for ${owner}.`,
@@ -142,6 +144,7 @@ export function buildAssistantInstructions(context: MemoryContext, channel?: str
     channelDirective,
     section('User Preferences', userPreferences),
     section('Persistent Facts', persistentFacts),
+    section('Proposal Feedback', proposalFeedback),
     section('Session Continuity', context.sessionBrief),
     section('Working Memory', context.workingMemory),
     section('Identity', context.identity),

@@ -9,6 +9,7 @@ import { createConfiguredMcpServers } from '../runtime/mcp-servers.js';
 import { autonomyV2OutputGuardrails } from './autonomy-guardrails.js';
 import { getProactivityPolicySnapshot, type ProactivityPolicy, type ProactivityPolicySnapshot } from './proactivity-policy.js';
 import { renderOpenCheckInsForAgent } from './check-ins.js';
+import { getProposalFeedback, renderProposalFeedback } from './proposal-feedback.js';
 import { activeExecutionCountForSession, renderActiveExecutionsForAgent } from '../tools/execution-tools.js';
 import { renderProfileForInstructions } from '../runtime/user-profile.js';
 import { defaultOrchestratorHandoffs, isOrchestratorSlug } from './sub-agents.js';
@@ -402,6 +403,7 @@ export function chooseFollowUpMinutes(
 
 function buildAgentInstructions(agent: TeamAgentRecord, policy: ProactivityPolicy): string {
   const orchestrator = isOrchestratorSlug(agent.slug);
+  const proposalFeedbackBlock = renderProposalFeedback(getProposalFeedback({ windowDays: 30 }));
   return [
     `You are ${agent.name} (${agent.slug}), an autonomous agent inside Clementine.`,
     agent.role ? `Role: ${agent.role}` : '',
@@ -438,6 +440,7 @@ function buildAgentInstructions(agent: TeamAgentRecord, policy: ProactivityPolic
       '- If you receive an inbox item of type `check_in_answered`, the user just answered a question you previously asked. Pick up where you left off and use the answer to make progress.',
     ].join('\n'),
     'Multi-agent comms (messaging, delegation, replies) is not available in v2 yet — for now, leave those to v1 by surfacing the intent in your summary so the user can act.',
+    proposalFeedbackBlock,
     'Output: return only `summary`, `commitments`, and optional `followUpMinutes`. Be specific and brief.',
   ].filter(Boolean).join('\n\n');
 }
