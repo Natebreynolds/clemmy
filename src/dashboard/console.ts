@@ -68,7 +68,7 @@ export function renderConsoleHtml(token: string): string {
         <span class="nav-key">02</span>
         <span class="nav-label">Memory</span>
       </button>
-      <button class="nav" data-panel="workflows" disabled title="Coming next">
+      <button class="nav" data-panel="workflows">
         <span class="nav-key">03</span>
         <span class="nav-label">Workflows</span>
       </button>
@@ -183,6 +183,55 @@ export function renderConsoleHtml(token: string): string {
               </div>
             </div>
           </div>
+
+        </div>
+      </section>
+
+      <section class="panel-frame" data-section="workflows" hidden>
+        <div class="panel-tag">PANEL · 03 · WORKFLOW STUDIO</div>
+
+        <div class="panel-body wf-layout">
+
+          <!-- Workflow list (left) -->
+          <aside class="wf-list-pane">
+            <div class="wf-list-head">
+              <span>WORKFLOWS</span>
+              <button class="wf-new-btn" data-wf-new title="Create new workflow">＋ NEW</button>
+            </div>
+            <ol class="wf-list" data-wf-list>
+              <li class="empty">— loading —</li>
+            </ol>
+          </aside>
+
+          <!-- Editor (middle) -->
+          <div class="wf-editor" data-wf-editor>
+            <div class="wf-empty">
+              <div class="wf-empty-mark">⊟</div>
+              <div class="wf-empty-text">SELECT A WORKFLOW OR ＋NEW</div>
+            </div>
+          </div>
+
+          <!-- Architect chat (right) -->
+          <aside class="wf-chat-pane">
+            <div class="wf-chat-head">
+              <span class="wf-chat-title">ARCHITECT</span>
+              <span class="wf-chat-meta" data-wf-chat-meta>idle</span>
+            </div>
+            <div class="wf-chat-log" data-wf-chat-log>
+              <div class="wf-chat-intro">
+                Workflow Architect chat.<br>
+                Ask the agent to draft, refine, or critique the workflow on the left.
+                <br><br>
+                <em>e.g. "Add a step after research that drafts a weekly email" or "Tighten the schedule to weekdays 9am" or "Validate this for cycles".</em>
+              </div>
+            </div>
+            <form class="wf-chat-form" data-wf-chat-form>
+              <textarea class="wf-chat-input" data-wf-chat-input
+                placeholder="message the architect · ⏎ to send · shift+⏎ for newline"
+                rows="2" autocomplete="off"></textarea>
+              <button type="submit" class="wf-chat-send" data-wf-chat-send>SEND ▸</button>
+            </form>
+          </aside>
 
         </div>
       </section>
@@ -870,6 +919,407 @@ body {
 }
 .fact-viewer .forget:hover { background: var(--accent-fail); color: var(--bg-0); }
 
+/* ── Workflow Studio ─────────────────────────────────────────── */
+.wf-layout {
+  display: grid;
+  grid-template-columns: 260px 1fr 360px;
+  gap: 14px;
+  height: 100%;
+  overflow: hidden;
+}
+.wf-list-pane,
+.wf-editor,
+.wf-chat-pane {
+  border: 1px solid var(--line);
+  background: var(--bg-2);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.wf-list-head,
+.wf-chat-head {
+  padding: 8px 12px;
+  background: var(--bg-1);
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  color: var(--fg-3);
+}
+.wf-chat-title { color: var(--fg); }
+.wf-chat-meta { color: var(--accent); font-size: 10px; }
+.wf-new-btn {
+  background: transparent;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  padding: 3px 8px;
+  cursor: pointer;
+  transition: background 100ms, color 100ms;
+}
+.wf-new-btn:hover { background: var(--accent); color: var(--bg-0); }
+
+.wf-list {
+  list-style: none;
+  margin: 0; padding: 0;
+  overflow-y: auto;
+  flex: 1;
+  font-size: 11px;
+}
+.wf-list .empty { padding: 18px; color: var(--fg-mute); text-align: center; letter-spacing: 0.1em; }
+.wf-list li.wf {
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--line);
+  cursor: pointer;
+  transition: background 100ms;
+}
+.wf-list li.wf:hover { background: var(--bg-3); }
+.wf-list li.wf.selected { background: var(--bg-3); box-shadow: inset 2px 0 0 var(--accent); }
+.wf-list li.wf .name {
+  color: var(--fg);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: block;
+}
+.wf-list li.wf .meta {
+  color: var(--fg-3);
+  font-size: 10px;
+  margin-top: 3px;
+  display: flex;
+  gap: 10px;
+}
+.wf-list li.wf .pill {
+  font-size: 9px;
+  letter-spacing: 0.18em;
+}
+.wf-list li.wf .pill.on { color: var(--accent-2); }
+.wf-list li.wf .pill.off { color: var(--fg-mute); }
+.wf-list li.wf .pill.cron { color: var(--accent-3); }
+
+/* Editor */
+.wf-editor { padding: 0; }
+.wf-empty {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  gap: 14px;
+  color: var(--fg-mute);
+  letter-spacing: 0.16em;
+  font-size: 10px;
+}
+.wf-empty-mark { font-size: 40px; color: var(--line-bright); }
+
+.wf-edit-head {
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-1);
+  display: flex;
+  align-items: baseline;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+.wf-edit-head input.wf-name {
+  background: transparent;
+  border: 0;
+  border-bottom: 1px dashed var(--line);
+  color: var(--fg);
+  font: inherit;
+  font-size: 13px;
+  padding: 4px 0;
+  outline: none;
+  letter-spacing: 0.02em;
+  min-width: 280px;
+  flex: 1;
+}
+.wf-edit-head input.wf-name:focus { border-bottom-color: var(--accent); }
+.wf-edit-head .status-pill {
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  padding: 3px 8px;
+  border: 1px solid var(--line);
+  color: var(--fg-3);
+}
+.wf-edit-head .status-pill.on { color: var(--accent-2); border-color: var(--accent-2); }
+.wf-edit-head .status-pill.off { color: var(--fg-mute); }
+
+.wf-edit-controls {
+  padding: 8px 14px;
+  background: var(--bg-1);
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.wf-edit-controls button {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  padding: 5px 10px;
+  cursor: pointer;
+  transition: background 100ms, color 100ms, border-color 100ms;
+}
+.wf-edit-controls button:hover { color: var(--fg); border-color: var(--line-bright); }
+.wf-edit-controls .btn-save { color: var(--accent); border-color: var(--accent); }
+.wf-edit-controls .btn-save:hover { background: var(--accent); color: var(--bg-0); }
+.wf-edit-controls .btn-validate { color: var(--accent-3); border-color: var(--accent-3); }
+.wf-edit-controls .btn-validate:hover { background: var(--accent-3); color: var(--bg-0); }
+.wf-edit-controls .btn-test { color: var(--accent-warn); border-color: var(--accent-warn); }
+.wf-edit-controls .btn-test:hover { background: var(--accent-warn); color: var(--bg-0); }
+.wf-edit-controls .btn-run { color: var(--accent-2); border-color: var(--accent-2); }
+.wf-edit-controls .btn-run:hover { background: var(--accent-2); color: var(--bg-0); }
+.wf-edit-controls .btn-toggle { color: var(--fg-2); }
+.wf-edit-controls .btn-delete { color: var(--accent-fail); border-color: var(--accent-fail); margin-left: auto; }
+.wf-edit-controls .btn-delete:hover { background: var(--accent-fail); color: var(--bg-0); }
+
+.wf-edit-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 14px;
+  font-size: 11px;
+}
+.wf-field {
+  margin-bottom: 14px;
+}
+.wf-field label {
+  display: block;
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  color: var(--fg-3);
+  margin-bottom: 5px;
+}
+.wf-field input,
+.wf-field textarea,
+.wf-field select {
+  width: 100%;
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  color: var(--fg);
+  font: inherit;
+  padding: 7px 9px;
+  outline: none;
+  transition: border-color 120ms;
+}
+.wf-field input:focus,
+.wf-field textarea:focus { border-color: var(--accent); }
+.wf-field textarea { resize: vertical; min-height: 60px; }
+.wf-field .hint {
+  display: block;
+  margin-top: 4px;
+  font-size: 10px;
+  color: var(--fg-mute);
+  letter-spacing: 0.06em;
+}
+
+.wf-steps { display: flex; flex-direction: column; gap: 8px; }
+.wf-step {
+  border: 1px solid var(--line);
+  background: var(--bg-1);
+}
+.wf-step-head {
+  padding: 6px 10px;
+  background: var(--bg-2);
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  color: var(--fg-3);
+}
+.wf-step-head .step-num { color: var(--accent); }
+.wf-step-head .step-id-input {
+  background: transparent;
+  border: 0;
+  border-bottom: 1px dashed var(--line);
+  color: var(--fg);
+  font: inherit;
+  font-size: 11px;
+  width: 120px;
+  outline: none;
+  letter-spacing: 0.06em;
+}
+.wf-step-head .step-id-input:focus { border-bottom-color: var(--accent); }
+.wf-step-head .step-actions { margin-left: auto; display: flex; gap: 4px; }
+.wf-step-head .step-actions button {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-3);
+  font: inherit;
+  font-size: 10px;
+  padding: 2px 6px;
+  cursor: pointer;
+}
+.wf-step-head .step-actions button:hover { color: var(--fg); border-color: var(--line-bright); }
+.wf-step-head .step-actions .step-remove { color: var(--accent-fail); border-color: var(--accent-fail); }
+
+.wf-step-body { padding: 10px; }
+.wf-step-body .step-prompt {
+  width: 100%;
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  color: var(--fg);
+  font: inherit;
+  padding: 8px 10px;
+  outline: none;
+  resize: vertical;
+  min-height: 60px;
+  transition: border-color 120ms;
+}
+.wf-step-body .step-prompt:focus { border-color: var(--accent); }
+.wf-step-body .step-deps {
+  margin-top: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  font-size: 10px;
+  letter-spacing: 0.12em;
+}
+.wf-step-body .step-deps-label { color: var(--fg-3); margin-right: 6px; }
+.wf-step-body .step-deps .dep-pill {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-3);
+  padding: 2px 6px;
+  cursor: pointer;
+}
+.wf-step-body .step-deps .dep-pill.on {
+  background: var(--accent-3);
+  border-color: var(--accent-3);
+  color: var(--bg-0);
+}
+
+.wf-add-step {
+  margin-top: 8px;
+  background: transparent;
+  border: 1px dashed var(--line);
+  color: var(--fg-3);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  padding: 8px;
+  width: 100%;
+  cursor: pointer;
+  transition: color 100ms, border-color 100ms;
+}
+.wf-add-step:hover { color: var(--accent); border-color: var(--accent); }
+
+.wf-validation {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  background: var(--bg-1);
+  font-size: 11px;
+}
+.wf-validation.ok { border-color: var(--accent-2); }
+.wf-validation.err { border-color: var(--accent-fail); }
+.wf-validation-head {
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  color: var(--fg-3);
+  margin-bottom: 6px;
+}
+.wf-validation.ok .wf-validation-head { color: var(--accent-2); }
+.wf-validation.err .wf-validation-head { color: var(--accent-fail); }
+.wf-validation ul { margin: 0; padding-left: 18px; color: var(--fg-2); }
+.wf-validation .warn { color: var(--accent-warn); }
+.wf-validation .err  { color: var(--accent-fail); }
+
+/* Architect chat */
+.wf-chat-pane { font-size: 12px; }
+.wf-chat-log {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.wf-chat-intro {
+  color: var(--fg-3);
+  font-size: 11px;
+  line-height: 1.55;
+  padding: 6px;
+  border: 1px dashed var(--line);
+}
+.wf-chat-intro em { color: var(--fg-2); font-style: italic; }
+
+.wf-msg {
+  border: 1px solid var(--line);
+  background: var(--bg-1);
+}
+.wf-msg-head {
+  padding: 4px 9px;
+  background: var(--bg-2);
+  border-bottom: 1px solid var(--line);
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  color: var(--fg-3);
+}
+.wf-msg-body {
+  padding: 9px 10px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 11px;
+  color: var(--fg);
+  line-height: 1.5;
+}
+.wf-msg.user .wf-msg-head { color: var(--accent-3); }
+.wf-msg.assistant .wf-msg-head { color: var(--accent); }
+.wf-msg.error .wf-msg-head { color: var(--accent-fail); }
+.wf-msg.thinking .wf-msg-body {
+  color: var(--fg-mute);
+  font-style: italic;
+}
+
+.wf-chat-form {
+  border-top: 1px solid var(--line);
+  background: var(--bg-1);
+  padding: 8px;
+  display: flex;
+  gap: 6px;
+  align-items: flex-end;
+}
+.wf-chat-input {
+  flex: 1;
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  color: var(--fg);
+  font: inherit;
+  font-size: 11px;
+  padding: 6px 8px;
+  resize: none;
+  outline: none;
+  transition: border-color 120ms;
+}
+.wf-chat-input:focus { border-color: var(--accent); }
+.wf-chat-send {
+  background: var(--accent);
+  border: 0;
+  color: var(--bg-0);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  padding: 7px 12px;
+  cursor: pointer;
+  align-self: stretch;
+  font-weight: 600;
+}
+.wf-chat-send:disabled {
+  background: var(--bg-3);
+  color: var(--fg-mute);
+  cursor: wait;
+}
+
 /* ── Foot bar ───────────────────────────────────────────────── */
 .foot-bar {
   display: flex;
@@ -1103,6 +1553,7 @@ const CONSOLE_JS = `
   const navButtons = Array.from(document.querySelectorAll('.nav[data-panel]'));
   const panelSections = Array.from(document.querySelectorAll('.panel-frame[data-section]'));
   let memoryBooted = false;
+  let workflowsBooted = false;
 
   function switchPanel(name) {
     panelSections.forEach((s) => {
@@ -1111,11 +1562,12 @@ const CONSOLE_JS = `
       else s.setAttribute('hidden', '');
     });
     navButtons.forEach((b) => b.classList.toggle('active', b.getAttribute('data-panel') === name));
-    if (name === 'memory' && !memoryBooted) {
-      memoryBooted = true;
-      bootMemoryPanel();
-    } else if (name === 'memory') {
-      refreshMemoryPanel();
+    if (name === 'memory') {
+      if (!memoryBooted) { memoryBooted = true; bootMemoryPanel(); }
+      else refreshMemoryPanel();
+    } else if (name === 'workflows') {
+      if (!workflowsBooted) { workflowsBooted = true; bootWorkflowsPanel(); }
+      else refreshWorkflowList();
     }
   }
   navButtons.forEach((b) => {
@@ -1343,6 +1795,449 @@ const CONSOLE_JS = `
       }
     });
   }
+
+  // ─── Workflow Studio ──────────────────────────────────────────
+
+  const wf = {
+    list:      document.querySelector('[data-wf-list]'),
+    editor:    document.querySelector('[data-wf-editor]'),
+    newBtn:    document.querySelector('[data-wf-new]'),
+    chatLog:   document.querySelector('[data-wf-chat-log]'),
+    chatForm:  document.querySelector('[data-wf-chat-form]'),
+    chatInput: document.querySelector('[data-wf-chat-input]'),
+    chatSend:  document.querySelector('[data-wf-chat-send]'),
+    chatMeta:  document.querySelector('[data-wf-chat-meta]'),
+  };
+
+  /** Local draft state — what the editor shows; not yet saved unless
+   *  the user hits SAVE. New workflows live here before the first POST. */
+  let wfDraft = null;
+  let wfSelectedName = null;
+  let wfIsNew = false;
+  let wfChatHistory = [];
+  let wfChatBusy = false;
+
+  async function bootWorkflowsPanel() { await refreshWorkflowList(); }
+
+  async function refreshWorkflowList() {
+    try {
+      const data = await fetchJSON('/api/console/workflows');
+      const items = data.workflows || [];
+      if (items.length === 0) {
+        wf.list.innerHTML = '<li class="empty">— no workflows — ＋ NEW to start —</li>';
+        return;
+      }
+      wf.list.innerHTML = items.map((w) => {
+        const cls = (wfSelectedName === w.name) ? 'wf selected' : 'wf';
+        const enabledPill = w.enabled ? '<span class="pill on">● APPROVED</span>' : '<span class="pill off">○ DISABLED</span>';
+        const cronPill = w.triggerSchedule ? '<span class="pill cron">⏱ ' + escMem(w.triggerSchedule) + '</span>' : '';
+        return [
+          '<li class="' + cls + '" data-wf-name="' + escMem(w.name) + '">',
+          '  <span class="name">' + escMem(w.name) + '</span>',
+          '  <span class="meta">' + enabledPill + cronPill + '<span class="pill">' + w.stepCount + ' steps</span></span>',
+          '</li>',
+        ].join('');
+      }).join('');
+      Array.from(wf.list.querySelectorAll('li.wf')).forEach((li) => {
+        li.addEventListener('click', () => {
+          const name = li.getAttribute('data-wf-name');
+          wfSelectedName = name;
+          wfIsNew = false;
+          Array.from(wf.list.querySelectorAll('li.wf')).forEach((el) => el.classList.toggle('selected', el === li));
+          loadWorkflow(name);
+        });
+      });
+    } catch (err) {
+      wf.list.innerHTML = '<li class="empty">— failed: ' + escMem(err.message || err) + ' —</li>';
+    }
+  }
+
+  async function loadWorkflow(name) {
+    try {
+      const data = await fetchJSON('/api/console/workflows/' + encodeURIComponent(name));
+      wfDraft = {
+        name: data.name,
+        description: data.description || '',
+        enabled: data.enabled !== false,
+        triggerSchedule: data.trigger && data.trigger.schedule ? data.trigger.schedule : '',
+        steps: Array.isArray(data.steps) ? data.steps.map((s) => ({ id: s.id, prompt: s.prompt, dependsOn: s.dependsOn || [], model: s.model })) : [],
+        inputs: data.inputs || {},
+        synthesisPrompt: data.synthesis && data.synthesis.prompt ? data.synthesis.prompt : '',
+      };
+      wfChatHistory = [];
+      renderEditor();
+    } catch (err) {
+      wf.editor.innerHTML = '<div class="wf-empty"><div class="wf-empty-mark">!</div><div class="wf-empty-text">' + escMem(err.message || err) + '</div></div>';
+    }
+  }
+
+  function startNewWorkflow() {
+    wfSelectedName = null;
+    wfIsNew = true;
+    wfDraft = {
+      name: 'new-workflow',
+      description: '',
+      enabled: false,
+      triggerSchedule: '',
+      steps: [{ id: 'step-1', prompt: '', dependsOn: [] }],
+      inputs: {},
+      synthesisPrompt: '',
+    };
+    wfChatHistory = [];
+    Array.from(wf.list.querySelectorAll('li.wf')).forEach((el) => el.classList.remove('selected'));
+    renderEditor();
+  }
+  wf.newBtn.addEventListener('click', startNewWorkflow);
+
+  function renderEditor() {
+    if (!wfDraft) {
+      wf.editor.innerHTML = '<div class="wf-empty"><div class="wf-empty-mark">⊟</div><div class="wf-empty-text">SELECT A WORKFLOW OR ＋NEW</div></div>';
+      return;
+    }
+    const d = wfDraft;
+    const stepIds = d.steps.map((s) => s.id);
+    const head = [
+      '<div class="wf-edit-head">',
+      '  <input class="wf-name" data-wf-field="name" type="text" value="' + escMem(d.name) + '" spellcheck="false" />',
+      '  <span class="status-pill ' + (d.enabled ? 'on' : 'off') + '">' + (d.enabled ? '● APPROVED' : '○ DRAFT') + '</span>',
+      '</div>',
+    ].join('');
+    const controls = [
+      '<div class="wf-edit-controls">',
+      '  <button class="btn-save" data-wf-action="save">' + (wfIsNew ? 'CREATE' : 'SAVE') + ' ✎</button>',
+      wfIsNew ? '' : '  <button class="btn-validate" data-wf-action="validate">VALIDATE ✓</button>',
+      wfIsNew ? '' : '  <button class="btn-test" data-wf-action="test">DRY-RUN ⌗</button>',
+      wfIsNew ? '' : '  <button class="btn-run" data-wf-action="run">RUN ▶</button>',
+      wfIsNew ? '' : '  <button class="btn-toggle" data-wf-action="toggle">' + (d.enabled ? '○ DISABLE' : '● APPROVE') + '</button>',
+      wfIsNew ? '' : '  <button class="btn-delete" data-wf-action="delete">DELETE ▣</button>',
+      '</div>',
+    ].join('');
+
+    const body = [
+      '<div class="wf-edit-body">',
+
+      '  <div class="wf-field">',
+      '    <label>DESCRIPTION</label>',
+      '    <textarea data-wf-field="description" rows="2" spellcheck="false">' + escMem(d.description) + '</textarea>',
+      '    <span class="hint">A clear description helps the agent pick the right workflow.</span>',
+      '  </div>',
+
+      '  <div class="wf-field">',
+      '    <label>TRIGGER (cron expression — blank = manual only)</label>',
+      '    <input type="text" data-wf-field="triggerSchedule" value="' + escMem(d.triggerSchedule) + '" spellcheck="false" placeholder="0 9 * * 1-5" />',
+      '    <span class="hint">Five-field cron. Examples: <code>0 9 * * 1-5</code> (weekdays 9am), <code>*/15 * * * *</code> (every 15m).</span>',
+      '  </div>',
+
+      '  <div class="wf-field">',
+      '    <label>STEPS · ' + d.steps.length + '</label>',
+      '    <div class="wf-steps" data-wf-steps>',
+           d.steps.map((s, i) => renderStep(s, i, stepIds)).join(''),
+      '    </div>',
+      '    <button class="wf-add-step" data-wf-action="add-step">＋ ADD STEP</button>',
+      '  </div>',
+
+      '  <div class="wf-field">',
+      '    <label>SYNTHESIS (optional final prompt that combines step outputs)</label>',
+      '    <textarea data-wf-field="synthesisPrompt" rows="3" spellcheck="false" placeholder="Summarize the prior step outputs as a single concise update.">' + escMem(d.synthesisPrompt) + '</textarea>',
+      '  </div>',
+
+      '  <div data-wf-validation></div>',
+
+      '</div>',
+    ].join('');
+
+    wf.editor.innerHTML = head + controls + body;
+    bindEditorEvents();
+  }
+
+  function renderStep(step, index, allStepIds) {
+    const deps = step.dependsOn || [];
+    const depPills = allStepIds
+      .filter((id) => id !== step.id)
+      .map((id) => '<button type="button" class="dep-pill ' + (deps.includes(id) ? 'on' : '') + '" data-wf-dep="' + escMem(id) + '" data-wf-step-id="' + escMem(step.id) + '">' + escMem(id) + '</button>')
+      .join('');
+    return [
+      '<div class="wf-step" data-wf-step-index="' + index + '">',
+      '  <div class="wf-step-head">',
+      '    <span class="step-num">#' + (index + 1) + '</span>',
+      '    <input class="step-id-input" type="text" value="' + escMem(step.id) + '" data-wf-step-field="id" data-wf-step-index="' + index + '" spellcheck="false" />',
+      '    <div class="step-actions">',
+      '      <button type="button" data-wf-action="step-up" data-wf-step-index="' + index + '">↑</button>',
+      '      <button type="button" data-wf-action="step-down" data-wf-step-index="' + index + '">↓</button>',
+      '      <button type="button" class="step-remove" data-wf-action="step-remove" data-wf-step-index="' + index + '">REMOVE</button>',
+      '    </div>',
+      '  </div>',
+      '  <div class="wf-step-body">',
+      '    <textarea class="step-prompt" rows="3" data-wf-step-field="prompt" data-wf-step-index="' + index + '" placeholder="What this step should do, ideally referencing any tools it should call (e.g. memory_recall, notify_user).">' + escMem(step.prompt || '') + '</textarea>',
+      depPills ? '    <div class="step-deps"><span class="step-deps-label">DEPENDS ON ⇢</span>' + depPills + '</div>' : '    <div class="step-deps"><span class="step-deps-label">DEPENDS ON ⇢</span><span style="color:var(--fg-mute);">(no other steps to depend on)</span></div>',
+      '  </div>',
+      '</div>',
+    ].join('');
+  }
+
+  function bindEditorEvents() {
+    // Field bindings — every input mutates wfDraft in place.
+    wf.editor.querySelectorAll('[data-wf-field]').forEach((input) => {
+      input.addEventListener('input', () => {
+        const key = input.getAttribute('data-wf-field');
+        wfDraft[key] = input.value;
+      });
+    });
+    wf.editor.querySelectorAll('[data-wf-step-field]').forEach((input) => {
+      input.addEventListener('input', () => {
+        const idx = parseInt(input.getAttribute('data-wf-step-index'), 10);
+        const field = input.getAttribute('data-wf-step-field');
+        if (Number.isFinite(idx) && wfDraft.steps[idx]) {
+          wfDraft.steps[idx][field] = input.value;
+        }
+      });
+    });
+    // Dependency pill toggles
+    wf.editor.querySelectorAll('.dep-pill').forEach((pill) => {
+      pill.addEventListener('click', () => {
+        const stepId = pill.getAttribute('data-wf-step-id');
+        const depId = pill.getAttribute('data-wf-dep');
+        const step = wfDraft.steps.find((s) => s.id === stepId);
+        if (!step) return;
+        const has = (step.dependsOn || []).includes(depId);
+        if (has) step.dependsOn = step.dependsOn.filter((d) => d !== depId);
+        else step.dependsOn = [...(step.dependsOn || []), depId];
+        pill.classList.toggle('on');
+      });
+    });
+
+    // Action buttons
+    wf.editor.querySelectorAll('[data-wf-action]').forEach((btn) => {
+      btn.addEventListener('click', (e) => {
+        e.preventDefault();
+        const action = btn.getAttribute('data-wf-action');
+        const idx = parseInt(btn.getAttribute('data-wf-step-index') || '-1', 10);
+        if (action === 'save') return saveWorkflow();
+        if (action === 'validate') return validateWorkflow();
+        if (action === 'test') return runWorkflow(true);
+        if (action === 'run') return runWorkflow(false);
+        if (action === 'toggle') return toggleEnabled();
+        if (action === 'delete') return deleteWorkflow();
+        if (action === 'add-step') {
+          const nextId = 'step-' + (wfDraft.steps.length + 1);
+          wfDraft.steps.push({ id: nextId, prompt: '', dependsOn: [] });
+          renderEditor();
+          return;
+        }
+        if (action === 'step-remove' && Number.isFinite(idx)) {
+          wfDraft.steps.splice(idx, 1);
+          renderEditor();
+          return;
+        }
+        if (action === 'step-up' && idx > 0) {
+          const [moved] = wfDraft.steps.splice(idx, 1);
+          wfDraft.steps.splice(idx - 1, 0, moved);
+          renderEditor();
+          return;
+        }
+        if (action === 'step-down' && idx >= 0 && idx < wfDraft.steps.length - 1) {
+          const [moved] = wfDraft.steps.splice(idx, 1);
+          wfDraft.steps.splice(idx + 1, 0, moved);
+          renderEditor();
+          return;
+        }
+      });
+    });
+  }
+
+  async function saveWorkflow() {
+    if (!wfDraft) return;
+    try {
+      if (wfIsNew) {
+        const r = await fetch(withToken('/api/console/workflows'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name: wfDraft.name,
+            description: wfDraft.description,
+            enabled: wfDraft.enabled,
+            triggerSchedule: wfDraft.triggerSchedule || undefined,
+            steps: wfDraft.steps,
+            synthesisPrompt: wfDraft.synthesisPrompt || undefined,
+            inputs: wfDraft.inputs,
+          }),
+        });
+        if (!r.ok) {
+          const j = await r.json().catch(() => ({}));
+          renderValidation({ ok: false, errors: [j.error || ('HTTP ' + r.status)], warnings: [], stepCount: 0, hasCycles: false });
+          return;
+        }
+        wfIsNew = false;
+        wfSelectedName = wfDraft.name;
+      } else {
+        const r = await fetch(withToken('/api/console/workflows/' + encodeURIComponent(wfSelectedName)), {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            description: wfDraft.description,
+            triggerSchedule: wfDraft.triggerSchedule || undefined,
+            clearTriggerSchedule: !wfDraft.triggerSchedule,
+            steps: wfDraft.steps,
+            synthesisPrompt: wfDraft.synthesisPrompt,
+            inputs: wfDraft.inputs,
+          }),
+        });
+        if (!r.ok) {
+          const j = await r.json().catch(() => ({}));
+          renderValidation({ ok: false, errors: [j.error || ('HTTP ' + r.status)], warnings: [], stepCount: 0, hasCycles: false });
+          return;
+        }
+      }
+      renderValidation({ ok: true, errors: [], warnings: [], stepCount: wfDraft.steps.length, hasCycles: false }, 'SAVED');
+      refreshWorkflowList();
+    } catch (err) {
+      renderValidation({ ok: false, errors: [err.message || String(err)], warnings: [], stepCount: 0, hasCycles: false });
+    }
+  }
+
+  async function validateWorkflow() {
+    if (!wfSelectedName) return;
+    try {
+      const r = await fetch(withToken('/api/console/workflows/' + encodeURIComponent(wfSelectedName) + '/validate'), { method: 'POST' });
+      const v = await r.json();
+      renderValidation(v);
+    } catch (err) {
+      renderValidation({ ok: false, errors: [err.message || String(err)], warnings: [], stepCount: 0, hasCycles: false });
+    }
+  }
+
+  async function runWorkflow(dryRun) {
+    if (!wfSelectedName) return;
+    try {
+      const r = await fetch(withToken('/api/console/workflows/' + encodeURIComponent(wfSelectedName) + '/run'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dryRun, inputs: {} }),
+      });
+      const j = await r.json();
+      if (!r.ok) {
+        renderValidation({ ok: false, errors: [j.error || ('HTTP ' + r.status)], warnings: [], stepCount: 0, hasCycles: false });
+        return;
+      }
+      renderValidation({ ok: true, errors: [], warnings: [], stepCount: 0, hasCycles: false }, dryRun ? ('DRY-RUN QUEUED · ' + j.id) : ('QUEUED · ' + j.id));
+    } catch (err) {
+      renderValidation({ ok: false, errors: [err.message || String(err)], warnings: [], stepCount: 0, hasCycles: false });
+    }
+  }
+
+  async function toggleEnabled() {
+    if (!wfSelectedName) return;
+    const next = !wfDraft.enabled;
+    try {
+      const r = await fetch(withToken('/api/console/workflows/' + encodeURIComponent(wfSelectedName) + '/set-enabled'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: next }),
+      });
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        renderValidation({ ok: false, errors: [j.error || ('HTTP ' + r.status)], warnings: [], stepCount: 0, hasCycles: false });
+        return;
+      }
+      wfDraft.enabled = next;
+      renderEditor();
+      refreshWorkflowList();
+    } catch (err) {
+      renderValidation({ ok: false, errors: [err.message || String(err)], warnings: [], stepCount: 0, hasCycles: false });
+    }
+  }
+
+  async function deleteWorkflow() {
+    if (!wfSelectedName) return;
+    if (!confirm('Permanently delete workflow "' + wfSelectedName + '"?')) return;
+    try {
+      const r = await fetch(withToken('/api/console/workflows/' + encodeURIComponent(wfSelectedName)), { method: 'DELETE' });
+      if (!r.ok) return;
+      wfDraft = null;
+      wfSelectedName = null;
+      renderEditor();
+      refreshWorkflowList();
+    } catch (_) {}
+  }
+
+  function renderValidation(v, customLabel) {
+    const target = wf.editor.querySelector('[data-wf-validation]');
+    if (!target) return;
+    const cls = v.ok ? 'ok' : 'err';
+    const headLabel = customLabel || (v.ok ? '✓ VALID · ' + (v.stepCount || 0) + ' STEPS' : '✗ ' + v.errors.length + ' ERROR' + (v.errors.length === 1 ? '' : 'S'));
+    const items = [];
+    v.errors.forEach((e) => items.push('<li class="err">' + escMem(e) + '</li>'));
+    v.warnings.forEach((w) => items.push('<li class="warn">⚠ ' + escMem(w) + '</li>'));
+    target.innerHTML = [
+      '<div class="wf-validation ' + cls + '">',
+      '  <div class="wf-validation-head">' + headLabel + '</div>',
+      items.length > 0 ? '  <ul>' + items.join('') + '</ul>' : '  <div style="color:var(--fg-mute);font-size:11px;">No issues.</div>',
+      '</div>',
+    ].join('');
+  }
+
+  // ─── Architect chat ───────────────────────────────────────────
+
+  function appendChatMessage(role, text) {
+    if (!wf.chatLog) return;
+    const intro = wf.chatLog.querySelector('.wf-chat-intro');
+    if (intro) intro.remove();
+    const div = document.createElement('div');
+    div.className = 'wf-msg ' + role;
+    div.innerHTML = '<div class="wf-msg-head">' + role.toUpperCase() + '</div><div class="wf-msg-body">' + escMem(text) + '</div>';
+    wf.chatLog.appendChild(div);
+    wf.chatLog.scrollTop = wf.chatLog.scrollHeight;
+    return div;
+  }
+
+  wf.chatForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    if (wfChatBusy) return;
+    const msg = wf.chatInput.value.trim();
+    if (!msg) return;
+    appendChatMessage('user', msg);
+    wfChatHistory.push({ role: 'user', text: msg });
+    wf.chatInput.value = '';
+    wfChatBusy = true;
+    wf.chatSend.disabled = true;
+    wf.chatMeta.textContent = 'thinking…';
+    const thinkingNode = appendChatMessage('thinking', '…');
+    try {
+      const r = await fetch(withToken('/api/console/workflows/architect/chat'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message: msg,
+          draft: wfDraft,
+          draftName: wfDraft ? wfDraft.name : null,
+          history: wfChatHistory.slice(0, -1),
+        }),
+      });
+      const j = await r.json();
+      if (thinkingNode) thinkingNode.remove();
+      if (!r.ok) {
+        appendChatMessage('error', j.error || ('HTTP ' + r.status));
+      } else {
+        appendChatMessage('assistant', j.text || '(no reply)');
+        wfChatHistory.push({ role: 'assistant', text: j.text || '' });
+      }
+    } catch (err) {
+      if (thinkingNode) thinkingNode.remove();
+      appendChatMessage('error', err.message || String(err));
+    } finally {
+      wfChatBusy = false;
+      wf.chatSend.disabled = false;
+      wf.chatMeta.textContent = 'idle';
+    }
+  });
+
+  // Enter sends; Shift+Enter inserts newline.
+  wf.chatInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      wf.chatForm.dispatchEvent(new Event('submit', { cancelable: true }));
+    }
+  });
 
   // Boot the loop.
   tick();

@@ -411,7 +411,7 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
   // /console — new parallel dashboard surface. Coexists with /dashboard;
   // own visual language and growing surface area (workflows, memory
   // navigator, project picker, etc.). See src/dashboard/console.ts.
-  registerConsoleRoutes(app, isAuthorized);
+  registerConsoleRoutes(app, isAuthorized, assistant);
 
   app.get('/dashboard', async (req, res) => {
     if (!isAuthorized(req)) {
