@@ -30,6 +30,12 @@ function saveSessions(data: Record<string, SessionRecord>): void {
 }
 
 export class SessionStore {
+  list(limit = 20): SessionRecord[] {
+    return Object.values(loadSessions())
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+      .slice(0, limit);
+  }
+
   get(sessionId: string): SessionRecord {
     const sessions = loadSessions();
     const existing = sessions[sessionId];

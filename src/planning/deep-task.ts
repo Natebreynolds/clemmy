@@ -14,8 +14,8 @@ export function buildDeepTaskPrompt(task: string): string {
   ].join('\n');
 }
 
-export function saveDeepTaskPlan(task: string, steps: string[]): string {
-  const plan = new PlanStore().create(task, steps);
+export function saveDeepTaskPlan(task: string, steps: string[], sessionId?: string): string {
+  const plan = new PlanStore().create(task, steps, { sessionId, source: 'deep_task' });
   return plan.id;
 }
 

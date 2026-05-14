@@ -30,6 +30,7 @@ The rebuild now has:
 - a local daemon runner for cron schedules, trigger files, and queued workflow runs
 - a daemon-driven autonomous agent loop with durable inboxes, commitments, and proactive wake cycles
 - a first-class Discord bot transport for inbound chat and outbound bot-channel delivery
+- Composio-backed connected app OAuth for services like Gmail, Slack, Notion, GitHub, Linear, Calendar, Drive, and CRMs
 
 ## Install
 
@@ -186,12 +187,22 @@ The webhook server now also exposes a minimal local dashboard.
 - daemon detail: `/api/daemon/status`
 - notifications feed: `/api/notifications`
 - agent state and inbox visibility in the dashboard/API snapshot
+- Discord onboarding directly in the dashboard by pasting a bot token
+- Composio onboarding, app connection actions, and tool-source preferences
 
 Run it with:
 
 ```bash
 npm run webhook
 ```
+
+Connected apps through Composio:
+
+- Open `/dashboard?token=YOUR_WEBHOOK_SECRET`
+- Paste a Composio API key in `Connected Apps`
+- Click `Connect` for Gmail, Slack, Notion, GitHub, Linear, Google Calendar, or any featured toolkit
+- Clementine can then use `composio_status`, `composio_list_tools`, and `composio_execute_tool` during agent runs
+- Mutating external actions are routed through the approval flow
 
 Notification delivery:
 
@@ -217,6 +228,14 @@ Set:
 DISCORD_ENABLED=true
 DISCORD_BOT_TOKEN=...
 DISCORD_REQUIRE_MENTION=true
+```
+
+When setup can verify the bot token, it also stores `DISCORD_CLIENT_ID` and prints a Discord install URL so you can add the bot to a server immediately.
+
+You can print the saved install link again later with:
+
+```bash
+clementine discord invite
 ```
 
 Optional:

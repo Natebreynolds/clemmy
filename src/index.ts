@@ -29,6 +29,8 @@ import { runDoctor } from './setup/doctor.js';
 import { initHome } from './setup/init-home.js';
 import { runSetupWizard } from './setup/setup.js';
 import { PLUGINS_DIR } from './plugins/loader.js';
+import { getConfiguredDiscordInstallInfo } from './channels/discord-install.js';
+import { readMemoryIndexStatus, rebuildVaultIndex } from './memory/indexer.js';
 
 const logger = pino({ name: 'clementine-next' });
 
@@ -63,6 +65,10 @@ Plugins
   plugin install <dir|pkg>  Install a plugin (copies dir or npm-installs pkg)
   plugin list               List installed plugins
 
+Memory
+  memory status       Show SQLite vault index and fact counts
+  memory reindex      Rebuild the SQLite vault index
+
 Setup
   setup               Interactive setup wizard
   doctor              Run diagnostics
@@ -71,6 +77,7 @@ Setup
 Individual services
   webhook             Start HTTP webhook server only
   discord             Start Discord bot only
+  discord invite      Print the Discord bot install link
 
 Options
   --help, -h          Show this help
@@ -261,6 +268,43 @@ function cmdPluginInstall(target: string): number {
   return 0;
 }
 
+function cmdMemoryStatus(): number {
+  const status = readMemoryIndexStatus();
+  console.log('Memory index');
+  console.log(`  DB: ${status.dbPath}`);
+  console.log(`  Present: ${status.dbPresent ? 'yes' : 'no'}`);
+  console.log(`  Size: ${status.dbBytes} bytes`);
+  console.log(`  Indexed files: ${status.indexedFiles}`);
+  console.log(`  Chunks: ${status.chunks}`);
+  console.log(`  Facts: ${status.activeFacts} active / ${status.totalFacts} total`);
+  console.log(`  Embeddings: ${status.embeddingsEnabled ? 'enabled' : 'disabled'}`);
+  console.log(`  Embedding vectors: ${status.embeddingsCount}`);
+  console.log(`  Embedding coverage: ${Math.round(status.embeddingsCoverage * 100)}%`);
+  if (status.embeddingsModel) {
+    console.log(`  Embedding model: ${status.embeddingsModel} (${status.embeddingsDim ?? '-'} dimensions)`);
+  }
+  if (status.lastIndexedSourceMtime) {
+    console.log(`  Latest source mtime: ${new Date(status.lastIndexedSourceMtime).toISOString()}`);
+  }
+  if (status.error) {
+    console.log(`  Error: ${status.error}`);
+    return 1;
+  }
+  return 0;
+}
+
+function cmdMemoryReindex(): number {
+  try {
+    const stats = rebuildVaultIndex();
+    console.log(`Rebuilt memory index: ${stats.inserted} chunks from ${stats.scanned} files.`);
+    console.log(`Changed: ${stats.changed}; skipped: ${stats.skipped}; removed: ${stats.removed}; errors: ${stats.errors}; duration: ${stats.durationMs}ms`);
+    return stats.errors > 0 ? 1 : 0;
+  } catch (error) {
+    console.error('Failed to rebuild memory index:', error instanceof Error ? error.message : error);
+    return 1;
+  }
+}
+
 async function main(): Promise<void> {
   const command = process.argv[2] ?? 'help';
 
@@ -281,6 +325,21 @@ async function main(): Promise<void> {
   if (command === 'init-home') {
     await initHome();
     return;
+  }
+
+  if (command === 'discord') {
+    const subcommand = process.argv[3] ?? '';
+    if (subcommand === 'invite') {
+      const installInfo = getConfiguredDiscordInstallInfo();
+      if (!installInfo) {
+        console.error('No Discord install link is configured.');
+        console.error('Run `clementine setup` with a valid Discord bot token or set DISCORD_CLIENT_ID in your .env.');
+        process.exitCode = 1;
+        return;
+      }
+      console.log(installInfo.installUrl);
+      return;
+    }
   }
 
   // --- Auth ---
@@ -372,6 +431,15 @@ async function main(): Promise<void> {
       return;
     }
     console.log('Usage: clementine plugin <list|install <path-or-package>>');
+    return;
+  }
+
+  if (command === 'memory') {
+    const sub = process.argv[3] ?? 'status';
+    if (sub === 'status') { process.exitCode = cmdMemoryStatus(); return; }
+    if (sub === 'reindex' || sub === 'rebuild-index') { process.exitCode = cmdMemoryReindex(); return; }
+    console.log('Usage: clementine memory <status|reindex>');
+    process.exitCode = 1;
     return;
   }
 

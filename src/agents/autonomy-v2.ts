@@ -3,7 +3,7 @@ import { z } from 'zod';
 import pino from 'pino';
 import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { getOpenAiApiKey, MODELS } from '../config.js';
+import { getOpenAiApiKey, getRuntimeEnv, MODELS } from '../config.js';
 import { getCoreTools } from '../tools/registry.js';
 import { createConfiguredMcpServers } from '../runtime/mcp-servers.js';
 import { autonomyV2OutputGuardrails } from './autonomy-guardrails.js';
@@ -97,7 +97,7 @@ const PER_AGENT_TIMEOUT_MS = 60_000;
 const MAX_INBOX_PER_CYCLE = 6;
 
 function readOptInSlugs(): Set<string> {
-  const raw = process.env[ENGINE_OPT_IN_ENV] ?? '';
+  const raw = getRuntimeEnv(ENGINE_OPT_IN_ENV, '');
   return new Set(
     raw.split(',').map((slug) => slug.trim()).filter(Boolean),
   );
@@ -338,6 +338,9 @@ export function buildPolicyText(policy: ProactivityPolicy): string {
   if (blockedCategories.length > 0) {
     lines.push(`- Blocked: ${blockedCategories.join(', ')}. Do not attempt tools in these categories — they will fail.`);
   }
+  lines.push(policy.requireWorkflowApprovalForExecution
+    ? '- Execution gate: Executor/Deployer handoffs require an active tracked execution. If the work is not tracked yet, ask the user to promote/approve it as a long-running task.'
+    : '- Execution gate: disabled. Executor/Deployer handoffs may run without a tracked execution.');
   return lines.join('\n');
 }
 
@@ -362,6 +365,7 @@ export function buildPolicyEvent(snapshot: ProactivityPolicySnapshot): {
       allowComputerActions: policy.allowComputerActions,
       allowComposioActions: policy.allowComposioActions,
       allowDiscordCheckIns: policy.allowDiscordCheckIns,
+      requireWorkflowApprovalForExecution: policy.requireWorkflowApprovalForExecution,
       quietHoursEnabled: policy.quietHoursEnabled,
       quietHoursActive: snapshot.quietHoursActive,
       proactiveWorkAllowed: snapshot.proactiveWorkAllowed,
@@ -396,7 +400,7 @@ export function chooseFollowUpMinutes(
   return Math.max(base * 3, 15);
 }
 
-function buildAgentInstructions(agent: TeamAgentRecord): string {
+function buildAgentInstructions(agent: TeamAgentRecord, policy: ProactivityPolicy): string {
   const orchestrator = isOrchestratorSlug(agent.slug);
   return [
     `You are ${agent.name} (${agent.slug}), an autonomous agent inside Clementine.`,
@@ -406,9 +410,15 @@ function buildAgentInstructions(agent: TeamAgentRecord): string {
     `Personality and operating guidance:\n${agent.personality}`,
     'You are proactive. If goals or tasks have stagnated, take initiative.',
     orchestrator ? [
-      'You are the orchestrator. Two sub-agents are available via handoff:',
+      'You are the orchestrator. Specialized sub-agents are available via handoff:',
       '- Researcher: read-only information gatherer. Hand off when you need facts from memory, files, the workspace, or session history before deciding. It cannot mutate state.',
-      '- Executor: does work. Hand off when a decision is made and there is concrete work to perform (tasks, executions, file writes, shell commands, notifications).',
+      '- Writer: drafts docs, reports, summaries, emails/messages, and handoff notes. It drafts but does not send or deploy.',
+      '- Reviewer: read-only auditor. Hand off before risky execution, deployment, or user-facing delivery when quality/risk matters.',
+      '- Executor: does concrete work (tasks, executions, file writes, shell commands, notifications).',
+      '- Deployer: handles release, deployment, CI, environment, and CLI-driven shipping work.',
+      policy.requireWorkflowApprovalForExecution
+        ? 'Workflow approval gate: Executor and Deployer handoffs are only available when an active tracked execution exists for this session. If no active execution is listed but the work needs execution, ask the user to promote/approve it as a long-running tracked task instead of silently handing off.'
+        : 'Workflow approval gate is disabled by policy: Executor and Deployer handoffs may be used whenever the work is concrete and appropriate.',
       'When to hand off vs. act directly: simple single-step actions you can take yourself. Multi-step work, especially when it involves both information gathering AND mutation, benefits from a handoff so the sub-agent stays focused.',
       'When handing off, give the sub-agent a clear, scoped objective. They return when their part is done — you can then hand off again, finish, or take a final action yourself.',
     ].join('\n') : '',
@@ -486,6 +496,7 @@ function policyFingerprint(policy: ProactivityPolicy): string {
     cs: policy.allowComputerActions,
     cm: policy.allowComposioActions,
     dc: policy.allowDiscordCheckIns,
+    wg: policy.requireWorkflowApprovalForExecution,
   });
 }
 
@@ -548,11 +559,15 @@ function getAgent(record: TeamAgentRecord, policy: ProactivityPolicy): AutonomyA
   // the SDK's native handoff flow — no disk polling, all in one run.
   // The primary `clementine` agent is the orchestrator by default;
   // other slugs can opt in via AUTONOMY_ORCHESTRATOR_SLUGS env var.
-  const handoffs = isOrchestratorSlug(record.slug) ? defaultOrchestratorHandoffs() : undefined;
+  const handoffs = isOrchestratorSlug(record.slug)
+    ? defaultOrchestratorHandoffs({
+      requireWorkflowApprovalForExecution: policy.requireWorkflowApprovalForExecution,
+    })
+    : undefined;
 
-  const agent: AutonomyAgent = new Agent({
+  const agent: AutonomyAgent = new Agent<RuntimeContextValue, typeof AgentDecisionSchema>({
     name: record.name,
-    instructions: buildAgentInstructions(record),
+    instructions: buildAgentInstructions(record, policy),
     model: record.model ?? MODELS.fast,
     outputType: AgentDecisionSchema,
     outputGuardrails: autonomyV2OutputGuardrails,

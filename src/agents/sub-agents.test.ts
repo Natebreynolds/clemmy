@@ -5,11 +5,19 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   SUB_AGENT_TOOL_ALLOWLISTS,
+  buildDeployerAgent,
   buildExecutorAgent,
   buildResearcherAgent,
+  buildReviewerAgent,
+  buildWriterAgent,
   defaultOrchestratorHandoffs,
   isOrchestratorSlug,
 } from './sub-agents.js';
+
+function handoffDisplayName(entry: unknown): string | undefined {
+  const ref = entry as { name?: string; agentName?: string };
+  return ref.name ?? ref.agentName;
+}
 
 test('isOrchestratorSlug: clementine is the default orchestrator', () => {
   assert.equal(isOrchestratorSlug('clementine'), true);
@@ -59,6 +67,26 @@ test('executor can ask the user when stuck (ask_user_question)', () => {
   assert.equal(SUB_AGENT_TOOL_ALLOWLISTS.executor.has('ask_user_question'), true);
 });
 
+test('writer can draft files but cannot execute external delivery', () => {
+  assert.equal(SUB_AGENT_TOOL_ALLOWLISTS.writer.has('write_file'), true);
+  assert.equal(SUB_AGENT_TOOL_ALLOWLISTS.writer.has('composio_execute_tool'), false);
+  assert.equal(SUB_AGENT_TOOL_ALLOWLISTS.writer.has('run_shell_command'), false);
+});
+
+test('reviewer is read-only', () => {
+  for (const name of ['write_file', 'run_shell_command', 'task_add', 'goal_update', 'execution_update_step', 'composio_execute_tool']) {
+    assert.equal(SUB_AGENT_TOOL_ALLOWLISTS.reviewer.has(name), false, `reviewer should NOT have ${name}`);
+  }
+  assert.equal(SUB_AGENT_TOOL_ALLOWLISTS.reviewer.has('read_file'), true);
+  assert.equal(SUB_AGENT_TOOL_ALLOWLISTS.reviewer.has('agent_runs_recent'), true);
+});
+
+test('deployer has release tools and can ask for missing info', () => {
+  for (const name of ['run_shell_command', 'git_status', 'execution_update_step', 'execution_complete', 'ask_user_question']) {
+    assert.equal(SUB_AGENT_TOOL_ALLOWLISTS.deployer.has(name), true, `deployer should have ${name}`);
+  }
+});
+
 test('researcher CANNOT ask user questions (it gathers, the orchestrator decides)', () => {
   assert.equal(SUB_AGENT_TOOL_ALLOWLISTS.researcher.has('ask_user_question'), false);
 });
@@ -77,21 +105,48 @@ test('buildExecutorAgent returns a configured Agent with handoffDescription', ()
   assert.match(agent.handoffDescription, /work|decision|perform/i);
 });
 
-test('defaultOrchestratorHandoffs returns researcher + executor', () => {
+test('build specialized agents return configured Agents with handoffDescription', () => {
+  for (const agent of [buildWriterAgent(), buildReviewerAgent(), buildDeployerAgent()]) {
+    assert.ok(agent.name);
+    assert.ok(agent.handoffDescription);
+  }
+});
+
+test('defaultOrchestratorHandoffs returns the specialized sub-agent set', () => {
   const handoffs = defaultOrchestratorHandoffs();
-  assert.equal(handoffs.length, 2);
-  const names = handoffs.map((h) => h.name);
+  assert.equal(handoffs.length, 5);
+  const names = handoffs.map(handoffDisplayName);
   assert.ok(names.includes('Researcher'));
+  assert.ok(names.includes('Writer'));
+  assert.ok(names.includes('Reviewer'));
   assert.ok(names.includes('Executor'));
+  assert.ok(names.includes('Deployer'));
+});
+
+test('execution handoffs are gated by default and ungated by option', () => {
+  const gated = defaultOrchestratorHandoffs();
+  const executor = gated.find((entry) => handoffDisplayName(entry) === 'Executor') as { isEnabled?: unknown } | undefined;
+  const deployer = gated.find((entry) => handoffDisplayName(entry) === 'Deployer') as { isEnabled?: unknown } | undefined;
+  assert.equal(typeof executor?.isEnabled, 'function');
+  assert.equal(typeof deployer?.isEnabled, 'function');
+
+  const ungated = defaultOrchestratorHandoffs({ requireWorkflowApprovalForExecution: false });
+  const ungatedExecutor = ungated.find((entry) => handoffDisplayName(entry) === 'Executor') as { isEnabled?: unknown } | undefined;
+  assert.equal(ungatedExecutor?.isEnabled, undefined);
 });
 
 test('sub-agents do NOT have their own handoffs (they are leaves)', () => {
-  const researcher = buildResearcherAgent();
-  const executor = buildExecutorAgent();
+  const agents = [
+    buildResearcherAgent(),
+    buildWriterAgent(),
+    buildReviewerAgent(),
+    buildExecutorAgent(),
+    buildDeployerAgent(),
+  ];
   // SDK exposes handoffs on Agent; sub-agents leave it undefined / empty.
   // We tolerate either undefined or empty array depending on SDK defaults.
-  const rH = (researcher as unknown as { handoffs?: unknown[] }).handoffs;
-  const eH = (executor as unknown as { handoffs?: unknown[] }).handoffs;
-  assert.ok(!rH || (Array.isArray(rH) && rH.length === 0));
-  assert.ok(!eH || (Array.isArray(eH) && eH.length === 0));
+  for (const agent of agents) {
+    const handoffs = (agent as unknown as { handoffs?: unknown[] }).handoffs;
+    assert.ok(!handoffs || (Array.isArray(handoffs) && handoffs.length === 0), `${agent.name} should be a leaf`);
+  }
 });

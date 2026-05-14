@@ -213,7 +213,7 @@ export async function startChatCli(): Promise<void> {
       done();
       const steps = extractSteps(response.text);
       if (steps.length > 0) {
-        const planId = saveDeepTaskPlan(task, steps);
+        const planId = saveDeepTaskPlan(task, steps, sessionId);
         console.log(`\n  ${GREEN}✓${RESET}  Plan saved as ${CYAN}${planId}${RESET}`);
       }
       printResponse(ASSISTANT_NAME, response.text);

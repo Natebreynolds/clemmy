@@ -8,7 +8,7 @@ const DELIVERY_QUEUE_FILE = path.join(BASE_DIR, 'state', 'notification-delivery-
 
 export interface NotificationRecord {
   id: string;
-  kind: 'cron' | 'workflow' | 'system' | 'approval';
+  kind: 'cron' | 'workflow' | 'system' | 'approval' | 'execution';
   title: string;
   body: string;
   createdAt: string;

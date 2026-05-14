@@ -39,7 +39,21 @@ export const ACTIVE_ENV_FILES = [
 const env = Object.assign({}, ...ACTIVE_ENV_FILES.map((filePath) => parseEnvFile(filePath)));
 
 function getEnv(key: string, fallback = ''): string {
-  return env[key] ?? process.env[key] ?? fallback;
+  return process.env[key] ?? env[key] ?? fallback;
+}
+
+export function getRuntimeEnv(key: string, fallback = ''): string {
+  const activeEnvFiles = [
+    path.join(PKG_DIR, '.env'),
+    path.join(process.cwd(), '.env'),
+    path.join(BASE_DIR, '.env'),
+  ].filter((filePath, index, items) => existsSync(filePath) && items.indexOf(filePath) === index);
+  const currentEnv = Object.assign({}, ...activeEnvFiles.map((filePath) => parseEnvFile(filePath)));
+  return process.env[key] ?? currentEnv[key] ?? fallback;
+}
+
+export function getOpenAiApiKey(): string {
+  return getRuntimeEnv('OPENAI_API_KEY', '');
 }
 
 export const ASSISTANT_NAME = getEnv('ASSISTANT_NAME', 'Clementine');
@@ -64,10 +78,18 @@ export const WEBHOOK_PORT = parseInt(getEnv('WEBHOOK_PORT', '8420'), 10);
 export const WEBHOOK_SECRET = getEnv('WEBHOOK_SECRET', '');
 export const DISCORD_ENABLED = getEnv('DISCORD_ENABLED', 'false').toLowerCase() === 'true';
 export const DISCORD_BOT_TOKEN = getEnv('DISCORD_BOT_TOKEN', '');
+export const DISCORD_CLIENT_ID = getEnv('DISCORD_CLIENT_ID', '');
 export const DISCORD_REQUIRE_MENTION = getEnv('DISCORD_REQUIRE_MENTION', 'true').toLowerCase() === 'true';
+export const DISCORD_DM_ALLOWED_USERS = getEnv('DISCORD_DM_ALLOWED_USERS', '')
+  .split(',')
+  .map((value) => value.trim())
+  .filter(Boolean);
+export const DISCORD_DM_POLL_INTERVAL_MS = parseInt(getEnv('DISCORD_DM_POLL_INTERVAL_MS', '5000'), 10);
 export const DISCORD_ALLOWED_CHANNELS = getEnv('DISCORD_ALLOWED_CHANNELS', '')
   .split(',')
   .map((value) => value.trim())
   .filter(Boolean);
 export const LOCAL_MCP_ENABLED = getEnv('LOCAL_MCP_ENABLED', 'true').toLowerCase() === 'true';
 export const MCP_SERVERS_FILE = path.join(BASE_DIR, 'mcp', 'servers.json');
+export const COMPOSIO_API_KEY = getEnv('COMPOSIO_API_KEY', '');
+export const COMPOSIO_USER_ID = getEnv('COMPOSIO_USER_ID', 'default');

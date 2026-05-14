@@ -36,6 +36,7 @@ export const TEAM_REQUESTS_DIR = path.join(BASE_DIR, 'team-requests');
 export const DELEGATIONS_DIR = path.join(BASE_DIR, 'delegations');
 export const AGENT_STATE_DIR = path.join(BASE_DIR, 'agents-state');
 export const AGENT_INBOX_DIR = path.join(BASE_DIR, 'agents-inbox');
+export { INBOX_DIR };
 export const CRON_RUNS_DIR = path.join(BASE_DIR, 'cron', 'runs');
 export const CRON_TRIGGERS_DIR = path.join(BASE_DIR, 'cron', 'triggers');
 export const CRON_PROGRESS_DIR = path.join(BASE_DIR, 'cron', 'progress');
@@ -285,6 +286,10 @@ export function getWorkspaceDirs(): string[] {
   const seen = new Set<string>();
   const dirs: string[] = [];
   const env = readBaseEnv();
+  const configuredDirs = (env.WORKSPACE_DIRS ?? '')
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean);
 
   const add = (dir: string): void => {
     const resolved = path.resolve(dir);
@@ -293,12 +298,15 @@ export function getWorkspaceDirs(): string[] {
     dirs.push(resolved);
   };
 
-  for (const candidate of DEFAULT_WORKSPACE_CANDIDATES) {
-    add(path.join(os.homedir(), candidate));
+  if (configuredDirs.length > 0) {
+    for (const dir of configuredDirs) {
+      add(dir.startsWith('~') ? dir.replace('~', os.homedir()) : dir);
+    }
+    return dirs;
   }
 
-  for (const dir of (env.WORKSPACE_DIRS ?? '').split(',').map((entry) => entry.trim()).filter(Boolean)) {
-    add(dir.startsWith('~') ? dir.replace('~', os.homedir()) : dir);
+  for (const candidate of DEFAULT_WORKSPACE_CANDIDATES) {
+    add(path.join(os.homedir(), candidate));
   }
 
   return dirs;

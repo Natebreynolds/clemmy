@@ -1,5 +1,5 @@
 import pino from 'pino';
-import { OPENAI_API_KEY } from '../config.js';
+import { getOpenAiApiKey } from '../config.js';
 import { openMemoryDb } from './db.js';
 
 /**
@@ -34,7 +34,7 @@ const BATCH_SIZE = 96;
 const MAX_INPUT_CHARS = 16_000;
 
 export function isEmbeddingsEnabled(): boolean {
-  return Boolean(OPENAI_API_KEY);
+  return Boolean(getOpenAiApiKey());
 }
 
 /**
@@ -79,7 +79,8 @@ interface EmbeddingsApiResponse {
  * Throws on hard failure — callers decide whether to retry or skip.
  */
 async function embedBatch(texts: string[]): Promise<Float32Array[]> {
-  if (!OPENAI_API_KEY) {
+  const apiKey = getOpenAiApiKey();
+  if (!apiKey) {
     throw new Error('OPENAI_API_KEY is not set');
   }
   if (texts.length === 0) return [];
@@ -89,7 +90,7 @@ async function embedBatch(texts: string[]): Promise<Float32Array[]> {
   const response = await fetch('https://api.openai.com/v1/embeddings', {
     method: 'POST',
     headers: {
-      'Authorization': `Bearer ${OPENAI_API_KEY}`,
+      'Authorization': `Bearer ${apiKey}`,
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({

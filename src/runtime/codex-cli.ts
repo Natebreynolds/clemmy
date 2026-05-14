@@ -6,7 +6,7 @@ import { spawn } from 'node:child_process';
 import pino from 'pino';
 import { CODEX_EXECUTABLE, CODEX_SANDBOX_MODE, CODEX_USE_FULL_AUTO } from '../config.js';
 import type { ApprovalResolutionResult, PendingApproval, RunRequest, RunResult } from '../types.js';
-import type { AgentRuntime, AgentRuntimeCallbacks } from './provider.js';
+import { AgentRuntimeCancelledError, type AgentRuntime, type AgentRuntimeCallbacks } from './provider.js';
 
 const logger = pino({ name: 'clementine-next.codex-cli' });
 
@@ -46,8 +46,11 @@ export class CodexCliRuntime implements AgentRuntime {
     throw new Error('Approval resolution is not supported in codex_oauth mode. Codex CLI handles its own execution flow.');
   }
 
-  async run(request: RunRequest, callbacks?: AgentRuntimeCallbacks): Promise<RunResult> {
-    const sessionId = request.sessionId ?? randomUUID();
+	  async run(request: RunRequest, callbacks?: AgentRuntimeCallbacks): Promise<RunResult> {
+	    if (await callbacks?.shouldCancel?.()) {
+	      throw new AgentRuntimeCancelledError();
+	    }
+	    const sessionId = request.sessionId ?? randomUUID();
     const tempDir = mkdtempSync(path.join(os.tmpdir(), 'clementine-codex-'));
     const outputPath = path.join(tempDir, 'last-message.txt');
 
@@ -76,7 +79,10 @@ export class CodexCliRuntime implements AgentRuntime {
 
     try {
       await runCodexExec(args, process.cwd());
-      const text = existsSync(outputPath)
+	      if (await callbacks?.shouldCancel?.()) {
+	        throw new AgentRuntimeCancelledError();
+	      }
+	      const text = existsSync(outputPath)
         ? readFileSync(outputPath, 'utf-8').trim()
         : '';
       const finalText = text || 'Codex returned no final message.';

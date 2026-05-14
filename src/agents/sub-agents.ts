@@ -1,6 +1,7 @@
-import { Agent } from '@openai/agents';
-import type { Tool } from '@openai/agents';
-import { MODELS } from '../config.js';
+import { Agent, handoff } from '@openai/agents';
+import type { Handoff, Tool } from '@openai/agents';
+import { MODELS, getRuntimeEnv } from '../config.js';
+import { activeExecutionCount, activeExecutionCountForSession } from '../tools/execution-tools.js';
 import { getCoreTools } from '../tools/registry.js';
 import type { RuntimeContextValue } from '../types.js';
 
@@ -22,11 +23,16 @@ import type { RuntimeContextValue } from '../types.js';
  * configured personas with their own autonomy cycles. Sub-agents
  * here are stateless workers used inside one orchestrator run.
  *
- * Day-one sub-agents:
+ * Sub-agents:
  *   researcher  — gathers information (memory, vault, files,
  *                 workspace inspection). Cannot write or mutate state.
+ *   writer      — drafts user-facing text, docs, notes, and message
+ *                 copy. Can write drafts, not send or deploy.
+ *   reviewer    — audits plans/code/output and reports risk. Read-only.
  *   executor    — does work (tasks, goals, executions, file writes,
  *                 shell commands). Approval flow gates risky calls.
+ *   deployer    — release/deploy specialist. Gated behind tracked
+ *                 execution approval because it can run commands.
  *
  * Add new sub-agent roles by:
  *   1. Defining the tool-name allowlist below
@@ -35,6 +41,11 @@ import type { RuntimeContextValue } from '../types.js';
  */
 
 type SubAgent = Agent<RuntimeContextValue>;
+type OrchestratorHandoff = SubAgent | Handoff<RuntimeContextValue>;
+
+export interface OrchestratorHandoffOptions {
+  requireWorkflowApprovalForExecution?: boolean;
+}
 
 const RESEARCHER_TOOL_NAMES = new Set<string>([
   // Memory recall
@@ -112,6 +123,83 @@ const EXECUTOR_TOOL_NAMES = new Set<string>([
   'composio_list_tools',
 ]);
 
+const WRITER_TOOL_NAMES = new Set<string>([
+  // Context
+  'memory_recall',
+  'memory_search',
+  'memory_read',
+  'user_profile_read',
+  // Notes and drafts
+  'note_take',
+  'note_create',
+  // Workspace drafting
+  'workspace_roots',
+  'workspace_list',
+  'workspace_info',
+  'list_files',
+  'read_file',
+  'write_file',
+  'git_status',
+  // Progress visibility
+  'execution_list',
+  'execution_get',
+  'execution_update_step',
+  'notify_user',
+]);
+
+const REVIEWER_TOOL_NAMES = new Set<string>([
+  // Memory/context
+  'memory_recall',
+  'memory_search',
+  'memory_read',
+  'user_profile_read',
+  // Read-only workspace and run inspection
+  'workspace_roots',
+  'workspace_list',
+  'workspace_info',
+  'list_files',
+  'read_file',
+  'git_status',
+  'agent_runs_recent',
+  'agent_run_get',
+  'execution_list',
+  'execution_get',
+  'list_plans',
+  'task_list',
+  'goal_list',
+  'goal_get',
+  'session_history',
+  'composio_status',
+  'composio_list_tools',
+]);
+
+const DEPLOYER_TOOL_NAMES = new Set<string>([
+  // Release/deploy context
+  'memory_recall',
+  'memory_search',
+  'user_profile_read',
+  'execution_list',
+  'execution_get',
+  'execution_update_step',
+  'execution_mark_blocked',
+  'execution_complete',
+  'notify_user',
+  'ask_user_question',
+  // Local release tooling; write/shell remain approval-gated at tool runtime
+  'workspace_roots',
+  'workspace_list',
+  'workspace_info',
+  'list_files',
+  'read_file',
+  'write_file',
+  'git_status',
+  'run_shell_command',
+  // External deployment/status integrations
+  'composio_status',
+  'composio_list_tools',
+  'composio_execute_tool',
+]);
+
 function filterToolsByNames<T extends { name?: string }>(tools: T[], allow: Set<string>): T[] {
   return tools.filter((tool) => Boolean(tool.name) && allow.has(tool.name as string));
 }
@@ -151,12 +239,87 @@ export function buildExecutorAgent(): SubAgent {
   });
 }
 
+export function buildWriterAgent(): SubAgent {
+  const tools = filterToolsByNames(getCoreTools(), WRITER_TOOL_NAMES) as Tool<RuntimeContextValue>[];
+  return new Agent<RuntimeContextValue>({
+    name: 'Writer',
+    handoffDescription: 'Drafts polished user-facing writing, docs, notes, email/message copy, and project summaries. Does not send messages or deploy.',
+    instructions: [
+      'You are the Writer sub-agent inside Clementine.',
+      'Your job is to turn gathered context into clear, useful written artifacts: drafts, docs, summaries, emails, reports, and handoff notes.',
+      'Do not send external messages or deploy changes. If the user wants something sent, return the draft and let the orchestrator or an approved executor handle delivery.',
+      'When writing files, keep changes scoped to the requested draft/document and avoid broad rewrites.',
+      'Return the final draft location or text plus any assumptions that matter.',
+    ].join('\n\n'),
+    model: MODELS.primary,
+    tools,
+  });
+}
+
+export function buildReviewerAgent(): SubAgent {
+  const tools = filterToolsByNames(getCoreTools(), REVIEWER_TOOL_NAMES) as Tool<RuntimeContextValue>[];
+  return new Agent<RuntimeContextValue>({
+    name: 'Reviewer',
+    handoffDescription: 'Audits work before execution or delivery. Reviews code, plans, outputs, runs, and risks. Read-only; reports findings.',
+    instructions: [
+      'You are the Reviewer sub-agent inside Clementine.',
+      'Use a code-review mindset: find bugs, risks, missing verification, broken assumptions, and unclear success criteria.',
+      'Stay read-only. Do not write files, update tasks, mutate goals, run commands, send notifications, or execute external actions.',
+      'Return findings first, ordered by severity, with concrete evidence. If there are no findings, say that and name residual risks.',
+    ].join('\n\n'),
+    model: MODELS.fast,
+    tools,
+  });
+}
+
+export function buildDeployerAgent(): SubAgent {
+  const tools = filterToolsByNames(getCoreTools(), DEPLOYER_TOOL_NAMES) as Tool<RuntimeContextValue>[];
+  return new Agent<RuntimeContextValue>({
+    name: 'Deployer',
+    handoffDescription: 'Handles release, deployment, CI, environment, and CLI-driven shipping work. Use only for tracked approved execution work.',
+    instructions: [
+      'You are the Deployer sub-agent inside Clementine.',
+      'Your job is to ship already-approved work: inspect status, run the needed release/deploy commands, verify, and report the result.',
+      'Do not invent deployment targets. If the environment, branch, token, or approval is unclear, call ask_user_question or execution_mark_blocked.',
+      'Use small, auditable commands. Capture verification evidence. Update the tracked execution every cycle you make progress.',
+      'Return exactly what was deployed, where, verification results, and any follow-up needed.',
+    ].join('\n\n'),
+    model: MODELS.deep,
+    tools,
+  });
+}
+
+function executionGateEnabled(sessionId: string | undefined): boolean {
+  return (sessionId ? activeExecutionCountForSession(sessionId) > 0 : false) || activeExecutionCount() > 0;
+}
+
+function maybeGateExecutionHandoff(agent: SubAgent, options: OrchestratorHandoffOptions = {}): OrchestratorHandoff {
+  if (options.requireWorkflowApprovalForExecution === false) {
+    return agent;
+  }
+
+  return handoff(agent, {
+    toolDescriptionOverride: [
+      `Handoff to the ${agent.name} agent to handle approved tracked execution work.`,
+      agent.handoffDescription,
+      'This handoff is only enabled when the current session has an active tracked execution, which acts as the workflow approval gate.',
+    ].filter(Boolean).join(' '),
+    isEnabled: ({ runContext }) => executionGateEnabled(runContext.context?.sessionId),
+  }) as OrchestratorHandoff;
+}
+
 /**
  * Default sub-agents the orchestrator can hand off to. Add specialized
  * roles here as the system grows (writer, reviewer, deployer, etc.).
  */
-export function defaultOrchestratorHandoffs(): SubAgent[] {
-  return [buildResearcherAgent(), buildExecutorAgent()];
+export function defaultOrchestratorHandoffs(options: OrchestratorHandoffOptions = {}): OrchestratorHandoff[] {
+  return [
+    buildResearcherAgent(),
+    buildWriterAgent(),
+    buildReviewerAgent(),
+    maybeGateExecutionHandoff(buildExecutorAgent(), options),
+    maybeGateExecutionHandoff(buildDeployerAgent(), options),
+  ];
 }
 
 /**
@@ -167,7 +330,7 @@ export function defaultOrchestratorHandoffs(): SubAgent[] {
  */
 export function isOrchestratorSlug(slug: string): boolean {
   if (slug === 'clementine') return true;
-  const extras = (process.env.AUTONOMY_ORCHESTRATOR_SLUGS ?? '')
+  const extras = getRuntimeEnv('AUTONOMY_ORCHESTRATOR_SLUGS', '')
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean);
@@ -181,5 +344,8 @@ export function isOrchestratorSlug(slug: string): boolean {
  */
 export const SUB_AGENT_TOOL_ALLOWLISTS = {
   researcher: RESEARCHER_TOOL_NAMES,
+  writer: WRITER_TOOL_NAMES,
+  reviewer: REVIEWER_TOOL_NAMES,
   executor: EXECUTOR_TOOL_NAMES,
+  deployer: DEPLOYER_TOOL_NAMES,
 } as const;

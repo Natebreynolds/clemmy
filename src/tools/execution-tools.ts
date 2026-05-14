@@ -186,3 +186,10 @@ export function activeExecutionCountForSession(sessionId: string): number {
     .filter((e) => e.status === 'active' || e.status === 'blocked')
     .length;
 }
+
+export function activeExecutionCount(limit = 40): number {
+  return store
+    .list(limit)
+    .filter((e) => e.status === 'active' || e.status === 'blocked')
+    .length;
+}
