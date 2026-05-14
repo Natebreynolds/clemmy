@@ -3,8 +3,8 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { AgentDecisionSchema, buildPolicyText, categorizeToolForPolicy, filterToolsByPolicy } from './autonomy-v2.js';
-import { DEFAULT_PROACTIVITY_POLICY } from './proactivity-policy.js';
+import { AgentDecisionSchema, buildPolicyEvent, buildPolicyText, categorizeToolForPolicy, filterToolsByPolicy } from './autonomy-v2.js';
+import { DEFAULT_PROACTIVITY_POLICY, type ProactivityPolicySnapshot } from './proactivity-policy.js';
 
 test('AgentDecisionSchema accepts the minimal valid shape', () => {
   const r = AgentDecisionSchema.safeParse({
@@ -167,4 +167,63 @@ test('filterToolsByPolicy: does not mutate input array', () => {
   const before = tools.length;
   filterToolsByPolicy(tools, { ...DEFAULT_PROACTIVITY_POLICY, allowComposioActions: false });
   assert.equal(tools.length, before, 'input array length unchanged');
+});
+
+// ---------- buildPolicyEvent ----------
+
+function snapshotOf(overrides: Partial<typeof DEFAULT_PROACTIVITY_POLICY> = {}, quietActive = false): ProactivityPolicySnapshot {
+  const policy = { ...DEFAULT_PROACTIVITY_POLICY, ...overrides };
+  return {
+    policy,
+    quietHoursActive: quietActive,
+    proactiveWorkAllowed: policy.enabled && !quietActive,
+  };
+}
+
+test('buildPolicyEvent: type is always status', () => {
+  const event = buildPolicyEvent(snapshotOf());
+  assert.equal(event.type, 'status');
+});
+
+test('buildPolicyEvent: message includes mode and check-in cadence', () => {
+  const event = buildPolicyEvent(snapshotOf({ mode: 'hands_on', checkInMinutes: 9 }));
+  assert.match(event.message, /hands_on/);
+  assert.match(event.message, /check-in 9m/);
+});
+
+test('buildPolicyEvent: message flags quiet hours when active', () => {
+  const event = buildPolicyEvent(snapshotOf({ quietHoursEnabled: true }, true));
+  assert.match(event.message, /quiet hours active/);
+});
+
+test('buildPolicyEvent: message omits quiet-hours suffix when not active', () => {
+  const event = buildPolicyEvent(snapshotOf({}, false));
+  assert.doesNotMatch(event.message, /quiet hours/);
+});
+
+test('buildPolicyEvent: data captures every policy gate', () => {
+  const event = buildPolicyEvent(snapshotOf({
+    mode: 'watch',
+    checkInMinutes: 15,
+    allowComputerActions: false,
+    allowComposioActions: true,
+    allowDiscordCheckIns: false,
+    quietHoursEnabled: true,
+  }, true));
+
+  assert.equal(event.data.mode, 'watch');
+  assert.equal(event.data.checkInMinutes, 15);
+  assert.equal(event.data.allowComputerActions, false);
+  assert.equal(event.data.allowComposioActions, true);
+  assert.equal(event.data.allowDiscordCheckIns, false);
+  assert.equal(event.data.quietHoursEnabled, true);
+  assert.equal(event.data.quietHoursActive, true);
+  assert.equal(event.data.proactiveWorkAllowed, false, 'proactive blocked by quiet hours');
+});
+
+test('buildPolicyEvent: data is JSON-serializable (no functions, no circular refs)', () => {
+  const event = buildPolicyEvent(snapshotOf());
+  // Throws on circular structure or non-serializable values.
+  const roundtripped = JSON.parse(JSON.stringify(event.data));
+  assert.equal(roundtripped.mode, event.data.mode);
 });

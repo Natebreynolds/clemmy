@@ -7,7 +7,7 @@ import { getOpenAiApiKey, MODELS } from '../config.js';
 import { getCoreTools } from '../tools/registry.js';
 import { createConfiguredMcpServers } from '../runtime/mcp-servers.js';
 import { autonomyV2OutputGuardrails } from './autonomy-guardrails.js';
-import { getProactivityPolicySnapshot, type ProactivityPolicy } from './proactivity-policy.js';
+import { getProactivityPolicySnapshot, type ProactivityPolicy, type ProactivityPolicySnapshot } from './proactivity-policy.js';
 import type { RuntimeContextValue } from '../types.js';
 import {
   AGENT_INBOX_DIR,
@@ -20,12 +20,13 @@ import {
   parseTasks,
   type TeamAgentRecord,
 } from '../tools/shared.js';
+import { addRunEvent, finishRun } from '../runtime/run-events.js';
 import {
-  addRunEvent,
-  createRunId,
-  finishRun,
-  startRun,
-} from '../runtime/run-events.js';
+  finishAutonomyRun,
+  recordAutonomyDecision,
+  recordAutonomyResponse,
+  startAutonomyRun,
+} from './run-tracking.js';
 
 /**
  * SDK-native autonomy loop (Phase 1).
@@ -330,6 +331,34 @@ export function buildPolicyText(policy: ProactivityPolicy): string {
   return lines.join('\n');
 }
 
+/**
+ * Build the run-event payload that records the active proactivity
+ * policy at cycle start. Compact `data` field — the dashboard renders
+ * the message inline and surfaces `data` on click. Replaying this
+ * months later answers "what mode + permissions did the agent have?"
+ */
+export function buildPolicyEvent(snapshot: ProactivityPolicySnapshot): {
+  type: 'status';
+  message: string;
+  data: Record<string, unknown>;
+} {
+  const policy = snapshot.policy;
+  return {
+    type: 'status',
+    message: `Policy: ${policy.mode}, check-in ${policy.checkInMinutes}m${snapshot.quietHoursActive ? ', quiet hours active' : ''}.`,
+    data: {
+      mode: policy.mode,
+      checkInMinutes: policy.checkInMinutes,
+      allowComputerActions: policy.allowComputerActions,
+      allowComposioActions: policy.allowComposioActions,
+      allowDiscordCheckIns: policy.allowDiscordCheckIns,
+      quietHoursEnabled: policy.quietHoursEnabled,
+      quietHoursActive: snapshot.quietHoursActive,
+      proactiveWorkAllowed: snapshot.proactiveWorkAllowed,
+    },
+  };
+}
+
 function buildAgentInstructions(agent: TeamAgentRecord): string {
   return [
     `You are ${agent.name} (${agent.slug}), an autonomous agent inside Clementine.`,
@@ -536,21 +565,21 @@ async function runAgentCycleV2(record: TeamAgentRecord): Promise<{ runId: string
     return { runId: '', success: true, outcomes: [] };
   }
 
-  const runId = createRunId();
-  startRun({
-    id: runId,
-    sessionId: `agent:${record.slug}`,
-    userId: record.slug,
-    channel: 'agent',
-    source: 'daemon',
-    title: `${record.name} autonomy v2 cycle (${wakeReasons.join(', ')})`,
-    message: `wake=${wakeReasons.join(',')} inbox=${inboxItems.length}`,
-  });
+  const runId = startAutonomyRun(record, wakeReasons, inboxItems.length);
 
-  // Read policy once per cycle so the agent build and the input use
-  // the same snapshot — avoids the agent's tools and the policy text
-  // disagreeing if the user toggles a setting mid-cycle.
-  const policy = getProactivityPolicySnapshot().policy;
+  // Read policy once per cycle so the agent build, the input text, and
+  // the recorded snapshot all use the same view. Avoids the agent's
+  // tools and the policy text disagreeing if the user toggles a setting
+  // mid-cycle.
+  const policySnapshot = getProactivityPolicySnapshot();
+  const policy = policySnapshot.policy;
+
+  // Capture the policy snapshot as a run event so the dashboard / audit
+  // can answer "what was the agent operating under during this cycle?"
+  // months later.
+  const policyEvent = buildPolicyEvent(policySnapshot);
+  addRunEvent(runId, policyEvent);
+
   const agent = getAgent(record, policy);
   const input = buildAgentInput(record, inboxItems, state, policy);
   currentRunIdByAgent.set(agent, runId);
@@ -566,13 +595,11 @@ async function runAgentCycleV2(record: TeamAgentRecord): Promise<{ runId: string
       throw new Error('Agent run completed but produced no structured output.');
     }
 
-    addRunEvent(runId, {
-      type: 'status',
-      message: `Decision: ${decision.summary.slice(0, 200)}`,
-      data: {
-        commitments: decision.commitments,
-        followUpMinutes: decision.followUpMinutes,
-      },
+    recordAutonomyResponse(runId, JSON.stringify(decision));
+    recordAutonomyDecision(runId, {
+      summary: decision.summary,
+      commitments: decision.commitments,
+      followUpMinutes: decision.followUpMinutes,
     });
 
     markInboxProcessed(record.slug, inboxItems.map((item) => item.id));
@@ -589,11 +616,7 @@ async function runAgentCycleV2(record: TeamAgentRecord): Promise<{ runId: string
         : undefined,
     });
 
-    finishRun(runId, {
-      status: 'completed',
-      message: decision.summary,
-      outputPreview: decision.summary,
-    });
+    finishAutonomyRun(runId, [decision.summary]);
 
     return { runId, success: true, outcomes: [decision.summary] };
   } catch (error) {
@@ -606,7 +629,7 @@ async function runAgentCycleV2(record: TeamAgentRecord): Promise<{ runId: string
       lastRunAt: new Date().toISOString(),
       lastError: message,
     });
-    finishRun(runId, { status: 'failed', message, error: message });
+    finishAutonomyRun(runId, [], message);
     return { runId, success: false, outcomes: [], error: message };
   } finally {
     // Always release the WeakMap binding so a stale runId can't leak
