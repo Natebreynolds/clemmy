@@ -75,6 +75,7 @@ import { closePlanScope, listActiveScopes, listAllScopes } from '../agents/plan-
 import type { CheckInUrgency } from '../agents/check-ins.js';
 import { createBackgroundTask, listBackgroundTasks } from '../execution/background-tasks.js';
 import { listRuns } from '../runtime/run-events.js';
+import { summarizeApprovalAction } from '../runtime/approval-summary.js';
 import {
   appendRecallTranscriptSegment,
   createRecallSdkUpload,
@@ -884,10 +885,10 @@ export function registerConsoleRoutes(
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const entry = findWorkflowFile(req.params.name);
     if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
-    if (entry.data.enabled === false) { res.status(409).json({ error: 'workflow is disabled — approve it first' }); return; }
     const body = req.body ?? {};
     const inputs = body.inputs && typeof body.inputs === 'object' ? body.inputs : {};
     const dryRun = body.dryRun === true;
+    if (!dryRun && entry.data.enabled === false) { res.status(409).json({ error: 'workflow is disabled — approve it first' }); return; }
 
     ensureDir(WORKFLOW_RUNS_DIR);
     const id = `${Date.now()}-${randomBytes(3).toString('hex')}`;
@@ -2035,8 +2036,11 @@ export function registerConsoleRoutes(
       const needsYou = [
         ...approvals.slice(0, 6).map((approval) => ({
           kind: 'approval',
-          title: `Approve ${approval.toolName || 'tool call'}`,
-          meta: approval.sessionId || approval.id,
+          // Lead with what's being approved, not just the bare tool name —
+          // "Approve: git push origin main" beats "Approve run_shell_command"
+          // any day from the dashboard sidebar.
+          title: `Approve: ${summarizeApprovalAction(approval)}`,
+          meta: `${approval.toolName} · ${approval.sessionId || approval.id}`,
           panel: 'settings',
           urgency: 'high',
         })),

@@ -36,19 +36,23 @@ export async function getCoreToolsAsync(options: {
   try {
     const dynamic = await getDynamicComposioRuntimeTools();
     if (dynamic.length === 0) return core;
-    // When first-class `cx_<slug>` tools are loaded, drop
-    // `composio_execute_tool` from the broker. The model has the real
-    // tools with real schemas in its surface — the broker's
-    // free-form-string slug invite was the path where it would
-    // hallucinate slugs (`GOOGLESHEETS_CREATE_SPREADSHEET` when the
-    // real slug is `GOOGLESHEETS_CREATE_GOOGLE_SHEET1`).
     // Keep `composio_status` / `composio_search_tools` /
-    // `composio_list_tools` — those are discovery helpers, not
-    // execution paths.
-    const filteredCore = core.filter(
-      (t) => (t as { name?: string }).name !== 'composio_execute_tool',
-    );
-    return [...filteredCore, ...dynamic];
+    // `composio_list_tools` / `composio_execute_tool` ALL in the surface
+    // alongside the first-class `cx_<toolkit>_<action>` tools.
+    //
+    // The first-class set is curated (~25 actions per toolkit) and won't
+    // cover every Composio action — Outlook alone has hundreds. When the
+    // model needs an action it doesn't see directly (list/read/search/
+    // query), the discovery → execution flow is:
+    //   composio_search_tools(query)  →  returns real slugs
+    //   composio_execute_tool(tool_slug, arguments)  →  runs the action
+    //
+    // We DON'T strip `composio_execute_tool` anymore. The previous
+    // hallucination concern (model inventing slugs like
+    // GOOGLESHEETS_CREATE_SPREADSHEET) is mitigated by routing through
+    // `composio_search_tools` first — the slugs that come back are real,
+    // and the executor returns a clear error for unknown slugs anyway.
+    return [...core, ...dynamic];
   } catch {
     // A connected-app catalog failure should not make the whole agent
     // unavailable. The broker tools remain available so the agent can

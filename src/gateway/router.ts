@@ -44,6 +44,12 @@ export interface GatewayResponse {
   pendingApprovalId?: string;
   handledControl?: boolean;
   runId?: string;
+  /** Why the underlying runtime stopped. When 'max-turns-with-grace',
+   *  channel UIs should surface a [Continue] affordance so the user
+   *  can resume without typing "continue" by hand. */
+  stoppedReason?: string;
+  /** How many turns were consumed before stopping. */
+  turnsUsed?: number;
 }
 
 type GatewayCommand =
@@ -318,6 +324,8 @@ export class ClementineGateway {
         sessionId: response.sessionId,
         pendingApprovalId: response.pendingApprovalId,
         runId: run.id,
+        stoppedReason: response.stoppedReason,
+        turnsUsed: response.turnsUsed,
       };
     } catch (error) {
       finishRun(run.id, {

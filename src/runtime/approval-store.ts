@@ -65,3 +65,28 @@ export class ApprovalStore {
     return approval;
   }
 }
+
+/**
+ * Force-reject approvals that have been sitting `pending` longer than
+ * `staleAfterMs`. The original run is long gone (timed out, cancelled,
+ * or replaced by a follow-up message) so the approval has nothing left
+ * to gate — but the dashboard still surfaces it as "needs you" forever.
+ * We rewrite the status to `rejected` so the queue clears.
+ *
+ * Default threshold: 24 hours. Conservative — interactive approvals
+ * usually resolve in minutes, so anything older than a day is dead.
+ */
+export function sweepStaleApprovals(staleAfterMs = 24 * 60 * 60 * 1000): number {
+  const cutoff = Date.now() - staleAfterMs;
+  const approvals = loadApprovals();
+  let swept = 0;
+  for (const approval of approvals) {
+    if (approval.status !== 'pending') continue;
+    const created = Date.parse(approval.createdAt);
+    if (Number.isFinite(created) && created > cutoff) continue;
+    approval.status = 'rejected';
+    swept += 1;
+  }
+  if (swept > 0) saveApprovals(approvals);
+  return swept;
+}

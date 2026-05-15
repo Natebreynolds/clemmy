@@ -1870,9 +1870,14 @@ body {
   overflow-y: auto;
 }
 
-/* TAKEOVER state — when the LIVE card is clicked, .home-layout gets
-   the .live-takeover class. Everything else is hidden; LIVE goes
-   absolute-fill so the orb owns the whole panel. */
+/* TAKEOVER state — clicking LIVE adds .live-takeover to .home-layout.
+   home-layout becomes a 2-row grid: [home-main, 1fr] [chrome, auto].
+   The LIVE card fills home-main with the orb centered. The chrome
+   (transcript + feed + actions) sits naturally below as a sibling. */
+.home-layout.live-takeover {
+  grid-template-rows: 1fr auto;
+  gap: 10px;
+}
 .home-layout.live-takeover .home-greet-strip,
 .home-layout.live-takeover .home-main-left > :not(.home-live),
 .home-layout.live-takeover .home-main-right {
@@ -1880,102 +1885,124 @@ body {
 }
 .home-layout.live-takeover .home-main {
   grid-template-columns: 1fr;
+  min-height: 0;
 }
 .home-layout.live-takeover .home-main-left {
   grid-template-rows: 1fr;
+  min-height: 0;
 }
 .home-layout.live-takeover .home-live {
   cursor: default;
   min-height: 0;
+  position: relative;
 }
 .home-layout.live-takeover .home-live-stage {
   flex-direction: column;
   justify-content: center;
   align-items: center;
-  gap: 22px;
-  padding: 28px;
+  gap: 18px;
+  padding: 24px 24px 16px;
   flex: 1 1 auto;
-  min-height: 0;
+  min-height: 220px;
+  overflow: hidden;
 }
 .home-layout.live-takeover .home-live-stage .home-voice-orb-button {
-  width: 180px;
-  height: 180px;
+  width: clamp(120px, 22vh, 180px);
+  height: clamp(120px, 22vh, 180px);
   transform: scale(1);
 }
 .home-layout.live-takeover .home-live-stage .home-voice-avatar {
-  width: 116px;
-  height: 116px;
+  width: clamp(76px, 14vh, 116px);
+  height: clamp(76px, 14vh, 116px);
 }
 .home-layout.live-takeover .home-live-copy {
   text-align: center;
   gap: 6px;
 }
 .home-layout.live-takeover .home-live-cta {
-  font-size: 22px;
+  font-size: 20px;
   letter-spacing: 0.02em;
 }
 .home-layout.live-takeover .home-live-sub {
-  font-size: 12px;
+  font-size: 11px;
   letter-spacing: 0.08em;
+  max-width: 480px;
+  line-height: 1.5;
+  white-space: normal;
+  word-wrap: break-word;
 }
+/* Chrome flows naturally at the bottom of the card; no more absolute
+   overlay (which caused the orb area to collide with transcript/feed
+   on narrow viewports). */
 .home-live-takeover-chrome {
-  position: absolute;
-  inset: 14px 18px 18px;
-  display: none; /* shown only via .live-takeover */
+  display: none;
   flex-direction: column;
-  pointer-events: none; /* let clicks through to the orb, except buttons */
+  gap: 8px;
+  padding: 0 18px 14px;
+  flex: 0 0 auto;
 }
 .home-layout.live-takeover .home-live-takeover-chrome {
   display: flex;
 }
-.home-live-takeover-chrome > * {
-  pointer-events: auto;
-}
 .home-live-close {
-  align-self: flex-start;
-  background: transparent;
+  position: absolute;
+  top: 10px;
+  right: 12px;
+  z-index: 5;
+  background: color-mix(in srgb, var(--bg-0) 70%, transparent);
   border: 1px solid var(--line);
   color: var(--fg-2);
   font: inherit;
   font-size: 10px;
   letter-spacing: 0.14em;
   text-transform: uppercase;
-  padding: 6px 12px;
+  padding: 5px 10px;
   cursor: pointer;
+  backdrop-filter: blur(6px);
 }
 .home-live-close:hover {
   border-color: var(--accent);
   color: var(--accent);
 }
 .home-live-takeover-transcript {
-  margin: 14px 0 6px;
-  padding: 14px 18px;
+  padding: 10px 14px;
   border: 1px dashed var(--line);
   background: color-mix(in srgb, var(--bg-0) 58%, transparent);
   color: var(--fg);
-  font-size: 13px;
+  font-size: 12px;
   line-height: 1.5;
-  max-height: 140px;
+  max-height: 96px;
   overflow-y: auto;
 }
 .home-live-takeover-feed {
-  padding: 10px 14px;
+  padding: 8px 12px;
   border: 1px solid var(--line);
   background: var(--bg-0);
   color: var(--fg-2);
   font-size: 10px;
   letter-spacing: 0.06em;
-  max-height: 90px;
+  max-height: 72px;
   overflow-y: auto;
-  margin-bottom: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.home-live-takeover-feed .home-voice-event {
+  display: block;
+  word-break: break-word;
+}
+.home-live-takeover-feed .home-voice-event.error {
+  color: var(--accent-fail);
+}
+.home-live-takeover-feed .home-voice-event.routing {
+  color: var(--accent-3);
 }
 .home-live-takeover-actions {
   display: flex;
   justify-content: space-between;
   align-items: center;
   gap: 10px;
-  margin-top: auto;
-  padding: 8px 0 0;
+  padding-top: 2px;
 }
 .home-live-takeover-hint {
   font-size: 10px;
@@ -1991,6 +2018,17 @@ body {
   font-size: 9px;
   color: var(--fg-2);
   background: var(--bg-1);
+}
+
+@media (max-height: 620px) {
+  .home-layout.live-takeover .home-live-stage {
+    min-height: 180px;
+    padding: 14px 18px 10px;
+    gap: 10px;
+  }
+  .home-live-takeover-transcript { max-height: 64px; }
+  .home-live-takeover-feed { max-height: 56px; }
+  .home-layout.live-takeover .home-live-cta { font-size: 17px; }
 }
 
 @media (max-width: 900px) {
@@ -6008,14 +6046,14 @@ const CONSOLE_JS = `
 
   async function refreshHomeAuxCounts() {
     try {
-      const [plans, props, checkins] = await Promise.allSettled([
+      const [plans, props, cmd] = await Promise.allSettled([
         fetchJSON('/api/console/plan-proposals?status=pending'),
         fetchJSON('/api/console/check-in-proposals?status=pending'),
-        fetchJSON('/api/check-ins?status=open'),
+        fetchJSON('/api/console/home/command-center'),
       ]);
       if (plans.status === 'fulfilled') homePlanCount = (plans.value.proposals || []).length;
       if (props.status === 'fulfilled') homeProposalCount = (props.value.proposals || []).length;
-      if (checkins.status === 'fulfilled') homeCheckinCount = (checkins.value.checkIns || checkins.value || []).length;
+      if (cmd.status === 'fulfilled') homeCheckinCount = cmd.value?.counts?.checkIns ?? 0;
     } catch (err) { /* tiles fall back to '—' */ }
     // Push the latest counts straight to the tiles even if no main
     // snapshot has been fetched yet.
@@ -8580,7 +8618,7 @@ const CONSOLE_JS = `
     return sendRealtimeEvent({
       type: 'response.create',
       response: {
-        modalities: ['audio', 'text'],
+        output_modalities: ['audio'],
         instructions,
       },
     });
@@ -10471,24 +10509,28 @@ const CONSOLE_JS = `
   // as the existing home command center.
   async function refreshDockNow() {
     try {
-      const data = await fetchJSON('/api/console/home/agenda');
-      const working = (data.working ?? []).length;
-      const approvals = (data.needsYou ?? []).filter((e) => e && e.kind === 'approval').length;
+      const data = await fetchJSON('/api/console/home/command-center');
       const presence = document.querySelector('[data-dock-now-presence]');
       const label = document.querySelector('[data-dock-now-label]');
       const detail = document.querySelector('[data-dock-now-detail]');
       const tick = document.querySelector('[data-dock-now-tick]');
       if (!presence || !label || !detail || !tick) return;
-      if (working > 0) {
+      const counts = data.counts || {};
+      const workingNow = Array.isArray(data.workingNow) ? data.workingNow : [];
+      const needsYou = Array.isArray(data.needsYou) ? data.needsYou : [];
+      const activeCount = counts.active || workingNow.length;
+      const approvalCount = counts.approvals || 0;
+      const needsYouCount = needsYou.length;
+      if (activeCount > 0) {
         presence.className = 'presence-dot working';
         label.textContent = 'working';
-        detail.textContent = (data.working[0].title || data.working[0].id || 'running').slice(0, 60);
-        tick.textContent = String(working);
-      } else if (approvals > 0) {
+        detail.textContent = ((workingNow[0]?.title) || data.presence?.awayMessage || 'running').slice(0, 60);
+        tick.textContent = String(activeCount);
+      } else if (approvalCount > 0 || needsYouCount > 0) {
         presence.className = 'presence-dot needs-you';
         label.textContent = 'needs you';
-        detail.textContent = (data.needsYou[0].title || 'approval pending').slice(0, 60);
-        tick.textContent = String(approvals);
+        detail.textContent = (needsYou[0]?.title || 'approval pending').slice(0, 60);
+        tick.textContent = String(approvalCount || needsYouCount);
       } else {
         presence.className = 'presence-dot';
         label.textContent = 'idle';

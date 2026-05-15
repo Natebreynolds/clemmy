@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { BASE_DIR } from '../config.js';
+import { BASE_DIR, DISCORD_BOT_TOKEN, DISCORD_DM_ALLOWED_USERS, DISCORD_ENABLED } from '../config.js';
 
 const NOTIFICATIONS_FILE = path.join(BASE_DIR, 'state', 'notifications.json');
 const DESTINATIONS_FILE = path.join(BASE_DIR, 'state', 'notification-destinations.json');
@@ -254,6 +254,18 @@ export function requeueNotificationDelivery(notificationId: string): void {
   saveDeliveryQueue(queue);
 }
 
+/**
+ * Resolve where a notification should be delivered.
+ *
+ * Order of precedence:
+ *   1. Configured destinations (`notification-destinations.json`, enabled only).
+ *   2. Explicit destinations in the notification metadata
+ *      (`discordUserId`, `discordChannelId`).
+ *   3. **Fallback to the primary Discord DM allowlist** so cron + workflow
+ *      notifications still reach the user when nothing has been wired up.
+ *      Previously the delivery loop silently dropped these — the user
+ *      could trigger hours of work and never hear a peep.
+ */
 export function getNotificationDestinationsForRecord(notification: NotificationRecord): NotificationDestination[] {
   const configured = listNotificationDestinations().filter((entry) => entry.enabled);
   const metadata = notification.metadata ?? {};
@@ -282,7 +294,26 @@ export function getNotificationDestinationsForRecord(notification: NotificationR
     });
   }
 
+  // Fallback: if nothing else routes this notification, ship it to the
+  // primary allowlisted Discord DM user. Only fires when Discord is
+  // enabled AND we have at least one allowed-DM user AND no other
+  // destination was found — this is the "you set the cron from Discord,
+  // you'd expect the cron's output to show up in Discord" path.
   const combined = [...configured, ...derived];
+  if (combined.length === 0
+      && DISCORD_ENABLED
+      && DISCORD_BOT_TOKEN
+      && DISCORD_DM_ALLOWED_USERS.length > 0) {
+    combined.push({
+      id: `fallback-discord-user:${DISCORD_DM_ALLOWED_USERS[0]}`,
+      name: `Discord DM (allowlist primary)`,
+      type: 'discord_user',
+      userId: DISCORD_DM_ALLOWED_USERS[0],
+      enabled: true,
+      createdAt: notification.createdAt,
+    });
+  }
+
   return combined.filter((destination, index) =>
     combined.findIndex((entry) => entry.id === destination.id) === index,
   );

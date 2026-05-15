@@ -31,6 +31,7 @@ import { ClementineAssistant } from '../assistant/core.js';
 import { ClementineGateway, type GatewayResponse } from '../gateway/router.js';
 import { getOrCreateDiscordSessionId } from './discord-store.js';
 import type { ApprovalResolutionResult, PendingApproval, ToolActivity } from '../types.js';
+import { summarizeApprovalAction } from '../runtime/approval-summary.js';
 import {
   getNotification,
   listNotifications,
@@ -639,10 +640,21 @@ function renderApprovalList(approvals: PendingApproval[]): string {
   if (approvals.length === 0) {
     return 'No pending approvals.';
   }
+  // Show the human-readable action first; the UUID is debug telemetry,
+  // not the headline. Without the preview the list was an unreadable
+  // wall of hex.
   return approvals
     .slice(0, 15)
-    .map((approval) => `- \`${approval.id}\` | ${approval.toolName} | session ${approval.sessionId}`)
+    .map((approval) => `- **${approval.toolName}** — ${summarizeApprovalAction(approval)} _(id \`${approval.id.slice(0, 8)}\`)_`)
     .join('\n');
+}
+
+function renderApprovalCardContent(approval: PendingApproval): string {
+  return [
+    `🔐 **Approval needed — ${approval.toolName}**`,
+    summarizeApprovalAction(approval),
+    `_session ${approval.sessionId} · id \`${approval.id.slice(0, 8)}\`_`,
+  ].join('\n');
 }
 
 function buildApprovalActions(approvalId: string) {
@@ -880,9 +892,29 @@ function renderGatewayTail(response: GatewayResponse): string {
   // Surface ONLY signal the user can act on. Run IDs are debug
   // telemetry — they belong in the dashboard activity panel, not
   // appended to every chat reply.
-  return [
+  const parts = [
     response.pendingApprovalId ? `Approval pending: \`${response.pendingApprovalId}\`` : '',
-  ].filter(Boolean).join('\n\n');
+  ];
+  if (response.stoppedReason === 'max-turns-with-grace') {
+    const turns = response.turnsUsed ? ` (${response.turnsUsed} turns used)` : '';
+    parts.push(`⏸ Paused at tool-call budget${turns}. Tap **Continue** below or reply \`continue\` to resume.`);
+  }
+  return parts.filter(Boolean).join('\n\n');
+}
+
+function buildContinueActions(sessionId: string): ActionRowBuilder<ButtonBuilder>[] {
+  // Discord customId is capped at 100 chars; sessionId is typically
+  // `discord:<uuid>` (~46 chars) so the prefix + verb + sessionId fits
+  // comfortably. We hash longer ids defensively just in case.
+  const safeId = sessionId.length > 80 ? sessionId.slice(0, 80) : sessionId;
+  return [
+    new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`${DISCORD_CUSTOM_ID_PREFIX}:continue:${safeId}`)
+        .setLabel('▶ Continue')
+        .setStyle(ButtonStyle.Primary),
+    ),
+  ];
 }
 
 function appendGatewayTail(text: string, tail: string): string {
@@ -976,7 +1008,7 @@ async function handleDiscordCommand(message: Message<boolean>, assistant: Clemen
     await sendChunks(message.channel, renderApprovalList(approvals), message);
     for (const approval of approvals.slice(0, 5)) {
       await sendComponentMessage(message.channel, {
-        content: `Approval \`${approval.id}\` for \`${approval.toolName}\``,
+        content: renderApprovalCardContent(approval),
         components: buildApprovalActions(approval.id),
       });
     }
@@ -1068,7 +1100,7 @@ async function handleDiscordRestCommand(input: {
     await send(renderApprovalList(approvals));
     for (const approval of approvals.slice(0, 5)) {
       await sendDiscordRestComponentMessage(input.channelId, {
-        content: `Approval \`${approval.id}\` for \`${approval.toolName}\``,
+        content: renderApprovalCardContent(approval),
         components: buildApprovalActions(approval.id),
       });
     }
@@ -1235,6 +1267,40 @@ async function handleButtonInteraction(interaction: ButtonInteraction, assistant
       }
       requeueNotificationDelivery(targetId);
       await interaction.reply({ content: `Requeued delivery for notification \`${targetId}\`.`, ephemeral: true });
+      return;
+    }
+
+    if (action === 'continue') {
+      // The button targets the original sessionId; we re-issue a
+      // "continue" prompt against it so the model resumes with full
+      // history. Defer first so Discord doesn't time out on the 3s
+      // window while the model thinks.
+      const sessionId = targetId;
+      await interaction.deferReply();
+      try {
+        const response = await assistant.respond({
+          message: 'continue',
+          sessionId,
+          userId: interaction.user.id,
+          channel: 'discord',
+        });
+        const chunks = splitMessage(response.text || 'No further output — task may already be complete.');
+        await interaction.editReply({ content: chunks.shift() ?? 'Resumed.' });
+        for (const chunk of chunks) {
+          if (interaction.channel && 'send' in interaction.channel) {
+            await interaction.channel.send(chunk);
+          }
+        }
+        if (response.stoppedReason === 'max-turns-with-grace'
+            && interaction.channel && 'send' in interaction.channel) {
+          await sendComponentMessage(interaction.channel, {
+            content: '_resume when ready_',
+            components: buildContinueActions(sessionId),
+          });
+        }
+      } catch (err) {
+        await interaction.editReply({ content: err instanceof Error ? err.message : String(err) });
+      }
       return;
     }
 
@@ -1429,6 +1495,21 @@ async function handleMessage(message: Message<boolean>, assistant: ClementineAss
       if (tail) await sendChunks(message.channel, tail, message);
     } else {
       await sendChunks(message.channel, appendGatewayTail(response.text, tail), message);
+    }
+    // After the text lands, attach the [Continue] button on max-turns-with-grace
+    // so the user has a one-tap resume affordance instead of having to type
+    // "continue" by hand. Falls back gracefully when the channel doesn't
+    // accept components.
+    if (response.stoppedReason === 'max-turns-with-grace'
+        && 'send' in message.channel) {
+      try {
+        await sendComponentMessage(message.channel, {
+          content: '_resume when ready_',
+          components: buildContinueActions(response.sessionId),
+        });
+      } catch (err) {
+        logger.warn({ err }, 'Failed to attach Continue button to Discord reply');
+      }
     }
   } catch (error) {
     logger.error({ err: error, channelId: message.channelId, userId: message.author.id }, 'Discord message handling failed');

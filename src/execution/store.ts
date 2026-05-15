@@ -187,6 +187,45 @@ export class ExecutionStore {
   }
 }
 
+/**
+ * Force-close executions that have been sitting in `active`/`blocked`/`paused`
+ * with no activity for longer than `staleAfterMs`. The model is supposed to
+ * call `execution_complete` when its work is done; when it forgets (turn cap,
+ * compaction, crash mid-run), the record stays "active" forever and the
+ * dashboard reports phantom in-flight work. Returns the number swept.
+ */
+export function sweepStaleExecutions(staleAfterMs = 60 * 60 * 1000): number {
+  const cutoff = Date.now() - staleAfterMs;
+  const executions = loadExecutions();
+  const now = new Date().toISOString();
+  let swept = 0;
+  for (const execution of executions) {
+    if (execution.status !== 'active' && execution.status !== 'blocked' && execution.status !== 'paused') continue;
+    const updated = Date.parse(execution.lastActivityAt || execution.updatedAt || execution.createdAt);
+    if (Number.isFinite(updated) && updated > cutoff) continue;
+    const note = `Auto-closed: no activity for ${Math.round(staleAfterMs / 60000)}m (stale-execution sweep).`;
+    execution.status = 'completed';
+    execution.updatedAt = now;
+    execution.lastActivityAt = now;
+    execution.blocker = note;
+    execution.lastAssistantSummary = execution.lastAssistantSummary
+      ? `${execution.lastAssistantSummary} | ${note}`
+      : note;
+    execution.activity = Array.isArray(execution.activity) ? execution.activity : [];
+    execution.activity.push({
+      id: randomUUID(),
+      key: `sweep-${Date.now()}`,
+      type: 'status',
+      message: note,
+      createdAt: now,
+    });
+    execution.activity = execution.activity.slice(-60);
+    swept += 1;
+  }
+  if (swept > 0) saveExecutions(executions);
+  return swept;
+}
+
 export function renderExecutionSummary(execution: ExecutionRecord): string {
   const parts = [
     `[${execution.status}] ${execution.title}`,

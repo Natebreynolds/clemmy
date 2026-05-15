@@ -67,7 +67,17 @@ function buildIntegrationsContext(): string {
       // surface with real schemas and Composio's own descriptions. The
       // model picks them directly. The approval taxonomy + scope policy
       // gate writes/sends automatically — no prompt-level coaching needed.
-      sections.push('Composio OAuth is connected. First-class tools named `cx_<toolkit>_<action>` are loaded for every active toolkit (call them directly). Use `composio_status` only to inspect what is connected; use `composio_search_tools` only if the user mentions a toolkit you do not recognize.');
+      sections.push([
+        'Composio OAuth is connected. First-class tools named `cx_<toolkit>_<action>` are loaded for every active toolkit — call them directly when one matches.',
+        '',
+        'IMPORTANT — first-class tools are a curated subset (~25 actions per toolkit, not exhaustive). If you need an action you don\'t see in the surface (e.g. listing/reading/searching messages, fetching files, querying records), do NOT conclude that the runtime "doesn\'t expose" it. The action almost certainly exists in Composio.',
+        '',
+        'Discovery flow when the exact tool isn\'t in your surface:',
+        '  1. Call `composio_search_tools` with a query describing what you need (e.g. "outlook list unread messages today", "gmail search messages", "salesforce query accounts"). It returns matching slugs.',
+        '  2. Call `composio_execute_tool` with the returned `tool_slug` and an `arguments` JSON string. This runs the same OAuth connection as the first-class tools and respects the same approval taxonomy.',
+        '',
+        'Only fall back to "I can\'t do that" after you\'ve actually searched. Use `composio_status` only to inspect what is connected.',
+      ].join('\n'));
     }
   } catch {
     // Keep building the rest of the integration context.

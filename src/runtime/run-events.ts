@@ -222,3 +222,40 @@ export function listRuns(limit = 30): RunRecord[] {
     .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
     .slice(0, limit);
 }
+
+/**
+ * Force-close runs that have been sitting in `running`/`received`/`queued`
+ * with no updates for longer than `staleAfterMs`. Without this, a daemon
+ * crash, channel disconnect, or unhandled rejection leaves the run pinned
+ * to the dashboard "NOW" panel forever — every stuck record gets counted
+ * as live work and confuses the operator.
+ *
+ * Returns the number of runs swept.
+ */
+export function sweepStaleRuns(staleAfterMs = 60 * 60 * 1000): number {
+  const cutoff = Date.now() - staleAfterMs;
+  const runs = loadRuns();
+  const now = nowIso();
+  let swept = 0;
+  for (const run of runs) {
+    if (run.status !== 'running' && run.status !== 'received' && run.status !== 'queued') continue;
+    const updated = Date.parse(run.updatedAt);
+    if (Number.isFinite(updated) && updated > cutoff) continue;
+    run.status = 'cancelled';
+    run.updatedAt = now;
+    run.completedAt = now;
+    run.error = run.error
+      ? `${run.error} | auto-closed: stale (no update in ${Math.round(staleAfterMs / 60000)}m)`
+      : `auto-closed: stale (no update in ${Math.round(staleAfterMs / 60000)}m)`;
+    run.events.push({
+      id: randomUUID(),
+      type: 'cancelled',
+      message: 'Run auto-closed by stale-run sweep.',
+      createdAt: now,
+    });
+    run.events = run.events.slice(-MAX_EVENTS_PER_RUN);
+    swept += 1;
+  }
+  if (swept > 0) saveRuns(runs);
+  return swept;
+}

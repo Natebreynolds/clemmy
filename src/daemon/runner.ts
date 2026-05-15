@@ -12,6 +12,9 @@ import { ensureSeedTemplates, processProactiveCheckIns } from '../agents/check-i
 import { MODELS } from '../config.js';
 import { processExecutionController } from '../execution/controller.js';
 import { interruptStaleRunningBackgroundTasks, processBackgroundTasks } from '../execution/background-tasks.js';
+import { sweepStaleExecutions } from '../execution/store.js';
+import { sweepStaleRuns } from '../runtime/run-events.js';
+import { sweepStaleApprovals } from '../runtime/approval-store.js';
 import { processMemoryMaintenance } from '../memory/maintenance.js';
 import {
   CRON_FILE,
@@ -379,6 +382,15 @@ async function processNotificationDeliveries(): Promise<void> {
 
     const destinations = getNotificationDestinationsForRecord(notification);
     if (destinations.length === 0) {
+      // No destinations resolved — this used to silently drop jobs forever,
+      // which is how cron notifications went missing all morning. Now we
+      // log it so the issue is visible, and drop the job (next addNotification
+      // will be a fresh attempt if destinations get configured).
+      logger.warn({
+        notificationId: notification.id,
+        kind: notification.kind,
+        title: notification.title,
+      }, 'No notification destinations resolved — message will not be delivered. Configure a destination or set DISCORD_DM_ALLOWED_USERS.');
       continue;
     }
     const now = new Date();
@@ -458,6 +470,16 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
   if (interrupted > 0) {
     logger.warn({ interrupted }, 'Marked stale running background tasks as interrupted');
   }
+  // Sweep records that got stuck active across a previous crash/restart.
+  // Without this, the dashboard "NOW" panel still reports phantom in-flight
+  // work from runs that the model forgot to close out (executions) or that
+  // the gateway never got to finishRun() on (runs).
+  const sweptRuns = sweepStaleRuns();
+  const sweptExecutions = sweepStaleExecutions();
+  const sweptApprovals = sweepStaleApprovals();
+  if (sweptRuns > 0 || sweptExecutions > 0 || sweptApprovals > 0) {
+    logger.warn({ sweptRuns, sweptExecutions, sweptApprovals }, 'Auto-closed stale runs / executions / approvals on daemon start');
+  }
   // First-tick init: ensure built-in proactive check-in templates
   // exist on disk (disabled). Re-runs are no-ops because the seeder
   // skips seededIds it already created.
@@ -508,6 +530,18 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
     }
     await processMemoryMaintenance(tickCount);
     await processNotificationDeliveries();
+    // Periodic stale-record sweep: cheap (one JSON load + a filter) and
+    // bounded — only writes when something actually expired. Every 60 ticks
+    // ≈ 15 minutes, which is plenty fast for dashboard correctness without
+    // hammering disk.
+    if (tickCount % 60 === 0) {
+      const sweptRuns = sweepStaleRuns();
+      const sweptExecutions = sweepStaleExecutions();
+      const sweptApprovals = sweepStaleApprovals();
+      if (sweptRuns > 0 || sweptExecutions > 0 || sweptApprovals > 0) {
+        logger.warn({ sweptRuns, sweptExecutions, sweptApprovals }, 'Periodic stale-record sweep auto-closed records');
+      }
+    }
     await sleep(15_000);
   }
 }
