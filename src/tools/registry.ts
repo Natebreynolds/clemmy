@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { tool, type Tool } from '@openai/agents';
 import type { RuntimeContextValue } from '../types.js';
 import { getComputerTools } from './computer-tools.js';
-import { getComposioRuntimeTools } from './composio-tools.js';
+import { getComposioRuntimeTools, getDynamicComposioRuntimeTools } from './composio-tools.js';
 import { getLocalRuntimeTools } from './local-runtime-tools.js';
 
 export function getCoreTools(): Tool<RuntimeContextValue>[] {
@@ -25,4 +25,34 @@ export function getCoreTools(): Tool<RuntimeContextValue>[] {
     ...getComputerTools(),
     ...getComposioRuntimeTools(),
   ];
+}
+
+export async function getCoreToolsAsync(options: {
+  includeDynamicComposioTools?: boolean;
+} = {}): Promise<Tool<RuntimeContextValue>[]> {
+  const core = getCoreTools();
+  if (!options.includeDynamicComposioTools) return core;
+
+  try {
+    const dynamic = await getDynamicComposioRuntimeTools();
+    if (dynamic.length === 0) return core;
+    // When first-class `cx_<slug>` tools are loaded, drop
+    // `composio_execute_tool` from the broker. The model has the real
+    // tools with real schemas in its surface — the broker's
+    // free-form-string slug invite was the path where it would
+    // hallucinate slugs (`GOOGLESHEETS_CREATE_SPREADSHEET` when the
+    // real slug is `GOOGLESHEETS_CREATE_GOOGLE_SHEET1`).
+    // Keep `composio_status` / `composio_search_tools` /
+    // `composio_list_tools` — those are discovery helpers, not
+    // execution paths.
+    const filteredCore = core.filter(
+      (t) => (t as { name?: string }).name !== 'composio_execute_tool',
+    );
+    return [...filteredCore, ...dynamic];
+  } catch {
+    // A connected-app catalog failure should not make the whole agent
+    // unavailable. The broker tools remain available so the agent can
+    // surface the actual connection/tooling issue.
+    return core;
+  }
 }

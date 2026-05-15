@@ -2,7 +2,7 @@ import { Agent, handoff } from '@openai/agents';
 import type { Handoff, Tool } from '@openai/agents';
 import { MODELS, getRuntimeEnv } from '../config.js';
 import { activeExecutionCount, activeExecutionCountForSession } from '../tools/execution-tools.js';
-import { getCoreTools } from '../tools/registry.js';
+import { getCoreTools, getCoreToolsAsync } from '../tools/registry.js';
 import type { RuntimeContextValue } from '../types.js';
 
 /**
@@ -81,9 +81,11 @@ const RESEARCHER_TOOL_NAMES = new Set<string>([
   'agent_run_get',
   // Discovery
   'discover_work',
-  // External (Composio read-only patterns — the agent decides)
+  // External — first-class cx_* tools are added via prefix at build
+  // time; the broker tools below remain as discovery helpers.
   'composio_status',
   'composio_list_tools',
+  'composio_search_tools',
 ]);
 
 const EXECUTOR_TOOL_NAMES = new Set<string>([
@@ -124,9 +126,12 @@ const EXECUTOR_TOOL_NAMES = new Set<string>([
   'write_file',
   'run_shell_command',
   'git_status',
-  // External
-  'composio_execute_tool',
+  // External — first-class cx_* tools are added via prefix at build
+  // time. The broker `composio_execute_tool` is deliberately omitted:
+  // the executor calls the real `cx_<toolkit>_<action>` tool directly
+  // (the orchestrator already dropped the broker execute in this mode).
   'composio_list_tools',
+  'composio_search_tools',
 ]);
 
 const WRITER_TOOL_NAMES = new Set<string>([
@@ -200,18 +205,45 @@ const DEPLOYER_TOOL_NAMES = new Set<string>([
   'write_file',
   'git_status',
   'run_shell_command',
-  // External deployment/status integrations
+  // External — first-class cx_* tools added by prefix at build time.
   'composio_status',
   'composio_list_tools',
-  'composio_execute_tool',
+  'composio_search_tools',
 ]);
 
-function filterToolsByNames<T extends { name?: string }>(tools: T[], allow: Set<string>): T[] {
-  return tools.filter((tool) => Boolean(tool.name) && allow.has(tool.name as string));
+/**
+ * Prefix patterns added on top of every sub-agent's explicit allowlist.
+ * `cx_` is the first-class Composio per-action surface; every sub-agent
+ * that has any Composio access gets the lot. The trust gradient still
+ * gates each call per its taxonomy `ToolKind` (read vs send), so adding
+ * the prefix here doesn't give Researcher a write path — it just lets
+ * Researcher call `cx_googlesheets_batch_get` etc.
+ *
+ * Note: Researcher / Reviewer are read-only sub-agents, so the cx_*
+ * prefix is intentionally *not* added to them — the orchestrator hands
+ * them off for lookups, not mutations. Executor / Deployer / Writer
+ * get the prefix because they may need to invoke external app actions.
+ */
+const COMPOSIO_FIRST_CLASS_PREFIX = 'cx_';
+
+function filterToolsByNames<T extends { name?: string }>(
+  tools: T[],
+  allow: Set<string>,
+  prefixes: string[] = [],
+): T[] {
+  return tools.filter((tool) => {
+    const name = tool.name;
+    if (!name) return false;
+    if (allow.has(name)) return true;
+    return prefixes.some((p) => name.startsWith(p));
+  });
 }
 
-export function buildResearcherAgent(): SubAgent {
-  const tools = filterToolsByNames(getCoreTools(), RESEARCHER_TOOL_NAMES) as Tool<RuntimeContextValue>[];
+export async function buildResearcherAgent(): Promise<SubAgent> {
+  // Researcher is read-only — no cx_* prefix needed; the few read-only
+  // composio_* helpers are explicit in the allowlist.
+  const all = await getCoreToolsAsync({ includeDynamicComposioTools: true });
+  const tools = filterToolsByNames(all, RESEARCHER_TOOL_NAMES) as Tool<RuntimeContextValue>[];
   return new Agent<RuntimeContextValue>({
     name: 'Researcher',
     handoffDescription: 'Gathers information, reads files/notes/memory, and returns concise findings. Cannot mutate state.',
@@ -227,8 +259,11 @@ export function buildResearcherAgent(): SubAgent {
   });
 }
 
-export function buildExecutorAgent(): SubAgent {
-  const tools = filterToolsByNames(getCoreTools(), EXECUTOR_TOOL_NAMES) as Tool<RuntimeContextValue>[];
+export async function buildExecutorAgent(): Promise<SubAgent> {
+  // Executor needs first-class cx_* so it can call `cx_googlesheets_*`
+  // and friends directly instead of going through the broker.
+  const all = await getCoreToolsAsync({ includeDynamicComposioTools: true });
+  const tools = filterToolsByNames(all, EXECUTOR_TOOL_NAMES, [COMPOSIO_FIRST_CLASS_PREFIX]) as Tool<RuntimeContextValue>[];
   return new Agent<RuntimeContextValue>({
     name: 'Executor',
     handoffDescription: 'Does the work — tasks, executions, file writes, commands, external actions. Use when a decision has been made and there is concrete work to perform.',
@@ -245,8 +280,11 @@ export function buildExecutorAgent(): SubAgent {
   });
 }
 
-export function buildWriterAgent(): SubAgent {
-  const tools = filterToolsByNames(getCoreTools(), WRITER_TOOL_NAMES) as Tool<RuntimeContextValue>[];
+export async function buildWriterAgent(): Promise<SubAgent> {
+  // Writer may need to call write/create cx_* tools (e.g. draft a doc
+  // into Google Docs). The taxonomy still gates writes by scope.
+  const all = await getCoreToolsAsync({ includeDynamicComposioTools: true });
+  const tools = filterToolsByNames(all, WRITER_TOOL_NAMES, [COMPOSIO_FIRST_CLASS_PREFIX]) as Tool<RuntimeContextValue>[];
   return new Agent<RuntimeContextValue>({
     name: 'Writer',
     handoffDescription: 'Drafts polished user-facing writing, docs, notes, email/message copy, and project summaries. Does not send messages or deploy.',
@@ -262,8 +300,11 @@ export function buildWriterAgent(): SubAgent {
   });
 }
 
-export function buildReviewerAgent(): SubAgent {
-  const tools = filterToolsByNames(getCoreTools(), REVIEWER_TOOL_NAMES) as Tool<RuntimeContextValue>[];
+export async function buildReviewerAgent(): Promise<SubAgent> {
+  // Reviewer is read-only — only the explicit composio_* discovery
+  // helpers in the allowlist.
+  const all = await getCoreToolsAsync({ includeDynamicComposioTools: true });
+  const tools = filterToolsByNames(all, REVIEWER_TOOL_NAMES) as Tool<RuntimeContextValue>[];
   return new Agent<RuntimeContextValue>({
     name: 'Reviewer',
     handoffDescription: 'Audits work — before execution OR after a mutation completes. Read-only; reports findings.',
@@ -281,8 +322,10 @@ export function buildReviewerAgent(): SubAgent {
   });
 }
 
-export function buildDeployerAgent(): SubAgent {
-  const tools = filterToolsByNames(getCoreTools(), DEPLOYER_TOOL_NAMES) as Tool<RuntimeContextValue>[];
+export async function buildDeployerAgent(): Promise<SubAgent> {
+  // Deployer may invoke external CI/CD / deploy actions via cx_*.
+  const all = await getCoreToolsAsync({ includeDynamicComposioTools: true });
+  const tools = filterToolsByNames(all, DEPLOYER_TOOL_NAMES, [COMPOSIO_FIRST_CLASS_PREFIX]) as Tool<RuntimeContextValue>[];
   return new Agent<RuntimeContextValue>({
     name: 'Deployer',
     handoffDescription: 'Handles release, deployment, CI, environment, and CLI-driven shipping work. Use only for tracked approved execution work.',
@@ -321,13 +364,25 @@ function maybeGateExecutionHandoff(agent: SubAgent, options: OrchestratorHandoff
  * Default sub-agents the orchestrator can hand off to. Add specialized
  * roles here as the system grows (writer, reviewer, deployer, etc.).
  */
-export function defaultOrchestratorHandoffs(options: OrchestratorHandoffOptions = {}): OrchestratorHandoff[] {
-  return [
+export async function defaultOrchestratorHandoffs(
+  options: OrchestratorHandoffOptions = {},
+): Promise<OrchestratorHandoff[]> {
+  // Build all five sub-agents in parallel; each awaits getCoreToolsAsync
+  // independently but they share the Composio catalog cache so only the
+  // first call hits the network.
+  const [researcher, writer, reviewer, executor, deployer] = await Promise.all([
     buildResearcherAgent(),
     buildWriterAgent(),
     buildReviewerAgent(),
-    maybeGateExecutionHandoff(buildExecutorAgent(), options),
-    maybeGateExecutionHandoff(buildDeployerAgent(), options),
+    buildExecutorAgent(),
+    buildDeployerAgent(),
+  ]);
+  return [
+    researcher,
+    writer,
+    reviewer,
+    maybeGateExecutionHandoff(executor, options),
+    maybeGateExecutionHandoff(deployer, options),
   ];
 }
 

@@ -106,6 +106,7 @@ test('buildPolicyText handles all-allowed without blocked section', () => {
 test('categorizeToolForPolicy: composio_* → composio', () => {
   assert.equal(categorizeToolForPolicy('composio_status'), 'composio');
   assert.equal(categorizeToolForPolicy('composio_execute_tool'), 'composio');
+  assert.equal(categorizeToolForPolicy('cx_gmail_send_email'), 'composio');
 });
 
 test('categorizeToolForPolicy: known shell/fs tools → computer', () => {

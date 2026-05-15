@@ -33,7 +33,7 @@ export async function runDoctor(): Promise<number> {
   const authStatus = getAuthStatus();
   if (authStatus.mode === 'codex_oauth') {
     if (authStatus.configured) {
-      warnRow('AUTH_MODE', authStatus.message);
+      passRow('AUTH_MODE', authStatus.message);
     } else if (authStatus.source === 'codex_cli') {
       warnRow('AUTH_MODE', `${authStatus.message} Run: clementine auth login`);
     } else {
@@ -51,12 +51,12 @@ export async function runDoctor(): Promise<number> {
 
   // API key
   if (getOpenAiApiKey()) {
-    passRow('OPENAI_API_KEY', 'Configured');
+    passRow('OPENAI_API_KEY', 'Configured for embeddings, live voice, and direct API features');
   } else if (AUTH_MODE === 'api_key') {
     failRow('OPENAI_API_KEY', 'Missing — chat, daemon, and workflows will not work');
     problems.push('OPENAI_API_KEY');
   } else {
-    warnRow('OPENAI_API_KEY', 'Missing, but AUTH_MODE is not api_key');
+    warnRow('OPENAI_API_KEY', 'Optional capability key missing — Codex OAuth runtime can still run; embeddings and live voice stay disabled');
   }
 
   const workspaceDirs = getWorkspaceDirs();

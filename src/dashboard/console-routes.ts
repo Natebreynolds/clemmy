@@ -1,20 +1,27 @@
 import type { Express, Request } from 'express';
+import * as fs from 'node:fs';
 import { existsSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import matter from 'gray-matter';
 import { renderConsoleHtml } from './console.js';
-import { BASE_DIR, WEBHOOK_SECRET } from '../config.js';
+import { BASE_DIR, WEBHOOK_SECRET, getOpenAiApiKey, getRuntimeEnv } from '../config.js';
 import { recallHybrid } from '../memory/recall.js';
-import { forgetFact, listActiveFacts, listAllFacts } from '../memory/facts.js';
+import { FACT_KINDS, forgetFact, listActiveFacts, listAllFacts, rememberFact } from '../memory/facts.js';
 import { openMemoryDb } from '../memory/db.js';
-import { readMemoryIndexStatus } from '../memory/indexer.js';
-import { WORKFLOWS_DIR } from '../memory/vault.js';
-import { ensureDir, getWorkspaceDirs, listWorkspaceProjects, WORKFLOW_RUNS_DIR } from '../tools/shared.js';
+import { readMemoryIndexStatus, reindexVault } from '../memory/indexer.js';
+import { IDENTITY_FILE, MEMORY_FILE, SOUL_FILE, WORKFLOWS_DIR, WORKING_MEMORY_FILE } from '../memory/vault.js';
+import { ensureDir, getWorkspaceDirs, listWorkspaceProjects, parseTasks, GOALS_DIR, TASKS_FILE, WORKFLOW_RUNS_DIR } from '../tools/shared.js';
+import { ExecutionStore } from '../execution/store.js';
+import { listOpenCheckIns } from '../agents/check-ins.js';
 import type { ClementineAssistant } from '../assistant/core.js';
+import { buildRealtimeVoiceInstructions } from '../assistant/voice-context.js';
 import { LOCAL_MCP_TOOL_NAMES } from '../tools/catalog.js';
-import { getCoreTools } from '../tools/registry.js';
-import { discoverMcpServers } from '../runtime/mcp-config.js';
+import { getCoreToolsAsync } from '../tools/registry.js';
+import { discoverMcpServers, loadUserMcpServers, saveUserMcpServers } from '../runtime/mcp-config.js';
+import { invalidateConfiguredMcpServers } from '../runtime/mcp-servers.js';
+import { clearAutonomyAgentCache } from '../agents/autonomy-v2.js';
 import { loadPlugins, PLUGINS_DIR } from '../plugins/loader.js';
 import { loadUserProfile, saveUserProfile } from '../runtime/user-profile.js';
 import { getProactivityPolicySnapshot, saveProactivityPolicy } from '../agents/proactivity-policy.js';
@@ -39,23 +46,34 @@ import {
   rejectProposal,
 } from '../agents/check-in-proposals.js';
 import {
-  approvePlanProposal,
   deletePlanProposal,
   getPlanProposal,
   listPlanProposals,
   rejectPlanProposal,
 } from '../agents/plan-proposals.js';
+import { approvePlanAndQueueBackgroundTask } from '../execution/approved-plan-tasks.js';
 import { PlanSchema } from '../agents/planner.js';
 import { closePlanScope, listActiveScopes, listAllScopes } from '../agents/plan-scope.js';
 import type { CheckInUrgency } from '../agents/check-ins.js';
+import { createBackgroundTask } from '../execution/background-tasks.js';
+import {
+  appendRecallTranscriptSegment,
+  createRecallSdkUpload,
+  finalizeRecallMeeting,
+  loadRecallMeetingSettings,
+  noteRecallMeetingDetected,
+  RECALL_REGIONS,
+  saveRecallMeetingSettings,
+  type RecallMeetingSettings,
+  type RecallRegion,
+} from '../integrations/recall/meeting-capture.js';
 
 /**
- * Mounts the new Console dashboard at /console.
+ * Mounts the Clementine Console dashboard at /console.
  *
- * The existing /dashboard route in webhook.ts is left untouched —
- * Run Control Center keeps working. /console is the new parallel
- * surface with its own visual language, growing toward the goal of
- * "manage your agent, workflows, skills, and all local/external tools."
+ * /console is the primary Electron surface for managing the agent,
+ * workflows, skills, memory, and local/external tools. Older /dashboard
+ * links redirect here from webhook.ts.
  *
  * Auth piggy-backs on the same isAuthorized check the rest of the
  * dashboard routes use. Future console-specific endpoints (workflow
@@ -77,6 +95,90 @@ interface WorkflowFrontmatter {
   steps?: WorkflowStepShape[];
   inputs?: Record<string, { type?: string; default?: string; description?: string }>;
   synthesis?: { prompt?: string };
+}
+
+interface ContextFileDefinition {
+  key: string;
+  title: string;
+  description: string;
+  filePath: string;
+  minUsefulChars: number;
+}
+
+const CONTEXT_FILES: ContextFileDefinition[] = [
+  {
+    key: 'identity',
+    title: 'Identity',
+    description: 'Who the user is, what Clementine should know about them, and the durable north-star context.',
+    filePath: IDENTITY_FILE,
+    minUsefulChars: 80,
+  },
+  {
+    key: 'soul',
+    title: 'Core Personality',
+    description: 'The assistant persona: judgment, tone, operating style, and behavioral principles.',
+    filePath: SOUL_FILE,
+    minUsefulChars: 120,
+  },
+  {
+    key: 'memory',
+    title: 'Long-Term Memory',
+    description: 'Standing context Clementine should keep visible across chat, Discord, voice, and autonomous runs.',
+    filePath: MEMORY_FILE,
+    minUsefulChars: 120,
+  },
+  {
+    key: 'working_memory',
+    title: 'Working Memory',
+    description: 'Current session focus and recent continuity. Usually managed automatically, but editable when needed.',
+    filePath: WORKING_MEMORY_FILE,
+    minUsefulChars: 80,
+  },
+];
+
+function contextFileForKey(key: string): ContextFileDefinition | undefined {
+  return CONTEXT_FILES.find((file) => file.key === key);
+}
+
+function readContextFile(def: ContextFileDefinition): Record<string, unknown> {
+  const exists = fs.existsSync(def.filePath);
+  const content = exists ? fs.readFileSync(def.filePath, 'utf-8') : '';
+  const bytes = Buffer.byteLength(content, 'utf-8');
+  const usefulChars = content.trim().length;
+  return {
+    key: def.key,
+    title: def.title,
+    description: def.description,
+    path: def.filePath,
+    exists,
+    bytes,
+    usefulChars,
+    empty: usefulChars < def.minUsefulChars,
+    content,
+  };
+}
+
+function readContextGoals(): Array<Record<string, unknown>> {
+  ensureDir(GOALS_DIR);
+  return fs.readdirSync(GOALS_DIR)
+    .filter((file) => file.endsWith('.json'))
+    .map((file) => {
+      try {
+        const parsed = JSON.parse(fs.readFileSync(path.join(GOALS_DIR, file), 'utf-8')) as Record<string, unknown>;
+        return parsed;
+      } catch {
+        return null;
+      }
+    })
+    .filter((goal): goal is Record<string, unknown> => goal !== null)
+    .sort((a, b) => String(b.updatedAt ?? '').localeCompare(String(a.updatedAt ?? '')));
+}
+
+function realtimeNumberEnv(name: string, fallback: number, min: number, max: number): number {
+  const raw = getRuntimeEnv(name, String(fallback));
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(min, Math.min(max, parsed));
 }
 
 function validateCronExpression(expr: string): boolean {
@@ -199,6 +301,48 @@ export function registerConsoleRoutes(
     res.type('html').send(renderConsoleHtml(queryToken));
   });
 
+  /**
+   * Serve the Clementine icon for use in the dashboard / favicons.
+   * Resolves from one of:
+   *   - dev: clementine-next/apps/desktop/build/icon.png
+   *   - packaged: process.resourcesPath/daemon/apps/desktop/build/icon.png
+   *   - fallback: ~/Downloads/clementine.png
+   * No auth — it's a public branding asset, not data.
+   */
+  /**
+   * Vendor scripts — currently just Cytoscape for the memory graph.
+   * Served from node_modules so the packaged app works offline.
+   */
+  app.get('/console/vendor/cytoscape.min.js', (_req, res) => {
+    const candidates = [
+      path.resolve(process.cwd(), 'node_modules', 'cytoscape', 'dist', 'cytoscape.min.js'),
+      path.resolve((process as NodeJS.Process & { resourcesPath?: string }).resourcesPath ?? '', 'daemon', 'node_modules', 'cytoscape', 'dist', 'cytoscape.min.js'),
+    ];
+    for (const candidate of candidates) {
+      if (fs.existsSync(candidate)) {
+        res.type('application/javascript').sendFile(candidate);
+        return;
+      }
+    }
+    res.status(404).send('// cytoscape not bundled');
+  });
+
+  app.get('/console/icon.png', (_req, res) => {
+    const candidates = [
+      path.resolve(process.cwd(), 'apps', 'desktop', 'build', 'icon.png'),
+      path.resolve(process.cwd(), '..', '..', 'apps', 'desktop', 'build', 'icon.png'),
+      path.resolve((process as NodeJS.Process & { resourcesPath?: string }).resourcesPath ?? '', 'daemon', 'apps', 'desktop', 'build', 'icon.png'),
+      path.resolve(os.homedir(), 'Downloads', 'clementine.png'),
+    ];
+    for (const candidate of candidates) {
+      if (fs.existsSync(candidate)) {
+        res.type('png').sendFile(candidate);
+        return;
+      }
+    }
+    res.status(404).send('icon not bundled');
+  });
+
   // ─── Console-specific API namespace ───────────────────────────────
   //
   // Routes under /api/console/* support the console panels. We avoid
@@ -264,6 +408,109 @@ export function registerConsoleRoutes(
    * List indexed vault files with chunk counts + last index time. The
    * panel renders this as a browsable file tree on the left side.
    */
+  /**
+   * Build a {nodes, edges} graph payload for the Memory tab visualizer.
+   *
+   * Nodes:
+   *   - fact     — durable knowledge entries
+   *   - file     — indexed vault files (path-based)
+   *   - kind     — fact kind clusters (user/project/feedback/reference)
+   *
+   * Edges:
+   *   - fact → kind   (every fact connects to its kind cluster)
+   *   - fact → file   (when the fact text mentions the file's name)
+   *
+   * Caps: 100 facts + 60 files by default to keep the layout snappy.
+   */
+  app.get('/api/console/memory/graph', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const factsLimit = Math.max(10, Math.min(300, parseInt(typeof req.query.facts === 'string' ? req.query.facts : '100', 10) || 100));
+      const filesLimit = Math.max(10, Math.min(200, parseInt(typeof req.query.files === 'string' ? req.query.files : '60', 10) || 60));
+
+      const facts = listActiveFacts({ limit: factsLimit });
+      const db = openMemoryDb();
+      const files = db.prepare(`
+        SELECT path, MAX(mtime) AS mtime, COUNT(*) AS chunks
+        FROM vault_chunks
+        GROUP BY path
+        ORDER BY MAX(mtime) DESC
+        LIMIT ?
+      `).all(filesLimit) as Array<{ path: string; mtime: number; chunks: number }>;
+
+      const KIND_SET = new Set<string>();
+      for (const f of facts) if (f.kind) KIND_SET.add(f.kind);
+      const kinds = Array.from(KIND_SET);
+
+      const nodes: Array<{ id: string; label: string; type: string; data?: Record<string, unknown> }> = [];
+      const edges: Array<{ id: string; source: string; target: string; type: string }> = [];
+
+      // Kind cluster nodes.
+      for (const kind of kinds) {
+        nodes.push({ id: `kind:${kind}`, label: kind.toUpperCase(), type: 'kind' });
+      }
+
+      // Fact nodes + fact→kind edges.
+      const fileBasenames = files.map((f) => {
+        const base = path.basename(f.path, path.extname(f.path));
+        return { path: f.path, base, baseLower: base.toLowerCase() };
+      });
+
+      for (const fact of facts) {
+        const id = `fact:${fact.id}`;
+        const summary = (fact.content || '(fact)').trim().split('\n')[0].slice(0, 60);
+        nodes.push({
+          id,
+          label: summary,
+          type: 'fact',
+          data: { kind: fact.kind, content: fact.content?.slice(0, 600), source: fact.source },
+        });
+        if (fact.kind) {
+          edges.push({ id: `${id}->kind:${fact.kind}`, source: id, target: `kind:${fact.kind}`, type: 'kind' });
+        }
+        // Fact → file edges when the fact text mentions a file basename.
+        const lower = (fact.content || '').toLowerCase();
+        if (lower.length > 0) {
+          for (const f of fileBasenames) {
+            if (f.baseLower.length < 4) continue; // skip tiny names
+            if (lower.includes(f.baseLower)) {
+              edges.push({ id: `${id}->file:${f.path}`, source: id, target: `file:${f.path}`, type: 'mentions' });
+            }
+          }
+        }
+      }
+
+      // File nodes — only include files that either have an inbound edge
+      // OR are recently-active (top 30 by mtime).
+      const referencedFilePaths = new Set(edges.filter((e) => e.target.startsWith('file:')).map((e) => e.target.slice(5)));
+      const recentTop = files.slice(0, 30).map((f) => f.path);
+      for (const path of recentTop) referencedFilePaths.add(path);
+
+      for (const f of files) {
+        if (!referencedFilePaths.has(f.path)) continue;
+        nodes.push({
+          id: `file:${f.path}`,
+          label: f.path.split('/').slice(-2).join('/'),
+          type: 'file',
+          data: { chunks: f.chunks, mtime: f.mtime },
+        });
+      }
+
+      res.json({
+        nodes,
+        edges,
+        meta: {
+          factCount: facts.length,
+          fileCount: nodes.filter((n) => n.type === 'file').length,
+          kindCount: kinds.length,
+          edgeCount: edges.length,
+        },
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   app.get('/api/console/memory/files', (_req, res) => {
     try {
       const db = openMemoryDb();
@@ -436,6 +683,37 @@ export function registerConsoleRoutes(
     res.json(validateWorkflowDefinition(entry.data));
   });
 
+  /**
+   * Recent runs for a single workflow. Reads from
+   * ~/.clementine-next/workflows/runs/ and filters by workflow name.
+   * The runs dir holds one JSON per run with shape:
+   *   { id, workflow, inputs, status, createdAt, source,
+   *     completedAt?, output?, error? }
+   */
+  app.get('/api/console/workflows/:name/runs', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const workflowName = req.params.name;
+    const limit = Math.max(1, Math.min(50, parseInt(typeof req.query.limit === 'string' ? req.query.limit : '20', 10) || 20));
+    try {
+      if (!fs.existsSync(WORKFLOW_RUNS_DIR)) {
+        res.json({ runs: [] });
+        return;
+      }
+      const files = fs.readdirSync(WORKFLOW_RUNS_DIR).filter((f) => f.endsWith('.json'));
+      const runs: Array<Record<string, unknown>> = [];
+      for (const file of files) {
+        try {
+          const data = JSON.parse(fs.readFileSync(path.join(WORKFLOW_RUNS_DIR, file), 'utf-8')) as Record<string, unknown>;
+          if (data.workflow === workflowName) runs.push(data);
+        } catch { /* skip malformed */ }
+      }
+      runs.sort((a, b) => String(b.createdAt ?? '').localeCompare(String(a.createdAt ?? '')));
+      res.json({ runs: runs.slice(0, limit) });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   app.post('/api/console/workflows/:name/run', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const entry = findWorkflowFile(req.params.name);
@@ -517,7 +795,7 @@ export function registerConsoleRoutes(
     if (name.startsWith('agent_run') || name.startsWith('user_profile') || name.startsWith('team_') || name.startsWith('create_agent') || name.startsWith('update_agent') || name.startsWith('delete_agent') || name.startsWith('delegate') || name === 'check_delegation') return 'Agents';
     if (name === 'set_timer' || name.startsWith('cron_') || name.startsWith('workflow_') || name === 'trigger_cron_job' || name === 'add_cron_job') return 'Automation';
     if (name === 'workspace_config' || name === 'workspace_list' || name === 'workspace_info' || name === 'workspace_roots' || name === 'list_files' || name === 'read_file' || name === 'write_file' || name === 'run_shell_command' || name === 'git_status') return 'Computer';
-    if (name.startsWith('composio_')) return 'Connected Apps';
+    if (name.startsWith('composio_') || name.startsWith('cx_')) return 'Connected Apps';
     if (name === 'session_history' || name === 'session_pause' || name === 'session_resume') return 'Sessions';
     if (name === 'create_tool') return 'Meta';
     if (name === 'ping') return 'System';
@@ -525,12 +803,12 @@ export function registerConsoleRoutes(
     return 'Other';
   }
 
-  app.get('/api/console/tools', (req, res) => {
+  app.get('/api/console/tools', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
       // Local MCP tools — from the catalog (string names) plus the
       // SDK-native tools registered in registry.ts (have full schema).
-      const sdkTools = getCoreTools()
+      const sdkTools = (await getCoreToolsAsync({ includeDynamicComposioTools: true }))
         .filter((tool) => tool.type === 'function')
         .map((tool) => ({
           name: tool.name,
@@ -555,9 +833,8 @@ export function registerConsoleRoutes(
         a.category.localeCompare(b.category) || a.name.localeCompare(b.name),
       );
 
-      // Discovered MCP servers (firecrawl, playwright, etc.) — what
-      // ELSE the agent has access to from the user's Claude Desktop /
-      // Claude Code config.
+      // Discovered MCP servers (firecrawl, playwright, etc.) from
+      // Clementine config plus compatible local MCP client configs.
       const mcpServers = discoverMcpServers().map((server) => ({
         name: server.name,
         description: server.description ?? '',
@@ -666,6 +943,109 @@ export function registerConsoleRoutes(
     }
   });
 
+  // ─── Context / Identity ──────────────────────────────────────────
+
+  app.get('/api/console/context', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const profile = loadUserProfile();
+      const files = CONTEXT_FILES.map(readContextFile);
+      const facts = listActiveFacts({ limit: 18 });
+      const goals = readContextGoals().slice(0, 12);
+      const voiceInstructions = buildRealtimeVoiceInstructions('console:home');
+      res.json({
+        profile,
+        files,
+        facts,
+        goals,
+        memory: readMemoryIndexStatus(),
+        voiceContext: {
+          chars: voiceInstructions.length,
+          sections: Array.from(voiceInstructions.matchAll(/^## (.+)$/gm)).map((match) => match[1]),
+        },
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.patch('/api/console/context/files/:key', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const def = contextFileForKey(req.params.key);
+    if (!def) { res.status(404).json({ error: 'unknown context file' }); return; }
+    const content = typeof req.body?.content === 'string' ? req.body.content : '';
+    if (content.length > 60000) {
+      res.status(400).json({ error: 'context file content is too large' });
+      return;
+    }
+    try {
+      ensureDir(path.dirname(def.filePath));
+      fs.writeFileSync(def.filePath, content.trimEnd() + (content.trim() ? '\n' : ''), 'utf-8');
+      res.json({ file: readContextFile(def) });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/context/facts', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const kind = typeof req.body?.kind === 'string' ? req.body.kind : 'user';
+    const content = typeof req.body?.content === 'string' ? req.body.content.trim() : '';
+    if (!FACT_KINDS.includes(kind as (typeof FACT_KINDS)[number])) {
+      res.status(400).json({ error: 'invalid fact kind' });
+      return;
+    }
+    if (!content) {
+      res.status(400).json({ error: 'fact content required' });
+      return;
+    }
+    try {
+      const fact = rememberFact({ kind: kind as (typeof FACT_KINDS)[number], content, sessionId: 'console:context' });
+      res.json({ fact, facts: listActiveFacts({ limit: 18 }) });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/context/goals', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const title = typeof req.body?.title === 'string' ? req.body.title.trim() : '';
+    const description = typeof req.body?.description === 'string' ? req.body.description.trim() : '';
+    const priority = ['high', 'medium', 'low'].includes(req.body?.priority) ? req.body.priority : 'medium';
+    const nextActions = Array.isArray(req.body?.nextActions)
+      ? req.body.nextActions.filter((item: unknown): item is string => typeof item === 'string' && item.trim().length > 0).map((item: string) => item.trim()).slice(0, 8)
+      : typeof req.body?.nextActions === 'string'
+        ? req.body.nextActions.split('\n').map((item: string) => item.trim()).filter(Boolean).slice(0, 8)
+        : [];
+    if (!title || !description) {
+      res.status(400).json({ error: 'title and description required' });
+      return;
+    }
+    try {
+      ensureDir(GOALS_DIR);
+      const now = new Date().toISOString();
+      const goal = {
+        id: randomBytes(4).toString('hex'),
+        title,
+        description,
+        owner: 'clementine',
+        priority,
+        status: 'active',
+        createdAt: now,
+        updatedAt: now,
+        reviewFrequency: 'weekly',
+        progressNotes: [],
+        nextActions,
+        blockers: [],
+        linkedCronJobs: [],
+      };
+      fs.writeFileSync(path.join(GOALS_DIR, `${goal.id}.json`), JSON.stringify(goal, null, 2), 'utf-8');
+      res.json({ goal, goals: readContextGoals().slice(0, 12) });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   // ─── Settings ──────────────────────────────────────────────────
 
   app.get('/api/console/settings', (req, res) => {
@@ -676,6 +1056,32 @@ export function registerConsoleRoutes(
       const auth = getAuthStatus();
       const memory = readMemoryIndexStatus();
       res.json({ profile, proactivity, auth, memory });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * Tiny endpoint the dashboard hits on first load to populate the
+   * version chip in the header + foot bar. Reads from package.json.
+   */
+  app.get('/api/console/build-info', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const candidates = [
+        path.resolve(process.cwd(), 'package.json'),
+        path.resolve(process.cwd(), '..', '..', 'package.json'),
+        path.resolve((process as NodeJS.Process & { resourcesPath?: string }).resourcesPath ?? '', 'daemon', 'package.json'),
+      ];
+      let version: string | undefined;
+      for (const candidate of candidates) {
+        if (!fs.existsSync(candidate)) continue;
+        try {
+          const pkg = JSON.parse(fs.readFileSync(candidate, 'utf-8')) as { version?: string; name?: string };
+          if (pkg.name === 'clemmy' && pkg.version) { version = pkg.version; break; }
+        } catch { /* try next */ }
+      }
+      res.json({ version: version ?? 'unknown', startedAt: new Date(process.uptime() * 1000 * -1 + Date.now()).toISOString() });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -701,6 +1107,153 @@ export function registerConsoleRoutes(
     }
   });
 
+  // ─── Optional Recall.ai desktop meeting capture ───────────────────
+
+  app.get('/api/console/meetings/recall', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const store = await getSecretStore();
+      const secret = await store.get('recall_api_key');
+      res.json({
+        settings: loadRecallMeetingSettings(),
+        credential: {
+          status: secret.status,
+          source: secret.source,
+          hasValue: Boolean(secret.value),
+        },
+        regions: RECALL_REGIONS,
+        docsUrl: 'https://docs.recall.ai/docs/desktop-sdk',
+        signupUrl: 'https://www.recall.ai/signup',
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.patch('/api/console/meetings/recall/settings', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const body = (req.body ?? {}) as Partial<RecallMeetingSettings>;
+    const region = typeof body.region === 'string' && body.region in RECALL_REGIONS
+      ? body.region as RecallRegion
+      : undefined;
+    try {
+      const settings = saveRecallMeetingSettings({
+        enabled: body.enabled === true,
+        region,
+        autoRecord: body.autoRecord === true,
+        liveTranscript: body.liveTranscript === true,
+        analyzeOnComplete: body.analyzeOnComplete !== false,
+      });
+      res.json({ settings });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/meetings/recall/upload-token', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const settings = loadRecallMeetingSettings();
+      if (!settings.enabled) {
+        res.status(409).json({ error: 'Recall meeting capture is disabled.' });
+        return;
+      }
+      const upload = await createRecallSdkUpload({
+        liveTranscript: req.body?.liveTranscript === true || settings.liveTranscript,
+      });
+      res.json(upload);
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/meetings/recall/detected', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const windowId = typeof req.body?.windowId === 'string' ? req.body.windowId : '';
+    if (!windowId) { res.status(400).json({ error: 'windowId required' }); return; }
+    try {
+      const record = noteRecallMeetingDetected({
+        windowId,
+        recordingId: typeof req.body?.recordingId === 'string' ? req.body.recordingId : undefined,
+        platform: typeof req.body?.platform === 'string' ? req.body.platform : undefined,
+        title: typeof req.body?.title === 'string' ? req.body.title : undefined,
+        status: req.body?.status === 'recording' ? 'recording' : 'detected',
+      });
+      res.json({ record });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/meetings/recall/transcript-event', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const windowId = typeof req.body?.windowId === 'string' ? req.body.windowId : '';
+    const text = typeof req.body?.text === 'string' ? req.body.text : '';
+    if (!windowId) { res.status(400).json({ error: 'windowId required' }); return; }
+    if (!text.trim()) { res.json({ skipped: true }); return; }
+    try {
+      const record = appendRecallTranscriptSegment({
+        windowId,
+        recordingId: typeof req.body?.recordingId === 'string' ? req.body.recordingId : undefined,
+        event: typeof req.body?.event === 'string' ? req.body.event : 'transcript.data',
+        speaker: typeof req.body?.speaker === 'string' ? req.body.speaker : undefined,
+        text,
+        timestamp: typeof req.body?.timestamp === 'string' ? req.body.timestamp : undefined,
+        isFinal: typeof req.body?.isFinal === 'boolean' ? req.body.isFinal : undefined,
+      });
+      res.json({ record, segmentCount: record.segments.length });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/meetings/recall/complete', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const windowId = typeof req.body?.windowId === 'string' ? req.body.windowId : '';
+    if (!windowId) { res.status(400).json({ error: 'windowId required' }); return; }
+    try {
+      const result = finalizeRecallMeeting({
+        windowId,
+        recordingId: typeof req.body?.recordingId === 'string' ? req.body.recordingId : undefined,
+        platform: typeof req.body?.platform === 'string' ? req.body.platform : undefined,
+        title: typeof req.body?.title === 'string' ? req.body.title : undefined,
+      });
+      if (result.artifactPath) {
+        try { reindexVault(); } catch { /* maintenance will retry */ }
+      }
+      const settings = loadRecallMeetingSettings();
+      const task = result.artifactPath && settings.analyzeOnComplete
+        ? createBackgroundTask({
+          title: `Analyze meeting transcript: ${result.record.title || result.record.platform || result.record.id}`,
+          prompt: [
+            'Analyze this captured meeting transcript and turn it into useful assistant memory and next actions.',
+            '',
+            `Transcript artifact: ${result.artifactPath}`,
+            `Meeting title: ${result.record.title || '(unknown)'}`,
+            `Platform: ${result.record.platform || '(unknown)'}`,
+            '',
+            'Deliver:',
+            '1. Concise meeting summary.',
+            '2. Decisions and commitments.',
+            '3. Action items with owners if inferable.',
+            '4. Suggested follow-up messages or tasks, but do not send/update external tools without approval.',
+          ].join('\n'),
+          source: 'daemon',
+          channel: 'electron:meeting-capture',
+          maxMinutes: 30,
+        })
+        : undefined;
+      res.json({
+        record: result.record,
+        artifactPath: result.artifactPath,
+        segmentCount: result.segmentCount,
+        queuedTask: task ? { id: task.id, title: task.title } : null,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   // ─── Credentials health + management ───────────────────────────
   //
   // Backed by the SecretStore abstraction (src/runtime/secrets). The
@@ -720,7 +1273,7 @@ export function registerConsoleRoutes(
         (acc, d) => { acc[d.name] = { description: d.description, setupHint: d.setupHint, required: d.required, envVarName: d.envVarName }; return acc; },
         {},
       );
-      res.json({ rows, descriptors });
+      res.json({ rows, descriptors, auth: getAuthStatus() });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -957,9 +1510,9 @@ export function registerConsoleRoutes(
     }
     const scopeTtlMs = typeof body.scopeTtlMs === 'number' && body.scopeTtlMs >= 0 ? body.scopeTtlMs : undefined;
     const allowedTools = Array.isArray(body.allowedTools) ? body.allowedTools.filter((t: unknown) => typeof t === 'string') : undefined;
-    const result = approvePlanProposal(req.params.id, { editedPlan, scopeTtlMs, allowedTools });
+    const result = approvePlanAndQueueBackgroundTask(req.params.id, { editedPlan, scopeTtlMs, allowedTools });
     if (!result) { res.status(404).json({ error: 'plan proposal not found or already resolved' }); return; }
-    res.json({ proposal: result });
+    res.json({ proposal: result.proposal, queuedTask: result.task, run: result.run });
   });
 
   app.post('/api/console/plan-proposals/:id/reject', (req, res) => {
@@ -992,5 +1545,466 @@ export function registerConsoleRoutes(
     const scope = closePlanScope(req.params.sessionId, reason);
     if (!scope) { res.status(404).json({ error: 'no scope for that session' }); return; }
     res.json({ scope });
+  });
+
+  // ─── MCP servers (manageable from the Integrations Hub) ────────
+  //
+  // Two sources merge into one list:
+  //   - auto-detected from compatible local MCP client configs
+  //   - user-managed in ~/.clementine-next/mcp/servers.json
+  // User edits only affect the user-managed file. Auto-detected
+  // entries are read-only here; the user toggles them via the user
+  // file (key with same name overrides).
+
+  app.get('/api/console/mcp-servers', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const discovered = discoverMcpServers();
+      const user = loadUserMcpServers();
+      res.json({ servers: discovered, userOverrides: user });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/mcp-servers', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const name = typeof body.name === 'string' ? body.name.trim() : '';
+    if (!name || !/^[A-Za-z0-9_.-]{2,40}$/.test(name)) {
+      res.status(400).json({ error: 'name required (2-40 chars, alphanumeric / _ . -)' });
+      return;
+    }
+    const type = body.type === 'http' || body.type === 'sse' ? body.type : 'stdio';
+    const enabled = body.enabled !== false;
+    const description = typeof body.description === 'string' ? body.description : undefined;
+    const command = typeof body.command === 'string' ? body.command : undefined;
+    const args = Array.isArray(body.args) ? body.args.filter((a): a is string => typeof a === 'string') : undefined;
+    const url = typeof body.url === 'string' ? body.url : undefined;
+    const headers = body.headers && typeof body.headers === 'object' && !Array.isArray(body.headers)
+      ? Object.fromEntries(Object.entries(body.headers as Record<string, unknown>).filter(([, v]) => typeof v === 'string')) as Record<string, string>
+      : undefined;
+    const env = body.env && typeof body.env === 'object' && !Array.isArray(body.env)
+      ? Object.fromEntries(Object.entries(body.env as Record<string, unknown>).filter(([, v]) => typeof v === 'string')) as Record<string, string>
+      : undefined;
+
+    if (type === 'stdio' && !command) {
+      res.status(400).json({ error: 'stdio servers require a command (e.g. "npx @modelcontextprotocol/server-filesystem")' });
+      return;
+    }
+    if ((type === 'http' || type === 'sse') && !url) {
+      res.status(400).json({ error: `${type} servers require a url` });
+      return;
+    }
+
+    try {
+      const current = loadUserMcpServers();
+      current[name] = { name, type, enabled, description, command, args, url, headers, env };
+      saveUserMcpServers(current);
+      // Drop the cached MCP shim + autonomy agents so the next chat
+      // request picks up the new server. No daemon restart needed.
+      await invalidateConfiguredMcpServers();
+      clearAutonomyAgentCache();
+      res.status(201).json({ server: current[name] });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.patch('/api/console/mcp-servers/:name', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const name = req.params.name;
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    try {
+      const current = loadUserMcpServers();
+      const existing = current[name];
+      if (!existing) {
+        // Allow toggling an auto-detected server by writing a minimal
+        // override that ONLY sets the enabled flag. The discoverer
+        // honors user-file values when both exist.
+        const discovered = discoverMcpServers().find((s) => s.name === name);
+        if (!discovered) { res.status(404).json({ error: 'server not found' }); return; }
+        current[name] = {
+          name,
+          type: discovered.type,
+          enabled: typeof body.enabled === 'boolean' ? body.enabled : discovered.enabled,
+          description: discovered.description,
+          command: discovered.command,
+          args: discovered.args,
+          url: discovered.url,
+          headers: discovered.headers,
+          env: discovered.env,
+        };
+      } else {
+        if (typeof body.enabled === 'boolean') existing.enabled = body.enabled;
+        if (typeof body.description === 'string') existing.description = body.description;
+        if (typeof body.command === 'string') existing.command = body.command;
+        if (Array.isArray(body.args)) existing.args = body.args.filter((a: unknown): a is string => typeof a === 'string');
+        if (typeof body.url === 'string') existing.url = body.url;
+        if (body.type === 'http' || body.type === 'sse' || body.type === 'stdio') existing.type = body.type;
+      }
+      saveUserMcpServers(current);
+      await invalidateConfiguredMcpServers();
+      clearAutonomyAgentCache();
+      res.json({ server: current[name] });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // ─── Home panel ────────────────────────────────────────────────
+
+  /**
+   * Today's agenda + completed-today, aggregated across the most useful
+   * surfaces for a single "what's the shape of today" view:
+   *   - pending tasks (TASKS.md)
+   *   - active executions (in_progress)
+   *   - open check-ins waiting on the user
+   *   - completed today: tasks marked done, executions completed,
+   *     runs that finished today.
+   */
+  app.get('/api/console/home/agenda', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const today = new Date().toISOString().slice(0, 10);
+      const agenda: Array<{ kind: string; title: string; meta?: string; sortKey: number }> = [];
+      const done: Array<{ kind: string; title: string; meta?: string; sortKey: number }> = [];
+
+      /**
+       * Tasks/executions created by autonomy agents often:
+       *   - reference T-IDs ("T-019", "T-022")
+       *   - start with "You are the X agent" (instruction dumps)
+       *   - say "Cron job:" (scheduled-run executions)
+       *   - are very long (>180 chars)
+       * These are real commitments but not what the user wants on home.
+       * Score them lower so user-flavored items float up. We don't drop
+       * them entirely — just push them to the "view all" tail.
+       */
+      function looksAgentTracked(text: string): boolean {
+        if (!text) return true; // empty descriptions are noise
+        // Markdown leaks from headers / bold lines that parsed as tasks.
+        if (/^\*\*/.test(text)) return true;
+        if (/^You are (the|operating as)\b/.test(text)) return true;
+        if (/^Cron job:/.test(text)) return true;
+        if (/Execution source:\s*schedule/i.test(text)) return true;
+        // The autonomy loop uses these verbs for its tracking
+        // commitments — they aren't language a user types.
+        // Past-tense agent-commitment verbs — these are how the
+        // autonomy loop logs what it did, not how a user writes a task.
+        if (/^(Reasserted|Reconfirmed|Confirmed|Re-pushed|Repushed|Re-escalated|Locked|Reviewed again|Retain (as|only)|Superseded|Explicitly required|Required (that|same|thread-by-thread)|Forced exact|Keep existing step|Reported|Captured|Acknowledged|Tracked|Promoted|Demoted|Closed out|Marked)\b/.test(text)) return true;
+        // Lane / gate / closeout / output= jargon.
+        if (/\b(lane-closing|bundled operations|blocker-based closeout|gate line|output=(yes|no)|in-thread artifact|scorpion-live-transcript|proposal-brief-builder|kickoff gate|mirrored-diff)\b/i.test(text)) return true;
+        const tIdCount = (text.match(/\bT-\d{2,}\b/g) ?? []).length;
+        return tIdCount >= 1 || text.length > 180;
+      }
+
+      function trimTitle(text: string, max = 120): string {
+        const clean = text.replace(/\s+/g, ' ').trim();
+        return clean.length > max ? clean.slice(0, max) + '…' : clean;
+      }
+
+      // Tasks. Most tasks in this file are agent-tracked operational
+      // commitments (lane closures, blocker tracking, etc.) that aren't
+      // meaningful for a user "what's on my plate" view. Filter by
+      // content shape rather than priority — the autonomy loop tags
+      // everything as !!high, so priority is unreliable here.
+      let pendingTaskCount = 0;
+      let completedTaskCount = 0;
+      if (fs.existsSync(TASKS_FILE)) {
+        const body = fs.readFileSync(TASKS_FILE, 'utf-8');
+        const tasks = parseTasks(body);
+        for (const t of tasks) {
+          const isAgentNoise = looksAgentTracked(t.description);
+          if (t.status === 'pending') {
+            pendingTaskCount++;
+            if (isAgentNoise) continue;
+            const title = trimTitle(t.description || '(untitled task)', 120);
+            agenda.push({
+              kind: 'task',
+              title,
+              meta: [t.id, t.priority === 'high' ? '!!high' : '', t.dueDate ? `📅 ${t.dueDate}` : '', t.project ? `#${t.project}` : ''].filter(Boolean).join(' · '),
+              sortKey: 800,
+            });
+          } else if (t.status === 'completed') {
+            completedTaskCount++;
+            if (isAgentNoise) continue;
+            const title = trimTitle(t.description || '(untitled task)', 120);
+            done.push({
+              kind: 'task',
+              title,
+              meta: t.id,
+              sortKey: 500,
+            });
+          }
+        }
+      }
+
+      // Executions — active work is high-signal, surface above tasks.
+      // We skip cron-spawned + autonomy-prompt-shaped executions; those
+      // are agent self-management, not user-facing items.
+      let hiddenAgentExecs = 0;
+      try {
+        const executionStore = new ExecutionStore();
+        const all = executionStore.list(50);
+        for (const exec of all) {
+          const rawTitle = exec.title || exec.objective || '(execution)';
+          if (looksAgentTracked(rawTitle)) {
+            hiddenAgentExecs++;
+            continue;
+          }
+          const title = trimTitle(rawTitle);
+          if (exec.status === 'active' || exec.status === 'paused' || exec.status === 'blocked') {
+            agenda.push({
+              kind: 'exec',
+              title,
+              meta: exec.nextStep ? `next: ${trimTitle(exec.nextStep, 80)}` : exec.status,
+              sortKey: 1500,
+            });
+          } else if (exec.status === 'completed' && exec.updatedAt && exec.updatedAt.startsWith(today)) {
+            done.push({
+              kind: 'exec',
+              title,
+              meta: `completed ${exec.updatedAt.slice(11, 16)}`,
+              sortKey: 1500,
+            });
+          }
+        }
+      } catch { /* ignore — execution store may not exist yet */ }
+
+      // Open check-ins — these are waiting on the user, surface FIRST.
+      try {
+        const open = listOpenCheckIns();
+        for (const c of open) {
+          agenda.push({
+            kind: 'checkin',
+            title: c.question || '(check-in)',
+            meta: c.urgency !== 'normal' ? `[${c.urgency}] asked ${c.askedAt.slice(11, 16)}` : `asked ${c.askedAt.slice(11, 16)}`,
+            sortKey: 2000,
+          });
+        }
+      } catch { /* ignore */ }
+
+      // Sort highest-sortKey first (user-flavored, recent, high-priority).
+      agenda.sort((a, b) => b.sortKey - a.sortKey);
+      done.sort((a, b) => b.sortKey - a.sortKey);
+
+      res.json({
+        agenda: agenda.slice(0, 15).map(({ sortKey, ...rest }) => rest),
+        done: done.slice(0, 10).map(({ sortKey, ...rest }) => rest),
+        // Counts so the dashboard can show "X total" + "+ N more" hints.
+        totals: {
+          pendingTasks: pendingTaskCount,
+          completedTasks: completedTaskCount,
+        },
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * Chat-with-Clementine endpoint for the Home panel. Wraps
+   * assistant.respond with a stable session id so the conversation
+   * carries across reloads.
+   */
+  app.post('/api/console/home/chat/stream', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const body = req.body ?? {};
+    const message = typeof body.message === 'string' ? body.message.trim() : '';
+    if (!message) { res.status(400).json({ error: 'message required' }); return; }
+
+    res.status(200);
+    res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders?.();
+
+    let closed = false;
+    res.on('close', () => { closed = true; });
+    const writeEvent = (event: Record<string, unknown>) => {
+      if (closed || res.destroyed) return;
+      res.write(`${JSON.stringify(event)}\n`);
+    };
+
+    try {
+      writeEvent({ type: 'status', text: 'Clementine run started.' });
+      const response = await assistant.respond({
+        message,
+        sessionId: 'console:home',
+        channel: 'cli',
+        userId: 'console',
+        onChunk: (delta) => {
+          writeEvent({ type: 'chunk', delta });
+        },
+        onToolActivity: (activity) => {
+          writeEvent({
+            type: 'tool',
+            toolName: activity.toolName,
+            input: activity.input,
+          });
+        },
+        onReasoning: () => {
+          writeEvent({ type: 'status', text: 'Clementine is planning the next step.' });
+        },
+        shouldCancel: () => closed,
+      });
+      writeEvent({
+        type: 'done',
+        text: response.text,
+        pendingApprovalId: response.pendingApprovalId ?? null,
+      });
+      res.end();
+    } catch (err) {
+      writeEvent({ type: 'error', error: err instanceof Error ? err.message : String(err) });
+      res.end();
+    }
+  });
+
+  app.post('/api/console/home/chat', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const body = req.body ?? {};
+    const message = typeof body.message === 'string' ? body.message.trim() : '';
+    if (!message) { res.status(400).json({ error: 'message required' }); return; }
+    try {
+      const response = await assistant.respond({
+        message,
+        sessionId: 'console:home',
+        channel: 'cli',
+        userId: 'console',
+      });
+      res.json({ text: response.text, pendingApprovalId: response.pendingApprovalId });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * Mint a short-lived Realtime client secret for the Electron/browser
+   * home voice panel. The renderer never receives the long-lived
+   * OpenAI API key; it only receives the ephemeral secret returned by
+   * OpenAI's Realtime API.
+   */
+  app.post('/api/console/realtime/session', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+
+    const apiKey = getOpenAiApiKey();
+    if (!apiKey) {
+      res.status(400).json({
+        error: 'Live voice needs the optional OpenAI API key. Codex OAuth can still run the agent; add the key in Settings → Runtime Auth & Capability Keys to enable voice.',
+      });
+      return;
+    }
+
+    const body = req.body ?? {};
+    const requestedVoice = typeof body.voice === 'string' ? body.voice : '';
+    const requestedModel = typeof body.model === 'string' ? body.model : '';
+    const sessionId = typeof body.sessionId === 'string' && body.sessionId.trim()
+      ? body.sessionId.trim().slice(0, 120)
+      : 'console:home';
+    const voice = requestedVoice || getRuntimeEnv('OPENAI_REALTIME_VOICE', 'marin');
+    const model = requestedModel || getRuntimeEnv('OPENAI_REALTIME_MODEL', 'gpt-realtime');
+    const transcriptionModel = getRuntimeEnv('OPENAI_REALTIME_TRANSCRIBE_MODEL', 'gpt-4o-mini-transcribe');
+    const instructions = buildRealtimeVoiceInstructions(sessionId);
+
+    const session = {
+      session: {
+        type: 'realtime',
+        model,
+        instructions,
+        audio: {
+          input: {
+            transcription: { model: transcriptionModel },
+            turn_detection: {
+              type: 'server_vad',
+              threshold: realtimeNumberEnv('OPENAI_REALTIME_VAD_THRESHOLD', 0.55, 0.1, 0.95),
+              prefix_padding_ms: realtimeNumberEnv('OPENAI_REALTIME_PREFIX_PADDING_MS', 350, 0, 1500),
+              silence_duration_ms: realtimeNumberEnv('OPENAI_REALTIME_SILENCE_MS', 430, 150, 2000),
+              idle_timeout_ms: realtimeNumberEnv('OPENAI_REALTIME_IDLE_TIMEOUT_MS', 6500, 1000, 30000),
+              interrupt_response: true,
+              create_response: true,
+            },
+          },
+          output: { voice },
+        },
+        tools: [
+          {
+            type: 'function',
+            name: 'send_to_clementine',
+            description: 'Send a spoken user request to the local Clementine agent for tool use, local computer actions, project work, approvals, or long-running execution.',
+            parameters: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                request: {
+                  type: 'string',
+                  description: 'The exact user request to send to Clementine.',
+                },
+                reason: {
+                  type: 'string',
+                  description: 'Why this request should be handled by the local agent instead of only the realtime voice model.',
+                },
+              },
+              required: ['request', 'reason'],
+            },
+          },
+        ],
+        tool_choice: 'auto',
+      },
+      expires_after: {
+        anchor: 'created_at',
+        seconds: 600,
+      },
+    };
+
+    try {
+      const response = await fetch('https://api.openai.com/v1/realtime/client_secrets', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(session),
+      });
+
+      const text = await response.text();
+      let payload: unknown;
+      try {
+        payload = JSON.parse(text);
+      } catch {
+        payload = { raw: text };
+      }
+
+      if (!response.ok) {
+        res.status(response.status).json({
+          error: 'Failed to create Realtime client secret.',
+          details: payload,
+        });
+        return;
+      }
+
+      res.json({
+        ...(payload && typeof payload === 'object' ? payload as Record<string, unknown> : { value: payload }),
+        model,
+        voice,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.delete('/api/console/mcp-servers/:name', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const name = req.params.name;
+    try {
+      const current = loadUserMcpServers();
+      if (!current[name]) { res.status(404).json({ error: 'server not in user overrides' }); return; }
+      delete current[name];
+      saveUserMcpServers(current);
+      await invalidateConfiguredMcpServers();
+      clearAutonomyAgentCache();
+      res.json({ deleted: true });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
   });
 }

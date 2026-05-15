@@ -11,8 +11,8 @@ import type {
 } from '../types.js';
 import { AgentRuntimeCancelledError, type AgentRuntime, type AgentRuntimeCallbacks } from './provider.js';
 import { ApprovalStore } from './approval-store.js';
-import { getCoreTools } from '../tools/registry.js';
-import { createConfiguredMcpServers } from './mcp-servers.js';
+import { getCoreToolsAsync } from '../tools/registry.js';
+import { getOrCreateConfiguredMcpServers } from './mcp-servers.js';
 import { addNotification } from './notifications.js';
 import { defaultOrchestratorHandoffs } from '../agents/sub-agents.js';
 import { buildPlannerTool } from '../agents/planner.js';
@@ -84,7 +84,15 @@ function toolActivityFromRunItem(item: unknown): ToolActivity | null {
 export class OpenAIRuntime implements AgentRuntime {
   private readonly runner: Runner;
   private readonly approvals = new ApprovalStore();
-  private readonly mcpServers = createConfiguredMcpServers();
+  // Single namespaced shim wrapping every configured MCP server.
+  // Wrapped in an array because the SDK signature is `mcpServers: MCPServer[]`.
+  // The shim itself flattens N underlying servers into one tool surface
+  // with `<server>__<tool>` names, eliminating duplicate-name throws.
+  // Lazily resolved on each agent build so dashboard MCP edits land on
+  // the next request (invalidateConfiguredMcpServers() drops the cache).
+  private get mcpServers() {
+    return [getOrCreateConfiguredMcpServers()];
+  }
 
   constructor() {
     if (OPENAI_API_KEY) {
@@ -97,7 +105,18 @@ export class OpenAIRuntime implements AgentRuntime {
     });
   }
 
-  private createAgent(request: RunRequest): Agent<RuntimeContextValue> {
+  private async createAgent(request: RunRequest): Promise<Agent<RuntimeContextValue>> {
+    // Expose every ACTIVE Composio toolkit action as a first-class
+    // tool the model can call directly (`cx_<slug>`). Same principle
+    // as the MCP namespace shim — the model is far more reliable
+    // calling real, schema-visible tools than chasing a broker layer
+    // through composio_search_tools → composio_execute_tool. The
+    // Composio client caches the toolkit catalog for 60min and active
+    // connections for 60s, so this does not add per-chat latency.
+    // The broker tools (composio_status / _search / _list / _execute)
+    // remain available as a fallback for ad-hoc lookups and for
+    // toolkits whose connections aren't ACTIVE yet.
+    const tools = await getCoreToolsAsync({ includeDynamicComposioTools: true });
     return new Agent<RuntimeContextValue>({
       name: ASSISTANT_NAME,
       instructions:
@@ -107,13 +126,13 @@ export class OpenAIRuntime implements AgentRuntime {
       // Core tool surface plus the Planner-as-tool — the orchestrator
       // can invoke `draft_plan` to think before executing on complex
       // multi-step work without transferring control.
-      tools: [...getCoreTools(), buildPlannerTool()],
+      tools: [...tools, buildPlannerTool()],
       // Chat path runs as the orchestrator: it can hand off to specialized
       // sub-agents (Researcher / Writer / Reviewer / Executor / Deployer)
       // exactly like the autonomy path. The Executor + Deployer handoffs
       // are gated behind an active tracked execution so risky mutations
       // require the user to promote work into a tracked task first.
-      handoffs: defaultOrchestratorHandoffs({ requireWorkflowApprovalForExecution: true }),
+      handoffs: await defaultOrchestratorHandoffs({ requireWorkflowApprovalForExecution: true }),
       mcpServers: this.mcpServers,
     });
   }
@@ -166,7 +185,7 @@ export class OpenAIRuntime implements AgentRuntime {
       throw new Error(`Approval ${approvalId} not found.`);
     }
 
-    const agent = this.createAgent({
+    const agent = await this.createAgent({
       sessionId: approval.sessionId,
       prompt: '',
       model: MODELS.primary,
@@ -215,6 +234,7 @@ export class OpenAIRuntime implements AgentRuntime {
         status: resolutionStatus,
         sessionId: approval.sessionId,
         text: `Resolved ${approvalId}. Another approval is required: ${followUpId}`,
+        nextApprovalId: followUpId,
       };
       this.notifyApprovalResolved(outcome, approval, approved);
       this.notifyApprovalPending({
@@ -251,7 +271,7 @@ export class OpenAIRuntime implements AgentRuntime {
 	    if (await callbacks?.shouldCancel?.()) {
 	      throw new AgentRuntimeCancelledError();
 	    }
-	    const agent = this.createAgent(request);
+	    const agent = await this.createAgent(request);
 
     const context: RuntimeContextValue = {
       sessionId: request.sessionId ?? randomUUID(),

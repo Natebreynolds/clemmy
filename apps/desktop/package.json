@@ -34,6 +34,9 @@
       "buildResources": "build",
       "output": "release"
     },
+    "asarUnpack": [
+      "node_modules/@recallai/desktop-sdk/**"
+    ],
     "files": [
       "dist/**/*",
       "package.json"
@@ -68,10 +71,31 @@
       "icon": "build/icon.icns",
       "hardenedRuntime": true,
       "gatekeeperAssess": false,
+      "extendInfo": {
+        "NSHumanReadableCopyright": "Clementine",
+        "NSMicrophoneUsageDescription": "Clementine needs the microphone for live voice commands and optional meeting capture.",
+        "NSScreenCaptureUsageDescription": "Clementine needs screen capture for optional meeting capture and screen-aware assistance.",
+        "NSCameraUsageDescription": "Clementine needs the camera only for optional video meeting capture.",
+        "NSCalendarsUsageDescription": "Clementine reads your calendar to surface upcoming meetings, attach context, and trigger meeting capture.",
+        "NSRemindersUsageDescription": "Clementine reads and writes Reminders so it can sync tasks across your devices.",
+        "NSContactsUsageDescription": "Clementine reads Contacts to identify meeting participants and draft messages to the right people.",
+        "NSAccessibilityUsageDescription": "Clementine needs Accessibility access to observe active windows and route commands to the right app, like an assistant looking over your shoulder.",
+        "NSAppleEventsUsageDescription": "Clementine sends commands to other apps (Mail, Calendar, Finder, etc.) so it can do work on your behalf without you switching windows.",
+        "NSSystemAdministrationUsageDescription": "Clementine occasionally needs admin access for setup tasks like installing CLIs or configuring local services.",
+        "NSDownloadsFolderUsageDescription": "Clementine reads and writes the Downloads folder when you ask it to grab files or save research artifacts.",
+        "NSDocumentsFolderUsageDescription": "Clementine reads and writes the Documents folder when you ask it to work on local files.",
+        "NSDesktopFolderUsageDescription": "Clementine reads and writes the Desktop when you ask it to work on files there.",
+        "NSPhotoLibraryUsageDescription": "Clementine reads Photos when you reference images in a chat or workflow.",
+        "NSLocationWhenInUseUsageDescription": "Clementine uses location only when a workflow you start explicitly asks for it.",
+        "NSBluetoothAlwaysUsageDescription": "Clementine uses Bluetooth only for accessory integrations you opt into.",
+        "NSLocalNetworkUsageDescription": "Clementine talks to local services (its own daemon, optional Pinecone/Supabase/etc. running locally) over your local network.",
+        "NSUserNotificationsUsageDescription": "Clementine sends notifications about completed work, pending approvals, and check-ins.",
+        "NSFocusStatusUsageDescription": "Clementine reads Focus state so it knows when to stay quiet."
+      },
       "entitlements": "build/entitlements.mac.plist",
       "entitlementsInherit": "build/entitlements.mac.plist",
       "identity": "Nathan Reynolds (4AR3Y8XD72)",
-      "notarize": false,
+      "notarize": true,
       "target": [
         {
           "target": "dmg",
@@ -129,5 +153,8 @@
         "releaseType": "release"
       }
     ]
+  },
+  "optionalDependencies": {
+    "@recallai/desktop-sdk": "2.0.14"
   }
 }

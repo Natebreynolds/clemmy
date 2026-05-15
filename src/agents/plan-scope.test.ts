@@ -21,6 +21,7 @@ process.env.CLEMENTINE_HOME = TEST_HOME;
 const {
   DEFAULT_SCOPE_ALLOWED_TOOLS,
   closePlanScope,
+  evaluateAutoApprove,
   getPlanScope,
   isAutoApprovedByScope,
   listActiveScopes,
@@ -200,4 +201,48 @@ test('summarizeToolArgs: generic fallback for unknown tools', () => {
   const s = summarizeToolArgs('something_else', { foo: 'bar', count: 3 });
   assert.match(s, /foo=bar/);
   assert.match(s, /count=3/);
+});
+
+// ─── evaluateAutoApprove (policy + scope layering) ─────────────
+
+test('evaluateAutoApprove: strict + no plan scope = denied', () => {
+  const d = evaluateAutoApprove({ sessionId: 'sess-x', toolName: 'run_shell_command', scope: 'strict', insideWorkspace: true });
+  assert.equal(d.autoApproved, false);
+  assert.equal(d.reason, 'denied');
+});
+
+test('evaluateAutoApprove: strict + active plan scope = auto via plan-scope', () => {
+  openPlanScope({ sessionId: 'sess-plan', planProposalId: 'plan-1', approvedPlanObjective: 'objective' });
+  const d = evaluateAutoApprove({ sessionId: 'sess-plan', toolName: 'run_shell_command', scope: 'strict', insideWorkspace: false });
+  assert.equal(d.autoApproved, true);
+  assert.equal(d.reason, 'plan-scope');
+});
+
+test('evaluateAutoApprove: workspace + inside workspace = auto', () => {
+  const d = evaluateAutoApprove({ sessionId: 'sess-w', toolName: 'run_shell_command', scope: 'workspace', insideWorkspace: true });
+  assert.equal(d.autoApproved, true);
+  assert.equal(d.reason, 'workspace-policy');
+});
+
+test('evaluateAutoApprove: workspace + outside workspace = denied', () => {
+  const d = evaluateAutoApprove({ sessionId: 'sess-out', toolName: 'run_shell_command', scope: 'workspace', insideWorkspace: false });
+  assert.equal(d.autoApproved, false);
+});
+
+test('evaluateAutoApprove: yolo = auto regardless of workspace', () => {
+  const d1 = evaluateAutoApprove({ sessionId: 'sess-y1', toolName: 'run_shell_command', scope: 'yolo', insideWorkspace: false });
+  const d2 = evaluateAutoApprove({ sessionId: 'sess-y2', toolName: 'write_file', scope: 'yolo', insideWorkspace: true });
+  assert.equal(d1.autoApproved, true);
+  assert.equal(d1.reason, 'yolo-policy');
+  assert.equal(d2.autoApproved, true);
+  assert.equal(d2.reason, 'yolo-policy');
+});
+
+test('evaluateAutoApprove: plan-scope wins over policy reason when both fire', () => {
+  openPlanScope({ sessionId: 'sess-both', planProposalId: 'plan-2', approvedPlanObjective: 'both' });
+  const d = evaluateAutoApprove({ sessionId: 'sess-both', toolName: 'run_shell_command', scope: 'yolo', insideWorkspace: true });
+  assert.equal(d.autoApproved, true);
+  // plan-scope takes precedence so the audit log reflects the user's
+  // explicit approval rather than the catch-all yolo policy.
+  assert.equal(d.reason, 'plan-scope');
 });

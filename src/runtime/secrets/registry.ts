@@ -20,7 +20,7 @@ import type { SecretDescriptor, SecretName } from './types.js';
 export const SECRET_DESCRIPTORS: readonly SecretDescriptor[] = [
   {
     name: 'openai_api_key',
-    description: 'OpenAI API key — unlocks the Agents SDK streaming runtime, embeddings, and structured outputs.',
+    description: 'Optional OpenAI API key — enables embeddings, Realtime live voice, and direct OpenAI API features. Not required when the agent runtime uses Codex OAuth.',
     envVarName: 'OPENAI_API_KEY',
     required: false, // codex_oauth path can substitute for some workloads
     setupHint: 'Get one at https://platform.openai.com/api-keys. Starts with sk-.',
@@ -40,14 +40,21 @@ export const SECRET_DESCRIPTORS: readonly SecretDescriptor[] = [
     setupHint: 'Sign up at https://composio.dev and create an API key.',
   },
   {
+    name: 'recall_api_key',
+    description: 'Recall.ai API key — optional desktop meeting capture for Zoom, Meet, Teams, Slack Huddles, and in-person meetings.',
+    envVarName: 'RECALL_API_KEY',
+    required: false,
+    setupHint: 'Sign up at https://www.recall.ai and create an API key for Desktop Recording SDK uploads.',
+  },
+  {
     name: 'codex_oauth_access_token',
-    description: 'Codex OAuth access token — auth path for ChatGPT/Codex subscribers without an OpenAI API key.',
+    description: 'Codex OAuth access token — primary agent runtime auth for ChatGPT/Codex subscribers.',
     envVarName: '', // populated by clementine auth login-native, not from env
     required: false,
   },
   {
     name: 'codex_oauth_refresh_token',
-    description: 'Codex OAuth refresh token — paired with the access token, used to renew it silently.',
+    description: 'Codex OAuth refresh token — paired with the access token so the agent runtime can renew ChatGPT/Codex auth silently.',
     envVarName: '',
     required: false,
   },

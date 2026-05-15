@@ -190,7 +190,7 @@ export class DaemonSupervisor {
   }
 
   getDashboardUrl(token?: string): string {
-    const base = `http://localhost:${this.chosenPort}/dashboard`;
+    const base = `http://localhost:${this.chosenPort}/console`;
     return token ? `${base}?token=${encodeURIComponent(token)}` : base;
   }
 
@@ -217,22 +217,22 @@ export class DaemonSupervisor {
     const tsEntry = path.join(this.opts.daemonProjectRoot, 'src', 'index.ts');
     const jsEntry = path.join(this.opts.daemonProjectRoot, 'dist', 'index.js');
 
-    if (existsSync(jsEntry)) {
-      // In a packaged Electron app, process.execPath is Electron itself.
-      // ELECTRON_RUN_AS_NODE=1 (set in the spawn env) makes it behave
-      // like Node. In dev (running under tsx), process.execPath is the
-      // real Node binary — runAsNode=true is harmless there.
-      return { command: process.execPath, args: [jsEntry, 'service'], runAsNode: true };
-    }
     if (existsSync(tsEntry)) {
-      // Use tsx from the daemon project's node_modules so versions
-      // match the rest of the project.
+      // Prefer the source entry in dev, even when dist/ exists. Running the
+      // daemon through Electron-as-Node in dev forces native modules such as
+      // better-sqlite3 to match Electron's ABI instead of the repo's Node ABI.
       const localTsx = path.join(this.opts.daemonProjectRoot, 'node_modules', '.bin', 'tsx');
       if (existsSync(localTsx)) {
         return { command: localTsx, args: [tsEntry, 'service'], runAsNode: false };
       }
       // Fallback to npx (slower first run, but works).
       return { command: 'npx', args: ['tsx', tsEntry, 'service'], runAsNode: false };
+    }
+    if (existsSync(jsEntry)) {
+      // In a packaged Electron app, process.execPath is Electron itself.
+      // ELECTRON_RUN_AS_NODE=1 (set in the spawn env) makes it behave
+      // like Node.
+      return { command: process.execPath, args: [jsEntry, 'service'], runAsNode: true };
     }
     throw new Error(`No daemon entry found in ${this.opts.daemonProjectRoot} (expected dist/index.js or src/index.ts)`);
   }

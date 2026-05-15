@@ -16,7 +16,7 @@ into a normal app surface (tray, notifications, log viewer, restarts).
 │       • Native notifications                             │
 │       • IPC bridge (Keychain access via SecretStore)     │
 │   - Preload (src/preload.ts) — narrow window.clemmy API  │
-│   - Renderer = the existing /console + /dashboard pages  │
+│   - Renderer = the /console UI served by the daemon       │
 │     served by the daemon                                 │
 └──────────────────────────────────────────────────────────┘
                           │

@@ -12,10 +12,11 @@ These exercise the code we shipped without needing OpenAI access.
 npx tsx --test src/**/*.test.ts
 ```
 
-Expect **155 tests pass, ~1.5s**. Covers memory, recall, embeddings,
-facts, autonomy guardrails, run-tracking, autonomy-v2 helpers,
-check-ins, sub-agents, user profile, channel directives,
-local-runtime tools.
+Expect **354 tests pass across 27 files** (~30s total). Covers memory,
+recall, embeddings, facts, autonomy guardrails, run-tracking, autonomy-v2
+helpers, check-ins, sub-agents, user profile, channel directives,
+local-runtime tools, tool taxonomy + observability, MCP namespace shim,
+plan scopes, and the credential store.
 
 ### Typecheck the whole project
 
@@ -162,7 +163,7 @@ npm run daemon:stop
 With the webhook server running, open:
 
 ```
-http://localhost:8420/dashboard?token=YOUR_WEBHOOK_SECRET
+http://localhost:8420/console?token=YOUR_WEBHOOK_SECRET
 ```
 
 (Set `WEBHOOK_SECRET` in `.env`. Without it, dashboard auth is disabled

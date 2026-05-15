@@ -46,9 +46,16 @@ npm run build:daemon
 echo "→ electron-builder mac (sign + notarize + dmg + zip)"
 # CSC_IDENTITY_AUTO_DISCOVERY=true lets electron-builder find the
 # Developer ID cert in your local keychain.
+#
+# electron-builder >=25 reads its own built-in notarize step from
+# APPLE_APP_SPECIFIC_PASSWORD (not APPLE_APP_PASSWORD), so we export
+# both names. The custom afterSign hook reads APPLE_APP_PASSWORD; the
+# built-in step reads APPLE_APP_SPECIFIC_PASSWORD. Setting both keeps
+# both code paths happy regardless of which actually fires.
 CSC_IDENTITY_AUTO_DISCOVERY=true \
 APPLE_ID="$APPLE_ID" \
 APPLE_APP_PASSWORD="$APPLE_APP_PASSWORD" \
+APPLE_APP_SPECIFIC_PASSWORD="$APPLE_APP_PASSWORD" \
 APPLE_TEAM_ID="$APPLE_TEAM_ID" \
 npx electron-builder --mac
 

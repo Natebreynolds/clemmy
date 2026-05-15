@@ -8,6 +8,7 @@ import { SessionStore } from '../memory/session-store.js';
 import type { AssistantRequest, AssistantResponse } from '../types.js';
 import { PlanStore } from '../planning/plan-store.js';
 import { refreshWorkingMemory } from '../memory/working-memory.js';
+import { captureInteractionSignals } from '../memory/auto-capture.js';
 import { refineActivePlanFromMessage } from '../planning/refinement.js';
 import { buildAssistantInstructions } from './instructions.js';
 import type { AgentRuntime } from '../runtime/provider.js';
@@ -49,6 +50,23 @@ export class ClementineAssistant {
     );
     refineActivePlanFromMessage(request.sessionId, request.message);
     const executionTrackingEnabled = shouldUseExecutionTracking(request);
+    if (executionTrackingEnabled) {
+      const captured = captureInteractionSignals({
+        message: request.message,
+        sessionId: request.sessionId,
+      });
+      if (request.runId && (captured.facts.length > 0 || captured.profilePatch)) {
+        addRunEvent(request.runId, {
+          type: 'status',
+          message: `Captured ${captured.facts.length} durable memory signal${captured.facts.length === 1 ? '' : 's'}${captured.profilePatch ? ' and updated profile preferences' : ''}.`,
+          data: {
+            factIds: captured.facts.map((fact) => fact.id),
+            profilePatch: captured.profilePatch,
+            reasons: captured.candidates.map((candidate) => candidate.reason),
+          },
+        });
+      }
+    }
     const activeExecutionBeforeReply = executionTrackingEnabled
       ? this.executions.getActiveForSession(request.sessionId)
       : undefined;

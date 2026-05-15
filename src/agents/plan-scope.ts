@@ -170,6 +170,42 @@ export function isAutoApprovedByScope(sessionId: string | undefined, toolName: s
 }
 
 /**
+ * Evaluate the user's global auto-approve policy. Layered on top of
+ * `isAutoApprovedByScope`:
+ *
+ *   strict    → defer to plan-scope only
+ *   workspace → also auto-approve when the tool's cwd / path resolves
+ *               inside a configured workspace dir
+ *   yolo      → auto-approve everything (the danger denylist on the
+ *               tool itself still applies — it's the safety floor)
+ *
+ * Returns the reason for auto-approval so the audit trail captures
+ * why a call ran without human approval.
+ */
+export interface AutoApproveDecision {
+  autoApproved: boolean;
+  reason: 'plan-scope' | 'workspace-policy' | 'yolo-policy' | 'denied';
+}
+
+export function evaluateAutoApprove(input: {
+  sessionId: string | undefined;
+  toolName: string;
+  scope: 'strict' | 'workspace' | 'yolo';
+  insideWorkspace: boolean;
+}): AutoApproveDecision {
+  if (isAutoApprovedByScope(input.sessionId, input.toolName)) {
+    return { autoApproved: true, reason: 'plan-scope' };
+  }
+  if (input.scope === 'yolo') {
+    return { autoApproved: true, reason: 'yolo-policy' };
+  }
+  if (input.scope === 'workspace' && input.insideWorkspace) {
+    return { autoApproved: true, reason: 'workspace-policy' };
+  }
+  return { autoApproved: false, reason: 'denied' };
+}
+
+/**
  * Record that a tool call was auto-approved by an active scope. Call
  * this from the same code path that returns true from
  * `isAutoApprovedByScope` so the audit trail stays in sync with what

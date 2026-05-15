@@ -17,6 +17,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { DaemonSupervisor, locateDaemonProjectRoot, type SupervisorEvent } from './daemon-supervisor.js';
 import { needsSetup, hasCompletedSetup, writeSetupComplete, type SetupConfiguredSummary } from './setup-state.js';
 import { createSetupWindow } from './setup-window.js';
+import { RecallDesktopCapture, type RecallCaptureSettings } from './recall-capture.js';
 import {
   deleteCredential,
   ensureWebhookSecret,
@@ -69,6 +70,7 @@ let splashWindow: BrowserWindow | null = null;
 let setupWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let dashboardUrl = '';
+let recallCapture: RecallDesktopCapture | null = null;
 
 function getWebhookSecret(): string {
   // Read the same secret the daemon will read so the dashboard URL we
@@ -227,7 +229,7 @@ function rebuildTrayMenu(): void {
         }
       },
     },
-    { label: 'Open Dashboard in Browser', click: () => dashboardUrl && shell.openExternal(dashboardUrl) },
+    { label: 'Open Console in Browser', click: () => dashboardUrl && shell.openExternal(dashboardUrl) },
     { label: 'Open Log File', click: () => shell.openPath(LOG_FILE) },
     { type: 'separator' },
     { label: 'Restart Daemon', click: () => supervisor?.restart() },
@@ -240,6 +242,7 @@ function rebuildTrayMenu(): void {
 
 async function quitCleanly(): Promise<void> {
   (app as { isQuitting?: boolean }).isQuitting = true;
+  await recallCapture?.shutdown().catch(() => { /* ignore */ });
   await supervisor?.stop().catch(() => { /* ignore */ });
   app.quit();
 }
@@ -309,6 +312,15 @@ async function launchDaemon(): Promise<void> {
   splashWindow = createSplashWindow();
 
   const daemonRoot = locateDaemonProjectRoot();
+  if (!recallCapture) {
+    recallCapture = new RecallDesktopCapture({
+      getDaemonBaseUrl: () => supervisor?.getPort() ? `http://localhost:${supervisor.getPort()}` : '',
+      getWebhookToken: () => getWebhookSecret(),
+      emit: (event) => {
+        mainWindow?.webContents.send('clemmy:recall-event', event);
+      },
+    });
+  }
 
   supervisor = new DaemonSupervisor({
     daemonProjectRoot: daemonRoot,
@@ -327,11 +339,22 @@ async function launchDaemon(): Promise<void> {
     const info = await supervisor.start();
     const token = getWebhookSecret();
     dashboardUrl = token ? `${info.url}/console?token=${encodeURIComponent(token)}` : `${info.url}/console`;
+    await syncRecallCaptureFromDaemon().catch((error) => {
+      console.error('[recall] initial sync failed:', error instanceof Error ? error.message : error);
+    });
     mainWindow = createMainWindow(dashboardUrl);
     mainWindow.once('ready-to-show', () => {
       mainWindow?.show();
       splashWindow?.close();
       splashWindow = null;
+    });
+    // Surface real renderer failures (rare) so a packaged user can see
+    // them in Console.app instead of staring at a blank window.
+    mainWindow.webContents.on('did-fail-load', (_e, code, desc, url) => {
+      console.error('[main] renderer did-fail-load', code, desc, url);
+    });
+    mainWindow.webContents.on('render-process-gone', (_e, details) => {
+      console.error('[main] renderer process gone', JSON.stringify(details));
     });
     rebuildTrayMenu();
   } catch (err) {
@@ -342,6 +365,30 @@ async function launchDaemon(): Promise<void> {
       'Clementine couldn\'t start the daemon',
       `${msg}\n\nLog file: ${LOG_FILE}\n\nTry restarting Clementine or open the log to investigate.`,
     );
+  }
+}
+
+async function fetchDaemonJson<T>(pathname: string, init?: RequestInit): Promise<T> {
+  const port = supervisor?.getPort();
+  const token = getWebhookSecret();
+  if (!port || !token) throw new Error('daemon is not ready');
+  const url = new URL(pathname, `http://localhost:${port}`);
+  url.searchParams.set('token', token);
+  const response = await fetch(url, init);
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const message = payload && typeof payload === 'object' && 'error' in payload
+      ? String((payload as { error?: unknown }).error)
+      : `${response.status} ${response.statusText}`;
+    throw new Error(message);
+  }
+  return payload as T;
+}
+
+async function syncRecallCaptureFromDaemon(): Promise<void> {
+  const payload = await fetchDaemonJson<{ settings?: RecallCaptureSettings }>('/api/console/meetings/recall');
+  if (payload.settings) {
+    await recallCapture?.configure(payload.settings);
   }
 }
 
@@ -368,6 +415,27 @@ ipcMain.handle('clemmy:open-logs', async () => {
   return { opened: true };
 });
 
+ipcMain.handle('clemmy:recall-status', async () => {
+  await syncRecallCaptureFromDaemon().catch(() => { /* status still returns local state */ });
+  return recallCapture?.status() ?? null;
+});
+
+ipcMain.handle('clemmy:recall-configure', async (_evt: IpcMainInvokeEvent, settings: Partial<RecallCaptureSettings>) => {
+  return recallCapture?.configure(settings ?? {}) ?? null;
+});
+
+ipcMain.handle('clemmy:recall-request-permissions', async () => {
+  return recallCapture?.requestPermissions() ?? null;
+});
+
+ipcMain.handle('clemmy:recall-start-manual', async () => {
+  return recallCapture?.startManualRecording() ?? null;
+});
+
+ipcMain.handle('clemmy:recall-stop', async () => {
+  return recallCapture?.stopRecording() ?? null;
+});
+
 // ─── Setup wizard IPC handlers ─────────────────────────────────────
 
 ipcMain.handle('clemmy:setup-status', async () => ({
@@ -383,7 +451,7 @@ ipcMain.handle('clemmy:credentials-list', async () => {
 
 ipcMain.handle('clemmy:credentials-set', async (_evt: IpcMainInvokeEvent, payload: { name: string; value: string }) => {
   const knownNames: CredentialName[] = [
-    'openai_api_key', 'discord_bot_token', 'composio_api_key',
+    'openai_api_key', 'discord_bot_token', 'composio_api_key', 'recall_api_key',
     'codex_oauth_access_token', 'codex_oauth_refresh_token', 'webhook_secret',
   ];
   if (!knownNames.includes(payload.name as CredentialName)) {
@@ -394,7 +462,7 @@ ipcMain.handle('clemmy:credentials-set', async (_evt: IpcMainInvokeEvent, payloa
 
 ipcMain.handle('clemmy:credentials-delete', async (_evt: IpcMainInvokeEvent, payload: { name: string }) => {
   const knownNames: CredentialName[] = [
-    'openai_api_key', 'discord_bot_token', 'composio_api_key',
+    'openai_api_key', 'discord_bot_token', 'composio_api_key', 'recall_api_key',
     'codex_oauth_access_token', 'codex_oauth_refresh_token', 'webhook_secret',
   ];
   if (!knownNames.includes(payload.name as CredentialName)) {

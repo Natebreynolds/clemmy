@@ -1,7 +1,43 @@
+# Dependencies
 node_modules/
 dist/
+
+# Environment + secrets — NEVER commit
 .env
 .env.local
-*.tgz
+.env.production
+.env.development
+.env.*.local
+
+# Logs
 *.log
+logs/
+
+# Build / packaging artifacts
+*.tgz
+release/
+*.dmg
+*.zip
+*.AppImage
+*.exe
+*.pkg
+
+# Editor / OS
 .DS_Store
+*.swp
+*.swo
+.vscode/
+.idea/
+.history/
+
+# Local scratch dirs
+.firecrawl/
+.tmp/
+tmp/
+
+# Test artifacts
+coverage/
+.nyc_output/
+
+# TypeScript build info
+*.tsbuildinfo

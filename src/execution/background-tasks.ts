@@ -48,6 +48,11 @@ export interface BackgroundTaskRecord {
   resultPath?: string;
   error?: string;
   pendingApprovalId?: string;
+  approvalResolution?: {
+    approvalId: string;
+    approved: boolean;
+    queuedAt: string;
+  };
   resumedFromTaskId?: string;
   resumeCount?: number;
   lastCheckInAt?: string;
@@ -238,6 +243,11 @@ export function listBackgroundTasks(filter: { status?: BackgroundTaskStatus; use
     .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
 }
 
+export function getBackgroundTaskByApprovalId(approvalId: string): BackgroundTaskRecord | null {
+  if (!approvalId) return null;
+  return listBackgroundTasks().find((task) => task.pendingApprovalId === approvalId) ?? null;
+}
+
 export function updateBackgroundTask(id: string, patch: Partial<Omit<BackgroundTaskRecord, 'id' | 'createdAt'>>): BackgroundTaskRecord | null {
   const task = getBackgroundTask(id);
   if (!task) return null;
@@ -274,6 +284,7 @@ export function markBackgroundTaskDone(id: string, result: string): BackgroundTa
     resultPath,
     error: undefined,
     pendingApprovalId: undefined,
+    approvalResolution: undefined,
   });
   if (updated) {
     addNotification({
@@ -293,6 +304,7 @@ export function markBackgroundTaskAwaitingApproval(id: string, approvalId: strin
   const updated = updateBackgroundTask(id, {
     status: 'awaiting_approval',
     pendingApprovalId: approvalId,
+    approvalResolution: undefined,
     result: resultText.slice(0, RESULT_TRUNCATE_CHARS),
   });
   if (updated) {
@@ -317,6 +329,7 @@ export function markBackgroundTaskFailed(id: string, error: string, status: Extr
     status,
     completedAt: nowIso(),
     error: clean(error, 1000),
+    approvalResolution: undefined,
   });
   if (updated) {
     addNotification({
@@ -387,6 +400,35 @@ export function resumeBackgroundTask(id: string): BackgroundTaskRecord | null {
     source: task.source,
     resumedFromTaskId: task.id,
   });
+}
+
+export function queueBackgroundTaskApprovalResolution(approvalId: string, approved: boolean): BackgroundTaskRecord | null {
+  const task = getBackgroundTaskByApprovalId(approvalId);
+  if (!task || task.status !== 'awaiting_approval') return null;
+  const now = nowIso();
+  const updated = updateBackgroundTask(task.id, {
+    status: 'pending',
+    pendingApprovalId: approvalId,
+    approvalResolution: {
+      approvalId,
+      approved,
+      queuedAt: now,
+    },
+    lastCheckInAt: now,
+    lastCheckInMessage: `${approved ? 'Approval granted' : 'Approval rejected'} for ${approvalId}; queued daemon continuation.`,
+  });
+  if (updated) {
+    addNotification({
+      id: `${Date.now()}-background-${updated.id}-approval-resolution-queued`,
+      kind: 'execution',
+      title: `Background task ${approved ? 'approved' : 'rejected'}: ${updated.title}`,
+      body: `Task ${updated.id} will resume in the daemon to process approval ${approvalId}.`,
+      createdAt: now,
+      read: false,
+      metadata: taskNotificationMetadata(updated, { approvalId, approved, status: 'pending' }),
+    });
+  }
+  return updated;
 }
 
 export function interruptStaleRunningBackgroundTasks(): number {
@@ -470,6 +512,49 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	        });
 	      }, progressCheckInMinMs);
 	      heartbeatTimer.unref?.();
+      if (task.approvalResolution) {
+        const resolution = task.approvalResolution;
+        addRunEvent(run.id, {
+          type: 'status',
+          message: `${resolution.approved ? 'Approving' : 'Rejecting'} pending approval ${resolution.approvalId} and resuming from serialized SDK state.`,
+          data: { approvalId: resolution.approvalId, approved: resolution.approved },
+        });
+        const result = await assistant.getRuntime().resolveApproval(resolution.approvalId, resolution.approved);
+        if (heartbeatTimer) clearInterval(heartbeatTimer);
+
+        if (!resolution.approved) {
+          markBackgroundTaskFailed(task.id, result.text || `Approval ${resolution.approvalId} rejected.`, 'aborted');
+          finishRun(run.id, {
+            status: 'cancelled',
+            message: `Background task stopped after approval ${resolution.approvalId} was rejected.`,
+            outputPreview: result.text,
+          });
+          logger.info({ taskId: task.id, approvalId: resolution.approvalId }, 'Background task stopped after rejected approval');
+          continue;
+        }
+
+        if (result.nextApprovalId) {
+          markBackgroundTaskAwaitingApproval(task.id, result.nextApprovalId, result.text);
+          finishRun(run.id, {
+            status: 'awaiting_approval',
+            message: `Background task paused for follow-up approval ${result.nextApprovalId}.`,
+            pendingApprovalId: result.nextApprovalId,
+            outputPreview: result.text,
+          });
+          logger.info({ taskId: task.id, approvalId: result.nextApprovalId }, 'Background task paused for follow-up approval');
+          continue;
+        }
+
+        markBackgroundTaskDone(task.id, result.text);
+        finishRun(run.id, {
+          status: 'completed',
+          message: `Background task ${task.id} completed after approval ${resolution.approvalId}.`,
+          outputPreview: result.text,
+        });
+        logger.info({ taskId: task.id, approvalId: resolution.approvalId }, 'Background task completed after approval continuation');
+        continue;
+      }
+
 	      const response = await assistant.respond({
 	        sessionId: task.runSessionId,
 	        channel: task.channel ?? 'background',

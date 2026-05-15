@@ -103,7 +103,7 @@ export function buildToolPreferencePromptBlock(availability: ServiceAvailability
     if (effective === 'off') {
       lines.push(`- ${item.service.label}: do not use tools for this service; user disabled it.`);
     } else if (effective === 'composio') {
-      lines.push(`- ${item.service.label}: prefer Composio via composio_execute_tool for toolkit ${item.service.composioSlug}.`);
+      lines.push(`- ${item.service.label}: prefer Composio. Use composio_search_tools for toolkit ${item.service.composioSlug}, then composio_execute_tool with the selected action.`);
     } else {
       lines.push(`- ${item.service.label}: prefer the configured MCP server instead of Composio.`);
     }
@@ -114,8 +114,8 @@ export function buildToolPreferencePromptBlock(availability: ServiceAvailability
 
 export function buildComposioPromptBlock(connectedSlugs: string[]): string {
   if (connectedSlugs.length === 0) {
-    return 'Composio external app connections are available through the tools composio_status, composio_list_tools, and composio_execute_tool when COMPOSIO_API_KEY is configured.';
+    return 'Composio external app connections are available through the tools composio_status, composio_search_tools, composio_list_tools, and composio_execute_tool when COMPOSIO_API_KEY is configured.';
   }
   const sorted = [...connectedSlugs].sort();
-  return `Composio is configured. Active connected toolkits: ${sorted.join(', ')}. Use composio_list_tools to inspect toolkit actions and composio_execute_tool to call a chosen Composio tool. Pass composio_execute_tool arguments as a JSON object string. External mutations require approval.`;
+  return `Composio is configured. Active connected toolkits: ${sorted.join(', ')}. Use composio_search_tools to find the smallest relevant action set for the task, composio_list_tools only when a full toolkit schema is needed, and composio_execute_tool to call the chosen action. Pass composio_execute_tool arguments as a JSON object string. External mutations require approval.`;
 }

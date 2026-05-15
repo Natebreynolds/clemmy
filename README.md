@@ -1,278 +1,233 @@
-# Clementine Next
+# Clementine
 
-Fresh rebuild of Clementine on a modern agent runtime.
+A persistent, single-user AI assistant for your Mac. Runs as a local daemon,
+talks through a clean dashboard, voice, Discord, and webhooks, and can act on
+your behalf in any app you grant her access to.
 
-This project is intentionally separate from `clementine-dev`. The old project is the reference implementation. This new project is where the migration happens.
+```
+chat ─┐
+voice ─┤
+discord─┤  →  Clementine ─→  tools ─→  your apps, your files, the web
+api ──┘                       (MCP + Composio + computer-use, all gated by one trust policy)
+```
 
-## Initial goals
+## What she is
 
-- Preserve the vault-first memory architecture.
-- Preserve multi-channel and daemon operation.
-- Replace the Anthropic runtime with modern agent-runtime primitives.
-- Improve orchestration, tracing, approvals, and model portability.
+Clementine is built around three primitives:
 
-## Migration strategy
+- **One memory spine.** Vault notes, structured facts, working memory, embeddings,
+  session briefs. Persistent across sessions; cleaned and re-summarised in the
+  background. She remembers your projects, preferences, and the rhythms of your
+  work — not because the prompt repeats them, but because the runtime knows
+  where to find them.
 
-1. Build a clean runtime/provider seam first.
-2. Port the core assistant loop on top of OpenAI Agents SDK.
-3. Reattach memory, MCP tools, approvals, and orchestration.
-4. Reconnect channels only after the core loop is stable.
+- **One tool surface.** Every tool — local SDK tools, MCP-discovered tools
+  (DataForSEO, Hostinger, Supabase, etc.), Composio-bridged apps (Gmail,
+  Google Sheets, Slack, Notion, …), computer-use, the planner — is exposed
+  with real schemas to the agent. No broker layers, no prompt coaching, no
+  hidden choice the model has to remember. She calls the tool that fits.
 
-## Current status
+- **One trust gradient.** Every tool flows through a single classifier
+  (`read | write | execute | send | admin`) and one approval decision driven
+  by the scope policy you set:
 
-The rebuild now has:
+  | Scope        | read | write/execute (inside workspace) | write/execute (outside) | send (network) | admin |
+  | ------------ | ---- | -------------------------------- | ----------------------- | -------------- | ----- |
+  | `strict`     | auto | ask                              | ask                     | ask            | ask   |
+  | `workspace`  | auto | **auto**                         | ask                     | ask            | ask   |
+  | `yolo`       | auto | **auto**                         | **auto**                | **auto**       | ask   |
 
-- OpenAI Agents SDK runtime
-- CLI chat loop with session persistence and approvals
-- vault-backed context assembly and working memory
-- MCP-first local tool server for memory, notes, plans, and session resume
-- external MCP server discovery from Claude Desktop, Claude Code, and local config
-- a local daemon runner for cron schedules, trigger files, and queued workflow runs
-- a daemon-driven autonomous agent loop with durable inboxes, commitments, and proactive wake cycles
-- a first-class Discord bot transport for inbound chat and outbound bot-channel delivery
-- Composio-backed connected app OAuth for services like Gmail, Slack, Notion, GitHub, Linear, Calendar, Drive, and CRMs
+  A hard denylist (`rm -rf /`, `sudo`, fork bombs, disk wipes) is **always
+  enforced** regardless of scope. `admin` tools always ask.
+
+She is single-user and local-first. The daemon writes only to
+`~/.clementine-next/`. Nothing goes to a hosted backend except the LLM
+provider you configure and the third-party APIs you connect.
 
 ## Install
 
-Target public install:
+The signed macOS app is the supported install path:
+
+1. Download the latest `Clementine-<version>-arm64.dmg` from
+   [Releases](https://github.com/Natebreynolds/clementine-next/releases).
+2. Drag **Clementine** to your Applications folder.
+3. Launch it. On first run, the setup wizard collects:
+   - Your LLM auth (Codex OAuth via ChatGPT, OpenAI API key, or both).
+   - Optional Composio API key for connected apps.
+   - Optional Discord bot token.
+4. Grant any macOS permissions the wizard prompts for (Microphone for voice,
+   Screen Recording for meeting capture, Accessibility + Apple Events so she
+   can do work in other apps).
+
+She runs in the background. The window is the dashboard; closing it leaves the
+daemon running. Find her in the menu bar to quit.
+
+### Run from source (development)
 
 ```bash
-npm install -g clemmy
-clementine setup
-clementine service
-```
-
-Current local repo path:
-
-```bash
-cd /Users/nathan.reynolds/clementine-next
-bash install.sh
-```
-
-Or install/link it as a CLI during development:
-
-```bash
-cd /Users/nathan.reynolds/clementine-next
+git clone https://github.com/Natebreynolds/clementine-next
+cd clementine-next
 npm install
-npm run build
-npm link
-clementine help
+npm run setup      # interactive wizard
+npm run daemon     # background service
+npm run chat       # CLI chat (separate terminal)
 ```
 
-Or create a local installable package tarball:
+Or the Electron shell:
 
 ```bash
-cd /Users/nathan.reynolds/clementine-next
+cd apps/desktop
 npm install
-npm run pack:local
-# then install the generated clemmy-0.1.0.tgz however you want
+npm start
 ```
 
-Manual repo path:
+## Architecture
+
+```
+                 ┌─────────────────────────────────────────┐
+                 │              Clementine.app             │
+                 │  (signed, hardened-runtime macOS bundle)│
+                 │                                         │
+                 │   ┌───────────────────────────────────┐ │
+                 │   │   Daemon (one Node process)       │ │
+                 │   │                                   │ │
+                 │   │   ┌─────────┐    ┌─────────────┐  │ │
+                 │   │   │ Runtime │ ←→ │ToolTaxonomy │  │ │
+                 │   │   │ (Codex /│    │ + scope     │  │ │
+                 │   │   │  OpenAI)│    │ policy      │  │ │
+                 │   │   └────┬────┘    └─────────────┘  │ │
+                 │   │        │                          │ │
+                 │   │   ┌────▼─────────────────────────┐│ │
+                 │   │   │  Tool surface (one list)     ││ │
+                 │   │   │  • SDK: local + computer-use ││ │
+                 │   │   │  • cx_<toolkit>_<action>     ││ │
+                 │   │   │  • <server>__<tool>  (MCP)   ││ │
+                 │   │   └──────────────────────────────┘│ │
+                 │   │        │                          │ │
+                 │   │   ┌────▼─────────────────────────┐│ │
+                 │   │   │ Memory spine (vault, facts,  ││ │
+                 │   │   │ working, embeddings, briefs) ││ │
+                 │   │   └──────────────────────────────┘│ │
+                 │   └───────────────────────────────────┘ │
+                 │                                         │
+                 │   Renderer ←→ /console (localhost:8520) │
+                 └─────────────────────────────────────────┘
+```
+
+### Key files
+
+- `src/agents/tool-taxonomy.ts` — the classifier + approval decision. Every
+  tool's `needsApproval` hook routes through it.
+- `src/runtime/mcp-namespace-shim.ts` — flattens N MCP servers into one
+  collision-free surface (`<server>__<tool>`).
+- `src/runtime/codex-native-runtime.ts` — the runtime that talks to ChatGPT's
+  Codex backend; folds MCP + Composio + SDK tools into one tool list.
+- `src/tools/composio-tools.ts` — first-class `cx_<toolkit>_<action>` tools
+  loaded for every active Composio connection.
+- `src/agents/proactivity-policy.ts` — the scope policy (`strict | workspace
+  | yolo`) you set in the dashboard.
+- `src/agents/tool-observability.ts` — append-only NDJSON log of every tool
+  call. The substrate for the always-learning loop.
+
+## Connected tools
+
+### MCP servers
+
+Drop a server into `~/.clementine-next/mcp/servers.json` or add one from the
+dashboard. Live-reloads — no daemon restart needed. Defaults to auto-detecting
+servers from Claude Desktop and Claude Code.
+
+Currently smoke-tested integrations: DataForSEO, Hostinger, Supabase, Bright
+Data, ElevenLabs, Apify, browsermcp, plus the local `clementine` MCP server.
+
+### Composio
+
+Paste a Composio API key in the dashboard under **Connected Apps**. Every
+active toolkit becomes first-class tools the agent can call directly. Approval
+gating still applies — Gmail-send asks in strict, autos in YOLO; Sheets-read
+autos everywhere.
+
+### Computer-use
+
+`write_file` and `run_shell_command` are gated by the scope policy. The hard
+denylist in `assertCommandAllowed` is absolute. Workspace dirs are configurable
+in `~/.clementine-next/.env` (`WORKSPACE_DIRS=...`).
+
+## Channels
+
+- **Dashboard chat** — the home page of the Electron app. Voice toggle in the
+  header.
+- **Voice (OpenAI Realtime)** — push-to-talk in the dashboard. Routes spoken
+  commands into the local agent via `send_to_clementine`.
+- **Discord** — paste a bot token in the dashboard. DMs, bot-channel posts,
+  approval buttons.
+- **Webhook / API** — `POST /api/console/home/chat` on `localhost:8520` with
+  the webhook secret in the query string. NDJSON streaming on
+  `/api/console/home/chat/stream`.
+
+## Data layout
+
+Everything she remembers lives under `~/.clementine-next/`:
+
+```
+~/.clementine-next/
+├── vault/              markdown notes, the memory floor
+├── memory.db           SQLite index (FTS + embeddings)
+├── state/
+│   ├── proactivity-policy.json    (your scope: strict/workspace/yolo)
+│   ├── plan-scopes.json           (active plan auto-approval windows)
+│   ├── approvals.json             (pending + historical approvals)
+│   ├── tool-events/               (per-day NDJSON of every tool call)
+│   └── secrets-vault.json         (encrypted-at-rest credentials)
+├── mcp/servers.json    your configured MCP servers
+├── goals/              persistent goal records
+├── workflows/          user-defined workflows
+├── working-memory.md   live session scratch
+└── logs/               daemon + supervisor logs
+```
+
+Apple Developer secrets (signing, notarization) live at
+`~/.clementine-secrets/desktop.env` — **never** in the repo.
+
+## Development
+
+Test:
 
 ```bash
-npm install
-npm run setup
-npm run service
+npx tsc --noEmit                              # type check
+find src -name "*.test.ts" -exec npx tsx --test {} \;
 ```
 
-For a realistic local test, use:
+Build the desktop app:
 
 ```bash
-npm run setup
-npm run service
+cd apps/desktop
+npm run package:mac          # signed + notarized DMG → release/
 ```
 
-## Auth Modes
+The daemon and the Electron app share the `~/.clementine-next/` data dir, so
+you can iterate on the daemon from source (`npm run daemon`) and your data
+stays consistent with the installed Clementine.app.
 
-`clementine-next` now has two auth tracks:
+## Status
 
-- `AUTH_MODE=api_key`
-- `AUTH_MODE=codex_oauth`
+Shipped and working:
 
-Current reality:
+- ✓ Single namespace-shimmed MCP surface across N servers (no collisions)
+- ✓ First-class Composio `cx_*` tools loaded for every active connection
+- ✓ Unified tool taxonomy + scope policy (`strict | workspace | yolo`)
+- ✓ Codex OAuth runtime with full tool surface (MCP + Composio + SDK + local)
+- ✓ Append-only tool-event audit log
+- ✓ Dashboard live-reload for MCP servers (no daemon restart)
+- ✓ Voice via OpenAI Realtime
+- ✓ Discord bot transport with approval buttons
+- ✓ Plan-scope auto-approval (a user approves a plan, the tools inside auto for 15 min)
 
-- `api_key` is a live runtime path
-- `codex_oauth` is now also a live runtime path through the official `codex exec` CLI bridge
+Known gaps:
 
-Useful commands:
+- Confidence scoring driven by the tool-event audit log
+- Windows / Linux desktop builds (macOS first)
 
-```bash
-clementine auth status
-clementine auth login
-clementine auth login-native
-clementine auth refresh
-clementine auth import-codex
-clementine auth logout
-```
+## License
 
-`clementine auth login-native` is now the preferred subscription login path. It will:
-
-- open the ChatGPT/Codex sign-in flow in your browser
-- save the resulting tokens locally inside Clementine
-- write a Codex-compatible `auth.json` so the current runtime can use those credentials
-
-`clementine auth login` remains the broader bootstrap path. It will:
-
-- try native browser sign-in first
-- install the official Codex CLI if it is missing
-- launch ChatGPT/Codex sign-in if needed
-- import reusable local Codex auth into Clementine
-
-If you already signed into Codex with ChatGPT, `clementine auth import-codex` imports local credentials from `~/.codex/auth.json` into Clementine’s own state store.
-
-For Codex-backed runtime usage:
-
-```bash
-AUTH_MODE=codex_oauth clementine doctor
-AUTH_MODE=codex_oauth clementine service
-```
-
-Notes:
-
-- native ChatGPT/Codex login is now available inside Clementine
-- `codex_oauth` runtime execution still runs through the official Codex CLI bridge rather than the OpenAI Agents SDK
-- Clementine-managed approval interruptions are only available on the OpenAI Agents SDK path today
-
-## MCP tooling
-
-`clementine-next` now treats MCP as the primary tool surface.
-
-- Local MCP is enabled by default
-- Local tools now cover:
-  - memory and working memory
-  - vault notes and task management
-  - saved plans
-  - session resume/history
-  - persistent goals
-  - timers
-  - cron job definitions, trigger files, and run/progress history
-  - workflow definitions and queued workflow runs
-  - workspace/project discovery
-  - team agents, local team messaging, and delegation state
-  - custom user tool creation
-- External MCP servers are auto-discovered from:
-  - `~/Library/Application Support/Claude/claude_desktop_config.json`
-  - `~/.claude/settings.json`
-  - `~/.clementine-next/mcp/servers.json`
-- User script tools can be dropped into `~/.clementine-next/tools/` as `.sh` or `.py`
-
-In the CLI, run `/tools` to inspect the current MCP surface.
-
-## Daemon
-
-Run the local background worker with:
-
-```bash
-npm run daemon
-```
-
-Current daemon scope:
-
-- executes due cron jobs from `CRON.md`
-- consumes manual cron trigger files
-- consumes queued workflow run files
-- runs autonomous agent wake cycles for the primary assistant and installed team agents
-- persists cron run logs and workflow run state locally
-- persists agent inbox and agent state locally under the Clementine home
-
-This is the rebuilt local-first execution layer. Full channel delivery and dashboard orchestration still need additional parity work.
-
-## Control Plane
-
-The webhook server now also exposes a minimal local dashboard.
-
-- HTML dashboard: `/dashboard?token=YOUR_WEBHOOK_SECRET`
-- JSON snapshot: `/api/dashboard`
-- daemon detail: `/api/daemon/status`
-- notifications feed: `/api/notifications`
-- agent state and inbox visibility in the dashboard/API snapshot
-- Discord onboarding directly in the dashboard by pasting a bot token
-- Composio onboarding, app connection actions, and tool-source preferences
-
-Run it with:
-
-```bash
-npm run webhook
-```
-
-Connected apps through Composio:
-
-- Open `/dashboard?token=YOUR_WEBHOOK_SECRET`
-- Paste a Composio API key in `Connected Apps`
-- Click `Connect` for Gmail, Slack, Notion, GitHub, Linear, Google Calendar, or any featured toolkit
-- Clementine can then use `composio_status`, `composio_list_tools`, and `composio_execute_tool` during agent runs
-- Mutating external actions are routed through the approval flow
-
-Notification delivery:
-
-- daemon results are stored locally as notifications
-- notifications can be pushed to configured outbound webhook destinations
-- destinations can be managed from the dashboard
-- delivery retries now happen per destination with backoff instead of blocking the whole queue on one failure
-- failed deliveries can be requeued from the dashboard
-- supported destination types:
-  - `generic_webhook`
-  - `discord_webhook`
-  - `discord_channel`
-  - `discord_user`
-- destinations can be tested from the dashboard before enabling them for delivery
-
-## Discord
-
-Discord is now a real bot transport, not just a webhook sink.
-
-Set:
-
-```bash
-DISCORD_ENABLED=true
-DISCORD_BOT_TOKEN=...
-DISCORD_REQUIRE_MENTION=true
-```
-
-When setup can verify the bot token, it also stores `DISCORD_CLIENT_ID` and prints a Discord install URL so you can add the bot to a server immediately.
-
-You can print the saved install link again later with:
-
-```bash
-clementine discord invite
-```
-
-Optional:
-
-```bash
-DISCORD_ALLOWED_CHANNELS=1234567890,0987654321
-```
-
-Run only the bot:
-
-```bash
-npm run discord
-```
-
-Run the local full stack:
-
-```bash
-npm run service
-```
-
-Current Discord behavior:
-
-- DMs respond automatically
-- guild messages respond when the bot is mentioned by default
-- sessions persist locally per Discord user/channel
-- daemon notifications can be delivered to Discord webhooks, direct Discord bot channels, or Discord user DMs
-- approvals can be listed and resolved directly in Discord with `approvals`, `approve <id>`, and `reject <id>`
-- approval notifications now auto-route back to the originating Discord user when possible
-- Discord operator commands also support `status`, `notifications`, `read <notification_id>`, and `retry <notification_id>`
-- approval and notification cards in Discord now include button actions for approve, reject, mark read, and retry delivery
-
-## Lightweight onboarding
-
-The target install path for end users is:
-
-```bash
-npx create-clementine@latest
-```
-
-That package is not published yet. For now, this repo keeps the install flow lightweight and local while the product shape stabilizes.
+MIT. See `LICENSE`.

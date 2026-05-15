@@ -54,8 +54,8 @@ export async function runSetupWizard(): Promise<number> {
     message: 'How should Clementine connect to the AI?',
     default: existingAuthMode,
     choices: [
-      { value: 'api_key', name: `api_key       Use an OpenAI API key (recommended for background agent)` },
-      { value: 'codex_oauth', name: `codex_oauth   Sign in with your ChatGPT account via Codex CLI` },
+      { value: 'api_key', name: `api_key       Use direct OpenAI API billing for the agent runtime` },
+      { value: 'codex_oauth', name: `codex_oauth   Use ChatGPT/Codex OAuth for the agent runtime` },
     ],
   });
 
@@ -129,16 +129,16 @@ export async function runSetupWizard(): Promise<number> {
 
   // --- Semantic memory ---
   sectionHeader('Step 2: Semantic Memory');
-  info('Clementine always uses local SQLite/FTS memory. Add an OpenAI API key if you want semantic embedding rerank and backfill.');
+  info('Clementine always uses local SQLite/FTS memory. The OpenAI API key is optional and separate from Codex OAuth; it enables semantic embedding rerank/backfill and live voice.');
   const configureEmbeddings = await confirm({
     message: values.OPENAI_API_KEY
-      ? 'OpenAI API key is present. Update it for semantic memory?'
-      : 'Add an OpenAI API key for semantic memory embeddings?',
+      ? 'OpenAI capability key is present. Update it for semantic memory/live voice?'
+      : 'Add an optional OpenAI API key for semantic memory and live voice?',
     default: Boolean(values.OPENAI_API_KEY),
   });
   if (configureEmbeddings) {
     const key = await password({
-      message: 'OpenAI API key for embeddings (starts with sk-, leave blank to keep existing)',
+      message: 'Optional OpenAI API key (starts with sk-, leave blank to keep existing)',
       mask: '*',
     });
     if (key) values.OPENAI_API_KEY = key;
@@ -247,7 +247,7 @@ export async function runSetupWizard(): Promise<number> {
   if (doctorCode === 0) {
     console.log(`  ${GREEN}${BOLD}All set!${RESET}`);
     console.log();
-    info(`Dashboard: ${CYAN}http://localhost:${values.WEBHOOK_PORT}/dashboard?token=${encodeURIComponent(values.WEBHOOK_SECRET)}${RESET}`);
+    info(`Console:   ${CYAN}http://localhost:${values.WEBHOOK_PORT}/console?token=${encodeURIComponent(values.WEBHOOK_SECRET)}${RESET}`);
     info(`Start:     ${CYAN}clementine daemon start${RESET}`);
     info(`Chat:      ${CYAN}clementine chat${RESET}`);
   }

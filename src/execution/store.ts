@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { BASE_DIR } from '../config.js';
 import type { ExecutionRecord, PlanRecord } from '../types.js';
+import { isUserFacingExecution } from './scope.js';
 
 const STATE_DIR = path.join(BASE_DIR, 'state');
 const EXECUTIONS_FILE = path.join(STATE_DIR, 'executions.json');
@@ -158,12 +159,15 @@ export class ExecutionStore {
   }
 
   listDue(now = new Date(), limit = 20): ExecutionRecord[] {
-    return this.list(limit).filter((execution) => {
+    return loadExecutions().filter((execution) => {
       if (execution.autoAdvance === false) return false;
+      if (!isUserFacingExecution(execution)) return false;
       if (execution.status !== 'active' && execution.status !== 'blocked') return false;
       if (!execution.nextReviewAt) return true;
       return new Date(execution.nextReviewAt).getTime() <= now.getTime();
-    });
+    })
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+      .slice(0, limit);
   }
 
   syncWithPlan(executionId: string, plan?: PlanRecord): ExecutionRecord | undefined {

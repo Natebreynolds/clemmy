@@ -46,6 +46,8 @@ export interface SetupCompleteRecord {
   };
 }
 
+export type SetupConfiguredSummary = SetupCompleteRecord['configured'];
+
 /** True when the user already has SOME usable credential anywhere
  *  (env, file vault, or codex auth). Used to choose between the
  *  setup wizard and the dashboard. */

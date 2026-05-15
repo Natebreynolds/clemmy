@@ -13,6 +13,7 @@ import {
 import { MODELS } from '../config.js';
 import { addRunEvent, finishRun, getRun, listRuns, startRun, type RunRecord } from '../runtime/run-events.js';
 import { loadProactivityPolicy } from '../agents/proactivity-policy.js';
+import type { ToolActivity } from '../types.js';
 
 const logger = pino({ name: 'clementine-next.gateway' });
 
@@ -31,6 +32,9 @@ export interface GatewayRequest {
   /** Reasoning-text callback for o-series-style models. Captured for
    *  run-timeline observability via assistant.respond. */
   onReasoning?: (text: string) => Promise<void> | void;
+  /** Tool-call activity callback. Used by channel UIs to show live
+   *  progress such as file reads, shell commands, and Composio calls. */
+  onToolActivity?: (activity: ToolActivity) => Promise<void> | void;
 }
 
 export interface GatewayResponse {
@@ -299,6 +303,7 @@ export class ClementineGateway {
         runId: run.id,
         onChunk: request.onChunk,
         onReasoning: request.onReasoning,
+        onToolActivity: request.onToolActivity,
       });
       finishRun(run.id, {
         status: response.pendingApprovalId ? 'awaiting_approval' : 'completed',

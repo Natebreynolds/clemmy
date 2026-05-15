@@ -139,6 +139,7 @@ export interface ApprovalResolutionResult {
   status: 'approved' | 'rejected';
   text: string;
   sessionId: string;
+  nextApprovalId?: string;
 }
 
 export interface PlanStep {

@@ -39,7 +39,9 @@ import {
   requeueNotificationDelivery,
 } from '../runtime/notifications.js';
 import { buildDiscordInstallUrl } from './discord-install.js';
-import { approvePlanProposal, getPlanProposal, rejectPlanProposal } from '../agents/plan-proposals.js';
+import { getPlanProposal, rejectPlanProposal } from '../agents/plan-proposals.js';
+import { approvePlanAndQueueBackgroundTask } from '../execution/approved-plan-tasks.js';
+import { queueBackgroundTaskApprovalResolution } from '../execution/background-tasks.js';
 import { WEBHOOK_PORT, WEBHOOK_SECRET } from '../config.js';
 
 const logger = pino({ name: 'clementine-next.discord' });
@@ -93,6 +95,8 @@ let discordClient: Client | null = null;
 let startPromise: Promise<void> | null = null;
 let dmPollLoopPromise: Promise<void> | null = null;
 let dmPollLoopActive = false;
+let dmPollConsecutiveFailures = 0;
+let dmPollBackoffUntil = 0;
 let status: DiscordRuntimeStatus = {
   enabled: DISCORD_ENABLED,
   connected: false,
@@ -163,6 +167,33 @@ function latestSnowflake(values: string[]): string | null {
   return values.reduce((latest, current) => (compareSnowflakes(current, latest) > 0 ? current : latest));
 }
 
+function summarizeDiscordError(error: unknown): string {
+  const raw = error instanceof Error ? error.message : String(error);
+  if (raw.includes('<!DOCTYPE') || raw.includes('<html')) {
+    const status = raw.match(/failed with\s+(\d+)/i)?.[1] ?? 'unknown';
+    const route = raw.match(/Discord API\s+([A-Z]+)\s+([^ ]+)/)?.slice(1, 3).join(' ') ?? 'Discord API';
+    return `${route} failed with ${status}; Discord returned an HTML upstream error page.`;
+  }
+  return truncate(raw.replace(/\s+/g, ' '), 500);
+}
+
+function recordDiscordPollSuccess(): void {
+  dmPollConsecutiveFailures = 0;
+  dmPollBackoffUntil = 0;
+}
+
+function recordDiscordPollFailure(error: unknown, userId?: string): void {
+  dmPollConsecutiveFailures += 1;
+  const delayMs = Math.min(60_000, 1000 * Math.pow(2, Math.min(dmPollConsecutiveFailures, 6)));
+  dmPollBackoffUntil = Date.now() + delayMs;
+  logger.warn({
+    error: summarizeDiscordError(error),
+    userId,
+    consecutiveFailures: dmPollConsecutiveFailures,
+    retryInMs: delayMs,
+  }, 'Discord DM polling failed');
+}
+
 function markDiscordDmMessageSeen(channelId: string, messageId: string): void {
   const state = loadDiscordDmPollState();
   const previous = state.lastSeenByChannel[channelId];
@@ -230,6 +261,24 @@ async function sendDiscordRestChunks(channelId: string, text: string): Promise<v
       contentLength: chunk.length,
     }, 'Discord REST message sent');
   }
+}
+
+async function sendDiscordRestComponentMessage(
+  channelId: string,
+  payload: { content: string; components: ActionRowBuilder<ButtonBuilder>[] },
+): Promise<void> {
+  const sent = await discordApiJson<DiscordRestSentMessage>(`/channels/${channelId}/messages`, {
+    method: 'POST',
+    body: {
+      content: payload.content,
+      components: payload.components.map((component) => component.toJSON()),
+    },
+  });
+  logger.info({
+    channelId,
+    messageId: sent.id,
+    contentLength: payload.content.length,
+  }, 'Discord REST component message sent');
 }
 
 async function sendDiscordRestTyping(channelId: string): Promise<void> {
@@ -415,6 +464,7 @@ const TOOL_ACTIVITY_LABELS: Record<string, string> = {
 };
 
 function readableToolName(toolName: string): string {
+  if (toolName.startsWith('cx_')) return 'using a connected app action';
   return TOOL_ACTIVITY_LABELS[toolName] ?? `using ${toolName.replace(/[_-]+/g, ' ')}`;
 }
 
@@ -666,6 +716,86 @@ function relevantApprovalsForMessage(message: Message<boolean>, approvals: Pendi
   return owned.length > 0 ? owned : approvals;
 }
 
+function relevantApprovalsForContext(input: {
+  userId: string;
+  channelId: string;
+  guildId?: string | null;
+}, approvals: PendingApproval[]): PendingApproval[] {
+  const channel = buildChannelLabelFromParts(input.channelId, input.guildId);
+  const owned = approvals.filter((approval) => approval.userId === input.userId || approval.channel === channel);
+  return owned.length > 0 ? owned : approvals;
+}
+
+type NaturalApprovalAction = 'approve_one' | 'approve_all' | 'reject_one' | 'reject_all';
+
+function detectNaturalApprovalAction(text: string): NaturalApprovalAction | null {
+  const normalized = text.toLowerCase().replace(/[.!?]+$/g, '').replace(/\s+/g, ' ').trim();
+  if (!normalized) return null;
+
+  if (/^(approve|approved|yes|yep|yeah|go ahead|proceed|run it|do it|authorized|authorize)\s+(all|everything|them all)$/i.test(normalized)) {
+    return 'approve_all';
+  }
+  if (/^(reject|rejected|deny|denied|cancel|stop)\s+(all|everything|them all)$/i.test(normalized)) {
+    return 'reject_all';
+  }
+  if (/^(approve all|approved all|yes to all|go ahead with all|run all|proceed with all)$/i.test(normalized)) {
+    return 'approve_all';
+  }
+  if (/^(reject all|deny all|cancel all|stop all)$/i.test(normalized)) {
+    return 'reject_all';
+  }
+  if (/^(approve|approved|yes|yep|yeah|go ahead|proceed|run it|do it|authorized|authorize)$/i.test(normalized)) {
+    return 'approve_one';
+  }
+  if (/^(reject|rejected|deny|denied|no|cancel|stop)$/i.test(normalized)) {
+    return 'reject_one';
+  }
+  return null;
+}
+
+async function resolveNaturalApproval(input: {
+  assistant: ClementineAssistant;
+  text: string;
+  userId: string;
+  channelId: string;
+  guildId?: string | null;
+  send: (text: string) => Promise<void>;
+}): Promise<boolean> {
+  const action = detectNaturalApprovalAction(input.text);
+  if (!action) return false;
+
+  const runtime = input.assistant.getRuntime();
+  const approvals = relevantApprovalsForContext({
+    userId: input.userId,
+    channelId: input.channelId,
+    guildId: input.guildId,
+  }, runtime.listPendingApprovals()).sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+
+  if (approvals.length === 0) {
+    await input.send('No pending approval is waiting on this Discord thread.');
+    return true;
+  }
+
+  const approve = action.startsWith('approve');
+  const selected = action.endsWith('_all') ? approvals : approvals.slice(0, 1);
+  const results: string[] = [];
+
+  for (const approval of selected) {
+    try {
+      results.push(await resolveApprovalOrQueueBackgroundContinuation(input.assistant, approval.id, approve));
+    } catch (error) {
+      results.push(`Failed to ${approve ? 'approve' : 'reject'} \`${approval.id}\`: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  const remainingCount = Math.max(0, approvals.length - selected.length);
+  const tail = remainingCount > 0
+    ? `\n\n${remainingCount} other approval${remainingCount === 1 ? '' : 's'} still pending. Say \`approve all\`, \`reject all\`, or \`approvals\` to inspect.`
+    : '';
+  await input.send(`${results.join('\n\n')}${tail}`);
+  return true;
+}
+
 function relevantNotificationsForUser(userId: string) {
   return listNotifications(50).filter((notification) => {
     const metadata = notification.metadata ?? {};
@@ -721,9 +851,29 @@ function renderDiscordStatusForContext(input: {
 function approvalResultText(result: ApprovalResolutionResult): string {
   return [
     `Approval ${result.status}: \`${result.approvalId}\``,
+    result.nextApprovalId ? `Next approval pending: \`${result.nextApprovalId}\`` : '',
     '',
     result.text,
-  ].join('\n');
+  ].filter(Boolean).join('\n');
+}
+
+async function resolveApprovalOrQueueBackgroundContinuation(
+  assistant: ClementineAssistant,
+  approvalId: string,
+  approved: boolean,
+): Promise<string> {
+  const queued = queueBackgroundTaskApprovalResolution(approvalId, approved);
+  if (queued) {
+    return [
+      `Approval ${approved ? 'approved' : 'rejected'}: \`${approvalId}\``,
+      '',
+      `Queued background task continuation: \`${queued.id}\`.`,
+      'The daemon will resume the paused SDK run and keep progress visible in the dashboard.',
+    ].join('\n');
+  }
+
+  const result = await assistant.getRuntime().resolveApproval(approvalId, approved);
+  return approvalResultText(result);
 }
 
 function renderGatewayTail(response: GatewayResponse): string {
@@ -772,6 +922,17 @@ async function runGatewayPrompt(input: {
 async function handleDiscordCommand(message: Message<boolean>, assistant: ClementineAssistant, prompt: string): Promise<boolean> {
   const normalized = normalizeCommandText(prompt);
   const runtime = assistant.getRuntime();
+
+  if (await resolveNaturalApproval({
+    assistant,
+    text: normalized,
+    userId: message.author.id,
+    channelId: message.channelId,
+    guildId: message.guildId,
+    send: (text) => sendChunks(message.channel, text, message),
+  })) {
+    return true;
+  }
 
   if (/^(help|discord help|commands)$/i.test(normalized)) {
     await sendChunks(
@@ -839,8 +1000,8 @@ async function handleDiscordCommand(message: Message<boolean>, assistant: Clemen
     const approved = match[1].toLowerCase() === 'approve';
     const approvalId = match[2];
     try {
-      const result = await runtime.resolveApproval(approvalId, approved);
-      await sendChunks(message.channel, approvalResultText(result), message);
+      const text = await resolveApprovalOrQueueBackgroundContinuation(assistant, approvalId, approved);
+      await sendChunks(message.channel, text, message);
     } catch (error) {
       await sendChunks(
         message.channel,
@@ -874,6 +1035,56 @@ async function handleDiscordCommand(message: Message<boolean>, assistant: Clemen
     }
     requeueNotificationDelivery(notificationId);
     await sendChunks(message.channel, `Requeued delivery for notification \`${notificationId}\`.`, message);
+    return true;
+  }
+
+  return false;
+}
+
+async function handleDiscordRestCommand(input: {
+  assistant: ClementineAssistant;
+  prompt: string;
+  channelId: string;
+  userId: string;
+  guildId?: string | null;
+}): Promise<boolean> {
+  const normalized = normalizeCommandText(input.prompt);
+  const runtime = input.assistant.getRuntime();
+  const send = (text: string) => sendDiscordRestChunks(input.channelId, text);
+
+  if (await resolveNaturalApproval({
+    assistant: input.assistant,
+    text: normalized,
+    userId: input.userId,
+    channelId: input.channelId,
+    guildId: input.guildId,
+    send,
+  })) {
+    return true;
+  }
+
+  if (/^(approvals|pending approvals)$/i.test(normalized)) {
+    const approvals = relevantApprovalsForContext(input, runtime.listPendingApprovals());
+    await send(renderApprovalList(approvals));
+    for (const approval of approvals.slice(0, 5)) {
+      await sendDiscordRestComponentMessage(input.channelId, {
+        content: `Approval \`${approval.id}\` for \`${approval.toolName}\``,
+        components: buildApprovalActions(approval.id),
+      });
+    }
+    return true;
+  }
+
+  const match = normalized.match(/^(approve|reject)\s+([a-zA-Z0-9-]+)$/i);
+  if (match) {
+    const approved = match[1].toLowerCase() === 'approve';
+    const approvalId = match[2];
+    try {
+      const text = await resolveApprovalOrQueueBackgroundContinuation(input.assistant, approvalId, approved);
+      await send(text);
+    } catch (error) {
+      await send(`Failed to ${approved ? 'approve' : 'reject'} \`${approvalId}\`: ${error instanceof Error ? error.message : String(error)}`);
+    }
     return true;
   }
 
@@ -945,24 +1156,25 @@ async function handleButtonInteraction(interaction: ButtonInteraction, assistant
   try {
     if (action === 'approve' || action === 'reject') {
       const approved = action === 'approve';
-      const result = await assistant.getRuntime().resolveApproval(targetId, approved);
+      const text = await resolveApprovalOrQueueBackgroundContinuation(assistant, targetId, approved);
       await interaction.reply({
-        content: approvalResultText(result),
+        content: text,
         ephemeral: true,
       });
       return;
     }
 
     if (action === 'plan-approve') {
-      const result = approvePlanProposal(targetId);
+      const result = approvePlanAndQueueBackgroundTask(targetId);
       if (!result) {
         await interaction.reply({ content: `Plan \`${targetId}\` was not found or already resolved.`, ephemeral: true });
         return;
       }
       await interaction.reply({
         content: [
-          `✓ Plan approved: **${result.plan.objective}**`,
-          'A 15-minute auto-approval window is open. The agent will proceed without per-command interrupts.',
+          `✓ Plan approved: **${result.proposal.plan.objective}**`,
+          `Queued durable background task: \`${result.task.id}\`.`,
+          'A 15-minute auto-approval window is open for the approved plan scope.',
         ].join('\n'),
         ephemeral: true,
       });
@@ -1238,6 +1450,7 @@ async function pollDiscordDirectMessages(client: Client, assistant: ClementineAs
     try {
       const dm = await ensureDiscordDmChannel(userId);
       const messages = await listDiscordChannelMessages(dm.id, 15);
+      recordDiscordPollSuccess();
       if (messages.length === 0) {
         continue;
       }
@@ -1269,6 +1482,17 @@ async function pollDiscordDirectMessages(client: Client, assistant: ClementineAs
 
         const prompt = message.content.trim();
         if (!prompt) {
+          markDiscordDmMessageSeen(dm.id, message.id);
+          continue;
+        }
+
+        if (await handleDiscordRestCommand({
+          assistant,
+          prompt,
+          channelId: dm.id,
+          userId: message.author.id,
+          guildId: null,
+        })) {
           markDiscordDmMessageSeen(dm.id, message.id);
           continue;
         }
@@ -1328,7 +1552,7 @@ async function pollDiscordDirectMessages(client: Client, assistant: ClementineAs
         }
       }
     } catch (error) {
-      logger.error({ err: error, userId }, 'Discord DM polling failed');
+      recordDiscordPollFailure(error, userId);
     }
   }
 }
@@ -1341,7 +1565,8 @@ async function runDiscordDmPollingLoop(client: Client, assistant: ClementineAssi
       logger.error({ err: error }, 'Discord DM polling loop iteration failed');
     }
 
-    await new Promise((resolve) => setTimeout(resolve, Math.max(DISCORD_DM_POLL_INTERVAL_MS, 1000)));
+    const backoffRemaining = Math.max(0, dmPollBackoffUntil - Date.now());
+    await new Promise((resolve) => setTimeout(resolve, Math.max(DISCORD_DM_POLL_INTERVAL_MS, 1000, backoffRemaining)));
   }
 }
 

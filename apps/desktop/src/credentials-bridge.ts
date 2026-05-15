@@ -45,6 +45,7 @@ export type CredentialName =
   | 'openai_api_key'
   | 'discord_bot_token'
   | 'composio_api_key'
+  | 'recall_api_key'
   | 'codex_oauth_access_token'
   | 'codex_oauth_refresh_token'
   | 'webhook_secret';
@@ -58,11 +59,12 @@ export interface CredentialDescriptor {
 }
 
 export const KNOWN_CREDENTIALS: readonly CredentialDescriptor[] = [
-  { name: 'openai_api_key',  envVarName: 'OPENAI_API_KEY',  description: 'OpenAI API key — unlocks streaming runtime + embeddings + structured outputs.', setupHint: 'Starts with sk- — get one at platform.openai.com/api-keys', required: false },
+  { name: 'openai_api_key',  envVarName: 'OPENAI_API_KEY',  description: 'Optional OpenAI API key — enables embeddings, Realtime live voice, and direct OpenAI API features. Not required when the runtime uses Codex OAuth.', setupHint: 'Starts with sk- — get one at platform.openai.com/api-keys', required: false },
   { name: 'discord_bot_token', envVarName: 'DISCORD_BOT_TOKEN', description: 'Discord bot token — enables Clementine on Discord.', setupHint: 'Create at discord.com/developers/applications', required: false },
   { name: 'composio_api_key', envVarName: 'COMPOSIO_API_KEY', description: 'Composio API key — Gmail / Slack / Notion / GitHub / Linear / Drive / CRMs.', setupHint: 'Sign up at composio.dev', required: false },
-  { name: 'codex_oauth_access_token', envVarName: '', description: 'Codex OAuth access token (ChatGPT subscribers).', required: false },
-  { name: 'codex_oauth_refresh_token', envVarName: '', description: 'Codex OAuth refresh token (paired with access).', required: false },
+  { name: 'recall_api_key', envVarName: 'RECALL_API_KEY', description: 'Recall.ai API key — optional desktop meeting capture and transcripts.', setupHint: 'Sign up at recall.ai and create an API key.', required: false },
+  { name: 'codex_oauth_access_token', envVarName: '', description: 'Codex OAuth access token — primary runtime auth for ChatGPT/Codex subscribers.', required: false },
+  { name: 'codex_oauth_refresh_token', envVarName: '', description: 'Codex OAuth refresh token — renews ChatGPT/Codex auth silently.', required: false },
   { name: 'webhook_secret', envVarName: 'WEBHOOK_SECRET', description: 'Dashboard auth secret (URL token).', setupHint: 'Auto-generated on first launch.', required: true },
 ];
 

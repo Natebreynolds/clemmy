@@ -91,29 +91,29 @@ test('researcher CANNOT ask user questions (it gathers, the orchestrator decides
   assert.equal(SUB_AGENT_TOOL_ALLOWLISTS.researcher.has('ask_user_question'), false);
 });
 
-test('buildResearcherAgent returns a configured Agent with handoffDescription', () => {
-  const agent = buildResearcherAgent();
+test('buildResearcherAgent returns a configured Agent with handoffDescription', async () => {
+  const agent = await buildResearcherAgent();
   assert.equal(agent.name, 'Researcher');
   assert.ok(agent.handoffDescription, 'handoffDescription required so orchestrator knows when to delegate');
   assert.match(agent.handoffDescription, /information|gather|read/i);
 });
 
-test('buildExecutorAgent returns a configured Agent with handoffDescription', () => {
-  const agent = buildExecutorAgent();
+test('buildExecutorAgent returns a configured Agent with handoffDescription', async () => {
+  const agent = await buildExecutorAgent();
   assert.equal(agent.name, 'Executor');
   assert.ok(agent.handoffDescription);
   assert.match(agent.handoffDescription, /work|decision|perform/i);
 });
 
-test('build specialized agents return configured Agents with handoffDescription', () => {
-  for (const agent of [buildWriterAgent(), buildReviewerAgent(), buildDeployerAgent()]) {
+test('build specialized agents return configured Agents with handoffDescription', async () => {
+  for (const agent of await Promise.all([buildWriterAgent(), buildReviewerAgent(), buildDeployerAgent()])) {
     assert.ok(agent.name);
     assert.ok(agent.handoffDescription);
   }
 });
 
-test('defaultOrchestratorHandoffs returns the specialized sub-agent set', () => {
-  const handoffs = defaultOrchestratorHandoffs();
+test('defaultOrchestratorHandoffs returns the specialized sub-agent set', async () => {
+  const handoffs = await defaultOrchestratorHandoffs();
   assert.equal(handoffs.length, 5);
   const names = handoffs.map(handoffDisplayName);
   assert.ok(names.includes('Researcher'));
@@ -123,26 +123,26 @@ test('defaultOrchestratorHandoffs returns the specialized sub-agent set', () => 
   assert.ok(names.includes('Deployer'));
 });
 
-test('execution handoffs are gated by default and ungated by option', () => {
-  const gated = defaultOrchestratorHandoffs();
+test('execution handoffs are gated by default and ungated by option', async () => {
+  const gated = await defaultOrchestratorHandoffs();
   const executor = gated.find((entry) => handoffDisplayName(entry) === 'Executor') as { isEnabled?: unknown } | undefined;
   const deployer = gated.find((entry) => handoffDisplayName(entry) === 'Deployer') as { isEnabled?: unknown } | undefined;
   assert.equal(typeof executor?.isEnabled, 'function');
   assert.equal(typeof deployer?.isEnabled, 'function');
 
-  const ungated = defaultOrchestratorHandoffs({ requireWorkflowApprovalForExecution: false });
+  const ungated = await defaultOrchestratorHandoffs({ requireWorkflowApprovalForExecution: false });
   const ungatedExecutor = ungated.find((entry) => handoffDisplayName(entry) === 'Executor') as { isEnabled?: unknown } | undefined;
   assert.equal(ungatedExecutor?.isEnabled, undefined);
 });
 
-test('sub-agents do NOT have their own handoffs (they are leaves)', () => {
-  const agents = [
+test('sub-agents do NOT have their own handoffs (they are leaves)', async () => {
+  const agents = await Promise.all([
     buildResearcherAgent(),
     buildWriterAgent(),
     buildReviewerAgent(),
     buildExecutorAgent(),
     buildDeployerAgent(),
-  ];
+  ]);
   // SDK exposes handoffs on Agent; sub-agents leave it undefined / empty.
   // We tolerate either undefined or empty array depending on SDK defaults.
   for (const agent of agents) {

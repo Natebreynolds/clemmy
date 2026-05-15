@@ -369,7 +369,23 @@ function extractDescription(dirPath: string, entries: string[]): string {
   return '';
 }
 
+// listWorkspaceProjects walks every configured workspace dir + a fan
+// of macOS standard locations, stat'ing each subdir against
+// PROJECT_MARKERS. With Spotlight/iCloud-mirrored dirs this can take
+// 30+ seconds — way too slow for the dashboard which calls it on
+// every projects-panel open. Cache the unfiltered list and re-filter
+// in-process. TTL is short so projects added during the session
+// surface within a minute.
+const PROJECT_LIST_CACHE_TTL_MS = 60_000;
+let projectListCache: { at: number; projects: WorkspaceProject[] } | null = null;
+
 export function listWorkspaceProjects(filter?: string): WorkspaceProject[] {
+  if (projectListCache && Date.now() - projectListCache.at < PROJECT_LIST_CACHE_TTL_MS) {
+    const filtered = filter
+      ? projectListCache.projects.filter((p) => p.name.toLowerCase().includes(filter.toLowerCase()))
+      : projectListCache.projects;
+    return filtered;
+  }
   const projects: WorkspaceProject[] = [];
   const seen = new Set<string>();
 
@@ -389,11 +405,10 @@ export function listWorkspaceProjects(filter?: string): WorkspaceProject[] {
         if (seen.has(resolved)) continue;
 
         const subEntries = readdirSync(candidate);
-        const isProject = PROJECT_MARKERS.some((marker) => subEntries.includes(marker) || existsSync(path.join(candidate, marker)));
+        const isProject = PROJECT_MARKERS.some((marker) => subEntries.includes(marker));
         if (!isProject) continue;
 
         const name = path.basename(candidate);
-        if (filter && !name.toLowerCase().includes(filter.toLowerCase())) continue;
 
         seen.add(resolved);
         projects.push({
@@ -409,7 +424,17 @@ export function listWorkspaceProjects(filter?: string): WorkspaceProject[] {
     }
   }
 
-  return projects.sort((left, right) => left.name.localeCompare(right.name));
+  const sorted = projects.sort((left, right) => left.name.localeCompare(right.name));
+  projectListCache = { at: Date.now(), projects: sorted };
+  if (filter) {
+    return sorted.filter((p) => p.name.toLowerCase().includes(filter.toLowerCase()));
+  }
+  return sorted;
+}
+
+/** Force the projects cache to refresh on next call. */
+export function invalidateWorkspaceProjectsCache(): void {
+  projectListCache = null;
 }
 
 export interface TeamAgentRecord {

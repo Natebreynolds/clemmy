@@ -5,7 +5,7 @@ import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { getOpenAiApiKey, getRuntimeEnv, MODELS } from '../config.js';
 import { getCoreTools } from '../tools/registry.js';
-import { createConfiguredMcpServers } from '../runtime/mcp-servers.js';
+import { getOrCreateConfiguredMcpServers } from '../runtime/mcp-servers.js';
 import { autonomyV2OutputGuardrails } from './autonomy-guardrails.js';
 import { getProactivityPolicySnapshot, type ProactivityPolicy, type ProactivityPolicySnapshot } from './proactivity-policy.js';
 import { renderOpenCheckInsForAgent } from './check-ins.js';
@@ -464,6 +464,16 @@ const agentCache = new Map<string, AgentCacheEntry>();
 let runner: Runner | null = null;
 
 /**
+ * Drop every cached autonomy agent. Called when the MCP server config
+ * changes (dashboard add/edit/delete) so the next cycle constructs a
+ * fresh agent against the new namespace shim instead of holding the
+ * old one.
+ */
+export function clearAutonomyAgentCache(): void {
+  agentCache.clear();
+}
+
+/**
  * WeakMap from Agent instance → active runId for the current cycle.
  * Hooks attached to a cached Agent read this to know which run to log
  * into. Per-slug cycles run in parallel safely because each slug has
@@ -513,7 +523,7 @@ function policyFingerprint(policy: ProactivityPolicy): string {
  * filter doesn't depend on the dashboard module.
  */
 export function categorizeToolForPolicy(name: string): 'composio' | 'computer' | 'other' {
-  if (name.startsWith('composio_')) return 'composio';
+  if (name.startsWith('composio_') || name.startsWith('cx_')) return 'composio';
   if ([
     'run_shell_command',
     'write_file',
@@ -550,7 +560,7 @@ export function filterToolsByPolicy<T extends PolicyFilterableTool>(
   });
 }
 
-function getAgent(record: TeamAgentRecord, policy: ProactivityPolicy): AutonomyAgent {
+async function getAgent(record: TeamAgentRecord, policy: ProactivityPolicy): Promise<AutonomyAgent> {
   const cached = agentCache.get(record.slug);
   const recFp = recordHash(record);
   const polFp = policyFingerprint(policy);
@@ -570,7 +580,7 @@ function getAgent(record: TeamAgentRecord, policy: ProactivityPolicy): AutonomyA
   // The primary `clementine` agent is the orchestrator by default;
   // other slugs can opt in via AUTONOMY_ORCHESTRATOR_SLUGS env var.
   const handoffs = isOrchestratorSlug(record.slug)
-    ? defaultOrchestratorHandoffs({
+    ? await defaultOrchestratorHandoffs({
       requireWorkflowApprovalForExecution: policy.requireWorkflowApprovalForExecution,
     })
     : undefined;
@@ -583,7 +593,10 @@ function getAgent(record: TeamAgentRecord, policy: ProactivityPolicy): AutonomyA
     outputGuardrails: autonomyV2OutputGuardrails,
     tools,
     handoffs,
-    mcpServers: createConfiguredMcpServers(),
+    // Single namespace-shimmed MCP server — flattens every configured
+    // server's tools under `<server>__<tool>` names so duplicate-name
+    // collisions across installs cannot throw at agent construction.
+    mcpServers: [getOrCreateConfiguredMcpServers()],
   });
 
   // Per-tool lifecycle hooks. Resolve the active runId via WeakMap so
@@ -727,7 +740,7 @@ async function runAgentCycleV2(record: TeamAgentRecord): Promise<{ runId: string
   const policyEvent = buildPolicyEvent(policySnapshot);
   addRunEvent(runId, policyEvent);
 
-  const agent = getAgent(record, policy);
+  const agent = await getAgent(record, policy);
   const input = buildAgentInput(record, inboxItems, state, policy);
   currentRunIdByAgent.set(agent, runId);
 

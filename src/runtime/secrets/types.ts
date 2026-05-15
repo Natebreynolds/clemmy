@@ -41,6 +41,7 @@ export type SecretName =
   | 'openai_api_key'
   | 'discord_bot_token'
   | 'composio_api_key'
+  | 'recall_api_key'
   | 'codex_oauth_access_token'
   | 'codex_oauth_refresh_token'
   | 'webhook_secret';

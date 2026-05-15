@@ -28,6 +28,17 @@ const api = {
   tailLog: (maxLines?: number) => ipcRenderer.invoke('clemmy:tail-log', maxLines) as Promise<{ lines: string[] }>,
   /** Open the log file in the OS default viewer. */
   openLogs: () => ipcRenderer.invoke('clemmy:open-logs') as Promise<{ opened: boolean }>,
+  /** Optional Recall.ai Desktop Recording SDK integration. */
+  recallStatus: () => ipcRenderer.invoke('clemmy:recall-status') as Promise<Record<string, unknown> | null>,
+  recallConfigure: (settings: Record<string, unknown>) => ipcRenderer.invoke('clemmy:recall-configure', settings) as Promise<Record<string, unknown> | null>,
+  recallRequestPermissions: () => ipcRenderer.invoke('clemmy:recall-request-permissions') as Promise<Record<string, unknown> | null>,
+  recallStartManual: () => ipcRenderer.invoke('clemmy:recall-start-manual') as Promise<Record<string, unknown> | null>,
+  recallStop: () => ipcRenderer.invoke('clemmy:recall-stop') as Promise<Record<string, unknown> | null>,
+  onRecallEvent: (cb: (event: Record<string, unknown>) => void) => {
+    const handler = (_event: unknown, payload: Record<string, unknown>) => cb(payload);
+    ipcRenderer.on('clemmy:recall-event', handler);
+    return () => ipcRenderer.removeListener('clemmy:recall-event', handler);
+  },
   /** Subscribe to supervisor lifecycle events (starting/running/ready/exit/restart). */
   onSupervisorEvent: (cb: (event: Record<string, unknown>) => void) => {
     const handler = (event: CustomEvent<Record<string, unknown>>) => cb(event.detail);

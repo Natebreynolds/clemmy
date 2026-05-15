@@ -1,8 +1,8 @@
 /**
  * Clementine Console — the new operational dashboard surface.
  *
- * Lives at /console alongside the existing /dashboard. Distinct visual
- * language ("operational console" aesthetic) and surfaces that scale
+ * Lives at /console as the primary Electron UI. Distinct visual language
+ * ("operational console" aesthetic) and surfaces that scale
  * to the full vision: agent management, workflows, skills, tool catalog,
  * memory navigator, project picker, workflow studio with chat.
  *
@@ -37,66 +37,193 @@ export function renderConsoleHtml(token: string): string {
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Clementine // Console</title>
-  <link rel="icon" href="data:," />
+  <link rel="icon" href="/console/icon.png" />
   <style>${CONSOLE_CSS}</style>
+  <script src="/console/vendor/cytoscape.min.js" defer></script>
 </head>
 <body>
   <div class="grid">
 
     <header class="status-bar">
       <div class="brand">
-        <span class="pulse" aria-hidden="true"></span>
-        <span class="brand-mark">CLEMENTINE</span>
-        <span class="brand-sep">//</span>
-        <span class="brand-sub">CONSOLE</span>
+        <img class="brand-icon" src="/console/icon.png" alt="" />
+        <div class="brand-words">
+          <span class="brand-mark">Clementine</span>
+          <span class="brand-sub" data-daemon-version>v0.1.0 · console</span>
+        </div>
       </div>
       <div class="status-row" data-status-row>
         <span class="stat" data-stat-runs>RUNS · <em>—</em></span>
         <span class="stat" data-stat-memory>MEM · <em>—</em></span>
         <span class="stat" data-stat-approvals>APPRV · <em>—</em></span>
         <span class="stat" data-stat-policy>MODE · <em>—</em></span>
-        <span class="stat connection" data-stat-connection>● ONLINE</span>
+        <span class="stat connection" data-stat-connection>
+          <span class="pulse" aria-hidden="true"></span>
+          <span data-conn-label>ONLINE</span>
+        </span>
+        <button class="theme-toggle" data-theme-toggle aria-label="Toggle light/dark mode" title="Toggle light/dark">
+          <span class="theme-toggle-icon" data-theme-icon>◐</span>
+        </button>
       </div>
     </header>
 
     <nav class="sidebar" aria-label="Console sections">
-      <button class="nav active" data-panel="activity">
+      <button class="nav active" data-panel="home">
         <span class="nav-key">01</span>
+        <span class="nav-label">Home</span>
+      </button>
+      <button class="nav" data-panel="activity">
+        <span class="nav-key">02</span>
         <span class="nav-label">Activity</span>
       </button>
       <button class="nav" data-panel="memory">
-        <span class="nav-key">02</span>
+        <span class="nav-key">03</span>
         <span class="nav-label">Memory</span>
       </button>
+      <button class="nav" data-panel="context">
+        <span class="nav-key">04</span>
+        <span class="nav-label">Context</span>
+      </button>
       <button class="nav" data-panel="workflows">
-        <span class="nav-key">03</span>
+        <span class="nav-key">05</span>
         <span class="nav-label">Workflows</span>
       </button>
       <button class="nav" data-panel="tools">
-        <span class="nav-key">04</span>
+        <span class="nav-key">06</span>
         <span class="nav-label">Tools</span>
       </button>
       <button class="nav" data-panel="projects">
-        <span class="nav-key">05</span>
+        <span class="nav-key">07</span>
         <span class="nav-label">Projects</span>
       </button>
       <button class="nav" data-panel="skills">
-        <span class="nav-key">06</span>
+        <span class="nav-key">08</span>
         <span class="nav-label">Skills</span>
       </button>
+      <button class="nav" data-panel="integrations">
+        <span class="nav-key">09</span>
+        <span class="nav-label">Integrations</span>
+      </button>
       <button class="nav" data-panel="settings">
-        <span class="nav-key">07</span>
+        <span class="nav-key">10</span>
         <span class="nav-label">Settings</span>
       </button>
-      <div class="nav-foot">
-        <a class="nav-foot-link" href="/dashboard?token=${esc(token)}">↗ classic dashboard</a>
-      </div>
     </nav>
 
-    <main class="panel" data-active-panel="activity">
+    <main class="panel" data-active-panel="home">
 
-      <section class="panel-frame" data-section="activity">
-        <div class="panel-tag">PANEL · 01 · ACTIVITY PULSE</div>
+      <section class="panel-frame" data-section="home">
+        <div class="panel-tag">PANEL · 01 · HOME</div>
+
+        <div class="panel-body home-layout">
+
+          <header class="home-welcome">
+            <div class="home-greet">
+              <h2 data-home-greeting>Hello.</h2>
+              <p data-home-sub>Loading status…</p>
+            </div>
+            <div class="home-tiles">
+              <button class="home-tile" data-home-tile="approvals">
+                <span class="home-tile-label">approvals</span>
+                <span class="home-tile-value" data-home-approvals>—</span>
+              </button>
+              <button class="home-tile" data-home-tile="plans">
+                <span class="home-tile-label">plans</span>
+                <span class="home-tile-value" data-home-plans>—</span>
+              </button>
+              <button class="home-tile" data-home-tile="proposals">
+                <span class="home-tile-label">proposals</span>
+                <span class="home-tile-value" data-home-proposals>—</span>
+              </button>
+              <button class="home-tile" data-home-tile="checkins">
+                <span class="home-tile-label">check-ins</span>
+                <span class="home-tile-value" data-home-checkins>—</span>
+              </button>
+            </div>
+          </header>
+
+          <div class="home-block home-chat">
+            <div class="home-block-head">
+              <span>CHAT WITH CLEMENTINE</span>
+              <span class="home-chat-meta" data-home-chat-meta>local session</span>
+            </div>
+            <div class="home-chat-thread" data-home-chat-thread>
+              <div class="home-chat-hint">
+                <div class="home-chat-hint-title">Ask anything.</div>
+                <div class="home-chat-hint-sub">Try a quick prompt to get started:</div>
+                <div class="home-chat-suggestions">
+                  <button type="button" class="home-chat-suggest" data-home-chat-suggest="what's on my plate today">what's on my plate today</button>
+                  <button type="button" class="home-chat-suggest" data-home-chat-suggest="show me my open salesforce accounts that haven't been touched in 14 days">stale Salesforce accounts</button>
+                  <button type="button" class="home-chat-suggest" data-home-chat-suggest="summarize what got done yesterday">recap yesterday</button>
+                </div>
+              </div>
+            </div>
+            <form class="home-chat-form" data-home-chat-form>
+              <input type="text" class="home-chat-input" data-home-chat-input
+                placeholder="message Clementine…" autocomplete="off" />
+              <button type="submit" class="home-chat-send">SEND ↵</button>
+            </form>
+            <div class="home-voice-panel" data-home-voice-panel>
+              <button type="button" class="home-voice-orb-button" data-home-voice-toggle aria-label="Start live voice" title="Start live voice">
+                <span class="home-voice-ring ring-a" aria-hidden="true"></span>
+                <span class="home-voice-ring ring-b" aria-hidden="true"></span>
+                <span class="home-voice-core">
+                  <img src="/console/icon.png" alt="" class="home-voice-avatar" />
+                  <span class="home-voice-face mouth" aria-hidden="true"></span>
+                  <span class="home-voice-face cheek cheek-left" aria-hidden="true"></span>
+                  <span class="home-voice-face cheek cheek-right" aria-hidden="true"></span>
+                  <span class="home-voice-scan" aria-hidden="true"></span>
+                </span>
+                <span class="home-voice-wave" aria-hidden="true">
+                  <i></i><i></i><i></i><i></i>
+                </span>
+              </button>
+              <div class="home-voice-copy">
+                <div class="home-voice-title-row">
+                  <div class="home-voice-title">Clementine Live</div>
+                  <span class="home-voice-phase" data-home-voice-phase>STANDBY</span>
+                </div>
+                <div class="home-voice-status" data-home-voice-status>Optional: add an OpenAI API key to enable live voice.</div>
+                <div class="home-voice-transcript" data-home-voice-transcript>Voice commands that need local work route back through Clementine approvals.</div>
+                <div class="home-voice-feed" data-home-voice-feed>
+                  <span>Realtime state, local handoffs, and SDK streaming will appear here.</span>
+                </div>
+              </div>
+              <div class="home-voice-actions">
+                <button type="button" class="home-voice-btn ghost" data-home-voice-expand>FOCUS</button>
+                <button type="button" class="home-voice-btn ghost" data-home-voice-handoff disabled>SEND LAST TURN</button>
+              </div>
+              <audio data-home-voice-audio autoplay></audio>
+            </div>
+          </div>
+
+          <div class="home-secondary">
+            <div class="home-block home-agenda">
+              <div class="home-block-head">
+                <span>LINED UP TODAY</span>
+                <em data-home-agenda-count>—</em>
+              </div>
+              <div class="home-block-body" data-home-agenda>
+                <div class="home-empty">— loading —</div>
+              </div>
+            </div>
+
+            <div class="home-block home-done">
+              <div class="home-block-head">
+                <span>COMPLETED TODAY</span>
+                <em data-home-done-count>—</em>
+              </div>
+              <div class="home-block-body" data-home-done>
+                <div class="home-empty">— loading —</div>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </section>
+
+      <section class="panel-frame" data-section="activity" hidden>
+        <div class="panel-tag">PANEL · 02 · ACTIVITY PULSE</div>
 
         <div class="panel-body activity-layout">
 
@@ -128,7 +255,7 @@ export function renderConsoleHtml(token: string): string {
       </section>
 
       <section class="panel-frame" data-section="memory" hidden>
-        <div class="panel-tag">PANEL · 02 · MEMORY NAVIGATOR</div>
+        <div class="panel-tag">PANEL · 03 · MEMORY NAVIGATOR</div>
 
         <div class="panel-body memory-layout">
 
@@ -169,11 +296,17 @@ export function renderConsoleHtml(token: string): string {
           </aside>
 
           <div class="mem-main">
-            <div class="mem-search">
-              <input type="search" class="mem-search-input" data-mem-search
-                placeholder="search vault · FTS + embedding rerank · ⏎ to query"
-                autocomplete="off" spellcheck="false" />
-              <span class="mem-search-meta" data-mem-search-meta>—</span>
+            <div class="mem-toolbar">
+              <div class="mem-view-toggle">
+                <button class="mem-view-btn active" data-mem-view="viewer">VIEWER</button>
+                <button class="mem-view-btn" data-mem-view="graph">GRAPH</button>
+              </div>
+              <div class="mem-search">
+                <input type="search" class="mem-search-input" data-mem-search
+                  placeholder="search vault · FTS + embedding rerank · ⏎ to query"
+                  autocomplete="off" spellcheck="false" />
+                <span class="mem-search-meta" data-mem-search-meta>—</span>
+              </div>
             </div>
 
             <div class="mem-viewer" data-mem-viewer>
@@ -182,13 +315,132 @@ export function renderConsoleHtml(token: string): string {
                 <div class="mem-empty-text">SEARCH OR SELECT A FILE / FACT</div>
               </div>
             </div>
+
+            <div class="mem-graph" data-mem-graph hidden>
+              <div class="mem-graph-canvas" data-mem-graph-canvas></div>
+              <aside class="mem-graph-detail" data-mem-graph-detail>
+                <div class="mem-graph-detail-empty">Hover or click a node to inspect.</div>
+              </aside>
+              <div class="mem-graph-legend">
+                <span><i class="dot fact"></i> Fact</span>
+                <span><i class="dot file"></i> File</span>
+                <span><i class="dot kind"></i> Kind cluster</span>
+              </div>
+            </div>
           </div>
 
         </div>
       </section>
 
+      <section class="panel-frame" data-section="context" hidden>
+        <div class="panel-tag">PANEL · 04 · CONTEXT / IDENTITY</div>
+
+        <div class="panel-body context-layout">
+          <header class="context-header">
+            <div>
+              <h3>Agent Context</h3>
+              <p>What Clementine knows before it talks, acts, or listens. Keep the core identity files useful, then add durable facts and goals as the operating picture changes.</p>
+            </div>
+            <div class="context-stats" data-context-stats>
+              <div class="stat-card"><span>FILES</span><em data-context-files-count>—</em></div>
+              <div class="stat-card"><span>FACTS</span><em data-context-facts-count>—</em></div>
+              <div class="stat-card"><span>GOALS</span><em data-context-goals-count>—</em></div>
+              <div class="stat-card"><span>VOICE CTX</span><em data-context-voice-count>—</em></div>
+            </div>
+          </header>
+
+          <div class="context-grid">
+            <section class="context-card context-profile-card">
+              <div class="context-card-head">
+                <span>USER PROFILE</span>
+                <em data-context-profile-meta>—</em>
+              </div>
+              <form class="context-profile-form" data-context-profile-form>
+                <div class="context-form-grid">
+                  <label>Preferred name<input name="preferredName" data-context-profile-field autocomplete="off" /></label>
+                  <label>Role<input name="role" data-context-profile-field autocomplete="off" /></label>
+                  <label>Timezone<input name="timezone" data-context-profile-field placeholder="America/Los_Angeles" autocomplete="off" /></label>
+                  <label>Tone
+                    <select name="communicationTone" data-context-profile-field>
+                      <option value="terse">terse</option>
+                      <option value="balanced">balanced</option>
+                      <option value="verbose">verbose</option>
+                    </select>
+                  </label>
+                </div>
+                <label class="context-notes-label">Notes<textarea name="notes" data-context-profile-field rows="3" placeholder="Standing preferences, work style, people/projects Clementine should respect."></textarea></label>
+                <button type="submit" class="context-save">SAVE PROFILE ✎</button>
+              </form>
+            </section>
+
+            <section class="context-card context-health-card">
+              <div class="context-card-head">
+                <span>CONTEXT HEALTH</span>
+                <button type="button" data-context-refresh>REFRESH</button>
+              </div>
+              <div class="context-health-list" data-context-health-list>
+                <div class="settings-info">— loading —</div>
+              </div>
+            </section>
+          </div>
+
+          <section class="context-card">
+            <div class="context-card-head">
+              <span>CORE CONTEXT FILES</span>
+              <em>loaded into chat, Discord, and live voice</em>
+            </div>
+            <div class="context-files" data-context-files>
+              <div class="settings-info">— loading —</div>
+            </div>
+          </section>
+
+          <div class="context-grid lower">
+            <section class="context-card">
+              <div class="context-card-head">
+                <span>STANDING MEMORY</span>
+                <em>durable facts injected on every run</em>
+              </div>
+              <form class="context-fact-form" data-context-fact-form>
+                <select name="kind">
+                  <option value="user">user</option>
+                  <option value="project">project</option>
+                  <option value="feedback">feedback</option>
+                  <option value="reference">reference</option>
+                </select>
+                <input name="content" placeholder="Clementine should remember…" autocomplete="off" />
+                <button type="submit">REMEMBER</button>
+              </form>
+              <div class="context-facts-list" data-context-facts-list>
+                <div class="settings-info">— loading —</div>
+              </div>
+            </section>
+
+            <section class="context-card">
+              <div class="context-card-head">
+                <span>ACTIVE GOALS</span>
+                <em>what proactive work should optimize around</em>
+              </div>
+              <form class="context-goal-form" data-context-goal-form>
+                <input name="title" placeholder="Goal title" autocomplete="off" />
+                <select name="priority">
+                  <option value="high">high</option>
+                  <option value="medium" selected>medium</option>
+                  <option value="low">low</option>
+                </select>
+                <textarea name="description" rows="2" placeholder="Why this matters and what done looks like."></textarea>
+                <textarea name="nextActions" rows="2" placeholder="Next actions, one per line."></textarea>
+                <button type="submit">CREATE GOAL</button>
+              </form>
+              <div class="context-goals-list" data-context-goals-list>
+                <div class="settings-info">— loading —</div>
+              </div>
+            </section>
+          </div>
+        </div>
+      </section>
+
       <section class="panel-frame" data-section="workflows" hidden>
-        <div class="panel-tag">PANEL · 03 · WORKFLOW STUDIO</div>
+        <div class="panel-tag">PANEL · 05 · WORKFLOW STUDIO</div>
 
         <div class="panel-body wf-layout">
 
@@ -205,9 +457,14 @@ export function renderConsoleHtml(token: string): string {
 
           <!-- Editor (middle) -->
           <div class="wf-editor" data-wf-editor>
-            <div class="wf-empty">
+            <div class="wf-empty wf-empty-onboarding">
               <div class="wf-empty-mark">⊟</div>
-              <div class="wf-empty-text">SELECT A WORKFLOW OR ＋NEW</div>
+              <div class="wf-empty-text">No workflow selected</div>
+              <p class="wf-empty-sub">A workflow is a multi-step task you can run on demand or on a schedule. Steps can depend on each other, share inputs, and synthesize a final output.</p>
+              <div class="wf-empty-actions">
+                <button class="wf-empty-btn primary" data-wf-new>＋ NEW WORKFLOW</button>
+                <button class="wf-empty-btn" data-wf-empty-architect>ASK ARCHITECT TO DRAFT ONE →</button>
+              </div>
             </div>
           </div>
 
@@ -237,7 +494,7 @@ export function renderConsoleHtml(token: string): string {
       </section>
 
       <section class="panel-frame" data-section="tools" hidden>
-        <div class="panel-tag">PANEL · 04 · TOOLS CATALOG</div>
+        <div class="panel-tag">PANEL · 06 · TOOLS</div>
         <div class="panel-body tools-layout">
 
           <aside class="tools-side">
@@ -260,14 +517,14 @@ export function renderConsoleHtml(token: string): string {
                 <div class="tools-empty">— loading —</div>
               </div>
             </div>
-
             <div class="tools-section">
               <div class="tools-section-head">
-                <span>DISCOVERED MCP SERVERS</span>
+                <span>MCP SERVERS</span>
                 <em data-mcp-count>—</em>
               </div>
-              <div class="mcp-grid" data-mcp-grid>
-                <div class="tools-empty">— loading —</div>
+              <div class="tools-empty">
+                Discovered + custom MCP servers live in <a class="tools-jump" data-tools-jump="integrations">Integrations</a>.
+                Toggle, edit, or add new ones there — anything the agent can call is reflected back here as a tool.
               </div>
             </div>
           </div>
@@ -276,7 +533,7 @@ export function renderConsoleHtml(token: string): string {
       </section>
 
       <section class="panel-frame" data-section="projects" hidden>
-        <div class="panel-tag">PANEL · 05 · PROJECTS</div>
+        <div class="panel-tag">PANEL · 07 · PROJECTS</div>
         <div class="panel-body projects-layout">
 
           <aside class="proj-side">
@@ -307,7 +564,7 @@ export function renderConsoleHtml(token: string): string {
       </section>
 
       <section class="panel-frame" data-section="skills" hidden>
-        <div class="panel-tag">PANEL · 06 · SKILLS</div>
+        <div class="panel-tag">PANEL · 08 · SKILLS</div>
         <div class="panel-body skills-layout">
 
           <div class="skills-header">
@@ -329,8 +586,81 @@ export function renderConsoleHtml(token: string): string {
         </div>
       </section>
 
+      <section class="panel-frame" data-section="integrations" hidden>
+        <div class="panel-tag">PANEL · 09 · INTEGRATIONS</div>
+
+        <div class="panel-body integrations-layout">
+
+          <header class="hub-header">
+            <div>
+              <h3>Integrations Hub</h3>
+              <p>One place to connect your APIs, third-party apps, and local MCP servers. Anything you add here becomes a tool the agent can call.</p>
+            </div>
+            <div class="hub-stats">
+              <div class="stat-card"><span>AUTH</span><em data-hub-keys>—</em></div>
+              <div class="stat-card"><span>APPS</span><em data-hub-apps>—</em></div>
+              <div class="stat-card"><span>MCP</span><em data-hub-mcp>—</em></div>
+            </div>
+          </header>
+
+          <div class="hub-block">
+            <div class="hub-block-head">
+              <span class="hub-block-title">Runtime Auth & Capability Keys</span>
+              <span class="hub-block-meta" data-hub-keys-meta>—</span>
+            </div>
+            <p class="hub-block-intro">Codex OAuth runs the agent runtime. An OpenAI API key is separate and optional: it unlocks embeddings, Realtime live voice, and direct API-only features. Discord, Composio, and webhook secrets are separate integration keys.</p>
+            <div class="hub-keys-list" data-hub-keys-list>
+              <div class="settings-info">— loading —</div>
+            </div>
+          </div>
+
+          <div class="hub-block">
+            <div class="hub-block-head">
+              <span class="hub-block-title">Connected Apps</span>
+              <span class="hub-block-meta" data-hub-apps-meta>—</span>
+            </div>
+            <p class="hub-block-intro">Third-party apps you connect via Composio — Gmail, Slack, Notion, GitHub, Linear, Calendar, Drive, CRMs. One OAuth click per app; the agent can then read/write within the scopes you approved.</p>
+            <div class="hub-apps-controls" data-hub-apps-controls>
+              <div class="settings-info">— loading —</div>
+            </div>
+            <div class="hub-apps-list" data-hub-apps-list>
+              <div class="settings-info">— loading —</div>
+            </div>
+          </div>
+
+          <div class="hub-block">
+            <div class="hub-block-head">
+              <span class="hub-block-title">Meeting Capture</span>
+              <span class="hub-block-meta" data-hub-recall-meta>—</span>
+            </div>
+            <p class="hub-block-intro">Optional Recall.ai Desktop Recording SDK capture for Zoom, Google Meet, Teams, Slack Huddles, and in-person meetings. The SDK only loads inside the Electron app after you enable it.</p>
+            <div class="hub-apps-controls" data-hub-recall-controls>
+              <div class="settings-info">— loading —</div>
+            </div>
+            <div class="hub-apps-list" data-hub-recall-list>
+              <div class="settings-info">— loading —</div>
+            </div>
+          </div>
+
+          <div class="hub-block">
+            <div class="hub-block-head">
+              <span class="hub-block-title">MCP Servers</span>
+              <span class="hub-block-meta" data-hub-mcp-meta>—</span>
+            </div>
+            <p class="hub-block-intro">Model Context Protocol servers extend the agent's tool surface with things like filesystem access, browser control, Playwright, Pinecone, Airtable, custom internal tools. Existing local MCP client configs can be imported automatically, but Clementine-owned config is the primary setup path.</p>
+            <div class="hub-mcp-list" data-hub-mcp-list>
+              <div class="settings-info">— loading —</div>
+            </div>
+            <div class="hub-mcp-actions">
+              <button class="hub-btn-add" data-hub-mcp-new>+ ADD CUSTOM SERVER</button>
+            </div>
+          </div>
+
+        </div>
+      </section>
+
       <section class="panel-frame" data-section="settings" hidden>
-        <div class="panel-tag">PANEL · 07 · SETTINGS</div>
+        <div class="panel-tag">PANEL · 10 · SETTINGS</div>
         <div class="panel-body settings-layout">
 
           <div class="settings-col">
@@ -400,7 +730,7 @@ export function renderConsoleHtml(token: string): string {
             </div>
 
             <div class="settings-block">
-              <div class="settings-block-head">AUTH</div>
+              <div class="settings-block-head">RUNTIME AUTH</div>
               <div class="settings-info" data-settings-auth>—</div>
             </div>
           </div>
@@ -431,6 +761,18 @@ export function renderConsoleHtml(token: string): string {
                     <label>CHECK-IN MINUTES</label>
                     <input type="number" name="checkInMinutes" data-policy-field min="1" max="60" />
                   </div>
+                </div>
+                <div class="settings-field">
+                  <label>AUTO-APPROVE SCOPE</label>
+                  <select name="autoApproveScope" data-policy-field>
+                    <option value="strict">strict — every shell/write asks (default)</option>
+                    <option value="workspace">workspace — auto inside ~/Desktop, ~/Documents, ~/Developer, etc.</option>
+                    <option value="yolo">YOLO — auto everywhere (only the danger denylist applies)</option>
+                  </select>
+                  <span class="hint" style="display:block; margin-top: 4px; color: var(--fg-3); font-size: 10.5px; line-height: 1.5;">
+                    Plan-scoped approvals (15 min) always work on top of this. The hard denylist (<code>rm -rf /</code>, <code>sudo</code>, fork bombs, disk wipes) is enforced regardless.
+                    <strong style="color: var(--accent-warn);">YOLO trusts the agent to run anywhere the user can</strong> — use when you want zero friction.
+                  </span>
                 </div>
                 <div class="settings-grid-2">
                   <div class="settings-field">
@@ -525,8 +867,12 @@ export function renderConsoleHtml(token: string): string {
 
             <div class="settings-block">
               <div class="settings-block-head">
-                CREDENTIALS HEALTH
+                CREDENTIAL VAULT
                 <span class="creds-meta" data-creds-meta>—</span>
+              </div>
+              <div class="settings-info" style="padding: 0 16px 8px; line-height: 1.5;">
+                Per-credential edit, repair, and reset live here.
+                Codex OAuth runtime credentials and optional capability keys are shown separately in <a class="tools-jump" data-tools-jump="integrations">Integrations</a>.
               </div>
               <div class="creds-list" data-creds-list>
                 <div class="settings-info">— loading —</div>
@@ -550,7 +896,8 @@ export function renderConsoleHtml(token: string): string {
     <footer class="foot-bar">
       <span class="foot-cell">poll · 2s</span>
       <span class="foot-cell">last · <em data-last-sync>—</em></span>
-      <span class="foot-cell foot-right">⌘ K coming soon</span>
+      <span class="foot-cell" data-foot-version>—</span>
+      <span class="foot-cell foot-right">⌘K · coming soon</span>
     </footer>
 
   </div>
@@ -568,32 +915,64 @@ export function renderConsoleHtml(token: string): string {
 //  contained. Mirrors a hardware-instrument aesthetic.
 // ─────────────────────────────────────────────────────────────────────
 const CONSOLE_CSS = `
-:root {
-  /* Surfaces */
+:root,
+:root[data-theme="ops"] {
+  /* Dark "operations console" theme — the default. */
   --bg-0: #07070a;
   --bg-1: #0d0d12;
   --bg-2: #14141c;
   --bg-3: #1c1c26;
 
-  /* Lines */
   --line: #2a2a36;
   --line-bright: #44445a;
 
-  /* Text */
   --fg: #e5e5ea;
   --fg-2: #a0a0aa;
   --fg-3: #6b6b78;
   --fg-mute: #4a4a55;
 
-  /* Accents */
   --accent: #ff5a35;        /* tactical orange */
   --accent-2: #b9ff36;      /* electric lime */
   --accent-3: #36c5ff;      /* cyan */
   --accent-warn: #ffcc33;
   --accent-fail: #ff3b5a;
 
+  --scanline-rgb: 255, 255, 255;
+  --scanline-alpha: 0.012;
+
   --mono: ui-monospace, "SF Mono", "JetBrains Mono", "IBM Plex Mono", Menlo, monospace;
   --tile: 8px;
+}
+
+:root[data-theme="day"] {
+  /* Light theme — same console DNA, just inverted. Same accents so
+     the visual identity stays consistent. */
+  --bg-0: #f6f4ef;
+  --bg-1: #fdfbf5;
+  --bg-2: #efebe0;
+  --bg-3: #e6e1d3;
+
+  --line: #d2cdbc;
+  --line-bright: #b2ac98;
+
+  --fg: #1c1a14;
+  --fg-2: #4a473b;
+  --fg-3: #76715f;
+  --fg-mute: #a6a08c;
+
+  /* Slightly darker accents to maintain contrast on the warm beige. */
+  --accent: #d44a25;
+  --accent-2: #6a9920;
+  --accent-3: #2588b8;
+  --accent-warn: #b88a18;
+  --accent-fail: #c8253c;
+
+  --scanline-rgb: 0, 0, 0;
+  --scanline-alpha: 0.010;
+
+  /* Slightly stronger card tint over the warm cream so the
+     plan/proposal accents still read clearly. */
+  --card-tint: 0.12;
 }
 
 * { box-sizing: border-box; }
@@ -606,16 +985,17 @@ body {
   letter-spacing: 0.01em;
   -webkit-font-smoothing: antialiased;
   overflow: hidden;
-  /* Subtle scan-line texture — gives the console a CRT-ish feel without
-     being heavy-handed. */
+  /* Subtle scan-line texture — flips polarity with the theme so it
+     reads as a CRT shimmer in both dark and light modes. */
   background-image:
     repeating-linear-gradient(
       to bottom,
       transparent 0px,
       transparent 3px,
-      rgba(255, 255, 255, 0.012) 3px,
-      rgba(255, 255, 255, 0.012) 4px
+      rgba(var(--scanline-rgb), var(--scanline-alpha)) 3px,
+      rgba(var(--scanline-rgb), var(--scanline-alpha)) 4px
     );
+  transition: background 200ms ease, color 200ms ease;
 }
 
 /* ── Layout ─────────────────────────────────────────────────────── */
@@ -639,10 +1019,26 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 16px;
+  /* On macOS the traffic-light buttons occupy roughly the leftmost
+     78px of the window chrome. Pad the brand area past them so the
+     Clementine icon isn't hiding underneath. Non-mac platforms put
+     window controls on the right, so the extra left padding is a
+     minor cost. -webkit-app-region: drag turns the status bar into
+     a draggable window handle when packaged. */
+  padding: 0 16px 0 84px;
   background: var(--bg-1);
   border-bottom: 1px solid var(--line);
   position: relative;
+  -webkit-app-region: drag;
+}
+.status-bar button,
+.status-bar input,
+.status-bar select,
+.status-bar a,
+.status-bar [role="button"] {
+  /* Drag-handle applies to the whole bar; carve out interactive
+     elements so clicks still register. */
+  -webkit-app-region: no-drag;
 }
 .status-bar::after {
   /* Hairline accent ribbon below the bar — subtle vertical anchor. */
@@ -656,14 +1052,39 @@ body {
 .brand {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
   font-weight: 600;
-  letter-spacing: 0.18em;
+  letter-spacing: 0.04em;
   font-size: 11px;
 }
-.brand-mark { color: var(--fg); }
-.brand-sep  { color: var(--fg-mute); }
-.brand-sub  { color: var(--accent); }
+.brand-icon {
+  width: 26px;
+  height: 26px;
+  border-radius: 6px;
+  image-rendering: pixelated;
+  background: var(--bg-2);
+  padding: 2px;
+  flex-shrink: 0;
+}
+.brand-words {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.05;
+}
+.brand-mark {
+  color: var(--fg);
+  font-size: 14px;
+  letter-spacing: 0.02em;
+  font-weight: 600;
+  text-transform: none;
+}
+.brand-sub {
+  color: var(--fg-3);
+  font-size: 9.5px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  margin-top: 1px;
+}
 .pulse {
   width: 8px;
   height: 8px;
@@ -678,21 +1099,68 @@ body {
 }
 .status-row {
   display: flex;
-  gap: 18px;
-  font-size: 11px;
+  align-items: center;
+  gap: 14px;
+  font-size: 10.5px;
   color: var(--fg-3);
   letter-spacing: 0.1em;
+}
+.status-row .stat {
+  white-space: nowrap;
 }
 .status-row .stat em {
   font-style: normal;
   color: var(--fg);
   margin-left: 4px;
 }
+@media (max-width: 900px) {
+  .status-row {
+    gap: 10px;
+    font-size: 9.5px;
+  }
+}
 .status-row .connection {
   color: var(--accent-2);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
 .status-row .connection[data-offline] {
   color: var(--accent-fail);
+}
+.status-row .connection[data-offline] .pulse {
+  background: var(--accent-fail);
+  box-shadow: 0 0 8px rgba(255, 59, 90, 0.6);
+}
+
+/* ── Theme toggle ─────────────────────────────────────────────── */
+.theme-toggle {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 13px;
+  line-height: 1;
+  width: 26px;
+  height: 26px;
+  border-radius: 5px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background 100ms, border-color 100ms, color 100ms;
+  margin-left: 4px;
+}
+.theme-toggle:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.theme-toggle-icon {
+  display: inline-block;
+  transition: transform 200ms ease;
+}
+:root[data-theme="day"] .theme-toggle-icon {
+  transform: rotate(180deg);
 }
 
 /* ── Sidebar (left nav) ───────────────────────────────────────── */
@@ -777,6 +1245,654 @@ body {
   overflow: hidden;
 }
 
+/* ── Home panel ───────────────────────────────────────────────── */
+.home-layout {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 16px 22px 22px;
+  overflow-y: auto;
+  height: 100%;
+}
+.home-chat {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 360px;
+  /* Subtle warm tint so the chat block reads as the focal point. */
+  background:
+    linear-gradient(180deg, rgba(255, 170, 80, var(--card-tint, 0.03)) 0%, transparent 30%),
+    var(--bg-1);
+  border-left: 2px solid var(--accent);
+}
+.home-secondary {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  min-height: 220px;
+  max-height: 260px;
+}
+@media (max-width: 900px) {
+  .home-secondary {
+    grid-template-columns: 1fr;
+    max-height: none;
+  }
+}
+.home-block {
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.home-block-head {
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--fg-3);
+}
+.home-block-head em {
+  font-style: normal;
+  font-size: 11px;
+  color: var(--accent);
+}
+.home-block-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 14px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.home-empty {
+  color: var(--fg-mute);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  padding: 18px 0;
+  text-align: center;
+}
+.home-item {
+  display: flex;
+  gap: 10px;
+  padding: 8px 0;
+  border-bottom: 1px dotted var(--line);
+  align-items: flex-start;
+}
+.home-item:last-child { border-bottom: 0; }
+.home-item-kind {
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  color: var(--accent);
+  text-transform: uppercase;
+  padding: 1px 6px;
+  border: 1px solid var(--accent);
+  align-self: flex-start;
+  flex-shrink: 0;
+}
+.home-item-kind.task { color: var(--accent-3); border-color: var(--accent-3); }
+.home-item-kind.exec { color: var(--accent-warn); border-color: var(--accent-warn); }
+.home-item-kind.checkin { color: var(--accent); border-color: var(--accent); }
+.home-item-kind.run { color: var(--accent-2); border-color: var(--accent-2); }
+.home-item-kind.done { color: var(--fg-mute); border-color: var(--fg-mute); }
+.home-item-text {
+  flex: 1;
+  font-size: 12px;
+  color: var(--fg);
+  line-height: 1.45;
+  /* Keep agent-generated tracking tasks from dominating the column —
+     show the first ~2 lines, fade the rest. */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  min-width: 0;
+}
+.home-list-footer {
+  padding: 8px 0 4px;
+  text-align: right;
+  font-size: 10px;
+  letter-spacing: 0.12em;
+}
+.home-list-footer .tools-jump {
+  color: var(--accent);
+  text-decoration: none;
+  border-bottom: 1px dashed var(--accent);
+  cursor: pointer;
+}
+.home-list-footer .tools-jump:hover {
+  background: var(--accent);
+  color: var(--bg-0);
+  border-bottom-color: transparent;
+}
+.home-item-meta {
+  font-size: 10px;
+  color: var(--fg-3);
+  margin-top: 2px;
+}
+
+/* Chat */
+.home-chat-thread {
+  flex: 1;
+  overflow-y: auto;
+  padding: 10px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.home-chat-hint {
+  color: var(--fg-mute);
+  text-align: center;
+  padding: 40px 16px;
+  margin: auto;
+  max-width: 560px;
+}
+.home-chat-hint-title {
+  font-size: 16px;
+  letter-spacing: 0.02em;
+  color: var(--fg);
+  font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+  font-weight: 500;
+  margin-bottom: 6px;
+}
+.home-chat-hint-sub {
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  color: var(--fg-3);
+  margin-bottom: 16px;
+}
+.home-chat-suggestions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: center;
+}
+.home-chat-suggest {
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 11px;
+  padding: 6px 12px;
+  cursor: pointer;
+  letter-spacing: 0.04em;
+  border-radius: 14px;
+  transition: background 100ms, border-color 100ms, color 100ms;
+}
+.home-chat-suggest:hover {
+  background: var(--accent);
+  color: var(--bg-0);
+  border-color: var(--accent);
+}
+.home-chat-meta {
+  font-style: normal;
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  color: var(--fg-mute);
+}
+.home-chat-turn {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px;
+  border-radius: 4px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.home-chat-turn.pending {
+  box-shadow: inset 2px 0 0 color-mix(in srgb, var(--accent) 72%, transparent);
+}
+.home-chat-turn.user {
+  background: var(--bg-0);
+  border-left: 2px solid var(--accent);
+  align-self: stretch;
+}
+.home-chat-turn.assistant {
+  background: var(--bg-2);
+  border-left: 2px solid var(--accent-2);
+  align-self: stretch;
+  white-space: pre-wrap;
+}
+.home-chat-role {
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--fg-3);
+}
+.home-chat-stream-status {
+  display: none;
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--accent-2);
+}
+.home-chat-turn.pending .home-chat-stream-status {
+  display: block;
+}
+.home-chat-form {
+  display: flex;
+  gap: 8px;
+  padding: 10px 14px;
+  border-top: 1px solid var(--line);
+  background: var(--bg-2);
+}
+.home-chat-input {
+  flex: 1;
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  color: var(--fg);
+  font: inherit;
+  font-size: 12px;
+  padding: 8px 10px;
+  outline: none;
+}
+.home-chat-input:focus { border-color: var(--accent); }
+.home-chat-send {
+  background: transparent;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  padding: 6px 14px;
+  cursor: pointer;
+}
+.home-chat-send:hover { background: var(--accent); color: var(--bg-0); }
+.home-chat-send:disabled {
+  opacity: 0.5;
+  cursor: progress;
+}
+.home-voice-panel {
+  position: relative;
+  display: grid;
+  grid-template-columns: 76px 1fr auto;
+  gap: 14px;
+  align-items: center;
+  padding: 14px;
+  border-top: 1px solid var(--line);
+  overflow: hidden;
+  transition:
+    min-height 220ms ease,
+    padding 220ms ease,
+    margin 220ms ease,
+    border-radius 220ms ease,
+    box-shadow 220ms ease;
+  background:
+    radial-gradient(circle at 42px 34px, color-mix(in srgb, var(--accent) 20%, transparent), transparent 56px),
+    radial-gradient(circle at 95% 30%, color-mix(in srgb, var(--accent-2) 14%, transparent), transparent 120px),
+    linear-gradient(90deg, var(--bg-2), color-mix(in srgb, var(--bg-1) 78%, var(--accent-2) 8%));
+}
+.home-voice-panel::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0;
+  transform: translateX(-20%);
+  transition: opacity 220ms ease, transform 480ms ease;
+  background:
+    linear-gradient(115deg, transparent 0 30%, color-mix(in srgb, var(--accent) 12%, transparent) 42%, transparent 56%),
+    repeating-linear-gradient(90deg, color-mix(in srgb, var(--fg) 5%, transparent) 0 1px, transparent 1px 18px);
+}
+.home-voice-panel.live {
+  grid-template-columns: 138px minmax(0, 1fr) auto;
+  min-height: 176px;
+  margin: 14px;
+  padding: 22px;
+  border: 1px solid color-mix(in srgb, var(--accent) 34%, var(--line));
+  border-radius: 28px;
+  box-shadow:
+    0 24px 80px color-mix(in srgb, #000 28%, transparent),
+    0 0 60px color-mix(in srgb, var(--accent) 15%, transparent),
+    inset 0 0 42px color-mix(in srgb, var(--accent-2) 8%, transparent);
+}
+.home-voice-panel.live::before {
+  opacity: 1;
+  transform: translateX(0);
+}
+.home-voice-panel.focus {
+  grid-template-columns: 176px minmax(0, 1fr) auto;
+  min-height: 248px;
+  margin: 18px;
+  padding: 28px;
+  border-radius: 34px;
+}
+.home-voice-orb-button {
+  position: relative;
+  width: 58px;
+  height: 58px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--accent) 54%, var(--line));
+  background:
+    radial-gradient(circle at 50% 50%, color-mix(in srgb, var(--accent) 18%, transparent), transparent 38%),
+    conic-gradient(from 205deg, color-mix(in srgb, var(--accent) 70%, transparent), transparent 28%, color-mix(in srgb, var(--accent-2) 75%, transparent), transparent 70%),
+    var(--bg-0);
+  cursor: pointer;
+  padding: 0;
+  box-shadow:
+    0 0 24px color-mix(in srgb, var(--accent) 22%, transparent),
+    inset 0 0 20px color-mix(in srgb, var(--accent-2) 10%, transparent);
+  isolation: isolate;
+  overflow: visible;
+  transition:
+    width 220ms ease,
+    height 220ms ease,
+    border-radius 220ms ease,
+    transform 180ms ease,
+    box-shadow 220ms ease;
+}
+.home-voice-orb-button:disabled {
+  cursor: progress;
+  opacity: 0.68;
+}
+.home-voice-orb-button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 4px;
+}
+.home-voice-ring {
+  position: absolute;
+  inset: -8px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--accent) 28%, transparent);
+  opacity: 0.56;
+}
+.home-voice-ring.ring-b {
+  inset: -15px;
+  border-color: color-mix(in srgb, var(--accent-2) 22%, transparent);
+  opacity: 0.35;
+}
+.home-voice-core {
+  position: absolute;
+  inset: 9px;
+  display: grid;
+  place-items: center;
+  border-radius: 16px;
+  overflow: hidden;
+  background: linear-gradient(145deg, color-mix(in srgb, var(--bg-0) 72%, var(--accent) 12%), var(--bg-1));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--fg) 14%, transparent);
+  transition: inset 220ms ease, border-radius 220ms ease;
+}
+.home-voice-avatar {
+  width: 29px;
+  height: 29px;
+  object-fit: contain;
+  image-rendering: pixelated;
+  filter: saturate(1.15) contrast(1.08);
+  transform: translateY(1px);
+  transition: width 220ms ease, height 220ms ease;
+}
+.home-voice-face {
+  position: absolute;
+  pointer-events: none;
+  image-rendering: pixelated;
+}
+.home-voice-face.mouth {
+  left: 50%;
+  bottom: 8px;
+  width: 10px;
+  height: 3px;
+  transform: translateX(-50%);
+  background: color-mix(in srgb, var(--bg-0) 76%, #111 24%);
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--accent) 18%, transparent),
+    0 1px 0 color-mix(in srgb, var(--accent-2) 45%, transparent);
+  opacity: 0;
+}
+.home-voice-face.cheek {
+  bottom: 11px;
+  width: 3px;
+  height: 3px;
+  background: color-mix(in srgb, var(--accent) 76%, transparent);
+  opacity: 0;
+}
+.home-voice-face.cheek-left { left: 9px; }
+.home-voice-face.cheek-right { right: 9px; }
+.home-voice-scan {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(180deg, transparent 0%, color-mix(in srgb, var(--accent) 28%, transparent) 48%, transparent 56%);
+  transform: translateY(-110%);
+  opacity: 0;
+}
+.home-voice-wave {
+  position: absolute;
+  right: -5px;
+  bottom: 7px;
+  display: grid;
+  grid-template-columns: repeat(4, 3px);
+  gap: 2px;
+  align-items: end;
+  height: 16px;
+  padding: 4px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--bg-0) 78%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 32%, transparent);
+}
+.home-voice-wave i {
+  display: block;
+  width: 3px;
+  height: 5px;
+  border-radius: 999px;
+  background: var(--accent);
+  opacity: 0.45;
+}
+.home-voice-panel.live .home-voice-orb-button {
+  width: 112px;
+  height: 112px;
+}
+.home-voice-panel.focus .home-voice-orb-button {
+  width: 148px;
+  height: 148px;
+}
+.home-voice-panel.live .home-voice-core {
+  inset: 18px;
+  border-radius: 26px;
+}
+.home-voice-panel.focus .home-voice-core {
+  inset: 24px;
+  border-radius: 32px;
+}
+.home-voice-panel.live .home-voice-avatar {
+  width: 62px;
+  height: 62px;
+}
+.home-voice-panel.focus .home-voice-avatar {
+  width: 82px;
+  height: 82px;
+}
+.home-voice-panel.live .home-voice-orb-button {
+  animation: voicePulse 1.35s ease-in-out infinite;
+}
+.home-voice-panel.routing .home-voice-orb-button {
+  border-color: color-mix(in srgb, var(--accent-2) 70%, var(--accent));
+  box-shadow:
+    0 0 44px color-mix(in srgb, var(--accent-2) 28%, transparent),
+    inset 0 0 30px color-mix(in srgb, var(--accent) 14%, transparent);
+}
+.home-voice-panel.thinking .home-voice-orb-button {
+  animation-duration: 920ms;
+}
+.home-voice-panel.speaking .home-voice-orb-button {
+  animation-duration: 680ms;
+}
+.home-voice-panel.live .home-voice-avatar {
+  animation: voiceAvatarTalk 540ms steps(2, end) infinite;
+}
+.home-voice-panel.live .home-voice-face.mouth {
+  opacity: 1;
+  animation: voicePixelMouth 360ms steps(3, end) infinite;
+}
+.home-voice-panel.live .home-voice-face.cheek {
+  animation: voicePixelCheeks 720ms steps(2, end) infinite;
+}
+.home-voice-panel.live .home-voice-ring.ring-a {
+  animation: voiceOrbit 3.6s linear infinite;
+}
+.home-voice-panel.live .home-voice-ring.ring-b {
+  animation: voiceOrbit 5.2s linear infinite reverse;
+}
+.home-voice-panel.live .home-voice-scan {
+  animation: voiceScan 2.2s ease-in-out infinite;
+}
+.home-voice-panel.live .home-voice-wave i {
+  opacity: 1;
+  animation: voiceBars 680ms ease-in-out infinite;
+}
+.home-voice-panel.live .home-voice-wave i:nth-child(2) { animation-delay: 90ms; }
+.home-voice-panel.live .home-voice-wave i:nth-child(3) { animation-delay: 180ms; }
+.home-voice-panel.live .home-voice-wave i:nth-child(4) { animation-delay: 270ms; }
+@keyframes voiceOrbit {
+  to { transform: rotate(360deg); }
+}
+@keyframes voicePulse {
+  0%, 100% { transform: scale(1); box-shadow: 0 0 22px color-mix(in srgb, var(--accent) 22%, transparent), inset 0 0 20px color-mix(in srgb, var(--accent-2) 10%, transparent); }
+  50% { transform: scale(1.045); box-shadow: 0 0 38px color-mix(in srgb, var(--accent) 36%, transparent), inset 0 0 24px color-mix(in srgb, var(--accent-2) 16%, transparent); }
+}
+@keyframes voiceAvatarTalk {
+  0%, 100% { transform: translateY(1px) scale(1); filter: saturate(1.15) contrast(1.08); }
+  50% { transform: translateY(0) scale(1.06); filter: saturate(1.35) contrast(1.16) drop-shadow(0 0 5px color-mix(in srgb, var(--accent) 42%, transparent)); }
+}
+@keyframes voicePixelMouth {
+  0% { height: 2px; width: 8px; bottom: 8px; }
+  34% { height: 7px; width: 8px; bottom: 6px; }
+  68% { height: 4px; width: 12px; bottom: 7px; }
+  100% { height: 2px; width: 8px; bottom: 8px; }
+}
+@keyframes voicePixelCheeks {
+  0%, 100% { opacity: 0.24; transform: translateY(0); }
+  50% { opacity: 0.95; transform: translateY(-1px); }
+}
+@keyframes voiceScan {
+  0%, 35% { transform: translateY(-110%); opacity: 0; }
+  45%, 60% { opacity: 0.85; }
+  78%, 100% { transform: translateY(110%); opacity: 0; }
+}
+@keyframes voiceBars {
+  0%, 100% { height: 4px; opacity: 0.52; }
+  45% { height: 14px; opacity: 1; }
+}
+.home-voice-copy {
+  min-width: 0;
+  position: relative;
+  z-index: 1;
+}
+.home-voice-title-row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.home-voice-title {
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--fg);
+}
+.home-voice-panel.live .home-voice-title {
+  font-size: 13px;
+  letter-spacing: 0.22em;
+}
+.home-voice-phase {
+  border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--line));
+  border-radius: 999px;
+  padding: 3px 8px;
+  font-size: 8px;
+  letter-spacing: 0.18em;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--bg-0) 78%, transparent);
+}
+.home-voice-status {
+  margin-top: 3px;
+  font-size: 11px;
+  color: var(--fg-2);
+}
+.home-voice-panel.live .home-voice-status {
+  margin-top: 9px;
+  font-size: 15px;
+  color: var(--fg);
+}
+.home-voice-transcript {
+  margin-top: 4px;
+  font-size: 10px;
+  color: var(--fg-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.home-voice-panel.live .home-voice-transcript {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--fg-2);
+  white-space: normal;
+}
+.home-voice-feed {
+  display: none;
+  margin-top: 12px;
+  max-height: 72px;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--line) 74%, transparent);
+  background: color-mix(in srgb, var(--bg-0) 48%, transparent);
+  padding: 8px;
+  color: var(--fg-3);
+  font-size: 10px;
+  line-height: 1.45;
+}
+.home-voice-panel.live .home-voice-feed {
+  display: grid;
+  gap: 4px;
+}
+.home-voice-panel.focus .home-voice-feed {
+  max-height: 120px;
+  font-size: 11px;
+}
+.home-voice-event {
+  display: block;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.home-voice-event.tool,
+.home-voice-event.routing {
+  color: var(--accent-2);
+}
+.home-voice-event.error {
+  color: var(--danger);
+}
+.home-voice-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  position: relative;
+  z-index: 1;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.home-voice-btn {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  padding: 7px 10px;
+  cursor: pointer;
+}
+.home-voice-btn:hover:not(:disabled) {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.home-voice-btn:disabled {
+  opacity: 0.42;
+  cursor: not-allowed;
+}
+.home-voice-panel audio {
+  display: none;
+}
+
 /* ── Activity panel ───────────────────────────────────────────── */
 .activity-layout {
   display: grid;
@@ -793,6 +1909,70 @@ body {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+}
+
+.home-welcome {
+  padding: 18px 18px 14px;
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 18px;
+  flex-wrap: wrap;
+}
+.home-greet h2 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  color: var(--fg);
+  font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+}
+.home-greet p {
+  margin: 4px 0 0;
+  font-size: 11px;
+  color: var(--fg-3);
+  letter-spacing: 0.06em;
+}
+.home-tiles {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.home-tile {
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  padding: 8px 12px;
+  min-width: 76px;
+  text-align: left;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  color: var(--fg-3);
+  font: inherit;
+  transition: background 120ms, border-color 120ms, color 120ms;
+}
+.home-tile:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.home-tile-label {
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+}
+.home-tile-value {
+  font-size: 22px;
+  color: var(--fg);
+  font-family: var(--mono);
+  font-weight: 600;
+}
+.home-tile.has-activity .home-tile-value {
+  color: var(--accent);
+}
+.home-tile.high .home-tile-value {
+  color: var(--accent-fail);
 }
 .feed-header,
 .detail-header {
@@ -1069,6 +2249,102 @@ body {
   flex-direction: column;
   overflow: hidden;
 }
+.mem-toolbar {
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  border-bottom: 1px solid var(--line);
+}
+.mem-view-toggle {
+  display: flex;
+  border-right: 1px solid var(--line);
+}
+.mem-view-btn {
+  background: transparent;
+  border: 0;
+  color: var(--fg-3);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  padding: 12px 14px;
+  cursor: pointer;
+  text-transform: uppercase;
+  transition: color 100ms, background 100ms;
+}
+.mem-view-btn:hover { color: var(--fg); background: var(--bg-1); }
+.mem-view-btn.active { color: var(--accent); background: var(--bg-1); }
+
+/* The graph view */
+.mem-graph {
+  flex: 1;
+  position: relative;
+  display: grid;
+  grid-template-columns: 1fr 280px;
+  background: var(--bg-2);
+  overflow: hidden;
+}
+.mem-graph[hidden] { display: none; }
+.mem-graph-canvas {
+  position: relative;
+  background:
+    radial-gradient(circle at 50% 50%, var(--bg-1) 0%, var(--bg-0) 80%);
+  overflow: hidden;
+}
+.mem-graph-detail {
+  border-left: 1px solid var(--line);
+  padding: 14px 16px;
+  background: var(--bg-1);
+  overflow-y: auto;
+  font-size: 11px;
+  color: var(--fg-2);
+  line-height: 1.55;
+}
+.mem-graph-detail h4 {
+  margin: 0 0 6px;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  color: var(--fg);
+}
+.mem-graph-detail .pill {
+  display: inline-block;
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  padding: 1px 6px;
+  border: 1px solid var(--line);
+  text-transform: uppercase;
+  margin-right: 6px;
+  color: var(--fg-3);
+}
+.mem-graph-detail .pill.fact { color: var(--accent); border-color: var(--accent); }
+.mem-graph-detail .pill.file { color: var(--accent-3); border-color: var(--accent-3); }
+.mem-graph-detail .pill.kind { color: var(--accent-2); border-color: var(--accent-2); }
+.mem-graph-detail-empty { color: var(--fg-mute); padding: 20px 0; }
+.mem-graph-legend {
+  position: absolute;
+  bottom: 12px;
+  left: 12px;
+  display: flex;
+  gap: 12px;
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  color: var(--fg-3);
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  padding: 6px 10px;
+  pointer-events: none;
+  text-transform: uppercase;
+}
+.mem-graph-legend .dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-right: 4px;
+  vertical-align: middle;
+}
+.mem-graph-legend .dot.fact { background: var(--accent); }
+.mem-graph-legend .dot.file { background: var(--accent-3); }
+.mem-graph-legend .dot.kind { background: var(--accent-2); }
 .mem-search {
   display: flex;
   align-items: center;
@@ -1228,6 +2504,255 @@ body {
 }
 .fact-viewer .forget:hover { background: var(--accent-fail); color: var(--bg-0); }
 
+/* ── Context / Identity panel ─────────────────────────────────── */
+.context-layout {
+  height: 100%;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.context-header {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 18px;
+  align-items: start;
+  border: 1px solid var(--line);
+  background:
+    linear-gradient(135deg, rgba(255, 90, 53, 0.10), transparent 38%),
+    var(--bg-2);
+  padding: 18px;
+}
+.context-header h3 {
+  margin: 0 0 6px;
+  font-size: 22px;
+  letter-spacing: -0.02em;
+  color: var(--fg);
+}
+.context-header p {
+  margin: 0;
+  color: var(--fg-2);
+  max-width: 780px;
+  line-height: 1.5;
+}
+.context-stats {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(82px, 1fr));
+  gap: 8px;
+}
+.context-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.1fr) minmax(320px, 0.9fr);
+  gap: 16px;
+}
+.context-grid.lower {
+  align-items: start;
+}
+.context-card {
+  border: 1px solid var(--line);
+  background: var(--bg-2);
+  min-width: 0;
+}
+.context-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 14px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-1);
+  color: var(--fg-3);
+  font-size: 10px;
+  letter-spacing: 0.18em;
+}
+.context-card-head em {
+  font-style: normal;
+  color: var(--fg-mute);
+  letter-spacing: 0.08em;
+}
+.context-card-head button,
+.context-save,
+.context-fact-form button,
+.context-goal-form button,
+.context-file-actions button {
+  background: transparent;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  padding: 5px 9px;
+  cursor: pointer;
+  transition: background 100ms, color 100ms;
+}
+.context-card-head button:hover,
+.context-save:hover,
+.context-fact-form button:hover,
+.context-goal-form button:hover,
+.context-file-actions button:hover {
+  background: var(--accent);
+  color: var(--bg-0);
+}
+.context-profile-form,
+.context-fact-form,
+.context-goal-form {
+  padding: 14px;
+}
+.context-form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+.context-profile-form label,
+.context-fact-form label,
+.context-goal-form label,
+.context-notes-label {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  color: var(--fg-3);
+  font-size: 10px;
+  letter-spacing: 0.14em;
+}
+.context-profile-form input,
+.context-profile-form select,
+.context-profile-form textarea,
+.context-fact-form input,
+.context-fact-form select,
+.context-goal-form input,
+.context-goal-form select,
+.context-goal-form textarea,
+.context-file textarea {
+  width: 100%;
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  color: var(--fg);
+  font: inherit;
+  font-size: 11px;
+  padding: 7px 9px;
+  outline: none;
+}
+.context-profile-form textarea,
+.context-goal-form textarea,
+.context-file textarea {
+  resize: vertical;
+  line-height: 1.55;
+}
+.context-notes-label {
+  margin-top: 10px;
+}
+.context-save {
+  margin-top: 10px;
+}
+.context-health-list,
+.context-facts-list,
+.context-goals-list,
+.context-files {
+  padding: 12px 14px;
+}
+.context-health-row {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 10px;
+  align-items: center;
+  padding: 8px 0;
+  border-bottom: 1px dashed var(--line);
+}
+.context-health-row:last-child { border-bottom: 0; }
+.context-health-status {
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  border: 1px solid var(--line);
+  padding: 2px 7px;
+  color: var(--fg-3);
+}
+.context-health-status.ok { color: var(--accent-2); border-color: var(--accent-2); }
+.context-health-status.warn { color: var(--accent-warn); border-color: var(--accent-warn); }
+.context-health-title { color: var(--fg); font-size: 11px; }
+.context-health-meta { color: var(--fg-3); font-size: 10px; }
+.context-file {
+  border: 1px solid var(--line);
+  background: var(--bg-1);
+  margin-bottom: 12px;
+}
+.context-file:last-child { margin-bottom: 0; }
+.context-file-head {
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+.context-file-title { color: var(--fg); font-size: 12px; }
+.context-file-desc { color: var(--fg-3); font-size: 10px; margin-top: 3px; line-height: 1.45; }
+.context-file-meta {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  color: var(--fg-3);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+}
+.context-file-meta .warn { color: var(--accent-warn); }
+.context-file textarea {
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  min-height: 150px;
+}
+.context-file-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 12px;
+  color: var(--fg-mute);
+  font-size: 10px;
+}
+.context-fact-form {
+  display: grid;
+  grid-template-columns: 120px 1fr auto;
+  gap: 8px;
+  border-bottom: 1px solid var(--line);
+}
+.context-goal-form {
+  display: grid;
+  grid-template-columns: 1fr 110px;
+  gap: 8px;
+  border-bottom: 1px solid var(--line);
+}
+.context-goal-form textarea,
+.context-goal-form button {
+  grid-column: 1 / -1;
+}
+.context-fact,
+.context-goal {
+  border-bottom: 1px dashed var(--line);
+  padding: 9px 0;
+}
+.context-fact:last-child,
+.context-goal:last-child { border-bottom: 0; }
+.context-fact-kind,
+.context-goal-meta {
+  color: var(--accent);
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+}
+.context-fact-body,
+.context-goal-title {
+  color: var(--fg);
+  margin-top: 4px;
+  line-height: 1.45;
+}
+.context-goal-desc,
+.context-goal-next {
+  color: var(--fg-3);
+  font-size: 10px;
+  line-height: 1.45;
+  margin-top: 4px;
+}
+
 /* ── Workflow Studio ─────────────────────────────────────────── */
 .wf-layout {
   display: grid;
@@ -1324,6 +2849,50 @@ body {
   font-size: 10px;
 }
 .wf-empty-mark { font-size: 40px; color: var(--line-bright); }
+.wf-empty-onboarding {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 40px 24px;
+  text-align: center;
+}
+.wf-empty-onboarding .wf-empty-text {
+  font-size: 14px;
+  letter-spacing: 0.02em;
+  color: var(--fg);
+  font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+  font-weight: 500;
+}
+.wf-empty-sub {
+  margin: 0;
+  max-width: 460px;
+  font-size: 11px;
+  color: var(--fg-3);
+  line-height: 1.55;
+}
+.wf-empty-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 6px;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+.wf-empty-btn {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  padding: 8px 14px;
+  cursor: pointer;
+  transition: background 100ms, border-color 100ms, color 100ms;
+}
+.wf-empty-btn:hover { border-color: var(--accent); color: var(--accent); }
+.wf-empty-btn.primary { border-color: var(--accent); color: var(--accent); }
+.wf-empty-btn.primary:hover { background: var(--accent); color: var(--bg-0); }
 
 .wf-edit-head {
   padding: 10px 14px;
@@ -1363,8 +2932,23 @@ body {
   background: var(--bg-1);
   border-bottom: 1px solid var(--line);
   display: flex;
-  gap: 8px;
+  gap: 14px;
   flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+}
+.wf-control-group {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.wf-control-group::before {
+  content: attr(data-label);
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  color: var(--fg-mute);
+  align-self: center;
+  text-transform: uppercase;
 }
 .wf-edit-controls button {
   background: transparent;
@@ -1380,6 +2964,7 @@ body {
 .wf-edit-controls button:hover { color: var(--fg); border-color: var(--line-bright); }
 .wf-edit-controls .btn-save { color: var(--accent); border-color: var(--accent); }
 .wf-edit-controls .btn-save:hover { background: var(--accent); color: var(--bg-0); }
+.wf-edit-controls .btn-duplicate { color: var(--fg-2); }
 .wf-edit-controls .btn-validate { color: var(--accent-3); border-color: var(--accent-3); }
 .wf-edit-controls .btn-validate:hover { background: var(--accent-3); color: var(--bg-0); }
 .wf-edit-controls .btn-test { color: var(--accent-warn); border-color: var(--accent-warn); }
@@ -1387,8 +2972,205 @@ body {
 .wf-edit-controls .btn-run { color: var(--accent-2); border-color: var(--accent-2); }
 .wf-edit-controls .btn-run:hover { background: var(--accent-2); color: var(--bg-0); }
 .wf-edit-controls .btn-toggle { color: var(--fg-2); }
-.wf-edit-controls .btn-delete { color: var(--accent-fail); border-color: var(--accent-fail); margin-left: auto; }
+.wf-edit-controls .btn-delete { color: var(--accent-fail); border-color: var(--accent-fail); }
 .wf-edit-controls .btn-delete:hover { background: var(--accent-fail); color: var(--bg-0); }
+
+/* Inputs editor */
+.wf-inputs {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 4px 0;
+}
+.wf-input-row {
+  display: grid;
+  grid-template-columns: 200px 1fr auto;
+  gap: 6px;
+  align-items: center;
+}
+.wf-input-row input {
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  color: var(--fg);
+  font: inherit;
+  font-size: 11px;
+  padding: 6px 8px;
+  outline: none;
+}
+.wf-input-row input:focus { border-color: var(--accent); }
+.wf-input-key { font-family: var(--mono); color: var(--accent); }
+.wf-input-remove {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-3);
+  font: inherit;
+  cursor: pointer;
+  padding: 6px 10px;
+}
+.wf-input-remove:hover { color: var(--accent-fail); border-color: var(--accent-fail); }
+.wf-input-empty {
+  color: var(--fg-mute);
+  font-style: italic;
+  font-size: 11px;
+  padding: 4px 0;
+  grid-template-columns: 1fr !important;
+}
+.wf-add-input {
+  align-self: flex-start;
+  background: transparent;
+  border: 1px dashed var(--line);
+  color: var(--fg-3);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  padding: 6px 12px;
+  margin-top: 6px;
+  cursor: pointer;
+}
+.wf-add-input:hover { color: var(--accent); border-color: var(--accent); }
+
+/* Recent runs in the editor */
+.wf-runs { display: flex; flex-direction: column; gap: 6px; }
+.wf-runs-head {
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  color: var(--fg-3);
+  text-transform: uppercase;
+  margin-top: 8px;
+}
+.wf-runs-empty {
+  color: var(--fg-mute);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  padding: 6px 0;
+}
+.wf-runs-list { margin: 0; padding: 0; list-style: none; }
+.wf-run {
+  display: grid;
+  grid-template-columns: 90px 1fr auto auto;
+  gap: 10px;
+  padding: 6px 0;
+  border-bottom: 1px dotted var(--line);
+  font-size: 11px;
+  align-items: center;
+}
+.wf-run:last-child { border-bottom: 0; }
+.wf-run-status {
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  padding: 2px 6px;
+  border: 1px solid var(--line);
+  text-align: center;
+}
+.wf-run-status.status-queued    { color: var(--accent-warn); border-color: var(--accent-warn); }
+.wf-run-status.status-running   { color: var(--accent-3); border-color: var(--accent-3); }
+.wf-run-status.status-completed { color: var(--accent-2); border-color: var(--accent-2); }
+.wf-run-status.status-success   { color: var(--accent-2); border-color: var(--accent-2); }
+.wf-run-status.status-error,
+.wf-run-status.status-failed    { color: var(--accent-fail); border-color: var(--accent-fail); }
+.wf-run-status.status-dry_run   { color: var(--fg-mute); border-color: var(--fg-mute); }
+.wf-run-id { font-family: var(--mono); color: var(--fg-3); font-size: 10px; }
+.wf-run-time { font-family: var(--mono); color: var(--fg-3); font-size: 10px; }
+.wf-run-inputs { font-family: var(--mono); color: var(--fg-mute); font-size: 10px; }
+
+/* Run inputs modal */
+.wf-run-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.wf-run-modal {
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  width: min(520px, 96vw);
+  max-height: 80vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+.wf-run-modal-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--line);
+  font-size: 11px;
+  letter-spacing: 0.18em;
+  color: var(--accent);
+  text-transform: uppercase;
+}
+.wf-run-modal-close {
+  background: transparent;
+  border: 0;
+  color: var(--fg-3);
+  font: inherit;
+  font-size: 14px;
+  cursor: pointer;
+}
+.wf-run-modal-close:hover { color: var(--accent-fail); }
+.wf-run-modal-sub {
+  margin: 0;
+  padding: 8px 16px;
+  font-size: 11px;
+  color: var(--fg-3);
+}
+.wf-run-modal-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 16px 14px;
+}
+.wf-run-modal-row {
+  display: grid;
+  grid-template-columns: 160px 1fr;
+  gap: 10px;
+  align-items: center;
+}
+.wf-run-modal-row span {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--accent);
+}
+.wf-run-modal-row input {
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  color: var(--fg);
+  font: inherit;
+  font-size: 12px;
+  padding: 8px 10px;
+  outline: none;
+}
+.wf-run-modal-row input:focus { border-color: var(--accent); }
+.wf-run-modal-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 8px;
+}
+.wf-run-modal-actions button {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  padding: 8px 14px;
+  cursor: pointer;
+}
+.wf-run-modal-actions .cancel:hover { border-color: var(--accent-fail); color: var(--accent-fail); }
+.wf-run-modal-actions .primary { border-color: var(--accent); color: var(--accent); }
+.wf-run-modal-actions .primary:hover { background: var(--accent); color: var(--bg-0); }
+.wf-run-modal kbd {
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  padding: 1px 4px;
+  font-size: 10px;
+  font-family: var(--mono);
+}
 
 .wf-edit-body {
   flex: 1;
@@ -1740,7 +3522,18 @@ body {
   flex: 1;
   font-size: 11px;
 }
-.tools-empty { color: var(--fg-mute); padding: 14px; letter-spacing: 0.12em; }
+.tools-empty { color: var(--fg-mute); padding: 14px; letter-spacing: 0.12em; line-height: 1.5; }
+.tools-empty .tools-jump {
+  color: var(--accent);
+  text-decoration: none;
+  border-bottom: 1px dashed var(--accent);
+  cursor: pointer;
+}
+.tools-empty .tools-jump:hover {
+  background: var(--accent);
+  color: var(--bg-0);
+  border-bottom-color: transparent;
+}
 
 .tool-card {
   border: 1px solid var(--line);
@@ -1930,6 +3723,387 @@ body {
   color: var(--fg-2);
 }
 .proj-entries .entry.dir { color: var(--accent-3); }
+
+/* ── Integrations hub ────────────────────────────────────────── */
+.integrations-layout {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 18px 20px 28px;
+  overflow-y: auto;
+}
+.hub-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 24px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--line);
+}
+.hub-header h3 {
+  margin: 0 0 4px;
+  font-size: 14px;
+  letter-spacing: 0.02em;
+  color: var(--fg);
+}
+.hub-header p {
+  margin: 0;
+  font-size: 11px;
+  color: var(--fg-3);
+  line-height: 1.55;
+  max-width: 640px;
+}
+.hub-stats {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.hub-stats .stat-card {
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  padding: 6px 10px;
+  min-width: 64px;
+  text-align: center;
+}
+.hub-stats .stat-card span {
+  display: block;
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  color: var(--fg-3);
+}
+.hub-stats .stat-card em {
+  display: block;
+  margin-top: 2px;
+  font-style: normal;
+  font-size: 16px;
+  color: var(--accent);
+}
+
+.hub-block {
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  padding: 16px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.hub-block-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 8px;
+}
+.hub-block-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.hub-block-meta {
+  font-size: 10px;
+  color: var(--fg-3);
+  letter-spacing: 0.12em;
+}
+.hub-block-intro {
+  margin: 0;
+  font-size: 11px;
+  color: var(--fg-2);
+  line-height: 1.55;
+}
+
+/* ─ Keys list ─ */
+.hub-keys-list {
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--line);
+}
+.hub-key-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 10px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--line);
+  align-items: center;
+}
+.hub-key-row:last-child { border-bottom: 0; }
+.hub-key-name {
+  font-size: 12px;
+  color: var(--fg);
+}
+.hub-key-meta {
+  margin-top: 4px;
+  font-size: 10px;
+  color: var(--fg-3);
+  letter-spacing: 0.08em;
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.hub-key-meta .pill {
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  padding: 1px 6px;
+  border: 1px solid var(--line);
+}
+.hub-key-meta .pill.connected { color: var(--accent-2); border-color: var(--accent-2); }
+.hub-key-meta .pill.runtime_ready { color: var(--accent); border-color: var(--accent); }
+.hub-key-meta .pill.optional { color: var(--fg-3); border-color: var(--line); }
+.hub-key-meta .pill.missing   { color: var(--accent-fail); border-color: var(--accent-fail); }
+.hub-key-meta .pill.env_only  { color: var(--accent-warn); border-color: var(--accent-warn); }
+.hub-key-meta .pill.unreadable, .hub-key-meta .pill.needs_repair { color: var(--accent-fail); border-color: var(--accent-fail); }
+.hub-key-desc {
+  margin-top: 4px;
+  font-size: 10px;
+  color: var(--fg-mute);
+}
+.hub-key-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.hub-key-ok,
+.cred-action-note {
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  padding: 3px 7px;
+  text-align: center;
+}
+.hub-key-actions button {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  padding: 5px 10px;
+  cursor: pointer;
+}
+.hub-key-actions button:hover { border-color: var(--accent); color: var(--accent); }
+
+/* ─ Apps list (Composio) ─ */
+.hub-apps-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  padding: 6px 0;
+}
+.hub-apps-controls input {
+  flex: 1;
+  min-width: 200px;
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  color: var(--fg);
+  font: inherit;
+  font-size: 11px;
+  padding: 6px 8px;
+  outline: none;
+}
+.hub-apps-controls input:focus { border-color: var(--accent); }
+.hub-apps-controls button {
+  background: transparent;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  padding: 6px 12px;
+  cursor: pointer;
+}
+.hub-apps-controls button:hover { background: var(--accent); color: var(--bg-0); }
+.hub-apps-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 10px;
+  margin-top: 4px;
+}
+.hub-app-card {
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.hub-app-name {
+  font-size: 12px;
+  color: var(--fg);
+  letter-spacing: 0.02em;
+}
+.hub-app-meta {
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  color: var(--fg-3);
+  text-transform: uppercase;
+}
+.hub-app-pill {
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  padding: 1px 6px;
+  border: 1px solid var(--line);
+  align-self: flex-start;
+}
+.hub-app-pill.active { color: var(--accent-2); border-color: var(--accent-2); }
+.hub-app-pill.pending { color: var(--accent-warn); border-color: var(--accent-warn); }
+.hub-app-pill.available { color: var(--fg-3); border-color: var(--line); }
+.hub-app-pill.failed, .hub-app-pill.disconnected { color: var(--accent-fail); border-color: var(--accent-fail); }
+.hub-app-card-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 2px;
+}
+.hub-app-card-actions button {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 9.5px;
+  letter-spacing: 0.14em;
+  padding: 5px 9px;
+  cursor: pointer;
+}
+.hub-app-card-actions .connect { color: var(--accent); border-color: var(--accent); }
+.hub-app-card-actions .connect:hover { background: var(--accent); color: var(--bg-0); }
+.hub-app-card-actions .disconnect { color: var(--accent-fail); border-color: var(--accent-fail); }
+.hub-app-card-actions .disconnect:hover { background: var(--accent-fail); color: var(--bg-0); }
+
+/* ─ MCP servers list ─ */
+.hub-mcp-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.hub-mcp-row {
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  padding: 10px 12px;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 10px;
+  align-items: center;
+}
+.hub-mcp-name {
+  font-size: 12px;
+  color: var(--fg);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.hub-mcp-name .pill {
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  padding: 1px 6px;
+  border: 1px solid var(--line);
+}
+.hub-mcp-name .pill.source-auto-detected { color: var(--accent-3); border-color: var(--accent-3); }
+.hub-mcp-name .pill.source-user { color: var(--accent); border-color: var(--accent); }
+.hub-mcp-name .pill.transport-stdio { color: var(--fg-3); }
+.hub-mcp-name .pill.transport-http,
+.hub-mcp-name .pill.transport-sse { color: var(--accent-2); border-color: var(--accent-2); }
+.hub-mcp-meta {
+  margin-top: 4px;
+  font-size: 10px;
+  color: var(--fg-3);
+  font-family: var(--mono);
+  word-break: break-all;
+}
+.hub-mcp-desc {
+  margin-top: 4px;
+  font-size: 10px;
+  color: var(--fg-mute);
+  font-style: italic;
+}
+.hub-mcp-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 110px;
+}
+.hub-mcp-actions button {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  padding: 5px 10px;
+  cursor: pointer;
+}
+.hub-mcp-actions .toggle.on { color: var(--accent-2); border-color: var(--accent-2); }
+.hub-mcp-actions .toggle.off { color: var(--fg-mute); }
+.hub-mcp-actions .del { color: var(--accent-fail); border-color: var(--accent-fail); }
+.hub-mcp-actions .del:hover { background: var(--accent-fail); color: var(--bg-0); }
+.hub-btn-add {
+  background: transparent;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  padding: 6px 12px;
+  cursor: pointer;
+  align-self: flex-start;
+}
+.hub-btn-add:hover { background: var(--accent); color: var(--bg-0); }
+
+.hub-mcp-editor {
+  grid-column: 1 / -1;
+  margin-top: 8px;
+  padding: 12px;
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  display: grid;
+  gap: 8px;
+}
+.hub-mcp-editor label {
+  display: block;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  color: var(--fg-3);
+  margin-bottom: 4px;
+}
+.hub-mcp-editor input,
+.hub-mcp-editor select,
+.hub-mcp-editor textarea {
+  width: 100%;
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  color: var(--fg);
+  font: inherit;
+  font-size: 11px;
+  padding: 6px 8px;
+  outline: none;
+}
+.hub-mcp-editor input:focus,
+.hub-mcp-editor select:focus,
+.hub-mcp-editor textarea:focus { border-color: var(--accent); }
+.hub-mcp-editor textarea { resize: vertical; min-height: 56px; font-family: var(--mono); }
+.hub-mcp-editor .row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+.hub-mcp-editor .buttons {
+  display: flex;
+  gap: 6px;
+  margin-top: 4px;
+}
+.hub-mcp-editor .buttons button {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  padding: 6px 12px;
+  cursor: pointer;
+}
+.hub-mcp-editor .buttons .save { color: var(--accent-2); border-color: var(--accent-2); }
+.hub-mcp-editor .buttons .save:hover { background: var(--accent-2); color: var(--bg-0); }
 
 /* ── Skills panel ────────────────────────────────────────────── */
 .skills-layout {
@@ -2175,6 +4349,12 @@ body {
 .settings-info .row .v { color: var(--fg); }
 .settings-info .row .v.on { color: var(--accent-2); }
 .settings-info .row .v.off { color: var(--fg-mute); }
+.settings-note {
+  margin: 10px 0 0;
+  color: var(--fg-mute);
+  font-size: 10px;
+  line-height: 1.5;
+}
 
 /* ── Proactive Check-ins (Settings sub-block) ─────────────────── */
 .checkins-intro {
@@ -2342,7 +4522,7 @@ body {
   flex-direction: column;
   gap: 10px;
   background:
-    linear-gradient(180deg, rgba(80, 200, 230, 0.05) 0%, transparent 32%),
+    linear-gradient(180deg, rgba(80, 200, 230, var(--card-tint, 0.05)) 0%, transparent 32%),
     var(--bg-1);
   border-left: 2px solid var(--accent-3);
 }
@@ -2461,7 +4641,7 @@ body {
   flex-direction: column;
   gap: 8px;
   background:
-    linear-gradient(180deg, rgba(255, 170, 80, 0.04) 0%, transparent 28%),
+    linear-gradient(180deg, rgba(255, 170, 80, var(--card-tint, 0.04)) 0%, transparent 28%),
     var(--bg-1);
   border-left: 2px solid var(--accent);
 }
@@ -2609,6 +4789,8 @@ body {
   border: 1px solid var(--line);
 }
 .cred-status.connected { color: var(--accent-2); border-color: var(--accent-2); }
+.cred-status.runtime_ready { color: var(--accent); border-color: var(--accent); }
+.cred-status.optional { color: var(--fg-3); border-color: var(--line); }
 .cred-status.missing { color: var(--fg-mute); }
 .cred-status.env_only { color: var(--accent-warn); border-color: var(--accent-warn); }
 .cred-status.unreadable { color: var(--accent-fail); border-color: var(--accent-fail); }
@@ -2799,14 +4981,62 @@ const CONSOLE_JS = `
   }
 
   function setOnline(ok) {
+    // The connection chip contains a .pulse element + the label span.
+    // Update ONLY the label so the pulse animation keeps running.
+    const label = document.querySelector('[data-conn-label]');
     if (ok) {
       els.conn.removeAttribute('data-offline');
-      els.conn.textContent = '● ONLINE';
+      if (label) label.textContent = 'ONLINE';
     } else {
       els.conn.setAttribute('data-offline', 'true');
-      els.conn.textContent = '● OFFLINE';
+      if (label) label.textContent = 'OFFLINE';
     }
   }
+
+  // ─── Theme toggle ─────────────────────────────────────────────
+  const THEME_KEY = 'clemmy.console.theme';
+  const themeIcon = document.querySelector('[data-theme-icon]');
+
+  function applyTheme(theme) {
+    const t = theme === 'day' ? 'day' : 'ops';
+    document.documentElement.setAttribute('data-theme', t);
+    if (themeIcon) themeIcon.textContent = t === 'day' ? '☀' : '◐';
+    try { localStorage.setItem(THEME_KEY, t); } catch (err) { /* private mode */ }
+  }
+
+  function initTheme() {
+    let saved = null;
+    try { saved = localStorage.getItem(THEME_KEY); } catch (err) { /* private mode */ }
+    if (saved === 'day' || saved === 'ops') {
+      applyTheme(saved);
+      return;
+    }
+    // No saved preference — follow the OS color scheme on first load.
+    const prefersLight = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches;
+    applyTheme(prefersLight ? 'day' : 'ops');
+  }
+
+  const themeToggleBtn = document.querySelector('[data-theme-toggle]');
+  if (themeToggleBtn) {
+    themeToggleBtn.addEventListener('click', () => {
+      const current = document.documentElement.getAttribute('data-theme') || 'ops';
+      applyTheme(current === 'day' ? 'ops' : 'day');
+    });
+  }
+  initTheme();
+
+  // Populate version chips from /api/console/build-info — done once at
+  // page load. If the call fails we keep the placeholder dash.
+  (async () => {
+    try {
+      const info = await fetchJSON('/api/console/build-info');
+      const v = info.version ? 'v' + info.version : '';
+      const headerSub = document.querySelector('[data-daemon-version]');
+      if (headerSub && v) headerSub.textContent = v + ' · console';
+      const footVer = document.querySelector('[data-foot-version]');
+      if (footVer && v) footVer.textContent = v;
+    } catch (err) { /* leave placeholder */ }
+  })();
 
   function fmtTime(iso) {
     if (!iso) return '—';
@@ -2915,6 +5145,111 @@ const CONSOLE_JS = `
     }
   }
 
+  // Home tile counts that don't come from /api/dashboard.
+  // Refreshed in the background so the tiles aren't always pinned to '—'.
+  let homePlanCount = null;
+  let homeProposalCount = null;
+  let homeCheckinCount = null;
+
+  async function refreshHomeAuxCounts() {
+    try {
+      const [plans, props, checkins] = await Promise.allSettled([
+        fetchJSON('/api/console/plan-proposals?status=pending'),
+        fetchJSON('/api/console/check-in-proposals?status=pending'),
+        fetchJSON('/api/check-ins?status=open'),
+      ]);
+      if (plans.status === 'fulfilled') homePlanCount = (plans.value.proposals || []).length;
+      if (props.status === 'fulfilled') homeProposalCount = (props.value.proposals || []).length;
+      if (checkins.status === 'fulfilled') homeCheckinCount = (checkins.value.checkIns || checkins.value || []).length;
+    } catch (err) { /* tiles fall back to '—' */ }
+    // Push the latest counts straight to the tiles even if no main
+    // snapshot has been fetched yet.
+    const plansEl = document.querySelector('[data-home-plans]');
+    const proposalsEl = document.querySelector('[data-home-proposals]');
+    const checkinsEl = document.querySelector('[data-home-checkins]');
+    function bump(el, v) {
+      if (!el) return;
+      el.textContent = v == null ? '—' : v;
+      const tile = el.closest('.home-tile');
+      if (!tile) return;
+      tile.classList.toggle('has-activity', typeof v === 'number' && v > 0);
+      tile.classList.toggle('high', typeof v === 'number' && v >= 5);
+    }
+    bump(plansEl, homePlanCount);
+    bump(proposalsEl, homeProposalCount);
+    bump(checkinsEl, homeCheckinCount);
+  }
+
+  function greetingForNow() {
+    const hour = new Date().getHours();
+    if (hour < 5)  return 'Late night.';
+    if (hour < 12) return 'Good morning.';
+    if (hour < 17) return 'Good afternoon.';
+    if (hour < 22) return 'Good evening.';
+    return 'Late night.';
+  }
+
+  function updateHome(snap) {
+    const greetEl = document.querySelector('[data-home-greeting]');
+    const subEl = document.querySelector('[data-home-sub]');
+    const approvalsEl = document.querySelector('[data-home-approvals]');
+    const plansEl = document.querySelector('[data-home-plans]');
+    const proposalsEl = document.querySelector('[data-home-proposals]');
+    const checkinsEl = document.querySelector('[data-home-checkins]');
+    if (!greetEl) return; // home block not on the page (initial paint)
+
+    if (greetEl) greetEl.textContent = greetingForNow();
+    const approvals = (snap.approvals || []).length;
+    const policy = snap.proactivity && snap.proactivity.policy ? snap.proactivity.policy : {};
+    const mode = policy.mode || 'unknown';
+    const autoScope = policy.autoApproveScope || 'strict';
+    const memIdx = snap.memoryIndex || {};
+    const facts = memIdx.activeFacts ?? 0;
+    if (subEl) {
+      const yoloChip = autoScope === 'yolo'
+        ? ' · <span style="color:var(--accent-warn); letter-spacing: 0.16em;">⚡ YOLO</span>'
+        : autoScope === 'workspace'
+          ? ' · <span style="color:var(--accent-3); letter-spacing: 0.16em;">⇢ WORKSPACE-AUTO</span>'
+          : '';
+      subEl.innerHTML =
+        'Mode: ' + escMem(mode) + '  ·  ' + facts + ' facts in memory  ·  ' +
+        (approvals === 0 ? 'nothing waiting on you.' : approvals + ' approval' + (approvals === 1 ? '' : 's') + ' waiting.') +
+        yoloChip;
+    }
+
+    function setTile(el, value) {
+      if (!el) return;
+      el.textContent = value == null ? '—' : value;
+      const tile = el.closest('.home-tile');
+      if (!tile) return;
+      tile.classList.toggle('has-activity', typeof value === 'number' && value > 0);
+      tile.classList.toggle('high', typeof value === 'number' && value >= 5);
+    }
+    setTile(approvalsEl, approvals);
+    setTile(plansEl, homePlanCount);
+    setTile(proposalsEl, homeProposalCount);
+    setTile(checkinsEl, homeCheckinCount);
+  }
+
+  // Wire tile click-through.
+  document.querySelectorAll('[data-home-tile]').forEach((tile) => {
+    tile.addEventListener('click', () => {
+      const kind = tile.getAttribute('data-home-tile');
+      if (kind === 'approvals' || kind === 'plans' || kind === 'proposals' || kind === 'checkins') {
+        switchPanel('settings');
+        // Settings panel hosts proposal/plan/check-in editors. Approvals
+        // surface in run-inspector / Discord buttons; for v1 just open
+        // Settings so users find the related controls.
+      }
+    });
+  });
+
+  // Poll the auxiliary counts every 8s — separate from the main tick
+  // so the home tiles update even when the user is looking at another
+  // panel.
+  refreshHomeAuxCounts();
+  setInterval(refreshHomeAuxCounts, 8000);
+
   async function tick() {
     try {
       const [snap, runs] = await Promise.all([
@@ -2929,6 +5264,9 @@ const CONSOLE_JS = `
       els.memory.textContent    = (memIdx.chunks ?? '—') + ' / ' + (memIdx.activeFacts ?? '—') + 'f';
       els.approvals.textContent = (snap.approvals || []).length;
       els.policy.textContent    = ((snap.proactivity && snap.proactivity.policy && snap.proactivity.policy.mode) || '—').toUpperCase();
+
+      // Home tiles + greeting (only on first paint + when count changes).
+      updateHome(snap);
 
       const list = runs.runs || runs || [];
       const running = list.filter((r) => r.status === 'running' || r.status === 'received').length;
@@ -2966,11 +5304,14 @@ const CONSOLE_JS = `
   const navButtons = Array.from(document.querySelectorAll('.nav[data-panel]'));
   const panelSections = Array.from(document.querySelectorAll('.panel-frame[data-section]'));
   let memoryBooted = false;
+  let contextBooted = false;
   let workflowsBooted = false;
   let toolsBooted = false;
   let projectsBooted = false;
   let skillsBooted = false;
   let settingsBooted = false;
+  let integrationsBooted = false;
+  let homeBooted = false;
 
   function switchPanel(name) {
     panelSections.forEach((s) => {
@@ -2982,6 +5323,9 @@ const CONSOLE_JS = `
     if (name === 'memory') {
       if (!memoryBooted) { memoryBooted = true; bootMemoryPanel(); }
       else refreshMemoryPanel();
+    } else if (name === 'context') {
+      if (!contextBooted) { contextBooted = true; bootContextPanel(); }
+      else refreshContextPanel();
     } else if (name === 'workflows') {
       if (!workflowsBooted) { workflowsBooted = true; bootWorkflowsPanel(); }
       else refreshWorkflowList();
@@ -2991,6 +5335,12 @@ const CONSOLE_JS = `
       if (!projectsBooted) { projectsBooted = true; bootProjectsPanel(); }
     } else if (name === 'skills') {
       if (!skillsBooted) { skillsBooted = true; bootSkillsPanel(); }
+    } else if (name === 'integrations') {
+      if (!integrationsBooted) { integrationsBooted = true; bootIntegrationsHub(); }
+      else refreshIntegrationsHub();
+    } else if (name === 'home') {
+      if (!homeBooted) { homeBooted = true; bootHomePanel(); }
+      else refreshHomeAgenda();
     } else if (name === 'settings') {
       if (!settingsBooted) { settingsBooted = true; bootSettingsPanel(); }
     }
@@ -3000,6 +5350,20 @@ const CONSOLE_JS = `
       if (b.hasAttribute('disabled')) return;
       switchPanel(b.getAttribute('data-panel'));
     });
+  });
+
+  // Home is the default panel — boot it on first paint.
+  if (!homeBooted) { homeBooted = true; bootHomePanel(); }
+
+  // Site-wide cross-panel deep links: any element with
+  // data-tools-jump="<panel>" switches to that panel on click.
+  document.addEventListener('click', (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLElement)) return;
+    const jump = target.closest('[data-tools-jump]');
+    if (!jump) return;
+    event.preventDefault();
+    switchPanel(jump.getAttribute('data-tools-jump'));
   });
 
   // ─── Memory panel ─────────────────────────────────────────────
@@ -3041,10 +5405,160 @@ const CONSOLE_JS = `
   }
 
   async function bootMemoryPanel() {
+    wireMemoryViewToggle();
     await Promise.all([refreshMemoryStatus(), refreshFileList(), refreshFactList()]);
   }
   async function refreshMemoryPanel() {
     await Promise.all([refreshMemoryStatus(), refreshFileList(), refreshFactList()]);
+  }
+
+  // ─── Memory view toggle + graph ────────────────────────────────
+
+  let memGraphCy = null;        // cytoscape instance, lazy-init
+  let memGraphLoaded = false;
+
+  function wireMemoryViewToggle() {
+    const buttons = document.querySelectorAll('[data-mem-view]');
+    buttons.forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const view = btn.getAttribute('data-mem-view');
+        buttons.forEach((b) => b.classList.toggle('active', b === btn));
+        const viewerEl = document.querySelector('[data-mem-viewer]');
+        const graphEl = document.querySelector('[data-mem-graph]');
+        if (view === 'graph') {
+          if (viewerEl) viewerEl.setAttribute('hidden', '');
+          if (graphEl) graphEl.removeAttribute('hidden');
+          if (!memGraphLoaded) {
+            memGraphLoaded = true;
+            loadMemoryGraph();
+          } else if (memGraphCy) {
+            // Refit on tab show — Cytoscape needs a resize hint when
+            // the canvas was hidden during init.
+            memGraphCy.resize();
+            memGraphCy.fit(undefined, 40);
+          }
+        } else {
+          if (graphEl) graphEl.setAttribute('hidden', '');
+          if (viewerEl) viewerEl.removeAttribute('hidden');
+        }
+      });
+    });
+  }
+
+  async function loadMemoryGraph() {
+    const canvas = document.querySelector('[data-mem-graph-canvas]');
+    const detail = document.querySelector('[data-mem-graph-detail]');
+    if (!canvas) return;
+    if (typeof window.cytoscape !== 'function') {
+      canvas.innerHTML = '<div class="mem-empty" style="padding:24px;">Cytoscape failed to load. Reload the page once the daemon is up.</div>';
+      return;
+    }
+    try {
+      const data = await fetchJSON('/api/console/memory/graph');
+      if (!data.nodes || data.nodes.length === 0) {
+        canvas.innerHTML = '<div class="mem-empty" style="padding:24px;">— no facts or files indexed yet. Memory needs some signal first. —</div>';
+        return;
+      }
+
+      const css = getComputedStyle(document.documentElement);
+      const accent = css.getPropertyValue('--accent').trim() || '#ff5a35';
+      const accent2 = css.getPropertyValue('--accent-2').trim() || '#b9ff36';
+      const accent3 = css.getPropertyValue('--accent-3').trim() || '#36c5ff';
+      const line = css.getPropertyValue('--line').trim() || '#2a2a36';
+      const fg2 = css.getPropertyValue('--fg-2').trim() || '#a0a0aa';
+      const bg0 = css.getPropertyValue('--bg-0').trim() || '#07070a';
+
+      memGraphCy = window.cytoscape({
+        container: canvas,
+        elements: [
+          ...data.nodes.map((n) => ({ data: { id: n.id, label: n.label, type: n.type, ...(n.data || {}) } })),
+          ...data.edges.map((e) => ({ data: { id: e.id, source: e.source, target: e.target, type: e.type } })),
+        ],
+        style: [
+          {
+            selector: 'node',
+            style: {
+              'background-color': fg2,
+              'label': 'data(label)',
+              'color': fg2,
+              'font-size': '9px',
+              'font-family': 'ui-monospace, SF Mono, Menlo, monospace',
+              'text-valign': 'bottom',
+              'text-margin-y': 4,
+              'text-wrap': 'wrap',
+              'text-max-width': '140px',
+              'width': 14,
+              'height': 14,
+              'border-width': 1,
+              'border-color': line,
+            },
+          },
+          { selector: 'node[type = "fact"]', style: { 'background-color': accent, 'width': 12, 'height': 12 } },
+          { selector: 'node[type = "file"]', style: { 'background-color': accent3, 'width': 10, 'height': 10, 'shape': 'rectangle' } },
+          { selector: 'node[type = "kind"]', style: { 'background-color': accent2, 'width': 22, 'height': 22, 'font-size': '11px', 'font-weight': 'bold' } },
+          {
+            selector: 'edge',
+            style: {
+              'width': 1,
+              'line-color': line,
+              'curve-style': 'bezier',
+              'target-arrow-shape': 'none',
+              'opacity': 0.45,
+            },
+          },
+          { selector: 'edge[type = "kind"]', style: { 'line-color': accent2, 'opacity': 0.35 } },
+          { selector: 'edge[type = "mentions"]', style: { 'line-color': accent3, 'opacity': 0.55, 'line-style': 'dashed' } },
+          {
+            selector: 'node:selected',
+            style: {
+              'border-width': 2,
+              'border-color': accent,
+              'background-color': accent,
+            },
+          },
+        ],
+        layout: {
+          name: 'cose',
+          animate: false,
+          fit: true,
+          padding: 40,
+          nodeRepulsion: 8000,
+          idealEdgeLength: 80,
+          nodeOverlap: 12,
+          gravity: 0.25,
+        },
+        wheelSensitivity: 0.2,
+        boxSelectionEnabled: false,
+        userPanningEnabled: true,
+        userZoomingEnabled: true,
+      });
+
+      memGraphCy.on('mouseover', 'node', (event) => renderGraphDetail(detail, event.target));
+      memGraphCy.on('tap', 'node', (event) => renderGraphDetail(detail, event.target, true));
+    } catch (err) {
+      canvas.innerHTML = '<div class="mem-empty" style="padding:24px; color:var(--accent-fail);">Failed: ' + escMem(err.message || err) + '</div>';
+    }
+  }
+
+  function renderGraphDetail(detail, node, pinned) {
+    if (!detail) return;
+    const d = node.data();
+    const kind = d.type;
+    const kindLabel = kind === 'fact' ? 'Fact' : kind === 'file' ? 'File' : kind === 'kind' ? 'Kind cluster' : kind;
+    const body = [];
+    body.push('<h4>' + escMem(d.label || '(node)') + '</h4>');
+    body.push('<div><span class="pill ' + escMem(kind) + '">' + escMem(kindLabel) + '</span>' + (pinned ? '<span class="pill">pinned</span>' : '') + '</div>');
+    if (kind === 'fact') {
+      if (d.kind) body.push('<p style="margin:8px 0 4px;"><strong>Kind:</strong> ' + escMem(d.kind) + '</p>');
+      if (d.content) body.push('<p style="margin:4px 0;">' + escMem(d.content) + '</p>');
+    } else if (kind === 'file') {
+      const fullPath = d.id ? d.id.slice('file:'.length) : '';
+      body.push('<p style="margin:8px 0 4px;"><code style="font-size:10px;">' + escMem(fullPath) + '</code></p>');
+      if (d.chunks) body.push('<p style="margin:4px 0; color:var(--fg-3); font-size:10px;">' + d.chunks + ' chunk' + (d.chunks === 1 ? '' : 's') + '</p>');
+    } else if (kind === 'kind') {
+      body.push('<p style="margin:8px 0; color:var(--fg-3);">All facts of this kind cluster here.</p>');
+    }
+    detail.innerHTML = body.join('');
   }
 
   async function refreshMemoryStatus() {
@@ -3221,6 +5735,258 @@ const CONSOLE_JS = `
     });
   }
 
+  // ─── Context / Identity panel ─────────────────────────────────
+
+  const ctx = {
+    filesCount: document.querySelector('[data-context-files-count]'),
+    factsCount: document.querySelector('[data-context-facts-count]'),
+    goalsCount: document.querySelector('[data-context-goals-count]'),
+    voiceCount: document.querySelector('[data-context-voice-count]'),
+    profileMeta: document.querySelector('[data-context-profile-meta]'),
+    profileForm: document.querySelector('[data-context-profile-form]'),
+    healthList: document.querySelector('[data-context-health-list]'),
+    files: document.querySelector('[data-context-files]'),
+    factsList: document.querySelector('[data-context-facts-list]'),
+    goalsList: document.querySelector('[data-context-goals-list]'),
+    factForm: document.querySelector('[data-context-fact-form]'),
+    goalForm: document.querySelector('[data-context-goal-form]'),
+    refresh: document.querySelector('[data-context-refresh]'),
+  };
+  let contextPanelBound = false;
+  let contextData = null;
+
+  async function bootContextPanel() {
+    bindContextPanel();
+    await refreshContextPanel();
+  }
+
+  function bindContextPanel() {
+    if (contextPanelBound) return;
+    contextPanelBound = true;
+
+    ctx.refresh?.addEventListener('click', () => refreshContextPanel());
+
+    ctx.profileForm?.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const form = ctx.profileForm;
+      const button = form.querySelector('button[type="submit"]');
+      const patch = {};
+      form.querySelectorAll('[data-context-profile-field]').forEach((el) => {
+        const name = el.getAttribute('name');
+        if (name) patch[name] = el.value;
+      });
+      if (button) button.textContent = 'SAVING…';
+      try {
+        const r = await fetch(withToken('/api/console/settings/profile'), {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(patch),
+        });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        if (button) button.textContent = 'SAVED ✓';
+        await refreshContextPanel();
+      } catch (err) {
+        if (button) button.textContent = 'FAILED';
+        alert('Profile save failed: ' + (err.message || err));
+      } finally {
+        setTimeout(() => { if (button) button.textContent = 'SAVE PROFILE ✎'; }, 1400);
+      }
+    });
+
+    ctx.factForm?.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const form = ctx.factForm;
+      const payload = {
+        kind: form.querySelector('[name="kind"]')?.value || 'user',
+        content: form.querySelector('[name="content"]')?.value || '',
+      };
+      if (!payload.content.trim()) return;
+      try {
+        const r = await fetch(withToken('/api/console/context/facts'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        form.querySelector('[name="content"]').value = '';
+        await refreshContextPanel();
+        await refreshMemoryStatus().catch(() => {});
+      } catch (err) {
+        alert('Remember failed: ' + (err.message || err));
+      }
+    });
+
+    ctx.goalForm?.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const form = ctx.goalForm;
+      const payload = {
+        title: form.querySelector('[name="title"]')?.value || '',
+        description: form.querySelector('[name="description"]')?.value || '',
+        priority: form.querySelector('[name="priority"]')?.value || 'medium',
+        nextActions: form.querySelector('[name="nextActions"]')?.value || '',
+      };
+      if (!payload.title.trim() || !payload.description.trim()) return;
+      try {
+        const r = await fetch(withToken('/api/console/context/goals'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        form.reset();
+        await refreshContextPanel();
+      } catch (err) {
+        alert('Goal create failed: ' + (err.message || err));
+      }
+    });
+  }
+
+  async function refreshContextPanel() {
+    try {
+      contextData = await fetchJSON('/api/console/context');
+      renderContextPanel();
+    } catch (err) {
+      if (ctx.healthList) ctx.healthList.innerHTML = '<div class="settings-info" style="color:var(--accent-fail);">Failed: ' + escMem(err.message || err) + '</div>';
+    }
+  }
+
+  function setContextProfileForm(profile) {
+    if (!ctx.profileForm || !profile) return;
+    ['preferredName', 'role', 'timezone', 'communicationTone', 'notes'].forEach((name) => {
+      const el = ctx.profileForm.querySelector('[name="' + name + '"]');
+      if (el) el.value = profile[name] || (name === 'communicationTone' ? 'balanced' : '');
+    });
+    if (ctx.profileMeta) {
+      const name = profile.preferredName || profile.displayName || 'not set';
+      ctx.profileMeta.textContent = name + ' · ' + (profile.communicationTone || 'balanced');
+    }
+  }
+
+  function renderContextPanel() {
+    const data = contextData || {};
+    const files = data.files || [];
+    const facts = data.facts || [];
+    const goals = data.goals || [];
+    if (ctx.filesCount) ctx.filesCount.textContent = files.length;
+    if (ctx.factsCount) ctx.factsCount.textContent = facts.length;
+    if (ctx.goalsCount) ctx.goalsCount.textContent = goals.filter((g) => g.status === 'active' || g.status === 'blocked').length + '/' + goals.length;
+    if (ctx.voiceCount) ctx.voiceCount.textContent = data.voiceContext?.chars ? Math.round(data.voiceContext.chars / 100) / 10 + 'k' : '—';
+
+    setContextProfileForm(data.profile);
+    renderContextHealth(data);
+    renderContextFiles(files);
+    renderContextFacts(facts);
+    renderContextGoals(goals);
+  }
+
+  function renderContextHealth(data) {
+    if (!ctx.healthList) return;
+    const files = data.files || [];
+    const profile = data.profile || {};
+    const rows = [
+      {
+        title: 'User profile',
+        ok: Boolean(profile.preferredName || profile.role || profile.notes),
+        meta: profile.preferredName || profile.displayName || 'defaults only',
+      },
+      ...files.map((file) => ({
+        title: file.title,
+        ok: !file.empty,
+        meta: (file.usefulChars || 0) + ' useful chars · ' + shortenPath(file.path || ''),
+      })),
+      {
+        title: 'Realtime voice prompt',
+        ok: (data.voiceContext?.chars || 0) > 1000,
+        meta: (data.voiceContext?.chars || 0) + ' chars · ' + ((data.voiceContext?.sections || []).slice(0, 5).join(', ') || 'no sections'),
+      },
+      {
+        title: 'Memory index',
+        ok: (data.memory?.chunks || 0) > 0,
+        meta: (data.memory?.chunks || 0) + ' chunks · ' + (data.memory?.activeFacts || 0) + ' facts',
+      },
+    ];
+    ctx.healthList.innerHTML = rows.map((row) => [
+      '<div class="context-health-row">',
+      '  <span class="context-health-status ' + (row.ok ? 'ok' : 'warn') + '">' + (row.ok ? 'READY' : 'NEEDS COPY') + '</span>',
+      '  <div><div class="context-health-title">' + escMem(row.title) + '</div><div class="context-health-meta">' + escMem(row.meta) + '</div></div>',
+      '  <span class="context-health-meta">' + (row.ok ? '✓' : '!') + '</span>',
+      '</div>',
+    ].join('')).join('');
+  }
+
+  function renderContextFiles(files) {
+    if (!ctx.files) return;
+    if (!files.length) {
+      ctx.files.innerHTML = '<div class="settings-info">— no context files found —</div>';
+      return;
+    }
+    ctx.files.innerHTML = files.map((file) => [
+      '<article class="context-file" data-context-file="' + escMem(file.key) + '">',
+      '  <div class="context-file-head">',
+      '    <div><div class="context-file-title">' + escMem(file.title) + '</div><div class="context-file-desc">' + escMem(file.description) + '</div></div>',
+      '    <div class="context-file-meta"><span>' + escMem(shortenPath(file.path || '')) + '</span><span class="' + (file.empty ? 'warn' : '') + '">' + (file.empty ? 'NEEDS COPY' : 'READY') + '</span><span>' + (file.bytes || 0) + ' bytes</span></div>',
+      '  </div>',
+      '  <textarea data-context-file-input="' + escMem(file.key) + '" rows="8" spellcheck="true">' + escMem(file.content || '') + '</textarea>',
+      '  <div class="context-file-actions"><span data-context-file-status="' + escMem(file.key) + '">saved state: ' + (file.empty ? 'thin' : 'ready') + '</span><button type="button" data-context-file-save="' + escMem(file.key) + '">SAVE ' + escMem(String(file.title || '').toUpperCase()) + '</button></div>',
+      '</article>',
+    ].join('')).join('');
+    ctx.files.querySelectorAll('[data-context-file-save]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const key = btn.getAttribute('data-context-file-save');
+        const input = ctx.files.querySelector('[data-context-file-input="' + key + '"]');
+        const status = ctx.files.querySelector('[data-context-file-status="' + key + '"]');
+        btn.textContent = 'SAVING…';
+        try {
+          const r = await fetch(withToken('/api/console/context/files/' + encodeURIComponent(key)), {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ content: input?.value || '' }),
+          });
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          if (status) status.textContent = 'saved ' + new Date().toLocaleTimeString();
+          await refreshContextPanel();
+        } catch (err) {
+          if (status) status.textContent = 'save failed: ' + (err.message || err);
+        } finally {
+          btn.textContent = 'SAVE';
+        }
+      });
+    });
+  }
+
+  function renderContextFacts(facts) {
+    if (!ctx.factsList) return;
+    if (!facts.length) {
+      ctx.factsList.innerHTML = '<div class="settings-info">— no durable facts yet. Add one above or let Clementine capture facts during chat. —</div>';
+      return;
+    }
+    ctx.factsList.innerHTML = facts.map((fact) => [
+      '<div class="context-fact">',
+      '  <div class="context-fact-kind">' + escMem(fact.kind) + ' · #' + escMem(fact.id) + '</div>',
+      '  <div class="context-fact-body">' + escMem(fact.content) + '</div>',
+      '</div>',
+    ].join('')).join('');
+  }
+
+  function renderContextGoals(goals) {
+    if (!ctx.goalsList) return;
+    if (!goals.length) {
+      ctx.goalsList.innerHTML = '<div class="settings-info">— no real goals yet. Create one above so proactive work has a target. —</div>';
+      return;
+    }
+    ctx.goalsList.innerHTML = goals.map((goal) => {
+      const next = Array.isArray(goal.nextActions) && goal.nextActions[0] ? goal.nextActions[0] : '';
+      return [
+        '<div class="context-goal">',
+        '  <div class="context-goal-meta">' + escMem(goal.status || 'unknown') + ' · ' + escMem(goal.priority || 'medium') + ' · ' + escMem(goal.id || '') + '</div>',
+        '  <div class="context-goal-title">' + escMem(goal.title || '(untitled goal)') + '</div>',
+        goal.description ? '  <div class="context-goal-desc">' + escMem(goal.description) + '</div>' : '',
+        next ? '  <div class="context-goal-next">next: ' + escMem(next) + '</div>' : '',
+        '</div>',
+      ].join('');
+    }).join('');
+  }
+
   // ─── Workflow Studio ──────────────────────────────────────────
 
   const wf = {
@@ -3242,7 +6008,42 @@ const CONSOLE_JS = `
   let wfChatHistory = [];
   let wfChatBusy = false;
 
-  async function bootWorkflowsPanel() { await refreshWorkflowList(); }
+  async function bootWorkflowsPanel() {
+    // Event delegation across the whole panel — covers both the
+    // sidebar "+ NEW" button AND the empty-state buttons that get
+    // re-rendered when the editor swaps. Plus a direct binding on
+    // the sidebar button as belt-and-suspenders.
+    const wfPanel = document.querySelector('[data-section="workflows"]');
+    if (wfPanel) {
+      wfPanel.addEventListener('click', (event) => {
+        const target = event.target;
+        if (!(target instanceof HTMLElement)) return;
+        if (target.closest('[data-wf-new]')) {
+          event.preventDefault();
+          startNewWorkflow();
+          return;
+        }
+        if (target.closest('[data-wf-empty-architect]')) {
+          event.preventDefault();
+          if (wf.chatInput) {
+            wf.chatInput.value = 'Draft me a workflow for ';
+            wf.chatInput.focus();
+          }
+        }
+      });
+    }
+    // Direct binding on the sidebar button so even if delegation is
+    // ever bypassed (e.g. someone re-renders the panel), the sidebar
+    // + NEW still works.
+    if (wf.newBtn) {
+      wf.newBtn.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        startNewWorkflow();
+      });
+    }
+    await refreshWorkflowList();
+  }
 
   async function refreshWorkflowList() {
     try {
@@ -3299,24 +6100,49 @@ const CONSOLE_JS = `
   function startNewWorkflow() {
     wfSelectedName = null;
     wfIsNew = true;
+    // Friendly starter template: a 3-step research-draft-synthesize
+    // pattern with one example input. Teaches the shape without
+    // forcing the user to learn from a blank page.
     wfDraft = {
       name: 'new-workflow',
-      description: '',
+      description: 'Briefly describe what this workflow does.',
       enabled: false,
       triggerSchedule: '',
-      steps: [{ id: 'step-1', prompt: '', dependsOn: [] }],
-      inputs: {},
-      synthesisPrompt: '',
+      steps: [
+        {
+          id: 'research',
+          prompt: 'Gather the context needed for this task. Reference {{topic}}. Use memory_recall + read_file as needed. Return concise findings.',
+          dependsOn: [],
+        },
+        {
+          id: 'draft',
+          prompt: 'Using the research above, draft the output the user asked for. Be concrete and direct.',
+          dependsOn: ['research'],
+        },
+      ],
+      inputs: { topic: '' },
+      synthesisPrompt: 'Return the draft from the previous step, formatted clearly. No preamble.',
     };
     wfChatHistory = [];
     Array.from(wf.list.querySelectorAll('li.wf')).forEach((el) => el.classList.remove('selected'));
     renderEditor();
   }
-  wf.newBtn.addEventListener('click', startNewWorkflow);
+  // The sidebar + empty-state both bind via event delegation in
+  // bootWorkflowsPanel(); no per-element listener needed here.
 
   function renderEditor() {
     if (!wfDraft) {
-      wf.editor.innerHTML = '<div class="wf-empty"><div class="wf-empty-mark">⊟</div><div class="wf-empty-text">SELECT A WORKFLOW OR ＋NEW</div></div>';
+      wf.editor.innerHTML = [
+        '<div class="wf-empty wf-empty-onboarding">',
+        '  <div class="wf-empty-mark">⊟</div>',
+        '  <div class="wf-empty-text">No workflow selected</div>',
+        '  <p class="wf-empty-sub">A workflow is a multi-step task you can run on demand or on a schedule.</p>',
+        '  <div class="wf-empty-actions">',
+        '    <button class="wf-empty-btn primary" data-wf-new>＋ NEW WORKFLOW</button>',
+        '    <button class="wf-empty-btn" data-wf-empty-architect>ASK ARCHITECT TO DRAFT ONE →</button>',
+        '  </div>',
+        '</div>',
+      ].join('');
       return;
     }
     const d = wfDraft;
@@ -3324,17 +6150,22 @@ const CONSOLE_JS = `
     const head = [
       '<div class="wf-edit-head">',
       '  <input class="wf-name" data-wf-field="name" type="text" value="' + escMem(d.name) + '" spellcheck="false" />',
-      '  <span class="status-pill ' + (d.enabled ? 'on' : 'off') + '">' + (d.enabled ? '● APPROVED' : '○ DRAFT') + '</span>',
+      '  <span class="status-pill ' + (d.enabled ? 'on' : 'off') + '">' + (d.enabled ? '● ENABLED' : '○ DISABLED') + '</span>',
       '</div>',
     ].join('');
     const controls = [
       '<div class="wf-edit-controls">',
-      '  <button class="btn-save" data-wf-action="save">' + (wfIsNew ? 'CREATE' : 'SAVE') + ' ✎</button>',
-      wfIsNew ? '' : '  <button class="btn-validate" data-wf-action="validate">VALIDATE ✓</button>',
-      wfIsNew ? '' : '  <button class="btn-test" data-wf-action="test">DRY-RUN ⌗</button>',
-      wfIsNew ? '' : '  <button class="btn-run" data-wf-action="run">RUN ▶</button>',
-      wfIsNew ? '' : '  <button class="btn-toggle" data-wf-action="toggle">' + (d.enabled ? '○ DISABLE' : '● APPROVE') + '</button>',
-      wfIsNew ? '' : '  <button class="btn-delete" data-wf-action="delete">DELETE ▣</button>',
+      '  <div class="wf-control-group wf-control-state">',
+      '    <button class="btn-save" data-wf-action="save">' + (wfIsNew ? 'CREATE' : 'SAVE') + ' ✎</button>',
+      wfIsNew ? '' : '    <button class="btn-duplicate" data-wf-action="duplicate">DUPLICATE ⎘</button>',
+      wfIsNew ? '' : '    <button class="btn-toggle" data-wf-action="toggle">' + (d.enabled ? '○ DISABLE' : '● ENABLE') + '</button>',
+      wfIsNew ? '' : '    <button class="btn-delete" data-wf-action="delete">DELETE ▣</button>',
+      '  </div>',
+      wfIsNew ? '' : '  <div class="wf-control-group wf-control-execute">',
+      wfIsNew ? '' : '    <button class="btn-validate" data-wf-action="validate">VALIDATE ✓</button>',
+      wfIsNew ? '' : '    <button class="btn-test" data-wf-action="dry-run">DRY-RUN ⌗</button>',
+      wfIsNew ? '' : '    <button class="btn-run" data-wf-action="run">RUN ▶</button>',
+      wfIsNew ? '' : '  </div>',
       '</div>',
     ].join('');
 
@@ -3362,9 +6193,20 @@ const CONSOLE_JS = `
       '  </div>',
 
       '  <div class="wf-field">',
+      '    <label>INPUTS · ' + Object.keys(d.inputs || {}).length + '</label>',
+      '    <div class="wf-inputs" data-wf-inputs>',
+           renderInputsList(d.inputs || {}),
+      '    </div>',
+      '    <button class="wf-add-input" data-wf-action="add-input">＋ ADD INPUT</button>',
+      '    <span class="hint">Inputs are runtime parameters (e.g. <code>customer_id</code>). Reference them in step prompts as <code>{{customer_id}}</code>. The user is prompted for values when running.</span>',
+      '  </div>',
+
+      '  <div class="wf-field">',
       '    <label>SYNTHESIS (optional final prompt that combines step outputs)</label>',
       '    <textarea data-wf-field="synthesisPrompt" rows="3" spellcheck="false" placeholder="Summarize the prior step outputs as a single concise update.">' + escMem(d.synthesisPrompt) + '</textarea>',
       '  </div>',
+
+      '  <div class="wf-runs" data-wf-runs></div>',
 
       '  <div data-wf-validation></div>',
 
@@ -3373,6 +6215,25 @@ const CONSOLE_JS = `
 
     wf.editor.innerHTML = head + controls + body;
     bindEditorEvents();
+    refreshWorkflowRuns();
+  }
+
+  function renderInputsList(inputs) {
+    const keys = Object.keys(inputs);
+    if (keys.length === 0) {
+      return '<div class="wf-input-row wf-input-empty">— no inputs declared. The workflow runs with whatever the runtime supplies. —</div>';
+    }
+    return keys.map((k) => {
+      const v = inputs[k];
+      const valueStr = typeof v === 'object' && v !== null ? JSON.stringify(v) : String(v ?? '');
+      return [
+        '<div class="wf-input-row" data-wf-input-row="' + escMem(k) + '">',
+        '  <input class="wf-input-key" type="text" value="' + escMem(k) + '" data-wf-input-key="' + escMem(k) + '" spellcheck="false" placeholder="key" />',
+        '  <input class="wf-input-default" type="text" value="' + escMem(valueStr) + '" data-wf-input-value="' + escMem(k) + '" spellcheck="false" placeholder="default value (optional)" />',
+        '  <button type="button" class="wf-input-remove" data-wf-action="input-remove" data-wf-input-name="' + escMem(k) + '">✕</button>',
+        '</div>',
+      ].join('');
+    }).join('');
   }
 
   function renderStep(step, index, allStepIds) {
@@ -3431,6 +6292,26 @@ const CONSOLE_JS = `
       });
     });
 
+    // Input key/value bindings — keep wfDraft.inputs in sync without
+    // re-rendering on every keystroke (the key field would lose focus).
+    wf.editor.querySelectorAll('[data-wf-input-key]').forEach((input) => {
+      const originalKey = input.getAttribute('data-wf-input-key');
+      input.addEventListener('change', () => {
+        const newKey = (input.value || '').trim();
+        if (!newKey || newKey === originalKey) return;
+        const v = wfDraft.inputs[originalKey];
+        delete wfDraft.inputs[originalKey];
+        wfDraft.inputs[newKey] = v;
+        renderEditor();
+      });
+    });
+    wf.editor.querySelectorAll('[data-wf-input-value]').forEach((input) => {
+      const key = input.getAttribute('data-wf-input-value');
+      input.addEventListener('input', () => {
+        wfDraft.inputs[key] = input.value;
+      });
+    });
+
     // Action buttons
     wf.editor.querySelectorAll('[data-wf-action]').forEach((btn) => {
       btn.addEventListener('click', (e) => {
@@ -3439,14 +6320,32 @@ const CONSOLE_JS = `
         const idx = parseInt(btn.getAttribute('data-wf-step-index') || '-1', 10);
         if (action === 'save') return saveWorkflow();
         if (action === 'validate') return validateWorkflow();
-        if (action === 'test') return runWorkflow(true);
+        if (action === 'dry-run' || action === 'test') return runWorkflow(true);
         if (action === 'run') return runWorkflow(false);
         if (action === 'toggle') return toggleEnabled();
         if (action === 'delete') return deleteWorkflow();
+        if (action === 'duplicate') return duplicateWorkflow();
         if (action === 'add-step') {
           const nextId = 'step-' + (wfDraft.steps.length + 1);
           wfDraft.steps.push({ id: nextId, prompt: '', dependsOn: [] });
           renderEditor();
+          return;
+        }
+        if (action === 'add-input') {
+          if (!wfDraft.inputs) wfDraft.inputs = {};
+          let n = Object.keys(wfDraft.inputs).length + 1;
+          let k = 'input_' + n;
+          while (wfDraft.inputs[k] !== undefined) { n++; k = 'input_' + n; }
+          wfDraft.inputs[k] = '';
+          renderEditor();
+          return;
+        }
+        if (action === 'input-remove') {
+          const name = btn.getAttribute('data-wf-input-name');
+          if (name && wfDraft.inputs) {
+            delete wfDraft.inputs[name];
+            renderEditor();
+          }
           return;
         }
         if (action === 'step-remove' && Number.isFinite(idx)) {
@@ -3531,13 +6430,41 @@ const CONSOLE_JS = `
     }
   }
 
+  function duplicateWorkflow() {
+    if (!wfDraft) return;
+    const newName = (prompt('Name for the duplicate:', wfDraft.name + '-copy') || '').trim();
+    if (!newName) return;
+    wfIsNew = true;
+    wfSelectedName = null;
+    wfDraft = {
+      ...wfDraft,
+      name: newName,
+      enabled: false,
+      // Steps + inputs are cloned by reference but they're flat enough
+      // that the user can edit independently from here.
+      steps: wfDraft.steps.map((s) => ({ ...s, dependsOn: [...(s.dependsOn || [])] })),
+      inputs: { ...(wfDraft.inputs || {}) },
+    };
+    wfChatHistory = [];
+    Array.from(wf.list.querySelectorAll('li.wf')).forEach((el) => el.classList.remove('selected'));
+    renderEditor();
+  }
+
   async function runWorkflow(dryRun) {
     if (!wfSelectedName) return;
+    // Prompt for input values if any are declared.
+    const declaredInputs = Object.keys(wfDraft?.inputs || {});
+    let inputValues = {};
+    if (declaredInputs.length > 0) {
+      const supplied = await promptForRunInputs(wfDraft.inputs, dryRun);
+      if (supplied === null) return; // user cancelled
+      inputValues = supplied;
+    }
     try {
       const r = await fetch(withToken('/api/console/workflows/' + encodeURIComponent(wfSelectedName) + '/run'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ dryRun, inputs: {} }),
+        body: JSON.stringify({ dryRun, inputs: inputValues }),
       });
       const j = await r.json();
       if (!r.ok) {
@@ -3545,8 +6472,102 @@ const CONSOLE_JS = `
         return;
       }
       renderValidation({ ok: true, errors: [], warnings: [], stepCount: 0, hasCycles: false }, dryRun ? ('DRY-RUN QUEUED · ' + j.id) : ('QUEUED · ' + j.id));
+      // Refresh the runs list so the user sees their new run land.
+      refreshWorkflowRuns();
     } catch (err) {
       renderValidation({ ok: false, errors: [err.message || String(err)], warnings: [], stepCount: 0, hasCycles: false });
+    }
+  }
+
+  /**
+   * Modal prompt for workflow inputs. Resolves with {key: value} or
+   * null if cancelled. Pure-DOM modal — no framework, just an absolute
+   * overlay over the editor.
+   */
+  function promptForRunInputs(declaredInputs, dryRun) {
+    return new Promise((resolve) => {
+      const keys = Object.keys(declaredInputs);
+      const overlay = document.createElement('div');
+      overlay.className = 'wf-run-modal-backdrop';
+      overlay.innerHTML = [
+        '<div class="wf-run-modal" role="dialog" aria-modal="true">',
+        '  <div class="wf-run-modal-head">',
+        '    <span>' + (dryRun ? 'DRY-RUN INPUTS' : 'RUN INPUTS') + '</span>',
+        '    <button class="wf-run-modal-close" data-close>✕</button>',
+        '  </div>',
+        '  <p class="wf-run-modal-sub">Provide values for the workflow inputs. Press <kbd>↩</kbd> to ' + (dryRun ? 'dry-run' : 'run') + '.</p>',
+        '  <form class="wf-run-modal-form">',
+             keys.map((k) => {
+               const def = declaredInputs[k];
+               const defStr = def === undefined || def === null ? '' : String(def);
+               return [
+                 '<label class="wf-run-modal-row">',
+                 '  <span>' + escMem(k) + '</span>',
+                 '  <input type="text" name="' + escMem(k) + '" value="' + escMem(defStr) + '" autocomplete="off" />',
+                 '</label>',
+               ].join('');
+             }).join(''),
+        '    <div class="wf-run-modal-actions">',
+        '      <button type="button" class="cancel" data-close>CANCEL</button>',
+        '      <button type="submit" class="primary">' + (dryRun ? 'DRY-RUN ⌗' : 'RUN ▶') + '</button>',
+        '    </div>',
+        '  </form>',
+        '</div>',
+      ].join('');
+      document.body.appendChild(overlay);
+      const cleanup = () => { overlay.remove(); };
+      overlay.querySelectorAll('[data-close]').forEach((b) => b.addEventListener('click', () => { cleanup(); resolve(null); }));
+      const form = overlay.querySelector('form');
+      form.addEventListener('submit', (event) => {
+        event.preventDefault();
+        const formData = new FormData(form);
+        const out = {};
+        for (const [k, v] of formData.entries()) out[k] = v;
+        cleanup();
+        resolve(out);
+      });
+      const firstInput = overlay.querySelector('input');
+      if (firstInput) firstInput.focus();
+    });
+  }
+
+  /** Recent runs for the currently-selected workflow. */
+  async function refreshWorkflowRuns() {
+    const slot = document.querySelector('[data-wf-runs]');
+    if (!slot || !wfSelectedName || wfIsNew) {
+      if (slot) slot.innerHTML = '';
+      return;
+    }
+    try {
+      const data = await fetchJSON('/api/console/workflows/' + encodeURIComponent(wfSelectedName) + '/runs?limit=5');
+      const runs = data.runs || [];
+      if (runs.length === 0) {
+        slot.innerHTML = '<div class="wf-runs-empty">— no runs yet. Click RUN ▶ to kick one off. —</div>';
+        return;
+      }
+      slot.innerHTML = [
+        '<div class="wf-runs-head">RECENT RUNS</div>',
+        '<ol class="wf-runs-list">',
+           runs.map((r) => {
+             const status = (r.status || 'unknown').toString();
+             const when = (r.createdAt || '').slice(11, 19);
+             const day = (r.createdAt || '').slice(0, 10);
+             const inputs = r.inputs && Object.keys(r.inputs).length > 0
+               ? Object.entries(r.inputs).map(([k, v]) => k + '=' + String(v).slice(0, 30)).join(' · ')
+               : '';
+             return [
+               '<li class="wf-run">',
+               '  <span class="wf-run-status status-' + escMem(status) + '">' + escMem(status.toUpperCase()) + '</span>',
+               '  <span class="wf-run-id">' + escMem(r.id) + '</span>',
+               '  <span class="wf-run-time">' + escMem(day + ' ' + when) + '</span>',
+               inputs ? '  <span class="wf-run-inputs">' + escMem(inputs) + '</span>' : '',
+               '</li>',
+             ].join('');
+           }).join(''),
+        '</ol>',
+      ].join('');
+    } catch (err) {
+      slot.innerHTML = '<div class="wf-runs-empty">runs unavailable: ' + escMem(err.message || err) + '</div>';
     }
   }
 
@@ -3672,7 +6693,6 @@ const CONSOLE_JS = `
     categories: document.querySelector('[data-tools-categories]'),
     grid:       document.querySelector('[data-tools-grid]'),
     shown:      document.querySelector('[data-tools-shown]'),
-    mcpGrid:    document.querySelector('[data-mcp-grid]'),
     mcpCount:   document.querySelector('[data-mcp-count]'),
   };
   let toolsData = null;
@@ -3683,7 +6703,7 @@ const CONSOLE_JS = `
       toolsData = await fetchJSON('/api/console/tools');
       renderToolsCategories();
       renderToolsGrid();
-      renderMcpGrid();
+      if (tools.mcpCount) tools.mcpCount.textContent = (toolsData.mcpServers || []).length;
     } catch (err) {
       tools.grid.innerHTML = '<div class="tools-empty">— failed: ' + escMem(err.message || err) + ' —</div>';
     }
@@ -3733,29 +6753,6 @@ const CONSOLE_JS = `
       t.needsApproval ? '    <span class="tool-approval">APPROVAL</span>' : '',
       '  </div>',
       t.description ? '  <div class="tool-desc">' + escMem(t.description) + '</div>' : '',
-      '</div>',
-    ].join('')).join('');
-  }
-
-  function renderMcpGrid() {
-    if (!toolsData) return;
-    const list = toolsData.mcpServers || [];
-    tools.mcpCount.textContent = list.length;
-    if (list.length === 0) {
-      tools.mcpGrid.innerHTML = '<div class="tools-empty">— no MCP servers discovered. Add one to your Claude Desktop / Code config to expose more tools. —</div>';
-      return;
-    }
-    tools.mcpGrid.innerHTML = list.map((s) => [
-      '<div class="mcp-card">',
-      '  <div class="mcp-name">' + escMem(s.name) + '</div>',
-      '  <div class="mcp-meta">',
-      '    <em>' + (s.enabled ? '● ENABLED' : '<span class="off">○ DISABLED</span>') + '</em>',
-      '    · ' + escMem(s.transport || 'stdio').toUpperCase(),
-      '    · ' + escMem(s.source || 'config'),
-      '  </div>',
-      s.description ? '  <div class="mcp-desc">' + escMem(s.description) + '</div>' : '',
-      s.command ? '  <div class="mcp-cmd">$ ' + escMem(s.command) + '</div>' : '',
-      s.url ? '  <div class="mcp-cmd">' + escMem(s.url) + '</div>' : '',
       '</div>',
     ].join('')).join('');
   }
@@ -3844,7 +6841,7 @@ const CONSOLE_JS = `
       }
 
       if (data.claudeMd) {
-        parts.push('<div class="proj-block"><div class="proj-block-head"><span>CLAUDE.MD</span></div><div class="proj-block-body"><pre>' + escMem(data.claudeMd) + '</pre></div></div>');
+        parts.push('<div class="proj-block"><div class="proj-block-head"><span>IMPORTED AGENT NOTES</span></div><div class="proj-block-body"><pre>' + escMem(data.claudeMd) + '</pre></div></div>');
       }
       if (data.readme) {
         parts.push('<div class="proj-block"><div class="proj-block-head"><span>README</span></div><div class="proj-block-body"><pre>' + escMem(data.readme) + '</pre></div></div>');
@@ -3929,6 +6926,1215 @@ const CONSOLE_JS = `
       else patch[name] = el.value;
     });
     return patch;
+  }
+
+  // ─── Home panel ────────────────────────────────────────────────
+
+  async function bootHomePanel() {
+    const form = document.querySelector('[data-home-chat-form]');
+    const input = document.querySelector('[data-home-chat-input]');
+    if (form && input) {
+      form.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const text = (input.value || '').trim();
+        if (!text) return;
+        input.value = '';
+        await sendHomeChat(text);
+      });
+    }
+    // Auto-send when the user clicks a suggested prompt.
+    document.querySelectorAll('[data-home-chat-suggest]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const text = btn.getAttribute('data-home-chat-suggest') || '';
+        if (text) await sendHomeChat(text);
+      });
+    });
+    bindHomeVoiceControls();
+    await refreshHomeAgenda();
+  }
+
+  const HOME_LIST_CAP = 5;
+
+  async function refreshHomeAgenda() {
+    const agendaEl = document.querySelector('[data-home-agenda]');
+    const doneEl = document.querySelector('[data-home-done]');
+    const agendaCountEl = document.querySelector('[data-home-agenda-count]');
+    const doneCountEl = document.querySelector('[data-home-done-count]');
+    if (!agendaEl || !doneEl) return;
+    try {
+      const data = await fetchJSON('/api/console/home/agenda');
+      const agenda = data.agenda || [];
+      const done = data.done || [];
+      const totals = data.totals || {};
+      if (agendaCountEl) agendaCountEl.textContent = String(agenda.length);
+      if (doneCountEl) doneCountEl.textContent = String(done.length);
+
+      const agendaSlice = agenda.slice(0, HOME_LIST_CAP);
+      const doneSlice = done.slice(0, HOME_LIST_CAP);
+
+      const agendaItems = agendaSlice.map((item) => renderHomeItem(item)).join('');
+      // If there are agent-tracked tasks NOT shown on home, surface them
+      // behind a single deep-link instead of a full list.
+      const hiddenPending = Math.max(0, (totals.pendingTasks || 0) - agendaSlice.filter((i) => i.kind === 'task').length);
+      const agendaFooterParts = [];
+      if (agenda.length > HOME_LIST_CAP) {
+        agendaFooterParts.push('<a class="tools-jump" data-tools-jump="activity">' + agenda.length + ' total →</a>');
+      }
+      if (hiddenPending > 0) {
+        agendaFooterParts.push('<a class="tools-jump" data-tools-jump="activity">+ ' + hiddenPending + ' agent-tracked tasks</a>');
+      }
+      const agendaFooter = agendaFooterParts.length > 0
+        ? '<div class="home-list-footer">' + agendaFooterParts.join(' · ') + '</div>'
+        : '';
+
+      agendaEl.innerHTML = agenda.length === 0
+        ? '<div class="home-empty">— nothing on the docket. Quiet day. —</div>' + (hiddenPending > 0 ? '<div class="home-list-footer"><a class="tools-jump" data-tools-jump="activity">' + hiddenPending + ' agent-tracked tasks →</a></div>' : '')
+        : agendaItems + agendaFooter;
+
+      const doneItems = doneSlice.map((item) => renderHomeItem(item, true)).join('');
+      const hiddenDone = Math.max(0, (totals.completedTasks || 0) - doneSlice.filter((i) => i.kind === 'task').length);
+      const doneFooterParts = [];
+      if (done.length > HOME_LIST_CAP) {
+        doneFooterParts.push('<a class="tools-jump" data-tools-jump="activity">' + done.length + ' total →</a>');
+      }
+      if (hiddenDone > 0) {
+        doneFooterParts.push('<a class="tools-jump" data-tools-jump="activity">+ ' + hiddenDone + ' more</a>');
+      }
+      const doneFooter = doneFooterParts.length > 0
+        ? '<div class="home-list-footer">' + doneFooterParts.join(' · ') + '</div>'
+        : '';
+      doneEl.innerHTML = done.length === 0
+        ? '<div class="home-empty">— nothing closed today yet. —</div>'
+        : doneItems + doneFooter;
+    } catch (err) {
+      agendaEl.innerHTML = '<div class="home-empty">Failed: ' + escMem(err.message || err) + '</div>';
+    }
+  }
+
+  function renderHomeItem(item, isDone) {
+    const kindClass = isDone ? 'done' : (item.kind || 'task');
+    return [
+      '<div class="home-item">',
+      '  <span class="home-item-kind ' + escMem(kindClass) + '">' + escMem((item.kind || 'item').toUpperCase()) + '</span>',
+      '  <div style="flex:1; min-width:0;">',
+      '    <div class="home-item-text">' + escMem(item.title || '') + '</div>',
+      item.meta ? '    <div class="home-item-meta">' + escMem(item.meta) + '</div>' : '',
+      '  </div>',
+      '</div>',
+    ].join('');
+  }
+
+  const homeChatHistory = [];
+
+  function setChatTurnText(turn, text) {
+    const body = turn?.querySelector?.('[data-home-chat-turn-text]');
+    if (body) body.textContent = text || '';
+  }
+
+  function setChatTurnStatus(turn, text) {
+    const status = turn?.querySelector?.('[data-home-chat-turn-status]');
+    if (status) status.textContent = text || '';
+  }
+
+  async function readNdjsonStream(response, onEvent) {
+    if (!response.body) throw new Error('Streaming response did not include a body.');
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\\n');
+      buffer = lines.pop() || '';
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        onEvent(JSON.parse(trimmed));
+      }
+    }
+    const tail = buffer.trim();
+    if (tail) onEvent(JSON.parse(tail));
+  }
+
+  async function sendHomeChat(text, options = {}) {
+    const thread = document.querySelector('[data-home-chat-thread]');
+    const send = document.querySelector('.home-chat-send');
+    if (!thread) return;
+    // Clear the hint on first send.
+    const hint = thread.querySelector('.home-chat-hint');
+    if (hint) hint.remove();
+
+    appendChatTurn('user', text);
+    homeChatHistory.push({ role: 'user', text });
+    const assistantTurn = appendChatTurn('assistant', '');
+    assistantTurn?.classList.add('pending');
+    setChatTurnStatus(assistantTurn, 'starting local run');
+
+    if (send) { send.setAttribute('disabled', 'true'); send.textContent = 'THINKING …'; }
+    let streamedText = '';
+    let finalText = '';
+    let pendingApprovalId = null;
+    try {
+      const r = await fetch(withToken('/api/console/home/chat/stream'), {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: text, history: homeChatHistory.slice(-10) }),
+      });
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        setChatTurnText(assistantTurn, 'Error: ' + (j.error || r.status));
+        return { ok: false, text: j.error || String(r.status) };
+      }
+
+      await readNdjsonStream(r, (event) => {
+        if (event.type === 'chunk' && typeof event.delta === 'string') {
+          streamedText += event.delta;
+          setChatTurnText(assistantTurn, streamedText);
+          setChatTurnStatus(assistantTurn, 'streaming response');
+          options.onChunk?.(event.delta, streamedText);
+          return;
+        }
+        if (event.type === 'tool') {
+          const toolName = event.toolName || 'tool';
+          setChatTurnStatus(assistantTurn, 'using ' + toolName);
+          options.onStatus?.('Using local tool: ' + toolName, 'tool');
+          return;
+        }
+        if (event.type === 'status') {
+          setChatTurnStatus(assistantTurn, event.text || 'working');
+          options.onStatus?.(event.text || 'working', 'status');
+          return;
+        }
+        if (event.type === 'done') {
+          finalText = event.text || streamedText || '(no reply)';
+          pendingApprovalId = event.pendingApprovalId || null;
+          setChatTurnText(assistantTurn, finalText);
+          setChatTurnStatus(assistantTurn, pendingApprovalId ? 'approval required' : 'complete');
+          return;
+        }
+        if (event.type === 'error') {
+          finalText = 'Error: ' + (event.error || 'unknown');
+          setChatTurnText(assistantTurn, finalText);
+          setChatTurnStatus(assistantTurn, 'failed');
+          options.onStatus?.(finalText, 'error');
+        }
+      });
+
+      const textOut = finalText || streamedText || '(no reply)';
+      setChatTurnText(assistantTurn, textOut);
+      homeChatHistory.push({ role: 'assistant', text: textOut });
+      return { ok: !textOut.startsWith('Error:'), text: textOut, pendingApprovalId };
+    } catch (err) {
+      setChatTurnText(assistantTurn, 'Network error: ' + (err.message || err));
+      setChatTurnStatus(assistantTurn, 'failed');
+      return { ok: false, text: err.message || String(err) };
+    } finally {
+      assistantTurn?.classList.remove('pending');
+      if (send) { send.removeAttribute('disabled'); send.textContent = 'SEND ↵'; }
+      const input = document.querySelector('[data-home-chat-input]');
+      if (input) input.focus();
+    }
+  }
+
+  function appendChatTurn(role, text) {
+    const thread = document.querySelector('[data-home-chat-thread]');
+    if (!thread) return;
+    const turn = document.createElement('div');
+    turn.className = 'home-chat-turn ' + role;
+    turn.innerHTML =
+      '<span class="home-chat-role">' + (role === 'user' ? 'YOU' : 'CLEMENTINE') + '</span>' +
+      '<div data-home-chat-turn-text>' + escMem(text) + '</div>' +
+      '<span class="home-chat-stream-status" data-home-chat-turn-status></span>';
+    thread.appendChild(turn);
+    thread.scrollTop = thread.scrollHeight;
+    return turn;
+  }
+
+  const liveVoiceState = {
+    pc: null,
+    dc: null,
+    stream: null,
+    connected: false,
+    phase: 'idle',
+    lastTranscript: '',
+    assistantTranscript: '',
+    handledCalls: new Set(),
+    focus: false,
+  };
+
+  function bindHomeVoiceControls() {
+    const toggle = document.querySelector('[data-home-voice-toggle]');
+    const handoff = document.querySelector('[data-home-voice-handoff]');
+    const expand = document.querySelector('[data-home-voice-expand]');
+    if (toggle && !toggle.dataset.bound) {
+      toggle.dataset.bound = 'true';
+      toggle.addEventListener('click', async () => {
+        if (liveVoiceState.connected) stopHomeVoice();
+        else await startHomeVoice();
+      });
+    }
+    if (handoff && !handoff.dataset.bound) {
+      handoff.dataset.bound = 'true';
+      handoff.addEventListener('click', async () => {
+        const text = liveVoiceState.lastTranscript.trim();
+        if (!text) return;
+        setLiveVoiceStatus('Sending last voice turn to Clementine…', true);
+        await sendHomeChat('[Voice command] ' + text);
+      });
+    }
+    if (expand && !expand.dataset.bound) {
+      expand.dataset.bound = 'true';
+      expand.addEventListener('click', () => {
+        liveVoiceState.focus = !liveVoiceState.focus;
+        const panel = document.querySelector('[data-home-voice-panel]');
+        if (panel) panel.classList.toggle('focus', liveVoiceState.focus);
+        expand.textContent = liveVoiceState.focus ? 'COMPACT' : 'FOCUS';
+      });
+    }
+  }
+
+  const liveVoicePhases = ['connecting', 'listening', 'thinking', 'speaking', 'routing', 'error'];
+
+  function setLiveVoiceStatus(text, live, phase) {
+    const panel = document.querySelector('[data-home-voice-panel]');
+    const status = document.querySelector('[data-home-voice-status]');
+    const toggle = document.querySelector('[data-home-voice-toggle]');
+    const phaseEl = document.querySelector('[data-home-voice-phase]');
+    if (panel) panel.classList.toggle('live', Boolean(live));
+    if (panel) {
+      liveVoicePhases.forEach((name) => panel.classList.remove(name));
+      if (phase) panel.classList.add(phase);
+      panel.classList.toggle('focus', liveVoiceState.focus);
+    }
+    if (phase) liveVoiceState.phase = phase;
+    if (phaseEl) phaseEl.textContent = (phase || liveVoiceState.phase || 'idle').toUpperCase();
+    if (status) status.textContent = text;
+    if (toggle) {
+      const label = liveVoiceState.connected ? 'Stop live voice' : 'Start live voice';
+      toggle.setAttribute('aria-label', label);
+      toggle.setAttribute('title', label);
+    }
+  }
+
+  function setLiveVoiceTranscript(text) {
+    const el = document.querySelector('[data-home-voice-transcript]');
+    const handoff = document.querySelector('[data-home-voice-handoff]');
+    if (el) el.textContent = text || 'Voice commands that need local work route back through Clementine approvals.';
+    if (handoff) handoff.disabled = !liveVoiceState.lastTranscript.trim();
+  }
+
+  function resetLiveVoiceFeed() {
+    const feed = document.querySelector('[data-home-voice-feed]');
+    if (feed) feed.innerHTML = '<span>Realtime state, local handoffs, and SDK streaming will appear here.</span>';
+  }
+
+  function addLiveVoiceEvent(text, kind = 'event') {
+    const feed = document.querySelector('[data-home-voice-feed]');
+    if (!feed || !text) return;
+    if (feed.children.length === 1 && feed.textContent?.includes('Realtime state')) feed.innerHTML = '';
+    const row = document.createElement('span');
+    row.className = 'home-voice-event ' + kind;
+    row.textContent = text;
+    feed.appendChild(row);
+    while (feed.children.length > 6) feed.removeChild(feed.firstElementChild);
+  }
+
+  function realtimeClientSecret(payload) {
+    return payload && (
+      payload.value ||
+      (payload.client_secret && payload.client_secret.value) ||
+      (payload.client_secret && payload.client_secret.secret) ||
+      (payload.secret && payload.secret.value)
+    );
+  }
+
+  function sendRealtimeEvent(event) {
+    if (liveVoiceState.dc?.readyState !== 'open') return false;
+    liveVoiceState.dc.send(JSON.stringify(event));
+    return true;
+  }
+
+  function requestRealtimeResponse(instructions) {
+    return sendRealtimeEvent({
+      type: 'response.create',
+      response: {
+        modalities: ['audio', 'text'],
+        instructions,
+      },
+    });
+  }
+
+  function sendRealtimeStarter() {
+    sendRealtimeEvent({
+      type: 'conversation.item.create',
+      item: {
+        type: 'message',
+        role: 'user',
+        content: [
+          {
+            type: 'input_text',
+            text: 'Clementine Live just connected. Briefly say you are online and listening. Keep it under one sentence.',
+          },
+        ],
+      },
+    });
+    requestRealtimeResponse('Say one short sentence that Clementine Live is online and listening. Do not ask a long follow-up.');
+  }
+
+  async function startHomeVoice() {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setLiveVoiceStatus('Microphone access is not available in this browser context.', false);
+      return;
+    }
+
+    const toggle = document.querySelector('[data-home-voice-toggle]');
+    if (toggle) toggle.disabled = true;
+    resetLiveVoiceFeed();
+    liveVoiceState.assistantTranscript = '';
+    setLiveVoiceStatus('Creating live voice session…', true, 'connecting');
+    addLiveVoiceEvent('Creating secure Realtime session.', 'routing');
+
+    try {
+      const tokenResponse = await fetch(withToken('/api/console/realtime/session'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId: 'console:home' }),
+      });
+      const tokenPayload = await tokenResponse.json().catch(() => ({}));
+      if (!tokenResponse.ok) {
+        throw new Error(tokenPayload.error || 'Failed to create Realtime session');
+      }
+
+      const ephemeralKey = realtimeClientSecret(tokenPayload);
+      if (!ephemeralKey) {
+        throw new Error('Realtime session did not return a client secret.');
+      }
+
+      const pc = new RTCPeerConnection();
+      const dc = pc.createDataChannel('oai-events');
+      const audio = document.querySelector('[data-home-voice-audio]') || document.createElement('audio');
+      audio.autoplay = true;
+
+      liveVoiceState.pc = pc;
+      liveVoiceState.dc = dc;
+      liveVoiceState.handledCalls = new Set();
+
+      pc.ontrack = (event) => {
+        audio.srcObject = event.streams[0];
+        addLiveVoiceEvent('Audio stream connected.', 'event');
+      };
+      pc.onconnectionstatechange = () => {
+        if (pc.connectionState === 'connected') setLiveVoiceStatus('Live voice connected. Speak naturally.', true, 'listening');
+        if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+          setLiveVoiceStatus('Live voice connection dropped.', false, 'error');
+          addLiveVoiceEvent('Realtime connection dropped.', 'error');
+        }
+      };
+
+      dc.addEventListener('open', () => {
+        setLiveVoiceStatus('Listening. Local actions will route through Clementine.', true, 'listening');
+        addLiveVoiceEvent('Realtime data channel open.', 'event');
+        sendRealtimeStarter();
+      });
+      dc.addEventListener('message', (event) => {
+        try {
+          handleRealtimeEvent(JSON.parse(event.data));
+        } catch (err) {
+          console.warn('Realtime event handling failed', err);
+        }
+      });
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+      liveVoiceState.stream = stream;
+      addLiveVoiceEvent('Microphone active with echo cancellation.', 'event');
+      for (const track of stream.getAudioTracks()) {
+        pc.addTrack(track, stream);
+      }
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      const sdpResponse = await fetch('https://api.openai.com/v1/realtime/calls', {
+        method: 'POST',
+        body: offer.sdp,
+        headers: {
+          Authorization: 'Bearer ' + ephemeralKey,
+          'Content-Type': 'application/sdp',
+        },
+      });
+      const answerSdp = await sdpResponse.text();
+      if (!sdpResponse.ok) {
+        throw new Error(answerSdp || 'Realtime WebRTC offer failed');
+      }
+      await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+
+      liveVoiceState.connected = true;
+      setLiveVoiceStatus('Live voice connected. Speak naturally.', true, 'listening');
+    } catch (err) {
+      stopHomeVoice();
+      setLiveVoiceStatus('Voice unavailable: ' + (err.message || err), false, 'error');
+      addLiveVoiceEvent('Voice unavailable: ' + (err.message || err), 'error');
+    } finally {
+      if (toggle) toggle.disabled = false;
+    }
+  }
+
+  function stopHomeVoice() {
+    try { liveVoiceState.dc?.close?.(); } catch {}
+    try { liveVoiceState.pc?.close?.(); } catch {}
+    try {
+      liveVoiceState.stream?.getTracks?.().forEach((track) => track.stop());
+    } catch {}
+    liveVoiceState.pc = null;
+    liveVoiceState.dc = null;
+    liveVoiceState.stream = null;
+    liveVoiceState.connected = false;
+    liveVoiceState.assistantTranscript = '';
+    liveVoiceState.focus = false;
+    const expand = document.querySelector('[data-home-voice-expand]');
+    if (expand) expand.textContent = 'FOCUS';
+    setLiveVoiceStatus('Voice stopped.', false, 'idle');
+    addLiveVoiceEvent('Voice session stopped.', 'event');
+  }
+
+  function handleRealtimeEvent(event) {
+    if (!event || !event.type) return;
+    if (event.type === 'input_audio_buffer.speech_started') {
+      liveVoiceState.assistantTranscript = '';
+      setLiveVoiceStatus('Listening to you…', true, 'listening');
+      addLiveVoiceEvent('User started speaking.', 'event');
+    } else if (event.type === 'input_audio_buffer.speech_stopped') {
+      setLiveVoiceStatus('Thinking through the turn…', true, 'thinking');
+    } else if (event.type === 'conversation.item.input_audio_transcription.delta') {
+      const delta = event.delta || event.transcript || '';
+      if (delta) setLiveVoiceTranscript('Hearing: ' + delta);
+    } else if (event.type === 'conversation.item.input_audio_transcription.completed') {
+      liveVoiceState.lastTranscript = event.transcript || '';
+      setLiveVoiceTranscript(liveVoiceState.lastTranscript ? 'Heard: ' + liveVoiceState.lastTranscript : '');
+      if (liveVoiceState.lastTranscript) addLiveVoiceEvent('Heard: ' + liveVoiceState.lastTranscript, 'event');
+    } else if (event.type === 'response.created') {
+      setLiveVoiceStatus('Generating voice response…', true, 'thinking');
+    } else if (event.type === 'response.output_audio_transcript.delta') {
+      const delta = event.delta || '';
+      if (delta) {
+        liveVoiceState.assistantTranscript += delta;
+        setLiveVoiceStatus('Clementine is speaking…', true, 'speaking');
+        setLiveVoiceTranscript('Clementine: ' + liveVoiceState.assistantTranscript);
+      }
+    } else if (event.type === 'response.output_audio_transcript.done') {
+      const transcript = event.transcript || liveVoiceState.assistantTranscript;
+      if (transcript) addLiveVoiceEvent('Said: ' + transcript, 'event');
+      liveVoiceState.assistantTranscript = '';
+    } else if (event.type === 'response.done') {
+      const routed = handleRealtimeResponseDone(event);
+      if (!routed) setLiveVoiceStatus('Live voice connected. Speak naturally.', true, 'listening');
+    } else if (event.type === 'response.function_call_arguments.done') {
+      handleRealtimeFunctionCall(event.name, event.arguments, event.call_id);
+    } else if (event.type === 'error') {
+      setLiveVoiceStatus('Realtime error: ' + (event.error?.message || 'unknown'), false, 'error');
+      addLiveVoiceEvent('Realtime error: ' + (event.error?.message || 'unknown'), 'error');
+    }
+  }
+
+  function handleRealtimeResponseDone(event) {
+    const output = event.response?.output || [];
+    let routed = false;
+    for (const item of output) {
+      if (item?.type === 'function_call') {
+        routed = true;
+        handleRealtimeFunctionCall(item.name, item.arguments, item.call_id);
+      }
+    }
+    return routed;
+  }
+
+  async function handleRealtimeFunctionCall(name, rawArguments, callId) {
+    if (name !== 'send_to_clementine' || !callId || liveVoiceState.handledCalls.has(callId)) return;
+    liveVoiceState.handledCalls.add(callId);
+
+    let args = {};
+    try { args = JSON.parse(rawArguments || '{}'); } catch {}
+    const request = String(args.request || liveVoiceState.lastTranscript || '').trim();
+    if (!request) return;
+
+    setLiveVoiceStatus('Routing into the local Clementine agent…', true, 'routing');
+    addLiveVoiceEvent('Local handoff: ' + request, 'routing');
+    const result = await sendHomeChat('[Voice command] ' + request, {
+      onStatus: (text, kind) => {
+        const label = text || 'Local agent is working.';
+        setLiveVoiceStatus(label, true, kind === 'tool' ? 'routing' : 'thinking');
+        addLiveVoiceEvent(label, kind === 'tool' ? 'tool' : 'routing');
+      },
+      onChunk: (_delta, fullText) => {
+        setLiveVoiceStatus('Local agent is streaming a response…', true, 'routing');
+        if (fullText && fullText.length < 180) {
+          setLiveVoiceTranscript('Local reply: ' + fullText);
+        }
+      },
+    });
+    const output = JSON.stringify({
+      ok: Boolean(result?.ok),
+      text: result?.text || '',
+      pendingApprovalId: result?.pendingApprovalId || null,
+    });
+
+    try {
+      if (liveVoiceState.dc?.readyState === 'open') {
+        sendRealtimeEvent({
+          type: 'conversation.item.create',
+          item: {
+            type: 'function_call_output',
+            call_id: callId,
+            output,
+          },
+        });
+        requestRealtimeResponse('Summarize the local Clementine result in one or two short spoken sentences. If an approval is required, tell the user to approve it in the dashboard or Discord.');
+      }
+    } catch (err) {
+      setLiveVoiceStatus('Clementine handled it, but voice reply failed: ' + (err.message || err), false, 'error');
+      addLiveVoiceEvent('Voice reply failed after local handoff: ' + (err.message || err), 'error');
+    }
+  }
+
+  // Refresh the agenda every 30s while the panel is mounted, so newly
+  // completed tasks / executions surface without manual reload.
+  setInterval(() => {
+    if (homeBooted && document.querySelector('.panel-frame[data-section="home"]:not([hidden])')) {
+      refreshHomeAgenda();
+    }
+  }, 30000);
+
+  // ─── Integrations Hub (API Keys + Composio + MCP) ──────────────
+
+  const HUB_APP_HINTS = {
+    gmail: 'Gmail',
+    googlecalendar: 'Google Calendar',
+    googledrive: 'Google Drive',
+    slack: 'Slack',
+    notion: 'Notion',
+    linear: 'Linear',
+    github: 'GitHub',
+    gitlab: 'GitLab',
+    discord: 'Discord',
+    figma: 'Figma',
+    stripe: 'Stripe',
+    asana: 'Asana',
+  };
+
+  function friendlyAppName(slug) {
+    if (!slug) return '';
+    const key = String(slug).toLowerCase().replace(/[^a-z0-9]/g, '');
+    return HUB_APP_HINTS[key] || slug;
+  }
+
+  function hasOpenAiApiKey(auth) {
+    return Boolean(auth && (auth.openaiApiKeyPresent || auth.hasOpenAiApiKey));
+  }
+
+  function hasCodexRuntimeAuth(auth) {
+    if (!auth) return false;
+    if (auth.codexOauthPresent || auth.hasNativeOAuth || auth.hasImportedCodexAuth) return true;
+    return auth.mode !== 'api_key' && ['native', 'local_store', 'codex_cli'].includes(auth.source);
+  }
+
+  function runtimeAuthLabel(auth) {
+    if (!auth?.configured) return 'not configured';
+    if (hasCodexRuntimeAuth(auth)) return auth.source === 'codex_cli' ? 'Codex CLI OAuth' : 'Codex OAuth';
+    if (hasOpenAiApiKey(auth)) return 'OpenAI API key';
+    return auth.mode || 'configured';
+  }
+
+  function credentialDisplayName(name) {
+    const labels = {
+      openai_api_key: 'OpenAI API key',
+      codex_oauth_access_token: 'Codex OAuth access token',
+      codex_oauth_refresh_token: 'Codex OAuth refresh token',
+      discord_bot_token: 'Discord bot token',
+      composio_api_key: 'Composio API key',
+      recall_api_key: 'Recall.ai API key',
+      webhook_secret: 'Dashboard/webhook secret',
+    };
+    return labels[name] || name;
+  }
+
+  function credentialDescription(name, descriptor) {
+    if (name === 'openai_api_key') {
+      return 'Optional capability key for embeddings, Realtime live voice, and direct OpenAI API features. Codex OAuth can still run the agent without this.';
+    }
+    if (name === 'codex_oauth_access_token' || name === 'codex_oauth_refresh_token') {
+      return 'Runtime auth for ChatGPT/Codex subscribers. Clementine can also use your existing Codex CLI login when detected.';
+    }
+    if (name === 'recall_api_key') {
+      return 'Optional desktop meeting capture key. Recall.ai handles recording uploads; Clementine stores transcripts locally and queues analysis tasks.';
+    }
+    return descriptor?.description || '';
+  }
+
+  function displayCredentialStatus(row, descriptor, auth) {
+    const status = row?.status || 'missing';
+    const source = row?.source || 'none';
+    const name = row?.name || '';
+    const codexRuntimeReady = hasCodexRuntimeAuth(auth);
+    if ((name === 'codex_oauth_access_token' || name === 'codex_oauth_refresh_token') && codexRuntimeReady) {
+      return { className: 'runtime_ready', label: 'RUNTIME READY', source: auth?.source || source };
+    }
+    if (name === 'openai_api_key' && !hasOpenAiApiKey(auth) && status === 'missing' && auth?.mode !== 'api_key') {
+      return { className: 'optional', label: 'OPTIONAL', source };
+    }
+    if (status === 'missing' && !descriptor?.required) {
+      return { className: 'optional', label: name === 'openai_api_key' ? 'OPTIONAL' : 'NOT SET', source };
+    }
+    return { className: status, label: String(status).toUpperCase().replace('_', ' '), source };
+  }
+
+  let hubMcpEditing = null; // server name being edited; 'new' for create
+  let hubAppSearch = '';
+  let hubRecallEventsBound = false;
+
+  async function bootIntegrationsHub() {
+    const newBtn = document.querySelector('[data-hub-mcp-new]');
+    if (newBtn) {
+      newBtn.addEventListener('click', () => {
+        hubMcpEditing = hubMcpEditing === 'new' ? null : 'new';
+        renderHubMcp();
+      });
+    }
+    if (!hubRecallEventsBound && window.clemmy?.onRecallEvent) {
+      hubRecallEventsBound = true;
+      window.clemmy.onRecallEvent(() => {
+        if (document.querySelector('.panel-frame[data-section="integrations"]:not([hidden])')) {
+          setTimeout(() => refreshHubRecall(), 250);
+        }
+      });
+    }
+    await refreshIntegrationsHub();
+  }
+
+  async function refreshIntegrationsHub() {
+    await Promise.allSettled([
+      refreshHubKeys(),
+      refreshHubApps(),
+      refreshHubRecall(),
+      refreshHubMcp(),
+    ]);
+  }
+
+  async function refreshHubKeys() {
+    const listEl = document.querySelector('[data-hub-keys-list]');
+    const metaEl = document.querySelector('[data-hub-keys-meta]');
+    const summary = document.querySelector('[data-hub-keys]');
+    if (!listEl || !metaEl) return;
+    try {
+      const data = await fetchJSON('/api/console/credentials');
+      const rows = data.rows || [];
+      const descriptors = data.descriptors || {};
+      const auth = data.auth || null;
+      metaEl.textContent = auth?.configured
+        ? 'runtime ready via ' + runtimeAuthLabel(auth) + (hasOpenAiApiKey(auth) ? ' · OpenAI key ready' : ' · OpenAI key optional')
+        : 'runtime auth needs setup';
+      if (summary) summary.textContent = auth?.configured ? 'ready' : 'setup';
+      listEl.innerHTML = rows.map((r) => {
+        const d = descriptors[r.name] || {};
+        const display = displayCredentialStatus(r, d, auth);
+        const runtimeCredentialReady = display.className === 'runtime_ready'
+          && (r.name === 'codex_oauth_access_token' || r.name === 'codex_oauth_refresh_token');
+        const sourceLine = [
+          '<span class="pill ' + escMem(display.className) + '">' + escMem(display.label) + '</span>',
+          display.source && display.source !== 'none' ? '<span>source: ' + escMem(display.source) + '</span>' : '',
+          d.envVarName ? '<span>env: ' + escMem(d.envVarName) + '</span>' : '',
+          r.lastSetAt ? '<span>set ' + escMem(r.lastSetAt.slice(0, 16).replace('T', ' ')) + '</span>' : '',
+        ].filter(Boolean).join(' ');
+        return [
+          '<div class="hub-key-row">',
+          '  <div>',
+          '    <div class="hub-key-name">' + escMem(credentialDisplayName(r.name)) + '</div>',
+          '    <div class="hub-key-meta">' + sourceLine + '</div>',
+          credentialDescription(r.name, d) ? '    <div class="hub-key-desc">' + escMem(credentialDescription(r.name, d)) + '</div>' : '',
+          '  </div>',
+          '  <div class="hub-key-actions">',
+          runtimeCredentialReady
+            ? '    <span class="hub-key-ok">ACTIVE</span>'
+            : '    <button data-hub-key-jump="' + escMem(r.name) + '">' + (r.hasValue ? 'UPDATE' : 'SET') + ' ✎</button>',
+          '  </div>',
+          '</div>',
+        ].join('');
+      }).join('') || '<div class="settings-info">— no credential schema —</div>';
+
+      // Wire jump-to-settings buttons — credentials live in the
+      // existing Settings → Credentials block; we just deep-link there.
+      listEl.querySelectorAll('[data-hub-key-jump]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          switchPanel('settings');
+          setTimeout(() => {
+            const target = document.querySelector('[data-cred-row="' + btn.getAttribute('data-hub-key-jump') + '"]');
+            if (target) target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            const setBtn = target?.querySelector('[data-cred-set]');
+            if (setBtn) setBtn.click();
+          }, 150);
+        });
+      });
+    } catch (err) {
+      listEl.innerHTML = '<div class="settings-info" style="color:var(--accent-fail);">Failed: ' + escMem(err.message || err) + '</div>';
+    }
+  }
+
+  async function refreshHubApps() {
+    const controlsEl = document.querySelector('[data-hub-apps-controls]');
+    const listEl = document.querySelector('[data-hub-apps-list]');
+    const metaEl = document.querySelector('[data-hub-apps-meta]');
+    const summary = document.querySelector('[data-hub-apps]');
+    if (!controlsEl || !listEl || !metaEl) return;
+    try {
+      const status = await fetchJSON('/api/composio/status');
+      if (!status?.enabled) {
+        controlsEl.innerHTML = [
+          '<input type="password" placeholder="Composio API key (sk_…)" data-hub-composio-key />',
+          '<button data-hub-composio-save>SAVE API KEY</button>',
+          '<a href="https://platform.composio.dev" target="_blank" rel="noopener" style="font-size:10px;letter-spacing:0.14em;color:var(--fg-3);">get a key →</a>',
+        ].join('');
+        listEl.innerHTML = '<div class="settings-info">— Composio not configured yet. Paste your API key above to start connecting apps. —</div>';
+        metaEl.textContent = 'not configured';
+        if (summary) summary.textContent = '—';
+        const saveBtn = controlsEl.querySelector('[data-hub-composio-save]');
+        if (saveBtn) {
+          saveBtn.addEventListener('click', async () => {
+            const input = controlsEl.querySelector('[data-hub-composio-key]');
+            const key = input?.value?.trim() || '';
+            if (!key) { alert('Paste an API key first.'); return; }
+            try {
+              const r = await fetch(withToken('/api/composio/api-key'), {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ api_key: key }),
+              });
+              if (!r.ok) { const j = await r.json().catch(() => ({})); alert('Save failed: ' + (j.error || r.status)); return; }
+              await refreshHubApps();
+            } catch (err) { alert('Save failed: ' + (err.message || err)); }
+          });
+        }
+        return;
+      }
+
+      const snapshot = await fetchJSON('/api/composio/toolkits');
+      const connected = (snapshot.connected || []).filter((c) => c.status !== 'DELETED');
+      const toolkits = snapshot.toolkits || snapshot.available || [];
+      const connectedSlugs = new Set(connected.map((c) => c.slug || c.toolkitSlug).filter(Boolean));
+
+      const activeCount = connected.filter((c) => (c.status || '').toUpperCase() === 'ACTIVE').length;
+      metaEl.textContent = activeCount + ' active · ' + (toolkits.length || '?') + ' available';
+      if (summary) summary.textContent = activeCount;
+
+      controlsEl.innerHTML = [
+        '<input type="text" placeholder="filter apps (gmail, slack, notion, …)" data-hub-app-filter value="' + escMem(hubAppSearch) + '" />',
+        '<button data-hub-composio-refresh>REFRESH ⟲</button>',
+      ].join('');
+      const filterEl = controlsEl.querySelector('[data-hub-app-filter]');
+      if (filterEl) {
+        filterEl.addEventListener('input', () => {
+          hubAppSearch = filterEl.value || '';
+          renderApps();
+        });
+      }
+      const refreshBtn = controlsEl.querySelector('[data-hub-composio-refresh]');
+      if (refreshBtn) {
+        refreshBtn.addEventListener('click', async () => {
+          await fetch(withToken('/api/composio/refresh'), { method: 'POST' });
+          await refreshHubApps();
+        });
+      }
+
+      function renderApps() {
+        const q = (hubAppSearch || '').toLowerCase().trim();
+        // Connected first.
+        const connRender = connected
+          .filter((c) => !q || (c.slug || '').toLowerCase().includes(q) || friendlyAppName(c.slug).toLowerCase().includes(q))
+          .map((c) => {
+            const slug = c.slug || c.toolkitSlug || '';
+            const statusKey = (c.status || 'ACTIVE').toLowerCase();
+            const pill = statusKey === 'active' ? 'active'
+              : statusKey === 'pending' || statusKey === 'initializing' ? 'pending'
+              : statusKey === 'failed' ? 'failed'
+              : 'disconnected';
+            return [
+              '<div class="hub-app-card" data-hub-app-slug="' + escMem(slug) + '">',
+              '  <div class="hub-app-name">' + escMem(friendlyAppName(slug)) + '</div>',
+              '  <span class="hub-app-pill ' + pill + '">' + escMem((c.status || 'ACTIVE').toUpperCase()) + '</span>',
+              c.userId ? '  <div class="hub-app-meta">' + escMem(c.userId) + '</div>' : '',
+              '  <div class="hub-app-card-actions">',
+              c.connectionId ? '    <button class="disconnect" data-hub-app-disconnect="' + escMem(slug) + '" data-conn="' + escMem(c.connectionId) + '">DISCONNECT</button>' : '',
+              '  </div>',
+              '</div>',
+            ].join('');
+          });
+        // Available (not connected).
+        const availRender = toolkits
+          .filter((t) => !connectedSlugs.has(t.slug))
+          .filter((t) => !q || (t.slug || '').toLowerCase().includes(q) || (t.name || '').toLowerCase().includes(q))
+          .slice(0, q ? 80 : 16)
+          .map((t) => [
+            '<div class="hub-app-card">',
+            '  <div class="hub-app-name">' + escMem(t.name || friendlyAppName(t.slug)) + '</div>',
+            '  <span class="hub-app-pill available">AVAILABLE</span>',
+            t.description ? '  <div class="hub-app-meta">' + escMem(t.description.slice(0, 80)) + '</div>' : '',
+            '  <div class="hub-app-card-actions">',
+            '    <button class="connect" data-hub-app-connect="' + escMem(t.slug) + '">CONNECT</button>',
+            '  </div>',
+            '</div>',
+          ].join(''));
+        const out = [...connRender, ...availRender];
+        listEl.innerHTML = out.length > 0
+          ? out.join('')
+          : '<div class="settings-info">— no apps match "' + escMem(q) + '" —</div>';
+
+        // Wire actions.
+        listEl.querySelectorAll('[data-hub-app-connect]').forEach((btn) => {
+          btn.addEventListener('click', async () => {
+            const slug = btn.getAttribute('data-hub-app-connect');
+            btn.textContent = 'OPENING …';
+            try {
+              const r = await fetch(withToken('/api/composio/toolkits/' + encodeURIComponent(slug) + '/authorize'), { method: 'POST' });
+              const j = await r.json().catch(() => ({}));
+              if (!r.ok) {
+                if (j.needsAuthConfig && j.setupUrl) {
+                  if (confirm(j.error + '\\n\\nOpen the Composio auth-configs page to set this up?')) {
+                    window.open(j.setupUrl, '_blank');
+                  }
+                } else {
+                  alert('Connect failed: ' + (j.error || r.status));
+                }
+                btn.textContent = 'CONNECT';
+                return;
+              }
+              if (j.redirectUrl || j.url) {
+                window.open(j.redirectUrl || j.url, '_blank');
+              }
+              setTimeout(() => refreshHubApps(), 2000);
+            } catch (err) {
+              alert('Connect failed: ' + (err.message || err));
+              btn.textContent = 'CONNECT';
+            }
+          });
+        });
+        listEl.querySelectorAll('[data-hub-app-disconnect]').forEach((btn) => {
+          btn.addEventListener('click', async () => {
+            const slug = btn.getAttribute('data-hub-app-disconnect');
+            const connectionId = btn.getAttribute('data-conn');
+            if (!confirm('Disconnect ' + friendlyAppName(slug) + '? The agent will no longer have access.')) return;
+            try {
+              await fetch(withToken('/api/composio/toolkits/' + encodeURIComponent(slug) + '/disconnect'), {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ connectionId }),
+              });
+              await refreshHubApps();
+            } catch (err) { alert('Disconnect failed: ' + (err.message || err)); }
+          });
+        });
+      }
+
+      renderApps();
+    } catch (err) {
+      listEl.innerHTML = '<div class="settings-info" style="color:var(--accent-fail);">Composio: ' + escMem(err.message || err) + '</div>';
+    }
+  }
+
+  async function refreshHubRecall() {
+    const controlsEl = document.querySelector('[data-hub-recall-controls]');
+    const listEl = document.querySelector('[data-hub-recall-list]');
+    const metaEl = document.querySelector('[data-hub-recall-meta]');
+    if (!controlsEl || !listEl || !metaEl) return;
+    try {
+      const data = await fetchJSON('/api/console/meetings/recall');
+      const settings = data.settings || {};
+      const credential = data.credential || {};
+      const desktop = window.clemmy?.recallStatus ? await window.clemmy.recallStatus().catch((err) => ({ lastError: err.message || String(err) })) : null;
+      const hasKey = Boolean(credential.hasValue);
+      const electronReady = Boolean(window.clemmy?.recallConfigure);
+      metaEl.textContent = [
+        settings.enabled ? 'enabled' : 'disabled',
+        hasKey ? 'key ready' : 'key needed',
+        electronReady ? 'electron available' : 'electron only',
+      ].join(' · ');
+
+      const regionOptions = Object.keys(data.regions || { 'us-west-2': true, 'us-east-1': true, 'eu-central-1': true, 'ap-northeast-1': true })
+        .map((region) => '<option value="' + escMem(region) + '"' + (settings.region === region ? ' selected' : '') + '>' + escMem(region) + '</option>')
+        .join('');
+      controlsEl.innerHTML = [
+        hasKey ? '' : '<input type="password" placeholder="Recall.ai API key" data-hub-recall-key />',
+        hasKey ? '' : '<button data-hub-recall-save-key>SAVE KEY</button>',
+        '<a href="' + escMem(data.signupUrl || 'https://www.recall.ai/signup') + '" target="_blank" rel="noopener" style="font-size:10px;letter-spacing:0.14em;color:var(--fg-3);">get Recall.ai →</a>',
+        '<select data-hub-recall-region>' + regionOptions + '</select>',
+        '<label class="check-pill"><input type="checkbox" data-hub-recall-enabled ' + (settings.enabled ? 'checked' : '') + ' /> ENABLED</label>',
+        '<label class="check-pill"><input type="checkbox" data-hub-recall-auto ' + (settings.autoRecord ? 'checked' : '') + ' /> AUTO RECORD</label>',
+        '<label class="check-pill"><input type="checkbox" data-hub-recall-live ' + (settings.liveTranscript ? 'checked' : '') + ' /> LIVE TRANSCRIPT</label>',
+        '<label class="check-pill"><input type="checkbox" data-hub-recall-analyze ' + (settings.analyzeOnComplete !== false ? 'checked' : '') + ' /> ANALYZE AFTER</label>',
+        '<button data-hub-recall-save-settings>SAVE SETTINGS</button>',
+        electronReady ? '<button data-hub-recall-perms>REQUEST PERMISSIONS</button>' : '',
+        electronReady ? '<button data-hub-recall-manual>START MANUAL</button>' : '',
+        electronReady ? '<button data-hub-recall-stop>STOP</button>' : '',
+      ].filter(Boolean).join('');
+
+      const statusRows = [
+        ['Credential', hasKey ? 'connected via ' + (credential.source || 'vault') : 'not configured'],
+        ['Electron bridge', electronReady ? 'available' : 'open in Clementine desktop app to control recording'],
+        ['SDK', desktop?.sdkAvailable ? 'loaded/available' : desktop?.initialized ? 'initialized' : 'not loaded'],
+        ['Recording', desktop?.recording ? 'active: ' + (desktop.currentWindowId || '') : 'idle'],
+        ['Last event', desktop?.lastEvent || 'none'],
+        ['Last meeting', desktop?.lastMeeting ? [desktop.lastMeeting.platform, desktop.lastMeeting.title].filter(Boolean).join(' · ') || desktop.lastMeeting.windowId : 'none'],
+        ['Error', desktop?.lastError || 'none'],
+      ];
+      listEl.innerHTML = [
+        '<div class="hub-app-card" style="grid-column:1/-1">',
+        '  <div class="hub-app-name">Recall.ai Desktop SDK</div>',
+        '  <span class="hub-app-pill ' + (settings.enabled && hasKey ? 'active' : 'available') + '">' + (settings.enabled && hasKey ? 'READY' : 'OPTIONAL') + '</span>',
+        '  <div class="hub-app-meta">Records only when enabled. Transcripts are saved to the local vault and then handed to Clementine as background analysis tasks.</div>',
+        '  <div class="settings-info" style="margin-top:10px">' + statusRows.map(([k, v]) => '<div class="row"><span class="k">' + escMem(k) + '</span><span class="v">' + escMem(v) + '</span></div>').join('') + '</div>',
+        '</div>',
+      ].join('');
+
+      const keyBtn = controlsEl.querySelector('[data-hub-recall-save-key]');
+      if (keyBtn) {
+        keyBtn.addEventListener('click', async () => {
+          const input = controlsEl.querySelector('[data-hub-recall-key]');
+          const value = input?.value?.trim() || '';
+          if (!value) { alert('Paste your Recall.ai API key first.'); return; }
+          keyBtn.textContent = 'SAVING…';
+          const r = await fetch(withToken('/api/console/credentials/set'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: 'recall_api_key', value }),
+          });
+          if (!r.ok) {
+            const j = await r.json().catch(() => ({}));
+            alert('Recall key save failed: ' + (j.error || r.status));
+            keyBtn.textContent = 'SAVE KEY';
+            return;
+          }
+          await Promise.allSettled([refreshHubRecall(), refreshHubKeys(), refreshCredentialsHealth()]);
+        });
+      }
+
+      const saveSettingsBtn = controlsEl.querySelector('[data-hub-recall-save-settings]');
+      if (saveSettingsBtn) {
+        saveSettingsBtn.addEventListener('click', async () => {
+          const next = {
+            enabled: Boolean(controlsEl.querySelector('[data-hub-recall-enabled]')?.checked),
+            autoRecord: Boolean(controlsEl.querySelector('[data-hub-recall-auto]')?.checked),
+            liveTranscript: Boolean(controlsEl.querySelector('[data-hub-recall-live]')?.checked),
+            analyzeOnComplete: Boolean(controlsEl.querySelector('[data-hub-recall-analyze]')?.checked),
+            region: controlsEl.querySelector('[data-hub-recall-region]')?.value || 'us-west-2',
+          };
+          saveSettingsBtn.textContent = 'SAVING…';
+          const r = await fetch(withToken('/api/console/meetings/recall/settings'), {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(next),
+          });
+          const j = await r.json().catch(() => ({}));
+          if (!r.ok) {
+            alert('Recall settings save failed: ' + (j.error || r.status));
+            saveSettingsBtn.textContent = 'SAVE SETTINGS';
+            return;
+          }
+          if (window.clemmy?.recallConfigure) {
+            await window.clemmy.recallConfigure(j.settings || next).catch((err) => alert('Electron setup failed: ' + (err.message || err)));
+          }
+          await refreshHubRecall();
+        });
+      }
+
+      const permBtn = controlsEl.querySelector('[data-hub-recall-perms]');
+      if (permBtn) {
+        permBtn.addEventListener('click', async () => {
+          try { await window.clemmy.recallRequestPermissions(); await refreshHubRecall(); }
+          catch (err) { alert('Permission request failed: ' + (err.message || err)); }
+        });
+      }
+      const manualBtn = controlsEl.querySelector('[data-hub-recall-manual]');
+      if (manualBtn) {
+        manualBtn.addEventListener('click', async () => {
+          if (!confirm('Start a manual desktop audio recording now? Make sure you have consent where required.')) return;
+          try { await window.clemmy.recallStartManual(); await refreshHubRecall(); }
+          catch (err) { alert('Manual recording failed: ' + (err.message || err)); }
+        });
+      }
+      const stopBtn = controlsEl.querySelector('[data-hub-recall-stop]');
+      if (stopBtn) {
+        stopBtn.addEventListener('click', async () => {
+          try { await window.clemmy.recallStop(); await refreshHubRecall(); }
+          catch (err) { alert('Stop failed: ' + (err.message || err)); }
+        });
+      }
+    } catch (err) {
+      listEl.innerHTML = '<div class="settings-info" style="color:var(--accent-fail);">Recall: ' + escMem(err.message || err) + '</div>';
+      metaEl.textContent = 'error';
+    }
+  }
+
+  async function refreshHubMcp() {
+    return renderHubMcp();
+  }
+
+  async function renderHubMcp() {
+    const listEl = document.querySelector('[data-hub-mcp-list]');
+    const metaEl = document.querySelector('[data-hub-mcp-meta]');
+    const summary = document.querySelector('[data-hub-mcp]');
+    if (!listEl || !metaEl) return;
+    try {
+      const data = await fetchJSON('/api/console/mcp-servers');
+      const servers = data.servers || [];
+      const enabled = servers.filter((s) => s.enabled !== false).length;
+      metaEl.textContent = servers.length + ' total · ' + enabled + ' enabled';
+      if (summary) summary.textContent = enabled + '/' + servers.length;
+
+      if (servers.length === 0 && hubMcpEditing !== 'new') {
+        listEl.innerHTML = '<div class="settings-info">— no MCP servers detected. Click + ADD CUSTOM SERVER to wire one in. —</div>';
+        return;
+      }
+
+      listEl.innerHTML = servers.map((s) => {
+        const transport = s.type || 'stdio';
+        const isEditing = hubMcpEditing === s.name;
+        const sourceLabel = s.source === 'user' ? 'CLEMENTINE CONFIG' : 'IMPORTED MCP';
+        const transportLine = transport === 'stdio'
+          ? (s.command ? s.command + (Array.isArray(s.args) ? ' ' + s.args.join(' ') : '') : '')
+          : (s.url || '');
+        return [
+          '<div class="hub-mcp-row" data-hub-mcp-row="' + escMem(s.name) + '">',
+          '  <div>',
+          '    <div class="hub-mcp-name">',
+          '      <span>' + escMem(s.name) + '</span>',
+          '      <span class="pill source-' + escMem(s.source) + '">' + escMem(sourceLabel) + '</span>',
+          '      <span class="pill transport-' + escMem(transport) + '">' + escMem(transport.toUpperCase()) + '</span>',
+          '    </div>',
+          transportLine ? '    <div class="hub-mcp-meta">' + escMem(transportLine) + '</div>' : '',
+          s.description ? '    <div class="hub-mcp-desc">' + escMem(s.description) + '</div>' : '',
+          '  </div>',
+          '  <div class="hub-mcp-actions">',
+          '    <button class="toggle ' + (s.enabled !== false ? 'on' : 'off') + '" data-hub-mcp-toggle="' + escMem(s.name) + '">' + (s.enabled !== false ? '● ENABLED' : '○ DISABLED') + '</button>',
+          '    <button class="edit" data-hub-mcp-edit="' + escMem(s.name) + '">' + (isEditing ? 'CANCEL' : 'EDIT ✎') + '</button>',
+          s.source === 'user' ? '    <button class="del" data-hub-mcp-del="' + escMem(s.name) + '">DELETE ▣</button>' : '',
+          '  </div>',
+          isEditing ? renderHubMcpEditor(s) : '',
+          '</div>',
+        ].join('');
+      }).join('');
+
+      if (hubMcpEditing === 'new') {
+        listEl.insertAdjacentHTML('beforeend', '<div class="hub-mcp-row">' + renderHubMcpEditor(null) + '</div>');
+      }
+
+      bindHubMcpActions();
+    } catch (err) {
+      listEl.innerHTML = '<div class="settings-info" style="color:var(--accent-fail);">Failed: ' + escMem(err.message || err) + '</div>';
+    }
+  }
+
+  function renderHubMcpEditor(s) {
+    const v = s || { name: '', type: 'stdio', command: '', args: [], url: '', description: '', enabled: true };
+    const argsStr = Array.isArray(v.args) ? v.args.join(' ') : '';
+    return [
+      '<div class="hub-mcp-editor" data-hub-mcp-editor-for="' + escMem(s ? s.name : 'new') + '">',
+      s ? '' : '  <div><label>NAME</label><input type="text" data-f="name" value="" placeholder="e.g. internal-airtable, custom-rag, etc." /></div>',
+      '  <div class="row">',
+      '    <div><label>TRANSPORT</label><select data-f="type">',
+           ['stdio','http','sse'].map((opt) => '<option value="' + opt + '"' + (v.type === opt ? ' selected' : '') + '>' + opt + '</option>').join(''),
+      '    </select></div>',
+      '    <div><label>DESCRIPTION</label><input type="text" data-f="description" value="' + escMem(v.description || '') + '" /></div>',
+      '  </div>',
+      '  <div><label>COMMAND (stdio)</label><input type="text" data-f="command" value="' + escMem(v.command || '') + '" placeholder="e.g. npx @modelcontextprotocol/server-filesystem /Users/me/notes" /></div>',
+      '  <div><label>ARGS (space-separated, stdio)</label><input type="text" data-f="args" value="' + escMem(argsStr) + '" placeholder="optional — overrides args from command line" /></div>',
+      '  <div><label>URL (http / sse)</label><input type="text" data-f="url" value="' + escMem(v.url || '') + '" placeholder="https://your-mcp-server.example.com/rpc" /></div>',
+      '  <div class="buttons">',
+      '    <button class="save" data-hub-mcp-save="' + escMem(s ? s.name : 'new') + '">' + (s ? 'SAVE' : 'CREATE') + '</button>',
+      '    <button class="cancel" data-hub-mcp-cancel>CANCEL</button>',
+      '  </div>',
+      '</div>',
+    ].join('');
+  }
+
+  function bindHubMcpActions() {
+    const root = document.querySelector('[data-hub-mcp-list]');
+    if (!root) return;
+
+    root.querySelectorAll('[data-hub-mcp-toggle]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const name = btn.getAttribute('data-hub-mcp-toggle');
+        const enabled = !btn.classList.contains('on');
+        try {
+          const r = await fetch(withToken('/api/console/mcp-servers/' + encodeURIComponent(name)), {
+            method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ enabled }),
+          });
+          if (!r.ok) { const j = await r.json().catch(() => ({})); alert('Toggle failed: ' + (j.error || r.status)); return; }
+          await refreshHubMcp();
+        } catch (err) { alert('Toggle failed: ' + (err.message || err)); }
+      });
+    });
+
+    root.querySelectorAll('[data-hub-mcp-edit]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const name = btn.getAttribute('data-hub-mcp-edit');
+        hubMcpEditing = hubMcpEditing === name ? null : name;
+        renderHubMcp();
+      });
+    });
+
+    root.querySelectorAll('[data-hub-mcp-cancel]').forEach((btn) => {
+      btn.addEventListener('click', () => { hubMcpEditing = null; renderHubMcp(); });
+    });
+
+    root.querySelectorAll('[data-hub-mcp-del]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const name = btn.getAttribute('data-hub-mcp-del');
+        if (!confirm('Delete MCP server "' + name + '"? Only the user override is removed; if another imported MCP client config also has it, it will reappear on next reload.')) return;
+        try {
+          await fetch(withToken('/api/console/mcp-servers/' + encodeURIComponent(name)), { method: 'DELETE' });
+          hubMcpEditing = null;
+          await refreshHubMcp();
+        } catch (err) { alert('Delete failed: ' + (err.message || err)); }
+      });
+    });
+
+    root.querySelectorAll('[data-hub-mcp-save]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const id = btn.getAttribute('data-hub-mcp-save');
+        const editor = root.querySelector('[data-hub-mcp-editor-for="' + id + '"]');
+        if (!editor) return;
+        const patch = {};
+        editor.querySelectorAll('[data-f]').forEach((el) => {
+          const field = el.getAttribute('data-f');
+          if (field === 'args') {
+            const trimmed = el.value.trim();
+            patch.args = trimmed ? trimmed.split(/\\s+/) : [];
+          } else if (el.value !== '') {
+            patch[field] = el.value;
+          }
+        });
+
+        try {
+          if (id === 'new') {
+            if (!patch.name) { alert('name is required'); return; }
+            const r = await fetch(withToken('/api/console/mcp-servers'), {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(patch),
+            });
+            if (!r.ok) { const j = await r.json().catch(() => ({})); alert('Create failed: ' + (j.error || r.status)); return; }
+          } else {
+            const r = await fetch(withToken('/api/console/mcp-servers/' + encodeURIComponent(id)), {
+              method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(patch),
+            });
+            if (!r.ok) { const j = await r.json().catch(() => ({})); alert('Save failed: ' + (j.error || r.status)); return; }
+          }
+          hubMcpEditing = null;
+          await refreshHubMcp();
+        } catch (err) { alert('Save failed: ' + (err.message || err)); }
+      });
+    });
   }
 
   async function bootSettingsPanel() {
@@ -4410,25 +8616,28 @@ const CONSOLE_JS = `
       const data = await fetchJSON('/api/console/credentials');
       const rows = data.rows || [];
       const descriptors = data.descriptors || {};
-      const connected = rows.filter((r) => r.status === 'connected').length;
-      const envOnly = rows.filter((r) => r.status === 'env_only').length;
-      const missing = rows.filter((r) => r.status === 'missing').length;
+      const auth = data.auth || null;
       const unreadable = rows.filter((r) => r.status === 'unreadable' || r.status === 'needs_repair').length;
-      metaEl.textContent = connected + ' connected · ' + envOnly + ' env-only · ' + missing + ' missing' + (unreadable ? ' · ' + unreadable + ' need repair' : '');
+      metaEl.textContent = (auth?.configured ? 'runtime ready via ' + runtimeAuthLabel(auth) : 'runtime auth needs setup')
+        + ' · ' + (hasOpenAiApiKey(auth) ? 'OpenAI key ready' : 'OpenAI key optional')
+        + (unreadable ? ' · ' + unreadable + ' need repair' : '');
 
       listEl.innerHTML = rows.map((r) => {
         const d = descriptors[r.name] || {};
+        const display = displayCredentialStatus(r, d, auth);
+        const runtimeCredentialReady = display.className === 'runtime_ready'
+          && (r.name === 'codex_oauth_access_token' || r.name === 'codex_oauth_refresh_token');
         return [
           '<div class="cred-row" data-cred-row="' + escMem(r.name) + '">',
           '  <div class="cred-main">',
-          '    <div class="cred-name">' + escMem(r.name) + '</div>',
+          '    <div class="cred-name">' + escMem(credentialDisplayName(r.name)) + '</div>',
           '    <div class="cred-meta">',
-          '      <span class="cred-status ' + escMem(r.status) + '">' + escMem(r.status.toUpperCase().replace('_', ' ')) + '</span>',
-          '      <span class="cred-source ' + escMem(r.source) + '">' + escMem(r.source.toUpperCase()) + '</span>',
+          '      <span class="cred-status ' + escMem(display.className) + '">' + escMem(display.label) + '</span>',
+          display.source && display.source !== 'none' ? '      <span class="cred-source ' + escMem(display.source) + '">' + escMem(display.source.toUpperCase()) + '</span>' : '',
           r.lastSetAt ? '      <span>set ' + escMem(r.lastSetAt.slice(0, 16).replace("T", " ")) + '</span>' : '',
           d.envVarName ? '      <span>env: ' + escMem(d.envVarName) + '</span>' : '',
           '    </div>',
-          d.description ? '    <div class="cred-desc">' + escMem(d.description) + '</div>' : '',
+          credentialDescription(r.name, d) ? '    <div class="cred-desc">' + escMem(credentialDescription(r.name, d)) + '</div>' : '',
           d.setupHint ? '    <div class="cred-hint">' + escMem(d.setupHint) + '</div>' : '',
           '    <div class="cred-set-input-wrap" data-cred-set-wrap="' + escMem(r.name) + '">',
           '      <input type="password" class="cred-set-input" data-cred-set-input="' + escMem(r.name) + '" placeholder="paste value…" autocomplete="off" />',
@@ -4439,11 +8648,13 @@ const CONSOLE_JS = `
           '    </div>',
           '  </div>',
           '  <div class="cred-actions">',
-          '    <button class="cred-set" type="button" data-cred-set="' + escMem(r.name) + '">' + (r.hasValue ? 'REPLACE' : 'SET') + ' ✎</button>',
-          (r.status === 'env_only')
+          runtimeCredentialReady
+            ? '    <span class="cred-action-note">ACTIVE VIA AUTH STORE</span>'
+            : '    <button class="cred-set" type="button" data-cred-set="' + escMem(r.name) + '">' + (r.hasValue ? 'REPLACE' : 'SET') + ' ✎</button>',
+          (!runtimeCredentialReady && r.status === 'env_only')
             ? '    <button class="cred-migrate" type="button" data-cred-migrate="' + escMem(r.name) + '">MOVE TO VAULT ⇢</button>'
             : '',
-          r.hasValue ? '    <button class="cred-delete" type="button" data-cred-delete="' + escMem(r.name) + '">DELETE ▣</button>' : '',
+          (!runtimeCredentialReady && r.hasValue) ? '    <button class="cred-delete" type="button" data-cred-delete="' + escMem(r.name) + '">DELETE ▣</button>' : '',
           '  </div>',
           '</div>',
         ].join('');
@@ -4573,14 +8784,22 @@ const CONSOLE_JS = `
 
   function renderAuthInfo(auth) {
     if (!auth) { sett.authBox.textContent = '—'; return; }
+    const codexReady = hasCodexRuntimeAuth(auth);
+    const apiKeyReady = hasOpenAiApiKey(auth);
     const rows = [
+      ['Agent runtime',  auth.configured ? 'ready' : 'needs sign-in'],
+      ['Runtime path',   runtimeAuthLabel(auth)],
       ['Mode',           auth.mode || '—'],
-      ['Has API key',    auth.hasOpenAiApiKey ? 'yes' : 'no'],
-      ['Codex auth',     auth.hasNativeOAuth || auth.hasImportedCodexAuth ? 'configured' : 'not configured'],
+      ['Source',         auth.source || '—'],
+      ['Codex OAuth',    codexReady ? 'connected' : 'not connected'],
+      ['OpenAI API key', apiKeyReady ? 'available for embeddings + live voice' : 'optional: embeddings + live voice disabled'],
+      auth.codexAccountId ? ['Codex account', auth.codexAccountId] : null,
     ];
-    sett.authBox.innerHTML = rows.map(([k, v]) =>
-      '<div class="row"><span class="k">' + escMem(k) + '</span><span class="v ' + (v === 'no' || v === 'not configured' ? 'off' : 'on') + '">' + escMem(String(v)) + '</span></div>',
-    ).join('');
+    sett.authBox.innerHTML = rows.filter(Boolean).map(([k, v]) => {
+      const text = String(v);
+      const off = text.includes('needs') || text.includes('not connected') || text.includes('disabled');
+      return '<div class="row"><span class="k">' + escMem(k) + '</span><span class="v ' + (off ? 'off' : 'on') + '">' + escMem(text) + '</span></div>';
+    }).join('') + '<p class="settings-note">Codex OAuth is the agent runtime auth. The OpenAI API key is a separate optional capability key for semantic embeddings, Realtime live voice, and direct API-only features.</p>';
   }
 
   function renderMemoryInfo(m) {
@@ -4590,11 +8809,11 @@ const CONSOLE_JS = `
       ['Files',           m.indexedFiles ?? '—'],
       ['Active facts',    m.activeFacts ?? '—'],
       ['Total facts',     m.totalFacts ?? '—'],
-      ['Embeddings',      m.embeddingsEnabled ? (m.embeddingsCount + ' vectors · ' + Math.round((m.embeddingsCoverage || 0) * 100) + '%') : 'disabled (set OPENAI_API_KEY)'],
+      ['Embeddings',      m.embeddingsEnabled ? (m.embeddingsCount + ' vectors · ' + Math.round((m.embeddingsCoverage || 0) * 100) + '%') : 'disabled (optional OpenAI API key required)'],
       ['DB size',         (m.dbBytes ?? 0) + ' bytes'],
     ];
     sett.memoryBox.innerHTML = rows.map(([k, v]) => {
-      const cls = (v === 'disabled (set OPENAI_API_KEY)') ? 'off' : 'on';
+      const cls = String(v).startsWith('disabled') ? 'off' : 'on';
       return '<div class="row"><span class="k">' + escMem(k) + '</span><span class="v ' + cls + '">' + escMem(String(v)) + '</span></div>';
     }).join('');
   }

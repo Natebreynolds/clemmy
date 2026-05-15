@@ -6,7 +6,11 @@ import { ApprovalStore } from './approval-store.js';
 import { addNotification } from './notifications.js';
 import { ASSISTANT_NAME } from '../config.js';
 import { getStoredCodexOAuthTokens, refreshStoredNativeOAuth } from './auth-store.js';
-import { getCoreTools } from '../tools/registry.js';
+import { getCoreToolsAsync } from '../tools/registry.js';
+import { getOrCreateConfiguredMcpServers } from './mcp-servers.js';
+import { classifyTool, decideToolApproval } from '../agents/tool-taxonomy.js';
+import { beginToolEvent, recordPendingApproval } from '../agents/tool-observability.js';
+import { truncateToolText } from '../tools/shared.js';
 import type { RuntimeContextValue, ToolActivity } from '../types.js';
 
 const logger = pino({ name: 'clementine-next.codex-native-runtime' });
@@ -56,22 +60,109 @@ async function throwIfCancelled(callbacks?: AgentRuntimeCallbacks): Promise<void
   }
 }
 
-function createCodexToolDefinitions() {
-  return getCoreTools()
+/**
+ * Tool surface presented to the Codex Responses API.
+ *
+ * Three sources, merged in a single flat list:
+ *   1. Local SDK tools (`getCoreTools`) — request_destructive_action,
+ *      computer-use, local runtime tools, Composio broker + cx_*.
+ *   2. MCP tools via the namespace shim — `<server>__<tool>` names.
+ *   3. (future) computer-use primitives via SDK `computerTool`.
+ *
+ * The OpenAI Agents SDK does NOT mediate Codex requests (Codex talks
+ * to `chatgpt.com/backend-api/codex/responses` directly), so this
+ * runtime is responsible for the same fan-in the SDK Runner does
+ * elsewhere: list the MCP shim's tools, present them to the model,
+ * route incoming function-calls back to the shim's `callTool`.
+ */
+async function createCodexToolDefinitions() {
+  // 1. Local tools (Composio + computer + local runtime + planner shims).
+  const local = await getCoreToolsAsync({ includeDynamicComposioTools: true });
+
+  // 2. MCP tools through the namespace shim. We tolerate the shim
+  //    being slow / partially broken — listTools() inside the shim
+  //    already swallows per-server failures, so a single dead MCP
+  //    server doesn't take the whole tool surface down.
+  let mcpDefs: Array<{ type: string; name: string; description?: string; parameters: unknown; strict?: boolean }> = [];
+  try {
+    const shim = getOrCreateConfiguredMcpServers();
+    if (typeof shim.connect === 'function') {
+      await shim.connect();
+    }
+    const mcpTools = await shim.listTools();
+    mcpDefs = mcpTools.map((t) => ({
+      type: 'function',
+      name: t.name,
+      description: t.description ?? `MCP tool ${t.name}`,
+      // The MCP SDK gives us a JSON Schema in `inputSchema`. Codex
+      // accepts JSON Schema directly in the `parameters` field, same
+      // as OpenAI function-calling.
+      parameters: (t as { inputSchema?: unknown }).inputSchema ?? { type: 'object', additionalProperties: true },
+    }));
+  } catch (err) {
+    logger.warn({ err }, 'failed to enumerate MCP tools for Codex runtime; continuing without MCP');
+  }
+
+  const localDefs = local
     .filter((tool) => tool.type === 'function')
     .map((tool) => ({
-      type: 'function',
+      type: 'function' as const,
       name: tool.name,
       description: tool.description,
       parameters: tool.parameters,
       strict: tool.strict,
     }));
+
+  return [...localDefs, ...mcpDefs];
 }
 
-function createToolMap() {
-  return new Map(getCoreTools()
+async function createToolMap() {
+  const tools = await getCoreToolsAsync({ includeDynamicComposioTools: true });
+  return new Map(tools
     .filter((tool) => tool.type === 'function')
     .map((tool) => [tool.name, tool]));
+}
+
+/**
+ * True if `name` is a namespace-shimmed MCP tool: `<server>__<tool>`.
+ * The Codex executeToolCall path routes these to the shim instead of
+ * looking them up in the local tool map (where they don't exist).
+ */
+function isMcpToolName(name: string): boolean {
+  return name.includes('__');
+}
+
+/**
+ * MCP `callTool` returns a CallToolResult — an array of content
+ * objects (text / image / resource). Collapse to a single string so
+ * Codex can feed it back into the next turn the same shape it does
+ * for SDK function-tool outputs.
+ */
+function stringifyMcpResult(result: unknown): string {
+  if (typeof result === 'string') return truncateToolText(result);
+  if (Array.isArray(result)) {
+    return truncateToolText(result.map(stringifyMcpResult).join('\n'));
+  }
+  if (result && typeof result === 'object') {
+    const r = result as Record<string, unknown>;
+    if (Array.isArray(r.content)) {
+      const parts: string[] = [];
+      for (const item of r.content) {
+        if (item && typeof item === 'object' && typeof (item as { text?: unknown }).text === 'string') {
+          parts.push((item as { text: string }).text);
+        } else if (item && typeof item === 'object') {
+          parts.push(JSON.stringify(item));
+        }
+      }
+      if (parts.length) return truncateToolText(parts.join('\n'));
+    }
+    try {
+      return truncateToolText(JSON.stringify(result, null, 2));
+    } catch {
+      return String(result);
+    }
+  }
+  return String(result);
 }
 
 function parseSseChunk(buffer: string): { events: CodexSseEvent[]; rest: string } {
@@ -196,7 +287,7 @@ async function performCodexRequest(
     store: false,
     stream: true,
     input,
-    tools: createCodexToolDefinitions(),
+    tools: await createCodexToolDefinitions(),
   };
 
   const abortController = callbacks?.shouldCancel ? new AbortController() : undefined;
@@ -276,6 +367,9 @@ async function performCodexRequest(
 	          const delta = payload.delta;
 	          if (typeof delta === 'string' && delta) {
 	            finalText += delta;
+	            if (callbacks?.onChunk) {
+	              await callbacks.onChunk(delta);
+	            }
 	          }
 	          continue;
 	        }
@@ -445,7 +539,16 @@ export class CodexNativeRuntime implements AgentRuntime {
 	    const name = toolCall.name;
     if (!name) return { output: 'Tool call is missing a name.' };
 
-    const tool = createToolMap().get(name);
+    // MCP tools live behind the namespace shim, not in the SDK tool
+    // map. Route them through the shim, apply the unified approval
+    // taxonomy ourselves (the shim doesn't expose a per-call
+    // needsApproval hook), and stream the result back into the Codex
+    // turn the same way SDK tools flow.
+    if (isMcpToolName(name)) {
+      return this.executeMcpToolCall(request, sessionId, toolCall, callbacks);
+    }
+
+    const tool = (await createToolMap()).get(name);
     if (!tool) return { output: `Tool "${name}" is not available in this Clementine runtime.` };
 
     const args = parseToolArguments(toolCall);
@@ -461,6 +564,11 @@ export class CodexNativeRuntime implements AgentRuntime {
       await callbacks.onToolActivity(toolActivityFor(toolCall));
     }
 
+    // Capture the taxonomy classification + the reason the SDK tool
+    // is asking for approval so we have a single observable shape for
+    // every call (local SDK tools + MCP), regardless of which approval
+    // function they wired in.
+    const kind = classifyTool(name, { args });
     const needsApproval = await tool.needsApproval(runContext, args, toolCall.call_id ?? toolCall.id);
     if (needsApproval) {
       const approvalId = randomUUID();
@@ -480,9 +588,18 @@ export class CodexNativeRuntime implements AgentRuntime {
       };
       this.approvals.add(pendingApproval);
       this.notifyApprovalPending(pendingApproval, toolCall);
+      recordPendingApproval({ sessionId, toolName: name, kind, args, approvalId, mcp: false });
       return { pendingApprovalId: approvalId };
     }
 
+    const finishEvent = beginToolEvent({
+      sessionId,
+      toolName: name,
+      kind,
+      approvalReason: 'auto',
+      args,
+      mcp: false,
+    });
 	    try {
 	      await throwIfCancelled(callbacks);
 	      const callId = toolCall.call_id ?? toolCall.id ?? randomUUID();
@@ -496,11 +613,98 @@ export class CodexNativeRuntime implements AgentRuntime {
         } as any,
 	      });
 	      await throwIfCancelled(callbacks);
+	      finishEvent('success');
 	      return { output: stringifyToolOutput(output) };
     } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
       logger.warn({ err: error, tool: name }, 'Native Codex tool execution failed');
-      return { output: `Tool "${name}" failed: ${error instanceof Error ? error.message : String(error)}` };
+      finishEvent('error', msg);
+      return { output: `Tool "${name}" failed: ${msg}` };
     }
+  }
+
+  /**
+   * Dispatch a `<server>__<tool>` MCP function-call. The local tool
+   * map doesn't have it; the namespace shim does. Approval is gated
+   * by the unified taxonomy (same `decideToolApproval` as everything
+   * else), so YOLO mode auto-runs a DataForSEO query, strict pauses
+   * a Hostinger create_domain, etc.
+   */
+  private async executeMcpToolCall(
+    request: RunRequest,
+    sessionId: string,
+    toolCall: CodexFunctionCall,
+    callbacks?: AgentRuntimeCallbacks,
+  ): Promise<{ output?: string; pendingApprovalId?: string }> {
+    const name = toolCall.name!;
+    const args = parseToolArguments(toolCall);
+
+    if (callbacks?.onToolActivity) {
+      await callbacks.onToolActivity(toolActivityFor(toolCall));
+    }
+
+    const decision = decideToolApproval({
+      sessionId,
+      toolName: name,
+      args,
+    });
+    if (decision.needsApproval) {
+      const approvalId = randomUUID();
+      const pendingApproval: PendingApproval = {
+        id: approvalId,
+        sessionId,
+        agentName: ASSISTANT_NAME,
+        toolName: name,
+        userId: request.userId,
+        channel: request.channel,
+        createdAt: new Date().toISOString(),
+        status: 'pending',
+        state: JSON.stringify({
+          request,
+          toolCall,
+        } satisfies StoredCodexApprovalState),
+      };
+      this.approvals.add(pendingApproval);
+      this.notifyApprovalPending(pendingApproval, toolCall);
+      recordPendingApproval({
+        sessionId,
+        toolName: name,
+        kind: decision.kind,
+        args,
+        approvalId,
+        mcp: true,
+      });
+      return { pendingApprovalId: approvalId };
+    }
+
+    const finishEvent = beginToolEvent({
+      sessionId,
+      toolName: name,
+      kind: decision.kind,
+      approvalReason: decision.reason,
+      args,
+      mcp: true,
+    });
+    try {
+      await throwIfCancelled(callbacks);
+      const output = await this.invokeMcpToolByName(name, args);
+      await throwIfCancelled(callbacks);
+      finishEvent('success');
+      return { output };
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      logger.warn({ err: error, tool: name }, 'MCP tool execution failed (Codex runtime)');
+      finishEvent('error', msg);
+      return { output: `MCP tool "${name}" failed: ${msg}` };
+    }
+  }
+
+  private async invokeMcpToolByName(name: string, args: Record<string, unknown>): Promise<string> {
+    const shim = getOrCreateConfiguredMcpServers();
+    // The shim itself routes by namespaced name; we don't unparse the
+    // `<server>__<tool>` prefix here.
+    const result = await shim.callTool(name, args ?? null);
+    return stringifyMcpResult(result);
   }
 
   private async executeApprovedToolCall(
@@ -511,7 +715,31 @@ export class CodexNativeRuntime implements AgentRuntime {
     const name = toolCall.name;
     if (!name) return 'Tool call is missing a name.';
 
-    const tool = createToolMap().get(name);
+    const args = parseToolArguments(toolCall);
+    const kind = classifyTool(name, { args });
+
+    // Approved MCP call — same dispatch path as the live executor.
+    if (isMcpToolName(name)) {
+      const finish = beginToolEvent({
+        sessionId,
+        toolName: name,
+        kind,
+        approvalReason: 'approved-after-prompt',
+        args,
+        mcp: true,
+      });
+      try {
+        const out = await this.invokeMcpToolByName(name, args);
+        finish('success');
+        return out;
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        finish('error', msg);
+        throw error;
+      }
+    }
+
+    const tool = (await createToolMap()).get(name);
     if (!tool) return `Tool "${name}" is not available in this Clementine runtime.`;
 
     const runContext = {
@@ -522,6 +750,14 @@ export class CodexNativeRuntime implements AgentRuntime {
       } satisfies RuntimeContextValue,
     } as any;
 
+    const finish = beginToolEvent({
+      sessionId,
+      toolName: name,
+      kind,
+      approvalReason: 'approved-after-prompt',
+      args,
+      mcp: false,
+    });
     try {
       const callId = toolCall.call_id ?? toolCall.id ?? randomUUID();
       const output = await tool.invoke(runContext, toolCall.arguments ?? '{}', {
@@ -533,10 +769,13 @@ export class CodexNativeRuntime implements AgentRuntime {
           arguments: toolCall.arguments ?? '{}',
         } as any,
       });
+      finish('success');
       return stringifyToolOutput(output);
     } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
       logger.warn({ err: error, tool: name }, 'Approved native Codex tool execution failed');
-      return `Tool "${name}" failed after approval: ${error instanceof Error ? error.message : String(error)}`;
+      finish('error', msg);
+      return `Tool "${name}" failed after approval: ${msg}`;
     }
   }
 
