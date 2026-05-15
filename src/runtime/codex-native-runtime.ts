@@ -9,7 +9,7 @@ import { getStoredCodexOAuthTokens, refreshStoredNativeOAuth } from './auth-stor
 import { getCoreToolsAsync } from '../tools/registry.js';
 import { getOrCreateConfiguredMcpServers } from './mcp-servers.js';
 import { classifyTool, decideToolApproval } from '../agents/tool-taxonomy.js';
-import { beginToolEvent, recordPendingApproval } from '../agents/tool-observability.js';
+import { beginToolEvent, recordPendingApproval, recordToolEvent } from '../agents/tool-observability.js';
 import { truncateToolText } from '../tools/shared.js';
 import type { RuntimeContextValue, ToolActivity } from '../types.js';
 
@@ -267,7 +267,7 @@ function formatCodexApiError(status: number, bodyText: string): string {
     return detail;
   }
 
-  return `Codex request failed (${status}).`;
+  return `Clementine's model backend request failed (HTTP ${status}).`;
 }
 
 async function performCodexRequest(
@@ -327,7 +327,7 @@ async function performCodexRequest(
   }
 
   if (!response.body) {
-    throw new CodexRuntimeError('Codex returned an empty response body.');
+    throw new CodexRuntimeError('Clementine\'s model backend returned an empty response.');
   }
 
   const reader = response.body.getReader();
@@ -788,7 +788,19 @@ export class CodexNativeRuntime implements AgentRuntime {
 	    let currentInput = [...input];
 	    let latestResult: CodexResponseResult | null = null;
 
-	    for (let turn = 0; turn < 10; turn++) {
+	    // Maximum back-and-forth turns of (model → tool calls → tool outputs
+	    // → model). One turn = one model completion + the tool dispatches
+	    // it asks for. SEO audits / cross-tool work can chain easily into
+	    // double digits, so we keep this generous and surface a
+	    // user-facing message + a `stopped-at-max-turns` audit event when
+	    // it does trip.
+	    //
+	    // Override via env: `CLEMENTINE_MAX_TOOL_TURNS=30 npm run daemon`.
+	    const maxTurns = Math.max(
+	      1,
+	      parseInt(process.env.CLEMENTINE_MAX_TOOL_TURNS || '', 10) || 25,
+	    );
+	    for (let turn = 0; turn < maxTurns; turn++) {
 	      await throwIfCancelled(callbacks);
 	      latestResult = await this.performWithRefresh(
         { ...request, sessionId },
@@ -797,7 +809,8 @@ export class CodexNativeRuntime implements AgentRuntime {
       );
 
       if (latestResult.toolCalls.length === 0) {
-        const finalText = latestResult.text || 'Codex returned no final message.';
+        const finalText = latestResult.text
+          || 'Clementine paused without a final reply — ask again to pick up where she left off.';
         if (callbacks?.onText) {
           await callbacks.onText(finalText);
         }
@@ -844,8 +857,23 @@ export class CodexNativeRuntime implements AgentRuntime {
       currentInput = nextInput;
     }
 
+    // Hit the turn cap. Record an observability event so we can see in
+    // tool-events.ndjson how often this happens and which sessions hit
+    // it — useful signal for tuning the cap or splitting work across
+    // multiple turns at the agent level.
+    recordToolEvent({
+      at: new Date().toISOString(),
+      sessionId,
+      toolName: '__runtime__',
+      kind: 'execute',
+      phase: 'error',
+      outcome: 'error',
+      errorMessage: `stopped at max tool-call turns (${maxTurns})`,
+    });
+
     return {
-      text: latestResult?.text || 'Stopped after the maximum native tool-call turns.',
+      text: latestResult?.text
+        || `Clementine ran out of tool-call cycles before finishing (cap: ${maxTurns}). Ask her to continue — she'll pick up where she left off.`,
       sessionId,
       raw: latestResult,
     };
