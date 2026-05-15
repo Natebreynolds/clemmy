@@ -49,7 +49,7 @@ provider you configure and the third-party APIs you connect.
 The signed macOS app is the supported install path:
 
 1. Download the latest `Clementine-<version>-arm64.dmg` from
-   [Releases](https://github.com/Natebreynolds/clementine-next/releases).
+   [Releases](https://github.com/Natebreynolds/clemmy/releases).
 2. Drag **Clementine** to your Applications folder.
 3. Launch it. On first run, the setup wizard collects:
    - Your LLM auth (Codex OAuth via ChatGPT, OpenAI API key, or both).
@@ -65,8 +65,8 @@ daemon running. Find her in the menu bar to quit.
 ### Run from source (development)
 
 ```bash
-git clone https://github.com/Natebreynolds/clementine-next
-cd clementine-next
+git clone https://github.com/Natebreynolds/clemmy
+cd clemmy
 npm install
 npm run setup      # interactive wizard
 npm run daemon     # background service
