@@ -43,6 +43,36 @@ npm run build
 echo "→ Building daemon (parent project)"
 npm run build:daemon
 
+# ──────────────────────────────────────────────────────────────────────
+# Rebuild the DAEMON's native modules for Electron's Node ABI.
+#
+# electron-builder's built-in @electron/rebuild only sees the desktop
+# package's node_modules (apps/desktop/node_modules/), so it rebuilds
+# keytar but never touches the daemon's better-sqlite3 / fsevents
+# living in the repo-root node_modules that gets copied via
+# `extraResources`.
+#
+# Without this step, the installed app's daemon throws
+# `NODE_MODULE_VERSION 127 vs 130` on every SQLite touch — memory
+# search degrades silently and Codex can return empty completions.
+#
+# We rebuild against the SAME Electron version electron-builder will
+# ship, then restore to the host Node ABI at the end of the script so
+# the dev daemon (`npm run daemon`) keeps working.
+# ──────────────────────────────────────────────────────────────────────
+ELECTRON_VERSION=$(node -e "console.log(require('./node_modules/electron/package.json').version)")
+echo "→ Rebuilding daemon native modules for Electron ${ELECTRON_VERSION}"
+( cd ../.. && npx @electron/rebuild --version="${ELECTRON_VERSION}" --types=prod )
+
+# Make sure we always restore the host Node ABI on exit, even if the
+# script fails — otherwise the user can't run `npm run daemon` from
+# source until they `npm rebuild` manually.
+restore_host_abi() {
+  echo "→ Restoring native modules to host Node ABI (so dev daemon keeps working)"
+  ( cd ../.. && npm rebuild better-sqlite3 fsevents 2>&1 ) || true
+}
+trap restore_host_abi EXIT
+
 echo "→ electron-builder mac (sign + notarize + dmg + zip)"
 # CSC_IDENTITY_AUTO_DISCOVERY=true lets electron-builder find the
 # Developer ID cert in your local keychain.
