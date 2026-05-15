@@ -56,6 +56,7 @@ interface WorkflowFile {
 
 function toolCategory(name: string): string {
   if (name.startsWith('composio_') || name.startsWith('cx_')) return 'Connected apps';
+  if (name.startsWith('browser_harness')) return 'Browser';
   if (['workspace_roots', 'list_files', 'read_file', 'write_file', 'run_shell_command', 'git_status', 'workspace_config', 'workspace_list', 'workspace_info'].includes(name)) return 'Computer';
   if (name.startsWith('memory_') || name === 'working_memory' || name.startsWith('note_')) return 'Memory';
   if (name.startsWith('task_') || name.includes('plan') || name === 'discover_work' || name.startsWith('goal_')) return 'Planning';

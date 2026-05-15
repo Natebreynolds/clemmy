@@ -19,9 +19,19 @@ import type { ClementineAssistant } from '../assistant/core.js';
 import { buildRealtimeVoiceInstructions } from '../assistant/voice-context.js';
 import { LOCAL_MCP_TOOL_NAMES } from '../tools/catalog.js';
 import { getCoreToolsAsync } from '../tools/registry.js';
+import {
+  getBrowserHarnessStatus,
+  getInstallJob,
+  openChromeRemoteDebuggingSetup,
+  runBrowserHarnessDoctor,
+  runBrowserHarnessSmokeTest,
+  startApprovedInstallCommand,
+  startBrowserHarnessInstall,
+} from '../integrations/browser-harness.js';
 import { discoverMcpServers, loadUserMcpServers, saveUserMcpServers } from '../runtime/mcp-config.js';
 import { invalidateConfiguredMcpServers } from '../runtime/mcp-servers.js';
 import { clearAutonomyAgentCache } from '../agents/autonomy-v2.js';
+import { classifyTool } from '../agents/tool-taxonomy.js';
 import { loadPlugins, PLUGINS_DIR } from '../plugins/loader.js';
 import { loadUserProfile, saveUserProfile } from '../runtime/user-profile.js';
 import { getProactivityPolicySnapshot, saveProactivityPolicy } from '../agents/proactivity-policy.js';
@@ -447,6 +457,9 @@ export function registerConsoleRoutes(
       return;
     }
     const queryToken = typeof req.query.token === 'string' ? req.query.token : WEBHOOK_SECRET;
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
     res.type('html').send(renderConsoleHtml(queryToken));
   });
 
@@ -720,6 +733,10 @@ export function registerConsoleRoutes(
         enabled: data.enabled !== false,
         triggerSchedule: data.trigger?.schedule ?? null,
         stepCount: Array.isArray(data.steps) ? data.steps.length : 0,
+        trigger: data.trigger ?? { manual: true },
+        steps: data.steps ?? [],
+        inputs: data.inputs ?? {},
+        synthesis: data.synthesis ?? null,
       }));
       res.json({ workflows: items });
     } catch (err) {
@@ -945,6 +962,7 @@ export function registerConsoleRoutes(
     if (name === 'set_timer' || name.startsWith('cron_') || name.startsWith('workflow_') || name === 'trigger_cron_job' || name === 'add_cron_job') return 'Automation';
     if (name === 'workspace_config' || name === 'workspace_list' || name === 'workspace_info' || name === 'workspace_roots' || name === 'list_files' || name === 'read_file' || name === 'write_file' || name === 'run_shell_command' || name === 'git_status') return 'Computer';
     if (name.startsWith('composio_') || name.startsWith('cx_')) return 'Connected Apps';
+    if (name.startsWith('browser_harness')) return 'Browser';
     if (name === 'session_history' || name === 'session_pause' || name === 'session_resume') return 'Sessions';
     if (name === 'create_tool') return 'Meta';
     if (name === 'ping') return 'System';
@@ -964,7 +982,9 @@ export function registerConsoleRoutes(
           description: tool.description ?? '',
           category: categorizeTool(tool.name),
           source: 'sdk' as const,
-          needsApproval: Boolean((tool as { needsApproval?: unknown }).needsApproval),
+          needsApproval: classifyTool(tool.name) === 'read'
+            ? false
+            : Boolean((tool as { needsApproval?: unknown }).needsApproval),
         }));
 
       const sdkNames = new Set(sdkTools.map((t) => t.name));
@@ -1015,57 +1035,90 @@ export function registerConsoleRoutes(
 
   /** Inspect one project deeply: README, CLAUDE.md, package.json snippet
    *  to surface relevant metadata for the user without exposing the
-   *  whole filesystem. */
-  app.get('/api/console/projects/inspect', (req, res) => {
+   *  whole filesystem.
+   *
+   *  All filesystem reads are async + bounded by a per-read timeout —
+   *  workspace dirs can live on CloudStorage / OneDrive / network mounts
+   *  where read() can block indefinitely. A single hung read here used
+   *  to freeze the entire daemon event loop and take the dashboard down. */
+  app.get('/api/console/projects/inspect', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const root = typeof req.query.path === 'string' ? req.query.path : '';
     if (!root || !existsSync(root)) { res.status(404).json({ error: 'path not found' }); return; }
+
+    const FS_TIMEOUT_MS = 1500;
+    const withTimeout = async <T>(work: Promise<T>): Promise<T | undefined> => {
+      let timer: NodeJS.Timeout | null = null;
+      const timeout = new Promise<undefined>((resolve) => {
+        timer = setTimeout(() => resolve(undefined), FS_TIMEOUT_MS);
+      });
+      try {
+        return await Promise.race([work, timeout]);
+      } catch {
+        return undefined;
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    };
+
     try {
       const result: Record<string, unknown> = { path: root };
+      const timedOut: string[] = [];
 
       // README in any common form.
       for (const name of ['README.md', 'readme.md', 'README', 'README.markdown']) {
         const candidate = path.join(root, name);
-        if (existsSync(candidate)) {
-          try { result.readme = readFileSync(candidate, 'utf-8').slice(0, 8000); }
-          catch { /* ignore */ }
-          break;
-        }
+        if (!existsSync(candidate)) continue;
+        const content = await withTimeout(fs.promises.readFile(candidate, 'utf-8'));
+        if (content === undefined) { timedOut.push(name); break; }
+        result.readme = content.slice(0, 8000);
+        break;
       }
 
       // CLAUDE.md — both root and .claude/ subdir.
       for (const candidate of [path.join(root, 'CLAUDE.md'), path.join(root, '.claude', 'CLAUDE.md')]) {
-        if (existsSync(candidate)) {
-          try { result.claudeMd = readFileSync(candidate, 'utf-8').slice(0, 8000); }
-          catch { /* ignore */ }
-          break;
-        }
+        if (!existsSync(candidate)) continue;
+        const content = await withTimeout(fs.promises.readFile(candidate, 'utf-8'));
+        if (content === undefined) { timedOut.push('CLAUDE.md'); break; }
+        result.claudeMd = content.slice(0, 8000);
+        break;
       }
 
       // package.json — pull a structured snippet.
       const pkgPath = path.join(root, 'package.json');
       if (existsSync(pkgPath)) {
-        try {
-          const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
-          result.package = {
-            name: pkg.name,
-            version: pkg.version,
-            description: pkg.description,
-            scripts: pkg.scripts ?? {},
-            dependencies: pkg.dependencies ? Object.keys(pkg.dependencies) : [],
-            devDependencies: pkg.devDependencies ? Object.keys(pkg.devDependencies) : [],
-          };
-        } catch { /* ignore */ }
+        const content = await withTimeout(fs.promises.readFile(pkgPath, 'utf-8'));
+        if (content === undefined) {
+          timedOut.push('package.json');
+        } else {
+          try {
+            const pkg = JSON.parse(content);
+            result.package = {
+              name: pkg.name,
+              version: pkg.version,
+              description: pkg.description,
+              scripts: pkg.scripts ?? {},
+              dependencies: pkg.dependencies ? Object.keys(pkg.dependencies) : [],
+              devDependencies: pkg.devDependencies ? Object.keys(pkg.devDependencies) : [],
+            };
+          } catch { /* malformed JSON — skip */ }
+        }
       }
 
       // Top-level entries.
-      try {
-        const entries = readdirSync(root, { withFileTypes: true })
+      const entries = await withTimeout(fs.promises.readdir(root, { withFileTypes: true }));
+      if (entries === undefined) {
+        timedOut.push('(directory listing)');
+      } else {
+        result.entries = entries
           .filter((e) => !e.name.startsWith('.'))
           .slice(0, 80)
           .map((e) => ({ name: e.name, isDir: e.isDirectory() }));
-        result.entries = entries;
-      } catch { /* ignore */ }
+      }
+
+      if (timedOut.length > 0) {
+        result.warning = `Slow filesystem (${timedOut.join(', ')} timed out after ${FS_TIMEOUT_MS}ms). The path may be on CloudStorage / OneDrive / a network mount.`;
+      }
 
       res.json(result);
     } catch (err) {
@@ -1087,6 +1140,78 @@ export function registerConsoleRoutes(
         tools: (p.tools ?? []).map((t) => ({ name: t.name, description: t.description })),
       }));
       res.json({ plugins: items, pluginsDir: PLUGINS_DIR });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // ─── Native Browser Harness ───────────────────────────────────
+
+  app.get('/api/console/browser-harness', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      res.json(await getBrowserHarnessStatus());
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/browser-harness/install', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      res.json({ job: startBrowserHarnessInstall() });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.get('/api/console/browser-harness/install/:id', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const job = getInstallJob(req.params.id);
+    if (!job) { res.status(404).json({ error: 'install job not found' }); return; }
+    res.json({ job });
+  });
+
+  app.post('/api/console/install-command', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const command = typeof req.body?.command === 'string' ? req.body.command : '';
+    const title = typeof req.body?.title === 'string' && req.body.title.trim() ? req.body.title.trim() : 'Install capability';
+    try {
+      res.json({ job: startApprovedInstallCommand(command, title) });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.get('/api/console/install-jobs/:id', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const job = getInstallJob(req.params.id);
+    if (!job) { res.status(404).json({ error: 'install job not found' }); return; }
+    res.json({ job });
+  });
+
+  app.post('/api/console/browser-harness/doctor', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      res.json(await runBrowserHarnessDoctor());
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/browser-harness/test', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      res.json(await runBrowserHarnessSmokeTest());
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/browser-harness/open-chrome-setup', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      res.json(await openChromeRemoteDebuggingSetup());
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -1234,6 +1359,91 @@ export function registerConsoleRoutes(
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
+  });
+
+  /**
+   * Recent tool events for the nav-dock RECENT card. Reads today's
+   * NDJSON file (from src/agents/tool-observability.ts) and returns
+   * the last N events newest-first.
+   */
+  app.get('/api/console/tool-events/recent', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const limit = Math.max(1, Math.min(50, parseInt(typeof req.query.limit === 'string' ? req.query.limit : '6', 10) || 6));
+    const eventsDir = path.join(os.homedir(), '.clementine-next', 'state', 'tool-events');
+    try {
+      if (!fs.existsSync(eventsDir)) {
+        res.json({ events: [] });
+        return;
+      }
+      const files = fs.readdirSync(eventsDir).filter((n) => n.endsWith('.ndjson')).sort();
+      if (files.length === 0) { res.json({ events: [] }); return; }
+      const events: Record<string, unknown>[] = [];
+      for (let i = files.length - 1; i >= 0 && events.length < limit; i--) {
+        const lines = fs.readFileSync(path.join(eventsDir, files[i]), 'utf-8').split('\n').filter(Boolean);
+        for (let j = lines.length - 1; j >= 0 && events.length < limit; j--) {
+          try {
+            const obj = JSON.parse(lines[j]) as Record<string, unknown>;
+            const phase = obj.phase;
+            // Only surface terminal events — start events double the
+            // noise without adding signal.
+            if (phase === 'end' || phase === 'error' || phase === 'pending-approval') {
+              events.push(obj);
+            }
+          } catch { /* skip malformed lines */ }
+        }
+      }
+      res.json({ events });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * Aggregated health snapshot for the nav-dock HEALTH card. Each
+   * subsystem is one of 'ok' | 'warn' | 'err' | 'unknown'.
+   */
+  app.get('/api/console/health', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const snapshot: Record<string, 'ok' | 'warn' | 'err' | 'unknown'> = {
+      daemon: 'ok', // if this endpoint is responding, the daemon is up
+      memoryDb: 'unknown',
+      mcp: 'unknown',
+      composio: 'unknown',
+    };
+
+    try {
+      const { openMemoryDb } = await import('../memory/db.js');
+      const db = openMemoryDb();
+      db.prepare('SELECT 1').get();
+      snapshot.memoryDb = 'ok';
+    } catch {
+      snapshot.memoryDb = 'err';
+    }
+
+    try {
+      const { discoverMcpServers } = await import('../runtime/mcp-config.js');
+      const servers = discoverMcpServers();
+      const enabled = servers.filter((s) => s.enabled).length;
+      snapshot.mcp = enabled > 0 ? 'ok' : 'warn';
+    } catch {
+      snapshot.mcp = 'err';
+    }
+
+    try {
+      const { getComposioCredentialStatus, listConnectedToolkits } = await import('../integrations/composio/client.js');
+      const cred = getComposioCredentialStatus();
+      if (!cred.enabled) {
+        snapshot.composio = 'warn';
+      } else {
+        const connections = await listConnectedToolkits();
+        const active = connections.filter((c) => c.status === 'ACTIVE').length;
+        snapshot.composio = active > 0 ? 'ok' : 'warn';
+      }
+    } catch {
+      snapshot.composio = 'err';
+    }
+
+    res.json(snapshot);
   });
 
   app.patch('/api/console/settings/profile', (req, res) => {
@@ -1897,15 +2107,16 @@ export function registerConsoleRoutes(
       ].slice(0, 6).map((item) => ({ ...item, title: trimConsoleTitle(item.title, 120), meta: trimConsoleTitle(item.meta || '', 100) }));
 
       const credentialRows = credentialHealth
-        .filter((row) => ['openai_api_key', 'discord_bot_token', 'composio_api_key', 'recall_api_key', 'codex_oauth_access_token', 'codex_oauth_refresh_token'].includes(row.name))
+        .filter((row) => ['openai_api_key', 'discord_bot_token', 'composio_api_key', 'recall_api_key', 'browser_use_api_key', 'codex_oauth_access_token', 'codex_oauth_refresh_token'].includes(row.name))
         .map((row) => ({
           name: row.name,
           label: row.name === 'openai_api_key' ? 'OpenAI API'
             : row.name === 'discord_bot_token' ? 'Discord'
               : row.name === 'composio_api_key' ? 'Composio'
                 : row.name === 'recall_api_key' ? 'Recall'
-                  : row.name === 'codex_oauth_access_token' ? 'Codex access'
-                    : 'Codex refresh',
+                  : row.name === 'browser_use_api_key' ? 'Browser Use'
+                    : row.name === 'codex_oauth_access_token' ? 'Codex access'
+                      : 'Codex refresh',
           status: row.status,
           hasValue: row.hasValue,
           required: listSecretDescriptors().find((descriptor) => descriptor.name === row.name)?.required ?? false,

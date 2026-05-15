@@ -108,6 +108,93 @@ export function renderConsoleHtml(token: string): string {
         <span class="nav-key">10</span>
         <span class="nav-label">Settings</span>
       </button>
+
+      <!-- ── nav-dock: fills the dead space under the menu items ──
+           Five stacked cards that surface monitoring + access to live
+           features from any panel. AIM-era "buddy info" zone.
+           Cards are fixed-height where possible; RECENT scrolls inside
+           its bounds so the nav itself never scrolls. -->
+      <div class="nav-dock" aria-label="Live status">
+
+        <div class="dock-card dock-now" data-dock-now>
+          <div class="dock-card-head">
+            <span class="dock-card-tag">NOW</span>
+            <span class="dock-card-tick" data-dock-now-tick>—</span>
+          </div>
+          <div class="dock-card-body">
+            <div class="dock-now-row">
+              <span class="presence-dot" data-dock-now-presence></span>
+              <span class="dock-now-label" data-dock-now-label>idle</span>
+            </div>
+            <div class="dock-now-detail" data-dock-now-detail>—</div>
+          </div>
+        </div>
+
+        <div class="dock-card dock-goal" data-dock-goal hidden>
+          <div class="dock-card-head">
+            <span class="dock-card-tag">ACTIVE GOAL</span>
+            <span class="dock-card-tick" data-dock-goal-turns>0/0</span>
+          </div>
+          <div class="dock-card-body">
+            <div class="dock-goal-obj" data-dock-goal-objective>—</div>
+            <div class="dock-progress">
+              <span class="dock-progress-fill" data-dock-goal-progress style="width:0%"></span>
+            </div>
+            <div class="dock-goal-judge" data-dock-goal-judge>—</div>
+          </div>
+        </div>
+
+        <div class="dock-card dock-live" data-dock-live>
+          <div class="dock-card-head">
+            <span class="dock-card-tag">CLEMENTINE LIVE</span>
+            <span class="dock-card-tick" data-dock-live-phase>STANDBY</span>
+          </div>
+          <div class="dock-card-body dock-live-body">
+            <button type="button" class="dock-live-orb" data-dock-live-toggle aria-label="Toggle voice">
+              <span class="dock-live-orb-ring"></span>
+              <span class="dock-live-orb-core">
+                <img src="/console/icon.png" alt="" />
+              </span>
+            </button>
+            <div class="dock-live-info">
+              <div class="dock-live-status" data-dock-live-status>tap to talk</div>
+              <div class="dock-live-meta" data-dock-live-meta>voice off</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="dock-card dock-recent" data-dock-recent>
+          <div class="dock-card-head">
+            <span class="dock-card-tag">RECENT</span>
+            <span class="dock-card-tick" data-dock-recent-count>0</span>
+          </div>
+          <div class="dock-card-body dock-recent-list" data-dock-recent-list>
+            <div class="dock-empty">— quiet —</div>
+          </div>
+        </div>
+
+        <div class="dock-card dock-health" data-dock-health>
+          <div class="dock-card-head">
+            <span class="dock-card-tag">HEALTH</span>
+            <span class="dock-card-tick" data-dock-health-overall>—</span>
+          </div>
+          <div class="dock-card-body dock-health-grid">
+            <div class="dock-health-cell" data-dock-health-daemon>
+              <span class="presence-dot"></span><span>daemon</span>
+            </div>
+            <div class="dock-health-cell" data-dock-health-db>
+              <span class="presence-dot"></span><span>memory.db</span>
+            </div>
+            <div class="dock-health-cell" data-dock-health-mcp>
+              <span class="presence-dot"></span><span>mcp</span>
+            </div>
+            <div class="dock-health-cell" data-dock-health-composio>
+              <span class="presence-dot"></span><span>composio</span>
+            </div>
+          </div>
+        </div>
+
+      </div>
     </nav>
 
     <main class="panel" data-active-panel="home">
@@ -115,52 +202,33 @@ export function renderConsoleHtml(token: string): string {
       <section class="panel-frame" data-section="home">
         <div class="panel-tag">PANEL · 01 · HOME</div>
 
-        <div class="panel-body home-layout">
+        <!--
+          Home panel — focused layout. Page itself never scrolls; each
+          card scrolls internally if its content overflows. The nav-dock
+          (left sidebar) carries the at-a-glance monitoring (NOW, RECENT,
+          HEALTH) so the home page can stay focused on:
+            1. agenda — what needs you and what's running (left col)
+            2. chat — the IM-style conversation (right col, focal)
+            3. CLEMENTINE LIVE — voice, with its own card; click to enter
+               takeover mode (orb fills the entire home panel).
+        -->
+        <div class="panel-body home-layout" data-home-layout>
 
-          <header class="home-welcome">
-            <div class="home-greet">
+          <header class="home-greet-strip">
+            <div class="home-greet-text">
               <h2 data-home-greeting>Hello.</h2>
               <p data-home-sub>Loading status…</p>
-              <div class="home-away">
-                <span class="presence-dot" data-home-agent-presence></span>
-                <span data-home-away-message>Reading the room…</span>
-              </div>
             </div>
-            <div class="home-tiles">
-              <button class="home-tile" data-home-tile="approvals">
-                <span class="home-tile-label">approvals</span>
-                <span class="home-tile-value" data-home-approvals>—</span>
-              </button>
-              <button class="home-tile" data-home-tile="plans">
-                <span class="home-tile-label">plans</span>
-                <span class="home-tile-value" data-home-plans>—</span>
-              </button>
-              <button class="home-tile" data-home-tile="proposals">
-                <span class="home-tile-label">proposals</span>
-                <span class="home-tile-value" data-home-proposals>—</span>
-              </button>
-              <button class="home-tile" data-home-tile="checkins">
-                <span class="home-tile-label">check-ins</span>
-                <span class="home-tile-value" data-home-checkins>—</span>
-              </button>
-              <button class="home-tile" data-home-tile="activity">
-                <span class="home-tile-label">working</span>
-                <span class="home-tile-value" data-home-working-count>—</span>
-              </button>
-              <button class="home-tile" data-home-tile="memory">
-                <span class="home-tile-label">memory</span>
-                <span class="home-tile-value" data-home-memory-health>—</span>
-              </button>
-              <button class="home-tile" data-home-tile="integrations">
-                <span class="home-tile-label">tools</span>
-                <span class="home-tile-value" data-home-tools-ready>—</span>
-              </button>
+            <div class="home-greet-status">
+              <span class="presence-dot" data-home-agent-presence></span>
+              <span data-home-away-message>Reading the room…</span>
             </div>
           </header>
 
-          <section class="home-command">
-            <div class="home-command-primary">
-              <div class="home-block home-command-card home-needs">
+          <div class="home-main">
+
+            <div class="home-main-left">
+              <div class="home-block home-needs">
                 <div class="home-block-head">
                   <span>NEEDS YOU</span>
                   <em data-home-needs-count>—</em>
@@ -170,7 +238,7 @@ export function renderConsoleHtml(token: string): string {
                 </div>
               </div>
 
-              <div class="home-block home-command-card home-working">
+              <div class="home-block home-working">
                 <div class="home-block-head">
                   <span>WORKING NOW</span>
                   <em data-home-active-count>—</em>
@@ -183,115 +251,89 @@ export function renderConsoleHtml(token: string): string {
                   <div class="home-empty">— no active workers yet —</div>
                 </div>
               </div>
+
+              <!--
+                CLEMENTINE LIVE — its own card on home. Click anywhere
+                outside the orb to enter takeover mode (orb fills the
+                panel). Clicking the orb directly enters takeover AND
+                starts voice in one motion. The voice JS hooks
+                (data-home-voice-*) are preserved so the existing
+                Realtime / Recall integrations keep working.
+              -->
+              <div class="home-block home-live" data-home-live-card role="button" tabindex="0" aria-label="Activate Clementine Live">
+                <div class="home-live-head">
+                  <span class="home-live-label">CLEMENTINE LIVE</span>
+                  <span class="home-live-phase" data-home-voice-phase>STANDBY</span>
+                </div>
+                <div class="home-live-stage" data-home-voice-panel>
+                  <button type="button" class="home-voice-orb-button" data-home-voice-toggle aria-label="Start live voice">
+                    <span class="home-voice-ring ring-a" aria-hidden="true"></span>
+                    <span class="home-voice-ring ring-b" aria-hidden="true"></span>
+                    <span class="home-voice-core">
+                      <img src="/console/icon.png" alt="" class="home-voice-avatar" />
+                      <span class="home-voice-face mouth" aria-hidden="true"></span>
+                      <span class="home-voice-face cheek cheek-left" aria-hidden="true"></span>
+                      <span class="home-voice-face cheek cheek-right" aria-hidden="true"></span>
+                      <span class="home-voice-scan" aria-hidden="true"></span>
+                    </span>
+                    <span class="home-voice-wave" aria-hidden="true">
+                      <i></i><i></i><i></i><i></i>
+                    </span>
+                  </button>
+                  <div class="home-live-copy">
+                    <div class="home-live-cta">Tap to talk</div>
+                    <div class="home-live-sub" data-home-voice-status>or say "hey Clementine" (coming soon)</div>
+                  </div>
+                  <audio data-home-voice-audio autoplay></audio>
+                </div>
+              </div>
             </div>
 
-            <aside class="home-command-side">
-              <div class="home-block home-memory-card">
+            <div class="home-main-right">
+              <div class="home-block home-chat home-chat-dock">
                 <div class="home-block-head">
-                  <span>MEMORY PULSE</span>
-                  <em data-home-memory-card-meta>—</em>
+                  <span>CHAT DOCK</span>
+                  <span class="home-chat-meta" data-home-chat-meta>local session</span>
                 </div>
-                <div class="home-block-body" data-home-memory-pulse>
-                  <div class="home-empty">— loading memory —</div>
+                <div class="home-chat-thread" data-home-chat-thread>
+                  <div class="home-chat-hint">
+                    <div class="home-chat-hint-title">Instant message Clementine.</div>
+                    <div class="home-chat-hint-sub">Try a quick prompt to get started:</div>
+                    <div class="home-chat-suggestions">
+                      <button type="button" class="home-chat-suggest" data-home-chat-suggest="what's on my plate today">what's on my plate today</button>
+                      <button type="button" class="home-chat-suggest" data-home-chat-suggest="show me my open salesforce accounts that haven't been touched in 14 days">stale Salesforce accounts</button>
+                      <button type="button" class="home-chat-suggest" data-home-chat-suggest="summarize what got done yesterday">recap yesterday</button>
+                    </div>
+                  </div>
                 </div>
+                <form class="home-chat-form" data-home-chat-form>
+                  <input type="text" class="home-chat-input" data-home-chat-input
+                    placeholder="message Clementine…" autocomplete="off" />
+                  <button type="submit" class="home-chat-send">SEND ↵</button>
+                </form>
               </div>
+            </div>
 
-              <div class="home-block home-tools-card">
-                <div class="home-block-head">
-                  <span>TOOL READINESS</span>
-                  <em data-home-tools-card-meta>—</em>
-                </div>
-                <div class="home-block-body command-list compact" data-home-tools-list>
-                  <div class="home-empty">— checking credentials —</div>
-                </div>
-              </div>
-            </aside>
-          </section>
-
-          <div class="home-block home-chat home-chat-dock">
-            <div class="home-block-head">
-              <span>CHAT DOCK</span>
-              <span class="home-chat-meta" data-home-chat-meta>local session</span>
-            </div>
-            <div class="home-chat-thread" data-home-chat-thread>
-              <div class="home-chat-hint">
-                <div class="home-chat-hint-title">Instant message Clementine.</div>
-                <div class="home-chat-hint-sub">Try a quick prompt to get started:</div>
-                <div class="home-chat-suggestions">
-                  <button type="button" class="home-chat-suggest" data-home-chat-suggest="what's on my plate today">what's on my plate today</button>
-                  <button type="button" class="home-chat-suggest" data-home-chat-suggest="show me my open salesforce accounts that haven't been touched in 14 days">stale Salesforce accounts</button>
-                  <button type="button" class="home-chat-suggest" data-home-chat-suggest="summarize what got done yesterday">recap yesterday</button>
-                </div>
-              </div>
-            </div>
-            <form class="home-chat-form" data-home-chat-form>
-              <input type="text" class="home-chat-input" data-home-chat-input
-                placeholder="message Clementine…" autocomplete="off" />
-              <button type="submit" class="home-chat-send">SEND ↵</button>
-            </form>
-            <div class="home-voice-panel" data-home-voice-panel>
-              <button type="button" class="home-voice-orb-button" data-home-voice-toggle aria-label="Start live voice" title="Start live voice">
-                <span class="home-voice-ring ring-a" aria-hidden="true"></span>
-                <span class="home-voice-ring ring-b" aria-hidden="true"></span>
-                <span class="home-voice-core">
-                  <img src="/console/icon.png" alt="" class="home-voice-avatar" />
-                  <span class="home-voice-face mouth" aria-hidden="true"></span>
-                  <span class="home-voice-face cheek cheek-left" aria-hidden="true"></span>
-                  <span class="home-voice-face cheek cheek-right" aria-hidden="true"></span>
-                  <span class="home-voice-scan" aria-hidden="true"></span>
-                </span>
-                <span class="home-voice-wave" aria-hidden="true">
-                  <i></i><i></i><i></i><i></i>
-                </span>
-              </button>
-              <div class="home-voice-copy">
-                <div class="home-voice-title-row">
-                  <div class="home-voice-title">Clementine Live</div>
-                  <span class="home-voice-phase" data-home-voice-phase>STANDBY</span>
-                </div>
-                <div class="home-voice-status" data-home-voice-status>Optional: add an OpenAI API key to enable live voice.</div>
-                <div class="home-voice-transcript" data-home-voice-transcript>Voice commands that need local work route back through Clementine approvals.</div>
-                <div class="home-voice-feed" data-home-voice-feed>
-                  <span>Realtime state, local handoffs, and SDK streaming will appear here.</span>
-                </div>
-              </div>
-              <div class="home-voice-actions">
-                <button type="button" class="home-voice-btn ghost" data-home-voice-expand>FOCUS</button>
-                <button type="button" class="home-voice-btn ghost" data-home-voice-handoff disabled>SEND LAST TURN</button>
-              </div>
-              <audio data-home-voice-audio autoplay></audio>
-            </div>
           </div>
 
-          <div class="home-secondary home-bottom-grid">
-            <div class="home-block home-agenda">
-              <div class="home-block-head">
-                <span>LINED UP TODAY</span>
-                <em data-home-agenda-count>—</em>
-              </div>
-              <div class="home-block-body" data-home-agenda>
-                <div class="home-empty">— loading —</div>
-              </div>
+          <!--
+            Takeover overlay — only visible when .home-layout has class
+            .live-takeover (toggled by clicking the LIVE card). The orb,
+            transcript, and live-feed live IN-PLACE inside the LIVE card
+            via CSS positioning, but this overlay holds the takeover-only
+            chrome (exit button, big transcript, send-last-turn action).
+          -->
+          <div class="home-live-takeover-chrome" data-home-live-takeover hidden>
+            <button type="button" class="home-live-close" data-home-live-close aria-label="Exit live mode" title="Exit live mode">✕  exit live</button>
+            <div class="home-live-takeover-transcript" data-home-voice-transcript>
+              Voice transcript will appear here while Clementine is listening.
             </div>
-
-            <div class="home-block home-done">
-              <div class="home-block-head">
-                <span>COMPLETED TODAY</span>
-                <em data-home-done-count>—</em>
-              </div>
-              <div class="home-block-body" data-home-done>
-                <div class="home-empty">— loading —</div>
-              </div>
+            <div class="home-live-takeover-feed" data-home-voice-feed>
+              <span>Tool calls + SDK events stream here in real time.</span>
             </div>
-
-            <div class="home-block home-recent">
-              <div class="home-block-head">
-                <span>RECENTLY COMPLETED</span>
-                <em data-home-recent-count>—</em>
-              </div>
-              <div class="home-block-body command-list compact" data-home-recent-list>
-                <div class="home-empty">— loading recent work —</div>
-              </div>
+            <div class="home-live-takeover-actions">
+              <button type="button" class="home-voice-btn" data-home-voice-handoff disabled>SEND LAST TURN TO CHAT</button>
+              <span class="home-live-takeover-hint">say "hey Clementine" — coming soon · press <kbd>Esc</kbd> to exit</span>
             </div>
           </div>
 
@@ -374,8 +416,8 @@ export function renderConsoleHtml(token: string): string {
           <div class="mem-main">
             <div class="mem-toolbar">
               <div class="mem-view-toggle">
-                <button class="mem-view-btn active" data-mem-view="viewer">VIEWER</button>
-                <button class="mem-view-btn" data-mem-view="graph">GRAPH</button>
+                <button class="mem-view-btn" data-mem-view="viewer" onclick="window.__clementineMemoryView && window.__clementineMemoryView('viewer'); return false;">VIEWER</button>
+                <button class="mem-view-btn active" data-mem-view="graph" onclick="window.__clementineMemoryView && window.__clementineMemoryView('graph'); return false;">GRAPH</button>
               </div>
               <div class="mem-search">
                 <input type="search" class="mem-search-input" data-mem-search
@@ -385,14 +427,14 @@ export function renderConsoleHtml(token: string): string {
               </div>
             </div>
 
-            <div class="mem-viewer" data-mem-viewer>
+            <div class="mem-viewer" data-mem-viewer hidden>
               <div class="mem-empty">
                 <div class="mem-empty-mark">▢</div>
                 <div class="mem-empty-text">SEARCH OR SELECT A FILE / FACT</div>
               </div>
             </div>
 
-            <div class="mem-graph" data-mem-graph hidden>
+            <div class="mem-graph" data-mem-graph>
               <div class="mem-graph-topbar">
                 <div class="mem-graph-controls">
                   <button type="button" data-mem-graph-refresh>REFRESH</button>
@@ -541,7 +583,7 @@ export function renderConsoleHtml(token: string): string {
           <aside class="wf-list-pane">
             <div class="wf-list-head">
               <span>WORKFLOWS</span>
-              <button class="wf-new-btn" data-wf-new title="Create new workflow">＋ NEW</button>
+              <span class="wf-new-btn" data-wf-new role="button" tabindex="0" title="Create new workflow" onclick="window.__clementineStartNewWorkflow && window.__clementineStartNewWorkflow();">＋ NEW</span>
             </div>
             <ol class="wf-list" data-wf-list>
               <li class="empty">— loading —</li>
@@ -555,7 +597,7 @@ export function renderConsoleHtml(token: string): string {
               <div class="wf-empty-text">No workflow selected</div>
               <p class="wf-empty-sub">A workflow is a multi-step task you can run on demand or on a schedule. Steps can depend on each other, share inputs, and synthesize a final output.</p>
               <div class="wf-empty-actions">
-                <button class="wf-empty-btn primary" data-wf-new>＋ NEW WORKFLOW</button>
+                <button class="wf-empty-btn primary" data-wf-new onclick="window.__clementineStartNewWorkflow && window.__clementineStartNewWorkflow();">＋ NEW WORKFLOW</button>
                 <button class="wf-empty-btn" data-wf-empty-architect>ASK ARCHITECT TO DRAFT ONE →</button>
               </div>
             </div>
@@ -718,6 +760,35 @@ export function renderConsoleHtml(token: string): string {
             </div>
             <div class="hub-apps-list" data-hub-apps-list>
               <div class="settings-info">— loading —</div>
+            </div>
+          </div>
+
+          <div class="hub-block">
+            <div class="hub-block-head">
+              <span class="hub-block-title">Native Browser Harness</span>
+              <span class="hub-block-meta" data-hub-browser-meta>—</span>
+            </div>
+            <p class="hub-block-intro">Browser Harness gives Clementine direct CDP control over your real Chrome or an optional Browser Use cloud browser. Once installed, the agent gets first-class browser_harness tools for web testing, scraping, uploads, and real browser tasks.</p>
+            <div class="hub-apps-controls" data-hub-browser-controls>
+              <div class="settings-info">— loading —</div>
+            </div>
+            <div class="hub-apps-list" data-hub-browser-list>
+              <div class="settings-info">— loading —</div>
+            </div>
+          </div>
+
+          <div class="hub-block">
+            <div class="hub-block-head">
+              <span class="hub-block-title">Skill / CLI Installer</span>
+              <span class="hub-block-meta" data-hub-installer-meta>approved commands only</span>
+            </div>
+            <p class="hub-block-intro">Install trusted CLIs or skill repos without opening Terminal. This runner only accepts single install commands such as <code>npm install -g package</code>, <code>brew install formula</code>, <code>uv tool install package</code>, <code>pipx install package</code>, or GitHub repo clones.</p>
+            <div class="hub-apps-controls" data-hub-installer-controls>
+              <input type="text" data-hub-install-command placeholder="npm install -g some-cli" />
+              <button data-hub-install-run>RUN INSTALL</button>
+            </div>
+            <div class="hub-apps-list" data-hub-installer-list>
+              <div class="settings-info">— paste an approved install command above. Output will stream here. —</div>
             </div>
           </div>
 
@@ -1326,6 +1397,240 @@ body {
   border-color: var(--accent-2);
   color: var(--accent-2);
 }
+
+/* -- Nav dock (the AIM "buddy info" zone) ------------------------
+ * Lives under the 10 menu items inside .sidebar, fills the dead
+ * vertical space with stacked status cards. The sidebar is a flex
+ * column; the dock uses margin-top:auto so it pins to the bottom of
+ * the available space and the menu sits on top.
+ *
+ * Cards are fixed-height where possible so the nav never scrolls;
+ * only the RECENT card scrolls internally when its event list grows.
+ */
+.nav-dock {
+  margin-top: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 10px 12px;
+  min-height: 0;
+  overflow: hidden;
+}
+.dock-card {
+  border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--bg-0) 56%, var(--bg-1));
+  display: flex;
+  flex-direction: column;
+  flex: 0 0 auto;
+}
+.dock-card-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 5px 9px 4px;
+  border-bottom: 1px dashed var(--line);
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  color: var(--fg-3);
+  text-transform: uppercase;
+}
+.dock-card-tag {
+  font-weight: 600;
+}
+.dock-card-tick {
+  color: var(--fg-2);
+  letter-spacing: 0.1em;
+  font-size: 9px;
+}
+.dock-card-body {
+  padding: 6px 9px 8px;
+  font-size: 10.5px;
+  color: var(--fg);
+  line-height: 1.35;
+}
+.dock-empty {
+  color: var(--fg-3);
+  font-style: italic;
+  font-size: 10px;
+}
+
+/* NOW */
+.dock-now-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.dock-now-label {
+  color: var(--fg);
+}
+.dock-now-detail {
+  color: var(--fg-2);
+  font-size: 10px;
+  margin-top: 3px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ACTIVE GOAL */
+.dock-goal-obj {
+  font-size: 10.5px;
+  color: var(--fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin-bottom: 5px;
+}
+.dock-progress {
+  width: 100%;
+  height: 4px;
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  overflow: hidden;
+  margin-bottom: 4px;
+}
+.dock-progress-fill {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  transition: width 220ms ease;
+}
+.dock-goal-judge {
+  color: var(--fg-3);
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+/* CLEMENTINE LIVE */
+.dock-live-body {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 9px 9px;
+}
+.dock-live-orb {
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  position: relative;
+  width: 38px;
+  height: 38px;
+  flex: 0 0 38px;
+}
+.dock-live-orb-ring {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  border: 1px solid var(--accent);
+  opacity: 0.4;
+}
+.dock-live-orb-core {
+  position: absolute;
+  inset: 4px;
+  border-radius: 50%;
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+.dock-live-orb-core img {
+  width: 28px;
+  height: 28px;
+  object-fit: contain;
+}
+.dock-live.live .dock-live-orb-ring {
+  border-color: var(--accent-2);
+  opacity: 1;
+  animation: dock-live-pulse 1.4s ease-in-out infinite;
+}
+@keyframes dock-live-pulse {
+  0%, 100% { transform: scale(1); opacity: 0.55; }
+  50%      { transform: scale(1.15); opacity: 0.95; }
+}
+.dock-live-info {
+  min-width: 0;
+}
+.dock-live-status {
+  color: var(--fg);
+  font-size: 10.5px;
+}
+.dock-live-meta {
+  color: var(--fg-3);
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  margin-top: 2px;
+}
+
+/* RECENT */
+.dock-recent-list {
+  max-height: 92px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 10px;
+}
+.dock-recent-row {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  color: var(--fg-2);
+  line-height: 1.35;
+}
+.dock-recent-row.ok   { color: var(--fg); }
+.dock-recent-row.warn { color: var(--accent-warn); }
+.dock-recent-row.err  { color: var(--accent-fail); }
+.dock-recent-row .t {
+  color: var(--fg-3);
+  font-size: 9px;
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+.dock-recent-row .n {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* HEALTH */
+.dock-health-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px 8px;
+  font-size: 9.5px;
+  letter-spacing: 0.04em;
+}
+.dock-health-cell {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--fg-2);
+}
+.dock-health-cell .presence-dot {
+  width: 7px;
+  height: 7px;
+  margin-top: 0;
+}
+.dock-health-cell.warn { color: var(--accent-warn); }
+.dock-health-cell.err  { color: var(--accent-fail); }
+
+@media (max-height: 760px) {
+  /* On short viewports the recent feed gets the squeeze first. */
+  .dock-recent-list { max-height: 64px; }
+}
+@media (max-height: 660px) {
+  /* If we really run out of room, fold recent + health into compact rows. */
+  .dock-health-grid { grid-template-columns: 1fr 1fr 1fr 1fr; }
+  .dock-recent-list { max-height: 44px; }
+}
+
 .nav-foot {
   margin-top: auto;
   padding: 14px 16px;
@@ -1365,55 +1670,63 @@ body {
 }
 
 /* ── Home panel ───────────────────────────────────────────────── */
+/* No page-level scroll. The page itself is a fixed-height grid; each
+   card inside scrolls internally if its content overflows. */
 .home-layout {
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-  padding: 14px 18px 18px;
-  overflow-y: auto;
-  height: 100%;
-}
-.home-welcome {
   display: grid;
-  grid-template-columns: minmax(260px, 0.85fr) minmax(360px, 1.35fr);
-  gap: 14px;
-  align-items: stretch;
+  grid-template-rows: auto 1fr;
+  gap: 12px;
+  padding: 14px 18px 18px;
+  overflow: hidden;
+  height: 100%;
+  position: relative; /* anchor the takeover overlay */
 }
-.home-greet {
+/* Compact greet strip — single horizontal row at the top of home.
+   Replaces the old home-welcome + 7 home-tiles block (those stats now
+   live in the nav-dock NOW card). */
+.home-greet-strip {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 10px 14px;
   border: 1px solid var(--line);
   background:
-    linear-gradient(135deg, color-mix(in srgb, var(--accent) 9%, transparent), transparent 46%),
+    linear-gradient(135deg, color-mix(in srgb, var(--accent) 7%, transparent), transparent 56%),
     var(--bg-1);
-  padding: 16px 18px;
-  min-height: 132px;
+  min-height: 50px;
+}
+.home-greet-text {
   display: flex;
-  flex-direction: column;
-  justify-content: center;
+  align-items: baseline;
+  gap: 12px;
+  min-width: 0;
 }
-.home-greet h2 {
-  margin: 0 0 6px;
+.home-greet-text h2 {
+  margin: 0;
   font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
-  font-size: 22px;
+  font-size: 18px;
   letter-spacing: 0.01em;
+  white-space: nowrap;
 }
-.home-greet p {
+.home-greet-text p {
   margin: 0;
   color: var(--fg-2);
   font-size: 11px;
-  letter-spacing: 0.08em;
-  line-height: 1.55;
+  letter-spacing: 0.06em;
+  line-height: 1.4;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.home-away {
+.home-greet-status {
   display: flex;
-  gap: 8px;
-  align-items: flex-start;
-  margin-top: 12px;
-  padding: 8px 10px;
-  border: 1px dashed var(--line);
-  background: color-mix(in srgb, var(--bg-0) 56%, transparent);
+  align-items: center;
+  gap: 7px;
   color: var(--fg);
   font-size: 11px;
-  line-height: 1.4;
+  letter-spacing: 0.06em;
+  flex: 0 0 auto;
 }
 .presence-dot {
   width: 9px;
@@ -1422,72 +1735,33 @@ body {
   background: var(--accent-2);
   box-shadow: 0 0 9px color-mix(in srgb, var(--accent-2) 52%, transparent);
   flex: 0 0 auto;
-  margin-top: 3px;
 }
 .presence-dot.needs-you,
 .presence-dot.warn { background: var(--accent-warn); box-shadow: 0 0 9px color-mix(in srgb, var(--accent-warn) 52%, transparent); }
 .presence-dot.working { background: var(--accent-3); box-shadow: 0 0 9px color-mix(in srgb, var(--accent-3) 52%, transparent); }
 .presence-dot.offline { background: var(--accent-fail); box-shadow: 0 0 9px color-mix(in srgb, var(--accent-fail) 52%, transparent); }
-.home-tiles {
+/* Two-column main: agenda + LIVE on the left, CHAT on the right.
+   Both columns fill the available height (1fr in the parent grid).
+   Each card inside uses min-height: 0 so its body can scroll instead
+   of expanding the page. */
+.home-main {
   display: grid;
-  grid-template-columns: repeat(4, minmax(90px, 1fr));
-  gap: 8px;
+  grid-template-columns: minmax(280px, 0.85fr) minmax(360px, 1.4fr);
+  gap: 12px;
+  min-height: 0; /* critical: lets children's overflow:auto actually scroll */
 }
-.home-tile {
-  background: var(--bg-1);
-  border: 1px solid var(--line);
-  color: var(--fg);
-  font: inherit;
-  min-height: 62px;
-  padding: 9px 10px;
-  text-align: left;
-  cursor: pointer;
-  display: flex;
-  flex-direction: column;
-  justify-content: space-between;
-  transition: background 120ms, border-color 120ms, transform 120ms;
-}
-.home-tile:hover {
-  background: var(--bg-2);
-  border-color: var(--line-bright);
-}
-.home-tile.has-activity { border-color: color-mix(in srgb, var(--accent) 55%, var(--line)); }
-.home-tile.high {
-  border-color: var(--accent);
-  box-shadow: inset 2px 0 0 var(--accent);
-}
-.home-tile-label {
-  color: var(--fg-3);
-  font-size: 9px;
-  letter-spacing: 0.16em;
-  text-transform: uppercase;
-}
-.home-tile-value {
-  font-size: 20px;
-  letter-spacing: 0.04em;
-}
-.home-command {
+.home-main-left {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 320px;
-  gap: 14px;
-  min-height: 250px;
+  grid-template-rows: minmax(0, 1fr) minmax(0, 1fr) auto;
+  gap: 12px;
+  min-height: 0;
 }
-.home-command-primary {
+.home-main-right {
   display: grid;
-  grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
-  gap: 14px;
-  min-width: 0;
+  min-height: 0;
 }
-.home-command-side {
-  display: grid;
-  grid-template-rows: 1fr 1fr;
-  gap: 14px;
-  min-width: 0;
-}
-.home-command-card,
-.home-memory-card,
-.home-tools-card,
-.home-recent {
+.home-needs,
+.home-working {
   min-height: 0;
 }
 .home-current-objective {
@@ -1509,49 +1783,222 @@ body {
 .command-list.compact .home-item {
   padding: 6px 0;
 }
+
+/* CLEMENTINE LIVE card — third card in left column. Whole card is a
+   button; clicking enters takeover mode. Compact by default; the
+   takeover state grows the orb and shows the transcript chrome. */
+.home-live {
+  background:
+    radial-gradient(circle at 25% 0%, color-mix(in srgb, var(--accent) 14%, transparent), transparent 55%),
+    var(--bg-1);
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--line));
+  color: var(--fg);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  transition: border-color 160ms, background 160ms;
+  overflow: hidden;
+}
+.home-live:hover {
+  border-color: var(--accent);
+  background:
+    radial-gradient(circle at 25% 0%, color-mix(in srgb, var(--accent) 22%, transparent), transparent 55%),
+    var(--bg-1);
+}
+.home-live-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 14px;
+  border-bottom: 1px dashed var(--line);
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  color: var(--fg-3);
+  text-transform: uppercase;
+}
+.home-live-label {
+  font-weight: 600;
+}
+.home-live-phase {
+  color: var(--accent);
+  letter-spacing: 0.1em;
+}
+.home-live-stage {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px 14px;
+}
+.home-live-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.home-live-cta {
+  font-size: 13px;
+  letter-spacing: 0.04em;
+  color: var(--fg);
+}
+.home-live-sub {
+  font-size: 10px;
+  letter-spacing: 0.05em;
+  color: var(--fg-3);
+}
+
+/* CHAT — full height of the right column, internal scroll for thread. */
 .home-chat-dock {
-  min-height: 260px;
-  max-height: 430px;
+  height: 100%;
+  min-height: 0;
 }
 .home-chat {
   display: flex;
   flex-direction: column;
-  flex: 0 0 auto;
+  min-height: 0;
   /* Subtle warm tint so the chat block reads as the focal point. */
   background:
     linear-gradient(180deg, rgba(255, 170, 80, var(--card-tint, 0.03)) 0%, transparent 30%),
     var(--bg-1);
   border-left: 2px solid var(--accent);
 }
-.home-secondary {
-  display: grid;
-  grid-template-columns: 1fr 1fr 1fr;
-  gap: 14px;
-  min-height: 220px;
-  max-height: 280px;
+.home-chat .home-chat-thread {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
 }
+
+/* TAKEOVER state — when the LIVE card is clicked, .home-layout gets
+   the .live-takeover class. Everything else is hidden; LIVE goes
+   absolute-fill so the orb owns the whole panel. */
+.home-layout.live-takeover .home-greet-strip,
+.home-layout.live-takeover .home-main-left > :not(.home-live),
+.home-layout.live-takeover .home-main-right {
+  display: none;
+}
+.home-layout.live-takeover .home-main {
+  grid-template-columns: 1fr;
+}
+.home-layout.live-takeover .home-main-left {
+  grid-template-rows: 1fr;
+}
+.home-layout.live-takeover .home-live {
+  cursor: default;
+  min-height: 0;
+}
+.home-layout.live-takeover .home-live-stage {
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  gap: 22px;
+  padding: 28px;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+.home-layout.live-takeover .home-live-stage .home-voice-orb-button {
+  width: 180px;
+  height: 180px;
+  transform: scale(1);
+}
+.home-layout.live-takeover .home-live-stage .home-voice-avatar {
+  width: 116px;
+  height: 116px;
+}
+.home-layout.live-takeover .home-live-copy {
+  text-align: center;
+  gap: 6px;
+}
+.home-layout.live-takeover .home-live-cta {
+  font-size: 22px;
+  letter-spacing: 0.02em;
+}
+.home-layout.live-takeover .home-live-sub {
+  font-size: 12px;
+  letter-spacing: 0.08em;
+}
+.home-live-takeover-chrome {
+  position: absolute;
+  inset: 14px 18px 18px;
+  display: none; /* shown only via .live-takeover */
+  flex-direction: column;
+  pointer-events: none; /* let clicks through to the orb, except buttons */
+}
+.home-layout.live-takeover .home-live-takeover-chrome {
+  display: flex;
+}
+.home-live-takeover-chrome > * {
+  pointer-events: auto;
+}
+.home-live-close {
+  align-self: flex-start;
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  padding: 6px 12px;
+  cursor: pointer;
+}
+.home-live-close:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.home-live-takeover-transcript {
+  margin: 14px 0 6px;
+  padding: 14px 18px;
+  border: 1px dashed var(--line);
+  background: color-mix(in srgb, var(--bg-0) 58%, transparent);
+  color: var(--fg);
+  font-size: 13px;
+  line-height: 1.5;
+  max-height: 140px;
+  overflow-y: auto;
+}
+.home-live-takeover-feed {
+  padding: 10px 14px;
+  border: 1px solid var(--line);
+  background: var(--bg-0);
+  color: var(--fg-2);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  max-height: 90px;
+  overflow-y: auto;
+  margin-bottom: 8px;
+}
+.home-live-takeover-actions {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  margin-top: auto;
+  padding: 8px 0 0;
+}
+.home-live-takeover-hint {
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  color: var(--fg-3);
+  text-transform: uppercase;
+}
+.home-live-takeover-hint kbd {
+  border: 1px solid var(--line);
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-family: ui-monospace, monospace;
+  font-size: 9px;
+  color: var(--fg-2);
+  background: var(--bg-1);
+}
+
 @media (max-width: 900px) {
-  .home-welcome,
-  .home-command,
-  .home-command-primary {
+  .home-main {
     grid-template-columns: 1fr;
   }
-  .home-command-side {
-    grid-template-columns: 1fr 1fr;
-    grid-template-rows: auto;
-  }
-  .home-tiles {
-    grid-template-columns: repeat(2, minmax(110px, 1fr));
-  }
-  .home-secondary {
-    grid-template-columns: 1fr;
-    max-height: none;
-  }
-}
-@media (max-width: 640px) {
-  .home-command-side,
-  .home-tiles {
-    grid-template-columns: 1fr;
+  .home-main-left {
+    grid-template-rows: auto auto auto;
   }
 }
 .home-block {
@@ -3133,6 +3580,7 @@ body {
 .wf-chat-title { color: var(--fg); }
 .wf-chat-meta { color: var(--accent); font-size: 10px; }
 .wf-new-btn {
+  display: inline-block;
   background: transparent;
   border: 1px solid var(--accent);
   color: var(--accent);
@@ -3154,13 +3602,23 @@ body {
 }
 .wf-list .empty { padding: 18px; color: var(--fg-mute); text-align: center; letter-spacing: 0.1em; }
 .wf-list li.wf {
-  padding: 9px 12px;
   border-bottom: 1px solid var(--line);
-  cursor: pointer;
   transition: background 100ms;
 }
 .wf-list li.wf:hover { background: var(--bg-3); }
 .wf-list li.wf.selected { background: var(--bg-3); box-shadow: inset 2px 0 0 var(--accent); }
+.wf-list .wf-select {
+  width: 100%;
+  display: block;
+  text-align: left;
+  padding: 9px 12px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  text-decoration: none;
+}
 .wf-list li.wf .name {
   color: var(--fg);
   white-space: nowrap;
@@ -4287,6 +4745,19 @@ body {
   letter-spacing: 0.14em;
   color: var(--fg-3);
   text-transform: uppercase;
+}
+.hub-install-log {
+  margin: 10px 0 0;
+  max-height: 260px;
+  overflow: auto;
+  white-space: pre-wrap;
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  padding: 10px;
+  font: 10px/1.5 var(--mono);
+  letter-spacing: 0.02em;
+  text-transform: none;
 }
 .hub-app-pill {
   font-size: 9px;
@@ -5880,8 +6351,14 @@ const CONSOLE_JS = `
     });
   });
 
-  // Home is the default panel — boot it on first paint.
-  if (!homeBooted) { homeBooted = true; bootHomePanel(); }
+  function panelFromHash() {
+    const requested = (location.hash || '').replace(/^#/, '').trim();
+    if (!requested) return 'home';
+    const panelName = requested.startsWith('workflows/') ? 'workflows' : requested;
+    return panelSections.some((section) => section.getAttribute('data-section') === panelName)
+      ? panelName
+      : 'home';
+  }
 
   // Site-wide cross-panel deep links: any element with
   // data-tools-jump="<panel>" switches to that panel on click.
@@ -5939,6 +6416,10 @@ const CONSOLE_JS = `
     wireMemoryViewToggle();
     wireMemoryGraphControls();
     await Promise.all([refreshMemoryStatus(), refreshFileList(), refreshFactList()]);
+    if (!memGraphLoaded) {
+      memGraphLoaded = true;
+      await loadMemoryGraph();
+    }
   }
   async function refreshMemoryPanel() {
     await Promise.all([refreshMemoryStatus(), refreshFileList(), refreshFactList()]);
@@ -5951,31 +6432,29 @@ const CONSOLE_JS = `
   let memGraphData = null;
   let memGraphPinnedNode = null;
   let memViewToggleBound = false;
+  let memGraphActionsBound = false;
 
   function wireMemoryViewToggle() {
-    if (memViewToggleBound) return;
-    memViewToggleBound = true;
-    document.addEventListener('click', (event) => {
-      const target = event.target;
-      if (!(target instanceof HTMLElement)) return;
-      const btn = target.closest('[data-mem-view]');
-      if (!btn) return;
-      event.preventDefault();
-      const view = btn.getAttribute('data-mem-view');
-      switchMemoryView(view);
-      if (view === 'graph') {
-        wireMemoryGraphControls();
-        if (!memGraphLoaded) {
-          memGraphLoaded = true;
-          loadMemoryGraph();
-        } else if (memGraphCy) {
-          // Refit on tab show — Cytoscape needs a resize hint when
-          // the canvas was hidden during init.
-          memGraphCy.resize();
-          memGraphCy.fit(undefined, 40);
-        }
-      }
+    document.querySelectorAll('[data-mem-view]').forEach((button) => {
+      if (button.dataset.memViewBound) return;
+      button.dataset.memViewBound = '1';
+      button.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        activateMemoryView(button.getAttribute('data-mem-view'));
+      });
     });
+    if (!memViewToggleBound) {
+      memViewToggleBound = true;
+      document.addEventListener('click', (event) => {
+        const target = event.target;
+        if (!(target instanceof HTMLElement)) return;
+        const btn = target.closest('[data-mem-view]');
+        if (!btn) return;
+        event.preventDefault();
+        activateMemoryView(btn.getAttribute('data-mem-view'));
+      });
+    }
   }
 
   function wireMemoryGraphControls() {
@@ -6012,33 +6491,36 @@ const CONSOLE_JS = `
       mem.graphSearch.dataset.bound = '1';
       mem.graphSearch.addEventListener('input', applyMemoryGraphFilters);
     }
-    document.addEventListener('click', async (event) => {
-      const target = event.target;
-      if (!(target instanceof HTMLElement)) return;
-      const action = target.closest('[data-graph-action]');
-      if (!action) return;
-      const type = action.getAttribute('data-graph-action');
-      const value = action.getAttribute('data-value') || '';
-      if (type === 'open-file' && value) {
-        switchMemoryView('viewer');
-        memSelectedFile = value;
-        memSelectedFact = null;
-        await loadFileViewer(value);
-      } else if (type === 'search' && value) {
-        switchMemoryView('viewer');
-        mem.search.value = value;
-        mem.search.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter' }));
-      } else if (type === 'filter-kind' && value) {
-        memActiveKind = value;
-        mem.kinds.querySelectorAll('.kind-pill').forEach((p) => p.classList.toggle('active', p.getAttribute('data-kind') === value));
-        switchMemoryView('viewer');
-        await refreshFactList();
-      } else if (type === 'forget-fact' && value) {
-        if (!confirm('Soft-delete fact #' + value + '?')) return;
-        await fetch(withToken('/api/console/memory/facts/' + encodeURIComponent(value) + '/forget'), { method: 'POST' });
-        await Promise.all([refreshFactList(), refreshMemoryStatus(), loadMemoryGraph({ force: true })]);
-      }
-    });
+    if (!memGraphActionsBound) {
+      memGraphActionsBound = true;
+      document.addEventListener('click', async (event) => {
+        const target = event.target;
+        if (!(target instanceof HTMLElement)) return;
+        const action = target.closest('[data-graph-action]');
+        if (!action) return;
+        const type = action.getAttribute('data-graph-action');
+        const value = action.getAttribute('data-value') || '';
+        if (type === 'open-file' && value) {
+          switchMemoryView('viewer');
+          memSelectedFile = value;
+          memSelectedFact = null;
+          await loadFileViewer(value);
+        } else if (type === 'search' && value) {
+          switchMemoryView('viewer');
+          mem.search.value = value;
+          mem.search.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter' }));
+        } else if (type === 'filter-kind' && value) {
+          memActiveKind = value;
+          mem.kinds.querySelectorAll('.kind-pill').forEach((p) => p.classList.toggle('active', p.getAttribute('data-kind') === value));
+          switchMemoryView('viewer');
+          await refreshFactList();
+        } else if (type === 'forget-fact' && value) {
+          if (!confirm('Soft-delete fact #' + value + '?')) return;
+          await fetch(withToken('/api/console/memory/facts/' + encodeURIComponent(value) + '/forget'), { method: 'POST' });
+          await Promise.all([refreshFactList(), refreshMemoryStatus(), loadMemoryGraph({ force: true })]);
+        }
+      });
+    }
   }
 
   function switchMemoryView(view) {
@@ -6055,6 +6537,22 @@ const CONSOLE_JS = `
       if (viewerEl) viewerEl.removeAttribute('hidden');
     }
   }
+
+  function activateMemoryView(view) {
+    switchMemoryView(view);
+    if (view !== 'graph') return;
+    wireMemoryGraphControls();
+    if (!memGraphLoaded) {
+      memGraphLoaded = true;
+      loadMemoryGraph();
+    } else if (memGraphCy) {
+      // Refit on tab show — Cytoscape needs a resize hint when
+      // the canvas was hidden during init.
+      memGraphCy.resize();
+      memGraphCy.fit(undefined, 40);
+    }
+  }
+  window.__clementineMemoryView = activateMemoryView;
 
   async function loadMemoryGraph(options = {}) {
     const canvas = document.querySelector('[data-mem-graph-canvas]');
@@ -6685,33 +7183,45 @@ const CONSOLE_JS = `
   let wfDraft = null;
   let wfSelectedName = null;
   let wfIsNew = false;
+  let wfItems = [];
   let wfChatHistory = [];
   let wfChatBusy = false;
 
   async function bootWorkflowsPanel() {
-    // Event delegation across the whole panel — covers both the
-    // sidebar "+ NEW" button AND the empty-state buttons that get
-    // re-rendered when the editor swaps. Plus a direct binding on
-    // the sidebar button as belt-and-suspenders.
-    const wfPanel = document.querySelector('[data-section="workflows"]');
-    if (wfPanel) {
-      wfPanel.addEventListener('click', (event) => {
-        const target = event.target;
-        if (!(target instanceof HTMLElement)) return;
-        if (target.closest('[data-wf-new]')) {
-          event.preventDefault();
-          startNewWorkflow();
-          return;
+    // Document-level delegation is intentional: the single-file HTML is
+    // heavily re-rendered, and these controls are identified by explicit
+    // data-wf-* attributes.
+    document.addEventListener('click', (event) => {
+      const rawTarget = event.target;
+      const target = rawTarget instanceof HTMLElement
+        ? rawTarget
+        : rawTarget instanceof Node
+          ? rawTarget.parentElement
+          : null;
+      if (!target) return;
+      const workflowSelect = target.closest('[data-wf-select]');
+      const workflowRow = workflowSelect
+        ? workflowSelect.closest('li[data-wf-name]')
+        : target.closest('li[data-wf-name]');
+      if (workflowRow) {
+        event.preventDefault();
+        const name = workflowRow.getAttribute('data-wf-name');
+        selectWorkflowByName(name);
+        return;
+      }
+      if (target.closest('[data-wf-new]')) {
+        event.preventDefault();
+        startNewWorkflow();
+        return;
+      }
+      if (target.closest('[data-wf-empty-architect]')) {
+        event.preventDefault();
+        if (wf.chatInput) {
+          wf.chatInput.value = 'Draft me a workflow for ';
+          wf.chatInput.focus();
         }
-        if (target.closest('[data-wf-empty-architect]')) {
-          event.preventDefault();
-          if (wf.chatInput) {
-            wf.chatInput.value = 'Draft me a workflow for ';
-            wf.chatInput.focus();
-          }
-        }
-      });
-    }
+      }
+    });
     // Direct binding on the sidebar button so even if delegation is
     // ever bypassed (e.g. someone re-renders the panel), the sidebar
     // + NEW still works.
@@ -6725,10 +7235,49 @@ const CONSOLE_JS = `
     await refreshWorkflowList();
   }
 
+  function selectWorkflowByName(name) {
+    if (!name || !wf.list) return;
+    wfSelectedName = name;
+    wfIsNew = false;
+    const rows = Array.from(wf.list.querySelectorAll('li.wf'));
+    rows.forEach((el) => el.classList.toggle('selected', el.getAttribute('data-wf-name') === name));
+    if (wf.editor) {
+      wf.editor.innerHTML = '<div class="wf-empty"><div class="wf-empty-mark">↻</div><div class="wf-empty-text">Loading workflow…</div></div>';
+    }
+    const cached = cachedWorkflowData(name);
+    if (cached && Array.isArray(cached.steps)) {
+      setWorkflowDraftFromData(cached);
+      return;
+    }
+    loadWorkflow(name);
+  }
+
+  window.__clementineSelectWorkflow = selectWorkflowByName;
+  // Direct global hook so the + NEW buttons can call us via inline
+  // onclick — sidestepping any event-delegation timing issues where the
+  // document listener wasn't yet bound or got swallowed by another
+  // handler upstream.
+  window.__clementineStartNewWorkflow = () => {
+    try { startNewWorkflow(); } catch (err) { console.error('startNewWorkflow failed', err); }
+  };
+
+  function workflowNameFromHash() {
+    const raw = (location.hash || '').replace(/^#/, '').trim();
+    if (!raw.startsWith('workflows/')) return null;
+    const encoded = raw.slice('workflows/'.length);
+    if (!encoded) return null;
+    try {
+      return decodeURIComponent(encoded);
+    } catch {
+      return encoded;
+    }
+  }
+
   async function refreshWorkflowList() {
     try {
       const data = await fetchJSON('/api/console/workflows');
       const items = data.workflows || [];
+      wfItems = items;
       if (items.length === 0) {
         wf.list.innerHTML = '<li class="empty">— no workflows — ＋ NEW to start —</li>';
         return;
@@ -6737,22 +7286,24 @@ const CONSOLE_JS = `
         const cls = (wfSelectedName === w.name) ? 'wf selected' : 'wf';
         const enabledPill = w.enabled ? '<span class="pill on">● APPROVED</span>' : '<span class="pill off">○ DISABLED</span>';
         const cronPill = w.triggerSchedule ? '<span class="pill cron">⏱ ' + escMem(w.triggerSchedule) + '</span>' : '';
+        const href = '#workflows/' + encodeURIComponent(w.name);
         return [
           '<li class="' + cls + '" data-wf-name="' + escMem(w.name) + '">',
-          '  <span class="name">' + escMem(w.name) + '</span>',
-          '  <span class="meta">' + enabledPill + cronPill + '<span class="pill">' + w.stepCount + ' steps</span></span>',
+          '  <a class="wf-select" data-wf-select="' + escMem(w.name) + '" href="' + href + '" onclick="window.__clementineSelectWorkflow && window.__clementineSelectWorkflow(this.getAttribute(&quot;data-wf-select&quot;));">',
+          '    <span class="name">' + escMem(w.name) + '</span>',
+          '    <span class="meta">' + enabledPill + cronPill + '<span class="pill">' + w.stepCount + ' steps</span></span>',
+          '  </a>',
           '</li>',
         ].join('');
       }).join('');
-      Array.from(wf.list.querySelectorAll('li.wf')).forEach((li) => {
-        li.addEventListener('click', () => {
-          const name = li.getAttribute('data-wf-name');
-          wfSelectedName = name;
-          wfIsNew = false;
-          Array.from(wf.list.querySelectorAll('li.wf')).forEach((el) => el.classList.toggle('selected', el === li));
-          loadWorkflow(name);
-        });
-      });
+      const hashName = workflowNameFromHash();
+      const nextSelection =
+        hashName && items.some((item) => item.name === hashName) ? hashName
+        : wfSelectedName && items.some((item) => item.name === wfSelectedName) ? wfSelectedName
+        : items[0]?.name;
+      if (nextSelection) {
+        selectWorkflowByName(nextSelection);
+      }
     } catch (err) {
       wf.list.innerHTML = '<li class="empty">— failed: ' + escMem(err.message || err) + ' —</li>';
     }
@@ -6760,21 +7311,32 @@ const CONSOLE_JS = `
 
   async function loadWorkflow(name) {
     try {
-      const data = await fetchJSON('/api/console/workflows/' + encodeURIComponent(name));
-      wfDraft = {
-        name: data.name,
-        description: data.description || '',
-        enabled: data.enabled !== false,
-        triggerSchedule: data.trigger && data.trigger.schedule ? data.trigger.schedule : '',
-        steps: Array.isArray(data.steps) ? data.steps.map((s) => ({ id: s.id, prompt: s.prompt, dependsOn: s.dependsOn || [], model: s.model })) : [],
-        inputs: data.inputs || {},
-        synthesisPrompt: data.synthesis && data.synthesis.prompt ? data.synthesis.prompt : '',
-      };
-      wfChatHistory = [];
-      renderEditor();
+      const cached = cachedWorkflowData(name);
+      const data = cached && Array.isArray(cached.steps)
+        ? cached
+        : await fetchJSON('/api/console/workflows/' + encodeURIComponent(name));
+      setWorkflowDraftFromData(data);
     } catch (err) {
       wf.editor.innerHTML = '<div class="wf-empty"><div class="wf-empty-mark">!</div><div class="wf-empty-text">' + escMem(err.message || err) + '</div></div>';
     }
+  }
+
+  function cachedWorkflowData(name) {
+    return wfItems.find((item) => item && item.name === name);
+  }
+
+  function setWorkflowDraftFromData(data) {
+    wfDraft = {
+      name: data.name,
+      description: data.description || '',
+      enabled: data.enabled !== false,
+      triggerSchedule: data.trigger && data.trigger.schedule ? data.trigger.schedule : '',
+      steps: Array.isArray(data.steps) ? data.steps.map((s) => ({ id: s.id, prompt: s.prompt, dependsOn: s.dependsOn || [], model: s.model })) : [],
+      inputs: data.inputs || {},
+      synthesisPrompt: data.synthesis && data.synthesis.prompt ? data.synthesis.prompt : '',
+    };
+    wfChatHistory = [];
+    renderEditor();
   }
 
   function startNewWorkflow() {
@@ -6818,7 +7380,7 @@ const CONSOLE_JS = `
         '  <div class="wf-empty-text">No workflow selected</div>',
         '  <p class="wf-empty-sub">A workflow is a multi-step task you can run on demand or on a schedule.</p>',
         '  <div class="wf-empty-actions">',
-        '    <button class="wf-empty-btn primary" data-wf-new>＋ NEW WORKFLOW</button>',
+        '    <button class="wf-empty-btn primary" data-wf-new onclick="window.__clementineStartNewWorkflow && window.__clementineStartNewWorkflow();">＋ NEW WORKFLOW</button>',
         '    <button class="wf-empty-btn" data-wf-empty-architect>ASK ARCHITECT TO DRAFT ONE →</button>',
         '  </div>',
         '</div>',
@@ -7874,10 +8436,32 @@ const CONSOLE_JS = `
   function bindHomeVoiceControls() {
     const toggle = document.querySelector('[data-home-voice-toggle]');
     const handoff = document.querySelector('[data-home-voice-handoff]');
-    const expand = document.querySelector('[data-home-voice-expand]');
+    const liveCard = document.querySelector('[data-home-live-card]');
+    const closeBtn = document.querySelector('[data-home-live-close]');
+    const layout = document.querySelector('[data-home-layout]');
+    const takeoverChrome = document.querySelector('[data-home-live-takeover]');
+
+    function setHomeTakeover(active) {
+      if (!layout) return;
+      layout.classList.toggle('live-takeover', Boolean(active));
+      if (takeoverChrome) takeoverChrome.hidden = !active;
+    }
+
     if (toggle && !toggle.dataset.bound) {
       toggle.dataset.bound = 'true';
-      toggle.addEventListener('click', async () => {
+      toggle.addEventListener('click', async (event) => {
+        // Stop the click from bubbling up to the LIVE card (which would
+        // re-toggle takeover). We want orb clicks to ONLY start/stop
+        // voice — entering takeover is handled by the card click below.
+        event.stopPropagation();
+        // First click anywhere on LIVE should land in takeover mode if
+        // we aren't already there. The card's own click handler will
+        // fire afterwards in the same gesture for that, but here we
+        // also flip the class so the orb's stop-propagation doesn't
+        // prevent the takeover entry.
+        if (layout && !layout.classList.contains('live-takeover')) {
+          setHomeTakeover(true);
+        }
         if (liveVoiceState.connected) stopHomeVoice();
         else await startHomeVoice();
       });
@@ -7891,13 +8475,42 @@ const CONSOLE_JS = `
         await sendHomeChat('[Voice command] ' + text);
       });
     }
-    if (expand && !expand.dataset.bound) {
-      expand.dataset.bound = 'true';
-      expand.addEventListener('click', () => {
-        liveVoiceState.focus = !liveVoiceState.focus;
-        const panel = document.querySelector('[data-home-voice-panel]');
-        if (panel) panel.classList.toggle('focus', liveVoiceState.focus);
-        expand.textContent = liveVoiceState.focus ? 'COMPACT' : 'FOCUS';
+    if (liveCard && !liveCard.dataset.bound) {
+      liveCard.dataset.bound = 'true';
+      const enter = () => {
+        if (layout?.classList.contains('live-takeover')) return; // already there
+        setHomeTakeover(true);
+      };
+      liveCard.addEventListener('click', (event) => {
+        // The orb handler stops propagation, so we only get here when
+        // the user clicked the head, copy, or stage padding — i.e.
+        // they want to enter takeover without starting voice yet.
+        if (event.target instanceof Element && event.target.closest('[data-home-voice-toggle]')) return;
+        enter();
+      });
+      liveCard.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          enter();
+        }
+      });
+    }
+    if (closeBtn && !closeBtn.dataset.bound) {
+      closeBtn.dataset.bound = 'true';
+      closeBtn.addEventListener('click', (event) => {
+        event.stopPropagation();
+        setHomeTakeover(false);
+      });
+    }
+    // Esc exits takeover. Bound once at the document level since the
+    // takeover chrome is the only thing that listens for global keys
+    // on the home page.
+    if (!document.body.dataset.liveEscBound) {
+      document.body.dataset.liveEscBound = '1';
+      document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape' && layout?.classList.contains('live-takeover')) {
+          setHomeTakeover(false);
+        }
       });
     }
   }
@@ -8266,6 +8879,7 @@ const CONSOLE_JS = `
       discord_bot_token: 'Discord bot token',
       composio_api_key: 'Composio API key',
       recall_api_key: 'Recall.ai API key',
+      browser_use_api_key: 'Browser Use API key',
       webhook_secret: 'Dashboard/webhook secret',
     };
     return labels[name] || name;
@@ -8280,6 +8894,9 @@ const CONSOLE_JS = `
     }
     if (name === 'recall_api_key') {
       return 'Optional desktop meeting capture key. Recall.ai handles recording uploads; Clementine stores transcripts locally and queues analysis tasks.';
+    }
+    if (name === 'browser_use_api_key') {
+      return 'Optional Browser Use cloud key for Browser Harness cloud browsers. Local Chrome Browser Harness does not require it.';
     }
     return descriptor?.description || '';
   }
@@ -8304,6 +8921,7 @@ const CONSOLE_JS = `
   let hubMcpEditing = null; // server name being edited; 'new' for create
   let hubAppSearch = '';
   let hubRecallEventsBound = false;
+  let hubBrowserInstallJob = null;
 
   async function bootIntegrationsHub() {
     const newBtn = document.querySelector('[data-hub-mcp-new]');
@@ -8321,6 +8939,7 @@ const CONSOLE_JS = `
         }
       });
     }
+    bindHubInstaller();
     await refreshIntegrationsHub();
   }
 
@@ -8328,6 +8947,7 @@ const CONSOLE_JS = `
     await Promise.allSettled([
       refreshHubKeys(),
       refreshHubApps(),
+      refreshHubBrowserHarness(),
       refreshHubRecall(),
       refreshHubMcp(),
     ]);
@@ -8547,6 +9167,209 @@ const CONSOLE_JS = `
       renderApps();
     } catch (err) {
       listEl.innerHTML = '<div class="settings-info" style="color:var(--accent-fail);">Composio: ' + escMem(err.message || err) + '</div>';
+    }
+  }
+
+  function renderBrowserHarnessOutput(result) {
+    if (!result) return '';
+    const lines = [
+      result.command ? '$ ' + result.command : '',
+      result.output || result.stderr || result.stdout || '',
+    ].filter(Boolean).join('\\n');
+    return '<pre class="hub-install-log">' + escMem(lines || '(no output)') + '</pre>';
+  }
+
+  async function pollBrowserHarnessJob(jobId) {
+    const listEl = document.querySelector('[data-hub-browser-list]');
+    const controlsEl = document.querySelector('[data-hub-browser-controls]');
+    if (!jobId || !listEl) return;
+    let done = false;
+    for (let i = 0; i < 240 && !done; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, i === 0 ? 300 : 1500));
+      const data = await fetchJSON('/api/console/browser-harness/install/' + encodeURIComponent(jobId));
+      const job = data.job || {};
+      done = job.status !== 'running';
+      listEl.innerHTML = [
+        '<div class="hub-app-card" style="grid-column:1/-1">',
+        '  <div class="hub-app-name">Install Browser Harness</div>',
+        '  <span class="hub-app-pill ' + (job.status === 'succeeded' ? 'active' : job.status === 'failed' ? 'failed' : 'pending') + '">' + escMem(String(job.status || 'running').toUpperCase()) + '</span>',
+        '  <div class="hub-app-meta">Installs the browser-harness CLI, keeps the editable repo at ~/Developer/browser-harness, and links its Codex skill file.</div>',
+        renderBrowserHarnessOutput(job),
+        '</div>',
+      ].join('');
+      if (done) {
+        hubBrowserInstallJob = null;
+        if (controlsEl) controlsEl.querySelectorAll('button').forEach((button) => { button.disabled = false; });
+        await refreshHubBrowserHarness();
+      }
+    }
+  }
+
+  async function pollInstallJob(jobId, listEl) {
+    if (!jobId || !listEl) return;
+    let done = false;
+    for (let i = 0; i < 240 && !done; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, i === 0 ? 300 : 1500));
+      const data = await fetchJSON('/api/console/install-jobs/' + encodeURIComponent(jobId));
+      const job = data.job || {};
+      done = job.status !== 'running';
+      listEl.innerHTML = [
+        '<div class="hub-app-card" style="grid-column:1/-1">',
+        '  <div class="hub-app-name">' + escMem(job.title || 'Install capability') + '</div>',
+        '  <span class="hub-app-pill ' + (job.status === 'succeeded' ? 'active' : job.status === 'failed' ? 'failed' : 'pending') + '">' + escMem(String(job.status || 'running').toUpperCase()) + '</span>',
+        '  <div class="hub-app-meta">Command: ' + escMem(job.command || '') + '</div>',
+        renderBrowserHarnessOutput(job),
+        '</div>',
+      ].join('');
+    }
+  }
+
+  function bindHubInstaller() {
+    const runBtn = document.querySelector('[data-hub-install-run]');
+    const input = document.querySelector('[data-hub-install-command]');
+    const listEl = document.querySelector('[data-hub-installer-list]');
+    if (!runBtn || !input || !listEl || runBtn.dataset.bound) return;
+    runBtn.dataset.bound = '1';
+    runBtn.addEventListener('click', async () => {
+      const command = (input.value || '').trim();
+      if (!command) { alert('Paste an install command first.'); return; }
+      if (!confirm('Run this install command now?\\n\\n' + command)) return;
+      runBtn.disabled = true;
+      runBtn.textContent = 'STARTING...';
+      try {
+        const r = await fetch(withToken('/api/console/install-command'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ command, title: 'Install: ' + command.slice(0, 80) }),
+        });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          alert('Install rejected: ' + (j.error || r.status));
+          return;
+        }
+        await pollInstallJob(j.job?.id, listEl);
+        await Promise.allSettled([refreshHubBrowserHarness(), refreshHubMcp(), bootSkillsPanel()]);
+      } catch (err) {
+        alert('Install failed: ' + (err.message || err));
+      } finally {
+        runBtn.disabled = false;
+        runBtn.textContent = 'RUN INSTALL';
+      }
+    });
+  }
+
+  async function refreshHubBrowserHarness() {
+    const controlsEl = document.querySelector('[data-hub-browser-controls]');
+    const listEl = document.querySelector('[data-hub-browser-list]');
+    const metaEl = document.querySelector('[data-hub-browser-meta]');
+    if (!controlsEl || !listEl || !metaEl) return;
+    try {
+      const status = await fetchJSON('/api/console/browser-harness');
+      const missingPrereqs = (status.prerequisites || []).filter((p) => !p.available);
+      metaEl.textContent = status.installed
+        ? 'installed' + (status.browserUseCloudKeyPresent ? ' · cloud key ready' : ' · local chrome mode')
+        : missingPrereqs.length > 0
+          ? 'needs ' + missingPrereqs.map((p) => p.name).join(', ')
+          : 'ready to install';
+
+      controlsEl.innerHTML = [
+        status.installed ? '<button data-hub-browser-doctor>RUN DOCTOR</button>' : '<button data-hub-browser-install>INSTALL BROWSER HARNESS</button>',
+        '<button data-hub-browser-chrome>OPEN CHROME SETUP</button>',
+        '<button data-hub-browser-test ' + (status.installed ? '' : 'disabled') + '>TEST ATTACH</button>',
+        '<button data-hub-browser-refresh>REFRESH</button>',
+        '<a href="' + escMem(status.docsUrl) + '" target="_blank" rel="noopener" style="font-size:10px;letter-spacing:0.14em;color:var(--fg-3);">docs →</a>',
+      ].join('');
+
+      const prereqRows = (status.prerequisites || []).map((p) => [
+        '<div class="row">',
+        '  <span class="k">' + escMem(p.name) + '</span>',
+        '  <span class="v">' + (p.available ? 'ready' : 'missing') + (p.version ? ' · ' + escMem(p.version) : '') + (p.path ? ' · ' + escMem(p.path) : '') + '</span>',
+        '</div>',
+      ].join('')).join('');
+      listEl.innerHTML = [
+        '<div class="hub-app-card" style="grid-column:1/-1">',
+        '  <div class="hub-app-name">Browser Harness CLI</div>',
+        '  <span class="hub-app-pill ' + (status.installed ? 'active' : missingPrereqs.length > 0 ? 'failed' : 'available') + '">' + (status.installed ? 'ACTIVE' : missingPrereqs.length > 0 ? 'PREREQS' : 'AVAILABLE') + '</span>',
+        '  <div class="hub-app-meta">Command: ' + escMem(status.commandPath || 'browser-harness missing') + '</div>',
+        '  <div class="hub-app-meta">Install dir: ' + escMem(status.installDir || '') + '</div>',
+        '  <div class="settings-info" style="margin-top:10px;">',
+        '    <div class="row"><span class="k">Version</span><span class="v">' + escMem(status.version || 'not installed') + '</span></div>',
+        '    <div class="row"><span class="k">Editable repo</span><span class="v">' + (status.repoPresent ? 'present' : 'not cloned yet') + '</span></div>',
+        '    <div class="row"><span class="k">Codex skill link</span><span class="v">' + (status.codexSkillLinked ? 'linked' : 'not linked yet') + '</span></div>',
+        '    <div class="row"><span class="k">Browser Use cloud</span><span class="v">' + (status.browserUseCloudKeyPresent ? 'key ready' : 'optional key missing') + '</span></div>',
+             prereqRows,
+        '  </div>',
+        missingPrereqs.length > 0 ? '  <div class="hub-app-meta" style="color:var(--accent-warn);margin-top:8px;">Install missing prerequisites first. Browser Harness requires git, uv, and Python 3.</div>' : '',
+        '  <div class="hub-app-card-actions" style="margin-top:10px;"><button data-hub-key-jump="browser_use_api_key">SET CLOUD KEY</button></div>',
+        '</div>',
+      ].join('');
+
+      const installBtn = controlsEl.querySelector('[data-hub-browser-install]');
+      if (installBtn) {
+        installBtn.disabled = missingPrereqs.length > 0;
+        installBtn.addEventListener('click', async () => {
+          if (!confirm('Install Browser Harness now? Clementine will clone browser-use/browser-harness into ~/Developer/browser-harness and run uv tool install -e .')) return;
+          installBtn.disabled = true;
+          installBtn.textContent = 'INSTALLING...';
+          const r = await fetch(withToken('/api/console/browser-harness/install'), { method: 'POST' });
+          const j = await r.json().catch(() => ({}));
+          if (!r.ok) {
+            alert('Install failed to start: ' + (j.error || r.status));
+            await refreshHubBrowserHarness();
+            return;
+          }
+          hubBrowserInstallJob = j.job?.id || null;
+          pollBrowserHarnessJob(hubBrowserInstallJob);
+        });
+      }
+
+      const doctorBtn = controlsEl.querySelector('[data-hub-browser-doctor]');
+      if (doctorBtn) {
+        doctorBtn.addEventListener('click', async () => {
+          doctorBtn.textContent = 'RUNNING...';
+          const r = await fetch(withToken('/api/console/browser-harness/doctor'), { method: 'POST' });
+          const j = await r.json().catch(() => ({}));
+          listEl.insertAdjacentHTML('afterbegin', renderBrowserHarnessOutput(j));
+          doctorBtn.textContent = 'RUN DOCTOR';
+        });
+      }
+
+      const chromeBtn = controlsEl.querySelector('[data-hub-browser-chrome]');
+      if (chromeBtn) {
+        chromeBtn.addEventListener('click', async () => {
+          const r = await fetch(withToken('/api/console/browser-harness/open-chrome-setup'), { method: 'POST' });
+          const j = await r.json().catch(() => ({}));
+          if (!j.ok) alert(j.output || 'Open chrome://inspect/#remote-debugging in Chrome and enable remote debugging.');
+        });
+      }
+
+      const testBtn = controlsEl.querySelector('[data-hub-browser-test]');
+      if (testBtn) {
+        testBtn.addEventListener('click', async () => {
+          testBtn.textContent = 'TESTING...';
+          const r = await fetch(withToken('/api/console/browser-harness/test'), { method: 'POST' });
+          const j = await r.json().catch(() => ({}));
+          listEl.insertAdjacentHTML('afterbegin', renderBrowserHarnessOutput(j));
+          testBtn.textContent = 'TEST ATTACH';
+        });
+      }
+
+      const refreshBtn = controlsEl.querySelector('[data-hub-browser-refresh]');
+      if (refreshBtn) refreshBtn.addEventListener('click', () => refreshHubBrowserHarness());
+      listEl.querySelectorAll('[data-hub-key-jump]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          switchPanel('settings');
+          setTimeout(() => {
+            const target = document.querySelector('[data-cred-row="' + btn.getAttribute('data-hub-key-jump') + '"]');
+            if (target) target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            const setBtn = target?.querySelector('[data-cred-set]');
+            if (setBtn) setBtn.click();
+          }, 150);
+        });
+      });
+    } catch (err) {
+      metaEl.textContent = 'error';
+      listEl.innerHTML = '<div class="settings-info" style="color:var(--accent-fail);">Browser Harness: ' + escMem(err.message || err) + '</div>';
     }
   }
 
@@ -9633,7 +10456,185 @@ const CONSOLE_JS = `
   });
 
   // Boot the loop.
+  wireMemoryViewToggle();
+  wireMemoryGraphControls();
+  // Home is the default panel, but honor deep links like
+  // /dashboard?token=...#memory after the stale-dashboard redirect.
+  switchPanel(panelFromHash());
+  window.addEventListener('hashchange', () => switchPanel(panelFromHash()));
   tick();
   setInterval(tick, POLL_MS);
+
+  // ── Nav-dock data wiring ──────────────────────────────────────────
+  // Pulls live state from the same endpoints the home panel uses, plus
+  // the recall IPC for live voice. Refreshes every 5s — same cadence
+  // as the existing home command center.
+  async function refreshDockNow() {
+    try {
+      const data = await fetchJSON('/api/console/home/agenda');
+      const working = (data.working ?? []).length;
+      const approvals = (data.needsYou ?? []).filter((e) => e && e.kind === 'approval').length;
+      const presence = document.querySelector('[data-dock-now-presence]');
+      const label = document.querySelector('[data-dock-now-label]');
+      const detail = document.querySelector('[data-dock-now-detail]');
+      const tick = document.querySelector('[data-dock-now-tick]');
+      if (!presence || !label || !detail || !tick) return;
+      if (working > 0) {
+        presence.className = 'presence-dot working';
+        label.textContent = 'working';
+        detail.textContent = (data.working[0].title || data.working[0].id || 'running').slice(0, 60);
+        tick.textContent = String(working);
+      } else if (approvals > 0) {
+        presence.className = 'presence-dot needs-you';
+        label.textContent = 'needs you';
+        detail.textContent = (data.needsYou[0].title || 'approval pending').slice(0, 60);
+        tick.textContent = String(approvals);
+      } else {
+        presence.className = 'presence-dot';
+        label.textContent = 'idle';
+        detail.textContent = 'awaiting';
+        tick.textContent = '—';
+      }
+    } catch { /* network blip — keep last state */ }
+  }
+
+  async function refreshDockGoal() {
+    // No dedicated /goal list endpoint yet — we hit the chat endpoint
+    // for /goal status from the home session. Falls back silently
+    // when there's no goal active.
+    const card = document.querySelector('[data-dock-goal]');
+    if (!card) return;
+    try {
+      const r = await fetch(withToken('/api/console/home/chat'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: '/goal status' }),
+      });
+      const j = await r.json();
+      const text = String(j?.text || '');
+      // Parse the human-readable goal-state string. Pattern is
+      // "Goal active (N/M): ..." or "Goal paused at N/M — ..." etc.
+      const m = text.match(/Goal (\\w+)\\s*\\(?(\\d+)\\/(\\d+)\\)?[:\\s—-]+\\s*(.+)/i);
+      if (m && (m[1] === 'active' || m[1] === 'paused')) {
+        const used = parseInt(m[2], 10), total = parseInt(m[3], 10);
+        const obj = m[4].replace(/^[\"']|[\"']$/g, '').trim();
+        const objective = document.querySelector('[data-dock-goal-objective]');
+        const turns = document.querySelector('[data-dock-goal-turns]');
+        const progress = document.querySelector('[data-dock-goal-progress]');
+        const judge = document.querySelector('[data-dock-goal-judge]');
+        if (objective) objective.textContent = obj.slice(0, 60);
+        if (turns) turns.textContent = used + '/' + total;
+        if (progress) progress.style.width = Math.round((used / Math.max(1, total)) * 100) + '%';
+        if (judge) judge.textContent = m[1].toUpperCase();
+        card.hidden = false;
+      } else {
+        card.hidden = true;
+      }
+    } catch {
+      card.hidden = true;
+    }
+  }
+
+  async function refreshDockLive() {
+    const phase = document.querySelector('[data-dock-live-phase]');
+    const status = document.querySelector('[data-dock-live-status]');
+    const meta = document.querySelector('[data-dock-live-meta]');
+    const card = document.querySelector('[data-dock-live]');
+    if (!phase || !status || !meta || !card) return;
+    let recall = null;
+    if (window.clemmy?.recallStatus) {
+      try { recall = await window.clemmy.recallStatus(); } catch { /* ignore */ }
+    }
+    if (recall?.recording) {
+      card.classList.add('live');
+      phase.textContent = 'REC';
+      status.textContent = (recall.lastMeeting?.title || 'recording').slice(0, 40);
+      meta.textContent = recall.lastMeeting?.platform || 'meeting capture';
+      return;
+    }
+    if (recall?.enabled && recall?.initialized) {
+      card.classList.remove('live');
+      phase.textContent = 'WATCH';
+      status.textContent = 'waiting for meeting';
+      meta.textContent = 'recall.ai · ' + (recall.settings?.region || 'us-west-2');
+      return;
+    }
+    card.classList.remove('live');
+    phase.textContent = 'STANDBY';
+    status.textContent = 'tap orb to talk';
+    meta.textContent = recall ? 'sdk loaded' : 'electron only';
+  }
+
+  async function refreshDockRecent() {
+    const list = document.querySelector('[data-dock-recent-list]');
+    const count = document.querySelector('[data-dock-recent-count]');
+    if (!list || !count) return;
+    try {
+      const data = await fetchJSON('/api/console/tool-events/recent?limit=6');
+      const events = Array.isArray(data?.events) ? data.events : [];
+      count.textContent = String(events.length);
+      if (events.length === 0) {
+        list.innerHTML = '<div class="dock-empty">— quiet —</div>';
+        return;
+      }
+      list.innerHTML = events.map((e) => {
+        const t = e.at ? new Date(e.at).toLocaleTimeString().replace(/:[0-9]{2}\\s/, ' ') : '—';
+        const ok = e.outcome === 'success' ? 'ok'
+          : e.outcome === 'error' ? 'err'
+          : e.phase === 'pending-approval' ? 'warn'
+          : '';
+        const glyph = ok === 'ok' ? '✓' : ok === 'err' ? '✗' : ok === 'warn' ? '⚠' : '·';
+        return '<div class="dock-recent-row ' + ok + '"><span class="t">' + escMem(t) + '</span><span class="n">' + glyph + ' ' + escMem(e.toolName || '?') + '</span></div>';
+      }).join('');
+    } catch {
+      list.innerHTML = '<div class="dock-empty">— activity feed offline —</div>';
+    }
+  }
+
+  async function refreshDockHealth() {
+    try {
+      const data = await fetchJSON('/api/console/health');
+      const cells = {
+        daemon: document.querySelector('[data-dock-health-daemon]'),
+        db: document.querySelector('[data-dock-health-db]'),
+        mcp: document.querySelector('[data-dock-health-mcp]'),
+        composio: document.querySelector('[data-dock-health-composio]'),
+      };
+      const overall = document.querySelector('[data-dock-health-overall]');
+      const setCell = (cell, state) => {
+        if (!cell) return;
+        cell.classList.remove('warn', 'err');
+        if (state === 'warn') cell.classList.add('warn');
+        if (state === 'err') cell.classList.add('err');
+        const dot = cell.querySelector('.presence-dot');
+        if (dot) {
+          dot.className = 'presence-dot' + (state === 'warn' ? ' warn' : state === 'err' ? ' offline' : '');
+        }
+      };
+      setCell(cells.daemon, data?.daemon || 'ok');
+      setCell(cells.db, data?.memoryDb || 'ok');
+      setCell(cells.mcp, data?.mcp || 'ok');
+      setCell(cells.composio, data?.composio || 'ok');
+      if (overall) {
+        const states = [data?.daemon, data?.memoryDb, data?.mcp, data?.composio];
+        const tone = states.includes('err') ? '✗' : states.includes('warn') ? '⚠' : '✓';
+        overall.textContent = tone;
+      }
+    } catch {
+      // Endpoint may not exist yet — surface unknown rather than error.
+      const overall = document.querySelector('[data-dock-health-overall]');
+      if (overall) overall.textContent = '—';
+    }
+  }
+
+  function refreshNavDock() {
+    refreshDockNow();
+    refreshDockGoal();
+    refreshDockLive();
+    refreshDockRecent();
+    refreshDockHealth();
+  }
+  refreshNavDock();
+  setInterval(refreshNavDock, 5000);
 })();
 `;
