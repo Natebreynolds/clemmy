@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { BASE_DIR as CONFIG_BASE_DIR } from '../config.js';
@@ -342,7 +342,33 @@ function detectProjectType(entries: string[]): string {
   return 'unknown';
 }
 
+/**
+ * macOS CloudStorage paths (OneDrive, Google Drive, iCloud File Provider, etc.)
+ * back files with on-demand hydration — read() can block indefinitely while
+ * the OS pulls the file down. There is no sync I/O timeout in Node, so the
+ * only safe option is to skip these paths entirely for nice-to-have reads.
+ *
+ * `~/Desktop` is the most common offender: OneDrive Known Folder Move
+ * symlinks `~/Desktop` to `~/Library/CloudStorage/OneDrive-*`. We canonicalize
+ * via realpath so the check catches paths that *resolve* into CloudStorage,
+ * not just literal CloudStorage paths.
+ */
+function isCloudStoragePath(dirPath: string): boolean {
+  const literal = /\/Library\/CloudStorage\//.test(dirPath) || /\/Library\/Mobile Documents\//.test(dirPath);
+  if (literal) return true;
+  try {
+    // realpath is a path-resolution syscall only — it does not pull file
+    // contents, so it stays fast even on hydrated-on-demand backings.
+    const resolved = realpathSync(dirPath);
+    return /\/Library\/CloudStorage\//.test(resolved) || /\/Library\/Mobile Documents\//.test(resolved);
+  } catch {
+    return false;
+  }
+}
+
 function extractDescription(dirPath: string, entries: string[]): string {
+  if (isCloudStoragePath(dirPath)) return '';
+
   if (entries.includes('package.json')) {
     try {
       const pkg = JSON.parse(readFileSync(path.join(dirPath, 'package.json'), 'utf-8')) as { description?: string };

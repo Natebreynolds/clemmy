@@ -3,7 +3,7 @@ import path from 'node:path';
 import {
   ACTIVE_ENV_FILES, ASSISTANT_NAME, AUTH_MODE, BASE_DIR,
   COMPOSIO_API_KEY,
-  DISCORD_BOT_TOKEN, DISCORD_ENABLED, LOCAL_MCP_ENABLED,
+  DISCORD_BOT_TOKEN, DISCORD_DM_ALLOWED_USERS, DISCORD_ENABLED, LOCAL_MCP_ENABLED,
   WEBHOOK_ENABLED, WEBHOOK_SECRET, getOpenAiApiKey, getRuntimeEnv,
 } from '../config.js';
 import { CRON_FILE, SOUL_FILE, VAULT_DIR, WORKFLOWS_DIR, WORKING_MEMORY_FILE } from '../memory/vault.js';
@@ -91,6 +91,11 @@ export async function runDoctor(): Promise<number> {
         passRow('DISCORD_INSTALL_URL', installInfo.installUrl);
       } else {
         warnRow('DISCORD_INSTALL_URL', 'Missing DISCORD_CLIENT_ID — rerun setup with a valid bot token');
+      }
+      if (DISCORD_DM_ALLOWED_USERS.length > 0) {
+        passRow('DISCORD_DM_ALLOWED_USERS', `${DISCORD_DM_ALLOWED_USERS.length} user(s) authorized for DMs`);
+      } else {
+        warnRow('DISCORD_DM_ALLOWED_USERS', 'No owner user ID set — DMs to the bot will be ignored. Run: clementine setup');
       }
     } else {
       failRow('DISCORD_BOT_TOKEN', 'DISCORD_ENABLED=true but token is missing');
