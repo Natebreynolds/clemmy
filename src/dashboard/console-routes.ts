@@ -52,10 +52,19 @@ import {
   rejectPlanProposal,
 } from '../agents/plan-proposals.js';
 import { approvePlanAndQueueBackgroundTask } from '../execution/approved-plan-tasks.js';
+import {
+  clearGoalState,
+  describeGoalState,
+  loadGoalState,
+  parseGoalCommand,
+  runGoalLoop,
+  type GoalCommand,
+} from '../agents/goal-loop.js';
 import { PlanSchema } from '../agents/planner.js';
 import { closePlanScope, listActiveScopes, listAllScopes } from '../agents/plan-scope.js';
 import type { CheckInUrgency } from '../agents/check-ins.js';
-import { createBackgroundTask } from '../execution/background-tasks.js';
+import { createBackgroundTask, listBackgroundTasks } from '../execution/background-tasks.js';
+import { listRuns } from '../runtime/run-events.js';
 import {
   appendRecallTranscriptSegment,
   createRecallSdkUpload,
@@ -140,6 +149,11 @@ function contextFileForKey(key: string): ContextFileDefinition | undefined {
   return CONTEXT_FILES.find((file) => file.key === key);
 }
 
+function trimConsoleTitle(text: string, max = 120): string {
+  const clean = text.replace(/\s+/g, ' ').trim();
+  return clean.length > max ? clean.slice(0, Math.max(0, max - 1)) + '…' : clean;
+}
+
 function readContextFile(def: ContextFileDefinition): Record<string, unknown> {
   const exists = fs.existsSync(def.filePath);
   const content = exists ? fs.readFileSync(def.filePath, 'utf-8') : '';
@@ -179,6 +193,141 @@ function realtimeNumberEnv(name: string, fallback: number, min: number, max: num
   const parsed = Number(raw);
   if (!Number.isFinite(parsed)) return fallback;
   return Math.max(min, Math.min(max, parsed));
+}
+
+/**
+ * Handle a `/goal <...>` slash command coming in through the streaming
+ * chat endpoint. Streams progress events so the dashboard can render a
+ * "Goal turn N/M" indicator and final summary inline.
+ *
+ * `status` / `clear` / `resume` are short-circuit responses. `start`
+ * drives the Ralph loop in `goal-loop.ts`.
+ */
+async function handleGoalCommand(opts: {
+  command: GoalCommand;
+  sessionId: string;
+  assistant: ClementineAssistant;
+  writeEvent: (event: Record<string, unknown>) => void;
+  shouldCancel: () => boolean;
+}): Promise<void> {
+  const { command, sessionId, assistant, writeEvent, shouldCancel } = opts;
+
+  if (command.kind === 'status') {
+    const state = loadGoalState(sessionId);
+    writeEvent({
+      type: 'done',
+      text: describeGoalState(state),
+      stoppedReason: 'success',
+    });
+    return;
+  }
+
+  if (command.kind === 'clear') {
+    const before = loadGoalState(sessionId);
+    clearGoalState(sessionId);
+    writeEvent({
+      type: 'done',
+      text: before
+        ? `Goal cleared: "${before.objective}" (was ${before.status} at ${before.turnsUsed}/${before.turnsLimit}).`
+        : 'No goal was active. Nothing to clear.',
+      stoppedReason: 'success',
+    });
+    return;
+  }
+
+  const existing = loadGoalState(sessionId);
+  const objective = command.kind === 'resume'
+    ? existing?.objective
+    : command.kind === 'start'
+      ? command.objective
+      : undefined;
+
+  if (!objective) {
+    writeEvent({
+      type: 'done',
+      text: 'No goal to resume in this session. Use `/goal <objective>` to start one.',
+      stoppedReason: 'success',
+    });
+    return;
+  }
+
+  if (command.kind === 'resume' && existing) {
+    writeEvent({
+      type: 'status',
+      text: `Resuming goal: "${objective}" (was at ${existing.turnsUsed}/${existing.turnsLimit}).`,
+    });
+  } else {
+    writeEvent({ type: 'status', text: `Starting goal: "${objective}"` });
+  }
+
+  const result = await runGoalLoop({
+    sessionId,
+    objective,
+    runtime: assistant.getRuntime(),
+    shouldCancel: () => shouldCancel(),
+    onTurnStart: ({ turn, total }) => {
+      writeEvent({
+        type: 'status',
+        text: `Goal turn ${turn}/${total}: thinking…`,
+        goalTurn: turn,
+        goalTotal: total,
+      });
+    },
+    onTurnEnd: ({ turn, done, reason }) => {
+      writeEvent({
+        type: 'status',
+        text: done
+          ? `Judge: complete after turn ${turn} (${reason}).`
+          : `Judge: not yet done after turn ${turn} (${reason}). Continuing…`,
+        goalTurn: turn,
+        goalJudgeDone: done,
+      });
+    },
+    driveAssistant: async (message) => {
+      // Each goal turn is a normal assistant.respond() call. The text
+      // we get back is what we'll surface as a chat turn.
+      const turnResponse = await assistant.respond({
+        message,
+        sessionId,
+        channel: 'cli',
+        userId: 'console',
+        onChunk: (delta) => {
+          writeEvent({ type: 'chunk', delta });
+        },
+        onToolActivity: (activity) => {
+          writeEvent({
+            type: 'tool',
+            toolName: activity.toolName,
+            input: activity.input,
+          });
+        },
+        shouldCancel: () => shouldCancel(),
+      });
+      // Emit a turn-boundary marker so the dashboard can visually
+      // separate goal turns in the same conversation thread.
+      writeEvent({
+        type: 'goal-turn-complete',
+        text: turnResponse.text,
+        pendingApprovalId: turnResponse.pendingApprovalId ?? null,
+        stoppedReason: turnResponse.stoppedReason ?? 'success',
+      });
+      return { text: turnResponse.text };
+    },
+  });
+
+  // Terminal event. The dashboard reads this to render the final
+  // affordance — "complete" / "paused → resume?" / "aborted".
+  const finalText = describeGoalState(result);
+  writeEvent({
+    type: 'done',
+    text: finalText,
+    stoppedReason: result.status === 'done' ? 'success'
+      : result.status === 'paused' ? 'max-turns-with-grace'
+      : 'cancelled',
+    turnsUsed: result.turnsUsed,
+    goalStatus: result.status,
+    goalObjective: result.objective,
+  });
 }
 
 function validateCronExpression(expr: string): boolean {
@@ -1654,6 +1803,175 @@ export function registerConsoleRoutes(
 
   // ─── Home panel ────────────────────────────────────────────────
 
+  app.get('/api/console/home/command-center', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const memory = readMemoryIndexStatus();
+      const runs = listRuns(50);
+      const approvals = assistant.getRuntime().listPendingApprovals();
+      const planProposals = listPlanProposals({ status: 'pending', limit: 20 });
+      const checkInProposals = listProposals({ status: 'pending', limit: 20 });
+      const openCheckIns = listOpenCheckIns();
+      const executions = new ExecutionStore().list(60)
+        .filter((execution) => execution.status === 'active' || execution.status === 'blocked' || execution.status === 'paused');
+      const backgroundTasks = listBackgroundTasks().slice(0, 60);
+      const activeBackgroundTasks = backgroundTasks.filter((task) =>
+        task.status === 'pending' || task.status === 'running' || task.status === 'awaiting_approval' || task.status === 'interrupted',
+      );
+      const credentialHealth = await (await getSecretStore()).health();
+      const runtimeAuth = getAuthStatus();
+      const policy = getProactivityPolicySnapshot();
+
+      const needsYou = [
+        ...approvals.slice(0, 6).map((approval) => ({
+          kind: 'approval',
+          title: `Approve ${approval.toolName || 'tool call'}`,
+          meta: approval.sessionId || approval.id,
+          panel: 'settings',
+          urgency: 'high',
+        })),
+        ...planProposals.slice(0, 4).map((proposal) => ({
+          kind: 'plan',
+          title: proposal.plan?.objective || proposal.originatingRequest || proposal.id,
+          meta: `plan ${proposal.id}`,
+          panel: 'settings',
+          urgency: 'high',
+        })),
+        ...checkInProposals.slice(0, 3).map((proposal) => ({
+          kind: 'proposal',
+          title: proposal.name || proposal.description || proposal.id,
+          meta: 'check-in proposal',
+          panel: 'settings',
+          urgency: 'normal',
+        })),
+        ...openCheckIns.slice(0, 5).map((checkIn) => ({
+          kind: 'checkin',
+          title: checkIn.question || '(check-in)',
+          meta: checkIn.urgency !== 'normal' ? `${checkIn.urgency} · ${checkIn.askedAt.slice(11, 16)}` : `asked ${checkIn.askedAt.slice(11, 16)}`,
+          panel: 'settings',
+          urgency: checkIn.urgency === 'high' ? 'high' : 'normal',
+        })),
+        ...activeBackgroundTasks.filter((task) => task.status === 'awaiting_approval').slice(0, 4).map((task) => ({
+          kind: 'background',
+          title: task.title,
+          meta: task.id,
+          panel: 'activity',
+          urgency: 'high',
+        })),
+      ].slice(0, 10).map((item) => ({ ...item, title: trimConsoleTitle(item.title, 140) }));
+
+      const workingNow = [
+        ...executions.slice(0, 6).map((execution) => ({
+          kind: execution.status,
+          title: execution.title || execution.objective || '(execution)',
+          meta: execution.nextStep ? `next: ${execution.nextStep}` : execution.status,
+          panel: 'activity',
+        })),
+        ...activeBackgroundTasks.slice(0, 6).map((task) => ({
+          kind: task.status,
+          title: task.title,
+          meta: `${task.status} · ${task.id}`,
+          panel: 'activity',
+        })),
+        ...runs.filter((run) => run.status === 'running' || run.status === 'received' || run.status === 'queued').slice(0, 6).map((run) => ({
+          kind: run.status,
+          title: run.title || run.input || run.id,
+          meta: run.channel || run.source || run.id,
+          panel: 'activity',
+        })),
+      ].slice(0, 10).map((item) => ({ ...item, title: trimConsoleTitle(item.title, 140), meta: trimConsoleTitle(item.meta || '', 100) }));
+
+      const recentCompleted = [
+        ...backgroundTasks.filter((task) => task.status === 'done').slice(0, 5).map((task) => ({
+          kind: 'done',
+          title: task.title,
+          meta: task.completedAt ? `done ${task.completedAt.slice(11, 16)}` : task.id,
+          panel: 'activity',
+        })),
+        ...runs.filter((run) => run.status === 'completed').slice(0, 5).map((run) => ({
+          kind: 'done',
+          title: run.title || run.input || run.id,
+          meta: run.completedAt ? `done ${run.completedAt.slice(11, 16)}` : run.id,
+          panel: 'activity',
+        })),
+      ].slice(0, 6).map((item) => ({ ...item, title: trimConsoleTitle(item.title, 120), meta: trimConsoleTitle(item.meta || '', 100) }));
+
+      const credentialRows = credentialHealth
+        .filter((row) => ['openai_api_key', 'discord_bot_token', 'composio_api_key', 'recall_api_key', 'codex_oauth_access_token', 'codex_oauth_refresh_token'].includes(row.name))
+        .map((row) => ({
+          name: row.name,
+          label: row.name === 'openai_api_key' ? 'OpenAI API'
+            : row.name === 'discord_bot_token' ? 'Discord'
+              : row.name === 'composio_api_key' ? 'Composio'
+                : row.name === 'recall_api_key' ? 'Recall'
+                  : row.name === 'codex_oauth_access_token' ? 'Codex access'
+                    : 'Codex refresh',
+          status: row.status,
+          hasValue: row.hasValue,
+          required: listSecretDescriptors().find((descriptor) => descriptor.name === row.name)?.required ?? false,
+          source: row.source,
+        }));
+      const requiredMissing = credentialHealth.filter((row) => {
+        const descriptor = listSecretDescriptors().find((item) => item.name === row.name);
+        return descriptor?.required && !row.hasValue;
+      }).length;
+      const connectedCredentialCount = credentialRows.filter((row) => row.hasValue).length;
+      const memoryWarnings = [
+        memory.dbPresent ? '' : 'memory db missing',
+        memory.embeddingsEnabled && memory.embeddingsCoverage < 0.99 ? 'embedding backfill incomplete' : '',
+        memory.activeFacts === 0 ? 'no durable facts yet' : '',
+      ].filter(Boolean);
+
+      const activeCount = executions.length + activeBackgroundTasks.length + runs.filter((run) => run.status === 'running' || run.status === 'received' || run.status === 'queued').length;
+      const waitingCount = needsYou.length;
+      const currentObjective = workingNow[0]?.title
+        ?? needsYou[0]?.title
+        ?? (memoryWarnings.length ? 'Memory needs attention before the graph is fully trustworthy.' : 'Standing by for the next useful task.');
+
+      res.json({
+        presence: {
+          status: waitingCount > 0 ? 'needs_you' : activeCount > 0 ? 'working' : 'online',
+          label: waitingCount > 0 ? 'needs you' : activeCount > 0 ? 'working' : 'online',
+          awayMessage: currentObjective,
+          mode: policy.policy.mode,
+          autoApproveScope: policy.policy.autoApproveScope,
+        },
+        counts: {
+          active: activeCount,
+          waiting: waitingCount,
+          approvals: approvals.length,
+          planProposals: planProposals.length,
+          checkInProposals: checkInProposals.length,
+          checkIns: openCheckIns.length,
+          runningRuns: runs.filter((run) => run.status === 'running' || run.status === 'received').length,
+          backgroundActive: activeBackgroundTasks.length,
+          requiredSetupMissing: requiredMissing,
+        },
+        needsYou,
+        workingNow,
+        recentCompleted,
+        memory: {
+          chunks: memory.chunks,
+          indexedFiles: memory.indexedFiles,
+          activeFacts: memory.activeFacts,
+          totalFacts: memory.totalFacts,
+          embeddingsEnabled: memory.embeddingsEnabled,
+          embeddingsCoverage: memory.embeddingsCoverage,
+          warnings: memoryWarnings,
+        },
+        integrations: {
+          connected: connectedCredentialCount,
+          total: credentialRows.length,
+          requiredMissing,
+          runtimeAuth,
+          credentials: credentialRows,
+        },
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   /**
    * Today's agenda + completed-today, aggregated across the most useful
    * surfaces for a single "what's the shape of today" view:
@@ -1827,6 +2145,21 @@ export function registerConsoleRoutes(
     };
 
     try {
+      // /goal slash-command interception. We do this BEFORE the normal
+      // respond() so the loop driver controls turn pacing + judging.
+      const goalCmd = parseGoalCommand(message);
+      if (goalCmd) {
+        await handleGoalCommand({
+          command: goalCmd,
+          sessionId: 'console:home',
+          assistant,
+          writeEvent,
+          shouldCancel: () => closed,
+        });
+        res.end();
+        return;
+      }
+
       writeEvent({ type: 'status', text: 'Clementine run started.' });
       const response = await assistant.respond({
         message,
@@ -1852,6 +2185,10 @@ export function registerConsoleRoutes(
         type: 'done',
         text: response.text,
         pendingApprovalId: response.pendingApprovalId ?? null,
+        // Surface why the run stopped so the dashboard can render the
+        // right affordance ([Continue] for max-turns-with-grace, etc.).
+        stoppedReason: response.stoppedReason ?? 'success',
+        turnsUsed: response.turnsUsed ?? null,
       });
       res.end();
     } catch (err) {

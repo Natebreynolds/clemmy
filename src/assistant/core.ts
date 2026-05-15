@@ -216,6 +216,11 @@ export class ClementineAssistant {
       text: result.text,
       sessionId: request.sessionId,
       pendingApprovalId: result.pendingApprovalId,
+      // Bubble the runtime's typed terminal state up to channels so
+      // they can render appropriate affordances (Continue button on
+      // 'max-turns-with-grace', etc.).
+      stoppedReason: result.stoppedReason,
+      turnsUsed: result.turnsUsed,
     };
   }
 }

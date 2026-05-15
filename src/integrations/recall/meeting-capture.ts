@@ -91,6 +91,12 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
+function isSyntheticRecallCapture(record: Pick<RecallMeetingRecord, 'windowId' | 'platform' | 'title'>): boolean {
+  return [record.windowId, record.platform, record.title]
+    .filter(Boolean)
+    .some((value) => /\b(smoke|synthetic|test-fixture|fixture)\b/i.test(String(value)));
+}
+
 function normalizeSettings(input: Partial<RecallMeetingSettings> | undefined): RecallMeetingSettings {
   const region = input?.region && input.region in RECALL_REGIONS ? input.region : DEFAULT_RECALL_MEETING_SETTINGS.region;
   return {
@@ -269,7 +275,7 @@ export function finalizeRecallMeeting(input: {
     .join('\n');
 
   let artifactPath: string | undefined;
-  if (completed.segments.length > 0) {
+  if (completed.segments.length > 0 && !isSyntheticRecallCapture(completed)) {
     ensureDir(VAULT_MEETINGS_DIR);
     const date = completed.startedAt.slice(0, 10);
     const label = safeId((completed.title || completed.platform || completed.id).toLowerCase()).slice(0, 60);
@@ -293,6 +299,7 @@ export function finalizeRecallMeeting(input: {
       `- Source: Recall.ai Desktop Recording SDK`,
       completed.platform ? `- Platform: ${completed.platform}` : '',
       `- Segments: ${completed.segments.length}`,
+      '- Note: synthetic/test captures are filtered before vault promotion.',
       '',
       '## Transcript',
       '',

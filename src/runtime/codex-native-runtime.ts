@@ -281,7 +281,11 @@ async function performCodexRequest(
     throw new CodexRuntimeError('No native Codex OAuth access token is available.');
   }
 
-  const body = {
+  // `prompt_cache_key` lets Codex re-use a cached prefix across calls
+  // in the same session. The Codex backend ignores `previous_response_id`
+  // (it enforces `store: false`), so this is the only token-cost lever
+  // we have for multi-turn chains. Hermes does the same thing.
+  const body: Record<string, unknown> = {
     model: resolveCodexModel(request.model),
     instructions: request.instructions || 'You are Clementine, a persistent executive assistant. Be concise, accurate, and action-oriented.',
     store: false,
@@ -289,6 +293,9 @@ async function performCodexRequest(
     input,
     tools: await createCodexToolDefinitions(),
   };
+  if (request.sessionId) {
+    body.prompt_cache_key = request.sessionId;
+  }
 
   const abortController = callbacks?.shouldCancel ? new AbortController() : undefined;
   let cancelPoll: ReturnType<typeof setInterval> | undefined;
@@ -787,18 +794,20 @@ export class CodexNativeRuntime implements AgentRuntime {
 	  ): Promise<RunResult> {
 	    let currentInput = [...input];
 	    let latestResult: CodexResponseResult | null = null;
+	    let toolCallsTotal = 0;
 
 	    // Maximum back-and-forth turns of (model → tool calls → tool outputs
 	    // → model). One turn = one model completion + the tool dispatches
-	    // it asks for. SEO audits / cross-tool work can chain easily into
-	    // double digits, so we keep this generous and surface a
-	    // user-facing message + a `stopped-at-max-turns` audit event when
-	    // it does trip.
+	    // it asks for. Default 75 — matches Hermes' "assistant doing real
+	    // work" tier (their default is 90; we trim slightly because our
+	    // orchestrator has sub-agent handoffs that each get their own
+	    // budget). The OpenAI Agents SDK default of 10 is unusably tight
+	    // for any multi-tool task.
 	    //
-	    // Override via env: `CLEMENTINE_MAX_TOOL_TURNS=30 npm run daemon`.
+	    // Override via env: `CLEMENTINE_MAX_TOOL_TURNS=120 npm run daemon`.
 	    const maxTurns = Math.max(
 	      1,
-	      parseInt(process.env.CLEMENTINE_MAX_TOOL_TURNS || '', 10) || 25,
+	      parseInt(process.env.CLEMENTINE_MAX_TOOL_TURNS || '', 10) || 75,
 	    );
 	    for (let turn = 0; turn < maxTurns; turn++) {
 	      await throwIfCancelled(callbacks);
@@ -817,6 +826,8 @@ export class CodexNativeRuntime implements AgentRuntime {
         return {
           text: finalText,
           sessionId,
+          stoppedReason: latestResult.text ? 'success' : 'error',
+          turnsUsed: turn + 1,
           raw: latestResult,
         };
       }
@@ -824,6 +835,7 @@ export class CodexNativeRuntime implements AgentRuntime {
 	      const nextInput: CodexInputMessage[] = [...currentInput];
 	      for (const toolCall of latestResult.toolCalls) {
 	        await throwIfCancelled(callbacks);
+	        toolCallsTotal++;
 	        const callId = toolCall.call_id ?? toolCall.id;
         if (!callId) {
           const fallbackCallId = randomUUID();
@@ -847,6 +859,8 @@ export class CodexNativeRuntime implements AgentRuntime {
             text: `Approval required before I continue. Pending approval ID: ${execution.pendingApprovalId}`,
             sessionId,
             pendingApprovalId: execution.pendingApprovalId,
+            stoppedReason: 'pending-approval',
+            turnsUsed: turn + 1,
             raw: latestResult,
           };
         }
@@ -857,10 +871,15 @@ export class CodexNativeRuntime implements AgentRuntime {
       currentInput = nextInput;
     }
 
-    // Hit the turn cap. Record an observability event so we can see in
-    // tool-events.ndjson how often this happens and which sessions hit
-    // it — useful signal for tuning the cap or splitting work across
-    // multiple turns at the agent level.
+    // Hit the tool-turn cap. Instead of returning a static "ran out of
+    // cycles" string, do what Hermes does: run ONE grace turn with an
+    // injected budget-exhausted notice that asks the model to summarize
+    // what it accomplished and what's pending. The model produces a real
+    // recap + an explicit "continue?" prompt instead of a dead-end error.
+    //
+    // The grace turn is forbidden from calling tools — we override the
+    // tools list to empty so the model can only respond with text. This
+    // is the Hermes `_budget_grace_call` pattern, simplified.
     recordToolEvent({
       at: new Date().toISOString(),
       sessionId,
@@ -868,15 +887,154 @@ export class CodexNativeRuntime implements AgentRuntime {
       kind: 'execute',
       phase: 'error',
       outcome: 'error',
-      errorMessage: `stopped at max tool-call turns (${maxTurns})`,
+      errorMessage: `stopped at max tool-call turns (${maxTurns}) — running grace turn`,
     });
 
+    const graceText = await this.runGraceTurn(request, sessionId, currentInput, maxTurns, toolCallsTotal, callbacks)
+      .catch((err) => {
+        logger.warn({ err }, 'grace turn failed; falling back to static message');
+        return null;
+      });
+
+    const finalText = graceText
+      || `Clementine reached her tool-call budget (${maxTurns} turns, ${toolCallsTotal} tools fired) before finishing. The work so far is in your vault. Reply "continue" to pick up where she left off.`;
+
+    if (callbacks?.onText) {
+      await callbacks.onText(finalText);
+    }
+
     return {
-      text: latestResult?.text
-        || `Clementine ran out of tool-call cycles before finishing (cap: ${maxTurns}). Ask her to continue — she'll pick up where she left off.`,
+      text: finalText,
       sessionId,
+      stoppedReason: 'max-turns-with-grace',
+      turnsUsed: maxTurns,
       raw: latestResult,
     };
+  }
+
+  /**
+   * Run ONE final model call after the tool-turn cap has been hit.
+   * No tools available — the model can only produce text. Inject a
+   * notice telling it the budget is exhausted and ask it to:
+   *
+   *   1. Summarize what it accomplished
+   *   2. Name what's still pending
+   *   3. End with an explicit "continue?" prompt
+   *
+   * Streams chunks to the caller via `onChunk` exactly like a normal
+   * turn so the user sees the summary appear in real time instead of
+   * waiting for the whole grace turn.
+   */
+  private async runGraceTurn(
+    request: RunRequest,
+    sessionId: string,
+    input: CodexInputMessage[],
+    maxTurns: number,
+    toolCallsFired: number,
+    callbacks?: AgentRuntimeCallbacks,
+  ): Promise<string | null> {
+    const graceNotice: CodexInputMessage = {
+      type: 'message',
+      role: 'developer',
+      content: [
+        {
+          type: 'input_text',
+          text: [
+            `You have reached your tool-call budget for this turn (${maxTurns} model→tool cycles, ${toolCallsFired} total tools fired).`,
+            `STOP calling tools. Do NOT request more tools.`,
+            `Write a short response that:`,
+            `  1. Summarizes what you accomplished in this run (be specific — name the tools/files/queries that succeeded).`,
+            `  2. Lists what's still pending or unfinished.`,
+            `  3. Ends with: "Want me to continue?" so the user has a clear path to resume.`,
+            `If you produced any artifacts (files, notes, plans, drafts), reference them by path/title so the user can find them.`,
+          ].join('\n'),
+        },
+      ],
+    } as unknown as CodexInputMessage;
+
+    // The grace turn replaces the tool surface with an empty list so
+    // the model has no choice but to write text. We construct the
+    // body manually instead of calling performCodexRequest so we can
+    // override `tools` cleanly.
+    const tokens = getStoredCodexOAuthTokens();
+    if (!tokens?.accessToken) return null;
+
+    const graceInput = [...input, graceNotice];
+    const body: Record<string, unknown> = {
+      model: resolveCodexModel(request.model),
+      instructions: request.instructions
+        || 'You are Clementine, a persistent executive assistant. Be concise, accurate, and action-oriented.',
+      store: false,
+      stream: true,
+      input: graceInput,
+      tools: [], // critical — no tools available on the grace turn
+    };
+    if (sessionId) body.prompt_cache_key = sessionId;
+
+    let response: Response;
+    try {
+      response = await fetch(CODEX_RESPONSES_URL, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${tokens.accessToken}`,
+          'Content-Type': 'application/json',
+          'User-Agent': CODEX_USER_AGENT,
+        },
+        body: JSON.stringify(body),
+      });
+    } catch (err) {
+      logger.warn({ err }, 'grace turn fetch failed');
+      return null;
+    }
+
+    if (!response.ok || !response.body) {
+      logger.warn({ status: response.status }, 'grace turn returned non-OK');
+      return null;
+    }
+
+    // Reuse the same SSE parser the main loop uses. We don't need to
+    // track tool calls (the model has none); we just collect text.
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let accumulated = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const { events, rest } = parseSseChunk(buffer);
+      buffer = rest;
+      for (const evt of events) {
+        if (!evt.data) continue;
+        const payload = safeJsonParse(evt.data) as
+          | { type?: string; delta?: string; response?: { output?: Array<{ type?: string; content?: Array<{ type?: string; text?: string }> }> } }
+          | null;
+        if (!payload) continue;
+        if (payload.type === 'response.output_text.delta' && typeof payload.delta === 'string') {
+          accumulated += payload.delta;
+          if (callbacks?.onChunk) {
+            await callbacks.onChunk(payload.delta);
+          }
+        } else if (payload.type === 'response.completed' && payload.response?.output) {
+          // Defensive: if streaming deltas were missed for any reason,
+          // reconstruct the final text from the completed output.
+          if (!accumulated) {
+            for (const item of payload.response.output) {
+              if (item.type === 'message' && Array.isArray(item.content)) {
+                for (const part of item.content) {
+                  if (part.type === 'output_text' && typeof part.text === 'string') {
+                    accumulated += part.text;
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    return accumulated.trim() || null;
   }
 
   async resolveApproval(approvalId: string, approved: boolean): Promise<ApprovalResolutionResult> {

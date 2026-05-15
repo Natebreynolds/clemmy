@@ -121,6 +121,10 @@ export function renderConsoleHtml(token: string): string {
             <div class="home-greet">
               <h2 data-home-greeting>Hello.</h2>
               <p data-home-sub>Loading status…</p>
+              <div class="home-away">
+                <span class="presence-dot" data-home-agent-presence></span>
+                <span data-home-away-message>Reading the room…</span>
+              </div>
             </div>
             <div class="home-tiles">
               <button class="home-tile" data-home-tile="approvals">
@@ -139,17 +143,79 @@ export function renderConsoleHtml(token: string): string {
                 <span class="home-tile-label">check-ins</span>
                 <span class="home-tile-value" data-home-checkins>—</span>
               </button>
+              <button class="home-tile" data-home-tile="activity">
+                <span class="home-tile-label">working</span>
+                <span class="home-tile-value" data-home-working-count>—</span>
+              </button>
+              <button class="home-tile" data-home-tile="memory">
+                <span class="home-tile-label">memory</span>
+                <span class="home-tile-value" data-home-memory-health>—</span>
+              </button>
+              <button class="home-tile" data-home-tile="integrations">
+                <span class="home-tile-label">tools</span>
+                <span class="home-tile-value" data-home-tools-ready>—</span>
+              </button>
             </div>
           </header>
 
-          <div class="home-block home-chat">
+          <section class="home-command">
+            <div class="home-command-primary">
+              <div class="home-block home-command-card home-needs">
+                <div class="home-block-head">
+                  <span>NEEDS YOU</span>
+                  <em data-home-needs-count>—</em>
+                </div>
+                <div class="home-block-body command-list" data-home-needs-list>
+                  <div class="home-empty">— checking approvals —</div>
+                </div>
+              </div>
+
+              <div class="home-block home-command-card home-working">
+                <div class="home-block-head">
+                  <span>WORKING NOW</span>
+                  <em data-home-active-count>—</em>
+                </div>
+                <div class="home-current-objective">
+                  <span class="presence-dot working"></span>
+                  <span data-home-current-objective>Finding active work…</span>
+                </div>
+                <div class="home-block-body command-list" data-home-working-list>
+                  <div class="home-empty">— no active workers yet —</div>
+                </div>
+              </div>
+            </div>
+
+            <aside class="home-command-side">
+              <div class="home-block home-memory-card">
+                <div class="home-block-head">
+                  <span>MEMORY PULSE</span>
+                  <em data-home-memory-card-meta>—</em>
+                </div>
+                <div class="home-block-body" data-home-memory-pulse>
+                  <div class="home-empty">— loading memory —</div>
+                </div>
+              </div>
+
+              <div class="home-block home-tools-card">
+                <div class="home-block-head">
+                  <span>TOOL READINESS</span>
+                  <em data-home-tools-card-meta>—</em>
+                </div>
+                <div class="home-block-body command-list compact" data-home-tools-list>
+                  <div class="home-empty">— checking credentials —</div>
+                </div>
+              </div>
+            </aside>
+          </section>
+
+          <div class="home-block home-chat home-chat-dock">
             <div class="home-block-head">
-              <span>CHAT WITH CLEMENTINE</span>
+              <span>CHAT DOCK</span>
               <span class="home-chat-meta" data-home-chat-meta>local session</span>
             </div>
             <div class="home-chat-thread" data-home-chat-thread>
               <div class="home-chat-hint">
-                <div class="home-chat-hint-title">Ask anything.</div>
+                <div class="home-chat-hint-title">Instant message Clementine.</div>
                 <div class="home-chat-hint-sub">Try a quick prompt to get started:</div>
                 <div class="home-chat-suggestions">
                   <button type="button" class="home-chat-suggest" data-home-chat-suggest="what's on my plate today">what's on my plate today</button>
@@ -197,7 +263,7 @@ export function renderConsoleHtml(token: string): string {
             </div>
           </div>
 
-          <div class="home-secondary">
+          <div class="home-secondary home-bottom-grid">
             <div class="home-block home-agenda">
               <div class="home-block-head">
                 <span>LINED UP TODAY</span>
@@ -215,6 +281,16 @@ export function renderConsoleHtml(token: string): string {
               </div>
               <div class="home-block-body" data-home-done>
                 <div class="home-empty">— loading —</div>
+              </div>
+            </div>
+
+            <div class="home-block home-recent">
+              <div class="home-block-head">
+                <span>RECENTLY COMPLETED</span>
+                <em data-home-recent-count>—</em>
+              </div>
+              <div class="home-block-body command-list compact" data-home-recent-list>
+                <div class="home-empty">— loading recent work —</div>
               </div>
             </div>
           </div>
@@ -317,6 +393,23 @@ export function renderConsoleHtml(token: string): string {
             </div>
 
             <div class="mem-graph" data-mem-graph hidden>
+              <div class="mem-graph-topbar">
+                <div class="mem-graph-controls">
+                  <button type="button" data-mem-graph-refresh>REFRESH</button>
+                  <button type="button" data-mem-graph-fit>FIT</button>
+                  <button type="button" data-mem-graph-reset>RESET</button>
+                </div>
+                <div class="mem-graph-filters">
+                  <select data-mem-graph-type aria-label="Filter graph node type">
+                    <option value="">ALL NODES</option>
+                    <option value="fact">FACTS</option>
+                    <option value="file">FILES</option>
+                    <option value="kind">KINDS</option>
+                  </select>
+                  <input type="search" data-mem-graph-search placeholder="filter graph…" autocomplete="off" spellcheck="false" />
+                </div>
+                <span class="mem-graph-meta" data-mem-graph-meta>—</span>
+              </div>
               <div class="mem-graph-canvas" data-mem-graph-canvas></div>
               <aside class="mem-graph-detail" data-mem-graph-detail>
                 <div class="mem-graph-detail-empty">Hover or click a node to inspect.</div>
@@ -1207,6 +1300,32 @@ body {
   letter-spacing: 0.16em;
 }
 .nav.active .nav-key { color: var(--accent); }
+.nav-badge {
+  margin-left: auto;
+  min-width: 19px;
+  height: 17px;
+  padding: 2px 5px;
+  border: 1px solid var(--line-bright);
+  color: var(--fg-2);
+  background: var(--bg-0);
+  font-size: 9px;
+  line-height: 11px;
+  text-align: center;
+  letter-spacing: 0.04em;
+}
+.nav-badge.warn {
+  border-color: var(--accent-warn);
+  color: var(--accent-warn);
+}
+.nav-badge.hot {
+  border-color: var(--accent);
+  color: var(--accent);
+  box-shadow: 0 0 12px color-mix(in srgb, var(--accent) 18%, transparent);
+}
+.nav-badge.good {
+  border-color: var(--accent-2);
+  color: var(--accent-2);
+}
 .nav-foot {
   margin-top: auto;
   padding: 14px 16px;
@@ -1250,15 +1369,154 @@ body {
   display: flex;
   flex-direction: column;
   gap: 14px;
-  padding: 16px 22px 22px;
+  padding: 14px 18px 18px;
   overflow-y: auto;
   height: 100%;
+}
+.home-welcome {
+  display: grid;
+  grid-template-columns: minmax(260px, 0.85fr) minmax(360px, 1.35fr);
+  gap: 14px;
+  align-items: stretch;
+}
+.home-greet {
+  border: 1px solid var(--line);
+  background:
+    linear-gradient(135deg, color-mix(in srgb, var(--accent) 9%, transparent), transparent 46%),
+    var(--bg-1);
+  padding: 16px 18px;
+  min-height: 132px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+}
+.home-greet h2 {
+  margin: 0 0 6px;
+  font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+  font-size: 22px;
+  letter-spacing: 0.01em;
+}
+.home-greet p {
+  margin: 0;
+  color: var(--fg-2);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  line-height: 1.55;
+}
+.home-away {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  margin-top: 12px;
+  padding: 8px 10px;
+  border: 1px dashed var(--line);
+  background: color-mix(in srgb, var(--bg-0) 56%, transparent);
+  color: var(--fg);
+  font-size: 11px;
+  line-height: 1.4;
+}
+.presence-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 999px;
+  background: var(--accent-2);
+  box-shadow: 0 0 9px color-mix(in srgb, var(--accent-2) 52%, transparent);
+  flex: 0 0 auto;
+  margin-top: 3px;
+}
+.presence-dot.needs-you,
+.presence-dot.warn { background: var(--accent-warn); box-shadow: 0 0 9px color-mix(in srgb, var(--accent-warn) 52%, transparent); }
+.presence-dot.working { background: var(--accent-3); box-shadow: 0 0 9px color-mix(in srgb, var(--accent-3) 52%, transparent); }
+.presence-dot.offline { background: var(--accent-fail); box-shadow: 0 0 9px color-mix(in srgb, var(--accent-fail) 52%, transparent); }
+.home-tiles {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(90px, 1fr));
+  gap: 8px;
+}
+.home-tile {
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  color: var(--fg);
+  font: inherit;
+  min-height: 62px;
+  padding: 9px 10px;
+  text-align: left;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  transition: background 120ms, border-color 120ms, transform 120ms;
+}
+.home-tile:hover {
+  background: var(--bg-2);
+  border-color: var(--line-bright);
+}
+.home-tile.has-activity { border-color: color-mix(in srgb, var(--accent) 55%, var(--line)); }
+.home-tile.high {
+  border-color: var(--accent);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+.home-tile-label {
+  color: var(--fg-3);
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+}
+.home-tile-value {
+  font-size: 20px;
+  letter-spacing: 0.04em;
+}
+.home-command {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 320px;
+  gap: 14px;
+  min-height: 250px;
+}
+.home-command-primary {
+  display: grid;
+  grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
+  gap: 14px;
+  min-width: 0;
+}
+.home-command-side {
+  display: grid;
+  grid-template-rows: 1fr 1fr;
+  gap: 14px;
+  min-width: 0;
+}
+.home-command-card,
+.home-memory-card,
+.home-tools-card,
+.home-recent {
+  min-height: 0;
+}
+.home-current-objective {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line);
+  color: var(--fg);
+  font-size: 11px;
+  line-height: 1.4;
+  background:
+    repeating-linear-gradient(90deg, color-mix(in srgb, var(--fg) 4%, transparent) 0 1px, transparent 1px 18px),
+    var(--bg-0);
+}
+.command-list {
+  gap: 0;
+}
+.command-list.compact .home-item {
+  padding: 6px 0;
+}
+.home-chat-dock {
+  min-height: 260px;
+  max-height: 430px;
 }
 .home-chat {
   display: flex;
   flex-direction: column;
-  flex: 1;
-  min-height: 360px;
+  flex: 0 0 auto;
   /* Subtle warm tint so the chat block reads as the focal point. */
   background:
     linear-gradient(180deg, rgba(255, 170, 80, var(--card-tint, 0.03)) 0%, transparent 30%),
@@ -1267,15 +1525,33 @@ body {
 }
 .home-secondary {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: 1fr 1fr 1fr;
   gap: 14px;
   min-height: 220px;
-  max-height: 260px;
+  max-height: 280px;
 }
 @media (max-width: 900px) {
+  .home-welcome,
+  .home-command,
+  .home-command-primary {
+    grid-template-columns: 1fr;
+  }
+  .home-command-side {
+    grid-template-columns: 1fr 1fr;
+    grid-template-rows: auto;
+  }
+  .home-tiles {
+    grid-template-columns: repeat(2, minmax(110px, 1fr));
+  }
   .home-secondary {
     grid-template-columns: 1fr;
     max-height: none;
+  }
+}
+@media (max-width: 640px) {
+  .home-command-side,
+  .home-tiles {
+    grid-template-columns: 1fr;
   }
 }
 .home-block {
@@ -1322,6 +1598,12 @@ body {
   padding: 8px 0;
   border-bottom: 1px dotted var(--line);
   align-items: flex-start;
+}
+.home-item.command-item {
+  cursor: pointer;
+}
+.home-item.command-item:hover .home-item-text {
+  color: var(--accent);
 }
 .home-item:last-child { border-bottom: 0; }
 .home-item-kind {
@@ -1373,6 +1655,23 @@ body {
   font-size: 10px;
   color: var(--fg-3);
   margin-top: 2px;
+}
+.home-memory-line {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 5px 0;
+  border-bottom: 1px dotted var(--line);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+}
+.home-memory-line span {
+  color: var(--fg-3);
+  text-transform: uppercase;
+}
+.home-memory-line em {
+  color: var(--fg);
+  font-style: normal;
 }
 
 /* Chat */
@@ -1911,69 +2210,6 @@ body {
   overflow: hidden;
 }
 
-.home-welcome {
-  padding: 18px 18px 14px;
-  border-bottom: 1px solid var(--line);
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-start;
-  gap: 18px;
-  flex-wrap: wrap;
-}
-.home-greet h2 {
-  margin: 0;
-  font-size: 18px;
-  font-weight: 600;
-  letter-spacing: 0.01em;
-  color: var(--fg);
-  font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
-}
-.home-greet p {
-  margin: 4px 0 0;
-  font-size: 11px;
-  color: var(--fg-3);
-  letter-spacing: 0.06em;
-}
-.home-tiles {
-  display: flex;
-  gap: 6px;
-  flex-shrink: 0;
-}
-.home-tile {
-  background: var(--bg-1);
-  border: 1px solid var(--line);
-  padding: 8px 12px;
-  min-width: 76px;
-  text-align: left;
-  cursor: pointer;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  color: var(--fg-3);
-  font: inherit;
-  transition: background 120ms, border-color 120ms, color 120ms;
-}
-.home-tile:hover {
-  border-color: var(--accent);
-  color: var(--accent);
-}
-.home-tile-label {
-  font-size: 9px;
-  letter-spacing: 0.18em;
-  text-transform: uppercase;
-}
-.home-tile-value {
-  font-size: 22px;
-  color: var(--fg);
-  font-family: var(--mono);
-  font-weight: 600;
-}
-.home-tile.has-activity .home-tile-value {
-  color: var(--accent);
-}
-.home-tile.high .home-tile-value {
-  color: var(--accent-fail);
-}
 .feed-header,
 .detail-header {
   padding: 8px 14px;
@@ -2279,16 +2515,66 @@ body {
   flex: 1;
   position: relative;
   display: grid;
+  grid-template-rows: auto 1fr;
   grid-template-columns: 1fr 280px;
   background: var(--bg-2);
   overflow: hidden;
 }
 .mem-graph[hidden] { display: none; }
+.mem-graph-topbar {
+  grid-column: 1 / -1;
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-1);
+  min-width: 0;
+}
+.mem-graph-controls,
+.mem-graph-filters {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  min-width: 0;
+}
+.mem-graph-controls button,
+.mem-graph-filters select,
+.mem-graph-filters input {
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  padding: 5px 8px;
+  outline: none;
+}
+.mem-graph-controls button {
+  cursor: pointer;
+}
+.mem-graph-controls button:hover,
+.mem-graph-filters select:focus,
+.mem-graph-filters input:focus {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.mem-graph-filters input {
+  width: 150px;
+}
+.mem-graph-meta {
+  color: var(--fg-3);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  white-space: nowrap;
+}
 .mem-graph-canvas {
   position: relative;
   background:
     radial-gradient(circle at 50% 50%, var(--bg-1) 0%, var(--bg-0) 80%);
   overflow: hidden;
+  min-height: 360px;
 }
 .mem-graph-detail {
   border-left: 1px solid var(--line);
@@ -2319,6 +2605,34 @@ body {
 .mem-graph-detail .pill.file { color: var(--accent-3); border-color: var(--accent-3); }
 .mem-graph-detail .pill.kind { color: var(--accent-2); border-color: var(--accent-2); }
 .mem-graph-detail-empty { color: var(--fg-mute); padding: 20px 0; }
+.mem-graph-detail-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 12px;
+}
+.mem-graph-detail-actions button {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  padding: 5px 8px;
+  cursor: pointer;
+}
+.mem-graph-detail-actions button:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.mem-graph-note {
+  margin: 10px 0 0;
+  color: var(--fg-3);
+  font-size: 10px;
+  line-height: 1.45;
+  border-top: 1px dashed var(--line);
+  padding-top: 10px;
+}
 .mem-graph-legend {
   position: absolute;
   bottom: 12px;
@@ -2345,6 +2659,40 @@ body {
 .mem-graph-legend .dot.fact { background: var(--accent); }
 .mem-graph-legend .dot.file { background: var(--accent-3); }
 .mem-graph-legend .dot.kind { background: var(--accent-2); }
+@media (max-width: 1040px) {
+  .memory-layout {
+    grid-template-columns: 1fr;
+    overflow-y: auto;
+  }
+  .mem-sidebar {
+    min-height: 280px;
+  }
+  .mem-graph {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto minmax(360px, 1fr) auto;
+  }
+  .mem-graph-detail {
+    border-left: 0;
+    border-top: 1px solid var(--line);
+    max-height: 220px;
+  }
+}
+@media (max-width: 760px) {
+  .mem-toolbar,
+  .mem-graph-topbar {
+    flex-wrap: wrap;
+  }
+  .mem-search {
+    min-width: 100%;
+  }
+  .mem-graph-filters {
+    width: 100%;
+  }
+  .mem-graph-filters input {
+    flex: 1;
+    width: auto;
+  }
+}
 .mem-search {
   display: flex;
   align-items: center;
@@ -5216,6 +5564,139 @@ const CONSOLE_JS = `
     bump(checkinsEl, homeCheckinCount);
   }
 
+  function setNavBadge(panel, value, tone) {
+    const nav = document.querySelector('.nav[data-panel="' + panel + '"]');
+    if (!nav) return;
+    let badge = nav.querySelector('.nav-badge');
+    if (!badge) {
+      badge = document.createElement('span');
+      badge.className = 'nav-badge';
+      nav.appendChild(badge);
+    }
+    const show = value !== null && value !== undefined && value !== '' && String(value) !== '0';
+    badge.hidden = !show;
+    badge.textContent = show ? String(value) : '';
+    badge.className = 'nav-badge' + (tone ? ' ' + tone : '');
+  }
+
+  function renderCommandItems(items, emptyText) {
+    if (!items || items.length === 0) {
+      return '<div class="home-empty">' + escMem(emptyText) + '</div>';
+    }
+    return items.map((item) => [
+      '<div class="home-item command-item" data-tools-jump="' + escMem(item.panel || 'activity') + '">',
+      '  <span class="home-item-kind ' + escMem(item.kind || 'task') + '">' + escMem(String(item.kind || 'item').toUpperCase()) + '</span>',
+      '  <div style="flex:1; min-width:0;">',
+      '    <div class="home-item-text">' + escMem(item.title || '') + '</div>',
+      item.meta ? '    <div class="home-item-meta">' + escMem(item.meta) + '</div>' : '',
+      '  </div>',
+      '</div>',
+    ].join('')).join('');
+  }
+
+  function setPresence(status) {
+    const dot = document.querySelector('[data-home-agent-presence]');
+    if (!dot) return;
+    dot.classList.remove('needs-you', 'working', 'offline', 'warn');
+    if (status === 'needs_you') dot.classList.add('needs-you');
+    else if (status === 'working') dot.classList.add('working');
+    else if (status === 'offline') dot.classList.add('offline');
+  }
+
+  function renderMemoryPulse(memory) {
+    const warnings = memory?.warnings || [];
+    const coverage = memory?.embeddingsEnabled
+      ? Math.round((memory.embeddingsCoverage || 0) * 100) + '% embedded'
+      : 'embeddings off';
+    return [
+      '<div class="home-memory-line"><span>chunks</span><em>' + escMem(memory?.chunks ?? '—') + '</em></div>',
+      '<div class="home-memory-line"><span>files</span><em>' + escMem(memory?.indexedFiles ?? '—') + '</em></div>',
+      '<div class="home-memory-line"><span>facts</span><em>' + escMem(memory?.activeFacts ?? '—') + '</em></div>',
+      '<div class="home-memory-line"><span>vector</span><em>' + escMem(coverage) + '</em></div>',
+      warnings.length
+        ? '<div class="mem-graph-note">' + warnings.map((w) => escMem(w)).join(' · ') + '</div>'
+        : '<div class="mem-graph-note">Memory index is ready for search and recall.</div>',
+    ].join('');
+  }
+
+  function renderToolReadiness(integrations) {
+    const rows = integrations?.credentials || [];
+    if (rows.length === 0) return '<div class="home-empty">— no credential registry —</div>';
+    return rows.map((row) => {
+      const kind = row.hasValue ? 'done' : row.required ? 'checkin' : 'task';
+      const status = row.hasValue ? (row.source || 'connected') : row.required ? 'required' : 'optional';
+      return [
+        '<div class="home-item command-item" data-tools-jump="integrations">',
+        '  <span class="home-item-kind ' + kind + '">' + (row.hasValue ? 'ON' : 'OFF') + '</span>',
+        '  <div style="flex:1; min-width:0;">',
+        '    <div class="home-item-text">' + escMem(row.label || row.name) + '</div>',
+        '    <div class="home-item-meta">' + escMem(status) + '</div>',
+        '  </div>',
+        '</div>',
+      ].join('');
+    }).join('');
+  }
+
+  async function refreshHomeCommandCenter() {
+    try {
+      const data = await fetchJSON('/api/console/home/command-center');
+      const counts = data.counts || {};
+      const presence = data.presence || {};
+      const needsEl = document.querySelector('[data-home-needs-list]');
+      const workingEl = document.querySelector('[data-home-working-list]');
+      const recentEl = document.querySelector('[data-home-recent-list]');
+      const memoryEl = document.querySelector('[data-home-memory-pulse]');
+      const toolsEl = document.querySelector('[data-home-tools-list]');
+      const awayEl = document.querySelector('[data-home-away-message]');
+      const objectiveEl = document.querySelector('[data-home-current-objective]');
+      const needsCountEl = document.querySelector('[data-home-needs-count]');
+      const activeCountEl = document.querySelector('[data-home-active-count]');
+      const recentCountEl = document.querySelector('[data-home-recent-count]');
+      const memoryMetaEl = document.querySelector('[data-home-memory-card-meta]');
+      const toolsMetaEl = document.querySelector('[data-home-tools-card-meta]');
+      const approvalsTile = document.querySelector('[data-home-approvals]');
+      const plansTile = document.querySelector('[data-home-plans]');
+      const proposalsTile = document.querySelector('[data-home-proposals]');
+      const checkinsTile = document.querySelector('[data-home-checkins]');
+      const workingTile = document.querySelector('[data-home-working-count]');
+      const memoryTile = document.querySelector('[data-home-memory-health]');
+      const toolsTile = document.querySelector('[data-home-tools-ready]');
+
+      setPresence(presence.status);
+      if (awayEl) awayEl.textContent = presence.awayMessage || 'Standing by.';
+      if (objectiveEl) objectiveEl.textContent = presence.awayMessage || 'Standing by for the next useful task.';
+      if (needsCountEl) needsCountEl.textContent = String(counts.waiting ?? 0);
+      if (activeCountEl) activeCountEl.textContent = String(counts.active ?? 0);
+      if (recentCountEl) recentCountEl.textContent = String((data.recentCompleted || []).length);
+      if (memoryMetaEl) memoryMetaEl.textContent = (data.memory?.warnings || []).length ? 'attention' : 'ready';
+      if (toolsMetaEl) toolsMetaEl.textContent = (data.integrations?.connected ?? 0) + '/' + (data.integrations?.total ?? 0);
+      if (approvalsTile) approvalsTile.textContent = counts.approvals ?? 0;
+      if (plansTile) plansTile.textContent = counts.planProposals ?? 0;
+      if (proposalsTile) proposalsTile.textContent = counts.checkInProposals ?? 0;
+      if (checkinsTile) checkinsTile.textContent = counts.checkIns ?? 0;
+      if (workingTile) workingTile.textContent = counts.active ?? 0;
+      if (memoryTile) memoryTile.textContent = (data.memory?.warnings || []).length ? '!' : 'ok';
+      if (toolsTile) toolsTile.textContent = (data.integrations?.requiredMissing || 0) > 0 ? '!' : ((data.integrations?.connected ?? 0) + '/' + (data.integrations?.total ?? 0));
+      if (els.approvals) els.approvals.textContent = counts.approvals ?? 0;
+
+      if (needsEl) needsEl.innerHTML = renderCommandItems(data.needsYou, '— nothing waiting on you —');
+      if (workingEl) workingEl.innerHTML = renderCommandItems(data.workingNow, '— no active runs or background tasks —');
+      if (recentEl) recentEl.innerHTML = renderCommandItems(data.recentCompleted, '— nothing completed recently —');
+      if (memoryEl) memoryEl.innerHTML = renderMemoryPulse(data.memory || {});
+      if (toolsEl) toolsEl.innerHTML = renderToolReadiness(data.integrations || {});
+
+      setNavBadge('home', counts.waiting || '', counts.waiting > 0 ? 'hot' : '');
+      setNavBadge('activity', counts.active || '', counts.active > 0 ? 'good' : '');
+      setNavBadge('memory', (data.memory?.warnings || []).length || '', 'warn');
+      setNavBadge('integrations', data.integrations?.requiredMissing || '', 'warn');
+      setNavBadge('settings', (counts.approvals || 0) + (counts.planProposals || 0) + (counts.checkInProposals || 0), 'hot');
+    } catch (err) {
+      const needsEl = document.querySelector('[data-home-needs-list]');
+      if (needsEl) needsEl.innerHTML = '<div class="home-empty">Command center failed: ' + escMem(err.message || err) + '</div>';
+      setPresence('offline');
+    }
+  }
+
   function greetingForNow() {
     const hour = new Date().getHours();
     if (hour < 5)  return 'Late night.';
@@ -5276,6 +5757,12 @@ const CONSOLE_JS = `
         // Settings panel hosts proposal/plan/check-in editors. Approvals
         // surface in run-inspector / Discord buttons; for v1 just open
         // Settings so users find the related controls.
+      } else if (kind === 'activity') {
+        switchPanel('activity');
+      } else if (kind === 'memory') {
+        switchPanel('memory');
+      } else if (kind === 'integrations') {
+        switchPanel('integrations');
       }
     });
   });
@@ -5285,24 +5772,29 @@ const CONSOLE_JS = `
   // panel.
   refreshHomeAuxCounts();
   setInterval(refreshHomeAuxCounts, 8000);
+  refreshHomeCommandCenter();
+  setInterval(refreshHomeCommandCenter, 6000);
 
   async function tick() {
     try {
-      const [snap, runs] = await Promise.all([
+      const [snap, runs, approvalsData] = await Promise.all([
         fetchJSON('/api/dashboard'),
         fetchJSON('/api/runs'),
+        fetchJSON('/api/approvals'),
       ]);
+      const approvals = approvalsData.approvals || [];
+      const snapWithApprovals = { ...snap, approvals };
       setOnline(true);
 
       // Status bar
       const memIdx = snap.memoryIndex || {};
       els.runs.textContent      = (runs.runs || runs || []).length;
       els.memory.textContent    = (memIdx.chunks ?? '—') + ' / ' + (memIdx.activeFacts ?? '—') + 'f';
-      els.approvals.textContent = (snap.approvals || []).length;
+      els.approvals.textContent = approvals.length;
       els.policy.textContent    = ((snap.proactivity && snap.proactivity.policy && snap.proactivity.policy.mode) || '—').toUpperCase();
 
       // Home tiles + greeting (only on first paint + when count changes).
-      updateHome(snap);
+      updateHome(snapWithApprovals);
 
       const list = runs.runs || runs || [];
       const running = list.filter((r) => r.status === 'running' || r.status === 'received').length;
@@ -5311,7 +5803,7 @@ const CONSOLE_JS = `
       els.feedRun.textContent   = running;
       els.feedFail.textContent  = failed;
 
-      const snapshotJSON = JSON.stringify({ chunks: memIdx.chunks, facts: memIdx.activeFacts, approvals: (snap.approvals || []).length, mode: snap.proactivity && snap.proactivity.policy && snap.proactivity.policy.mode });
+      const snapshotJSON = JSON.stringify({ chunks: memIdx.chunks, facts: memIdx.activeFacts, approvals: approvals.length, mode: snap.proactivity && snap.proactivity.policy && snap.proactivity.policy.mode });
       const runsJSON = JSON.stringify(list.map((r) => [r.id, r.status, r.updatedAt]));
       if (runsJSON !== lastRunsJSON) {
         renderRunList(list);
@@ -5417,6 +5909,9 @@ const CONSOLE_JS = `
     search:     document.querySelector('[data-mem-search]'),
     searchMeta: document.querySelector('[data-mem-search-meta]'),
     viewer:     document.querySelector('[data-mem-viewer]'),
+    graphSearch: document.querySelector('[data-mem-graph-search]'),
+    graphType: document.querySelector('[data-mem-graph-type]'),
+    graphMeta: document.querySelector('[data-mem-graph-meta]'),
   };
   let memSelectedFile = null;
   let memSelectedFact = null;
@@ -5442,6 +5937,7 @@ const CONSOLE_JS = `
 
   async function bootMemoryPanel() {
     wireMemoryViewToggle();
+    wireMemoryGraphControls();
     await Promise.all([refreshMemoryStatus(), refreshFileList(), refreshFactList()]);
   }
   async function refreshMemoryPanel() {
@@ -5452,36 +5948,115 @@ const CONSOLE_JS = `
 
   let memGraphCy = null;        // cytoscape instance, lazy-init
   let memGraphLoaded = false;
+  let memGraphData = null;
+  let memGraphPinnedNode = null;
+  let memViewToggleBound = false;
 
   function wireMemoryViewToggle() {
-    const buttons = document.querySelectorAll('[data-mem-view]');
-    buttons.forEach((btn) => {
-      btn.addEventListener('click', () => {
-        const view = btn.getAttribute('data-mem-view');
-        buttons.forEach((b) => b.classList.toggle('active', b === btn));
-        const viewerEl = document.querySelector('[data-mem-viewer]');
-        const graphEl = document.querySelector('[data-mem-graph]');
-        if (view === 'graph') {
-          if (viewerEl) viewerEl.setAttribute('hidden', '');
-          if (graphEl) graphEl.removeAttribute('hidden');
-          if (!memGraphLoaded) {
-            memGraphLoaded = true;
-            loadMemoryGraph();
-          } else if (memGraphCy) {
-            // Refit on tab show — Cytoscape needs a resize hint when
-            // the canvas was hidden during init.
-            memGraphCy.resize();
-            memGraphCy.fit(undefined, 40);
-          }
-        } else {
-          if (graphEl) graphEl.setAttribute('hidden', '');
-          if (viewerEl) viewerEl.removeAttribute('hidden');
+    if (memViewToggleBound) return;
+    memViewToggleBound = true;
+    document.addEventListener('click', (event) => {
+      const target = event.target;
+      if (!(target instanceof HTMLElement)) return;
+      const btn = target.closest('[data-mem-view]');
+      if (!btn) return;
+      event.preventDefault();
+      const view = btn.getAttribute('data-mem-view');
+      switchMemoryView(view);
+      if (view === 'graph') {
+        wireMemoryGraphControls();
+        if (!memGraphLoaded) {
+          memGraphLoaded = true;
+          loadMemoryGraph();
+        } else if (memGraphCy) {
+          // Refit on tab show — Cytoscape needs a resize hint when
+          // the canvas was hidden during init.
+          memGraphCy.resize();
+          memGraphCy.fit(undefined, 40);
         }
-      });
+      }
     });
   }
 
-  async function loadMemoryGraph() {
+  function wireMemoryGraphControls() {
+    const refresh = document.querySelector('[data-mem-graph-refresh]');
+    const fit = document.querySelector('[data-mem-graph-fit]');
+    const reset = document.querySelector('[data-mem-graph-reset]');
+    if (refresh && !refresh.dataset.bound) {
+      refresh.dataset.bound = '1';
+      refresh.addEventListener('click', () => loadMemoryGraph({ force: true }));
+    }
+    if (fit && !fit.dataset.bound) {
+      fit.dataset.bound = '1';
+      fit.addEventListener('click', () => {
+        if (!memGraphCy) return;
+        memGraphCy.resize();
+        memGraphCy.fit(undefined, 42);
+      });
+    }
+    if (reset && !reset.dataset.bound) {
+      reset.dataset.bound = '1';
+      reset.addEventListener('click', () => {
+        if (!memGraphCy) return;
+        memGraphCy.elements().removeClass('dimmed related pinned');
+        memGraphPinnedNode = null;
+        applyMemoryGraphFilters();
+        memGraphCy.layout({ name: 'cose', animate: false, fit: true, padding: 42, nodeRepulsion: 8000, idealEdgeLength: 80, nodeOverlap: 12, gravity: 0.25 }).run();
+      });
+    }
+    if (mem.graphType && !mem.graphType.dataset.bound) {
+      mem.graphType.dataset.bound = '1';
+      mem.graphType.addEventListener('change', applyMemoryGraphFilters);
+    }
+    if (mem.graphSearch && !mem.graphSearch.dataset.bound) {
+      mem.graphSearch.dataset.bound = '1';
+      mem.graphSearch.addEventListener('input', applyMemoryGraphFilters);
+    }
+    document.addEventListener('click', async (event) => {
+      const target = event.target;
+      if (!(target instanceof HTMLElement)) return;
+      const action = target.closest('[data-graph-action]');
+      if (!action) return;
+      const type = action.getAttribute('data-graph-action');
+      const value = action.getAttribute('data-value') || '';
+      if (type === 'open-file' && value) {
+        switchMemoryView('viewer');
+        memSelectedFile = value;
+        memSelectedFact = null;
+        await loadFileViewer(value);
+      } else if (type === 'search' && value) {
+        switchMemoryView('viewer');
+        mem.search.value = value;
+        mem.search.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter' }));
+      } else if (type === 'filter-kind' && value) {
+        memActiveKind = value;
+        mem.kinds.querySelectorAll('.kind-pill').forEach((p) => p.classList.toggle('active', p.getAttribute('data-kind') === value));
+        switchMemoryView('viewer');
+        await refreshFactList();
+      } else if (type === 'forget-fact' && value) {
+        if (!confirm('Soft-delete fact #' + value + '?')) return;
+        await fetch(withToken('/api/console/memory/facts/' + encodeURIComponent(value) + '/forget'), { method: 'POST' });
+        await Promise.all([refreshFactList(), refreshMemoryStatus(), loadMemoryGraph({ force: true })]);
+      }
+    });
+  }
+
+  function switchMemoryView(view) {
+    document.querySelectorAll('[data-mem-view]').forEach((button) => {
+      button.classList.toggle('active', button.getAttribute('data-mem-view') === view);
+    });
+    const viewerEl = document.querySelector('[data-mem-viewer]');
+    const graphEl = document.querySelector('[data-mem-graph]');
+    if (view === 'graph') {
+      if (viewerEl) viewerEl.setAttribute('hidden', '');
+      if (graphEl) graphEl.removeAttribute('hidden');
+    } else {
+      if (graphEl) graphEl.setAttribute('hidden', '');
+      if (viewerEl) viewerEl.removeAttribute('hidden');
+    }
+  }
+
+  async function loadMemoryGraph(options = {}) {
     const canvas = document.querySelector('[data-mem-graph-canvas]');
     const detail = document.querySelector('[data-mem-graph-detail]');
     if (!canvas) return;
@@ -5491,9 +6066,15 @@ const CONSOLE_JS = `
     }
     try {
       const data = await fetchJSON('/api/console/memory/graph');
+      memGraphData = data;
       if (!data.nodes || data.nodes.length === 0) {
-        canvas.innerHTML = '<div class="mem-empty" style="padding:24px;">— no facts or files indexed yet. Memory needs some signal first. —</div>';
+        canvas.innerHTML = '<div class="mem-empty" style="padding:24px;">— no facts or files indexed yet. Memory needs some signal first. Chat, meeting transcripts, and vault notes will grow this graph. —</div>';
+        if (mem.graphMeta) mem.graphMeta.textContent = '0 nodes';
         return;
+      }
+      if (options.force && memGraphCy) {
+        memGraphCy.destroy();
+        memGraphCy = null;
       }
 
       const css = getComputedStyle(document.documentElement);
@@ -5552,6 +6133,9 @@ const CONSOLE_JS = `
               'background-color': accent,
             },
           },
+          { selector: '.dimmed', style: { 'opacity': 0.14 } },
+          { selector: '.related', style: { 'opacity': 0.92, 'border-width': 2, 'border-color': accent2 } },
+          { selector: '.pinned', style: { 'border-width': 3, 'border-color': accent, 'opacity': 1 } },
         ],
         layout: {
           name: 'cose',
@@ -5569,11 +6153,59 @@ const CONSOLE_JS = `
         userZoomingEnabled: true,
       });
 
-      memGraphCy.on('mouseover', 'node', (event) => renderGraphDetail(detail, event.target));
-      memGraphCy.on('tap', 'node', (event) => renderGraphDetail(detail, event.target, true));
+      memGraphCy.on('mouseover', 'node', (event) => {
+        if (!memGraphPinnedNode) renderGraphDetail(detail, event.target);
+      });
+      memGraphCy.on('tap', 'node', (event) => {
+        memGraphPinnedNode = event.target;
+        highlightGraphNeighborhood(event.target);
+        renderGraphDetail(detail, event.target, true);
+      });
+      memGraphCy.on('tap', (event) => {
+        if (event.target !== memGraphCy) return;
+        memGraphPinnedNode = null;
+        memGraphCy.elements().removeClass('dimmed related pinned');
+      });
+      applyMemoryGraphFilters();
     } catch (err) {
       canvas.innerHTML = '<div class="mem-empty" style="padding:24px; color:var(--accent-fail);">Failed: ' + escMem(err.message || err) + '</div>';
     }
+  }
+
+  function applyMemoryGraphFilters() {
+    if (!memGraphCy) return;
+    const type = mem.graphType?.value || '';
+    const query = (mem.graphSearch?.value || '').trim().toLowerCase();
+    let visible = 0;
+    memGraphCy.nodes().forEach((node) => {
+      const d = node.data();
+      const haystack = [d.label, d.content, d.kind, d.id].filter(Boolean).join(' ').toLowerCase();
+      const show = (!type || d.type === type) && (!query || haystack.includes(query));
+      node.style('display', show ? 'element' : 'none');
+      if (show) visible += 1;
+    });
+    memGraphCy.edges().forEach((edge) => {
+      const show = edge.source().style('display') !== 'none' && edge.target().style('display') !== 'none';
+      edge.style('display', show ? 'element' : 'none');
+    });
+    if (mem.graphMeta && memGraphData) {
+      const edges = memGraphData.edges || [];
+      const sparse = edges.length <= Math.max(2, Math.floor((memGraphData.nodes || []).length / 3));
+      mem.graphMeta.textContent = visible + '/' + (memGraphData.nodes || []).length + ' nodes' + (sparse ? ' · sparse links' : '');
+    }
+    if (memGraphCy) {
+      memGraphCy.resize();
+      const visibleElements = memGraphCy.elements().filter((el) => el.style('display') !== 'none');
+      if (visibleElements.length > 0) memGraphCy.fit(visibleElements, 42);
+    }
+  }
+
+  function highlightGraphNeighborhood(node) {
+    if (!memGraphCy) return;
+    const neighborhood = node.closedNeighborhood();
+    memGraphCy.elements().addClass('dimmed').removeClass('related pinned');
+    neighborhood.removeClass('dimmed').addClass('related');
+    node.addClass('pinned');
   }
 
   function renderGraphDetail(detail, node, pinned) {
@@ -5587,12 +6219,24 @@ const CONSOLE_JS = `
     if (kind === 'fact') {
       if (d.kind) body.push('<p style="margin:8px 0 4px;"><strong>Kind:</strong> ' + escMem(d.kind) + '</p>');
       if (d.content) body.push('<p style="margin:4px 0;">' + escMem(d.content) + '</p>');
+      body.push('<div class="mem-graph-detail-actions">');
+      if (d.kind) body.push('<button data-graph-action="filter-kind" data-value="' + escMem(d.kind) + '">FILTER KIND</button>');
+      if (d.content) body.push('<button data-graph-action="search" data-value="' + escMem(d.content.slice(0, 120)) + '">SEARCH MEMORY</button>');
+      const id = String(d.id || '').startsWith('fact:') ? String(d.id).slice('fact:'.length) : '';
+      if (id) body.push('<button data-graph-action="forget-fact" data-value="' + escMem(id) + '">FORGET FACT</button>');
+      body.push('</div>');
     } else if (kind === 'file') {
       const fullPath = d.id ? d.id.slice('file:'.length) : '';
       body.push('<p style="margin:8px 0 4px;"><code style="font-size:10px;">' + escMem(fullPath) + '</code></p>');
       if (d.chunks) body.push('<p style="margin:4px 0; color:var(--fg-3); font-size:10px;">' + d.chunks + ' chunk' + (d.chunks === 1 ? '' : 's') + '</p>');
+      body.push('<div class="mem-graph-detail-actions"><button data-graph-action="open-file" data-value="' + escMem(fullPath) + '">OPEN FILE</button><button data-graph-action="search" data-value="' + escMem(d.label || fullPath) + '">SEARCH MEMORY</button></div>');
     } else if (kind === 'kind') {
       body.push('<p style="margin:8px 0; color:var(--fg-3);">All facts of this kind cluster here.</p>');
+      const kindValue = String(d.id || '').startsWith('kind:') ? String(d.id).slice('kind:'.length) : d.label;
+      body.push('<div class="mem-graph-detail-actions"><button data-graph-action="filter-kind" data-value="' + escMem(String(kindValue).toLowerCase()) + '">SHOW FACTS</button></div>');
+    }
+    if (memGraphData && (memGraphData.edges || []).length <= Math.max(2, Math.floor((memGraphData.nodes || []).length / 3))) {
+      body.push('<div class="mem-graph-note">Sparse graph: most current links are kind clusters and explicit source mentions. More meeting notes, project facts, and cross-file references will make this denser.</div>');
     }
     detail.innerHTML = body.join('');
   }
@@ -6986,7 +7630,7 @@ const CONSOLE_JS = `
       });
     });
     bindHomeVoiceControls();
-    await refreshHomeAgenda();
+    await Promise.allSettled([refreshHomeAgenda(), refreshHomeCommandCenter()]);
   }
 
   const HOME_LIST_CAP = 5;
@@ -7145,7 +7789,36 @@ const CONSOLE_JS = `
           finalText = event.text || streamedText || '(no reply)';
           pendingApprovalId = event.pendingApprovalId || null;
           setChatTurnText(assistantTurn, finalText);
-          setChatTurnStatus(assistantTurn, pendingApprovalId ? 'approval required' : 'complete');
+          // Status label varies by why the run ended. The grace-turn
+          // case carries a real model-written summary; we just need
+          // to add a [Continue] button below the message so the user
+          // can resume with a fresh budget.
+          const reason = event.stoppedReason || 'success';
+          const turns = event.turnsUsed ? ' (' + event.turnsUsed + ' turns)' : '';
+          if (reason === 'max-turns-with-grace') {
+            setChatTurnStatus(assistantTurn, 'paused at budget' + turns);
+            // Add an inline [Continue] button under the message.
+            const actions = document.createElement('div');
+            actions.className = 'home-chat-turn-actions';
+            actions.style.marginTop = '8px';
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'home-chat-suggest';
+            btn.textContent = '▶ CONTINUE';
+            btn.addEventListener('click', () => {
+              btn.disabled = true;
+              btn.textContent = 'continuing…';
+              sendHomeChat('continue', { onStatus: options.onStatus, onChunk: options.onChunk });
+            });
+            actions.appendChild(btn);
+            assistantTurn.appendChild(actions);
+          } else if (pendingApprovalId) {
+            setChatTurnStatus(assistantTurn, 'approval required');
+          } else if (reason === 'error') {
+            setChatTurnStatus(assistantTurn, 'no reply');
+          } else {
+            setChatTurnStatus(assistantTurn, 'complete' + turns);
+          }
           return;
         }
         if (event.type === 'error') {
@@ -7930,7 +8603,7 @@ const CONSOLE_JS = `
       const detected = Array.isArray(desktop?.detectedWindows) ? desktop.detectedWindows : [];
       const detectedSummary = detected.length === 0
         ? 'no meeting windows currently detected'
-        : detected.map((w) => '• ' + (w.platform || 'meeting') + ' · ' + (w.title || w.windowId) + (w.recording ? ' (recording)' : '')).join('\n');
+        : detected.map((w) => '• ' + (w.platform || 'meeting') + ' · ' + (w.title || w.windowId) + (w.recording ? ' (recording)' : '')).join('\\n');
       const permEntries = desktop?.permissionStatuses && typeof desktop.permissionStatuses === 'object'
         ? Object.entries(desktop.permissionStatuses)
         : [];
