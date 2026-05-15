@@ -6,6 +6,7 @@ import { needsApprovalFromTaxonomy } from '../agents/tool-taxonomy.js';
 import { registerAdminTools } from './admin-tools.js';
 import { registerAgentRunsTools } from './agent-runs-tools.js';
 import { registerAutonomyActionTools } from './autonomy-action-tools.js';
+import { registerBrowserHarnessTools } from './browser-harness-tools.js';
 import { registerCapabilityTools } from './capability-tools.js';
 import { registerDynamicTools } from './dynamic-tools.js';
 import { registerExecutionTools } from './execution-tools.js';
@@ -145,6 +146,7 @@ function captureLocalTools(): CapturedLocalTool[] {
   registerExecutionTools(server);
   registerProfileTools(server);
   registerCapabilityTools(server);
+  registerBrowserHarnessTools(server);
   registerMcpStatusTools(server);
   const dynamicToolStart = captured.length;
   registerDynamicTools(server);

@@ -47,6 +47,13 @@ export const SECRET_DESCRIPTORS: readonly SecretDescriptor[] = [
     setupHint: 'Sign up at https://www.recall.ai and create an API key for Desktop Recording SDK uploads.',
   },
   {
+    name: 'browser_use_api_key',
+    description: 'Browser Use API key — optional cloud browser support for Browser Harness when local Chrome is not the right execution target.',
+    envVarName: 'BROWSER_USE_API_KEY',
+    required: false,
+    setupHint: 'Create one at https://cloud.browser-use.com/new-api-key. Local Chrome Browser Harness does not require this.',
+  },
+  {
     name: 'codex_oauth_access_token',
     description: 'Codex OAuth access token — primary agent runtime auth for ChatGPT/Codex subscribers.',
     envVarName: '', // populated by clementine auth login-native, not from env

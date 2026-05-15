@@ -22,6 +22,8 @@ export const LOCAL_MCP_TOOL_NAMES = [
   'discover_work',
   'check_capability',
   'list_capabilities',
+  'browser_harness_status',
+  'browser_harness_run',
   'mcp_status',
   'goal_create',
   'goal_update',

@@ -214,6 +214,24 @@ export const CAPABILITY_REGISTRY: Readonly<CapabilityDescriptor[]> = Object.free
     installHint: 'Install via Homebrew: brew install jq',
     category: 'devtools',
   },
+  {
+    name: 'uv',
+    friendlyName: 'uv',
+    description: 'Python package/tool manager used to install Browser Harness cleanly.',
+    probeArgs: ['--version'],
+    installHint: 'Install from https://docs.astral.sh/uv/getting-started/installation/ or via Homebrew: brew install uv',
+    docsUrl: 'https://docs.astral.sh/uv/',
+    category: 'devtools',
+  },
+  {
+    name: 'browser-harness',
+    friendlyName: 'Browser Harness',
+    description: 'Direct CDP browser control for real Chrome or Browser Use cloud browsers.',
+    probeArgs: ['--version'],
+    installHint: 'Install from the Integrations tab, or manually: git clone https://github.com/browser-use/browser-harness ~/Developer/browser-harness && cd ~/Developer/browser-harness && uv tool install -e .',
+    docsUrl: 'https://github.com/browser-use/browser-harness',
+    category: 'devtools',
+  },
 ]);
 
 export interface CapabilityCheckResult {

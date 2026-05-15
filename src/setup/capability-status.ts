@@ -23,6 +23,7 @@ const GLOBAL_CLI_CHECKS: Array<{
   { id: 'pnpm', label: 'pnpm', command: 'pnpm', versionArgs: ['--version'], purpose: 'workspace package management when projects use pnpm' },
   { id: 'python3', label: 'Python', command: 'python3', versionArgs: ['--version'], purpose: 'Python automation and local scripts' },
   { id: 'uv', label: 'uv', command: 'uv', versionArgs: ['--version'], purpose: 'modern Python package and task workflows' },
+  { id: 'browser-harness', label: 'Browser Harness', command: 'browser-harness', versionArgs: ['--version'], purpose: 'native browser automation through a real Chrome or Browser Use cloud browser' },
   { id: 'gh', label: 'GitHub CLI', command: 'gh', versionArgs: ['--version'], purpose: 'GitHub issues, PRs, and repository operations' },
   { id: 'codex', label: 'Codex CLI', command: 'codex', versionArgs: ['--version'], purpose: 'ChatGPT/Codex OAuth bootstrap and local agent auth' },
   { id: 'railway', label: 'Railway CLI', command: 'railway', versionArgs: ['--version'], purpose: 'Railway deploy and service workflows' },

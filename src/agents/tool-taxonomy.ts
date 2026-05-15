@@ -103,7 +103,7 @@ const NAME_PATTERNS: Array<{ kind: ToolKind; needles: string[] }> = [
     needles: [
       'run_shell_command', 'exec_', '_exec_', 'execute_', '_execute_',
       'spawn_', 'launch_', 'run_workflow', 'run_plan', 'run_task',
-      'run_agent', 'invoke_workflow',
+      'run_agent', 'invoke_workflow', 'browser_harness_run',
     ],
   },
   {
@@ -128,7 +128,7 @@ const NAME_PATTERNS: Array<{ kind: ToolKind; needles: string[] }> = [
       'lookup_', 'retrieve_', 'describe_', 'browse_', 'scan_', 'view_',
       'inspect_', 'status_', 'head_', 'peek_', 'count_', 'summarize_',
       'recall', 'observe', 'capture_', 'ping', 'snapshot_', 'preview_',
-      'show_', 'check_',
+      'show_', 'check_', 'browser_harness_status',
     ],
   },
 ];
