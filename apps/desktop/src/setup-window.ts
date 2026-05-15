@@ -371,6 +371,12 @@ const SETUP_JS = `
     openaiKey: '',
     codexInstructions: '',
     discordToken: '',
+    discordOwnerId: '',
+    discordClientId: '',
+    discordAppName: '',
+    discordInstallUrl: '',
+    discordVerifyStatus: '', // '' | 'verifying' | 'ok' | 'error'
+    discordVerifyMessage: '',
     composioKey: '',
     workspaces: [],          // string paths
     profile: {
@@ -462,16 +468,40 @@ const SETUP_JS = `
   }
 
   function renderDiscord() {
+    const verifyDisabled = !state.discordToken || state.discordVerifyStatus === 'verifying';
+    let verifiedBlock = '';
+    if (state.discordVerifyStatus === 'ok') {
+      verifiedBlock = [
+        '<div class="status-msg ok" style="margin-top:12px;">Verified: ' + esc(state.discordAppName || 'bot') + ' (' + esc(state.discordClientId) + ')</div>',
+        '<div class="field" style="margin-top:14px;">',
+        '  <label>YOUR DISCORD USER ID</label>',
+        '  <input type="text" data-state="discordOwnerId" value="' + esc(state.discordOwnerId) + '" placeholder="e.g. 123456789012345678" autocomplete="off" spellcheck="false" inputmode="numeric" />',
+        '  <span class="hint">Right-click your name in Discord → Copy User ID. Used so only you can DM the bot.</span>',
+        '</div>',
+        '<div class="field" style="margin-top:14px;">',
+        '  <label>BOT INSTALL LINK</label>',
+        '  <div class="hint" style="word-break:break-all;">' + esc(state.discordInstallUrl) + '</div>',
+        '  <button class="ws-pick" type="button" data-discord-open style="margin-top:8px;">OPEN INSTALL LINK ▸</button>',
+        '  <span class="hint" style="display:block;margin-top:6px;">Opens in your default browser so you can pick the server to add the bot to.</span>',
+        '</div>',
+      ].join('');
+    } else if (state.discordVerifyStatus === 'error') {
+      verifiedBlock = '<div class="status-msg warn" style="margin-top:12px;">' + esc(state.discordVerifyMessage || 'Verification failed') + '</div>';
+    } else if (state.discordVerifyStatus === 'verifying') {
+      verifiedBlock = '<div class="status-msg" style="margin-top:12px;">Verifying token with Discord…</div>';
+    }
     return [
       '<div class="step active">',
       '  <div class="step-tag">INTEGRATION · 03</div>',
       '  <h1>Discord (optional)</h1>',
-      '  <div class="step-desc">If you want to chat with me on Discord, paste the bot token. Skip otherwise.</div>',
+      '  <div class="step-desc">Paste the bot token, click Verify, then add the bot to a server. Skip otherwise.</div>',
       '  <div class="field">',
       '    <label>DISCORD BOT TOKEN</label>',
       '    <input type="password" data-state="discordToken" value="' + esc(state.discordToken) + '" placeholder="paste token or leave blank" autocomplete="off" spellcheck="false" />',
       '    <span class="hint">Create one at discord.com/developers/applications. Bot needs the Message Content + Server Members intents.</span>',
+      '    <button class="ws-pick" type="button" data-discord-verify style="margin-top:8px;"' + (verifyDisabled ? ' disabled' : '') + '>VERIFY TOKEN</button>',
       '  </div>',
+           verifiedBlock,
       '</div>',
     ].join('');
   }
@@ -585,6 +615,43 @@ const SETUP_JS = `
         renderStep();
       });
     });
+    const verifyBtn = mainEl.querySelector('[data-discord-verify]');
+    if (verifyBtn) {
+      verifyBtn.addEventListener('click', async () => {
+        const token = (state.discordToken || '').trim();
+        if (!token || !window.clemmy || !window.clemmy.setupDiscordVerify) return;
+        state.discordVerifyStatus = 'verifying';
+        state.discordVerifyMessage = '';
+        renderStep();
+        try {
+          const result = await window.clemmy.setupDiscordVerify(token);
+          if (result && result.ok) {
+            state.discordClientId = result.clientId;
+            state.discordAppName = result.appName || '';
+            state.discordInstallUrl = result.installUrl;
+            state.discordVerifyStatus = 'ok';
+          } else {
+            state.discordVerifyStatus = 'error';
+            state.discordVerifyMessage = (result && result.error) || 'Verification failed';
+          }
+        } catch (err) {
+          state.discordVerifyStatus = 'error';
+          state.discordVerifyMessage = err && err.message ? err.message : String(err);
+        }
+        renderStep();
+      });
+    }
+    const openBtn = mainEl.querySelector('[data-discord-open]');
+    if (openBtn) {
+      openBtn.addEventListener('click', async () => {
+        if (!state.discordInstallUrl || !window.clemmy || !window.clemmy.setupOpenExternal) return;
+        try {
+          await window.clemmy.setupOpenExternal(state.discordInstallUrl);
+        } catch (err) {
+          alert('Could not open browser: ' + (err && err.message ? err.message : String(err)));
+        }
+      });
+    }
   }
 
   backBtn.addEventListener('click', () => {
@@ -610,9 +677,15 @@ const SETUP_JS = `
       if (state.authChoice === 'openai' && state.openaiKey) {
         await window.clemmy.credentialsSet('openai_api_key', state.openaiKey);
       }
-      // 2. Discord
+      // 2. Discord — token (secret), client ID + owner ID (non-secret env)
       if (state.discordToken) {
         await window.clemmy.credentialsSet('discord_bot_token', state.discordToken);
+      }
+      if (state.discordClientId || state.discordOwnerId) {
+        await window.clemmy.setupSaveDiscordConfig({
+          clientId: state.discordClientId || '',
+          ownerId: state.discordOwnerId ? state.discordOwnerId.trim() : '',
+        });
       }
       // 3. Composio
       if (state.composioKey) {

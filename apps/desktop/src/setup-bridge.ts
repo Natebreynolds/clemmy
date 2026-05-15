@@ -74,6 +74,19 @@ export function ensureHomeEnv(values: Record<string, string>): void {
   writeEnvFile(HOME_ENV, env);
 }
 
+/** Always overwrites the given keys in the home .env (drops empty values). */
+export function setHomeEnv(values: Record<string, string>): void {
+  const env = readEnvFile(HOME_ENV);
+  for (const [k, v] of Object.entries(values)) {
+    if (v === '' || v === undefined) {
+      delete env[k];
+    } else {
+      env[k] = v;
+    }
+  }
+  writeEnvFile(HOME_ENV, env);
+}
+
 export interface ProfilePatch {
   preferredName?: string;
   displayName?: string;

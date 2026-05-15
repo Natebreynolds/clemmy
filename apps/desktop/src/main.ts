@@ -35,7 +35,7 @@ import {
   setCredential,
   type CredentialName,
 } from './credentials-bridge.js';
-import { addWorkspaceDir, ensureHomeEnv, saveUserProfile, type ProfilePatch } from './setup-bridge.js';
+import { addWorkspaceDir, ensureHomeEnv, saveUserProfile, setHomeEnv, type ProfilePatch } from './setup-bridge.js';
 
 /**
  * Clementine Desktop — Electron main process.
@@ -166,6 +166,11 @@ function createMainWindow(url: string): BrowserWindow {
     },
   });
   win.loadURL(url);
+  // Auto-open DevTools when running unpackaged (dev mode) so renderer
+  // errors are visible without the user having to know ⌘⌥I.
+  if (!app.isPackaged) {
+    win.webContents.openDevTools({ mode: 'right' });
+  }
   win.on('close', (event: { preventDefault(): void }) => {
     // On macOS we keep the app alive in the tray. Hide instead of
     // quit; cmd-Q exits explicitly.
@@ -545,6 +550,48 @@ ipcMain.handle('clemmy:setup-save-workspace', async (_evt: IpcMainInvokeEvent, p
   const p = (payload?.path ?? '').trim();
   if (!p) throw new Error('path required');
   addWorkspaceDir(p);
+  return { ok: true };
+});
+
+ipcMain.handle('clemmy:setup-discord-verify', async (_evt: IpcMainInvokeEvent, payload: { token: string }) => {
+  const token = (payload?.token ?? '').trim();
+  if (!token) return { ok: false as const, error: 'token required' };
+  try {
+    const response = await fetch('https://discord.com/api/v10/oauth2/applications/@me', {
+      headers: { Authorization: `Bot ${token}` },
+    });
+    if (!response.ok) {
+      const body = await response.text();
+      return { ok: false as const, error: `Discord lookup failed (${response.status}): ${body.slice(0, 200)}` };
+    }
+    const data = await response.json() as { id?: string; name?: string };
+    if (!data.id) return { ok: false as const, error: 'Discord lookup did not return an application id' };
+    const permissions = '274878000128'; // ViewChannel|SendMessages|ReadHistory|EmbedLinks|AttachFiles|AddReactions
+    const installUrl = `https://discord.com/oauth2/authorize?client_id=${encodeURIComponent(data.id)}&scope=${encodeURIComponent('bot applications.commands')}&permissions=${permissions}`;
+    return {
+      ok: true as const,
+      clientId: data.id,
+      appName: data.name ?? '',
+      installUrl,
+    };
+  } catch (err) {
+    return { ok: false as const, error: err instanceof Error ? err.message : String(err) };
+  }
+});
+
+ipcMain.handle('clemmy:setup-open-external', async (_evt: IpcMainInvokeEvent, payload: { url: string }) => {
+  const url = (payload?.url ?? '').trim();
+  if (!url) throw new Error('url required');
+  if (!/^https?:\/\//i.test(url)) throw new Error('only http(s) urls are allowed');
+  await shell.openExternal(url);
+  return { ok: true };
+});
+
+ipcMain.handle('clemmy:setup-save-discord-config', async (_evt: IpcMainInvokeEvent, payload: { clientId?: string; ownerId?: string }) => {
+  const env: Record<string, string> = {};
+  if (payload?.clientId !== undefined) env.DISCORD_CLIENT_ID = payload.clientId.trim();
+  if (payload?.ownerId !== undefined) env.DISCORD_DM_ALLOWED_USERS = payload.ownerId.trim();
+  if (Object.keys(env).length > 0) setHomeEnv(env);
   return { ok: true };
 });
 

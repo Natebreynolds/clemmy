@@ -280,12 +280,17 @@ function sleep(ms: number): Promise<void> {
 /** Try to bind to `preferred`; if busy, walk forward until we find one
  *  that's free. Caps at 50 attempts. */
 async function pickFreePort(preferred: number): Promise<number> {
+  // Probe on 0.0.0.0 to match how the daemon actually binds. Probing on
+  // 127.0.0.1 could falsely succeed when another process has 0.0.0.0:p
+  // (the loopback test slot is technically distinct from the wildcard
+  // bind on some kernels), letting us hand out a port the daemon will
+  // immediately fail to acquire with EADDRINUSE.
   for (let p = preferred; p < preferred + 50; p++) {
     const ok = await new Promise<boolean>((resolve) => {
       const server = createServer();
       server.once('error', () => resolve(false));
       server.once('listening', () => server.close(() => resolve(true)));
-      server.listen(p, '127.0.0.1');
+      server.listen(p, '0.0.0.0');
     });
     if (ok) return p;
   }

@@ -19,8 +19,13 @@
  * the integration surface, but the periodic check is skipped.
  */
 import { app, Notification } from 'electron';
-import { autoUpdater, type UpdateInfo } from 'electron-updater';
+import electronUpdater, { type UpdateInfo } from 'electron-updater';
 import path from 'node:path';
+
+// electron-updater is published as CommonJS. Under Node ESM the named
+// `autoUpdater` export isn't statically detected, so we have to pull it
+// off the default export instead.
+const { autoUpdater } = electronUpdater;
 import { appendFileSync, existsSync, mkdirSync } from 'node:fs';
 
 const CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4 hours

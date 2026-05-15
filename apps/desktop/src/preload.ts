@@ -75,6 +75,15 @@ const api = {
   setupComplete: (record: Record<string, unknown>) => ipcRenderer.invoke('clemmy:setup-complete', record) as Promise<{ ok: boolean }>,
   /** Wizard skipped — close + boot dashboard anyway. */
   setupSkip: () => ipcRenderer.invoke('clemmy:setup-skip') as Promise<{ ok: boolean }>,
+  /** Validate a Discord bot token; on success returns clientId/appName/installUrl. */
+  setupDiscordVerify: (token: string) => ipcRenderer.invoke('clemmy:setup-discord-verify', { token }) as Promise<
+    | { ok: true; clientId: string; appName: string; installUrl: string }
+    | { ok: false; error: string }
+  >,
+  /** Open an http(s) URL in the user's default browser. */
+  setupOpenExternal: (url: string) => ipcRenderer.invoke('clemmy:setup-open-external', { url }) as Promise<{ ok: boolean }>,
+  /** Persist DISCORD_CLIENT_ID and/or DISCORD_DM_ALLOWED_USERS to ~/.clementine-next/.env. */
+  setupSaveDiscordConfig: (payload: { clientId?: string; ownerId?: string }) => ipcRenderer.invoke('clemmy:setup-save-discord-config', payload) as Promise<{ ok: boolean }>,
 };
 
 contextBridge.exposeInMainWorld('clemmy', api);
