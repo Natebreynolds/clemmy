@@ -34,6 +34,17 @@ const api = {
   recallRequestPermissions: () => ipcRenderer.invoke('clemmy:recall-request-permissions') as Promise<Record<string, unknown> | null>,
   recallStartManual: () => ipcRenderer.invoke('clemmy:recall-start-manual') as Promise<Record<string, unknown> | null>,
   recallStop: () => ipcRenderer.invoke('clemmy:recall-stop') as Promise<Record<string, unknown> | null>,
+  /** Forces an SDK init (if enabled) and returns the full status incl.
+   *  permissionStatuses + detectedWindows. Use this for the dashboard's
+   *  "Test Connection" diagnostic button. */
+  recallTest: () => ipcRenderer.invoke('clemmy:recall-test') as Promise<Record<string, unknown> | null>,
+
+  /** Auto-updater status (checking/no-update/available/downloading/ready/error). */
+  updaterStatus: () => ipcRenderer.invoke('clemmy:updater-status') as Promise<Record<string, unknown>>,
+  /** Manually trigger a one-shot update check. Returns the new status. */
+  updaterCheck: () => ipcRenderer.invoke('clemmy:updater-check') as Promise<Record<string, unknown>>,
+  /** Quit+install a downloaded update (no-op when state isn't `ready-to-install`). */
+  updaterApply: () => ipcRenderer.invoke('clemmy:updater-apply') as Promise<Record<string, unknown>>,
   onRecallEvent: (cb: (event: Record<string, unknown>) => void) => {
     const handler = (_event: unknown, payload: Record<string, unknown>) => cb(payload);
     ipcRenderer.on('clemmy:recall-event', handler);

@@ -5038,6 +5038,42 @@ const CONSOLE_JS = `
     } catch (err) { /* leave placeholder */ }
   })();
 
+  // Auto-updater hint in the header. We only display when we have a
+  // real signal (avail / downloading / ready / error) — silent on
+  // idle and no-update. Single tap installs when ready. The tray
+  // menu is the durable affordance; this is just a glanceable banner.
+  if (window.clemmy?.updaterStatus) {
+    const renderUpdaterChip = async () => {
+      let info;
+      try { info = await window.clemmy.updaterStatus(); } catch { return; }
+      const sub = document.querySelector('[data-daemon-version]');
+      if (!sub) return;
+      const baseLabel = sub.dataset.baseLabel || sub.textContent || '';
+      sub.dataset.baseLabel = baseLabel;
+      let suffix = '';
+      if (info.state === 'available' || info.state === 'downloading') {
+        suffix = ' · ' + (info.progressPct ? 'downloading ' + info.progressPct + '%' : 'update available');
+      } else if (info.state === 'ready-to-install') {
+        suffix = ' · click for v' + (info.version || '') + ' update';
+        sub.style.cursor = 'pointer';
+        sub.title = 'Restart Clementine to install v' + (info.version || '');
+        sub.onclick = () => { window.clemmy?.updaterApply?.(); };
+      } else if (info.state === 'error') {
+        suffix = ' · update check failed';
+        sub.title = info.error || '';
+      } else {
+        sub.style.cursor = '';
+        sub.title = '';
+        sub.onclick = null;
+      }
+      sub.textContent = baseLabel + suffix;
+    };
+    renderUpdaterChip();
+    // Poll every 30s — cheap, doesn't block, picks up state changes
+    // that fire after auto-updater's periodic check (4h cadence).
+    setInterval(renderUpdaterChip, 30_000);
+  }
+
   function fmtTime(iso) {
     if (!iso) return '—';
     return iso.slice(11, 19);
@@ -7872,18 +7908,50 @@ const CONSOLE_JS = `
         '<label class="check-pill"><input type="checkbox" data-hub-recall-live ' + (settings.liveTranscript ? 'checked' : '') + ' /> LIVE TRANSCRIPT</label>',
         '<label class="check-pill"><input type="checkbox" data-hub-recall-analyze ' + (settings.analyzeOnComplete !== false ? 'checked' : '') + ' /> ANALYZE AFTER</label>',
         '<button data-hub-recall-save-settings>SAVE SETTINGS</button>',
+        electronReady ? '<button data-hub-recall-test>TEST CONNECTION</button>' : '',
         electronReady ? '<button data-hub-recall-perms>REQUEST PERMISSIONS</button>' : '',
         electronReady ? '<button data-hub-recall-manual>START MANUAL</button>' : '',
         electronReady ? '<button data-hub-recall-stop>STOP</button>' : '',
       ].filter(Boolean).join('');
 
+      // Roll up the SDK + permission + window state into the
+      // diagnostic the user actually needs at a glance.
+      const recordingAt = desktop?.lastEventAt
+        ? new Date(desktop.lastEventAt).toLocaleString()
+        : 'never';
+      const sdkSummary = !electronReady ? 'electron only — open in Clementine.app to inspect SDK'
+        : desktop?.sdkAvailable === false ? '✗ SDK failed to load'
+        : !desktop?.enabled ? '— SDK disabled (turn ENABLED on, then save settings)'
+        : !desktop?.initialized ? '⚠ SDK not yet initialized — click TEST CONNECTION'
+        : '✓ SDK initialized · region ' + (settings.region || 'us-west-2');
+      const recordingSummary = desktop?.recording
+        ? '✓ recording window ' + (desktop.currentWindowId || '')
+        : 'idle';
+      const detected = Array.isArray(desktop?.detectedWindows) ? desktop.detectedWindows : [];
+      const detectedSummary = detected.length === 0
+        ? 'no meeting windows currently detected'
+        : detected.map((w) => '• ' + (w.platform || 'meeting') + ' · ' + (w.title || w.windowId) + (w.recording ? ' (recording)' : '')).join('\n');
+      const permEntries = desktop?.permissionStatuses && typeof desktop.permissionStatuses === 'object'
+        ? Object.entries(desktop.permissionStatuses)
+        : [];
+      const permissionSummary = permEntries.length === 0
+        ? 'no permission status received yet — click REQUEST PERMISSIONS'
+        : permEntries
+            .map(([perm, state]) => {
+              const mark = state === 'granted' ? '✓' : state === 'denied' ? '✗' : '⚠';
+              return mark + ' ' + perm + ': ' + state;
+            })
+            .join(' · ');
+
       const statusRows = [
         ['Credential', hasKey ? 'connected via ' + (credential.source || 'vault') : 'not configured'],
-        ['Electron bridge', electronReady ? 'available' : 'open in Clementine desktop app to control recording'],
-        ['SDK', desktop?.sdkAvailable ? 'loaded/available' : desktop?.initialized ? 'initialized' : 'not loaded'],
-        ['Recording', desktop?.recording ? 'active: ' + (desktop.currentWindowId || '') : 'idle'],
-        ['Last event', desktop?.lastEvent || 'none'],
+        ['Electron bridge', electronReady ? 'available' : 'open in Clementine.app to control recording'],
+        ['SDK', sdkSummary],
+        ['Permissions', permissionSummary],
+        ['Recording', recordingSummary],
+        ['Last event', (desktop?.lastEvent || 'none') + (desktop?.lastEventAt ? ' (' + recordingAt + ')' : '')],
         ['Last meeting', desktop?.lastMeeting ? [desktop.lastMeeting.platform, desktop.lastMeeting.title].filter(Boolean).join(' · ') || desktop.lastMeeting.windowId : 'none'],
+        ['Detected windows', detectedSummary],
         ['Error', desktop?.lastError || 'none'],
       ];
       listEl.innerHTML = [
@@ -7891,7 +7959,7 @@ const CONSOLE_JS = `
         '  <div class="hub-app-name">Recall.ai Desktop SDK</div>',
         '  <span class="hub-app-pill ' + (settings.enabled && hasKey ? 'active' : 'available') + '">' + (settings.enabled && hasKey ? 'READY' : 'OPTIONAL') + '</span>',
         '  <div class="hub-app-meta">Records only when enabled. Transcripts are saved to the local vault and then handed to Clementine as background analysis tasks.</div>',
-        '  <div class="settings-info" style="margin-top:10px">' + statusRows.map(([k, v]) => '<div class="row"><span class="k">' + escMem(k) + '</span><span class="v">' + escMem(v) + '</span></div>').join('') + '</div>',
+        '  <div class="settings-info" style="margin-top:10px;white-space:pre-wrap">' + statusRows.map(([k, v]) => '<div class="row"><span class="k">' + escMem(k) + '</span><span class="v">' + escMem(v) + '</span></div>').join('') + '</div>',
         '</div>',
       ].join('');
 
@@ -7951,6 +8019,37 @@ const CONSOLE_JS = `
         permBtn.addEventListener('click', async () => {
           try { await window.clemmy.recallRequestPermissions(); await refreshHubRecall(); }
           catch (err) { alert('Permission request failed: ' + (err.message || err)); }
+        });
+      }
+      const testBtn = controlsEl.querySelector('[data-hub-recall-test]');
+      if (testBtn) {
+        testBtn.addEventListener('click', async () => {
+          if (!window.clemmy?.recallTest) {
+            alert('Test Connection requires the Clementine desktop app. Open Clementine.app to run it.');
+            return;
+          }
+          testBtn.textContent = 'TESTING…';
+          try {
+            const result = await window.clemmy.recallTest();
+            // Refresh first so the new state is rendered, then drop a
+            // human-readable summary so the user knows the test actually
+            // returned (vs the silent re-render).
+            await refreshHubRecall();
+            const summary = !result
+              ? 'no result returned'
+              : !result.sdkAvailable
+                ? 'SDK could not load: ' + (result.lastError || 'unknown error')
+                : !result.enabled
+                  ? 'SDK is disabled — turn ENABLED on and save settings, then test again'
+                  : !result.initialized
+                    ? 'SDK loaded but init failed: ' + (result.lastError || 'unknown error')
+                    : 'SDK initialized · ' + (Array.isArray(result.detectedWindows) ? result.detectedWindows.length : 0) + ' detected window(s)';
+            alert('Recall test: ' + summary);
+          } catch (err) {
+            alert('Test failed: ' + (err.message || err));
+          } finally {
+            testBtn.textContent = 'TEST CONNECTION';
+          }
         });
       }
       const manualBtn = controlsEl.querySelector('[data-hub-recall-manual]');

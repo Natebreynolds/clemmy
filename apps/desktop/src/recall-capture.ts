@@ -16,11 +16,33 @@ export interface RecallCaptureStatus {
   currentWindowId?: string;
   lastError?: string;
   lastEvent?: string;
+  lastEventAt?: string;
   lastMeeting?: {
     windowId: string;
     platform?: string;
     title?: string;
   };
+  /**
+   * Per-permission status as reported by the SDK's `permission-status`
+   * event. Keys are the permission slugs (`accessibility`, `microphone`,
+   * `screen-capture`, etc.); values are the SDK's own strings — usually
+   * `granted` | `denied` | `not-determined`. Empty until the SDK fires
+   * its first event, so callers should treat missing keys as "unknown."
+   */
+  permissionStatuses: Record<string, string>;
+  /**
+   * Snapshot of any meeting windows the SDK has detected during this
+   * session that are still considered open. Lets the "Test Connection"
+   * button answer "can the SDK currently see my Zoom?" without forcing
+   * the user to dig through the logs. Resets on SDK shutdown.
+   */
+  detectedWindows: Array<{
+    windowId: string;
+    platform?: string;
+    title?: string;
+    detectedAt: string;
+    recording?: boolean;
+  }>;
   settings: RecallCaptureSettings;
 }
 
@@ -139,7 +161,10 @@ export class RecallDesktopCapture {
   private currentWindowId: string | undefined;
   private lastError: string | undefined;
   private lastEvent: string | undefined;
+  private lastEventAt: string | undefined;
   private lastMeeting: RecallCaptureStatus['lastMeeting'];
+  private permissionStatuses: Record<string, string> = {};
+  private detectedWindows = new Map<string, RecallCaptureStatus['detectedWindows'][number]>();
 
   constructor(private readonly opts: RecallCaptureOptions) {}
 
@@ -152,9 +177,17 @@ export class RecallDesktopCapture {
       currentWindowId: this.currentWindowId,
       lastError: this.lastError,
       lastEvent: this.lastEvent,
+      lastEventAt: this.lastEventAt,
       lastMeeting: this.lastMeeting,
+      permissionStatuses: { ...this.permissionStatuses },
+      detectedWindows: Array.from(this.detectedWindows.values()),
       settings: this.settings,
     };
+  }
+
+  private noteEvent(name: string): void {
+    this.lastEvent = name;
+    this.lastEventAt = new Date().toISOString();
   }
 
   async configure(settings: Partial<RecallCaptureSettings>): Promise<RecallCaptureStatus> {
@@ -209,6 +242,29 @@ export class RecallDesktopCapture {
     this.initialized = false;
     this.recording = false;
     this.currentWindowId = undefined;
+    this.detectedWindows.clear();
+    this.permissionStatuses = {};
+  }
+
+  /**
+   * Diagnostic — drives the dashboard "Test Connection" button. Forces
+   * an SDK init if settings.enabled but the SDK hasn't loaded yet,
+   * then returns the full status (which includes permissionStatuses
+   * and detectedWindows). Errors are captured into lastError instead
+   * of throwing so the UI can render them.
+   */
+  async testConnection(): Promise<RecallCaptureStatus> {
+    if (!this.settings.enabled) {
+      // The SDK is gated on the user enabling capture; we don't force
+      // it to load when the user has explicitly disabled it.
+      return this.status();
+    }
+    try {
+      await this.initialize();
+    } catch (err) {
+      this.lastError = err instanceof Error ? err.message : String(err);
+    }
+    return this.status();
   }
 
   private async initialize(): Promise<void> {
@@ -220,7 +276,7 @@ export class RecallDesktopCapture {
     sdk.addEventListener('meeting-closed', (event) => { this.onMeetingClosed(event as { window?: RecallSdkWindow }); });
     sdk.addEventListener('realtime-event', (event) => { void this.onRealtimeEvent(event as RecallRealtimeEvent); });
     sdk.addEventListener('error', (event) => this.onError(event));
-    sdk.addEventListener('permission-status', (event) => this.emit('permission-status', event as Record<string, unknown>));
+    sdk.addEventListener('permission-status', (event) => this.onPermissionStatus(event as Record<string, unknown>));
     await sdk.init({
       apiUrl: REGION_URLS[this.settings.region],
       acquirePermissionsOnStartup: [],
@@ -251,8 +307,15 @@ export class RecallDesktopCapture {
   private async onMeetingDetected(event: { window?: RecallSdkWindow }): Promise<void> {
     const win = event.window;
     if (!win?.id) return;
-    this.lastEvent = 'meeting-detected';
+    this.noteEvent('meeting-detected');
     this.lastMeeting = { windowId: win.id, platform: win.platform, title: win.title };
+    this.detectedWindows.set(win.id, {
+      windowId: win.id,
+      platform: win.platform,
+      title: win.title,
+      detectedAt: new Date().toISOString(),
+      recording: this.recording && this.currentWindowId === win.id,
+    });
     this.emit('meeting-detected', this.lastMeeting);
     await this.postDaemon('/api/console/meetings/recall/detected', {
       windowId: win.id,
@@ -288,7 +351,11 @@ export class RecallDesktopCapture {
     if (!windowId) return;
     this.recording = true;
     this.currentWindowId = windowId;
-    this.lastEvent = 'recording-started';
+    this.noteEvent('recording-started');
+    const existing = this.detectedWindows.get(windowId);
+    if (existing) {
+      this.detectedWindows.set(windowId, { ...existing, recording: true });
+    }
     this.emit('recording-started', { windowId });
   }
 
@@ -298,7 +365,11 @@ export class RecallDesktopCapture {
     if (!windowId) return;
     this.recording = false;
     this.currentWindowId = undefined;
-    this.lastEvent = 'recording-ended';
+    this.noteEvent('recording-ended');
+    const existing = this.detectedWindows.get(windowId);
+    if (existing) {
+      this.detectedWindows.set(windowId, { ...existing, recording: false });
+    }
     const complete = await this.postDaemon('/api/console/meetings/recall/complete', {
       windowId,
       platform: win?.platform ?? this.lastMeeting?.platform,
@@ -309,8 +380,28 @@ export class RecallDesktopCapture {
 
   private onMeetingClosed(event: { window?: RecallSdkWindow }): void {
     const win = event.window;
-    this.lastEvent = 'meeting-closed';
+    this.noteEvent('meeting-closed');
+    if (win?.id) this.detectedWindows.delete(win.id);
     this.emit('meeting-closed', { windowId: win?.id, platform: win?.platform, title: win?.title });
+  }
+
+  /**
+   * `permission-status` event payload shape varies across SDK versions
+   * but always contains a permission name + a granted/denied/etc.
+   * status. Normalise to a flat key→value map.
+   */
+  private onPermissionStatus(event: Record<string, unknown>): void {
+    const permission = typeof event.permission === 'string' ? event.permission
+      : typeof event.name === 'string' ? event.name
+      : undefined;
+    const statusValue = typeof event.status === 'string' ? event.status
+      : typeof event.state === 'string' ? event.state
+      : typeof event.granted === 'boolean' ? (event.granted ? 'granted' : 'denied')
+      : undefined;
+    if (permission && statusValue) {
+      this.permissionStatuses[permission] = statusValue;
+    }
+    this.emit('permission-status', event);
   }
 
   private async onRealtimeEvent(event: RecallRealtimeEvent): Promise<void> {

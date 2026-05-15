@@ -19,6 +19,14 @@ import { needsSetup, hasCompletedSetup, writeSetupComplete, type SetupConfigured
 import { createSetupWindow } from './setup-window.js';
 import { RecallDesktopCapture, type RecallCaptureSettings } from './recall-capture.js';
 import {
+  applyUpdate,
+  checkForUpdatesNow,
+  disposeAutoUpdater,
+  getUpdaterStatus,
+  initAutoUpdater,
+  onUpdaterStatusChange,
+} from './updater.js';
+import {
   deleteCredential,
   ensureWebhookSecret,
   isKeychainAvailable,
@@ -235,13 +243,49 @@ function rebuildTrayMenu(): void {
     { label: 'Restart Daemon', click: () => supervisor?.restart() },
     { label: 'Stop Daemon', click: () => supervisor?.stop() },
     { type: 'separator' },
+    ...buildUpdaterMenuItems(),
     { label: 'Quit Clementine', click: () => quitCleanly() },
   ]);
   tray.setContextMenu(menu);
 }
 
+function buildUpdaterMenuItems(): Electron.MenuItemConstructorOptions[] {
+  const u = getUpdaterStatus();
+  // We always show ONE updater entry plus a divider. The label changes
+  // by state so the tray flip ("Restart to install vX.Y.Z") is the
+  // durable affordance to the user.
+  let label = 'Check for Updates';
+  let click: (() => void) | undefined = () => { void checkForUpdatesNow(); };
+  let enabled = true;
+
+  if (u.state === 'checking') {
+    label = 'Checking for updates…';
+    enabled = false;
+    click = undefined;
+  } else if (u.state === 'available' || u.state === 'downloading') {
+    label = u.progressPct
+      ? `Downloading v${u.version || ''} · ${u.progressPct}%`
+      : `Downloading v${u.version || ''}…`;
+    enabled = false;
+    click = undefined;
+  } else if (u.state === 'ready-to-install') {
+    label = `Restart to install v${u.version || ''}`;
+    click = () => applyUpdate();
+  } else if (u.state === 'no-update') {
+    label = 'Clementine is up to date';
+  } else if (u.state === 'error') {
+    label = `Update error: ${u.error?.slice(0, 60) || 'unknown'} — retry`;
+  }
+
+  return [
+    { label, click, enabled },
+    { type: 'separator' as const },
+  ];
+}
+
 async function quitCleanly(): Promise<void> {
   (app as { isQuitting?: boolean }).isQuitting = true;
+  disposeAutoUpdater();
   await recallCapture?.shutdown().catch(() => { /* ignore */ });
   await supervisor?.stop().catch(() => { /* ignore */ });
   app.quit();
@@ -436,6 +480,27 @@ ipcMain.handle('clemmy:recall-stop', async () => {
   return recallCapture?.stopRecording() ?? null;
 });
 
+ipcMain.handle('clemmy:recall-test', async () => {
+  // Force an SDK init (if enabled) and return the full status incl.
+  // permissionStatuses + detectedWindows so the dashboard's
+  // "Test Connection" button can diagnose why recording isn't firing.
+  await syncRecallCaptureFromDaemon().catch(() => { /* keep going on stale status */ });
+  return recallCapture?.testConnection() ?? null;
+});
+
+// ─── Auto-update IPC ────────────────────────────────────────────────
+
+ipcMain.handle('clemmy:updater-status', () => getUpdaterStatus());
+
+ipcMain.handle('clemmy:updater-check', async () => {
+  return checkForUpdatesNow();
+});
+
+ipcMain.handle('clemmy:updater-apply', () => {
+  applyUpdate();
+  return getUpdaterStatus();
+});
+
 // ─── Setup wizard IPC handlers ─────────────────────────────────────
 
 ipcMain.handle('clemmy:setup-status', async () => ({
@@ -511,7 +576,15 @@ ipcMain.handle('clemmy:setup-skip', async () => {
 
 // ─── App lifecycle ─────────────────────────────────────────────────
 
-app.on('ready', () => { void boot(); setupTray(); });
+app.on('ready', () => {
+  void boot();
+  setupTray();
+  // Arm auto-updater after boot kicks off. Status changes flip the
+  // tray label so the user sees "Restart to install vX.Y.Z" when an
+  // update is downloaded; no modal interrupts.
+  initAutoUpdater({ logFile: LOG_FILE });
+  onUpdaterStatusChange(() => rebuildTrayMenu());
+});
 app.on('window-all-closed', () => {
   // macOS tray-resident pattern. On Linux/Windows we still quit when
   // all windows are gone unless the user is explicitly tray-only.

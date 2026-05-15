@@ -17,6 +17,7 @@
     "release": "npm run build && npm run build:daemon && electron-builder --mac --publish always"
   },
   "dependencies": {
+    "electron-updater": "^6.8.3",
     "keytar": "^7.9.0"
   },
   "devDependencies": {
