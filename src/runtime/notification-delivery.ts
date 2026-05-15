@@ -1,5 +1,10 @@
 import type { NotificationDestination, NotificationRecord } from './notifications.js';
-import { sendDiscordChannelMessage, sendDiscordDirectMessage } from '../channels/discord.js';
+import {
+  buildActionsForNotification,
+  sendDiscordChannelMessage,
+  sendDiscordChannelMessageWithComponents,
+  sendDiscordDirectMessage,
+} from '../channels/discord.js';
 
 function truncate(text: string, max = 1800): string {
   return text.length > max ? `${text.slice(0, max - 1)}…` : text;
@@ -28,9 +33,8 @@ function buildGenericPayload(notification: NotificationRecord): Record<string, u
 function buildDiscordPayload(notification: NotificationRecord): Record<string, unknown> {
   const header = `**${notification.title}**`;
   const body = truncate(notification.body, 1500);
-  const meta = notification.metadata ? `\n\n\`\`\`json\n${truncate(JSON.stringify(notification.metadata, null, 2), 800)}\n\`\`\`` : '';
   return {
-    content: `${header}\n${body}${meta}`,
+    content: `${header}\n${body}`,
   };
 }
 
@@ -42,7 +46,11 @@ export async function deliverNotificationToDestination(
     if (!destination.userId) {
       throw new Error('Discord user destination is missing userId.');
     }
-    await sendDiscordDirectMessage(destination.userId, buildDiscordBotMessage(notification));
+    // Attach approval buttons when the notification carries an
+    // actionable target (approvalId for SDK interrupts, planProposalId
+    // for plan proposals). Plain text otherwise.
+    const components = buildActionsForNotification(notification.metadata);
+    await sendDiscordDirectMessage(destination.userId, buildDiscordBotMessage(notification), { components });
     return;
   }
 
@@ -50,7 +58,12 @@ export async function deliverNotificationToDestination(
     if (!destination.channelId) {
       throw new Error('Discord channel destination is missing channelId.');
     }
-    await sendDiscordChannelMessage(destination.channelId, buildDiscordBotMessage(notification));
+    const components = buildActionsForNotification(notification.metadata);
+    if (components && components.length > 0) {
+      await sendDiscordChannelMessageWithComponents(destination.channelId, buildDiscordBotMessage(notification), components);
+    } else {
+      await sendDiscordChannelMessage(destination.channelId, buildDiscordBotMessage(notification));
+    }
     return;
   }
 
@@ -82,10 +95,7 @@ export async function deliverNotificationToDestination(
 function buildDiscordBotMessage(notification: NotificationRecord): string {
   const header = `**${notification.title}**`;
   const body = truncate(notification.body, 1500);
-  const meta = notification.metadata
-    ? `\n\n\`\`\`json\n${truncate(JSON.stringify(notification.metadata, null, 2), 800)}\n\`\`\``
-    : '';
-  return `${header}\n${body}${meta}`;
+  return `${header}\n${body}`;
 }
 
 export async function testNotificationDestination(destination: NotificationDestination): Promise<void> {

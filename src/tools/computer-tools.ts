@@ -7,6 +7,42 @@ import { z } from 'zod';
 import { BASE_DIR } from '../config.js';
 import type { RuntimeContextValue } from '../types.js';
 import { getWorkspaceDirs } from './shared.js';
+import { loadProactivityPolicy } from '../agents/proactivity-policy.js';
+import { needsApprovalFromTaxonomy } from '../agents/tool-taxonomy.js';
+
+/**
+ * Approval gate for SDK-native tools — delegates to the global
+ * taxonomy in `agents/tool-taxonomy.ts`. The taxonomy layers:
+ *
+ *   1. ALWAYS_ADMIN list → ask regardless of scope.
+ *   2. Hard denylist (`assertCommandAllowed` below) → enforced inside
+ *      the tool's `execute`; even YOLO does not bypass it.
+ *   3. Per-session PlanScope (user pre-approved a plan) → auto.
+ *   4. Global ProactivityPolicy.autoApproveScope (strict/workspace/yolo).
+ *
+ * Computer tools compute `insideWorkspace` per-call from the user's
+ * `path` / `cwd` argument and pass it through the factory.
+ */
+function inputIsInsideWorkspace(toolName: string, input: unknown): boolean {
+  if (!input || typeof input !== 'object') return false;
+  const obj = input as Record<string, unknown>;
+  const target = toolName === 'write_file'
+    ? (typeof obj.path === 'string' ? obj.path : '')
+    : (typeof obj.cwd === 'string' && obj.cwd ? obj.cwd : process.cwd());
+  if (!target) return false;
+  try {
+    const resolved = path.resolve(expandHome(target));
+    return workspaceRoots().some((root) => isInside(root, resolved));
+  } catch {
+    return false;
+  }
+}
+
+function needsApprovalUnlessInPlanScope(toolName: string) {
+  return needsApprovalFromTaxonomy(toolName, {
+    computeInsideWorkspace: (input) => inputIsInsideWorkspace(toolName, input),
+  });
+}
 
 const MAX_COMMAND_OUTPUT_CHARS = 12000;
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -30,9 +66,16 @@ function isInside(parent: string, child: string): boolean {
 
 function resolveAllowedPath(input: string): string {
   const resolved = path.resolve(expandHome(input));
+  // YOLO mode lets the agent act anywhere the user can. The hard
+  // command denylist (assertCommandAllowed) still applies on
+  // run_shell_command, so destructive ops like `rm -rf /` remain
+  // blocked even here.
+  const policy = loadProactivityPolicy();
+  if (policy.autoApproveScope === 'yolo') return resolved;
+
   const roots = workspaceRoots();
   if (!roots.some((root) => isInside(root, resolved))) {
-    throw new Error(`Path is outside allowed workspace roots: ${resolved}`);
+    throw new Error(`Path is outside allowed workspace roots: ${resolved}. Switch to YOLO mode in Settings → Proactivity Policy if you want the agent to act anywhere, or add this dir to WORKSPACE_DIRS in ~/.clementine-next/.env.`);
   }
   return resolved;
 }
@@ -152,12 +195,12 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
 
   const write_file = tool({
     name: 'write_file',
-    description: 'Write a UTF-8 file inside an allowed workspace. Requires approval because it modifies disk.',
+    description: 'Write a UTF-8 file inside an allowed workspace. Requires approval because it modifies disk. Auto-approved if the session has an open PlanScope covering write_file.',
     parameters: z.object({
       path: z.string().min(1),
       content: z.string(),
     }),
-    needsApproval: true,
+    needsApproval: needsApprovalUnlessInPlanScope('write_file'),
     execute: async (input) => {
       const filePath = resolveAllowedPath(input.path);
       mkdirSync(path.dirname(filePath), { recursive: true });
@@ -168,13 +211,13 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
 
   const run_shell_command = tool({
     name: 'run_shell_command',
-    description: 'Run a shell command in an allowed workspace directory. Requires approval and has output/time limits.',
+    description: 'Run a shell command in an allowed workspace directory. Requires per-call approval UNLESS the session has an open PlanScope (the user pre-approved a plan covering this kind of work). Has output and time limits.',
     parameters: z.object({
       command: z.string().min(1),
       cwd: z.string().nullable(),
       timeout_ms: z.number().min(1000).max(120000).nullable(),
     }),
-    needsApproval: true,
+    needsApproval: needsApprovalUnlessInPlanScope('run_shell_command'),
     execute: async (input) => {
       const cwd = resolveAllowedCwd(input.cwd ?? undefined);
       return runCommand(input.command, cwd, input.timeout_ms ?? DEFAULT_TIMEOUT_MS);

@@ -40,10 +40,18 @@ function cleanList(values: string[], maxItems = 6, maxChars = 180): string[] {
   return items;
 }
 
+function isLowSignalTurn(role: 'user' | 'assistant', text: string): boolean {
+  const normalized = text.toLowerCase().replace(/[.!?]+$/g, '').replace(/\s+/g, ' ').trim();
+  if (role === 'user') {
+    return /^(approve|approved|approve all|approved all|reject|rejected|reject all|yes|yes to all|yep|yeah|no|go ahead|proceed|run it|do it|authorized|authorize|cancel|stop)$/i.test(normalized);
+  }
+  return /^approval required before i continue\.?\s+pending approval id:/i.test(text.trim());
+}
+
 function latestTurnText(session: SessionRecord, role: 'user' | 'assistant'): string | undefined {
   return [...session.turns]
     .reverse()
-    .find((turn) => turn.role === role)
+    .find((turn) => turn.role === role && !isLowSignalTurn(turn.role, turn.text))
     ?.text;
 }
 
@@ -52,6 +60,7 @@ function listTurnTexts(session: SessionRecord, role: 'user' | 'assistant', limit
     [...session.turns]
       .reverse()
       .filter((turn) => turn.role === role)
+      .filter((turn) => !isLowSignalTurn(turn.role, turn.text))
       .map((turn) => turn.text),
     limit,
     maxChars,
@@ -63,6 +72,7 @@ function listOpenQuestions(session: SessionRecord): string[] {
     [...session.turns]
       .reverse()
       .filter((turn) => turn.role === 'user')
+      .filter((turn) => !isLowSignalTurn(turn.role, turn.text))
       .map((turn) => turn.text)
       .filter((text) => text.includes('?')),
     4,
@@ -83,15 +93,15 @@ function buildActivePlanSummary(sessionId: string): string | undefined {
 }
 
 function buildSummary(session: SessionRecord, activePlan?: string, activeExecution?: string): string {
-  const firstUser = session.turns.find((turn) => turn.role === 'user')?.text;
+  const firstMeaningfulUser = session.turns.find((turn) => turn.role === 'user' && !isLowSignalTurn(turn.role, turn.text))?.text;
   const latestUser = latestTurnText(session, 'user');
   const latestAssistant = latestTurnText(session, 'assistant');
   const parts: string[] = [];
 
-  if (firstUser) {
-    parts.push(`Started around: ${cleanText(firstUser, 140)}.`);
+  if (firstMeaningfulUser) {
+    parts.push(`Started around: ${cleanText(firstMeaningfulUser, 140)}.`);
   }
-  if (latestUser && latestUser !== firstUser) {
+  if (latestUser && latestUser !== firstMeaningfulUser) {
     parts.push(`Latest ask: ${cleanText(latestUser, 160)}.`);
   }
   if (latestAssistant) {

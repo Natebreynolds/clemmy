@@ -85,7 +85,7 @@ export class CodexCliRuntime implements AgentRuntime {
 	      const text = existsSync(outputPath)
         ? readFileSync(outputPath, 'utf-8').trim()
         : '';
-      const finalText = text || 'Codex returned no final message.';
+      const finalText = text || 'Clementine paused without a final reply — ask again to pick up where she left off.';
       if (callbacks?.onText) {
         await callbacks.onText(finalText);
       }

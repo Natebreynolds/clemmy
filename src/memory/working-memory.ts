@@ -1,9 +1,32 @@
-import { existsSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
 import { ExecutionStore, renderExecutionSummary } from '../execution/store.js';
 import { WORKING_MEMORY_FILE } from './vault.js';
 import { loadSessionBrief } from './session-briefs.js';
 import type { SessionRecord } from '../types.js';
 import { PlanStore } from '../planning/plan-store.js';
+import { isUserFacingSession } from '../execution/scope.js';
+
+const SESSION_WORKING_MEMORY_DIR = path.join(path.dirname(WORKING_MEMORY_FILE), 'state', 'working-memory');
+
+function workingMemoryDigest(sessionId: string): string {
+  return createHash('sha1').update(sessionId).digest('hex');
+}
+
+export function workingMemoryPathForSession(sessionId: string): string {
+  return path.join(SESSION_WORKING_MEMORY_DIR, `${workingMemoryDigest(sessionId)}.md`);
+}
+
+export function loadWorkingMemoryForSession(sessionId: string, maxChars = 3000): string | undefined {
+  const filePath = workingMemoryPathForSession(sessionId);
+  if (!existsSync(filePath)) return undefined;
+  try {
+    return readFileSync(filePath, 'utf-8').trim().slice(0, maxChars);
+  } catch {
+    return undefined;
+  }
+}
 
 function buildSessionSummary(session: SessionRecord): string {
   const turns = session.turns.slice(-6);
@@ -80,7 +103,12 @@ export function refreshWorkingMemory(session: SessionRecord): void {
     '',
   ];
 
-  writeFileSync(WORKING_MEMORY_FILE, sections.join('\n'));
+  const content = sections.join('\n');
+  mkdirSync(SESSION_WORKING_MEMORY_DIR, { recursive: true });
+  writeFileSync(workingMemoryPathForSession(session.id), content);
+  if (isUserFacingSession(session.id, session.channel)) {
+    writeFileSync(WORKING_MEMORY_FILE, content);
+  }
 }
 
 export function workingMemoryExists(): boolean {

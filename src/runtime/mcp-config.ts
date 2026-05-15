@@ -14,12 +14,18 @@ const KNOWN_DESCRIPTIONS: Record<string, string> = {
   gitlab: 'GitLab repository management',
   supabase: 'Supabase database and auth',
   firecrawl: 'Web crawling and scraping',
+  apify: 'Apify actors for web automation, scraping, and data extraction',
   exa: 'Neural web search',
   playwright: 'Browser testing and automation',
   browsermcp: 'Browser automation via MCP',
   context7: 'Documentation lookup',
   discord: 'Discord integration',
   figma: 'Figma design files',
+  dataforseo: 'DataForSEO SEO, SERP, keyword, backlink, domain, and on-page audit data',
+  'dataforseo-mcp-server': 'DataForSEO SEO, SERP, keyword, backlink, domain, and on-page audit data',
+  'bright-data': 'Bright Data web scraping, browser automation, and web data access',
+  elevenlabs: 'ElevenLabs text-to-speech and voice generation',
+  'hostinger-mcp': 'Hostinger account, hosting, domain, and website operations',
 };
 
 let cachedServers: ManagedMcpServer[] | null = null;
@@ -28,6 +34,14 @@ let cacheExpiry = 0;
 function invalidateCache(): void {
   cachedServers = null;
   cacheExpiry = 0;
+}
+
+function normalizeServerName(name: string): string {
+  return name.trim().toLowerCase().replace(/[\s_]+/g, '-');
+}
+
+function knownDescriptionFor(name: string): string | undefined {
+  return KNOWN_DESCRIPTIONS[name] ?? KNOWN_DESCRIPTIONS[normalizeServerName(name)];
 }
 
 function addServer(servers: Map<string, ManagedMcpServer>, name: string, config: Record<string, unknown>, source: ManagedMcpServer['source']): void {
@@ -39,10 +53,35 @@ function addServer(servers: Map<string, ManagedMcpServer>, name: string, config:
     url: typeof config.url === 'string' ? config.url : undefined,
     headers: typeof config.headers === 'object' && config.headers ? (config.headers as Record<string, string>) : undefined,
     env: typeof config.env === 'object' && config.env ? (config.env as Record<string, string>) : undefined,
-    description: typeof config.description === 'string' ? config.description : KNOWN_DESCRIPTIONS[name] ?? `${name} MCP server`,
+    description: typeof config.description === 'string' ? config.description : knownDescriptionFor(name) ?? `${name} MCP server`,
     enabled: config.enabled !== false,
     source,
   });
+}
+
+export function mcpServerSourceLabel(server: Pick<ManagedMcpServer, 'source'>): string {
+  return server.source === 'user'
+    ? 'Clementine user config'
+    : 'imported MCP config';
+}
+
+export function renderMcpServersForInstructions(): string {
+  const servers = discoverMcpServers().filter((server) => server.enabled);
+  if (servers.length === 0) {
+    return 'No external MCP servers are configured.';
+  }
+
+  const visible = servers.slice(0, 12).map((server) => (
+    `- ${server.name} (${server.type}, ${mcpServerSourceLabel(server)}): ${server.description}`
+  ));
+  const hidden = servers.length > visible.length ? `\n- ${servers.length - visible.length} more MCP server(s) configured.` : '';
+
+  return [
+    'External MCP servers are configured and attached to the OpenAI agent runtime.',
+    'Important: "imported MCP config" means the server definition came from another local MCP client config. It is only a source label; Clementine still runs the server through the OpenAI Agents SDK.',
+    ...visible,
+    hidden,
+  ].filter(Boolean).join('\n');
 }
 
 export function discoverMcpServers(): ManagedMcpServer[] {
@@ -75,7 +114,7 @@ export function discoverMcpServers(): ManagedMcpServer[] {
         }
       }
     } catch {
-      // Ignore malformed Claude Code config.
+      // Ignore malformed compatible MCP client config.
     }
   }
 

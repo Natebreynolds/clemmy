@@ -2,13 +2,17 @@ import { tool, type Tool } from '@openai/agents';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import type { RuntimeContextValue } from '../types.js';
+import { needsApprovalFromTaxonomy } from '../agents/tool-taxonomy.js';
 import { registerAdminTools } from './admin-tools.js';
 import { registerAgentRunsTools } from './agent-runs-tools.js';
 import { registerAutonomyActionTools } from './autonomy-action-tools.js';
+import { registerBrowserHarnessTools } from './browser-harness-tools.js';
+import { registerCapabilityTools } from './capability-tools.js';
 import { registerDynamicTools } from './dynamic-tools.js';
 import { registerExecutionTools } from './execution-tools.js';
 import { registerGoalTools } from './goal-tools.js';
 import { registerMemoryTools } from './memory-tools.js';
+import { registerMcpStatusTools } from './mcp-status-tools.js';
 import { registerOrchestrationTools } from './orchestration-tools.js';
 import { registerPlanTools } from './plan-tools.js';
 import { registerProfileTools } from './profile-tools.js';
@@ -27,11 +31,9 @@ interface CapturedLocalTool {
   approvalRequired?: boolean;
 }
 
-const APPROVAL_REQUIRED_TOOLS = new Set([
-  'create_tool',
-  'delete_agent',
-  'workspace_config',
-]);
+// `create_tool`, `delete_agent`, `workspace_config` are now in the
+// ALWAYS_ADMIN list in agents/tool-taxonomy.ts. Their approval gate
+// fires through the unified path along with every other tool.
 
 function resultToText(result: unknown): string {
   if (typeof result === 'string') return result;
@@ -103,14 +105,15 @@ function normalizeShapeForResponses(shape: z.ZodRawShape): z.ZodRawShape {
   );
 }
 
-function needsRuntimeApproval(localTool: CapturedLocalTool, input: Record<string, unknown>): boolean {
-  if (localTool.approvalRequired) return true;
-  const { name } = localTool;
-  if (APPROVAL_REQUIRED_TOOLS.has(name)) {
-    if (name === 'workspace_config') {
-      return input.action === 'add' || input.action === 'remove';
-    }
-    return true;
+/**
+ * Per-call destructive-hint override for the handful of local tools
+ * where the kind depends on the args (e.g. `workspace_config` is admin
+ * only on `add` / `remove`, but `list` is a plain read).
+ */
+function localDestructiveHint(toolName: string, input: unknown): boolean {
+  if (toolName === 'workspace_config') {
+    const action = (input && typeof input === 'object' ? (input as Record<string, unknown>).action : undefined);
+    return action === 'add' || action === 'remove';
   }
   return false;
 }
@@ -142,6 +145,9 @@ function captureLocalTools(): CapturedLocalTool[] {
   registerAutonomyActionTools(server);
   registerExecutionTools(server);
   registerProfileTools(server);
+  registerCapabilityTools(server);
+  registerBrowserHarnessTools(server);
+  registerMcpStatusTools(server);
   const dynamicToolStart = captured.length;
   registerDynamicTools(server);
   for (const dynamicTool of captured.slice(dynamicToolStart)) {
@@ -163,7 +169,13 @@ export function getLocalRuntimeTools(): Tool<RuntimeContextValue>[] {
     name: localTool.name,
     description: localTool.description,
     parameters: z.object(normalizeShapeForResponses(localTool.parameters)),
-    needsApproval: async (_context, input) => needsRuntimeApproval(localTool, input as Record<string, unknown>),
+    // Unified taxonomy. The captured tool's `approvalRequired` flag is
+    // honored via a destructive-hint so dynamic tools that the runtime
+    // marks as "always ask" still pause regardless of policy scope.
+    needsApproval: needsApprovalFromTaxonomy(localTool.name, {
+      isDestructive: (input) =>
+        Boolean(localTool.approvalRequired) || localDestructiveHint(localTool.name, input),
+    }),
     execute: async (input) => resultToText(await localTool.handler(input as Record<string, unknown>)),
   }));
 }

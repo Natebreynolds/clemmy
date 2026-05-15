@@ -8,10 +8,18 @@ import { SessionStore } from '../memory/session-store.js';
 import type { AssistantRequest, AssistantResponse } from '../types.js';
 import { PlanStore } from '../planning/plan-store.js';
 import { refreshWorkingMemory } from '../memory/working-memory.js';
+import { captureInteractionSignals } from '../memory/auto-capture.js';
 import { refineActivePlanFromMessage } from '../planning/refinement.js';
 import { buildAssistantInstructions } from './instructions.js';
 import type { AgentRuntime } from '../runtime/provider.js';
 import { addRunEvent } from '../runtime/run-events.js';
+import { isUserFacingSession, looksLikeInternalPrompt } from '../execution/scope.js';
+import { classifyMessageIntent } from './message-intent.js';
+
+function shouldUseExecutionTracking(request: AssistantRequest): boolean {
+  return isUserFacingSession(request.sessionId, request.channel) &&
+    !looksLikeInternalPrompt(request.message);
+}
 
 export class ClementineAssistant {
   constructor(
@@ -41,7 +49,27 @@ export class ClementineAssistant {
       request.channel,
     );
     refineActivePlanFromMessage(request.sessionId, request.message);
-    const activeExecutionBeforeReply = this.executions.getActiveForSession(request.sessionId);
+    const executionTrackingEnabled = shouldUseExecutionTracking(request);
+    if (executionTrackingEnabled) {
+      const captured = captureInteractionSignals({
+        message: request.message,
+        sessionId: request.sessionId,
+      });
+      if (request.runId && (captured.facts.length > 0 || captured.profilePatch)) {
+        addRunEvent(request.runId, {
+          type: 'status',
+          message: `Captured ${captured.facts.length} durable memory signal${captured.facts.length === 1 ? '' : 's'}${captured.profilePatch ? ' and updated profile preferences' : ''}.`,
+          data: {
+            factIds: captured.facts.map((fact) => fact.id),
+            profilePatch: captured.profilePatch,
+            reasons: captured.candidates.map((candidate) => candidate.reason),
+          },
+        });
+      }
+    }
+    const activeExecutionBeforeReply = executionTrackingEnabled
+      ? this.executions.getActiveForSession(request.sessionId)
+      : undefined;
     if (activeExecutionBeforeReply?.planId) {
       const plan = this.plans.get(activeExecutionBeforeReply.planId);
       if (plan) {
@@ -50,10 +78,25 @@ export class ClementineAssistant {
     }
     refreshSessionBrief(sessionBeforeReply);
 
-    const transcriptBeforeReply = this.sessions.recentTranscript(request.sessionId);
-    const activeExecution = this.executions.getActiveForSession(request.sessionId);
-    const executionIntent = analyzeExecutionIntent(request.message, activeExecution);
-    const executionPrompt = buildExecutionPromptBlock(executionIntent, activeExecution);
+    const messageIntent = classifyMessageIntent(request.message);
+    const casualCheckIn = messageIntent.intent === 'casual';
+    const lightContext = casualCheckIn || messageIntent.intent === 'meta_clarify';
+    const transcriptDepth = casualCheckIn ? 1 : messageIntent.intent === 'meta_clarify' ? 3 : 12;
+    const transcriptBeforeReply = this.sessions.recentTranscript(request.sessionId, transcriptDepth);
+    const activeExecution = executionTrackingEnabled
+      ? this.executions.getActiveForSession(request.sessionId)
+      : undefined;
+    // ExecutionIntent only matters when the user is asking for action
+    // or continuing tracked work. Skip the keyword scoring entirely
+    // for casual / lookup / meta turns — saves a scan and avoids
+    // false-positive execution wrapping.
+    const shouldAnalyzeExecution = executionTrackingEnabled
+      && !lightContext
+      && (messageIntent.intent === 'action' || messageIntent.intent === 'tool_intent' || activeExecution);
+    const executionIntent = shouldAnalyzeExecution
+      ? analyzeExecutionIntent(request.message, activeExecution)
+      : undefined;
+    const executionPrompt = executionIntent ? buildExecutionPromptBlock(executionIntent, activeExecution) : '';
     const { memoryContext, retrievalText } = await assemblePromptContextAsync(request.sessionId, request.message, transcriptBeforeReply);
     const instructions = buildAssistantInstructions(memoryContext, request.channel);
 
@@ -110,7 +153,7 @@ export class ClementineAssistant {
       },
     });
 
-    if (executionPrompt) {
+    if (executionPrompt && executionIntent) {
       const parsed = parseExecutionResponse(result.text);
       const shouldPersistExecution = executionIntent.shouldTrack && parsed.steps.length >= 3;
       let execution = activeExecution;
@@ -173,6 +216,11 @@ export class ClementineAssistant {
       text: result.text,
       sessionId: request.sessionId,
       pendingApprovalId: result.pendingApprovalId,
+      // Bubble the runtime's typed terminal state up to channels so
+      // they can render appropriate affordances (Continue button on
+      // 'max-turns-with-grace', etc.).
+      stoppedReason: result.stoppedReason,
+      turnsUsed: result.turnsUsed,
     };
   }
 }

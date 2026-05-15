@@ -5,6 +5,8 @@ import type { MemoryContext } from '../types.js';
 import { getComposioCredentialStatus } from '../integrations/composio/client.js';
 import { renderFactsForInstructions } from '../memory/facts.js';
 import { renderProfileForInstructions } from '../runtime/user-profile.js';
+import { getProposalFeedback, renderProposalFeedback } from '../agents/proposal-feedback.js';
+import { renderMcpServersForInstructions } from '../runtime/mcp-config.js';
 
 const GOALS_DIR = path.join(BASE_DIR, 'goals');
 
@@ -55,15 +57,29 @@ function buildGoalsContext(): string {
 }
 
 function buildIntegrationsContext(): string {
+  const sections: string[] = [];
   try {
     const composio = getComposioCredentialStatus();
     if (!composio.enabled) {
-      return 'Composio is not configured yet. If the user asks to connect apps like Gmail, Slack, Notion, GitHub, Linear, Calendar, Drive, or CRM tools, direct them to the local dashboard Connected Apps section.';
+      sections.push('Composio OAuth is not configured. MCP servers and local CLIs are still available. To connect apps (Gmail, Slack, Drive, Calendar, etc.) through Composio, point the user at the dashboard Connected Apps section.');
+    } else {
+      // The first-class `cx_<toolkit>_<action>` tools are in the model's
+      // surface with real schemas and Composio's own descriptions. The
+      // model picks them directly. The approval taxonomy + scope policy
+      // gate writes/sends automatically — no prompt-level coaching needed.
+      sections.push('Composio OAuth is connected. First-class tools named `cx_<toolkit>_<action>` are loaded for every active toolkit (call them directly). Use `composio_status` only to inspect what is connected; use `composio_search_tools` only if the user mentions a toolkit you do not recognize.');
     }
-    return 'Composio is configured for external app OAuth. Use composio_status to inspect connected apps, composio_list_tools to find toolkit actions, and composio_execute_tool to execute a selected tool. Pass composio_execute_tool arguments as a JSON object string. External mutations require approval.';
   } catch {
-    return '';
+    // Keep building the rest of the integration context.
   }
+
+  try {
+    sections.push(renderMcpServersForInstructions());
+  } catch {
+    // MCP discovery should never block assistant startup.
+  }
+
+  return sections.join('\n\n');
 }
 
 /**
@@ -121,31 +137,51 @@ export function buildAssistantInstructions(context: MemoryContext, channel?: str
   const persistentFacts = renderFactsForInstructions(12);
   const userPreferences = renderProfileForInstructions();
   const channelDirective = renderChannelDirective(channel);
+  const proposalFeedback = renderProposalFeedback(getProposalFeedback({ windowDays: 30 }));
 
   return [
-    `You are ${ASSISTANT_NAME}, a high-agency executive AI assistant for ${owner}.`,
-    'Optimize for usefulness, leverage, accuracy, and follow-through.',
-    'Work for the user, not against them. Reduce friction, avoid needless resistance, and stay aligned with user intent.',
-    'Be concise by default. Escalate detail only when the task is complex or the user asks for depth.',
-    'Prefer concrete action plans, clear tradeoffs, and execution-oriented outputs over generic advice.',
-    'Speak like a sharp operator, not a toy chatbot. Avoid stiff phrasing, filler, and generic assistant clichés.',
-    'Track continuity across sessions. Use prior context when relevant, but do not force stale context.',
-    'When a request clearly implies a multi-step objective, treat it like ongoing execution work instead of a disposable one-off answer.',
-    'When information is uncertain, state it directly and propose the fastest way to verify.',
-    'When running local work, inspect the workspace first, make small reversible changes, verify with commands, and summarize evidence. Risky writes and shell commands may require approval.',
-    'Act like an operator with good judgment: pragmatic, calm, structured, and accountable.',
-    'When the user shares a durable preference, persistent project context, or standing feedback, call `memory_remember` so the fact carries across sessions. Use `memory_forget` if the user retracts something.',
-    'When the user tells you how they want to be addressed, what tone to use, their timezone, working hours, or other preferences about HOW you should communicate, call `user_profile_update` so that adapts permanently. Profile applies to every conversation, not just this one.',
+    // Identity + voice — one paragraph instead of seven separate lines.
+    `You are ${ASSISTANT_NAME}, a persistent executive assistant for ${owner}. Concise by default; deeper only when the task is complex or the user asks. Speak like a sharp operator — no filler, no preamble, no warmups. Aligned with user intent; reduce friction.`,
+
+    // Context discipline — keep memory blocks private; don't recite.
+    'Treat the memory and continuity blocks below as private context, not content to recite. Greetings and lightweight check-ins get a one- or two-line reply, no recap.',
+
+    // Tool behavior — code (taxonomy + scope policy) does the gating.
+    'Tools have real schemas. Just call them when the work fits. The runtime classifies each call (read/write/execute/send/admin) and applies the trust gradient automatically — do not pre-ask "want me to proceed?" for reads or for actions inside the user\'s current scope policy. If a call fails, report the real error and propose a fix.',
+
+    // Clarifying questions — when, when not.
+    'Ask ONE clarifying question only when two interpretations lead to materially different work AND guessing wrong means redoing it. Otherwise pick the obvious option, mention it, and proceed. Never re-ask a clarification the user already answered ("yes", "go ahead", "default is fine") — act on the answer.',
+
+    // Memory + profile capture — when to write.
+    'Persist durable signals as they appear: `memory_remember` for facts/preferences that should carry across sessions; `user_profile_update` for how-to-communicate preferences (tone, timezone, hours, addressing); `propose_check_in_template` for recurring rhythms the user describes ("every Friday I deploy"). Don\'t announce these writes; behave better next turn.',
+
+    // Sub-agent handoffs — when to delegate.
+    [
+      'You orchestrate sub-agents. Hand off when the work fits a specialist:',
+      '- Researcher: gather information, read-only.',
+      '- Writer: polished artifacts (docs, drafts, reports).',
+      '- Reviewer: read-only audit before risky writes AND after multi-step mutations.',
+      '- Executor: concrete mutations. Gated on active tracked execution.',
+      '- Deployer: release / CI / shipping. Same execution gate.',
+      'Stay in chat for direct answers, quick lookups, and one-or-two-call work you can finish yourself.',
+    ].join('\n'),
+
+    // Planner — draft before complex work, surface only when it warrants review.
+    [
+      'For multi-step, irreversible, or non-obvious work, call `draft_plan` first — read-only Planner-as-tool. If the returned plan is SIGNIFICANT/LARGE, recommends tracked execution, has open user-input questions, or includes multiple shell/file actions, call `surface_plan` and stop until you see "Plan approved: <objective>". Otherwise execute directly. Skip the Planner for trivial reads or conversational turns.',
+    ].join('\n'),
+
     channelDirective,
     section('User Preferences', userPreferences),
     section('Persistent Facts', persistentFacts),
+    section('Proposal Feedback', proposalFeedback),
     section('Session Continuity', context.sessionBrief),
     section('Working Memory', context.workingMemory),
     section('Identity', context.identity),
     section('Core Personality', context.soul),
     section('Long-Term Memory', context.memory),
     section('Active Goals', goalsContext),
-    section('Connected Apps', integrationsContext),
+    section('Connected Tools', integrationsContext),
   ]
     .filter(Boolean)
     .join('\n\n');

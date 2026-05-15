@@ -23,6 +23,7 @@ const GLOBAL_CLI_CHECKS: Array<{
   { id: 'pnpm', label: 'pnpm', command: 'pnpm', versionArgs: ['--version'], purpose: 'workspace package management when projects use pnpm' },
   { id: 'python3', label: 'Python', command: 'python3', versionArgs: ['--version'], purpose: 'Python automation and local scripts' },
   { id: 'uv', label: 'uv', command: 'uv', versionArgs: ['--version'], purpose: 'modern Python package and task workflows' },
+  { id: 'browser-harness', label: 'Browser Harness', command: 'browser-harness', versionArgs: ['--version'], purpose: 'native browser automation through a real Chrome or Browser Use cloud browser' },
   { id: 'gh', label: 'GitHub CLI', command: 'gh', versionArgs: ['--version'], purpose: 'GitHub issues, PRs, and repository operations' },
   { id: 'codex', label: 'Codex CLI', command: 'codex', versionArgs: ['--version'], purpose: 'ChatGPT/Codex OAuth bootstrap and local agent auth' },
   { id: 'railway', label: 'Railway CLI', command: 'railway', versionArgs: ['--version'], purpose: 'Railway deploy and service workflows' },
@@ -31,6 +32,9 @@ const GLOBAL_CLI_CHECKS: Array<{
   { id: 'docker', label: 'Docker', command: 'docker', versionArgs: ['--version'], purpose: 'containerized local services and build workflows' },
 ];
 
+const CACHE_TTL_MS = 60_000;
+let cachedStatus: { expiresAt: number; value: GlobalCliStatus[] } | null = null;
+
 function firstLine(value: string): string {
   return value.split('\n').map((line) => line.trim()).find(Boolean) ?? '';
 }
@@ -38,9 +42,10 @@ function firstLine(value: string): string {
 function commandPath(command: string): string | undefined {
   const result = spawnSync('sh', ['-lc', `command -v ${command}`], {
     encoding: 'utf-8',
-    timeout: 1500,
+    timeout: 250,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
+  if (result.error) return undefined;
   if (result.status !== 0) return undefined;
   return firstLine(result.stdout);
 }
@@ -48,15 +53,21 @@ function commandPath(command: string): string | undefined {
 function commandVersion(command: string, args: string[]): string | undefined {
   const result = spawnSync(command, args, {
     encoding: 'utf-8',
-    timeout: 2500,
+    timeout: 600,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
+  if (result.error) return undefined;
   const output = firstLine(`${result.stdout ?? ''}\n${result.stderr ?? ''}`);
   return output || undefined;
 }
 
 export function listGlobalCliStatus(): GlobalCliStatus[] {
-  return GLOBAL_CLI_CHECKS.map((check) => {
+  const now = Date.now();
+  if (cachedStatus && cachedStatus.expiresAt > now) {
+    return cachedStatus.value;
+  }
+
+  const value = GLOBAL_CLI_CHECKS.map((check) => {
     const path = commandPath(check.command);
     return {
       id: check.id,
@@ -68,4 +79,6 @@ export function listGlobalCliStatus(): GlobalCliStatus[] {
       purpose: check.purpose,
     };
   });
+  cachedStatus = { value, expiresAt: now + CACHE_TTL_MS };
+  return value;
 }

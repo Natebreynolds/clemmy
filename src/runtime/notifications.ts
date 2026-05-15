@@ -5,6 +5,8 @@ import { BASE_DIR } from '../config.js';
 const NOTIFICATIONS_FILE = path.join(BASE_DIR, 'state', 'notifications.json');
 const DESTINATIONS_FILE = path.join(BASE_DIR, 'state', 'notification-destinations.json');
 const DELIVERY_QUEUE_FILE = path.join(BASE_DIR, 'state', 'notification-delivery-queue.json');
+const MAX_STORED_NOTIFICATIONS = 1000;
+const PROACTIVE_DEDUPE_WINDOW_MS = 6 * 60 * 60 * 1000;
 
 export interface NotificationRecord {
   id: string;
@@ -57,7 +59,8 @@ function loadNotifications(): NotificationRecord[] {
 
 function saveNotifications(items: NotificationRecord[]): void {
   mkdirSync(path.dirname(NOTIFICATIONS_FILE), { recursive: true });
-  writeFileSync(NOTIFICATIONS_FILE, JSON.stringify(items, null, 2), 'utf-8');
+  const pruned = pruneNotifications(items);
+  writeFileSync(NOTIFICATIONS_FILE, JSON.stringify(pruned, null, 2), 'utf-8');
 }
 
 function loadDestinations(): NotificationDestination[] {
@@ -97,14 +100,55 @@ function saveDeliveryQueue(items: NotificationDeliveryJob[]): void {
   writeFileSync(DELIVERY_QUEUE_FILE, JSON.stringify(items, null, 2), 'utf-8');
 }
 
+function pruneNotifications(items: NotificationRecord[]): NotificationRecord[] {
+  if (items.length <= MAX_STORED_NOTIFICATIONS) return items;
+  return [...items]
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+    .slice(0, MAX_STORED_NOTIFICATIONS)
+    .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+}
+
+function isRecentDuplicateProactiveBrief(existing: NotificationRecord, next: NotificationRecord): boolean {
+  if (!existing.metadata?.proactiveBrief || !next.metadata?.proactiveBrief) return false;
+  if (existing.title !== next.title || existing.body !== next.body) return false;
+  const previousAt = Date.parse(existing.createdAt);
+  const nextAt = Date.parse(next.createdAt);
+  return Number.isFinite(previousAt) &&
+    Number.isFinite(nextAt) &&
+    nextAt - previousAt >= 0 &&
+    nextAt - previousAt < PROACTIVE_DEDUPE_WINDOW_MS;
+}
+
+function isDuplicateApprovalNotification(existing: NotificationRecord, next: NotificationRecord): boolean {
+  if (existing.kind !== 'approval' || next.kind !== 'approval') return false;
+  const existingApprovalId = existing.metadata?.approvalId;
+  const nextApprovalId = next.metadata?.approvalId;
+  return typeof existingApprovalId === 'string' &&
+    existingApprovalId.length > 0 &&
+    existingApprovalId === nextApprovalId &&
+    existing.title === next.title &&
+    existing.body === next.body;
+}
+
 export function listNotifications(limit = 20): NotificationRecord[] {
-  return loadNotifications()
+  const items = loadNotifications();
+  const compacted = pruneNotifications(items);
+  if (compacted.length !== items.length) {
+    saveNotifications(compacted);
+  }
+  return compacted
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
     .slice(0, limit);
 }
 
 export function addNotification(item: NotificationRecord): void {
   const items = loadNotifications();
+  if (items.some((existing) =>
+    isRecentDuplicateProactiveBrief(existing, item) ||
+    isDuplicateApprovalNotification(existing, item)
+  )) {
+    return;
+  }
   items.push(item);
   saveNotifications(items);
 

@@ -3,7 +3,7 @@ import path from 'node:path';
 import {
   ACTIVE_ENV_FILES, ASSISTANT_NAME, AUTH_MODE, BASE_DIR,
   COMPOSIO_API_KEY,
-  DISCORD_BOT_TOKEN, DISCORD_ENABLED, LOCAL_MCP_ENABLED,
+  DISCORD_BOT_TOKEN, DISCORD_DM_ALLOWED_USERS, DISCORD_ENABLED, LOCAL_MCP_ENABLED,
   WEBHOOK_ENABLED, WEBHOOK_SECRET, getOpenAiApiKey, getRuntimeEnv,
 } from '../config.js';
 import { CRON_FILE, SOUL_FILE, VAULT_DIR, WORKFLOWS_DIR, WORKING_MEMORY_FILE } from '../memory/vault.js';
@@ -33,7 +33,7 @@ export async function runDoctor(): Promise<number> {
   const authStatus = getAuthStatus();
   if (authStatus.mode === 'codex_oauth') {
     if (authStatus.configured) {
-      warnRow('AUTH_MODE', authStatus.message);
+      passRow('AUTH_MODE', authStatus.message);
     } else if (authStatus.source === 'codex_cli') {
       warnRow('AUTH_MODE', `${authStatus.message} Run: clementine auth login`);
     } else {
@@ -51,12 +51,12 @@ export async function runDoctor(): Promise<number> {
 
   // API key
   if (getOpenAiApiKey()) {
-    passRow('OPENAI_API_KEY', 'Configured');
+    passRow('OPENAI_API_KEY', 'Configured for embeddings, live voice, and direct API features');
   } else if (AUTH_MODE === 'api_key') {
     failRow('OPENAI_API_KEY', 'Missing — chat, daemon, and workflows will not work');
     problems.push('OPENAI_API_KEY');
   } else {
-    warnRow('OPENAI_API_KEY', 'Missing, but AUTH_MODE is not api_key');
+    warnRow('OPENAI_API_KEY', 'Optional capability key missing — Codex OAuth runtime can still run; embeddings and live voice stay disabled');
   }
 
   const workspaceDirs = getWorkspaceDirs();
@@ -91,6 +91,11 @@ export async function runDoctor(): Promise<number> {
         passRow('DISCORD_INSTALL_URL', installInfo.installUrl);
       } else {
         warnRow('DISCORD_INSTALL_URL', 'Missing DISCORD_CLIENT_ID — rerun setup with a valid bot token');
+      }
+      if (DISCORD_DM_ALLOWED_USERS.length > 0) {
+        passRow('DISCORD_DM_ALLOWED_USERS', `${DISCORD_DM_ALLOWED_USERS.length} user(s) authorized for DMs`);
+      } else {
+        warnRow('DISCORD_DM_ALLOWED_USERS', 'No owner user ID set — DMs to the bot will be ignored. Run: clementine setup');
       }
     } else {
       failRow('DISCORD_BOT_TOKEN', 'DISCORD_ENABLED=true but token is missing');

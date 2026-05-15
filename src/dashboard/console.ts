@@ -1,8 +1,8 @@
 /**
  * Clementine Console — the new operational dashboard surface.
  *
- * Lives at /console alongside the existing /dashboard. Distinct visual
- * language ("operational console" aesthetic) and surfaces that scale
+ * Lives at /console as the primary Electron UI. Distinct visual language
+ * ("operational console" aesthetic) and surfaces that scale
  * to the full vision: agent management, workflows, skills, tool catalog,
  * memory navigator, project picker, workflow studio with chat.
  *
@@ -37,66 +37,311 @@ export function renderConsoleHtml(token: string): string {
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Clementine // Console</title>
-  <link rel="icon" href="data:," />
+  <link rel="icon" href="/console/icon.png" />
   <style>${CONSOLE_CSS}</style>
+  <script src="/console/vendor/cytoscape.min.js" defer></script>
 </head>
 <body>
   <div class="grid">
 
     <header class="status-bar">
       <div class="brand">
-        <span class="pulse" aria-hidden="true"></span>
-        <span class="brand-mark">CLEMENTINE</span>
-        <span class="brand-sep">//</span>
-        <span class="brand-sub">CONSOLE</span>
+        <img class="brand-icon" src="/console/icon.png" alt="" />
+        <div class="brand-words">
+          <span class="brand-mark">Clementine</span>
+          <span class="brand-sub" data-daemon-version>v0.1.0 · console</span>
+        </div>
       </div>
       <div class="status-row" data-status-row>
         <span class="stat" data-stat-runs>RUNS · <em>—</em></span>
         <span class="stat" data-stat-memory>MEM · <em>—</em></span>
         <span class="stat" data-stat-approvals>APPRV · <em>—</em></span>
         <span class="stat" data-stat-policy>MODE · <em>—</em></span>
-        <span class="stat connection" data-stat-connection>● ONLINE</span>
+        <span class="stat connection" data-stat-connection>
+          <span class="pulse" aria-hidden="true"></span>
+          <span data-conn-label>ONLINE</span>
+        </span>
+        <button class="theme-toggle" data-theme-toggle aria-label="Toggle light/dark mode" title="Toggle light/dark">
+          <span class="theme-toggle-icon" data-theme-icon>◐</span>
+        </button>
       </div>
     </header>
 
     <nav class="sidebar" aria-label="Console sections">
-      <button class="nav active" data-panel="activity">
+      <button class="nav active" data-panel="home">
         <span class="nav-key">01</span>
+        <span class="nav-label">Home</span>
+      </button>
+      <button class="nav" data-panel="activity">
+        <span class="nav-key">02</span>
         <span class="nav-label">Activity</span>
       </button>
       <button class="nav" data-panel="memory">
-        <span class="nav-key">02</span>
+        <span class="nav-key">03</span>
         <span class="nav-label">Memory</span>
       </button>
-      <button class="nav" data-panel="workflows" disabled title="Coming next">
-        <span class="nav-key">03</span>
+      <button class="nav" data-panel="context">
+        <span class="nav-key">04</span>
+        <span class="nav-label">Context</span>
+      </button>
+      <button class="nav" data-panel="workflows">
+        <span class="nav-key">05</span>
         <span class="nav-label">Workflows</span>
       </button>
-      <button class="nav" data-panel="tools" disabled title="Coming next">
-        <span class="nav-key">04</span>
+      <button class="nav" data-panel="tools">
+        <span class="nav-key">06</span>
         <span class="nav-label">Tools</span>
       </button>
-      <button class="nav" data-panel="projects" disabled title="Coming next">
-        <span class="nav-key">05</span>
+      <button class="nav" data-panel="projects">
+        <span class="nav-key">07</span>
         <span class="nav-label">Projects</span>
       </button>
-      <button class="nav" data-panel="skills" disabled title="Coming next">
-        <span class="nav-key">06</span>
+      <button class="nav" data-panel="skills">
+        <span class="nav-key">08</span>
         <span class="nav-label">Skills</span>
       </button>
-      <button class="nav" data-panel="settings" disabled title="Coming next">
-        <span class="nav-key">07</span>
+      <button class="nav" data-panel="integrations">
+        <span class="nav-key">09</span>
+        <span class="nav-label">Integrations</span>
+      </button>
+      <button class="nav" data-panel="settings">
+        <span class="nav-key">10</span>
         <span class="nav-label">Settings</span>
       </button>
-      <div class="nav-foot">
-        <a class="nav-foot-link" href="/dashboard?token=${esc(token)}">↗ classic dashboard</a>
+
+      <!-- ── nav-dock: fills the dead space under the menu items ──
+           Five stacked cards that surface monitoring + access to live
+           features from any panel. AIM-era "buddy info" zone.
+           Cards are fixed-height where possible; RECENT scrolls inside
+           its bounds so the nav itself never scrolls. -->
+      <div class="nav-dock" aria-label="Live status">
+
+        <div class="dock-card dock-now" data-dock-now>
+          <div class="dock-card-head">
+            <span class="dock-card-tag">NOW</span>
+            <span class="dock-card-tick" data-dock-now-tick>—</span>
+          </div>
+          <div class="dock-card-body">
+            <div class="dock-now-row">
+              <span class="presence-dot" data-dock-now-presence></span>
+              <span class="dock-now-label" data-dock-now-label>idle</span>
+            </div>
+            <div class="dock-now-detail" data-dock-now-detail>—</div>
+          </div>
+        </div>
+
+        <div class="dock-card dock-goal" data-dock-goal hidden>
+          <div class="dock-card-head">
+            <span class="dock-card-tag">ACTIVE GOAL</span>
+            <span class="dock-card-tick" data-dock-goal-turns>0/0</span>
+          </div>
+          <div class="dock-card-body">
+            <div class="dock-goal-obj" data-dock-goal-objective>—</div>
+            <div class="dock-progress">
+              <span class="dock-progress-fill" data-dock-goal-progress style="width:0%"></span>
+            </div>
+            <div class="dock-goal-judge" data-dock-goal-judge>—</div>
+          </div>
+        </div>
+
+        <div class="dock-card dock-live" data-dock-live>
+          <div class="dock-card-head">
+            <span class="dock-card-tag">CLEMENTINE LIVE</span>
+            <span class="dock-card-tick" data-dock-live-phase>STANDBY</span>
+          </div>
+          <div class="dock-card-body dock-live-body">
+            <button type="button" class="dock-live-orb" data-dock-live-toggle aria-label="Toggle voice">
+              <span class="dock-live-orb-ring"></span>
+              <span class="dock-live-orb-core">
+                <img src="/console/icon.png" alt="" />
+              </span>
+            </button>
+            <div class="dock-live-info">
+              <div class="dock-live-status" data-dock-live-status>tap to talk</div>
+              <div class="dock-live-meta" data-dock-live-meta>voice off</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="dock-card dock-recent" data-dock-recent>
+          <div class="dock-card-head">
+            <span class="dock-card-tag">RECENT</span>
+            <span class="dock-card-tick" data-dock-recent-count>0</span>
+          </div>
+          <div class="dock-card-body dock-recent-list" data-dock-recent-list>
+            <div class="dock-empty">— quiet —</div>
+          </div>
+        </div>
+
+        <div class="dock-card dock-health" data-dock-health>
+          <div class="dock-card-head">
+            <span class="dock-card-tag">HEALTH</span>
+            <span class="dock-card-tick" data-dock-health-overall>—</span>
+          </div>
+          <div class="dock-card-body dock-health-grid">
+            <div class="dock-health-cell" data-dock-health-daemon>
+              <span class="presence-dot"></span><span>daemon</span>
+            </div>
+            <div class="dock-health-cell" data-dock-health-db>
+              <span class="presence-dot"></span><span>memory.db</span>
+            </div>
+            <div class="dock-health-cell" data-dock-health-mcp>
+              <span class="presence-dot"></span><span>mcp</span>
+            </div>
+            <div class="dock-health-cell" data-dock-health-composio>
+              <span class="presence-dot"></span><span>composio</span>
+            </div>
+          </div>
+        </div>
+
       </div>
     </nav>
 
-    <main class="panel" data-active-panel="activity">
+    <main class="panel" data-active-panel="home">
 
-      <section class="panel-frame" data-section="activity">
-        <div class="panel-tag">PANEL · 01 · ACTIVITY PULSE</div>
+      <section class="panel-frame" data-section="home">
+        <div class="panel-tag">PANEL · 01 · HOME</div>
+
+        <!--
+          Home panel — focused layout. Page itself never scrolls; each
+          card scrolls internally if its content overflows. The nav-dock
+          (left sidebar) carries the at-a-glance monitoring (NOW, RECENT,
+          HEALTH) so the home page can stay focused on:
+            1. agenda — what needs you and what's running (left col)
+            2. chat — the IM-style conversation (right col, focal)
+            3. CLEMENTINE LIVE — voice, with its own card; click to enter
+               takeover mode (orb fills the entire home panel).
+        -->
+        <div class="panel-body home-layout" data-home-layout>
+
+          <header class="home-greet-strip">
+            <div class="home-greet-text">
+              <h2 data-home-greeting>Hello.</h2>
+              <p data-home-sub>Loading status…</p>
+            </div>
+            <div class="home-greet-status">
+              <span class="presence-dot" data-home-agent-presence></span>
+              <span data-home-away-message>Reading the room…</span>
+            </div>
+          </header>
+
+          <div class="home-main">
+
+            <div class="home-main-left">
+              <div class="home-block home-needs">
+                <div class="home-block-head">
+                  <span>NEEDS YOU</span>
+                  <em data-home-needs-count>—</em>
+                </div>
+                <div class="home-block-body command-list" data-home-needs-list>
+                  <div class="home-empty">— checking approvals —</div>
+                </div>
+              </div>
+
+              <div class="home-block home-working">
+                <div class="home-block-head">
+                  <span>WORKING NOW</span>
+                  <em data-home-active-count>—</em>
+                </div>
+                <div class="home-current-objective">
+                  <span class="presence-dot working"></span>
+                  <span data-home-current-objective>Finding active work…</span>
+                </div>
+                <div class="home-block-body command-list" data-home-working-list>
+                  <div class="home-empty">— no active workers yet —</div>
+                </div>
+              </div>
+
+              <!--
+                CLEMENTINE LIVE — its own card on home. Click anywhere
+                outside the orb to enter takeover mode (orb fills the
+                panel). Clicking the orb directly enters takeover AND
+                starts voice in one motion. The voice JS hooks
+                (data-home-voice-*) are preserved so the existing
+                Realtime / Recall integrations keep working.
+              -->
+              <div class="home-block home-live" data-home-live-card role="button" tabindex="0" aria-label="Activate Clementine Live">
+                <div class="home-live-head">
+                  <span class="home-live-label">CLEMENTINE LIVE</span>
+                  <span class="home-live-phase" data-home-voice-phase>STANDBY</span>
+                </div>
+                <div class="home-live-stage" data-home-voice-panel>
+                  <button type="button" class="home-voice-orb-button" data-home-voice-toggle aria-label="Start live voice">
+                    <span class="home-voice-ring ring-a" aria-hidden="true"></span>
+                    <span class="home-voice-ring ring-b" aria-hidden="true"></span>
+                    <span class="home-voice-core">
+                      <img src="/console/icon.png" alt="" class="home-voice-avatar" />
+                      <span class="home-voice-face mouth" aria-hidden="true"></span>
+                      <span class="home-voice-face cheek cheek-left" aria-hidden="true"></span>
+                      <span class="home-voice-face cheek cheek-right" aria-hidden="true"></span>
+                      <span class="home-voice-scan" aria-hidden="true"></span>
+                    </span>
+                    <span class="home-voice-wave" aria-hidden="true">
+                      <i></i><i></i><i></i><i></i>
+                    </span>
+                  </button>
+                  <div class="home-live-copy">
+                    <div class="home-live-cta">Tap to talk</div>
+                    <div class="home-live-sub" data-home-voice-status>or say "hey Clementine" (coming soon)</div>
+                  </div>
+                  <audio data-home-voice-audio autoplay></audio>
+                </div>
+              </div>
+            </div>
+
+            <div class="home-main-right">
+              <div class="home-block home-chat home-chat-dock">
+                <div class="home-block-head">
+                  <span>CHAT DOCK</span>
+                  <span class="home-chat-meta" data-home-chat-meta>local session</span>
+                </div>
+                <div class="home-chat-thread" data-home-chat-thread>
+                  <div class="home-chat-hint">
+                    <div class="home-chat-hint-title">Instant message Clementine.</div>
+                    <div class="home-chat-hint-sub">Try a quick prompt to get started:</div>
+                    <div class="home-chat-suggestions">
+                      <button type="button" class="home-chat-suggest" data-home-chat-suggest="what's on my plate today">what's on my plate today</button>
+                      <button type="button" class="home-chat-suggest" data-home-chat-suggest="show me my open salesforce accounts that haven't been touched in 14 days">stale Salesforce accounts</button>
+                      <button type="button" class="home-chat-suggest" data-home-chat-suggest="summarize what got done yesterday">recap yesterday</button>
+                    </div>
+                  </div>
+                </div>
+                <form class="home-chat-form" data-home-chat-form>
+                  <input type="text" class="home-chat-input" data-home-chat-input
+                    placeholder="message Clementine…" autocomplete="off" />
+                  <button type="submit" class="home-chat-send">SEND ↵</button>
+                </form>
+              </div>
+            </div>
+
+          </div>
+
+          <!--
+            Takeover overlay — only visible when .home-layout has class
+            .live-takeover (toggled by clicking the LIVE card). The orb,
+            transcript, and live-feed live IN-PLACE inside the LIVE card
+            via CSS positioning, but this overlay holds the takeover-only
+            chrome (exit button, big transcript, send-last-turn action).
+          -->
+          <div class="home-live-takeover-chrome" data-home-live-takeover hidden>
+            <button type="button" class="home-live-close" data-home-live-close aria-label="Exit live mode" title="Exit live mode">✕  exit live</button>
+            <div class="home-live-takeover-transcript" data-home-voice-transcript>
+              Voice transcript will appear here while Clementine is listening.
+            </div>
+            <div class="home-live-takeover-feed" data-home-voice-feed>
+              <span>Tool calls + SDK events stream here in real time.</span>
+            </div>
+            <div class="home-live-takeover-actions">
+              <button type="button" class="home-voice-btn" data-home-voice-handoff disabled>SEND LAST TURN TO CHAT</button>
+              <span class="home-live-takeover-hint">say "hey Clementine" — coming soon · press <kbd>Esc</kbd> to exit</span>
+            </div>
+          </div>
+
+        </div>
+      </section>
+
+      <section class="panel-frame" data-section="activity" hidden>
+        <div class="panel-tag">PANEL · 02 · ACTIVITY PULSE</div>
 
         <div class="panel-body activity-layout">
 
@@ -128,7 +373,7 @@ export function renderConsoleHtml(token: string): string {
       </section>
 
       <section class="panel-frame" data-section="memory" hidden>
-        <div class="panel-tag">PANEL · 02 · MEMORY NAVIGATOR</div>
+        <div class="panel-tag">PANEL · 03 · MEMORY NAVIGATOR</div>
 
         <div class="panel-body memory-layout">
 
@@ -169,17 +414,640 @@ export function renderConsoleHtml(token: string): string {
           </aside>
 
           <div class="mem-main">
-            <div class="mem-search">
-              <input type="search" class="mem-search-input" data-mem-search
-                placeholder="search vault · FTS + embedding rerank · ⏎ to query"
-                autocomplete="off" spellcheck="false" />
-              <span class="mem-search-meta" data-mem-search-meta>—</span>
+            <div class="mem-toolbar">
+              <div class="mem-view-toggle">
+                <button class="mem-view-btn" data-mem-view="viewer" onclick="window.__clementineMemoryView && window.__clementineMemoryView('viewer'); return false;">VIEWER</button>
+                <button class="mem-view-btn active" data-mem-view="graph" onclick="window.__clementineMemoryView && window.__clementineMemoryView('graph'); return false;">GRAPH</button>
+              </div>
+              <div class="mem-search">
+                <input type="search" class="mem-search-input" data-mem-search
+                  placeholder="search vault · FTS + embedding rerank · ⏎ to query"
+                  autocomplete="off" spellcheck="false" />
+                <span class="mem-search-meta" data-mem-search-meta>—</span>
+              </div>
             </div>
 
-            <div class="mem-viewer" data-mem-viewer>
+            <div class="mem-viewer" data-mem-viewer hidden>
               <div class="mem-empty">
                 <div class="mem-empty-mark">▢</div>
                 <div class="mem-empty-text">SEARCH OR SELECT A FILE / FACT</div>
+              </div>
+            </div>
+
+            <div class="mem-graph" data-mem-graph>
+              <div class="mem-graph-topbar">
+                <div class="mem-graph-controls">
+                  <button type="button" data-mem-graph-refresh>REFRESH</button>
+                  <button type="button" data-mem-graph-fit>FIT</button>
+                  <button type="button" data-mem-graph-reset>RESET</button>
+                </div>
+                <div class="mem-graph-filters">
+                  <select data-mem-graph-type aria-label="Filter graph node type">
+                    <option value="">ALL NODES</option>
+                    <option value="fact">FACTS</option>
+                    <option value="file">FILES</option>
+                    <option value="kind">KINDS</option>
+                  </select>
+                  <input type="search" data-mem-graph-search placeholder="filter graph…" autocomplete="off" spellcheck="false" />
+                </div>
+                <span class="mem-graph-meta" data-mem-graph-meta>—</span>
+              </div>
+              <div class="mem-graph-canvas" data-mem-graph-canvas></div>
+              <aside class="mem-graph-detail" data-mem-graph-detail>
+                <div class="mem-graph-detail-empty">Hover or click a node to inspect.</div>
+              </aside>
+              <div class="mem-graph-legend">
+                <span><i class="dot fact"></i> Fact</span>
+                <span><i class="dot file"></i> File</span>
+                <span><i class="dot kind"></i> Kind cluster</span>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </section>
+
+      <section class="panel-frame" data-section="context" hidden>
+        <div class="panel-tag">PANEL · 04 · CONTEXT / IDENTITY</div>
+
+        <div class="panel-body context-layout">
+          <header class="context-header">
+            <div>
+              <h3>Agent Context</h3>
+              <p>What Clementine knows before it talks, acts, or listens. Keep the core identity files useful, then add durable facts and goals as the operating picture changes.</p>
+            </div>
+            <div class="context-stats" data-context-stats>
+              <div class="stat-card"><span>FILES</span><em data-context-files-count>—</em></div>
+              <div class="stat-card"><span>FACTS</span><em data-context-facts-count>—</em></div>
+              <div class="stat-card"><span>GOALS</span><em data-context-goals-count>—</em></div>
+              <div class="stat-card"><span>VOICE CTX</span><em data-context-voice-count>—</em></div>
+            </div>
+          </header>
+
+          <div class="context-grid">
+            <section class="context-card context-profile-card">
+              <div class="context-card-head">
+                <span>USER PROFILE</span>
+                <em data-context-profile-meta>—</em>
+              </div>
+              <form class="context-profile-form" data-context-profile-form>
+                <div class="context-form-grid">
+                  <label>Preferred name<input name="preferredName" data-context-profile-field autocomplete="off" /></label>
+                  <label>Role<input name="role" data-context-profile-field autocomplete="off" /></label>
+                  <label>Timezone<input name="timezone" data-context-profile-field placeholder="America/Los_Angeles" autocomplete="off" /></label>
+                  <label>Tone
+                    <select name="communicationTone" data-context-profile-field>
+                      <option value="terse">terse</option>
+                      <option value="balanced">balanced</option>
+                      <option value="verbose">verbose</option>
+                    </select>
+                  </label>
+                </div>
+                <label class="context-notes-label">Notes<textarea name="notes" data-context-profile-field rows="3" placeholder="Standing preferences, work style, people/projects Clementine should respect."></textarea></label>
+                <button type="submit" class="context-save">SAVE PROFILE ✎</button>
+              </form>
+            </section>
+
+            <section class="context-card context-health-card">
+              <div class="context-card-head">
+                <span>CONTEXT HEALTH</span>
+                <button type="button" data-context-refresh>REFRESH</button>
+              </div>
+              <div class="context-health-list" data-context-health-list>
+                <div class="settings-info">— loading —</div>
+              </div>
+            </section>
+          </div>
+
+          <section class="context-card">
+            <div class="context-card-head">
+              <span>CORE CONTEXT FILES</span>
+              <em>loaded into chat, Discord, and live voice</em>
+            </div>
+            <div class="context-files" data-context-files>
+              <div class="settings-info">— loading —</div>
+            </div>
+          </section>
+
+          <div class="context-grid lower">
+            <section class="context-card">
+              <div class="context-card-head">
+                <span>STANDING MEMORY</span>
+                <em>durable facts injected on every run</em>
+              </div>
+              <form class="context-fact-form" data-context-fact-form>
+                <select name="kind">
+                  <option value="user">user</option>
+                  <option value="project">project</option>
+                  <option value="feedback">feedback</option>
+                  <option value="reference">reference</option>
+                </select>
+                <input name="content" placeholder="Clementine should remember…" autocomplete="off" />
+                <button type="submit">REMEMBER</button>
+              </form>
+              <div class="context-facts-list" data-context-facts-list>
+                <div class="settings-info">— loading —</div>
+              </div>
+            </section>
+
+            <section class="context-card">
+              <div class="context-card-head">
+                <span>ACTIVE GOALS</span>
+                <em>what proactive work should optimize around</em>
+              </div>
+              <form class="context-goal-form" data-context-goal-form>
+                <input name="title" placeholder="Goal title" autocomplete="off" />
+                <select name="priority">
+                  <option value="high">high</option>
+                  <option value="medium" selected>medium</option>
+                  <option value="low">low</option>
+                </select>
+                <textarea name="description" rows="2" placeholder="Why this matters and what done looks like."></textarea>
+                <textarea name="nextActions" rows="2" placeholder="Next actions, one per line."></textarea>
+                <button type="submit">CREATE GOAL</button>
+              </form>
+              <div class="context-goals-list" data-context-goals-list>
+                <div class="settings-info">— loading —</div>
+              </div>
+            </section>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel-frame" data-section="workflows" hidden>
+        <div class="panel-tag">PANEL · 05 · WORKFLOW STUDIO</div>
+
+        <div class="panel-body wf-layout">
+
+          <!-- Workflow list (left) -->
+          <aside class="wf-list-pane">
+            <div class="wf-list-head">
+              <span>WORKFLOWS</span>
+              <span class="wf-new-btn" data-wf-new role="button" tabindex="0" title="Create new workflow" onclick="window.__clementineStartNewWorkflow && window.__clementineStartNewWorkflow();">＋ NEW</span>
+            </div>
+            <ol class="wf-list" data-wf-list>
+              <li class="empty">— loading —</li>
+            </ol>
+          </aside>
+
+          <!-- Editor (middle) -->
+          <div class="wf-editor" data-wf-editor>
+            <div class="wf-empty wf-empty-onboarding">
+              <div class="wf-empty-mark">⊟</div>
+              <div class="wf-empty-text">No workflow selected</div>
+              <p class="wf-empty-sub">A workflow is a multi-step task you can run on demand or on a schedule. Steps can depend on each other, share inputs, and synthesize a final output.</p>
+              <div class="wf-empty-actions">
+                <button class="wf-empty-btn primary" data-wf-new onclick="window.__clementineStartNewWorkflow && window.__clementineStartNewWorkflow();">＋ NEW WORKFLOW</button>
+                <button class="wf-empty-btn" data-wf-empty-architect>ASK ARCHITECT TO DRAFT ONE →</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Architect chat (right) -->
+          <aside class="wf-chat-pane">
+            <div class="wf-chat-head">
+              <span class="wf-chat-title">ARCHITECT</span>
+              <span class="wf-chat-meta" data-wf-chat-meta>idle</span>
+            </div>
+            <div class="wf-chat-log" data-wf-chat-log>
+              <div class="wf-chat-intro">
+                Workflow Architect chat.<br>
+                Ask the agent to draft, refine, or critique the workflow on the left.
+                <br><br>
+                <em>e.g. "Add a step after research that drafts a weekly email" or "Tighten the schedule to weekdays 9am" or "Validate this for cycles".</em>
+              </div>
+            </div>
+            <form class="wf-chat-form" data-wf-chat-form>
+              <textarea class="wf-chat-input" data-wf-chat-input
+                placeholder="message the architect · ⏎ to send · shift+⏎ for newline"
+                rows="2" autocomplete="off"></textarea>
+              <button type="submit" class="wf-chat-send" data-wf-chat-send>SEND ▸</button>
+            </form>
+          </aside>
+
+        </div>
+      </section>
+
+      <section class="panel-frame" data-section="tools" hidden>
+        <div class="panel-tag">PANEL · 06 · TOOLS</div>
+        <div class="panel-body tools-layout">
+
+          <aside class="tools-side">
+            <div class="tools-filter">
+              <input class="tools-search" data-tools-search type="search" placeholder="filter tools · category, name…" />
+              <span class="tools-count" data-tools-count>—</span>
+            </div>
+            <div class="tools-categories" data-tools-categories>
+              <!-- pills populated by JS -->
+            </div>
+          </aside>
+
+          <div class="tools-main">
+            <div class="tools-section">
+              <div class="tools-section-head">
+                <span>REGISTERED TOOLS</span>
+                <em data-tools-shown>—</em>
+              </div>
+              <div class="tools-grid" data-tools-grid>
+                <div class="tools-empty">— loading —</div>
+              </div>
+            </div>
+            <div class="tools-section">
+              <div class="tools-section-head">
+                <span>MCP SERVERS</span>
+                <em data-mcp-count>—</em>
+              </div>
+              <div class="tools-empty">
+                Discovered + custom MCP servers live in <a class="tools-jump" data-tools-jump="integrations">Integrations</a>.
+                Toggle, edit, or add new ones there — anything the agent can call is reflected back here as a tool.
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </section>
+
+      <section class="panel-frame" data-section="projects" hidden>
+        <div class="panel-tag">PANEL · 07 · PROJECTS</div>
+        <div class="panel-body projects-layout">
+
+          <aside class="proj-side">
+            <div class="proj-side-head">
+              <span>WORKSPACES</span>
+              <em data-proj-workspaces-count>—</em>
+            </div>
+            <ul class="proj-ws-list" data-proj-ws-list>
+              <li class="empty">— loading —</li>
+            </ul>
+            <div class="proj-side-head">
+              <span>DETECTED PROJECTS</span>
+              <em data-proj-list-count>—</em>
+            </div>
+            <ol class="proj-list" data-proj-list>
+              <li class="empty">— loading —</li>
+            </ol>
+          </aside>
+
+          <div class="proj-detail" data-proj-detail>
+            <div class="wf-empty">
+              <div class="wf-empty-mark">⌗</div>
+              <div class="wf-empty-text">SELECT A PROJECT</div>
+            </div>
+          </div>
+
+        </div>
+      </section>
+
+      <section class="panel-frame" data-section="skills" hidden>
+        <div class="panel-tag">PANEL · 08 · SKILLS</div>
+        <div class="panel-body skills-layout">
+
+          <div class="skills-header">
+            <div class="skills-intro">
+              <h3>Installed Skills</h3>
+              <p>Skills are plugins dropped into <code data-skills-dir>~/.clementine-next/plugins/</code>.
+                 Each plugin can register tools the agent calls just like built-in ones.</p>
+            </div>
+            <div class="skills-stats">
+              <div class="stat-card"><span>SKILLS</span><em data-skills-count>—</em></div>
+              <div class="stat-card"><span>TOOLS</span><em data-skills-tool-count>—</em></div>
+            </div>
+          </div>
+
+          <div class="skills-grid" data-skills-grid>
+            <div class="tools-empty">— loading —</div>
+          </div>
+
+        </div>
+      </section>
+
+      <section class="panel-frame" data-section="integrations" hidden>
+        <div class="panel-tag">PANEL · 09 · INTEGRATIONS</div>
+
+        <div class="panel-body integrations-layout">
+
+          <header class="hub-header">
+            <div>
+              <h3>Integrations Hub</h3>
+              <p>One place to connect your APIs, third-party apps, and local MCP servers. Anything you add here becomes a tool the agent can call.</p>
+            </div>
+            <div class="hub-stats">
+              <div class="stat-card"><span>AUTH</span><em data-hub-keys>—</em></div>
+              <div class="stat-card"><span>APPS</span><em data-hub-apps>—</em></div>
+              <div class="stat-card"><span>MCP</span><em data-hub-mcp>—</em></div>
+            </div>
+          </header>
+
+          <div class="hub-block">
+            <div class="hub-block-head">
+              <span class="hub-block-title">Runtime Auth & Capability Keys</span>
+              <span class="hub-block-meta" data-hub-keys-meta>—</span>
+            </div>
+            <p class="hub-block-intro">Codex OAuth runs the agent runtime. An OpenAI API key is separate and optional: it unlocks embeddings, Realtime live voice, and direct API-only features. Discord, Composio, and webhook secrets are separate integration keys.</p>
+            <div class="hub-keys-list" data-hub-keys-list>
+              <div class="settings-info">— loading —</div>
+            </div>
+          </div>
+
+          <div class="hub-block">
+            <div class="hub-block-head">
+              <span class="hub-block-title">Connected Apps</span>
+              <span class="hub-block-meta" data-hub-apps-meta>—</span>
+            </div>
+            <p class="hub-block-intro">Third-party apps you connect via Composio — Gmail, Slack, Notion, GitHub, Linear, Calendar, Drive, CRMs. One OAuth click per app; the agent can then read/write within the scopes you approved.</p>
+            <div class="hub-apps-controls" data-hub-apps-controls>
+              <div class="settings-info">— loading —</div>
+            </div>
+            <div class="hub-apps-list" data-hub-apps-list>
+              <div class="settings-info">— loading —</div>
+            </div>
+          </div>
+
+          <div class="hub-block">
+            <div class="hub-block-head">
+              <span class="hub-block-title">Native Browser Harness</span>
+              <span class="hub-block-meta" data-hub-browser-meta>—</span>
+            </div>
+            <p class="hub-block-intro">Browser Harness gives Clementine direct CDP control over your real Chrome or an optional Browser Use cloud browser. Once installed, the agent gets first-class browser_harness tools for web testing, scraping, uploads, and real browser tasks.</p>
+            <div class="hub-apps-controls" data-hub-browser-controls>
+              <div class="settings-info">— loading —</div>
+            </div>
+            <div class="hub-apps-list" data-hub-browser-list>
+              <div class="settings-info">— loading —</div>
+            </div>
+          </div>
+
+          <div class="hub-block">
+            <div class="hub-block-head">
+              <span class="hub-block-title">Skill / CLI Installer</span>
+              <span class="hub-block-meta" data-hub-installer-meta>approved commands only</span>
+            </div>
+            <p class="hub-block-intro">Install trusted CLIs or skill repos without opening Terminal. This runner only accepts single install commands such as <code>npm install -g package</code>, <code>brew install formula</code>, <code>uv tool install package</code>, <code>pipx install package</code>, or GitHub repo clones.</p>
+            <div class="hub-apps-controls" data-hub-installer-controls>
+              <input type="text" data-hub-install-command placeholder="npm install -g some-cli" />
+              <button data-hub-install-run>RUN INSTALL</button>
+            </div>
+            <div class="hub-apps-list" data-hub-installer-list>
+              <div class="settings-info">— paste an approved install command above. Output will stream here. —</div>
+            </div>
+          </div>
+
+          <div class="hub-block">
+            <div class="hub-block-head">
+              <span class="hub-block-title">Meeting Capture</span>
+              <span class="hub-block-meta" data-hub-recall-meta>—</span>
+            </div>
+            <p class="hub-block-intro">Optional Recall.ai Desktop Recording SDK capture for Zoom, Google Meet, Teams, Slack Huddles, and in-person meetings. The SDK only loads inside the Electron app after you enable it.</p>
+            <div class="hub-apps-controls" data-hub-recall-controls>
+              <div class="settings-info">— loading —</div>
+            </div>
+            <div class="hub-apps-list" data-hub-recall-list>
+              <div class="settings-info">— loading —</div>
+            </div>
+          </div>
+
+          <div class="hub-block">
+            <div class="hub-block-head">
+              <span class="hub-block-title">MCP Servers</span>
+              <span class="hub-block-meta" data-hub-mcp-meta>—</span>
+            </div>
+            <p class="hub-block-intro">Model Context Protocol servers extend the agent's tool surface with things like filesystem access, browser control, Playwright, Pinecone, Airtable, custom internal tools. Existing local MCP client configs can be imported automatically, but Clementine-owned config is the primary setup path.</p>
+            <div class="hub-mcp-list" data-hub-mcp-list>
+              <div class="settings-info">— loading —</div>
+            </div>
+            <div class="hub-mcp-actions">
+              <button class="hub-btn-add" data-hub-mcp-new>+ ADD CUSTOM SERVER</button>
+            </div>
+          </div>
+
+        </div>
+      </section>
+
+      <section class="panel-frame" data-section="settings" hidden>
+        <div class="panel-tag">PANEL · 10 · SETTINGS</div>
+        <div class="panel-body settings-layout">
+
+          <div class="settings-col">
+            <div class="settings-block">
+              <div class="settings-block-head">USER PROFILE</div>
+              <form class="settings-form" data-settings-profile-form>
+                <div class="settings-field">
+                  <label>DISPLAY NAME</label>
+                  <input type="text" name="displayName" data-profile-field />
+                </div>
+                <div class="settings-field">
+                  <label>PREFERRED NAME (how the agent addresses you)</label>
+                  <input type="text" name="preferredName" data-profile-field />
+                </div>
+                <div class="settings-field">
+                  <label>ROLE</label>
+                  <input type="text" name="role" data-profile-field />
+                </div>
+                <div class="settings-grid-2">
+                  <div class="settings-field">
+                    <label>TIMEZONE</label>
+                    <input type="text" name="timezone" data-profile-field placeholder="America/Los_Angeles" />
+                  </div>
+                  <div class="settings-field">
+                    <label>URGENCY TOLERANCE</label>
+                    <select name="urgencyTolerance" data-profile-field>
+                      <option value="low">low — notify sparingly</option>
+                      <option value="normal">normal</option>
+                      <option value="high">high — frequent updates ok</option>
+                    </select>
+                  </div>
+                </div>
+                <div class="settings-grid-2">
+                  <div class="settings-field">
+                    <label>TONE</label>
+                    <select name="communicationTone" data-profile-field>
+                      <option value="terse">terse</option>
+                      <option value="balanced">balanced</option>
+                      <option value="verbose">verbose</option>
+                    </select>
+                  </div>
+                  <div class="settings-field">
+                    <label>FORMALITY</label>
+                    <select name="formality" data-profile-field>
+                      <option value="casual">casual</option>
+                      <option value="professional">professional</option>
+                      <option value="formal">formal</option>
+                    </select>
+                  </div>
+                </div>
+                <div class="settings-grid-2">
+                  <div class="settings-field">
+                    <label>WORKING HOURS START</label>
+                    <input type="text" name="workingHoursStart" data-profile-field placeholder="9:00" />
+                  </div>
+                  <div class="settings-field">
+                    <label>WORKING HOURS END</label>
+                    <input type="text" name="workingHoursEnd" data-profile-field placeholder="18:00" />
+                  </div>
+                </div>
+                <div class="settings-field">
+                  <label>NOTES (free-form context the agent should know)</label>
+                  <textarea name="notes" data-profile-field rows="3"></textarea>
+                </div>
+                <button type="submit" class="settings-save">SAVE PROFILE ✎</button>
+              </form>
+            </div>
+
+            <div class="settings-block">
+              <div class="settings-block-head">RUNTIME AUTH</div>
+              <div class="settings-info" data-settings-auth>—</div>
+            </div>
+          </div>
+
+          <div class="settings-col">
+            <div class="settings-block">
+              <div class="settings-block-head">PROACTIVITY POLICY</div>
+              <form class="settings-form" data-settings-policy-form>
+                <div class="settings-field">
+                  <label>ENABLED · the master switch for proactive work</label>
+                  <div class="settings-row">
+                    <label class="check-pill">
+                      <input type="checkbox" name="enabled" data-policy-field />
+                      <span>Proactive loops on</span>
+                    </label>
+                  </div>
+                </div>
+                <div class="settings-grid-2">
+                  <div class="settings-field">
+                    <label>MODE</label>
+                    <select name="mode" data-policy-field>
+                      <option value="watch">watch — observe + notify only</option>
+                      <option value="balanced">balanced</option>
+                      <option value="hands_on">hands_on — drive forward</option>
+                    </select>
+                  </div>
+                  <div class="settings-field">
+                    <label>CHECK-IN MINUTES</label>
+                    <input type="number" name="checkInMinutes" data-policy-field min="1" max="60" />
+                  </div>
+                </div>
+                <div class="settings-field">
+                  <label>AUTO-APPROVE SCOPE</label>
+                  <select name="autoApproveScope" data-policy-field>
+                    <option value="strict">strict — every shell/write asks (default)</option>
+                    <option value="workspace">workspace — auto inside ~/Desktop, ~/Documents, ~/Developer, etc.</option>
+                    <option value="yolo">YOLO — auto everywhere (only the danger denylist applies)</option>
+                  </select>
+                  <span class="hint" style="display:block; margin-top: 4px; color: var(--fg-3); font-size: 10.5px; line-height: 1.5;">
+                    Plan-scoped approvals (15 min) always work on top of this. The hard denylist (<code>rm -rf /</code>, <code>sudo</code>, fork bombs, disk wipes) is enforced regardless.
+                    <strong style="color: var(--accent-warn);">YOLO trusts the agent to run anywhere the user can</strong> — use when you want zero friction.
+                  </span>
+                </div>
+                <div class="settings-grid-2">
+                  <div class="settings-field">
+                    <label>DEFAULT LONG TASK (MIN)</label>
+                    <input type="number" name="defaultLongTaskMinutes" data-policy-field min="5" max="240" />
+                  </div>
+                  <div class="settings-field">
+                    <label>BRIEF CADENCE (MIN)</label>
+                    <input type="number" name="briefCadenceMinutes" data-policy-field min="10" max="1440" />
+                  </div>
+                </div>
+                <div class="settings-field">
+                  <label>QUIET HOURS</label>
+                  <div class="settings-row">
+                    <label class="check-pill">
+                      <input type="checkbox" name="quietHoursEnabled" data-policy-field />
+                      <span>Enabled</span>
+                    </label>
+                    <input type="text" name="quietHoursStart" data-policy-field placeholder="22:00" style="width:90px;" />
+                    <span style="color:var(--fg-3);">→</span>
+                    <input type="text" name="quietHoursEnd" data-policy-field placeholder="07:00" style="width:90px;" />
+                  </div>
+                </div>
+                <div class="settings-field">
+                  <label>CAPABILITY GATES</label>
+                  <div class="settings-row settings-gates">
+                    <label class="check-pill">
+                      <input type="checkbox" name="allowComputerActions" data-policy-field />
+                      <span>Computer</span>
+                    </label>
+                    <label class="check-pill">
+                      <input type="checkbox" name="allowComposioActions" data-policy-field />
+                      <span>Composio</span>
+                    </label>
+                    <label class="check-pill">
+                      <input type="checkbox" name="allowDiscordCheckIns" data-policy-field />
+                      <span>Discord</span>
+                    </label>
+                  </div>
+                </div>
+                <button type="submit" class="settings-save">SAVE POLICY ✎</button>
+              </form>
+            </div>
+
+            <div class="settings-block">
+              <div class="settings-block-head">MEMORY INDEX</div>
+              <div class="settings-info" data-settings-memory>—</div>
+            </div>
+
+            <div class="settings-block">
+              <div class="settings-block-head">
+                PROPOSED PLANS
+                <span class="creds-meta" data-plan-proposals-meta>—</span>
+              </div>
+              <div class="proposals-intro">
+                Plans the agent drafted before mutating anything. Review the objective, steps, and risks. Approve to let the agent proceed, edit to change the plan first, or reject to abandon.
+              </div>
+              <div class="plan-proposals-list" data-plan-proposals-list>
+                <div class="settings-info">— no pending plans —</div>
+              </div>
+            </div>
+
+            <div class="settings-block">
+              <div class="settings-block-head">
+                PROPOSED BY AGENT
+                <span class="creds-meta" data-proposals-meta>—</span>
+              </div>
+              <div class="proposals-intro">
+                Templates the agent drafted from patterns it noticed. Review the rationale, then approve, edit, or reject. Approved proposals are installed as live templates.
+              </div>
+              <div class="proposals-list" data-proposals-list>
+                <div class="settings-info">— no pending proposals —</div>
+              </div>
+            </div>
+
+            <div class="settings-block">
+              <div class="settings-block-head">
+                PROACTIVE CHECK-INS
+                <span class="creds-meta" data-checkins-meta>—</span>
+              </div>
+              <div class="checkins-intro">
+                Autonomous reach-outs the agent fires on a schedule or when a condition is true.
+                Five seeded templates are installed and disabled — toggle the ones you want active. Cooldown prevents repeat-firing.
+              </div>
+              <div class="checkins-list" data-checkins-list>
+                <div class="settings-info">— loading —</div>
+              </div>
+              <div class="checkins-actions">
+                <button class="checkins-btn-new" data-checkins-new>+ NEW TEMPLATE</button>
+              </div>
+            </div>
+
+            <div class="settings-block">
+              <div class="settings-block-head">
+                CREDENTIAL VAULT
+                <span class="creds-meta" data-creds-meta>—</span>
+              </div>
+              <div class="settings-info" style="padding: 0 16px 8px; line-height: 1.5;">
+                Per-credential edit, repair, and reset live here.
+                Codex OAuth runtime credentials and optional capability keys are shown separately in <a class="tools-jump" data-tools-jump="integrations">Integrations</a>.
+              </div>
+              <div class="creds-list" data-creds-list>
+                <div class="settings-info">— loading —</div>
+              </div>
+              <div class="creds-actions">
+                <button class="creds-btn-repair" data-creds-repair>REPAIR KEYCHAIN ⟲</button>
+                <button class="creds-btn-reset" data-creds-reset>RESET CREDENTIALS ▣</button>
+              </div>
+              <div class="creds-footnote">
+                Reset only deletes entries under <code>com.clemmy.desktop.v1</code> and the local file vault.
+                Your <code>.env</code> is never touched.
               </div>
             </div>
           </div>
@@ -192,7 +1060,8 @@ export function renderConsoleHtml(token: string): string {
     <footer class="foot-bar">
       <span class="foot-cell">poll · 2s</span>
       <span class="foot-cell">last · <em data-last-sync>—</em></span>
-      <span class="foot-cell foot-right">⌘ K coming soon</span>
+      <span class="foot-cell" data-foot-version>—</span>
+      <span class="foot-cell foot-right">⌘K · coming soon</span>
     </footer>
 
   </div>
@@ -210,32 +1079,64 @@ export function renderConsoleHtml(token: string): string {
 //  contained. Mirrors a hardware-instrument aesthetic.
 // ─────────────────────────────────────────────────────────────────────
 const CONSOLE_CSS = `
-:root {
-  /* Surfaces */
+:root,
+:root[data-theme="ops"] {
+  /* Dark "operations console" theme — the default. */
   --bg-0: #07070a;
   --bg-1: #0d0d12;
   --bg-2: #14141c;
   --bg-3: #1c1c26;
 
-  /* Lines */
   --line: #2a2a36;
   --line-bright: #44445a;
 
-  /* Text */
   --fg: #e5e5ea;
   --fg-2: #a0a0aa;
   --fg-3: #6b6b78;
   --fg-mute: #4a4a55;
 
-  /* Accents */
   --accent: #ff5a35;        /* tactical orange */
   --accent-2: #b9ff36;      /* electric lime */
   --accent-3: #36c5ff;      /* cyan */
   --accent-warn: #ffcc33;
   --accent-fail: #ff3b5a;
 
+  --scanline-rgb: 255, 255, 255;
+  --scanline-alpha: 0.012;
+
   --mono: ui-monospace, "SF Mono", "JetBrains Mono", "IBM Plex Mono", Menlo, monospace;
   --tile: 8px;
+}
+
+:root[data-theme="day"] {
+  /* Light theme — same console DNA, just inverted. Same accents so
+     the visual identity stays consistent. */
+  --bg-0: #f6f4ef;
+  --bg-1: #fdfbf5;
+  --bg-2: #efebe0;
+  --bg-3: #e6e1d3;
+
+  --line: #d2cdbc;
+  --line-bright: #b2ac98;
+
+  --fg: #1c1a14;
+  --fg-2: #4a473b;
+  --fg-3: #76715f;
+  --fg-mute: #a6a08c;
+
+  /* Slightly darker accents to maintain contrast on the warm beige. */
+  --accent: #d44a25;
+  --accent-2: #6a9920;
+  --accent-3: #2588b8;
+  --accent-warn: #b88a18;
+  --accent-fail: #c8253c;
+
+  --scanline-rgb: 0, 0, 0;
+  --scanline-alpha: 0.010;
+
+  /* Slightly stronger card tint over the warm cream so the
+     plan/proposal accents still read clearly. */
+  --card-tint: 0.12;
 }
 
 * { box-sizing: border-box; }
@@ -248,16 +1149,17 @@ body {
   letter-spacing: 0.01em;
   -webkit-font-smoothing: antialiased;
   overflow: hidden;
-  /* Subtle scan-line texture — gives the console a CRT-ish feel without
-     being heavy-handed. */
+  /* Subtle scan-line texture — flips polarity with the theme so it
+     reads as a CRT shimmer in both dark and light modes. */
   background-image:
     repeating-linear-gradient(
       to bottom,
       transparent 0px,
       transparent 3px,
-      rgba(255, 255, 255, 0.012) 3px,
-      rgba(255, 255, 255, 0.012) 4px
+      rgba(var(--scanline-rgb), var(--scanline-alpha)) 3px,
+      rgba(var(--scanline-rgb), var(--scanline-alpha)) 4px
     );
+  transition: background 200ms ease, color 200ms ease;
 }
 
 /* ── Layout ─────────────────────────────────────────────────────── */
@@ -281,10 +1183,26 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 16px;
+  /* On macOS the traffic-light buttons occupy roughly the leftmost
+     78px of the window chrome. Pad the brand area past them so the
+     Clementine icon isn't hiding underneath. Non-mac platforms put
+     window controls on the right, so the extra left padding is a
+     minor cost. -webkit-app-region: drag turns the status bar into
+     a draggable window handle when packaged. */
+  padding: 0 16px 0 84px;
   background: var(--bg-1);
   border-bottom: 1px solid var(--line);
   position: relative;
+  -webkit-app-region: drag;
+}
+.status-bar button,
+.status-bar input,
+.status-bar select,
+.status-bar a,
+.status-bar [role="button"] {
+  /* Drag-handle applies to the whole bar; carve out interactive
+     elements so clicks still register. */
+  -webkit-app-region: no-drag;
 }
 .status-bar::after {
   /* Hairline accent ribbon below the bar — subtle vertical anchor. */
@@ -298,14 +1216,39 @@ body {
 .brand {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
   font-weight: 600;
-  letter-spacing: 0.18em;
+  letter-spacing: 0.04em;
   font-size: 11px;
 }
-.brand-mark { color: var(--fg); }
-.brand-sep  { color: var(--fg-mute); }
-.brand-sub  { color: var(--accent); }
+.brand-icon {
+  width: 26px;
+  height: 26px;
+  border-radius: 6px;
+  image-rendering: pixelated;
+  background: var(--bg-2);
+  padding: 2px;
+  flex-shrink: 0;
+}
+.brand-words {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.05;
+}
+.brand-mark {
+  color: var(--fg);
+  font-size: 14px;
+  letter-spacing: 0.02em;
+  font-weight: 600;
+  text-transform: none;
+}
+.brand-sub {
+  color: var(--fg-3);
+  font-size: 9.5px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  margin-top: 1px;
+}
 .pulse {
   width: 8px;
   height: 8px;
@@ -320,21 +1263,68 @@ body {
 }
 .status-row {
   display: flex;
-  gap: 18px;
-  font-size: 11px;
+  align-items: center;
+  gap: 14px;
+  font-size: 10.5px;
   color: var(--fg-3);
   letter-spacing: 0.1em;
+}
+.status-row .stat {
+  white-space: nowrap;
 }
 .status-row .stat em {
   font-style: normal;
   color: var(--fg);
   margin-left: 4px;
 }
+@media (max-width: 900px) {
+  .status-row {
+    gap: 10px;
+    font-size: 9.5px;
+  }
+}
 .status-row .connection {
   color: var(--accent-2);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
 .status-row .connection[data-offline] {
   color: var(--accent-fail);
+}
+.status-row .connection[data-offline] .pulse {
+  background: var(--accent-fail);
+  box-shadow: 0 0 8px rgba(255, 59, 90, 0.6);
+}
+
+/* ── Theme toggle ─────────────────────────────────────────────── */
+.theme-toggle {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 13px;
+  line-height: 1;
+  width: 26px;
+  height: 26px;
+  border-radius: 5px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background 100ms, border-color 100ms, color 100ms;
+  margin-left: 4px;
+}
+.theme-toggle:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.theme-toggle-icon {
+  display: inline-block;
+  transition: transform 200ms ease;
+}
+:root[data-theme="day"] .theme-toggle-icon {
+  transform: rotate(180deg);
 }
 
 /* ── Sidebar (left nav) ───────────────────────────────────────── */
@@ -381,6 +1371,266 @@ body {
   letter-spacing: 0.16em;
 }
 .nav.active .nav-key { color: var(--accent); }
+.nav-badge {
+  margin-left: auto;
+  min-width: 19px;
+  height: 17px;
+  padding: 2px 5px;
+  border: 1px solid var(--line-bright);
+  color: var(--fg-2);
+  background: var(--bg-0);
+  font-size: 9px;
+  line-height: 11px;
+  text-align: center;
+  letter-spacing: 0.04em;
+}
+.nav-badge.warn {
+  border-color: var(--accent-warn);
+  color: var(--accent-warn);
+}
+.nav-badge.hot {
+  border-color: var(--accent);
+  color: var(--accent);
+  box-shadow: 0 0 12px color-mix(in srgb, var(--accent) 18%, transparent);
+}
+.nav-badge.good {
+  border-color: var(--accent-2);
+  color: var(--accent-2);
+}
+
+/* -- Nav dock (the AIM "buddy info" zone) ------------------------
+ * Lives under the 10 menu items inside .sidebar, fills the dead
+ * vertical space with stacked status cards. The sidebar is a flex
+ * column; the dock uses margin-top:auto so it pins to the bottom of
+ * the available space and the menu sits on top.
+ *
+ * Cards are fixed-height where possible so the nav never scrolls;
+ * only the RECENT card scrolls internally when its event list grows.
+ */
+.nav-dock {
+  margin-top: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 10px 12px;
+  min-height: 0;
+  overflow: hidden;
+}
+.dock-card {
+  border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--bg-0) 56%, var(--bg-1));
+  display: flex;
+  flex-direction: column;
+  flex: 0 0 auto;
+}
+.dock-card-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 5px 9px 4px;
+  border-bottom: 1px dashed var(--line);
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  color: var(--fg-3);
+  text-transform: uppercase;
+}
+.dock-card-tag {
+  font-weight: 600;
+}
+.dock-card-tick {
+  color: var(--fg-2);
+  letter-spacing: 0.1em;
+  font-size: 9px;
+}
+.dock-card-body {
+  padding: 6px 9px 8px;
+  font-size: 10.5px;
+  color: var(--fg);
+  line-height: 1.35;
+}
+.dock-empty {
+  color: var(--fg-3);
+  font-style: italic;
+  font-size: 10px;
+}
+
+/* NOW */
+.dock-now-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.dock-now-label {
+  color: var(--fg);
+}
+.dock-now-detail {
+  color: var(--fg-2);
+  font-size: 10px;
+  margin-top: 3px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ACTIVE GOAL */
+.dock-goal-obj {
+  font-size: 10.5px;
+  color: var(--fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin-bottom: 5px;
+}
+.dock-progress {
+  width: 100%;
+  height: 4px;
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  overflow: hidden;
+  margin-bottom: 4px;
+}
+.dock-progress-fill {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  transition: width 220ms ease;
+}
+.dock-goal-judge {
+  color: var(--fg-3);
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+/* CLEMENTINE LIVE */
+.dock-live-body {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 9px 9px;
+}
+.dock-live-orb {
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  position: relative;
+  width: 38px;
+  height: 38px;
+  flex: 0 0 38px;
+}
+.dock-live-orb-ring {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  border: 1px solid var(--accent);
+  opacity: 0.4;
+}
+.dock-live-orb-core {
+  position: absolute;
+  inset: 4px;
+  border-radius: 50%;
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+.dock-live-orb-core img {
+  width: 28px;
+  height: 28px;
+  object-fit: contain;
+}
+.dock-live.live .dock-live-orb-ring {
+  border-color: var(--accent-2);
+  opacity: 1;
+  animation: dock-live-pulse 1.4s ease-in-out infinite;
+}
+@keyframes dock-live-pulse {
+  0%, 100% { transform: scale(1); opacity: 0.55; }
+  50%      { transform: scale(1.15); opacity: 0.95; }
+}
+.dock-live-info {
+  min-width: 0;
+}
+.dock-live-status {
+  color: var(--fg);
+  font-size: 10.5px;
+}
+.dock-live-meta {
+  color: var(--fg-3);
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  margin-top: 2px;
+}
+
+/* RECENT */
+.dock-recent-list {
+  max-height: 92px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 10px;
+}
+.dock-recent-row {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  color: var(--fg-2);
+  line-height: 1.35;
+}
+.dock-recent-row.ok   { color: var(--fg); }
+.dock-recent-row.warn { color: var(--accent-warn); }
+.dock-recent-row.err  { color: var(--accent-fail); }
+.dock-recent-row .t {
+  color: var(--fg-3);
+  font-size: 9px;
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+.dock-recent-row .n {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* HEALTH */
+.dock-health-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px 8px;
+  font-size: 9.5px;
+  letter-spacing: 0.04em;
+}
+.dock-health-cell {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--fg-2);
+}
+.dock-health-cell .presence-dot {
+  width: 7px;
+  height: 7px;
+  margin-top: 0;
+}
+.dock-health-cell.warn { color: var(--accent-warn); }
+.dock-health-cell.err  { color: var(--accent-fail); }
+
+@media (max-height: 760px) {
+  /* On short viewports the recent feed gets the squeeze first. */
+  .dock-recent-list { max-height: 64px; }
+}
+@media (max-height: 660px) {
+  /* If we really run out of room, fold recent + health into compact rows. */
+  .dock-health-grid { grid-template-columns: 1fr 1fr 1fr 1fr; }
+  .dock-recent-list { max-height: 44px; }
+}
+
 .nav-foot {
   margin-top: auto;
   padding: 14px 16px;
@@ -419,6 +1669,976 @@ body {
   overflow: hidden;
 }
 
+/* ── Home panel ───────────────────────────────────────────────── */
+/* No page-level scroll. The page itself is a fixed-height grid; each
+   card inside scrolls internally if its content overflows. */
+.home-layout {
+  display: grid;
+  grid-template-rows: auto 1fr;
+  gap: 12px;
+  padding: 14px 18px 18px;
+  overflow: hidden;
+  height: 100%;
+  position: relative; /* anchor the takeover overlay */
+}
+/* Compact greet strip — single horizontal row at the top of home.
+   Replaces the old home-welcome + 7 home-tiles block (those stats now
+   live in the nav-dock NOW card). */
+.home-greet-strip {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 10px 14px;
+  border: 1px solid var(--line);
+  background:
+    linear-gradient(135deg, color-mix(in srgb, var(--accent) 7%, transparent), transparent 56%),
+    var(--bg-1);
+  min-height: 50px;
+}
+.home-greet-text {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  min-width: 0;
+}
+.home-greet-text h2 {
+  margin: 0;
+  font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+  font-size: 18px;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+}
+.home-greet-text p {
+  margin: 0;
+  color: var(--fg-2);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  line-height: 1.4;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.home-greet-status {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--fg);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  flex: 0 0 auto;
+}
+.presence-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 999px;
+  background: var(--accent-2);
+  box-shadow: 0 0 9px color-mix(in srgb, var(--accent-2) 52%, transparent);
+  flex: 0 0 auto;
+}
+.presence-dot.needs-you,
+.presence-dot.warn { background: var(--accent-warn); box-shadow: 0 0 9px color-mix(in srgb, var(--accent-warn) 52%, transparent); }
+.presence-dot.working { background: var(--accent-3); box-shadow: 0 0 9px color-mix(in srgb, var(--accent-3) 52%, transparent); }
+.presence-dot.offline { background: var(--accent-fail); box-shadow: 0 0 9px color-mix(in srgb, var(--accent-fail) 52%, transparent); }
+/* Two-column main: agenda + LIVE on the left, CHAT on the right.
+   Both columns fill the available height (1fr in the parent grid).
+   Each card inside uses min-height: 0 so its body can scroll instead
+   of expanding the page. */
+.home-main {
+  display: grid;
+  grid-template-columns: minmax(280px, 0.85fr) minmax(360px, 1.4fr);
+  gap: 12px;
+  min-height: 0; /* critical: lets children's overflow:auto actually scroll */
+}
+.home-main-left {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) minmax(0, 1fr) auto;
+  gap: 12px;
+  min-height: 0;
+}
+.home-main-right {
+  display: grid;
+  min-height: 0;
+}
+.home-needs,
+.home-working {
+  min-height: 0;
+}
+.home-current-objective {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line);
+  color: var(--fg);
+  font-size: 11px;
+  line-height: 1.4;
+  background:
+    repeating-linear-gradient(90deg, color-mix(in srgb, var(--fg) 4%, transparent) 0 1px, transparent 1px 18px),
+    var(--bg-0);
+}
+.command-list {
+  gap: 0;
+}
+.command-list.compact .home-item {
+  padding: 6px 0;
+}
+
+/* CLEMENTINE LIVE card — third card in left column. Whole card is a
+   button; clicking enters takeover mode. Compact by default; the
+   takeover state grows the orb and shows the transcript chrome. */
+.home-live {
+  background:
+    radial-gradient(circle at 25% 0%, color-mix(in srgb, var(--accent) 14%, transparent), transparent 55%),
+    var(--bg-1);
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--line));
+  color: var(--fg);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  transition: border-color 160ms, background 160ms;
+  overflow: hidden;
+}
+.home-live:hover {
+  border-color: var(--accent);
+  background:
+    radial-gradient(circle at 25% 0%, color-mix(in srgb, var(--accent) 22%, transparent), transparent 55%),
+    var(--bg-1);
+}
+.home-live-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 14px;
+  border-bottom: 1px dashed var(--line);
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  color: var(--fg-3);
+  text-transform: uppercase;
+}
+.home-live-label {
+  font-weight: 600;
+}
+.home-live-phase {
+  color: var(--accent);
+  letter-spacing: 0.1em;
+}
+.home-live-stage {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px 14px;
+}
+.home-live-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.home-live-cta {
+  font-size: 13px;
+  letter-spacing: 0.04em;
+  color: var(--fg);
+}
+.home-live-sub {
+  font-size: 10px;
+  letter-spacing: 0.05em;
+  color: var(--fg-3);
+}
+
+/* CHAT — full height of the right column, internal scroll for thread. */
+.home-chat-dock {
+  height: 100%;
+  min-height: 0;
+}
+.home-chat {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  /* Subtle warm tint so the chat block reads as the focal point. */
+  background:
+    linear-gradient(180deg, rgba(255, 170, 80, var(--card-tint, 0.03)) 0%, transparent 30%),
+    var(--bg-1);
+  border-left: 2px solid var(--accent);
+}
+.home-chat .home-chat-thread {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+/* TAKEOVER state — when the LIVE card is clicked, .home-layout gets
+   the .live-takeover class. Everything else is hidden; LIVE goes
+   absolute-fill so the orb owns the whole panel. */
+.home-layout.live-takeover .home-greet-strip,
+.home-layout.live-takeover .home-main-left > :not(.home-live),
+.home-layout.live-takeover .home-main-right {
+  display: none;
+}
+.home-layout.live-takeover .home-main {
+  grid-template-columns: 1fr;
+}
+.home-layout.live-takeover .home-main-left {
+  grid-template-rows: 1fr;
+}
+.home-layout.live-takeover .home-live {
+  cursor: default;
+  min-height: 0;
+}
+.home-layout.live-takeover .home-live-stage {
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  gap: 22px;
+  padding: 28px;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+.home-layout.live-takeover .home-live-stage .home-voice-orb-button {
+  width: 180px;
+  height: 180px;
+  transform: scale(1);
+}
+.home-layout.live-takeover .home-live-stage .home-voice-avatar {
+  width: 116px;
+  height: 116px;
+}
+.home-layout.live-takeover .home-live-copy {
+  text-align: center;
+  gap: 6px;
+}
+.home-layout.live-takeover .home-live-cta {
+  font-size: 22px;
+  letter-spacing: 0.02em;
+}
+.home-layout.live-takeover .home-live-sub {
+  font-size: 12px;
+  letter-spacing: 0.08em;
+}
+.home-live-takeover-chrome {
+  position: absolute;
+  inset: 14px 18px 18px;
+  display: none; /* shown only via .live-takeover */
+  flex-direction: column;
+  pointer-events: none; /* let clicks through to the orb, except buttons */
+}
+.home-layout.live-takeover .home-live-takeover-chrome {
+  display: flex;
+}
+.home-live-takeover-chrome > * {
+  pointer-events: auto;
+}
+.home-live-close {
+  align-self: flex-start;
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  padding: 6px 12px;
+  cursor: pointer;
+}
+.home-live-close:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.home-live-takeover-transcript {
+  margin: 14px 0 6px;
+  padding: 14px 18px;
+  border: 1px dashed var(--line);
+  background: color-mix(in srgb, var(--bg-0) 58%, transparent);
+  color: var(--fg);
+  font-size: 13px;
+  line-height: 1.5;
+  max-height: 140px;
+  overflow-y: auto;
+}
+.home-live-takeover-feed {
+  padding: 10px 14px;
+  border: 1px solid var(--line);
+  background: var(--bg-0);
+  color: var(--fg-2);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  max-height: 90px;
+  overflow-y: auto;
+  margin-bottom: 8px;
+}
+.home-live-takeover-actions {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  margin-top: auto;
+  padding: 8px 0 0;
+}
+.home-live-takeover-hint {
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  color: var(--fg-3);
+  text-transform: uppercase;
+}
+.home-live-takeover-hint kbd {
+  border: 1px solid var(--line);
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-family: ui-monospace, monospace;
+  font-size: 9px;
+  color: var(--fg-2);
+  background: var(--bg-1);
+}
+
+@media (max-width: 900px) {
+  .home-main {
+    grid-template-columns: 1fr;
+  }
+  .home-main-left {
+    grid-template-rows: auto auto auto;
+  }
+}
+.home-block {
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.home-block-head {
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--fg-3);
+}
+.home-block-head em {
+  font-style: normal;
+  font-size: 11px;
+  color: var(--accent);
+}
+.home-block-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 14px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.home-empty {
+  color: var(--fg-mute);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  padding: 18px 0;
+  text-align: center;
+}
+.home-item {
+  display: flex;
+  gap: 10px;
+  padding: 8px 0;
+  border-bottom: 1px dotted var(--line);
+  align-items: flex-start;
+}
+.home-item.command-item {
+  cursor: pointer;
+}
+.home-item.command-item:hover .home-item-text {
+  color: var(--accent);
+}
+.home-item:last-child { border-bottom: 0; }
+.home-item-kind {
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  color: var(--accent);
+  text-transform: uppercase;
+  padding: 1px 6px;
+  border: 1px solid var(--accent);
+  align-self: flex-start;
+  flex-shrink: 0;
+}
+.home-item-kind.task { color: var(--accent-3); border-color: var(--accent-3); }
+.home-item-kind.exec { color: var(--accent-warn); border-color: var(--accent-warn); }
+.home-item-kind.checkin { color: var(--accent); border-color: var(--accent); }
+.home-item-kind.run { color: var(--accent-2); border-color: var(--accent-2); }
+.home-item-kind.done { color: var(--fg-mute); border-color: var(--fg-mute); }
+.home-item-text {
+  flex: 1;
+  font-size: 12px;
+  color: var(--fg);
+  line-height: 1.45;
+  /* Keep agent-generated tracking tasks from dominating the column —
+     show the first ~2 lines, fade the rest. */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  min-width: 0;
+}
+.home-list-footer {
+  padding: 8px 0 4px;
+  text-align: right;
+  font-size: 10px;
+  letter-spacing: 0.12em;
+}
+.home-list-footer .tools-jump {
+  color: var(--accent);
+  text-decoration: none;
+  border-bottom: 1px dashed var(--accent);
+  cursor: pointer;
+}
+.home-list-footer .tools-jump:hover {
+  background: var(--accent);
+  color: var(--bg-0);
+  border-bottom-color: transparent;
+}
+.home-item-meta {
+  font-size: 10px;
+  color: var(--fg-3);
+  margin-top: 2px;
+}
+.home-memory-line {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 5px 0;
+  border-bottom: 1px dotted var(--line);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+}
+.home-memory-line span {
+  color: var(--fg-3);
+  text-transform: uppercase;
+}
+.home-memory-line em {
+  color: var(--fg);
+  font-style: normal;
+}
+
+/* Chat */
+.home-chat-thread {
+  flex: 1;
+  overflow-y: auto;
+  padding: 10px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.home-chat-hint {
+  color: var(--fg-mute);
+  text-align: center;
+  padding: 40px 16px;
+  margin: auto;
+  max-width: 560px;
+}
+.home-chat-hint-title {
+  font-size: 16px;
+  letter-spacing: 0.02em;
+  color: var(--fg);
+  font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+  font-weight: 500;
+  margin-bottom: 6px;
+}
+.home-chat-hint-sub {
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  color: var(--fg-3);
+  margin-bottom: 16px;
+}
+.home-chat-suggestions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: center;
+}
+.home-chat-suggest {
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 11px;
+  padding: 6px 12px;
+  cursor: pointer;
+  letter-spacing: 0.04em;
+  border-radius: 14px;
+  transition: background 100ms, border-color 100ms, color 100ms;
+}
+.home-chat-suggest:hover {
+  background: var(--accent);
+  color: var(--bg-0);
+  border-color: var(--accent);
+}
+.home-chat-meta {
+  font-style: normal;
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  color: var(--fg-mute);
+}
+.home-chat-turn {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px;
+  border-radius: 4px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.home-chat-turn.pending {
+  box-shadow: inset 2px 0 0 color-mix(in srgb, var(--accent) 72%, transparent);
+}
+.home-chat-turn.user {
+  background: var(--bg-0);
+  border-left: 2px solid var(--accent);
+  align-self: stretch;
+}
+.home-chat-turn.assistant {
+  background: var(--bg-2);
+  border-left: 2px solid var(--accent-2);
+  align-self: stretch;
+  white-space: pre-wrap;
+}
+.home-chat-role {
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--fg-3);
+}
+.home-chat-stream-status {
+  display: none;
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--accent-2);
+}
+.home-chat-turn.pending .home-chat-stream-status {
+  display: block;
+}
+.home-chat-form {
+  display: flex;
+  gap: 8px;
+  padding: 10px 14px;
+  border-top: 1px solid var(--line);
+  background: var(--bg-2);
+}
+.home-chat-input {
+  flex: 1;
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  color: var(--fg);
+  font: inherit;
+  font-size: 12px;
+  padding: 8px 10px;
+  outline: none;
+}
+.home-chat-input:focus { border-color: var(--accent); }
+.home-chat-send {
+  background: transparent;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  padding: 6px 14px;
+  cursor: pointer;
+}
+.home-chat-send:hover { background: var(--accent); color: var(--bg-0); }
+.home-chat-send:disabled {
+  opacity: 0.5;
+  cursor: progress;
+}
+.home-voice-panel {
+  position: relative;
+  display: grid;
+  grid-template-columns: 76px 1fr auto;
+  gap: 14px;
+  align-items: center;
+  padding: 14px;
+  border-top: 1px solid var(--line);
+  overflow: hidden;
+  transition:
+    min-height 220ms ease,
+    padding 220ms ease,
+    margin 220ms ease,
+    border-radius 220ms ease,
+    box-shadow 220ms ease;
+  background:
+    radial-gradient(circle at 42px 34px, color-mix(in srgb, var(--accent) 20%, transparent), transparent 56px),
+    radial-gradient(circle at 95% 30%, color-mix(in srgb, var(--accent-2) 14%, transparent), transparent 120px),
+    linear-gradient(90deg, var(--bg-2), color-mix(in srgb, var(--bg-1) 78%, var(--accent-2) 8%));
+}
+.home-voice-panel::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0;
+  transform: translateX(-20%);
+  transition: opacity 220ms ease, transform 480ms ease;
+  background:
+    linear-gradient(115deg, transparent 0 30%, color-mix(in srgb, var(--accent) 12%, transparent) 42%, transparent 56%),
+    repeating-linear-gradient(90deg, color-mix(in srgb, var(--fg) 5%, transparent) 0 1px, transparent 1px 18px);
+}
+.home-voice-panel.live {
+  grid-template-columns: 138px minmax(0, 1fr) auto;
+  min-height: 176px;
+  margin: 14px;
+  padding: 22px;
+  border: 1px solid color-mix(in srgb, var(--accent) 34%, var(--line));
+  border-radius: 28px;
+  box-shadow:
+    0 24px 80px color-mix(in srgb, #000 28%, transparent),
+    0 0 60px color-mix(in srgb, var(--accent) 15%, transparent),
+    inset 0 0 42px color-mix(in srgb, var(--accent-2) 8%, transparent);
+}
+.home-voice-panel.live::before {
+  opacity: 1;
+  transform: translateX(0);
+}
+.home-voice-panel.focus {
+  grid-template-columns: 176px minmax(0, 1fr) auto;
+  min-height: 248px;
+  margin: 18px;
+  padding: 28px;
+  border-radius: 34px;
+}
+.home-voice-orb-button {
+  position: relative;
+  width: 58px;
+  height: 58px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--accent) 54%, var(--line));
+  background:
+    radial-gradient(circle at 50% 50%, color-mix(in srgb, var(--accent) 18%, transparent), transparent 38%),
+    conic-gradient(from 205deg, color-mix(in srgb, var(--accent) 70%, transparent), transparent 28%, color-mix(in srgb, var(--accent-2) 75%, transparent), transparent 70%),
+    var(--bg-0);
+  cursor: pointer;
+  padding: 0;
+  box-shadow:
+    0 0 24px color-mix(in srgb, var(--accent) 22%, transparent),
+    inset 0 0 20px color-mix(in srgb, var(--accent-2) 10%, transparent);
+  isolation: isolate;
+  overflow: visible;
+  transition:
+    width 220ms ease,
+    height 220ms ease,
+    border-radius 220ms ease,
+    transform 180ms ease,
+    box-shadow 220ms ease;
+}
+.home-voice-orb-button:disabled {
+  cursor: progress;
+  opacity: 0.68;
+}
+.home-voice-orb-button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 4px;
+}
+.home-voice-ring {
+  position: absolute;
+  inset: -8px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--accent) 28%, transparent);
+  opacity: 0.56;
+}
+.home-voice-ring.ring-b {
+  inset: -15px;
+  border-color: color-mix(in srgb, var(--accent-2) 22%, transparent);
+  opacity: 0.35;
+}
+.home-voice-core {
+  position: absolute;
+  inset: 9px;
+  display: grid;
+  place-items: center;
+  border-radius: 16px;
+  overflow: hidden;
+  background: linear-gradient(145deg, color-mix(in srgb, var(--bg-0) 72%, var(--accent) 12%), var(--bg-1));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--fg) 14%, transparent);
+  transition: inset 220ms ease, border-radius 220ms ease;
+}
+.home-voice-avatar {
+  width: 29px;
+  height: 29px;
+  object-fit: contain;
+  image-rendering: pixelated;
+  filter: saturate(1.15) contrast(1.08);
+  transform: translateY(1px);
+  transition: width 220ms ease, height 220ms ease;
+}
+.home-voice-face {
+  position: absolute;
+  pointer-events: none;
+  image-rendering: pixelated;
+}
+.home-voice-face.mouth {
+  left: 50%;
+  bottom: 8px;
+  width: 10px;
+  height: 3px;
+  transform: translateX(-50%);
+  background: color-mix(in srgb, var(--bg-0) 76%, #111 24%);
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--accent) 18%, transparent),
+    0 1px 0 color-mix(in srgb, var(--accent-2) 45%, transparent);
+  opacity: 0;
+}
+.home-voice-face.cheek {
+  bottom: 11px;
+  width: 3px;
+  height: 3px;
+  background: color-mix(in srgb, var(--accent) 76%, transparent);
+  opacity: 0;
+}
+.home-voice-face.cheek-left { left: 9px; }
+.home-voice-face.cheek-right { right: 9px; }
+.home-voice-scan {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(180deg, transparent 0%, color-mix(in srgb, var(--accent) 28%, transparent) 48%, transparent 56%);
+  transform: translateY(-110%);
+  opacity: 0;
+}
+.home-voice-wave {
+  position: absolute;
+  right: -5px;
+  bottom: 7px;
+  display: grid;
+  grid-template-columns: repeat(4, 3px);
+  gap: 2px;
+  align-items: end;
+  height: 16px;
+  padding: 4px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--bg-0) 78%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 32%, transparent);
+}
+.home-voice-wave i {
+  display: block;
+  width: 3px;
+  height: 5px;
+  border-radius: 999px;
+  background: var(--accent);
+  opacity: 0.45;
+}
+.home-voice-panel.live .home-voice-orb-button {
+  width: 112px;
+  height: 112px;
+}
+.home-voice-panel.focus .home-voice-orb-button {
+  width: 148px;
+  height: 148px;
+}
+.home-voice-panel.live .home-voice-core {
+  inset: 18px;
+  border-radius: 26px;
+}
+.home-voice-panel.focus .home-voice-core {
+  inset: 24px;
+  border-radius: 32px;
+}
+.home-voice-panel.live .home-voice-avatar {
+  width: 62px;
+  height: 62px;
+}
+.home-voice-panel.focus .home-voice-avatar {
+  width: 82px;
+  height: 82px;
+}
+.home-voice-panel.live .home-voice-orb-button {
+  animation: voicePulse 1.35s ease-in-out infinite;
+}
+.home-voice-panel.routing .home-voice-orb-button {
+  border-color: color-mix(in srgb, var(--accent-2) 70%, var(--accent));
+  box-shadow:
+    0 0 44px color-mix(in srgb, var(--accent-2) 28%, transparent),
+    inset 0 0 30px color-mix(in srgb, var(--accent) 14%, transparent);
+}
+.home-voice-panel.thinking .home-voice-orb-button {
+  animation-duration: 920ms;
+}
+.home-voice-panel.speaking .home-voice-orb-button {
+  animation-duration: 680ms;
+}
+.home-voice-panel.live .home-voice-avatar {
+  animation: voiceAvatarTalk 540ms steps(2, end) infinite;
+}
+.home-voice-panel.live .home-voice-face.mouth {
+  opacity: 1;
+  animation: voicePixelMouth 360ms steps(3, end) infinite;
+}
+.home-voice-panel.live .home-voice-face.cheek {
+  animation: voicePixelCheeks 720ms steps(2, end) infinite;
+}
+.home-voice-panel.live .home-voice-ring.ring-a {
+  animation: voiceOrbit 3.6s linear infinite;
+}
+.home-voice-panel.live .home-voice-ring.ring-b {
+  animation: voiceOrbit 5.2s linear infinite reverse;
+}
+.home-voice-panel.live .home-voice-scan {
+  animation: voiceScan 2.2s ease-in-out infinite;
+}
+.home-voice-panel.live .home-voice-wave i {
+  opacity: 1;
+  animation: voiceBars 680ms ease-in-out infinite;
+}
+.home-voice-panel.live .home-voice-wave i:nth-child(2) { animation-delay: 90ms; }
+.home-voice-panel.live .home-voice-wave i:nth-child(3) { animation-delay: 180ms; }
+.home-voice-panel.live .home-voice-wave i:nth-child(4) { animation-delay: 270ms; }
+@keyframes voiceOrbit {
+  to { transform: rotate(360deg); }
+}
+@keyframes voicePulse {
+  0%, 100% { transform: scale(1); box-shadow: 0 0 22px color-mix(in srgb, var(--accent) 22%, transparent), inset 0 0 20px color-mix(in srgb, var(--accent-2) 10%, transparent); }
+  50% { transform: scale(1.045); box-shadow: 0 0 38px color-mix(in srgb, var(--accent) 36%, transparent), inset 0 0 24px color-mix(in srgb, var(--accent-2) 16%, transparent); }
+}
+@keyframes voiceAvatarTalk {
+  0%, 100% { transform: translateY(1px) scale(1); filter: saturate(1.15) contrast(1.08); }
+  50% { transform: translateY(0) scale(1.06); filter: saturate(1.35) contrast(1.16) drop-shadow(0 0 5px color-mix(in srgb, var(--accent) 42%, transparent)); }
+}
+@keyframes voicePixelMouth {
+  0% { height: 2px; width: 8px; bottom: 8px; }
+  34% { height: 7px; width: 8px; bottom: 6px; }
+  68% { height: 4px; width: 12px; bottom: 7px; }
+  100% { height: 2px; width: 8px; bottom: 8px; }
+}
+@keyframes voicePixelCheeks {
+  0%, 100% { opacity: 0.24; transform: translateY(0); }
+  50% { opacity: 0.95; transform: translateY(-1px); }
+}
+@keyframes voiceScan {
+  0%, 35% { transform: translateY(-110%); opacity: 0; }
+  45%, 60% { opacity: 0.85; }
+  78%, 100% { transform: translateY(110%); opacity: 0; }
+}
+@keyframes voiceBars {
+  0%, 100% { height: 4px; opacity: 0.52; }
+  45% { height: 14px; opacity: 1; }
+}
+.home-voice-copy {
+  min-width: 0;
+  position: relative;
+  z-index: 1;
+}
+.home-voice-title-row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.home-voice-title {
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--fg);
+}
+.home-voice-panel.live .home-voice-title {
+  font-size: 13px;
+  letter-spacing: 0.22em;
+}
+.home-voice-phase {
+  border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--line));
+  border-radius: 999px;
+  padding: 3px 8px;
+  font-size: 8px;
+  letter-spacing: 0.18em;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--bg-0) 78%, transparent);
+}
+.home-voice-status {
+  margin-top: 3px;
+  font-size: 11px;
+  color: var(--fg-2);
+}
+.home-voice-panel.live .home-voice-status {
+  margin-top: 9px;
+  font-size: 15px;
+  color: var(--fg);
+}
+.home-voice-transcript {
+  margin-top: 4px;
+  font-size: 10px;
+  color: var(--fg-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.home-voice-panel.live .home-voice-transcript {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--fg-2);
+  white-space: normal;
+}
+.home-voice-feed {
+  display: none;
+  margin-top: 12px;
+  max-height: 72px;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--line) 74%, transparent);
+  background: color-mix(in srgb, var(--bg-0) 48%, transparent);
+  padding: 8px;
+  color: var(--fg-3);
+  font-size: 10px;
+  line-height: 1.45;
+}
+.home-voice-panel.live .home-voice-feed {
+  display: grid;
+  gap: 4px;
+}
+.home-voice-panel.focus .home-voice-feed {
+  max-height: 120px;
+  font-size: 11px;
+}
+.home-voice-event {
+  display: block;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.home-voice-event.tool,
+.home-voice-event.routing {
+  color: var(--accent-2);
+}
+.home-voice-event.error {
+  color: var(--danger);
+}
+.home-voice-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  position: relative;
+  z-index: 1;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.home-voice-btn {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  padding: 7px 10px;
+  cursor: pointer;
+}
+.home-voice-btn:hover:not(:disabled) {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.home-voice-btn:disabled {
+  opacity: 0.42;
+  cursor: not-allowed;
+}
+.home-voice-panel audio {
+  display: none;
+}
+
 /* ── Activity panel ───────────────────────────────────────────── */
 .activity-layout {
   display: grid;
@@ -436,6 +2656,7 @@ body {
   flex-direction: column;
   overflow: hidden;
 }
+
 .feed-header,
 .detail-header {
   padding: 8px 14px;
@@ -711,6 +2932,214 @@ body {
   flex-direction: column;
   overflow: hidden;
 }
+.mem-toolbar {
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  border-bottom: 1px solid var(--line);
+}
+.mem-view-toggle {
+  display: flex;
+  border-right: 1px solid var(--line);
+}
+.mem-view-btn {
+  background: transparent;
+  border: 0;
+  color: var(--fg-3);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  padding: 12px 14px;
+  cursor: pointer;
+  text-transform: uppercase;
+  transition: color 100ms, background 100ms;
+}
+.mem-view-btn:hover { color: var(--fg); background: var(--bg-1); }
+.mem-view-btn.active { color: var(--accent); background: var(--bg-1); }
+
+/* The graph view */
+.mem-graph {
+  flex: 1;
+  position: relative;
+  display: grid;
+  grid-template-rows: auto 1fr;
+  grid-template-columns: 1fr 280px;
+  background: var(--bg-2);
+  overflow: hidden;
+}
+.mem-graph[hidden] { display: none; }
+.mem-graph-topbar {
+  grid-column: 1 / -1;
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-1);
+  min-width: 0;
+}
+.mem-graph-controls,
+.mem-graph-filters {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  min-width: 0;
+}
+.mem-graph-controls button,
+.mem-graph-filters select,
+.mem-graph-filters input {
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  padding: 5px 8px;
+  outline: none;
+}
+.mem-graph-controls button {
+  cursor: pointer;
+}
+.mem-graph-controls button:hover,
+.mem-graph-filters select:focus,
+.mem-graph-filters input:focus {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.mem-graph-filters input {
+  width: 150px;
+}
+.mem-graph-meta {
+  color: var(--fg-3);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  white-space: nowrap;
+}
+.mem-graph-canvas {
+  position: relative;
+  background:
+    radial-gradient(circle at 50% 50%, var(--bg-1) 0%, var(--bg-0) 80%);
+  overflow: hidden;
+  min-height: 360px;
+}
+.mem-graph-detail {
+  border-left: 1px solid var(--line);
+  padding: 14px 16px;
+  background: var(--bg-1);
+  overflow-y: auto;
+  font-size: 11px;
+  color: var(--fg-2);
+  line-height: 1.55;
+}
+.mem-graph-detail h4 {
+  margin: 0 0 6px;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  color: var(--fg);
+}
+.mem-graph-detail .pill {
+  display: inline-block;
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  padding: 1px 6px;
+  border: 1px solid var(--line);
+  text-transform: uppercase;
+  margin-right: 6px;
+  color: var(--fg-3);
+}
+.mem-graph-detail .pill.fact { color: var(--accent); border-color: var(--accent); }
+.mem-graph-detail .pill.file { color: var(--accent-3); border-color: var(--accent-3); }
+.mem-graph-detail .pill.kind { color: var(--accent-2); border-color: var(--accent-2); }
+.mem-graph-detail-empty { color: var(--fg-mute); padding: 20px 0; }
+.mem-graph-detail-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 12px;
+}
+.mem-graph-detail-actions button {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  padding: 5px 8px;
+  cursor: pointer;
+}
+.mem-graph-detail-actions button:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.mem-graph-note {
+  margin: 10px 0 0;
+  color: var(--fg-3);
+  font-size: 10px;
+  line-height: 1.45;
+  border-top: 1px dashed var(--line);
+  padding-top: 10px;
+}
+.mem-graph-legend {
+  position: absolute;
+  bottom: 12px;
+  left: 12px;
+  display: flex;
+  gap: 12px;
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  color: var(--fg-3);
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  padding: 6px 10px;
+  pointer-events: none;
+  text-transform: uppercase;
+}
+.mem-graph-legend .dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-right: 4px;
+  vertical-align: middle;
+}
+.mem-graph-legend .dot.fact { background: var(--accent); }
+.mem-graph-legend .dot.file { background: var(--accent-3); }
+.mem-graph-legend .dot.kind { background: var(--accent-2); }
+@media (max-width: 1040px) {
+  .memory-layout {
+    grid-template-columns: 1fr;
+    overflow-y: auto;
+  }
+  .mem-sidebar {
+    min-height: 280px;
+  }
+  .mem-graph {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto minmax(360px, 1fr) auto;
+  }
+  .mem-graph-detail {
+    border-left: 0;
+    border-top: 1px solid var(--line);
+    max-height: 220px;
+  }
+}
+@media (max-width: 760px) {
+  .mem-toolbar,
+  .mem-graph-topbar {
+    flex-wrap: wrap;
+  }
+  .mem-search {
+    min-width: 100%;
+  }
+  .mem-graph-filters {
+    width: 100%;
+  }
+  .mem-graph-filters input {
+    flex: 1;
+    width: auto;
+  }
+}
 .mem-search {
   display: flex;
   align-items: center;
@@ -870,6 +3299,2441 @@ body {
 }
 .fact-viewer .forget:hover { background: var(--accent-fail); color: var(--bg-0); }
 
+/* ── Context / Identity panel ─────────────────────────────────── */
+.context-layout {
+  height: 100%;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.context-header {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 18px;
+  align-items: start;
+  border: 1px solid var(--line);
+  background:
+    linear-gradient(135deg, rgba(255, 90, 53, 0.10), transparent 38%),
+    var(--bg-2);
+  padding: 18px;
+}
+.context-header h3 {
+  margin: 0 0 6px;
+  font-size: 22px;
+  letter-spacing: -0.02em;
+  color: var(--fg);
+}
+.context-header p {
+  margin: 0;
+  color: var(--fg-2);
+  max-width: 780px;
+  line-height: 1.5;
+}
+.context-stats {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(82px, 1fr));
+  gap: 8px;
+}
+.context-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.1fr) minmax(320px, 0.9fr);
+  gap: 16px;
+}
+.context-grid.lower {
+  align-items: start;
+}
+.context-card {
+  border: 1px solid var(--line);
+  background: var(--bg-2);
+  min-width: 0;
+}
+.context-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 14px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-1);
+  color: var(--fg-3);
+  font-size: 10px;
+  letter-spacing: 0.18em;
+}
+.context-card-head em {
+  font-style: normal;
+  color: var(--fg-mute);
+  letter-spacing: 0.08em;
+}
+.context-card-head button,
+.context-save,
+.context-fact-form button,
+.context-goal-form button,
+.context-file-actions button {
+  background: transparent;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  padding: 5px 9px;
+  cursor: pointer;
+  transition: background 100ms, color 100ms;
+}
+.context-card-head button:hover,
+.context-save:hover,
+.context-fact-form button:hover,
+.context-goal-form button:hover,
+.context-file-actions button:hover {
+  background: var(--accent);
+  color: var(--bg-0);
+}
+.context-profile-form,
+.context-fact-form,
+.context-goal-form {
+  padding: 14px;
+}
+.context-form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+.context-profile-form label,
+.context-fact-form label,
+.context-goal-form label,
+.context-notes-label {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  color: var(--fg-3);
+  font-size: 10px;
+  letter-spacing: 0.14em;
+}
+.context-profile-form input,
+.context-profile-form select,
+.context-profile-form textarea,
+.context-fact-form input,
+.context-fact-form select,
+.context-goal-form input,
+.context-goal-form select,
+.context-goal-form textarea,
+.context-file textarea {
+  width: 100%;
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  color: var(--fg);
+  font: inherit;
+  font-size: 11px;
+  padding: 7px 9px;
+  outline: none;
+}
+.context-profile-form textarea,
+.context-goal-form textarea,
+.context-file textarea {
+  resize: vertical;
+  line-height: 1.55;
+}
+.context-notes-label {
+  margin-top: 10px;
+}
+.context-save {
+  margin-top: 10px;
+}
+.context-health-list,
+.context-facts-list,
+.context-goals-list,
+.context-files {
+  padding: 12px 14px;
+}
+.context-health-row {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 10px;
+  align-items: center;
+  padding: 8px 0;
+  border-bottom: 1px dashed var(--line);
+}
+.context-health-row:last-child { border-bottom: 0; }
+.context-health-status {
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  border: 1px solid var(--line);
+  padding: 2px 7px;
+  color: var(--fg-3);
+}
+.context-health-status.ok { color: var(--accent-2); border-color: var(--accent-2); }
+.context-health-status.warn { color: var(--accent-warn); border-color: var(--accent-warn); }
+.context-health-title { color: var(--fg); font-size: 11px; }
+.context-health-meta { color: var(--fg-3); font-size: 10px; }
+.context-file {
+  border: 1px solid var(--line);
+  background: var(--bg-1);
+  margin-bottom: 12px;
+}
+.context-file:last-child { margin-bottom: 0; }
+.context-file-head {
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+.context-file-title { color: var(--fg); font-size: 12px; }
+.context-file-desc { color: var(--fg-3); font-size: 10px; margin-top: 3px; line-height: 1.45; }
+.context-file-meta {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  color: var(--fg-3);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+}
+.context-file-meta .warn { color: var(--accent-warn); }
+.context-file textarea {
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  min-height: 150px;
+}
+.context-file-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 12px;
+  color: var(--fg-mute);
+  font-size: 10px;
+}
+.context-fact-form {
+  display: grid;
+  grid-template-columns: 120px 1fr auto;
+  gap: 8px;
+  border-bottom: 1px solid var(--line);
+}
+.context-goal-form {
+  display: grid;
+  grid-template-columns: 1fr 110px;
+  gap: 8px;
+  border-bottom: 1px solid var(--line);
+}
+.context-goal-form textarea,
+.context-goal-form button {
+  grid-column: 1 / -1;
+}
+.context-fact,
+.context-goal {
+  border-bottom: 1px dashed var(--line);
+  padding: 9px 0;
+}
+.context-fact:last-child,
+.context-goal:last-child { border-bottom: 0; }
+.context-fact-kind,
+.context-goal-meta {
+  color: var(--accent);
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+}
+.context-fact-body,
+.context-goal-title {
+  color: var(--fg);
+  margin-top: 4px;
+  line-height: 1.45;
+}
+.context-goal-desc,
+.context-goal-next {
+  color: var(--fg-3);
+  font-size: 10px;
+  line-height: 1.45;
+  margin-top: 4px;
+}
+
+/* ── Workflow Studio ─────────────────────────────────────────── */
+.wf-layout {
+  display: grid;
+  grid-template-columns: 260px 1fr 360px;
+  gap: 14px;
+  height: 100%;
+  overflow: hidden;
+}
+.wf-list-pane,
+.wf-editor,
+.wf-chat-pane {
+  border: 1px solid var(--line);
+  background: var(--bg-2);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.wf-list-head,
+.wf-chat-head {
+  padding: 8px 12px;
+  background: var(--bg-1);
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  color: var(--fg-3);
+}
+.wf-chat-title { color: var(--fg); }
+.wf-chat-meta { color: var(--accent); font-size: 10px; }
+.wf-new-btn {
+  display: inline-block;
+  background: transparent;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  padding: 3px 8px;
+  cursor: pointer;
+  transition: background 100ms, color 100ms;
+}
+.wf-new-btn:hover { background: var(--accent); color: var(--bg-0); }
+
+.wf-list {
+  list-style: none;
+  margin: 0; padding: 0;
+  overflow-y: auto;
+  flex: 1;
+  font-size: 11px;
+}
+.wf-list .empty { padding: 18px; color: var(--fg-mute); text-align: center; letter-spacing: 0.1em; }
+.wf-list li.wf {
+  border-bottom: 1px solid var(--line);
+  transition: background 100ms;
+}
+.wf-list li.wf:hover { background: var(--bg-3); }
+.wf-list li.wf.selected { background: var(--bg-3); box-shadow: inset 2px 0 0 var(--accent); }
+.wf-list .wf-select {
+  width: 100%;
+  display: block;
+  text-align: left;
+  padding: 9px 12px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  text-decoration: none;
+}
+.wf-list li.wf .name {
+  color: var(--fg);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: block;
+}
+.wf-list li.wf .meta {
+  color: var(--fg-3);
+  font-size: 10px;
+  margin-top: 3px;
+  display: flex;
+  gap: 10px;
+}
+.wf-list li.wf .pill {
+  font-size: 9px;
+  letter-spacing: 0.18em;
+}
+.wf-list li.wf .pill.on { color: var(--accent-2); }
+.wf-list li.wf .pill.off { color: var(--fg-mute); }
+.wf-list li.wf .pill.cron { color: var(--accent-3); }
+
+/* Editor */
+.wf-editor { padding: 0; }
+.wf-empty {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  gap: 14px;
+  color: var(--fg-mute);
+  letter-spacing: 0.16em;
+  font-size: 10px;
+}
+.wf-empty-mark { font-size: 40px; color: var(--line-bright); }
+.wf-empty-onboarding {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 40px 24px;
+  text-align: center;
+}
+.wf-empty-onboarding .wf-empty-text {
+  font-size: 14px;
+  letter-spacing: 0.02em;
+  color: var(--fg);
+  font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+  font-weight: 500;
+}
+.wf-empty-sub {
+  margin: 0;
+  max-width: 460px;
+  font-size: 11px;
+  color: var(--fg-3);
+  line-height: 1.55;
+}
+.wf-empty-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 6px;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+.wf-empty-btn {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  padding: 8px 14px;
+  cursor: pointer;
+  transition: background 100ms, border-color 100ms, color 100ms;
+}
+.wf-empty-btn:hover { border-color: var(--accent); color: var(--accent); }
+.wf-empty-btn.primary { border-color: var(--accent); color: var(--accent); }
+.wf-empty-btn.primary:hover { background: var(--accent); color: var(--bg-0); }
+
+.wf-edit-head {
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-1);
+  display: flex;
+  align-items: baseline;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+.wf-edit-head input.wf-name {
+  background: transparent;
+  border: 0;
+  border-bottom: 1px dashed var(--line);
+  color: var(--fg);
+  font: inherit;
+  font-size: 13px;
+  padding: 4px 0;
+  outline: none;
+  letter-spacing: 0.02em;
+  min-width: 280px;
+  flex: 1;
+}
+.wf-edit-head input.wf-name:focus { border-bottom-color: var(--accent); }
+.wf-edit-head .status-pill {
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  padding: 3px 8px;
+  border: 1px solid var(--line);
+  color: var(--fg-3);
+}
+.wf-edit-head .status-pill.on { color: var(--accent-2); border-color: var(--accent-2); }
+.wf-edit-head .status-pill.off { color: var(--fg-mute); }
+
+.wf-edit-controls {
+  padding: 8px 14px;
+  background: var(--bg-1);
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+}
+.wf-control-group {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.wf-control-group::before {
+  content: attr(data-label);
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  color: var(--fg-mute);
+  align-self: center;
+  text-transform: uppercase;
+}
+.wf-edit-controls button {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  padding: 5px 10px;
+  cursor: pointer;
+  transition: background 100ms, color 100ms, border-color 100ms;
+}
+.wf-edit-controls button:hover { color: var(--fg); border-color: var(--line-bright); }
+.wf-edit-controls .btn-save { color: var(--accent); border-color: var(--accent); }
+.wf-edit-controls .btn-save:hover { background: var(--accent); color: var(--bg-0); }
+.wf-edit-controls .btn-duplicate { color: var(--fg-2); }
+.wf-edit-controls .btn-validate { color: var(--accent-3); border-color: var(--accent-3); }
+.wf-edit-controls .btn-validate:hover { background: var(--accent-3); color: var(--bg-0); }
+.wf-edit-controls .btn-test { color: var(--accent-warn); border-color: var(--accent-warn); }
+.wf-edit-controls .btn-test:hover { background: var(--accent-warn); color: var(--bg-0); }
+.wf-edit-controls .btn-run { color: var(--accent-2); border-color: var(--accent-2); }
+.wf-edit-controls .btn-run:hover { background: var(--accent-2); color: var(--bg-0); }
+.wf-edit-controls .btn-toggle { color: var(--fg-2); }
+.wf-edit-controls .btn-delete { color: var(--accent-fail); border-color: var(--accent-fail); }
+.wf-edit-controls .btn-delete:hover { background: var(--accent-fail); color: var(--bg-0); }
+
+/* Inputs editor */
+.wf-inputs {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 4px 0;
+}
+.wf-input-row {
+  display: grid;
+  grid-template-columns: 200px 1fr auto;
+  gap: 6px;
+  align-items: center;
+}
+.wf-input-row input {
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  color: var(--fg);
+  font: inherit;
+  font-size: 11px;
+  padding: 6px 8px;
+  outline: none;
+}
+.wf-input-row input:focus { border-color: var(--accent); }
+.wf-input-key { font-family: var(--mono); color: var(--accent); }
+.wf-input-remove {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-3);
+  font: inherit;
+  cursor: pointer;
+  padding: 6px 10px;
+}
+.wf-input-remove:hover { color: var(--accent-fail); border-color: var(--accent-fail); }
+.wf-input-empty {
+  color: var(--fg-mute);
+  font-style: italic;
+  font-size: 11px;
+  padding: 4px 0;
+  grid-template-columns: 1fr !important;
+}
+.wf-add-input {
+  align-self: flex-start;
+  background: transparent;
+  border: 1px dashed var(--line);
+  color: var(--fg-3);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  padding: 6px 12px;
+  margin-top: 6px;
+  cursor: pointer;
+}
+.wf-add-input:hover { color: var(--accent); border-color: var(--accent); }
+
+/* Recent runs in the editor */
+.wf-runs { display: flex; flex-direction: column; gap: 6px; }
+.wf-runs-head {
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  color: var(--fg-3);
+  text-transform: uppercase;
+  margin-top: 8px;
+}
+.wf-runs-empty {
+  color: var(--fg-mute);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  padding: 6px 0;
+}
+.wf-runs-list { margin: 0; padding: 0; list-style: none; }
+.wf-run {
+  display: grid;
+  grid-template-columns: 90px 1fr auto auto;
+  gap: 10px;
+  padding: 6px 0;
+  border-bottom: 1px dotted var(--line);
+  font-size: 11px;
+  align-items: center;
+}
+.wf-run:last-child { border-bottom: 0; }
+.wf-run-status {
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  padding: 2px 6px;
+  border: 1px solid var(--line);
+  text-align: center;
+}
+.wf-run-status.status-queued    { color: var(--accent-warn); border-color: var(--accent-warn); }
+.wf-run-status.status-running   { color: var(--accent-3); border-color: var(--accent-3); }
+.wf-run-status.status-completed { color: var(--accent-2); border-color: var(--accent-2); }
+.wf-run-status.status-success   { color: var(--accent-2); border-color: var(--accent-2); }
+.wf-run-status.status-error,
+.wf-run-status.status-failed    { color: var(--accent-fail); border-color: var(--accent-fail); }
+.wf-run-status.status-dry_run   { color: var(--fg-mute); border-color: var(--fg-mute); }
+.wf-run-id { font-family: var(--mono); color: var(--fg-3); font-size: 10px; }
+.wf-run-time { font-family: var(--mono); color: var(--fg-3); font-size: 10px; }
+.wf-run-inputs { font-family: var(--mono); color: var(--fg-mute); font-size: 10px; }
+
+/* Run inputs modal */
+.wf-run-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.wf-run-modal {
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  width: min(520px, 96vw);
+  max-height: 80vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+.wf-run-modal-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--line);
+  font-size: 11px;
+  letter-spacing: 0.18em;
+  color: var(--accent);
+  text-transform: uppercase;
+}
+.wf-run-modal-close {
+  background: transparent;
+  border: 0;
+  color: var(--fg-3);
+  font: inherit;
+  font-size: 14px;
+  cursor: pointer;
+}
+.wf-run-modal-close:hover { color: var(--accent-fail); }
+.wf-run-modal-sub {
+  margin: 0;
+  padding: 8px 16px;
+  font-size: 11px;
+  color: var(--fg-3);
+}
+.wf-run-modal-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 16px 14px;
+}
+.wf-run-modal-row {
+  display: grid;
+  grid-template-columns: 160px 1fr;
+  gap: 10px;
+  align-items: center;
+}
+.wf-run-modal-row span {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--accent);
+}
+.wf-run-modal-row input {
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  color: var(--fg);
+  font: inherit;
+  font-size: 12px;
+  padding: 8px 10px;
+  outline: none;
+}
+.wf-run-modal-row input:focus { border-color: var(--accent); }
+.wf-run-modal-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 8px;
+}
+.wf-run-modal-actions button {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  padding: 8px 14px;
+  cursor: pointer;
+}
+.wf-run-modal-actions .cancel:hover { border-color: var(--accent-fail); color: var(--accent-fail); }
+.wf-run-modal-actions .primary { border-color: var(--accent); color: var(--accent); }
+.wf-run-modal-actions .primary:hover { background: var(--accent); color: var(--bg-0); }
+.wf-run-modal kbd {
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  padding: 1px 4px;
+  font-size: 10px;
+  font-family: var(--mono);
+}
+
+.wf-edit-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 14px;
+  font-size: 11px;
+}
+.wf-field {
+  margin-bottom: 14px;
+}
+.wf-field label {
+  display: block;
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  color: var(--fg-3);
+  margin-bottom: 5px;
+}
+.wf-field input,
+.wf-field textarea,
+.wf-field select {
+  width: 100%;
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  color: var(--fg);
+  font: inherit;
+  padding: 7px 9px;
+  outline: none;
+  transition: border-color 120ms;
+}
+.wf-field input:focus,
+.wf-field textarea:focus { border-color: var(--accent); }
+.wf-field textarea { resize: vertical; min-height: 60px; }
+.wf-field .hint {
+  display: block;
+  margin-top: 4px;
+  font-size: 10px;
+  color: var(--fg-mute);
+  letter-spacing: 0.06em;
+}
+
+.wf-steps { display: flex; flex-direction: column; gap: 8px; }
+.wf-step {
+  border: 1px solid var(--line);
+  background: var(--bg-1);
+}
+.wf-step-head {
+  padding: 6px 10px;
+  background: var(--bg-2);
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  color: var(--fg-3);
+}
+.wf-step-head .step-num { color: var(--accent); }
+.wf-step-head .step-id-input {
+  background: transparent;
+  border: 0;
+  border-bottom: 1px dashed var(--line);
+  color: var(--fg);
+  font: inherit;
+  font-size: 11px;
+  width: 120px;
+  outline: none;
+  letter-spacing: 0.06em;
+}
+.wf-step-head .step-id-input:focus { border-bottom-color: var(--accent); }
+.wf-step-head .step-actions { margin-left: auto; display: flex; gap: 4px; }
+.wf-step-head .step-actions button {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-3);
+  font: inherit;
+  font-size: 10px;
+  padding: 2px 6px;
+  cursor: pointer;
+}
+.wf-step-head .step-actions button:hover { color: var(--fg); border-color: var(--line-bright); }
+.wf-step-head .step-actions .step-remove { color: var(--accent-fail); border-color: var(--accent-fail); }
+
+.wf-step-body { padding: 10px; }
+.wf-step-body .step-prompt {
+  width: 100%;
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  color: var(--fg);
+  font: inherit;
+  padding: 8px 10px;
+  outline: none;
+  resize: vertical;
+  min-height: 60px;
+  transition: border-color 120ms;
+}
+.wf-step-body .step-prompt:focus { border-color: var(--accent); }
+.wf-step-body .step-deps {
+  margin-top: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  font-size: 10px;
+  letter-spacing: 0.12em;
+}
+.wf-step-body .step-deps-label { color: var(--fg-3); margin-right: 6px; }
+.wf-step-body .step-deps .dep-pill {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-3);
+  padding: 2px 6px;
+  cursor: pointer;
+}
+.wf-step-body .step-deps .dep-pill.on {
+  background: var(--accent-3);
+  border-color: var(--accent-3);
+  color: var(--bg-0);
+}
+
+.wf-add-step {
+  margin-top: 8px;
+  background: transparent;
+  border: 1px dashed var(--line);
+  color: var(--fg-3);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  padding: 8px;
+  width: 100%;
+  cursor: pointer;
+  transition: color 100ms, border-color 100ms;
+}
+.wf-add-step:hover { color: var(--accent); border-color: var(--accent); }
+
+.wf-validation {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  background: var(--bg-1);
+  font-size: 11px;
+}
+.wf-validation.ok { border-color: var(--accent-2); }
+.wf-validation.err { border-color: var(--accent-fail); }
+.wf-validation-head {
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  color: var(--fg-3);
+  margin-bottom: 6px;
+}
+.wf-validation.ok .wf-validation-head { color: var(--accent-2); }
+.wf-validation.err .wf-validation-head { color: var(--accent-fail); }
+.wf-validation ul { margin: 0; padding-left: 18px; color: var(--fg-2); }
+.wf-validation .warn { color: var(--accent-warn); }
+.wf-validation .err  { color: var(--accent-fail); }
+
+/* Architect chat */
+.wf-chat-pane { font-size: 12px; }
+.wf-chat-log {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.wf-chat-intro {
+  color: var(--fg-3);
+  font-size: 11px;
+  line-height: 1.55;
+  padding: 6px;
+  border: 1px dashed var(--line);
+}
+.wf-chat-intro em { color: var(--fg-2); font-style: italic; }
+
+.wf-msg {
+  border: 1px solid var(--line);
+  background: var(--bg-1);
+}
+.wf-msg-head {
+  padding: 4px 9px;
+  background: var(--bg-2);
+  border-bottom: 1px solid var(--line);
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  color: var(--fg-3);
+}
+.wf-msg-body {
+  padding: 9px 10px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 11px;
+  color: var(--fg);
+  line-height: 1.5;
+}
+.wf-msg.user .wf-msg-head { color: var(--accent-3); }
+.wf-msg.assistant .wf-msg-head { color: var(--accent); }
+.wf-msg.error .wf-msg-head { color: var(--accent-fail); }
+.wf-msg.thinking .wf-msg-body {
+  color: var(--fg-mute);
+  font-style: italic;
+}
+
+.wf-chat-form {
+  border-top: 1px solid var(--line);
+  background: var(--bg-1);
+  padding: 8px;
+  display: flex;
+  gap: 6px;
+  align-items: flex-end;
+}
+.wf-chat-input {
+  flex: 1;
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  color: var(--fg);
+  font: inherit;
+  font-size: 11px;
+  padding: 6px 8px;
+  resize: none;
+  outline: none;
+  transition: border-color 120ms;
+}
+.wf-chat-input:focus { border-color: var(--accent); }
+.wf-chat-send {
+  background: var(--accent);
+  border: 0;
+  color: var(--bg-0);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  padding: 7px 12px;
+  cursor: pointer;
+  align-self: stretch;
+  font-weight: 600;
+}
+.wf-chat-send:disabled {
+  background: var(--bg-3);
+  color: var(--fg-mute);
+  cursor: wait;
+}
+
+/* ── Tools panel ─────────────────────────────────────────────── */
+.tools-layout {
+  display: grid;
+  grid-template-columns: 240px 1fr;
+  gap: 14px;
+  height: 100%;
+  overflow: hidden;
+}
+.tools-side {
+  border: 1px solid var(--line);
+  background: var(--bg-2);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.tools-filter {
+  padding: 10px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-1);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.tools-search {
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  color: var(--fg);
+  font: inherit;
+  font-size: 11px;
+  padding: 6px 8px;
+  outline: none;
+}
+.tools-search:focus { border-color: var(--accent); }
+.tools-count {
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  color: var(--fg-3);
+}
+.tools-count em { font-style: normal; color: var(--fg); }
+.tools-categories {
+  padding: 8px;
+  overflow-y: auto;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.cat-pill {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  padding: 6px 8px;
+  text-align: left;
+  cursor: pointer;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  transition: background 100ms, color 100ms, border-color 100ms;
+}
+.cat-pill:hover { color: var(--fg); border-color: var(--line-bright); }
+.cat-pill.active {
+  background: var(--accent);
+  color: var(--bg-0);
+  border-color: var(--accent);
+}
+.cat-pill .cat-count {
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  opacity: 0.7;
+}
+
+.tools-main {
+  border: 1px solid var(--line);
+  background: var(--bg-2);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.tools-section {
+  display: flex;
+  flex-direction: column;
+  border-bottom: 1px solid var(--line);
+  min-height: 0;
+}
+.tools-section:last-child { border-bottom: 0; }
+.tools-section-head {
+  padding: 8px 14px;
+  background: var(--bg-1);
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  color: var(--fg-3);
+}
+.tools-section-head em { font-style: normal; color: var(--fg); }
+
+.tools-grid,
+.mcp-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 8px;
+  padding: 12px;
+  overflow-y: auto;
+  flex: 1;
+  font-size: 11px;
+}
+.tools-empty { color: var(--fg-mute); padding: 14px; letter-spacing: 0.12em; line-height: 1.5; }
+.tools-empty .tools-jump {
+  color: var(--accent);
+  text-decoration: none;
+  border-bottom: 1px dashed var(--accent);
+  cursor: pointer;
+}
+.tools-empty .tools-jump:hover {
+  background: var(--accent);
+  color: var(--bg-0);
+  border-bottom-color: transparent;
+}
+
+.tool-card {
+  border: 1px solid var(--line);
+  background: var(--bg-1);
+  padding: 8px 10px;
+  transition: border-color 100ms, background 100ms;
+}
+.tool-card:hover { border-color: var(--line-bright); background: var(--bg-3); }
+.tool-card .tool-name {
+  color: var(--fg);
+  font-size: 11px;
+  word-break: break-word;
+}
+.tool-card .tool-meta {
+  margin-top: 4px;
+  display: flex;
+  gap: 6px;
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  color: var(--fg-3);
+}
+.tool-card .tool-cat { color: var(--accent); }
+.tool-card .tool-src { color: var(--accent-3); }
+.tool-card .tool-src.mcp { color: var(--accent-warn); }
+.tool-card .tool-approval { color: var(--accent-fail); }
+.tool-card .tool-desc {
+  margin-top: 6px;
+  color: var(--fg-2);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.mcp-card {
+  border: 1px solid var(--line);
+  background: var(--bg-1);
+  padding: 10px 12px;
+}
+.mcp-card .mcp-name {
+  color: var(--fg);
+  font-size: 12px;
+}
+.mcp-card .mcp-meta {
+  margin-top: 4px;
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  color: var(--fg-3);
+}
+.mcp-card .mcp-meta em { color: var(--accent-2); font-style: normal; }
+.mcp-card .mcp-meta .off { color: var(--fg-mute); }
+.mcp-card .mcp-desc {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--fg-2);
+}
+.mcp-card .mcp-cmd {
+  margin-top: 4px;
+  font-size: 10px;
+  color: var(--fg-mute);
+  word-break: break-all;
+}
+
+/* ── Projects panel ──────────────────────────────────────────── */
+.projects-layout {
+  display: grid;
+  grid-template-columns: 320px 1fr;
+  gap: 14px;
+  height: 100%;
+  overflow: hidden;
+}
+.proj-side {
+  border: 1px solid var(--line);
+  background: var(--bg-2);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.proj-side-head {
+  padding: 8px 12px;
+  background: var(--bg-1);
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  color: var(--fg-3);
+}
+.proj-side-head em { font-style: normal; color: var(--fg); }
+.proj-ws-list,
+.proj-list {
+  list-style: none;
+  margin: 0; padding: 0;
+  overflow-y: auto;
+  font-size: 11px;
+  max-height: 240px;
+}
+.proj-list { flex: 1; max-height: none; }
+.proj-ws-list li,
+.proj-list li {
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--line);
+}
+.proj-ws-list li { color: var(--fg-2); font-size: 10px; word-break: break-all; letter-spacing: 0.04em; }
+.proj-list li.proj {
+  cursor: pointer;
+  transition: background 100ms;
+}
+.proj-list li.proj:hover { background: var(--bg-3); }
+.proj-list li.proj.selected { background: var(--bg-3); box-shadow: inset 2px 0 0 var(--accent); }
+.proj-list li.proj .pname {
+  color: var(--fg);
+  display: block;
+}
+.proj-list li.proj .ppath {
+  display: block;
+  margin-top: 2px;
+  color: var(--fg-mute);
+  font-size: 9px;
+  word-break: break-all;
+}
+.proj-list .empty,
+.proj-ws-list .empty {
+  padding: 14px; color: var(--fg-mute); letter-spacing: 0.12em; text-align: center;
+}
+
+.proj-detail {
+  border: 1px solid var(--line);
+  background: var(--bg-2);
+  overflow-y: auto;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  font-size: 11px;
+}
+.proj-block {
+  border: 1px solid var(--line);
+  background: var(--bg-1);
+}
+.proj-block-head {
+  padding: 6px 12px;
+  background: var(--bg-2);
+  border-bottom: 1px solid var(--line);
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  color: var(--fg-3);
+  display: flex;
+  justify-content: space-between;
+}
+.proj-block-head em { font-style: normal; color: var(--accent); }
+.proj-block-body {
+  padding: 10px 12px;
+}
+.proj-block-body pre {
+  margin: 0;
+  font: 11px/1.5 var(--mono);
+  color: var(--fg);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 320px;
+  overflow-y: auto;
+}
+.proj-pkg-grid {
+  display: grid;
+  grid-template-columns: 100px 1fr;
+  gap: 4px 12px;
+  font-size: 11px;
+}
+.proj-pkg-grid dt {
+  color: var(--fg-3);
+  letter-spacing: 0.1em;
+  font-size: 10px;
+  text-transform: uppercase;
+}
+.proj-pkg-grid dd { margin: 0; color: var(--fg); }
+.proj-entries {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 4px;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+}
+.proj-entries .entry {
+  padding: 3px 6px;
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+}
+.proj-entries .entry.dir { color: var(--accent-3); }
+
+/* ── Integrations hub ────────────────────────────────────────── */
+.integrations-layout {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 18px 20px 28px;
+  overflow-y: auto;
+}
+.hub-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 24px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--line);
+}
+.hub-header h3 {
+  margin: 0 0 4px;
+  font-size: 14px;
+  letter-spacing: 0.02em;
+  color: var(--fg);
+}
+.hub-header p {
+  margin: 0;
+  font-size: 11px;
+  color: var(--fg-3);
+  line-height: 1.55;
+  max-width: 640px;
+}
+.hub-stats {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.hub-stats .stat-card {
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  padding: 6px 10px;
+  min-width: 64px;
+  text-align: center;
+}
+.hub-stats .stat-card span {
+  display: block;
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  color: var(--fg-3);
+}
+.hub-stats .stat-card em {
+  display: block;
+  margin-top: 2px;
+  font-style: normal;
+  font-size: 16px;
+  color: var(--accent);
+}
+
+.hub-block {
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  padding: 16px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.hub-block-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 8px;
+}
+.hub-block-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.hub-block-meta {
+  font-size: 10px;
+  color: var(--fg-3);
+  letter-spacing: 0.12em;
+}
+.hub-block-intro {
+  margin: 0;
+  font-size: 11px;
+  color: var(--fg-2);
+  line-height: 1.55;
+}
+
+/* ─ Keys list ─ */
+.hub-keys-list {
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--line);
+}
+.hub-key-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 10px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--line);
+  align-items: center;
+}
+.hub-key-row:last-child { border-bottom: 0; }
+.hub-key-name {
+  font-size: 12px;
+  color: var(--fg);
+}
+.hub-key-meta {
+  margin-top: 4px;
+  font-size: 10px;
+  color: var(--fg-3);
+  letter-spacing: 0.08em;
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.hub-key-meta .pill {
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  padding: 1px 6px;
+  border: 1px solid var(--line);
+}
+.hub-key-meta .pill.connected { color: var(--accent-2); border-color: var(--accent-2); }
+.hub-key-meta .pill.runtime_ready { color: var(--accent); border-color: var(--accent); }
+.hub-key-meta .pill.optional { color: var(--fg-3); border-color: var(--line); }
+.hub-key-meta .pill.missing   { color: var(--accent-fail); border-color: var(--accent-fail); }
+.hub-key-meta .pill.env_only  { color: var(--accent-warn); border-color: var(--accent-warn); }
+.hub-key-meta .pill.unreadable, .hub-key-meta .pill.needs_repair { color: var(--accent-fail); border-color: var(--accent-fail); }
+.hub-key-desc {
+  margin-top: 4px;
+  font-size: 10px;
+  color: var(--fg-mute);
+}
+.hub-key-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.hub-key-ok,
+.cred-action-note {
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  padding: 3px 7px;
+  text-align: center;
+}
+.hub-key-actions button {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  padding: 5px 10px;
+  cursor: pointer;
+}
+.hub-key-actions button:hover { border-color: var(--accent); color: var(--accent); }
+
+/* ─ Apps list (Composio) ─ */
+.hub-apps-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  padding: 6px 0;
+}
+.hub-apps-controls input {
+  flex: 1;
+  min-width: 200px;
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  color: var(--fg);
+  font: inherit;
+  font-size: 11px;
+  padding: 6px 8px;
+  outline: none;
+}
+.hub-apps-controls input:focus { border-color: var(--accent); }
+.hub-apps-controls button {
+  background: transparent;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  padding: 6px 12px;
+  cursor: pointer;
+}
+.hub-apps-controls button:hover { background: var(--accent); color: var(--bg-0); }
+.hub-apps-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 10px;
+  margin-top: 4px;
+}
+.hub-app-card {
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.hub-app-name {
+  font-size: 12px;
+  color: var(--fg);
+  letter-spacing: 0.02em;
+}
+.hub-app-meta {
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  color: var(--fg-3);
+  text-transform: uppercase;
+}
+.hub-install-log {
+  margin: 10px 0 0;
+  max-height: 260px;
+  overflow: auto;
+  white-space: pre-wrap;
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  padding: 10px;
+  font: 10px/1.5 var(--mono);
+  letter-spacing: 0.02em;
+  text-transform: none;
+}
+.hub-app-pill {
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  padding: 1px 6px;
+  border: 1px solid var(--line);
+  align-self: flex-start;
+}
+.hub-app-pill.active { color: var(--accent-2); border-color: var(--accent-2); }
+.hub-app-pill.pending { color: var(--accent-warn); border-color: var(--accent-warn); }
+.hub-app-pill.available { color: var(--fg-3); border-color: var(--line); }
+.hub-app-pill.failed, .hub-app-pill.disconnected { color: var(--accent-fail); border-color: var(--accent-fail); }
+.hub-app-card-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 2px;
+}
+.hub-app-card-actions button {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 9.5px;
+  letter-spacing: 0.14em;
+  padding: 5px 9px;
+  cursor: pointer;
+}
+.hub-app-card-actions .connect { color: var(--accent); border-color: var(--accent); }
+.hub-app-card-actions .connect:hover { background: var(--accent); color: var(--bg-0); }
+.hub-app-card-actions .disconnect { color: var(--accent-fail); border-color: var(--accent-fail); }
+.hub-app-card-actions .disconnect:hover { background: var(--accent-fail); color: var(--bg-0); }
+
+/* ─ MCP servers list ─ */
+.hub-mcp-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.hub-mcp-row {
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  padding: 10px 12px;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 10px;
+  align-items: center;
+}
+.hub-mcp-name {
+  font-size: 12px;
+  color: var(--fg);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.hub-mcp-name .pill {
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  padding: 1px 6px;
+  border: 1px solid var(--line);
+}
+.hub-mcp-name .pill.source-auto-detected { color: var(--accent-3); border-color: var(--accent-3); }
+.hub-mcp-name .pill.source-user { color: var(--accent); border-color: var(--accent); }
+.hub-mcp-name .pill.transport-stdio { color: var(--fg-3); }
+.hub-mcp-name .pill.transport-http,
+.hub-mcp-name .pill.transport-sse { color: var(--accent-2); border-color: var(--accent-2); }
+.hub-mcp-meta {
+  margin-top: 4px;
+  font-size: 10px;
+  color: var(--fg-3);
+  font-family: var(--mono);
+  word-break: break-all;
+}
+.hub-mcp-desc {
+  margin-top: 4px;
+  font-size: 10px;
+  color: var(--fg-mute);
+  font-style: italic;
+}
+.hub-mcp-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 110px;
+}
+.hub-mcp-actions button {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  padding: 5px 10px;
+  cursor: pointer;
+}
+.hub-mcp-actions .toggle.on { color: var(--accent-2); border-color: var(--accent-2); }
+.hub-mcp-actions .toggle.off { color: var(--fg-mute); }
+.hub-mcp-actions .del { color: var(--accent-fail); border-color: var(--accent-fail); }
+.hub-mcp-actions .del:hover { background: var(--accent-fail); color: var(--bg-0); }
+.hub-btn-add {
+  background: transparent;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  padding: 6px 12px;
+  cursor: pointer;
+  align-self: flex-start;
+}
+.hub-btn-add:hover { background: var(--accent); color: var(--bg-0); }
+
+.hub-mcp-editor {
+  grid-column: 1 / -1;
+  margin-top: 8px;
+  padding: 12px;
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  display: grid;
+  gap: 8px;
+}
+.hub-mcp-editor label {
+  display: block;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  color: var(--fg-3);
+  margin-bottom: 4px;
+}
+.hub-mcp-editor input,
+.hub-mcp-editor select,
+.hub-mcp-editor textarea {
+  width: 100%;
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  color: var(--fg);
+  font: inherit;
+  font-size: 11px;
+  padding: 6px 8px;
+  outline: none;
+}
+.hub-mcp-editor input:focus,
+.hub-mcp-editor select:focus,
+.hub-mcp-editor textarea:focus { border-color: var(--accent); }
+.hub-mcp-editor textarea { resize: vertical; min-height: 56px; font-family: var(--mono); }
+.hub-mcp-editor .row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+.hub-mcp-editor .buttons {
+  display: flex;
+  gap: 6px;
+  margin-top: 4px;
+}
+.hub-mcp-editor .buttons button {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  padding: 6px 12px;
+  cursor: pointer;
+}
+.hub-mcp-editor .buttons .save { color: var(--accent-2); border-color: var(--accent-2); }
+.hub-mcp-editor .buttons .save:hover { background: var(--accent-2); color: var(--bg-0); }
+
+/* ── Skills panel ────────────────────────────────────────────── */
+.skills-layout {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  gap: 14px;
+  overflow: hidden;
+}
+.skills-header {
+  display: grid;
+  grid-template-columns: 1fr 260px;
+  gap: 14px;
+}
+.skills-intro {
+  border: 1px solid var(--line);
+  background: var(--bg-2);
+  padding: 14px 16px;
+  font-size: 12px;
+  color: var(--fg-2);
+  line-height: 1.5;
+}
+.skills-intro h3 {
+  margin: 0 0 6px;
+  color: var(--fg);
+  font-size: 11px;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+}
+.skills-intro p { margin: 0; }
+.skills-intro code {
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  padding: 1px 6px;
+  color: var(--accent);
+  font-size: 11px;
+}
+.skills-stats {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0;
+  border: 1px solid var(--line);
+  background: var(--bg-2);
+}
+.stat-card {
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  color: var(--fg-3);
+}
+.stat-card:first-child { border-right: 1px solid var(--line); }
+.stat-card em {
+  font-style: normal;
+  font-size: 28px;
+  color: var(--accent);
+  letter-spacing: 0;
+}
+
+.skills-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 10px;
+  overflow-y: auto;
+  flex: 1;
+}
+.skill-card {
+  border: 1px solid var(--line);
+  background: var(--bg-2);
+  display: flex;
+  flex-direction: column;
+}
+.skill-card .skill-head {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-1);
+}
+.skill-card .skill-name {
+  color: var(--fg);
+  font-size: 12px;
+  letter-spacing: 0.02em;
+}
+.skill-card .skill-version {
+  color: var(--accent);
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  margin-left: 6px;
+}
+.skill-card .skill-desc {
+  padding: 10px 12px;
+  color: var(--fg-2);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.skill-card .skill-tools-head {
+  padding: 6px 12px;
+  background: var(--bg-1);
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  color: var(--fg-3);
+  display: flex;
+  justify-content: space-between;
+}
+.skill-card .skill-tools-head em { font-style: normal; color: var(--fg); }
+.skill-card .skill-tools {
+  padding: 8px 12px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.skill-card .skill-tool-pill {
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  padding: 2px 6px;
+  color: var(--fg-2);
+}
+
+/* ── Settings panel ──────────────────────────────────────────── */
+.settings-layout {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  height: 100%;
+  overflow: hidden;
+}
+.settings-col {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  overflow-y: auto;
+}
+.settings-block {
+  border: 1px solid var(--line);
+  background: var(--bg-2);
+}
+.settings-block-head {
+  padding: 8px 14px;
+  background: var(--bg-1);
+  border-bottom: 1px solid var(--line);
+  font-size: 10px;
+  letter-spacing: 0.2em;
+  color: var(--fg-3);
+}
+.settings-form { padding: 14px 16px; }
+.settings-field { margin-bottom: 12px; }
+.settings-field:last-child { margin-bottom: 0; }
+.settings-field label {
+  display: block;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  color: var(--fg-3);
+  margin-bottom: 5px;
+}
+.settings-field input[type="text"],
+.settings-field input[type="number"],
+.settings-field select,
+.settings-field textarea {
+  width: 100%;
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  color: var(--fg);
+  font: inherit;
+  font-size: 11px;
+  padding: 6px 8px;
+  outline: none;
+  transition: border-color 120ms;
+}
+.settings-field input[type="text"]:focus,
+.settings-field input[type="number"]:focus,
+.settings-field select:focus,
+.settings-field textarea:focus { border-color: var(--accent); }
+.settings-field textarea { resize: vertical; }
+.settings-grid-2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.settings-grid-2 .settings-field { margin-bottom: 0; }
+.settings-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.check-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--fg-2);
+  padding: 5px 10px;
+  border: 1px solid var(--line);
+  cursor: pointer;
+  user-select: none;
+  background: var(--bg-1);
+  transition: border-color 100ms;
+}
+.check-pill:hover { border-color: var(--line-bright); }
+.check-pill input { accent-color: var(--accent); }
+.settings-gates .check-pill { font-size: 10px; letter-spacing: 0.1em; }
+
+.settings-save {
+  background: var(--accent);
+  border: 0;
+  color: var(--bg-0);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  padding: 8px 16px;
+  cursor: pointer;
+  font-weight: 600;
+  margin-top: 4px;
+  transition: background 100ms;
+}
+.settings-save:hover { background: var(--accent-2); color: var(--bg-0); }
+.settings-save:disabled { background: var(--bg-3); color: var(--fg-mute); cursor: wait; }
+
+.settings-info {
+  padding: 14px 16px;
+  font-size: 11px;
+  color: var(--fg-2);
+  line-height: 1.6;
+}
+.settings-info .row {
+  display: flex;
+  justify-content: space-between;
+  border-bottom: 1px dashed var(--line);
+  padding: 4px 0;
+}
+.settings-info .row:last-child { border-bottom: 0; }
+.settings-info .row .k {
+  color: var(--fg-3);
+  font-size: 10px;
+  letter-spacing: 0.14em;
+}
+.settings-info .row .v { color: var(--fg); }
+.settings-info .row .v.on { color: var(--accent-2); }
+.settings-info .row .v.off { color: var(--fg-mute); }
+.settings-note {
+  margin: 10px 0 0;
+  color: var(--fg-mute);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+/* ── Proactive Check-ins (Settings sub-block) ─────────────────── */
+.checkins-intro {
+  padding: 10px 16px;
+  font-size: 11px;
+  color: var(--fg-2);
+  line-height: 1.55;
+  border-bottom: 1px solid var(--line);
+}
+.checkins-list {
+  display: flex;
+  flex-direction: column;
+}
+.checkin-row {
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--line);
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 10px;
+  align-items: center;
+}
+.checkin-row:last-child { border-bottom: 0; }
+.checkin-row .checkin-main { min-width: 0; }
+.checkin-row .checkin-name {
+  font-size: 12px;
+  color: var(--fg);
+  letter-spacing: 0.02em;
+}
+.checkin-row .checkin-meta {
+  margin-top: 4px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  color: var(--fg-3);
+}
+.checkin-row .checkin-meta .pill {
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  padding: 1px 6px;
+  border: 1px solid var(--line);
+}
+.checkin-row .checkin-meta .pill.trigger-schedule { color: var(--accent-3); border-color: var(--accent-3); }
+.checkin-row .checkin-meta .pill.trigger-execution_blocked { color: var(--accent-fail); border-color: var(--accent-fail); }
+.checkin-row .checkin-meta .pill.trigger-goal_stale { color: var(--accent-warn); border-color: var(--accent-warn); }
+.checkin-row .checkin-meta .pill.trigger-inbox_backed_up { color: var(--accent); border-color: var(--accent); }
+.checkin-row .checkin-desc {
+  margin-top: 6px;
+  font-size: 10px;
+  color: var(--fg-mute);
+  line-height: 1.5;
+  font-style: italic;
+}
+
+.checkin-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  align-items: stretch;
+  min-width: 130px;
+}
+.checkin-actions button {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  padding: 5px 10px;
+  cursor: pointer;
+  transition: background 100ms, color 100ms, border-color 100ms;
+}
+.checkin-actions button:hover { color: var(--fg); border-color: var(--line-bright); }
+.checkin-actions .toggle.on { color: var(--accent-2); border-color: var(--accent-2); }
+.checkin-actions .toggle.off { color: var(--fg-mute); }
+.checkin-actions .test { color: var(--accent-3); border-color: var(--accent-3); }
+.checkin-actions .test:hover { background: var(--accent-3); color: var(--bg-0); }
+.checkin-actions .edit { color: var(--accent); border-color: var(--accent); }
+.checkin-actions .edit:hover { background: var(--accent); color: var(--bg-0); }
+.checkin-actions .del { color: var(--accent-fail); border-color: var(--accent-fail); }
+.checkin-actions .del:hover { background: var(--accent-fail); color: var(--bg-0); }
+
+.checkin-editor {
+  grid-column: 1 / -1;
+  margin-top: 10px;
+  padding: 12px;
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  display: grid;
+  gap: 8px;
+}
+.checkin-editor label {
+  display: block;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  color: var(--fg-3);
+  margin-bottom: 4px;
+}
+.checkin-editor input,
+.checkin-editor select,
+.checkin-editor textarea {
+  width: 100%;
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  color: var(--fg);
+  font: inherit;
+  font-size: 11px;
+  padding: 6px 8px;
+  outline: none;
+}
+.checkin-editor input:focus, .checkin-editor select:focus, .checkin-editor textarea:focus { border-color: var(--accent); }
+.checkin-editor textarea { resize: vertical; min-height: 56px; }
+.checkin-editor .row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+.checkin-editor .editor-buttons {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+}
+.checkin-editor .editor-buttons button {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  padding: 6px 10px;
+  cursor: pointer;
+}
+.checkin-editor .editor-buttons .save { color: var(--accent-2); border-color: var(--accent-2); }
+.checkin-editor .editor-buttons .save:hover { background: var(--accent-2); color: var(--bg-0); }
+.checkin-editor .editor-buttons .cancel { color: var(--fg-3); }
+
+.checkins-actions {
+  padding: 12px 16px;
+  border-top: 1px solid var(--line);
+  background: var(--bg-1);
+}
+.checkins-btn-new {
+  background: transparent;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  padding: 6px 12px;
+  cursor: pointer;
+  transition: background 100ms, color 100ms;
+}
+.checkins-btn-new:hover { background: var(--accent); color: var(--bg-0); }
+
+/* ── Plan proposals (Settings sub-block) ──────────────────────── */
+.plan-proposals-list {
+  display: flex;
+  flex-direction: column;
+}
+.plan-proposal-row {
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  background:
+    linear-gradient(180deg, rgba(80, 200, 230, var(--card-tint, 0.05)) 0%, transparent 32%),
+    var(--bg-1);
+  border-left: 2px solid var(--accent-3);
+}
+.plan-proposal-row:last-child { border-bottom: 0; }
+.plan-head { display: flex; flex-direction: column; gap: 4px; }
+.plan-objective {
+  font-size: 13px;
+  color: var(--fg);
+  letter-spacing: 0.01em;
+  font-weight: 500;
+}
+.plan-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  color: var(--fg-3);
+}
+.plan-meta .pill {
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  padding: 1px 6px;
+  border: 1px solid var(--line);
+}
+.plan-meta .pill.complexity-trivial { color: var(--fg-mute); border-color: var(--fg-mute); }
+.plan-meta .pill.complexity-moderate { color: var(--accent-2); border-color: var(--accent-2); }
+.plan-meta .pill.complexity-significant { color: var(--accent-warn); border-color: var(--accent-warn); }
+.plan-meta .pill.complexity-large { color: var(--accent-fail); border-color: var(--accent-fail); }
+.plan-meta .pill.plan-tracked { color: var(--accent-3); border-color: var(--accent-3); }
+
+.plan-label {
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  color: var(--accent-3);
+  margin-right: 6px;
+}
+.plan-context, .plan-request {
+  font-size: 11px;
+  color: var(--fg-2);
+  line-height: 1.5;
+}
+.plan-request { color: var(--fg-mute); font-style: italic; }
+
+.plan-section { font-size: 11px; line-height: 1.55; color: var(--fg-2); }
+.plan-section ol, .plan-section ul {
+  margin: 4px 0 0 4px;
+  padding: 0;
+  list-style: none;
+}
+.plan-section li {
+  padding: 4px 0;
+  border-left: 1px dotted var(--line);
+  padding-left: 10px;
+  margin-left: 6px;
+}
+.plan-step-n {
+  font-family: var(--font-mono, monospace);
+  color: var(--accent-3);
+  margin-right: 4px;
+}
+.plan-step-action { color: var(--fg); }
+.plan-step-rationale {
+  margin-top: 2px;
+  font-size: 10px;
+  color: var(--fg-mute);
+  font-style: italic;
+}
+.plan-step-verify {
+  margin-top: 2px;
+  font-size: 10px;
+  color: var(--accent-2);
+  font-family: var(--font-mono, monospace);
+}
+.plan-risks li { color: var(--accent-warn); }
+.plan-questions li { color: var(--accent); }
+
+.plan-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 4px;
+}
+.plan-actions button {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  padding: 6px 12px;
+  cursor: pointer;
+  transition: background 100ms, color 100ms, border-color 100ms;
+}
+.plan-actions .plan-btn-approve { color: var(--accent-2); border-color: var(--accent-2); }
+.plan-actions .plan-btn-approve:hover { background: var(--accent-2); color: var(--bg-0); }
+.plan-actions .plan-btn-reject { color: var(--accent-fail); border-color: var(--accent-fail); }
+.plan-actions .plan-btn-reject:hover { background: var(--accent-fail); color: var(--bg-0); }
+
+/* ── Agent-drafted proposals (Settings sub-block) ─────────────── */
+.proposals-intro {
+  padding: 10px 16px;
+  font-size: 11px;
+  color: var(--fg-2);
+  line-height: 1.55;
+  border-bottom: 1px solid var(--line);
+}
+.proposals-list {
+  display: flex;
+  flex-direction: column;
+}
+.proposal-row {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background:
+    linear-gradient(180deg, rgba(255, 170, 80, var(--card-tint, 0.04)) 0%, transparent 28%),
+    var(--bg-1);
+  border-left: 2px solid var(--accent);
+}
+.proposal-row:last-child { border-bottom: 0; }
+.proposal-head { display: flex; flex-direction: column; gap: 4px; }
+.proposal-name {
+  font-size: 12px;
+  color: var(--fg);
+  letter-spacing: 0.02em;
+}
+.proposal-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  color: var(--fg-3);
+}
+.proposal-meta .pill {
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  padding: 1px 6px;
+  border: 1px solid var(--line);
+}
+.proposal-meta .pill.trigger-schedule { color: var(--accent-3); border-color: var(--accent-3); }
+.proposal-meta .pill.trigger-execution_blocked { color: var(--accent-fail); border-color: var(--accent-fail); }
+.proposal-meta .pill.trigger-goal_stale { color: var(--accent-warn); border-color: var(--accent-warn); }
+.proposal-meta .pill.trigger-inbox_backed_up { color: var(--accent); border-color: var(--accent); }
+
+.proposal-label {
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  color: var(--accent);
+  margin-right: 6px;
+}
+.proposal-rationale,
+.proposal-question,
+.proposal-desc {
+  font-size: 11px;
+  color: var(--fg-2);
+  line-height: 1.5;
+}
+.proposal-question { color: var(--fg); }
+.proposal-desc { color: var(--fg-mute); font-style: italic; }
+
+.proposal-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 2px;
+}
+.proposal-actions button {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  padding: 6px 12px;
+  cursor: pointer;
+  transition: background 100ms, color 100ms, border-color 100ms;
+}
+.proposal-actions .proposal-btn-approve { color: var(--accent-2); border-color: var(--accent-2); }
+.proposal-actions .proposal-btn-approve:hover { background: var(--accent-2); color: var(--bg-0); }
+.proposal-actions .proposal-btn-edit { color: var(--accent); border-color: var(--accent); }
+.proposal-actions .proposal-btn-edit:hover { background: var(--accent); color: var(--bg-0); }
+.proposal-actions .proposal-btn-reject { color: var(--accent-fail); border-color: var(--accent-fail); }
+.proposal-actions .proposal-btn-reject:hover { background: var(--accent-fail); color: var(--bg-0); }
+
+.proposal-editor {
+  margin-top: 4px;
+  padding: 12px;
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  display: grid;
+  gap: 8px;
+}
+.proposal-editor label {
+  display: block;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  color: var(--fg-3);
+  margin-bottom: 4px;
+}
+.proposal-editor input,
+.proposal-editor select,
+.proposal-editor textarea {
+  width: 100%;
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  color: var(--fg);
+  font: inherit;
+  font-size: 11px;
+  padding: 6px 8px;
+  outline: none;
+}
+.proposal-editor input:focus, .proposal-editor select:focus, .proposal-editor textarea:focus { border-color: var(--accent); }
+.proposal-editor textarea { resize: vertical; min-height: 48px; }
+.proposal-editor .row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+/* ── Credentials Health (Settings sub-block) ──────────────────── */
+.creds-meta {
+  margin-left: auto;
+  font-size: 9px;
+  color: var(--fg-mute);
+  letter-spacing: 0.14em;
+}
+.creds-list {
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+.cred-row {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--line);
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
+  align-items: start;
+}
+.cred-row:last-child { border-bottom: 0; }
+.cred-row .cred-main { min-width: 0; }
+.cred-row .cred-name {
+  font-size: 11px;
+  color: var(--fg);
+  letter-spacing: 0.06em;
+}
+.cred-row .cred-meta {
+  margin-top: 3px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  color: var(--fg-3);
+}
+.cred-status {
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  padding: 1px 6px;
+  border: 1px solid var(--line);
+}
+.cred-status.connected { color: var(--accent-2); border-color: var(--accent-2); }
+.cred-status.runtime_ready { color: var(--accent); border-color: var(--accent); }
+.cred-status.optional { color: var(--fg-3); border-color: var(--line); }
+.cred-status.missing { color: var(--fg-mute); }
+.cred-status.env_only { color: var(--accent-warn); border-color: var(--accent-warn); }
+.cred-status.unreadable { color: var(--accent-fail); border-color: var(--accent-fail); }
+.cred-status.needs_repair { color: var(--accent-fail); border-color: var(--accent-fail); }
+
+.cred-source {
+  font-size: 9px;
+  letter-spacing: 0.16em;
+}
+.cred-source.keychain { color: var(--accent-3); }
+.cred-source.file { color: var(--accent); }
+.cred-source.env { color: var(--accent-warn); }
+.cred-source.missing { color: var(--fg-mute); }
+
+.cred-desc {
+  margin-top: 6px;
+  font-size: 10px;
+  color: var(--fg-3);
+  line-height: 1.5;
+}
+.cred-hint {
+  margin-top: 4px;
+  font-size: 10px;
+  color: var(--fg-mute);
+  letter-spacing: 0.02em;
+}
+
+.cred-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  align-items: stretch;
+  min-width: 130px;
+}
+.cred-actions button {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  padding: 5px 8px;
+  cursor: pointer;
+  transition: background 100ms, color 100ms, border-color 100ms;
+}
+.cred-actions button:hover { color: var(--fg); border-color: var(--line-bright); }
+.cred-actions .cred-set { color: var(--accent); border-color: var(--accent); }
+.cred-actions .cred-set:hover { background: var(--accent); color: var(--bg-0); }
+.cred-actions .cred-migrate { color: var(--accent-3); border-color: var(--accent-3); }
+.cred-actions .cred-migrate:hover { background: var(--accent-3); color: var(--bg-0); }
+.cred-actions .cred-delete { color: var(--accent-fail); border-color: var(--accent-fail); }
+.cred-actions .cred-delete:hover { background: var(--accent-fail); color: var(--bg-0); }
+
+.cred-set-input-wrap {
+  margin-top: 8px;
+  display: none;
+  gap: 6px;
+  flex-direction: column;
+}
+.cred-set-input-wrap.open { display: flex; }
+.cred-set-input {
+  width: 100%;
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  color: var(--fg);
+  font: inherit;
+  font-size: 11px;
+  padding: 6px 8px;
+  outline: none;
+  transition: border-color 120ms;
+}
+.cred-set-input:focus { border-color: var(--accent); }
+.cred-set-buttons { display: flex; gap: 4px; }
+.cred-set-buttons button {
+  flex: 1;
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  padding: 4px 8px;
+  cursor: pointer;
+}
+.cred-set-buttons .save { color: var(--accent-2); border-color: var(--accent-2); }
+.cred-set-buttons .save:hover { background: var(--accent-2); color: var(--bg-0); }
+
+.creds-actions {
+  display: flex;
+  gap: 8px;
+  padding: 12px 16px;
+  border-top: 1px solid var(--line);
+  background: var(--bg-1);
+}
+.creds-actions button {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  padding: 6px 12px;
+  cursor: pointer;
+  transition: background 100ms, color 100ms, border-color 100ms;
+}
+.creds-btn-repair { color: var(--accent-3) !important; border-color: var(--accent-3) !important; }
+.creds-btn-repair:hover { background: var(--accent-3); color: var(--bg-0) !important; }
+.creds-btn-reset { color: var(--accent-fail) !important; border-color: var(--accent-fail) !important; margin-left: auto; }
+.creds-btn-reset:hover { background: var(--accent-fail); color: var(--bg-0) !important; }
+
+.creds-footnote {
+  padding: 8px 16px 14px;
+  font-size: 10px;
+  color: var(--fg-mute);
+  line-height: 1.55;
+}
+.creds-footnote code {
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  padding: 1px 5px;
+  color: var(--accent);
+  font-size: 10px;
+}
+
 /* ── Foot bar ───────────────────────────────────────────────── */
 .foot-bar {
   display: flex;
@@ -936,13 +5800,97 @@ const CONSOLE_JS = `
   }
 
   function setOnline(ok) {
+    // The connection chip contains a .pulse element + the label span.
+    // Update ONLY the label so the pulse animation keeps running.
+    const label = document.querySelector('[data-conn-label]');
     if (ok) {
       els.conn.removeAttribute('data-offline');
-      els.conn.textContent = '● ONLINE';
+      if (label) label.textContent = 'ONLINE';
     } else {
       els.conn.setAttribute('data-offline', 'true');
-      els.conn.textContent = '● OFFLINE';
+      if (label) label.textContent = 'OFFLINE';
     }
+  }
+
+  // ─── Theme toggle ─────────────────────────────────────────────
+  const THEME_KEY = 'clemmy.console.theme';
+  const themeIcon = document.querySelector('[data-theme-icon]');
+
+  function applyTheme(theme) {
+    const t = theme === 'day' ? 'day' : 'ops';
+    document.documentElement.setAttribute('data-theme', t);
+    if (themeIcon) themeIcon.textContent = t === 'day' ? '☀' : '◐';
+    try { localStorage.setItem(THEME_KEY, t); } catch (err) { /* private mode */ }
+  }
+
+  function initTheme() {
+    let saved = null;
+    try { saved = localStorage.getItem(THEME_KEY); } catch (err) { /* private mode */ }
+    if (saved === 'day' || saved === 'ops') {
+      applyTheme(saved);
+      return;
+    }
+    // No saved preference — follow the OS color scheme on first load.
+    const prefersLight = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches;
+    applyTheme(prefersLight ? 'day' : 'ops');
+  }
+
+  const themeToggleBtn = document.querySelector('[data-theme-toggle]');
+  if (themeToggleBtn) {
+    themeToggleBtn.addEventListener('click', () => {
+      const current = document.documentElement.getAttribute('data-theme') || 'ops';
+      applyTheme(current === 'day' ? 'ops' : 'day');
+    });
+  }
+  initTheme();
+
+  // Populate version chips from /api/console/build-info — done once at
+  // page load. If the call fails we keep the placeholder dash.
+  (async () => {
+    try {
+      const info = await fetchJSON('/api/console/build-info');
+      const v = info.version ? 'v' + info.version : '';
+      const headerSub = document.querySelector('[data-daemon-version]');
+      if (headerSub && v) headerSub.textContent = v + ' · console';
+      const footVer = document.querySelector('[data-foot-version]');
+      if (footVer && v) footVer.textContent = v;
+    } catch (err) { /* leave placeholder */ }
+  })();
+
+  // Auto-updater hint in the header. We only display when we have a
+  // real signal (avail / downloading / ready / error) — silent on
+  // idle and no-update. Single tap installs when ready. The tray
+  // menu is the durable affordance; this is just a glanceable banner.
+  if (window.clemmy?.updaterStatus) {
+    const renderUpdaterChip = async () => {
+      let info;
+      try { info = await window.clemmy.updaterStatus(); } catch { return; }
+      const sub = document.querySelector('[data-daemon-version]');
+      if (!sub) return;
+      const baseLabel = sub.dataset.baseLabel || sub.textContent || '';
+      sub.dataset.baseLabel = baseLabel;
+      let suffix = '';
+      if (info.state === 'available' || info.state === 'downloading') {
+        suffix = ' · ' + (info.progressPct ? 'downloading ' + info.progressPct + '%' : 'update available');
+      } else if (info.state === 'ready-to-install') {
+        suffix = ' · click for v' + (info.version || '') + ' update';
+        sub.style.cursor = 'pointer';
+        sub.title = 'Restart Clementine to install v' + (info.version || '');
+        sub.onclick = () => { window.clemmy?.updaterApply?.(); };
+      } else if (info.state === 'error') {
+        suffix = ' · update check failed';
+        sub.title = info.error || '';
+      } else {
+        sub.style.cursor = '';
+        sub.title = '';
+        sub.onclick = null;
+      }
+      sub.textContent = baseLabel + suffix;
+    };
+    renderUpdaterChip();
+    // Poll every 30s — cheap, doesn't block, picks up state changes
+    // that fire after auto-updater's periodic check (4h cadence).
+    setInterval(renderUpdaterChip, 30_000);
   }
 
   function fmtTime(iso) {
@@ -1052,20 +6000,272 @@ const CONSOLE_JS = `
     }
   }
 
+  // Home tile counts that don't come from /api/dashboard.
+  // Refreshed in the background so the tiles aren't always pinned to '—'.
+  let homePlanCount = null;
+  let homeProposalCount = null;
+  let homeCheckinCount = null;
+
+  async function refreshHomeAuxCounts() {
+    try {
+      const [plans, props, checkins] = await Promise.allSettled([
+        fetchJSON('/api/console/plan-proposals?status=pending'),
+        fetchJSON('/api/console/check-in-proposals?status=pending'),
+        fetchJSON('/api/check-ins?status=open'),
+      ]);
+      if (plans.status === 'fulfilled') homePlanCount = (plans.value.proposals || []).length;
+      if (props.status === 'fulfilled') homeProposalCount = (props.value.proposals || []).length;
+      if (checkins.status === 'fulfilled') homeCheckinCount = (checkins.value.checkIns || checkins.value || []).length;
+    } catch (err) { /* tiles fall back to '—' */ }
+    // Push the latest counts straight to the tiles even if no main
+    // snapshot has been fetched yet.
+    const plansEl = document.querySelector('[data-home-plans]');
+    const proposalsEl = document.querySelector('[data-home-proposals]');
+    const checkinsEl = document.querySelector('[data-home-checkins]');
+    function bump(el, v) {
+      if (!el) return;
+      el.textContent = v == null ? '—' : v;
+      const tile = el.closest('.home-tile');
+      if (!tile) return;
+      tile.classList.toggle('has-activity', typeof v === 'number' && v > 0);
+      tile.classList.toggle('high', typeof v === 'number' && v >= 5);
+    }
+    bump(plansEl, homePlanCount);
+    bump(proposalsEl, homeProposalCount);
+    bump(checkinsEl, homeCheckinCount);
+  }
+
+  function setNavBadge(panel, value, tone) {
+    const nav = document.querySelector('.nav[data-panel="' + panel + '"]');
+    if (!nav) return;
+    let badge = nav.querySelector('.nav-badge');
+    if (!badge) {
+      badge = document.createElement('span');
+      badge.className = 'nav-badge';
+      nav.appendChild(badge);
+    }
+    const show = value !== null && value !== undefined && value !== '' && String(value) !== '0';
+    badge.hidden = !show;
+    badge.textContent = show ? String(value) : '';
+    badge.className = 'nav-badge' + (tone ? ' ' + tone : '');
+  }
+
+  function renderCommandItems(items, emptyText) {
+    if (!items || items.length === 0) {
+      return '<div class="home-empty">' + escMem(emptyText) + '</div>';
+    }
+    return items.map((item) => [
+      '<div class="home-item command-item" data-tools-jump="' + escMem(item.panel || 'activity') + '">',
+      '  <span class="home-item-kind ' + escMem(item.kind || 'task') + '">' + escMem(String(item.kind || 'item').toUpperCase()) + '</span>',
+      '  <div style="flex:1; min-width:0;">',
+      '    <div class="home-item-text">' + escMem(item.title || '') + '</div>',
+      item.meta ? '    <div class="home-item-meta">' + escMem(item.meta) + '</div>' : '',
+      '  </div>',
+      '</div>',
+    ].join('')).join('');
+  }
+
+  function setPresence(status) {
+    const dot = document.querySelector('[data-home-agent-presence]');
+    if (!dot) return;
+    dot.classList.remove('needs-you', 'working', 'offline', 'warn');
+    if (status === 'needs_you') dot.classList.add('needs-you');
+    else if (status === 'working') dot.classList.add('working');
+    else if (status === 'offline') dot.classList.add('offline');
+  }
+
+  function renderMemoryPulse(memory) {
+    const warnings = memory?.warnings || [];
+    const coverage = memory?.embeddingsEnabled
+      ? Math.round((memory.embeddingsCoverage || 0) * 100) + '% embedded'
+      : 'embeddings off';
+    return [
+      '<div class="home-memory-line"><span>chunks</span><em>' + escMem(memory?.chunks ?? '—') + '</em></div>',
+      '<div class="home-memory-line"><span>files</span><em>' + escMem(memory?.indexedFiles ?? '—') + '</em></div>',
+      '<div class="home-memory-line"><span>facts</span><em>' + escMem(memory?.activeFacts ?? '—') + '</em></div>',
+      '<div class="home-memory-line"><span>vector</span><em>' + escMem(coverage) + '</em></div>',
+      warnings.length
+        ? '<div class="mem-graph-note">' + warnings.map((w) => escMem(w)).join(' · ') + '</div>'
+        : '<div class="mem-graph-note">Memory index is ready for search and recall.</div>',
+    ].join('');
+  }
+
+  function renderToolReadiness(integrations) {
+    const rows = integrations?.credentials || [];
+    if (rows.length === 0) return '<div class="home-empty">— no credential registry —</div>';
+    return rows.map((row) => {
+      const kind = row.hasValue ? 'done' : row.required ? 'checkin' : 'task';
+      const status = row.hasValue ? (row.source || 'connected') : row.required ? 'required' : 'optional';
+      return [
+        '<div class="home-item command-item" data-tools-jump="integrations">',
+        '  <span class="home-item-kind ' + kind + '">' + (row.hasValue ? 'ON' : 'OFF') + '</span>',
+        '  <div style="flex:1; min-width:0;">',
+        '    <div class="home-item-text">' + escMem(row.label || row.name) + '</div>',
+        '    <div class="home-item-meta">' + escMem(status) + '</div>',
+        '  </div>',
+        '</div>',
+      ].join('');
+    }).join('');
+  }
+
+  async function refreshHomeCommandCenter() {
+    try {
+      const data = await fetchJSON('/api/console/home/command-center');
+      const counts = data.counts || {};
+      const presence = data.presence || {};
+      const needsEl = document.querySelector('[data-home-needs-list]');
+      const workingEl = document.querySelector('[data-home-working-list]');
+      const recentEl = document.querySelector('[data-home-recent-list]');
+      const memoryEl = document.querySelector('[data-home-memory-pulse]');
+      const toolsEl = document.querySelector('[data-home-tools-list]');
+      const awayEl = document.querySelector('[data-home-away-message]');
+      const objectiveEl = document.querySelector('[data-home-current-objective]');
+      const needsCountEl = document.querySelector('[data-home-needs-count]');
+      const activeCountEl = document.querySelector('[data-home-active-count]');
+      const recentCountEl = document.querySelector('[data-home-recent-count]');
+      const memoryMetaEl = document.querySelector('[data-home-memory-card-meta]');
+      const toolsMetaEl = document.querySelector('[data-home-tools-card-meta]');
+      const approvalsTile = document.querySelector('[data-home-approvals]');
+      const plansTile = document.querySelector('[data-home-plans]');
+      const proposalsTile = document.querySelector('[data-home-proposals]');
+      const checkinsTile = document.querySelector('[data-home-checkins]');
+      const workingTile = document.querySelector('[data-home-working-count]');
+      const memoryTile = document.querySelector('[data-home-memory-health]');
+      const toolsTile = document.querySelector('[data-home-tools-ready]');
+
+      setPresence(presence.status);
+      if (awayEl) awayEl.textContent = presence.awayMessage || 'Standing by.';
+      if (objectiveEl) objectiveEl.textContent = presence.awayMessage || 'Standing by for the next useful task.';
+      if (needsCountEl) needsCountEl.textContent = String(counts.waiting ?? 0);
+      if (activeCountEl) activeCountEl.textContent = String(counts.active ?? 0);
+      if (recentCountEl) recentCountEl.textContent = String((data.recentCompleted || []).length);
+      if (memoryMetaEl) memoryMetaEl.textContent = (data.memory?.warnings || []).length ? 'attention' : 'ready';
+      if (toolsMetaEl) toolsMetaEl.textContent = (data.integrations?.connected ?? 0) + '/' + (data.integrations?.total ?? 0);
+      if (approvalsTile) approvalsTile.textContent = counts.approvals ?? 0;
+      if (plansTile) plansTile.textContent = counts.planProposals ?? 0;
+      if (proposalsTile) proposalsTile.textContent = counts.checkInProposals ?? 0;
+      if (checkinsTile) checkinsTile.textContent = counts.checkIns ?? 0;
+      if (workingTile) workingTile.textContent = counts.active ?? 0;
+      if (memoryTile) memoryTile.textContent = (data.memory?.warnings || []).length ? '!' : 'ok';
+      if (toolsTile) toolsTile.textContent = (data.integrations?.requiredMissing || 0) > 0 ? '!' : ((data.integrations?.connected ?? 0) + '/' + (data.integrations?.total ?? 0));
+      if (els.approvals) els.approvals.textContent = counts.approvals ?? 0;
+
+      if (needsEl) needsEl.innerHTML = renderCommandItems(data.needsYou, '— nothing waiting on you —');
+      if (workingEl) workingEl.innerHTML = renderCommandItems(data.workingNow, '— no active runs or background tasks —');
+      if (recentEl) recentEl.innerHTML = renderCommandItems(data.recentCompleted, '— nothing completed recently —');
+      if (memoryEl) memoryEl.innerHTML = renderMemoryPulse(data.memory || {});
+      if (toolsEl) toolsEl.innerHTML = renderToolReadiness(data.integrations || {});
+
+      setNavBadge('home', counts.waiting || '', counts.waiting > 0 ? 'hot' : '');
+      setNavBadge('activity', counts.active || '', counts.active > 0 ? 'good' : '');
+      setNavBadge('memory', (data.memory?.warnings || []).length || '', 'warn');
+      setNavBadge('integrations', data.integrations?.requiredMissing || '', 'warn');
+      setNavBadge('settings', (counts.approvals || 0) + (counts.planProposals || 0) + (counts.checkInProposals || 0), 'hot');
+    } catch (err) {
+      const needsEl = document.querySelector('[data-home-needs-list]');
+      if (needsEl) needsEl.innerHTML = '<div class="home-empty">Command center failed: ' + escMem(err.message || err) + '</div>';
+      setPresence('offline');
+    }
+  }
+
+  function greetingForNow() {
+    const hour = new Date().getHours();
+    if (hour < 5)  return 'Late night.';
+    if (hour < 12) return 'Good morning.';
+    if (hour < 17) return 'Good afternoon.';
+    if (hour < 22) return 'Good evening.';
+    return 'Late night.';
+  }
+
+  function updateHome(snap) {
+    const greetEl = document.querySelector('[data-home-greeting]');
+    const subEl = document.querySelector('[data-home-sub]');
+    const approvalsEl = document.querySelector('[data-home-approvals]');
+    const plansEl = document.querySelector('[data-home-plans]');
+    const proposalsEl = document.querySelector('[data-home-proposals]');
+    const checkinsEl = document.querySelector('[data-home-checkins]');
+    if (!greetEl) return; // home block not on the page (initial paint)
+
+    if (greetEl) greetEl.textContent = greetingForNow();
+    const approvals = (snap.approvals || []).length;
+    const policy = snap.proactivity && snap.proactivity.policy ? snap.proactivity.policy : {};
+    const mode = policy.mode || 'unknown';
+    const autoScope = policy.autoApproveScope || 'strict';
+    const memIdx = snap.memoryIndex || {};
+    const facts = memIdx.activeFacts ?? 0;
+    if (subEl) {
+      const yoloChip = autoScope === 'yolo'
+        ? ' · <span style="color:var(--accent-warn); letter-spacing: 0.16em;">⚡ YOLO</span>'
+        : autoScope === 'workspace'
+          ? ' · <span style="color:var(--accent-3); letter-spacing: 0.16em;">⇢ WORKSPACE-AUTO</span>'
+          : '';
+      subEl.innerHTML =
+        'Mode: ' + escMem(mode) + '  ·  ' + facts + ' facts in memory  ·  ' +
+        (approvals === 0 ? 'nothing waiting on you.' : approvals + ' approval' + (approvals === 1 ? '' : 's') + ' waiting.') +
+        yoloChip;
+    }
+
+    function setTile(el, value) {
+      if (!el) return;
+      el.textContent = value == null ? '—' : value;
+      const tile = el.closest('.home-tile');
+      if (!tile) return;
+      tile.classList.toggle('has-activity', typeof value === 'number' && value > 0);
+      tile.classList.toggle('high', typeof value === 'number' && value >= 5);
+    }
+    setTile(approvalsEl, approvals);
+    setTile(plansEl, homePlanCount);
+    setTile(proposalsEl, homeProposalCount);
+    setTile(checkinsEl, homeCheckinCount);
+  }
+
+  // Wire tile click-through.
+  document.querySelectorAll('[data-home-tile]').forEach((tile) => {
+    tile.addEventListener('click', () => {
+      const kind = tile.getAttribute('data-home-tile');
+      if (kind === 'approvals' || kind === 'plans' || kind === 'proposals' || kind === 'checkins') {
+        switchPanel('settings');
+        // Settings panel hosts proposal/plan/check-in editors. Approvals
+        // surface in run-inspector / Discord buttons; for v1 just open
+        // Settings so users find the related controls.
+      } else if (kind === 'activity') {
+        switchPanel('activity');
+      } else if (kind === 'memory') {
+        switchPanel('memory');
+      } else if (kind === 'integrations') {
+        switchPanel('integrations');
+      }
+    });
+  });
+
+  // Poll the auxiliary counts every 8s — separate from the main tick
+  // so the home tiles update even when the user is looking at another
+  // panel.
+  refreshHomeAuxCounts();
+  setInterval(refreshHomeAuxCounts, 8000);
+  refreshHomeCommandCenter();
+  setInterval(refreshHomeCommandCenter, 6000);
+
   async function tick() {
     try {
-      const [snap, runs] = await Promise.all([
+      const [snap, runs, approvalsData] = await Promise.all([
         fetchJSON('/api/dashboard'),
         fetchJSON('/api/runs'),
+        fetchJSON('/api/approvals'),
       ]);
+      const approvals = approvalsData.approvals || [];
+      const snapWithApprovals = { ...snap, approvals };
       setOnline(true);
 
       // Status bar
       const memIdx = snap.memoryIndex || {};
       els.runs.textContent      = (runs.runs || runs || []).length;
       els.memory.textContent    = (memIdx.chunks ?? '—') + ' / ' + (memIdx.activeFacts ?? '—') + 'f';
-      els.approvals.textContent = (snap.approvals || []).length;
+      els.approvals.textContent = approvals.length;
       els.policy.textContent    = ((snap.proactivity && snap.proactivity.policy && snap.proactivity.policy.mode) || '—').toUpperCase();
+
+      // Home tiles + greeting (only on first paint + when count changes).
+      updateHome(snapWithApprovals);
 
       const list = runs.runs || runs || [];
       const running = list.filter((r) => r.status === 'running' || r.status === 'received').length;
@@ -1074,7 +6274,7 @@ const CONSOLE_JS = `
       els.feedRun.textContent   = running;
       els.feedFail.textContent  = failed;
 
-      const snapshotJSON = JSON.stringify({ chunks: memIdx.chunks, facts: memIdx.activeFacts, approvals: (snap.approvals || []).length, mode: snap.proactivity && snap.proactivity.policy && snap.proactivity.policy.mode });
+      const snapshotJSON = JSON.stringify({ chunks: memIdx.chunks, facts: memIdx.activeFacts, approvals: approvals.length, mode: snap.proactivity && snap.proactivity.policy && snap.proactivity.policy.mode });
       const runsJSON = JSON.stringify(list.map((r) => [r.id, r.status, r.updatedAt]));
       if (runsJSON !== lastRunsJSON) {
         renderRunList(list);
@@ -1103,6 +6303,14 @@ const CONSOLE_JS = `
   const navButtons = Array.from(document.querySelectorAll('.nav[data-panel]'));
   const panelSections = Array.from(document.querySelectorAll('.panel-frame[data-section]'));
   let memoryBooted = false;
+  let contextBooted = false;
+  let workflowsBooted = false;
+  let toolsBooted = false;
+  let projectsBooted = false;
+  let skillsBooted = false;
+  let settingsBooted = false;
+  let integrationsBooted = false;
+  let homeBooted = false;
 
   function switchPanel(name) {
     panelSections.forEach((s) => {
@@ -1111,11 +6319,29 @@ const CONSOLE_JS = `
       else s.setAttribute('hidden', '');
     });
     navButtons.forEach((b) => b.classList.toggle('active', b.getAttribute('data-panel') === name));
-    if (name === 'memory' && !memoryBooted) {
-      memoryBooted = true;
-      bootMemoryPanel();
-    } else if (name === 'memory') {
-      refreshMemoryPanel();
+    if (name === 'memory') {
+      if (!memoryBooted) { memoryBooted = true; bootMemoryPanel(); }
+      else refreshMemoryPanel();
+    } else if (name === 'context') {
+      if (!contextBooted) { contextBooted = true; bootContextPanel(); }
+      else refreshContextPanel();
+    } else if (name === 'workflows') {
+      if (!workflowsBooted) { workflowsBooted = true; bootWorkflowsPanel(); }
+      else refreshWorkflowList();
+    } else if (name === 'tools') {
+      if (!toolsBooted) { toolsBooted = true; bootToolsPanel(); }
+    } else if (name === 'projects') {
+      if (!projectsBooted) { projectsBooted = true; bootProjectsPanel(); }
+    } else if (name === 'skills') {
+      if (!skillsBooted) { skillsBooted = true; bootSkillsPanel(); }
+    } else if (name === 'integrations') {
+      if (!integrationsBooted) { integrationsBooted = true; bootIntegrationsHub(); }
+      else refreshIntegrationsHub();
+    } else if (name === 'home') {
+      if (!homeBooted) { homeBooted = true; bootHomePanel(); }
+      else refreshHomeAgenda();
+    } else if (name === 'settings') {
+      if (!settingsBooted) { settingsBooted = true; bootSettingsPanel(); }
     }
   }
   navButtons.forEach((b) => {
@@ -1123,6 +6349,26 @@ const CONSOLE_JS = `
       if (b.hasAttribute('disabled')) return;
       switchPanel(b.getAttribute('data-panel'));
     });
+  });
+
+  function panelFromHash() {
+    const requested = (location.hash || '').replace(/^#/, '').trim();
+    if (!requested) return 'home';
+    const panelName = requested.startsWith('workflows/') ? 'workflows' : requested;
+    return panelSections.some((section) => section.getAttribute('data-section') === panelName)
+      ? panelName
+      : 'home';
+  }
+
+  // Site-wide cross-panel deep links: any element with
+  // data-tools-jump="<panel>" switches to that panel on click.
+  document.addEventListener('click', (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLElement)) return;
+    const jump = target.closest('[data-tools-jump]');
+    if (!jump) return;
+    event.preventDefault();
+    switchPanel(jump.getAttribute('data-tools-jump'));
   });
 
   // ─── Memory panel ─────────────────────────────────────────────
@@ -1140,6 +6386,9 @@ const CONSOLE_JS = `
     search:     document.querySelector('[data-mem-search]'),
     searchMeta: document.querySelector('[data-mem-search-meta]'),
     viewer:     document.querySelector('[data-mem-viewer]'),
+    graphSearch: document.querySelector('[data-mem-graph-search]'),
+    graphType: document.querySelector('[data-mem-graph-type]'),
+    graphMeta: document.querySelector('[data-mem-graph-meta]'),
   };
   let memSelectedFile = null;
   let memSelectedFact = null;
@@ -1164,10 +6413,330 @@ const CONSOLE_JS = `
   }
 
   async function bootMemoryPanel() {
+    wireMemoryViewToggle();
+    wireMemoryGraphControls();
     await Promise.all([refreshMemoryStatus(), refreshFileList(), refreshFactList()]);
+    if (!memGraphLoaded) {
+      memGraphLoaded = true;
+      await loadMemoryGraph();
+    }
   }
   async function refreshMemoryPanel() {
     await Promise.all([refreshMemoryStatus(), refreshFileList(), refreshFactList()]);
+  }
+
+  // ─── Memory view toggle + graph ────────────────────────────────
+
+  let memGraphCy = null;        // cytoscape instance, lazy-init
+  let memGraphLoaded = false;
+  let memGraphData = null;
+  let memGraphPinnedNode = null;
+  let memViewToggleBound = false;
+  let memGraphActionsBound = false;
+
+  function wireMemoryViewToggle() {
+    document.querySelectorAll('[data-mem-view]').forEach((button) => {
+      if (button.dataset.memViewBound) return;
+      button.dataset.memViewBound = '1';
+      button.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        activateMemoryView(button.getAttribute('data-mem-view'));
+      });
+    });
+    if (!memViewToggleBound) {
+      memViewToggleBound = true;
+      document.addEventListener('click', (event) => {
+        const target = event.target;
+        if (!(target instanceof HTMLElement)) return;
+        const btn = target.closest('[data-mem-view]');
+        if (!btn) return;
+        event.preventDefault();
+        activateMemoryView(btn.getAttribute('data-mem-view'));
+      });
+    }
+  }
+
+  function wireMemoryGraphControls() {
+    const refresh = document.querySelector('[data-mem-graph-refresh]');
+    const fit = document.querySelector('[data-mem-graph-fit]');
+    const reset = document.querySelector('[data-mem-graph-reset]');
+    if (refresh && !refresh.dataset.bound) {
+      refresh.dataset.bound = '1';
+      refresh.addEventListener('click', () => loadMemoryGraph({ force: true }));
+    }
+    if (fit && !fit.dataset.bound) {
+      fit.dataset.bound = '1';
+      fit.addEventListener('click', () => {
+        if (!memGraphCy) return;
+        memGraphCy.resize();
+        memGraphCy.fit(undefined, 42);
+      });
+    }
+    if (reset && !reset.dataset.bound) {
+      reset.dataset.bound = '1';
+      reset.addEventListener('click', () => {
+        if (!memGraphCy) return;
+        memGraphCy.elements().removeClass('dimmed related pinned');
+        memGraphPinnedNode = null;
+        applyMemoryGraphFilters();
+        memGraphCy.layout({ name: 'cose', animate: false, fit: true, padding: 42, nodeRepulsion: 8000, idealEdgeLength: 80, nodeOverlap: 12, gravity: 0.25 }).run();
+      });
+    }
+    if (mem.graphType && !mem.graphType.dataset.bound) {
+      mem.graphType.dataset.bound = '1';
+      mem.graphType.addEventListener('change', applyMemoryGraphFilters);
+    }
+    if (mem.graphSearch && !mem.graphSearch.dataset.bound) {
+      mem.graphSearch.dataset.bound = '1';
+      mem.graphSearch.addEventListener('input', applyMemoryGraphFilters);
+    }
+    if (!memGraphActionsBound) {
+      memGraphActionsBound = true;
+      document.addEventListener('click', async (event) => {
+        const target = event.target;
+        if (!(target instanceof HTMLElement)) return;
+        const action = target.closest('[data-graph-action]');
+        if (!action) return;
+        const type = action.getAttribute('data-graph-action');
+        const value = action.getAttribute('data-value') || '';
+        if (type === 'open-file' && value) {
+          switchMemoryView('viewer');
+          memSelectedFile = value;
+          memSelectedFact = null;
+          await loadFileViewer(value);
+        } else if (type === 'search' && value) {
+          switchMemoryView('viewer');
+          mem.search.value = value;
+          mem.search.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter' }));
+        } else if (type === 'filter-kind' && value) {
+          memActiveKind = value;
+          mem.kinds.querySelectorAll('.kind-pill').forEach((p) => p.classList.toggle('active', p.getAttribute('data-kind') === value));
+          switchMemoryView('viewer');
+          await refreshFactList();
+        } else if (type === 'forget-fact' && value) {
+          if (!confirm('Soft-delete fact #' + value + '?')) return;
+          await fetch(withToken('/api/console/memory/facts/' + encodeURIComponent(value) + '/forget'), { method: 'POST' });
+          await Promise.all([refreshFactList(), refreshMemoryStatus(), loadMemoryGraph({ force: true })]);
+        }
+      });
+    }
+  }
+
+  function switchMemoryView(view) {
+    document.querySelectorAll('[data-mem-view]').forEach((button) => {
+      button.classList.toggle('active', button.getAttribute('data-mem-view') === view);
+    });
+    const viewerEl = document.querySelector('[data-mem-viewer]');
+    const graphEl = document.querySelector('[data-mem-graph]');
+    if (view === 'graph') {
+      if (viewerEl) viewerEl.setAttribute('hidden', '');
+      if (graphEl) graphEl.removeAttribute('hidden');
+    } else {
+      if (graphEl) graphEl.setAttribute('hidden', '');
+      if (viewerEl) viewerEl.removeAttribute('hidden');
+    }
+  }
+
+  function activateMemoryView(view) {
+    switchMemoryView(view);
+    if (view !== 'graph') return;
+    wireMemoryGraphControls();
+    if (!memGraphLoaded) {
+      memGraphLoaded = true;
+      loadMemoryGraph();
+    } else if (memGraphCy) {
+      // Refit on tab show — Cytoscape needs a resize hint when
+      // the canvas was hidden during init.
+      memGraphCy.resize();
+      memGraphCy.fit(undefined, 40);
+    }
+  }
+  window.__clementineMemoryView = activateMemoryView;
+
+  async function loadMemoryGraph(options = {}) {
+    const canvas = document.querySelector('[data-mem-graph-canvas]');
+    const detail = document.querySelector('[data-mem-graph-detail]');
+    if (!canvas) return;
+    if (typeof window.cytoscape !== 'function') {
+      canvas.innerHTML = '<div class="mem-empty" style="padding:24px;">Cytoscape failed to load. Reload the page once the daemon is up.</div>';
+      return;
+    }
+    try {
+      const data = await fetchJSON('/api/console/memory/graph');
+      memGraphData = data;
+      if (!data.nodes || data.nodes.length === 0) {
+        canvas.innerHTML = '<div class="mem-empty" style="padding:24px;">— no facts or files indexed yet. Memory needs some signal first. Chat, meeting transcripts, and vault notes will grow this graph. —</div>';
+        if (mem.graphMeta) mem.graphMeta.textContent = '0 nodes';
+        return;
+      }
+      if (options.force && memGraphCy) {
+        memGraphCy.destroy();
+        memGraphCy = null;
+      }
+
+      const css = getComputedStyle(document.documentElement);
+      const accent = css.getPropertyValue('--accent').trim() || '#ff5a35';
+      const accent2 = css.getPropertyValue('--accent-2').trim() || '#b9ff36';
+      const accent3 = css.getPropertyValue('--accent-3').trim() || '#36c5ff';
+      const line = css.getPropertyValue('--line').trim() || '#2a2a36';
+      const fg2 = css.getPropertyValue('--fg-2').trim() || '#a0a0aa';
+      const bg0 = css.getPropertyValue('--bg-0').trim() || '#07070a';
+
+      memGraphCy = window.cytoscape({
+        container: canvas,
+        elements: [
+          ...data.nodes.map((n) => ({ data: { id: n.id, label: n.label, type: n.type, ...(n.data || {}) } })),
+          ...data.edges.map((e) => ({ data: { id: e.id, source: e.source, target: e.target, type: e.type } })),
+        ],
+        style: [
+          {
+            selector: 'node',
+            style: {
+              'background-color': fg2,
+              'label': 'data(label)',
+              'color': fg2,
+              'font-size': '9px',
+              'font-family': 'ui-monospace, SF Mono, Menlo, monospace',
+              'text-valign': 'bottom',
+              'text-margin-y': 4,
+              'text-wrap': 'wrap',
+              'text-max-width': '140px',
+              'width': 14,
+              'height': 14,
+              'border-width': 1,
+              'border-color': line,
+            },
+          },
+          { selector: 'node[type = "fact"]', style: { 'background-color': accent, 'width': 12, 'height': 12 } },
+          { selector: 'node[type = "file"]', style: { 'background-color': accent3, 'width': 10, 'height': 10, 'shape': 'rectangle' } },
+          { selector: 'node[type = "kind"]', style: { 'background-color': accent2, 'width': 22, 'height': 22, 'font-size': '11px', 'font-weight': 'bold' } },
+          {
+            selector: 'edge',
+            style: {
+              'width': 1,
+              'line-color': line,
+              'curve-style': 'bezier',
+              'target-arrow-shape': 'none',
+              'opacity': 0.45,
+            },
+          },
+          { selector: 'edge[type = "kind"]', style: { 'line-color': accent2, 'opacity': 0.35 } },
+          { selector: 'edge[type = "mentions"]', style: { 'line-color': accent3, 'opacity': 0.55, 'line-style': 'dashed' } },
+          {
+            selector: 'node:selected',
+            style: {
+              'border-width': 2,
+              'border-color': accent,
+              'background-color': accent,
+            },
+          },
+          { selector: '.dimmed', style: { 'opacity': 0.14 } },
+          { selector: '.related', style: { 'opacity': 0.92, 'border-width': 2, 'border-color': accent2 } },
+          { selector: '.pinned', style: { 'border-width': 3, 'border-color': accent, 'opacity': 1 } },
+        ],
+        layout: {
+          name: 'cose',
+          animate: false,
+          fit: true,
+          padding: 40,
+          nodeRepulsion: 8000,
+          idealEdgeLength: 80,
+          nodeOverlap: 12,
+          gravity: 0.25,
+        },
+        wheelSensitivity: 0.2,
+        boxSelectionEnabled: false,
+        userPanningEnabled: true,
+        userZoomingEnabled: true,
+      });
+
+      memGraphCy.on('mouseover', 'node', (event) => {
+        if (!memGraphPinnedNode) renderGraphDetail(detail, event.target);
+      });
+      memGraphCy.on('tap', 'node', (event) => {
+        memGraphPinnedNode = event.target;
+        highlightGraphNeighborhood(event.target);
+        renderGraphDetail(detail, event.target, true);
+      });
+      memGraphCy.on('tap', (event) => {
+        if (event.target !== memGraphCy) return;
+        memGraphPinnedNode = null;
+        memGraphCy.elements().removeClass('dimmed related pinned');
+      });
+      applyMemoryGraphFilters();
+    } catch (err) {
+      canvas.innerHTML = '<div class="mem-empty" style="padding:24px; color:var(--accent-fail);">Failed: ' + escMem(err.message || err) + '</div>';
+    }
+  }
+
+  function applyMemoryGraphFilters() {
+    if (!memGraphCy) return;
+    const type = mem.graphType?.value || '';
+    const query = (mem.graphSearch?.value || '').trim().toLowerCase();
+    let visible = 0;
+    memGraphCy.nodes().forEach((node) => {
+      const d = node.data();
+      const haystack = [d.label, d.content, d.kind, d.id].filter(Boolean).join(' ').toLowerCase();
+      const show = (!type || d.type === type) && (!query || haystack.includes(query));
+      node.style('display', show ? 'element' : 'none');
+      if (show) visible += 1;
+    });
+    memGraphCy.edges().forEach((edge) => {
+      const show = edge.source().style('display') !== 'none' && edge.target().style('display') !== 'none';
+      edge.style('display', show ? 'element' : 'none');
+    });
+    if (mem.graphMeta && memGraphData) {
+      const edges = memGraphData.edges || [];
+      const sparse = edges.length <= Math.max(2, Math.floor((memGraphData.nodes || []).length / 3));
+      mem.graphMeta.textContent = visible + '/' + (memGraphData.nodes || []).length + ' nodes' + (sparse ? ' · sparse links' : '');
+    }
+    if (memGraphCy) {
+      memGraphCy.resize();
+      const visibleElements = memGraphCy.elements().filter((el) => el.style('display') !== 'none');
+      if (visibleElements.length > 0) memGraphCy.fit(visibleElements, 42);
+    }
+  }
+
+  function highlightGraphNeighborhood(node) {
+    if (!memGraphCy) return;
+    const neighborhood = node.closedNeighborhood();
+    memGraphCy.elements().addClass('dimmed').removeClass('related pinned');
+    neighborhood.removeClass('dimmed').addClass('related');
+    node.addClass('pinned');
+  }
+
+  function renderGraphDetail(detail, node, pinned) {
+    if (!detail) return;
+    const d = node.data();
+    const kind = d.type;
+    const kindLabel = kind === 'fact' ? 'Fact' : kind === 'file' ? 'File' : kind === 'kind' ? 'Kind cluster' : kind;
+    const body = [];
+    body.push('<h4>' + escMem(d.label || '(node)') + '</h4>');
+    body.push('<div><span class="pill ' + escMem(kind) + '">' + escMem(kindLabel) + '</span>' + (pinned ? '<span class="pill">pinned</span>' : '') + '</div>');
+    if (kind === 'fact') {
+      if (d.kind) body.push('<p style="margin:8px 0 4px;"><strong>Kind:</strong> ' + escMem(d.kind) + '</p>');
+      if (d.content) body.push('<p style="margin:4px 0;">' + escMem(d.content) + '</p>');
+      body.push('<div class="mem-graph-detail-actions">');
+      if (d.kind) body.push('<button data-graph-action="filter-kind" data-value="' + escMem(d.kind) + '">FILTER KIND</button>');
+      if (d.content) body.push('<button data-graph-action="search" data-value="' + escMem(d.content.slice(0, 120)) + '">SEARCH MEMORY</button>');
+      const id = String(d.id || '').startsWith('fact:') ? String(d.id).slice('fact:'.length) : '';
+      if (id) body.push('<button data-graph-action="forget-fact" data-value="' + escMem(id) + '">FORGET FACT</button>');
+      body.push('</div>');
+    } else if (kind === 'file') {
+      const fullPath = d.id ? d.id.slice('file:'.length) : '';
+      body.push('<p style="margin:8px 0 4px;"><code style="font-size:10px;">' + escMem(fullPath) + '</code></p>');
+      if (d.chunks) body.push('<p style="margin:4px 0; color:var(--fg-3); font-size:10px;">' + d.chunks + ' chunk' + (d.chunks === 1 ? '' : 's') + '</p>');
+      body.push('<div class="mem-graph-detail-actions"><button data-graph-action="open-file" data-value="' + escMem(fullPath) + '">OPEN FILE</button><button data-graph-action="search" data-value="' + escMem(d.label || fullPath) + '">SEARCH MEMORY</button></div>');
+    } else if (kind === 'kind') {
+      body.push('<p style="margin:8px 0; color:var(--fg-3);">All facts of this kind cluster here.</p>');
+      const kindValue = String(d.id || '').startsWith('kind:') ? String(d.id).slice('kind:'.length) : d.label;
+      body.push('<div class="mem-graph-detail-actions"><button data-graph-action="filter-kind" data-value="' + escMem(String(kindValue).toLowerCase()) + '">SHOW FACTS</button></div>');
+    }
+    if (memGraphData && (memGraphData.edges || []).length <= Math.max(2, Math.floor((memGraphData.nodes || []).length / 3))) {
+      body.push('<div class="mem-graph-note">Sparse graph: most current links are kind clusters and explicit source mentions. More meeting notes, project facts, and cross-file references will make this denser.</div>');
+    }
+    detail.innerHTML = body.join('');
   }
 
   async function refreshMemoryStatus() {
@@ -1344,8 +6913,3728 @@ const CONSOLE_JS = `
     });
   }
 
+  // ─── Context / Identity panel ─────────────────────────────────
+
+  const ctx = {
+    filesCount: document.querySelector('[data-context-files-count]'),
+    factsCount: document.querySelector('[data-context-facts-count]'),
+    goalsCount: document.querySelector('[data-context-goals-count]'),
+    voiceCount: document.querySelector('[data-context-voice-count]'),
+    profileMeta: document.querySelector('[data-context-profile-meta]'),
+    profileForm: document.querySelector('[data-context-profile-form]'),
+    healthList: document.querySelector('[data-context-health-list]'),
+    files: document.querySelector('[data-context-files]'),
+    factsList: document.querySelector('[data-context-facts-list]'),
+    goalsList: document.querySelector('[data-context-goals-list]'),
+    factForm: document.querySelector('[data-context-fact-form]'),
+    goalForm: document.querySelector('[data-context-goal-form]'),
+    refresh: document.querySelector('[data-context-refresh]'),
+  };
+  let contextPanelBound = false;
+  let contextData = null;
+
+  async function bootContextPanel() {
+    bindContextPanel();
+    await refreshContextPanel();
+  }
+
+  function bindContextPanel() {
+    if (contextPanelBound) return;
+    contextPanelBound = true;
+
+    ctx.refresh?.addEventListener('click', () => refreshContextPanel());
+
+    ctx.profileForm?.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const form = ctx.profileForm;
+      const button = form.querySelector('button[type="submit"]');
+      const patch = {};
+      form.querySelectorAll('[data-context-profile-field]').forEach((el) => {
+        const name = el.getAttribute('name');
+        if (name) patch[name] = el.value;
+      });
+      if (button) button.textContent = 'SAVING…';
+      try {
+        const r = await fetch(withToken('/api/console/settings/profile'), {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(patch),
+        });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        if (button) button.textContent = 'SAVED ✓';
+        await refreshContextPanel();
+      } catch (err) {
+        if (button) button.textContent = 'FAILED';
+        alert('Profile save failed: ' + (err.message || err));
+      } finally {
+        setTimeout(() => { if (button) button.textContent = 'SAVE PROFILE ✎'; }, 1400);
+      }
+    });
+
+    ctx.factForm?.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const form = ctx.factForm;
+      const payload = {
+        kind: form.querySelector('[name="kind"]')?.value || 'user',
+        content: form.querySelector('[name="content"]')?.value || '',
+      };
+      if (!payload.content.trim()) return;
+      try {
+        const r = await fetch(withToken('/api/console/context/facts'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        form.querySelector('[name="content"]').value = '';
+        await refreshContextPanel();
+        await refreshMemoryStatus().catch(() => {});
+      } catch (err) {
+        alert('Remember failed: ' + (err.message || err));
+      }
+    });
+
+    ctx.goalForm?.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const form = ctx.goalForm;
+      const payload = {
+        title: form.querySelector('[name="title"]')?.value || '',
+        description: form.querySelector('[name="description"]')?.value || '',
+        priority: form.querySelector('[name="priority"]')?.value || 'medium',
+        nextActions: form.querySelector('[name="nextActions"]')?.value || '',
+      };
+      if (!payload.title.trim() || !payload.description.trim()) return;
+      try {
+        const r = await fetch(withToken('/api/console/context/goals'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        form.reset();
+        await refreshContextPanel();
+      } catch (err) {
+        alert('Goal create failed: ' + (err.message || err));
+      }
+    });
+  }
+
+  async function refreshContextPanel() {
+    try {
+      contextData = await fetchJSON('/api/console/context');
+      renderContextPanel();
+    } catch (err) {
+      if (ctx.healthList) ctx.healthList.innerHTML = '<div class="settings-info" style="color:var(--accent-fail);">Failed: ' + escMem(err.message || err) + '</div>';
+    }
+  }
+
+  function setContextProfileForm(profile) {
+    if (!ctx.profileForm || !profile) return;
+    ['preferredName', 'role', 'timezone', 'communicationTone', 'notes'].forEach((name) => {
+      const el = ctx.profileForm.querySelector('[name="' + name + '"]');
+      if (el) el.value = profile[name] || (name === 'communicationTone' ? 'balanced' : '');
+    });
+    if (ctx.profileMeta) {
+      const name = profile.preferredName || profile.displayName || 'not set';
+      ctx.profileMeta.textContent = name + ' · ' + (profile.communicationTone || 'balanced');
+    }
+  }
+
+  function renderContextPanel() {
+    const data = contextData || {};
+    const files = data.files || [];
+    const facts = data.facts || [];
+    const goals = data.goals || [];
+    if (ctx.filesCount) ctx.filesCount.textContent = files.length;
+    if (ctx.factsCount) ctx.factsCount.textContent = facts.length;
+    if (ctx.goalsCount) ctx.goalsCount.textContent = goals.filter((g) => g.status === 'active' || g.status === 'blocked').length + '/' + goals.length;
+    if (ctx.voiceCount) ctx.voiceCount.textContent = data.voiceContext?.chars ? Math.round(data.voiceContext.chars / 100) / 10 + 'k' : '—';
+
+    setContextProfileForm(data.profile);
+    renderContextHealth(data);
+    renderContextFiles(files);
+    renderContextFacts(facts);
+    renderContextGoals(goals);
+  }
+
+  function renderContextHealth(data) {
+    if (!ctx.healthList) return;
+    const files = data.files || [];
+    const profile = data.profile || {};
+    const rows = [
+      {
+        title: 'User profile',
+        ok: Boolean(profile.preferredName || profile.role || profile.notes),
+        meta: profile.preferredName || profile.displayName || 'defaults only',
+      },
+      ...files.map((file) => ({
+        title: file.title,
+        ok: !file.empty,
+        meta: (file.usefulChars || 0) + ' useful chars · ' + shortenPath(file.path || ''),
+      })),
+      {
+        title: 'Realtime voice prompt',
+        ok: (data.voiceContext?.chars || 0) > 1000,
+        meta: (data.voiceContext?.chars || 0) + ' chars · ' + ((data.voiceContext?.sections || []).slice(0, 5).join(', ') || 'no sections'),
+      },
+      {
+        title: 'Memory index',
+        ok: (data.memory?.chunks || 0) > 0,
+        meta: (data.memory?.chunks || 0) + ' chunks · ' + (data.memory?.activeFacts || 0) + ' facts',
+      },
+    ];
+    ctx.healthList.innerHTML = rows.map((row) => [
+      '<div class="context-health-row">',
+      '  <span class="context-health-status ' + (row.ok ? 'ok' : 'warn') + '">' + (row.ok ? 'READY' : 'NEEDS COPY') + '</span>',
+      '  <div><div class="context-health-title">' + escMem(row.title) + '</div><div class="context-health-meta">' + escMem(row.meta) + '</div></div>',
+      '  <span class="context-health-meta">' + (row.ok ? '✓' : '!') + '</span>',
+      '</div>',
+    ].join('')).join('');
+  }
+
+  function renderContextFiles(files) {
+    if (!ctx.files) return;
+    if (!files.length) {
+      ctx.files.innerHTML = '<div class="settings-info">— no context files found —</div>';
+      return;
+    }
+    ctx.files.innerHTML = files.map((file) => [
+      '<article class="context-file" data-context-file="' + escMem(file.key) + '">',
+      '  <div class="context-file-head">',
+      '    <div><div class="context-file-title">' + escMem(file.title) + '</div><div class="context-file-desc">' + escMem(file.description) + '</div></div>',
+      '    <div class="context-file-meta"><span>' + escMem(shortenPath(file.path || '')) + '</span><span class="' + (file.empty ? 'warn' : '') + '">' + (file.empty ? 'NEEDS COPY' : 'READY') + '</span><span>' + (file.bytes || 0) + ' bytes</span></div>',
+      '  </div>',
+      '  <textarea data-context-file-input="' + escMem(file.key) + '" rows="8" spellcheck="true">' + escMem(file.content || '') + '</textarea>',
+      '  <div class="context-file-actions"><span data-context-file-status="' + escMem(file.key) + '">saved state: ' + (file.empty ? 'thin' : 'ready') + '</span><button type="button" data-context-file-save="' + escMem(file.key) + '">SAVE ' + escMem(String(file.title || '').toUpperCase()) + '</button></div>',
+      '</article>',
+    ].join('')).join('');
+    ctx.files.querySelectorAll('[data-context-file-save]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const key = btn.getAttribute('data-context-file-save');
+        const input = ctx.files.querySelector('[data-context-file-input="' + key + '"]');
+        const status = ctx.files.querySelector('[data-context-file-status="' + key + '"]');
+        btn.textContent = 'SAVING…';
+        try {
+          const r = await fetch(withToken('/api/console/context/files/' + encodeURIComponent(key)), {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ content: input?.value || '' }),
+          });
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          if (status) status.textContent = 'saved ' + new Date().toLocaleTimeString();
+          await refreshContextPanel();
+        } catch (err) {
+          if (status) status.textContent = 'save failed: ' + (err.message || err);
+        } finally {
+          btn.textContent = 'SAVE';
+        }
+      });
+    });
+  }
+
+  function renderContextFacts(facts) {
+    if (!ctx.factsList) return;
+    if (!facts.length) {
+      ctx.factsList.innerHTML = '<div class="settings-info">— no durable facts yet. Add one above or let Clementine capture facts during chat. —</div>';
+      return;
+    }
+    ctx.factsList.innerHTML = facts.map((fact) => [
+      '<div class="context-fact">',
+      '  <div class="context-fact-kind">' + escMem(fact.kind) + ' · #' + escMem(fact.id) + '</div>',
+      '  <div class="context-fact-body">' + escMem(fact.content) + '</div>',
+      '</div>',
+    ].join('')).join('');
+  }
+
+  function renderContextGoals(goals) {
+    if (!ctx.goalsList) return;
+    if (!goals.length) {
+      ctx.goalsList.innerHTML = '<div class="settings-info">— no real goals yet. Create one above so proactive work has a target. —</div>';
+      return;
+    }
+    ctx.goalsList.innerHTML = goals.map((goal) => {
+      const next = Array.isArray(goal.nextActions) && goal.nextActions[0] ? goal.nextActions[0] : '';
+      return [
+        '<div class="context-goal">',
+        '  <div class="context-goal-meta">' + escMem(goal.status || 'unknown') + ' · ' + escMem(goal.priority || 'medium') + ' · ' + escMem(goal.id || '') + '</div>',
+        '  <div class="context-goal-title">' + escMem(goal.title || '(untitled goal)') + '</div>',
+        goal.description ? '  <div class="context-goal-desc">' + escMem(goal.description) + '</div>' : '',
+        next ? '  <div class="context-goal-next">next: ' + escMem(next) + '</div>' : '',
+        '</div>',
+      ].join('');
+    }).join('');
+  }
+
+  // ─── Workflow Studio ──────────────────────────────────────────
+
+  const wf = {
+    list:      document.querySelector('[data-wf-list]'),
+    editor:    document.querySelector('[data-wf-editor]'),
+    newBtn:    document.querySelector('[data-wf-new]'),
+    chatLog:   document.querySelector('[data-wf-chat-log]'),
+    chatForm:  document.querySelector('[data-wf-chat-form]'),
+    chatInput: document.querySelector('[data-wf-chat-input]'),
+    chatSend:  document.querySelector('[data-wf-chat-send]'),
+    chatMeta:  document.querySelector('[data-wf-chat-meta]'),
+  };
+
+  /** Local draft state — what the editor shows; not yet saved unless
+   *  the user hits SAVE. New workflows live here before the first POST. */
+  let wfDraft = null;
+  let wfSelectedName = null;
+  let wfIsNew = false;
+  let wfItems = [];
+  let wfChatHistory = [];
+  let wfChatBusy = false;
+
+  async function bootWorkflowsPanel() {
+    // Document-level delegation is intentional: the single-file HTML is
+    // heavily re-rendered, and these controls are identified by explicit
+    // data-wf-* attributes.
+    document.addEventListener('click', (event) => {
+      const rawTarget = event.target;
+      const target = rawTarget instanceof HTMLElement
+        ? rawTarget
+        : rawTarget instanceof Node
+          ? rawTarget.parentElement
+          : null;
+      if (!target) return;
+      const workflowSelect = target.closest('[data-wf-select]');
+      const workflowRow = workflowSelect
+        ? workflowSelect.closest('li[data-wf-name]')
+        : target.closest('li[data-wf-name]');
+      if (workflowRow) {
+        event.preventDefault();
+        const name = workflowRow.getAttribute('data-wf-name');
+        selectWorkflowByName(name);
+        return;
+      }
+      if (target.closest('[data-wf-new]')) {
+        event.preventDefault();
+        startNewWorkflow();
+        return;
+      }
+      if (target.closest('[data-wf-empty-architect]')) {
+        event.preventDefault();
+        if (wf.chatInput) {
+          wf.chatInput.value = 'Draft me a workflow for ';
+          wf.chatInput.focus();
+        }
+      }
+    });
+    // Direct binding on the sidebar button so even if delegation is
+    // ever bypassed (e.g. someone re-renders the panel), the sidebar
+    // + NEW still works.
+    if (wf.newBtn) {
+      wf.newBtn.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        startNewWorkflow();
+      });
+    }
+    await refreshWorkflowList();
+  }
+
+  function selectWorkflowByName(name) {
+    if (!name || !wf.list) return;
+    wfSelectedName = name;
+    wfIsNew = false;
+    const rows = Array.from(wf.list.querySelectorAll('li.wf'));
+    rows.forEach((el) => el.classList.toggle('selected', el.getAttribute('data-wf-name') === name));
+    if (wf.editor) {
+      wf.editor.innerHTML = '<div class="wf-empty"><div class="wf-empty-mark">↻</div><div class="wf-empty-text">Loading workflow…</div></div>';
+    }
+    const cached = cachedWorkflowData(name);
+    if (cached && Array.isArray(cached.steps)) {
+      setWorkflowDraftFromData(cached);
+      return;
+    }
+    loadWorkflow(name);
+  }
+
+  window.__clementineSelectWorkflow = selectWorkflowByName;
+  // Direct global hook so the + NEW buttons can call us via inline
+  // onclick — sidestepping any event-delegation timing issues where the
+  // document listener wasn't yet bound or got swallowed by another
+  // handler upstream.
+  window.__clementineStartNewWorkflow = () => {
+    try { startNewWorkflow(); } catch (err) { console.error('startNewWorkflow failed', err); }
+  };
+
+  function workflowNameFromHash() {
+    const raw = (location.hash || '').replace(/^#/, '').trim();
+    if (!raw.startsWith('workflows/')) return null;
+    const encoded = raw.slice('workflows/'.length);
+    if (!encoded) return null;
+    try {
+      return decodeURIComponent(encoded);
+    } catch {
+      return encoded;
+    }
+  }
+
+  async function refreshWorkflowList() {
+    try {
+      const data = await fetchJSON('/api/console/workflows');
+      const items = data.workflows || [];
+      wfItems = items;
+      if (items.length === 0) {
+        wf.list.innerHTML = '<li class="empty">— no workflows — ＋ NEW to start —</li>';
+        return;
+      }
+      wf.list.innerHTML = items.map((w) => {
+        const cls = (wfSelectedName === w.name) ? 'wf selected' : 'wf';
+        const enabledPill = w.enabled ? '<span class="pill on">● APPROVED</span>' : '<span class="pill off">○ DISABLED</span>';
+        const cronPill = w.triggerSchedule ? '<span class="pill cron">⏱ ' + escMem(w.triggerSchedule) + '</span>' : '';
+        const href = '#workflows/' + encodeURIComponent(w.name);
+        return [
+          '<li class="' + cls + '" data-wf-name="' + escMem(w.name) + '">',
+          '  <a class="wf-select" data-wf-select="' + escMem(w.name) + '" href="' + href + '" onclick="window.__clementineSelectWorkflow && window.__clementineSelectWorkflow(this.getAttribute(&quot;data-wf-select&quot;));">',
+          '    <span class="name">' + escMem(w.name) + '</span>',
+          '    <span class="meta">' + enabledPill + cronPill + '<span class="pill">' + w.stepCount + ' steps</span></span>',
+          '  </a>',
+          '</li>',
+        ].join('');
+      }).join('');
+      const hashName = workflowNameFromHash();
+      const nextSelection =
+        hashName && items.some((item) => item.name === hashName) ? hashName
+        : wfSelectedName && items.some((item) => item.name === wfSelectedName) ? wfSelectedName
+        : items[0]?.name;
+      if (nextSelection) {
+        selectWorkflowByName(nextSelection);
+      }
+    } catch (err) {
+      wf.list.innerHTML = '<li class="empty">— failed: ' + escMem(err.message || err) + ' —</li>';
+    }
+  }
+
+  async function loadWorkflow(name) {
+    try {
+      const cached = cachedWorkflowData(name);
+      const data = cached && Array.isArray(cached.steps)
+        ? cached
+        : await fetchJSON('/api/console/workflows/' + encodeURIComponent(name));
+      setWorkflowDraftFromData(data);
+    } catch (err) {
+      wf.editor.innerHTML = '<div class="wf-empty"><div class="wf-empty-mark">!</div><div class="wf-empty-text">' + escMem(err.message || err) + '</div></div>';
+    }
+  }
+
+  function cachedWorkflowData(name) {
+    return wfItems.find((item) => item && item.name === name);
+  }
+
+  function setWorkflowDraftFromData(data) {
+    wfDraft = {
+      name: data.name,
+      description: data.description || '',
+      enabled: data.enabled !== false,
+      triggerSchedule: data.trigger && data.trigger.schedule ? data.trigger.schedule : '',
+      steps: Array.isArray(data.steps) ? data.steps.map((s) => ({ id: s.id, prompt: s.prompt, dependsOn: s.dependsOn || [], model: s.model })) : [],
+      inputs: data.inputs || {},
+      synthesisPrompt: data.synthesis && data.synthesis.prompt ? data.synthesis.prompt : '',
+    };
+    wfChatHistory = [];
+    renderEditor();
+  }
+
+  function startNewWorkflow() {
+    wfSelectedName = null;
+    wfIsNew = true;
+    // Friendly starter template: a 3-step research-draft-synthesize
+    // pattern with one example input. Teaches the shape without
+    // forcing the user to learn from a blank page.
+    wfDraft = {
+      name: 'new-workflow',
+      description: 'Briefly describe what this workflow does.',
+      enabled: false,
+      triggerSchedule: '',
+      steps: [
+        {
+          id: 'research',
+          prompt: 'Gather the context needed for this task. Reference {{topic}}. Use memory_recall + read_file as needed. Return concise findings.',
+          dependsOn: [],
+        },
+        {
+          id: 'draft',
+          prompt: 'Using the research above, draft the output the user asked for. Be concrete and direct.',
+          dependsOn: ['research'],
+        },
+      ],
+      inputs: { topic: '' },
+      synthesisPrompt: 'Return the draft from the previous step, formatted clearly. No preamble.',
+    };
+    wfChatHistory = [];
+    Array.from(wf.list.querySelectorAll('li.wf')).forEach((el) => el.classList.remove('selected'));
+    renderEditor();
+  }
+  // The sidebar + empty-state both bind via event delegation in
+  // bootWorkflowsPanel(); no per-element listener needed here.
+
+  function renderEditor() {
+    if (!wfDraft) {
+      wf.editor.innerHTML = [
+        '<div class="wf-empty wf-empty-onboarding">',
+        '  <div class="wf-empty-mark">⊟</div>',
+        '  <div class="wf-empty-text">No workflow selected</div>',
+        '  <p class="wf-empty-sub">A workflow is a multi-step task you can run on demand or on a schedule.</p>',
+        '  <div class="wf-empty-actions">',
+        '    <button class="wf-empty-btn primary" data-wf-new onclick="window.__clementineStartNewWorkflow && window.__clementineStartNewWorkflow();">＋ NEW WORKFLOW</button>',
+        '    <button class="wf-empty-btn" data-wf-empty-architect>ASK ARCHITECT TO DRAFT ONE →</button>',
+        '  </div>',
+        '</div>',
+      ].join('');
+      return;
+    }
+    const d = wfDraft;
+    const stepIds = d.steps.map((s) => s.id);
+    const head = [
+      '<div class="wf-edit-head">',
+      '  <input class="wf-name" data-wf-field="name" type="text" value="' + escMem(d.name) + '" spellcheck="false" />',
+      '  <span class="status-pill ' + (d.enabled ? 'on' : 'off') + '">' + (d.enabled ? '● ENABLED' : '○ DISABLED') + '</span>',
+      '</div>',
+    ].join('');
+    const controls = [
+      '<div class="wf-edit-controls">',
+      '  <div class="wf-control-group wf-control-state">',
+      '    <button class="btn-save" data-wf-action="save">' + (wfIsNew ? 'CREATE' : 'SAVE') + ' ✎</button>',
+      wfIsNew ? '' : '    <button class="btn-duplicate" data-wf-action="duplicate">DUPLICATE ⎘</button>',
+      wfIsNew ? '' : '    <button class="btn-toggle" data-wf-action="toggle">' + (d.enabled ? '○ DISABLE' : '● ENABLE') + '</button>',
+      wfIsNew ? '' : '    <button class="btn-delete" data-wf-action="delete">DELETE ▣</button>',
+      '  </div>',
+      wfIsNew ? '' : '  <div class="wf-control-group wf-control-execute">',
+      wfIsNew ? '' : '    <button class="btn-validate" data-wf-action="validate">VALIDATE ✓</button>',
+      wfIsNew ? '' : '    <button class="btn-test" data-wf-action="dry-run">DRY-RUN ⌗</button>',
+      wfIsNew ? '' : '    <button class="btn-run" data-wf-action="run">RUN ▶</button>',
+      wfIsNew ? '' : '  </div>',
+      '</div>',
+    ].join('');
+
+    const body = [
+      '<div class="wf-edit-body">',
+
+      '  <div class="wf-field">',
+      '    <label>DESCRIPTION</label>',
+      '    <textarea data-wf-field="description" rows="2" spellcheck="false">' + escMem(d.description) + '</textarea>',
+      '    <span class="hint">A clear description helps the agent pick the right workflow.</span>',
+      '  </div>',
+
+      '  <div class="wf-field">',
+      '    <label>TRIGGER (cron expression — blank = manual only)</label>',
+      '    <input type="text" data-wf-field="triggerSchedule" value="' + escMem(d.triggerSchedule) + '" spellcheck="false" placeholder="0 9 * * 1-5" />',
+      '    <span class="hint">Five-field cron. Examples: <code>0 9 * * 1-5</code> (weekdays 9am), <code>*/15 * * * *</code> (every 15m).</span>',
+      '  </div>',
+
+      '  <div class="wf-field">',
+      '    <label>STEPS · ' + d.steps.length + '</label>',
+      '    <div class="wf-steps" data-wf-steps>',
+           d.steps.map((s, i) => renderStep(s, i, stepIds)).join(''),
+      '    </div>',
+      '    <button class="wf-add-step" data-wf-action="add-step">＋ ADD STEP</button>',
+      '  </div>',
+
+      '  <div class="wf-field">',
+      '    <label>INPUTS · ' + Object.keys(d.inputs || {}).length + '</label>',
+      '    <div class="wf-inputs" data-wf-inputs>',
+           renderInputsList(d.inputs || {}),
+      '    </div>',
+      '    <button class="wf-add-input" data-wf-action="add-input">＋ ADD INPUT</button>',
+      '    <span class="hint">Inputs are runtime parameters (e.g. <code>customer_id</code>). Reference them in step prompts as <code>{{customer_id}}</code>. The user is prompted for values when running.</span>',
+      '  </div>',
+
+      '  <div class="wf-field">',
+      '    <label>SYNTHESIS (optional final prompt that combines step outputs)</label>',
+      '    <textarea data-wf-field="synthesisPrompt" rows="3" spellcheck="false" placeholder="Summarize the prior step outputs as a single concise update.">' + escMem(d.synthesisPrompt) + '</textarea>',
+      '  </div>',
+
+      '  <div class="wf-runs" data-wf-runs></div>',
+
+      '  <div data-wf-validation></div>',
+
+      '</div>',
+    ].join('');
+
+    wf.editor.innerHTML = head + controls + body;
+    bindEditorEvents();
+    refreshWorkflowRuns();
+  }
+
+  function renderInputsList(inputs) {
+    const keys = Object.keys(inputs);
+    if (keys.length === 0) {
+      return '<div class="wf-input-row wf-input-empty">— no inputs declared. The workflow runs with whatever the runtime supplies. —</div>';
+    }
+    return keys.map((k) => {
+      const v = inputs[k];
+      const valueStr = typeof v === 'object' && v !== null ? JSON.stringify(v) : String(v ?? '');
+      return [
+        '<div class="wf-input-row" data-wf-input-row="' + escMem(k) + '">',
+        '  <input class="wf-input-key" type="text" value="' + escMem(k) + '" data-wf-input-key="' + escMem(k) + '" spellcheck="false" placeholder="key" />',
+        '  <input class="wf-input-default" type="text" value="' + escMem(valueStr) + '" data-wf-input-value="' + escMem(k) + '" spellcheck="false" placeholder="default value (optional)" />',
+        '  <button type="button" class="wf-input-remove" data-wf-action="input-remove" data-wf-input-name="' + escMem(k) + '">✕</button>',
+        '</div>',
+      ].join('');
+    }).join('');
+  }
+
+  function renderStep(step, index, allStepIds) {
+    const deps = step.dependsOn || [];
+    const depPills = allStepIds
+      .filter((id) => id !== step.id)
+      .map((id) => '<button type="button" class="dep-pill ' + (deps.includes(id) ? 'on' : '') + '" data-wf-dep="' + escMem(id) + '" data-wf-step-id="' + escMem(step.id) + '">' + escMem(id) + '</button>')
+      .join('');
+    return [
+      '<div class="wf-step" data-wf-step-index="' + index + '">',
+      '  <div class="wf-step-head">',
+      '    <span class="step-num">#' + (index + 1) + '</span>',
+      '    <input class="step-id-input" type="text" value="' + escMem(step.id) + '" data-wf-step-field="id" data-wf-step-index="' + index + '" spellcheck="false" />',
+      '    <div class="step-actions">',
+      '      <button type="button" data-wf-action="step-up" data-wf-step-index="' + index + '">↑</button>',
+      '      <button type="button" data-wf-action="step-down" data-wf-step-index="' + index + '">↓</button>',
+      '      <button type="button" class="step-remove" data-wf-action="step-remove" data-wf-step-index="' + index + '">REMOVE</button>',
+      '    </div>',
+      '  </div>',
+      '  <div class="wf-step-body">',
+      '    <textarea class="step-prompt" rows="3" data-wf-step-field="prompt" data-wf-step-index="' + index + '" placeholder="What this step should do, ideally referencing any tools it should call (e.g. memory_recall, notify_user).">' + escMem(step.prompt || '') + '</textarea>',
+      depPills ? '    <div class="step-deps"><span class="step-deps-label">DEPENDS ON ⇢</span>' + depPills + '</div>' : '    <div class="step-deps"><span class="step-deps-label">DEPENDS ON ⇢</span><span style="color:var(--fg-mute);">(no other steps to depend on)</span></div>',
+      '  </div>',
+      '</div>',
+    ].join('');
+  }
+
+  function bindEditorEvents() {
+    // Field bindings — every input mutates wfDraft in place.
+    wf.editor.querySelectorAll('[data-wf-field]').forEach((input) => {
+      input.addEventListener('input', () => {
+        const key = input.getAttribute('data-wf-field');
+        wfDraft[key] = input.value;
+      });
+    });
+    wf.editor.querySelectorAll('[data-wf-step-field]').forEach((input) => {
+      input.addEventListener('input', () => {
+        const idx = parseInt(input.getAttribute('data-wf-step-index'), 10);
+        const field = input.getAttribute('data-wf-step-field');
+        if (Number.isFinite(idx) && wfDraft.steps[idx]) {
+          wfDraft.steps[idx][field] = input.value;
+        }
+      });
+    });
+    // Dependency pill toggles
+    wf.editor.querySelectorAll('.dep-pill').forEach((pill) => {
+      pill.addEventListener('click', () => {
+        const stepId = pill.getAttribute('data-wf-step-id');
+        const depId = pill.getAttribute('data-wf-dep');
+        const step = wfDraft.steps.find((s) => s.id === stepId);
+        if (!step) return;
+        const has = (step.dependsOn || []).includes(depId);
+        if (has) step.dependsOn = step.dependsOn.filter((d) => d !== depId);
+        else step.dependsOn = [...(step.dependsOn || []), depId];
+        pill.classList.toggle('on');
+      });
+    });
+
+    // Input key/value bindings — keep wfDraft.inputs in sync without
+    // re-rendering on every keystroke (the key field would lose focus).
+    wf.editor.querySelectorAll('[data-wf-input-key]').forEach((input) => {
+      const originalKey = input.getAttribute('data-wf-input-key');
+      input.addEventListener('change', () => {
+        const newKey = (input.value || '').trim();
+        if (!newKey || newKey === originalKey) return;
+        const v = wfDraft.inputs[originalKey];
+        delete wfDraft.inputs[originalKey];
+        wfDraft.inputs[newKey] = v;
+        renderEditor();
+      });
+    });
+    wf.editor.querySelectorAll('[data-wf-input-value]').forEach((input) => {
+      const key = input.getAttribute('data-wf-input-value');
+      input.addEventListener('input', () => {
+        wfDraft.inputs[key] = input.value;
+      });
+    });
+
+    // Action buttons
+    wf.editor.querySelectorAll('[data-wf-action]').forEach((btn) => {
+      btn.addEventListener('click', (e) => {
+        e.preventDefault();
+        const action = btn.getAttribute('data-wf-action');
+        const idx = parseInt(btn.getAttribute('data-wf-step-index') || '-1', 10);
+        if (action === 'save') return saveWorkflow();
+        if (action === 'validate') return validateWorkflow();
+        if (action === 'dry-run' || action === 'test') return runWorkflow(true);
+        if (action === 'run') return runWorkflow(false);
+        if (action === 'toggle') return toggleEnabled();
+        if (action === 'delete') return deleteWorkflow();
+        if (action === 'duplicate') return duplicateWorkflow();
+        if (action === 'add-step') {
+          const nextId = 'step-' + (wfDraft.steps.length + 1);
+          wfDraft.steps.push({ id: nextId, prompt: '', dependsOn: [] });
+          renderEditor();
+          return;
+        }
+        if (action === 'add-input') {
+          if (!wfDraft.inputs) wfDraft.inputs = {};
+          let n = Object.keys(wfDraft.inputs).length + 1;
+          let k = 'input_' + n;
+          while (wfDraft.inputs[k] !== undefined) { n++; k = 'input_' + n; }
+          wfDraft.inputs[k] = '';
+          renderEditor();
+          return;
+        }
+        if (action === 'input-remove') {
+          const name = btn.getAttribute('data-wf-input-name');
+          if (name && wfDraft.inputs) {
+            delete wfDraft.inputs[name];
+            renderEditor();
+          }
+          return;
+        }
+        if (action === 'step-remove' && Number.isFinite(idx)) {
+          wfDraft.steps.splice(idx, 1);
+          renderEditor();
+          return;
+        }
+        if (action === 'step-up' && idx > 0) {
+          const [moved] = wfDraft.steps.splice(idx, 1);
+          wfDraft.steps.splice(idx - 1, 0, moved);
+          renderEditor();
+          return;
+        }
+        if (action === 'step-down' && idx >= 0 && idx < wfDraft.steps.length - 1) {
+          const [moved] = wfDraft.steps.splice(idx, 1);
+          wfDraft.steps.splice(idx + 1, 0, moved);
+          renderEditor();
+          return;
+        }
+      });
+    });
+  }
+
+  async function saveWorkflow() {
+    if (!wfDraft) return;
+    try {
+      if (wfIsNew) {
+        const r = await fetch(withToken('/api/console/workflows'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name: wfDraft.name,
+            description: wfDraft.description,
+            enabled: wfDraft.enabled,
+            triggerSchedule: wfDraft.triggerSchedule || undefined,
+            steps: wfDraft.steps,
+            synthesisPrompt: wfDraft.synthesisPrompt || undefined,
+            inputs: wfDraft.inputs,
+          }),
+        });
+        if (!r.ok) {
+          const j = await r.json().catch(() => ({}));
+          renderValidation({ ok: false, errors: [j.error || ('HTTP ' + r.status)], warnings: [], stepCount: 0, hasCycles: false });
+          return;
+        }
+        wfIsNew = false;
+        wfSelectedName = wfDraft.name;
+      } else {
+        const r = await fetch(withToken('/api/console/workflows/' + encodeURIComponent(wfSelectedName)), {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            description: wfDraft.description,
+            triggerSchedule: wfDraft.triggerSchedule || undefined,
+            clearTriggerSchedule: !wfDraft.triggerSchedule,
+            steps: wfDraft.steps,
+            synthesisPrompt: wfDraft.synthesisPrompt,
+            inputs: wfDraft.inputs,
+          }),
+        });
+        if (!r.ok) {
+          const j = await r.json().catch(() => ({}));
+          renderValidation({ ok: false, errors: [j.error || ('HTTP ' + r.status)], warnings: [], stepCount: 0, hasCycles: false });
+          return;
+        }
+      }
+      renderValidation({ ok: true, errors: [], warnings: [], stepCount: wfDraft.steps.length, hasCycles: false }, 'SAVED');
+      refreshWorkflowList();
+    } catch (err) {
+      renderValidation({ ok: false, errors: [err.message || String(err)], warnings: [], stepCount: 0, hasCycles: false });
+    }
+  }
+
+  async function validateWorkflow() {
+    if (!wfSelectedName) return;
+    try {
+      const r = await fetch(withToken('/api/console/workflows/' + encodeURIComponent(wfSelectedName) + '/validate'), { method: 'POST' });
+      const v = await r.json();
+      renderValidation(v);
+    } catch (err) {
+      renderValidation({ ok: false, errors: [err.message || String(err)], warnings: [], stepCount: 0, hasCycles: false });
+    }
+  }
+
+  function duplicateWorkflow() {
+    if (!wfDraft) return;
+    const newName = (prompt('Name for the duplicate:', wfDraft.name + '-copy') || '').trim();
+    if (!newName) return;
+    wfIsNew = true;
+    wfSelectedName = null;
+    wfDraft = {
+      ...wfDraft,
+      name: newName,
+      enabled: false,
+      // Steps + inputs are cloned by reference but they're flat enough
+      // that the user can edit independently from here.
+      steps: wfDraft.steps.map((s) => ({ ...s, dependsOn: [...(s.dependsOn || [])] })),
+      inputs: { ...(wfDraft.inputs || {}) },
+    };
+    wfChatHistory = [];
+    Array.from(wf.list.querySelectorAll('li.wf')).forEach((el) => el.classList.remove('selected'));
+    renderEditor();
+  }
+
+  async function runWorkflow(dryRun) {
+    if (!wfSelectedName) return;
+    // Prompt for input values if any are declared.
+    const declaredInputs = Object.keys(wfDraft?.inputs || {});
+    let inputValues = {};
+    if (declaredInputs.length > 0) {
+      const supplied = await promptForRunInputs(wfDraft.inputs, dryRun);
+      if (supplied === null) return; // user cancelled
+      inputValues = supplied;
+    }
+    try {
+      const r = await fetch(withToken('/api/console/workflows/' + encodeURIComponent(wfSelectedName) + '/run'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dryRun, inputs: inputValues }),
+      });
+      const j = await r.json();
+      if (!r.ok) {
+        renderValidation({ ok: false, errors: [j.error || ('HTTP ' + r.status)], warnings: [], stepCount: 0, hasCycles: false });
+        return;
+      }
+      renderValidation({ ok: true, errors: [], warnings: [], stepCount: 0, hasCycles: false }, dryRun ? ('DRY-RUN QUEUED · ' + j.id) : ('QUEUED · ' + j.id));
+      // Refresh the runs list so the user sees their new run land.
+      refreshWorkflowRuns();
+    } catch (err) {
+      renderValidation({ ok: false, errors: [err.message || String(err)], warnings: [], stepCount: 0, hasCycles: false });
+    }
+  }
+
+  /**
+   * Modal prompt for workflow inputs. Resolves with {key: value} or
+   * null if cancelled. Pure-DOM modal — no framework, just an absolute
+   * overlay over the editor.
+   */
+  function promptForRunInputs(declaredInputs, dryRun) {
+    return new Promise((resolve) => {
+      const keys = Object.keys(declaredInputs);
+      const overlay = document.createElement('div');
+      overlay.className = 'wf-run-modal-backdrop';
+      overlay.innerHTML = [
+        '<div class="wf-run-modal" role="dialog" aria-modal="true">',
+        '  <div class="wf-run-modal-head">',
+        '    <span>' + (dryRun ? 'DRY-RUN INPUTS' : 'RUN INPUTS') + '</span>',
+        '    <button class="wf-run-modal-close" data-close>✕</button>',
+        '  </div>',
+        '  <p class="wf-run-modal-sub">Provide values for the workflow inputs. Press <kbd>↩</kbd> to ' + (dryRun ? 'dry-run' : 'run') + '.</p>',
+        '  <form class="wf-run-modal-form">',
+             keys.map((k) => {
+               const def = declaredInputs[k];
+               const defStr = def === undefined || def === null ? '' : String(def);
+               return [
+                 '<label class="wf-run-modal-row">',
+                 '  <span>' + escMem(k) + '</span>',
+                 '  <input type="text" name="' + escMem(k) + '" value="' + escMem(defStr) + '" autocomplete="off" />',
+                 '</label>',
+               ].join('');
+             }).join(''),
+        '    <div class="wf-run-modal-actions">',
+        '      <button type="button" class="cancel" data-close>CANCEL</button>',
+        '      <button type="submit" class="primary">' + (dryRun ? 'DRY-RUN ⌗' : 'RUN ▶') + '</button>',
+        '    </div>',
+        '  </form>',
+        '</div>',
+      ].join('');
+      document.body.appendChild(overlay);
+      const cleanup = () => { overlay.remove(); };
+      overlay.querySelectorAll('[data-close]').forEach((b) => b.addEventListener('click', () => { cleanup(); resolve(null); }));
+      const form = overlay.querySelector('form');
+      form.addEventListener('submit', (event) => {
+        event.preventDefault();
+        const formData = new FormData(form);
+        const out = {};
+        for (const [k, v] of formData.entries()) out[k] = v;
+        cleanup();
+        resolve(out);
+      });
+      const firstInput = overlay.querySelector('input');
+      if (firstInput) firstInput.focus();
+    });
+  }
+
+  /** Recent runs for the currently-selected workflow. */
+  async function refreshWorkflowRuns() {
+    const slot = document.querySelector('[data-wf-runs]');
+    if (!slot || !wfSelectedName || wfIsNew) {
+      if (slot) slot.innerHTML = '';
+      return;
+    }
+    try {
+      const data = await fetchJSON('/api/console/workflows/' + encodeURIComponent(wfSelectedName) + '/runs?limit=5');
+      const runs = data.runs || [];
+      if (runs.length === 0) {
+        slot.innerHTML = '<div class="wf-runs-empty">— no runs yet. Click RUN ▶ to kick one off. —</div>';
+        return;
+      }
+      slot.innerHTML = [
+        '<div class="wf-runs-head">RECENT RUNS</div>',
+        '<ol class="wf-runs-list">',
+           runs.map((r) => {
+             const status = (r.status || 'unknown').toString();
+             const when = (r.createdAt || '').slice(11, 19);
+             const day = (r.createdAt || '').slice(0, 10);
+             const inputs = r.inputs && Object.keys(r.inputs).length > 0
+               ? Object.entries(r.inputs).map(([k, v]) => k + '=' + String(v).slice(0, 30)).join(' · ')
+               : '';
+             return [
+               '<li class="wf-run">',
+               '  <span class="wf-run-status status-' + escMem(status) + '">' + escMem(status.toUpperCase()) + '</span>',
+               '  <span class="wf-run-id">' + escMem(r.id) + '</span>',
+               '  <span class="wf-run-time">' + escMem(day + ' ' + when) + '</span>',
+               inputs ? '  <span class="wf-run-inputs">' + escMem(inputs) + '</span>' : '',
+               '</li>',
+             ].join('');
+           }).join(''),
+        '</ol>',
+      ].join('');
+    } catch (err) {
+      slot.innerHTML = '<div class="wf-runs-empty">runs unavailable: ' + escMem(err.message || err) + '</div>';
+    }
+  }
+
+  async function toggleEnabled() {
+    if (!wfSelectedName) return;
+    const next = !wfDraft.enabled;
+    try {
+      const r = await fetch(withToken('/api/console/workflows/' + encodeURIComponent(wfSelectedName) + '/set-enabled'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: next }),
+      });
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        renderValidation({ ok: false, errors: [j.error || ('HTTP ' + r.status)], warnings: [], stepCount: 0, hasCycles: false });
+        return;
+      }
+      wfDraft.enabled = next;
+      renderEditor();
+      refreshWorkflowList();
+    } catch (err) {
+      renderValidation({ ok: false, errors: [err.message || String(err)], warnings: [], stepCount: 0, hasCycles: false });
+    }
+  }
+
+  async function deleteWorkflow() {
+    if (!wfSelectedName) return;
+    if (!confirm('Permanently delete workflow "' + wfSelectedName + '"?')) return;
+    try {
+      const r = await fetch(withToken('/api/console/workflows/' + encodeURIComponent(wfSelectedName)), { method: 'DELETE' });
+      if (!r.ok) return;
+      wfDraft = null;
+      wfSelectedName = null;
+      renderEditor();
+      refreshWorkflowList();
+    } catch (_) {}
+  }
+
+  function renderValidation(v, customLabel) {
+    const target = wf.editor.querySelector('[data-wf-validation]');
+    if (!target) return;
+    const cls = v.ok ? 'ok' : 'err';
+    const headLabel = customLabel || (v.ok ? '✓ VALID · ' + (v.stepCount || 0) + ' STEPS' : '✗ ' + v.errors.length + ' ERROR' + (v.errors.length === 1 ? '' : 'S'));
+    const items = [];
+    v.errors.forEach((e) => items.push('<li class="err">' + escMem(e) + '</li>'));
+    v.warnings.forEach((w) => items.push('<li class="warn">⚠ ' + escMem(w) + '</li>'));
+    target.innerHTML = [
+      '<div class="wf-validation ' + cls + '">',
+      '  <div class="wf-validation-head">' + headLabel + '</div>',
+      items.length > 0 ? '  <ul>' + items.join('') + '</ul>' : '  <div style="color:var(--fg-mute);font-size:11px;">No issues.</div>',
+      '</div>',
+    ].join('');
+  }
+
+  // ─── Architect chat ───────────────────────────────────────────
+
+  function appendChatMessage(role, text) {
+    if (!wf.chatLog) return;
+    const intro = wf.chatLog.querySelector('.wf-chat-intro');
+    if (intro) intro.remove();
+    const div = document.createElement('div');
+    div.className = 'wf-msg ' + role;
+    div.innerHTML = '<div class="wf-msg-head">' + role.toUpperCase() + '</div><div class="wf-msg-body">' + escMem(text) + '</div>';
+    wf.chatLog.appendChild(div);
+    wf.chatLog.scrollTop = wf.chatLog.scrollHeight;
+    return div;
+  }
+
+  wf.chatForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    if (wfChatBusy) return;
+    const msg = wf.chatInput.value.trim();
+    if (!msg) return;
+    appendChatMessage('user', msg);
+    wfChatHistory.push({ role: 'user', text: msg });
+    wf.chatInput.value = '';
+    wfChatBusy = true;
+    wf.chatSend.disabled = true;
+    wf.chatMeta.textContent = 'thinking…';
+    const thinkingNode = appendChatMessage('thinking', '…');
+    try {
+      const r = await fetch(withToken('/api/console/workflows/architect/chat'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message: msg,
+          draft: wfDraft,
+          draftName: wfDraft ? wfDraft.name : null,
+          history: wfChatHistory.slice(0, -1),
+        }),
+      });
+      const j = await r.json();
+      if (thinkingNode) thinkingNode.remove();
+      if (!r.ok) {
+        appendChatMessage('error', j.error || ('HTTP ' + r.status));
+      } else {
+        appendChatMessage('assistant', j.text || '(no reply)');
+        wfChatHistory.push({ role: 'assistant', text: j.text || '' });
+      }
+    } catch (err) {
+      if (thinkingNode) thinkingNode.remove();
+      appendChatMessage('error', err.message || String(err));
+    } finally {
+      wfChatBusy = false;
+      wf.chatSend.disabled = false;
+      wf.chatMeta.textContent = 'idle';
+    }
+  });
+
+  // Enter sends; Shift+Enter inserts newline.
+  wf.chatInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      wf.chatForm.dispatchEvent(new Event('submit', { cancelable: true }));
+    }
+  });
+
+  // ─── Tools panel ──────────────────────────────────────────────
+
+  const tools = {
+    search:     document.querySelector('[data-tools-search]'),
+    count:      document.querySelector('[data-tools-count]'),
+    categories: document.querySelector('[data-tools-categories]'),
+    grid:       document.querySelector('[data-tools-grid]'),
+    shown:      document.querySelector('[data-tools-shown]'),
+    mcpCount:   document.querySelector('[data-mcp-count]'),
+  };
+  let toolsData = null;
+  let toolsActiveCategory = '';
+
+  async function bootToolsPanel() {
+    try {
+      toolsData = await fetchJSON('/api/console/tools');
+      renderToolsCategories();
+      renderToolsGrid();
+      if (tools.mcpCount) tools.mcpCount.textContent = (toolsData.mcpServers || []).length;
+    } catch (err) {
+      tools.grid.innerHTML = '<div class="tools-empty">— failed: ' + escMem(err.message || err) + ' —</div>';
+    }
+  }
+
+  function renderToolsCategories() {
+    const counts = new Map();
+    toolsData.tools.forEach((t) => counts.set(t.category, (counts.get(t.category) || 0) + 1));
+    const total = toolsData.tools.length;
+    const cats = Array.from(counts.entries()).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+    const pills = [
+      '<button class="cat-pill ' + (toolsActiveCategory === '' ? 'active' : '') + '" data-cat="">'
+        + '<span>ALL</span><span class="cat-count">' + total + '</span></button>',
+    ].concat(cats.map(([c, n]) =>
+      '<button class="cat-pill ' + (toolsActiveCategory === c ? 'active' : '') + '" data-cat="' + escMem(c) + '">'
+        + '<span>' + escMem(c).toUpperCase() + '</span><span class="cat-count">' + n + '</span></button>',
+    ));
+    tools.categories.innerHTML = pills.join('');
+    tools.count.innerHTML = 'TOTAL · <em>' + total + '</em>';
+    Array.from(tools.categories.querySelectorAll('.cat-pill')).forEach((p) => {
+      p.addEventListener('click', () => {
+        toolsActiveCategory = p.getAttribute('data-cat') || '';
+        Array.from(tools.categories.querySelectorAll('.cat-pill')).forEach((el) => el.classList.toggle('active', el === p));
+        renderToolsGrid();
+      });
+    });
+  }
+
+  function renderToolsGrid() {
+    if (!toolsData) return;
+    const q = (tools.search.value || '').trim().toLowerCase();
+    const filtered = toolsData.tools.filter((t) =>
+      (toolsActiveCategory === '' || t.category === toolsActiveCategory) &&
+      (q === '' || t.name.toLowerCase().includes(q) || (t.description || '').toLowerCase().includes(q) || t.category.toLowerCase().includes(q)),
+    );
+    tools.shown.textContent = filtered.length + ' shown';
+    if (filtered.length === 0) {
+      tools.grid.innerHTML = '<div class="tools-empty">— no tools match the filter —</div>';
+      return;
+    }
+    tools.grid.innerHTML = filtered.map((t) => [
+      '<div class="tool-card">',
+      '  <div class="tool-name">' + escMem(t.name) + '</div>',
+      '  <div class="tool-meta">',
+      '    <span class="tool-cat">' + escMem(t.category).toUpperCase() + '</span>',
+      '    <span class="tool-src ' + escMem(t.source) + '">' + escMem(t.source).toUpperCase() + '</span>',
+      t.needsApproval ? '    <span class="tool-approval">APPROVAL</span>' : '',
+      '  </div>',
+      t.description ? '  <div class="tool-desc">' + escMem(t.description) + '</div>' : '',
+      '</div>',
+    ].join('')).join('');
+  }
+
+  tools.search.addEventListener('input', () => renderToolsGrid());
+
+  // ─── Projects panel ────────────────────────────────────────────
+
+  const proj = {
+    wsList:     document.querySelector('[data-proj-ws-list]'),
+    wsCount:    document.querySelector('[data-proj-workspaces-count]'),
+    list:       document.querySelector('[data-proj-list]'),
+    count:      document.querySelector('[data-proj-list-count]'),
+    detail:     document.querySelector('[data-proj-detail]'),
+  };
+  let projData = null;
+  let projSelectedPath = null;
+
+  async function bootProjectsPanel() {
+    try {
+      projData = await fetchJSON('/api/console/projects');
+      renderWorkspaces();
+      renderProjects();
+    } catch (err) {
+      proj.list.innerHTML = '<li class="empty">— failed: ' + escMem(err.message || err) + ' —</li>';
+    }
+  }
+
+  function renderWorkspaces() {
+    const dirs = (projData && projData.workspaceDirs) || [];
+    proj.wsCount.textContent = dirs.length;
+    if (dirs.length === 0) {
+      proj.wsList.innerHTML = '<li class="empty">— no workspaces configured · use the workspace_config tool to add one —</li>';
+      return;
+    }
+    proj.wsList.innerHTML = dirs.map((d) => '<li>' + escMem(d) + '</li>').join('');
+  }
+
+  function renderProjects() {
+    const items = (projData && projData.projects) || [];
+    proj.count.textContent = items.length;
+    if (items.length === 0) {
+      proj.list.innerHTML = '<li class="empty">— no projects detected in configured workspaces —</li>';
+      return;
+    }
+    proj.list.innerHTML = items.map((p) => {
+      const cls = (projSelectedPath === p.path) ? 'proj selected' : 'proj';
+      return [
+        '<li class="' + cls + '" data-proj-path="' + escMem(p.path) + '">',
+        '  <span class="pname">' + escMem(p.name || p.path.split("/").pop()) + '</span>',
+        '  <span class="ppath">' + escMem(p.path) + '</span>',
+        '</li>',
+      ].join('');
+    }).join('');
+    Array.from(proj.list.querySelectorAll('li.proj')).forEach((li) => {
+      li.addEventListener('click', () => {
+        projSelectedPath = li.getAttribute('data-proj-path');
+        Array.from(proj.list.querySelectorAll('li.proj')).forEach((el) => el.classList.toggle('selected', el === li));
+        loadProjectDetail(projSelectedPath);
+      });
+    });
+  }
+
+  async function loadProjectDetail(p) {
+    if (!p) return;
+    proj.detail.innerHTML = '<div class="wf-empty"><div class="wf-empty-mark">⌛</div><div class="wf-empty-text">LOADING…</div></div>';
+    try {
+      const data = await fetchJSON('/api/console/projects/inspect?path=' + encodeURIComponent(p));
+      const parts = [];
+      parts.push('<div class="proj-block"><div class="proj-block-head"><span>PATH</span></div><div class="proj-block-body"><pre>' + escMem(data.path) + '</pre></div></div>');
+
+      if (data.package) {
+        const pkg = data.package;
+        const scripts = Object.entries(pkg.scripts || {}).slice(0, 12)
+          .map(([k, v]) => '<dt>' + escMem(k) + '</dt><dd>' + escMem(String(v)) + '</dd>').join('');
+        parts.push([
+          '<div class="proj-block"><div class="proj-block-head"><span>PACKAGE.JSON</span><em>' + escMem(pkg.name || '') + ' ' + escMem(pkg.version || '') + '</em></div>',
+          '<div class="proj-block-body">',
+          pkg.description ? '<div style="color:var(--fg-2);margin-bottom:8px;">' + escMem(pkg.description) + '</div>' : '',
+          scripts ? '<div style="font-size:10px;letter-spacing:0.14em;color:var(--fg-3);margin-bottom:4px;">SCRIPTS</div><dl class="proj-pkg-grid">' + scripts + '</dl>' : '',
+          (pkg.dependencies || []).length > 0
+            ? '<div style="margin-top:8px;font-size:10px;letter-spacing:0.14em;color:var(--fg-3);">DEPS (' + pkg.dependencies.length + ')</div><div style="font-size:10px;color:var(--fg-2);">' + escMem(pkg.dependencies.slice(0, 24).join(", ")) + (pkg.dependencies.length > 24 ? " …" : "") + '</div>'
+            : '',
+          '</div></div>',
+        ].join(''));
+      }
+
+      if (data.claudeMd) {
+        parts.push('<div class="proj-block"><div class="proj-block-head"><span>IMPORTED AGENT NOTES</span></div><div class="proj-block-body"><pre>' + escMem(data.claudeMd) + '</pre></div></div>');
+      }
+      if (data.readme) {
+        parts.push('<div class="proj-block"><div class="proj-block-head"><span>README</span></div><div class="proj-block-body"><pre>' + escMem(data.readme) + '</pre></div></div>');
+      }
+      if (Array.isArray(data.entries) && data.entries.length > 0) {
+        parts.push([
+          '<div class="proj-block"><div class="proj-block-head"><span>TOP-LEVEL · ' + data.entries.length + '</span></div>',
+          '<div class="proj-block-body"><div class="proj-entries">',
+          data.entries.map((e) => '<span class="entry ' + (e.isDir ? 'dir' : '') + '">' + escMem(e.name) + (e.isDir ? '/' : '') + '</span>').join(''),
+          '</div></div></div>',
+        ].join(''));
+      }
+      proj.detail.innerHTML = parts.join('');
+    } catch (err) {
+      proj.detail.innerHTML = '<div class="wf-empty"><div class="wf-empty-mark">!</div><div class="wf-empty-text">' + escMem(err.message || err) + '</div></div>';
+    }
+  }
+
+  // ─── Skills panel ─────────────────────────────────────────────
+
+  async function bootSkillsPanel() {
+    const dirEl   = document.querySelector('[data-skills-dir]');
+    const cntEl   = document.querySelector('[data-skills-count]');
+    const tcntEl  = document.querySelector('[data-skills-tool-count]');
+    const gridEl  = document.querySelector('[data-skills-grid]');
+    try {
+      const data = await fetchJSON('/api/console/skills');
+      if (data.pluginsDir) dirEl.textContent = data.pluginsDir;
+      const plugins = data.plugins || [];
+      cntEl.textContent = plugins.length;
+      tcntEl.textContent = plugins.reduce((s, p) => s + (p.toolCount || 0), 0);
+      if (plugins.length === 0) {
+        gridEl.innerHTML =
+          '<div class="tools-empty">— no skills installed —<br>'
+        + '<span style="color:var(--fg-mute);font-size:10px;letter-spacing:0.06em;">Drop a folder with index.js into '
+        + escMem(data.pluginsDir || '') + ' to install one. Use the plugin install command or build your own.</span></div>';
+        return;
+      }
+      gridEl.innerHTML = plugins.map((p) => [
+        '<div class="skill-card">',
+        '  <div class="skill-head">',
+        '    <span class="skill-name">' + escMem(p.name) + '</span>',
+        p.version ? '    <span class="skill-version">v' + escMem(p.version) + '</span>' : '',
+        '  </div>',
+        p.description ? '  <div class="skill-desc">' + escMem(p.description) + '</div>' : '',
+        '  <div class="skill-tools-head"><span>TOOLS</span><em>' + (p.toolCount || 0) + '</em></div>',
+        '  <div class="skill-tools">',
+           (p.tools || []).map((t) => '<span class="skill-tool-pill" title="' + escMem(t.description || '') + '">' + escMem(t.name) + '</span>').join('') || '<span style="color:var(--fg-mute);font-size:10px;">(no tools)</span>',
+        '  </div>',
+        '</div>',
+      ].join('')).join('');
+    } catch (err) {
+      gridEl.innerHTML = '<div class="tools-empty">— failed: ' + escMem(err.message || err) + ' —</div>';
+    }
+  }
+
+  // ─── Settings panel ───────────────────────────────────────────
+
+  const sett = {
+    profileForm: document.querySelector('[data-settings-profile-form]'),
+    policyForm:  document.querySelector('[data-settings-policy-form]'),
+    authBox:     document.querySelector('[data-settings-auth]'),
+    memoryBox:   document.querySelector('[data-settings-memory]'),
+  };
+
+  function setFormValue(form, name, value) {
+    const el = form.querySelector('[name="' + name + '"]');
+    if (!el) return;
+    if (el.type === 'checkbox') el.checked = Boolean(value);
+    else el.value = value ?? '';
+  }
+  function getFormPatch(form) {
+    const patch = {};
+    form.querySelectorAll('[data-profile-field], [data-policy-field]').forEach((el) => {
+      const name = el.getAttribute('name');
+      if (!name) return;
+      if (el.type === 'checkbox') patch[name] = el.checked;
+      else if (el.type === 'number') {
+        const n = parseInt(el.value, 10);
+        if (Number.isFinite(n)) patch[name] = n;
+      }
+      else patch[name] = el.value;
+    });
+    return patch;
+  }
+
+  // ─── Home panel ────────────────────────────────────────────────
+
+  async function bootHomePanel() {
+    const form = document.querySelector('[data-home-chat-form]');
+    const input = document.querySelector('[data-home-chat-input]');
+    if (form && input) {
+      form.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const text = (input.value || '').trim();
+        if (!text) return;
+        input.value = '';
+        await sendHomeChat(text);
+      });
+    }
+    // Auto-send when the user clicks a suggested prompt.
+    document.querySelectorAll('[data-home-chat-suggest]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const text = btn.getAttribute('data-home-chat-suggest') || '';
+        if (text) await sendHomeChat(text);
+      });
+    });
+    bindHomeVoiceControls();
+    await Promise.allSettled([refreshHomeAgenda(), refreshHomeCommandCenter()]);
+  }
+
+  const HOME_LIST_CAP = 5;
+
+  async function refreshHomeAgenda() {
+    const agendaEl = document.querySelector('[data-home-agenda]');
+    const doneEl = document.querySelector('[data-home-done]');
+    const agendaCountEl = document.querySelector('[data-home-agenda-count]');
+    const doneCountEl = document.querySelector('[data-home-done-count]');
+    if (!agendaEl || !doneEl) return;
+    try {
+      const data = await fetchJSON('/api/console/home/agenda');
+      const agenda = data.agenda || [];
+      const done = data.done || [];
+      const totals = data.totals || {};
+      if (agendaCountEl) agendaCountEl.textContent = String(agenda.length);
+      if (doneCountEl) doneCountEl.textContent = String(done.length);
+
+      const agendaSlice = agenda.slice(0, HOME_LIST_CAP);
+      const doneSlice = done.slice(0, HOME_LIST_CAP);
+
+      const agendaItems = agendaSlice.map((item) => renderHomeItem(item)).join('');
+      // If there are agent-tracked tasks NOT shown on home, surface them
+      // behind a single deep-link instead of a full list.
+      const hiddenPending = Math.max(0, (totals.pendingTasks || 0) - agendaSlice.filter((i) => i.kind === 'task').length);
+      const agendaFooterParts = [];
+      if (agenda.length > HOME_LIST_CAP) {
+        agendaFooterParts.push('<a class="tools-jump" data-tools-jump="activity">' + agenda.length + ' total →</a>');
+      }
+      if (hiddenPending > 0) {
+        agendaFooterParts.push('<a class="tools-jump" data-tools-jump="activity">+ ' + hiddenPending + ' agent-tracked tasks</a>');
+      }
+      const agendaFooter = agendaFooterParts.length > 0
+        ? '<div class="home-list-footer">' + agendaFooterParts.join(' · ') + '</div>'
+        : '';
+
+      agendaEl.innerHTML = agenda.length === 0
+        ? '<div class="home-empty">— nothing on the docket. Quiet day. —</div>' + (hiddenPending > 0 ? '<div class="home-list-footer"><a class="tools-jump" data-tools-jump="activity">' + hiddenPending + ' agent-tracked tasks →</a></div>' : '')
+        : agendaItems + agendaFooter;
+
+      const doneItems = doneSlice.map((item) => renderHomeItem(item, true)).join('');
+      const hiddenDone = Math.max(0, (totals.completedTasks || 0) - doneSlice.filter((i) => i.kind === 'task').length);
+      const doneFooterParts = [];
+      if (done.length > HOME_LIST_CAP) {
+        doneFooterParts.push('<a class="tools-jump" data-tools-jump="activity">' + done.length + ' total →</a>');
+      }
+      if (hiddenDone > 0) {
+        doneFooterParts.push('<a class="tools-jump" data-tools-jump="activity">+ ' + hiddenDone + ' more</a>');
+      }
+      const doneFooter = doneFooterParts.length > 0
+        ? '<div class="home-list-footer">' + doneFooterParts.join(' · ') + '</div>'
+        : '';
+      doneEl.innerHTML = done.length === 0
+        ? '<div class="home-empty">— nothing closed today yet. —</div>'
+        : doneItems + doneFooter;
+    } catch (err) {
+      agendaEl.innerHTML = '<div class="home-empty">Failed: ' + escMem(err.message || err) + '</div>';
+    }
+  }
+
+  function renderHomeItem(item, isDone) {
+    const kindClass = isDone ? 'done' : (item.kind || 'task');
+    return [
+      '<div class="home-item">',
+      '  <span class="home-item-kind ' + escMem(kindClass) + '">' + escMem((item.kind || 'item').toUpperCase()) + '</span>',
+      '  <div style="flex:1; min-width:0;">',
+      '    <div class="home-item-text">' + escMem(item.title || '') + '</div>',
+      item.meta ? '    <div class="home-item-meta">' + escMem(item.meta) + '</div>' : '',
+      '  </div>',
+      '</div>',
+    ].join('');
+  }
+
+  const homeChatHistory = [];
+
+  function setChatTurnText(turn, text) {
+    const body = turn?.querySelector?.('[data-home-chat-turn-text]');
+    if (body) body.textContent = text || '';
+  }
+
+  function setChatTurnStatus(turn, text) {
+    const status = turn?.querySelector?.('[data-home-chat-turn-status]');
+    if (status) status.textContent = text || '';
+  }
+
+  async function readNdjsonStream(response, onEvent) {
+    if (!response.body) throw new Error('Streaming response did not include a body.');
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\\n');
+      buffer = lines.pop() || '';
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        onEvent(JSON.parse(trimmed));
+      }
+    }
+    const tail = buffer.trim();
+    if (tail) onEvent(JSON.parse(tail));
+  }
+
+  async function sendHomeChat(text, options = {}) {
+    const thread = document.querySelector('[data-home-chat-thread]');
+    const send = document.querySelector('.home-chat-send');
+    if (!thread) return;
+    // Clear the hint on first send.
+    const hint = thread.querySelector('.home-chat-hint');
+    if (hint) hint.remove();
+
+    appendChatTurn('user', text);
+    homeChatHistory.push({ role: 'user', text });
+    const assistantTurn = appendChatTurn('assistant', '');
+    assistantTurn?.classList.add('pending');
+    setChatTurnStatus(assistantTurn, 'starting local run');
+
+    if (send) { send.setAttribute('disabled', 'true'); send.textContent = 'THINKING …'; }
+    let streamedText = '';
+    let finalText = '';
+    let pendingApprovalId = null;
+    try {
+      const r = await fetch(withToken('/api/console/home/chat/stream'), {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: text, history: homeChatHistory.slice(-10) }),
+      });
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        setChatTurnText(assistantTurn, 'Error: ' + (j.error || r.status));
+        return { ok: false, text: j.error || String(r.status) };
+      }
+
+      await readNdjsonStream(r, (event) => {
+        if (event.type === 'chunk' && typeof event.delta === 'string') {
+          streamedText += event.delta;
+          setChatTurnText(assistantTurn, streamedText);
+          setChatTurnStatus(assistantTurn, 'streaming response');
+          options.onChunk?.(event.delta, streamedText);
+          return;
+        }
+        if (event.type === 'tool') {
+          const toolName = event.toolName || 'tool';
+          setChatTurnStatus(assistantTurn, 'using ' + toolName);
+          options.onStatus?.('Using local tool: ' + toolName, 'tool');
+          return;
+        }
+        if (event.type === 'status') {
+          setChatTurnStatus(assistantTurn, event.text || 'working');
+          options.onStatus?.(event.text || 'working', 'status');
+          return;
+        }
+        if (event.type === 'done') {
+          finalText = event.text || streamedText || '(no reply)';
+          pendingApprovalId = event.pendingApprovalId || null;
+          setChatTurnText(assistantTurn, finalText);
+          // Status label varies by why the run ended. The grace-turn
+          // case carries a real model-written summary; we just need
+          // to add a [Continue] button below the message so the user
+          // can resume with a fresh budget.
+          const reason = event.stoppedReason || 'success';
+          const turns = event.turnsUsed ? ' (' + event.turnsUsed + ' turns)' : '';
+          if (reason === 'max-turns-with-grace') {
+            setChatTurnStatus(assistantTurn, 'paused at budget' + turns);
+            // Add an inline [Continue] button under the message.
+            const actions = document.createElement('div');
+            actions.className = 'home-chat-turn-actions';
+            actions.style.marginTop = '8px';
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'home-chat-suggest';
+            btn.textContent = '▶ CONTINUE';
+            btn.addEventListener('click', () => {
+              btn.disabled = true;
+              btn.textContent = 'continuing…';
+              sendHomeChat('continue', { onStatus: options.onStatus, onChunk: options.onChunk });
+            });
+            actions.appendChild(btn);
+            assistantTurn.appendChild(actions);
+          } else if (pendingApprovalId) {
+            setChatTurnStatus(assistantTurn, 'approval required');
+          } else if (reason === 'error') {
+            setChatTurnStatus(assistantTurn, 'no reply');
+          } else {
+            setChatTurnStatus(assistantTurn, 'complete' + turns);
+          }
+          return;
+        }
+        if (event.type === 'error') {
+          finalText = 'Error: ' + (event.error || 'unknown');
+          setChatTurnText(assistantTurn, finalText);
+          setChatTurnStatus(assistantTurn, 'failed');
+          options.onStatus?.(finalText, 'error');
+        }
+      });
+
+      const textOut = finalText || streamedText || '(no reply)';
+      setChatTurnText(assistantTurn, textOut);
+      homeChatHistory.push({ role: 'assistant', text: textOut });
+      return { ok: !textOut.startsWith('Error:'), text: textOut, pendingApprovalId };
+    } catch (err) {
+      setChatTurnText(assistantTurn, 'Network error: ' + (err.message || err));
+      setChatTurnStatus(assistantTurn, 'failed');
+      return { ok: false, text: err.message || String(err) };
+    } finally {
+      assistantTurn?.classList.remove('pending');
+      if (send) { send.removeAttribute('disabled'); send.textContent = 'SEND ↵'; }
+      const input = document.querySelector('[data-home-chat-input]');
+      if (input) input.focus();
+    }
+  }
+
+  function appendChatTurn(role, text) {
+    const thread = document.querySelector('[data-home-chat-thread]');
+    if (!thread) return;
+    const turn = document.createElement('div');
+    turn.className = 'home-chat-turn ' + role;
+    turn.innerHTML =
+      '<span class="home-chat-role">' + (role === 'user' ? 'YOU' : 'CLEMENTINE') + '</span>' +
+      '<div data-home-chat-turn-text>' + escMem(text) + '</div>' +
+      '<span class="home-chat-stream-status" data-home-chat-turn-status></span>';
+    thread.appendChild(turn);
+    thread.scrollTop = thread.scrollHeight;
+    return turn;
+  }
+
+  const liveVoiceState = {
+    pc: null,
+    dc: null,
+    stream: null,
+    connected: false,
+    phase: 'idle',
+    lastTranscript: '',
+    assistantTranscript: '',
+    handledCalls: new Set(),
+    focus: false,
+  };
+
+  function bindHomeVoiceControls() {
+    const toggle = document.querySelector('[data-home-voice-toggle]');
+    const handoff = document.querySelector('[data-home-voice-handoff]');
+    const liveCard = document.querySelector('[data-home-live-card]');
+    const closeBtn = document.querySelector('[data-home-live-close]');
+    const layout = document.querySelector('[data-home-layout]');
+    const takeoverChrome = document.querySelector('[data-home-live-takeover]');
+
+    function setHomeTakeover(active) {
+      if (!layout) return;
+      layout.classList.toggle('live-takeover', Boolean(active));
+      if (takeoverChrome) takeoverChrome.hidden = !active;
+    }
+
+    if (toggle && !toggle.dataset.bound) {
+      toggle.dataset.bound = 'true';
+      toggle.addEventListener('click', async (event) => {
+        // Stop the click from bubbling up to the LIVE card (which would
+        // re-toggle takeover). We want orb clicks to ONLY start/stop
+        // voice — entering takeover is handled by the card click below.
+        event.stopPropagation();
+        // First click anywhere on LIVE should land in takeover mode if
+        // we aren't already there. The card's own click handler will
+        // fire afterwards in the same gesture for that, but here we
+        // also flip the class so the orb's stop-propagation doesn't
+        // prevent the takeover entry.
+        if (layout && !layout.classList.contains('live-takeover')) {
+          setHomeTakeover(true);
+        }
+        if (liveVoiceState.connected) stopHomeVoice();
+        else await startHomeVoice();
+      });
+    }
+    if (handoff && !handoff.dataset.bound) {
+      handoff.dataset.bound = 'true';
+      handoff.addEventListener('click', async () => {
+        const text = liveVoiceState.lastTranscript.trim();
+        if (!text) return;
+        setLiveVoiceStatus('Sending last voice turn to Clementine…', true);
+        await sendHomeChat('[Voice command] ' + text);
+      });
+    }
+    if (liveCard && !liveCard.dataset.bound) {
+      liveCard.dataset.bound = 'true';
+      const enter = () => {
+        if (layout?.classList.contains('live-takeover')) return; // already there
+        setHomeTakeover(true);
+      };
+      liveCard.addEventListener('click', (event) => {
+        // The orb handler stops propagation, so we only get here when
+        // the user clicked the head, copy, or stage padding — i.e.
+        // they want to enter takeover without starting voice yet.
+        if (event.target instanceof Element && event.target.closest('[data-home-voice-toggle]')) return;
+        enter();
+      });
+      liveCard.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          enter();
+        }
+      });
+    }
+    if (closeBtn && !closeBtn.dataset.bound) {
+      closeBtn.dataset.bound = 'true';
+      closeBtn.addEventListener('click', (event) => {
+        event.stopPropagation();
+        setHomeTakeover(false);
+      });
+    }
+    // Esc exits takeover. Bound once at the document level since the
+    // takeover chrome is the only thing that listens for global keys
+    // on the home page.
+    if (!document.body.dataset.liveEscBound) {
+      document.body.dataset.liveEscBound = '1';
+      document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape' && layout?.classList.contains('live-takeover')) {
+          setHomeTakeover(false);
+        }
+      });
+    }
+  }
+
+  const liveVoicePhases = ['connecting', 'listening', 'thinking', 'speaking', 'routing', 'error'];
+
+  function setLiveVoiceStatus(text, live, phase) {
+    const panel = document.querySelector('[data-home-voice-panel]');
+    const status = document.querySelector('[data-home-voice-status]');
+    const toggle = document.querySelector('[data-home-voice-toggle]');
+    const phaseEl = document.querySelector('[data-home-voice-phase]');
+    if (panel) panel.classList.toggle('live', Boolean(live));
+    if (panel) {
+      liveVoicePhases.forEach((name) => panel.classList.remove(name));
+      if (phase) panel.classList.add(phase);
+      panel.classList.toggle('focus', liveVoiceState.focus);
+    }
+    if (phase) liveVoiceState.phase = phase;
+    if (phaseEl) phaseEl.textContent = (phase || liveVoiceState.phase || 'idle').toUpperCase();
+    if (status) status.textContent = text;
+    if (toggle) {
+      const label = liveVoiceState.connected ? 'Stop live voice' : 'Start live voice';
+      toggle.setAttribute('aria-label', label);
+      toggle.setAttribute('title', label);
+    }
+  }
+
+  function setLiveVoiceTranscript(text) {
+    const el = document.querySelector('[data-home-voice-transcript]');
+    const handoff = document.querySelector('[data-home-voice-handoff]');
+    if (el) el.textContent = text || 'Voice commands that need local work route back through Clementine approvals.';
+    if (handoff) handoff.disabled = !liveVoiceState.lastTranscript.trim();
+  }
+
+  function resetLiveVoiceFeed() {
+    const feed = document.querySelector('[data-home-voice-feed]');
+    if (feed) feed.innerHTML = '<span>Realtime state, local handoffs, and SDK streaming will appear here.</span>';
+  }
+
+  function addLiveVoiceEvent(text, kind = 'event') {
+    const feed = document.querySelector('[data-home-voice-feed]');
+    if (!feed || !text) return;
+    if (feed.children.length === 1 && feed.textContent?.includes('Realtime state')) feed.innerHTML = '';
+    const row = document.createElement('span');
+    row.className = 'home-voice-event ' + kind;
+    row.textContent = text;
+    feed.appendChild(row);
+    while (feed.children.length > 6) feed.removeChild(feed.firstElementChild);
+  }
+
+  function realtimeClientSecret(payload) {
+    return payload && (
+      payload.value ||
+      (payload.client_secret && payload.client_secret.value) ||
+      (payload.client_secret && payload.client_secret.secret) ||
+      (payload.secret && payload.secret.value)
+    );
+  }
+
+  function sendRealtimeEvent(event) {
+    if (liveVoiceState.dc?.readyState !== 'open') return false;
+    liveVoiceState.dc.send(JSON.stringify(event));
+    return true;
+  }
+
+  function requestRealtimeResponse(instructions) {
+    return sendRealtimeEvent({
+      type: 'response.create',
+      response: {
+        modalities: ['audio', 'text'],
+        instructions,
+      },
+    });
+  }
+
+  function sendRealtimeStarter() {
+    sendRealtimeEvent({
+      type: 'conversation.item.create',
+      item: {
+        type: 'message',
+        role: 'user',
+        content: [
+          {
+            type: 'input_text',
+            text: 'Clementine Live just connected. Briefly say you are online and listening. Keep it under one sentence.',
+          },
+        ],
+      },
+    });
+    requestRealtimeResponse('Say one short sentence that Clementine Live is online and listening. Do not ask a long follow-up.');
+  }
+
+  async function startHomeVoice() {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setLiveVoiceStatus('Microphone access is not available in this browser context.', false);
+      return;
+    }
+
+    const toggle = document.querySelector('[data-home-voice-toggle]');
+    if (toggle) toggle.disabled = true;
+    resetLiveVoiceFeed();
+    liveVoiceState.assistantTranscript = '';
+    setLiveVoiceStatus('Creating live voice session…', true, 'connecting');
+    addLiveVoiceEvent('Creating secure Realtime session.', 'routing');
+
+    try {
+      const tokenResponse = await fetch(withToken('/api/console/realtime/session'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId: 'console:home' }),
+      });
+      const tokenPayload = await tokenResponse.json().catch(() => ({}));
+      if (!tokenResponse.ok) {
+        throw new Error(tokenPayload.error || 'Failed to create Realtime session');
+      }
+
+      const ephemeralKey = realtimeClientSecret(tokenPayload);
+      if (!ephemeralKey) {
+        throw new Error('Realtime session did not return a client secret.');
+      }
+
+      const pc = new RTCPeerConnection();
+      const dc = pc.createDataChannel('oai-events');
+      const audio = document.querySelector('[data-home-voice-audio]') || document.createElement('audio');
+      audio.autoplay = true;
+
+      liveVoiceState.pc = pc;
+      liveVoiceState.dc = dc;
+      liveVoiceState.handledCalls = new Set();
+
+      pc.ontrack = (event) => {
+        audio.srcObject = event.streams[0];
+        addLiveVoiceEvent('Audio stream connected.', 'event');
+      };
+      pc.onconnectionstatechange = () => {
+        if (pc.connectionState === 'connected') setLiveVoiceStatus('Live voice connected. Speak naturally.', true, 'listening');
+        if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+          setLiveVoiceStatus('Live voice connection dropped.', false, 'error');
+          addLiveVoiceEvent('Realtime connection dropped.', 'error');
+        }
+      };
+
+      dc.addEventListener('open', () => {
+        setLiveVoiceStatus('Listening. Local actions will route through Clementine.', true, 'listening');
+        addLiveVoiceEvent('Realtime data channel open.', 'event');
+        sendRealtimeStarter();
+      });
+      dc.addEventListener('message', (event) => {
+        try {
+          handleRealtimeEvent(JSON.parse(event.data));
+        } catch (err) {
+          console.warn('Realtime event handling failed', err);
+        }
+      });
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+      liveVoiceState.stream = stream;
+      addLiveVoiceEvent('Microphone active with echo cancellation.', 'event');
+      for (const track of stream.getAudioTracks()) {
+        pc.addTrack(track, stream);
+      }
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      const sdpResponse = await fetch('https://api.openai.com/v1/realtime/calls', {
+        method: 'POST',
+        body: offer.sdp,
+        headers: {
+          Authorization: 'Bearer ' + ephemeralKey,
+          'Content-Type': 'application/sdp',
+        },
+      });
+      const answerSdp = await sdpResponse.text();
+      if (!sdpResponse.ok) {
+        throw new Error(answerSdp || 'Realtime WebRTC offer failed');
+      }
+      await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+
+      liveVoiceState.connected = true;
+      setLiveVoiceStatus('Live voice connected. Speak naturally.', true, 'listening');
+    } catch (err) {
+      stopHomeVoice();
+      setLiveVoiceStatus('Voice unavailable: ' + (err.message || err), false, 'error');
+      addLiveVoiceEvent('Voice unavailable: ' + (err.message || err), 'error');
+    } finally {
+      if (toggle) toggle.disabled = false;
+    }
+  }
+
+  function stopHomeVoice() {
+    try { liveVoiceState.dc?.close?.(); } catch {}
+    try { liveVoiceState.pc?.close?.(); } catch {}
+    try {
+      liveVoiceState.stream?.getTracks?.().forEach((track) => track.stop());
+    } catch {}
+    liveVoiceState.pc = null;
+    liveVoiceState.dc = null;
+    liveVoiceState.stream = null;
+    liveVoiceState.connected = false;
+    liveVoiceState.assistantTranscript = '';
+    liveVoiceState.focus = false;
+    const expand = document.querySelector('[data-home-voice-expand]');
+    if (expand) expand.textContent = 'FOCUS';
+    setLiveVoiceStatus('Voice stopped.', false, 'idle');
+    addLiveVoiceEvent('Voice session stopped.', 'event');
+  }
+
+  function handleRealtimeEvent(event) {
+    if (!event || !event.type) return;
+    if (event.type === 'input_audio_buffer.speech_started') {
+      liveVoiceState.assistantTranscript = '';
+      setLiveVoiceStatus('Listening to you…', true, 'listening');
+      addLiveVoiceEvent('User started speaking.', 'event');
+    } else if (event.type === 'input_audio_buffer.speech_stopped') {
+      setLiveVoiceStatus('Thinking through the turn…', true, 'thinking');
+    } else if (event.type === 'conversation.item.input_audio_transcription.delta') {
+      const delta = event.delta || event.transcript || '';
+      if (delta) setLiveVoiceTranscript('Hearing: ' + delta);
+    } else if (event.type === 'conversation.item.input_audio_transcription.completed') {
+      liveVoiceState.lastTranscript = event.transcript || '';
+      setLiveVoiceTranscript(liveVoiceState.lastTranscript ? 'Heard: ' + liveVoiceState.lastTranscript : '');
+      if (liveVoiceState.lastTranscript) addLiveVoiceEvent('Heard: ' + liveVoiceState.lastTranscript, 'event');
+    } else if (event.type === 'response.created') {
+      setLiveVoiceStatus('Generating voice response…', true, 'thinking');
+    } else if (event.type === 'response.output_audio_transcript.delta') {
+      const delta = event.delta || '';
+      if (delta) {
+        liveVoiceState.assistantTranscript += delta;
+        setLiveVoiceStatus('Clementine is speaking…', true, 'speaking');
+        setLiveVoiceTranscript('Clementine: ' + liveVoiceState.assistantTranscript);
+      }
+    } else if (event.type === 'response.output_audio_transcript.done') {
+      const transcript = event.transcript || liveVoiceState.assistantTranscript;
+      if (transcript) addLiveVoiceEvent('Said: ' + transcript, 'event');
+      liveVoiceState.assistantTranscript = '';
+    } else if (event.type === 'response.done') {
+      const routed = handleRealtimeResponseDone(event);
+      if (!routed) setLiveVoiceStatus('Live voice connected. Speak naturally.', true, 'listening');
+    } else if (event.type === 'response.function_call_arguments.done') {
+      handleRealtimeFunctionCall(event.name, event.arguments, event.call_id);
+    } else if (event.type === 'error') {
+      setLiveVoiceStatus('Realtime error: ' + (event.error?.message || 'unknown'), false, 'error');
+      addLiveVoiceEvent('Realtime error: ' + (event.error?.message || 'unknown'), 'error');
+    }
+  }
+
+  function handleRealtimeResponseDone(event) {
+    const output = event.response?.output || [];
+    let routed = false;
+    for (const item of output) {
+      if (item?.type === 'function_call') {
+        routed = true;
+        handleRealtimeFunctionCall(item.name, item.arguments, item.call_id);
+      }
+    }
+    return routed;
+  }
+
+  async function handleRealtimeFunctionCall(name, rawArguments, callId) {
+    if (name !== 'send_to_clementine' || !callId || liveVoiceState.handledCalls.has(callId)) return;
+    liveVoiceState.handledCalls.add(callId);
+
+    let args = {};
+    try { args = JSON.parse(rawArguments || '{}'); } catch {}
+    const request = String(args.request || liveVoiceState.lastTranscript || '').trim();
+    if (!request) return;
+
+    setLiveVoiceStatus('Routing into the local Clementine agent…', true, 'routing');
+    addLiveVoiceEvent('Local handoff: ' + request, 'routing');
+    const result = await sendHomeChat('[Voice command] ' + request, {
+      onStatus: (text, kind) => {
+        const label = text || 'Local agent is working.';
+        setLiveVoiceStatus(label, true, kind === 'tool' ? 'routing' : 'thinking');
+        addLiveVoiceEvent(label, kind === 'tool' ? 'tool' : 'routing');
+      },
+      onChunk: (_delta, fullText) => {
+        setLiveVoiceStatus('Local agent is streaming a response…', true, 'routing');
+        if (fullText && fullText.length < 180) {
+          setLiveVoiceTranscript('Local reply: ' + fullText);
+        }
+      },
+    });
+    const output = JSON.stringify({
+      ok: Boolean(result?.ok),
+      text: result?.text || '',
+      pendingApprovalId: result?.pendingApprovalId || null,
+    });
+
+    try {
+      if (liveVoiceState.dc?.readyState === 'open') {
+        sendRealtimeEvent({
+          type: 'conversation.item.create',
+          item: {
+            type: 'function_call_output',
+            call_id: callId,
+            output,
+          },
+        });
+        requestRealtimeResponse('Summarize the local Clementine result in one or two short spoken sentences. If an approval is required, tell the user to approve it in the dashboard or Discord.');
+      }
+    } catch (err) {
+      setLiveVoiceStatus('Clementine handled it, but voice reply failed: ' + (err.message || err), false, 'error');
+      addLiveVoiceEvent('Voice reply failed after local handoff: ' + (err.message || err), 'error');
+    }
+  }
+
+  // Refresh the agenda every 30s while the panel is mounted, so newly
+  // completed tasks / executions surface without manual reload.
+  setInterval(() => {
+    if (homeBooted && document.querySelector('.panel-frame[data-section="home"]:not([hidden])')) {
+      refreshHomeAgenda();
+    }
+  }, 30000);
+
+  // ─── Integrations Hub (API Keys + Composio + MCP) ──────────────
+
+  const HUB_APP_HINTS = {
+    gmail: 'Gmail',
+    googlecalendar: 'Google Calendar',
+    googledrive: 'Google Drive',
+    slack: 'Slack',
+    notion: 'Notion',
+    linear: 'Linear',
+    github: 'GitHub',
+    gitlab: 'GitLab',
+    discord: 'Discord',
+    figma: 'Figma',
+    stripe: 'Stripe',
+    asana: 'Asana',
+  };
+
+  function friendlyAppName(slug) {
+    if (!slug) return '';
+    const key = String(slug).toLowerCase().replace(/[^a-z0-9]/g, '');
+    return HUB_APP_HINTS[key] || slug;
+  }
+
+  function hasOpenAiApiKey(auth) {
+    return Boolean(auth && (auth.openaiApiKeyPresent || auth.hasOpenAiApiKey));
+  }
+
+  function hasCodexRuntimeAuth(auth) {
+    if (!auth) return false;
+    if (auth.codexOauthPresent || auth.hasNativeOAuth || auth.hasImportedCodexAuth) return true;
+    return auth.mode !== 'api_key' && ['native', 'local_store', 'codex_cli'].includes(auth.source);
+  }
+
+  function runtimeAuthLabel(auth) {
+    if (!auth?.configured) return 'not configured';
+    if (hasCodexRuntimeAuth(auth)) return auth.source === 'codex_cli' ? 'Codex CLI OAuth' : 'Codex OAuth';
+    if (hasOpenAiApiKey(auth)) return 'OpenAI API key';
+    return auth.mode || 'configured';
+  }
+
+  function credentialDisplayName(name) {
+    const labels = {
+      openai_api_key: 'OpenAI API key',
+      codex_oauth_access_token: 'Codex OAuth access token',
+      codex_oauth_refresh_token: 'Codex OAuth refresh token',
+      discord_bot_token: 'Discord bot token',
+      composio_api_key: 'Composio API key',
+      recall_api_key: 'Recall.ai API key',
+      browser_use_api_key: 'Browser Use API key',
+      webhook_secret: 'Dashboard/webhook secret',
+    };
+    return labels[name] || name;
+  }
+
+  function credentialDescription(name, descriptor) {
+    if (name === 'openai_api_key') {
+      return 'Optional capability key for embeddings, Realtime live voice, and direct OpenAI API features. Codex OAuth can still run the agent without this.';
+    }
+    if (name === 'codex_oauth_access_token' || name === 'codex_oauth_refresh_token') {
+      return 'Runtime auth for ChatGPT/Codex subscribers. Clementine can also use your existing Codex CLI login when detected.';
+    }
+    if (name === 'recall_api_key') {
+      return 'Optional desktop meeting capture key. Recall.ai handles recording uploads; Clementine stores transcripts locally and queues analysis tasks.';
+    }
+    if (name === 'browser_use_api_key') {
+      return 'Optional Browser Use cloud key for Browser Harness cloud browsers. Local Chrome Browser Harness does not require it.';
+    }
+    return descriptor?.description || '';
+  }
+
+  function displayCredentialStatus(row, descriptor, auth) {
+    const status = row?.status || 'missing';
+    const source = row?.source || 'none';
+    const name = row?.name || '';
+    const codexRuntimeReady = hasCodexRuntimeAuth(auth);
+    if ((name === 'codex_oauth_access_token' || name === 'codex_oauth_refresh_token') && codexRuntimeReady) {
+      return { className: 'runtime_ready', label: 'RUNTIME READY', source: auth?.source || source };
+    }
+    if (name === 'openai_api_key' && !hasOpenAiApiKey(auth) && status === 'missing' && auth?.mode !== 'api_key') {
+      return { className: 'optional', label: 'OPTIONAL', source };
+    }
+    if (status === 'missing' && !descriptor?.required) {
+      return { className: 'optional', label: name === 'openai_api_key' ? 'OPTIONAL' : 'NOT SET', source };
+    }
+    return { className: status, label: String(status).toUpperCase().replace('_', ' '), source };
+  }
+
+  let hubMcpEditing = null; // server name being edited; 'new' for create
+  let hubAppSearch = '';
+  let hubRecallEventsBound = false;
+  let hubBrowserInstallJob = null;
+
+  async function bootIntegrationsHub() {
+    const newBtn = document.querySelector('[data-hub-mcp-new]');
+    if (newBtn) {
+      newBtn.addEventListener('click', () => {
+        hubMcpEditing = hubMcpEditing === 'new' ? null : 'new';
+        renderHubMcp();
+      });
+    }
+    if (!hubRecallEventsBound && window.clemmy?.onRecallEvent) {
+      hubRecallEventsBound = true;
+      window.clemmy.onRecallEvent(() => {
+        if (document.querySelector('.panel-frame[data-section="integrations"]:not([hidden])')) {
+          setTimeout(() => refreshHubRecall(), 250);
+        }
+      });
+    }
+    bindHubInstaller();
+    await refreshIntegrationsHub();
+  }
+
+  async function refreshIntegrationsHub() {
+    await Promise.allSettled([
+      refreshHubKeys(),
+      refreshHubApps(),
+      refreshHubBrowserHarness(),
+      refreshHubRecall(),
+      refreshHubMcp(),
+    ]);
+  }
+
+  async function refreshHubKeys() {
+    const listEl = document.querySelector('[data-hub-keys-list]');
+    const metaEl = document.querySelector('[data-hub-keys-meta]');
+    const summary = document.querySelector('[data-hub-keys]');
+    if (!listEl || !metaEl) return;
+    try {
+      const data = await fetchJSON('/api/console/credentials');
+      const rows = data.rows || [];
+      const descriptors = data.descriptors || {};
+      const auth = data.auth || null;
+      metaEl.textContent = auth?.configured
+        ? 'runtime ready via ' + runtimeAuthLabel(auth) + (hasOpenAiApiKey(auth) ? ' · OpenAI key ready' : ' · OpenAI key optional')
+        : 'runtime auth needs setup';
+      if (summary) summary.textContent = auth?.configured ? 'ready' : 'setup';
+      listEl.innerHTML = rows.map((r) => {
+        const d = descriptors[r.name] || {};
+        const display = displayCredentialStatus(r, d, auth);
+        const runtimeCredentialReady = display.className === 'runtime_ready'
+          && (r.name === 'codex_oauth_access_token' || r.name === 'codex_oauth_refresh_token');
+        const sourceLine = [
+          '<span class="pill ' + escMem(display.className) + '">' + escMem(display.label) + '</span>',
+          display.source && display.source !== 'none' ? '<span>source: ' + escMem(display.source) + '</span>' : '',
+          d.envVarName ? '<span>env: ' + escMem(d.envVarName) + '</span>' : '',
+          r.lastSetAt ? '<span>set ' + escMem(r.lastSetAt.slice(0, 16).replace('T', ' ')) + '</span>' : '',
+        ].filter(Boolean).join(' ');
+        return [
+          '<div class="hub-key-row">',
+          '  <div>',
+          '    <div class="hub-key-name">' + escMem(credentialDisplayName(r.name)) + '</div>',
+          '    <div class="hub-key-meta">' + sourceLine + '</div>',
+          credentialDescription(r.name, d) ? '    <div class="hub-key-desc">' + escMem(credentialDescription(r.name, d)) + '</div>' : '',
+          '  </div>',
+          '  <div class="hub-key-actions">',
+          runtimeCredentialReady
+            ? '    <span class="hub-key-ok">ACTIVE</span>'
+            : '    <button data-hub-key-jump="' + escMem(r.name) + '">' + (r.hasValue ? 'UPDATE' : 'SET') + ' ✎</button>',
+          '  </div>',
+          '</div>',
+        ].join('');
+      }).join('') || '<div class="settings-info">— no credential schema —</div>';
+
+      // Wire jump-to-settings buttons — credentials live in the
+      // existing Settings → Credentials block; we just deep-link there.
+      listEl.querySelectorAll('[data-hub-key-jump]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          switchPanel('settings');
+          setTimeout(() => {
+            const target = document.querySelector('[data-cred-row="' + btn.getAttribute('data-hub-key-jump') + '"]');
+            if (target) target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            const setBtn = target?.querySelector('[data-cred-set]');
+            if (setBtn) setBtn.click();
+          }, 150);
+        });
+      });
+    } catch (err) {
+      listEl.innerHTML = '<div class="settings-info" style="color:var(--accent-fail);">Failed: ' + escMem(err.message || err) + '</div>';
+    }
+  }
+
+  async function refreshHubApps() {
+    const controlsEl = document.querySelector('[data-hub-apps-controls]');
+    const listEl = document.querySelector('[data-hub-apps-list]');
+    const metaEl = document.querySelector('[data-hub-apps-meta]');
+    const summary = document.querySelector('[data-hub-apps]');
+    if (!controlsEl || !listEl || !metaEl) return;
+    try {
+      const status = await fetchJSON('/api/composio/status');
+      if (!status?.enabled) {
+        controlsEl.innerHTML = [
+          '<input type="password" placeholder="Composio API key (sk_…)" data-hub-composio-key />',
+          '<button data-hub-composio-save>SAVE API KEY</button>',
+          '<a href="https://platform.composio.dev" target="_blank" rel="noopener" style="font-size:10px;letter-spacing:0.14em;color:var(--fg-3);">get a key →</a>',
+        ].join('');
+        listEl.innerHTML = '<div class="settings-info">— Composio not configured yet. Paste your API key above to start connecting apps. —</div>';
+        metaEl.textContent = 'not configured';
+        if (summary) summary.textContent = '—';
+        const saveBtn = controlsEl.querySelector('[data-hub-composio-save]');
+        if (saveBtn) {
+          saveBtn.addEventListener('click', async () => {
+            const input = controlsEl.querySelector('[data-hub-composio-key]');
+            const key = input?.value?.trim() || '';
+            if (!key) { alert('Paste an API key first.'); return; }
+            try {
+              const r = await fetch(withToken('/api/composio/api-key'), {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ api_key: key }),
+              });
+              if (!r.ok) { const j = await r.json().catch(() => ({})); alert('Save failed: ' + (j.error || r.status)); return; }
+              await refreshHubApps();
+            } catch (err) { alert('Save failed: ' + (err.message || err)); }
+          });
+        }
+        return;
+      }
+
+      const snapshot = await fetchJSON('/api/composio/toolkits');
+      const connected = (snapshot.connected || []).filter((c) => c.status !== 'DELETED');
+      const toolkits = snapshot.toolkits || snapshot.available || [];
+      const connectedSlugs = new Set(connected.map((c) => c.slug || c.toolkitSlug).filter(Boolean));
+
+      const activeCount = connected.filter((c) => (c.status || '').toUpperCase() === 'ACTIVE').length;
+      metaEl.textContent = activeCount + ' active · ' + (toolkits.length || '?') + ' available';
+      if (summary) summary.textContent = activeCount;
+
+      controlsEl.innerHTML = [
+        '<input type="text" placeholder="filter apps (gmail, slack, notion, …)" data-hub-app-filter value="' + escMem(hubAppSearch) + '" />',
+        '<button data-hub-composio-refresh>REFRESH ⟲</button>',
+      ].join('');
+      const filterEl = controlsEl.querySelector('[data-hub-app-filter]');
+      if (filterEl) {
+        filterEl.addEventListener('input', () => {
+          hubAppSearch = filterEl.value || '';
+          renderApps();
+        });
+      }
+      const refreshBtn = controlsEl.querySelector('[data-hub-composio-refresh]');
+      if (refreshBtn) {
+        refreshBtn.addEventListener('click', async () => {
+          await fetch(withToken('/api/composio/refresh'), { method: 'POST' });
+          await refreshHubApps();
+        });
+      }
+
+      function renderApps() {
+        const q = (hubAppSearch || '').toLowerCase().trim();
+        // Connected first.
+        const connRender = connected
+          .filter((c) => !q || (c.slug || '').toLowerCase().includes(q) || friendlyAppName(c.slug).toLowerCase().includes(q))
+          .map((c) => {
+            const slug = c.slug || c.toolkitSlug || '';
+            const statusKey = (c.status || 'ACTIVE').toLowerCase();
+            const pill = statusKey === 'active' ? 'active'
+              : statusKey === 'pending' || statusKey === 'initializing' ? 'pending'
+              : statusKey === 'failed' ? 'failed'
+              : 'disconnected';
+            return [
+              '<div class="hub-app-card" data-hub-app-slug="' + escMem(slug) + '">',
+              '  <div class="hub-app-name">' + escMem(friendlyAppName(slug)) + '</div>',
+              '  <span class="hub-app-pill ' + pill + '">' + escMem((c.status || 'ACTIVE').toUpperCase()) + '</span>',
+              c.userId ? '  <div class="hub-app-meta">' + escMem(c.userId) + '</div>' : '',
+              '  <div class="hub-app-card-actions">',
+              c.connectionId ? '    <button class="disconnect" data-hub-app-disconnect="' + escMem(slug) + '" data-conn="' + escMem(c.connectionId) + '">DISCONNECT</button>' : '',
+              '  </div>',
+              '</div>',
+            ].join('');
+          });
+        // Available (not connected).
+        const availRender = toolkits
+          .filter((t) => !connectedSlugs.has(t.slug))
+          .filter((t) => !q || (t.slug || '').toLowerCase().includes(q) || (t.name || '').toLowerCase().includes(q))
+          .slice(0, q ? 80 : 16)
+          .map((t) => [
+            '<div class="hub-app-card">',
+            '  <div class="hub-app-name">' + escMem(t.name || friendlyAppName(t.slug)) + '</div>',
+            '  <span class="hub-app-pill available">AVAILABLE</span>',
+            t.description ? '  <div class="hub-app-meta">' + escMem(t.description.slice(0, 80)) + '</div>' : '',
+            '  <div class="hub-app-card-actions">',
+            '    <button class="connect" data-hub-app-connect="' + escMem(t.slug) + '">CONNECT</button>',
+            '  </div>',
+            '</div>',
+          ].join(''));
+        const out = [...connRender, ...availRender];
+        listEl.innerHTML = out.length > 0
+          ? out.join('')
+          : '<div class="settings-info">— no apps match "' + escMem(q) + '" —</div>';
+
+        // Wire actions.
+        listEl.querySelectorAll('[data-hub-app-connect]').forEach((btn) => {
+          btn.addEventListener('click', async () => {
+            const slug = btn.getAttribute('data-hub-app-connect');
+            btn.textContent = 'OPENING …';
+            try {
+              const r = await fetch(withToken('/api/composio/toolkits/' + encodeURIComponent(slug) + '/authorize'), { method: 'POST' });
+              const j = await r.json().catch(() => ({}));
+              if (!r.ok) {
+                if (j.needsAuthConfig && j.setupUrl) {
+                  if (confirm(j.error + '\\n\\nOpen the Composio auth-configs page to set this up?')) {
+                    window.open(j.setupUrl, '_blank');
+                  }
+                } else {
+                  alert('Connect failed: ' + (j.error || r.status));
+                }
+                btn.textContent = 'CONNECT';
+                return;
+              }
+              if (j.redirectUrl || j.url) {
+                window.open(j.redirectUrl || j.url, '_blank');
+              }
+              setTimeout(() => refreshHubApps(), 2000);
+            } catch (err) {
+              alert('Connect failed: ' + (err.message || err));
+              btn.textContent = 'CONNECT';
+            }
+          });
+        });
+        listEl.querySelectorAll('[data-hub-app-disconnect]').forEach((btn) => {
+          btn.addEventListener('click', async () => {
+            const slug = btn.getAttribute('data-hub-app-disconnect');
+            const connectionId = btn.getAttribute('data-conn');
+            if (!confirm('Disconnect ' + friendlyAppName(slug) + '? The agent will no longer have access.')) return;
+            try {
+              await fetch(withToken('/api/composio/toolkits/' + encodeURIComponent(slug) + '/disconnect'), {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ connectionId }),
+              });
+              await refreshHubApps();
+            } catch (err) { alert('Disconnect failed: ' + (err.message || err)); }
+          });
+        });
+      }
+
+      renderApps();
+    } catch (err) {
+      listEl.innerHTML = '<div class="settings-info" style="color:var(--accent-fail);">Composio: ' + escMem(err.message || err) + '</div>';
+    }
+  }
+
+  function renderBrowserHarnessOutput(result) {
+    if (!result) return '';
+    const lines = [
+      result.command ? '$ ' + result.command : '',
+      result.output || result.stderr || result.stdout || '',
+    ].filter(Boolean).join('\\n');
+    return '<pre class="hub-install-log">' + escMem(lines || '(no output)') + '</pre>';
+  }
+
+  async function pollBrowserHarnessJob(jobId) {
+    const listEl = document.querySelector('[data-hub-browser-list]');
+    const controlsEl = document.querySelector('[data-hub-browser-controls]');
+    if (!jobId || !listEl) return;
+    let done = false;
+    for (let i = 0; i < 240 && !done; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, i === 0 ? 300 : 1500));
+      const data = await fetchJSON('/api/console/browser-harness/install/' + encodeURIComponent(jobId));
+      const job = data.job || {};
+      done = job.status !== 'running';
+      listEl.innerHTML = [
+        '<div class="hub-app-card" style="grid-column:1/-1">',
+        '  <div class="hub-app-name">Install Browser Harness</div>',
+        '  <span class="hub-app-pill ' + (job.status === 'succeeded' ? 'active' : job.status === 'failed' ? 'failed' : 'pending') + '">' + escMem(String(job.status || 'running').toUpperCase()) + '</span>',
+        '  <div class="hub-app-meta">Installs the browser-harness CLI, keeps the editable repo at ~/Developer/browser-harness, and links its Codex skill file.</div>',
+        renderBrowserHarnessOutput(job),
+        '</div>',
+      ].join('');
+      if (done) {
+        hubBrowserInstallJob = null;
+        if (controlsEl) controlsEl.querySelectorAll('button').forEach((button) => { button.disabled = false; });
+        await refreshHubBrowserHarness();
+      }
+    }
+  }
+
+  async function pollInstallJob(jobId, listEl) {
+    if (!jobId || !listEl) return;
+    let done = false;
+    for (let i = 0; i < 240 && !done; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, i === 0 ? 300 : 1500));
+      const data = await fetchJSON('/api/console/install-jobs/' + encodeURIComponent(jobId));
+      const job = data.job || {};
+      done = job.status !== 'running';
+      listEl.innerHTML = [
+        '<div class="hub-app-card" style="grid-column:1/-1">',
+        '  <div class="hub-app-name">' + escMem(job.title || 'Install capability') + '</div>',
+        '  <span class="hub-app-pill ' + (job.status === 'succeeded' ? 'active' : job.status === 'failed' ? 'failed' : 'pending') + '">' + escMem(String(job.status || 'running').toUpperCase()) + '</span>',
+        '  <div class="hub-app-meta">Command: ' + escMem(job.command || '') + '</div>',
+        renderBrowserHarnessOutput(job),
+        '</div>',
+      ].join('');
+    }
+  }
+
+  function bindHubInstaller() {
+    const runBtn = document.querySelector('[data-hub-install-run]');
+    const input = document.querySelector('[data-hub-install-command]');
+    const listEl = document.querySelector('[data-hub-installer-list]');
+    if (!runBtn || !input || !listEl || runBtn.dataset.bound) return;
+    runBtn.dataset.bound = '1';
+    runBtn.addEventListener('click', async () => {
+      const command = (input.value || '').trim();
+      if (!command) { alert('Paste an install command first.'); return; }
+      if (!confirm('Run this install command now?\\n\\n' + command)) return;
+      runBtn.disabled = true;
+      runBtn.textContent = 'STARTING...';
+      try {
+        const r = await fetch(withToken('/api/console/install-command'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ command, title: 'Install: ' + command.slice(0, 80) }),
+        });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          alert('Install rejected: ' + (j.error || r.status));
+          return;
+        }
+        await pollInstallJob(j.job?.id, listEl);
+        await Promise.allSettled([refreshHubBrowserHarness(), refreshHubMcp(), bootSkillsPanel()]);
+      } catch (err) {
+        alert('Install failed: ' + (err.message || err));
+      } finally {
+        runBtn.disabled = false;
+        runBtn.textContent = 'RUN INSTALL';
+      }
+    });
+  }
+
+  async function refreshHubBrowserHarness() {
+    const controlsEl = document.querySelector('[data-hub-browser-controls]');
+    const listEl = document.querySelector('[data-hub-browser-list]');
+    const metaEl = document.querySelector('[data-hub-browser-meta]');
+    if (!controlsEl || !listEl || !metaEl) return;
+    try {
+      const status = await fetchJSON('/api/console/browser-harness');
+      const missingPrereqs = (status.prerequisites || []).filter((p) => !p.available);
+      metaEl.textContent = status.installed
+        ? 'installed' + (status.browserUseCloudKeyPresent ? ' · cloud key ready' : ' · local chrome mode')
+        : missingPrereqs.length > 0
+          ? 'needs ' + missingPrereqs.map((p) => p.name).join(', ')
+          : 'ready to install';
+
+      controlsEl.innerHTML = [
+        status.installed ? '<button data-hub-browser-doctor>RUN DOCTOR</button>' : '<button data-hub-browser-install>INSTALL BROWSER HARNESS</button>',
+        '<button data-hub-browser-chrome>OPEN CHROME SETUP</button>',
+        '<button data-hub-browser-test ' + (status.installed ? '' : 'disabled') + '>TEST ATTACH</button>',
+        '<button data-hub-browser-refresh>REFRESH</button>',
+        '<a href="' + escMem(status.docsUrl) + '" target="_blank" rel="noopener" style="font-size:10px;letter-spacing:0.14em;color:var(--fg-3);">docs →</a>',
+      ].join('');
+
+      const prereqRows = (status.prerequisites || []).map((p) => [
+        '<div class="row">',
+        '  <span class="k">' + escMem(p.name) + '</span>',
+        '  <span class="v">' + (p.available ? 'ready' : 'missing') + (p.version ? ' · ' + escMem(p.version) : '') + (p.path ? ' · ' + escMem(p.path) : '') + '</span>',
+        '</div>',
+      ].join('')).join('');
+      listEl.innerHTML = [
+        '<div class="hub-app-card" style="grid-column:1/-1">',
+        '  <div class="hub-app-name">Browser Harness CLI</div>',
+        '  <span class="hub-app-pill ' + (status.installed ? 'active' : missingPrereqs.length > 0 ? 'failed' : 'available') + '">' + (status.installed ? 'ACTIVE' : missingPrereqs.length > 0 ? 'PREREQS' : 'AVAILABLE') + '</span>',
+        '  <div class="hub-app-meta">Command: ' + escMem(status.commandPath || 'browser-harness missing') + '</div>',
+        '  <div class="hub-app-meta">Install dir: ' + escMem(status.installDir || '') + '</div>',
+        '  <div class="settings-info" style="margin-top:10px;">',
+        '    <div class="row"><span class="k">Version</span><span class="v">' + escMem(status.version || 'not installed') + '</span></div>',
+        '    <div class="row"><span class="k">Editable repo</span><span class="v">' + (status.repoPresent ? 'present' : 'not cloned yet') + '</span></div>',
+        '    <div class="row"><span class="k">Codex skill link</span><span class="v">' + (status.codexSkillLinked ? 'linked' : 'not linked yet') + '</span></div>',
+        '    <div class="row"><span class="k">Browser Use cloud</span><span class="v">' + (status.browserUseCloudKeyPresent ? 'key ready' : 'optional key missing') + '</span></div>',
+             prereqRows,
+        '  </div>',
+        missingPrereqs.length > 0 ? '  <div class="hub-app-meta" style="color:var(--accent-warn);margin-top:8px;">Install missing prerequisites first. Browser Harness requires git, uv, and Python 3.</div>' : '',
+        '  <div class="hub-app-card-actions" style="margin-top:10px;"><button data-hub-key-jump="browser_use_api_key">SET CLOUD KEY</button></div>',
+        '</div>',
+      ].join('');
+
+      const installBtn = controlsEl.querySelector('[data-hub-browser-install]');
+      if (installBtn) {
+        installBtn.disabled = missingPrereqs.length > 0;
+        installBtn.addEventListener('click', async () => {
+          if (!confirm('Install Browser Harness now? Clementine will clone browser-use/browser-harness into ~/Developer/browser-harness and run uv tool install -e .')) return;
+          installBtn.disabled = true;
+          installBtn.textContent = 'INSTALLING...';
+          const r = await fetch(withToken('/api/console/browser-harness/install'), { method: 'POST' });
+          const j = await r.json().catch(() => ({}));
+          if (!r.ok) {
+            alert('Install failed to start: ' + (j.error || r.status));
+            await refreshHubBrowserHarness();
+            return;
+          }
+          hubBrowserInstallJob = j.job?.id || null;
+          pollBrowserHarnessJob(hubBrowserInstallJob);
+        });
+      }
+
+      const doctorBtn = controlsEl.querySelector('[data-hub-browser-doctor]');
+      if (doctorBtn) {
+        doctorBtn.addEventListener('click', async () => {
+          doctorBtn.textContent = 'RUNNING...';
+          const r = await fetch(withToken('/api/console/browser-harness/doctor'), { method: 'POST' });
+          const j = await r.json().catch(() => ({}));
+          listEl.insertAdjacentHTML('afterbegin', renderBrowserHarnessOutput(j));
+          doctorBtn.textContent = 'RUN DOCTOR';
+        });
+      }
+
+      const chromeBtn = controlsEl.querySelector('[data-hub-browser-chrome]');
+      if (chromeBtn) {
+        chromeBtn.addEventListener('click', async () => {
+          const r = await fetch(withToken('/api/console/browser-harness/open-chrome-setup'), { method: 'POST' });
+          const j = await r.json().catch(() => ({}));
+          if (!j.ok) alert(j.output || 'Open chrome://inspect/#remote-debugging in Chrome and enable remote debugging.');
+        });
+      }
+
+      const testBtn = controlsEl.querySelector('[data-hub-browser-test]');
+      if (testBtn) {
+        testBtn.addEventListener('click', async () => {
+          testBtn.textContent = 'TESTING...';
+          const r = await fetch(withToken('/api/console/browser-harness/test'), { method: 'POST' });
+          const j = await r.json().catch(() => ({}));
+          listEl.insertAdjacentHTML('afterbegin', renderBrowserHarnessOutput(j));
+          testBtn.textContent = 'TEST ATTACH';
+        });
+      }
+
+      const refreshBtn = controlsEl.querySelector('[data-hub-browser-refresh]');
+      if (refreshBtn) refreshBtn.addEventListener('click', () => refreshHubBrowserHarness());
+      listEl.querySelectorAll('[data-hub-key-jump]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          switchPanel('settings');
+          setTimeout(() => {
+            const target = document.querySelector('[data-cred-row="' + btn.getAttribute('data-hub-key-jump') + '"]');
+            if (target) target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            const setBtn = target?.querySelector('[data-cred-set]');
+            if (setBtn) setBtn.click();
+          }, 150);
+        });
+      });
+    } catch (err) {
+      metaEl.textContent = 'error';
+      listEl.innerHTML = '<div class="settings-info" style="color:var(--accent-fail);">Browser Harness: ' + escMem(err.message || err) + '</div>';
+    }
+  }
+
+  async function refreshHubRecall() {
+    const controlsEl = document.querySelector('[data-hub-recall-controls]');
+    const listEl = document.querySelector('[data-hub-recall-list]');
+    const metaEl = document.querySelector('[data-hub-recall-meta]');
+    if (!controlsEl || !listEl || !metaEl) return;
+    try {
+      const data = await fetchJSON('/api/console/meetings/recall');
+      const settings = data.settings || {};
+      const credential = data.credential || {};
+      const desktop = window.clemmy?.recallStatus ? await window.clemmy.recallStatus().catch((err) => ({ lastError: err.message || String(err) })) : null;
+      const hasKey = Boolean(credential.hasValue);
+      const electronReady = Boolean(window.clemmy?.recallConfigure);
+      metaEl.textContent = [
+        settings.enabled ? 'enabled' : 'disabled',
+        hasKey ? 'key ready' : 'key needed',
+        electronReady ? 'electron available' : 'electron only',
+      ].join(' · ');
+
+      const regionOptions = Object.keys(data.regions || { 'us-west-2': true, 'us-east-1': true, 'eu-central-1': true, 'ap-northeast-1': true })
+        .map((region) => '<option value="' + escMem(region) + '"' + (settings.region === region ? ' selected' : '') + '>' + escMem(region) + '</option>')
+        .join('');
+      controlsEl.innerHTML = [
+        hasKey ? '' : '<input type="password" placeholder="Recall.ai API key" data-hub-recall-key />',
+        hasKey ? '' : '<button data-hub-recall-save-key>SAVE KEY</button>',
+        '<a href="' + escMem(data.signupUrl || 'https://www.recall.ai/signup') + '" target="_blank" rel="noopener" style="font-size:10px;letter-spacing:0.14em;color:var(--fg-3);">get Recall.ai →</a>',
+        '<select data-hub-recall-region>' + regionOptions + '</select>',
+        '<label class="check-pill"><input type="checkbox" data-hub-recall-enabled ' + (settings.enabled ? 'checked' : '') + ' /> ENABLED</label>',
+        '<label class="check-pill"><input type="checkbox" data-hub-recall-auto ' + (settings.autoRecord ? 'checked' : '') + ' /> AUTO RECORD</label>',
+        '<label class="check-pill"><input type="checkbox" data-hub-recall-live ' + (settings.liveTranscript ? 'checked' : '') + ' /> LIVE TRANSCRIPT</label>',
+        '<label class="check-pill"><input type="checkbox" data-hub-recall-analyze ' + (settings.analyzeOnComplete !== false ? 'checked' : '') + ' /> ANALYZE AFTER</label>',
+        '<button data-hub-recall-save-settings>SAVE SETTINGS</button>',
+        electronReady ? '<button data-hub-recall-test>TEST CONNECTION</button>' : '',
+        electronReady ? '<button data-hub-recall-perms>REQUEST PERMISSIONS</button>' : '',
+        electronReady ? '<button data-hub-recall-manual>START MANUAL</button>' : '',
+        electronReady ? '<button data-hub-recall-stop>STOP</button>' : '',
+      ].filter(Boolean).join('');
+
+      // Roll up the SDK + permission + window state into the
+      // diagnostic the user actually needs at a glance.
+      const recordingAt = desktop?.lastEventAt
+        ? new Date(desktop.lastEventAt).toLocaleString()
+        : 'never';
+      const sdkSummary = !electronReady ? 'electron only — open in Clementine.app to inspect SDK'
+        : desktop?.sdkAvailable === false ? '✗ SDK failed to load'
+        : !desktop?.enabled ? '— SDK disabled (turn ENABLED on, then save settings)'
+        : !desktop?.initialized ? '⚠ SDK not yet initialized — click TEST CONNECTION'
+        : '✓ SDK initialized · region ' + (settings.region || 'us-west-2');
+      const recordingSummary = desktop?.recording
+        ? '✓ recording window ' + (desktop.currentWindowId || '')
+        : 'idle';
+      const detected = Array.isArray(desktop?.detectedWindows) ? desktop.detectedWindows : [];
+      const detectedSummary = detected.length === 0
+        ? 'no meeting windows currently detected'
+        : detected.map((w) => '• ' + (w.platform || 'meeting') + ' · ' + (w.title || w.windowId) + (w.recording ? ' (recording)' : '')).join('\\n');
+      const permEntries = desktop?.permissionStatuses && typeof desktop.permissionStatuses === 'object'
+        ? Object.entries(desktop.permissionStatuses)
+        : [];
+      const permissionSummary = permEntries.length === 0
+        ? 'no permission status received yet — click REQUEST PERMISSIONS'
+        : permEntries
+            .map(([perm, state]) => {
+              const mark = state === 'granted' ? '✓' : state === 'denied' ? '✗' : '⚠';
+              return mark + ' ' + perm + ': ' + state;
+            })
+            .join(' · ');
+
+      const statusRows = [
+        ['Credential', hasKey ? 'connected via ' + (credential.source || 'vault') : 'not configured'],
+        ['Electron bridge', electronReady ? 'available' : 'open in Clementine.app to control recording'],
+        ['SDK', sdkSummary],
+        ['Permissions', permissionSummary],
+        ['Recording', recordingSummary],
+        ['Last event', (desktop?.lastEvent || 'none') + (desktop?.lastEventAt ? ' (' + recordingAt + ')' : '')],
+        ['Last meeting', desktop?.lastMeeting ? [desktop.lastMeeting.platform, desktop.lastMeeting.title].filter(Boolean).join(' · ') || desktop.lastMeeting.windowId : 'none'],
+        ['Detected windows', detectedSummary],
+        ['Error', desktop?.lastError || 'none'],
+      ];
+      listEl.innerHTML = [
+        '<div class="hub-app-card" style="grid-column:1/-1">',
+        '  <div class="hub-app-name">Recall.ai Desktop SDK</div>',
+        '  <span class="hub-app-pill ' + (settings.enabled && hasKey ? 'active' : 'available') + '">' + (settings.enabled && hasKey ? 'READY' : 'OPTIONAL') + '</span>',
+        '  <div class="hub-app-meta">Records only when enabled. Transcripts are saved to the local vault and then handed to Clementine as background analysis tasks.</div>',
+        '  <div class="settings-info" style="margin-top:10px;white-space:pre-wrap">' + statusRows.map(([k, v]) => '<div class="row"><span class="k">' + escMem(k) + '</span><span class="v">' + escMem(v) + '</span></div>').join('') + '</div>',
+        '</div>',
+      ].join('');
+
+      const keyBtn = controlsEl.querySelector('[data-hub-recall-save-key]');
+      if (keyBtn) {
+        keyBtn.addEventListener('click', async () => {
+          const input = controlsEl.querySelector('[data-hub-recall-key]');
+          const value = input?.value?.trim() || '';
+          if (!value) { alert('Paste your Recall.ai API key first.'); return; }
+          keyBtn.textContent = 'SAVING…';
+          const r = await fetch(withToken('/api/console/credentials/set'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: 'recall_api_key', value }),
+          });
+          if (!r.ok) {
+            const j = await r.json().catch(() => ({}));
+            alert('Recall key save failed: ' + (j.error || r.status));
+            keyBtn.textContent = 'SAVE KEY';
+            return;
+          }
+          await Promise.allSettled([refreshHubRecall(), refreshHubKeys(), refreshCredentialsHealth()]);
+        });
+      }
+
+      const saveSettingsBtn = controlsEl.querySelector('[data-hub-recall-save-settings]');
+      if (saveSettingsBtn) {
+        saveSettingsBtn.addEventListener('click', async () => {
+          const next = {
+            enabled: Boolean(controlsEl.querySelector('[data-hub-recall-enabled]')?.checked),
+            autoRecord: Boolean(controlsEl.querySelector('[data-hub-recall-auto]')?.checked),
+            liveTranscript: Boolean(controlsEl.querySelector('[data-hub-recall-live]')?.checked),
+            analyzeOnComplete: Boolean(controlsEl.querySelector('[data-hub-recall-analyze]')?.checked),
+            region: controlsEl.querySelector('[data-hub-recall-region]')?.value || 'us-west-2',
+          };
+          saveSettingsBtn.textContent = 'SAVING…';
+          const r = await fetch(withToken('/api/console/meetings/recall/settings'), {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(next),
+          });
+          const j = await r.json().catch(() => ({}));
+          if (!r.ok) {
+            alert('Recall settings save failed: ' + (j.error || r.status));
+            saveSettingsBtn.textContent = 'SAVE SETTINGS';
+            return;
+          }
+          if (window.clemmy?.recallConfigure) {
+            await window.clemmy.recallConfigure(j.settings || next).catch((err) => alert('Electron setup failed: ' + (err.message || err)));
+          }
+          await refreshHubRecall();
+        });
+      }
+
+      const permBtn = controlsEl.querySelector('[data-hub-recall-perms]');
+      if (permBtn) {
+        permBtn.addEventListener('click', async () => {
+          try { await window.clemmy.recallRequestPermissions(); await refreshHubRecall(); }
+          catch (err) { alert('Permission request failed: ' + (err.message || err)); }
+        });
+      }
+      const testBtn = controlsEl.querySelector('[data-hub-recall-test]');
+      if (testBtn) {
+        testBtn.addEventListener('click', async () => {
+          if (!window.clemmy?.recallTest) {
+            alert('Test Connection requires the Clementine desktop app. Open Clementine.app to run it.');
+            return;
+          }
+          testBtn.textContent = 'TESTING…';
+          try {
+            const result = await window.clemmy.recallTest();
+            // Refresh first so the new state is rendered, then drop a
+            // human-readable summary so the user knows the test actually
+            // returned (vs the silent re-render).
+            await refreshHubRecall();
+            const summary = !result
+              ? 'no result returned'
+              : !result.sdkAvailable
+                ? 'SDK could not load: ' + (result.lastError || 'unknown error')
+                : !result.enabled
+                  ? 'SDK is disabled — turn ENABLED on and save settings, then test again'
+                  : !result.initialized
+                    ? 'SDK loaded but init failed: ' + (result.lastError || 'unknown error')
+                    : 'SDK initialized · ' + (Array.isArray(result.detectedWindows) ? result.detectedWindows.length : 0) + ' detected window(s)';
+            alert('Recall test: ' + summary);
+          } catch (err) {
+            alert('Test failed: ' + (err.message || err));
+          } finally {
+            testBtn.textContent = 'TEST CONNECTION';
+          }
+        });
+      }
+      const manualBtn = controlsEl.querySelector('[data-hub-recall-manual]');
+      if (manualBtn) {
+        manualBtn.addEventListener('click', async () => {
+          if (!confirm('Start a manual desktop audio recording now? Make sure you have consent where required.')) return;
+          try { await window.clemmy.recallStartManual(); await refreshHubRecall(); }
+          catch (err) { alert('Manual recording failed: ' + (err.message || err)); }
+        });
+      }
+      const stopBtn = controlsEl.querySelector('[data-hub-recall-stop]');
+      if (stopBtn) {
+        stopBtn.addEventListener('click', async () => {
+          try { await window.clemmy.recallStop(); await refreshHubRecall(); }
+          catch (err) { alert('Stop failed: ' + (err.message || err)); }
+        });
+      }
+    } catch (err) {
+      listEl.innerHTML = '<div class="settings-info" style="color:var(--accent-fail);">Recall: ' + escMem(err.message || err) + '</div>';
+      metaEl.textContent = 'error';
+    }
+  }
+
+  async function refreshHubMcp() {
+    return renderHubMcp();
+  }
+
+  async function renderHubMcp() {
+    const listEl = document.querySelector('[data-hub-mcp-list]');
+    const metaEl = document.querySelector('[data-hub-mcp-meta]');
+    const summary = document.querySelector('[data-hub-mcp]');
+    if (!listEl || !metaEl) return;
+    try {
+      const data = await fetchJSON('/api/console/mcp-servers');
+      const servers = data.servers || [];
+      const enabled = servers.filter((s) => s.enabled !== false).length;
+      metaEl.textContent = servers.length + ' total · ' + enabled + ' enabled';
+      if (summary) summary.textContent = enabled + '/' + servers.length;
+
+      if (servers.length === 0 && hubMcpEditing !== 'new') {
+        listEl.innerHTML = '<div class="settings-info">— no MCP servers detected. Click + ADD CUSTOM SERVER to wire one in. —</div>';
+        return;
+      }
+
+      listEl.innerHTML = servers.map((s) => {
+        const transport = s.type || 'stdio';
+        const isEditing = hubMcpEditing === s.name;
+        const sourceLabel = s.source === 'user' ? 'CLEMENTINE CONFIG' : 'IMPORTED MCP';
+        const transportLine = transport === 'stdio'
+          ? (s.command ? s.command + (Array.isArray(s.args) ? ' ' + s.args.join(' ') : '') : '')
+          : (s.url || '');
+        return [
+          '<div class="hub-mcp-row" data-hub-mcp-row="' + escMem(s.name) + '">',
+          '  <div>',
+          '    <div class="hub-mcp-name">',
+          '      <span>' + escMem(s.name) + '</span>',
+          '      <span class="pill source-' + escMem(s.source) + '">' + escMem(sourceLabel) + '</span>',
+          '      <span class="pill transport-' + escMem(transport) + '">' + escMem(transport.toUpperCase()) + '</span>',
+          '    </div>',
+          transportLine ? '    <div class="hub-mcp-meta">' + escMem(transportLine) + '</div>' : '',
+          s.description ? '    <div class="hub-mcp-desc">' + escMem(s.description) + '</div>' : '',
+          '  </div>',
+          '  <div class="hub-mcp-actions">',
+          '    <button class="toggle ' + (s.enabled !== false ? 'on' : 'off') + '" data-hub-mcp-toggle="' + escMem(s.name) + '">' + (s.enabled !== false ? '● ENABLED' : '○ DISABLED') + '</button>',
+          '    <button class="edit" data-hub-mcp-edit="' + escMem(s.name) + '">' + (isEditing ? 'CANCEL' : 'EDIT ✎') + '</button>',
+          s.source === 'user' ? '    <button class="del" data-hub-mcp-del="' + escMem(s.name) + '">DELETE ▣</button>' : '',
+          '  </div>',
+          isEditing ? renderHubMcpEditor(s) : '',
+          '</div>',
+        ].join('');
+      }).join('');
+
+      if (hubMcpEditing === 'new') {
+        listEl.insertAdjacentHTML('beforeend', '<div class="hub-mcp-row">' + renderHubMcpEditor(null) + '</div>');
+      }
+
+      bindHubMcpActions();
+    } catch (err) {
+      listEl.innerHTML = '<div class="settings-info" style="color:var(--accent-fail);">Failed: ' + escMem(err.message || err) + '</div>';
+    }
+  }
+
+  function renderHubMcpEditor(s) {
+    const v = s || { name: '', type: 'stdio', command: '', args: [], url: '', description: '', enabled: true };
+    const argsStr = Array.isArray(v.args) ? v.args.join(' ') : '';
+    return [
+      '<div class="hub-mcp-editor" data-hub-mcp-editor-for="' + escMem(s ? s.name : 'new') + '">',
+      s ? '' : '  <div><label>NAME</label><input type="text" data-f="name" value="" placeholder="e.g. internal-airtable, custom-rag, etc." /></div>',
+      '  <div class="row">',
+      '    <div><label>TRANSPORT</label><select data-f="type">',
+           ['stdio','http','sse'].map((opt) => '<option value="' + opt + '"' + (v.type === opt ? ' selected' : '') + '>' + opt + '</option>').join(''),
+      '    </select></div>',
+      '    <div><label>DESCRIPTION</label><input type="text" data-f="description" value="' + escMem(v.description || '') + '" /></div>',
+      '  </div>',
+      '  <div><label>COMMAND (stdio)</label><input type="text" data-f="command" value="' + escMem(v.command || '') + '" placeholder="e.g. npx @modelcontextprotocol/server-filesystem /Users/me/notes" /></div>',
+      '  <div><label>ARGS (space-separated, stdio)</label><input type="text" data-f="args" value="' + escMem(argsStr) + '" placeholder="optional — overrides args from command line" /></div>',
+      '  <div><label>URL (http / sse)</label><input type="text" data-f="url" value="' + escMem(v.url || '') + '" placeholder="https://your-mcp-server.example.com/rpc" /></div>',
+      '  <div class="buttons">',
+      '    <button class="save" data-hub-mcp-save="' + escMem(s ? s.name : 'new') + '">' + (s ? 'SAVE' : 'CREATE') + '</button>',
+      '    <button class="cancel" data-hub-mcp-cancel>CANCEL</button>',
+      '  </div>',
+      '</div>',
+    ].join('');
+  }
+
+  function bindHubMcpActions() {
+    const root = document.querySelector('[data-hub-mcp-list]');
+    if (!root) return;
+
+    root.querySelectorAll('[data-hub-mcp-toggle]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const name = btn.getAttribute('data-hub-mcp-toggle');
+        const enabled = !btn.classList.contains('on');
+        try {
+          const r = await fetch(withToken('/api/console/mcp-servers/' + encodeURIComponent(name)), {
+            method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ enabled }),
+          });
+          if (!r.ok) { const j = await r.json().catch(() => ({})); alert('Toggle failed: ' + (j.error || r.status)); return; }
+          await refreshHubMcp();
+        } catch (err) { alert('Toggle failed: ' + (err.message || err)); }
+      });
+    });
+
+    root.querySelectorAll('[data-hub-mcp-edit]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const name = btn.getAttribute('data-hub-mcp-edit');
+        hubMcpEditing = hubMcpEditing === name ? null : name;
+        renderHubMcp();
+      });
+    });
+
+    root.querySelectorAll('[data-hub-mcp-cancel]').forEach((btn) => {
+      btn.addEventListener('click', () => { hubMcpEditing = null; renderHubMcp(); });
+    });
+
+    root.querySelectorAll('[data-hub-mcp-del]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const name = btn.getAttribute('data-hub-mcp-del');
+        if (!confirm('Delete MCP server "' + name + '"? Only the user override is removed; if another imported MCP client config also has it, it will reappear on next reload.')) return;
+        try {
+          await fetch(withToken('/api/console/mcp-servers/' + encodeURIComponent(name)), { method: 'DELETE' });
+          hubMcpEditing = null;
+          await refreshHubMcp();
+        } catch (err) { alert('Delete failed: ' + (err.message || err)); }
+      });
+    });
+
+    root.querySelectorAll('[data-hub-mcp-save]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const id = btn.getAttribute('data-hub-mcp-save');
+        const editor = root.querySelector('[data-hub-mcp-editor-for="' + id + '"]');
+        if (!editor) return;
+        const patch = {};
+        editor.querySelectorAll('[data-f]').forEach((el) => {
+          const field = el.getAttribute('data-f');
+          if (field === 'args') {
+            const trimmed = el.value.trim();
+            patch.args = trimmed ? trimmed.split(/\\s+/) : [];
+          } else if (el.value !== '') {
+            patch[field] = el.value;
+          }
+        });
+
+        try {
+          if (id === 'new') {
+            if (!patch.name) { alert('name is required'); return; }
+            const r = await fetch(withToken('/api/console/mcp-servers'), {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(patch),
+            });
+            if (!r.ok) { const j = await r.json().catch(() => ({})); alert('Create failed: ' + (j.error || r.status)); return; }
+          } else {
+            const r = await fetch(withToken('/api/console/mcp-servers/' + encodeURIComponent(id)), {
+              method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(patch),
+            });
+            if (!r.ok) { const j = await r.json().catch(() => ({})); alert('Save failed: ' + (j.error || r.status)); return; }
+          }
+          hubMcpEditing = null;
+          await refreshHubMcp();
+        } catch (err) { alert('Save failed: ' + (err.message || err)); }
+      });
+    });
+  }
+
+  async function bootSettingsPanel() {
+    try {
+      const s = await fetchJSON('/api/console/settings');
+      const profile = s.profile || {};
+      ['displayName','preferredName','role','timezone','urgencyTolerance','communicationTone','formality','workingHoursStart','workingHoursEnd','notes'].forEach((k) => setFormValue(sett.profileForm, k, profile[k]));
+
+      const policy = (s.proactivity && s.proactivity.policy) || {};
+      ['enabled','quietHoursEnabled','allowComputerActions','allowComposioActions','allowDiscordCheckIns'].forEach((k) => setFormValue(sett.policyForm, k, policy[k]));
+      ['mode','checkInMinutes','defaultLongTaskMinutes','briefCadenceMinutes','quietHoursStart','quietHoursEnd'].forEach((k) => setFormValue(sett.policyForm, k, policy[k]));
+
+      renderAuthInfo(s.auth);
+      renderMemoryInfo(s.memory);
+      await refreshPlanProposals();
+      await refreshProposals();
+      await refreshCheckIns();
+      await refreshCredentialsHealth();
+    } catch (err) {
+      sett.authBox.innerHTML = '<div style="color:var(--accent-fail);">Failed to load settings: ' + escMem(err.message || err) + '</div>';
+    }
+  }
+
+  // ─── Plan proposals (draft_plan → user review) ────────────────
+
+  async function refreshPlanProposals() {
+    const listEl = document.querySelector('[data-plan-proposals-list]');
+    const metaEl = document.querySelector('[data-plan-proposals-meta]');
+    if (!listEl || !metaEl) return;
+    try {
+      const data = await fetchJSON('/api/console/plan-proposals?status=pending');
+      const items = data.proposals || [];
+      metaEl.textContent = items.length === 0 ? 'no plans' : items.length + ' awaiting review';
+      if (items.length === 0) {
+        listEl.innerHTML = '<div class="settings-info">— no pending plans · agent will surface plans for significant work before mutating —</div>';
+        return;
+      }
+      listEl.innerHTML = items.map((p) => {
+        const plan = p.plan || {};
+        const proposedAt = (p.proposedAt || '').slice(0, 16).replace('T', ' ');
+        const steps = (plan.steps || []).map((s) => (
+          '<li><span class="plan-step-n">' + s.n + '.</span> ' +
+          '<span class="plan-step-action">' + escMem(s.action) + '</span>' +
+          (s.rationale ? '<div class="plan-step-rationale">' + escMem(s.rationale) + '</div>' : '') +
+          (s.verification ? '<div class="plan-step-verify">verify: ' + escMem(s.verification) + '</div>' : '') +
+          '</li>'
+        )).join('');
+        const successCriteria = (plan.successCriteria || []).map((c) => '<li>' + escMem(c) + '</li>').join('');
+        const risks = (plan.risks || []).length > 0
+          ? '<div class="plan-section"><span class="plan-label">RISKS</span><ul class="plan-risks">' + plan.risks.map((r) => '<li>' + escMem(r) + '</li>').join('') + '</ul></div>'
+          : '';
+        const questions = (plan.needsUserInput || []).length > 0
+          ? '<div class="plan-section"><span class="plan-label">QUESTIONS</span><ul class="plan-questions">' + plan.needsUserInput.map((q) => '<li>' + escMem(q) + '</li>').join('') + '</ul></div>'
+          : '';
+        const trackedPill = plan.recommendsTrackedExecution
+          ? '<span class="pill plan-tracked">RECOMMENDS TRACKED EXECUTION</span>'
+          : '';
+        return [
+          '<div class="plan-proposal-row" data-plan-row="' + escMem(p.id) + '">',
+          '  <div class="plan-head">',
+          '    <div class="plan-objective">' + escMem(plan.objective || '(no objective)') + '</div>',
+          '    <div class="plan-meta">',
+          '      <span class="pill complexity-' + escMem(plan.estimatedComplexity || 'unknown') + '">' + escMem((plan.estimatedComplexity || 'unknown').toUpperCase()) + '</span>',
+          '      ' + trackedPill,
+          '      <span>' + ((plan.steps || []).length) + ' step' + ((plan.steps || []).length === 1 ? '' : 's') + '</span>',
+          '      <span>proposed ' + escMem(proposedAt) + '</span>',
+          '    </div>',
+          '  </div>',
+          p.context ? '  <div class="plan-context"><span class="plan-label">CONTEXT</span> ' + escMem(p.context) + '</div>' : '',
+          '  <div class="plan-request"><span class="plan-label">FROM</span> ' + escMem(p.originatingRequest) + '</div>',
+          '  <div class="plan-section"><span class="plan-label">STEPS</span><ol class="plan-steps">' + steps + '</ol></div>',
+          '  <div class="plan-section"><span class="plan-label">SUCCESS</span><ul class="plan-success">' + successCriteria + '</ul></div>',
+          risks,
+          questions,
+          '  <div class="plan-actions">',
+          '    <button class="plan-btn-approve" data-plan-approve="' + escMem(p.id) + '">APPROVE & PROCEED ✓</button>',
+          '    <button class="plan-btn-reject" data-plan-reject="' + escMem(p.id) + '">REJECT ▣</button>',
+          '  </div>',
+          '</div>',
+        ].join('');
+      }).join('');
+
+      bindPlanProposalActions();
+    } catch (err) {
+      listEl.innerHTML = '<div class="settings-info" style="color:var(--accent-fail);">Failed: ' + escMem(err.message || err) + '</div>';
+    }
+  }
+
+  function bindPlanProposalActions() {
+    const root = document.querySelector('[data-plan-proposals-list]');
+    if (!root) return;
+
+    root.querySelectorAll('[data-plan-approve]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const id = btn.getAttribute('data-plan-approve');
+        try {
+          const r = await fetch(withToken('/api/console/plan-proposals/' + encodeURIComponent(id) + '/approve'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({}),
+          });
+          if (!r.ok) {
+            const j = await r.json().catch(() => ({}));
+            alert('Approve failed: ' + (j.error || r.status));
+            return;
+          }
+          await refreshPlanProposals();
+        } catch (err) { alert('Approve failed: ' + (err.message || err)); }
+      });
+    });
+
+    root.querySelectorAll('[data-plan-reject]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const id = btn.getAttribute('data-plan-reject');
+        const reason = prompt('Why are you rejecting this plan? (optional — helps the agent learn)') || '';
+        try {
+          await fetch(withToken('/api/console/plan-proposals/' + encodeURIComponent(id) + '/reject'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ reason }),
+          });
+          await refreshPlanProposals();
+        } catch (err) { alert('Reject failed: ' + (err.message || err)); }
+      });
+    });
+  }
+
+  // ─── Agent-drafted check-in proposals ─────────────────────────
+
+  async function refreshProposals() {
+    const listEl = document.querySelector('[data-proposals-list]');
+    const metaEl = document.querySelector('[data-proposals-meta]');
+    if (!listEl || !metaEl) return;
+    try {
+      const data = await fetchJSON('/api/console/check-in-proposals?status=pending');
+      const items = data.proposals || [];
+      metaEl.textContent = items.length === 0
+        ? 'no proposals'
+        : items.length + ' awaiting review';
+      if (items.length === 0) {
+        listEl.innerHTML = '<div class="settings-info">— no pending proposals · agent will propose new templates as it spots patterns —</div>';
+        return;
+      }
+      listEl.innerHTML = items.map((p) => {
+        const proposedAt = (p.proposedAt || '').slice(0, 16).replace('T', ' ');
+        const triggerDetail = p.trigger === 'schedule'
+          ? ('cron: ' + escMem(p.schedule || '—'))
+          : p.trigger === 'execution_blocked' ? ('>' + (p.blockedHours ?? 24) + 'h blocked')
+          : p.trigger === 'goal_stale' ? ('>' + (p.staleDays ?? 7) + 'd stale')
+          : p.trigger === 'inbox_backed_up' ? ('>=' + (p.inboxThreshold ?? 10) + ' open') : '';
+        const editMode = p.id === editingProposalId;
+        return [
+          '<div class="proposal-row" data-proposal-row="' + escMem(p.id) + '">',
+          '  <div class="proposal-head">',
+          '    <div class="proposal-name">' + escMem(p.name) + '</div>',
+          '    <div class="proposal-meta">',
+          '      <span class="pill trigger-' + escMem(p.trigger) + '">' + escMem(p.trigger.toUpperCase().replace(/_/g, ' ')) + '</span>',
+          '      <span>' + escMem(triggerDetail) + '</span>',
+          '      <span>urgency: ' + escMem(p.urgency || 'normal') + '</span>',
+          '      <span>proposed ' + escMem(proposedAt) + '</span>',
+          '    </div>',
+          '  </div>',
+          '  <div class="proposal-rationale"><span class="proposal-label">RATIONALE</span> ' + escMem(p.rationale) + '</div>',
+          '  <div class="proposal-question"><span class="proposal-label">QUESTION</span> ' + escMem(p.questionTemplate) + '</div>',
+          p.description ? '  <div class="proposal-desc"><span class="proposal-label">DESC</span> ' + escMem(p.description) + '</div>' : '',
+          editMode ? renderProposalEditor(p) : '',
+          '  <div class="proposal-actions">',
+          '    <button class="proposal-btn-approve" data-proposal-approve="' + escMem(p.id) + '">APPROVE & INSTALL ✓</button>',
+          '    <button class="proposal-btn-edit" data-proposal-edit="' + escMem(p.id) + '">' + (editMode ? 'CANCEL EDIT' : 'EDIT BEFORE APPROVE ✎') + '</button>',
+          '    <button class="proposal-btn-reject" data-proposal-reject="' + escMem(p.id) + '">REJECT ▣</button>',
+          '  </div>',
+          '</div>',
+        ].join('');
+      }).join('');
+
+      bindProposalActions();
+    } catch (err) {
+      listEl.innerHTML = '<div class="settings-info" style="color:var(--accent-fail);">Failed: ' + escMem(err.message || err) + '</div>';
+    }
+  }
+
+  let editingProposalId = null;
+
+  function renderProposalEditor(p) {
+    return [
+      '<div class="proposal-editor" data-proposal-editor-for="' + escMem(p.id) + '">',
+      '  <div><label>NAME</label><input type="text" data-pf="name" value="' + escMem(p.name) + '" /></div>',
+      '  <div><label>QUESTION TEMPLATE</label><textarea data-pf="questionTemplate" rows="2">' + escMem(p.questionTemplate) + '</textarea></div>',
+      '  <div class="row">',
+      '    <div><label>SCHEDULE (cron)</label><input type="text" data-pf="schedule" value="' + escMem(p.schedule || '') + '" /></div>',
+      '    <div><label>COOLDOWN (HOURS)</label><input type="number" data-pf="cooldownHours" value="' + (p.cooldownHours ?? 12) + '" /></div>',
+      '  </div>',
+      '  <div><label>URGENCY</label><select data-pf="urgency">',
+           ['low','normal','high'].map((opt) => '<option value="' + opt + '"' + ((p.urgency || 'normal') === opt ? ' selected' : '') + '>' + opt + '</option>').join(''),
+      '  </select></div>',
+      '</div>',
+    ].join('');
+  }
+
+  function bindProposalActions() {
+    const root = document.querySelector('[data-proposals-list]');
+    if (!root) return;
+
+    root.querySelectorAll('[data-proposal-edit]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const id = btn.getAttribute('data-proposal-edit');
+        editingProposalId = editingProposalId === id ? null : id;
+        refreshProposals();
+      });
+    });
+
+    root.querySelectorAll('[data-proposal-approve]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const id = btn.getAttribute('data-proposal-approve');
+        const editor = root.querySelector('[data-proposal-editor-for="' + id + '"]');
+        const overrides = {};
+        if (editor) {
+          editor.querySelectorAll('[data-pf]').forEach((el) => {
+            const field = el.getAttribute('data-pf');
+            if (el.type === 'number') {
+              const n = parseInt(el.value, 10);
+              if (Number.isFinite(n)) overrides[field] = n;
+            } else if (el.value !== '') {
+              overrides[field] = el.value;
+            }
+          });
+        }
+        try {
+          const r = await fetch(withToken('/api/console/check-in-proposals/' + encodeURIComponent(id) + '/approve'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ overrides, enabledOnInstall: true }),
+          });
+          if (!r.ok) {
+            const j = await r.json().catch(() => ({}));
+            alert('Approve failed: ' + (j.error || r.status));
+            return;
+          }
+          editingProposalId = null;
+          await refreshProposals();
+          await refreshCheckIns();
+        } catch (err) { alert('Approve failed: ' + (err.message || err)); }
+      });
+    });
+
+    root.querySelectorAll('[data-proposal-reject]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const id = btn.getAttribute('data-proposal-reject');
+        const reason = prompt('Reason for rejecting? (optional — helps the agent learn)') || '';
+        try {
+          await fetch(withToken('/api/console/check-in-proposals/' + encodeURIComponent(id) + '/reject'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ reason }),
+          });
+          await refreshProposals();
+        } catch (err) { alert('Reject failed: ' + (err.message || err)); }
+      });
+    });
+  }
+
+  // ─── Proactive check-ins (Settings sub-block) ─────────────────
+
+  let editingTemplateId = null;
+  let editingNew = false;
+
+  async function refreshCheckIns() {
+    const listEl = document.querySelector('[data-checkins-list]');
+    const metaEl = document.querySelector('[data-checkins-meta]');
+    if (!listEl || !metaEl) return;
+    try {
+      const data = await fetchJSON('/api/console/check-in-templates');
+      const items = data.templates || [];
+      const enabled = items.filter((t) => t.enabled).length;
+      metaEl.textContent = items.length + ' templates · ' + enabled + ' enabled';
+      if (items.length === 0) {
+        listEl.innerHTML = '<div class="settings-info">— no templates yet · click + NEW TEMPLATE to create one —</div>';
+        return;
+      }
+      listEl.innerHTML = items.map((t) => {
+        const state = t.state || {};
+        const lastFired = state.lastFiredAt ? state.lastFiredAt.slice(0, 16).replace('T', ' ') : 'never';
+        const triggerDetail = t.trigger === 'schedule'
+          ? ('cron: ' + escMem(t.schedule || '—'))
+          : t.trigger === 'execution_blocked' ? ('>' + (t.blockedHours ?? 24) + 'h blocked')
+          : t.trigger === 'goal_stale' ? ('>' + (t.staleDays ?? 7) + 'd stale')
+          : t.trigger === 'inbox_backed_up' ? ('>=' + (t.inboxThreshold ?? 10) + ' open') : '';
+        const editor = editingTemplateId === t.id ? renderEditor(t) : '';
+        return [
+          '<div class="checkin-row" data-checkin-row="' + escMem(t.id) + '">',
+          '  <div class="checkin-main">',
+          '    <div class="checkin-name">' + escMem(t.name) + '</div>',
+          '    <div class="checkin-meta">',
+          '      <span class="pill trigger-' + escMem(t.trigger) + '">' + escMem(t.trigger.toUpperCase().replace('_', ' ')) + '</span>',
+          '      <span>' + escMem(triggerDetail) + '</span>',
+          '      <span>cooldown ' + (t.cooldownHours ?? 0) + 'h</span>',
+          '      <span>last fired: ' + escMem(lastFired) + '</span>',
+          '      <span>urgency: ' + escMem(t.urgency) + '</span>',
+          '    </div>',
+          t.description ? '    <div class="checkin-desc">' + escMem(t.description) + '</div>' : '',
+          '  </div>',
+          '  <div class="checkin-actions">',
+          '    <button class="toggle ' + (t.enabled ? 'on' : 'off') + '" data-toggle="' + escMem(t.id) + '">' + (t.enabled ? '● ENABLED' : '○ DISABLED') + '</button>',
+          '    <button class="test" data-test="' + escMem(t.id) + '">TEST FIRE ⌗</button>',
+          '    <button class="edit" data-edit="' + escMem(t.id) + '">EDIT ✎</button>',
+          '    <button class="del" data-del="' + escMem(t.id) + '">DELETE ▣</button>',
+          '  </div>',
+               editor,
+          '</div>',
+        ].join('');
+      }).join('');
+
+      if (editingNew) {
+        listEl.insertAdjacentHTML('beforeend', renderEditor(null));
+      }
+
+      bindCheckInActions();
+    } catch (err) {
+      listEl.innerHTML = '<div class="settings-info" style="color:var(--accent-fail);">Failed: ' + escMem(err.message || err) + '</div>';
+    }
+  }
+
+  function renderEditor(t) {
+    const v = t || {
+      name: '', description: '', trigger: 'schedule',
+      schedule: '0 9 * * 1', blockedHours: 24, staleDays: 7, inboxThreshold: 10,
+      questionTemplate: '', urgency: 'normal', cooldownHours: 12,
+    };
+    return [
+      '<div class="checkin-editor" data-editor-for="' + escMem(t ? t.id : 'new') + '">',
+      '  <div><label>NAME</label><input type="text" data-f="name" value="' + escMem(v.name) + '" /></div>',
+      '  <div><label>DESCRIPTION</label><input type="text" data-f="description" value="' + escMem(v.description) + '" /></div>',
+      '  <div class="row">',
+      '    <div><label>TRIGGER</label><select data-f="trigger">',
+           ['schedule','execution_blocked','goal_stale','inbox_backed_up'].map((opt) =>
+             '<option value="' + opt + '"' + (v.trigger === opt ? ' selected' : '') + '>' + opt + '</option>'
+           ).join(''),
+      '    </select></div>',
+      '    <div><label>URGENCY</label><select data-f="urgency">',
+           ['low','normal','high'].map((opt) => '<option value="' + opt + '"' + (v.urgency === opt ? ' selected' : '') + '>' + opt + '</option>').join(''),
+      '    </select></div>',
+      '  </div>',
+      '  <div class="row">',
+      '    <div><label>SCHEDULE (cron, when trigger=schedule)</label><input type="text" data-f="schedule" value="' + escMem(v.schedule || '0 9 * * 1') + '" placeholder="0 9 * * 1" /></div>',
+      '    <div><label>COOLDOWN (HOURS)</label><input type="number" data-f="cooldownHours" value="' + (v.cooldownHours ?? 12) + '" /></div>',
+      '  </div>',
+      '  <div class="row">',
+      '    <div><label>BLOCKED HOURS (execution_blocked)</label><input type="number" data-f="blockedHours" value="' + (v.blockedHours ?? 24) + '" /></div>',
+      '    <div><label>STALE DAYS / INBOX THRESHOLD</label><input type="number" data-f="staleDays" value="' + (v.staleDays ?? v.inboxThreshold ?? 7) + '" /></div>',
+      '  </div>',
+      '  <div><label>QUESTION TEMPLATE</label><textarea data-f="questionTemplate" rows="3" placeholder="What is on your plate this week?">' + escMem(v.questionTemplate) + '</textarea></div>',
+      '  <div class="editor-buttons">',
+      '    <button class="save" data-save="' + escMem(t ? t.id : 'new') + '">' + (t ? 'SAVE' : 'CREATE') + '</button>',
+      '    <button class="cancel" data-cancel="' + escMem(t ? t.id : 'new') + '">CANCEL</button>',
+      '  </div>',
+      '</div>',
+    ].join('');
+  }
+
+  function bindCheckInActions() {
+    const root = document.querySelector('[data-checkins-list]');
+    if (!root) return;
+
+    root.querySelectorAll('[data-toggle]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const id = btn.getAttribute('data-toggle');
+        const isOn = btn.classList.contains('on');
+        try {
+          await fetch(withToken('/api/console/check-in-templates/' + encodeURIComponent(id)), {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ enabled: !isOn }),
+          });
+          await refreshCheckIns();
+        } catch (err) { alert('Toggle failed: ' + (err.message || err)); }
+      });
+    });
+    root.querySelectorAll('[data-test]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const id = btn.getAttribute('data-test');
+        if (!confirm('Fire this template now (bypassing cooldown)?\\nThe agent will create an open check-in immediately.')) return;
+        try {
+          const r = await fetch(withToken('/api/console/check-in-templates/' + encodeURIComponent(id) + '/test'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ bypassCooldown: true }),
+          });
+          const j = await r.json();
+          if (j.ok) alert('Fired. Check-in id: ' + j.checkInId);
+          else alert('Fire failed: ' + (j.reason || r.status));
+          await refreshCheckIns();
+        } catch (err) { alert('Fire failed: ' + (err.message || err)); }
+      });
+    });
+    root.querySelectorAll('[data-edit]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        editingTemplateId = btn.getAttribute('data-edit');
+        editingNew = false;
+        refreshCheckIns();
+      });
+    });
+    root.querySelectorAll('[data-del]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const id = btn.getAttribute('data-del');
+        if (!confirm('Delete this template? This cannot be undone.')) return;
+        try {
+          await fetch(withToken('/api/console/check-in-templates/' + encodeURIComponent(id)), { method: 'DELETE' });
+          await refreshCheckIns();
+        } catch (err) { alert('Delete failed: ' + (err.message || err)); }
+      });
+    });
+    root.querySelectorAll('[data-cancel]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        editingTemplateId = null;
+        editingNew = false;
+        refreshCheckIns();
+      });
+    });
+    root.querySelectorAll('[data-save]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const id = btn.getAttribute('data-save');
+        const editor = root.querySelector('[data-editor-for="' + id + '"]');
+        if (!editor) return;
+        const patch = {};
+        editor.querySelectorAll('[data-f]').forEach((el) => {
+          const field = el.getAttribute('data-f');
+          if (el.type === 'number') {
+            const n = parseInt(el.value, 10);
+            if (Number.isFinite(n)) patch[field] = n;
+          } else {
+            patch[field] = el.value;
+          }
+        });
+        // Normalize staleDays vs inboxThreshold based on trigger
+        if (patch.trigger === 'inbox_backed_up' && patch.staleDays !== undefined) {
+          patch.inboxThreshold = patch.staleDays;
+          delete patch.staleDays;
+        }
+
+        try {
+          if (id === 'new') {
+            if (!patch.name || !patch.questionTemplate) { alert('name + question required'); return; }
+            const r = await fetch(withToken('/api/console/check-in-templates'), {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(patch),
+            });
+            if (!r.ok) { const j = await r.json().catch(() => ({})); alert('Create failed: ' + (j.error || r.status)); return; }
+            editingNew = false;
+          } else {
+            await fetch(withToken('/api/console/check-in-templates/' + encodeURIComponent(id)), {
+              method: 'PATCH',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(patch),
+            });
+            editingTemplateId = null;
+          }
+          await refreshCheckIns();
+        } catch (err) { alert('Save failed: ' + (err.message || err)); }
+      });
+    });
+  }
+
+  // Top-level new-template button
+  const newCheckInBtn = document.querySelector('[data-checkins-new]');
+  if (newCheckInBtn) {
+    newCheckInBtn.addEventListener('click', () => {
+      editingNew = true;
+      editingTemplateId = null;
+      refreshCheckIns();
+    });
+  }
+
+  async function refreshCredentialsHealth() {
+    const listEl = document.querySelector('[data-creds-list]');
+    const metaEl = document.querySelector('[data-creds-meta]');
+    if (!listEl || !metaEl) return;
+    try {
+      const data = await fetchJSON('/api/console/credentials');
+      const rows = data.rows || [];
+      const descriptors = data.descriptors || {};
+      const auth = data.auth || null;
+      const unreadable = rows.filter((r) => r.status === 'unreadable' || r.status === 'needs_repair').length;
+      metaEl.textContent = (auth?.configured ? 'runtime ready via ' + runtimeAuthLabel(auth) : 'runtime auth needs setup')
+        + ' · ' + (hasOpenAiApiKey(auth) ? 'OpenAI key ready' : 'OpenAI key optional')
+        + (unreadable ? ' · ' + unreadable + ' need repair' : '');
+
+      listEl.innerHTML = rows.map((r) => {
+        const d = descriptors[r.name] || {};
+        const display = displayCredentialStatus(r, d, auth);
+        const runtimeCredentialReady = display.className === 'runtime_ready'
+          && (r.name === 'codex_oauth_access_token' || r.name === 'codex_oauth_refresh_token');
+        return [
+          '<div class="cred-row" data-cred-row="' + escMem(r.name) + '">',
+          '  <div class="cred-main">',
+          '    <div class="cred-name">' + escMem(credentialDisplayName(r.name)) + '</div>',
+          '    <div class="cred-meta">',
+          '      <span class="cred-status ' + escMem(display.className) + '">' + escMem(display.label) + '</span>',
+          display.source && display.source !== 'none' ? '      <span class="cred-source ' + escMem(display.source) + '">' + escMem(display.source.toUpperCase()) + '</span>' : '',
+          r.lastSetAt ? '      <span>set ' + escMem(r.lastSetAt.slice(0, 16).replace("T", " ")) + '</span>' : '',
+          d.envVarName ? '      <span>env: ' + escMem(d.envVarName) + '</span>' : '',
+          '    </div>',
+          credentialDescription(r.name, d) ? '    <div class="cred-desc">' + escMem(credentialDescription(r.name, d)) + '</div>' : '',
+          d.setupHint ? '    <div class="cred-hint">' + escMem(d.setupHint) + '</div>' : '',
+          '    <div class="cred-set-input-wrap" data-cred-set-wrap="' + escMem(r.name) + '">',
+          '      <input type="password" class="cred-set-input" data-cred-set-input="' + escMem(r.name) + '" placeholder="paste value…" autocomplete="off" />',
+          '      <div class="cred-set-buttons">',
+          '        <button class="cancel" type="button" data-cred-set-cancel="' + escMem(r.name) + '">CANCEL</button>',
+          '        <button class="save" type="button" data-cred-set-save="' + escMem(r.name) + '">SAVE</button>',
+          '      </div>',
+          '    </div>',
+          '  </div>',
+          '  <div class="cred-actions">',
+          runtimeCredentialReady
+            ? '    <span class="cred-action-note">ACTIVE VIA AUTH STORE</span>'
+            : '    <button class="cred-set" type="button" data-cred-set="' + escMem(r.name) + '">' + (r.hasValue ? 'REPLACE' : 'SET') + ' ✎</button>',
+          (!runtimeCredentialReady && r.status === 'env_only')
+            ? '    <button class="cred-migrate" type="button" data-cred-migrate="' + escMem(r.name) + '">MOVE TO VAULT ⇢</button>'
+            : '',
+          (!runtimeCredentialReady && r.hasValue) ? '    <button class="cred-delete" type="button" data-cred-delete="' + escMem(r.name) + '">DELETE ▣</button>' : '',
+          '  </div>',
+          '</div>',
+        ].join('');
+      }).join('');
+      bindCredentialActions();
+    } catch (err) {
+      listEl.innerHTML = '<div class="settings-info" style="color:var(--accent-fail);">Failed: ' + escMem(err.message || err) + '</div>';
+    }
+  }
+
+  function bindCredentialActions() {
+    const root = document.querySelector('[data-creds-list]');
+    if (!root) return;
+
+    root.querySelectorAll('[data-cred-set]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const name = btn.getAttribute('data-cred-set');
+        const wrap = root.querySelector('[data-cred-set-wrap="' + name + '"]');
+        if (wrap) {
+          wrap.classList.add('open');
+          const input = wrap.querySelector('input');
+          if (input) input.focus();
+        }
+      });
+    });
+    root.querySelectorAll('[data-cred-set-cancel]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const name = btn.getAttribute('data-cred-set-cancel');
+        const wrap = root.querySelector('[data-cred-set-wrap="' + name + '"]');
+        if (wrap) wrap.classList.remove('open');
+      });
+    });
+    root.querySelectorAll('[data-cred-set-save]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const name = btn.getAttribute('data-cred-set-save');
+        const input = root.querySelector('[data-cred-set-input="' + name + '"]');
+        const value = input?.value?.trim();
+        if (!name || !value) return;
+        btn.textContent = 'SAVING…';
+        try {
+          const r = await fetch(withToken('/api/console/credentials/set'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name, value }),
+          });
+          if (!r.ok) {
+            const j = await r.json().catch(() => ({}));
+            alert('Save failed: ' + (j.error || r.status));
+            btn.textContent = 'SAVE';
+            return;
+          }
+          await refreshCredentialsHealth();
+        } catch (err) {
+          alert('Save failed: ' + (err.message || err));
+          btn.textContent = 'SAVE';
+        }
+      });
+    });
+    root.querySelectorAll('[data-cred-migrate]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const name = btn.getAttribute('data-cred-migrate');
+        if (!confirm('Move ' + name + ' from .env into the local vault?\\n\\nYour .env stays intact — the vault gets the value as its new primary source.')) return;
+        try {
+          const r = await fetch(withToken('/api/console/credentials/migrate'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name, from: 'env', to: 'file' }),
+          });
+          if (!r.ok) { const j = await r.json().catch(() => ({})); alert('Migrate failed: ' + (j.error || r.status)); return; }
+          await refreshCredentialsHealth();
+        } catch (err) { alert('Migrate failed: ' + (err.message || err)); }
+      });
+    });
+    root.querySelectorAll('[data-cred-delete]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const name = btn.getAttribute('data-cred-delete');
+        if (!confirm('Delete ' + name + ' from vault + keychain?\\n\\nYour .env (if set) is never touched.')) return;
+        try {
+          await fetch(withToken('/api/console/credentials/' + encodeURIComponent(name)), { method: 'DELETE' });
+          await refreshCredentialsHealth();
+        } catch (err) { alert('Delete failed: ' + (err.message || err)); }
+      });
+    });
+  }
+
+  const repairBtn = document.querySelector('[data-creds-repair]');
+  const resetBtn  = document.querySelector('[data-creds-reset]');
+  if (repairBtn) {
+    repairBtn.addEventListener('click', async () => {
+      repairBtn.textContent = 'REPAIRING…';
+      try {
+        const r = await fetch(withToken('/api/console/credentials/repair-keychain'), { method: 'POST' });
+        const j = await r.json();
+        if (!j.probed) {
+          alert('Keychain not available — keytar is not installed in this build.\\nThis is expected for the daemon-only / CLI install; install the desktop app to use Keychain.');
+        } else {
+          alert('Keychain repair complete. Tested ' + j.tested + ' credentials, recovered ' + (j.recovered?.length || 0) + ' to keychain status.');
+        }
+        await refreshCredentialsHealth();
+      } catch (err) {
+        alert('Repair failed: ' + (err.message || err));
+      } finally {
+        repairBtn.textContent = 'REPAIR KEYCHAIN ⟲';
+      }
+    });
+  }
+  if (resetBtn) {
+    resetBtn.addEventListener('click', async () => {
+      if (!confirm('Reset ALL Clementine credentials?\\n\\nThis deletes:\\n  • all keychain entries under com.clemmy.desktop.v1\\n  • the local file vault (~/.clementine-next/state/secrets-vault.json)\\n  • the credentials metadata file\\n\\nYour .env files are NEVER touched.\\nProceed?')) return;
+      resetBtn.textContent = 'RESETTING…';
+      try {
+        const r = await fetch(withToken('/api/console/credentials/reset'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ confirm: true }),
+        });
+        const j = await r.json();
+        alert('Reset complete.\\n\\nKeychain entries removed: ' + (j.keychainDeleted?.length || 0) + '\\nFile vault deleted: ' + j.fileVaultDeleted + '\\nMetadata deleted: ' + j.metaDeleted);
+        await refreshCredentialsHealth();
+      } catch (err) {
+        alert('Reset failed: ' + (err.message || err));
+      } finally {
+        resetBtn.textContent = 'RESET CREDENTIALS ▣';
+      }
+    });
+  }
+
+  function renderAuthInfo(auth) {
+    if (!auth) { sett.authBox.textContent = '—'; return; }
+    const codexReady = hasCodexRuntimeAuth(auth);
+    const apiKeyReady = hasOpenAiApiKey(auth);
+    const rows = [
+      ['Agent runtime',  auth.configured ? 'ready' : 'needs sign-in'],
+      ['Runtime path',   runtimeAuthLabel(auth)],
+      ['Mode',           auth.mode || '—'],
+      ['Source',         auth.source || '—'],
+      ['Codex OAuth',    codexReady ? 'connected' : 'not connected'],
+      ['OpenAI API key', apiKeyReady ? 'available for embeddings + live voice' : 'optional: embeddings + live voice disabled'],
+      auth.codexAccountId ? ['Codex account', auth.codexAccountId] : null,
+    ];
+    sett.authBox.innerHTML = rows.filter(Boolean).map(([k, v]) => {
+      const text = String(v);
+      const off = text.includes('needs') || text.includes('not connected') || text.includes('disabled');
+      return '<div class="row"><span class="k">' + escMem(k) + '</span><span class="v ' + (off ? 'off' : 'on') + '">' + escMem(text) + '</span></div>';
+    }).join('') + '<p class="settings-note">Codex OAuth is the agent runtime auth. The OpenAI API key is a separate optional capability key for semantic embeddings, Realtime live voice, and direct API-only features.</p>';
+  }
+
+  function renderMemoryInfo(m) {
+    if (!m) { sett.memoryBox.textContent = '—'; return; }
+    const rows = [
+      ['Chunks',          m.chunks ?? '—'],
+      ['Files',           m.indexedFiles ?? '—'],
+      ['Active facts',    m.activeFacts ?? '—'],
+      ['Total facts',     m.totalFacts ?? '—'],
+      ['Embeddings',      m.embeddingsEnabled ? (m.embeddingsCount + ' vectors · ' + Math.round((m.embeddingsCoverage || 0) * 100) + '%') : 'disabled (optional OpenAI API key required)'],
+      ['DB size',         (m.dbBytes ?? 0) + ' bytes'],
+    ];
+    sett.memoryBox.innerHTML = rows.map(([k, v]) => {
+      const cls = String(v).startsWith('disabled') ? 'off' : 'on';
+      return '<div class="row"><span class="k">' + escMem(k) + '</span><span class="v ' + cls + '">' + escMem(String(v)) + '</span></div>';
+    }).join('');
+  }
+
+  sett.profileForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const btn = sett.profileForm.querySelector('button[type="submit"]');
+    btn.disabled = true;
+    try {
+      const patch = getFormPatch(sett.profileForm);
+      const r = await fetch(withToken('/api/console/settings/profile'), {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(patch),
+      });
+      btn.disabled = false;
+      btn.textContent = r.ok ? 'SAVED ✓' : 'FAILED';
+      setTimeout(() => { btn.textContent = 'SAVE PROFILE ✎'; }, 1400);
+    } catch (err) {
+      btn.disabled = false;
+      btn.textContent = 'FAILED';
+      setTimeout(() => { btn.textContent = 'SAVE PROFILE ✎'; }, 1400);
+    }
+  });
+
+  sett.policyForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const btn = sett.policyForm.querySelector('button[type="submit"]');
+    btn.disabled = true;
+    try {
+      const patch = getFormPatch(sett.policyForm);
+      const r = await fetch(withToken('/api/console/settings/policy'), {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(patch),
+      });
+      btn.disabled = false;
+      btn.textContent = r.ok ? 'SAVED ✓' : 'FAILED';
+      setTimeout(() => { btn.textContent = 'SAVE POLICY ✎'; }, 1400);
+    } catch (err) {
+      btn.disabled = false;
+      btn.textContent = 'FAILED';
+      setTimeout(() => { btn.textContent = 'SAVE POLICY ✎'; }, 1400);
+    }
+  });
+
   // Boot the loop.
+  wireMemoryViewToggle();
+  wireMemoryGraphControls();
+  // Home is the default panel, but honor deep links like
+  // /dashboard?token=...#memory after the stale-dashboard redirect.
+  switchPanel(panelFromHash());
+  window.addEventListener('hashchange', () => switchPanel(panelFromHash()));
   tick();
   setInterval(tick, POLL_MS);
+
+  // ── Nav-dock data wiring ──────────────────────────────────────────
+  // Pulls live state from the same endpoints the home panel uses, plus
+  // the recall IPC for live voice. Refreshes every 5s — same cadence
+  // as the existing home command center.
+  async function refreshDockNow() {
+    try {
+      const data = await fetchJSON('/api/console/home/agenda');
+      const working = (data.working ?? []).length;
+      const approvals = (data.needsYou ?? []).filter((e) => e && e.kind === 'approval').length;
+      const presence = document.querySelector('[data-dock-now-presence]');
+      const label = document.querySelector('[data-dock-now-label]');
+      const detail = document.querySelector('[data-dock-now-detail]');
+      const tick = document.querySelector('[data-dock-now-tick]');
+      if (!presence || !label || !detail || !tick) return;
+      if (working > 0) {
+        presence.className = 'presence-dot working';
+        label.textContent = 'working';
+        detail.textContent = (data.working[0].title || data.working[0].id || 'running').slice(0, 60);
+        tick.textContent = String(working);
+      } else if (approvals > 0) {
+        presence.className = 'presence-dot needs-you';
+        label.textContent = 'needs you';
+        detail.textContent = (data.needsYou[0].title || 'approval pending').slice(0, 60);
+        tick.textContent = String(approvals);
+      } else {
+        presence.className = 'presence-dot';
+        label.textContent = 'idle';
+        detail.textContent = 'awaiting';
+        tick.textContent = '—';
+      }
+    } catch { /* network blip — keep last state */ }
+  }
+
+  async function refreshDockGoal() {
+    // No dedicated /goal list endpoint yet — we hit the chat endpoint
+    // for /goal status from the home session. Falls back silently
+    // when there's no goal active.
+    const card = document.querySelector('[data-dock-goal]');
+    if (!card) return;
+    try {
+      const r = await fetch(withToken('/api/console/home/chat'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: '/goal status' }),
+      });
+      const j = await r.json();
+      const text = String(j?.text || '');
+      // Parse the human-readable goal-state string. Pattern is
+      // "Goal active (N/M): ..." or "Goal paused at N/M — ..." etc.
+      const m = text.match(/Goal (\\w+)\\s*\\(?(\\d+)\\/(\\d+)\\)?[:\\s—-]+\\s*(.+)/i);
+      if (m && (m[1] === 'active' || m[1] === 'paused')) {
+        const used = parseInt(m[2], 10), total = parseInt(m[3], 10);
+        const obj = m[4].replace(/^[\"']|[\"']$/g, '').trim();
+        const objective = document.querySelector('[data-dock-goal-objective]');
+        const turns = document.querySelector('[data-dock-goal-turns]');
+        const progress = document.querySelector('[data-dock-goal-progress]');
+        const judge = document.querySelector('[data-dock-goal-judge]');
+        if (objective) objective.textContent = obj.slice(0, 60);
+        if (turns) turns.textContent = used + '/' + total;
+        if (progress) progress.style.width = Math.round((used / Math.max(1, total)) * 100) + '%';
+        if (judge) judge.textContent = m[1].toUpperCase();
+        card.hidden = false;
+      } else {
+        card.hidden = true;
+      }
+    } catch {
+      card.hidden = true;
+    }
+  }
+
+  async function refreshDockLive() {
+    const phase = document.querySelector('[data-dock-live-phase]');
+    const status = document.querySelector('[data-dock-live-status]');
+    const meta = document.querySelector('[data-dock-live-meta]');
+    const card = document.querySelector('[data-dock-live]');
+    if (!phase || !status || !meta || !card) return;
+    let recall = null;
+    if (window.clemmy?.recallStatus) {
+      try { recall = await window.clemmy.recallStatus(); } catch { /* ignore */ }
+    }
+    if (recall?.recording) {
+      card.classList.add('live');
+      phase.textContent = 'REC';
+      status.textContent = (recall.lastMeeting?.title || 'recording').slice(0, 40);
+      meta.textContent = recall.lastMeeting?.platform || 'meeting capture';
+      return;
+    }
+    if (recall?.enabled && recall?.initialized) {
+      card.classList.remove('live');
+      phase.textContent = 'WATCH';
+      status.textContent = 'waiting for meeting';
+      meta.textContent = 'recall.ai · ' + (recall.settings?.region || 'us-west-2');
+      return;
+    }
+    card.classList.remove('live');
+    phase.textContent = 'STANDBY';
+    status.textContent = 'tap orb to talk';
+    meta.textContent = recall ? 'sdk loaded' : 'electron only';
+  }
+
+  async function refreshDockRecent() {
+    const list = document.querySelector('[data-dock-recent-list]');
+    const count = document.querySelector('[data-dock-recent-count]');
+    if (!list || !count) return;
+    try {
+      const data = await fetchJSON('/api/console/tool-events/recent?limit=6');
+      const events = Array.isArray(data?.events) ? data.events : [];
+      count.textContent = String(events.length);
+      if (events.length === 0) {
+        list.innerHTML = '<div class="dock-empty">— quiet —</div>';
+        return;
+      }
+      list.innerHTML = events.map((e) => {
+        const t = e.at ? new Date(e.at).toLocaleTimeString().replace(/:[0-9]{2}\\s/, ' ') : '—';
+        const ok = e.outcome === 'success' ? 'ok'
+          : e.outcome === 'error' ? 'err'
+          : e.phase === 'pending-approval' ? 'warn'
+          : '';
+        const glyph = ok === 'ok' ? '✓' : ok === 'err' ? '✗' : ok === 'warn' ? '⚠' : '·';
+        return '<div class="dock-recent-row ' + ok + '"><span class="t">' + escMem(t) + '</span><span class="n">' + glyph + ' ' + escMem(e.toolName || '?') + '</span></div>';
+      }).join('');
+    } catch {
+      list.innerHTML = '<div class="dock-empty">— activity feed offline —</div>';
+    }
+  }
+
+  async function refreshDockHealth() {
+    try {
+      const data = await fetchJSON('/api/console/health');
+      const cells = {
+        daemon: document.querySelector('[data-dock-health-daemon]'),
+        db: document.querySelector('[data-dock-health-db]'),
+        mcp: document.querySelector('[data-dock-health-mcp]'),
+        composio: document.querySelector('[data-dock-health-composio]'),
+      };
+      const overall = document.querySelector('[data-dock-health-overall]');
+      const setCell = (cell, state) => {
+        if (!cell) return;
+        cell.classList.remove('warn', 'err');
+        if (state === 'warn') cell.classList.add('warn');
+        if (state === 'err') cell.classList.add('err');
+        const dot = cell.querySelector('.presence-dot');
+        if (dot) {
+          dot.className = 'presence-dot' + (state === 'warn' ? ' warn' : state === 'err' ? ' offline' : '');
+        }
+      };
+      setCell(cells.daemon, data?.daemon || 'ok');
+      setCell(cells.db, data?.memoryDb || 'ok');
+      setCell(cells.mcp, data?.mcp || 'ok');
+      setCell(cells.composio, data?.composio || 'ok');
+      if (overall) {
+        const states = [data?.daemon, data?.memoryDb, data?.mcp, data?.composio];
+        const tone = states.includes('err') ? '✗' : states.includes('warn') ? '⚠' : '✓';
+        overall.textContent = tone;
+      }
+    } catch {
+      // Endpoint may not exist yet — surface unknown rather than error.
+      const overall = document.querySelector('[data-dock-health-overall]');
+      if (overall) overall.textContent = '—';
+    }
+  }
+
+  function refreshNavDock() {
+    refreshDockNow();
+    refreshDockGoal();
+    refreshDockLive();
+    refreshDockRecent();
+    refreshDockHealth();
+  }
+  refreshNavDock();
+  setInterval(refreshNavDock, 5000);
 })();
 `;

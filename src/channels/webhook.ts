@@ -8,7 +8,6 @@ import matter from 'gray-matter';
 import { ClementineAssistant } from '../assistant/core.js';
 import { BASE_DIR, WEBHOOK_PORT, WEBHOOK_SECRET } from '../config.js';
 import { DASHBOARD_CRON_RUNS_DIR, buildDashboardSnapshot, loadCronJobs, loadWorkflows, readDaemonState, readRecentJsonLines, readWorkflowRuns } from '../dashboard/state.js';
-import { renderDashboardHtml } from '../dashboard/page.js';
 import { registerConsoleRoutes } from '../dashboard/console-routes.js';
 import {
   addNotification,
@@ -40,7 +39,13 @@ import { addRunEvent, finishRun, getRun, listRuns, startRun } from '../runtime/r
 import { readMemoryIndexStatus, rebuildVaultIndex } from '../memory/indexer.js';
 import { embedMissingChunks } from '../memory/embeddings.js';
 import { CRON_FILE } from '../memory/vault.js';
-import { cancelBackgroundTask, createBackgroundTask, getBackgroundTask, resumeBackgroundTask } from '../execution/background-tasks.js';
+import {
+  cancelBackgroundTask,
+  createBackgroundTask,
+  getBackgroundTask,
+  queueBackgroundTaskApprovalResolution,
+  resumeBackgroundTask,
+} from '../execution/background-tasks.js';
 import { saveProactivityPolicy } from '../agents/proactivity-policy.js';
 
 const logger = pino({ name: 'clementine-next.webhook' });
@@ -170,19 +175,41 @@ function queueRunRetry(run: NonNullable<ReturnType<typeof getRun>>) {
   return { task, retryRun };
 }
 
+async function resolveApprovalOrQueueBackgroundContinuation(
+  assistant: ClementineAssistant,
+  approvalId: string,
+  approved: boolean,
+) {
+  const queued = queueBackgroundTaskApprovalResolution(approvalId, approved);
+  if (queued) {
+    return {
+      approvalId,
+      status: approved ? 'approved' as const : 'rejected' as const,
+      sessionId: queued.runSessionId,
+      text: `Queued background task continuation: ${queued.id}. The daemon will resume the paused SDK run.`,
+      queuedTaskId: queued.id,
+    };
+  }
+  return assistant.getRuntime().resolveApproval(approvalId, approved);
+}
+
 export async function startWebhookServer(assistant: ClementineAssistant): Promise<void> {
   const app = express();
   app.use(express.json());
   app.use(express.urlencoded({ extended: true }));
 
-  function redirectDashboard(res: express.Response, token: string, flash?: { kind: 'success' | 'error'; text: string }): void {
-    const url = new URL('/dashboard', 'http://localhost');
+  function buildConsoleRedirectPath(token: string, flash?: { kind: 'success' | 'error'; text: string }): string {
+    const url = new URL('/console', 'http://localhost');
     url.searchParams.set('token', token);
     if (flash) {
       url.searchParams.set('flash', flash.kind);
       url.searchParams.set('message', flash.text);
     }
-    res.redirect(`${url.pathname}?${url.searchParams.toString()}`);
+    return `${url.pathname}?${url.searchParams.toString()}`;
+  }
+
+  function redirectDashboard(res: express.Response, token: string, flash?: { kind: 'success' | 'error'; text: string }): void {
+    res.redirect(buildConsoleRedirectPath(token, flash));
   }
 
   function isAuthorized(req: express.Request): boolean {
@@ -408,24 +435,25 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
     }
   });
 
-  // /console — new parallel dashboard surface. Coexists with /dashboard;
-  // own visual language and growing surface area (workflows, memory
-  // navigator, project picker, etc.). See src/dashboard/console.ts.
-  registerConsoleRoutes(app, isAuthorized);
+  // /console is the primary UI surface. /dashboard remains only as a
+  // compatibility redirect for stale bookmarks and older local installs.
+  registerConsoleRoutes(app, isAuthorized, assistant);
 
-  app.get('/dashboard', async (req, res) => {
+  app.get('/dashboard', (req, res) => {
     if (!isAuthorized(req)) {
       res.status(401).send('Unauthorized');
       return;
     }
-    const queryToken = typeof req.query.token === 'string' ? req.query.token : WEBHOOK_SECRET;
-    const flashKind = req.query.flash === 'success' || req.query.flash === 'error' ? req.query.flash : undefined;
-    const flashText = typeof req.query.message === 'string' ? req.query.message : '';
-    res.type('html').send(await renderDashboardHtml(
-      assistant.getRuntime().listPendingApprovals(),
-      queryToken,
-      flashKind && flashText ? { kind: flashKind, text: flashText } : undefined,
-    ));
+    const url = new URL('/console', 'http://localhost');
+    for (const [key, value] of Object.entries(req.query)) {
+      if (typeof value === 'string') {
+        url.searchParams.set(key, value);
+      }
+    }
+    if (!url.searchParams.has('token')) {
+      url.searchParams.set('token', WEBHOOK_SECRET);
+    }
+    res.redirect(302, `${url.pathname}?${url.searchParams.toString()}`);
   });
 
   app.post('/dashboard/actions/composio/api-key', (req, res) => {
@@ -452,7 +480,7 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
     const token = typeof req.query.token === 'string' ? req.query.token : WEBHOOK_SECRET;
     const apiKey = typeof req.body.api_key === 'string' ? req.body.api_key.trim() : '';
     if (!apiKey) {
-      redirectDashboard(res, token, { kind: 'error', text: 'OpenAI API key is required.' });
+      redirectDashboard(res, token, { kind: 'error', text: 'OpenAI capability key is required for this optional feature.' });
       return;
     }
     const envPath = path.join(BASE_DIR, '.env');
@@ -460,7 +488,7 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
     current.OPENAI_API_KEY = apiKey;
     writeEnvFile(envPath, current);
     process.env.OPENAI_API_KEY = apiKey;
-    redirectDashboard(res, token, { kind: 'success', text: 'OpenAI API key saved for semantic memory embeddings.' });
+    redirectDashboard(res, token, { kind: 'success', text: 'OpenAI capability key saved for semantic memory embeddings and live voice.' });
   });
 
   app.post('/dashboard/actions/openai/clear-api-key', (req, res) => {
@@ -474,7 +502,7 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
     current.OPENAI_API_KEY = '';
     writeEnvFile(envPath, current);
     delete process.env.OPENAI_API_KEY;
-    redirectDashboard(res, token, { kind: 'success', text: 'OpenAI API key cleared. Memory will use FTS-only recall.' });
+    redirectDashboard(res, token, { kind: 'success', text: 'OpenAI capability key cleared. Codex OAuth runtime is unchanged; memory will use FTS-only recall.' });
   });
 
   app.post('/dashboard/actions/composio/connect', async (req, res) => {
@@ -649,7 +677,7 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
       const maxChunks = Number.isFinite(maxChunksRaw) ? Math.max(1, Math.min(maxChunksRaw, 1000)) : 200;
       const stats = await embedMissingChunks({ maxChunks });
       if (!stats.enabled) {
-        redirectDashboard(res, token, { kind: 'error', text: stats.reason ?? 'Embeddings are disabled. Add OPENAI_API_KEY first.' });
+        redirectDashboard(res, token, { kind: 'error', text: stats.reason ?? 'Embeddings are disabled. Add the optional OpenAI capability key first.' });
         return;
       }
       redirectDashboard(res, token, {
@@ -948,7 +976,7 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
     const id = typeof req.body.id === 'string' ? req.body.id : '';
     if (id) {
       try {
-        await assistant.getRuntime().resolveApproval(id, true);
+        await resolveApprovalOrQueueBackgroundContinuation(assistant, id, true);
       } catch (err) {
         logger.error({ err, id }, 'Dashboard approve failed');
       }
@@ -965,7 +993,7 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
     const id = typeof req.body.id === 'string' ? req.body.id : '';
     if (id) {
       try {
-        await assistant.getRuntime().resolveApproval(id, false);
+        await resolveApprovalOrQueueBackgroundContinuation(assistant, id, false);
       } catch (err) {
         logger.error({ err, id }, 'Dashboard reject failed');
       }
@@ -1078,7 +1106,7 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
     const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
     removeNotificationDestination(id);
     const token = typeof req.query.token === 'string' ? req.query.token : WEBHOOK_SECRET;
-    res.redirect(`/dashboard?token=${encodeURIComponent(token)}`);
+    redirectDashboard(res, token);
   });
 
   app.post('/api/message', requireAuth, async (req, res) => {
@@ -1122,7 +1150,7 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
   app.post('/api/approvals/:id/approve', requireAuth, async (req, res) => {
     try {
       const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
-      const result = await assistant.getRuntime().resolveApproval(id, true);
+      const result = await resolveApprovalOrQueueBackgroundContinuation(assistant, id, true);
       res.json(result);
     } catch (err) {
       logger.error({ err }, 'Webhook approval approve failed');
@@ -1133,7 +1161,7 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
   app.post('/api/approvals/:id/reject', requireAuth, async (req, res) => {
     try {
       const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
-      const result = await assistant.getRuntime().resolveApproval(id, false);
+      const result = await resolveApprovalOrQueueBackgroundContinuation(assistant, id, false);
       res.json(result);
     } catch (err) {
       logger.error({ err }, 'Webhook approval reject failed');

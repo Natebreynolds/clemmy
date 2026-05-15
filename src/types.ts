@@ -20,10 +20,37 @@ export interface ToolActivity {
   input: Record<string, unknown>;
 }
 
+/**
+ * Why a run ended. Lets UIs render appropriate affordances:
+ *  - 'success' — normal end (model returned text, no more tool calls). No extra action.
+ *  - 'pending-approval' — paused on an approval gate. UI shows approve/reject.
+ *  - 'max-turns-with-grace' — hit the tool-turn cap; the model produced a
+ *    summary of what it accomplished + what's pending. UI shows a
+ *    [Continue] affordance that resumes with a fresh budget.
+ *  - 'cancelled' — caller invoked AbortSignal mid-run.
+ *  - 'error' — model backend returned no usable text and no tool calls.
+ */
+export type RunStoppedReason =
+  | 'success'
+  | 'pending-approval'
+  | 'max-turns-with-grace'
+  | 'cancelled'
+  | 'error';
+
 export interface RunResult {
   text: string;
   sessionId?: string;
   pendingApprovalId?: string;
+  /**
+   * Why this run stopped. Defaults to 'success' for backward-compat
+   * with callers that don't yet inspect it.
+   */
+  stoppedReason?: RunStoppedReason;
+  /**
+   * Number of tool-call turns the loop went through before stopping.
+   * Useful for the UI to show "Clementine ran 75 tool cycles" + cost.
+   */
+  turnsUsed?: number;
   raw?: unknown;
 }
 
@@ -114,6 +141,12 @@ export interface AssistantResponse {
   text: string;
   sessionId: string;
   pendingApprovalId?: string;
+  /** Surfaced from the underlying runtime so channels can render
+   *  appropriate affordances (e.g. a "Continue" button on
+   *  `max-turns-with-grace`). Defaults to `'success'` when absent. */
+  stoppedReason?: RunStoppedReason;
+  /** Number of model→tool→model turns the run actually used. */
+  turnsUsed?: number;
 }
 
 export interface RuntimeContextValue {
@@ -139,6 +172,7 @@ export interface ApprovalResolutionResult {
   status: 'approved' | 'rejected';
   text: string;
   sessionId: string;
+  nextApprovalId?: string;
 }
 
 export interface PlanStep {

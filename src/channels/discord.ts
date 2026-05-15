@@ -30,7 +30,7 @@ import {
 import { ClementineAssistant } from '../assistant/core.js';
 import { ClementineGateway, type GatewayResponse } from '../gateway/router.js';
 import { getOrCreateDiscordSessionId } from './discord-store.js';
-import type { ApprovalResolutionResult, PendingApproval } from '../types.js';
+import type { ApprovalResolutionResult, PendingApproval, ToolActivity } from '../types.js';
 import {
   getNotification,
   listNotifications,
@@ -39,6 +39,10 @@ import {
   requeueNotificationDelivery,
 } from '../runtime/notifications.js';
 import { buildDiscordInstallUrl } from './discord-install.js';
+import { getPlanProposal, rejectPlanProposal } from '../agents/plan-proposals.js';
+import { approvePlanAndQueueBackgroundTask } from '../execution/approved-plan-tasks.js';
+import { queueBackgroundTaskApprovalResolution } from '../execution/background-tasks.js';
+import { WEBHOOK_PORT, WEBHOOK_SECRET } from '../config.js';
 
 const logger = pino({ name: 'clementine-next.discord' });
 
@@ -91,6 +95,8 @@ let discordClient: Client | null = null;
 let startPromise: Promise<void> | null = null;
 let dmPollLoopPromise: Promise<void> | null = null;
 let dmPollLoopActive = false;
+let dmPollConsecutiveFailures = 0;
+let dmPollBackoffUntil = 0;
 let status: DiscordRuntimeStatus = {
   enabled: DISCORD_ENABLED,
   connected: false,
@@ -161,6 +167,33 @@ function latestSnowflake(values: string[]): string | null {
   return values.reduce((latest, current) => (compareSnowflakes(current, latest) > 0 ? current : latest));
 }
 
+function summarizeDiscordError(error: unknown): string {
+  const raw = error instanceof Error ? error.message : String(error);
+  if (raw.includes('<!DOCTYPE') || raw.includes('<html')) {
+    const status = raw.match(/failed with\s+(\d+)/i)?.[1] ?? 'unknown';
+    const route = raw.match(/Discord API\s+([A-Z]+)\s+([^ ]+)/)?.slice(1, 3).join(' ') ?? 'Discord API';
+    return `${route} failed with ${status}; Discord returned an HTML upstream error page.`;
+  }
+  return truncate(raw.replace(/\s+/g, ' '), 500);
+}
+
+function recordDiscordPollSuccess(): void {
+  dmPollConsecutiveFailures = 0;
+  dmPollBackoffUntil = 0;
+}
+
+function recordDiscordPollFailure(error: unknown, userId?: string): void {
+  dmPollConsecutiveFailures += 1;
+  const delayMs = Math.min(60_000, 1000 * Math.pow(2, Math.min(dmPollConsecutiveFailures, 6)));
+  dmPollBackoffUntil = Date.now() + delayMs;
+  logger.warn({
+    error: summarizeDiscordError(error),
+    userId,
+    consecutiveFailures: dmPollConsecutiveFailures,
+    retryInMs: delayMs,
+  }, 'Discord DM polling failed');
+}
+
 function markDiscordDmMessageSeen(channelId: string, messageId: string): void {
   const state = loadDiscordDmPollState();
   const previous = state.lastSeenByChannel[channelId];
@@ -185,6 +218,21 @@ async function discordApiJson<T>(path: string, init?: { method?: string; body?: 
   }
 
   return response.json() as Promise<T>;
+}
+
+async function discordApiVoid(path: string, init?: { method?: string; body?: unknown }): Promise<void> {
+  const response = await fetch(`https://discord.com/api/v10${path}`, {
+    method: init?.method ?? 'GET',
+    headers: {
+      Authorization: `Bot ${DISCORD_BOT_TOKEN}`,
+      'Content-Type': 'application/json',
+    },
+    body: init?.body === undefined ? undefined : JSON.stringify(init.body),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Discord API ${init?.method ?? 'GET'} ${path} failed with ${response.status}: ${await response.text()}`);
+  }
 }
 
 async function ensureDiscordDmChannel(userId: string): Promise<DiscordRestDmChannel> {
@@ -215,8 +263,51 @@ async function sendDiscordRestChunks(channelId: string, text: string): Promise<v
   }
 }
 
+async function sendDiscordRestComponentMessage(
+  channelId: string,
+  payload: { content: string; components: ActionRowBuilder<ButtonBuilder>[] },
+): Promise<void> {
+  const sent = await discordApiJson<DiscordRestSentMessage>(`/channels/${channelId}/messages`, {
+    method: 'POST',
+    body: {
+      content: payload.content,
+      components: payload.components.map((component) => component.toJSON()),
+    },
+  });
+  logger.info({
+    channelId,
+    messageId: sent.id,
+    contentLength: payload.content.length,
+  }, 'Discord REST component message sent');
+}
+
+async function sendDiscordRestTyping(channelId: string): Promise<void> {
+  await discordApiVoid(`/channels/${channelId}/typing`, { method: 'POST' });
+}
+
+function startDiscordTypingLoop(input: {
+  channelId: string;
+  sendTyping: () => Promise<unknown>;
+}): () => void {
+  let stopped = false;
+  const tick = () => {
+    if (stopped) return;
+    input.sendTyping().catch((error) => {
+      logger.warn({ err: error, channelId: input.channelId }, 'Discord typing indicator failed');
+    });
+  };
+  tick();
+  const timer = setInterval(tick, 8_000);
+  timer.unref?.();
+
+  return () => {
+    stopped = true;
+    clearInterval(timer);
+  };
+}
+
 /**
- * Streaming handler for Discord DMs.
+ * Streaming handler for Discord channels and DMs.
  *
  * Discord's API allows message-editing, which is how we surface streaming
  * text without spamming new messages. The handler:
@@ -353,6 +444,126 @@ function createDiscordStreamHandler(channelId: string): DiscordStreamHandler {
   };
 }
 
+interface DiscordLiveActivityHandler {
+  onToolActivity(activity: ToolActivity): Promise<void>;
+  flush(): Promise<void>;
+}
+
+const TOOL_ACTIVITY_LABELS: Record<string, string> = {
+  composio_execute_tool: 'using a connected app',
+  composio_list_tools: 'checking available app actions',
+  composio_status: 'checking connected apps',
+  git_status: 'checking git status',
+  list_files: 'listing files',
+  ping: 'checking tool runtime',
+  read_file: 'reading a file',
+  request_destructive_action: 'requesting approval',
+  run_shell_command: 'preparing a shell command',
+  workspace_roots: 'checking workspace access',
+  write_file: 'preparing a file edit',
+};
+
+function readableToolName(toolName: string): string {
+  if (toolName.startsWith('cx_')) return 'using a connected app action';
+  return TOOL_ACTIVITY_LABELS[toolName] ?? `using ${toolName.replace(/[_-]+/g, ' ')}`;
+}
+
+function activityTarget(input: Record<string, unknown>): string {
+  const keys = [
+    'path',
+    'directory',
+    'command',
+    'query',
+    'url',
+    'tool_slug',
+    'toolkit_slug',
+    'cwd',
+    'title',
+    'action',
+  ];
+
+  for (const key of keys) {
+    const value = input[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+    if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  }
+
+  return '';
+}
+
+function renderToolActivityLine(activity: ToolActivity): string {
+  const target = activityTarget(activity.input);
+  if (!target) return readableToolName(activity.toolName);
+  return `${readableToolName(activity.toolName)}: \`${truncate(target.replace(/`/g, "'"), 90)}\``;
+}
+
+function renderLiveActivity(lines: string[]): string {
+  return [
+    '**Live activity**',
+    ...lines.slice(-8).map((line) => `- ${line}`),
+  ].join('\n').slice(0, 1900);
+}
+
+function createDiscordLiveActivityHandler(channelId: string): DiscordLiveActivityHandler {
+  const EDIT_INTERVAL_MS = 1000;
+  const lines: string[] = [];
+  const seen = new Set<string>();
+  let messageId: string | null = null;
+  let lastEditAt = 0;
+  let pendingEdit = false;
+  let inFlight: Promise<void> = Promise.resolve();
+
+  async function commit(): Promise<void> {
+    if (lines.length === 0) return;
+    const content = renderLiveActivity(lines);
+    try {
+      if (!messageId) {
+        const sent = await discordApiJson<DiscordRestSentMessage>(
+          `/channels/${channelId}/messages`,
+          { method: 'POST', body: { content } },
+        );
+        messageId = sent.id;
+      } else {
+        await discordApiJson<DiscordRestSentMessage>(
+          `/channels/${channelId}/messages/${messageId}`,
+          { method: 'PATCH', body: { content } },
+        );
+      }
+      lastEditAt = Date.now();
+      pendingEdit = false;
+    } catch (error) {
+      logger.warn({ err: error, channelId, messageId }, 'Discord live activity update failed');
+    }
+  }
+
+  async function processActivity(activity: ToolActivity): Promise<void> {
+    const line = renderToolActivityLine(activity);
+    if (seen.has(line)) return;
+    seen.add(line);
+    lines.push(line);
+
+    if (!messageId || Date.now() - lastEditAt >= EDIT_INTERVAL_MS) {
+      await commit();
+      return;
+    }
+
+    pendingEdit = true;
+  }
+
+  return {
+    onToolActivity: (activity: ToolActivity) => {
+      inFlight = inFlight.then(() => processActivity(activity).catch((error) => {
+        logger.warn({ err: error, channelId, toolName: activity.toolName }, 'Discord live activity handler failed');
+      }));
+      return inFlight;
+    },
+    flush: async () => {
+      await inFlight;
+      if (pendingEdit) await commit();
+    },
+  };
+}
+
 function splitMessage(text: string, maxLength = 1900): string[] {
   const normalized = text.trim();
   if (!normalized) return [];
@@ -464,10 +675,125 @@ function buildNotificationActions(notificationId: string, read: boolean) {
   ];
 }
 
+function buildPlanProposalActions(planProposalId: string) {
+  return [
+    new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`${DISCORD_CUSTOM_ID_PREFIX}:plan-approve:${planProposalId}`)
+        .setLabel('Approve & Proceed')
+        .setStyle(ButtonStyle.Success),
+      new ButtonBuilder()
+        .setCustomId(`${DISCORD_CUSTOM_ID_PREFIX}:plan-reject:${planProposalId}`)
+        .setLabel('Reject')
+        .setStyle(ButtonStyle.Danger),
+      new ButtonBuilder()
+        .setCustomId(`${DISCORD_CUSTOM_ID_PREFIX}:plan-view:${planProposalId}`)
+        .setLabel('View / Edit in Dashboard')
+        .setStyle(ButtonStyle.Secondary),
+    ),
+  ];
+}
+
+/**
+ * Resolve which ActionRow to attach to an outbound notification, based
+ * on the notification's metadata. The notification queue tags
+ * approval-kind items with either `approvalId` (SDK interrupt) or
+ * `planProposalId` (Plan Proposal). When neither is present we send
+ * the plain notification — no buttons to click.
+ */
+export function buildActionsForNotification(metadata: Record<string, unknown> | undefined): ActionRowBuilder<ButtonBuilder>[] | undefined {
+  if (!metadata || typeof metadata !== 'object') return undefined;
+  const planProposalId = typeof metadata.planProposalId === 'string' ? metadata.planProposalId : undefined;
+  if (planProposalId) return buildPlanProposalActions(planProposalId);
+  const approvalId = typeof metadata.approvalId === 'string' ? metadata.approvalId : undefined;
+  if (approvalId) return buildApprovalActions(approvalId);
+  return undefined;
+}
+
 function relevantApprovalsForMessage(message: Message<boolean>, approvals: PendingApproval[]): PendingApproval[] {
   const channel = buildChannelLabel(message);
   const owned = approvals.filter((approval) => approval.userId === message.author.id || approval.channel === channel);
   return owned.length > 0 ? owned : approvals;
+}
+
+function relevantApprovalsForContext(input: {
+  userId: string;
+  channelId: string;
+  guildId?: string | null;
+}, approvals: PendingApproval[]): PendingApproval[] {
+  const channel = buildChannelLabelFromParts(input.channelId, input.guildId);
+  const owned = approvals.filter((approval) => approval.userId === input.userId || approval.channel === channel);
+  return owned.length > 0 ? owned : approvals;
+}
+
+type NaturalApprovalAction = 'approve_one' | 'approve_all' | 'reject_one' | 'reject_all';
+
+function detectNaturalApprovalAction(text: string): NaturalApprovalAction | null {
+  const normalized = text.toLowerCase().replace(/[.!?]+$/g, '').replace(/\s+/g, ' ').trim();
+  if (!normalized) return null;
+
+  if (/^(approve|approved|yes|yep|yeah|go ahead|proceed|run it|do it|authorized|authorize)\s+(all|everything|them all)$/i.test(normalized)) {
+    return 'approve_all';
+  }
+  if (/^(reject|rejected|deny|denied|cancel|stop)\s+(all|everything|them all)$/i.test(normalized)) {
+    return 'reject_all';
+  }
+  if (/^(approve all|approved all|yes to all|go ahead with all|run all|proceed with all)$/i.test(normalized)) {
+    return 'approve_all';
+  }
+  if (/^(reject all|deny all|cancel all|stop all)$/i.test(normalized)) {
+    return 'reject_all';
+  }
+  if (/^(approve|approved|yes|yep|yeah|go ahead|proceed|run it|do it|authorized|authorize)$/i.test(normalized)) {
+    return 'approve_one';
+  }
+  if (/^(reject|rejected|deny|denied|no|cancel|stop)$/i.test(normalized)) {
+    return 'reject_one';
+  }
+  return null;
+}
+
+async function resolveNaturalApproval(input: {
+  assistant: ClementineAssistant;
+  text: string;
+  userId: string;
+  channelId: string;
+  guildId?: string | null;
+  send: (text: string) => Promise<void>;
+}): Promise<boolean> {
+  const action = detectNaturalApprovalAction(input.text);
+  if (!action) return false;
+
+  const runtime = input.assistant.getRuntime();
+  const approvals = relevantApprovalsForContext({
+    userId: input.userId,
+    channelId: input.channelId,
+    guildId: input.guildId,
+  }, runtime.listPendingApprovals()).sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+
+  if (approvals.length === 0) {
+    await input.send('No pending approval is waiting on this Discord thread.');
+    return true;
+  }
+
+  const approve = action.startsWith('approve');
+  const selected = action.endsWith('_all') ? approvals : approvals.slice(0, 1);
+  const results: string[] = [];
+
+  for (const approval of selected) {
+    try {
+      results.push(await resolveApprovalOrQueueBackgroundContinuation(input.assistant, approval.id, approve));
+    } catch (error) {
+      results.push(`Failed to ${approve ? 'approve' : 'reject'} \`${approval.id}\`: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  const remainingCount = Math.max(0, approvals.length - selected.length);
+  const tail = remainingCount > 0
+    ? `\n\n${remainingCount} other approval${remainingCount === 1 ? '' : 's'} still pending. Say \`approve all\`, \`reject all\`, or \`approvals\` to inspect.`
+    : '';
+  await input.send(`${results.join('\n\n')}${tail}`);
+  return true;
 }
 
 function relevantNotificationsForUser(userId: string) {
@@ -525,9 +851,42 @@ function renderDiscordStatusForContext(input: {
 function approvalResultText(result: ApprovalResolutionResult): string {
   return [
     `Approval ${result.status}: \`${result.approvalId}\``,
+    result.nextApprovalId ? `Next approval pending: \`${result.nextApprovalId}\`` : '',
     '',
     result.text,
-  ].join('\n');
+  ].filter(Boolean).join('\n');
+}
+
+async function resolveApprovalOrQueueBackgroundContinuation(
+  assistant: ClementineAssistant,
+  approvalId: string,
+  approved: boolean,
+): Promise<string> {
+  const queued = queueBackgroundTaskApprovalResolution(approvalId, approved);
+  if (queued) {
+    return [
+      `Approval ${approved ? 'approved' : 'rejected'}: \`${approvalId}\``,
+      '',
+      `Queued background task continuation: \`${queued.id}\`.`,
+      'The daemon will resume the paused SDK run and keep progress visible in the dashboard.',
+    ].join('\n');
+  }
+
+  const result = await assistant.getRuntime().resolveApproval(approvalId, approved);
+  return approvalResultText(result);
+}
+
+function renderGatewayTail(response: GatewayResponse): string {
+  // Surface ONLY signal the user can act on. Run IDs are debug
+  // telemetry — they belong in the dashboard activity panel, not
+  // appended to every chat reply.
+  return [
+    response.pendingApprovalId ? `Approval pending: \`${response.pendingApprovalId}\`` : '',
+  ].filter(Boolean).join('\n\n');
+}
+
+function appendGatewayTail(text: string, tail: string): string {
+  return tail ? `${text}\n\n${tail}` : text;
 }
 
 async function runGatewayPrompt(input: {
@@ -540,6 +899,8 @@ async function runGatewayPrompt(input: {
    *  supports streaming (OpenAI Agents SDK path). Codex CLI bridge
    *  ignores it — non-streaming users get the same one-shot reveal. */
   onChunk?: (delta: string) => Promise<void> | void;
+  /** Tool activity callback surfaced by the runtime when tools start. */
+  onToolActivity?: (activity: ToolActivity) => Promise<void> | void;
 }): Promise<GatewayResponse> {
   const sessionId = getOrCreateDiscordSessionId({
     channelId: input.channelId,
@@ -554,12 +915,24 @@ async function runGatewayPrompt(input: {
     channel: buildChannelLabelFromParts(input.channelId, input.guildId),
     source: 'discord',
     onChunk: input.onChunk,
+    onToolActivity: input.onToolActivity,
   });
 }
 
 async function handleDiscordCommand(message: Message<boolean>, assistant: ClementineAssistant, prompt: string): Promise<boolean> {
   const normalized = normalizeCommandText(prompt);
   const runtime = assistant.getRuntime();
+
+  if (await resolveNaturalApproval({
+    assistant,
+    text: normalized,
+    userId: message.author.id,
+    channelId: message.channelId,
+    guildId: message.guildId,
+    send: (text) => sendChunks(message.channel, text, message),
+  })) {
+    return true;
+  }
 
   if (/^(help|discord help|commands)$/i.test(normalized)) {
     await sendChunks(
@@ -627,8 +1000,8 @@ async function handleDiscordCommand(message: Message<boolean>, assistant: Clemen
     const approved = match[1].toLowerCase() === 'approve';
     const approvalId = match[2];
     try {
-      const result = await runtime.resolveApproval(approvalId, approved);
-      await sendChunks(message.channel, approvalResultText(result), message);
+      const text = await resolveApprovalOrQueueBackgroundContinuation(assistant, approvalId, approved);
+      await sendChunks(message.channel, text, message);
     } catch (error) {
       await sendChunks(
         message.channel,
@@ -662,6 +1035,56 @@ async function handleDiscordCommand(message: Message<boolean>, assistant: Clemen
     }
     requeueNotificationDelivery(notificationId);
     await sendChunks(message.channel, `Requeued delivery for notification \`${notificationId}\`.`, message);
+    return true;
+  }
+
+  return false;
+}
+
+async function handleDiscordRestCommand(input: {
+  assistant: ClementineAssistant;
+  prompt: string;
+  channelId: string;
+  userId: string;
+  guildId?: string | null;
+}): Promise<boolean> {
+  const normalized = normalizeCommandText(input.prompt);
+  const runtime = input.assistant.getRuntime();
+  const send = (text: string) => sendDiscordRestChunks(input.channelId, text);
+
+  if (await resolveNaturalApproval({
+    assistant: input.assistant,
+    text: normalized,
+    userId: input.userId,
+    channelId: input.channelId,
+    guildId: input.guildId,
+    send,
+  })) {
+    return true;
+  }
+
+  if (/^(approvals|pending approvals)$/i.test(normalized)) {
+    const approvals = relevantApprovalsForContext(input, runtime.listPendingApprovals());
+    await send(renderApprovalList(approvals));
+    for (const approval of approvals.slice(0, 5)) {
+      await sendDiscordRestComponentMessage(input.channelId, {
+        content: `Approval \`${approval.id}\` for \`${approval.toolName}\``,
+        components: buildApprovalActions(approval.id),
+      });
+    }
+    return true;
+  }
+
+  const match = normalized.match(/^(approve|reject)\s+([a-zA-Z0-9-]+)$/i);
+  if (match) {
+    const approved = match[1].toLowerCase() === 'approve';
+    const approvalId = match[2];
+    try {
+      const text = await resolveApprovalOrQueueBackgroundContinuation(input.assistant, approvalId, approved);
+      await send(text);
+    } catch (error) {
+      await send(`Failed to ${approved ? 'approve' : 'reject'} \`${approvalId}\`: ${error instanceof Error ? error.message : String(error)}`);
+    }
     return true;
   }
 
@@ -733,9 +1156,61 @@ async function handleButtonInteraction(interaction: ButtonInteraction, assistant
   try {
     if (action === 'approve' || action === 'reject') {
       const approved = action === 'approve';
-      const result = await assistant.getRuntime().resolveApproval(targetId, approved);
+      const text = await resolveApprovalOrQueueBackgroundContinuation(assistant, targetId, approved);
       await interaction.reply({
-        content: approvalResultText(result),
+        content: text,
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (action === 'plan-approve') {
+      const result = approvePlanAndQueueBackgroundTask(targetId);
+      if (!result) {
+        await interaction.reply({ content: `Plan \`${targetId}\` was not found or already resolved.`, ephemeral: true });
+        return;
+      }
+      await interaction.reply({
+        content: [
+          `✓ Plan approved: **${result.proposal.plan.objective}**`,
+          `Queued durable background task: \`${result.task.id}\`.`,
+          'A 15-minute auto-approval window is open for the approved plan scope.',
+        ].join('\n'),
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (action === 'plan-reject') {
+      const result = rejectPlanProposal(targetId, 'rejected via Discord button');
+      if (!result) {
+        await interaction.reply({ content: `Plan \`${targetId}\` was not found.`, ephemeral: true });
+        return;
+      }
+      await interaction.reply({
+        content: `✗ Plan rejected: **${result.plan.objective}**\nThe agent will not proceed with this plan.`,
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (action === 'plan-view') {
+      const proposal = getPlanProposal(targetId);
+      if (!proposal) {
+        await interaction.reply({ content: `Plan \`${targetId}\` was not found.`, ephemeral: true });
+        return;
+      }
+      // Deep link to the dashboard plan list. Token in querystring is the
+      // dashboard's existing auth pattern.
+      const tokenPart = WEBHOOK_SECRET ? `?token=${encodeURIComponent(WEBHOOK_SECRET)}` : '';
+      const url = `http://localhost:${WEBHOOK_PORT}/console${tokenPart}`;
+      await interaction.reply({
+        content: [
+          `**${proposal.plan.objective}**`,
+          `Complexity: ${proposal.plan.estimatedComplexity}; ${proposal.plan.steps.length} step(s).`,
+          `Open the dashboard to view full steps, success criteria, risks, and edit before approving:`,
+          url,
+        ].join('\n'),
         ephemeral: true,
       });
       return;
@@ -918,35 +1393,43 @@ async function handleMessage(message: Message<boolean>, assistant: ClementineAss
     return;
   }
 
-  let progressCompleted = false;
-  let progressTimer: ReturnType<typeof setTimeout> | undefined;
+  const streamHandler = createDiscordStreamHandler(message.channelId);
+  const activityHandler = createDiscordLiveActivityHandler(message.channelId);
+  let chunkSeen = false;
+  const stopTyping = startDiscordTypingLoop({
+    channelId: message.channelId,
+    sendTyping: async () => {
+      if ('sendTyping' in message.channel) {
+        await message.channel.sendTyping();
+      }
+    },
+  });
 
   try {
-    if ('sendTyping' in message.channel) {
-      await message.channel.sendTyping();
-    }
-
-    progressTimer = setTimeout(() => {
-      if (progressCompleted) return;
-      void sendChunks(message.channel, 'Working on it. I’ll post the result here when the run finishes.', message)
-        .catch((error) => logger.warn({ err: error, channelId: message.channelId }, 'Discord progress message failed'));
-    }, 2500);
-
     const response = await runGatewayPrompt({
       assistant,
       prompt,
       channelId: message.channelId,
       userId: message.author.id,
       guildId: message.guildId,
+      onChunk: async (delta) => {
+        chunkSeen = true;
+        await streamHandler.onChunk(delta);
+      },
+      onToolActivity: async (activity) => {
+        await activityHandler.onToolActivity(activity);
+      },
     });
-    progressCompleted = true;
-    if (progressTimer) clearTimeout(progressTimer);
 
-    const suffix = response.pendingApprovalId
-      ? `\n\nApproval pending: \`${response.pendingApprovalId}\``
-      : '';
-    const runSuffix = response.runId ? `\n\nRun: \`${response.runId}\`` : '';
-    await sendChunks(message.channel, `${response.text}${suffix}${runSuffix}`, message);
+    await streamHandler.flush();
+    await activityHandler.flush();
+
+    const tail = renderGatewayTail(response);
+    if (chunkSeen) {
+      if (tail) await sendChunks(message.channel, tail, message);
+    } else {
+      await sendChunks(message.channel, appendGatewayTail(response.text, tail), message);
+    }
   } catch (error) {
     logger.error({ err: error, channelId: message.channelId, userId: message.author.id }, 'Discord message handling failed');
     await sendChunks(
@@ -955,8 +1438,7 @@ async function handleMessage(message: Message<boolean>, assistant: ClementineAss
       message,
     );
   } finally {
-    progressCompleted = true;
-    if (progressTimer) clearTimeout(progressTimer);
+    stopTyping();
   }
 }
 
@@ -968,6 +1450,7 @@ async function pollDiscordDirectMessages(client: Client, assistant: ClementineAs
     try {
       const dm = await ensureDiscordDmChannel(userId);
       const messages = await listDiscordChannelMessages(dm.id, 15);
+      recordDiscordPollSuccess();
       if (messages.length === 0) {
         continue;
       }
@@ -1003,18 +1486,26 @@ async function pollDiscordDirectMessages(client: Client, assistant: ClementineAs
           continue;
         }
 
-        let progressCompleted = false;
-        let progressTimer: ReturnType<typeof setTimeout> | undefined;
+        if (await handleDiscordRestCommand({
+          assistant,
+          prompt,
+          channelId: dm.id,
+          userId: message.author.id,
+          guildId: null,
+        })) {
+          markDiscordDmMessageSeen(dm.id, message.id);
+          continue;
+        }
+
         const streamHandler = createDiscordStreamHandler(dm.id);
+        const activityHandler = createDiscordLiveActivityHandler(dm.id);
         let chunkSeen = false;
+        const stopTyping = startDiscordTypingLoop({
+          channelId: dm.id,
+          sendTyping: () => sendDiscordRestTyping(dm.id),
+        });
 
         try {
-          progressTimer = setTimeout(() => {
-            if (progressCompleted || chunkSeen) return;
-            void sendDiscordRestChunks(dm.id, 'Working on it. I’ll post the result here when the run finishes.')
-              .catch((sendError) => logger.warn({ err: sendError, channelId: dm.id }, 'Discord DM progress message failed'));
-          }, 2500);
-
           const response = await runGatewayPrompt({
             assistant,
             prompt,
@@ -1023,32 +1514,29 @@ async function pollDiscordDirectMessages(client: Client, assistant: ClementineAs
             guildId: null,
             onChunk: async (delta) => {
               chunkSeen = true;
-              if (progressTimer) { clearTimeout(progressTimer); progressTimer = undefined; }
               await streamHandler.onChunk(delta);
             },
+            onToolActivity: async (activity) => {
+              await activityHandler.onToolActivity(activity);
+            },
           });
-          progressCompleted = true;
-          if (progressTimer) clearTimeout(progressTimer);
 
           // Flush any pending edit so the final delta lands before we
           // append suffixes / fall back to a full send.
           await streamHandler.flush();
+          await activityHandler.flush();
 
-          const suffix = response.pendingApprovalId
-            ? `\n\nApproval pending: \`${response.pendingApprovalId}\``
-            : '';
-          const runSuffix = response.runId ? `\n\nRun: \`${response.runId}\`` : '';
+          const tail = renderGatewayTail(response);
 
           if (chunkSeen) {
             // Streaming already published the body. Send only the
             // suffix(es), if any, as a follow-up message — keeps the
             // streamed text intact and doesn't double-post the body.
-            const tail = `${suffix}${runSuffix}`.trim();
             if (tail) await sendDiscordRestChunks(dm.id, tail);
           } else {
             // Non-streaming runtime (codex CLI bridge) — fall back to
             // the original one-shot send.
-            await sendDiscordRestChunks(dm.id, `${response.text}${suffix}${runSuffix}`);
+            await sendDiscordRestChunks(dm.id, appendGatewayTail(response.text, tail));
           }
 
           markDiscordDmMessageSeen(dm.id, message.id);
@@ -1060,12 +1548,11 @@ async function pollDiscordDirectMessages(client: Client, assistant: ClementineAs
           );
           markDiscordDmMessageSeen(dm.id, message.id);
         } finally {
-          progressCompleted = true;
-          if (progressTimer) clearTimeout(progressTimer);
+          stopTyping();
         }
       }
     } catch (error) {
-      logger.error({ err: error, userId }, 'Discord DM polling failed');
+      recordDiscordPollFailure(error, userId);
     }
   }
 }
@@ -1078,7 +1565,8 @@ async function runDiscordDmPollingLoop(client: Client, assistant: ClementineAssi
       logger.error({ err: error }, 'Discord DM polling loop iteration failed');
     }
 
-    await new Promise((resolve) => setTimeout(resolve, Math.max(DISCORD_DM_POLL_INTERVAL_MS, 1000)));
+    const backoffRemaining = Math.max(0, dmPollBackoffUntil - Date.now());
+    await new Promise((resolve) => setTimeout(resolve, Math.max(DISCORD_DM_POLL_INTERVAL_MS, 1000, backoffRemaining)));
   }
 }
 
@@ -1225,15 +1713,51 @@ export async function sendDiscordChannelMessage(channelId: string, text: string)
   }
 }
 
-export async function sendDiscordDirectMessage(userId: string, text: string): Promise<void> {
+export async function sendDiscordDirectMessage(
+  userId: string,
+  text: string,
+  options: { components?: ActionRowBuilder<ButtonBuilder>[] } = {},
+): Promise<void> {
   if (!discordClient?.isReady()) {
     throw new Error('Discord client is not connected in this process.');
   }
 
   const user = await discordClient.users.fetch(userId);
   const dm = await user.createDM();
-  for (const chunk of splitMessage(text)) {
-    await dm.send(chunk);
+  const chunks = splitMessage(text);
+  // Attach the action row to the LAST chunk only — Discord renders the
+  // buttons under the message they're attached to, and we want them
+  // visible below the full notification body.
+  for (let i = 0; i < chunks.length; i++) {
+    const isLast = i === chunks.length - 1;
+    if (isLast && options.components && options.components.length > 0) {
+      await dm.send({ content: chunks[i], components: options.components });
+    } else {
+      await dm.send(chunks[i]);
+    }
+  }
+}
+
+export async function sendDiscordChannelMessageWithComponents(
+  channelId: string,
+  text: string,
+  components: ActionRowBuilder<ButtonBuilder>[],
+): Promise<void> {
+  if (!discordClient?.isReady()) {
+    throw new Error('Discord client is not connected in this process.');
+  }
+  const channel = await discordClient.channels.fetch(channelId);
+  if (!channel?.isTextBased() || !('send' in channel)) {
+    throw new Error(`Discord channel ${channelId} is not text-based.`);
+  }
+  const chunks = splitMessage(text);
+  for (let i = 0; i < chunks.length; i++) {
+    const isLast = i === chunks.length - 1;
+    if (isLast && components.length > 0) {
+      await channel.send({ content: chunks[i], components });
+    } else {
+      await channel.send(chunks[i]);
+    }
   }
 }
 

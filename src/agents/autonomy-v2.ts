@@ -5,10 +5,12 @@ import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { getOpenAiApiKey, getRuntimeEnv, MODELS } from '../config.js';
 import { getCoreTools } from '../tools/registry.js';
-import { createConfiguredMcpServers } from '../runtime/mcp-servers.js';
+import { getOrCreateConfiguredMcpServers } from '../runtime/mcp-servers.js';
 import { autonomyV2OutputGuardrails } from './autonomy-guardrails.js';
 import { getProactivityPolicySnapshot, type ProactivityPolicy, type ProactivityPolicySnapshot } from './proactivity-policy.js';
 import { renderOpenCheckInsForAgent } from './check-ins.js';
+import { getProposalFeedback, renderProposalFeedback } from './proposal-feedback.js';
+import { buildPlannerTool } from './planner.js';
 import { activeExecutionCountForSession, renderActiveExecutionsForAgent } from '../tools/execution-tools.js';
 import { renderProfileForInstructions } from '../runtime/user-profile.js';
 import { defaultOrchestratorHandoffs, isOrchestratorSlug } from './sub-agents.js';
@@ -402,6 +404,7 @@ export function chooseFollowUpMinutes(
 
 function buildAgentInstructions(agent: TeamAgentRecord, policy: ProactivityPolicy): string {
   const orchestrator = isOrchestratorSlug(agent.slug);
+  const proposalFeedbackBlock = renderProposalFeedback(getProposalFeedback({ windowDays: 30 }));
   return [
     `You are ${agent.name} (${agent.slug}), an autonomous agent inside Clementine.`,
     agent.role ? `Role: ${agent.role}` : '',
@@ -413,7 +416,7 @@ function buildAgentInstructions(agent: TeamAgentRecord, policy: ProactivityPolic
       'You are the orchestrator. Specialized sub-agents are available via handoff:',
       '- Researcher: read-only information gatherer. Hand off when you need facts from memory, files, the workspace, or session history before deciding. It cannot mutate state.',
       '- Writer: drafts docs, reports, summaries, emails/messages, and handoff notes. It drafts but does not send or deploy.',
-      '- Reviewer: read-only auditor. Hand off before risky execution, deployment, or user-facing delivery when quality/risk matters.',
+      '- Reviewer: read-only auditor. Hand off (a) before risky execution, deployment, or user-facing delivery, AND (b) after a multi-step mutation completes (multiple writes, command sequence, workflow that changed state) before declaring done. Reviewer reads what changed and confirms or flags. Skip the post-write Reviewer pass only for trivial single-file edits or read-only work.',
       '- Executor: does concrete work (tasks, executions, file writes, shell commands, notifications).',
       '- Deployer: handles release, deployment, CI, environment, and CLI-driven shipping work.',
       policy.requireWorkflowApprovalForExecution
@@ -433,10 +436,14 @@ function buildAgentInstructions(agent: TeamAgentRecord, policy: ProactivityPolic
       '- `note_take` to append context to today\'s daily note.',
       '- `memory_remember` for durable preferences, project context, or standing feedback that should carry across sessions.',
       '- `memory_recall` to look something up before deciding.',
+      '- `propose_check_in_template` when you notice a recurring rhythm in the user\'s work (weekly deploys, daily standups, monthly reviews) or a condition that should trigger a future nudge. DO NOT auto-install — the user approves from Settings → Proactive Check-Ins. Always include a clear `rationale` referencing the specific pattern you observed.',
+      '- `draft_plan` BEFORE you act on complex multi-step work — it returns a structured plan (objective, steps, risks, needsUserInput, recommendsTrackedExecution) without mutating anything. Skip it for trivial actions.',
+      '- `surface_plan` after `draft_plan` when the plan is significant/large, recommendsTrackedExecution, or needsUserInput is non-empty. Persists the plan as a PlanProposal and notifies the user for review. Wait for approval before executing against the plan. Skip surface_plan when the plan is trivial/moderate and unambiguous — just execute it.',
       '- If there\'s nothing useful to do this cycle, take no action and say so in your summary.',
       '- If you receive an inbox item of type `check_in_answered`, the user just answered a question you previously asked. Pick up where you left off and use the answer to make progress.',
     ].join('\n'),
     'Multi-agent comms (messaging, delegation, replies) is not available in v2 yet — for now, leave those to v1 by surfacing the intent in your summary so the user can act.',
+    proposalFeedbackBlock,
     'Output: return only `summary`, `commitments`, and optional `followUpMinutes`. Be specific and brief.',
   ].filter(Boolean).join('\n\n');
 }
@@ -455,6 +462,16 @@ interface AgentCacheEntry {
 
 const agentCache = new Map<string, AgentCacheEntry>();
 let runner: Runner | null = null;
+
+/**
+ * Drop every cached autonomy agent. Called when the MCP server config
+ * changes (dashboard add/edit/delete) so the next cycle constructs a
+ * fresh agent against the new namespace shim instead of holding the
+ * old one.
+ */
+export function clearAutonomyAgentCache(): void {
+  agentCache.clear();
+}
 
 /**
  * WeakMap from Agent instance → active runId for the current cycle.
@@ -506,7 +523,7 @@ function policyFingerprint(policy: ProactivityPolicy): string {
  * filter doesn't depend on the dashboard module.
  */
 export function categorizeToolForPolicy(name: string): 'composio' | 'computer' | 'other' {
-  if (name.startsWith('composio_')) return 'composio';
+  if (name.startsWith('composio_') || name.startsWith('cx_')) return 'composio';
   if ([
     'run_shell_command',
     'write_file',
@@ -543,7 +560,7 @@ export function filterToolsByPolicy<T extends PolicyFilterableTool>(
   });
 }
 
-function getAgent(record: TeamAgentRecord, policy: ProactivityPolicy): AutonomyAgent {
+async function getAgent(record: TeamAgentRecord, policy: ProactivityPolicy): Promise<AutonomyAgent> {
   const cached = agentCache.get(record.slug);
   const recFp = recordHash(record);
   const polFp = policyFingerprint(policy);
@@ -551,7 +568,10 @@ function getAgent(record: TeamAgentRecord, policy: ProactivityPolicy): AutonomyA
     return cached.agent;
   }
 
-  const allTools = getCoreTools();
+  // Include the Planner-as-tool so autonomy cycles can think before
+  // they act, exactly like the chat path. The Planner is read-only so
+  // it always passes policy filters.
+  const allTools = [...getCoreTools(), buildPlannerTool()];
   const tools = filterToolsByPolicy(allTools, policy);
 
   // Orchestrator agents get handoffs configured so they can delegate
@@ -560,7 +580,7 @@ function getAgent(record: TeamAgentRecord, policy: ProactivityPolicy): AutonomyA
   // The primary `clementine` agent is the orchestrator by default;
   // other slugs can opt in via AUTONOMY_ORCHESTRATOR_SLUGS env var.
   const handoffs = isOrchestratorSlug(record.slug)
-    ? defaultOrchestratorHandoffs({
+    ? await defaultOrchestratorHandoffs({
       requireWorkflowApprovalForExecution: policy.requireWorkflowApprovalForExecution,
     })
     : undefined;
@@ -573,7 +593,10 @@ function getAgent(record: TeamAgentRecord, policy: ProactivityPolicy): AutonomyA
     outputGuardrails: autonomyV2OutputGuardrails,
     tools,
     handoffs,
-    mcpServers: createConfiguredMcpServers(),
+    // Single namespace-shimmed MCP server — flattens every configured
+    // server's tools under `<server>__<tool>` names so duplicate-name
+    // collisions across installs cannot throw at agent construction.
+    mcpServers: [getOrCreateConfiguredMcpServers()],
   });
 
   // Per-tool lifecycle hooks. Resolve the active runId via WeakMap so
@@ -717,7 +740,7 @@ async function runAgentCycleV2(record: TeamAgentRecord): Promise<{ runId: string
   const policyEvent = buildPolicyEvent(policySnapshot);
   addRunEvent(runId, policyEvent);
 
-  const agent = getAgent(record, policy);
+  const agent = await getAgent(record, policy);
   const input = buildAgentInput(record, inboxItems, state, policy);
   currentRunIdByAgent.set(agent, runId);
 

@@ -4,9 +4,28 @@ import { BASE_DIR } from '../config.js';
 
 export type ProactivityMode = 'watch' | 'balanced' | 'hands_on';
 
+/**
+ * How aggressively the agent can auto-approve its own actions.
+ *
+ *   strict    — default. Every shell command + file write requires
+ *               explicit approval UNLESS the user has approved a Plan
+ *               that opened a 15-min plan-scope (see plan-scope.ts).
+ *   workspace — auto-approve when the action's cwd / path is inside
+ *               one of the user's configured WORKSPACE_DIRS. Catches
+ *               80% of day-to-day "yes obviously" cases without
+ *               sliding into yolo.
+ *   yolo      — auto-approve everything except the hard-coded danger
+ *               denylist (rm -rf /, sudo, fork bombs, etc.) which is
+ *               enforced unconditionally. Also bypasses the workspace-
+ *               root check on run_shell_command + write_file so the
+ *               agent can act anywhere the user can.
+ */
+export type AutoApproveScope = 'strict' | 'workspace' | 'yolo';
+
 export interface ProactivityPolicy {
   enabled: boolean;
   mode: ProactivityMode;
+  autoApproveScope: AutoApproveScope;
   checkInMinutes: number;
   briefCadenceMinutes: number;
   defaultLongTaskMinutes: number;
@@ -34,6 +53,7 @@ const POLICY_FILE = path.join(BASE_DIR, 'state', 'proactivity-policy.json');
 export const DEFAULT_PROACTIVITY_POLICY: ProactivityPolicy = {
   enabled: true,
   mode: 'balanced',
+  autoApproveScope: 'strict',
   checkInMinutes: 3,
   briefCadenceMinutes: 60,
   defaultLongTaskMinutes: 90,
@@ -72,10 +92,15 @@ function normalizeMode(value: unknown): ProactivityMode {
   return value === 'watch' || value === 'hands_on' || value === 'balanced' ? value : 'balanced';
 }
 
+function normalizeAutoApproveScope(value: unknown): AutoApproveScope {
+  return value === 'workspace' || value === 'yolo' || value === 'strict' ? value : 'strict';
+}
+
 function normalizePolicy(input: RawProactivityPolicy = {}): ProactivityPolicy {
   return {
     enabled: input.enabled !== false,
     mode: normalizeMode(input.mode),
+    autoApproveScope: normalizeAutoApproveScope(input.autoApproveScope),
     checkInMinutes: clampInteger(input.checkInMinutes, DEFAULT_PROACTIVITY_POLICY.checkInMinutes, 1, 60),
     briefCadenceMinutes: clampInteger(input.briefCadenceMinutes, DEFAULT_PROACTIVITY_POLICY.briefCadenceMinutes, 10, 1440),
     defaultLongTaskMinutes: clampInteger(input.defaultLongTaskMinutes, DEFAULT_PROACTIVITY_POLICY.defaultLongTaskMinutes, 5, 240),

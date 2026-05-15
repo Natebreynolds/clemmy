@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { BASE_DIR as CONFIG_BASE_DIR } from '../config.js';
@@ -42,8 +42,30 @@ export const CRON_TRIGGERS_DIR = path.join(BASE_DIR, 'cron', 'triggers');
 export const CRON_PROGRESS_DIR = path.join(BASE_DIR, 'cron', 'progress');
 export const WORKFLOW_RUNS_DIR = path.join(BASE_DIR, 'workflows', 'runs');
 
-export function textResult(text: string): { content: Array<{ type: 'text'; text: string }> } {
-  return { content: [{ type: 'text', text }] };
+/**
+ * Cap a single tool result so a runaway tool output (a 50KB file dump,
+ * a giant JSON blob) doesn't fill the model's context. Defaults to
+ * ~8000 chars, which is generous for normal responses but stops the
+ * worst offenders. Callers that genuinely need raw fidelity (e.g.
+ * read_file with an explicit byte budget) can pass a higher maxChars.
+ *
+ * The truncation marker tells the model the response was cut and how
+ * much was dropped, so it can choose to re-call with a narrower scope
+ * (offset/limit, filter, more specific query) instead of guessing at
+ * the missing bytes.
+ */
+export const DEFAULT_TOOL_RESULT_MAX_CHARS = 8000;
+
+export function truncateToolText(text: string, maxChars: number = DEFAULT_TOOL_RESULT_MAX_CHARS): string {
+  if (text.length <= maxChars) return text;
+  const head = text.slice(0, maxChars);
+  const dropped = text.length - maxChars;
+  return `${head}\n\n…[truncated — ${dropped.toLocaleString()} of ${text.length.toLocaleString()} chars omitted; re-call with a narrower scope (offset/limit, filter, specific query) if you need the rest]`;
+}
+
+export function textResult(text: string, options?: { maxChars?: number }): { content: Array<{ type: 'text'; text: string }> } {
+  const capped = truncateToolText(text, options?.maxChars ?? DEFAULT_TOOL_RESULT_MAX_CHARS);
+  return { content: [{ type: 'text', text: capped }] };
 }
 
 export function ensureDir(dir: string): void {
@@ -320,7 +342,33 @@ function detectProjectType(entries: string[]): string {
   return 'unknown';
 }
 
+/**
+ * macOS CloudStorage paths (OneDrive, Google Drive, iCloud File Provider, etc.)
+ * back files with on-demand hydration — read() can block indefinitely while
+ * the OS pulls the file down. There is no sync I/O timeout in Node, so the
+ * only safe option is to skip these paths entirely for nice-to-have reads.
+ *
+ * `~/Desktop` is the most common offender: OneDrive Known Folder Move
+ * symlinks `~/Desktop` to `~/Library/CloudStorage/OneDrive-*`. We canonicalize
+ * via realpath so the check catches paths that *resolve* into CloudStorage,
+ * not just literal CloudStorage paths.
+ */
+function isCloudStoragePath(dirPath: string): boolean {
+  const literal = /\/Library\/CloudStorage\//.test(dirPath) || /\/Library\/Mobile Documents\//.test(dirPath);
+  if (literal) return true;
+  try {
+    // realpath is a path-resolution syscall only — it does not pull file
+    // contents, so it stays fast even on hydrated-on-demand backings.
+    const resolved = realpathSync(dirPath);
+    return /\/Library\/CloudStorage\//.test(resolved) || /\/Library\/Mobile Documents\//.test(resolved);
+  } catch {
+    return false;
+  }
+}
+
 function extractDescription(dirPath: string, entries: string[]): string {
+  if (isCloudStoragePath(dirPath)) return '';
+
   if (entries.includes('package.json')) {
     try {
       const pkg = JSON.parse(readFileSync(path.join(dirPath, 'package.json'), 'utf-8')) as { description?: string };
@@ -347,7 +395,23 @@ function extractDescription(dirPath: string, entries: string[]): string {
   return '';
 }
 
+// listWorkspaceProjects walks every configured workspace dir + a fan
+// of macOS standard locations, stat'ing each subdir against
+// PROJECT_MARKERS. With Spotlight/iCloud-mirrored dirs this can take
+// 30+ seconds — way too slow for the dashboard which calls it on
+// every projects-panel open. Cache the unfiltered list and re-filter
+// in-process. TTL is short so projects added during the session
+// surface within a minute.
+const PROJECT_LIST_CACHE_TTL_MS = 60_000;
+let projectListCache: { at: number; projects: WorkspaceProject[] } | null = null;
+
 export function listWorkspaceProjects(filter?: string): WorkspaceProject[] {
+  if (projectListCache && Date.now() - projectListCache.at < PROJECT_LIST_CACHE_TTL_MS) {
+    const filtered = filter
+      ? projectListCache.projects.filter((p) => p.name.toLowerCase().includes(filter.toLowerCase()))
+      : projectListCache.projects;
+    return filtered;
+  }
   const projects: WorkspaceProject[] = [];
   const seen = new Set<string>();
 
@@ -367,11 +431,10 @@ export function listWorkspaceProjects(filter?: string): WorkspaceProject[] {
         if (seen.has(resolved)) continue;
 
         const subEntries = readdirSync(candidate);
-        const isProject = PROJECT_MARKERS.some((marker) => subEntries.includes(marker) || existsSync(path.join(candidate, marker)));
+        const isProject = PROJECT_MARKERS.some((marker) => subEntries.includes(marker));
         if (!isProject) continue;
 
         const name = path.basename(candidate);
-        if (filter && !name.toLowerCase().includes(filter.toLowerCase())) continue;
 
         seen.add(resolved);
         projects.push({
@@ -387,7 +450,17 @@ export function listWorkspaceProjects(filter?: string): WorkspaceProject[] {
     }
   }
 
-  return projects.sort((left, right) => left.name.localeCompare(right.name));
+  const sorted = projects.sort((left, right) => left.name.localeCompare(right.name));
+  projectListCache = { at: Date.now(), projects: sorted };
+  if (filter) {
+    return sorted.filter((p) => p.name.toLowerCase().includes(filter.toLowerCase()));
+  }
+  return sorted;
+}
+
+/** Force the projects cache to refresh on next call. */
+export function invalidateWorkspaceProjectsCache(): void {
+  projectListCache = null;
 }
 
 export interface TeamAgentRecord {

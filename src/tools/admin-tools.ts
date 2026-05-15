@@ -124,7 +124,7 @@ export function registerAdminTools(server: McpServer): void {
           .map((project) => {
             const parts = [`- ${project.name} (${project.type})`, `  Path: ${project.path}`];
             if (project.description) parts.splice(1, 0, `  ${project.description}`);
-            if (project.hasClaude) parts.push('  Has .claude/CLAUDE.md');
+            if (project.hasClaude) parts.push('  Has imported agent notes');
             return parts.join('\n');
           })
           .join('\n\n'),
@@ -148,7 +148,7 @@ export function registerAdminTools(server: McpServer): void {
       const sections: string[] = [`# ${path.basename(resolved)}`, `Path: ${resolved}`];
       const claudePath = path.join(resolved, '.claude', 'CLAUDE.md');
       if (existsSync(claudePath)) {
-        sections.push('', '## CLAUDE.md', readFileSync(claudePath, 'utf-8').slice(0, 3000));
+        sections.push('', '## Imported Agent Notes', readFileSync(claudePath, 'utf-8').slice(0, 3000));
       }
 
       for (const readmeName of ['README.md', 'readme.md', 'README']) {

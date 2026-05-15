@@ -11,6 +11,7 @@ import { getAuthStatus } from '../runtime/auth-store.js';
 import { listAgentInboxCounts, listAgentStates } from '../agents/autonomy.js';
 import { getConfiguredDiscordInstallInfo } from '../channels/discord-install.js';
 import { ExecutionStore } from '../execution/store.js';
+import { isUserFacingExecution } from '../execution/scope.js';
 import { listBackgroundTasks } from '../execution/background-tasks.js';
 import { countSessionBriefs, listSessionBriefs, loadSessionBrief, refreshSessionBrief } from '../memory/session-briefs.js';
 import { SessionStore } from '../memory/session-store.js';
@@ -18,7 +19,7 @@ import { readMemoryIndexStatus } from '../memory/indexer.js';
 import { buildComposioDashboardSnapshot } from '../integrations/composio/client.js';
 import { computeAvailability, loadToolPreferences } from '../integrations/tool-preferences.js';
 import { discoverMcpServers } from '../runtime/mcp-config.js';
-import { getCoreTools } from '../tools/registry.js';
+import { getCoreToolsAsync } from '../tools/registry.js';
 import { listRuns } from '../runtime/run-events.js';
 import { listGlobalCliStatus } from '../setup/capability-status.js';
 import { getProactivityPolicySnapshot } from '../agents/proactivity-policy.js';
@@ -54,7 +55,8 @@ interface WorkflowFile {
 }
 
 function toolCategory(name: string): string {
-  if (name.startsWith('composio_')) return 'Connected apps';
+  if (name.startsWith('composio_') || name.startsWith('cx_')) return 'Connected apps';
+  if (name.startsWith('browser_harness')) return 'Browser';
   if (['workspace_roots', 'list_files', 'read_file', 'write_file', 'run_shell_command', 'git_status', 'workspace_config', 'workspace_list', 'workspace_info'].includes(name)) return 'Computer';
   if (name.startsWith('memory_') || name === 'working_memory' || name.startsWith('note_')) return 'Memory';
   if (name.startsWith('task_') || name.includes('plan') || name === 'discover_work' || name.startsWith('goal_')) return 'Planning';
@@ -63,8 +65,8 @@ function toolCategory(name: string): string {
   return 'Core';
 }
 
-function listRuntimeTools(): Array<{ name: string; description: string; category: string }> {
-  return getCoreTools()
+async function listRuntimeTools(): Promise<Array<{ name: string; description: string; category: string }>> {
+  return (await getCoreToolsAsync({ includeDynamicComposioTools: true }))
     .filter((item) => item.type === 'function')
     .map((item) => ({
       name: item.name,
@@ -195,11 +197,14 @@ export async function buildDashboardSnapshot() {
     workspaces: getWorkspaceDirs(),
     workspaceProjects: listWorkspaceProjects().slice(0, 50),
     globalClis: listGlobalCliStatus(),
-    activeExecutions: executionStore.list(12).filter((execution) => execution.status === 'active' || execution.status === 'blocked'),
+    activeExecutions: executionStore.list(12).filter((execution) =>
+      (execution.status === 'active' || execution.status === 'blocked') &&
+      isUserFacingExecution(execution),
+    ),
     executionCount: executionStore.list(200).length,
     backgroundTasks: listBackgroundTasks().slice(0, 40),
     recentRuns: listRuns(20),
-    runtimeTools: listRuntimeTools(),
+    runtimeTools: await listRuntimeTools(),
     composio,
     toolPreferences: {
       preferences: toolPreferences.preferences,

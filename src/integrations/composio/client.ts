@@ -7,6 +7,7 @@ import { readEnvFile, writeEnvFile } from '../../setup/env-file.js';
 const ENV_FILE = path.join(BASE_DIR, '.env');
 const CACHE_DIR = path.join(BASE_DIR, 'state');
 const CATALOG_CACHE_FILE = path.join(CACHE_DIR, 'composio-catalog-cache.json');
+const SECRET_VAULT_FILE = path.join(CACHE_DIR, 'secrets-vault.json');
 const DEFAULT_USER_ID = 'default';
 const CONNECTIONS_TTL_MS = 60_000;
 const CATALOG_TTL_MS = 60 * 60_000;
@@ -133,10 +134,30 @@ function readLocalEnv(): Record<string, string> {
   return env;
 }
 
+function readSecretFromFileVaultSync(name: string): string | undefined {
+  if (!existsSync(SECRET_VAULT_FILE)) return undefined;
+  try {
+    const parsed = JSON.parse(readFileSync(SECRET_VAULT_FILE, 'utf-8')) as {
+      version?: string;
+      entries?: Record<string, string>;
+    };
+    if (parsed.version !== 'v1' || !parsed.entries) return undefined;
+    const value = parsed.entries[name];
+    return value && value.length > 0 ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function readComposioEnv(key: 'COMPOSIO_API_KEY' | 'COMPOSIO_USER_ID'): string {
   const fromProcess = process.env[key]?.trim();
   if (fromProcess) return fromProcess;
-  return readLocalEnv()[key]?.trim() ?? '';
+  const fromEnvFile = readLocalEnv()[key]?.trim();
+  if (fromEnvFile) return fromEnvFile;
+  if (key === 'COMPOSIO_API_KEY') {
+    return readSecretFromFileVaultSync('composio_api_key')?.trim() ?? '';
+  }
+  return '';
 }
 
 function str(value: unknown): string | undefined {
