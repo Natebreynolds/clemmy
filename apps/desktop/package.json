@@ -11,10 +11,11 @@
     "dev": "tsx src/main.ts",
     "start": "electron .",
     "build:daemon": "cd ../.. && npm run build",
-    "package:mac": "npm run build && npm run build:daemon && electron-builder --mac",
-    "package:mac:unsigned": "APPLE_NOTARIZE_SKIP=true CSC_IDENTITY_AUTO_DISCOVERY=false npm run build && npm run build:daemon && electron-builder --mac",
-    "package:dist": "npm run build && npm run build:daemon && electron-builder",
-    "release": "npm run build && npm run build:daemon && electron-builder --mac --publish always"
+    "rebuild-daemon-natives": "cd ../.. && npx --yes @electron/rebuild@^4 --version $(node -p \"require('./apps/desktop/node_modules/electron/package.json').version\") --types prod",
+    "package:mac": "npm run build && npm run build:daemon && npm run rebuild-daemon-natives && electron-builder --mac",
+    "package:mac:unsigned": "APPLE_NOTARIZE_SKIP=true CSC_IDENTITY_AUTO_DISCOVERY=false npm run build && npm run build:daemon && npm run rebuild-daemon-natives && electron-builder --mac",
+    "package:dist": "npm run build && npm run build:daemon && npm run rebuild-daemon-natives && electron-builder",
+    "release": "npm run build && npm run build:daemon && npm run rebuild-daemon-natives && electron-builder --mac --publish always"
   },
   "dependencies": {
     "electron-updater": "^6.8.3",
