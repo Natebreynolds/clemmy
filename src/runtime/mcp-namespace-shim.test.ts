@@ -137,13 +137,16 @@ test('shim: collides slugs from differently-spelled-but-same server names get su
 // 2) Dispatch
 
 test('shim: callTool routes to the right server with the original tool name', async () => {
-  const a = makeFakeServer({ name: 'alpha', tools: [{ name: 'search' }] });
-  const b = makeFakeServer({ name: 'beta', tools: [{ name: 'search' }] });
+  // Tool name has to classify as read by decideToolApproval — bare 'search'
+  // falls through to the conservative 'write' default and trips the approval
+  // guard, which has nothing to do with routing.
+  const a = makeFakeServer({ name: 'alpha', tools: [{ name: 'get_thing' }] });
+  const b = makeFakeServer({ name: 'beta', tools: [{ name: 'get_thing' }] });
   const shim = createMcpNamespaceShim({ servers: [a, b], cacheToolsList: false });
   await shim.listTools(); // populate routing map
-  await shim.callTool('beta__search', { q: 'pinecone' });
+  await shim.callTool('beta__get_thing', { q: 'pinecone' });
   assert.deepEqual(a._calls, []);
-  assert.deepEqual(b._calls, [{ tool: 'search', args: { q: 'pinecone' } }]);
+  assert.deepEqual(b._calls, [{ tool: 'get_thing', args: { q: 'pinecone' } }]);
 });
 
 test('shim: callTool throws a clear error for an unknown tool name', async () => {
