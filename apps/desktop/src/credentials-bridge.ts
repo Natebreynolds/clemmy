@@ -2,6 +2,9 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync,
 import path from 'node:path';
 import os from 'node:os';
 import { randomFillSync } from 'node:crypto';
+import { createRequire } from 'node:module';
+
+const requireFromHere = createRequire(import.meta.url);
 
 /**
  * Credentials bridge — the Electron main process's direct path to the
@@ -92,13 +95,26 @@ interface KeytarLike {
 
 let keytarPromise: Promise<KeytarLike | null> | null = null;
 
+// Load via createRequire instead of dynamic import(). ESM's CJS interop
+// sometimes synthesizes only a partial named-export namespace from
+// keytar's module.exports — packaged 0.2.3 hit a case where getPassword
+// was present but setPassword was missing, so callers got past the
+// truthy-check and then crashed on `keychain.setPassword is not a
+// function`. createRequire gives us the real CommonJS module.exports.
 async function loadKeytar(): Promise<KeytarLike | null> {
   if (keytarPromise) return keytarPromise;
   keytarPromise = (async () => {
     try {
-      const specifier = 'keytar';
-      const mod = (await import(specifier as string)) as unknown as KeytarLike | { default: KeytarLike };
-      return ('getPassword' in (mod as object)) ? (mod as KeytarLike) : (mod as { default: KeytarLike }).default;
+      const candidate = requireFromHere('keytar') as Partial<KeytarLike> | { default?: Partial<KeytarLike> };
+      const mod = (candidate as { default?: Partial<KeytarLike> }).default ?? (candidate as Partial<KeytarLike>);
+      if (
+        typeof mod.getPassword !== 'function' ||
+        typeof mod.setPassword !== 'function' ||
+        typeof mod.deletePassword !== 'function'
+      ) {
+        return null;
+      }
+      return mod as KeytarLike;
     } catch {
       return null;
     }
