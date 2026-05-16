@@ -320,6 +320,12 @@ async function performCodexRequest(
       },
       body: JSON.stringify(body),
       signal: abortController?.signal,
+      // Opt out of undici's keep-alive pool. After hours of daemon
+      // uptime the pool fills with stale Cloudflare-edge IPs and
+      // every reused connection times out at 10s. Fresh DNS + TCP
+      // connect per call costs a few ms; the alternative is a
+      // multi-hour outage of every chat run. Same fix as embeddings.
+      keepalive: false,
     });
 	  } catch (error) {
 	    if (abortController?.signal.aborted) {
@@ -981,6 +987,9 @@ export class CodexNativeRuntime implements AgentRuntime {
           'User-Agent': CODEX_USER_AGENT,
         },
         body: JSON.stringify(body),
+        // See note above on the main fetch site — avoid the long-
+        // uptime keep-alive pool poisoning that breaks chat.
+        keepalive: false,
       });
     } catch (err) {
       logger.warn({ err }, 'grace turn fetch failed');

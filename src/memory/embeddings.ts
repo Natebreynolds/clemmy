@@ -32,6 +32,47 @@ const BATCH_SIZE = 96;
 // Embedding model max is 8192 tokens; chunks are ~300 tokens, but we
 // hard-cap the input length to avoid surprises on edge-case files.
 const MAX_INPUT_CHARS = 16_000;
+// Per-call timeout for the embeddings fetch. Tighter than undici's
+// default (10s) so the daemon doesn't hang for a full 10s on a stale
+// Cloudflare IP — chat/recall fall back to FTS-only on timeout.
+const FETCH_TIMEOUT_MS = 6_000;
+
+// Circuit breaker for the long-running daemon's pool-poisoning
+// failure mode. After ~hours of uptime, undici keeps stale Cloudflare
+// IPs in its connection pool and every embedding call times out for
+// some period. When we see CONSECUTIVE_FAIL_THRESHOLD failures in a
+// row we open the breaker for COOLDOWN_MS — recall and the indexer
+// silently fall through to the FTS path, avoiding the 6s × N tax per
+// chat. A single success closes the breaker.
+const CONSECUTIVE_FAIL_THRESHOLD = 3;
+const COOLDOWN_MS = 5 * 60_000;
+
+let consecutiveFailures = 0;
+let cooldownUntilMs = 0;
+
+function inCooldown(): boolean {
+  if (cooldownUntilMs === 0) return false;
+  if (Date.now() >= cooldownUntilMs) {
+    // Half-open: let the next call probe. Don't reset failures — if
+    // the probe also fails the breaker re-opens immediately.
+    cooldownUntilMs = 0;
+    return false;
+  }
+  return true;
+}
+
+function recordSuccess(): void {
+  consecutiveFailures = 0;
+  cooldownUntilMs = 0;
+}
+
+function recordFailure(): void {
+  consecutiveFailures++;
+  if (consecutiveFailures >= CONSECUTIVE_FAIL_THRESHOLD && cooldownUntilMs === 0) {
+    cooldownUntilMs = Date.now() + COOLDOWN_MS;
+    logger.warn({ failures: consecutiveFailures, cooldownMs: COOLDOWN_MS }, 'embeddings circuit breaker open — falling back to FTS-only for the next 5 minutes');
+  }
+}
 
 export function isEmbeddingsEnabled(): boolean {
   return Boolean(getOpenAiApiKey());
@@ -87,6 +128,12 @@ async function embedBatch(texts: string[]): Promise<Float32Array[]> {
 
   const safeInputs = texts.map((t) => (t.length > MAX_INPUT_CHARS ? t.slice(0, MAX_INPUT_CHARS) : t));
 
+  // keepalive:false forces undici to NOT pool this connection. After
+  // hours of daemon uptime, the keep-alive pool fills with stale
+  // Cloudflare-edge IPs that no longer route — every subsequent call
+  // times out at undici's 10s connect timeout. Opting out of the pool
+  // means every embedding call does a fresh DNS lookup + TCP connect.
+  // That's a few-ms tax per call but avoids the multi-hour outage.
   const response = await fetch('https://api.openai.com/v1/embeddings', {
     method: 'POST',
     headers: {
@@ -97,6 +144,8 @@ async function embedBatch(texts: string[]): Promise<Float32Array[]> {
       model: EMBEDDING_MODEL,
       input: safeInputs,
     }),
+    keepalive: false,
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
   });
 
   if (!response.ok) {
@@ -117,10 +166,13 @@ async function embedBatch(texts: string[]): Promise<Float32Array[]> {
  */
 export async function embedQuery(query: string): Promise<Float32Array | null> {
   if (!isEmbeddingsEnabled()) return null;
+  if (inCooldown()) return null;
   try {
     const [vector] = await embedBatch([query]);
+    recordSuccess();
     return vector ?? null;
   } catch (err) {
+    recordFailure();
     logger.warn({ err }, 'embedQuery failed; falling back to FTS-only');
     return null;
   }
@@ -161,6 +213,11 @@ export async function embedMissingChunks(options: { maxChunks?: number } = {}): 
     stats.durationMs = Date.now() - start;
     return stats;
   }
+  if (inCooldown()) {
+    stats.reason = 'circuit breaker open — skipping this backfill tick';
+    stats.durationMs = Date.now() - start;
+    return stats;
+  }
 
   const db = openMemoryDb();
   const limit = Math.max(1, options.maxChunks ?? 200);
@@ -192,9 +249,18 @@ export async function embedMissingChunks(options: { maxChunks?: number } = {}): 
     let vectors: Float32Array[] = [];
     try {
       vectors = await embedBatch(batch.map((r) => r.content));
+      recordSuccess();
     } catch (err) {
+      recordFailure();
       stats.failed += batch.length;
       logger.warn({ err, batchStart: i, batchSize: batch.length }, 'embed batch failed');
+      // If the breaker tripped on this batch, bail the whole tick —
+      // hammering N more batches just to time out N more times wastes
+      // 6s per batch and floods the log.
+      if (inCooldown()) {
+        stats.reason = 'circuit breaker opened mid-tick';
+        break;
+      }
       continue;
     }
 

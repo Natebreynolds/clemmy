@@ -1,6 +1,7 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { randomFillSync } from 'node:crypto';
 
 /**
  * Credentials bridge — the Electron main process's direct path to the
@@ -375,8 +376,6 @@ export async function ensureWebhookSecret(): Promise<string> {
 
 function randomToken(len: number): string {
   const bytes = Buffer.alloc(len);
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const crypto = require('node:crypto') as typeof import('node:crypto');
-  crypto.randomFillSync(bytes);
+  randomFillSync(bytes);
   return bytes.toString('hex').slice(0, len);
 }

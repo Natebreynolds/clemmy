@@ -185,58 +185,134 @@ function readWorkflowRunRecord(runId: string): Record<string, unknown> | null {
   }
 }
 
-function parseControllerDecision(text: string): ControllerDecision | null {
-  const candidates: string[] = [text.trim()];
+// Walks the response text yielding parse candidates in cooperative
+// order: fenced code block, then trimmed whole text, then each
+// balanced top-level `{...}` block found by depth-tracking with
+// string/escape awareness. The old "first { to last }" span heuristic
+// failed on responses that contained more than one brace pair
+// (e.g. "I'll respond with {foo: 1} — here's my answer: { ... }").
+function* iterateJsonCandidates(text: string): Generator<string> {
   const fenceMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  if (fenceMatch?.[1]) candidates.push(fenceMatch[1].trim());
-  const start = text.indexOf('{');
-  const end = text.lastIndexOf('}');
-  if (start !== -1 && end > start) candidates.push(text.slice(start, end + 1));
+  if (fenceMatch?.[1]) yield fenceMatch[1].trim();
+  const trimmed = text.trim();
+  if (trimmed) yield trimmed;
+  yield* iterateBalancedObjects(text);
+}
 
-  for (const candidate of candidates) {
-    if (!candidate) continue;
-    try {
-      const parsed = JSON.parse(candidate) as Partial<ControllerDecision>;
-      return {
-        summary: typeof parsed.summary === 'string' ? parsed.summary : 'No summary provided.',
-        nextReviewMinutes: typeof parsed.nextReviewMinutes === 'number' ? parsed.nextReviewMinutes : undefined,
-        actions: Array.isArray(parsed.actions) ? parsed.actions as ControllerAction[] : [],
-      };
-    } catch {
-      continue;
+function* iterateBalancedObjects(text: string): Generator<string> {
+  let i = 0;
+  while (i < text.length) {
+    if (text[i] !== '{') { i++; continue; }
+    const start = i;
+    let depth = 0;
+    let inString = false;
+    let escape = false;
+    let consumed = start;
+    for (; consumed < text.length; consumed++) {
+      const ch = text[consumed];
+      if (escape) { escape = false; continue; }
+      if (ch === '\\') { escape = true; continue; }
+      if (ch === '"') { inString = !inString; continue; }
+      if (inString) continue;
+      if (ch === '{') depth++;
+      else if (ch === '}') {
+        depth--;
+        if (depth === 0) {
+          yield text.slice(start, consumed + 1);
+          break;
+        }
+      }
     }
+    if (depth !== 0) return; // unbalanced tail — no further candidates worth scanning
+    i = consumed + 1;
+  }
+}
+
+// Strict JSON.parse first, then a tolerant retry on a cleaned copy.
+// Cleanups address the three failure modes observed across model
+// outputs on the Codex backend: stray // comments on their own line,
+// smart/curly quotes around keys or strings, and trailing commas
+// before close-brace/bracket. None of these are valid JSON, but the
+// model emits them often enough that recovering is cheaper than a
+// second round-trip.
+function relaxedJsonParse(candidate: string): unknown {
+  try { return JSON.parse(candidate); } catch {}
+  const cleaned = candidate
+    .replace(/^\s*\/\/.*$/gm, '')
+    .replace(/[“”]/g, '"')
+    .replace(/[‘’]/g, "'")
+    .replace(/,(\s*[}\]])/g, '$1');
+  try { return JSON.parse(cleaned); } catch { return null; }
+}
+
+const JSON_RETRY_INSTRUCTION =
+  '\n\nYour previous response could not be parsed as JSON. Reply with a single JSON object only — no prose, no markdown fences, no comments, no trailing commas.';
+
+// Runs the model once, parses, and on failure re-runs with a sterner
+// reminder appended before parsing again. On final failure logs a
+// truncated sample of both raw responses so we can actually see what
+// the model returned. Previously we logged only the executionId and
+// the "unparsable output" message — diagnosing root cause required
+// reproducing the exact prompt by hand.
+async function runDecisionWithRetry<T>(
+  assistant: ClementineAssistant,
+  request: RunRequest,
+  parser: (text: string) => T | null,
+  logContext: Record<string, unknown>,
+): Promise<T | null> {
+  const first = await assistant.getRuntime().run(request);
+  const parsedFirst = parser(first.text);
+  if (parsedFirst) return parsedFirst;
+
+  const retryRequest: RunRequest = {
+    ...request,
+    prompt: `${request.prompt}${JSON_RETRY_INSTRUCTION}`,
+  };
+  const second = await assistant.getRuntime().run(retryRequest);
+  const parsedSecond = parser(second.text);
+  if (parsedSecond) {
+    logger.info({ ...logContext, rawSample: first.text.slice(0, 800) }, 'Decision parser recovered on retry');
+    return parsedSecond;
   }
 
+  logger.warn({
+    ...logContext,
+    rawSampleFirst: first.text.slice(0, 800),
+    rawSampleRetry: second.text.slice(0, 800),
+  }, 'Decision still unparsable after retry');
+  return null;
+}
+
+function parseControllerDecision(text: string): ControllerDecision | null {
+  for (const candidate of iterateJsonCandidates(text)) {
+    if (!candidate) continue;
+    const parsed = relaxedJsonParse(candidate) as Partial<ControllerDecision> | null;
+    if (!parsed || typeof parsed !== 'object') continue;
+    return {
+      summary: typeof parsed.summary === 'string' ? parsed.summary : 'No summary provided.',
+      nextReviewMinutes: typeof parsed.nextReviewMinutes === 'number' ? parsed.nextReviewMinutes : undefined,
+      actions: Array.isArray(parsed.actions) ? parsed.actions as ControllerAction[] : [],
+    };
+  }
   return null;
 }
 
 function parseSynthesisDecision(text: string): SynthesisDecision | null {
-  const candidates: string[] = [text.trim()];
-  const fenceMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  if (fenceMatch?.[1]) candidates.push(fenceMatch[1].trim());
-  const start = text.indexOf('{');
-  const end = text.lastIndexOf('}');
-  if (start !== -1 && end > start) candidates.push(text.slice(start, end + 1));
-
-  for (const candidate of candidates) {
+  for (const candidate of iterateJsonCandidates(text)) {
     if (!candidate) continue;
-    try {
-      const parsed = JSON.parse(candidate) as Partial<SynthesisDecision>;
-      return {
-        summary: typeof parsed.summary === 'string' ? parsed.summary : 'No synthesis summary provided.',
-        nextStep: typeof parsed.nextStep === 'string' ? parsed.nextStep : undefined,
-        status: parsed.status === 'active' || parsed.status === 'blocked' || parsed.status === 'completed' ? parsed.status : undefined,
-        blocker: typeof parsed.blocker === 'string' ? parsed.blocker : undefined,
-        notifyUser: typeof parsed.notifyUser === 'boolean' ? parsed.notifyUser : undefined,
-        notificationTitle: typeof parsed.notificationTitle === 'string' ? parsed.notificationTitle : undefined,
-        notificationBody: typeof parsed.notificationBody === 'string' ? parsed.notificationBody : undefined,
-        nextReviewMinutes: typeof parsed.nextReviewMinutes === 'number' ? parsed.nextReviewMinutes : undefined,
-      };
-    } catch {
-      continue;
-    }
+    const parsed = relaxedJsonParse(candidate) as Partial<SynthesisDecision> | null;
+    if (!parsed || typeof parsed !== 'object') continue;
+    return {
+      summary: typeof parsed.summary === 'string' ? parsed.summary : 'No synthesis summary provided.',
+      nextStep: typeof parsed.nextStep === 'string' ? parsed.nextStep : undefined,
+      status: parsed.status === 'active' || parsed.status === 'blocked' || parsed.status === 'completed' ? parsed.status : undefined,
+      blocker: typeof parsed.blocker === 'string' ? parsed.blocker : undefined,
+      notifyUser: typeof parsed.notifyUser === 'boolean' ? parsed.notifyUser : undefined,
+      notificationTitle: typeof parsed.notificationTitle === 'string' ? parsed.notificationTitle : undefined,
+      notificationBody: typeof parsed.notificationBody === 'string' ? parsed.notificationBody : undefined,
+      nextReviewMinutes: typeof parsed.nextReviewMinutes === 'number' ? parsed.nextReviewMinutes : undefined,
+    };
   }
-
   return null;
 }
 
@@ -728,8 +804,10 @@ async function runSynthesisDecision(
     prompt: buildSynthesisPrompt(execution, plan, activity),
   };
 
-  const result = await assistant.getRuntime().run(request);
-  return parseSynthesisDecision(result.text);
+  return runDecisionWithRetry(assistant, request, parseSynthesisDecision, {
+    executionId: execution.id,
+    decisionKind: 'synthesis',
+  });
 }
 
 function applySynthesisDecision(
@@ -815,7 +893,6 @@ async function maybeSynthesizeExecution(
 
   const decision = await runSynthesisDecision(assistant, execution, plan, activity);
   if (!decision) {
-    logger.warn({ executionId: execution.id }, 'Execution synthesis returned unparsable output');
     return { execution };
   }
 
@@ -897,8 +974,10 @@ async function runControllerDecision(assistant: ClementineAssistant, execution: 
     prompt: buildControllerPrompt(execution, plan),
   };
 
-  const result = await assistant.getRuntime().run(request);
-  return parseControllerDecision(result.text);
+  return runDecisionWithRetry(assistant, request, parseControllerDecision, {
+    executionId: execution.id,
+    decisionKind: 'controller',
+  });
 }
 
 function applyNextReview(store: ExecutionStore, execution: ExecutionRecord, minutes?: number): ExecutionRecord {
@@ -959,7 +1038,6 @@ async function advanceExecution(assistant: ClementineAssistant, execution: Execu
 
   const decision = await runControllerDecision(assistant, execution, plan);
   if (!decision) {
-    logger.warn({ executionId: execution.id }, 'Execution controller returned unparsable output');
     applyNextReview(store, execution, 30);
     return;
   }
