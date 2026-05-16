@@ -35,7 +35,26 @@ const STATE_DIR = path.join(BASE_DIR, 'state', 'goals');
 const DEFAULT_TURNS_LIMIT = 20;
 const DEFAULT_JUDGE_PARSE_FAILURE_LIMIT = 3;
 
-export type GoalStatus = 'active' | 'paused' | 'done' | 'aborted';
+/**
+ * Terminal + intermediate states for a goal run.
+ *
+ * Vocabulary aligned with OpenAI Codex CLI 0.128.0's /goal slash command
+ * (https://developers.openai.com/codex/cli/slash-commands) so users
+ * switching between Clementine and Codex have one mental model:
+ *
+ *   pursuing       — the loop is in flight, currently making progress
+ *   paused         — explicit pause: user said /goal pause, judge wedged,
+ *                    or an error during the loop forced a halt that the
+ *                    user can resume from
+ *   achieved       — the judge confirmed the objective is complete
+ *   unmet          — the loop ended without completing the objective
+ *                    (user aborted, or terminal failure)
+ *   budget-limited — turns budget was exhausted before the judge said done
+ *
+ * Older on-disk states used: active/done/aborted. The reader maps those
+ * forward on load so existing goal files keep working.
+ */
+export type GoalStatus = 'pursuing' | 'paused' | 'achieved' | 'unmet' | 'budget-limited';
 
 export interface GoalState {
   sessionId: string;
@@ -50,8 +69,32 @@ export interface GoalState {
   judgeParseFailures: number;
   /** Last summary the assistant produced — used to inform the next continuation prompt. */
   lastSummary?: string;
-  /** When `done`, the judge's reason text. */
+  /** When `achieved`, the judge's reason text. When budget-limited or
+   *  unmet, a short note describing why the loop stopped. */
   doneReason?: string;
+}
+
+/**
+ * Legacy → current status remap. Goal state files written before the
+ * Codex-aligned vocabulary used these names; map them forward so users
+ * don't lose in-flight goals across the upgrade.
+ */
+const LEGACY_STATUS_MAP: Record<string, GoalStatus> = {
+  active: 'pursuing',
+  done: 'achieved',
+  aborted: 'unmet',
+};
+
+function normalizeStatus(raw: unknown): GoalStatus {
+  if (typeof raw === 'string') {
+    if (LEGACY_STATUS_MAP[raw]) return LEGACY_STATUS_MAP[raw];
+    if (raw === 'pursuing' || raw === 'paused' || raw === 'achieved' || raw === 'unmet' || raw === 'budget-limited') {
+      return raw;
+    }
+  }
+  // Unknown / missing → safest assumption is paused so the user can
+  // inspect and either resume or clear.
+  return 'paused';
 }
 
 function ensureStateDir(): void {
@@ -71,7 +114,11 @@ export function loadGoalState(sessionId: string): GoalState | null {
   const file = goalFile(sessionId);
   if (!existsSync(file)) return null;
   try {
-    return JSON.parse(readFileSync(file, 'utf-8')) as GoalState;
+    const parsed = JSON.parse(readFileSync(file, 'utf-8')) as Partial<GoalState> & { status?: unknown };
+    // Forward-map legacy status names. Save the normalized state back
+    // to disk lazily on the next saveGoalState so over time the legacy
+    // strings disappear from the vault.
+    return { ...parsed, status: normalizeStatus(parsed.status) } as GoalState;
   } catch {
     return null;
   }
@@ -90,7 +137,9 @@ export function clearGoalState(sessionId: string): void {
   }
 }
 
-/** List every active goal across all sessions — used by `/goal status`. */
+/** List every active goal across all sessions — used by `/goal status`.
+ *  Returns states that haven't reached a terminal kind (achieved /
+ *  unmet / budget-limited); pursuing + paused are both "still in play". */
 export function listActiveGoals(): GoalState[] {
   ensureStateDir();
   if (!existsSync(STATE_DIR)) return [];
@@ -98,8 +147,9 @@ export function listActiveGoals(): GoalState[] {
   for (const name of readdirSync(STATE_DIR)) {
     if (!name.endsWith('.json')) continue;
     try {
-      const state = JSON.parse(readFileSync(path.join(STATE_DIR, name), 'utf-8')) as GoalState;
-      if (state.status === 'active' || state.status === 'paused') {
+      const parsed = JSON.parse(readFileSync(path.join(STATE_DIR, name), 'utf-8')) as Partial<GoalState>;
+      const state = { ...parsed, status: normalizeStatus(parsed.status) } as GoalState;
+      if (state.status === 'pursuing' || state.status === 'paused') {
         out.push(state);
       }
     } catch { /* skip corrupt entries */ }
@@ -116,14 +166,37 @@ interface JudgeResult {
   parseFailed: boolean;
 }
 
+/**
+ * Judge system prompt — modeled on OpenAI Codex's continuation.md
+ * auditor pattern (Codex CLI 0.128.0, April 2026). The Codex prompt
+ * explicitly tells the agent: "Do not accept proxy signals as
+ * completion by themselves. Build an audit checklist mapping
+ * requirements → verifiable evidence before marking done."
+ *
+ * The audit-checklist framing is meaningfully stronger than a generic
+ * "is this done?" because it forces the judge to enumerate concrete
+ * deliverables and check evidence for each — which is the dimension
+ * a confident-sounding but incomplete assistant response usually
+ * fails on.
+ */
 const JUDGE_SYSTEM_PROMPT = [
   'You are a goal-completion judge. You receive (1) a user objective and (2) the most recent assistant response.',
-  'Decide whether the objective has been COMPLETED by the assistant. Be strict — a partial summary, a plan, or "I will work on this next" is NOT complete.',
-  'Output ONLY a JSON object on one line with no prose: {"done": <boolean>, "reason": "<one short sentence>"}.',
+  '',
+  'Use an AUDIT CHECKLIST: enumerate the concrete, verifiable deliverables the objective implies, then check each one against the assistant\'s response.',
+  '',
+  'Rules:',
+  '- A deliverable counts as complete only when the response contains VERIFIABLE EVIDENCE (a URL, a file path, a quoted result, an emitted artifact) — not a promise or summary of what was done.',
+  '- Do NOT accept proxy signals (e.g. "I have updated the records", "task complete", "✓") as completion by themselves. Require the artifact or its output.',
+  '- A plan, intention, or "I will work on this next" is NOT complete.',
+  '- Partial completion of multiple deliverables is NOT complete unless the objective only asked for one.',
+  '- If the objective is ambiguous, lean toward not-done so the user can clarify rather than the loop terminating prematurely.',
+  '',
+  'Output ONLY a JSON object on one line with no prose: {"done": <boolean>, "reason": "<one short sentence naming the missing evidence or the artifact that satisfied the objective>"}.',
+  '',
   'Examples:',
-  '  {"done": true, "reason": "Spreadsheet created and URL returned"}',
-  '  {"done": false, "reason": "Assistant proposed steps but did not execute them"}',
-  '  {"done": false, "reason": "Two of three deliverables remain — see assistant\'s pending list"}',
+  '  {"done": true, "reason": "Spreadsheet created at /Users/me/Q3.xlsx with URL returned"}',
+  '  {"done": false, "reason": "Assistant proposed steps but no artifact or URL was produced"}',
+  '  {"done": false, "reason": "Two of three deliverables remain — emails drafted but no send confirmation evidence"}',
 ].join('\n');
 
 async function callJudge(
@@ -200,7 +273,7 @@ export async function runGoalLoop(opts: GoalLoopOptions): Promise<GoalState> {
     state = {
       sessionId,
       objective: opts.objective,
-      status: 'active',
+      status: 'pursuing',
       startedAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       turnsUsed: 0,
@@ -208,7 +281,7 @@ export async function runGoalLoop(opts: GoalLoopOptions): Promise<GoalState> {
       judgeParseFailures: 0,
     };
   } else {
-    state.status = 'active';
+    state.status = 'pursuing';
     state.turnsLimit = turnsLimit;
     state.judgeParseFailures = 0;
   }
@@ -216,8 +289,11 @@ export async function runGoalLoop(opts: GoalLoopOptions): Promise<GoalState> {
 
   while (state.turnsUsed < state.turnsLimit) {
     if (await opts.shouldCancel?.()) {
-      state.status = 'aborted';
+      // Codex vocabulary: explicit user cancellation maps to `unmet` —
+      // the loop ended without satisfying the objective.
+      state.status = 'unmet';
       state.pausedAt = new Date().toISOString();
+      state.doneReason = state.doneReason ?? 'Cancelled by user before completion.';
       saveGoalState(state);
       return state;
     }
@@ -254,8 +330,9 @@ export async function runGoalLoop(opts: GoalLoopOptions): Promise<GoalState> {
 
     // Cancellation between assistant + judge.
     if (await opts.shouldCancel?.()) {
-      state.status = 'aborted';
+      state.status = 'unmet';
       state.pausedAt = new Date().toISOString();
+      state.doneReason = state.doneReason ?? 'Cancelled by user between turn and judge.';
       saveGoalState(state);
       return state;
     }
@@ -279,16 +356,21 @@ export async function runGoalLoop(opts: GoalLoopOptions): Promise<GoalState> {
     }
 
     if (judgement.done) {
-      state.status = 'done';
+      state.status = 'achieved';
       state.doneReason = judgement.reason;
       saveGoalState(state);
       return state;
     }
   }
 
-  // Budget exhausted without the judge saying done.
-  state.status = 'paused';
+  // Turn budget exhausted without the judge marking the objective
+  // achieved. Codex distinguishes this from a user pause — it's
+  // `budget-limited` so the surface can offer "extend budget" vs
+  // the generic "resume" treatment. The doneReason captures the
+  // exact stop condition for the UI.
+  state.status = 'budget-limited';
   state.pausedAt = new Date().toISOString();
+  state.doneReason = `Turn budget (${state.turnsLimit}) exhausted before judge marked the objective achieved.`;
   saveGoalState(state);
   return state;
 }
@@ -326,13 +408,15 @@ export function describeGoalState(state: GoalState | null): string {
   if (!state) return 'No goal active in this session. Use `/goal <objective>` to start one.';
   const pct = `${state.turnsUsed}/${state.turnsLimit}`;
   switch (state.status) {
-    case 'active':
-      return `Goal active (${pct}): ${state.objective}`;
+    case 'pursuing':
+      return `Goal pursuing (${pct}): ${state.objective}`;
     case 'paused':
       return `Goal paused at ${pct} — "${state.objective}". Use \`/goal resume\` to continue or \`/goal clear\` to drop it.`;
-    case 'done':
-      return `Goal complete (${pct}): ${state.objective}${state.doneReason ? ` — ${state.doneReason}` : ''}`;
-    case 'aborted':
-      return `Goal aborted at ${pct}: ${state.objective}`;
+    case 'achieved':
+      return `Goal achieved (${pct}): ${state.objective}${state.doneReason ? ` — ${state.doneReason}` : ''}`;
+    case 'unmet':
+      return `Goal unmet at ${pct}: ${state.objective}${state.doneReason ? ` — ${state.doneReason}` : ''}`;
+    case 'budget-limited':
+      return `Goal budget-limited at ${pct} — "${state.objective}". Hit the turn cap before the audit checklist was complete; \`/goal resume\` to extend, or \`/goal clear\` to drop it.`;
   }
 }

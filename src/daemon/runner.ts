@@ -12,14 +12,17 @@ import { ensureSeedTemplates, processProactiveCheckIns } from '../agents/check-i
 import { MODELS } from '../config.js';
 import { processExecutionController } from '../execution/controller.js';
 import { interruptStaleRunningBackgroundTasks, processBackgroundTasks } from '../execution/background-tasks.js';
+import { processWorkflowRuns, reconcilePendingWorkflowRuns } from '../execution/workflow-runner.js';
 import { sweepStaleExecutions } from '../execution/store.js';
 import { sweepStaleRuns } from '../runtime/run-events.js';
 import { sweepStaleApprovals } from '../runtime/approval-store.js';
 import { processMemoryMaintenance } from '../memory/maintenance.js';
 import {
   CRON_FILE,
-  WORKFLOWS_DIR,
 } from '../memory/vault.js';
+import {
+  migrateLegacyWorkflowsOnce,
+} from '../memory/workflow-store.js';
 import {
   CRON_PROGRESS_DIR,
   CRON_RUNS_DIR,
@@ -49,25 +52,6 @@ interface CronJobRecord {
   work_dir?: string;
   mode?: 'standard' | 'unleashed';
   max_hours?: number;
-}
-
-interface WorkflowStepInput {
-  id: string;
-  prompt: string;
-  dependsOn?: string[];
-  model?: string;
-  tier?: number;
-  maxTurns?: number;
-}
-
-interface WorkflowFile {
-  name: string;
-  description: string;
-  enabled: boolean;
-  trigger: { schedule?: string; manual?: boolean };
-  steps: WorkflowStepInput[];
-  inputs?: Record<string, { type?: 'string' | 'number'; default?: string; description?: string }>;
-  synthesis?: { prompt?: string };
 }
 
 interface DaemonState {
@@ -143,39 +127,6 @@ function loadCronJobs(): CronJobRecord[] {
   } catch {
     return [];
   }
-}
-
-function listWorkflowFiles(): Array<{ filePath: string; data: WorkflowFile }> {
-  if (!existsSync(WORKFLOWS_DIR)) return [];
-  const items: Array<{ filePath: string; data: WorkflowFile }> = [];
-  for (const file of readdirSync(WORKFLOWS_DIR).filter((entry) => entry.endsWith('.md'))) {
-    try {
-      const filePath = path.join(WORKFLOWS_DIR, file);
-      const parsed = matter(readFileSync(filePath, 'utf-8'));
-      items.push({
-        filePath,
-        data: {
-          name: String(parsed.data.name ?? path.basename(file, '.md')),
-          description: String(parsed.data.description ?? ''),
-          enabled: parsed.data.enabled !== false,
-          trigger: typeof parsed.data.trigger === 'object' && parsed.data.trigger ? parsed.data.trigger as WorkflowFile['trigger'] : { manual: true },
-          steps: Array.isArray(parsed.data.steps) ? parsed.data.steps as WorkflowStepInput[] : [],
-          inputs: typeof parsed.data.inputs === 'object' && parsed.data.inputs ? parsed.data.inputs as WorkflowFile['inputs'] : undefined,
-          synthesis: typeof parsed.data.synthesis === 'object' && parsed.data.synthesis ? parsed.data.synthesis as WorkflowFile['synthesis'] : undefined,
-        },
-      });
-    } catch {
-      continue;
-    }
-  }
-  return items;
-}
-
-function renderTemplate(template: string, inputs: Record<string, string>, stepOutputs: Record<string, string>): string {
-  return template
-    .replace(/\{\{date\}\}/g, new Date().toISOString().slice(0, 10))
-    .replace(/\{\{input\.([a-zA-Z0-9_-]+)\}\}/g, (_match, key: string) => inputs[key] ?? '')
-    .replace(/\{\{steps\.([a-zA-Z0-9_-]+)\.output\}\}/g, (_match, key: string) => stepOutputs[key] ?? '');
 }
 
 function appendRunLog(jobName: string, payload: Record<string, unknown>): void {
@@ -280,94 +231,11 @@ async function processCronTriggers(assistant: ClementineAssistant): Promise<void
   }
 }
 
-async function processWorkflowRuns(assistant: ClementineAssistant): Promise<void> {
-  ensureDir(WORKFLOW_RUNS_DIR);
-  const workflows = listWorkflowFiles();
-  for (const file of readdirSync(WORKFLOW_RUNS_DIR).filter((entry) => entry.endsWith('.json'))) {
-    const filePath = path.join(WORKFLOW_RUNS_DIR, file);
-    let run: { id: string; workflow: string; inputs?: Record<string, string>; status?: string; createdAt?: string } | null = null;
-    try {
-      run = JSON.parse(readFileSync(filePath, 'utf-8')) as { id: string; workflow: string; inputs?: Record<string, string>; status?: string; createdAt?: string };
-      if (run.status && run.status !== 'queued') continue;
-
-      const workflow = workflows.find((entry) => entry.data.name === run?.workflow);
-      if (!workflow || !workflow.data.enabled) {
-        writeFileSync(filePath, JSON.stringify({ ...run, status: 'error', error: 'Workflow not found or disabled' }, null, 2), 'utf-8');
-        continue;
-      }
-
-      const inputs = {
-        ...Object.fromEntries(Object.entries(workflow.data.inputs ?? {}).map(([key, meta]) => [key, meta.default ?? ''])),
-        ...(run.inputs ?? {}),
-      };
-      const stepOutputs: Record<string, string> = {};
-      writeFileSync(filePath, JSON.stringify({ ...run, status: 'running', startedAt: new Date().toISOString() }, null, 2), 'utf-8');
-
-      for (const step of workflow.data.steps) {
-        const prompt = renderTemplate(step.prompt, inputs, stepOutputs);
-        const response = await assistant.respond({
-          sessionId: `workflow:${run.id}:${step.id}`,
-          channel: 'workflow',
-          message: `Workflow: ${workflow.data.name}\nStep: ${step.id}\n\n${prompt}`,
-          model: step.model || MODELS.primary,
-        });
-        stepOutputs[step.id] = response.text;
-      }
-
-      let finalOutput = Object.entries(stepOutputs)
-        .map(([stepId, output]) => `## ${stepId}\n${output}`)
-        .join('\n\n');
-
-      if (workflow.data.synthesis?.prompt) {
-        const synthesisPrompt = renderTemplate(workflow.data.synthesis.prompt, inputs, stepOutputs);
-        const synthesis = await assistant.respond({
-          sessionId: `workflow:${run.id}:synthesis`,
-          channel: 'workflow',
-          message: `${synthesisPrompt}\n\nStep outputs:\n\n${finalOutput}`,
-          model: MODELS.primary,
-        });
-        finalOutput = synthesis.text;
-      }
-
-      writeFileSync(filePath, JSON.stringify({
-        ...run,
-        status: 'completed',
-        finishedAt: new Date().toISOString(),
-        stepOutputs,
-        output: finalOutput,
-      }, null, 2), 'utf-8');
-      addNotification({
-        id: `${Date.now()}-workflow-${run.id}`,
-        kind: 'workflow',
-        title: `Workflow completed: ${workflow.data.name}`,
-        body: finalOutput.slice(0, 2000),
-        createdAt: new Date().toISOString(),
-        read: false,
-        metadata: { workflow: workflow.data.name, runId: run.id },
-      });
-      logger.info({ workflow: workflow.data.name, runId: run.id }, 'Workflow run completed');
-    } catch (error) {
-      logger.error({ err: error, file }, 'Workflow run failed');
-      if (run) {
-        writeFileSync(filePath, JSON.stringify({
-          ...run,
-          status: 'error',
-          finishedAt: new Date().toISOString(),
-          error: error instanceof Error ? error.message : String(error),
-        }, null, 2), 'utf-8');
-        addNotification({
-          id: `${Date.now()}-workflow-${run.id}-error`,
-          kind: 'workflow',
-          title: `Workflow failed: ${run.workflow}`,
-          body: error instanceof Error ? error.message : String(error),
-          createdAt: new Date().toISOString(),
-          read: false,
-          metadata: { workflow: run.workflow, runId: run.id, status: 'error' },
-        });
-      }
-    }
-  }
-}
+// Workflow execution lives in src/execution/workflow-runner.ts now —
+// the new runner supports per-step forEach fan-out, deterministic
+// scripted steps, and append-only events.jsonl for resume after
+// daemon restart (research_bot/manager.py pattern). The inline
+// sequential runner that lived here has been retired.
 
 async function processNotificationDeliveries(): Promise<void> {
   const queue = listQueuedNotificationDeliveries();
@@ -484,6 +352,29 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
   // exist on disk (disabled). Re-runs are no-ops because the seeder
   // skips seededIds it already created.
   ensureSeedTemplates();
+
+  // One-time migration: convert any legacy flat workflow .md files
+  // into <name>/SKILL.md directories so the rest of the loader can
+  // assume the Skills-spec layout. Idempotent; the original is kept
+  // as <name>.md.bak for one clean boot, then removed.
+  try {
+    const migrated = migrateLegacyWorkflowsOnce();
+    if (migrated.length > 0) {
+      logger.info({ migrated }, 'Migrated legacy workflow .md files to SKILL.md directories');
+    }
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Workflow legacy migration failed (continuing)');
+  }
+
+  // Surface any in-flight workflow runs that didn't reach a terminal
+  // state — daemon restart, crash, or kill mid-run. The runner picks
+  // these up on the next tick and resumes from the last successful
+  // step using the events.jsonl log.
+  try {
+    reconcilePendingWorkflowRuns();
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Pending workflow run reconcile failed');
+  }
 
   logger.info('Daemon loop started');
 

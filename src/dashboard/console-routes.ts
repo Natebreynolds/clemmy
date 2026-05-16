@@ -13,6 +13,14 @@ import { openMemoryDb } from '../memory/db.js';
 import { readMemoryIndexStatus, reindexVault } from '../memory/indexer.js';
 import { IDENTITY_FILE, MEMORY_FILE, SOUL_FILE, WORKFLOWS_DIR, WORKING_MEMORY_FILE } from '../memory/vault.js';
 import { ensureDir, getWorkspaceDirs, listWorkspaceProjects, parseTasks, GOALS_DIR, TASKS_FILE, WORKFLOW_RUNS_DIR } from '../tools/shared.js';
+import {
+  deleteWorkflow,
+  listWorkflows,
+  readWorkflow,
+  writeWorkflow,
+  type WorkflowDefinition,
+} from '../memory/workflow-store.js';
+import { readWorkflowEvents } from '../execution/workflow-events.js';
 import { ExecutionStore } from '../execution/store.js';
 import { listOpenCheckIns } from '../agents/check-ins.js';
 import type { ClementineAssistant } from '../assistant/core.js';
@@ -327,13 +335,14 @@ async function handleGoalCommand(opts: {
   });
 
   // Terminal event. The dashboard reads this to render the final
-  // affordance — "complete" / "paused → resume?" / "aborted".
+  // affordance — "achieved" / "paused → resume?" / "budget-limited" /
+  // "unmet". Vocabulary mirrors OpenAI Codex CLI 0.128.0's /goal.
   const finalText = describeGoalState(result);
   writeEvent({
     type: 'done',
     text: finalText,
-    stoppedReason: result.status === 'done' ? 'success'
-      : result.status === 'paused' ? 'max-turns-with-grace'
+    stoppedReason: result.status === 'achieved' ? 'success'
+      : result.status === 'paused' || result.status === 'budget-limited' ? 'max-turns-with-grace'
       : 'cancelled',
     turnsUsed: result.turnsUsed,
     goalStatus: result.status,
@@ -347,33 +356,8 @@ function validateCronExpression(expr: string): boolean {
   return parts.every((part) => /^(\*|\*\/\d+|\d+|\d+-\d+)(,(\*\/\d+|\d+|\d+-\d+))*$/.test(part));
 }
 
-function sanitizeWorkflowFileName(name: string): string {
-  return `${name.replace(/[^a-zA-Z0-9_-]/g, '-').toLowerCase()}.md`;
-}
-
-function findWorkflowFile(workflowName: string): { file: string; data: WorkflowFrontmatter; content: string } | null {
-  if (!existsSync(WORKFLOWS_DIR)) return null;
-  for (const file of readdirSync(WORKFLOWS_DIR).filter((f) => f.endsWith('.md'))) {
-    const filePath = path.join(WORKFLOWS_DIR, file);
-    try {
-      const parsed = matter(readFileSync(filePath, 'utf-8'));
-      const data = parsed.data as WorkflowFrontmatter;
-      if (data.name === workflowName) return { file, data, content: parsed.content };
-    } catch { continue; }
-  }
-  return null;
-}
-
-function listAllWorkflows(): Array<{ file: string; data: WorkflowFrontmatter }> {
-  if (!existsSync(WORKFLOWS_DIR)) return [];
-  const out: Array<{ file: string; data: WorkflowFrontmatter }> = [];
-  for (const file of readdirSync(WORKFLOWS_DIR).filter((f) => f.endsWith('.md'))) {
-    try {
-      const parsed = matter(readFileSync(path.join(WORKFLOWS_DIR, file), 'utf-8'));
-      out.push({ file, data: parsed.data as WorkflowFrontmatter });
-    } catch { continue; }
-  }
-  return out.sort((a, b) => (a.data.name ?? '').localeCompare(b.data.name ?? ''));
+function sanitizeWorkflowName(name: string): string {
+  return name.replace(/[^a-zA-Z0-9_-]/g, '-').toLowerCase();
 }
 
 interface WorkflowValidation {
@@ -727,18 +711,22 @@ export function registerConsoleRoutes(
   app.get('/api/console/workflows', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
-      const items = listAllWorkflows().map(({ file, data }) => ({
-        name: data.name ?? file.replace(/\.md$/, ''),
-        file,
-        description: data.description ?? '',
-        enabled: data.enabled !== false,
-        triggerSchedule: data.trigger?.schedule ?? null,
-        stepCount: Array.isArray(data.steps) ? data.steps.length : 0,
-        trigger: data.trigger ?? { manual: true },
-        steps: data.steps ?? [],
-        inputs: data.inputs ?? {},
-        synthesis: data.synthesis ?? null,
-      }));
+      const items = listWorkflows()
+        .sort((a, b) => a.data.name.localeCompare(b.data.name))
+        .map((entry) => ({
+          name: entry.data.name,
+          file: entry.layout === 'directory' ? `${entry.name}/SKILL.md` : `${entry.name}.md`,
+          description: entry.data.description,
+          enabled: entry.data.enabled,
+          triggerSchedule: entry.data.trigger.schedule ?? null,
+          stepCount: entry.data.steps.length,
+          trigger: entry.data.trigger,
+          steps: entry.data.steps,
+          inputs: entry.data.inputs ?? {},
+          synthesis: entry.data.synthesis ?? null,
+          allowedTools: entry.data.allowedTools ?? null,
+          whenToUse: entry.data.whenToUse ?? null,
+        }));
       res.json({ workflows: items });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
@@ -747,17 +735,23 @@ export function registerConsoleRoutes(
 
   app.get('/api/console/workflows/:name', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
-    const entry = findWorkflowFile(req.params.name);
+    // Accept lookup either by display name (data.name) or by directory
+    // slug. Most callers use the display name (round-tripped from the
+    // workflows list), but the Architect agent may pass the slug.
+    const target = req.params.name;
+    const entry = listWorkflows().find((e) => e.data.name === target || e.name === target);
     if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
     res.json({
-      name: entry.data.name ?? req.params.name,
-      file: entry.file,
-      description: entry.data.description ?? '',
-      enabled: entry.data.enabled !== false,
-      trigger: entry.data.trigger ?? { manual: true },
-      steps: entry.data.steps ?? [],
+      name: entry.data.name,
+      file: entry.layout === 'directory' ? `${entry.name}/SKILL.md` : `${entry.name}.md`,
+      description: entry.data.description,
+      enabled: entry.data.enabled,
+      trigger: entry.data.trigger,
+      steps: entry.data.steps,
       inputs: entry.data.inputs ?? {},
       synthesis: entry.data.synthesis ?? null,
+      allowedTools: entry.data.allowedTools ?? null,
+      whenToUse: entry.data.whenToUse ?? null,
     });
   });
 
@@ -766,7 +760,8 @@ export function registerConsoleRoutes(
     const body = req.body ?? {};
     const name = typeof body.name === 'string' ? body.name.trim() : '';
     if (!name) { res.status(400).json({ error: 'name required' }); return; }
-    if (findWorkflowFile(name)) { res.status(409).json({ error: 'workflow already exists' }); return; }
+    const slug = sanitizeWorkflowName(name);
+    if (readWorkflow(slug)) { res.status(409).json({ error: 'workflow already exists' }); return; }
     const description = typeof body.description === 'string' ? body.description : '';
     const steps = Array.isArray(body.steps) ? body.steps : [];
     const triggerSchedule = typeof body.triggerSchedule === 'string' ? body.triggerSchedule.trim() : '';
@@ -778,30 +773,26 @@ export function registerConsoleRoutes(
       ? { prompt: body.synthesisPrompt.trim() } : undefined;
     const inputs = (body.inputs && typeof body.inputs === 'object') ? body.inputs : undefined;
 
-    ensureDir(WORKFLOWS_DIR);
-    const fileName = sanitizeWorkflowFileName(name);
-    const filePath = path.join(WORKFLOWS_DIR, fileName);
-
-    const frontmatter: WorkflowFrontmatter = {
-      name, description,
+    const def: WorkflowDefinition = {
+      name,
+      description,
       enabled: body.enabled !== false,
       trigger,
       steps,
+      inputs: inputs && Object.keys(inputs).length > 0 ? inputs : undefined,
+      synthesis,
     };
-    if (inputs && Object.keys(inputs).length > 0) frontmatter.inputs = inputs;
-    if (synthesis) frontmatter.synthesis = synthesis;
-
-    writeFileSync(filePath, matter.stringify(`# ${name}\n\n${description}\n`, frontmatter as Record<string, unknown>), 'utf-8');
-    res.json({ created: true, name, file: fileName });
+    writeWorkflow(slug, def);
+    res.json({ created: true, name, file: `${slug}/SKILL.md` });
   });
 
   app.patch('/api/console/workflows/:name', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
-    const entry = findWorkflowFile(req.params.name);
+    const target = req.params.name;
+    const entry = listWorkflows().find((e) => e.data.name === target || e.name === target);
     if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
     const body = req.body ?? {};
-    const filePath = path.join(WORKFLOWS_DIR, entry.file);
-    const next: WorkflowFrontmatter = { ...entry.data };
+    const next: WorkflowDefinition = { ...entry.data };
 
     if (typeof body.description === 'string') next.description = body.description;
     if (Array.isArray(body.steps)) next.steps = body.steps;
@@ -819,35 +810,49 @@ export function registerConsoleRoutes(
       next.trigger = { manual: true };
     }
 
-    writeFileSync(filePath, matter.stringify(entry.content, next as Record<string, unknown>), 'utf-8');
-    res.json({ updated: true, name: next.name ?? req.params.name });
+    writeWorkflow(entry.name, next);
+    res.json({ updated: true, name: next.name });
   });
 
   app.delete('/api/console/workflows/:name', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
-    const entry = findWorkflowFile(req.params.name);
+    const target = req.params.name;
+    const entry = listWorkflows().find((e) => e.data.name === target || e.name === target);
     if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
-    unlinkSync(path.join(WORKFLOWS_DIR, entry.file));
+    deleteWorkflow(entry.name);
     res.json({ deleted: true });
   });
 
   app.post('/api/console/workflows/:name/set-enabled', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
-    const entry = findWorkflowFile(req.params.name);
+    const target = req.params.name;
+    const entry = listWorkflows().find((e) => e.data.name === target || e.name === target);
     if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
     const body = req.body ?? {};
     if (typeof body.enabled !== 'boolean') { res.status(400).json({ error: 'enabled (boolean) required' }); return; }
-    const filePath = path.join(WORKFLOWS_DIR, entry.file);
-    const next: WorkflowFrontmatter = { ...entry.data, enabled: body.enabled };
-    writeFileSync(filePath, matter.stringify(entry.content, next as Record<string, unknown>), 'utf-8');
+    writeWorkflow(entry.name, { ...entry.data, enabled: body.enabled });
     res.json({ updated: true, enabled: body.enabled });
   });
 
   app.post('/api/console/workflows/:name/validate', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
-    const entry = findWorkflowFile(req.params.name);
+    const target = req.params.name;
+    const entry = listWorkflows().find((e) => e.data.name === target || e.name === target);
     if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
-    res.json(validateWorkflowDefinition(entry.data));
+    // The validator was written against the legacy WorkflowFrontmatter
+    // shape (loose fields, may be undefined). Convert from the typed
+    // WorkflowDefinition by surfacing only the fields the validator
+    // reads — keeps validation rules identical pre/post-migration.
+    const data: WorkflowFrontmatter = {
+      name: entry.data.name,
+      description: entry.data.description,
+      enabled: entry.data.enabled,
+      trigger: entry.data.trigger,
+      steps: entry.data.steps,
+      inputs: entry.data.inputs,
+      synthesis: entry.data.synthesis,
+    };
+    res.json(validateWorkflowDefinition(data));
   });
 
   /**
@@ -883,25 +888,74 @@ export function registerConsoleRoutes(
 
   app.post('/api/console/workflows/:name/run', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
-    const entry = findWorkflowFile(req.params.name);
+    const target = req.params.name;
+    const entry = listWorkflows().find((e) => e.data.name === target || e.name === target);
     if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
     const body = req.body ?? {};
     const inputs = body.inputs && typeof body.inputs === 'object' ? body.inputs : {};
     const dryRun = body.dryRun === true;
-    if (!dryRun && entry.data.enabled === false) { res.status(409).json({ error: 'workflow is disabled — approve it first' }); return; }
+    // Single-step "try this" hint. When set, the runner executes only
+    // the named step (no upstream chain, no synthesis) so the user can
+    // see what one step does in isolation. Bypasses the enabled gate
+    // because TRY is a deliberate user action on a draft.
+    const targetStepId = typeof body.targetStepId === 'string' && body.targetStepId.trim() ? body.targetStepId.trim() : null;
+    if (targetStepId && !entry.data.steps.some((s) => s.id === targetStepId)) {
+      res.status(400).json({ error: `step "${targetStepId}" is not defined in this workflow` });
+      return;
+    }
+    if (!dryRun && !targetStepId && entry.data.enabled === false) {
+      res.status(409).json({ error: 'workflow is disabled — approve it first' }); return;
+    }
 
     ensureDir(WORKFLOW_RUNS_DIR);
     const id = `${Date.now()}-${randomBytes(3).toString('hex')}`;
     const filePath = path.join(WORKFLOW_RUNS_DIR, `${id}.json`);
-    writeFileSync(filePath, JSON.stringify({
+    const payload: Record<string, unknown> = {
       id,
       workflow: entry.data.name,
       inputs,
       status: dryRun ? 'dry_run' : 'queued',
       createdAt: new Date().toISOString(),
       source: 'console',
-    }, null, 2), 'utf-8');
-    res.json({ queued: !dryRun, dryRun, id });
+    };
+    if (targetStepId) payload.targetStepId = targetStepId;
+    writeFileSync(filePath, JSON.stringify(payload, null, 2), 'utf-8');
+    res.json({ queued: !dryRun, dryRun, id, targetStepId });
+  });
+
+  /**
+   * Live event stream for a workflow run. Reads the per-run
+   * events.jsonl log written by the workflow runner. Used by the
+   * dashboard's planned chat-first UI to render step status updates
+   * (RUNNING / DONE / FAILED) and the live transcript as a workflow
+   * progresses. JSON polling for now; SSE can layer on later.
+   *
+   * Query params:
+   *   ?since=<timestamp> — return events strictly after this ISO time
+   *                       (cheap incremental polling)
+   *   ?limit=<n>         — cap at n events (newest-last); default 500
+   */
+  app.get('/api/console/workflows/:name/runs/:runId/events', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const target = req.params.name;
+    const entry = listWorkflows().find((e) => e.data.name === target || e.name === target);
+    if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
+    const since = typeof req.query.since === 'string' ? req.query.since : null;
+    const limit = Math.max(1, Math.min(2000, parseInt(typeof req.query.limit === 'string' ? req.query.limit : '500', 10) || 500));
+    try {
+      const all = readWorkflowEvents(entry.name, req.params.runId);
+      const filtered = since ? all.filter((ev) => ev.t > since) : all;
+      const tail = filtered.length > limit ? filtered.slice(-limit) : filtered;
+      res.json({
+        runId: req.params.runId,
+        workflow: entry.data.name,
+        events: tail,
+        count: tail.length,
+        truncated: filtered.length > tail.length,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
   });
 
   /**

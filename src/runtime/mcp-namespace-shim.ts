@@ -117,6 +117,35 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): MCPSer
   let cachedTools: MCPTool[] | null = null;
   let cachedToolToServer: Map<string, MCPServer> | null = null;
 
+  // Track per-server connection state. The OpenAI Agents SDK's
+  // MCPServerStdio.connect() unconditionally spawns a fresh child
+  // process every call (overwriting the previous transport without
+  // closing it). Repeated shim.connect() calls — which happen once per
+  // OpenAI Runner run and once per Codex tool-defs build — would
+  // otherwise leak N child processes per call. Guarding with a per-
+  // server "in flight" promise dedupes concurrent callers too.
+  const connectPromises = new WeakMap<MCPServer, Promise<void>>();
+
+  async function ensureConnected(server: MCPServer): Promise<void> {
+    if (typeof server.connect !== 'function') return;
+    const existing = connectPromises.get(server);
+    if (existing) {
+      await existing;
+      return;
+    }
+    const promise = (async () => {
+      try {
+        await server.connect!();
+      } catch (err) {
+        // Clear so a future call can retry instead of resolving instantly.
+        connectPromises.delete(server);
+        throw err;
+      }
+    })();
+    connectPromises.set(server, promise);
+    await promise;
+  }
+
   /** Flatten + rename every underlying server's tools. */
   async function buildFlattenedTools(): Promise<{ tools: MCPTool[]; routing: Map<string, MCPServer> }> {
     const tools: MCPTool[] = [];
@@ -127,11 +156,7 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): MCPSer
       servers.map(async (server) => {
         const slug = serverSlugs.get(server)!;
         try {
-          // Most SDK servers connect lazily; calling connect() is idempotent
-          // and safe. Catch + log so one broken server doesn't poison the rest.
-          if (typeof server.connect === 'function') {
-            await server.connect();
-          }
+          await ensureConnected(server);
           const list = await server.listTools();
           return { server, slug, list };
         } catch (err) {
@@ -178,14 +203,13 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): MCPSer
     },
 
     async connect() {
-      // Lazy connect happens during buildFlattenedTools() so a slow
-      // server doesn't block the shim's own readiness. Eagerly connect
-      // the easy ones up front so first listTools() is faster.
+      // Eager connect for the easy servers so first listTools() is
+      // faster. Each call is deduped via `ensureConnected` — repeated
+      // shim.connect() calls don't respawn child processes.
       await Promise.allSettled(
         servers.map(async (server) => {
-          if (typeof server.connect !== 'function') return;
           try {
-            await server.connect();
+            await ensureConnected(server);
           } catch (err) {
             logger.warn({ server: server.name, err: err instanceof Error ? err.message : String(err) }, 'MCP server connect failed; will retry on first use');
           }
@@ -196,6 +220,9 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): MCPSer
     async close() {
       await Promise.allSettled(
         servers.map(async (server) => {
+          // Drop the connect record so a subsequent connect() on this
+          // shim spawns a fresh child for any server we close here.
+          connectPromises.delete(server);
           if (typeof server.close !== 'function') return;
           try {
             await server.close();

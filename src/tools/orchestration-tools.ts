@@ -1,13 +1,20 @@
 import { randomBytes } from 'node:crypto';
-import { existsSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import matter from 'gray-matter';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import {
   CRON_FILE,
-  WORKFLOWS_DIR,
 } from '../memory/vault.js';
+import {
+  deleteWorkflow,
+  listWorkflows,
+  readWorkflow,
+  writeWorkflow,
+  type WorkflowDefinition,
+  type WorkflowEntry,
+} from '../memory/workflow-store.js';
 import {
   CRON_PROGRESS_DIR,
   CRON_RUNS_DIR,
@@ -28,24 +35,10 @@ interface CronJobRecord {
   max_hours?: number;
 }
 
-interface WorkflowStepInput {
-  id: string;
-  prompt: string;
-  dependsOn?: string[];
-  model?: string;
-  tier?: number;
-  maxTurns?: number;
-}
-
-interface WorkflowFile {
-  name: string;
-  description: string;
-  enabled: boolean;
-  trigger: { schedule?: string; manual?: boolean };
-  steps: WorkflowStepInput[];
-  inputs?: Record<string, { type?: 'string' | 'number'; default?: string; description?: string }>;
-  synthesis?: { prompt?: string };
-}
+// Workflow schema lives in the shared workflow-store module so the MCP
+// tools, the daemon's workflow runner, and the dashboard REST routes
+// all parse identical shapes. Importing the types instead of redefining
+// them keeps the three surfaces in lock-step on field defaults.
 
 function validateCronExpression(expr: string): boolean {
   const parts = expr.trim().split(/\s+/);
@@ -137,29 +130,11 @@ function readRunHistory(jobName: string, limit = 10): Array<{ status?: string; s
     .reverse();
 }
 
-function listWorkflowFiles(): Array<{ file: string; data: WorkflowFile }> {
-  if (!existsSync(WORKFLOWS_DIR)) return [];
-  const workflows: Array<{ file: string; data: WorkflowFile }> = [];
-  for (const file of readdirSync(WORKFLOWS_DIR).filter((entry) => entry.endsWith('.md'))) {
-    try {
-      const parsed = matter(readFileSync(path.join(WORKFLOWS_DIR, file), 'utf-8'));
-      workflows.push({
-        file,
-        data: {
-          name: String(parsed.data.name ?? path.basename(file, '.md')),
-          description: String(parsed.data.description ?? ''),
-          enabled: parsed.data.enabled !== false,
-          trigger: typeof parsed.data.trigger === 'object' && parsed.data.trigger ? parsed.data.trigger as WorkflowFile['trigger'] : { manual: true },
-          steps: Array.isArray(parsed.data.steps) ? parsed.data.steps as WorkflowStepInput[] : [],
-          inputs: typeof parsed.data.inputs === 'object' && parsed.data.inputs ? parsed.data.inputs as WorkflowFile['inputs'] : undefined,
-          synthesis: typeof parsed.data.synthesis === 'object' && parsed.data.synthesis ? parsed.data.synthesis as WorkflowFile['synthesis'] : undefined,
-        },
-      });
-    } catch {
-      continue;
-    }
-  }
-  return workflows;
+// Thin alias so existing callsites that wanted `entry.file` keep working.
+// The shared store returns WorkflowEntry with `filePath` + `layout`; we
+// expose the basename here for log readability.
+function listWorkflowFiles(): WorkflowEntry[] {
+  return listWorkflows();
 }
 
 export function registerOrchestrationTools(server: McpServer): void {
@@ -275,9 +250,10 @@ export function registerOrchestrationTools(server: McpServer): void {
       if (workflows.length === 0) return textResult('No workflows found.');
       return textResult(
         workflows
-          .map(({ file, data }) => {
+          .map(({ name, filePath, layout, data }) => {
             const trigger = data.trigger.schedule ? `schedule: ${data.trigger.schedule}` : 'manual';
-            return `**${data.name}** [${data.enabled ? 'enabled' : 'disabled'}]\n  File: ${file}\n  ${data.description || '(no description)'}\n  Trigger: ${trigger}\n  Steps (${data.steps.length}): ${data.steps.map((step) => step.id).join(' -> ')}`;
+            const fileLabel = layout === 'directory' ? `${name}/SKILL.md` : path.basename(filePath);
+            return `**${data.name}** [${data.enabled ? 'enabled' : 'disabled'}]\n  File: ${fileLabel}\n  ${data.description || '(no description)'}\n  Trigger: ${trigger}\n  Steps (${data.steps.length}): ${data.steps.map((step) => step.id).join(' -> ')}`;
           })
           .join('\n\n'),
       );
@@ -318,24 +294,27 @@ export function registerOrchestrationTools(server: McpServer): void {
         return textResult(`Invalid cron expression: "${trigger_schedule}"`);
       }
 
-      ensureDir(WORKFLOWS_DIR);
-      const fileName = `${name.replace(/[^a-zA-Z0-9_-]/g, '-').toLowerCase()}.md`;
-      const filePath = path.join(WORKFLOWS_DIR, fileName);
-      if (existsSync(filePath)) return textResult(`Workflow file already exists: ${fileName}`);
+      const dirName = name.replace(/[^a-zA-Z0-9_-]/g, '-').toLowerCase();
+      if (readWorkflow(dirName)) return textResult(`Workflow "${name}" already exists.`);
 
-      const frontmatter: Record<string, unknown> = {
-        type: 'workflow',
+      const def: WorkflowDefinition = {
         name,
         description,
         enabled: true,
         trigger: trigger_schedule ? { schedule: trigger_schedule, manual: true } : { manual: true },
-        steps,
+        steps: steps.map((s) => ({
+          id: s.id,
+          prompt: s.prompt,
+          dependsOn: s.dependsOn,
+          model: s.model,
+          tier: s.tier,
+          maxTurns: s.maxTurns,
+        })),
+        inputs: inputs && Object.keys(inputs).length > 0 ? inputs : undefined,
+        synthesis: synthesis_prompt ? { prompt: synthesis_prompt } : undefined,
       };
-      if (inputs && Object.keys(inputs).length > 0) frontmatter.inputs = inputs;
-      if (synthesis_prompt) frontmatter.synthesis = { prompt: synthesis_prompt };
-
-      writeFileSync(filePath, matter.stringify(`# ${name}\n\n${description}\n`, frontmatter), 'utf-8');
-      return textResult(`Created workflow "${name}" at ${fileName}.`);
+      writeWorkflow(dirName, def);
+      return textResult(`Created workflow "${name}" at workflows/${dirName}/SKILL.md.`);
     },
   );
 
@@ -383,17 +362,24 @@ export function registerOrchestrationTools(server: McpServer): void {
       const stepsBlock = w.steps.map((step) => {
         const deps = step.dependsOn && step.dependsOn.length > 0 ? ` (depends on: ${step.dependsOn.join(', ')})` : '';
         const model = step.model ? ` model=${step.model}` : '';
-        return `  ${step.id}${deps}${model}\n    ${step.prompt.slice(0, 600).replace(/\n+/g, ' ')}`;
+        const forEach = step.forEach ? ` forEach=${step.forEach}` : '';
+        const det = step.deterministic ? ` deterministic=${step.deterministic.runner}` : '';
+        return `  ${step.id}${deps}${model}${forEach}${det}\n    ${step.prompt.slice(0, 600).replace(/\n+/g, ' ')}`;
       }).join('\n');
       const inputsBlock = w.inputs && Object.keys(w.inputs).length > 0
         ? Object.entries(w.inputs).map(([k, meta]) => `  - ${k}: ${meta.type ?? 'string'}${meta.default !== undefined ? ` (default: ${meta.default})` : ''}${meta.description ? ` — ${meta.description}` : ''}`).join('\n')
         : '  (none)';
       const trigger = w.trigger.schedule ? `schedule: ${w.trigger.schedule}` : (w.trigger.manual ? 'manual only' : 'manual');
+      const allowed = w.allowedTools && w.allowedTools.length > 0
+        ? w.allowedTools.map((t) => (typeof t === 'string' ? t : `${t.name}${t.approval === 'required' ? ' (approval)' : ''}`)).join(', ')
+        : '(any)';
       return textResult([
         `**${w.name}** [${w.enabled ? 'enabled' : 'disabled'}]`,
-        `File: ${entry.file}`,
+        `File: ${path.relative(path.dirname(entry.dir), entry.filePath)}`,
         `${w.description || '(no description)'}`,
+        w.whenToUse ? `When to use: ${w.whenToUse}` : '',
         `Trigger: ${trigger}`,
+        `Allowed tools: ${allowed}`,
         `Steps (${w.steps.length}):`,
         stepsBlock,
         `Inputs:`,
@@ -413,11 +399,7 @@ export function registerOrchestrationTools(server: McpServer): void {
     async ({ name, enabled }) => {
       const entry = listWorkflowFiles().find((w) => w.data.name === name);
       if (!entry) return textResult(`Workflow "${name}" not found.`);
-      const filePath = path.join(WORKFLOWS_DIR, entry.file);
-      const raw = readFileSync(filePath, 'utf-8');
-      const parsed = matter(raw);
-      const nextFrontmatter = { ...parsed.data, enabled };
-      writeFileSync(filePath, matter.stringify(parsed.content, nextFrontmatter), 'utf-8');
+      writeWorkflow(entry.name, { ...entry.data, enabled });
       return textResult(`Workflow "${name}" is now ${enabled ? 'approved (enabled)' : 'disabled'}.`);
     },
   );
@@ -462,24 +444,30 @@ export function registerOrchestrationTools(server: McpServer): void {
         return textResult(`Invalid cron expression: "${trigger_schedule}"`);
       }
 
-      const filePath = path.join(WORKFLOWS_DIR, entry.file);
-      const raw = readFileSync(filePath, 'utf-8');
-      const parsed = matter(raw);
-      const next: Record<string, unknown> = { ...parsed.data };
+      const next: WorkflowDefinition = { ...entry.data };
       if (description !== undefined) next.description = description;
-      if (steps) next.steps = steps;
+      if (steps) {
+        next.steps = steps.map((s) => ({
+          id: s.id,
+          prompt: s.prompt,
+          dependsOn: s.dependsOn,
+          model: s.model,
+          tier: s.tier,
+          maxTurns: s.maxTurns,
+        }));
+      }
       if (inputs) next.inputs = inputs;
       if (synthesis_prompt !== undefined) next.synthesis = { prompt: synthesis_prompt };
 
-      const currentTrigger = (typeof next.trigger === 'object' && next.trigger ? next.trigger : { manual: true }) as Record<string, unknown>;
+      const currentTrigger = next.trigger ?? { manual: true };
       if (clear_trigger_schedule) {
-        delete currentTrigger.schedule;
-        next.trigger = { ...currentTrigger, manual: true };
+        const { schedule: _drop, ...rest } = currentTrigger;
+        next.trigger = { ...rest, manual: true };
       } else if (trigger_schedule !== undefined) {
         next.trigger = { ...currentTrigger, schedule: trigger_schedule, manual: currentTrigger.manual ?? true };
       }
 
-      writeFileSync(filePath, matter.stringify(parsed.content, next), 'utf-8');
+      writeWorkflow(entry.name, next);
       return textResult(`Workflow "${name}" updated.`);
     },
   );
@@ -495,8 +483,9 @@ export function registerOrchestrationTools(server: McpServer): void {
       if (!confirm) return textResult('Refusing to delete: pass confirm=true.');
       const entry = listWorkflowFiles().find((w) => w.data.name === name);
       if (!entry) return textResult(`Workflow "${name}" not found.`);
-      unlinkSync(path.join(WORKFLOWS_DIR, entry.file));
-      return textResult(`Workflow "${name}" deleted (${entry.file}).`);
+      const ok = deleteWorkflow(entry.name);
+      if (!ok) return textResult(`Workflow "${name}" delete failed (file system error).`);
+      return textResult(`Workflow "${name}" deleted.`);
     },
   );
 

@@ -239,3 +239,62 @@ test('shim: close() reaches every server and swallows close errors', async () =>
   // b.close ran; a.close threw but did not bubble.
   assert.equal(b._closed, 1);
 });
+
+test('shim: repeated connect() calls do NOT respawn underlying servers', async () => {
+  // Regression: the OpenAI Agents SDK's MCPServerStdio.connect()
+  // unconditionally spawns a fresh child process. Without per-server
+  // deduping inside the shim, every shim.connect() (called by the
+  // Runner before each run and by the Codex tool-defs builder) would
+  // leak N orphan stdio children.
+  const a = makeFakeServer({ name: 'alpha', tools: [] });
+  const b = makeFakeServer({ name: 'beta', tools: [] });
+  const shim = createMcpNamespaceShim({ servers: [a, b], cacheToolsList: false });
+  await shim.connect!();
+  await shim.connect!();
+  await shim.connect!();
+  assert.equal(a._connected, 1);
+  assert.equal(b._connected, 1);
+});
+
+test('shim: listTools() does not re-connect after the initial shim.connect()', async () => {
+  const a = makeFakeServer({ name: 'alpha', tools: [{ name: 'one' }] });
+  const shim = createMcpNamespaceShim({ servers: [a], cacheToolsList: false });
+  await shim.connect!();
+  await shim.listTools();
+  await shim.listTools();
+  // cacheToolsList=false means listTools queries the server every call,
+  // but connect() must remain a one-shot.
+  assert.equal(a._connected, 1);
+});
+
+test('shim: close() then connect() respawns the underlying server', async () => {
+  const a = makeFakeServer({ name: 'alpha', tools: [] });
+  const shim = createMcpNamespaceShim({ servers: [a], cacheToolsList: false });
+  await shim.connect!();
+  await shim.close!();
+  await shim.connect!();
+  assert.equal(a._connected, 2);
+});
+
+test('shim: failed connect() does not stick — next call retries', async () => {
+  let calls = 0;
+  let shouldFail = true;
+  const a: MCPServer = {
+    name: 'flaky',
+    cacheToolsList: false,
+    toolFilter: undefined,
+    async connect() {
+      calls++;
+      if (shouldFail) throw new Error('boom');
+    },
+    async close() {},
+    async listTools() { return []; },
+    async callTool() { return { content: [] } as any; },
+    async invalidateToolsCache() {},
+  };
+  const shim = createMcpNamespaceShim({ servers: [a], cacheToolsList: false });
+  await shim.connect!(); // first attempt fails — shim absorbs + logs
+  shouldFail = false;
+  await shim.connect!(); // retries because we cleared the cached promise on error
+  assert.equal(calls, 2);
+});

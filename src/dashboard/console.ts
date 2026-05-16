@@ -1423,6 +1423,7 @@ body {
   flex-direction: column;
   flex: 0 0 auto;
 }
+.dock-card[hidden] { display: none; }
 .dock-card-head {
   display: flex;
   justify-content: space-between;
@@ -1776,6 +1777,13 @@ body {
   background:
     repeating-linear-gradient(90deg, color-mix(in srgb, var(--fg) 4%, transparent) 0 1px, transparent 1px 18px),
     var(--bg-0);
+}
+.home-current-objective[hidden] {
+  /* HTML's hidden attribute applies display:none with low
+     specificity, which the display:flex above overrides — explicit
+     reset so the JS can collapse the banner when there's no active
+     work without it ghosting as an empty row. */
+  display: none;
 }
 .command-list {
   gap: 0;
@@ -3589,8 +3597,13 @@ body {
 /* ── Workflow Studio ─────────────────────────────────────────── */
 .wf-layout {
   display: grid;
-  grid-template-columns: 260px 1fr 360px;
-  gap: 14px;
+  /* List stays slim, editor takes 1.5x of the remaining space so the
+     per-step action row (▶ TRY · ✎ REFINE · ⛭) doesn't clip, and the
+     architect chat keeps a usable column on standard desktops. fr
+     units (not min-width) so we degrade gracefully on narrow windows
+     instead of overflowing horizontally. */
+  grid-template-columns: 200px 1.5fr 1fr;
+  gap: 12px;
   height: 100%;
   overflow: hidden;
 }
@@ -4084,18 +4097,66 @@ body {
   letter-spacing: 0.06em;
 }
 .wf-step-head .step-id-input:focus { border-bottom-color: var(--accent); }
-.wf-step-head .step-actions { margin-left: auto; display: flex; gap: 4px; }
+.wf-step-head .step-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
 .wf-step-head .step-actions button {
   background: transparent;
   border: 1px solid var(--line);
   color: var(--fg-3);
   font: inherit;
   font-size: 10px;
-  padding: 2px 6px;
+  letter-spacing: 0.08em;
+  padding: 2px 7px;
   cursor: pointer;
+  white-space: nowrap;
 }
 .wf-step-head .step-actions button:hover { color: var(--fg); border-color: var(--line-bright); }
 .wf-step-head .step-actions .step-remove { color: var(--accent-fail); border-color: var(--accent-fail); }
+.wf-step-head .step-actions .btn-step-try { color: var(--accent-2); border-color: var(--accent-2); }
+.wf-step-head .step-actions .btn-step-try:hover { background: var(--accent-2); color: var(--bg-0); }
+.wf-step-head .step-actions .btn-step-refine { color: var(--accent); border-color: var(--accent); }
+.wf-step-head .step-actions .btn-step-refine:hover { background: var(--accent); color: var(--bg-0); }
+.wf-step-head .step-actions .btn-step-edit { color: var(--fg-3); }
+.wf-step-head .step-id-label {
+  color: var(--fg);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: lowercase;
+}
+.wf-step-head .step-status {
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  padding: 2px 7px;
+  border: 1px solid var(--line);
+  color: var(--fg-mute);
+  text-transform: uppercase;
+}
+.wf-step-head .step-status.status-running {
+  color: var(--accent);
+  border-color: var(--accent);
+  animation: status-pulse 1.4s ease-in-out infinite;
+}
+.wf-step-head .step-status.status-done {
+  color: var(--accent-2);
+  border-color: var(--accent-2);
+}
+.wf-step-head .step-status.status-failed {
+  color: var(--accent-fail);
+  border-color: var(--accent-fail);
+}
+.wf-step-head .step-status.status-queueing,
+.wf-step-head .step-status.status-skipped {
+  color: var(--accent-warn);
+  border-color: var(--accent-warn);
+}
+@keyframes status-pulse { 0%, 100% { opacity: 1 } 50% { opacity: 0.5 } }
+
+.wf-step.wf-step-editing { box-shadow: inset 2px 0 0 var(--accent); }
 
 .wf-step-body { padding: 10px; }
 .wf-step-body .step-prompt {
@@ -4147,6 +4208,59 @@ body {
   transition: color 100ms, border-color 100ms;
 }
 .wf-add-step:hover { color: var(--accent); border-color: var(--accent); }
+
+/* Step read-only prompt display + chips + live output. The read-only
+   surface is the default — the textarea only appears when the user
+   clicks ⛭ EDIT on a step. */
+.wf-step-body .step-prompt-display {
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  color: var(--fg);
+  font-size: 12px;
+  line-height: 1.55;
+  padding: 10px 12px;
+  cursor: text;
+  white-space: pre-wrap;
+  word-break: break-word;
+  transition: border-color 120ms, background 120ms;
+}
+.wf-step-body .step-prompt-display:hover {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--bg-2) 80%, var(--accent) 8%);
+}
+.wf-step-body .step-chips {
+  margin-top: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+}
+.wf-step-body .step-chip {
+  padding: 2px 8px;
+  border: 1px solid var(--line);
+  color: var(--fg-3);
+  background: transparent;
+}
+.wf-step-body .step-chip.chip-forEach { color: var(--accent-3); border-color: color-mix(in srgb, var(--accent-3) 60%, transparent); }
+.wf-step-body .step-chip.chip-deterministic { color: var(--accent-warn); border-color: color-mix(in srgb, var(--accent-warn) 60%, transparent); }
+.wf-step-body .step-chip.chip-tools { color: var(--accent-2); border-color: color-mix(in srgb, var(--accent-2) 60%, transparent); }
+.wf-step-body .step-chip.chip-deps { color: var(--fg-2); }
+.wf-step-body .step-chip.chip-model { color: var(--fg-3); }
+.wf-step-body .step-output {
+  margin-top: 10px;
+  padding: 8px 12px;
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  border-left: 2px solid var(--accent-2);
+  color: var(--fg-2);
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 240px;
+  overflow-y: auto;
+}
 
 .wf-validation {
   margin-top: 12px;
@@ -6173,7 +6287,25 @@ const CONSOLE_JS = `
 
       setPresence(presence.status);
       if (awayEl) awayEl.textContent = presence.awayMessage || 'Standing by.';
-      if (objectiveEl) objectiveEl.textContent = presence.awayMessage || 'Standing by for the next useful task.';
+      // The WORKING NOW banner is for active-work context — NOT the
+      // pending check-in question or other "needs you" cues, which
+      // already show in the NEEDS YOU card above. presence.awayMessage
+      // is the check-in question when status === 'needs_you', so use
+      // it only when status indicates actual work in flight.
+      if (objectiveEl) {
+        const activeStatuses = new Set(['working', 'thinking', 'running', 'autonomy']);
+        const objectiveBanner = objectiveEl.closest('.home-current-objective');
+        const showObjective = activeStatuses.has(presence.status) && (counts.active ?? 0) > 0;
+        if (showObjective) {
+          objectiveEl.textContent = presence.awayMessage || 'Working on the queue.';
+          if (objectiveBanner) objectiveBanner.removeAttribute('hidden');
+        } else {
+          // Hide the banner outright when there's no active work — a
+          // muted "standing by" line on an empty card is just clutter.
+          if (objectiveBanner) objectiveBanner.setAttribute('hidden', '');
+          objectiveEl.textContent = '';
+        }
+      }
       if (needsCountEl) needsCountEl.textContent = String(counts.waiting ?? 0);
       if (activeCountEl) activeCountEl.textContent = String(counts.active ?? 0);
       if (recentCountEl) recentCountEl.textContent = String((data.recentCompleted || []).length);
@@ -6357,6 +6489,15 @@ const CONSOLE_JS = `
       else s.setAttribute('hidden', '');
     });
     navButtons.forEach((b) => b.classList.toggle('active', b.getAttribute('data-panel') === name));
+    // The Home panel has its own prominent LIVE card with the orb;
+    // the sidebar dock-live duplicates the same controls. Hide the
+    // dock copy when Home is active so the at-a-glance dock stays
+    // useful from every other panel without doubling up on Home.
+    const dockLive = document.querySelector('[data-dock-live]');
+    if (dockLive) {
+      if (name === 'home') dockLive.setAttribute('hidden', '');
+      else dockLive.removeAttribute('hidden');
+    }
     if (name === 'memory') {
       if (!memoryBooted) { memoryBooted = true; bootMemoryPanel(); }
       else refreshMemoryPanel();
@@ -7224,6 +7365,15 @@ const CONSOLE_JS = `
   let wfItems = [];
   let wfChatHistory = [];
   let wfChatBusy = false;
+  // Set of step indices currently in edit mode. Cleared on workflow
+  // switch. Read by renderStep() to decide between textarea / display.
+  const wfEditingStepIndices = new Set();
+  // Run id currently being polled for live events (set when a TRY or
+  // RUN fires; cleared when the run reaches a terminal state). Drives
+  // the per-step status pill + output panel.
+  let wfActiveRunId = null;
+  let wfActiveRunPollTimer = null;
+  let wfActiveRunLastEventAt = '';
 
   async function bootWorkflowsPanel() {
     // Document-level delegation is intentional: the single-file HTML is
@@ -7369,11 +7519,25 @@ const CONSOLE_JS = `
       description: data.description || '',
       enabled: data.enabled !== false,
       triggerSchedule: data.trigger && data.trigger.schedule ? data.trigger.schedule : '',
-      steps: Array.isArray(data.steps) ? data.steps.map((s) => ({ id: s.id, prompt: s.prompt, dependsOn: s.dependsOn || [], model: s.model })) : [],
+      steps: Array.isArray(data.steps) ? data.steps.map((s) => ({
+        id: s.id,
+        prompt: s.prompt,
+        dependsOn: s.dependsOn || [],
+        model: s.model,
+        forEach: s.forEach,
+        deterministic: s.deterministic,
+        allowedTools: s.allowedTools,
+      })) : [],
       inputs: data.inputs || {},
       synthesisPrompt: data.synthesis && data.synthesis.prompt ? data.synthesis.prompt : '',
+      allowedTools: data.allowedTools || null,
+      whenToUse: data.whenToUse || null,
     };
     wfChatHistory = [];
+    // Reset per-step edit state when loading a different workflow —
+    // never carry over edit toggles across switches.
+    wfEditingStepIndices.clear();
+    stopActiveRunPolling();
     renderEditor();
   }
 
@@ -7517,25 +7681,61 @@ const CONSOLE_JS = `
   }
 
   function renderStep(step, index, allStepIds) {
+    // Step rendering is read-only by default. The whole industry (OpenAI
+    // AgentKit, Zapier Copilot, Lovable) converged on chat-builds /
+    // visual-displays in 2025-2026, so the step pane is a receipt of
+    // what the Architect agent produced rather than the authoring
+    // surface. ▶ TRY, ✎ REFINE, and ⛭ EDIT buttons cover the three
+    // common operations a user wants on a step. Live status pulled
+    // from events.jsonl by the run-status poller (refreshStepStatuses).
     const deps = step.dependsOn || [];
+    const isEditing = wfEditingStepIndices.has(index);
     const depPills = allStepIds
       .filter((id) => id !== step.id)
       .map((id) => '<button type="button" class="dep-pill ' + (deps.includes(id) ? 'on' : '') + '" data-wf-dep="' + escMem(id) + '" data-wf-step-id="' + escMem(step.id) + '">' + escMem(id) + '</button>')
       .join('');
+    // Chips: forEach / deterministic / per-step allowed-tools — these
+    // are the agent-runtime hints the user picked. Showing them on the
+    // step makes the runner's behavior legible without opening the
+    // raw markdown.
+    const chips = [];
+    if (step.forEach) chips.push('<span class="step-chip chip-forEach" title="Runs once per item in &quot;' + escMem(step.forEach) + '&quot;">⇢ forEach ' + escMem(step.forEach) + '</span>');
+    if (step.deterministic && step.deterministic.runner) chips.push('<span class="step-chip chip-deterministic" title="Runs a script — no LLM call">⚙ ' + escMem(step.deterministic.runner) + '</span>');
+    if (Array.isArray(step.allowedTools) && step.allowedTools.length > 0) {
+      const toolNames = step.allowedTools.slice(0, 4).map((t) => typeof t === 'string' ? t : t.name).join(', ');
+      const more = step.allowedTools.length > 4 ? ' +' + (step.allowedTools.length - 4) : '';
+      chips.push('<span class="step-chip chip-tools" title="Tools this step may call">⚡ ' + escMem(toolNames + more) + '</span>');
+    }
+    if (deps.length > 0) {
+      chips.push('<span class="step-chip chip-deps">↑ depends on ' + escMem(deps.join(', ')) + '</span>');
+    }
+    if (step.model) chips.push('<span class="step-chip chip-model">model: ' + escMem(step.model) + '</span>');
+
+    const promptDisplay = (step.prompt || '').trim() || '(empty prompt)';
     return [
-      '<div class="wf-step" data-wf-step-index="' + index + '">',
+      '<div class="wf-step ' + (isEditing ? 'wf-step-editing' : '') + '" data-wf-step-index="' + index + '" data-wf-step-id="' + escMem(step.id) + '">',
       '  <div class="wf-step-head">',
       '    <span class="step-num">#' + (index + 1) + '</span>',
-      '    <input class="step-id-input" type="text" value="' + escMem(step.id) + '" data-wf-step-field="id" data-wf-step-index="' + index + '" spellcheck="false" />',
+      isEditing
+        ? '    <input class="step-id-input" type="text" value="' + escMem(step.id) + '" data-wf-step-field="id" data-wf-step-index="' + index + '" spellcheck="false" />'
+        : '    <span class="step-id-label">' + escMem(step.id) + '</span>',
+      '    <span class="step-status" data-wf-step-status="' + escMem(step.id) + '">idle</span>',
       '    <div class="step-actions">',
-      '      <button type="button" data-wf-action="step-up" data-wf-step-index="' + index + '">↑</button>',
-      '      <button type="button" data-wf-action="step-down" data-wf-step-index="' + index + '">↓</button>',
-      '      <button type="button" class="step-remove" data-wf-action="step-remove" data-wf-step-index="' + index + '">REMOVE</button>',
+      wfIsNew ? '' : '      <button type="button" class="btn-step-try" data-wf-action="step-try" data-wf-step-index="' + index + '" title="Run only this step with the current draft prompt (single LLM call, no upstream)">▶ TRY</button>',
+      '      <button type="button" class="btn-step-refine" data-wf-action="step-refine" data-wf-step-index="' + index + '" title="Ask the Architect to rewrite this step">✎ REFINE</button>',
+      '      <button type="button" class="btn-step-edit" data-wf-action="step-edit-toggle" data-wf-step-index="' + index + '" title="' + (isEditing ? 'Done editing — return to read-only view' : 'Edit this step manually') + '">' + (isEditing ? '✓ DONE' : '⛭') + '</button>',
+      isEditing ? '      <button type="button" data-wf-action="step-up" data-wf-step-index="' + index + '" title="Move up">↑</button>' : '',
+      isEditing ? '      <button type="button" data-wf-action="step-down" data-wf-step-index="' + index + '" title="Move down">↓</button>' : '',
+      isEditing ? '      <button type="button" class="step-remove" data-wf-action="step-remove" data-wf-step-index="' + index + '">REMOVE</button>' : '',
       '    </div>',
       '  </div>',
       '  <div class="wf-step-body">',
-      '    <textarea class="step-prompt" rows="3" data-wf-step-field="prompt" data-wf-step-index="' + index + '" placeholder="What this step should do, ideally referencing any tools it should call (e.g. memory_recall, notify_user).">' + escMem(step.prompt || '') + '</textarea>',
-      depPills ? '    <div class="step-deps"><span class="step-deps-label">DEPENDS ON ⇢</span>' + depPills + '</div>' : '    <div class="step-deps"><span class="step-deps-label">DEPENDS ON ⇢</span><span style="color:var(--fg-mute);">(no other steps to depend on)</span></div>',
+      isEditing
+        ? '    <textarea class="step-prompt" rows="4" data-wf-step-field="prompt" data-wf-step-index="' + index + '" placeholder="What this step should do, ideally referencing any tools it should call (e.g. memory_recall, notify_user).">' + escMem(step.prompt || '') + '</textarea>'
+        : '    <div class="step-prompt-display" data-wf-action="step-edit-toggle" data-wf-step-index="' + index + '" title="Click to edit, or use ✎ REFINE to ask the Architect">' + escMem(promptDisplay) + '</div>',
+      chips.length > 0 ? '    <div class="step-chips">' + chips.join('') + '</div>' : '',
+      isEditing ? (depPills ? '    <div class="step-deps"><span class="step-deps-label">DEPENDS ON ⇢</span>' + depPills + '</div>' : '    <div class="step-deps"><span class="step-deps-label">DEPENDS ON ⇢</span><span style="color:var(--fg-mute);">(no other steps to depend on)</span></div>') : '',
+      '    <div class="step-output" hidden data-wf-step-output="' + escMem(step.id) + '"></div>',
       '  </div>',
       '</div>',
     ].join('');
@@ -7645,8 +7845,161 @@ const CONSOLE_JS = `
           renderEditor();
           return;
         }
+        if (action === 'step-edit-toggle' && Number.isFinite(idx)) {
+          // Toggle this step into / out of inline edit mode without
+          // touching the rest of the workflow. The set is the source
+          // of truth; renderStep() reads it on render.
+          if (wfEditingStepIndices.has(idx)) wfEditingStepIndices.delete(idx);
+          else wfEditingStepIndices.add(idx);
+          renderEditor();
+          return;
+        }
+        if (action === 'step-refine' && Number.isFinite(idx)) {
+          // Scope the next Architect message to this step — prefill
+          // the chat input with a leading directive and focus it. The
+          // Architect's instructions already know how to handle a
+          // step-scoped refinement because the workflow body already
+          // names every step.
+          const step = wfDraft.steps[idx];
+          if (!step) return;
+          const input = wf.chatInput;
+          if (input) {
+            const existing = (input.value || '').trim();
+            const prefix = 'Refine step "' + step.id + '": ';
+            if (!existing.startsWith(prefix)) {
+              input.value = prefix + existing;
+            }
+            input.focus();
+            // Place caret at end so the user types after the prefix.
+            const end = input.value.length;
+            try { input.setSelectionRange(end, end); } catch { /* tolerate textareas without selection */ }
+          }
+          return;
+        }
+        if (action === 'step-try' && Number.isFinite(idx)) {
+          const step = wfDraft.steps[idx];
+          if (!step) return;
+          // Single-step run is the highest-leverage trust UX in the
+          // category — Lovable, AgentKit, Zapier Copilot all ship it.
+          // Sends a queued-run request with targetStepId so the runner
+          // only executes this step (with empty / sample upstream).
+          tryStep(step).catch((err) => console.error('try step failed', err));
+          return;
+        }
       });
     });
+  }
+
+  // ── Step TRY + live status ─────────────────────────────────────
+  // The TRY button queues a single-step run via the same endpoint as
+  // RUN (POST /api/console/workflows/:name/run) with targetStepId set.
+  // The runner respects this hint and only fires that step. We then
+  // poll the events endpoint (added in this redesign) for live status
+  // updates that drive the per-step pill + output panel.
+  async function tryStep(step) {
+    if (wfIsNew || !wfSelectedName) {
+      alert('Save the workflow first — TRY requires the SKILL.md on disk.');
+      return;
+    }
+    const pill = document.querySelector('[data-wf-step-status="' + step.id + '"]');
+    if (pill) { pill.textContent = 'queueing'; pill.className = 'step-status status-queueing'; }
+    try {
+      const r = await fetch(withToken('/api/console/workflows/' + encodeURIComponent(wfSelectedName) + '/run'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ targetStepId: step.id, inputs: {} }),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        if (pill) { pill.textContent = 'error'; pill.className = 'step-status status-failed'; pill.title = j.error || ('HTTP ' + r.status); }
+        return;
+      }
+      if (j.id) startActiveRunPolling(j.id);
+    } catch (err) {
+      if (pill) { pill.textContent = 'error'; pill.className = 'step-status status-failed'; pill.title = err && err.message ? err.message : String(err); }
+    }
+  }
+
+  function stopActiveRunPolling() {
+    if (wfActiveRunPollTimer) {
+      clearInterval(wfActiveRunPollTimer);
+      wfActiveRunPollTimer = null;
+    }
+    wfActiveRunId = null;
+    wfActiveRunLastEventAt = '';
+  }
+
+  function startActiveRunPolling(runId) {
+    stopActiveRunPolling();
+    wfActiveRunId = runId;
+    wfActiveRunLastEventAt = '';
+    // 1s poll is plenty for an interactive editor — we're tailing a
+    // file, not driving a tight loop. The since= param keeps the
+    // response body small after the first call.
+    const poll = async () => {
+      if (!wfActiveRunId || !wfSelectedName) return;
+      try {
+        const url = '/api/console/workflows/' + encodeURIComponent(wfSelectedName)
+          + '/runs/' + encodeURIComponent(wfActiveRunId) + '/events'
+          + (wfActiveRunLastEventAt ? '?since=' + encodeURIComponent(wfActiveRunLastEventAt) : '');
+        const data = await fetchJSON(url);
+        const events = Array.isArray(data.events) ? data.events : [];
+        for (const ev of events) {
+          applyStepEvent(ev);
+          wfActiveRunLastEventAt = ev.t;
+        }
+        // Stop polling once the run reaches a terminal kind.
+        const terminal = events.some((ev) => ev.kind === 'run_completed' || ev.kind === 'run_failed');
+        if (terminal) stopActiveRunPolling();
+      } catch {
+        // Network blip — keep polling. We'll exit when the run hits
+        // a terminal state.
+      }
+    };
+    poll();
+    wfActiveRunPollTimer = setInterval(poll, 1000);
+  }
+
+  function applyStepEvent(ev) {
+    if (!ev || !ev.stepId) return;
+    const pill = document.querySelector('[data-wf-step-status="' + ev.stepId + '"]');
+    const output = document.querySelector('[data-wf-step-output="' + ev.stepId + '"]');
+    if (ev.kind === 'step_started') {
+      if (pill) { pill.textContent = 'running'; pill.className = 'step-status status-running'; pill.title = ''; }
+      if (output) { output.hidden = true; output.textContent = ''; }
+    }
+    if (ev.kind === 'step_completed') {
+      if (pill) { pill.textContent = 'done'; pill.className = 'step-status status-done'; pill.title = ''; }
+      if (output) {
+        const text = typeof ev.output === 'string' ? ev.output : (ev.output != null ? JSON.stringify(ev.output, null, 2) : '');
+        if (text) { output.hidden = false; output.textContent = text; }
+      }
+    }
+    if (ev.kind === 'step_failed') {
+      if (pill) { pill.textContent = 'failed'; pill.className = 'step-status status-failed'; pill.title = ev.error || ''; }
+      if (output && ev.error) { output.hidden = false; output.textContent = 'Error: ' + ev.error; }
+    }
+    if (ev.kind === 'step_skipped') {
+      if (pill) { pill.textContent = 'skipped'; pill.className = 'step-status status-skipped'; pill.title = (ev.meta && ev.meta.reason) || ''; }
+    }
+    if (ev.kind === 'item_started') {
+      // For forEach steps, surface live progress as "running (3/100)"
+      // — the count comes from accumulating item_started events. We
+      // store the running tally on the pill's dataset so the next
+      // tick can read + increment it without re-parsing text.
+      if (pill) {
+        const total = pill.dataset.itemTotal || '?';
+        const seen = (parseInt(pill.dataset.itemDone || '0', 10)) + 1;
+        pill.dataset.itemDone = String(seen);
+        pill.dataset.itemTotal = total;
+        pill.textContent = 'running (' + seen + '/' + total + ')';
+        pill.className = 'step-status status-running';
+      }
+    }
+    if (ev.kind === 'item_completed' && pill) {
+      const seen = (parseInt(pill.dataset.itemDone || '0', 10)) + 1;
+      pill.dataset.itemDone = String(seen);
+    }
   }
 
   async function saveWorkflow() {
@@ -10055,7 +10408,7 @@ const CONSOLE_JS = `
           : t.trigger === 'execution_blocked' ? ('>' + (t.blockedHours ?? 24) + 'h blocked')
           : t.trigger === 'goal_stale' ? ('>' + (t.staleDays ?? 7) + 'd stale')
           : t.trigger === 'inbox_backed_up' ? ('>=' + (t.inboxThreshold ?? 10) + ' open') : '';
-        const editor = editingTemplateId === t.id ? renderEditor(t) : '';
+        const editor = editingTemplateId === t.id ? renderCheckInEditor(t) : '';
         return [
           '<div class="checkin-row" data-checkin-row="' + escMem(t.id) + '">',
           '  <div class="checkin-main">',
@@ -10081,7 +10434,7 @@ const CONSOLE_JS = `
       }).join('');
 
       if (editingNew) {
-        listEl.insertAdjacentHTML('beforeend', renderEditor(null));
+        listEl.insertAdjacentHTML('beforeend', renderCheckInEditor(null));
       }
 
       bindCheckInActions();
@@ -10090,7 +10443,15 @@ const CONSOLE_JS = `
     }
   }
 
-  function renderEditor(t) {
+  // This is the check-in template editor renderer. Originally named
+  // renderEditor and lexically-hoisted to shadow the workflow editor's
+  // renderEditor (same name, same IIFE scope), which made the Workflow
+  // Studio middle pane silently stay on "Loading workflow…" whenever
+  // setWorkflowDraftFromData → renderEditor ran: JS resolved the name
+  // to THIS function and called it with no t, returning a check-in
+  // editor HTML string into the void. Renaming keeps both namespaces
+  // distinct.
+  function renderCheckInEditor(t) {
     const v = t || {
       name: '', description: '', trigger: 'schedule',
       schedule: '0 9 * * 1', blockedHours: 24, staleDays: 7, inboxThreshold: 10,
@@ -10607,13 +10968,26 @@ const CONSOLE_JS = `
     meta.textContent = recall ? 'sdk loaded' : 'electron only';
   }
 
+  // Tools whose execution is internal self-polling — the daemon reads
+  // its own state continuously to drive autonomy + the dashboard.
+  // Surfacing those in the user-facing RECENT card is pure noise
+  // (every poll prints "execution_list ✓" and pushes real work off).
+  // Filter here rather than the API so the raw event log stays
+  // intact for debugging via /api/console/tool-events/recent itself.
+  const DOCK_RECENT_HIDDEN = new Set([
+    'execution_list', 'goal_list', 'run_list',
+    'memory_search', 'monitor_list', 'task_list',
+  ]);
+
   async function refreshDockRecent() {
     const list = document.querySelector('[data-dock-recent-list]');
     const count = document.querySelector('[data-dock-recent-count]');
     if (!list || !count) return;
     try {
-      const data = await fetchJSON('/api/console/tool-events/recent?limit=6');
-      const events = Array.isArray(data?.events) ? data.events : [];
+      // Over-fetch so the filter still leaves us with ~6 visible rows.
+      const data = await fetchJSON('/api/console/tool-events/recent?limit=24');
+      const rawEvents = Array.isArray(data?.events) ? data.events : [];
+      const events = rawEvents.filter((e) => !DOCK_RECENT_HIDDEN.has(e.toolName)).slice(0, 6);
       count.textContent = String(events.length);
       if (events.length === 0) {
         list.innerHTML = '<div class="dock-empty">— quiet —</div>';
