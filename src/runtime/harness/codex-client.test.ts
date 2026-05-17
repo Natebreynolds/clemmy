@@ -1,0 +1,126 @@
+/**
+ * Run: npx tsx --test src/runtime/harness/codex-client.test.ts
+ *
+ * Exercises the codex-native auth bridge for the harness Runner.
+ *
+ * The auth-store reads tokens from `${BASE_DIR}/state/auth.json`,
+ * computed from CLEMENTINE_HOME at module load. Tests set
+ * CLEMENTINE_HOME to a temp dir BEFORE importing the module under
+ * test, write a fake auth.json, then verify:
+ *
+ *  - configureHarnessRuntime returns ok:false with a clear reason
+ *    when no OAuth tokens are stored
+ *  - configureHarnessRuntime returns ok:true and is idempotent once
+ *    tokens exist (a second call within the same process is a no-op)
+ *  - shouldRefresh's staleness window correctly classifies missing,
+ *    just-refreshed, and old token timestamps
+ *
+ * We do NOT exercise the live OAuth refresh against the codex backend
+ * — that's a network integration and belongs in a smoke test.
+ */
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+
+const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-codex-client-test-'));
+process.env.CLEMENTINE_HOME = TMP_HOME;
+const AUTH_STATE_DIR = path.join(TMP_HOME, 'state');
+const AUTH_STATE_FILE = path.join(AUTH_STATE_DIR, 'auth.json');
+mkdirSync(AUTH_STATE_DIR, { recursive: true });
+
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+
+const { configureHarnessRuntime, resetHarnessRuntimeConfig, __test__ } = await import(
+  './codex-client.js'
+);
+
+function clearAuth(): void {
+  try {
+    rmSync(AUTH_STATE_FILE);
+  } catch {
+    /* not present */
+  }
+}
+
+function writeAuth(payload: Record<string, unknown>): void {
+  writeFileSync(AUTH_STATE_FILE, JSON.stringify(payload, null, 2), 'utf-8');
+}
+
+test.beforeEach(() => {
+  resetHarnessRuntimeConfig();
+  clearAuth();
+});
+
+test.after(() => {
+  try {
+    rmSync(TMP_HOME, { recursive: true, force: true });
+  } catch {
+    /* best effort */
+  }
+});
+
+test('configureHarnessRuntime returns ok:false when no OAuth tokens are stored', async () => {
+  const result = await configureHarnessRuntime();
+  assert.equal(result.ok, false);
+  assert.match(result.reason ?? '', /No codex OAuth tokens/);
+  assert.match(result.reason ?? '', /clementine auth login-native/);
+});
+
+test('configureHarnessRuntime returns ok:true once tokens exist', async () => {
+  writeAuth({
+    source: 'native',
+    codexOauth: {
+      accessToken: 'fake-access-token-abc',
+      refreshToken: 'fake-refresh-token-xyz',
+      lastRefresh: new Date().toISOString(),
+    },
+  });
+  const result = await configureHarnessRuntime();
+  assert.equal(result.ok, true);
+  assert.equal(result.reason, undefined);
+});
+
+test('configureHarnessRuntime is idempotent within a process', async () => {
+  writeAuth({
+    source: 'native',
+    codexOauth: {
+      accessToken: 'a',
+      refreshToken: 'r',
+      lastRefresh: new Date().toISOString(),
+    },
+  });
+  const first = await configureHarnessRuntime();
+  assert.equal(first.ok, true);
+
+  // Wipe auth and call again — should still report ok because the
+  // module already installed the OpenAI client into the agents SDK.
+  clearAuth();
+  const second = await configureHarnessRuntime();
+  assert.equal(second.ok, true);
+});
+
+test('shouldRefresh: missing lastRefresh forces a refresh', () => {
+  assert.equal(__test__.shouldRefresh(undefined), true);
+  assert.equal(__test__.shouldRefresh(null), true);
+  assert.equal(__test__.shouldRefresh(''), true);
+});
+
+test('shouldRefresh: malformed lastRefresh forces a refresh', () => {
+  assert.equal(__test__.shouldRefresh('not-a-date'), true);
+});
+
+test('shouldRefresh: a fresh timestamp does not trigger a refresh', () => {
+  const justNow = new Date().toISOString();
+  assert.equal(__test__.shouldRefresh(justNow), false);
+});
+
+test('shouldRefresh: a token older than REFRESH_AFTER_MS triggers a refresh', () => {
+  const old = new Date(Date.now() - __test__.REFRESH_AFTER_MS - 60_000).toISOString();
+  assert.equal(__test__.shouldRefresh(old), true);
+});
+
+test('shouldRefresh: a token just inside the window does not trigger', () => {
+  const recent = new Date(Date.now() - __test__.REFRESH_AFTER_MS + 60_000).toISOString();
+  assert.equal(__test__.shouldRefresh(recent), false);
+});
