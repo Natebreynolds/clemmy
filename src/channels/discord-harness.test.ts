@@ -28,7 +28,6 @@ function event(type: EventRow['type'], data: Record<string, unknown> = {}): Even
     role: 'system',
     type,
     parentEventId: null,
-    idemKey: null,
     data,
     createdAt: '2026-05-17T12:00:00.000Z',
   };

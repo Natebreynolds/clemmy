@@ -11,10 +11,9 @@ import { actionBus } from '../action-bus.js';
  * Mirrors the SQLite pattern used by src/memory/db.ts: WAL + NORMAL,
  * schema_version migrations, cached singleton handle, reset for tests.
  *
- * One file: ~/.clementine-next/state/harness.db. Holds four tables:
+ * One file: ~/.clementine-next/state/harness.db. Holds three tables:
  *   - sessions       : one row per chat / execution / workflow / agent run
  *   - events         : append-only, monotonic seq, JSON payload
- *   - idempotency    : `sha256(session|tool|args)` -> result event id
  *   - kill_switches  : session_id rows that pause the next turn_started
  *
  * The harness reads events to rebuild Session state on replay. The event
@@ -94,7 +93,6 @@ export interface EventRow {
   role: string;
   type: EventType;
   parentEventId: string | null;
-  idemKey: string | null;
   data: Record<string, unknown>;
   createdAt: string;
 }
@@ -106,7 +104,6 @@ export interface AppendEventInput {
   type: EventType;
   data?: Record<string, unknown>;
   parentEventId?: string;
-  idemKey?: string;
 }
 
 export interface CreateSessionInput {
@@ -118,14 +115,6 @@ export interface CreateSessionInput {
   objective?: string;
   tokenBudget?: number;
   metadata?: Record<string, unknown>;
-}
-
-export interface IdempotencyRow {
-  key: string;
-  tool: string;
-  sessionId: string;
-  resultEventId: string;
-  createdAt: string;
 }
 
 export interface ListEventsOptions {
@@ -172,22 +161,11 @@ const MIGRATIONS: { version: number; sql: string }[] = [
         role            TEXT NOT NULL,
         type            TEXT NOT NULL,
         parent_event_id TEXT,
-        idem_key        TEXT,
         data_json       TEXT NOT NULL,
         created_at      TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_events_session_seq ON events(session_id, seq);
       CREATE INDEX IF NOT EXISTS idx_events_session_type ON events(session_id, type);
-      CREATE INDEX IF NOT EXISTS idx_events_idem ON events(idem_key) WHERE idem_key IS NOT NULL;
-
-      CREATE TABLE IF NOT EXISTS idempotency (
-        key             TEXT PRIMARY KEY,
-        tool            TEXT NOT NULL,
-        session_id      TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-        result_event_id TEXT NOT NULL,
-        created_at      TEXT NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS idx_idempotency_session ON idempotency(session_id);
 
       CREATE TABLE IF NOT EXISTS kill_switches (
         session_id   TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
@@ -275,16 +253,7 @@ interface RawEventRow {
   role: string;
   type: string;
   parent_event_id: string | null;
-  idem_key: string | null;
   data_json: string;
-  created_at: string;
-}
-
-interface RawIdempotencyRow {
-  key: string;
-  tool: string;
-  session_id: string;
-  result_event_id: string;
   created_at: string;
 }
 
@@ -315,18 +284,7 @@ function rowToEvent(row: RawEventRow): EventRow {
     role: row.role,
     type: row.type as EventType,
     parentEventId: row.parent_event_id,
-    idemKey: row.idem_key,
     data: JSON.parse(row.data_json),
-    createdAt: row.created_at,
-  };
-}
-
-function rowToIdempotency(row: RawIdempotencyRow): IdempotencyRow {
-  return {
-    key: row.key,
-    tool: row.tool,
-    sessionId: row.session_id,
-    resultEventId: row.result_event_id,
     createdAt: row.created_at,
   };
 }
@@ -411,8 +369,8 @@ export function appendEvent(input: AppendEventInput): EventRow {
   const tx = db.transaction(() => {
     db.prepare(
       `INSERT INTO events
-         (id, session_id, turn, role, type, parent_event_id, idem_key, data_json, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (id, session_id, turn, role, type, parent_event_id, data_json, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       id,
       input.sessionId,
@@ -420,7 +378,6 @@ export function appendEvent(input: AppendEventInput): EventRow {
       input.role,
       input.type,
       input.parentEventId ?? null,
-      input.idemKey ?? null,
       data,
       now,
     );
@@ -464,27 +421,6 @@ export function getEvent(eventId: string): EventRow | null {
     | RawEventRow
     | undefined;
   return row ? rowToEvent(row) : null;
-}
-
-export function lookupIdempotent(key: string): IdempotencyRow | null {
-  const db = openEventLog();
-  const row = db.prepare('SELECT * FROM idempotency WHERE key = ?').get(key) as
-    | RawIdempotencyRow
-    | undefined;
-  return row ? rowToIdempotency(row) : null;
-}
-
-export function recordIdempotent(input: {
-  key: string;
-  tool: string;
-  sessionId: string;
-  resultEventId: string;
-}): void {
-  const db = openEventLog();
-  db.prepare(
-    `INSERT OR REPLACE INTO idempotency (key, tool, session_id, result_event_id, created_at)
-     VALUES (?, ?, ?, ?, ?)`,
-  ).run(input.key, input.tool, input.sessionId, input.resultEventId, nowIso());
 }
 
 export function requestKill(sessionId: string, reason?: string): void {

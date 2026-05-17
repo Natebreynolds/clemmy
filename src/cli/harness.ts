@@ -3,18 +3,19 @@
  * driving the Orchestrator end-to-end without touching the existing
  * v0.2 daemon channels.
  *
- *   clementine harness run "<prompt>"     One turn through the loop.
+ *   clementine harness run "<prompt>"     Multi-step conversation through the loop.
  *   clementine harness events <session>   Pretty-print all events.
  *
  * `run` creates a HarnessSession (kind=chat), builds the
- * Orchestrator, drives runTurn(), prints emitted events live, and
- * exits with the final OrchestratorDecision. If the agent calls
- * request_approval, the turn pauses (status=awaiting_approval) and
- * we print the pending approval — resume from a follow-up turn is
- * not wired yet.
+ * Orchestrator, drives runConversation() — which auto-continues
+ * across turns until the Orchestrator emits done=true or a budget
+ * trips — and prints each emitted event live as it lands in the
+ * event log. This exercises the same code path the desktop chat
+ * dock and Discord harness use, so a green smoke test means
+ * auto-continuation actually works, not just one turn.
  *
- * Requires OPENAI_API_KEY (or codex auth) to actually invoke the
- * Runner. Without it, the SDK will fail loudly.
+ * Authenticates via codex OAuth (`clementine auth login-native`).
+ * Raw OPENAI_API_KEYs are intentionally NOT accepted.
  */
 import { buildOrchestratorAgent } from '../agents/orchestrator.js';
 import { configureHarnessRuntime } from '../runtime/harness/codex-client.js';
@@ -24,23 +25,20 @@ import {
   getSession,
   type EventRow,
 } from '../runtime/harness/eventlog.js';
-import { runTurn } from '../runtime/harness/loop.js';
+import { runConversation } from '../runtime/harness/loop.js';
+import { actionBus } from '../runtime/action-bus.js';
 
 interface HarnessRunOptions {
   prompt: string;
   maxTurns?: number;
+  maxSteps?: number;
 }
 
 /**
- * One-turn execution. Returns the session id and the loop's status
- * so the caller can decide what to print.
+ * Multi-step execution. Subscribes to the actionBus for live event
+ * printing, then drives runConversation until terminal state.
  */
 async function harnessRun(opts: HarnessRunOptions): Promise<number> {
-  // The harness Runner authenticates via the user's OAuth bearer
-  // token, brokered through chatgpt.com/backend-api/codex — the
-  // same path Codex CLI and Hermes use. Raw OPENAI_API_KEYs are
-  // reserved for voice + embeddings and intentionally NOT accepted
-  // here.
   const auth = await configureHarnessRuntime();
   if (!auth.ok) {
     process.stderr.write(`harness run: ${auth.reason}\n`);
@@ -54,24 +52,36 @@ async function harnessRun(opts: HarnessRunOptions): Promise<number> {
   process.stdout.write(`harness session: ${session.id}\n`);
   process.stdout.write(`> ${opts.prompt}\n\n`);
 
-  const agent = await buildOrchestratorAgent();
-  const result = await runTurn({
-    agent,
-    sessionId: session.id,
-    input: opts.prompt,
-    maxTurns: opts.maxTurns,
+  // Live event printing. The conversation persists every event to
+  // SQLite AND fans out on the actionBus; subscribing here gives the
+  // user real-time progress instead of a silent wait followed by a
+  // dump.
+  const unsubscribe = actionBus.subscribe((bus) => {
+    if (bus.kind !== 'harness.event') return;
+    if (bus.sessionId !== session.id) return;
+    printEvent(bus.event);
   });
 
-  // Print events emitted during this turn (the loop also persisted
-  // them to SQLite — this is the live view of what happened).
-  const events = listEvents(session.id).filter((ev) => ev.turn === result.turn);
-  printEvents(events);
+  let result;
+  try {
+    const agent = await buildOrchestratorAgent();
+    result = await runConversation({
+      agent,
+      sessionId: session.id,
+      input: opts.prompt,
+      maxSteps: opts.maxSteps,
+      maxTurns: opts.maxTurns,
+    });
+  } finally {
+    unsubscribe();
+  }
 
   process.stdout.write(`\nstatus: ${result.status}\n`);
+  process.stdout.write(`steps:  ${result.steps}\n`);
   if (result.error) process.stdout.write(`error: ${result.error}\n`);
-  if (result.finalOutput !== undefined) {
-    process.stdout.write('finalOutput:\n');
-    process.stdout.write(formatFinalOutput(result.finalOutput) + '\n');
+  if (result.lastDecision) {
+    process.stdout.write('lastDecision:\n');
+    process.stdout.write(formatFinalOutput(result.lastDecision) + '\n');
   }
   process.stdout.write(`\nreplay with: clementine harness events ${session.id}\n`);
 
@@ -94,15 +104,17 @@ function harnessShowEvents(sessionId: string): number {
 // ---------- formatting ----------
 
 function printEvents(events: EventRow[]): void {
-  for (const ev of events) {
-    const ts = ev.createdAt.slice(11, 19); // HH:MM:SS
-    const head = `[${ts}] turn ${ev.turn} ${ev.role}.${ev.type}`;
-    const detail = formatEventData(ev.type, ev.data);
-    if (detail) {
-      process.stdout.write(`${head}  ${detail}\n`);
-    } else {
-      process.stdout.write(`${head}\n`);
-    }
+  for (const ev of events) printEvent(ev);
+}
+
+function printEvent(ev: EventRow): void {
+  const ts = ev.createdAt.slice(11, 19); // HH:MM:SS
+  const head = `[${ts}] turn ${ev.turn} ${ev.role}.${ev.type}`;
+  const detail = formatEventData(ev.type, ev.data);
+  if (detail) {
+    process.stdout.write(`${head}  ${detail}\n`);
+  } else {
+    process.stdout.write(`${head}\n`);
   }
 }
 
@@ -153,7 +165,7 @@ function formatFinalOutput(value: unknown): string {
 // ---------- argv dispatch ----------
 
 const USAGE = `Usage:
-  clementine harness run "<prompt>" [--max-turns N]
+  clementine harness run "<prompt>" [--max-turns N] [--max-steps N]
   clementine harness events <session-id>
 `;
 
@@ -165,13 +177,13 @@ export async function runHarnessCli(args: string[]): Promise<number> {
   }
 
   if (sub === 'run') {
-    const { prompt, maxTurns } = parseRunArgs(args.slice(1));
+    const { prompt, maxTurns, maxSteps } = parseRunArgs(args.slice(1));
     if (!prompt) {
       process.stderr.write('harness run: missing prompt\n');
       process.stderr.write(USAGE);
       return 2;
     }
-    return harnessRun({ prompt, maxTurns });
+    return harnessRun({ prompt, maxTurns, maxSteps });
   }
 
   if (sub === 'events') {
@@ -188,9 +200,14 @@ export async function runHarnessCli(args: string[]): Promise<number> {
   return 2;
 }
 
-function parseRunArgs(args: string[]): { prompt: string; maxTurns?: number } {
+function parseRunArgs(args: string[]): {
+  prompt: string;
+  maxTurns?: number;
+  maxSteps?: number;
+} {
   const promptParts: string[] = [];
   let maxTurns: number | undefined;
+  let maxSteps: number | undefined;
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === '--max-turns') {
@@ -198,7 +215,12 @@ function parseRunArgs(args: string[]): { prompt: string; maxTurns?: number } {
       if (Number.isFinite(n) && n > 0) maxTurns = Math.floor(n);
       continue;
     }
+    if (a === '--max-steps') {
+      const n = Number(args[++i]);
+      if (Number.isFinite(n) && n > 0) maxSteps = Math.floor(n);
+      continue;
+    }
     promptParts.push(a);
   }
-  return { prompt: promptParts.join(' ').trim(), maxTurns };
+  return { prompt: promptParts.join(' ').trim(), maxTurns, maxSteps };
 }

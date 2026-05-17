@@ -1,7 +1,13 @@
 import type { Agent, AgentInputItem } from '@openai/agents';
 import { Runner } from '@openai/agents';
 import { HarnessSession } from './session.js';
-import { appendEvent, getSession, updateSession, type SessionRow } from './eventlog.js';
+import {
+  appendEvent,
+  getSession,
+  openEventLog,
+  type AppendEventInput,
+  type SessionRow,
+} from './eventlog.js';
 import {
   assertNotKilled,
   KillRequested,
@@ -11,6 +17,27 @@ import {
   DEFAULT_TOOL_CALLS_PER_TURN,
 } from './brackets.js';
 import { attachEventLogHooks, extractSessionIdFromContext, type RunHooksLike } from './hooks.js';
+
+/**
+ * Wrap appendEvent so a transient SQLite write failure (lock, disk
+ * full, etc.) inside the loop logs an error instead of unwinding the
+ * whole turn and surfacing as an unhandled rejection. The event log
+ * is observability, not load-bearing for the run's logical outcome —
+ * losing one event entry is preferable to crashing the daemon.
+ */
+function safeAppend(input: AppendEventInput): void {
+  try {
+    appendEvent(input);
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error('[harness] failed to write event', {
+      type: input.type,
+      sessionId: input.sessionId,
+      turn: input.turn,
+      err: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
 
 /**
  * The harness loop — `runTurn(options)`.
@@ -212,7 +239,7 @@ export async function runConversation(
     const decision = toOrchestratorDecision(turnResult.finalOutput);
     lastDecision = decision ?? lastDecision;
 
-    appendEvent({
+    safeAppend({
       sessionId: options.sessionId,
       turn: turnResult.turn,
       role: 'orchestrator',
@@ -225,7 +252,7 @@ export async function runConversation(
 
     if (!decision) {
       // No structured decision = nothing to recurse on. End cleanly.
-      appendEvent({
+      safeAppend({
         sessionId: options.sessionId,
         turn: turnResult.turn,
         role: 'system',
@@ -242,7 +269,7 @@ export async function runConversation(
     }
 
     if (decision.done) {
-      appendEvent({
+      safeAppend({
         sessionId: options.sessionId,
         turn: turnResult.turn,
         role: 'system',
@@ -281,7 +308,7 @@ export async function runConversation(
       };
     }
     if (decision.nextAction === 'abandoned') {
-      appendEvent({
+      safeAppend({
         sessionId: options.sessionId,
         turn: turnResult.turn,
         role: 'system',
@@ -303,7 +330,7 @@ export async function runConversation(
 
     // Wall-clock check before we kick off another turn.
     if (Date.now() - startedAt > maxWallMs) {
-      appendEvent({
+      safeAppend({
         sessionId: options.sessionId,
         turn: turnResult.turn,
         role: 'system',
@@ -324,7 +351,7 @@ export async function runConversation(
   }
 
   // Max steps without resolution.
-  appendEvent({
+  safeAppend({
     sessionId: options.sessionId,
     turn: lastTurn,
     role: 'system',
@@ -376,7 +403,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     return { sessionId: options.sessionId, turn, status: 'killed' };
   }
 
-  appendEvent({
+  safeAppend({
     sessionId: options.sessionId,
     turn,
     role: 'system',
@@ -432,7 +459,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
       // approval_requested. Emit one event per interrupted tool call
       // so the audit log explains the pause.
       for (const interruption of outcome.interruptions ?? []) {
-        appendEvent({
+        safeAppend({
           sessionId: options.sessionId,
           turn,
           role: 'orchestrator',
@@ -455,7 +482,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
       lastResponseId: outcome.lastResponseId,
       turn,
     });
-    appendEvent({
+    safeAppend({
       sessionId: options.sessionId,
       turn,
       role: 'system',
@@ -496,7 +523,7 @@ function isKillBeforeStart(
     return false;
   } catch (err) {
     if (!(err instanceof KillRequested)) throw err;
-    appendEvent({
+    safeAppend({
       sessionId,
       turn,
       role: 'system',
@@ -515,7 +542,7 @@ function handleRunError(
   err: unknown,
 ): RunTurnResult {
   if (err instanceof KillRequested) {
-    appendEvent({
+    safeAppend({
       sessionId,
       turn,
       role: 'system',
@@ -527,7 +554,7 @@ function handleRunError(
     return { sessionId, turn, status: 'killed' };
   }
   if (err instanceof ToolCallsLimitExceeded) {
-    appendEvent({
+    safeAppend({
       sessionId,
       turn,
       role: 'system',
@@ -539,7 +566,7 @@ function handleRunError(
     return { sessionId, turn, status: 'limit_exceeded', error: err.message };
   }
   const message = err instanceof Error ? err.message : String(err);
-  appendEvent({
+  safeAppend({
     sessionId,
     turn,
     role: 'system',
@@ -552,11 +579,18 @@ function handleRunError(
 }
 
 function bumpTurnNumber(sessionId: string, turn: number): void {
-  const row = getSession(sessionId);
-  if (!row) return;
-  updateSession(sessionId, {
-    metadata: { ...row.metadata, __turn: turn },
-  });
+  // Atomic update via SQLite's JSON1 json_set — avoids the
+  // read-modify-write race the previous getSession + updateSession
+  // path had when two runTurn() calls land on the same session
+  // (e.g. UI double-submit). One UPDATE statement, one transaction,
+  // no lost increments.
+  const db = openEventLog();
+  db.prepare(
+    `UPDATE sessions
+       SET metadata_json = json_set(metadata_json, '$.__turn', ?),
+           updated_at    = ?
+       WHERE id = ?`,
+  ).run(turn, new Date().toISOString(), sessionId);
 }
 
 function nextTurnNumber(row: SessionRow): number {

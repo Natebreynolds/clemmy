@@ -8931,58 +8931,101 @@ const CONSOLE_JS = `
   // Subscribe to the per-session SSE stream and update the assistant
   // turn as events arrive. Resolves when the stream reaches a
   // terminal state.
+  //
+  // Reconnect strategy: EventSource auto-reconnects but loses query
+  // params, so a network blip would replay from seq=0 and miss any
+  // event written during the gap. We track lastSeq, manually close
+  // on error, and rebuild with ?sinceSeq=<lastSeq>. Bounded by
+  // MAX_RECONNECTS so a permanently-broken endpoint doesn't loop.
   function streamHarnessSession(sessionId, turn, options) {
+    const MAX_RECONNECTS = 5;
     return new Promise((resolve) => {
-      const url = withToken('/api/sessions/' + encodeURIComponent(sessionId) + '/events');
-      const es = new EventSource(url);
+      let lastSeq = 0;
+      let attempts = 0;
+      let es = null;
       let closed = false;
+
       const finish = () => {
         if (closed) return;
         closed = true;
-        try { es.close(); } catch (_) {}
+        try { if (es) es.close(); } catch (_) {}
         resolve();
       };
 
-      // Replay payload: { sessionId, sessionStatus, events: [...] }
-      es.addEventListener('replay', (e) => {
-        try {
-          const payload = JSON.parse(e.data);
-          for (const ev of payload.events || []) renderHarnessEvent(ev, turn, options);
-        } catch (_) {}
-      });
-      es.addEventListener('event', (e) => {
-        try {
-          const ev = JSON.parse(e.data);
-          renderHarnessEvent(ev, turn, options);
-          if (ev.type === 'conversation_completed') {
-            const summary = (ev.data && ev.data.summary) || '';
-            if (summary) setChatTurnText(turn, summary);
-            const reason = ev.data && ev.data.reason;
-            setChatTurnStatus(turn, reason === 'abandoned_by_orchestrator' ? 'abandoned' : 'complete');
-            finish();
-          } else if (ev.type === 'run_failed') {
-            const msg = (ev.data && ev.data.error) || 'failed';
-            setChatTurnText(turn, 'Error: ' + msg);
-            setChatTurnStatus(turn, 'failed');
-            finish();
-          } else if (ev.type === 'conversation_limit_exceeded') {
-            const reason = (ev.data && ev.data.reason) || 'limit';
-            setChatTurnStatus(turn, 'stopped: ' + reason);
-            finish();
-          } else if (ev.type === 'awaiting_user_input') {
-            const q = (ev.data && ev.data.question) || 'waiting on your reply';
-            setChatTurnText(turn, q);
-            setChatTurnStatus(turn, 'awaiting reply');
-            finish();
-          } else if (ev.type === 'approval_requested') {
-            const subj = (ev.data && (ev.data.subject || ev.data.tool)) || 'action';
-            setChatTurnStatus(turn, 'approval required: ' + subj);
-          }
-        } catch (_) {}
-      });
-      es.onerror = () => {
-        if (es.readyState === EventSource.CLOSED) finish();
+      const handleEvent = (ev) => {
+        if (ev && typeof ev.seq === 'number' && ev.seq > lastSeq) lastSeq = ev.seq;
+        renderHarnessEvent(ev, turn, options);
+        if (ev.type === 'conversation_completed') {
+          const summary = (ev.data && ev.data.summary) || '';
+          if (summary) setChatTurnText(turn, summary);
+          const reason = ev.data && ev.data.reason;
+          setChatTurnStatus(turn, reason === 'abandoned_by_orchestrator' ? 'abandoned' : 'complete');
+          finish();
+        } else if (ev.type === 'run_failed') {
+          const msg = (ev.data && ev.data.error) || 'failed';
+          setChatTurnText(turn, 'Error: ' + msg);
+          setChatTurnStatus(turn, 'failed');
+          finish();
+        } else if (ev.type === 'conversation_limit_exceeded') {
+          const reason = (ev.data && ev.data.reason) || 'limit';
+          setChatTurnStatus(turn, 'stopped: ' + reason);
+          finish();
+        } else if (ev.type === 'awaiting_user_input') {
+          const q = (ev.data && ev.data.question) || 'waiting on your reply';
+          setChatTurnText(turn, q);
+          setChatTurnStatus(turn, 'awaiting reply');
+          finish();
+        } else if (ev.type === 'approval_requested') {
+          const subj = (ev.data && (ev.data.subject || ev.data.tool)) || 'action';
+          setChatTurnStatus(turn, 'approval required: ' + subj);
+        }
       };
+
+      const connect = () => {
+        if (closed) return;
+        const base = '/api/sessions/' + encodeURIComponent(sessionId) + '/events';
+        const url = withToken(lastSeq > 0 ? base + '?sinceSeq=' + lastSeq : base);
+        es = new EventSource(url);
+
+        es.addEventListener('replay', (e) => {
+          try {
+            const payload = JSON.parse(e.data);
+            for (const ev of payload.events || []) {
+              if (ev && typeof ev.seq === 'number' && ev.seq > lastSeq) lastSeq = ev.seq;
+              renderHarnessEvent(ev, turn, options);
+            }
+            // Successful replay frame means we're connected — reset
+            // the backoff so a later blip gets the full retry budget.
+            attempts = 0;
+          } catch (_) {}
+        });
+        es.addEventListener('event', (e) => {
+          try {
+            const ev = JSON.parse(e.data);
+            handleEvent(ev);
+          } catch (_) {}
+        });
+        es.onerror = () => {
+          if (closed) return;
+          if (es && es.readyState === EventSource.CLOSED) {
+            // Server-side close (terminal session, auth failure, etc).
+            // Don't reconnect — the user-visible state is already final.
+            finish();
+            return;
+          }
+          attempts += 1;
+          if (attempts > MAX_RECONNECTS) {
+            setChatTurnStatus(turn, 'lost connection');
+            finish();
+            return;
+          }
+          try { if (es) es.close(); } catch (_) {}
+          // Brief backoff: 250ms * attempts (250, 500, 750, 1000, 1250).
+          setTimeout(connect, 250 * attempts);
+        };
+      };
+
+      connect();
     });
   }
 

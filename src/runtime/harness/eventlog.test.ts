@@ -5,7 +5,6 @@
  *   - sessions/events round-trip with monotonic seq
  *   - unknown event types are rejected (no free-form writes)
  *   - data survives close/reopen (crash recovery via SQLite WAL)
- *   - idempotency lookup returns the cached result event
  *   - kill switch is sticky until cleared
  *
  * Isolated via per-test CLEMENTINE_HOME so the user's real
@@ -32,9 +31,6 @@ const {
   updateSession,
   appendEvent,
   listEvents,
-  getEvent,
-  lookupIdempotent,
-  recordIdempotent,
   requestKill,
   isKillRequested,
   clearKill,
@@ -115,32 +111,6 @@ test('persists across close+reopen (crash recovery)', () => {
   assert.equal(reload!.id, sess.id);
 });
 
-test('idempotency: store and lookup returns the cached result event', () => {
-  resetEventLog();
-  const sess = createSession({ kind: 'chat' });
-  const returned = appendEvent({
-    sessionId: sess.id,
-    turn: 1,
-    role: 'executor',
-    type: 'tool_returned',
-    data: { result: 'ok' },
-    idemKey: 'k1',
-  });
-  recordIdempotent({
-    key: 'k1',
-    tool: 'write_file',
-    sessionId: sess.id,
-    resultEventId: returned.id,
-  });
-  const cached = lookupIdempotent('k1');
-  assert.ok(cached);
-  assert.equal(cached!.resultEventId, returned.id);
-  assert.equal(cached!.tool, 'write_file');
-  const loaded = getEvent(cached!.resultEventId);
-  assert.ok(loaded);
-  assert.deepEqual(loaded!.data, { result: 'ok' });
-});
-
 test('listEvents filters by sinceSeq and types', () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
@@ -194,29 +164,6 @@ test('appending event bumps the parent session updated_at', () => {
   const reloaded = getSession(sess.id);
   assert.ok(reloaded);
   assert.ok(reloaded!.updatedAt >= original);
-});
-
-test('events with idem_key are queryable for replay', () => {
-  resetEventLog();
-  const sess = createSession({ kind: 'chat' });
-  appendEvent({
-    sessionId: sess.id,
-    turn: 1,
-    role: 'executor',
-    type: 'tool_called',
-    data: { tool: 'write_file', path: '/a' },
-    idemKey: 'abc',
-  });
-  appendEvent({
-    sessionId: sess.id,
-    turn: 1,
-    role: 'executor',
-    type: 'tool_returned',
-    data: { ok: true },
-    idemKey: 'abc',
-  });
-  const events = listEvents(sess.id);
-  assert.equal(events.filter((e) => e.idemKey === 'abc').length, 2);
 });
 
 test('500 sequential appends keep ordering and survive reopen', () => {
