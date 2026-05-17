@@ -2,6 +2,7 @@ import { EventEmitter } from 'node:events';
 import type { RunEvent, RunRecord } from './run-events.js';
 import type { NotificationRecord } from './notifications.js';
 import type { PendingApproval } from '../types.js';
+import type { EventRow } from './harness/eventlog.js';
 
 // Fan-out bus for "the daemon just did a thing" events. Listeners are
 // in-process only (the SSE handler in console-routes.ts subscribes
@@ -39,6 +40,15 @@ export type ActionEvent =
       stepId?: string;
       summary?: string;
       nextReviewAt?: string;
+    }
+  | {
+      // 0.3 harness — emitted from src/runtime/harness/eventlog.ts
+      // appendEvent(). Subscribers can filter by sessionId for a
+      // per-conversation stream, or by event.type for the high-signal
+      // global rail.
+      kind: 'harness.event';
+      sessionId: string;
+      event: EventRow;
     };
 
 export interface ActionBus {

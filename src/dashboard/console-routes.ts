@@ -85,6 +85,15 @@ import { createBackgroundTask, listBackgroundTasks } from '../execution/backgrou
 import { listRuns } from '../runtime/run-events.js';
 import { listNotifications } from '../runtime/notifications.js';
 import { actionBus, type ActionEvent } from '../runtime/action-bus.js';
+import {
+  appendEvent as appendHarnessEvent,
+  createSession as createHarnessSession,
+  getSession as getHarnessSession,
+  listEvents as listHarnessEvents,
+} from '../runtime/harness/eventlog.js';
+import { runConversation } from '../runtime/harness/loop.js';
+import { buildOrchestratorAgent } from '../agents/orchestrator.js';
+import { configureHarnessRuntime } from '../runtime/harness/codex-client.js';
 import { summarizeApprovalAction } from '../runtime/approval-summary.js';
 import {
   appendRecallTranscriptSegment,
@@ -2488,6 +2497,146 @@ export function registerConsoleRoutes(
     };
     res.on('close', cleanup);
     res.on('error', cleanup);
+  });
+
+  /**
+   * Per-session harness event stream.
+   *
+   * Used by the desktop chat and the Discord bot to watch a long-
+   * running 0.3 harness conversation. Each connection:
+   *   1. Replays existing events for this session from SQLite, so
+   *      subscribers that connect mid-run render history immediately.
+   *   2. Subscribes to actionBus and forwards every 'harness.event'
+   *      matching this sessionId.
+   *   3. Heartbeats every 15s so proxies/Electron don't close the
+   *      idle keep-alive.
+   *
+   * Query params:
+   *   ?sinceSeq=N  — only replay events with seq > N (resume mode).
+   */
+  app.get('/api/sessions/:sessionId/events', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const sessionId = req.params.sessionId;
+    const session = getHarnessSession(sessionId);
+    if (!session) { res.status(404).json({ error: 'session not found' }); return; }
+    const sinceSeqRaw = typeof req.query.sinceSeq === 'string' ? Number(req.query.sinceSeq) : 0;
+    const sinceSeq = Number.isFinite(sinceSeqRaw) && sinceSeqRaw > 0 ? sinceSeqRaw : 0;
+
+    res.status(200);
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders?.();
+
+    let closed = false;
+    const writeEvent = (eventName: string, payload: unknown): void => {
+      if (closed || res.destroyed) return;
+      res.write(`event: ${eventName}\n`);
+      res.write(`data: ${JSON.stringify(payload)}\n\n`);
+    };
+
+    // 1) Replay existing events. Cap at 500 so a very long session
+    // doesn't flood the initial frame; subscribers can reconnect
+    // with ?sinceSeq= for older slices if needed.
+    try {
+      const replay = listHarnessEvents(sessionId, { sinceSeq, limit: 500 });
+      writeEvent('replay', { sessionId, sessionStatus: session.status, events: replay });
+    } catch (err) {
+      writeEvent('replay', { sessionId, events: [], error: (err as Error).message });
+    }
+
+    // 2) Live subscription.
+    const unsubscribe = actionBus.subscribe((event) => {
+      if (event.kind !== 'harness.event') return;
+      if (event.sessionId !== sessionId) return;
+      writeEvent('event', event.event);
+    });
+
+    // 3) Heartbeat. The existing console-actions stream uses 15s.
+    const heartbeat = setInterval(() => {
+      if (closed || res.destroyed) return;
+      res.write(`: ping\n\n`);
+    }, 15_000);
+
+    const cleanup = (): void => {
+      if (closed) return;
+      closed = true;
+      clearInterval(heartbeat);
+      unsubscribe();
+    };
+    res.on('close', cleanup);
+    res.on('error', cleanup);
+  });
+
+  /**
+   * Background-mode harness chat handler.
+   *
+   * The desktop UI and Discord bot POST here to start (or continue)
+   * a 0.3 conversation. The response returns immediately with a
+   * session id + the SSE stream URL — execution happens in the
+   * background. The caller renders progress by subscribing to
+   * `/api/sessions/:sessionId/events`.
+   *
+   * Request body:
+   *   { input: string, sessionId?: string }
+   *
+   * Response (202 Accepted):
+   *   { sessionId, streamUrl, status: 'started' }
+   *
+   * If auth (codex OAuth) is missing, returns 412 with the message
+   * the CLI already prints; the caller surfaces it as a banner.
+   */
+  app.post('/api/harness/chat', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+
+    const body = req.body ?? {};
+    const input = typeof body.input === 'string' ? body.input.trim() : '';
+    if (!input) { res.status(400).json({ error: 'input required' }); return; }
+
+    const existingId = typeof body.sessionId === 'string' ? body.sessionId : '';
+    let session = existingId ? getHarnessSession(existingId) : null;
+    if (existingId && !session) { res.status(404).json({ error: 'session not found' }); return; }
+    if (!session) {
+      session = createHarnessSession({
+        kind: 'chat',
+        title: input.length > 80 ? `${input.slice(0, 77)}...` : input,
+        metadata: { source: 'desktop' },
+      });
+    }
+
+    const auth = await configureHarnessRuntime();
+    if (!auth.ok) { res.status(412).json({ error: auth.reason }); return; }
+
+    const sessionId = session.id;
+    const streamUrl = `/api/sessions/${sessionId}/events`;
+    // Respond immediately. The model run happens off the request
+    // thread so the desktop chat input unblocks instantly.
+    res.status(202).json({ sessionId, streamUrl, status: 'started' });
+
+    setImmediate(async () => {
+      try {
+        const agent = await buildOrchestratorAgent();
+        await runConversation({ agent, sessionId, input });
+      } catch (err) {
+        // The loop emits its own run_failed when a turn throws. If we
+        // got here, the throw happened BEFORE any turn started
+        // (typically inside buildOrchestratorAgent / handoff catalog
+        // build). Emit run_failed so the SSE stream surfaces it.
+        const message = err instanceof Error ? err.message : String(err);
+        try {
+          appendHarnessEvent({
+            sessionId,
+            turn: 0,
+            role: 'system',
+            type: 'run_failed',
+            data: { error: message, stage: 'pre_first_turn' },
+          });
+        } catch {
+          // last-ditch — swallow to avoid an unhandled rejection
+        }
+      }
+    });
   });
 
   app.post('/api/console/home/chat/stream', async (req, res) => {

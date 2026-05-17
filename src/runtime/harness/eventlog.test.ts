@@ -238,3 +238,47 @@ test('500 sequential appends keep ordering and survive reopen', () => {
     assert.equal(all[i].data.i, i);
   }
 });
+
+test('appendEvent emits a harness.event on the global actionBus', async () => {
+  // The dashboard SSE endpoint and Discord live-progress edits both
+  // subscribe to actionBus to learn about new harness events. Wire
+  // a subscriber here and verify every appendEvent fans out.
+  const { actionBus } = await import('../action-bus.js');
+  const sess = createSession({ kind: 'chat' });
+
+  const seen: Array<{ sessionId: string; type: string; turn: number }> = [];
+  const unsubscribe = actionBus.subscribe((evt) => {
+    if (evt.kind !== 'harness.event') return;
+    if (evt.sessionId !== sess.id) return;
+    seen.push({ sessionId: evt.sessionId, type: evt.event.type, turn: evt.event.turn });
+  });
+
+  appendEvent({ sessionId: sess.id, turn: 1, role: 'system', type: 'turn_started', data: {} });
+  appendEvent({ sessionId: sess.id, turn: 1, role: 'orchestrator', type: 'handoff', data: { to: 'Executor' } });
+  appendEvent({ sessionId: sess.id, turn: 2, role: 'system', type: 'turn_ended', data: {} });
+
+  unsubscribe();
+  assert.equal(seen.length, 3);
+  assert.deepEqual(seen.map((s) => s.type), ['turn_started', 'handoff', 'turn_ended']);
+  assert.equal(seen[0].sessionId, sess.id);
+});
+
+test('actionBus subscribers filtered by sessionId never see other sessions', async () => {
+  const { actionBus } = await import('../action-bus.js');
+  const a = createSession({ kind: 'chat' });
+  const b = createSession({ kind: 'chat' });
+
+  const onlyA: string[] = [];
+  const unsubscribe = actionBus.subscribe((evt) => {
+    if (evt.kind !== 'harness.event') return;
+    if (evt.sessionId !== a.id) return;
+    onlyA.push(evt.event.type);
+  });
+
+  appendEvent({ sessionId: a.id, turn: 1, role: 'system', type: 'turn_started', data: {} });
+  appendEvent({ sessionId: b.id, turn: 1, role: 'system', type: 'turn_started', data: {} });
+  appendEvent({ sessionId: a.id, turn: 1, role: 'system', type: 'turn_ended', data: {} });
+
+  unsubscribe();
+  assert.deepEqual(onlyA, ['turn_started', 'turn_ended']);
+});

@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { BASE_DIR } from '../../config.js';
+import { actionBus } from '../action-bus.js';
 
 /**
  * Event log — the spine of the 0.3 harness.
@@ -427,7 +428,12 @@ export function appendEvent(input: AppendEventInput): EventRow {
   });
   tx();
   const row = db.prepare('SELECT * FROM events WHERE id = ?').get(id) as RawEventRow;
-  return rowToEvent(row);
+  const event = rowToEvent(row);
+  // Fan out for live SSE subscribers. Best-effort — emit errors are
+  // swallowed inside actionBus so a flaky listener can never block
+  // an event write.
+  actionBus.emit({ kind: 'harness.event', sessionId: event.sessionId, event });
+  return event;
 }
 
 export function listEvents(sessionId: string, options: ListEventsOptions = {}): EventRow[] {
