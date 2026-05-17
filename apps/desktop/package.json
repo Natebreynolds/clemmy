@@ -1,6 +1,6 @@
 {
   "name": "@clemmy/desktop",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "private": true,
   "description": "Clementine — native desktop shell. Supervises the daemon, opens the local dashboard, surfaces approvals and check-ins, manages credentials.",
   "main": "dist/main.js",
@@ -69,6 +69,7 @@
       }
     ],
     "afterSign": "build/notarize.cjs",
+    "afterAllArtifactBuild": "build/after-all-artifact-build.cjs",
     "mac": {
       "category": "public.app-category.developer-tools",
       "icon": "build/icon.icns",
