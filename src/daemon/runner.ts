@@ -13,7 +13,7 @@ import { MODELS } from '../config.js';
 import { processExecutionController } from '../execution/controller.js';
 import { interruptStaleRunningBackgroundTasks, processBackgroundTasks } from '../execution/background-tasks.js';
 import { processWorkflowRuns, reconcilePendingWorkflowRuns } from '../execution/workflow-runner.js';
-import { sweepStaleExecutions } from '../execution/store.js';
+import { sweepStaleExecutions, sweepCrashedExecutions, sweepStaleBlockedExecutions } from '../execution/store.js';
 import { sweepStaleRuns } from '../runtime/run-events.js';
 import { sweepStaleApprovals } from '../runtime/approval-store.js';
 import { processMemoryMaintenance } from '../memory/maintenance.js';
@@ -345,8 +345,17 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
   const sweptRuns = sweepStaleRuns();
   const sweptExecutions = sweepStaleExecutions();
   const sweptApprovals = sweepStaleApprovals();
-  if (sweptRuns > 0 || sweptExecutions > 0 || sweptApprovals > 0) {
-    logger.warn({ sweptRuns, sweptExecutions, sweptApprovals }, 'Auto-closed stale runs / executions / approvals on daemon start');
+  // On boot, the heartbeat sweeper is the most important one — any
+  // execution that was mid-cycle when the previous daemon died has a
+  // stale heartbeat and the dashboard would otherwise report it as
+  // still working.
+  const sweptCrashed = sweepCrashedExecutions();
+  const sweptBlocked = sweepStaleBlockedExecutions();
+  if (sweptRuns > 0 || sweptExecutions > 0 || sweptApprovals > 0 || sweptCrashed > 0 || sweptBlocked > 0) {
+    logger.warn(
+      { sweptRuns, sweptExecutions, sweptApprovals, sweptCrashed, sweptBlocked },
+      'Auto-closed stale runs / executions / approvals on daemon start',
+    );
   }
   // First-tick init: ensure built-in proactive check-in templates
   // exist on disk (disabled). Re-runs are no-ops because the seeder
@@ -429,8 +438,19 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
       const sweptRuns = sweepStaleRuns();
       const sweptExecutions = sweepStaleExecutions();
       const sweptApprovals = sweepStaleApprovals();
-      if (sweptRuns > 0 || sweptExecutions > 0 || sweptApprovals > 0) {
-        logger.warn({ sweptRuns, sweptExecutions, sweptApprovals }, 'Periodic stale-record sweep auto-closed records');
+      const sweptBlocked = sweepStaleBlockedExecutions();
+      if (sweptRuns > 0 || sweptExecutions > 0 || sweptApprovals > 0 || sweptBlocked > 0) {
+        logger.warn({ sweptRuns, sweptExecutions, sweptApprovals, sweptBlocked }, 'Periodic stale-record sweep auto-closed records');
+      }
+    }
+    // Heartbeat sweep runs FASTER than the others (every ~5 min instead
+    // of every ~15) because its whole purpose is to catch crashed
+    // controller cycles quickly. tickCount * sleep(15s) = tickCount in
+    // 15-second units, so 20 ticks ≈ 5 min.
+    if (tickCount % 20 === 0) {
+      const sweptCrashed = sweepCrashedExecutions();
+      if (sweptCrashed > 0) {
+        logger.warn({ sweptCrashed }, 'Heartbeat sweep auto-failed crashed executions');
       }
     }
     await sleep(15_000);

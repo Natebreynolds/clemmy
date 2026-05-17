@@ -258,6 +258,22 @@ export interface ExecutionRecord {
     metadata?: Record<string, unknown>;
   }>;
   lastSynthesisAt?: string;
+  /**
+   * Wall-clock timestamp the controller wrote at the START of its most
+   * recent advance cycle. Distinct from `lastActivityAt` (which only
+   * advances on state-changing events) — heartbeat advances on EVERY
+   * cycle so the reaper can tell "controller is alive and working" from
+   * "controller crashed mid-cycle." Hermes-style.
+   */
+  lastHeartbeatAt?: string;
+  /**
+   * How many controller advance cycles in a row have errored / produced
+   * unparsable output. Resets to 0 on a successful cycle. When it hits
+   * the auto-fail threshold (5) the execution is moved to `failed`
+   * with a `controller failed N times in a row` blocker so the user
+   * gets one notification instead of N silent retries.
+   */
+  consecutiveAdvanceFailures?: number;
   confidence: number;
   reasons: string[];
 }

@@ -4,6 +4,8 @@ import path from 'node:path';
 import { BASE_DIR } from '../config.js';
 import type { ExecutionRecord, PlanRecord } from '../types.js';
 import { isUserFacingExecution } from './scope.js';
+import { actionBus } from '../runtime/action-bus.js';
+import { addNotification } from '../runtime/notifications.js';
 
 const STATE_DIR = path.join(BASE_DIR, 'state');
 const EXECUTIONS_FILE = path.join(STATE_DIR, 'executions.json');
@@ -234,4 +236,121 @@ export function renderExecutionSummary(execution: ExecutionRecord): string {
     execution.successCriteria ? `Done when: ${execution.successCriteria}` : '',
   ].filter(Boolean);
   return parts.join(' | ');
+}
+
+function transitionToFailed(
+  execution: ExecutionRecord,
+  reason: string,
+  activityKey: string,
+): ExecutionRecord {
+  const now = new Date().toISOString();
+  const previousStatus = execution.status;
+  execution.status = 'completed'; // ExecutionRecord status doesn't have 'failed' — keep 'completed' semantically + use blocker for reason
+  execution.updatedAt = now;
+  execution.lastActivityAt = now;
+  execution.blocker = reason;
+  execution.lastAssistantSummary = execution.lastAssistantSummary
+    ? `${execution.lastAssistantSummary} | ${reason}`
+    : reason;
+  execution.activity = Array.isArray(execution.activity) ? execution.activity : [];
+  execution.activity.push({
+    id: randomUUID(),
+    key: activityKey,
+    type: 'status',
+    message: reason,
+    createdAt: now,
+  });
+  execution.activity = execution.activity.slice(-60);
+
+  // Tell the live rail this transition happened so the user sees it.
+  actionBus.emit({
+    kind: 'execution.transitioned',
+    executionId: execution.id,
+    title: execution.title,
+    previousState: previousStatus,
+    nextState: 'completed',
+    summary: reason,
+  });
+
+  // Surface a notification so the user finds out without staring at
+  // the dashboard. Skip noisy notifications for non-user-facing
+  // executions (background plumbing the user never asked about).
+  if (isUserFacingExecution(execution)) {
+    addNotification({
+      id: `${Date.now()}-execution-${execution.id}-${activityKey}`,
+      kind: 'execution',
+      title: `Execution stopped: ${execution.title}`,
+      body: reason,
+      createdAt: now,
+      read: false,
+      metadata: { executionId: execution.id, sweepKey: activityKey },
+    });
+  }
+  return execution;
+}
+
+/**
+ * Reaper #1 — controller-crash detector. Active executions that haven't
+ * had a heartbeat in `staleAfterMs` (default 5 min) are presumed to have
+ * crashed mid-cycle: the controller process died, the daemon was
+ * SIGSTOP'd, or `advanceExecution` is wedged. We can't recover the run
+ * automatically (the model context is gone), but we can stop silently
+ * pretending it's still working — flip to a stopped state, fire a
+ * notification, and let the user retry if they care.
+ *
+ * Only kicks in for executions that have *ever* had a heartbeat
+ * written (`lastHeartbeatAt` set). Executions created before this
+ * field existed, or created very recently, are left alone — the
+ * activity-based sweep (`sweepStaleExecutions`, 60 min) is the
+ * fallback for those.
+ */
+export function sweepCrashedExecutions(staleAfterMs = 5 * 60 * 1000): number {
+  const cutoff = Date.now() - staleAfterMs;
+  const executions = loadExecutions();
+  let swept = 0;
+  for (const execution of executions) {
+    if (execution.status !== 'active') continue;
+    if (!execution.lastHeartbeatAt) continue;
+    const heartbeatTime = Date.parse(execution.lastHeartbeatAt);
+    if (!Number.isFinite(heartbeatTime) || heartbeatTime > cutoff) continue;
+    const ageMinutes = Math.round((Date.now() - heartbeatTime) / 60000);
+    transitionToFailed(
+      execution,
+      `Controller heartbeat stalled for ${ageMinutes}m — daemon likely crashed mid-cycle.`,
+      `sweep-crashed-${Date.now()}`,
+    );
+    swept += 1;
+  }
+  if (swept > 0) saveExecutions(executions);
+  return swept;
+}
+
+/**
+ * Reaper #2 — perpetually-blocked execution detector. An execution
+ * sits in `blocked` because the controller decided synthesis can't
+ * proceed (waiting on a user reply, an external integration, etc.).
+ * The existing `sweepStaleExecutions` runs at 60 min on `lastActivityAt`
+ * which also fires controller-tick activity — so a blocked execution
+ * that the controller checks on every 30 min indefinitely never trips
+ * that sweep. This one looks at `updatedAt` (when state last actually
+ * CHANGED) so a stuck blocker actually times out. Default 6 hours.
+ */
+export function sweepStaleBlockedExecutions(staleAfterMs = 6 * 60 * 60 * 1000): number {
+  const cutoff = Date.now() - staleAfterMs;
+  const executions = loadExecutions();
+  let swept = 0;
+  for (const execution of executions) {
+    if (execution.status !== 'blocked') continue;
+    const updated = Date.parse(execution.updatedAt || execution.createdAt);
+    if (!Number.isFinite(updated) || updated > cutoff) continue;
+    const ageHours = Math.round((Date.now() - updated) / 3600000);
+    transitionToFailed(
+      execution,
+      `Blocked for ${ageHours}h with no resolution — auto-failed; retry from the dashboard if still relevant.`,
+      `sweep-blocked-${Date.now()}`,
+    );
+    swept += 1;
+  }
+  if (swept > 0) saveExecutions(executions);
+  return swept;
 }

@@ -1,7 +1,83 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync, writeSync } from 'node:fs';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { BASE_DIR, DISCORD_BOT_TOKEN, DISCORD_DM_ALLOWED_USERS, DISCORD_ENABLED } from '../config.js';
 import { actionBus } from './action-bus.js';
+
+/**
+ * Atomic JSON write: stages bytes into a sibling .tmp file, fsync to
+ * flush to disk, then atomically rename onto the canonical path. A
+ * crash (kill -9, power loss) leaves either the previous good file
+ * OR the .tmp file but never a half-written canonical file — readers
+ * always see a consistent snapshot.
+ *
+ * Why we need this: the previous non-atomic write was the silent loss
+ * mode for the notification store. A SIGKILL during the JSON write
+ * left a truncated file; the load path caught JSON.parse and silently
+ * returned [], wiping every pending notification + delivery job.
+ */
+function atomicWriteJson(filePath: string, value: unknown): void {
+  mkdirSync(path.dirname(filePath), { recursive: true });
+  const tmp = `${filePath}.tmp.${process.pid}.${randomUUID().slice(0, 8)}`;
+  const payload = JSON.stringify(value, null, 2);
+  const fd = openSync(tmp, 'w');
+  try {
+    writeSync(fd, payload);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  renameSync(tmp, filePath);
+}
+
+/**
+ * Tolerant JSON read: if the file is missing OR unparsable, returns
+ * `fallback`. On a parse failure we ALSO rename the corrupted file to
+ * `<path>.corrupt-<timestamp>` so it survives for inspection, and emit
+ * an action-bus + notification signal so the user finds out — instead
+ * of the previous silent `return []` which made corruptions invisible.
+ *
+ * NOTE: we deliberately do NOT call addNotification() from inside here
+ * (that would recurse if the notifications file itself was corrupted).
+ * Callers responsible for surfacing the recovery — see surfaceCorruption.
+ */
+function loadJsonResilient<T>(filePath: string, fallback: T): { value: T; corrupted: boolean } {
+  if (!existsSync(filePath)) return { value: fallback, corrupted: false };
+  try {
+    const parsed = JSON.parse(readFileSync(filePath, 'utf-8'));
+    return { value: parsed as T, corrupted: false };
+  } catch {
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const quarantined = `${filePath}.corrupt-${stamp}`;
+    try {
+      renameSync(filePath, quarantined);
+    } catch {
+      // If we can't even quarantine, fall through — at least the fallback
+      // is returned. Loss of the original is unavoidable in that case.
+    }
+    return { value: fallback, corrupted: true };
+  }
+}
+
+function surfaceCorruption(filePath: string): void {
+  // Emit through actionBus directly (not addNotification) because the
+  // notifications file itself may be the one that was corrupted, and
+  // re-entering addNotification on a half-loaded queue is unsafe.
+  const id = `${Date.now()}-notif-store-corrupt-${randomUUID().slice(0, 6)}`;
+  const now = new Date().toISOString();
+  actionBus.emit({
+    kind: 'notification.created',
+    notification: {
+      id,
+      kind: 'system',
+      title: 'Notification store was corrupted and reset',
+      body: `Found unparsable JSON in ${path.basename(filePath)}. Quarantined the bad file with a .corrupt-<timestamp> suffix and started fresh. Some pending notifications or delivery state may have been lost.`,
+      createdAt: now,
+      read: false,
+      metadata: { filePath, recoveredAt: now },
+    },
+  });
+}
 
 const NOTIFICATIONS_FILE = path.join(BASE_DIR, 'state', 'notifications.json');
 const DESTINATIONS_FILE = path.join(BASE_DIR, 'state', 'notification-destinations.json');
@@ -50,55 +126,42 @@ function uniqueStrings(items: string[]): string[] {
 }
 
 function loadNotifications(): NotificationRecord[] {
-  if (!existsSync(NOTIFICATIONS_FILE)) return [];
-  try {
-    return JSON.parse(readFileSync(NOTIFICATIONS_FILE, 'utf-8')) as NotificationRecord[];
-  } catch {
-    return [];
-  }
+  const result = loadJsonResilient<NotificationRecord[]>(NOTIFICATIONS_FILE, []);
+  if (result.corrupted) surfaceCorruption(NOTIFICATIONS_FILE);
+  return result.value;
 }
 
 function saveNotifications(items: NotificationRecord[]): void {
-  mkdirSync(path.dirname(NOTIFICATIONS_FILE), { recursive: true });
   const pruned = pruneNotifications(items);
-  writeFileSync(NOTIFICATIONS_FILE, JSON.stringify(pruned, null, 2), 'utf-8');
+  atomicWriteJson(NOTIFICATIONS_FILE, pruned);
 }
 
 function loadDestinations(): NotificationDestination[] {
-  if (!existsSync(DESTINATIONS_FILE)) return [];
-  try {
-    return JSON.parse(readFileSync(DESTINATIONS_FILE, 'utf-8')) as NotificationDestination[];
-  } catch {
-    return [];
-  }
+  const result = loadJsonResilient<NotificationDestination[]>(DESTINATIONS_FILE, []);
+  if (result.corrupted) surfaceCorruption(DESTINATIONS_FILE);
+  return result.value;
 }
 
 function saveDestinations(items: NotificationDestination[]): void {
-  mkdirSync(path.dirname(DESTINATIONS_FILE), { recursive: true });
-  writeFileSync(DESTINATIONS_FILE, JSON.stringify(items, null, 2), 'utf-8');
+  atomicWriteJson(DESTINATIONS_FILE, items);
 }
 
 function loadDeliveryQueue(): NotificationDeliveryJob[] {
-  if (!existsSync(DELIVERY_QUEUE_FILE)) return [];
-  try {
-    const parsed = JSON.parse(readFileSync(DELIVERY_QUEUE_FILE, 'utf-8')) as NotificationDeliveryJob[];
-    return parsed.map((item) => ({
-      notificationId: item.notificationId,
-      queuedAt: item.queuedAt,
-      completedDestinationIds: Array.isArray(item.completedDestinationIds) ? item.completedDestinationIds : [],
-      failedDestinationIds: Array.isArray(item.failedDestinationIds) ? item.failedDestinationIds : [],
-      attemptCountByDestination: item.attemptCountByDestination ?? {},
-      nextAttemptAtByDestination: item.nextAttemptAtByDestination ?? {},
-      lastErrorByDestination: item.lastErrorByDestination ?? {},
-    }));
-  } catch {
-    return [];
-  }
+  const result = loadJsonResilient<NotificationDeliveryJob[]>(DELIVERY_QUEUE_FILE, []);
+  if (result.corrupted) surfaceCorruption(DELIVERY_QUEUE_FILE);
+  return result.value.map((item) => ({
+    notificationId: item.notificationId,
+    queuedAt: item.queuedAt,
+    completedDestinationIds: Array.isArray(item.completedDestinationIds) ? item.completedDestinationIds : [],
+    failedDestinationIds: Array.isArray(item.failedDestinationIds) ? item.failedDestinationIds : [],
+    attemptCountByDestination: item.attemptCountByDestination ?? {},
+    nextAttemptAtByDestination: item.nextAttemptAtByDestination ?? {},
+    lastErrorByDestination: item.lastErrorByDestination ?? {},
+  }));
 }
 
 function saveDeliveryQueue(items: NotificationDeliveryJob[]): void {
-  mkdirSync(path.dirname(DELIVERY_QUEUE_FILE), { recursive: true });
-  writeFileSync(DELIVERY_QUEUE_FILE, JSON.stringify(items, null, 2), 'utf-8');
+  atomicWriteJson(DELIVERY_QUEUE_FILE, items);
 }
 
 function pruneNotifications(items: NotificationRecord[]): NotificationRecord[] {

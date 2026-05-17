@@ -24,6 +24,7 @@ import {
 } from '../tools/shared.js';
 import type { ExecutionRecord, PlanRecord, PlanStep, RunRequest } from '../types.js';
 import { ExecutionStore } from './store.js';
+import { isUserFacingExecution } from './scope.js';
 
 const logger = pino({ name: 'clementine-next.execution-controller' });
 
@@ -1004,6 +1005,15 @@ async function advanceExecution(assistant: ClementineAssistant, execution: Execu
   let plan = execution.planId ? plans.get(execution.planId) : undefined;
   let synthesisReviewMinutes: number | undefined;
 
+  // Heartbeat at the TOP of every cycle so the heartbeat reaper can
+  // tell "controller is alive and working" from "controller crashed
+  // mid-cycle." We don't wait until the cycle is done — if we did,
+  // a crash during synthesis would never get a heartbeat written
+  // and the reaper would have to fall back to the 60-min activity
+  // sweep, defeating the point.
+  const heartbeatPatch = store.update(execution.id, { lastHeartbeatAt: new Date().toISOString() });
+  if (heartbeatPatch) execution = heartbeatPatch;
+
   execution = syncWorkflowBindings(store, execution);
   const syncResult = syncTaskBindings(store, plans, execution, plan);
   execution = syncResult.execution;
@@ -1146,17 +1156,73 @@ async function advanceExecution(assistant: ClementineAssistant, execution: Execu
   refreshExecutionContinuity(updated.sessionId);
 }
 
+const ADVANCE_FAILURE_AUTO_FAIL_THRESHOLD = 5;
+
 export async function processExecutionController(assistant: ClementineAssistant): Promise<void> {
-  const dueExecutions = new ExecutionStore().listDue(new Date(), 8);
+  const store = new ExecutionStore();
+  const dueExecutions = store.listDue(new Date(), 8);
   for (const execution of dueExecutions) {
     try {
       await advanceExecution(assistant, execution);
+      // Success: reset the failure counter. Reading the fresh record
+      // because advanceExecution may have written other fields we
+      // shouldn't clobber.
+      if ((execution.consecutiveAdvanceFailures ?? 0) > 0) {
+        store.update(execution.id, { consecutiveAdvanceFailures: 0 });
+      }
     } catch (error) {
-      logger.error({ err: error, executionId: execution.id }, 'Execution controller cycle failed');
-      new ExecutionStore().update(execution.id, {
+      const previousFailures = execution.consecutiveAdvanceFailures ?? 0;
+      const nextFailures = previousFailures + 1;
+      const errorMessage = error instanceof Error ? clean(error.message, 400) : String(error);
+      logger.error(
+        { err: error, executionId: execution.id, consecutiveAdvanceFailures: nextFailures },
+        'Execution controller cycle failed',
+      );
+
+      // Hard auto-fail after N consecutive cycles. Spinning forever
+      // on a malformed prompt / persistent integration error is the
+      // classic "feels like babysitting" failure mode — the user
+      // sees the same warning every nextReview tick and has to
+      // intervene manually. Bound it.
+      if (nextFailures >= ADVANCE_FAILURE_AUTO_FAIL_THRESHOLD) {
+        const fresh = store.get(execution.id);
+        if (fresh && fresh.status !== 'completed') {
+          const reason = `Controller failed ${nextFailures} cycles in a row — auto-failed. Last error: ${errorMessage}`;
+          store.update(execution.id, {
+            status: 'completed',
+            blocker: reason,
+            lastAssistantSummary: reason,
+            consecutiveAdvanceFailures: nextFailures,
+            lastControllerRunAt: new Date().toISOString(),
+          });
+          actionBus.emit({
+            kind: 'execution.transitioned',
+            executionId: execution.id,
+            title: execution.title,
+            previousState: fresh.status,
+            nextState: 'completed',
+            summary: reason,
+          });
+          if (isUserFacingExecution(execution)) {
+            addNotification({
+              id: `${Date.now()}-execution-${execution.id}-autofail`,
+              kind: 'execution',
+              title: `Execution auto-failed: ${execution.title}`,
+              body: reason,
+              createdAt: new Date().toISOString(),
+              read: false,
+              metadata: { executionId: execution.id, consecutiveAdvanceFailures: nextFailures },
+            });
+          }
+          continue;
+        }
+      }
+
+      store.update(execution.id, {
         nextReviewAt: plusMinutes(30),
         lastControllerRunAt: new Date().toISOString(),
-        lastAssistantSummary: error instanceof Error ? clean(error.message, 400) : String(error),
+        lastAssistantSummary: errorMessage,
+        consecutiveAdvanceFailures: nextFailures,
       });
     }
   }
