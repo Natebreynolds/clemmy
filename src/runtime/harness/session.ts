@@ -6,7 +6,6 @@ import {
   updateSession,
   type CreateSessionInput,
   type EventRow,
-  type EventType,
   type SessionRow,
   type SessionStatus,
 } from './eventlog.js';
@@ -191,21 +190,15 @@ export class HarnessSession {
     });
   }
 
-  /** Move the session into a terminal state and emit the matching event. */
-  markStatus(status: SessionStatus, reason?: string): void {
+  /**
+   * Update the session's status. Does NOT emit a terminal event — the
+   * caller (typically the harness loop) is responsible for emitting
+   * `run_completed` / `run_failed` with the rich payload (final
+   * output preview, tool-call counts, etc.). Splitting these
+   * concerns avoids the double-emission bug where both this method
+   * and the loop appended the terminal event.
+   */
+  markStatus(status: SessionStatus): void {
     this.row = updateSession(this.row.id, { status });
-    const type: EventType =
-      status === 'completed'
-        ? 'run_completed'
-        : status === 'failed'
-          ? 'run_failed'
-          : 'turn_ended';
-    appendEvent({
-      sessionId: this.row.id,
-      turn: 0,
-      role: 'system',
-      type,
-      data: reason ? { reason } : {},
-    });
   }
 }

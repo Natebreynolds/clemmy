@@ -133,24 +133,27 @@ test('clearInterruptState is a no-op when nothing was saved', () => {
   assert.equal(resumed.length, 0, 'no resume event when there was no pause');
 });
 
-test('markStatus emits run_completed and updates the session row', () => {
+test('markStatus updates the session row but does NOT emit a terminal event', () => {
+  // The harness loop owns the terminal event (with rich payload —
+  // toolCalls count, finalOutput preview); markStatus only flips
+  // the row status so the two callers don't double-emit.
   resetEventLog();
   const sess = HarnessSession.create({ kind: 'execution' });
-  sess.markStatus('completed', 'all steps verified');
+  sess.markStatus('completed');
   sess.refresh();
   assert.equal(sess.sessionRow.status, 'completed');
   const completions = listEvents(sess.id, { types: ['run_completed'] });
-  assert.equal(completions.length, 1);
-  assert.equal(completions[0].data.reason, 'all steps verified');
+  assert.equal(completions.length, 0, 'markStatus does not emit run_completed');
 });
 
-test('markStatus("failed") emits run_failed', () => {
+test('markStatus("failed") flips the row status without emitting', () => {
   resetEventLog();
   const sess = HarnessSession.create({ kind: 'execution' });
-  sess.markStatus('failed', 'verifier rejected step 2');
+  sess.markStatus('failed');
+  sess.refresh();
+  assert.equal(sess.sessionRow.status, 'failed');
   const failures = listEvents(sess.id, { types: ['run_failed'] });
-  assert.equal(failures.length, 1);
-  assert.equal(failures[0].data.reason, 'verifier rejected step 2');
+  assert.equal(failures.length, 0, 'markStatus does not emit run_failed');
 });
 
 test('two turns: second recordTurnResult overwrites the conversation snapshot', () => {
