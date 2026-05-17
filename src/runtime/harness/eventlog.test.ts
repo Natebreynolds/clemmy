@@ -11,7 +11,7 @@
  * Isolated via per-test CLEMENTINE_HOME so the user's real
  * ~/.clementine-next/state/harness.db is never touched.
  */
-import { mkdtempSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -21,7 +21,10 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import {
+
+// Dynamic imports: anything that reads BASE_DIR must load AFTER
+// process.env.CLEMENTINE_HOME is set, or it'll bake in the wrong path.
+const {
   closeEventLog,
   resetEventLog,
   createSession,
@@ -35,8 +38,16 @@ import {
   requestKill,
   isKillRequested,
   clearKill,
-  type EventType,
-} from './eventlog.js';
+} = await import('./eventlog.js');
+type EventType = import('./eventlog.js').EventType;
+
+test.after(() => {
+  try {
+    rmSync(TMP_HOME, { recursive: true, force: true });
+  } catch {
+    /* best effort */
+  }
+});
 
 test('creates a session and appends events with monotonic seq', () => {
   resetEventLog();

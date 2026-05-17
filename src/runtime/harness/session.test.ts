@@ -11,7 +11,7 @@
  *   - markStatus('completed' | 'failed') emits the matching terminal
  *     event so monitors don't have to guess
  */
-import { mkdtempSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -22,8 +22,19 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { AgentInputItem } from '@openai/agents';
-import { closeEventLog, resetEventLog, listEvents } from './eventlog.js';
-import { HarnessSession } from './session.js';
+
+// Dynamic imports: BASE_DIR is read at module load (see config.ts:11),
+// so anything that touches it must be imported AFTER the env is set.
+const { closeEventLog, resetEventLog, listEvents } = await import('./eventlog.js');
+const { HarnessSession } = await import('./session.js');
+
+test.after(() => {
+  try {
+    rmSync(TMP_HOME, { recursive: true, force: true });
+  } catch {
+    /* best effort */
+  }
+});
 
 test('create + load round-trips and emits session_started', () => {
   resetEventLog();

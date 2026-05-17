@@ -10,7 +10,7 @@
  *     when work completes in time
  *   - timeoutForTool picks shell/MCP/default budgets correctly
  */
-import { mkdtempSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -20,8 +20,10 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { resetEventLog, createSession, requestKill } from './eventlog.js';
-import {
+
+// Dynamic imports — see eventlog.test.ts for why.
+const { resetEventLog, createSession, requestKill } = await import('./eventlog.js');
+const {
   assertNotKilled,
   KillRequested,
   ToolCallsCounter,
@@ -34,7 +36,15 @@ import {
   DEFAULT_TIMEOUTS_MS,
   DEFAULT_MAX_TURNS,
   DEFAULT_TOOL_CALLS_PER_TURN,
-} from './brackets.js';
+} = await import('./brackets.js');
+
+test.after(() => {
+  try {
+    rmSync(TMP_HOME, { recursive: true, force: true });
+  } catch {
+    /* best effort */
+  }
+});
 
 test('assertNotKilled is a no-op without a kill row', () => {
   resetEventLog();
@@ -48,7 +58,7 @@ test('assertNotKilled throws KillRequested after requestKill', () => {
   requestKill(sess.id, 'user pressed stop');
   assert.throws(() => assertNotKilled(sess.id), (err: unknown) => {
     assert.ok(err instanceof KillRequested);
-    assert.equal((err as KillRequested).sessionId, sess.id);
+    assert.equal(err.sessionId, sess.id);
     return true;
   });
 });
@@ -141,7 +151,7 @@ test('withTimeout rejects with ToolTimeout when work exceeds the deadline', asyn
   const slow = new Promise((resolve) => setTimeout(() => resolve('slow'), 100));
   await assert.rejects(() => withTimeout(slow, 20, 'slow_tool'), (err: unknown) => {
     assert.ok(err instanceof ToolTimeout);
-    assert.equal((err as ToolTimeout).toolName, 'slow_tool');
+    assert.equal(err.toolName, 'slow_tool');
     return true;
   });
 });

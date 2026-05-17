@@ -12,7 +12,7 @@
  * exposes the same on/off/emit surface. The shape we depend on is
  * documented at node_modules/@openai/agents-core/dist/lifecycle.d.ts.
  */
-import { mkdtempSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -23,8 +23,19 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { resetEventLog, createSession, listEvents } from './eventlog.js';
-import { attachEventLogHooks, extractSessionIdFromContext, type RunHooksLike } from './hooks.js';
+
+// Dynamic imports — see eventlog.test.ts for why.
+const { resetEventLog, createSession, listEvents } = await import('./eventlog.js');
+const { attachEventLogHooks, extractSessionIdFromContext } = await import('./hooks.js');
+type RunHooksLike = import('./hooks.js').RunHooksLike;
+
+test.after(() => {
+  try {
+    rmSync(TMP_HOME, { recursive: true, force: true });
+  } catch {
+    /* best effort */
+  }
+});
 
 function makeStub(): RunHooksLike & { emit: EventEmitter['emit'] } {
   const ee = new EventEmitter();
