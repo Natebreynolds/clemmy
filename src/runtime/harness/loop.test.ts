@@ -261,6 +261,69 @@ test('interruption saves serialized RunState and returns awaiting_approval', asy
   assert.equal(paused.length, 1);
 });
 
+test('interruption emits approval_requested per interrupted tool call with parsed args', async () => {
+  // The SDK skips a tool's execute() when needsApproval=true, so the
+  // loop — not the tool body — must record approval_requested. Drive
+  // a fake interruption shaped like a real RunToolApprovalItem.
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+
+  const runRunner: RunRunnerFn = async () => ({
+    history: [],
+    lastResponseId: undefined,
+    finalOutput: undefined,
+    hasInterruptions: true,
+    serializedState: '{"$schema":1,"items":[]}',
+    interruptions: [
+      {
+        toolName: 'request_approval',
+        rawArgs: '{"subject":"deploy to prod","destructive":true}',
+        args: { subject: 'deploy to prod', destructive: true },
+      },
+    ],
+  });
+
+  await runTurn({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'ship it',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  const approvals = listEvents(sess.id, { types: ['approval_requested'] });
+  assert.equal(approvals.length, 1);
+  assert.equal(approvals[0].data.tool, 'request_approval');
+  assert.equal(approvals[0].data.subject, 'deploy to prod');
+  assert.deepEqual(approvals[0].data.args, { subject: 'deploy to prod', destructive: true });
+});
+
+test('interruption with no rich args falls back to the tool name as subject', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+
+  const runRunner: RunRunnerFn = async () => ({
+    history: [],
+    lastResponseId: undefined,
+    finalOutput: undefined,
+    hasInterruptions: true,
+    serializedState: '{}',
+    interruptions: [{ toolName: 'cx_zendesk_create_ticket', rawArgs: 'not json', args: null }],
+  });
+
+  await runTurn({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'open the ticket',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  const approvals = listEvents(sess.id, { types: ['approval_requested'] });
+  assert.equal(approvals.length, 1);
+  assert.equal(approvals[0].data.subject, 'cx_zendesk_create_ticket');
+});
+
 test('generic run error emits run_failed and marks the session failed', async () => {
   resetEventLog();
   const sess = HarnessSession.create({ kind: 'chat' });

@@ -16,7 +16,9 @@
  * Requires OPENAI_API_KEY (or codex auth) to actually invoke the
  * Runner. Without it, the SDK will fail loudly.
  */
+import { setDefaultOpenAIKey } from '@openai/agents';
 import { buildOrchestratorAgent } from '../agents/orchestrator.js';
+import { OPENAI_API_KEY } from '../config.js';
 import {
   createSession,
   listEvents,
@@ -35,6 +37,20 @@ interface HarnessRunOptions {
  * so the caller can decide what to print.
  */
 async function harnessRun(opts: HarnessRunOptions): Promise<number> {
+  // The harness Runner uses the SDK's default OpenAI client. Wire
+  // the API key explicitly so we get a clear error here instead of
+  // a confusing 401 mid-run. Codex-native auth isn't supported by
+  // the harness yet — that's a follow-up.
+  if (!OPENAI_API_KEY) {
+    process.stderr.write(
+      'harness run: OPENAI_API_KEY is not set.\n' +
+        '  Set it on env (export OPENAI_API_KEY=sk-...) or in your .env file.\n' +
+        '  Codex-native auth is not yet wired through the harness.\n',
+    );
+    return 2;
+  }
+  setDefaultOpenAIKey(OPENAI_API_KEY);
+
   const session = createSession({
     kind: 'chat',
     metadata: { source: 'cli', invokedAt: new Date().toISOString() },

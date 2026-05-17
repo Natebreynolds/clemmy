@@ -91,26 +91,14 @@ export function buildRequestApprovalTool() {
       'Pause and ask the user to approve a specific action. The harness records an approval_requested event; the next turn resumes after the user responds.',
     parameters: requestApprovalParams,
     // Force-trigger the SDK's approval interrupt. The harness catches
-    // it (loop.ts hasInterruptions path), persists RunState, and
-    // resumes after the UI resolves the request.
+    // it (loop.ts awaiting_approval branch), emits approval_requested
+    // with the tool args, persists RunState, and resumes after the UI
+    // resolves the request. execute() only runs after approval — at
+    // that point the approved action's already in motion, so the only
+    // thing left is to acknowledge it to the model.
     needsApproval: async () => true,
-    execute: async (args, runContext) => {
-      const sessionId = extractSessionId(runContext);
-      if (sessionId) {
-        appendEvent({
-          sessionId,
-          turn: extractTurn(runContext),
-          role: 'orchestrator',
-          type: 'approval_requested',
-          data: {
-            subject: args.subject,
-            reason: args.reason ?? null,
-            destructive: args.destructive ?? false,
-          },
-        });
-      }
-      return `Approval requested for: ${args.subject}. Awaiting user response.`;
-    },
+    execute: async (args) =>
+      `Approved: ${args.subject}. Proceed with the action you described.`,
   });
 }
 

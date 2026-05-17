@@ -145,7 +145,11 @@ async function invokeFunctionTool(
   return typeof result === 'string' ? result : JSON.stringify(result);
 }
 
-test('request_approval emits approval_requested to the event log', async () => {
+test('request_approval execute returns an "approved" acknowledgement after resume', async () => {
+  // execute() only runs after the user approves — at that point the
+  // SDK resumes the run and feeds the return value back to the model.
+  // The approval_requested event is emitted by the loop (loop.test.ts),
+  // not by the tool body.
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
   const t = buildRequestApprovalTool();
@@ -154,13 +158,10 @@ test('request_approval emits approval_requested to the event log', async () => {
     { subject: 'deploy to prod', reason: 'staging green', destructive: true },
     { sessionId: sess.id, turn: 3 },
   );
-  assert.match(result, /Approval requested for: deploy to prod/);
-
+  assert.match(result, /Approved: deploy to prod/);
+  // No approval_requested event from execute — the loop owns that.
   const events = listEvents(sess.id, { types: ['approval_requested'] });
-  assert.equal(events.length, 1);
-  assert.equal(events[0].data.subject, 'deploy to prod');
-  assert.equal(events[0].data.destructive, true);
-  assert.equal(events[0].turn, 3);
+  assert.equal(events.length, 0);
 });
 
 test('ask_user_question emits awaiting_user_input with options', async () => {
@@ -184,13 +185,13 @@ test('deliberation tools no-op silently when no sessionId is on the context', as
   // Tools must not throw when called outside the harness (e.g. via
   // the SDK's playground or a unit test).
   resetEventLog();
-  const t = buildRequestApprovalTool();
+  const t = buildAskUserQuestionTool();
   const result = await invokeFunctionTool(
     t,
-    { subject: 'something', reason: null, destructive: false },
+    { question: 'is anyone listening?', options: null },
     {},
   );
-  assert.match(result, /Approval requested/);
+  assert.match(result, /Question posted/);
 });
 
 test('OrchestratorDecision: nextAction enum covers the harness states the loop expects', () => {

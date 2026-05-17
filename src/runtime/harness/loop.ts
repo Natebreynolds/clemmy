@@ -37,6 +37,15 @@ import { attachEventLogHooks, extractSessionIdFromContext, type RunHooksLike } f
  * so unit tests can drive the loop without spending tokens.
  */
 
+export interface InterruptionInfo {
+  /** Tool name the model wanted to call (e.g. `request_approval`). */
+  toolName: string;
+  /** Parsed arguments the model passed to the tool, when JSON-decodable. */
+  args: Record<string, unknown> | null;
+  /** Raw argument string, untouched. */
+  rawArgs: string;
+}
+
 export interface RunOutcome {
   history: AgentInputItem[];
   lastResponseId: string | undefined;
@@ -45,6 +54,8 @@ export interface RunOutcome {
   serializedState?: string;
   /** True when the underlying RunResult had interruptions[]. */
   hasInterruptions?: boolean;
+  /** Per-interruption details, extracted from RunToolApprovalItem.rawItem. */
+  interruptions?: InterruptionInfo[];
 }
 
 export type RunRunnerFn = (
@@ -141,6 +152,24 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     const outcome = await run(runner, options.agent, items, opts);
 
     if (outcome.hasInterruptions && outcome.serializedState) {
+      // The SDK pauses BEFORE invoking the tool's execute when
+      // needsApproval=true, so we — not the tool body — must record
+      // approval_requested. Emit one event per interrupted tool call
+      // so the audit log explains the pause.
+      for (const interruption of outcome.interruptions ?? []) {
+        appendEvent({
+          sessionId: options.sessionId,
+          turn,
+          role: 'orchestrator',
+          type: 'approval_requested',
+          data: {
+            tool: interruption.toolName,
+            subject: extractApprovalSubject(interruption),
+            args: interruption.args,
+            rawArgs: interruption.rawArgs,
+          },
+        });
+      }
       session.saveInterruptState(outcome.serializedState);
       bumpTurnNumber(options.sessionId, turn);
       return { sessionId: options.sessionId, turn, status: 'awaiting_approval' };
@@ -298,6 +327,44 @@ const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
     lastResponseId: result.lastResponseId,
     finalOutput: result.finalOutput,
     hasInterruptions,
+    interruptions: hasInterruptions ? extractInterruptionInfo(result.interruptions ?? []) : undefined,
     serializedState: hasInterruptions ? result.state?.toString() : undefined,
   };
 };
+
+/**
+ * Walk RunResult.interruptions and extract each tool call's name and
+ * parsed arguments. The SDK shapes these as RunToolApprovalItem with
+ * a rawItem of FunctionCallItem ({ name, arguments: string }).
+ */
+function extractInterruptionInfo(items: unknown[]): InterruptionInfo[] {
+  const out: InterruptionInfo[] = [];
+  for (const item of items) {
+    const raw = (item as { rawItem?: { name?: string; arguments?: string } } | null)?.rawItem;
+    if (!raw) continue;
+    const toolName = typeof raw.name === 'string' ? raw.name : '';
+    const rawArgs = typeof raw.arguments === 'string' ? raw.arguments : '';
+    let args: Record<string, unknown> | null = null;
+    if (rawArgs) {
+      try {
+        const parsed = JSON.parse(rawArgs);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          args = parsed as Record<string, unknown>;
+        }
+      } catch {
+        args = null;
+      }
+    }
+    out.push({ toolName, args, rawArgs });
+  }
+  return out;
+}
+
+/** Heuristic: pull a human-readable subject out of the tool args. */
+function extractApprovalSubject(info: InterruptionInfo): string {
+  const args = info.args ?? {};
+  if (typeof args.subject === 'string') return args.subject;
+  if (typeof args.title === 'string') return args.title;
+  if (typeof args.action === 'string') return args.action;
+  return info.toolName;
+}
