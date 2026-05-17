@@ -294,6 +294,10 @@ export function renderConsoleHtml(token: string): string {
                 <div class="home-block-head">
                   <span>CHAT DOCK</span>
                   <span class="home-chat-meta" data-home-chat-meta>local session</span>
+                  <label class="home-chat-harness-toggle" title="Route this chat through the 0.3 harness (auto-continuation, sub-agents, live progress).">
+                    <input type="checkbox" data-home-chat-harness-toggle />
+                    <span>0.3 harness</span>
+                  </label>
                 </div>
                 <div class="home-chat-thread" data-home-chat-thread>
                   <div class="home-chat-hint">
@@ -2031,6 +2035,25 @@ body {
 }
 
 /* CHAT — full height of the right column, internal scroll for thread. */
+.home-chat-harness-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+  font-size: 10px;
+  color: rgba(255, 255, 255, 0.55);
+  cursor: pointer;
+  user-select: none;
+}
+.home-chat-harness-toggle input {
+  width: 11px;
+  height: 11px;
+  accent-color: #f6a623;
+  cursor: pointer;
+}
+.home-chat-harness-toggle:has(input:checked) {
+  color: #f6a623;
+}
 .home-chat-dock {
   height: 100%;
   min-height: 0;
@@ -8748,6 +8771,19 @@ const CONSOLE_JS = `
         await sendHomeChat(text);
       });
     }
+    // Wire the 0.3 harness toggle. Persisted in localStorage; flipping
+    // it clears the current harness session so the next message starts
+    // a fresh conversation rather than continuing one mid-tool.
+    const harnessToggle = document.querySelector('[data-home-chat-harness-toggle]');
+    if (harnessToggle) {
+      try { harnessToggle.checked = harnessModeOn(); } catch (_) {}
+      harnessToggle.addEventListener('change', () => {
+        try {
+          localStorage.setItem('clementine.useHarness', harnessToggle.checked ? '1' : '0');
+        } catch (_) {}
+        __harnessSessionId = null;
+      });
+    }
     // Auto-send when the user clicks a suggested prompt.
     document.querySelectorAll('[data-home-chat-suggest]').forEach((btn) => {
       btn.addEventListener('click', async () => {
@@ -8832,6 +8868,157 @@ const CONSOLE_JS = `
 
   const homeChatHistory = [];
 
+  // 0.3 harness session — kept across turns within the same chat
+  // dock so follow-up messages continue the same conversation.
+  // Reset whenever the toggle flips.
+  let __harnessSessionId = null;
+
+  function harnessModeOn() {
+    try { return localStorage.getItem('clementine.useHarness') === '1'; } catch (_) { return false; }
+  }
+
+  /**
+   * Route a chat message through the 0.3 harness:
+   * POST /api/harness/chat returns 202 + sessionId + streamUrl, then
+   * subscribe to /api/sessions/<id>/events via EventSource. Each
+   * event updates the in-flight assistant turn (status line + body).
+   * The stream closes when conversation_completed / run_failed /
+   * awaiting_user_input arrives.
+   */
+  async function sendHarnessChat(text, options) {
+    options = options || {};
+    const thread = document.querySelector('[data-home-chat-thread]');
+    const send = document.querySelector('.home-chat-send');
+    if (!thread) return { ok: false };
+    const hint = thread.querySelector('.home-chat-hint');
+    if (hint) hint.remove();
+
+    appendChatTurn('user', text);
+    homeChatHistory.push({ role: 'user', text });
+    const assistantTurn = appendChatTurn('assistant', '');
+    assistantTurn && assistantTurn.classList.add('pending');
+    setChatTurnStatus(assistantTurn, 'starting harness run');
+
+    if (send) { send.setAttribute('disabled', 'true'); send.textContent = 'THINKING …'; }
+
+    try {
+      const r = await fetch(withToken('/api/harness/chat'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ input: text, sessionId: __harnessSessionId }),
+      });
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        const msg = j.error || ('HTTP ' + r.status);
+        setChatTurnText(assistantTurn, 'Error: ' + msg);
+        setChatTurnStatus(assistantTurn, 'failed');
+        return { ok: false, text: msg };
+      }
+      const body = await r.json();
+      __harnessSessionId = body.sessionId;
+      await streamHarnessSession(body.sessionId, assistantTurn, options);
+      homeChatHistory.push({ role: 'assistant', text: assistantTurn.querySelector('[data-home-chat-text]')?.textContent || '' });
+      return { ok: true };
+    } catch (err) {
+      setChatTurnText(assistantTurn, 'Network error: ' + ((err && err.message) || err));
+      setChatTurnStatus(assistantTurn, 'failed');
+      return { ok: false };
+    } finally {
+      if (send) { send.removeAttribute('disabled'); send.textContent = 'SEND ↵'; }
+    }
+  }
+
+  // Subscribe to the per-session SSE stream and update the assistant
+  // turn as events arrive. Resolves when the stream reaches a
+  // terminal state.
+  function streamHarnessSession(sessionId, turn, options) {
+    return new Promise((resolve) => {
+      const url = withToken('/api/sessions/' + encodeURIComponent(sessionId) + '/events');
+      const es = new EventSource(url);
+      let closed = false;
+      const finish = () => {
+        if (closed) return;
+        closed = true;
+        try { es.close(); } catch (_) {}
+        resolve();
+      };
+
+      // Replay payload: { sessionId, sessionStatus, events: [...] }
+      es.addEventListener('replay', (e) => {
+        try {
+          const payload = JSON.parse(e.data);
+          for (const ev of payload.events || []) renderHarnessEvent(ev, turn, options);
+        } catch (_) {}
+      });
+      es.addEventListener('event', (e) => {
+        try {
+          const ev = JSON.parse(e.data);
+          renderHarnessEvent(ev, turn, options);
+          if (ev.type === 'conversation_completed') {
+            const summary = (ev.data && ev.data.summary) || '';
+            if (summary) setChatTurnText(turn, summary);
+            const reason = ev.data && ev.data.reason;
+            setChatTurnStatus(turn, reason === 'abandoned_by_orchestrator' ? 'abandoned' : 'complete');
+            finish();
+          } else if (ev.type === 'run_failed') {
+            const msg = (ev.data && ev.data.error) || 'failed';
+            setChatTurnText(turn, 'Error: ' + msg);
+            setChatTurnStatus(turn, 'failed');
+            finish();
+          } else if (ev.type === 'conversation_limit_exceeded') {
+            const reason = (ev.data && ev.data.reason) || 'limit';
+            setChatTurnStatus(turn, 'stopped: ' + reason);
+            finish();
+          } else if (ev.type === 'awaiting_user_input') {
+            const q = (ev.data && ev.data.question) || 'waiting on your reply';
+            setChatTurnText(turn, q);
+            setChatTurnStatus(turn, 'awaiting reply');
+            finish();
+          } else if (ev.type === 'approval_requested') {
+            const subj = (ev.data && (ev.data.subject || ev.data.tool)) || 'action';
+            setChatTurnStatus(turn, 'approval required: ' + subj);
+          }
+        } catch (_) {}
+      });
+      es.onerror = () => {
+        if (es.readyState === EventSource.CLOSED) finish();
+      };
+    });
+  }
+
+  function renderHarnessEvent(ev, turn, options) {
+    if (!ev || !ev.type) return;
+    switch (ev.type) {
+      case 'turn_started':
+        setChatTurnStatus(turn, 'thinking…');
+        return;
+      case 'tool_called': {
+        const t = (ev.data && (ev.data.tool || ev.data.name)) || 'tool';
+        setChatTurnStatus(turn, 'using ' + t);
+        if (options && options.onStatus) options.onStatus('Using: ' + t, 'tool');
+        return;
+      }
+      case 'handoff': {
+        const to = (ev.data && (ev.data.to || ev.data.target)) || 'sub-agent';
+        setChatTurnStatus(turn, '→ ' + to);
+        return;
+      }
+      case 'conversation_step': {
+        const decision = ev.data && ev.data.decision;
+        if (decision && decision.summary) {
+          setChatTurnText(turn, decision.summary);
+          setChatTurnStatus(turn, 'step ' + (ev.data.step || '?'));
+        }
+        return;
+      }
+      case 'guardrail_tripped': {
+        const name = (ev.data && ev.data.name) || 'guardrail';
+        setChatTurnStatus(turn, '⚠ ' + name);
+        return;
+      }
+    }
+  }
+
   function setChatTurnText(turn, text) {
     const body = turn?.querySelector?.('[data-home-chat-turn-text]');
     if (body) body.textContent = text || '';
@@ -8864,6 +9051,10 @@ const CONSOLE_JS = `
   }
 
   async function sendHomeChat(text, options = {}) {
+    // 0.3 harness routes when the toggle is flipped on. The legacy
+    // chat path below stays untouched as the fallback.
+    if (harnessModeOn()) return sendHarnessChat(text, options);
+
     const thread = document.querySelector('[data-home-chat-thread]');
     const send = document.querySelector('.home-chat-send');
     if (!thread) return;

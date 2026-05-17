@@ -25,8 +25,10 @@ import {
   DISCORD_DM_ALLOWED_USERS,
   DISCORD_DM_POLL_INTERVAL_MS,
   DISCORD_ENABLED,
+  DISCORD_HARNESS_ENABLED,
   DISCORD_REQUIRE_MENTION,
 } from '../config.js';
+import { handleDiscordHarnessMessage } from './discord-harness.js';
 import { ClementineAssistant } from '../assistant/core.js';
 import { ClementineGateway, type GatewayResponse } from '../gateway/router.js';
 import { getOrCreateDiscordSessionId } from './discord-store.js';
@@ -1456,6 +1458,20 @@ async function handleMessage(message: Message<boolean>, assistant: ClementineAss
   if (!prompt) return;
 
   if (await handleDiscordCommand(message, assistant, prompt)) {
+    return;
+  }
+
+  // 0.3 harness routing — when DISCORD_HARNESS_ENABLED=true, every
+  // qualifying message goes through Orchestrator + sub-agents +
+  // auto-continuation. The reply is edited in place as progress
+  // events arrive on actionBus.
+  if (DISCORD_HARNESS_ENABLED) {
+    try {
+      await handleDiscordHarnessMessage(message, prompt);
+    } catch (err) {
+      logger.error({ err, channelId: message.channelId }, 'Discord harness handler failed');
+      try { await message.reply('Harness run failed: ' + ((err as Error).message ?? 'unknown')); } catch {}
+    }
     return;
   }
 

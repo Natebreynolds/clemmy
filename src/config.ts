@@ -106,6 +106,11 @@ export const WEBHOOK_ENABLED = getEnv('WEBHOOK_ENABLED', 'false').toLowerCase() 
 export const WEBHOOK_PORT = parseInt(getEnv('WEBHOOK_PORT', '8420'), 10);
 export const WEBHOOK_SECRET = getEnv('WEBHOOK_SECRET', '');
 export const DISCORD_ENABLED = getEnv('DISCORD_ENABLED', 'false').toLowerCase() === 'true';
+// When true, Discord routes incoming messages through the 0.3 harness
+// (Orchestrator + sub-agents + auto-continuation + live progress) instead
+// of the v0.2 gateway. Off by default so the desktop release ships the
+// stable path and we can flip per-deployment.
+export const DISCORD_HARNESS_ENABLED = getEnv('DISCORD_HARNESS_ENABLED', 'false').toLowerCase() === 'true';
 export const DISCORD_BOT_TOKEN = getEnv('DISCORD_BOT_TOKEN', '');
 export const DISCORD_CLIENT_ID = getEnv('DISCORD_CLIENT_ID', '');
 export const DISCORD_REQUIRE_MENTION = getEnv('DISCORD_REQUIRE_MENTION', 'true').toLowerCase() === 'true';
