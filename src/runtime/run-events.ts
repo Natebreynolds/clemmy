@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { BASE_DIR } from '../config.js';
+import { actionBus } from './action-bus.js';
 
 export type RunStatus = 'received' | 'running' | 'queued' | 'awaiting_approval' | 'completed' | 'failed' | 'cancelled';
 
@@ -54,6 +55,19 @@ function nowIso(): string {
 
 function clean(value: string, maxChars: number): string {
   return value.replace(/\s+/g, ' ').trim().slice(0, maxChars);
+}
+
+function emitLatestEvent(run: RunRecord): void {
+  const event = run.events[run.events.length - 1];
+  if (!event) return;
+  actionBus.emit({
+    kind: 'run.event',
+    runId: run.id,
+    sessionId: run.sessionId,
+    runTitle: run.title,
+    runStatus: run.status,
+    event,
+  });
 }
 
 export function createRunId(): string {
@@ -109,6 +123,7 @@ export function startRun(input: {
     });
     existing.events = existing.events.slice(-MAX_EVENTS_PER_RUN);
     saveRuns(runs);
+    emitLatestEvent(existing);
     return existing;
   }
 
@@ -132,6 +147,7 @@ export function startRun(input: {
   };
   runs.push(run);
   saveRuns(runs);
+  emitLatestEvent(run);
   return run;
 }
 
@@ -161,6 +177,7 @@ export function addRunEvent(
   run.status = event.status ?? run.status;
   run.updatedAt = now;
   saveRuns(runs);
+  emitLatestEvent(run);
   return run;
 }
 
@@ -210,6 +227,7 @@ export function finishRun(
   });
   run.events = run.events.slice(-MAX_EVENTS_PER_RUN);
   saveRuns(runs);
+  emitLatestEvent(run);
   return run;
 }
 

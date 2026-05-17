@@ -10,6 +10,7 @@ import { SessionStore } from '../memory/session-store.js';
 import { WORKFLOWS_DIR } from '../memory/vault.js';
 import { refreshWorkingMemory } from '../memory/working-memory.js';
 import { addNotification } from '../runtime/notifications.js';
+import { actionBus } from '../runtime/action-bus.js';
 import { PlanStore } from '../planning/plan-store.js';
 import {
   DELEGATIONS_DIR,
@@ -876,6 +877,16 @@ function applySynthesisDecision(
       metadata: buildExecutionNotificationMetadata(updatedExecution),
     });
   }
+
+  actionBus.emit({
+    kind: 'execution.transitioned',
+    executionId: updatedExecution.id,
+    title: updatedExecution.title,
+    previousState: execution.status,
+    nextState: nextStatus,
+    summary: clean(decision.summary, 400),
+    nextReviewAt: updatedExecution.nextReviewAt,
+  });
 
   return updatedExecution;
 }

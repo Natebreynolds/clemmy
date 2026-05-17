@@ -83,6 +83,8 @@ import { closePlanScope, listActiveScopes, listAllScopes } from '../agents/plan-
 import type { CheckInUrgency } from '../agents/check-ins.js';
 import { createBackgroundTask, listBackgroundTasks } from '../execution/background-tasks.js';
 import { listRuns } from '../runtime/run-events.js';
+import { listNotifications } from '../runtime/notifications.js';
+import { actionBus, type ActionEvent } from '../runtime/action-bus.js';
 import { summarizeApprovalAction } from '../runtime/approval-summary.js';
 import {
   appendRecallTranscriptSegment,
@@ -2394,6 +2396,100 @@ export function registerConsoleRoutes(
    * assistant.respond with a stable session id so the conversation
    * carries across reloads.
    */
+
+  /**
+   * Server-Sent Events stream of every action the daemon takes —
+   * tool calls, run lifecycle events, approval transitions,
+   * notifications, execution state changes. The dashboard's right
+   * rail subscribes here for sub-second visibility. Persistence
+   * still lives in the underlying JSON stores (runs.json,
+   * approvals.json, notifications.json) — this is a fan-out signal
+   * layer only.
+   *
+   * On connect we emit a single `replay` event with the last 20
+   * run events + every pending approval + the most recent 10
+   * notifications so the rail isn't blank for users who arrive
+   * after the daemon was already busy. Then live events stream
+   * through the action-bus subscription.
+   */
+  app.get('/api/console/actions/stream', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+
+    res.status(200);
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders?.();
+
+    let closed = false;
+    const writeEvent = (eventName: string, payload: unknown): void => {
+      if (closed || res.destroyed) return;
+      res.write(`event: ${eventName}\n`);
+      res.write(`data: ${JSON.stringify(payload)}\n\n`);
+    };
+
+    // Replay buffer: pull the last 20 run events, currently-pending
+    // approvals, and recent notifications from disk so the client
+    // can render history immediately.
+    try {
+      const replayRunEvents: ActionEvent[] = [];
+      const recentRuns = listRuns(30);
+      for (const run of recentRuns) {
+        for (const event of run.events.slice(-3)) {
+          replayRunEvents.push({
+            kind: 'run.event',
+            runId: run.id,
+            sessionId: run.sessionId,
+            runTitle: run.title,
+            runStatus: run.status,
+            event,
+          });
+        }
+      }
+      replayRunEvents.sort((a, b) => {
+        if (a.kind !== 'run.event' || b.kind !== 'run.event') return 0;
+        return a.event.createdAt.localeCompare(b.event.createdAt);
+      });
+      const replay: ActionEvent[] = [
+        ...replayRunEvents.slice(-20),
+        ...assistant.getRuntime().listPendingApprovals().map((approval) => ({
+          kind: 'approval.created' as const,
+          approval,
+        })),
+        ...listNotifications(10).map((notification) => ({
+          kind: 'notification.created' as const,
+          notification,
+        })),
+      ];
+      writeEvent('replay', replay);
+    } catch (err) {
+      writeEvent('replay', []);
+    }
+
+    const unsubscribe = actionBus.subscribe((event) => {
+      writeEvent(event.kind, event);
+    });
+
+    // Heartbeat every 15s. Some proxies (and Electron's net stack
+    // under certain configs) drop idle keep-alive connections after
+    // ~30s — a comment ping keeps the channel warm without showing
+    // up as an event in the client.
+    const heartbeat = setInterval(() => {
+      if (closed || res.destroyed) return;
+      res.write(`: ping\n\n`);
+    }, 15_000);
+
+    const cleanup = (): void => {
+      if (closed) return;
+      closed = true;
+      clearInterval(heartbeat);
+      unsubscribe();
+    };
+    res.on('close', cleanup);
+    res.on('error', cleanup);
+  });
+
   app.post('/api/console/home/chat/stream', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const body = req.body ?? {};

@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { BASE_DIR, DISCORD_BOT_TOKEN, DISCORD_DM_ALLOWED_USERS, DISCORD_ENABLED } from '../config.js';
+import { actionBus } from './action-bus.js';
 
 const NOTIFICATIONS_FILE = path.join(BASE_DIR, 'state', 'notifications.json');
 const DESTINATIONS_FILE = path.join(BASE_DIR, 'state', 'notification-destinations.json');
@@ -163,6 +164,8 @@ export function addNotification(item: NotificationRecord): void {
     lastErrorByDestination: {},
   });
   saveDeliveryQueue(queue);
+
+  actionBus.emit({ kind: 'notification.created', notification: item });
 }
 
 export function markNotificationRead(id: string): NotificationRecord | undefined {

@@ -1057,6 +1057,35 @@ export function renderConsoleHtml(token: string): string {
 
     </main>
 
+    <!-- ── Live Actions rail ────────────────────────────────────────
+         Persistent right-side rail visible on every panel. Subscribes
+         to /api/console/actions/stream (SSE) for real-time visibility
+         into every action the daemon takes — tool calls, runs,
+         approvals, notifications, execution transitions.
+         Independent of the home/activity panels' existing polling. -->
+    <aside class="live-rail" data-live-rail aria-label="Live actions">
+      <header class="live-rail-head">
+        <div class="live-rail-title">
+          <span class="live-rail-tag">LIVE</span>
+          <span class="live-rail-status" data-live-rail-status>
+            <span class="live-rail-dot" data-live-rail-dot></span>
+            <span data-live-rail-status-label>connecting…</span>
+          </span>
+        </div>
+        <button type="button" class="live-rail-collapse" data-live-rail-collapse aria-label="Collapse rail" title="Collapse rail">
+          ›
+        </button>
+      </header>
+      <div class="live-rail-feed" data-live-rail-feed>
+        <div class="live-rail-empty" data-live-rail-empty>
+          waiting for activity…
+        </div>
+      </div>
+    </aside>
+    <button type="button" class="live-rail-expand" data-live-rail-expand aria-label="Open live actions" title="Open live actions" hidden>
+      LIVE
+    </button>
+
     <footer class="foot-bar">
       <span class="foot-cell">poll · 2s</span>
       <span class="foot-cell">last · <em data-last-sync>—</em></span>
@@ -1165,18 +1194,162 @@ body {
 /* ── Layout ─────────────────────────────────────────────────────── */
 .grid {
   display: grid;
-  grid-template-columns: 220px 1fr;
+  grid-template-columns: 220px 1fr var(--live-rail-width, 340px);
   grid-template-rows: 44px 1fr 28px;
   grid-template-areas:
-    "header header"
-    "sidebar panel"
-    "foot foot";
+    "header header header"
+    "sidebar panel rail"
+    "foot foot foot";
   height: 100vh;
+}
+.grid.live-rail-collapsed {
+  grid-template-columns: 220px 1fr 0;
+}
+.grid.live-rail-collapsed .live-rail {
+  display: none;
 }
 .status-bar { grid-area: header; }
 .sidebar     { grid-area: sidebar; }
 .panel       { grid-area: panel; overflow: hidden; }
 .foot-bar    { grid-area: foot; }
+.live-rail   { grid-area: rail; overflow: hidden; border-left: 1px solid var(--rule, #1f1f24); background: var(--surface, #0a0a0d); display: flex; flex-direction: column; }
+
+/* On narrower screens the rail moves out of the grid and becomes a
+   floating overlay drawer launched by the .live-rail-expand button. */
+@media (max-width: 1280px) {
+  .grid {
+    grid-template-columns: 220px 1fr;
+    grid-template-areas:
+      "header header"
+      "sidebar panel"
+      "foot foot";
+  }
+  .live-rail {
+    position: fixed;
+    top: 44px;
+    right: 0;
+    bottom: 28px;
+    width: 340px;
+    z-index: 30;
+    box-shadow: -8px 0 24px rgba(0,0,0,0.4);
+  }
+  .grid:not(.live-rail-open) .live-rail { display: none; }
+  .grid:not(.live-rail-open) .live-rail-expand { display: flex; }
+}
+
+.live-rail-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--rule, #1f1f24);
+  font: 11px/1 ui-monospace, "SF Mono", Menlo, monospace;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+.live-rail-title { display: flex; align-items: center; gap: 10px; }
+.live-rail-tag { color: var(--accent, #ff8f3c); font-weight: 600; }
+.live-rail-status { display: flex; align-items: center; gap: 6px; color: var(--muted, #888); font-size: 10px; }
+.live-rail-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: #6b6b70;
+  transition: background-color 200ms;
+}
+.live-rail-status[data-state="connected"] .live-rail-dot { background: #5cd66a; box-shadow: 0 0 6px rgba(92,214,106,0.6); }
+.live-rail-status[data-state="reconnecting"] .live-rail-dot { background: #f7b733; animation: live-rail-pulse 1.2s infinite; }
+.live-rail-status[data-state="offline"] .live-rail-dot { background: #e34a4a; }
+.live-rail-status[data-state="offline"] { cursor: pointer; text-decoration: underline; }
+@keyframes live-rail-pulse {
+  0%, 100% { opacity: 0.45; }
+  50%      { opacity: 1; }
+}
+.live-rail-collapse {
+  background: transparent;
+  border: 1px solid var(--rule, #1f1f24);
+  color: var(--muted, #888);
+  width: 22px; height: 22px;
+  cursor: pointer;
+  border-radius: 4px;
+  font-size: 14px;
+  line-height: 1;
+  transition: color 120ms, border-color 120ms;
+}
+.live-rail-collapse:hover { color: var(--text, #e5e5ea); border-color: var(--text, #e5e5ea); }
+
+.live-rail-feed {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 8px 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  scrollbar-width: thin;
+}
+.live-rail-empty {
+  color: var(--muted, #666);
+  font: 11px/1.4 ui-monospace, "SF Mono", Menlo, monospace;
+  padding: 24px 8px;
+  text-align: center;
+  letter-spacing: 0.06em;
+}
+
+.live-card {
+  border: 1px solid var(--rule, #1f1f24);
+  background: var(--surface-2, #101015);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font: 11.5px/1.4 ui-monospace, "SF Mono", Menlo, monospace;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  animation: live-card-in 220ms ease-out;
+}
+@keyframes live-card-in {
+  from { opacity: 0; transform: translateY(-4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.live-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--muted, #888);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.live-card-icon { font-style: normal; }
+.live-card-time { color: var(--muted, #666); font-size: 10px; flex-shrink: 0; }
+.live-card-title {
+  color: var(--text, #e5e5ea);
+  font-size: 12px;
+  word-break: break-word;
+  text-transform: none;
+  letter-spacing: 0;
+}
+.live-card-meta { color: var(--muted, #888); font-size: 10.5px; word-break: break-word; }
+.live-card[data-event-kind="approval.created"] { border-color: rgba(247,183,51,0.45); }
+.live-card[data-event-kind="approval.resolved"] { border-color: rgba(92,214,106,0.35); }
+.live-card[data-event-kind="run.event"][data-event-type="failed"] { border-color: rgba(227,74,74,0.5); }
+.live-card[data-event-kind="run.event"][data-event-type="completed"] { border-color: rgba(92,214,106,0.3); }
+
+.live-rail-expand {
+  display: none;
+  position: fixed;
+  bottom: 36px;
+  right: 12px;
+  z-index: 31;
+  background: var(--accent, #ff8f3c);
+  color: #0a0a0d;
+  border: none;
+  padding: 8px 12px;
+  border-radius: 999px;
+  font: 600 11px/1 ui-monospace, "SF Mono", Menlo, monospace;
+  letter-spacing: 0.16em;
+  cursor: pointer;
+  box-shadow: 0 4px 14px rgba(0,0,0,0.4);
+}
 
 /* ── Status bar (top) ─────────────────────────────────────────── */
 .status-bar {
@@ -11052,5 +11225,209 @@ const CONSOLE_JS = `
   }
   refreshNavDock();
   setInterval(refreshNavDock, 5000);
+
+  // ─── Live Actions rail ─────────────────────────────────────────
+  // Subscribes to /api/console/actions/stream (SSE). Renders each
+  // event as a card in reverse-chronological order. Persists
+  // collapsed/expanded state in localStorage. Independent of the
+  // home/activity panels' existing polling.
+  (function initLiveRail() {
+    const grid       = document.querySelector('.grid');
+    const rail       = document.querySelector('[data-live-rail]');
+    const feed       = document.querySelector('[data-live-rail-feed]');
+    const emptyEl    = document.querySelector('[data-live-rail-empty]');
+    const statusEl   = document.querySelector('[data-live-rail-status]');
+    const statusLbl  = document.querySelector('[data-live-rail-status-label]');
+    const collapseBtn = document.querySelector('[data-live-rail-collapse]');
+    const expandBtn   = document.querySelector('[data-live-rail-expand]');
+    if (!grid || !rail || !feed || !statusEl || !statusLbl) return;
+
+    const MAX_CARDS = 80;
+    const STORAGE_KEY_COLLAPSED = 'clemmy.liveRail.collapsed';
+
+    function setStatus(state, label) {
+      statusEl.setAttribute('data-state', state);
+      statusLbl.textContent = label;
+      // When offline, clicking the pill reloads the page (refresh
+      // path, per plan).
+      statusEl.onclick = state === 'offline' ? () => window.location.reload() : null;
+    }
+
+    function setCollapsed(collapsed) {
+      grid.classList.toggle('live-rail-collapsed', collapsed);
+      grid.classList.toggle('live-rail-open', !collapsed && window.matchMedia('(max-width: 1280px)').matches);
+      try { localStorage.setItem(STORAGE_KEY_COLLAPSED, collapsed ? '1' : '0'); } catch (_) {}
+      if (expandBtn) expandBtn.hidden = !collapsed;
+    }
+
+    try {
+      const stored = localStorage.getItem(STORAGE_KEY_COLLAPSED);
+      if (stored === '1') setCollapsed(true);
+    } catch (_) {}
+
+    if (collapseBtn) collapseBtn.addEventListener('click', () => setCollapsed(true));
+    if (expandBtn)   expandBtn.addEventListener('click',  () => setCollapsed(false));
+
+    function timeAgo(iso) {
+      const t = new Date(iso).getTime();
+      if (!Number.isFinite(t)) return '—';
+      const ms = Date.now() - t;
+      if (ms < 5000)     return 'just now';
+      if (ms < 60000)    return Math.floor(ms / 1000) + 's';
+      if (ms < 3600000)  return Math.floor(ms / 60000) + 'm';
+      return Math.floor(ms / 3600000) + 'h';
+    }
+
+    function escapeHtml(value) {
+      return String(value == null ? '' : value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+    }
+
+    function describe(event) {
+      if (event.kind === 'run.event') {
+        const e = event.event || {};
+        const iconMap = {
+          received:          '⟶',
+          model_started:     '✦',
+          tool_started:      '⚙',
+          approval_required: '◇',
+          queued_background: '◌',
+          completed:         '✓',
+          failed:            '⚠',
+          cancelled:         '✕',
+          status:            '·',
+        };
+        const icon = iconMap[e.type] || '·';
+        const toolName = e.data && (e.data.toolName || e.data.tool || '');
+        let title = event.runTitle || 'run';
+        let meta = e.message || e.type;
+        if (e.type === 'tool_started' && toolName) {
+          title = String(toolName);
+          meta = (e.data && (e.data.kind ? '[' + e.data.kind + '] ' : '')) + (event.runTitle || '');
+        }
+        return { icon, title, meta, eventType: e.type };
+      }
+      if (event.kind === 'approval.created') {
+        return {
+          icon: '◇',
+          title: 'Approve · ' + (event.approval.toolName || 'tool'),
+          meta: 'session ' + (event.approval.sessionId || '—').slice(0, 12) + ' · ' + (event.approval.agentName || ''),
+          eventType: 'pending',
+        };
+      }
+      if (event.kind === 'approval.resolved') {
+        return {
+          icon: event.resolution === 'approved' ? '✓' : '✕',
+          title: (event.resolution === 'approved' ? 'Approved' : 'Denied') + ' · ' + (event.approval.toolName || 'tool'),
+          meta: 'session ' + (event.approval.sessionId || '—').slice(0, 12),
+          eventType: event.resolution,
+        };
+      }
+      if (event.kind === 'notification.created') {
+        return {
+          icon: '✉',
+          title: event.notification.title || '(notification)',
+          meta: (event.notification.kind || '') + ' · ' + (event.notification.body || '').slice(0, 120),
+          eventType: event.notification.kind,
+        };
+      }
+      if (event.kind === 'execution.transitioned') {
+        return {
+          icon: '⇢',
+          title: event.title || 'execution',
+          meta: event.previousState + ' → ' + event.nextState + (event.summary ? ' · ' + event.summary : ''),
+          eventType: event.nextState,
+        };
+      }
+      return { icon: '·', title: 'event', meta: '', eventType: '' };
+    }
+
+    function appendCard(event) {
+      if (emptyEl) emptyEl.style.display = 'none';
+      const d = describe(event);
+      const card = document.createElement('div');
+      card.className = 'live-card';
+      card.setAttribute('data-event-kind', event.kind);
+      if (d.eventType) card.setAttribute('data-event-type', d.eventType);
+      const ts = (event.kind === 'run.event' && event.event && event.event.createdAt)
+        || (event.kind === 'notification.created' && event.notification.createdAt)
+        || (event.kind === 'approval.created' && event.approval.createdAt)
+        || new Date().toISOString();
+      card.innerHTML =
+        '<div class="live-card-head">' +
+          '<span class="live-card-icon">' + escapeHtml(d.icon) + '</span>' +
+          '<span class="live-card-time" title="' + escapeHtml(ts) + '">' + escapeHtml(timeAgo(ts)) + '</span>' +
+        '</div>' +
+        '<div class="live-card-title">' + escapeHtml(d.title) + '</div>' +
+        (d.meta ? '<div class="live-card-meta">' + escapeHtml(d.meta) + '</div>' : '');
+      feed.insertBefore(card, feed.firstChild);
+      while (feed.children.length > MAX_CARDS) {
+        feed.removeChild(feed.lastChild);
+      }
+    }
+
+    let es = null;
+    let reconnectAttempt = 0;
+    let reconnectTimer = null;
+
+    function scheduleReconnect() {
+      if (reconnectTimer) return;
+      reconnectAttempt += 1;
+      const delay = Math.min(30000, 1000 * Math.pow(2, Math.min(reconnectAttempt - 1, 4)));
+      setStatus('reconnecting', 'reconnecting in ' + Math.round(delay / 1000) + 's…');
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        connect();
+      }, delay);
+      if (reconnectAttempt > 5) {
+        setStatus('offline', 'offline — click to refresh');
+      }
+    }
+
+    function connect() {
+      if (es) { try { es.close(); } catch (_) {} es = null; }
+      setStatus('reconnecting', 'connecting…');
+      const url = '/api/console/actions/stream?token=' + encodeURIComponent(TOKEN);
+      try {
+        es = new EventSource(url);
+      } catch (err) {
+        scheduleReconnect();
+        return;
+      }
+      es.addEventListener('open', () => {
+        reconnectAttempt = 0;
+        setStatus('connected', 'live');
+      });
+      es.addEventListener('replay', (msg) => {
+        try {
+          const items = JSON.parse(msg.data);
+          if (!Array.isArray(items) || items.length === 0) return;
+          for (let i = 0; i < items.length; i++) appendCard(items[i]);
+        } catch (_) {}
+      });
+      const handleLive = (msg) => {
+        try {
+          const event = JSON.parse(msg.data);
+          appendCard(event);
+        } catch (_) {}
+      };
+      es.addEventListener('run.event', handleLive);
+      es.addEventListener('approval.created', handleLive);
+      es.addEventListener('approval.resolved', handleLive);
+      es.addEventListener('notification.created', handleLive);
+      es.addEventListener('execution.transitioned', handleLive);
+      es.addEventListener('error', () => {
+        if (!es || es.readyState !== EventSource.CONNECTING) {
+          if (es) { try { es.close(); } catch (_) {} es = null; }
+          scheduleReconnect();
+        }
+      });
+    }
+
+    connect();
+  })();
 })();
 `;

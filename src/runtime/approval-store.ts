@@ -2,6 +2,17 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { BASE_DIR } from '../config.js';
 import type { PendingApproval } from '../types.js';
+import { actionBus } from './action-bus.js';
+
+function emitIfResolved(previous: PendingApproval | undefined, next: PendingApproval): void {
+  // `pending → approved` and `pending → rejected` are the transitions
+  // the dashboard cares about; status reaffirmations (pending → pending)
+  // shouldn't generate a notification.
+  if (!previous || previous.status === next.status) return;
+  if (next.status === 'approved' || next.status === 'rejected') {
+    actionBus.emit({ kind: 'approval.resolved', approval: next, resolution: next.status });
+  }
+}
 
 const STATE_DIR = path.join(BASE_DIR, 'state');
 const APPROVAL_FILE = path.join(STATE_DIR, 'approvals.json');
@@ -40,28 +51,39 @@ export class ApprovalStore {
     const approvals = loadApprovals();
     approvals.push(item);
     saveApprovals(approvals);
+    if (item.status === 'pending') {
+      actionBus.emit({ kind: 'approval.created', approval: item });
+    }
   }
 
   replace(item: PendingApproval): void {
     const approvals = loadApprovals();
     const index = approvals.findIndex((entry) => entry.id === item.id);
+    const previous = index >= 0 ? approvals[index] : undefined;
     if (index >= 0) {
       approvals[index] = item;
     } else {
       approvals.push(item);
     }
     saveApprovals(approvals);
+    if (!previous && item.status === 'pending') {
+      actionBus.emit({ kind: 'approval.created', approval: item });
+    } else {
+      emitIfResolved(previous, item);
+    }
   }
 
   updateStatus(id: string, status: PendingApproval['status'], state?: string): PendingApproval | undefined {
     const approvals = loadApprovals();
     const approval = approvals.find((item) => item.id === id);
     if (!approval) return undefined;
+    const previous = { ...approval };
     approval.status = status;
     if (state !== undefined) {
       approval.state = state;
     }
     saveApprovals(approvals);
+    emitIfResolved(previous, approval);
     return approval;
   }
 }
