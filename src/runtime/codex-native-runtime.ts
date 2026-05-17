@@ -24,7 +24,7 @@ interface CodexSseEvent {
   data?: string;
 }
 
-interface CodexFunctionCall {
+export interface CodexFunctionCall {
   id?: string;
   call_id?: string;
   name?: string;
@@ -227,12 +227,115 @@ function functionCallOutput(callId: string, output: string): CodexInputMessage[]
   ];
 }
 
+/**
+ * The Codex API enforces tool names match `^[a-zA-Z0-9_-]+$`. Models
+ * occasionally hallucinate names with dots, colons, slashes, or
+ * spaces — and the API rejects the *next* request (status 400) that
+ * echoes the bad name back as part of conversation history. Slugify
+ * any non-allowed characters to `_` and collapse runs of `_`. This is
+ * the LAST-RESORT belt; the primary fix for the most common
+ * hallucination (`multi_tool_use.parallel`) is the expander below.
+ */
+function sanitizeToolName(rawName: string): string {
+  const safe = rawName.replace(/[^a-zA-Z0-9_-]/g, '_').replace(/_+/g, '_').replace(/^_+|_+$/g, '');
+  if (safe && safe !== rawName) {
+    logger.warn({ rawName, safe }, 'sanitized hallucinated tool name for Codex API regex');
+  }
+  return safe || 'unknown_tool';
+}
+
+/**
+ * GPT models periodically emit a SYNTHETIC tool call named
+ * `multi_tool_use.parallel` (or just `parallel`) when they want to run
+ * multiple tools in one turn. This isn't a real tool — it's the
+ * model's internal representation leaking through. The arguments
+ * object has the shape:
+ *
+ *   { "tool_uses": [
+ *       { "recipient_name": "functions.<real_tool>", "parameters": {...} },
+ *       { "recipient_name": "functions.<real_tool_2>", "parameters": {...} }
+ *     ] }
+ *
+ * The canonical fix (per the OpenAI community + the
+ * openai_multi_tool_use_parallel_patch reference impl) is to detect
+ * the synthetic call and expand it into N real tool calls before any
+ * dispatch happens. This preserves the model's *intent* (parallel
+ * execution of real tools) without losing a round trip to the
+ * "unknown tool" error path, and keeps the system prompt unchanged.
+ *
+ * Falls through to the sanitizer + normal failure path if the
+ * arguments don't decode cleanly — we never want this expander to
+ * THROW and kill the whole turn.
+ */
+export function expandParallelHallucination(toolCalls: CodexFunctionCall[]): CodexFunctionCall[] {
+  const expanded: CodexFunctionCall[] = [];
+  let synthetic = 0;
+  for (const call of toolCalls) {
+    const name = call.name;
+    const isParallel = name === 'multi_tool_use.parallel' || name === 'parallel';
+    if (!isParallel) {
+      expanded.push(call);
+      continue;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(call.arguments ?? '{}');
+    } catch {
+      // Couldn't decode — fall back to sanitizer-only behavior (push
+      // through; the next-turn 400 protection still catches it).
+      expanded.push(call);
+      continue;
+    }
+    const toolUses = (parsed as { tool_uses?: unknown }).tool_uses;
+    if (!Array.isArray(toolUses) || toolUses.length === 0) {
+      expanded.push(call);
+      continue;
+    }
+    const baseId = call.id ?? call.call_id ?? randomUUID();
+    let kept = 0;
+    for (let i = 0; i < toolUses.length; i++) {
+      const entry = toolUses[i];
+      if (!entry || typeof entry !== 'object') continue;
+      const recipient = (entry as { recipient_name?: unknown }).recipient_name;
+      const parameters = (entry as { parameters?: unknown }).parameters;
+      if (typeof recipient !== 'string' || !recipient) continue;
+      // Models prefix the real tool name with `functions.` in the
+      // synthetic envelope — strip it so the dispatcher sees the
+      // actual registered tool name.
+      const realName = recipient.replace(/^functions\./, '');
+      expanded.push({
+        id: `${baseId}_p${i}`,
+        call_id: `${baseId}_p${i}`,
+        name: realName,
+        arguments: typeof parameters === 'string'
+          ? parameters
+          : JSON.stringify(parameters ?? {}),
+      });
+      kept += 1;
+    }
+    if (kept > 0) {
+      synthetic += 1;
+    } else {
+      // Decoded but the structure didn't yield any real calls; let
+      // the next-turn path handle it.
+      expanded.push(call);
+    }
+  }
+  if (synthetic > 0) {
+    logger.info(
+      { synthetic, expandedTo: expanded.length, originalCount: toolCalls.length },
+      'expanded multi_tool_use.parallel hallucination into real tool calls',
+    );
+  }
+  return expanded;
+}
+
 function functionCallInput(toolCall: CodexFunctionCall): CodexInputMessage {
   const callId = toolCall.call_id ?? toolCall.id ?? randomUUID();
   const item: CodexInputMessage = {
     type: 'function_call',
     call_id: callId,
-    name: toolCall.name ?? 'unknown_tool',
+    name: sanitizeToolName(toolCall.name ?? 'unknown_tool'),
     arguments: toolCall.arguments ?? '{}',
     status: 'completed',
   };
@@ -420,7 +523,7 @@ async function performCodexRequest(
 
   return {
     text: finalText.trim(),
-    toolCalls,
+    toolCalls: expandParallelHallucination(toolCalls),
     responseId,
   };
 }
