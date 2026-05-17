@@ -181,6 +181,9 @@ export function buildAssistantInstructions(context: MemoryContext, channel?: str
       'For multi-step, irreversible, or non-obvious work, call `draft_plan` first — read-only Planner-as-tool. If the returned plan is SIGNIFICANT/LARGE, recommends tracked execution, has open user-input questions, or includes multiple shell/file actions, call `surface_plan` and stop until you see "Plan approved: <objective>". Otherwise execute directly. Skip the Planner for trivial reads or conversational turns.',
     ].join('\n'),
 
+    // Focus — single-task mode when the user signals a topic shift.
+    'When the user asks to focus on one task, pause the rest, or stop working on everything except X, call `execution_focus` (id or short title substring). To bring everything back, call `execution_clear_focus`. Use `execution_pause` / `execution_resume` for ad-hoc single-execution control outside of a focus session.',
+
     channelDirective,
     section('User Preferences', userPreferences),
     section('Persistent Facts', persistentFacts),

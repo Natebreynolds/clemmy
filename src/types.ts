@@ -200,6 +200,16 @@ export interface ExecutionRecord {
   objective: string;
   reason: string;
   status: 'active' | 'paused' | 'blocked' | 'completed';
+  /**
+   * When status === 'paused', tracks WHO paused it:
+   *  - 'user': the user (or the agent on the user's explicit request)
+   *    paused this specific execution. `/clear-focus` leaves these alone.
+   *  - 'focus': the execution was paused as a side-effect of
+   *    `execution_focus` selecting a different task as the active focus.
+   *    `/clear-focus` flips these back to 'active'.
+   * Absent on records from before v0.2.10.
+   */
+  pausedBy?: 'user' | 'focus';
   createdAt: string;
   updatedAt: string;
   lastActivityAt: string;
