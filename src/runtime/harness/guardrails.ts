@@ -240,4 +240,9 @@ export const harnessInputGuardrails: InputGuardrail[] = [
   missingCapabilityGuardrail,
 ];
 
-export const harnessOutputGuardrails: OutputGuardrail[] = [secretLeakGuardrail];
+// Typed as OutputGuardrail<any>[] so any agent (text-output or
+// structured-output) can attach this registry directly. The secret
+// scanner stringifies whatever it gets, so the underlying type is
+// irrelevant.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export const harnessOutputGuardrails: OutputGuardrail<any>[] = [secretLeakGuardrail];
