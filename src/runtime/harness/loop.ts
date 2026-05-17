@@ -87,6 +87,281 @@ export interface RunTurnResult {
   error?: string;
 }
 
+// ---------- runConversation ----------
+//
+// One call to runTurn() ends when the Orchestrator emits its
+// structured output. For a multi-step workflow ("find 20 accounts,
+// scrape, sheet, schedule emails") that single turn isn't enough —
+// the Orchestrator's job is to decide the NEXT step, hand off, and
+// only mark itself done when the whole user request is fulfilled.
+//
+// runConversation() wraps runTurn() in an auto-continuation loop:
+//
+//   - First call uses the user's input.
+//   - Each subsequent call uses a continuation nudge so the
+//     Orchestrator picks the next step from the persisted history.
+//   - The loop stops when:
+//       (a) OrchestratorDecision.done === true → completed
+//       (b) nextAction asks for user/approval → paused
+//       (c) maxSteps exceeded → limit_exceeded
+//       (d) wall-clock budget exceeded → limit_exceeded
+//       (e) any turn returned non-completed status (failed/killed
+//           /awaiting_approval) → propagate
+//
+// Each step boundary records a `conversation_step` event so the
+// SSE stream can show the user "step 2 of plan: scrape accounts"
+// in real time.
+
+export interface OrchestratorDecisionShape {
+  summary: string;
+  done: boolean;
+  nextAction:
+    | 'awaiting_user_input'
+    | 'awaiting_approval'
+    | 'awaiting_handoff_result'
+    | 'completed'
+    | 'abandoned';
+  reason?: string | null;
+}
+
+export type RunConversationStatus =
+  | 'completed'
+  | 'awaiting_user_input'
+  | 'awaiting_approval'
+  | 'killed'
+  | 'limit_exceeded'
+  | 'failed';
+
+export interface RunConversationOptions {
+  agent: Agent<any, any>;
+  sessionId: string;
+  input: string;
+  /** Max auto-continuation hops. Defaults to 12. */
+  maxSteps?: number;
+  /** Wall-clock budget across all hops. Defaults to 30 minutes. */
+  maxWallClockMs?: number;
+  /** Forwarded to each underlying runTurn(). */
+  maxTurns?: number;
+  /** Forwarded to each underlying runTurn(). */
+  toolCallsPerTurn?: number;
+  /** Test injection. */
+  makeRunner?: () => Runner;
+  /** Test injection. */
+  runRunner?: RunRunnerFn;
+}
+
+export interface RunConversationResult {
+  sessionId: string;
+  status: RunConversationStatus;
+  steps: number;
+  lastDecision?: OrchestratorDecisionShape;
+  lastTurn: number;
+  error?: string;
+}
+
+export const DEFAULT_MAX_CONVERSATION_STEPS = 12;
+export const DEFAULT_MAX_CONVERSATION_WALL_MS = 30 * 60 * 1000;
+
+const CONTINUATION_INPUT =
+  'Continue with the next step of your plan. If you have nothing left to do, set done=true and nextAction=completed.';
+
+export async function runConversation(
+  options: RunConversationOptions,
+): Promise<RunConversationResult> {
+  const maxSteps = options.maxSteps ?? DEFAULT_MAX_CONVERSATION_STEPS;
+  const maxWallMs = options.maxWallClockMs ?? DEFAULT_MAX_CONVERSATION_WALL_MS;
+  const startedAt = Date.now();
+
+  let stepIndex = 0;
+  let nextInput = options.input;
+  let lastDecision: OrchestratorDecisionShape | undefined;
+  let lastTurn = 0;
+
+  while (stepIndex < maxSteps) {
+    stepIndex += 1;
+
+    const turnResult = await runTurn({
+      agent: options.agent,
+      sessionId: options.sessionId,
+      input: nextInput,
+      maxTurns: options.maxTurns,
+      toolCallsPerTurn: options.toolCallsPerTurn,
+      makeRunner: options.makeRunner,
+      runRunner: options.runRunner,
+    });
+    lastTurn = turnResult.turn;
+
+    // Any non-completed status propagates immediately. The conversation
+    // can't continue if the SDK paused for approval, the kill switch
+    // tripped, the brackets blew, or an error fired.
+    if (turnResult.status !== 'completed') {
+      const status: RunConversationStatus = turnResult.status;
+      return {
+        sessionId: options.sessionId,
+        status,
+        steps: stepIndex,
+        lastDecision,
+        lastTurn,
+        error: turnResult.error,
+      };
+    }
+
+    // A completed turn MUST hand back an OrchestratorDecision-shaped
+    // finalOutput. If it doesn't, treat the conversation as complete
+    // (the Orchestrator chose to end without our structured shape).
+    const decision = toOrchestratorDecision(turnResult.finalOutput);
+    lastDecision = decision ?? lastDecision;
+
+    appendEvent({
+      sessionId: options.sessionId,
+      turn: turnResult.turn,
+      role: 'orchestrator',
+      type: 'conversation_step',
+      data: {
+        step: stepIndex,
+        decision: decision ?? null,
+      },
+    });
+
+    if (!decision) {
+      // No structured decision = nothing to recurse on. End cleanly.
+      appendEvent({
+        sessionId: options.sessionId,
+        turn: turnResult.turn,
+        role: 'system',
+        type: 'conversation_completed',
+        data: { steps: stepIndex, reason: 'no_structured_output' },
+      });
+      return {
+        sessionId: options.sessionId,
+        status: 'completed',
+        steps: stepIndex,
+        lastDecision,
+        lastTurn,
+      };
+    }
+
+    if (decision.done) {
+      appendEvent({
+        sessionId: options.sessionId,
+        turn: turnResult.turn,
+        role: 'system',
+        type: 'conversation_completed',
+        data: { steps: stepIndex, summary: decision.summary },
+      });
+      return {
+        sessionId: options.sessionId,
+        status: 'completed',
+        steps: stepIndex,
+        lastDecision: decision,
+        lastTurn,
+      };
+    }
+
+    if (decision.nextAction === 'awaiting_user_input') {
+      return {
+        sessionId: options.sessionId,
+        status: 'awaiting_user_input',
+        steps: stepIndex,
+        lastDecision: decision,
+        lastTurn,
+      };
+    }
+    if (decision.nextAction === 'awaiting_approval') {
+      // The SDK-level interrupt path normally handles this via
+      // turnResult.status. If we end up here it means the Orchestrator
+      // self-reported the state without triggering needsApproval. Honor
+      // its declaration and stop.
+      return {
+        sessionId: options.sessionId,
+        status: 'awaiting_approval',
+        steps: stepIndex,
+        lastDecision: decision,
+        lastTurn,
+      };
+    }
+    if (decision.nextAction === 'abandoned') {
+      appendEvent({
+        sessionId: options.sessionId,
+        turn: turnResult.turn,
+        role: 'system',
+        type: 'conversation_completed',
+        data: {
+          steps: stepIndex,
+          summary: decision.summary,
+          reason: 'abandoned_by_orchestrator',
+        },
+      });
+      return {
+        sessionId: options.sessionId,
+        status: 'completed',
+        steps: stepIndex,
+        lastDecision: decision,
+        lastTurn,
+      };
+    }
+
+    // Wall-clock check before we kick off another turn.
+    if (Date.now() - startedAt > maxWallMs) {
+      appendEvent({
+        sessionId: options.sessionId,
+        turn: turnResult.turn,
+        role: 'system',
+        type: 'conversation_limit_exceeded',
+        data: { steps: stepIndex, reason: 'wall_clock', maxWallClockMs: maxWallMs },
+      });
+      return {
+        sessionId: options.sessionId,
+        status: 'limit_exceeded',
+        steps: stepIndex,
+        lastDecision: decision,
+        lastTurn,
+      };
+    }
+
+    // 'awaiting_handoff_result' or any other non-terminal state → loop.
+    nextInput = CONTINUATION_INPUT;
+  }
+
+  // Max steps without resolution.
+  appendEvent({
+    sessionId: options.sessionId,
+    turn: lastTurn,
+    role: 'system',
+    type: 'conversation_limit_exceeded',
+    data: { steps: stepIndex, reason: 'max_steps', maxSteps },
+  });
+  return {
+    sessionId: options.sessionId,
+    status: 'limit_exceeded',
+    steps: stepIndex,
+    lastDecision,
+    lastTurn,
+  };
+}
+
+function toOrchestratorDecision(value: unknown): OrchestratorDecisionShape | null {
+  if (!value || typeof value !== 'object') return null;
+  const v = value as Record<string, unknown>;
+  if (typeof v.summary !== 'string') return null;
+  if (typeof v.done !== 'boolean') return null;
+  if (typeof v.nextAction !== 'string') return null;
+  const validActions: ReadonlySet<string> = new Set([
+    'awaiting_user_input',
+    'awaiting_approval',
+    'awaiting_handoff_result',
+    'completed',
+    'abandoned',
+  ]);
+  if (!validActions.has(v.nextAction)) return null;
+  return {
+    summary: v.summary,
+    done: v.done,
+    nextAction: v.nextAction as OrchestratorDecisionShape['nextAction'],
+    reason: typeof v.reason === 'string' ? v.reason : null,
+  };
+}
+
 // ---------- public API ----------
 
 export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {

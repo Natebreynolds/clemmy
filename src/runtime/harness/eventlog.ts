@@ -56,6 +56,12 @@ export const EVENT_TYPES = [
   'run_resumed',
   'run_completed',
   'run_failed',
+  // Multi-turn auto-continuation: emitted at the boundary between
+  // two runTurn() calls inside the same runConversation(). The
+  // OrchestratorDecision drives whether the loop recurses.
+  'conversation_step',
+  'conversation_completed',
+  'conversation_limit_exceeded',
 ] as const;
 export type EventType = (typeof EVENT_TYPES)[number];
 const EVENT_TYPE_SET: ReadonlySet<string> = new Set(EVENT_TYPES);

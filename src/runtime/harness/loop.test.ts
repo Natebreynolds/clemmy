@@ -33,9 +33,10 @@ import type { AgentInputItem, Runner } from '@openai/agents';
 
 const { resetEventLog, requestKill, listEvents, createSession } = await import('./eventlog.js');
 const { HarnessSession } = await import('./session.js');
-const { runTurn } = await import('./loop.js');
+const { runTurn, runConversation } = await import('./loop.js');
 type RunRunnerFn = import('./loop.js').RunRunnerFn;
 const { ToolCallsLimitExceeded } = await import('./brackets.js');
+const { listEvents: listEventsForConv } = await import('./eventlog.js');
 
 test.after(() => {
   try {
@@ -432,4 +433,263 @@ test('hooks are detached after the run (no listener leak)', async () => {
   ]) {
     assert.equal(ee.listenerCount(name), 0, `${name} listeners leaked`);
   }
+});
+
+// ---------- runConversation (auto-continuation) ----------
+//
+// runConversation wraps runTurn() in a loop that recurses when the
+// Orchestrator's structured decision sets done=false. These tests
+// drive the wrapper with scripted RunRunner outputs so each "turn"
+// returns whatever decision shape the scenario needs, without
+// touching the SDK or the model.
+
+interface ScriptedTurn {
+  finalOutput?: unknown;
+  status?: 'completed' | 'interrupt' | 'throw';
+  delayMs?: number;
+}
+
+function scriptedRunner(turns: ScriptedTurn[]): RunRunnerFn {
+  let i = 0;
+  return async () => {
+    const turn = turns[i++] ?? turns[turns.length - 1];
+    if (turn.delayMs) await new Promise((r) => setTimeout(r, turn.delayMs));
+    if (turn.status === 'throw') throw new Error('scripted_throw');
+    if (turn.status === 'interrupt') {
+      return {
+        history: [],
+        lastResponseId: undefined,
+        finalOutput: undefined,
+        hasInterruptions: true,
+        serializedState: '{}',
+      };
+    }
+    return {
+      history: [],
+      lastResponseId: undefined,
+      finalOutput: turn.finalOutput,
+    };
+  };
+}
+
+test('runConversation: stops on first completed decision', async () => {
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const runner = scriptedRunner([
+    {
+      finalOutput: {
+        summary: 'created the README in one shot',
+        done: true,
+        nextAction: 'completed',
+        reason: null,
+      },
+    },
+  ]);
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'write a README',
+    makeRunner: makeRunnerStub,
+    runRunner: runner,
+  });
+  assert.equal(result.status, 'completed');
+  assert.equal(result.steps, 1);
+  assert.equal(result.lastDecision?.done, true);
+
+  const events = listEventsForConv(sess.id, { types: ['conversation_step', 'conversation_completed'] });
+  assert.equal(events.filter((e) => e.type === 'conversation_step').length, 1);
+  assert.equal(events.filter((e) => e.type === 'conversation_completed').length, 1);
+});
+
+test('runConversation: recurses through done=false steps until done=true', async () => {
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const runner = scriptedRunner([
+    {
+      finalOutput: {
+        summary: 'handed off to Researcher for step 1',
+        done: false,
+        nextAction: 'awaiting_handoff_result',
+        reason: null,
+      },
+    },
+    {
+      finalOutput: {
+        summary: 'handed off to Executor for step 2',
+        done: false,
+        nextAction: 'awaiting_handoff_result',
+        reason: null,
+      },
+    },
+    {
+      finalOutput: {
+        summary: 'all three steps complete, sheet created',
+        done: true,
+        nextAction: 'completed',
+        reason: null,
+      },
+    },
+  ]);
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'find 20 accounts, scrape, build a sheet',
+    makeRunner: makeRunnerStub,
+    runRunner: runner,
+  });
+  assert.equal(result.status, 'completed');
+  assert.equal(result.steps, 3);
+  assert.equal(result.lastDecision?.done, true);
+
+  const stepEvents = listEventsForConv(sess.id, { types: ['conversation_step'] });
+  assert.equal(stepEvents.length, 3);
+  assert.equal(stepEvents[0].data.step, 1);
+  assert.equal(stepEvents[1].data.step, 2);
+  assert.equal(stepEvents[2].data.step, 3);
+});
+
+test('runConversation: stops with awaiting_user_input when the orchestrator asks', async () => {
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const runner = scriptedRunner([
+    {
+      finalOutput: {
+        summary: 'need clarification before I can proceed',
+        done: false,
+        nextAction: 'awaiting_user_input',
+        reason: null,
+      },
+    },
+  ]);
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'do something ambiguous',
+    makeRunner: makeRunnerStub,
+    runRunner: runner,
+  });
+  assert.equal(result.status, 'awaiting_user_input');
+  assert.equal(result.steps, 1);
+});
+
+test('runConversation: propagates SDK-level awaiting_approval status from runTurn', async () => {
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const runner = scriptedRunner([{ status: 'interrupt' }]);
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'deploy to prod',
+    makeRunner: makeRunnerStub,
+    runRunner: runner,
+  });
+  assert.equal(result.status, 'awaiting_approval');
+  assert.equal(result.steps, 1);
+});
+
+test('runConversation: bails out at maxSteps when the orchestrator keeps recursing', async () => {
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const recurseForever = scriptedRunner([
+    {
+      finalOutput: {
+        summary: 'still working',
+        done: false,
+        nextAction: 'awaiting_handoff_result',
+        reason: null,
+      },
+    },
+  ]);
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'do the thing',
+    maxSteps: 3,
+    makeRunner: makeRunnerStub,
+    runRunner: recurseForever,
+  });
+  assert.equal(result.status, 'limit_exceeded');
+  assert.equal(result.steps, 3);
+  const limitEvents = listEventsForConv(sess.id, { types: ['conversation_limit_exceeded'] });
+  assert.equal(limitEvents.length, 1);
+  assert.equal(limitEvents[0].data.reason, 'max_steps');
+});
+
+test('runConversation: bails out at maxWallClockMs', async () => {
+  const sess = HarnessSession.create({ kind: 'chat' });
+  // Each turn sleeps 20ms; with maxWallClockMs=10 the first turn
+  // already exceeds the budget, so the loop should stop after one
+  // step.
+  const slow = scriptedRunner([
+    {
+      delayMs: 20,
+      finalOutput: {
+        summary: 'still working',
+        done: false,
+        nextAction: 'awaiting_handoff_result',
+        reason: null,
+      },
+    },
+  ]);
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'do the thing',
+    maxSteps: 99,
+    maxWallClockMs: 10,
+    makeRunner: makeRunnerStub,
+    runRunner: slow,
+  });
+  assert.equal(result.status, 'limit_exceeded');
+  const limitEvents = listEventsForConv(sess.id, { types: ['conversation_limit_exceeded'] });
+  assert.equal(limitEvents[0].data.reason, 'wall_clock');
+});
+
+test('runConversation: abandoned nextAction marks the conversation completed', async () => {
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const runner = scriptedRunner([
+    {
+      finalOutput: {
+        summary: 'the request is impossible without admin access',
+        done: false,
+        nextAction: 'abandoned',
+        reason: 'no admin role',
+      },
+    },
+  ]);
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'do an impossible thing',
+    makeRunner: makeRunnerStub,
+    runRunner: runner,
+  });
+  assert.equal(result.status, 'completed');
+  const completedEvents = listEventsForConv(sess.id, { types: ['conversation_completed'] });
+  assert.equal(completedEvents[0].data.reason, 'abandoned_by_orchestrator');
+});
+
+test('runConversation: a malformed finalOutput counts as completed without recursion', async () => {
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const runner = scriptedRunner([{ finalOutput: 'a plain string, not a Decision' }]);
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'whatever',
+    makeRunner: makeRunnerStub,
+    runRunner: runner,
+  });
+  assert.equal(result.status, 'completed');
+  assert.equal(result.steps, 1);
+  const completedEvents = listEventsForConv(sess.id, { types: ['conversation_completed'] });
+  assert.equal(completedEvents[0].data.reason, 'no_structured_output');
+});
+
+test('runConversation: propagates run_failed status when a turn throws', async () => {
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const runner = scriptedRunner([{ status: 'throw' }]);
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'do the thing',
+    makeRunner: makeRunnerStub,
+    runRunner: runner,
+  });
+  assert.equal(result.status, 'failed');
+  assert.match(result.error ?? '', /scripted_throw/);
 });
