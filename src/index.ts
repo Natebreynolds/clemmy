@@ -69,6 +69,10 @@ Memory
   memory status       Show SQLite vault index and fact counts
   memory reindex      Rebuild the SQLite vault index
 
+Harness (0.3, local smoke test)
+  harness run "<prompt>"     Run one turn through the Orchestrator + loop
+  harness events <session>   Pretty-print the event log for a session
+
 Setup
   setup               Interactive setup wizard
   doctor              Run diagnostics
@@ -440,6 +444,12 @@ async function main(): Promise<void> {
     if (sub === 'reindex' || sub === 'rebuild-index') { process.exitCode = cmdMemoryReindex(); return; }
     console.log('Usage: clementine memory <status|reindex>');
     process.exitCode = 1;
+    return;
+  }
+
+  if (command === 'harness') {
+    const { runHarnessCli } = await import('./cli/harness.js');
+    process.exitCode = await runHarnessCli(process.argv.slice(3));
     return;
   }
 
