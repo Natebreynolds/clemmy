@@ -23,6 +23,7 @@ import { configureHarnessRuntime } from '../runtime/harness/codex-client.js';
 import {
   appendEvent as appendHarnessEvent,
   createSession as createHarnessSession,
+  getSession as getHarnessSession,
   type EventRow,
 } from '../runtime/harness/eventlog.js';
 import { runConversation } from '../runtime/harness/loop.js';
@@ -31,6 +32,62 @@ import { buildOrchestratorAgent } from '../agents/orchestrator.js';
 const EDIT_DEBOUNCE_MS = 2_000;
 const SAFETY_TIMEOUT_MS = 35 * 60_000;
 const MAX_DISCORD_MESSAGE = 1_900;
+
+/**
+ * Per-channel harness session continuity. Without this, every DM
+ * spawns a brand-new session and the orchestrator has zero memory
+ * of the previous turn — the agent looks broken (asks a clarifying
+ * question, the user answers, and the next "session" has no idea
+ * what file/topic was just discussed).
+ *
+ * Channel → most-recent session id + last-used timestamp. Sessions
+ * older than CONTINUITY_WINDOW_MS are treated as stale and a fresh
+ * session is created on the next DM, so a user coming back the next
+ * day doesn't end up resuming a long-cold thread.
+ */
+interface ChannelSessionEntry {
+  sessionId: string;
+  lastUsedAt: number;
+}
+const channelSessions = new Map<string, ChannelSessionEntry>();
+const CONTINUITY_WINDOW_MS = 30 * 60_000;
+
+function resolveOrCreateSession(opts: {
+  channelId: string;
+  userId: string;
+  guildId: string | null;
+  prompt: string;
+}): { id: string; isContinuation: boolean } {
+  const now = Date.now();
+  const existing = channelSessions.get(opts.channelId);
+  if (existing && now - existing.lastUsedAt < CONTINUITY_WINDOW_MS) {
+    // Verify the session still exists in the event log (could have
+    // been wiped externally between requests). If so, reuse.
+    const row = getHarnessSession(existing.sessionId);
+    if (row) {
+      existing.lastUsedAt = now;
+      return { id: existing.sessionId, isContinuation: true };
+    }
+    channelSessions.delete(opts.channelId);
+  }
+  const session = createHarnessSession({
+    kind: 'chat',
+    title: opts.prompt.length > 60 ? `${opts.prompt.slice(0, 57)}...` : opts.prompt,
+    metadata: {
+      source: 'discord',
+      channelId: opts.channelId,
+      userId: opts.userId,
+      guildId: opts.guildId,
+    },
+  });
+  channelSessions.set(opts.channelId, { sessionId: session.id, lastUsedAt: now });
+  return { id: session.id, isContinuation: false };
+}
+
+/** Exposed for tests / a future /new command — drop the channel's session. */
+export function clearDiscordHarnessSession(channelId: string): void {
+  channelSessions.delete(channelId);
+}
 
 /**
  * Abstraction over "where do we send the placeholder and where do we
@@ -91,11 +148,7 @@ export async function runDiscordHarnessConversation(opts: {
     return;
   }
 
-  const session = createHarnessSession({
-    kind: 'chat',
-    title: prompt.length > 60 ? `${prompt.slice(0, 57)}...` : prompt,
-    metadata: { source: 'discord', channelId, userId, guildId },
-  });
+  const session = resolveOrCreateSession({ channelId, userId, guildId, prompt });
 
   let handle: DiscordHarnessReplyHandle;
   try {
