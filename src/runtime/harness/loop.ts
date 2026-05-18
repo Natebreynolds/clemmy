@@ -593,15 +593,24 @@ export async function resumePendingApproval(
     return { sessionId: options.sessionId, turn, status: 'failed', error: message };
   }
 
-  // Resolve each interruption. The SDK's RunState exposes
-  // `interruptions` as an array of RunToolApprovalItem; we
-  // approve / reject every pending one with the user's decision.
-  const pending: unknown[] = (state as unknown as { interruptions: unknown[] }).interruptions ?? [];
+  // Resolve each interruption. The SDK's RunState exposes pending
+  // tool-approval items via getInterruptions() (a METHOD, not a
+  // property — the property `interruptions` only exists on
+  // RunResult/StreamedRunResult, not on RunState). My earlier code
+  // read state.interruptions, got undefined → [], approved zero
+  // items, and let the orchestrator re-emit the same approval call
+  // on the next turn. Loop. Use the method.
+  const stateApi = state as unknown as {
+    getInterruptions(): unknown[];
+    approve(i: unknown, opts?: { alwaysApprove?: boolean }): void;
+    reject(i: unknown, opts?: { alwaysReject?: boolean }): void;
+  };
+  const pending: unknown[] = stateApi.getInterruptions() ?? [];
   for (const item of pending) {
     if (options.decision === 'approve') {
-      (state as unknown as { approve: (i: unknown) => void }).approve(item);
+      stateApi.approve(item);
     } else {
-      (state as unknown as { reject: (i: unknown) => void }).reject(item);
+      stateApi.reject(item);
     }
     const raw = (item as { rawItem?: { name?: string } } | null)?.rawItem;
     safeAppend({
