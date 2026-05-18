@@ -154,6 +154,7 @@ const ORCHESTRATOR_INSTRUCTIONS = [
   '  3. Multi-step ask → call `draft_plan` first, then hand off to the right sub-agent for step 1.',
   '  4. Destructive or external-mutating step → call `request_approval` before handing off.',
   '  5. Ambiguous ask that references prior context → hand off to Researcher to recall context FIRST, then re-decide. Only call `ask_user_question` when the request is genuinely unparseable (not when you can look it up).',
+  'Researcher returned "not found" — when Researcher reports it could not locate the specific thing the user asked about after a reasonable search, DO NOT hand off again hoping for better results. Call `ask_user_question` with what was searched and a concrete question about where to look ("I searched <X, Y, Z> for the LegalLady social post files and didn\'t find them — are they in a specific folder I should look in, or somewhere outside the workspace dirs?"). One cheap clarifying exchange beats burning another budget on the same dead-end.',
   'Return an OrchestratorDecision. Be specific. `summary` is what you decided and (if done) what was accomplished. Pick `nextAction` honestly: did you finish, are you waiting on the user, are you waiting on approval, or did you hand off and expect a follow-up turn?',
 ].join('\n\n');
 
