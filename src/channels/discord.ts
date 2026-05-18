@@ -28,7 +28,11 @@ import {
   DISCORD_HARNESS_ENABLED,
   DISCORD_REQUIRE_MENTION,
 } from '../config.js';
-import { handleDiscordHarnessMessage, runDiscordHarnessConversation } from './discord-harness.js';
+import {
+  handleDiscordHarnessMessage,
+  runDiscordHarnessConversation,
+  tryHandleHarnessApprovalReply,
+} from './discord-harness.js';
 import { ClementineAssistant } from '../assistant/core.js';
 import { ClementineGateway, type GatewayResponse } from '../gateway/router.js';
 import { getOrCreateDiscordSessionId } from './discord-store.js';
@@ -286,6 +290,34 @@ async function sendDiscordRestComponentMessage(
 
 async function sendDiscordRestTyping(channelId: string): Promise<void> {
   await discordApiVoid(`/channels/${channelId}/typing`, { method: 'POST' });
+}
+
+/**
+ * Build the harness transport used for REST DM channels — POST the
+ * placeholder, PATCH for live progress edits. Shared between the
+ * fresh-message path (runDiscordHarnessConversation) and the
+ * approval-resume path (tryHandleHarnessApprovalReply).
+ */
+function buildDiscordRestTransport(channelId: string) {
+  return {
+    async sendInitial(content: string) {
+      const sent = await discordApiJson<DiscordRestSentMessage>(
+        `/channels/${channelId}/messages`,
+        { method: 'POST', body: { content } },
+      );
+      return {
+        edit: async (next: string) => {
+          await discordApiJson(`/channels/${channelId}/messages/${sent.id}`, {
+            method: 'PATCH',
+            body: { content: next.slice(0, 1900) },
+          });
+        },
+      };
+    },
+    async sendError(content: string) {
+      await sendDiscordRestChunks(channelId, content);
+    },
+  };
 }
 
 function startDiscordTypingLoop(input: {
@@ -1457,6 +1489,37 @@ async function handleMessage(message: Message<boolean>, assistant: ClementineAss
   const prompt = extractPrompt(message);
   if (!prompt) return;
 
+  // Harness-approval shortcut MUST run before handleDiscordCommand
+  // (which calls v0.2's resolveNaturalApproval). When the harness
+  // session is paused waiting on approval, "approve" / "reject"
+  // need to route into the harness resume — NOT into the v0.2
+  // approval store, which knows nothing about the pause and would
+  // reply "No pending approval".
+  if (DISCORD_HARNESS_ENABLED) {
+    const gatewayTransport = {
+      async sendInitial(content: string) {
+        const reply = (await message.reply(content)) as unknown as {
+          edit(opts: { content: string }): Promise<unknown>;
+        };
+        return {
+          edit: async (next: string) => {
+            await reply.edit({ content: next });
+          },
+        };
+      },
+      async sendError(content: string) {
+        await message.reply(content);
+      },
+    };
+    if (await tryHandleHarnessApprovalReply({
+      channelId: message.channelId,
+      prompt,
+      transport: gatewayTransport,
+    })) {
+      return;
+    }
+  }
+
   if (await handleDiscordCommand(message, assistant, prompt)) {
     return;
   }
@@ -1583,6 +1646,25 @@ async function pollDiscordDirectMessages(client: Client, assistant: ClementineAs
           continue;
         }
 
+        // Harness-approval shortcut MUST run before
+        // handleDiscordRestCommand. v0.2's resolveNaturalApproval
+        // (called from handleDiscordRestCommand) checks its own
+        // approval store; if the user types "approve" while a HARNESS
+        // session is paused, v0.2 finds no match and replies "No
+        // pending approval" — hijacking the message and preventing
+        // the harness from resuming.
+        if (DISCORD_HARNESS_ENABLED) {
+          const dmTransport = buildDiscordRestTransport(dm.id);
+          if (await tryHandleHarnessApprovalReply({
+            channelId: dm.id,
+            prompt,
+            transport: dmTransport,
+          })) {
+            markDiscordDmMessageSeen(dm.id, message.id);
+            continue;
+          }
+        }
+
         if (await handleDiscordRestCommand({
           assistant,
           prompt,
@@ -1606,25 +1688,7 @@ async function pollDiscordDirectMessages(client: Client, assistant: ClementineAs
               channelId: dm.id,
               userId: message.author.id,
               guildId: null,
-              transport: {
-                async sendInitial(content: string) {
-                  const sent = await discordApiJson<DiscordRestSentMessage>(
-                    `/channels/${dm.id}/messages`,
-                    { method: 'POST', body: { content } },
-                  );
-                  return {
-                    edit: async (next: string) => {
-                      await discordApiJson(`/channels/${dm.id}/messages/${sent.id}`, {
-                        method: 'PATCH',
-                        body: { content: next.slice(0, 1900) },
-                      });
-                    },
-                  };
-                },
-                async sendError(content: string) {
-                  await sendDiscordRestChunks(dm.id, content);
-                },
-              },
+              transport: buildDiscordRestTransport(dm.id),
             });
           } catch (err) {
             logger.error(

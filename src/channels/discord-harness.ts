@@ -28,6 +28,7 @@ import {
 } from '../runtime/harness/eventlog.js';
 import { runConversation, resumePendingApproval } from '../runtime/harness/loop.js';
 import { HarnessSession } from '../runtime/harness/session.js';
+import { openEventLog } from '../runtime/harness/eventlog.js';
 import { buildOrchestratorAgent } from '../agents/orchestrator.js';
 
 const EDIT_DEBOUNCE_MS = 2_000;
@@ -53,6 +54,66 @@ interface ChannelSessionEntry {
 const channelSessions = new Map<string, ChannelSessionEntry>();
 const CONTINUITY_WINDOW_MS = 30 * 60_000;
 
+/**
+ * Look up the most recent harness session for a Discord channel in
+ * SQLite. Used to rehydrate the in-memory channelSessions map after
+ * a daemon restart so a session that was paused-for-approval before
+ * the restart can still be resumed by typing "approve" — the
+ * approval state lives in the durable event log, but the channel-id
+ * → session-id mapping was process-local.
+ */
+function findMostRecentChannelSession(channelId: string): { sessionId: string; updatedAt: number } | null {
+  try {
+    const db = openEventLog();
+    const row = db
+      .prepare(
+        `SELECT id, updated_at FROM sessions
+           WHERE channel = 'discord'
+             AND json_extract(metadata_json, '$.channelId') = ?
+           ORDER BY updated_at DESC
+           LIMIT 1`,
+      )
+      .get(channelId) as { id?: string; updated_at?: string } | undefined;
+    // The `channel` column is filled from createSession opts.channel
+    // which we don't currently pass — fall back to a pure metadata
+    // match if the indexed lookup misses.
+    const matched = row ?? (db
+      .prepare(
+        `SELECT id, updated_at FROM sessions
+           WHERE json_extract(metadata_json, '$.source') = 'discord'
+             AND json_extract(metadata_json, '$.channelId') = ?
+           ORDER BY updated_at DESC
+           LIMIT 1`,
+      )
+      .get(channelId) as { id?: string; updated_at?: string } | undefined);
+    if (!matched?.id || !matched.updated_at) return null;
+    return { sessionId: matched.id, updatedAt: new Date(matched.updated_at).getTime() };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Look up the channel's session, hydrating from SQLite if it's not
+ * already in the in-memory map. Returns null if no recent session
+ * exists OR the most recent one is past the continuity window.
+ */
+function getOrHydrateChannelSession(channelId: string): ChannelSessionEntry | null {
+  const now = Date.now();
+  const existing = channelSessions.get(channelId);
+  if (existing && now - existing.lastUsedAt < CONTINUITY_WINDOW_MS) {
+    const row = getHarnessSession(existing.sessionId);
+    if (row) return existing;
+    channelSessions.delete(channelId);
+  }
+  const recent = findMostRecentChannelSession(channelId);
+  if (!recent) return null;
+  if (now - recent.updatedAt > CONTINUITY_WINDOW_MS) return null;
+  const entry: ChannelSessionEntry = { sessionId: recent.sessionId, lastUsedAt: recent.updatedAt };
+  channelSessions.set(channelId, entry);
+  return entry;
+}
+
 function resolveOrCreateSession(opts: {
   channelId: string;
   userId: string;
@@ -60,16 +121,10 @@ function resolveOrCreateSession(opts: {
   prompt: string;
 }): { id: string; isContinuation: boolean } {
   const now = Date.now();
-  const existing = channelSessions.get(opts.channelId);
-  if (existing && now - existing.lastUsedAt < CONTINUITY_WINDOW_MS) {
-    // Verify the session still exists in the event log (could have
-    // been wiped externally between requests). If so, reuse.
-    const row = getHarnessSession(existing.sessionId);
-    if (row) {
-      existing.lastUsedAt = now;
-      return { id: existing.sessionId, isContinuation: true };
-    }
-    channelSessions.delete(opts.channelId);
+  const existing = getOrHydrateChannelSession(opts.channelId);
+  if (existing) {
+    existing.lastUsedAt = now;
+    return { id: existing.sessionId, isContinuation: true };
   }
   const session = createHarnessSession({
     kind: 'chat',
@@ -108,12 +163,46 @@ export function parseApprovalIntent(prompt: string): 'approve' | 'reject' | null
   return null;
 }
 
-/** True if the harness session for this channel is currently paused awaiting approval. */
-function isChannelSessionAwaitingApproval(channelId: string): boolean {
-  const entry = channelSessions.get(channelId);
+/**
+ * True if the harness session for this channel is currently paused
+ * awaiting approval. Hydrates from SQLite if the in-memory map was
+ * cleared (e.g. by a daemon restart) so the durable interrupt state
+ * stays addressable through "approve" / "reject" replies.
+ */
+export function isChannelSessionAwaitingApproval(channelId: string): boolean {
+  const entry = getOrHydrateChannelSession(channelId);
   if (!entry) return false;
   const sess = HarnessSession.load(entry.sessionId);
   return !!sess && !!sess.loadInterruptState();
+}
+
+/**
+ * Discord-channel-side approval router. Called BEFORE the v0.2
+ * `handleDiscordRestCommand` / `handleDiscordCommand` paths so the
+ * v0.2 `resolveNaturalApproval` resolver doesn't intercept the
+ * user's "approve" / "reject" — the v0.2 approval store knows
+ * nothing about the harness's pending interruption and replies with
+ * "No pending approval is waiting".
+ *
+ * Returns true if the prompt was an approval intent AND a harness
+ * session was paused for this channel. In that case the resume has
+ * been kicked off and the caller should NOT continue to the v0.2
+ * gateway path.
+ */
+export async function tryHandleHarnessApprovalReply(opts: {
+  channelId: string;
+  prompt: string;
+  transport: DiscordHarnessTransport;
+}): Promise<boolean> {
+  if (!isChannelSessionAwaitingApproval(opts.channelId)) return false;
+  const intent = parseApprovalIntent(opts.prompt);
+  if (!intent) return false;
+  await runDiscordHarnessResume({
+    channelId: opts.channelId,
+    decision: intent,
+    transport: opts.transport,
+  });
+  return true;
 }
 
 /**
