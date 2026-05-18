@@ -128,11 +128,19 @@ const EXECUTOR_TOOL_NAMES = new Set<string>([
   'run_shell_command',
   'git_status',
   // External — first-class cx_* tools are added via prefix at build
-  // time. The broker `composio_execute_tool` is deliberately omitted:
-  // the executor calls the real `cx_<toolkit>_<action>` tool directly
-  // (the orchestrator already dropped the broker execute in this mode).
+  // time for CURATED toolkits (CURATED_TOOLKITS in
+  // integrations/composio/client.ts). For non-curated toolkits the
+  // user has connected (e.g. Instagram, TikTok, anything outside the
+  // curated set), the cx_*_* tools don't exist — so the executor
+  // MUST be able to fall back to discovery + dynamic execution:
+  //     composio_search_tools(query) → matching slugs
+  //     composio_execute_tool(slug, args) → runs it
+  // Per the no-hardcoded-tool-lists architectural principle, we keep
+  // BOTH paths in the surface so the executor can handle any toolkit
+  // the user has connected, not just the ~24 in CURATED_TOOLKITS.
   'composio_list_tools',
   'composio_search_tools',
+  'composio_execute_tool',
 ]);
 
 const WRITER_TOOL_NAMES = new Set<string>([
@@ -275,6 +283,11 @@ export async function buildExecutorAgent(): Promise<SubAgent> {
       'You are the Executor sub-agent inside Clementine.',
       'Your single job is to take the work that has been decided and DO it. No deliberation, no re-planning.',
       'Available tools: tasks (task_add, task_update), executions (execution_update_step, execution_complete, execution_mark_blocked), files (write_file, read_file), commands (run_shell_command — approval may be required), goals (goal_update), notifications (notify_user), check-ins (ask_user_question when truly blocked on user info).',
+      'External integrations — you have TWO paths to call a connected Composio toolkit:',
+      '  Path 1 (curated, fast): if you see a `cx_<toolkit>_<action>` tool directly in your tool list, call it. These are the curated toolkits (gmail, googlesheets, slack, github, etc.) loaded at build time.',
+      '  Path 2 (discovery, universal): for any other connected toolkit the user has set up — Instagram, TikTok, X, anything outside the curated set — use the discovery → execute pattern: call `composio_search_tools` with a focused query (e.g. "instagram create post", "tiktok upload video"), pick the best match from the returned slugs, then call `composio_execute_tool(tool_slug, arguments_json_string)` to run it. Use `composio_list_tools` to enumerate everything available for a specific toolkit when you need to see options.',
+      'NEVER conclude "the runtime doesn\'t expose that action" before trying the discovery path. The user has connected toolkits we can\'t enumerate at build time; the search→execute path is how you reach them.',
+      'Use `composio_status` early in a run to confirm a toolkit is actually connected before you assume it exists. If a needed toolkit is missing or disconnected, surface that with notify_user (or ask_user_question if you need them to connect it) — don\'t silently fail.',
       'Make small reversible changes, verify after each one when possible, and surface real errors via notify_user.',
       'When a tracked execution is involved, call execution_update_step every cycle you make progress, and execution_complete only when success criteria are met.',
       'Return a concise summary of what was done so the orchestrator knows the state.',
