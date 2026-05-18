@@ -210,33 +210,61 @@ function markDiscordDmMessageSeen(channelId: string, messageId: string): void {
   }
 }
 
-async function discordApiJson<T>(path: string, init?: { method?: string; body?: unknown }): Promise<T> {
-  const response = await fetch(`https://discord.com/api/v10${path}`, {
-    method: init?.method ?? 'GET',
-    headers: {
-      Authorization: `Bot ${DISCORD_BOT_TOKEN}`,
-      'Content-Type': 'application/json',
-    },
-    body: init?.body === undefined ? undefined : JSON.stringify(init.body),
-  });
+// Discord returns 429 with a JSON body { retry_after: <seconds>, ... }.
+// Previously we surfaced it as a plain Error and the caller logged a
+// warning — the user saw a truncated stream-edit and no recovery.
+// We now honor retry_after (capped) and re-issue the request up to N
+// times before giving up. Cap on the wait + attempt count protects
+// against pathological "retry_after: 60" loops eating the daemon tick.
+const DISCORD_RATE_LIMIT_MAX_RETRIES = 3;
+const DISCORD_RATE_LIMIT_MAX_WAIT_MS = 5_000;
 
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function executeDiscordRequest(path: string, init?: { method?: string; body?: unknown }): Promise<Response> {
+  const method = init?.method ?? 'GET';
+  let attempt = 0;
+  while (true) {
+    const response = await fetch(`https://discord.com/api/v10${path}`, {
+      method,
+      headers: {
+        Authorization: `Bot ${DISCORD_BOT_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: init?.body === undefined ? undefined : JSON.stringify(init.body),
+    });
+    if (response.status !== 429 || attempt >= DISCORD_RATE_LIMIT_MAX_RETRIES) {
+      return response;
+    }
+    // Parse the retry_after hint without consuming the body destructively.
+    const cloned = response.clone();
+    let retryAfterMs = 1000;
+    try {
+      const payload = await cloned.json() as { retry_after?: number };
+      if (typeof payload.retry_after === 'number' && payload.retry_after > 0) {
+        retryAfterMs = Math.min(DISCORD_RATE_LIMIT_MAX_WAIT_MS, Math.ceil(payload.retry_after * 1000));
+      }
+    } catch { /* fall back to 1s */ }
+    // Drain the original body so the connection can be reused.
+    try { await response.text(); } catch { /* ignore */ }
+    attempt += 1;
+    logger.warn({ path, method, attempt, retryAfterMs }, 'Discord 429 — retrying after backoff');
+    await sleepMs(retryAfterMs);
+  }
+}
+
+async function discordApiJson<T>(path: string, init?: { method?: string; body?: unknown }): Promise<T> {
+  const response = await executeDiscordRequest(path, init);
   if (!response.ok) {
     throw new Error(`Discord API ${init?.method ?? 'GET'} ${path} failed with ${response.status}: ${await response.text()}`);
   }
-
   return response.json() as Promise<T>;
 }
 
 async function discordApiVoid(path: string, init?: { method?: string; body?: unknown }): Promise<void> {
-  const response = await fetch(`https://discord.com/api/v10${path}`, {
-    method: init?.method ?? 'GET',
-    headers: {
-      Authorization: `Bot ${DISCORD_BOT_TOKEN}`,
-      'Content-Type': 'application/json',
-    },
-    body: init?.body === undefined ? undefined : JSON.stringify(init.body),
-  });
-
+  const response = await executeDiscordRequest(path, init);
   if (!response.ok) {
     throw new Error(`Discord API ${init?.method ?? 'GET'} ${path} failed with ${response.status}: ${await response.text()}`);
   }
@@ -1655,11 +1683,26 @@ async function pollDiscordDirectMessages(client: Client, assistant: ClementineAs
         // the harness from resuming.
         if (DISCORD_HARNESS_ENABLED) {
           const dmTransport = buildDiscordRestTransport(dm.id);
-          if (await tryHandleHarnessApprovalReply({
-            channelId: dm.id,
-            prompt,
-            transport: dmTransport,
-          })) {
+          // Wrap the approval-resume path in try/finally so an exception
+          // can't leave the DM unmarked-seen — that would loop the
+          // poller on the same message forever, retrying a broken
+          // resume on every 5s tick.
+          let handled = false;
+          try {
+            handled = await tryHandleHarnessApprovalReply({
+              channelId: dm.id,
+              prompt,
+              transport: dmTransport,
+            });
+          } catch (err) {
+            // Mark seen so we don't re-poll a permanently-broken
+            // message. The error surfaces in logs; the user can resend
+            // if they meant to approve something.
+            console.error('[discord-dm] tryHandleHarnessApprovalReply threw — marking message seen to prevent re-poll loop:', err);
+            markDiscordDmMessageSeen(dm.id, message.id);
+            continue;
+          }
+          if (handled) {
             markDiscordDmMessageSeen(dm.id, message.id);
             continue;
           }

@@ -6,7 +6,7 @@ import { spawn } from 'node:child_process';
 import pino from 'pino';
 import { CODEX_EXECUTABLE, CODEX_SANDBOX_MODE, CODEX_USE_FULL_AUTO } from '../config.js';
 import type { ApprovalResolutionResult, PendingApproval, RunRequest, RunResult } from '../types.js';
-import { AgentRuntimeCancelledError, type AgentRuntime, type AgentRuntimeCallbacks } from './provider.js';
+import { AgentRuntimeCancelledError, ASSISTANT_PAUSED_PLACEHOLDER, type AgentRuntime, type AgentRuntimeCallbacks } from './provider.js';
 
 const logger = pino({ name: 'clementine-next.codex-cli' });
 
@@ -85,7 +85,7 @@ export class CodexCliRuntime implements AgentRuntime {
 	      const text = existsSync(outputPath)
         ? readFileSync(outputPath, 'utf-8').trim()
         : '';
-      const finalText = text || 'Clementine paused without a final reply — ask again to pick up where she left off.';
+      const finalText = text || ASSISTANT_PAUSED_PLACEHOLDER;
       if (callbacks?.onText) {
         await callbacks.onText(finalText);
       }

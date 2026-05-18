@@ -1,9 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import pino from 'pino';
 import type { ApprovalResolutionResult, PendingApproval, RunRequest, RunResult } from '../types.js';
-import { AgentRuntimeCancelledError, type AgentRuntime, type AgentRuntimeCallbacks } from './provider.js';
+import { AgentRuntimeCancelledError, ASSISTANT_PAUSED_PLACEHOLDER, type AgentRuntime, type AgentRuntimeCallbacks } from './provider.js';
 import { ApprovalStore } from './approval-store.js';
-import { addNotification } from './notifications.js';
+import { addNotification, getNotification } from './notifications.js';
 import { ASSISTANT_NAME } from '../config.js';
 import { getStoredCodexOAuthTokens, refreshStoredNativeOAuth } from './auth-store.js';
 import { getCoreToolsAsync } from '../tools/registry.js';
@@ -52,6 +52,27 @@ class CodexRuntimeError extends Error {
     super(message);
     this.name = 'CodexRuntimeError';
   }
+}
+
+// One actionable user-facing notification per calendar day when the
+// Codex OAuth token has expired AND the auto-refresh attempt failed.
+// Without this, the 401 throws unwind to a logger.error stack trace
+// in the caller (cron, autonomy, controller) and the user never sees
+// the "re-authenticate" prompt — observed 35 silent 401s in a row in
+// production logs. Bucket id by date so we never spam.
+function notifyCodexAuthExpired(refreshError?: string): void {
+  const id = `system-codex-auth-expired-${new Date().toISOString().slice(0, 10)}`;
+  if (getNotification(id)) return;
+  const detail = refreshError ? `Refresh attempt failed: ${refreshError}\n\n` : '';
+  addNotification({
+    id,
+    kind: 'system',
+    title: 'Codex authentication expired — re-authenticate to resume agent work',
+    body: `${detail}Clementine's model backend rejected the stored OAuth token and the auto-refresh attempt failed. Open the Clementine desktop app and click "Re-authenticate Codex" in Settings, or run \`clementine auth login\` in a terminal. Background jobs, cron triggers, and chat will keep failing until this is resolved.`,
+    createdAt: new Date().toISOString(),
+    read: false,
+    metadata: { errorCategory: 'auth_expired', provider: 'codex' },
+  });
 }
 
 async function throwIfCancelled(callbacks?: AgentRuntimeCallbacks): Promise<void> {
@@ -400,8 +421,17 @@ async function performCodexRequest(
     body.prompt_cache_key = request.sessionId;
   }
 
-  const abortController = callbacks?.shouldCancel ? new AbortController() : undefined;
+  // Two reasons to want an abort handle:
+  //   1) caller-driven cancellation via shouldCancel polling
+  //   2) wall-clock budget exceeded
+  // If either applies we wire the AbortController. wallClockTimer is
+  // separate from cancelPoll so each cleans up independently in the
+  // finally block.
+  const wantsAbort = Boolean(callbacks?.shouldCancel) || typeof request.maxWallClockMs === 'number';
+  const abortController = wantsAbort ? new AbortController() : undefined;
   let cancelPoll: ReturnType<typeof setInterval> | undefined;
+  let wallClockTimer: ReturnType<typeof setTimeout> | undefined;
+  let wallClockTimedOut = false;
 	  if (abortController && callbacks?.shouldCancel) {
 	    cancelPoll = setInterval(() => {
 	      void Promise.resolve(callbacks.shouldCancel?.())
@@ -410,6 +440,14 @@ async function performCodexRequest(
 	        })
         .catch(() => undefined);
     }, 2000);
+  }
+  if (abortController && typeof request.maxWallClockMs === 'number' && request.maxWallClockMs > 0) {
+    wallClockTimer = setTimeout(() => {
+      wallClockTimedOut = true;
+      abortController.abort();
+    }, request.maxWallClockMs);
+    // unref so a stray timer doesn't keep Node alive past shutdown.
+    wallClockTimer.unref?.();
   }
 
   let response: Response;
@@ -432,6 +470,11 @@ async function performCodexRequest(
     });
 	  } catch (error) {
 	    if (abortController?.signal.aborted) {
+	      if (wallClockTimedOut) {
+	        throw new CodexRuntimeError(
+	          `Clementine's model backend exceeded the wall-clock budget of ${request.maxWallClockMs}ms and was aborted.`,
+	        );
+	      }
 	      throw new AgentRuntimeCancelledError();
 	    }
 	    throw error;
@@ -464,6 +507,11 @@ async function performCodexRequest(
 	        value = read.value;
 	      } catch (error) {
 	        if (abortController?.signal.aborted) {
+	          if (wallClockTimedOut) {
+	            throw new CodexRuntimeError(
+	              `Clementine's model backend exceeded the wall-clock budget of ${request.maxWallClockMs}ms and was aborted mid-stream.`,
+	            );
+	          }
 	          throw new AgentRuntimeCancelledError();
 	        }
 	        throw error;
@@ -519,6 +567,7 @@ async function performCodexRequest(
 	    }
 	  } finally {
 	    if (cancelPoll) clearInterval(cancelPoll);
+	    if (wallClockTimer) clearTimeout(wallClockTimer);
 	  }
 
   return {
@@ -628,6 +677,13 @@ export class CodexNativeRuntime implements AgentRuntime {
             refreshed = true;
             continue;
           }
+          // Refresh failed. The previous behavior was to throw and let
+          // the caller swallow the stack trace into a log line —
+          // 35-in-a-row 401s went by without a user-visible signal.
+          // Emit one daily-bucketed notification so the user has a
+          // clear "re-authenticate" pointer the first time they
+          // open the dashboard / check Discord.
+          notifyCodexAuthExpired(refreshResult.message);
         }
         if (
           error instanceof CodexRuntimeError &&
@@ -927,8 +983,7 @@ export class CodexNativeRuntime implements AgentRuntime {
       );
 
       if (latestResult.toolCalls.length === 0) {
-        const finalText = latestResult.text
-          || 'Clementine paused without a final reply — ask again to pick up where she left off.';
+        const finalText = latestResult.text || ASSISTANT_PAUSED_PLACEHOLDER;
         if (callbacks?.onText) {
           await callbacks.onText(finalText);
         }

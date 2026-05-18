@@ -267,22 +267,30 @@ export function renderConsoleHtml(token: string): string {
                 </div>
                 <div class="home-live-stage" data-home-voice-panel>
                   <button type="button" class="home-voice-orb-button" data-home-voice-toggle aria-label="Start live voice">
-                    <span class="home-voice-ring ring-a" aria-hidden="true"></span>
-                    <span class="home-voice-ring ring-b" aria-hidden="true"></span>
-                    <span class="home-voice-core">
+                    <span class="home-voice-halo" aria-hidden="true"></span>
+                    <span class="home-voice-portrait">
                       <img src="/console/icon.png" alt="" class="home-voice-avatar" />
-                      <span class="home-voice-face mouth" aria-hidden="true"></span>
-                      <span class="home-voice-face cheek cheek-left" aria-hidden="true"></span>
-                      <span class="home-voice-face cheek cheek-right" aria-hidden="true"></span>
-                      <span class="home-voice-scan" aria-hidden="true"></span>
-                    </span>
-                    <span class="home-voice-wave" aria-hidden="true">
-                      <i></i><i></i><i></i><i></i>
+                      <!--
+                        Pixel-art mouth overlay positioned over the dog's
+                        real mouth coordinates. .open animates the cavity
+                        height + tongue visibility; the inline style on
+                        --mouth-open is updated in JS from the AnalyserNode
+                        amplitude so the mouth tracks the actual TTS output.
+                      -->
+                      <span class="home-voice-mouth" data-home-voice-mouth aria-hidden="true">
+                        <span class="home-voice-mouth-cavity"></span>
+                        <span class="home-voice-mouth-tongue"></span>
+                      </span>
                     </span>
                   </button>
                   <div class="home-live-copy">
                     <div class="home-live-cta">Tap to talk</div>
-                    <div class="home-live-sub" data-home-voice-status>or say "hey Clementine" (coming soon)</div>
+                    <div class="home-live-sub" data-home-voice-status>or say <em>"hey Clementine"</em> from anywhere</div>
+                    <label class="home-live-wake-toggle" title="Listen for &quot;hey Clementine&quot; in the background.">
+                      <input type="checkbox" data-home-voice-wake-toggle />
+                      <span>Wake-word</span>
+                      <span class="home-live-wake-dot" data-home-voice-wake-dot aria-hidden="true"></span>
+                    </label>
                   </div>
                   <audio data-home-voice-audio autoplay></audio>
                 </div>
@@ -294,10 +302,6 @@ export function renderConsoleHtml(token: string): string {
                 <div class="home-block-head">
                   <span>CHAT DOCK</span>
                   <span class="home-chat-meta" data-home-chat-meta>local session</span>
-                  <label class="home-chat-harness-toggle" title="Route this chat through the 0.3 harness (auto-continuation, sub-agents, live progress).">
-                    <input type="checkbox" data-home-chat-harness-toggle />
-                    <span>0.3 harness</span>
-                  </label>
                 </div>
                 <div class="home-chat-thread" data-home-chat-thread>
                   <div class="home-chat-hint">
@@ -422,6 +426,7 @@ export function renderConsoleHtml(token: string): string {
               <div class="mem-view-toggle">
                 <button class="mem-view-btn" data-mem-view="viewer" onclick="window.__clementineMemoryView && window.__clementineMemoryView('viewer'); return false;">VIEWER</button>
                 <button class="mem-view-btn active" data-mem-view="graph" onclick="window.__clementineMemoryView && window.__clementineMemoryView('graph'); return false;">GRAPH</button>
+                <button class="mem-view-btn" data-mem-view="meetings" onclick="window.__clementineMemoryView && window.__clementineMemoryView('meetings'); return false;">MEETINGS</button>
               </div>
               <div class="mem-search">
                 <input type="search" class="mem-search-input" data-mem-search
@@ -456,14 +461,38 @@ export function renderConsoleHtml(token: string): string {
                 </div>
                 <span class="mem-graph-meta" data-mem-graph-meta>—</span>
               </div>
-              <div class="mem-graph-canvas" data-mem-graph-canvas></div>
+              <div class="mem-graph-canvas" data-mem-graph-canvas>
+                <div class="mem-graph-sparse-hint" data-mem-graph-sparse-hint hidden>
+                  <strong>SPARSE LINKS</strong>
+                  Most current connections are kind clusters. More meeting notes, vault entries, and cross-file references will thicken the web.
+                </div>
+              </div>
               <aside class="mem-graph-detail" data-mem-graph-detail>
                 <div class="mem-graph-detail-empty">Hover or click a node to inspect.</div>
               </aside>
               <div class="mem-graph-legend">
-                <span><i class="dot fact"></i> Fact</span>
-                <span><i class="dot file"></i> File</span>
-                <span><i class="dot kind"></i> Kind cluster</span>
+                <span><i class="dot kind"></i> Kind<em data-mem-legend-kinds>—</em></span>
+                <span><i class="dot fact"></i> Fact<em data-mem-legend-facts>—</em></span>
+                <span><i class="dot file"></i> File<em data-mem-legend-files>—</em></span>
+              </div>
+            </div>
+
+            <!--
+              Meetings sub-view — listing of recent Recall captures with
+              their analysis. Hidden by default; activated by the
+              MEETINGS button in the mem-view-toggle.
+            -->
+            <div class="mem-meetings" data-mem-meetings hidden>
+              <div class="mem-meetings-head">
+                <span class="mem-meetings-tag">CAPTURED MEETINGS</span>
+                <span class="mem-meetings-meta" data-mem-meetings-meta>—</span>
+                <button type="button" class="mem-meetings-refresh" data-mem-meetings-refresh>REFRESH</button>
+              </div>
+              <div class="mem-meetings-list" data-mem-meetings-list>
+                <div class="mem-meetings-empty">— loading recent meetings —</div>
+              </div>
+              <div class="mem-meetings-detail" data-mem-meetings-detail>
+                <div class="mem-meetings-detail-empty">Pick a meeting on the left to see its summary, action items, and transcript.</div>
               </div>
             </div>
           </div>
@@ -709,18 +738,24 @@ export function renderConsoleHtml(token: string): string {
           <div class="skills-header">
             <div class="skills-intro">
               <h3>Installed Skills</h3>
-              <p>Skills are plugins dropped into <code data-skills-dir>~/.clementine-next/plugins/</code>.
-                 Each plugin can register tools the agent calls just like built-in ones.</p>
+              <p>Skills are reusable <code>SKILL.md</code> prompt modules — personas, design systems, style guides, domain knowledge — that load into the agent's context on demand. Same format as Claude Code skills, Codex skills, and <a href="https://agentskills.io" target="_blank" rel="noopener">agentskills.io</a>. Install any public repo from GitHub below.</p>
             </div>
             <div class="skills-stats">
               <div class="stat-card"><span>SKILLS</span><em data-skills-count>—</em></div>
-              <div class="stat-card"><span>TOOLS</span><em data-skills-tool-count>—</em></div>
             </div>
+          </div>
+
+          <div class="skills-install" data-skills-install>
+            <input type="text" data-skills-install-url placeholder="https://github.com/owner/repo  (e.g. Leonxlnx/taste-skill)" />
+            <button data-skills-install-run>INSTALL FROM GITHUB</button>
+            <div class="skills-install-status" data-skills-install-status hidden></div>
           </div>
 
           <div class="skills-grid" data-skills-grid>
             <div class="tools-empty">— loading —</div>
           </div>
+
+          <p class="skills-footer">Skills install to <code data-skills-dir>~/.clementine-next/skills/</code>. Want custom executable tools instead? Drop a JS plugin under <code>~/.clementine-next/plugins/</code> — they show up in the Tools panel as Custom Tools.</p>
 
         </div>
       </section>
@@ -778,6 +813,24 @@ export function renderConsoleHtml(token: string): string {
             </div>
             <div class="hub-apps-list" data-hub-browser-list>
               <div class="settings-info">— loading —</div>
+            </div>
+          </div>
+
+          <div class="hub-block">
+            <div class="hub-block-head">
+              <span class="hub-block-title">Connect a CLI</span>
+              <span class="hub-block-meta" data-hub-cli-cat-meta>—</span>
+            </div>
+            <p class="hub-block-intro">Search for a CLI by name — Clementine knows how to install and authenticate the common ones. Once connected, the agent can call it via <code>run_shell_command</code> and the install + auth context is saved so future sessions know it's available.</p>
+            <div class="hub-apps-controls">
+              <input type="search" data-hub-cli-cat-search placeholder="Search a CLI — e.g. salesforce, railway, vercel…" autocomplete="off" spellcheck="false" />
+            </div>
+            <div class="hub-apps-list" data-hub-cli-cat-results>
+              <div class="settings-info">Type a name above to find an installable CLI.</div>
+            </div>
+            <div class="hub-apps-list" data-hub-cli-cat-connected>
+              <!-- "Already connected" surface populated by JS when the
+                   user has CLIs in connected-clis.json. -->
             </div>
           </div>
 
@@ -1096,6 +1149,57 @@ export function renderConsoleHtml(token: string): string {
       <span class="foot-cell" data-foot-version>—</span>
       <span class="foot-cell foot-right">⌘K · coming soon</span>
     </footer>
+
+    <!--
+      ── Meeting-capture floating layer ─────────────────────────────
+      Three states, mutually exclusive, all top-right:
+        a) meeting detected but not recording → prompt banner with
+           [Record this meeting] [Always record] [Not this time]
+        b) recording in progress → live pill (platform + elapsed),
+           click to expand the transcript drawer
+        c) recording just ended → completion toast with
+           [Open transcript] [Send summary to chat] [Dismiss]
+      Visible from any panel — the recall events fire globally,
+      not just when the Integrations tab is open.
+    -->
+    <div class="meeting-layer" data-meeting-layer aria-live="polite">
+
+      <div class="meeting-prompt" data-meeting-prompt hidden>
+        <div class="meeting-prompt-head">
+          <span class="meeting-dot detected"></span>
+          <span class="meeting-prompt-title" data-meeting-prompt-title>Meeting detected</span>
+          <button type="button" class="meeting-x" data-meeting-prompt-dismiss aria-label="Dismiss">✕</button>
+        </div>
+        <div class="meeting-prompt-sub" data-meeting-prompt-sub>—</div>
+        <div class="meeting-prompt-actions">
+          <button type="button" class="meeting-btn primary" data-meeting-prompt-record>RECORD THIS MEETING</button>
+          <button type="button" class="meeting-btn ghost" data-meeting-prompt-always>ALWAYS RECORD</button>
+        </div>
+      </div>
+
+      <div class="meeting-pill-wrap" data-meeting-pill-wrap hidden>
+        <button type="button" class="meeting-pill" data-meeting-pill aria-label="Open live meeting in Memory panel">
+          <span class="meeting-dot recording"></span>
+          <span class="meeting-pill-label" data-meeting-pill-label>recording</span>
+          <span class="meeting-pill-time" data-meeting-pill-time>00:00</span>
+        </button>
+        <button type="button" class="meeting-pill-dismiss" data-meeting-pill-dismiss aria-label="Dismiss stale recording indicator" title="Dismiss — if this is wrong, the daemon's recording state may have desynced">✕</button>
+      </div>
+
+      <div class="meeting-toast" data-meeting-toast hidden>
+        <div class="meeting-toast-head">
+          <span class="meeting-dot complete"></span>
+          <span class="meeting-toast-title">Meeting captured</span>
+          <button type="button" class="meeting-x" data-meeting-toast-dismiss aria-label="Dismiss">✕</button>
+        </div>
+        <div class="meeting-toast-sub" data-meeting-toast-sub>—</div>
+        <div class="meeting-toast-actions">
+          <button type="button" class="meeting-btn ghost" data-meeting-toast-transcript>OPEN TRANSCRIPT</button>
+          <button type="button" class="meeting-btn primary" data-meeting-toast-summary>SUMMARIZE IN CHAT</button>
+        </div>
+      </div>
+
+    </div>
 
   </div>
 
@@ -2111,14 +2215,12 @@ body {
   overflow: hidden;
 }
 .home-layout.live-takeover .home-live-stage .home-voice-orb-button {
-  width: clamp(120px, 22vh, 180px);
-  height: clamp(120px, 22vh, 180px);
+  width: clamp(140px, 24vh, 220px);
+  height: clamp(140px, 24vh, 220px);
   transform: scale(1);
 }
-.home-layout.live-takeover .home-live-stage .home-voice-avatar {
-  width: clamp(76px, 14vh, 116px);
-  height: clamp(76px, 14vh, 116px);
-}
+/* Avatar fills the portrait disc at every size now — no per-state
+   sizing needed. */
 .home-layout.live-takeover .home-live-copy {
   text-align: center;
   gap: 6px;
@@ -2549,219 +2651,186 @@ body {
   padding: 28px;
   border-radius: 34px;
 }
+/* ── Live-voice orb: portrait-first, all chrome stripped ────────────
+   The orb is a clean disc whose only contents are the Clementine
+   portrait and an inline pixel-art mouth overlay sitting exactly over
+   the dog's actual mouth pixels. A single soft halo handles the
+   "alive" feel. Everything that used to clutter the bottom — wave
+   bars, scan line, dual orbiting rings, floating cheek pixels — is
+   gone. Mouth-open is amplitude-driven via the --mouth-open custom
+   property updated from JS each frame. */
 .home-voice-orb-button {
   position: relative;
-  width: 58px;
-  height: 58px;
+  width: 64px;
+  height: 64px;
   border-radius: 999px;
-  border: 1px solid color-mix(in srgb, var(--accent) 54%, var(--line));
+  border: 1px solid color-mix(in srgb, var(--accent) 48%, var(--line));
   background:
-    radial-gradient(circle at 50% 50%, color-mix(in srgb, var(--accent) 18%, transparent), transparent 38%),
-    conic-gradient(from 205deg, color-mix(in srgb, var(--accent) 70%, transparent), transparent 28%, color-mix(in srgb, var(--accent-2) 75%, transparent), transparent 70%),
-    var(--bg-0);
+    radial-gradient(circle at 50% 40%, color-mix(in srgb, var(--accent) 14%, transparent) 0%, transparent 55%),
+    radial-gradient(circle at 50% 50%, var(--bg-1) 0%, var(--bg-0) 100%);
   cursor: pointer;
   padding: 0;
   box-shadow:
-    0 0 24px color-mix(in srgb, var(--accent) 22%, transparent),
-    inset 0 0 20px color-mix(in srgb, var(--accent-2) 10%, transparent);
+    0 8px 30px rgba(0, 0, 0, 0.45),
+    0 0 20px color-mix(in srgb, var(--accent) 18%, transparent);
   isolation: isolate;
   overflow: visible;
+  --mouth-open: 0;             /* 0 = closed, 1 = wide open */
+  --halo-strength: 0;          /* 0 idle, 1 speaking peak */
   transition:
-    width 220ms ease,
-    height 220ms ease,
-    border-radius 220ms ease,
-    transform 180ms ease,
+    width 240ms cubic-bezier(0.4, 0, 0.2, 1),
+    height 240ms cubic-bezier(0.4, 0, 0.2, 1),
     box-shadow 220ms ease;
 }
-.home-voice-orb-button:disabled {
-  cursor: progress;
-  opacity: 0.68;
-}
+.home-voice-orb-button:disabled { cursor: progress; opacity: 0.7; }
 .home-voice-orb-button:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 4px;
 }
-.home-voice-ring {
+.home-voice-halo {
   position: absolute;
-  inset: -8px;
+  inset: -14px;
   border-radius: 999px;
-  border: 1px solid color-mix(in srgb, var(--accent) 28%, transparent);
-  opacity: 0.56;
+  pointer-events: none;
+  background: radial-gradient(circle, color-mix(in srgb, var(--accent) 36%, transparent) 0%, transparent 62%);
+  opacity: calc(0.15 + 0.55 * var(--halo-strength));
+  transition: opacity 120ms ease;
+  z-index: -1;
 }
-.home-voice-ring.ring-b {
-  inset: -15px;
-  border-color: color-mix(in srgb, var(--accent-2) 22%, transparent);
-  opacity: 0.35;
-}
-.home-voice-core {
+.home-voice-portrait {
   position: absolute;
-  inset: 9px;
+  inset: 6px;
+  border-radius: 999px;
+  overflow: hidden;
   display: grid;
   place-items: center;
-  border-radius: 16px;
-  overflow: hidden;
-  background: linear-gradient(145deg, color-mix(in srgb, var(--bg-0) 72%, var(--accent) 12%), var(--bg-1));
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--fg) 14%, transparent);
-  transition: inset 220ms ease, border-radius 220ms ease;
+  background: var(--bg-0);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--fg) 8%, transparent);
 }
 .home-voice-avatar {
-  width: 29px;
-  height: 29px;
-  object-fit: contain;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
   image-rendering: pixelated;
-  filter: saturate(1.15) contrast(1.08);
-  transform: translateY(1px);
-  transition: width 220ms ease, height 220ms ease;
+  /* Slight contrast lift so the dog reads sharp on the dark backdrop. */
+  filter: saturate(1.1) contrast(1.05);
+  /* The breathing scale tracks halo-strength so the head subtly
+     "comes alive" when the agent is speaking. */
+  transform: scale(calc(1 + 0.025 * var(--halo-strength)));
+  transition: transform 90ms ease;
 }
-.home-voice-face {
+
+/* Pixel-art mouth, anchored to the dog's real mouth pixels.
+   The icon is 1024×1024 with the mouth centered at roughly y=78% from
+   top, width ≈ 11% of the canvas. We position the overlay in those
+   same proportions so it lines up at any orb size. */
+.home-voice-mouth {
   position: absolute;
+  left: 50%;
+  top: 78%;
+  width: 11%;
+  height: 5%;
+  transform: translate(-50%, -50%);
   pointer-events: none;
   image-rendering: pixelated;
-}
-.home-voice-face.mouth {
-  left: 50%;
-  bottom: 8px;
-  width: 10px;
-  height: 3px;
-  transform: translateX(-50%);
-  background: color-mix(in srgb, var(--bg-0) 76%, #111 24%);
-  box-shadow:
-    0 0 0 1px color-mix(in srgb, var(--accent) 18%, transparent),
-    0 1px 0 color-mix(in srgb, var(--accent-2) 45%, transparent);
+  /* Use grid so cavity + tongue stack and grow together. */
+  display: grid;
+  place-items: end center;
   opacity: 0;
+  transition: opacity 200ms ease;
 }
-.home-voice-face.cheek {
-  bottom: 11px;
-  width: 3px;
-  height: 3px;
-  background: color-mix(in srgb, var(--accent) 76%, transparent);
-  opacity: 0;
-}
-.home-voice-face.cheek-left { left: 9px; }
-.home-voice-face.cheek-right { right: 9px; }
-.home-voice-scan {
+.home-voice-mouth-cavity {
   position: absolute;
   inset: 0;
-  background: linear-gradient(180deg, transparent 0%, color-mix(in srgb, var(--accent) 28%, transparent) 48%, transparent 56%);
-  transform: translateY(-110%);
-  opacity: 0;
+  /* Dark mouth interior — matches the icon's #1b1822 nose/mouth tone. */
+  background: #0c0a14;
+  border-radius: 0;
+  /* Mouth opens by scaling Y from the bottom edge. */
+  transform-origin: 50% 50%;
+  transform: scaleY(calc(0.15 + 1.4 * var(--mouth-open)));
+  transition: transform 70ms ease-out;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.6);
 }
-.home-voice-wave {
+.home-voice-mouth-tongue {
   position: absolute;
-  right: -5px;
-  bottom: 7px;
-  display: grid;
-  grid-template-columns: repeat(4, 3px);
-  gap: 2px;
-  align-items: end;
-  height: 16px;
-  padding: 4px;
-  border-radius: 999px;
-  background: color-mix(in srgb, var(--bg-0) 78%, transparent);
-  border: 1px solid color-mix(in srgb, var(--accent) 32%, transparent);
+  left: 22%;
+  right: 22%;
+  bottom: 8%;
+  height: 28%;
+  background: #b73a3a;
+  opacity: calc(var(--mouth-open) * 0.9);
+  transform: scaleY(var(--mouth-open));
+  transform-origin: 50% 100%;
+  transition: opacity 70ms, transform 70ms;
 }
-.home-voice-wave i {
-  display: block;
-  width: 3px;
-  height: 5px;
-  border-radius: 999px;
-  background: var(--accent);
-  opacity: 0.45;
+.home-voice-panel.live .home-voice-mouth { opacity: 1; }
+
+/* Size scaling per panel state. Halo & mouth scale with the parent
+   percentages so the alignment holds without per-state overrides. */
+.home-voice-panel.live .home-voice-orb-button { width: 132px; height: 132px; }
+.home-voice-panel.focus .home-voice-orb-button { width: 192px; height: 192px; }
+
+/* "Speaking" state gets a stronger amber halo; "thinking" goes cooler. */
+.home-voice-panel.speaking .home-voice-orb-button {
+  border-color: color-mix(in srgb, var(--accent) 72%, var(--accent-2));
+  box-shadow: 0 8px 40px rgba(0, 0, 0, 0.55), 0 0 40px color-mix(in srgb, var(--accent) 42%, transparent);
 }
-.home-voice-panel.live .home-voice-orb-button {
-  width: 112px;
-  height: 112px;
-}
-.home-voice-panel.focus .home-voice-orb-button {
-  width: 148px;
-  height: 148px;
-}
-.home-voice-panel.live .home-voice-core {
-  inset: 18px;
-  border-radius: 26px;
-}
-.home-voice-panel.focus .home-voice-core {
-  inset: 24px;
-  border-radius: 32px;
-}
-.home-voice-panel.live .home-voice-avatar {
-  width: 62px;
-  height: 62px;
-}
-.home-voice-panel.focus .home-voice-avatar {
-  width: 82px;
-  height: 82px;
-}
-.home-voice-panel.live .home-voice-orb-button {
-  animation: voicePulse 1.35s ease-in-out infinite;
+.home-voice-panel.thinking .home-voice-orb-button {
+  border-color: color-mix(in srgb, var(--accent-3) 60%, var(--line));
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.45), 0 0 28px color-mix(in srgb, var(--accent-3) 30%, transparent);
 }
 .home-voice-panel.routing .home-voice-orb-button {
   border-color: color-mix(in srgb, var(--accent-2) 70%, var(--accent));
-  box-shadow:
-    0 0 44px color-mix(in srgb, var(--accent-2) 28%, transparent),
-    inset 0 0 30px color-mix(in srgb, var(--accent) 14%, transparent);
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.45), 0 0 32px color-mix(in srgb, var(--accent-2) 32%, transparent);
 }
-.home-voice-panel.thinking .home-voice-orb-button {
-  animation-duration: 920ms;
+
+/* Idle "breathing" — gentle scale on the whole button so the orb
+   feels alive even before audio amplitude drives the halo. Stops
+   when speaking so the audio-reactive halo can dominate. */
+.home-voice-orb-button { animation: voiceBreathe 4.2s ease-in-out infinite; }
+.home-voice-panel.live .home-voice-orb-button,
+.home-voice-panel.speaking .home-voice-orb-button { animation: none; }
+@keyframes voiceBreathe {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.025); }
 }
-.home-voice-panel.speaking .home-voice-orb-button {
-  animation-duration: 680ms;
+
+/* Wake-word toggle pill */
+.home-live-wake-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  color: var(--fg-3);
+  text-transform: uppercase;
+  cursor: pointer;
+  user-select: none;
 }
-.home-voice-panel.live .home-voice-avatar {
-  animation: voiceAvatarTalk 540ms steps(2, end) infinite;
+.home-live-wake-toggle input { accent-color: var(--accent); transform: scale(0.9); }
+.home-live-wake-toggle:hover { color: var(--fg-2); }
+.home-live-wake-dot {
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  background: var(--fg-mute);
+  transition: background 160ms ease, box-shadow 160ms ease;
 }
-.home-voice-panel.live .home-voice-face.mouth {
-  opacity: 1;
-  animation: voicePixelMouth 360ms steps(3, end) infinite;
+.home-live-wake-toggle[data-wake-state="listening"] .home-live-wake-dot {
+  background: var(--accent-2);
+  box-shadow: 0 0 8px color-mix(in srgb, var(--accent-2) 70%, transparent);
+  animation: wakeDot 1.6s ease-in-out infinite;
 }
-.home-voice-panel.live .home-voice-face.cheek {
-  animation: voicePixelCheeks 720ms steps(2, end) infinite;
+.home-live-wake-toggle[data-wake-state="unavailable"] .home-live-wake-dot {
+  background: var(--accent-warn);
 }
-.home-voice-panel.live .home-voice-ring.ring-a {
-  animation: voiceOrbit 3.6s linear infinite;
+.home-live-wake-toggle[data-wake-state="heard"] .home-live-wake-dot {
+  background: var(--accent);
+  box-shadow: 0 0 12px color-mix(in srgb, var(--accent) 80%, transparent);
 }
-.home-voice-panel.live .home-voice-ring.ring-b {
-  animation: voiceOrbit 5.2s linear infinite reverse;
-}
-.home-voice-panel.live .home-voice-scan {
-  animation: voiceScan 2.2s ease-in-out infinite;
-}
-.home-voice-panel.live .home-voice-wave i {
-  opacity: 1;
-  animation: voiceBars 680ms ease-in-out infinite;
-}
-.home-voice-panel.live .home-voice-wave i:nth-child(2) { animation-delay: 90ms; }
-.home-voice-panel.live .home-voice-wave i:nth-child(3) { animation-delay: 180ms; }
-.home-voice-panel.live .home-voice-wave i:nth-child(4) { animation-delay: 270ms; }
-@keyframes voiceOrbit {
-  to { transform: rotate(360deg); }
-}
-@keyframes voicePulse {
-  0%, 100% { transform: scale(1); box-shadow: 0 0 22px color-mix(in srgb, var(--accent) 22%, transparent), inset 0 0 20px color-mix(in srgb, var(--accent-2) 10%, transparent); }
-  50% { transform: scale(1.045); box-shadow: 0 0 38px color-mix(in srgb, var(--accent) 36%, transparent), inset 0 0 24px color-mix(in srgb, var(--accent-2) 16%, transparent); }
-}
-@keyframes voiceAvatarTalk {
-  0%, 100% { transform: translateY(1px) scale(1); filter: saturate(1.15) contrast(1.08); }
-  50% { transform: translateY(0) scale(1.06); filter: saturate(1.35) contrast(1.16) drop-shadow(0 0 5px color-mix(in srgb, var(--accent) 42%, transparent)); }
-}
-@keyframes voicePixelMouth {
-  0% { height: 2px; width: 8px; bottom: 8px; }
-  34% { height: 7px; width: 8px; bottom: 6px; }
-  68% { height: 4px; width: 12px; bottom: 7px; }
-  100% { height: 2px; width: 8px; bottom: 8px; }
-}
-@keyframes voicePixelCheeks {
-  0%, 100% { opacity: 0.24; transform: translateY(0); }
-  50% { opacity: 0.95; transform: translateY(-1px); }
-}
-@keyframes voiceScan {
-  0%, 35% { transform: translateY(-110%); opacity: 0; }
-  45%, 60% { opacity: 0.85; }
-  78%, 100% { transform: translateY(110%); opacity: 0; }
-}
-@keyframes voiceBars {
-  0%, 100% { height: 4px; opacity: 0.52; }
-  45% { height: 14px; opacity: 1; }
+@keyframes wakeDot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
 }
 .home-voice-copy {
   min-width: 0;
@@ -3261,9 +3330,36 @@ body {
 .mem-graph-canvas {
   position: relative;
   background:
+    /* Soft central spotlight so the kind clusters feel anchored at the
+       middle of the canvas. */
+    radial-gradient(ellipse 60% 50% at 50% 50%, rgba(255, 90, 53, 0.06) 0%, transparent 70%),
+    /* Faint starfield: two offset dot layers at different densities to
+       avoid the regular-grid look. */
+    radial-gradient(circle at 12% 18%, rgba(255, 255, 255, 0.08) 0 1px, transparent 1.4px),
+    radial-gradient(circle at 76% 64%, rgba(185, 255, 54, 0.06) 0 1px, transparent 1.4px),
+    radial-gradient(circle at 38% 84%, rgba(54, 197, 255, 0.06) 0 1px, transparent 1.4px),
+    /* Base radial vignette — keep the existing depth gradient under everything. */
     radial-gradient(circle at 50% 50%, var(--bg-1) 0%, var(--bg-0) 80%);
+  background-size: 100% 100%, 180px 180px, 240px 240px, 220px 220px, 100% 100%;
   overflow: hidden;
   min-height: 360px;
+}
+.mem-graph-canvas::before {
+  /* Inner vignette frame — pulls the eye toward the middle of the graph. */
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  box-shadow: inset 0 0 80px rgba(0, 0, 0, 0.55);
+  border: 1px solid transparent;
+}
+.mem-graph-canvas::after {
+  /* Scan-line texture, matching the rest of the operational UI. */
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background-image: repeating-linear-gradient(to bottom, transparent 0 3px, rgba(255, 255, 255, 0.015) 3px 4px);
 }
 .mem-graph-detail {
   border-left: 1px solid var(--line);
@@ -3324,30 +3420,287 @@ body {
 }
 .mem-graph-legend {
   position: absolute;
-  bottom: 12px;
-  left: 12px;
+  bottom: 14px;
+  left: 14px;
   display: flex;
-  gap: 12px;
+  gap: 16px;
   font-size: 10px;
-  letter-spacing: 0.12em;
-  color: var(--fg-3);
-  background: var(--bg-1);
+  letter-spacing: 0.14em;
+  color: var(--fg-2);
+  background: rgba(13, 13, 18, 0.78);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
   border: 1px solid var(--line);
-  padding: 6px 10px;
+  padding: 8px 14px;
   pointer-events: none;
   text-transform: uppercase;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.45);
+}
+.mem-graph-legend span { display: inline-flex; align-items: center; gap: 6px; }
+.mem-graph-legend em {
+  font-style: normal;
+  color: var(--fg);
+  margin-left: 2px;
+  letter-spacing: 0.05em;
 }
 .mem-graph-legend .dot {
   display: inline-block;
-  width: 8px;
-  height: 8px;
+  width: 9px;
+  height: 9px;
   border-radius: 50%;
-  margin-right: 4px;
   vertical-align: middle;
 }
-.mem-graph-legend .dot.fact { background: var(--accent); }
-.mem-graph-legend .dot.file { background: var(--accent-3); }
-.mem-graph-legend .dot.kind { background: var(--accent-2); }
+.mem-graph-legend .dot.fact { background: var(--accent); box-shadow: 0 0 8px rgba(255, 90, 53, 0.55); }
+.mem-graph-legend .dot.file { background: var(--accent-3); box-shadow: 0 0 8px rgba(54, 197, 255, 0.45); border-radius: 1px; width: 8px; height: 8px; }
+.mem-graph-legend .dot.kind { background: var(--accent-2); box-shadow: 0 0 10px rgba(185, 255, 54, 0.55); width: 11px; height: 11px; }
+
+/* Sparse-data hint that floats above the canvas instead of crowding
+   the detail pane. Less ceremonial than the prior inline note. */
+.mem-graph-sparse-hint {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  max-width: 220px;
+  font-size: 10px;
+  line-height: 1.5;
+  letter-spacing: 0.04em;
+  color: var(--fg-3);
+  background: rgba(13, 13, 18, 0.78);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  border: 1px solid var(--line);
+  border-left: 2px solid var(--accent-warn);
+  padding: 8px 12px;
+  pointer-events: none;
+}
+.mem-graph-sparse-hint strong { color: var(--accent-warn); display: block; letter-spacing: 0.16em; font-size: 9px; margin-bottom: 4px; }
+
+.mem-graph-empty {
+  position: absolute; inset: 0;
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  gap: 14px;
+  text-align: center;
+  padding: 0 40px;
+  color: var(--fg-2);
+}
+.mem-graph-empty h4 {
+  margin: 0;
+  font-size: 11px;
+  letter-spacing: 0.22em;
+  color: var(--accent);
+}
+.mem-graph-empty p {
+  margin: 0;
+  max-width: 360px;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--fg-3);
+}
+.mem-graph-empty-ring {
+  position: relative;
+  width: 64px; height: 64px;
+  border-radius: 50%;
+  border: 1px dashed rgba(255, 90, 53, 0.4);
+}
+.mem-graph-empty-ring::before,
+.mem-graph-empty-ring::after {
+  content: '';
+  position: absolute;
+  border-radius: 50%;
+}
+.mem-graph-empty-ring::before {
+  inset: 12px;
+  border: 1px solid rgba(185, 255, 54, 0.35);
+}
+.mem-graph-empty-ring::after {
+  inset: 26px;
+  background: var(--accent);
+  box-shadow: 0 0 16px rgba(255, 90, 53, 0.7);
+  animation: pulse-soft 1.8s ease-in-out infinite;
+}
+@keyframes pulse-soft {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.4; transform: scale(0.55); }
+}
+
+/* ── Meetings sub-view ──────────────────────────────────────── */
+.mem-meetings {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 320px 1fr;
+  grid-template-rows: auto 1fr;
+  gap: 0;
+  background: var(--bg-2);
+  min-height: 0;
+}
+.mem-meetings[hidden] { display: none; }
+.mem-meetings-head {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  background: var(--bg-1);
+  border-bottom: 1px solid var(--line);
+}
+.mem-meetings-tag {
+  font-size: 10px;
+  letter-spacing: 0.22em;
+  color: var(--accent);
+  font-weight: 600;
+}
+.mem-meetings-meta {
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  color: var(--fg-3);
+  margin-left: auto;
+}
+.mem-meetings-refresh {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+.mem-meetings-refresh:hover { color: var(--accent); border-color: var(--accent); }
+
+.mem-meetings-list {
+  border-right: 1px solid var(--line);
+  overflow-y: auto;
+  background: var(--bg-1);
+}
+.mem-meetings-list .mem-meetings-empty {
+  padding: 18px 14px;
+  font-size: 11px;
+  color: var(--fg-mute);
+}
+.mem-meeting-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--line);
+  cursor: pointer;
+  transition: background 100ms;
+}
+.mem-meeting-row:hover { background: var(--bg-2); }
+.mem-meeting-row.selected { background: var(--bg-2); border-left: 2px solid var(--accent); padding-left: 12px; }
+.mem-meeting-row-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--fg);
+}
+.mem-meeting-platform {
+  font-size: 9px;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--accent);
+  padding: 1px 6px;
+  border: 1px solid color-mix(in srgb, var(--accent) 50%, var(--line));
+}
+.mem-meeting-platform.zoom { color: var(--accent-3); border-color: color-mix(in srgb, var(--accent-3) 50%, var(--line)); }
+.mem-meeting-platform.meet { color: var(--accent-2); border-color: color-mix(in srgb, var(--accent-2) 50%, var(--line)); }
+.mem-meeting-platform.teams { color: var(--accent-warn); border-color: color-mix(in srgb, var(--accent-warn) 50%, var(--line)); }
+.mem-meeting-status {
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  margin-left: auto;
+  color: var(--fg-mute);
+}
+.mem-meeting-status.completed { color: var(--accent-2); }
+.mem-meeting-status.recording { color: var(--accent-fail); }
+.mem-meeting-status.analysis-ready { color: var(--accent-2); }
+.mem-meeting-status.analysis-pending { color: var(--accent-warn); }
+.mem-meeting-row-title {
+  font-size: 11px;
+  color: var(--fg-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.mem-meeting-row-meta {
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  color: var(--fg-mute);
+}
+
+.mem-meetings-detail {
+  overflow-y: auto;
+  padding: 18px 22px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--fg);
+}
+.mem-meetings-detail-empty { color: var(--fg-mute); padding: 12px 0; }
+.mem-meeting-detail h3 {
+  margin: 0 0 6px;
+  font-size: 14px;
+  color: var(--fg);
+  letter-spacing: 0.02em;
+}
+.mem-meeting-detail h4 {
+  margin: 18px 0 8px;
+  font-size: 10px;
+  letter-spacing: 0.22em;
+  color: var(--accent);
+  text-transform: uppercase;
+}
+.mem-meeting-detail-meta {
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  color: var(--fg-3);
+  margin-bottom: 10px;
+}
+.mem-meeting-detail-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 14px 0 4px;
+}
+.mem-meeting-detail-actions button {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  padding: 6px 12px;
+  cursor: pointer;
+}
+.mem-meeting-detail-actions button:hover { color: var(--fg); border-color: var(--line-bright); }
+.mem-meeting-detail-actions .primary { color: var(--accent); border-color: var(--accent); }
+.mem-meeting-detail-actions .primary:hover { background: var(--accent); color: var(--bg-0); }
+.mem-meeting-detail ul {
+  margin: 6px 0 0;
+  padding-left: 18px;
+}
+.mem-meeting-detail li { margin-bottom: 4px; }
+.mem-meeting-detail-pending {
+  display: inline-block;
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--accent-warn);
+  padding: 3px 8px;
+  border: 1px dashed color-mix(in srgb, var(--accent-warn) 60%, var(--line));
+  margin-top: 6px;
+}
+.mem-meeting-detail-empty-state {
+  text-align: center;
+  padding: 24px 0;
+  color: var(--fg-mute);
+  font-size: 11px;
+}
 @media (max-width: 1040px) {
   .memory-layout {
     grid-template-columns: 1fr;
@@ -4262,6 +4615,45 @@ body {
   font-size: 10px;
   color: var(--fg-mute);
   letter-spacing: 0.06em;
+}
+.sched-picker {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.sched-picker select,
+.sched-picker input[type="time"],
+.sched-picker input[type="number"],
+.sched-picker input[type="text"] {
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  padding: 6px 8px;
+  color: var(--fg);
+  font: inherit;
+  font-size: 12px;
+}
+.sched-picker select { min-width: 180px; }
+.sched-picker input[type="number"] { width: 80px; }
+.sched-picker input[type="text"] { flex: 1; min-width: 200px; font-family: var(--mono, ui-monospace, monospace); }
+.sched-picker input[hidden], .sched-picker div[hidden] { display: none; }
+.sched-days {
+  display: inline-flex;
+  gap: 4px;
+}
+.sched-day {
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  padding: 4px 7px;
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  color: var(--fg-3);
+  cursor: pointer;
+}
+.sched-day.on {
+  background: var(--bg-1);
+  border-color: var(--accent);
+  color: var(--accent);
 }
 
 .wf-steps { display: flex; flex-direction: column; gap: 8px; }
@@ -5291,6 +5683,55 @@ body {
 .hub-app-pill.pending { color: var(--accent-warn); border-color: var(--accent-warn); }
 .hub-app-pill.available { color: var(--fg-3); border-color: var(--line); }
 .hub-app-pill.failed, .hub-app-pill.disconnected { color: var(--accent-fail); border-color: var(--accent-fail); }
+
+/* CLI catalog — action row + connected pills */
+.hub-app-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+  flex-wrap: wrap;
+}
+.hub-app-actions button,
+.hub-app-actions a {
+  background: transparent;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  padding: 5px 10px;
+  cursor: pointer;
+  text-decoration: none;
+  text-transform: uppercase;
+}
+.hub-app-actions button:hover,
+.hub-app-actions a:hover { background: var(--accent); color: var(--bg-0); }
+.hub-app-actions .cli-cat-forget {
+  border-color: var(--line);
+  color: var(--fg-3);
+}
+.hub-app-actions .cli-cat-forget:hover {
+  border-color: var(--accent-fail);
+  color: var(--accent-fail);
+  background: transparent;
+}
+.hub-cli-connected-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+.hub-cli-connected-pill {
+  font-size: 10px;
+  padding: 3px 8px;
+  border: 1px solid color-mix(in srgb, var(--accent-2) 50%, var(--line));
+  color: var(--fg-2);
+  background: color-mix(in srgb, var(--accent-2) 5%, transparent);
+}
+.hub-cli-connected-pill code {
+  color: var(--accent-2);
+  background: transparent;
+}
 .hub-app-card-actions {
   display: flex;
   gap: 6px;
@@ -5565,6 +6006,60 @@ body {
   border: 1px solid var(--line);
   padding: 2px 6px;
   color: var(--fg-2);
+}
+.skill-card .skill-uninstall {
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  background: transparent;
+  border: 1px solid var(--line);
+  padding: 3px 8px;
+  color: var(--fg-3);
+  cursor: pointer;
+}
+.skill-card .skill-uninstall:hover { color: var(--accent-fail); border-color: var(--accent-fail); }
+.skills-install {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 14px;
+}
+.skills-install input {
+  flex: 1;
+  min-width: 280px;
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  padding: 8px 10px;
+  color: var(--fg);
+  font: inherit;
+}
+.skills-install button {
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  padding: 8px 14px;
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  color: var(--fg);
+  cursor: pointer;
+}
+.skills-install button:hover { border-color: var(--accent); color: var(--accent); }
+.skills-install button:disabled { opacity: 0.5; cursor: wait; }
+.skills-install-status {
+  flex-basis: 100%;
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  padding: 8px 10px;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 10px;
+  white-space: pre-wrap;
+  color: var(--fg-2);
+  max-height: 160px;
+  overflow-y: auto;
+}
+.skills-footer {
+  margin-top: 14px;
+  font-size: 10px;
+  color: var(--fg-3);
 }
 
 /* ── Settings panel ──────────────────────────────────────────── */
@@ -6276,6 +6771,253 @@ body {
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--line); border-radius: 0; }
 ::-webkit-scrollbar-thumb:hover { background: var(--line-bright); }
+
+/* ── Meeting-capture floating layer ───────────────────────────
+   Always-mounted, conditionally visible. Three top-right slots
+   (prompt → pill → toast) stack so the user only ever sees one at
+   a time. The drawer slides in from the right when the pill is
+   tapped. Everything pointer-events:none on the layer itself; the
+   individual cards re-enable pointer events. */
+.meeting-layer {
+  position: fixed;
+  top: 64px;
+  right: 18px;
+  z-index: 2400;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 10px;
+  pointer-events: none;
+}
+.meeting-layer > * { pointer-events: auto; }
+
+.meeting-prompt,
+.meeting-toast {
+  width: 320px;
+  padding: 14px 14px 12px;
+  /* Glass surface — uses the theme's bg-1 with a small alpha lift so
+     the backdrop-filter blur reads through. Adapts to both ops (dark)
+     and day (light) themes via the CSS variables. */
+  background: color-mix(in srgb, var(--bg-1) 88%, transparent);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  border: 1px solid var(--line);
+  border-left: 2px solid var(--accent);
+  box-shadow: 0 10px 36px color-mix(in srgb, var(--bg-0) 50%, transparent);
+  color: var(--fg);
+  animation: meetingSlideIn 220ms ease-out;
+}
+.meeting-toast { border-left-color: var(--accent-2); }
+
+@keyframes meetingSlideIn {
+  from { opacity: 0; transform: translateY(-6px) translateX(8px); }
+  to { opacity: 1; transform: none; }
+}
+
+.meeting-prompt-head,
+.meeting-toast-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+.meeting-prompt-title,
+.meeting-toast-title {
+  font-size: 11px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--fg);
+  flex: 1;
+}
+.meeting-prompt-sub,
+.meeting-toast-sub {
+  font-size: 11px;
+  color: var(--fg-2);
+  line-height: 1.5;
+  margin-bottom: 10px;
+}
+.meeting-prompt-actions,
+.meeting-toast-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.meeting-x {
+  background: transparent;
+  border: 0;
+  color: var(--fg-3);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 2px 4px;
+}
+.meeting-x:hover { color: var(--accent-fail); }
+
+.meeting-btn {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  padding: 6px 10px;
+  cursor: pointer;
+  transition: background 120ms, color 120ms, border-color 120ms;
+}
+.meeting-btn:hover { color: var(--fg); border-color: var(--line-bright); }
+.meeting-btn.primary { color: var(--accent); border-color: var(--accent); }
+.meeting-btn.primary:hover { background: var(--accent); color: var(--bg-0); }
+.meeting-btn.ghost { color: var(--fg-3); }
+
+.meeting-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+  flex-shrink: 0;
+}
+.meeting-dot.detected { background: var(--accent); box-shadow: 0 0 8px color-mix(in srgb, var(--accent) 60%, transparent); }
+.meeting-dot.recording { background: var(--accent-fail); box-shadow: 0 0 10px color-mix(in srgb, var(--accent-fail) 75%, transparent); animation: meetingPulse 1.4s ease-in-out infinite; }
+.meeting-dot.complete { background: var(--accent-2); box-shadow: 0 0 10px color-mix(in srgb, var(--accent-2) 70%, transparent); }
+@keyframes meetingPulse {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(0.7); opacity: 0.55; }
+}
+
+/* Pill wrap groups the pill + a tiny dismiss button so the user has
+   an escape hatch when the daemon's state desyncs and the pill thinks
+   a recording is active when it isn't. */
+.meeting-pill-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.meeting-pill-dismiss {
+  background: color-mix(in srgb, var(--bg-1) 88%, transparent);
+  border: 1px solid var(--line);
+  color: var(--fg-3);
+  font: inherit;
+  font-size: 10px;
+  width: 22px;
+  height: 22px;
+  cursor: pointer;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.meeting-pill-dismiss:hover { color: var(--accent-fail); border-color: var(--accent-fail); }
+
+/* Live pill — small enough to live in the corner without dominating,
+   but signals "we're capturing right now" unambiguously. */
+.meeting-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 12px;
+  background: color-mix(in srgb, var(--bg-1) 88%, transparent);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  border: 1px solid color-mix(in srgb, var(--accent-fail) 50%, var(--line));
+  color: var(--fg);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  cursor: pointer;
+  box-shadow: 0 6px 22px color-mix(in srgb, var(--bg-0) 45%, transparent);
+  transition: border-color 120ms, transform 120ms;
+}
+.meeting-pill:hover {
+  border-color: var(--accent-fail);
+  transform: translateY(-1px);
+}
+.meeting-pill-label { color: var(--fg-2); }
+.meeting-pill-time {
+  font-variant-numeric: tabular-nums;
+  color: var(--accent-fail);
+  letter-spacing: 0.06em;
+}
+
+/* Live recording card — lives INLINE inside the Memory > Meetings
+   panel rather than as a floating popup. The pill click navigates
+   to Memory > Meetings and this card scrolls into view at the top of
+   the meetings list. Theme-aware via CSS variables. */
+.mem-meeting-live {
+  display: flex;
+  flex-direction: column;
+  padding: 14px 16px;
+  background: color-mix(in srgb, var(--accent-fail) 8%, var(--bg-1));
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent-fail);
+}
+.mem-meeting-live-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+.mem-meeting-live-titles { display: flex; flex-direction: column; min-width: 0; flex: 1; }
+.mem-meeting-live-tag {
+  font-size: 9px;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--accent-fail);
+  font-weight: 600;
+}
+.mem-meeting-live-title {
+  font-size: 12px;
+  color: var(--fg);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.mem-meeting-live-elapsed {
+  font-size: 12px;
+  color: var(--fg);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.08em;
+  padding: 2px 8px;
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+}
+.mem-meeting-live-body {
+  max-height: 240px;
+  overflow-y: auto;
+  padding: 10px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.mem-meeting-live-empty { color: var(--fg-mute); font-size: 11px; padding: 4px 0; font-style: italic; }
+.mem-meeting-live-foot {
+  margin-top: 6px;
+  padding-top: 10px;
+  border-top: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.mem-meeting-live-hint { color: var(--fg-mute); font-size: 9px; letter-spacing: 0.14em; text-transform: uppercase; }
+
+/* Shared segment style used by both the live card and any post-meeting
+   transcript inline render. */
+.meeting-segment {
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--fg);
+  padding-bottom: 8px;
+  border-bottom: 1px dashed color-mix(in srgb, var(--line) 70%, transparent);
+}
+.meeting-segment:last-child { border-bottom: 0; padding-bottom: 0; }
+.meeting-segment-speaker {
+  display: block;
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin-bottom: 3px;
+}
 `;
 
 // ─────────────────────────────────────────────────────────────────────
@@ -6397,7 +7139,31 @@ const CONSOLE_JS = `
         suffix = ' · click for v' + (info.version || '') + ' update';
         sub.style.cursor = 'pointer';
         sub.title = 'Restart Clementine to install v' + (info.version || '');
-        sub.onclick = () => { window.clemmy?.updaterApply?.(); };
+        sub.onclick = async () => {
+          // Give the user immediate feedback that the click registered.
+          // Previously the click silently called updaterApply with no
+          // awaited result — if applyUpdate refused for any reason,
+          // nothing visibly happened. Now: surface success (relaunch
+          // is imminent) or the actual refusal reason.
+          const prevText = sub.textContent;
+          sub.textContent = baseLabel + ' · restarting…';
+          sub.style.pointerEvents = 'none';
+          try {
+            const result = await window.clemmy?.updaterApply?.();
+            const applyResult = result && result.applyResult;
+            if (applyResult && applyResult.ok === false) {
+              sub.textContent = prevText;
+              sub.style.pointerEvents = '';
+              alert('Update could not be applied: ' + (applyResult.reason || 'unknown reason'));
+            }
+            // If ok=true, Electron is about to quit-and-install so the
+            // banner state doesn't matter — the renderer is going away.
+          } catch (err) {
+            sub.textContent = prevText;
+            sub.style.pointerEvents = '';
+            alert('Update apply failed: ' + ((err && err.message) || err));
+          }
+        };
       } else if (info.state === 'error') {
         suffix = ' · update check failed';
         sub.title = info.error || '';
@@ -7028,7 +7794,26 @@ const CONSOLE_JS = `
         memGraphCy.elements().removeClass('dimmed related pinned');
         memGraphPinnedNode = null;
         applyMemoryGraphFilters();
-        memGraphCy.layout({ name: 'cose', animate: false, fit: true, padding: 42, nodeRepulsion: 8000, idealEdgeLength: 80, nodeOverlap: 12, gravity: 0.25 }).run();
+        memGraphCy.layout({
+          name: 'concentric',
+          animate: true,
+          animationDuration: 360,
+          fit: true,
+          padding: 56,
+          startAngle: -Math.PI / 2,
+          sweep: Math.PI * 2,
+          equidistant: false,
+          minNodeSpacing: 26,
+          spacingFactor: 1.2,
+          avoidOverlap: true,
+          concentric: (node) => {
+            const type = node.data('type');
+            if (type === 'kind') return 3;
+            if (type === 'fact') return 2;
+            return 1;
+          },
+          levelWidth: () => 1,
+        }).run();
       });
     }
     if (mem.graphType && !mem.graphType.dataset.bound) {
@@ -7077,30 +7862,281 @@ const CONSOLE_JS = `
     });
     const viewerEl = document.querySelector('[data-mem-viewer]');
     const graphEl = document.querySelector('[data-mem-graph]');
-    if (view === 'graph') {
-      if (viewerEl) viewerEl.setAttribute('hidden', '');
-      if (graphEl) graphEl.removeAttribute('hidden');
-    } else {
-      if (graphEl) graphEl.setAttribute('hidden', '');
-      if (viewerEl) viewerEl.removeAttribute('hidden');
-    }
+    const meetingsEl = document.querySelector('[data-mem-meetings]');
+    [viewerEl, graphEl, meetingsEl].forEach((el) => el && el.setAttribute('hidden', ''));
+    if (view === 'graph' && graphEl) graphEl.removeAttribute('hidden');
+    else if (view === 'meetings' && meetingsEl) meetingsEl.removeAttribute('hidden');
+    else if (viewerEl) viewerEl.removeAttribute('hidden');
   }
 
   function activateMemoryView(view) {
     switchMemoryView(view);
-    if (view !== 'graph') return;
-    wireMemoryGraphControls();
-    if (!memGraphLoaded) {
-      memGraphLoaded = true;
-      loadMemoryGraph();
-    } else if (memGraphCy) {
-      // Refit on tab show — Cytoscape needs a resize hint when
-      // the canvas was hidden during init.
-      memGraphCy.resize();
-      memGraphCy.fit(undefined, 40);
+    if (view === 'graph') {
+      wireMemoryGraphControls();
+      if (!memGraphLoaded) {
+        memGraphLoaded = true;
+        loadMemoryGraph();
+      } else if (memGraphCy) {
+        memGraphCy.resize();
+        memGraphCy.fit(undefined, 40);
+      }
+      return;
+    }
+    if (view === 'meetings') {
+      wireMemoryMeetingsControls();
+      loadMemoryMeetings();
     }
   }
   window.__clementineMemoryView = activateMemoryView;
+
+  // ─── Memory · Meetings sub-view ──────────────────────────────
+  let memMeetingsBound = false;
+  let memMeetingsCache = [];
+  let memMeetingsSelected = null;
+
+  function wireMemoryMeetingsControls() {
+    if (memMeetingsBound) return;
+    memMeetingsBound = true;
+    const refresh = document.querySelector('[data-mem-meetings-refresh]');
+    refresh?.addEventListener('click', () => loadMemoryMeetings());
+  }
+
+  function platformClass(platform) {
+    const p = String(platform || '').toLowerCase();
+    if (p.includes('zoom')) return 'zoom';
+    if (p.includes('meet') || p.includes('google')) return 'meet';
+    if (p.includes('teams') || p.includes('microsoft')) return 'teams';
+    return '';
+  }
+
+  function fmtMeetingDuration(seconds) {
+    if (!seconds || !Number.isFinite(seconds)) return '—';
+    const m = Math.max(1, Math.round(seconds / 60));
+    if (m < 60) return m + ' min';
+    const h = Math.floor(m / 60);
+    const r = m - h * 60;
+    return h + 'h ' + (r < 10 ? '0' : '') + r + 'm';
+  }
+
+  function fmtMeetingDate(iso) {
+    if (!iso) return '—';
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return iso;
+    return d.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+  }
+
+  function renderLiveMeetingCard() {
+    const live = (window.__clementineLiveMeeting || {});
+    if (!live.activeWindow) return '';
+    const win = live.activeWindow;
+    const segments = Array.isArray(live.segments) ? live.segments : [];
+    const segmentsHtml = segments.length === 0
+      ? '<div class="mem-meeting-live-empty">Waiting for the first transcript segment…</div>'
+      : segments.map((s) => {
+          const speaker = s.speaker || '';
+          return '<div class="meeting-segment">' +
+            (speaker ? '<span class="meeting-segment-speaker">' + escMem(speaker) + '</span>' : '') +
+            escMem(s.text || '') +
+            '</div>';
+        }).join('');
+    return [
+      '<div class="mem-meeting-live" data-mem-meeting-live>',
+      '  <div class="mem-meeting-live-head">',
+      '    <span class="meeting-dot recording"></span>',
+      '    <div class="mem-meeting-live-titles">',
+      '      <span class="mem-meeting-live-tag">RECORDING NOW · ' + escMem((win.platform || 'meeting').toUpperCase()) + '</span>',
+      '      <span class="mem-meeting-live-title" title="' + escMem(win.title || win.windowId || '') + '">' + escMem(win.title || '(untitled meeting)') + '</span>',
+      '    </div>',
+      '    <span class="mem-meeting-live-elapsed" data-mem-meeting-live-elapsed>00:00</span>',
+      '  </div>',
+      '  <div class="mem-meeting-live-body" data-mem-meeting-live-body>' + segmentsHtml + '</div>',
+      '  <div class="mem-meeting-live-foot">',
+      '    <button type="button" class="meeting-btn primary" data-mem-meeting-live-stop>STOP RECORDING</button>',
+      '    <span class="mem-meeting-live-hint">Live transcript · segments stream as they finalize</span>',
+      '  </div>',
+      '</div>',
+    ].join('');
+  }
+
+  function wireLiveMeetingCardActions() {
+    const stopBtn = document.querySelector('[data-mem-meeting-live-stop]');
+    if (!stopBtn || stopBtn.dataset.bound) return;
+    stopBtn.dataset.bound = '1';
+    stopBtn.addEventListener('click', async () => {
+      if (!window.clemmy || !window.clemmy.recallStop) return;
+      try { await window.clemmy.recallStop(); }
+      catch (err) { alert('Stop failed: ' + (err && err.message ? err.message : String(err))); }
+    });
+  }
+
+  async function loadMemoryMeetings() {
+    const list = document.querySelector('[data-mem-meetings-list]');
+    const meta = document.querySelector('[data-mem-meetings-meta]');
+    if (!list) return;
+    try {
+      const data = await fetchJSON('/api/console/meetings/recall/recent?limit=50');
+      const meetings = data.meetings || [];
+      memMeetingsCache = meetings;
+      const liveCard = renderLiveMeetingCard();
+      const haveLive = liveCard !== '';
+      if (meta) meta.textContent = (haveLive ? '1 live · ' : '') + meetings.length + ' captured';
+      if (meetings.length === 0 && !haveLive) {
+        list.innerHTML = [
+          '<div class="mem-meetings-empty">',
+          '— no meetings captured yet. Start a Zoom / Meet / Teams call with Recall enabled and the transcript will land here. —',
+          '</div>',
+        ].join('');
+        renderMemoryMeetingDetail(null);
+        return;
+      }
+      list.innerHTML = liveCard + meetings.map((m) => {
+        const cls = memMeetingsSelected === m.id ? 'mem-meeting-row selected' : 'mem-meeting-row';
+        const platform = m.platform || 'meeting';
+        const statusLabel = m.status === 'recording' ? 'RECORDING'
+          : m.hasAnalysis ? 'ANALYSIS READY'
+          : m.status === 'completed' ? 'ANALYSIS PENDING'
+          : (m.status || 'unknown').toUpperCase();
+        const statusCls = m.status === 'recording' ? 'recording'
+          : m.hasAnalysis ? 'analysis-ready'
+          : m.status === 'completed' ? 'analysis-pending'
+          : '';
+        return [
+          '<div class="' + cls + '" data-mem-meeting-id="' + escMem(m.id) + '">',
+          '  <div class="mem-meeting-row-head">',
+          '    <span class="mem-meeting-platform ' + platformClass(platform) + '">' + escMem(platform) + '</span>',
+          '    <span class="mem-meeting-status ' + statusCls + '">' + escMem(statusLabel) + '</span>',
+          '  </div>',
+          '  <div class="mem-meeting-row-title" title="' + escMem(m.title || m.windowId) + '">' + escMem(m.title || '(untitled meeting)') + '</div>',
+          '  <div class="mem-meeting-row-meta">' + fmtMeetingDate(m.startedAt) + ' · ' + fmtMeetingDuration(m.durationSeconds) + ' · ' + (m.segmentCount || 0) + ' segments</div>',
+          '</div>',
+        ].join('');
+      }).join('');
+      Array.from(list.querySelectorAll('[data-mem-meeting-id]')).forEach((row) => {
+        row.addEventListener('click', () => {
+          const id = row.getAttribute('data-mem-meeting-id');
+          memMeetingsSelected = id;
+          Array.from(list.querySelectorAll('.mem-meeting-row')).forEach((el) => el.classList.toggle('selected', el === row));
+          loadMemoryMeetingDetail(id);
+        });
+      });
+      wireLiveMeetingCardActions();
+      if (memMeetingsSelected && meetings.some((m) => m.id === memMeetingsSelected)) {
+        loadMemoryMeetingDetail(memMeetingsSelected);
+      }
+    } catch (err) {
+      list.innerHTML = '<div class="mem-meetings-empty" style="color:var(--accent-fail);">Failed to load meetings: ' + escMem(err.message || err) + '</div>';
+    }
+  }
+
+  async function loadMemoryMeetingDetail(meetingId) {
+    const detail = document.querySelector('[data-mem-meetings-detail]');
+    if (!detail || !meetingId) return;
+    detail.innerHTML = '<div class="mem-meetings-detail-empty">Loading…</div>';
+    try {
+      const data = await fetchJSON('/api/console/meetings/recall/' + encodeURIComponent(meetingId));
+      renderMemoryMeetingDetail(data);
+    } catch (err) {
+      detail.innerHTML = '<div class="mem-meetings-detail-empty" style="color:var(--accent-fail);">Failed: ' + escMem(err.message || err) + '</div>';
+    }
+  }
+
+  function renderMemoryMeetingDetail(data) {
+    const detail = document.querySelector('[data-mem-meetings-detail]');
+    if (!detail) return;
+    if (!data || !data.record) {
+      detail.innerHTML = '<div class="mem-meetings-detail-empty">Pick a meeting on the left to see its summary, action items, and transcript.</div>';
+      return;
+    }
+    const rec = data.record;
+    const analysis = data.analysis;
+    const platform = rec.platform || 'meeting';
+    const lines = [];
+    lines.push('<div class="mem-meeting-detail">');
+    lines.push('<h3>' + escMem(rec.title || '(untitled meeting)') + '</h3>');
+    lines.push('<div class="mem-meeting-detail-meta">');
+    lines.push('<span><strong>' + escMem(platform).toUpperCase() + '</strong></span>');
+    lines.push('<span>' + fmtMeetingDate(rec.startedAt) + '</span>');
+    if (rec.endedAt) {
+      const dur = (Date.parse(rec.endedAt) - Date.parse(rec.startedAt)) / 1000;
+      lines.push('<span>' + fmtMeetingDuration(dur) + '</span>');
+    }
+    lines.push('<span>' + (rec.segments?.length || 0) + ' segments</span>');
+    lines.push('</div>');
+
+    lines.push('<div class="mem-meeting-detail-actions">');
+    if (rec.artifactPath) {
+      lines.push('<button data-meeting-action="transcript" data-path="' + escMem(rec.artifactPath) + '">OPEN TRANSCRIPT</button>');
+    }
+    lines.push('<button class="primary" data-meeting-action="send-summary" data-id="' + escMem(rec.id) + '">SUMMARIZE IN CHAT</button>');
+    lines.push('</div>');
+
+    if (analysis) {
+      if (analysis.summary) {
+        lines.push('<h4>Summary</h4>');
+        lines.push('<p>' + escMem(analysis.summary) + '</p>');
+      }
+      if (Array.isArray(analysis.actionItems) && analysis.actionItems.length > 0) {
+        lines.push('<h4>Action items</h4><ul>');
+        for (const a of analysis.actionItems) {
+          const owner = a.owner ? '<strong>' + escMem(a.owner) + ':</strong> ' : '';
+          const due = a.dueDate ? ' <span style="color:var(--fg-3);">(by ' + escMem(a.dueDate) + ')</span>' : '';
+          lines.push('<li>' + owner + escMem(a.text || '') + due + '</li>');
+        }
+        lines.push('</ul>');
+      }
+      if (Array.isArray(analysis.decisions) && analysis.decisions.length > 0) {
+        lines.push('<h4>Decisions</h4><ul>');
+        for (const d of analysis.decisions) lines.push('<li>' + escMem(d) + '</li>');
+        lines.push('</ul>');
+      }
+      if (Array.isArray(analysis.topics) && analysis.topics.length > 0) {
+        lines.push('<h4>Topics</h4>');
+        lines.push('<p>' + analysis.topics.map((t) => '<span class="mem-meeting-platform" style="margin-right:6px;">' + escMem(t) + '</span>').join('') + '</p>');
+      }
+      if (Array.isArray(analysis.participants) && analysis.participants.length > 0) {
+        lines.push('<h4>Participants</h4>');
+        lines.push('<p>' + analysis.participants.map(escMem).join(' · ') + '</p>');
+      }
+    } else if (rec.status === 'completed') {
+      lines.push('<div class="mem-meeting-detail-pending">Analysis pending · the background agent will fill this in shortly</div>');
+    }
+    lines.push('</div>');
+    detail.innerHTML = lines.join('');
+
+    // Wire up the action buttons.
+    Array.from(detail.querySelectorAll('[data-meeting-action]')).forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const action = btn.getAttribute('data-meeting-action');
+        if (action === 'transcript') {
+          const p = btn.getAttribute('data-path');
+          if (!p) return;
+          switchMemoryView('viewer');
+          try { await loadFileViewer(p); } catch (_) {}
+        } else if (action === 'send-summary') {
+          const id = btn.getAttribute('data-id');
+          if (!id) return;
+          try {
+            const fresh = await fetchJSON('/api/console/meetings/recall/' + encodeURIComponent(id));
+            const a = fresh.analysis;
+            let msg;
+            if (a && a.summary) {
+              const parts = ['Meeting summary:', '', a.summary];
+              if (Array.isArray(a.actionItems) && a.actionItems.length > 0) {
+                parts.push('', 'Action items:');
+                for (const x of a.actionItems) parts.push('- ' + (x.owner ? x.owner + ': ' : '') + x.text);
+              }
+              msg = parts.join('\\n');
+            } else {
+              msg = 'Captured meeting transcript is at ' + (fresh.record?.artifactPath || '(path unknown)') + '. Read it and give me the summary + action items.';
+            }
+            await sendHomeChat(msg);
+          } catch (err) {
+            alert('Send summary failed: ' + (err && err.message ? err.message : String(err)));
+          }
+        }
+      });
+    });
+  }
 
   async function loadMemoryGraph(options = {}) {
     const canvas = document.querySelector('[data-mem-graph-canvas]');
@@ -7114,8 +8150,25 @@ const CONSOLE_JS = `
       const data = await fetchJSON('/api/console/memory/graph');
       memGraphData = data;
       if (!data.nodes || data.nodes.length === 0) {
-        canvas.innerHTML = '<div class="mem-empty" style="padding:24px;">— no facts or files indexed yet. Memory needs some signal first. Chat, meeting transcripts, and vault notes will grow this graph. —</div>';
-        if (mem.graphMeta) mem.graphMeta.textContent = '0 nodes';
+        // Empty-state card — kept inside the canvas so the starfield
+        // backdrop reads, with a brand-aligned visual so the section
+        // doesn't feel like an "error" panel.
+        canvas.innerHTML = [
+          '<div class="mem-graph-empty">',
+          '  <div class="mem-graph-empty-ring"></div>',
+          '  <h4>NOTHING TO ORBIT YET</h4>',
+          '  <p>Memory grows as Clementine works. Chat, meeting transcripts, and vault notes seed the kinds; cross-references make the web denser. Come back after a few sessions.</p>',
+          '</div>',
+        ].join('');
+        if (mem.graphMeta) mem.graphMeta.textContent = '0 nodes · 0 links';
+        const hint = document.querySelector('[data-mem-graph-sparse-hint]');
+        if (hint) hint.setAttribute('hidden', '');
+        const legendKinds = document.querySelector('[data-mem-legend-kinds]');
+        const legendFacts = document.querySelector('[data-mem-legend-facts]');
+        const legendFiles = document.querySelector('[data-mem-legend-files]');
+        if (legendKinds) legendKinds.textContent = '0';
+        if (legendFacts) legendFacts.textContent = '0';
+        if (legendFiles) legendFiles.textContent = '0';
         return;
       }
       if (options.force && memGraphCy) {
@@ -7131,6 +8184,18 @@ const CONSOLE_JS = `
       const fg2 = css.getPropertyValue('--fg-2').trim() || '#a0a0aa';
       const bg0 = css.getPropertyValue('--bg-0').trim() || '#07070a';
 
+      // Concentric layout rings the graph as kind clusters in the
+      // middle, facts in a mid orbit, files on the outer edge — gives
+      // sparse graphs a structured shape instead of a horizontal
+      // scatter, and reads as "facts cluster around the topics they
+      // belong to" which is what the data actually represents.
+      const concentricLevel = (node) => {
+        const type = node.data('type');
+        if (type === 'kind') return 3;
+        if (type === 'fact') return 2;
+        return 1; // file
+      };
+
       memGraphCy = window.cytoscape({
         container: canvas,
         elements: [
@@ -7144,54 +8209,157 @@ const CONSOLE_JS = `
               'background-color': fg2,
               'label': 'data(label)',
               'color': fg2,
-              'font-size': '9px',
+              'font-size': '10px',
               'font-family': 'ui-monospace, SF Mono, Menlo, monospace',
               'text-valign': 'bottom',
-              'text-margin-y': 4,
+              'text-margin-y': 6,
               'text-wrap': 'wrap',
-              'text-max-width': '140px',
-              'width': 14,
-              'height': 14,
+              'text-max-width': '120px',
+              'text-outline-color': bg0,
+              'text-outline-width': 2,
+              'text-outline-opacity': 1,
+              'width': 16,
+              'height': 16,
               'border-width': 1,
               'border-color': line,
+              'border-opacity': 0.9,
+              'transition-property': 'border-color, border-width, opacity, background-color',
+              'transition-duration': '180ms',
             },
           },
-          { selector: 'node[type = "fact"]', style: { 'background-color': accent, 'width': 12, 'height': 12 } },
-          { selector: 'node[type = "file"]', style: { 'background-color': accent3, 'width': 10, 'height': 10, 'shape': 'rectangle' } },
-          { selector: 'node[type = "kind"]', style: { 'background-color': accent2, 'width': 22, 'height': 22, 'font-size': '11px', 'font-weight': 'bold' } },
+          {
+            selector: 'node[type = "fact"]',
+            style: {
+              'background-color': accent,
+              'width': 18,
+              'height': 18,
+              'border-color': accent,
+              'border-opacity': 0.4,
+              // Faux-halo: a wide, faded border simulates a soft glow in
+              // Cytoscape's canvas renderer without overlay nodes.
+              'overlay-color': accent,
+              'overlay-opacity': 0.08,
+              'overlay-padding': 8,
+            },
+          },
+          {
+            selector: 'node[type = "file"]',
+            style: {
+              'background-color': accent3,
+              'shape': 'round-rectangle',
+              'width': 14,
+              'height': 14,
+              'border-color': accent3,
+              'border-opacity': 0.4,
+              'overlay-color': accent3,
+              'overlay-opacity': 0.06,
+              'overlay-padding': 6,
+            },
+          },
+          {
+            selector: 'node[type = "kind"]',
+            style: {
+              'background-color': accent2,
+              'width': 38,
+              'height': 38,
+              'font-size': '11px',
+              'font-weight': 'bold',
+              'color': bg0,
+              'text-valign': 'center',
+              'text-halign': 'center',
+              'text-margin-y': 0,
+              'text-outline-color': accent2,
+              'text-outline-width': 0,
+              'text-outline-opacity': 0,
+              'border-color': accent2,
+              'border-width': 2,
+              'border-opacity': 0.6,
+              // Bigger halo on kind clusters so they read as anchors.
+              'overlay-color': accent2,
+              'overlay-opacity': 0.12,
+              'overlay-padding': 14,
+            },
+          },
           {
             selector: 'edge',
             style: {
-              'width': 1,
-              'line-color': line,
+              'width': 1.2,
+              'line-color': fg2,
               'curve-style': 'bezier',
               'target-arrow-shape': 'none',
-              'opacity': 0.45,
+              'opacity': 0.55,
             },
           },
-          { selector: 'edge[type = "kind"]', style: { 'line-color': accent2, 'opacity': 0.35 } },
-          { selector: 'edge[type = "mentions"]', style: { 'line-color': accent3, 'opacity': 0.55, 'line-style': 'dashed' } },
+          {
+            selector: 'edge[type = "kind"]',
+            style: {
+              'line-color': accent2,
+              'opacity': 0.62,
+              'width': 1.4,
+              // Straight spokes so kind clusters look like anchors.
+              'curve-style': 'straight',
+            },
+          },
+          {
+            selector: 'edge[type = "mentions"]',
+            style: {
+              'line-color': accent3,
+              'opacity': 0.7,
+              'width': 1.2,
+              'line-style': 'dashed',
+              'line-dash-pattern': [4, 4],
+            },
+          },
           {
             selector: 'node:selected',
             style: {
-              'border-width': 2,
+              'border-width': 3,
               'border-color': accent,
-              'background-color': accent,
             },
           },
-          { selector: '.dimmed', style: { 'opacity': 0.14 } },
-          { selector: '.related', style: { 'opacity': 0.92, 'border-width': 2, 'border-color': accent2 } },
-          { selector: '.pinned', style: { 'border-width': 3, 'border-color': accent, 'opacity': 1 } },
+          { selector: '.dimmed', style: { 'opacity': 0.08, 'text-opacity': 0.2 } },
+          {
+            selector: '.related',
+            style: {
+              'opacity': 1,
+              'border-width': 2,
+              'border-color': accent2,
+              'border-opacity': 1,
+            },
+          },
+          {
+            selector: '.pinned',
+            style: {
+              'border-width': 3,
+              'border-color': accent,
+              'border-opacity': 1,
+              'opacity': 1,
+              'overlay-color': accent,
+              'overlay-opacity': 0.22,
+              'overlay-padding': 12,
+            },
+          },
+          {
+            selector: 'edge.related',
+            style: {
+              'opacity': 0.95,
+              'width': 1.8,
+            },
+          },
         ],
         layout: {
-          name: 'cose',
+          name: 'concentric',
           animate: false,
           fit: true,
-          padding: 40,
-          nodeRepulsion: 8000,
-          idealEdgeLength: 80,
-          nodeOverlap: 12,
-          gravity: 0.25,
+          padding: 56,
+          startAngle: -Math.PI / 2,
+          sweep: Math.PI * 2,
+          equidistant: false,
+          minNodeSpacing: 26,
+          spacingFactor: 1.2,
+          avoidOverlap: true,
+          concentric: concentricLevel,
+          levelWidth: () => 1,
         },
         wheelSensitivity: 0.2,
         boxSelectionEnabled: false,
@@ -7223,31 +8391,58 @@ const CONSOLE_JS = `
     const type = mem.graphType?.value || '';
     const query = (mem.graphSearch?.value || '').trim().toLowerCase();
     let visible = 0;
+    const visibleByType = { kind: 0, fact: 0, file: 0 };
     memGraphCy.nodes().forEach((node) => {
       const d = node.data();
       const haystack = [d.label, d.content, d.kind, d.id].filter(Boolean).join(' ').toLowerCase();
       const show = (!type || d.type === type) && (!query || haystack.includes(query));
       node.style('display', show ? 'element' : 'none');
-      if (show) visible += 1;
+      if (show) {
+        visible += 1;
+        if (visibleByType[d.type] !== undefined) visibleByType[d.type] += 1;
+      }
     });
     memGraphCy.edges().forEach((edge) => {
       const show = edge.source().style('display') !== 'none' && edge.target().style('display') !== 'none';
       edge.style('display', show ? 'element' : 'none');
     });
+
+    const edges = (memGraphData && memGraphData.edges) || [];
+    const nodes = (memGraphData && memGraphData.nodes) || [];
+    const sparse = edges.length <= Math.max(2, Math.floor(nodes.length / 3));
+
     if (mem.graphMeta && memGraphData) {
-      const edges = memGraphData.edges || [];
-      const sparse = edges.length <= Math.max(2, Math.floor((memGraphData.nodes || []).length / 3));
-      mem.graphMeta.textContent = visible + '/' + (memGraphData.nodes || []).length + ' nodes' + (sparse ? ' · sparse links' : '');
+      mem.graphMeta.textContent = visible + '/' + nodes.length + ' nodes · ' + edges.length + ' links' + (sparse ? ' · sparse' : '');
     }
+
+    // Update the legend counts so the legend doubles as a quick stats
+    // strip instead of static decoration.
+    const legendKinds = document.querySelector('[data-mem-legend-kinds]');
+    const legendFacts = document.querySelector('[data-mem-legend-facts]');
+    const legendFiles = document.querySelector('[data-mem-legend-files]');
+    if (legendKinds) legendKinds.textContent = String(visibleByType.kind);
+    if (legendFacts) legendFacts.textContent = String(visibleByType.fact);
+    if (legendFiles) legendFiles.textContent = String(visibleByType.file);
+
+    // Surface the sparse-link state as a floating hint rather than
+    // injecting copy into the detail pane on every node click.
+    const hint = document.querySelector('[data-mem-graph-sparse-hint]');
+    if (hint) {
+      if (sparse && nodes.length > 0) hint.removeAttribute('hidden');
+      else hint.setAttribute('hidden', '');
+    }
+
     if (memGraphCy) {
       memGraphCy.resize();
       const visibleElements = memGraphCy.elements().filter((el) => el.style('display') !== 'none');
-      if (visibleElements.length > 0) memGraphCy.fit(visibleElements, 42);
+      if (visibleElements.length > 0) memGraphCy.fit(visibleElements, 56);
     }
   }
 
   function highlightGraphNeighborhood(node) {
     if (!memGraphCy) return;
+    // Include connected edges in the neighborhood so the lit-up
+    // segment reads as a connected sub-graph instead of orphan nodes.
     const neighborhood = node.closedNeighborhood();
     memGraphCy.elements().addClass('dimmed').removeClass('related pinned');
     neighborhood.removeClass('dimmed').addClass('related');
@@ -7281,9 +8476,8 @@ const CONSOLE_JS = `
       const kindValue = String(d.id || '').startsWith('kind:') ? String(d.id).slice('kind:'.length) : d.label;
       body.push('<div class="mem-graph-detail-actions"><button data-graph-action="filter-kind" data-value="' + escMem(String(kindValue).toLowerCase()) + '">SHOW FACTS</button></div>');
     }
-    if (memGraphData && (memGraphData.edges || []).length <= Math.max(2, Math.floor((memGraphData.nodes || []).length / 3))) {
-      body.push('<div class="mem-graph-note">Sparse graph: most current links are kind clusters and explicit source mentions. More meeting notes, project facts, and cross-file references will make this denser.</div>');
-    }
+    // Sparse-link copy lives in the floating hint over the canvas now,
+    // not in every node detail card — keeps the inspector compact.
     detail.innerHTML = body.join('');
   }
 
@@ -7991,10 +9185,11 @@ const CONSOLE_JS = `
       '    <span class="hint">A clear description helps the agent pick the right workflow.</span>',
       '  </div>',
 
-      '  <div class="wf-field">',
-      '    <label>TRIGGER (cron expression — blank = manual only)</label>',
-      '    <input type="text" data-wf-field="triggerSchedule" value="' + escMem(d.triggerSchedule) + '" spellcheck="false" placeholder="0 9 * * 1-5" />',
-      '    <span class="hint">Five-field cron. Examples: <code>0 9 * * 1-5</code> (weekdays 9am), <code>*/15 * * * *</code> (every 15m).</span>',
+      '  <div class="wf-field wf-schedule">',
+      '    <label>SCHEDULE</label>',
+           renderSchedulePicker(d.triggerSchedule),
+      '    <input type="hidden" data-wf-field="triggerSchedule" value="' + escMem(d.triggerSchedule) + '" />',
+      '    <span class="hint" data-sched-summary>' + escMem(describeCron(d.triggerSchedule)) + '</span>',
       '  </div>',
 
       '  <div class="wf-field">',
@@ -8028,7 +9223,161 @@ const CONSOLE_JS = `
 
     wf.editor.innerHTML = head + controls + body;
     bindEditorEvents();
+    bindSchedulePicker(wf.editor);
     refreshWorkflowRuns();
+  }
+
+  const SCHED_DAY_LABELS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+  function parseScheduleToPreset(cron) {
+    const empty = { mode: 'manual', time: '09:00', days: [1, 2, 3, 4, 5], every: 15, custom: '' };
+    if (!cron || !cron.trim()) return empty;
+    // NOTE: this function lives inside the CONSOLE_JS template literal,
+    // so every backslash in a regex literal must be doubled (\\) — a
+    // single \ gets stripped at template-evaluation time. Bug shipped
+    // 2026-05-18 ("/^*/: Nothing to repeat") because /^\*\/(\d+)$/
+    // became /^*/(d+)$/ after template eval. The doubled-\\ form here
+    // is correct: at runtime the regex is /\s+/, /^\d+$/, etc.
+    const parts = cron.trim().split(new RegExp('\\s+'));
+    if (parts.length !== 5) return { ...empty, mode: 'custom', custom: cron };
+    const [min, hour, dom, mon, dow] = parts;
+    const RE_NUM = new RegExp('^\\d+$');
+    const RE_STEP = new RegExp('^\\*\\/(\\d+)$');
+    const RE_DAYS = new RegExp('^\\d(,\\d)*$');
+    const isNum = (s) => RE_NUM.test(s);
+    const everyStar = dom === '*' && mon === '*';
+    let m = min.match(RE_STEP);
+    if (m && hour === '*' && everyStar && dow === '*') {
+      return { ...empty, mode: 'every-minutes', every: parseInt(m[1], 10) };
+    }
+    m = hour.match(RE_STEP);
+    if (isNum(min) && parseInt(min, 10) === 0 && m && everyStar && dow === '*') {
+      return { ...empty, mode: 'every-hours', every: parseInt(m[1], 10) };
+    }
+    if (isNum(min) && isNum(hour) && everyStar) {
+      const time = hour.padStart(2, '0') + ':' + min.padStart(2, '0');
+      if (dow === '*') return { ...empty, mode: 'daily', time };
+      if (dow === '1-5') return { ...empty, mode: 'weekdays', time };
+      if (RE_DAYS.test(dow)) {
+        const days = dow.split(',').map(Number).filter((n) => n >= 0 && n <= 6);
+        return { ...empty, mode: 'days', time, days };
+      }
+    }
+    return { ...empty, mode: 'custom', custom: cron };
+  }
+
+  function cronFromPreset(state) {
+    if (state.mode === 'manual') return '';
+    if (state.mode === 'custom') return (state.custom || '').trim();
+    if (state.mode === 'every-minutes') {
+      const n = Math.max(1, Math.min(59, parseInt(state.every, 10) || 15));
+      return '*/' + n + ' * * * *';
+    }
+    if (state.mode === 'every-hours') {
+      const n = Math.max(1, Math.min(23, parseInt(state.every, 10) || 1));
+      return '0 */' + n + ' * * *';
+    }
+    const [hStr, mStr] = (state.time || '09:00').split(':');
+    const hour = Math.max(0, Math.min(23, parseInt(hStr, 10) || 9));
+    const min = Math.max(0, Math.min(59, parseInt(mStr, 10) || 0));
+    if (state.mode === 'daily') return min + ' ' + hour + ' * * *';
+    if (state.mode === 'weekdays') return min + ' ' + hour + ' * * 1-5';
+    if (state.mode === 'days') {
+      const days = (state.days || []).slice().sort((a, b) => a - b);
+      if (days.length === 0) return '';
+      return min + ' ' + hour + ' * * ' + days.join(',');
+    }
+    return '';
+  }
+
+  function describeCron(cron) {
+    if (!cron || !cron.trim()) return 'No schedule — runs only when manually triggered or fired from chat.';
+    const state = parseScheduleToPreset(cron);
+    if (state.mode === 'every-minutes') return 'Runs every ' + state.every + ' minutes. Cron: ' + cron;
+    if (state.mode === 'every-hours') return 'Runs every ' + state.every + ' hour' + (state.every === 1 ? '' : 's') + ' on the hour. Cron: ' + cron;
+    if (state.mode === 'daily') return 'Runs every day at ' + state.time + '. Cron: ' + cron;
+    if (state.mode === 'weekdays') return 'Runs weekdays (Mon–Fri) at ' + state.time + '. Cron: ' + cron;
+    if (state.mode === 'days') {
+      const names = state.days.map((d) => SCHED_DAY_LABELS[d]).join(', ');
+      return 'Runs ' + (names || '(no days selected)') + ' at ' + state.time + '. Cron: ' + cron;
+    }
+    return 'Custom cron: ' + cron;
+  }
+
+  function renderSchedulePicker(cron) {
+    const s = parseScheduleToPreset(cron);
+    const opt = (val, label) => '<option value="' + val + '"' + (s.mode === val ? ' selected' : '') + '>' + label + '</option>';
+    const dayChips = SCHED_DAY_LABELS.map((label, idx) => {
+      const on = s.days.includes(idx);
+      return '<button type="button" class="sched-day' + (on ? ' on' : '') + '" data-sched-day="' + idx + '">' + label + '</button>';
+    }).join('');
+    const showTime = s.mode === 'daily' || s.mode === 'weekdays' || s.mode === 'days';
+    const showEvery = s.mode === 'every-hours' || s.mode === 'every-minutes';
+    return [
+      '<div class="sched-picker" data-sched-picker>',
+      '  <select class="sched-mode" data-sched-mode>',
+      opt('manual', 'Manual only'),
+      opt('daily', 'Every day'),
+      opt('weekdays', 'Weekdays (Mon–Fri)'),
+      opt('days', 'Specific days'),
+      opt('every-hours', 'Every N hours'),
+      opt('every-minutes', 'Every N minutes'),
+      opt('custom', 'Custom cron'),
+      '  </select>',
+      '  <input type="time" class="sched-time" data-sched-time value="' + escMem(s.time || '09:00') + '"' + (showTime ? '' : ' hidden') + ' />',
+      '  <div class="sched-days" data-sched-days' + (s.mode === 'days' ? '' : ' hidden') + '>' + dayChips + '</div>',
+      '  <input type="number" class="sched-every" data-sched-every min="1" max="' + (s.mode === 'every-hours' ? '23' : '59') + '" value="' + escMem(String(s.every || (s.mode === 'every-hours' ? 1 : 15))) + '"' + (showEvery ? '' : ' hidden') + ' />',
+      '  <input type="text" class="sched-custom" data-sched-custom value="' + escMem(s.custom || cron || '') + '" placeholder="0 9 * * 1-5"' + (s.mode === 'custom' ? '' : ' hidden') + ' spellcheck="false" />',
+      '</div>',
+    ].join('');
+  }
+
+  function bindSchedulePicker(root) {
+    const picker = root.querySelector('[data-sched-picker]');
+    if (!picker) return;
+    const modeEl = picker.querySelector('[data-sched-mode]');
+    const timeEl = picker.querySelector('[data-sched-time]');
+    const daysEl = picker.querySelector('[data-sched-days]');
+    const everyEl = picker.querySelector('[data-sched-every]');
+    const customEl = picker.querySelector('[data-sched-custom]');
+    const hidden = root.querySelector('input[data-wf-field="triggerSchedule"]');
+    const summary = root.querySelector('[data-sched-summary]');
+    if (!modeEl || !hidden) return;
+    const readState = () => ({
+      mode: modeEl.value,
+      time: timeEl.value || '09:00',
+      days: Array.from(picker.querySelectorAll('[data-sched-day]'))
+        .filter((b) => b.classList.contains('on'))
+        .map((b) => parseInt(b.getAttribute('data-sched-day'), 10)),
+      every: parseInt(everyEl.value, 10) || 15,
+      custom: customEl.value || '',
+    });
+    const syncVisibility = () => {
+      const mode = modeEl.value;
+      const showTime = mode === 'daily' || mode === 'weekdays' || mode === 'days';
+      timeEl.hidden = !showTime;
+      daysEl.hidden = mode !== 'days';
+      everyEl.hidden = !(mode === 'every-hours' || mode === 'every-minutes');
+      everyEl.max = mode === 'every-hours' ? '23' : '59';
+      customEl.hidden = mode !== 'custom';
+    };
+    const recompute = () => {
+      const cron = cronFromPreset(readState());
+      hidden.value = cron;
+      hidden.dispatchEvent(new Event('input', { bubbles: true }));
+      if (summary) summary.textContent = describeCron(cron);
+    };
+    modeEl.addEventListener('change', () => { syncVisibility(); recompute(); });
+    timeEl.addEventListener('input', recompute);
+    everyEl.addEventListener('input', recompute);
+    customEl.addEventListener('input', recompute);
+    picker.querySelectorAll('[data-sched-day]').forEach((btn) => {
+      btn.addEventListener('click', (e) => {
+        e.preventDefault();
+        btn.classList.toggle('on');
+        recompute();
+      });
+    });
   }
 
   function renderInputsList(inputs) {
@@ -9083,40 +10432,172 @@ const CONSOLE_JS = `
   }
 
   // ─── Skills panel ─────────────────────────────────────────────
+  //
+  // Manages SKILL.md format skills (Anthropic Skills spec): folders
+  // with SKILL.md (YAML frontmatter + markdown body) that load into
+  // the agent's context on demand. Install from GitHub; uninstall
+  // here. Lives in ~/.clementine-next/skills/.
+
+  let skillsInstallPollTimer = null;
 
   async function bootSkillsPanel() {
-    const dirEl   = document.querySelector('[data-skills-dir]');
-    const cntEl   = document.querySelector('[data-skills-count]');
-    const tcntEl  = document.querySelector('[data-skills-tool-count]');
-    const gridEl  = document.querySelector('[data-skills-grid]');
+    const dirEl    = document.querySelector('[data-skills-dir]');
+    const cntEl    = document.querySelector('[data-skills-count]');
+    const gridEl   = document.querySelector('[data-skills-grid]');
+    const urlInput = document.querySelector('[data-skills-install-url]');
+    const runBtn   = document.querySelector('[data-skills-install-run]');
+    const statusEl = document.querySelector('[data-skills-install-status]');
+
+    if (runBtn && !runBtn.dataset.bound) {
+      runBtn.dataset.bound = '1';
+      runBtn.addEventListener('click', async () => {
+        const url = (urlInput?.value || '').trim();
+        if (!url) { alert('Paste a GitHub repo URL first.'); return; }
+        await startSkillInstall(url, statusEl, runBtn);
+      });
+    }
+    if (urlInput && !urlInput.dataset.bound) {
+      urlInput.dataset.bound = '1';
+      urlInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); runBtn?.click(); }
+      });
+    }
+
+    await refreshSkillsList(gridEl, cntEl, dirEl);
+  }
+
+  async function refreshSkillsList(gridEl, cntEl, dirEl) {
+    if (!gridEl) return;
     try {
       const data = await fetchJSON('/api/console/skills');
-      if (data.pluginsDir) dirEl.textContent = data.pluginsDir;
-      const plugins = data.plugins || [];
-      cntEl.textContent = plugins.length;
-      tcntEl.textContent = plugins.reduce((s, p) => s + (p.toolCount || 0), 0);
-      if (plugins.length === 0) {
-        gridEl.innerHTML =
-          '<div class="tools-empty">— no skills installed —<br>'
-        + '<span style="color:var(--fg-mute);font-size:10px;letter-spacing:0.06em;">Drop a folder with index.js into '
-        + escMem(data.pluginsDir || '') + ' to install one. Use the plugin install command or build your own.</span></div>';
+      if (dirEl && data.skillsDir) dirEl.textContent = data.skillsDir;
+      const skills = data.skills || [];
+      if (cntEl) cntEl.textContent = skills.length;
+      if (skills.length === 0) {
+        gridEl.innerHTML = [
+          '<div class="tools-empty">— no skills installed —<br>',
+          '<span style="color:var(--fg-mute);font-size:10px;letter-spacing:0.06em;">',
+          'Paste a public GitHub repo URL above. Try <code>Leonxlnx/taste-skill</code> to start — it ships 12 design skills in one repo.',
+          '</span></div>',
+        ].join('');
         return;
       }
-      gridEl.innerHTML = plugins.map((p) => [
-        '<div class="skill-card">',
-        '  <div class="skill-head">',
-        '    <span class="skill-name">' + escMem(p.name) + '</span>',
-        p.version ? '    <span class="skill-version">v' + escMem(p.version) + '</span>' : '',
-        '  </div>',
-        p.description ? '  <div class="skill-desc">' + escMem(p.description) + '</div>' : '',
-        '  <div class="skill-tools-head"><span>TOOLS</span><em>' + (p.toolCount || 0) + '</em></div>',
-        '  <div class="skill-tools">',
-           (p.tools || []).map((t) => '<span class="skill-tool-pill" title="' + escMem(t.description || '') + '">' + escMem(t.name) + '</span>').join('') || '<span style="color:var(--fg-mute);font-size:10px;">(no tools)</span>',
-        '  </div>',
-        '</div>',
-      ].join('')).join('');
+      gridEl.innerHTML = skills.map((s) => {
+        const sourceLine = s.source && s.source.repo
+          ? '<div class="skill-desc" style="color:var(--fg-3);font-size:10px;">from ' + escMem(s.source.repo) + (s.source.sha ? ' @ ' + escMem(s.source.sha.slice(0, 7)) : '') + '</div>'
+          : '';
+        const extras = [
+          s.hasScripts ? '<span class="skill-tool-pill">scripts/</span>' : '',
+          s.hasReferences ? '<span class="skill-tool-pill">references/</span>' : '',
+        ].filter(Boolean).join('');
+        const display = s.displayName && s.displayName !== s.name ? s.displayName : s.name;
+        return [
+          '<div class="skill-card" data-skill-name="' + escMem(s.name) + '">',
+          '  <div class="skill-head">',
+          '    <span class="skill-name">' + escMem(display) + '</span>',
+          '    <button class="skill-uninstall" data-skill-uninstall="' + escMem(s.name) + '" title="Uninstall">UNINSTALL</button>',
+          '  </div>',
+          s.description ? '  <div class="skill-desc">' + escMem(s.description) + '</div>' : '',
+          sourceLine,
+          extras ? '  <div class="skill-tools">' + extras + '</div>' : '',
+          '</div>',
+        ].join('');
+      }).join('');
+
+      gridEl.querySelectorAll('[data-skill-uninstall]').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          const name = btn.getAttribute('data-skill-uninstall');
+          if (!confirm('Uninstall skill "' + name + '"? The folder will be deleted.')) return;
+          btn.disabled = true;
+          btn.textContent = 'REMOVING…';
+          try {
+            const r = await fetch(withToken('/api/console/skills/' + encodeURIComponent(name)), { method: 'DELETE' });
+            if (!r.ok) {
+              const j = await r.json().catch(() => ({}));
+              alert('Uninstall failed: ' + (j.error || r.status));
+            }
+            await refreshSkillsList(gridEl, cntEl, dirEl);
+          } catch (err) {
+            alert('Uninstall failed: ' + (err.message || err));
+          }
+        });
+      });
     } catch (err) {
       gridEl.innerHTML = '<div class="tools-empty">— failed: ' + escMem(err.message || err) + ' —</div>';
+    }
+  }
+
+  async function startSkillInstall(url, statusEl, runBtn) {
+    if (skillsInstallPollTimer) { clearInterval(skillsInstallPollTimer); skillsInstallPollTimer = null; }
+    if (statusEl) {
+      statusEl.hidden = false;
+      statusEl.textContent = 'Queuing install…';
+    }
+    if (runBtn) { runBtn.disabled = true; runBtn.textContent = 'INSTALLING…'; }
+    try {
+      const r = await fetch(withToken('/api/console/skills/install'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url }),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        if (statusEl) statusEl.textContent = 'Error: ' + (j.error || r.status);
+        return;
+      }
+      const jobId = j.job?.id;
+      if (!jobId) {
+        if (statusEl) statusEl.textContent = 'Install kicked off but no job id returned.';
+        return;
+      }
+      // Poll until terminal.
+      skillsInstallPollTimer = setInterval(async () => {
+        try {
+          const pollR = await fetch(withToken('/api/console/skills/install/' + encodeURIComponent(jobId)));
+          const pollJ = await pollR.json().catch(() => ({}));
+          if (!pollR.ok) {
+            if (statusEl) statusEl.textContent = 'Status check failed: ' + (pollJ.error || pollR.status);
+            clearInterval(skillsInstallPollTimer);
+            skillsInstallPollTimer = null;
+            return;
+          }
+          const job = pollJ.job || {};
+          if (statusEl) statusEl.textContent = (job.output || '').slice(-1500);
+          if (job.status === 'succeeded' || job.status === 'failed') {
+            clearInterval(skillsInstallPollTimer);
+            skillsInstallPollTimer = null;
+            if (runBtn) { runBtn.disabled = false; runBtn.textContent = 'INSTALL FROM GITHUB'; }
+            const gridEl = document.querySelector('[data-skills-grid]');
+            const cntEl = document.querySelector('[data-skills-count]');
+            const dirEl = document.querySelector('[data-skills-dir]');
+            await refreshSkillsList(gridEl, cntEl, dirEl);
+            // Reset the install form so the user can paste another URL
+            // without clearing the field by hand. Success briefly shows a
+            // confirmation, then collapses the log; failures keep the log
+            // visible so the user can read why it broke.
+            const urlInput = document.querySelector('[data-skills-install-url]');
+            if (job.status === 'succeeded') {
+              if (urlInput) {
+                urlInput.value = '';
+                try { urlInput.focus(); } catch (_) { /* noop */ }
+              }
+              const installedNames = (job.installed || []).map((x) => x.name);
+              if (statusEl) {
+                const n = installedNames.length;
+                statusEl.textContent = n > 0
+                  ? '✓ Installed ' + n + ' skill' + (n === 1 ? '' : 's') + ': ' + installedNames.slice(0, 6).join(', ') + (n > 6 ? ' + ' + (n - 6) + ' more' : '') + '. Paste another URL to install more.'
+                  : '✓ Done.';
+                setTimeout(() => { if (statusEl) statusEl.hidden = true; }, 6000);
+              }
+            }
+          }
+        } catch (err) {
+          if (statusEl) statusEl.textContent = 'Status check error: ' + (err.message || err);
+        }
+      }, 750);
+    } catch (err) {
+      if (statusEl) statusEl.textContent = 'Network error: ' + (err.message || err);
+      if (runBtn) { runBtn.disabled = false; runBtn.textContent = 'INSTALL FROM GITHUB'; }
     }
   }
 
@@ -9164,19 +10645,11 @@ const CONSOLE_JS = `
         await sendHomeChat(text);
       });
     }
-    // Wire the 0.3 harness toggle. Persisted in localStorage; flipping
-    // it clears the current harness session so the next message starts
-    // a fresh conversation rather than continuing one mid-tool.
-    const harnessToggle = document.querySelector('[data-home-chat-harness-toggle]');
-    if (harnessToggle) {
-      try { harnessToggle.checked = harnessModeOn(); } catch (_) {}
-      harnessToggle.addEventListener('change', () => {
-        try {
-          localStorage.setItem('clementine.useHarness', harnessToggle.checked ? '1' : '0');
-        } catch (_) {}
-        __harnessSessionId = null;
-      });
-    }
+    // 0.3 harness toggle removed — harness is the default chat runtime
+    // now. The localStorage key clementine.useHarness stays as a
+    // debug-only escape hatch (set to "0" to force legacy v0.2 chat),
+    // but there is no user-visible control. See harnessModeOn().
+
     // Auto-send when the user clicks a suggested prompt.
     document.querySelectorAll('[data-home-chat-suggest]').forEach((btn) => {
       btn.addEventListener('click', async () => {
@@ -9267,7 +10740,13 @@ const CONSOLE_JS = `
   let __harnessSessionId = null;
 
   function harnessModeOn() {
-    try { return localStorage.getItem('clementine.useHarness') === '1'; } catch (_) { return false; }
+    // Harness is the default chat runtime as of 0.3. The localStorage
+    // key is kept ONLY as an escape hatch: explicitly setting it to "0"
+    // forces the legacy v0.2 path for debugging. Anything else (unset,
+    // "1", anything) routes through the harness — which is what the
+    // user-visible UI was supposed to do all along. The opt-in toggle
+    // it used to live behind has been retired.
+    try { return localStorage.getItem('clementine.useHarness') !== '0'; } catch (_) { return true; }
   }
 
   /**
@@ -9317,6 +10796,7 @@ const CONSOLE_JS = `
       setChatTurnStatus(assistantTurn, 'failed');
       return { ok: false };
     } finally {
+      assistantTurn?.classList.remove('pending');
       if (send) { send.removeAttribute('disabled'); send.textContent = 'SEND ↵'; }
     }
   }
@@ -9350,8 +10830,17 @@ const CONSOLE_JS = `
         renderHarnessEvent(ev, turn, options);
         if (ev.type === 'conversation_completed') {
           const summary = (ev.data && ev.data.summary) || '';
-          if (summary) setChatTurnText(turn, summary);
           const reason = ev.data && ev.data.reason;
+          const existing = turn?.querySelector?.('[data-home-chat-turn-text]')?.textContent || '';
+          if (summary) {
+            setChatTurnText(turn, summary);
+          } else if (!existing) {
+            // No final summary and no intermediate text — fall back to a
+            // human-readable reason so the bubble isn't visually blank.
+            setChatTurnText(turn, reason === 'no_structured_output'
+              ? '(Finished without a written reply.)'
+              : '(Done.)');
+          }
           setChatTurnStatus(turn, reason === 'abandoned_by_orchestrator' ? 'abandoned' : 'complete');
           finish();
         } else if (ev.type === 'run_failed') {
@@ -9622,7 +11111,283 @@ const CONSOLE_JS = `
     assistantTranscript: '',
     handledCalls: new Set(),
     focus: false,
+    // Audio-reactive mouth — created when the remote audio track lands.
+    audioCtx: null,
+    analyser: null,
+    analyserData: null,
+    mouthRaf: 0,
+    mouthSmoothed: 0,
+    haloSmoothed: 0,
+    // Wake-word listener — independent of the Realtime session.
+    wakeRecognizer: null,
+    wakeActive: false,
+    wakeRestartTimer: 0,
   };
+
+  /**
+   * Drive the dog's mouth + halo from the remote audio track. Called
+   * once when WebRTC delivers the assistant's audio stream; runs a
+   * rAF loop that updates two CSS custom properties on the orb
+   * button: --mouth-open (0..1) and --halo-strength (0..1).
+   *
+   * Smoothing uses asymmetric attack/release so the mouth snaps open
+   * with speech onsets but closes smoothly when the syllable ends —
+   * matches how a real mouth moves.
+   */
+  function startMouthDriver(remoteStream) {
+    const orb = document.querySelector('[data-home-voice-toggle]');
+    if (!orb || !remoteStream) return;
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      if (!liveVoiceState.audioCtx || liveVoiceState.audioCtx.state === 'closed') {
+        liveVoiceState.audioCtx = new AC();
+      }
+      const ctx = liveVoiceState.audioCtx;
+      if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+      const source = ctx.createMediaStreamSource(remoteStream);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 512;
+      analyser.smoothingTimeConstant = 0.45;
+      source.connect(analyser);
+      liveVoiceState.analyser = analyser;
+      liveVoiceState.analyserData = new Uint8Array(analyser.frequencyBinCount);
+      cancelAnimationFrame(liveVoiceState.mouthRaf);
+
+      const ATTACK = 0.55;   // how fast the mouth opens
+      const RELEASE = 0.18;  // how fast it closes
+      const NOISE_FLOOR = 0.05;
+
+      const tick = () => {
+        if (!liveVoiceState.analyser) return;
+        analyser.getByteTimeDomainData(liveVoiceState.analyserData);
+        // RMS amplitude across the time-domain frame, mapped to 0..1.
+        let sum = 0;
+        for (let i = 0; i < liveVoiceState.analyserData.length; i += 1) {
+          const v = (liveVoiceState.analyserData[i] - 128) / 128;
+          sum += v * v;
+        }
+        const rms = Math.sqrt(sum / liveVoiceState.analyserData.length);
+        const lifted = Math.max(0, (rms - NOISE_FLOOR) / (1 - NOISE_FLOOR));
+        // Non-linear curve so quiet TTS still moves the mouth.
+        const target = Math.min(1, Math.pow(lifted, 0.5) * 1.4);
+        const prev = liveVoiceState.mouthSmoothed;
+        const rate = target > prev ? ATTACK : RELEASE;
+        liveVoiceState.mouthSmoothed = prev + (target - prev) * rate;
+        // Halo follows but lags the mouth slightly so the glow reads as
+        // a wash of presence rather than a flicker.
+        liveVoiceState.haloSmoothed += (target - liveVoiceState.haloSmoothed) * 0.12;
+        orb.style.setProperty('--mouth-open', liveVoiceState.mouthSmoothed.toFixed(3));
+        orb.style.setProperty('--halo-strength', liveVoiceState.haloSmoothed.toFixed(3));
+        liveVoiceState.mouthRaf = requestAnimationFrame(tick);
+      };
+      tick();
+    } catch (err) {
+      console.warn('Mouth driver init failed:', err);
+    }
+  }
+
+  /**
+   * Wake-word listener — "Hey Clementine" from anywhere in the app.
+   *
+   * Uses the browser's SpeechRecognition (webkitSpeechRecognition) for
+   * a "good-enough" v1 with zero external dependencies. This works
+   * reliably in real Chrome but is unreliable inside Electron's stock
+   * Chromium (no Google API key shipped). When unavailable we surface
+   * "unavailable" on the toggle dot so the user can see the truth
+   * instead of toggling into a dead listener.
+   *
+   * Production path: swap the engine for Picovoice Porcupine
+   * (@picovoice/porcupine-web) — offline, custom .ppn file, ~1MB
+   * model. Wire-up shape stays the same: instantiate, on detect → call
+   * onWakeWord().
+   */
+  const WAKE_PHRASES = [
+    'hey clementine', 'hi clementine', 'hey clemmy', 'hi clemmy',
+    // Common ASR mis-hearings — capture them rather than reject the
+    // turn. The agent itself can disambiguate downstream.
+    'hey clemantine', 'hey clemintine', 'hey clemmie',
+  ];
+
+  function getSpeechRecognitionCtor() {
+    // Electron blacklist: the Chromium build shipped with Electron does
+    // accept SpeechRecognition calls, but the continuous-listening
+    // pattern causes the macOS microphone privacy indicator in the menu
+    // bar to pulse on/off every time the engine restarts after a silence
+    // window. That's roughly every 5–10s, which looks broken. Picovoice
+    // Porcupine is the right always-on engine here; until that's wired,
+    // wake-word stays a browser-only feature so the desktop app doesn't
+    // turn into a mic strobe light. window.clemmy is the unambiguous
+    // marker that we're inside the Electron renderer.
+    if (typeof window !== 'undefined' && window.clemmy) return null;
+    return window.SpeechRecognition || window.webkitSpeechRecognition || null;
+  }
+
+  function transcriptContainsWake(text) {
+    if (!text) return false;
+    const lower = text.toLowerCase();
+    return WAKE_PHRASES.some((phrase) => lower.includes(phrase));
+  }
+
+  function setWakeToggleState(state) {
+    const label = document.querySelector('.home-live-wake-toggle');
+    if (label) label.setAttribute('data-wake-state', state);
+  }
+
+  function onWakeWordDetected() {
+    if (liveVoiceState.connected) return;
+    setWakeToggleState('heard');
+    // Brief visual confirmation, then start live voice. The orb itself
+    // animates as the Realtime session connects.
+    setTimeout(() => {
+      if (liveVoiceState.wakeActive) setWakeToggleState('listening');
+    }, 1200);
+    startHomeVoice().catch((err) => {
+      console.warn('Wake-word startHomeVoice failed:', err);
+    });
+  }
+
+  function startWakeListener() {
+    const Ctor = getSpeechRecognitionCtor();
+    if (!Ctor) {
+      setWakeToggleState('unavailable');
+      return false;
+    }
+    if (liveVoiceState.connected) {
+      // The Realtime session owns the mic. Park the wake listener
+      // until it ends; stopHomeVoice() re-arms us.
+      setWakeToggleState('listening');
+      return true;
+    }
+    try {
+      if (liveVoiceState.wakeRecognizer) {
+        try { liveVoiceState.wakeRecognizer.stop(); } catch {}
+      }
+      const rec = new Ctor();
+      rec.continuous = true;
+      rec.interimResults = true;
+      rec.lang = 'en-US';
+      rec.maxAlternatives = 2;
+      rec.onresult = (event) => {
+        for (let i = event.resultIndex; i < event.results.length; i += 1) {
+          const alts = event.results[i];
+          for (let j = 0; j < alts.length; j += 1) {
+            const candidate = alts[j]?.transcript || '';
+            if (transcriptContainsWake(candidate)) {
+              onWakeWordDetected();
+              return;
+            }
+          }
+        }
+      };
+      rec.onerror = (event) => {
+        const reason = event && event.error;
+        if (reason === 'not-allowed' || reason === 'service-not-allowed') {
+          // Permanent failure — Electron without speech service, or
+          // user denied mic. Don't auto-restart.
+          liveVoiceState.wakeActive = false;
+          liveVoiceState.wakeRecognizer = null;
+          setWakeToggleState('unavailable');
+          const cb = document.querySelector('[data-home-voice-wake-toggle]');
+          if (cb) cb.checked = false;
+          try { localStorage.setItem('clemmy.wake', '0'); } catch {}
+          return;
+        }
+        // Transient (no-speech, network, aborted): just let onend
+        // restart us in a moment.
+      };
+      rec.onend = () => {
+        // SpeechRecognition stops itself after a window of silence.
+        // Bounce it back on if the user still has wake-word enabled
+        // and we aren't currently in a live voice call.
+        if (!liveVoiceState.wakeActive || liveVoiceState.connected) return;
+        clearTimeout(liveVoiceState.wakeRestartTimer);
+        liveVoiceState.wakeRestartTimer = setTimeout(() => {
+          if (liveVoiceState.wakeActive && !liveVoiceState.connected) startWakeListener();
+        }, 400);
+      };
+      rec.start();
+      liveVoiceState.wakeRecognizer = rec;
+      setWakeToggleState('listening');
+      return true;
+    } catch (err) {
+      console.warn('Wake-word listener failed to start:', err);
+      setWakeToggleState('unavailable');
+      return false;
+    }
+  }
+
+  function stopWakeListener() {
+    clearTimeout(liveVoiceState.wakeRestartTimer);
+    liveVoiceState.wakeRestartTimer = 0;
+    if (liveVoiceState.wakeRecognizer) {
+      try { liveVoiceState.wakeRecognizer.onend = null; } catch {}
+      try { liveVoiceState.wakeRecognizer.stop(); } catch {}
+      liveVoiceState.wakeRecognizer = null;
+    }
+    setWakeToggleState('');
+  }
+
+  function bindWakeWordToggle() {
+    const cb = document.querySelector('[data-home-voice-wake-toggle]');
+    if (!cb || cb.dataset.bound === '1') return;
+    cb.dataset.bound = '1';
+    const engineAvailable = Boolean(getSpeechRecognitionCtor());
+
+    // If the engine isn't available (Electron, no SpeechRecognition),
+    // force the toggle off + clear any stale localStorage preference so
+    // a previously-enabled flag from a different runtime can't auto-arm
+    // a non-functional listener. The label flips to "unavailable" so the
+    // user knows toggling won't help here.
+    if (!engineAvailable) {
+      cb.checked = false;
+      cb.disabled = true;
+      try { localStorage.setItem('clemmy.wake', '0'); } catch {}
+      liveVoiceState.wakeActive = false;
+      setWakeToggleState('unavailable');
+      const wrap = document.querySelector('.home-live-wake-toggle');
+      if (wrap) wrap.title = 'Wake-word ("Hey Clementine") not available in this build — needs an always-on engine like Picovoice Porcupine. Open the dashboard in a regular browser to test.';
+      cb.addEventListener('change', (e) => {
+        // Block re-enable attempts.
+        e.preventDefault();
+        cb.checked = false;
+      });
+      return;
+    }
+
+    // Restore saved preference, then auto-arm if it was on.
+    let initial = false;
+    try { initial = localStorage.getItem('clemmy.wake') === '1'; } catch {}
+    cb.checked = initial;
+    if (initial) {
+      liveVoiceState.wakeActive = true;
+      startWakeListener();
+    }
+    cb.addEventListener('change', () => {
+      liveVoiceState.wakeActive = cb.checked;
+      try { localStorage.setItem('clemmy.wake', cb.checked ? '1' : '0'); } catch {}
+      if (cb.checked) startWakeListener();
+      else stopWakeListener();
+    });
+  }
+
+  function stopMouthDriver() {
+    cancelAnimationFrame(liveVoiceState.mouthRaf);
+    liveVoiceState.mouthRaf = 0;
+    liveVoiceState.analyser = null;
+    liveVoiceState.analyserData = null;
+    liveVoiceState.mouthSmoothed = 0;
+    liveVoiceState.haloSmoothed = 0;
+    const orb = document.querySelector('[data-home-voice-toggle]');
+    if (orb) {
+      orb.style.setProperty('--mouth-open', '0');
+      orb.style.setProperty('--halo-strength', '0');
+    }
+    if (liveVoiceState.audioCtx && liveVoiceState.audioCtx.state !== 'closed') {
+      try { liveVoiceState.audioCtx.close(); } catch {}
+    }
+    liveVoiceState.audioCtx = null;
+  }
 
   function bindHomeVoiceControls() {
     const toggle = document.querySelector('[data-home-voice-toggle]');
@@ -9631,6 +11396,7 @@ const CONSOLE_JS = `
     const closeBtn = document.querySelector('[data-home-live-close]');
     const layout = document.querySelector('[data-home-layout]');
     const takeoverChrome = document.querySelector('[data-home-live-takeover]');
+    bindWakeWordToggle();
 
     function setHomeTakeover(active) {
       if (!layout) return;
@@ -9800,6 +11566,11 @@ const CONSOLE_JS = `
       return;
     }
 
+    // The Realtime call wants exclusive use of the mic. Pause the
+    // wake-word listener now; stopHomeVoice() will re-arm it if the
+    // user kept the toggle on.
+    stopWakeListener();
+
     const toggle = document.querySelector('[data-home-voice-toggle]');
     if (toggle) toggle.disabled = true;
     resetLiveVoiceFeed();
@@ -9835,6 +11606,9 @@ const CONSOLE_JS = `
       pc.ontrack = (event) => {
         audio.srcObject = event.streams[0];
         addLiveVoiceEvent('Audio stream connected.', 'event');
+        // Spin up the amplitude analyser on the same stream so the dog
+        // mouth tracks the actual TTS output rather than a fake timer.
+        startMouthDriver(event.streams[0]);
       };
       pc.onconnectionstatechange = () => {
         if (pc.connectionState === 'connected') setLiveVoiceStatus('Live voice connected. Speak naturally.', true, 'listening');
@@ -9903,6 +11677,7 @@ const CONSOLE_JS = `
     try {
       liveVoiceState.stream?.getTracks?.().forEach((track) => track.stop());
     } catch {}
+    stopMouthDriver();
     liveVoiceState.pc = null;
     liveVoiceState.dc = null;
     liveVoiceState.stream = null;
@@ -9913,6 +11688,9 @@ const CONSOLE_JS = `
     if (expand) expand.textContent = 'FOCUS';
     setLiveVoiceStatus('Voice stopped.', false, 'idle');
     addLiveVoiceEvent('Voice session stopped.', 'event');
+    // Voice ended → kick the wake-word back on if it was armed, so the
+    // user can re-trigger by voice without clicking again.
+    if (liveVoiceState.wakeActive) startWakeListener();
   }
 
   function handleRealtimeEvent(event) {
@@ -10139,6 +11917,7 @@ const CONSOLE_JS = `
       refreshHubKeys(),
       refreshHubApps(),
       refreshHubBrowserHarness(),
+      refreshHubCliCatalog(),
       refreshHubRecall(),
       refreshHubMcp(),
     ]);
@@ -10561,6 +12340,179 @@ const CONSOLE_JS = `
     } catch (err) {
       metaEl.textContent = 'error';
       listEl.innerHTML = '<div class="settings-info" style="color:var(--accent-fail);">Browser Harness: ' + escMem(err.message || err) + '</div>';
+    }
+  }
+
+  // ── CLI catalog (search-driven curated installs) ──────────────
+  let hubCliCatQuery = '';
+  let hubCliCatDebounce = 0;
+  let hubCliCatPollTimers = {};   // jobId → setInterval handle
+
+  function renderCliCatalogResults(listEl, payload) {
+    if (!listEl) return;
+    const results = (payload && payload.results) || [];
+    if (!hubCliCatQuery.trim()) {
+      listEl.innerHTML = '<div class="settings-info">Type a name above to find an installable CLI.</div>';
+      return;
+    }
+    if (results.length === 0) {
+      listEl.innerHTML = '<div class="settings-info">No catalog entry matches "' + escMem(hubCliCatQuery) + '". Try a different name — or paste an install command into the installer below.</div>';
+      return;
+    }
+    listEl.innerHTML = results.map((r) => {
+      const installed = Boolean(r.installed);
+      const pillCls = installed ? 'active' : 'available';
+      const pillText = installed ? 'INSTALLED' : 'NOT INSTALLED';
+      const actionBtn = installed
+        ? '<a href="' + escMem(r.authDocsUrl) + '" target="_blank" rel="noopener" data-cli-cat-configure="' + escMem(r.id) + '">CONFIGURE ▸</a>'
+        : '<button data-cli-cat-install="' + escMem(r.id) + '">INSTALL</button>';
+      const authLine = installed && r.authCommand
+        ? '<div class="hub-app-meta">After connect: <code>' + escMem(r.authCommand) + '</code></div>'
+        : '';
+      const installPreview = !installed
+        ? '<div class="hub-app-meta" style="color:var(--fg-3);">via <code>' + escMem(r.installCommand) + '</code></div>'
+        : '';
+      return [
+        '<div class="hub-app-card" data-cli-cat-card="' + escMem(r.id) + '">',
+        '  <div class="hub-app-name">' + escMem(r.name) + '</div>',
+        '  <span class="hub-app-pill ' + pillCls + '">' + pillText + '</span>',
+        '  <div class="hub-app-meta">' + escMem(r.vendor) + ' · <code>' + escMem(r.command) + '</code></div>',
+        '  <div class="hub-app-meta">' + escMem(r.description) + '</div>',
+        authLine,
+        installPreview,
+        '  <div class="hub-app-actions">' + actionBtn,
+        installed ? '<button class="cli-cat-forget" data-cli-cat-forget="' + escMem(r.id) + '">DISCONNECT</button>' : '',
+        '  </div>',
+        '  <div class="hub-app-meta" data-cli-cat-job-status="' + escMem(r.id) + '"></div>',
+        '</div>',
+      ].join('');
+    }).join('');
+    wireCliCatalogActions(listEl);
+  }
+
+  function renderCliCatalogConnected(connectedEl, connected) {
+    if (!connectedEl) return;
+    const entries = Object.values(connected || {});
+    if (entries.length === 0) {
+      connectedEl.innerHTML = '';
+      return;
+    }
+    connectedEl.innerHTML = [
+      '<div class="settings-info" style="margin-top:14px;">',
+      '<strong style="color:var(--accent-2);letter-spacing:0.14em;text-transform:uppercase;font-size:10px;">Connected — ' + entries.length + '</strong>',
+      '<div class="hub-cli-connected-grid">',
+      entries.map((c) => [
+        '<span class="hub-cli-connected-pill" title="' + escMem(c.vendor) + ' · linked ' + escMem(c.installedAt || '') + '">',
+        '<code>' + escMem(c.command) + '</code> · ' + escMem(c.name),
+        '</span>',
+      ].join('')).join(''),
+      '</div>',
+      '</div>',
+    ].join('');
+  }
+
+  function wireCliCatalogActions(rootEl) {
+    rootEl.querySelectorAll('[data-cli-cat-install]').forEach((btn) => {
+      if (btn.dataset.bound) return;
+      btn.dataset.bound = '1';
+      btn.addEventListener('click', async () => {
+        const id = btn.getAttribute('data-cli-cat-install');
+        if (!id) return;
+        btn.disabled = true;
+        const originalText = btn.textContent;
+        btn.textContent = 'STARTING…';
+        const statusEl = rootEl.querySelector('[data-cli-cat-job-status="' + id + '"]');
+        try {
+          const result = await fetch(withToken('/api/console/cli-catalog/install'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id }),
+          }).then((r) => r.json());
+          if (!result.job) throw new Error(result.error || 'install start failed');
+          if (statusEl) statusEl.textContent = '⏵ running: ' + result.entry.installCommand;
+          btn.textContent = 'INSTALLING…';
+          pollCliCatalogJob(id, result.job.id, btn, statusEl, originalText);
+        } catch (err) {
+          if (statusEl) statusEl.textContent = '✗ ' + (err.message || err);
+          btn.disabled = false;
+          btn.textContent = originalText;
+        }
+      });
+    });
+    rootEl.querySelectorAll('[data-cli-cat-forget]').forEach((btn) => {
+      if (btn.dataset.bound) return;
+      btn.dataset.bound = '1';
+      btn.addEventListener('click', async () => {
+        const id = btn.getAttribute('data-cli-cat-forget');
+        if (!id) return;
+        if (!confirm('Disconnect this CLI from Clementine? This only forgets the agent linkage — the binary stays installed.')) return;
+        await fetch(withToken('/api/console/cli-catalog/forget'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id }),
+        });
+        refreshHubCliCatalog();
+      });
+    });
+  }
+
+  function pollCliCatalogJob(catalogId, jobId, btn, statusEl, originalText) {
+    if (hubCliCatPollTimers[catalogId]) {
+      clearInterval(hubCliCatPollTimers[catalogId]);
+    }
+    hubCliCatPollTimers[catalogId] = setInterval(async () => {
+      try {
+        const data = await fetchJSON('/api/console/install-jobs/' + encodeURIComponent(jobId));
+        const job = data && data.job;
+        if (!job) return;
+        if (statusEl) {
+          const tail = (job.output || '').slice(-220).replace(/\s+$/, '');
+          statusEl.textContent = '· ' + job.status + (tail ? ' · ' + tail : '');
+        }
+        if (job.status === 'succeeded') {
+          clearInterval(hubCliCatPollTimers[catalogId]);
+          delete hubCliCatPollTimers[catalogId];
+          if (statusEl) statusEl.textContent = '✓ installed';
+          await refreshHubCliCatalog();
+        } else if (job.status === 'failed') {
+          clearInterval(hubCliCatPollTimers[catalogId]);
+          delete hubCliCatPollTimers[catalogId];
+          if (statusEl) statusEl.textContent = '✗ install failed (exit ' + (job.exitCode ?? '?') + ')';
+          btn.disabled = false;
+          btn.textContent = originalText;
+        }
+      } catch { /* keep polling */ }
+    }, 1500);
+  }
+
+  async function refreshHubCliCatalog() {
+    const metaEl = document.querySelector('[data-hub-cli-cat-meta]');
+    const resultsEl = document.querySelector('[data-hub-cli-cat-results]');
+    const connectedEl = document.querySelector('[data-hub-cli-cat-connected]');
+    const searchEl = document.querySelector('[data-hub-cli-cat-search]');
+    if (!resultsEl) return;
+
+    if (searchEl && !searchEl.dataset.bound) {
+      searchEl.dataset.bound = '1';
+      searchEl.addEventListener('input', () => {
+        hubCliCatQuery = searchEl.value || '';
+        clearTimeout(hubCliCatDebounce);
+        hubCliCatDebounce = setTimeout(() => { void refreshHubCliCatalog(); }, 150);
+      });
+    }
+
+    try {
+      const data = await fetchJSON('/api/console/cli-catalog?q=' + encodeURIComponent(hubCliCatQuery));
+      const connectedCount = Object.keys(data.connected || {}).length;
+      if (metaEl) {
+        metaEl.textContent = connectedCount === 0
+          ? 'no CLIs connected yet'
+          : connectedCount + ' connected';
+      }
+      renderCliCatalogResults(resultsEl, data);
+      renderCliCatalogConnected(connectedEl, data.connected || {});
+    } catch (err) {
+      resultsEl.innerHTML = '<div class="settings-info" style="color:var(--accent-fail);">Catalog: ' + escMem(err.message || err) + '</div>';
     }
   }
 
@@ -12055,6 +14007,346 @@ const CONSOLE_JS = `
     }
 
     connect();
+  })();
+
+  // ─── Meeting-capture floating layer controller ──────────────────
+  //
+  // Listens to the recall-event IPC stream from the Electron main
+  // process (window.clemmy.onRecallEvent) and drives the four UI
+  // surfaces — prompt banner, live pill, transcript drawer,
+  // completion toast — from a single state machine. Independent of
+  // the Integrations panel; visible from anywhere in the dashboard.
+  (function meetingCaptureFloating() {
+    if (!window.clemmy || !window.clemmy.onRecallEvent) return;
+
+    const prompt = document.querySelector('[data-meeting-prompt]');
+    const promptTitle = document.querySelector('[data-meeting-prompt-title]');
+    const promptSub = document.querySelector('[data-meeting-prompt-sub]');
+    const promptRecord = document.querySelector('[data-meeting-prompt-record]');
+    const promptAlways = document.querySelector('[data-meeting-prompt-always]');
+    const promptDismiss = document.querySelector('[data-meeting-prompt-dismiss]');
+
+    const pillWrap = document.querySelector('[data-meeting-pill-wrap]');
+    const pill = document.querySelector('[data-meeting-pill]');
+    const pillLabel = document.querySelector('[data-meeting-pill-label]');
+    const pillTime = document.querySelector('[data-meeting-pill-time]');
+    const pillDismiss = document.querySelector('[data-meeting-pill-dismiss]');
+
+    const toast = document.querySelector('[data-meeting-toast]');
+    const toastSub = document.querySelector('[data-meeting-toast-sub]');
+    const toastTranscript = document.querySelector('[data-meeting-toast-transcript]');
+    const toastSummary = document.querySelector('[data-meeting-toast-summary]');
+    const toastDismiss = document.querySelector('[data-meeting-toast-dismiss]');
+
+    if (!prompt || !pill || !toast) return;
+
+    // Live state is exposed on window so the Memory > Meetings panel
+    // can render the recording inline. Replaces the previous floating
+    // drawer popup with an in-window card.
+    const state = {
+      pendingWindow: null,
+      activeWindow: null,
+      activeRecordingId: null,
+      startedAt: null,
+      lastCompleted: null,
+      segments: [],
+      elapsedTimer: 0,
+    };
+    window.__clementineLiveMeeting = state;
+
+    function fmtElapsed(seconds) {
+      const s = Math.max(0, Math.floor(seconds));
+      const m = Math.floor(s / 60);
+      const r = s - m * 60;
+      return (m < 10 ? '0' : '') + m + ':' + (r < 10 ? '0' : '') + r;
+    }
+
+    function startElapsedTimer() {
+      stopElapsedTimer();
+      state.elapsedTimer = setInterval(() => {
+        if (!state.startedAt) return;
+        const seconds = (Date.now() - Date.parse(state.startedAt)) / 1000;
+        const text = fmtElapsed(seconds);
+        if (pillTime) pillTime.textContent = text;
+        // Update the inline live card's elapsed cell if the Meetings
+        // panel happens to be open. Querying every tick is cheap and
+        // avoids holding stale element references across panel switches.
+        const liveElapsedEl = document.querySelector('[data-mem-meeting-live-elapsed]');
+        if (liveElapsedEl) liveElapsedEl.textContent = text;
+      }, 1000);
+    }
+    function stopElapsedTimer() {
+      if (state.elapsedTimer) { clearInterval(state.elapsedTimer); state.elapsedTimer = 0; }
+    }
+
+    function showPrompt(win) {
+      if (state.activeWindow) return;
+      state.pendingWindow = win;
+      if (promptTitle) promptTitle.textContent = (win.platform || 'Meeting') + ' detected';
+      if (promptSub) promptSub.textContent = (win.title ? win.title + ' · ' : '') + 'Record this meeting so Clementine can transcribe + summarize it after.';
+      prompt.hidden = false;
+      toast.hidden = true;
+    }
+    function hidePrompt() {
+      prompt.hidden = true;
+      state.pendingWindow = null;
+    }
+
+    function showPill(win, startedAt) {
+      const sameWindow = state.activeWindow && state.activeWindow.windowId === win.windowId;
+      if (!sameWindow) {
+        state.activeWindow = win;
+        state.startedAt = startedAt || new Date().toISOString();
+        state.segments = [];
+      }
+      if (pillLabel) pillLabel.textContent = (win.platform || 'recording');
+      if (pillWrap) pillWrap.hidden = false;
+      hidePrompt();
+      toast.hidden = true;
+      startElapsedTimer();
+      // If the Meetings panel is open, redraw it so the live card
+      // appears at the top.
+      if (typeof loadMemoryMeetings === 'function' && !document.querySelector('[data-mem-meetings]')?.hidden) {
+        loadMemoryMeetings();
+      }
+    }
+    function hidePill() {
+      if (pillWrap) pillWrap.hidden = true;
+      stopElapsedTimer();
+      state.activeWindow = null;
+      state.activeRecordingId = null;
+      state.startedAt = null;
+      state.segments = [];
+      if (typeof loadMemoryMeetings === 'function' && !document.querySelector('[data-mem-meetings]')?.hidden) {
+        loadMemoryMeetings();
+      }
+    }
+
+    function appendSegment(segment) {
+      if (!segment || !segment.text) return;
+      state.segments.push(segment);
+      if (state.segments.length > 80) state.segments.shift();
+      // Stream into the inline live card if the Meetings panel is open.
+      const liveBody = document.querySelector('[data-mem-meeting-live-body]');
+      if (liveBody) {
+        const empty = liveBody.querySelector('.mem-meeting-live-empty');
+        if (empty) empty.remove();
+        const node = document.createElement('div');
+        node.className = 'meeting-segment';
+        const speaker = segment.speaker || '';
+        node.innerHTML = (speaker ? '<span class="meeting-segment-speaker">' + escMem(speaker) + '</span>' : '') + escMem(segment.text);
+        liveBody.appendChild(node);
+        liveBody.scrollTop = liveBody.scrollHeight;
+      }
+    }
+
+    function showToast(meetingInfo) {
+      state.lastCompleted = meetingInfo;
+      const mins = meetingInfo.durationSeconds
+        ? Math.max(1, Math.round(meetingInfo.durationSeconds / 60))
+        : null;
+      const sub = [
+        (meetingInfo.platform || 'meeting').toString().toUpperCase(),
+        meetingInfo.title ? '· ' + meetingInfo.title : '',
+        mins ? '· ' + mins + ' min' : '',
+        meetingInfo.segmentCount ? '· ' + meetingInfo.segmentCount + ' segments' : '',
+      ].filter(Boolean).join(' ');
+      if (toastSub) toastSub.textContent = sub || 'Meeting captured.';
+      toast.hidden = false;
+      hidePill();
+    }
+    function hideToast() {
+      toast.hidden = true;
+      state.lastCompleted = null;
+    }
+
+    // ── Wire up the bridge ──────────────────────────────────────
+    promptDismiss?.addEventListener('click', () => hidePrompt());
+    promptRecord?.addEventListener('click', async () => {
+      const win = state.pendingWindow;
+      if (!win || !window.clemmy.recallRecordDetected) { hidePrompt(); return; }
+      try { await window.clemmy.recallRecordDetected(win.windowId); }
+      catch (err) { alert('Could not start recording: ' + (err && err.message ? err.message : String(err))); }
+      hidePrompt();
+    });
+    promptAlways?.addEventListener('click', async () => {
+      const win = state.pendingWindow;
+      if (!win || !window.clemmy.recallAutoRecord) { hidePrompt(); return; }
+      try { await window.clemmy.recallAutoRecord(win.windowId); }
+      catch (err) { alert('Could not enable auto-record: ' + (err && err.message ? err.message : String(err))); }
+      hidePrompt();
+    });
+
+    // Pill click → navigate to Memory > Meetings panel. The live card
+    // renders inline at the top of the meetings list. No floating popup.
+    pill.addEventListener('click', () => {
+      const navMemory = document.querySelector('.nav[data-panel="memory"]');
+      if (navMemory) navMemory.click();
+      // switchMemoryView is in the IIFE scope.
+      try { if (typeof activateMemoryView === 'function') activateMemoryView('meetings'); }
+      catch (_) { /* not loaded yet */ }
+    });
+
+    toastDismiss?.addEventListener('click', () => hideToast());
+    toastTranscript?.addEventListener('click', async () => {
+      const info = state.lastCompleted;
+      if (!info?.artifactPath) { hideToast(); return; }
+      // Route to the memory viewer so the user lands on the actual
+      // markdown file with chunk view + search.
+      switchMemoryView && switchMemoryView('viewer');
+      // Trigger navigation to the memory panel.
+      const navMemory = document.querySelector('.nav[data-panel="memory"]');
+      if (navMemory) navMemory.click();
+      try {
+        await loadFileViewer(info.artifactPath);
+      } catch (_) { /* loadFileViewer may not be in scope before user navigates */ }
+      hideToast();
+    });
+    toastSummary?.addEventListener('click', async () => {
+      const info = state.lastCompleted;
+      if (!info?.meetingId) { hideToast(); return; }
+      // Try the structured analysis first; fall back to a transcript-
+      // pointer prompt so chat still has something useful.
+      let analysis = null;
+      try {
+        const data = await fetchJSON('/api/console/meetings/recall/' + encodeURIComponent(info.meetingId));
+        analysis = data.analysis || null;
+      } catch (_) { /* fall through */ }
+      let message;
+      if (analysis && analysis.summary) {
+        const parts = ['Meeting summary just landed:', '', analysis.summary];
+        if (Array.isArray(analysis.actionItems) && analysis.actionItems.length > 0) {
+          parts.push('', 'Action items:');
+          for (const a of analysis.actionItems) parts.push('- ' + (a.owner ? a.owner + ': ' : '') + a.text);
+        }
+        if (Array.isArray(analysis.decisions) && analysis.decisions.length > 0) {
+          parts.push('', 'Decisions:');
+          for (const d of analysis.decisions) parts.push('- ' + d);
+        }
+        message = parts.join('\\n');
+      } else {
+        message = 'I just captured a meeting. Transcript is at ' + (info.artifactPath || '(unknown path)') + '. Read it and tell me the summary, decisions, and action items.';
+      }
+      try { await sendHomeChat(message); }
+      catch (err) {
+        // sendHomeChat may not exist on some builds — fall back to a
+        // simple alert so the toast does *something*.
+        alert('Summary ready but chat send failed: ' + (err && err.message ? err.message : String(err)));
+      }
+      hideToast();
+    });
+
+    // Dismiss button — escape hatch for desynced state. Calls recallStop
+    // (no-op if the daemon already considers itself not-recording) and
+    // forcibly resets the local pill state so the user is unstuck.
+    pillDismiss?.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      try { await window.clemmy.recallStop?.(); } catch { /* not recording; ignore */ }
+      hidePill();
+      toast.hidden = true;
+    });
+
+    // ── Truth reconciler ────────────────────────────────────────
+    // The pill must ONLY be visible when the SDK is genuinely capturing
+    // an active call. Three checks have to all pass:
+    //   1. The user has Recall capture enabled in settings.
+    //   2. The daemon reports recording === true.
+    //   3. The current window matches one the SDK detected as a live
+    //      meeting (not a leftover "meeting client open but no call"
+    //      window) — i.e. detectedWindows contains it and its recording
+    //      flag is true.
+    // Any failure ⇒ hide the pill, reset local state. Polled every 5s.
+    async function reconcileFromRecallStatus() {
+      if (!window.clemmy || !window.clemmy.recallStatus) return;
+      let status;
+      try { status = await window.clemmy.recallStatus(); }
+      catch { return; }
+      if (!status || typeof status !== 'object') return;
+
+      const captureEnabled = Boolean(status.enabled);
+      const daemonRecording = Boolean(status.recording);
+      const currentId = status.currentWindowId || '';
+      const detected = Array.isArray(status.detectedWindows) ? status.detectedWindows : [];
+      const matchingDetected = detected.find((w) => w && w.windowId === currentId && w.recording === true);
+
+      const shouldShowPill = captureEnabled && daemonRecording && currentId && Boolean(matchingDetected);
+      const localRecording = Boolean(state.activeWindow);
+
+      if (shouldShowPill && !localRecording) {
+        // Adopt the daemon's truth — pill should appear (e.g. after a
+        // page reload mid-recording).
+        showPill({
+          windowId: currentId,
+          platform: matchingDetected.platform || status.lastMeeting?.platform,
+          title: matchingDetected.title || status.lastMeeting?.title,
+        }, status.recordingStartedAt || new Date().toISOString());
+      } else if (!shouldShowPill && localRecording) {
+        // No active capture per the SDK — pill must go, even if our
+        // local state thinks it shouldn't.
+        hidePill();
+      } else if (shouldShowPill && localRecording && state.activeWindow.windowId !== currentId) {
+        // The active window changed underneath us — re-anchor.
+        showPill({
+          windowId: currentId,
+          platform: matchingDetected.platform,
+          title: matchingDetected.title,
+        }, status.recordingStartedAt || new Date().toISOString());
+      }
+    }
+
+    // Initial sync (after a beat so the page is settled), then a
+    // gentle 5s poll. Cheap — recallStatus is a local IPC call.
+    setTimeout(() => { void reconcileFromRecallStatus(); }, 600);
+    setInterval(() => { void reconcileFromRecallStatus(); }, 5000);
+
+    // ── Recall event subscription ───────────────────────────────
+    window.clemmy.onRecallEvent((event) => {
+      if (!event || typeof event !== 'object') return;
+      const t = event.type;
+      if (t === 'meeting-prompt-required') {
+        showPrompt({ windowId: event.windowId, platform: event.platform, title: event.title });
+      } else if (t === 'meeting-detected') {
+        // The capture module emits both 'meeting-detected' (always) and
+        // 'meeting-prompt-required' (only when autoRecord is off). We
+        // listen to both — the prompt is the authoritative trigger.
+      } else if (t === 'recording-started') {
+        // Only show the pill after the SDK confirms recording is live.
+        // The earlier 'recording-start-requested' event fires after our
+        // startRecording() call resolves but before the SDK has hooked
+        // the window's audio — showing then could leave a pill up if
+        // the SDK then fails silently. Wait for the SDK's own signal.
+        showPill({
+          windowId: event.windowId || (state.pendingWindow && state.pendingWindow.windowId),
+          platform: event.platform || (state.pendingWindow && state.pendingWindow.platform),
+          title: event.title || (state.pendingWindow && state.pendingWindow.title),
+        }, event.startedAt || new Date().toISOString());
+        if (event.recordingId) state.activeRecordingId = event.recordingId;
+      } else if (t === 'recording-start-requested') {
+        // Pre-confirmation: stash the recording ID so we can correlate
+        // when 'recording-started' lands. Don't show the pill yet.
+        if (event.recordingId) state.activeRecordingId = event.recordingId;
+      } else if (t === 'transcript') {
+        appendSegment({ speaker: event.speaker, text: event.text });
+      } else if (t === 'recording-ended') {
+        const complete = event.complete || {};
+        const recordInfo = complete.record || {};
+        showToast({
+          meetingId: recordInfo.id,
+          artifactPath: complete.artifactPath || recordInfo.artifactPath,
+          platform: event.platform || recordInfo.platform,
+          title: event.title || recordInfo.title,
+          segmentCount: complete.segmentCount,
+          durationSeconds: (event.startedAt && event.endedAt)
+            ? Math.max(0, (Date.parse(event.endedAt) - Date.parse(event.startedAt)) / 1000)
+            : undefined,
+        });
+      } else if (t === 'error') {
+        // Surface SDK errors as a transient toast so the user knows the
+        // pipeline broke. Reuse the toast slot since it's a one-off.
+        if (toastSub) toastSub.textContent = 'Recall error: ' + (event.error || 'unknown');
+        toast.hidden = false;
+      }
+    });
   })();
 })();
 `;

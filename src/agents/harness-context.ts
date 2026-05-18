@@ -31,6 +31,7 @@ import { BASE_DIR } from '../config.js';
 import { loadMemoryContext } from '../memory/vault.js';
 import { renderFactsForInstructions } from '../memory/facts.js';
 import { renderProfileForInstructions } from '../runtime/user-profile.js';
+import { renderSkillsIndex } from '../memory/skill-store.js';
 
 const GOALS_DIR = path.join(BASE_DIR, 'goals');
 
@@ -110,6 +111,13 @@ export function renderHarnessMemoryContext(): string {
 
   const goals = renderActiveGoals();
 
+  let skills = '';
+  try {
+    skills = renderSkillsIndex();
+  } catch {
+    skills = '';
+  }
+
   const blocks = [
     section('User Preferences', profile),
     section('Persistent Facts', facts),
@@ -118,6 +126,7 @@ export function renderHarnessMemoryContext(): string {
     section('Core Personality', memContext.soul),
     section('Long-Term Memory', memContext.memory),
     section('Active Goals', goals),
+    section('Installed Skills', skills),
   ].filter(Boolean);
 
   if (blocks.length === 0) return '';

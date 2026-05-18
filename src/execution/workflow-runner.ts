@@ -48,6 +48,48 @@ const logger = pino({ name: 'clementine-next.workflow-runner' });
 
 const RUNNER_CONCURRENCY = parseInt(process.env.CLEMENTINE_WORKFLOW_CONCURRENCY ?? '5', 10);
 
+// Per-step wall-clock budget. forEach items use the same per-call cap
+// (each item is its own assistant call) and the surrounding step gets
+// the cap multiplied by item count, capped by RUNNER_CONCURRENCY — but
+// we just hand each invocation the same value and let the runtime
+// abort individual stuck items. Synthesis sees a smaller cap because
+// it should be a tight rollup, not exploration.
+const WORKFLOW_STEP_WALL_CLOCK_MS = parseInt(process.env.CLEMENTINE_WORKFLOW_STEP_WALL_MS ?? `${15 * 60_000}`, 10);
+const WORKFLOW_SYNTHESIS_WALL_CLOCK_MS = parseInt(process.env.CLEMENTINE_WORKFLOW_SYNTHESIS_WALL_MS ?? `${5 * 60_000}`, 10);
+
+// Workflow run heartbeats — same pattern as cron. A 30-min fan-out
+// over 50 items shouldn't go silent between "started" and "completed".
+const WORKFLOW_HEARTBEAT_FIRST_MS = 5 * 60_000;
+const WORKFLOW_HEARTBEAT_INTERVAL_MS = 10 * 60_000;
+
+function startWorkflowHeartbeat(workflowName: string, runId: string, startMs: number): () => void {
+  let count = 0;
+  const fire = () => {
+    count += 1;
+    const elapsedMin = Math.max(1, Math.round((Date.now() - startMs) / 60_000));
+    addNotification({
+      id: `workflow-heartbeat-${runId}-${count}`,
+      kind: 'workflow',
+      title: `Workflow still running: ${workflowName}`,
+      body: `Run ${runId} has been working for ${elapsedMin} min. Will notify on completion or failure. Open Console → Activity for live status.`,
+      createdAt: new Date().toISOString(),
+      read: false,
+      metadata: { workflow: workflowName, runId, heartbeat: true, elapsedMin },
+    });
+  };
+  let interval: ReturnType<typeof setInterval> | undefined;
+  const first = setTimeout(() => {
+    fire();
+    interval = setInterval(fire, WORKFLOW_HEARTBEAT_INTERVAL_MS);
+    interval.unref?.();
+  }, WORKFLOW_HEARTBEAT_FIRST_MS);
+  first.unref?.();
+  return () => {
+    clearTimeout(first);
+    if (interval) clearInterval(interval);
+  };
+}
+
 interface QueuedRunRecord {
   id: string;
   workflow: string;
@@ -206,6 +248,10 @@ interface StepExecutionContext {
   stepOutputs: Record<string, unknown>;
   assistant: ClementineAssistant;
   completedItems: Map<string, unknown>;
+  // Shared accumulator for per-item forEach failures so the surrounding
+  // workflow run can surface "completed with N/M failures" instead of
+  // reporting an all-green success when fan-out items quietly errored.
+  forEachFailures: Array<{ stepId: string; itemKey: string; error: string }>;
 }
 
 /**
@@ -272,6 +318,7 @@ async function executeStep(
           channel: 'workflow',
           message: `Workflow: ${ctx.workflow.name}\nStep: ${step.id}\nItem: ${key}\n\n${prompt}`,
           model: step.model || MODELS.primary,
+          maxWallClockMs: WORKFLOW_STEP_WALL_CLOCK_MS,
         });
         appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
           kind: 'item_completed',
@@ -295,6 +342,15 @@ async function executeStep(
     const successes = itemResults.filter((r): r is { ok: true; value: ItemResult } => r.ok);
     const failed = itemResults.length - successes.length;
     const aggregate = successes.map((r) => r.value);
+    // Record failures on the shared accumulator so the outer run
+    // notification can flag partial-success runs that previously read
+    // as "completed" with no hint that items dropped.
+    for (let i = 0; i < itemResults.length; i++) {
+      const r = itemResults[i];
+      if (r.ok) continue;
+      const key = itemKey(items[i], i);
+      ctx.forEachFailures.push({ stepId: step.id, itemKey: key, error: r.error });
+    }
     appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
       kind: 'step_completed',
       stepId: step.id,
@@ -315,6 +371,7 @@ async function executeStep(
     channel: 'workflow',
     message: `Workflow: ${ctx.workflow.name}\nStep: ${step.id}\n\n${prompt}`,
     model: step.model || MODELS.primary,
+    maxWallClockMs: WORKFLOW_STEP_WALL_CLOCK_MS,
   });
   appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
     kind: 'step_completed',
@@ -338,9 +395,10 @@ async function executeWorkflow(
   inputs: Record<string, string>,
   assistant: ClementineAssistant,
   targetStepId?: string,
-): Promise<string> {
+): Promise<{ finalOutput: string; forEachFailures: Array<{ stepId: string; itemKey: string; error: string }> }> {
   const resume = computeResumeState(workflowSlug, runId);
   const stepOutputs: Record<string, unknown> = Object.fromEntries(resume.completedSteps);
+  const forEachFailures: Array<{ stepId: string; itemKey: string; error: string }> = [];
 
   // Single-step "TRY" mode: execute only the named step. Upstream
   // references in the prompt resolve to empty strings — the user is
@@ -357,7 +415,7 @@ async function executeWorkflow(
     }
     const completedItems = resume.completedItems.get(step.id) ?? new Map();
     const output = await executeStep(step, {
-      workflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems,
+      workflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems, forEachFailures,
     });
     stepOutputs[step.id] = output;
   }
@@ -380,6 +438,7 @@ async function executeWorkflow(
       channel: 'workflow',
       message: `${synthesisPrompt}\n\nStep outputs:\n\n${stepOutputsAsText}`,
       model: MODELS.primary,
+      maxWallClockMs: WORKFLOW_SYNTHESIS_WALL_CLOCK_MS,
     });
     finalOutput = response.text;
     appendWorkflowEvent(workflowSlug, runId, {
@@ -395,7 +454,7 @@ async function executeWorkflow(
 
   // Record string-coerced step outputs on the run record for the
   // dashboard's recent-runs display (which expects strings).
-  return finalOutput;
+  return { finalOutput, forEachFailures };
 }
 
 function stringifyOutputs(stepOutputs: Record<string, unknown>): Record<string, string> {
@@ -460,8 +519,9 @@ export async function processWorkflowRuns(assistant: ClementineAssistant): Promi
       meta: { inputs, source: run.source, targetStepId: run.targetStepId ?? null },
     });
 
+    const stopHeartbeat = startWorkflowHeartbeat(workflow.data.name, run.id, Date.now());
     try {
-      const finalOutput = await executeWorkflow(workflow.data, workflow.name, run.id, inputs, assistant, run.targetStepId);
+      const { finalOutput, forEachFailures } = await executeWorkflow(workflow.data, workflow.name, run.id, inputs, assistant, run.targetStepId);
       const resume = computeResumeState(workflow.name, run.id);
       const stepOutputs = stringifyOutputs(Object.fromEntries(resume.completedSteps));
       appendWorkflowEvent(workflow.name, run.id, { kind: 'run_completed' });
@@ -472,16 +532,32 @@ export async function processWorkflowRuns(assistant: ClementineAssistant): Promi
         stepOutputs,
         output: finalOutput,
       });
+      // Partial-success surfacing: if any forEach items errored, lift
+      // them into the user-visible notification so a "completed" run
+      // can't masquerade as all-green when items quietly dropped.
+      const hasFailures = forEachFailures.length > 0;
+      const failureSummary = hasFailures
+        ? `\n\n⚠️ ${forEachFailures.length} item${forEachFailures.length === 1 ? '' : 's'} failed:\n${forEachFailures
+            .slice(0, 5)
+            .map((f) => `- ${f.stepId} · ${f.itemKey}: ${f.error.slice(0, 200)}`)
+            .join('\n')}${forEachFailures.length > 5 ? `\n(+${forEachFailures.length - 5} more)` : ''}`
+        : '';
       addNotification({
         id: `${Date.now()}-workflow-${run.id}`,
         kind: 'workflow',
-        title: `Workflow completed: ${workflow.data.name}`,
-        body: finalOutput.slice(0, 2000),
+        title: hasFailures
+          ? `Workflow completed with ${forEachFailures.length} failure${forEachFailures.length === 1 ? '' : 's'}: ${workflow.data.name}`
+          : `Workflow completed: ${workflow.data.name}`,
+        body: `${finalOutput.slice(0, 2000 - failureSummary.length)}${failureSummary}`,
         createdAt: new Date().toISOString(),
         read: false,
-        metadata: { workflow: workflow.data.name, runId: run.id },
+        metadata: {
+          workflow: workflow.data.name,
+          runId: run.id,
+          forEachFailures: hasFailures ? forEachFailures : undefined,
+        },
       });
-      logger.info({ workflow: workflow.data.name, runId: run.id }, 'Workflow run completed');
+      logger.info({ workflow: workflow.data.name, runId: run.id, partialFailures: forEachFailures.length }, 'Workflow run completed');
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       logger.error({ err: error, file }, 'Workflow run failed');
@@ -501,6 +577,8 @@ export async function processWorkflowRuns(assistant: ClementineAssistant): Promi
         read: false,
         metadata: { workflow: run.workflow, runId: run.id, status: 'error' },
       });
+    } finally {
+      stopHeartbeat();
     }
   }
 }

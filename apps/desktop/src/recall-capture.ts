@@ -13,6 +13,9 @@ export interface RecallCaptureStatus {
   initialized: boolean;
   enabled: boolean;
   recording: boolean;
+  /** Wall-clock ISO timestamp when the current recording started.
+   *  Drives the live "MEETING LIVE · 02:14" pill in the dashboard. */
+  recordingStartedAt?: string;
   currentWindowId?: string;
   lastError?: string;
   lastEvent?: string;
@@ -165,22 +168,53 @@ export class RecallDesktopCapture {
   private lastMeeting: RecallCaptureStatus['lastMeeting'];
   private permissionStatuses: Record<string, string> = {};
   private detectedWindows = new Map<string, RecallCaptureStatus['detectedWindows'][number]>();
+  // Windows we've already prompted the user about during this session.
+  // Prevents the UI from re-firing the "record this meeting?" banner
+  // every time the SDK re-detects the same Zoom window (which it does
+  // every few seconds while the window is open).
+  private promptedWindows = new Set<string>();
+  // Windows the user explicitly dismissed via the recording pill ×.
+  // While a windowId is in this set, autoRecord skips it — otherwise
+  // the SDK's repeating meeting-detected events would re-auto-record
+  // it within seconds of the dismiss, producing a pill the user can
+  // never get rid of. Cleared when the SDK fires meeting-closed for
+  // that window (i.e. they really closed Zoom/Meet/Teams).
+  private userDismissedWindows = new Set<string>();
+  // Permission slugs we've already asked the SDK to request during this
+  // session. The SDK's native dialogs are sticky — once shown, asking
+  // again is a no-op for "denied" but also produces no useful signal.
+  // We track this so we don't spam requests on every meeting-detected.
+  private requestedPermissions = new Set<RecallPermission>();
+  // Wall-clock start so the live UI can render an elapsed-time pill
+  // without recomputing from the SDK's recording-started event.
+  private recordingStartedAt: string | undefined;
 
   constructor(private readonly opts: RecallCaptureOptions) {}
 
   status(): RecallCaptureStatus {
+    // Defense-in-depth: if the active window is one the user dismissed,
+    // report not-recording to the dashboard truth reconciler regardless
+    // of what this.recording happens to say. Without this, a stray SDK
+    // event could flip recording back to true a few ms after dismiss
+    // and the pill would reappear on the next 5s reconcile tick.
+    const dismissedActive = Boolean(
+      this.currentWindowId && this.userDismissedWindows.has(this.currentWindowId),
+    );
     return {
       sdkAvailable: this.sdkAvailable,
       initialized: this.initialized,
       enabled: this.settings.enabled,
-      recording: this.recording,
-      currentWindowId: this.currentWindowId,
+      recording: this.recording && !dismissedActive,
+      recordingStartedAt: dismissedActive ? undefined : this.recordingStartedAt,
+      currentWindowId: dismissedActive ? undefined : this.currentWindowId,
       lastError: this.lastError,
       lastEvent: this.lastEvent,
       lastEventAt: this.lastEventAt,
       lastMeeting: this.lastMeeting,
       permissionStatuses: { ...this.permissionStatuses },
-      detectedWindows: Array.from(this.detectedWindows.values()),
+      detectedWindows: Array.from(this.detectedWindows.values()).map((w) => (
+        this.userDismissedWindows.has(w.windowId) ? { ...w, recording: false } : w
+      )),
       settings: this.settings,
     };
   }
@@ -223,9 +257,42 @@ export class RecallDesktopCapture {
   }
 
   async stopRecording(): Promise<RecallCaptureStatus> {
-    if (!this.currentWindowId || !this.sdk) return this.status();
-    await this.sdk.stopRecording({ windowId: this.currentWindowId });
-    this.emit('recording-stop-requested', { windowId: this.currentWindowId });
+    // Clear LOCAL state up front, regardless of SDK echo.
+    //
+    // Previously this method waited for the Recall SDK to fire its own
+    // 'recording-ended' event (which runs onRecordingEnded → sets
+    // this.recording = false). If the SDK never fires that event —
+    // because the recording never actually started, the SDK is in a
+    // weird state, or the user is clicking dismiss on a stale pill —
+    // this.recording stayed true forever, the truth reconciler in the
+    // dashboard kept re-showing the pill every 5s, and the user could
+    // never dismiss it. Clear state synchronously so a dismiss is
+    // ALWAYS effective; if the SDK later fires recording-ended too,
+    // onRecordingEnded becomes a no-op repeat.
+    const windowId = this.currentWindowId;
+    this.recording = false;
+    this.recordingStartedAt = undefined;
+    if (windowId) {
+      const existing = this.detectedWindows.get(windowId);
+      if (existing) {
+        this.detectedWindows.set(windowId, { ...existing, recording: false });
+      }
+      // Remember the user dismissed THIS window so autoRecord doesn't
+      // immediately re-fire on the next meeting-detected event. Cleared
+      // in onMeetingClosed when the meeting window actually closes.
+      this.userDismissedWindows.add(windowId);
+    }
+    this.currentWindowId = undefined;
+
+    if (windowId && this.sdk) {
+      try {
+        await this.sdk.stopRecording({ windowId });
+      } catch {
+        // SDK may have already stopped or never had this window —
+        // either way our local state is correct now. Don't bubble.
+      }
+      this.emit('recording-stop-requested', { windowId });
+    }
     return this.status();
   }
 
@@ -242,7 +309,10 @@ export class RecallDesktopCapture {
     this.initialized = false;
     this.recording = false;
     this.currentWindowId = undefined;
+    this.recordingStartedAt = undefined;
     this.detectedWindows.clear();
+    this.userDismissedWindows.clear();
+    this.promptedWindows.clear();
     this.permissionStatuses = {};
   }
 
@@ -307,6 +377,13 @@ export class RecallDesktopCapture {
   private async onMeetingDetected(event: { window?: RecallSdkWindow }): Promise<void> {
     const win = event.window;
     if (!win?.id) return;
+
+    // The SDK re-fires this event repeatedly while the meeting window
+    // stays open. Only act once per window per session — the daemon
+    // detection write, the prompt event, and the permission auto-
+    // request should all be idempotent.
+    const alreadySeen = this.detectedWindows.has(win.id);
+
     this.noteEvent('meeting-detected');
     this.lastMeeting = { windowId: win.id, platform: win.platform, title: win.title };
     this.detectedWindows.set(win.id, {
@@ -317,14 +394,127 @@ export class RecallDesktopCapture {
       recording: this.recording && this.currentWindowId === win.id,
     });
     this.emit('meeting-detected', this.lastMeeting);
-    await this.postDaemon('/api/console/meetings/recall/detected', {
-      windowId: win.id,
-      platform: win.platform,
-      title: win.title,
-    });
-    if (this.settings.autoRecord && !this.recording) {
-      await this.startRecording(win.id, { platform: win.platform, title: win.title });
+
+    if (!alreadySeen) {
+      await this.postDaemon('/api/console/meetings/recall/detected', {
+        windowId: win.id,
+        platform: win.platform,
+        title: win.title,
+      }).catch(() => { /* detection write is best-effort */ });
+
+      // Recall capture is useless without screen-capture + system-
+      // audio on macOS. Auto-trigger the SDK's native permission
+      // dialogs the first time a meeting is detected so the user
+      // doesn't have to find the REQUEST PERMISSIONS button in
+      // settings before recording becomes possible.
+      void this.requestMissingPermissions();
     }
+
+    if (this.recording) return;
+
+    // The user previously dismissed the pill for this window — respect
+    // that. autoRecord won't refire until the meeting actually closes.
+    if (this.userDismissedWindows.has(win.id)) return;
+
+    if (this.settings.autoRecord) {
+      try {
+        await this.startRecording(win.id, { platform: win.platform, title: win.title });
+        return;
+      } catch (err) {
+        // Auto-record failed (no API key, network, daemon unreachable).
+        // Capture the reason so the UI can show it, then fall through
+        // to the prompt path so the user still sees something — they
+        // can retry by clicking RECORD.
+        this.lastError = err instanceof Error ? err.message : String(err);
+        this.emit('error', { error: this.lastError, phase: 'auto-record' });
+      }
+    }
+
+    // autoRecord is off (or auto-record failed) — surface a single
+    // per-window prompt so the dashboard can offer "Record this
+    // meeting? · Always record · Not this time" without forcing the
+    // user to dig through settings.
+    if (!this.promptedWindows.has(win.id)) {
+      this.promptedWindows.add(win.id);
+      this.emit('meeting-prompt-required', {
+        windowId: win.id,
+        platform: win.platform,
+        title: win.title,
+        detectedAt: new Date().toISOString(),
+      });
+    }
+  }
+
+  /**
+   * Trigger the SDK's permission dialogs for anything we know we'll
+   * need but haven't been granted yet. Idempotent — once a permission
+   * has been requested in this session we don't re-fire (the OS-level
+   * dialog won't re-appear anyway, and we'd just spam SDK events).
+   */
+  private async requestMissingPermissions(): Promise<void> {
+    if (!this.sdk) return;
+    // Order matters: accessibility is required for window detection
+    // (the user already has it if they got this far), then the two
+    // critical recording permissions.
+    const required: RecallPermission[] = ['screen-capture', 'system-audio', 'microphone'];
+    const requested: RecallPermission[] = [];
+    for (const perm of required) {
+      if (this.requestedPermissions.has(perm)) continue;
+      const current = this.permissionStatuses[perm];
+      if (current === 'granted') continue;
+      this.requestedPermissions.add(perm);
+      try {
+        await this.sdk.requestPermission(perm);
+        requested.push(perm);
+      } catch (err) {
+        this.lastError = err instanceof Error ? err.message : String(err);
+      }
+    }
+    if (requested.length > 0) {
+      this.emit('permissions-requested', { permissions: requested, reason: 'meeting-detected' });
+    }
+  }
+
+  /**
+   * Public entry point for the dashboard prompt's "Record" button.
+   * Starts recording against a specific window id the SDK has already
+   * detected (vs `startManualRecording()` which spins up a generic
+   * desktop-audio capture not tied to any window).
+   */
+  async recordDetectedWindow(windowId: string): Promise<RecallCaptureStatus> {
+    await this.initialize();
+    const existing = this.detectedWindows.get(windowId);
+    await this.startRecording(windowId, {
+      platform: existing?.platform,
+      title: existing?.title,
+    });
+    return this.status();
+  }
+
+  /**
+   * Public entry point for the "Always record" prompt button.
+   * Persists the autoRecord toggle so future meetings are picked up
+   * automatically, then immediately records the supplied window.
+   *
+   * "Persists" means writing through the daemon's settings endpoint
+   * (which owns the canonical recall-settings.json file). Updating
+   * only this.settings would be lost on the next daemon restart.
+   */
+  async enableAutoRecordAndRecord(windowId: string): Promise<RecallCaptureStatus> {
+    this.settings = { ...this.settings, autoRecord: true };
+    // Best-effort: if the daemon isn't reachable for some reason we
+    // still want the user's click to record the current meeting, so
+    // we don't await this. Worst case the toggle reverts after a
+    // daemon restart and the user re-confirms once.
+    void this.postDaemon('/api/console/meetings/recall/settings', {
+      ...this.settings,
+      autoRecord: true,
+    }, 'PATCH').catch((err) => {
+      this.emit('settings-persist-failed', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
+    return this.recordDetectedWindow(windowId);
   }
 
   private async startRecording(windowId: string, meta: { platform?: string; title?: string } = {}): Promise<void> {
@@ -335,8 +525,15 @@ export class RecallDesktopCapture {
     await this.sdk.startRecording({ windowId, uploadToken: upload.uploadToken });
     this.recording = true;
     this.currentWindowId = windowId;
+    this.recordingStartedAt = new Date().toISOString();
     this.lastMeeting = { windowId, platform: meta.platform, title: meta.title };
-    this.emit('recording-start-requested', { windowId, platform: meta.platform, title: meta.title });
+    this.emit('recording-start-requested', {
+      windowId,
+      platform: meta.platform,
+      title: meta.title,
+      recordingId: upload.id,
+      startedAt: this.recordingStartedAt,
+    });
     await this.postDaemon('/api/console/meetings/recall/detected', {
       windowId,
       recordingId: upload.id,
@@ -349,6 +546,18 @@ export class RecallDesktopCapture {
   private async onRecordingStarted(event: { window?: RecallSdkWindow }): Promise<void> {
     const windowId = event.window?.id ?? this.currentWindowId;
     if (!windowId) return;
+    // The SDK can re-fire recording-started for a window we previously
+    // told it to stop on (race between sdk.stopRecording() resolving
+    // and the next event tick, or the SDK retrying after restartOnError).
+    // If the user dismissed the pill for this window, ignore the event —
+    // calling sdk.stopRecording again is harmless, and refusing to flip
+    // our local recording flag back to true is what makes the dismiss
+    // actually stick.
+    if (this.userDismissedWindows.has(windowId)) {
+      try { await this.sdk?.stopRecording({ windowId }); } catch { /* best-effort */ }
+      this.noteEvent('recording-started-ignored');
+      return;
+    }
     this.recording = true;
     this.currentWindowId = windowId;
     this.noteEvent('recording-started');
@@ -363,25 +572,44 @@ export class RecallDesktopCapture {
     const win = event.window;
     const windowId = win?.id ?? this.currentWindowId;
     if (!windowId) return;
+    const startedAt = this.recordingStartedAt;
     this.recording = false;
     this.currentWindowId = undefined;
+    this.recordingStartedAt = undefined;
     this.noteEvent('recording-ended');
     const existing = this.detectedWindows.get(windowId);
     if (existing) {
       this.detectedWindows.set(windowId, { ...existing, recording: false });
     }
+    // Same window may host another meeting later — clear the
+    // already-prompted flag so the prompt fires on the next detection.
+    this.promptedWindows.delete(windowId);
     const complete = await this.postDaemon('/api/console/meetings/recall/complete', {
       windowId,
       platform: win?.platform ?? this.lastMeeting?.platform,
       title: win?.title ?? this.lastMeeting?.title,
+      startedAt,
     }).catch((error) => ({ error: error instanceof Error ? error.message : String(error) }));
-    this.emit('recording-ended', { windowId, complete });
+    this.emit('recording-ended', {
+      windowId,
+      platform: win?.platform ?? this.lastMeeting?.platform,
+      title: win?.title ?? this.lastMeeting?.title,
+      startedAt,
+      endedAt: new Date().toISOString(),
+      complete,
+    });
   }
 
   private onMeetingClosed(event: { window?: RecallSdkWindow }): void {
     const win = event.window;
     this.noteEvent('meeting-closed');
-    if (win?.id) this.detectedWindows.delete(win.id);
+    if (win?.id) {
+      this.detectedWindows.delete(win.id);
+      // Once the meeting actually closes, drop the dismiss flag so the
+      // next meeting in this window auto-records normally.
+      this.userDismissedWindows.delete(win.id);
+      this.promptedWindows.delete(win.id);
+    }
     this.emit('meeting-closed', { windowId: win?.id, platform: win?.platform, title: win?.title });
   }
 
@@ -433,14 +661,14 @@ export class RecallDesktopCapture {
     this.emit('error', { error });
   }
 
-  private async postDaemon<T = Record<string, unknown>>(pathname: string, body: Record<string, unknown>): Promise<T> {
+  private async postDaemon<T = Record<string, unknown>>(pathname: string, body: Record<string, unknown>, method: 'POST' | 'PATCH' = 'POST'): Promise<T> {
     const base = this.opts.getDaemonBaseUrl();
     const token = this.opts.getWebhookToken();
     if (!base || !token) throw new Error('Clementine daemon URL/token is unavailable.');
     const url = new URL(pathname, base);
     url.searchParams.set('token', token);
     const response = await fetch(url, {
-      method: 'POST',
+      method,
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body),
     });

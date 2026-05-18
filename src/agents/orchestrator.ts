@@ -44,7 +44,11 @@ export const OrchestratorDecisionSchema = z.object({
   summary: z
     .string()
     .min(8)
-    .describe('One-sentence statement of what was decided and/or done this turn.'),
+    .describe('One-sentence INTERNAL description of what you decided and/or did this turn. This is a log entry, NOT what the user sees. e.g. "Replied to greeting directly", "Handed off to Researcher for slug discovery".'),
+  reply: z
+    .string()
+    .nullish()
+    .describe('The natural-language message to show the user IN THIS TURN. REQUIRED whenever you answer directly without handing off (e.g. greetings, simple questions, confirmations). Pass null ONLY when you are handing off, asking for approval, or otherwise not the one producing the user-visible text. Without a reply here, the chat surface renders nothing and the user sees an empty bubble.'),
   done: z
     .boolean()
     .describe(
@@ -169,7 +173,9 @@ const ORCHESTRATOR_INSTRUCTIONS = [
   'EXCEPTIONS:',
   '  - If a curated `cx_<toolkit>_<action>` obviously matches (e.g. user says "send a Gmail draft" and there\'s a cx_gmail_create_draft), skip the search step. Hand off with toolCall: null and the Executor will call the cx_* tool directly from its own surface.',
   '  - If composio_search_tools returns no matches AND no curated cx_* exists, ask the user with ask_user_question what they want — DO NOT silently report "tool not available." The status field on returned toolkits is informational only; Composio reports EXPIRED for connections that work fine, so do not refuse to attempt a tool just because the status looks stale. Let the actual execute call surface a real error if there is one.',
-  'Return an OrchestratorDecision. Be specific. `summary` is what you decided and (if done) what was accomplished. Pick `nextAction` honestly: did you finish, are you waiting on the user, are you waiting on approval, or did you hand off and expect a follow-up turn?',
+  'Return an OrchestratorDecision. Be specific. `summary` is an INTERNAL log entry — one sentence describing what you decided and/or did this turn (e.g. "Replied to greeting directly", "Handed off to Researcher for slug discovery"). NEVER write user-facing copy in `summary`.',
+  'CRITICAL: when you answer the user directly without handing off (greetings, simple questions, confirmations, summaries you produce yourself), you MUST put the actual reply in the `reply` field. The chat surface renders `reply` as the user-visible message. If you set done:true without populating `reply`, the user sees nothing — that is a bug. Only leave reply: null when you handed off (the sub-agent\'s output is the reply) or when the turn produces no user-visible text yet (awaiting_approval, etc.).',
+  'Pick `nextAction` honestly: did you finish, are you waiting on the user, are you waiting on approval, or did you hand off and expect a follow-up turn?',
 ].join('\n\n');
 
 export async function buildOrchestratorAgent(): Promise<

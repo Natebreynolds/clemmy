@@ -33,6 +33,12 @@ const api = {
   recallConfigure: (settings: Record<string, unknown>) => ipcRenderer.invoke('clemmy:recall-configure', settings) as Promise<Record<string, unknown> | null>,
   recallRequestPermissions: () => ipcRenderer.invoke('clemmy:recall-request-permissions') as Promise<Record<string, unknown> | null>,
   recallStartManual: () => ipcRenderer.invoke('clemmy:recall-start-manual') as Promise<Record<string, unknown> | null>,
+  /** Start recording a specific window the SDK has detected. Drives
+   *  the "Record this meeting" prompt button. */
+  recallRecordDetected: (windowId: string) => ipcRenderer.invoke('clemmy:recall-record-detected', { windowId }) as Promise<Record<string, unknown> | null>,
+  /** Flip autoRecord on AND start recording this window — the
+   *  "Always record" prompt button. */
+  recallAutoRecord: (windowId: string) => ipcRenderer.invoke('clemmy:recall-auto-record', { windowId }) as Promise<Record<string, unknown> | null>,
   recallStop: () => ipcRenderer.invoke('clemmy:recall-stop') as Promise<Record<string, unknown> | null>,
   /** Forces an SDK init (if enabled) and returns the full status incl.
    *  permissionStatuses + detectedWindows. Use this for the dashboard's
@@ -69,6 +75,16 @@ const api = {
   credentialsSet: (name: string, value: string) => ipcRenderer.invoke('clemmy:credentials-set', { name, value }) as Promise<Record<string, unknown>>,
   /** Persist a workspace path to ~/.clementine-next/.env's WORKSPACE_DIRS. */
   setupSaveWorkspace: (absPath: string) => ipcRenderer.invoke('clemmy:setup-save-workspace', { path: absPath }) as Promise<{ ok: boolean }>,
+  /** Native folder picker for the setup wizard's workspace step. */
+  setupPickWorkspaceFolder: () => ipcRenderer.invoke('clemmy:setup-pick-workspace-folder') as Promise<{ path: string }>,
+  /** Run the Codex OAuth flow from the main process — opens the user's
+   *  default browser, listens on localhost:1455 for the callback, and
+   *  persists the resulting tokens. Returns { ok, accountId } on success
+   *  or { ok: false, error } on failure (user cancel, network, etc.). */
+  setupCodexLogin: () => ipcRenderer.invoke('clemmy:setup-codex-login') as Promise<
+    | { ok: true; accountId: string; lastRefresh: string }
+    | { ok: false; error: string }
+  >,
   /** Persist a profile patch to ~/.clementine-next/state/user-profile.json. */
   setupSaveProfile: (patch: Record<string, unknown>) => ipcRenderer.invoke('clemmy:setup-save-profile', patch) as Promise<{ ok: boolean }>,
   /** Wizard finished — close setup window, signal main to boot dashboard. */

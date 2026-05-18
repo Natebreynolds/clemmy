@@ -13,6 +13,15 @@ export interface RunRequest {
   sessionId?: string;
   userId?: string;
   channel?: string;
+  /**
+   * Hard wall-clock budget for the entire run, in milliseconds. When
+   * exceeded, the runtime aborts in-flight requests and throws a
+   * RuntimeTimeoutError (a CodexRuntimeError with status undefined and
+   * a recognizable message prefix). Set per-caller — cron uses the
+   * largest budgets, controller/synthesis the smallest. Omit to allow
+   * unbounded runs (chat default — the user is watching).
+   */
+  maxWallClockMs?: number;
 }
 
 export interface ToolActivity {
@@ -135,6 +144,8 @@ export interface AssistantRequest {
    *  display by default. */
   onReasoning?: (text: string) => Promise<void> | void;
   shouldCancel?: () => boolean | Promise<boolean>;
+  /** Wall-clock budget passed through to the runtime. See RunRequest. */
+  maxWallClockMs?: number;
 }
 
 export interface AssistantResponse {

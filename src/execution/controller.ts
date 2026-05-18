@@ -9,7 +9,7 @@ import { refreshSessionBrief } from '../memory/session-briefs.js';
 import { SessionStore } from '../memory/session-store.js';
 import { WORKFLOWS_DIR } from '../memory/vault.js';
 import { refreshWorkingMemory } from '../memory/working-memory.js';
-import { addNotification } from '../runtime/notifications.js';
+import { addNotification, getNotification } from '../runtime/notifications.js';
 import { actionBus } from '../runtime/action-bus.js';
 import { PlanStore } from '../planning/plan-store.js';
 import {
@@ -791,6 +791,14 @@ function buildSynthesisPrompt(execution: ExecutionRecord, plan: PlanRecord | und
   ].filter(Boolean).join('\n');
 }
 
+// Controller + synthesis are internal model calls that should be
+// snappy. A 5-minute cap is generous for what's effectively a JSON
+// rollup — anything longer is almost certainly a stuck stream that
+// will not produce parsable output anyway. The retry budget inside
+// runDecisionWithRetry doubles the worst case (10 min) which is still
+// well inside any caller's tolerance.
+const CONTROLLER_DECISION_WALL_CLOCK_MS = 5 * 60_000;
+
 async function runSynthesisDecision(
   assistant: ClementineAssistant,
   execution: ExecutionRecord,
@@ -804,6 +812,7 @@ async function runSynthesisDecision(
     model: MODELS.fast,
     instructions: 'You are a strict internal execution synthesizer that returns JSON only.',
     prompt: buildSynthesisPrompt(execution, plan, activity),
+    maxWallClockMs: CONTROLLER_DECISION_WALL_CLOCK_MS,
   };
 
   return runDecisionWithRetry(assistant, request, parseSynthesisDecision, {
@@ -984,6 +993,7 @@ async function runControllerDecision(assistant: ClementineAssistant, execution: 
     model: MODELS.fast,
     instructions: 'You are a strict internal controller that returns JSON only.',
     prompt: buildControllerPrompt(execution, plan),
+    maxWallClockMs: CONTROLLER_DECISION_WALL_CLOCK_MS,
   };
 
   return runDecisionWithRetry(assistant, request, parseControllerDecision, {
@@ -1179,6 +1189,32 @@ export async function processExecutionController(assistant: ClementineAssistant)
         'Execution controller cycle failed',
       );
 
+      // Early-warning at cycle 2 so the user can intervene before
+      // the 5-cycle auto-fail kicks in (~75 min of silent thrash
+      // otherwise). Dedup'd per execution + cycle so we never spam
+      // the same notification on subsequent ticks of the same cycle.
+      if (
+        nextFailures === 2 &&
+        isUserFacingExecution(execution)
+      ) {
+        const earlyId = `execution-${execution.id}-early-warning`;
+        if (!getNotification(earlyId)) {
+          addNotification({
+            id: earlyId,
+            kind: 'execution',
+            title: `Execution may be stuck: ${execution.title}`,
+            body: `The controller has failed ${nextFailures} cycles in a row. Last error: ${errorMessage}\n\nIf this keeps failing for 3 more cycles I'll auto-fail the execution. Open Console → Activity to intervene now (re-state the objective, attach a plan, or mark blocked).`,
+            createdAt: new Date().toISOString(),
+            read: false,
+            metadata: {
+              executionId: execution.id,
+              consecutiveAdvanceFailures: nextFailures,
+              earlyWarning: true,
+            },
+          });
+        }
+      }
+
       // Hard auto-fail after N consecutive cycles. Spinning forever
       // on a malformed prompt / persistent integration error is the
       // classic "feels like babysitting" failure mode — the user
@@ -1213,6 +1249,29 @@ export async function processExecutionController(assistant: ClementineAssistant)
               read: false,
               metadata: { executionId: execution.id, consecutiveAdvanceFailures: nextFailures },
             });
+          } else {
+            // Internal executions (controller-driven, synthesizer-only,
+            // etc.) previously auto-failed in total silence — only a
+            // stack trace in the daemon log. Emit one rolled-up daily
+            // notification so the user knows internal work is dropping
+            // without spamming them per execution.
+            const dayKey = new Date().toISOString().slice(0, 10);
+            const dailyId = `system-internal-execution-autofail-${dayKey}`;
+            if (!getNotification(dailyId)) {
+              addNotification({
+                id: dailyId,
+                kind: 'system',
+                title: 'Internal execution auto-failed — investigate Activity',
+                body: `An internal (non-user-facing) execution auto-failed today after ${nextFailures} consecutive errors. Most recent: "${execution.title}". Open Console → Activity to see the full failure trail. Further internal auto-fails today are silently logged to avoid noise.`,
+                createdAt: new Date().toISOString(),
+                read: false,
+                metadata: {
+                  errorCategory: 'internal_execution_autofail',
+                  executionId: execution.id,
+                  consecutiveAdvanceFailures: nextFailures,
+                },
+              });
+            }
           }
           continue;
         }

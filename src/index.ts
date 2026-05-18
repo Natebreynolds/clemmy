@@ -470,6 +470,17 @@ async function main(): Promise<void> {
     return;
   }
   if (command === 'service') {
+    // Idempotent home scaffold — creates SOUL.md / MEMORY.md / cron
+    // jobs / working-memory / example workflow if they don't already
+    // exist. The desktop wizard writes credentials + profile but
+    // never ran this, so fresh-install users were booting with an
+    // empty vault. `ensureFile` is a no-op when files exist, so this
+    // is safe to call on every daemon start.
+    try {
+      await initHome();
+    } catch (err) {
+      logger.warn({ err }, 'initHome failed during service boot — continuing with whatever scaffold exists');
+    }
     if (WEBHOOK_ENABLED) {
       await startWebhookServer(assistant);
     } else {

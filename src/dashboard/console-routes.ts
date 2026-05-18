@@ -42,6 +42,9 @@ import { clearAutonomyAgentCache } from '../agents/autonomy-v2.js';
 import { classifyTool } from '../agents/tool-taxonomy.js';
 import { loadPlugins, PLUGINS_DIR } from '../plugins/loader.js';
 import { loadUserProfile, saveUserProfile } from '../runtime/user-profile.js';
+import { getOrRefreshScan, probe, readCachedScan } from '../runtime/cli-discovery.js';
+import { SKILLS_DIR, listSkills, uninstallSkill } from '../memory/skill-store.js';
+import { getSkillInstallJob, startSkillInstall } from '../runtime/skill-installer.js';
 import { getProactivityPolicySnapshot, saveProactivityPolicy } from '../agents/proactivity-policy.js';
 import { getAuthStatus } from '../runtime/auth-store.js';
 import { getSecretStore, listSecretDescriptors, type SecretName } from '../runtime/secrets/index.js';
@@ -97,8 +100,12 @@ import { configureHarnessRuntime } from '../runtime/harness/codex-client.js';
 import { summarizeApprovalAction } from '../runtime/approval-summary.js';
 import {
   appendRecallTranscriptSegment,
+  buildAnalyzerPrompt,
   createRecallSdkUpload,
   finalizeRecallMeeting,
+  listRecentRecallMeetingSummaries,
+  loadRecallMeetingAnalysis,
+  loadRecallMeetingById,
   loadRecallMeetingSettings,
   noteRecallMeetingDetected,
   RECALL_REGIONS,
@@ -106,6 +113,13 @@ import {
   type RecallMeetingSettings,
   type RecallRegion,
 } from '../integrations/recall/meeting-capture.js';
+import {
+  findCatalogEntry,
+  forgetConnectedCli,
+  readConnectedClis,
+  recordConnectedCli,
+  statusForSearchResults,
+} from '../integrations/cli-catalog/catalog.js';
 
 /**
  * Mounts the Clementine Console dashboard at /console.
@@ -1025,8 +1039,9 @@ export function registerConsoleRoutes(
     if (name.startsWith('check_in') || name === 'ask_user_question' || name === 'list_pending_check_ins' || name === 'answer_check_in') return 'Check-ins';
     if (name === 'notify_user') return 'Notifications';
     if (name.startsWith('agent_run') || name.startsWith('user_profile') || name.startsWith('team_') || name.startsWith('create_agent') || name.startsWith('update_agent') || name.startsWith('delete_agent') || name.startsWith('delegate') || name === 'check_delegation') return 'Agents';
-    if (name === 'set_timer' || name.startsWith('cron_') || name.startsWith('workflow_') || name === 'trigger_cron_job' || name === 'add_cron_job') return 'Automation';
-    if (name === 'workspace_config' || name === 'workspace_list' || name === 'workspace_info' || name === 'workspace_roots' || name === 'list_files' || name === 'read_file' || name === 'write_file' || name === 'run_shell_command' || name === 'git_status') return 'Computer';
+    if (name === 'set_timer' || name.startsWith('cron_') || name.startsWith('workflow_') || name === 'trigger_cron_job' || name === 'add_cron_job' || name === 'schedule_list') return 'Automation';
+    if (name === 'workspace_config' || name === 'workspace_list' || name === 'workspace_info' || name === 'workspace_roots' || name === 'list_files' || name === 'read_file' || name === 'write_file' || name === 'run_shell_command' || name === 'git_status' || name === 'local_cli_list' || name === 'local_cli_probe') return 'Computer';
+    if (name === 'skill_list' || name === 'skill_read') return 'Skills';
     if (name.startsWith('composio_') || name.startsWith('cx_')) return 'Connected Apps';
     if (name.startsWith('browser_harness')) return 'Browser';
     if (name === 'session_history' || name === 'session_pause' || name === 'session_resume') return 'Sessions';
@@ -1081,6 +1096,65 @@ export function registerConsoleRoutes(
       }));
 
       res.json({ tools: allTools, mcpServers });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // ─── Local CLIs ────────────────────────────────────────────────
+  //
+  // Walks the user's $PATH and surfaces installed CLIs so the
+  // dashboard can show "yes, sf/gh/aws/etc. are here" without us
+  // maintaining a curated allowlist. The agent gets the same data
+  // via local_cli_list / local_cli_probe MCP tools.
+  //
+  // Cached for ~10 min (see src/runtime/cli-discovery.ts). Pass
+  // ?refresh=1 to force a fresh scan.
+
+  app.get('/api/console/clis', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const force = req.query.refresh === '1' || req.query.refresh === 'true';
+      const cached = force ? undefined : readCachedScan();
+      const scan = cached ?? await getOrRefreshScan({ force });
+      res.json({
+        scannedAt: scan.scannedAt,
+        cached: !force && !!cached,
+        cliCount: scan.clis.length,
+        detectedCount: scan.detected.length,
+        clis: scan.clis,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/clis/scan', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const scan = await getOrRefreshScan({ force: true });
+      res.json({
+        scannedAt: scan.scannedAt,
+        cliCount: scan.clis.length,
+        detectedCount: scan.detected.length,
+        clis: scan.clis,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.get('/api/console/clis/probe', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const command = typeof req.query.command === 'string' ? req.query.command.trim() : '';
+    if (!command || command.length > 60 || /[/\\\s]/.test(command)) {
+      res.status(400).json({ error: 'invalid command — pass a bare CLI name like "sf" or "gh"' });
+      return;
+    }
+    try {
+      const entry = await probe(command);
+      if (!entry) { res.status(404).json({ error: 'not installed', command }); return; }
+      res.json(entry);
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -1357,9 +1431,74 @@ export function registerConsoleRoutes(
     res.json({ query, results: hits });
   });
 
-  // ─── Skills (plugins) ──────────────────────────────────────────
+  // ─── Skills (SKILL.md format) ──────────────────────────────────
+  //
+  // Skills are reusable prompt modules in the Anthropic Skills format
+  // (agentskills.io spec): a folder with SKILL.md (YAML frontmatter +
+  // markdown body). They live in ~/.clementine-next/skills/<name>/ and
+  // get pulled into the agent's context on demand via the skill_read
+  // tool. Install from GitHub at /api/console/skills/install.
 
   app.get('/api/console/skills', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const skills = listSkills();
+      res.json({
+        skillsDir: SKILLS_DIR,
+        count: skills.length,
+        skills: skills.map((s) => ({
+          name: s.name,
+          description: s.frontmatter.description,
+          displayName: s.frontmatter.name,
+          bodyPreview: s.bodyPreview,
+          hasScripts: s.hasScripts,
+          hasReferences: s.hasReferences,
+          source: s.source ?? null,
+        })),
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/skills/install', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const url = typeof req.body?.url === 'string' ? req.body.url : '';
+    if (!url) { res.status(400).json({ error: 'pass a GitHub repo URL in { url }' }); return; }
+    try {
+      const job = startSkillInstall(url);
+      res.json({ job });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.get('/api/console/skills/install/:id', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const job = getSkillInstallJob(req.params.id);
+    if (!job) { res.status(404).json({ error: 'install job not found' }); return; }
+    res.json({ job });
+  });
+
+  app.delete('/api/console/skills/:name', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const name = req.params.name;
+    try {
+      const ok = uninstallSkill(name);
+      if (!ok) { res.status(404).json({ error: 'skill not found' }); return; }
+      res.json({ ok: true, name });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // ─── Custom Tools (JS plugins) ─────────────────────────────────
+  //
+  // JS plugins register MCP tools (executable code). They show up here
+  // and under the Tools panel — they are NOT skills. Skills are pure
+  // prompt knowledge; plugins are tool code.
+
+  app.get('/api/console/plugins', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
       const plugins = await loadPlugins();
@@ -1411,6 +1550,58 @@ export function registerConsoleRoutes(
       res.json({ job: startApprovedInstallCommand(command, title) });
     } catch (err) {
       res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // ─── CLI catalog (search-driven curated installs) ─────────────────
+  //
+  // The dashboard's CLI section is a search box, not a grid. The user
+  // types a name (e.g. "salesforce", "railway"), this returns matching
+  // entries with their current install status, and the install route
+  // wraps startApprovedInstallCommand so the existing job machinery
+  // streams output back.
+
+  app.get('/api/console/cli-catalog', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const q = typeof req.query.q === 'string' ? req.query.q : '';
+    try {
+      res.json({
+        query: q,
+        results: q ? statusForSearchResults(q) : [],
+        connected: readConnectedClis(),
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/cli-catalog/install', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const id = typeof req.body?.id === 'string' ? req.body.id : '';
+    const entry = findCatalogEntry(id);
+    if (!entry) { res.status(404).json({ error: 'unknown catalog id: ' + id }); return; }
+    try {
+      const job = startApprovedInstallCommand(entry.installCommand, `Install ${entry.name}`);
+      // Optimistically record the connection — if the install fails the
+      // record can be cleared via /forget. Recording up front means the
+      // agent sees the user's intent even if they navigate away before
+      // the job completes.
+      const record = recordConnectedCli(entry);
+      res.json({ job, entry, record });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/cli-catalog/forget', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const id = typeof req.body?.id === 'string' ? req.body.id : '';
+    if (!id) { res.status(400).json({ error: 'id required' }); return; }
+    try {
+      forgetConnectedCli(id);
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
   });
 
@@ -1815,19 +2006,7 @@ export function registerConsoleRoutes(
       const task = result.artifactPath && settings.analyzeOnComplete
         ? createBackgroundTask({
           title: `Analyze meeting transcript: ${result.record.title || result.record.platform || result.record.id}`,
-          prompt: [
-            'Analyze this captured meeting transcript and turn it into useful assistant memory and next actions.',
-            '',
-            `Transcript artifact: ${result.artifactPath}`,
-            `Meeting title: ${result.record.title || '(unknown)'}`,
-            `Platform: ${result.record.platform || '(unknown)'}`,
-            '',
-            'Deliver:',
-            '1. Concise meeting summary.',
-            '2. Decisions and commitments.',
-            '3. Action items with owners if inferable.',
-            '4. Suggested follow-up messages or tasks, but do not send/update external tools without approval.',
-          ].join('\n'),
+          prompt: buildAnalyzerPrompt(result.record, result.artifactPath),
           source: 'daemon',
           channel: 'electron:meeting-capture',
           maxMinutes: 30,
@@ -1839,6 +2018,42 @@ export function registerConsoleRoutes(
         segmentCount: result.segmentCount,
         queuedTask: task ? { id: task.id, title: task.title } : null,
       });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * Recent captured meetings — newest first. Drives the dashboard's
+   * Meetings panel + the post-recording completion toast (so the
+   * "send summary to chat" button can pull the analysis even if the
+   * analyzer task hasn't finished yet, in which case `hasAnalysis`
+   * stays false and the UI shows "analysis pending").
+   */
+  app.get('/api/console/meetings/recall/recent', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const limit = Math.max(1, Math.min(100, parseInt(typeof req.query.limit === 'string' ? req.query.limit : '20', 10) || 20));
+    try {
+      res.json({ meetings: listRecentRecallMeetingSummaries(limit) });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * Single meeting + analysis. Returns the full record (with
+   * transcript segments) plus the structured analysis JSON when
+   * available. Used by the meeting drawer's "view" mode and the
+   * completion toast.
+   */
+  app.get('/api/console/meetings/recall/:meetingId', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const meetingId = req.params.meetingId;
+    try {
+      const record = loadRecallMeetingById(meetingId);
+      if (!record) { res.status(404).json({ error: 'meeting not found' }); return; }
+      const analysis = loadRecallMeetingAnalysis(meetingId);
+      res.json({ record, analysis });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

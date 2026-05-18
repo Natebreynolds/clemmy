@@ -11,11 +11,16 @@ import { processProactiveBriefs } from '../agents/proactive-briefs.js';
 import { ensureSeedTemplates, processProactiveCheckIns } from '../agents/check-in-templates.js';
 import { MODELS } from '../config.js';
 import { processExecutionController } from '../execution/controller.js';
+import { ExecutionStore } from '../execution/store.js';
 import { interruptStaleRunningBackgroundTasks, processBackgroundTasks } from '../execution/background-tasks.js';
 import { processWorkflowRuns, reconcilePendingWorkflowRuns } from '../execution/workflow-runner.js';
+import { processWorkflowSchedules, reapStaleWorkflowRuns } from '../execution/workflow-scheduler.js';
 import { sweepStaleExecutions, sweepCrashedExecutions, sweepStaleBlockedExecutions } from '../execution/store.js';
 import { sweepStaleRuns } from '../runtime/run-events.js';
 import { sweepStaleApprovals } from '../runtime/approval-store.js';
+import { getAuthStatus } from '../runtime/auth-store.js';
+import { DISCORD_BOT_TOKEN, DISCORD_ENABLED, WEBHOOK_ENABLED, WEBHOOK_SECRET } from '../config.js';
+import { fullScan as warmCliScan } from '../runtime/cli-discovery.js';
 import { processMemoryMaintenance } from '../memory/maintenance.js';
 import {
   CRON_FILE,
@@ -56,6 +61,13 @@ interface CronJobRecord {
 
 interface DaemonState {
   lastCronRunByMinute: Record<string, string>;
+  // Wall-clock heartbeat written on every tick so a boot-time check
+  // can detect daemon-offline gaps and notify the user about cron runs
+  // that would have fired during the outage. Without this, a daemon
+  // crash at 02:00:30 means a 02:00 cron is silently lost — the
+  // existing dedup map would prevent re-firing within the same minute,
+  // and there's nothing to detect "scheduled but never ran" otherwise.
+  lastHealthyTickAt?: string;
 }
 
 const DELIVERY_MAX_ATTEMPTS = 5;
@@ -75,9 +87,32 @@ function loadState(): DaemonState {
   }
 }
 
+// Cron deduplication keys are minute-stamped strings like
+// "2026-05-18T07:30". Without pruning the map grows unboundedly for
+// every job × minute since first daemon boot, which slowly turns each
+// saveState into a measurable disk hit. Seven days is plenty: we only
+// need enough history to avoid re-firing a job we already ran in the
+// current minute, plus a safety margin for daemon clock-stutter.
+const CRON_STATE_RETENTION_DAYS = 7;
+
+function pruneDaemonState(state: DaemonState): DaemonState {
+  const cutoff = new Date(Date.now() - CRON_STATE_RETENTION_DAYS * 24 * 60 * 60 * 1000)
+    .toISOString()
+    .slice(0, 16); // YYYY-MM-DDTHH:MM — lexicographically comparable to currentMinuteKey
+  const next: Record<string, string> = {};
+  for (const [name, key] of Object.entries(state.lastCronRunByMinute)) {
+    if (key >= cutoff) next[name] = key;
+  }
+  return { ...state, lastCronRunByMinute: next };
+}
+
 function saveState(state: DaemonState): void {
   ensureDir(path.dirname(STATE_FILE));
-  writeFileSync(STATE_FILE, JSON.stringify(state, null, 2), 'utf-8');
+  const pruned = pruneDaemonState(state);
+  writeFileSync(STATE_FILE, JSON.stringify(pruned, null, 2), 'utf-8');
+  // Mutate in place so callers retain a reference to the pruned map —
+  // otherwise the next saveState would re-write the dropped entries.
+  state.lastCronRunByMinute = pruned.lastCronRunByMinute;
 }
 
 function validateCronExpression(expr: string): boolean {
@@ -136,9 +171,61 @@ function appendRunLog(jobName: string, payload: Record<string, unknown>): void {
   writeFileSync(filePath, `${existing}${JSON.stringify(payload)}\n`, 'utf-8');
 }
 
+// Per-cron wall-clock budget. Unleashed/background jobs are allowed
+// more headroom because they're often the ones doing real research
+// (proposal briefs, audits). job.max_hours is honored if set; otherwise
+// fall back to a sane default per mode. We never let a single cron run
+// hold the daemon's main loop hostage forever — that's the failure mode
+// that turned cron, notification delivery, and heartbeat sweeping into
+// silent dead air for hours at a time.
+function resolveCronWallClockMs(job: CronJobRecord): number {
+  if (typeof job.max_hours === 'number' && job.max_hours > 0) {
+    return Math.min(job.max_hours * 60 * 60_000, 6 * 60 * 60_000);
+  }
+  return job.mode === 'unleashed' ? 60 * 60_000 : 15 * 60_000;
+}
+
+// Long-running cron jobs used to vanish into total silence between
+// "started" and "completed". For a 30-min cron, the user got nothing
+// for 30 min and couldn't tell crash from progress. We now emit one
+// heartbeat at the 5-min mark and every 10 min after. Each heartbeat
+// has a deterministic ID so re-runs of the same cron at the same
+// timestamp don't double-fire (dedup via addNotification's id check).
+const CRON_HEARTBEAT_FIRST_MS = 5 * 60_000;
+const CRON_HEARTBEAT_INTERVAL_MS = 10 * 60_000;
+
+function startCronHeartbeat(job: CronJobRecord, startedAt: string, startMs: number): () => void {
+  let count = 0;
+  const fire = () => {
+    count += 1;
+    const elapsedMin = Math.max(1, Math.round((Date.now() - startMs) / 60_000));
+    addNotification({
+      id: `cron-heartbeat-${job.name}-${startedAt}-${count}`,
+      kind: 'cron',
+      title: `Cron job still running: ${job.name}`,
+      body: `Elapsed: ${elapsedMin} min. Will notify on completion or failure. Open Console → Activity for live status.`,
+      createdAt: new Date().toISOString(),
+      read: false,
+      metadata: { job: job.name, heartbeat: true, elapsedMin },
+    });
+  };
+  let interval: ReturnType<typeof setInterval> | undefined;
+  const first = setTimeout(() => {
+    fire();
+    interval = setInterval(fire, CRON_HEARTBEAT_INTERVAL_MS);
+    interval.unref?.();
+  }, CRON_HEARTBEAT_FIRST_MS);
+  first.unref?.();
+  return () => {
+    clearTimeout(first);
+    if (interval) clearInterval(interval);
+  };
+}
+
 async function runCronJob(assistant: ClementineAssistant, job: CronJobRecord, source: 'schedule' | 'trigger'): Promise<void> {
   const startedAt = new Date().toISOString();
   const startMs = Date.now();
+  const stopHeartbeat = startCronHeartbeat(job, startedAt, startMs);
   try {
     const prompt = [
       `Cron job: ${job.name}`,
@@ -155,6 +242,7 @@ async function runCronJob(assistant: ClementineAssistant, job: CronJobRecord, so
       channel: 'cron',
       message: prompt,
       model: job.mode === 'unleashed' ? MODELS.deep : MODELS.primary,
+      maxWallClockMs: resolveCronWallClockMs(job),
     });
 
     appendRunLog(job.name, {
@@ -194,6 +282,8 @@ async function runCronJob(assistant: ClementineAssistant, job: CronJobRecord, so
       metadata: { job: job.name, source, status: 'error' },
     });
     logger.error({ err: error, job: job.name, source }, 'Cron job failed');
+  } finally {
+    stopHeartbeat();
   }
 }
 
@@ -206,10 +296,165 @@ async function processCronSchedules(assistant: ClementineAssistant, state: Daemo
     if (job.enabled === false) continue;
     if (!cronMatches(job.schedule, now)) continue;
     if (state.lastCronRunByMinute[job.name] === minuteKey) continue;
+    // In-memory dedup BEFORE await so a follow-up tick within the
+    // same minute doesn't re-fire. Persist AFTER successful run so a
+    // crash mid-job leaves the disk state clean — the boot-time
+    // missed-run scan will see the gap and surface it instead of
+    // silently treating it as "ran."
     state.lastCronRunByMinute[job.name] = minuteKey;
-    saveState(state);
     await runCronJob(assistant, job, 'schedule');
+    saveState(state);
   }
+}
+
+// Surfaces critical setup gaps as one-per-day notifications at daemon
+// boot. The doctor CLI catches the same things but only when the user
+// runs it manually — for problems that silently break agent work
+// (missing auth, missing Discord token), the user should learn at the
+// next login to the dashboard, not when they go investigate why no
+// notifications have arrived. Each issue uses a daily-bucketed id so
+// addNotification's dedup keeps the noise down.
+function reportBootSetupIssues(): void {
+  const dayKey = new Date().toISOString().slice(0, 10);
+  const issues: Array<{ slug: string; title: string; body: string }> = [];
+
+  try {
+    const auth = getAuthStatus();
+    if (!auth.configured) {
+      issues.push({
+        slug: 'auth',
+        title: 'Authentication not configured — agent runs will fail',
+        body: `${auth.message}\n\nOpen the desktop app → Settings → Re-authenticate, or run \`clementine auth login\`. Until this is fixed, cron jobs, workflows, chat, and background tasks all error out.`,
+      });
+    }
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'Boot setup check: getAuthStatus threw',
+    );
+  }
+
+  if (WEBHOOK_ENABLED && (!WEBHOOK_SECRET || WEBHOOK_SECRET === 'change-me' || WEBHOOK_SECRET === 'change-me-local-secret')) {
+    issues.push({
+      slug: 'webhook-secret',
+      title: 'Webhook secret is the default placeholder',
+      body: 'The dashboard / webhook endpoint is using a placeholder WEBHOOK_SECRET. Anyone on your network could reach the API. Set a real secret in `~/.clementine-next/.env` and restart the daemon.',
+    });
+  }
+
+  if (DISCORD_ENABLED && !DISCORD_BOT_TOKEN) {
+    issues.push({
+      slug: 'discord-token',
+      title: 'Discord enabled but token is missing',
+      body: 'DISCORD_ENABLED=true but DISCORD_BOT_TOKEN is empty. The Discord channel will not connect. Run `clementine setup` and configure the bot token, or set DISCORD_ENABLED=false.',
+    });
+  }
+
+  for (const issue of issues) {
+    addNotification({
+      id: `system-setup-${issue.slug}-${dayKey}`,
+      kind: 'system',
+      title: issue.title,
+      body: issue.body,
+      createdAt: new Date().toISOString(),
+      read: false,
+      metadata: { errorCategory: 'setup_gap', slug: issue.slug },
+    });
+  }
+}
+
+// Marks due executions with a once-per-day "paused by policy" activity
+// entry so the dashboard can render "Paused: quiet hours" instead of
+// looking like the execution is stuck. The reason string is built from
+// the proactivity snapshot so the user sees what specifically is
+// preventing work (quiet hours vs. global disable).
+function annotateDueExecutionsAsPolicyPaused(
+  proactivity: ReturnType<typeof getProactivityPolicySnapshot>,
+): void {
+  try {
+    const store = new ExecutionStore();
+    const due = store.listDue(new Date(), 20);
+    if (due.length === 0) return;
+    const reason = proactivity.quietHoursActive
+      ? 'Paused for quiet hours'
+      : 'Paused: proactivity policy disabled';
+    const dayKey = new Date().toISOString().slice(0, 10);
+    for (const execution of due) {
+      store.addActivity({
+        executionId: execution.id,
+        key: `policy_paused:${dayKey}`,
+        type: 'status',
+        message: `${reason} — execution will resume on next allowed tick.`,
+        metadata: {
+          policyPaused: true,
+          quietHoursActive: proactivity.quietHoursActive,
+          policyEnabled: proactivity.policy.enabled,
+          observedAt: new Date().toISOString(),
+        },
+      });
+    }
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'Failed to annotate due executions as policy-paused',
+    );
+  }
+}
+
+// Boot-time missed-run detection. Compares the persisted
+// lastHealthyTickAt against now; if the daemon was offline for more
+// than 5 min, walk every minute in the gap and count cron schedules
+// that would have matched. Roll up into one notification so the user
+// learns "you were down for X minutes and missed Y scheduled runs"
+// instead of finding out hours later that the morning briefing never
+// arrived.
+function reportMissedCronRunsOnBoot(state: DaemonState): void {
+  if (!state.lastHealthyTickAt) return;
+  const lastAt = Date.parse(state.lastHealthyTickAt);
+  if (!Number.isFinite(lastAt)) return;
+  const now = Date.now();
+  const gapMs = now - lastAt;
+  const GAP_THRESHOLD_MS = 5 * 60_000;
+  if (gapMs < GAP_THRESHOLD_MS) return;
+
+  const jobs = loadCronJobs().filter((job) => job.enabled !== false);
+  const missed: Array<{ job: string; at: string }> = [];
+  // Iterate every minute in the gap. We start one minute past the
+  // last healthy tick (the tick before the crash already covered
+  // anything in its own minute) and include the current minute so a
+  // crash that straddled a scheduled fire still surfaces.
+  for (let t = lastAt + 60_000; t <= now; t += 60_000) {
+    const at = new Date(t);
+    for (const job of jobs) {
+      if (cronMatches(job.schedule, at)) {
+        missed.push({ job: job.name, at: at.toISOString().slice(0, 16) });
+      }
+    }
+  }
+  const gapMinutes = Math.round(gapMs / 60_000);
+  const id = `system-daemon-offline-${state.lastHealthyTickAt}`;
+  if (missed.length === 0) {
+    addNotification({
+      id,
+      kind: 'system',
+      title: `Clementine was offline for ${gapMinutes} min`,
+      body: `Daemon was down from ${state.lastHealthyTickAt} until ${new Date(now).toISOString()}. No scheduled cron runs were due during the outage.`,
+      createdAt: new Date().toISOString(),
+      read: false,
+      metadata: { errorCategory: 'daemon_offline', gapMinutes, missedCount: 0 },
+    });
+    return;
+  }
+  const list = missed.slice(0, 10).map((m) => `• ${m.job} @ ${m.at}`).join('\n');
+  addNotification({
+    id,
+    kind: 'system',
+    title: `${missed.length} scheduled cron run${missed.length === 1 ? '' : 's'} missed (daemon was offline ${gapMinutes} min)`,
+    body: `These scheduled runs did NOT fire while Clementine was down:\n${list}${missed.length > 10 ? `\n(+${missed.length - 10} more)` : ''}\n\nIf any are critical, re-trigger from Console → Crons.`,
+    createdAt: new Date().toISOString(),
+    read: false,
+    metadata: { errorCategory: 'daemon_offline', gapMinutes, missedCount: missed.length, missed: missed.slice(0, 50) },
+  });
 }
 
 async function processCronTriggers(assistant: ClementineAssistant): Promise<void> {
@@ -237,11 +482,31 @@ async function processCronTriggers(assistant: ClementineAssistant): Promise<void
 // daemon restart (research_bot/manager.py pattern). The inline
 // sequential runner that lived here has been retired.
 
+// Daily user-facing prompt when notifications can't be delivered for
+// lack of any configured destination. Bucketed by calendar day so the
+// user sees it once, not on every 15s tick. When destinations get
+// configured later, deferred jobs flush automatically on the next tick.
+function emitNoDestinationsPromptIfNeeded(deferredCount: number): void {
+  if (deferredCount === 0) return;
+  const id = `system-no-notification-destinations-${new Date().toISOString().slice(0, 10)}`;
+  if (getNotification(id)) return;
+  addNotification({
+    id,
+    kind: 'system',
+    title: `${deferredCount} notification${deferredCount === 1 ? '' : 's'} can't be delivered — no destination configured`,
+    body: 'Clementine has produced notifications (cron jobs, workflows, executions) that have nowhere to go. Open Console → Settings → Notifications to add a Discord channel/DM or webhook. Deferred notifications will flush automatically once a destination is configured.',
+    createdAt: new Date().toISOString(),
+    read: false,
+    metadata: { errorCategory: 'no_destinations', deferredCount },
+  });
+}
+
 async function processNotificationDeliveries(): Promise<void> {
   const queue = listQueuedNotificationDeliveries();
   if (queue.length === 0) return;
 
   const nextQueue: typeof queue = [];
+  let deferredCount = 0;
   for (const job of queue) {
     const notification = getNotification(job.notificationId);
     if (!notification) {
@@ -250,15 +515,21 @@ async function processNotificationDeliveries(): Promise<void> {
 
     const destinations = getNotificationDestinationsForRecord(notification);
     if (destinations.length === 0) {
-      // No destinations resolved — this used to silently drop jobs forever,
-      // which is how cron notifications went missing all morning. Now we
-      // log it so the issue is visible, and drop the job (next addNotification
-      // will be a fresh attempt if destinations get configured).
-      logger.warn({
-        notificationId: notification.id,
-        kind: notification.kind,
-        title: notification.title,
-      }, 'No notification destinations resolved — message will not be delivered. Configure a destination or set DISCORD_DM_ALLOWED_USERS.');
+      // No destinations resolved. Previously this dropped the job
+      // permanently — the user could trigger hours of work and never
+      // hear a peep. Now we keep the job alive in the queue (cheap;
+      // it's just a scan per tick) and emit a single daily prompt
+      // telling the user to configure a destination. As soon as one
+      // is added, the queued jobs flush on the next tick.
+      deferredCount += 1;
+      if (deferredCount === 1) {
+        logger.warn({
+          notificationId: notification.id,
+          kind: notification.kind,
+          title: notification.title,
+        }, 'No notification destinations resolved — keeping job deferred in queue.');
+      }
+      nextQueue.push(job);
       continue;
     }
     const now = new Date();
@@ -329,11 +600,20 @@ async function processNotificationDeliveries(): Promise<void> {
   }
 
   replaceQueuedNotificationDeliveries(nextQueue);
+  emitNoDestinationsPromptIfNeeded(deferredCount);
 }
 
 export async function startDaemon(assistant: ClementineAssistant): Promise<void> {
   ensureDir(CRON_PROGRESS_DIR);
   const state = loadState();
+  // Surface "we missed N scheduled runs while you were offline" BEFORE
+  // any other startup work so the user has the bad news first. Safe to
+  // call even on first boot (no-op without a previous heartbeat).
+  reportMissedCronRunsOnBoot(state);
+  // Daily-bucketed setup-gap notifications so the user discovers
+  // missing auth / broken config when they open the dashboard, not
+  // when they go looking for a missing notification.
+  reportBootSetupIssues();
   const interrupted = interruptStaleRunningBackgroundTasks();
   if (interrupted > 0) {
     logger.warn({ interrupted }, 'Marked stale running background tasks as interrupted');
@@ -387,6 +667,43 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
 
   logger.info('Daemon loop started');
 
+  // Warm the CLI-discovery cache in the background so the first agent
+  // call to local_cli_list and the first dashboard render of the Local
+  // CLIs card don't pay the full $PATH-walk-and-probe cost (5–30s on a
+  // typical dev machine). Errors are non-fatal — the cache will rebuild
+  // on demand if this fails.
+  void warmCliScan().catch((err) => {
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'Initial CLI discovery scan failed (will retry on demand)',
+    );
+  });
+
+  // Notification delivery runs on its OWN cadence, independent of the
+  // main loop. The main loop can park for 30+ min on a long cron job
+  // or workflow; without this decoupling, notifications queued during
+  // that window would only flush after the long phase returned. With
+  // this, the user sees completion/failure notifications, heartbeats,
+  // and approvals in near-real-time even while a deep job is in flight.
+  // An in-flight guard prevents overlap when a single delivery pass
+  // is unusually slow.
+  let deliveryInFlight = false;
+  const deliveryTimer = setInterval(() => {
+    if (deliveryInFlight) return;
+    deliveryInFlight = true;
+    processNotificationDeliveries()
+      .catch((err) => {
+        logger.warn(
+          { err: err instanceof Error ? err.message : String(err) },
+          'Independent notification delivery tick failed',
+        );
+      })
+      .finally(() => {
+        deliveryInFlight = false;
+      });
+  }, 15_000);
+  deliveryTimer.unref?.();
+
   // Stagger monitor runs — don't run them every 15s tick
   let tickCount = 0;
 
@@ -394,6 +711,9 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
     tickCount++;
     await processCronSchedules(assistant, state);
     await processCronTriggers(assistant);
+    // Match workflows with trigger.schedule against the wall clock and
+    // enqueue runs. processWorkflowRuns (below) then drains the queue.
+    await processWorkflowSchedules();
     await processWorkflowRuns(assistant);
     await processBackgroundTasks(assistant);
     const proactivity = getProactivityPolicySnapshot();
@@ -427,9 +747,19 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
         enabled: proactivity.policy.enabled,
         quietHoursActive: proactivity.quietHoursActive,
       }, 'Proactive daemon work is paused by policy');
+      // Daily-bucketed "I'm paused, not stuck" marker on each
+      // currently-due execution. Without this, a tracked execution
+      // sitting at "Active · next review now" with no progress for
+      // 8h overnight looks broken on the dashboard — actually it's
+      // just quiet hours. addActivity's key-based dedup means each
+      // execution gets at most one entry per UTC day per pause window.
+      annotateDueExecutionsAsPolicyPaused(proactivity);
     }
     await processMemoryMaintenance(tickCount);
-    await processNotificationDeliveries();
+    // Notification delivery used to run inline here. It now ticks on
+    // its own independent setInterval above, so deliveries keep
+    // flowing while this loop is parked on a long workflow / cron /
+    // background task.
     // Periodic stale-record sweep: cheap (one JSON load + a filter) and
     // bounded — only writes when something actually expired. Every 60 ticks
     // ≈ 15 minutes, which is plenty fast for dashboard correctness without
@@ -452,6 +782,32 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
       if (sweptCrashed > 0) {
         logger.warn({ sweptCrashed }, 'Heartbeat sweep auto-failed crashed executions');
       }
+    }
+    // Reap terminal workflow run records older than 7 days. Without
+    // this, processWorkflowRuns re-reads every completed run file every
+    // tick — a `*/1 * * * *` workflow that ran for a day would leave
+    // 1440 files re-parsed on every 15s tick, slowly browning out the
+    // main loop. Hourly cadence keeps disk traffic minimal.
+    if (tickCount % 240 === 0) {
+      try {
+        const reaped = reapStaleWorkflowRuns();
+        if (reaped.deleted > 0) {
+          logger.info(reaped, 'Reaped stale workflow run records');
+        }
+      } catch (err) {
+        logger.warn(
+          { err: err instanceof Error ? err.message : String(err) },
+          'Workflow run reaper failed',
+        );
+      }
+    }
+    // Persist a daemon-alive heartbeat every ~minute so a future boot
+    // can detect outages and surface missed cron firings. Pinning to
+    // every 4 ticks (~60s) keeps disk traffic minimal while staying
+    // well inside cron's minute-resolution gap detection threshold.
+    if (tickCount % 4 === 0) {
+      state.lastHealthyTickAt = new Date().toISOString();
+      saveState(state);
     }
     await sleep(15_000);
   }

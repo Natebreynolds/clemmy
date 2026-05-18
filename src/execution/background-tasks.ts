@@ -555,6 +555,15 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
         continue;
       }
 
+	      // Hard wall-clock cap. Previously `maxMinutes` was only embedded
+	      // in the worker prompt as a soft hint — a model that ignored
+	      // it (or a runtime stall) would have the task run for hours.
+	      // The 2s shouldCancel poll inside the runtime turns this into
+	      // an at-most-2s grace period past the deadline before we
+	      // unwind via AgentRuntimeCancelledError. The catch handler
+	      // reads cancellationReason and marks the task aborted with a
+	      // user-readable message.
+	      const wallClockDeadlineMs = Date.now() + task.maxMinutes * 60_000;
 	      const response = await assistant.respond({
 	        sessionId: task.runSessionId,
 	        channel: task.channel ?? 'background',
@@ -563,6 +572,17 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	        message: buildWorkerPrompt(task),
 	        runId: run.id,
 	        shouldCancel: () => {
+	          if (Date.now() > wallClockDeadlineMs) {
+	            const latest = getBackgroundTask(task.id);
+	            if (latest && latest.status !== 'cancelling' && latest.status !== 'aborted') {
+	              updateBackgroundTask(task.id, {
+	                status: 'cancelling',
+	                cancellationRequestedAt: new Date().toISOString(),
+	                cancellationReason: `Exceeded soft max runtime of ${task.maxMinutes} minutes. Re-queue with a higher cap to continue.`,
+	              });
+	            }
+	            return true;
+	          }
 	          const latest = getBackgroundTask(task.id);
 	          return latest?.status === 'cancelling' || latest?.status === 'aborted';
 	        },

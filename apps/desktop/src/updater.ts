@@ -100,15 +100,30 @@ export async function checkForUpdatesNow(): Promise<UpdaterStatus> {
 }
 
 /**
- * Trigger quit+install of an already-downloaded update. Safe to call
- * when state !== 'ready-to-install' — autoUpdater no-ops in that case.
+ * Trigger quit+install of an already-downloaded update.
+ *
+ * Returns a result so the renderer can surface failures. The earlier
+ * version was `void` and silently no-op'd when state !== 'ready-to-
+ * install', so the in-app banner click "did nothing" with no signal
+ * to the user — observed in production on v0.3.0.
  */
-export function applyUpdate(): void {
-  if (status.state !== 'ready-to-install') return;
-  // isSilent=false: show the standard installer UI.
-  // isForceRunAfter=true: relaunch Clementine post-update so the user
-  //   doesn't have to manually re-open it.
-  autoUpdater.quitAndInstall(false, true);
+export function applyUpdate(): { ok: boolean; reason?: string } {
+  if (status.state !== 'ready-to-install') {
+    return {
+      ok: false,
+      reason: `Not ready to install (state: ${status.state}). Try again after the update finishes downloading, or use Check For Updates from the tray.`,
+    };
+  }
+  try {
+    // isSilent=false: show the standard installer UI.
+    // isForceRunAfter=true: relaunch Clementine post-update so the user
+    //   doesn't have to manually re-open it.
+    autoUpdater.quitAndInstall(false, true);
+    return { ok: true };
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    return { ok: false, reason };
+  }
 }
 
 /**

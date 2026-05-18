@@ -7,6 +7,14 @@ export class AgentRuntimeCancelledError extends Error {
   }
 }
 
+// The single canonical placeholder shown to the user when the runtime
+// produces no final text AND no tool calls. Exported so callers can
+// recognize it and avoid persisting it as a real assistant turn — the
+// previous behavior polluted session history (each error ate one slot
+// in the 40-turn window, pushing real content out faster than chat).
+export const ASSISTANT_PAUSED_PLACEHOLDER =
+  'Clementine paused without a final reply — ask again to pick up where she left off.';
+
 export interface AgentRuntimeCallbacks {
   /** Final assembled text — fired once when the run completes. Always fires. */
   onText?: (text: string) => Promise<void>;

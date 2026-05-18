@@ -141,6 +141,11 @@ export interface RunTurnResult {
 
 export interface OrchestratorDecisionShape {
   summary: string;
+  /** Natural-language reply to show the user this turn. Null when the
+   *  Orchestrator is handing off or otherwise not producing the
+   *  user-visible text itself. When present and non-empty, this is
+   *  what the chat/Discord surface renders — not `summary`. */
+  reply?: string | null;
   done: boolean;
   nextAction:
     | 'awaiting_user_input'
@@ -252,12 +257,22 @@ export async function runConversation(
 
     if (!decision) {
       // No structured decision = nothing to recurse on. End cleanly.
+      // This usually means a handoff target (Executor/Researcher/etc.)
+      // became the final agent on the run, so the Orchestrator's
+      // outputType never applied. The sub-agent's raw final output IS
+      // the user-facing answer — surface it as the summary so the UI
+      // has something to render instead of just "complete".
+      const fallbackSummary = extractFallbackSummary(turnResult.finalOutput);
       safeAppend({
         sessionId: options.sessionId,
         turn: turnResult.turn,
         role: 'system',
         type: 'conversation_completed',
-        data: { steps: stepIndex, reason: 'no_structured_output' },
+        data: {
+          steps: stepIndex,
+          reason: 'no_structured_output',
+          summary: fallbackSummary,
+        },
       });
       return {
         sessionId: options.sessionId,
@@ -269,12 +284,23 @@ export async function runConversation(
     }
 
     if (decision.done) {
+      // Render priority on the chat surface: prefer `reply` (the
+      // natural-language message intended for the user) over `summary`
+      // (an internal log entry). Earlier behavior used summary as the
+      // user-visible text, which produced "Responded to Nate's greeting
+      // directly with no handoff." style META-descriptions in the chat
+      // bubble. The summary stays in the event for telemetry.
       safeAppend({
         sessionId: options.sessionId,
         turn: turnResult.turn,
         role: 'system',
         type: 'conversation_completed',
-        data: { steps: stepIndex, summary: decision.summary },
+        data: {
+          steps: stepIndex,
+          summary: decision.reply && decision.reply.trim() ? decision.reply : decision.summary,
+          internalSummary: decision.summary,
+          reply: decision.reply ?? null,
+        },
       });
       return {
         sessionId: options.sessionId,
@@ -315,7 +341,9 @@ export async function runConversation(
         type: 'conversation_completed',
         data: {
           steps: stepIndex,
-          summary: decision.summary,
+          summary: decision.reply && decision.reply.trim() ? decision.reply : decision.summary,
+          internalSummary: decision.summary,
+          reply: decision.reply ?? null,
           reason: 'abandoned_by_orchestrator',
         },
       });
@@ -383,6 +411,7 @@ function toOrchestratorDecision(value: unknown): OrchestratorDecisionShape | nul
   if (!validActions.has(v.nextAction)) return null;
   return {
     summary: v.summary,
+    reply: typeof v.reply === 'string' && v.reply.trim() ? v.reply : null,
     done: v.done,
     nextAction: v.nextAction as OrchestratorDecisionShape['nextAction'],
     reason: typeof v.reason === 'string' ? v.reason : null,
@@ -1012,6 +1041,32 @@ function previewOutput(out: unknown): string {
   } catch {
     return String(out).slice(0, 200);
   }
+}
+
+/**
+ * When the Orchestrator hands off to a sub-agent, that sub-agent
+ * becomes the final agent on the run — the Orchestrator's structured
+ * outputType doesn't apply, so the loop sees `decision: null`. The
+ * sub-agent's raw final output is still the actual user-facing
+ * answer. Surface it as a fallback summary so the chat UI renders the
+ * answer instead of a bare "complete" status.
+ *
+ * Returns undefined when no usable text exists (the conversation_completed
+ * event then omits the summary field entirely).
+ */
+function extractFallbackSummary(out: unknown): string | undefined {
+  if (typeof out === 'string') {
+    const trimmed = out.trim();
+    return trimmed ? trimmed : undefined;
+  }
+  if (out && typeof out === 'object') {
+    try {
+      return JSON.stringify(out);
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
 }
 
 // ---------- default Runner adapter ----------

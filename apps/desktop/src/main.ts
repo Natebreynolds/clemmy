@@ -36,6 +36,7 @@ import {
   type CredentialName,
 } from './credentials-bridge.js';
 import { addWorkspaceDir, ensureHomeEnv, saveUserProfile, setHomeEnv, type ProfilePatch } from './setup-bridge.js';
+import { persistCodexOAuthTokens, runCodexOAuthLogin } from './codex-oauth.js';
 
 /**
  * Clementine Desktop — Electron main process.
@@ -104,7 +105,16 @@ function createSplashWindow(): BrowserWindow {
     resizable: false,
     alwaysOnTop: true,
     backgroundColor: '#07070a',
-    webPreferences: { contextIsolation: true, nodeIntegration: false },
+    webPreferences: {
+      // Without the preload, window.clemmy isn't defined, so the
+      // splash's status-text updater never wires up and the user
+      // sees "starting daemon…" for the entire boot. The supervisor
+      // events are still dispatched via executeJavaScript, but the
+      // listener never registers.
+      preload: preloadPath(),
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
   });
   const html = `<!DOCTYPE html>
 <html><head><meta charset="utf-8" /><title>Clementine</title>
@@ -481,6 +491,18 @@ ipcMain.handle('clemmy:recall-start-manual', async () => {
   return recallCapture?.startManualRecording() ?? null;
 });
 
+ipcMain.handle('clemmy:recall-record-detected', async (_evt: IpcMainInvokeEvent, payload: { windowId: string }) => {
+  const id = (payload?.windowId ?? '').trim();
+  if (!id) throw new Error('windowId required');
+  return recallCapture?.recordDetectedWindow(id) ?? null;
+});
+
+ipcMain.handle('clemmy:recall-auto-record', async (_evt: IpcMainInvokeEvent, payload: { windowId: string }) => {
+  const id = (payload?.windowId ?? '').trim();
+  if (!id) throw new Error('windowId required');
+  return recallCapture?.enableAutoRecordAndRecord(id) ?? null;
+});
+
 ipcMain.handle('clemmy:recall-stop', async () => {
   return recallCapture?.stopRecording() ?? null;
 });
@@ -502,8 +524,8 @@ ipcMain.handle('clemmy:updater-check', async () => {
 });
 
 ipcMain.handle('clemmy:updater-apply', () => {
-  applyUpdate();
-  return getUpdaterStatus();
+  const result = applyUpdate();
+  return { ...getUpdaterStatus(), applyResult: result };
 });
 
 // ─── Setup wizard IPC handlers ─────────────────────────────────────
@@ -551,6 +573,47 @@ ipcMain.handle('clemmy:setup-save-workspace', async (_evt: IpcMainInvokeEvent, p
   if (!p) throw new Error('path required');
   addWorkspaceDir(p);
   return { ok: true };
+});
+
+ipcMain.handle('clemmy:setup-pick-workspace-folder', async () => {
+  // Native folder picker so the wizard doesn't ask the user to type a
+  // path. Resolves to { path } when the user picks a folder, or
+  // { path: '' } when they cancel.
+  const parent = setupWindow ?? mainWindow;
+  const opts: Electron.OpenDialogOptions = {
+    title: 'Pick a workspace folder',
+    properties: ['openDirectory', 'createDirectory'],
+    defaultPath: HOME,
+  };
+  const result = parent
+    ? await dialog.showOpenDialog(parent, opts)
+    : await dialog.showOpenDialog(opts);
+  if (result.canceled || result.filePaths.length === 0) return { path: '' };
+  return { path: result.filePaths[0] };
+});
+
+ipcMain.handle('clemmy:setup-codex-login', async () => {
+  // Run the OAuth dance from the Electron main process so the user
+  // never sees a terminal. Tokens are persisted to BOTH the daemon's
+  // local auth store and the codex CLI compatibility file, plus the
+  // SecretStore vault so the dashboard's credentials view picks them
+  // up immediately.
+  try {
+    const tokens = await runCodexOAuthLogin();
+    persistCodexOAuthTokens(tokens);
+    await setCredential('codex_oauth_access_token', tokens.accessToken).catch(() => { /* vault is best-effort */ });
+    await setCredential('codex_oauth_refresh_token', tokens.refreshToken).catch(() => { /* vault is best-effort */ });
+    return {
+      ok: true as const,
+      accountId: tokens.accountId ?? '',
+      lastRefresh: tokens.lastRefresh,
+    };
+  } catch (err) {
+    return {
+      ok: false as const,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
 });
 
 ipcMain.handle('clemmy:setup-discord-verify', async (_evt: IpcMainInvokeEvent, payload: { token: string }) => {
@@ -601,6 +664,16 @@ ipcMain.handle('clemmy:setup-save-profile', async (_evt: IpcMainInvokeEvent, pat
 });
 
 ipcMain.handle('clemmy:setup-complete', async (_evt: IpcMainInvokeEvent, record: { configured: SetupConfiguredSummary }) => {
+  // Persist AUTH_MODE so the daemon reads the right runtime on boot.
+  // Without this, a user who picked Codex OAuth still gets AUTH_MODE=
+  // api_key (the config.ts default) and the runtime tries to use an
+  // empty OPENAI_API_KEY → every agent call fails. Skip mode leaves
+  // AUTH_MODE alone so a later credential drop can set it.
+  if (record.configured.auth === 'codex') {
+    setHomeEnv({ AUTH_MODE: 'codex_oauth' });
+  } else if (record.configured.auth === 'openai') {
+    setHomeEnv({ AUTH_MODE: 'api_key' });
+  }
   writeSetupComplete({ configured: record.configured });
   // Close the wizard, kick the daemon, transition to dashboard.
   const win = setupWindow;

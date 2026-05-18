@@ -7,6 +7,7 @@ import { renderFactsForInstructions } from '../memory/facts.js';
 import { renderProfileForInstructions } from '../runtime/user-profile.js';
 import { getProposalFeedback, renderProposalFeedback } from '../agents/proposal-feedback.js';
 import { renderMcpServersForInstructions } from '../runtime/mcp-config.js';
+import { readConnectedClis } from '../integrations/cli-catalog/catalog.js';
 
 const GOALS_DIR = path.join(BASE_DIR, 'goals');
 
@@ -89,7 +90,35 @@ function buildIntegrationsContext(): string {
     // MCP discovery should never block assistant startup.
   }
 
+  try {
+    const cliBlock = renderConnectedCliForInstructions();
+    if (cliBlock) sections.push(cliBlock);
+  } catch {
+    // Best-effort — connected-cli surfacing is enrichment, not load-bearing.
+  }
+
   return sections.join('\n\n');
+}
+
+/**
+ * Tell the agent which CLIs the user has explicitly connected via the
+ * dashboard's CLI catalog. This is a stronger signal than "it's on $PATH"
+ * — if it's here, the user wired it intentionally and the auth command +
+ * doc URL are known. Renders nothing when the user hasn't connected any.
+ */
+function renderConnectedCliForInstructions(): string {
+  const connected = readConnectedClis();
+  const entries = Object.values(connected);
+  if (entries.length === 0) return '';
+  const lines = entries.map((c) => {
+    const authHint = c.authCommand ? ` · auth: \`${c.authCommand}\`` : '';
+    return `- \`${c.command}\` — ${c.name} (${c.vendor})${authHint}`;
+  });
+  return [
+    'Connected CLIs (the user wired these via the dashboard — they are intentionally available, not random $PATH noise):',
+    ...lines,
+    'Call them via `run_shell_command`. If a CLI needs auth, run its auth command first; if that fails, surface the doc link rather than guessing flags.',
+  ].join('\n');
 }
 
 /**

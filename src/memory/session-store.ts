@@ -1,11 +1,58 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { BASE_DIR } from '../config.js';
 import type { ConversationTurn, SessionRecord } from '../types.js';
+import { ASSISTANT_PAUSED_PLACEHOLDER } from '../runtime/provider.js';
 
 const SESSION_DIR = path.join(BASE_DIR, 'state');
 const SESSION_FILE = path.join(SESSION_DIR, 'sessions.json');
-const MAX_TURNS_PER_SESSION = 40;
+// Sessions like `console:home` are a persistent rolling chat for the
+// user — we MUST keep enough turns to make months of normal use feel
+// continuous. The previous cap of 40 silently dropped older content
+// every time the session went past ~40 messages, which is well within
+// a single afternoon for a real working session. Bumped to 400 (≈ 5+
+// months of typical use at the observed ~80 turns/week). Anything
+// pushed past the cap is archived to a daily vault note (see
+// archiveDroppedTurnsToVault) so it remains FTS-recallable instead
+// of vanishing into /dev/null.
+const MAX_TURNS_PER_SESSION = 400;
+// Vault subfolder for archived session turns. Lives under the
+// existing Daily Notes tree so the vault reindexer picks it up
+// automatically without any new wiring.
+const SESSION_ARCHIVE_VAULT_REL = path.join('vault', '01-Daily-Notes');
+
+function isPersistableTurn(turn: ConversationTurn): boolean {
+  // Drop the "Clementine paused without a final reply" placeholder —
+  // a runtime error sentinel, not real conversation. Storing it costs
+  // a slot in the turn window AND clutters the brief / transcript
+  // with "Clementine paused" entries that displace real history.
+  if (turn.role === 'assistant' && turn.text.trim() === ASSISTANT_PAUSED_PLACEHOLDER) {
+    return false;
+  }
+  return true;
+}
+
+function archiveDroppedTurnsToVault(sessionId: string, dropped: ConversationTurn[]): void {
+  if (dropped.length === 0) return;
+  try {
+    const safeSession = sessionId.replace(/[^a-zA-Z0-9_.-]/g, '-').slice(0, 80);
+    const day = new Date().toISOString().slice(0, 10);
+    const dir = path.join(BASE_DIR, SESSION_ARCHIVE_VAULT_REL);
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    const filePath = path.join(dir, `${day}-chat-archive-${safeSession}.md`);
+    const header = existsSync(filePath)
+      ? ''
+      : `---\nkind: chat-archive\nsessionId: ${sessionId}\nday: ${day}\n---\n\n# Chat archive · ${sessionId} · ${day}\n\nTurns rotated out of the live session ring buffer. Searchable via vault FTS / semantic recall.\n\n`;
+    const body = dropped
+      .map((turn) => `## ${turn.role} · ${turn.createdAt}\n\n${turn.text}\n`)
+      .join('\n');
+    appendFileSync(filePath, `${header}${body}\n`, 'utf-8');
+  } catch {
+    // Best-effort. Archive failure must never block the chat turn —
+    // the canonical session is still being persisted; this is just
+    // the durable recall path.
+  }
+}
 
 function ensureSessionDir(): void {
   if (!existsSync(SESSION_DIR)) {
@@ -60,8 +107,25 @@ export class SessionStore {
     const session = this.get(sessionId);
     session.userId = userId ?? session.userId;
     session.channel = channel ?? session.channel;
+    if (!isPersistableTurn(turn)) {
+      // Don't store error placeholders. The channel already rendered
+      // the text to the user; nothing is lost in their view, and we
+      // keep the turn window dense with real content.
+      session.updatedAt = new Date().toISOString();
+      this.upsert(session);
+      return session;
+    }
     session.turns.push(turn);
-    session.turns = session.turns.slice(-MAX_TURNS_PER_SESSION);
+    if (session.turns.length > MAX_TURNS_PER_SESSION) {
+      // Archive the rotated turns to the vault before dropping so the
+      // conversation remains FTS-recallable. Previously these were
+      // silently lost — see commit history for the "I had a chat
+      // earlier and the agent can't find it" failure mode.
+      const overflow = session.turns.length - MAX_TURNS_PER_SESSION;
+      const dropped = session.turns.slice(0, overflow);
+      archiveDroppedTurnsToVault(session.id, dropped);
+      session.turns = session.turns.slice(-MAX_TURNS_PER_SESSION);
+    }
     session.updatedAt = new Date().toISOString();
     this.upsert(session);
     return session;

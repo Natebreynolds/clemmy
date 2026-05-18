@@ -3,6 +3,7 @@ import { existsSync, lstatSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { getSecretStore } from '../runtime/secrets/index.js';
+import { invalidateCachedScan as invalidateCliScan } from '../runtime/cli-discovery.js';
 
 export const BROWSER_HARNESS_REPO_URL = 'https://github.com/browser-use/browser-harness';
 export const BROWSER_HARNESS_DIR = path.join(os.homedir(), 'Developer', 'browser-harness');
@@ -247,6 +248,11 @@ export function startBrowserHarnessInstall(): InstallJob {
     job.status = code === 0 ? 'succeeded' : 'failed';
     job.completedAt = new Date().toISOString();
     job.exitCode = code;
+    // A successful install (brew/npm/uv/pipx/git clone) almost always
+    // adds something to $PATH or a directory we probe. Bust the CLI
+    // cache so the agent and dashboard see the new tool immediately
+    // instead of waiting for the 10-min TTL.
+    if (code === 0) invalidateCliScan();
   });
   return job;
 }
@@ -274,7 +280,10 @@ export function validateInstallCommand(command: string): { ok: true; normalized:
   }
   const allowed = [
     /^npm (install|i) (-g|--global) [@a-z0-9._/-]+$/i,
-    /^brew (install|tap) [a-z0-9._/@+-]+$/i,
+    // brew install [--cask] <formula>  — cask flag is standard for
+    // GUI / macOS-bundle packages like google-cloud-sdk.
+    /^brew install (--cask )?[a-z0-9._/@+-]+$/i,
+    /^brew tap [a-z0-9._/@+-]+$/i,
     /^uv tool install [@a-z0-9._/-]+$/i,
     /^pipx install [@a-z0-9._/-]+$/i,
     /^python3 -m pip install --user [@a-z0-9._/-]+$/i,
@@ -329,6 +338,11 @@ export function startApprovedInstallCommand(command: string, title = 'Install ca
     job.status = code === 0 ? 'succeeded' : 'failed';
     job.completedAt = new Date().toISOString();
     job.exitCode = code;
+    // A successful install (brew/npm/uv/pipx/git clone) almost always
+    // adds something to $PATH or a directory we probe. Bust the CLI
+    // cache so the agent and dashboard see the new tool immediately
+    // instead of waiting for the 10-min TTL.
+    if (code === 0) invalidateCliScan();
   });
   return job;
 }

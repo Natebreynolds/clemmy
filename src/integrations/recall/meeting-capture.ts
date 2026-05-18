@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { BASE_DIR } from '../../config.js';
 import { VAULT_DIR } from '../../memory/vault.js';
@@ -37,6 +37,24 @@ export interface RecallMeetingRecord {
   endedAt?: string;
   segments: RecallTranscriptSegment[];
   artifactPath?: string;
+  /** Path to the JSON sidecar written by the post-meeting analyzer,
+   *  populated lazily after recording-ended when analyzeOnComplete is
+   *  on. The dashboard reads this to surface summary + actions. */
+  analysisPath?: string;
+}
+
+export interface RecallMeetingAnalysis {
+  summary?: string;
+  decisions?: string[];
+  actionItems?: Array<{
+    text: string;
+    owner?: string;
+    dueDate?: string;
+  }>;
+  topics?: string[];
+  participants?: string[];
+  generatedAt: string;
+  source: 'agent' | 'manual';
 }
 
 export interface RecallUploadInput {
@@ -51,6 +69,7 @@ export interface RecallUploadToken {
 
 const SETTINGS_FILE = path.join(BASE_DIR, 'state', 'meeting-capture', 'recall-settings.json');
 const RECORDS_DIR = path.join(BASE_DIR, 'state', 'meeting-capture', 'recall-recordings');
+const ANALYSIS_DIR = path.join(BASE_DIR, 'state', 'meeting-capture', 'analysis');
 const VAULT_MEETINGS_DIR = path.join(VAULT_DIR, '04-Meetings');
 
 export const RECALL_REGIONS: Record<RecallRegion, string> = {
@@ -311,4 +330,162 @@ export function finalizeRecallMeeting(input: {
 
   const saved = saveMeetingRecord({ ...completed, artifactPath });
   return { record: saved, artifactPath, segmentCount: saved.segments.length, transcriptText };
+}
+
+/**
+ * Path the post-meeting analyzer should write its JSON sidecar to.
+ * Stable, derived from the meeting id so the dashboard can poll it
+ * without coordinating with the background-task runner.
+ */
+export function analysisPathFor(meetingId: string): string {
+  return path.join(ANALYSIS_DIR, `${safeId(meetingId)}.analysis.json`);
+}
+
+/**
+ * Idempotent — records the analysis path on the meeting record so
+ * future reads from the dashboard can find it without filesystem
+ * walking. Called by the analyzer prompt's writeback step.
+ */
+export function recordAnalysisPath(meetingId: string, analysisPath: string): RecallMeetingRecord | null {
+  const allRecords = listAllRecallMeetingRecords();
+  const target = allRecords.find((r) => r.id === meetingId);
+  if (!target) return null;
+  return saveMeetingRecord({ ...target, analysisPath });
+}
+
+/**
+ * Persist a structured analysis (summary, decisions, actions) for a
+ * captured meeting. Atomic write; idempotent; updates the meeting
+ * record's `analysisPath` so the UI can find it.
+ */
+export function saveRecallMeetingAnalysis(meetingId: string, analysis: RecallMeetingAnalysis): { path: string } {
+  ensureDir(ANALYSIS_DIR);
+  const filePath = analysisPathFor(meetingId);
+  writeJsonAtomic(filePath, analysis);
+  recordAnalysisPath(meetingId, filePath);
+  return { path: filePath };
+}
+
+export function loadRecallMeetingAnalysis(meetingId: string): RecallMeetingAnalysis | null {
+  const filePath = analysisPathFor(meetingId);
+  if (!existsSync(filePath)) return null;
+  try {
+    return JSON.parse(readFileSync(filePath, 'utf-8')) as RecallMeetingAnalysis;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Walk the recordings dir and return every captured meeting, newest
+ * first. Used by the dashboard's "recent meetings" list. Cheap — even
+ * 100 meetings is ~100 small JSON reads.
+ */
+export function listAllRecallMeetingRecords(): RecallMeetingRecord[] {
+  if (!existsSync(RECORDS_DIR)) return [];
+  const out: RecallMeetingRecord[] = [];
+  try {
+    for (const entry of readdirSync(RECORDS_DIR)) {
+      if (!entry.endsWith('.json')) continue;
+      try {
+        const parsed = JSON.parse(readFileSync(path.join(RECORDS_DIR, entry), 'utf-8')) as RecallMeetingRecord;
+        if (parsed && parsed.id) out.push(parsed);
+      } catch { /* skip corrupt entries */ }
+    }
+  } catch { /* dir disappeared between checks */ }
+  return out.sort((a, b) => (b.startedAt || '').localeCompare(a.startedAt || ''));
+}
+
+export interface RecallMeetingSummary {
+  id: string;
+  windowId: string;
+  platform?: string;
+  title?: string;
+  status: RecallMeetingRecord['status'];
+  startedAt: string;
+  endedAt?: string;
+  segmentCount: number;
+  artifactPath?: string;
+  analysisPath?: string;
+  hasAnalysis: boolean;
+  durationSeconds?: number;
+}
+
+export function summarizeRecallMeeting(record: RecallMeetingRecord): RecallMeetingSummary {
+  let durationSeconds: number | undefined;
+  if (record.startedAt && record.endedAt) {
+    const ms = Date.parse(record.endedAt) - Date.parse(record.startedAt);
+    if (Number.isFinite(ms) && ms > 0) durationSeconds = Math.round(ms / 1000);
+  }
+  // Analysis path resolution: the agent writes via write_file directly to
+  // the canonical path (analysisPathFor(id)) — it doesn't go through
+  // saveRecallMeetingAnalysis, so the record itself won't have
+  // analysisPath set. Fall back to the canonical path so hasAnalysis
+  // reflects reality.
+  const canonical = analysisPathFor(record.id);
+  const resolvedAnalysisPath = record.analysisPath && existsSync(record.analysisPath)
+    ? record.analysisPath
+    : (existsSync(canonical) ? canonical : undefined);
+  return {
+    id: record.id,
+    windowId: record.windowId,
+    platform: record.platform,
+    title: record.title,
+    status: record.status,
+    startedAt: record.startedAt,
+    endedAt: record.endedAt,
+    segmentCount: record.segments?.length ?? 0,
+    artifactPath: record.artifactPath,
+    analysisPath: resolvedAnalysisPath,
+    hasAnalysis: Boolean(resolvedAnalysisPath),
+    durationSeconds,
+  };
+}
+
+export function listRecentRecallMeetingSummaries(limit = 20): RecallMeetingSummary[] {
+  return listAllRecallMeetingRecords().slice(0, Math.max(1, limit)).map(summarizeRecallMeeting);
+}
+
+export function loadRecallMeetingById(meetingId: string): RecallMeetingRecord | null {
+  return listAllRecallMeetingRecords().find((r) => r.id === meetingId) ?? null;
+}
+
+/**
+ * The post-meeting analyzer prompt — produces a strict JSON shape we
+ * can persist and surface in the UI. Kept here (not in the dashboard
+ * route) so the analyzer prompt evolves with the data model.
+ */
+export function buildAnalyzerPrompt(record: RecallMeetingRecord, artifactPath: string): string {
+  const expectedAnalysisPath = analysisPathFor(record.id);
+  return [
+    'You just received a meeting transcript captured by the desktop SDK.',
+    'Your job: produce a structured analysis the user can act on at a glance.',
+    '',
+    `Transcript file: ${artifactPath}`,
+    `Meeting id: ${record.id}`,
+    `Meeting title: ${record.title || '(unknown)'}`,
+    `Platform: ${record.platform || '(unknown)'}`,
+    `Started: ${record.startedAt}`,
+    record.endedAt ? `Ended: ${record.endedAt}` : '',
+    '',
+    'Steps:',
+    '1. Read the transcript file end-to-end.',
+    '2. Produce a single JSON object with exactly these keys:',
+    '   {',
+    '     "summary": "3–5 sentence overview, neutral tone",',
+    '     "decisions": ["decision 1", ...],            // empty array if none',
+    '     "actionItems": [                             // empty array if none',
+    '       { "text": "what needs to happen", "owner": "person if named, else null", "dueDate": "ISO date or null" }',
+    '     ],',
+    '     "topics": ["short tag", ...],                // 3–8 topic tags',
+    '     "participants": ["name", ...]                // people who spoke',
+    '   }',
+    `3. Save that JSON to ${expectedAnalysisPath} via write_file.`,
+    '4. After saving, return a one-line confirmation message — do NOT include the JSON in your response.',
+    '',
+    'Hard rules:',
+    '- No external API calls, no sending messages, no scheduling — analysis only.',
+    '- If the transcript is empty or unintelligible, save a JSON with summary: "Transcript too short to analyze." and empty arrays.',
+    '- The JSON must be valid (no trailing commas, no comments).',
+  ].filter((line) => line !== '').join('\n');
 }

@@ -154,6 +154,41 @@ const RESEARCHER_TOOL_NAMES = new Set<string>([
   'composio_search_tools',
 ]);
 
+// Worker = a stateless leaf agent the Executor (or any parent) can
+// invoke as a TOOL via Worker.asTool(). When the parent calls the
+// worker tool N times in one turn, the SDK runs N workers in PARALLEL,
+// each with its own conversation context. That's how "scrape 100
+// accounts" gets fan-out: the Executor's model fires the worker tool
+// in parallel batches, and each worker handles ONE item in isolation.
+//
+// What it does NOT have:
+//   - task/execution mutation tools (no state collision with siblings)
+//   - notify_user, ask_user_question (workers are silent)
+//   - handoffs (workers are leaves, not transferers)
+// What it HAS:
+//   - all data-fetch composio tools, shell, file reads, memory reads
+//   - the discovery+execute composio pair so unknown actions still work
+//   - write_file (workers often produce per-item artifacts)
+const WORKER_TOOL_NAMES = new Set<string>([
+  'memory_recall',
+  'memory_search',
+  'memory_read',
+  'user_profile_read',
+  'workspace_roots',
+  'workspace_list',
+  'workspace_info',
+  'list_files',
+  'read_file',
+  'write_file',
+  'run_shell_command',
+  'git_status',
+  'local_cli_list',
+  'local_cli_probe',
+  'composio_list_tools',
+  'composio_search_tools',
+  'composio_execute_tool',
+]);
+
 const EXECUTOR_TOOL_NAMES = new Set<string>([
   // Memory (write durable signals)
   'memory_remember',
@@ -337,11 +372,64 @@ export async function buildResearcherAgent(): Promise<SubAgent> {
   });
 }
 
+/**
+ * Worker agent — a stateless leaf the Executor calls as a tool to
+ * fan out independent items in parallel. Each invocation runs in its
+ * own SDK context with its own model run, so 100 workers in flight =
+ * 100 isolated ~10K-token contexts instead of one balloon. The
+ * Executor itself decides parallelism by emitting parallel tool calls
+ * (which the SDK's `parallel_tool_calls` honors for free-form sub-
+ * agents).
+ *
+ * Returned as a plain Agent so the caller can either run it standalone
+ * or wrap it via `worker.asTool({...})` for in-tool fan-out.
+ */
+export async function buildWorkerAgent(): Promise<SubAgent> {
+  const all = await getCoreToolsAsync({ includeDynamicComposioTools: true });
+  const tools = filterToolsByNames(all, WORKER_TOOL_NAMES, [COMPOSIO_FIRST_CLASS_PREFIX]) as Tool<RuntimeContextValue>[];
+  return new Agent<RuntimeContextValue>({
+    name: 'Worker',
+    handoffDescription: 'Stateless per-item worker. Use via run_worker tool for parallel fan-out.',
+    instructions: [
+      'You are a Worker — a stateless, single-task sub-agent inside Clementine.',
+      'Your scope is ONE item. The parent agent fans out across N items by calling you N times in parallel; each call is a fresh, isolated context.',
+      'Rules:',
+      '  - Do exactly the work described in the input prompt. Do not ask follow-up questions, do not deliberate, do not branch into other tasks.',
+      '  - Use the smallest set of tool calls needed. Discovery → execute when the action is external.',
+      '  - Return a TIGHT, structured result on the last line: a single sentence, a JSON object, or a bullet list. The parent will aggregate hundreds of these — keep yours compact.',
+      '  - If you cannot complete the item, return a single line starting with "ERROR:" and a brief reason. Do not retry, do not escalate.',
+      '  - Do NOT call notify_user, ask_user_question, or write to shared tasks/executions — those mutate state your sibling workers also touch and create race conditions.',
+      'You may write per-item artifacts (write_file with a unique path) if the parent\'s prompt asks for them. Otherwise, prefer returning the result inline.',
+    ].join('\n\n'),
+    model: MODELS.primary,
+    tools,
+  });
+}
+
 export async function buildExecutorAgent(): Promise<SubAgent> {
   // Executor needs first-class cx_* so it can call `cx_googlesheets_*`
   // and friends directly instead of going through the broker.
   const all = await getCoreToolsAsync({ includeDynamicComposioTools: true });
   const tools = filterToolsByNames(all, EXECUTOR_TOOL_NAMES, [COMPOSIO_FIRST_CLASS_PREFIX]) as Tool<RuntimeContextValue>[];
+
+  // Wrap a Worker as a tool for parallel fan-out. The Executor's model
+  // decides when to invoke it (one shot for single items, N shots in
+  // parallel for fan-out) — we don't gate concurrency here; the SDK's
+  // parallel_tool_calls handles batching. For large N (>50), explicit
+  // workflow forEach is still the right primitive — this inline path
+  // is for chat-driven mid-conversation fan-out.
+  const worker = await buildWorkerAgent();
+  const runWorkerTool = worker.asTool({
+    toolName: 'run_worker',
+    toolDescription: [
+      'Spawn a stateless Worker sub-agent on ONE item. Call this MULTIPLE TIMES IN PARALLEL when you have N independent items to process (scrape, classify, summarize, fetch, transform).',
+      'Each worker call gets its own isolated context — use this to keep your own context from ballooning over hundreds of items, and to run the work concurrently instead of sequentially.',
+      'Input: a SINGLE prompt describing the work for ONE item. Include the item identifier directly in the prompt (e.g. "Scrape account_id=42 using DataForSEO and return the keyword count").',
+      'When to use: 3+ independent items of the same kind. The Worker returns a tight result you aggregate.',
+      'When NOT to use: tasks that need cross-item memory or a single coherent output stream — those stay on you.',
+    ].join(' '),
+  });
+  tools.push(runWorkerTool as Tool<RuntimeContextValue>);
   return new Agent<RuntimeContextValue>({
     name: 'Executor',
     handoffDescription: 'Does the work — tasks, executions, file writes, commands, external actions. Use when a decision has been made and there is concrete work to perform.',
@@ -359,6 +447,7 @@ export async function buildExecutorAgent(): Promise<SubAgent> {
       'Use `composio_status` only to confirm a toolkit is actually connected when you have a real reason to doubt it. If a needed toolkit is missing or disconnected, surface that with notify_user (or ask_user_question if you need them to connect it) — don\'t silently fail.',
       'Make small reversible changes, verify after each one when possible, and surface real errors via notify_user.',
       'When a tracked execution is involved, call execution_update_step every cycle you make progress, and execution_complete only when success criteria are met.',
+      'PARALLEL FAN-OUT: when the work is "do the same operation across N independent items" (scrape N accounts, classify N records, fetch N URLs, summarize N docs), DO NOT loop sequentially in your own context — call `run_worker` MULTIPLE TIMES IN PARALLEL in the same turn (one call per item). The SDK runs them concurrently and each worker gets its own isolated context, so your context stays clean and the work completes in roughly the time of ONE item instead of N. For very large N (>50), prefer authoring a workflow with a `forEach` step via `workflow_schedule` — that has bounded concurrency and per-item durability for crashes.',
       'Return a concise summary of what was done so the orchestrator knows the state.',
     ].join('\n\n')),
     model: MODELS.primary,
