@@ -28,7 +28,7 @@ import { appendEvent } from '../runtime/harness/eventlog.js';
  */
 export const ExecutorHandoffInput = z.object({
   directive: z.string().min(8).describe(
-    'One-line description of what the Executor should do, e.g. "Post LegalLady image 2 with its README caption to Instagram via Composio." Be specific.',
+    'One-line description of what the Executor should do, e.g. "Send the draft summary via the user\'s Gmail account" or "Post the prepared content to the connected Instagram account." Be specific.',
   ),
   toolCall: z
     .object({

@@ -17,9 +17,10 @@ function parseEnvFile(envPath: string): Record<string, string> {
   const result: Record<string, string> = {};
   for (const rawLine of readFileSync(envPath, 'utf-8').split('\n')) {
     // Preserve trailing whitespace on values — some folder names
-    // (e.g. ~/legallady.ai live ) carry significant trailing
-    // spaces. Strip only leading whitespace and trailing \r so
-    // comments and key-trim still work.
+    // carry significant trailing spaces (e.g. a project folder a
+    // user named with a stray space at the end). Strip only leading
+    // whitespace and trailing \r so comments and key-trim still
+    // work, but leave the value bytes alone.
     const line = rawLine.replace(/^\s+|\r+$/g, '');
     if (!line || line.startsWith('#')) continue;
     const eqIndex = line.indexOf('=');

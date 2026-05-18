@@ -8942,7 +8942,7 @@ const CONSOLE_JS = `
     if (!wsModal) return;
     const body = wsModal.querySelector('[data-ws-modal-body]');
     body.innerHTML = [
-      '<input type="text" class="ws-search-input" data-ws-search-input placeholder="Type a folder name (e.g. legallady, proposal)…" />',
+      '<input type="text" class="ws-search-input" data-ws-search-input placeholder="Type a folder name to search for…" />',
       '<div class="ws-modal-status">Type at least 2 characters to search common locations (~, ~/Desktop, ~/Documents, ~/Developer, ~/Projects).</div>',
       '<ul class="ws-dir-list" data-ws-search-results></ul>',
     ].join('');

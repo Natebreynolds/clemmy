@@ -7,7 +7,7 @@ import { textResult } from './shared.js';
  * User-profile MCP tools. The agent uses these to adapt to the user
  * over time. Examples of legitimate use:
  *
- *   - User says "call me Nathan, not Mr. Reynolds" → `user_profile_update({ preferredName: 'Nathan' })`
+ *   - User says "call me Alex, not by my last name" → `user_profile_update({ preferredName: 'Alex' })`
  *   - User says "skip the recap, just answer" → `user_profile_update({ communicationTone: 'terse' })`
  *   - User says "I'm in Pacific time, working 9–6 weekdays" → set timezone + working hours
  *

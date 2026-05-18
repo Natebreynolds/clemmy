@@ -277,8 +277,8 @@ export function readBaseEnv(): Record<string, string> {
   for (const rawLine of readFileSync(envPath, 'utf-8').split('\n')) {
     // Strip leading whitespace + trailing \r only — DO NOT strip
     // trailing whitespace on the value. Some folder names have
-    // significant trailing spaces (e.g. ~/legallady.ai live ) and
-    // the workspace list breaks if we collapse them silently.
+    // significant trailing spaces, and the workspace list breaks
+    // if we collapse them silently.
     const line = rawLine.replace(/^\s+|\r+$/g, '');
     if (!line || line.startsWith('#')) continue;
     const eqIndex = line.indexOf('=');
@@ -315,10 +315,11 @@ export function getWorkspaceDirs(): string[] {
   const dirs: string[] = [];
   const env = readBaseEnv();
   // Split but DON'T pre-trim — some folder names have significant
-  // trailing whitespace (e.g. ~/legallady.ai live ). We can't tell
-  // from the CSV whether " /foo" is "user added spaces around the
-  // comma" or "/foo has a leading space in its real name", so the
-  // resolver below tries both forms.
+  // trailing whitespace (real project paths in the wild end with
+  // a stray space). We can't tell from the CSV whether " /foo" is
+  // "user added spaces around the comma" or "/foo has a leading
+  // space in its real name", so the resolver below tries both
+  // forms.
   const configuredEntries = (env.WORKSPACE_DIRS ?? '')
     .split(',')
     .filter((entry) => entry.length > 0);

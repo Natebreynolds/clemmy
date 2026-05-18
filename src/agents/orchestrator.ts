@@ -175,14 +175,14 @@ const ORCHESTRATOR_INSTRUCTIONS = [
 export async function buildOrchestratorAgent(): Promise<
   Agent<RuntimeContextValue, typeof OrchestratorDecisionSchema>
 > {
-  // The 0.3 harness uses request_approval as the gate for destructive
-  // and external-mutating work, so the v0.2 "tracked execution"
-  // pre-condition that gated Executor/Deployer handoffs is redundant
-  // here. Without disabling that gate, the orchestrator sees no
-  // transfer_to_Executor in its tool surface (the handoff is hidden
-  // by isEnabled until a tracked execution exists) and gives up with
-  // "tool not available" even after the user approved the action.
-  // Nathan hit this on the LegalLady Instagram-post test.
+  // The 0.3 harness uses request_approval as the gate for
+  // destructive and external-mutating work, so the v0.2 "tracked
+  // execution" pre-condition that gated Executor/Deployer handoffs
+  // is redundant here. Without disabling that gate, the orchestrator
+  // sees no transfer_to_Executor in its tool surface (the handoff
+  // is hidden by isEnabled until a tracked execution exists) and
+  // gives up with "tool not available" even after the user approved
+  // the action.
   const handoffs = await defaultOrchestratorHandoffs({
     requireWorkflowApprovalForExecution: false,
   });

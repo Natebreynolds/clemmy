@@ -1203,10 +1203,10 @@ export function registerConsoleRoutes(
 
   function writeWorkspaceDirs(dirs: string[]): void {
     // No trim — folder names with significant trailing whitespace
-    // (e.g. ~/legallady.ai live ) must survive a round-trip through
-    // the .env. The downstream getWorkspaceDirs() resolver is
-    // whitespace-tolerant: it tries the entry as-written first, then
-    // trimmed, so CSV entries with " "-padding still work.
+    // must survive a round-trip through the .env. The downstream
+    // getWorkspaceDirs() resolver is whitespace-tolerant: it tries
+    // the entry as-written first, then trimmed, so CSV entries with
+    // " "-padding still work either way.
     const value = dirs.filter((d) => d.length > 0).join(',');
     updateEnvKey('WORKSPACE_DIRS', value);
   }

@@ -629,7 +629,7 @@ export function applyEventToState(event: EventRow, state: DisplayState): void {
       // Move the approval text into summary (which survives the
       // done=true render path) instead of status (which renderBody
       // hides when done). Without this the placeholder degrades to
-      // "working…" — what Nathan hit on the LegalLady test.
+      // "working…" forever — the user never sees what's pending.
       state.summary = `Approval required: ${subject}\n\nReply **approve** to continue or **reject** to cancel.`;
       state.status = 'approval required';
       state.done = true;

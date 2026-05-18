@@ -12,10 +12,10 @@ import { BASE_DIR } from '../config.js';
  *     person, learned over time
  *
  * UserProfile is what the user EXPLICITLY tells the agent about how
- * they want to be treated. Settable from chat ("call me Nathan, not
- * Mr. Reynolds"), from the dashboard, or from the setup wizard. The
- * agent reads it on every cycle and adapts tone, urgency tolerance,
- * channel preferences, etc.
+ * they want to be treated. Settable from chat ("call me Alex, not
+ * by my last name"), from the dashboard, or from the setup wizard.
+ * The agent reads it on every cycle and adapts tone, urgency
+ * tolerance, channel preferences, etc.
  *
  * Storage: single JSON file at ~/.clementine-next/state/user-profile.json
  * Atomic writes via tmp+rename, same pattern as proactivity-policy.
