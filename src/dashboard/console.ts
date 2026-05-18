@@ -13615,25 +13615,23 @@ const CONSOLE_JS = `
   }
 
   async function refreshDockGoal() {
-    // No dedicated /goal list endpoint yet — we hit the chat endpoint
-    // for /goal status from the home session. Falls back silently
-    // when there's no goal active.
+    // Use the cheap /api/console/home/goal-status endpoint that reads
+    // the goal state file directly. The old path POST /api/console/home/chat
+    // {message: "/goal status"} fired a FULL LLM TURN + 4 status-list
+    // tool calls every 5 seconds — observed 6097 tool calls on a single
+    // session today purely from this dock refresh loop.
     const card = document.querySelector('[data-dock-goal]');
     if (!card) return;
     try {
-      const r = await fetch(withToken('/api/console/home/chat'), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: '/goal status' }),
-      });
+      const r = await fetch(withToken('/api/console/home/goal-status'));
+      if (!r.ok) return;
       const j = await r.json();
-      const text = String(j?.text || '');
-      // Parse the human-readable goal-state string. Pattern is
-      // "Goal active (N/M): ..." or "Goal paused at N/M — ..." etc.
-      const m = text.match(/Goal (\\w+)\\s*\\(?(\\d+)\\/(\\d+)\\)?[:\\s—-]+\\s*(.+)/i);
-      if (m && (m[1] === 'active' || m[1] === 'paused')) {
-        const used = parseInt(m[2], 10), total = parseInt(m[3], 10);
-        const obj = m[4].replace(/^[\"']|[\"']$/g, '').trim();
+      const state = j?.goal;
+      const status = state?.status;
+      if (state && (status === 'pursuing' || status === 'paused')) {
+        const used = parseInt(state.turnsUsed, 10) || 0;
+        const total = parseInt(state.turnsLimit, 10) || 0;
+        const obj = String(state.objective || '');
         const objective = document.querySelector('[data-dock-goal-objective]');
         const turns = document.querySelector('[data-dock-goal-turns]');
         const progress = document.querySelector('[data-dock-goal-progress]');
@@ -13641,7 +13639,7 @@ const CONSOLE_JS = `
         if (objective) objective.textContent = obj.slice(0, 60);
         if (turns) turns.textContent = used + '/' + total;
         if (progress) progress.style.width = Math.round((used / Math.max(1, total)) * 100) + '%';
-        if (judge) judge.textContent = m[1].toUpperCase();
+        if (judge) judge.textContent = (status === 'pursuing' ? 'ACTIVE' : 'PAUSED');
         card.hidden = false;
       } else {
         card.hidden = true;

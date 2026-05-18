@@ -3110,6 +3110,35 @@ export function registerConsoleRoutes(
     }
   });
 
+  /**
+   * Cheap goal-state read for the dashboard's nav-dock GOAL card.
+   *
+   * The card used to refresh by POSTing `/goal status` to /chat every
+   * 5 seconds — a full LLM turn + 4 status-list tool calls per fetch.
+   * Observed today: 6097 cumulative tool calls and roughly 1700 LLM
+   * turns on a single dashboard session because the user left the
+   * window open all day. Reading the goal state file directly is
+   * free and gives the dock all the data it needs.
+   */
+  app.get('/api/console/home/goal-status', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      // Lazy-require to avoid pulling goal-loop into the top of this
+      // file just for one route; keeps the existing import graph stable.
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { loadGoalState } = require('../agents/goal-loop.js') as {
+        loadGoalState: (sessionId: string) => Record<string, unknown> | null;
+      };
+      const sessionId = typeof req.query.sessionId === 'string' && req.query.sessionId.trim()
+        ? req.query.sessionId.trim().slice(0, 120)
+        : 'console:home';
+      const state = loadGoalState(sessionId);
+      res.json({ goal: state });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   app.post('/api/console/home/chat', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const body = req.body ?? {};
