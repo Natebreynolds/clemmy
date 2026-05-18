@@ -10954,8 +10954,18 @@ const CONSOLE_JS = `
           setChatTurnStatus(turn, 'awaiting reply');
           finish();
         } else if (ev.type === 'approval_requested') {
+          // Render the approval prompt in the BODY (not just status)
+          // and end the SSE stream so the SEND button re-enables.
+          // Without finish(), the button sat in THINKING… forever and
+          // the user couldn't reply 'approve' / 'reject' to continue.
+          // The reply path is handled server-side: /api/harness/chat
+          // detects approve/reject intent on a paused session and routes
+          // through runConversationFromResume.
           const subj = (ev.data && (ev.data.subject || ev.data.tool)) || 'action';
-          setChatTurnStatus(turn, 'approval required: ' + subj);
+          const reason = (ev.data && ev.data.reason) || '';
+          setChatTurnText(turn, 'Approval required: ' + subj + (reason ? '\n\n' + reason : '') + '\n\nReply **approve** to continue or **reject** to cancel.');
+          setChatTurnStatus(turn, 'awaiting approval');
+          finish();
         }
       };
 

@@ -95,7 +95,9 @@ import {
   getSession as getHarnessSession,
   listEvents as listHarnessEvents,
 } from '../runtime/harness/eventlog.js';
-import { runConversation } from '../runtime/harness/loop.js';
+import { runConversation, runConversationFromResume } from '../runtime/harness/loop.js';
+import { HarnessSession } from '../runtime/harness/session.js';
+import { parseApprovalIntent } from '../channels/discord-harness.js';
 import { buildOrchestratorAgent } from '../agents/orchestrator.js';
 import { configureHarnessRuntime } from '../runtime/harness/codex-client.js';
 import { summarizeApprovalAction } from '../runtime/approval-summary.js';
@@ -3009,13 +3011,35 @@ export function registerConsoleRoutes(
 
     const sessionId = session.id;
     const streamUrl = `/api/sessions/${sessionId}/events`;
-    // Respond immediately. The model run happens off the request
-    // thread so the desktop chat input unblocks instantly.
-    res.status(202).json({ sessionId, streamUrl, status: 'started' });
+
+    // If this session is paused on an SDK approval interrupt and the
+    // user's message is an approve/reject intent, take the RESUME path
+    // instead of starting a new turn. Mirrors the Discord-side
+    // tryHandleHarnessApprovalReply pattern — without this, the chat
+    // dock had no way to resume a paused session, the SEND button sat
+    // in THINKING forever, and the user couldn't continue the workflow.
+    const harnessSession = HarnessSession.load(sessionId);
+    const isPausedOnApproval = !!harnessSession && !!harnessSession.loadInterruptState();
+    const intent = isPausedOnApproval ? parseApprovalIntent(input) : null;
+
+    res.status(202).json({
+      sessionId,
+      streamUrl,
+      status: intent ? 'resuming' : 'started',
+      mode: intent ? `approval-${intent}` : 'fresh',
+    });
 
     setImmediate(async () => {
       try {
         const agent = await buildOrchestratorAgent();
+        if (intent && harnessSession) {
+          await runConversationFromResume({
+            agent,
+            sessionId,
+            decision: intent === 'approve' ? 'approve' : 'reject',
+          });
+          return;
+        }
         await runConversation({ agent, sessionId, input });
       } catch (err) {
         // The loop emits its own run_failed when a turn throws. If we
