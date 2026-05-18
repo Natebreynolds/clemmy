@@ -511,6 +511,203 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   }
 }
 
+// ---------- resume after approval ----------
+
+export interface ResumePendingApprovalOptions {
+  agent: Agent<any, any>;
+  sessionId: string;
+  decision: 'approve' | 'reject';
+  maxTurns?: number;
+  toolCallsPerTurn?: number;
+  /** Test injection. */
+  makeRunner?: () => Runner;
+  /** Test injection: drive the resume with a pre-built outcome. */
+  runRunner?: RunRunnerFn;
+}
+
+/**
+ * Resume a session that was paused waiting for the user to approve a
+ * tool call. Loads the persisted RunState, resolves each pending
+ * interruption (approve or reject), continues the run with the SDK's
+ * stateful runner, and persists the outcome the same way runTurn
+ * does (recording approval_resolved + run_resumed events, handling
+ * another interruption if it fires, handling the normal completion
+ * path, etc.).
+ *
+ * Returns:
+ *   - `awaiting_approval` if the resumed run requests another approval.
+ *   - `completed` once the run finishes naturally.
+ *   - The usual failure modes (killed, limit_exceeded, failed).
+ *
+ * If the session is not paused / has no saved RunState, returns
+ * `completed` with no work done — callers can treat that as a no-op.
+ */
+export async function resumePendingApproval(
+  options: ResumePendingApprovalOptions,
+): Promise<RunTurnResult> {
+  const row = getSession(options.sessionId);
+  if (!row) throw new Error(`unknown session: ${options.sessionId}`);
+  const session = HarnessSession.load(options.sessionId);
+  if (!session) throw new Error(`unable to load session: ${options.sessionId}`);
+
+  const blob = session.loadInterruptState();
+  if (!blob) {
+    // Session isn't paused — nothing to resume. Caller can decide to
+    // treat the prompt as a fresh user turn instead.
+    return { sessionId: options.sessionId, turn: 0, status: 'completed' };
+  }
+
+  const turn = nextTurnNumber(row);
+
+  if (isKillBeforeStart(options.sessionId, turn, session)) {
+    return { sessionId: options.sessionId, turn, status: 'killed' };
+  }
+
+  // Deserialize the paused RunState. Lazy-imported so the SDK module
+  // graph doesn't force-load on every loop import (RunState is heavy).
+  const { RunState } = await import('@openai/agents');
+  let state;
+  try {
+    state = await RunState.fromString(options.agent, blob);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    safeAppend({
+      sessionId: options.sessionId,
+      turn,
+      role: 'system',
+      type: 'run_failed',
+      data: { error: `failed to deserialize RunState: ${clip(message, 300)}` },
+    });
+    session.markStatus('failed');
+    session.clearInterruptState();
+    bumpTurnNumber(options.sessionId, turn);
+    return { sessionId: options.sessionId, turn, status: 'failed', error: message };
+  }
+
+  // Resolve each interruption. The SDK's RunState exposes
+  // `interruptions` as an array of RunToolApprovalItem; we
+  // approve / reject every pending one with the user's decision.
+  const pending: unknown[] = (state as unknown as { interruptions: unknown[] }).interruptions ?? [];
+  for (const item of pending) {
+    if (options.decision === 'approve') {
+      (state as unknown as { approve: (i: unknown) => void }).approve(item);
+    } else {
+      (state as unknown as { reject: (i: unknown) => void }).reject(item);
+    }
+    const raw = (item as { rawItem?: { name?: string } } | null)?.rawItem;
+    safeAppend({
+      sessionId: options.sessionId,
+      turn,
+      role: 'system',
+      type: 'approval_resolved',
+      data: { decision: options.decision, tool: raw?.name ?? 'unknown' },
+    });
+  }
+  safeAppend({
+    sessionId: options.sessionId,
+    turn,
+    role: 'system',
+    type: 'run_resumed',
+    data: { pending: pending.length, decision: options.decision },
+  });
+  session.clearInterruptState();
+
+  const toolCounter = new ToolCallsCounter(
+    options.toolCallsPerTurn ?? DEFAULT_TOOL_CALLS_PER_TURN,
+  );
+  const makeRunner =
+    options.makeRunner ??
+    (() =>
+      new Runner({
+        workflowName: 'clementine-harness',
+        groupId: options.sessionId,
+      }));
+  const runner = makeRunner();
+
+  const detachLogHooks = attachEventLogHooks(runner as unknown as RunHooksLike, {
+    getSessionId: extractSessionIdFromContext,
+    getTurn: () => turn,
+  });
+  const onToolStart = (): void => {
+    toolCounter.increment();
+  };
+  (runner as unknown as RunHooksLike).on(
+    'agent_tool_start',
+    onToolStart as (...args: unknown[]) => void,
+  );
+
+  const opts: Record<string, unknown> = {
+    context: { sessionId: options.sessionId, turn },
+    maxTurns: options.maxTurns ?? DEFAULT_MAX_TURNS.orchestrator,
+  };
+
+  try {
+    const run = options.runRunner ?? defaultRunRunner;
+    // The SDK's Runner.run accepts a RunState in place of input
+    // items — it picks up the conversation from exactly where the
+    // interrupt fired. We thread it through the same defaultRunRunner
+    // so streaming + completion semantics match runTurn().
+    const outcome = await run(
+      runner,
+      options.agent,
+      state as unknown as AgentInputItem[],
+      { ...opts, stream: true },
+    );
+
+    if (outcome.hasInterruptions && outcome.serializedState) {
+      for (const interruption of outcome.interruptions ?? []) {
+        safeAppend({
+          sessionId: options.sessionId,
+          turn,
+          role: 'orchestrator',
+          type: 'approval_requested',
+          data: {
+            tool: interruption.toolName,
+            subject: extractApprovalSubject(interruption),
+            args: interruption.args,
+            rawArgs: interruption.rawArgs,
+          },
+        });
+      }
+      session.saveInterruptState(outcome.serializedState);
+      bumpTurnNumber(options.sessionId, turn);
+      return { sessionId: options.sessionId, turn, status: 'awaiting_approval' };
+    }
+
+    session.recordTurnResult({
+      history: outcome.history,
+      lastResponseId: outcome.lastResponseId,
+      turn,
+    });
+    safeAppend({
+      sessionId: options.sessionId,
+      turn,
+      role: 'system',
+      type: 'run_completed',
+      data: {
+        finalOutputPreview: previewOutput(outcome.finalOutput),
+        toolCalls: toolCounter.currentCount,
+      },
+    });
+    session.markStatus('completed');
+    bumpTurnNumber(options.sessionId, turn);
+    return {
+      sessionId: options.sessionId,
+      turn,
+      status: 'completed',
+      finalOutput: outcome.finalOutput,
+    };
+  } catch (err) {
+    return handleRunError(options.sessionId, turn, session, err);
+  } finally {
+    detachLogHooks();
+    (runner as unknown as RunHooksLike).off(
+      'agent_tool_start',
+      onToolStart as (...args: unknown[]) => void,
+    );
+  }
+}
+
 // ---------- helpers ----------
 
 function isKillBeforeStart(

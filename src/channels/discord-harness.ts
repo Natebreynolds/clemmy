@@ -26,7 +26,8 @@ import {
   getSession as getHarnessSession,
   type EventRow,
 } from '../runtime/harness/eventlog.js';
-import { runConversation } from '../runtime/harness/loop.js';
+import { runConversation, resumePendingApproval } from '../runtime/harness/loop.js';
+import { HarnessSession } from '../runtime/harness/session.js';
 import { buildOrchestratorAgent } from '../agents/orchestrator.js';
 
 const EDIT_DEBOUNCE_MS = 2_000;
@@ -90,6 +91,32 @@ export function clearDiscordHarnessSession(channelId: string): void {
 }
 
 /**
+ * Detect approve / reject intent in a Discord prompt. Conservative —
+ * only matches at the start of the message and only when a session
+ * is actually awaiting approval. "Yes" mid-conversation when nothing
+ * is pending should be treated as a regular new turn, not an approval.
+ */
+export function parseApprovalIntent(prompt: string): 'approve' | 'reject' | null {
+  const t = prompt.trim().toLowerCase();
+  if (!t) return null;
+  if (/^(approve(d)?|yes|y|go( ahead)?|proceed|ok|okay|lgtm|sounds good|do it|👍)\b/.test(t)) {
+    return 'approve';
+  }
+  if (/^(reject(ed)?|no|n|cancel|stop|abort|nevermind|never mind|don'?t|👎)\b/.test(t)) {
+    return 'reject';
+  }
+  return null;
+}
+
+/** True if the harness session for this channel is currently paused awaiting approval. */
+function isChannelSessionAwaitingApproval(channelId: string): boolean {
+  const entry = channelSessions.get(channelId);
+  if (!entry) return false;
+  const sess = HarnessSession.load(entry.sessionId);
+  return !!sess && !!sess.loadInterruptState();
+}
+
+/**
  * Abstraction over "where do we send the placeholder and where do we
  * edit it as progress arrives." The two Discord paths into the harness
  * need different transports:
@@ -146,6 +173,23 @@ export async function runDiscordHarnessConversation(opts: {
   if (!auth.ok) {
     await transport.sendError(`Cannot start: ${auth.reason}`);
     return;
+  }
+
+  // Approval-resume path: if the channel has a paused session and
+  // the user typed an approve/reject phrase, resolve the pending
+  // approval and continue THAT session instead of starting fresh.
+  // Anything else while paused is treated as a regular new turn
+  // (which will append on top of the existing session via continuity).
+  if (isChannelSessionAwaitingApproval(channelId)) {
+    const intent = parseApprovalIntent(prompt);
+    if (intent) {
+      await runDiscordHarnessResume({
+        channelId,
+        decision: intent,
+        transport,
+      });
+      return;
+    }
   }
 
   const session = resolveOrCreateSession({ channelId, userId, guildId, prompt });
@@ -252,6 +296,148 @@ export async function runDiscordHarnessConversation(opts: {
 }
 
 /**
+ * Approval-resume helper. Same live-edit loop as
+ * runDiscordHarnessConversation, but bound to an existing paused
+ * session and a yes/no decision instead of fresh user input. The
+ * conversation continues from where the SDK paused — the orchestrator
+ * sees the approval result on its next decision and proceeds (or
+ * halts, on reject).
+ */
+async function runDiscordHarnessResume(opts: {
+  channelId: string;
+  decision: 'approve' | 'reject';
+  transport: DiscordHarnessTransport;
+}): Promise<void> {
+  const { channelId, decision, transport } = opts;
+  const entry = channelSessions.get(channelId);
+  if (!entry) {
+    await transport.sendError('No paused session to resume.');
+    return;
+  }
+  const sessionId = entry.sessionId;
+  entry.lastUsedAt = Date.now();
+
+  let handle: DiscordHarnessReplyHandle;
+  try {
+    handle = await transport.sendInitial(
+      decision === 'approve' ? '🍊 approved — resuming…' : '🍊 rejected — winding down…',
+    );
+  } catch (err) {
+    try {
+      appendHarnessEvent({
+        sessionId,
+        turn: 0,
+        role: 'system',
+        type: 'run_failed',
+        data: {
+          error: err instanceof Error ? err.message : String(err),
+          stage: 'resume_initial_reply',
+        },
+      });
+    } catch {
+      /* last-ditch */
+    }
+    return;
+  }
+
+  const state: DisplayState = {
+    summary: '',
+    status: decision === 'approve' ? 'resuming after approval' : 'cancelling',
+    done: false,
+  };
+  let lastEditAt = 0;
+  let pendingEdit: NodeJS.Timeout | null = null;
+
+  const flush = async (): Promise<void> => {
+    pendingEdit = null;
+    lastEditAt = Date.now();
+    try {
+      await handle.edit(renderBody(state));
+    } catch {
+      /* transient — next event retries */
+    }
+  };
+
+  const scheduleEdit = (): void => {
+    if (pendingEdit) return;
+    const elapsed = Date.now() - lastEditAt;
+    const wait = Math.max(0, EDIT_DEBOUNCE_MS - elapsed);
+    pendingEdit = setTimeout(() => {
+      void flush();
+    }, wait);
+  };
+
+  const finished: Promise<void> = new Promise((resolve) => {
+    let unsubscribe: (() => void) | null = null;
+    let safetyTimer: NodeJS.Timeout | null = null;
+
+    const settle = async (): Promise<void> => {
+      if (unsubscribe) unsubscribe();
+      unsubscribe = null;
+      if (safetyTimer) clearTimeout(safetyTimer);
+      if (pendingEdit) {
+        clearTimeout(pendingEdit);
+        pendingEdit = null;
+      }
+      await flush();
+      resolve();
+    };
+
+    unsubscribe = actionBus.subscribe((bus) => {
+      if (bus.kind !== 'harness.event') return;
+      if (bus.sessionId !== sessionId) return;
+      applyEventToState(bus.event, state);
+      if (state.done) {
+        void settle();
+        return;
+      }
+      scheduleEdit();
+    });
+
+    safetyTimer = setTimeout(() => {
+      state.status = 'timed out waiting for completion';
+      state.done = true;
+      void settle();
+    }, SAFETY_TIMEOUT_MS);
+  });
+
+  void (async () => {
+    try {
+      const agent = await buildOrchestratorAgent();
+      const result = await resumePendingApproval({
+        agent,
+        sessionId,
+        decision,
+      });
+      // If reject — the run pivoted to "no work to do" and the
+      // conversation is effectively done. Force the UI into the
+      // completed state so the placeholder updates with a final
+      // message even when no run_completed event fires post-reject.
+      if (decision === 'reject' && result.status === 'completed' && !state.done) {
+        state.summary = state.summary || 'Action rejected. No work performed.';
+        state.status = 'rejected';
+        state.done = true;
+      }
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      try {
+        appendHarnessEvent({
+          sessionId,
+          turn: 0,
+          role: 'system',
+          type: 'run_failed',
+          data: { error: errorMessage, stage: 'resume' },
+        });
+      } catch {
+        /* last-ditch */
+      }
+    }
+  })();
+
+  await finished;
+}
+
+/**
  * Gateway entry point — wraps Discord.js Message into the transport
  * abstraction and runs the conversation.
  */
@@ -338,6 +524,16 @@ export function applyEventToState(event: EventRow, state: DisplayState): void {
     case 'approval_requested': {
       const subject = String(data.subject ?? data.tool ?? 'action');
       state.status = `approval required: ${subject}`;
+      state.done = true;
+      return;
+    }
+    case 'approval_resolved': {
+      const decision = String(data.decision ?? 'resolved');
+      state.status = decision === 'approved' ? 'approved — continuing' : 'rejected — stopping';
+      return;
+    }
+    case 'run_resumed': {
+      state.status = 'resuming';
       return;
     }
     case 'guardrail_tripped': {

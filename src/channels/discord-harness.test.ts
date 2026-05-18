@@ -68,11 +68,16 @@ test('conversation_step updates the summary and step counter', () => {
   assert.equal(s.done, false);
 });
 
-test('approval_requested surfaces the subject without marking done', () => {
+test('approval_requested surfaces the subject and marks the display done', () => {
+  // Marking done=true lets the live-edit loop settle on the
+  // "approval required" reply so the bot stops animating while the
+  // user is being asked. The session itself stays paused server-side
+  // — the next approve/reject message resumes it via
+  // runDiscordHarnessResume.
   const s = freshState();
   applyEventToState(event('approval_requested', { subject: 'deploy to prod', tool: 'request_approval' }), s);
   assert.equal(s.status, 'approval required: deploy to prod');
-  assert.equal(s.done, false);
+  assert.equal(s.done, true);
 });
 
 test('approval_requested falls back to tool name when no subject', () => {
