@@ -7176,12 +7176,23 @@ const CONSOLE_JS = `
 
   // Populate version chips from /api/console/build-info — done once at
   // page load. If the call fails we keep the placeholder dash.
+  //
+  // Race fix: the renderUpdaterChip below caches `sub.textContent` into
+  // `sub.dataset.baseLabel` on its first run. If renderUpdaterChip
+  // fires before this IIFE resolves, baseLabel sticks at the HTML
+  // placeholder "v0.1.0 · console" and every subsequent tick rebuilds
+  // the header with that stale prefix — even after install of 0.4.x.
+  // So after we set the real version, drop the cached baseLabel so the
+  // next chip render re-captures from the fresh textContent.
   (async () => {
     try {
       const info = await fetchJSON('/api/console/build-info');
       const v = info.version ? 'v' + info.version : '';
       const headerSub = document.querySelector('[data-daemon-version]');
-      if (headerSub && v) headerSub.textContent = v + ' · console';
+      if (headerSub && v) {
+        headerSub.textContent = v + ' · console';
+        delete headerSub.dataset.baseLabel;
+      }
       const footVer = document.querySelector('[data-foot-version]');
       if (footVer && v) footVer.textContent = v;
     } catch (err) { /* leave placeholder */ }
