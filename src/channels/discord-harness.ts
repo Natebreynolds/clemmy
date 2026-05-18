@@ -26,7 +26,7 @@ import {
   getSession as getHarnessSession,
   type EventRow,
 } from '../runtime/harness/eventlog.js';
-import { runConversation, resumePendingApproval } from '../runtime/harness/loop.js';
+import { runConversation, runConversationFromResume } from '../runtime/harness/loop.js';
 import { HarnessSession } from '../runtime/harness/session.js';
 import { openEventLog } from '../runtime/harness/eventlog.js';
 import { buildOrchestratorAgent } from '../agents/orchestrator.js';
@@ -507,7 +507,7 @@ async function runDiscordHarnessResume(opts: {
   void (async () => {
     try {
       const agent = await buildOrchestratorAgent();
-      const result = await resumePendingApproval({
+      const result = await runConversationFromResume({
         agent,
         sessionId,
         decision,

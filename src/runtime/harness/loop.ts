@@ -726,6 +726,194 @@ export async function resumePendingApproval(
   }
 }
 
+/**
+ * Resume after approval AND drive the conversation to completion.
+ *
+ * resumePendingApproval runs exactly one turn — the SDK call that
+ * was paused waiting for approval. That single turn is often not
+ * the end: the Orchestrator's structured output typically says
+ * `done: false, nextAction: "awaiting_handoff_result"`, meaning
+ * "I told the user I have approval and I'm ready to hand off to
+ * the Executor to actually do the work." runConversation's
+ * auto-continuation loop is what normally drives the follow-up
+ * turn(s), but the resume entry point bypassed that.
+ *
+ * This wrapper:
+ *   1. Calls resumePendingApproval for the first turn.
+ *   2. If that turn paused again / failed / errored → propagate.
+ *   3. If it completed with a decision saying "not done", keep
+ *      running runTurn() with the continuation prompt until done,
+ *      budgets blow, or another pause fires.
+ *
+ * Returns RunConversationResult so the caller sees one unified
+ * shape whether the resume was one-shot or multi-step.
+ */
+export async function runConversationFromResume(opts: {
+  agent: Agent<any, any>;
+  sessionId: string;
+  decision: 'approve' | 'reject';
+  maxSteps?: number;
+  maxWallClockMs?: number;
+  maxTurns?: number;
+  toolCallsPerTurn?: number;
+  makeRunner?: () => Runner;
+  runRunner?: RunRunnerFn;
+}): Promise<RunConversationResult> {
+  const maxSteps = opts.maxSteps ?? DEFAULT_MAX_CONVERSATION_STEPS;
+  const maxWallMs = opts.maxWallClockMs ?? DEFAULT_MAX_CONVERSATION_WALL_MS;
+  const startedAt = Date.now();
+
+  let lastDecision: OrchestratorDecisionShape | undefined;
+  let lastTurn = 0;
+
+  // Step 1: resume the paused approval.
+  const firstResult = await resumePendingApproval({
+    agent: opts.agent,
+    sessionId: opts.sessionId,
+    decision: opts.decision,
+    maxTurns: opts.maxTurns,
+    toolCallsPerTurn: opts.toolCallsPerTurn,
+    makeRunner: opts.makeRunner,
+    runRunner: opts.runRunner,
+  });
+  lastTurn = firstResult.turn;
+
+  if (firstResult.status !== 'completed') {
+    return {
+      sessionId: opts.sessionId,
+      status: firstResult.status,
+      steps: 1,
+      lastDecision,
+      lastTurn,
+      error: firstResult.error,
+    };
+  }
+
+  let decision = toOrchestratorDecision(firstResult.finalOutput);
+  lastDecision = decision ?? lastDecision;
+
+  // If reject was the decision, treat it as "done — we cancelled
+  // the action" regardless of what the orchestrator says next.
+  if (opts.decision === 'reject') {
+    safeAppend({
+      sessionId: opts.sessionId,
+      turn: lastTurn,
+      role: 'system',
+      type: 'conversation_completed',
+      data: { steps: 1, reason: 'rejected_by_user', summary: decision?.summary },
+    });
+    return {
+      sessionId: opts.sessionId,
+      status: 'completed',
+      steps: 1,
+      lastDecision: decision ?? undefined,
+      lastTurn,
+    };
+  }
+
+  // Steps 2..N: same loop semantics as runConversation, but starting
+  // from step 2 since the resume covered step 1.
+  let stepIndex = 1;
+  while (stepIndex < maxSteps) {
+    if (!decision || decision.done) {
+      safeAppend({
+        sessionId: opts.sessionId,
+        turn: lastTurn,
+        role: 'system',
+        type: 'conversation_completed',
+        data: { steps: stepIndex, summary: decision?.summary },
+      });
+      return {
+        sessionId: opts.sessionId,
+        status: 'completed',
+        steps: stepIndex,
+        lastDecision: decision ?? undefined,
+        lastTurn,
+      };
+    }
+    if (decision.nextAction === 'awaiting_user_input') {
+      return {
+        sessionId: opts.sessionId,
+        status: 'awaiting_user_input',
+        steps: stepIndex,
+        lastDecision: decision,
+        lastTurn,
+      };
+    }
+    if (decision.nextAction === 'awaiting_approval') {
+      return {
+        sessionId: opts.sessionId,
+        status: 'awaiting_approval',
+        steps: stepIndex,
+        lastDecision: decision,
+        lastTurn,
+      };
+    }
+    if (Date.now() - startedAt > maxWallMs) {
+      safeAppend({
+        sessionId: opts.sessionId,
+        turn: lastTurn,
+        role: 'system',
+        type: 'conversation_limit_exceeded',
+        data: { steps: stepIndex, reason: 'wall_clock', maxWallClockMs: maxWallMs },
+      });
+      return {
+        sessionId: opts.sessionId,
+        status: 'limit_exceeded',
+        steps: stepIndex,
+        lastDecision: decision,
+        lastTurn,
+      };
+    }
+
+    stepIndex += 1;
+    const turnResult = await runTurn({
+      agent: opts.agent,
+      sessionId: opts.sessionId,
+      input: CONTINUATION_INPUT,
+      maxTurns: opts.maxTurns,
+      toolCallsPerTurn: opts.toolCallsPerTurn,
+      makeRunner: opts.makeRunner,
+      runRunner: opts.runRunner,
+    });
+    lastTurn = turnResult.turn;
+    if (turnResult.status !== 'completed') {
+      return {
+        sessionId: opts.sessionId,
+        status: turnResult.status,
+        steps: stepIndex,
+        lastDecision,
+        lastTurn,
+        error: turnResult.error,
+      };
+    }
+    decision = toOrchestratorDecision(turnResult.finalOutput);
+    lastDecision = decision ?? lastDecision;
+    safeAppend({
+      sessionId: opts.sessionId,
+      turn: turnResult.turn,
+      role: 'orchestrator',
+      type: 'conversation_step',
+      data: { step: stepIndex, decision: decision ?? null },
+    });
+  }
+
+  safeAppend({
+    sessionId: opts.sessionId,
+    turn: lastTurn,
+    role: 'system',
+    type: 'conversation_limit_exceeded',
+    data: { steps: stepIndex, reason: 'max_steps', maxSteps },
+  });
+  return {
+    sessionId: opts.sessionId,
+    status: 'limit_exceeded',
+    steps: stepIndex,
+    lastDecision,
+    lastTurn,
+  };
+}
+
 // ---------- helpers ----------
 
 function isKillBeforeStart(
