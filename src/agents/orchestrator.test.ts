@@ -95,11 +95,20 @@ test('Orchestrator carries the harness guardrails', async () => {
   assert.ok(outputNames.includes('secret_leak'));
 });
 
-test('Orchestrator tools are draft_plan + request_approval + ask_user_question and NOTHING else', async () => {
+test('Orchestrator tools are the three deliberation tools + composio_search_tools (read-only)', async () => {
+  // composio_search_tools is read-only — it queries Composio for
+  // matching action slugs but doesn't mutate anything. Including it
+  // on the Orchestrator lets it own the "find the right tool"
+  // decision in code instead of via a Researcher detour. The
+  // execute counterpart (composio_execute_tool) is NOT here — it
+  // stays on the Executor side of the handoff so the
+  // zero-action-tools discipline holds for the Orchestrator.
   const agent = await buildOrchestratorAgent();
-  const toolNames = (agent.tools ?? []).map((t) => (t as { name?: string }).name);
-  toolNames.sort();
-  assert.deepEqual(toolNames, ['ask_user_question', 'draft_plan', 'request_approval'].sort());
+  const toolNames = (agent.tools ?? []).map((t) => (t as { name?: string }).name).sort();
+  assert.deepEqual(
+    toolNames,
+    ['ask_user_question', 'composio_search_tools', 'draft_plan', 'request_approval'].sort(),
+  );
 });
 
 test('Orchestrator hands off to the five sub-agents by name', async () => {

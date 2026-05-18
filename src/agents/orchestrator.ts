@@ -6,6 +6,8 @@ import type { RuntimeContextValue } from '../types.js';
 import { buildPlannerTool } from './planner.js';
 import { defaultOrchestratorHandoffs } from './sub-agents.js';
 import { harnessInstructions } from './harness-context.js';
+import { getCoreToolsAsync } from '../tools/registry.js';
+import type { Tool } from '@openai/agents';
 import { appendEvent } from '../runtime/harness/eventlog.js';
 import {
   harnessInputGuardrails,
@@ -156,14 +158,17 @@ const ORCHESTRATOR_INSTRUCTIONS = [
   '  5. Ambiguous ask that references prior context → hand off to Researcher to recall context FIRST, then re-decide. Only call `ask_user_question` when the request is genuinely unparseable (not when you can look it up).',
   'Researcher returned "not found" — when Researcher reports it could not locate the specific thing the user asked about after a reasonable search, DO NOT hand off again hoping for better results. Call `ask_user_question` with what was searched and a concrete question about where to look ("I searched <list of places> for <thing the user asked about> and didn\'t find it — is it in a specific folder I should look in, or somewhere outside the linked workspaces?"). One cheap clarifying exchange beats burning another budget on the same dead-end.',
   'After approval — when the user has just approved a destructive / external-mutating action, you ALREADY have what you need to hand off. Do not emit a structured output saying "I cannot continue because the tool is not available." Instead, hand off to the sub-agent that can actually do the work (almost always Executor for cx_* / Composio actions, file writes, shell commands, or external API calls; Writer for drafts; Deployer for releases). The handoffs are real — you can see them in your tool list as transfer_to_Researcher / transfer_to_Writer / transfer_to_Reviewer / transfer_to_Executor / transfer_to_Deployer. If you genuinely don\'t see the handoff you need, ask the user with a specific question about what tool/integration to enable — never silently give up after collecting approval.',
-  'External actions — DISCOVER FIRST, then EXECUTE, with structured handoff. When the user wants an action on a connected external service (Instagram post, Slack DM, send an email, create a Trello card, etc.):',
-  '  1. Hand off to Researcher with a directive like "find the Composio tool for posting to Instagram, return the slug and the required arguments." Researcher calls composio_search_tools / composio_list_tools and returns a specific slug + the parameter schema. This is the discovery step.',
-  '  2. With the slug in hand, call request_approval (external mutations need user consent). Include the resolved tool slug in your decision summary so the next turn has full context.',
-  '  3. After approval, hand off to Executor — and YOU MUST FILL IN THE STRUCTURED HANDOFF INPUT. The transfer_to_Executor tool expects:',
+  'External actions — DISCOVER YOURSELF, then EXECUTE. Composio is part of Clementine; you have direct access to `composio_search_tools` (read-only, doesn\'t violate the no-action-tools rule). When the user wants an action on a connected external service (Instagram post, Slack DM, Trello card, send an email, anything outside the curated cx_* tools):',
+  '  1. Call `composio_search_tools` with a focused query (e.g. {query: "instagram create post", toolkit_slug: "instagram"}). It returns matching slugs + parameter schemas for whichever toolkits the user has connected. No need to hand off to Researcher for this — discovery is YOUR job.',
+  '  2. Pick the best matching slug. Compose the JSON args from the returned `inputParameters` schema.',
+  '  3. Call `request_approval` (external mutations need user consent). Surface the resolved slug in the approval summary.',
+  '  4. After approval, hand off to Executor — and FILL IN THE STRUCTURED HANDOFF INPUT. The transfer_to_Executor tool expects:',
   '       { directive: "<one line of what to do>", toolCall: { slug: "<exact slug>", args: "<JSON string of args>", rationale: "<why or null>" } | null }',
-  '     For external actions like Instagram, set toolCall to the slug and JSON-encoded args the Researcher returned. For non-Composio work (file writes, shell commands, tracked-execution updates), set toolCall: null. The Executor reads this directly and calls composio_execute_tool with your slug/args — no re-discovery on its end. The same shape applies for transfer_to_Deployer.',
-  '  Skipping the Researcher step OR handing off without populating toolCall forces the Executor to either re-discover (wasted turn) or fail. Fill the structured input every time, exactly as the schema describes.',
-  'EXCEPTION: if you already see a curated `cx_<toolkit>_<action>` tool that obviously matches (e.g. user says "send a Gmail draft" and you see cx_gmail_create_draft), you can skip the Researcher discovery step AND set toolCall: null on the handoff. The Executor will call the cx_* tool directly via its own surface.',
+  '     For external Composio actions, populate toolCall with the slug you discovered and the JSON-encoded args. For non-Composio work (file writes, shell commands, tracked-execution updates), set toolCall: null. The Executor reads this directly and calls composio_execute_tool with your slug/args — no re-discovery on its end. Same shape applies for transfer_to_Deployer.',
+  '  Handing off without populating toolCall when the work IS a Composio action forces the Executor to either re-discover (wasted turn) or fail. Fill the structured input every time.',
+  'EXCEPTIONS:',
+  '  - If a curated `cx_<toolkit>_<action>` obviously matches (e.g. user says "send a Gmail draft" and there\'s a cx_gmail_create_draft), skip the search step. Hand off with toolCall: null and the Executor will call the cx_* tool directly from its own surface.',
+  '  - If composio_search_tools returns no matches AND no curated cx_* exists, ask the user with ask_user_question what they want — DO NOT silently report "tool not available." The status field on returned toolkits is informational only; Composio reports EXPIRED for connections that work fine, so do not refuse to attempt a tool just because the status looks stale. Let the actual execute call surface a real error if there is one.',
   'Return an OrchestratorDecision. Be specific. `summary` is what you decided and (if done) what was accomplished. Pick `nextAction` honestly: did you finish, are you waiting on the user, are you waiting on approval, or did you hand off and expect a follow-up turn?',
 ].join('\n\n');
 
@@ -183,6 +188,21 @@ export async function buildOrchestratorAgent(): Promise<
   });
   const plannerTool = buildPlannerTool();
 
+  // Read-only Composio discovery tool. Surfaces `composio_search_tools`
+  // (and only that) directly on the Orchestrator so it can resolve
+  // an external-action slug WITHOUT a Researcher detour. This is the
+  // discover-once-then-execute pattern in code: the Orchestrator
+  // owns "what tool should run", the Executor owns "run it". Search
+  // is pure read — it doesn't violate the orchestrator's
+  // zero-action-tools discipline (it doesn't mutate; it returns
+  // descriptions). composio_execute_tool is NOT added here — that
+  // stays on the Executor side of the handoff boundary.
+  const allCoreTools = await getCoreToolsAsync({ includeDynamicComposioTools: false });
+  const composioSearch = allCoreTools.find(
+    (t) => (t as { name?: string }).name === 'composio_search_tools',
+  ) as Tool<RuntimeContextValue> | undefined;
+  const composioTools: Tool<RuntimeContextValue>[] = composioSearch ? [composioSearch] : [];
+
   return new Agent<RuntimeContextValue, typeof OrchestratorDecisionSchema>({
     name: 'Orchestrator',
     handoffDescription:
@@ -194,7 +214,7 @@ export async function buildOrchestratorAgent(): Promise<
     instructions: harnessInstructions(ORCHESTRATOR_INSTRUCTIONS),
     model: MODELS.primary,
     outputType: OrchestratorDecisionSchema,
-    tools: [plannerTool, buildRequestApprovalTool(), buildAskUserQuestionTool()],
+    tools: [plannerTool, buildRequestApprovalTool(), buildAskUserQuestionTool(), ...composioTools],
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     handoffs: handoffs as unknown as (Agent<any, any> | Handoff<any, any>)[],
     inputGuardrails: harnessInputGuardrails,

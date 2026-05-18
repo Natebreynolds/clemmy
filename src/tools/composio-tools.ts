@@ -128,7 +128,13 @@ export async function getDynamicComposioRuntimeTools(options: {
 
   const perToolkitLimit = Math.max(1, Math.min(options.perToolkitLimit ?? DEFAULT_DYNAMIC_TOOLKIT_LIMIT, 100));
   const totalLimit = Math.max(1, Math.min(options.totalLimit ?? DEFAULT_DYNAMIC_TOTAL_LIMIT, 300));
-  const connections = (await listConnectedToolkits()).filter((connection) => connection.status === 'ACTIVE');
+  // Load cx_* tools for ALL connected toolkits, not just status=ACTIVE.
+  // Composio's status flag is unreliable (lags, false EXPIRED) and we
+  // were silently hiding working tools from the agent's surface. If
+  // a connection is truly dead, the execute call will surface a real
+  // error — the user gets actionable feedback instead of "tool not
+  // available".
+  const connections = await listConnectedToolkits();
   if (connections.length === 0) return [];
 
   const connectionsByToolkit = new Map<string, typeof connections>();
@@ -240,10 +246,19 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
         });
       }
 
-      const connected = (await listConnectedToolkits()).filter((connection) => connection.status === 'ACTIVE');
+      // DO NOT filter by `status === 'ACTIVE'` here. Composio's
+      // status flag is unreliable — connections that genuinely work
+      // can show as EXPIRED if the toolkit hasn't been hit recently,
+      // and Clementine users have hit this filtering out Instagram /
+      // TikTok / etc. that were perfectly usable. We search against
+      // every connected toolkit and let the actual execute call
+      // surface a real error if the connection truly is dead. That
+      // gives the agent (and the user) accurate, actionable feedback
+      // instead of "tool not available" when the tool IS available.
+      const allConnections = await listConnectedToolkits();
       const targetToolkits = toolkit_slug
         ? [toolkit_slug]
-        : [...new Set(connected.map((connection) => connection.slug))];
+        : [...new Set(allConnections.map((connection) => connection.slug))];
       const queryTerms = tokenize(query);
       const maxResults = Math.max(1, Math.min(limit ?? DEFAULT_SEARCH_TOTAL_LIMIT, 50));
       const matches: Array<{
@@ -287,10 +302,15 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
       matches.sort((left, right) => right.score - left.score || left.slug.localeCompare(right.slug));
       return prettyJson({
         configured: true,
-        connectedToolkits: connected.map((connection) => ({
+        connectedToolkits: allConnections.map((connection) => ({
           toolkit: connection.slug,
           account: connection.accountLabel ?? connection.alias ?? null,
           connectionId: connection.connectionId,
+          // status is reported for visibility but search no longer
+          // filters by it — Composio's "ACTIVE"/"EXPIRED" reporting
+          // lags reality, so the agent should attempt execution and
+          // surface a real error if the connection is truly dead.
+          status: connection.status ?? 'unknown',
         })),
         searchedToolkits: targetToolkits,
         query,
