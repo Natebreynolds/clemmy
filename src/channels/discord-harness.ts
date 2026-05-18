@@ -235,12 +235,31 @@ interface DisplayState {
   summary: string;
   status: string;
   done: boolean;
+  // Visibility extensions — surfaced in the rolling message body so
+  // the user can see what the agent is actually doing in real time.
+  // Without these, long runs look identical to stuck runs.
+  toolsCalled: string[];
+  currentAgent?: string;
+  toolCount: number;
 }
 
 function renderBody(state: DisplayState): string {
   const head = state.summary ? `> ${state.summary}\n\n` : '';
-  const status = state.done ? '' : `_${state.status}_`;
-  const body = (head + status).trim() || '_working…_';
+  // Live-progress block: only shown while not-done. Pulls the agent
+  // currently running, the count of tool calls so far, and the last
+  // ~4 tool names so the user can see "what is it doing?" at a glance.
+  let activity = '';
+  if (!state.done) {
+    const lines: string[] = [];
+    if (state.currentAgent) lines.push(`**${state.currentAgent}** is working…`);
+    if (state.toolCount > 0) {
+      const recent = state.toolsCalled.slice(-4).join(', ');
+      lines.push(`Tools used: ${state.toolCount} (${recent})`);
+    }
+    if (state.status) lines.push(`_${state.status}_`);
+    activity = lines.join('\n');
+  }
+  const body = (head + activity).trim() || '_working…_';
   return body.length > MAX_DISCORD_MESSAGE ? body.slice(0, MAX_DISCORD_MESSAGE - 1) + '…' : body;
 }
 
@@ -303,7 +322,7 @@ export async function runDiscordHarnessConversation(opts: {
     return;
   }
 
-  const state: DisplayState = { summary: '', status: 'starting', done: false };
+  const state: DisplayState = { summary: '', status: 'starting', done: false, toolsCalled: [], toolCount: 0 };
   let lastEditAt = 0;
   let pendingEdit: NodeJS.Timeout | null = null;
 
@@ -447,6 +466,8 @@ async function runDiscordHarnessResume(opts: {
     summary: '',
     status: decision === 'approve' ? 'resuming after approval' : 'cancelling',
     done: false,
+    toolsCalled: [],
+    toolCount: 0,
   };
   let lastEditAt = 0;
   let pendingEdit: NodeJS.Timeout | null = null;
@@ -580,12 +601,22 @@ export async function handleDiscordHarnessMessage(
 export function applyEventToState(event: EventRow, state: DisplayState): void {
   const data = event.data ?? {};
   switch (event.type) {
-    case 'turn_started':
+    case 'turn_started': {
+      // role on a turn_started event is the agent that's starting
+      // (Orchestrator, Researcher, Executor, Writer, etc.). Surface it
+      // so the user sees who's running.
+      const role = typeof event.role === 'string' && event.role !== 'system' && event.role !== 'user'
+        ? event.role
+        : '';
+      if (role) state.currentAgent = role;
       state.status = 'thinking…';
       return;
+    }
     case 'tool_called': {
       const tool = String(data.tool ?? data.name ?? 'tool');
       state.status = `using ${tool}`;
+      state.toolsCalled.push(tool);
+      state.toolCount += 1;
       return;
     }
     case 'handoff': {

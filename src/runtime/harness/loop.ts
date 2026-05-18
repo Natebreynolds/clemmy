@@ -1071,11 +1071,37 @@ function previewOutput(out: unknown): string {
 function extractFallbackSummary(out: unknown): string | undefined {
   if (typeof out === 'string') {
     const trimmed = out.trim();
-    return trimmed ? trimmed : undefined;
+    if (!trimmed) return undefined;
+    // Sub-agents (especially the Executor) sometimes emit a JSON-shaped
+    // OrchestratorDecision string because they saw the schema in their
+    // context and over-conformed. If we render the raw string, the user
+    // sees literal '{"summary":"...","reply":"","done":false,...}' braces
+    // in Discord — observed on 0.4.x SEO enrichment turn 11:16. Detect the
+    // shape and pull out the user-facing field instead.
+    if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+      try {
+        const parsed = JSON.parse(trimmed) as Record<string, unknown>;
+        const reply = typeof parsed.reply === 'string' ? parsed.reply.trim() : '';
+        if (reply) return reply;
+        const summary = typeof parsed.summary === 'string' ? parsed.summary.trim() : '';
+        if (summary) {
+          const wasIntent = parsed.done === false || parsed.nextAction === 'in_progress';
+          return wasIntent
+            ? `${summary}\n\n_(The agent described an intent but did not perform the tool calls. Ask it to run the actual tools.)_`
+            : summary;
+        }
+      } catch { /* not valid JSON — fall through */ }
+    }
+    return trimmed;
   }
   if (out && typeof out === 'object') {
     try {
-      return JSON.stringify(out);
+      const obj = out as Record<string, unknown>;
+      const reply = typeof obj.reply === 'string' ? obj.reply.trim() : '';
+      if (reply) return reply;
+      const summary = typeof obj.summary === 'string' ? obj.summary.trim() : '';
+      if (summary) return summary;
+      return JSON.stringify(obj);
     } catch {
       return undefined;
     }

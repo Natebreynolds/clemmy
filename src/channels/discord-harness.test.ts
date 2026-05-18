@@ -16,7 +16,7 @@ import type { EventRow } from '../runtime/harness/eventlog.js';
 import { applyEventToState } from './discord-harness.js';
 
 function freshState() {
-  return { summary: '', status: 'starting', done: false };
+  return { summary: '', status: 'starting', done: false, toolsCalled: [], toolCount: 0 };
 }
 
 function event(type: EventRow['type'], data: Record<string, unknown> = {}): EventRow {
@@ -96,7 +96,7 @@ test('awaiting_user_input promotes the question to the summary and marks done', 
 });
 
 test('conversation_completed promotes summary, marks done, "complete" status', () => {
-  const s = { summary: 'older summary', status: 'step 3', done: false };
+  const s = { summary: 'older summary', status: 'step 3', done: false, toolsCalled: [], toolCount: 0 };
   applyEventToState(
     event('conversation_completed', { summary: 'all 20 emails scheduled for 2pm daily', steps: 4 }),
     s,
@@ -135,10 +135,10 @@ test('conversation_limit_exceeded surfaces the reason and marks done', () => {
 });
 
 test('unknown event types are no-ops (state untouched)', () => {
-  const s = { summary: 'still here', status: 'mid-flight', done: false };
+  const s = { summary: 'still here', status: 'mid-flight', done: false, toolsCalled: [] as string[], toolCount: 0 };
   applyEventToState(event('heartbeat'), s);
   applyEventToState(event('plan_drafted'), s);
-  assert.deepEqual(s, { summary: 'still here', status: 'mid-flight', done: false });
+  assert.deepEqual(s, { summary: 'still here', status: 'mid-flight', done: false, toolsCalled: [], toolCount: 0 });
 });
 
 test('summary persists across steps when a later event lacks one', () => {
