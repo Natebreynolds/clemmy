@@ -32,8 +32,30 @@ const EDIT_DEBOUNCE_MS = 2_000;
 const SAFETY_TIMEOUT_MS = 35 * 60_000;
 const MAX_DISCORD_MESSAGE = 1_900;
 
-interface DiscordLikeReply {
-  edit(opts: { content: string }): Promise<unknown>;
+/**
+ * Abstraction over "where do we send the placeholder and where do we
+ * edit it as progress arrives." The two Discord paths into the harness
+ * need different transports:
+ *
+ *   - Gateway path: real Discord.js Message — uses message.reply +
+ *     reply.edit. Used when the bot is connected to Discord's
+ *     WebSocket gateway.
+ *   - REST/DM polling path: no Message object — we POST a fresh
+ *     message and PATCH it by id. Used when intents make DMs
+ *     unavailable over the gateway and we poll DMs via REST.
+ *
+ * Both end up driving the same conversation flow; only the transport
+ * differs. `runDiscordHarnessConversation` owns the state machine.
+ */
+export interface DiscordHarnessTransport {
+  /** Send the initial placeholder. Returns a handle for subsequent edits. */
+  sendInitial(content: string): Promise<DiscordHarnessReplyHandle>;
+  /** Send a one-shot error message when we never get to start the run. */
+  sendError(content: string): Promise<void>;
+}
+
+export interface DiscordHarnessReplyHandle {
+  edit(content: string): Promise<void>;
 }
 
 interface DisplayState {
@@ -50,34 +72,50 @@ function renderBody(state: DisplayState): string {
 }
 
 /**
- * Run one Discord-routed harness conversation. Reads the message
- * prompt, creates a session, kicks off runConversation in the
- * background, and edits the placeholder reply with live progress
- * until the conversation reaches a terminal state.
+ * Transport-agnostic harness conversation runner. Subscribes to the
+ * actionBus for the session's events, debounces edits, and resolves
+ * once the conversation reaches a terminal state.
  */
-export async function handleDiscordHarnessMessage(
-  message: Message<boolean>,
-  prompt: string,
-): Promise<void> {
-  // Auth gate: same OAuth bridge the desktop chat and CLI use.
+export async function runDiscordHarnessConversation(opts: {
+  prompt: string;
+  channelId: string;
+  userId: string;
+  guildId: string | null;
+  transport: DiscordHarnessTransport;
+}): Promise<void> {
+  const { prompt, channelId, userId, guildId, transport } = opts;
+
   const auth = await configureHarnessRuntime();
   if (!auth.ok) {
-    await message.reply(`Cannot start: ${auth.reason}`);
+    await transport.sendError(`Cannot start: ${auth.reason}`);
     return;
   }
 
   const session = createHarnessSession({
     kind: 'chat',
     title: prompt.length > 60 ? `${prompt.slice(0, 57)}...` : prompt,
-    metadata: {
-      source: 'discord',
-      channelId: message.channelId,
-      userId: message.author.id,
-      guildId: message.guildId ?? null,
-    },
+    metadata: { source: 'discord', channelId, userId, guildId },
   });
 
-  const reply = (await message.reply('🍊 starting…')) as unknown as DiscordLikeReply;
+  let handle: DiscordHarnessReplyHandle;
+  try {
+    handle = await transport.sendInitial('🍊 starting…');
+  } catch (err) {
+    // Couldn't even post the placeholder — nothing we can do from
+    // here; record the failure for offline replay.
+    try {
+      appendHarnessEvent({
+        sessionId: session.id,
+        turn: 0,
+        role: 'system',
+        type: 'run_failed',
+        data: { error: err instanceof Error ? err.message : String(err), stage: 'initial_reply' },
+      });
+    } catch {
+      /* last-ditch */
+    }
+    return;
+  }
 
   const state: DisplayState = { summary: '', status: 'starting', done: false };
   let lastEditAt = 0;
@@ -87,7 +125,7 @@ export async function handleDiscordHarnessMessage(
     pendingEdit = null;
     lastEditAt = Date.now();
     try {
-      await reply.edit({ content: renderBody(state) });
+      await handle.edit(renderBody(state));
     } catch {
       // Discord can transiently refuse edits (network blip, rate
       // limit). The next event will retry; nothing fatal.
@@ -130,10 +168,6 @@ export async function handleDiscordHarnessMessage(
       scheduleEdit();
     });
 
-    // Safety net: if for any reason the conversation never emits a
-    // terminal event (e.g. the daemon's clock drifts and the wall-
-    // clock guard inside runConversation never fires), give up after
-    // 35 minutes so the Discord reply stops looking stuck.
     safetyTimer = setTimeout(() => {
       state.status = 'timed out waiting for completion';
       state.done = true;
@@ -141,10 +175,6 @@ export async function handleDiscordHarnessMessage(
     }, SAFETY_TIMEOUT_MS);
   });
 
-  // Run the conversation off the message handler — Discord wants the
-  // event loop free to keep handling other messages, and the
-  // actionBus subscription below feeds the UI without needing the
-  // run's return value.
   void (async () => {
     try {
       const agent = await buildOrchestratorAgent();
@@ -160,12 +190,44 @@ export async function handleDiscordHarnessMessage(
           data: { error: errorMessage, stage: 'pre_first_turn' },
         });
       } catch {
-        // last-ditch — don't escalate an unhandled rejection
+        /* last-ditch */
       }
     }
   })();
 
   await finished;
+}
+
+/**
+ * Gateway entry point — wraps Discord.js Message into the transport
+ * abstraction and runs the conversation.
+ */
+export async function handleDiscordHarnessMessage(
+  message: Message<boolean>,
+  prompt: string,
+): Promise<void> {
+  const transport: DiscordHarnessTransport = {
+    async sendInitial(content) {
+      const reply = (await message.reply(content)) as unknown as {
+        edit(opts: { content: string }): Promise<unknown>;
+      };
+      return {
+        edit: async (next) => {
+          await reply.edit({ content: next });
+        },
+      };
+    },
+    async sendError(content) {
+      await message.reply(content);
+    },
+  };
+  await runDiscordHarnessConversation({
+    prompt,
+    channelId: message.channelId,
+    userId: message.author.id,
+    guildId: message.guildId ?? null,
+    transport,
+  });
 }
 
 /**

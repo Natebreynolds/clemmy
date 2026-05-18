@@ -28,7 +28,7 @@ import {
   DISCORD_HARNESS_ENABLED,
   DISCORD_REQUIRE_MENTION,
 } from '../config.js';
-import { handleDiscordHarnessMessage } from './discord-harness.js';
+import { handleDiscordHarnessMessage, runDiscordHarnessConversation } from './discord-harness.js';
 import { ClementineAssistant } from '../assistant/core.js';
 import { ClementineGateway, type GatewayResponse } from '../gateway/router.js';
 import { getOrCreateDiscordSessionId } from './discord-store.js';
@@ -1590,6 +1590,56 @@ async function pollDiscordDirectMessages(client: Client, assistant: ClementineAs
           userId: message.author.id,
           guildId: null,
         })) {
+          markDiscordDmMessageSeen(dm.id, message.id);
+          continue;
+        }
+
+        // 0.3 harness routing for DM-polling path. The gateway-side
+        // branch (handleDiscordHarnessMessage) doesn't fire for DMs
+        // when intents force REST polling, so we wire the same
+        // conversation runner here with a REST transport: POST a
+        // placeholder, PATCH it as actionBus events arrive.
+        if (DISCORD_HARNESS_ENABLED) {
+          try {
+            await runDiscordHarnessConversation({
+              prompt,
+              channelId: dm.id,
+              userId: message.author.id,
+              guildId: null,
+              transport: {
+                async sendInitial(content: string) {
+                  const sent = await discordApiJson<DiscordRestSentMessage>(
+                    `/channels/${dm.id}/messages`,
+                    { method: 'POST', body: { content } },
+                  );
+                  return {
+                    edit: async (next: string) => {
+                      await discordApiJson(`/channels/${dm.id}/messages/${sent.id}`, {
+                        method: 'PATCH',
+                        body: { content: next.slice(0, 1900) },
+                      });
+                    },
+                  };
+                },
+                async sendError(content: string) {
+                  await sendDiscordRestChunks(dm.id, content);
+                },
+              },
+            });
+          } catch (err) {
+            logger.error(
+              { err, channelId: dm.id, userId: message.author.id },
+              'Discord harness DM handler failed',
+            );
+            try {
+              await sendDiscordRestChunks(
+                dm.id,
+                `Harness run failed: ${err instanceof Error ? err.message : String(err)}`,
+              );
+            } catch {
+              /* swallow — already in error path */
+            }
+          }
           markDiscordDmMessageSeen(dm.id, message.id);
           continue;
         }
