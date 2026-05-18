@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { MODELS, getRuntimeEnv } from '../config.js';
 import { activeExecutionCount, activeExecutionCountForSession } from '../tools/execution-tools.js';
 import { getCoreTools, getCoreToolsAsync } from '../tools/registry.js';
+import { getOrCreateExternalMcpServers } from '../runtime/mcp-servers.js';
 import type { RuntimeContextValue } from '../types.js';
 import { harnessInstructions } from './harness-context.js';
 import { appendEvent } from '../runtime/harness/eventlog.js';
@@ -369,6 +370,12 @@ export async function buildResearcherAgent(): Promise<SubAgent> {
     ].join('\n\n')),
     model: MODELS.fast,
     tools,
+    // External MCP servers (DataForSEO, Supabase, browsermcp, etc.)
+    // the user has configured. Tools surface as `<server>__<tool>`.
+    // Local clementine MCP is excluded — those tools are already in
+    // `tools` via getCoreToolsAsync(), and duplicating would force the
+    // model to disambiguate (memory_remember vs clementine-local__memory_remember).
+    mcpServers: [getOrCreateExternalMcpServers()],
   });
 }
 
@@ -403,6 +410,12 @@ export async function buildWorkerAgent(): Promise<SubAgent> {
     ].join('\n\n'),
     model: MODELS.primary,
     tools,
+    // External MCP servers (DataForSEO, Supabase, browsermcp, etc.)
+    // the user has configured. Tools surface as `<server>__<tool>`.
+    // Local clementine MCP is excluded — those tools are already in
+    // `tools` via getCoreToolsAsync(), and duplicating would force the
+    // model to disambiguate (memory_remember vs clementine-local__memory_remember).
+    mcpServers: [getOrCreateExternalMcpServers()],
   });
 }
 
@@ -452,6 +465,12 @@ export async function buildExecutorAgent(): Promise<SubAgent> {
     ].join('\n\n')),
     model: MODELS.primary,
     tools,
+    // External MCP servers (DataForSEO, Supabase, browsermcp, etc.)
+    // the user has configured. Tools surface as `<server>__<tool>`.
+    // Local clementine MCP is excluded — those tools are already in
+    // `tools` via getCoreToolsAsync(), and duplicating would force the
+    // model to disambiguate (memory_remember vs clementine-local__memory_remember).
+    mcpServers: [getOrCreateExternalMcpServers()],
   });
 }
 
@@ -472,6 +491,12 @@ export async function buildWriterAgent(): Promise<SubAgent> {
     ].join('\n\n')),
     model: MODELS.primary,
     tools,
+    // External MCP servers (DataForSEO, Supabase, browsermcp, etc.)
+    // the user has configured. Tools surface as `<server>__<tool>`.
+    // Local clementine MCP is excluded — those tools are already in
+    // `tools` via getCoreToolsAsync(), and duplicating would force the
+    // model to disambiguate (memory_remember vs clementine-local__memory_remember).
+    mcpServers: [getOrCreateExternalMcpServers()],
   });
 }
 
@@ -494,6 +519,12 @@ export async function buildReviewerAgent(): Promise<SubAgent> {
     ].join('\n\n')),
     model: MODELS.fast,
     tools,
+    // External MCP servers (DataForSEO, Supabase, browsermcp, etc.)
+    // the user has configured. Tools surface as `<server>__<tool>`.
+    // Local clementine MCP is excluded — those tools are already in
+    // `tools` via getCoreToolsAsync(), and duplicating would force the
+    // model to disambiguate (memory_remember vs clementine-local__memory_remember).
+    mcpServers: [getOrCreateExternalMcpServers()],
   });
 }
 
@@ -513,6 +544,12 @@ export async function buildDeployerAgent(): Promise<SubAgent> {
     ].join('\n\n')),
     model: MODELS.deep,
     tools,
+    // External MCP servers (DataForSEO, Supabase, browsermcp, etc.)
+    // the user has configured. Tools surface as `<server>__<tool>`.
+    // Local clementine MCP is excluded — those tools are already in
+    // `tools` via getCoreToolsAsync(), and duplicating would force the
+    // model to disambiguate (memory_remember vs clementine-local__memory_remember).
+    mcpServers: [getOrCreateExternalMcpServers()],
   });
 }
 

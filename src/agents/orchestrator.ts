@@ -7,6 +7,7 @@ import { buildPlannerTool } from './planner.js';
 import { defaultOrchestratorHandoffs } from './sub-agents.js';
 import { harnessInstructions } from './harness-context.js';
 import { getCoreToolsAsync } from '../tools/registry.js';
+import { getOrCreateExternalMcpServers } from '../runtime/mcp-servers.js';
 import type { Tool } from '@openai/agents';
 import { appendEvent } from '../runtime/harness/eventlog.js';
 import {
@@ -231,6 +232,13 @@ export async function buildOrchestratorAgent(): Promise<
     model: MODELS.primary,
     outputType: OrchestratorDecisionSchema,
     tools: [plannerTool, buildRequestApprovalTool(), buildAskUserQuestionTool(), ...composioTools],
+    // External MCP servers (DataForSEO, Supabase, browsermcp, etc.) the
+    // user has configured. Tools surface as `<server>__<tool>` (e.g.
+    // `dataforseo__serp_organic_live_advanced`). Without this the
+    // Orchestrator couldn't discover or route MCP-only capabilities —
+    // it would mistakenly tell the user "DataForSEO isn't connected"
+    // when in fact the MCP server is running with 118 tools loaded.
+    mcpServers: [getOrCreateExternalMcpServers()],
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     handoffs: handoffs as unknown as (Agent<any, any> | Handoff<any, any>)[],
     inputGuardrails: harnessInputGuardrails,

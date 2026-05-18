@@ -128,11 +128,20 @@ function createExternalServer(server: ManagedMcpServer): MCPServer | null {
  * Build the per-server list of MCPServer instances. Internal use only —
  * the Agent should be given the namespace-wrapped result of
  * `createConfiguredMcpServers()` so collisions are impossible.
+ *
+ * When `excludeLocal: true`, the local clementine MCP server is left
+ * out. Use this from the harness Agent path, where the same tools
+ * (memory, task, skill, etc.) are already in the surface via
+ * getCoreToolsAsync() — including the local server through the shim
+ * AND through registry.ts would create dup tools the model has to
+ * disambiguate between (memory_remember vs clementine-local__memory_remember).
  */
-function buildRawMcpServers(): MCPServer[] {
+function buildRawMcpServers(options: { excludeLocal?: boolean } = {}): MCPServer[] {
   const servers: MCPServer[] = [];
-  const local = createLocalServer();
-  if (local) servers.push(local);
+  if (!options.excludeLocal) {
+    const local = createLocalServer();
+    if (local) servers.push(local);
+  }
 
   for (const config of discoverMcpServers()) {
     const server = createExternalServer(config);
@@ -170,6 +179,7 @@ export function createConfiguredMcpServers(): MCPServer {
  *     the daemon — see invalidateConfiguredMcpServers() below.
  */
 let cachedShim: MCPServer | null = null;
+let cachedExternalShim: MCPServer | null = null;
 
 export function getOrCreateConfiguredMcpServers(): MCPServer {
   if (!cachedShim) {
@@ -179,21 +189,41 @@ export function getOrCreateConfiguredMcpServers(): MCPServer {
 }
 
 /**
- * Drop the cached shim. Closes the existing one (best-effort) so its
- * underlying stdio MCP child processes get terminated. The next call
- * to `getOrCreateConfiguredMcpServers()` builds a fresh shim that
- * picks up the latest `mcp/servers.json`.
+ * External-only namespace shim — same as `getOrCreateConfiguredMcpServers`
+ * but excludes the local clementine MCP server. Used by the harness
+ * Agent path so DataForSEO / Supabase / browsermcp / etc. tools reach
+ * the model WITHOUT duplicating the memory/task/skill tools that the
+ * agent already gets through getCoreToolsAsync().
+ *
+ * Same daemon-lifetime cache pattern — stdio children spawn once and
+ * are reused across every Orchestrator/Executor/Researcher build.
+ */
+export function getOrCreateExternalMcpServers(): MCPServer {
+  if (!cachedExternalShim) {
+    cachedExternalShim = createMcpNamespaceShim({
+      servers: buildRawMcpServers({ excludeLocal: true }),
+    });
+  }
+  return cachedExternalShim;
+}
+
+/**
+ * Drop the cached shims. Closes the existing ones (best-effort) so
+ * their underlying stdio MCP child processes get terminated. The next
+ * call to `getOrCreateConfiguredMcpServers()` / `getOrCreateExternalMcpServers()`
+ * builds a fresh shim that picks up the latest `mcp/servers.json`.
  *
  * Called from the dashboard's `/api/console/mcp-servers` POST/PATCH/
  * DELETE handlers — adding or toggling an MCP server takes effect on
  * the NEXT chat request, without a daemon restart.
  */
 export async function invalidateConfiguredMcpServers(): Promise<void> {
-  const previous = cachedShim;
+  const targets = [cachedShim, cachedExternalShim].filter((s): s is MCPServer => s !== null);
   cachedShim = null;
-  if (previous && typeof previous.close === 'function') {
-    await previous.close().catch(() => undefined);
-  }
+  cachedExternalShim = null;
+  await Promise.all(
+    targets.map((s) => (typeof s.close === 'function' ? s.close().catch(() => undefined) : undefined)),
+  );
 }
 
 /**
