@@ -155,13 +155,24 @@ const ORCHESTRATOR_INSTRUCTIONS = [
   '  4. Destructive or external-mutating step → call `request_approval` before handing off.',
   '  5. Ambiguous ask that references prior context → hand off to Researcher to recall context FIRST, then re-decide. Only call `ask_user_question` when the request is genuinely unparseable (not when you can look it up).',
   'Researcher returned "not found" — when Researcher reports it could not locate the specific thing the user asked about after a reasonable search, DO NOT hand off again hoping for better results. Call `ask_user_question` with what was searched and a concrete question about where to look ("I searched <X, Y, Z> for the LegalLady social post files and didn\'t find them — are they in a specific folder I should look in, or somewhere outside the workspace dirs?"). One cheap clarifying exchange beats burning another budget on the same dead-end.',
+  'After approval — when the user has just approved a destructive / external-mutating action, you ALREADY have what you need to hand off. Do not emit a structured output saying "I cannot continue because the tool is not available." Instead, hand off to the sub-agent that can actually do the work (almost always Executor for cx_* / Composio actions, file writes, shell commands, or external API calls; Writer for drafts; Deployer for releases). The handoffs are real — you can see them in your tool list as transfer_to_Researcher / transfer_to_Writer / transfer_to_Reviewer / transfer_to_Executor / transfer_to_Deployer. If you genuinely don\'t see the handoff you need, ask the user with a specific question about what tool/integration to enable — never silently give up after collecting approval.',
   'Return an OrchestratorDecision. Be specific. `summary` is what you decided and (if done) what was accomplished. Pick `nextAction` honestly: did you finish, are you waiting on the user, are you waiting on approval, or did you hand off and expect a follow-up turn?',
 ].join('\n\n');
 
 export async function buildOrchestratorAgent(): Promise<
   Agent<RuntimeContextValue, typeof OrchestratorDecisionSchema>
 > {
-  const handoffs = await defaultOrchestratorHandoffs();
+  // The 0.3 harness uses request_approval as the gate for destructive
+  // and external-mutating work, so the v0.2 "tracked execution"
+  // pre-condition that gated Executor/Deployer handoffs is redundant
+  // here. Without disabling that gate, the orchestrator sees no
+  // transfer_to_Executor in its tool surface (the handoff is hidden
+  // by isEnabled until a tracked execution exists) and gives up with
+  // "tool not available" even after the user approved the action.
+  // Nathan hit this on the LegalLady Instagram-post test.
+  const handoffs = await defaultOrchestratorHandoffs({
+    requireWorkflowApprovalForExecution: false,
+  });
   const plannerTool = buildPlannerTool();
 
   return new Agent<RuntimeContextValue, typeof OrchestratorDecisionSchema>({
