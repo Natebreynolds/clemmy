@@ -124,15 +124,28 @@ test('defaultOrchestratorHandoffs returns the specialized sub-agent set', async 
 });
 
 test('execution handoffs are gated by default and ungated by option', async () => {
+  // Both gated and ungated Executor handoffs are now always wrapped
+  // in handoff(...) so they can carry the ExecutorHandoffInput Zod
+  // schema. The difference is behavioral, not structural:
+  //   gated   → isEnabled callback returns false unless a tracked
+  //             execution is active in the session.
+  //   ungated → isEnabled is either absent OR returns true.
+  // Assert behavior, not property identity.
+  type EnabledFn = (opts: { runContext: { context: Record<string, unknown> } }) => boolean | Promise<boolean>;
+  type HandoffWithEnabled = { isEnabled?: EnabledFn };
   const gated = await defaultOrchestratorHandoffs();
-  const executor = gated.find((entry) => handoffDisplayName(entry) === 'Executor') as { isEnabled?: unknown } | undefined;
-  const deployer = gated.find((entry) => handoffDisplayName(entry) === 'Deployer') as { isEnabled?: unknown } | undefined;
-  assert.equal(typeof executor?.isEnabled, 'function');
-  assert.equal(typeof deployer?.isEnabled, 'function');
+  const gatedExecutor = gated.find((entry) => handoffDisplayName(entry) === 'Executor') as HandoffWithEnabled | undefined;
+  assert.equal(typeof gatedExecutor?.isEnabled, 'function');
+  const gatedResult = await gatedExecutor?.isEnabled?.({ runContext: { context: {} } });
+  assert.equal(gatedResult, false, 'gated executor handoff is disabled without a tracked execution');
 
   const ungated = await defaultOrchestratorHandoffs({ requireWorkflowApprovalForExecution: false });
-  const ungatedExecutor = ungated.find((entry) => handoffDisplayName(entry) === 'Executor') as { isEnabled?: unknown } | undefined;
-  assert.equal(ungatedExecutor?.isEnabled, undefined);
+  const ungatedExecutor = ungated.find((entry) => handoffDisplayName(entry) === 'Executor') as HandoffWithEnabled | undefined;
+  const ungatedResult = await ungatedExecutor?.isEnabled?.({ runContext: { context: {} } });
+  assert.ok(
+    ungatedResult === undefined || ungatedResult === true,
+    `ungated executor handoff should be reachable, got ${String(ungatedResult)}`,
+  );
 });
 
 test('sub-agents do NOT have their own handoffs (they are leaves)', async () => {

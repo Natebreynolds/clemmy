@@ -1,10 +1,75 @@
 import { Agent, handoff } from '@openai/agents';
 import type { Handoff, Tool } from '@openai/agents';
+import { z } from 'zod';
 import { MODELS, getRuntimeEnv } from '../config.js';
 import { activeExecutionCount, activeExecutionCountForSession } from '../tools/execution-tools.js';
 import { getCoreTools, getCoreToolsAsync } from '../tools/registry.js';
 import type { RuntimeContextValue } from '../types.js';
 import { harnessInstructions } from './harness-context.js';
+import { appendEvent } from '../runtime/harness/eventlog.js';
+
+/**
+ * Structured input the Orchestrator MUST supply when handing off to
+ * the Executor. The SDK validates this at the handoff site — the
+ * Orchestrator's model literally cannot call transfer_to_Executor
+ * without filling in these fields, which forces the
+ * discover-then-execute discipline:
+ *
+ *   directive    : one-line description of the work
+ *   toolCall     : when the Researcher already discovered a Composio
+ *                  tool, the Orchestrator must pass through the
+ *                  exact slug and args so the Executor calls
+ *                  composio_execute_tool directly without
+ *                  re-discovering. null when no Composio tool is
+ *                  involved (file writes, shell commands, etc.).
+ *
+ * The Executor receives the parsed input via its handoff context;
+ * its instructions tell it to read this first.
+ */
+export const ExecutorHandoffInput = z.object({
+  directive: z.string().min(8).describe(
+    'One-line description of what the Executor should do, e.g. "Post LegalLady image 2 with its README caption to Instagram via Composio." Be specific.',
+  ),
+  toolCall: z
+    .object({
+      slug: z.string().describe(
+        'Exact Composio tool slug to execute (e.g. INSTAGRAM_POST_CREATE, SLACK_POST_MESSAGE). Use this as the slug argument to composio_execute_tool.',
+      ),
+      args: z.string().describe(
+        'JSON-encoded arguments object for the tool, ready to pass as `arguments` to composio_execute_tool. Example: \'{"image_url":"/path/to/img.png","caption":"..."}\'',
+      ),
+      rationale: z.string().nullable().describe(
+        'Optional brief explanation of why this slug/args were chosen (helps the Executor verify intent if anything looks off). Pass null if none.',
+      ),
+    })
+    .nullable()
+    .describe(
+      'Set when the Researcher discovered a specific Composio tool to call. The Executor will pass slug+args directly to composio_execute_tool — NO re-discovery. Set to null for non-Composio work (file writes, shell commands, tracked-execution updates, etc.).',
+    ),
+});
+export type ExecutorHandoffInput = z.infer<typeof ExecutorHandoffInput>;
+
+/**
+ * Structured input for the Deployer — same discipline, scoped to
+ * release/deploy work. The Orchestrator must explicitly state what
+ * to deploy and the verification expectation.
+ */
+export const DeployerHandoffInput = z.object({
+  directive: z.string().min(8).describe(
+    'One-line description of the deploy/release work, e.g. "Cut v0.3.0 release of the harness branch and verify the DMG signs cleanly."',
+  ),
+  toolCall: z
+    .object({
+      slug: z.string(),
+      args: z.string(),
+      rationale: z.string().nullable(),
+    })
+    .nullable()
+    .describe(
+      'Set when a specific Composio tool (e.g. github_create_release) was pre-resolved by the Researcher. null when the deploy is a shell/CI workflow.',
+    ),
+});
+export type DeployerHandoffInput = z.infer<typeof DeployerHandoffInput>;
 
 /**
  * Sub-agent factory — the second half of "orchestrator that spawns
@@ -284,11 +349,12 @@ export async function buildExecutorAgent(): Promise<SubAgent> {
       'You are the Executor sub-agent inside Clementine.',
       'Your single job is to take the work that has been decided and DO it. No deliberation, no re-planning.',
       'Available tools: tasks (task_add, task_update), executions (execution_update_step, execution_complete, execution_mark_blocked), files (write_file, read_file), commands (run_shell_command — approval may be required), goals (goal_update), notifications (notify_user), check-ins (ask_user_question when truly blocked on user info).',
+      'READ THE HANDOFF INPUT FIRST. The Orchestrator handed off to you with a structured object: { directive: string, toolCall: { slug, args, rationale } | null }. This appears in your input as the transfer_to_Executor result. The `directive` tells you what to do; the `toolCall` (when non-null) tells you the EXACT Composio tool slug and JSON-encoded arguments the Researcher pre-resolved. Use them directly — that is your fast path.',
       'External integrations — three tiers, USE IN THIS ORDER:',
-      '  1. The orchestrator told you exactly which tool to call. Look at the handoff message — if the Researcher already discovered the right Composio action and the orchestrator passed it through (e.g. "Use INSTAGRAM_POST_CREATE with {image_url, caption}"), call `composio_execute_tool` with that exact slug and the provided args. DO NOT re-discover.',
-      '  2. Curated `cx_<toolkit>_<action>` is in your tool list. Call it directly. These exist for the curated toolkits (gmail, googlesheets, slack, github, ...).',
-      '  3. Neither of the above. ONLY IF the orchestrator didn\'t pre-resolve the tool AND no cx_* matches, fall back to discovery: `composio_search_tools` → `composio_execute_tool`. Surface what you searched in the result summary so the orchestrator can learn what you did.',
-      'Discovery on the Executor is a FALLBACK, not the default path. The Researcher\'s job is discovery; yours is execution. If you find yourself calling composio_search_tools, ask: did the orchestrator skip the research step? If so, do the minimum search needed to unblock, but flag it in your summary.',
+      '  1. handoff.toolCall is non-null → call `composio_execute_tool` with `{tool_slug: <slug>, arguments: <args>}` exactly as given. NO re-discovery, NO second-guessing the slug.',
+      '  2. handoff.toolCall is null AND a curated `cx_<toolkit>_<action>` matches → call it directly. These exist for gmail, googlesheets, slack, github, etc.',
+      '  3. Neither — fall back to discovery: `composio_search_tools` → `composio_execute_tool`. Flag in your summary that you had to discover, so the orchestrator learns to use the Researcher next time.',
+      'Discovery on the Executor is a FALLBACK. The Researcher\'s job is discovery; yours is execution. The Orchestrator should have pre-resolved any non-curated tool via Researcher. If toolCall is null and the work is clearly a Composio action, that\'s a sign the pipeline was skipped — note it in your summary.',
       'NEVER conclude "the runtime doesn\'t expose that action" without trying tier 3. The user has connected toolkits we can\'t enumerate at build time.',
       'Use `composio_status` only to confirm a toolkit is actually connected when you have a real reason to doubt it. If a needed toolkit is missing or disconnected, surface that with notify_user (or ask_user_question if you need them to connect it) — don\'t silently fail.',
       'Make small reversible changes, verify after each one when possible, and surface real errors via notify_user.',
@@ -365,12 +431,62 @@ function executionGateEnabled(sessionId: string | undefined): boolean {
   return (sessionId ? activeExecutionCountForSession(sessionId) > 0 : false) || activeExecutionCount() > 0;
 }
 
+/**
+ * `onHandoff` callback for execution handoffs. Logs the structured
+ * input the Orchestrator filled in so the event log captures the
+ * full intent (slug, args, rationale) at the moment of handoff. The
+ * SDK requires `onHandoff` to be present whenever `inputType` is —
+ * we use that requirement productively by tracing the contract.
+ */
+function logHandoffInput(agentName: string) {
+  return (runContext: { context?: { sessionId?: string; turn?: number } }, input: unknown): void => {
+    const sessionId = runContext.context?.sessionId;
+    if (!sessionId) return;
+    try {
+      appendEvent({
+        sessionId,
+        turn: typeof runContext.context?.turn === 'number' ? runContext.context.turn : 0,
+        role: 'orchestrator',
+        type: 'handoff',
+        data: {
+          to: agentName,
+          input: input ?? null,
+        },
+      });
+    } catch {
+      // best-effort — handoff still proceeds if the log write fails
+    }
+  };
+}
+
 function maybeGateExecutionHandoff(agent: SubAgent, options: OrchestratorHandoffOptions = {}): OrchestratorHandoff {
+  // Always wrap in `handoff(...)` so we can attach an `inputType`
+  // that forces the Orchestrator to provide a structured directive
+  // (and a pre-resolved Composio tool slug + args when applicable).
+  // The SDK validates this at handoff time — the Orchestrator's
+  // model literally cannot transfer to Executor / Deployer without
+  // filling these in, which enforces the
+  //   Researcher discovers → Orchestrator routes → Executor executes
+  // discipline at the protocol level instead of relying purely on
+  // prompt guidance.
+  const inputType =
+    agent.name === 'Deployer' ? DeployerHandoffInput : ExecutorHandoffInput;
+  const onHandoff = logHandoffInput(agent.name);
+
   if (options.requireWorkflowApprovalForExecution === false) {
-    return agent;
+    return handoff(agent, {
+      inputType: inputType as never,
+      onHandoff: onHandoff as never,
+      toolDescriptionOverride: [
+        `Handoff to the ${agent.name} agent to do the approved work.`,
+        agent.handoffDescription,
+      ].filter(Boolean).join(' '),
+    }) as OrchestratorHandoff;
   }
 
   return handoff(agent, {
+    inputType: inputType as never,
+    onHandoff: onHandoff as never,
     toolDescriptionOverride: [
       `Handoff to the ${agent.name} agent to handle approved tracked execution work.`,
       agent.handoffDescription,
