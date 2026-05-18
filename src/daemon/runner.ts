@@ -257,7 +257,11 @@ async function runCronJob(assistant: ClementineAssistant, job: CronJobRecord, so
       id: `${Date.now()}-cron-${job.name}`,
       kind: 'cron',
       title: `Cron job completed: ${job.name}`,
-      body: response.text.slice(0, 2000),
+      // Send the full body. Discord delivery (notification-delivery.ts)
+      // splits long content into multiple messages with paragraph-
+      // preserving chunks. Previously this was hard-sliced to 2000 chars
+      // and a morning briefing > 2000 arrived cut off with no continuation.
+      body: response.text,
       createdAt: new Date().toISOString(),
       read: false,
       metadata: { job: job.name, source },

@@ -1177,15 +1177,6 @@ export function renderConsoleHtml(token: string): string {
         </div>
       </div>
 
-      <div class="meeting-pill-wrap" data-meeting-pill-wrap hidden>
-        <button type="button" class="meeting-pill" data-meeting-pill aria-label="Open live meeting in Memory panel">
-          <span class="meeting-dot recording"></span>
-          <span class="meeting-pill-label" data-meeting-pill-label>recording</span>
-          <span class="meeting-pill-time" data-meeting-pill-time>00:00</span>
-        </button>
-        <button type="button" class="meeting-pill-dismiss" data-meeting-pill-dismiss aria-label="Dismiss stale recording indicator" title="Dismiss — if this is wrong, the daemon's recording state may have desynced">✕</button>
-      </div>
-
       <div class="meeting-toast" data-meeting-toast hidden>
         <div class="meeting-toast-head">
           <span class="meeting-dot complete"></span>
@@ -6882,61 +6873,6 @@ body {
 @keyframes meetingPulse {
   0%, 100% { transform: scale(1); opacity: 1; }
   50% { transform: scale(0.7); opacity: 0.55; }
-}
-
-/* Pill wrap groups the pill + a tiny dismiss button so the user has
-   an escape hatch when the daemon's state desyncs and the pill thinks
-   a recording is active when it isn't. */
-.meeting-pill-wrap {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-}
-.meeting-pill-dismiss {
-  background: color-mix(in srgb, var(--bg-1) 88%, transparent);
-  border: 1px solid var(--line);
-  color: var(--fg-3);
-  font: inherit;
-  font-size: 10px;
-  width: 22px;
-  height: 22px;
-  cursor: pointer;
-  padding: 0;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-}
-.meeting-pill-dismiss:hover { color: var(--accent-fail); border-color: var(--accent-fail); }
-
-/* Live pill — small enough to live in the corner without dominating,
-   but signals "we're capturing right now" unambiguously. */
-.meeting-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  padding: 7px 12px;
-  background: color-mix(in srgb, var(--bg-1) 88%, transparent);
-  backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
-  border: 1px solid color-mix(in srgb, var(--accent-fail) 50%, var(--line));
-  color: var(--fg);
-  font: inherit;
-  font-size: 10px;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-  cursor: pointer;
-  box-shadow: 0 6px 22px color-mix(in srgb, var(--bg-0) 45%, transparent);
-  transition: border-color 120ms, transform 120ms;
-}
-.meeting-pill:hover {
-  border-color: var(--accent-fail);
-  transform: translateY(-1px);
-}
-.meeting-pill-label { color: var(--fg-2); }
-.meeting-pill-time {
-  font-variant-numeric: tabular-nums;
-  color: var(--accent-fail);
-  letter-spacing: 0.06em;
 }
 
 /* Live recording card — lives INLINE inside the Memory > Meetings
@@ -14051,11 +13987,11 @@ const CONSOLE_JS = `
     const promptAlways = document.querySelector('[data-meeting-prompt-always]');
     const promptDismiss = document.querySelector('[data-meeting-prompt-dismiss]');
 
-    const pillWrap = document.querySelector('[data-meeting-pill-wrap]');
-    const pill = document.querySelector('[data-meeting-pill]');
-    const pillLabel = document.querySelector('[data-meeting-pill-label]');
-    const pillTime = document.querySelector('[data-meeting-pill-time]');
-    const pillDismiss = document.querySelector('[data-meeting-pill-dismiss]');
+    // The floating recording pill was removed — the in-window Memory >
+    // Meetings live card is the canonical recording-state UI now. The
+    // state machine below stays intact because the inline card reads
+    // from window.__clementineLiveMeeting and gets re-rendered when
+    // showPill / hidePill / appendSegment mutate state.
 
     const toast = document.querySelector('[data-meeting-toast]');
     const toastSub = document.querySelector('[data-meeting-toast-sub]');
@@ -14063,7 +13999,7 @@ const CONSOLE_JS = `
     const toastSummary = document.querySelector('[data-meeting-toast-summary]');
     const toastDismiss = document.querySelector('[data-meeting-toast-dismiss]');
 
-    if (!prompt || !pill || !toast) return;
+    if (!prompt || !toast) return;
 
     // Live state is exposed on window so the Memory > Meetings panel
     // can render the recording inline. Replaces the previous floating
@@ -14092,10 +14028,10 @@ const CONSOLE_JS = `
         if (!state.startedAt) return;
         const seconds = (Date.now() - Date.parse(state.startedAt)) / 1000;
         const text = fmtElapsed(seconds);
-        if (pillTime) pillTime.textContent = text;
-        // Update the inline live card's elapsed cell if the Meetings
-        // panel happens to be open. Querying every tick is cheap and
-        // avoids holding stale element references across panel switches.
+        // The floating pill is gone; only the inline Memory > Meetings
+        // live card needs the elapsed updates now. Querying every tick
+        // is cheap and avoids holding stale element references across
+        // panel switches.
         const liveElapsedEl = document.querySelector('[data-mem-meeting-live-elapsed]');
         if (liveElapsedEl) liveElapsedEl.textContent = text;
       }, 1000);
@@ -14117,6 +14053,9 @@ const CONSOLE_JS = `
       state.pendingWindow = null;
     }
 
+    // showPill is now misnamed — it just updates the in-memory state
+    // (used by the Memory > Meetings inline live card) and starts the
+    // elapsed-time timer. The floating pill UI has been removed.
     function showPill(win, startedAt) {
       const sameWindow = state.activeWindow && state.activeWindow.windowId === win.windowId;
       if (!sameWindow) {
@@ -14124,8 +14063,6 @@ const CONSOLE_JS = `
         state.startedAt = startedAt || new Date().toISOString();
         state.segments = [];
       }
-      if (pillLabel) pillLabel.textContent = (win.platform || 'recording');
-      if (pillWrap) pillWrap.hidden = false;
       hidePrompt();
       toast.hidden = true;
       startElapsedTimer();
@@ -14136,7 +14073,8 @@ const CONSOLE_JS = `
       }
     }
     function hidePill() {
-      if (pillWrap) pillWrap.hidden = true;
+      // Pill UI is gone; just clear state + stop the timer. Inline
+      // Memory > Meetings card re-renders on the next load.
       stopElapsedTimer();
       state.activeWindow = null;
       state.activeRecordingId = null;
@@ -14202,15 +14140,9 @@ const CONSOLE_JS = `
       hidePrompt();
     });
 
-    // Pill click → navigate to Memory > Meetings panel. The live card
-    // renders inline at the top of the meetings list. No floating popup.
-    pill.addEventListener('click', () => {
-      const navMemory = document.querySelector('.nav[data-panel="memory"]');
-      if (navMemory) navMemory.click();
-      // switchMemoryView is in the IIFE scope.
-      try { if (typeof activateMemoryView === 'function') activateMemoryView('meetings'); }
-      catch (_) { /* not loaded yet */ }
-    });
+    // Floating pill removed — Memory > Meetings live card is the only
+    // recording surface now. No click-to-navigate needed because the
+    // card already lives in that panel.
 
     toastDismiss?.addEventListener('click', () => hideToast());
     toastTranscript?.addEventListener('click', async () => {
@@ -14261,18 +14193,15 @@ const CONSOLE_JS = `
       hideToast();
     });
 
-    // Dismiss button — escape hatch for desynced state. Calls recallStop
-    // (no-op if the daemon already considers itself not-recording) and
-    // forcibly resets the local pill state so the user is unstuck.
-    pillDismiss?.addEventListener('click', async (e) => {
-      e.stopPropagation();
-      try { await window.clemmy.recallStop?.(); } catch { /* not recording; ignore */ }
-      hidePill();
-      toast.hidden = true;
-    });
+    // Pill dismiss handler removed alongside the pill UI. The
+    // STOP RECORDING button on the Memory > Meetings live card now
+    // serves as the only user-driven stop path.
 
     // ── Truth reconciler ────────────────────────────────────────
-    // The pill must ONLY be visible when the SDK is genuinely capturing
+    // Reads recall daemon status and keeps the in-memory state machine
+    // (window.__clementineLiveMeeting) consistent. The floating pill
+    // it used to drive is gone, but the inline Memory > Meetings live
+    // card subscribes to the same state, so this still matters.
     // an active call. Three checks have to all pass:
     //   1. The user has Recall capture enabled in settings.
     //   2. The daemon reports recording === true.

@@ -548,7 +548,10 @@ export async function processWorkflowRuns(assistant: ClementineAssistant): Promi
         title: hasFailures
           ? `Workflow completed with ${forEachFailures.length} failure${forEachFailures.length === 1 ? '' : 's'}: ${workflow.data.name}`
           : `Workflow completed: ${workflow.data.name}`,
-        body: `${finalOutput.slice(0, 2000 - failureSummary.length)}${failureSummary}`,
+        // Send the full body. Discord delivery splits long content into
+        // multiple messages; previous 2000-char slice cut off workflow
+        // results above that length with no continuation.
+        body: `${finalOutput}${failureSummary}`,
         createdAt: new Date().toISOString(),
         read: false,
         metadata: {
