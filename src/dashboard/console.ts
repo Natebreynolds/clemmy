@@ -8814,7 +8814,7 @@ const CONSOLE_JS = `
         ev.stopPropagation();
         const target = btn.getAttribute('data-ws-remove');
         if (!target) return;
-        if (!confirm('Unlink this workspace?\n\n' + target + '\n\nThe folder stays on disk — only the agent\'s view of it goes away.')) return;
+        if (!confirm('Unlink this workspace?\\n\\n' + target + '\\n\\nThe folder stays on disk — only the agent\\'s view of it goes away.')) return;
         try {
           const r = await fetch(withToken('/api/console/projects/workspace?path=' + encodeURIComponent(target)), { method: 'DELETE' });
           if (!r.ok) {
