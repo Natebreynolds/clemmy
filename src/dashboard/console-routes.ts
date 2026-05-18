@@ -3143,7 +3143,7 @@ export function registerConsoleRoutes(
    * Each toggle is reversible and never disables chat/harness — only
    * paces or pauses the cost-heavy background loops.
    */
-  app.post('/api/console/usage/trim', (req, res) => {
+  app.post('/api/console/usage/trim', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const body = req.body ?? {};
     const kind = typeof body.kind === 'string' ? body.kind : '';
@@ -3152,8 +3152,7 @@ export function registerConsoleRoutes(
     try {
       if (kind === 'cron') {
         // Toggle a cron job's `enabled` flag inside CRON.md frontmatter.
-        // eslint-disable-next-line @typescript-eslint/no-require-imports
-        const mat = require('gray-matter');
+        const mat = (await import('gray-matter')).default;
         const cronPath = path.join(BASE_DIR, 'vault', '00-System', 'CRON.md');
         if (!existsSync(cronPath)) { res.status(404).json({ error: 'CRON.md not found' }); return; }
         const parsed = mat(readFileSync(cronPath, 'utf-8'));
@@ -3187,11 +3186,10 @@ export function registerConsoleRoutes(
    * Used by the Usage panel to render the "Trim Controls" rows so they
    * always reflect the latest enabled-state without the user reloading.
    */
-  app.get('/api/console/usage/trim', (req, res) => {
+  app.get('/api/console/usage/trim', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const mat = require('gray-matter');
+      const mat = (await import('gray-matter')).default;
       const cronPath = path.join(BASE_DIR, 'vault', '00-System', 'CRON.md');
       const crons: Array<{ name: string; schedule: string; enabled: boolean }> = [];
       if (existsSync(cronPath)) {
@@ -3222,17 +3220,12 @@ export function registerConsoleRoutes(
    * and aggregates into a dashboard-friendly shape. Cheap — single
    * day's data is at most a few thousand lines.
    */
-  app.get('/api/console/usage', (req, res) => {
+  app.get('/api/console/usage', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
-      // Lazy-require so dashboard-routes doesn't take a hard dep at
+      // Lazy-import so dashboard-routes doesn't take a hard dep at
       // module load time. Same pattern as other recent dashboard reads.
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const { readUsageEventsForDate, rollupUsage, listUsageDates } = require('../runtime/usage-log.js') as {
-        readUsageEventsForDate: (d: Date) => unknown[];
-        rollupUsage: (events: unknown[], d: Date) => Record<string, unknown>;
-        listUsageDates: () => string[];
-      };
+      const { readUsageEventsForDate, rollupUsage, listUsageDates } = await import('../runtime/usage-log.js');
       const dateParam = typeof req.query.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(req.query.date)
         ? new Date(req.query.date + 'T00:00:00')
         : new Date();
@@ -3258,15 +3251,12 @@ export function registerConsoleRoutes(
    * window open all day. Reading the goal state file directly is
    * free and gives the dock all the data it needs.
    */
-  app.get('/api/console/home/goal-status', (req, res) => {
+  app.get('/api/console/home/goal-status', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
-      // Lazy-require to avoid pulling goal-loop into the top of this
+      // Lazy-import to avoid pulling goal-loop into the top of this
       // file just for one route; keeps the existing import graph stable.
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const { loadGoalState } = require('../agents/goal-loop.js') as {
-        loadGoalState: (sessionId: string) => Record<string, unknown> | null;
-      };
+      const { loadGoalState } = await import('../agents/goal-loop.js');
       const sessionId = typeof req.query.sessionId === 'string' && req.query.sessionId.trim()
         ? req.query.sessionId.trim().slice(0, 120)
         : 'console:home';
