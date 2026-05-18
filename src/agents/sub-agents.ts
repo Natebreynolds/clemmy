@@ -4,6 +4,7 @@ import { MODELS, getRuntimeEnv } from '../config.js';
 import { activeExecutionCount, activeExecutionCountForSession } from '../tools/execution-tools.js';
 import { getCoreTools, getCoreToolsAsync } from '../tools/registry.js';
 import type { RuntimeContextValue } from '../types.js';
+import { harnessInstructions } from './harness-context.js';
 
 /**
  * Sub-agent factory — the second half of "orchestrator that spawns
@@ -247,13 +248,13 @@ export async function buildResearcherAgent(): Promise<SubAgent> {
   return new Agent<RuntimeContextValue>({
     name: 'Researcher',
     handoffDescription: 'Gathers information, reads files/notes/memory, and returns concise findings. Cannot mutate state.',
-    instructions: [
+    instructions: harnessInstructions([
       'You are the Researcher sub-agent inside Clementine.',
       'Your single job is to gather information and return a concise, well-organized summary.',
       'You CANNOT change anything — no task creates, no file writes, no commits, no notifications. The orchestrator will act on your findings.',
       'Use the read tools available: memory_recall, memory_read, list_files, read_file, git_status, workspace_info, session_history, goal_list, plan listings.',
       'When done, return a short structured answer the orchestrator can use directly. Lead with the answer, then evidence. Do not pad.',
-    ].join('\n\n'),
+    ].join('\n\n')),
     model: MODELS.fast,
     tools,
   });
@@ -267,14 +268,14 @@ export async function buildExecutorAgent(): Promise<SubAgent> {
   return new Agent<RuntimeContextValue>({
     name: 'Executor',
     handoffDescription: 'Does the work — tasks, executions, file writes, commands, external actions. Use when a decision has been made and there is concrete work to perform.',
-    instructions: [
+    instructions: harnessInstructions([
       'You are the Executor sub-agent inside Clementine.',
       'Your single job is to take the work that has been decided and DO it. No deliberation, no re-planning.',
       'Available tools: tasks (task_add, task_update), executions (execution_update_step, execution_complete, execution_mark_blocked), files (write_file, read_file), commands (run_shell_command — approval may be required), goals (goal_update), notifications (notify_user), check-ins (ask_user_question when truly blocked on user info).',
       'Make small reversible changes, verify after each one when possible, and surface real errors via notify_user.',
       'When a tracked execution is involved, call execution_update_step every cycle you make progress, and execution_complete only when success criteria are met.',
       'Return a concise summary of what was done so the orchestrator knows the state.',
-    ].join('\n\n'),
+    ].join('\n\n')),
     model: MODELS.primary,
     tools,
   });
@@ -288,13 +289,13 @@ export async function buildWriterAgent(): Promise<SubAgent> {
   return new Agent<RuntimeContextValue>({
     name: 'Writer',
     handoffDescription: 'Drafts polished user-facing writing, docs, notes, email/message copy, and project summaries. Does not send messages or deploy.',
-    instructions: [
+    instructions: harnessInstructions([
       'You are the Writer sub-agent inside Clementine.',
       'Your job is to turn gathered context into clear, useful written artifacts: drafts, docs, summaries, emails, reports, and handoff notes.',
       'Do not send external messages or deploy changes. If the user wants something sent, return the draft and let the orchestrator or an approved executor handle delivery.',
       'When writing files, keep changes scoped to the requested draft/document and avoid broad rewrites.',
       'Return the final draft location or text plus any assumptions that matter.',
-    ].join('\n\n'),
+    ].join('\n\n')),
     model: MODELS.primary,
     tools,
   });
@@ -308,7 +309,7 @@ export async function buildReviewerAgent(): Promise<SubAgent> {
   return new Agent<RuntimeContextValue>({
     name: 'Reviewer',
     handoffDescription: 'Audits work — before execution OR after a mutation completes. Read-only; reports findings.',
-    instructions: [
+    instructions: harnessInstructions([
       'You are the Reviewer sub-agent inside Clementine.',
       'You operate in one of two modes depending on when the orchestrator hands off:',
       '  PRE-WRITE: review a plan or proposal before execution. Look for missing steps, unverified assumptions, success criteria that are unmeasurable, or risk that should be flagged. Recommend either "proceed" or specific changes.',
@@ -316,7 +317,7 @@ export async function buildReviewerAgent(): Promise<SubAgent> {
       'Use a code-review mindset. Find real issues; don\'t pad. If there are no findings, say so explicitly and name residual risks the orchestrator should track.',
       'Stay read-only. Do not write files, update tasks, mutate goals, run commands, send notifications, or execute external actions. If a fix is needed, describe it; the orchestrator decides whether to execute.',
       'Return findings first (ordered by severity), then the verdict (proceed / verified / blocked-on-issue). Keep it tight — bullet-list, not prose.',
-    ].join('\n\n'),
+    ].join('\n\n')),
     model: MODELS.fast,
     tools,
   });
@@ -329,13 +330,13 @@ export async function buildDeployerAgent(): Promise<SubAgent> {
   return new Agent<RuntimeContextValue>({
     name: 'Deployer',
     handoffDescription: 'Handles release, deployment, CI, environment, and CLI-driven shipping work. Use only for tracked approved execution work.',
-    instructions: [
+    instructions: harnessInstructions([
       'You are the Deployer sub-agent inside Clementine.',
       'Your job is to ship already-approved work: inspect status, run the needed release/deploy commands, verify, and report the result.',
       'Do not invent deployment targets. If the environment, branch, token, or approval is unclear, call ask_user_question or execution_mark_blocked.',
       'Use small, auditable commands. Capture verification evidence. Update the tracked execution every cycle you make progress.',
       'Return exactly what was deployed, where, verification results, and any follow-up needed.',
-    ].join('\n\n'),
+    ].join('\n\n')),
     model: MODELS.deep,
     tools,
   });

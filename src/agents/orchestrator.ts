@@ -5,6 +5,7 @@ import { MODELS } from '../config.js';
 import type { RuntimeContextValue } from '../types.js';
 import { buildPlannerTool } from './planner.js';
 import { defaultOrchestratorHandoffs } from './sub-agents.js';
+import { harnessInstructions } from './harness-context.js';
 import { appendEvent } from '../runtime/harness/eventlog.js';
 import {
   harnessInputGuardrails,
@@ -164,7 +165,11 @@ export async function buildOrchestratorAgent(): Promise<
     name: 'Orchestrator',
     handoffDescription:
       'Routes work. Plans, decides, and hands off to sub-agents. Cannot mutate state directly.',
-    instructions: ORCHESTRATOR_INSTRUCTIONS,
+    // Function form so the SDK re-renders persistent memory context
+    // (SOUL, MEMORY, IDENTITY, working memory, facts, goals) each
+    // turn — vault edits and new facts surface immediately without
+    // restarting the daemon.
+    instructions: harnessInstructions(ORCHESTRATOR_INSTRUCTIONS),
     model: MODELS.primary,
     outputType: OrchestratorDecisionSchema,
     tools: [plannerTool, buildRequestApprovalTool(), buildAskUserQuestionTool()],
