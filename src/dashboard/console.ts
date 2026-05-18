@@ -677,8 +677,8 @@ export function renderConsoleHtml(token: string): string {
 
           <aside class="proj-side">
             <div class="proj-side-head">
-              <span>WORKSPACES</span>
-              <em data-proj-workspaces-count>—</em>
+              <span>WORKSPACES <em data-proj-workspaces-count>—</em></span>
+              <button class="ws-add-btn" data-ws-add-btn type="button">+ ADD</button>
             </div>
             <ul class="proj-ws-list" data-proj-ws-list>
               <li class="empty">— loading —</li>
@@ -4878,6 +4878,179 @@ body {
 }
 .proj-entries .entry.dir { color: var(--accent-3); }
 
+/* Workspace add/remove controls */
+.proj-side-head .ws-add-btn {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--accent);
+  font: 11px var(--mono);
+  letter-spacing: 0.1em;
+  padding: 2px 7px;
+  cursor: pointer;
+  transition: background 100ms;
+}
+.proj-side-head .ws-add-btn:hover { background: var(--bg-3); }
+.proj-ws-list li {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+.proj-ws-list .ws-remove {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-mute);
+  font: 10px var(--mono);
+  padding: 1px 5px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 100ms, color 100ms;
+  flex-shrink: 0;
+}
+.proj-ws-list li:hover .ws-remove { opacity: 1; }
+.proj-ws-list .ws-remove:hover { color: #d04848; border-color: #d04848; }
+
+/* Workspace linker modal */
+.ws-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9999;
+}
+.ws-modal {
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  width: 560px;
+  max-width: 90vw;
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+  font: 12px var(--mono);
+}
+.ws-modal-head {
+  padding: 10px 14px;
+  background: var(--bg-2);
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 11px;
+  letter-spacing: 0.16em;
+  color: var(--fg-3);
+}
+.ws-modal-head .ws-close {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  padding: 1px 8px;
+  cursor: pointer;
+  font: 11px var(--mono);
+}
+.ws-modal-head .ws-close:hover { color: var(--fg); }
+.ws-modal-tabs {
+  display: flex;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-2);
+}
+.ws-modal-tabs button {
+  flex: 1;
+  background: transparent;
+  border: 0;
+  border-right: 1px solid var(--line);
+  color: var(--fg-3);
+  padding: 8px;
+  letter-spacing: 0.14em;
+  font: 10px var(--mono);
+  cursor: pointer;
+}
+.ws-modal-tabs button:last-child { border-right: 0; }
+.ws-modal-tabs button.active {
+  color: var(--accent);
+  background: var(--bg-1);
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+.ws-modal-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px;
+  font-size: 11px;
+}
+.ws-cwd {
+  font-size: 10px;
+  color: var(--fg-mute);
+  padding: 6px 8px;
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  margin-bottom: 8px;
+  word-break: break-all;
+}
+.ws-cwd .ws-cwd-link {
+  color: var(--accent);
+  text-decoration: underline;
+  cursor: pointer;
+  margin-right: 8px;
+}
+.ws-add-this {
+  width: 100%;
+  text-align: left;
+  background: var(--bg-2);
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  padding: 8px 10px;
+  margin-bottom: 8px;
+  cursor: pointer;
+  font: 11px var(--mono);
+  letter-spacing: 0.04em;
+}
+.ws-add-this:hover { background: var(--bg-3); }
+.ws-dir-list {
+  list-style: none;
+  margin: 0; padding: 0;
+}
+.ws-dir-list li {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--line);
+  cursor: pointer;
+  transition: background 100ms;
+}
+.ws-dir-list li:hover { background: var(--bg-3); }
+.ws-dir-list .ws-dir-name { color: var(--fg); flex: 1; word-break: break-all; }
+.ws-dir-list .ws-link-btn {
+  background: transparent;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  padding: 1px 8px;
+  cursor: pointer;
+  font: 10px var(--mono);
+  letter-spacing: 0.1em;
+  flex-shrink: 0;
+  margin-left: 8px;
+}
+.ws-dir-list .ws-link-btn:hover { background: var(--bg-3); }
+.ws-search-input {
+  width: 100%;
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  color: var(--fg);
+  padding: 8px 10px;
+  font: 11px var(--mono);
+  margin-bottom: 10px;
+}
+.ws-search-input:focus { outline: none; border-color: var(--accent); }
+.ws-modal-status {
+  font-size: 10px;
+  color: var(--fg-mute);
+  text-align: center;
+  padding: 8px;
+}
+.ws-modal-status.error { color: #d04848; }
+
 /* ── Integrations hub ────────────────────────────────────────── */
 .integrations-layout {
   display: flex;
@@ -8605,19 +8778,239 @@ const CONSOLE_JS = `
       projData = await fetchJSON('/api/console/projects');
       renderWorkspaces();
       renderProjects();
+      const addBtn = document.querySelector('[data-ws-add-btn]');
+      if (addBtn && !addBtn.dataset.wired) {
+        addBtn.dataset.wired = '1';
+        addBtn.addEventListener('click', () => openWorkspaceModal());
+      }
     } catch (err) {
       proj.list.innerHTML = '<li class="empty">— failed: ' + escMem(err.message || err) + ' —</li>';
     }
+  }
+
+  async function refreshProjectsPanel() {
+    try {
+      projData = await fetchJSON('/api/console/projects');
+      renderWorkspaces();
+      renderProjects();
+    } catch (_) { /* keep current view */ }
   }
 
   function renderWorkspaces() {
     const dirs = (projData && projData.workspaceDirs) || [];
     proj.wsCount.textContent = dirs.length;
     if (dirs.length === 0) {
-      proj.wsList.innerHTML = '<li class="empty">— no workspaces configured · use the workspace_config tool to add one —</li>';
+      proj.wsList.innerHTML = '<li class="empty">— no workspaces yet · click + ADD to link a project folder —</li>';
       return;
     }
-    proj.wsList.innerHTML = dirs.map((d) => '<li>' + escMem(d) + '</li>').join('');
+    proj.wsList.innerHTML = dirs.map((d) => [
+      '<li>',
+      '  <span>' + escMem(d) + '</span>',
+      '  <button class="ws-remove" data-ws-remove="' + escMem(d) + '" type="button" title="Unlink this workspace">×</button>',
+      '</li>',
+    ].join('')).join('');
+    Array.from(proj.wsList.querySelectorAll('[data-ws-remove]')).forEach((btn) => {
+      btn.addEventListener('click', async (ev) => {
+        ev.stopPropagation();
+        const target = btn.getAttribute('data-ws-remove');
+        if (!target) return;
+        if (!confirm('Unlink this workspace?\n\n' + target + '\n\nThe folder stays on disk — only the agent\'s view of it goes away.')) return;
+        try {
+          const r = await fetch(withToken('/api/console/projects/workspace?path=' + encodeURIComponent(target)), { method: 'DELETE' });
+          if (!r.ok) {
+            const j = await r.json().catch(() => ({}));
+            alert('Could not remove: ' + (j.error || ('HTTP ' + r.status)));
+            return;
+          }
+          await refreshProjectsPanel();
+        } catch (err) {
+          alert('Network error: ' + ((err && err.message) || err));
+        }
+      });
+    });
+  }
+
+  // ─── Workspace linker modal ───────────────────────────────────
+  let wsModal = null;
+  let wsModalMode = 'browse';
+  let wsModalCwd = null;
+
+  function openWorkspaceModal() {
+    if (wsModal) return;
+    wsModal = document.createElement('div');
+    wsModal.className = 'ws-modal-backdrop';
+    wsModal.innerHTML = [
+      '<div class="ws-modal">',
+      '  <div class="ws-modal-head">',
+      '    <span>LINK A WORKSPACE</span>',
+      '    <button class="ws-close" data-ws-modal-close type="button">CLOSE ✕</button>',
+      '  </div>',
+      '  <div class="ws-modal-tabs">',
+      '    <button data-ws-tab="browse" class="active" type="button">BROWSE</button>',
+      '    <button data-ws-tab="search" type="button">SEARCH BY NAME</button>',
+      '  </div>',
+      '  <div class="ws-modal-body" data-ws-modal-body>',
+      '    <div class="ws-modal-status">— loading —</div>',
+      '  </div>',
+      '</div>',
+    ].join('');
+    document.body.appendChild(wsModal);
+    wsModal.addEventListener('click', (ev) => {
+      if (ev.target === wsModal) closeWorkspaceModal();
+    });
+    wsModal.querySelector('[data-ws-modal-close]').addEventListener('click', closeWorkspaceModal);
+    Array.from(wsModal.querySelectorAll('[data-ws-tab]')).forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const tab = btn.getAttribute('data-ws-tab');
+        wsModalMode = tab;
+        Array.from(wsModal.querySelectorAll('[data-ws-tab]')).forEach((b) =>
+          b.classList.toggle('active', b === btn));
+        if (tab === 'browse') renderWsBrowse();
+        else renderWsSearch();
+      });
+    });
+    renderWsBrowse();
+  }
+
+  function closeWorkspaceModal() {
+    if (!wsModal) return;
+    wsModal.remove();
+    wsModal = null;
+    wsModalCwd = null;
+  }
+
+  async function renderWsBrowse(targetPath) {
+    if (!wsModal) return;
+    const body = wsModal.querySelector('[data-ws-modal-body]');
+    body.innerHTML = '<div class="ws-modal-status">— loading —</div>';
+    const url = targetPath
+      ? '/api/console/projects/browse?path=' + encodeURIComponent(targetPath)
+      : '/api/console/projects/browse';
+    try {
+      const data = await fetchJSON(url);
+      wsModalCwd = data.path;
+      const parent = data.parent;
+      const home = data.home;
+      const breadcrumb = [
+        '<div class="ws-cwd">',
+        (parent ? '<span class="ws-cwd-link" data-ws-go="' + escMem(parent) + '">../</span>' : ''),
+        (home && data.path !== home ? '<span class="ws-cwd-link" data-ws-go="' + escMem(home) + '">~ / home</span>' : ''),
+        '<span>' + escMem(data.path) + '</span>',
+        '</div>',
+      ].join('');
+      const addThis = '<button class="ws-add-this" data-ws-add-current="' + escMem(data.path) + '" type="button">+ Link this folder · ' + escMem(data.path) + '</button>';
+      const entries = (data.entries || []).map((e) => [
+        '<li data-ws-go="' + escMem(e.path) + '">',
+        '  <span class="ws-dir-name">' + escMem(e.name) + '/</span>',
+        '  <button class="ws-link-btn" data-ws-add="' + escMem(e.path) + '" type="button">LINK</button>',
+        '</li>',
+      ].join('')).join('');
+      body.innerHTML = [
+        breadcrumb,
+        addThis,
+        '<ul class="ws-dir-list">',
+        entries || '<li><span class="ws-dir-name" style="color:var(--fg-mute)">— no subfolders here —</span></li>',
+        '</ul>',
+      ].join('');
+      wireWsBrowse(body);
+    } catch (err) {
+      body.innerHTML = '<div class="ws-modal-status error">— ' + escMem(err.message || err) + ' —</div>';
+    }
+  }
+
+  function wireWsBrowse(body) {
+    Array.from(body.querySelectorAll('[data-ws-go]')).forEach((el) => {
+      el.addEventListener('click', (ev) => {
+        if ((ev.target).hasAttribute && ev.target.hasAttribute('data-ws-add')) return; // let the inner Link button win
+        const target = el.getAttribute('data-ws-go');
+        if (target) renderWsBrowse(target);
+      });
+    });
+    const addCurrent = body.querySelector('[data-ws-add-current]');
+    if (addCurrent) {
+      addCurrent.addEventListener('click', () => linkWorkspace(addCurrent.getAttribute('data-ws-add-current')));
+    }
+    Array.from(body.querySelectorAll('[data-ws-add]')).forEach((btn) => {
+      btn.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        linkWorkspace(btn.getAttribute('data-ws-add'));
+      });
+    });
+  }
+
+  function renderWsSearch() {
+    if (!wsModal) return;
+    const body = wsModal.querySelector('[data-ws-modal-body]');
+    body.innerHTML = [
+      '<input type="text" class="ws-search-input" data-ws-search-input placeholder="Type a folder name (e.g. legallady, proposal)…" />',
+      '<div class="ws-modal-status">Type at least 2 characters to search common locations (~, ~/Desktop, ~/Documents, ~/Developer, ~/Projects).</div>',
+      '<ul class="ws-dir-list" data-ws-search-results></ul>',
+    ].join('');
+    const input = body.querySelector('[data-ws-search-input]');
+    const results = body.querySelector('[data-ws-search-results]');
+    const status = body.querySelector('.ws-modal-status');
+    input.focus();
+    let timer = null;
+    input.addEventListener('input', () => {
+      if (timer) clearTimeout(timer);
+      const q = input.value.trim();
+      if (q.length < 2) {
+        results.innerHTML = '';
+        status.textContent = 'Type at least 2 characters to search common locations.';
+        status.classList.remove('error');
+        return;
+      }
+      timer = setTimeout(async () => {
+        status.textContent = '— searching —';
+        status.classList.remove('error');
+        try {
+          const data = await fetchJSON('/api/console/projects/search?query=' + encodeURIComponent(q));
+          const hits = data.results || [];
+          if (hits.length === 0) {
+            results.innerHTML = '';
+            status.textContent = 'No matches in common locations. Try Browse to navigate manually.';
+            return;
+          }
+          status.textContent = hits.length + ' match' + (hits.length === 1 ? '' : 'es') + ' (max 80)';
+          results.innerHTML = hits.map((h) => [
+            '<li>',
+            '  <span class="ws-dir-name">' + escMem(h.name) + '/<br><span style="color:var(--fg-mute);font-size:10px;">' + escMem(h.path) + '</span></span>',
+            '  <button class="ws-link-btn" data-ws-add="' + escMem(h.path) + '" type="button">LINK</button>',
+            '</li>',
+          ].join('')).join('');
+          Array.from(results.querySelectorAll('[data-ws-add]')).forEach((btn) => {
+            btn.addEventListener('click', () => linkWorkspace(btn.getAttribute('data-ws-add')));
+          });
+        } catch (err) {
+          status.textContent = '— ' + (err.message || err) + ' —';
+          status.classList.add('error');
+        }
+      }, 200);
+    });
+  }
+
+  async function linkWorkspace(targetPath) {
+    if (!targetPath) return;
+    try {
+      const r = await fetch(withToken('/api/console/projects/workspace'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: targetPath }),
+      });
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        alert('Could not link: ' + (j.error || ('HTTP ' + r.status)));
+        return;
+      }
+      const j = await r.json();
+      await refreshProjectsPanel();
+      closeWorkspaceModal();
+      if (j.alreadyLinked) {
+        alert('That folder is already linked.');
+      }
+    } catch (err) {
+      alert('Network error: ' + ((err && err.message) || err));
+    }
   }
 
   function renderProjects() {

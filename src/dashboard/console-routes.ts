@@ -12,7 +12,7 @@ import { FACT_KINDS, forgetFact, listActiveFacts, listAllFacts, rememberFact } f
 import { openMemoryDb } from '../memory/db.js';
 import { readMemoryIndexStatus, reindexVault } from '../memory/indexer.js';
 import { IDENTITY_FILE, MEMORY_FILE, SOUL_FILE, WORKFLOWS_DIR, WORKING_MEMORY_FILE } from '../memory/vault.js';
-import { ensureDir, getWorkspaceDirs, listWorkspaceProjects, parseTasks, GOALS_DIR, TASKS_FILE, WORKFLOW_RUNS_DIR } from '../tools/shared.js';
+import { ensureDir, getWorkspaceDirs, listWorkspaceProjects, parseTasks, readBaseEnv, updateEnvKey, GOALS_DIR, TASKS_FILE, WORKFLOW_RUNS_DIR } from '../tools/shared.js';
 import {
   deleteWorkflow,
   listWorkflows,
@@ -1190,6 +1190,172 @@ export function registerConsoleRoutes(
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
+  });
+
+  // ─── Workspace management (add / remove / browse / search) ─────
+  //
+  // Lets the user link arbitrary directories as workspace projects
+  // from the UI instead of editing WORKSPACE_DIRS in .env by hand.
+  // The agent's workspace_list / workspace_info / list_files tools
+  // all read from getWorkspaceDirs(), which re-parses .env on every
+  // call — so adds/removes take effect immediately on the next agent
+  // turn, no daemon restart.
+
+  function writeWorkspaceDirs(dirs: string[]): void {
+    const value = dirs
+      .map((d) => d.trim())
+      .filter(Boolean)
+      .join(',');
+    updateEnvKey('WORKSPACE_DIRS', value);
+  }
+
+  function readConfiguredWorkspaceDirs(): string[] {
+    const env = readBaseEnv();
+    return (env.WORKSPACE_DIRS ?? '')
+      .split(',')
+      .map((entry) => entry.trim())
+      .filter(Boolean);
+  }
+
+  app.post('/api/console/projects/workspace', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const body = req.body ?? {};
+    const raw = typeof body.path === 'string' ? body.path : '';
+    if (!raw.trim()) { res.status(400).json({ error: 'path required' }); return; }
+    // Preserve trailing spaces and unusual names — only trim wrapping
+    // whitespace the user clearly didn't mean. Resolve so relative or
+    // ~/-prefixed paths land on a concrete absolute directory.
+    const expanded = raw.startsWith('~')
+      ? path.join(os.homedir(), raw.slice(1))
+      : raw;
+    const absolute = path.isAbsolute(expanded) ? expanded : path.resolve(expanded);
+    if (!existsSync(absolute)) { res.status(404).json({ error: 'path does not exist on disk' }); return; }
+    try {
+      const stat = fs.statSync(absolute);
+      if (!stat.isDirectory()) { res.status(400).json({ error: 'path is not a directory' }); return; }
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+      return;
+    }
+    const existing = readConfiguredWorkspaceDirs();
+    if (existing.includes(absolute)) {
+      res.json({ ok: true, alreadyLinked: true, workspaceDirs: existing });
+      return;
+    }
+    const next = [...existing, absolute];
+    writeWorkspaceDirs(next);
+    res.json({ ok: true, workspaceDirs: next });
+  });
+
+  app.delete('/api/console/projects/workspace', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const target = typeof req.query.path === 'string' ? req.query.path : '';
+    if (!target.trim()) { res.status(400).json({ error: 'path query param required' }); return; }
+    const existing = readConfiguredWorkspaceDirs();
+    const next = existing.filter((d) => d !== target);
+    if (next.length === existing.length) {
+      res.status(404).json({ error: 'path was not in WORKSPACE_DIRS' });
+      return;
+    }
+    writeWorkspaceDirs(next);
+    res.json({ ok: true, workspaceDirs: next });
+  });
+
+  /**
+   * Folder browser — list immediate subdirectories at `path`. Used by
+   * the workspace-linking UI to let the user drill into their disk
+   * without typing absolute paths. Defaults to $HOME if no path is
+   * passed. Bounded — never returns more than 200 entries.
+   */
+  app.get('/api/console/projects/browse', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const requested = typeof req.query.path === 'string' && req.query.path.trim()
+      ? req.query.path
+      : os.homedir();
+    const expanded = requested.startsWith('~')
+      ? path.join(os.homedir(), requested.slice(1))
+      : requested;
+    const absolute = path.isAbsolute(expanded) ? expanded : path.resolve(expanded);
+    if (!existsSync(absolute)) { res.status(404).json({ error: 'path not found' }); return; }
+    try {
+      const stat = fs.statSync(absolute);
+      if (!stat.isDirectory()) { res.status(400).json({ error: 'not a directory' }); return; }
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+      return;
+    }
+    try {
+      const entries = fs
+        .readdirSync(absolute, { withFileTypes: true })
+        .filter((e) => e.isDirectory() && !e.name.startsWith('.'))
+        .slice(0, 200)
+        .map((e) => ({ name: e.name, path: path.join(absolute, e.name) }))
+        .sort((a, b) => a.name.localeCompare(b.name));
+      res.json({
+        path: absolute,
+        parent: path.dirname(absolute) === absolute ? null : path.dirname(absolute),
+        home: os.homedir(),
+        entries,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * Fast search for directories matching a query across common spots.
+   * Bounded depth + skip-list keeps it from scanning node_modules etc.
+   * Used by the "find by name" tab of the workspace-linking UI.
+   */
+  app.get('/api/console/projects/search', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const query = typeof req.query.query === 'string' ? req.query.query.trim().toLowerCase() : '';
+    if (!query) { res.status(400).json({ error: 'query required' }); return; }
+
+    const SEARCH_ROOTS = [
+      os.homedir(),
+      path.join(os.homedir(), 'Desktop'),
+      path.join(os.homedir(), 'Documents'),
+      path.join(os.homedir(), 'Downloads'),
+      path.join(os.homedir(), 'Developer'),
+      path.join(os.homedir(), 'Projects'),
+      path.join(os.homedir(), 'code'),
+    ].filter((p) => existsSync(p));
+
+    const SKIP = new Set([
+      'node_modules', '.git', '.next', '.turbo', 'dist', 'build', '.venv', '.cache',
+      '__pycache__', 'venv', 'env', '.DS_Store', 'Library', 'Pictures', 'Movies', 'Music',
+    ]);
+    const MAX_DEPTH = 4;
+    const MAX_RESULTS = 80;
+    const hits: { name: string; path: string }[] = [];
+
+    function walk(dir: string, depth: number): void {
+      if (hits.length >= MAX_RESULTS) return;
+      if (depth > MAX_DEPTH) return;
+      let entries: fs.Dirent[];
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const e of entries) {
+        if (hits.length >= MAX_RESULTS) return;
+        if (!e.isDirectory()) continue;
+        if (SKIP.has(e.name) || e.name.startsWith('.')) continue;
+        if (e.name.toLowerCase().includes(query)) {
+          hits.push({ name: e.name, path: path.join(dir, e.name) });
+        }
+        walk(path.join(dir, e.name), depth + 1);
+      }
+    }
+
+    for (const root of SEARCH_ROOTS) {
+      walk(root, 0);
+      if (hits.length >= MAX_RESULTS) break;
+    }
+
+    res.json({ query, results: hits });
   });
 
   // ─── Skills (plugins) ──────────────────────────────────────────
