@@ -1,0 +1,236 @@
+- generic [ref=e2]:
+  - banner [ref=e3]:
+    - generic [ref=e5]:
+      - generic [ref=e6]: Clementine
+      - generic [ref=e7]: v0.2.1 · console
+    - generic [ref=e8]:
+      - generic [ref=e9]:
+        - text: RUNS ·
+        - emphasis [ref=e10]: "30"
+      - generic [ref=e11]:
+        - text: MEM ·
+        - emphasis [ref=e12]: 33 / 3f
+      - generic [ref=e13]:
+        - text: APPRV ·
+        - emphasis [ref=e14]: "0"
+      - generic [ref=e15]:
+        - text: MODE ·
+        - emphasis [ref=e16]: BALANCED
+      - generic [ref=e19]: ONLINE
+      - button "Toggle light/dark mode" [ref=e20] [cursor=pointer]:
+        - generic [ref=e21]: ◐
+  - navigation "Console sections" [ref=e22]:
+    - button "01 Home 1" [ref=e154] [cursor=pointer]:
+      - generic [ref=e24]: "01"
+      - generic [ref=e25]: Home
+      - generic [ref=e155]: "1"
+    - button "02 Activity" [ref=e26] [cursor=pointer]:
+      - generic [ref=e27]: "02"
+      - generic [ref=e28]: Activity
+    - button "03 Memory" [ref=e29] [cursor=pointer]:
+      - generic [ref=e30]: "03"
+      - generic [ref=e31]: Memory
+    - button "04 Context" [ref=e32] [cursor=pointer]:
+      - generic [ref=e33]: "04"
+      - generic [ref=e34]: Context
+    - button "05 Workflows" [ref=e35] [cursor=pointer]:
+      - generic [ref=e36]: "05"
+      - generic [ref=e37]: Workflows
+    - button "06 Tools" [ref=e38] [cursor=pointer]:
+      - generic [ref=e39]: "06"
+      - generic [ref=e40]: Tools
+    - button "07 Projects" [ref=e41] [cursor=pointer]:
+      - generic [ref=e42]: "07"
+      - generic [ref=e43]: Projects
+    - button "08 Skills" [ref=e44] [cursor=pointer]:
+      - generic [ref=e45]: "08"
+      - generic [ref=e46]: Skills
+    - button "09 Integrations" [ref=e47] [cursor=pointer]:
+      - generic [ref=e48]: "09"
+      - generic [ref=e49]: Integrations
+    - button "10 Settings" [active] [ref=e50] [cursor=pointer]:
+      - generic [ref=e51]: "10"
+      - generic [ref=e52]: Settings
+    - generic "Live status" [ref=e53]:
+      - generic [ref=e54]:
+        - generic [ref=e55]:
+          - generic [ref=e56]: NOW
+          - generic [ref=e57]: "1"
+        - generic [ref=e58]:
+          - generic [ref=e61]: needs you
+          - generic [ref=e62]: End of the week. What got done that you want recorded, what
+      - generic [ref=e164]:
+        - generic [ref=e165]:
+          - generic [ref=e166]: CLEMENTINE LIVE
+          - generic [ref=e167]: STANDBY
+        - generic [ref=e168]:
+          - button "Toggle voice" [ref=e169] [cursor=pointer]
+          - generic [ref=e172]:
+            - generic [ref=e173]: tap orb to talk
+            - generic [ref=e174]: electron only
+      - generic [ref=e63]:
+        - generic [ref=e64]:
+          - generic [ref=e65]: RECENT
+          - generic [ref=e66]: "0"
+        - generic [ref=e376]: — quiet —
+      - generic [ref=e69]:
+        - generic [ref=e70]:
+          - generic [ref=e71]: HEALTH
+          - generic [ref=e72]: ✓
+        - generic [ref=e73]:
+          - generic [ref=e76]: daemon
+          - generic [ref=e79]: memory.db
+          - generic [ref=e82]: mcp
+          - generic [ref=e85]: composio
+  - main [ref=e86]:
+    - generic [ref=e433]:
+      - generic [ref=e434]: PANEL · 10 · SETTINGS
+      - generic [ref=e435]:
+        - generic [ref=e436]:
+          - generic [ref=e437]:
+            - generic [ref=e438]: USER PROFILE
+            - generic [ref=e439]:
+              - generic [ref=e440]:
+                - generic [ref=e441]: DISPLAY NAME
+                - textbox [ref=e442]
+              - generic [ref=e443]:
+                - generic [ref=e444]: PREFERRED NAME (how the agent addresses you)
+                - textbox [ref=e445]
+              - generic [ref=e446]:
+                - generic [ref=e447]: ROLE
+                - textbox [ref=e448]
+              - generic [ref=e449]:
+                - generic [ref=e450]:
+                  - generic [ref=e451]: TIMEZONE
+                  - textbox "America/Los_Angeles" [ref=e452]
+                - generic [ref=e453]:
+                  - generic [ref=e454]: URGENCY TOLERANCE
+                  - combobox [ref=e455]:
+                    - option "low — notify sparingly" [selected]
+                    - option "normal"
+                    - option "high — frequent updates ok"
+              - generic [ref=e456]:
+                - generic [ref=e457]:
+                  - generic [ref=e458]: TONE
+                  - combobox [ref=e459]:
+                    - option "terse" [selected]
+                    - option "balanced"
+                    - option "verbose"
+                - generic [ref=e460]:
+                  - generic [ref=e461]: FORMALITY
+                  - combobox [ref=e462]:
+                    - option "casual" [selected]
+                    - option "professional"
+                    - option "formal"
+              - generic [ref=e463]:
+                - generic [ref=e464]:
+                  - generic [ref=e465]: WORKING HOURS START
+                  - textbox "9:00" [ref=e466]
+                - generic [ref=e467]:
+                  - generic [ref=e468]: WORKING HOURS END
+                  - textbox "18:00" [ref=e469]
+              - generic [ref=e470]:
+                - generic [ref=e471]: NOTES (free-form context the agent should know)
+                - textbox [ref=e472]
+              - button "SAVE PROFILE ✎" [ref=e473] [cursor=pointer]
+          - generic [ref=e474]:
+            - generic [ref=e475]: RUNTIME AUTH
+            - generic [ref=e476]: —
+        - generic [ref=e477]:
+          - generic [ref=e478]:
+            - generic [ref=e479]: PROACTIVITY POLICY
+            - generic [ref=e480]:
+              - generic [ref=e481]:
+                - generic [ref=e482]: ENABLED · the master switch for proactive work
+                - generic [ref=e484] [cursor=pointer]:
+                  - checkbox "Proactive loops on" [ref=e485]
+                  - text: Proactive loops on
+              - generic [ref=e486]:
+                - generic [ref=e487]:
+                  - generic [ref=e488]: MODE
+                  - combobox [ref=e489]:
+                    - option "watch — observe + notify only" [selected]
+                    - option "balanced"
+                    - option "hands_on — drive forward"
+                - generic [ref=e490]:
+                  - generic [ref=e491]: CHECK-IN MINUTES
+                  - spinbutton [ref=e492]
+              - generic [ref=e493]:
+                - generic [ref=e494]: AUTO-APPROVE SCOPE
+                - combobox [ref=e495]:
+                  - option "strict — every shell/write asks (default)" [selected]
+                  - option "workspace — auto inside ~/Desktop, ~/Documents, ~/Developer, etc."
+                  - option "YOLO — auto everywhere (only the danger denylist applies)"
+                - generic [ref=e496]:
+                  - text: Plan-scoped approvals (15 min) always work on top of this. The hard denylist (
+                  - code [ref=e497]: rm -rf /
+                  - text: ","
+                  - code [ref=e498]: sudo
+                  - text: ", fork bombs, disk wipes) is enforced regardless."
+                  - strong [ref=e499]: YOLO trusts the agent to run anywhere the user can
+                  - text: — use when you want zero friction.
+              - generic [ref=e500]:
+                - generic [ref=e501]:
+                  - generic [ref=e502]: DEFAULT LONG TASK (MIN)
+                  - spinbutton [ref=e503]
+                - generic [ref=e504]:
+                  - generic [ref=e505]: BRIEF CADENCE (MIN)
+                  - spinbutton [ref=e506]
+              - generic [ref=e507]:
+                - generic [ref=e508]: QUIET HOURS
+                - generic [ref=e509]:
+                  - generic [ref=e510] [cursor=pointer]:
+                    - checkbox "Enabled" [ref=e511]
+                    - text: Enabled
+                  - textbox "22:00" [ref=e512]
+                  - generic [ref=e513]: →
+                  - textbox "07:00" [ref=e514]
+              - generic [ref=e515]:
+                - generic [ref=e516]: CAPABILITY GATES
+                - generic [ref=e517]:
+                  - generic [ref=e518] [cursor=pointer]:
+                    - checkbox "Computer" [ref=e519]
+                    - text: Computer
+                  - generic [ref=e520] [cursor=pointer]:
+                    - checkbox "Composio" [ref=e521]
+                    - text: Composio
+                  - generic [ref=e522] [cursor=pointer]:
+                    - checkbox "Discord" [ref=e523]
+                    - text: Discord
+              - button "SAVE POLICY ✎" [ref=e524] [cursor=pointer]
+          - generic [ref=e525]:
+            - generic [ref=e526]: MEMORY INDEX
+            - generic [ref=e527]: —
+          - generic [ref=e528]:
+            - generic [ref=e529]: PROPOSED PLANS —
+            - generic [ref=e530]: Plans the agent drafted before mutating anything. Review the objective, steps, and risks. Approve to let the agent proceed, edit to change the plan first, or reject to abandon.
+            - generic [ref=e532]: — no pending plans —
+          - generic [ref=e533]:
+            - generic [ref=e534]: PROPOSED BY AGENT —
+            - generic [ref=e535]: Templates the agent drafted from patterns it noticed. Review the rationale, then approve, edit, or reject. Approved proposals are installed as live templates.
+            - generic [ref=e537]: — no pending proposals —
+          - generic [ref=e538]:
+            - generic [ref=e539]: PROACTIVE CHECK-INS —
+            - generic [ref=e540]: Autonomous reach-outs the agent fires on a schedule or when a condition is true. Five seeded templates are installed and disabled — toggle the ones you want active. Cooldown prevents repeat-firing.
+            - generic [ref=e542]: — loading —
+            - button "+ NEW TEMPLATE" [ref=e544] [cursor=pointer]
+          - generic [ref=e545]:
+            - generic [ref=e546]: CREDENTIAL VAULT —
+            - generic [ref=e547]: Per-credential edit, repair, and reset live here. Codex OAuth runtime credentials and optional capability keys are shown separately in Integrations.
+            - generic [ref=e549]: — loading —
+            - generic [ref=e550]:
+              - button "REPAIR KEYCHAIN ⟲" [ref=e551] [cursor=pointer]
+              - button "RESET CREDENTIALS ▣" [ref=e552] [cursor=pointer]
+            - generic [ref=e553]:
+              - text: Reset only deletes entries under
+              - code [ref=e554]: com.clemmy.desktop.v1
+              - text: and the local file vault. Your
+              - code [ref=e555]: .env
+              - text: is never touched.
+  - contentinfo [ref=e148]:
+    - generic [ref=e149]: poll · 2s
+    - generic [ref=e150]:
+      - text: last ·
+      - emphasis [ref=e151]: 10:52:26 PM
+    - generic [ref=e152]: v0.2.1
+    - generic [ref=e153]: ⌘K · coming soon

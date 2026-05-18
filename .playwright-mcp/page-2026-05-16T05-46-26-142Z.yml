@@ -1,0 +1,289 @@
+- generic [ref=e2]:
+  - banner [ref=e3]:
+    - generic [ref=e5]:
+      - generic [ref=e6]: Clementine
+      - generic [ref=e7]: v0.2.1 · console
+    - generic [ref=e8]:
+      - generic [ref=e9]:
+        - text: RUNS ·
+        - emphasis [ref=e10]: "30"
+      - generic [ref=e11]:
+        - text: MEM ·
+        - emphasis [ref=e12]: 33 / 3f
+      - generic [ref=e13]:
+        - text: APPRV ·
+        - emphasis [ref=e14]: "0"
+      - generic [ref=e15]:
+        - text: MODE ·
+        - emphasis [ref=e16]: BALANCED
+      - generic [ref=e19]: ONLINE
+      - button "Toggle light/dark mode" [ref=e20] [cursor=pointer]:
+        - generic [ref=e21]: ◐
+  - navigation "Console sections" [ref=e22]:
+    - button "01 Home 1" [ref=e190] [cursor=pointer]:
+      - generic [ref=e24]: "01"
+      - generic [ref=e25]: Home
+      - generic [ref=e191]: "1"
+    - button "02 Activity" [active] [ref=e26] [cursor=pointer]:
+      - generic [ref=e27]: "02"
+      - generic [ref=e28]: Activity
+    - button "03 Memory" [ref=e29] [cursor=pointer]:
+      - generic [ref=e30]: "03"
+      - generic [ref=e31]: Memory
+    - button "04 Context" [ref=e32] [cursor=pointer]:
+      - generic [ref=e33]: "04"
+      - generic [ref=e34]: Context
+    - button "05 Workflows" [ref=e35] [cursor=pointer]:
+      - generic [ref=e36]: "05"
+      - generic [ref=e37]: Workflows
+    - button "06 Tools" [ref=e38] [cursor=pointer]:
+      - generic [ref=e39]: "06"
+      - generic [ref=e40]: Tools
+    - button "07 Projects" [ref=e41] [cursor=pointer]:
+      - generic [ref=e42]: "07"
+      - generic [ref=e43]: Projects
+    - button "08 Skills" [ref=e44] [cursor=pointer]:
+      - generic [ref=e45]: "08"
+      - generic [ref=e46]: Skills
+    - button "09 Integrations" [ref=e47] [cursor=pointer]:
+      - generic [ref=e48]: "09"
+      - generic [ref=e49]: Integrations
+    - button "10 Settings" [ref=e50] [cursor=pointer]:
+      - generic [ref=e51]: "10"
+      - generic [ref=e52]: Settings
+    - generic "Live status" [ref=e53]:
+      - generic [ref=e54]:
+        - generic [ref=e55]:
+          - generic [ref=e56]: NOW
+          - generic [ref=e57]: "1"
+        - generic [ref=e58]:
+          - generic [ref=e61]: needs you
+          - generic [ref=e62]: End of the week. What got done that you want recorded, what
+      - generic [ref=e63]:
+        - generic [ref=e64]:
+          - generic [ref=e65]: ACTIVE GOAL
+          - generic [ref=e66]: 0/0
+        - generic [ref=e67]:
+          - generic [ref=e68]: —
+          - generic [ref=e70]: —
+      - generic [ref=e71]:
+        - generic [ref=e72]:
+          - generic [ref=e73]: CLEMENTINE LIVE
+          - generic [ref=e74]: STANDBY
+        - generic [ref=e75]:
+          - button "Toggle voice" [ref=e76] [cursor=pointer]
+          - generic [ref=e79]:
+            - generic [ref=e80]: tap orb to talk
+            - generic [ref=e81]: electron only
+      - generic [ref=e82]:
+        - generic [ref=e83]:
+          - generic [ref=e84]: RECENT
+          - generic [ref=e85]: "6"
+        - generic [ref=e86]:
+          - generic [ref=e271]:
+            - generic [ref=e272]: 10:46 PM
+            - generic [ref=e273]: ✓ execution_list
+          - generic [ref=e274]:
+            - generic [ref=e275]: 10:46 PM
+            - generic [ref=e276]: ✓ goal_list
+          - generic [ref=e277]:
+            - generic [ref=e278]: 10:46 PM
+            - generic [ref=e279]: ✓ execution_list
+          - generic [ref=e280]:
+            - generic [ref=e281]: 10:46 PM
+            - generic [ref=e282]: ✓ execution_list
+          - generic [ref=e283]:
+            - generic [ref=e284]: 10:46 PM
+            - generic [ref=e285]: ✓ goal_list
+          - generic [ref=e286]:
+            - generic [ref=e287]: 10:46 PM
+            - generic [ref=e288]: ✓ goal_list
+      - generic [ref=e105]:
+        - generic [ref=e106]:
+          - generic [ref=e107]: HEALTH
+          - generic [ref=e108]: ✓
+        - generic [ref=e109]:
+          - generic [ref=e112]: daemon
+          - generic [ref=e115]: memory.db
+          - generic [ref=e118]: mcp
+          - generic [ref=e121]: composio
+  - main [ref=e122]:
+    - generic [ref=e289]:
+      - generic [ref=e290]: PANEL · 02 · ACTIVITY PULSE
+      - generic [ref=e291]:
+        - generic [ref=e292]:
+          - generic [ref=e293]:
+            - generic [ref=e294]: LIVE RUNS
+            - generic [ref=e295]:
+              - generic [ref=e296]:
+                - text: TOTAL ·
+                - emphasis [ref=e297]: "30"
+              - generic [ref=e298]:
+                - text: RUNNING ·
+                - emphasis [ref=e299]: "0"
+              - generic [ref=e300]:
+                - text: FAILED ·
+                - emphasis [ref=e301]: "0"
+          - list [ref=e302]:
+            - listitem [ref=e303] [cursor=pointer]:
+              - generic [ref=e305]: 20:22:59
+              - generic [ref=e306]: DISCORD
+              - generic "On the Outlook triage, I would like for a little bit more information rather than just a list. If you see anything impor" [ref=e307]
+              - generic [ref=e308]: 39.2s
+            - listitem [ref=e309] [cursor=pointer]:
+              - generic [ref=e311]: 20:23:17
+              - generic [ref=e312]: DISCORD
+              - generic "On the Outlook triage, I would like for a little bit more information rather than just a list. If you see anything impor" [ref=e313]
+              - generic [ref=e314]: 20.7s
+            - listitem [ref=e315] [cursor=pointer]:
+              - generic [ref=e317]: 17:34:17
+              - generic [ref=e318]: DISCORD
+              - generic "run those through data for SEO please and do that anytime I ask for an SEO audit" [ref=e319]
+              - generic [ref=e320]: 16.0s
+            - listitem [ref=e321] [cursor=pointer]:
+              - generic [ref=e323]: 07:17:08
+              - generic [ref=e324]: DISCORD
+              - generic "hey hows it going" [ref=e325]
+              - generic [ref=e326]: 37032s
+            - listitem [ref=e327] [cursor=pointer]:
+              - generic [ref=e329]: 23:09:45
+              - generic [ref=e330]: DISCORD
+              - generic "The project is actually proposal builder as the name" [ref=e331]
+              - generic [ref=e332]: 152676s
+            - listitem [ref=e333] [cursor=pointer]:
+              - generic [ref=e335]: 22:44:45
+              - generic [ref=e336]: WEBHOOK
+              - generic "Use ping and report the output for run timeline background smoke." [ref=e337]
+              - generic [ref=e338]: 154176s
+            - listitem [ref=e339] [cursor=pointer]:
+              - generic [ref=e341]: 17:33:05
+              - generic [ref=e342]: DISCORD
+              - generic "Let’s run local SEO gaps please" [ref=e343]
+              - generic [ref=e344]: 28.3s
+            - listitem [ref=e345] [cursor=pointer]:
+              - generic [ref=e347]: 17:29:25
+              - generic [ref=e348]: DISCORD
+              - generic "run a quick SEO audit on this firm for me please https://www.whitleyjordan.com" [ref=e349]
+              - generic [ref=e350]: 11.9s
+            - listitem [ref=e351] [cursor=pointer]:
+              - generic [ref=e353]: 14:57:25
+              - generic [ref=e354]: DISCORD
+              - generic "Let’s do it" [ref=e355]
+              - generic [ref=e356]: 103s
+            - listitem [ref=e357] [cursor=pointer]:
+              - generic [ref=e359]: 14:56:36
+              - generic [ref=e360]: DISCORD
+              - generic "How’s it going" [ref=e361]
+              - generic [ref=e362]: 17.0s
+            - listitem [ref=e363] [cursor=pointer]:
+              - generic [ref=e365]: 14:56:36
+              - generic [ref=e366]: DISCORD
+              - generic "How’s it going" [ref=e367]
+              - generic [ref=e368]: 15.4s
+            - listitem [ref=e369] [cursor=pointer]:
+              - generic [ref=e371]: 14:56:35
+              - generic [ref=e372]: DISCORD
+              - generic "?" [ref=e373]
+              - generic [ref=e374]: 13.2s
+            - listitem [ref=e375] [cursor=pointer]:
+              - generic [ref=e377]: 14:54:04
+              - generic [ref=e378]: DISCORD
+              - generic "Update the cron logic before it runs please and then let’s run the test I havnt seen anything back yet" [ref=e379]
+              - generic [ref=e380]: 15.4s
+            - listitem [ref=e381] [cursor=pointer]:
+              - generic [ref=e383]: 14:53:06
+              - generic [ref=e384]: DISCORD
+              - generic "I guess something we could be specific in is emails for the current day that are unready only that way we slim down the" [ref=e385]
+              - generic [ref=e386]: 16.7s
+            - listitem [ref=e387] [cursor=pointer]:
+              - generic [ref=e389]: 14:51:30
+              - generic [ref=e390]: DISCORD
+              - generic "Let’s just see how this one goes" [ref=e391]
+              - generic [ref=e392]: 15.4s
+            - listitem [ref=e393] [cursor=pointer]:
+              - generic [ref=e395]: 14:49:32
+              - generic [ref=e396]: DISCORD
+              - generic "Let’s set it and see it run at the top of the hour" [ref=e397]
+              - generic [ref=e398]: 91s
+            - listitem [ref=e399] [cursor=pointer]:
+              - generic [ref=e401]: 14:48:42
+              - generic [ref=e402]: DISCORD
+              - generic "Let’s do it confirm access to my inbox 1st please" [ref=e403]
+              - generic [ref=e404]: 29.2s
+            - listitem [ref=e405] [cursor=pointer]:
+              - generic [ref=e407]: 14:48:04
+              - generic [ref=e408]: DISCORD
+              - generic "Where are we at with that triage" [ref=e409]
+              - generic [ref=e410]: 12.7s
+            - listitem [ref=e411] [cursor=pointer]:
+              - generic [ref=e413]: 14:47:23
+              - generic [ref=e414]: DISCORD
+              - generic "And what did we work on yesterday" [ref=e415]
+              - generic [ref=e416]: 20.3s
+            - listitem [ref=e417] [cursor=pointer]:
+              - generic [ref=e419]: 14:47:04
+              - generic [ref=e420]: DISCORD
+              - generic "What’s my name ?" [ref=e421]
+              - generic [ref=e422]: 11.3s
+            - listitem [ref=e423] [cursor=pointer]:
+              - generic [ref=e425]: 14:46:30
+              - generic [ref=e426]: DISCORD
+              - generic "Hey how’s it going" [ref=e427]
+              - generic [ref=e428]: 17.9s
+            - listitem [ref=e429] [cursor=pointer]:
+              - generic [ref=e431]: 07:17:40
+              - generic [ref=e432]: DISCORD
+              - generic "hey hows it going" [ref=e433]
+              - generic [ref=e434]: 93s
+            - listitem [ref=e435] [cursor=pointer]:
+              - generic [ref=e437]: 04:36:32
+              - generic [ref=e438]: DISCORD
+              - generic "Nope that was great just wanted to test that out and see how it would go thank you. Now I would like to see if you. An s" [ref=e439]
+              - generic [ref=e440]: 20.4s
+            - listitem [ref=e441] [cursor=pointer]:
+              - generic [ref=e443]: 04:31:38
+              - generic [ref=e444]: DISCORD
+              - generic "Are you able to finish that up where you left off" [ref=e445]
+              - generic [ref=e446]: 202s
+            - listitem [ref=e447] [cursor=pointer]:
+              - generic [ref=e449]: 04:27:26
+              - generic [ref=e450]: DISCORD
+              - generic "You can just use Netflify by itself outside of that project please" [ref=e451]
+              - generic [ref=e452]: 225s
+            - listitem [ref=e453] [cursor=pointer]:
+              - generic [ref=e455]: 04:25:59
+              - generic [ref=e456]: DISCORD
+              - generic "spin up a quick HTML report in this and host it on netlify please" [ref=e457]
+              - generic [ref=e458]: 54.6s
+            - listitem [ref=e459] [cursor=pointer]:
+              - generic [ref=e461]: 04:21:00
+              - generic [ref=e462]: DISCORD
+              - generic "run a quick SEO audit on https://www.opolaw.com/" [ref=e463]
+              - generic [ref=e464]: 82s
+            - listitem [ref=e465] [cursor=pointer]:
+              - generic [ref=e467]: 04:10:59
+              - generic [ref=e468]: DISCORD
+              - generic "Hey" [ref=e469]
+              - generic [ref=e470]: 18.4s
+            - listitem [ref=e471] [cursor=pointer]:
+              - generic [ref=e473]: 03:28:41
+              - generic [ref=e474]: DISCORD
+              - generic "A quick SEO audit on this firm https://www.opolaw.com" [ref=e475]
+              - generic [ref=e476]: 13.1s
+            - listitem [ref=e477] [cursor=pointer]:
+              - generic [ref=e479]: 03:27:32
+              - generic [ref=e480]: DISCORD
+              - generic "Hey how’s it going" [ref=e481]
+              - generic [ref=e482]: 26.0s
+        - complementary [ref=e483]:
+          - generic [ref=e484]:
+            - generic [ref=e485]: RUN INSPECTOR
+            - generic [ref=e486]: —
+          - paragraph [ref=e488]: Select a run to inspect its event timeline.
+  - contentinfo [ref=e184]:
+    - generic [ref=e185]: poll · 2s
+    - generic [ref=e186]:
+      - text: last ·
+      - emphasis [ref=e187]: 10:46:26 PM
+    - generic [ref=e188]: v0.2.1
+    - generic [ref=e189]: ⌘K · coming soon

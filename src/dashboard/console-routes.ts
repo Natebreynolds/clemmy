@@ -3111,6 +3111,120 @@ export function registerConsoleRoutes(
   });
 
   /**
+   * Trim-control endpoint — the dashboard's Usage panel posts here to
+   * toggle individual cost sources without the user having to hand-edit
+   * config files. Currently supports:
+   *   - cron jobs (enable/disable individual entries in CRON.md)
+   *   - proactivity policy (enable/disable proactive briefs)
+   * Each toggle is reversible and never disables chat/harness — only
+   * paces or pauses the cost-heavy background loops.
+   */
+  app.post('/api/console/usage/trim', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const body = req.body ?? {};
+    const kind = typeof body.kind === 'string' ? body.kind : '';
+    const action = typeof body.action === 'string' ? body.action : '';
+    const target = typeof body.target === 'string' ? body.target : '';
+    try {
+      if (kind === 'cron') {
+        // Toggle a cron job's `enabled` flag inside CRON.md frontmatter.
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const mat = require('gray-matter');
+        const cronPath = path.join(BASE_DIR, 'vault', '00-System', 'CRON.md');
+        if (!existsSync(cronPath)) { res.status(404).json({ error: 'CRON.md not found' }); return; }
+        const parsed = mat(readFileSync(cronPath, 'utf-8'));
+        const jobs = Array.isArray((parsed.data as { jobs?: unknown }).jobs)
+          ? (parsed.data as { jobs: Record<string, unknown>[] }).jobs
+          : [];
+        const job = jobs.find((j) => j.name === target);
+        if (!job) { res.status(404).json({ error: 'cron job not found' }); return; }
+        job.enabled = action === 'enable';
+        fs.writeFileSync(cronPath, mat.stringify(parsed.content, parsed.data), 'utf-8');
+        res.json({ ok: true, name: target, enabled: job.enabled });
+        return;
+      }
+      if (kind === 'proactivity') {
+        const file = path.join(BASE_DIR, 'state', 'proactivity-policy.json');
+        if (!existsSync(file)) { res.status(404).json({ error: 'proactivity-policy.json not found' }); return; }
+        const policy = JSON.parse(readFileSync(file, 'utf-8')) as Record<string, unknown>;
+        policy.enabled = action === 'enable';
+        fs.writeFileSync(file, JSON.stringify(policy, null, 2), 'utf-8');
+        res.json({ ok: true, enabled: policy.enabled });
+        return;
+      }
+      res.status(400).json({ error: 'unknown trim kind' });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * List trim targets currently available (cron jobs + proactivity state).
+   * Used by the Usage panel to render the "Trim Controls" rows so they
+   * always reflect the latest enabled-state without the user reloading.
+   */
+  app.get('/api/console/usage/trim', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const mat = require('gray-matter');
+      const cronPath = path.join(BASE_DIR, 'vault', '00-System', 'CRON.md');
+      const crons: Array<{ name: string; schedule: string; enabled: boolean }> = [];
+      if (existsSync(cronPath)) {
+        const parsed = mat(readFileSync(cronPath, 'utf-8'));
+        const jobs = Array.isArray((parsed.data as { jobs?: unknown }).jobs)
+          ? (parsed.data as { jobs: Record<string, unknown>[] }).jobs
+          : [];
+        for (const job of jobs) {
+          crons.push({
+            name: String(job.name ?? ''),
+            schedule: String(job.schedule ?? ''),
+            enabled: job.enabled !== false,
+          });
+        }
+      }
+      const proacFile = path.join(BASE_DIR, 'state', 'proactivity-policy.json');
+      const proactivityEnabled = existsSync(proacFile)
+        ? Boolean((JSON.parse(readFileSync(proacFile, 'utf-8')) as { enabled?: boolean }).enabled)
+        : false;
+      res.json({ crons, proactivityEnabled });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * Token-usage rollup for the Usage panel. Reads today's NDJSON log
+   * and aggregates into a dashboard-friendly shape. Cheap — single
+   * day's data is at most a few thousand lines.
+   */
+  app.get('/api/console/usage', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      // Lazy-require so dashboard-routes doesn't take a hard dep at
+      // module load time. Same pattern as other recent dashboard reads.
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { readUsageEventsForDate, rollupUsage, listUsageDates } = require('../runtime/usage-log.js') as {
+        readUsageEventsForDate: (d: Date) => unknown[];
+        rollupUsage: (events: unknown[], d: Date) => Record<string, unknown>;
+        listUsageDates: () => string[];
+      };
+      const dateParam = typeof req.query.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(req.query.date)
+        ? new Date(req.query.date + 'T00:00:00')
+        : new Date();
+      const events = readUsageEventsForDate(dateParam);
+      const rollup = rollupUsage(events, dateParam);
+      res.json({
+        date: dateParam.toISOString().slice(0, 10),
+        availableDates: listUsageDates(),
+        ...rollup,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
    * Cheap goal-state read for the dashboard's nav-dock GOAL card.
    *
    * The card used to refresh by POSTing `/goal status` to /chat every

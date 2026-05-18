@@ -104,8 +104,12 @@ export function renderConsoleHtml(token: string): string {
         <span class="nav-key">09</span>
         <span class="nav-label">Integrations</span>
       </button>
-      <button class="nav" data-panel="settings">
+      <button class="nav" data-panel="usage">
         <span class="nav-key">10</span>
+        <span class="nav-label">Usage</span>
+      </button>
+      <button class="nav" data-panel="settings">
+        <span class="nav-key">11</span>
         <span class="nav-label">Settings</span>
       </button>
 
@@ -880,8 +884,61 @@ export function renderConsoleHtml(token: string): string {
         </div>
       </section>
 
+      <section class="panel-frame" data-section="usage" hidden>
+        <div class="panel-tag">PANEL · 10 · USAGE</div>
+        <div class="panel-body usage-layout">
+
+          <div class="usage-header">
+            <div class="usage-intro">
+              <h3>Token Usage Today</h3>
+              <p>What's eating tokens. Captured per model call. Drill in to disable a noisy source without breaking agentic work.</p>
+            </div>
+            <div class="usage-totals">
+              <div class="stat-card"><span>TOTAL TOKENS</span><em data-usage-total>—</em></div>
+              <div class="stat-card"><span>CALLS</span><em data-usage-calls>—</em></div>
+              <div class="stat-card"><span>INPUT</span><em data-usage-input>—</em></div>
+              <div class="stat-card"><span>OUTPUT</span><em data-usage-output>—</em></div>
+            </div>
+          </div>
+
+          <div class="usage-grid">
+            <div class="usage-block">
+              <div class="usage-block-head">BY SOURCE <button data-usage-refresh>REFRESH</button></div>
+              <div class="usage-bysource" data-usage-bysource>
+                <div class="settings-info">— loading —</div>
+              </div>
+            </div>
+
+            <div class="usage-block">
+              <div class="usage-block-head">BY KIND</div>
+              <div class="usage-bykind" data-usage-bykind>
+                <div class="settings-info">— loading —</div>
+              </div>
+              <div class="usage-block-head" style="margin-top:14px;">BY MODEL</div>
+              <div class="usage-bymodel" data-usage-bymodel>
+                <div class="settings-info">— loading —</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="usage-block">
+            <div class="usage-block-head">HOURLY TOKEN SPEND</div>
+            <div class="usage-spark" data-usage-spark>— loading —</div>
+          </div>
+
+          <div class="usage-block">
+            <div class="usage-block-head">TRIM CONTROLS</div>
+            <p class="usage-trim-intro">Pause expensive loops without losing the agentic component. Re-enable any time. None of these disable chat or harness runs.</p>
+            <div class="usage-trim" data-usage-trim>
+              <div class="settings-info">— loading —</div>
+            </div>
+          </div>
+
+        </div>
+      </section>
+
       <section class="panel-frame" data-section="settings" hidden>
-        <div class="panel-tag">PANEL · 10 · SETTINGS</div>
+        <div class="panel-tag">PANEL · 11 · SETTINGS</div>
         <div class="panel-body settings-layout">
 
           <div class="settings-col">
@@ -5937,6 +5994,80 @@ body {
   letter-spacing: 0;
 }
 
+/* ── Usage panel ─────────────────────────────────────────────── */
+.usage-layout {
+  display: flex; flex-direction: column; gap: 14px;
+  height: 100%; overflow-y: auto;
+}
+.usage-header {
+  display: flex; justify-content: space-between; align-items: start;
+  gap: 14px; padding: 14px; border: 1px solid var(--line); background: var(--bg-1);
+}
+.usage-intro h3 { margin: 0 0 6px; font-size: 16px; letter-spacing: 0.04em; }
+.usage-intro p { margin: 0; color: var(--fg-3); font-size: 12px; max-width: 520px; }
+.usage-totals { display: flex; gap: 0; border: 1px solid var(--line); }
+.usage-totals .stat-card { border-right: 1px solid var(--line); padding: 10px 14px; }
+.usage-totals .stat-card:last-child { border-right: none; }
+.usage-totals .stat-card em { font-size: 22px; }
+.usage-grid {
+  display: grid; grid-template-columns: 1.4fr 1fr; gap: 14px;
+}
+.usage-block { padding: 14px; border: 1px solid var(--line); background: var(--bg-1); }
+.usage-block-head {
+  display: flex; justify-content: space-between; align-items: center;
+  font-size: 10px; letter-spacing: 0.18em; color: var(--fg-3);
+  margin-bottom: 10px; text-transform: uppercase;
+}
+.usage-block-head button {
+  font-size: 10px; padding: 3px 8px; background: transparent;
+  border: 1px solid var(--line); color: var(--fg-3); cursor: pointer;
+  letter-spacing: 0.14em;
+}
+.usage-block-head button:hover { color: var(--accent); border-color: var(--accent); }
+.usage-row {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 6px 0; border-bottom: 1px dashed var(--line); font-size: 12px;
+  font-family: var(--mono, ui-monospace, monospace);
+}
+.usage-row:last-child { border-bottom: none; }
+.usage-row .label { color: var(--fg-2); }
+.usage-row .meta { color: var(--fg-3); font-size: 10px; letter-spacing: 0.1em; }
+.usage-row .tokens { color: var(--accent); font-variant-numeric: tabular-nums; }
+.usage-row .bar {
+  flex: 1; height: 4px; background: var(--bg-0); margin: 0 12px;
+  border: 1px solid var(--line); border-radius: 2px; overflow: hidden;
+}
+.usage-row .bar-fill { height: 100%; background: var(--accent); }
+.usage-spark {
+  display: flex; align-items: end; gap: 2px;
+  height: 80px; padding: 8px 0;
+}
+.usage-spark .spark-bar {
+  flex: 1; background: var(--accent); min-height: 1px;
+  border-radius: 1px 1px 0 0;
+}
+.usage-spark .spark-bar.empty { background: var(--line); }
+.usage-spark .spark-hour {
+  font-size: 8px; color: var(--fg-3); letter-spacing: 0;
+  text-align: center; margin-top: 4px;
+}
+.usage-trim-intro { color: var(--fg-3); font-size: 11px; margin: 0 0 12px; }
+.usage-trim-row {
+  display: flex; align-items: center; gap: 12px;
+  padding: 10px 0; border-bottom: 1px solid var(--line);
+}
+.usage-trim-row:last-child { border-bottom: none; }
+.usage-trim-row .name { flex: 1; font-size: 12px; }
+.usage-trim-row .desc { color: var(--fg-3); font-size: 10px; letter-spacing: 0.06em; }
+.usage-trim-row button {
+  font-size: 10px; padding: 5px 12px; letter-spacing: 0.14em;
+  background: transparent; border: 1px solid var(--line);
+  color: var(--fg-3); cursor: pointer;
+}
+.usage-trim-row button:hover { color: var(--accent); border-color: var(--accent); }
+.usage-trim-row button.on { color: var(--accent); border-color: var(--accent); }
+.usage-trim-row button.danger { color: var(--accent-fail); border-color: var(--accent-fail); }
+
 .skills-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
@@ -7549,6 +7680,7 @@ const CONSOLE_JS = `
   let toolsBooted = false;
   let projectsBooted = false;
   let skillsBooted = false;
+  let usageBooted = false;
   let settingsBooted = false;
   let integrationsBooted = false;
   let homeBooted = false;
@@ -7590,6 +7722,9 @@ const CONSOLE_JS = `
     } else if (name === 'home') {
       if (!homeBooted) { homeBooted = true; bootHomePanel(); }
       else refreshHomeAgenda();
+    } else if (name === 'usage') {
+      if (!usageBooted) { usageBooted = true; bootUsagePanel(); }
+      else refreshUsagePanel();
     } else if (name === 'settings') {
       if (!settingsBooted) { settingsBooted = true; bootSettingsPanel(); }
     }
@@ -12834,6 +12969,174 @@ const CONSOLE_JS = `
         } catch (err) { alert('Save failed: ' + (err.message || err)); }
       });
     });
+  }
+
+  // ─── Usage panel ──────────────────────────────────────────────
+  // Reads /api/console/usage (NDJSON rollup) and renders four sections:
+  // totals, by-source, by-kind, by-model, hourly sparkline, trim
+  // controls. Trim controls POST to /api/console/usage/trim which
+  // toggles individual cron jobs or the proactivity policy.
+
+  function fmtTokens(n) {
+    n = Number(n) || 0;
+    if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + 'M';
+    if (n >= 1_000) return (n / 1_000).toFixed(1) + 'K';
+    return String(n);
+  }
+
+  async function bootUsagePanel() {
+    const refreshBtn = document.querySelector('[data-usage-refresh]');
+    if (refreshBtn && !refreshBtn.dataset.bound) {
+      refreshBtn.dataset.bound = '1';
+      refreshBtn.addEventListener('click', () => refreshUsagePanel());
+    }
+    await refreshUsagePanel();
+    // Cheap auto-refresh — endpoint is a single ndjson read.
+    setInterval(refreshUsagePanel, 15000);
+  }
+
+  async function refreshUsagePanel() {
+    try {
+      const data = await fetchJSON('/api/console/usage');
+      const totalEl = document.querySelector('[data-usage-total]');
+      const callsEl = document.querySelector('[data-usage-calls]');
+      const inputEl = document.querySelector('[data-usage-input]');
+      const outputEl = document.querySelector('[data-usage-output]');
+      if (totalEl) totalEl.textContent = fmtTokens(data.totalTokens);
+      if (callsEl) callsEl.textContent = String(data.totalCalls || 0);
+      if (inputEl) inputEl.textContent = fmtTokens(data.totalInputTokens);
+      if (outputEl) outputEl.textContent = fmtTokens(data.totalOutputTokens);
+
+      // BY SOURCE
+      const bsEl = document.querySelector('[data-usage-bysource]');
+      if (bsEl) {
+        const sources = Array.isArray(data.bySource) ? data.bySource : [];
+        if (sources.length === 0) {
+          bsEl.innerHTML = '<div class="settings-info">No usage yet today. As the agent makes model calls, sources will appear here.</div>';
+        } else {
+          const maxTokens = sources[0].tokens || 1;
+          bsEl.innerHTML = sources.slice(0, 20).map(function (s) {
+            const pct = Math.round((s.tokens / maxTokens) * 100);
+            return [
+              '<div class="usage-row">',
+              '  <span class="label">' + escMem(s.source) + '</span>',
+              '  <span class="meta">' + escMem(s.kind) + '</span>',
+              '  <span class="bar"><span class="bar-fill" style="width:' + pct + '%"></span></span>',
+              '  <span class="tokens">' + fmtTokens(s.tokens) + '</span>',
+              '  <span class="meta">' + s.calls + ' calls</span>',
+              '</div>',
+            ].join('');
+          }).join('');
+        }
+      }
+
+      // BY KIND
+      const bkEl = document.querySelector('[data-usage-bykind]');
+      if (bkEl) {
+        const entries = Object.entries(data.byKind || {}).sort(function (a, b) { return b[1].tokens - a[1].tokens; });
+        if (entries.length === 0) {
+          bkEl.innerHTML = '<div class="settings-info">—</div>';
+        } else {
+          bkEl.innerHTML = entries.map(function (entry) {
+            return [
+              '<div class="usage-row">',
+              '  <span class="label">' + escMem(entry[0]) + '</span>',
+              '  <span class="tokens">' + fmtTokens(entry[1].tokens) + '</span>',
+              '  <span class="meta">' + entry[1].calls + ' calls</span>',
+              '</div>',
+            ].join('');
+          }).join('');
+        }
+      }
+
+      // BY MODEL
+      const bmEl = document.querySelector('[data-usage-bymodel]');
+      if (bmEl) {
+        const entries = Object.entries(data.byModel || {}).sort(function (a, b) { return b[1].tokens - a[1].tokens; });
+        if (entries.length === 0) {
+          bmEl.innerHTML = '<div class="settings-info">—</div>';
+        } else {
+          bmEl.innerHTML = entries.map(function (entry) {
+            return [
+              '<div class="usage-row">',
+              '  <span class="label">' + escMem(entry[0]) + '</span>',
+              '  <span class="tokens">' + fmtTokens(entry[1].tokens) + '</span>',
+              '  <span class="meta">' + entry[1].calls + ' calls</span>',
+              '</div>',
+            ].join('');
+          }).join('');
+        }
+      }
+
+      // HOURLY SPARK
+      const sparkEl = document.querySelector('[data-usage-spark]');
+      if (sparkEl) {
+        const hours = Array.isArray(data.byHour) ? data.byHour : [];
+        const maxH = Math.max.apply(null, hours.map(function (h) { return h.tokens; }).concat([1]));
+        const bars = hours.map(function (h) {
+          const heightPct = Math.max(1, Math.round((h.tokens / maxH) * 100));
+          const empty = h.tokens === 0 ? ' empty' : '';
+          return '<div class="spark-bar' + empty + '" style="height:' + heightPct + '%" title="' + h.hour + ': ' + fmtTokens(h.tokens) + ' tokens, ' + h.calls + ' calls"></div>';
+        }).join('');
+        sparkEl.innerHTML = '<div style="display:flex;align-items:end;gap:2px;height:80px;flex:1;">' + bars + '</div>';
+      }
+
+      await refreshUsageTrim();
+    } catch (err) {
+      console.error('usage panel refresh failed:', err);
+    }
+  }
+
+  async function refreshUsageTrim() {
+    const el = document.querySelector('[data-usage-trim]');
+    if (!el) return;
+    try {
+      const trim = await fetchJSON('/api/console/usage/trim');
+      const rows = [];
+      const proacOn = trim.proactivityEnabled;
+      rows.push([
+        '<div class="usage-trim-row">',
+        '  <div class="name"><div>Proactive briefs / autonomy</div><div class="desc">Hourly check-ins, scheduled brief notifications, autonomy loops. Chat + workflows are not affected.</div></div>',
+        '  <button class="' + (proacOn ? 'on danger' : '') + '" data-usage-trim-proac>' + (proacOn ? 'PAUSE' : 'RESUME') + '</button>',
+        '</div>',
+      ].join(''));
+      for (const cron of trim.crons || []) {
+        rows.push([
+          '<div class="usage-trim-row">',
+          '  <div class="name"><div>cron: ' + escMem(cron.name) + '</div><div class="desc">schedule: ' + escMem(cron.schedule) + '</div></div>',
+          '  <button class="' + (cron.enabled ? 'on danger' : '') + '" data-usage-trim-cron="' + escMem(cron.name) + '">' + (cron.enabled ? 'PAUSE' : 'RESUME') + '</button>',
+          '</div>',
+        ].join(''));
+      }
+      el.innerHTML = rows.join('') || '<div class="settings-info">No trim targets configured.</div>';
+
+      el.querySelectorAll('[data-usage-trim-cron]').forEach(function (btn) {
+        btn.addEventListener('click', async function () {
+          const name = btn.getAttribute('data-usage-trim-cron');
+          const enabling = btn.classList.contains('on') === false;
+          btn.disabled = true;
+          await fetch(withToken('/api/console/usage/trim'), {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ kind: 'cron', target: name, action: enabling ? 'enable' : 'disable' }),
+          });
+          await refreshUsageTrim();
+        });
+      });
+      const proacBtn = el.querySelector('[data-usage-trim-proac]');
+      if (proacBtn) {
+        proacBtn.addEventListener('click', async function () {
+          const enabling = proacBtn.classList.contains('on') === false;
+          proacBtn.disabled = true;
+          await fetch(withToken('/api/console/usage/trim'), {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ kind: 'proactivity', action: enabling ? 'enable' : 'disable' }),
+          });
+          await refreshUsageTrim();
+        });
+      }
+    } catch (err) {
+      console.error('usage trim refresh failed:', err);
+    }
   }
 
   async function bootSettingsPanel() {

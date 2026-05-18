@@ -1,0 +1,135 @@
+- generic [ref=e2]:
+  - banner [ref=e3]:
+    - generic [ref=e5]:
+      - generic [ref=e6]: Clementine
+      - generic [ref=e7]: v0.2.1 · console
+    - generic [ref=e8]:
+      - generic [ref=e9]:
+        - text: RUNS ·
+        - emphasis [ref=e10]: "30"
+      - generic [ref=e11]:
+        - text: MEM ·
+        - emphasis [ref=e12]: 33 / 3f
+      - generic [ref=e13]:
+        - text: APPRV ·
+        - emphasis [ref=e14]: "0"
+      - generic [ref=e15]:
+        - text: MODE ·
+        - emphasis [ref=e16]: BALANCED
+      - generic [ref=e19]: ONLINE
+      - button "Toggle light/dark mode" [ref=e20] [cursor=pointer]:
+        - generic [ref=e21]: ◐
+  - navigation "Console sections" [ref=e22]:
+    - button "01 Home 1" [ref=e190] [cursor=pointer]:
+      - generic [ref=e24]: "01"
+      - generic [ref=e25]: Home
+      - generic [ref=e191]: "1"
+    - button "02 Activity" [ref=e26] [cursor=pointer]:
+      - generic [ref=e27]: "02"
+      - generic [ref=e28]: Activity
+    - button "03 Memory" [ref=e29] [cursor=pointer]:
+      - generic [ref=e30]: "03"
+      - generic [ref=e31]: Memory
+    - button "04 Context" [ref=e32] [cursor=pointer]:
+      - generic [ref=e33]: "04"
+      - generic [ref=e34]: Context
+    - button "05 Workflows" [ref=e35] [cursor=pointer]:
+      - generic [ref=e36]: "05"
+      - generic [ref=e37]: Workflows
+    - button "06 Tools" [active] [ref=e38] [cursor=pointer]:
+      - generic [ref=e39]: "06"
+      - generic [ref=e40]: Tools
+    - button "07 Projects" [ref=e41] [cursor=pointer]:
+      - generic [ref=e42]: "07"
+      - generic [ref=e43]: Projects
+    - button "08 Skills" [ref=e44] [cursor=pointer]:
+      - generic [ref=e45]: "08"
+      - generic [ref=e46]: Skills
+    - button "09 Integrations" [ref=e47] [cursor=pointer]:
+      - generic [ref=e48]: "09"
+      - generic [ref=e49]: Integrations
+    - button "10 Settings" [ref=e50] [cursor=pointer]:
+      - generic [ref=e51]: "10"
+      - generic [ref=e52]: Settings
+    - generic "Live status" [ref=e53]:
+      - generic [ref=e54]:
+        - generic [ref=e55]:
+          - generic [ref=e56]: NOW
+          - generic [ref=e57]: "1"
+        - generic [ref=e58]:
+          - generic [ref=e61]: needs you
+          - generic [ref=e62]: End of the week. What got done that you want recorded, what
+      - generic [ref=e63]:
+        - generic [ref=e64]:
+          - generic [ref=e65]: ACTIVE GOAL
+          - generic [ref=e66]: 0/0
+        - generic [ref=e67]:
+          - generic [ref=e68]: —
+          - generic [ref=e70]: —
+      - generic [ref=e71]:
+        - generic [ref=e72]:
+          - generic [ref=e73]: CLEMENTINE LIVE
+          - generic [ref=e74]: STANDBY
+        - generic [ref=e75]:
+          - button "Toggle voice" [ref=e76] [cursor=pointer]
+          - generic [ref=e79]:
+            - generic [ref=e80]: tap orb to talk
+            - generic [ref=e81]: electron only
+      - generic [ref=e82]:
+        - generic [ref=e83]:
+          - generic [ref=e84]: RECENT
+          - generic [ref=e85]: "6"
+        - generic [ref=e86]:
+          - generic [ref=e489]:
+            - generic [ref=e490]: 10:46 PM
+            - generic [ref=e491]: ✓ goal_list
+          - generic [ref=e492]:
+            - generic [ref=e493]: 10:46 PM
+            - generic [ref=e494]: ✓ execution_list
+          - generic [ref=e495]:
+            - generic [ref=e496]: 10:46 PM
+            - generic [ref=e497]: ✓ goal_list
+          - generic [ref=e498]:
+            - generic [ref=e499]: 10:46 PM
+            - generic [ref=e500]: ✓ execution_list
+          - generic [ref=e501]:
+            - generic [ref=e502]: 10:46 PM
+            - generic [ref=e503]: ✓ goal_list
+          - generic [ref=e504]:
+            - generic [ref=e505]: 10:46 PM
+            - generic [ref=e506]: ✓ execution_list
+      - generic [ref=e105]:
+        - generic [ref=e106]:
+          - generic [ref=e107]: HEALTH
+          - generic [ref=e108]: ✓
+        - generic [ref=e109]:
+          - generic [ref=e112]: daemon
+          - generic [ref=e115]: memory.db
+          - generic [ref=e118]: mcp
+          - generic [ref=e121]: composio
+  - main [ref=e122]:
+    - generic [ref=e507]:
+      - generic [ref=e508]: PANEL · 06 · TOOLS
+      - generic [ref=e509]:
+        - complementary [ref=e510]:
+          - generic [ref=e511]:
+            - searchbox "filter tools · category, name…" [ref=e512]
+            - generic [ref=e513]: —
+        - generic [ref=e515]:
+          - generic [ref=e516]:
+            - generic [ref=e517]:
+              - generic [ref=e518]: REGISTERED TOOLS
+              - emphasis [ref=e519]: —
+            - generic [ref=e521]: — loading —
+          - generic [ref=e522]:
+            - generic [ref=e523]:
+              - generic [ref=e524]: MCP SERVERS
+              - emphasis [ref=e525]: —
+            - generic [ref=e526]: Discovered + custom MCP servers live in Integrations. Toggle, edit, or add new ones there — anything the agent can call is reflected back here as a tool.
+  - contentinfo [ref=e184]:
+    - generic [ref=e185]: poll · 2s
+    - generic [ref=e186]:
+      - text: last ·
+      - emphasis [ref=e187]: 10:46:43 PM
+    - generic [ref=e188]: v0.2.1
+    - generic [ref=e189]: ⌘K · coming soon

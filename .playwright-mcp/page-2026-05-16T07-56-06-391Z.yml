@@ -1,0 +1,188 @@
+- generic [ref=e2]:
+  - banner [ref=e3]:
+    - generic [ref=e5]:
+      - generic [ref=e6]: Clementine
+      - generic [ref=e7]: v0.2.1 · console
+    - generic [ref=e8]:
+      - generic [ref=e9]:
+        - text: RUNS ·
+        - emphasis [ref=e10]: —
+      - generic [ref=e11]:
+        - text: MEM ·
+        - emphasis [ref=e12]: —
+      - generic [ref=e13]:
+        - text: APPRV ·
+        - emphasis [ref=e14]: —
+      - generic [ref=e15]:
+        - text: MODE ·
+        - emphasis [ref=e16]: —
+      - generic [ref=e19]: ONLINE
+      - button "Toggle light/dark mode" [ref=e20] [cursor=pointer]:
+        - generic [ref=e21]: ◐
+  - navigation "Console sections" [ref=e22]:
+    - button "01 Home" [ref=e23] [cursor=pointer]:
+      - generic [ref=e24]: "01"
+      - generic [ref=e25]: Home
+    - button "02 Activity" [ref=e26] [cursor=pointer]:
+      - generic [ref=e27]: "02"
+      - generic [ref=e28]: Activity
+    - button "03 Memory" [ref=e29] [cursor=pointer]:
+      - generic [ref=e30]: "03"
+      - generic [ref=e31]: Memory
+    - button "04 Context" [ref=e32] [cursor=pointer]:
+      - generic [ref=e33]: "04"
+      - generic [ref=e34]: Context
+    - button "05 Workflows" [ref=e35] [cursor=pointer]:
+      - generic [ref=e36]: "05"
+      - generic [ref=e37]: Workflows
+    - button "06 Tools" [ref=e38] [cursor=pointer]:
+      - generic [ref=e39]: "06"
+      - generic [ref=e40]: Tools
+    - button "07 Projects" [ref=e41] [cursor=pointer]:
+      - generic [ref=e42]: "07"
+      - generic [ref=e43]: Projects
+    - button "08 Skills" [ref=e44] [cursor=pointer]:
+      - generic [ref=e45]: "08"
+      - generic [ref=e46]: Skills
+    - button "09 Integrations" [ref=e47] [cursor=pointer]:
+      - generic [ref=e48]: "09"
+      - generic [ref=e49]: Integrations
+    - button "10 Settings" [ref=e50] [cursor=pointer]:
+      - generic [ref=e51]: "10"
+      - generic [ref=e52]: Settings
+    - generic "Live status" [ref=e53]:
+      - generic [ref=e54]:
+        - generic [ref=e55]:
+          - generic [ref=e56]: NOW
+          - generic [ref=e57]: —
+        - generic [ref=e58]:
+          - generic [ref=e61]: idle
+          - generic [ref=e62]: —
+      - generic [ref=e63]:
+        - generic [ref=e64]:
+          - generic [ref=e65]: CLEMENTINE LIVE
+          - generic [ref=e66]: STANDBY
+        - generic [ref=e67]:
+          - button "Toggle voice" [ref=e68] [cursor=pointer]
+          - generic [ref=e71]:
+            - generic [ref=e72]: tap orb to talk
+            - generic [ref=e73]: electron only
+      - generic [ref=e74]:
+        - generic [ref=e75]:
+          - generic [ref=e76]: RECENT
+          - generic [ref=e77]: "2"
+        - generic [ref=e78]:
+          - generic [ref=e79]:
+            - generic [ref=e80]: 12:03 AM
+            - generic [ref=e81]: ✓ memory_read
+          - generic [ref=e82]:
+            - generic [ref=e83]: 12:03 AM
+            - generic [ref=e84]: ✓ memory_read
+      - generic [ref=e85]:
+        - generic [ref=e86]:
+          - generic [ref=e87]: HEALTH
+          - generic [ref=e88]: —
+        - generic [ref=e89]:
+          - generic [ref=e92]: daemon
+          - generic [ref=e95]: memory.db
+          - generic [ref=e98]: mcp
+          - generic [ref=e101]: composio
+  - main [ref=e102]:
+    - generic [ref=e103]:
+      - generic [ref=e104]: PANEL · 05 · WORKFLOW STUDIO
+      - generic [ref=e105]:
+        - complementary [ref=e106]:
+          - generic [ref=e107]:
+            - generic [ref=e108]: WORKFLOWS
+            - button "＋ NEW" [ref=e109] [cursor=pointer]
+          - list [ref=e110]:
+            - listitem [ref=e111]:
+              - link "daily-summary ○ DISABLED 1 steps" [ref=e112] [cursor=pointer]:
+                - /url: "#workflows/daily-summary"
+                - generic [ref=e113]: daily-summary
+                - generic [ref=e114]:
+                  - generic [ref=e115]: ○ DISABLED
+                  - generic [ref=e116]: 1 steps
+        - generic [ref=e117]:
+          - generic [ref=e118]:
+            - textbox [ref=e119]: daily-summary
+            - generic [ref=e120]: ○ DISABLED
+          - generic [ref=e121]:
+            - generic [ref=e122]:
+              - button "SAVE ✎" [ref=e123] [cursor=pointer]
+              - button "DUPLICATE ⎘" [ref=e124] [cursor=pointer]
+              - button "● ENABLE" [ref=e125] [cursor=pointer]
+              - button "DELETE ▣" [ref=e126] [cursor=pointer]
+            - generic [ref=e127]:
+              - button "VALIDATE ✓" [ref=e128] [cursor=pointer]
+              - button "DRY-RUN ⌗" [ref=e129] [cursor=pointer]
+              - button "RUN ▶" [ref=e130] [cursor=pointer]
+          - generic [ref=e131]:
+            - generic [ref=e132]:
+              - generic [ref=e133]: DESCRIPTION
+              - textbox [ref=e134]: Example local workflow scaffold.
+              - generic [ref=e135]: A clear description helps the agent pick the right workflow.
+            - generic [ref=e136]:
+              - generic [ref=e137]: TRIGGER (cron expression — blank = manual only)
+              - textbox "0 9 * * 1-5" [ref=e138]
+              - generic [ref=e139]:
+                - text: "Five-field cron. Examples:"
+                - code [ref=e140]: 0 9 * * 1-5
+                - text: (weekdays 9am),
+                - code [ref=e141]: "*/15 * * * *"
+                - text: (every 15m).
+            - generic [ref=e142]:
+              - generic [ref=e143]: STEPS · 1
+              - generic [ref=e145]:
+                - generic [ref=e146]:
+                  - generic [ref=e147]: "#1"
+                  - generic [ref=e148]: summarize
+                  - generic [ref=e149]: idle
+                  - generic [ref=e150]:
+                    - button "▶ TRY" [ref=e151] [cursor=pointer]
+                    - button "✎ REFINE" [ref=e152] [cursor=pointer]
+                    - button "⛭" [ref=e153] [cursor=pointer]
+                - generic "Click to edit, or use ✎ REFINE to ask the Architect" [ref=e155]: Summarize the most important open work for today using the current vault and context.
+              - button "＋ ADD STEP" [ref=e156] [cursor=pointer]
+            - generic [ref=e157]:
+              - generic [ref=e158]: INPUTS · 0
+              - generic [ref=e160]: — no inputs declared. The workflow runs with whatever the runtime supplies. —
+              - button "＋ ADD INPUT" [ref=e161] [cursor=pointer]
+              - generic [ref=e162]:
+                - text: Inputs are runtime parameters (e.g.
+                - code [ref=e163]: customer_id
+                - text: ). Reference them in step prompts as
+                - code [ref=e164]: "{{customer_id}}"
+                - text: . The user is prompted for values when running.
+            - generic [ref=e165]:
+              - generic [ref=e166]: SYNTHESIS (optional final prompt that combines step outputs)
+              - textbox "Summarize the prior step outputs as a single concise update." [ref=e167]
+            - generic [ref=e168]:
+              - generic [ref=e169]: RECENT RUNS
+              - list [ref=e170]:
+                - listitem [ref=e171]:
+                  - generic [ref=e172]: DRY_RUN
+                  - generic [ref=e173]: 1778861658623-e7f08f
+                  - generic [ref=e174]: 2026-05-15 16:14:18
+                - listitem [ref=e175]:
+                  - generic [ref=e176]: COMPLETED
+                  - generic [ref=e177]: 1778861023018-193d3c
+                  - generic [ref=e178]: 2026-05-15 16:03:43
+        - complementary [ref=e179]:
+          - generic [ref=e180]:
+            - generic [ref=e181]: ARCHITECT
+            - generic [ref=e182]: idle
+          - generic [ref=e184]:
+            - text: Workflow Architect chat.
+            - text: Ask the agent to draft, refine, or critique the workflow on the left.
+            - emphasis [ref=e185]: e.g. "Add a step after research that drafts a weekly email" or "Tighten the schedule to weekdays 9am" or "Validate this for cycles".
+          - generic [ref=e186]:
+            - textbox "message the architect · ⏎ to send · shift+⏎ for newline" [ref=e187]
+            - button "SEND ▸" [ref=e188] [cursor=pointer]
+  - contentinfo [ref=e189]:
+    - generic [ref=e190]: poll · 2s
+    - generic [ref=e191]:
+      - text: last ·
+      - emphasis [ref=e192]: —
+    - generic [ref=e193]: v0.2.1
+    - generic [ref=e194]: ⌘K · coming soon

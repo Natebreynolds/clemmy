@@ -10,6 +10,7 @@ import { getCoreToolsAsync } from '../tools/registry.js';
 import { getOrCreateConfiguredMcpServers } from './mcp-servers.js';
 import { classifyTool, decideToolApproval } from '../agents/tool-taxonomy.js';
 import { beginToolEvent, recordPendingApproval, recordToolEvent } from '../agents/tool-observability.js';
+import { recordUsage, type UsageEvent } from './usage-log.js';
 import { truncateToolText } from '../tools/shared.js';
 import type { RuntimeContextValue, ToolActivity } from '../types.js';
 
@@ -394,11 +395,28 @@ function formatCodexApiError(status: number, bodyText: string): string {
   return `Clementine's model backend request failed (HTTP ${status}).`;
 }
 
+/**
+ * Classify a usage event by sessionId/channel into a UI-friendly kind.
+ * Lets the dashboard "Usage" panel group spend by source category
+ * (chat vs cron vs autonomy vs workflow) without having to parse the
+ * raw sessionId on the read side.
+ */
+function classifyUsageKind(sessionId: string, channel?: string): UsageEvent['kind'] {
+  if (channel === 'cron' || sessionId.startsWith('cron:')) return 'cron';
+  if (channel === 'workflow' || sessionId.startsWith('workflow:')) return 'workflow';
+  if (channel === 'background' || sessionId.startsWith('background:') || sessionId.startsWith('bg-')) return 'background';
+  if (channel === 'controller' || sessionId.startsWith('execution-controller:')) return 'controller';
+  if (sessionId.startsWith('agent:')) return 'autonomy';
+  if (sessionId === 'console:home' || sessionId.startsWith('console:') || sessionId.startsWith('discord:') || channel === 'cli' || channel === 'discord' || channel === 'electron') return 'chat';
+  return 'other';
+}
+
 async function performCodexRequest(
   request: RunRequest,
   input: CodexInputMessage[],
   callbacks?: AgentRuntimeCallbacks,
 ): Promise<CodexResponseResult> {
+  const startedAt = Date.now();
   await throwIfCancelled(callbacks);
   const tokens = getStoredCodexOAuthTokens();
   if (!tokens?.accessToken) {
@@ -562,6 +580,39 @@ async function performCodexRequest(
 	          if (callbacks?.onText && finalText.trim()) {
 	            await callbacks.onText(finalText.trim());
 	          }
+	          // Capture token usage for the dashboard's Usage panel.
+	          // The codex responses API reports usage on the completed
+	          // event when available. We swallow any extraction errors —
+	          // observability must never break the response path.
+	          try {
+	            const responseObj = (payload as { response?: Record<string, unknown> }).response;
+	            const usage = responseObj && (responseObj.usage as Record<string, unknown> | undefined);
+	            if (usage && typeof usage === 'object') {
+	              const num = (key: string): number | undefined => {
+	                const v = usage[key];
+	                return typeof v === 'number' ? v : undefined;
+	              };
+	              const inputTokens = num('input_tokens') ?? num('prompt_tokens') ?? 0;
+	              const outputTokens = num('output_tokens') ?? num('completion_tokens') ?? 0;
+	              const totalTokens = num('total_tokens') ?? (inputTokens + outputTokens);
+	              const cachedInputTokens = num('cached_tokens') ?? num('prompt_tokens_details.cached_tokens');
+	              const reasoningTokens = num('reasoning_tokens') ?? num('output_tokens_details.reasoning_tokens');
+	              const sessionId = request.sessionId ?? 'unknown';
+	              recordUsage({
+	                at: new Date().toISOString(),
+	                source: sessionId,
+	                kind: classifyUsageKind(sessionId, request.channel),
+	                model: resolveCodexModel(request.model),
+	                inputTokens,
+	                cachedInputTokens,
+	                outputTokens,
+	                reasoningTokens,
+	                totalTokens,
+	                durationMs: Date.now() - startedAt,
+	                responseId,
+	              });
+	            }
+	          } catch { /* ignore */ }
 	        }
 	      }
 	    }

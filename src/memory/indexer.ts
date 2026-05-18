@@ -63,6 +63,41 @@ function hashString(input: string): string {
   return createHash('sha1').update(input).digest('hex');
 }
 
+/**
+ * Skip patterns for the vault indexer. These files are append-only
+ * logs (chat archives, meeting transcripts) — they grow continuously,
+ * their content is already in the harness DB for direct lookup, and
+ * letting them through the chunker means every chat or meeting bumps
+ * the file mtime, triggers a per-tick reindex that deletes + recreates
+ * their entire chunk set, which cascade-deletes embeddings, which
+ * cascades to a backfill loop that re-embeds the same content against
+ * OpenAI on every minute tick.
+ *
+ * Observed today: the chat-archive for sessionId console:home was
+ * 3.7 MB / 121K lines after a single day of use, and was responsible
+ * for ~40M re-embedding tokens billed to OpenAI before this exclusion
+ * landed.
+ *
+ * Match against the basename only — directory paths are kept as-is.
+ */
+const INDEXER_FILENAME_SKIP_PATTERNS: RegExp[] = [
+  // Chat-archive files written by session-store.ts:
+  //   YYYY-MM-DD-chat-archive-<sessionSlug>.md
+  /-chat-archive-/,
+  // Meeting transcripts written by recall capture:
+  //   YYYY-MM-DD-zoom-recall-<id>.md
+  //   YYYY-MM-DD-meet-recall-<id>.md
+  //   YYYY-MM-DD-teams-recall-<id>.md
+  /-(?:zoom|meet|teams|recall)-recall-/,
+  // Cron run logs (append-only ndjson would normally be skipped by the
+  // .md filter, but defensive):
+  /\.jsonl$/,
+];
+
+function shouldSkipForIndex(filename: string): boolean {
+  return INDEXER_FILENAME_SKIP_PATTERNS.some((re) => re.test(filename));
+}
+
 function walkMarkdown(dir: string): string[] {
   if (!existsSync(dir)) return [];
   const out: string[] = [];
@@ -71,7 +106,7 @@ function walkMarkdown(dir: string): string[] {
     const full = path.join(dir, entry.name);
     if (entry.isDirectory()) {
       out.push(...walkMarkdown(full));
-    } else if (entry.isFile() && entry.name.endsWith('.md')) {
+    } else if (entry.isFile() && entry.name.endsWith('.md') && !shouldSkipForIndex(entry.name)) {
       out.push(full);
     }
   }

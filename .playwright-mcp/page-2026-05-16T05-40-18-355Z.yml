@@ -1,0 +1,160 @@
+- generic [ref=e2]:
+  - banner [ref=e3]:
+    - generic [ref=e5]:
+      - generic [ref=e6]: Clementine
+      - generic [ref=e7]: v0.2.1 · console
+    - generic [ref=e8]:
+      - generic [ref=e9]:
+        - text: RUNS ·
+        - emphasis [ref=e10]: —
+      - generic [ref=e11]:
+        - text: MEM ·
+        - emphasis [ref=e12]: —
+      - generic [ref=e13]:
+        - text: APPRV ·
+        - emphasis [ref=e14]: —
+      - generic [ref=e15]:
+        - text: MODE ·
+        - emphasis [ref=e16]: —
+      - generic [ref=e19]: ONLINE
+      - button "Toggle light/dark mode" [ref=e20] [cursor=pointer]:
+        - generic [ref=e21]: ☀
+  - navigation "Console sections" [ref=e22]:
+    - button "01 Home" [ref=e23] [cursor=pointer]:
+      - generic [ref=e24]: "01"
+      - generic [ref=e25]: Home
+    - button "02 Activity" [ref=e26] [cursor=pointer]:
+      - generic [ref=e27]: "02"
+      - generic [ref=e28]: Activity
+    - button "03 Memory" [ref=e29] [cursor=pointer]:
+      - generic [ref=e30]: "03"
+      - generic [ref=e31]: Memory
+    - button "04 Context" [ref=e32] [cursor=pointer]:
+      - generic [ref=e33]: "04"
+      - generic [ref=e34]: Context
+    - button "05 Workflows" [ref=e35] [cursor=pointer]:
+      - generic [ref=e36]: "05"
+      - generic [ref=e37]: Workflows
+    - button "06 Tools" [ref=e38] [cursor=pointer]:
+      - generic [ref=e39]: "06"
+      - generic [ref=e40]: Tools
+    - button "07 Projects" [ref=e41] [cursor=pointer]:
+      - generic [ref=e42]: "07"
+      - generic [ref=e43]: Projects
+    - button "08 Skills" [ref=e44] [cursor=pointer]:
+      - generic [ref=e45]: "08"
+      - generic [ref=e46]: Skills
+    - button "09 Integrations" [ref=e47] [cursor=pointer]:
+      - generic [ref=e48]: "09"
+      - generic [ref=e49]: Integrations
+    - button "10 Settings" [ref=e50] [cursor=pointer]:
+      - generic [ref=e51]: "10"
+      - generic [ref=e52]: Settings
+    - generic "Live status" [ref=e53]:
+      - generic [ref=e54]:
+        - generic [ref=e55]:
+          - generic [ref=e56]: NOW
+          - generic [ref=e57]: —
+        - generic [ref=e58]:
+          - generic [ref=e61]: idle
+          - generic [ref=e62]: —
+      - generic [ref=e63]:
+        - generic [ref=e64]:
+          - generic [ref=e65]: ACTIVE GOAL
+          - generic [ref=e66]: 0/0
+        - generic [ref=e67]:
+          - generic [ref=e68]: —
+          - generic [ref=e70]: —
+      - generic [ref=e71]:
+        - generic [ref=e72]:
+          - generic [ref=e73]: CLEMENTINE LIVE
+          - generic [ref=e74]: STANDBY
+        - generic [ref=e75]:
+          - button "Toggle voice" [ref=e76] [cursor=pointer]
+          - generic [ref=e79]:
+            - generic [ref=e80]: tap orb to talk
+            - generic [ref=e81]: electron only
+      - generic [ref=e82]:
+        - generic [ref=e83]:
+          - generic [ref=e84]: RECENT
+          - generic [ref=e85]: "6"
+        - generic [ref=e86]:
+          - generic [ref=e87]:
+            - generic [ref=e88]: 10:39 PM
+            - generic [ref=e89]: ✓ execution_list
+          - generic [ref=e90]:
+            - generic [ref=e91]: 10:39 PM
+            - generic [ref=e92]: ✓ goal_list
+          - generic [ref=e93]:
+            - generic [ref=e94]: 10:39 PM
+            - generic [ref=e95]: ✓ execution_list
+          - generic [ref=e96]:
+            - generic [ref=e97]: 10:39 PM
+            - generic [ref=e98]: ✓ goal_list
+          - generic [ref=e99]:
+            - generic [ref=e100]: 10:39 PM
+            - generic [ref=e101]: ✓ execution_list
+          - generic [ref=e102]:
+            - generic [ref=e103]: 10:39 PM
+            - generic [ref=e104]: ✓ goal_list
+      - generic [ref=e105]:
+        - generic [ref=e106]:
+          - generic [ref=e107]: HEALTH
+          - generic [ref=e108]: —
+        - generic [ref=e109]:
+          - generic [ref=e112]: daemon
+          - generic [ref=e115]: memory.db
+          - generic [ref=e118]: mcp
+          - generic [ref=e121]: composio
+  - main [ref=e122]:
+    - generic [ref=e123]:
+      - generic [ref=e124]: PANEL · 01 · HOME
+      - generic [ref=e125]:
+        - generic [ref=e126]:
+          - generic [ref=e127]:
+            - heading "Hello." [level=2] [ref=e128]
+            - paragraph [ref=e129]: Loading status…
+          - generic [ref=e132]: Reading the room…
+        - generic [ref=e133]:
+          - generic [ref=e134]:
+            - generic [ref=e135]:
+              - generic [ref=e136]:
+                - generic [ref=e137]: NEEDS YOU
+                - emphasis [ref=e138]: —
+              - generic [ref=e140]: — checking approvals —
+            - generic [ref=e141]:
+              - generic [ref=e142]:
+                - generic [ref=e143]: WORKING NOW
+                - emphasis [ref=e144]: —
+              - generic [ref=e147]: Finding active work…
+              - generic [ref=e149]: — no active workers yet —
+            - button "Activate Clementine Live" [ref=e150] [cursor=pointer]:
+              - generic [ref=e151]:
+                - generic [ref=e152]: CLEMENTINE LIVE
+                - generic [ref=e153]: STANDBY
+              - generic [ref=e154]:
+                - button "Start live voice" [ref=e155]
+                - generic [ref=e165]:
+                  - generic [ref=e166]: Tap to talk
+                  - generic [ref=e167]: or say "hey Clementine" (coming soon)
+          - generic [ref=e169]:
+            - generic [ref=e170]:
+              - generic [ref=e171]: CHAT DOCK
+              - generic [ref=e172]: local session
+            - generic [ref=e174]:
+              - generic [ref=e175]: Instant message Clementine.
+              - generic [ref=e176]: "Try a quick prompt to get started:"
+              - generic [ref=e177]:
+                - button "what's on my plate today" [ref=e178] [cursor=pointer]
+                - button "stale Salesforce accounts" [ref=e179] [cursor=pointer]
+                - button "recap yesterday" [ref=e180] [cursor=pointer]
+            - generic [ref=e181]:
+              - textbox "message Clementine…" [ref=e182]
+              - button "SEND ↵" [ref=e183] [cursor=pointer]
+  - contentinfo [ref=e184]:
+    - generic [ref=e185]: poll · 2s
+    - generic [ref=e186]:
+      - text: last ·
+      - emphasis [ref=e187]: —
+    - generic [ref=e188]: v0.2.1
+    - generic [ref=e189]: ⌘K · coming soon
