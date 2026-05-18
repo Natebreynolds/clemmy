@@ -15,13 +15,17 @@ function parseEnvFile(envPath: string): Record<string, string> {
   if (!existsSync(envPath)) return {};
 
   const result: Record<string, string> = {};
-  for (const line of readFileSync(envPath, 'utf-8').split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#')) continue;
-    const eqIndex = trimmed.indexOf('=');
+  for (const rawLine of readFileSync(envPath, 'utf-8').split('\n')) {
+    // Preserve trailing whitespace on values — some folder names
+    // (e.g. ~/legallady.ai live ) carry significant trailing
+    // spaces. Strip only leading whitespace and trailing \r so
+    // comments and key-trim still work.
+    const line = rawLine.replace(/^\s+|\r+$/g, '');
+    if (!line || line.startsWith('#')) continue;
+    const eqIndex = line.indexOf('=');
     if (eqIndex === -1) continue;
-    const key = trimmed.slice(0, eqIndex);
-    let value = trimmed.slice(eqIndex + 1);
+    const key = line.slice(0, eqIndex).trim();
+    let value = line.slice(eqIndex + 1);
     if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
       value = value.slice(1, -1);
     }

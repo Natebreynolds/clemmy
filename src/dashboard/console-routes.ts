@@ -1202,19 +1202,18 @@ export function registerConsoleRoutes(
   // turn, no daemon restart.
 
   function writeWorkspaceDirs(dirs: string[]): void {
-    const value = dirs
-      .map((d) => d.trim())
-      .filter(Boolean)
-      .join(',');
+    // No trim — folder names with significant trailing whitespace
+    // (e.g. ~/legallady.ai live ) must survive a round-trip through
+    // the .env. The downstream getWorkspaceDirs() resolver is
+    // whitespace-tolerant: it tries the entry as-written first, then
+    // trimmed, so CSV entries with " "-padding still work.
+    const value = dirs.filter((d) => d.length > 0).join(',');
     updateEnvKey('WORKSPACE_DIRS', value);
   }
 
   function readConfiguredWorkspaceDirs(): string[] {
     const env = readBaseEnv();
-    return (env.WORKSPACE_DIRS ?? '')
-      .split(',')
-      .map((entry) => entry.trim())
-      .filter(Boolean);
+    return (env.WORKSPACE_DIRS ?? '').split(',').filter((entry) => entry.length > 0);
   }
 
   app.post('/api/console/projects/workspace', (req, res) => {

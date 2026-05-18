@@ -274,12 +274,18 @@ export function readBaseEnv(): Record<string, string> {
   if (!existsSync(envPath)) return {};
 
   const result: Record<string, string> = {};
-  for (const line of readFileSync(envPath, 'utf-8').split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#')) continue;
-    const eqIndex = trimmed.indexOf('=');
+  for (const rawLine of readFileSync(envPath, 'utf-8').split('\n')) {
+    // Strip leading whitespace + trailing \r only — DO NOT strip
+    // trailing whitespace on the value. Some folder names have
+    // significant trailing spaces (e.g. ~/legallady.ai live ) and
+    // the workspace list breaks if we collapse them silently.
+    const line = rawLine.replace(/^\s+|\r+$/g, '');
+    if (!line || line.startsWith('#')) continue;
+    const eqIndex = line.indexOf('=');
     if (eqIndex === -1) continue;
-    result[trimmed.slice(0, eqIndex)] = trimmed.slice(eqIndex + 1);
+    const key = line.slice(0, eqIndex).trim();
+    const value = line.slice(eqIndex + 1);
+    result[key] = value;
   }
   return result;
 }
@@ -308,22 +314,41 @@ export function getWorkspaceDirs(): string[] {
   const seen = new Set<string>();
   const dirs: string[] = [];
   const env = readBaseEnv();
-  const configuredDirs = (env.WORKSPACE_DIRS ?? '')
+  // Split but DON'T pre-trim — some folder names have significant
+  // trailing whitespace (e.g. ~/legallady.ai live ). We can't tell
+  // from the CSV whether " /foo" is "user added spaces around the
+  // comma" or "/foo has a leading space in its real name", so the
+  // resolver below tries both forms.
+  const configuredEntries = (env.WORKSPACE_DIRS ?? '')
     .split(',')
-    .map((entry) => entry.trim())
-    .filter(Boolean);
+    .filter((entry) => entry.length > 0);
 
-  const add = (dir: string): void => {
-    const resolved = path.resolve(dir);
-    if (seen.has(resolved) || !existsSync(resolved) || !statSync(resolved).isDirectory()) return;
-    seen.add(resolved);
-    dirs.push(resolved);
+  const add = (raw: string): void => {
+    // Try as-written first (preserves trailing whitespace in folder
+    // names), then fall back to trimmed (handles the common
+    // ", "-separated CSV pattern). Stop at the first one that exists
+    // on disk so we don't double-register the same folder.
+    const candidates = raw !== raw.trim() ? [raw, raw.trim()] : [raw];
+    for (const candidate of candidates) {
+      if (!candidate) continue;
+      const expanded = candidate.startsWith('~')
+        ? candidate.replace('~', os.homedir())
+        : candidate;
+      const resolved = path.resolve(expanded);
+      if (seen.has(resolved)) return;
+      try {
+        if (!existsSync(resolved) || !statSync(resolved).isDirectory()) continue;
+      } catch {
+        continue;
+      }
+      seen.add(resolved);
+      dirs.push(resolved);
+      return;
+    }
   };
 
-  if (configuredDirs.length > 0) {
-    for (const dir of configuredDirs) {
-      add(dir.startsWith('~') ? dir.replace('~', os.homedir()) : dir);
-    }
+  if (configuredEntries.length > 0) {
+    for (const dir of configuredEntries) add(dir);
     return dirs;
   }
 
