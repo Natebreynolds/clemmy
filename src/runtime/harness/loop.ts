@@ -286,10 +286,23 @@ export async function runConversation(
     if (decision.done) {
       // Render priority on the chat surface: prefer `reply` (the
       // natural-language message intended for the user) over `summary`
-      // (an internal log entry). Earlier behavior used summary as the
-      // user-visible text, which produced "Responded to Nate's greeting
-      // directly with no handoff." style META-descriptions in the chat
-      // bubble. The summary stays in the event for telemetry.
+      // (an internal log entry).
+      //
+      // When the model marks the turn complete (done:true,
+      // nextAction:completed) but provides NO reply, the previous
+      // fallback leaked the META summary into the bubble — which the
+      // user reads as if it were the bot's answer, e.g. "Drafted a
+      // workflow and surfaced two decisions" instead of THE workflow
+      // and THE decisions. Make this failure VISIBLE: emit an obvious
+      // "model produced no user-facing reply" message so the bug is
+      // diagnosable instead of masked by plausible-looking META text.
+      const hasReply = decision.reply && decision.reply.trim();
+      const isCompletedAction = decision.nextAction === 'completed';
+      const userVisibleSummary = hasReply
+        ? decision.reply!
+        : isCompletedAction
+          ? `(The model marked the turn complete without producing a user-facing reply. This is a bug. Internal log: ${decision.summary})`
+          : decision.summary;
       safeAppend({
         sessionId: options.sessionId,
         turn: turnResult.turn,
@@ -297,9 +310,10 @@ export async function runConversation(
         type: 'conversation_completed',
         data: {
           steps: stepIndex,
-          summary: decision.reply && decision.reply.trim() ? decision.reply : decision.summary,
+          summary: userVisibleSummary,
           internalSummary: decision.summary,
           reply: decision.reply ?? null,
+          missingReply: isCompletedAction && !hasReply ? true : undefined,
         },
       });
       return {

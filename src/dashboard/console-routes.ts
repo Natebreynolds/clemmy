@@ -3,6 +3,7 @@ import * as fs from 'node:fs';
 import { existsSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { randomBytes } from 'node:crypto';
 import matter from 'gray-matter';
 import { renderConsoleHtml } from './console.js';
@@ -1764,11 +1765,29 @@ export function registerConsoleRoutes(
   app.get('/api/console/build-info', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
-      const candidates = [
-        path.resolve(process.cwd(), 'package.json'),
-        path.resolve(process.cwd(), '..', '..', 'package.json'),
-        path.resolve((process as NodeJS.Process & { resourcesPath?: string }).resourcesPath ?? '', 'daemon', 'package.json'),
-      ];
+      // Find the daemon's own package.json. The dev tree path
+      // (`process.cwd()/package.json`) only works when launched via
+      // `npm run dev`. The installed app spawns the daemon as a Node
+      // child whose cwd is set by Electron and whose process.resourcesPath
+      // is undefined — so we walk UP from this module's own __dirname
+      // looking for the first package.json with name === 'clemmy'. This
+      // is the same primitive Node uses for require.resolve and survives
+      // any spawn cwd / packaging layout.
+      const moduleDir = path.dirname(fileURLToPath(import.meta.url));
+      const candidates: string[] = [];
+      let walk = moduleDir;
+      for (let i = 0; i < 8; i += 1) {
+        candidates.push(path.join(walk, 'package.json'));
+        const parent = path.dirname(walk);
+        if (parent === walk) break;
+        walk = parent;
+      }
+      // Keep the legacy candidates as a fallback for dev / odd layouts.
+      candidates.push(path.resolve(process.cwd(), 'package.json'));
+      candidates.push(path.resolve(process.cwd(), '..', '..', 'package.json'));
+      const resourcesPath = (process as NodeJS.Process & { resourcesPath?: string }).resourcesPath;
+      if (resourcesPath) candidates.push(path.resolve(resourcesPath, 'daemon', 'package.json'));
+
       let version: string | undefined;
       for (const candidate of candidates) {
         if (!fs.existsSync(candidate)) continue;

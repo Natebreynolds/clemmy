@@ -618,8 +618,12 @@ export function applyEventToState(event: EventRow, state: DisplayState): void {
       return;
     }
     case 'conversation_step': {
-      const decision = (data.decision ?? null) as { summary?: string } | null;
-      if (decision?.summary) state.summary = decision.summary;
+      const decision = (data.decision ?? null) as { summary?: string; reply?: string | null } | null;
+      // Prefer reply (user-facing text) over summary (META log). Without
+      // this, a step's META summary leaks into state.summary and survives
+      // even when conversation_completed later carries a real reply.
+      const stepText = decision?.reply && decision.reply.trim() ? decision.reply : decision?.summary;
+      if (stepText) state.summary = stepText;
       const step = data.step ? `step ${String(data.step)}` : 'step';
       state.status = step;
       return;
@@ -657,7 +661,16 @@ export function applyEventToState(event: EventRow, state: DisplayState): void {
       return;
     }
     case 'conversation_completed': {
-      const summary = data.summary ? String(data.summary) : state.summary;
+      // Render priority: explicit `reply` (the user-facing message) over
+      // `summary` (which loop.ts now also stuffs the reply into when
+      // present, but defense-in-depth — if a producer somewhere forgets
+      // the fallback, reading reply first still wins).
+      const reply = typeof data.reply === 'string' && data.reply.trim() ? data.reply : '';
+      const summary = reply
+        ? reply
+        : data.summary
+          ? String(data.summary)
+          : state.summary;
       if (summary) state.summary = summary;
       const reason = data.reason ? String(data.reason) : '';
       state.status = reason === 'abandoned_by_orchestrator' ? 'abandoned' : 'complete';
