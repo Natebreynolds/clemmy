@@ -1,2 +1,0 @@
-[  274002ms] [ERROR] Failed to load resource: the server responded with a status of 500 (Internal Server Error) @ http://localhost:8520/api/console/home/chat?token=0299773f-bdb9-4c:0
-[  274003ms] [ERROR] Failed to load resource: the server responded with a status of 500 (Internal Server Error) @ http://localhost:8520/api/console/home/chat?token=0299773f-bdb9-4c:0

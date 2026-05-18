@@ -41,3 +41,15 @@ coverage/
 
 # TypeScript build info
 *.tsbuildinfo
+
+# Debug / scratch artifacts
+.playwright-mcp/
+.mib2c-updaterc
+install-v040.sh
+hot-patch.sh
+patcheck.tmp
+cvelist
+cvelist-our
+cvelist.diff
+console-home.png
+
