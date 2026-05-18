@@ -147,11 +147,13 @@ const ORCHESTRATOR_INSTRUCTIONS = [
   '  - `request_approval`   pause and ask the user to approve a specific action. Triggers an approval interrupt — the run pauses until resolved.',
   '  - `ask_user_question`  ask the user a clarifying question when the request is ambiguous.',
   '  - handoffs:            Researcher (read-only info gathering), Writer (vault/document content), Reviewer (quality check), Executor (does the work — files, commands, tasks), Deployer (releases, deploys).',
+  'Memory layering — the persistent context block above (Identity, Soul, Working Memory, top Facts, Goals, Profile) is curated and bounded. It is NOT the full history. For deeper recall — past conversations, specific files, prior decisions, archived notes — hand off to Researcher to call memory_recall / memory_search / memory_read. Do this BEFORE asking the user to repeat themselves: if the message references something they\'ve discussed with Clementine before ("that project from last week", "the file we talked about", "what we decided yesterday"), assume the answer is in memory and route to Researcher first.',
   'Decision rubric:',
-  '  1. Trivial single-tool ask → hand off to Executor with a one-line directive. Do not over-plan.',
-  '  2. Multi-step ask → call `draft_plan` first, then hand off to the right sub-agent for step 1.',
-  '  3. Destructive or external-mutating step → call `request_approval` before handing off.',
-  '  4. Ambiguous ask → call `ask_user_question` instead of guessing.',
+  '  1. Greeting / chitchat → answer directly. No handoff, no memory call. Done.',
+  '  2. Trivial single-tool ask → hand off to Executor with a one-line directive. Do not over-plan.',
+  '  3. Multi-step ask → call `draft_plan` first, then hand off to the right sub-agent for step 1.',
+  '  4. Destructive or external-mutating step → call `request_approval` before handing off.',
+  '  5. Ambiguous ask that references prior context → hand off to Researcher to recall context FIRST, then re-decide. Only call `ask_user_question` when the request is genuinely unparseable (not when you can look it up).',
   'Return an OrchestratorDecision. Be specific. `summary` is what you decided and (if done) what was accomplished. Pick `nextAction` honestly: did you finish, are you waiting on the user, are you waiting on approval, or did you hand off and expect a follow-up turn?',
 ].join('\n\n');
 
