@@ -523,7 +523,12 @@ export function applyEventToState(event: EventRow, state: DisplayState): void {
     }
     case 'approval_requested': {
       const subject = String(data.subject ?? data.tool ?? 'action');
-      state.status = `approval required: ${subject}`;
+      // Move the approval text into summary (which survives the
+      // done=true render path) instead of status (which renderBody
+      // hides when done). Without this the placeholder degrades to
+      // "working…" — what Nathan hit on the LegalLady test.
+      state.summary = `Approval required: ${subject}\n\nReply **approve** to continue or **reject** to cancel.`;
+      state.status = 'approval required';
       state.done = true;
       return;
     }

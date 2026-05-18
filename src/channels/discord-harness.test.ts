@@ -68,22 +68,23 @@ test('conversation_step updates the summary and step counter', () => {
   assert.equal(s.done, false);
 });
 
-test('approval_requested surfaces the subject and marks the display done', () => {
-  // Marking done=true lets the live-edit loop settle on the
-  // "approval required" reply so the bot stops animating while the
-  // user is being asked. The session itself stays paused server-side
-  // — the next approve/reject message resumes it via
-  // runDiscordHarnessResume.
+test('approval_requested surfaces the subject in summary and marks the display done', () => {
+  // The summary (not status) carries the approval text because
+  // renderBody hides status when done=true. Putting the message in
+  // summary is what makes the Discord reply settle on
+  // "Approval required: ..." instead of degrading to "working…".
   const s = freshState();
   applyEventToState(event('approval_requested', { subject: 'deploy to prod', tool: 'request_approval' }), s);
-  assert.equal(s.status, 'approval required: deploy to prod');
+  assert.ok(s.summary.startsWith('Approval required: deploy to prod'));
+  assert.ok(s.summary.includes('approve'));
+  assert.equal(s.status, 'approval required');
   assert.equal(s.done, true);
 });
 
 test('approval_requested falls back to tool name when no subject', () => {
   const s = freshState();
   applyEventToState(event('approval_requested', { tool: 'cx_zendesk_create_ticket' }), s);
-  assert.equal(s.status, 'approval required: cx_zendesk_create_ticket');
+  assert.ok(s.summary.startsWith('Approval required: cx_zendesk_create_ticket'));
 });
 
 test('awaiting_user_input promotes the question to the summary and marks done', () => {
