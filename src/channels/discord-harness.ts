@@ -251,6 +251,30 @@ export function applyEventToState(event: EventRow, state: DisplayState): void {
       state.status = `→ ${to}`;
       return;
     }
+    case 'turn_ended': {
+      // Each agent turn's output lands here. For sub-agents
+      // (Researcher / Writer / Executor / etc.) that don't define an
+      // outputType, `output` is the agent's plain-text reply — which
+      // becomes the final answer when the orchestrator doesn't take
+      // another turn (the "no_structured_output" path in
+      // runConversation). For the Orchestrator itself, `output` is
+      // the OrchestratorDecision JSON — extract `.summary` so we
+      // surface the human-readable line, not raw JSON.
+      if (event.role === 'system') return;
+      const output = String(data.output ?? '');
+      if (!output) return;
+      try {
+        const parsed = JSON.parse(output);
+        if (parsed && typeof parsed === 'object' && typeof parsed.summary === 'string') {
+          state.summary = parsed.summary;
+          return;
+        }
+      } catch {
+        /* not JSON — fall through */
+      }
+      state.summary = output;
+      return;
+    }
     case 'conversation_step': {
       const decision = (data.decision ?? null) as { summary?: string } | null;
       if (decision?.summary) state.summary = decision.summary;
