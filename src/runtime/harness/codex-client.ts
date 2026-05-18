@@ -101,6 +101,13 @@ async function codexResponsesFetch(
     if (!Array.isArray(parsed.include)) {
       parsed.include = ['reasoning.encrypted_content'];
     }
+    // Codex enforces `store: false`, so it has nothing to look up
+    // for a `previous_response_id` from an earlier turn — the id
+    // refers to a response codex never persisted. Sending it 400s
+    // the second turn of any multi-turn session with no body.
+    // History is already inlined into `input`, so dropping this is
+    // safe and matches what pi-ai's hand-rolled provider does.
+    delete parsed.previous_response_id;
     bodyText = JSON.stringify(parsed);
   } catch {
     // body wasn't JSON — leave it alone
