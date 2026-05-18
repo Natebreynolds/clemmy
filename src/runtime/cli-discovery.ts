@@ -201,14 +201,84 @@ function headLines(text: string, max = 3, perLine = 200): string | undefined {
 }
 
 /**
+ * macOS Command Line Tools stubs that live at /usr/bin/ on every
+ * Mac. Invoking ANY of them without Xcode / CLT installed pops a
+ * system-level installer GUI ("The X command requires the command
+ * line developer tools. Install?"). That dialog cannot be suppressed
+ * from our side — the stub binary triggers it via private
+ * xcselect_invoke_xcrun.
+ *
+ * Probing these on daemon-boot warmup makes Clementine spam the
+ * dialog on every fresh open, which is exactly what users saw with
+ * xcscontrol after 0.4.0 shipped.
+ *
+ * Skip them entirely. The agent can still ask for them via
+ * local_cli_probe if it really needs to — but the dashboard warmup
+ * and `local_cli_list` results no longer trigger system prompts.
+ */
+const STUB_BINARIES_THAT_TRIGGER_SYSTEM_INSTALLER = new Set<string>([
+  'xcscontrol',
+  'xcrun',
+  'xcodebuild',
+  'xcode-select',
+  'xcs',
+  'xcsdiagnose',
+  'xed',
+  'xcsbuildd',
+  'xcstool',
+  'swift',
+  'swiftc',
+  'metal',
+  'metallib',
+  'clang',
+  'clang++',
+  'cc',
+  'c++',
+  'gcc',
+  'g++',
+  'make',
+  'lldb',
+  'lldb-mi',
+  'dsymutil',
+  'ld',
+  'as',
+  'nm',
+  'otool',
+  'libtool',
+  'install_name_tool',
+  'ranlib',
+]);
+
+function shouldSkipProbe(command: string, resolved: string): boolean {
+  if (!STUB_BINARIES_THAT_TRIGGER_SYSTEM_INSTALLER.has(command)) return false;
+  // Only skip when the resolved path is the system stub location.
+  // If the user has a brew/non-system override (e.g. /opt/homebrew/bin/swift
+  // via swiftly), the override is real and probing it is fine.
+  return resolved.startsWith('/usr/bin/') || resolved.startsWith('/Library/Developer/');
+}
+
+/**
  * Probe a single command. Returns null if the binary isn't on PATH.
  * Otherwise returns a CliEntry with whatever we learned. Tries
  * --version first, falls back to --help. If both fail the entry comes
  * back with `isLikelyCli: false` so callers can choose to hide it.
+ *
+ * Special case: macOS Command Line Tools stubs (see set above) are
+ * skipped because invoking them triggers a system-level installer
+ * GUI we can't suppress.
  */
 export async function probe(command: string, candidatePath?: string): Promise<CliEntry | null> {
   const resolved = candidatePath ?? whichOnPath(command);
   if (!resolved) return null;
+
+  if (shouldSkipProbe(command, resolved)) {
+    return {
+      command,
+      path: resolved,
+      isLikelyCli: false,
+      probedAt: new Date().toISOString(),
+    };
+  }
 
   const versionOut = await runQuick(command, ['--version']);
   const helpOut = versionOut ? undefined : await runQuick(command, ['--help']);
