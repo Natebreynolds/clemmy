@@ -103,7 +103,14 @@ test('completed run snapshots conversation and emits run_completed', async () =>
   assert.equal(userInputs[0].data.text, 'do the thing');
 });
 
-test('previousResponseId is threaded into opts on the next turn', async () => {
+test('previousResponseId is NOT passed to the SDK (codex requires full history each turn)', async () => {
+  // Codex enforces `store: false`, so the server never persists
+  // responses we could refer back to. Passing previousResponseId
+  // to the SDK opt would flip it into delta-only mode
+  // (ServerConversationTracker), and codex would 400 every
+  // continuation call with "No tool call found for function call
+  // output". Instead the harness inlines the full conversation
+  // history into `items` every turn.
   resetEventLog();
   const sess = HarnessSession.create({ kind: 'chat' });
   const seenOpts: Record<string, unknown>[] = [];
@@ -120,7 +127,6 @@ test('previousResponseId is threaded into opts on the next turn', async () => {
     };
   };
 
-  // Re-mark active between turns so the second turn isn't blocked.
   await runTurn({
     agent: makeAgentStub(),
     sessionId: sess.id,
@@ -128,9 +134,7 @@ test('previousResponseId is threaded into opts on the next turn', async () => {
     makeRunner: makeRunnerStub,
     runRunner,
   });
-  // The session is now "completed". Mark it active for a follow-up.
   const after1 = HarnessSession.load(sess.id)!;
-  // (no public reopen helper yet — drop down to updateSession)
   const { updateSession } = await import('./eventlog.js');
   updateSession(after1.id, { status: 'active' });
 
@@ -143,8 +147,8 @@ test('previousResponseId is threaded into opts on the next turn', async () => {
   });
 
   assert.equal(seenOpts.length, 2);
-  assert.equal(seenOpts[0].previousResponseId, undefined, 'first turn has no prior');
-  assert.equal(seenOpts[1].previousResponseId, 'resp_1', 'second turn passes back resp_1');
+  assert.equal(seenOpts[0].previousResponseId, undefined, 'first turn never sets prior');
+  assert.equal(seenOpts[1].previousResponseId, undefined, 'second turn also never sets prior — full history is inlined into items instead');
 });
 
 test('turn numbers monotonically increment across runs', async () => {

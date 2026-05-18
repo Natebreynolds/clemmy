@@ -446,8 +446,17 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     context: { sessionId: options.sessionId, turn },
     maxTurns: options.maxTurns ?? DEFAULT_MAX_TURNS.orchestrator,
   };
-  const prevResp = session.previousResponseId();
-  if (prevResp) opts.previousResponseId = prevResp;
+  // DO NOT pass previousResponseId to the SDK when using the codex
+  // backend. The SDK uses this flag to opt into a ServerConversationTracker
+  // that only sends DELTAS to the model on each subsequent call —
+  // assuming the server remembers prior items via the response chain.
+  // Codex enforces `store: false`, so the server has no memory of past
+  // responses. The delta-only mode then sends just the latest tool
+  // output to the model, which codex correctly rejects with
+  // "No tool call found for function call output ...".
+  // The full history is already inlined into `items` above
+  // (session.toInputItems() returns everything), so codex sees the
+  // complete conversation on every call without needing server state.
 
   try {
     const run = options.runRunner ?? defaultRunRunner;
