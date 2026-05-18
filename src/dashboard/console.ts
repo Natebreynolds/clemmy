@@ -7177,8 +7177,8 @@ const CONSOLE_JS = `
   // Populate version chips from /api/console/build-info — done once at
   // page load. If the call fails we keep the placeholder dash.
   //
-  // Race fix: the renderUpdaterChip below caches `sub.textContent` into
-  // `sub.dataset.baseLabel` on its first run. If renderUpdaterChip
+  // Race fix: the renderUpdaterChip below caches sub.textContent into
+  // sub.dataset.baseLabel on its first run. If renderUpdaterChip
   // fires before this IIFE resolves, baseLabel sticks at the HTML
   // placeholder "v0.1.0 · console" and every subsequent tick rebuilds
   // the header with that stale prefix — even after install of 0.4.x.
