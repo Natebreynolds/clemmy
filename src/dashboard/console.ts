@@ -12109,7 +12109,7 @@ const CONSOLE_JS = `
       const status = await fetchJSON('/api/composio/status');
       if (!status?.enabled) {
         controlsEl.innerHTML = [
-          '<input type="password" placeholder="Composio API key (sk_…)" data-hub-composio-key />',
+          '<input type="password" placeholder="Composio API key (sk_…)" data-hub-composio-key autocomplete="new-password" data-1p-ignore="true" data-lpignore="true" spellcheck="false" name="api-key-composio-no-autofill" />',
           '<button data-hub-composio-save>SAVE API KEY</button>',
           '<a href="https://platform.composio.dev" target="_blank" rel="noopener" style="font-size:10px;letter-spacing:0.14em;color:var(--fg-3);">get a key →</a>',
         ].join('');
@@ -12655,7 +12655,7 @@ const CONSOLE_JS = `
         .map((region) => '<option value="' + escMem(region) + '"' + (settings.region === region ? ' selected' : '') + '>' + escMem(region) + '</option>')
         .join('');
       controlsEl.innerHTML = [
-        hasKey ? '' : '<input type="password" placeholder="Recall.ai API key" data-hub-recall-key />',
+        hasKey ? '' : '<input type="password" placeholder="Recall.ai API key" data-hub-recall-key autocomplete="new-password" data-1p-ignore="true" data-lpignore="true" spellcheck="false" name="api-key-recall-no-autofill" />',
         hasKey ? '' : '<button data-hub-recall-save-key>SAVE KEY</button>',
         '<a href="' + escMem(data.signupUrl || 'https://www.recall.ai/signup') + '" target="_blank" rel="noopener" style="font-size:10px;letter-spacing:0.14em;color:var(--fg-3);">get Recall.ai →</a>',
         '<select data-hub-recall-region>' + regionOptions + '</select>',
@@ -13671,7 +13671,7 @@ const CONSOLE_JS = `
           credentialDescription(r.name, d) ? '    <div class="cred-desc">' + escMem(credentialDescription(r.name, d)) + '</div>' : '',
           d.setupHint ? '    <div class="cred-hint">' + escMem(d.setupHint) + '</div>' : '',
           '    <div class="cred-set-input-wrap" data-cred-set-wrap="' + escMem(r.name) + '">',
-          '      <input type="password" class="cred-set-input" data-cred-set-input="' + escMem(r.name) + '" placeholder="paste value…" autocomplete="off" />',
+          '      <input type="password" class="cred-set-input" data-cred-set-input="' + escMem(r.name) + '" placeholder="paste value…" autocomplete="new-password" data-1p-ignore="true" data-lpignore="true" spellcheck="false" name="cred-' + escMem(r.name) + '-no-autofill" />',
           '      <div class="cred-set-buttons">',
           '        <button class="cancel" type="button" data-cred-set-cancel="' + escMem(r.name) + '">CANCEL</button>',
           '        <button class="save" type="button" data-cred-set-save="' + escMem(r.name) + '">SAVE</button>',

@@ -73,6 +73,15 @@ const HOME = os.homedir();
 const LOG_DIR = path.join(HOME, '.clementine-next', 'logs', 'desktop');
 const LOG_FILE = path.join(LOG_DIR, 'supervisor.log');
 
+// Disable Chromium's password manager + macOS Passwords AutoFill so the
+// dashboard's API-key inputs don't trigger "Use Passwords?" / Keychain
+// prompts every page load. These must run before app.whenReady.
+app.commandLine.appendSwitch('password-store', 'basic');
+app.commandLine.appendSwitch(
+  'disable-features',
+  'PasswordManagerEnabledForApp,AutofillEnableAccountWalletStorage,AutofillServerCommunication',
+);
+
 let supervisor: DaemonSupervisor | null = null;
 let mainWindow: BrowserWindow | null = null;
 let splashWindow: BrowserWindow | null = null;
