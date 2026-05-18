@@ -28,7 +28,7 @@ test('PlanSchema: accepts a minimal valid plan', () => {
   const plan = PlanSchema.parse({
     objective: 'Add a refresh token handler to the Composio client.',
     steps: [
-      { n: 1, action: 'Read src/integrations/composio/client.ts', rationale: 'Confirm current auth path.' },
+      { n: 1, action: 'Read src/integrations/composio/client.ts', rationale: 'Confirm current auth path.', verification: null },
     ],
     successCriteria: ['The refresh handler retries on 401 once with a fresh token.'],
     risks: [],
@@ -43,7 +43,7 @@ test('PlanSchema: accepts a minimal valid plan', () => {
 test('PlanSchema: rejects empty objective', () => {
   assert.throws(() => PlanSchema.parse({
     objective: '',
-    steps: [{ n: 1, action: 'do thing', rationale: 'why' }],
+    steps: [{ n: 1, action: 'do thing', rationale: 'why', verification: null }],
     successCriteria: ['it works'],
     risks: [],
     estimatedComplexity: 'trivial',
@@ -67,7 +67,7 @@ test('PlanSchema: rejects zero steps', () => {
 test('PlanSchema: rejects bad complexity enum', () => {
   assert.throws(() => PlanSchema.parse({
     objective: 'A real objective.',
-    steps: [{ n: 1, action: 'do thing', rationale: 'why' }],
+    steps: [{ n: 1, action: 'do thing', rationale: 'why', verification: null }],
     successCriteria: ['it works'],
     risks: [],
     estimatedComplexity: 'small',

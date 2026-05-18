@@ -69,7 +69,7 @@ export const PlanSchema = z.object({
       n: z.number().int().min(1),
       action: z.string().min(4).describe('Concrete action — what gets done in this step.'),
       rationale: z.string().min(4).describe('Why this step is necessary right now.'),
-      verification: z.string().optional().describe('How we will know this step actually worked.'),
+      verification: z.string().nullable().describe('How we will know this step actually worked. Use null if no verification check is meaningful for this step.'),
     }),
   ).min(1).max(20).describe('Ordered steps. Group small tasks; do not pad.'),
   successCriteria: z.array(z.string()).min(1).max(6).describe(

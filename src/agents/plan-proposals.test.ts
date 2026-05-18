@@ -39,8 +39,8 @@ function aPlan(overrides = {}) {
   return {
     objective: 'Add a refresh token handler to the Composio client.',
     steps: [
-      { n: 1, action: 'Read src/integrations/composio/client.ts', rationale: 'Confirm current auth path.' },
-      { n: 2, action: 'Add refreshToken handler', rationale: 'Retry on 401.' },
+      { n: 1, action: 'Read src/integrations/composio/client.ts', rationale: 'Confirm current auth path.', verification: null },
+      { n: 2, action: 'Add refreshToken handler', rationale: 'Retry on 401.', verification: null },
     ],
     successCriteria: ['401 responses retry once with a fresh token.'],
     risks: [],

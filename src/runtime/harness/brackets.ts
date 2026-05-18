@@ -250,8 +250,19 @@ export const DEFAULT_MAX_TURNS: Readonly<Record<string, number>> = Object.freeze
   session: 60,
 });
 
-/** Default per-turn tool-call cap. */
-export const DEFAULT_TOOL_CALLS_PER_TURN = 8;
+/**
+ * Default per-turn tool-call cap.
+ *
+ * 16 leaves real headroom for legitimate research turns — a
+ * Researcher exploring a project routinely needs workspace_roots +
+ * workspace_list + memory_recall + memory_search + a few list_files
+ * + a few read_file, easily 10-12 calls before producing an answer.
+ * The previous value of 8 killed a real session mid-exploration. If
+ * the model is genuinely running away, maxTurns and the
+ * conversation-level wall-clock catch it; we don't need an
+ * aggressive per-turn count limit to do that.
+ */
+export const DEFAULT_TOOL_CALLS_PER_TURN = 16;
 
 /** Default token budget. 200k input / 80k output mirrors the plan. */
 export const DEFAULT_TOKEN_BUDGET: Readonly<TokenBudgetCounts> = Object.freeze({
