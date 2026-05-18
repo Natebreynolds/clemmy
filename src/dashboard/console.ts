@@ -8115,6 +8115,10 @@ const CONSOLE_JS = `
         } else if (action === 'send-summary') {
           const id = btn.getAttribute('data-id');
           if (!id) return;
+          // Give the user feedback while we wait for the daemon.
+          const originalLabel = btn.textContent;
+          btn.disabled = true;
+          btn.textContent = 'SENDING…';
           try {
             const fresh = await fetchJSON('/api/console/meetings/recall/' + encodeURIComponent(id));
             const a = fresh.analysis;
@@ -8125,13 +8129,34 @@ const CONSOLE_JS = `
                 parts.push('', 'Action items:');
                 for (const x of a.actionItems) parts.push('- ' + (x.owner ? x.owner + ': ' : '') + x.text);
               }
+              if (Array.isArray(a.decisions) && a.decisions.length > 0) {
+                parts.push('', 'Decisions:');
+                for (const d of a.decisions) parts.push('- ' + (typeof d === 'string' ? d : (d.text || JSON.stringify(d))));
+              }
               msg = parts.join('\\n');
             } else {
               msg = 'Captured meeting transcript is at ' + (fresh.record?.artifactPath || '(path unknown)') + '. Read it and give me the summary + action items.';
             }
-            await sendHomeChat(msg);
+            // SWITCH TO HOME PANEL FIRST. Without this the message lands
+            // on the home chat thread (which exists in the DOM but is
+            // hidden) and the user — still looking at Memory > Captured
+            // Meetings — sees no feedback and thinks the button broke.
+            // Was the exact bug reported on the 0.4.x Captured Meetings
+            // detail pane.
+            try { switchPanel('home'); } catch (_) { /* not critical */ }
+            // Tiny delay so the panel transition lands BEFORE the
+            // appendChatTurn mutates the now-visible thread (avoids a
+            // flash of "still on Memory" with no visible chat update).
+            await new Promise((resolve) => setTimeout(resolve, 100));
+            const result = await sendHomeChat(msg);
+            if (result && result.ok === false) {
+              alert('Chat send failed: ' + (result.text || 'unknown reason'));
+            }
           } catch (err) {
             alert('Send summary failed: ' + (err && err.message ? err.message : String(err)));
+          } finally {
+            btn.disabled = false;
+            btn.textContent = originalLabel;
           }
         }
       });

@@ -143,12 +143,27 @@ function extractTranscript(event: RecallRealtimeEvent): {
   const text = (directText ?? words.map((word) => word.text).filter(Boolean).join(' ')).replace(/\s+/g, ' ').trim();
   if (!text) return null;
 
+  // Recall.ai's transcript payload shape varies across SDK versions
+  // and providers. Names can land under any of:
+  //   participant.name / .display_name / .full_name
+  //   speaker.name
+  //   participant_name (flat)
+  // Reaching for all known variants instead of just participant.name
+  // fixes "speaker shown as Speaker 0/1/2 even though the meeting has
+  // real attendees with names" — observed on 0.4.x Zoom captures.
   const participantName = getNestedString(data, ['participant', 'name'])
-    ?? getNestedString(data, ['data', 'participant', 'name']);
+    ?? getNestedString(data, ['participant', 'display_name'])
+    ?? getNestedString(data, ['participant', 'full_name'])
+    ?? getNestedString(data, ['speaker', 'name'])
+    ?? getNestedString(data, ['speaker', 'display_name'])
+    ?? getNestedString(data, ['participant_name'])
+    ?? getNestedString(data, ['data', 'participant', 'name'])
+    ?? getNestedString(data, ['data', 'participant', 'display_name'])
+    ?? getNestedString(data, ['data', 'speaker', 'name'])
+    ?? getNestedString(data, ['data', 'participant_name']);
+  const wordSpeaker = words.find((word) => word.speaker !== undefined)?.speaker;
   const speaker = participantName
-    ?? (words.find((word) => word.speaker !== undefined)?.speaker !== undefined
-      ? `Speaker ${words.find((word) => word.speaker !== undefined)?.speaker}`
-      : undefined);
+    ?? (wordSpeaker !== undefined ? `Speaker ${wordSpeaker}` : undefined);
   const recordingId = getNestedString(data, ['recording_id'])
     ?? getNestedString(data, ['recordingId'])
     ?? getNestedString(data, ['data', 'recording_id']);
