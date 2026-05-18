@@ -398,6 +398,20 @@ async function runDiscordHarnessResume(opts: {
   transport: DiscordHarnessTransport;
 }): Promise<void> {
   const { channelId, decision, transport } = opts;
+
+  // Configure the codex bridge BEFORE driving the SDK runner. The
+  // resume path can be the first thing the daemon does after a
+  // restart (paused session lives in SQLite, "approve" arrives via
+  // DM polling) — without this, getDefaultModelProvider() returns
+  // the SDK's built-in default that requires OPENAI_API_KEY, and
+  // the post-approval model call fails with
+  // "Missing credentials. Please pass an `apiKey`...".
+  const auth = await configureHarnessRuntime();
+  if (!auth.ok) {
+    await transport.sendError(`Cannot resume: ${auth.reason}`);
+    return;
+  }
+
   const entry = channelSessions.get(channelId);
   if (!entry) {
     await transport.sendError('No paused session to resume.');
