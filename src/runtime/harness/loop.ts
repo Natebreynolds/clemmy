@@ -613,23 +613,33 @@ function previewOutput(out: unknown): string {
 
 // ---------- default Runner adapter ----------
 
+// The codex backend (the OAuth-bridged endpoint used by the harness)
+// enforces stream:true. Non-streaming requests 400 with
+// "Stream must be set to true". Both RunResult and StreamedRunResult
+// expose identical `history` / `lastResponseId` / `finalOutput` /
+// `interruptions` / `state` getters via RunResultBase, so streaming
+// is a pure superset: drain the stream, then read the same fields.
 const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
-  // Cast through unknown because the SDK's overloads make TS unhappy
-  // about a generic-erased agent type. The adapter sees only the
-  // result fields we care about.
-  type RunMethod = (
-    a: typeof agent,
-    i: typeof items,
-    o: typeof opts,
-  ) => Promise<{
+  type StreamedResultLike = {
     history: AgentInputItem[];
     lastResponseId: string | undefined;
     finalOutput: unknown;
     interruptions?: unknown[];
     state?: { toString(): string };
-  }>;
+    completed: Promise<void>;
+  };
+  type RunMethod = (
+    a: typeof agent,
+    i: typeof items,
+    o: typeof opts,
+  ) => Promise<StreamedResultLike>;
   const run = runner.run.bind(runner) as unknown as RunMethod;
-  const result = await run(agent, items, opts);
+  const result = await run(agent, items, { ...opts, stream: true });
+  // StreamedRunResult exposes a `completed` promise that resolves
+  // once the SSE stream has been fully drained and the state machine
+  // is settled. Without awaiting it, finalOutput/interruptions read
+  // stale (undefined) values and the SDK logs a warning.
+  await result.completed;
   const hasInterruptions = Array.isArray(result.interruptions) && result.interruptions.length > 0;
   return {
     history: result.history,
