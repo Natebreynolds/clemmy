@@ -37,20 +37,45 @@ let keytarPromise: Promise<KeytarModule | null> | null = null;
 async function loadKeytar(): Promise<KeytarModule | null> {
   if (keytarPromise) return keytarPromise;
   keytarPromise = (async () => {
+    // First: try the normal resolution path. This works in dev (root
+    // node_modules has keytar) and in any environment where keytar is
+    // a sibling of the running module.
     try {
-      // Dynamic import via a runtime-computed specifier so TypeScript
-      // doesn't try to type-resolve it. The Electron build adds keytar
-      // as a real dependency; daemon-only / CLI builds resolve to null.
       const specifier = 'keytar';
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const mod = (await import(/* @vite-ignore */ specifier as string)) as unknown as KeytarModule | { default: KeytarModule };
       return ('getPassword' in (mod as object))
         ? (mod as KeytarModule)
         : (mod as { default: KeytarModule }).default;
-    } catch (err) {
-      logger.debug({ err: err instanceof Error ? err.message : err }, 'keytar not available — keychain backend disabled');
-      return null;
+    } catch {
+      // Fallthrough — try the Electron app.asar.unpacked location.
     }
+    // Second: in the packaged Electron app, keytar is at
+    //   <resourcesPath>/app.asar.unpacked/node_modules/keytar
+    // The daemon is spawned with CLEMENTINE_RESOURCES_PATH pointing
+    // there (see apps/desktop/src/daemon-supervisor.ts). Resolve via
+    // an explicit path so we don't depend on node's resolution walk.
+    const resourcesPath = process.env.CLEMENTINE_RESOURCES_PATH;
+    if (resourcesPath) {
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const path = require('node:path') as typeof import('node:path');
+        const explicit = path.join(resourcesPath, 'app.asar.unpacked', 'node_modules', 'keytar');
+        // Use require() so node-gyp's binary loads via the .node-style binding path.
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const mod = require(explicit) as KeytarModule | { default: KeytarModule };
+        return ('getPassword' in (mod as object))
+          ? (mod as KeytarModule)
+          : (mod as { default: KeytarModule }).default;
+      } catch (err) {
+        logger.debug(
+          { err: err instanceof Error ? err.message : err, resourcesPath },
+          'keytar present in resourcesPath but could not be required',
+        );
+      }
+    }
+    logger.debug('keytar not available — keychain backend disabled');
+    return null;
   })();
   return keytarPromise;
 }

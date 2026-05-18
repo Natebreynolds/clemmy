@@ -99,6 +99,15 @@ export class DaemonSupervisor {
       ...this.opts.envOverrides,
       WEBHOOK_ENABLED: 'true',
       WEBHOOK_PORT: String(this.chosenPort),
+      // Forward Electron's process.resourcesPath so the daemon can
+      // resolve native modules (keytar) bundled in app.asar.unpacked.
+      // Without this, the daemon's node_modules walk doesn't see the
+      // Electron-bundled keytar and the Keychain backend disables itself
+      // with "keytar not available — install the desktop app to use Keychain"
+      // even though the user IS on the desktop app.
+      ...(typeof (process as NodeJS.Process & { resourcesPath?: string }).resourcesPath === 'string'
+        ? { CLEMENTINE_RESOURCES_PATH: (process as NodeJS.Process & { resourcesPath?: string }).resourcesPath as string }
+        : {}),
     };
     // In a packaged Electron build, process.execPath is the Electron
     // executable itself. To run it as a plain Node.js, we set
