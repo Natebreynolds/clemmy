@@ -10974,7 +10974,7 @@ const CONSOLE_JS = `
           // through runConversationFromResume.
           const subj = (ev.data && (ev.data.subject || ev.data.tool)) || 'action';
           const reason = (ev.data && ev.data.reason) || '';
-          setChatTurnText(turn, 'Approval required: ' + subj + (reason ? '\n\n' + reason : '') + '\n\nReply **approve** to continue or **reject** to cancel.');
+          setChatTurnText(turn, 'Approval required: ' + subj + (reason ? '\\n\\n' + reason : '') + '\\n\\nReply **approve** to continue or **reject** to cancel.');
           setChatTurnStatus(turn, 'awaiting approval');
           finish();
         }
