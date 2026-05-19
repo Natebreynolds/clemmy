@@ -175,6 +175,49 @@ export class CodexResponsesModel implements Model {
 
     if (!res.ok) {
       const detail = await safeReadErrorBody(res);
+      // Persist a 4xx trace so operators can inspect the exact request
+      // that Codex rejected. The codex-native-runtime path has the same
+      // logic (T2.4); the harness path was a gap — without this trace
+      // an error like "No tool output found for function call call_X"
+      // has no diagnosable surface because the request body is not
+      // preserved anywhere else (store:false, stream:true).
+      if (res.status >= 400 && res.status < 500) {
+        try {
+          const { atomicJsonMutate } = await import('../atomic-json.js');
+          const path = await import('node:path');
+          const { BASE_DIR } = await import('../../config.js');
+          const inputArr = Array.isArray(body.input) ? body.input : [];
+          const tracePath = path.join(
+            BASE_DIR,
+            'state',
+            'codex-4xx-trace',
+            `harness-${Date.now()}.json`,
+          );
+          await atomicJsonMutate(
+            tracePath,
+            () => ({
+              ts: new Date().toISOString(),
+              source: 'codex-model',
+              status: res.status,
+              modelId: this.modelId,
+              responseBody: detail?.slice(0, 4096) ?? '',
+              inputItemCount: inputArr.length,
+              inputItemSummary: inputArr.map((it) => {
+                const r = it as Record<string, unknown>;
+                return {
+                  type: r.type ?? r.role ?? 'unknown',
+                  call_id: r.call_id ?? undefined,
+                  name: r.name ?? undefined,
+                };
+              }),
+              requestBody: body,
+            }),
+            {} as Record<string, unknown>,
+          );
+        } catch {
+          // best-effort; never block the error path on a trace write
+        }
+      }
       throw new CodexModelError(
         `Codex /responses returned ${res.status} ${res.statusText}${detail ? ': ' + detail : ''}`,
         res.status,
@@ -231,7 +274,9 @@ interface CodexRequestBody {
   reasoning?: { effort?: string; summary?: string };
 }
 
-function buildCodexRequestBody(modelId: string, request: ModelRequest): CodexRequestBody {
+// Exported so contract tests can assert the wire shape without
+// having to mock fetch + OAuth + SSE for every assertion.
+export function buildCodexRequestBody(modelId: string, request: ModelRequest): CodexRequestBody {
   const tools = serializeTools(request.tools, request.handoffs);
   const body: CodexRequestBody = {
     model: resolveCodexModel(modelId),

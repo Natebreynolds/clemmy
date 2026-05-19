@@ -44,6 +44,118 @@ function needsApprovalUnlessInPlanScope(toolName: string) {
   });
 }
 
+/**
+ * Per-command read/write classifier for run_shell_command.
+ *
+ * Nathan's rule (2026-05-19): "It should be able to run shell and bash
+ * to find what it needs and only ask approval to write." A blanket
+ * "shell = approval" gate makes every discovery turn pause; the
+ * common case is `sf data query`, `git status`, `ls`, `cat`, `--version`
+ * — pure reads that should fire without friction.
+ *
+ * Conservative bias: when we can't recognize the command as a known
+ * read shape, treat as write (require approval). Over-prompting beats
+ * silently running a destructive op.
+ */
+function shellCommandIsReadOnly(rawCommand: unknown): boolean {
+  if (typeof rawCommand !== 'string') return false;
+  const cmd = rawCommand.trim();
+  if (!cmd) return false;
+
+  // Chain operators short-circuit to "write" — every linked command
+  // would need to be classified individually. If you want to chain,
+  // request approval for the whole thing.
+  if (/[;&|]/.test(cmd.replace(/"[^"]*"|'[^']*'/g, ''))) return false;
+  // Output redirection writes to disk.
+  if (/>\s*\S/.test(cmd.replace(/"[^"]*"|'[^']*'/g, ''))) return false;
+  // sudo / exec / eval are explicit privilege/scope expansions.
+  if (/^\s*(sudo|exec|eval)\b/.test(cmd)) return false;
+
+  const tokens = cmd.split(/\s+/);
+  const head = tokens[0] ?? '';
+  const second = tokens[1] ?? '';
+
+  // Always-safe binaries (the unix read toolkit).
+  const SAFE_BINARIES = new Set([
+    'ls', 'cat', 'head', 'tail', 'less', 'more', 'file', 'stat', 'pwd', 'which',
+    'type', 'whoami', 'hostname', 'uname', 'env', 'printenv', 'ps', 'top', 'df',
+    'du', 'uptime', 'date', 'free', 'id', 'groups', 'history', 'echo', 'printf',
+    'grep', 'find', 'wc', 'sort', 'uniq', 'tr', 'cut', 'awk', 'sed', 'jq', 'yq',
+    'tree', 'realpath', 'readlink', 'basename', 'dirname',
+  ]);
+  if (SAFE_BINARIES.has(head)) return true;
+
+  // --version / --help / -V / -h flags are universally informational
+  // regardless of binary.
+  if (tokens.some((t) => /^(--version|--help|-V|-h)$/.test(t))) return true;
+
+  // Composite tools: classify by subcommand.
+  const SUBCOMMAND_READ: Record<string, Set<string>> = {
+    git: new Set([
+      'status', 'log', 'diff', 'show', 'branch', 'remote', 'blame', 'grep',
+      'ls-files', 'ls-tree', 'rev-parse', 'cat-file', 'tag', 'reflog',
+      'describe', 'shortlog', 'whatchanged', 'fsck',
+    ]),
+    sf: new Set([
+      'data', // 'sf data query' specifically — narrowed below
+      'config', 'project',
+    ]),
+    npm: new Set(['list', 'ls', 'view', 'show', 'search', 'outdated', 'doctor', 'audit']),
+    brew: new Set(['list', 'info', 'search', 'outdated', 'leaves', 'deps', 'home']),
+    pip: new Set(['list', 'show', 'search', 'check']),
+    pip3: new Set(['list', 'show', 'search', 'check']),
+    gem: new Set(['list', 'info', 'search']),
+    docker: new Set(['ps', 'images', 'logs', 'inspect', 'version', 'info', 'stats']),
+    kubectl: new Set(['get', 'describe', 'logs', 'version', 'config', 'top', 'explain']),
+    gh: new Set(['repo', 'pr', 'issue', 'run', 'workflow', 'release', 'auth', 'api', 'browse', 'status']),
+    aws: new Set(['s3', 'ec2', 'iam', 'sts']), // many AWS subcommands are read-only describe/list; we err to "needs approval" via fallback
+  };
+
+  const readSubs = SUBCOMMAND_READ[head];
+  if (readSubs && readSubs.has(second)) {
+    // Narrow further for the ones that have both read AND write
+    // verbs nested another level deep.
+    if (head === 'sf' && second === 'data') {
+      // `sf data query` is a SOQL SELECT (read). `sf data update/insert/delete/upsert/import` mutate.
+      return tokens[2] === 'query' || tokens[2] === 'search' || tokens[2] === 'get';
+    }
+    if (head === 'sf' && second === 'config') {
+      // `sf config get/list` is read. `sf config set/unset` writes the local CLI config.
+      return tokens[2] === 'get' || tokens[2] === 'list';
+    }
+    if (head === 'sf' && second === 'project') {
+      // `sf project list` etc.; deploys/retrieves are writes.
+      return tokens[2] === 'list' || tokens[2] === 'manifest';
+    }
+    if (head === 'gh' && (second === 'repo' || second === 'pr' || second === 'issue' || second === 'workflow' || second === 'release' || second === 'run')) {
+      // gh has read verbs (view/list/checks) and write verbs (create/edit/merge/close).
+      return ['view', 'list', 'status', 'checks', 'diff'].includes(tokens[2] ?? '');
+    }
+    return true;
+  }
+
+  // Unknown shape → conservative.
+  return false;
+}
+
+/**
+ * needsApproval wrapper specifically for run_shell_command. Inspects
+ * the `command` arg and treats known-read commands as auto-approved
+ * regardless of policy scope. Falls through to the default
+ * execute-class behavior (which still respects plan-scope) for
+ * write/unknown commands.
+ */
+function needsApprovalForShellSmart() {
+  // We can't statically set kindHint because it depends on the actual
+  // command. Build a fresh callback that classifies per-invocation.
+  return async (runContext: unknown, input: unknown): Promise<boolean> => {
+    const command = (input && typeof input === 'object' ? (input as Record<string, unknown>).command : undefined);
+    if (shellCommandIsReadOnly(command)) return false; // never pause for read
+    // Otherwise use the existing taxonomy path (execute kind, plan-scope honored, etc.).
+    return needsApprovalUnlessInPlanScope('run_shell_command')(runContext, input);
+  };
+}
+
 const MAX_COMMAND_OUTPUT_CHARS = 12000;
 const DEFAULT_TIMEOUT_MS = 30_000;
 
@@ -54,7 +166,15 @@ function expandHome(input: string): string {
 }
 
 function workspaceRoots(): string[] {
-  const roots = [process.cwd(), BASE_DIR, ...getWorkspaceDirs()]
+  // $HOME is included so the agent can operate on any user file (the
+  // natural workspace for "do work for me"). The path-allowlist check
+  // is a soft barrier, not a TCC defense — TCC enforcement happens at
+  // the OS level when child processes try to read protected dirs. The
+  // tool description in run_shell_command steers the model away from
+  // ~/Desktop, ~/Documents, ~/Downloads, and iCloud Drive (which TCC
+  // blocks for sandboxed-app children); the model is expected to honor
+  // that guidance.
+  const roots = [os.homedir(), process.cwd(), BASE_DIR, ...getWorkspaceDirs()]
     .map((entry) => path.resolve(expandHome(entry)));
   return [...new Set(roots)];
 }
@@ -81,7 +201,14 @@ function resolveAllowedPath(input: string): string {
 }
 
 function resolveAllowedCwd(input?: string): string {
-  return resolveAllowedPath(input?.trim() || process.cwd());
+  // Default to BASE_DIR (~/.clementine-next) rather than process.cwd() or
+  // os.homedir(). The daemon writes to BASE_DIR constantly, so macOS App
+  // Management TCC has already granted access — child shells spawned there
+  // never EPERM. Defaulting to HOME or to TCC-protected HOME subdirectories
+  // (Desktop, Documents, Downloads) causes child Node CLIs to throw
+  // EPERM on uv_cwd. The model can still pass an explicit `cwd` that's
+  // inside any allowed workspaceRoots() entry.
+  return resolveAllowedPath(input?.trim() || BASE_DIR);
 }
 
 function truncateOutput(value: string, maxChars = MAX_COMMAND_OUTPUT_CHARS): string {
@@ -211,13 +338,17 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
 
   const run_shell_command = tool({
     name: 'run_shell_command',
-    description: 'Run a shell command in an allowed workspace directory. Requires per-call approval UNLESS the session has an open PlanScope (the user pre-approved a plan covering this kind of work). Has output and time limits.',
+    description: [
+      'Run a shell command in an allowed workspace directory. Requires per-call approval UNLESS the session has an open PlanScope. Has output and time limits.',
+      '',
+      'CWD GUIDANCE: leave `cwd` null unless you have a specific reason to be elsewhere. On macOS, paths under ~/Desktop, ~/Documents, ~/Downloads, and iCloud Drive are TCC-protected from sandboxed-app children: child Node CLIs (sf, npm, etc.) spawned there throw EPERM on getcwd. The default cwd (Clementine\'s base directory, which the daemon already has TCC access to) is safe and works for tool invocations that don\'t actually depend on file context (CLI calls, API queries, etc.). Pass an explicit `cwd` only when the command genuinely needs to run in a specific project directory configured in WORKSPACE_DIRS.',
+    ].join('\n'),
     parameters: z.object({
       command: z.string().min(1),
       cwd: z.string().nullable(),
       timeout_ms: z.number().min(1000).max(120000).nullable(),
     }),
-    needsApproval: needsApprovalUnlessInPlanScope('run_shell_command'),
+    needsApproval: needsApprovalForShellSmart(),
     execute: async (input) => {
       const cwd = resolveAllowedCwd(input.cwd ?? undefined);
       return runCommand(input.command, cwd, input.timeout_ms ?? DEFAULT_TIMEOUT_MS);

@@ -182,7 +182,10 @@ test('shim: one server failing listTools does not poison the others', async () =
   const shim = createMcpNamespaceShim({ servers: [a, broken, c], cacheToolsList: false });
   const tools = await shim.listTools();
   const names = tools.map((t) => t.name).sort();
-  assert.deepEqual(names, ['alpha__a1', 'gamma__c1']);
+  // T2.3 change: the broken server's tools no longer vanish silently —
+  // it gets a single <slug>__unavailable stub the model can see. The
+  // OTHER servers' tools are still present and unaffected.
+  assert.deepEqual(names, ['alpha__a1', 'broken__unavailable', 'gamma__c1']);
 });
 
 test('shim: cacheToolsList=true memoizes listTools so underlying servers are queried once', async () => {
@@ -298,6 +301,53 @@ test('shim: failed connect() does not stick — next call retries', async () => 
   const shim = createMcpNamespaceShim({ servers: [a], cacheToolsList: false });
   await shim.connect!(); // first attempt fails — shim absorbs + logs
   shouldFail = false;
-  await shim.connect!(); // retries because we cleared the cached promise on error
+  // The shim now backoffs on failure; clear backoff window for this
+  // test by waiting past the first-failure 1s ladder step. We use a
+  // shorter wait to keep the test fast and rely on the test runner's
+  // global timeout to bound it.
+  await new Promise((r) => setTimeout(r, 1100));
+  await shim.connect!(); // retries because backoff window elapsed
   assert.equal(calls, 2);
+});
+
+// ─── T2.3 — server-unavailable surface ─────────────────────────────
+
+test('T2.3: a failed server surfaces a <slug>__unavailable stub tool the model can see', async () => {
+  const good = makeFakeServer({
+    name: 'good',
+    tools: [{ name: 'do_thing', description: 'fine', inputSchema: { type: 'object' } } as any],
+  });
+  const bad = makeFakeServer({
+    name: 'bad-server',
+    failConnect: true,
+    tools: [],
+  });
+  const shim = createMcpNamespaceShim({ servers: [good, bad], cacheToolsList: false });
+  const tools = await shim.listTools();
+
+  // The good server's tool is present with namespaced name.
+  assert.ok(tools.some((t) => t.name === 'good__do_thing'));
+  // The bad server gets a single stub tool — NOT silently dropped.
+  const stub = tools.find((t) => t.name === 'bad-server__unavailable');
+  assert.ok(stub, 'expected an unavailable stub tool for the failed server');
+  assert.match(stub!.description!, /UNAVAILABLE/);
+  assert.match(stub!.description!, /bad-server/);
+});
+
+test('T2.3: callTool on the stub throws BoundaryError(mcp.server_unavailable)', async () => {
+  const bad = makeFakeServer({
+    name: 'bad-server',
+    failConnect: true,
+    tools: [],
+  });
+  const shim = createMcpNamespaceShim({ servers: [bad], cacheToolsList: false });
+  await shim.listTools(); // populates routing + marks server unavailable
+  await assert.rejects(
+    () => shim.callTool('bad-server__unavailable', null),
+    (err: Error) => {
+      const isBoundary = (err as { kind?: unknown }).kind === 'mcp.server_unavailable';
+      const hasUserMessage = typeof (err as { userMessage?: unknown }).userMessage === 'string';
+      return isBoundary && hasUserMessage;
+    },
+  );
 });

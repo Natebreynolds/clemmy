@@ -365,5 +365,31 @@ export async function getOrRefreshScan(opts: { force?: boolean } = {}): Promise<
 export function filterClis(scan: CliScanResult, filter?: string): CliEntry[] {
   if (!filter || !filter.trim()) return scan.clis;
   const needle = filter.trim().toLowerCase();
+  // Exact match wins — when the caller passes `filter: "sf"` they want
+  // `sf`, not `csfdiagnose` (substring noise).
+  const exact = scan.clis.filter((c) => c.command.toLowerCase() === needle);
+  if (exact.length > 0) return exact;
+  // CRITICAL fallback: some CLIs (e.g. `sf`, which embeds Node.js) FAIL
+  // the --version probe under the macOS sandbox the daemon runs under,
+  // so they end up in scan.detected (the raw binary list) but NOT in
+  // scan.clis (the probed-cleanly list). They ARE installed, the model
+  // just can't see them via clis. When clis has no exact match, look
+  // at detected for one — that's the same correctness signal the user
+  // would get from `which <name>` in their terminal.
+  const fromDetected = scan.detected.find((d) => d.command.toLowerCase() === needle);
+  if (fromDetected) {
+    return [{
+      command: fromDetected.command,
+      path: fromDetected.path,
+      isLikelyCli: true,
+      // No version/helpHead — the probe failed at scan time, but the
+      // binary exists on $PATH. The model should treat this as
+      // "installed but unprobed" and rely on a direct probe via
+      // `local_cli_probe` or `run_shell_command <cmd> --version` to
+      // confirm runtime behavior.
+    }];
+  }
+  // Fall back to substring across clis for genuinely fuzzy lookups
+  // ("docker" → docker + dockerd).
   return scan.clis.filter((c) => c.command.toLowerCase().includes(needle));
 }

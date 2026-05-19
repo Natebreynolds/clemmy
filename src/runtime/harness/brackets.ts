@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { isKillRequested } from './eventlog.js';
 
 /**
@@ -85,6 +86,18 @@ export class ToolCallsCounter {
     if (this.count > this.limit) {
       throw new ToolCallsLimitExceeded(this.limit);
     }
+  }
+
+  /**
+   * Non-mutating predicate: would the next increment exceed the limit?
+   * Used by wrapToolForHarness to throw BEFORE the tool's execute
+   * starts running. The previous post-hoc check (increment after the
+   * SDK's `agent_tool_start` hook) allowed the (limit+1)th tool to
+   * begin work + consume time + cause side-effects before the throw
+   * surfaced. This predicate lets the wrapper bail at the entry edge.
+   */
+  willExceed(): boolean {
+    return this.count + 1 > this.limit;
   }
 
   reset(): void {
@@ -269,3 +282,127 @@ export const DEFAULT_TOKEN_BUDGET: Readonly<TokenBudgetCounts> = Object.freeze({
   inputTokens: 200_000,
   outputTokens: 80_000,
 });
+
+// ───────────────────────────────────────────────────────────────
+//  T2.1 — tool-call boundary wrapper
+//
+// Why this exists: the audit on 2026-05-18 found three failure modes
+// at the tool boundary that the existing brackets DID NOT close:
+//
+//   #6 — Kill switch checked only at turn start. A long-running tool
+//        ignores a kill request issued mid-turn until the turn ends.
+//   #7 — Tool-call cap allows the (limit+1)th call to START work
+//        before the post-hoc `agent_tool_start` hook throws. Side
+//        effects + token cost are already committed by the time the
+//        rejection fires.
+//   #8 — DEFAULT_TIMEOUTS_MS + withTimeout were authored but not
+//        wired anywhere. A hanging Composio call (e.g. external API
+//        no-response) blocks the whole turn indefinitely.
+//
+// wrapToolForHarness wraps every tool's `execute` so the three checks
+// fire at the tool's entry edge:
+//   1. assertNotKilled(sessionId)          — sync; mid-turn kill
+//   2. counter.willExceed()                — pre-increment limit
+//   3. withTimeout(execute(...), timeout)  — per-tool wall clock
+//
+// All three read the per-run context from `harnessRunContextStorage`
+// (AsyncLocalStorage). The loop installs the context around the SDK's
+// runner.run() call; tools called outside that scope get a no-op
+// wrapper so non-harness call paths (direct API, tests) aren't broken.
+// ───────────────────────────────────────────────────────────────
+
+export interface HarnessRunContext {
+  sessionId: string;
+  counter: ToolCallsCounter;
+  /** Cap each tool's wall-clock execution to this. Overrides
+   *  timeoutForTool(name) when set; otherwise the default per-name
+   *  policy applies. */
+  defaultTimeoutMs?: number;
+}
+
+/** Per-turn context store. The loop wraps runner.run() in `run` so
+ *  every tool invocation underneath can read the active counter +
+ *  sessionId without explicit threading through SDK options. */
+export const harnessRunContextStorage = new AsyncLocalStorage<HarnessRunContext>();
+
+/** Sugar around AsyncLocalStorage.run for the loop call site. */
+export function withHarnessRunContext<T>(
+  ctx: HarnessRunContext,
+  work: () => T | Promise<T>,
+): T | Promise<T> {
+  return harnessRunContextStorage.run(ctx, work);
+}
+
+/** Internal: minimum shape of an SDK `Tool` the wrapper needs to
+ *  rewrite execute on. We keep this loose so we don't import the
+ *  full SDK type union (Tool<RuntimeContextValue> | FunctionTool | …)
+ *  and end up coupling brackets.ts to every variant. */
+export interface WrappableTool {
+  name: string;
+  execute?: (input: unknown, runContext?: unknown) => Promise<unknown>;
+}
+
+export interface WrapToolOptions {
+  /** Override the per-tool timeout. When omitted, timeoutForTool(name)
+   *  picks one from DEFAULT_TIMEOUTS_MS. */
+  timeoutMs?: number;
+  /** Test injection — when set, use this clock instead of Date.now()
+   *  for timeout testing. */
+  now?: () => number;
+}
+
+/**
+ * Wrap a tool so its execute fires the three reliability checks at the
+ * entry edge. The wrap is gated behind `HARNESS_TOOL_BRACKETS=on` env
+ * flag so we can ship + dogfood without flipping behavior until we're
+ * sure nothing legitimate gets killed by a too-tight timeout.
+ *
+ * When the flag is off, returns the tool unchanged. When on, returns
+ * a new object with a wrapped `execute`. The original tool is not
+ * mutated — both can coexist if needed.
+ *
+ * Reading the run context via AsyncLocalStorage means tools called
+ * OUTSIDE the harness (e.g. direct MCP invocations, test fixtures)
+ * see ctx === undefined; in that case the wrapper degrades to "apply
+ * timeout only, no kill check, no counter check" — safer than
+ * crashing on a missing counter.
+ */
+export function wrapToolForHarness<T extends WrappableTool>(
+  tool: T,
+  options: WrapToolOptions = {},
+): T {
+  if (process.env.HARNESS_TOOL_BRACKETS !== 'on') return tool;
+  const originalExecute = tool.execute;
+  if (!originalExecute) return tool; // pure declaration; no execute to wrap
+  const wrappedExecute = async (input: unknown, runContext?: unknown): Promise<unknown> => {
+    const ctx = harnessRunContextStorage.getStore();
+    if (ctx) {
+      // 1. Kill check — sync throw. The SDK records this tool call as
+      //    errored and the run halts cleanly. Without this, a long
+      //    tool (10-min DataForSEO scrape) ignores `clementine kill`
+      //    until it returns.
+      assertNotKilled(ctx.sessionId);
+      // 2. Counter cap — pre-increment check. If we're at the limit,
+      //    throw BEFORE the inner execute runs so no side effects
+      //    happen. The increment moves AFTER willExceed so a thrown
+      //    check doesn't bump the count.
+      if (ctx.counter.willExceed()) {
+        throw new ToolCallsLimitExceeded(ctx.counter.limit);
+      }
+      ctx.counter.increment();
+    }
+    // 3. Per-tool timeout. The withTimeout helper races a setTimeout
+    //    against the tool promise; on expiry it throws ToolTimeout
+    //    (the inner work continues unaborted — tools wire their own
+    //    AbortSignal if they want to cancel cleanly).
+    const timeoutMs = options.timeoutMs
+      ?? ctx?.defaultTimeoutMs
+      ?? timeoutForTool(tool.name);
+    return withTimeout(
+      (async () => originalExecute(input, runContext))(),
+      timeoutMs,
+      tool.name,
+    );
+  };
+  return { ...tool, execute: wrappedExecute };
+}

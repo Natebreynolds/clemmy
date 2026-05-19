@@ -8,6 +8,20 @@ import { getOrCreateExternalMcpServers } from '../runtime/mcp-servers.js';
 import type { RuntimeContextValue } from '../types.js';
 import { harnessInstructions } from './harness-context.js';
 import { appendEvent } from '../runtime/harness/eventlog.js';
+import { wrapToolForHarness, type WrappableTool } from '../runtime/harness/brackets.js';
+
+/**
+ * T2.1 — wrap a sub-agent's tools so every execute fires through the
+ * harness boundary (per-tool timeout + mid-turn kill check + pre-
+ * increment limit check). No-op when HARNESS_TOOL_BRACKETS is off.
+ * Centralized so the 6 sub-agent factories don't each have to repeat
+ * the same `.map(...)` boilerplate.
+ */
+function wrapTools(tools: Tool<RuntimeContextValue>[]): Tool<RuntimeContextValue>[] {
+  return tools.map((t) =>
+    wrapToolForHarness(t as unknown as WrappableTool) as unknown as Tool<RuntimeContextValue>,
+  );
+}
 
 /**
  * Structured input the Orchestrator MUST supply when handing off to
@@ -370,7 +384,7 @@ export async function buildResearcherAgent(): Promise<SubAgent> {
       'When done, return a short structured answer the orchestrator can use directly. Lead with the answer (or "not found"), then evidence. Do not pad.',
     ].join('\n\n')),
     model: MODELS.fast,
-    tools,
+    tools: wrapTools(tools),
     // External MCP servers (DataForSEO, Supabase, browsermcp, etc.)
     // the user has configured. Tools surface as `<server>__<tool>`.
     // Local clementine MCP is excluded — those tools are already in
@@ -410,7 +424,7 @@ export async function buildWorkerAgent(): Promise<SubAgent> {
       'You may write per-item artifacts (write_file with a unique path) if the parent\'s prompt asks for them. Otherwise, prefer returning the result inline.',
     ].join('\n\n'),
     model: MODELS.primary,
-    tools,
+    tools: wrapTools(tools),
     // External MCP servers (DataForSEO, Supabase, browsermcp, etc.)
     // the user has configured. Tools surface as `<server>__<tool>`.
     // Local clementine MCP is excluded — those tools are already in
@@ -460,13 +474,14 @@ export async function buildExecutorAgent(): Promise<SubAgent> {
       'NEVER conclude "the runtime doesn\'t expose that action" without trying tier 3. The user has connected toolkits we can\'t enumerate at build time.',
       'Use `composio_status` only to confirm a toolkit is actually connected when you have a real reason to doubt it. If a needed toolkit is missing or disconnected, surface that with notify_user (or ask_user_question if you need them to connect it) — don\'t silently fail.',
       'Make small reversible changes, verify after each one when possible, and surface real errors via notify_user.',
+      'READ SHELL ERRORS LITERALLY. When run_shell_command returns a non-zero exit code, do NOT infer the cause from the command type — read the actual stderr line by line and report THAT, verbatim, to the user. An exit code alone is not a diagnosis: quote the stderr. Do not write notifications like "X needs re-auth" unless the stderr literally says the credentials are expired/invalid. If the message is generic (working-directory issues, shell-init noise, PATH problems, etc.), retry once with `cwd` set explicitly, then surface the real error verbatim and ask the user what to do.',
       'When a tracked execution is involved, call execution_update_step every cycle you make progress, and execution_complete only when success criteria are met.',
       'PARALLEL FAN-OUT: when the work is "do the same operation across N independent items" (scrape N accounts, classify N records, fetch N URLs, summarize N docs), DO NOT loop sequentially in your own context — call `run_worker` MULTIPLE TIMES IN PARALLEL in the same turn (one call per item). The SDK runs them concurrently and each worker gets its own isolated context, so your context stays clean and the work completes in roughly the time of ONE item instead of N. For very large N (>50), prefer authoring a workflow with a `forEach` step via `workflow_schedule` — that has bounded concurrency and per-item durability for crashes.',
-      'NEVER END YOUR TURN WITHOUT ACTING. You were handed off because the Orchestrator decided concrete work needed to happen. Returning a one-word acknowledgement like "Continuing.", "OK.", "Done.", or "Working on it." without any tool calls is a STALL — the user sees that as the agent doing nothing, and the conversation dies. If the directive is genuinely ambiguous and you can\'t pick a tool to call, use `ask_user_question` to get the clarification you need; do NOT just acknowledge and stop. Your turn must include at least one tool call (composio_search_tools / composio_execute_tool / write_file / cx_* / ask_user_question / etc.).',
+      'NEVER END YOUR TURN WITHOUT ACTING. You were handed off because the Orchestrator decided concrete work needed to happen. Returning ANY message that describes work in future tense — "Executing now…", "I\'ll run the query…", "Let me fetch that…", "Pulling the data…", "Running it now…" — WITHOUT actually invoking the tool in the SAME turn is a STALL. The user sees an announcement of work that never happened. This is the single most common failure mode. Hard rule: if your reply contains future-tense action language ("I\'ll", "let me", "executing", "fetching", "running", "pulling", "about to"), you MUST have called the corresponding tool BEFORE that text was produced. Equivalent stalls include short acknowledgements ("Continuing.", "OK.", "Done.", "Working on it."). The fix is always the same: actually call the tool. If the directive is genuinely ambiguous and you can\'t pick a tool to call, use `ask_user_question` to clarify; do NOT just acknowledge and stop. Your turn MUST include at least one real tool call (composio_execute_tool, run_shell_command, cx_*, write_file, ask_user_question, etc.).',
       'Return a concise summary of what was done so the orchestrator knows the state. The summary describes the ACTION you took — never use it as a substitute for taking action.',
     ].join('\n\n')),
     model: MODELS.primary,
-    tools,
+    tools: wrapTools(tools),
     // External MCP servers (DataForSEO, Supabase, browsermcp, etc.)
     // the user has configured. Tools surface as `<server>__<tool>`.
     // Local clementine MCP is excluded — those tools are already in
@@ -493,7 +508,7 @@ export async function buildWriterAgent(): Promise<SubAgent> {
       'Return the final draft location or text plus any assumptions that matter.',
     ].join('\n\n')),
     model: MODELS.primary,
-    tools,
+    tools: wrapTools(tools),
     // External MCP servers (DataForSEO, Supabase, browsermcp, etc.)
     // the user has configured. Tools surface as `<server>__<tool>`.
     // Local clementine MCP is excluded — those tools are already in
@@ -521,7 +536,7 @@ export async function buildReviewerAgent(): Promise<SubAgent> {
       'Return findings first (ordered by severity), then the verdict (proceed / verified / blocked-on-issue). Keep it tight — bullet-list, not prose.',
     ].join('\n\n')),
     model: MODELS.fast,
-    tools,
+    tools: wrapTools(tools),
     // External MCP servers (DataForSEO, Supabase, browsermcp, etc.)
     // the user has configured. Tools surface as `<server>__<tool>`.
     // Local clementine MCP is excluded — those tools are already in
@@ -546,7 +561,7 @@ export async function buildDeployerAgent(): Promise<SubAgent> {
       'Return exactly what was deployed, where, verification results, and any follow-up needed.',
     ].join('\n\n')),
     model: MODELS.deep,
-    tools,
+    tools: wrapTools(tools),
     // External MCP servers (DataForSEO, Supabase, browsermcp, etc.)
     // the user has configured. Tools surface as `<server>__<tool>`.
     // Local clementine MCP is excluded — those tools are already in

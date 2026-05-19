@@ -4,8 +4,10 @@ import { HarnessSession } from './session.js';
 import {
   appendEvent,
   getSession,
+  listEvents,
   openEventLog,
   type AppendEventInput,
+  type EventRow,
   type SessionRow,
 } from './eventlog.js';
 import {
@@ -15,6 +17,7 @@ import {
   ToolCallsLimitExceeded,
   DEFAULT_MAX_TURNS,
   DEFAULT_TOOL_CALLS_PER_TURN,
+  withHarnessRunContext,
 } from './brackets.js';
 import { attachEventLogHooks, extractSessionIdFromContext, type RunHooksLike } from './hooks.js';
 import * as approvalRegistry from './approval-registry.js';
@@ -388,10 +391,27 @@ async function runConversationCore(
       // the bot's reply hides the failure — the user sees a non-answer
       // and assumes the agent is working when it actually gave up.
       // Override the summary so the failure is visible and actionable.
-      const stallInfo = detectSubAgentStall(
-        turnResult.finalOutput,
-        turnResult.toolCalls ?? 0,
-      );
+      const stallInfo = evaluateProgress({
+        finalOutput: turnResult.finalOutput,
+        toolCalls: turnResult.toolCalls ?? 0,
+        sessionId: options.sessionId,
+      });
+
+      // Emit a dedicated stuck_detected event so the dashboard
+      // (Recent Errors panel, future Tier 3) can show stall patterns
+      // distinct from generic conversation_completed.
+      if (stallInfo) {
+        safeAppend({
+          sessionId: options.sessionId,
+          turn: turnResult.turn,
+          role: 'system',
+          type: 'stuck_detected',
+          data: {
+            signal: stallInfo.signal,
+            ...stallInfo.detail,
+          },
+        });
+      }
 
       safeAppend({
         sessionId: options.sessionId,
@@ -404,7 +424,8 @@ async function runConversationCore(
           summary: stallInfo ? stallInfo.userVisibleMessage : fallbackSummary,
           stallDetail: stallInfo
             ? {
-                rawOutput: stallInfo.rawOutput,
+                signal: stallInfo.signal,
+                ...stallInfo.detail,
                 toolCalls: turnResult.toolCalls ?? 0,
               }
             : undefined,
@@ -669,10 +690,19 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   const onToolStart = (): void => {
     toolCounter.increment();
   };
-  (runner as unknown as RunHooksLike).on(
-    'agent_tool_start',
-    onToolStart as (...args: unknown[]) => void,
-  );
+  // T2.1 — when HARNESS_TOOL_BRACKETS is on, wrapToolForHarness in
+  // brackets.ts owns the counter (incrementing AT tool-entry, with a
+  // pre-increment willExceed check that throws BEFORE side effects).
+  // When the flag is off, fall back to the legacy post-hoc hook so
+  // counting still works for any agent that didn't go through the
+  // wrap factory yet.
+  const useToolWrapper = process.env.HARNESS_TOOL_BRACKETS === 'on';
+  if (!useToolWrapper) {
+    (runner as unknown as RunHooksLike).on(
+      'agent_tool_start',
+      onToolStart as (...args: unknown[]) => void,
+    );
+  }
 
   const items: AgentInputItem[] = [
     ...session.toInputItems(),
@@ -697,7 +727,16 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
 
   try {
     const run = options.runRunner ?? defaultRunRunner;
-    const outcome = await run(runner, options.agent, items, opts);
+    // T2.1 — install the AsyncLocalStorage context so any wrapToolForHarness
+    // wrapper inside the SDK's run() can read the per-turn counter +
+    // sessionId without explicit threading. Pass-through when the
+    // wrapper flag is off (no behavior change).
+    const outcome = useToolWrapper
+      ? await withHarnessRunContext(
+          { sessionId: options.sessionId, counter: toolCounter },
+          () => run(runner, options.agent, items, opts),
+        )
+      : await run(runner, options.agent, items, opts);
 
     if (outcome.hasInterruptions && outcome.serializedState) {
       // The SDK pauses BEFORE invoking the tool's execute when
@@ -879,10 +918,14 @@ export async function resumePendingApproval(
   const onToolStart = (): void => {
     toolCounter.increment();
   };
-  (runner as unknown as RunHooksLike).on(
-    'agent_tool_start',
-    onToolStart as (...args: unknown[]) => void,
-  );
+  // T2.1 — see equivalent block in runTurn at the top of this file.
+  const useToolWrapper = process.env.HARNESS_TOOL_BRACKETS === 'on';
+  if (!useToolWrapper) {
+    (runner as unknown as RunHooksLike).on(
+      'agent_tool_start',
+      onToolStart as (...args: unknown[]) => void,
+    );
+  }
 
   const opts: Record<string, unknown> = {
     context: { sessionId: options.sessionId, turn },
@@ -895,12 +938,22 @@ export async function resumePendingApproval(
     // items — it picks up the conversation from exactly where the
     // interrupt fired. We thread it through the same defaultRunRunner
     // so streaming + completion semantics match runTurn().
-    const outcome = await run(
-      runner,
-      options.agent,
-      state as unknown as AgentInputItem[],
-      { ...opts, stream: true },
-    );
+    const outcome = useToolWrapper
+      ? await withHarnessRunContext(
+          { sessionId: options.sessionId, counter: toolCounter },
+          () => run(
+            runner,
+            options.agent,
+            state as unknown as AgentInputItem[],
+            { ...opts, stream: true },
+          ),
+        )
+      : await run(
+          runner,
+          options.agent,
+          state as unknown as AgentInputItem[],
+          { ...opts, stream: true },
+        );
 
     if (outcome.hasInterruptions && outcome.serializedState) {
       // Same registry + emit pattern as runTurn; consolidated in
@@ -1301,24 +1354,223 @@ function previewOutput(out: unknown): string {
  */
 const STALL_OUTPUT_PATTERN = /^(continuing|ok|okay|done|sure|got it|working on it|will do|on it|understood|noted|alright|certainly|yes)\.?$/i;
 
+// Verbose-announcement stall: the model produced future-tense
+// language describing work it's about to do, but didn't actually call
+// any tool to do it. Example: "Executing the Salesforce pull now —
+// I'll fetch 15 contacts ..." with 0 tool calls. This is a louder
+// version of "Continuing." and just as broken.
+const STALL_ANNOUNCEMENT_PATTERN = /\b(I[' ]?ll\s|let me\s|executing\s|fetching\s|running\s|pulling\s|querying\s|about to\s|going to\s|on the way|in progress|kicking off|starting now)/i;
+
+export type StallSignal = 'A_zero_tools' | 'B_repeated_tool' | 'C_handoff_pingpong' | 'D_decision_json';
+
 interface StallInfo {
-  rawOutput: string;
+  signal: StallSignal;
+  rawOutput?: string;
   userVisibleMessage: string;
+  /** Structured detail for the stuck_detected event / dashboard panel. */
+  detail: Record<string, unknown>;
 }
 
-function detectSubAgentStall(finalOutput: unknown, toolCalls: number): StallInfo | undefined {
-  if (toolCalls > 0) return undefined;
-  if (typeof finalOutput !== 'string') return undefined;
-  const trimmed = finalOutput.trim();
-  if (!trimmed) return undefined;
-  if (trimmed.length > 60) return undefined; // a short reply is the tell
-  if (!STALL_OUTPUT_PATTERN.test(trimmed)) return undefined;
-  return {
-    rawOutput: trimmed,
-    userVisibleMessage:
-      `_(The sub-agent ended its turn without taking any action. The model said "${trimmed}" but made zero tool calls. ` +
-      `Re-send your request with a more specific directive — e.g. name the toolkit, the field, or the file you want it to touch.)_`,
-  };
+/**
+ * T2.2 — Generalized stall detector. Four signals; first match wins.
+ * Called from the no-structured-output branch of runConversation when
+ * a sub-agent's turn ended without an OrchestratorDecision, but useful
+ * for both the "punted on directive" and "stuck-in-loop" patterns.
+ *
+ *   Signal A — zero tools + short generic reply ("Continuing.", "OK.").
+ *              The legacy detector; still the most common stall shape.
+ *   Signal B — identical (toolName, hash(args)) ≥3 times in the last
+ *              5 tool_called events for this session. The agent is
+ *              re-running the same query expecting different results.
+ *   Signal C — same from→to→from handoff pair fires ≥2 times within
+ *              the last 8 handoff events. Orchestrator + sub-agent
+ *              bouncing the directive back and forth.
+ *   Signal D — final output is a stringified OrchestratorDecision
+ *              JSON instead of a plain reply. Model over-conformed to
+ *              the schema and the SDK exposed it raw.
+ */
+function evaluateProgress(opts: {
+  finalOutput: unknown;
+  toolCalls: number;
+  sessionId: string;
+}): StallInfo | undefined {
+  // Signal A — zero tools + short generic reply (current behavior).
+  if (opts.toolCalls === 0 && typeof opts.finalOutput === 'string') {
+    const trimmed = opts.finalOutput.trim();
+    if (trimmed && trimmed.length <= 60 && STALL_OUTPUT_PATTERN.test(trimmed)) {
+      return {
+        signal: 'A_zero_tools',
+        rawOutput: trimmed,
+        userVisibleMessage:
+          `_(The sub-agent ended its turn without taking any action. The model said "${trimmed}" but made zero tool calls. ` +
+          `Re-send your request with a more specific directive — e.g. name the toolkit, the field, or the file you want it to touch.)_`,
+        detail: { rawOutput: trimmed, toolCalls: 0 },
+      };
+    }
+    // Signal A' — verbose-announcement stall. The model spent a turn
+    // describing what it WOULD do without actually doing it. Caught the
+    // 2026-05-19 sf data query session (Executor said "Executing the
+    // Salesforce pull now — I'll fetch 15 contacts ..." with 0 tool
+    // calls). Any time the output is future-tense and zero tools fired,
+    // treat it the same as the bare "Continuing." stall.
+    if (trimmed && STALL_ANNOUNCEMENT_PATTERN.test(trimmed)) {
+      return {
+        signal: 'A_zero_tools',
+        rawOutput: trimmed.slice(0, 220),
+        userVisibleMessage:
+          `_(The sub-agent announced work it was about to do but didn't actually call the tool. ` +
+          `Output: "${trimmed.slice(0, 160)}…". Re-send your request — if it keeps stalling, name the exact tool you want it to use.)_`,
+        detail: { rawOutput: trimmed.slice(0, 220), toolCalls: 0 },
+      };
+    }
+  }
+
+  // Signal D — stringified OrchestratorDecision JSON. Detect a `{...}`
+  // shape with the schema's discriminating keys before we look up tool
+  // history (cheap structural check first).
+  if (typeof opts.finalOutput === 'string') {
+    const trimmed = opts.finalOutput.trim();
+    if (trimmed.startsWith('{') && trimmed.endsWith('}') && trimmed.length > 40) {
+      try {
+        const parsed = JSON.parse(trimmed) as Record<string, unknown>;
+        if (
+          typeof parsed.summary === 'string' &&
+          typeof parsed.done === 'boolean' &&
+          typeof parsed.nextAction === 'string'
+        ) {
+          const reply = typeof parsed.reply === 'string' ? parsed.reply : null;
+          return {
+            signal: 'D_decision_json',
+            rawOutput: trimmed.slice(0, 200),
+            userVisibleMessage:
+              reply && reply.trim()
+                ? reply
+                : `_(The model produced a structured decision but no user-facing reply. Internal summary: "${(parsed.summary as string).slice(0, 160)}". Re-ask if you wanted a specific result.)_`,
+            detail: {
+              summary: parsed.summary,
+              done: parsed.done,
+              nextAction: parsed.nextAction,
+              hasReply: !!(reply && reply.trim()),
+            },
+          };
+        }
+      } catch {
+        /* not JSON-shaped after all — fall through */
+      }
+    }
+  }
+
+  // Signal B — repeated identical tool call. Look at the LAST 5
+  // tool_called events for this session; if 3+ share (toolName, args
+  // hash), the agent is looping on the same query.
+  try {
+    const recentToolCalls = listEvents(opts.sessionId, {
+      types: ['tool_called'],
+    }).slice(-5);
+    if (recentToolCalls.length >= 3) {
+      const counts = new Map<string, { count: number; toolName: string; argsExcerpt: string }>();
+      for (const ev of recentToolCalls as EventRow[]) {
+        const data = ev.data as { tool?: unknown; arguments?: unknown };
+        const toolName = typeof data.tool === 'string' ? data.tool : 'unknown';
+        const args = typeof data.arguments === 'string'
+          ? data.arguments
+          : data.arguments !== undefined ? JSON.stringify(data.arguments) : '';
+        // Tight hash — collapses small whitespace differences but
+        // preserves intent. A 60-char fingerprint catches "same query"
+        // without false-positives on different keys.
+        const key = `${toolName}::${args.slice(0, 200)}`;
+        const existing = counts.get(key);
+        if (existing) {
+          existing.count++;
+        } else {
+          counts.set(key, { count: 1, toolName, argsExcerpt: args.slice(0, 120) });
+        }
+      }
+      for (const [, info] of counts) {
+        if (info.count >= 3) {
+          return {
+            signal: 'B_repeated_tool',
+            userVisibleMessage:
+              `_(I'm not making progress — I just re-ran \`${info.toolName}\` with the same arguments ${info.count} times in a row. ` +
+              `What did you mean by the request? A different keyword, a specific record id, or a clarification will get past this.)_`,
+            detail: {
+              toolName: info.toolName,
+              argsExcerpt: info.argsExcerpt,
+              repeatCount: info.count,
+              windowSize: recentToolCalls.length,
+            },
+          };
+        }
+      }
+    }
+  } catch {
+    /* event-log query is best-effort */
+  }
+
+  // Signal C — handoff ping-pong. Pull the last 8 handoff events and
+  // look for `from→to→from` patterns occurring twice or more.
+  try {
+    const recentHandoffs = listEvents(opts.sessionId, {
+      types: ['handoff'],
+    }).slice(-8);
+    if (recentHandoffs.length >= 4) {
+      const pairs = new Map<string, number>();
+      // Build sequences of consecutive (from, to) pairs.
+      const sequence: string[] = [];
+      for (const ev of recentHandoffs as EventRow[]) {
+        const d = ev.data as { from?: unknown; to?: unknown };
+        const from = typeof d.from === 'string' ? d.from : null;
+        const to = typeof d.to === 'string' ? d.to : null;
+        if (from && to) sequence.push(`${from}→${to}`);
+      }
+      // Look for a triple ABA pattern occurring multiple times.
+      for (let i = 0; i + 2 < sequence.length; i++) {
+        const a = sequence[i];
+        const b = sequence[i + 1];
+        const c = sequence[i + 2];
+        // ABA pattern: from→to→from (a's from === c's to AND a's to === c's from)
+        const aFrom = a.split('→')[0]; const aTo = a.split('→')[1];
+        const cFrom = c.split('→')[0]; const cTo = c.split('→')[1];
+        if (aFrom === cTo && aTo === cFrom) {
+          const key = `${aFrom}↔${aTo}`;
+          pairs.set(key, (pairs.get(key) ?? 0) + 1);
+        }
+        // suppress unused warning
+        void b;
+      }
+      for (const [pair, count] of pairs) {
+        if (count >= 2) {
+          return {
+            signal: 'C_handoff_pingpong',
+            userVisibleMessage:
+              `_(${pair.replace('↔', ' and ')} are handing the work back and forth without making progress. ` +
+              `The directive is probably ambiguous — clarify what you want and which agent should own it.)_`,
+            detail: {
+              agentPair: pair,
+              repeatCount: count,
+              windowSize: recentHandoffs.length,
+            },
+          };
+        }
+      }
+    }
+  } catch {
+    /* best effort */
+  }
+
+  return undefined;
+}
+
+/**
+ * Legacy alias — kept so existing call sites + tests don't break while
+ * we migrate to evaluateProgress's discriminated signal output.
+ */
+function detectSubAgentStall(finalOutput: unknown, toolCalls: number, sessionId?: string): StallInfo | undefined {
+  return evaluateProgress({
+    finalOutput,
+    toolCalls,
+    sessionId: sessionId ?? '',
+  });
 }
 
 /**

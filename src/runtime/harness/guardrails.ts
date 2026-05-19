@@ -235,9 +235,14 @@ export const secretLeakGuardrail: OutputGuardrail = {
 
 // ---------- registries ----------
 
+// missingCapabilityGuardrail is intentionally NOT wired here. It text-matches
+// the user's input against a hardcoded registry of CLI names and refuses
+// upfront — that is a curated-allowlist pattern and Clementine is a global
+// harness ("no hardcoded tool lists"). CLI availability is surfaced to the
+// planner via the $PATH-scan `local_cli_list` / `local_cli_probe` tools
+// instead, so any CLI the user has installed is usable without code changes.
 export const harnessInputGuardrails: InputGuardrail[] = [
   policyViolationGuardrail,
-  missingCapabilityGuardrail,
 ];
 
 // Typed as OutputGuardrail<any>[] so any agent (text-output or

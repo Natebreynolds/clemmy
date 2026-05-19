@@ -4,7 +4,7 @@ import type { ApprovalResolutionResult, PendingApproval, RunRequest, RunResult }
 import { AgentRuntimeCancelledError, ASSISTANT_PAUSED_PLACEHOLDER, type AgentRuntime, type AgentRuntimeCallbacks } from './provider.js';
 import { ApprovalStore } from './approval-store.js';
 import { addNotification, getNotification } from './notifications.js';
-import { ASSISTANT_NAME } from '../config.js';
+import { ASSISTANT_NAME, BASE_DIR } from '../config.js';
 import { getStoredCodexOAuthTokens, refreshStoredNativeOAuth } from './auth-store.js';
 import { getCoreToolsAsync } from '../tools/registry.js';
 import { getOrCreateConfiguredMcpServers } from './mcp-servers.js';
@@ -49,7 +49,18 @@ interface CodexInputMessage {
 }
 
 class CodexRuntimeError extends Error {
-  constructor(message: string, readonly status?: number) {
+  constructor(
+    message: string,
+    readonly status?: number,
+    /** T2.4 — extra structured context. When set, the top-level
+     *  handler can route to a BoundaryError(codex.http_4xx | http_5xx)
+     *  with this data attached. Backwards-compatible: existing
+     *  call sites that just construct with (message, status) still
+     *  work; the new fields are optional. */
+    readonly bodyText?: string,
+    readonly elapsedMs?: number,
+    readonly retriesAttempted?: number,
+  ) {
     super(message);
     this.name = 'CodexRuntimeError';
   }
@@ -500,7 +511,50 @@ async function performCodexRequest(
 
   if (!response.ok) {
     const errorText = await response.text();
-    throw new CodexRuntimeError(formatCodexApiError(response.status, errorText), response.status);
+    const elapsedMs = Date.now() - startedAt;
+    // T2.4 — persist 4xx traces for the operator. The 2026-05-17
+    // cluster of 15 silent fails on 16:49-17:19 had a Codex 400 burst
+    // with no diagnostic surface — there was no record of what the
+    // requests looked like. Now every 4xx writes a trace file the
+    // Recent Errors panel + ops grep can use.
+    if (response.status >= 400 && response.status < 500) {
+      try {
+        const { atomicJsonMutate } = await import('./atomic-json.js');
+        const path = await import('node:path');
+        const safeSessionId = (request.sessionId ?? 'no-session').replace(/[^a-zA-Z0-9_-]/g, '_');
+        const tracePath = path.join(
+          BASE_DIR,
+          'state',
+          'codex-4xx-trace',
+          `${safeSessionId}-${Date.now()}.json`,
+        );
+        await atomicJsonMutate(
+          tracePath,
+          () => ({
+            ts: new Date().toISOString(),
+            sessionId: request.sessionId,
+            status: response.status,
+            model: request.model,
+            elapsedMs,
+            bodyExcerpt: errorText.slice(0, 4096),
+            inputTokenEstimate: input.length,
+          }),
+          {} as Record<string, unknown>,
+        );
+      } catch (writeErr) {
+        // Trace write is best-effort; never block the main error path.
+        logger.warn(
+          { err: writeErr instanceof Error ? writeErr.message : String(writeErr) },
+          'codex-4xx-trace write failed (continuing)',
+        );
+      }
+    }
+    throw new CodexRuntimeError(
+      formatCodexApiError(response.status, errorText),
+      response.status,
+      errorText.slice(0, 2048),
+      elapsedMs,
+    );
   }
 
   if (!response.body) {
@@ -744,8 +798,43 @@ export class CodexNativeRuntime implements AgentRuntime {
           const delayMs = 750 * 2 ** transientAttempts;
           transientAttempts += 1;
           logger.warn({ status: error.status, attempt: transientAttempts, delayMs }, 'Retrying transient native Codex request failure');
+          // T2.4 — surface a liveness chunk so the user sees the
+          // retry happening instead of a 5+ second gap. Without
+          // this, a 503 burst looked exactly like the chat hung.
+          try {
+            callbacks?.onChunk?.(
+              `_(Backend hiccup — retrying in ${Math.round(delayMs / 1000)}s…)_`,
+            );
+          } catch { /* onChunk is best-effort */ }
           await sleep(delayMs);
           continue;
+        }
+        // T2.4 — final-failure paths: when retries are exhausted on a
+        // 5xx (or a 4xx outside the auth-refresh window), fire ONE
+        // rate-limited alert so a Codex incident shows up as a single
+        // actionable user notification instead of N silent stack
+        // traces per minute. The original exception still throws so
+        // the caller's existing handling fires.
+        if (error instanceof CodexRuntimeError && typeof error.status === 'number') {
+          try {
+            const { rateLimitedAlert } = await import('./rate-limited-alert.js');
+            const bucket =
+              error.status >= 500 ? 'codex-5xx-cluster' :
+              error.status === 429 ? 'codex-rate-limit' :
+              `codex-${error.status}`;
+            await rateLimitedAlert(bucket, {
+              title: `Codex backend returned ${error.status}`,
+              body:
+                `Clementine's model backend failed with HTTP ${error.status} ` +
+                `after ${transientAttempts} retr${transientAttempts === 1 ? 'y' : 'ies'}. ` +
+                `${error.message.slice(0, 200)}. ` +
+                (error.status >= 500
+                  ? 'Likely a backend incident — check status.openai.com.'
+                  : 'Likely a request/auth issue — see state/codex-4xx-trace/.'),
+              kind: 'system',
+              metadata: { status: error.status, retries: transientAttempts },
+            });
+          } catch { /* alert is best-effort */ }
         }
         throw error;
       }
@@ -918,6 +1007,57 @@ export class CodexNativeRuntime implements AgentRuntime {
       const msg = error instanceof Error ? error.message : String(error);
       logger.warn({ err: error, tool: name }, 'MCP tool execution failed (Codex runtime)');
       finishEvent('error', msg);
+
+      // T2.5 — if the shim threw BoundaryError(mcp.approval_blocked),
+      // route through the real PendingApproval state machine instead
+      // of just stringifying. The runtime's own decideToolApproval
+      // check above should have caught most of these, but the shim's
+      // safety net can fire for edge cases (e.g. a slug that the
+      // runtime classified as benign but the taxonomy gated). Mirror
+      // the local-tool approval path so the user gets an apr-xxxx
+      // prompt instead of a model that "saw 'approval required' as
+      // tool output and gave up."
+      if (
+        (error as { kind?: unknown })?.kind === 'mcp.approval_blocked'
+      ) {
+        const approvalId = randomUUID();
+        const pendingApproval: PendingApproval = {
+          id: approvalId,
+          sessionId,
+          agentName: ASSISTANT_NAME,
+          toolName: name,
+          userId: request.userId,
+          channel: request.channel,
+          createdAt: new Date().toISOString(),
+          status: 'pending',
+          state: JSON.stringify({
+            request,
+            toolCall,
+          } satisfies StoredCodexApprovalState),
+        };
+        this.approvals.add(pendingApproval);
+        this.notifyApprovalPending(pendingApproval, toolCall);
+        recordPendingApproval({
+          sessionId,
+          toolName: name,
+          kind: ((error as { context?: { kind?: string } })?.context?.kind ?? decision.kind) as
+            'read' | 'write' | 'execute' | 'send' | 'admin',
+          args,
+          approvalId,
+          mcp: true,
+        });
+        return { pendingApprovalId: approvalId };
+      }
+
+      // T2.4 — when the runtime catches a BoundaryError (e.g.
+      // mcp.server_unavailable from a downed server), feed the
+      // user-facing message back as the tool output so the model's
+      // next turn explains the failure honestly instead of a generic
+      // "MCP tool failed".
+      const userMessage = (error as { userMessage?: unknown })?.userMessage;
+      if (typeof userMessage === 'string' && userMessage) {
+        return { output: userMessage };
+      }
       return { output: `MCP tool "${name}" failed: ${msg}` };
     }
   }

@@ -310,6 +310,15 @@ function cmdMemoryReindex(): number {
 }
 
 async function main(): Promise<void> {
+  // NOTE: an earlier attempt called process.chdir(os.homedir()) here to
+  // dodge a `shell-init: getcwd` warning. That broke previously-working
+  // shell commands — calling chdir on the daemon process apparently
+  // perturbs macOS's sandbox association and makes child Node CLIs
+  // throw EPERM on uv_cwd. The bundle cwd was working before; leave it
+  // alone. The getcwd warning is harmless noise; bash still runs the
+  // command and the binary still gets a usable cwd from spawn's
+  // `cwd:` argument.
+
   const command = process.argv[2] ?? 'help';
 
   if (command === 'help' || command === '--help' || command === '-h') {

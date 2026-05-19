@@ -2,6 +2,17 @@ import type { MCPServer } from '@openai/agents';
 import pino from 'pino';
 import { decideToolApproval } from '../agents/tool-taxonomy.js';
 import { beginToolEvent } from '../agents/tool-observability.js';
+import { BoundaryError } from './boundary-error.js';
+import { rateLimitedAlert } from './rate-limited-alert.js';
+import { withTimeout } from './harness/brackets.js';
+
+// Tighter client-side timeouts than the MCP SDK's default (~60s). Each
+// server that's unreachable used to burn the full 60s before
+// surfacing as a stub; on a daemon with 5 dead servers that's a
+// noticeable boot stall. With 5s/8s, a dead server fast-fails into the
+// backoff loop and stops being probed until its nextRetryAt elapses.
+const MCP_LIST_TOOLS_TIMEOUT_MS = 5_000;
+const MCP_CONNECT_TIMEOUT_MS = 8_000;
 
 type MCPTool = Awaited<ReturnType<MCPServer['listTools']>>[number];
 type CallToolResultContent = Awaited<ReturnType<MCPServer['callTool']>>;
@@ -126,8 +137,102 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): MCPSer
   // server "in flight" promise dedupes concurrent callers too.
   const connectPromises = new WeakMap<MCPServer, Promise<void>>();
 
+  // T2.3 — per-server health tracking. The previous implementation
+  // dropped failed servers' tools silently from the model's surface,
+  // so a connect error looked exactly like "this server was never
+  // installed." With health tracking + a stub `<slug>__unavailable`
+  // tool, the model SEES the failure in its tool catalog and can
+  // tell the user "DataForSEO is offline" instead of pretending the
+  // tool never existed.
+  interface ServerHealth {
+    state: 'connected' | 'degraded' | 'unavailable';
+    lastError?: Error;
+    failureCount: number;
+    nextRetryAt: number; // epoch ms; 0 = retry now
+    reconnectBackoffMs: number;
+  }
+  const serverHealth = new Map<MCPServer, ServerHealth>();
+  // Bounded exponential backoff: 1s → 5s → 30s → 5min, capped.
+  const BACKOFF_LADDER_MS = [1_000, 5_000, 30_000, 300_000];
+  const MAX_BACKOFF_MS = 5 * 60 * 1000;
+
+  function recordHealth(
+    server: MCPServer,
+    update: Partial<ServerHealth> & { state: ServerHealth['state'] },
+  ): ServerHealth {
+    const existing = serverHealth.get(server) ?? {
+      state: 'connected' as const,
+      failureCount: 0,
+      nextRetryAt: 0,
+      reconnectBackoffMs: BACKOFF_LADDER_MS[0],
+    };
+    const next: ServerHealth = { ...existing, ...update };
+    serverHealth.set(server, next);
+    return next;
+  }
+
+  function markServerFailed(server: MCPServer, err: unknown): ServerHealth {
+    const existing = serverHealth.get(server) ?? {
+      state: 'connected' as const,
+      failureCount: 0,
+      nextRetryAt: 0,
+      reconnectBackoffMs: BACKOFF_LADDER_MS[0],
+    };
+    const failureCount = existing.failureCount + 1;
+    const backoff = BACKOFF_LADDER_MS[Math.min(failureCount - 1, BACKOFF_LADDER_MS.length - 1)] ?? MAX_BACKOFF_MS;
+    const errorObj = err instanceof Error ? err : new Error(String(err));
+    const next: ServerHealth = {
+      state: failureCount >= 3 ? 'unavailable' : 'degraded',
+      lastError: errorObj,
+      failureCount,
+      nextRetryAt: Date.now() + backoff,
+      reconnectBackoffMs: backoff,
+    };
+    serverHealth.set(server, next);
+
+    // Fire ONE user notification per server-down event (rate-limited
+    // to 10 min). Without this, a flapping server spams the log; with
+    // it the user gets one actionable message and the rest aggregate.
+    if (next.state === 'unavailable') {
+      const slug = serverSlugs.get(server) ?? server.name;
+      rateLimitedAlert(`mcp-server-down-${slug}`, {
+        title: `MCP server "${server.name}" is unavailable`,
+        body:
+          `${server.name} failed to connect ${failureCount} times in a row. ` +
+          `Last error: ${errorObj.message.slice(0, 200)}. ` +
+          `Reconnect from Settings → MCP Servers or check the server's config.`,
+        kind: 'system',
+        metadata: { slug, failureCount, lastError: errorObj.message },
+      }).catch(() => { /* alert is best-effort */ });
+    }
+    return next;
+  }
+
+  function markServerConnected(server: MCPServer): void {
+    serverHealth.set(server, {
+      state: 'connected',
+      failureCount: 0,
+      nextRetryAt: 0,
+      reconnectBackoffMs: BACKOFF_LADDER_MS[0],
+    });
+  }
+
+  function isServerInBackoffWindow(server: MCPServer): boolean {
+    const h = serverHealth.get(server);
+    return !!h && h.nextRetryAt > Date.now() && h.state !== 'connected';
+  }
+
   async function ensureConnected(server: MCPServer): Promise<void> {
     if (typeof server.connect !== 'function') return;
+    // Backoff guard — if we just tried and failed, don't immediately
+    // retry; let the next listTools call after nextRetryAt elapses
+    // re-attempt. The previous impl deleted connectPromises on error
+    // so every subsequent caller would retry from scratch with no
+    // pacing; one downed server could trigger 100 reconnects/sec.
+    if (isServerInBackoffWindow(server)) {
+      const h = serverHealth.get(server)!;
+      throw h.lastError ?? new Error('server in backoff window');
+    }
     const existing = connectPromises.get(server);
     if (existing) {
       await existing;
@@ -135,15 +240,42 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): MCPSer
     }
     const promise = (async () => {
       try {
-        await server.connect!();
+        await withTimeout(server.connect!(), MCP_CONNECT_TIMEOUT_MS, `mcp.connect[${server.name}]`);
+        markServerConnected(server);
       } catch (err) {
         // Clear so a future call can retry instead of resolving instantly.
         connectPromises.delete(server);
+        markServerFailed(server, err);
         throw err;
       }
     })();
     connectPromises.set(server, promise);
     await promise;
+  }
+
+  /**
+   * T2.3 — synthetic stub tool for a server that's currently
+   * unavailable. The model sees it, so a request that would have gone
+   * to that server now gets a clear "server down" tool output it can
+   * verbalize to the user, instead of the previous behavior where the
+   * tool simply disappeared from the catalog.
+   *
+   * The stub's name is intentionally invalid as a real tool call —
+   * starts with `<slug>__` so the routing map can match it to the
+   * downed server and emit the BoundaryError.
+   */
+  function buildUnavailableStubTool(server: MCPServer, slug: string, health: ServerHealth): MCPTool {
+    const lastErr = health.lastError?.message ?? 'unknown error';
+    return {
+      name: namespaceToolName(slug, 'unavailable'),
+      description:
+        `[${slug}] UNAVAILABLE — ${server.name} failed to connect ` +
+        `(${health.failureCount} consecutive failures: ${lastErr.slice(0, 160)}). ` +
+        `Tools from this server are temporarily unavailable. ` +
+        `If you need a capability from this server, tell the user the data source is offline ` +
+        `and propose an alternative or ask them to reconnect via Settings → MCP Servers.`,
+      inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+    } as unknown as MCPTool;
   }
 
   /** Flatten + rename every underlying server's tools. */
@@ -157,18 +289,36 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): MCPSer
         const slug = serverSlugs.get(server)!;
         try {
           await ensureConnected(server);
-          const list = await server.listTools();
-          return { server, slug, list };
+          const list = await withTimeout(
+            server.listTools(),
+            MCP_LIST_TOOLS_TIMEOUT_MS,
+            `mcp.listTools[${server.name}]`,
+          );
+          markServerConnected(server);
+          return { server, slug, list, status: 'ok' as const };
         } catch (err) {
-          logger.warn({ server: server.name, err: err instanceof Error ? err.message : String(err) }, 'MCP server listTools failed; skipping its tools');
-          return { server, slug, list: [] as MCPTool[] };
+          logger.warn({ server: server.name, err: err instanceof Error ? err.message : String(err) }, 'MCP server listTools failed; surfacing as unavailable stub');
+          markServerFailed(server, err);
+          return { server, slug, list: [] as MCPTool[], status: 'failed' as const };
         }
       }),
     );
 
     for (const result of results) {
       if (result.status !== 'fulfilled') continue;
-      const { server, slug, list } = result.value;
+      const { server, slug, list, status } = result.value;
+      if (status === 'failed') {
+        // T2.3 — emit the unavailable stub instead of silently dropping
+        // the server's tools. The model can read its description and
+        // SEE that this server is offline.
+        const health = serverHealth.get(server);
+        if (health) {
+          const stub = buildUnavailableStubTool(server, slug, health);
+          tools.push(stub);
+          routing.set(stub.name, server);
+        }
+        continue;
+      }
       for (const tool of list) {
         const namespaced = namespaceToolName(slug, tool.name);
         if (routing.has(namespaced)) {
@@ -272,6 +422,31 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): MCPSer
       if (!parsed) {
         throw new Error(`Malformed namespaced tool name: "${toolName}".`);
       }
+      // T2.3 — if the model called the synthetic "<slug>__unavailable"
+      // stub or any tool on a known-unavailable server, throw a
+      // structured BoundaryError instead of dispatching. The runtime
+      // catches and feeds it back as tool output so the model's next
+      // turn explains "Server X is offline" to the user.
+      if (parsed.toolName === 'unavailable' || serverHealth.get(server)?.state === 'unavailable') {
+        const slug = parsed.serverSlug;
+        const health = serverHealth.get(server);
+        throw new BoundaryError({
+          kind: 'mcp.server_unavailable',
+          retryable: true,
+          userMessage:
+            `${server.name} is offline (${health?.failureCount ?? '?'} consecutive failures: ` +
+            `${health?.lastError?.message?.slice(0, 160) ?? 'unknown error'}). ` +
+            `Reconnect via Settings → MCP Servers or use an alternative source.`,
+          operatorMessage: `mcp.server_unavailable slug=${slug} failureCount=${health?.failureCount ?? 'n/a'}`,
+          context: {
+            slug,
+            toolName,
+            originalToolName: parsed.toolName,
+            failureCount: health?.failureCount,
+            lastError: health?.lastError?.message,
+          },
+        });
+      }
 
       // Apply the unified approval taxonomy to MCP calls invoked
       // through the SDK Runner path. The Codex runtime gates approval
@@ -286,9 +461,33 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): MCPSer
       // approval" rather than silent execution.
       const decision = decideToolApproval({ toolName, args });
       if (decision.needsApproval) {
-        throw new Error(
-          `Approval required to call ${toolName} (kind=${decision.kind}, reason=${decision.reason}). The trust gradient is set so this kind of action must be approved before running. Either ask the user to approve, or upgrade the scope policy.`,
-        );
+        // T2.5 — Throw a structured BoundaryError instead of a bare
+        // Error. The Codex runtime's MCP catch path used to receive a
+        // plain Error and stringify it into the tool's output; the
+        // model then read "Approval required to call X" as a tool
+        // result and either gave up or tried something different —
+        // never triggering the real PendingApproval flow. With the
+        // structured error, the runtime can detect the kind and
+        // create an actual approval (mirroring the local-tool path)
+        // so the user sees the apr-xxxx prompt and can resolve it.
+        throw new BoundaryError({
+          kind: 'mcp.approval_blocked',
+          retryable: false,
+          userMessage:
+            `Approval required to call \`${toolName}\` ` +
+            `(${decision.kind} action: ${decision.reason}). ` +
+            `Reply \`approve\` to proceed.`,
+          operatorMessage:
+            `mcp.approval_blocked tool=${toolName} kind=${decision.kind} reason=${decision.reason}`,
+          context: {
+            toolName,
+            originalToolName: parsed.toolName,
+            slug: parsed.serverSlug,
+            kind: decision.kind,
+            reason: decision.reason,
+            args,
+          },
+        });
       }
 
       const finish = beginToolEvent({

@@ -730,6 +730,67 @@ test('runConversation: a short SUBSTANTIVE reply is NOT flagged as a stall', asy
   assert.equal(completedEvents[0].data.summary, 'Added 5 rows to the sheet.');
 });
 
+// ─── T2.2 — generalized stall detector signals ─────────────────
+
+test('runConversation: stuck_detected fires Signal A when zero tools + generic ack', async () => {
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const runner = scriptedRunner([{ finalOutput: 'OK.' }]);
+  await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'do work',
+    makeRunner: makeRunnerStub,
+    runRunner: runner,
+  });
+  const stuckEvents = listEventsForConv(sess.id, { types: ['stuck_detected'] });
+  assert.equal(stuckEvents.length, 1, 'expected one stuck_detected event');
+  assert.equal((stuckEvents[0].data as { signal: string }).signal, 'A_zero_tools');
+});
+
+test('runConversation: Signal D fires when sub-agent emits OrchestratorDecision JSON', async () => {
+  // Pattern: model over-conforms to schema and the SDK passes the
+  // JSON through as a plain string. Today extractFallbackSummary
+  // recovered the reply silently; the detector now ALSO flags it so
+  // ops can see how often this happens.
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const decisionJson = JSON.stringify({
+    summary: 'I drafted a workflow but did not finalize',
+    reply: 'Here is the draft — want me to ship it?',
+    done: false,
+    nextAction: 'awaiting_user_input',
+  });
+  const runner = scriptedRunner([{ finalOutput: decisionJson }]);
+  await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'draft something',
+    makeRunner: makeRunnerStub,
+    runRunner: runner,
+  });
+  const stuckEvents = listEventsForConv(sess.id, { types: ['stuck_detected'] });
+  assert.equal(stuckEvents.length, 1);
+  assert.equal((stuckEvents[0].data as { signal: string }).signal, 'D_decision_json');
+  // The visible summary should be the model's reply (since it had a
+  // usable one) — surfaced through the detector instead of silently
+  // returned as-is.
+  const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] });
+  assert.match(completed[0].data.summary as string, /draft|ship it/i);
+});
+
+test('runConversation: a real "Added 5 rows" reply does NOT fire any stall signal', async () => {
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const runner = scriptedRunner([{ finalOutput: 'Added 5 rows to the sheet.' }]);
+  await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'go',
+    makeRunner: makeRunnerStub,
+    runRunner: runner,
+  });
+  const stuckEvents = listEventsForConv(sess.id, { types: ['stuck_detected'] });
+  assert.equal(stuckEvents.length, 0);
+});
+
 test('runConversation: propagates run_failed status when a turn throws', async () => {
   const sess = HarnessSession.create({ kind: 'chat' });
   const runner = scriptedRunner([{ status: 'throw' }]);

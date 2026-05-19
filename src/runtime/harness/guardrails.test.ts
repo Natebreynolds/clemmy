@@ -225,6 +225,11 @@ test('scanSecrets: previews are truncated to 12 chars', () => {
 });
 
 test('harness registries are populated', () => {
-  assert.equal(harnessInputGuardrails.length, 2);
+  // missingCapabilityGuardrail was removed from the wired list 2026-05-19
+  // (intent-based dispatch plan, Phase 0): hardcoded CLI allowlists
+  // conflict with the global-harness/no-curated-tool-lists principle.
+  // The guardrail itself still exists and is unit-testable; it's just
+  // not in the harness's input-guardrail registry.
+  assert.equal(harnessInputGuardrails.length, 1);
   assert.equal(harnessOutputGuardrails.length, 1);
 });
