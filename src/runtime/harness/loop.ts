@@ -838,12 +838,19 @@ export async function runConversationFromResume(opts: {
   // If reject was the decision, treat it as "done — we cancelled
   // the action" regardless of what the orchestrator says next.
   if (opts.decision === 'reject') {
+    const hasReply = decision?.reply && decision.reply.trim();
     safeAppend({
       sessionId: opts.sessionId,
       turn: lastTurn,
       role: 'system',
       type: 'conversation_completed',
-      data: { steps: 1, reason: 'rejected_by_user', summary: decision?.summary },
+      data: {
+        steps: 1,
+        reason: 'rejected_by_user',
+        summary: hasReply ? decision!.reply! : decision?.summary,
+        internalSummary: decision?.summary,
+        reply: decision?.reply ?? null,
+      },
     });
     return {
       sessionId: opts.sessionId,
@@ -859,12 +866,31 @@ export async function runConversationFromResume(opts: {
   let stepIndex = 1;
   while (stepIndex < maxSteps) {
     if (!decision || decision.done) {
+      // Render priority on the chat surface: prefer `reply` (user-facing)
+      // over `summary` (internal META log). Mirrors the equivalent path
+      // in runConversation at line ~286 — without this the resume path
+      // leaks the META summary into Discord so the user sees "Resumed
+      // the stale-account workflow context, recognized…" instead of the
+      // actual reply the model produced.
+      const hasReply = decision?.reply && decision.reply.trim();
+      const isCompletedAction = decision?.nextAction === 'completed';
+      const userVisibleSummary = hasReply
+        ? decision!.reply!
+        : isCompletedAction
+          ? `(The model marked the turn complete without producing a user-facing reply. This is a bug. Internal log: ${decision?.summary ?? '(none)'})`
+          : decision?.summary;
       safeAppend({
         sessionId: opts.sessionId,
         turn: lastTurn,
         role: 'system',
         type: 'conversation_completed',
-        data: { steps: stepIndex, summary: decision?.summary },
+        data: {
+          steps: stepIndex,
+          summary: userVisibleSummary,
+          internalSummary: decision?.summary,
+          reply: decision?.reply ?? null,
+          missingReply: isCompletedAction && !hasReply ? true : undefined,
+        },
       });
       return {
         sessionId: opts.sessionId,
