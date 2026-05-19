@@ -124,18 +124,86 @@ test('Orchestrator hands off to the five sub-agents by name', async () => {
   assert.ok(handoffNames.includes('Deployer'), `missing Deployer in ${handoffNames}`);
 });
 
-test('request_approval is wired to the SDK approval interrupt', async () => {
+test('request_approval triggers the SDK interrupt for external/destructive actions', async () => {
   const t = buildRequestApprovalTool();
   assert.equal(t.name, 'request_approval');
-  // The SDK accepts a (runContext, input) => boolean | Promise<boolean>
-  // for needsApproval. We force-trigger so the harness can pause the
-  // run on every request_approval call.
   const needsFn = t.needsApproval as unknown as (
     ctx: unknown,
-    input: unknown,
-  ) => Promise<boolean> | boolean;
-  const result = await needsFn({}, {});
-  assert.equal(result, true);
+    input: { subject: string; reason: string | null; destructive: boolean },
+  ) => Promise<boolean>;
+  // External mutation — should pause for human approval.
+  assert.equal(
+    await needsFn({}, { subject: 'Send email to customer', reason: 'Outreach', destructive: false }),
+    true,
+  );
+  // Destructive remote action — should pause.
+  assert.equal(
+    await needsFn({}, { subject: 'Delete remote record', reason: null, destructive: true }),
+    true,
+  );
+  // Composio write — should pause.
+  assert.equal(
+    await needsFn({}, { subject: 'Create Salesforce account', reason: null, destructive: false }),
+    true,
+  );
+});
+
+test('request_approval auto-resolves local saves so user-initiated memory writes do not stall', async () => {
+  // Repro: orchestrator was gating "save salesforce CLI rule to memory" behind
+  // an approval prompt even though the action was local and the user had just
+  // asked for it. The "approve" reply landed on a different paused session
+  // and the rule never made it into the vault, so the agent kept re-asking
+  // the same context question across sessions.
+  const t = buildRequestApprovalTool();
+  const needsFn = t.needsApproval as unknown as (
+    ctx: unknown,
+    input: { subject: string; reason: string | null; destructive: boolean },
+  ) => Promise<boolean>;
+  // The exact production case from sess-mpbpih0u — must NOT pause.
+  assert.equal(
+    await needsFn({}, {
+      subject: 'Save Salesforce access rule to memory',
+      reason: 'Store user preference that Salesforce work should use the CLI by default',
+      destructive: false,
+    }),
+    false,
+  );
+  // Other local-save phrasings the model commonly produces — none should pause.
+  for (const subject of [
+    'Remember this fact',
+    'Add a task to TASKS.md',
+    'Update a goal',
+    'Save workflow draft',
+    'Persist note to vault',
+  ]) {
+    assert.equal(
+      await needsFn({}, { subject, reason: null, destructive: false }),
+      false,
+      `local-save should auto-approve: ${subject}`,
+    );
+  }
+});
+
+test('request_approval execute carries auto-approval reason when the action was local', async () => {
+  // When the runtime guard auto-resolves, the execute payload should make
+  // that explicit so the orchestrator's next decision knows it can proceed
+  // without re-confirming.
+  const t = buildRequestApprovalTool();
+  const sess = createSession({ kind: 'chat' });
+  const result = await invokeFunctionTool(
+    t,
+    {
+      subject: 'Save Salesforce CLI rule to memory',
+      reason: 'User preference',
+      destructive: false,
+    },
+    { sessionId: sess.id, turn: 1 },
+  );
+  assert.match(result, /Auto-approved \(local save/);
+  // No approval_requested event was emitted (the loop is what emits it, and
+  // for auto-resolved calls the SDK never triggers the interrupt).
+  const events = listEvents(sess.id, { types: ['approval_requested'] });
+  assert.equal(events.length, 0);
 });
 
 // The SDK's tool() exposes `invoke(runContext, inputString)` rather

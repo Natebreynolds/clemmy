@@ -92,21 +92,56 @@ const requestApprovalParams = z.object({
   destructive: z.boolean().describe('Is the approved action destructive?'),
 });
 
+/**
+ * Detect when the orchestrator is asking for approval on something that
+ * is clearly LOCAL (memory / vault / tasks / plans / goals / files in
+ * the user's workspace). The user already consented by asking; an
+ * approval gate here is friction the user reads as a bug.
+ *
+ * Observed failure mode (sess-mpbpih0u, 2026-05-18 14:27): user said
+ * "save salesforce CLI rule to memory please" → orchestrator called
+ * request_approval(subject="Save Salesforce access rule to memory",
+ * destructive:false) → the user's later "approve" landed on a
+ * different paused session, and the rule was never written. The agent
+ * then re-asked the same context question on every follow-up because
+ * the rule didn't make it into the vault.
+ *
+ * Returns true when the subject + reason patterns indicate a local
+ * save the orchestrator should NOT have gated. Used by needsApproval
+ * to skip the SDK interrupt, so the request_approval call acts like
+ * an auto-resolved "yes" and the orchestrator can continue.
+ */
+const LOCAL_SAVE_PATTERN = /\b(memory|vault|note|fact|task|plan|goal|workflow|cron|preference|rule|reminder)\b/i;
+const LOCAL_VERB_PATTERN = /\b(save|record|remember|write|note|track|add|update|log|store|persist)\b/i;
+function isLocalSaveApproval(args: { subject: string; reason: string | null; destructive: boolean }): boolean {
+  if (args.destructive) return false;
+  const subject = args.subject;
+  const reason = args.reason ?? '';
+  const combined = `${subject} ${reason}`;
+  // Both a local-noun (memory/vault/etc.) AND a save-verb (save/remember/etc.)
+  // must appear. Single-pattern matches are too loose — "save the email"
+  // could refer to a remote service.
+  return LOCAL_VERB_PATTERN.test(combined) && LOCAL_SAVE_PATTERN.test(combined);
+}
+
 export function buildRequestApprovalTool() {
   return tool({
     name: 'request_approval',
     description:
-      'Pause and ask the user to approve a specific action. The harness records an approval_requested event; the next turn resumes after the user responds.',
+      'Pause and ask the user to approve a specific action. ONLY use this for actions that change state OUTSIDE Clementine — sending an email, posting to Slack, running a Composio write tool, deleting a remote record, deploying a release, executing arbitrary shell. DO NOT use this for local saves the user just asked for (memory writes, vault notes, tasks, goals, plans) — the ask IS the consent; gating it again is a bug.',
     parameters: requestApprovalParams,
-    // Force-trigger the SDK's approval interrupt. The harness catches
-    // it (loop.ts awaiting_approval branch), emits approval_requested
-    // with the tool args, persists RunState, and resumes after the UI
-    // resolves the request. execute() only runs after approval — at
-    // that point the approved action's already in motion, so the only
-    // thing left is to acknowledge it to the model.
-    needsApproval: async () => true,
+    // Skip the SDK approval interrupt when the model misclassifies a
+    // local save as needing approval. The instruction above tells the
+    // model not to do this, but the prompt isn't load-bearing — if the
+    // model still calls request_approval with subject="save X to
+    // memory" + destructive:false, the runtime guard turns it into a
+    // no-op so the user doesn't see a phantom approval prompt and the
+    // orchestrator can keep moving.
+    needsApproval: async (_ctx, input) => !isLocalSaveApproval(input as z.infer<typeof requestApprovalParams>),
     execute: async (args) =>
-      `Approved: ${args.subject}. Proceed with the action you described.`,
+      isLocalSaveApproval(args)
+        ? `Auto-approved (local save — no external mutation): ${args.subject}. Proceed with the save and report back what landed.`
+        : `Approved: ${args.subject}. Proceed with the action you described.`,
   });
 }
 
@@ -159,8 +194,9 @@ const ORCHESTRATOR_INSTRUCTIONS = [
   '  1. Greeting / chitchat → answer directly. No handoff, no memory call. Done.',
   '  2. Trivial single-tool ask → hand off to Executor with a one-line directive. Do not over-plan.',
   '  3. Multi-step ask → call `draft_plan` first, then hand off to the right sub-agent for step 1.',
-  '  4. Destructive or external-mutating step → call `request_approval` before handing off.',
-  '  5. Ambiguous ask that references prior context → hand off to Researcher to recall context FIRST, then re-decide. Only call `ask_user_question` when the request is genuinely unparseable (not when you can look it up).',
+  '  4. Destructive or EXTERNALLY-MUTATING step → call `request_approval` before handing off. The approval gate is ONLY for actions that change state OUTSIDE Clementine — sending an email, posting to Slack, running a Composio write tool, deleting a remote record, deploying a release, executing arbitrary shell. The user already consented to anything they JUST asked you to do; the gate exists to catch you over-reaching past their request.',
+  '  5. LOCAL writes are NOT gated — never call `request_approval` for them. This includes: writing/updating memory (memory_remember, memory_write), saving tasks (task_add, task_update), updating goals, drafting workflows or plans, writing files inside the user\'s vault or workspace, and recording notes. When the user says "remember this", "save that to memory", "note this", "track this task", "add a goal" — that IS the consent. Hand off to Executor/Writer immediately. Asking for approval on top of their explicit save request is friction the user reads as a bug (observed: "save salesforce CLI rule to memory" was approval-gated for hours, the rule never landed, the agent kept asking the same context question again).',
+  '  6. Ambiguous ask that references prior context → hand off to Researcher to recall context FIRST, then re-decide. Only call `ask_user_question` when the request is genuinely unparseable (not when you can look it up).',
   'Researcher returned "not found" — when Researcher reports it could not locate the specific thing the user asked about after a reasonable search, DO NOT hand off again hoping for better results. Call `ask_user_question` with what was searched and a concrete question about where to look ("I searched <list of places> for <thing the user asked about> and didn\'t find it — is it in a specific folder I should look in, or somewhere outside the linked workspaces?"). One cheap clarifying exchange beats burning another budget on the same dead-end.',
   'After approval — when the user has just approved a destructive / external-mutating action, you ALREADY have what you need to hand off. Do not emit a structured output saying "I cannot continue because the tool is not available." Instead, hand off to the sub-agent that can actually do the work (almost always Executor for cx_* / Composio actions, file writes, shell commands, or external API calls; Writer for drafts; Deployer for releases). The handoffs are real — you can see them in your tool list as transfer_to_Researcher / transfer_to_Writer / transfer_to_Reviewer / transfer_to_Executor / transfer_to_Deployer. If you genuinely don\'t see the handoff you need, ask the user with a specific question about what tool/integration to enable — never silently give up after collecting approval.',
   'External actions — DISCOVER YOURSELF, then EXECUTE. Composio is part of Clementine; you have direct access to `composio_search_tools` (read-only, doesn\'t violate the no-action-tools rule). When the user wants an action on a connected external service (Instagram post, Slack DM, Trello card, send an email, anything outside the curated cx_* tools):',
