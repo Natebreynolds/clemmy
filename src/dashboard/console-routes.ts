@@ -97,7 +97,7 @@ import {
 } from '../runtime/harness/eventlog.js';
 import { runConversation, runConversationFromResume } from '../runtime/harness/loop.js';
 import { HarnessSession } from '../runtime/harness/session.js';
-import { parseApprovalIntent } from '../channels/discord-harness.js';
+import { parseApprovalIntent, parseHarnessCommand } from '../channels/discord-harness.js';
 import { buildOrchestratorAgent } from '../agents/orchestrator.js';
 import { configureHarnessRuntime } from '../runtime/harness/codex-client.js';
 import { summarizeApprovalAction } from '../runtime/approval-summary.js';
@@ -3132,6 +3132,90 @@ export function registerConsoleRoutes(
     const sessionId = session.id;
     const streamUrl = `/api/sessions/${sessionId}/events`;
 
+    // /cancel, /new, and /continue commands — handled BEFORE the
+    // approval-resume path so a user typing "cancel" gets to abandon
+    // the pause instead of being routed through reject. /continue
+    // is the T1.3 graceful-continue path: when the loop hits a step
+    // or wall-clock budget, it emits a "Reply `continue` to keep
+    // going" message; the user typing `continue` rewrites the prompt
+    // into a structured continuation directive and falls through to
+    // the normal turn path.
+    const command = parseHarnessCommand(input);
+    if (command === 'cancel') {
+      const harnessSessionForCancel = HarnessSession.load(sessionId);
+      const { listPending: listPendingApprovals, resolve: resolveApproval } =
+        await import('../runtime/harness/approval-registry.js');
+      const pending = listPendingApprovals({ sessionId, status: 'pending' });
+      let cancelledCount = 0;
+      for (const row of pending) {
+        const r = resolveApproval(row.approvalId, 'cancelled_by_user', 'chat-dock-user');
+        if (r.ok) cancelledCount++;
+      }
+      try {
+        harnessSessionForCancel?.clearInterruptState();
+        harnessSessionForCancel?.markStatus('cancelled');
+      } catch { /* best effort */ }
+      const { appendEvent } = await import('../runtime/harness/eventlog.js');
+      try {
+        appendEvent({
+          sessionId,
+          turn: 0,
+          role: 'system',
+          type: 'conversation_completed',
+          data: {
+            summary: cancelledCount > 0
+              ? `Cancelled. Abandoned ${cancelledCount} pending approval${cancelledCount === 1 ? '' : 's'}. Send a new message to start fresh.`
+              : 'Cancelled. Session cleared. Send a new message to start fresh.',
+            reason: 'cancelled_by_user',
+            approvalsCancelled: cancelledCount,
+          },
+        });
+      } catch { /* best effort */ }
+      res.status(202).json({ sessionId, streamUrl, status: 'cancelled', mode: 'command' });
+      return;
+    }
+    if (command === 'new') {
+      // The chat-dock client owns the sessionId reference, so /new is
+      // a hint to start a fresh session on the next message. Confirm
+      // and return; the next POST without sessionId creates a new one.
+      const { appendEvent } = await import('../runtime/harness/eventlog.js');
+      try {
+        appendEvent({
+          sessionId,
+          turn: 0,
+          role: 'system',
+          type: 'conversation_completed',
+          data: {
+            summary: 'Fresh session ready. Your next message will start a new conversation.',
+            reason: 'new_requested',
+          },
+        });
+      } catch { /* best effort */ }
+      res.status(202).json({ sessionId, streamUrl, status: 'new-pending', mode: 'command' });
+      return;
+    }
+
+    // /continue — rewrite the bare keyword into a structured
+    // continuation directive when the session's last completion was
+    // an awaiting_continue (limit-exceeded). Falls through to the
+    // normal turn path with the rewritten input.
+    let turnInput = input;
+    if (command === 'continue') {
+      const { readLastConversationCompletion } = await import('../channels/discord-harness.js');
+      const lastCompletion = readLastConversationCompletion(sessionId);
+      if (lastCompletion?.reason === 'awaiting_continue') {
+        const summaryHint = lastCompletion.lastDecisionSummary
+          ? `Your last summary on the prior turn was: "${lastCompletion.lastDecisionSummary.slice(0, 400)}".`
+          : 'Use the conversation history above to figure out where you were.';
+        turnInput = [
+          'You hit a step / time budget on the previous turn and the user has now replied `continue`.',
+          'Pick up where you left off; do not restart the workflow from scratch.',
+          summaryHint,
+          'Continue with the next step of your plan. If you have nothing left to do, set done=true and nextAction=completed.',
+        ].join('\n\n');
+      }
+    }
+
     // If this session is paused on an SDK approval interrupt and the
     // user's message is an approve/reject intent, take the RESUME path
     // instead of starting a new turn. Mirrors the Discord-side
@@ -3146,7 +3230,7 @@ export function registerConsoleRoutes(
       sessionId,
       streamUrl,
       status: intent ? 'resuming' : 'started',
-      mode: intent ? `approval-${intent}` : 'fresh',
+      mode: intent ? `approval-${intent.decision}` : 'fresh',
     });
 
     setImmediate(async () => {
@@ -3156,11 +3240,21 @@ export function registerConsoleRoutes(
           await runConversationFromResume({
             agent,
             sessionId,
-            decision: intent === 'approve' ? 'approve' : 'reject',
+            decision: intent.decision,
           });
+          // Resolve the pending approval registry rows for this
+          // session so the addressable-approval state machine reflects
+          // the user's choice. Matches the discord-harness path.
+          const { listPending: listPendingApprovals, resolve: resolveApproval } =
+            await import('../runtime/harness/approval-registry.js');
+          const pending = listPendingApprovals({ sessionId, status: 'pending' });
+          const resolution = intent.decision === 'approve' ? 'approved' : 'rejected';
+          for (const row of pending) {
+            resolveApproval(row.approvalId, resolution, 'chat-dock-user');
+          }
           return;
         }
-        await runConversation({ agent, sessionId, input });
+        await runConversation({ agent, sessionId, input: turnInput });
       } catch (err) {
         // The loop emits its own run_failed when a turn throws. If we
         // got here, the throw happened BEFORE any turn started

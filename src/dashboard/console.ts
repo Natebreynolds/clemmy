@@ -4305,7 +4305,9 @@ body {
 .wf-list-head-cron { margin-top: 6px; border-top: 1px solid var(--line); }
 .wf-list-meta { color: var(--fg-mute); font-size: 10px; }
 .wf-cron-list { flex: 0 0 auto; max-height: 45vh; }
-.wf-cron-row { padding: 9px 12px; cursor: default; }
+.wf-cron-row { padding: 9px 12px; cursor: pointer; }
+.wf-cron-row.selected { background: var(--bg-3); box-shadow: inset 2px 0 0 var(--accent-3); }
+.wf-cron-row:hover { background: var(--bg-3); }
 .wf-cron-row .wf-cron-head { display: flex; flex-direction: column; gap: 4px; }
 .wf-cron-row .name {
   color: var(--fg);
@@ -4344,6 +4346,94 @@ body {
   max-height: 5em;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* Cron detail view rendered in wf-editor when a cron row is clicked.
+   Same container as the workflow editor; the wf-empty placeholder is
+   replaced by a cron-specific layout. */
+.cron-detail {
+  padding: 18px 22px;
+  overflow-y: auto;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+.cron-detail-head h2 {
+  margin: 0 0 8px;
+  font-size: 14px;
+  letter-spacing: 0.08em;
+  color: var(--fg);
+}
+.cron-detail-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: 10px;
+}
+.cron-detail-meta .pill {
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  padding: 2px 6px;
+  border: 1px solid var(--line);
+  color: var(--fg-3);
+}
+.cron-detail-meta .pill.on { color: var(--accent-2); border-color: var(--accent-2); }
+.cron-detail-meta .pill.off { color: var(--fg-mute); }
+.cron-detail-meta .pill.cron { color: var(--accent-3); border-color: var(--accent-3); }
+.cron-detail-section { display: flex; flex-direction: column; gap: 8px; }
+.cron-detail-label {
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  color: var(--fg-3);
+}
+.cron-detail-prompt {
+  margin: 0;
+  padding: 10px 12px;
+  background: var(--bg-1);
+  border-left: 2px solid var(--line);
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--fg);
+  max-height: 14em;
+  overflow-y: auto;
+}
+.cron-detail-empty { color: var(--fg-mute); font-size: 11px; font-style: italic; }
+.cron-detail-run {
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  padding: 8px 10px;
+  background: var(--bg-1);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.cron-detail-run.ok { border-left: 2px solid var(--accent-2); }
+.cron-detail-run.err { border-left: 2px solid #e25656; }
+.cron-detail-run-head {
+  display: flex;
+  justify-content: space-between;
+  font-size: 10px;
+  letter-spacing: 0.1em;
+}
+.cron-detail-run-head .status { color: var(--fg); }
+.cron-detail-run-head .when { color: var(--fg-3); }
+.cron-detail-run.ok .cron-detail-run-head .status { color: var(--accent-2); }
+.cron-detail-run.err .cron-detail-run-head .status { color: #e25656; }
+.cron-detail-run-body {
+  margin: 0;
+  padding: 8px 10px;
+  background: var(--bg-2);
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--fg-3);
+  max-height: 12em;
+  overflow-y: auto;
+  border-radius: 2px;
 }
 
 /* Editor */
@@ -9129,6 +9219,17 @@ const CONSOLE_JS = `
         selectWorkflowByName(name);
         return;
       }
+      // Cron rows live in the same pane but route to selectCronByName
+      // so the middle pane renders the cron detail view instead of the
+      // workflow editor. Checked AFTER workflowRow so a cron click
+      // doesn't accidentally trigger workflow selection.
+      const cronRow = target.closest('li.wf-cron-row');
+      if (cronRow) {
+        event.preventDefault();
+        const cronName = cronRow.getAttribute('data-wf-cron-name');
+        if (cronName) selectCronByName(cronName);
+        return;
+      }
       if (target.closest('[data-wf-new]')) {
         event.preventDefault();
         startNewWorkflow();
@@ -9170,6 +9271,12 @@ const CONSOLE_JS = `
     } catch { return '—'; }
   }
 
+  // Cache the most recent /api/console/crons payload so selecting a
+  // cron doesn't have to round-trip — refreshCronList is the single
+  // source of truth, selectCronByName reads from this cache.
+  let cronsCache = [];
+  let cronSelectedName = null;
+
   async function refreshCronList() {
     const listEl = document.querySelector('[data-wf-cron-list]');
     const countEl = document.querySelector('[data-wf-cron-count]');
@@ -9177,12 +9284,14 @@ const CONSOLE_JS = `
     try {
       const data = await fetchJSON('/api/console/crons');
       const crons = data.crons || [];
+      cronsCache = crons;
       if (countEl) countEl.textContent = String(crons.length);
       if (crons.length === 0) {
         listEl.innerHTML = '<li class="empty">— no scheduled jobs —</li>';
         return;
       }
       listEl.innerHTML = crons.map((c) => {
+        const selected = (cronSelectedName === c.name) ? ' selected' : '';
         const enabledPill = c.enabled
           ? '<span class="pill on">● ENABLED</span>'
           : '<span class="pill off">○ DISABLED</span>';
@@ -9207,7 +9316,7 @@ const CONSOLE_JS = `
         }
         const runsCount = '<span class="pill">' + (c.runCount || 0) + ' run' + ((c.runCount || 0) === 1 ? '' : 's') + '</span>';
         return [
-          '<li class="wf wf-cron-row" data-wf-cron-name="' + escMem(c.name) + '">',
+          '<li class="wf wf-cron-row' + selected + '" data-wf-cron-name="' + escMem(c.name) + '">',
           '  <div class="wf-cron-head">',
           '    <span class="name">' + escMem(c.name) + '</span>',
           '    <span class="meta">' + enabledPill + schedPill + lastBadge + runsCount + '</span>',
@@ -9220,6 +9329,106 @@ const CONSOLE_JS = `
       listEl.innerHTML = '<li class="empty">— failed: ' + escMem(err.message || err) + ' —</li>';
     }
   }
+
+  function describeCronSchedule(expr) {
+    // Best-effort human-readable from standard 5-field cron. Falls back
+    // to the raw expression for shapes we don't recognize.
+    if (!expr || typeof expr !== 'string') return '';
+    const parts = expr.trim().split(/\s+/);
+    if (parts.length !== 5) return '';
+    const [min, hour, dom, mon, dow] = parts;
+    const allWild = (dom === '*' && mon === '*' && dow === '*');
+    const days =
+      dow === '1-5' ? 'weekdays' :
+      dow === '0,6' || dow === '6,0' ? 'weekends' :
+      dow === '1' ? 'Mondays' :
+      dow === '2' ? 'Tuesdays' :
+      dow === '3' ? 'Wednesdays' :
+      dow === '4' ? 'Thursdays' :
+      dow === '5' ? 'Fridays' :
+      dow === '0' ? 'Sundays' :
+      '';
+    if (min === '0' && /^\d+$/.test(hour) && allWild) {
+      return 'every day at ' + hour + ':00';
+    }
+    if (min === '0' && /^\d+$/.test(hour) && dow && days) {
+      return days + ' at ' + hour + ':00';
+    }
+    if (min === '0' && /^\d+-\d+$/.test(hour) && allWild) {
+      const [a, b] = hour.split('-');
+      return 'every hour from ' + a + ':00 to ' + b + ':00';
+    }
+    return '';
+  }
+
+  function selectCronByName(name) {
+    if (!name || !wf.editor) return;
+    cronSelectedName = name;
+    // Deselect any selected workflow — clicking a cron is a different
+    // surface than the workflow editor; clear so the user sees the
+    // cron view without a stale "selected workflow" row in the list.
+    wfSelectedName = null;
+    const wfRows = wf.list ? Array.from(wf.list.querySelectorAll('li.wf')) : [];
+    wfRows.forEach((el) => el.classList.remove('selected'));
+    const cronListEl = document.querySelector('[data-wf-cron-list]');
+    if (cronListEl) {
+      const rows = Array.from(cronListEl.querySelectorAll('li.wf-cron-row'));
+      rows.forEach((el) => el.classList.toggle('selected', el.getAttribute('data-wf-cron-name') === name));
+    }
+    const cron = cronsCache.find((c) => c.name === name);
+    if (!cron) {
+      wf.editor.innerHTML = '<div class="wf-empty"><div class="wf-empty-mark">!</div><div class="wf-empty-text">Cron not found — try refreshing the list.</div></div>';
+      return;
+    }
+    const hint = describeCronSchedule(cron.schedule);
+    const enabledPill = cron.enabled
+      ? '<span class="pill on">● ENABLED</span>'
+      : '<span class="pill off">○ DISABLED</span>';
+    const runs = (cron.recentRuns || []).slice().reverse();
+    const runsHtml = runs.length === 0
+      ? '<div class="cron-detail-empty">— no runs recorded —</div>'
+      : runs.map((r) => {
+        const okClass = r.status === 'ok' ? 'ok' : r.status === 'error' ? 'err' : '';
+        const dur = typeof r.durationMs === 'number' ? (r.durationMs / 1000).toFixed(1) + 's' : '—';
+        const body = (r.error || r.responseExcerpt || '').slice(0, 1200);
+        return [
+          '<div class="cron-detail-run ' + okClass + '">',
+          '  <div class="cron-detail-run-head">',
+          '    <span class="status">' + (r.status === 'ok' ? '✓ ok' : r.status === 'error' ? '✗ error' : '· ' + escMem(r.status)) + '</span>',
+          '    <span class="when">' + escMem(r.startedAt || '—') + ' · ' + dur + (r.source ? ' · ' + escMem(r.source) : '') + '</span>',
+          '  </div>',
+          body ? '<pre class="cron-detail-run-body">' + escMem(body) + '</pre>' : '',
+          '</div>',
+        ].join('');
+      }).join('');
+
+    wf.editor.innerHTML = [
+      '<div class="cron-detail">',
+      '  <div class="cron-detail-head">',
+      '    <div class="cron-detail-title">',
+      '      <h2>' + escMem(cron.name) + '</h2>',
+      '      <div class="cron-detail-meta">',
+      '        ' + enabledPill,
+      '        <span class="pill cron">⏱ ' + escMem(cron.schedule) + (hint ? ' · ' + escMem(hint) : '') + '</span>',
+      '        <span class="pill">mode: ' + escMem(cron.mode || 'standard') + '</span>',
+      cron.maxHours ? '        <span class="pill">max ' + cron.maxHours + 'h</span>' : '',
+      cron.workDir ? '        <span class="pill">cwd: ' + escMem(cron.workDir) + '</span>' : '',
+      '      </div>',
+      '    </div>',
+      '  </div>',
+      '  <div class="cron-detail-section">',
+      '    <div class="cron-detail-label">PROMPT</div>',
+      '    <pre class="cron-detail-prompt">' + escMem(cron.prompt || '— (none)') + '</pre>',
+      '  </div>',
+      '  <div class="cron-detail-section">',
+      '    <div class="cron-detail-label">RECENT RUNS · ' + (cron.runCount || 0) + '</div>',
+      '    ' + runsHtml,
+      '  </div>',
+      '</div>',
+    ].filter(Boolean).join('');
+  }
+
+  window.__clementineSelectCron = selectCronByName;
 
   function selectWorkflowByName(name) {
     if (!name || !wf.list) return;
@@ -11102,7 +11311,11 @@ const CONSOLE_JS = `
           // through runConversationFromResume.
           const subj = (ev.data && (ev.data.subject || ev.data.tool)) || 'action';
           const reason = (ev.data && ev.data.reason) || '';
-          setChatTurnText(turn, 'Approval required: ' + subj + (reason ? '\\n\\n' + reason : '') + '\\n\\nReply **approve** to continue or **reject** to cancel.');
+          const apr = ev.data && typeof ev.data.approvalId === 'string' ? ev.data.approvalId : null;
+          const replyHint = apr
+            ? 'Reply \`approve ' + apr + '\` (or \`reject ' + apr + '\`) to continue.'
+            : 'Reply **approve** to continue or **reject** to cancel.';
+          setChatTurnText(turn, 'Approval required: ' + subj + (reason ? '\\n\\n' + reason : '') + '\\n\\n' + replyHint);
           setChatTurnStatus(turn, 'awaiting approval');
           finish();
         }

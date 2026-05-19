@@ -13,7 +13,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { EventRow } from '../runtime/harness/eventlog.js';
-import { applyEventToState } from './discord-harness.js';
+import { applyEventToState, parseApprovalIntent, parseHarnessCommand } from './discord-harness.js';
 
 function freshState() {
   return { summary: '', status: 'starting', done: false, toolsCalled: [], toolCount: 0 };
@@ -154,4 +154,107 @@ test('summary persists across steps when a later event lacks one', () => {
   applyEventToState(event('tool_called', { tool: 'write_file' }), s);
   assert.equal(s.summary, 'researched accounts');
   assert.equal(s.status, 'using write_file');
+});
+
+// ─── parseApprovalIntent — T1.2 tightening (v0.4.22+) ─────────────
+
+test('parseApprovalIntent: strong verbs match without an apr-xxxx', () => {
+  assert.deepEqual(parseApprovalIntent('approve'), { decision: 'approve' });
+  assert.deepEqual(parseApprovalIntent('approved'), { decision: 'approve' });
+  assert.deepEqual(parseApprovalIntent('proceed'), { decision: 'approve' });
+  assert.deepEqual(parseApprovalIntent('go ahead'), { decision: 'approve' });
+  assert.deepEqual(parseApprovalIntent('lgtm'), { decision: 'approve' });
+  assert.deepEqual(parseApprovalIntent('do it'), { decision: 'approve' });
+  assert.deepEqual(parseApprovalIntent('confirm'), { decision: 'approve' });
+  assert.deepEqual(parseApprovalIntent('👍'), { decision: 'approve' });
+  assert.deepEqual(parseApprovalIntent('reject'), { decision: 'reject' });
+  assert.deepEqual(parseApprovalIntent('deny'), { decision: 'reject' });
+  assert.deepEqual(parseApprovalIntent('abort'), { decision: 'reject' });
+  assert.deepEqual(parseApprovalIntent('nevermind'), { decision: 'reject' });
+  assert.deepEqual(parseApprovalIntent("don't do it"), { decision: 'reject' });
+  assert.deepEqual(parseApprovalIntent('👎'), { decision: 'reject' });
+});
+
+test('parseApprovalIntent: bare loose verbs do NOT match (T1.2 tightening)', () => {
+  // These used to count as approve/reject under the old matcher. They
+  // were the source of the "what's up?" hijack — too many real
+  // conversation messages started with these.
+  assert.equal(parseApprovalIntent('yes'), null);
+  assert.equal(parseApprovalIntent('y'), null);
+  assert.equal(parseApprovalIntent('ok'), null);
+  assert.equal(parseApprovalIntent('okay'), null);
+  assert.equal(parseApprovalIntent('sure'), null);
+  assert.equal(parseApprovalIntent('sounds good'), null);
+  assert.equal(parseApprovalIntent('no'), null);
+  assert.equal(parseApprovalIntent('n'), null);
+  assert.equal(parseApprovalIntent('stop'), null);
+  // The "cancel" word is reserved for /cancel — no longer a reject.
+  assert.equal(parseApprovalIntent('cancel'), null);
+  assert.equal(parseApprovalIntent("what's up?"), null);
+  assert.equal(parseApprovalIntent('any updates?'), null);
+});
+
+test('parseApprovalIntent: loose verbs DO match when an apr-xxxx is present', () => {
+  // "yes apr-26ba" reads as approval because the ID makes the intent
+  // unambiguous; the user is explicitly addressing the approval.
+  assert.deepEqual(parseApprovalIntent('yes apr-26ba'), { decision: 'approve', approvalId: 'apr-26ba' });
+  assert.deepEqual(parseApprovalIntent('ok apr-xy7q'), { decision: 'approve', approvalId: 'apr-xy7q' });
+  assert.deepEqual(parseApprovalIntent('sure apr-1abc'), { decision: 'approve', approvalId: 'apr-1abc' });
+  assert.deepEqual(parseApprovalIntent('no apr-99zz'), { decision: 'reject', approvalId: 'apr-99zz' });
+  assert.deepEqual(parseApprovalIntent('stop apr-0000'), { decision: 'reject', approvalId: 'apr-0000' });
+});
+
+test('parseApprovalIntent: strong verbs pick up an apr-xxxx when present', () => {
+  assert.deepEqual(parseApprovalIntent('approve apr-xy7q'), { decision: 'approve', approvalId: 'apr-xy7q' });
+  assert.deepEqual(parseApprovalIntent('reject apr-26ba'), { decision: 'reject', approvalId: 'apr-26ba' });
+  // ID at end of a longer phrase still extracts.
+  assert.deepEqual(
+    parseApprovalIntent('approve the salesforce one apr-111h please'),
+    { decision: 'approve', approvalId: 'apr-111h' },
+  );
+});
+
+test('parseApprovalIntent: trims + ignores case', () => {
+  assert.deepEqual(parseApprovalIntent('  APPROVE  '), { decision: 'approve' });
+  assert.deepEqual(parseApprovalIntent('Reject'), { decision: 'reject' });
+});
+
+test('parseApprovalIntent: empty string returns null', () => {
+  assert.equal(parseApprovalIntent(''), null);
+  assert.equal(parseApprovalIntent('   '), null);
+});
+
+// ─── parseHarnessCommand — /cancel and /new (T1.2) ────────────────
+
+test('parseHarnessCommand: recognizes /cancel and bare cancel', () => {
+  assert.equal(parseHarnessCommand('/cancel'), 'cancel');
+  assert.equal(parseHarnessCommand('cancel'), 'cancel');
+  assert.equal(parseHarnessCommand('  cancel  '), 'cancel');
+  assert.equal(parseHarnessCommand('CANCEL'), 'cancel');
+});
+
+test('parseHarnessCommand: recognizes /new and bare new', () => {
+  assert.equal(parseHarnessCommand('/new'), 'new');
+  assert.equal(parseHarnessCommand('new'), 'new');
+  assert.equal(parseHarnessCommand('  New  '), 'new');
+});
+
+test('parseHarnessCommand: recognizes /continue, continue, and "keep going" (T1.3)', () => {
+  assert.equal(parseHarnessCommand('/continue'), 'continue');
+  assert.equal(parseHarnessCommand('continue'), 'continue');
+  assert.equal(parseHarnessCommand('Continue'), 'continue');
+  assert.equal(parseHarnessCommand('keep going'), 'continue');
+  assert.equal(parseHarnessCommand('  CONTINUE  '), 'continue');
+});
+
+test('parseHarnessCommand: does NOT match substring matches or natural language', () => {
+  // The whole message must equal the command — "cancel the workflow"
+  // is a regular agent prompt, not a /cancel directive.
+  assert.equal(parseHarnessCommand('cancel the workflow'), null);
+  assert.equal(parseHarnessCommand('please cancel'), null);
+  assert.equal(parseHarnessCommand('start a new project'), null);
+  assert.equal(parseHarnessCommand('/cancel-this'), null);
+  assert.equal(parseHarnessCommand('continue the conversation'), null);
+  assert.equal(parseHarnessCommand("let's keep going on this"), null);
+  assert.equal(parseHarnessCommand(''), null);
 });

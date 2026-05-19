@@ -671,6 +671,23 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
 
   logger.info('Daemon loop started');
 
+  // Start the approval reaper. Every 60s it expires past-due rows in
+  // pending_approvals (default TTL 24h), clears the orphan session's
+  // interrupt state, marks the session 'cancelled', and posts a user
+  // notification ("Approval on `X` expired — re-ask and I'll redo it").
+  // Without this, the audit found 3+ paused sessions that sat in
+  // __interrupt_state indefinitely; the user had no signal the work
+  // was lost. See src/runtime/harness/reaper.ts.
+  try {
+    const { startApprovalReaper } = await import('../runtime/harness/reaper.js');
+    startApprovalReaper();
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'Approval reaper failed to start (continuing without periodic expiry)',
+    );
+  }
+
   // Warm the CLI-discovery cache in the background so the first agent
   // call to local_cli_list and the first dashboard render of the Local
   // CLIs card don't pay the full $PATH-walk-and-probe cost (5–30s on a

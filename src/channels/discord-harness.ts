@@ -29,6 +29,7 @@ import {
 import { runConversation, runConversationFromResume } from '../runtime/harness/loop.js';
 import { HarnessSession } from '../runtime/harness/session.js';
 import { openEventLog } from '../runtime/harness/eventlog.js';
+import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { buildOrchestratorAgent } from '../agents/orchestrator.js';
 
 const EDIT_DEBOUNCE_MS = 2_000;
@@ -114,6 +115,19 @@ function getOrHydrateChannelSession(channelId: string): ChannelSessionEntry | nu
   return entry;
 }
 
+/**
+ * Per-channel staleness window. If the user's last interaction with
+ * the channel-cached session was longer ago than this AND a fresh
+ * non-approval message arrives, open a NEW session instead of
+ * grafting. Prevents the failure mode where a 6-hour-old paused
+ * session captures unrelated chat as a "continuation."
+ *
+ * 5 min is short enough to keep continuation feeling fluid in an
+ * active conversation, long enough that a brief context switch
+ * doesn't lose state.
+ */
+const STALE_SESSION_MS = 5 * 60 * 1000;
+
 function resolveOrCreateSession(opts: {
   channelId: string;
   userId: string;
@@ -123,8 +137,21 @@ function resolveOrCreateSession(opts: {
   const now = Date.now();
   const existing = getOrHydrateChannelSession(opts.channelId);
   if (existing) {
-    existing.lastUsedAt = now;
-    return { id: existing.sessionId, isContinuation: true };
+    // Continuation is intentional ONLY when the channel was actively
+    // engaged recently. After STALE_SESSION_MS without traffic, fresh
+    // messages open a new session — the prior one keeps its history
+    // and (if paused) stays reachable via apr-xxxx. Without this, a
+    // paused session that sat 6 hours would silently absorb the next
+    // unrelated message as if it were continuing the same workflow.
+    const elapsed = now - existing.lastUsedAt;
+    if (elapsed <= STALE_SESSION_MS) {
+      existing.lastUsedAt = now;
+      return { id: existing.sessionId, isContinuation: true };
+    }
+    // Stale: drop the cached reference. The old session row + any
+    // pending approvals stay in the DB; they're just no longer the
+    // channel's "default."
+    channelSessions.delete(opts.channelId);
   }
   const session = createHarnessSession({
     kind: 'chat',
@@ -146,21 +173,256 @@ export function clearDiscordHarnessSession(channelId: string): void {
 }
 
 /**
+ * /cancel handler — abandon paused approvals on this channel, clear
+ * the session's interrupt state, mark the session 'cancelled', and
+ * confirm to the user. The paused approval rows are resolved with
+ * 'cancelled_by_user' so the audit log distinguishes user-driven
+ * abandonment from reaper-driven expiry.
+ *
+ * The session row stays in the DB (we don't delete history) — just
+ * its status flips and its interrupt state is cleared so the next
+ * message from the user starts fresh.
+ */
+async function handleHarnessCancel(opts: {
+  channelId: string;
+  transport: DiscordHarnessTransport;
+}): Promise<void> {
+  const entry = getOrHydrateChannelSession(opts.channelId);
+  if (!entry) {
+    await opts.transport.sendError('Nothing to cancel — no paused session on this channel.');
+    return;
+  }
+  const session = HarnessSession.load(entry.sessionId);
+  if (!session) {
+    channelSessions.delete(opts.channelId);
+    await opts.transport.sendError('Nothing to cancel — the session is no longer available.');
+    return;
+  }
+
+  // Resolve any pending registry rows for this session as cancelled_by_user.
+  let cancelledCount = 0;
+  for (const row of approvalRegistry.listPending({ sessionId: session.id, status: 'pending' })) {
+    const result = approvalRegistry.resolve(row.approvalId, 'cancelled_by_user', 'discord-user');
+    if (result.ok) cancelledCount++;
+  }
+  // Clear interrupt state + mark session cancelled. The next message
+  // resolveOrCreateSession will create a fresh session because the
+  // staleness check sees this one as terminal.
+  try {
+    session.clearInterruptState();
+    session.markStatus('cancelled');
+  } catch {
+    /* best effort — the user-facing confirmation still goes out */
+  }
+  channelSessions.delete(opts.channelId);
+
+  // Emit a harness event so the audit log + dashboard see the cancel.
+  try {
+    appendHarnessEvent({
+      sessionId: session.id,
+      turn: 0,
+      role: 'user',
+      type: 'approval_resolved',
+      data: {
+        decision: 'cancelled_by_user',
+        approvalsCancelled: cancelledCount,
+      },
+    });
+  } catch {
+    /* best effort */
+  }
+
+  const replyBody = cancelledCount > 0
+    ? `🍊 Cancelled. Abandoned ${cancelledCount} pending approval${cancelledCount === 1 ? '' : 's'} on this channel. Send a new message to start fresh.`
+    : '🍊 Cancelled. Session cleared. Send a new message to start fresh.';
+  try {
+    const handle = await opts.transport.sendInitial(replyBody);
+    // sendInitial returns a handle but we don't need to edit it — the
+    // body is the final message.
+    void handle;
+  } catch {
+    /* transport already failed once; user can re-engage if needed */
+  }
+}
+
+/**
+ * /new handler — drop the channel's cached session so the next
+ * message creates a fresh one. The paused session (if any) stays
+ * in __interrupt_state and addressable via its apr-xxxx code, but
+ * the channel no longer routes incoming messages to it.
+ *
+ * Distinct from /cancel: /new keeps the old session reachable (for
+ * later `approve apr-xxxx`); /cancel actively abandons it.
+ */
+async function handleHarnessNew(opts: {
+  channelId: string;
+  transport: DiscordHarnessTransport;
+}): Promise<void> {
+  const entry = getOrHydrateChannelSession(opts.channelId);
+  channelSessions.delete(opts.channelId);
+
+  if (entry) {
+    const pending = approvalRegistry.listPending({ sessionId: entry.sessionId, status: 'pending' });
+    const addressableHint = pending.length > 0
+      ? ` The paused session is still reachable via \`approve ${pending[0].approvalId}\` (or \`reject\`).`
+      : '';
+    await opts.transport.sendInitial(`🍊 Fresh session ready. Send your first message.${addressableHint}`);
+  } else {
+    await opts.transport.sendInitial('🍊 Fresh session ready. Send your first message.');
+  }
+}
+
+/**
  * Detect approve / reject intent in a Discord prompt. Conservative —
  * only matches at the start of the message and only when a session
  * is actually awaiting approval. "Yes" mid-conversation when nothing
  * is pending should be treated as a regular new turn, not an approval.
+ *
+ * Returns `{ decision, approvalId? }` so callers can route an explicit
+ * `approve apr-xy7q` (or `reject apr-xy7q`) at exactly the addressable
+ * approval, instead of the legacy "most recent paused session" fallback
+ * that today silently routes to the wrong session when multiple are
+ * pending. The approval ID is the apr-<4 base36 chars> format minted
+ * by approval-registry.ts.
+ *
+ * Matcher tightening (T1.2): the old permissive set (`yes|y|ok|okay`)
+ * hijacked plenty of conversational messages — "yes please continue
+ * the workflow" got routed as an approval. The new rule:
+ *   - STRONG verbs (`approve`, `reject`, `proceed`, `go ahead`, `lgtm`,
+ *     `do it`, `confirm`, `deny`, `abort`, `nevermind`, 👍/👎) match
+ *     regardless of whether an apr-xxxx is present.
+ *   - LOOSE verbs (`yes`, `y`, `ok`, `okay`, `no`, `n`, `sure`, etc.)
+ *     ONLY match when paired with an explicit apr-xxxx code. A bare
+ *     "yes" no longer reads as approval; "yes apr-26ba" does.
+ *   - "cancel" is reserved for the /cancel command (parseHarnessCommand);
+ *     it no longer counts as a reject so users can abandon the pause
+ *     entirely instead of resolving it as rejected.
  */
-export function parseApprovalIntent(prompt: string): 'approve' | 'reject' | null {
+export interface ParsedApprovalIntent {
+  decision: 'approve' | 'reject';
+  /** When the user typed `approve apr-xy7q` or `reject apr-xy7q`. */
+  approvalId?: string;
+}
+
+// Strong verbs — unambiguous endorsement / rejection of an approval.
+// Match at the start of the message ONLY so "I approve of that idea"
+// doesn't fire when nothing is asking for approval.
+//
+// The emoji patterns are separate from the word patterns because
+// JavaScript's `\b` (ASCII word boundary) doesn't fire around an
+// emoji codepoint, so `^👍\b` never matches. Two patterns, OR'd at
+// the caller, keeps each clean and well-tested.
+const STRONG_APPROVE = /^(approve(d)?|proceed|go ahead|lgtm|do it|confirm(ed)?)\b/;
+const STRONG_APPROVE_EMOJI = /^👍/;
+const STRONG_REJECT = /^(reject(ed)?|deny|denied|abort|nevermind|never mind|don'?t do (it|that))\b/;
+const STRONG_REJECT_EMOJI = /^👎/;
+// Loose verbs — require an apr-xxxx in the message to disambiguate
+// from regular conversation. "yes apr-26ba" reads as approval; bare
+// "yes" does not (it's just a conversational ack).
+const LOOSE_APPROVE_WITH_ID = /^(yes|y|ok|okay|sure|sounds good|do this)\b/;
+const LOOSE_REJECT_WITH_ID = /^(no|n|stop)\b/;
+const APR_ID_PATTERN = /\bapr-([a-z0-9]{4})\b/;
+
+export function parseApprovalIntent(prompt: string): ParsedApprovalIntent | null {
   const t = prompt.trim().toLowerCase();
   if (!t) return null;
-  if (/^(approve(d)?|yes|y|go( ahead)?|proceed|ok|okay|lgtm|sounds good|do it|👍)\b/.test(t)) {
-    return 'approve';
+  const idMatch = APR_ID_PATTERN.exec(t);
+  const approvalId = idMatch ? `apr-${idMatch[1]}` : undefined;
+
+  if (STRONG_APPROVE.test(t) || STRONG_APPROVE_EMOJI.test(t)) {
+    return approvalId ? { decision: 'approve', approvalId } : { decision: 'approve' };
   }
-  if (/^(reject(ed)?|no|n|cancel|stop|abort|nevermind|never mind|don'?t|👎)\b/.test(t)) {
-    return 'reject';
+  if (STRONG_REJECT.test(t) || STRONG_REJECT_EMOJI.test(t)) {
+    return approvalId ? { decision: 'reject', approvalId } : { decision: 'reject' };
+  }
+  // Loose verbs only count when an apr-xxxx code is also present —
+  // that's the explicit signal "yes I mean THIS approval".
+  if (approvalId && LOOSE_APPROVE_WITH_ID.test(t)) {
+    return { decision: 'approve', approvalId };
+  }
+  if (approvalId && LOOSE_REJECT_WITH_ID.test(t)) {
+    return { decision: 'reject', approvalId };
   }
   return null;
+}
+
+/**
+ * Slash-style command parser for harness-channel control. Distinct
+ * from parseApprovalIntent so the two surfaces don't bleed into each
+ * other — `cancel` used to count as a reject, which conflated
+ * "abandon this whole session" with "say no to the specific tool the
+ * bot asked permission for." Now `/cancel` is its own thing.
+ *
+ * Recognized:
+ *   /cancel     — abandon the paused approval(s) on this channel,
+ *                 clear the session's interrupt state, mark the
+ *                 session 'cancelled'. Frees the channel for a fresh
+ *                 turn.
+ *   /new        — start a fresh session on this channel ignoring any
+ *                 paused one. The paused session stays addressable
+ *                 via its apr-xxxx code for later.
+ *
+ * Accepts both `/cancel` and bare `cancel` / `new` on a line by
+ * itself, so the user doesn't need to know the prefix.
+ */
+export type HarnessCommand = 'cancel' | 'new' | 'continue';
+export function parseHarnessCommand(prompt: string): HarnessCommand | null {
+  const t = prompt.trim().toLowerCase();
+  if (t === '/cancel' || t === 'cancel') return 'cancel';
+  if (t === '/new' || t === 'new') return 'new';
+  // /continue (T1.3 graceful continue) — the loop emits a "Reply
+  // `continue` to keep going" message when it hits a step or wall-clock
+  // limit. Honor a bare `continue` or `keep going` so the user can
+  // resume long-running work without re-typing the original request.
+  if (t === '/continue' || t === 'continue' || t === 'keep going') return 'continue';
+  return null;
+}
+
+/**
+ * Find the most recent `conversation_completed` event for a session.
+ * Used by the /continue path to inspect whether the session ended on
+ * an awaiting_continue limit and to extract the last orchestrator
+ * summary as continuation context.
+ */
+export function readLastConversationCompletion(sessionId: string): {
+  reason?: string;
+  limitKind?: string;
+  lastDecisionSummary?: string;
+} | null {
+  try {
+    const db = openEventLog();
+    const row = db
+      .prepare(`SELECT data_json FROM events WHERE session_id = ? AND type = 'conversation_completed' ORDER BY seq DESC LIMIT 1`)
+      .get(sessionId) as { data_json: string } | undefined;
+    if (!row) return null;
+    const parsed = JSON.parse(row.data_json) as Record<string, unknown>;
+    return {
+      reason: typeof parsed.reason === 'string' ? parsed.reason : undefined,
+      limitKind: typeof parsed.limitKind === 'string' ? parsed.limitKind : undefined,
+      lastDecisionSummary: typeof parsed.lastDecisionSummary === 'string' ? parsed.lastDecisionSummary : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Build the synthetic input the orchestrator sees on a /continue
+ * resume. The session history is replayed in full via
+ * session.toInputItems, so the model already has all prior turns —
+ * this prompt just gives it explicit permission to keep going + a
+ * pointer to the last decision's summary so it doesn't restart from
+ * scratch.
+ */
+function buildContinueInput(lastSummary: string | undefined): string {
+  return [
+    'You hit a step / time budget on the previous turn and the user has now replied `continue`.',
+    'Pick up where you left off; do not restart the workflow from scratch.',
+    lastSummary
+      ? `Your last summary on the prior turn was: "${lastSummary.slice(0, 400)}".`
+      : 'Use the conversation history above to figure out where you were.',
+    'Continue with the next step of your plan. If you have nothing left to do, set done=true and nextAction=completed.',
+  ].join('\n\n');
 }
 
 /**
@@ -199,7 +461,8 @@ export async function tryHandleHarnessApprovalReply(opts: {
   if (!intent) return false;
   await runDiscordHarnessResume({
     channelId: opts.channelId,
-    decision: intent,
+    decision: intent.decision,
+    approvalId: intent.approvalId,
     transport: opts.transport,
   });
   return true;
@@ -341,12 +604,55 @@ export async function runDiscordHarnessConversation(opts: {
   guildId: string | null;
   transport: DiscordHarnessTransport;
 }): Promise<void> {
-  const { prompt, channelId, userId, guildId, transport } = opts;
+  const { channelId, userId, guildId, transport } = opts;
+  // `prompt` is `let` (not destructured const) because the /continue
+  // command path rewrites it from the bare "continue" the user typed
+  // into a structured continuation directive the orchestrator can
+  // act on. The rest of the function treats it as the user's input
+  // verbatim.
+  let prompt = opts.prompt;
 
   const auth = await configureHarnessRuntime();
   if (!auth.ok) {
     await transport.sendError(`Cannot start: ${auth.reason}`);
     return;
+  }
+
+  // Harness-control commands (/cancel, /new, /continue) — handled
+  // BEFORE approval routing so a user-typed "cancel" abandons the
+  // pause instead of counting as a reject (the old matcher conflated
+  // the two and left the user with no way to back out without
+  // "resolving" the action).
+  const command = parseHarnessCommand(prompt);
+  if (command === 'cancel') {
+    await handleHarnessCancel({ channelId, transport });
+    return;
+  }
+  if (command === 'new') {
+    await handleHarnessNew({ channelId, transport });
+    // Fall through is intentional — /new just clears the
+    // channel-cached session; the rest of this function then creates
+    // a fresh one. But the user's actual prompt was "/new", not
+    // something the agent should reason about. Return so the user
+    // sees the confirmation and can send their real first message.
+    return;
+  }
+  if (command === 'continue') {
+    // /continue is only meaningful when the session's last
+    // conversation_completed was an "awaiting_continue" — the
+    // synthetic prompt we emit from the loop's max-step / wall-clock
+    // branch. When that's the case, rewrite the bare "continue" into
+    // a structured continuation directive the orchestrator can act
+    // on (with the prior turn's summary inlined for context), and
+    // fall through to the normal turn path. Otherwise leave `continue`
+    // as-is and let the agent handle it as a regular message.
+    const entry = getOrHydrateChannelSession(channelId);
+    if (entry) {
+      const lastCompletion = readLastConversationCompletion(entry.sessionId);
+      if (lastCompletion?.reason === 'awaiting_continue') {
+        prompt = buildContinueInput(lastCompletion.lastDecisionSummary);
+      }
+    }
   }
 
   // Approval-resume path: if the channel has a paused session and
@@ -359,7 +665,8 @@ export async function runDiscordHarnessConversation(opts: {
     if (intent) {
       await runDiscordHarnessResume({
         channelId,
-        decision: intent,
+        decision: intent.decision,
+        approvalId: intent.approvalId,
         transport,
       });
       return;
@@ -505,9 +812,15 @@ export async function runDiscordHarnessConversation(opts: {
 async function runDiscordHarnessResume(opts: {
   channelId: string;
   decision: 'approve' | 'reject';
+  /** When the user typed `approve apr-xy7q`, route to that specific
+   *  pending approval (even if it belongs to a different session
+   *  than the channel's most-recent). Without this, multi-session
+   *  channels silently routed "approve" to the most-recent paused
+   *  session, losing work on the older one (audit 2026-05-18). */
+  approvalId?: string;
   transport: DiscordHarnessTransport;
 }): Promise<void> {
-  const { channelId, decision, transport } = opts;
+  const { channelId, decision, approvalId, transport } = opts;
 
   // Configure the codex bridge BEFORE driving the SDK runner. The
   // resume path can be the first thing the daemon does after a
@@ -522,13 +835,78 @@ async function runDiscordHarnessResume(opts: {
     return;
   }
 
-  const entry = channelSessions.get(channelId);
-  if (!entry) {
-    await transport.sendError('No paused session to resume.');
-    return;
+  // ── Route the approval ────────────────────────────────────────
+  // Three cases, in priority order:
+  //   1. `approvalId` supplied → look it up in the registry. If it
+  //      points to a session paused for the same channel, switch to
+  //      that session (overrides the channelSessions "most recent"
+  //      heuristic). If it's missing / already resolved / not on this
+  //      channel, tell the user and bail.
+  //   2. No `approvalId` AND exactly one session paused on this
+  //      channel → continue with the channelSessions entry (today's
+  //      behavior).
+  //   3. No `approvalId` AND multiple distinct sessions paused on
+  //      this channel → tell the user the list of apr-xxx codes and
+  //      bail. Never silently route to the wrong session.
+  let sessionId: string;
+  if (approvalId) {
+    const row = approvalRegistry.get(approvalId);
+    if (!row) {
+      await transport.sendError(`No pending approval matches \`${approvalId}\`. It may have already been resolved or expired.`);
+      return;
+    }
+    if (row.status !== 'pending') {
+      await transport.sendError(`Approval \`${approvalId}\` was already ${row.status}${row.resolution ? ` (${row.resolution})` : ''}.`);
+      return;
+    }
+    if (row.channel && row.channel !== 'discord' && row.channel !== 'discord-dm') {
+      // Cross-channel approvals are intentionally blocked — the user
+      // should resolve from the channel where the approval originated.
+      await transport.sendError(`Approval \`${approvalId}\` belongs to a different channel.`);
+      return;
+    }
+    sessionId = row.sessionId;
+  } else {
+    const pendingOnChannel = approvalRegistry
+      .listPending({ status: 'pending' })
+      .filter((row) => row.channel === 'discord' || row.channel === 'discord-dm');
+    const distinctSessions = [...new Set(pendingOnChannel.map((r) => r.sessionId))];
+    const fallback = channelSessions.get(channelId);
+    if (distinctSessions.length > 1) {
+      // Multiple paused sessions — make the user pick.
+      const summary = distinctSessions.slice(0, 5).map((sid) => {
+        const rows = pendingOnChannel.filter((r) => r.sessionId === sid);
+        const first = rows[0];
+        return `  • \`${first.approvalId}\` — ${first.subject}`;
+      }).join('\n');
+      await transport.sendError(
+        `You have ${distinctSessions.length} paused approvals on this channel. Reply \`${decision} apr-xxxx\` for the one you mean:\n${summary}`,
+      );
+      return;
+    }
+    if (distinctSessions.length === 1) {
+      sessionId = distinctSessions[0];
+    } else if (fallback) {
+      // Registry has nothing recorded (pre-migration session or a
+      // race) — fall back to today's "most recent on channel" so we
+      // don't regress sessions that paused before the registry
+      // existed.
+      sessionId = fallback.sessionId;
+    } else {
+      await transport.sendError('No paused session to resume.');
+      return;
+    }
   }
-  const sessionId = entry.sessionId;
-  entry.lastUsedAt = Date.now();
+
+  const entry = channelSessions.get(channelId);
+  if (entry && entry.sessionId === sessionId) {
+    entry.lastUsedAt = Date.now();
+  } else {
+    // The chosen session may not be the channel-cached one (when
+    // routing by approvalId). Update the cache so subsequent
+    // interactions in this channel target the now-active session.
+    channelSessions.set(channelId, { sessionId, lastUsedAt: Date.now() });
+  }
 
   let handle: DiscordHarnessReplyHandle;
   try {
@@ -644,6 +1022,19 @@ async function runDiscordHarnessResume(opts: {
         sessionId,
         decision,
       });
+      // Resolve every still-pending registry row for this session.
+      // The SDK's resume processes ALL interrupted tool calls at once
+      // (it's a single state, not per-tool), so we mirror that by
+      // marking every pending apr-xxx for this session as resolved
+      // with the user's chosen decision. Best-effort — if the row was
+      // already expired by the reaper between user click and resume,
+      // the resolve() returns ok:false reason:'already_resolved' and
+      // we move on.
+      const pendingForSession = approvalRegistry.listPending({ sessionId, status: 'pending' });
+      const resolution = decision === 'approve' ? 'approved' : 'rejected';
+      for (const row of pendingForSession) {
+        approvalRegistry.resolve(row.approvalId, resolution, 'discord-user');
+      }
       // If reject — the run pivoted to "no work to do" and the
       // conversation is effectively done. Force the UI into the
       // completed state so the placeholder updates with a final
@@ -778,11 +1169,20 @@ export function applyEventToState(event: EventRow, state: DisplayState): void {
     }
     case 'approval_requested': {
       const subject = String(data.subject ?? data.tool ?? 'action');
+      // When the registry-side write succeeded, the event data carries
+      // an apr-xxxx ID. Include it in the body so the user can
+      // disambiguate when multiple sessions are paused on the same
+      // channel ("Reply `approve apr-xy7q`"). Fall back to plain
+      // "approve" when no ID is present (pre-migration sessions).
+      const approvalId = typeof data.approvalId === 'string' ? data.approvalId : null;
+      const replyHint = approvalId
+        ? `Reply \`approve ${approvalId}\` (or \`reject ${approvalId}\`) to continue.`
+        : 'Reply **approve** to continue or **reject** to cancel.';
       // Move the approval text into summary (which survives the
       // done=true render path) instead of status (which renderBody
       // hides when done). Without this the placeholder degrades to
       // "working…" forever — the user never sees what's pending.
-      state.summary = `Approval required: ${subject}\n\nReply **approve** to continue or **reject** to cancel.`;
+      state.summary = `Approval required: ${subject}\n\n${replyHint}`;
       state.status = 'approval required';
       state.done = true;
       return;

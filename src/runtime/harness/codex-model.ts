@@ -50,6 +50,7 @@ import type { AgentInputItem, AgentOutputItem } from '@openai/agents-core';
 import type { StreamEvent } from '@openai/agents-core/types';
 import { MODELS } from '../../config.js';
 import { loadFreshCodexAccessToken, extractAccountIdFromJwt } from './codex-client.js';
+import { BoundaryError } from '../boundary-error.js';
 
 const CODEX_URL = 'https://chatgpt.com/backend-api/codex/responses';
 const CODEX_USER_AGENT = 'Codex/0.118.0';
@@ -101,6 +102,27 @@ export class CodexResponsesModel implements Model {
       // Pass everything else through verbatim. The SDK doesn't act on
       // these but trace/observability code can inspect them.
       yield { type: 'model', event: evt } as StreamEvent;
+    }
+
+    // T1.4 — refuse to fabricate a clean "response_done" when the
+    // upstream stream never emitted response.completed. The previous
+    // behavior here synthesized response_done with empty usage,
+    // letting the SDK proceed as if the model had finished cleanly;
+    // the caller could not distinguish "model said nothing" from
+    // "connection dropped mid-stream." Throw a structured boundary
+    // error instead so the harness logs it as codex.sse_truncated +
+    // surfaces a real message to the user.
+    if (!completedEvent) {
+      throw new BoundaryError({
+        kind: 'codex.sse_truncated',
+        retryable: true,
+        userMessage: "Clementine's model backend dropped the connection before finishing this turn. Retry — if it persists, the Codex backend may be having an incident.",
+        operatorMessage: `getStreamedResponse: SSE ended without response.completed (items=${seenOutputItems.length}, responseId=${responseId ?? 'none'})`,
+        context: {
+          itemCount: seenOutputItems.length,
+          responseId: responseId ?? null,
+        },
+      });
     }
 
     // Codex's response.completed has output: []. Stuff in the items
@@ -587,6 +609,30 @@ function assembleModelResponse(events: AnyCodexEvent[]): ModelResponse {
     } else if (evt.type === 'response.completed' || evt.type === 'response.done') {
       completed = evt;
     }
+  }
+  // T1.4 — SSE truncation honesty. If we processed the entire event
+  // stream and never saw a `response.completed` (or `response.done`),
+  // the upstream connection dropped mid-response. Before this throw,
+  // we returned a ModelResponse with empty usage and partial items;
+  // the SDK then treated that as "the model finished cleanly with no
+  // work to do" and the harness emitted an empty conversation_completed
+  // — observed on the 2026-05-17 cluster of 15 sessions that died
+  // with no diagnostic surface. Now we throw a structured error the
+  // top-level handler can retry on (`retryable: true`) and surface
+  // to the user as "Model response was cut short."
+  if (!completed) {
+    throw new BoundaryError({
+      kind: 'codex.sse_truncated',
+      retryable: true,
+      userMessage: "Clementine's model backend dropped the connection before finishing this turn. Retry — if it persists, the Codex backend may be having an incident.",
+      operatorMessage: `assembleModelResponse: SSE ended without response.completed (events=${events.length}, items=${items.length}, responseId=${responseId ?? 'none'})`,
+      context: {
+        eventCount: events.length,
+        itemCount: items.length,
+        responseId: responseId ?? null,
+        lastEventType: events[events.length - 1]?.type ?? null,
+      },
+    });
   }
   return {
     output: items.map(convertCodexItemToSdkOutputItem),

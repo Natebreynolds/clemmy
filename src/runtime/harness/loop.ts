@@ -17,6 +17,9 @@ import {
   DEFAULT_TOOL_CALLS_PER_TURN,
 } from './brackets.js';
 import { attachEventLogHooks, extractSessionIdFromContext, type RunHooksLike } from './hooks.js';
+import * as approvalRegistry from './approval-registry.js';
+import { actionBus } from '../action-bus.js';
+import { BoundaryError } from '../boundary-error.js';
 
 /**
  * Wrap appendEvent so a transient SQLite write failure (lock, disk
@@ -37,6 +40,65 @@ function safeAppend(input: AppendEventInput): void {
       err: err instanceof Error ? err.message : String(err),
     });
   }
+}
+
+/**
+ * Register pending approvals in the approval-registry and emit the
+ * `approval_requested` events with the approval ID inlined into the
+ * event data. The two emit sites (runTurn at ~530, resumePendingApproval
+ * at ~742) used to inline this; consolidated here so both surfaces stay
+ * in sync. The registry write is best-effort — if it fails (e.g. table
+ * missing on a pre-migration DB), the event still emits so the existing
+ * "is paused?" check based on loadInterruptState keeps working.
+ *
+ * Returns the array of approval IDs (one per interruption) so the
+ * caller can include them in the user-facing prompt body.
+ */
+function registerAndEmitApprovals(
+  options: { sessionId: string; turn: number },
+  session: HarnessSession,
+  interruptions: InterruptionInfo[],
+): string[] {
+  const approvalIds: string[] = [];
+  const channel = session.sessionRow.channel ?? null;
+  for (const interruption of interruptions) {
+    const subject = extractApprovalSubject(interruption);
+    let approvalId: string | null = null;
+    try {
+      const row = approvalRegistry.register({
+        sessionId: options.sessionId,
+        channel,
+        subject,
+        tool: interruption.toolName,
+        args: interruption.args ?? null,
+      });
+      approvalId = row.approvalId;
+    } catch (err) {
+      // Best-effort. The hot-patch flow today exercises a DB where the
+      // table may be missing if migrations didn't run yet; we don't
+      // want to fail the whole approval pause on a registry write.
+      console.error('[harness] approval-registry.register failed (continuing without ID)', {
+        sessionId: options.sessionId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+    if (approvalId) approvalIds.push(approvalId);
+    safeAppend({
+      sessionId: options.sessionId,
+      turn: options.turn,
+      role: 'orchestrator',
+      type: 'approval_requested',
+      data: {
+        tool: interruption.toolName,
+        subject,
+        args: interruption.args,
+        rawArgs: interruption.rawArgs,
+        approvalId, // null when registry write failed; consumers fall
+                    // back to old "single pending approval" routing.
+      },
+    });
+  }
+  return approvalIds;
 }
 
 /**
@@ -201,7 +263,58 @@ export const DEFAULT_MAX_CONVERSATION_WALL_MS = 30 * 60 * 1000;
 const CONTINUATION_INPUT =
   'Continue with the next step of your plan. If you have nothing left to do, set done=true and nextAction=completed.';
 
+/**
+ * Emit the terminal `runtime.completed` or `runtime.failed` action-bus
+ * event for a finished `runConversation` call. The invariant
+ * (T0.6 + T1.5): every runConversation invocation terminates with
+ * EXACTLY ONE of these signals, so subscribers (Discord, dashboard
+ * SSE, ops log) can distinguish "still in flight" from "died silently"
+ * by construction. runtime.failed is reserved for genuine failures
+ * (status='failed', the unhandled-exception branch in handleRunError);
+ * status='awaiting_approval' / 'awaiting_user_input' / 'limit_exceeded'
+ * / 'killed' all count as clean terminations and emit runtime.completed.
+ */
+function emitRuntimeTerminalEvent(sessionId: string, result: RunConversationResult): void {
+  try {
+    if (result.status === 'failed') {
+      const message = result.error ?? 'unknown error';
+      const err = new BoundaryError({
+        kind: 'runtime.unknown',
+        retryable: false,
+        userMessage: `Clementine hit an unexpected error during this turn. ${message.slice(0, 200)}`,
+        operatorMessage: `runConversation status=failed: ${message}`,
+        context: {
+          sessionId,
+          steps: result.steps,
+          error: message,
+        },
+      });
+      actionBus.emit({
+        kind: 'runtime.failed',
+        sessionId,
+        error: err,
+        surface: 'both',
+      });
+    } else {
+      actionBus.emit({ kind: 'runtime.completed', sessionId });
+    }
+  } catch {
+    // The action bus already swallows listener exceptions, but a
+    // BoundaryError construction throw would still escape — wrap
+    // just-in-case so a terminal-event emit failure never propagates
+    // into the loop's return contract.
+  }
+}
+
 export async function runConversation(
+  options: RunConversationOptions,
+): Promise<RunConversationResult> {
+  const result = await runConversationCore(options);
+  emitRuntimeTerminalEvent(options.sessionId, result);
+  return result;
+}
+
+async function runConversationCore(
   options: RunConversationOptions,
 ): Promise<RunConversationResult> {
   const maxSteps = options.maxSteps ?? DEFAULT_MAX_CONVERSATION_STEPS;
@@ -395,12 +508,13 @@ export async function runConversation(
 
     // Wall-clock check before we kick off another turn.
     if (Date.now() - startedAt > maxWallMs) {
-      safeAppend({
+      emitLimitExceededWithContinuePrompt({
         sessionId: options.sessionId,
         turn: turnResult.turn,
-        role: 'system',
-        type: 'conversation_limit_exceeded',
-        data: { steps: stepIndex, reason: 'wall_clock', maxWallClockMs: maxWallMs },
+        steps: stepIndex,
+        reason: 'wall_clock',
+        limitDetail: { maxWallClockMs: maxWallMs },
+        lastDecision: decision ?? lastDecision,
       });
       return {
         sessionId: options.sessionId,
@@ -416,12 +530,13 @@ export async function runConversation(
   }
 
   // Max steps without resolution.
-  safeAppend({
+  emitLimitExceededWithContinuePrompt({
     sessionId: options.sessionId,
     turn: lastTurn,
-    role: 'system',
-    type: 'conversation_limit_exceeded',
-    data: { steps: stepIndex, reason: 'max_steps', maxSteps },
+    steps: stepIndex,
+    reason: 'max_steps',
+    limitDetail: { maxSteps },
+    lastDecision,
   });
   return {
     sessionId: options.sessionId,
@@ -430,6 +545,62 @@ export async function runConversation(
     lastDecision,
     lastTurn,
   };
+}
+
+/**
+ * Emit BOTH the audit-trail `conversation_limit_exceeded` event AND a
+ * user-facing `conversation_completed` event that carries a synthesized
+ * reply asking the user whether to keep going.
+ *
+ * Before this helper, the loop emitted only the audit event, which
+ * the chat surface had no good way to render — the user saw silence
+ * or "Continuing." (the sub-agent stall pattern). The synthetic
+ * conversation_completed flows through the existing chat-dock +
+ * Discord rendering path, so the user sees: "I've been working on
+ * this for N steps and there's more to do. Reply `continue` to keep
+ * going, or break it into a smaller piece."
+ *
+ * When the user replies `continue`, the entry-point handlers
+ * (discord-harness, console-routes /api/harness/chat) detect that
+ * keyword and start a fresh runConversation on the SAME session with
+ * the prior decision's summary prepended so the orchestrator picks
+ * up where it left off.
+ */
+function emitLimitExceededWithContinuePrompt(opts: {
+  sessionId: string;
+  turn: number;
+  steps: number;
+  reason: 'wall_clock' | 'max_steps';
+  limitDetail: Record<string, unknown>;
+  lastDecision: OrchestratorDecisionShape | undefined;
+}): void {
+  safeAppend({
+    sessionId: opts.sessionId,
+    turn: opts.turn,
+    role: 'system',
+    type: 'conversation_limit_exceeded',
+    data: { steps: opts.steps, reason: opts.reason, ...opts.limitDetail },
+  });
+
+  const continueReply = opts.reason === 'wall_clock'
+    ? `I hit the time budget on this conversation after ${opts.steps} step${opts.steps === 1 ? '' : 's'} and there's more to do. Reply \`continue\` to keep going, or break it into a smaller piece.`
+    : `I've been working on this for ${opts.steps} step${opts.steps === 1 ? '' : 's'} and hit the step budget — there's more to do. Reply \`continue\` to keep going, or break it into a smaller piece.`;
+  const internalSummary = `Hit ${opts.reason === 'wall_clock' ? 'wall-clock' : 'max-steps'} limit at step ${opts.steps}; offered the user a \`continue\` prompt instead of silently failing.`;
+  safeAppend({
+    sessionId: opts.sessionId,
+    turn: opts.turn,
+    role: 'system',
+    type: 'conversation_completed',
+    data: {
+      steps: opts.steps,
+      reason: 'awaiting_continue',
+      summary: continueReply,
+      reply: continueReply,
+      internalSummary,
+      lastDecisionSummary: opts.lastDecision?.summary ?? null,
+      limitKind: opts.reason,
+    },
+  });
 }
 
 function toOrchestratorDecision(value: unknown): OrchestratorDecisionShape | null {
@@ -531,22 +702,14 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     if (outcome.hasInterruptions && outcome.serializedState) {
       // The SDK pauses BEFORE invoking the tool's execute when
       // needsApproval=true, so we — not the tool body — must record
-      // approval_requested. Emit one event per interrupted tool call
-      // so the audit log explains the pause.
-      for (const interruption of outcome.interruptions ?? []) {
-        safeAppend({
-          sessionId: options.sessionId,
-          turn,
-          role: 'orchestrator',
-          type: 'approval_requested',
-          data: {
-            tool: interruption.toolName,
-            subject: extractApprovalSubject(interruption),
-            args: interruption.args,
-            rawArgs: interruption.rawArgs,
-          },
-        });
-      }
+      // approval_requested. registerAndEmitApprovals registers each
+      // interruption in the addressable approval registry AND emits
+      // the audit-log event with the approval ID inlined.
+      registerAndEmitApprovals(
+        { sessionId: options.sessionId, turn },
+        session,
+        outcome.interruptions ?? [],
+      );
       session.saveInterruptState(outcome.serializedState);
       bumpTurnNumber(options.sessionId, turn);
       return { sessionId: options.sessionId, turn, status: 'awaiting_approval' };
@@ -740,20 +903,13 @@ export async function resumePendingApproval(
     );
 
     if (outcome.hasInterruptions && outcome.serializedState) {
-      for (const interruption of outcome.interruptions ?? []) {
-        safeAppend({
-          sessionId: options.sessionId,
-          turn,
-          role: 'orchestrator',
-          type: 'approval_requested',
-          data: {
-            tool: interruption.toolName,
-            subject: extractApprovalSubject(interruption),
-            args: interruption.args,
-            rawArgs: interruption.rawArgs,
-          },
-        });
-      }
+      // Same registry + emit pattern as runTurn; consolidated in
+      // registerAndEmitApprovals so both surfaces stay in sync.
+      registerAndEmitApprovals(
+        { sessionId: options.sessionId, turn },
+        session,
+        outcome.interruptions ?? [],
+      );
       session.saveInterruptState(outcome.serializedState);
       bumpTurnNumber(options.sessionId, turn);
       return { sessionId: options.sessionId, turn, status: 'awaiting_approval' };
@@ -817,6 +973,22 @@ export async function resumePendingApproval(
  * shape whether the resume was one-shot or multi-step.
  */
 export async function runConversationFromResume(opts: {
+  agent: Agent<any, any>;
+  sessionId: string;
+  decision: 'approve' | 'reject';
+  maxSteps?: number;
+  maxWallClockMs?: number;
+  maxTurns?: number;
+  toolCallsPerTurn?: number;
+  makeRunner?: () => Runner;
+  runRunner?: RunRunnerFn;
+}): Promise<RunConversationResult> {
+  const result = await runConversationFromResumeCore(opts);
+  emitRuntimeTerminalEvent(opts.sessionId, result);
+  return result;
+}
+
+async function runConversationFromResumeCore(opts: {
   agent: Agent<any, any>;
   sessionId: string;
   decision: 'approve' | 'reject';
