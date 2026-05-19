@@ -625,6 +625,16 @@ export function renderConsoleHtml(token: string): string {
             <ol class="wf-list" data-wf-list>
               <li class="empty">— loading —</li>
             </ol>
+
+            <!-- Cron jobs (CRON.md). Separate abstraction from workflows
+                 but lives in the same "scheduled work" mental bucket. -->
+            <div class="wf-list-head wf-list-head-cron">
+              <span>SCHEDULED JOBS</span>
+              <span class="wf-list-meta" data-wf-cron-count>—</span>
+            </div>
+            <ol class="wf-list wf-cron-list" data-wf-cron-list>
+              <li class="empty">— loading —</li>
+            </ol>
           </aside>
 
           <!-- Editor (middle) -->
@@ -4289,6 +4299,53 @@ body {
 .wf-list li.wf .pill.off { color: var(--fg-mute); }
 .wf-list li.wf .pill.cron { color: var(--accent-3); }
 
+/* Scheduled-jobs (cron) section in the workflows pane. Same list
+   width as workflows but the items don't navigate — they expand
+   inline to show last-run excerpt + history. */
+.wf-list-head-cron { margin-top: 6px; border-top: 1px solid var(--line); }
+.wf-list-meta { color: var(--fg-mute); font-size: 10px; }
+.wf-cron-list { flex: 0 0 auto; max-height: 45vh; }
+.wf-cron-row { padding: 9px 12px; cursor: default; }
+.wf-cron-row .wf-cron-head { display: flex; flex-direction: column; gap: 4px; }
+.wf-cron-row .name {
+  color: var(--fg);
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.wf-cron-row .meta {
+  color: var(--fg-3);
+  font-size: 10px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  row-gap: 4px;
+}
+.wf-cron-row .pill {
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  padding: 1px 5px;
+  border: 1px solid var(--line);
+}
+.wf-cron-row .pill.on { color: var(--accent-2); border-color: var(--accent-2); }
+.wf-cron-row .pill.off { color: var(--fg-mute); }
+.wf-cron-row .pill.cron { color: var(--accent-3); border-color: var(--accent-3); }
+.wf-cron-excerpt {
+  margin-top: 6px;
+  padding: 6px 8px;
+  background: var(--bg-1);
+  border-left: 2px solid var(--accent-3);
+  font-size: 10px;
+  color: var(--fg-3);
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 5em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 /* Editor */
 .wf-editor { padding: 0; }
 .wf-empty {
@@ -7719,8 +7776,13 @@ const CONSOLE_JS = `
       if (!contextBooted) { contextBooted = true; bootContextPanel(); }
       else refreshContextPanel();
     } else if (name === 'workflows') {
-      if (!workflowsBooted) { workflowsBooted = true; bootWorkflowsPanel(); }
-      else refreshWorkflowList();
+      if (!workflowsBooted) {
+        workflowsBooted = true;
+        bootWorkflowsPanel();
+      } else {
+        refreshWorkflowList();
+        refreshCronList().catch((err) => console.error('cron list refresh failed:', err));
+      }
     } else if (name === 'tools') {
       if (!toolsBooted) { toolsBooted = true; bootToolsPanel(); }
     } else if (name === 'projects') {
@@ -9091,6 +9153,72 @@ const CONSOLE_JS = `
       });
     }
     await refreshWorkflowList();
+    refreshCronList().catch((err) => {
+      console.error('cron list refresh failed:', err);
+    });
+  }
+
+  function fmtCronAgo(iso) {
+    if (!iso) return '—';
+    try {
+      const then = new Date(iso).getTime();
+      const seconds = Math.max(0, Math.floor((Date.now() - then) / 1000));
+      if (seconds < 60) return seconds + 's ago';
+      if (seconds < 3600) return Math.floor(seconds / 60) + 'm ago';
+      if (seconds < 86400) return Math.floor(seconds / 3600) + 'h ago';
+      return Math.floor(seconds / 86400) + 'd ago';
+    } catch { return '—'; }
+  }
+
+  async function refreshCronList() {
+    const listEl = document.querySelector('[data-wf-cron-list]');
+    const countEl = document.querySelector('[data-wf-cron-count]');
+    if (!listEl) return;
+    try {
+      const data = await fetchJSON('/api/console/crons');
+      const crons = data.crons || [];
+      if (countEl) countEl.textContent = String(crons.length);
+      if (crons.length === 0) {
+        listEl.innerHTML = '<li class="empty">— no scheduled jobs —</li>';
+        return;
+      }
+      listEl.innerHTML = crons.map((c) => {
+        const enabledPill = c.enabled
+          ? '<span class="pill on">● ENABLED</span>'
+          : '<span class="pill off">○ DISABLED</span>';
+        const schedPill = '<span class="pill cron">⏱ ' + escMem(c.schedule) + '</span>';
+        const last = c.lastRun;
+        let lastBadge = '';
+        let excerpt = '';
+        if (last) {
+          const statusClass = last.status === 'ok' ? 'on'
+            : last.status === 'error' ? 'off'
+              : '';
+          const statusLabel = last.status === 'ok' ? '✓ ok'
+            : last.status === 'error' ? '✗ error'
+              : '· ' + last.status;
+          lastBadge = '<span class="pill ' + statusClass + '">' + statusLabel + ' ' + fmtCronAgo(last.startedAt) + '</span>';
+          const body = last.responseExcerpt || last.error || '';
+          if (body) {
+            excerpt = '<div class="wf-cron-excerpt">' + escMem(body.slice(0, 240)) + '</div>';
+          }
+        } else {
+          lastBadge = '<span class="pill">no runs yet</span>';
+        }
+        const runsCount = '<span class="pill">' + (c.runCount || 0) + ' run' + ((c.runCount || 0) === 1 ? '' : 's') + '</span>';
+        return [
+          '<li class="wf wf-cron-row" data-wf-cron-name="' + escMem(c.name) + '">',
+          '  <div class="wf-cron-head">',
+          '    <span class="name">' + escMem(c.name) + '</span>',
+          '    <span class="meta">' + enabledPill + schedPill + lastBadge + runsCount + '</span>',
+          '  </div>',
+          excerpt,
+          '</li>',
+        ].join('');
+      }).join('');
+    } catch (err) {
+      listEl.innerHTML = '<li class="empty">— failed: ' + escMem(err.message || err) + ' —</li>';
+    }
   }
 
   function selectWorkflowByName(name) {

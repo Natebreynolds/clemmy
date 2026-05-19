@@ -734,6 +734,126 @@ export function registerConsoleRoutes(
     }
   });
 
+  // ─── Cron jobs (visibility into CRON.md) ───────────────────────
+  //
+  // Cron jobs live in vault/00-System/CRON.md frontmatter and are
+  // executed by src/daemon/runner.ts:runCronJob. They are a separate
+  // abstraction from workflows — single prompts that fire on a
+  // schedule. The Workflows panel only enumerates workflow directories,
+  // so historically cron jobs had no surface in the dashboard. The
+  // user authored a cron and had to grep supervisor.log to know it was
+  // running; that's the gap this endpoint closes.
+  //
+  // Returns each cron with its config + the last 10 runs from
+  // ~/.clementine-next/cron/runs/<jobName>.jsonl (already maintained
+  // by appendRunLog in the daemon).
+  app.get('/api/console/crons', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const cronFile = path.join(BASE_DIR, 'vault', '00-System', 'CRON.md');
+      const cronRunsDir = path.join(BASE_DIR, 'cron', 'runs');
+
+      interface CronJobInput {
+        name?: unknown;
+        schedule?: unknown;
+        prompt?: unknown;
+        enabled?: unknown;
+        tier?: unknown;
+        mode?: unknown;
+        max_hours?: unknown;
+        work_dir?: unknown;
+      }
+
+      const jobs: CronJobInput[] = (() => {
+        if (!existsSync(cronFile)) return [];
+        try {
+          const parsed = matter(readFileSync(cronFile, 'utf-8'));
+          const list = (parsed.data as { jobs?: unknown }).jobs;
+          return Array.isArray(list) ? (list as CronJobInput[]) : [];
+        } catch {
+          return [];
+        }
+      })();
+
+      const result = jobs.map((job) => {
+        const name = String(job.name ?? '');
+        const schedule = String(job.schedule ?? '');
+        const enabled = job.enabled !== false;
+        const prompt = String(job.prompt ?? '');
+        const tier = typeof job.tier === 'number' ? job.tier : null;
+        const mode = typeof job.mode === 'string' ? job.mode : 'standard';
+        const maxHours = typeof job.max_hours === 'number' ? job.max_hours : null;
+        const workDir = typeof job.work_dir === 'string' && job.work_dir.length > 0 ? job.work_dir : null;
+
+        // Read recent runs from the per-job JSONL log. Tail the last
+        // 10 entries — older history stays in the file for grep but
+        // doesn't need to round-trip on every dashboard refresh.
+        const safeName = name.replace(/[^a-zA-Z0-9_-]/g, '_');
+        const runsPath = path.join(cronRunsDir, `${safeName}.jsonl`);
+        let recentRuns: Array<Record<string, unknown>> = [];
+        if (existsSync(runsPath)) {
+          try {
+            const lines = readFileSync(runsPath, 'utf-8').trim().split('\n');
+            const tail = lines.slice(-10);
+            recentRuns = tail
+              .map((line) => {
+                try { return JSON.parse(line); } catch { return null; }
+              })
+              .filter((entry): entry is Record<string, unknown> => entry !== null);
+          } catch {
+            recentRuns = [];
+          }
+        }
+
+        const lastRun = recentRuns.length > 0 ? recentRuns[recentRuns.length - 1] : null;
+        const lastRunSummary = lastRun
+          ? {
+              status: String(lastRun.status ?? 'unknown'),
+              startedAt: typeof lastRun.startedAt === 'string' ? lastRun.startedAt : null,
+              finishedAt: typeof lastRun.finishedAt === 'string' ? lastRun.finishedAt : null,
+              durationMs: typeof lastRun.durationMs === 'number' ? lastRun.durationMs : null,
+              source: typeof lastRun.source === 'string' ? lastRun.source : null,
+              // Excerpt the response/error to keep the payload tight;
+              // full text is available via the per-run history endpoint
+              // (future iteration).
+              responseExcerpt: typeof lastRun.response === 'string'
+                ? lastRun.response.slice(0, 240)
+                : null,
+              error: typeof lastRun.error === 'string' ? lastRun.error.slice(0, 240) : null,
+            }
+          : null;
+
+        return {
+          name,
+          schedule,
+          enabled,
+          prompt,
+          tier,
+          mode,
+          maxHours,
+          workDir,
+          lastRun: lastRunSummary,
+          runCount: recentRuns.length,
+          // Full recent runs (parsed) so the UI can render an
+          // expandable list without another round-trip per job.
+          recentRuns: recentRuns.map((run) => ({
+            status: String(run.status ?? 'unknown'),
+            startedAt: typeof run.startedAt === 'string' ? run.startedAt : null,
+            finishedAt: typeof run.finishedAt === 'string' ? run.finishedAt : null,
+            durationMs: typeof run.durationMs === 'number' ? run.durationMs : null,
+            source: typeof run.source === 'string' ? run.source : null,
+            responseExcerpt: typeof run.response === 'string' ? run.response.slice(0, 500) : null,
+            error: typeof run.error === 'string' ? run.error.slice(0, 500) : null,
+          })),
+        };
+      });
+
+      res.json({ crons: result });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   // ─── Workflow Studio ──────────────────────────────────────────
 
   app.get('/api/console/workflows', (req, res) => {
