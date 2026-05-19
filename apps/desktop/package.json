@@ -1,6 +1,6 @@
 {
   "name": "@clemmy/desktop",
-  "version": "0.4.15",
+  "version": "0.4.16",
   "private": true,
   "description": "Clementine \u2014 native desktop shell. Supervises the daemon, opens the local dashboard, surfaces approvals and check-ins, manages credentials.",
   "main": "dist/main.js",

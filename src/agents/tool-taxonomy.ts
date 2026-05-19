@@ -73,17 +73,22 @@ const ALWAYS_ADMIN = new Set<string>([
  * (highest gate), then send (network mutation), execute (subprocess),
  * write (local mutation), read (lookup).
  *
- * Patterns are matched against a normalized name where uppercase is
- * lowered and `__` (the MCP namespace shim separator) is collapsed —
- * so `dataforseo__serp_organic_live_advanced` is still seen as
- * `serp_organic_live_advanced` for classification.
+ * Patterns are matched as WHOLE WORDS in the underscore-separated name
+ * — so `search` matches `memory_search`, `search_files`, and `db_search_v2`
+ * but NOT `searcher_bot`. This catches both the older `verb_noun` style
+ * (`search_files`) and the local-tool `noun_verb` style (`memory_search`)
+ * that previously fell through to the catch-all `write` classification.
+ *
+ * Normalization: uppercase lowered, `__` (the MCP namespace shim
+ * separator) collapsed — so `dataforseo__serp_organic_live_advanced`
+ * is matched as `serp_organic_live_advanced`.
  */
-const NAME_PATTERNS: Array<{ kind: ToolKind; needles: string[] }> = [
+const NAME_PATTERNS: Array<{ kind: ToolKind; verbs: string[] }> = [
   {
     kind: 'admin',
-    needles: [
-      '_admin_', 'admin_', '_install', '_uninstall', '_migrate', '_repair_keychain',
-      '_reset_credentials',
+    verbs: [
+      'admin', 'install', 'uninstall', 'migrate',
+      'repair_keychain', 'reset_credentials',
     ],
   },
   {
@@ -91,47 +96,58 @@ const NAME_PATTERNS: Array<{ kind: ToolKind; needles: string[] }> = [
     // External network-touching mutations. Composio cx_* lives here when
     // the slug mutates state; we resolve that via Composio-aware override
     // below in classifyTool().
-    needles: [
-      'send_', '_send_', 'post_', '_post_', 'publish_', 'deliver_', 'dispatch_',
-      'notify_', '_notify_', 'dm_', '_dm_', 'email_', '_email_', 'sms_', '_sms_',
-      'reply_', 'forward_', 'invite_', '_invite_', 'upload_', '_upload_',
-      'webhook_', '_announce_', '_broadcast_',
+    verbs: [
+      'send', 'post', 'publish', 'deliver', 'dispatch', 'notify',
+      'dm', 'email', 'sms', 'reply', 'forward', 'invite', 'upload',
+      'webhook', 'announce', 'broadcast',
     ],
   },
   {
     kind: 'execute',
-    needles: [
-      'run_shell_command', 'exec_', '_exec_', 'execute_', '_execute_',
-      'spawn_', 'launch_', 'run_workflow', 'run_plan', 'run_task',
+    verbs: [
+      'exec', 'execute', 'spawn', 'launch',
+      'run_shell_command', 'run_workflow', 'run_plan', 'run_task',
       'run_agent', 'invoke_workflow', 'browser_harness_run',
     ],
   },
   {
     kind: 'write',
-    needles: [
-      'write_', '_write_', 'save_', '_save_', 'create_', '_create_', 'update_',
-      '_update_', 'delete_', '_delete_', 'remove_', '_remove_', 'patch_', '_patch_',
-      'set_', '_set_', 'edit_', '_edit_', 'modify_', 'append_', 'prepend_',
-      'archive_', 'unarchive_', 'restore_', 'add_', '_add_', 'put_', '_put_',
-      'remember', 'forget', 'tag_', 'untag_', 'star_', 'unstar_',
-      'attach_', 'detach_', 'register_', 'unregister_', 'mark_', '_log_',
-      'draft_', 'propose_', 'plan_',
+    verbs: [
+      'write', 'save', 'create', 'update', 'delete', 'remove', 'patch',
+      'set', 'edit', 'modify', 'append', 'prepend', 'archive', 'unarchive',
+      'restore', 'add', 'put', 'remember', 'forget', 'tag', 'untag',
+      'star', 'unstar', 'attach', 'detach', 'register', 'unregister',
+      'mark', 'log', 'draft', 'propose', 'plan',
     ],
   },
   {
     kind: 'read',
-    // Anything that didn't trip a write/execute/send needle is treated
-    // as read by default. We still keep an explicit read list so this
-    // file documents the universe rather than relying on the catch-all.
-    needles: [
-      'get_', 'list_', 'search_', 'find_', 'fetch_', 'read_', 'query_',
-      'lookup_', 'retrieve_', 'describe_', 'browse_', 'scan_', 'view_',
-      'inspect_', 'status_', 'head_', 'peek_', 'count_', 'summarize_',
-      'recall', 'observe', 'capture_', 'ping', 'snapshot_', 'preview_',
-      'show_', 'check_', 'browser_harness_status',
+    verbs: [
+      'get', 'list', 'search', 'find', 'fetch', 'read', 'query', 'lookup',
+      'retrieve', 'describe', 'browse', 'scan', 'view', 'inspect', 'status',
+      'head', 'peek', 'count', 'summarize', 'recall', 'observe', 'capture',
+      'ping', 'snapshot', 'preview', 'show', 'check', 'discover',
+      'browser_harness_status',
     ],
   },
 ];
+
+/**
+ * True when `verb` appears as a whole underscore-delimited word in `name`.
+ * Examples:
+ *   matchesVerb('memory_search', 'search') → true
+ *   matchesVerb('search_files', 'search') → true
+ *   matchesVerb('db_search_v2', 'search') → true
+ *   matchesVerb('searcher_bot', 'search') → false
+ *   matchesVerb('run_shell_command', 'run_shell_command') → true (multi-word verb)
+ */
+function matchesVerb(name: string, verb: string): boolean {
+  if (name === verb) return true;
+  if (name.startsWith(verb + '_')) return true;
+  if (name.endsWith('_' + verb)) return true;
+  if (name.includes('_' + verb + '_')) return true;
+  return false;
+}
 
 function normalizeForMatch(name: string): string {
   // Drop the MCP namespace shim prefix so classification looks at the
@@ -189,9 +205,9 @@ export function classifyTool(name: string, options: ClassifyOptions = {}): ToolK
   }
 
   const norm = normalizeForMatch(name);
-  for (const { kind, needles } of NAME_PATTERNS) {
-    for (const needle of needles) {
-      if (norm.includes(needle)) return kind;
+  for (const { kind, verbs } of NAME_PATTERNS) {
+    for (const verb of verbs) {
+      if (matchesVerb(norm, verb)) return kind;
     }
   }
 
