@@ -10,6 +10,7 @@ import { registerBrowserHarnessTools } from './browser-harness-tools.js';
 import { registerCapabilityTools } from './capability-tools.js';
 import { registerCliTools } from './cli-tools.js';
 import { registerSkillTools } from './skill-tools.js';
+import { registerToolChoiceTools } from './tool-choice-tools.js';
 import { registerWorkflowScheduleTools } from './workflow-schedule-tools.js';
 import { registerDynamicTools } from './dynamic-tools.js';
 import { registerExecutionTools } from './execution-tools.js';
@@ -151,6 +152,7 @@ function captureLocalTools(): CapturedLocalTool[] {
   registerCapabilityTools(server);
   registerCliTools(server);
   registerSkillTools(server);
+  registerToolChoiceTools(server);
   registerWorkflowScheduleTools(server);
   registerBrowserHarnessTools(server);
   registerMcpStatusTools(server);

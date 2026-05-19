@@ -69,6 +69,24 @@ const ALWAYS_ADMIN = new Set<string>([
 ]);
 
 /**
+ * Pure local memory-bookkeeping tools. These mutate the agent's own
+ * memory layer (per-machine tool-choice records, durable facts) but
+ * NEVER touch external state or shared resources. The Orchestrator
+ * prompt explicitly says "local writes are NOT gated" for these —
+ * approval-prompting the agent for `tool_choice_remember` after it
+ * just probed a tool to save us from re-discovering it every turn
+ * is exactly the friction the prompt warns against.
+ *
+ * Match is exact-name only (no prefix sloppiness) so a new tool can't
+ * accidentally land here by naming convention.
+ */
+const NEVER_GATE_LOCAL_MEMORY = new Set<string>([
+  'tool_choice_recall',
+  'tool_choice_remember',
+  'tool_choice_invalidate',
+]);
+
+/**
  * Tool-name prefixes/needles. Order matters: we test admin first
  * (highest gate), then send (network mutation), execute (subprocess),
  * write (local mutation), read (lookup).
@@ -127,6 +145,12 @@ const NAME_PATTERNS: Array<{ kind: ToolKind; verbs: string[] }> = [
       'retrieve', 'describe', 'browse', 'scan', 'view', 'inspect', 'status',
       'head', 'peek', 'count', 'summarize', 'recall', 'observe', 'capture',
       'ping', 'snapshot', 'preview', 'show', 'check', 'discover',
+      // Discovery verbs added 2026-05-19 to stop the Orchestrator from
+      // approval-gating on read-only discovery surfaces (local_cli_probe,
+      // composio_status, mcp_status, etc.). These never mutate — they
+      // run --version/--help, query connection state, list catalog
+      // entries. Gating them is friction the user reads as a bug.
+      'probe', 'detect', 'enumerate', 'audit', 'introspect',
       'browser_harness_status',
     ],
   },
@@ -259,6 +283,15 @@ export function decideToolApproval(input: ApprovalDecisionInput): ApprovalDecisi
     kindHint: input.kindHint,
     args: input.args,
   });
+
+  // Local memory bookkeeping is the cheapest possible write — no
+  // network, no external mutation, no shared state. Treat as read
+  // for approval purposes regardless of the kind classifier's word
+  // matching (e.g. `tool_choice_remember` matches the `remember`
+  // verb and would otherwise count as `write`).
+  if (NEVER_GATE_LOCAL_MEMORY.has(input.toolName)) {
+    return { needsApproval: false, reason: 'read-always-auto', kind };
+  }
 
   if (kind === 'admin') {
     return { needsApproval: true, reason: 'admin', kind };

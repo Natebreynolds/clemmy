@@ -19,6 +19,7 @@ import { registerCliTools } from './cli-tools.js';
 import { registerSkillTools } from './skill-tools.js';
 import { registerWorkflowScheduleTools } from './workflow-schedule-tools.js';
 import { registerMcpStatusTools } from './mcp-status-tools.js';
+import { registerToolChoiceTools } from './tool-choice-tools.js';
 import { ensureToolDirectories, textResult } from './shared.js';
 import { loadPlugins } from '../plugins/loader.js';
 import type { PluginTool } from '../plugins/types.js';
@@ -42,6 +43,7 @@ registerCliTools(server);
 registerSkillTools(server);
 registerWorkflowScheduleTools(server);
 registerMcpStatusTools(server);
+registerToolChoiceTools(server);
 registerDynamicTools(server);
 
 server.tool('ping', 'Basic health-check tool for the local MCP server.', {}, async () => textResult('pong'));

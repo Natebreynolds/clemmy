@@ -14,7 +14,7 @@ import {
   harnessInputGuardrails,
   harnessOutputGuardrails,
 } from '../runtime/harness/guardrails.js';
-import { DEFAULT_MAX_TURNS } from '../runtime/harness/brackets.js';
+import { DEFAULT_MAX_TURNS, wrapToolForHarness, type WrappableTool } from '../runtime/harness/brackets.js';
 
 /**
  * Orchestrator — the top of the 0.3 harness.
@@ -190,6 +190,17 @@ const ORCHESTRATOR_INSTRUCTIONS = [
   '  - `ask_user_question`  ask the user a clarifying question when the request is ambiguous.',
   '  - handoffs:            Researcher (read-only info gathering), Writer (vault/document content), Reviewer (quality check), Executor (does the work — files, commands, tasks), Deployer (releases, deploys).',
   'Memory layering — the persistent context block above (Identity, Soul, Working Memory, top Facts, Goals, Profile) is curated and bounded. It is NOT the full history. For deeper recall — past conversations, specific files, prior decisions, archived notes — hand off to Researcher to call memory_recall / memory_search / memory_read. Do this BEFORE asking the user to repeat themselves: if the message references something they\'ve discussed with Clementine before ("that project from last week", "the file we talked about", "what we decided yesterday"), assume the answer is in memory and route to Researcher first.',
+  'TOOL DISCIPLINE for any request that needs an external action (CLI, Composio, MCP). Read FIRST, before the decision rubric.',
+  '  Step 1 — Distill a short canonical intent slug (lowercase, dot-separated): `salesforce.contacts.list_stale`, `gmail.draft_send`, `github.issue.create`.',
+  '  Step 2 — Call `tool_choice_recall(intent)` as your FIRST tool call. HIT (active `choice`) → hand off to Executor with the recorded invocation, skip discovery. MISS or `choice: null` → continue.',
+  '  Step 3 — Discover candidates in PARALLEL (one Orchestrator turn, multiple tool calls): `composio_search_tools` (note `connectedToolkits`!), `local_cli_list({filter: "<exact-cli>"})`, scan your tool surface for `<slug>__*` MCP tools.',
+  '  Step 4 — Pick by this order: (a) local CLI on $PATH, (b) Composio action whose toolkit IS in `connectedToolkits`, (c) MCP tool from a healthy server. An UNCONNECTED Composio toolkit is NEVER a valid choice — it goes in `fallbacks`. If nothing works, ask the user with `ask_user_question`.',
+  '  Step 5 — Probe the winner with a CHEAP read-only call (CLI `--version`, MCP introspection). Composio status from step 3 counts as the probe.',
+  '  Step 6 — Call `tool_choice_remember({intent, kind, identifier, invocationTemplate, fallbacks})`. Record losers as fallbacks so future runs skip them. NEVER memorize a known-broken choice (unconnected toolkit, missing CLI).',
+  '  Step 7 — Hand off to Executor. Fill the structured `toolCall` when the choice is Composio (`{slug, args}`); leave it null and put the literal command in `directive` for CLI choices.',
+  '  Step 8 — If Executor reports runtime failure later, call `tool_choice_invalidate(intent, <verbatim error>)` and start over at Step 3.',
+  '  SKIP `draft_plan` for single-tool-dispatch requests. The discipline above IS the plan. Use draft_plan only for genuinely multi-step plans.',
+  'Why: a cached recall is 1 call; rediscovery is 4-6. Memorize once, reuse across every session. Workflows that hard-code a tool (`"use sf data query ..."`) are a smell — the discipline above overrides them.',
   'Decision rubric:',
   '  1. Greeting / chitchat → answer directly. No handoff, no memory call. Done.',
   '  2. Trivial single-tool ask → hand off to Executor with a one-line directive. Do not over-plan.',
@@ -251,10 +262,30 @@ export async function buildOrchestratorAgent(): Promise<
   // descriptions). composio_execute_tool is NOT added here — that
   // stays on the Executor side of the handoff boundary.
   const allCoreTools = await getCoreToolsAsync({ includeDynamicComposioTools: false });
-  const composioSearch = allCoreTools.find(
-    (t) => (t as { name?: string }).name === 'composio_search_tools',
-  ) as Tool<RuntimeContextValue> | undefined;
-  const composioTools: Tool<RuntimeContextValue>[] = composioSearch ? [composioSearch] : [];
+  const byName = (n: string) =>
+    allCoreTools.find((t) => (t as { name?: string }).name === n) as
+      | Tool<RuntimeContextValue>
+      | undefined;
+  // Discovery surfaces the Orchestrator needs for the intent-based
+  // dispatch pipeline (recall → discover → probe → remember → handoff):
+  //   - composio_search_tools: Composio action discovery (already used)
+  //   - local_cli_list / local_cli_probe: $PATH scan + cheap probe for CLIs
+  //   - tool_choice_recall / _remember / _invalidate: per-machine memory
+  //     of which tool actually works for a given intent
+  // All are read-only or pure-memory operations — they do not violate
+  // the orchestrator's "no action tools" discipline.
+  const discoveryTools: Tool<RuntimeContextValue>[] = (
+    [
+      'composio_search_tools',
+      'local_cli_list',
+      'local_cli_probe',
+      'tool_choice_recall',
+      'tool_choice_remember',
+      'tool_choice_invalidate',
+    ]
+      .map(byName)
+      .filter((t): t is Tool<RuntimeContextValue> => Boolean(t))
+  );
 
   return new Agent<RuntimeContextValue, typeof OrchestratorDecisionSchema>({
     name: 'Orchestrator',
@@ -267,7 +298,12 @@ export async function buildOrchestratorAgent(): Promise<
     instructions: harnessInstructions(ORCHESTRATOR_INSTRUCTIONS),
     model: MODELS.primary,
     outputType: OrchestratorDecisionSchema,
-    tools: [plannerTool, buildRequestApprovalTool(), buildAskUserQuestionTool(), ...composioTools],
+    // T2.1 — wrapToolForHarness adds the per-tool timeout + mid-turn
+    // kill check + pre-increment limit check. No-op when
+    // HARNESS_TOOL_BRACKETS is off, so this is safe to leave in even
+    // before the flag flips default-on.
+    tools: [plannerTool, buildRequestApprovalTool(), buildAskUserQuestionTool(), ...discoveryTools]
+      .map((t) => wrapToolForHarness(t as unknown as WrappableTool) as unknown as Tool<RuntimeContextValue>),
     // External MCP servers (DataForSEO, Supabase, browsermcp, etc.) the
     // user has configured. Tools surface as `<server>__<tool>` (e.g.
     // `dataforseo__serp_organic_live_advanced`). Without this the
