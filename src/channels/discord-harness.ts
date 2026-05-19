@@ -225,6 +225,12 @@ export interface DiscordHarnessTransport {
   sendInitial(content: string): Promise<DiscordHarnessReplyHandle>;
   /** Send a one-shot error message when we never get to start the run. */
   sendError(content: string): Promise<void>;
+  /**
+   * Post a follow-up message into the same conversation. Used to deliver
+   * the tail of a reply that exceeds Discord's 2000-char per-message
+   * cap, so the user sees the whole answer instead of `…obje…`.
+   */
+  sendFollowup?(content: string): Promise<void>;
 }
 
 export interface DiscordHarnessReplyHandle {
@@ -260,7 +266,67 @@ function renderBody(state: DisplayState): string {
     activity = lines.join('\n');
   }
   const body = (head + activity).trim() || '_working…_';
+  // In-progress edits still truncate — the live-edit message is just a
+  // status display, not the answer. The FULL reply goes through
+  // renderFullBody + splitForLongReply at terminal time.
   return body.length > MAX_DISCORD_MESSAGE ? body.slice(0, MAX_DISCORD_MESSAGE - 1) + '…' : body;
+}
+
+/**
+ * Final-message renderer — no truncation. Used by finalFlush when the
+ * conversation reaches a terminal state. The caller pairs this with
+ * splitForLongReply to fan the body across multiple Discord messages
+ * when it exceeds the 2000-char per-message cap.
+ *
+ * The activity block is only included when state.done is false, which
+ * can happen if we're rendering a timed-out state (state.done=true was
+ * set by the safety timer); in that case the status string carries the
+ * useful info already, so we leave activity off and just show the
+ * summary.
+ */
+function renderFullBody(state: DisplayState): string {
+  const head = state.summary ? `> ${state.summary}\n\n` : '';
+  let activity = '';
+  if (!state.done) {
+    const lines: string[] = [];
+    if (state.currentAgent) lines.push(`**${state.currentAgent}** is working…`);
+    if (state.toolCount > 0) {
+      const recent = state.toolsCalled.slice(-4).join(', ');
+      lines.push(`Tools used: ${state.toolCount} (${recent})`);
+    }
+    if (state.status) lines.push(`_${state.status}_`);
+    activity = lines.join('\n');
+  }
+  return (head + activity).trim() || '_working…_';
+}
+
+/**
+ * Split a Discord message body into chunks <= MAX_DISCORD_MESSAGE,
+ * preferring paragraph then line then space boundaries. Mirrors the
+ * splitForDiscord shape used by notification-delivery so the same
+ * "your reply spilled into N parts" semantics apply across surfaces.
+ */
+function splitForLongReply(text: string): string[] {
+  const trimmed = text.trim();
+  if (!trimmed) return [''];
+  if (trimmed.length <= MAX_DISCORD_MESSAGE) return [trimmed];
+
+  const chunks: string[] = [];
+  let remaining = trimmed;
+  while (remaining.length > MAX_DISCORD_MESSAGE) {
+    const window = remaining.slice(0, MAX_DISCORD_MESSAGE);
+    // Prefer a paragraph break, then a newline, then a space, then
+    // hard-cut. The 400-char threshold avoids giving up the cap
+    // entirely on a stubborn block of unbroken text.
+    let cut = window.lastIndexOf('\n\n');
+    if (cut < 400) cut = window.lastIndexOf('\n');
+    if (cut < 400) cut = window.lastIndexOf(' ');
+    if (cut < 400) cut = MAX_DISCORD_MESSAGE;
+    chunks.push(remaining.slice(0, cut).trim());
+    remaining = remaining.slice(cut).trim();
+  }
+  if (remaining) chunks.push(remaining);
+  return chunks;
 }
 
 /**
@@ -337,6 +403,31 @@ export async function runDiscordHarnessConversation(opts: {
     }
   };
 
+  /**
+   * Final flush on conversation completion. Unlike progress edits,
+   * this one preserves the full reply: if the body exceeds Discord's
+   * per-message cap, post the head into the existing message and the
+   * tail as follow-up messages. The user sees the whole answer
+   * instead of the previous `…obje…` truncation marker.
+   */
+  const finalFlush = async (): Promise<void> => {
+    pendingEdit = null;
+    lastEditAt = Date.now();
+    const fullBody = renderFullBody(state);
+    const chunks = splitForLongReply(fullBody);
+    try {
+      await handle.edit(chunks[0] ?? '_working…_');
+      if (chunks.length > 1 && transport.sendFollowup) {
+        for (let i = 1; i < chunks.length; i++) {
+          await transport.sendFollowup(chunks[i]);
+        }
+      }
+    } catch {
+      // Edit can transiently fail. Don't crash settle — the user can
+      // re-ping if they don't see the full reply.
+    }
+  };
+
   const scheduleEdit = (): void => {
     if (pendingEdit) return;
     const elapsed = Date.now() - lastEditAt;
@@ -358,7 +449,7 @@ export async function runDiscordHarnessConversation(opts: {
         clearTimeout(pendingEdit);
         pendingEdit = null;
       }
-      await flush();
+      await finalFlush();
       resolve();
     };
 
@@ -482,6 +573,26 @@ async function runDiscordHarnessResume(opts: {
     }
   };
 
+  // See renderFullBody / splitForLongReply at the bottom of this file:
+  // resume completions can also exceed Discord's 2000-char cap; mirror
+  // the head-edit + tail-followup pattern from the main path.
+  const finalFlush = async (): Promise<void> => {
+    pendingEdit = null;
+    lastEditAt = Date.now();
+    const fullBody = renderFullBody(state);
+    const chunks = splitForLongReply(fullBody);
+    try {
+      await handle.edit(chunks[0] ?? '_working…_');
+      if (chunks.length > 1 && transport.sendFollowup) {
+        for (let i = 1; i < chunks.length; i++) {
+          await transport.sendFollowup(chunks[i]);
+        }
+      }
+    } catch {
+      /* transient — user can re-ping if they don't see the full reply */
+    }
+  };
+
   const scheduleEdit = (): void => {
     if (pendingEdit) return;
     const elapsed = Date.now() - lastEditAt;
@@ -503,7 +614,7 @@ async function runDiscordHarnessResume(opts: {
         clearTimeout(pendingEdit);
         pendingEdit = null;
       }
-      await flush();
+      await finalFlush();
       resolve();
     };
 
@@ -581,6 +692,12 @@ export async function handleDiscordHarnessMessage(
       };
     },
     async sendError(content) {
+      await message.reply(content);
+    },
+    async sendFollowup(content) {
+      // Post a new message in the same channel for the tail of a long
+      // reply. message.reply() threads it to the original prompt so the
+      // user sees it as a continuation of the same conversation.
       await message.reply(content);
     },
   };
