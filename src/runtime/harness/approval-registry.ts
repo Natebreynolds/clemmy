@@ -1,0 +1,308 @@
+/**
+ * Approval registry — the addressable replacement for the implicit
+ * "loadInterruptState() exists" check that was the entire approval
+ * state machine before this module.
+ *
+ * Why this exists: the audit on 2026-05-18 found three orphan paused
+ * sessions, including the "save Salesforce CLI rule to memory" approval
+ * from earlier today. The user's "approve" landed on a different
+ * paused session (the memory_search one) because the channel-level
+ * routing assumed "the only paused session is the right one." With
+ * multiple concurrent approvals — easy to reach in practice — that
+ * heuristic loses work. The fix:
+ *
+ *   - Every `approval_requested` event also registers a row in
+ *     `pending_approvals` with a short addressable ID (`apr-xy7q`)
+ *     and an explicit `expires_at`.
+ *   - The approval prompt shown to the user INCLUDES the ID so they
+ *     can resolve a specific one ("approve apr-xy7q") when multiple
+ *     are pending.
+ *   - A background reaper expires stale rows, never silently leaves
+ *     a session paused forever.
+ *
+ * This module is the data layer; the reaper, the chat-surface routing,
+ * and the loop integration live in their own modules (reaper.ts,
+ * discord-harness.ts, loop.ts).
+ *
+ * Gating: flag `HARNESS_APPROVAL_REGISTRY=on` controls whether the
+ * channel-routing code consults this registry. The DB writes happen
+ * regardless so a flag flip mid-session doesn't lose pending rows.
+ */
+
+import { randomBytes } from 'node:crypto';
+import { openEventLog } from './eventlog.js';
+
+export type PendingApprovalStatus = 'pending' | 'resolved' | 'expired' | 'cancelled';
+export type ApprovalResolution = 'approved' | 'rejected' | 'expired' | 'cancelled_by_user';
+
+export interface PendingApprovalRow {
+  approvalId: string;
+  sessionId: string;
+  channel: string | null;
+  channelId: string | null;
+  requestedAt: string;
+  expiresAt: string;
+  subject: string;
+  tool: string | null;
+  args: Record<string, unknown> | null;
+  status: PendingApprovalStatus;
+  resolution: ApprovalResolution | null;
+  resolver: string | null;
+  resolvedAt: string | null;
+}
+
+export const DEFAULT_APPROVAL_TTL_MS = 24 * 60 * 60 * 1000;
+
+export interface RegisterApprovalInput {
+  sessionId: string;
+  channel?: string | null;
+  channelId?: string | null;
+  subject: string;
+  tool?: string | null;
+  args?: Record<string, unknown> | null;
+  ttlMs?: number;
+}
+
+interface ApprovalSqlRow {
+  approval_id: string;
+  session_id: string;
+  channel: string | null;
+  channel_id: string | null;
+  requested_at: string;
+  expires_at: string;
+  subject: string;
+  tool: string | null;
+  args_json: string | null;
+  status: PendingApprovalStatus;
+  resolution: ApprovalResolution | null;
+  resolver: string | null;
+  resolved_at: string | null;
+}
+
+function rowToPublic(row: ApprovalSqlRow): PendingApprovalRow {
+  return {
+    approvalId: row.approval_id,
+    sessionId: row.session_id,
+    channel: row.channel,
+    channelId: row.channel_id,
+    requestedAt: row.requested_at,
+    expiresAt: row.expires_at,
+    subject: row.subject,
+    tool: row.tool,
+    args: row.args_json ? safeParse(row.args_json) : null,
+    status: row.status,
+    resolution: row.resolution,
+    resolver: row.resolver,
+    resolvedAt: row.resolved_at,
+  };
+}
+
+function safeParse(json: string): Record<string, unknown> | null {
+  try {
+    const parsed = JSON.parse(json);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Generate a short prefixed approval ID. Format: `apr-xy7q` (4 chars
+ * base36 hex-ish, distinct enough for the surface display + tight
+ * enough for the user to type). Collisions are checked by the PK.
+ */
+function newApprovalId(): string {
+  // 24 bits → ~16M space; we pick 4 base36 chars (~1.6M) which is
+  // plenty for concurrent approvals on a single machine.
+  const bytes = randomBytes(3);
+  let n = (bytes[0] << 16) | (bytes[1] << 8) | bytes[2];
+  const out: string[] = [];
+  for (let i = 0; i < 4; i++) {
+    out.push((n % 36).toString(36));
+    n = Math.floor(n / 36);
+  }
+  return `apr-${out.join('')}`;
+}
+
+/**
+ * Register a new pending approval. Returns the row (with the freshly
+ * generated approval ID). Called from the harness loop at the same
+ * point as `approval_requested` event emission.
+ */
+export function register(input: RegisterApprovalInput): PendingApprovalRow {
+  const db = openEventLog();
+  const now = new Date();
+  const ttl = input.ttlMs ?? DEFAULT_APPROVAL_TTL_MS;
+  const expiresAt = new Date(now.getTime() + ttl);
+
+  // Retry on collision (extremely unlikely but the PK enforces it).
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const approvalId = newApprovalId();
+    try {
+      db.prepare(`
+        INSERT INTO pending_approvals
+          (approval_id, session_id, channel, channel_id, requested_at,
+           expires_at, subject, tool, args_json, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+      `).run(
+        approvalId,
+        input.sessionId,
+        input.channel ?? null,
+        input.channelId ?? null,
+        now.toISOString(),
+        expiresAt.toISOString(),
+        input.subject,
+        input.tool ?? null,
+        input.args ? JSON.stringify(input.args) : null,
+      );
+      const row = db.prepare('SELECT * FROM pending_approvals WHERE approval_id = ?').get(approvalId) as ApprovalSqlRow;
+      return rowToPublic(row);
+    } catch (err) {
+      if ((err as { code?: string }).code === 'SQLITE_CONSTRAINT_PRIMARYKEY') continue;
+      throw err;
+    }
+  }
+  throw new Error('approval-registry: failed to generate a unique approval ID after 4 attempts');
+}
+
+/**
+ * Look up an approval by ID. Returns undefined when not found.
+ */
+export function get(approvalId: string): PendingApprovalRow | undefined {
+  const db = openEventLog();
+  const row = db.prepare('SELECT * FROM pending_approvals WHERE approval_id = ?')
+    .get(approvalId) as ApprovalSqlRow | undefined;
+  return row ? rowToPublic(row) : undefined;
+}
+
+/**
+ * List approvals that match the filter. Used by the chat-surface
+ * routing to figure out whether a bare "approve" should resolve THIS
+ * channel's one-and-only pending, OR demand an explicit `apr-xxx`
+ * code because there are several.
+ *
+ * Default filter: `status='pending'`. Pass `status: 'any'` to include
+ * resolved/expired rows (the dashboard panel uses this for history).
+ */
+export interface ListFilter {
+  status?: PendingApprovalStatus | 'any';
+  sessionId?: string;
+  channelId?: string;
+  channel?: string;
+}
+
+export function listPending(filter: ListFilter = {}): PendingApprovalRow[] {
+  const db = openEventLog();
+  const conditions: string[] = [];
+  const params: unknown[] = [];
+  const status = filter.status ?? 'pending';
+  if (status !== 'any') {
+    conditions.push('status = ?');
+    params.push(status);
+  }
+  if (filter.sessionId) {
+    conditions.push('session_id = ?');
+    params.push(filter.sessionId);
+  }
+  if (filter.channelId) {
+    conditions.push('channel_id = ?');
+    params.push(filter.channelId);
+  }
+  if (filter.channel) {
+    conditions.push('channel = ?');
+    params.push(filter.channel);
+  }
+  const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+  const rows = db
+    .prepare(`SELECT * FROM pending_approvals ${where} ORDER BY requested_at DESC`)
+    .all(...params) as ApprovalSqlRow[];
+  return rows.map(rowToPublic);
+}
+
+/**
+ * Convenience predicate. Used by every "is this session paused?"
+ * call-site so the answer is single-sourced — no more three
+ * disagreeing definitions of "paused".
+ */
+export function hasPending(sessionId: string): boolean {
+  const db = openEventLog();
+  const row = db
+    .prepare("SELECT 1 AS hit FROM pending_approvals WHERE session_id = ? AND status = 'pending' LIMIT 1")
+    .get(sessionId) as { hit: number } | undefined;
+  return !!row;
+}
+
+/**
+ * Resolve a pending approval. Atomic — if another caller resolved it
+ * first, the second caller's `resolve` returns `{ ok: false, reason }`
+ * so they can surface "already resolved by <resolver>" instead of
+ * silently overwriting.
+ */
+export interface ResolveResult {
+  ok: boolean;
+  reason?: 'already_resolved' | 'not_found' | 'expired';
+  row?: PendingApprovalRow;
+}
+
+export function resolve(
+  approvalId: string,
+  resolution: ApprovalResolution,
+  resolver: string,
+): ResolveResult {
+  const db = openEventLog();
+  const existing = db
+    .prepare('SELECT * FROM pending_approvals WHERE approval_id = ?')
+    .get(approvalId) as ApprovalSqlRow | undefined;
+  if (!existing) return { ok: false, reason: 'not_found' };
+  if (existing.status !== 'pending') return { ok: false, reason: 'already_resolved', row: rowToPublic(existing) };
+
+  // Atomic conditional update — only succeeds if status is still
+  // 'pending'. Two racers can't both win.
+  const nextStatus: PendingApprovalStatus = resolution === 'expired' ? 'expired' : 'resolved';
+  const now = new Date().toISOString();
+  const changes = db
+    .prepare(`
+      UPDATE pending_approvals
+         SET status      = ?,
+             resolution  = ?,
+             resolver    = ?,
+             resolved_at = ?
+       WHERE approval_id = ?
+         AND status      = 'pending'
+    `)
+    .run(nextStatus, resolution, resolver, now, approvalId).changes;
+  if (changes === 0) {
+    const reread = db
+      .prepare('SELECT * FROM pending_approvals WHERE approval_id = ?')
+      .get(approvalId) as ApprovalSqlRow;
+    return { ok: false, reason: 'already_resolved', row: rowToPublic(reread) };
+  }
+  const row = db
+    .prepare('SELECT * FROM pending_approvals WHERE approval_id = ?')
+    .get(approvalId) as ApprovalSqlRow;
+  return { ok: true, row: rowToPublic(row) };
+}
+
+/**
+ * Reaper helper. Finds pending rows past their expiry and marks them
+ * expired. Returns the rows that were just expired so the caller can
+ * emit user-facing notifications + clear interrupt state on each one.
+ *
+ * Idempotent: calling this twice for the same row is a no-op the
+ * second time (the conditional UPDATE only fires when status='pending').
+ */
+export function expireStaleApprovals(now: Date = new Date()): PendingApprovalRow[] {
+  const db = openEventLog();
+  const candidates = db
+    .prepare("SELECT * FROM pending_approvals WHERE status = 'pending' AND expires_at < ?")
+    .all(now.toISOString()) as ApprovalSqlRow[];
+
+  const expired: PendingApprovalRow[] = [];
+  for (const row of candidates) {
+    const result = resolve(row.approval_id, 'expired', 'reaper');
+    if (result.ok && result.row) expired.push(result.row);
+  }
+  return expired;
+}

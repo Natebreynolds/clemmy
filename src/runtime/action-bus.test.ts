@@ -121,3 +121,81 @@ test('actionBus: emits all four event kinds with their distinct shapes', () => {
     'execution.transitioned',
   ]);
 });
+
+// ---- runtime.completed / runtime.failed (v0.4.20+ reliability invariant)
+
+test('actionBus: runtime.completed events deliver sessionId + optional runId', async () => {
+  const { actionBus: bus } = await import('./action-bus.js');
+  const received: ActionEvent[] = [];
+  const unsub = bus.subscribe((evt) => {
+    if (evt.kind === 'runtime.completed') received.push(evt);
+  });
+  try {
+    bus.emit({ kind: 'runtime.completed', sessionId: 'sess-A' });
+    bus.emit({ kind: 'runtime.completed', sessionId: 'sess-B', runId: 'run-1' });
+  } finally {
+    unsub();
+  }
+  assert.equal(received.length, 2);
+  const r0 = received[0] as { sessionId: string };
+  const r1 = received[1] as { sessionId: string; runId: string };
+  assert.equal(r0.sessionId, 'sess-A');
+  assert.equal(r1.runId, 'run-1');
+});
+
+test('actionBus: runtime.failed carries BoundaryError + surface', async () => {
+  const { actionBus: bus } = await import('./action-bus.js');
+  const { BoundaryError } = await import('./boundary-error.js');
+  const received: ActionEvent[] = [];
+  const unsub = bus.subscribe((evt) => {
+    if (evt.kind === 'runtime.failed') received.push(evt);
+  });
+  try {
+    bus.emit({
+      kind: 'runtime.failed',
+      sessionId: 'sess-X',
+      error: new BoundaryError({
+        kind: 'codex.sse_truncated',
+        retryable: true,
+        userMessage: 'Model response was cut short.',
+        operatorMessage: 'SSE stream ended without response.completed',
+      }),
+      surface: 'both',
+    });
+  } finally {
+    unsub();
+  }
+  assert.equal(received.length, 1);
+  const evt = received[0] as { sessionId: string; error: InstanceType<typeof BoundaryError>; surface: string };
+  assert.equal(evt.sessionId, 'sess-X');
+  assert.equal(evt.error.kind, 'codex.sse_truncated');
+  assert.equal(evt.surface, 'both');
+});
+
+test('actionBus: runtime.completed and runtime.failed listeners can be filtered independently', async () => {
+  const { actionBus: bus } = await import('./action-bus.js');
+  const { BoundaryError } = await import('./boundary-error.js');
+  const completed: ActionEvent[] = [];
+  const failed: ActionEvent[] = [];
+  const unsubC = bus.subscribe((evt) => { if (evt.kind === 'runtime.completed') completed.push(evt); });
+  const unsubF = bus.subscribe((evt) => { if (evt.kind === 'runtime.failed') failed.push(evt); });
+  try {
+    bus.emit({ kind: 'runtime.completed', sessionId: 's1' });
+    bus.emit({
+      kind: 'runtime.failed',
+      sessionId: 's2',
+      error: new BoundaryError({
+        kind: 'runtime.unknown',
+        retryable: false,
+        userMessage: 'fail',
+        operatorMessage: 'fail',
+      }),
+      surface: 'user',
+    });
+  } finally {
+    unsubC();
+    unsubF();
+  }
+  assert.equal(completed.length, 1);
+  assert.equal(failed.length, 1);
+});

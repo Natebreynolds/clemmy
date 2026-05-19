@@ -3,6 +3,7 @@ import type { RunEvent, RunRecord } from './run-events.js';
 import type { NotificationRecord } from './notifications.js';
 import type { PendingApproval } from '../types.js';
 import type { EventRow } from './harness/eventlog.js';
+import type { BoundaryError } from './boundary-error.js';
 
 // Fan-out bus for "the daemon just did a thing" events. Listeners are
 // in-process only (the SSE handler in console-routes.ts subscribes
@@ -49,6 +50,30 @@ export type ActionEvent =
       kind: 'harness.event';
       sessionId: string;
       event: EventRow;
+    }
+  | {
+      // Reliability invariant (v0.4.20+): every CodexNativeRuntime.run
+      // terminates with EXACTLY ONE of `runtime.completed` or
+      // `runtime.failed`. Subscribers (Discord, dashboard, ops log)
+      // can be sure that "no terminal event" means "the run is still
+      // in flight" — never "the run died silently."
+      //
+      // The Recent Errors dashboard panel listens for runtime.failed
+      // and renders the BoundaryError via boundary-error-renderer.
+      kind: 'runtime.failed';
+      sessionId: string;
+      runId?: string;
+      error: BoundaryError;
+      /** Where the failure should surface. 'user' = chat/Discord/toast.
+       *  'ops' = supervisor.log only (internal failures the user can't
+       *  act on). 'both' = both surfaces. Defaults to 'both' at the
+       *  emit site when omitted. */
+      surface: 'user' | 'ops' | 'both';
+    }
+  | {
+      kind: 'runtime.completed';
+      sessionId: string;
+      runId?: string;
     };
 
 export interface ActionBus {

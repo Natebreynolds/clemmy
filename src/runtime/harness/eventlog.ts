@@ -174,6 +174,56 @@ const MIGRATIONS: { version: number; sql: string }[] = [
       );
     `,
   },
+  {
+    // Reliability pass v0.4.20:
+    //   - session_locks: cross-process serialization for state mutations on
+    //     a single sessionId. Used by withSessionLock (session-lock.ts) to
+    //     close the TOCTOU + duplicate-write holes the audit found.
+    //   - pending_approvals: addressable approval requests with per-row TTL.
+    //     One row per `approval_requested` event. The reaper expires stale
+    //     rows; the approval-registry resolves them by approval_id so a
+    //     bare "approve" reply on a busy channel never silently routes to
+    //     the wrong paused session.
+    //
+    // Both tables reference sessions(id) so they cascade on session delete.
+    // session_locks is a small set (one row per actively-locked session,
+    // typically <10 at peak); pending_approvals grows with usage but the
+    // reaper keeps it bounded.
+    version: 2,
+    sql: `
+      CREATE TABLE IF NOT EXISTS session_locks (
+        session_id   TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+        owner_pid    INTEGER NOT NULL,
+        owner_token  TEXT NOT NULL,
+        acquired_at  INTEGER NOT NULL,
+        expires_at   INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS pending_approvals (
+        approval_id   TEXT PRIMARY KEY,
+        session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        channel       TEXT,
+        channel_id    TEXT,
+        requested_at  TEXT NOT NULL,
+        expires_at    TEXT NOT NULL,
+        subject       TEXT NOT NULL,
+        tool          TEXT,
+        args_json     TEXT,
+        status        TEXT NOT NULL DEFAULT 'pending'
+                      CHECK (status IN ('pending','resolved','expired','cancelled')),
+        resolution    TEXT
+                      CHECK (resolution IS NULL OR resolution IN ('approved','rejected','expired','cancelled_by_user')),
+        resolver      TEXT,
+        resolved_at   TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_pending_approvals_session_status
+        ON pending_approvals(session_id, status);
+      CREATE INDEX IF NOT EXISTS idx_pending_approvals_channel_status
+        ON pending_approvals(channel_id, status) WHERE channel_id IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS idx_pending_approvals_expires
+        ON pending_approvals(expires_at) WHERE status = 'pending';
+    `,
+  },
 ];
 
 function runMigrations(db: Database.Database): void {
