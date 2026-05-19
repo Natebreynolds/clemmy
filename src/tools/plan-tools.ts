@@ -5,14 +5,20 @@ import { plans, textResult } from './shared.js';
 export function registerPlanTools(server: McpServer): void {
   server.tool(
     'create_plan',
-    'Create a lightweight execution plan with concrete steps.',
+    'Create a lightweight execution plan with concrete steps. Optional parallel `verifications` array supplies one verification check per step ("how will we know this step worked") — same length as steps, leave individual entries empty when no meaningful check exists.',
     {
       title: z.string().min(1),
       steps: z.array(z.string().min(1)).min(1).max(12),
+      verifications: z.array(z.string()).max(12).optional()
+        .describe('Optional parallel array of verification checks, one per step. Same length as steps. Empty strings (or omitting the array) leave the step without a typed verify check.'),
       session_id: z.string().min(1).optional(),
     },
-    async ({ title, steps, session_id }) => {
-      const plan = plans.create(title, steps, { sessionId: session_id, source: 'manual' });
+    async ({ title, steps, verifications, session_id }) => {
+      const richSteps = steps.map((text, index) => {
+        const verify = verifications?.[index]?.trim();
+        return verify ? { text, verify } : text;
+      });
+      const plan = plans.create(title, richSteps, { sessionId: session_id, source: 'manual' });
       return textResult(`Created plan ${plan.id} with ${plan.steps.length} steps.`);
     },
   );

@@ -8,6 +8,7 @@ import { renderProfileForInstructions } from '../runtime/user-profile.js';
 import { getProposalFeedback, renderProposalFeedback } from '../agents/proposal-feedback.js';
 import { renderMcpServersForInstructions } from '../runtime/mcp-config.js';
 import { readConnectedClis } from '../integrations/cli-catalog/catalog.js';
+import type { MessageIntent } from './message-intent.js';
 
 const GOALS_DIR = path.join(BASE_DIR, 'goals');
 
@@ -169,13 +170,34 @@ export function renderChannelDirective(channel?: string): string {
   return '';
 }
 
-export function buildAssistantInstructions(context: MemoryContext, channel?: string): string {
+/**
+ * Two-rule discipline directive for action/tool-intent turns. Distilled
+ * from the multica-ai/andrej-karpathy-skills CLAUDE.md framework, kept
+ * to the rules Clemmy didn't already enforce — value-vs-complexity and
+ * goal-driven verification are already present elsewhere (auto-memory
+ * + Planner schema) and re-stating them is pure token cost.
+ *
+ * Gated: only injected on `action` and `tool_intent` turns. Casual,
+ * lookup, and meta_clarify turns get no extra prompt — they don't have
+ * the change/edit failure modes these rules guard against.
+ */
+export function renderActionDisciplineDirective(intent?: MessageIntent): string {
+  if (intent !== 'action' && intent !== 'tool_intent') return '';
+  return [
+    'Action discipline (this turn is editing / multi-step work):',
+    '- Surface tradeoffs. If two interpretations of the request lead to materially different work, name them in one sentence and pick one — don\'t silently choose. Name your load-bearing assumptions inline rather than burying them in a diff.',
+    '- Touch only what the request requires. Don\'t refactor adjacent code, fix unrelated formatting, or sneak in "while-I\'m-here" cleanups. Match the existing style even when you\'d write it differently. If you notice unrelated dead code, mention it, don\'t delete it.',
+  ].join('\n');
+}
+
+export function buildAssistantInstructions(context: MemoryContext, channel?: string, intent?: MessageIntent): string {
   const owner = OWNER_NAME || 'the user';
   const goalsContext = buildGoalsContext();
   const integrationsContext = buildIntegrationsContext();
   const persistentFacts = renderFactsForInstructions(12);
   const userPreferences = renderProfileForInstructions();
   const channelDirective = renderChannelDirective(channel);
+  const actionDirective = renderActionDisciplineDirective(intent);
   const proposalFeedback = renderProposalFeedback(getProposalFeedback({ windowDays: 30 }));
 
   return [
@@ -214,6 +236,7 @@ export function buildAssistantInstructions(context: MemoryContext, channel?: str
     'When the user asks to focus on one task, pause the rest, or stop working on everything except X, call `execution_focus` (id or short title substring). To bring everything back, call `execution_clear_focus`. Use `execution_pause` / `execution_resume` for ad-hoc single-execution control outside of a focus session.',
 
     channelDirective,
+    actionDirective,
     section('User Preferences', userPreferences),
     section('Persistent Facts', persistentFacts),
     section('Proposal Feedback', proposalFeedback),

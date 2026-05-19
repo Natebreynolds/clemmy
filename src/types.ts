@@ -190,6 +190,16 @@ export interface PlanStep {
   id: string;
   text: string;
   status: 'pending' | 'in_progress' | 'done';
+  /**
+   * Optional one-line verification check — how we'll know this step
+   * actually worked. Pulled from the Planner sub-agent's `verification`
+   * field when present, or supplied manually via `create_plan`. The
+   * intent is to convert "make it work" advice into a typed,
+   * inspectable success criterion per step. Absent on plans authored
+   * before this field existed and on free-text step lists from
+   * `parseExecutionResponse` (markdown path has no place for it yet).
+   */
+  verify?: string;
 }
 
 export interface PlanRecord {

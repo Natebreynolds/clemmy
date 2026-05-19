@@ -28,16 +28,34 @@ function savePlans(plans: PlanRecord[]): void {
   writeFileSync(PLAN_FILE, JSON.stringify(plans, null, 2));
 }
 
-function buildSteps(items: string[]): PlanStep[] {
-  return items.map((text, index) => ({
-    id: `step-${index + 1}`,
-    text: text.trim(),
-    status: index === 0 ? 'in_progress' : 'pending',
-  }));
+/**
+ * A step as supplied to `PlanStore.create`. Strings are kept for
+ * backward compatibility with the markdown-based intake path
+ * (`extractSteps` returns string[]); callers with richer data — notably
+ * the Planner sub-agent — can pass `{ text, verify }` so the typed
+ * verification check survives into PlanStep.
+ */
+export type PlanStepInput = string | { text: string; verify?: string };
+
+function normalizeStepInput(item: PlanStepInput): { text: string; verify?: string } {
+  if (typeof item === 'string') return { text: item.trim() };
+  return { text: item.text.trim(), verify: item.verify?.trim() || undefined };
+}
+
+function buildSteps(items: PlanStepInput[]): PlanStep[] {
+  return items.map((raw, index) => {
+    const { text, verify } = normalizeStepInput(raw);
+    return {
+      id: `step-${index + 1}`,
+      text,
+      status: index === 0 ? 'in_progress' : 'pending',
+      ...(verify ? { verify } : {}),
+    };
+  });
 }
 
 export class PlanStore {
-  create(title: string, steps: string[], options?: { sessionId?: string; source?: PlanRecord['source'] }): PlanRecord {
+  create(title: string, steps: PlanStepInput[], options?: { sessionId?: string; source?: PlanRecord['source'] }): PlanRecord {
     const plans = loadPlans();
     const now = new Date().toISOString();
     const plan: PlanRecord = {
@@ -47,7 +65,10 @@ export class PlanStore {
       source: options?.source ?? 'manual',
       createdAt: now,
       updatedAt: now,
-      steps: buildSteps(steps.filter(Boolean)),
+      steps: buildSteps(steps.filter((item) => {
+        if (typeof item === 'string') return Boolean(item);
+        return Boolean(item?.text);
+      })),
     };
     plans.push(plan);
     savePlans(plans);

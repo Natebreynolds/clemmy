@@ -135,6 +135,33 @@ const MIGRATIONS: { version: number; sql: string }[] = [
       CREATE INDEX IF NOT EXISTS idx_facts_active ON consolidated_facts(active, kind, score DESC);
     `,
   },
+  {
+    version: 2,
+    sql: `
+      -- Inbound message inbox. Channels (Discord, dashboard, webhook)
+      -- write 'received' before handing off to the gateway and mark
+      -- 'replied' once delivery confirms. PRIMARY KEY enforces
+      -- idempotency: redelivery of the same provider message id is a
+      -- no-op. On daemon restart, anything not in ('replied','dropped')
+      -- can be replayed without double-billing the model.
+      CREATE TABLE IF NOT EXISTS inbound_messages (
+        channel            TEXT NOT NULL,
+        source_message_id  TEXT NOT NULL,
+        session_id         TEXT,
+        user_id            TEXT,
+        run_id             TEXT,
+        status             TEXT NOT NULL CHECK (status IN ('received','claimed','replied','failed','dropped')),
+        attempts           INTEGER NOT NULL DEFAULT 0,
+        error              TEXT,
+        received_at        TEXT NOT NULL,
+        claimed_at         TEXT,
+        completed_at       TEXT,
+        PRIMARY KEY (channel, source_message_id)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_inbound_status ON inbound_messages(status, received_at);
+    `,
+  },
 ];
 
 function runMigrations(db: Database.Database): void {

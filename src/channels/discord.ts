@@ -36,6 +36,7 @@ import {
 import { ClementineAssistant } from '../assistant/core.js';
 import { ClementineGateway, type GatewayResponse } from '../gateway/router.js';
 import { getOrCreateDiscordSessionId } from './discord-store.js';
+import { claimInbound, completeInbound } from './inbox-store.js';
 import type { ApprovalResolutionResult, PendingApproval, ToolActivity } from '../types.js';
 import { summarizeApprovalAction } from '../runtime/approval-summary.js';
 import {
@@ -1552,6 +1553,23 @@ async function handleMessage(message: Message<boolean>, assistant: ClementineAss
     return;
   }
 
+  // Claim the inbound message in the persistent inbox before we spend
+  // any model tokens. Two reliability properties this enforces:
+  //   1. Idempotency. If Discord re-delivers the same message id
+  //      (gateway reconnect, retried HTTP edit, etc.) we skip the
+  //      second model call entirely — that bug was a real source of
+  //      double-replies and double-billed turns.
+  //   2. Restart durability. A 'claimed' row that never reaches
+  //      'replied' is the signal that the daemon crashed mid-reply;
+  //      future restart-replay code can pick those up.
+  // Zero LLM tokens — pure local SQLite.
+  const inboxKey = { channel: `discord:${message.channelId}`, sourceMessageId: message.id };
+  const claim = claimInbound({ ...inboxKey, userId: message.author.id });
+  if (!claim.shouldProcess) {
+    logger.info({ ...inboxKey, status: claim.record.status }, 'Skipping already-handled Discord message');
+    return;
+  }
+
   // 0.3 harness routing — when DISCORD_HARNESS_ENABLED=true, every
   // qualifying message goes through Orchestrator + sub-agents +
   // auto-continuation. The reply is edited in place as progress
@@ -1559,8 +1577,10 @@ async function handleMessage(message: Message<boolean>, assistant: ClementineAss
   if (DISCORD_HARNESS_ENABLED) {
     try {
       await handleDiscordHarnessMessage(message, prompt);
+      completeInbound({ ...inboxKey, status: 'replied' });
     } catch (err) {
       logger.error({ err, channelId: message.channelId }, 'Discord harness handler failed');
+      completeInbound({ ...inboxKey, status: 'failed', error: err instanceof Error ? err.message : String(err) });
       try { await message.reply('Harness run failed: ' + ((err as Error).message ?? 'unknown')); } catch {}
     }
     return;
@@ -1618,8 +1638,14 @@ async function handleMessage(message: Message<boolean>, assistant: ClementineAss
         logger.warn({ err }, 'Failed to attach Continue button to Discord reply');
       }
     }
+    completeInbound({ ...inboxKey, runId: response.runId, status: 'replied' });
   } catch (error) {
     logger.error({ err: error, channelId: message.channelId, userId: message.author.id }, 'Discord message handling failed');
+    completeInbound({
+      ...inboxKey,
+      status: 'failed',
+      error: error instanceof Error ? error.message : String(error),
+    });
     await sendChunks(
       message.channel,
       error instanceof Error ? `I hit an error while handling that message: ${error.message}` : 'I hit an internal error while handling that message.',
