@@ -81,9 +81,39 @@ const ALWAYS_ADMIN = new Set<string>([
  * accidentally land here by naming convention.
  */
 const NEVER_GATE_LOCAL_MEMORY = new Set<string>([
+  // Tool-choice memory (Phase A): per-machine record of "what tool
+  // works for which intent." Pure local file I/O.
   'tool_choice_recall',
   'tool_choice_remember',
   'tool_choice_invalidate',
+  // Durable facts + working memory.
+  'memory_remember',
+  'memory_forget',
+  'memory_embed_backfill',
+  'working_memory',
+  'note_create',
+  'note_take',
+  // Task + goal bookkeeping — local JSON, no external surface.
+  'task_add',
+  'task_update',
+  'goal_create',
+  'goal_update',
+  // Execution-tracking writes are local state. The Orchestrator was
+  // pausing on `execution_update_step` after every tool call, which
+  // is friction the user reads as "why does it keep asking?"
+  'execution_update_step',
+  'execution_complete',
+  'execution_mark_blocked',
+  // Cron progress writes — local progress file.
+  'cron_progress_write',
+  // Plan + autonomy authoring — local writes, the user approves the
+  // plan as a whole via the plan-surface flow, not per-step.
+  'create_plan',
+  'update_plan_step',
+  'surface_plan',
+  // Session bookkeeping
+  'session_pause',
+  'session_resume',
 ]);
 
 /**

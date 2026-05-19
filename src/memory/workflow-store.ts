@@ -39,6 +39,17 @@ export interface WorkflowStepInput {
   tier?: number;
   maxTurns?: number;
   /**
+   * T-WF-1: route this step through the harness loop (full orchestrator
+   * + sub-agents + addressable approvals via apr-xxxx codes) instead
+   * of the legacy `assistant.respond()` shorthand. Opt-in per step so
+   * existing workflows authored before the harness existed keep their
+   * original behavior. New workflows that need real tool calls (sf,
+   * composio writes, MCP tools that pause for approval) should set
+   * this to true. Equivalent to setting the env flag
+   * WORKFLOW_USE_HARNESS=on for ALL steps in the workflow.
+   */
+  useHarness?: boolean;
+  /**
    * "for each item in <input>, run this step once per item." When set,
    * the daemon's workflow runner iterates the named upstream output
    * with bounded concurrency (research_bot/manager.py pattern). The
@@ -217,6 +228,7 @@ function readWorkflowFile(filePath: string): WorkflowDefinition | null {
       if (typeof step.model === 'string') result.model = step.model;
       if (typeof step.tier === 'number') result.tier = step.tier;
       if (typeof step.maxTurns === 'number') result.maxTurns = step.maxTurns;
+      if (typeof step.useHarness === 'boolean') result.useHarness = step.useHarness;
       if (typeof step.forEach === 'string') result.forEach = step.forEach;
       if (step.deterministic && typeof step.deterministic === 'object') {
         const d = step.deterministic as Record<string, unknown>;

@@ -335,10 +335,19 @@ function buildDiscordRestTransport(channelId: string) {
         { method: 'POST', body: { content } },
       );
       return {
-        edit: async (next: string) => {
+        edit: async (next: string, options?: { components?: unknown[] }) => {
+          const body: Record<string, unknown> = { content: next.slice(0, 1900) };
+          // When components are passed (e.g. approval Approve/Reject
+          // buttons), include them; passing an empty array drops any
+          // previously-attached components on a re-edit. Discord's
+          // PATCH /channels/.../messages accepts the same `components`
+          // wire shape as our other button-rendering code.
+          if (options && Array.isArray(options.components)) {
+            body.components = options.components;
+          }
           await discordApiJson(`/channels/${channelId}/messages/${sent.id}`, {
             method: 'PATCH',
-            body: { content: next.slice(0, 1900) },
+            body,
           });
         },
       };
@@ -1528,11 +1537,21 @@ async function handleMessage(message: Message<boolean>, assistant: ClementineAss
     const gatewayTransport = {
       async sendInitial(content: string) {
         const reply = (await message.reply(content)) as unknown as {
-          edit(opts: { content: string }): Promise<unknown>;
+          edit(opts: { content: string; components?: unknown[] }): Promise<unknown>;
         };
         return {
-          edit: async (next: string) => {
-            await reply.edit({ content: next });
+          edit: async (next: string, options?: { components?: unknown[] }) => {
+            const editPayload: { content: string; components?: unknown[] } = {
+              content: next,
+            };
+            // Pass components through so approval Approve/Reject buttons
+            // render on the gateway path (DMs over gateway, guild
+            // channels). Without this, the harness sets `pendingApprovalId`
+            // and the components array is built — then silently dropped here.
+            if (options && Array.isArray(options.components)) {
+              editPayload.components = options.components;
+            }
+            await reply.edit(editPayload);
           },
         };
       },
@@ -1751,6 +1770,19 @@ async function pollDiscordDirectMessages(client: Client, assistant: ClementineAs
         // conversation runner here with a REST transport: POST a
         // placeholder, PATCH it as actionBus events arrive.
         if (DISCORD_HARNESS_ENABLED) {
+          // Inbox claim — the gateway-side path at line ~1576 already
+          // does this, but the polling path used to skip it. When both
+          // paths fire for the same DM message (gateway AND polling
+          // pick it up because Discord delivers DM events through both
+          // channels in some setups), the user saw two "starting…"
+          // messages and the harness ran twice for one ask. Claiming
+          // here makes the second attempt a no-op.
+          const inboxKey = { channel: `discord:${dm.id}`, sourceMessageId: message.id };
+          const claim = claimInbound({ ...inboxKey, userId: message.author.id });
+          if (!claim.shouldProcess) {
+            markDiscordDmMessageSeen(dm.id, message.id);
+            continue;
+          }
           try {
             await runDiscordHarnessConversation({
               prompt,
@@ -1759,7 +1791,9 @@ async function pollDiscordDirectMessages(client: Client, assistant: ClementineAs
               guildId: null,
               transport: buildDiscordRestTransport(dm.id),
             });
+            completeInbound({ ...inboxKey, status: 'replied' });
           } catch (err) {
+            completeInbound({ ...inboxKey, status: 'failed', error: err instanceof Error ? err.message : String(err) });
             logger.error(
               { err, channelId: dm.id, userId: message.author.id },
               'Discord harness DM handler failed',

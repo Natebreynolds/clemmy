@@ -45,97 +45,84 @@ function needsApprovalUnlessInPlanScope(toolName: string) {
 }
 
 /**
- * Per-command read/write classifier for run_shell_command.
+ * Per-command danger classifier for run_shell_command.
  *
- * Nathan's rule (2026-05-19): "It should be able to run shell and bash
- * to find what it needs and only ask approval to write." A blanket
- * "shell = approval" gate makes every discovery turn pause; the
- * common case is `sf data query`, `git status`, `ls`, `cat`, `--version`
- * — pure reads that should fire without friction.
- *
- * Conservative bias: when we can't recognize the command as a known
- * read shape, treat as write (require approval). Over-prompting beats
- * silently running a destructive op.
+ * Nathan's mental model (2026-05-19): "Clementine has shell access.
+ * Bash is bash. Don't make me approve every `ls` or `sf data query`.
+ * Only ask when something destructive is about to happen." That
+ * inverts the previous polarity: default AUTO-APPROVE, deny-list the
+ * known destructive shapes. The hard-block list in
+ * `assertCommandAllowed` still applies on top (rm -rf /, sudo,
+ * shutdown, etc.); this gate is the softer "human-in-the-loop please"
+ * checkpoint for ops that mutate state outside Clementine.
  */
-function shellCommandIsReadOnly(rawCommand: unknown): boolean {
-  if (typeof rawCommand !== 'string') return false;
+function shellCommandNeedsApproval(rawCommand: unknown): boolean {
+  if (typeof rawCommand !== 'string') return true; // unparseable → ask
   const cmd = rawCommand.trim();
-  if (!cmd) return false;
+  if (!cmd) return true;
 
-  // Chain operators short-circuit to "write" — every linked command
-  // would need to be classified individually. If you want to chain,
-  // request approval for the whole thing.
-  if (/[;&|]/.test(cmd.replace(/"[^"]*"|'[^']*'/g, ''))) return false;
-  // Output redirection writes to disk.
-  if (/>\s*\S/.test(cmd.replace(/"[^"]*"|'[^']*'/g, ''))) return false;
-  // sudo / exec / eval are explicit privilege/scope expansions.
-  if (/^\s*(sudo|exec|eval)\b/.test(cmd)) return false;
+  // Strip quoted segments so the patterns don't false-positive on a
+  // SOQL string like "DELETE FROM …" inside `sf data query --query "..."`.
+  const stripped = cmd.replace(/"[^"]*"|'[^']*'/g, ' ').toLowerCase();
 
-  const tokens = cmd.split(/\s+/);
-  const head = tokens[0] ?? '';
-  const second = tokens[1] ?? '';
+  // Output redirection writes to disk (> file, >> file, |tee).
+  if (/>\s*\S/.test(stripped) || /\|\s*tee\b/.test(stripped)) return true;
 
-  // Always-safe binaries (the unix read toolkit).
-  const SAFE_BINARIES = new Set([
-    'ls', 'cat', 'head', 'tail', 'less', 'more', 'file', 'stat', 'pwd', 'which',
-    'type', 'whoami', 'hostname', 'uname', 'env', 'printenv', 'ps', 'top', 'df',
-    'du', 'uptime', 'date', 'free', 'id', 'groups', 'history', 'echo', 'printf',
-    'grep', 'find', 'wc', 'sort', 'uniq', 'tr', 'cut', 'awk', 'sed', 'jq', 'yq',
-    'tree', 'realpath', 'readlink', 'basename', 'dirname',
-  ]);
-  if (SAFE_BINARIES.has(head)) return true;
+  // sudo / su escalate privileges — always ask.
+  if (/(^|[\s;&|])sudo\b/.test(stripped) || /(^|[\s;&|])su\s+-/.test(stripped)) return true;
 
-  // --version / --help / -V / -h flags are universally informational
-  // regardless of binary.
-  if (tokens.some((t) => /^(--version|--help|-V|-h)$/.test(t))) return true;
+  // Destructive patterns — file/dir mutations, system changes, process control,
+  // remote mutations, package installs, CRM/SaaS data writes.
+  const DANGER_PATTERNS: RegExp[] = [
+    // Filesystem mutations
+    /(^|[\s;&|])(rm|rmdir|unlink|trash)\b/,
+    /(^|[\s;&|])mv\b/,
+    /(^|[\s;&|])cp\s+-[a-z]*r/,                  // recursive copy (full-tree write)
+    /(^|[\s;&|])(chmod|chown|chgrp)\b/,
+    /(^|[\s;&|])(ln|link)\s+-s?/,                // symlink creation
+    /(^|[\s;&|])mkfs\b/,
+    /(^|[\s;&|])dd\s+.*\bof=/,
+    // Process control
+    /(^|[\s;&|])(kill|killall|pkill)\b/,
+    // System-level state changes
+    /(^|[\s;&|])defaults\s+(write|delete)/,
+    /(^|[\s;&|])launchctl\s+(load|unload|bootstrap|bootout|kickstart|enable|disable)/,
+    /(^|[\s;&|])pmset\b/,
+    /(^|[\s;&|])networksetup\b/,
+    // Package managers (installing software is a real change)
+    /(^|[\s;&|])npm\s+(install|i\b|uninstall|un\b|remove|rm\b|publish|run|exec|update|audit\s+fix)/,
+    /(^|[\s;&|])(yarn|pnpm)\s+(add|remove|install|publish|run)/,
+    /(^|[\s;&|])brew\s+(install|uninstall|reinstall|upgrade|update|cleanup|tap|untap|link|unlink|cask)/,
+    /(^|[\s;&|])(pip|pip3)\s+(install|uninstall|wheel)/,
+    /(^|[\s;&|])gem\s+(install|uninstall|update)/,
+    /(^|[\s;&|])cargo\s+(install|publish|uninstall)/,
+    /(^|[\s;&|])go\s+(install|get|mod\s+tidy)/,
+    // Git mutations / data-loss
+    /(^|[\s;&|])git\s+(push|merge|rebase|reset\s+--hard|clean\s+-[a-z]*[df]|checkout\s+--|restore\s+--source|branch\s+-d|tag\s+-d|remote\s+(add|remove|rm)|stash\s+drop|stash\s+clear|filter-branch|gc\s+--prune)/,
+    // Docker / k8s mutations
+    /(^|[\s;&|])docker\s+(run|rm|rmi|stop|start|kill|build|push|exec|cp|tag|commit|prune|system\s+prune)/,
+    /(^|[\s;&|])kubectl\s+(apply|create|delete|edit|patch|replace|rollout|scale|cordon|drain|exec|cp|attach|debug|run)/,
+    // Salesforce CLI writes
+    /(^|[\s;&|])sf\s+(data\s+(update|insert|delete|upsert|import|tree)|org\s+(login|logout|create|delete|open|display|switch)|project\s+(deploy|retrieve|delete|generate)|deploy\b|alias\s+(set|unset))/,
+    // GitHub CLI mutations
+    /(^|[\s;&|])gh\s+(repo\s+(create|delete|fork|clone|sync|edit|archive|rename|set-default)|pr\s+(create|close|merge|edit|review|comment|ready|reopen)|issue\s+(create|close|edit|comment|reopen|transfer|delete|pin|unpin)|release\s+(create|delete|edit|upload|download)|workflow\s+(run|disable|enable)|secret\s+(set|delete)|auth\s+(login|logout|refresh|token)|api\s+(post|put|patch|delete))/,
+    // HTTP mutations
+    /(^|[\s;&|])curl\s+.*-X\s*(POST|PUT|DELETE|PATCH)/i,
+    /(^|[\s;&|])curl\s+.*(--data|--data-raw|--data-binary|--data-urlencode|-d\s)/,
+    /(^|[\s;&|])curl\s+.*--upload-file/,
+    /(^|[\s;&|])(wget|wget2)\s+.*(--post-data|--post-file)/,
+    // AWS / cloud mutations
+    /(^|[\s;&|])aws\s+\S+\s+(create|update|put|delete|terminate|deregister|associate|disassociate|enable|disable|attach|detach|start|stop|reboot|run-instances|publish|send)/,
+    /(^|[\s;&|])gcloud\s+\S+\s+(create|update|delete|enable|disable|set)/,
+    /(^|[\s;&|])(terraform|tofu)\s+(apply|destroy|init|import|state\s+(rm|mv|push)|workspace\s+(new|delete))/,
+    /(^|[\s;&|])(ansible|ansible-playbook)\b/,
+    // Scary tools
+    /(^|[\s;&|])(eval|exec|source|\.)\s/,
+    /(^|[\s;&|])history\s+-c/,
+    /(^|[\s;&|])(crontab|launchd)\s+-r/,
+  ];
 
-  // Composite tools: classify by subcommand.
-  const SUBCOMMAND_READ: Record<string, Set<string>> = {
-    git: new Set([
-      'status', 'log', 'diff', 'show', 'branch', 'remote', 'blame', 'grep',
-      'ls-files', 'ls-tree', 'rev-parse', 'cat-file', 'tag', 'reflog',
-      'describe', 'shortlog', 'whatchanged', 'fsck',
-    ]),
-    sf: new Set([
-      'data', // 'sf data query' specifically — narrowed below
-      'config', 'project',
-    ]),
-    npm: new Set(['list', 'ls', 'view', 'show', 'search', 'outdated', 'doctor', 'audit']),
-    brew: new Set(['list', 'info', 'search', 'outdated', 'leaves', 'deps', 'home']),
-    pip: new Set(['list', 'show', 'search', 'check']),
-    pip3: new Set(['list', 'show', 'search', 'check']),
-    gem: new Set(['list', 'info', 'search']),
-    docker: new Set(['ps', 'images', 'logs', 'inspect', 'version', 'info', 'stats']),
-    kubectl: new Set(['get', 'describe', 'logs', 'version', 'config', 'top', 'explain']),
-    gh: new Set(['repo', 'pr', 'issue', 'run', 'workflow', 'release', 'auth', 'api', 'browse', 'status']),
-    aws: new Set(['s3', 'ec2', 'iam', 'sts']), // many AWS subcommands are read-only describe/list; we err to "needs approval" via fallback
-  };
-
-  const readSubs = SUBCOMMAND_READ[head];
-  if (readSubs && readSubs.has(second)) {
-    // Narrow further for the ones that have both read AND write
-    // verbs nested another level deep.
-    if (head === 'sf' && second === 'data') {
-      // `sf data query` is a SOQL SELECT (read). `sf data update/insert/delete/upsert/import` mutate.
-      return tokens[2] === 'query' || tokens[2] === 'search' || tokens[2] === 'get';
-    }
-    if (head === 'sf' && second === 'config') {
-      // `sf config get/list` is read. `sf config set/unset` writes the local CLI config.
-      return tokens[2] === 'get' || tokens[2] === 'list';
-    }
-    if (head === 'sf' && second === 'project') {
-      // `sf project list` etc.; deploys/retrieves are writes.
-      return tokens[2] === 'list' || tokens[2] === 'manifest';
-    }
-    if (head === 'gh' && (second === 'repo' || second === 'pr' || second === 'issue' || second === 'workflow' || second === 'release' || second === 'run')) {
-      // gh has read verbs (view/list/checks) and write verbs (create/edit/merge/close).
-      return ['view', 'list', 'status', 'checks', 'diff'].includes(tokens[2] ?? '');
-    }
-    return true;
-  }
-
-  // Unknown shape → conservative.
-  return false;
+  return DANGER_PATTERNS.some((re) => re.test(stripped));
 }
 
 /**
@@ -146,12 +133,16 @@ function shellCommandIsReadOnly(rawCommand: unknown): boolean {
  * write/unknown commands.
  */
 function needsApprovalForShellSmart() {
-  // We can't statically set kindHint because it depends on the actual
-  // command. Build a fresh callback that classifies per-invocation.
+  // Inverted polarity: auto-approve by default; pause only on
+  // recognized destructive shapes (rm, git push, package installs,
+  // sf data update, curl POST, etc.). The full hard-block list in
+  // assertCommandAllowed still applies at the binary level for the
+  // truly catastrophic shapes (rm -rf /, sudo, shutdown).
   return async (runContext: unknown, input: unknown): Promise<boolean> => {
     const command = (input && typeof input === 'object' ? (input as Record<string, unknown>).command : undefined);
-    if (shellCommandIsReadOnly(command)) return false; // never pause for read
-    // Otherwise use the existing taxonomy path (execute kind, plan-scope honored, etc.).
+    if (!shellCommandNeedsApproval(command)) return false;
+    // Destructive pattern matched — still honor plan-scope so an
+    // approved plan can pre-cover the whole thing.
     return needsApprovalUnlessInPlanScope('run_shell_command')(runContext, input);
   };
 }

@@ -14545,17 +14545,126 @@ const CONSOLE_JS = `
           eventType: event.nextState,
         };
       }
+      // T-WF surface — harness events (per-tool stream for ACTIVE
+      // sessions). The harness emits one of these for every turn
+      // start, tool call, handoff, approval pause, etc. We surface
+      // the high-signal kinds; the noise (model deltas, etc.) is
+      // dropped so the rail stays scannable.
+      if (event.kind === 'harness.event' && event.event) {
+        const ev = event.event;
+        const sid = (event.sessionId || '').slice(0, 14);
+        const data = (ev.data || {});
+        // Map event type → icon + title + meta
+        switch (ev.type) {
+          case 'turn_started': {
+            const agent = (data.agent || ev.role || '?');
+            return {
+              icon: '◑',
+              title: agent + ' · turn started',
+              meta: 'session ' + sid + '…',
+              eventType: 'turn_started',
+            };
+          }
+          case 'tool_called': {
+            const tool = (data.tool || '?');
+            const callId = (data.callId || '').slice(0, 8);
+            return {
+              icon: '⚙',
+              title: tool,
+              meta: 'session ' + sid + '… · call ' + callId,
+              eventType: 'tool_called',
+            };
+          }
+          case 'tool_returned': {
+            const tool = (data.tool || '?');
+            const resultPrev = (typeof data.result === 'string' ? data.result : JSON.stringify(data.result || {})).slice(0, 120);
+            return {
+              icon: '✓',
+              title: tool + ' returned',
+              meta: resultPrev,
+              eventType: 'tool_returned',
+            };
+          }
+          case 'handoff': {
+            return {
+              icon: '⇆',
+              title: (data.from || '?') + ' → ' + (data.to || '?'),
+              meta: 'handoff · session ' + sid + '…',
+              eventType: 'handoff',
+            };
+          }
+          case 'approval_requested': {
+            const apr = (data.approvalId || '').slice(0, 12);
+            return {
+              icon: '◇',
+              title: 'Approval requested · ' + (data.subject || data.tool || '?'),
+              meta: apr ? apr : 'session ' + sid + '…',
+              eventType: 'approval_requested',
+            };
+          }
+          case 'approval_resolved': {
+            return {
+              icon: data.decision === 'approved' ? '✓' : '✕',
+              title: (data.decision || 'resolved') + ' · ' + (data.tool || ''),
+              meta: 'session ' + sid + '…',
+              eventType: 'approval_resolved',
+            };
+          }
+          case 'run_completed':
+          case 'conversation_completed': {
+            return {
+              icon: '✓',
+              title: 'Run completed',
+              meta: (data.summary || data.finalOutputPreview || '').slice(0, 140),
+              eventType: 'run_completed',
+            };
+          }
+          case 'run_failed':
+          case 'guardrail_tripped':
+          case 'stuck_detected': {
+            return {
+              icon: '⚠',
+              title: ev.type.replace(/_/g, ' '),
+              meta: (data.error || data.signal || data.summary || '').slice(0, 140),
+              eventType: ev.type,
+            };
+          }
+          default:
+            // Drop low-signal events (run_paused, run_resumed, etc.)
+            // to keep the feed scannable. They're still visible in
+            // the per-session events stream + audit log.
+            return null;
+        }
+      }
+      if (event.kind === 'runtime.failed') {
+        return {
+          icon: '⚠',
+          title: 'Runtime failed',
+          meta: (event.error && event.error.userMessage) || (event.error && event.error.kind) || 'unknown',
+          eventType: 'runtime_failed',
+        };
+      }
+      if (event.kind === 'runtime.completed') {
+        // Skip — these fire on every successful turn and would flood
+        // the rail. The conversation_completed event from the harness
+        // already surfaces the user-facing result above.
+        return null;
+      }
       return { icon: '·', title: 'event', meta: '', eventType: '' };
     }
 
     function appendCard(event) {
-      if (emptyEl) emptyEl.style.display = 'none';
       const d = describe(event);
+      // describe() returns null for low-signal kinds (e.g. runtime.completed,
+      // run_resumed) so the rail stays scannable. Drop the card entirely.
+      if (!d) return;
+      if (emptyEl) emptyEl.style.display = 'none';
       const card = document.createElement('div');
       card.className = 'live-card';
       card.setAttribute('data-event-kind', event.kind);
       if (d.eventType) card.setAttribute('data-event-type', d.eventType);
       const ts = (event.kind === 'run.event' && event.event && event.event.createdAt)
+        || (event.kind === 'harness.event' && event.event && event.event.createdAt)
         || (event.kind === 'notification.created' && event.notification.createdAt)
         || (event.kind === 'approval.created' && event.approval.createdAt)
         || new Date().toISOString();
@@ -14622,6 +14731,13 @@ const CONSOLE_JS = `
       es.addEventListener('approval.resolved', handleLive);
       es.addEventListener('notification.created', handleLive);
       es.addEventListener('execution.transitioned', handleLive);
+      // T-WF surface — every harness session emits these as it works.
+      // For active workflow sessions this is the per-tool stream the
+      // user wants to watch (calling sf, calling dataforseo, etc.)
+      // instead of the every-10-min heartbeat.
+      es.addEventListener('harness.event', handleLive);
+      es.addEventListener('runtime.failed', handleLive);
+      es.addEventListener('runtime.completed', handleLive);
       es.addEventListener('error', () => {
         if (!es || es.readyState !== EventSource.CONNECTING) {
           if (es) { try { es.close(); } catch (_) {} es = null; }

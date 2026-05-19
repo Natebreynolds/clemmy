@@ -127,7 +127,27 @@ export function claimInbound(input: ClaimInput): ClaimResult {
     return { isNew: false, shouldProcess: false, record: rowToRecord(existing) };
   }
 
-  // Retry path: bump attempts and re-claim. Keep original received_at.
+  // Concurrent-second-claim guard: a row that's already 'claimed' AND
+  // freshly so (claimed_at within the last few minutes) means another
+  // code path inside THIS daemon is currently processing the same
+  // message. Refuse the second claim so the gateway-path and the
+  // DM-polling path don't both spawn a session for one Discord message.
+  // The bug this fixes: handleDiscordHarnessMessage (gateway) and
+  // runDiscordHarnessConversation (polling) BOTH fire for DMs in some
+  // intents-mix configurations; without this guard the user saw 2-3
+  // "Orchestrator working…" messages per ask and the model burned 2-3×
+  // the tokens.
+  if (existing.status === 'claimed' && existing.claimed_at) {
+    const claimedAt = Date.parse(existing.claimed_at);
+    const FRESH_CLAIM_WINDOW_MS = 5 * 60_000;
+    if (!Number.isNaN(claimedAt) && Date.now() - claimedAt < FRESH_CLAIM_WINDOW_MS) {
+      return { isNew: false, shouldProcess: false, record: rowToRecord(existing) };
+    }
+  }
+
+  // Stale-claim retry path: a 'claimed' row older than the fresh window
+  // (or status 'failed') is the signal that a prior run crashed mid-reply.
+  // Bump attempts and re-claim so a future restart-replay can finish.
   db.prepare(
     `UPDATE inbound_messages
         SET status = 'claimed', attempts = attempts + 1, claimed_at = ?

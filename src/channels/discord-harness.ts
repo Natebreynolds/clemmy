@@ -456,9 +456,49 @@ export async function tryHandleHarnessApprovalReply(opts: {
   prompt: string;
   transport: DiscordHarnessTransport;
 }): Promise<boolean> {
-  if (!isChannelSessionAwaitingApproval(opts.channelId)) return false;
   const intent = parseApprovalIntent(opts.prompt);
   if (!intent) return false;
+  // T-WF-1 addendum: when the user types `approve apr-xxxx`, the
+  // approval may belong to a WORKFLOW session that isn't bound to
+  // their current Discord channel (workflow sessions have channel
+  // 'workflow', not the Discord channel id). The legacy gate
+  // `isChannelSessionAwaitingApproval` returns false in that case
+  // and the message falls through to a fresh turn — leaving the
+  // workflow's polling loop never seeing the resolution.
+  //
+  // If the user supplied an approval ID AND the registry has it
+  // pending, resolve it directly from here. The workflow runner's
+  // polling loop will detect the status flip on the next tick and
+  // call runConversationFromResume against its own session, so we
+  // don't need to drive the SDK runner here.
+  if (intent.approvalId) {
+    const row = approvalRegistry.get(intent.approvalId);
+    if (row && row.status === 'pending') {
+      const resolution = intent.decision === 'approve' ? 'approved' : 'rejected';
+      const result = approvalRegistry.resolve(row.approvalId, resolution, 'discord-user');
+      try {
+        await opts.transport.sendInitial(
+          result.ok
+            ? `🍊 ${resolution === 'approved' ? 'approved' : 'rejected'} \`${row.approvalId}\` — ${row.subject}`
+            : `Couldn't resolve \`${row.approvalId}\`: ${result.reason ?? 'unknown'}`,
+        );
+      } catch { /* transport is best-effort */ }
+      // If the approval also has a paused session on THIS channel,
+      // continue down the runDiscordHarnessResume path so the SDK
+      // run resumes. Otherwise the workflow runner picks it up on
+      // its next poll tick.
+      if (isChannelSessionAwaitingApproval(opts.channelId)) {
+        await runDiscordHarnessResume({
+          channelId: opts.channelId,
+          decision: intent.decision,
+          approvalId: intent.approvalId,
+          transport: opts.transport,
+        });
+      }
+      return true;
+    }
+  }
+  if (!isChannelSessionAwaitingApproval(opts.channelId)) return false;
   await runDiscordHarnessResume({
     channelId: opts.channelId,
     decision: intent.decision,
@@ -497,7 +537,7 @@ export interface DiscordHarnessTransport {
 }
 
 export interface DiscordHarnessReplyHandle {
-  edit(content: string): Promise<void>;
+  edit(content: string, options?: { components?: unknown[] }): Promise<void>;
 }
 
 interface DisplayState {
@@ -510,28 +550,49 @@ interface DisplayState {
   toolsCalled: string[];
   currentAgent?: string;
   toolCount: number;
+  // When an approval_requested event fires, we stash the approvalId
+  // here. The next flush attaches Approve/Reject buttons to the
+  // message so the user clicks instead of typing "approve apr-xxxx".
+  // Cleared on approval_resolved / awaiting_user_input / completion.
+  pendingApprovalId?: string;
+}
+
+/**
+ * Build Discord button components for a pending approval, or null when
+ * the state has no active approval. The components encode the same
+ * custom-id format that the desktop's `buildApprovalActions` uses, so
+ * the existing button interaction handler in discord.ts resolves the
+ * apr-xxxx id and triggers `runDiscordHarnessResume`.
+ */
+function approvalComponentsForState(state: DisplayState): unknown[] | null {
+  if (!state.pendingApprovalId) return null;
+  const id = state.pendingApprovalId;
+  return [
+    {
+      type: 1, // ActionRow
+      components: [
+        { type: 2 /* Button */, style: 3 /* Success */, label: 'Approve', custom_id: `clementine:approve:${id}` },
+        { type: 2, style: 4 /* Danger */, label: 'Reject', custom_id: `clementine:reject:${id}` },
+      ],
+    },
+  ];
 }
 
 function renderBody(state: DisplayState): string {
-  const head = state.summary ? `> ${state.summary}\n\n` : '';
-  // Live-progress block: only shown while not-done. Pulls the agent
-  // currently running, the count of tool calls so far, and the last
-  // ~4 tool names so the user can see "what is it doing?" at a glance.
-  let activity = '';
-  if (!state.done) {
-    const lines: string[] = [];
-    if (state.currentAgent) lines.push(`**${state.currentAgent}** is working…`);
-    if (state.toolCount > 0) {
-      const recent = state.toolsCalled.slice(-4).join(', ');
-      lines.push(`Tools used: ${state.toolCount} (${recent})`);
-    }
-    if (state.status) lines.push(`_${state.status}_`);
-    activity = lines.join('\n');
+  // Done states (final reply / approval / awaiting input) show ONLY
+  // the summary — no progress noise. The summary already carries the
+  // user-facing message, the approval prompt, or the awaiting-input
+  // question.
+  if (state.done) {
+    const body = state.summary || '_done._';
+    return body.length > MAX_DISCORD_MESSAGE ? body.slice(0, MAX_DISCORD_MESSAGE - 1) + '…' : body;
   }
-  const body = (head + activity).trim() || '_working…_';
-  // In-progress edits still truncate — the live-edit message is just a
-  // status display, not the answer. The FULL reply goes through
-  // renderFullBody + splitForLongReply at terminal time.
+  // In-progress: ONE short status line. No tool-call history, no
+  // "Tools used: 4 (composio_search_tools, local_cli_list, ...)"
+  // — that was visual clutter the user reads as "the agent is
+  // confused / churning." Keep it tight: agent name + a tasteful verb.
+  const verb = state.currentAgent ? `${state.currentAgent} working…` : (state.status || 'working…');
+  const body = `_${verb}_`;
   return body.length > MAX_DISCORD_MESSAGE ? body.slice(0, MAX_DISCORD_MESSAGE - 1) + '…' : body;
 }
 
@@ -698,12 +759,25 @@ export async function runDiscordHarnessConversation(opts: {
   const state: DisplayState = { summary: '', status: 'starting', done: false, toolsCalled: [], toolCount: 0 };
   let lastEditAt = 0;
   let pendingEdit: NodeJS.Timeout | null = null;
+  // Track which approval the LAST flush attached buttons for, so a
+  // subsequent flush after the approval resolves (or a new approval
+  // arrives) clears/replaces them — passing components:[] drops them.
+  let lastAttachedApprovalId: string | undefined;
 
   const flush = async (): Promise<void> => {
     pendingEdit = null;
     lastEditAt = Date.now();
     try {
-      await handle.edit(renderBody(state));
+      const components = approvalComponentsForState(state);
+      const needsUpdate = state.pendingApprovalId !== lastAttachedApprovalId;
+      if (components || needsUpdate) {
+        // Pass components (or an empty array when we need to clear
+        // previously-attached buttons).
+        await handle.edit(renderBody(state), { components: components ?? [] });
+        lastAttachedApprovalId = state.pendingApprovalId;
+      } else {
+        await handle.edit(renderBody(state));
+      }
     } catch {
       // Discord can transiently refuse edits (network blip, rate
       // limit). The next event will retry; nothing fatal.
@@ -1074,11 +1148,15 @@ export async function handleDiscordHarnessMessage(
   const transport: DiscordHarnessTransport = {
     async sendInitial(content) {
       const reply = (await message.reply(content)) as unknown as {
-        edit(opts: { content: string }): Promise<unknown>;
+        edit(opts: { content: string; components?: unknown[] }): Promise<unknown>;
       };
       return {
-        edit: async (next) => {
-          await reply.edit({ content: next });
+        edit: async (next, options) => {
+          const payload: { content: string; components?: unknown[] } = { content: next };
+          if (options && Array.isArray(options.components)) {
+            payload.components = options.components;
+          }
+          await reply.edit(payload);
         },
       };
     },
@@ -1169,19 +1247,16 @@ export function applyEventToState(event: EventRow, state: DisplayState): void {
     }
     case 'approval_requested': {
       const subject = String(data.subject ?? data.tool ?? 'action');
-      // When the registry-side write succeeded, the event data carries
-      // an apr-xxxx ID. Include it in the body so the user can
-      // disambiguate when multiple sessions are paused on the same
-      // channel ("Reply `approve apr-xy7q`"). Fall back to plain
-      // "approve" when no ID is present (pre-migration sessions).
       const approvalId = typeof data.approvalId === 'string' ? data.approvalId : null;
+      // Stash the approval id so the next flush attaches Approve/Reject
+      // buttons (rendered server-side by the Discord transport via the
+      // standard buildApprovalActions helper). Text fallback stays in
+      // the body for clients that ignore components or for users who
+      // prefer to type — never required.
+      if (approvalId) state.pendingApprovalId = approvalId;
       const replyHint = approvalId
-        ? `Reply \`approve ${approvalId}\` (or \`reject ${approvalId}\`) to continue.`
-        : 'Reply **approve** to continue or **reject** to cancel.';
-      // Move the approval text into summary (which survives the
-      // done=true render path) instead of status (which renderBody
-      // hides when done). Without this the placeholder degrades to
-      // "working…" forever — the user never sees what's pending.
+        ? `Tap **Approve** or **Reject** below — or type \`approve ${approvalId}\` / \`reject ${approvalId}\` if you prefer.`
+        : 'Tap a button below — or reply **approve** / **reject**.';
       state.summary = `Approval required: ${subject}\n\n${replyHint}`;
       state.status = 'approval required';
       state.done = true;
@@ -1190,6 +1265,8 @@ export function applyEventToState(event: EventRow, state: DisplayState): void {
     case 'approval_resolved': {
       const decision = String(data.decision ?? 'resolved');
       state.status = decision === 'approved' ? 'approved — continuing' : 'rejected — stopping';
+      // Buttons are no longer relevant; clear so the next flush drops them.
+      state.pendingApprovalId = undefined;
       return;
     }
     case 'run_resumed': {
