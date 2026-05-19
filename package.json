@@ -1,6 +1,6 @@
 {
   "name": "clemmy",
-  "version": "0.4.16",
+  "version": "0.4.17",
   "description": "Lightweight background agent system \u2014 proactive, customizable, runs out of the box",
   "license": "MIT",
   "homepage": "https://github.com/Natebreynolds/clemmy",

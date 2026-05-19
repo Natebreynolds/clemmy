@@ -684,6 +684,52 @@ test('runConversation: a malformed finalOutput counts as completed without recur
   assert.equal(completedEvents[0].data.reason, 'no_structured_output');
 });
 
+test('runConversation: sub-agent stall ("Continuing." with zero tool calls) is flagged as sub_agent_stalled', async () => {
+  // Repro: Orchestrator hands off to Executor, Executor returns the
+  // single word "Continuing." and makes zero tool calls. Without the
+  // detector the user sees "Continuing." as the bot's reply and waits
+  // forever. With it, the conversation_completed event reports the
+  // stall explicitly so Discord/chat dock can render a clear failure.
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const runner = scriptedRunner([{ finalOutput: 'Continuing.' }]);
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'continue this',
+    makeRunner: makeRunnerStub,
+    runRunner: runner,
+  });
+  assert.equal(result.status, 'completed');
+  const completedEvents = listEventsForConv(sess.id, { types: ['conversation_completed'] });
+  assert.equal(completedEvents[0].data.reason, 'sub_agent_stalled');
+  assert.match(
+    completedEvents[0].data.summary as string,
+    /sub-agent ended its turn without taking any action/,
+  );
+  assert.equal(
+    (completedEvents[0].data.stallDetail as { rawOutput: string }).rawOutput,
+    'Continuing.',
+  );
+});
+
+test('runConversation: a short SUBSTANTIVE reply is NOT flagged as a stall', async () => {
+  // Counter-test: short reply but not on the stall whitelist. Should be
+  // surfaced as a normal summary so we don't drown real terse answers
+  // in the same "agent gave up" message.
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const runner = scriptedRunner([{ finalOutput: 'Added 5 rows to the sheet.' }]);
+  await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'add the rows',
+    makeRunner: makeRunnerStub,
+    runRunner: runner,
+  });
+  const completedEvents = listEventsForConv(sess.id, { types: ['conversation_completed'] });
+  assert.equal(completedEvents[0].data.reason, 'no_structured_output');
+  assert.equal(completedEvents[0].data.summary, 'Added 5 rows to the sheet.');
+});
+
 test('runConversation: propagates run_failed status when a turn throws', async () => {
   const sess = HarnessSession.create({ kind: 'chat' });
   const runner = scriptedRunner([{ status: 'throw' }]);

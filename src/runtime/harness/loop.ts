@@ -112,6 +112,10 @@ export interface RunTurnResult {
   status: RunTurnStatus;
   finalOutput?: unknown;
   error?: string;
+  /** How many tool/handoff calls fired during this turn. Used by the
+   *  outer loop to detect sub-agent stalls (zero tools + short generic
+   *  output = the model punted on the directive). */
+  toolCalls?: number;
 }
 
 // ---------- runConversation ----------
@@ -263,6 +267,19 @@ export async function runConversation(
       // the user-facing answer — surface it as the summary so the UI
       // has something to render instead of just "complete".
       const fallbackSummary = extractFallbackSummary(turnResult.finalOutput);
+
+      // Stall detection: the sub-agent took zero tool calls AND emitted
+      // a short generic acknowledgement ("Continuing.", "OK.", "Done.").
+      // That means the model received the handoff and punted instead of
+      // acting on the directive. Rendering "Continuing." as if it were
+      // the bot's reply hides the failure — the user sees a non-answer
+      // and assumes the agent is working when it actually gave up.
+      // Override the summary so the failure is visible and actionable.
+      const stallInfo = detectSubAgentStall(
+        turnResult.finalOutput,
+        turnResult.toolCalls ?? 0,
+      );
+
       safeAppend({
         sessionId: options.sessionId,
         turn: turnResult.turn,
@@ -270,8 +287,14 @@ export async function runConversation(
         type: 'conversation_completed',
         data: {
           steps: stepIndex,
-          reason: 'no_structured_output',
-          summary: fallbackSummary,
+          reason: stallInfo ? 'sub_agent_stalled' : 'no_structured_output',
+          summary: stallInfo ? stallInfo.userVisibleMessage : fallbackSummary,
+          stallDetail: stallInfo
+            ? {
+                rawOutput: stallInfo.rawOutput,
+                toolCalls: turnResult.toolCalls ?? 0,
+              }
+            : undefined,
         },
       });
       return {
@@ -551,6 +574,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
       turn,
       status: 'completed',
       finalOutput: outcome.finalOutput,
+      toolCalls: toolCounter.currentCount,
     };
   } catch (err) {
     return handleRunError(options.sessionId, turn, session, err);
@@ -757,6 +781,7 @@ export async function resumePendingApproval(
       turn,
       status: 'completed',
       finalOutput: outcome.finalOutput,
+      toolCalls: toolCounter.currentCount,
     };
   } catch (err) {
     return handleRunError(options.sessionId, turn, session, err);
@@ -1081,6 +1106,47 @@ function previewOutput(out: unknown): string {
   } catch {
     return String(out).slice(0, 200);
   }
+}
+
+/**
+ * Detect when a sub-agent received a handoff and then returned without
+ * actually doing the work — a "stall". Observed pattern:
+ *   - Orchestrator hands off to Executor with a clear directive.
+ *   - Executor's turn ends with finalOutput "Continuing." (or "OK.",
+ *     "Done.", "Working on it.") and ZERO tool calls.
+ *   - The harness sees no_structured_output and renders the generic
+ *     acknowledgement as if it were the bot's reply.
+ *
+ * The user sees "Continuing." and waits for action that never comes.
+ * Surface the failure explicitly so they (and the chat UI) can tell
+ * the difference between a real answer and a punt.
+ *
+ * Returns a stall descriptor when the pattern matches, undefined when
+ * the output looks like real work. The check is intentionally narrow:
+ * we don't want to flag a sub-agent that returned a short BUT real
+ * answer ("Done — added 5 rows to the sheet"). Only the
+ * acknowledgement-with-no-work pattern qualifies.
+ */
+const STALL_OUTPUT_PATTERN = /^(continuing|ok|okay|done|sure|got it|working on it|will do|on it|understood|noted|alright|certainly|yes)\.?$/i;
+
+interface StallInfo {
+  rawOutput: string;
+  userVisibleMessage: string;
+}
+
+function detectSubAgentStall(finalOutput: unknown, toolCalls: number): StallInfo | undefined {
+  if (toolCalls > 0) return undefined;
+  if (typeof finalOutput !== 'string') return undefined;
+  const trimmed = finalOutput.trim();
+  if (!trimmed) return undefined;
+  if (trimmed.length > 60) return undefined; // a short reply is the tell
+  if (!STALL_OUTPUT_PATTERN.test(trimmed)) return undefined;
+  return {
+    rawOutput: trimmed,
+    userVisibleMessage:
+      `_(The sub-agent ended its turn without taking any action. The model said "${trimmed}" but made zero tool calls. ` +
+      `Re-send your request with a more specific directive — e.g. name the toolkit, the field, or the file you want it to touch.)_`,
+  };
 }
 
 /**
