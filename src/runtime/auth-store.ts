@@ -1,11 +1,19 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
-import { AUTH_MODE, BASE_DIR, CODEX_AUTH_SOURCE_FILE, CODEX_EXECUTABLE, CODEX_INSTALL_PACKAGE, getOpenAiApiKey } from '../config.js';
+import { AUTH_MODE, BASE_DIR, CODEX_EXECUTABLE, CODEX_INSTALL_PACKAGE, getOpenAiApiKey, getRuntimeEnv } from '../config.js';
 import type { AuthStatus } from '../types.js';
 import { loginWithNativeCodexOAuth, refreshNativeCodexTokens } from './codex-native-oauth.js';
 
 const AUTH_STATE_FILE = path.join(BASE_DIR, 'state', 'auth.json');
+
+function getCodexAuthSourceFile(): string {
+  return getRuntimeEnv(
+    'CODEX_AUTH_SOURCE_FILE',
+    path.join(os.homedir(), '.codex', 'auth.json'),
+  );
+}
 
 interface CodexCliAuthFile {
   auth_mode?: string;
@@ -92,7 +100,7 @@ function saveLocalAuthState(state: LocalAuthState): void {
   writeFileSync(AUTH_STATE_FILE, JSON.stringify(state, null, 2), 'utf-8');
 }
 
-function loadCodexCliAuth(sourceFile = CODEX_AUTH_SOURCE_FILE): CodexCliAuthFile | null {
+function loadCodexCliAuth(sourceFile = getCodexAuthSourceFile()): CodexCliAuthFile | null {
   if (!existsSync(sourceFile)) return null;
   try {
     return JSON.parse(readFileSync(sourceFile, 'utf-8')) as CodexCliAuthFile;
@@ -101,7 +109,7 @@ function loadCodexCliAuth(sourceFile = CODEX_AUTH_SOURCE_FILE): CodexCliAuthFile
   }
 }
 
-function getCodexBootstrapState(sourceFile = CODEX_AUTH_SOURCE_FILE): CodexBootstrapState {
+function getCodexBootstrapState(sourceFile = getCodexAuthSourceFile()): CodexBootstrapState {
   const local = loadLocalAuthState();
   const codexCli = loadCodexCliAuth(sourceFile);
   return {
@@ -111,7 +119,7 @@ function getCodexBootstrapState(sourceFile = CODEX_AUTH_SOURCE_FILE): CodexBoots
   };
 }
 
-export function getCodexBootstrapAvailability(sourceFile = CODEX_AUTH_SOURCE_FILE): CodexBootstrapAvailability {
+export function getCodexBootstrapAvailability(sourceFile = getCodexAuthSourceFile()): CodexBootstrapAvailability {
   const state = getCodexBootstrapState(sourceFile);
   if (state.localCodex?.accessToken && state.localCodex?.refreshToken) {
     return {
@@ -147,7 +155,7 @@ export function getCodexInstallHint(): string {
   return `Install Codex first: npm install -g ${CODEX_INSTALL_PACKAGE}`;
 }
 
-function writeCodexAuthFile(tokens: NonNullable<LocalAuthState['codexOauth']>, sourceFile = CODEX_AUTH_SOURCE_FILE): void {
+function writeCodexAuthFile(tokens: NonNullable<LocalAuthState['codexOauth']>, sourceFile = getCodexAuthSourceFile()): void {
   mkdirSync(path.dirname(sourceFile), { recursive: true });
   writeFileSync(sourceFile, JSON.stringify({
     auth_mode: 'chatgpt',
@@ -188,7 +196,7 @@ export async function installCodexCli(): Promise<{ ok: boolean; message: string 
   };
 }
 
-export async function loginWithNativeOAuth(sourceFile = CODEX_AUTH_SOURCE_FILE): Promise<{ ok: boolean; message: string }> {
+export async function loginWithNativeOAuth(sourceFile = getCodexAuthSourceFile()): Promise<{ ok: boolean; message: string }> {
   try {
     const tokens = await loginWithNativeCodexOAuth();
     saveLocalAuthState({
@@ -221,7 +229,7 @@ export async function loginWithNativeOAuth(sourceFile = CODEX_AUTH_SOURCE_FILE):
   }
 }
 
-export async function refreshStoredNativeOAuth(sourceFile = CODEX_AUTH_SOURCE_FILE): Promise<{ ok: boolean; message: string }> {
+export async function refreshStoredNativeOAuth(sourceFile = getCodexAuthSourceFile()): Promise<{ ok: boolean; message: string }> {
   const local = loadLocalAuthState();
   const refreshToken = local.codexOauth?.refreshToken;
   if (!refreshToken) {
@@ -276,7 +284,7 @@ export async function runCodexLogin(): Promise<{ ok: boolean; message: string }>
   };
 }
 
-export async function bootstrapCodexAuth(sourceFile = CODEX_AUTH_SOURCE_FILE): Promise<{ ok: boolean; message: string }> {
+export async function bootstrapCodexAuth(sourceFile = getCodexAuthSourceFile()): Promise<{ ok: boolean; message: string }> {
   let state = getCodexBootstrapState(sourceFile);
   const hasReusableAuth = Boolean(
     (state.localCodex?.accessToken && state.localCodex?.refreshToken)
@@ -330,7 +338,7 @@ export async function bootstrapCodexAuth(sourceFile = CODEX_AUTH_SOURCE_FILE): P
   };
 }
 
-export function importCodexCliAuth(sourceFile = CODEX_AUTH_SOURCE_FILE): { ok: boolean; message: string } {
+export function importCodexCliAuth(sourceFile = getCodexAuthSourceFile()): { ok: boolean; message: string } {
   const source = loadCodexCliAuth(sourceFile);
   if (!source?.tokens?.access_token || !source.tokens.refresh_token) {
     return {
@@ -364,6 +372,7 @@ export function clearImportedAuth(): void {
 export function getAuthStatus(): AuthStatus {
   const local = loadLocalAuthState();
   const codexCli = loadCodexCliAuth();
+  const codexAuthSourceFile = getCodexAuthSourceFile();
   const localCodex = local.codexOauth;
   const openaiApiKeyPresent = Boolean(getOpenAiApiKey());
   const codexOauthPresent = Boolean(localCodex?.accessToken && localCodex?.refreshToken);
@@ -380,7 +389,7 @@ export function getAuthStatus(): AuthStatus {
       codexOauthPresent,
       codexAccountId: localCodex?.accountId,
       codexLastRefresh: localCodex?.lastRefresh,
-      codexImportPath: CODEX_AUTH_SOURCE_FILE,
+      codexImportPath: codexAuthSourceFile,
     };
   }
 
@@ -398,7 +407,7 @@ export function getAuthStatus(): AuthStatus {
       codexOauthPresent,
       codexAccountId: localCodex?.accountId,
       codexLastRefresh: localCodex?.lastRefresh,
-      codexImportPath: CODEX_AUTH_SOURCE_FILE,
+      codexImportPath: codexAuthSourceFile,
     };
   }
 
@@ -414,7 +423,7 @@ export function getAuthStatus(): AuthStatus {
       codexOauthPresent,
       codexAccountId: codexCli.tokens.account_id,
       codexLastRefresh: codexCli.last_refresh,
-      codexImportPath: CODEX_AUTH_SOURCE_FILE,
+      codexImportPath: codexAuthSourceFile,
     };
   }
 
@@ -423,11 +432,11 @@ export function getAuthStatus(): AuthStatus {
     configured: false,
     source: 'none',
     message: isCodexCliAvailable()
-      ? `No Codex OAuth credentials found. Expected source file: ${CODEX_AUTH_SOURCE_FILE}`
+      ? `No Codex OAuth credentials found. Expected source file: ${codexAuthSourceFile}`
       : `Codex executable not found on PATH. ${getCodexInstallHint()}`,
     openaiApiKeyPresent,
     codexOauthPresent,
-    codexImportPath: CODEX_AUTH_SOURCE_FILE,
+    codexImportPath: codexAuthSourceFile,
   };
 }
 

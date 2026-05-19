@@ -24,6 +24,7 @@ import os from 'node:os';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-codex-client-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
+process.env.CODEX_AUTH_SOURCE_FILE = path.join(TMP_HOME, 'codex-cli-auth.json');
 const AUTH_STATE_DIR = path.join(TMP_HOME, 'state');
 const AUTH_STATE_FILE = path.join(AUTH_STATE_DIR, 'auth.json');
 mkdirSync(AUTH_STATE_DIR, { recursive: true });

@@ -145,7 +145,7 @@ async function main(): Promise<void> {
   const envExamplePath = path.join(path.resolve(BASE_DIR, '..', '..') === path.resolve('/') ? BASE_DIR : path.resolve(process.cwd()), '.env.example');
   const envPath = path.join(path.resolve(process.cwd()), '.env');
   if (!existsSync(envPath) && existsSync(envExamplePath)) {
-    const example = `OPENAI_API_KEY=\nAUTH_MODE=api_key\nCODEX_AUTH_SOURCE_FILE=~/.codex/auth.json\nOPENAI_MODEL_PRIMARY=gpt-5.4\nOPENAI_MODEL_FAST=gpt-5.4-mini\nOPENAI_MODEL_DEEP=gpt-5.4\nCLEMENTINE_HOME=${BASE_DIR}\nASSISTANT_NAME=Clementine\nOWNER_NAME=\nWEBHOOK_ENABLED=true\nWEBHOOK_PORT=8420\nWEBHOOK_SECRET=change-me-local-secret\nDISCORD_ENABLED=false\nDISCORD_BOT_TOKEN=\nDISCORD_REQUIRE_MENTION=true\nDISCORD_ALLOWED_CHANNELS=\nLOCAL_MCP_ENABLED=true\nAUTONOMY_V2_AGENTS=clementine\nAUTONOMY_ORCHESTRATOR_SLUGS=\nCOMPOSIO_API_KEY=\nCOMPOSIO_USER_ID=default\nWORKSPACE_DIRS=\n`;
+    const example = `OPENAI_API_KEY=\nAUTH_MODE=api_key\nCODEX_AUTH_SOURCE_FILE=~/.codex/auth.json\nOPENAI_MODEL_PRIMARY=gpt-5.4\nOPENAI_MODEL_FAST=gpt-5.4-mini\nOPENAI_MODEL_DEEP=gpt-5.4\nCLEMENTINE_HOME=${BASE_DIR}\nASSISTANT_NAME=Clementine\nOWNER_NAME=\nWEBHOOK_ENABLED=true\nWEBHOOK_PORT=8420\nWEBHOOK_SECRET=change-me-local-secret\nDISCORD_ENABLED=false\nDISCORD_BOT_TOKEN=\nDISCORD_REQUIRE_MENTION=true\nDISCORD_ALLOWED_CHANNELS=\nLOCAL_MCP_ENABLED=true\nMCP_AUTO_IMPORT_ENABLED=false\nAUTONOMY_V2_AGENTS=clementine\nAUTONOMY_ORCHESTRATOR_SLUGS=\nCOMPOSIO_API_KEY=\nCOMPOSIO_USER_ID=default\nWORKSPACE_DIRS=\n`;
     replaceFile(envPath, example);
   }
 

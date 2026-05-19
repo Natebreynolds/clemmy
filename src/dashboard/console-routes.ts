@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { randomBytes } from 'node:crypto';
 import matter from 'gray-matter';
 import { renderConsoleHtml } from './console.js';
-import { BASE_DIR, WEBHOOK_SECRET, getOpenAiApiKey, getRuntimeEnv } from '../config.js';
+import { BASE_DIR, LOCAL_MCP_ENABLED, WEBHOOK_SECRET, getOpenAiApiKey, getRuntimeEnv } from '../config.js';
 import { recallHybrid } from '../memory/recall.js';
 import { FACT_KINDS, forgetFact, listActiveFacts, listAllFacts, rememberFact } from '../memory/facts.js';
 import { openMemoryDb } from '../memory/db.js';
@@ -1987,7 +1987,7 @@ export function registerConsoleRoutes(
       const { discoverMcpServers } = await import('../runtime/mcp-config.js');
       const servers = discoverMcpServers();
       const enabled = servers.filter((s) => s.enabled).length;
-      snapshot.mcp = enabled > 0 ? 'ok' : 'warn';
+      snapshot.mcp = LOCAL_MCP_ENABLED || enabled > 0 ? 'ok' : 'warn';
     } catch {
       snapshot.mcp = 'err';
     }
@@ -2496,7 +2496,7 @@ export function registerConsoleRoutes(
   // ─── MCP servers (manageable from the Integrations Hub) ────────
   //
   // Two sources merge into one list:
-  //   - auto-detected from compatible local MCP client configs
+  //   - auto-detected from compatible local MCP client configs when enabled
   //   - user-managed in ~/.clementine-next/mcp/servers.json
   // User edits only affect the user-managed file. Auto-detected
   // entries are read-only here; the user toggles them via the user

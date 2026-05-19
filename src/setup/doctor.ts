@@ -3,7 +3,7 @@ import path from 'node:path';
 import {
   ACTIVE_ENV_FILES, ASSISTANT_NAME, AUTH_MODE, BASE_DIR,
   COMPOSIO_API_KEY,
-  DISCORD_BOT_TOKEN, DISCORD_DM_ALLOWED_USERS, DISCORD_ENABLED, LOCAL_MCP_ENABLED,
+  DISCORD_BOT_TOKEN, DISCORD_DM_ALLOWED_USERS, DISCORD_ENABLED, LOCAL_MCP_ENABLED, MCP_AUTO_IMPORT_ENABLED,
   WEBHOOK_ENABLED, WEBHOOK_SECRET, getOpenAiApiKey, getRuntimeEnv,
 } from '../config.js';
 import { CRON_FILE, SOUL_FILE, VAULT_DIR, WORKFLOWS_DIR, WORKING_MEMORY_FILE } from '../memory/vault.js';
@@ -110,6 +110,11 @@ export async function runDoctor(): Promise<number> {
     passRow('LOCAL_MCP_ENABLED', 'Enabled');
   } else {
     warnRow('LOCAL_MCP_ENABLED', 'Disabled — local tool surface will be reduced');
+  }
+  if (MCP_AUTO_IMPORT_ENABLED) {
+    passRow('MCP_AUTO_IMPORT_ENABLED', 'Importing compatible Claude MCP configs');
+  } else {
+    warnRow('MCP_AUTO_IMPORT_ENABLED', 'Off — add MCP servers in the dashboard or set true to import Claude configs');
   }
 
   const v2Agents = getRuntimeEnv('AUTONOMY_V2_AGENTS', '')

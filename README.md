@@ -134,8 +134,9 @@ npm start
 ### MCP servers
 
 Drop a server into `~/.clementine-next/mcp/servers.json` or add one from the
-dashboard. Live-reloads — no daemon restart needed. Defaults to auto-detecting
-servers from Claude Desktop and Claude Code.
+dashboard. Live-reloads — no daemon restart needed. Set
+`MCP_AUTO_IMPORT_ENABLED=true` to import servers from Claude Desktop and Claude
+Code.
 
 Currently smoke-tested integrations: DataForSEO, Hostinger, Supabase, Bright
 Data, ElevenLabs, Apify, browsermcp, plus the local `clementine` MCP server.

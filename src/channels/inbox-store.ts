@@ -88,10 +88,11 @@ export interface ClaimResult {
  * - First sighting → insert row as 'claimed', shouldProcess = true.
  * - Already 'replied' / 'dropped' → shouldProcess = false. Caller
  *   should skip silently (the user already got their answer).
- * - Already 'claimed' or 'failed' → shouldProcess = true, attempts++.
- *   Treated as a retry; the caller decides whether to bail based on
- *   `attempts`. We don't refuse retries outright because a stuck
- *   'claimed' row from a crashed run is a real recovery path.
+ * - Already freshly 'claimed' → shouldProcess = false. Another local
+ *   path is probably processing the same provider message right now.
+ * - Already stale 'claimed' or 'failed' → shouldProcess = true,
+ *   attempts++. Treated as a retry because a stuck row from a crashed
+ *   run is a real recovery path.
  */
 export function claimInbound(input: ClaimInput): ClaimResult {
   const db = openMemoryDb();

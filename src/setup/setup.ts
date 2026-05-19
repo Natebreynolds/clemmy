@@ -100,6 +100,7 @@ export async function runSetupWizard(): Promise<number> {
     DISCORD_ALLOWED_CHANNELS: existing.DISCORD_ALLOWED_CHANNELS || '',
     DISCORD_DM_ALLOWED_USERS: existing.DISCORD_DM_ALLOWED_USERS || '',
     LOCAL_MCP_ENABLED: existing.LOCAL_MCP_ENABLED || 'true',
+    MCP_AUTO_IMPORT_ENABLED: existing.MCP_AUTO_IMPORT_ENABLED || 'false',
     AUTONOMY_V2_AGENTS: existing.AUTONOMY_V2_AGENTS || 'clementine',
     AUTONOMY_ORCHESTRATOR_SLUGS: existing.AUTONOMY_ORCHESTRATOR_SLUGS || '',
     COMPOSIO_API_KEY: existing.COMPOSIO_API_KEY || '',

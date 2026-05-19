@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { MCP_SERVERS_FILE } from '../config.js';
+import { MCP_SERVERS_FILE, getRuntimeEnv } from '../config.js';
 import type { ManagedMcpServer } from '../types.js';
 
 const CACHE_TTL_MS = 60_000;
@@ -31,7 +31,7 @@ const KNOWN_DESCRIPTIONS: Record<string, string> = {
 let cachedServers: ManagedMcpServer[] | null = null;
 let cacheExpiry = 0;
 
-function invalidateCache(): void {
+export function invalidateMcpServerDiscoveryCache(): void {
   cachedServers = null;
   cacheExpiry = 0;
 }
@@ -42,6 +42,10 @@ function normalizeServerName(name: string): string {
 
 function knownDescriptionFor(name: string): string | undefined {
   return KNOWN_DESCRIPTIONS[name] ?? KNOWN_DESCRIPTIONS[normalizeServerName(name)];
+}
+
+function mcpAutoImportEnabled(): boolean {
+  return getRuntimeEnv('MCP_AUTO_IMPORT_ENABLED', 'false').toLowerCase() === 'true';
 }
 
 function addServer(servers: Map<string, ManagedMcpServer>, name: string, config: Record<string, unknown>, source: ManagedMcpServer['source']): void {
@@ -92,29 +96,31 @@ export function discoverMcpServers(): ManagedMcpServer[] {
 
   const servers = new Map<string, ManagedMcpServer>();
 
-  const desktopConfig = path.join(os.homedir(), 'Library', 'Application Support', 'Claude', 'claude_desktop_config.json');
-  if (existsSync(desktopConfig)) {
-    try {
-      const data = JSON.parse(readFileSync(desktopConfig, 'utf-8')) as { mcpServers?: Record<string, Record<string, unknown>> };
-      for (const [name, config] of Object.entries(data.mcpServers ?? {})) {
-        addServer(servers, name, config, 'auto-detected');
-      }
-    } catch {
-      // Ignore malformed desktop config.
-    }
-  }
-
-  const claudeSettings = path.join(os.homedir(), '.claude', 'settings.json');
-  if (existsSync(claudeSettings)) {
-    try {
-      const data = JSON.parse(readFileSync(claudeSettings, 'utf-8')) as { mcpServers?: Record<string, Record<string, unknown>> };
-      for (const [name, config] of Object.entries(data.mcpServers ?? {})) {
-        if (!servers.has(name)) {
+  if (mcpAutoImportEnabled()) {
+    const desktopConfig = path.join(os.homedir(), 'Library', 'Application Support', 'Claude', 'claude_desktop_config.json');
+    if (existsSync(desktopConfig)) {
+      try {
+        const data = JSON.parse(readFileSync(desktopConfig, 'utf-8')) as { mcpServers?: Record<string, Record<string, unknown>> };
+        for (const [name, config] of Object.entries(data.mcpServers ?? {})) {
           addServer(servers, name, config, 'auto-detected');
         }
+      } catch {
+        // Ignore malformed desktop config.
       }
-    } catch {
-      // Ignore malformed compatible MCP client config.
+    }
+
+    const claudeSettings = path.join(os.homedir(), '.claude', 'settings.json');
+    if (existsSync(claudeSettings)) {
+      try {
+        const data = JSON.parse(readFileSync(claudeSettings, 'utf-8')) as { mcpServers?: Record<string, Record<string, unknown>> };
+        for (const [name, config] of Object.entries(data.mcpServers ?? {})) {
+          if (!servers.has(name)) {
+            addServer(servers, name, config, 'auto-detected');
+          }
+        }
+      } catch {
+        // Ignore malformed compatible MCP client config.
+      }
     }
   }
 
@@ -146,5 +152,5 @@ export function loadUserMcpServers(): Record<string, Partial<ManagedMcpServer>> 
 export function saveUserMcpServers(servers: Record<string, Partial<ManagedMcpServer>>): void {
   mkdirSync(path.dirname(MCP_SERVERS_FILE), { recursive: true });
   writeFileSync(MCP_SERVERS_FILE, JSON.stringify(servers, null, 2));
-  invalidateCache();
+  invalidateMcpServerDiscoveryCache();
 }

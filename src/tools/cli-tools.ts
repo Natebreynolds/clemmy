@@ -23,7 +23,8 @@ export function registerCliTools(server: McpServer): void {
     'local_cli_list',
     [
       'List CLIs installed on the local machine and detected on $PATH.',
-      'Use this BEFORE reaching for run_shell_command when you need to know whether a particular CLI (sf, gh, aws, kubectl, git, vercel, …) is available. Pass `filter` to narrow by substring.',
+      'Use this BEFORE reaching for run_shell_command when you need to know whether a particular CLI (sf, gh, aws, kubectl, git, vercel, …) is available. Pass `filter` as the exact command name when you know it.',
+      'With an exact `filter`, this performs one quick probe instead of scanning the entire PATH. Without a filter, it returns the cached full scan or runs one if needed.',
       'Returns the command name, install path, version (if probed), and the head of `--help` so you can confirm the surface without spawning a separate probe.',
     ].join('\n'),
     {
@@ -31,13 +32,24 @@ export function registerCliTools(server: McpServer): void {
         .string()
         .max(60)
         .optional()
-        .describe('Substring to filter command names (e.g. "sf", "aws", "git"). Omit to return everything detected.'),
+        .describe('Exact command name when possible (e.g. "sf", "aws", "git"). Omit to return everything detected.'),
       refresh: z
         .boolean()
         .optional()
         .describe('Pass true to re-scan $PATH instead of using the cached result. Slower but reflects very recent installs.'),
     },
     async ({ filter, refresh }) => {
+      const exactFilter = filter?.trim();
+      if (exactFilter && /^[A-Za-z0-9._+-]+$/.test(exactFilter) && !refresh) {
+        const entry = await probe(exactFilter);
+        if (!entry) {
+          return textResult(`"${exactFilter}" is not installed on $PATH.`);
+        }
+        const v = entry.version ? ` — ${entry.version}` : '';
+        const help = entry.helpHead ? `\nhelp: ${entry.helpHead}` : '';
+        const likely = entry.isLikelyCli ? '' : '\n(no --version or --help output — binary exists but did not identify itself as a CLI)';
+        return textResult(`1 CLI on $PATH:\n${entry.command} (${entry.path})${v}${help}${likely}`);
+      }
       const scan = refresh
         ? await getOrRefreshScan({ force: true })
         : (readCachedScan() ?? await getOrRefreshScan());

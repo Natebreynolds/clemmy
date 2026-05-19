@@ -129,6 +129,7 @@ export const DISCORD_ALLOWED_CHANNELS = getEnv('DISCORD_ALLOWED_CHANNELS', '')
   .map((value) => value.trim())
   .filter(Boolean);
 export const LOCAL_MCP_ENABLED = getEnv('LOCAL_MCP_ENABLED', 'true').toLowerCase() === 'true';
+export const MCP_AUTO_IMPORT_ENABLED = getEnv('MCP_AUTO_IMPORT_ENABLED', 'false').toLowerCase() === 'true';
 export const MCP_SERVERS_FILE = path.join(BASE_DIR, 'mcp', 'servers.json');
 export const COMPOSIO_API_KEY = getEnv('COMPOSIO_API_KEY', '');
 export const COMPOSIO_USER_ID = getEnv('COMPOSIO_USER_ID', 'default');

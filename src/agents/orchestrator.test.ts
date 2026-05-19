@@ -4,10 +4,10 @@
  * Static contracts the Orchestrator must keep — no Runner invocation
  * (that needs OpenAI credentials). We verify the structural promises:
  *   - Orchestrator constructs with the right name and output schema
- *   - It exposes ONLY the deliberation tools (zero action tools)
+ *   - It exposes ONLY deliberation/discovery tools (zero action tools)
  *   - Handoffs include the five sub-agents
  *   - inputGuardrails + outputGuardrails are wired to the harness
- *     registry (policy_violation, missing_capability, secret_leak)
+ *     registry (policy_violation, secret_leak)
  *   - request_approval has needsApproval=true → the SDK pauses
  *   - request_approval emits approval_requested
  *   - ask_user_question emits awaiting_user_input
@@ -91,11 +91,11 @@ test('Orchestrator carries the harness guardrails', async () => {
     (g as { name?: string }).name,
   );
   assert.ok(inputNames.includes('policy_violation'));
-  assert.ok(inputNames.includes('missing_capability'));
+  assert.ok(!inputNames.includes('missing_capability'));
   assert.ok(outputNames.includes('secret_leak'));
 });
 
-test('Orchestrator tools are the three deliberation tools + composio_search_tools (read-only)', async () => {
+test('Orchestrator tools are deliberation + read-only discovery/memory tools', async () => {
   // composio_search_tools is read-only — it queries Composio for
   // matching action slugs but doesn't mutate anything. Including it
   // on the Orchestrator lets it own the "find the right tool"
@@ -107,8 +107,21 @@ test('Orchestrator tools are the three deliberation tools + composio_search_tool
   const toolNames = (agent.tools ?? []).map((t) => (t as { name?: string }).name).sort();
   assert.deepEqual(
     toolNames,
-    ['ask_user_question', 'composio_search_tools', 'draft_plan', 'request_approval'].sort(),
+    [
+      'ask_user_question',
+      'composio_search_tools',
+      'draft_plan',
+      'local_cli_list',
+      'local_cli_probe',
+      'request_approval',
+      'tool_choice_invalidate',
+      'tool_choice_recall',
+      'tool_choice_remember',
+    ].sort(),
   );
+  assert.equal(toolNames.includes('composio_execute_tool'), false);
+  assert.equal(toolNames.includes('run_shell_command'), false);
+  assert.equal(toolNames.includes('write_file'), false);
 });
 
 test('Orchestrator hands off to the five sub-agents by name', async () => {

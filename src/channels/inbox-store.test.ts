@@ -48,15 +48,31 @@ test('claim after dropped also short-circuits', () => {
   assert.equal(second.shouldProcess, false);
 });
 
-test('claim after a stuck claimed/failed retry-bumps attempts', () => {
+test('fresh duplicate claimed message is suppressed, stale claimed/failed rows retry', () => {
   // First claim — simulates a crash before completion.
   const first = claimInbound({ channel: 'discord:chan1', sourceMessageId: 'm4' });
   assert.equal(first.record.attempts, 1);
 
-  // Daemon restart replays. The row is still 'claimed' but never marked
-  // 'replied'. The retry path bumps attempts and lets us recover.
+  // Immediate duplicate delivery in the same daemon window is treated
+  // as concurrent processing and suppressed.
+  const duplicate = claimInbound({ channel: 'discord:chan1', sourceMessageId: 'm4' });
+  assert.equal(duplicate.shouldProcess, false, 'fresh duplicate claim should not double-run the model');
+  assert.equal(duplicate.record.attempts, 1);
+
+  // Daemon restart replay after the freshness window. The row is still
+  // 'claimed' but never marked 'replied', so the retry path bumps
+  // attempts and lets us recover.
+  const staleClaimedAt = new Date(Date.now() - 10 * 60_000).toISOString();
+  openMemoryDb()
+    .prepare(
+      `UPDATE inbound_messages
+          SET claimed_at = ?
+        WHERE channel = ? AND source_message_id = ?`,
+    )
+    .run(staleClaimedAt, 'discord:chan1', 'm4');
+
   const second = claimInbound({ channel: 'discord:chan1', sourceMessageId: 'm4' });
-  assert.equal(second.shouldProcess, true, 'stuck claim should be retryable');
+  assert.equal(second.shouldProcess, true, 'stale stuck claim should be retryable');
   assert.equal(second.record.attempts, 2);
 
   // Failed runs are also retryable.
