@@ -293,6 +293,9 @@ function buildUpdaterMenuItems(): Electron.MenuItemConstructorOptions[] {
   } else if (u.installBlocker === 'move-to-applications') {
     label = 'Move to Applications to enable updates';
     click = () => { moveAppToApplicationsFolder(); };
+  } else if (u.installBlocker === 'app-not-writable') {
+    label = 'Reinstall Clementine to enable updates';
+    click = () => { void shell.openExternal('https://github.com/Natebreynolds/clemmy/releases/latest'); };
   } else if (u.state === 'available') {
     label = `Download update v${u.version || ''}`;
     click = () => { void applyUpdateFromUi(); };

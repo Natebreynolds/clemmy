@@ -26,11 +26,13 @@ import path from 'node:path';
 // `autoUpdater` export isn't statically detected, so we have to pull it
 // off the default export instead.
 const { autoUpdater } = electronUpdater;
-import { appendFileSync, existsSync, mkdirSync } from 'node:fs';
+import { accessSync, appendFileSync, constants, existsSync, mkdirSync } from 'node:fs';
 
 const CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4 hours
 const MOVE_TO_APPLICATIONS_MESSAGE =
   'Clementine is running from a read-only or translocated location. Move Clementine to /Applications to enable auto-updates.';
+const APP_NOT_WRITABLE_MESSAGE =
+  'Clementine is installed in /Applications, but this user cannot replace the app bundle. Reinstall Clementine from the DMG, or fix /Applications/Clementine.app ownership so your user can update it.';
 
 export interface UpdaterStatus {
   /** Highest-level state — what to show in the tray. */
@@ -51,7 +53,7 @@ export interface UpdaterStatus {
   /** Most recent error message, if state === 'error'. */
   error?: string;
   /** Actionable install-location issue that prevents auto-update apply. */
-  installBlocker?: 'move-to-applications';
+  installBlocker?: 'move-to-applications' | 'app-not-writable';
   /** Current app executable path, useful for diagnostics. */
   appPath?: string;
   /** Last successful check timestamp (ISO). */
@@ -98,7 +100,7 @@ export async function checkForUpdatesNow(): Promise<UpdaterStatus> {
   if (blocker.installBlocker) {
     updateStatus({
       state: 'error',
-      error: MOVE_TO_APPLICATIONS_MESSAGE,
+      error: blocker.error || MOVE_TO_APPLICATIONS_MESSAGE,
       ...blocker,
     });
     return getUpdaterStatus();
@@ -142,13 +144,13 @@ export function applyUpdate(): {
   if (blocker.installBlocker) {
     updateStatus({
       state: 'error',
-      error: MOVE_TO_APPLICATIONS_MESSAGE,
+      error: blocker.error || MOVE_TO_APPLICATIONS_MESSAGE,
       ...blocker,
     });
     return {
       ok: false,
-      action: 'move-required',
-      reason: MOVE_TO_APPLICATIONS_MESSAGE,
+      action: blocker.installBlocker === 'move-to-applications' ? 'move-required' : undefined,
+      reason: blocker.error || MOVE_TO_APPLICATIONS_MESSAGE,
       installBlocker: blocker.installBlocker,
     };
   }
@@ -360,10 +362,10 @@ export function initAutoUpdater(opts: { logFile: string }): void {
     log('info', 'auto-updater armed');
     const blocker = getInstallBlockerStatus();
     if (blocker.installBlocker) {
-      log('warn', MOVE_TO_APPLICATIONS_MESSAGE, blocker);
+      log('warn', blocker.error || MOVE_TO_APPLICATIONS_MESSAGE, blocker);
       updateStatus({
         state: 'error',
-        error: MOVE_TO_APPLICATIONS_MESSAGE,
+        error: blocker.error || MOVE_TO_APPLICATIONS_MESSAGE,
         ...blocker,
       });
       return;
@@ -398,12 +400,22 @@ function ensureLogDir(logFile: string): void {
   }
 }
 
-function getInstallBlockerStatus(): Pick<UpdaterStatus, 'installBlocker' | 'appPath'> {
+function getInstallBlockerStatus(): Pick<UpdaterStatus, 'installBlocker' | 'appPath' | 'error'> {
   if (process.platform !== 'darwin' || !app.isPackaged) return {};
+  const appPath = process.execPath;
   try {
-    if (app.isInApplicationsFolder()) return { installBlocker: undefined, appPath: process.execPath };
-    return { installBlocker: 'move-to-applications', appPath: process.execPath };
+    const inApplications = app.isInApplicationsFolder();
+    if (!inApplications) return { installBlocker: 'move-to-applications', appPath, error: MOVE_TO_APPLICATIONS_MESSAGE };
   } catch {
-    return { installBlocker: undefined, appPath: process.execPath };
+    return { installBlocker: undefined, appPath };
   }
+
+  const appBundlePath = path.resolve(appPath, '..', '..', '..');
+  try {
+    accessSync(appBundlePath, constants.W_OK);
+    accessSync(path.join(appBundlePath, 'Contents'), constants.W_OK);
+  } catch {
+    return { installBlocker: 'app-not-writable', appPath, error: APP_NOT_WRITABLE_MESSAGE };
+  }
+  return { installBlocker: undefined, appPath };
 }

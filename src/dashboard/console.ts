@@ -7588,20 +7588,7 @@ const CONSOLE_JS = `
         }
       };
 
-      if (info.state === 'available') {
-        suffix = ' · click to download v' + (info.version || '') + ' update';
-        sub.style.cursor = 'pointer';
-        sub.title = 'Download Clementine v' + (info.version || '');
-        sub.onclick = () => applyFromChip(' · starting download…');
-      } else if (info.state === 'downloading') {
-        suffix = ' · ' + (info.progressPct ? 'downloading ' + info.progressPct + '%' : 'downloading update…');
-        sub.title = 'Clementine is downloading the update in the background';
-      } else if (info.state === 'ready-to-install') {
-        suffix = ' · click for v' + (info.version || '') + ' update';
-        sub.style.cursor = 'pointer';
-        sub.title = 'Restart Clementine to install v' + (info.version || '');
-        sub.onclick = () => applyFromChip(' · restarting…');
-      } else if (info.installBlocker === 'move-to-applications') {
+      if (info.installBlocker === 'move-to-applications') {
         suffix = ' · move to Applications for updates';
         sub.style.cursor = 'pointer';
         sub.title = info.error || 'Move Clementine to /Applications to enable auto-updates';
@@ -7623,6 +7610,26 @@ const CONSOLE_JS = `
             sub.style.pointerEvents = '';
           }
         };
+      } else if (info.installBlocker === 'app-not-writable') {
+        suffix = ' · reinstall to enable updates';
+        sub.style.cursor = 'pointer';
+        sub.title = info.error || 'Clementine cannot replace /Applications/Clementine.app from this user account';
+        sub.onclick = () => {
+          alert(info.error || 'Clementine cannot replace /Applications/Clementine.app from this user account. Reinstall from the latest DMG, or fix app ownership, then relaunch.');
+        };
+      } else if (info.state === 'available') {
+        suffix = ' · click to download v' + (info.version || '') + ' update';
+        sub.style.cursor = 'pointer';
+        sub.title = 'Download Clementine v' + (info.version || '');
+        sub.onclick = () => applyFromChip(' · starting download…');
+      } else if (info.state === 'downloading') {
+        suffix = ' · ' + (info.progressPct ? 'downloading ' + info.progressPct + '%' : 'downloading update…');
+        sub.title = 'Clementine is downloading the update in the background';
+      } else if (info.state === 'ready-to-install') {
+        suffix = ' · click for v' + (info.version || '') + ' update';
+        sub.style.cursor = 'pointer';
+        sub.title = 'Restart Clementine to install v' + (info.version || '');
+        sub.onclick = () => applyFromChip(' · restarting…');
       } else if (info.state === 'error') {
         suffix = ' · update check failed';
         sub.style.cursor = 'pointer';
