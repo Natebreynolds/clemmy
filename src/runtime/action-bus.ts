@@ -2,7 +2,7 @@ import { EventEmitter } from 'node:events';
 import type { RunEvent, RunRecord } from './run-events.js';
 import type { NotificationRecord } from './notifications.js';
 import type { PendingApproval } from '../types.js';
-import type { EventRow } from './harness/eventlog.js';
+import type { EventRow, HarnessSessionSignal } from './harness/eventlog.js';
 import type { BoundaryError } from './boundary-error.js';
 
 // Fan-out bus for "the daemon just did a thing" events. Listeners are
@@ -50,6 +50,7 @@ export type ActionEvent =
       kind: 'harness.event';
       sessionId: string;
       event: EventRow;
+      session?: HarnessSessionSignal;
     }
   | {
       // Reliability invariant (v0.4.20+): every CodexNativeRuntime.run

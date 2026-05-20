@@ -87,7 +87,7 @@ const api = {
    *  persists the resulting tokens. Returns { ok, accountId } on success
    *  or { ok: false, error } on failure (user cancel, network, etc.). */
   setupCodexLogin: () => ipcRenderer.invoke('clemmy:setup-codex-login') as Promise<
-    | { ok: true; accountId: string; lastRefresh: string }
+    | { ok: true; accountId: string; lastRefresh: string; reused?: boolean }
     | { ok: false; error: string }
   >,
   /** Persist a profile patch to ~/.clementine-next/state/user-profile.json. */

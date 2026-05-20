@@ -14676,14 +14676,28 @@ const CONSOLE_JS = `
         const ev = event.event;
         const sid = (event.sessionId || '').slice(0, 14);
         const data = (ev.data || {});
+        const session = event.session || {};
+        const metadata = session.metadata || {};
+        const isDiscordSession = session.channel === 'discord'
+          || session.channel === 'discord-dm'
+          || metadata.source === 'discord';
+        const surface = isDiscordSession
+          ? 'Discord'
+          : (session.channel === 'workflow' || session.kind === 'workflow' || metadata.source === 'workflow')
+            ? 'Workflow'
+            : 'Session';
+        const sessionTitle = session.title || session.objective || ('session ' + sid + '…');
+        const contextMeta = surface === 'Session'
+          ? 'session ' + sid + '…'
+          : surface + ' · ' + sessionTitle;
         // Map event type → icon + title + meta
         switch (ev.type) {
           case 'turn_started': {
             const agent = (data.agent || ev.role || '?');
             return {
               icon: '◑',
-              title: agent + ' · turn started',
-              meta: 'session ' + sid + '…',
+              title: surface + ' · ' + agent + ' started',
+              meta: contextMeta,
               eventType: 'turn_started',
             };
           }
@@ -14692,8 +14706,8 @@ const CONSOLE_JS = `
             const callId = (data.callId || '').slice(0, 8);
             return {
               icon: '⚙',
-              title: tool,
-              meta: 'session ' + sid + '… · call ' + callId,
+              title: surface + ' · ' + tool,
+              meta: contextMeta + (callId ? ' · call ' + callId : ''),
               eventType: 'tool_called',
             };
           }
@@ -14702,16 +14716,16 @@ const CONSOLE_JS = `
             const resultPrev = (typeof data.result === 'string' ? data.result : JSON.stringify(data.result || {})).slice(0, 120);
             return {
               icon: '✓',
-              title: tool + ' returned',
-              meta: resultPrev,
+              title: surface + ' · ' + tool + ' returned',
+              meta: resultPrev || contextMeta,
               eventType: 'tool_returned',
             };
           }
           case 'handoff': {
             return {
               icon: '⇆',
-              title: (data.from || '?') + ' → ' + (data.to || '?'),
-              meta: 'handoff · session ' + sid + '…',
+              title: surface + ' · ' + (data.from || '?') + ' → ' + (data.to || '?'),
+              meta: contextMeta,
               eventType: 'handoff',
             };
           }
@@ -14719,7 +14733,7 @@ const CONSOLE_JS = `
             const apr = (data.approvalId || '').slice(0, 12);
             return {
               icon: '◇',
-              title: 'Approval requested · ' + (data.subject || data.tool || '?'),
+              title: surface + ' approval · ' + (data.subject || data.tool || '?'),
               meta: apr ? apr : 'session ' + sid + '…',
               eventType: 'approval_requested',
             };
@@ -14727,8 +14741,8 @@ const CONSOLE_JS = `
           case 'approval_resolved': {
             return {
               icon: data.decision === 'approved' ? '✓' : '✕',
-              title: (data.decision || 'resolved') + ' · ' + (data.tool || ''),
-              meta: 'session ' + sid + '…',
+              title: surface + ' · ' + (data.decision || 'resolved') + ' · ' + (data.tool || ''),
+              meta: contextMeta,
               eventType: 'approval_resolved',
             };
           }
@@ -14736,7 +14750,7 @@ const CONSOLE_JS = `
           case 'conversation_completed': {
             return {
               icon: '✓',
-              title: 'Run completed',
+              title: surface + ' completed',
               meta: (data.summary || data.finalOutputPreview || '').slice(0, 140),
               eventType: 'run_completed',
             };
@@ -14746,7 +14760,7 @@ const CONSOLE_JS = `
           case 'stuck_detected': {
             return {
               icon: '⚠',
-              title: ev.type.replace(/_/g, ' '),
+              title: surface + ' · ' + ev.type.replace(/_/g, ' '),
               meta: (data.error || data.signal || data.summary || '').slice(0, 140),
               eventType: ev.type,
             };

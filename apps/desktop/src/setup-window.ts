@@ -353,6 +353,18 @@ const SETUP_JS = `
   const skipBtn = document.querySelector('[data-wiz-skip]');
   const nextBtn = document.querySelector('[data-wiz-next]');
 
+  function canAdvanceFromCurrentStep() {
+    if (currentStep !== 1) return true;
+    if (state.authChoice === 'skipped') return true;
+    if (state.authChoice === 'openai') return Boolean(state.openaiKey && state.openaiKey.trim());
+    if (state.authChoice === 'codex') return state.codexStatus === 'ok';
+    return true;
+  }
+
+  function updateNavState() {
+    nextBtn.disabled = !canAdvanceFromCurrentStep();
+  }
+
   function renderStep() {
     stepPill.textContent = 'STEP ' + (currentStep + 1) + ' OF ' + STEPS;
     backBtn.hidden = currentStep === 0;
@@ -368,6 +380,7 @@ const SETUP_JS = `
     if (currentStep === 6) html = renderProfileAndDone();
     mainEl.innerHTML = html;
     bindStepEvents();
+    updateNavState();
   }
 
   function renderWelcome() {
@@ -397,7 +410,7 @@ const SETUP_JS = `
       '<div class="field" style="margin-top:14px;">',
       '  <label>OPENAI API KEY</label>',
       '  <input type="password" data-state="openaiKey" value="' + esc(state.openaiKey) + '" placeholder="sk-..." autocomplete="off" spellcheck="false" />',
-      '  <span class="hint">Get one at platform.openai.com/api-keys.</span>',
+      '  <span class="hint">Get one at platform.openai.com/api-keys, or choose Codex OAuth / Skip instead.</span>',
       '</div>',
     ].join('') : '';
 
@@ -405,12 +418,14 @@ const SETUP_JS = `
     if (state.authChoice === 'codex') {
       let statusLine = '';
       if (state.codexStatus === 'launching') {
-        statusLine = '<div class="status-msg" style="margin-top:10px;">Opening your browser at auth.openai.com&hellip; finish sign-in there. Listening on localhost:1455.</div>';
+        statusLine = '<div class="status-msg" style="margin-top:10px;">Checking for an existing Codex login, then opening auth.openai.com if needed. Finish sign-in in your browser.</div>';
       } else if (state.codexStatus === 'ok') {
         const who = state.codexAccountId ? ' (account ' + esc(state.codexAccountId) + ')' : '';
-        statusLine = '<div class="status-msg ok" style="margin-top:10px;">Signed in with ChatGPT/Codex' + who + '. Tokens stored locally.</div>';
+        statusLine = '<div class="status-msg ok" style="margin-top:10px;">' + esc(state.codexMessage || 'Signed in with ChatGPT/Codex') + who + '. Tokens stored locally.</div>';
       } else if (state.codexStatus === 'error') {
         statusLine = '<div class="status-msg err" style="margin-top:10px;">' + esc(state.codexMessage || 'Sign-in failed') + '</div>';
+      } else {
+        statusLine = '<div class="status-msg warn" style="margin-top:10px;">Sign in before continuing, or choose Skip for now.</div>';
       }
       const btnLabel = state.codexStatus === 'ok' ? 'RE-SIGN IN' : 'SIGN IN WITH CHATGPT';
       const btnDisabled = state.codexStatus === 'launching' ? ' disabled' : '';
@@ -611,6 +626,7 @@ const SETUP_JS = `
         } else {
           state[key] = el.value;
         }
+        updateNavState();
       });
     });
 
@@ -626,6 +642,7 @@ const SETUP_JS = `
           if (result && result.ok) {
             state.codexStatus = 'ok';
             state.codexAccountId = result.accountId || '';
+            state.codexMessage = result.reused ? 'Existing Codex sign-in imported' : 'Signed in with ChatGPT/Codex';
           } else {
             state.codexStatus = 'error';
             state.codexMessage = (result && result.error) || 'Sign-in failed';
@@ -717,6 +734,7 @@ const SETUP_JS = `
   });
   nextBtn.addEventListener('click', async () => {
     if (currentStep < STEPS - 1) {
+      if (!canAdvanceFromCurrentStep()) return;
       currentStep++;
       renderStep();
       return;

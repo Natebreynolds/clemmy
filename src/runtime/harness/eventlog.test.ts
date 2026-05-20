@@ -29,6 +29,7 @@ const {
   createSession,
   getSession,
   updateSession,
+  listSessions,
   appendEvent,
   listEvents,
   requestKill,
@@ -130,6 +131,32 @@ test('listEvents filters by sinceSeq and types', () => {
   assert.equal(onlyTools[0].type, 'tool_called');
 });
 
+test('listSessions filters recent sessions without loading events', () => {
+  resetEventLog();
+  const discord = createSession({
+    kind: 'chat',
+    channel: 'discord',
+    userId: 'user-1',
+    title: 'discord task',
+    metadata: { source: 'discord', channelId: 'channel-1' },
+  });
+  const workflow = createSession({
+    kind: 'workflow',
+    channel: 'workflow',
+    title: 'workflow task',
+    metadata: { source: 'workflow', workflowName: 'daily' },
+  });
+  updateSession(workflow.id, { status: 'paused' });
+
+  const discordRows = listSessions({ channel: 'discord' });
+  assert.equal(discordRows.length, 1);
+  assert.equal(discordRows[0].id, discord.id);
+  assert.equal(discordRows[0].metadata.source, 'discord');
+
+  const activeRows = listSessions({ status: ['active', 'paused'], limit: 10 });
+  assert.deepEqual(new Set(activeRows.map((session) => session.id)), new Set([discord.id, workflow.id]));
+});
+
 test('kill switch is sticky until cleared', () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
@@ -191,13 +218,37 @@ test('appendEvent emits a harness.event on the global actionBus', async () => {
   // subscribe to actionBus to learn about new harness events. Wire
   // a subscriber here and verify every appendEvent fans out.
   const { actionBus } = await import('../action-bus.js');
-  const sess = createSession({ kind: 'chat' });
+  const sess = createSession({
+    kind: 'chat',
+    channel: 'discord',
+    userId: 'user-1',
+    title: 'discord task',
+    metadata: {
+      source: 'discord',
+      channelId: 'channel-1',
+      __conversation: { items: [{ role: 'user', content: 'private history' }] },
+    },
+  });
 
-  const seen: Array<{ sessionId: string; type: string; turn: number }> = [];
+  const seen: Array<{
+    sessionId: string;
+    type: string;
+    turn: number;
+    channel: string | null;
+    source: unknown;
+    hasConversation: boolean;
+  }> = [];
   const unsubscribe = actionBus.subscribe((evt) => {
     if (evt.kind !== 'harness.event') return;
     if (evt.sessionId !== sess.id) return;
-    seen.push({ sessionId: evt.sessionId, type: evt.event.type, turn: evt.event.turn });
+    seen.push({
+      sessionId: evt.sessionId,
+      type: evt.event.type,
+      turn: evt.event.turn,
+      channel: evt.session?.channel ?? null,
+      source: evt.session?.metadata.source,
+      hasConversation: Object.prototype.hasOwnProperty.call(evt.session?.metadata ?? {}, '__conversation'),
+    });
   });
 
   appendEvent({ sessionId: sess.id, turn: 1, role: 'system', type: 'turn_started', data: {} });
@@ -208,6 +259,9 @@ test('appendEvent emits a harness.event on the global actionBus', async () => {
   assert.equal(seen.length, 3);
   assert.deepEqual(seen.map((s) => s.type), ['turn_started', 'handoff', 'turn_ended']);
   assert.equal(seen[0].sessionId, sess.id);
+  assert.equal(seen[0].channel, 'discord');
+  assert.equal(seen[0].source, 'discord');
+  assert.equal(seen[0].hasConversation, false);
 });
 
 test('actionBus subscribers filtered by sessionId never see other sessions', async () => {

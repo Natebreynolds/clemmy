@@ -27,6 +27,7 @@ const HOME = os.homedir();
 const STATE_DIR = path.join(HOME, '.clementine-next', 'state');
 const MARKER_FILE = path.join(STATE_DIR, 'setup-complete.json');
 const VAULT_FILE = path.join(STATE_DIR, 'secrets-vault.json');
+const LOCAL_AUTH_FILE = path.join(STATE_DIR, 'auth.json');
 const HOME_ENV = path.join(HOME, '.clementine-next', '.env');
 const REPO_ENV_HINTS = [
   path.join(HOME, 'clementine-next', '.env'),
@@ -70,7 +71,14 @@ export function hasAnyUsableCredential(): boolean {
   if (existsSync(CODEX_AUTH)) {
     try {
       const parsed = JSON.parse(readFileSync(CODEX_AUTH, 'utf-8'));
-      if (parsed && (parsed.access_token || parsed.id_token)) return true;
+      if (parsed?.tokens?.access_token && parsed.tokens.refresh_token) return true;
+    } catch { /* fall through */ }
+  }
+
+  if (existsSync(LOCAL_AUTH_FILE)) {
+    try {
+      const parsed = JSON.parse(readFileSync(LOCAL_AUTH_FILE, 'utf-8'));
+      if (parsed?.codexOauth?.accessToken && parsed.codexOauth.refreshToken) return true;
     } catch { /* fall through */ }
   }
 

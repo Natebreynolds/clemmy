@@ -75,9 +75,8 @@ function findMostRecentChannelSession(channelId: string): { sessionId: string; u
            LIMIT 1`,
       )
       .get(channelId) as { id?: string; updated_at?: string } | undefined;
-    // The `channel` column is filled from createSession opts.channel
-    // which we don't currently pass — fall back to a pure metadata
-    // match if the indexed lookup misses.
+    // Older sessions did not populate the `channel` column, so keep
+    // the metadata fallback to preserve continuity across upgrades.
     const matched = row ?? (db
       .prepare(
         `SELECT id, updated_at FROM sessions
@@ -155,6 +154,8 @@ function resolveOrCreateSession(opts: {
   }
   const session = createHarnessSession({
     kind: 'chat',
+    channel: 'discord',
+    userId: opts.userId,
     title: opts.prompt.length > 60 ? `${opts.prompt.slice(0, 57)}...` : opts.prompt,
     metadata: {
       source: 'discord',

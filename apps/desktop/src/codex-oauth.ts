@@ -24,7 +24,7 @@ const AUTH_BASE_URL = 'https://auth.openai.com';
 const AUTHORIZE_URL = `${AUTH_BASE_URL}/oauth/authorize`;
 const TOKEN_URL = `${AUTH_BASE_URL}/oauth/token`;
 const CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';
-const SCOPE = 'openid profile email offline_access api.connectors.read api.connectors.invoke';
+const SCOPE = 'openid profile email offline_access';
 const CALLBACK_PORT = 1455;
 const CALLBACK_PATH = '/callback';
 const LOGIN_TIMEOUT_MS = 15 * 60_000;
@@ -80,6 +80,74 @@ function extractAccountId(idToken?: string, accessToken?: string): string | unde
   return undefined;
 }
 
+function getJwtExpiryMs(token?: string): number | null {
+  const payload = parseJwtPayload(token);
+  const exp = payload?.exp;
+  return typeof exp === 'number' && Number.isFinite(exp) ? exp * 1000 : null;
+}
+
+function isAccessTokenFresh(tokens: CodexOAuthTokens, skewMs = 60_000): boolean {
+  const expiresAt = getJwtExpiryMs(tokens.accessToken);
+  return expiresAt === null || expiresAt - skewMs > Date.now();
+}
+
+function normalizeTokenSet(input: {
+  accessToken?: unknown;
+  refreshToken?: unknown;
+  idToken?: unknown;
+  accountId?: unknown;
+  lastRefresh?: unknown;
+}): CodexOAuthTokens | null {
+  if (typeof input.accessToken !== 'string' || !input.accessToken) return null;
+  if (typeof input.refreshToken !== 'string' || !input.refreshToken) return null;
+  const idToken = typeof input.idToken === 'string' ? input.idToken : undefined;
+  const accountId = typeof input.accountId === 'string' ? input.accountId : extractAccountId(idToken, input.accessToken);
+  return {
+    accessToken: input.accessToken,
+    refreshToken: input.refreshToken,
+    idToken,
+    accountId,
+    lastRefresh: typeof input.lastRefresh === 'string' ? input.lastRefresh : new Date().toISOString(),
+  };
+}
+
+function readJsonFile(filePath: string): Record<string, unknown> | null {
+  if (!existsSync(filePath)) return null;
+  try {
+    const parsed = JSON.parse(readFileSync(filePath, 'utf-8')) as unknown;
+    return parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : null;
+  } catch {
+    return null;
+  }
+}
+
+function loadExistingCodexOAuthTokens(): CodexOAuthTokens | null {
+  const local = readJsonFile(LOCAL_AUTH_FILE);
+  const localCodex = local?.codexOauth && typeof local.codexOauth === 'object'
+    ? local.codexOauth as Record<string, unknown>
+    : null;
+  const localTokens = localCodex ? normalizeTokenSet({
+    accessToken: localCodex.accessToken,
+    refreshToken: localCodex.refreshToken,
+    idToken: localCodex.idToken,
+    accountId: localCodex.accountId,
+    lastRefresh: localCodex.lastRefresh,
+  }) : null;
+  if (localTokens) return localTokens;
+
+  const cli = readJsonFile(CODEX_AUTH_FILE);
+  const cliTokens = cli?.tokens && typeof cli.tokens === 'object'
+    ? cli.tokens as Record<string, unknown>
+    : null;
+  return cliTokens ? normalizeTokenSet({
+    accessToken: cliTokens.access_token,
+    refreshToken: cliTokens.refresh_token,
+    idToken: cliTokens.id_token,
+    accountId: cliTokens.account_id,
+    lastRefresh: cli?.last_refresh,
+  }) : null;
+}
+
 async function exchangeAuthorizationCode(code: string, redirectUri: string, codeVerifier: string): Promise<CodexOAuthTokens> {
   const response = await fetch(TOKEN_URL, {
     method: 'POST',
@@ -114,6 +182,49 @@ async function exchangeAuthorizationCode(code: string, redirectUri: string, code
     accountId: extractAccountId(idToken, accessToken),
     lastRefresh: new Date().toISOString(),
   };
+}
+
+async function refreshCodexOAuthTokens(tokens: CodexOAuthTokens): Promise<CodexOAuthTokens> {
+  const response = await fetch(TOKEN_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'refresh_token',
+      client_id: CLIENT_ID,
+      refresh_token: tokens.refreshToken,
+    }),
+  });
+
+  const text = await response.text();
+  if (!response.ok) throw new Error(`OAuth refresh failed (${response.status}): ${text.slice(0, 300)}`);
+
+  let parsed: Record<string, unknown>;
+  try { parsed = JSON.parse(text) as Record<string, unknown>; }
+  catch { throw new Error(`OAuth refresh returned invalid JSON: ${text.slice(0, 300)}`); }
+
+  const accessToken = typeof parsed.access_token === 'string' ? parsed.access_token : '';
+  const refreshToken = typeof parsed.refresh_token === 'string' ? parsed.refresh_token : tokens.refreshToken;
+  const idToken = typeof parsed.id_token === 'string' ? parsed.id_token : tokens.idToken;
+  if (!accessToken) throw new Error('OAuth refresh did not return an access token.');
+
+  return {
+    accessToken,
+    refreshToken,
+    idToken,
+    accountId: extractAccountId(idToken, accessToken) ?? tokens.accountId,
+    lastRefresh: new Date().toISOString(),
+  };
+}
+
+export async function importUsableCodexOAuthTokens(): Promise<CodexOAuthTokens | null> {
+  const existing = loadExistingCodexOAuthTokens();
+  if (!existing) return null;
+  if (isAccessTokenFresh(existing)) return existing;
+  try {
+    return await refreshCodexOAuthTokens(existing);
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -227,7 +338,8 @@ export function persistCodexOAuthTokens(tokens: CodexOAuthTokens): void {
     try { cliFile = JSON.parse(readFileSync(CODEX_AUTH_FILE, 'utf-8')) ?? {}; }
     catch { cliFile = {}; }
   }
-  cliFile.auth_mode = 'ChatGPT';
+  cliFile.auth_mode = 'chatgpt';
+  cliFile.OPENAI_API_KEY = null;
   cliFile.tokens = {
     id_token: tokens.idToken,
     access_token: tokens.accessToken,

@@ -36,7 +36,7 @@ import {
   type CredentialName,
 } from './credentials-bridge.js';
 import { addWorkspaceDir, ensureHomeEnv, saveUserProfile, setHomeEnv, type ProfilePatch } from './setup-bridge.js';
-import { persistCodexOAuthTokens, runCodexOAuthLogin } from './codex-oauth.js';
+import { importUsableCodexOAuthTokens, persistCodexOAuthTokens, runCodexOAuthLogin } from './codex-oauth.js';
 
 /**
  * Clementine Desktop — Electron main process.
@@ -619,7 +619,8 @@ ipcMain.handle('clemmy:setup-codex-login', async () => {
   // SecretStore vault so the dashboard's credentials view picks them
   // up immediately.
   try {
-    const tokens = await runCodexOAuthLogin();
+    const imported = await importUsableCodexOAuthTokens();
+    const tokens = imported ?? await runCodexOAuthLogin();
     persistCodexOAuthTokens(tokens);
     await setCredential('codex_oauth_access_token', tokens.accessToken).catch(() => { /* vault is best-effort */ });
     await setCredential('codex_oauth_refresh_token', tokens.refreshToken).catch(() => { /* vault is best-effort */ });
@@ -627,6 +628,7 @@ ipcMain.handle('clemmy:setup-codex-login', async () => {
       ok: true as const,
       accountId: tokens.accountId ?? '',
       lastRefresh: tokens.lastRefresh,
+      reused: Boolean(imported),
     };
   } catch (err) {
     return {

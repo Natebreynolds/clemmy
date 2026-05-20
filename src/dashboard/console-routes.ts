@@ -94,6 +94,10 @@ import {
   createSession as createHarnessSession,
   getSession as getHarnessSession,
   listEvents as listHarnessEvents,
+  listSessions as listHarnessSessions,
+  summarizeSessionForSignal,
+  type EventRow as HarnessEventRow,
+  type SessionRow as HarnessSessionRow,
 } from '../runtime/harness/eventlog.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { runConversation, runConversationFromResume } from '../runtime/harness/loop.js';
@@ -200,6 +204,48 @@ function contextFileForKey(key: string): ContextFileDefinition | undefined {
 function trimConsoleTitle(text: string, max = 120): string {
   const clean = text.replace(/\s+/g, ' ').trim();
   return clean.length > max ? clean.slice(0, Math.max(0, max - 1)) + '…' : clean;
+}
+
+const CONSOLE_HARNESS_REPLAY_TYPES = new Set<HarnessEventRow['type']>([
+  'turn_started',
+  'tool_called',
+  'tool_returned',
+  'handoff',
+  'approval_requested',
+  'approval_resolved',
+  'run_completed',
+  'conversation_completed',
+  'run_failed',
+  'guardrail_tripped',
+  'stuck_detected',
+]);
+
+function isDiscordHarnessSession(session: HarnessSessionRow): boolean {
+  return session.channel === 'discord'
+    || session.channel === 'discord-dm'
+    || session.metadata.source === 'discord';
+}
+
+function isConsoleVisibleHarnessSession(session: HarnessSessionRow): boolean {
+  return isDiscordHarnessSession(session)
+    || session.kind === 'workflow'
+    || session.channel === 'workflow'
+    || session.metadata.source === 'workflow';
+}
+
+function harnessSessionSourceLabel(session: HarnessSessionRow): string {
+  if (isDiscordHarnessSession(session)) return 'Discord';
+  if (session.kind === 'workflow' || session.channel === 'workflow' || session.metadata.source === 'workflow') return 'Workflow';
+  return session.channel || session.kind;
+}
+
+function actionEventTime(event: ActionEvent): string {
+  if (event.kind === 'run.event') return event.event.createdAt;
+  if (event.kind === 'harness.event') return event.event.createdAt;
+  if (event.kind === 'notification.created') return event.notification.createdAt;
+  if (event.kind === 'approval.created') return event.approval.createdAt;
+  if (event.kind === 'approval.resolved') return event.approval.createdAt;
+  return new Date().toISOString();
 }
 
 function readContextFile(def: ContextFileDefinition): Record<string, unknown> {
@@ -2654,6 +2700,11 @@ export function registerConsoleRoutes(
       const runtimeAuth = getAuthStatus();
       const policy = getProactivityPolicySnapshot();
       const pendingWorkflowRuns = listPendingRuns();
+      const recentHarnessSessions = listHarnessSessions({ limit: 60 }).filter(isConsoleVisibleHarnessSession);
+      const activeHarnessSessions = recentHarnessSessions.filter((session) =>
+        session.status === 'active' || session.status === 'paused',
+      );
+      const activeDiscordHarnessSessions = activeHarnessSessions.filter(isDiscordHarnessSession);
 
       const needsYou = [
         ...approvals.slice(0, 6).map((approval) => ({
@@ -2736,6 +2787,12 @@ export function registerConsoleRoutes(
           meta: run.channel || run.source || run.id,
           panel: 'activity',
         })),
+        ...activeDiscordHarnessSessions.slice(0, 6).map((session) => ({
+          kind: 'discord',
+          title: session.title || session.objective || 'Discord conversation',
+          meta: `${harnessSessionSourceLabel(session)} · ${session.status} · ${session.updatedAt.slice(11, 16)}`,
+          panel: 'activity',
+        })),
       ].slice(0, 10).map((item) => ({ ...item, title: trimConsoleTitle(item.title, 140), meta: trimConsoleTitle(item.meta || '', 100) }));
 
       const recentCompleted = [
@@ -2749,6 +2806,12 @@ export function registerConsoleRoutes(
           kind: 'done',
           title: run.title || run.input || run.id,
           meta: run.completedAt ? `done ${run.completedAt.slice(11, 16)}` : run.id,
+          panel: 'activity',
+        })),
+        ...recentHarnessSessions.filter((session) => session.status === 'completed' && isDiscordHarnessSession(session)).slice(0, 5).map((session) => ({
+          kind: 'done',
+          title: session.title || session.objective || 'Discord conversation',
+          meta: `Discord done ${session.updatedAt.slice(11, 16)}`,
           panel: 'activity',
         })),
       ].slice(0, 6).map((item) => ({ ...item, title: trimConsoleTitle(item.title, 120), meta: trimConsoleTitle(item.meta || '', 100) }));
@@ -2780,7 +2843,7 @@ export function registerConsoleRoutes(
         memory.activeFacts === 0 ? 'no durable facts yet' : '',
       ].filter(Boolean);
 
-      const activeCount = executions.length + activeBackgroundTasks.length + pendingWorkflowRuns.length + runs.filter((run) => run.status === 'running' || run.status === 'received' || run.status === 'queued').length;
+      const activeCount = executions.length + activeBackgroundTasks.length + pendingWorkflowRuns.length + activeDiscordHarnessSessions.length + runs.filter((run) => run.status === 'running' || run.status === 'received' || run.status === 'queued').length;
       const waitingCount = needsYou.length;
       const currentObjective = workingNow[0]?.title
         ?? needsYou[0]?.title
@@ -3040,8 +3103,28 @@ export function registerConsoleRoutes(
         if (a.kind !== 'run.event' || b.kind !== 'run.event') return 0;
         return a.event.createdAt.localeCompare(b.event.createdAt);
       });
-      const replay: ActionEvent[] = [
+      const replayHarnessEvents: ActionEvent[] = [];
+      const recentHarnessSessions = listHarnessSessions({ limit: 25 }).filter(isConsoleVisibleHarnessSession);
+      for (const session of recentHarnessSessions) {
+        const events = listHarnessEvents(session.id, { limit: 500 })
+          .filter((event) => CONSOLE_HARNESS_REPLAY_TYPES.has(event.type))
+          .slice(-8);
+        for (const event of events) {
+          replayHarnessEvents.push({
+            kind: 'harness.event',
+            sessionId: session.id,
+            event,
+            session: summarizeSessionForSignal(session),
+          });
+        }
+      }
+      replayHarnessEvents.sort((a, b) => actionEventTime(a).localeCompare(actionEventTime(b)));
+      const replayTimeline = [
         ...replayRunEvents.slice(-20),
+        ...replayHarnessEvents.slice(-30),
+      ].sort((a, b) => actionEventTime(a).localeCompare(actionEventTime(b)));
+      const replay: ActionEvent[] = [
+        ...replayTimeline.slice(-40),
         ...assistant.getRuntime().listPendingApprovals().map((approval) => ({
           kind: 'approval.created' as const,
           approval,

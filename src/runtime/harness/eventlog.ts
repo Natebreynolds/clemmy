@@ -85,6 +85,18 @@ export interface SessionRow {
   metadata: Record<string, unknown>;
 }
 
+export interface HarnessSessionSignal {
+  id: string;
+  kind: SessionKind;
+  channel: string | null;
+  userId: string | null;
+  status: SessionStatus;
+  title: string | null;
+  objective: string | null;
+  updatedAt: string;
+  metadata: Record<string, string | number | boolean | null>;
+}
+
 export interface EventRow {
   seq: number;
   id: string;
@@ -120,6 +132,14 @@ export interface CreateSessionInput {
 export interface ListEventsOptions {
   sinceSeq?: number;
   types?: EventType[];
+  limit?: number;
+}
+
+export interface ListSessionsOptions {
+  kind?: SessionKind | SessionKind[];
+  status?: SessionStatus | SessionStatus[] | 'any';
+  channel?: string | string[];
+  updatedAfter?: string;
   limit?: number;
 }
 
@@ -339,6 +359,41 @@ function rowToEvent(row: RawEventRow): EventRow {
   };
 }
 
+const SESSION_SIGNAL_METADATA_KEYS = [
+  'source',
+  'channelId',
+  'guildId',
+  'workflowName',
+  'workflowRunId',
+  'stepId',
+] as const;
+
+export function summarizeSessionForSignal(session: SessionRow): HarnessSessionSignal {
+  const metadata: Record<string, string | number | boolean | null> = {};
+  for (const key of SESSION_SIGNAL_METADATA_KEYS) {
+    const value = session.metadata[key];
+    if (
+      value === null ||
+      typeof value === 'string' ||
+      typeof value === 'number' ||
+      typeof value === 'boolean'
+    ) {
+      metadata[key] = value;
+    }
+  }
+  return {
+    id: session.id,
+    kind: session.kind,
+    channel: session.channel,
+    userId: session.userId,
+    status: session.status,
+    title: session.title,
+    objective: session.objective,
+    updatedAt: session.updatedAt,
+    metadata,
+  };
+}
+
 export function createSession(input: CreateSessionInput): SessionRow {
   const db = openEventLog();
   const id = input.id ?? `sess-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`;
@@ -370,6 +425,45 @@ export function getSession(sessionId: string): SessionRow | null {
     | RawSessionRow
     | undefined;
   return row ? rowToSession(row) : null;
+}
+
+function addListFilter(
+  clauses: string[],
+  params: unknown[],
+  column: string,
+  value: string | string[] | undefined,
+): void {
+  if (value === undefined) return;
+  const values = Array.isArray(value) ? value : [value];
+  if (values.length === 0) return;
+  clauses.push(`${column} IN (${values.map(() => '?').join(',')})`);
+  params.push(...values);
+}
+
+export function listSessions(options: ListSessionsOptions = {}): SessionRow[] {
+  const db = openEventLog();
+  const clauses: string[] = [];
+  const params: unknown[] = [];
+  addListFilter(clauses, params, 'kind', options.kind);
+  if (options.status !== undefined && options.status !== 'any') {
+    addListFilter(clauses, params, 'status', options.status);
+  }
+  addListFilter(clauses, params, 'channel', options.channel);
+  if (options.updatedAfter !== undefined) {
+    clauses.push('updated_at >= ?');
+    params.push(options.updatedAfter);
+  }
+  let sql = 'SELECT * FROM sessions';
+  if (clauses.length > 0) {
+    sql += ` WHERE ${clauses.join(' AND ')}`;
+  }
+  sql += ' ORDER BY updated_at DESC';
+  const rawLimit = Math.trunc(options.limit ?? 100);
+  const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(500, rawLimit)) : 100;
+  sql += ' LIMIT ?';
+  params.push(limit);
+  const rows = db.prepare(sql).all(...params) as RawSessionRow[];
+  return rows.map(rowToSession);
 }
 
 export type SessionPatch = Partial<
@@ -436,10 +530,16 @@ export function appendEvent(input: AppendEventInput): EventRow {
   tx();
   const row = db.prepare('SELECT * FROM events WHERE id = ?').get(id) as RawEventRow;
   const event = rowToEvent(row);
+  const session = getSession(event.sessionId);
   // Fan out for live SSE subscribers. Best-effort — emit errors are
   // swallowed inside actionBus so a flaky listener can never block
   // an event write.
-  actionBus.emit({ kind: 'harness.event', sessionId: event.sessionId, event });
+  actionBus.emit({
+    kind: 'harness.event',
+    sessionId: event.sessionId,
+    event,
+    session: session ? summarizeSessionForSignal(session) : undefined,
+  });
   return event;
 }
 
