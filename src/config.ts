@@ -100,11 +100,66 @@ export const CODEX_INSTALL_PACKAGE = getEnv('CODEX_INSTALL_PACKAGE', '@openai/co
 export const CODEX_SANDBOX_MODE = getEnv('CODEX_SANDBOX_MODE', 'workspace-write');
 export const CODEX_USE_FULL_AUTO = getEnv('CODEX_USE_FULL_AUTO', 'true').toLowerCase() === 'true';
 
-export const MODELS: Models = {
-  fast: getEnv('OPENAI_MODEL_FAST', 'gpt-5.4-mini'),
-  primary: getEnv('OPENAI_MODEL_PRIMARY', 'gpt-5.4'),
-  deep: getEnv('OPENAI_MODEL_DEEP', 'gpt-5.4'),
+export type ModelTier = keyof Models;
+
+export const DEFAULT_MODELS: Models = {
+  fast: 'gpt-5.4-mini',
+  primary: 'gpt-5.4',
+  deep: 'gpt-5.4',
 };
+
+export const MODEL_ENV_KEYS: Record<ModelTier, string> = {
+  fast: 'OPENAI_MODEL_FAST',
+  primary: 'OPENAI_MODEL_PRIMARY',
+  deep: 'OPENAI_MODEL_DEEP',
+};
+
+export const MODEL_PRESETS = [
+  { id: 'gpt-5.4-mini', label: 'GPT-5.4 Mini' },
+  { id: 'gpt-5.4', label: 'GPT-5.4' },
+  { id: 'gpt-5.5', label: 'GPT-5.5' },
+];
+
+export function normalizeModelId(value: unknown, fallback: string): string {
+  const raw = typeof value === 'string' ? value.trim() : '';
+  if (!raw) return fallback;
+  if (!/^[A-Za-z0-9._:-]+$/.test(raw)) return fallback;
+  return raw;
+}
+
+export function getModelForTier(tier: ModelTier): string {
+  return normalizeModelId(getRuntimeEnv(MODEL_ENV_KEYS[tier], DEFAULT_MODELS[tier]), DEFAULT_MODELS[tier]);
+}
+
+export const MODELS: Models = {
+  get fast() { return getModelForTier('fast'); },
+  get primary() { return getModelForTier('primary'); },
+  get deep() { return getModelForTier('deep'); },
+};
+
+export function getModelSettingsSnapshot(): {
+  models: Models;
+  defaults: Models;
+  envKeys: Record<ModelTier, string>;
+  presets: typeof MODEL_PRESETS;
+  processEnvOverrides: Record<ModelTier, boolean>;
+} {
+  return {
+    models: {
+      fast: MODELS.fast,
+      primary: MODELS.primary,
+      deep: MODELS.deep,
+    },
+    defaults: { ...DEFAULT_MODELS },
+    envKeys: { ...MODEL_ENV_KEYS },
+    presets: [...MODEL_PRESETS],
+    processEnvOverrides: {
+      fast: process.env[MODEL_ENV_KEYS.fast] !== undefined,
+      primary: process.env[MODEL_ENV_KEYS.primary] !== undefined,
+      deep: process.env[MODEL_ENV_KEYS.deep] !== undefined,
+    },
+  };
+}
 
 export const VAULT_DIR = path.join(BASE_DIR, 'vault');
 export const WEBHOOK_ENABLED = getEnv('WEBHOOK_ENABLED', 'false').toLowerCase() === 'true';

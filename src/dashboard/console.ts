@@ -1021,6 +1021,47 @@ export function renderConsoleHtml(token: string): string {
               <div class="settings-block-head">RUNTIME AUTH</div>
               <div class="settings-info" data-settings-auth>—</div>
             </div>
+
+            <div class="settings-block">
+              <div class="settings-block-head">MODEL PICKER</div>
+              <form class="settings-form" data-settings-models-form>
+                <div class="settings-model-row">
+                  <div class="settings-field">
+                    <label>FAST</label>
+                    <select data-model-preset="fast"></select>
+                  </div>
+                  <div class="settings-field">
+                    <label>CUSTOM ID</label>
+                    <input type="text" data-model-custom="fast" autocomplete="off" spellcheck="false" />
+                  </div>
+                </div>
+                <div class="settings-model-row">
+                  <div class="settings-field">
+                    <label>PRIMARY</label>
+                    <select data-model-preset="primary"></select>
+                  </div>
+                  <div class="settings-field">
+                    <label>CUSTOM ID</label>
+                    <input type="text" data-model-custom="primary" autocomplete="off" spellcheck="false" />
+                  </div>
+                </div>
+                <div class="settings-model-row">
+                  <div class="settings-field">
+                    <label>DEEP</label>
+                    <select data-model-preset="deep"></select>
+                  </div>
+                  <div class="settings-field">
+                    <label>CUSTOM ID</label>
+                    <input type="text" data-model-custom="deep" autocomplete="off" spellcheck="false" />
+                  </div>
+                </div>
+                <div class="settings-actions-row">
+                  <button type="submit" class="settings-save">SAVE MODELS ✎</button>
+                  <button type="button" class="settings-secondary" data-settings-models-reset>RESET DEFAULTS</button>
+                </div>
+              </form>
+              <div class="settings-info" data-settings-models-status>—</div>
+            </div>
           </div>
 
           <div class="settings-col">
@@ -6465,6 +6506,30 @@ body {
 }
 .settings-save:hover { background: var(--accent-2); color: var(--bg-0); }
 .settings-save:disabled { background: var(--bg-3); color: var(--fg-mute); cursor: wait; }
+.settings-secondary {
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  padding: 7px 12px;
+  cursor: pointer;
+}
+.settings-secondary:hover { border-color: var(--line-bright); color: var(--fg); }
+.settings-model-row {
+  display: grid;
+  grid-template-columns: 0.8fr 1fr;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.settings-model-row .settings-field { margin-bottom: 0; }
+.settings-actions-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
 
 .settings-info {
   padding: 14px 16px;
@@ -11265,6 +11330,9 @@ const CONSOLE_JS = `
     policyForm:  document.querySelector('[data-settings-policy-form]'),
     authBox:     document.querySelector('[data-settings-auth]'),
     memoryBox:   document.querySelector('[data-settings-memory]'),
+    modelsForm:  document.querySelector('[data-settings-models-form]'),
+    modelsStatus: document.querySelector('[data-settings-models-status]'),
+    modelsReset: document.querySelector('[data-settings-models-reset]'),
   };
 
   function setFormValue(form, name, value) {
@@ -13750,6 +13818,7 @@ const CONSOLE_JS = `
       ['mode','checkInMinutes','defaultLongTaskMinutes','briefCadenceMinutes','quietHoursStart','quietHoursEnd'].forEach((k) => setFormValue(sett.policyForm, k, policy[k]));
 
       renderAuthInfo(s.auth);
+      renderModelPicker(s.models);
       renderMemoryInfo(s.memory);
       await refreshPlanProposals();
       await refreshProposals();
@@ -14392,6 +14461,71 @@ const CONSOLE_JS = `
     });
   }
 
+  let currentModelSettings = null;
+
+  function modelTierLabel(tier) {
+    if (tier === 'primary') return 'Primary';
+    return tier.charAt(0).toUpperCase() + tier.slice(1);
+  }
+
+  function renderModelPicker(snapshot) {
+    currentModelSettings = snapshot || null;
+    if (!sett.modelsForm || !sett.modelsStatus || !snapshot) return;
+
+    const presets = Array.isArray(snapshot.presets) ? snapshot.presets : [];
+    const models = snapshot.models || {};
+    ['fast','primary','deep'].forEach((tier) => {
+      const select = sett.modelsForm.querySelector('[data-model-preset="' + tier + '"]');
+      const input = sett.modelsForm.querySelector('[data-model-custom="' + tier + '"]');
+      if (!select || !input) return;
+      const current = models[tier] || (snapshot.defaults && snapshot.defaults[tier]) || '';
+      const presetIds = presets.map((p) => p.id);
+      const known = presetIds.includes(current);
+      select.innerHTML = presets.map((preset) => (
+        '<option value="' + escMem(preset.id) + '">' + escMem(preset.label || preset.id) + '</option>'
+      )).join('') + '<option value="__custom__">Custom model id</option>';
+      select.value = known ? current : '__custom__';
+      input.value = current;
+      input.disabled = select.value !== '__custom__';
+      input.style.opacity = input.disabled ? '0.55' : '1';
+      select.onchange = () => {
+        if (select.value === '__custom__') {
+          input.disabled = false;
+          input.style.opacity = '1';
+          input.focus();
+        } else {
+          input.value = select.value;
+          input.disabled = true;
+          input.style.opacity = '0.55';
+        }
+      };
+    });
+
+    const overrides = snapshot.processEnvOverrides || {};
+    const rows = ['fast','primary','deep'].map((tier) => {
+      const value = models[tier] || '';
+      const locked = overrides[tier] ? ' env override' : '';
+      return '<div class="row"><span class="k">' + modelTierLabel(tier) + '</span><span class="v on">' + escMem(value + locked) + '</span></div>';
+    }).join('');
+    sett.modelsStatus.innerHTML = rows + '<p class="settings-note">Saved to the local runtime env. New turns use the selected tiers immediately.</p>';
+  }
+
+  function collectModelPatch(useDefaults) {
+    const source = useDefaults && currentModelSettings ? currentModelSettings.defaults : null;
+    const patch = {};
+    ['fast','primary','deep'].forEach((tier) => {
+      if (source && source[tier]) {
+        patch[tier] = source[tier];
+        return;
+      }
+      const select = sett.modelsForm.querySelector('[data-model-preset="' + tier + '"]');
+      const input = sett.modelsForm.querySelector('[data-model-custom="' + tier + '"]');
+      const selected = select ? select.value : '';
+      patch[tier] = selected === '__custom__' ? (input?.value || '').trim() : selected;
+    });
+    return patch;
+  }
+
   function renderAuthInfo(auth) {
     if (!auth) { sett.authBox.textContent = '—'; return; }
     const codexReady = hasCodexRuntimeAuth(auth);
@@ -14469,6 +14603,52 @@ const CONSOLE_JS = `
       setTimeout(() => { btn.textContent = 'SAVE POLICY ✎'; }, 1400);
     }
   });
+
+  sett.modelsForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const btn = sett.modelsForm.querySelector('button[type="submit"]');
+    btn.disabled = true;
+    try {
+      const patch = collectModelPatch(false);
+      const r = await fetch(withToken('/api/console/settings/models'), {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(patch),
+      });
+      const j = await r.json().catch(() => ({}));
+      btn.disabled = false;
+      btn.textContent = r.ok ? 'SAVED ✓' : 'FAILED';
+      if (r.ok) renderModelPicker(j.models);
+      else if (sett.modelsStatus) sett.modelsStatus.innerHTML = '<div style="color:var(--accent-fail);">Failed to save models: ' + escMem(j.error || r.status) + '</div>';
+      setTimeout(() => { btn.textContent = 'SAVE MODELS ✎'; }, 1400);
+    } catch (err) {
+      btn.disabled = false;
+      btn.textContent = 'FAILED';
+      if (sett.modelsStatus) sett.modelsStatus.innerHTML = '<div style="color:var(--accent-fail);">Failed to save models: ' + escMem(err.message || err) + '</div>';
+      setTimeout(() => { btn.textContent = 'SAVE MODELS ✎'; }, 1400);
+    }
+  });
+
+  if (sett.modelsReset) {
+    sett.modelsReset.addEventListener('click', async () => {
+      if (!currentModelSettings) return;
+      sett.modelsReset.textContent = 'RESETTING...';
+      try {
+        const r = await fetch(withToken('/api/console/settings/models'), {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(collectModelPatch(true)),
+        });
+        const j = await r.json().catch(() => ({}));
+        if (r.ok) renderModelPicker(j.models);
+        else alert('Reset failed: ' + (j.error || r.status));
+      } catch (err) {
+        alert('Reset failed: ' + (err.message || err));
+      } finally {
+        sett.modelsReset.textContent = 'RESET DEFAULTS';
+      }
+    });
+  }
 
   // Boot the loop.
   wireMemoryViewToggle();

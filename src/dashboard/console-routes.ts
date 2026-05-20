@@ -7,7 +7,18 @@ import { fileURLToPath } from 'node:url';
 import { randomBytes } from 'node:crypto';
 import matter from 'gray-matter';
 import { renderConsoleHtml } from './console.js';
-import { BASE_DIR, LOCAL_MCP_ENABLED, WEBHOOK_SECRET, getOpenAiApiKey, getRuntimeEnv } from '../config.js';
+import {
+  BASE_DIR,
+  DEFAULT_MODELS,
+  LOCAL_MCP_ENABLED,
+  MODEL_ENV_KEYS,
+  WEBHOOK_SECRET,
+  getModelSettingsSnapshot,
+  getOpenAiApiKey,
+  getRuntimeEnv,
+  normalizeModelId,
+  type ModelTier,
+} from '../config.js';
 import { recallHybrid } from '../memory/recall.js';
 import { FACT_KINDS, forgetFact, listActiveFacts, listAllFacts, rememberFact } from '../memory/facts.js';
 import { openMemoryDb } from '../memory/db.js';
@@ -1967,7 +1978,8 @@ export function registerConsoleRoutes(
       const proactivity = getProactivityPolicySnapshot();
       const auth = getAuthStatus();
       const memory = readMemoryIndexStatus();
-      res.json({ profile, proactivity, auth, memory });
+      const models = getModelSettingsSnapshot();
+      res.json({ profile, proactivity, auth, memory, models });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -2117,6 +2129,22 @@ export function registerConsoleRoutes(
     try {
       const updated = saveProactivityPolicy(req.body ?? {});
       res.json({ policy: updated });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.patch('/api/console/settings/models', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const body = (req.body ?? {}) as Partial<Record<ModelTier, unknown>>;
+      const tiers: ModelTier[] = ['fast', 'primary', 'deep'];
+      for (const tier of tiers) {
+        const next = normalizeModelId(body[tier], DEFAULT_MODELS[tier]);
+        updateEnvKey(MODEL_ENV_KEYS[tier], next);
+      }
+      clearAutonomyAgentCache();
+      res.json({ models: getModelSettingsSnapshot() });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

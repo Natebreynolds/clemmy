@@ -232,9 +232,9 @@ export class CodexResponsesModel implements Model {
 }
 
 export class CodexModelProvider implements ModelProvider {
-  constructor(private readonly defaultModelId: string = MODELS.primary) {}
+  constructor(private readonly defaultModelId?: string) {}
   getModel(modelName?: string): Model {
-    return new CodexResponsesModel(resolveCodexModel(modelName ?? this.defaultModelId));
+    return new CodexResponsesModel(resolveCodexModel(modelName ?? this.defaultModelId ?? MODELS.primary));
   }
 }
 
