@@ -113,3 +113,14 @@ test('startApprovalReaper is idempotent — second start is a no-op', () => {
   // Second disposer is a no-op since the first already stopped.
   stop2();
 });
+
+test('startApprovalReaper sweeps stale approvals immediately on startup', async () => {
+  const session = createSession({ kind: 'chat' });
+  const row = reg.register({ sessionId: session.id, subject: 'stale on boot', ttlMs: 5 });
+  await new Promise((r) => setTimeout(r, 20));
+
+  const stop = reaper.startApprovalReaper({ tickMs: 60_000 });
+  stop();
+
+  assert.equal(reg.get(row.approvalId)?.status, 'expired');
+});

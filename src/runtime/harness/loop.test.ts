@@ -37,6 +37,7 @@ const { runTurn, runConversation } = await import('./loop.js');
 type RunRunnerFn = import('./loop.js').RunRunnerFn;
 const { ToolCallsLimitExceeded } = await import('./brackets.js');
 const { listEvents: listEventsForConv } = await import('./eventlog.js');
+const approvalRegistry = await import('./approval-registry.js');
 
 test.after(() => {
   try {
@@ -301,6 +302,43 @@ test('interruption emits approval_requested per interrupted tool call with parse
   assert.equal(approvals[0].data.tool, 'request_approval');
   assert.equal(approvals[0].data.subject, 'deploy to prod');
   assert.deepEqual(approvals[0].data.args, { subject: 'deploy to prod', destructive: true });
+});
+
+test('interruption registers Discord channel id for approval routing', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({
+    kind: 'chat',
+    channel: 'discord',
+    metadata: { channelId: 'discord-channel-123' },
+  });
+
+  const runRunner: RunRunnerFn = async () => ({
+    history: [],
+    lastResponseId: undefined,
+    finalOutput: undefined,
+    hasInterruptions: true,
+    serializedState: '{"$schema":1,"items":[]}',
+    interruptions: [
+      {
+        toolName: 'request_approval',
+        rawArgs: '{"subject":"send outreach"}',
+        args: { subject: 'send outreach' },
+      },
+    ],
+  });
+
+  await runTurn({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'send it',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  const rows = approvalRegistry.listPending({ sessionId: sess.id, status: 'pending' });
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].channel, 'discord');
+  assert.equal(rows[0].channelId, 'discord-channel-123');
 });
 
 test('interruption with no rich args falls back to the tool name as subject', async () => {

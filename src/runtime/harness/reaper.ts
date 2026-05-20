@@ -41,6 +41,8 @@ let activeInterval: NodeJS.Timeout | null = null;
 interface StartOptions {
   /** Sweep cadence; defaults to 60s. */
   tickMs?: number;
+  /** Run one sweep immediately before scheduling the periodic timer. */
+  runImmediately?: boolean;
   /** Test injection — fire immediately and return the disposer with
    *  no setInterval scheduled. */
   immediate?: boolean;
@@ -66,6 +68,7 @@ export function startApprovalReaper(opts: StartOptions = {}): () => void {
   if (opts.immediate) {
     tick();
   } else {
+    if (opts.runImmediately ?? true) tick();
     activeInterval = setInterval(tick, tickMs);
     activeInterval.unref?.();
   }

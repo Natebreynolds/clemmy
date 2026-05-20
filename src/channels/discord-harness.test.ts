@@ -13,7 +13,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { EventRow } from '../runtime/harness/eventlog.js';
-import { applyEventToState, parseApprovalIntent, parseHarnessCommand } from './discord-harness.js';
+import { applyEventToState, parseApprovalIntent, parseHarnessCommand, __test__ } from './discord-harness.js';
+import type { PendingApprovalRow } from '../runtime/harness/approval-registry.js';
 
 function freshState() {
   return { summary: '', status: 'starting', done: false, toolsCalled: [], toolCount: 0 };
@@ -30,6 +31,25 @@ function event(type: EventRow['type'], data: Record<string, unknown> = {}): Even
     parentEventId: null,
     data,
     createdAt: '2026-05-17T12:00:00.000Z',
+  };
+}
+
+function approvalRow(overrides: Partial<PendingApprovalRow> = {}): PendingApprovalRow {
+  return {
+    approvalId: 'apr-test',
+    sessionId: 'sess-test',
+    channel: 'discord',
+    channelId: 'chan-a',
+    requestedAt: new Date().toISOString(),
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    subject: 'test approval',
+    tool: 'request_approval',
+    args: null,
+    status: 'pending',
+    resolution: null,
+    resolver: null,
+    resolvedAt: null,
+    ...overrides,
   };
 }
 
@@ -154,6 +174,31 @@ test('summary persists across steps when a later event lacks one', () => {
   applyEventToState(event('tool_called', { tool: 'write_file' }), s);
   assert.equal(s.summary, 'researched accounts');
   assert.equal(s.status, 'using write_file');
+});
+
+test('approval routing only accepts approvals for the current Discord channel', () => {
+  assert.equal(
+    __test__.approvalBelongsToDiscordChannel(approvalRow({ channelId: 'chan-a' }), 'chan-a'),
+    true,
+  );
+  assert.equal(
+    __test__.approvalBelongsToDiscordChannel(approvalRow({ channelId: 'chan-a' }), 'chan-b'),
+    false,
+  );
+});
+
+test('approval routing rejects expired or non-Discord approvals', () => {
+  assert.equal(
+    __test__.approvalBelongsToDiscordChannel(
+      approvalRow({ expiresAt: new Date(Date.now() - 1000).toISOString() }),
+      'chan-a',
+    ),
+    false,
+  );
+  assert.equal(
+    __test__.approvalBelongsToDiscordChannel(approvalRow({ channel: 'workflow', channelId: null }), 'chan-a'),
+    false,
+  );
 });
 
 // ─── parseApprovalIntent — T1.2 tightening (v0.4.22+) ─────────────

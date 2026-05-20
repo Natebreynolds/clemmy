@@ -752,7 +752,7 @@ export function renderConsoleHtml(token: string): string {
           <div class="skills-header">
             <div class="skills-intro">
               <h3>Installed Skills</h3>
-              <p>Skills are reusable <code>SKILL.md</code> prompt modules — personas, design systems, style guides, domain knowledge — that load into the agent's context on demand. Same format as Claude Code skills, Codex skills, and <a href="https://agentskills.io" target="_blank" rel="noopener">agentskills.io</a>. Install any public repo from GitHub below.</p>
+              <p>Skills are reusable <code>SKILL.md</code> prompt modules — personas, design systems, style guides, domain knowledge — that load into the agent's context on demand. Same format as Claude Code skills, Codex skills, and <a href="https://agentskills.io" target="_blank" rel="noopener">agentskills.io</a>. Install public repos directly, or private repos when GitHub CLI is authenticated.</p>
             </div>
             <div class="skills-stats">
               <div class="stat-card"><span>SKILLS</span><em data-skills-count>—</em></div>
@@ -836,6 +836,9 @@ export function renderConsoleHtml(token: string): string {
               <span class="hub-block-meta" data-hub-cli-cat-meta>—</span>
             </div>
             <p class="hub-block-intro">Search for a CLI by name — Clementine knows how to install and authenticate the common ones. Once connected, the agent can call it via <code>run_shell_command</code> and the install + auth context is saved so future sessions know it's available.</p>
+            <div class="hub-apps-list" data-hub-github-cli>
+              <div class="settings-info">Checking GitHub CLI…</div>
+            </div>
             <div class="hub-apps-controls">
               <input type="search" data-hub-cli-cat-search placeholder="Search a CLI — e.g. salesforce, railway, vercel…" autocomplete="off" spellcheck="false" />
             </div>
@@ -1061,6 +1064,59 @@ export function renderConsoleHtml(token: string): string {
                 </div>
               </form>
               <div class="settings-info" data-settings-models-status>—</div>
+            </div>
+
+            <div class="settings-block">
+              <div class="settings-block-head">RUNTIME BUDGETS</div>
+              <form class="settings-form" data-settings-runtime-form>
+                <div class="settings-field">
+                  <label>WORKFLOW MODE</label>
+                  <select name="preset" data-runtime-field data-runtime-preset>
+                    <option value="standard">standard — normal chat + tasks</option>
+                    <option value="long">long workflow — higher budget + check-ins</option>
+                    <option value="unlimited">unlimited supervised — keep going until done/cancelled</option>
+                  </select>
+                </div>
+                <div class="settings-grid-2">
+                  <div class="settings-field">
+                    <label>MAX SDK TURNS</label>
+                    <input type="number" name="maxTurns" data-runtime-field min="1" max="2000" />
+                  </div>
+                  <div class="settings-field">
+                    <label>MAX CONVERSATION STEPS</label>
+                    <input type="number" name="maxConversationSteps" data-runtime-field min="1" max="1000000" />
+                  </div>
+                </div>
+                <div class="settings-grid-2">
+                  <div class="settings-field">
+                    <label>WALL-CLOCK MINUTES</label>
+                    <input type="number" name="maxConversationWallMinutes" data-runtime-field min="0" max="525600" />
+                  </div>
+                  <div class="settings-field">
+                    <label>TOOL CALLS PER TURN</label>
+                    <input type="number" name="toolCallsPerTurn" data-runtime-field min="1" max="256" />
+                  </div>
+                </div>
+                <div class="settings-grid-2">
+                  <div class="settings-field">
+                    <label>VISIBLE CHECK-IN MINUTES</label>
+                    <input type="number" name="checkInMinutes" data-runtime-field min="1" max="240" />
+                  </div>
+                  <div class="settings-field">
+                    <label>AUTO-CONTINUE</label>
+                    <label class="check-pill">
+                      <input type="checkbox" name="autoContinueOnLimit" data-runtime-field />
+                      <span>Continue instead of waiting when a soft budget is reached</span>
+                    </label>
+                  </div>
+                </div>
+                <div class="settings-actions-row">
+                  <button type="submit" class="settings-save">SAVE RUNTIME ✎</button>
+                  <button type="button" class="settings-secondary" data-runtime-preset-apply="long">USE LONG</button>
+                  <button type="button" class="settings-secondary" data-runtime-preset-apply="unlimited">USE UNLIMITED</button>
+                </div>
+              </form>
+              <div class="settings-info" data-settings-runtime-status>—</div>
             </div>
           </div>
 
@@ -2682,6 +2738,31 @@ body {
 }
 .home-chat-turn.pending .home-chat-stream-status {
   display: block;
+}
+.home-chat-turn-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+.home-chat-turn-actions button {
+  border: 1px solid var(--line-strong);
+  background: var(--bg-0);
+  color: var(--fg);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  padding: 6px 10px;
+  cursor: pointer;
+}
+.home-chat-turn-actions button:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.home-chat-turn-actions button:disabled {
+  cursor: wait;
+  opacity: 0.55;
 }
 .home-chat-form {
   display: flex;
@@ -7736,6 +7817,7 @@ const CONSOLE_JS = `
     return items.map((item) => {
       const hasApproval = item.approvalId && item.approvalKind;
       const hasWorkflowRun = item.actionKind === 'workflow-run' && item.workflowName && item.runId;
+      const hasHarnessSession = item.actionKind === 'harness-session' && item.sessionId;
       const approvalActions = hasApproval
         ? [
             '<div class="home-item-actions">',
@@ -7752,6 +7834,14 @@ const CONSOLE_JS = `
             '</div>',
           ].join('')
         : '';
+      const harnessActions = hasHarnessSession
+        ? [
+            '<div class="home-item-actions">',
+            '  <button type="button" data-home-harness-action="open" data-home-harness-session-id="' + escMem(item.sessionId) + '">WATCH</button>',
+            '  <button type="button" data-home-harness-action="cancel" data-home-harness-session-id="' + escMem(item.sessionId) + '">CANCEL</button>',
+            '</div>',
+          ].join('')
+        : '';
       return [
       '<div class="home-item command-item" data-tools-jump="' + escMem(item.panel || 'activity') + '">',
       '  <span class="home-item-kind ' + escMem(item.kind || 'task') + '">' + escMem(String(item.kind || 'item').toUpperCase()) + '</span>',
@@ -7760,6 +7850,7 @@ const CONSOLE_JS = `
       item.meta ? '    <div class="home-item-meta">' + escMem(item.meta) + '</div>' : '',
       approvalActions,
       workflowActions,
+      harnessActions,
       '  </div>',
       '</div>',
     ].join('');
@@ -7844,6 +7935,39 @@ const CONSOLE_JS = `
       buttons.forEach((btn) => { btn.disabled = false; });
       button.textContent = original || 'CANCEL';
       alert('Could not cancel workflow run: ' + ((err && err.message) || err));
+    }
+  }
+
+  async function handleHomeHarnessButton(button) {
+    const action = button.getAttribute('data-home-harness-action');
+    const sessionId = button.getAttribute('data-home-harness-session-id') || '';
+    if (!sessionId) return;
+    if (action === 'open') {
+      switchPanel('activity');
+      return;
+    }
+    if (action !== 'cancel') return;
+    if (!confirm('Cancel this running Clementine session? It will stop at the next kill check and abandon pending approvals.')) return;
+    const row = button.closest('.home-item');
+    const buttons = row ? Array.from(row.querySelectorAll('[data-home-harness-action]')) : [button];
+    buttons.forEach((btn) => { btn.disabled = true; });
+    const original = button.textContent;
+    button.textContent = 'CANCELLING';
+    try {
+      const r = await fetch(withToken('/api/console/harness-sessions/' + encodeURIComponent(sessionId) + '/cancel'), {
+        method: 'POST',
+        headers: { Accept: 'application/json' },
+      });
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        throw new Error(j.error || ('HTTP ' + r.status));
+      }
+      await refreshHomeCommandCenter();
+      try { await tick(); } catch (_) {}
+    } catch (err) {
+      buttons.forEach((btn) => { btn.disabled = false; });
+      button.textContent = original || 'CANCEL';
+      alert('Could not cancel session: ' + ((err && err.message) || err));
     }
   }
 
@@ -8197,6 +8321,13 @@ const CONSOLE_JS = `
       event.preventDefault();
       event.stopPropagation();
       handleHomeWorkflowButton(workflowButton);
+      return;
+    }
+    const harnessButton = target.closest('[data-home-harness-action]');
+    if (harnessButton) {
+      event.preventDefault();
+      event.stopPropagation();
+      handleHomeHarnessButton(harnessButton);
       return;
     }
     const jump = target.closest('[data-tools-jump]');
@@ -11240,7 +11371,7 @@ const CONSOLE_JS = `
         gridEl.innerHTML = [
           '<div class="tools-empty">— no skills installed —<br>',
           '<span style="color:var(--fg-mute);font-size:10px;letter-spacing:0.06em;">',
-          'Paste a public GitHub repo URL above. Try <code>Leonxlnx/taste-skill</code> to start — it ships 12 design skills in one repo.',
+          'Paste a GitHub repo URL above. Private repos work when GitHub CLI is authenticated. Try <code>Leonxlnx/taste-skill</code> to start — it ships 12 design skills in one repo.',
           '</span></div>',
         ].join('');
         return;
@@ -11374,6 +11505,8 @@ const CONSOLE_JS = `
     modelsForm:  document.querySelector('[data-settings-models-form]'),
     modelsStatus: document.querySelector('[data-settings-models-status]'),
     modelsReset: document.querySelector('[data-settings-models-reset]'),
+    runtimeForm: document.querySelector('[data-settings-runtime-form]'),
+    runtimeStatus: document.querySelector('[data-settings-runtime-status]'),
   };
 
   function setFormValue(form, name, value) {
@@ -11393,6 +11526,21 @@ const CONSOLE_JS = `
         if (Number.isFinite(n)) patch[name] = n;
       }
       else patch[name] = el.value;
+    });
+    return patch;
+  }
+  function getRuntimeFormPatch(form) {
+    const patch = {};
+    form.querySelectorAll('[data-runtime-field]').forEach((el) => {
+      const name = el.getAttribute('name');
+      if (!name) return;
+      if (el.type === 'checkbox') patch[name] = el.checked;
+      else if (el.type === 'number') {
+        const n = parseInt(el.value, 10);
+        if (Number.isFinite(n)) patch[name] = n;
+      } else {
+        patch[name] = el.value;
+      }
     });
     return patch;
   }
@@ -11554,8 +11702,8 @@ const CONSOLE_JS = `
       }
       const body = await r.json();
       __harnessSessionId = body.sessionId;
-      await streamHarnessSession(body.sessionId, assistantTurn, options);
-      homeChatHistory.push({ role: 'assistant', text: assistantTurn.querySelector('[data-home-chat-text]')?.textContent || '' });
+      await streamHarnessSession(body.sessionId, assistantTurn, { ...options, sinceSeq: body.sinceSeq || 0 });
+      homeChatHistory.push({ role: 'assistant', text: assistantTurn.querySelector('[data-home-chat-turn-text]')?.textContent || '' });
       return { ok: true };
     } catch (err) {
       setChatTurnText(assistantTurn, 'Network error: ' + ((err && err.message) || err));
@@ -11603,7 +11751,7 @@ const CONSOLE_JS = `
   function streamHarnessSession(sessionId, turn, options) {
     const MAX_RECONNECTS = 5;
     return new Promise((resolve) => {
-      let lastSeq = 0;
+      let lastSeq = Number(options && options.sinceSeq) || 0;
       let attempts = 0;
       let es = null;
       let closed = false;
@@ -11648,20 +11796,14 @@ const CONSOLE_JS = `
           setChatTurnStatus(turn, 'awaiting reply');
           finish();
         } else if (ev.type === 'approval_requested') {
-          // Render the approval prompt in the BODY (not just status)
-          // and end the SSE stream so the SEND button re-enables.
-          // Without finish(), the button sat in THINKING… forever and
-          // the user couldn't reply 'approve' / 'reject' to continue.
-          // The reply path is handled server-side: /api/harness/chat
-          // detects approve/reject intent on a paused session and routes
-          // through runConversationFromResume.
+          // Render an actual approval control in the BODY (not just a
+          // typed command hint) and end this SSE stream so the SEND
+          // button re-enables. Clicking a button resumes this same
+          // session through /api/harness/chat.
           const subj = (ev.data && (ev.data.subject || ev.data.tool)) || 'action';
           const reason = (ev.data && ev.data.reason) || '';
           const apr = ev.data && typeof ev.data.approvalId === 'string' ? ev.data.approvalId : null;
-          const replyHint = apr
-            ? 'Reply \`approve ' + apr + '\` (or \`reject ' + apr + '\`) to continue.'
-            : 'Reply **approve** to continue or **reject** to cancel.';
-          setChatTurnText(turn, 'Approval required: ' + subj + (reason ? '\\n\\n' + reason : '') + '\\n\\n' + replyHint);
+          setChatTurnApproval(turn, { subject: subj, reason, approvalId: apr }, sessionId, options);
           setChatTurnStatus(turn, 'awaiting approval');
           finish();
         }
@@ -11677,8 +11819,8 @@ const CONSOLE_JS = `
           try {
             const payload = JSON.parse(e.data);
             for (const ev of payload.events || []) {
-              if (ev && typeof ev.seq === 'number' && ev.seq > lastSeq) lastSeq = ev.seq;
-              renderHarnessEvent(ev, turn, options);
+              handleEvent(ev);
+              if (closed) break;
             }
             // Successful replay frame means we're connected — reset
             // the backoff so a later blip gets the full retry budget.
@@ -11752,6 +11894,86 @@ const CONSOLE_JS = `
   function setChatTurnText(turn, text) {
     const body = turn?.querySelector?.('[data-home-chat-turn-text]');
     if (body) body.textContent = text || '';
+  }
+
+  function setChatTurnApproval(turn, approval, sessionId, options) {
+    const body = turn?.querySelector?.('[data-home-chat-turn-text]');
+    if (!body) return;
+    body.textContent = '';
+
+    const title = document.createElement('div');
+    title.textContent = 'Approval required: ' + (approval.subject || 'action');
+    body.appendChild(title);
+
+    if (approval.reason) {
+      const reason = document.createElement('div');
+      reason.style.marginTop = '8px';
+      reason.textContent = approval.reason;
+      body.appendChild(reason);
+    }
+
+    const hint = document.createElement('div');
+    hint.style.marginTop = '8px';
+    hint.textContent = approval.approvalId
+      ? 'Approval ID: ' + approval.approvalId
+      : 'This approval is tied to the current paused session.';
+    body.appendChild(hint);
+
+    const actions = document.createElement('div');
+    actions.className = 'home-chat-turn-actions';
+
+    const approve = document.createElement('button');
+    approve.type = 'button';
+    approve.textContent = 'Approve';
+    approve.addEventListener('click', () => {
+      resumeHarnessApprovalFromButton(approve, 'approve', approval.approvalId, sessionId, turn, options);
+    });
+
+    const reject = document.createElement('button');
+    reject.type = 'button';
+    reject.textContent = 'Reject';
+    reject.addEventListener('click', () => {
+      resumeHarnessApprovalFromButton(reject, 'reject', approval.approvalId, sessionId, turn, options);
+    });
+
+    actions.appendChild(approve);
+    actions.appendChild(reject);
+    body.appendChild(actions);
+  }
+
+  async function resumeHarnessApprovalFromButton(button, decision, approvalId, sessionId, turn, options) {
+    const actions = button.closest('.home-chat-turn-actions');
+    const buttons = actions ? Array.from(actions.querySelectorAll('button')) : [button];
+    const send = document.querySelector('.home-chat-send');
+    buttons.forEach((btn) => { btn.disabled = true; });
+    if (send) { send.setAttribute('disabled', 'true'); send.textContent = 'THINKING …'; }
+    button.textContent = decision === 'approve' ? 'Approved' : 'Rejected';
+    turn?.classList?.add('pending');
+    setChatTurnStatus(turn, (decision === 'approve' ? 'approved' : 'rejected') + ' · continuing…');
+    try {
+      const input = decision + (approvalId ? ' ' + approvalId : '');
+      const r = await fetch(withToken('/api/harness/chat'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ input, sessionId }),
+      });
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        throw new Error(j.error || ('HTTP ' + r.status));
+      }
+      const body = await r.json();
+      __harnessSessionId = body.sessionId || sessionId;
+      await streamHarnessSession(__harnessSessionId, turn, { ...(options || {}), sinceSeq: body.sinceSeq || 0 });
+      homeChatHistory.push({ role: 'assistant', text: turn?.querySelector?.('[data-home-chat-turn-text]')?.textContent || '' });
+    } catch (err) {
+      buttons.forEach((btn) => { btn.disabled = false; });
+      button.textContent = decision === 'approve' ? 'Approve' : 'Reject';
+      setChatTurnStatus(turn, 'approval failed');
+      alert('Could not resolve approval: ' + ((err && err.message) || err));
+    } finally {
+      turn?.classList?.remove('pending');
+      if (send) { send.removeAttribute('disabled'); send.textContent = 'SEND ↵'; }
+    }
   }
 
   function setChatTurnStatus(turn, text) {
@@ -12721,6 +12943,7 @@ const CONSOLE_JS = `
     await Promise.allSettled([
       refreshHubKeys(),
       refreshHubApps(),
+      refreshHubGitHubCli(),
       refreshHubBrowserHarness(),
       refreshHubCliCatalog(),
       refreshHubRecall(),
@@ -12801,6 +13024,7 @@ const CONSOLE_JS = `
           '<button data-hub-composio-save>SAVE API KEY</button>',
           '<a href="https://platform.composio.dev" target="_blank" rel="noopener" style="font-size:10px;letter-spacing:0.14em;color:var(--fg-3);">get a key →</a>',
           renderComposioCliChip(status),
+          renderComposioCliActions(status),
         ].join('');
         listEl.innerHTML = '<div class="settings-info">— Composio not configured yet. Paste your API key above to start connecting apps. —</div>';
         metaEl.textContent = 'not configured';
@@ -12821,6 +13045,7 @@ const CONSOLE_JS = `
             } catch (err) { alert('Save failed: ' + (err.message || err)); }
           });
         }
+        bindComposioCliActions(controlsEl, listEl);
         return;
       }
 
@@ -12840,7 +13065,9 @@ const CONSOLE_JS = `
         '<button data-hub-composio-refresh>REFRESH ⟲</button>',
         renderComposioBackendSelect(status),
         renderComposioCliChip(status),
+        renderComposioCliActions(status),
       ].join('');
+      bindComposioCliActions(controlsEl, listEl);
       const filterEl = controlsEl.querySelector('[data-hub-app-filter]');
       if (filterEl) {
         filterEl.addEventListener('input', () => {
@@ -12995,6 +13222,62 @@ const CONSOLE_JS = `
     return '<span class="hub-app-pill ' + cls + '" title="' + escMem(title) + '">' + escMem(label) + '</span>';
   }
 
+  function renderComposioCliActions(status) {
+    const cli = status?.cli || {};
+    if (cli.installed !== true) return '<button data-hub-composio-cli-action="install">INSTALL CLI</button>';
+    if (cli.authenticated !== true) return '<button data-hub-composio-cli-action="auth">CLI LOGIN</button>';
+    return '<button data-hub-composio-cli-action="repair">REPAIR CLI AUTH</button>';
+  }
+
+  function bindComposioCliActions(controlsEl, listEl) {
+    controlsEl.querySelectorAll('[data-hub-composio-cli-action]').forEach((btn) => {
+      if (btn.dataset.bound) return;
+      btn.dataset.bound = '1';
+      btn.addEventListener('click', async () => {
+        const action = btn.getAttribute('data-hub-composio-cli-action') || 'auth';
+        if (action === 'install' && !confirm('Install the Composio universal CLI now?')) return;
+        btn.disabled = true;
+        btn.textContent = action === 'install' ? 'INSTALLING...' : 'STARTING...';
+        try {
+          await startManagedCliAction('composio', action, listEl, refreshHubApps);
+        } catch (err) {
+          alert('Composio CLI action failed: ' + (err.message || err));
+          await refreshHubApps();
+        }
+      });
+    });
+  }
+
+  async function pollManagedCliJob(jobId, targetEl, afterDone) {
+    if (!jobId || !targetEl) return;
+    let done = false;
+    for (let i = 0; i < 240 && !done; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, i === 0 ? 400 : 1500));
+      const data = await fetchJSON('/api/console/managed-cli-jobs/' + encodeURIComponent(jobId));
+      const job = data.job || {};
+      done = job.status !== 'running';
+      targetEl.innerHTML = [
+        '<div class="hub-app-card" style="grid-column:1/-1">',
+        '  <div class="hub-app-name">' + escMem(job.title || 'CLI job') + '</div>',
+        '  <span class="hub-app-pill ' + (job.status === 'succeeded' ? 'active' : job.status === 'failed' ? 'failed' : 'pending') + '">' + escMem(String(job.status || 'running').toUpperCase()) + '</span>',
+        '  <div class="hub-app-meta">Command: <code>' + escMem(job.command || '') + '</code></div>',
+        renderBrowserHarnessOutput(job),
+        '</div>',
+      ].join('');
+    }
+    if (done && afterDone) await afterDone();
+  }
+
+  async function startManagedCliAction(kind, action, targetEl, afterDone) {
+    const r = await fetch(withToken('/api/console/managed-clis/' + encodeURIComponent(kind) + '/' + encodeURIComponent(action)), {
+      method: 'POST',
+      headers: { Accept: 'application/json' },
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    await pollManagedCliJob(j.job?.id, targetEl, afterDone);
+  }
+
   function renderBrowserHarnessOutput(result) {
     if (!result) return '';
     const lines = [
@@ -13081,6 +13364,50 @@ const CONSOLE_JS = `
         runBtn.textContent = 'RUN INSTALL';
       }
     });
+  }
+
+  async function refreshHubGitHubCli() {
+    const el = document.querySelector('[data-hub-github-cli]');
+    if (!el) return;
+    try {
+      const data = await fetchJSON('/api/console/managed-clis');
+      const gh = data.github || {};
+      const installed = gh.installed === true;
+      const auth = gh.authenticated === true;
+      const pill = auth ? 'active' : installed ? 'failed' : 'available';
+      const pillText = auth ? 'AUTHENTICATED' : installed ? 'AUTH NEEDED' : 'NOT INSTALLED';
+      const actionButtons = installed
+        ? [
+            '<button data-hub-github-cli-action="auth">' + (auth ? 'LOGIN AGAIN' : 'LOGIN') + '</button>',
+            '<button data-hub-github-cli-action="repair">REPAIR TOKEN</button>',
+          ].join('')
+        : '<button data-hub-github-cli-action="install">INSTALL GH</button>';
+      el.innerHTML = [
+        '<div class="hub-app-card" style="grid-column:1/-1">',
+        '  <div class="hub-app-name">GitHub CLI</div>',
+        '  <span class="hub-app-pill ' + pill + '">' + pillText + '</span>',
+        '  <div class="hub-app-meta">' + escMem(gh.version || 'gh not found') + '</div>',
+        '  <div class="hub-app-meta">' + escMem(gh.authMessage || 'Used for private skill repos, PRs, issues, releases, and Actions.') + '</div>',
+        '  <div class="hub-app-card-actions">' + actionButtons + '</div>',
+        '</div>',
+      ].join('');
+      el.querySelectorAll('[data-hub-github-cli-action]').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          const action = btn.getAttribute('data-hub-github-cli-action') || 'auth';
+          if (action === 'install' && !confirm('Install GitHub CLI with Homebrew now?')) return;
+          btn.disabled = true;
+          btn.textContent = action === 'install' ? 'INSTALLING...' : 'STARTING...';
+          try {
+            await startManagedCliAction('github', action, el, refreshHubGitHubCli);
+          } catch (err) {
+            alert('GitHub CLI action failed: ' + (err.message || err));
+            await refreshHubGitHubCli();
+          }
+        });
+      });
+    } catch (err) {
+      el.innerHTML = '<div class="settings-info" style="color:var(--accent-fail);">GitHub CLI: ' + escMem(err.message || err) + '</div>';
+    }
   }
 
   async function refreshHubBrowserHarness() {
@@ -13910,6 +14237,7 @@ const CONSOLE_JS = `
 
       renderAuthInfo(s.auth);
       renderModelPicker(s.models);
+      renderRuntimeBudget(s.runtimeBudget);
       renderMemoryInfo(s.memory);
       await refreshPlanProposals();
       await refreshProposals();
@@ -14637,6 +14965,28 @@ const CONSOLE_JS = `
     }).join('') + '<p class="settings-note">Codex OAuth is the agent runtime auth. The OpenAI API key is a separate optional capability key for semantic embeddings, Realtime live voice, and direct API-only features.</p>';
   }
 
+  function renderRuntimeBudget(snapshot) {
+    if (!sett.runtimeForm || !sett.runtimeStatus || !snapshot) return;
+    const settings = snapshot.settings || {};
+    ['preset','maxConversationSteps','maxConversationWallMinutes','maxTurns','toolCallsPerTurn','checkInMinutes','autoContinueOnLimit'].forEach((key) => {
+      setFormValue(sett.runtimeForm, key, settings[key]);
+    });
+    const unlimited = settings.unlimited || settings.preset === 'unlimited';
+    const wall = Number(settings.maxConversationWallMinutes || 0) === 0 ? 'no wall-clock cutoff' : settings.maxConversationWallMinutes + ' min wall';
+    const rows = [
+      ['Mode', settings.preset || 'standard'],
+      ['SDK turns', settings.maxTurns ?? '—'],
+      ['Steps', settings.maxConversationSteps ?? '—'],
+      ['Wall clock', wall],
+      ['Tool calls / turn', settings.toolCallsPerTurn ?? '—'],
+      ['Check-ins', (settings.checkInMinutes ?? '—') + ' min'],
+    ].map(([k, v]) => '<div class="row"><span class="k">' + escMem(k) + '</span><span class="v ' + (unlimited && k === 'Mode' ? 'on' : '') + '">' + escMem(String(v)) + '</span></div>').join('');
+    sett.runtimeStatus.innerHTML = rows
+      + '<p class="settings-note">' + (unlimited
+        ? 'Unlimited supervised keeps running with no wall-clock cutoff, but approvals, kill switch, tool timeouts, and stuck-loop detection still apply. Running sessions appear on Home with CANCEL.'
+        : 'New turns use these budgets immediately. Long workflows should use Long or Unlimited Supervised so they do not end silently.') + '</p>';
+  }
+
   function renderMemoryInfo(m) {
     if (!m) { sett.memoryBox.textContent = '—'; return; }
     const rows = [
@@ -14719,6 +15069,48 @@ const CONSOLE_JS = `
       setTimeout(() => { btn.textContent = 'SAVE MODELS ✎'; }, 1400);
     }
   });
+
+  if (sett.runtimeForm) {
+    sett.runtimeForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const btn = sett.runtimeForm.querySelector('button[type="submit"]');
+      if (btn) btn.disabled = true;
+      try {
+        const patch = getRuntimeFormPatch(sett.runtimeForm);
+        const r = await fetch(withToken('/api/console/settings/runtime-budget'), {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(patch),
+        });
+        const j = await r.json().catch(() => ({}));
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = r.ok ? 'SAVED ✓' : 'FAILED';
+          setTimeout(() => { btn.textContent = 'SAVE RUNTIME ✎'; }, 1400);
+        }
+        if (r.ok) renderRuntimeBudget(j.runtimeBudget);
+        else if (sett.runtimeStatus) sett.runtimeStatus.innerHTML = '<div style="color:var(--accent-fail);">Failed to save runtime: ' + escMem(j.error || r.status) + '</div>';
+      } catch (err) {
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = 'FAILED';
+          setTimeout(() => { btn.textContent = 'SAVE RUNTIME ✎'; }, 1400);
+        }
+        if (sett.runtimeStatus) sett.runtimeStatus.innerHTML = '<div style="color:var(--accent-fail);">Failed to save runtime: ' + escMem(err.message || err) + '</div>';
+      }
+    });
+    sett.runtimeForm.querySelectorAll('[data-runtime-preset-apply]').forEach((button) => {
+      button.addEventListener('click', () => {
+        const preset = button.getAttribute('data-runtime-preset-apply') || 'long';
+        const select = sett.runtimeForm.querySelector('[name="preset"]');
+        if (select) select.value = preset;
+        const defaults = preset === 'unlimited'
+          ? { maxTurns: 500, maxConversationSteps: 1000000, maxConversationWallMinutes: 0, toolCallsPerTurn: 64, checkInMinutes: 3, autoContinueOnLimit: true }
+          : { maxTurns: 120, maxConversationSteps: 160, maxConversationWallMinutes: 480, toolCallsPerTurn: 32, checkInMinutes: 5, autoContinueOnLimit: true };
+        Object.entries(defaults).forEach(([key, value]) => setFormValue(sett.runtimeForm, key, value));
+      });
+    });
+  }
 
   if (sett.modelsReset) {
     sett.modelsReset.addEventListener('click', async () => {
@@ -15106,6 +15498,14 @@ const CONSOLE_JS = `
               title: surface + ' · ' + tool + ' returned',
               meta: resultPrev || contextMeta,
               eventType: 'tool_returned',
+            };
+          }
+          case 'heartbeat': {
+            return {
+              icon: '◌',
+              title: surface + ' still working',
+              meta: (data.message || data.summary || contextMeta || '').slice(0, 140),
+              eventType: 'heartbeat',
             };
           }
           case 'handoff': {

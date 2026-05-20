@@ -15,10 +15,11 @@ import {
   KillRequested,
   ToolCallsCounter,
   ToolCallsLimitExceeded,
-  DEFAULT_MAX_TURNS,
-  DEFAULT_TOOL_CALLS_PER_TURN,
+  maxTurnsForRole,
+  defaultToolCallsPerTurn,
   withHarnessRunContext,
 } from './brackets.js';
+import { getHarnessBudgetSettings } from './budget-settings.js';
 import { attachEventLogHooks, extractSessionIdFromContext, type RunHooksLike } from './hooks.js';
 import * as approvalRegistry from './approval-registry.js';
 import { actionBus } from '../action-bus.js';
@@ -65,6 +66,12 @@ function registerAndEmitApprovals(
 ): string[] {
   const approvalIds: string[] = [];
   const channel = session.sessionRow.channel ?? null;
+  const metadata = session.sessionRow.metadata ?? {};
+  const channelId = typeof metadata.channelId === 'string'
+    ? metadata.channelId
+    : typeof metadata.discordChannelId === 'string'
+      ? metadata.discordChannelId
+      : null;
   for (const interruption of interruptions) {
     const subject = extractApprovalSubject(interruption);
     let approvalId: string | null = null;
@@ -72,6 +79,7 @@ function registerAndEmitApprovals(
       const row = approvalRegistry.register({
         sessionId: options.sessionId,
         channel,
+        channelId,
         subject,
         tool: interruption.toolName,
         args: interruption.args ?? null,
@@ -329,9 +337,17 @@ export async function runConversation(
 async function runConversationCore(
   options: RunConversationOptions,
 ): Promise<RunConversationResult> {
-  const maxSteps = options.maxSteps ?? DEFAULT_MAX_CONVERSATION_STEPS;
-  const maxWallMs = options.maxWallClockMs ?? DEFAULT_MAX_CONVERSATION_WALL_MS;
+  const budget = getHarnessBudgetSettings();
+  let maxSteps = options.maxSteps ?? budget.maxConversationSteps;
+  if (options.maxSteps === undefined && budget.autoContinueOnLimit) {
+    maxSteps = Math.max(maxSteps, 1_000_000);
+  }
+  const maxWallMs = options.maxWallClockMs ?? budget.maxConversationWallMs;
+  const maxTurns = options.maxTurns ?? budget.maxTurns;
+  const toolCallsPerTurn = options.toolCallsPerTurn ?? budget.toolCallsPerTurn;
+  const checkInMs = Math.max(60_000, budget.checkInMinutes * 60 * 1000);
   const startedAt = Date.now();
+  let lastCheckInAt = startedAt;
 
   let stepIndex = 0;
   let nextInput = options.input;
@@ -345,8 +361,8 @@ async function runConversationCore(
       agent: options.agent,
       sessionId: options.sessionId,
       input: nextInput,
-      maxTurns: options.maxTurns,
-      toolCallsPerTurn: options.toolCallsPerTurn,
+      maxTurns,
+      toolCallsPerTurn,
       makeRunner: options.makeRunner,
       runRunner: options.runRunner,
     });
@@ -537,7 +553,25 @@ async function runConversationCore(
     }
 
     // Wall-clock check before we kick off another turn.
-    if (Date.now() - startedAt > maxWallMs) {
+    if (Date.now() - lastCheckInAt >= checkInMs) {
+      lastCheckInAt = Date.now();
+      safeAppend({
+        sessionId: options.sessionId,
+        turn: lastTurn,
+        role: 'system',
+        type: 'heartbeat',
+        data: {
+          kind: 'progress_check_in',
+          steps: stepIndex,
+          preset: budget.preset,
+          unlimited: budget.unlimited,
+          summary: lastDecision?.summary ?? null,
+          message: `Still working (${stepIndex} step${stepIndex === 1 ? '' : 's'} completed).`,
+        },
+      });
+    }
+
+    if (maxWallMs > 0 && Date.now() - startedAt > maxWallMs) {
       emitLimitExceededWithContinuePrompt({
         sessionId: options.sessionId,
         turn: turnResult.turn,
@@ -633,6 +667,39 @@ function emitLimitExceededWithContinuePrompt(opts: {
   });
 }
 
+async function withActiveTurnHeartbeat<T>(
+  opts: {
+    sessionId: string;
+    turn: number;
+    budget: ReturnType<typeof getHarnessBudgetSettings>;
+    checkInMs: number;
+    stage: 'turn' | 'approval_resume';
+  },
+  work: () => Promise<T>,
+): Promise<T> {
+  const timer = setInterval(() => {
+    safeAppend({
+      sessionId: opts.sessionId,
+      turn: opts.turn,
+      role: 'system',
+      type: 'heartbeat',
+      data: {
+        kind: 'active_turn_check_in',
+        stage: opts.stage,
+        preset: opts.budget.preset,
+        unlimited: opts.budget.unlimited,
+        message: `Still working inside turn ${opts.turn}.`,
+      },
+    });
+  }, opts.checkInMs);
+  timer.unref?.();
+  try {
+    return await work();
+  } finally {
+    clearInterval(timer);
+  }
+}
+
 function toOrchestratorDecision(value: unknown): OrchestratorDecisionShape | null {
   if (!value || typeof value !== 'object') return null;
   const v = value as Record<string, unknown>;
@@ -680,8 +747,10 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   session.recordUserInput(options.input, turn);
 
   const toolCounter = new ToolCallsCounter(
-    options.toolCallsPerTurn ?? DEFAULT_TOOL_CALLS_PER_TURN,
+    options.toolCallsPerTurn ?? defaultToolCallsPerTurn(),
   );
+  const heartbeatBudget = getHarnessBudgetSettings();
+  const heartbeatMs = Math.max(60_000, heartbeatBudget.checkInMinutes * 60 * 1000);
 
   const makeRunner =
     options.makeRunner ??
@@ -720,7 +789,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
 
   const opts: Record<string, unknown> = {
     context: { sessionId: options.sessionId, turn },
-    maxTurns: options.maxTurns ?? DEFAULT_MAX_TURNS.orchestrator,
+    maxTurns: options.maxTurns ?? maxTurnsForRole('orchestrator'),
   };
   // DO NOT pass previousResponseId to the SDK when using the codex
   // backend. The SDK uses this flag to opt into a ServerConversationTracker
@@ -740,12 +809,24 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     // wrapper inside the SDK's run() can read the per-turn counter +
     // sessionId without explicit threading. Pass-through when the
     // wrapper flag is off (no behavior change).
-    const outcome = useToolWrapper
-      ? await withHarnessRunContext(
-          { sessionId: options.sessionId, counter: toolCounter },
-          () => run(runner, options.agent, items, opts),
-        )
-      : await run(runner, options.agent, items, opts);
+    const outcome = await withActiveTurnHeartbeat(
+      {
+        sessionId: options.sessionId,
+        turn,
+        budget: heartbeatBudget,
+        checkInMs: heartbeatMs,
+        stage: 'turn',
+      },
+      async () => {
+        if (useToolWrapper) {
+          return await withHarnessRunContext(
+            { sessionId: options.sessionId, counter: toolCounter },
+            () => run(runner, options.agent, items, opts),
+          ) as RunOutcome;
+        }
+        return await run(runner, options.agent, items, opts);
+      },
+    );
 
     if (outcome.hasInterruptions && outcome.serializedState) {
       // The SDK pauses BEFORE invoking the tool's execute when
@@ -909,8 +990,10 @@ export async function resumePendingApproval(
   session.clearInterruptState();
 
   const toolCounter = new ToolCallsCounter(
-    options.toolCallsPerTurn ?? DEFAULT_TOOL_CALLS_PER_TURN,
+    options.toolCallsPerTurn ?? defaultToolCallsPerTurn(),
   );
+  const heartbeatBudget = getHarnessBudgetSettings();
+  const heartbeatMs = Math.max(60_000, heartbeatBudget.checkInMinutes * 60 * 1000);
   const makeRunner =
     options.makeRunner ??
     (() =>
@@ -938,7 +1021,7 @@ export async function resumePendingApproval(
 
   const opts: Record<string, unknown> = {
     context: { sessionId: options.sessionId, turn },
-    maxTurns: options.maxTurns ?? DEFAULT_MAX_TURNS.orchestrator,
+    maxTurns: options.maxTurns ?? maxTurnsForRole('orchestrator'),
   };
 
   try {
@@ -947,22 +1030,34 @@ export async function resumePendingApproval(
     // items — it picks up the conversation from exactly where the
     // interrupt fired. We thread it through the same defaultRunRunner
     // so streaming + completion semantics match runTurn().
-    const outcome = useToolWrapper
-      ? await withHarnessRunContext(
-          { sessionId: options.sessionId, counter: toolCounter },
-          () => run(
-            runner,
-            options.agent,
-            state as unknown as AgentInputItem[],
-            { ...opts, stream: true },
-          ),
-        )
-      : await run(
+    const outcome = await withActiveTurnHeartbeat(
+      {
+        sessionId: options.sessionId,
+        turn,
+        budget: heartbeatBudget,
+        checkInMs: heartbeatMs,
+        stage: 'approval_resume',
+      },
+      async () => {
+        if (useToolWrapper) {
+          return await withHarnessRunContext(
+            { sessionId: options.sessionId, counter: toolCounter },
+            () => run(
+              runner,
+              options.agent,
+              state as unknown as AgentInputItem[],
+              { ...opts, stream: true },
+            ),
+          ) as RunOutcome;
+        }
+        return await run(
           runner,
           options.agent,
           state as unknown as AgentInputItem[],
           { ...opts, stream: true },
         );
+      },
+    );
 
     if (outcome.hasInterruptions && outcome.serializedState) {
       // Same registry + emit pattern as runTurn; consolidated in
@@ -1061,9 +1156,17 @@ async function runConversationFromResumeCore(opts: {
   makeRunner?: () => Runner;
   runRunner?: RunRunnerFn;
 }): Promise<RunConversationResult> {
-  const maxSteps = opts.maxSteps ?? DEFAULT_MAX_CONVERSATION_STEPS;
-  const maxWallMs = opts.maxWallClockMs ?? DEFAULT_MAX_CONVERSATION_WALL_MS;
+  const budget = getHarnessBudgetSettings();
+  let maxSteps = opts.maxSteps ?? budget.maxConversationSteps;
+  if (opts.maxSteps === undefined && budget.autoContinueOnLimit) {
+    maxSteps = Math.max(maxSteps, 1_000_000);
+  }
+  const maxWallMs = opts.maxWallClockMs ?? budget.maxConversationWallMs;
+  const maxTurns = opts.maxTurns ?? budget.maxTurns;
+  const toolCallsPerTurn = opts.toolCallsPerTurn ?? budget.toolCallsPerTurn;
+  const checkInMs = Math.max(60_000, budget.checkInMinutes * 60 * 1000);
   const startedAt = Date.now();
+  let lastCheckInAt = startedAt;
 
   let lastDecision: OrchestratorDecisionShape | undefined;
   let lastTurn = 0;
@@ -1073,8 +1176,8 @@ async function runConversationFromResumeCore(opts: {
     agent: opts.agent,
     sessionId: opts.sessionId,
     decision: opts.decision,
-    maxTurns: opts.maxTurns,
-    toolCallsPerTurn: opts.toolCallsPerTurn,
+    maxTurns,
+    toolCallsPerTurn,
     makeRunner: opts.makeRunner,
     runRunner: opts.runRunner,
   });
@@ -1177,7 +1280,25 @@ async function runConversationFromResumeCore(opts: {
         lastTurn,
       };
     }
-    if (Date.now() - startedAt > maxWallMs) {
+    if (Date.now() - lastCheckInAt >= checkInMs) {
+      lastCheckInAt = Date.now();
+      safeAppend({
+        sessionId: opts.sessionId,
+        turn: lastTurn,
+        role: 'system',
+        type: 'heartbeat',
+        data: {
+          kind: 'progress_check_in',
+          steps: stepIndex,
+          preset: budget.preset,
+          unlimited: budget.unlimited,
+          summary: lastDecision?.summary ?? null,
+          message: `Still working (${stepIndex} step${stepIndex === 1 ? '' : 's'} completed).`,
+        },
+      });
+    }
+
+    if (maxWallMs > 0 && Date.now() - startedAt > maxWallMs) {
       safeAppend({
         sessionId: opts.sessionId,
         turn: lastTurn,
@@ -1199,8 +1320,8 @@ async function runConversationFromResumeCore(opts: {
       agent: opts.agent,
       sessionId: opts.sessionId,
       input: CONTINUATION_INPUT,
-      maxTurns: opts.maxTurns,
-      toolCallsPerTurn: opts.toolCallsPerTurn,
+      maxTurns,
+      toolCallsPerTurn,
       makeRunner: opts.makeRunner,
       runRunner: opts.runRunner,
     });

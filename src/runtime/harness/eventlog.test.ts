@@ -32,6 +32,7 @@ const {
   listSessions,
   appendEvent,
   listEvents,
+  getLatestEventSeq,
   requestKill,
   isKillRequested,
   clearKill,
@@ -129,6 +130,32 @@ test('listEvents filters by sinceSeq and types', () => {
   const onlyTools = listEvents(sess.id, { types: ['tool_called'] });
   assert.equal(onlyTools.length, 1);
   assert.equal(onlyTools[0].type, 'tool_called');
+});
+
+test('getLatestEventSeq returns the current replay cursor for a session', () => {
+  resetEventLog();
+  const first = createSession({ kind: 'chat' });
+  const second = createSession({ kind: 'chat' });
+  assert.equal(getLatestEventSeq(first.id), 0);
+
+  const e1 = appendEvent({
+    sessionId: first.id,
+    turn: 1,
+    role: 'o',
+    type: 'turn_started',
+    data: {},
+  });
+  appendEvent({ sessionId: second.id, turn: 1, role: 'o', type: 'heartbeat', data: {} });
+  const e2 = appendEvent({
+    sessionId: first.id,
+    turn: 1,
+    role: 'o',
+    type: 'tool_called',
+    data: {},
+  });
+
+  assert.ok(e2.seq > e1.seq);
+  assert.equal(getLatestEventSeq(first.id), e2.seq);
 });
 
 test('listSessions filters recent sessions without loading events', () => {

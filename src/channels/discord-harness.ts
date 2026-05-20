@@ -439,6 +439,36 @@ export function isChannelSessionAwaitingApproval(channelId: string): boolean {
   return !!sess && !!sess.loadInterruptState();
 }
 
+function isDiscordApproval(row: approvalRegistry.PendingApprovalRow): boolean {
+  return row.channel === 'discord' || row.channel === 'discord-dm';
+}
+
+function approvalBelongsToDiscordChannel(
+  row: approvalRegistry.PendingApprovalRow,
+  channelId: string,
+): boolean {
+  if (!isDiscordApproval(row)) return false;
+  if (!approvalRegistry.isActionable(row)) return false;
+  if (row.channelId) return row.channelId === channelId;
+
+  // Legacy rows created before channel_id was populated may still be
+  // valid, but only if they are the currently-hydrated paused session
+  // for this channel. This keeps pre-migration approvals usable
+  // without letting old approvals from another Discord thread bleed in.
+  const entry = getOrHydrateChannelSession(channelId);
+  return entry?.sessionId === row.sessionId;
+}
+
+function pendingDiscordApprovalsForChannel(channelId: string): approvalRegistry.PendingApprovalRow[] {
+  return approvalRegistry
+    .listPending({ status: 'pending' })
+    .filter((row) => approvalBelongsToDiscordChannel(row, channelId));
+}
+
+export const __test__ = {
+  approvalBelongsToDiscordChannel,
+};
+
 /**
  * Discord-channel-side approval router. Called BEFORE the v0.2
  * `handleDiscordRestCommand` / `handleDiscordCommand` paths so the
@@ -474,7 +504,12 @@ export async function tryHandleHarnessApprovalReply(opts: {
   if (intent.approvalId) {
     const row = approvalRegistry.get(intent.approvalId);
     if (row && row.status === 'pending') {
-      const canResumeInDiscord = row.channel === 'discord' || row.channel === 'discord-dm';
+      if (approvalRegistry.isExpired(row)) {
+        approvalRegistry.resolve(row.approvalId, 'expired', 'discord-user');
+        await opts.transport.sendError(`Approval \`${row.approvalId}\` has expired. Re-ask and I'll redo that work.`);
+        return true;
+      }
+      const canResumeInDiscord = approvalBelongsToDiscordChannel(row, opts.channelId);
       if (canResumeInDiscord && isChannelSessionAwaitingApproval(opts.channelId)) {
         await runDiscordHarnessResume({
           channelId: opts.channelId,
@@ -482,6 +517,11 @@ export async function tryHandleHarnessApprovalReply(opts: {
           approvalId: intent.approvalId,
           transport: opts.transport,
         });
+        return true;
+      }
+
+      if (isDiscordApproval(row)) {
+        await opts.transport.sendError(`Approval \`${row.approvalId}\` belongs to a different or stale Discord conversation.`);
         return true;
       }
 
@@ -957,17 +997,21 @@ async function runDiscordHarnessResume(opts: {
       await transport.sendError(`Approval \`${approvalId}\` was already ${row.status}${row.resolution ? ` (${row.resolution})` : ''}.`);
       return;
     }
-    if (row.channel && row.channel !== 'discord' && row.channel !== 'discord-dm') {
-      // Cross-channel approvals are intentionally blocked — the user
-      // should resolve from the channel where the approval originated.
-      await transport.sendError(`Approval \`${approvalId}\` belongs to a different channel.`);
+    if (approvalRegistry.isExpired(row)) {
+      approvalRegistry.resolve(row.approvalId, 'expired', 'discord-user');
+      await transport.sendError(`Approval \`${approvalId}\` has expired. Re-ask and I'll redo that work.`);
+      return;
+    }
+    if (!approvalBelongsToDiscordChannel(row, channelId)) {
+      // Cross-channel approvals are intentionally blocked for Discord
+      // sessions. Workflow approvals are resolved by
+      // tryHandleHarnessApprovalReply before this resume helper runs.
+      await transport.sendError(`Approval \`${approvalId}\` belongs to a different or stale Discord conversation.`);
       return;
     }
     sessionId = row.sessionId;
   } else {
-    const pendingOnChannel = approvalRegistry
-      .listPending({ status: 'pending' })
-      .filter((row) => row.channel === 'discord' || row.channel === 'discord-dm');
+    const pendingOnChannel = pendingDiscordApprovalsForChannel(channelId);
     const distinctSessions = [...new Set(pendingOnChannel.map((r) => r.sessionId))];
     const fallback = channelSessions.get(channelId);
     if (distinctSessions.length > 1) {

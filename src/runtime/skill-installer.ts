@@ -7,6 +7,7 @@ import {
   installSkillFromDir,
   type Skill,
 } from '../memory/skill-store.js';
+import { getGitHubCliStatus } from '../integrations/github-cli.js';
 
 /**
  * Skill installer — clones a public Git repo into a temp dir, scans
@@ -31,6 +32,7 @@ export interface SkillInstallJob {
   installed: Array<{ name: string; pathInRepo: string }>;
   error?: string;
   sha?: string;
+  cloneMethod?: 'git' | 'gh';
 }
 
 const jobs = new Map<string, SkillInstallJob>();
@@ -52,7 +54,7 @@ function appendOutput(job: SkillInstallJob, chunk: string): void {
  * Returns the normalized clone URL plus the inferred "repo basename"
  * (used as the default install name for single-SKILL.md repos).
  */
-export function normalizeRepoUrl(input: string): { url: string; basename: string } {
+export function normalizeRepoUrl(input: string): { url: string; basename: string; owner?: string; repo?: string } {
   const trimmed = (input || '').trim();
   if (!trimmed) throw new Error('Empty repo URL');
   if (trimmed.length > 400) throw new Error('Repo URL too long');
@@ -62,14 +64,14 @@ export function normalizeRepoUrl(input: string): { url: string; basename: string
   if (m) {
     const owner = m[1];
     const repo = m[2];
-    return { url: `https://github.com/${owner}/${repo}.git`, basename: repo };
+    return { url: `https://github.com/${owner}/${repo}.git`, basename: repo, owner, repo };
   }
   // git@github.com:owner/repo[.git]
   m = trimmed.match(/^git@github\.com:([a-zA-Z0-9_.-]+)\/([a-zA-Z0-9_.-]+?)(?:\.git)?\/?$/);
   if (m) {
     const owner = m[1];
     const repo = m[2];
-    return { url: `git@github.com:${owner}/${repo}.git`, basename: repo };
+    return { url: `git@github.com:${owner}/${repo}.git`, basename: repo, owner, repo };
   }
   throw new Error('Unsupported URL — paste a GitHub repo URL like https://github.com/owner/repo');
 }
@@ -118,7 +120,7 @@ async function readGitSha(cwd: string): Promise<string | undefined> {
  * work happens in the background. Poll via getSkillInstallJob(id).
  */
 export function startSkillInstall(rawUrl: string): SkillInstallJob {
-  const { url, basename } = normalizeRepoUrl(rawUrl);
+  const { url, basename, owner, repo } = normalizeRepoUrl(rawUrl);
   const id = newJobId();
   const job: SkillInstallJob = {
     id,
@@ -131,7 +133,7 @@ export function startSkillInstall(rawUrl: string): SkillInstallJob {
   };
   jobs.set(id, job);
 
-  void runInstall(job, url, basename).catch((err) => {
+  void runInstall(job, url, basename, owner && repo ? `${owner}/${repo}` : undefined).catch((err) => {
     job.status = 'failed';
     job.error = err instanceof Error ? err.message : String(err);
     job.completedAt = new Date().toISOString();
@@ -140,18 +142,30 @@ export function startSkillInstall(rawUrl: string): SkillInstallJob {
   return job;
 }
 
-async function runInstall(job: SkillInstallJob, url: string, basename: string): Promise<void> {
+async function runInstall(job: SkillInstallJob, url: string, basename: string, ghRepo?: string): Promise<void> {
   const tmpRoot = mkdtempSync(path.join(os.tmpdir(), 'clemmy-skill-install-'));
   try {
     job.status = 'cloning';
     appendOutput(job, `Cloning ${url} into ${tmpRoot}…\n`);
 
-    const cloneResult = await runGit(
-      ['clone', '--depth=1', '--single-branch', '--', url, '.'],
-      tmpRoot,
-      (s) => appendOutput(job, s),
-      60_000,
-    );
+    let cloneResult: { code: number };
+    const ghStatus = ghRepo ? await getGitHubCliStatus().catch(() => null) : null;
+    if (ghRepo && ghStatus?.installed && ghStatus.authenticated) {
+      job.cloneMethod = 'gh';
+      appendOutput(job, `Using authenticated GitHub CLI for ${ghRepo} (private repos supported).\n`);
+      cloneResult = await runGitHubClone(ghStatus.path || 'gh', ghRepo, tmpRoot, (s) => appendOutput(job, s), 90_000);
+    } else {
+      job.cloneMethod = 'git';
+      if (ghRepo && ghStatus?.installed && !ghStatus.authenticated) {
+        appendOutput(job, `GitHub CLI is installed but not authenticated; falling back to public git clone. Private repos need GitHub CLI login in Integrations.\n`);
+      }
+      cloneResult = await runGit(
+        ['clone', '--depth=1', '--single-branch', '--', url, '.'],
+        tmpRoot,
+        (s) => appendOutput(job, s),
+        60_000,
+      );
+    }
     if (cloneResult.code !== 0) {
       job.status = 'failed';
       job.error = `git clone exited with code ${cloneResult.code}`;
@@ -203,6 +217,38 @@ async function runInstall(job: SkillInstallJob, url: string, basename: string): 
     // Always clean up the temp clone, even on failure.
     try { rmSync(tmpRoot, { recursive: true, force: true }); } catch { /* noop */ }
   }
+}
+
+function runGitHubClone(binary: string, repo: string, cwd: string, onChunk: (s: string) => void, timeoutMs: number): Promise<{ code: number }> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const child = spawn(binary, ['repo', 'clone', repo, '.', '--', '--depth=1', '--single-branch'], {
+      cwd,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    child.stdout.on('data', (b: Buffer) => onChunk(b.toString('utf-8')));
+    child.stderr.on('data', (b: Buffer) => onChunk(b.toString('utf-8')));
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try { child.kill('SIGKILL'); } catch (_) { /* noop */ }
+      onChunk(`\n[gh repo clone timed out after ${timeoutMs}ms]\n`);
+      resolve({ code: 124 });
+    }, timeoutMs);
+    child.on('error', (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      onChunk(`\n[gh spawn error: ${err.message}]\n`);
+      resolve({ code: -1 });
+    });
+    child.on('close', (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ code: code ?? -1 });
+    });
+  });
 }
 
 export function getSkillInstallJob(id: string): SkillInstallJob | undefined {

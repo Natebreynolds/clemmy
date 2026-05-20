@@ -565,6 +565,13 @@ export function listEvents(sessionId: string, options: ListEventsOptions = {}): 
   return rows.map(rowToEvent);
 }
 
+export function getLatestEventSeq(sessionId: string): number {
+  const db = openEventLog();
+  const row = db.prepare('SELECT COALESCE(MAX(seq), 0) AS seq FROM events WHERE session_id = ?')
+    .get(sessionId) as { seq: number } | undefined;
+  return Number.isFinite(row?.seq) ? row!.seq : 0;
+}
+
 export function getEvent(eventId: string): EventRow | null {
   const db = openEventLog();
   const row = db.prepare('SELECT * FROM events WHERE id = ?').get(eventId) as

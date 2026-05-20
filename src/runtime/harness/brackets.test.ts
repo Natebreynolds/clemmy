@@ -179,6 +179,7 @@ test('DEFAULT_MAX_TURNS exposes the roles the orchestrator hands off to', () => 
   for (const role of ['planner', 'verifier', 'researcher', 'writer', 'reviewer', 'executor', 'orchestrator', 'session']) {
     assert.ok(typeof DEFAULT_MAX_TURNS[role] === 'number', `missing role ${role}`);
   }
+  assert.equal(DEFAULT_MAX_TURNS.orchestrator, 40);
   assert.equal(DEFAULT_TOOL_CALLS_PER_TURN, 16);
 });
 

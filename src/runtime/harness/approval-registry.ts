@@ -53,6 +53,15 @@ export interface PendingApprovalRow {
 
 export const DEFAULT_APPROVAL_TTL_MS = 24 * 60 * 60 * 1000;
 
+export function isExpired(row: Pick<PendingApprovalRow, 'expiresAt'>, now: Date = new Date()): boolean {
+  const expiresAt = Date.parse(row.expiresAt);
+  return Number.isFinite(expiresAt) && expiresAt < now.getTime();
+}
+
+export function isActionable(row: PendingApprovalRow, now: Date = new Date()): boolean {
+  return row.status === 'pending' && !isExpired(row, now);
+}
+
 export interface RegisterApprovalInput {
   sessionId: string;
   channel?: string | null;

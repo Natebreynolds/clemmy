@@ -65,6 +65,7 @@ test('classifyTool: workspace_config list is read, add/remove are admin', () => 
 test('classifyTool: read prefixes', () => {
   assert.equal(classifyTool('get_tasks'), 'read');
   assert.equal(classifyTool('list_files'), 'read');
+  assert.equal(classifyTool('workspace_info'), 'read');
   assert.equal(classifyTool('search_memory'), 'read');
   assert.equal(classifyTool('ping'), 'read');
   assert.equal(classifyTool('recall'), 'read');
@@ -111,10 +112,13 @@ test('classifyTool: MCP-namespaced names classify by underlying tool', () => {
   assert.equal(classifyTool('filesystem__write_file'), 'write');
   assert.equal(classifyTool('hostinger-mcp__list_domains'), 'read');
   assert.equal(classifyTool('github__get_pull_request'), 'read');
-  // Vendor-specific names that don't match a known prefix fall to the
-  // conservative default — that's by design. The trust gradient takes
-  // care of the friction (yolo auto-approves, strict prompts).
-  assert.equal(classifyTool('dataforseo__serp_organic_live_advanced'), 'write');
+  // DataForSEO tool names are domain verbs rather than CRUD verbs, but
+  // the MCP server is read-only SEO data lookup surface.
+  assert.equal(classifyTool('dataforseo__serp_organic_live_advanced'), 'read');
+  assert.equal(classifyTool('dataforseo-mcp-server__serp_organic_live_advanced'), 'read');
+  // Unknown vendors with no known read verb still fall to the
+  // conservative default.
+  assert.equal(classifyTool('unknownvendor__serp_organic_live_advanced'), 'write');
 });
 
 test('classifyTool: unknown names default to write (conservative)', () => {
@@ -126,10 +130,12 @@ test('classifyTool: unknown names default to write (conservative)', () => {
 test('decideToolApproval: read is auto in every scope', () => {
   for (const scope of ['strict', 'workspace', 'yolo'] as const) {
     setScope(scope);
-    const { needsApproval, kind, reason } = decideToolApproval({ toolName: 'list_files' });
-    assert.equal(needsApproval, false, `${scope}: read should auto`);
-    assert.equal(kind, 'read');
-    assert.equal(reason, 'read-always-auto');
+    for (const toolName of ['list_files', 'workspace_info', 'dataforseo__serp_organic_live_advanced']) {
+      const { needsApproval, kind, reason } = decideToolApproval({ toolName });
+      assert.equal(needsApproval, false, `${scope}: ${toolName} should auto`);
+      assert.equal(kind, 'read');
+      assert.equal(reason, 'read-always-auto');
+    }
   }
 });
 

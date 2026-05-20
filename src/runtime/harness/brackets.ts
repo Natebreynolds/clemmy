@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { isKillRequested } from './eventlog.js';
+import { getHarnessBudgetSettings } from './budget-settings.js';
 
 /**
  * Reliability brackets — the safety primitives the harness loop weaves
@@ -259,9 +260,18 @@ export const DEFAULT_MAX_TURNS: Readonly<Record<string, number>> = Object.freeze
   reviewer: 6,
   executor: 6,
   deployer: 6,
-  orchestrator: 12,
+  // Long-running desktop workflows can legitimately need many
+  // model/tool cycles inside one SDK run before the outer 40-step
+  // harness loop gets a chance to continue. Keep the real runaway
+  // brakes at the conversation wall-clock, step budget, and tool cap.
+  orchestrator: 40,
   session: 60,
 });
+
+export function maxTurnsForRole(role: keyof typeof DEFAULT_MAX_TURNS): number {
+  if (role === 'orchestrator') return getHarnessBudgetSettings().maxTurns;
+  return DEFAULT_MAX_TURNS[role];
+}
 
 /**
  * Default per-turn tool-call cap.
@@ -276,6 +286,10 @@ export const DEFAULT_MAX_TURNS: Readonly<Record<string, number>> = Object.freeze
  * aggressive per-turn count limit to do that.
  */
 export const DEFAULT_TOOL_CALLS_PER_TURN = 16;
+
+export function defaultToolCallsPerTurn(): number {
+  return getHarnessBudgetSettings().toolCallsPerTurn;
+}
 
 /** Default token budget. 200k input / 80k output mirrors the plan. */
 export const DEFAULT_TOKEN_BUDGET: Readonly<TokenBudgetCounts> = Object.freeze({

@@ -41,10 +41,13 @@ import {
   getNotificationDestinationsForRecord,
   getNotification,
   listQueuedNotificationDeliveries,
+  markNotificationRead,
   replaceQueuedNotificationDeliveries,
   updateNotificationDeliveryStatus,
+  type NotificationRecord,
 } from '../runtime/notifications.js';
 import { deliverNotificationToDestination } from '../runtime/notification-delivery.js';
+import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 
 const logger = pino({ name: 'clementine-next.daemon' });
 const STATE_FILE = path.join(path.dirname(CRON_RUNS_DIR), 'daemon-state.json');
@@ -517,6 +520,17 @@ function emitNoDestinationsPromptIfNeeded(deferredCount: number): void {
   });
 }
 
+function staleApprovalNotificationReason(notification: NotificationRecord): string | null {
+  if (notification.kind !== 'approval') return null;
+  const approvalId = notification.metadata?.approvalId;
+  if (typeof approvalId !== 'string' || approvalId.length === 0) return null;
+  const approval = approvalRegistry.get(approvalId);
+  if (!approval) return 'approval_not_found';
+  if (approvalRegistry.isExpired(approval)) return 'approval_expired';
+  if (approval.status !== 'pending') return `approval_${approval.status}`;
+  return null;
+}
+
 async function processNotificationDeliveries(): Promise<void> {
   const queue = listQueuedNotificationDeliveries();
   if (queue.length === 0) return;
@@ -526,6 +540,21 @@ async function processNotificationDeliveries(): Promise<void> {
   for (const job of queue) {
     const notification = getNotification(job.notificationId);
     if (!notification) {
+      continue;
+    }
+
+    const staleApprovalReason = staleApprovalNotificationReason(notification);
+    if (staleApprovalReason) {
+      markNotificationRead(notification.id);
+      updateNotificationDeliveryStatus(notification.id, {
+        deliveredAt: notification.deliveredAt,
+        deliveryError: `Skipped stale approval notification: ${staleApprovalReason}`,
+      });
+      logger.info({
+        notificationId: notification.id,
+        approvalId: notification.metadata?.approvalId,
+        reason: staleApprovalReason,
+      }, 'Skipped stale approval notification delivery');
       continue;
     }
 

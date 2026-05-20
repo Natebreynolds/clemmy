@@ -19,6 +19,8 @@ import {
   normalizeModelId,
   type ModelTier,
 } from '../config.js';
+import { getComposioRuntimeStatus } from '../integrations/composio/client.js';
+import { getGitHubCliStatus } from '../integrations/github-cli.js';
 import { recallHybrid } from '../memory/recall.js';
 import { FACT_KINDS, forgetFact, listActiveFacts, listAllFacts, rememberFact } from '../memory/facts.js';
 import { openMemoryDb } from '../memory/db.js';
@@ -48,6 +50,7 @@ import {
   startApprovedInstallCommand,
   startBrowserHarnessInstall,
 } from '../integrations/browser-harness.js';
+import { getManagedCliJob, startManagedCliJob, type ManagedCliAction, type ManagedCliKind } from '../runtime/managed-cli-jobs.js';
 import { discoverMcpServers, loadUserMcpServers, saveUserMcpServers } from '../runtime/mcp-config.js';
 import { invalidateConfiguredMcpServers } from '../runtime/mcp-servers.js';
 import { clearAutonomyAgentCache } from '../agents/autonomy-v2.js';
@@ -103,7 +106,9 @@ import { actionBus, type ActionEvent } from '../runtime/action-bus.js';
 import {
   appendEvent as appendHarnessEvent,
   createSession as createHarnessSession,
+  getLatestEventSeq as getLatestHarnessEventSeq,
   getSession as getHarnessSession,
+  requestKill as requestHarnessKill,
   listEvents as listHarnessEvents,
   listSessions as listHarnessSessions,
   summarizeSessionForSignal,
@@ -112,6 +117,7 @@ import {
 } from '../runtime/harness/eventlog.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { runConversation, runConversationFromResume } from '../runtime/harness/loop.js';
+import { getHarnessBudgetSnapshot, saveHarnessBudgetSettings } from '../runtime/harness/budget-settings.js';
 import { HarnessSession } from '../runtime/harness/session.js';
 import { parseApprovalIntent, parseHarnessCommand } from '../channels/discord-harness.js';
 import { buildOrchestratorAgent } from '../agents/orchestrator.js';
@@ -221,6 +227,7 @@ const CONSOLE_HARNESS_REPLAY_TYPES = new Set<HarnessEventRow['type']>([
   'turn_started',
   'tool_called',
   'tool_returned',
+  'heartbeat',
   'handoff',
   'approval_requested',
   'approval_resolved',
@@ -238,10 +245,14 @@ function isDiscordHarnessSession(session: HarnessSessionRow): boolean {
 }
 
 function isConsoleVisibleHarnessSession(session: HarnessSessionRow): boolean {
-  return isDiscordHarnessSession(session)
+  return session.kind === 'chat'
     || session.kind === 'workflow'
+    || session.status === 'active'
+    || session.status === 'paused'
+    || isDiscordHarnessSession(session)
     || session.channel === 'workflow'
-    || session.metadata.source === 'workflow';
+    || session.metadata.source === 'workflow'
+    || session.metadata.source === 'desktop';
 }
 
 function harnessSessionSourceLabel(session: HarnessSessionRow): string {
@@ -1979,7 +1990,8 @@ export function registerConsoleRoutes(
       const auth = getAuthStatus();
       const memory = readMemoryIndexStatus();
       const models = getModelSettingsSnapshot();
-      res.json({ profile, proactivity, auth, memory, models });
+      const runtimeBudget = getHarnessBudgetSnapshot();
+      res.json({ profile, proactivity, auth, memory, models, runtimeBudget });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -2148,6 +2160,56 @@ export function registerConsoleRoutes(
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
+  });
+
+  app.patch('/api/console/settings/runtime-budget', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const settings = saveHarnessBudgetSettings(req.body ?? {});
+      clearAutonomyAgentCache();
+      res.json({ runtimeBudget: { ...getHarnessBudgetSnapshot(), settings } });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.get('/api/console/managed-clis', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const [composio, github] = await Promise.all([
+        getComposioRuntimeStatus(),
+        getGitHubCliStatus(),
+      ]);
+      res.json({ composio, github });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/managed-clis/:kind/:action', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const kind = req.params.kind as ManagedCliKind;
+    const action = req.params.action as ManagedCliAction;
+    if (kind !== 'composio' && kind !== 'github') {
+      res.status(400).json({ error: 'kind must be composio or github' });
+      return;
+    }
+    if (action !== 'install' && action !== 'auth' && action !== 'repair') {
+      res.status(400).json({ error: 'action must be install, auth, or repair' });
+      return;
+    }
+    try {
+      res.json({ job: startManagedCliJob(kind, action) });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.get('/api/console/managed-cli-jobs/:id', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const job = getManagedCliJob(req.params.id);
+    if (!job) { res.status(404).json({ error: 'job not found' }); return; }
+    res.json({ job });
   });
 
   // ─── Optional Recall.ai desktop meeting capture ───────────────────
@@ -2719,14 +2781,15 @@ export function registerConsoleRoutes(
     }
   });
 
-  app.post('/api/console/harness-approvals/:id/:decision', (req, res) => {
+  app.post('/api/console/harness-approvals/:id/:decision', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const id = req.params.id;
-    const decision = req.params.decision;
-    if (decision !== 'approve' && decision !== 'reject') {
+    const decisionParam = req.params.decision;
+    if (decisionParam !== 'approve' && decisionParam !== 'reject') {
       res.status(400).json({ error: 'decision must be approve or reject' });
       return;
     }
+    const decision: 'approve' | 'reject' = decisionParam;
     const existing = approvalRegistry.get(id);
     if (!existing) {
       res.status(404).json({ error: 'approval not found' });
@@ -2736,19 +2799,74 @@ export function registerConsoleRoutes(
       res.status(409).json({ error: 'approval already resolved', approval: existing });
       return;
     }
-    const result = approvalRegistry.resolve(
-      id,
-      decision === 'approve' ? 'approved' : 'rejected',
-      'desktop-user',
-    );
+
+    const harnessSession = HarnessSession.load(existing.sessionId);
+    const shouldResume = !!harnessSession?.loadInterruptState();
+    if (!shouldResume) {
+      const result = approvalRegistry.resolve(
+        id,
+        decision === 'approve' ? 'approved' : 'rejected',
+        'desktop-command-center',
+      );
+      if (!result.ok) {
+        res.status(409).json({ error: result.reason ?? 'could not resolve approval', approval: result.row });
+        return;
+      }
+      res.json({
+        ok: true,
+        approval: result.row,
+        message: `Approval ${decision === 'approve' ? 'approved' : 'rejected'}: ${id}`,
+        status: 'resolved-stale',
+      });
+      return;
+    }
+
+    const auth = await configureHarnessRuntime();
+    if (!auth.ok) { res.status(412).json({ error: auth.reason }); return; }
+
+    const sessionId = existing.sessionId;
+    const resolution = decision === 'approve' ? 'approved' : 'rejected';
+    const result = approvalRegistry.resolve(id, resolution, 'desktop-command-center');
     if (!result.ok) {
       res.status(409).json({ error: result.reason ?? 'could not resolve approval', approval: result.row });
       return;
     }
-    res.json({
+
+    res.status(202).json({
       ok: true,
       approval: result.row,
+      sessionId,
+      streamUrl: `/api/sessions/${sessionId}/events`,
+      status: 'resuming',
       message: `Approval ${decision === 'approve' ? 'approved' : 'rejected'}: ${id}`,
+    });
+
+    setImmediate(async () => {
+      try {
+        const agent = await buildOrchestratorAgent();
+        await runConversationFromResume({
+          agent,
+          sessionId,
+          decision,
+        });
+        const pending = approvalRegistry.listPending({ sessionId, status: 'pending' });
+        for (const row of pending) {
+          approvalRegistry.resolve(row.approvalId, resolution, 'desktop-command-center');
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        try {
+          appendHarnessEvent({
+            sessionId,
+            turn: 0,
+            role: 'system',
+            type: 'run_failed',
+            data: { error: message, stage: 'approval_resume' },
+          });
+        } catch {
+          // best effort
+        }
+      }
     });
   });
 
@@ -2778,7 +2896,6 @@ export function registerConsoleRoutes(
       const activeHarnessSessions = recentHarnessSessions.filter((session) =>
         session.status === 'active' || session.status === 'paused',
       );
-      const activeDiscordHarnessSessions = activeHarnessSessions.filter(isDiscordHarnessSession);
 
       const needsYou = [
         ...approvals.slice(0, 6).map((approval) => ({
@@ -2864,11 +2981,13 @@ export function registerConsoleRoutes(
           meta: run.channel || run.source || run.id,
           panel: 'activity',
         })),
-        ...activeDiscordHarnessSessions.slice(0, 6).map((session) => ({
-          kind: 'discord',
-          title: session.title || session.objective || 'Discord conversation',
+        ...activeHarnessSessions.slice(0, 8).map((session) => ({
+          kind: isDiscordHarnessSession(session) ? 'discord' : session.kind,
+          title: session.title || session.objective || (isDiscordHarnessSession(session) ? 'Discord conversation' : 'Harness run'),
           meta: `${harnessSessionSourceLabel(session)} · ${session.status} · ${session.updatedAt.slice(11, 16)}`,
           panel: 'activity',
+          actionKind: 'harness-session',
+          sessionId: session.id,
         })),
       ].slice(0, 10).map((item) => ({ ...item, title: trimConsoleTitle(item.title, 140), meta: trimConsoleTitle(item.meta || '', 100) }));
 
@@ -2885,10 +3004,10 @@ export function registerConsoleRoutes(
           meta: run.completedAt ? `done ${run.completedAt.slice(11, 16)}` : run.id,
           panel: 'activity',
         })),
-        ...recentHarnessSessions.filter((session) => session.status === 'completed' && isDiscordHarnessSession(session)).slice(0, 5).map((session) => ({
+        ...recentHarnessSessions.filter((session) => session.status === 'completed').slice(0, 5).map((session) => ({
           kind: 'done',
-          title: session.title || session.objective || 'Discord conversation',
-          meta: `Discord done ${session.updatedAt.slice(11, 16)}`,
+          title: session.title || session.objective || 'Harness conversation',
+          meta: `${harnessSessionSourceLabel(session)} done ${session.updatedAt.slice(11, 16)}`,
           panel: 'activity',
         })),
       ].slice(0, 6).map((item) => ({ ...item, title: trimConsoleTitle(item.title, 120), meta: trimConsoleTitle(item.meta || '', 100) }));
@@ -2920,7 +3039,7 @@ export function registerConsoleRoutes(
         memory.activeFacts === 0 ? 'no durable facts yet' : '',
       ].filter(Boolean);
 
-      const activeCount = executions.length + activeBackgroundTasks.length + pendingWorkflowRuns.length + activeDiscordHarnessSessions.length + runs.filter((run) => run.status === 'running' || run.status === 'received' || run.status === 'queued').length;
+      const activeCount = executions.length + activeBackgroundTasks.length + pendingWorkflowRuns.length + activeHarnessSessions.length + runs.filter((run) => run.status === 'running' || run.status === 'received' || run.status === 'queued').length;
       const waitingCount = needsYou.length;
       const currentObjective = workingNow[0]?.title
         ?? needsYou[0]?.title
@@ -3309,6 +3428,41 @@ export function registerConsoleRoutes(
     res.on('error', cleanup);
   });
 
+  app.post('/api/console/harness-sessions/:sessionId/cancel', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const sessionId = req.params.sessionId;
+    const session = getHarnessSession(sessionId);
+    if (!session) { res.status(404).json({ error: 'session not found' }); return; }
+    try {
+      requestHarnessKill(sessionId, 'cancelled from desktop command center');
+      const harnessSession = HarnessSession.load(sessionId);
+      const { listPending: listPendingApprovals, resolve: resolveApproval } =
+        await import('../runtime/harness/approval-registry.js');
+      const pending = listPendingApprovals({ sessionId, status: 'pending' });
+      for (const row of pending) {
+        resolveApproval(row.approvalId, 'cancelled_by_user', 'desktop-command-center');
+      }
+      try {
+        harnessSession?.clearInterruptState();
+        harnessSession?.markStatus('cancelled');
+      } catch { /* best effort */ }
+      appendHarnessEvent({
+        sessionId,
+        turn: 0,
+        role: 'system',
+        type: 'conversation_completed',
+        data: {
+          summary: 'Cancelled from the desktop command center.',
+          reason: 'cancelled_by_user',
+          approvalsCancelled: pending.length,
+        },
+      });
+      res.json({ ok: true, sessionId, cancelledApprovals: pending.length });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   /**
    * Background-mode harness chat handler.
    *
@@ -3362,6 +3516,7 @@ export function registerConsoleRoutes(
     const command = parseHarnessCommand(input);
     if (command === 'cancel') {
       const harnessSessionForCancel = HarnessSession.load(sessionId);
+      const sinceSeq = getLatestHarnessEventSeq(sessionId);
       const { listPending: listPendingApprovals, resolve: resolveApproval } =
         await import('../runtime/harness/approval-registry.js');
       const pending = listPendingApprovals({ sessionId, status: 'pending' });
@@ -3390,7 +3545,7 @@ export function registerConsoleRoutes(
           },
         });
       } catch { /* best effort */ }
-      res.status(202).json({ sessionId, streamUrl, status: 'cancelled', mode: 'command' });
+      res.status(202).json({ sessionId, streamUrl, status: 'cancelled', mode: 'command', sinceSeq });
       return;
     }
     if (command === 'new') {
@@ -3398,6 +3553,7 @@ export function registerConsoleRoutes(
       // a hint to start a fresh session on the next message. Confirm
       // and return; the next POST without sessionId creates a new one.
       const { appendEvent } = await import('../runtime/harness/eventlog.js');
+      const sinceSeq = getLatestHarnessEventSeq(sessionId);
       try {
         appendEvent({
           sessionId,
@@ -3410,7 +3566,7 @@ export function registerConsoleRoutes(
           },
         });
       } catch { /* best effort */ }
-      res.status(202).json({ sessionId, streamUrl, status: 'new-pending', mode: 'command' });
+      res.status(202).json({ sessionId, streamUrl, status: 'new-pending', mode: 'command', sinceSeq });
       return;
     }
 
@@ -3444,12 +3600,14 @@ export function registerConsoleRoutes(
     const harnessSession = HarnessSession.load(sessionId);
     const isPausedOnApproval = !!harnessSession && !!harnessSession.loadInterruptState();
     const intent = isPausedOnApproval ? parseApprovalIntent(input) : null;
+    const sinceSeq = getLatestHarnessEventSeq(sessionId);
 
     res.status(202).json({
       sessionId,
       streamUrl,
       status: intent ? 'resuming' : 'started',
       mode: intent ? `approval-${intent.decision}` : 'fresh',
+      sinceSeq,
     });
 
     setImmediate(async () => {

@@ -116,6 +116,30 @@ const NEVER_GATE_LOCAL_MEMORY = new Set<string>([
 ]);
 
 /**
+ * Explicit read-only tools whose names do not carry a reliable lookup
+ * verb. `workspace_info` was falling through to the conservative write
+ * default, which made the desktop ask for approval before merely
+ * inspecting a local project. Keep this exact-name list small and
+ * intentional.
+ */
+const ALWAYS_READ = new Set<string>([
+  'workspace_roots',
+  'workspace_list',
+  'workspace_info',
+  'git_status',
+  'session_history',
+  'skill_list',
+  'skill_read',
+  'composio_status',
+  'composio_search_tools',
+  'composio_list_tools',
+  'mcp_status',
+  'mcp_list_tools',
+  'local_cli_probe',
+  'ping',
+]);
+
+/**
  * Tool-name prefixes/needles. Order matters: we test admin first
  * (highest gate), then send (network mutation), execute (subprocess),
  * write (local mutation), read (lookup).
@@ -236,6 +260,17 @@ function classifyComposioSlug(slug: string): ToolKind {
 /** Public — used by every tool family's `needsApproval` factory. */
 export function classifyTool(name: string, options: ClassifyOptions = {}): ToolKind {
   if (options.kindHint) return options.kindHint;
+
+  if (ALWAYS_READ.has(name)) return 'read';
+
+  // DataForSEO MCP endpoints are read-only SEO data lookups. They do
+  // hit an external service, but they do not mutate third-party state.
+  // Treating every `dataforseo__*` call as "write" caused SEO audits to
+  // stop for approval on every lookup.
+  const rawLower = name.toLowerCase();
+  if (rawLower.startsWith('dataforseo__') || rawLower.startsWith('dataforseo-mcp-server__')) {
+    return 'read';
+  }
 
   // workspace_config is mixed-mode: listing is a read, while adding or
   // removing workspace roots changes Clementine's trust boundary.
