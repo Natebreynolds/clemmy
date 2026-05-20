@@ -7520,6 +7520,28 @@ const CONSOLE_JS = `
         sub.style.cursor = 'pointer';
         sub.title = 'Restart Clementine to install v' + (info.version || '');
         sub.onclick = () => applyFromChip(' · restarting…');
+      } else if (info.installBlocker === 'move-to-applications') {
+        suffix = ' · move to Applications for updates';
+        sub.style.cursor = 'pointer';
+        sub.title = info.error || 'Move Clementine to /Applications to enable auto-updates';
+        sub.onclick = async () => {
+          const prevText = sub.textContent;
+          sub.textContent = baseLabel + ' · moving to Applications…';
+          sub.style.pointerEvents = 'none';
+          try {
+            const result = await window.clemmy?.updaterMoveToApplications?.();
+            const moveResult = result && result.moveResult;
+            if (moveResult && moveResult.ok === false) {
+              sub.textContent = prevText;
+              alert('Move failed: ' + (moveResult.reason || 'unknown reason'));
+            }
+          } catch (err) {
+            sub.textContent = prevText;
+            alert('Move failed: ' + ((err && err.message) || err));
+          } finally {
+            sub.style.pointerEvents = '';
+          }
+        };
       } else if (info.state === 'error') {
         suffix = ' · update check failed';
         sub.style.cursor = 'pointer';

@@ -24,6 +24,7 @@ import {
   disposeAutoUpdater,
   getUpdaterStatus,
   initAutoUpdater,
+  moveAppToApplicationsFolder,
   onUpdaterStatusChange,
 } from './updater.js';
 import {
@@ -286,6 +287,9 @@ function buildUpdaterMenuItems(): Electron.MenuItemConstructorOptions[] {
     label = 'Checking for updates…';
     enabled = false;
     click = undefined;
+  } else if (u.installBlocker === 'move-to-applications') {
+    label = 'Move to Applications to enable updates';
+    click = () => { moveAppToApplicationsFolder(); };
   } else if (u.state === 'available') {
     label = `Download update v${u.version || ''}`;
     click = () => { applyUpdate(); };
@@ -538,6 +542,11 @@ ipcMain.handle('clemmy:updater-check', async () => {
 ipcMain.handle('clemmy:updater-apply', () => {
   const result = applyUpdate();
   return { ...getUpdaterStatus(), applyResult: result };
+});
+
+ipcMain.handle('clemmy:updater-move-to-applications', () => {
+  const result = moveAppToApplicationsFolder();
+  return { ...getUpdaterStatus(), moveResult: result };
 });
 
 function sendUpdaterEvent(status: ReturnType<typeof getUpdaterStatus>): void {

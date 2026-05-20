@@ -51,6 +51,8 @@ const api = {
   updaterCheck: () => ipcRenderer.invoke('clemmy:updater-check') as Promise<Record<string, unknown>>,
   /** Download an available update, or quit+install once it is ready. */
   updaterApply: () => ipcRenderer.invoke('clemmy:updater-apply') as Promise<Record<string, unknown>>,
+  /** Move the packaged app to /Applications so macOS auto-updates can apply. */
+  updaterMoveToApplications: () => ipcRenderer.invoke('clemmy:updater-move-to-applications') as Promise<Record<string, unknown>>,
   onUpdaterEvent: (cb: (event: Record<string, unknown>) => void) => {
     const handler = (_event: unknown, payload: Record<string, unknown>) => cb(payload);
     ipcRenderer.on('clemmy:updater-event', handler);

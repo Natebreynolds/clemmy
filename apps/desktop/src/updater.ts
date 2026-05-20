@@ -18,7 +18,7 @@
  * still register the handlers so future packaging changes don't break
  * the integration surface, but the periodic check is skipped.
  */
-import { app, Notification } from 'electron';
+import { app, dialog, Notification } from 'electron';
 import electronUpdater, { type UpdateInfo } from 'electron-updater';
 import path from 'node:path';
 
@@ -29,6 +29,8 @@ const { autoUpdater } = electronUpdater;
 import { appendFileSync, existsSync, mkdirSync } from 'node:fs';
 
 const CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4 hours
+const MOVE_TO_APPLICATIONS_MESSAGE =
+  'Clementine is running from a read-only or translocated location. Move Clementine to /Applications to enable auto-updates.';
 
 export interface UpdaterStatus {
   /** Highest-level state — what to show in the tray. */
@@ -48,6 +50,10 @@ export interface UpdaterStatus {
   progressPct?: number;
   /** Most recent error message, if state === 'error'. */
   error?: string;
+  /** Actionable install-location issue that prevents auto-update apply. */
+  installBlocker?: 'move-to-applications';
+  /** Current app executable path, useful for diagnostics. */
+  appPath?: string;
   /** Last successful check timestamp (ISO). */
   lastCheckedAt?: string;
 }
@@ -58,7 +64,7 @@ let periodicHandle: NodeJS.Timeout | null = null;
 let downloadInFlight = false;
 
 function updateStatus(next: Partial<UpdaterStatus>): void {
-  status = { ...status, ...next };
+  status = { ...status, ...next, ...getInstallBlockerStatus() };
   for (const listener of onStatusChangeListeners) {
     try {
       listener(status);
@@ -69,7 +75,7 @@ function updateStatus(next: Partial<UpdaterStatus>): void {
 }
 
 export function getUpdaterStatus(): UpdaterStatus {
-  return { ...status };
+  return { ...status, ...getInstallBlockerStatus() };
 }
 
 export function onUpdaterStatusChange(listener: (status: UpdaterStatus) => void): () => void {
@@ -86,6 +92,15 @@ export function onUpdaterStatusChange(listener: (status: UpdaterStatus) => void)
 export async function checkForUpdatesNow(): Promise<UpdaterStatus> {
   if (!app.isPackaged) {
     updateStatus({ state: 'no-update', error: 'Updates are only checked in the packaged Clementine.app' });
+    return getUpdaterStatus();
+  }
+  const blocker = getInstallBlockerStatus();
+  if (blocker.installBlocker) {
+    updateStatus({
+      state: 'error',
+      error: MOVE_TO_APPLICATIONS_MESSAGE,
+      ...blocker,
+    });
     return getUpdaterStatus();
   }
   try {
@@ -111,11 +126,30 @@ export async function checkForUpdatesNow(): Promise<UpdaterStatus> {
  * install', so the in-app banner click "did nothing" with no signal
  * to the user — observed in production on v0.3.0.
  */
-export function applyUpdate(): { ok: boolean; action?: 'download-started' | 'downloading' | 'installing'; reason?: string } {
+export function applyUpdate(): {
+  ok: boolean;
+  action?: 'download-started' | 'downloading' | 'installing' | 'move-required';
+  reason?: string;
+  installBlocker?: UpdaterStatus['installBlocker'];
+} {
   if (!app.isPackaged) {
     return {
       ok: false,
       reason: 'Updates can only be applied from the packaged Clementine.app.',
+    };
+  }
+  const blocker = getInstallBlockerStatus();
+  if (blocker.installBlocker) {
+    updateStatus({
+      state: 'error',
+      error: MOVE_TO_APPLICATIONS_MESSAGE,
+      ...blocker,
+    });
+    return {
+      ok: false,
+      action: 'move-required',
+      reason: MOVE_TO_APPLICATIONS_MESSAGE,
+      installBlocker: blocker.installBlocker,
     };
   }
 
@@ -162,6 +196,60 @@ export function applyUpdate(): { ok: boolean; action?: 'download-started' | 'dow
     return { ok: true, action: 'installing' };
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
+    return { ok: false, reason };
+  }
+}
+
+export function moveAppToApplicationsFolder(): { ok: boolean; action?: 'already-installed' | 'moving'; reason?: string } {
+  if (process.platform !== 'darwin') {
+    return { ok: false, reason: 'Moving to /Applications is only available on macOS.' };
+  }
+  if (!app.isPackaged) {
+    return { ok: false, reason: 'Only the packaged Clementine.app can be moved to /Applications.' };
+  }
+  if (app.isInApplicationsFolder()) {
+    updateStatus({ state: status.state, error: undefined, installBlocker: undefined });
+    return { ok: true, action: 'already-installed' };
+  }
+
+  const choice = dialog.showMessageBoxSync({
+    type: 'question',
+    buttons: ['Move to Applications', 'Cancel'],
+    defaultId: 0,
+    cancelId: 1,
+    noLink: true,
+    title: 'Move Clementine to Applications?',
+    message: 'Move Clementine to /Applications?',
+    detail: 'macOS is running this copy from a read-only or translocated location, so auto-update cannot replace it. Clementine will relaunch after the move.',
+  });
+  if (choice !== 0) {
+    return { ok: false, reason: 'Move canceled.' };
+  }
+
+  try {
+    const moved = app.moveToApplicationsFolder({
+      conflictHandler: (conflictType) => {
+        const conflictChoice = dialog.showMessageBoxSync({
+          type: 'question',
+          buttons: ['Replace Existing App', 'Cancel'],
+          defaultId: 0,
+          cancelId: 1,
+          noLink: true,
+          title: 'Replace existing Clementine?',
+          message: 'Clementine already exists in /Applications.',
+          detail: conflictType === 'existsAndRunning'
+            ? 'The existing app is already running. Continue to switch to that copy.'
+            : 'Replace the existing copy so future auto-updates can install correctly.',
+        });
+        return conflictChoice === 0;
+      },
+    });
+    return moved
+      ? { ok: true, action: 'moving' }
+      : { ok: false, reason: 'Move canceled or blocked by macOS.' };
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    updateStatus({ state: 'error', error: reason, ...getInstallBlockerStatus() });
     return { ok: false, reason };
   }
 }
@@ -268,6 +356,16 @@ export function initAutoUpdater(opts: { logFile: string }): void {
   // disabled" errors.
   if (app.isPackaged) {
     log('info', 'auto-updater armed');
+    const blocker = getInstallBlockerStatus();
+    if (blocker.installBlocker) {
+      log('warn', MOVE_TO_APPLICATIONS_MESSAGE, blocker);
+      updateStatus({
+        state: 'error',
+        error: MOVE_TO_APPLICATIONS_MESSAGE,
+        ...blocker,
+      });
+      return;
+    }
     autoUpdater.checkForUpdates().catch(() => { /* logged above */ });
     periodicHandle = setInterval(() => {
       autoUpdater.checkForUpdates().catch(() => { /* logged above */ });
@@ -295,5 +393,15 @@ function ensureLogDir(logFile: string): void {
     } catch {
       // best-effort
     }
+  }
+}
+
+function getInstallBlockerStatus(): Pick<UpdaterStatus, 'installBlocker' | 'appPath'> {
+  if (process.platform !== 'darwin' || !app.isPackaged) return {};
+  try {
+    if (app.isInApplicationsFolder()) return { installBlocker: undefined, appPath: process.execPath };
+    return { installBlocker: 'move-to-applications', appPath: process.execPath };
+  } catch {
+    return { installBlocker: undefined, appPath: process.execPath };
   }
 }

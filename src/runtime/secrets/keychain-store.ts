@@ -1,4 +1,6 @@
 import pino from 'pino';
+import { createRequire } from 'node:module';
+import path from 'node:path';
 import type { SecretBackend, SecretName } from './types.js';
 import { KEYCHAIN_SERVICE, keychainAccount } from './registry.js';
 
@@ -24,6 +26,7 @@ import { KEYCHAIN_SERVICE, keychainAccount } from './registry.js';
  */
 
 const logger = pino({ name: 'clementine-next.secrets.keychain' });
+const requireFromHere = createRequire(import.meta.url);
 
 interface KeytarModule {
   getPassword(service: string, account: string): Promise<string | null>;
@@ -58,12 +61,9 @@ async function loadKeytar(): Promise<KeytarModule | null> {
     const resourcesPath = process.env.CLEMENTINE_RESOURCES_PATH;
     if (resourcesPath) {
       try {
-        // eslint-disable-next-line @typescript-eslint/no-require-imports
-        const path = require('node:path') as typeof import('node:path');
         const explicit = path.join(resourcesPath, 'app.asar.unpacked', 'node_modules', 'keytar');
         // Use require() so node-gyp's binary loads via the .node-style binding path.
-        // eslint-disable-next-line @typescript-eslint/no-require-imports
-        const mod = require(explicit) as KeytarModule | { default: KeytarModule };
+        const mod = requireFromHere(explicit) as KeytarModule | { default: KeytarModule };
         return ('getPassword' in (mod as object))
           ? (mod as KeytarModule)
           : (mod as { default: KeytarModule }).default;

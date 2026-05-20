@@ -56,6 +56,42 @@ test('registry: KEYCHAIN_SERVICE is the stable v1 name (NEVER change)', () => {
   assert.equal(KEYCHAIN_SERVICE, 'com.clemmy.desktop.v1');
 });
 
+test('keychain backend: resolves bundled keytar from Electron resources path', async () => {
+  const oldResourcesPath = process.env.CLEMENTINE_RESOURCES_PATH;
+  const resourcesPath = path.join(TEST_HOME, 'fake-electron-resources');
+  const keytarDir = path.join(resourcesPath, 'app.asar.unpacked', 'node_modules', 'keytar');
+  rmSync(resourcesPath, { recursive: true, force: true });
+  mkdirSync(keytarDir, { recursive: true });
+  writeFileSync(path.join(keytarDir, 'index.js'), [
+    'const entries = new Map();',
+    'module.exports = {',
+    '  async getPassword(service, account) { return entries.get(`${service}:${account}`) ?? null; },',
+    '  async setPassword(service, account, password) { entries.set(`${service}:${account}`, password); },',
+    '  async deletePassword(service, account) { return entries.delete(`${service}:${account}`); },',
+    '  async findCredentials(service) {',
+    '    return [...entries.entries()]',
+    '      .filter(([key]) => key.startsWith(`${service}:`))',
+    '      .map(([key, password]) => ({ account: key.slice(service.length + 1), password }));',
+    '  },',
+    '};',
+    '',
+  ].join('\n'));
+
+  process.env.CLEMENTINE_RESOURCES_PATH = resourcesPath;
+  const { KeychainSecretBackend, probeKeychain, resetKeychainProbe } = await import('./keychain-store.js');
+  resetKeychainProbe();
+  try {
+    assert.equal(await probeKeychain(), true);
+    const backend = new KeychainSecretBackend();
+    await backend.set('openai_api_key', 'sk-from-bundled-keytar');
+    assert.equal(await backend.get('openai_api_key'), 'sk-from-bundled-keytar');
+  } finally {
+    resetKeychainProbe();
+    if (oldResourcesPath === undefined) delete process.env.CLEMENTINE_RESOURCES_PATH;
+    else process.env.CLEMENTINE_RESOURCES_PATH = oldResourcesPath;
+  }
+});
+
 // ─── Env backend ─────────────────────────────────────────────────
 
 test('env backend: reads from process.env', async () => {
