@@ -126,6 +126,23 @@ function writeRunRecord(filePath: string, record: QueuedRunRecord): void {
   writeFileSync(filePath, JSON.stringify(record, null, 2), 'utf-8');
 }
 
+class WorkflowRunCancelledError extends Error {
+  constructor() {
+    super('Workflow run cancelled by user.');
+    this.name = 'WorkflowRunCancelledError';
+  }
+}
+
+function isWorkflowRunCancelled(runId: string): boolean {
+  const filePath = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+  const record = readRunRecord(filePath);
+  return record?.status === 'cancelled';
+}
+
+function throwIfWorkflowRunCancelled(runId: string): void {
+  if (isWorkflowRunCancelled(runId)) throw new WorkflowRunCancelledError();
+}
+
 /**
  * Cheap template renderer. Supports:
  *   {{date}}                  → today (UTC date)
@@ -685,6 +702,7 @@ async function executeWorkflow(
     : workflow.steps;
 
   for (const step of steps) {
+    throwIfWorkflowRunCancelled(runId);
     if (stepOutputs[step.id] !== undefined) {
       // Already completed in a prior pass — use the cached output.
       continue;
@@ -693,6 +711,7 @@ async function executeWorkflow(
     const output = await executeStep(step, {
       workflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems, forEachFailures,
     });
+    throwIfWorkflowRunCancelled(runId);
     stepOutputs[step.id] = output;
   }
 
@@ -701,6 +720,7 @@ async function executeWorkflow(
   // output is the user-facing result.
   let finalOutput: string;
   if (workflow.synthesis?.prompt && !targetStepId) {
+    throwIfWorkflowRunCancelled(runId);
     appendWorkflowEvent(workflowSlug, runId, {
       kind: 'step_started',
       stepId: '__synthesis__',
@@ -717,6 +737,7 @@ async function executeWorkflow(
       maxWallClockMs: WORKFLOW_SYNTHESIS_WALL_CLOCK_MS,
     });
     finalOutput = response.text;
+    throwIfWorkflowRunCancelled(runId);
     appendWorkflowEvent(workflowSlug, runId, {
       kind: 'step_completed',
       stepId: '__synthesis__',
@@ -798,6 +819,7 @@ export async function processWorkflowRuns(assistant: ClementineAssistant): Promi
     const stopHeartbeat = startWorkflowHeartbeat(workflow.data.name, run.id, Date.now());
     try {
       const { finalOutput, forEachFailures } = await executeWorkflow(workflow.data, workflow.name, run.id, inputs, assistant, run.targetStepId);
+      throwIfWorkflowRunCancelled(run.id);
       const resume = computeResumeState(workflow.name, run.id);
       const stepOutputs = stringifyOutputs(Object.fromEntries(resume.completedSteps));
       appendWorkflowEvent(workflow.name, run.id, { kind: 'run_completed' });
@@ -839,22 +861,23 @@ export async function processWorkflowRuns(assistant: ClementineAssistant): Promi
       logger.info({ workflow: workflow.data.name, runId: run.id, partialFailures: forEachFailures.length }, 'Workflow run completed');
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      logger.error({ err: error, file }, 'Workflow run failed');
-      appendWorkflowEvent(workflow.name, run.id, { kind: 'run_failed', error: message });
+      const cancelled = error instanceof WorkflowRunCancelledError || isWorkflowRunCancelled(run.id);
+      logger[cancelled ? 'info' : 'error']({ err: error, file }, cancelled ? 'Workflow run cancelled' : 'Workflow run failed');
+      appendWorkflowEvent(workflow.name, run.id, { kind: cancelled ? 'run_cancelled' : 'run_failed', error: message });
       writeRunRecord(filePath, {
         ...run,
-        status: 'error',
+        status: cancelled ? 'cancelled' : 'error',
         finishedAt: new Date().toISOString(),
         error: message,
       });
       addNotification({
-        id: `${Date.now()}-workflow-${run.id}-error`,
+        id: `${Date.now()}-workflow-${run.id}-${cancelled ? 'cancelled' : 'error'}`,
         kind: 'workflow',
-        title: `Workflow failed: ${run.workflow}`,
+        title: cancelled ? `Workflow cancelled: ${run.workflow}` : `Workflow failed: ${run.workflow}`,
         body: message,
         createdAt: new Date().toISOString(),
         read: false,
-        metadata: { workflow: run.workflow, runId: run.id, status: 'error' },
+        metadata: { workflow: run.workflow, runId: run.id, status: cancelled ? 'cancelled' : 'error' },
       });
     } finally {
       stopHeartbeat();

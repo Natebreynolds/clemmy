@@ -1,6 +1,7 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import { WORKFLOWS_DIR } from '../memory/vault.js';
+import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
 
 /**
  * Append-only event log per workflow run — the durability layer.
@@ -37,6 +38,7 @@ export type WorkflowEventKind =
   | 'run_started'         // workflow run kicked off
   | 'run_completed'       // workflow finished successfully
   | 'run_failed'          // workflow halted with an error
+  | 'run_cancelled'       // workflow was abandoned by the user/operator
   | 'run_paused'          // explicit pause (approval gate, user pause)
   | 'run_resumed'         // resumed after pause / daemon restart
   | 'step_started'        // single-shot or container step started
@@ -195,7 +197,7 @@ export function computeResumeState(workflowName: string, runId: string): ResumeS
 
   for (const ev of events) {
     lastEventAt = ev.t;
-    if (ev.kind === 'run_completed' || ev.kind === 'run_failed') {
+    if (ev.kind === 'run_completed' || ev.kind === 'run_failed' || ev.kind === 'run_cancelled') {
       terminal = true;
     }
     if (ev.kind === 'step_started' && ev.stepId) {
@@ -231,6 +233,19 @@ export interface PendingRun {
   inFlightStepId?: string;
 }
 
+const TERMINAL_RUN_RECORD_STATUSES = new Set(['completed', 'error', 'cancelled', 'dry_run']);
+
+function terminalRunRecordStatus(runId: string): boolean {
+  const file = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+  if (!existsSync(file)) return false;
+  try {
+    const raw = JSON.parse(readFileSync(file, 'utf-8')) as { status?: unknown };
+    return typeof raw.status === 'string' && TERMINAL_RUN_RECORD_STATUSES.has(raw.status);
+  } catch {
+    return false;
+  }
+}
+
 export function listPendingRuns(): PendingRun[] {
   if (!existsSync(WORKFLOWS_DIR)) return [];
   const pending: PendingRun[] = [];
@@ -242,6 +257,7 @@ export function listPendingRuns(): PendingRun[] {
       if (!existsSync(evFile)) continue;
       const state = computeResumeState(workflowDir, runId);
       if (state.terminal) continue;
+      if (terminalRunRecordStatus(runId)) continue;
       pending.push({
         workflowName: workflowDir,
         runId,

@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { BASE_DIR } from '../../config.js';
 import { VAULT_DIR } from '../../memory/vault.js';
@@ -102,8 +102,8 @@ function safeId(value: string): string {
   return value.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 120) || `recall-${randomBytes(4).toString('hex')}`;
 }
 
-function recordPath(windowId: string): string {
-  return path.join(RECORDS_DIR, `${safeId(windowId)}.json`);
+function recordPath(recordKey: string): string {
+  return path.join(RECORDS_DIR, `${safeId(recordKey)}.json`);
 }
 
 function nowIso(): string {
@@ -210,18 +210,35 @@ export async function createRecallSdkUpload(input: RecallUploadInput = {}): Prom
   return { id: payload.id, uploadToken, apiUrl };
 }
 
-function loadMeetingRecord(windowId: string): RecallMeetingRecord | null {
-  const filePath = recordPath(windowId);
+function readMeetingRecordFile(filePath: string): RecallMeetingRecord | null {
   if (!existsSync(filePath)) return null;
-  try {
-    return JSON.parse(readFileSync(filePath, 'utf-8')) as RecallMeetingRecord;
-  } catch {
-    return null;
+  try { return JSON.parse(readFileSync(filePath, 'utf-8')) as RecallMeetingRecord; }
+  catch { return null; }
+}
+
+function loadMeetingRecord(windowId: string, recordingId?: string): RecallMeetingRecord | null {
+  if (recordingId) {
+    const byRecording = readMeetingRecordFile(recordPath(recordingId));
+    if (byRecording) return byRecording;
   }
+  return readMeetingRecordFile(recordPath(windowId));
 }
 
 function saveMeetingRecord(record: RecallMeetingRecord): RecallMeetingRecord {
-  writeJsonAtomic(recordPath(record.windowId), record);
+  const targetPath = recordPath(record.recordingId || record.windowId);
+  writeJsonAtomic(targetPath, record);
+  if (record.recordingId) {
+    const placeholderPath = recordPath(record.windowId);
+    if (placeholderPath !== targetPath) {
+      const placeholder = readMeetingRecordFile(placeholderPath);
+      if (placeholder && (
+        placeholder.id === record.id ||
+        (placeholder.status === 'detected' && (placeholder.segments?.length ?? 0) === 0)
+      )) {
+        try { unlinkSync(placeholderPath); } catch { /* best-effort placeholder cleanup */ }
+      }
+    }
+  }
   return record;
 }
 
@@ -232,7 +249,7 @@ export function noteRecallMeetingDetected(input: {
   title?: string;
   status?: RecallMeetingRecord['status'];
 }): RecallMeetingRecord {
-  const existing = loadMeetingRecord(input.windowId);
+  const existing = loadMeetingRecord(input.windowId, input.recordingId);
   const record: RecallMeetingRecord = {
     id: existing?.id ?? `recall-${Date.now().toString(36)}-${randomBytes(3).toString('hex')}`,
     windowId: input.windowId,

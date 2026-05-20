@@ -4669,7 +4669,7 @@ body {
 .wf-runs-list { margin: 0; padding: 0; list-style: none; }
 .wf-run {
   display: grid;
-  grid-template-columns: 90px 1fr auto auto;
+  grid-template-columns: 90px 1fr auto auto auto;
   gap: 10px;
   padding: 6px 0;
   border-bottom: 1px dotted var(--line);
@@ -4691,9 +4691,22 @@ body {
 .wf-run-status.status-error,
 .wf-run-status.status-failed    { color: var(--accent-fail); border-color: var(--accent-fail); }
 .wf-run-status.status-dry_run   { color: var(--fg-mute); border-color: var(--fg-mute); }
+.wf-run-status.status-cancelled { color: var(--fg-mute); border-color: var(--fg-mute); }
 .wf-run-id { font-family: var(--mono); color: var(--fg-3); font-size: 10px; }
 .wf-run-time { font-family: var(--mono); color: var(--fg-3); font-size: 10px; }
 .wf-run-inputs { font-family: var(--mono); color: var(--fg-mute); font-size: 10px; }
+.wf-run-action {
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--fg-2);
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  padding: 3px 6px;
+  cursor: pointer;
+}
+.wf-run-action:hover { border-color: var(--accent-fail); color: var(--accent-fail); }
+.wf-run-action[disabled] { opacity: 0.45; cursor: wait; }
 
 /* Run inputs modal */
 .wf-run-modal-backdrop {
@@ -7616,11 +7629,20 @@ const CONSOLE_JS = `
     }
     return items.map((item) => {
       const hasApproval = item.approvalId && item.approvalKind;
+      const hasWorkflowRun = item.actionKind === 'workflow-run' && item.workflowName && item.runId;
       const approvalActions = hasApproval
         ? [
             '<div class="home-item-actions">',
             '  <button type="button" data-home-approval-action="approve" data-home-approval-kind="' + escMem(item.approvalKind) + '" data-home-approval-id="' + escMem(item.approvalId) + '">APPROVE</button>',
-            '  <button type="button" data-home-approval-action="reject" data-home-approval-kind="' + escMem(item.approvalKind) + '" data-home-approval-id="' + escMem(item.approvalId) + '">REJECT</button>',
+            '  <button type="button" data-home-approval-action="reject" data-home-approval-kind="' + escMem(item.approvalKind) + '" data-home-approval-id="' + escMem(item.approvalId) + '">CANCEL</button>',
+            '</div>',
+          ].join('')
+        : '';
+      const workflowActions = hasWorkflowRun
+        ? [
+            '<div class="home-item-actions">',
+            '  <button type="button" data-home-workflow-action="open" data-home-workflow-name="' + escMem(item.workflowName) + '" data-home-workflow-run-id="' + escMem(item.runId) + '">OPEN</button>',
+            '  <button type="button" data-home-workflow-action="cancel" data-home-workflow-name="' + escMem(item.workflowName) + '" data-home-workflow-run-id="' + escMem(item.runId) + '">CANCEL</button>',
             '</div>',
           ].join('')
         : '';
@@ -7631,6 +7653,7 @@ const CONSOLE_JS = `
       '    <div class="home-item-text">' + escMem(item.title || '') + '</div>',
       item.meta ? '    <div class="home-item-meta">' + escMem(item.meta) + '</div>' : '',
       approvalActions,
+      workflowActions,
       '  </div>',
       '</div>',
     ].join('');
@@ -7646,7 +7669,7 @@ const CONSOLE_JS = `
     const buttons = row ? Array.from(row.querySelectorAll('[data-home-approval-action]')) : [button];
     buttons.forEach((btn) => { btn.disabled = true; });
     const original = button.textContent;
-    button.textContent = action === 'approve' ? 'APPROVING' : 'REJECTING';
+    button.textContent = action === 'approve' ? 'APPROVING' : 'CANCELLING';
     const endpoint = kind === 'harness'
       ? '/api/console/harness-approvals/' + encodeURIComponent(id) + '/' + action
       : '/api/approvals/' + encodeURIComponent(id) + '/' + action;
@@ -7660,8 +7683,61 @@ const CONSOLE_JS = `
       try { await tick(); } catch (_) {}
     } catch (err) {
       buttons.forEach((btn) => { btn.disabled = false; });
-      button.textContent = original || action.toUpperCase();
+      button.textContent = original || (action === 'reject' ? 'CANCEL' : action.toUpperCase());
       alert('Could not resolve approval: ' + ((err && err.message) || err));
+    }
+  }
+
+  function openHomeWorkflowRun(workflowName, runId) {
+    if (!workflowName) return;
+    location.hash = 'workflows/' + encodeURIComponent(workflowName);
+    switchPanel('workflows');
+    setTimeout(() => {
+      try {
+        selectWorkflowByName(workflowName);
+        if (runId) startActiveRunPolling(runId);
+      } catch (err) {
+        console.warn('workflow open failed', err);
+      }
+    }, 250);
+  }
+
+  async function handleHomeWorkflowButton(button) {
+    const action = button.getAttribute('data-home-workflow-action');
+    const workflowName = button.getAttribute('data-home-workflow-name') || '';
+    const runId = button.getAttribute('data-home-workflow-run-id') || '';
+    if (!workflowName || !runId) return;
+    if (action === 'open') {
+      openHomeWorkflowRun(workflowName, runId);
+      return;
+    }
+    if (action !== 'cancel') return;
+    const row = button.closest('.home-item');
+    const buttons = row ? Array.from(row.querySelectorAll('[data-home-workflow-action]')) : [button];
+    buttons.forEach((btn) => { btn.disabled = true; });
+    const original = button.textContent;
+    button.textContent = 'CANCELLING';
+    try {
+      const endpoint = '/api/console/workflows/' + encodeURIComponent(workflowName)
+        + '/runs/' + encodeURIComponent(runId) + '/cancel';
+      const r = await fetch(withToken(endpoint), {
+        method: 'POST',
+        headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reason: 'Cancelled from the desktop command center.' }),
+      });
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        throw new Error(j.error || ('HTTP ' + r.status));
+      }
+      if (wfSelectedName === workflowName) {
+        try { await refreshWorkflowRuns(); } catch (_) {}
+      }
+      await refreshHomeCommandCenter();
+      try { await tick(); } catch (_) {}
+    } catch (err) {
+      buttons.forEach((btn) => { btn.disabled = false; });
+      button.textContent = original || 'CANCEL';
+      alert('Could not cancel workflow run: ' + ((err && err.message) || err));
     }
   }
 
@@ -8008,6 +8084,13 @@ const CONSOLE_JS = `
       event.preventDefault();
       event.stopPropagation();
       resolveHomeApprovalButton(approvalButton);
+      return;
+    }
+    const workflowButton = target.closest('[data-home-workflow-action]');
+    if (workflowButton) {
+      event.preventDefault();
+      event.stopPropagation();
+      handleHomeWorkflowButton(workflowButton);
       return;
     }
     const jump = target.closest('[data-tools-jump]');
@@ -10208,7 +10291,9 @@ const CONSOLE_JS = `
           wfActiveRunLastEventAt = ev.t;
         }
         // Stop polling once the run reaches a terminal kind.
-        const terminal = events.some((ev) => ev.kind === 'run_completed' || ev.kind === 'run_failed');
+        const terminal = events.some((ev) =>
+          ev.kind === 'run_completed' || ev.kind === 'run_failed' || ev.kind === 'run_cancelled',
+        );
         if (terminal) stopActiveRunPolling();
       } catch {
         // Network blip — keep polling. We'll exit when the run hits
@@ -10444,6 +10529,7 @@ const CONSOLE_JS = `
              const status = (r.status || 'unknown').toString();
              const when = (r.createdAt || '').slice(11, 19);
              const day = (r.createdAt || '').slice(0, 10);
+             const canCancel = status === 'queued' || status === 'running';
              const inputs = r.inputs && Object.keys(r.inputs).length > 0
                ? Object.entries(r.inputs).map(([k, v]) => k + '=' + String(v).slice(0, 30)).join(' · ')
                : '';
@@ -10453,11 +10539,41 @@ const CONSOLE_JS = `
                '  <span class="wf-run-id">' + escMem(r.id) + '</span>',
                '  <span class="wf-run-time">' + escMem(day + ' ' + when) + '</span>',
                inputs ? '  <span class="wf-run-inputs">' + escMem(inputs) + '</span>' : '',
+               canCancel ? '  <button type="button" class="wf-run-action" data-wf-run-cancel="' + escMem(r.id) + '">CANCEL</button>' : '',
                '</li>',
              ].join('');
            }).join(''),
         '</ol>',
       ].join('');
+      Array.from(slot.querySelectorAll('[data-wf-run-cancel]')).forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          if (!wfSelectedName) return;
+          const runId = btn.getAttribute('data-wf-run-cancel');
+          if (!runId) return;
+          btn.disabled = true;
+          const original = btn.textContent;
+          btn.textContent = 'CANCELLING';
+          try {
+            const endpoint = '/api/console/workflows/' + encodeURIComponent(wfSelectedName)
+              + '/runs/' + encodeURIComponent(runId) + '/cancel';
+            const r = await fetch(withToken(endpoint), {
+              method: 'POST',
+              headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+              body: JSON.stringify({ reason: 'Cancelled from Workflow Studio.' }),
+            });
+            if (!r.ok) {
+              const j = await r.json().catch(() => ({}));
+              throw new Error(j.error || ('HTTP ' + r.status));
+            }
+            await refreshWorkflowRuns();
+            await refreshHomeCommandCenter();
+          } catch (err) {
+            btn.disabled = false;
+            btn.textContent = original || 'CANCEL';
+            alert('Could not cancel run: ' + ((err && err.message) || err));
+          }
+        });
+      });
     } catch (err) {
       slot.innerHTML = '<div class="wf-runs-empty">runs unavailable: ' + escMem(err.message || err) + '</div>';
     }

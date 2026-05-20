@@ -177,6 +177,7 @@ export class RecallDesktopCapture {
   private sdkAvailable = false;
   private recording = false;
   private currentWindowId: string | undefined;
+  private currentRecordingId: string | undefined;
   private lastError: string | undefined;
   private lastEvent: string | undefined;
   private lastEventAt: string | undefined;
@@ -203,6 +204,7 @@ export class RecallDesktopCapture {
   // Wall-clock start so the live UI can render an elapsed-time pill
   // without recomputing from the SDK's recording-started event.
   private recordingStartedAt: string | undefined;
+  private completedRecordingKeys = new Set<string>();
 
   constructor(private readonly opts: RecallCaptureOptions) {}
 
@@ -285,8 +287,13 @@ export class RecallDesktopCapture {
     // ALWAYS effective; if the SDK later fires recording-ended too,
     // onRecordingEnded becomes a no-op repeat.
     const windowId = this.currentWindowId;
+    const recordingId = this.currentRecordingId;
+    const startedAt = this.recordingStartedAt;
+    const platform = this.lastMeeting?.platform;
+    const title = this.lastMeeting?.title;
     this.recording = false;
     this.recordingStartedAt = undefined;
+    this.currentRecordingId = undefined;
     if (windowId) {
       const existing = this.detectedWindows.get(windowId);
       if (existing) {
@@ -299,13 +306,32 @@ export class RecallDesktopCapture {
     }
     this.currentWindowId = undefined;
 
-    if (windowId && this.sdk) {
-      try {
-        await this.sdk.stopRecording({ windowId });
-      } catch {
-        // SDK may have already stopped or never had this window —
-        // either way our local state is correct now. Don't bubble.
+    if (windowId) {
+      if (this.sdk) {
+        try {
+          await this.sdk.stopRecording({ windowId });
+        } catch {
+          // SDK may have already stopped or never had this window —
+          // either way our local state is correct now. Don't bubble.
+        }
       }
+      const complete = await this.completeRecording({
+        windowId,
+        recordingId,
+        platform,
+        title,
+        startedAt,
+      }).catch((error) => ({ error: error instanceof Error ? error.message : String(error) }));
+      this.emit('recording-ended', {
+        windowId,
+        recordingId,
+        platform,
+        title,
+        startedAt,
+        endedAt: new Date().toISOString(),
+        complete,
+        source: 'stop-recording',
+      });
       this.emit('recording-stop-requested', { windowId });
     }
     return this.status();
@@ -324,6 +350,7 @@ export class RecallDesktopCapture {
     this.initialized = false;
     this.recording = false;
     this.currentWindowId = undefined;
+    this.currentRecordingId = undefined;
     this.recordingStartedAt = undefined;
     this.detectedWindows.clear();
     this.userDismissedWindows.clear();
@@ -540,6 +567,7 @@ export class RecallDesktopCapture {
     await this.sdk.startRecording({ windowId, uploadToken: upload.uploadToken });
     this.recording = true;
     this.currentWindowId = windowId;
+    this.currentRecordingId = upload.id;
     this.recordingStartedAt = new Date().toISOString();
     this.lastMeeting = { windowId, platform: meta.platform, title: meta.title };
     this.emit('recording-start-requested', {
@@ -588,8 +616,10 @@ export class RecallDesktopCapture {
     const windowId = win?.id ?? this.currentWindowId;
     if (!windowId) return;
     const startedAt = this.recordingStartedAt;
+    const recordingId = this.currentRecordingId;
     this.recording = false;
     this.currentWindowId = undefined;
+    this.currentRecordingId = undefined;
     this.recordingStartedAt = undefined;
     this.noteEvent('recording-ended');
     const existing = this.detectedWindows.get(windowId);
@@ -599,14 +629,17 @@ export class RecallDesktopCapture {
     // Same window may host another meeting later — clear the
     // already-prompted flag so the prompt fires on the next detection.
     this.promptedWindows.delete(windowId);
-    const complete = await this.postDaemon('/api/console/meetings/recall/complete', {
+    const complete = await this.completeRecording({
       windowId,
+      recordingId,
       platform: win?.platform ?? this.lastMeeting?.platform,
       title: win?.title ?? this.lastMeeting?.title,
       startedAt,
     }).catch((error) => ({ error: error instanceof Error ? error.message : String(error) }));
+    if ('duplicate' in complete && complete.duplicate === true) return;
     this.emit('recording-ended', {
       windowId,
+      recordingId,
       platform: win?.platform ?? this.lastMeeting?.platform,
       title: win?.title ?? this.lastMeeting?.title,
       startedAt,
@@ -656,7 +689,7 @@ export class RecallDesktopCapture {
     if (!transcript || !windowId) return;
     await this.postDaemon('/api/console/meetings/recall/transcript-event', {
       windowId,
-      recordingId: transcript.recordingId,
+      recordingId: transcript.recordingId ?? this.currentRecordingId,
       event: event.event,
       speaker: transcript.speaker,
       text: transcript.text,
@@ -666,6 +699,28 @@ export class RecallDesktopCapture {
       this.emit('transcript-store-failed', { error: error instanceof Error ? error.message : String(error) });
     });
     this.emit('transcript', { windowId, speaker: transcript.speaker, text: transcript.text });
+  }
+
+  private async completeRecording(input: {
+    windowId: string;
+    recordingId?: string;
+    platform?: string;
+    title?: string;
+    startedAt?: string;
+  }): Promise<Record<string, unknown>> {
+    const keys = [input.recordingId, input.windowId].filter((value): value is string => Boolean(value));
+    if (keys.some((key) => this.completedRecordingKeys.has(key))) {
+      return { skipped: true, duplicate: true };
+    }
+    const complete = await this.postDaemon<Record<string, unknown>>('/api/console/meetings/recall/complete', {
+      windowId: input.windowId,
+      recordingId: input.recordingId,
+      platform: input.platform,
+      title: input.title,
+      startedAt: input.startedAt,
+    });
+    for (const key of keys) this.completedRecordingKeys.add(key);
+    return complete;
   }
 
   private onError(event: unknown): void {

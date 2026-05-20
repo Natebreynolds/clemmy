@@ -21,7 +21,7 @@ import {
   writeWorkflow,
   type WorkflowDefinition,
 } from '../memory/workflow-store.js';
-import { listPendingRuns, readWorkflowEvents } from '../execution/workflow-events.js';
+import { appendWorkflowEvent, listPendingRuns, readWorkflowEvents } from '../execution/workflow-events.js';
 import { ExecutionStore } from '../execution/store.js';
 import { listOpenCheckIns } from '../agents/check-ins.js';
 import type { ClementineAssistant } from '../assistant/core.js';
@@ -1118,6 +1118,52 @@ export function registerConsoleRoutes(
     res.json({ queued: !dryRun, dryRun, id, targetStepId });
   });
 
+  app.post('/api/console/workflows/:name/runs/:runId/cancel', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const target = req.params.name;
+    const entry = listWorkflows().find((e) => e.data.name === target || e.name === target);
+    if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
+    const runId = req.params.runId;
+    const filePath = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+    if (!fs.existsSync(filePath)) {
+      res.status(404).json({ error: 'workflow run not found' });
+      return;
+    }
+    try {
+      const now = new Date().toISOString();
+      const raw = JSON.parse(fs.readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
+      if (raw.workflow !== entry.data.name) {
+        res.status(404).json({ error: 'workflow run does not belong to this workflow' });
+        return;
+      }
+      const reason = typeof req.body?.reason === 'string' && req.body.reason.trim()
+        ? req.body.reason.trim().slice(0, 500)
+        : 'Cancelled from the desktop dashboard.';
+      const events = readWorkflowEvents(entry.name, runId);
+      const hasTerminal = events.some((ev) =>
+        ev.kind === 'run_completed' || ev.kind === 'run_failed' || ev.kind === 'run_cancelled',
+      );
+      if (!hasTerminal) {
+        appendWorkflowEvent(entry.name, runId, {
+          kind: 'run_cancelled',
+          error: reason,
+          meta: { source: 'desktop-dashboard' },
+        });
+      }
+      const next = {
+        ...raw,
+        status: 'cancelled',
+        cancelledAt: typeof raw.cancelledAt === 'string' ? raw.cancelledAt : now,
+        finishedAt: typeof raw.finishedAt === 'string' ? raw.finishedAt : now,
+        error: typeof raw.error === 'string' && raw.error ? raw.error : reason,
+      };
+      fs.writeFileSync(filePath, JSON.stringify(next, null, 2), 'utf-8');
+      res.json({ ok: true, run: next });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   /**
    * Live event stream for a workflow run. Reads the per-run
    * events.jsonl log written by the workflow runner. Used by the
@@ -2128,7 +2174,7 @@ export function registerConsoleRoutes(
         return;
       }
       const upload = await createRecallSdkUpload({
-        liveTranscript: req.body?.liveTranscript === true || settings.liveTranscript,
+        liveTranscript: req.body?.liveTranscript === true || settings.liveTranscript || settings.analyzeOnComplete,
       });
       res.json(upload);
     } catch (err) {
@@ -2766,7 +2812,10 @@ export function registerConsoleRoutes(
             kind: 'workflow',
             title: run.inFlightStepId ? `${title} · ${run.inFlightStepId}` : title,
             meta: `run ${run.runId}${run.lastEventAt ? ` · ${run.lastEventAt.slice(11, 16)}` : ''}`,
-            panel: 'activity',
+            panel: 'workflows',
+            actionKind: 'workflow-run',
+            workflowName: run.workflowName,
+            runId: run.runId,
           };
         }),
         ...executions.slice(0, 6).map((execution) => ({

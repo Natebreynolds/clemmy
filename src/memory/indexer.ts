@@ -65,13 +65,12 @@ function hashString(input: string): string {
 
 /**
  * Skip patterns for the vault indexer. These files are append-only
- * logs (chat archives, meeting transcripts) — they grow continuously,
- * their content is already in the harness DB for direct lookup, and
- * letting them through the chunker means every chat or meeting bumps
- * the file mtime, triggers a per-tick reindex that deletes + recreates
- * their entire chunk set, which cascade-deletes embeddings, which
- * cascades to a backfill loop that re-embeds the same content against
- * OpenAI on every minute tick.
+ * logs (chat archives) — they grow continuously, their content is
+ * already in the harness DB for direct lookup, and letting them through
+ * the chunker means every chat bump triggers a per-tick reindex that
+ * deletes + recreates their entire chunk set, which cascade-deletes
+ * embeddings, which cascades to a backfill loop that re-embeds the
+ * same content against OpenAI on every minute tick.
  *
  * Observed today: the chat-archive for sessionId console:home was
  * 3.7 MB / 121K lines after a single day of use, and was responsible
@@ -84,11 +83,6 @@ const INDEXER_FILENAME_SKIP_PATTERNS: RegExp[] = [
   // Chat-archive files written by session-store.ts:
   //   YYYY-MM-DD-chat-archive-<sessionSlug>.md
   /-chat-archive-/,
-  // Meeting transcripts written by recall capture:
-  //   YYYY-MM-DD-zoom-recall-<id>.md
-  //   YYYY-MM-DD-meet-recall-<id>.md
-  //   YYYY-MM-DD-teams-recall-<id>.md
-  /-(?:zoom|meet|teams|recall)-recall-/,
   // Cron run logs (append-only ndjson would normally be skipped by the
   // .md filter, but defensive):
   /\.jsonl$/,

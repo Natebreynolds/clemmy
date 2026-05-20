@@ -10,7 +10,8 @@
  *   - large payloads are truncated, not silently dropped
  *   - partial / corrupt trailing lines are skipped without throwing
  *   - listPendingRuns() filters out runs that already reached a
- *     terminal kind (run_completed / run_failed)
+ *     terminal kind (run_completed / run_failed / run_cancelled) or a
+ *     terminal queue-record status.
  *
  * The tests redirect WORKFLOWS_DIR to a temp dir per-test via the
  * env CLEMENTINE_HOME hook so we don't trample the user's real vault.
@@ -30,6 +31,7 @@ process.env.CLEMENTINE_HOME = TMP_HOME;
 const { appendWorkflowEvent, readWorkflowEvents, computeResumeState, listPendingRuns } =
   await import('./workflow-events.js');
 const { WORKFLOWS_DIR } = await import('../memory/vault.js');
+const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
 
 function cleanup(): void {
   try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ }
@@ -106,6 +108,13 @@ test('computeResumeState detects terminal run_failed', () => {
   assert.equal(state.terminal, true);
 });
 
+test('computeResumeState detects terminal run_cancelled', () => {
+  appendWorkflowEvent('terminal-cancel', 'r1', { kind: 'run_started' });
+  appendWorkflowEvent('terminal-cancel', 'r1', { kind: 'run_cancelled', error: 'cancelled by user' });
+  const state = computeResumeState('terminal-cancel', 'r1');
+  assert.equal(state.terminal, true);
+});
+
 test('readWorkflowEvents skips corrupt trailing lines without throwing', () => {
   appendWorkflowEvent('corrupt', 'r1', { kind: 'run_started' });
   // Manually append an unparseable trailing line to simulate a torn
@@ -128,6 +137,21 @@ test('listPendingRuns excludes terminal runs and includes in-flight', () => {
   const flights = pending.map((p) => `${p.workflowName}/${p.runId}`);
   assert.ok(flights.includes('in-flight/r1'), 'still-running run is pending');
   assert.ok(!flights.includes('done/r1'), 'completed run is not pending');
+});
+
+test('listPendingRuns excludes runs with terminal queue-record status', () => {
+  appendWorkflowEvent('queue-cancelled', 'r1', { kind: 'run_started' });
+  appendWorkflowEvent('queue-cancelled', 'r1', { kind: 'step_started', stepId: 'one' });
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  writeFileSync(
+    path.join(WORKFLOW_RUNS_DIR, 'r1.json'),
+    JSON.stringify({ id: 'r1', workflow: 'queue-cancelled', status: 'cancelled' }),
+    'utf-8',
+  );
+
+  const pending = listPendingRuns();
+  const flights = pending.map((p) => `${p.workflowName}/${p.runId}`);
+  assert.ok(!flights.includes('queue-cancelled/r1'), 'cancelled queue record is not pending');
 });
 
 test('listPendingRuns returns empty when WORKFLOWS_DIR is empty', () => {
