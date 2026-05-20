@@ -31,9 +31,9 @@ const requireFromHere = createRequire(import.meta.url);
  * the daemon's SecretStore).
  *
  * Keychain integration: also lazily loads keytar with the same
- * service name (com.clemmy.desktop.v1) so the packaged Electron app
- * writes to keychain by default. Falls through to the file vault
- * when keytar isn't available.
+ * service name (com.clemmy.desktop.v1) for reset/repair compatibility.
+ * Default setup writes use the file vault to avoid repeated macOS
+ * Keychain prompts after desktop app updates.
  */
 
 const HOME = os.homedir();
@@ -233,7 +233,19 @@ export async function listCredentialRows(): Promise<CredentialRow[]> {
     let status: CredentialStatus = 'missing';
     let hasValue = false;
 
-    if (keychain) {
+    const fileValue = vault.entries[d.name];
+    if (fileValue && fileValue.length > 0) {
+      source = 'file'; status = 'connected'; hasValue = true;
+    }
+
+    if (!hasValue && d.envVarName) {
+      const envValue = readEnvVar(d.envVarName);
+      if (envValue) {
+        source = 'env'; status = 'env_only'; hasValue = true;
+      }
+    }
+
+    if (!hasValue && keychain) {
       try {
         const value = await keychain.getPassword(KEYCHAIN_SERVICE, d.name);
         if (value && value.length > 0) {
@@ -241,20 +253,6 @@ export async function listCredentialRows(): Promise<CredentialRow[]> {
         }
       } catch {
         source = 'keychain'; status = 'unreadable';
-      }
-    }
-
-    if (!hasValue && status !== 'unreadable') {
-      const fileValue = vault.entries[d.name];
-      if (fileValue && fileValue.length > 0) {
-        source = 'file'; status = 'connected'; hasValue = true;
-      }
-    }
-
-    if (!hasValue && status !== 'unreadable' && d.envVarName) {
-      const envValue = readEnvVar(d.envVarName);
-      if (envValue) {
-        source = 'env'; status = 'env_only'; hasValue = true;
       }
     }
 
@@ -276,33 +274,11 @@ export async function listCredentialRows(): Promise<CredentialRow[]> {
   return rows;
 }
 
-/** Write a credential to keychain (when available) or the file vault.
+/** Write a credential to the file vault.
  *  Readback-verified — never records "connected" without confirming
  *  the value is fetchable from the destination. */
 export async function setCredential(name: CredentialName, value: string): Promise<CredentialMetadata> {
   if (!value) throw new Error('empty value');
-  const keychain = await loadKeytar();
-  if (keychain) {
-    await keychain.setPassword(KEYCHAIN_SERVICE, name, value);
-    let confirmed: string | null = null;
-    try { confirmed = await keychain.getPassword(KEYCHAIN_SERVICE, name); }
-    catch { confirmed = null; }
-    if (confirmed === value) {
-      return updateMeta(name, {
-        source: 'keychain',
-        status: 'connected',
-        lastSetAt: new Date().toISOString(),
-        lastError: undefined,
-      });
-    }
-    return updateMeta(name, {
-      source: 'keychain',
-      status: 'needs_repair',
-      lastError: 'set succeeded but keychain readback returned a different value',
-    });
-  }
-
-  // Fallback to file vault.
   const vault = readVault();
   vault.entries[name] = value;
   writeVault(vault);

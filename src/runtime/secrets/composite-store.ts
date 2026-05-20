@@ -71,16 +71,16 @@ function updateMeta(name: SecretName, patch: Partial<SecretMetadata>): SecretMet
 /**
  * Composite SecretStore — orchestrates the three backends.
  *
- * Read order (highest to lowest priority): keychain → file → env.
- *   - Keychain wins because it's the most secure / Electron-native.
- *   - File is the dev/CLI fallback with controlled perms.
+ * Read order (highest to lowest priority): file → env → keychain.
+ *   - File wins because it is stable across desktop updates and does
+ *     not trigger macOS Keychain prompts during launch.
  *   - Env is the transparent compatibility layer so existing .env
  *     setups keep working without forced migration.
+ *   - Keychain remains supported for explicit repair/reset/migration,
+ *     but is no longer the normal read/write path.
  *
  * Write target:
- *   - Defaults to keychain when available.
- *   - Falls back to file when keychain is unavailable (CLI / daemon-
- *     only mode).
+ *   - Defaults to file vault with 0600 permissions.
  *   - NEVER writes to env (would mean editing the user's .env file).
  *
  * Migration:
@@ -114,26 +114,8 @@ export class CompositeSecretStore {
   }
 
   async get(name: SecretName): Promise<SecretGetResult> {
-    // Keychain first (when available).
-    if (this.keychainBackend) {
-      try {
-        const value = await this.keychainBackend.get(name);
-        if (value !== undefined) {
-          const metadata = updateMeta(name, { source: 'keychain', status: 'connected', lastError: undefined });
-          return { name, value, source: 'keychain', status: 'connected', metadata };
-        }
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        logger.warn({ err: message, name }, 'keychain read failed');
-        const metadata = updateMeta(name, { source: 'keychain', status: 'unreadable', lastError: message });
-        // Don't fall through — the user needs to repair the keychain
-        // entry, not silently get the same secret from a less-safe
-        // source. The Repair flow handles this explicitly.
-        return { name, source: 'keychain', status: 'unreadable', metadata };
-      }
-    }
-
-    // File backend next.
+    // File backend first. This avoids macOS Keychain access prompts on
+    // normal dashboard launch and after signed desktop updates.
     try {
       const value = await this.fileBackend.get(name);
       if (value !== undefined) {
@@ -146,11 +128,29 @@ export class CompositeSecretStore {
       return { name, source: 'file', status: 'unreadable', metadata };
     }
 
-    // Env backend last — transparent dev/CLI compatibility.
+    // Env backend next — transparent dev/CLI compatibility.
     const value = await this.envBackend.get(name);
     if (value !== undefined) {
       const metadata = updateMeta(name, { source: 'env', status: 'env_only', lastError: undefined });
       return { name, value, source: 'env', status: 'env_only', metadata };
+    }
+
+    // Keychain last. Existing users who already stored credentials in
+    // Keychain still work, but fresh installs and file-backed users
+    // avoid touching Keychain entirely during normal reads.
+    if (this.keychainBackend) {
+      try {
+        const keychainValue = await this.keychainBackend.get(name);
+        if (keychainValue !== undefined) {
+          const metadata = updateMeta(name, { source: 'keychain', status: 'connected', lastError: undefined });
+          return { name, value: keychainValue, source: 'keychain', status: 'connected', metadata };
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        logger.warn({ err: message, name }, 'keychain read failed');
+        const metadata = updateMeta(name, { source: 'keychain', status: 'unreadable', lastError: message });
+        return { name, source: 'keychain', status: 'unreadable', metadata };
+      }
     }
 
     const metadata = updateMeta(name, { source: 'missing', status: 'missing' });
@@ -158,9 +158,10 @@ export class CompositeSecretStore {
   }
 
   async set(name: SecretName, value: string): Promise<SecretSetResult> {
-    // Pick the highest-priority writable backend.
-    const target: 'keychain' | 'file' = this.keychainBackend ? 'keychain' : 'file';
-    const backend = target === 'keychain' ? this.keychainBackend! : this.fileBackend;
+    // Default writes go to the local file vault. Keychain writes remain
+    // available only through explicit migration/repair flows.
+    const target: 'file' = 'file';
+    const backend = this.fileBackend;
     await backend.set(name, value);
 
     // Confirm via readback. This is the safety net — if a future

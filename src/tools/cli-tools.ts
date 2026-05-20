@@ -45,6 +45,12 @@ export function registerCliTools(server: McpServer): void {
         if (!entry) {
           return textResult(`"${exactFilter}" is not installed on $PATH.`);
         }
+        if (!entry.isLikelyCli && entry.helpHead?.startsWith('Skipped macOS Command Line Tools stub')) {
+          return textResult([
+            `"${exactFilter}" resolves to ${entry.path}, but it is only the macOS Command Line Tools installer stub.`,
+            `Install Xcode Command Line Tools or a standalone ${exactFilter} binary, then retry.`,
+          ].join('\n'));
+        }
         const v = entry.version ? ` — ${entry.version}` : '';
         const help = entry.helpHead ? `\nhelp: ${entry.helpHead}` : '';
         const likely = entry.isLikelyCli ? '' : '\n(no --version or --help output — binary exists but did not identify itself as a CLI)';
@@ -85,6 +91,12 @@ export function registerCliTools(server: McpServer): void {
       const entry = await probe(command);
       if (!entry) {
         return textResult(`"${command}" is not installed on $PATH.`);
+      }
+      if (!entry.isLikelyCli && entry.helpHead?.startsWith('Skipped macOS Command Line Tools stub')) {
+        return textResult([
+          `"${command}" resolves to ${entry.path}, but it is only the macOS Command Line Tools installer stub.`,
+          `Install Xcode Command Line Tools or a standalone ${command} binary, then retry.`,
+        ].join('\n'));
       }
       const parts = [
         `${entry.command} at ${entry.path}`,

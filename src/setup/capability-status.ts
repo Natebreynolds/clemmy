@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process';
+import { resolveSafeCliProbe } from '../runtime/cli-discovery.js';
 
 export interface GlobalCliStatus {
   id: string;
@@ -25,7 +26,7 @@ const GLOBAL_CLI_CHECKS: Array<{
   { id: 'uv', label: 'uv', command: 'uv', versionArgs: ['--version'], purpose: 'modern Python package and task workflows' },
   { id: 'browser-harness', label: 'Browser Harness', command: 'browser-harness', versionArgs: ['--version'], purpose: 'native browser automation through a real Chrome or Browser Use cloud browser' },
   { id: 'gh', label: 'GitHub CLI', command: 'gh', versionArgs: ['--version'], purpose: 'GitHub issues, PRs, and repository operations' },
-  { id: 'codex', label: 'Codex CLI', command: 'codex', versionArgs: ['--version'], purpose: 'ChatGPT/Codex OAuth bootstrap and local agent auth' },
+  { id: 'codex', label: 'Codex CLI', command: 'codex', versionArgs: ['--version'], purpose: 'optional ChatGPT/Codex OAuth import and compatibility; not required for desktop OAuth' },
   { id: 'railway', label: 'Railway CLI', command: 'railway', versionArgs: ['--version'], purpose: 'Railway deploy and service workflows' },
   { id: 'vercel', label: 'Vercel CLI', command: 'vercel', versionArgs: ['--version'], purpose: 'Vercel deploy and project workflows' },
   { id: 'netlify', label: 'Netlify CLI', command: 'netlify', versionArgs: ['--version'], purpose: 'Netlify deploy and site workflows' },
@@ -68,14 +69,16 @@ export function listGlobalCliStatus(): GlobalCliStatus[] {
   }
 
   const value = GLOBAL_CLI_CHECKS.map((check) => {
-    const path = commandPath(check.command);
+    const foundPath = commandPath(check.command);
+    const safe = foundPath ? resolveSafeCliProbe(check.command, foundPath) : null;
+    const available = Boolean(safe && !safe.skipped);
     return {
       id: check.id,
       label: check.label,
       command: check.command,
-      available: Boolean(path),
-      path,
-      version: path ? commandVersion(check.command, check.versionArgs) : undefined,
+      available,
+      path: safe?.path ?? foundPath,
+      version: safe && !safe.skipped ? commandVersion(safe.command, check.versionArgs) : undefined,
       purpose: check.purpose,
     };
   });

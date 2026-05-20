@@ -212,11 +212,16 @@ function headLines(text: string, max = 3, perLine = 200): string | undefined {
  * dialog on every fresh open, which is exactly what users saw with
  * xcscontrol after 0.4.0 shipped.
  *
- * Skip them entirely. The agent can still ask for them via
- * local_cli_probe if it really needs to — but the dashboard warmup
- * and `local_cli_list` results no longer trigger system prompts.
+ * Skip them unless a real Command Line Tools or Xcode backing binary
+ * exists. This keeps dashboard warmup and `local_cli_list` from
+ * triggering system prompts.
  */
 const STUB_BINARIES_THAT_TRIGGER_SYSTEM_INSTALLER = new Set<string>([
+  'git',
+  'python',
+  'python3',
+  'pip',
+  'pip3',
   'xcscontrol',
   'xcrun',
   'xcodebuild',
@@ -249,12 +254,52 @@ const STUB_BINARIES_THAT_TRIGGER_SYSTEM_INSTALLER = new Set<string>([
   'ranlib',
 ]);
 
-function shouldSkipProbe(command: string, resolved: string): boolean {
-  if (!STUB_BINARIES_THAT_TRIGGER_SYSTEM_INSTALLER.has(command)) return false;
+const DEVELOPER_TOOL_BACKING_DIRS = [
+  '/Library/Developer/CommandLineTools/usr/bin',
+  '/Applications/Xcode.app/Contents/Developer/usr/bin',
+  '/Library/Developer/CommandLineTools/Toolchains/XcodeDefault.xctoolchain/usr/bin',
+  '/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin',
+];
+
+export type SafeCliProbe =
+  | { skipped: false; command: string; path: string }
+  | { skipped: true; command: string; path: string; reason: string };
+
+function executableFile(candidate: string): boolean {
+  try {
+    const st = statSync(candidate);
+    return st.isFile() && Boolean(st.mode & 0o111);
+  } catch {
+    return false;
+  }
+}
+
+function developerToolBackingPath(command: string): string | undefined {
+  for (const dir of DEVELOPER_TOOL_BACKING_DIRS) {
+    const candidate = path.join(dir, command);
+    if (executableFile(candidate)) return candidate;
+  }
+  return undefined;
+}
+
+export function resolveSafeCliProbe(command: string, resolved: string): SafeCliProbe {
+  if (!STUB_BINARIES_THAT_TRIGGER_SYSTEM_INSTALLER.has(command)) {
+    return { skipped: false, command, path: resolved };
+  }
   // Only skip when the resolved path is the system stub location.
   // If the user has a brew/non-system override (e.g. /opt/homebrew/bin/swift
   // via swiftly), the override is real and probing it is fine.
-  return resolved.startsWith('/usr/bin/') || resolved.startsWith('/Library/Developer/');
+  if (!resolved.startsWith('/usr/bin/')) {
+    return { skipped: false, command, path: resolved };
+  }
+  const backing = developerToolBackingPath(command);
+  if (backing) return { skipped: false, command: backing, path: backing };
+  return {
+    skipped: true,
+    command,
+    path: resolved,
+    reason: 'Skipped macOS Command Line Tools stub to avoid opening the system installer.',
+  };
 }
 
 /**
@@ -271,24 +316,26 @@ export async function probe(command: string, candidatePath?: string): Promise<Cl
   const resolved = candidatePath ?? whichOnPath(command);
   if (!resolved) return null;
 
-  if (shouldSkipProbe(command, resolved)) {
+  const safe = resolveSafeCliProbe(command, resolved);
+  if (safe.skipped) {
     return {
       command,
       path: resolved,
       isLikelyCli: false,
+      helpHead: safe.reason,
       probedAt: new Date().toISOString(),
     };
   }
 
-  const versionOut = await runQuick(command, ['--version']);
-  const helpOut = versionOut ? undefined : await runQuick(command, ['--help']);
+  const versionOut = await runQuick(safe.command, ['--version']);
+  const helpOut = versionOut ? undefined : await runQuick(safe.command, ['--help']);
 
   const version = headLines(versionOut ?? '', 2);
   const helpHead = headLines(helpOut ?? '', 4);
 
   return {
     command,
-    path: resolved,
+    path: safe.path,
     isLikelyCli: Boolean(version || helpHead),
     version,
     helpHead,
@@ -378,9 +425,11 @@ export function filterClis(scan: CliScanResult, filter?: string): CliEntry[] {
   // would get from `which <name>` in their terminal.
   const fromDetected = scan.detected.find((d) => d.command.toLowerCase() === needle);
   if (fromDetected) {
+    const safe = resolveSafeCliProbe(fromDetected.command, fromDetected.path);
+    if (safe.skipped) return [];
     return [{
       command: fromDetected.command,
-      path: fromDetected.path,
+      path: safe.path,
       isLikelyCli: true,
       // No version/helpHead — the probe failed at scan time, but the
       // binary exists on $PATH. The model should treat this as

@@ -398,11 +398,9 @@ export function getAuthStatus(): AuthStatus {
       mode: AUTH_MODE,
       configured: true,
       source: local.source === 'native' ? 'native' : 'local_store',
-      message: isCodexCliAvailable()
-        ? local.source === 'native'
-          ? 'Native ChatGPT/Codex credentials are stored locally and Codex CLI runtime is available.'
-          : 'Codex OAuth credentials imported locally and Codex CLI is available.'
-        : `Codex OAuth credentials imported locally, but Codex CLI is not available on PATH. ${getCodexInstallHint()}`,
+      message: local.source === 'native'
+        ? 'Native ChatGPT/Codex credentials are stored locally. Codex CLI is optional.'
+        : 'Codex OAuth credentials are imported locally. Codex CLI is optional.',
       openaiApiKeyPresent,
       codexOauthPresent,
       codexAccountId: localCodex?.accountId,
@@ -431,9 +429,7 @@ export function getAuthStatus(): AuthStatus {
     mode: AUTH_MODE,
     configured: false,
     source: 'none',
-    message: isCodexCliAvailable()
-      ? `No Codex OAuth credentials found. Expected source file: ${codexAuthSourceFile}`
-      : `Codex executable not found on PATH. ${getCodexInstallHint()}`,
+    message: `No Codex OAuth credentials found. Sign in with ChatGPT from the desktop setup flow, or import an existing Codex CLI auth file from ${codexAuthSourceFile}.`,
     openaiApiKeyPresent,
     codexOauthPresent,
     codexImportPath: codexAuthSourceFile,

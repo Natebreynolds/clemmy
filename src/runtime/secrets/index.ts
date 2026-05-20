@@ -10,7 +10,7 @@
  *
  * For a smooth migration off `getRuntimeEnv('OPENAI_API_KEY')`,
  * getOpenAiApiKeyAsync() returns the raw value via the SecretStore
- * read order (keychain → file → env). Synchronous getOpenAiApiKey()
+ * read order (file → env → keychain). Synchronous getOpenAiApiKey()
  * stays in config.ts as the dev/CLI fallback that hits env directly.
  */
 export * from './types.js';

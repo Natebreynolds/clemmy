@@ -667,15 +667,14 @@ ipcMain.handle('clemmy:setup-pick-workspace-folder', async () => {
 ipcMain.handle('clemmy:setup-codex-login', async () => {
   // Run the OAuth dance from the Electron main process so the user
   // never sees a terminal. Tokens are persisted to BOTH the daemon's
-  // local auth store and the codex CLI compatibility file, plus the
-  // SecretStore vault so the dashboard's credentials view picks them
-  // up immediately.
+  // local auth store and the codex CLI compatibility file. We do not
+  // mirror them into Keychain here; the runtime reads the native auth
+  // store directly, and avoiding extra Keychain writes prevents repeated
+  // macOS prompts during first-run setup.
   try {
     const imported = await importUsableCodexOAuthTokens();
     const tokens = imported ?? await runCodexOAuthLogin();
     persistCodexOAuthTokens(tokens);
-    await setCredential('codex_oauth_access_token', tokens.accessToken).catch(() => { /* vault is best-effort */ });
-    await setCredential('codex_oauth_refresh_token', tokens.refreshToken).catch(() => { /* vault is best-effort */ });
     return {
       ok: true as const,
       accountId: tokens.accountId ?? '',

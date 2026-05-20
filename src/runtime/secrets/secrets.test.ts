@@ -202,6 +202,26 @@ test('composite: set writes to file (when no keychain), readback verified', asyn
   assert.equal(getResult.source, 'file');
 });
 
+test('composite: set writes to file even when keychain is available', async () => {
+  const store = new CompositeSecretStore();
+  await store.init();
+  const fake = {
+    name: 'keychain' as const,
+    isAvailable: true,
+    get: async () => 'keychain-value',
+    set: async () => {
+      throw new Error('default set must not write keychain');
+    },
+    delete: async () => {},
+  };
+  store.setKeychainBackend(fake as unknown as Parameters<typeof store.setKeychainBackend>[0]);
+  const setResult = await store.set('openai_api_key', 'sk-written-to-file');
+  assert.equal(setResult.source, 'file');
+  const getResult = await store.get('openai_api_key');
+  assert.equal(getResult.value, 'sk-written-to-file');
+  assert.equal(getResult.source, 'file');
+});
+
 test('composite: file beats env in read priority', async () => {
   process.env.OPENAI_API_KEY = 'sk-from-env';
   const store = new CompositeSecretStore();
@@ -336,8 +356,8 @@ test('composite: resetAll wipes vault + meta but not env', async () => {
   assert.equal(r2.value, undefined);
 });
 
-test('composite: readback failure during set is recorded as needs_repair', async () => {
-  // Force the file backend to return wrong data on readback by mocking.
+test('composite: readback failure during explicit keychain migration is recorded as needs_repair', async () => {
+  process.env.OPENAI_API_KEY = 'right-value';
   const store = new CompositeSecretStore();
   await store.init();
   const fake = {
@@ -348,6 +368,6 @@ test('composite: readback failure during set is recorded as needs_repair', async
     delete: async () => {},
   };
   store.setKeychainBackend(fake as unknown as Parameters<typeof store.setKeychainBackend>[0]);
-  const result = await store.set('openai_api_key', 'right-value');
+  const result = await store.migrate('openai_api_key', 'env', 'keychain');
   assert.equal(result.status, 'needs_repair');
 });

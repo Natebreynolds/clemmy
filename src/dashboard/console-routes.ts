@@ -1820,13 +1820,8 @@ export function registerConsoleRoutes(
     const entry = findCatalogEntry(id);
     if (!entry) { res.status(404).json({ error: 'unknown catalog id: ' + id }); return; }
     try {
-      const job = startApprovedInstallCommand(entry.installCommand, `Install ${entry.name}`);
-      // Optimistically record the connection — if the install fails the
-      // record can be cleared via /forget. Recording up front means the
-      // agent sees the user's intent even if they navigate away before
-      // the job completes.
-      const record = recordConnectedCli(entry);
-      res.json({ job, entry, record });
+      const job = startApprovedInstallCommand(entry.installCommand, `Install ${entry.name}`, { cliCatalogId: entry.id });
+      res.json({ job, entry });
     } catch (err) {
       res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -1848,6 +1843,13 @@ export function registerConsoleRoutes(
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const job = getInstallJob(req.params.id);
     if (!job) { res.status(404).json({ error: 'install job not found' }); return; }
+    if (job.status === 'succeeded' && job.metadata?.cliCatalogId && !job.connectedRecorded) {
+      const entry = findCatalogEntry(job.metadata.cliCatalogId);
+      if (entry) {
+        recordConnectedCli(entry);
+        job.connectedRecorded = true;
+      }
+    }
     res.json({ job });
   });
 

@@ -392,7 +392,7 @@ const SETUP_JS = `
       "    I&rsquo;m a local autonomous agent that runs on your machine. Memory that doesn&rsquo;t forget. Workflows you can build with me. Tools, CLIs, MCPs, browser use &mdash; everything in one place. <br><br>",
       '    The next few steps configure how I connect. Everything happens inside this window &mdash; no terminal required. You can skip anything optional and add it later from the Console.',
       '  </div>',
-      '  <div class="status-msg ok">Your credentials stay on this machine. Keychain when available, encrypted file vault otherwise. Never .env unless you put them there.</div>',
+      '  <div class="status-msg ok">Your credentials stay on this machine in Clementine&rsquo;s local vault. Never .env unless you put them there.</div>',
       '</div>',
     ].join('');
   }
@@ -409,7 +409,7 @@ const SETUP_JS = `
     const openaiField = state.authChoice === 'openai' ? [
       '<div class="field" style="margin-top:14px;">',
       '  <label>OPENAI API KEY</label>',
-      '  <input type="password" data-state="openaiKey" value="' + esc(state.openaiKey) + '" placeholder="sk-..." autocomplete="off" spellcheck="false" />',
+      '  <input type="password" data-state="openaiKey" name="setup-openai-key-no-autofill" value="' + esc(state.openaiKey) + '" placeholder="sk-..." autocomplete="new-password" data-1p-ignore="true" data-lpignore="true" data-form-type="other" spellcheck="false" />',
       '  <span class="hint">Get one at platform.openai.com/api-keys, or choose Codex OAuth / Skip instead.</span>',
       '</div>',
     ].join('') : '';
@@ -476,8 +476,8 @@ const SETUP_JS = `
       '  <div class="step-desc">An OpenAI API key unlocks two extras that Codex OAuth doesn&rsquo;t cover: <strong>embeddings</strong> (semantic search across your vault) and <strong>live voice</strong> (Realtime API on the home screen). Leave blank to skip &mdash; you can paste one later from Settings → Credentials.</div>',
       '  <div class="field">',
       '    <label>OPENAI API KEY (OPTIONAL)</label>',
-      '    <input type="password" data-state="extraOpenaiKey" value="' + esc(state.extraOpenaiKey) + '" placeholder="sk-..." autocomplete="off" spellcheck="false" />',
-      '    <span class="hint">Stored in keychain. Used only for embeddings + voice; never for chat when you&rsquo;re on Codex.</span>',
+      '    <input type="password" data-state="extraOpenaiKey" name="setup-extra-openai-key-no-autofill" value="' + esc(state.extraOpenaiKey) + '" placeholder="sk-..." autocomplete="new-password" data-1p-ignore="true" data-lpignore="true" data-form-type="other" spellcheck="false" />',
+      '    <span class="hint">Stored in Clementine&rsquo;s local vault. Used only for embeddings + voice; never for chat when you&rsquo;re on Codex.</span>',
       '  </div>',
       '</div>',
     ].join('');
@@ -513,7 +513,7 @@ const SETUP_JS = `
       '  <div class="step-desc">Paste the bot token, click Verify, then add the bot to a server. Skip otherwise.</div>',
       '  <div class="field">',
       '    <label>DISCORD BOT TOKEN</label>',
-      '    <input type="password" data-state="discordToken" value="' + esc(state.discordToken) + '" placeholder="paste token or leave blank" autocomplete="off" spellcheck="false" />',
+      '    <input type="password" data-state="discordToken" name="setup-discord-token-no-autofill" value="' + esc(state.discordToken) + '" placeholder="paste token or leave blank" autocomplete="new-password" data-1p-ignore="true" data-lpignore="true" data-form-type="other" spellcheck="false" />',
       '    <span class="hint">Create one at discord.com/developers/applications. Bot needs the Message Content + Server Members intents.</span>',
       '    <button class="ws-pick" type="button" data-discord-verify style="margin-top:8px;"' + (verifyDisabled ? ' disabled' : '') + '>VERIFY TOKEN</button>',
       '  </div>',
@@ -530,7 +530,7 @@ const SETUP_JS = `
       '  <div class="step-desc">Connect external apps (Gmail, Slack, Notion, GitHub, Linear, Drive, CRMs) in one shot. Skip for now if you don&rsquo;t use these.</div>',
       '  <div class="field">',
       '    <label>COMPOSIO API KEY</label>',
-      '    <input type="password" data-state="composioKey" value="' + esc(state.composioKey) + '" placeholder="paste key or leave blank" autocomplete="off" spellcheck="false" />',
+      '    <input type="password" data-state="composioKey" name="setup-composio-key-no-autofill" value="' + esc(state.composioKey) + '" placeholder="paste key or leave blank" autocomplete="new-password" data-1p-ignore="true" data-lpignore="true" data-form-type="other" spellcheck="false" />',
       '    <span class="hint">Sign up at composio.dev and create an API key.</span>',
       '  </div>',
       '</div>',

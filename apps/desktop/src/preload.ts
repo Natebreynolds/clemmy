@@ -77,8 +77,7 @@ const api = {
   setupStatus: () => ipcRenderer.invoke('clemmy:setup-status') as Promise<{ needsSetup: boolean; hasKeychain: boolean }>,
   /** Per-credential listing for the dashboard / wizard. */
   credentialsList: () => ipcRenderer.invoke('clemmy:credentials-list') as Promise<{ rows: Array<Record<string, unknown>> }>,
-  /** Write a credential through main → SecretStore (keychain when
-   *  packaged, file vault otherwise). */
+  /** Write a credential through main into Clementine's local vault. */
   credentialsSet: (name: string, value: string) => ipcRenderer.invoke('clemmy:credentials-set', { name, value }) as Promise<Record<string, unknown>>,
   /** Persist a workspace path to ~/.clementine-next/.env's WORKSPACE_DIRS. */
   setupSaveWorkspace: (absPath: string) => ipcRenderer.invoke('clemmy:setup-save-workspace', { path: absPath }) as Promise<{ ok: boolean }>,

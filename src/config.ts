@@ -81,7 +81,7 @@ function readSecretFromFileVaultSync(name: string): string | undefined {
 
 export function getOpenAiApiKey(): string {
   // Env wins (highest priority for the sync path) → file vault → empty.
-  // The composite SecretStore implements the full keychain-first read
+  // The composite SecretStore implements the full file/env/keychain read
   // order asynchronously; this sync helper keeps existing call sites
   // working without forcing async refactors.
   const fromEnv = getRuntimeEnv('OPENAI_API_KEY', '');

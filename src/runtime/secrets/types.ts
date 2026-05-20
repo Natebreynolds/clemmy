@@ -4,11 +4,11 @@
  * Why this exists:
  *   - .env + state/auth.json works fine for a CLI but is the wrong
  *     long-term path for a packaged desktop app.
- *   - Keychain is the right destination, but it's fragile if treated
- *     as a one-way migration (corruption, lost entries, version drift).
- *   - This abstraction lets us add Keychain as the primary store in
- *     Electron without breaking the CLI path, and keep .env / file as
- *     transparent fallbacks for development.
+ *   - Keychain is useful, but it is fragile as a default desktop store
+ *     because app updates can trigger macOS access prompts.
+ *   - This abstraction keeps the local file vault as the stable default
+ *     while preserving Keychain as an explicit repair/reset/migration
+ *     target.
  *
  * Design rules (from the project goal):
  *   1. One stable keychain service name forever: com.clemmy.desktop.v1.

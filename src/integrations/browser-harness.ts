@@ -3,7 +3,7 @@ import { existsSync, lstatSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { getSecretStore } from '../runtime/secrets/index.js';
-import { invalidateCachedScan as invalidateCliScan } from '../runtime/cli-discovery.js';
+import { invalidateCachedScan as invalidateCliScan, resolveSafeCliProbe } from '../runtime/cli-discovery.js';
 
 export const BROWSER_HARNESS_REPO_URL = 'https://github.com/browser-use/browser-harness';
 export const BROWSER_HARNESS_DIR = path.join(os.homedir(), 'Developer', 'browser-harness');
@@ -50,6 +50,8 @@ export interface InstallJob {
   startedAt: string;
   completedAt?: string;
   exitCode?: number | null;
+  metadata?: Record<string, string>;
+  connectedRecorded?: boolean;
 }
 
 const jobs = new Map<string, InstallJob>();
@@ -162,21 +164,26 @@ function commandVersion(command: string, args: string[]): string | undefined {
 
 function prerequisite(name: string, versionArgs: string[] = ['--version']): BrowserHarnessStatus['prerequisites'][number] {
   const found = commandPath(name);
+  const safe = found ? resolveSafeCliProbe(name, found) : null;
   return {
     name,
-    available: Boolean(found),
-    path: found,
-    version: found ? commandVersion(name, versionArgs) : undefined,
+    available: Boolean(safe && !safe.skipped),
+    path: safe?.path ?? found,
+    version: safe && !safe.skipped ? commandVersion(safe.command, versionArgs) : safe?.reason,
   };
 }
 
 export function browserHarnessInstallCommand(): string {
   return [
     'set -e',
-    'if ! command -v git >/dev/null 2>&1; then echo "git is required before installing Browser Harness."; exit 2; fi',
+    'GIT_BINARY=""',
+    'if command -v git >/dev/null 2>&1 && [ "$(command -v git)" != "/usr/bin/git" ]; then GIT_BINARY="$(command -v git)"; fi',
+    'if [ -z "$GIT_BINARY" ] && [ -x /Library/Developer/CommandLineTools/usr/bin/git ]; then GIT_BINARY=/Library/Developer/CommandLineTools/usr/bin/git; fi',
+    'if [ -z "$GIT_BINARY" ] && [ -x /Applications/Xcode.app/Contents/Developer/usr/bin/git ]; then GIT_BINARY=/Applications/Xcode.app/Contents/Developer/usr/bin/git; fi',
+    'if [ -z "$GIT_BINARY" ]; then echo "Git is required before installing Browser Harness. Install Xcode Command Line Tools or Git, then retry."; exit 2; fi',
     'if ! command -v uv >/dev/null 2>&1; then echo "uv is required before installing Browser Harness. Install uv first: https://docs.astral.sh/uv/getting-started/installation/"; exit 2; fi',
     'mkdir -p "$HOME/Developer"',
-    `if [ ! -d "${BROWSER_HARNESS_DIR}/.git" ]; then git clone ${BROWSER_HARNESS_REPO_URL} "${BROWSER_HARNESS_DIR}"; else cd "${BROWSER_HARNESS_DIR}" && git pull --ff-only; fi`,
+    `if [ ! -d "${BROWSER_HARNESS_DIR}/.git" ]; then "$GIT_BINARY" clone ${BROWSER_HARNESS_REPO_URL} "${BROWSER_HARNESS_DIR}"; else cd "${BROWSER_HARNESS_DIR}" && "$GIT_BINARY" pull --ff-only; fi`,
     `cd "${BROWSER_HARNESS_DIR}"`,
     'uv tool install -e .',
     'mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills/browser-harness"',
@@ -188,6 +195,7 @@ export function browserHarnessInstallCommand(): string {
 
 export async function getBrowserHarnessStatus(): Promise<BrowserHarnessStatus> {
   const command = commandPath('browser-harness');
+  const safeCommand = command ? resolveSafeCliProbe('browser-harness', command) : null;
   const store = await getSecretStore();
   const cloudKey = await store.get('browser_use_api_key');
   const skillPath = path.join(BROWSER_HARNESS_CODEX_SKILL_DIR, 'SKILL.md');
@@ -199,8 +207,8 @@ export async function getBrowserHarnessStatus(): Promise<BrowserHarnessStatus> {
   }
   return {
     installed: Boolean(command),
-    commandPath: command,
-    version: command ? commandVersion('browser-harness', ['--version']) : undefined,
+    commandPath: safeCommand?.path ?? command,
+    version: safeCommand && !safeCommand.skipped ? commandVersion(safeCommand.command, ['--version']) : undefined,
     installDir: BROWSER_HARNESS_DIR,
     repoPresent: existsSync(path.join(BROWSER_HARNESS_DIR, '.git')),
     codexSkillLinked,
@@ -305,7 +313,7 @@ export function validateInstallCommand(command: string): { ok: true; normalized:
   return { ok: true, normalized };
 }
 
-export function startApprovedInstallCommand(command: string, title = 'Install capability'): InstallJob {
+export function startApprovedInstallCommand(command: string, title = 'Install capability', metadata?: Record<string, string>): InstallJob {
   const checked = validateInstallCommand(command);
   if (!checked.ok) throw new Error(checked.error);
   const id = `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
@@ -317,6 +325,7 @@ export function startApprovedInstallCommand(command: string, title = 'Install ca
     command: checked.normalized,
     output: '',
     startedAt: new Date().toISOString(),
+    metadata,
   };
   jobs.set(id, job);
 

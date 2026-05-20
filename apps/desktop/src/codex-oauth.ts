@@ -15,9 +15,8 @@ import { shell } from 'electron';
  *   2. ~/.codex/auth.json                   (codex CLI compat)
  *
  * We write both so whichever runtime path the daemon takes finds the
- * tokens. Tokens also get mirrored into the desktop secret vault
- * (`codex_oauth_access_token` / `codex_oauth_refresh_token`) by the
- * caller so the dashboard's credentials view shows them as "connected".
+ * tokens. The setup flow avoids mirroring these tokens into Keychain;
+ * the runtime reads this native auth store directly.
  */
 
 const AUTH_BASE_URL = 'https://auth.openai.com';
