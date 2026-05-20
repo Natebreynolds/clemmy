@@ -10,6 +10,7 @@ import {
   CheckCircle2,
   Sparkles,
   Cpu,
+  Video,
 } from "lucide-react";
 import { Section } from "./ui/Section";
 
@@ -22,15 +23,16 @@ type Beat =
   | { kind: "reply"; text: string };
 
 const SCRIPT: Beat[] = [
-  { kind: "user", text: "Draft a Q4 retro doc from our wins this quarter and email it to the team." },
-  { kind: "think", text: "Recalling Q4 wins from project notes…" },
-  { kind: "memory", text: "vault/projects/Q4.md · 12 wins · last updated yesterday" },
-  { kind: "tool", icon: Search, label: "vault.search", args: '"Q4 wins, retro"', result: "12 matches" },
-  { kind: "tool", icon: FileSpreadsheet, label: "google_drive.create", args: "Q4 Retro · /Team Docs", result: "doc_e9f1a8" },
+  { kind: "memory", text: "Q4 Planning meeting · 47 min · auto-captured · 14 action items extracted" },
+  { kind: "user", text: "Summarize today's planning meeting and email action items to the team." },
+  { kind: "think", text: "Pulling transcript and structured notes…" },
+  { kind: "tool", icon: Video, label: "meeting.get", args: "today · Q4 Planning", result: "47 min · 3 speakers · 14 actions" },
+  { kind: "tool", icon: Search, label: "vault.search", args: '"Q4 plan, Acme partnership"', result: "8 matches" },
+  { kind: "tool", icon: FileSpreadsheet, label: "google_drive.create", args: "Q4 Planning · /Team Docs", result: "doc_e9f1a8" },
   { kind: "approval", label: "Send email to 7 recipients?" },
-  { kind: "tool", icon: Mail, label: "gmail.send", args: "team@clem.ai · Q4 Retro", result: "sent · msg_3c1d" },
-  { kind: "memory", text: "Wrote: 'Q4 retro shipped 2026-05-20' → vault/notes" },
-  { kind: "reply", text: "Done. Doc in Team Docs, mail sent to 7. Logged the win." },
+  { kind: "tool", icon: Mail, label: "gmail.send", args: "team@clem.ai · Q4 Planning · 14 actions", result: "sent · msg_3c1d" },
+  { kind: "memory", text: "Wrote: 'Q4 planning shipped 2026-05-20 · 14 actions' → vault/notes" },
+  { kind: "reply", text: "Done. Doc in Team Docs, mail sent to 7. 14 actions assigned and logged." },
 ];
 
 const TYPE_SPEED = 14; // ms per char for typed strings

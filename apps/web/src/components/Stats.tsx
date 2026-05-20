@@ -9,10 +9,10 @@ const STATS: Array<{
   label: string;
   sub: string;
 }> = [
-  { value: 200, suffix: "+", label: "Connected apps",  sub: "via Composio · Gmail · Slack · Notion · Sheets · …" },
-  { value: 40,  suffix: "+", label: "MCP servers",     sub: "DataForSEO · Supabase · Apify · Bright Data · …" },
-  { value: 100, suffix: "%", label: "Local-first",     sub: "Data lives in ~/.clementine-next/ · nothing else" },
-  { value: 0,   suffix: "",  label: "Cost to run",     sub: "Free, MIT-licensed · use your own API keys" },
+  { value: 0,   suffix: "",  label: "Bots in your meetings", sub: "Native Zoom · Meet · Teams capture · no participant-list noise" },
+  { value: 200, suffix: "+", label: "Connected apps",        sub: "via Composio · Gmail · Slack · Notion · Sheets · …" },
+  { value: 40,  suffix: "+", label: "MCP servers",           sub: "DataForSEO · Supabase · Apify · Bright Data · …" },
+  { value: 100, suffix: "%", label: "Local-first",           sub: "Data lives in ~/.clementine-next/ · nothing else" },
 ];
 
 export function Stats() {

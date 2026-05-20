@@ -94,9 +94,12 @@ export function Hero() {
             initial={{ opacity: 0, y: 8 }}
             animate={{ opacity: 1, y: 0 }}
             transition={{ duration: 0.6, delay: 0.45 }}
-            className="mt-5 mx-auto max-w-xl text-sm sm:text-base leading-relaxed text-[var(--ink-dim)]"
+            className="mt-5 mx-auto max-w-2xl text-sm sm:text-base leading-relaxed text-[var(--ink-dim)]"
           >
-            Persistent memory. Every tool you use. Runs in the background on your Mac.
+            Persistent memory. Every tool you use.{" "}
+            <span className="text-clem-300">Sits in your meetings —</span>{" "}
+            <span className="text-white/90">no bot joins the call.</span>{" "}
+            Runs in the background on your Mac.
           </motion.p>
           <motion.div
             initial={{ opacity: 0, y: 12 }}
