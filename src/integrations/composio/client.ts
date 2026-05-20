@@ -3,6 +3,12 @@ import path from 'node:path';
 import { Composio } from '@composio/core';
 import { BASE_DIR } from '../../config.js';
 import { readEnvFile, writeEnvFile } from '../../setup/env-file.js';
+import {
+  executeComposioCliTool,
+  getComposioCliStatus,
+  searchComposioCliTools,
+  type ComposioCliStatus,
+} from './cli.js';
 
 const ENV_FILE = path.join(BASE_DIR, '.env');
 const CACHE_DIR = path.join(BASE_DIR, 'state');
@@ -12,8 +18,10 @@ const DEFAULT_USER_ID = 'default';
 const CONNECTIONS_TTL_MS = 60_000;
 const CATALOG_TTL_MS = 60 * 60_000;
 const USER_ID_TTL_MS = 60_000;
+const BACKEND_VALUES = ['auto', 'sdk', 'cli'] as const;
 
 export type ToolkitAuthMode = 'managed' | 'byo' | 'none';
+export type ComposioExecutionBackend = typeof BACKEND_VALUES[number];
 
 export interface CuratedToolkit {
   slug: string;
@@ -106,6 +114,8 @@ export interface ComposioDashboardSnapshot {
   apiKeyPresent: boolean;
   maskedApiKey?: string;
   userId: string;
+  executionBackend: ComposioExecutionBackend;
+  cli: ComposioCliStatus;
   connected: ConnectedToolkit[];
   toolkits: ComposioDashboardToolkit[];
   featured: string[];
@@ -160,6 +170,12 @@ function readComposioEnv(key: 'COMPOSIO_API_KEY' | 'COMPOSIO_USER_ID'): string {
   return '';
 }
 
+function readComposioConfigEnv(key: 'COMPOSIO_BACKEND'): string {
+  const fromProcess = process.env[key]?.trim();
+  if (fromProcess) return fromProcess;
+  return readLocalEnv()[key]?.trim() ?? '';
+}
+
 function str(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
 }
@@ -203,6 +219,7 @@ export function getComposioCredentialStatus(): {
   apiKeyPresent: boolean;
   maskedApiKey?: string;
   userId: string;
+  executionBackend: ComposioExecutionBackend;
 } {
   const apiKey = readComposioEnv('COMPOSIO_API_KEY');
   return {
@@ -210,7 +227,40 @@ export function getComposioCredentialStatus(): {
     apiKeyPresent: Boolean(apiKey),
     maskedApiKey: apiKey ? maskApiKey(apiKey) : undefined,
     userId: readComposioEnv('COMPOSIO_USER_ID') || DEFAULT_USER_ID,
+    executionBackend: getComposioExecutionBackend(),
   };
+}
+
+export function getComposioExecutionBackend(): ComposioExecutionBackend {
+  const raw = readComposioConfigEnv('COMPOSIO_BACKEND').toLowerCase();
+  return (BACKEND_VALUES as readonly string[]).includes(raw) ? raw as ComposioExecutionBackend : 'auto';
+}
+
+export function saveComposioExecutionBackend(backend: string): ComposioExecutionBackend {
+  const normalized = (BACKEND_VALUES as readonly string[]).includes(backend) ? backend as ComposioExecutionBackend : 'auto';
+  const env = readEnvFile(ENV_FILE);
+  env.COMPOSIO_BACKEND = normalized;
+  writeEnvFile(ENV_FILE, env);
+  process.env.COMPOSIO_BACKEND = normalized;
+  resetComposioClient();
+  return normalized;
+}
+
+function composioCliOptions(): { apiKey?: string; userId?: string } {
+  const apiKey = readComposioEnv('COMPOSIO_API_KEY');
+  const userId = readComposioEnv('COMPOSIO_USER_ID') || DEFAULT_USER_ID;
+  return {
+    ...(apiKey ? { apiKey } : {}),
+    ...(userId ? { userId } : {}),
+  };
+}
+
+export async function getComposioRuntimeStatus(): Promise<ReturnType<typeof getComposioCredentialStatus> & {
+  cli: ComposioCliStatus;
+}> {
+  const credentials = getComposioCredentialStatus();
+  const cli = await getComposioCliStatus(composioCliOptions());
+  return { ...credentials, cli };
 }
 
 export function saveComposioCredentials(apiKey: string, userId?: string): void {
@@ -582,6 +632,24 @@ export async function executeComposioTool(
   args: Record<string, unknown>,
   connectedAccountId?: string,
 ): Promise<unknown> {
+  const backend = getComposioExecutionBackend();
+  if (backend !== 'sdk' && !connectedAccountId) {
+    const cliStatus = await getComposioCliStatus(composioCliOptions());
+    if (cliStatus.installed && (backend === 'cli' || cliStatus.authenticated)) {
+      try {
+        return await executeComposioCliTool(toolSlug, args, composioCliOptions());
+      } catch (error) {
+        if (backend === 'cli') throw error;
+        // In auto mode, a CLI auth/version mismatch should not break
+        // existing users. Fall through to the SDK path.
+      }
+    } else if (backend === 'cli') {
+      throw new Error(cliStatus.installed
+        ? 'Composio CLI is installed, but no CLI login was detected. Run composio login or switch the backend to AUTO/SDK.'
+        : 'Composio CLI is not installed. Install it or switch the backend to AUTO/SDK.');
+    }
+  }
+
   const composio = getComposio();
   if (!composio) throw new Error('COMPOSIO_API_KEY is not configured.');
   const body: Record<string, unknown> = {
@@ -593,8 +661,20 @@ export async function executeComposioTool(
   return (composio as any).tools.execute(toolSlug, body);
 }
 
+export async function searchComposioToolsViaCli(
+  query: string,
+  options: { toolkitSlug?: string; limit?: number } = {},
+): Promise<unknown> {
+  return searchComposioCliTools(query, {
+    ...composioCliOptions(),
+    toolkitSlug: options.toolkitSlug,
+    limit: options.limit,
+  });
+}
+
 export async function buildComposioDashboardSnapshot(): Promise<ComposioDashboardSnapshot> {
   const credentials = getComposioCredentialStatus();
+  const cli = await getComposioCliStatus(composioCliOptions());
   if (!credentials.enabled) {
     const toolkits = CURATED_TOOLKITS.map((toolkit) => ({
       slug: toolkit.slug,
@@ -609,6 +689,7 @@ export async function buildComposioDashboardSnapshot(): Promise<ComposioDashboar
     }));
     return {
       ...credentials,
+      cli,
       connected: [],
       toolkits,
       featured: toolkits.map((toolkit) => toolkit.slug),
@@ -695,6 +776,7 @@ export async function buildComposioDashboardSnapshot(): Promise<ComposioDashboar
 
   return {
     ...credentials,
+    cli,
     connected,
     toolkits,
     featured,

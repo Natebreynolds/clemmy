@@ -5893,6 +5893,25 @@ body {
   outline: none;
 }
 .hub-apps-controls input:focus { border-color: var(--accent); }
+.hub-inline-select {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--fg-3);
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+.hub-inline-select select {
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  color: var(--fg);
+  font: inherit;
+  font-size: 10px;
+  padding: 5px 8px;
+  outline: none;
+}
+.hub-inline-select select:focus { border-color: var(--accent); }
 .hub-apps-controls button {
   background: transparent;
   border: 1px solid var(--accent);
@@ -12759,6 +12778,7 @@ const CONSOLE_JS = `
           '<input type="password" placeholder="Composio API key (sk_…)" data-hub-composio-key autocomplete="new-password" data-1p-ignore="true" data-lpignore="true" spellcheck="false" name="api-key-composio-no-autofill" />',
           '<button data-hub-composio-save>SAVE API KEY</button>',
           '<a href="https://platform.composio.dev" target="_blank" rel="noopener" style="font-size:10px;letter-spacing:0.14em;color:var(--fg-3);">get a key →</a>',
+          renderComposioCliChip(status),
         ].join('');
         listEl.innerHTML = '<div class="settings-info">— Composio not configured yet. Paste your API key above to start connecting apps. —</div>';
         metaEl.textContent = 'not configured';
@@ -12783,6 +12803,8 @@ const CONSOLE_JS = `
       }
 
       const snapshot = await fetchJSON('/api/composio/toolkits');
+      if (snapshot?.cli) status.cli = snapshot.cli;
+      if (snapshot?.executionBackend) status.executionBackend = snapshot.executionBackend;
       const connected = (snapshot.connected || []).filter((c) => c.status !== 'DELETED');
       const toolkits = snapshot.toolkits || snapshot.available || [];
       const connectedSlugs = new Set(connected.map((c) => c.slug || c.toolkitSlug).filter(Boolean));
@@ -12794,6 +12816,8 @@ const CONSOLE_JS = `
       controlsEl.innerHTML = [
         '<input type="text" placeholder="filter apps (gmail, slack, notion, …)" data-hub-app-filter value="' + escMem(hubAppSearch) + '" />',
         '<button data-hub-composio-refresh>REFRESH ⟲</button>',
+        renderComposioBackendSelect(status),
+        renderComposioCliChip(status),
       ].join('');
       const filterEl = controlsEl.querySelector('[data-hub-app-filter]');
       if (filterEl) {
@@ -12807,6 +12831,27 @@ const CONSOLE_JS = `
         refreshBtn.addEventListener('click', async () => {
           await fetch(withToken('/api/composio/refresh'), { method: 'POST' });
           await refreshHubApps();
+        });
+      }
+      const backendSelect = controlsEl.querySelector('[data-hub-composio-backend]');
+      if (backendSelect) {
+        backendSelect.addEventListener('change', async () => {
+          const backend = backendSelect.value || 'auto';
+          try {
+            const r = await fetch(withToken('/api/composio/backend'), {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ backend }),
+            });
+            if (!r.ok) {
+              const j = await r.json().catch(() => ({}));
+              alert('Backend save failed: ' + (j.error || r.status));
+              return;
+            }
+            await refreshHubApps();
+          } catch (err) {
+            alert('Backend save failed: ' + (err.message || err));
+          }
         });
       }
 
@@ -12902,6 +12947,30 @@ const CONSOLE_JS = `
     } catch (err) {
       listEl.innerHTML = '<div class="settings-info" style="color:var(--accent-fail);">Composio: ' + escMem(err.message || err) + '</div>';
     }
+  }
+
+  function renderComposioBackendSelect(status) {
+    const current = status?.executionBackend || 'auto';
+    const opts = [
+      ['auto', 'AUTO'],
+      ['cli', 'CLI'],
+      ['sdk', 'SDK'],
+    ].map(([value, label]) => '<option value="' + value + '"' + (current === value ? ' selected' : '') + '>' + label + '</option>').join('');
+    return '<label class="hub-inline-select"><span>backend</span><select data-hub-composio-backend>' + opts + '</select></label>';
+  }
+
+  function renderComposioCliChip(status) {
+    const cli = status?.cli || {};
+    const installed = cli.installed === true;
+    const auth = cli.authenticated === true;
+    const label = installed
+      ? ('CLI ' + (auth ? 'READY' : 'INSTALLED') + (cli.version ? ' · ' + cli.version : ''))
+      : 'CLI NOT INSTALLED';
+    const cls = installed && auth ? 'active' : installed ? 'pending' : 'available';
+    const title = installed
+      ? ((cli.path || 'composio') + (cli.authMessage ? ' · ' + cli.authMessage : ''))
+      : 'Install with: curl -fsSL https://composio.dev/install | bash';
+    return '<span class="hub-app-pill ' + cls + '" title="' + escMem(title) + '">' + escMem(label) + '</span>';
   }
 
   function renderBrowserHarnessOutput(result) {

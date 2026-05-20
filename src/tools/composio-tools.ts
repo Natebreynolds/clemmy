@@ -6,6 +6,7 @@ import { needsApprovalFromTaxonomy } from '../agents/tool-taxonomy.js';
 import {
   executeComposioTool,
   getComposioCredentialStatus,
+  getComposioRuntimeStatus,
   listComposioToolkitTools,
   listConnectedToolkits,
 } from '../integrations/composio/client.js';
@@ -192,7 +193,7 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
     description: 'Inspect whether Composio is configured and list active third-party app connections available to Clementine.',
     parameters: z.object({}),
     execute: async () => {
-      const credentials = getComposioCredentialStatus();
+      const credentials = await getComposioRuntimeStatus();
       const connections = credentials.enabled ? await listConnectedToolkits() : [];
       return prettyJson({
         ...credentials,

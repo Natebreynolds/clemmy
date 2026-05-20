@@ -29,8 +29,10 @@ import {
   ComposioNeedsAuthConfigError,
   disconnectToolkit,
   getComposioCredentialStatus,
+  getComposioRuntimeStatus,
   resetComposioClient,
   saveComposioCredentials,
+  saveComposioExecutionBackend,
 } from '../integrations/composio/client.js';
 import { computeAvailability, KNOWN_SERVICES, loadToolPreferences, saveToolPreferences, type ToolSource } from '../integrations/tool-preferences.js';
 import { discoverMcpServers } from '../runtime/mcp-config.js';
@@ -267,8 +269,8 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
     }
   });
 
-  app.get('/api/composio/status', requireAuth, (_req, res) => {
-    res.json(getComposioCredentialStatus());
+  app.get('/api/composio/status', requireAuth, async (_req, res) => {
+    res.json(await getComposioRuntimeStatus());
   });
 
   app.get('/api/composio/toolkits', requireAuth, async (_req, res) => {
@@ -285,6 +287,16 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
     try {
       saveComposioCredentials(apiKey, userId);
       res.json({ ok: true, status: getComposioCredentialStatus() });
+    } catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post('/api/composio/backend', requireAuth, (req, res) => {
+    const backend = typeof req.body.backend === 'string' ? req.body.backend : 'auto';
+    try {
+      const saved = saveComposioExecutionBackend(backend);
+      res.json({ ok: true, backend: saved });
     } catch (error) {
       res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
     }
