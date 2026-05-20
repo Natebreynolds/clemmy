@@ -110,6 +110,7 @@ test('Orchestrator tools are deliberation + read-only discovery/memory tools', a
     [
       'ask_user_question',
       'composio_search_tools',
+      'desktop_status',
       'draft_plan',
       'local_cli_list',
       'local_cli_probe',
