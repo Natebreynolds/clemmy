@@ -10,41 +10,44 @@ const items = [
     icon: Brain,
     title: "One memory spine",
     bullets: [
-      "Markdown vault as the floor",
-      "SQLite FTS + embeddings",
-      "Working memory + session briefs",
+      "Markdown vault — your notes, your format",
+      "SQLite FTS + embeddings, indexed in the background",
+      "Working memory carries context between sessions",
+      "Every meeting, decision, and tool result writes here",
     ],
     body:
-      "Persistent across sessions, cleaned and re-summarized in the background. She remembers your projects, preferences, and the rhythm of your work — because the runtime knows where to find them.",
+      "Tomorrow morning she opens already knowing what you shipped, what slipped, what's due, and what tools worked for what task. Nothing to re-explain.",
   },
   {
     icon: Wrench,
     title: "One tool surface",
     bullets: [
-      "Local SDK + computer-use",
-      "MCP-discovered (40+ servers)",
-      "Composio broker (200+ apps)",
+      "200+ Composio apps — Gmail, Slack, Sheets, Notion, Linear",
+      "40+ MCP servers, hot-reloaded from the dashboard",
+      "Computer-use — write files, run shells, edit code",
+      "Custom skills — drop SKILL.md and she finds it",
     ],
     body:
-      "All on a single, namespaced surface. The model sees a compact list, not a dump of every schema, and discovers what it needs on demand.",
+      "She uses the things you already pay for. No new dashboard to learn. No new keys for half the integrations — Composio handles auth once.",
   },
   {
     icon: ShieldCheck,
     title: "One trust gradient",
     bullets: [
-      "read · write · execute · send · admin",
-      "Hard denylist always enforced",
-      "Admin actions always ask",
+      "read · write · execute · send · admin — five lanes",
+      "Hard denylist for rm -rf, sudo, disk wipes — always",
+      "Plan-scoped auto-approval: approve a plan, the steps go",
+      "Append-only audit log of every tool call",
     ],
     body:
-      "Every tool flows through a single classifier, gated by the scope policy you set: strict, workspace, or yolo.",
+      "She moves fast on safe work and stops at irreversible ones. You set the scope; the policy does the rest.",
   },
 ];
 
 export function Primitives() {
   return (
     <Section
-      eyebrow="The pitch in three primitives"
+      eyebrow="Three primitives, end to end"
       title={
         <>
           One memory. One tool surface.
@@ -52,7 +55,7 @@ export function Primitives() {
           <span className="text-[var(--ink-dim)]">One trust policy.</span>
         </>
       }
-      intro="Clementine isn't a chatbot you call. She's an assistant that already knows your context, has access to the things you already use, and asks before she does something irreversible."
+      intro="Most agents bolt features together. Clementine is built on three primitives the runtime never violates — that's how she stays predictable as you teach her more."
     >
       <motion.div
         variants={stagger}
@@ -67,21 +70,21 @@ export function Primitives() {
             key={title}
             whileHover={{ y: -3 }}
             transition={{ type: "spring", stiffness: 200, damping: 22 }}
-            className="group relative overflow-hidden rounded-2xl bg-white/[0.02] p-7 ring-1 ring-white/10 hover:ring-clem-400/30 transition-all"
+            className="group relative overflow-hidden card-surface p-7 transition-all"
           >
-            <div className="absolute -top-24 -right-24 h-48 w-48 rounded-full bg-clem-500/[0.12] blur-3xl opacity-0 group-hover:opacity-100 transition-opacity duration-500" />
-            <div className="font-mono text-[10px] uppercase tracking-[0.18em] text-clem-300/60 mb-3">
+            <div className="absolute -top-24 -right-24 h-48 w-48 rounded-full bg-clem-500/[0.10] blur-3xl opacity-0 group-hover:opacity-100 transition-opacity duration-500" />
+            <div className="font-mono text-[10px] uppercase tracking-[0.18em] text-clem-700/70 mb-3">
               {String(i + 1).padStart(2, "0")}
             </div>
-            <Icon className="h-7 w-7 text-clem-400" />
-            <h3 className="mt-5 text-xl font-semibold tracking-tight">{title}</h3>
+            <Icon className="h-7 w-7 text-clem-600" />
+            <h3 className="mt-5 text-xl font-semibold tracking-tight text-[var(--ink-strong)]">{title}</h3>
             <ul className="mt-4 space-y-2">
               {bullets.map((b) => (
                 <li
                   key={b}
-                  className="flex items-start gap-2 text-[13px] text-white/85"
+                  className="flex items-start gap-2 text-[13px] text-[var(--ink)]"
                 >
-                  <span className="mt-1.5 size-1.5 shrink-0 rounded-full bg-clem-400/80" />
+                  <span className="mt-1.5 size-1.5 shrink-0 rounded-full bg-clem-500" />
                   <span>{b}</span>
                 </li>
               ))}

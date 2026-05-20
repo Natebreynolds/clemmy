@@ -6,18 +6,16 @@ import { PrimaryButton, GhostButton } from "./ui/Button";
 
 export function DownloadCTA() {
   return (
-    <section className="relative overflow-hidden px-6 py-32 sm:py-44">
-      {/* Big radial glow */}
+    <section className="relative overflow-hidden px-6 py-32 sm:py-44 bg-[var(--bg-dim)]/30">
       <div className="radial-glow absolute inset-0" />
-      <div className="absolute inset-0 dot-grid opacity-40" />
+      <div className="absolute inset-0 dot-grid opacity-50" />
       <motion.div
-        animate={{ opacity: [0.5, 0.9, 0.5] }}
+        animate={{ opacity: [0.4, 0.7, 0.4] }}
         transition={{ duration: 6, repeat: Infinity, ease: "easeInOut" }}
-        className="pointer-events-none absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 h-[60vh] w-[80vw] rounded-[50%] bg-clem-500/20 blur-[140px]"
+        className="pointer-events-none absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 h-[60vh] w-[80vw] rounded-[50%] bg-clem-400/25 blur-[160px]"
       />
 
       <div className="relative max-w-4xl mx-auto text-center">
-        {/* Logo orb */}
         <motion.div
           initial={{ opacity: 0, scale: 0.85 }}
           whileInView={{ opacity: 1, scale: 1 }}
@@ -43,7 +41,7 @@ export function DownloadCTA() {
           whileInView={{ opacity: 1, y: 0 }}
           viewport={{ once: true, margin: "-100px" }}
           transition={{ duration: 0.8, ease: [0.16, 1, 0.3, 1] }}
-          className="text-5xl sm:text-7xl font-semibold leading-[1] tracking-tight"
+          className="text-5xl sm:text-7xl font-semibold leading-[1] tracking-tight text-[var(--ink-strong)]"
         >
           Bring her home.
         </motion.h2>
@@ -71,13 +69,12 @@ export function DownloadCTA() {
           <GhostButton href="/api/download?arch=intel">Intel Mac</GhostButton>
         </motion.div>
 
-        {/* Spec strip */}
         <motion.div
           initial={{ opacity: 0, y: 12 }}
           whileInView={{ opacity: 1, y: 0 }}
           viewport={{ once: true, margin: "-100px" }}
           transition={{ duration: 0.7, delay: 0.3 }}
-          className="mt-10 mx-auto inline-flex flex-wrap items-center justify-center gap-x-6 gap-y-3 rounded-2xl bg-white/[0.02] px-6 py-4 ring-1 ring-white/10 backdrop-blur"
+          className="mt-10 mx-auto inline-flex flex-wrap items-center justify-center gap-x-6 gap-y-3 rounded-2xl bg-white/80 px-6 py-4 ring-1 ring-black/10 backdrop-blur shadow-[0_10px_30px_-15px_rgba(80,40,10,0.18)]"
         >
           <SpecChip icon={Cpu}        label="macOS 13+" />
           <Divider />
@@ -85,7 +82,7 @@ export function DownloadCTA() {
           <Divider />
           <SpecChip icon={ShieldCheck} label="Signed · Notarized" />
           <Divider />
-          <SpecChip icon={Terminal}   label="MIT" />
+          <SpecChip icon={Terminal}   label="MIT · free" />
         </motion.div>
 
         <motion.div
@@ -99,7 +96,7 @@ export function DownloadCTA() {
             href="https://github.com/Natebreynolds/clemmy"
             target="_blank"
             rel="noreferrer"
-            className="inline-flex items-center gap-2 hover:text-white transition-colors"
+            className="inline-flex items-center gap-2 hover:text-[var(--ink-strong)] transition-colors"
           >
             <Github className="h-4 w-4" />
             View on GitHub
@@ -108,7 +105,7 @@ export function DownloadCTA() {
             href="https://github.com/Natebreynolds/clemmy#run-from-source-development"
             target="_blank"
             rel="noreferrer"
-            className="inline-flex items-center gap-2 hover:text-white transition-colors"
+            className="inline-flex items-center gap-2 hover:text-[var(--ink-strong)] transition-colors"
           >
             <Terminal className="h-4 w-4" />
             Build from source
@@ -117,7 +114,7 @@ export function DownloadCTA() {
             href="https://github.com/Natebreynolds/clemmy/releases"
             target="_blank"
             rel="noreferrer"
-            className="inline-flex items-center gap-2 hover:text-white transition-colors"
+            className="inline-flex items-center gap-2 hover:text-[var(--ink-strong)] transition-colors"
           >
             All releases
           </a>
@@ -129,13 +126,13 @@ export function DownloadCTA() {
 
 function SpecChip({ icon: Icon, label }: { icon: typeof Cpu; label: string }) {
   return (
-    <div className="inline-flex items-center gap-2 text-sm text-white/85">
-      <Icon className="h-4 w-4 text-clem-300" />
+    <div className="inline-flex items-center gap-2 text-sm text-[var(--ink-strong)]">
+      <Icon className="h-4 w-4 text-clem-600" />
       <span className="font-mono text-[12px] tracking-tight">{label}</span>
     </div>
   );
 }
 
 function Divider() {
-  return <span className="hidden sm:inline h-3 w-px bg-white/15" />;
+  return <span className="hidden sm:inline h-3 w-px bg-black/15" />;
 }

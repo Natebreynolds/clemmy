@@ -69,8 +69,8 @@ export function Channels() {
               className={
                 "inline-flex items-center gap-2 rounded-full px-4 py-2 text-sm transition-all " +
                 (isActive
-                  ? "bg-clem-500/15 text-clem-200 ring-1 ring-clem-400/40"
-                  : "text-[var(--ink-dim)] ring-1 ring-white/10 hover:ring-white/20 hover:text-white")
+                  ? "bg-clem-500/15 text-clem-800 ring-1 ring-clem-500/50"
+                  : "bg-white text-[var(--ink-dim)] ring-1 ring-black/10 hover:ring-black/20 hover:text-[var(--ink-strong)]")
               }
             >
               <Icon className="h-4 w-4" />
@@ -81,8 +81,7 @@ export function Channels() {
       </div>
 
       <div className="grid gap-10 lg:grid-cols-[1.25fr_1fr] items-center">
-        {/* Mockup canvas */}
-        <div className="relative aspect-[16/10] overflow-hidden rounded-2xl bg-[var(--bg-elev)] ring-1 ring-white/10 shadow-[0_30px_80px_-30px_rgba(0,0,0,0.7)]">
+        <div className="relative aspect-[16/10] overflow-hidden rounded-2xl bg-[var(--bg-elev)] ring-1 ring-black/10 shadow-[0_30px_80px_-30px_rgba(80,40,10,0.30)]">
           <AnimatePresence mode="wait">
             <motion.div
               key={active}
@@ -98,10 +97,8 @@ export function Channels() {
               {active === "api" && <WebhookMockup />}
             </motion.div>
           </AnimatePresence>
-          <div className="pointer-events-none absolute inset-0 ring-1 ring-inset ring-white/5 rounded-2xl" />
         </div>
 
-        {/* Copy */}
         <AnimatePresence mode="wait">
           <motion.div
             key={tab.id}
@@ -110,7 +107,7 @@ export function Channels() {
             exit={{ opacity: 0, y: -6 }}
             transition={{ duration: 0.3 }}
           >
-            <h3 className="text-2xl font-semibold tracking-tight">{tab.title}</h3>
+            <h3 className="text-2xl font-semibold tracking-tight text-[var(--ink-strong)]">{tab.title}</h3>
             <p className="mt-4 text-[var(--ink-dim)] leading-relaxed">{tab.body}</p>
           </motion.div>
         </AnimatePresence>
@@ -118,8 +115,6 @@ export function Channels() {
     </Section>
   );
 }
-
-/* ───────── Dashboard ───────── */
 
 function DashboardMockup() {
   return (
@@ -129,8 +124,6 @@ function DashboardMockup() {
     />
   );
 }
-
-/* ───────── Voice ───────── */
 
 function VoiceMockup() {
   const [transcript, setTranscript] = useState("");
@@ -142,9 +135,7 @@ function VoiceMockup() {
     const id = window.setInterval(() => {
       i++;
       setTranscript(FULL.slice(0, i));
-      if (i >= FULL.length) {
-        window.clearInterval(id);
-      }
+      if (i >= FULL.length) window.clearInterval(id);
     }, 28);
     return () => window.clearInterval(id);
   }, []);
@@ -163,7 +154,6 @@ function VoiceMockup() {
         Listening · OpenAI Realtime
       </div>
 
-      {/* Mic orb */}
       <motion.div
         animate={{ scale: [1, 1.06, 1] }}
         transition={{ duration: 2, repeat: Infinity, ease: "easeInOut" }}
@@ -175,7 +165,6 @@ function VoiceMockup() {
         </div>
       </motion.div>
 
-      {/* Waveform */}
       <div className="relative flex items-center gap-1 h-12 mb-6">
         {Array.from({ length: 36 }).map((_, i) => {
           const seed = (i * 37 + 13) % 100;
@@ -208,14 +197,12 @@ function VoiceMockup() {
         <span className="ml-0.5 inline-block h-[1em] w-[2px] -mb-[3px] bg-clem-300 align-middle animate-pulse" />
         &rdquo;
       </div>
-      <div className="relative mt-2 font-mono text-[11px] text-[var(--ink-dim)]/80">
+      <div className="relative mt-2 font-mono text-[11px] text-white/40">
         spacebar to stop · esc to cancel
       </div>
     </div>
   );
 }
-
-/* ───────── Discord ───────── */
 
 const DISCORD_BG = "#1e1f22";
 const DISCORD_SIDEBAR = "#2b2d31";
@@ -226,7 +213,6 @@ const DISCORD_MUTED = "#949ba4";
 function DiscordMockup() {
   return (
     <div className="absolute inset-0 flex font-sans" style={{ background: DISCORD_BG }}>
-      {/* Server rail */}
       <div className="hidden sm:flex w-[60px] shrink-0 flex-col items-center py-3 gap-2" style={{ background: DISCORD_BG }}>
         <div className="h-10 w-10 rounded-2xl bg-indigo-500 grid place-items-center text-white text-sm font-bold">D</div>
         <div className="h-px w-8 bg-white/10 my-1" />
@@ -236,7 +222,6 @@ function DiscordMockup() {
         <div className="h-10 w-10 rounded-3xl bg-white/5 grid place-items-center text-white/50 text-lg">+</div>
       </div>
 
-      {/* Channel list */}
       <div className="hidden md:flex w-[200px] shrink-0 flex-col" style={{ background: DISCORD_SIDEBAR }}>
         <div className="h-12 border-b border-black/30 flex items-center px-4 text-white font-semibold text-sm">
           Clementine
@@ -270,35 +255,22 @@ function DiscordMockup() {
         </div>
       </div>
 
-      {/* Chat pane */}
       <div className="flex-1 flex flex-col min-w-0" style={{ background: DISCORD_CHAT_BG, color: DISCORD_TEXT }}>
         <div className="h-12 border-b border-black/30 flex items-center px-4 text-sm">
           <span style={{ color: DISCORD_MUTED }}>#</span>
           <span className="ml-2 font-semibold text-white">clementine-bot</span>
         </div>
         <div className="flex-1 overflow-hidden px-4 py-3 space-y-4 text-[13.5px]">
-          <DiscordMsg
-            avatar="N"
-            avatarColor="#5865f2"
-            author="nathan"
-            time="10:42 AM"
-          >
+          <DiscordMsg avatar="N" avatarColor="#5865f2" author="nathan" time="10:42 AM">
             <p>any urgent emails this morning?</p>
           </DiscordMsg>
-          <DiscordMsg
-            isClementine
-            author="Clementine"
-            time="10:42 AM"
-          >
+          <DiscordMsg isClementine author="Clementine" time="10:42 AM">
             <p style={{ color: DISCORD_TEXT }}>3 worth eyes. Pulling now…</p>
             <ToolCall icon="📥" name="gmail.search" args='"unread is:important"' result="3 results" />
             <ApprovalCard />
           </DiscordMsg>
         </div>
-        <div
-          className="m-3 rounded-lg px-4 py-2.5 text-sm"
-          style={{ background: "#383a40", color: DISCORD_MUTED }}
-        >
+        <div className="m-3 rounded-lg px-4 py-2.5 text-sm" style={{ background: "#383a40", color: DISCORD_MUTED }}>
           Message #clementine-bot
         </div>
       </div>
@@ -307,19 +279,10 @@ function DiscordMockup() {
 }
 
 function DiscordMsg({
-  author,
-  time,
-  avatar,
-  avatarColor,
-  isClementine,
-  children,
+  author, time, avatar, avatarColor, isClementine, children,
 }: {
-  author: string;
-  time: string;
-  avatar?: string;
-  avatarColor?: string;
-  isClementine?: boolean;
-  children: React.ReactNode;
+  author: string; time: string; avatar?: string; avatarColor?: string;
+  isClementine?: boolean; children: React.ReactNode;
 }) {
   return (
     <div className="flex gap-3">
@@ -329,30 +292,20 @@ function DiscordMsg({
             <img src="/logo.png" alt="" className="h-full w-full" style={{ imageRendering: "pixelated" }} />
           </div>
         ) : (
-          <div
-            className="h-9 w-9 rounded-full grid place-items-center text-white text-sm font-bold"
-            style={{ background: avatarColor }}
-          >
+          <div className="h-9 w-9 rounded-full grid place-items-center text-white text-sm font-bold" style={{ background: avatarColor }}>
             {avatar}
           </div>
         )}
       </div>
       <div className="flex-1 min-w-0">
         <div className="flex items-baseline gap-2">
-          <span
-            className="font-semibold text-[14px]"
-            style={{ color: isClementine ? "#fdba74" : "#fff" }}
-          >
+          <span className="font-semibold text-[14px]" style={{ color: isClementine ? "#fdba74" : "#fff" }}>
             {author}
           </span>
           {isClementine && (
-            <span className="text-[10px] font-bold rounded-sm px-1.5 py-0.5 bg-indigo-500 text-white">
-              APP
-            </span>
+            <span className="text-[10px] font-bold rounded-sm px-1.5 py-0.5 bg-indigo-500 text-white">APP</span>
           )}
-          <span className="text-[11px]" style={{ color: DISCORD_MUTED }}>
-            {time}
-          </span>
+          <span className="text-[11px]" style={{ color: DISCORD_MUTED }}>{time}</span>
         </div>
         <div className="mt-0.5 space-y-2">{children}</div>
       </div>
@@ -403,8 +356,6 @@ function ApprovalCard() {
   );
 }
 
-/* ───────── Webhook / API ───────── */
-
 type StreamLine =
   | { kind: "tick"; text: string }
   | { kind: "tool"; text: string }
@@ -429,10 +380,7 @@ function WebhookMockup() {
 
   useEffect(() => {
     if (step >= STREAM.length) {
-      const t = window.setTimeout(() => {
-        setStep(0);
-        setTick((x) => x + 1);
-      }, 2200);
+      const t = window.setTimeout(() => { setStep(0); setTick((x) => x + 1); }, 2200);
       return () => window.clearTimeout(t);
     }
     const t = window.setTimeout(() => setStep(step + 1), 320);
@@ -440,7 +388,6 @@ function WebhookMockup() {
   }, [step]);
 
   const visible = STREAM.slice(0, step);
-
   const color = (k: StreamLine["kind"]) =>
     k === "tool"   ? "text-clem-300"
   : k === "result" ? "text-emerald-300"
@@ -449,7 +396,7 @@ function WebhookMockup() {
 
   return (
     <div className="absolute inset-0 flex flex-col bg-[#0a0806] font-mono text-[11.5px] leading-[1.5]">
-      <div className="flex items-center gap-2 border-b border-white/5 px-4 py-2.5 text-[var(--ink-dim)]">
+      <div className="flex items-center gap-2 border-b border-white/5 px-4 py-2.5 text-white/55">
         <span className="size-2.5 rounded-full bg-red-400/70" />
         <span className="size-2.5 rounded-full bg-yellow-400/70" />
         <span className="size-2.5 rounded-full bg-green-400/70" />
@@ -487,7 +434,7 @@ function WebhookMockup() {
           </motion.div>
         )}
       </div>
-      <div className="border-t border-white/5 px-4 py-2 text-[10px] text-[var(--ink-dim)] flex items-center gap-4">
+      <div className="border-t border-white/5 px-4 py-2 text-[10px] text-white/55 flex items-center gap-4">
         <span>Connected from: <span className="text-clem-300">Raycast</span></span>
         <span>·</span>
         <span>Also works in: Shortcuts · Alfred · cron · webhook</span>
@@ -497,9 +444,5 @@ function WebhookMockup() {
 }
 
 function Line({ children, c, indent }: { children: React.ReactNode; c?: string; indent?: boolean }) {
-  return (
-    <div className={(c ?? "text-white/85") + (indent ? " pl-4" : "")}>
-      {children}
-    </div>
-  );
+  return <div className={(c ?? "text-white/85") + (indent ? " pl-4" : "")}>{children}</div>;
 }

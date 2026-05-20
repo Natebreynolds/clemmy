@@ -11,11 +11,11 @@ const APPS = [
 
 export function ConnectedMarquee() {
   return (
-    <section className="relative py-16 overflow-hidden">
-      <div className="absolute inset-0 bg-gradient-to-b from-transparent via-clem-500/[0.03] to-transparent" />
+    <section className="relative py-16 overflow-hidden bg-[var(--bg-dim)]/40">
+      <div className="absolute inset-0 bg-gradient-to-b from-transparent via-clem-500/[0.04] to-transparent" />
       <div className="relative max-w-6xl mx-auto px-6">
         <div className="text-center mb-8">
-          <div className="font-mono text-xs uppercase tracking-[0.18em] text-clem-400/80 mb-3">
+          <div className="font-mono text-xs uppercase tracking-[0.18em] text-clem-700 mb-3">
             Reaches everything you already pay for
           </div>
           <p className="text-[var(--ink-dim)]">
@@ -43,9 +43,9 @@ function Strip({ apps, className }: { apps: string[]; className: string }) {
         {doubled.map((a, i) => (
           <span
             key={`${a}-${i}`}
-            className="inline-flex items-center gap-2 rounded-full bg-white/[0.03] px-4 py-2 ring-1 ring-white/10 text-sm text-white/85 hover:ring-clem-400/30 hover:text-white transition-colors"
+            className="inline-flex items-center gap-2 rounded-full bg-white px-4 py-2 ring-1 ring-black/10 text-sm text-[var(--ink-strong)] hover:ring-clem-500/40 transition-colors shadow-[0_2px_8px_-3px_rgba(80,40,10,0.10)]"
           >
-            <span className="size-1.5 rounded-full bg-clem-400/70" />
+            <span className="size-1.5 rounded-full bg-clem-500" />
             {a}
           </span>
         ))}

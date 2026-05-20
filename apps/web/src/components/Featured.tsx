@@ -14,6 +14,8 @@ import {
   Webhook,
   CheckCircle2,
   Sparkles,
+  Puzzle,
+  Workflow,
 } from "lucide-react";
 import { Section } from "./ui/Section";
 import { fadeUp, stagger } from "@/lib/motion";
@@ -30,7 +32,7 @@ export function Featured() {
           <span className="text-[var(--ink-dim)]">Now she does it for you.</span>
         </>
       }
-      intro="Five headline capabilities. Seven more underneath. Every one runs through the same memory, the same tools, and the same approval policy."
+      intro="Six headline capabilities. Six more underneath. Every one runs through the same memory, the same tools, and the same approval policy."
     >
       <div className="space-y-6">
         <FeatureRow
@@ -42,34 +44,50 @@ export function Featured() {
         />
         <FeatureRow
           eyebrow="200+ apps · 40+ MCP servers"
-          title="Reaches every tool you use."
-          body="Gmail, Slack, Sheets, Notion, Calendar through Composio. DataForSEO, Supabase, Hostinger, ElevenLabs, Apify, Bright Data, and any MCP server you drop in — live-reloaded, no daemon restart."
+          title="Reaches every tool you already pay for."
+          body="Connect Composio once and she uses Gmail, Slack, Notion, Sheets, Calendar, Linear, Stripe, Airtable, and 200+ more. Drop an MCP server into the dashboard and she picks it up live — DataForSEO, Supabase, Hostinger, ElevenLabs, Apify, Bright Data, Playwright. No daemon restart, no rebuild."
           icon={Plug}
           preview={<ToolOrbit />}
         />
         <div className="grid gap-6 md:grid-cols-2">
           <FeatureRow
-            eyebrow="OpenAI Realtime"
-            title="Voice in the dashboard."
-            body="Push-to-talk. Spoken commands route into the same local agent — same memory, same tools, same approvals."
+            eyebrow="Voice · OpenAI Realtime"
+            title="Talk to her like a coworker."
+            body="Push-to-talk in the dashboard. Spoken commands route into the same local agent — same memory, same tools, same approvals. Great for hands-free starts on a long task."
             icon={Mic}
             compact
             preview={<VoiceWave />}
           />
           <FeatureRow
             eyebrow="Memory spine"
-            title="Remembers what worked."
-            body="Markdown vault + SQLite FTS + embeddings. Tool choices that worked once stop being re-discovered every session."
+            title="Learns what works. Remembers it."
+            body="Markdown vault + SQLite FTS + embeddings. Decisions, wins, tool choices, and project context flow in automatically. Tomorrow's session starts knowing yesterday."
             icon={Brain}
             compact
             preview={<MemoryStack />}
           />
         </div>
         <FeatureRow
+          eyebrow="Workflows · runs on schedule"
+          title="Automate what you do twice."
+          body="Define a workflow once — morning briefing, weekly review, post-meeting follow-up, on-call summary — and she runs it on cron. Or trigger it from voice, webhook, or Discord. Workflows pull from memory, call tools, and report back without fail. Silent failure is a bug."
+          icon={Workflow}
+          preview={<WorkflowsPreview />}
+        />
+        <FeatureRow
+          eyebrow="Skills · drop-in extensibility"
+          title="Teach her in plain markdown."
+          body="A skill is a single SKILL.md file in ~/.clementine-next/skills/ that tells her how to do something domain-specific — onboard a new client, run a quarterly close, plan a launch. Drop one in, she finds it and uses it. No code required."
+          icon={Puzzle}
+          compact
+          preview={<SkillsPreview />}
+        />
+        <FeatureRow
           eyebrow="Trust gradient"
           title="Asks when it counts. Doesn't when it doesn't."
-          body="Five categories — read · write · execute · send · admin. One classifier routes every tool call. Hard denylist always enforced. Admin tools always ask."
+          body="Five categories — read · write · execute · send · admin. One classifier routes every tool call. Hard denylist always enforced. Admin tools always ask. You change the scope policy from the dashboard."
           icon={ShieldCheck}
+          compact
           preview={<ApprovalFlow />}
         />
       </div>
@@ -84,27 +102,27 @@ export function Featured() {
           initial="hidden"
           whileInView="visible"
           viewport={{ once: true, margin: "-60px" }}
-          className="grid gap-px overflow-hidden rounded-2xl bg-white/10 sm:grid-cols-2 lg:grid-cols-4"
+          className="grid gap-px overflow-hidden rounded-2xl bg-black/[0.08] sm:grid-cols-2 lg:grid-cols-4"
         >
           {[
             { icon: MessageSquare, title: "Discord bot", body: "DM her or post in a bot channel. Inline approval buttons run her from your phone." },
             { icon: Terminal, title: "Computer-use", body: "Write files, run shell commands, edit code. Gated by your scope policy, hard denylist absolute." },
-            { icon: Clock, title: "Scheduled tasks", body: "Pre-configured morning briefing, end-of-day, weekly review. Add your own from the dashboard." },
+            { icon: Clock, title: "Scheduled tasks", body: "Pre-configured morning briefing, end-of-day, weekly review. Add your own cron from the dashboard." },
             { icon: Webhook, title: "Webhook & API", body: "POST a task and walk away. NDJSON streaming on /chat/stream. Wire her into Raycast or Shortcuts." },
             { icon: Sparkles, title: "Goals & autonomy", body: "Active goals get injected into every cycle. She brings them up — you don't have to remember." },
             { icon: Plug, title: "Plugin system", body: "Drop a package into ~/.clementine-next/plugins/. Adds tools, monitors, channels — no rebuild." },
             { icon: ShieldCheck, title: "Audit log", body: "Append-only NDJSON record of every tool call. The substrate for the always-learning loop." },
-            { icon: Brain, title: "Skills", body: "Drop SKILL.md files into ~/.clementine-next/skills/. She'll discover and use them automatically." },
+            { icon: Brain, title: "Codex OAuth", body: "Sign in once with ChatGPT. Or bring your own OpenAI key. Or both. Your wallet, your model." },
           ].map(({ icon: Icon, title, body }) => (
             <motion.div
               key={title}
               variants={fadeUp}
-              className="group relative bg-[var(--bg)] p-6 transition-colors hover:bg-white/[0.02]"
+              className="group relative bg-[var(--bg-elev)] p-6 transition-colors hover:bg-clem-50/40"
             >
-              <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-clem-500/10 ring-1 ring-clem-500/20">
-                <Icon className="h-4 w-4 text-clem-300" />
+              <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-clem-500/12 ring-1 ring-clem-500/25">
+                <Icon className="h-4 w-4 text-clem-700" />
               </div>
-              <h3 className="mt-4 text-[15px] font-semibold tracking-tight">{title}</h3>
+              <h3 className="mt-4 text-[15px] font-semibold tracking-tight text-[var(--ink-strong)]">{title}</h3>
               <p className="mt-1.5 text-[13px] leading-relaxed text-[var(--ink-dim)]">{body}</p>
             </motion.div>
           ))}
@@ -136,11 +154,11 @@ function FeatureRow({
       whileInView="visible"
       viewport={{ once: true, margin: "-80px" }}
       className={
-        "group relative overflow-hidden rounded-2xl bg-white/[0.02] ring-1 ring-white/10 hover:ring-clem-400/30 transition-all " +
+        "group relative overflow-hidden card-surface transition-all hover:ring-clem-400/30 " +
         (compact ? "p-6" : "p-8 md:p-10")
       }
     >
-      <div className="absolute -top-32 -right-32 h-64 w-64 rounded-full bg-clem-500/[0.08] blur-3xl opacity-0 group-hover:opacity-100 transition-opacity duration-500" />
+      <div className="absolute -top-32 -right-32 h-64 w-64 rounded-full bg-clem-500/[0.10] blur-3xl opacity-0 group-hover:opacity-100 transition-opacity duration-500" />
       <div
         className={
           "relative grid gap-8 " +
@@ -148,13 +166,13 @@ function FeatureRow({
         }
       >
         <div>
-          <div className="flex items-center gap-2 font-mono text-[11px] uppercase tracking-wider text-clem-300">
+          <div className="flex items-center gap-2 font-mono text-[11px] uppercase tracking-wider text-clem-700">
             <Icon className="h-3.5 w-3.5" />
             {eyebrow}
           </div>
           <h3
             className={
-              "mt-3 font-semibold tracking-tight " +
+              "mt-3 font-semibold tracking-tight text-[var(--ink-strong)] " +
               (compact ? "text-xl" : "text-3xl md:text-4xl")
             }
           >
@@ -177,17 +195,17 @@ function FeatureRow({
   );
 }
 
-/* ───── Preview: orbiting tool icons ───── */
+/* ───── Preview: tool orbit ───── */
 
 const TOOLS = [
   { name: "Gmail", c: "#ea4335" },
   { name: "Slack", c: "#611f69" },
-  { name: "Notion", c: "#ffffff" },
+  { name: "Notion", c: "#1a1410" },
   { name: "Sheets", c: "#0f9d58" },
   { name: "Drive", c: "#1a73e8" },
   { name: "Calendar", c: "#3a87f0" },
   { name: "Linear", c: "#5e6ad2" },
-  { name: "GitHub", c: "#f6f6f6" },
+  { name: "GitHub", c: "#24292e" },
   { name: "Supabase", c: "#3ecf8e" },
   { name: "Stripe", c: "#635bff" },
   { name: "Airtable", c: "#fcb400" },
@@ -195,7 +213,6 @@ const TOOLS = [
 ];
 
 function ToolOrbit() {
-  // Distribute 12 tools across 3 rings with explicit pixel orbits
   const rings = [
     { count: 4, r: 92, dur: 32, dir: 1 },
     { count: 5, r: 152, dur: 48, dir: -1 },
@@ -219,25 +236,22 @@ function ToolOrbit() {
   return (
     <div className="absolute inset-0 flex items-center justify-center">
       <div className="relative aspect-square h-full">
-        {/* Orbit rings (visual) */}
         {rings.map((r, i) => (
           <div
             key={i}
-            className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 rounded-full border border-clem-300/12"
+            className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 rounded-full border border-clem-700/15"
             style={{ width: r.r * 2, height: r.r * 2 }}
           />
         ))}
 
-        {/* Core */}
         <motion.div
           animate={{ scale: [1, 1.06, 1] }}
           transition={{ duration: 3.5, repeat: Infinity, ease: "easeInOut" }}
-          className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 size-16 rounded-full bg-gradient-to-br from-clem-300 to-clem-600 shadow-[0_0_70px_rgba(249,115,22,0.7)] ring-2 ring-clem-200/40"
+          className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 size-16 rounded-full bg-gradient-to-br from-clem-300 to-clem-600 shadow-[0_0_70px_rgba(249,115,22,0.6)] ring-2 ring-clem-200"
         >
           <div className="absolute inset-0 rounded-full bg-gradient-to-tr from-transparent to-white/30" />
         </motion.div>
 
-        {/* Orbiting chips — one rotating wrapper per ring so each chip stays in formation */}
         {rings.map((ring, ri) => (
           <motion.div
             key={ri}
@@ -257,17 +271,16 @@ function ToolOrbit() {
                     className="absolute left-1/2 top-1/2"
                     style={{ x, y }}
                   >
-                    {/* counter-rotate so chips stay upright */}
                     <motion.div
                       animate={{ rotate: -dir * 360 }}
                       transition={{ duration: dur, repeat: Infinity, ease: "linear" }}
-                      className="-translate-x-1/2 -translate-y-1/2 rounded-full bg-[var(--bg-elev)] ring-1 ring-white/15 px-2.5 py-1 flex items-center gap-1.5 backdrop-blur-sm shadow-[0_6px_24px_rgba(0,0,0,0.55)]"
+                      className="-translate-x-1/2 -translate-y-1/2 rounded-full bg-white ring-1 ring-black/10 px-2.5 py-1 flex items-center gap-1.5 shadow-[0_4px_14px_-4px_rgba(80,40,10,0.18)]"
                     >
                       <span
                         className="size-1.5 rounded-full"
                         style={{ background: tool.c, boxShadow: `0 0 6px ${tool.c}` }}
                       />
-                      <span className="font-mono text-[10px] tracking-tight text-white/85 whitespace-nowrap">
+                      <span className="font-mono text-[10px] tracking-tight text-[var(--ink)] whitespace-nowrap">
                         {tool.name}
                       </span>
                     </motion.div>
@@ -293,7 +306,7 @@ function VoiceWave() {
           return (
             <motion.span
               key={i}
-              className="w-1 rounded-full bg-gradient-to-t from-clem-600 to-clem-300"
+              className="w-1 rounded-full bg-gradient-to-t from-clem-700 to-clem-400"
               animate={{
                 height: [
                   `${baseH * 0.4}px`,
@@ -322,7 +335,7 @@ const NOTES = [
   { tag: "decision", text: "Picked Railway over Vercel — preview env per branch" },
   { tag: "fact", text: "Nathan @ Breakthrough Coaching · macOS · Codex OAuth" },
   { tag: "win", text: "Q4 retro shipped 2026-05-20 · 7 recipients" },
-  { tag: "tool", text: "vault.search + gmail.send routinely cluster — preload" },
+  { tag: "tool", text: "vault.search + gmail.send cluster — preload" },
 ];
 
 function MemoryStack() {
@@ -336,7 +349,7 @@ function MemoryStack() {
             whileInView={{ y: 0, opacity: 1 }}
             viewport={{ once: true }}
             transition={{ duration: 0.6, delay: i * 0.15 }}
-            className="absolute left-0 right-0 rounded-lg bg-[var(--bg-elev)] ring-1 ring-white/10 px-3 py-2.5 shadow-[0_8px_30px_rgba(0,0,0,0.5)]"
+            className="absolute left-0 right-0 rounded-lg bg-white ring-1 ring-black/10 px-3 py-2.5 shadow-[0_6px_18px_-6px_rgba(80,40,10,0.18)]"
             style={{
               top: `${i * 28}px`,
               transform: `rotate(${(i - 1.5) * 1.5}deg)`,
@@ -344,13 +357,92 @@ function MemoryStack() {
             }}
           >
             <div className="flex items-center gap-2 mb-1">
-              <span className="font-mono text-[9px] uppercase tracking-wider text-clem-300 rounded bg-clem-500/15 px-1.5 py-0.5 ring-1 ring-clem-500/30">
+              <span className="font-mono text-[9px] uppercase tracking-wider text-clem-700 rounded bg-clem-500/12 px-1.5 py-0.5 ring-1 ring-clem-500/30">
                 {n.tag}
               </span>
             </div>
-            <div className="text-[12px] text-white/85 leading-snug">{n.text}</div>
+            <div className="text-[12px] text-[var(--ink-strong)] leading-snug">{n.text}</div>
           </motion.div>
         ))}
+      </div>
+    </div>
+  );
+}
+
+/* ───── Preview: workflows ───── */
+
+const WORKFLOWS = [
+  { name: "Morning brief", schedule: "Daily · 07:30", calls: 4 },
+  { name: "Post-meeting follow-up", schedule: "Trigger · meeting.end", calls: 7 },
+  { name: "Weekly review", schedule: "Fri · 16:00", calls: 11 },
+  { name: "On-call summary", schedule: "Daily · 18:00", calls: 5 },
+];
+
+function WorkflowsPreview() {
+  return (
+    <div className="absolute inset-0 flex items-center justify-center p-2">
+      <div className="grid grid-cols-2 gap-2 w-full max-w-md">
+        {WORKFLOWS.map((w, i) => (
+          <motion.div
+            key={w.name}
+            initial={{ opacity: 0, y: 10 }}
+            whileInView={{ opacity: 1, y: 0 }}
+            viewport={{ once: true }}
+            transition={{ delay: i * 0.1, duration: 0.5 }}
+            className="rounded-lg bg-white ring-1 ring-black/10 p-3 shadow-[0_4px_14px_-6px_rgba(80,40,10,0.15)]"
+          >
+            <div className="flex items-center gap-2">
+              <Workflow className="h-3.5 w-3.5 text-clem-600" />
+              <span className="text-[12px] font-semibold tracking-tight text-[var(--ink-strong)]">
+                {w.name}
+              </span>
+            </div>
+            <div className="mt-1.5 font-mono text-[10px] text-[var(--ink-dim)]">
+              {w.schedule}
+            </div>
+            <div className="mt-2 flex items-center gap-1 text-[10px] text-[var(--ink-dim)]">
+              <span className="size-1 rounded-full bg-emerald-500" />
+              {w.calls} tool calls / run
+            </div>
+          </motion.div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* ───── Preview: skills list ───── */
+
+const SKILLS = [
+  { name: "onboard-client.md", size: "1.2k" },
+  { name: "q-close.md", size: "2.8k" },
+  { name: "launch-plan.md", size: "4.1k" },
+  { name: "weekly-1on1.md", size: "0.9k" },
+];
+
+function SkillsPreview() {
+  return (
+    <div className="absolute inset-0 flex items-center justify-center p-2">
+      <div className="rounded-lg bg-[#0d0907] ring-1 ring-black/20 p-3 w-full max-w-sm font-mono text-[11px] shadow-[0_8px_24px_-8px_rgba(0,0,0,0.4)]">
+        <div className="flex items-center gap-1.5 text-emerald-300/80 text-[10px] mb-2">
+          <span className="text-clem-300">~/.clementine-next/skills/</span>
+        </div>
+        {SKILLS.map((s, i) => (
+          <motion.div
+            key={s.name}
+            initial={{ opacity: 0, x: -4 }}
+            whileInView={{ opacity: 1, x: 0 }}
+            viewport={{ once: true }}
+            transition={{ delay: i * 0.08 }}
+            className="flex items-center justify-between py-0.5 text-white/85"
+          >
+            <span className="text-clem-300">→ {s.name}</span>
+            <span className="text-white/40">{s.size}</span>
+          </motion.div>
+        ))}
+        <div className="mt-2 pt-2 border-t border-white/10 text-emerald-300/80 text-[10px]">
+          $ clementine skill install zoom-recap
+        </div>
       </div>
     </div>
   );
@@ -382,10 +474,10 @@ function Pill({
   approval?: boolean;
 }) {
   const colors: Record<typeof kind, string> = {
-    read: "bg-sky-400/10 ring-sky-400/30 text-sky-200",
-    write: "bg-emerald-400/10 ring-emerald-400/30 text-emerald-200",
-    send: "bg-amber-300/10 ring-amber-300/30 text-amber-200",
-    done: "bg-clem-400/15 ring-clem-400/30 text-clem-200",
+    read: "bg-sky-50 ring-sky-400/40 text-sky-800",
+    write: "bg-emerald-50 ring-emerald-400/40 text-emerald-800",
+    send: "bg-amber-50 ring-amber-400/40 text-amber-900",
+    done: "bg-clem-50 ring-clem-400/50 text-clem-800",
   };
   return (
     <motion.div
@@ -393,14 +485,14 @@ function Pill({
       whileInView={{ opacity: 1, x: 0 }}
       viewport={{ once: true }}
       className={
-        "inline-flex items-center gap-2 rounded-full px-3 py-1 text-[12px] ring-1 backdrop-blur " +
+        "inline-flex items-center gap-2 rounded-full px-3 py-1 text-[12px] ring-1 " +
         colors[kind]
       }
     >
       <span className="font-mono text-[10px] uppercase opacity-80">{kind}</span>
       {label}
       {approval && (
-        <span className="font-mono text-[10px] uppercase text-amber-300/90 ring-1 ring-amber-300/40 rounded-md px-1.5 py-0.5">
+        <span className="font-mono text-[10px] uppercase text-amber-900 ring-1 ring-amber-400/60 rounded-md px-1.5 py-0.5">
           ask
         </span>
       )}
@@ -411,15 +503,15 @@ function Pill({
 function Arrow({ auto, done }: { auto?: boolean; done?: boolean }) {
   return (
     <div className="font-mono text-[10px] text-[var(--ink-dim)] flex items-center gap-1">
-      <span className="size-px h-3 w-px bg-white/20" />
-      {auto && <span className="text-emerald-300/70">auto</span>}
-      {done && <span className="text-clem-300/80">approved ✓</span>}
-      <span className="size-px h-3 w-px bg-white/20" />
+      <span className="size-px h-3 w-px bg-black/20" />
+      {auto && <span className="text-emerald-700">auto</span>}
+      {done && <span className="text-clem-700">approved ✓</span>}
+      <span className="size-px h-3 w-px bg-black/20" />
     </div>
   );
 }
 
-/* ───── Preview: meeting recording in progress ───── */
+/* ───── Preview: meeting recording ───── */
 
 type Utterance = { speaker: "N" | "M" | "J"; name: string; text: string };
 type Action = { kind: "todo" | "send" | "note"; text: string };
@@ -438,7 +530,7 @@ const ACTIONS: Action[] = [
 ];
 
 function useElapsed(active: boolean) {
-  const [secs, setSecs] = useState(1334); // 22:14
+  const [secs, setSecs] = useState(1334);
   useEffect(() => {
     if (!active) return;
     const id = window.setInterval(() => setSecs((s) => s + 1), 1000);
@@ -455,7 +547,6 @@ function MeetingRecording() {
   const [tick, setTick] = useState(0);
   const timer = useElapsed(true);
 
-  // Advance transcript
   useEffect(() => {
     if (step >= UTTERANCES.length) {
       const t = window.setTimeout(() => {
@@ -469,7 +560,6 @@ function MeetingRecording() {
     return () => window.clearTimeout(t);
   }, [step]);
 
-  // Action items appear slightly after relevant utterances
   useEffect(() => {
     if (actionStep >= ACTIONS.length) return;
     if (step < actionStep + 2) return;
@@ -481,16 +571,13 @@ function MeetingRecording() {
   const visibleActions = ACTIONS.slice(0, actionStep);
 
   return (
-    <div className="absolute inset-0 flex flex-col overflow-hidden rounded-xl bg-[#0d0907] ring-1 ring-white/10">
-      {/* Header */}
+    <div className="absolute inset-0 flex flex-col overflow-hidden rounded-xl bg-[#0d0907] ring-1 ring-black/20 shadow-[0_30px_60px_-20px_rgba(0,0,0,0.4)]">
       <div className="flex items-center gap-2.5 border-b border-white/5 px-4 py-2.5 text-[11px]">
         <span className="relative inline-flex h-2.5 w-2.5">
           <span className="absolute inset-0 rounded-full bg-red-500/60 animate-ping" />
           <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-red-500" />
         </span>
-        <span className="font-mono uppercase tracking-wider text-red-300">
-          Meeting live
-        </span>
+        <span className="font-mono uppercase tracking-wider text-red-300">Meeting live</span>
         <span className="font-mono text-white/40">·</span>
         <span className="font-mono text-white/85">{timer}</span>
         <span className="ml-auto inline-flex items-center gap-1.5 text-[10px] text-emerald-300/80 font-mono">
@@ -500,7 +587,6 @@ function MeetingRecording() {
       </div>
 
       <div key={tick} className="flex flex-1 min-h-0">
-        {/* Transcript */}
         <div className="flex-[1.4] overflow-hidden px-4 py-3 space-y-2.5 border-r border-white/5">
           <AnimatePresence initial={false}>
             {visible.map((u, i) => (
@@ -513,12 +599,8 @@ function MeetingRecording() {
               >
                 <SpeakerBadge speaker={u.speaker} />
                 <div className="min-w-0 flex-1">
-                  <div className="font-mono text-[10px] text-white/45 mb-0.5">
-                    {u.name}
-                  </div>
-                  <div className="text-[12.5px] leading-snug text-white/85">
-                    {u.text}
-                  </div>
+                  <div className="font-mono text-[10px] text-white/45 mb-0.5">{u.name}</div>
+                  <div className="text-[12.5px] leading-snug text-white/85">{u.text}</div>
                 </div>
               </motion.div>
             ))}
@@ -537,7 +619,6 @@ function MeetingRecording() {
           </AnimatePresence>
         </div>
 
-        {/* Action items panel */}
         <div className="flex-1 min-w-0 px-4 py-3">
           <div className="font-mono text-[10px] uppercase tracking-wider text-clem-300/80 mb-3 flex items-center gap-1.5">
             <Sparkles className="h-3 w-3" />
@@ -554,9 +635,7 @@ function MeetingRecording() {
                   className="flex items-start gap-2 rounded-md bg-white/[0.03] ring-1 ring-white/10 px-2.5 py-2"
                 >
                   <ActionIcon kind={a.kind} />
-                  <span className="text-[11.5px] text-white/85 leading-snug">
-                    {a.text}
-                  </span>
+                  <span className="text-[11.5px] text-white/85 leading-snug">{a.text}</span>
                 </motion.div>
               ))}
             </AnimatePresence>
@@ -574,12 +653,7 @@ function SpeakerBadge({ speaker }: { speaker: Utterance["speaker"] }) {
     J: "bg-emerald-500/20 text-emerald-200 ring-emerald-400/40",
   };
   return (
-    <div
-      className={
-        "shrink-0 h-7 w-7 rounded-full ring-1 grid place-items-center text-[11px] font-semibold " +
-        palette[speaker]
-      }
-    >
+    <div className={"shrink-0 h-7 w-7 rounded-full ring-1 grid place-items-center text-[11px] font-semibold " + palette[speaker]}>
       {speaker}
     </div>
   );
@@ -610,4 +684,3 @@ function Dot({ delay }: { delay: number }) {
     />
   );
 }
-

@@ -3,12 +3,18 @@
 @tailwind utilities;
 
 :root {
-  color-scheme: dark;
-  --bg: #0a0806;
-  --bg-elev: #110d09;
-  --ink: #f5ede2;
-  --ink-dim: #b8a892;
-  --rule: rgba(253, 186, 116, 0.12);
+  color-scheme: light;
+  /* Warm cream palette — clementine vibe, easy on the eyes */
+  --bg: #fbf6ef;           /* page bg */
+  --bg-elev: #ffffff;      /* elevated card */
+  --bg-dim: #f4ead8;       /* dimmed bg (alt sections) */
+  --ink: #1a1410;          /* primary text */
+  --ink-strong: #0f0a06;   /* strong text (headlines) */
+  --ink-dim: #6b5d50;      /* secondary text */
+  --ink-faint: #a39487;    /* tertiary text */
+  --rule: rgba(120, 60, 20, 0.12);
+  --surface: rgba(20, 12, 5, 0.04);
+  --surface-strong: rgba(20, 12, 5, 0.08);
 }
 
 html, body {
@@ -19,8 +25,8 @@ html, body {
 }
 
 ::selection {
-  background: rgba(249, 115, 22, 0.35);
-  color: #fff7ed;
+  background: rgba(249, 115, 22, 0.28);
+  color: var(--ink-strong);
 }
 
 .grain {
@@ -31,24 +37,26 @@ html, body {
   position: absolute;
   inset: 0;
   pointer-events: none;
-  opacity: 0.04;
-  mix-blend-mode: overlay;
+  opacity: 0.025;
+  mix-blend-mode: multiply;
   background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='180' height='180'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='3' stitchTiles='stitch'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
 }
 
 .radial-glow {
   background:
-    radial-gradient(60% 50% at 50% 0%, rgba(249, 115, 22, 0.18), transparent 70%),
-    radial-gradient(40% 30% at 80% 100%, rgba(234, 88, 12, 0.10), transparent 70%);
+    radial-gradient(60% 50% at 50% 0%, rgba(249, 115, 22, 0.10), transparent 70%),
+    radial-gradient(40% 30% at 80% 100%, rgba(234, 88, 12, 0.06), transparent 70%);
 }
 
 .dot-grid {
   background-image:
-    radial-gradient(circle at 1px 1px, rgba(253, 186, 116, 0.08) 1px, transparent 0);
+    radial-gradient(circle at 1px 1px, rgba(120, 60, 20, 0.10) 1px, transparent 0);
   background-size: 28px 28px;
   mask-image: radial-gradient(ellipse 80% 60% at 50% 40%, black 30%, transparent 80%);
   -webkit-mask-image: radial-gradient(ellipse 80% 60% at 50% 40%, black 30%, transparent 80%);
 }
+
+.hairline { border-color: var(--rule); }
 
 @keyframes sheen {
   0%   { transform: translateX(0) rotate(12deg); opacity: 0; }
@@ -69,8 +77,14 @@ html, body {
   mask-image: linear-gradient(to right, transparent, black 8%, black 92%, transparent);
 }
 
-.hairline {
-  border-color: var(--rule);
+/* Card surfaces */
+.card-surface {
+  background: var(--bg-elev);
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.6) inset,
+    0 0 0 1px var(--rule),
+    0 6px 24px -10px rgba(80, 40, 10, 0.08);
+  border-radius: 16px;
 }
 
 @media (prefers-reduced-motion: reduce) {

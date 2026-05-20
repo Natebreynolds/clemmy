@@ -1,5 +1,6 @@
 import { Hero } from "@/components/Hero";
 import { Stats } from "@/components/Stats";
+import { Flywheel } from "@/components/Flywheel";
 import { LiveAgent } from "@/components/LiveAgent";
 import { Primitives } from "@/components/Primitives";
 import { Featured } from "@/components/Featured";
@@ -15,6 +16,7 @@ export default function Home() {
     <main className="min-h-screen">
       <Hero />
       <Stats />
+      <Flywheel />
       <LiveAgent />
       <Primitives />
       <Featured />
