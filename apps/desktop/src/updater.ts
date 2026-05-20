@@ -55,6 +55,7 @@ export interface UpdaterStatus {
 let status: UpdaterStatus = { state: 'idle' };
 let onStatusChangeListeners: Array<(s: UpdaterStatus) => void> = [];
 let periodicHandle: NodeJS.Timeout | null = null;
+let downloadInFlight = false;
 
 function updateStatus(next: Partial<UpdaterStatus>): void {
   status = { ...status, ...next };
@@ -100,26 +101,65 @@ export async function checkForUpdatesNow(): Promise<UpdaterStatus> {
 }
 
 /**
- * Trigger quit+install of an already-downloaded update.
+ * Trigger the next user-facing update action:
+ *   - available: start/retry the update download now
+ *   - downloading: report that work is already in progress
+ *   - ready-to-install: quit+install immediately
  *
  * Returns a result so the renderer can surface failures. The earlier
  * version was `void` and silently no-op'd when state !== 'ready-to-
  * install', so the in-app banner click "did nothing" with no signal
  * to the user — observed in production on v0.3.0.
  */
-export function applyUpdate(): { ok: boolean; reason?: string } {
+export function applyUpdate(): { ok: boolean; action?: 'download-started' | 'downloading' | 'installing'; reason?: string } {
+  if (!app.isPackaged) {
+    return {
+      ok: false,
+      reason: 'Updates can only be applied from the packaged Clementine.app.',
+    };
+  }
+
+  if (status.state === 'available') {
+    if (downloadInFlight) {
+      return { ok: true, action: 'downloading', reason: 'Update download is already running.' };
+    }
+    try {
+      downloadInFlight = true;
+      updateStatus({ state: 'downloading', progressPct: status.progressPct ?? 0, error: undefined });
+      void autoUpdater.downloadUpdate()
+        .catch((err: unknown) => {
+          const reason = err instanceof Error ? err.message : String(err);
+          updateStatus({ state: 'error', error: reason });
+        })
+        .finally(() => {
+          downloadInFlight = false;
+        });
+      return { ok: true, action: 'download-started' };
+    } catch (err) {
+      downloadInFlight = false;
+      const reason = err instanceof Error ? err.message : String(err);
+      updateStatus({ state: 'error', error: reason });
+      return { ok: false, reason };
+    }
+  }
+
+  if (status.state === 'downloading') {
+    return { ok: true, action: 'downloading', reason: 'Update download is already running.' };
+  }
+
   if (status.state !== 'ready-to-install') {
     return {
       ok: false,
-      reason: `Not ready to install (state: ${status.state}). Try again after the update finishes downloading, or use Check For Updates from the tray.`,
+      reason: `Not ready to install (state: ${status.state}). Use Check For Updates from the tray, then try again once a download is available.`,
     };
   }
+
   try {
     // isSilent=false: show the standard installer UI.
     // isForceRunAfter=true: relaunch Clementine post-update so the user
     //   doesn't have to manually re-open it.
     autoUpdater.quitAndInstall(false, true);
-    return { ok: true };
+    return { ok: true, action: 'installing' };
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
     return { ok: false, reason };
@@ -192,10 +232,12 @@ export function initAutoUpdater(opts: { logFile: string }): void {
   });
 
   autoUpdater.on('download-progress', (progress: { percent: number }) => {
+    downloadInFlight = true;
     updateStatus({ state: 'downloading', progressPct: Math.round(progress.percent) });
   });
 
   autoUpdater.on('update-downloaded', (info: UpdateInfo) => {
+    downloadInFlight = false;
     log('info', 'update downloaded — ready to install', { version: info.version });
     updateStatus({
       state: 'ready-to-install',
@@ -213,6 +255,7 @@ export function initAutoUpdater(opts: { logFile: string }): void {
   });
 
   autoUpdater.on('error', (err: Error) => {
+    downloadInFlight = false;
     log('error', 'updater error', { err: err.message });
     updateStatus({
       state: 'error',

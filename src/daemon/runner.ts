@@ -21,6 +21,7 @@ import { sweepStaleApprovals } from '../runtime/approval-store.js';
 import { getAuthStatus } from '../runtime/auth-store.js';
 import { DISCORD_BOT_TOKEN, DISCORD_ENABLED, WEBHOOK_ENABLED, WEBHOOK_SECRET } from '../config.js';
 import { fullScan as warmCliScan } from '../runtime/cli-discovery.js';
+import { closePlanScope, openPlanScope } from '../agents/plan-scope.js';
 import { processMemoryMaintenance } from '../memory/maintenance.js';
 import {
   CRON_FILE,
@@ -237,12 +238,22 @@ async function runCronJob(assistant: ClementineAssistant, job: CronJobRecord, so
       job.prompt,
     ].filter(Boolean).join('\n');
 
+    const cronSessionId = `cron:${job.name}`;
+    const cronBudgetMs = resolveCronWallClockMs(job);
+    openPlanScope({
+      sessionId: cronSessionId,
+      planProposalId: `cron:${job.name}`,
+      approvedPlanObjective: `Approved cron job "${job.name}"`,
+      ttlMs: cronBudgetMs + 60_000,
+      allowedTools: ['*'],
+    });
+
     const response = await assistant.respond({
-      sessionId: `cron:${job.name}`,
+      sessionId: cronSessionId,
       channel: 'cron',
       message: prompt,
       model: job.mode === 'unleashed' ? MODELS.deep : MODELS.primary,
-      maxWallClockMs: resolveCronWallClockMs(job),
+      maxWallClockMs: cronBudgetMs,
     });
 
     appendRunLog(job.name, {
@@ -287,6 +298,7 @@ async function runCronJob(assistant: ClementineAssistant, job: CronJobRecord, so
     });
     logger.error({ err: error, job: job.name, source }, 'Cron job failed');
   } finally {
+    closePlanScope(`cron:${job.name}`, 'cron-run-finished');
     stopHeartbeat();
   }
 }

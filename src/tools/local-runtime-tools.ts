@@ -35,9 +35,9 @@ interface CapturedLocalTool {
   approvalRequired?: boolean;
 }
 
-// `create_tool`, `delete_agent`, `workspace_config` are now in the
-// ALWAYS_ADMIN list in agents/tool-taxonomy.ts. Their approval gate
-// fires through the unified path along with every other tool.
+// `create_tool` and `delete_agent` are admin tools in
+// agents/tool-taxonomy.ts. `workspace_config` is mixed-mode there:
+// list is read-only, add/remove are admin.
 
 function resultToText(result: unknown): string {
   if (typeof result === 'string') return result;

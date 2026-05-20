@@ -56,6 +56,12 @@ test('classifyTool: explicit admin list wins', () => {
   }
 });
 
+test('classifyTool: workspace_config list is read, add/remove are admin', () => {
+  assert.equal(classifyTool('workspace_config', { args: { action: 'list' } }), 'read');
+  assert.equal(classifyTool('workspace_config', { args: { action: 'add' } }), 'admin');
+  assert.equal(classifyTool('workspace_config', { args: { action: 'remove' } }), 'admin');
+});
+
 test('classifyTool: read prefixes', () => {
   assert.equal(classifyTool('get_tasks'), 'read');
   assert.equal(classifyTool('list_files'), 'read');
@@ -133,6 +139,17 @@ test('decideToolApproval: admin always asks (even YOLO)', () => {
   assert.equal(needsApproval, true);
   assert.equal(kind, 'admin');
   assert.equal(reason, 'admin');
+});
+
+test('decideToolApproval: workspace_config list autos, add asks', () => {
+  setScope('yolo');
+  const list = decideToolApproval({ toolName: 'workspace_config', args: { action: 'list' } });
+  assert.equal(list.needsApproval, false);
+  assert.equal(list.kind, 'read');
+
+  const add = decideToolApproval({ toolName: 'workspace_config', args: { action: 'add' } });
+  assert.equal(add.needsApproval, true);
+  assert.equal(add.kind, 'admin');
 });
 
 test('decideToolApproval: destructive-hint forces a prompt even in YOLO', () => {

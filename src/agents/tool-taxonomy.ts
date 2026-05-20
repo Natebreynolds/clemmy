@@ -57,7 +57,6 @@ export interface ClassifyOptions {
 const ALWAYS_ADMIN = new Set<string>([
   'create_tool',
   'delete_agent',
-  'workspace_config',
   'credentials_set',
   'credentials_migrate',
   'credentials_repair_keychain',
@@ -237,6 +236,16 @@ function classifyComposioSlug(slug: string): ToolKind {
 /** Public — used by every tool family's `needsApproval` factory. */
 export function classifyTool(name: string, options: ClassifyOptions = {}): ToolKind {
   if (options.kindHint) return options.kindHint;
+
+  // workspace_config is mixed-mode: listing is a read, while adding or
+  // removing workspace roots changes Clementine's trust boundary.
+  if (name === 'workspace_config') {
+    const action = options.args && typeof options.args === 'object'
+      ? (options.args as { action?: unknown }).action
+      : undefined;
+    if (action === 'list') return 'read';
+    return 'admin';
+  }
 
   // Hard admin list — always ask.
   if (ALWAYS_ADMIN.has(name)) return 'admin';

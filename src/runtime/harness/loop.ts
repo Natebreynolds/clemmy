@@ -23,6 +23,7 @@ import { attachEventLogHooks, extractSessionIdFromContext, type RunHooksLike } f
 import * as approvalRegistry from './approval-registry.js';
 import { actionBus } from '../action-bus.js';
 import { BoundaryError } from '../boundary-error.js';
+import { getRuntimeEnv } from '../../config.js';
 
 /**
  * Wrap appendEvent so a transient SQLite write failure (lock, disk
@@ -260,8 +261,16 @@ export interface RunConversationResult {
   error?: string;
 }
 
-export const DEFAULT_MAX_CONVERSATION_STEPS = 12;
-export const DEFAULT_MAX_CONVERSATION_WALL_MS = 30 * 60 * 1000;
+function positiveIntEnv(key: string, fallback: number): number {
+  const parsed = Number.parseInt(getRuntimeEnv(key, String(fallback)), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+export const DEFAULT_MAX_CONVERSATION_STEPS = positiveIntEnv('HARNESS_MAX_CONVERSATION_STEPS', 40);
+export const DEFAULT_MAX_CONVERSATION_WALL_MS = positiveIntEnv(
+  'HARNESS_MAX_CONVERSATION_WALL_MS',
+  positiveIntEnv('HARNESS_MAX_CONVERSATION_WALL_MINUTES', 120) * 60 * 1000,
+);
 
 const CONTINUATION_INPUT =
   'Continue with the next step of your plan. If you have nothing left to do, set done=true and nextAction=completed.';

@@ -12,7 +12,7 @@ set -euo pipefail
 #  helpful "not yet" message.
 # ──────────────────────────────────────────────────────────────────────
 
-REPO="Natebreynolds/clementine-next"
+REPO="Natebreynolds/clemmy"
 APP_NAME="Clementine"
 
 # ── Colors ────────────────────────────────────────────────────────────

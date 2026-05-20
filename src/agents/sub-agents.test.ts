@@ -50,14 +50,14 @@ test('researcher allowlist is read-only (no writes to user state)', () => {
 });
 
 test('researcher allowlist includes the core read tools', () => {
-  const required = ['memory_recall', 'memory_read', 'read_file', 'list_files', 'workspace_info', 'git_status'];
+  const required = ['memory_recall', 'memory_read', 'read_file', 'list_files', 'workspace_info', 'git_status', 'skill_list', 'skill_read'];
   for (const name of required) {
     assert.equal(SUB_AGENT_TOOL_ALLOWLISTS.researcher.has(name), true, `researcher should have ${name}`);
   }
 });
 
 test('executor allowlist includes the core write tools', () => {
-  const required = ['task_add', 'execution_update_step', 'execution_complete', 'write_file', 'goal_update', 'notify_user', 'memory_remember'];
+  const required = ['task_add', 'execution_update_step', 'execution_complete', 'write_file', 'goal_update', 'notify_user', 'memory_remember', 'workspace_config', 'skill_list', 'skill_read'];
   for (const name of required) {
     assert.equal(SUB_AGENT_TOOL_ALLOWLISTS.executor.has(name), true, `executor should have ${name}`);
   }
@@ -69,6 +69,8 @@ test('executor can ask the user when stuck (ask_user_question)', () => {
 
 test('writer can draft files but cannot execute external delivery', () => {
   assert.equal(SUB_AGENT_TOOL_ALLOWLISTS.writer.has('write_file'), true);
+  assert.equal(SUB_AGENT_TOOL_ALLOWLISTS.writer.has('skill_list'), true);
+  assert.equal(SUB_AGENT_TOOL_ALLOWLISTS.writer.has('skill_read'), true);
   assert.equal(SUB_AGENT_TOOL_ALLOWLISTS.writer.has('composio_execute_tool'), false);
   assert.equal(SUB_AGENT_TOOL_ALLOWLISTS.writer.has('run_shell_command'), false);
 });
@@ -79,10 +81,11 @@ test('reviewer is read-only', () => {
   }
   assert.equal(SUB_AGENT_TOOL_ALLOWLISTS.reviewer.has('read_file'), true);
   assert.equal(SUB_AGENT_TOOL_ALLOWLISTS.reviewer.has('agent_runs_recent'), true);
+  assert.equal(SUB_AGENT_TOOL_ALLOWLISTS.reviewer.has('skill_read'), true);
 });
 
 test('deployer has release tools and can ask for missing info', () => {
-  for (const name of ['run_shell_command', 'git_status', 'execution_update_step', 'execution_complete', 'ask_user_question']) {
+  for (const name of ['run_shell_command', 'git_status', 'execution_update_step', 'execution_complete', 'ask_user_question', 'skill_read']) {
     assert.equal(SUB_AGENT_TOOL_ALLOWLISTS.deployer.has(name), true, `deployer should have ${name}`);
   }
 });

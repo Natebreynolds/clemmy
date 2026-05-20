@@ -98,7 +98,7 @@ async function throwIfCancelled(callbacks?: AgentRuntimeCallbacks): Promise<void
  *
  * Three sources, merged in a single flat list:
  *   1. Local SDK tools (`getCoreTools`) — request_destructive_action,
- *      computer-use, local runtime tools, Composio broker + cx_*.
+ *      computer-use, local runtime tools, compact Composio broker.
  *   2. MCP tools via the namespace shim — `<server>__<tool>` names.
  *   3. (future) computer-use primitives via SDK `computerTool`.
  *
@@ -109,8 +109,8 @@ async function throwIfCancelled(callbacks?: AgentRuntimeCallbacks): Promise<void
  * route incoming function-calls back to the shim's `callTool`.
  */
 async function createCodexToolDefinitions() {
-  // 1. Local tools (Composio + computer + local runtime + planner shims).
-  const local = await getCoreToolsAsync({ includeDynamicComposioTools: true });
+  // 1. Local tools (Composio broker + computer + local runtime + planner shims).
+  const local = await getCoreToolsAsync({ includeDynamicComposioTools: false });
 
   // 2. MCP tools through the namespace shim. We tolerate the shim
   //    being slow / partially broken — listTools() inside the shim
@@ -150,7 +150,7 @@ async function createCodexToolDefinitions() {
 }
 
 async function createToolMap() {
-  const tools = await getCoreToolsAsync({ includeDynamicComposioTools: true });
+  const tools = await getCoreToolsAsync({ includeDynamicComposioTools: false });
   return new Map(tools
     .filter((tool) => tool.type === 'function')
     .map((tool) => [tool.name, tool]));

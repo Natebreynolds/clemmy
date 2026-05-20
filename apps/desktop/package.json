@@ -1,6 +1,6 @@
 {
   "name": "@clemmy/desktop",
-  "version": "0.4.22",
+  "version": "0.4.23",
   "private": true,
   "description": "Clementine \u2014 native desktop shell. Supervises the daemon, opens the local dashboard, surfaces approvals and check-ins, manages credentials.",
   "main": "dist/main.js",
@@ -13,7 +13,7 @@
     "build:daemon": "cd ../.. && npm run build",
     "rebuild-daemon-natives": "cd ../.. && npx --yes @electron/rebuild@^4 --version $(node -p \"require('./apps/desktop/node_modules/electron/package.json').version\") --types prod",
     "package:mac": "npm run build && npm run build:daemon && npm run rebuild-daemon-natives && electron-builder --mac",
-    "package:mac:unsigned": "APPLE_NOTARIZE_SKIP=true CSC_IDENTITY_AUTO_DISCOVERY=false npm run build && npm run build:daemon && npm run rebuild-daemon-natives && electron-builder --mac",
+    "package:mac:unsigned": "npm run build && npm run build:daemon && npm run rebuild-daemon-natives && APPLE_NOTARIZE_SKIP=true CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac",
     "package:dist": "npm run build && npm run build:daemon && npm run rebuild-daemon-natives && electron-builder",
     "release": "npm run build && npm run build:daemon && npm run rebuild-daemon-natives && electron-builder --mac --publish never"
   },

@@ -2468,6 +2468,8 @@ body {
 .home-item-kind.task { color: var(--accent-3); border-color: var(--accent-3); }
 .home-item-kind.exec { color: var(--accent-warn); border-color: var(--accent-warn); }
 .home-item-kind.checkin { color: var(--accent); border-color: var(--accent); }
+.home-item-kind.harness-approval { color: var(--accent-warn); border-color: var(--accent-warn); }
+.home-item-kind.workflow { color: var(--accent-2); border-color: var(--accent-2); }
 .home-item-kind.run { color: var(--accent-2); border-color: var(--accent-2); }
 .home-item-kind.done { color: var(--fg-mute); border-color: var(--fg-mute); }
 .home-item-text {
@@ -2505,6 +2507,25 @@ body {
   color: var(--fg-3);
   margin-top: 2px;
 }
+.home-item-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+}
+.home-item-actions button {
+  border: 1px solid var(--line-strong);
+  background: transparent;
+  color: var(--fg);
+  font-family: inherit;
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  padding: 4px 7px;
+  cursor: pointer;
+}
+.home-item-actions button:hover { background: var(--fg); color: var(--bg-0); }
+.home-item-actions button[data-home-approval-action="approve"] { border-color: var(--accent-2); color: var(--accent-2); }
+.home-item-actions button[data-home-approval-action="reject"] { border-color: var(--accent-fail); color: var(--accent-fail); }
+.home-item-actions button[disabled] { opacity: 0.45; cursor: wait; }
 .home-memory-line {
   display: flex;
   justify-content: space-between;
@@ -7347,59 +7368,86 @@ const CONSOLE_JS = `
 
   // Auto-updater hint in the header. We only display when we have a
   // real signal (avail / downloading / ready / error) — silent on
-  // idle and no-update. Single tap installs when ready. The tray
-  // menu is the durable affordance; this is just a glanceable banner.
+  // idle and no-update. Single tap starts download when available
+  // or installs when ready. The tray menu is the durable affordance;
+  // this is just a glanceable banner.
   if (window.clemmy?.updaterStatus) {
-    const renderUpdaterChip = async () => {
-      let info;
-      try { info = await window.clemmy.updaterStatus(); } catch { return; }
+    const renderUpdaterChip = async (incoming) => {
+      let info = incoming;
+      if (!info) {
+        try { info = await window.clemmy.updaterStatus(); } catch { return; }
+      }
       const sub = document.querySelector('[data-daemon-version]');
       if (!sub) return;
       const baseLabel = sub.dataset.baseLabel || sub.textContent || '';
       sub.dataset.baseLabel = baseLabel;
       let suffix = '';
-      if (info.state === 'available' || info.state === 'downloading') {
-        suffix = ' · ' + (info.progressPct ? 'downloading ' + info.progressPct + '%' : 'update available');
+      sub.style.cursor = '';
+      sub.style.pointerEvents = '';
+      sub.title = '';
+      sub.onclick = null;
+
+      const applyFromChip = async (pendingLabel) => {
+        const prevText = sub.textContent;
+        sub.textContent = baseLabel + pendingLabel;
+        sub.style.pointerEvents = 'none';
+        try {
+          const result = await window.clemmy?.updaterApply?.();
+          const applyResult = result && result.applyResult;
+          if (applyResult && applyResult.ok === false) {
+            sub.textContent = prevText;
+            alert('Update could not be applied: ' + (applyResult.reason || 'unknown reason'));
+          } else if (applyResult && applyResult.action !== 'installing') {
+            await renderUpdaterChip(result);
+          }
+          // If action=installing, Electron is about to quit-and-install so
+          // the banner state doesn't matter — the renderer is going away.
+        } catch (err) {
+          sub.textContent = prevText;
+          alert('Update apply failed: ' + ((err && err.message) || err));
+        } finally {
+          sub.style.pointerEvents = '';
+        }
+      };
+
+      if (info.state === 'available') {
+        suffix = ' · click to download v' + (info.version || '') + ' update';
+        sub.style.cursor = 'pointer';
+        sub.title = 'Download Clementine v' + (info.version || '');
+        sub.onclick = () => applyFromChip(' · starting download…');
+      } else if (info.state === 'downloading') {
+        suffix = ' · ' + (info.progressPct ? 'downloading ' + info.progressPct + '%' : 'downloading update…');
+        sub.title = 'Clementine is downloading the update in the background';
       } else if (info.state === 'ready-to-install') {
         suffix = ' · click for v' + (info.version || '') + ' update';
         sub.style.cursor = 'pointer';
         sub.title = 'Restart Clementine to install v' + (info.version || '');
-        sub.onclick = async () => {
-          // Give the user immediate feedback that the click registered.
-          // Previously the click silently called updaterApply with no
-          // awaited result — if applyUpdate refused for any reason,
-          // nothing visibly happened. Now: surface success (relaunch
-          // is imminent) or the actual refusal reason.
-          const prevText = sub.textContent;
-          sub.textContent = baseLabel + ' · restarting…';
-          sub.style.pointerEvents = 'none';
-          try {
-            const result = await window.clemmy?.updaterApply?.();
-            const applyResult = result && result.applyResult;
-            if (applyResult && applyResult.ok === false) {
-              sub.textContent = prevText;
-              sub.style.pointerEvents = '';
-              alert('Update could not be applied: ' + (applyResult.reason || 'unknown reason'));
-            }
-            // If ok=true, Electron is about to quit-and-install so the
-            // banner state doesn't matter — the renderer is going away.
-          } catch (err) {
-            sub.textContent = prevText;
-            sub.style.pointerEvents = '';
-            alert('Update apply failed: ' + ((err && err.message) || err));
-          }
-        };
+        sub.onclick = () => applyFromChip(' · restarting…');
       } else if (info.state === 'error') {
         suffix = ' · update check failed';
-        sub.title = info.error || '';
-      } else {
-        sub.style.cursor = '';
-        sub.title = '';
-        sub.onclick = null;
+        sub.style.cursor = 'pointer';
+        sub.title = (info.error ? info.error + ' — ' : '') + 'Click to retry update check';
+        sub.onclick = async () => {
+          const prevText = sub.textContent;
+          sub.textContent = baseLabel + ' · checking update…';
+          sub.style.pointerEvents = 'none';
+          try {
+            const result = await window.clemmy?.updaterCheck?.();
+            await renderUpdaterChip(result);
+          } catch (err) {
+            sub.textContent = prevText;
+            alert('Update check failed: ' + ((err && err.message) || err));
+          } finally {
+            sub.style.pointerEvents = '';
+          }
+        };
       }
       sub.textContent = baseLabel + suffix;
     };
     renderUpdaterChip();
+    if (window.clemmy?.onUpdaterEvent) {
+      window.clemmy.onUpdaterEvent((event) => { renderUpdaterChip(event); });
+    }
     // Poll every 30s — cheap, doesn't block, picks up state changes
     // that fire after auto-updater's periodic check (4h cadence).
     setInterval(renderUpdaterChip, 30_000);
@@ -7566,15 +7614,55 @@ const CONSOLE_JS = `
     if (!items || items.length === 0) {
       return '<div class="home-empty">' + escMem(emptyText) + '</div>';
     }
-    return items.map((item) => [
+    return items.map((item) => {
+      const hasApproval = item.approvalId && item.approvalKind;
+      const approvalActions = hasApproval
+        ? [
+            '<div class="home-item-actions">',
+            '  <button type="button" data-home-approval-action="approve" data-home-approval-kind="' + escMem(item.approvalKind) + '" data-home-approval-id="' + escMem(item.approvalId) + '">APPROVE</button>',
+            '  <button type="button" data-home-approval-action="reject" data-home-approval-kind="' + escMem(item.approvalKind) + '" data-home-approval-id="' + escMem(item.approvalId) + '">REJECT</button>',
+            '</div>',
+          ].join('')
+        : '';
+      return [
       '<div class="home-item command-item" data-tools-jump="' + escMem(item.panel || 'activity') + '">',
       '  <span class="home-item-kind ' + escMem(item.kind || 'task') + '">' + escMem(String(item.kind || 'item').toUpperCase()) + '</span>',
       '  <div style="flex:1; min-width:0;">',
       '    <div class="home-item-text">' + escMem(item.title || '') + '</div>',
       item.meta ? '    <div class="home-item-meta">' + escMem(item.meta) + '</div>' : '',
+      approvalActions,
       '  </div>',
       '</div>',
-    ].join('')).join('');
+    ].join('');
+    }).join('');
+  }
+
+  async function resolveHomeApprovalButton(button) {
+    const id = button.getAttribute('data-home-approval-id');
+    const kind = button.getAttribute('data-home-approval-kind') || 'runtime';
+    const action = button.getAttribute('data-home-approval-action');
+    if (!id || (action !== 'approve' && action !== 'reject')) return;
+    const row = button.closest('.home-item');
+    const buttons = row ? Array.from(row.querySelectorAll('[data-home-approval-action]')) : [button];
+    buttons.forEach((btn) => { btn.disabled = true; });
+    const original = button.textContent;
+    button.textContent = action === 'approve' ? 'APPROVING' : 'REJECTING';
+    const endpoint = kind === 'harness'
+      ? '/api/console/harness-approvals/' + encodeURIComponent(id) + '/' + action
+      : '/api/approvals/' + encodeURIComponent(id) + '/' + action;
+    try {
+      const r = await fetch(withToken(endpoint), { method: 'POST', headers: { Accept: 'application/json' } });
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        throw new Error(j.error || ('HTTP ' + r.status));
+      }
+      await refreshHomeCommandCenter();
+      try { await tick(); } catch (_) {}
+    } catch (err) {
+      buttons.forEach((btn) => { btn.disabled = false; });
+      button.textContent = original || action.toUpperCase();
+      alert('Could not resolve approval: ' + ((err && err.message) || err));
+    }
   }
 
   function setPresence(status) {
@@ -7784,14 +7872,16 @@ const CONSOLE_JS = `
         fetchJSON('/api/approvals'),
       ]);
       const approvals = approvalsData.approvals || [];
-      const snapWithApprovals = { ...snap, approvals };
+      const harnessApprovalCount = (approvalsData.harnessApprovals || []).length;
+      const totalApprovalCount = approvals.length + harnessApprovalCount;
+      const snapWithApprovals = { ...snap, approvals: Array.from({ length: totalApprovalCount }) };
       setOnline(true);
 
       // Status bar
       const memIdx = snap.memoryIndex || {};
       els.runs.textContent      = (runs.runs || runs || []).length;
       els.memory.textContent    = (memIdx.chunks ?? '—') + ' / ' + (memIdx.activeFacts ?? '—') + 'f';
-      els.approvals.textContent = approvals.length;
+      els.approvals.textContent = totalApprovalCount;
       els.policy.textContent    = ((snap.proactivity && snap.proactivity.policy && snap.proactivity.policy.mode) || '—').toUpperCase();
 
       // Home tiles + greeting (only on first paint + when count changes).
@@ -7804,7 +7894,7 @@ const CONSOLE_JS = `
       els.feedRun.textContent   = running;
       els.feedFail.textContent  = failed;
 
-      const snapshotJSON = JSON.stringify({ chunks: memIdx.chunks, facts: memIdx.activeFacts, approvals: approvals.length, mode: snap.proactivity && snap.proactivity.policy && snap.proactivity.policy.mode });
+      const snapshotJSON = JSON.stringify({ chunks: memIdx.chunks, facts: memIdx.activeFacts, approvals: totalApprovalCount, mode: snap.proactivity && snap.proactivity.policy && snap.proactivity.policy.mode });
       const runsJSON = JSON.stringify(list.map((r) => [r.id, r.status, r.updatedAt]));
       if (runsJSON !== lastRunsJSON) {
         renderRunList(list);
@@ -7913,6 +8003,13 @@ const CONSOLE_JS = `
   document.addEventListener('click', (event) => {
     const target = event.target;
     if (!(target instanceof HTMLElement)) return;
+    const approvalButton = target.closest('[data-home-approval-action]');
+    if (approvalButton) {
+      event.preventDefault();
+      event.stopPropagation();
+      resolveHomeApprovalButton(approvalButton);
+      return;
+    }
     const jump = target.closest('[data-tools-jump]');
     if (!jump) return;
     event.preventDefault();
@@ -11254,6 +11351,30 @@ const CONSOLE_JS = `
   // event written during the gap. We track lastSeq, manually close
   // on error, and rebuild with ?sinceSeq=<lastSeq>. Bounded by
   // MAX_RECONNECTS so a permanently-broken endpoint doesn't loop.
+  function humanHarnessText(value, fallback) {
+    if (value == null) return fallback || '';
+    if (typeof value === 'object') {
+      const reply = typeof value.reply === 'string' ? value.reply.trim() : '';
+      const summary = typeof value.summary === 'string' ? value.summary.trim() : '';
+      return reply || summary || fallback || '';
+    }
+    const text = String(value).trim();
+    if (!text) return fallback || '';
+    if ((text.startsWith('{') && text.endsWith('}')) || (text.startsWith('[') && text.endsWith(']'))) {
+      try {
+        const parsed = JSON.parse(text);
+        if (parsed && typeof parsed === 'object') {
+          const reply = typeof parsed.reply === 'string' ? parsed.reply.trim() : '';
+          const summary = typeof parsed.summary === 'string' ? parsed.summary.trim() : '';
+          if (reply || summary) return reply || summary;
+        }
+      } catch (_) {
+        // Not JSON after all; use the raw text below.
+      }
+    }
+    return text;
+  }
+
   function streamHarnessSession(sessionId, turn, options) {
     const MAX_RECONNECTS = 5;
     return new Promise((resolve) => {
@@ -11273,7 +11394,7 @@ const CONSOLE_JS = `
         if (ev && typeof ev.seq === 'number' && ev.seq > lastSeq) lastSeq = ev.seq;
         renderHarnessEvent(ev, turn, options);
         if (ev.type === 'conversation_completed') {
-          const summary = (ev.data && ev.data.summary) || '';
+          const summary = humanHarnessText(ev.data && (ev.data.reply || ev.data.summary), '');
           const reason = ev.data && ev.data.reason;
           const existing = turn?.querySelector?.('[data-home-chat-turn-text]')?.textContent || '';
           if (summary) {
@@ -11388,8 +11509,9 @@ const CONSOLE_JS = `
       }
       case 'conversation_step': {
         const decision = ev.data && ev.data.decision;
-        if (decision && decision.summary) {
-          setChatTurnText(turn, decision.summary);
+        const stepText = decision ? humanHarnessText(decision.reply || decision.summary, '') : '';
+        if (stepText) {
+          setChatTurnText(turn, stepText);
           setChatTurnStatus(turn, 'step ' + (ev.data.step || '?'));
         }
         return;

@@ -188,6 +188,7 @@ const ORCHESTRATOR_INSTRUCTIONS = [
   '  - `draft_plan`         draft a structured plan when work is multi-step or the path is not obvious. Read-only.',
   '  - `request_approval`   pause and ask the user to approve a specific action. Triggers an approval interrupt — the run pauses until resolved.',
   '  - `ask_user_question`  ask the user a clarifying question when the request is ambiguous.',
+  '  - `skill_list` / `skill_read`  load installed SKILL.md instructions on demand. Use only when a task clearly benefits from a specialized skill; never bulk-load skills.',
   '  - handoffs:            Researcher (read-only info gathering), Writer (vault/document content), Reviewer (quality check), Executor (does the work — files, commands, tasks), Deployer (releases, deploys).',
   'Memory layering — the persistent context block above (Identity, Soul, Working Memory, top Facts, Goals, Profile) is curated and bounded. It is NOT the full history. For deeper recall — past conversations, specific files, prior decisions, archived notes — hand off to Researcher to call memory_recall / memory_search / memory_read. Do this BEFORE asking the user to repeat themselves: if the message references something they\'ve discussed with Clementine before ("that project from last week", "the file we talked about", "what we decided yesterday"), assume the answer is in memory and route to Researcher first.',
   'TOOL DISCIPLINE for any request that needs an external action (CLI, Composio, MCP). Read FIRST, before the decision rubric.',
@@ -201,6 +202,7 @@ const ORCHESTRATOR_INSTRUCTIONS = [
   '  Step 8 — If Executor reports runtime failure later, call `tool_choice_invalidate(intent, <verbatim error>)` and start over at Step 3.',
   '  SKIP `draft_plan` for single-tool-dispatch requests. The discipline above IS the plan. Use draft_plan only for genuinely multi-step plans.',
   'Why: a cached recall is 1 call; rediscovery is 4-6. Memorize once, reuse across every session. Workflows that hard-code a tool (`"use sf data query ..."`) are a smell — the discipline above overrides them.',
+  'Skills — skills are available but not injected as full prompt text. If the user asks for specialized work (browser automation, spreadsheet/document creation, image/video work, domain playbooks, writing voice, etc.), call `skill_list`, then `skill_read` for the one relevant skill and route with those instructions in mind. Do not read every installed skill.',
   'Decision rubric:',
   '  1. Greeting / chitchat → answer directly. No handoff, no memory call. Done.',
   '  2. Trivial single-tool ask → hand off to Executor with a one-line directive. Do not over-plan.',
@@ -210,8 +212,9 @@ const ORCHESTRATOR_INSTRUCTIONS = [
   '  5a. READ-ONLY SHELL IS NOT GATED BY THE ORCHESTRATOR. If the user asks to inspect local state ("what branch am I on", "list files", "check sf --version", "query Salesforce with SELECT"), hand off to Executor with the literal command intent. Never call `request_approval` for read-only shell. `run_shell_command` will ask on its own if the command is actually mutating or dangerous.',
   '  6. Ambiguous ask that references prior context → hand off to Researcher to recall context FIRST, then re-decide. Only call `ask_user_question` when the request is genuinely unparseable (not when you can look it up).',
   'Researcher returned "not found" — when Researcher reports it could not locate the specific thing the user asked about after a reasonable search, DO NOT hand off again hoping for better results. Call `ask_user_question` with what was searched and a concrete question about where to look ("I searched <list of places> for <thing the user asked about> and didn\'t find it — is it in a specific folder I should look in, or somewhere outside the linked workspaces?"). One cheap clarifying exchange beats burning another budget on the same dead-end.',
-  'After approval — when the user has just approved a destructive / external-mutating action, you ALREADY have what you need to hand off. Do not emit a structured output saying "I cannot continue because the tool is not available." Instead, hand off to the sub-agent that can actually do the work (almost always Executor for cx_* / Composio actions, file writes, shell commands, or external API calls; Writer for drafts; Deployer for releases). The handoffs are real — you can see them in your tool list as transfer_to_Researcher / transfer_to_Writer / transfer_to_Reviewer / transfer_to_Executor / transfer_to_Deployer. If you genuinely don\'t see the handoff you need, ask the user with a specific question about what tool/integration to enable — never silently give up after collecting approval.',
-  'External actions — DISCOVER YOURSELF, then EXECUTE. Composio is part of Clementine; you have direct access to `composio_search_tools` (read-only, doesn\'t violate the no-action-tools rule). When the user wants an action on a connected external service (Instagram post, Slack DM, Trello card, send an email, anything outside the curated cx_* tools):',
+  'Local projects — if the user asks Clementine to link/use a local project path, hand off to Executor with the path and directive to call `workspace_config({action:"add", directory:"<path>"})`, then inspect it with `workspace_info`. Do not try to mutate workspace config yourself.',
+  'After approval — when the user has just approved a destructive / external-mutating action, you ALREADY have what you need to hand off. Do not emit a structured output saying "I cannot continue because the tool is not available." Instead, hand off to the sub-agent that can actually do the work (almost always Executor for Composio actions, file writes, shell commands, or external API calls; Writer for drafts; Deployer for releases). The handoffs are real — you can see them in your tool list as transfer_to_Researcher / transfer_to_Writer / transfer_to_Reviewer / transfer_to_Executor / transfer_to_Deployer. If you genuinely don\'t see the handoff you need, ask the user with a specific question about what tool/integration to enable — never silently give up after collecting approval.',
+  'External actions — DISCOVER YOURSELF, then EXECUTE. Composio is part of Clementine; you have direct access to `composio_search_tools` (read-only, doesn\'t violate the no-action-tools rule). When the user wants an action on a connected external service (Instagram post, Slack DM, Trello card, send an email, Salesforce/Outlook/Sheets, etc.):',
   '  1. Call `composio_search_tools` with a focused query (e.g. {query: "instagram create post", toolkit_slug: "instagram"}). It returns matching slugs + parameter schemas for whichever toolkits the user has connected. No need to hand off to Researcher for this — discovery is YOUR job.',
   '  2. Pick the best matching slug. Compose the JSON args from the returned `inputParameters` schema.',
   '  3. Hand off to Executor — and FILL IN THE STRUCTURED HANDOFF INPUT. The concrete `composio_execute_tool` call owns approval if the slug mutates external state; do not add a separate pre-approval turn unless the user asked for a review gate before execution.',
@@ -219,8 +222,7 @@ const ORCHESTRATOR_INSTRUCTIONS = [
   '     For external Composio actions, populate toolCall with the slug you discovered and the JSON-encoded args. For non-Composio work (file writes, shell commands, tracked-execution updates), set toolCall: null. The Executor reads this directly and calls composio_execute_tool with your slug/args — no re-discovery on its end. Same shape applies for transfer_to_Deployer.',
   '  Handing off without populating toolCall when the work IS a Composio action forces the Executor to either re-discover (wasted turn) or fail. Fill the structured input every time.',
   'EXCEPTIONS:',
-  '  - If a curated `cx_<toolkit>_<action>` obviously matches (e.g. user says "send a Gmail draft" and there\'s a cx_gmail_create_draft), skip the search step. Hand off with toolCall: null and the Executor will call the cx_* tool directly from its own surface.',
-  '  - If composio_search_tools returns no matches AND no curated cx_* exists, ask the user with ask_user_question what they want — DO NOT silently report "tool not available." The status field on returned toolkits is informational only; Composio reports EXPIRED for connections that work fine, so do not refuse to attempt a tool just because the status looks stale. Let the actual execute call surface a real error if there is one.',
+  '  - If composio_search_tools returns no matches, ask the user with ask_user_question what they want — DO NOT silently report "tool not available." The status field on returned toolkits is informational only; Composio reports EXPIRED for connections that work fine, so do not refuse to attempt a tool just because the status looks stale. Let the actual execute call surface a real error if there is one.',
   'Return an OrchestratorDecision. Be specific.',
   '`summary` is an INTERNAL log entry the user never sees. One sentence describing what you decided and/or did this turn (e.g. "Replied to greeting directly", "Drafted workflow and surfaced two decisions for the user"). NEVER write user-facing copy in `summary`. Think of `summary` as what you would write in a ticket comment.',
   '`reply` IS what the user reads on Discord/chat. THIS IS A HARD RULE: if `done:true` and `nextAction:completed`, `reply` MUST be a non-empty natural-language message containing the actual answer/result/asks. NOT a meta-description of what you did. Examples:',
@@ -270,6 +272,7 @@ export async function buildOrchestratorAgent(): Promise<
   // dispatch pipeline (recall → discover → probe → remember → handoff):
   //   - composio_search_tools: Composio action discovery (already used)
   //   - local_cli_list / local_cli_probe: $PATH scan + cheap probe for CLIs
+  //   - skill_list / skill_read: on-demand skill instruction loading
   //   - tool_choice_recall / _remember / _invalidate: per-machine memory
   //     of which tool actually works for a given intent
   // All are read-only or pure-memory operations — they do not violate
@@ -277,6 +280,8 @@ export async function buildOrchestratorAgent(): Promise<
   const discoveryTools: Tool<RuntimeContextValue>[] = (
     [
       'composio_search_tools',
+      'skill_list',
+      'skill_read',
       'local_cli_list',
       'local_cli_probe',
       'tool_choice_recall',

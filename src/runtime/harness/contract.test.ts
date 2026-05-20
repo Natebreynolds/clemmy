@@ -330,7 +330,8 @@ test('Phase B wiring: Orchestrator tool surface includes the discovery + memory 
   // has zero direct action tools). The Phase B discipline requires
   // tool_choice_recall / _remember / _invalidate AND local_cli_list /
   // local_cli_probe to be present, alongside the existing
-  // composio_search_tools. Without them, the prompt rubric is unreachable.
+  // composio_search_tools and lazy skill tools. Without them, the prompt
+  // rubric is unreachable.
   const { buildOrchestratorAgent } = await import('../../agents/orchestrator.js');
   const orchestrator = await buildOrchestratorAgent();
   const toolNames = new Set(
@@ -343,6 +344,8 @@ test('Phase B wiring: Orchestrator tool surface includes the discovery + memory 
     'local_cli_list',
     'local_cli_probe',
     'composio_search_tools',
+    'skill_list',
+    'skill_read',
     'draft_plan',
     'request_approval',
     'ask_user_question',

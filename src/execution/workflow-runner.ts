@@ -20,6 +20,7 @@ import { runConversation, runConversationFromResume } from '../runtime/harness/l
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { buildOrchestratorAgent } from '../agents/orchestrator.js';
 import { configureHarnessRuntime } from '../runtime/harness/codex-client.js';
+import { closePlanScope, openPlanScope } from '../agents/plan-scope.js';
 
 const logger = pino({ name: 'clementine-next.workflow-runner' });
 
@@ -283,8 +284,9 @@ interface StepExecutionContext {
  * runner calls runConversationFromResume; the next loop iteration
  * either completes or pauses again on the next interrupted tool.
  *
- * Gated behind `WORKFLOW_USE_HARNESS=on` so legacy workflows that
- * relied on the old quasi-broken behavior aren't surprised.
+ * The harness is now the default workflow path. Set
+ * WORKFLOW_USE_HARNESS=off or step.useHarness=false only for deliberate
+ * legacy/simple text-only debugging.
  */
 const WORKFLOW_HARNESS_POLL_MS = parseInt(
   process.env.CLEMENTINE_WORKFLOW_HARNESS_POLL_MS ?? '5000', 10,
@@ -297,9 +299,27 @@ const WORKFLOW_HARNESS_APPROVAL_MAX_WAIT_MS = parseInt(
 );
 
 function workflowHarnessEnabled(step: WorkflowStepInput): boolean {
-  // Per-step opt-in OR global flag. Default: opt-in only.
-  if ((step as unknown as { useHarness?: boolean }).useHarness === true) return true;
-  return process.env.WORKFLOW_USE_HARNESS === 'on';
+  if ((step as unknown as { useHarness?: boolean }).useHarness === false) return false;
+  return process.env.WORKFLOW_USE_HARNESS !== 'off';
+}
+
+function workflowAutoApprovalTools(workflow: WorkflowDefinition, step: WorkflowStepInput): string[] {
+  if (step.allowedTools && step.allowedTools.length > 0) {
+    return step.allowedTools;
+  }
+
+  const allowed = (workflow.allowedTools ?? [])
+    .flatMap((tool) => {
+      if (typeof tool === 'string') return [tool];
+      if (!tool || typeof tool.name !== 'string') return [];
+      return tool.approval === 'required' ? [] : [tool.name];
+    })
+    .filter((tool) => tool.trim().length > 0);
+
+  // Enabled workflows are already user-approved automation. A wildcard
+  // plan scope removes per-tool approval churn while the shared taxonomy
+  // still gates admin/destructive calls before plan-scope is consulted.
+  return allowed.length > 0 ? [...new Set(allowed)] : ['*'];
 }
 
 interface HarnessStepResult {
@@ -314,6 +334,7 @@ async function runStepViaHarness(
   sessionIdSuffix: string,
   promptBody: string,
   workflowName: string,
+  allowedTools: string[],
 ): Promise<HarnessStepResult> {
   // T-WF-1 — configure the codex OAuth bridge BEFORE the SDK runner
   // touches the model. Discord + chat-dock paths do this at every
@@ -345,115 +366,127 @@ async function runStepViaHarness(
   // ↑ HarnessSession.create generates its own session.id; we use that
   // rather than the suffix-derived one. The suffix is informational.
   const realSessionId = session.id;
+  openPlanScope({
+    sessionId: realSessionId,
+    planProposalId: `workflow:${workflowName}:${sessionIdSuffix}`,
+    approvedPlanObjective: `Approved workflow "${workflowName}" step "${step.id}"`,
+    ttlMs: WORKFLOW_STEP_WALL_CLOCK_MS + 60_000,
+    allowedTools,
+  });
 
   const approvalIds: string[] = [];
   let hadApprovals = false;
   const startedAt = Date.now();
 
-  // Build a fresh orchestrator each call so it picks up current memory
-  // context + connected toolkit list.
-  const agent = await buildOrchestratorAgent();
+  try {
+    // Build a fresh orchestrator each call so it picks up current memory
+    // context + connected toolkit list.
+    const agent = await buildOrchestratorAgent();
 
-  // Initial turn.
-  const message = `Workflow: ${workflowName}\nStep: ${step.id}\n\n${promptBody}`;
-  let result = await runConversation({
-    agent,
-    sessionId: realSessionId,
-    input: message,
-  });
+    // Initial turn.
+    const message = `Workflow: ${workflowName}\nStep: ${step.id}\n\n${promptBody}`;
+    let result = await runConversation({
+      agent,
+      sessionId: realSessionId,
+      input: message,
+    });
 
-  // Loop until terminal (completed / failed / awaiting_user_input).
-  while (result.status === 'awaiting_approval') {
-    hadApprovals = true;
-    if (Date.now() - startedAt > WORKFLOW_HARNESS_APPROVAL_MAX_WAIT_MS) {
+    // Loop until terminal (completed / failed / awaiting_user_input).
+    while (result.status === 'awaiting_approval') {
+      hadApprovals = true;
+      if (Date.now() - startedAt > WORKFLOW_HARNESS_APPROVAL_MAX_WAIT_MS) {
+        throw new Error(
+          `workflow step "${step.id}" timed out waiting for approval after ${WORKFLOW_HARNESS_APPROVAL_MAX_WAIT_MS / 1000}s`,
+        );
+      }
+
+      // Find the pending registry row(s) for this session and surface a
+      // user notification. The harness already registered the approval
+      // via registerAndEmitApprovals on the SDK interrupt; here we
+      // re-post a Discord-friendly nudge so the user sees the apr-xxxx
+      // code from their main channel, not just the audit log.
+      const pending = approvalRegistry.listPending({ sessionId: realSessionId, status: 'pending' });
+      for (const row of pending) {
+        if (!approvalIds.includes(row.approvalId)) {
+          approvalIds.push(row.approvalId);
+          try {
+            addNotification({
+              id: `wf-approval-${row.approvalId}-${Date.now()}`,
+              kind: 'approval',
+              title: `Workflow ${workflowName} · ${step.id} needs approval`,
+              body: `**${row.subject}**\n\nReply \`approve ${row.approvalId}\` (or \`reject ${row.approvalId}\`) to continue. The workflow is parked on step \`${step.id}\` until you respond.`,
+              createdAt: new Date().toISOString(),
+              read: false,
+              metadata: {
+                approvalId: row.approvalId,
+                sessionId: realSessionId,
+                subject: row.subject,
+                tool: row.tool,
+                workflowName,
+                stepId: step.id,
+              },
+            });
+          } catch {
+            /* notification is best-effort; the apr-xxxx is still
+               discoverable via the dashboard + sessions table */
+          }
+        }
+      }
+
+      // Poll for resolution. The reaper might expire stale rows; the
+      // user might approve/reject; or all pending rows might clear via
+      // a /cancel command. Loop until the session has no more pending.
+      while (true) {
+        await new Promise((resolve) => setTimeout(resolve, WORKFLOW_HARNESS_POLL_MS));
+        const stillPending = approvalRegistry.listPending({ sessionId: realSessionId, status: 'pending' });
+        if (stillPending.length === 0) break;
+        if (Date.now() - startedAt > WORKFLOW_HARNESS_APPROVAL_MAX_WAIT_MS) {
+          throw new Error(
+            `workflow step "${step.id}" exceeded approval wait budget (${WORKFLOW_HARNESS_APPROVAL_MAX_WAIT_MS}ms)`,
+          );
+        }
+      }
+
+      // At this point at least one approval has been resolved. The most
+      // recent resolution defines whether we approve or reject the SDK
+      // interrupt — if any was rejected/cancelled, we reject; otherwise
+      // approve. Mirror the same channel-side logic from
+      // tryHandleHarnessApprovalReply.
+      const resolved = approvalRegistry.listPending({ sessionId: realSessionId, status: 'any' });
+      const anyRejected = resolved.some((r) => r.resolution === 'rejected' || r.resolution === 'cancelled_by_user');
+      const anyExpired = resolved.some((r) => r.resolution === 'expired');
+      const decision: 'approve' | 'reject' = (anyRejected || anyExpired) ? 'reject' : 'approve';
+
+      result = await runConversationFromResume({
+        agent,
+        sessionId: realSessionId,
+        decision,
+      });
+    }
+
+    if (result.status === 'failed') {
       throw new Error(
-        `workflow step "${step.id}" timed out waiting for approval after ${WORKFLOW_HARNESS_APPROVAL_MAX_WAIT_MS / 1000}s`,
+        `workflow step "${step.id}" failed via harness: ${result.error ?? 'unknown error'}`,
       );
     }
 
-    // Find the pending registry row(s) for this session and surface a
-    // user notification. The harness already registered the approval
-    // via registerAndEmitApprovals on the SDK interrupt; here we
-    // re-post a Discord-friendly nudge so the user sees the apr-xxxx
-    // code from their main channel, not just the audit log.
-    const pending = approvalRegistry.listPending({ sessionId: realSessionId, status: 'pending' });
-    for (const row of pending) {
-      if (!approvalIds.includes(row.approvalId)) {
-        approvalIds.push(row.approvalId);
-        try {
-          addNotification({
-            id: `wf-approval-${row.approvalId}-${Date.now()}`,
-            kind: 'approval',
-            title: `Workflow ${workflowName} · ${step.id} needs approval`,
-            body: `**${row.subject}**\n\nReply \`approve ${row.approvalId}\` (or \`reject ${row.approvalId}\`) to continue. The workflow is parked on step \`${step.id}\` until you respond.`,
-            createdAt: new Date().toISOString(),
-            read: false,
-            metadata: {
-              approvalId: row.approvalId,
-              sessionId: realSessionId,
-              subject: row.subject,
-              tool: row.tool,
-              workflowName,
-              stepId: step.id,
-            },
-          });
-        } catch {
-          /* notification is best-effort; the apr-xxxx is still
-             discoverable via the dashboard + sessions table */
-        }
-      }
-    }
+    // Pull the user-visible output from the most recent
+    // conversation_completed event for this session. The harness writes
+    // `summary` (or `reply` when present) as the user-facing text.
+    const { listEvents: listHarnessEvents } = await import('../runtime/harness/eventlog.js');
+    const completed = listHarnessEvents(realSessionId, { types: ['conversation_completed'] });
+    const lastCompletion = completed[completed.length - 1];
+    const lastDecision = result.lastDecision;
+    const output = (lastDecision?.reply && lastDecision.reply.trim())
+      || (lastDecision?.summary)
+      || (lastCompletion?.data?.reply as string | undefined)
+      || (lastCompletion?.data?.summary as string | undefined)
+      || '';
 
-    // Poll for resolution. The reaper might expire stale rows; the
-    // user might approve/reject; or all pending rows might clear via
-    // a /cancel command. Loop until the session has no more pending.
-    while (true) {
-      await new Promise((resolve) => setTimeout(resolve, WORKFLOW_HARNESS_POLL_MS));
-      const stillPending = approvalRegistry.listPending({ sessionId: realSessionId, status: 'pending' });
-      if (stillPending.length === 0) break;
-      if (Date.now() - startedAt > WORKFLOW_HARNESS_APPROVAL_MAX_WAIT_MS) {
-        throw new Error(
-          `workflow step "${step.id}" exceeded approval wait budget (${WORKFLOW_HARNESS_APPROVAL_MAX_WAIT_MS}ms)`,
-        );
-      }
-    }
-
-    // At this point at least one approval has been resolved. The most
-    // recent resolution defines whether we approve or reject the SDK
-    // interrupt — if any was rejected/cancelled, we reject; otherwise
-    // approve. Mirror the same channel-side logic from
-    // tryHandleHarnessApprovalReply.
-    const resolved = approvalRegistry.listPending({ sessionId: realSessionId, status: 'any' });
-    const anyRejected = resolved.some((r) => r.resolution === 'rejected' || r.resolution === 'cancelled_by_user');
-    const anyExpired = resolved.some((r) => r.resolution === 'expired');
-    const decision: 'approve' | 'reject' = (anyRejected || anyExpired) ? 'reject' : 'approve';
-
-    result = await runConversationFromResume({
-      agent,
-      sessionId: realSessionId,
-      decision,
-    });
+    return { output, hadApprovals, approvalIds };
+  } finally {
+    closePlanScope(realSessionId, 'workflow-step-finished');
   }
-
-  if (result.status === 'failed') {
-    throw new Error(
-      `workflow step "${step.id}" failed via harness: ${result.error ?? 'unknown error'}`,
-    );
-  }
-
-  // Pull the user-visible output from the most recent
-  // conversation_completed event for this session. The harness writes
-  // `summary` (or `reply` when present) as the user-facing text.
-  const { listEvents: listHarnessEvents } = await import('../runtime/harness/eventlog.js');
-  const completed = listHarnessEvents(realSessionId, { types: ['conversation_completed'] });
-  const lastCompletion = completed[completed.length - 1];
-  const lastDecision = result.lastDecision;
-  const output = (lastDecision?.reply && lastDecision.reply.trim())
-    || (lastDecision?.summary)
-    || (lastCompletion?.data?.summary as string | undefined)
-    || '';
-
-  return { output, hadApprovals, approvalIds };
 }
 
 /**
@@ -515,20 +548,28 @@ async function executeStep(
       });
       try {
         const prompt = renderTemplate(step.prompt, ctx.inputs, ctx.stepOutputs, item);
-        const response = await ctx.assistant.respond({
-          sessionId: `workflow:${ctx.runId}:${step.id}:${key}`,
-          channel: 'workflow',
-          message: `Workflow: ${ctx.workflow.name}\nStep: ${step.id}\nItem: ${key}\n\n${prompt}`,
-          model: step.model || MODELS.primary,
-          maxWallClockMs: WORKFLOW_STEP_WALL_CLOCK_MS,
-        });
+        const output = workflowHarnessEnabled(step)
+          ? (await runStepViaHarness(
+              step,
+              `${ctx.runId}:${step.id}:${key}`,
+              `Item: ${key}\n\n${prompt}`,
+              ctx.workflow.name,
+              workflowAutoApprovalTools(ctx.workflow, step),
+            )).output
+          : (await ctx.assistant.respond({
+              sessionId: `workflow:${ctx.runId}:${step.id}:${key}`,
+              channel: 'workflow',
+              message: `Workflow: ${ctx.workflow.name}\nStep: ${step.id}\nItem: ${key}\n\n${prompt}`,
+              model: step.model || MODELS.primary,
+              maxWallClockMs: WORKFLOW_STEP_WALL_CLOCK_MS,
+            })).text;
         appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
           kind: 'item_completed',
           stepId: step.id,
           itemKey: key,
-          output: response.text,
+          output,
         });
-        return { itemKey: key, output: response.text };
+        return { itemKey: key, output };
       } catch (err) {
         const error = err instanceof Error ? err.message : String(err);
         appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
@@ -581,6 +622,7 @@ async function executeStep(
         `${ctx.runId}:${step.id}`,
         prompt,
         ctx.workflow.name,
+        workflowAutoApprovalTools(ctx.workflow, step),
       );
       output = result.output;
       if (result.hadApprovals) {

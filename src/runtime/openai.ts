@@ -106,17 +106,10 @@ export class OpenAIRuntime implements AgentRuntime {
   }
 
   private async createAgent(request: RunRequest): Promise<Agent<RuntimeContextValue>> {
-    // Expose every ACTIVE Composio toolkit action as a first-class
-    // tool the model can call directly (`cx_<slug>`). Same principle
-    // as the MCP namespace shim — the model is far more reliable
-    // calling real, schema-visible tools than chasing a broker layer
-    // through composio_search_tools → composio_execute_tool. The
-    // Composio client caches the toolkit catalog for 60min and active
-    // connections for 60s, so this does not add per-chat latency.
-    // The broker tools (composio_status / _search / _list / _execute)
-    // remain available as a fallback for ad-hoc lookups and for
-    // toolkits whose connections aren't ACTIVE yet.
-    const tools = await getCoreToolsAsync({ includeDynamicComposioTools: true });
+    // Keep Composio token-efficient: expose the compact broker tools
+    // (`composio_search_tools` -> `composio_execute_tool`) instead of
+    // injecting one cx_* function per connected action into every run.
+    const tools = await getCoreToolsAsync({ includeDynamicComposioTools: false });
     return new Agent<RuntimeContextValue>({
       name: ASSISTANT_NAME,
       instructions:

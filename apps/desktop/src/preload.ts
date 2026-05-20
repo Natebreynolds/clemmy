@@ -49,8 +49,13 @@ const api = {
   updaterStatus: () => ipcRenderer.invoke('clemmy:updater-status') as Promise<Record<string, unknown>>,
   /** Manually trigger a one-shot update check. Returns the new status. */
   updaterCheck: () => ipcRenderer.invoke('clemmy:updater-check') as Promise<Record<string, unknown>>,
-  /** Quit+install a downloaded update (no-op when state isn't `ready-to-install`). */
+  /** Download an available update, or quit+install once it is ready. */
   updaterApply: () => ipcRenderer.invoke('clemmy:updater-apply') as Promise<Record<string, unknown>>,
+  onUpdaterEvent: (cb: (event: Record<string, unknown>) => void) => {
+    const handler = (_event: unknown, payload: Record<string, unknown>) => cb(payload);
+    ipcRenderer.on('clemmy:updater-event', handler);
+    return () => ipcRenderer.removeListener('clemmy:updater-event', handler);
+  },
   onRecallEvent: (cb: (event: Record<string, unknown>) => void) => {
     const handler = (_event: unknown, payload: Record<string, unknown>) => cb(payload);
     ipcRenderer.on('clemmy:recall-event', handler);

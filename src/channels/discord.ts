@@ -31,6 +31,7 @@ import {
 import {
   handleDiscordHarnessMessage,
   runDiscordHarnessConversation,
+  type DiscordHarnessTransport,
   tryHandleHarnessApprovalReply,
 } from './discord-harness.js';
 import { ClementineAssistant } from '../assistant/core.js';
@@ -1237,6 +1238,37 @@ async function sendInteractionChunks(
   }
 }
 
+function buildButtonHarnessTransport(interaction: ButtonInteraction): DiscordHarnessTransport {
+  return {
+    async sendInitial(content: string) {
+      const first = content.slice(0, 1900);
+      if (interaction.deferred || interaction.replied) {
+        await interaction.editReply({ content: first });
+      } else {
+        await interaction.reply({ content: first });
+      }
+      return {
+        edit: async (next: string, options?: { components?: unknown[] }) => {
+          const payload: { content: string; components?: unknown[] } = { content: next.slice(0, 1900) };
+          if (options && Array.isArray(options.components)) payload.components = options.components;
+          await interaction.editReply(payload as Parameters<ButtonInteraction['editReply']>[0]);
+        },
+      };
+    },
+    async sendError(content: string) {
+      const payload = { content: content.slice(0, 1900), ephemeral: true };
+      if (interaction.deferred || interaction.replied) {
+        await interaction.followUp(payload);
+      } else {
+        await interaction.reply(payload);
+      }
+    },
+    async sendFollowup(content: string) {
+      await interaction.followUp({ content: content.slice(0, 1900) });
+    },
+  };
+}
+
 async function registerSlashCommands(client: Client): Promise<void> {
   if (!client.isReady()) return;
 
@@ -1260,6 +1292,14 @@ async function handleButtonInteraction(interaction: ButtonInteraction, assistant
   try {
     if (action === 'approve' || action === 'reject') {
       const approved = action === 'approve';
+      if (DISCORD_HARNESS_ENABLED && targetId.startsWith('apr-')) {
+        const handled = await tryHandleHarnessApprovalReply({
+          channelId: interaction.channelId ?? '',
+          prompt: `${approved ? 'approve' : 'reject'} ${targetId}`,
+          transport: buildButtonHarnessTransport(interaction),
+        });
+        if (handled) return;
+      }
       const text = await resolveApprovalOrQueueBackgroundContinuation(assistant, targetId, approved);
       await interaction.reply({
         content: text,

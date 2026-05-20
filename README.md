@@ -21,11 +21,11 @@ Clementine is built around three primitives:
   work — not because the prompt repeats them, but because the runtime knows
   where to find them.
 
-- **One tool surface.** Every tool — local SDK tools, MCP-discovered tools
+- **One compact tool surface.** Local SDK tools, MCP-discovered tools
   (DataForSEO, Hostinger, Supabase, etc.), Composio-bridged apps (Gmail,
-  Google Sheets, Slack, Notion, …), computer-use, the planner — is exposed
-  with real schemas to the agent. No broker layers, no prompt coaching, no
-  hidden choice the model has to remember. She calls the tool that fits.
+  Google Sheets, Slack, Notion, …), computer-use, the planner, and installed
+  skills are available without dumping every possible schema into every model
+  call. Composio uses a search/execute broker; skills are loaded on demand.
 
 - **One trust gradient.** Every tool flows through a single classifier
   (`read | write | execute | send | admin`) and one approval decision driven
@@ -100,7 +100,7 @@ npm start
                  │   │   ┌────▼─────────────────────────┐│ │
                  │   │   │  Tool surface (one list)     ││ │
                  │   │   │  • SDK: local + computer-use ││ │
-                 │   │   │  • cx_<toolkit>_<action>     ││ │
+                 │   │   │  • Composio search/execute   ││ │
                  │   │   │  • <server>__<tool>  (MCP)   ││ │
                  │   │   └──────────────────────────────┘│ │
                  │   │        │                          │ │
@@ -121,9 +121,9 @@ npm start
 - `src/runtime/mcp-namespace-shim.ts` — flattens N MCP servers into one
   collision-free surface (`<server>__<tool>`).
 - `src/runtime/codex-native-runtime.ts` — the runtime that talks to ChatGPT's
-  Codex backend; folds MCP + Composio + SDK tools into one tool list.
-- `src/tools/composio-tools.ts` — first-class `cx_<toolkit>_<action>` tools
-  loaded for every active Composio connection.
+  Codex backend; folds MCP + compact Composio broker + SDK tools into one tool list.
+- `src/tools/composio-tools.ts` — broker tools for discovering and executing
+  any connected Composio action by exact slug.
 - `src/agents/proactivity-policy.ts` — the scope policy (`strict | workspace
   | yolo`) you set in the dashboard.
 - `src/agents/tool-observability.ts` — append-only NDJSON log of every tool
@@ -144,9 +144,10 @@ Data, ElevenLabs, Apify, browsermcp, plus the local `clementine` MCP server.
 ### Composio
 
 Paste a Composio API key in the dashboard under **Connected Apps**. Every
-active toolkit becomes first-class tools the agent can call directly. Approval
-gating still applies — Gmail-send asks in strict, autos in YOLO; Sheets-read
-autos everywhere.
+active toolkit is reachable through `composio_search_tools` and
+`composio_execute_tool`, so the model can use all actions without loading
+hundreds of per-action schemas into every turn. Approval gating still applies:
+Gmail-send asks in strict, autos in YOLO; Sheets-read autos everywhere.
 
 ### Computer-use
 
@@ -203,7 +204,7 @@ Build the desktop app:
 
 ```bash
 cd apps/desktop
-npm run package:mac          # signed + notarized DMG → release/
+./scripts/release-local.sh   # signed + notarized DMG → release/
 ```
 
 The daemon and the Electron app share the `~/.clementine-next/` data dir, so
@@ -215,7 +216,7 @@ stays consistent with the installed Clementine.app.
 Shipped and working:
 
 - ✓ Single namespace-shimmed MCP surface across N servers (no collisions)
-- ✓ First-class Composio `cx_*` tools loaded for every active connection
+- ✓ Token-efficient Composio broker for all connected actions
 - ✓ Unified tool taxonomy + scope policy (`strict | workspace | yolo`)
 - ✓ Codex OAuth runtime with full tool surface (MCP + Composio + SDK + local)
 - ✓ Append-only tool-event audit log

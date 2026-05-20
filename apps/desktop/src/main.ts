@@ -286,7 +286,10 @@ function buildUpdaterMenuItems(): Electron.MenuItemConstructorOptions[] {
     label = 'Checking for updates…';
     enabled = false;
     click = undefined;
-  } else if (u.state === 'available' || u.state === 'downloading') {
+  } else if (u.state === 'available') {
+    label = `Download update v${u.version || ''}`;
+    click = () => { applyUpdate(); };
+  } else if (u.state === 'downloading') {
     label = u.progressPct
       ? `Downloading v${u.version || ''} · ${u.progressPct}%`
       : `Downloading v${u.version || ''}…`;
@@ -537,6 +540,14 @@ ipcMain.handle('clemmy:updater-apply', () => {
   return { ...getUpdaterStatus(), applyResult: result };
 });
 
+function sendUpdaterEvent(status: ReturnType<typeof getUpdaterStatus>): void {
+  for (const win of [mainWindow, splashWindow, setupWindow]) {
+    if (win && !win.isDestroyed()) {
+      win.webContents.send('clemmy:updater-event', status);
+    }
+  }
+}
+
 // ─── Setup wizard IPC handlers ─────────────────────────────────────
 
 ipcMain.handle('clemmy:setup-status', async () => ({
@@ -712,7 +723,10 @@ app.on('ready', () => {
   // tray label so the user sees "Restart to install vX.Y.Z" when an
   // update is downloaded; no modal interrupts.
   initAutoUpdater({ logFile: LOG_FILE });
-  onUpdaterStatusChange(() => rebuildTrayMenu());
+  onUpdaterStatusChange((status) => {
+    rebuildTrayMenu();
+    sendUpdaterEvent(status);
+  });
 });
 app.on('window-all-closed', () => {
   // macOS tray-resident pattern. On Linux/Windows we still quit when

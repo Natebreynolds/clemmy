@@ -467,13 +467,23 @@ export async function tryHandleHarnessApprovalReply(opts: {
   // workflow's polling loop never seeing the resolution.
   //
   // If the user supplied an approval ID AND the registry has it
-  // pending, resolve it directly from here. The workflow runner's
-  // polling loop will detect the status flip on the next tick and
-  // call runConversationFromResume against its own session, so we
-  // don't need to drive the SDK runner here.
+  // pending, either resume the paused Discord session (interactive
+  // harness chat) or resolve it directly (workflow/cron-style harness
+  // sessions that are waiting in a polling loop).
   if (intent.approvalId) {
     const row = approvalRegistry.get(intent.approvalId);
     if (row && row.status === 'pending') {
+      const canResumeInDiscord = row.channel === 'discord' || row.channel === 'discord-dm';
+      if (canResumeInDiscord && isChannelSessionAwaitingApproval(opts.channelId)) {
+        await runDiscordHarnessResume({
+          channelId: opts.channelId,
+          decision: intent.decision,
+          approvalId: intent.approvalId,
+          transport: opts.transport,
+        });
+        return true;
+      }
+
       const resolution = intent.decision === 'approve' ? 'approved' : 'rejected';
       const result = approvalRegistry.resolve(row.approvalId, resolution, 'discord-user');
       try {
@@ -483,18 +493,6 @@ export async function tryHandleHarnessApprovalReply(opts: {
             : `Couldn't resolve \`${row.approvalId}\`: ${result.reason ?? 'unknown'}`,
         );
       } catch { /* transport is best-effort */ }
-      // If the approval also has a paused session on THIS channel,
-      // continue down the runDiscordHarnessResume path so the SDK
-      // run resumes. Otherwise the workflow runner picks it up on
-      // its next poll tick.
-      if (isChannelSessionAwaitingApproval(opts.channelId)) {
-        await runDiscordHarnessResume({
-          channelId: opts.channelId,
-          decision: intent.decision,
-          approvalId: intent.approvalId,
-          transport: opts.transport,
-        });
-      }
       return true;
     }
   }
@@ -594,6 +592,31 @@ function renderBody(state: DisplayState): string {
   const verb = state.currentAgent ? `${state.currentAgent} working…` : (state.status || 'working…');
   const body = `_${verb}_`;
   return body.length > MAX_DISCORD_MESSAGE ? body.slice(0, MAX_DISCORD_MESSAGE - 1) + '…' : body;
+}
+
+function humanHarnessText(value: unknown, fallback = ''): string {
+  if (value === null || value === undefined) return fallback;
+  if (typeof value === 'object') {
+    const obj = value as { reply?: unknown; summary?: unknown };
+    const reply = typeof obj.reply === 'string' ? obj.reply.trim() : '';
+    const summary = typeof obj.summary === 'string' ? obj.summary.trim() : '';
+    return reply || summary || fallback;
+  }
+  const text = String(value).trim();
+  if (!text) return fallback;
+  if ((text.startsWith('{') && text.endsWith('}')) || (text.startsWith('[') && text.endsWith(']'))) {
+    try {
+      const parsed = JSON.parse(text) as { reply?: unknown; summary?: unknown } | null;
+      if (parsed && typeof parsed === 'object') {
+        const reply = typeof parsed.reply === 'string' ? parsed.reply.trim() : '';
+        const summary = typeof parsed.summary === 'string' ? parsed.summary.trim() : '';
+        if (reply || summary) return reply || summary;
+      }
+    } catch {
+      // Not JSON after all; use the raw text below.
+    }
+  }
+  return text;
 }
 
 /**
@@ -1222,16 +1245,7 @@ export function applyEventToState(event: EventRow, state: DisplayState): void {
       if (event.role === 'system') return;
       const output = String(data.output ?? '');
       if (!output) return;
-      try {
-        const parsed = JSON.parse(output);
-        if (parsed && typeof parsed === 'object' && typeof parsed.summary === 'string') {
-          state.summary = parsed.summary;
-          return;
-        }
-      } catch {
-        /* not JSON — fall through */
-      }
-      state.summary = output;
+      state.summary = humanHarnessText(output, output);
       return;
     }
     case 'conversation_step': {
@@ -1239,7 +1253,7 @@ export function applyEventToState(event: EventRow, state: DisplayState): void {
       // Prefer reply (user-facing text) over summary (META log). Without
       // this, a step's META summary leaks into state.summary and survives
       // even when conversation_completed later carries a real reply.
-      const stepText = decision?.reply && decision.reply.trim() ? decision.reply : decision?.summary;
+      const stepText = humanHarnessText(decision?.reply && decision.reply.trim() ? decision.reply : decision?.summary);
       if (stepText) state.summary = stepText;
       const step = data.step ? `step ${String(data.step)}` : 'step';
       state.status = step;
@@ -1291,11 +1305,7 @@ export function applyEventToState(event: EventRow, state: DisplayState): void {
       // present, but defense-in-depth — if a producer somewhere forgets
       // the fallback, reading reply first still wins).
       const reply = typeof data.reply === 'string' && data.reply.trim() ? data.reply : '';
-      const summary = reply
-        ? reply
-        : data.summary
-          ? String(data.summary)
-          : state.summary;
+      const summary = humanHarnessText(reply || data.summary, state.summary);
       if (summary) state.summary = summary;
       const reason = data.reason ? String(data.reason) : '';
       state.status = reason === 'abandoned_by_orchestrator' ? 'abandoned' : 'complete';

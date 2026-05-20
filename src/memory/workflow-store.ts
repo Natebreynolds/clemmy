@@ -39,14 +39,12 @@ export interface WorkflowStepInput {
   tier?: number;
   maxTurns?: number;
   /**
-   * T-WF-1: route this step through the harness loop (full orchestrator
-   * + sub-agents + addressable approvals via apr-xxxx codes) instead
-   * of the legacy `assistant.respond()` shorthand. Opt-in per step so
-   * existing workflows authored before the harness existed keep their
-   * original behavior. New workflows that need real tool calls (sf,
-   * composio writes, MCP tools that pause for approval) should set
-   * this to true. Equivalent to setting the env flag
-   * WORKFLOW_USE_HARNESS=on for ALL steps in the workflow.
+   * Route this step through the harness loop (full orchestrator +
+   * sub-agents + addressable approvals via apr-xxxx codes) instead of
+   * the legacy `assistant.respond()` shorthand. The runner now defaults
+   * to the harness for workflow steps; set this to false only for a
+   * deliberately legacy/simple text-only step, or set
+   * WORKFLOW_USE_HARNESS=off globally for debugging.
    */
   useHarness?: boolean;
   /**

@@ -47,6 +47,7 @@ import {
   resumeBackgroundTask,
 } from '../execution/background-tasks.js';
 import { saveProactivityPolicy } from '../agents/proactivity-policy.js';
+import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 
 const logger = pino({ name: 'clementine-next.webhook' });
 const CRON_TRIGGERS_DIR = path.join(BASE_DIR, 'cron', 'triggers');
@@ -1170,7 +1171,10 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
   });
 
   app.get('/api/approvals', requireAuth, (_req, res) => {
-    res.json({ approvals: assistant.getRuntime().listPendingApprovals() });
+    res.json({
+      approvals: assistant.getRuntime().listPendingApprovals(),
+      harnessApprovals: approvalRegistry.listPending({ status: 'pending' }),
+    });
   });
 
   app.get('/api/runs', requireAuth, (req, res) => {

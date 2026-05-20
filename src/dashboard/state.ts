@@ -66,7 +66,7 @@ function toolCategory(name: string): string {
 }
 
 async function listRuntimeTools(): Promise<Array<{ name: string; description: string; category: string }>> {
-  return (await getCoreToolsAsync({ includeDynamicComposioTools: true }))
+  return (await getCoreToolsAsync({ includeDynamicComposioTools: false }))
     .filter((item) => item.type === 'function')
     .map((item) => ({
       name: item.name,

@@ -230,7 +230,7 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
 
   const composio_search_tools = tool({
     name: 'composio_search_tools',
-    description: 'Search Composio for the right action when no first-class `cx_<toolkit>_<action>` tool in your surface matches what you need. Use this BEFORE concluding an action is unavailable — Composio exposes hundreds of actions per toolkit, only ~25 are preloaded as first-class tools. Query with plain English ("outlook list unread messages today", "drive search by name", "gmail mark as read"). Returns slugs to pass to `composio_execute_tool`.',
+    description: 'Search Composio for the right action slug. Use this BEFORE concluding an action is unavailable — Composio exposes hundreds of actions per toolkit and Clementine intentionally does not inject every action schema into every call. Query with plain English ("outlook list unread messages today", "drive search by name", "gmail mark as read"). Returns slugs to pass to `composio_execute_tool`.',
     parameters: z.object({
       query: z.string().min(1),
       toolkit_slug: z.string().min(1).nullable(),
@@ -316,14 +316,14 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
         query,
         count: Math.min(matches.length, maxResults),
         matches: matches.slice(0, maxResults),
-        nextStep: 'For each match, prefer the matching `cx_<toolkit>_<action>` first-class tool if it appears in your surface. If the slug is NOT in your surface (common for read/list/search actions outside the curated set), call `composio_execute_tool` with `tool_slug` set to the exact slug from this result and `arguments` as a JSON object string built from the action\'s `inputParameters` schema.',
+        nextStep: 'Pick the best match, then call `composio_execute_tool` with `tool_slug` set to the exact slug from this result and `arguments` as a JSON object string built from the action\'s `inputParameters` schema.',
       });
     },
   });
 
   const composio_execute_tool = tool({
     name: 'composio_execute_tool',
-    description: 'Execute any Composio action by exact slug — the universal fallback when no first-class `cx_<toolkit>_<action>` tool covers what you need (Outlook list-mail, Gmail search, Drive search, Salesforce query, etc.). Never invent slugs — always call `composio_search_tools` first with a plain-English query, then pass the returned slug here. Arguments must be a JSON object string. Uses the same OAuth connection and approval policy as the first-class tools.',
+    description: 'Execute any Composio action by exact slug (Outlook list-mail, Gmail search, Drive search, Salesforce query, etc.). Never invent slugs — always call `composio_search_tools` first with a plain-English query, then pass the returned slug here. Arguments must be a JSON object string. Uses the connected OAuth account and approval policy.',
     parameters: z.object({
       tool_slug: z.string().min(1),
       arguments: z.string().nullable(),

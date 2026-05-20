@@ -114,6 +114,8 @@ test('Orchestrator tools are deliberation + read-only discovery/memory tools', a
       'local_cli_list',
       'local_cli_probe',
       'request_approval',
+      'skill_list',
+      'skill_read',
       'tool_choice_invalidate',
       'tool_choice_recall',
       'tool_choice_remember',

@@ -35,6 +35,16 @@ if [[ -z "${APPLE_ID:-}" || -z "${APPLE_APP_PASSWORD:-}" || -z "${APPLE_TEAM_ID:
   exit 1
 fi
 
+IDENTITIES="$(security find-identity -v -p codesigning 2>/dev/null || true)"
+if [[ "$IDENTITIES" != *"Developer ID Application"*"$APPLE_TEAM_ID"* ]]; then
+  cat <<EOF
+No Developer ID Application signing identity for team $APPLE_TEAM_ID was found in the current Keychain.
+
+Import the Developer ID Application certificate/private key, unlock the Keychain, then rerun.
+EOF
+  exit 1
+fi
+
 cd "$(dirname "$0")/.."   # apps/desktop
 
 echo "→ Building desktop main process"

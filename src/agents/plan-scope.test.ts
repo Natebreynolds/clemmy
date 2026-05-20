@@ -116,6 +116,26 @@ test('isAutoApprovedByScope: false for tool NOT in allowedTools', () => {
   assert.equal(isAutoApprovedByScope('sess-narrow', 'write_file'), false);
 });
 
+test('isAutoApprovedByScope: wildcard and prefix wildcards cover matching tools', () => {
+  openPlanScope({
+    sessionId: 'sess-wide',
+    planProposalId: 'plan-wide',
+    approvedPlanObjective: 'approved workflow',
+    allowedTools: ['*'],
+  });
+  assert.equal(isAutoApprovedByScope('sess-wide', 'composio_execute_tool'), true);
+  assert.equal(isAutoApprovedByScope('sess-wide', 'write_file'), true);
+
+  openPlanScope({
+    sessionId: 'sess-prefix',
+    planProposalId: 'plan-prefix',
+    approvedPlanObjective: 'approved connector family',
+    allowedTools: ['composio_*'],
+  });
+  assert.equal(isAutoApprovedByScope('sess-prefix', 'composio_execute_tool'), true);
+  assert.equal(isAutoApprovedByScope('sess-prefix', 'run_shell_command'), false);
+});
+
 test('isAutoApprovedByScope: false when scope expired', () => {
   openPlanScope({ sessionId: 'sess-exp', planProposalId: 'plan-1', approvedPlanObjective: 'exp' });
   backdate('sess-exp', -7200_000, -1000); // opened 2h ago, expired 1s ago

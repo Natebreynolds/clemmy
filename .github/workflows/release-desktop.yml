@@ -50,6 +50,27 @@ jobs:
         working-directory: apps/desktop
         run: npm ci
 
+      - name: Verify release secrets
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=()
+          for name in APPLE_ID APPLE_APP_PASSWORD APPLE_TEAM_ID CSC_LINK CSC_KEY_PASSWORD; do
+            value="${!name-}"
+            if [[ -z "$value" ]]; then
+              missing+=("$name")
+            fi
+          done
+          if (( ${#missing[@]} > 0 )); then
+            echo "::error::Missing required desktop release secrets: ${missing[*]}"
+            exit 1
+          fi
+
       - name: Build + sign + notarize (no publish)
         working-directory: apps/desktop
         env:
@@ -84,6 +105,10 @@ jobs:
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
+          if [[ ! "$tag" =~ ^v[0-9]+(\.[0-9]+){2}(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Desktop releases must run from a semver tag like v0.4.23, not '$tag'."
+            exit 1
+          fi
           echo "Uploading artifacts for tag $tag"
           ls -la release/
           if ! gh release view "$tag" >/dev/null 2>&1; then

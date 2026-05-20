@@ -162,8 +162,11 @@ const RESEARCHER_TOOL_NAMES = new Set<string>([
   'agent_run_get',
   // Discovery
   'discover_work',
-  // External — first-class cx_* tools are added via prefix at build
-  // time; the broker tools below remain as discovery helpers.
+  // On-demand skill loading. Skills are not injected into every prompt;
+  // the agent reads only the relevant SKILL.md body when the task needs it.
+  'skill_list',
+  'skill_read',
+  // External app discovery through the compact Composio broker.
   'composio_status',
   'composio_list_tools',
   'composio_search_tools',
@@ -199,6 +202,8 @@ const WORKER_TOOL_NAMES = new Set<string>([
   'git_status',
   'local_cli_list',
   'local_cli_probe',
+  'skill_list',
+  'skill_read',
   'composio_list_tools',
   'composio_search_tools',
   'composio_execute_tool',
@@ -234,6 +239,7 @@ const EXECUTOR_TOOL_NAMES = new Set<string>([
   // Notifications
   'notify_user',
   // Workspace (read + targeted writes; shell is approval-gated)
+  'workspace_config',
   'workspace_roots',
   'workspace_list',
   'workspace_info',
@@ -242,17 +248,15 @@ const EXECUTOR_TOOL_NAMES = new Set<string>([
   'write_file',
   'run_shell_command',
   'git_status',
-  // External — first-class cx_* tools are added via prefix at build
-  // time for CURATED toolkits (CURATED_TOOLKITS in
-  // integrations/composio/client.ts). For non-curated toolkits the
-  // user has connected (e.g. Instagram, TikTok, anything outside the
-  // curated set), the cx_*_* tools don't exist — so the executor
-  // MUST be able to fall back to discovery + dynamic execution:
+  // On-demand skill loading for specialized execution work (design,
+  // scraping recipes, document/spreadsheet workflows, etc.).
+  'skill_list',
+  'skill_read',
+  // External actions use brokered discovery + execution:
   //     composio_search_tools(query) → matching slugs
   //     composio_execute_tool(slug, args) → runs it
-  // Per the no-hardcoded-tool-lists architectural principle, we keep
-  // BOTH paths in the surface so the executor can handle any toolkit
-  // the user has connected, not just the ~24 in CURATED_TOOLKITS.
+  // This handles every connected toolkit without injecting hundreds of
+  // per-action tools into every model call.
   'composio_list_tools',
   'composio_search_tools',
   'composio_execute_tool',
@@ -275,6 +279,8 @@ const WRITER_TOOL_NAMES = new Set<string>([
   'read_file',
   'write_file',
   'git_status',
+  'skill_list',
+  'skill_read',
   // Progress visibility
   'execution_list',
   'execution_get',
@@ -304,6 +310,8 @@ const REVIEWER_TOOL_NAMES = new Set<string>([
   'goal_list',
   'goal_get',
   'session_history',
+  'skill_list',
+  'skill_read',
   'composio_status',
   'composio_list_tools',
 ]);
@@ -329,44 +337,27 @@ const DEPLOYER_TOOL_NAMES = new Set<string>([
   'write_file',
   'git_status',
   'run_shell_command',
-  // External — first-class cx_* tools added by prefix at build time.
+  'skill_list',
+  'skill_read',
+  // External app discovery through the compact Composio broker.
   'composio_status',
   'composio_list_tools',
   'composio_search_tools',
 ]);
 
-/**
- * Prefix patterns added on top of every sub-agent's explicit allowlist.
- * `cx_` is the first-class Composio per-action surface; every sub-agent
- * that has any Composio access gets the lot. The trust gradient still
- * gates each call per its taxonomy `ToolKind` (read vs send), so adding
- * the prefix here doesn't give Researcher a write path — it just lets
- * Researcher call `cx_googlesheets_batch_get` etc.
- *
- * Note: Researcher / Reviewer are read-only sub-agents, so the cx_*
- * prefix is intentionally *not* added to them — the orchestrator hands
- * them off for lookups, not mutations. Executor / Deployer / Writer
- * get the prefix because they may need to invoke external app actions.
- */
-const COMPOSIO_FIRST_CLASS_PREFIX = 'cx_';
-
 function filterToolsByNames<T extends { name?: string }>(
   tools: T[],
   allow: Set<string>,
-  prefixes: string[] = [],
 ): T[] {
   return tools.filter((tool) => {
     const name = tool.name;
     if (!name) return false;
-    if (allow.has(name)) return true;
-    return prefixes.some((p) => name.startsWith(p));
+    return allow.has(name);
   });
 }
 
 export async function buildResearcherAgent(): Promise<SubAgent> {
-  // Researcher is read-only — no cx_* prefix needed; the few read-only
-  // composio_* helpers are explicit in the allowlist.
-  const all = await getCoreToolsAsync({ includeDynamicComposioTools: true });
+  const all = await getCoreToolsAsync({ includeDynamicComposioTools: false });
   const tools = filterToolsByNames(all, RESEARCHER_TOOL_NAMES) as Tool<RuntimeContextValue>[];
   return new Agent<RuntimeContextValue>({
     name: 'Researcher',
@@ -376,6 +367,7 @@ export async function buildResearcherAgent(): Promise<SubAgent> {
       'Your single job is to gather information and return a concise, well-organized summary.',
       'You CANNOT change anything — no task creates, no file writes, no commits, no notifications. The orchestrator will act on your findings.',
       'Memory tools are your primary surface. You have ACCESS to the user\'s full persistent memory beyond the bounded context block in your system prompt: memory_recall (embedding search across notes, conversations, and consolidated facts), memory_search (lexical search), memory_read (read a specific note by id/path), session_history (prior conversations), workspace_info, list_files / read_file (vault + project files), git_status, goal_list. CALL these tools actively. If the orchestrator handed off because the user referenced past context, you must surface that context — do not ask the user to repeat themselves when their memory store already has the answer.',
+      'Skills are on-demand. For specialized research domains or installed workflow recipes, call `skill_list`, then `skill_read` for the one relevant skill. Do not bulk-load skills.',
       'External-tool discovery — when the orchestrator hands off to identify an external action (e.g. "find the Composio tool for posting to Instagram", "what tool can send a Slack DM"), you OWN the discovery: call `composio_status` to confirm the toolkit is connected, then `composio_search_tools` with a focused query, then `composio_list_tools` if you need to see all actions for that toolkit. Return the SPECIFIC tool slug AND its required arguments (parameter names + a brief description of each). The Executor will receive your finding via the orchestrator and call `composio_execute_tool(slug, args)` directly — it will NOT re-search. Be precise; if you return a wrong slug the Executor blindly runs it.',
       'Search pattern: form a focused query → call memory_recall (or memory_search if you have specific keywords) → read the top hits → return.',
       'TIME-BOX RULE: you have at most ~5 tool calls to find the target. If the first round of memory + a top-level workspace listing does not surface the specific thing the user asked for, STOP exploring. Do not exhaustively drill into nested directories or repeat similar searches with slight query variations — that pattern burns the per-turn budget without producing better answers. Instead, return what you searched, what you found (candidates that are close but not exact matches), and an explicit "could not locate <target>" line so the orchestrator can ask the user to clarify the path.',
@@ -407,8 +399,8 @@ export async function buildResearcherAgent(): Promise<SubAgent> {
  * or wrap it via `worker.asTool({...})` for in-tool fan-out.
  */
 export async function buildWorkerAgent(): Promise<SubAgent> {
-  const all = await getCoreToolsAsync({ includeDynamicComposioTools: true });
-  const tools = filterToolsByNames(all, WORKER_TOOL_NAMES, [COMPOSIO_FIRST_CLASS_PREFIX]) as Tool<RuntimeContextValue>[];
+  const all = await getCoreToolsAsync({ includeDynamicComposioTools: false });
+  const tools = filterToolsByNames(all, WORKER_TOOL_NAMES) as Tool<RuntimeContextValue>[];
   return new Agent<RuntimeContextValue>({
     name: 'Worker',
     handoffDescription: 'Stateless per-item worker. Use via run_worker tool for parallel fan-out.',
@@ -418,6 +410,7 @@ export async function buildWorkerAgent(): Promise<SubAgent> {
       'Rules:',
       '  - Do exactly the work described in the input prompt. Do not ask follow-up questions, do not deliberate, do not branch into other tasks.',
       '  - Use the smallest set of tool calls needed. Discovery → execute when the action is external.',
+      '  - If the parent named a specific skill or the item clearly needs installed skill rules, call `skill_read` for that skill. Otherwise do not spend worker context on skill discovery.',
       '  - Return a TIGHT, structured result on the last line: a single sentence, a JSON object, or a bullet list. The parent will aggregate hundreds of these — keep yours compact.',
       '  - If you cannot complete the item, return a single line starting with "ERROR:" and a brief reason. Do not retry, do not escalate.',
       '  - Do NOT call notify_user, ask_user_question, or write to shared tasks/executions — those mutate state your sibling workers also touch and create race conditions.',
@@ -435,10 +428,11 @@ export async function buildWorkerAgent(): Promise<SubAgent> {
 }
 
 export async function buildExecutorAgent(): Promise<SubAgent> {
-  // Executor needs first-class cx_* so it can call `cx_googlesheets_*`
-  // and friends directly instead of going through the broker.
-  const all = await getCoreToolsAsync({ includeDynamicComposioTools: true });
-  const tools = filterToolsByNames(all, EXECUTOR_TOOL_NAMES, [COMPOSIO_FIRST_CLASS_PREFIX]) as Tool<RuntimeContextValue>[];
+  // Keep the Executor's connected-app surface compact: it uses the
+  // Composio broker tools to search/execute exact slugs instead of
+  // injecting per-action cx_* tools for every connected toolkit.
+  const all = await getCoreToolsAsync({ includeDynamicComposioTools: false });
+  const tools = filterToolsByNames(all, EXECUTOR_TOOL_NAMES) as Tool<RuntimeContextValue>[];
 
   // Wrap a Worker as a tool for parallel fan-out. The Executor's model
   // decides when to invoke it (one shot for single items, N shots in
@@ -464,20 +458,22 @@ export async function buildExecutorAgent(): Promise<SubAgent> {
     instructions: harnessInstructions([
       'You are the Executor sub-agent inside Clementine.',
       'Your single job is to take the work that has been decided and DO it. No deliberation, no re-planning.',
-      'Available tools: tasks (task_add, task_update), executions (execution_update_step, execution_complete, execution_mark_blocked), files (write_file, read_file), commands (run_shell_command — approval may be required), goals (goal_update), notifications (notify_user), check-ins (ask_user_question when truly blocked on user info).',
+      'Available tools: tasks (task_add, task_update), executions (execution_update_step, execution_complete, execution_mark_blocked), files (write_file, read_file), commands (run_shell_command — approval may be required), goals (goal_update), project linking (workspace_config), notifications (notify_user), check-ins (ask_user_question when truly blocked on user info).',
       'READ THE HANDOFF INPUT FIRST. The Orchestrator handed off to you with a structured object: { directive: string, toolCall: { slug, args, rationale } | null }. This appears in your input as the transfer_to_Executor result. The `directive` tells you what to do; the `toolCall` (when non-null) tells you the EXACT Composio tool slug and JSON-encoded arguments the Researcher pre-resolved. Use them directly — that is your fast path.',
-      'External integrations — three tiers, USE IN THIS ORDER:',
+      'Skills are on-demand. For specialized build, scraping, writing, spreadsheet, browser, or domain work, call `skill_list`, then `skill_read` for the one relevant skill. Do not bulk-load skills.',
+      'Project linking — if the user gives you a local project path and asks Clementine to use/link/work in it, call `workspace_config({action:"add", directory:"<path>"})`, then `workspace_info` for that project before editing. Adding/removing workspace dirs is an admin-level trust-boundary change, so the tool may pause for approval.',
+      'External integrations — brokered, token-efficient path:',
       '  1. handoff.toolCall is non-null → call `composio_execute_tool` with `{tool_slug: <slug>, arguments: <args>}` exactly as given. NO re-discovery, NO second-guessing the slug.',
-      '  2. handoff.toolCall is null AND a curated `cx_<toolkit>_<action>` matches → call it directly. These exist for gmail, googlesheets, slack, github, etc.',
-      '  3. Neither — fall back to discovery: `composio_search_tools` → `composio_execute_tool`. Flag in your summary that you had to discover, so the orchestrator learns to use the Researcher next time.',
-      'Discovery on the Executor is a FALLBACK. The Researcher\'s job is discovery; yours is execution. The Orchestrator should have pre-resolved any non-curated tool via Researcher. If toolCall is null and the work is clearly a Composio action, that\'s a sign the pipeline was skipped — note it in your summary.',
-      'NEVER conclude "the runtime doesn\'t expose that action" without trying tier 3. The user has connected toolkits we can\'t enumerate at build time.',
+      '  2. handoff.toolCall is null and the work is a Composio action → discover with `composio_search_tools`, then call `composio_execute_tool` with the exact returned slug and JSON args.',
+      '  3. If no Composio match exists, check the local CLI/MCP direction in the directive, or ask_user_question with the missing connection/tool.',
+      'Discovery on the Executor is a FALLBACK. The Researcher\'s job is discovery; yours is execution. The Orchestrator should have pre-resolved Composio actions. If toolCall is null and the work is clearly a Composio action, that\'s a sign the pipeline was skipped — note it in your summary.',
+      'NEVER conclude "the runtime doesn\'t expose that action" without trying broker discovery. The user has connected toolkits we can\'t enumerate at build time.',
       'Use `composio_status` only to confirm a toolkit is actually connected when you have a real reason to doubt it. If a needed toolkit is missing or disconnected, surface that with notify_user (or ask_user_question if you need them to connect it) — don\'t silently fail.',
       'Make small reversible changes, verify after each one when possible, and surface real errors via notify_user.',
       'READ SHELL ERRORS LITERALLY. When run_shell_command returns a non-zero exit code, do NOT infer the cause from the command type — read the actual stderr line by line and report THAT, verbatim, to the user. An exit code alone is not a diagnosis: quote the stderr. Do not write notifications like "X needs re-auth" unless the stderr literally says the credentials are expired/invalid. If the message is generic (working-directory issues, shell-init noise, PATH problems, etc.), retry once with `cwd` set explicitly, then surface the real error verbatim and ask the user what to do.',
       'When a tracked execution is involved, call execution_update_step every cycle you make progress, and execution_complete only when success criteria are met.',
       'PARALLEL FAN-OUT: when the work is "do the same operation across N independent items" (scrape N accounts, classify N records, fetch N URLs, summarize N docs), DO NOT loop sequentially in your own context — call `run_worker` MULTIPLE TIMES IN PARALLEL in the same turn (one call per item). The SDK runs them concurrently and each worker gets its own isolated context, so your context stays clean and the work completes in roughly the time of ONE item instead of N. For very large N (>50), prefer authoring a workflow with a `forEach` step via `workflow_schedule` — that has bounded concurrency and per-item durability for crashes.',
-      'NEVER END YOUR TURN WITHOUT ACTING. You were handed off because the Orchestrator decided concrete work needed to happen. Returning ANY message that describes work in future tense — "Executing now…", "I\'ll run the query…", "Let me fetch that…", "Pulling the data…", "Running it now…" — WITHOUT actually invoking the tool in the SAME turn is a STALL. The user sees an announcement of work that never happened. This is the single most common failure mode. Hard rule: if your reply contains future-tense action language ("I\'ll", "let me", "executing", "fetching", "running", "pulling", "about to"), you MUST have called the corresponding tool BEFORE that text was produced. Equivalent stalls include short acknowledgements ("Continuing.", "OK.", "Done.", "Working on it."). The fix is always the same: actually call the tool. If the directive is genuinely ambiguous and you can\'t pick a tool to call, use `ask_user_question` to clarify; do NOT just acknowledge and stop. Your turn MUST include at least one real tool call (composio_execute_tool, run_shell_command, cx_*, write_file, ask_user_question, etc.).',
+      'NEVER END YOUR TURN WITHOUT ACTING. You were handed off because the Orchestrator decided concrete work needed to happen. Returning ANY message that describes work in future tense — "Executing now…", "I\'ll run the query…", "Let me fetch that…", "Pulling the data…", "Running it now…" — WITHOUT actually invoking the tool in the SAME turn is a STALL. The user sees an announcement of work that never happened. This is the single most common failure mode. Hard rule: if your reply contains future-tense action language ("I\'ll", "let me", "executing", "fetching", "running", "pulling", "about to"), you MUST have called the corresponding tool BEFORE that text was produced. Equivalent stalls include short acknowledgements ("Continuing.", "OK.", "Done.", "Working on it."). The fix is always the same: actually call the tool. If the directive is genuinely ambiguous and you can\'t pick a tool to call, use `ask_user_question` to clarify; do NOT just acknowledge and stop. Your turn MUST include at least one real tool call (composio_execute_tool, run_shell_command, write_file, ask_user_question, etc.).',
       'Return a concise summary of what was done so the orchestrator knows the state. The summary describes the ACTION you took — never use it as a substitute for taking action.',
     ].join('\n\n')),
     model: MODELS.primary,
@@ -492,10 +488,8 @@ export async function buildExecutorAgent(): Promise<SubAgent> {
 }
 
 export async function buildWriterAgent(): Promise<SubAgent> {
-  // Writer may need to call write/create cx_* tools (e.g. draft a doc
-  // into Google Docs). The taxonomy still gates writes by scope.
-  const all = await getCoreToolsAsync({ includeDynamicComposioTools: true });
-  const tools = filterToolsByNames(all, WRITER_TOOL_NAMES, [COMPOSIO_FIRST_CLASS_PREFIX]) as Tool<RuntimeContextValue>[];
+  const all = await getCoreToolsAsync({ includeDynamicComposioTools: false });
+  const tools = filterToolsByNames(all, WRITER_TOOL_NAMES) as Tool<RuntimeContextValue>[];
   return new Agent<RuntimeContextValue>({
     name: 'Writer',
     handoffDescription: 'Drafts polished user-facing writing, docs, notes, email/message copy, and project summaries. Does not send messages or deploy.',
@@ -503,6 +497,7 @@ export async function buildWriterAgent(): Promise<SubAgent> {
       'You are the Writer sub-agent inside Clementine.',
       'Your job is to turn gathered context into clear, useful written artifacts: drafts, docs, summaries, emails, reports, and handoff notes.',
       'Do not send external messages or deploy changes. If the user wants something sent, return the draft and let the orchestrator or an approved executor handle delivery.',
+      'Skills are on-demand. For copy voice, design systems, document/presentation/spreadsheet formats, or domain-specific writing rules, call `skill_list`, then `skill_read` for the one relevant skill. Do not bulk-load skills.',
       'When writing files, keep changes scoped to the requested draft/document and avoid broad rewrites.',
       'NEVER END YOUR TURN WITHOUT PRODUCING ARTIFACTS OR ASKING. You were handed off to draft something concrete. Returning a one-word acknowledgement ("Continuing.", "OK.", "Done.") with zero tool calls is a stall — the user gets nothing back. Either write the file/draft, or call ask_user_question to resolve the ambiguity. Acknowledgement is not action.',
       'Return the final draft location or text plus any assumptions that matter.',
@@ -519,9 +514,7 @@ export async function buildWriterAgent(): Promise<SubAgent> {
 }
 
 export async function buildReviewerAgent(): Promise<SubAgent> {
-  // Reviewer is read-only — only the explicit composio_* discovery
-  // helpers in the allowlist.
-  const all = await getCoreToolsAsync({ includeDynamicComposioTools: true });
+  const all = await getCoreToolsAsync({ includeDynamicComposioTools: false });
   const tools = filterToolsByNames(all, REVIEWER_TOOL_NAMES) as Tool<RuntimeContextValue>[];
   return new Agent<RuntimeContextValue>({
     name: 'Reviewer',
@@ -533,6 +526,7 @@ export async function buildReviewerAgent(): Promise<SubAgent> {
       '  POST-WRITE: confirm that work that just landed actually does what was claimed. Read the changed files / state. Look for: bugs, regressions, broken assumptions, missing tests, missing verification, mismatched success criteria. Recommend either "verified — done" or list the gaps with concrete evidence (file:line if possible).',
       'Use a code-review mindset. Find real issues; don\'t pad. If there are no findings, say so explicitly and name residual risks the orchestrator should track.',
       'Stay read-only. Do not write files, update tasks, mutate goals, run commands, send notifications, or execute external actions. If a fix is needed, describe it; the orchestrator decides whether to execute.',
+      'Skills are on-demand. If a relevant installed review or domain skill would materially improve the audit, call `skill_list`, then `skill_read` for that one skill only.',
       'Return findings first (ordered by severity), then the verdict (proceed / verified / blocked-on-issue). Keep it tight — bullet-list, not prose.',
     ].join('\n\n')),
     model: MODELS.fast,
@@ -547,9 +541,8 @@ export async function buildReviewerAgent(): Promise<SubAgent> {
 }
 
 export async function buildDeployerAgent(): Promise<SubAgent> {
-  // Deployer may invoke external CI/CD / deploy actions via cx_*.
-  const all = await getCoreToolsAsync({ includeDynamicComposioTools: true });
-  const tools = filterToolsByNames(all, DEPLOYER_TOOL_NAMES, [COMPOSIO_FIRST_CLASS_PREFIX]) as Tool<RuntimeContextValue>[];
+  const all = await getCoreToolsAsync({ includeDynamicComposioTools: false });
+  const tools = filterToolsByNames(all, DEPLOYER_TOOL_NAMES) as Tool<RuntimeContextValue>[];
   return new Agent<RuntimeContextValue>({
     name: 'Deployer',
     handoffDescription: 'Handles release, deployment, CI, environment, and CLI-driven shipping work. Use only for tracked approved execution work.',
@@ -557,6 +550,7 @@ export async function buildDeployerAgent(): Promise<SubAgent> {
       'You are the Deployer sub-agent inside Clementine.',
       'Your job is to ship already-approved work: inspect status, run the needed release/deploy commands, verify, and report the result.',
       'Do not invent deployment targets. If the environment, branch, token, or approval is unclear, call ask_user_question or execution_mark_blocked.',
+      'Skills are on-demand. If an installed release/deployment skill is relevant, load only that skill with `skill_read`.',
       'Use small, auditable commands. Capture verification evidence. Update the tracked execution every cycle you make progress.',
       'Return exactly what was deployed, where, verification results, and any follow-up needed.',
     ].join('\n\n')),

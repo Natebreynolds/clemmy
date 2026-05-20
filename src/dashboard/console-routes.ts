@@ -21,7 +21,7 @@ import {
   writeWorkflow,
   type WorkflowDefinition,
 } from '../memory/workflow-store.js';
-import { readWorkflowEvents } from '../execution/workflow-events.js';
+import { listPendingRuns, readWorkflowEvents } from '../execution/workflow-events.js';
 import { ExecutionStore } from '../execution/store.js';
 import { listOpenCheckIns } from '../agents/check-ins.js';
 import type { ClementineAssistant } from '../assistant/core.js';
@@ -95,6 +95,7 @@ import {
   getSession as getHarnessSession,
   listEvents as listHarnessEvents,
 } from '../runtime/harness/eventlog.js';
+import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { runConversation, runConversationFromResume } from '../runtime/harness/loop.js';
 import { HarnessSession } from '../runtime/harness/session.js';
 import { parseApprovalIntent, parseHarnessCommand } from '../channels/discord-harness.js';
@@ -1179,7 +1180,7 @@ export function registerConsoleRoutes(
     try {
       // Local MCP tools — from the catalog (string names) plus the
       // SDK-native tools registered in registry.ts (have full schema).
-      const sdkTools = (await getCoreToolsAsync({ includeDynamicComposioTools: true }))
+      const sdkTools = (await getCoreToolsAsync({ includeDynamicComposioTools: false }))
         .filter((tool) => tool.type === 'function')
         .map((tool) => ({
           name: tool.name,
@@ -2598,6 +2599,39 @@ export function registerConsoleRoutes(
     }
   });
 
+  app.post('/api/console/harness-approvals/:id/:decision', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const id = req.params.id;
+    const decision = req.params.decision;
+    if (decision !== 'approve' && decision !== 'reject') {
+      res.status(400).json({ error: 'decision must be approve or reject' });
+      return;
+    }
+    const existing = approvalRegistry.get(id);
+    if (!existing) {
+      res.status(404).json({ error: 'approval not found' });
+      return;
+    }
+    if (existing.status !== 'pending') {
+      res.status(409).json({ error: 'approval already resolved', approval: existing });
+      return;
+    }
+    const result = approvalRegistry.resolve(
+      id,
+      decision === 'approve' ? 'approved' : 'rejected',
+      'desktop-user',
+    );
+    if (!result.ok) {
+      res.status(409).json({ error: result.reason ?? 'could not resolve approval', approval: result.row });
+      return;
+    }
+    res.json({
+      ok: true,
+      approval: result.row,
+      message: `Approval ${decision === 'approve' ? 'approved' : 'rejected'}: ${id}`,
+    });
+  });
+
   // ─── Home panel ────────────────────────────────────────────────
 
   app.get('/api/console/home/command-center', async (req, res) => {
@@ -2606,6 +2640,7 @@ export function registerConsoleRoutes(
       const memory = readMemoryIndexStatus();
       const runs = listRuns(50);
       const approvals = assistant.getRuntime().listPendingApprovals();
+      const harnessApprovals = approvalRegistry.listPending({ status: 'pending' });
       const planProposals = listPlanProposals({ status: 'pending', limit: 20 });
       const checkInProposals = listProposals({ status: 'pending', limit: 20 });
       const openCheckIns = listOpenCheckIns();
@@ -2618,6 +2653,7 @@ export function registerConsoleRoutes(
       const credentialHealth = await (await getSecretStore()).health();
       const runtimeAuth = getAuthStatus();
       const policy = getProactivityPolicySnapshot();
+      const pendingWorkflowRuns = listPendingRuns();
 
       const needsYou = [
         ...approvals.slice(0, 6).map((approval) => ({
@@ -2629,6 +2665,17 @@ export function registerConsoleRoutes(
           meta: `${approval.toolName} · ${approval.sessionId || approval.id}`,
           panel: 'settings',
           urgency: 'high',
+          approvalKind: 'runtime',
+          approvalId: approval.id,
+        })),
+        ...harnessApprovals.slice(0, 8).map((approval) => ({
+          kind: 'harness-approval',
+          title: `Approve: ${approval.subject}`,
+          meta: `${approval.approvalId} · ${approval.tool || approval.sessionId}`,
+          panel: 'activity',
+          urgency: 'high',
+          approvalKind: 'harness',
+          approvalId: approval.approvalId,
         })),
         ...planProposals.slice(0, 4).map((proposal) => ({
           kind: 'plan',
@@ -2661,6 +2708,16 @@ export function registerConsoleRoutes(
       ].slice(0, 10).map((item) => ({ ...item, title: trimConsoleTitle(item.title, 140) }));
 
       const workingNow = [
+        ...pendingWorkflowRuns.slice(0, 6).map((run) => {
+          const workflow = readWorkflow(run.workflowName);
+          const title = workflow?.data?.name ?? run.workflowName;
+          return {
+            kind: 'workflow',
+            title: run.inFlightStepId ? `${title} · ${run.inFlightStepId}` : title,
+            meta: `run ${run.runId}${run.lastEventAt ? ` · ${run.lastEventAt.slice(11, 16)}` : ''}`,
+            panel: 'activity',
+          };
+        }),
         ...executions.slice(0, 6).map((execution) => ({
           kind: execution.status,
           title: execution.title || execution.objective || '(execution)',
@@ -2723,7 +2780,7 @@ export function registerConsoleRoutes(
         memory.activeFacts === 0 ? 'no durable facts yet' : '',
       ].filter(Boolean);
 
-      const activeCount = executions.length + activeBackgroundTasks.length + runs.filter((run) => run.status === 'running' || run.status === 'received' || run.status === 'queued').length;
+      const activeCount = executions.length + activeBackgroundTasks.length + pendingWorkflowRuns.length + runs.filter((run) => run.status === 'running' || run.status === 'received' || run.status === 'queued').length;
       const waitingCount = needsYou.length;
       const currentObjective = workingNow[0]?.title
         ?? needsYou[0]?.title
@@ -2740,11 +2797,13 @@ export function registerConsoleRoutes(
         counts: {
           active: activeCount,
           waiting: waitingCount,
-          approvals: approvals.length,
+          approvals: approvals.length + harnessApprovals.length,
+          harnessApprovals: harnessApprovals.length,
           planProposals: planProposals.length,
           checkInProposals: checkInProposals.length,
           checkIns: openCheckIns.length,
           runningRuns: runs.filter((run) => run.status === 'running' || run.status === 'received').length,
+          runningWorkflows: pendingWorkflowRuns.length,
           backgroundActive: activeBackgroundTasks.length,
           requiredSetupMissing: requiredMissing,
         },

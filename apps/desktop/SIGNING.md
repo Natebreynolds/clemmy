@@ -126,12 +126,12 @@ git push origin v0.1.0
 The Action runs, builds + signs + notarizes, and uploads
 `Clementine-0.1.0-arm64.dmg` + `Clementine-0.1.0-x64.dmg` (plus zips)
 to a new GitHub Release at
-`https://github.com/Natebreynolds/clementine-next/releases/tag/v0.1.0`.
+`https://github.com/Natebreynolds/clemmy/releases/tag/v0.1.0`.
 
 The `install.sh` at the repo root pulls from there:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Natebreynolds/clementine-next/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Natebreynolds/clemmy/main/install.sh | bash
 ```
 
 ## Troubleshooting

@@ -36,14 +36,13 @@ export async function getCoreToolsAsync(options: {
   try {
     const dynamic = await getDynamicComposioRuntimeTools();
     if (dynamic.length === 0) return core;
-    // Keep `composio_status` / `composio_search_tools` /
-    // `composio_list_tools` / `composio_execute_tool` ALL in the surface
-    // alongside the first-class `cx_<toolkit>_<action>` tools.
+    // Optional legacy compatibility: keep `composio_status` /
+    // `composio_search_tools` / `composio_list_tools` /
+    // `composio_execute_tool` in the surface alongside dynamic cx_*
+    // wrappers when a caller explicitly opts in.
     //
-    // The first-class set is curated (~25 actions per toolkit) and won't
-    // cover every Composio action — Outlook alone has hundreds. When the
-    // model needs an action it doesn't see directly (list/read/search/
-    // query), the discovery → execution flow is:
+    // The default model-facing runtime does NOT opt in; its token-
+    // efficient discovery → execution flow is:
     //   composio_search_tools(query)  →  returns real slugs
     //   composio_execute_tool(tool_slug, arguments)  →  runs the action
     //

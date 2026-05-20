@@ -30,8 +30,10 @@ import { BASE_DIR } from '../config.js';
  *
  * The plan as drafted lists the concrete actions. We optionally
  * constrain auto-approval to tool names that match what the plan
- * actually said it would do (allowedTools). The wider the
- * allowedTools, the less granular the consent — keep this tight.
+ * actually said it would do (allowedTools). `*` is reserved for
+ * already-approved workflows/crons: it covers any non-read tool that
+ * survives the shared taxonomy safety checks (admin/destructive tools
+ * are still gated before this module is consulted).
  */
 
 const logger = pino({ name: 'clementine-next.plan-scope' });
@@ -52,7 +54,7 @@ export interface PlanScope {
   sessionId: string;
   planProposalId: string;
   approvedPlanObjective: string;
-  /** Tool names that the plan-approval covers. Default: shell + file writes. */
+  /** Tool names that the plan-approval covers. `*` means all non-admin/non-destructive tools. */
   allowedTools: string[];
   openedAt: string;
   expiresAt: string;
@@ -165,7 +167,12 @@ export function isAutoApprovedByScope(sessionId: string | undefined, toolName: s
   const scope = getPlanScope(sessionId);
   if (!scope) return false;
   if (scope.closedAt) return false;
-  if (!scope.allowedTools.includes(toolName)) return false;
+  if (scope.allowedTools.includes('*')) return true;
+  if (scope.allowedTools.includes(toolName)) return true;
+  const prefixMatch = scope.allowedTools.some((allowed) => (
+    allowed.endsWith('*') && toolName.startsWith(allowed.slice(0, -1))
+  ));
+  if (!prefixMatch) return false;
   return true;
 }
 
