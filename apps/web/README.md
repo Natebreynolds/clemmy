@@ -24,7 +24,9 @@ npm start
 2. Settings → Root Directory: `apps/web`.
 3. Railway picks up `railway.json` automatically (Nixpacks build, standalone Next.js server).
 
-The `/api/download` route fetches the latest Clementine DMG asset from GitHub Releases and 302s to it. Cached for 5 minutes.
+The `/api/download` route fetches the latest Clementine Mac asset from GitHub
+Releases and 302s to it. It intentionally avoids caching so release-day
+downloads pick up newly published desktop builds immediately.
 
 ## Hero video
 

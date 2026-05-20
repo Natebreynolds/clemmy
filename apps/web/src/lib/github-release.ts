@@ -28,7 +28,7 @@ export async function getLatestRelease(): Promise<GitHubRelease | null> {
             ? { Authorization: `Bearer ${process.env.GITHUB_TOKEN}` }
             : {}),
         },
-        next: { revalidate: 300 },
+        cache: "no-store",
       },
     );
     if (!res.ok) return null;
