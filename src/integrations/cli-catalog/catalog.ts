@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { BASE_DIR } from '../../config.js';
+import { resolveSafeCliProbe } from '../../runtime/cli-discovery.js';
 
 /**
  * Curated catalog of installable CLIs that Clementine knows how to:
@@ -330,12 +331,13 @@ export interface CatalogEntryStatus extends CliCatalogEntry {
 
 export function statusForEntry(entry: CliCatalogEntry): CatalogEntryStatus {
   const resolved = whichOnPath(entry.command);
+  const safe = resolved ? resolveSafeCliProbe(entry.command, resolved) : null;
   const connected = readConnectedClis()[entry.id];
   return {
     ...entry,
-    installed: Boolean(resolved),
+    installed: Boolean(safe && !safe.skipped),
     installedAt: connected?.installedAt,
-    resolvedPath: resolved,
+    resolvedPath: safe?.path ?? resolved,
   };
 }
 

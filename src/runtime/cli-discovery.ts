@@ -217,11 +217,13 @@ function headLines(text: string, max = 3, perLine = 200): string | undefined {
  * triggering system prompts.
  */
 const STUB_BINARIES_THAT_TRIGGER_SYSTEM_INSTALLER = new Set<string>([
+  'actool',
   'git',
   'python',
   'python3',
   'pip',
   'pip3',
+  'cmpdylib',
   'xcscontrol',
   'xcrun',
   'xcodebuild',
@@ -237,6 +239,7 @@ const STUB_BINARIES_THAT_TRIGGER_SYSTEM_INSTALLER = new Set<string>([
   'metallib',
   'clang',
   'clang++',
+  'codesign_allocate',
   'cc',
   'c++',
   'gcc',
@@ -245,13 +248,63 @@ const STUB_BINARIES_THAT_TRIGGER_SYSTEM_INSTALLER = new Set<string>([
   'lldb',
   'lldb-mi',
   'dsymutil',
+  'dwarfdump',
   'ld',
   'as',
   'nm',
   'otool',
+  'size',
+  'strings',
+  'strip',
   'libtool',
   'install_name_tool',
+  'lipo',
   'ranlib',
+  'unwinddump',
+]);
+
+const SYSTEM_BINARIES_THAT_LAUNCH_GUI_OR_INSTALLER = new Set<string>([
+  // Tcl/Tk's `wish` launches a GUI app even for a harmless-looking
+  // `--version` probe. On fresh installs this showed up as repeated
+  // "Wish quit unexpectedly" dialogs.
+  'wish',
+  'wish8.5',
+  'wish8.6',
+  // Apple's Java shims can open a separate "install Java" system dialog.
+  'appletviewer',
+  'java',
+  'javac',
+  'javadoc',
+  'javap',
+  'jcmd',
+  'jconsole',
+  'jdb',
+  'jdeps',
+  'jfr',
+  'jhsdb',
+  'jimage',
+  'jinfo',
+  'jlink',
+  'jmap',
+  'jmod',
+  'jpackage',
+  'jps',
+  'jrunscript',
+  'jshell',
+  'jstack',
+  'jstat',
+  'jstatd',
+  'keytool',
+  'orbd',
+  'pack200',
+  'policytool',
+  'rmic',
+  'rmid',
+  'rmiregistry',
+  'serialver',
+  'servertool',
+  'tnameserv',
+  'unpack200',
 ]);
 
 const DEVELOPER_TOOL_BACKING_DIRS = [
@@ -283,6 +336,15 @@ function developerToolBackingPath(command: string): string | undefined {
 }
 
 export function resolveSafeCliProbe(command: string, resolved: string): SafeCliProbe {
+  if (SYSTEM_BINARIES_THAT_LAUNCH_GUI_OR_INSTALLER.has(command) && resolved.startsWith('/usr/bin/')) {
+    return {
+      skipped: true,
+      command,
+      path: resolved,
+      reason: 'Skipped macOS system binary to avoid opening a GUI or installer dialog.',
+    };
+  }
+
   if (!STUB_BINARIES_THAT_TRIGGER_SYSTEM_INSTALLER.has(command)) {
     return { skipped: false, command, path: resolved };
   }

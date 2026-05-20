@@ -45,10 +45,11 @@ export function registerCliTools(server: McpServer): void {
         if (!entry) {
           return textResult(`"${exactFilter}" is not installed on $PATH.`);
         }
-        if (!entry.isLikelyCli && entry.helpHead?.startsWith('Skipped macOS Command Line Tools stub')) {
+        if (!entry.isLikelyCli && entry.helpHead?.startsWith('Skipped macOS')) {
           return textResult([
-            `"${exactFilter}" resolves to ${entry.path}, but it is only the macOS Command Line Tools installer stub.`,
-            `Install Xcode Command Line Tools or a standalone ${exactFilter} binary, then retry.`,
+            `"${exactFilter}" resolves to ${entry.path}, but Clementine skipped probing it because macOS may open a system dialog.`,
+            entry.helpHead,
+            `Install the required dependency or a standalone ${exactFilter} binary, then retry.`,
           ].join('\n'));
         }
         const v = entry.version ? ` — ${entry.version}` : '';
@@ -92,10 +93,11 @@ export function registerCliTools(server: McpServer): void {
       if (!entry) {
         return textResult(`"${command}" is not installed on $PATH.`);
       }
-      if (!entry.isLikelyCli && entry.helpHead?.startsWith('Skipped macOS Command Line Tools stub')) {
+      if (!entry.isLikelyCli && entry.helpHead?.startsWith('Skipped macOS')) {
         return textResult([
-          `"${command}" resolves to ${entry.path}, but it is only the macOS Command Line Tools installer stub.`,
-          `Install Xcode Command Line Tools or a standalone ${command} binary, then retry.`,
+          `"${command}" resolves to ${entry.path}, but Clementine skipped probing it because macOS may open a system dialog.`,
+          entry.helpHead,
+          `Install the required dependency or a standalone ${command} binary, then retry.`,
         ].join('\n'));
       }
       const parts = [

@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import pino from 'pino';
+import { findSafeCliCommand } from '../runtime/cli-discovery.js';
 
 /**
  * Capability pre-flight — does this machine actually have the CLI /
@@ -280,16 +281,6 @@ function runProbe(command: string, args: string[]): Promise<{ stdout: string; st
   });
 }
 
-async function resolveOnPath(command: string): Promise<string | undefined> {
-  return new Promise((resolve) => {
-    const child = spawn('which', [command], { env: process.env, timeout: 2_000 });
-    let stdout = '';
-    child.stdout?.on('data', (d: Buffer) => { stdout += d.toString('utf-8'); });
-    child.on('error', () => resolve(undefined));
-    child.on('exit', () => resolve(stdout.trim() || undefined));
-  });
-}
-
 function parseVersionLine(text: string): string | undefined {
   const firstLine = text.split('\n').find((line) => line.trim().length > 0);
   if (!firstLine) return undefined;
@@ -311,27 +302,45 @@ export async function checkCapability(name: string, options: { useCache?: boolea
   const descriptor = getCapabilityDescriptor(trimmed);
   const probeArgs = descriptor?.probeArgs ?? ['--version'];
 
-  const probe = await runProbe(trimmed, probeArgs);
+  const safe = findSafeCliCommand(trimmed);
   let result: CapabilityCheckResult;
 
-  if (probe.code === 0 || (probe.code !== -1 && (probe.stdout.length > 0 || probe.stderr.length > 0))) {
-    const versionText = parseVersionLine(probe.stdout) ?? parseVersionLine(probe.stderr);
-    const resolvedPath = await resolveOnPath(trimmed);
-    result = {
-      name: trimmed,
-      available: true,
-      version: versionText,
-      source: resolvedPath,
-      checkedAt: new Date().toISOString(),
-    };
-  } else {
-    const errSnippet = (probe.stderr || probe.stdout || '').slice(0, 240).trim();
+  if (!safe) {
     result = {
       name: trimmed,
       available: false,
-      error: errSnippet || `command '${trimmed}' not found on PATH`,
+      error: `command '${trimmed}' not found on PATH`,
       checkedAt: new Date().toISOString(),
     };
+  } else if (safe.skipped) {
+    result = {
+      name: trimmed,
+      available: false,
+      source: safe.path,
+      error: `${safe.reason} Install the required tool separately, then retry.`,
+      checkedAt: new Date().toISOString(),
+    };
+  } else {
+    const probe = await runProbe(safe.command, probeArgs);
+    if (probe.code === 0 || (probe.code !== -1 && (probe.stdout.length > 0 || probe.stderr.length > 0))) {
+      const versionText = parseVersionLine(probe.stdout) ?? parseVersionLine(probe.stderr);
+      result = {
+        name: trimmed,
+        available: true,
+        version: versionText,
+        source: safe.path,
+        checkedAt: new Date().toISOString(),
+      };
+    } else {
+      const errSnippet = (probe.stderr || probe.stdout || '').slice(0, 240).trim();
+      result = {
+        name: trimmed,
+        available: false,
+        source: safe.path,
+        error: errSnippet || `command '${trimmed}' did not respond to ${probeArgs.join(' ')}`,
+        checkedAt: new Date().toISOString(),
+      };
+    }
   }
 
   if (useCache) {
