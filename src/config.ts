@@ -164,7 +164,7 @@ export function getModelSettingsSnapshot(): {
 export const VAULT_DIR = path.join(BASE_DIR, 'vault');
 export const WEBHOOK_ENABLED = getEnv('WEBHOOK_ENABLED', 'false').toLowerCase() === 'true';
 export const WEBHOOK_PORT = parseInt(getEnv('WEBHOOK_PORT', '8420'), 10);
-export const WEBHOOK_SECRET = getEnv('WEBHOOK_SECRET', '');
+export const WEBHOOK_SECRET = getEnv('WEBHOOK_SECRET', '') || readSecretFromFileVaultSync('webhook_secret') || '';
 export const DISCORD_ENABLED = getEnv('DISCORD_ENABLED', 'false').toLowerCase() === 'true';
 // When true, Discord routes incoming messages through the 0.3 harness
 // (Orchestrator + sub-agents + auto-continuation + live progress) instead

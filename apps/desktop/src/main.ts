@@ -93,20 +93,35 @@ let recallCapture: RecallDesktopCapture | null = null;
 let quitPrepared = false;
 let quitPreparing = false;
 let installQuitFallback: NodeJS.Timeout | null = null;
+let cachedWebhookSecret = '';
 
 function getWebhookSecret(): string {
+  if (cachedWebhookSecret) return cachedWebhookSecret;
   // Read the same secret the daemon will read so the dashboard URL we
   // load matches the daemon's auth.
-  // The daemon's home is ~/.clementine-next; the .env file there is the
-  // canonical place for WEBHOOK_SECRET in dev.
+  // The daemon's home is ~/.clementine-next; .env is the dev path, and
+  // the file vault is the fresh desktop setup path.
   const envFile = path.join(HOME, '.clementine-next', '.env');
-  if (!existsSync(envFile)) return '';
-  try {
-    for (const line of readFileSync(envFile, 'utf-8').split('\n')) {
-      const m = line.match(/^WEBHOOK_SECRET=(.*)$/);
-      if (m) return m[1].trim();
+  if (existsSync(envFile)) {
+    try {
+      for (const line of readFileSync(envFile, 'utf-8').split('\n')) {
+        const m = line.match(/^WEBHOOK_SECRET=(.*)$/);
+        if (m) return m[1].trim();
+      }
+    } catch {
+      // fall through to the file vault
     }
-  } catch { /* fall through */ }
+  }
+  const vaultFile = path.join(HOME, '.clementine-next', 'state', 'secrets-vault.json');
+  if (existsSync(vaultFile)) {
+    try {
+      const parsed = JSON.parse(readFileSync(vaultFile, 'utf-8')) as { version?: string; entries?: Record<string, string> };
+      const token = parsed.version === 'v1' ? parsed.entries?.webhook_secret : undefined;
+      if (token) return token;
+    } catch {
+      // fall through to empty; boot should have generated this already
+    }
+  }
   return '';
 }
 
@@ -407,7 +422,7 @@ async function boot(): Promise<void> {
   // daemon and the dashboard URL need it. ensureWebhookSecret() reads
   // env first, then falls back to generating a new one stored in the
   // file vault (which the daemon's SecretStore reads at boot).
-  await ensureWebhookSecret();
+  cachedWebhookSecret = await ensureWebhookSecret();
 
   if (needsSetup()) {
     openSetupWindow();

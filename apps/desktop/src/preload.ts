@@ -84,7 +84,7 @@ const api = {
   /** Native folder picker for the setup wizard's workspace step. */
   setupPickWorkspaceFolder: () => ipcRenderer.invoke('clemmy:setup-pick-workspace-folder') as Promise<{ path: string }>,
   /** Run the Codex OAuth flow from the main process — opens the user's
-   *  default browser, listens on localhost:1455 for the callback, and
+   *  default browser, listens on localhost for the callback, and
    *  persists the resulting tokens. Returns { ok, accountId } on success
    *  or { ok: false, error } on failure (user cancel, network, etc.). */
   setupCodexLogin: () => ipcRenderer.invoke('clemmy:setup-codex-login') as Promise<
