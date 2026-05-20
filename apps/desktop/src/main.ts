@@ -92,6 +92,7 @@ let dashboardUrl = '';
 let recallCapture: RecallDesktopCapture | null = null;
 let quitPrepared = false;
 let quitPreparing = false;
+let installQuitFallback: NodeJS.Timeout | null = null;
 
 function getWebhookSecret(): string {
   // Read the same secret the daemon will read so the dashboard URL we
@@ -294,7 +295,7 @@ function buildUpdaterMenuItems(): Electron.MenuItemConstructorOptions[] {
     click = () => { moveAppToApplicationsFolder(); };
   } else if (u.state === 'available') {
     label = `Download update v${u.version || ''}`;
-    click = () => { applyUpdate(); };
+    click = () => { void applyUpdateFromUi(); };
   } else if (u.state === 'downloading') {
     label = u.progressPct
       ? `Downloading v${u.version || ''} · ${u.progressPct}%`
@@ -303,7 +304,7 @@ function buildUpdaterMenuItems(): Electron.MenuItemConstructorOptions[] {
     click = undefined;
   } else if (u.state === 'ready-to-install') {
     label = `Restart to install v${u.version || ''}`;
-    click = () => applyUpdate();
+    click = () => { void applyUpdateFromUi(); };
   } else if (u.state === 'no-update') {
     label = 'Clementine is up to date';
   } else if (u.state === 'error') {
@@ -324,6 +325,41 @@ async function prepareForQuit(): Promise<void> {
   await supervisor?.stop().catch(() => { /* ignore */ });
   quitPrepared = true;
   quitPreparing = false;
+}
+
+async function prepareForUpdateInstall(): Promise<void> {
+  (app as { isQuitting?: boolean; isInstallingUpdate?: boolean }).isQuitting = true;
+  (app as { isInstallingUpdate?: boolean }).isInstallingUpdate = true;
+  await recallCapture?.shutdown().catch(() => { /* ignore */ });
+  await supervisor?.stop().catch(() => { /* ignore */ });
+}
+
+function scheduleInstallQuitFallback(): void {
+  if (installQuitFallback) return;
+  installQuitFallback = setTimeout(() => {
+    installQuitFallback = null;
+    (app as { isQuitting?: boolean; isInstallingUpdate?: boolean }).isQuitting = true;
+    (app as { isInstallingUpdate?: boolean }).isInstallingUpdate = true;
+    app.quit();
+    setTimeout(() => {
+      app.exit(0);
+    }, 8_000).unref?.();
+  }, process.platform === 'darwin' ? 15_000 : 1_000);
+  installQuitFallback.unref?.();
+}
+
+async function applyUpdateFromUi(): Promise<ReturnType<typeof getUpdaterStatus> & { applyResult: ReturnType<typeof applyUpdate> }> {
+  if (getUpdaterStatus().state === 'ready-to-install') {
+    // Let electron-updater/Squirrel own the install, but make every UI
+    // entry point mark the app as intentionally quitting first. The tray
+    // path used to skip this and macOS would keep the app alive.
+    await prepareForUpdateInstall();
+  }
+  const result = applyUpdate();
+  if (result.ok && result.action === 'installing') {
+    scheduleInstallQuitFallback();
+  }
+  return { ...getUpdaterStatus(), applyResult: result };
 }
 
 async function quitCleanly(): Promise<void> {
@@ -549,19 +585,7 @@ ipcMain.handle('clemmy:updater-check', async () => {
   return checkForUpdatesNow();
 });
 
-ipcMain.handle('clemmy:updater-apply', async () => {
-  if (getUpdaterStatus().state === 'ready-to-install') {
-    // Let electron-updater own the final quit/install cycle. We still
-    // stop long-lived Clementine work first so the app bundle can be
-    // replaced cleanly, but we do not run disposeAutoUpdater() here.
-    (app as { isQuitting?: boolean; isInstallingUpdate?: boolean }).isQuitting = true;
-    (app as { isInstallingUpdate?: boolean }).isInstallingUpdate = true;
-    await recallCapture?.shutdown().catch(() => { /* ignore */ });
-    await supervisor?.stop().catch(() => { /* ignore */ });
-  }
-  const result = applyUpdate();
-  return { ...getUpdaterStatus(), applyResult: result };
-});
+ipcMain.handle('clemmy:updater-apply', () => applyUpdateFromUi());
 
 ipcMain.handle('clemmy:updater-move-to-applications', () => {
   const result = moveAppToApplicationsFolder();

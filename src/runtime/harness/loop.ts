@@ -420,6 +420,7 @@ async function runConversationCore(
         finalOutput: turnResult.finalOutput,
         toolCalls: turnResult.toolCalls ?? 0,
         sessionId: options.sessionId,
+        turn: turnResult.turn,
       });
 
       // Emit a dedicated stuck_detected event so the dashboard
@@ -1489,7 +1490,7 @@ const STALL_OUTPUT_PATTERN = /^(continuing|ok|okay|done|sure|got it|working on i
 // any tool to do it. Example: "Executing the Salesforce pull now —
 // I'll fetch 15 contacts ..." with 0 tool calls. This is a louder
 // version of "Continuing." and just as broken.
-const STALL_ANNOUNCEMENT_PATTERN = /\b(I[' ]?ll\s|let me\s|executing\s|fetching\s|running\s|pulling\s|querying\s|about to\s|going to\s|on the way|in progress|kicking off|starting now)/i;
+const STALL_ANNOUNCEMENT_PATTERN = /\b(I[\u2018\u2019\u02bc' ]?ll\s|let me\s|executing\s|fetching\s|running\s|pulling\s|querying\s|about to\s|going to\s|on the way|in progress|kicking off|starting now)/i;
 
 export type StallSignal = 'A_zero_tools' | 'B_repeated_tool' | 'C_handoff_pingpong' | 'D_decision_json';
 
@@ -1499,6 +1500,35 @@ interface StallInfo {
   userVisibleMessage: string;
   /** Structured detail for the stuck_detected event / dashboard panel. */
   detail: Record<string, unknown>;
+}
+
+function finalHandoffProgress(
+  sessionId: string,
+  turn: number | undefined,
+): { from: string | null; to: string | null; toolCallsAfterHandoff: number } | undefined {
+  if (!turn) return undefined;
+  try {
+    const turnEvents = listEvents(sessionId)
+      .filter((event) => event.turn === turn);
+    let lastHandoffIndex = -1;
+    for (let index = turnEvents.length - 1; index >= 0; index -= 1) {
+      if (turnEvents[index].type === 'handoff') {
+        lastHandoffIndex = index;
+        break;
+      }
+    }
+    if (lastHandoffIndex < 0) return undefined;
+
+    const handoff = turnEvents[lastHandoffIndex];
+    const afterHandoff = turnEvents.slice(lastHandoffIndex + 1);
+    return {
+      from: typeof handoff.data.from === 'string' ? handoff.data.from : null,
+      to: typeof handoff.data.to === 'string' ? handoff.data.to : null,
+      toolCallsAfterHandoff: afterHandoff.filter((event) => event.type === 'tool_called').length,
+    };
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -1523,9 +1553,13 @@ function evaluateProgress(opts: {
   finalOutput: unknown;
   toolCalls: number;
   sessionId: string;
+  turn?: number;
 }): StallInfo | undefined {
+  const handoffProgress = finalHandoffProgress(opts.sessionId, opts.turn);
+  const effectiveToolCalls = handoffProgress?.toolCallsAfterHandoff ?? opts.toolCalls;
+
   // Signal A — zero tools + short generic reply (current behavior).
-  if (opts.toolCalls === 0 && typeof opts.finalOutput === 'string') {
+  if (effectiveToolCalls === 0 && typeof opts.finalOutput === 'string') {
     const trimmed = opts.finalOutput.trim();
     if (trimmed && trimmed.length <= 60 && STALL_OUTPUT_PATTERN.test(trimmed)) {
       return {
@@ -1534,7 +1568,12 @@ function evaluateProgress(opts: {
         userVisibleMessage:
           `_(The sub-agent ended its turn without taking any action. The model said "${trimmed}" but made zero tool calls. ` +
           `Re-send your request with a more specific directive — e.g. name the toolkit, the field, or the file you want it to touch.)_`,
-        detail: { rawOutput: trimmed, toolCalls: 0 },
+        detail: {
+          rawOutput: trimmed,
+          toolCalls: effectiveToolCalls,
+          totalToolCalls: opts.toolCalls,
+          afterHandoff: handoffProgress ?? null,
+        },
       };
     }
     // Signal A' — verbose-announcement stall. The model spent a turn
@@ -1550,7 +1589,12 @@ function evaluateProgress(opts: {
         userVisibleMessage:
           `_(The sub-agent announced work it was about to do but didn't actually call the tool. ` +
           `Output: "${trimmed.slice(0, 160)}…". Re-send your request — if it keeps stalling, name the exact tool you want it to use.)_`,
-        detail: { rawOutput: trimmed.slice(0, 220), toolCalls: 0 },
+        detail: {
+          rawOutput: trimmed.slice(0, 220),
+          toolCalls: effectiveToolCalls,
+          totalToolCalls: opts.toolCalls,
+          afterHandoff: handoffProgress ?? null,
+        },
       };
     }
   }

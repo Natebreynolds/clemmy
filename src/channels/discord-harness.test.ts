@@ -139,6 +139,20 @@ test('conversation_completed with abandoned reason marks "abandoned" status', ()
   assert.equal(s.done, true);
 });
 
+test('conversation_completed with sub-agent stall marks "stalled" status', () => {
+  const s = freshState();
+  applyEventToState(
+    event('conversation_completed', {
+      summary: "The sub-agent announced work it was about to do but didn't actually call the tool.",
+      reason: 'sub_agent_stalled',
+    }),
+    s,
+  );
+  assert.match(s.summary, /didn't actually call the tool/);
+  assert.equal(s.status, 'stalled');
+  assert.equal(s.done, true);
+});
+
 test('run_failed shows the error and marks done', () => {
   const s = freshState();
   applyEventToState(event('run_failed', { error: 'composio catalog timeout' }), s);

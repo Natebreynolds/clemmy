@@ -750,6 +750,66 @@ test('runConversation: sub-agent stall ("Continuing." with zero tool calls) is f
   );
 });
 
+test('runConversation: future-tense sub-agent stall after discovery tools is flagged', async () => {
+  // Repro from Discord "what desktop version are you running":
+  // Orchestrator made discovery/memory tool calls, handed off to
+  // Executor, then Executor only said "I'll check..." and made zero
+  // post-handoff tool calls. Total run tool calls were non-zero, so
+  // the older detector missed it and the user saw a promise that never
+  // completed.
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const runRunner: RunRunnerFn = async (runner, _agent, items, opts) => {
+    const ee = runner as unknown as EventEmitter;
+    const runContext = { context: opts.context };
+    ee.emit('agent_start', runContext, { name: 'Orchestrator' });
+    ee.emit(
+      'agent_tool_start',
+      runContext,
+      { name: 'Orchestrator' },
+      { name: 'local_cli_list' },
+      { toolCall: { callId: 'call_1', arguments: '{"filter":"defaults"}' } },
+    );
+    ee.emit(
+      'agent_tool_start',
+      runContext,
+      { name: 'Orchestrator' },
+      { name: 'tool_choice_remember' },
+      { toolCall: { callId: 'call_2', arguments: '{"intent":"local.desktop.version"}' } },
+    );
+    ee.emit('agent_handoff', runContext, { name: 'Orchestrator' }, { name: 'Executor' });
+    ee.emit('agent_start', runContext, { name: 'Executor' });
+    const output = 'I\u2019ll check the installed desktop app version from the local app bundle metadata.';
+    ee.emit('agent_end', runContext, { name: 'Executor' }, output);
+    return {
+      history: items,
+      lastResponseId: undefined,
+      finalOutput: output,
+    };
+  };
+
+  await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'what desktop version are you running',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  const completedEvents = listEventsForConv(sess.id, { types: ['conversation_completed'] });
+  assert.equal(completedEvents[0].data.reason, 'sub_agent_stalled');
+  assert.match(
+    completedEvents[0].data.summary as string,
+    /announced work it was about to do but didn't actually call the tool/,
+  );
+  const detail = completedEvents[0].data.stallDetail as {
+    totalToolCalls: number;
+    afterHandoff: { to: string; toolCallsAfterHandoff: number };
+  };
+  assert.equal(detail.totalToolCalls, 2);
+  assert.equal(detail.afterHandoff.to, 'Executor');
+  assert.equal(detail.afterHandoff.toolCallsAfterHandoff, 0);
+});
+
 test('runConversation: a short SUBSTANTIVE reply is NOT flagged as a stall', async () => {
   // Counter-test: short reply but not on the stall whitelist. Should be
   // surfaced as a normal summary so we don't drown real terse answers

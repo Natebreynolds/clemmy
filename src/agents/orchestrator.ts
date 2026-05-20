@@ -271,6 +271,7 @@ export async function buildOrchestratorAgent(): Promise<
   // Discovery surfaces the Orchestrator needs for the intent-based
   // dispatch pipeline (recall → discover → probe → remember → handoff):
   //   - composio_search_tools: Composio action discovery (already used)
+  //   - desktop_status: direct read-only answer for local app version/status
   //   - local_cli_list / local_cli_probe: $PATH scan + cheap probe for CLIs
   //   - skill_list / skill_read: on-demand skill instruction loading
   //   - tool_choice_recall / _remember / _invalidate: per-machine memory
@@ -280,6 +281,7 @@ export async function buildOrchestratorAgent(): Promise<
   const discoveryTools: Tool<RuntimeContextValue>[] = (
     [
       'composio_search_tools',
+      'desktop_status',
       'skill_list',
       'skill_read',
       'local_cli_list',

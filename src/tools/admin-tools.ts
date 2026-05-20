@@ -1,4 +1,5 @@
 import { randomBytes } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -39,11 +40,67 @@ function resolveHomePath(input: string): string {
   return path.resolve(input.startsWith('~') ? input.replace('~', os.homedir()) : input);
 }
 
+function readJsonFile<T extends object>(filePath: string): T | null {
+  try {
+    return JSON.parse(readFileSync(filePath, 'utf-8')) as T;
+  } catch {
+    return null;
+  }
+}
+
+function readPlistValue(plistPath: string, key: string): string | null {
+  if (!existsSync(plistPath)) return null;
+  const result = spawnSync('/usr/libexec/PlistBuddy', ['-c', `Print :${key}`, plistPath], {
+    encoding: 'utf-8',
+    timeout: 5_000,
+  });
+  if (result.status !== 0) return null;
+  const value = result.stdout.trim();
+  return value || null;
+}
+
+function desktopBundleCandidates(): string[] {
+  return [
+    '/Applications/Clementine.app',
+    path.join(os.homedir(), 'Applications', 'Clementine.app'),
+  ];
+}
+
 function formatWorkspaceDir(resolved: string): string {
   return resolved.startsWith(os.homedir()) ? resolved.replace(os.homedir(), '~') : resolved;
 }
 
 export function registerAdminTools(server: McpServer): void {
+  server.tool(
+    'desktop_status',
+    'Read-only status for the locally installed Clementine desktop app, including installed bundle version and packaged runtime version.',
+    {},
+    async () => {
+      const rootPackage = readJsonFile<{ version?: string; name?: string }>(
+        path.resolve(process.cwd(), 'package.json'),
+      );
+      const desktopPackage = readJsonFile<{ version?: string; name?: string }>(
+        path.resolve(process.cwd(), 'apps', 'desktop', 'package.json'),
+      );
+
+      const foundBundle = desktopBundleCandidates().find((candidate) => existsSync(candidate));
+      const plistPath = foundBundle ? path.join(foundBundle, 'Contents', 'Info.plist') : null;
+      const bundleVersion = plistPath ? readPlistValue(plistPath, 'CFBundleShortVersionString') : null;
+      const bundleBuild = plistPath ? readPlistValue(plistPath, 'CFBundleVersion') : null;
+
+      return textResult(
+        [
+          'Clementine desktop status',
+          foundBundle ? `Installed app: ${foundBundle}` : 'Installed app: not found in /Applications or ~/Applications',
+          bundleVersion ? `Installed version: ${bundleVersion}` : 'Installed version: unknown',
+          bundleBuild && bundleBuild !== bundleVersion ? `Installed build: ${bundleBuild}` : '',
+          desktopPackage?.version ? `Packaged desktop version: ${desktopPackage.version}` : '',
+          rootPackage?.version ? `Workspace version: ${rootPackage.version}` : '',
+        ].filter(Boolean).join('\n'),
+      );
+    },
+  );
+
   server.tool(
     'set_timer',
     'Set a short-term reminder. Use this instead of cron for reminders under 24 hours.',

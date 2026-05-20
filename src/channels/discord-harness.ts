@@ -1353,7 +1353,12 @@ export function applyEventToState(event: EventRow, state: DisplayState): void {
       const summary = humanHarnessText(reply || data.summary, state.summary);
       if (summary) state.summary = summary;
       const reason = data.reason ? String(data.reason) : '';
-      state.status = reason === 'abandoned_by_orchestrator' ? 'abandoned' : 'complete';
+      state.status =
+        reason === 'abandoned_by_orchestrator'
+          ? 'abandoned'
+          : reason === 'sub_agent_stalled'
+            ? 'stalled'
+            : 'complete';
       state.done = true;
       return;
     }

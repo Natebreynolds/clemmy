@@ -289,10 +289,12 @@ export function initAutoUpdater(opts: { logFile: string }): void {
     debug: () => {},
   } as unknown as typeof autoUpdater.logger;
 
-  // We download in the background but never auto-restart the app —
-  // the user clicks "Restart to install" from the tray when ready.
+  // We download in the background but do not ask Squirrel.Mac to stage
+  // the native install until the user explicitly clicks Restart. With
+  // tray-resident apps, autoInstallOnAppQuit can leave ShipIt waiting
+  // behind the scenes while the main app stays alive.
   autoUpdater.autoDownload = true;
-  autoUpdater.autoInstallOnAppQuit = true;
+  autoUpdater.autoInstallOnAppQuit = false;
 
   autoUpdater.on('checking-for-update', () => {
     log('info', 'checking for updates');
