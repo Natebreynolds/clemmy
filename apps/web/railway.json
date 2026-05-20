@@ -1,0 +1,13 @@
+{
+  "$schema": "https://railway.app/railway.schema.json",
+  "build": {
+    "builder": "NIXPACKS",
+    "buildCommand": "npm ci && npm run build && cp -r public .next/standalone/apps/web/ && cp -r .next/static .next/standalone/apps/web/.next/"
+  },
+  "deploy": {
+    "startCommand": "node .next/standalone/apps/web/server.js",
+    "healthcheckPath": "/",
+    "restartPolicyType": "ON_FAILURE",
+    "restartPolicyMaxRetries": 3
+  }
+}
