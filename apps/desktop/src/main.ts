@@ -90,6 +90,8 @@ let setupWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let dashboardUrl = '';
 let recallCapture: RecallDesktopCapture | null = null;
+let quitPrepared = false;
+let quitPreparing = false;
 
 function getWebhookSecret(): string {
   // Read the same secret the daemon will read so the dashboard URL we
@@ -314,11 +316,19 @@ function buildUpdaterMenuItems(): Electron.MenuItemConstructorOptions[] {
   ];
 }
 
-async function quitCleanly(): Promise<void> {
-  (app as { isQuitting?: boolean }).isQuitting = true;
+async function prepareForQuit(): Promise<void> {
+  if (quitPrepared || quitPreparing) return;
+  quitPreparing = true;
   disposeAutoUpdater();
   await recallCapture?.shutdown().catch(() => { /* ignore */ });
   await supervisor?.stop().catch(() => { /* ignore */ });
+  quitPrepared = true;
+  quitPreparing = false;
+}
+
+async function quitCleanly(): Promise<void> {
+  (app as { isQuitting?: boolean }).isQuitting = true;
+  await prepareForQuit();
   app.quit();
 }
 
@@ -539,7 +549,16 @@ ipcMain.handle('clemmy:updater-check', async () => {
   return checkForUpdatesNow();
 });
 
-ipcMain.handle('clemmy:updater-apply', () => {
+ipcMain.handle('clemmy:updater-apply', async () => {
+  if (getUpdaterStatus().state === 'ready-to-install') {
+    // Let electron-updater own the final quit/install cycle. We still
+    // stop long-lived Clementine work first so the app bundle can be
+    // replaced cleanly, but we do not run disposeAutoUpdater() here.
+    (app as { isQuitting?: boolean; isInstallingUpdate?: boolean }).isQuitting = true;
+    (app as { isInstallingUpdate?: boolean }).isInstallingUpdate = true;
+    await recallCapture?.shutdown().catch(() => { /* ignore */ });
+    await supervisor?.stop().catch(() => { /* ignore */ });
+  }
   const result = applyUpdate();
   return { ...getUpdaterStatus(), applyResult: result };
 });
@@ -751,4 +770,12 @@ app.on('activate', () => {
     mainWindow = createMainWindow(dashboardUrl);
   }
 });
-app.on('before-quit', () => { void quitCleanly(); });
+app.on('before-quit', (event) => {
+  if ((app as { isInstallingUpdate?: boolean }).isInstallingUpdate) {
+    (app as { isQuitting?: boolean }).isQuitting = true;
+    return;
+  }
+  if (quitPrepared) return;
+  event.preventDefault();
+  void quitCleanly();
+});

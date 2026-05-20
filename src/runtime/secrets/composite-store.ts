@@ -245,10 +245,77 @@ export class CompositeSecretStore {
     return { name, source: to, status: 'connected', metadata };
   }
 
-  /** Snapshot for the dashboard "Credentials" panel. */
-  async health(): Promise<SecretHealthRow[]> {
+  /** Snapshot for dashboards.
+   *
+   * `passive: true` avoids keychain reads and relies on metadata plus
+   * file/env checks. Use it for launch/home surfaces so macOS Keychain
+   * never opens just because Clementine rendered a dashboard. Explicit
+   * credential edits, migration, reset, and Repair Keychain still use
+   * the live keychain path.
+   */
+  async health(options: { passive?: boolean } = {}): Promise<SecretHealthRow[]> {
     const rows: SecretHealthRow[] = [];
+    const meta = options.passive ? readMeta() : null;
     for (const desc of listSecretDescriptors()) {
+      if (options.passive) {
+        const metadata = meta?.entries[desc.name];
+        const fileValue = await this.fileBackend.get(desc.name);
+        const envFallbackAvailable = Boolean(desc.envVarName && await this.envBackend.get(desc.name));
+        if (fileValue !== undefined) {
+          rows.push({
+            name: desc.name,
+            description: desc.description,
+            source: 'file',
+            status: 'connected',
+            hasValue: true,
+            lastSetAt: metadata?.lastSetAt,
+            lastValidatedAt: metadata?.lastValidatedAt,
+            envFallbackAvailable,
+            envVarName: desc.envVarName,
+          });
+          continue;
+        }
+        if (metadata?.source === 'keychain') {
+          rows.push({
+            name: desc.name,
+            description: desc.description,
+            source: 'keychain',
+            status: metadata.status,
+            hasValue: metadata.status === 'connected',
+            lastSetAt: metadata.lastSetAt,
+            lastValidatedAt: metadata.lastValidatedAt,
+            envFallbackAvailable,
+            envVarName: desc.envVarName,
+          });
+          continue;
+        }
+        if (envFallbackAvailable) {
+          rows.push({
+            name: desc.name,
+            description: desc.description,
+            source: 'env',
+            status: 'env_only',
+            hasValue: true,
+            lastSetAt: metadata?.lastSetAt,
+            lastValidatedAt: metadata?.lastValidatedAt,
+            envFallbackAvailable,
+            envVarName: desc.envVarName,
+          });
+          continue;
+        }
+        rows.push({
+          name: desc.name,
+          description: desc.description,
+          source: 'missing',
+          status: 'missing',
+          hasValue: false,
+          lastSetAt: metadata?.lastSetAt,
+          lastValidatedAt: metadata?.lastValidatedAt,
+          envFallbackAvailable,
+          envVarName: desc.envVarName,
+        });
+        continue;
+      }
       const result = await this.get(desc.name);
       const envFallbackAvailable = Boolean(desc.envVarName && await this.envBackend.get(desc.name));
       rows.push({

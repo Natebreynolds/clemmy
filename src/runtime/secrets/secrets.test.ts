@@ -34,6 +34,7 @@ beforeEach(() => {
   delete process.env.OPENAI_API_KEY;
   delete process.env.DISCORD_BOT_TOKEN;
   delete process.env.COMPOSIO_API_KEY;
+  delete process.env.BROWSER_USE_API_KEY;
 });
 
 // ─── Registry ────────────────────────────────────────────────────
@@ -282,6 +283,41 @@ test('composite: health() includes every known credential', async () => {
   const openai = rows.find((r) => r.name === 'openai_api_key');
   assert.equal(openai?.hasValue, true);
   assert.equal(openai?.envFallbackAvailable, true);
+});
+
+test('composite: passive health uses metadata and does not read keychain', async () => {
+  mkdirSync(path.dirname(META), { recursive: true });
+  writeFileSync(META, JSON.stringify({
+    version: 'v1',
+    entries: {
+      openai_api_key: {
+        name: 'openai_api_key',
+        source: 'keychain',
+        status: 'connected',
+        lastSetAt: '2026-05-20T00:00:00.000Z',
+        version: 'v1',
+      },
+    },
+  }, null, 2));
+
+  const store = new CompositeSecretStore();
+  await store.init();
+  const fake = {
+    name: 'keychain' as const,
+    isAvailable: true,
+    get: async () => {
+      throw new Error('passive health must not read keychain');
+    },
+    set: async () => {},
+    delete: async () => {},
+  };
+  store.setKeychainBackend(fake as unknown as Parameters<typeof store.setKeychainBackend>[0]);
+
+  const rows = await store.health({ passive: true });
+  const openai = rows.find((r) => r.name === 'openai_api_key');
+  assert.equal(openai?.source, 'keychain');
+  assert.equal(openai?.status, 'connected');
+  assert.equal(openai?.hasValue, true);
 });
 
 test('composite: resetAll wipes vault + meta but not env', async () => {

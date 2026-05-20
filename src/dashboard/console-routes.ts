@@ -2397,7 +2397,8 @@ export function registerConsoleRoutes(
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
       const store = await getSecretStore();
-      const rows = await store.health();
+      const live = req.query.live === '1' || req.query.live === 'true';
+      const rows = await store.health({ passive: !live });
       const descriptors = listSecretDescriptors().reduce<Record<string, { description: string; setupHint?: string; required: boolean; envVarName: string }>>(
         (acc, d) => { acc[d.name] = { description: d.description, setupHint: d.setupHint, required: d.required, envVarName: d.envVarName }; return acc; },
         {},
@@ -2888,7 +2889,7 @@ export function registerConsoleRoutes(
       const activeBackgroundTasks = backgroundTasks.filter((task) =>
         task.status === 'pending' || task.status === 'running' || task.status === 'awaiting_approval' || task.status === 'interrupted',
       );
-      const credentialHealth = await (await getSecretStore()).health();
+      const credentialHealth = await (await getSecretStore()).health({ passive: true });
       const runtimeAuth = getAuthStatus();
       const policy = getProactivityPolicySnapshot();
       const pendingWorkflowRuns = listPendingRuns();
