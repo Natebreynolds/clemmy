@@ -5,10 +5,26 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { renderChannelDirective } from './instructions.js';
 
-test('discord: requests tight replies under 500 chars', () => {
+test('discord: requests tight conversational replies under ~500 chars', () => {
   const d = renderChannelDirective('discord');
   assert.match(d, /Discord/);
-  assert.match(d, /under 500 characters/);
+  assert.match(d, /under ~500 characters/);
+});
+
+test('discord: deliverables go to disk via write_file, not pasted into chat', () => {
+  // Prevents a regression where the agent reads the "under 500 chars"
+  // rule as universal and refuses to produce an HTML/audit/report
+  // artifact the user explicitly asked for.
+  const d = renderChannelDirective('discord');
+  assert.match(d, /deliverables/i);
+  assert.match(d, /write_file/);
+  assert.match(d, /saved to/);
+});
+
+test('discord: explicitly forbids the "cannot create files" hallucination', () => {
+  const d = renderChannelDirective('discord');
+  assert.match(d, /NEVER decline/);
+  assert.match(d, /write_file is always available/);
 });
 
 test('discord: warns against markdown headers', () => {
@@ -16,7 +32,7 @@ test('discord: warns against markdown headers', () => {
   assert.match(d, /Avoid markdown headers/);
 });
 
-test('discord: tells the model to chunk long responses', () => {
+test('discord: tells the model to chunk long conversational responses', () => {
   const d = renderChannelDirective('discord');
   assert.match(d, /split into 2–3 short turns/);
 });

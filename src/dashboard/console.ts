@@ -11382,6 +11382,7 @@ const CONSOLE_JS = `
           : '';
         const extras = [
           s.hasScripts ? '<span class="skill-tool-pill">scripts/</span>' : '',
+          s.hasSrc ? '<span class="skill-tool-pill">src/</span>' : '',
           s.hasReferences ? '<span class="skill-tool-pill">references/</span>' : '',
         ].filter(Boolean).join('');
         const display = s.displayName && s.displayName !== s.name ? s.displayName : s.name;

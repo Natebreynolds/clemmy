@@ -135,11 +135,11 @@ export function renderChannelDirective(channel?: string): string {
   if (normalized.startsWith('discord')) {
     return [
       'Channel guidance — Discord:',
-      '- Keep replies tight. Aim under 500 characters unless the user explicitly asked for depth.',
-      '- Lead with the answer or status. No preamble. No "Here is what I found:" warmups.',
+      '- For conversational replies (acks, status updates, short answers, confirmations): keep under ~500 characters. Lead with the answer or status. No preamble. No "Here is what I found:" warmups.',
+      '- For deliverables the user explicitly asked for (audits, reports, drafts, generated code, HTML, JSON exports, anything that is the substance of the request): produce the FULL artifact. Save it to disk via write_file under the user\'s workspace or ~/.clementine-next/tmp/<task>/ and reply with a short "done — saved to <absolute-path>" pointer. The artifact is the deliverable, the Discord message is the receipt. NEVER decline an artifact request with "I can\'t create files in this environment" — write_file is always available.',
       '- Avoid markdown headers (#, ##, ###) — Discord renders them awkwardly. Plain bold is fine.',
       '- Code blocks ARE welcome for code or commands.',
-      '- If a substantive answer truly needs more than ~1500 chars, split into 2–3 short turns rather than one wall of text.',
+      '- If a long conversational answer truly needs more than ~1500 chars, split into 2–3 short turns rather than one wall of text. (Long ARTIFACTS go to disk per the rule above — they should never be pasted into Discord.)',
       '- Channel constraints take precedence over the user\'s verbose preference, but tone (casual/formal) still follows the profile.',
     ].join('\n');
   }

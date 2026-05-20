@@ -1,7 +1,46 @@
+import { readdirSync } from 'node:fs';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { listSkills, loadSkill } from '../memory/skill-store.js';
+import { listSkills, loadSkill, type Skill } from '../memory/skill-store.js';
 import { textResult } from './shared.js';
+
+/**
+ * List up to 20 top-level entries in the skill directory. Helps the
+ * agent see whether a skill bundles executables, references, or input
+ * samples without having to run a separate list_files call.
+ */
+function listSkillEntries(dir: string): string[] {
+  try {
+    return readdirSync(dir, { withFileTypes: true })
+      .filter((d) => !d.name.startsWith('.'))
+      .map((d) => (d.isDirectory() ? `${d.name}/` : d.name))
+      .sort()
+      .slice(0, 20);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * SKILL.md files authored against the Claude Code / Anthropic spec
+ * declare allowed-tools using names like "Bash, Read, Write, Edit,
+ * WebFetch". Clementine's tools are named differently. The skill body
+ * is documentation, not enforcement, so the agent is free to pick
+ * Clementine's equivalents — but only if it knows the mapping. We
+ * append a short crib sheet to every skill_read so the agent never
+ * has to guess.
+ */
+function renderToolNameCrib(skill: Skill): string {
+  return [
+    'Tool name mapping (this skill is documented in Claude Code conventions; use Clementine\'s tools instead):',
+    `- Bash → run_shell_command (set cwd to "${skill.dir}" when invoking bundled helpers)`,
+    '- Read → read_file',
+    '- Write → write_file',
+    '- Edit → write_file (read existing content first, then write the new content)',
+    '- WebFetch → web_fetch',
+    'The skill\'s allowed-tools frontmatter is documentation only; pick whichever Clementine tool fits the step.',
+  ].join('\n');
+}
 
 /**
  * Skill discovery tools — agent-facing surface for installed SKILL.md
@@ -55,7 +94,29 @@ export function registerSkillTools(server: McpServer): void {
         `# ${skill.frontmatter.name || skill.name}`,
         skill.frontmatter.description ? `\n${skill.frontmatter.description}\n` : '',
       ].filter(Boolean).join('\n');
-      return textResult(`${head}\n\n---\n${skill.body}`);
+
+      // Tell the agent where the skill actually lives so it can run
+      // bundled scripts via run_shell_command(cwd=…) instead of
+      // hallucinating that "this environment" can't execute the
+      // skill's body. Without this, skill bodies that reference
+      // "src/aggregate.js" or "scripts/install.sh" stay non-actionable.
+      const assets = [
+        skill.hasScripts ? 'scripts/' : null,
+        skill.hasSrc ? 'src/' : null,
+        skill.hasReferences ? 'references/' : null,
+      ].filter(Boolean) as string[];
+      const entries = listSkillEntries(skill.dir);
+      const manifestLines = [
+        `Skill location on disk: ${skill.dir}`,
+        assets.length > 0
+          ? `Bundled assets: ${assets.join(', ')} — invoke with run_shell_command and cwd="${skill.dir}".`
+          : 'Bundled assets: none — this skill is pure instructions, no executable helpers.',
+        entries.length > 0 ? `Top-level entries: ${entries.join(', ')}` : '',
+      ].filter(Boolean).join('\n');
+
+      const crib = renderToolNameCrib(skill);
+
+      return textResult(`${head}\n\n${manifestLines}\n\n${crib}\n\n---\n${skill.body}`);
     },
   );
 }

@@ -434,7 +434,29 @@ function createDiscordStreamHandler(channelId: string): DiscordStreamHandler {
       lastEditAt = Date.now();
       lastEditLength = buffer.length;
     } catch (err) {
-      logger.warn({ err, channelId, messageId: currentMessageId }, 'Discord stream edit failed');
+      // PATCH failed even after the rate-limit retry loop in
+      // executeDiscordRequest. Silently swallowing this loses the
+      // tail of the agent's reply (the message stays at whatever was
+      // last successfully edited in). Fall back to posting the
+      // current buffer as a NEW follow-up message so the trailing
+      // text always lands. Reset currentMessageId so further deltas
+      // edit the follow-up, not the failed message.
+      logger.warn({ err, channelId, messageId: currentMessageId }, 'Discord stream edit failed — falling back to new message');
+      const failedId = currentMessageId;
+      currentMessageId = null;
+      try {
+        const sent = await discordApiJson<DiscordRestSentMessage>(
+          `/channels/${channelId}/messages`,
+          { method: 'POST', body: { content } },
+        );
+        currentMessageId = sent.id;
+        messageIds.push(sent.id);
+        lastEditAt = Date.now();
+        lastEditLength = buffer.length;
+        logger.info({ channelId, messageId: sent.id, failedMessageId: failedId, contentLength: buffer.length }, 'Discord stream edit fallback posted as new message');
+      } catch (fallbackErr) {
+        logger.warn({ err: fallbackErr, channelId, failedMessageId: failedId }, 'Discord stream edit fallback also failed');
+      }
     }
   }
 

@@ -69,6 +69,8 @@ export interface Skill {
   hasScripts: boolean;
   /** True when references/ exists. */
   hasReferences: boolean;
+  /** True when src/ exists. Many skills package executable helpers under src/. */
+  hasSrc: boolean;
 }
 
 export function ensureSkillsDir(): void {
@@ -113,6 +115,7 @@ function parseSkillFile(skillPath: string, dirName: string): Skill | null {
     source: readSourceMeta(dir),
     hasScripts: existsSync(path.join(dir, 'scripts')),
     hasReferences: existsSync(path.join(dir, 'references')),
+    hasSrc: existsSync(path.join(dir, 'src')),
   };
 }
 
@@ -285,5 +288,6 @@ export function renderSkillsIndex(): string {
   return [
     'Installed skills (call `skill_read("<name>")` to load the full instructions when relevant):',
     ...lines,
+    `Skills live on disk under ${SKILLS_DIR}/<name>/. Skills that bundle scripts/, src/, or references/ can be executed via run_shell_command with cwd set to the skill directory.`,
   ].join('\n');
 }

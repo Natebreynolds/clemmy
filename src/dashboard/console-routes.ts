@@ -1691,6 +1691,7 @@ export function registerConsoleRoutes(
           bodyPreview: s.bodyPreview,
           hasScripts: s.hasScripts,
           hasReferences: s.hasReferences,
+          hasSrc: s.hasSrc,
           source: s.source ?? null,
         })),
       });
