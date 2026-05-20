@@ -7,8 +7,9 @@ const AUTHORIZE_URL = `${AUTH_BASE_URL}/oauth/authorize`;
 const TOKEN_URL = `${AUTH_BASE_URL}/oauth/token`;
 const CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';
 const SCOPE = 'openid profile email offline_access';
-const CALLBACK_PORT = 1455;
-const CALLBACK_PATH = '/callback';
+const CALLBACK_PORTS = [1455, 1441, 1444, 1449, 1452, 1457, 1460, 1466, 1467];
+const CALLBACK_PATH = '/auth/callback';
+const LEGACY_CALLBACK_PATH = '/callback';
 const LOGIN_TIMEOUT_MS = 15 * 60_000;
 
 export interface NativeCodexTokenSet {
@@ -26,6 +27,11 @@ interface CallbackPayload {
   errorDescription?: string;
 }
 
+interface OAuthCallbackResult {
+  payload: CallbackPayload;
+  redirectUri: string;
+}
+
 function base64UrlEncode(value: Buffer): string {
   return value.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
 }
@@ -36,6 +42,23 @@ function createCodeVerifier(): string {
 
 function createCodeChallenge(verifier: string): string {
   return base64UrlEncode(createHash('sha256').update(verifier).digest());
+}
+
+function buildAuthorizeUrl(redirectUri: string, state: string, codeChallenge: string): URL {
+  const authorizeUrl = new URL(AUTHORIZE_URL);
+  authorizeUrl.searchParams.set('response_type', 'code');
+  authorizeUrl.searchParams.set('client_id', CLIENT_ID);
+  authorizeUrl.searchParams.set('redirect_uri', redirectUri);
+  authorizeUrl.searchParams.set('scope', SCOPE);
+  authorizeUrl.searchParams.set('state', state);
+  authorizeUrl.searchParams.set('code_challenge', codeChallenge);
+  authorizeUrl.searchParams.set('code_challenge_method', 'S256');
+  authorizeUrl.searchParams.set('id_token_add_organizations', 'true');
+  return authorizeUrl;
+}
+
+function isOAuthCallbackPath(pathname: string): boolean {
+  return pathname === CALLBACK_PATH || pathname === LEGACY_CALLBACK_PATH;
 }
 
 function openBrowser(url: string): void {
@@ -49,6 +72,95 @@ function openBrowser(url: string): void {
     return;
   }
   spawn('xdg-open', [url], { detached: true, stdio: 'ignore' }).unref();
+}
+
+function listenForOAuthCallback(state: string, codeChallenge: string): Promise<OAuthCallbackResult> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timeout: NodeJS.Timeout | null = null;
+    let lastListenError: Error | null = null;
+
+    const finish = (
+      server: ReturnType<typeof createServer> | null,
+      error?: Error,
+      result?: OAuthCallbackResult,
+    ) => {
+      if (settled) return;
+      settled = true;
+      if (timeout) {
+        clearTimeout(timeout);
+        timeout = null;
+      }
+      try {
+        server?.close();
+      } catch {
+        // The server may already be closed after a callback response.
+      }
+      if (error) reject(error);
+      else if (result) resolve(result);
+    };
+
+    const tryPort = (index: number) => {
+      if (index >= CALLBACK_PORTS.length) {
+        const detail = lastListenError ? ` Last error: ${lastListenError.message}` : '';
+        reject(new Error(`Native OAuth callback server could not bind to localhost ports ${CALLBACK_PORTS.join(', ')}.${detail}`));
+        return;
+      }
+
+      const port = CALLBACK_PORTS[index];
+      const redirectUri = `http://localhost:${port}${CALLBACK_PATH}`;
+      const authorizeUrl = buildAuthorizeUrl(redirectUri, state, codeChallenge);
+      const server = createServer((req, res) => {
+        const requestUrl = new URL(req.url ?? '/', redirectUri);
+        if (!isOAuthCallbackPath(requestUrl.pathname)) {
+          res.statusCode = 404;
+          res.end('Not found');
+          return;
+        }
+
+        const payload: CallbackPayload = {
+          code: requestUrl.searchParams.get('code') ?? undefined,
+          state: requestUrl.searchParams.get('state') ?? undefined,
+          error: requestUrl.searchParams.get('error') ?? undefined,
+          errorDescription: requestUrl.searchParams.get('error_description') ?? undefined,
+        };
+
+        res.statusCode = 200;
+        res.setHeader('Content-Type', 'text/html; charset=utf-8');
+        res.end('<html><body><h1>Sign-in completed.</h1><p>You can return to Clementine.</p></body></html>');
+        finish(server, undefined, { payload, redirectUri });
+      });
+
+      server.once('error', (error: Error & { code?: string }) => {
+        if (settled) return;
+        if (error.code === 'EADDRINUSE' || error.code === 'EACCES') {
+          lastListenError = error;
+          try {
+            server.close();
+          } catch {
+            // ignore and try the next port
+          }
+          tryPort(index + 1);
+          return;
+        }
+        finish(server, error);
+      });
+
+      server.listen(port, '127.0.0.1', () => {
+        timeout = setTimeout(() => {
+          finish(server, new Error('Native OAuth login timed out after 15 minutes.'));
+        }, LOGIN_TIMEOUT_MS);
+        try {
+          openBrowser(authorizeUrl.toString());
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          finish(server, new Error(`Could not open the browser for native OAuth login: ${message}`));
+        }
+      });
+    };
+
+    tryPort(0);
+  });
 }
 
 function parseJwtPayload(token?: string): Record<string, unknown> | null {
@@ -167,55 +279,7 @@ export async function loginWithNativeCodexOAuth(): Promise<NativeCodexTokenSet> 
   const state = base64UrlEncode(randomBytes(24));
   const codeVerifier = createCodeVerifier();
   const codeChallenge = createCodeChallenge(codeVerifier);
-  const redirectUri = `http://localhost:${CALLBACK_PORT}${CALLBACK_PATH}`;
-
-  const authorizeUrl = new URL(AUTHORIZE_URL);
-  authorizeUrl.searchParams.set('response_type', 'code');
-  authorizeUrl.searchParams.set('client_id', CLIENT_ID);
-  authorizeUrl.searchParams.set('redirect_uri', redirectUri);
-  authorizeUrl.searchParams.set('scope', SCOPE);
-  authorizeUrl.searchParams.set('state', state);
-  authorizeUrl.searchParams.set('code_challenge', codeChallenge);
-  authorizeUrl.searchParams.set('code_challenge_method', 'S256');
-  authorizeUrl.searchParams.set('id_token_add_organizations', 'true');
-
-  const callback = await new Promise<CallbackPayload>((resolve, reject) => {
-    const server = createServer((req, res) => {
-      const requestUrl = new URL(req.url ?? '/', redirectUri);
-      if (requestUrl.pathname !== CALLBACK_PATH) {
-        res.statusCode = 404;
-        res.end('Not found');
-        return;
-      }
-
-      const payload: CallbackPayload = {
-        code: requestUrl.searchParams.get('code') ?? undefined,
-        state: requestUrl.searchParams.get('state') ?? undefined,
-        error: requestUrl.searchParams.get('error') ?? undefined,
-        errorDescription: requestUrl.searchParams.get('error_description') ?? undefined,
-      };
-
-      res.statusCode = 200;
-      res.setHeader('Content-Type', 'text/html; charset=utf-8');
-      res.end('<html><body><h1>Sign-in completed.</h1><p>You can return to Clementine.</p></body></html>');
-      server.close();
-      resolve(payload);
-    });
-
-    const timeout = setTimeout(() => {
-      server.close();
-      reject(new Error('Native OAuth login timed out after 15 minutes.'));
-    }, LOGIN_TIMEOUT_MS);
-
-    server.once('close', () => clearTimeout(timeout));
-    server.listen(CALLBACK_PORT, '127.0.0.1', () => {
-      openBrowser(authorizeUrl.toString());
-    });
-    server.on('error', (error) => {
-      clearTimeout(timeout);
-      reject(error);
-    });
-  });
+  const { payload: callback, redirectUri } = await listenForOAuthCallback(state, codeChallenge);
 
   if (callback.error) {
     throw new Error(`Native OAuth callback failed: ${callback.error}${callback.errorDescription ? ` (${callback.errorDescription})` : ''}`);
