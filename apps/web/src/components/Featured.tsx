@@ -1,7 +1,7 @@
 "use client";
 
-import { ReactNode } from "react";
-import { motion } from "framer-motion";
+import { ReactNode, useEffect, useState } from "react";
+import { motion, AnimatePresence } from "framer-motion";
 import {
   Plug,
   Mic,
@@ -12,6 +12,8 @@ import {
   Video,
   Clock,
   Webhook,
+  CheckCircle2,
+  Sparkles,
 } from "lucide-react";
 import { Section } from "./ui/Section";
 import { fadeUp, stagger } from "@/lib/motion";
@@ -28,9 +30,16 @@ export function Featured() {
           <span className="text-[var(--ink-dim)]">Now she does it for you.</span>
         </>
       }
-      intro="Four headline capabilities. Eight more underneath. Every one runs through the same memory, the same tools, and the same approval policy."
+      intro="Five headline capabilities. Seven more underneath. Every one runs through the same memory, the same tools, and the same approval policy."
     >
       <div className="space-y-6">
+        <FeatureRow
+          eyebrow="Meeting capture · zero meeting bots"
+          title="She sits in. Nobody else has to know."
+          body="Grant Screen Recording once. Clementine detects Zoom, Meet, Teams, and native calls — captures and transcribes them from your machine. No 'Otter has joined' moment, no extra bot in the participant list. Every meeting becomes structured notes, action items, and follow-up drafts you can ship."
+          icon={Video}
+          preview={<MeetingRecording />}
+        />
         <FeatureRow
           eyebrow="200+ apps · 40+ MCP servers"
           title="Reaches every tool you use."
@@ -80,12 +89,12 @@ export function Featured() {
           {[
             { icon: MessageSquare, title: "Discord bot", body: "DM her or post in a bot channel. Inline approval buttons run her from your phone." },
             { icon: Terminal, title: "Computer-use", body: "Write files, run shell commands, edit code. Gated by your scope policy, hard denylist absolute." },
-            { icon: Video, title: "Meeting capture", body: "Grant Screen Recording once. She attends calls, transcribes, and writes follow-ups." },
             { icon: Clock, title: "Scheduled tasks", body: "Pre-configured morning briefing, end-of-day, weekly review. Add your own from the dashboard." },
             { icon: Webhook, title: "Webhook & API", body: "POST a task and walk away. NDJSON streaming on /chat/stream. Wire her into Raycast or Shortcuts." },
-            { icon: Brain, title: "Goals & autonomy", body: "Active goals get injected into every cycle. She brings them up — you don't have to remember." },
+            { icon: Sparkles, title: "Goals & autonomy", body: "Active goals get injected into every cycle. She brings them up — you don't have to remember." },
             { icon: Plug, title: "Plugin system", body: "Drop a package into ~/.clementine-next/plugins/. Adds tools, monitors, channels — no rebuild." },
             { icon: ShieldCheck, title: "Audit log", body: "Append-only NDJSON record of every tool call. The substrate for the always-learning loop." },
+            { icon: Brain, title: "Skills", body: "Drop SKILL.md files into ~/.clementine-next/skills/. She'll discover and use them automatically." },
           ].map(({ icon: Icon, title, body }) => (
             <motion.div
               key={title}
@@ -409,3 +418,196 @@ function Arrow({ auto, done }: { auto?: boolean; done?: boolean }) {
     </div>
   );
 }
+
+/* ───── Preview: meeting recording in progress ───── */
+
+type Utterance = { speaker: "N" | "M" | "J"; name: string; text: string };
+type Action = { kind: "todo" | "send" | "note"; text: string };
+
+const UTTERANCES: Utterance[] = [
+  { speaker: "M", name: "Maya",   text: "Next quarter we should push the partnership deck to Acme before Friday." },
+  { speaker: "N", name: "Nathan", text: "Agreed. I'll get them a v1 by Thursday EOD." },
+  { speaker: "J", name: "Jess",   text: "Should we loop in design earlier this time?" },
+  { speaker: "N", name: "Nathan", text: "Yeah — let's brief Sam on Monday so they can sketch alongside us." },
+];
+
+const ACTIONS: Action[] = [
+  { kind: "send", text: "Send Acme draft by Thu EOD" },
+  { kind: "todo", text: "Brief Sam (design) Monday" },
+  { kind: "note", text: "Q4 partnership push agreed" },
+];
+
+function useElapsed(active: boolean) {
+  const [secs, setSecs] = useState(1334); // 22:14
+  useEffect(() => {
+    if (!active) return;
+    const id = window.setInterval(() => setSecs((s) => s + 1), 1000);
+    return () => window.clearInterval(id);
+  }, [active]);
+  const m = Math.floor(secs / 60);
+  const s = secs % 60;
+  return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+}
+
+function MeetingRecording() {
+  const [step, setStep] = useState(0);
+  const [actionStep, setActionStep] = useState(0);
+  const [tick, setTick] = useState(0);
+  const timer = useElapsed(true);
+
+  // Advance transcript
+  useEffect(() => {
+    if (step >= UTTERANCES.length) {
+      const t = window.setTimeout(() => {
+        setStep(0);
+        setActionStep(0);
+        setTick((x) => x + 1);
+      }, 2400);
+      return () => window.clearTimeout(t);
+    }
+    const t = window.setTimeout(() => setStep((s) => s + 1), 1900);
+    return () => window.clearTimeout(t);
+  }, [step]);
+
+  // Action items appear slightly after relevant utterances
+  useEffect(() => {
+    if (actionStep >= ACTIONS.length) return;
+    if (step < actionStep + 2) return;
+    const t = window.setTimeout(() => setActionStep((s) => s + 1), 400);
+    return () => window.clearTimeout(t);
+  }, [step, actionStep]);
+
+  const visible = UTTERANCES.slice(0, step);
+  const visibleActions = ACTIONS.slice(0, actionStep);
+
+  return (
+    <div className="absolute inset-0 flex flex-col overflow-hidden rounded-xl bg-[#0d0907] ring-1 ring-white/10">
+      {/* Header */}
+      <div className="flex items-center gap-2.5 border-b border-white/5 px-4 py-2.5 text-[11px]">
+        <span className="relative inline-flex h-2.5 w-2.5">
+          <span className="absolute inset-0 rounded-full bg-red-500/60 animate-ping" />
+          <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-red-500" />
+        </span>
+        <span className="font-mono uppercase tracking-wider text-red-300">
+          Meeting live
+        </span>
+        <span className="font-mono text-white/40">·</span>
+        <span className="font-mono text-white/85">{timer}</span>
+        <span className="ml-auto inline-flex items-center gap-1.5 text-[10px] text-emerald-300/80 font-mono">
+          <span className="size-1.5 rounded-full bg-emerald-400 animate-pulse" />
+          Zoom · transcribing
+        </span>
+      </div>
+
+      <div key={tick} className="flex flex-1 min-h-0">
+        {/* Transcript */}
+        <div className="flex-[1.4] overflow-hidden px-4 py-3 space-y-2.5 border-r border-white/5">
+          <AnimatePresence initial={false}>
+            {visible.map((u, i) => (
+              <motion.div
+                key={`${tick}-${i}`}
+                initial={{ opacity: 0, y: 6 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ duration: 0.3 }}
+                className="flex gap-2.5"
+              >
+                <SpeakerBadge speaker={u.speaker} />
+                <div className="min-w-0 flex-1">
+                  <div className="font-mono text-[10px] text-white/45 mb-0.5">
+                    {u.name}
+                  </div>
+                  <div className="text-[12.5px] leading-snug text-white/85">
+                    {u.text}
+                  </div>
+                </div>
+              </motion.div>
+            ))}
+            {step < UTTERANCES.length && step > 0 && (
+              <motion.div
+                key="thinking"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                className="flex items-center gap-1.5 pl-9 pt-1"
+              >
+                <Dot delay={0} />
+                <Dot delay={0.15} />
+                <Dot delay={0.3} />
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </div>
+
+        {/* Action items panel */}
+        <div className="flex-1 min-w-0 px-4 py-3">
+          <div className="font-mono text-[10px] uppercase tracking-wider text-clem-300/80 mb-3 flex items-center gap-1.5">
+            <Sparkles className="h-3 w-3" />
+            captured
+          </div>
+          <div className="space-y-2">
+            <AnimatePresence initial={false}>
+              {visibleActions.map((a, i) => (
+                <motion.div
+                  key={`${tick}-act-${i}`}
+                  initial={{ opacity: 0, x: 8 }}
+                  animate={{ opacity: 1, x: 0 }}
+                  transition={{ duration: 0.35 }}
+                  className="flex items-start gap-2 rounded-md bg-white/[0.03] ring-1 ring-white/10 px-2.5 py-2"
+                >
+                  <ActionIcon kind={a.kind} />
+                  <span className="text-[11.5px] text-white/85 leading-snug">
+                    {a.text}
+                  </span>
+                </motion.div>
+              ))}
+            </AnimatePresence>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SpeakerBadge({ speaker }: { speaker: Utterance["speaker"] }) {
+  const palette: Record<Utterance["speaker"], string> = {
+    N: "bg-clem-500/20 text-clem-200 ring-clem-400/40",
+    M: "bg-violet-500/20 text-violet-200 ring-violet-400/40",
+    J: "bg-emerald-500/20 text-emerald-200 ring-emerald-400/40",
+  };
+  return (
+    <div
+      className={
+        "shrink-0 h-7 w-7 rounded-full ring-1 grid place-items-center text-[11px] font-semibold " +
+        palette[speaker]
+      }
+    >
+      {speaker}
+    </div>
+  );
+}
+
+function ActionIcon({ kind }: { kind: Action["kind"] }) {
+  if (kind === "send")
+    return (
+      <span className="mt-0.5 inline-grid place-items-center size-4 rounded text-[10px] text-amber-300 bg-amber-400/15 ring-1 ring-amber-400/30">
+        →
+      </span>
+    );
+  if (kind === "todo")
+    return <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-300" />;
+  return (
+    <span className="mt-0.5 inline-grid place-items-center size-4 rounded text-[10px] text-clem-300 bg-clem-400/15 ring-1 ring-clem-400/30">
+      ✎
+    </span>
+  );
+}
+
+function Dot({ delay }: { delay: number }) {
+  return (
+    <motion.span
+      className="size-1.5 rounded-full bg-white/40"
+      animate={{ opacity: [0.3, 1, 0.3] }}
+      transition={{ duration: 1.2, repeat: Infinity, delay }}
+    />
+  );
+}
+
