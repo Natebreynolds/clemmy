@@ -302,6 +302,12 @@ export function resolveSafeCliProbe(command: string, resolved: string): SafeCliP
   };
 }
 
+export function findSafeCliCommand(command: string): SafeCliProbe | null {
+  const resolved = whichOnPath(command);
+  if (!resolved) return null;
+  return resolveSafeCliProbe(command, resolved);
+}
+
 /**
  * Probe a single command. Returns null if the binary isn't on PATH.
  * Otherwise returns a CliEntry with whatever we learned. Tries

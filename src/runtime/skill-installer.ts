@@ -8,6 +8,7 @@ import {
   type Skill,
 } from '../memory/skill-store.js';
 import { getGitHubCliStatus } from '../integrations/github-cli.js';
+import { findSafeCliCommand } from './cli-discovery.js';
 
 /**
  * Skill installer — clones a public Git repo into a temp dir, scans
@@ -78,8 +79,15 @@ export function normalizeRepoUrl(input: string): { url: string; basename: string
 
 function runGit(args: string[], cwd: string, onChunk: (s: string) => void, timeoutMs: number): Promise<{ code: number }> {
   return new Promise((resolve) => {
+    const git = findSafeCliCommand('git');
+    if (!git || git.skipped) {
+      const reason = git?.skipped ? git.reason : 'git was not found on PATH.';
+      onChunk(`\n[git unavailable: ${reason} Install Xcode Command Line Tools or a standalone Git binary, then retry.]\n`);
+      resolve({ code: 127 });
+      return;
+    }
     let settled = false;
-    const child = spawn('git', args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(git.command, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
     child.stdout.on('data', (b: Buffer) => onChunk(b.toString('utf-8')));
     child.stderr.on('data', (b: Buffer) => onChunk(b.toString('utf-8')));
     const timer = setTimeout(() => {
@@ -107,8 +115,13 @@ function runGit(args: string[], cwd: string, onChunk: (s: string) => void, timeo
 
 async function readGitSha(cwd: string): Promise<string | undefined> {
   return new Promise((resolve) => {
+    const git = findSafeCliCommand('git');
+    if (!git || git.skipped) {
+      resolve(undefined);
+      return;
+    }
     let out = '';
-    const child = spawn('git', ['rev-parse', 'HEAD'], { cwd, stdio: ['ignore', 'pipe', 'ignore'] });
+    const child = spawn(git.command, ['rev-parse', 'HEAD'], { cwd, stdio: ['ignore', 'pipe', 'ignore'] });
     child.stdout.on('data', (b: Buffer) => { out += b.toString('utf-8'); });
     child.on('close', (code) => resolve(code === 0 ? out.trim() : undefined));
     child.on('error', () => resolve(undefined));

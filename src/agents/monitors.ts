@@ -1,9 +1,10 @@
-import { execSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import pino from 'pino';
 import { BASE_DIR } from '../config.js';
+import { findSafeCliCommand } from '../runtime/cli-discovery.js';
 import { listWorkspaceProjects } from '../tools/shared.js';
 import { AGENT_INBOX_DIR } from '../tools/shared.js';
 
@@ -68,35 +69,35 @@ function enqueueAgentInboxItem(slug: string, item: {
   writeFileSync(filePath, JSON.stringify(items, null, 2), 'utf-8');
 }
 
-function execGit(cmd: string, cwd: string): string {
+function execGit(gitCommand: string, args: string[], cwd: string): string {
   try {
-    return execSync(cmd, { cwd, timeout: 8000, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    return execFileSync(gitCommand, args, { cwd, timeout: 8000, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
   } catch {
     return '';
   }
 }
 
-function isGitRepo(dirPath: string): boolean {
-  return execGit('git rev-parse --git-dir', dirPath) !== '';
+function isGitRepo(gitCommand: string, dirPath: string): boolean {
+  return execGit(gitCommand, ['rev-parse', '--git-dir'], dirPath) !== '';
 }
 
-function getUncommittedChanges(dirPath: string): string {
-  return execGit('git status --porcelain', dirPath);
+function getUncommittedChanges(gitCommand: string, dirPath: string): string {
+  return execGit(gitCommand, ['status', '--porcelain'], dirPath);
 }
 
-function getLastCommitAgeHours(dirPath: string): number {
-  const raw = execGit('git log -1 --format=%ct', dirPath);
+function getLastCommitAgeHours(gitCommand: string, dirPath: string): number {
+  const raw = execGit(gitCommand, ['log', '-1', '--format=%ct'], dirPath);
   if (!raw) return Infinity;
   const ts = parseInt(raw, 10);
   return (Date.now() - ts * 1000) / 3_600_000;
 }
 
-function getCurrentBranch(dirPath: string): string {
-  return execGit('git branch --show-current', dirPath);
+function getCurrentBranch(gitCommand: string, dirPath: string): string {
+  return execGit(gitCommand, ['branch', '--show-current'], dirPath);
 }
 
-function getRecentLog(dirPath: string): string {
-  return execGit('git log --oneline -3', dirPath);
+function getRecentLog(gitCommand: string, dirPath: string): string {
+  return execGit(gitCommand, ['log', '--oneline', '-3'], dirPath);
 }
 
 function runGitMonitor(state: MonitorState): void {
@@ -104,24 +105,31 @@ function runGitMonitor(state: MonitorState): void {
   const lastChecked = state.git.lastCheckedAt ? new Date(state.git.lastCheckedAt).getTime() : 0;
   if (now - lastChecked < GIT_MONITOR_INTERVAL_MS) return;
 
+  const git = findSafeCliCommand('git');
+  if (!git || git.skipped) {
+    state.git.lastCheckedAt = new Date().toISOString();
+    logger.debug({ reason: git?.skipped ? git.reason : 'git not found' }, 'Git monitor skipped because Git is unavailable');
+    return;
+  }
+
   const projects = listWorkspaceProjects();
   let alertCount = 0;
 
   for (const project of projects.slice(0, 30)) {
     if (alertCount >= 5) break; // Cap alerts per cycle
-    if (!isGitRepo(project.path)) continue;
+    if (!isGitRepo(git.command, project.path)) continue;
 
     const lastAlerted = state.git.lastAlertedAt[project.path];
     if (lastAlerted && now - new Date(lastAlerted).getTime() < GIT_MONITOR_PROJECT_COOLDOWN_MS) continue;
 
-    const changes = getUncommittedChanges(project.path);
+    const changes = getUncommittedChanges(git.command, project.path);
     if (!changes) continue;
 
-    const ageHours = getLastCommitAgeHours(project.path);
+    const ageHours = getLastCommitAgeHours(git.command, project.path);
     if (ageHours < STALE_WORK_THRESHOLD_HOURS) continue;
 
-    const branch = getCurrentBranch(project.path);
-    const recentLog = getRecentLog(project.path);
+    const branch = getCurrentBranch(git.command, project.path);
+    const recentLog = getRecentLog(git.command, project.path);
     const fileCount = changes.split('\n').filter(Boolean).length;
     const ageLabel = ageHours === Infinity ? 'unknown time' : `${Math.round(ageHours)}h`;
 

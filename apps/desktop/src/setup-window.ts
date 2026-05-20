@@ -287,7 +287,7 @@ const SETUP_JS = `
   // Fail fast if the preload bridge didn't attach. Surfaces the root
   // cause instead of a downstream "Cannot read properties of undefined".
   if (!window.clemmy) {
-    document.body.innerHTML = '<div style="padding:32px;color:#ff3b5a;font-family:monospace;line-height:1.6"><h2 style="color:#ff5a35">Setup bridge unavailable</h2><p>Clementine could not attach its preload script. Quit and relaunch the app; if this keeps happening, run <code>clementine setup</code> from a terminal.</p></div>';
+    document.body.innerHTML = '<div style="padding:32px;color:#ff3b5a;font-family:monospace;line-height:1.6"><h2 style="color:#ff5a35">Setup bridge unavailable</h2><p>Clementine could not attach its preload script. Quit and relaunch the app; if this keeps happening, reinstall the latest Clementine app and open setup again.</p></div>';
     return;
   }
 

@@ -752,7 +752,7 @@ export function renderConsoleHtml(token: string): string {
           <div class="skills-header">
             <div class="skills-intro">
               <h3>Installed Skills</h3>
-              <p>Skills are reusable <code>SKILL.md</code> prompt modules — personas, design systems, style guides, domain knowledge — that load into the agent's context on demand. Same format as Claude Code skills, Codex skills, and <a href="https://agentskills.io" target="_blank" rel="noopener">agentskills.io</a>. Install public repos directly, or private repos when GitHub CLI is authenticated.</p>
+              <p>Skills are reusable <code>SKILL.md</code> prompt modules — personas, design systems, style guides, domain knowledge — that load into the agent's context on demand. Same format as Claude Code skills, Codex skills, and <a href="https://agentskills.io" target="_blank" rel="noopener">agentskills.io</a>. Public repos work directly; private repos can be enabled later with GitHub CLI.</p>
             </div>
             <div class="skills-stats">
               <div class="stat-card"><span>SKILLS</span><em data-skills-count>—</em></div>
@@ -821,7 +821,7 @@ export function renderConsoleHtml(token: string): string {
               <span class="hub-block-title">Native Browser Harness</span>
               <span class="hub-block-meta" data-hub-browser-meta>—</span>
             </div>
-            <p class="hub-block-intro">Browser Harness gives Clementine direct CDP control over your real Chrome or an optional Browser Use cloud browser. Once installed, the agent gets first-class browser_harness tools for web testing, scraping, uploads, and real browser tasks.</p>
+            <p class="hub-block-intro">Optional. Browser Harness gives Clementine direct CDP control over your real Chrome or a Browser Use cloud browser. Install it only when you want live browser automation; normal chat, memory, files, Discord, and Composio do not require it.</p>
             <div class="hub-apps-controls" data-hub-browser-controls>
               <div class="settings-info">— loading —</div>
             </div>
@@ -835,7 +835,7 @@ export function renderConsoleHtml(token: string): string {
               <span class="hub-block-title">Connect a CLI</span>
               <span class="hub-block-meta" data-hub-cli-cat-meta>—</span>
             </div>
-            <p class="hub-block-intro">Search for a CLI by name — Clementine knows how to install and authenticate the common ones. Once connected, the agent can call it via <code>run_shell_command</code> and the install + auth context is saved so future sessions know it's available.</p>
+            <p class="hub-block-intro">Optional. Search for a CLI by name when a workflow needs a local vendor tool. Clementine can run without these; once connected, the agent can call it via <code>run_shell_command</code> and remember the install + auth context.</p>
             <div class="hub-apps-list" data-hub-github-cli>
               <div class="settings-info">Checking GitHub CLI…</div>
             </div>
@@ -856,7 +856,7 @@ export function renderConsoleHtml(token: string): string {
               <span class="hub-block-title">Skill / CLI Installer</span>
               <span class="hub-block-meta" data-hub-installer-meta>approved commands only</span>
             </div>
-            <p class="hub-block-intro">Install trusted CLIs or skill repos without opening Terminal. This runner only accepts single install commands such as <code>npm install -g package</code>, <code>brew install formula</code>, <code>uv tool install package</code>, <code>pipx install package</code>, or GitHub repo clones.</p>
+            <p class="hub-block-intro">Advanced and optional. Install trusted CLIs or skill repos without opening Terminal. This runner only accepts single install commands such as <code>npm install -g package</code>, <code>brew install formula</code>, <code>uv tool install package</code>, <code>pipx install package</code>, or GitHub repo clones.</p>
             <div class="hub-apps-controls" data-hub-installer-controls>
               <input type="text" data-hub-install-command placeholder="npm install -g some-cli" />
               <button data-hub-install-run>RUN INSTALL</button>
@@ -13222,17 +13222,17 @@ const CONSOLE_JS = `
     const auth = cli.authenticated === true;
     const label = installed
       ? ('CLI ' + (auth ? 'READY' : 'INSTALLED') + (cli.version ? ' · ' + cli.version : ''))
-      : 'CLI NOT INSTALLED';
+      : 'CLI OPTIONAL';
     const cls = installed && auth ? 'active' : installed ? 'pending' : 'available';
     const title = installed
       ? ((cli.path || 'composio') + (cli.authMessage ? ' · ' + cli.authMessage : ''))
-      : 'Install with: curl -fsSL https://composio.dev/install | bash';
+      : 'Optional. Connected-app OAuth can still use the Composio API key without the local CLI.';
     return '<span class="hub-app-pill ' + cls + '" title="' + escMem(title) + '">' + escMem(label) + '</span>';
   }
 
   function renderComposioCliActions(status) {
     const cli = status?.cli || {};
-    if (cli.installed !== true) return '<button data-hub-composio-cli-action="install">INSTALL CLI</button>';
+    if (cli.installed !== true) return '<button data-hub-composio-cli-action="install">INSTALL OPTIONAL CLI</button>';
     if (cli.authenticated !== true) return '<button data-hub-composio-cli-action="auth">CLI LOGIN</button>';
     return '<button data-hub-composio-cli-action="repair">REPAIR CLI AUTH</button>';
   }
@@ -13243,7 +13243,7 @@ const CONSOLE_JS = `
       btn.dataset.bound = '1';
       btn.addEventListener('click', async () => {
         const action = btn.getAttribute('data-hub-composio-cli-action') || 'auth';
-        if (action === 'install' && !confirm('Install the Composio universal CLI now?')) return;
+        if (action === 'install' && !confirm('Install the optional Composio universal CLI now?\n\nClementine can still connect apps with your Composio API key without this.')) return;
         btn.disabled = true;
         btn.textContent = action === 'install' ? 'INSTALLING...' : 'STARTING...';
         try {
@@ -13382,27 +13382,27 @@ const CONSOLE_JS = `
       const gh = data.github || {};
       const installed = gh.installed === true;
       const auth = gh.authenticated === true;
-      const pill = auth ? 'active' : installed ? 'failed' : 'available';
-      const pillText = auth ? 'AUTHENTICATED' : installed ? 'AUTH NEEDED' : 'NOT INSTALLED';
+      const pill = auth ? 'active' : installed ? 'pending' : 'available';
+      const pillText = auth ? 'AUTHENTICATED' : installed ? 'AUTH NEEDED' : 'OPTIONAL';
       const actionButtons = installed
         ? [
             '<button data-hub-github-cli-action="auth">' + (auth ? 'LOGIN AGAIN' : 'LOGIN') + '</button>',
             '<button data-hub-github-cli-action="repair">REPAIR TOKEN</button>',
           ].join('')
-        : '<button data-hub-github-cli-action="install">INSTALL GH</button>';
+        : '<button data-hub-github-cli-action="install">INSTALL OPTIONAL GH</button>';
       el.innerHTML = [
         '<div class="hub-app-card" style="grid-column:1/-1">',
         '  <div class="hub-app-name">GitHub CLI</div>',
         '  <span class="hub-app-pill ' + pill + '">' + pillText + '</span>',
-        '  <div class="hub-app-meta">' + escMem(gh.version || 'gh not found') + '</div>',
-        '  <div class="hub-app-meta">' + escMem(gh.authMessage || 'Used for private skill repos, PRs, issues, releases, and Actions.') + '</div>',
+        '  <div class="hub-app-meta">' + escMem(gh.version || 'gh not installed') + '</div>',
+        '  <div class="hub-app-meta">' + escMem(installed ? (gh.authMessage || 'Used for private skill repos, PRs, issues, releases, and Actions.') : 'Optional. Install/authenticate only for private skill repos or GitHub CLI workflows.') + '</div>',
         '  <div class="hub-app-card-actions">' + actionButtons + '</div>',
         '</div>',
       ].join('');
       el.querySelectorAll('[data-hub-github-cli-action]').forEach((btn) => {
         btn.addEventListener('click', async () => {
           const action = btn.getAttribute('data-hub-github-cli-action') || 'auth';
-          if (action === 'install' && !confirm('Install GitHub CLI with Homebrew now?')) return;
+          if (action === 'install' && !confirm('Install optional GitHub CLI with Homebrew now?\n\nClementine can run without this. It is only needed for private skill repos and GitHub CLI workflows.')) return;
           btn.disabled = true;
           btn.textContent = action === 'install' ? 'INSTALLING...' : 'STARTING...';
           try {
@@ -13428,12 +13428,10 @@ const CONSOLE_JS = `
       const missingPrereqs = (status.prerequisites || []).filter((p) => !p.available);
       metaEl.textContent = status.installed
         ? 'installed' + (status.browserUseCloudKeyPresent ? ' · cloud key ready' : ' · local chrome mode')
-        : missingPrereqs.length > 0
-          ? 'needs ' + missingPrereqs.map((p) => p.name).join(', ')
-          : 'ready to install';
+        : 'optional' + (missingPrereqs.length > 0 ? ' · prerequisites missing' : ' · ready to install');
 
       controlsEl.innerHTML = [
-        status.installed ? '<button data-hub-browser-doctor>RUN DOCTOR</button>' : '<button data-hub-browser-install>INSTALL BROWSER HARNESS</button>',
+        status.installed ? '<button data-hub-browser-doctor>RUN DOCTOR</button>' : '<button data-hub-browser-install>INSTALL OPTIONAL BROWSER HARNESS</button>',
         '<button data-hub-browser-chrome>OPEN CHROME SETUP</button>',
         '<button data-hub-browser-test ' + (status.installed ? '' : 'disabled') + '>TEST ATTACH</button>',
         '<button data-hub-browser-refresh>REFRESH</button>',
@@ -13449,17 +13447,17 @@ const CONSOLE_JS = `
       listEl.innerHTML = [
         '<div class="hub-app-card" style="grid-column:1/-1">',
         '  <div class="hub-app-name">Browser Harness CLI</div>',
-        '  <span class="hub-app-pill ' + (status.installed ? 'active' : missingPrereqs.length > 0 ? 'failed' : 'available') + '">' + (status.installed ? 'ACTIVE' : missingPrereqs.length > 0 ? 'PREREQS' : 'AVAILABLE') + '</span>',
-        '  <div class="hub-app-meta">Command: ' + escMem(status.commandPath || 'browser-harness missing') + '</div>',
+        '  <span class="hub-app-pill ' + (status.installed ? 'active' : 'available') + '">' + (status.installed ? 'ACTIVE' : 'OPTIONAL') + '</span>',
+        '  <div class="hub-app-meta">Command: ' + escMem(status.commandPath || 'not installed') + '</div>',
         '  <div class="hub-app-meta">Install dir: ' + escMem(status.installDir || '') + '</div>',
         '  <div class="settings-info" style="margin-top:10px;">',
         '    <div class="row"><span class="k">Version</span><span class="v">' + escMem(status.version || 'not installed') + '</span></div>',
         '    <div class="row"><span class="k">Editable repo</span><span class="v">' + (status.repoPresent ? 'present' : 'not cloned yet') + '</span></div>',
         '    <div class="row"><span class="k">Codex skill link</span><span class="v">' + (status.codexSkillLinked ? 'linked' : 'not linked yet') + '</span></div>',
         '    <div class="row"><span class="k">Browser Use cloud</span><span class="v">' + (status.browserUseCloudKeyPresent ? 'key ready' : 'optional key missing') + '</span></div>',
-             prereqRows,
+             status.installed || missingPrereqs.length === 0 ? prereqRows : '',
         '  </div>',
-        missingPrereqs.length > 0 ? '  <div class="hub-app-meta" style="color:var(--accent-warn);margin-top:8px;">Install missing prerequisites first. Browser Harness requires git, uv, and Python 3.</div>' : '',
+        missingPrereqs.length > 0 ? '  <div class="hub-app-meta" style="color:var(--fg-3);margin-top:8px;">Optional browser automation is disabled until git, uv, and Python 3 are installed. Clementine can keep running without Browser Harness.</div>' : '',
         '  <div class="hub-app-card-actions" style="margin-top:10px;"><button data-hub-key-jump="browser_use_api_key">SET CLOUD KEY</button></div>',
         '</div>',
       ].join('');
@@ -13468,7 +13466,7 @@ const CONSOLE_JS = `
       if (installBtn) {
         installBtn.disabled = missingPrereqs.length > 0;
         installBtn.addEventListener('click', async () => {
-          if (!confirm('Install Browser Harness now? Clementine will clone browser-use/browser-harness into ~/Developer/browser-harness and run uv tool install -e .')) return;
+          if (!confirm('Install optional Browser Harness now?\n\nClementine will clone browser-use/browser-harness into ~/Developer/browser-harness and run uv tool install -e .')) return;
           installBtn.disabled = true;
           installBtn.textContent = 'INSTALLING...';
           const r = await fetch(withToken('/api/console/browser-harness/install'), { method: 'POST' });
@@ -13552,7 +13550,7 @@ const CONSOLE_JS = `
     listEl.innerHTML = results.map((r) => {
       const installed = Boolean(r.installed);
       const pillCls = installed ? 'active' : 'available';
-      const pillText = installed ? 'INSTALLED' : 'NOT INSTALLED';
+      const pillText = installed ? 'INSTALLED' : 'OPTIONAL';
       const actionBtn = installed
         ? '<a href="' + escMem(r.authDocsUrl) + '" target="_blank" rel="noopener" data-cli-cat-configure="' + escMem(r.id) + '">CONFIGURE ▸</a>'
         : '<button data-cli-cat-install="' + escMem(r.id) + '">INSTALL</button>';

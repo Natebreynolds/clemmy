@@ -9,6 +9,7 @@ import type { RuntimeContextValue } from '../types.js';
 import { getWorkspaceDirs } from './shared.js';
 import { loadProactivityPolicy } from '../agents/proactivity-policy.js';
 import { needsApprovalFromTaxonomy } from '../agents/tool-taxonomy.js';
+import { findSafeCliCommand } from '../runtime/cli-discovery.js';
 
 /**
  * Approval gate for SDK-native tools — delegates to the global
@@ -227,12 +228,64 @@ function assertCommandAllowed(command: string): void {
   }
 }
 
+function developerToolStubBlockMessage(command: string): string | null {
+  const matches = command.matchAll(/(?:^|[;&|]\s*)([A-Za-z0-9_.+-]+)\b/g);
+  for (const match of matches) {
+    const binary = match[1];
+    const safe = findSafeCliCommand(binary);
+    if (safe?.skipped) {
+      return `${binary} is unavailable: ${safe.reason} Install Xcode Command Line Tools or a standalone ${binary} binary before using this command.`;
+    }
+  }
+  return null;
+}
+
 function runCommand(command: string, cwd: string, timeoutMs: number): Promise<string> {
   assertCommandAllowed(command);
+  const stubMessage = developerToolStubBlockMessage(command);
+  if (stubMessage) return Promise.resolve(stubMessage);
   return new Promise((resolve, reject) => {
     const child = spawn(command, {
       cwd,
       shell: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: process.env,
+    });
+
+    let stdout = '';
+    let stderr = '';
+    const timeout = setTimeout(() => {
+      child.kill('SIGTERM');
+      reject(new Error(`Command timed out after ${timeoutMs}ms.`));
+    }, timeoutMs);
+
+    child.stdout.on('data', (chunk) => {
+      stdout = truncateOutput(stdout + String(chunk));
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr = truncateOutput(stderr + String(chunk));
+    });
+    child.on('error', (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+    child.on('close', (code) => {
+      clearTimeout(timeout);
+      const output = [
+        `exit_code: ${code ?? 0}`,
+        stdout ? `stdout:\n${stdout}` : '',
+        stderr ? `stderr:\n${stderr}` : '',
+      ].filter(Boolean).join('\n\n');
+      resolve(output || `exit_code: ${code ?? 0}`);
+    });
+  });
+}
+
+function runProcess(command: string, args: string[], cwd: string, timeoutMs: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd,
+      shell: false,
       stdio: ['ignore', 'pipe', 'pipe'],
       env: process.env,
     });
@@ -352,7 +405,14 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
     parameters: z.object({
       cwd: z.string().nullable(),
     }),
-    execute: async ({ cwd }) => runCommand('git status --short --branch', resolveAllowedCwd(cwd ?? undefined), 10_000),
+    execute: async ({ cwd }) => {
+      const git = findSafeCliCommand('git');
+      if (!git || git.skipped) {
+        const reason = git?.skipped ? git.reason : 'git was not found on PATH.';
+        return `Git is unavailable: ${reason} Install Xcode Command Line Tools or a standalone Git binary to use git_status.`;
+      }
+      return runProcess(git.command, ['status', '--short', '--branch'], resolveAllowedCwd(cwd ?? undefined), 10_000);
+    },
   });
 
   return [workspace_roots, list_files, read_file, write_file, run_shell_command, git_status];
