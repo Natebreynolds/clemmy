@@ -60,7 +60,13 @@ function makeAgentStub(): import('@openai/agents').Agent<any, any> {
   return {} as import('@openai/agents').Agent<any, any>;
 }
 
-test('completed run snapshots conversation and emits run_completed', async () => {
+test('completed chat run snapshots conversation, emits run_completed, leaves session active', async () => {
+  // Chat sessions are inherently multi-turn — the user types again. The
+  // loop emits run_completed + conversation_completed (the chat dock
+  // watches for those to clear THINKING…), but the session row status
+  // stays 'active' so the next user message can run a new turn under
+  // the same session. Before this fix the row flipped to 'completed'
+  // on every turn end, stranding the chat dock.
   resetEventLog();
   const sess = HarnessSession.create({ kind: 'chat', title: 'completed' });
 
@@ -97,11 +103,44 @@ test('completed run snapshots conversation and emits run_completed', async () =>
   const reloaded = HarnessSession.load(sess.id);
   assert.ok(reloaded);
   assert.equal(reloaded!.previousResponseId(), 'resp_1');
-  assert.equal(reloaded!.sessionRow.status, 'completed');
+  assert.equal(reloaded!.sessionRow.status, 'active', 'chat sessions stay active between turns');
   // user turn input was recorded
   const userInputs = listEvents(sess.id, { types: ['user_input_received'] });
   assert.equal(userInputs.length, 1);
   assert.equal(userInputs[0].data.text, 'do the thing');
+});
+
+test('completed workflow run flips session status to completed (one-shot)', async () => {
+  // Workflow / execution / agent sessions represent a single step or
+  // task. Marking the row 'completed' here is correct so the dashboard's
+  // Live Runs filter doesn't keep showing them.
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'workflow', title: 'workflow-step' });
+
+  const runRunner: RunRunnerFn = async (_runner, _agent, items, _opts) => ({
+    history: [
+      ...items,
+      {
+        role: 'assistant',
+        status: 'completed',
+        content: [{ type: 'output_text', text: 'done' }],
+      },
+    ],
+    lastResponseId: 'resp_w',
+    finalOutput: { ok: true },
+  });
+
+  await runTurn({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'do the workflow step',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  const reloaded = HarnessSession.load(sess.id);
+  assert.ok(reloaded);
+  assert.equal(reloaded!.sessionRow.status, 'completed', 'workflow sessions are one-shot');
 });
 
 test('previousResponseId is NOT passed to the SDK (codex requires full history each turn)', async () => {

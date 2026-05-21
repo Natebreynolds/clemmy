@@ -1005,7 +1005,18 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
         toolCalls: toolCounter.currentCount,
       },
     });
-    session.markStatus('completed');
+    // Chat sessions are inherently multi-turn — the user will type
+    // again. Marking them 'completed' at turn-end strands the chat
+    // dock on "THINKING…" forever (the frontend sees no event past the
+    // last reply because the session is no longer accepting new
+    // turns). Workflow / execution / agent sessions ARE one-shot here,
+    // so the original semantics hold for them. The conversation_completed
+    // event still fires for both — that's how the chat dock learns the
+    // turn ended; the session staying 'active' just keeps the door
+    // open for the next user message.
+    if (session.sessionRow.kind !== 'chat') {
+      session.markStatus('completed');
+    }
     bumpTurnNumber(options.sessionId, turn);
     return {
       sessionId: options.sessionId,
@@ -1307,7 +1318,18 @@ export async function resumePendingApproval(
         toolCalls: toolCounter.currentCount,
       },
     });
-    session.markStatus('completed');
+    // Chat sessions are inherently multi-turn — the user will type
+    // again. Marking them 'completed' at turn-end strands the chat
+    // dock on "THINKING…" forever (the frontend sees no event past the
+    // last reply because the session is no longer accepting new
+    // turns). Workflow / execution / agent sessions ARE one-shot here,
+    // so the original semantics hold for them. The conversation_completed
+    // event still fires for both — that's how the chat dock learns the
+    // turn ended; the session staying 'active' just keeps the door
+    // open for the next user message.
+    if (session.sessionRow.kind !== 'chat') {
+      session.markStatus('completed');
+    }
     bumpTurnNumber(options.sessionId, turn);
     return {
       sessionId: options.sessionId,

@@ -72,83 +72,126 @@ export class CodexResponsesModel implements Model {
   }
 
   async *getStreamedResponse(request: ModelRequest): AsyncIterable<StreamEvent> {
-    const seenOutputItems: CodexOutputItem[] = [];
-    let responseId: string | undefined;
-    let completedEvent: AnyCodexEvent | undefined;
+    // Up to one transparent retry on `codex.sse_truncated` when NO
+    // content was yielded to the SDK yet. Common case from the field:
+    // the upstream Codex stream emits `response.created` and then drops
+    // before any output_text.delta / output_item.done — items=0,
+    // responseId set. With this retry, the user-visible failure is
+    // hidden as long as the second attempt succeeds. If content was
+    // already yielded, we cannot safely retry (would duplicate tokens),
+    // so we throw the BoundaryError as before.
+    const MAX_RETRY = 1;
+    let lastResponseId: string | undefined;
+    let lastItemCount = 0;
 
-    for await (const evt of this.#streamCodex(request)) {
-      // First codex event we ever see — surface a response_started.
-      if (evt.type === 'response.created' && evt.response?.id) {
-        responseId = evt.response.id;
-        yield { type: 'response_started', providerData: { responseId } } as StreamEvent;
-        continue;
+    for (let attempt = 0; attempt <= MAX_RETRY; attempt++) {
+      const seenOutputItems: CodexOutputItem[] = [];
+      let responseId: string | undefined;
+      let completedEvent: AnyCodexEvent | undefined;
+      let yieldedAnyContent = false;
+      // Defer response_started until the first piece of real content —
+      // so a failed attempt that only got `response.created` (no text,
+      // no items) can be silently retried without the SDK ever seeing
+      // a stale responseId.
+      let pendingStart: StreamEvent | undefined;
+
+      for await (const evt of this.#streamCodex(request)) {
+        if (evt.type === 'response.created' && evt.response?.id) {
+          responseId = evt.response.id;
+          pendingStart = { type: 'response_started', providerData: { responseId } } as StreamEvent;
+          continue;
+        }
+        if (evt.type === 'response.output_text.delta' && typeof evt.delta === 'string') {
+          if (pendingStart) { yield pendingStart; pendingStart = undefined; }
+          yieldedAnyContent = true;
+          yield {
+            type: 'output_text_delta',
+            delta: evt.delta,
+            providerData: { sequence_number: evt.sequence_number },
+          } as StreamEvent;
+          continue;
+        }
+        if (evt.type === 'response.output_item.done' && evt.item) {
+          if (pendingStart) { yield pendingStart; pendingStart = undefined; }
+          yieldedAnyContent = true;
+          seenOutputItems.push(evt.item);
+          continue;
+        }
+        if (evt.type === 'response.completed' || evt.type === 'response.done') {
+          completedEvent = evt;
+          continue;
+        }
+        // Pass everything else through verbatim. The SDK doesn't act on
+        // these but trace/observability code can inspect them.
+        if (pendingStart) { yield pendingStart; pendingStart = undefined; }
+        yieldedAnyContent = true;
+        yield { type: 'model', event: evt } as StreamEvent;
       }
-      if (evt.type === 'response.output_text.delta' && typeof evt.delta === 'string') {
+
+      if (completedEvent) {
+        // Success path — flush any deferred response_started (rare:
+        // completed with zero events between created and completed).
+        if (pendingStart) yield pendingStart;
+        // Codex's response.completed has output: []. Stuff in the items
+        // we accumulated so the SDK builds the right ModelResponse.
+        const finalOutput = seenOutputItems.map(convertCodexItemToSdkOutputItem);
+        // The response_done event schema expects a *plain* usage object —
+        // not a Usage class instance (which has Array<Record<>> for the
+        // details fields). Mirror the OpenAIResponsesModel's streaming
+        // shape: snake_case detail spreads, camelCase token counts.
+        const u = completedEvent?.response?.usage ?? {};
         yield {
-          type: 'output_text_delta',
-          delta: evt.delta,
-          providerData: { sequence_number: evt.sequence_number },
-        } as StreamEvent;
-        continue;
+          type: 'response_done',
+          response: {
+            id: responseId ?? completedEvent?.response?.id ?? '',
+            output: finalOutput,
+            usage: {
+              inputTokens: u.input_tokens ?? 0,
+              outputTokens: u.output_tokens ?? 0,
+              totalTokens: u.total_tokens ?? 0,
+              inputTokensDetails: { ...(u.input_tokens_details ?? {}) },
+              outputTokensDetails: { ...(u.output_tokens_details ?? {}) },
+            },
+            providerData: completedEvent?.response ?? {},
+          },
+          providerData: {},
+        } as unknown as StreamEvent;
+        return;
       }
-      if (evt.type === 'response.output_item.done' && evt.item) {
-        seenOutputItems.push(evt.item);
-        continue;
-      }
-      if (evt.type === 'response.completed' || evt.type === 'response.done') {
-        completedEvent = evt;
-        continue;
-      }
-      // Pass everything else through verbatim. The SDK doesn't act on
-      // these but trace/observability code can inspect them.
-      yield { type: 'model', event: evt } as StreamEvent;
-    }
 
-    // T1.4 — refuse to fabricate a clean "response_done" when the
-    // upstream stream never emitted response.completed. The previous
-    // behavior here synthesized response_done with empty usage,
-    // letting the SDK proceed as if the model had finished cleanly;
-    // the caller could not distinguish "model said nothing" from
-    // "connection dropped mid-stream." Throw a structured boundary
-    // error instead so the harness logs it as codex.sse_truncated +
-    // surfaces a real message to the user.
-    if (!completedEvent) {
+      // Truncated. Retry IF nothing was yielded to the SDK yet AND we
+      // have retry budget. Otherwise throw the same BoundaryError as
+      // before so the harness logs it + surfaces a real message.
+      lastResponseId = responseId;
+      lastItemCount = seenOutputItems.length;
+      if (!yieldedAnyContent && attempt < MAX_RETRY) {
+        // 750ms backoff. The Codex backend recovers fast in the common
+        // case; this avoids stampeding it while still keeping latency
+        // imperceptible for the user (they don't see the first attempt).
+        await new Promise((resolve) => setTimeout(resolve, 750));
+        continue;
+      }
+
+      // T1.4 — refuse to fabricate a clean "response_done" when the
+      // upstream stream never emitted response.completed. The previous
+      // behavior here synthesized response_done with empty usage,
+      // letting the SDK proceed as if the model had finished cleanly;
+      // the caller could not distinguish "model said nothing" from
+      // "connection dropped mid-stream." Throw a structured boundary
+      // error instead so the harness logs it as codex.sse_truncated +
+      // surfaces a real message to the user.
       throw new BoundaryError({
         kind: 'codex.sse_truncated',
         retryable: true,
         userMessage: "Clementine's model backend dropped the connection before finishing this turn. Retry — if it persists, the Codex backend may be having an incident.",
-        operatorMessage: `getStreamedResponse: SSE ended without response.completed (items=${seenOutputItems.length}, responseId=${responseId ?? 'none'})`,
+        operatorMessage: `getStreamedResponse: SSE ended without response.completed (items=${lastItemCount}, responseId=${lastResponseId ?? 'none'}, attempts=${attempt + 1})`,
         context: {
-          itemCount: seenOutputItems.length,
-          responseId: responseId ?? null,
+          itemCount: lastItemCount,
+          responseId: lastResponseId ?? null,
+          attempts: attempt + 1,
         },
       });
     }
-
-    // Codex's response.completed has output: []. Stuff in the items
-    // we accumulated so the SDK builds the right ModelResponse.
-    const finalOutput = seenOutputItems.map(convertCodexItemToSdkOutputItem);
-    // The response_done event schema expects a *plain* usage object —
-    // not a Usage class instance (which has Array<Record<>> for the
-    // details fields). Mirror the OpenAIResponsesModel's streaming
-    // shape: snake_case detail spreads, camelCase token counts.
-    const u = completedEvent?.response?.usage ?? {};
-    yield {
-      type: 'response_done',
-      response: {
-        id: responseId ?? completedEvent?.response?.id ?? '',
-        output: finalOutput,
-        usage: {
-          inputTokens: u.input_tokens ?? 0,
-          outputTokens: u.output_tokens ?? 0,
-          totalTokens: u.total_tokens ?? 0,
-          inputTokensDetails: { ...(u.input_tokens_details ?? {}) },
-          outputTokensDetails: { ...(u.output_tokens_details ?? {}) },
-        },
-        providerData: completedEvent?.response ?? {},
-      },
-      providerData: {},
-    } as unknown as StreamEvent;
   }
 
   /**
