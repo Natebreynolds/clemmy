@@ -897,6 +897,36 @@ test('runConversation: a real "Added 5 rows" reply does NOT fire any stall signa
   assert.equal(stuckEvents.length, 0);
 });
 
+test('runConversation: "Transferred to Executor" false claim is flagged (regression: sess-mpeu2wmk)', async () => {
+  // Repro from 2026-05-21 sess-mpeu2wmk-4785eded turn 2: after the
+  // stall_retry_attempted hook re-prompted the Executor for a multi-
+  // step Composio + Salesforce chain, the model emitted:
+  //   "Transferred to Executor to run the actual workflow now."
+  // The first broadened pattern landed in v0.4.32 caught "Handed off"
+  // but missed "Transferred to" — the model just swapped synonyms.
+  // The user saw a fabricated reply that lied about doing the work.
+  // The pattern set now covers transfer/route/dispatch/delegate/
+  // launch/trigger/forward verbs in both past- and present-progressive
+  // tense; this test pins one of them.
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const runner = scriptedRunner([
+    {
+      finalOutput: 'Transferred to Executor to run the actual workflow now.',
+    },
+  ]);
+  await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'do the multi-step thing',
+    makeRunner: makeRunnerStub,
+    runRunner: runner,
+  });
+  const stuckEvents = listEventsForConv(sess.id, { types: ['stuck_detected'] });
+  assert.ok(stuckEvents.length >= 1, 'expected "Transferred to" false claim to fire stuck_detected');
+  assert.equal((stuckEvents[0].data as { signal: string }).signal, 'A_zero_tools');
+});
+
 test('runConversation: past-tense FALSE CLAIM with zero tools is flagged (regression: sess-mper69si)', async () => {
   // Repro from 2026-05-21 sess-mper69si-1a163ec1 turn 2:
   // After the retry hook re-prompted the Executor with a clear
