@@ -68,9 +68,39 @@ const WORKFLOW_SYNTHESIS_WALL_CLOCK_MS = parseInt(process.env.CLEMENTINE_WORKFLO
 const WORKFLOW_HEARTBEAT_FIRST_MS = 5 * 60_000;
 const WORKFLOW_HEARTBEAT_INTERVAL_MS = 10 * 60_000;
 
-function startWorkflowHeartbeat(workflowName: string, runId: string, startMs: number): () => void {
+/**
+ * Module-level set of workflow run IDs that are currently parked on a
+ * human approval. The deep approval loop in `runStepViaHarness`
+ * adds the runId on entry and removes it on exit; the top-level
+ * heartbeat checks this set each tick and stays silent while the run
+ * is parked. Avoids prop-drilling state through 4 function layers
+ * (runQueuedWorkflow → executeWorkflow → executeStep → runStepViaHarness).
+ * Without this gate, a workflow waiting 20 min for a human to click
+ * Approve fired "still running" notifications every 10 min — confusing
+ * because the workflow wasn't running, it was parked (seen 2026-05-21
+ * with daily-prospect-outreach).
+ */
+const runsParkedOnApproval = new Set<string>();
+
+export function markWorkflowRunPausedForApproval(runId: string): void {
+  runsParkedOnApproval.add(runId);
+}
+
+export function clearWorkflowRunPausedForApproval(runId: string): void {
+  runsParkedOnApproval.delete(runId);
+}
+
+function startWorkflowHeartbeat(
+  workflowName: string,
+  runId: string,
+  startMs: number,
+): () => void {
   let count = 0;
   const fire = () => {
+    // Suppress heartbeat while parked on an approval. The workflow run
+    // is *waiting* on a human, not doing work; "still running" is the
+    // wrong status copy and conditions the user to ignore the channel.
+    if (runsParkedOnApproval.has(runId)) return;
     count += 1;
     const elapsedMin = Math.max(1, Math.round((Date.now() - startMs) / 60_000));
     addNotification({
@@ -352,6 +382,7 @@ async function runStepViaHarness(
   promptBody: string,
   workflowName: string,
   allowedTools: string[],
+  workflowRunId: string,
 ): Promise<HarnessStepResult> {
   // T-WF-1 — configure the codex OAuth bridge BEFORE the SDK runner
   // touches the model. Discord + chat-dock paths do this at every
@@ -411,6 +442,9 @@ async function runStepViaHarness(
     // Loop until terminal (completed / failed / awaiting_user_input).
     while (result.status === 'awaiting_approval') {
       hadApprovals = true;
+      // Tell the heartbeat we're parked — it'll suppress "still running"
+      // notifications until we clear the flag below.
+      markWorkflowRunPausedForApproval(workflowRunId);
       if (Date.now() - startedAt > WORKFLOW_HARNESS_APPROVAL_MAX_WAIT_MS) {
         throw new Error(
           `workflow step "${step.id}" timed out waiting for approval after ${WORKFLOW_HARNESS_APPROVAL_MAX_WAIT_MS / 1000}s`,
@@ -431,7 +465,7 @@ async function runStepViaHarness(
               id: `wf-approval-${row.approvalId}-${Date.now()}`,
               kind: 'approval',
               title: `Workflow ${workflowName} · ${step.id} needs approval`,
-              body: `**${row.subject}**\n\nReply \`approve ${row.approvalId}\` (or \`reject ${row.approvalId}\`) to continue. The workflow is parked on step \`${step.id}\` until you respond.`,
+              body: `**${row.subject}**\n\nTap **Approve**, **Edit**, or **Reject** below — or reply \`approve ${row.approvalId}\` / \`reject ${row.approvalId}\` if you prefer. The workflow is parked on step \`${step.id}\` until you respond.`,
               createdAt: new Date().toISOString(),
               read: false,
               metadata: {
@@ -479,6 +513,10 @@ async function runStepViaHarness(
         sessionId: realSessionId,
         decision,
       });
+      // Resume returned — the run is moving again. Clear the heartbeat
+      // gate so the next "still running" interval can fire normally
+      // (the loop will re-mark if another approval surfaces).
+      clearWorkflowRunPausedForApproval(workflowRunId);
     }
 
     if (result.status === 'failed') {
@@ -502,6 +540,10 @@ async function runStepViaHarness(
 
     return { output, hadApprovals, approvalIds };
   } finally {
+    // Belt + suspenders: clear the heartbeat gate in finally so a throw
+    // mid-resume doesn't leave the heartbeat permanently suppressed
+    // for the rest of the workflow run.
+    clearWorkflowRunPausedForApproval(workflowRunId);
     closePlanScope(realSessionId, 'workflow-step-finished');
   }
 }
@@ -572,6 +614,7 @@ async function executeStep(
               `Item: ${key}\n\n${prompt}`,
               ctx.workflow.name,
               workflowAutoApprovalTools(ctx.workflow, step),
+              ctx.runId,
             )).output
           : (await ctx.assistant.respond({
               sessionId: `workflow:${ctx.runId}:${step.id}:${key}`,
@@ -640,6 +683,7 @@ async function executeStep(
         prompt,
         ctx.workflow.name,
         workflowAutoApprovalTools(ctx.workflow, step),
+        ctx.runId,
       );
       output = result.output;
       if (result.hadApprovals) {

@@ -41,11 +41,14 @@ test('buildActionsForNotification: planProposalId attaches plan buttons', () => 
   assert.ok(ids.some((id) => id.includes('plan-view:plan-abc123')));
 });
 
-test('buildActionsForNotification: approvalId attaches SDK approve/reject', () => {
+test('buildActionsForNotification: approvalId attaches SDK approve/edit/reject', () => {
   const rows = buildActionsForNotification({ approvalId: 'appr-xyz789' });
   const ids = customIds(rows);
-  assert.equal(ids.length, 2, 'expected 2 buttons: approve, reject');
+  // 2026-05-21: Edit added so workflow approval notifications match the
+  // chat-dock and discord-harness paths (Approve / Edit / Reject).
+  assert.equal(ids.length, 3, 'expected 3 buttons: approve, edit, reject');
   assert.ok(ids.some((id) => id.includes('approve:appr-xyz789')));
+  assert.ok(ids.some((id) => id.includes('edit:appr-xyz789')));
   assert.ok(ids.some((id) => id.includes('reject:appr-xyz789')));
 });
 

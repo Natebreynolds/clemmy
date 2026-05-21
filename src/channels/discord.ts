@@ -764,6 +764,15 @@ function buildApprovalActions(approvalId: string) {
         .setCustomId(`${DISCORD_CUSTOM_ID_PREFIX}:approve:${approvalId}`)
         .setLabel('Approve')
         .setStyle(ButtonStyle.Success),
+      // Edit added 2026-05-21 — was inconsistent with the chat-dock and
+      // discord-harness paths which both surface Approve/Edit/Reject.
+      // The notification-delivery path is the one workflows hit when
+      // request_approval fires; users got Approve+Reject only, no way
+      // to tweak args before approving.
+      new ButtonBuilder()
+        .setCustomId(`${DISCORD_CUSTOM_ID_PREFIX}:edit:${approvalId}`)
+        .setLabel('Edit')
+        .setStyle(ButtonStyle.Primary),
       new ButtonBuilder()
         .setCustomId(`${DISCORD_CUSTOM_ID_PREFIX}:reject:${approvalId}`)
         .setLabel('Reject')
@@ -1321,25 +1330,20 @@ async function handleModalSubmit(interaction: ModalSubmitInteraction): Promise<v
   if (!interaction.customId.startsWith(`${DISCORD_CUSTOM_ID_PREFIX}:edit-modal:`)) {
     return;
   }
-  const approvalId = interaction.customId.split(':')[2];
+  // customId format: `clementine:edit-modal:<approvalId>` (legacy) OR
+  // `clementine:edit-modal:<approvalId>:<plain|json>` (2026-05-21+).
+  // The mode suffix tells us whether the user edited a single field
+  // (plain) or the whole args JSON (json).
+  const parts = interaction.customId.split(':');
+  const approvalId = parts[2];
+  const modalMode: 'plain' | 'json' = parts[3] === 'plain' ? 'plain' : 'json';
   if (!approvalId || !approvalId.startsWith('apr-')) {
     await interaction.reply({ content: 'Malformed edit submission.', ephemeral: true });
     return;
   }
-  let editedArgs = interaction.fields.getTextInputValue('args').trim();
-  if (!editedArgs) {
-    await interaction.reply({ content: 'Edited args were empty — submit cancelled.', ephemeral: true });
-    return;
-  }
-  // Validate that what the user submitted is real JSON. If not, refuse
-  // up-front rather than failing inside the tool with a cryptic error.
-  try {
-    JSON.parse(editedArgs);
-  } catch (err) {
-    await interaction.reply({
-      content: `Edited args are not valid JSON: ${err instanceof Error ? err.message : String(err)}. Click Edit again to fix.`,
-      ephemeral: true,
-    });
+  const editedValue = interaction.fields.getTextInputValue('args').trim();
+  if (!editedValue) {
+    await interaction.reply({ content: 'Edited value was empty — submit cancelled.', ephemeral: true });
     return;
   }
   const row = approvalRegistry.get(approvalId);
@@ -1349,6 +1353,57 @@ async function handleModalSubmit(interaction: ModalSubmitInteraction): Promise<v
       ephemeral: true,
     });
     return;
+  }
+  // Reconstruct the full args envelope. In `plain` mode, the user only
+  // edited the human-meaningful field (e.g. `reason` for
+  // request_approval); we merge that single field back into the
+  // original args so the tool receives the full structure it expects.
+  // In `json` mode, the user edited the whole JSON envelope — pass
+  // through after validation.
+  let editedArgs = '';
+  if (modalMode === 'plain') {
+    const args = row.args ?? {};
+    if (row.tool === 'request_approval') {
+      const merged = { ...args, reason: editedValue };
+      editedArgs = JSON.stringify(merged);
+    } else if (row.tool === 'composio_execute_tool') {
+      const inner = (args as { arguments?: unknown }).arguments;
+      let innerObj: Record<string, unknown> = {};
+      if (typeof inner === 'string') {
+        try { innerObj = JSON.parse(inner) as Record<string, unknown>; } catch { innerObj = {}; }
+      }
+      const slug = (args as { tool_slug?: unknown }).tool_slug;
+      if (typeof slug === 'string' && /OUTLOOK_SEND_EMAIL|GMAIL_SEND_EMAIL/i.test(slug)) {
+        innerObj.body = editedValue;
+      } else {
+        // Unknown plain-mode tool — fall back to using the edited text
+        // as the whole inner payload (unlikely to be hit because pickEditable
+        // returns 'json' for unrecognized composio slugs).
+        innerObj = { ...innerObj, instruction: editedValue };
+      }
+      const merged = { ...(args as Record<string, unknown>), arguments: JSON.stringify(innerObj) };
+      editedArgs = JSON.stringify(merged);
+    } else {
+      // Shouldn't happen — pickEditable only emits 'plain' for the
+      // tools above. Refuse rather than guess.
+      await interaction.reply({
+        content: `Plain-text edit isn't supported for tool ${row.tool ?? 'unknown'} — click Edit again to use the JSON editor.`,
+        ephemeral: true,
+      });
+      return;
+    }
+  } else {
+    // json mode — validate the JSON before submitting.
+    try {
+      JSON.parse(editedValue);
+    } catch (err) {
+      await interaction.reply({
+        content: `Edited args are not valid JSON: ${err instanceof Error ? err.message : String(err)}. Click Edit again to fix.`,
+        ephemeral: true,
+      });
+      return;
+    }
+    editedArgs = editedValue;
   }
   await interaction.deferReply({ ephemeral: true });
   // For composio_execute_tool the inner args are a JSON string nested
@@ -1426,36 +1481,72 @@ async function handleButtonInteraction(interaction: ButtonInteraction, assistant
         });
         return;
       }
-      // Pull the editable args. For composio_execute_tool we want the
-      // INNER args (the actual tool payload), not the wrapper.
-      let initialArgs = '';
-      const args = row.args ?? {};
-      if (row.tool === 'composio_execute_tool' && typeof (args as { arguments?: unknown }).arguments === 'string') {
-        // Try to pretty-print for the editor.
-        try {
-          const parsed = JSON.parse((args as { arguments: string }).arguments);
-          initialArgs = JSON.stringify(parsed, null, 2);
-        } catch {
-          initialArgs = (args as { arguments: string }).arguments;
+      // Pick the most human-editable field for the modal. The previous
+      // pass dumped raw JSON for every tool — for request_approval
+      // (the most-common edit case) that surfaced fields like
+      // `subject`, `reason`, `destructive` which look like developer
+      // plumbing, not instructions. Users want to edit WHAT THE AGENT
+      // DOES, not the envelope around it.
+      //
+      // Per-tool "primary instruction field" extraction:
+      //   - request_approval → `reason` (the prose describing the action)
+      //   - composio_execute_tool with OUTLOOK_SEND_EMAIL slug → `body`
+      //     (the email body); recipient/subject are usually right
+      //   - composio_execute_tool generally → inner `arguments` JSON
+      //     (advanced users editing a tool payload directly)
+      //   - everything else → full args JSON (fallback for power users)
+      // Narrow row to non-null for the closure below; TS doesn't carry
+      // the !row guard from above through the inner function boundary.
+      const approvalRow = row;
+      const args = approvalRow.args ?? {};
+      type EditableField = { label: string; initialValue: string; modalStyle: 'plain' | 'json' };
+      function pickEditable(): EditableField {
+        if (approvalRow.tool === 'request_approval' && typeof (args as { reason?: unknown }).reason === 'string') {
+          return {
+            label: 'What should Clementine do?',
+            initialValue: (args as { reason: string }).reason,
+            modalStyle: 'plain',
+          };
         }
-      } else {
-        initialArgs = JSON.stringify(args, null, 2);
+        if (approvalRow.tool === 'composio_execute_tool') {
+          const inner = (args as { arguments?: unknown }).arguments;
+          if (typeof inner === 'string') {
+            try {
+              const parsed = JSON.parse(inner) as Record<string, unknown>;
+              const slug = (args as { tool_slug?: unknown }).tool_slug;
+              if (typeof slug === 'string' && /OUTLOOK_SEND_EMAIL|GMAIL_SEND_EMAIL/i.test(slug) && typeof parsed.body === 'string') {
+                return { label: 'Email body', initialValue: parsed.body, modalStyle: 'plain' };
+              }
+              return { label: 'Tool args (JSON)', initialValue: JSON.stringify(parsed, null, 2), modalStyle: 'json' };
+            } catch {
+              return { label: 'Tool args (JSON)', initialValue: inner, modalStyle: 'json' };
+            }
+          }
+        }
+        return { label: 'Tool args (JSON)', initialValue: JSON.stringify(args, null, 2), modalStyle: 'json' };
       }
+      const editable = pickEditable();
+      let initialValue = editable.initialValue;
       // Discord text-input value cap is 4000 chars. Truncate gracefully.
-      if (initialArgs.length > 3900) {
-        initialArgs = `${initialArgs.slice(0, 3900)}\n…[truncated for modal]`;
+      if (initialValue.length > 3900) {
+        initialValue = `${initialValue.slice(0, 3900)}\n…[truncated for modal]`;
       }
+      // Discord modal title hard-caps at 45 chars; pre-truncate so
+      // showModal doesn't reject with "Invalid string length".
+      const titleCandidate = editable.modalStyle === 'plain'
+        ? 'Edit instructions'
+        : `Edit args: ${row.subject || row.tool || 'action'}`;
       const modal = new ModalBuilder()
-        .setCustomId(`${DISCORD_CUSTOM_ID_PREFIX}:edit-modal:${targetId}`)
-        .setTitle(`Edit args: ${truncate(row.subject || row.tool || 'action', 40)}`)
+        .setCustomId(`${DISCORD_CUSTOM_ID_PREFIX}:edit-modal:${targetId}:${editable.modalStyle}`)
+        .setTitle(titleCandidate.length > 45 ? `${titleCandidate.slice(0, 44)}…` : titleCandidate)
         .addComponents(
           new ActionRowBuilder<TextInputBuilder>().addComponents(
             new TextInputBuilder()
               .setCustomId('args')
-              .setLabel('Tool args (JSON)')
+              .setLabel(editable.label)
               .setStyle(TextInputStyle.Paragraph)
               .setRequired(true)
-              .setValue(initialArgs),
+              .setValue(initialValue),
           ),
         );
       await interaction.showModal(modal);

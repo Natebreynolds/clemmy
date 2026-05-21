@@ -35,6 +35,10 @@ import {
   type WorkflowDefinition,
 } from '../memory/workflow-store.js';
 import { appendWorkflowEvent, listPendingRuns, readWorkflowEvents } from '../execution/workflow-events.js';
+import {
+  validateWorkflowDefinition as runValidator,
+  type WorkflowValidation,
+} from '../execution/workflow-validator.js';
 import { ExecutionStore } from '../execution/store.js';
 import { listOpenCheckIns } from '../agents/check-ins.js';
 import type { ClementineAssistant } from '../assistant/core.js';
@@ -138,6 +142,7 @@ import {
   type RecallMeetingSettings,
   type RecallRegion,
 } from '../integrations/recall/meeting-capture.js';
+import { startCanonicalTranscriptBackfill } from '../integrations/recall/backfill.js';
 import {
   findCatalogEntry,
   forgetConnectedCli,
@@ -457,76 +462,22 @@ function sanitizeWorkflowName(name: string): string {
   return name.replace(/[^a-zA-Z0-9_-]/g, '-').toLowerCase();
 }
 
-interface WorkflowValidation {
-  ok: boolean;
-  errors: string[];
-  warnings: string[];
-  stepCount: number;
-  hasCycles: boolean;
-}
-
 function validateWorkflowDefinition(data: WorkflowFrontmatter): WorkflowValidation {
-  const errors: string[] = [];
-  const warnings: string[] = [];
-  if (!data.name) errors.push('Workflow has no name.');
-  if (!Array.isArray(data.steps) || data.steps.length === 0) errors.push('Workflow has no steps.');
-
-  const steps = data.steps ?? [];
-  const ids = new Set<string>();
-  let duplicates = 0;
-  for (const step of steps) {
-    if (!step.id) errors.push('A step is missing an id.');
-    if (!step.prompt || step.prompt.trim().length < 3) errors.push(`Step "${step.id ?? '?'}" has no substantive prompt.`);
-    if (step.id) {
-      if (ids.has(step.id)) duplicates++;
-      ids.add(step.id);
-    }
+  // Tool catalog lookup for slug checks: feed the validator the
+  // canonical tool names so it can warn on hallucinated slugs in step
+  // prompts (e.g. "GOOGLESHEETS_SPREADSHEETS_VALUES_APPEND" when the
+  // real catalog has "GOOGLESHEETS_BATCH_UPDATE"). If the catalog
+  // isn't reachable for any reason, the slug check is skipped — the
+  // rest of the validator still runs.
+  let knownToolNames: Set<string> | undefined;
+  try {
+    knownToolNames = new Set(LOCAL_MCP_TOOL_NAMES as readonly string[]);
+  } catch {
+    knownToolNames = undefined;
   }
-  if (duplicates > 0) errors.push(`${duplicates} duplicate step id${duplicates === 1 ? '' : 's'}.`);
-
-  for (const step of steps) {
-    for (const dep of step.dependsOn ?? []) {
-      if (!ids.has(dep)) errors.push(`Step "${step.id}" depends on unknown step "${dep}".`);
-    }
-  }
-
-  // Cycle detection via DFS on the dependency graph.
-  const adj = new Map<string, string[]>();
-  for (const step of steps) adj.set(step.id, step.dependsOn ?? []);
-  const WHITE = 0, GRAY = 1, BLACK = 2;
-  const color = new Map<string, number>();
-  let hasCycles = false;
-  function dfs(node: string): boolean {
-    color.set(node, GRAY);
-    for (const next of adj.get(node) ?? []) {
-      const c = color.get(next) ?? WHITE;
-      if (c === GRAY) return true;
-      if (c === WHITE && dfs(next)) return true;
-    }
-    color.set(node, BLACK);
-    return false;
-  }
-  for (const id of ids) {
-    if ((color.get(id) ?? WHITE) === WHITE && dfs(id)) { hasCycles = true; break; }
-  }
-  if (hasCycles) errors.push('Dependency graph has a cycle.');
-
-  if (data.trigger?.schedule && !validateCronExpression(data.trigger.schedule)) {
-    errors.push(`Invalid cron expression: "${data.trigger.schedule}"`);
-  }
-
-  if (!data.description || data.description.trim().length < 8) {
-    warnings.push('Description is missing or too short — the agent will have trouble picking the right workflow.');
-  }
-  if (data.enabled === false) {
-    warnings.push('Workflow is currently disabled — Executor/Deployer handoffs will not fire it.');
-  }
-  if (steps.length > 12) {
-    warnings.push(`${steps.length} steps is a lot — consider splitting into smaller workflows for reliability.`);
-  }
-
-  return { ok: errors.length === 0, errors, warnings, stepCount: steps.length, hasCycles };
+  return runValidator(data, { knownToolNames });
 }
+
 
 export function registerConsoleRoutes(
   app: Express,
@@ -2331,6 +2282,17 @@ export function registerConsoleRoutes(
       if (result.artifactPath) {
         try { reindexVault(); } catch { /* maintenance will retry */ }
       }
+      // Fire-and-forget canonical-transcript backfill. Only fires when
+      // we have a recordingId — streaming-only meetings (no SDK upload)
+      // can't be backfilled. The function catches all errors and
+      // reflects them in the meeting record's canonicalStatus, so a
+      // failed backfill never breaks this HTTP response.
+      if (result.record.recordingId) {
+        startCanonicalTranscriptBackfill({
+          windowId: result.record.windowId,
+          recordingId: result.record.recordingId,
+        });
+      }
       const settings = loadRecallMeetingSettings();
       const task = result.artifactPath && settings.analyzeOnComplete
         ? createBackgroundTask({
@@ -2943,6 +2905,13 @@ export function registerConsoleRoutes(
           urgency: 'high',
           approvalKind: 'harness',
           approvalId: approval.approvalId,
+          // Drill-target: when the user clicks this NEEDS YOU item body,
+          // the dashboard switches to Activity AND loads the inspector
+          // for this exact session. Without this attribute the user
+          // landed on Activity showing "everything" with no anchor to
+          // the specific approval that brought them here (the visibility
+          // gap Nathan flagged 2026-05-21).
+          targetSessionId: approval.sessionId,
           // Pass the tool name + args so the EDIT button can render a
           // pre-filled textarea. For composio_execute_tool we surface
           // the INNER args JSON (the actual tool payload).

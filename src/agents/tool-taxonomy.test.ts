@@ -210,6 +210,36 @@ test('decideToolApproval: workspace scope still asks for send (no workspace conc
   assert.equal(needsApproval, true);
 });
 
+test('decideToolApproval: agent-owned-dir short-circuits even under strict scope', () => {
+  setScope('strict');
+  // write into ~/.clementine-next/ (or any path the caller flagged as
+  // agent-owned) auto-approves regardless of scope — that's bookkeeping.
+  const writeIntoAgentDir = decideToolApproval({
+    toolName: 'write_file',
+    insideAgentOwnedDirHint: true,
+  });
+  assert.equal(writeIntoAgentDir.needsApproval, false);
+  assert.equal(writeIntoAgentDir.reason, 'agent-owned-dir');
+
+  // The hint is meaningless for 'send' tools (no path concept) — they
+  // should still gate under strict.
+  const sendWithFalseHint = decideToolApproval({
+    toolName: 'send_message',
+    insideAgentOwnedDirHint: true,
+  });
+  assert.equal(sendWithFalseHint.needsApproval, true);
+
+  // A destructive hint still wins — agent-owned dir does NOT override
+  // an explicit "this is destructive" caller signal.
+  const destructiveInAgentDir = decideToolApproval({
+    toolName: 'write_file',
+    insideAgentOwnedDirHint: true,
+    isDestructiveHint: true,
+  });
+  assert.equal(destructiveInAgentDir.needsApproval, true);
+  assert.equal(destructiveInAgentDir.reason, 'destructive-hint');
+});
+
 test('decideToolApproval: cx_* googlesheets writes auto in yolo, ask in strict', () => {
   setScope('yolo');
   const yolo = decideToolApproval({ toolName: 'cx_googlesheets_create_spreadsheet' });

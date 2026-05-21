@@ -41,6 +41,29 @@ export interface RecallMeetingRecord {
    *  populated lazily after recording-ended when analyzeOnComplete is
    *  on. The dashboard reads this to surface summary + actions. */
   analysisPath?: string;
+  /**
+   * State of the post-recording canonical-transcript backfill (see
+   * backfillCanonicalTranscript). The streamed segments captured during
+   * the meeting label speakers generically (Host / Speaker 2) and can
+   * drop mid-recording; the canonical transcript fetched from Recall's
+   * async API has real participant names AND is gap-free. We always
+   * keep the streamed segments visible immediately when the recording
+   * ends, then upgrade once the canonical lands.
+   *
+   *   not_started — recording too short / no recordingId / no API key
+   *   pending     — backfill kicked off; poller still running
+   *   ready       — canonical transcript landed; segments + artifact
+   *                  have been rewritten using participant.name
+   *   timed_out   — gave up after the poll window expired
+   *   failed      — Recall API error or download failed; streamed
+   *                  segments remain (no regression vs. today)
+   */
+  canonicalStatus?: 'not_started' | 'pending' | 'ready' | 'timed_out' | 'failed';
+  /** ISO timestamp of the last canonicalStatus transition. */
+  canonicalUpdatedAt?: string;
+  /** Last error message from a failed backfill attempt, surfaced in
+   *  the dashboard so users know why it's stuck on streamed data. */
+  canonicalError?: string;
 }
 
 export interface RecallMeetingAnalysis {
@@ -147,7 +170,7 @@ export function recallApiUrl(region: RecallRegion): string {
   return RECALL_REGIONS[region] ?? RECALL_REGIONS['us-west-2'];
 }
 
-function recallAuthorizationHeader(apiKey: string): string {
+export function recallAuthorizationHeader(apiKey: string): string {
   if (/^(token|bearer)\s+/i.test(apiKey)) return apiKey;
   return `Token ${apiKey}`;
 }
@@ -287,6 +310,52 @@ export function appendRecallTranscriptSegment(input: Omit<RecallTranscriptSegmen
   return saveMeetingRecord(updated);
 }
 
+/**
+ * Render the meeting's transcript markdown body from its current
+ * segments. Exposed so the canonical-transcript backfill can rewrite
+ * the file with real participant names once the async transcript lands,
+ * using the exact same layout — keeps the dashboard / vault reader
+ * stable across the streamed→canonical transition.
+ */
+function renderTranscriptArtifactBody(record: RecallMeetingRecord, sourceLabel: string): string {
+  const transcriptText = record.segments
+    .map((segment) => `[${segment.timestamp}] ${segment.speaker ? `${segment.speaker}: ` : ''}${segment.text}`)
+    .join('\n');
+  return [
+    '---',
+    `type: meeting-transcript`,
+    `source: ${sourceLabel}`,
+    `meeting_id: ${record.id}`,
+    `window_id: ${record.windowId}`,
+    record.recordingId ? `recording_id: ${record.recordingId}` : '',
+    record.platform ? `platform: ${record.platform}` : '',
+    `started_at: ${record.startedAt}`,
+    record.endedAt ? `ended_at: ${record.endedAt}` : '',
+    '---',
+    '',
+    `# ${record.title || 'Meeting Capture'}`,
+    '',
+    '## Capture',
+    '',
+    `- Source: ${sourceLabel}`,
+    record.platform ? `- Platform: ${record.platform}` : '',
+    `- Segments: ${record.segments.length}`,
+    '- Note: synthetic/test captures are filtered before vault promotion.',
+    '',
+    '## Transcript',
+    '',
+    transcriptText,
+    '',
+  ].filter((line) => line !== '').join('\n');
+}
+
+function defaultArtifactPath(record: RecallMeetingRecord): string {
+  ensureDir(VAULT_MEETINGS_DIR);
+  const date = record.startedAt.slice(0, 10);
+  const label = safeId((record.title || record.platform || record.id).toLowerCase()).slice(0, 60);
+  return path.join(VAULT_MEETINGS_DIR, `${date}-${label}-${safeId(record.id)}.md`);
+}
+
 export function finalizeRecallMeeting(input: {
   windowId: string;
   recordingId?: string;
@@ -304,6 +373,12 @@ export function finalizeRecallMeeting(input: {
     ...record,
     endedAt: nowIso(),
     status: 'completed',
+    // Recordings with a recordingId qualify for a canonical-transcript
+    // backfill. The actual backfill is kicked off by the
+    // /api/console/meetings/recall/complete route after this function
+    // returns, so we just stamp the intent here.
+    canonicalStatus: input.recordingId ? 'pending' : 'not_started',
+    canonicalUpdatedAt: nowIso(),
   };
 
   const transcriptText = completed.segments
@@ -312,41 +387,79 @@ export function finalizeRecallMeeting(input: {
 
   let artifactPath: string | undefined;
   if (completed.segments.length > 0 && !isSyntheticRecallCapture(completed)) {
-    ensureDir(VAULT_MEETINGS_DIR);
-    const date = completed.startedAt.slice(0, 10);
-    const label = safeId((completed.title || completed.platform || completed.id).toLowerCase()).slice(0, 60);
-    artifactPath = path.join(VAULT_MEETINGS_DIR, `${date}-${label}-${safeId(completed.id)}.md`);
-    const body = [
-      '---',
-      `type: meeting-transcript`,
-      `source: recall.ai-desktop-sdk`,
-      `meeting_id: ${completed.id}`,
-      `window_id: ${completed.windowId}`,
-      completed.recordingId ? `recording_id: ${completed.recordingId}` : '',
-      completed.platform ? `platform: ${completed.platform}` : '',
-      `started_at: ${completed.startedAt}`,
-      `ended_at: ${completed.endedAt}`,
-      '---',
-      '',
-      `# ${completed.title || 'Meeting Capture'}`,
-      '',
-      '## Capture',
-      '',
-      `- Source: Recall.ai Desktop Recording SDK`,
-      completed.platform ? `- Platform: ${completed.platform}` : '',
-      `- Segments: ${completed.segments.length}`,
-      '- Note: synthetic/test captures are filtered before vault promotion.',
-      '',
-      '## Transcript',
-      '',
-      transcriptText,
-      '',
-    ].filter((line) => line !== '').join('\n');
+    artifactPath = defaultArtifactPath(completed);
+    const body = renderTranscriptArtifactBody(completed, 'recall.ai-desktop-sdk (streamed)');
     writeFileSync(artifactPath, body, 'utf-8');
   }
 
   const saved = saveMeetingRecord({ ...completed, artifactPath });
   return { record: saved, artifactPath, segmentCount: saved.segments.length, transcriptText };
+}
+
+/**
+ * Replace a meeting's streamed segments with the canonical, real-name
+ * segments parsed from Recall's async transcript download. Rewrites
+ * the markdown artifact in place using the same layout so downstream
+ * readers don't notice the swap beyond "speakers now have real names
+ * and there's no gap where streaming dropped."
+ *
+ * Returns the updated record + the artifact path so the caller (the
+ * background backfill task) can log it.
+ */
+export function applyCanonicalTranscript(
+  record: RecallMeetingRecord,
+  canonicalSegments: RecallTranscriptSegment[],
+): { record: RecallMeetingRecord; artifactPath?: string } {
+  const updated: RecallMeetingRecord = {
+    ...record,
+    segments: canonicalSegments,
+    canonicalStatus: 'ready',
+    canonicalUpdatedAt: nowIso(),
+    canonicalError: undefined,
+  };
+
+  let artifactPath = record.artifactPath;
+  if (canonicalSegments.length > 0 && !isSyntheticRecallCapture(updated)) {
+    if (!artifactPath) artifactPath = defaultArtifactPath(updated);
+    const body = renderTranscriptArtifactBody(updated, 'recall.ai async transcript (canonical)');
+    writeFileSync(artifactPath, body, 'utf-8');
+    updated.artifactPath = artifactPath;
+  }
+
+  const saved = saveMeetingRecord(updated);
+  return { record: saved, artifactPath };
+}
+
+/**
+ * Internal helper: mark a meeting record's canonical-transcript backfill
+ * as failed or timed out without touching its segments. The streamed
+ * transcript stays as the persisted artifact — no regression vs. today.
+ */
+export function markCanonicalTranscriptIncomplete(
+  record: RecallMeetingRecord,
+  status: 'timed_out' | 'failed',
+  errorMessage?: string,
+): RecallMeetingRecord {
+  return saveMeetingRecord({
+    ...record,
+    canonicalStatus: status,
+    canonicalUpdatedAt: nowIso(),
+    canonicalError: errorMessage,
+  });
+}
+
+/** Load a meeting record by windowId or recordingId. Exported so the
+ *  backfill background task and the dashboard route can both find a
+ *  record without knowing which key matched. */
+export function findRecallMeetingRecord(opts: { windowId?: string; recordingId?: string }): RecallMeetingRecord | null {
+  if (opts.recordingId) {
+    const byRec = readMeetingRecordFile(recordPath(opts.recordingId));
+    if (byRec) return byRec;
+  }
+  if (opts.windowId) {
+    return readMeetingRecordFile(recordPath(opts.windowId));
+  }
+  return null;
 }
 
 /**

@@ -24,24 +24,40 @@ import { findSafeCliCommand } from '../runtime/cli-discovery.js';
  * Computer tools compute `insideWorkspace` per-call from the user's
  * `path` / `cwd` argument and pass it through the factory.
  */
-function inputIsInsideWorkspace(toolName: string, input: unknown): boolean {
-  if (!input || typeof input !== 'object') return false;
+function resolveTargetPath(toolName: string, input: unknown): string | null {
+  if (!input || typeof input !== 'object') return null;
   const obj = input as Record<string, unknown>;
   const target = toolName === 'write_file'
     ? (typeof obj.path === 'string' ? obj.path : '')
     : (typeof obj.cwd === 'string' && obj.cwd ? obj.cwd : process.cwd());
-  if (!target) return false;
+  if (!target) return null;
   try {
-    const resolved = path.resolve(expandHome(target));
-    return workspaceRoots().some((root) => isInside(root, resolved));
+    return path.resolve(expandHome(target));
   } catch {
-    return false;
+    return null;
   }
+}
+
+function inputIsInsideWorkspace(toolName: string, input: unknown): boolean {
+  const resolved = resolveTargetPath(toolName, input);
+  if (!resolved) return false;
+  // Auto-approve hint uses the narrow user-workspace list (no $HOME).
+  // The hard-boundary check in resolveAllowedPath() still uses the
+  // wider workspaceRoots() so explicit "save to ~/Documents/foo.txt"
+  // calls succeed once approved.
+  return userWorkspaceRoots().some((root) => isInside(root, resolved));
+}
+
+function inputIsInsideAgentOwnedDir(toolName: string, input: unknown): boolean {
+  const resolved = resolveTargetPath(toolName, input);
+  if (!resolved) return false;
+  return agentOwnedRoots().some((root) => isInside(root, resolved));
 }
 
 function needsApprovalUnlessInPlanScope(toolName: string) {
   return needsApprovalFromTaxonomy(toolName, {
     computeInsideWorkspace: (input) => inputIsInsideWorkspace(toolName, input),
+    computeInsideAgentOwnedDir: (input) => inputIsInsideAgentOwnedDir(toolName, input),
   });
 }
 
@@ -157,17 +173,38 @@ function expandHome(input: string): string {
   return input;
 }
 
+function agentOwnedRoots(): string[] {
+  // BASE_DIR (~/.clementine-next) is the agent's own data directory:
+  // vault, harness.db, logs, state, meeting-capture/analysis/ outputs.
+  // Writing here is bookkeeping the agent OWNS — not a user-visible
+  // action — so it auto-approves regardless of scope.
+  return [path.resolve(BASE_DIR)];
+}
+
+function userWorkspaceRoots(): string[] {
+  // The "workspace" scope means: dirs the user explicitly opted into.
+  // We include BASE_DIR (agent's own) and the daemon's cwd for safety,
+  // PLUS whatever the user listed in WORKSPACE_DIRS. We deliberately
+  // do NOT include $HOME — that's reserved for the hard-boundary list
+  // (workspaceRoots) so explicit "write to ~/Documents" still works
+  // with approval, but auto-approve under "workspace" scope is limited
+  // to dirs the user actually declared.
+  const roots = [process.cwd(), BASE_DIR, ...getWorkspaceDirs()]
+    .map((entry) => path.resolve(expandHome(entry)));
+  return [...new Set(roots)];
+}
+
 function workspaceRoots(): string[] {
-  // $HOME is included so the agent can operate on any user file (the
-  // natural workspace for "do work for me"). The path-allowlist check
-  // is a soft barrier, not a TCC defense — TCC enforcement happens at
-  // the OS level when child processes try to read protected dirs. The
-  // tool description in run_shell_command steers the model away from
+  // Hard-boundary list used by resolveAllowedPath(). $HOME is included
+  // so the agent CAN write to ~/Documents/foo.txt when the user
+  // explicitly asks (with approval). TCC enforcement happens at the OS
+  // level when child processes try to read protected dirs. The tool
+  // description in run_shell_command steers the model away from
   // ~/Desktop, ~/Documents, ~/Downloads, and iCloud Drive (which TCC
   // blocks for sandboxed-app children); the model is expected to honor
-  // that guidance.
-  const roots = [os.homedir(), process.cwd(), BASE_DIR, ...getWorkspaceDirs()]
-    .map((entry) => path.resolve(expandHome(entry)));
+  // that guidance. The auto-approve hint uses userWorkspaceRoots()
+  // (narrower) so "workspace" scope means what the dropdown says.
+  const roots = [os.homedir(), ...userWorkspaceRoots()];
   return [...new Set(roots)];
 }
 

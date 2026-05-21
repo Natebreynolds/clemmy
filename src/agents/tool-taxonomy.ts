@@ -351,6 +351,14 @@ export interface ApprovalDecisionInput {
    */
   insideWorkspaceHint?: boolean;
   /**
+   * Optional: caller already computed whether the args resolve to a
+   * path inside the agent's OWN data directory (~/.clementine-next/).
+   * When true, the call auto-approves regardless of scope — the agent
+   * writing to its own vault/state/analysis dirs is bookkeeping, not a
+   * user-visible action. Not relevant for `send` (network).
+   */
+  insideAgentOwnedDirHint?: boolean;
+  /**
    * Optional: even with auto-approve eligibility, force a prompt if the
    * caller has determined this specific invocation is destructive
    * (e.g. a recursive delete or a public broadcast).
@@ -366,6 +374,7 @@ export interface ApprovalDecision {
     | 'admin'
     | 'destructive-hint'
     | 'read-always-auto'
+    | 'agent-owned-dir'
     | 'plan-scope'
     | 'workspace-policy'
     | 'yolo-policy'
@@ -397,6 +406,22 @@ export function decideToolApproval(input: ApprovalDecisionInput): ApprovalDecisi
   }
   if (kind === 'read') {
     return { needsApproval: false, reason: 'read-always-auto', kind };
+  }
+
+  // Writes inside the agent's OWN data directory auto-approve regardless
+  // of scope. Admin + destructive checks above still gate; this only
+  // applies to write/execute on agent-managed paths (vault, state, logs,
+  // meeting-capture/analysis/, etc.). For 'send' (network) there's no
+  // path concept, so the hint is meaningless and ignored.
+  if (kind !== 'send' && input.insideAgentOwnedDirHint) {
+    if (input.sessionId) {
+      recordAutoApproval(
+        input.sessionId,
+        input.toolName,
+        `[agent-owned-dir] kind=${kind} ${summarizeToolArgs(input.toolName, input.args)}`,
+      );
+    }
+    return { needsApproval: false, reason: 'agent-owned-dir', kind };
   }
 
   const policy = loadProactivityPolicy();
@@ -449,12 +474,14 @@ export function needsApprovalFromTaxonomy(
   options: {
     kindHint?: ToolKind;
     computeInsideWorkspace?: (input: unknown) => boolean;
+    computeInsideAgentOwnedDir?: (input: unknown) => boolean;
     isDestructive?: (input: unknown) => boolean;
   } = {},
 ): (runContext: unknown, input: unknown) => Promise<boolean> {
   return async (runContext, input) => {
     const sessionId = extractSessionId(runContext);
     const insideWorkspaceHint = options.computeInsideWorkspace?.(input);
+    const insideAgentOwnedDirHint = options.computeInsideAgentOwnedDir?.(input);
     const isDestructiveHint = options.isDestructive?.(input);
     const { needsApproval } = decideToolApproval({
       sessionId,
@@ -462,6 +489,7 @@ export function needsApprovalFromTaxonomy(
       kindHint: options.kindHint,
       args: input,
       insideWorkspaceHint,
+      insideAgentOwnedDirHint,
       isDestructiveHint,
     });
     return needsApproval;

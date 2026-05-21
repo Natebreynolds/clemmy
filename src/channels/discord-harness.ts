@@ -18,6 +18,7 @@
  *   wins regardless of how many events fired during the debounce.
  */
 import type { Message } from 'discord.js';
+import pino from 'pino';
 import { actionBus } from '../runtime/action-bus.js';
 import { configureHarnessRuntime } from '../runtime/harness/codex-client.js';
 import {
@@ -35,6 +36,16 @@ import { buildOrchestratorAgent } from '../agents/orchestrator.js';
 const EDIT_DEBOUNCE_MS = 2_000;
 const SAFETY_TIMEOUT_MS = 35 * 60_000;
 const MAX_DISCORD_MESSAGE = 1_900;
+
+// Structured logger for Discord edit failures. The previous
+// `catch { }` blocks at the edit sites swallowed errors silently —
+// rate limits, token expiry (Discord interaction tokens die at 15
+// min), network blips — all invisible to the dev + user. With this
+// logger, every edit failure lands in ~/.clementine-next/logs/daemon.log
+// so long-running workflows that go quiet on Discord can be
+// diagnosed instead of guessed at. Pure observability — no behavior
+// change.
+const logger = pino({ name: 'clementine-next.discord-harness' });
 
 /**
  * Per-channel harness session continuity. Without this, every DM
@@ -888,9 +899,15 @@ export async function runDiscordHarnessConversation(opts: {
       } else {
         await handle.edit(renderBody(state));
       }
-    } catch {
+    } catch (err) {
       // Discord can transiently refuse edits (network blip, rate
-      // limit). The next event will retry; nothing fatal.
+      // limit, or — at minute 15+ — interaction-token expiry). The
+      // next event will retry; nothing fatal. Log so long-workflow
+      // failures are diagnosable instead of silent.
+      logger.warn(
+        { err: err instanceof Error ? err.message : String(err), sessionId: session.id, stage: 'flush' },
+        'discord edit failed',
+      );
     }
   };
 
@@ -929,9 +946,14 @@ export async function runDiscordHarnessConversation(opts: {
           await transport.sendFollowup(chunks[i]);
         }
       }
-    } catch {
+    } catch (err) {
       // Edit can transiently fail. Don't crash settle — the user can
-      // re-ping if they don't see the full reply.
+      // re-ping if they don't see the full reply. Log so long-workflow
+      // settle failures are diagnosable instead of silent.
+      logger.warn(
+        { err: err instanceof Error ? err.message : String(err), sessionId: session.id, stage: 'finalFlush' },
+        'discord final edit failed',
+      );
     }
   };
 

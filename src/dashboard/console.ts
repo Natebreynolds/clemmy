@@ -173,6 +173,19 @@ export function renderConsoleHtml(token: string): string {
             <div class="dock-live-info">
               <div class="dock-live-status" data-dock-live-status>tap to talk</div>
               <div class="dock-live-meta" data-dock-live-meta>voice off</div>
+              <!--
+                Record affordance for Recall.ai meeting capture. Lives
+                inside the dock-live info block so it doesn't fight with
+                the voice orb (which stays as the dedicated voice
+                control). The button toggles between REC and STOP and is
+                hidden when Recall isn't enabled / initialized. State +
+                visibility are driven by refreshDockLive() reading
+                window.clemmy.recallStatus().
+              -->
+              <button type="button" class="dock-live-rec" data-dock-live-rec hidden>
+                <span class="dock-live-rec-dot" aria-hidden="true"></span>
+                <span data-dock-live-rec-label>RECORD MEETING</span>
+              </button>
             </div>
           </div>
         </div>
@@ -635,16 +648,11 @@ export function renderConsoleHtml(token: string): string {
             <ol class="wf-list" data-wf-list>
               <li class="empty">— loading —</li>
             </ol>
-
-            <!-- Cron jobs (CRON.md). Separate abstraction from workflows
-                 but lives in the same "scheduled work" mental bucket. -->
-            <div class="wf-list-head wf-list-head-cron">
-              <span>SCHEDULED JOBS</span>
-              <span class="wf-list-meta" data-wf-cron-count>—</span>
-            </div>
-            <ol class="wf-list wf-cron-list" data-wf-cron-list>
-              <li class="empty">— loading —</li>
-            </ol>
+            <!-- "SCHEDULED JOBS" (legacy crons) panel removed 2026-05-21.
+                 Crons are being migrated to workflows so users have one
+                 mental model: every recurring action is a workflow,
+                 every one-off is a task. The legacy panel implied two
+                 parallel systems and trained users to expect both. -->
           </aside>
 
           <!-- Editor (middle) -->
@@ -866,7 +874,7 @@ export function renderConsoleHtml(token: string): string {
               <span class="hub-block-title">Skill / CLI Installer</span>
               <span class="hub-block-meta" data-hub-installer-meta>approved commands only</span>
             </div>
-            <p class="hub-block-intro">Advanced and optional. Install trusted CLIs or skill repos without opening Terminal. This runner only accepts single install commands such as <code>npm install -g package</code>, <code>brew install formula</code>, <code>uv tool install package</code>, <code>pipx install package</code>, or GitHub repo clones.</p>
+            <p class="hub-block-intro">Advanced and optional. Install trusted CLI tools (gh, sf, etc.) without opening Terminal. Accepts single install commands such as <code>npm install -g package</code>, <code>brew install formula</code>, <code>uv tool install package</code>, <code>pipx install package</code>, or <code>git clone https://github.com/org/repo</code>. <strong>For SKILL installs (Hallmark, etc.) use Skills → Install Skill — that path drops the skill into <code>~/.clementine-next/skills/</code> properly.</strong></p>
             <div class="hub-apps-controls" data-hub-installer-controls>
               <input type="text" data-hub-install-command placeholder="npm install -g some-cli" />
               <button data-hub-install-run>RUN INSTALL</button>
@@ -1161,12 +1169,12 @@ export function renderConsoleHtml(token: string): string {
                   <label>AUTO-APPROVE SCOPE</label>
                   <select name="autoApproveScope" data-policy-field>
                     <option value="strict">strict — every shell/write asks (default)</option>
-                    <option value="workspace">workspace — auto inside ~/Desktop, ~/Documents, ~/Developer, etc.</option>
+                    <option value="workspace">workspace — auto inside your configured project dirs</option>
                     <option value="yolo">YOLO — auto everywhere (only the danger denylist applies)</option>
                   </select>
                   <span class="hint" style="display:block; margin-top: 4px; color: var(--fg-3); font-size: 10.5px; line-height: 1.5;">
-                    Plan-scoped approvals (15 min) always work on top of this. The hard denylist (<code>rm -rf /</code>, <code>sudo</code>, fork bombs, disk wipes) is enforced regardless.
-                    <strong style="color: var(--accent-warn);">YOLO trusts the agent to run anywhere the user can</strong> — use when you want zero friction.
+                    Clementine's own data dir (<code>~/.clementine-next/</code>) always auto-approves regardless of scope — that's bookkeeping, not a user-visible action. <strong>workspace</strong> additionally auto-approves writes inside the dirs you listed in <code>WORKSPACE_DIRS</code>. Plan-scoped approvals (15 min) always work on top. The hard denylist (<code>rm -rf /</code>, <code>sudo</code>, fork bombs, disk wipes) is enforced regardless.
+                    <strong style="color: var(--accent-warn);">YOLO trusts the agent anywhere the user can write</strong> — use when you want zero friction.
                   </span>
                 </div>
                 <div class="settings-grid-2">
@@ -1901,6 +1909,41 @@ body {
   letter-spacing: 0.1em;
   text-transform: uppercase;
   margin-top: 2px;
+}
+/* Record button in the dock-live card. Distinct from the orb (which
+   is voice). Red dot indicates idle-ready; pulses when recording. */
+.dock-live-rec {
+  margin-top: 6px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  font-size: 9.5px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  font-weight: 600;
+  background: transparent;
+  color: var(--accent-fail, #ff5a5f);
+  border: 1px solid var(--accent-fail, #ff5a5f);
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+.dock-live-rec:hover { background: var(--accent-fail, #ff5a5f); color: var(--bg-0); }
+.dock-live-rec:disabled { opacity: 0.55; cursor: progress; }
+.dock-live-rec[hidden] { display: none; }
+.dock-live-rec-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--accent-fail, #ff5a5f);
+  box-shadow: 0 0 5px color-mix(in srgb, var(--accent-fail, #ff5a5f) 60%, transparent);
+}
+.dock-live.live .dock-live-rec {
+  background: var(--accent-fail, #ff5a5f);
+  color: var(--bg-0);
+}
+.dock-live.live .dock-live-rec-dot { animation: dock-live-rec-pulse 1.2s ease-in-out infinite; }
+@keyframes dock-live-rec-pulse {
+  0%, 100% { opacity: 0.45; transform: scale(1); }
+  50%      { opacity: 1; transform: scale(1.25); }
 }
 
 /* RECENT */
@@ -5953,6 +5996,7 @@ body {
 .hub-app-pill.active { color: var(--accent-2); border-color: var(--accent-2); }
 .hub-app-pill.pending { color: var(--accent-warn); border-color: var(--accent-warn); }
 .hub-app-pill.available { color: var(--fg-3); border-color: var(--line); }
+.hub-app-pill.needs-setup { color: var(--accent-warn); border-color: var(--accent-warn); }
 .hub-app-pill.failed, .hub-app-pill.disconnected { color: var(--accent-fail); border-color: var(--accent-fail); }
 
 /* CLI catalog — action row + connected pills */
@@ -6022,6 +6066,52 @@ body {
 .hub-app-card-actions .connect:hover { background: var(--accent); color: var(--bg-0); }
 .hub-app-card-actions .disconnect { color: var(--accent-fail); border-color: var(--accent-fail); }
 .hub-app-card-actions .disconnect:hover { background: var(--accent-fail); color: var(--bg-0); }
+
+/* ─ Clementine-native auth-setup modal (replaces Composio's broken popup for API_KEY toolkits) ─ */
+.clemmy-modal-backdrop {
+  position: fixed; inset: 0;
+  background: rgba(0,0,0,0.55);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 9999;
+}
+.clemmy-modal {
+  background: var(--bg-1); color: var(--fg);
+  border: 1px solid var(--line); border-radius: 8px;
+  padding: 20px 22px;
+  min-width: 380px; max-width: 480px;
+  box-shadow: 0 18px 50px rgba(0,0,0,0.35);
+  font-family: inherit;
+}
+.clemmy-modal-title {
+  font-size: 14px; letter-spacing: 0.06em;
+  text-transform: uppercase; color: var(--fg); margin-bottom: 4px;
+}
+.clemmy-modal-sub {
+  font-size: 12px; color: var(--fg-3); margin-bottom: 16px; line-height: 1.45;
+}
+.clemmy-modal label { display: block; font-size: 11px; color: var(--fg-3); letter-spacing: 0.04em; margin: 10px 0 4px; }
+.clemmy-modal input {
+  width: 100%; box-sizing: border-box;
+  background: var(--bg-0); color: var(--fg); border: 1px solid var(--line);
+  padding: 8px 10px; font: inherit; font-size: 12px; border-radius: 4px; outline: none;
+}
+.clemmy-modal input:focus { border-color: var(--accent); }
+.clemmy-modal-actions {
+  margin-top: 18px; display: flex; gap: 8px; justify-content: flex-end;
+}
+.clemmy-modal-actions button {
+  font: inherit; font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase;
+  padding: 8px 14px; border: 1px solid var(--line); background: transparent;
+  color: var(--fg); border-radius: 4px; cursor: pointer;
+}
+.clemmy-modal-actions .submit { color: var(--accent); border-color: var(--accent); }
+.clemmy-modal-actions .submit:hover { background: var(--accent); color: var(--bg-0); }
+.clemmy-modal-actions .submit:disabled { opacity: 0.5; cursor: not-allowed; }
+.clemmy-modal-error {
+  margin-top: 12px; font-size: 12px; color: var(--accent-fail);
+  background: rgba(255,80,80,0.08); border: 1px solid var(--accent-fail);
+  padding: 8px 10px; border-radius: 4px;
+}
 
 /* ─ MCP servers list ─ */
 .hub-mcp-list {
@@ -8027,8 +8117,16 @@ const CONSOLE_JS = `
             '</div>',
           ].join('')
         : '';
+      // Drill-target: if the item carries a sessionId or runId, attach
+      // it as a data attribute. The click handler at line ~8693 reads
+      // these and, AFTER switching panels, loads the inspector detail
+      // so the user lands directly on the specific approval/run that
+      // brought them here — not on a generic "everything" list.
+      const targetSessionAttr = item.targetSessionId
+        ? ' data-home-target-session-id="' + escMem(item.targetSessionId) + '"'
+        : '';
       return [
-      '<div class="home-item command-item" data-tools-jump="' + escMem(item.panel || 'activity') + '">',
+      '<div class="home-item command-item" data-tools-jump="' + escMem(item.panel || 'activity') + '"' + targetSessionAttr + '>',
       '  <span class="home-item-kind ' + escMem(item.kind || 'task') + '">' + escMem(String(item.kind || 'item').toUpperCase()) + '</span>',
       '  <div style="flex:1; min-width:0;">',
       '    <div class="home-item-text">' + escMem(item.title || '') + '</div>',
@@ -8722,7 +8820,33 @@ const CONSOLE_JS = `
     const jump = target.closest('[data-tools-jump]');
     if (!jump) return;
     event.preventDefault();
-    switchPanel(jump.getAttribute('data-tools-jump'));
+    const panel = jump.getAttribute('data-tools-jump');
+    switchPanel(panel);
+    // Drill-link: if the clicked NEEDS-YOU item carries a specific
+    // session/run id, load that exact item in the destination panel's
+    // inspector after the panel renders. setTimeout lets the panel
+    // DOM mount first so els.runList exists. Without this, users
+    // landed on Activity with no anchor to the approval they clicked
+    // (visibility gap surfaced 2026-05-21).
+    const targetSessionId = jump.getAttribute('data-home-target-session-id');
+    if (targetSessionId && panel === 'activity') {
+      setTimeout(() => {
+        try {
+          selectedRunId = targetSessionId;
+          if (typeof loadDetail === 'function') loadDetail(targetSessionId);
+          if (els && els.runList) {
+            Array.from(els.runList.querySelectorAll('li.run')).forEach((el) => {
+              el.classList.toggle('selected', el.getAttribute('data-run-id') === targetSessionId);
+            });
+            // Scroll the selected row into view if it exists.
+            const selectedLi = els.runList.querySelector('li.run.selected');
+            if (selectedLi && typeof selectedLi.scrollIntoView === 'function') {
+              selectedLi.scrollIntoView({ block: 'center', behavior: 'smooth' });
+            }
+          }
+        } catch (err) { console.error('drill-link failed:', err); }
+      }, 80);
+    }
   });
 
   // ─── Memory panel ─────────────────────────────────────────────
@@ -8752,6 +8876,153 @@ const CONSOLE_JS = `
   function escMem(s) {
     if (s === null || s === undefined) return '';
     return String(s).replace(/[<>&]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]));
+  }
+
+  // Clementine-native auth-setup modal. Replaces Composio's broken
+  // hosted popup for API_KEY toolkits (firecrawl, apify). Renders
+  // toolkit-specific fields + descriptions + "where do I get this"
+  // link, pulled from /api/composio/toolkits/:slug/setup-meta
+  // (which proxies Composio's per-toolkit metadata).
+  //
+  // Returns a Promise that resolves to { apiKey, baseUrl } on submit
+  // or null on cancel.
+  async function showApiKeyModal(slug, toolkitName) {
+    // Fetch the toolkit's per-field metadata so we can render proper
+    // labels + descriptions + the right help link, instead of a
+    // generic "API key" prompt that leaves users hunting for where
+    // to obtain the key.
+    let meta = null;
+    try {
+      const r = await fetch(withToken('/api/composio/toolkits/' + encodeURIComponent(slug) + '/setup-meta'));
+      if (r.ok) meta = await r.json();
+    } catch { /* fall back to generic prompt */ }
+
+    const displayName = (meta && meta.name) || toolkitName || slug;
+    const description = (meta && meta.description) || null;
+    const appUrl = (meta && meta.appUrl) || null;
+    const authHintUrl = (meta && meta.authHintUrl) || null;
+    const authGuideUrl = (meta && meta.authGuideUrl) || null;
+
+    // Build a help-link strip from whatever Composio surfaced.
+    const helpLinks = [];
+    if (authHintUrl) helpLinks.push('<a href="' + escMem(authHintUrl) + '" target="_blank" rel="noopener noreferrer">Composio setup guide ↗</a>');
+    if (authGuideUrl && authGuideUrl !== authHintUrl) helpLinks.push('<a href="' + escMem(authGuideUrl) + '" target="_blank" rel="noopener noreferrer">Auth guide ↗</a>');
+    if (appUrl) helpLinks.push('Get your API key from <a href="' + escMem(appUrl) + '" target="_blank" rel="noopener noreferrer">' + escMem(displayName) + ' ↗</a>');
+
+    return new Promise((resolve) => {
+      const backdrop = document.createElement('div');
+      backdrop.className = 'clemmy-modal-backdrop';
+      backdrop.innerHTML = [
+        '<div class="clemmy-modal" role="dialog" aria-modal="true">',
+        '  <div class="clemmy-modal-title">Connect ' + escMem(displayName) + '</div>',
+        '  <div class="clemmy-modal-sub">',
+        description ? escMem(description) + '<br><br>' : '',
+        '    Paste your API key below — we send it to Composio over HTTPS and never store the value locally.',
+        helpLinks.length > 0 ? '<br><br>' + helpLinks.join(' · ') : '',
+        '  </div>',
+        '  <label for="clemmy-modal-apikey">API key <span style="color:var(--accent-fail);">*</span></label>',
+        '  <input type="password" id="clemmy-modal-apikey" autocomplete="off" spellcheck="false" placeholder="paste your API key" />',
+        '  <label for="clemmy-modal-baseurl">Base URL <span style="color:var(--fg-3);font-weight:normal;">(optional — leave blank for default)</span></label>',
+        '  <input type="text" id="clemmy-modal-baseurl" autocomplete="off" spellcheck="false" placeholder="' + escMem((meta && meta.fields && (meta.fields.find((f) => f.name === 'full' || f.name === 'base_url') || {}).default) || 'https://api.example.com') + '" />',
+        '  <div class="clemmy-modal-error" data-clemmy-modal-error hidden></div>',
+        '  <div class="clemmy-modal-actions">',
+        '    <button type="button" data-clemmy-modal-cancel>Cancel</button>',
+        '    <button type="button" class="submit" data-clemmy-modal-submit>Connect</button>',
+        '  </div>',
+        '</div>',
+      ].join('');
+      document.body.appendChild(backdrop);
+      const apikeyEl = backdrop.querySelector('#clemmy-modal-apikey');
+      const baseurlEl = backdrop.querySelector('#clemmy-modal-baseurl');
+      const errorEl = backdrop.querySelector('[data-clemmy-modal-error]');
+      const cancelBtn = backdrop.querySelector('[data-clemmy-modal-cancel]');
+      const submitBtn = backdrop.querySelector('[data-clemmy-modal-submit]');
+      const cleanup = () => { try { document.body.removeChild(backdrop); } catch {} };
+      const finishWith = (value) => { cleanup(); resolve(value); };
+      cancelBtn.addEventListener('click', () => finishWith(null));
+      backdrop.addEventListener('click', (e) => { if (e.target === backdrop) finishWith(null); });
+      document.addEventListener('keydown', function escHandler(e) {
+        if (e.key === 'Escape') { document.removeEventListener('keydown', escHandler); finishWith(null); }
+      });
+      const onSubmit = () => {
+        const apiKey = (apikeyEl.value || '').trim();
+        if (!apiKey) {
+          errorEl.textContent = 'API key is required.';
+          errorEl.hidden = false;
+          apikeyEl.focus();
+          return;
+        }
+        errorEl.hidden = true;
+        finishWith({ apiKey, baseUrl: (baseurlEl.value || '').trim() });
+      };
+      submitBtn.addEventListener('click', onSubmit);
+      // Enter in either field submits.
+      [apikeyEl, baseurlEl].forEach((el) => {
+        el.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter') { e.preventDefault(); onSubmit(); }
+        });
+      });
+      setTimeout(() => apikeyEl.focus(), 50);
+    });
+  }
+
+  // Stricter escape that also handles quotes — needed when the escaped
+  // text will land inside an HTML attribute value (href, title, etc).
+  function escAttr(s) {
+    if (s === null || s === undefined) return '';
+    return String(s).replace(/[<>&"']/g, (c) => ({
+      '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;', "'": '&#39;',
+    }[c]));
+  }
+
+  // Render plain text as HTML with bare URLs auto-linked. Used for the
+  // dashboard chat dock so Clementine's replies containing Google Sheet
+  // links, GitHub PR URLs, etc. are clickable instead of forcing the
+  // user to copy-paste.
+  //
+  // Implementation note: CONSOLE_JS is a TS template literal, which
+  // means a regex literal "/\\s+/" gets its escape stripped at
+  // template-eval time and parses as "/s+/" — completely changing
+  // meaning. Worse, "/[\\]]/" becomes "/[]]/" and throws a SyntaxError
+  // that halts ALL dashboard JS (seen 2026-05-21, dashboard froze).
+  //
+  // Sidestep entirely by using pure string operations — no regex, no
+  // escape ambiguity. Performance is fine; chat replies are short.
+  function renderTextWithLinks(text) {
+    if (text === null || text === undefined) return '';
+    const raw = String(text);
+    // Separator chars: space, tab(9), LF(10), CR(13), <, >, double-quote, single-quote.
+    // String.fromCharCode lets us include control chars without escape sequences.
+    const SEPS = ' ' + String.fromCharCode(9, 10, 13) + '<>"' + String.fromCharCode(39);
+    const TRAILING_PUNCT = '.,;:!?)';
+    function isSep(c) { return SEPS.indexOf(c) >= 0; }
+    function startsURL(s, i) {
+      if (s.substring(i, i + 8) === 'https://') return 'https://';
+      if (s.substring(i, i + 7) === 'http://') return 'http://';
+      if (s.substring(i, i + 4) === 'www.') {
+        if (i === 0 || isSep(s.charAt(i - 1))) return 'www.';
+      }
+      return null;
+    }
+    let out = '';
+    let i = 0;
+    while (i < raw.length) {
+      const prefix = startsURL(raw, i);
+      if (prefix) {
+        let end = i + prefix.length;
+        while (end < raw.length && !isSep(raw.charAt(end))) end++;
+        // Strip trailing punctuation so "see https://x.com." gives a clean link.
+        while (end > i + prefix.length && TRAILING_PUNCT.indexOf(raw.charAt(end - 1)) >= 0) end--;
+        const url = raw.substring(i, end);
+        const href = url.charAt(0) === 'w' ? 'https://' + url : url;
+        out += '<a href="' + escAttr(href) + '" target="_blank" rel="noopener noreferrer">' + escMem(url) + '</a>';
+        i = end;
+      } else {
+        out += escMem(raw.charAt(i));
+        i++;
+      }
+    }
+    return out;
   }
 
   function fmtMtime(ms) {
@@ -12286,7 +12557,13 @@ const CONSOLE_JS = `
 
   function setChatTurnText(turn, text) {
     const body = turn?.querySelector?.('[data-home-chat-turn-text]');
-    if (body) body.textContent = text || '';
+    if (!body) return;
+    // Use innerHTML with safe escape + URL detection so Clementine's
+    // replies that contain links (Sheet URLs, GitHub PRs, etc.) render
+    // as clickable anchors instead of plain text. The history-capture
+    // sites still read body.textContent, which strips the <a> tags
+    // back to the raw URL — exactly the right behavior for transcript.
+    body.innerHTML = renderTextWithLinks(text || '');
   }
 
   function setChatTurnApproval(turn, approval, sessionId, options) {
@@ -12512,9 +12789,12 @@ const CONSOLE_JS = `
     if (!thread) return;
     const turn = document.createElement('div');
     turn.className = 'home-chat-turn ' + role;
+    // Use the link-aware renderer for the initial body so the first
+    // assistant reply that lands with a URL is already clickable —
+    // no need to wait for a follow-up setChatTurnText.
     turn.innerHTML =
       '<span class="home-chat-role">' + (role === 'user' ? 'YOU' : 'CLEMENTINE') + '</span>' +
-      '<div data-home-chat-turn-text>' + escMem(text) + '</div>' +
+      '<div data-home-chat-turn-text>' + renderTextWithLinks(text) + '</div>' +
       '<span class="home-chat-stream-status" data-home-chat-turn-status></span>';
     thread.appendChild(turn);
     thread.scrollTop = thread.scrollHeight;
@@ -13509,11 +13789,23 @@ const CONSOLE_JS = `
               : statusKey === 'pending' || statusKey === 'initializing' ? 'pending'
               : statusKey === 'failed' ? 'failed'
               : 'disconnected';
+            // Distinguishing meta — needed when multiple connections share
+            // the same toolkit slug (e.g. 1 ACTIVE outlook + 2 EXPIRED).
+            // Without these, every duplicate card looked identical and
+            // users couldn't tell which one to disconnect (visibility
+            // gap surfaced 2026-05-21 with 3 outlook entries).
+            const shortConnId = c.connectionId ? String(c.connectionId).slice(-8) : '';
+            const createdAgo = c.createdAt ? fmtMtime(new Date(c.createdAt).getTime()) : '';
+            const metaParts = [];
+            if (c.userId) metaParts.push(c.userId);
+            if (shortConnId) metaParts.push('id …' + shortConnId);
+            if (createdAgo) metaParts.push(createdAgo);
+            const metaLine = metaParts.join(' · ');
             return [
               '<div class="hub-app-card" data-hub-app-slug="' + escMem(slug) + '">',
               '  <div class="hub-app-name">' + escMem(friendlyAppName(slug)) + '</div>',
               '  <span class="hub-app-pill ' + pill + '">' + escMem((c.status || 'ACTIVE').toUpperCase()) + '</span>',
-              c.userId ? '  <div class="hub-app-meta">' + escMem(c.userId) + '</div>' : '',
+              metaLine ? '  <div class="hub-app-meta">' + escMem(metaLine) + '</div>' : '',
               '  <div class="hub-app-card-actions">',
               c.connectionId ? '    <button class="disconnect" data-hub-app-disconnect="' + escMem(slug) + '" data-conn="' + escMem(c.connectionId) + '">DISCONNECT</button>' : '',
               '  </div>',
@@ -13525,16 +13817,30 @@ const CONSOLE_JS = `
           .filter((t) => !connectedSlugs.has(t.slug))
           .filter((t) => !q || (t.slug || '').toLowerCase().includes(q) || (t.name || '').toLowerCase().includes(q))
           .slice(0, q ? 80 : 16)
-          .map((t) => [
+          .map((t) => {
+            // hasAuthConfig comes from the Composio dashboard snapshot —
+            // true when Composio has a project-level auth_config for the
+            // toolkit, false when it'd need to be set up first.
+            // Without this distinction, the user clicks CONNECT, the
+            // hosted OAuth page errors out with "Something went wrong",
+            // and they have no path forward (seen 2026-05-21 with apify
+            // + firecrawl).
+            const setupReady = t.hasAuthConfig !== false;
+            const pillCls = setupReady ? 'available' : 'needs-setup';
+            const pillTxt = setupReady ? 'AVAILABLE' : 'NEEDS SETUP';
+            const btnLabel = setupReady ? 'CONNECT' : 'SET UP AUTH';
+            const btnClass = setupReady ? 'connect' : 'connect needs-setup';
+            return [
             '<div class="hub-app-card">',
             '  <div class="hub-app-name">' + escMem(t.name || friendlyAppName(t.slug)) + '</div>',
-            '  <span class="hub-app-pill available">AVAILABLE</span>',
+            '  <span class="hub-app-pill ' + pillCls + '">' + pillTxt + '</span>',
             t.description ? '  <div class="hub-app-meta">' + escMem(t.description.slice(0, 80)) + '</div>' : '',
             '  <div class="hub-app-card-actions">',
-            '    <button class="connect" data-hub-app-connect="' + escMem(t.slug) + '">CONNECT</button>',
+            '    <button class="' + btnClass + '" data-hub-app-connect="' + escMem(t.slug) + '" data-hub-app-needs-setup="' + (setupReady ? '0' : '1') + '">' + btnLabel + '</button>',
             '  </div>',
             '</div>',
-          ].join(''));
+            ].join('');
+          });
         const out = [...connRender, ...availRender];
         listEl.innerHTML = out.length > 0
           ? out.join('')
@@ -13544,6 +13850,99 @@ const CONSOLE_JS = `
         listEl.querySelectorAll('[data-hub-app-connect]').forEach((btn) => {
           btn.addEventListener('click', async () => {
             const slug = btn.getAttribute('data-hub-app-connect');
+            const needsSetup = btn.getAttribute('data-hub-app-needs-setup') === '1';
+            // Toolkits without an auth_config in this Composio project
+            // can't complete an OAuth dance. For API_KEY-mode toolkits
+            // (firecrawl, apify, ...), Composio's hosted popup throws
+            // "Something went wrong" — we sidestep it by collecting the
+            // API key in a Clementine-native prompt and creating the
+            // auth_config + connection via Composio's REST API directly.
+            if (needsSetup) {
+              const name = friendlyAppName(slug);
+              // Fetch the toolkit's auth scheme so we route to the right
+              // setup flow (API_KEY → in-app modal; OAUTH2 → auto-create
+              // composio-managed config + OAuth window; other → fall
+              // back to platform.composio.dev). Without this, Gmail and
+              // other OAuth toolkits hit my api-key modal which makes
+              // no sense (no API key exists for OAuth).
+              let metaForRouting = null;
+              try {
+                const r = await fetch(withToken('/api/composio/toolkits/' + encodeURIComponent(slug) + '/setup-meta'));
+                if (r.ok) metaForRouting = await r.json();
+              } catch { /* fall back to api-key path */ }
+
+              const scheme = (metaForRouting && metaForRouting.authScheme) || 'API_KEY';
+
+              if (scheme === 'OAUTH2' || scheme === 'OAUTH1') {
+                // Auto-create the composio-managed auth_config, then
+                // immediately call /authorize to open the OAuth window.
+                btn.textContent = 'STARTING OAUTH …';
+                try {
+                  const setupRes = await fetch(withToken('/api/composio/toolkits/' + encodeURIComponent(slug) + '/setup-oauth'), { method: 'POST' });
+                  if (!setupRes.ok) {
+                    const j = await setupRes.json().catch(() => ({}));
+                    alert('OAuth setup failed: ' + (j.error || setupRes.status) + '\\n\\nIf this toolkit uses bring-your-own credentials, set them up at platform.composio.dev/auth-configs.');
+                    btn.textContent = 'SET UP AUTH';
+                    return;
+                  }
+                  // Now trigger the actual OAuth flow (opens Composio's OAuth window).
+                  const authRes = await fetch(withToken('/api/composio/toolkits/' + encodeURIComponent(slug) + '/authorize'), { method: 'POST' });
+                  const authJson = await authRes.json().catch(() => ({}));
+                  if (!authRes.ok) {
+                    alert('Authorize failed: ' + (authJson.error || authRes.status));
+                    btn.textContent = 'SET UP AUTH';
+                    return;
+                  }
+                  if (authJson.redirectUrl || authJson.url) {
+                    window.open(authJson.redirectUrl || authJson.url, '_blank');
+                  }
+                  // Poll for connection a few times so the card flips
+                  // from NEEDS SETUP → ACTIVE once OAuth completes.
+                  setTimeout(() => refreshHubApps(), 3000);
+                  setTimeout(() => refreshHubApps(), 10_000);
+                } catch (err) {
+                  alert('OAuth setup failed: ' + (err.message || err));
+                  btn.textContent = 'SET UP AUTH';
+                }
+                return;
+              }
+
+              if (scheme !== 'API_KEY') {
+                // BASIC, BEARER_TOKEN, etc. — open the platform page so
+                // the user configures it there. We can't easily support
+                // every scheme inline.
+                if (confirm(name + ' uses ' + scheme + ' authentication which isn\\'t supported inline yet. Open the Composio auth-configs page to set it up there?')) {
+                  window.open('https://platform.composio.dev/auth-configs', '_blank');
+                }
+                return;
+              }
+
+              // API_KEY path — Clementine-native modal.
+              const result = await showApiKeyModal(slug, name);
+              if (!result) return; // user cancelled
+              btn.textContent = 'CONNECTING …';
+              try {
+                const r = await fetch(withToken('/api/composio/toolkits/' + encodeURIComponent(slug) + '/setup-api-key'), {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ apiKey: result.apiKey, baseUrl: result.baseUrl }),
+                });
+                const j = await r.json().catch(() => ({}));
+                if (!r.ok) {
+                  alert('Connection failed: ' + (j.error || r.status));
+                  btn.textContent = 'SET UP AUTH';
+                  return;
+                }
+                // Refresh to flip the card from NEEDS SETUP → ACTIVE.
+                await fetch(withToken('/api/composio/refresh'), { method: 'POST' });
+                await refreshHubApps();
+              } catch (err) {
+                alert('Setup failed: ' + (err.message || err));
+                btn.textContent = 'SET UP AUTH';
+              }
+              return;
+            }
+            const origLabel = btn.textContent || 'CONNECT';
             btn.textContent = 'OPENING …';
             try {
               const r = await fetch(withToken('/api/composio/toolkits/' + encodeURIComponent(slug) + '/authorize'), { method: 'POST' });
@@ -13556,7 +13955,7 @@ const CONSOLE_JS = `
                 } else {
                   alert('Connect failed: ' + (j.error || r.status));
                 }
-                btn.textContent = 'CONNECT';
+                btn.textContent = origLabel;
                 return;
               }
               if (j.redirectUrl || j.url) {
@@ -13565,7 +13964,7 @@ const CONSOLE_JS = `
               setTimeout(() => refreshHubApps(), 2000);
             } catch (err) {
               alert('Connect failed: ' + (err.message || err));
-              btn.textContent = 'CONNECT';
+              btn.textContent = origLabel;
             }
           });
         });
@@ -13573,12 +13972,23 @@ const CONSOLE_JS = `
           btn.addEventListener('click', async () => {
             const slug = btn.getAttribute('data-hub-app-disconnect');
             const connectionId = btn.getAttribute('data-conn');
-            if (!confirm('Disconnect ' + friendlyAppName(slug) + '? The agent will no longer have access.')) return;
+            // Include the connectionId tail in the prompt so duplicate
+            // entries (e.g. 3 outlook connections) can be told apart at
+            // the confirm step. Otherwise users had no way to know which
+            // of 3 identical "Disconnect outlook?" prompts was for the
+            // expired one vs the active one.
+            const idTail = connectionId ? ' (id …' + String(connectionId).slice(-8) + ')' : '';
+            if (!confirm('Disconnect ' + friendlyAppName(slug) + idTail + '?\\nThe agent will no longer have access via this connection.')) return;
             try {
-              await fetch(withToken('/api/composio/toolkits/' + encodeURIComponent(slug) + '/disconnect'), {
+              const r = await fetch(withToken('/api/composio/toolkits/' + encodeURIComponent(slug) + '/disconnect'), {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ connectionId }),
               });
+              if (!r.ok) {
+                const j = await r.json().catch(() => ({}));
+                alert('Disconnect failed: ' + (j.error || r.status));
+                return;
+              }
               await refreshHubApps();
             } catch (err) { alert('Disconnect failed: ' + (err.message || err)); }
           });
@@ -13733,7 +14143,39 @@ const CONSOLE_JS = `
     runBtn.dataset.bound = '1';
     runBtn.addEventListener('click', async () => {
       const command = (input.value || '').trim();
-      if (!command) { alert('Paste an install command first.'); return; }
+      if (!command) { showError('Paste an install command first.'); return; }
+
+      // Pre-flight: if the user pasted a SKILL install command into the
+      // CLI installer, the right destination is the Skills install
+      // endpoint (which clones the repo into ~/.clementine-next/skills/
+      // and registers it). The CLI install runner only knows how to
+      // shell out to brew/npm/pipx/git — running "npx skills add ..."
+      // here would either fail validation or clone to the wrong place.
+      // Recognize the same paste shapes normalizeRepoUrl() accepts and
+      // re-route automatically so the user doesn't have to switch tabs.
+      const skillPasteRe = /^(?:npx(?:\\s+-y)?|pnpm\\s+dlx|yarn\\s+dlx|bunx)\\s+skills\\s+add\\s+[@a-zA-Z0-9_./-]+$/i;
+      if (skillPasteRe.test(command)) {
+        showInfo('That looks like a skill install — routing it to the Skills installer.', { durationMs: 4000 });
+        try {
+          const r = await fetch(withToken('/api/console/skills/install'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url: command }),
+          });
+          const j = await r.json().catch(() => ({}));
+          if (!r.ok) {
+            showError('Skill install rejected: ' + (j.error || r.status));
+            return;
+          }
+          showSuccess('Skill install started. Check the Skills panel for progress.');
+          // Jump the user over to the Skills panel so they see the result.
+          if (typeof switchPanel === 'function') switchPanel('skills');
+        } catch (err) {
+          showError('Skill install failed: ' + ((err && err.message) || err));
+        }
+        return;
+      }
+
       if (!confirm('Run this install command now?\\n\\n' + command)) return;
       runBtn.disabled = true;
       runBtn.textContent = 'STARTING...';
@@ -13745,13 +14187,13 @@ const CONSOLE_JS = `
         });
         const j = await r.json().catch(() => ({}));
         if (!r.ok) {
-          alert('Install rejected: ' + (j.error || r.status));
+          showError('Install rejected: ' + (j.error || r.status));
           return;
         }
         await pollInstallJob(j.job?.id, listEl);
         await Promise.allSettled([refreshHubBrowserHarness(), refreshHubMcp(), bootSkillsPanel()]);
       } catch (err) {
-        alert('Install failed: ' + (err.message || err));
+        showError('Install failed: ' + ((err && err.message) || err));
       } finally {
         runBtn.disabled = false;
         runBtn.textContent = 'RUN INSTALL';
@@ -14180,7 +14622,7 @@ const CONSOLE_JS = `
         keyBtn.addEventListener('click', async () => {
           const input = controlsEl.querySelector('[data-hub-recall-key]');
           const value = input?.value?.trim() || '';
-          if (!value) { alert('Paste your Recall.ai API key first.'); return; }
+          if (!value) { showError('Paste your Recall.ai API key first.'); return; }
           keyBtn.textContent = 'SAVING…';
           const r = await fetch(withToken('/api/console/credentials/set'), {
             method: 'POST',
@@ -14189,10 +14631,11 @@ const CONSOLE_JS = `
           });
           if (!r.ok) {
             const j = await r.json().catch(() => ({}));
-            alert('Recall key save failed: ' + (j.error || r.status));
+            showError('Recall key save failed: ' + (j.error || r.status));
             keyBtn.textContent = 'SAVE KEY';
             return;
           }
+          showSuccess('Recall.ai API key saved.');
           await Promise.allSettled([refreshHubRecall(), refreshHubKeys(), refreshCredentialsHealth()]);
         });
       }
@@ -14215,13 +14658,14 @@ const CONSOLE_JS = `
           });
           const j = await r.json().catch(() => ({}));
           if (!r.ok) {
-            alert('Recall settings save failed: ' + (j.error || r.status));
+            showError('Recall settings save failed: ' + (j.error || r.status));
             saveSettingsBtn.textContent = 'SAVE SETTINGS';
             return;
           }
           if (window.clemmy?.recallConfigure) {
-            await window.clemmy.recallConfigure(j.settings || next).catch((err) => alert('Electron setup failed: ' + (err.message || err)));
+            await window.clemmy.recallConfigure(j.settings || next).catch((err) => showError('Electron setup failed: ' + (err.message || err)));
           }
+          showSuccess('Recall settings saved.');
           await refreshHubRecall();
         });
       }
@@ -14229,36 +14673,49 @@ const CONSOLE_JS = `
       const permBtn = controlsEl.querySelector('[data-hub-recall-perms]');
       if (permBtn) {
         permBtn.addEventListener('click', async () => {
-          try { await window.clemmy.recallRequestPermissions(); await refreshHubRecall(); }
-          catch (err) { alert('Permission request failed: ' + (err.message || err)); }
+          try {
+            await window.clemmy.recallRequestPermissions();
+            showInfo('Permission requests sent — check the macOS dialogs.', { durationMs: 6000 });
+            await refreshHubRecall();
+          } catch (err) {
+            showError('Permission request failed: ' + ((err && err.message) || err));
+          }
         });
       }
       const testBtn = controlsEl.querySelector('[data-hub-recall-test]');
       if (testBtn) {
         testBtn.addEventListener('click', async () => {
           if (!window.clemmy?.recallTest) {
-            alert('Test Connection requires the Clementine desktop app. Open Clementine.app to run it.');
+            // Toast instead of alert: when the user clicks TEST from a
+            // backgrounded Clementine (they're focused on Zoom mid-
+            // meeting), a native alert fires inside Clementine's window
+            // but doesn't grab cross-app focus — so the user thinks
+            // nothing happened. Toasts are renderer-side overlays that
+            // stay visible without needing app focus.
+            showWarn('Test Connection requires the Clementine desktop app. Open Clementine.app to run it.', { sticky: true });
             return;
           }
           testBtn.textContent = 'TESTING…';
           try {
             const result = await window.clemmy.recallTest();
-            // Refresh first so the new state is rendered, then drop a
-            // human-readable summary so the user knows the test actually
-            // returned (vs the silent re-render).
+            // Refresh first so the new state is rendered, then surface
+            // a human-readable result the user can see even when
+            // Clementine is in the background.
             await refreshHubRecall();
-            const summary = !result
-              ? 'no result returned'
-              : !result.sdkAvailable
-                ? 'SDK could not load: ' + (result.lastError || 'unknown error')
-                : !result.enabled
-                  ? 'SDK is disabled — turn ENABLED on and save settings, then test again'
-                  : !result.initialized
-                    ? 'SDK loaded but init failed: ' + (result.lastError || 'unknown error')
-                    : 'SDK initialized · ' + (Array.isArray(result.detectedWindows) ? result.detectedWindows.length : 0) + ' detected window(s)';
-            alert('Recall test: ' + summary);
+            if (!result) {
+              showWarn('Recall test returned no result.');
+            } else if (!result.sdkAvailable) {
+              showError('SDK could not load: ' + (result.lastError || 'unknown error'), { sticky: true });
+            } else if (!result.enabled) {
+              showWarn('SDK is disabled — turn ENABLED on and save settings, then test again.');
+            } else if (!result.initialized) {
+              showError('SDK loaded but init failed: ' + (result.lastError || 'unknown error'), { sticky: true });
+            } else {
+              const windowCount = Array.isArray(result.detectedWindows) ? result.detectedWindows.length : 0;
+              showSuccess('SDK initialized · ' + windowCount + ' detected window' + (windowCount === 1 ? '' : 's') + '.', { durationMs: 8000 });
+            }
           } catch (err) {
-            alert('Test failed: ' + (err.message || err));
+            showError('Test failed: ' + ((err && err.message) || err), { sticky: true });
           } finally {
             testBtn.textContent = 'TEST CONNECTION';
           }
@@ -14267,16 +14724,31 @@ const CONSOLE_JS = `
       const manualBtn = controlsEl.querySelector('[data-hub-recall-manual]');
       if (manualBtn) {
         manualBtn.addEventListener('click', async () => {
+          // confirm() suffers the same cross-app-focus problem as
+          // alert(), but for a destructive-ish "are you sure" we
+          // still want a blocking interaction. Toast-with-action
+          // would be the proper fix; for now keep confirm() so a
+          // misclick can't start a surprise recording.
           if (!confirm('Start a manual desktop audio recording now? Make sure you have consent where required.')) return;
-          try { await window.clemmy.recallStartManual(); await refreshHubRecall(); }
-          catch (err) { alert('Manual recording failed: ' + (err.message || err)); }
+          try {
+            await window.clemmy.recallStartManual();
+            showSuccess('Manual recording started.');
+            await refreshHubRecall();
+          } catch (err) {
+            showError('Manual recording failed: ' + ((err && err.message) || err));
+          }
         });
       }
       const stopBtn = controlsEl.querySelector('[data-hub-recall-stop]');
       if (stopBtn) {
         stopBtn.addEventListener('click', async () => {
-          try { await window.clemmy.recallStop(); await refreshHubRecall(); }
-          catch (err) { alert('Stop failed: ' + (err.message || err)); }
+          try {
+            await window.clemmy.recallStop();
+            showSuccess('Recording stopped. Canonical transcript backfill will land in a few minutes.');
+            await refreshHubRecall();
+          } catch (err) {
+            showError('Stop failed: ' + ((err && err.message) || err));
+          }
         });
       }
     } catch (err) {
@@ -15633,11 +16105,33 @@ const CONSOLE_JS = `
     const status = document.querySelector('[data-dock-live-status]');
     const meta = document.querySelector('[data-dock-live-meta]');
     const card = document.querySelector('[data-dock-live]');
+    const recBtn = document.querySelector('[data-dock-live-rec]');
+    const recLbl = document.querySelector('[data-dock-live-rec-label]');
     if (!phase || !status || !meta || !card) return;
     let recall = null;
     if (window.clemmy?.recallStatus) {
       try { recall = await window.clemmy.recallStatus(); } catch { /* ignore */ }
     }
+
+    // Reflect Recall state into the REC affordance. The button is
+    // hidden unless the SDK is enabled+initialized — otherwise clicking
+    // it would just fail with "SDK not ready", which is noise.
+    if (recBtn) {
+      const ready = Boolean(recall?.enabled && recall?.initialized);
+      if (!ready) {
+        recBtn.setAttribute('hidden', '');
+      } else {
+        recBtn.removeAttribute('hidden');
+        if (recall?.recording) {
+          if (recLbl) recLbl.textContent = 'STOP RECORDING';
+          recBtn.setAttribute('data-state', 'recording');
+        } else {
+          if (recLbl) recLbl.textContent = 'RECORD MEETING';
+          recBtn.setAttribute('data-state', 'idle');
+        }
+      }
+    }
+
     if (recall?.recording) {
       card.classList.add('live');
       phase.textContent = 'REC';
@@ -15657,6 +16151,50 @@ const CONSOLE_JS = `
     status.textContent = 'tap orb to talk';
     meta.textContent = recall ? 'sdk loaded' : 'electron only';
   }
+
+  // Wire the REC button (dock-live card) to start/stop a Recall capture
+  // without nav-hopping to Integrations mid-meeting. Bound once at
+  // initial render; the visible state is driven by refreshDockLive().
+  (function bindDockLiveRec() {
+    const recBtn = document.querySelector('[data-dock-live-rec]');
+    if (!recBtn) return;
+    recBtn.addEventListener('click', async (event) => {
+      // The orb is a sibling button — clicking REC shouldn't bubble
+      // into the dock-card-clickable jump-target logic we added today.
+      event.stopPropagation();
+      if (!window.clemmy?.recallStartManual || !window.clemmy?.recallStop) {
+        showError('Recall controls require the Clementine desktop app.');
+        return;
+      }
+      const state = recBtn.getAttribute('data-state') || 'idle';
+      if (state === 'recording') {
+        recBtn.setAttribute('disabled', '');
+        try {
+          await window.clemmy.recallStop();
+          showSuccess('Recording stopped. Canonical transcript backfill will land in a few minutes.');
+        } catch (err) {
+          showError('Stop failed: ' + ((err && err.message) || err));
+        } finally {
+          recBtn.removeAttribute('disabled');
+          refreshDockLive();
+        }
+        return;
+      }
+      // Confirm only the start side — stopping mid-meeting should be
+      // one click since the user can always restart.
+      if (!confirm('Start recording this meeting?\\nMake sure participants are aware where required.')) return;
+      recBtn.setAttribute('disabled', '');
+      try {
+        await window.clemmy.recallStartManual();
+        showSuccess('Recording started.');
+      } catch (err) {
+        showError('Recording failed to start: ' + ((err && err.message) || err));
+      } finally {
+        recBtn.removeAttribute('disabled');
+        refreshDockLive();
+      }
+    });
+  })();
 
   // Tools whose execution is internal self-polling — the daemon reads
   // its own state continuously to drive autonomy + the dashboard.

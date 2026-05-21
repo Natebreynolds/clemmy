@@ -577,6 +577,28 @@ export class ComposioNeedsAuthConfigError extends Error {
 export async function authorizeToolkit(slug: string): Promise<{ redirectUrl: string | null; connectionId: string }> {
   const composio = getComposio();
   if (!composio) throw new Error('COMPOSIO_API_KEY is not configured.');
+
+  // Pre-flight check: if Composio has no auth_config for this toolkit,
+  // toolkits.authorize() still returns a redirectUrl — but the hosted
+  // OAuth page errors out with "Something went wrong. Clear your
+  // session." (seen 2026-05-21 with apify + firecrawl). Skip the bad
+  // dance and surface the proper "needs setup" path immediately.
+  try {
+    const configured = await listToolkitSlugsWithAuthConfig();
+    if (!configured.has(slug)) {
+      throw new ComposioNeedsAuthConfigError(
+        slug,
+        `No auth_config for "${slug}" in this Composio project. Add one at platform.composio.dev/auth-configs before connecting.`,
+      );
+    }
+  } catch (error) {
+    // Re-throw the structured needs-setup error; swallow listing
+    // failures (rare — network blip etc.) and fall through to the
+    // legacy authorize call which still has its own 400/401/403
+    // fallback.
+    if (error instanceof ComposioNeedsAuthConfigError) throw error;
+  }
+
   const userId = await getPreferredUserId();
   try {
     const connection = await (composio as any).toolkits.authorize(userId, slug);
@@ -599,11 +621,207 @@ export async function authorizeToolkit(slug: string): Promise<{ redirectUrl: str
   }
 }
 
+/**
+ * Fetch the help/setup metadata for a toolkit — used by the
+ * Clementine-native setup modal to render the toolkit's
+ * fields, descriptions, and "where do I get my API key" link.
+ * Returns null when Composio is misconfigured (caller treats as
+ * "fall back to generic prompt").
+ */
+export async function getToolkitSetupMeta(slug: string): Promise<{
+  name: string;
+  description: string | null;
+  appUrl: string | null;
+  authHintUrl: string | null;
+  authGuideUrl: string | null;
+  fields: Array<{ name: string; label: string; description: string | null; default: string | null; isSecret: boolean; required: boolean }>;
+  authScheme: string;
+} | null> {
+  const composioApiKey = readComposioEnv('COMPOSIO_API_KEY');
+  if (!composioApiKey) return null;
+  try {
+    const res = await fetch(`https://backend.composio.dev/api/v3/toolkits/${encodeURIComponent(slug)}`, {
+      headers: { 'x-api-key': composioApiKey },
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as Record<string, unknown>;
+    const detail = Array.isArray(data.auth_config_details)
+      ? (data.auth_config_details[0] as Record<string, unknown>)
+      : null;
+    const fieldsObj = detail ? obj(detail.fields) : {};
+    const initiation = obj((fieldsObj as { connected_account_initiation?: unknown }).connected_account_initiation);
+    const required = Array.isArray(initiation.required) ? initiation.required : [];
+    const fields = (required as Array<Record<string, unknown>>).map((f) => ({
+      name: str(f.name) ?? '',
+      label: str(f.displayName) ?? str(f.name) ?? '',
+      description: str(f.description) ?? null,
+      default: str(f.default) ?? null,
+      isSecret: Boolean(f.is_secret),
+      required: Boolean(f.required),
+    })).filter((f) => f.name);
+    const meta = obj(data.meta);
+    return {
+      name: str(data.name) ?? slug,
+      description: str(meta.description) ?? null,
+      appUrl: str(meta.app_url) ?? null,
+      authHintUrl: detail ? str((detail as { auth_hint_url?: unknown }).auth_hint_url) ?? null : null,
+      authGuideUrl: str(data.auth_guide_url) ?? null,
+      fields,
+      authScheme: detail ? str((detail as { mode?: unknown }).mode) ?? 'API_KEY' : 'API_KEY',
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * One-shot setup for OAUTH2 toolkits that have NO project-level
+ * auth_config yet. Composio's catalog tells us via the toolkit's
+ * `composio_managed_auth_schemes` whether they offer managed OAuth
+ * credentials — if they do, we create a `use_composio_managed_auth`
+ * auth_config for the user automatically. Then the regular
+ * `authorizeToolkit` flow can run and Composio's OAuth window will
+ * load correctly (it loads broken when there's no auth_config).
+ *
+ * If Composio has NO managed creds for the toolkit, callers fall
+ * back to platform.composio.dev — there's no way to skip the manual
+ * BYO setup in that case.
+ */
+export async function setupOAuthToolkit(slug: string): Promise<{ ok: true; authConfigId: string }> {
+  const composioApiKey = readComposioEnv('COMPOSIO_API_KEY');
+  if (!composioApiKey) throw new Error('COMPOSIO_API_KEY is not configured.');
+  const res = await fetch('https://backend.composio.dev/api/v3/auth_configs', {
+    method: 'POST',
+    headers: {
+      'x-api-key': composioApiKey,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      toolkit: { slug },
+      auth_config: {
+        type: 'use_composio_managed_auth',
+        name: slug,
+      },
+    }),
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Composio auth_config create failed (${res.status}): ${body.slice(0, 300)}`);
+  }
+  const result = (await res.json()) as Record<string, unknown>;
+  const authConfigInner = obj(result.auth_config);
+  const authConfigId = str(result.id) ?? str(authConfigInner.id) ?? str(result.nanoid) ?? '';
+  if (!authConfigId) {
+    throw new Error(`Composio returned no auth_config id. Body: ${JSON.stringify(result).slice(0, 200)}`);
+  }
+  connectionsCache = null;
+  detectedPreferredUserId = null;
+  return { ok: true, authConfigId };
+}
+
 export async function disconnectToolkit(connectionId: string): Promise<void> {
   const composio = getComposio();
   if (!composio) throw new Error('COMPOSIO_API_KEY is not configured.');
   await (composio as any).connectedAccounts.delete(connectionId);
   connectionsCache = null;
+}
+
+/**
+ * One-shot setup for API_KEY-mode toolkits whose hosted Composio popup
+ * throws "Something went wrong" (firecrawl, apify, ...). We call
+ * Composio's REST API directly via fetch — the SDK's typed shapes
+ * mismatch the actual API contract (the SDK serializes `toolkit.slug`
+ * in a way the server rejects with "Expected string, received object").
+ *
+ * The correct API shape, probed 2026-05-21:
+ *   POST /api/v3/auth_configs
+ *     { "toolkit": { "slug": "..." },
+ *       "auth_config": { "type": "use_custom_auth",
+ *                        "authScheme": "API_KEY",  // ← camelCase
+ *                        "name": "..." } }
+ *
+ *   POST /api/v3/connected_accounts
+ *     { "auth_config": { "id": "ac_..." },
+ *       "connection": { "user_id": "...",
+ *                       "state": { "authScheme": "API_KEY",
+ *                                  "val": { "status": "ACTIVE",
+ *                                           "generic_api_key": "...",
+ *                                           "base_url": "..." (optional) } } } }
+ */
+export async function setupApiKeyToolkit(
+  slug: string,
+  apiKey: string,
+  baseUrl?: string,
+): Promise<{ ok: true; authConfigId: string; connectionId: string }> {
+  const composioApiKey = readComposioEnv('COMPOSIO_API_KEY');
+  if (!composioApiKey) throw new Error('COMPOSIO_API_KEY is not configured.');
+  const userId = await getPreferredUserId();
+
+  // Step 1 — project-level auth_config (via raw fetch; see banner).
+  const createAuthRes = await fetch('https://backend.composio.dev/api/v3/auth_configs', {
+    method: 'POST',
+    headers: {
+      'x-api-key': composioApiKey,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      toolkit: { slug },
+      auth_config: {
+        type: 'use_custom_auth',
+        authScheme: 'API_KEY',
+        name: slug,
+      },
+    }),
+  });
+  if (!createAuthRes.ok) {
+    const body = await createAuthRes.text();
+    throw new Error(`Composio auth_config create failed (${createAuthRes.status}): ${body.slice(0, 300)}`);
+  }
+  const authConfig = (await createAuthRes.json()) as Record<string, unknown>;
+  const authConfigInner = obj(authConfig.auth_config);
+  const authConfigId = str(authConfig.id)
+    ?? str(authConfigInner.id)
+    ?? str(authConfig.nanoid)
+    ?? '';
+  if (!authConfigId) {
+    throw new Error(`Composio returned no auth_config id. Body: ${JSON.stringify(authConfig).slice(0, 200)}`);
+  }
+
+  // Step 2 — per-user connection. state carries the actual API key.
+  const val: Record<string, unknown> = {
+    status: 'ACTIVE',
+    generic_api_key: apiKey,
+  };
+  if (baseUrl) val.base_url = baseUrl;
+  const createConnRes = await fetch('https://backend.composio.dev/api/v3/connected_accounts', {
+    method: 'POST',
+    headers: {
+      'x-api-key': composioApiKey,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      auth_config: { id: authConfigId },
+      connection: {
+        user_id: userId,
+        state: {
+          authScheme: 'API_KEY',
+          val,
+        },
+      },
+      validate_credentials: false,
+    }),
+  });
+  if (!createConnRes.ok) {
+    const body = await createConnRes.text();
+    throw new Error(`Composio connection create failed (${createConnRes.status}): ${body.slice(0, 300)}`);
+  }
+  const connection = (await createConnRes.json()) as Record<string, unknown>;
+  const connectionId = str(connection.id) ?? str(connection.nanoid) ?? '';
+
+  // Bust caches so the dashboard refresh picks up the new connection.
+  connectionsCache = null;
+  detectedPreferredUserId = null;
+  return { ok: true, authConfigId, connectionId };
 }
 
 export async function listComposioToolkitTools(slug: string, limit = 80): Promise<ComposioToolkitTool[]> {
@@ -633,11 +851,23 @@ export async function executeComposioTool(
   connectedAccountId?: string,
 ): Promise<unknown> {
   const backend = getComposioExecutionBackend();
+  // Resolve the actual Composio user_id ONCE up front. The setup wizard
+  // writes `COMPOSIO_USER_ID=default` into .env, but Composio's real
+  // user ids look like `pg-test-04a26016-…` — connections live under
+  // the real id, not under literal "default". getPreferredUserId()
+  // probes connected_accounts and picks the user with the most ACTIVE
+  // connections, so both the CLI and SDK paths route to where the
+  // user's data actually is. Without this, the CLI path emits
+  // `ToolRouterV2_NoActiveConnection` for every toolkit a user has set
+  // up via the dashboard.
+  const userId = await getPreferredUserId();
+
   if (backend !== 'sdk' && !connectedAccountId) {
-    const cliStatus = await getComposioCliStatus(composioCliOptions());
+    const cliOptions = { ...composioCliOptions(), userId };
+    const cliStatus = await getComposioCliStatus(cliOptions);
     if (cliStatus.installed && (backend === 'cli' || cliStatus.authenticated)) {
       try {
-        return await executeComposioCliTool(toolSlug, args, composioCliOptions());
+        return await executeComposioCliTool(toolSlug, args, cliOptions);
       } catch (error) {
         if (backend === 'cli') throw error;
         // In auto mode, a CLI auth/version mismatch should not break
@@ -653,7 +883,7 @@ export async function executeComposioTool(
   const composio = getComposio();
   if (!composio) throw new Error('COMPOSIO_API_KEY is not configured.');
   const body: Record<string, unknown> = {
-    userId: await getPreferredUserId(),
+    userId,
     arguments: args,
     dangerouslySkipVersionCheck: true,
   };
@@ -665,8 +895,10 @@ export async function searchComposioToolsViaCli(
   query: string,
   options: { toolkitSlug?: string; limit?: number } = {},
 ): Promise<unknown> {
+  const userId = await getPreferredUserId();
   return searchComposioCliTools(query, {
     ...composioCliOptions(),
+    userId,
     toolkitSlug: options.toolkitSlug,
     limit: options.limit,
   });

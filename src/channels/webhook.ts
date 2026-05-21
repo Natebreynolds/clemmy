@@ -8,6 +8,12 @@ import matter from 'gray-matter';
 import { ClementineAssistant } from '../assistant/core.js';
 import { BASE_DIR, WEBHOOK_PORT, WEBHOOK_SECRET } from '../config.js';
 import { DASHBOARD_CRON_RUNS_DIR, buildDashboardSnapshot, loadCronJobs, loadWorkflows, readDaemonState, readRecentJsonLines, readWorkflowRuns } from '../dashboard/state.js';
+// Added 2026-05-21: /api/runs/:id fallbacks for harness sessions and
+// workflow runs. The legacy run-store only knows about run-xxx IDs;
+// without these fallbacks, clicking a harness session or workflow run
+// in the dashboard's Live Runs feed 404s and the inspector shows
+// "Run not found".
+import { getSession as harnessGetSession, listEvents as harnessListEvents } from '../runtime/harness/eventlog.js';
 import { registerConsoleRoutes } from '../dashboard/console-routes.js';
 import {
   addNotification,
@@ -33,6 +39,9 @@ import {
   resetComposioClient,
   saveComposioCredentials,
   saveComposioExecutionBackend,
+  setupApiKeyToolkit,
+  setupOAuthToolkit,
+  getToolkitSetupMeta,
 } from '../integrations/composio/client.js';
 import { computeAvailability, KNOWN_SERVICES, loadToolPreferences, saveToolPreferences, type ToolSource } from '../integrations/tool-preferences.js';
 import { discoverMcpServers } from '../runtime/mcp-config.js';
@@ -341,6 +350,66 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
   app.post('/api/composio/refresh', requireAuth, (_req, res) => {
     resetComposioClient();
     res.json({ ok: true });
+  });
+
+  // Setup metadata for the Clementine-native modal — exposes the
+  // toolkit's per-field descriptions + the right "where do I get
+  // my API key" link. Lets the modal render guidance instead of
+  // a generic "API key" prompt that leaves the user hunting for
+  // where to get the key (real ux feedback from 2026-05-21).
+  app.get('/api/composio/toolkits/:slug/setup-meta', requireAuth, async (req, res) => {
+    const slug = Array.isArray(req.params.slug) ? req.params.slug[0] : req.params.slug;
+    try {
+      const meta = await getToolkitSetupMeta(slug);
+      if (!meta) {
+        res.status(404).json({ error: 'toolkit not found or Composio not configured' });
+        return;
+      }
+      res.json(meta);
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  // Bypass route for API_KEY-mode toolkits whose Composio hosted popup
+  // throws "Something went wrong" (firecrawl, apify, ...). Front-end
+  // collects the API key in a Clementine-native modal and POSTs here;
+  // we create both the auth_config and the per-user connection via
+  // Composio's REST API directly.
+  app.post('/api/composio/toolkits/:slug/setup-api-key', requireAuth, async (req, res) => {
+    const slug = Array.isArray(req.params.slug) ? req.params.slug[0] : req.params.slug;
+    const apiKey = typeof req.body?.apiKey === 'string' ? req.body.apiKey.trim() : '';
+    const baseUrl = typeof req.body?.baseUrl === 'string' ? req.body.baseUrl.trim() : '';
+    if (!slug || !apiKey) {
+      res.status(400).json({ error: 'slug + apiKey required' });
+      return;
+    }
+    try {
+      const result = await setupApiKeyToolkit(slug, apiKey, baseUrl || undefined);
+      res.json(result);
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  // OAuth2 auto-setup. Creates a `use_composio_managed_auth` config
+  // for OAUTH2 toolkits where Composio offers managed credentials
+  // (gmail, slack, github, notion, etc.). After this returns, the
+  // existing /authorize flow can run and Composio's OAuth window will
+  // load properly. Without this preflight, /authorize bounces the
+  // user to "Something went wrong" because there's no auth_config.
+  app.post('/api/composio/toolkits/:slug/setup-oauth', requireAuth, async (req, res) => {
+    const slug = Array.isArray(req.params.slug) ? req.params.slug[0] : req.params.slug;
+    if (!slug) {
+      res.status(400).json({ error: 'slug required' });
+      return;
+    }
+    try {
+      const result = await setupOAuthToolkit(slug);
+      res.json(result);
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
+    }
   });
 
   app.get('/api/tool-preferences', requireAuth, async (_req, res) => {
@@ -1196,12 +1265,68 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
 
   app.get('/api/runs/:id', requireAuth, (req, res) => {
     const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+    // Legacy run-store lookup first (run-xxx IDs).
     const run = getRun(id);
-    if (!run) {
-      res.status(404).json({ error: 'Run not found' });
+    if (run) {
+      res.json({ run });
       return;
     }
-    res.json({ run });
+    // Fallback A — harness session (sess-xxx IDs).
+    try {
+      if (id.startsWith('sess-')) {
+        const session = harnessGetSession(id);
+        if (session) {
+          const events = harnessListEvents(id) ?? [];
+          res.json({ run: {
+            id,
+            sessionId: id,
+            kind: (session as { kind?: unknown }).kind ?? 'harness',
+            channel: (session as { channel?: unknown }).channel ?? '—',
+            source: 'harness',
+            title: (session as { title?: unknown }).title ?? '(harness session)',
+            status: (session as { status?: unknown }).status ?? 'unknown',
+            createdAt: (session as { createdAt?: unknown }).createdAt,
+            updatedAt: (session as { updatedAt?: unknown }).updatedAt,
+            events: events.map((ev) => ({
+              id: (ev as { id?: unknown }).id,
+              type: (ev as { type?: unknown }).type,
+              createdAt: (ev as { createdAt?: unknown }).createdAt,
+              message: (() => {
+                const dj = (ev as { data_json?: unknown }).data_json;
+                if (typeof dj === 'string') {
+                  return dj.length > 220 ? dj.slice(0, 220) + '…' : dj;
+                }
+                return '';
+              })(),
+            })),
+          } });
+          return;
+        }
+      }
+      // Fallback B — workflow run record at workflows/runs/<runId>.json.
+      const runPath = path.join(WORKFLOW_RUNS_DIR, `${id}.json`);
+      if (existsSync(runPath)) {
+        const wfRun = JSON.parse(readFileSync(runPath, 'utf-8')) as Record<string, unknown>;
+        res.json({ run: {
+          id,
+          sessionId: id,
+          kind: 'workflow',
+          channel: 'workflow',
+          source: 'workflow',
+          title: (wfRun.workflow as string | undefined) ?? '(workflow run)',
+          input: '',
+          status: (wfRun.status as string | undefined) ?? 'unknown',
+          createdAt: wfRun.createdAt as string | undefined,
+          updatedAt: (wfRun.finishedAt as string | undefined) ?? (wfRun.startedAt as string | undefined),
+          outputPreview: typeof wfRun.output === 'string' ? wfRun.output.slice(0, 2000) : '',
+          events: [],
+        } });
+        return;
+      }
+    } catch (err) {
+      // Fallback lookups are best-effort.
+    }
+    res.status(404).json({ error: 'Run not found' });
   });
 
   app.get('/api/runs/:id/events', requireAuth, (req, res) => {
