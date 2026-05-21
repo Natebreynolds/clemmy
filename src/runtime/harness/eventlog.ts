@@ -68,6 +68,11 @@ export const EVENT_TYPES = [
   'conversation_step',
   'conversation_completed',
   'conversation_limit_exceeded',
+  // Auto-capture writeback: emitted from the harness loop whenever a
+  // user message produced durable facts or a profile patch via
+  // captureInteractionSignals. Lets the trace show "Clementine learned
+  // X from this turn" so memory growth is observable.
+  'memory_signals_captured',
 ] as const;
 export type EventType = (typeof EVENT_TYPES)[number];
 const EVENT_TYPE_SET: ReadonlySet<string> = new Set(EVENT_TYPES);

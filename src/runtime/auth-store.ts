@@ -188,6 +188,18 @@ function runInteractiveCommand(command: string, args: string[]): Promise<boolean
 }
 
 export async function installCodexCli(): Promise<{ ok: boolean; message: string }> {
+  // Fail fast and honestly when npm itself is missing. Without this the
+  // error surfaced to the user is "Failed to install Codex globally"
+  // with no hint that Node is the actual missing piece — observed on
+  // fresh Macs where Clementine was the user's first attempt at any
+  // Node-based tool.
+  const npmProbe = spawnSync('npm', ['--version'], { stdio: 'ignore', env: process.env });
+  if (npmProbe.status !== 0) {
+    return {
+      ok: false,
+      message: 'Cannot install Codex: npm is not on PATH. Install Node.js from https://nodejs.org (LTS is fine), reopen your terminal, then retry.',
+    };
+  }
   const installed = await runInteractiveCommand('npm', ['install', '-g', CODEX_INSTALL_PACKAGE]);
   if (!installed) {
     return {

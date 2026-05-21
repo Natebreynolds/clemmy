@@ -88,7 +88,54 @@ export function stopApprovalReaper(): void {
  * can inspect the effect.
  */
 export function reapOnce(): approvalRegistry.PendingApprovalRow[] {
+  // 1) TTL-based expiry (24h default) — long fallback for "user is
+  // away for the day" cases.
   const expired = approvalRegistry.expireStaleApprovals(new Date());
+
+  // 2) Session-status-aware reap: if a pending approval is tied to a
+  // session that's no longer active (cancelled / completed / failed),
+  // it's dead — cancel the approval row so the dashboard "NEEDS YOU"
+  // surface stops showing it. Without this, an abandoned session
+  // leaves a ghost approval card hanging around for up to 24h.
+  // Discovered 2026-05-21: a 6-hour-old approval (apr-ynut for
+  // agent_runs_recent) sat in the home feed because its session was
+  // long gone but the TTL hadn't elapsed.
+  try {
+    const stillPending = approvalRegistry.listPending({ status: 'pending' });
+    for (const row of stillPending) {
+      let dead = false;
+      try {
+        const session = HarnessSession.load(row.sessionId);
+        if (!session) {
+          dead = true;
+        } else if (
+          session.sessionRow.status === 'completed'
+          || session.sessionRow.status === 'cancelled'
+          || session.sessionRow.status === 'failed'
+        ) {
+          dead = true;
+        }
+      } catch {
+        // Session row malformed / missing — treat as dead.
+        dead = true;
+      }
+      if (!dead) continue;
+      const result = approvalRegistry.resolve(row.approvalId, 'cancelled_by_user', 'reaper-dead-session');
+      if (result.ok && result.row) {
+        expired.push(result.row);
+        logger.info(
+          { approvalId: row.approvalId, sessionId: row.sessionId, subject: row.subject },
+          'approval cancelled — session no longer active',
+        );
+      }
+    }
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : err },
+      'session-status reap pass failed',
+    );
+  }
+
   for (const row of expired) {
     // Clear the SDK interrupt state so the next user message in this
     // session starts a fresh turn instead of trying to resume the

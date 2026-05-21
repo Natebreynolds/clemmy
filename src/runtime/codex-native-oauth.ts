@@ -2,7 +2,12 @@ import { createHash, randomBytes } from 'node:crypto';
 import { createServer } from 'node:http';
 import { spawn } from 'node:child_process';
 
-const AUTH_BASE_URL = 'https://auth.openai.com';
+// CODEX_OAUTH_AUTH_BASE_URL overrides the base URL for local testing
+// (smoke scripts stand up a fake OAuth server on localhost). Empty /
+// undefined falls back to production.
+const AUTH_BASE_URL = (process.env.CODEX_OAUTH_AUTH_BASE_URL && process.env.CODEX_OAUTH_AUTH_BASE_URL.length > 0)
+  ? process.env.CODEX_OAUTH_AUTH_BASE_URL.replace(/\/+$/, '')
+  : 'https://auth.openai.com';
 const AUTHORIZE_URL = `${AUTH_BASE_URL}/oauth/authorize`;
 const TOKEN_URL = `${AUTH_BASE_URL}/oauth/token`;
 const CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';
@@ -74,7 +79,9 @@ function openBrowser(url: string): void {
   spawn('xdg-open', [url], { detached: true, stdio: 'ignore' }).unref();
 }
 
-function listenForOAuthCallback(state: string, codeChallenge: string): Promise<OAuthCallbackResult> {
+type BrowserOpener = (url: string) => void | Promise<void>;
+
+function listenForOAuthCallback(state: string, codeChallenge: string, opener?: BrowserOpener): Promise<OAuthCallbackResult> {
   return new Promise((resolve, reject) => {
     let settled = false;
     let timeout: NodeJS.Timeout | null = null;
@@ -151,7 +158,14 @@ function listenForOAuthCallback(state: string, codeChallenge: string): Promise<O
           finish(server, new Error('Native OAuth login timed out after 15 minutes.'));
         }, LOGIN_TIMEOUT_MS);
         try {
-          openBrowser(authorizeUrl.toString());
+          const launch = opener ?? openBrowser;
+          const result = launch(authorizeUrl.toString());
+          if (result && typeof (result as Promise<void>).catch === 'function') {
+            (result as Promise<void>).catch((error: unknown) => {
+              const message = error instanceof Error ? error.message : String(error);
+              finish(server, new Error(`Could not open the browser for native OAuth login: ${message}`));
+            });
+          }
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           finish(server, new Error(`Could not open the browser for native OAuth login: ${message}`));
@@ -290,11 +304,11 @@ export async function refreshNativeCodexTokens(refreshToken: string): Promise<Na
   };
 }
 
-export async function loginWithNativeCodexOAuth(): Promise<NativeCodexTokenSet> {
+export async function loginWithNativeCodexOAuth(opener?: BrowserOpener): Promise<NativeCodexTokenSet> {
   const state = base64UrlEncode(randomBytes(24));
   const codeVerifier = createCodeVerifier();
   const codeChallenge = createCodeChallenge(codeVerifier);
-  const { payload: callback, redirectUri } = await listenForOAuthCallback(state, codeChallenge);
+  const { payload: callback, redirectUri } = await listenForOAuthCallback(state, codeChallenge, opener);
 
   if (callback.error) {
     throw new Error(`Native OAuth callback failed: ${callback.error}${callback.errorDescription ? ` (${callback.errorDescription})` : ''}`);

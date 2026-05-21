@@ -2791,11 +2791,24 @@ export function registerConsoleRoutes(
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const id = req.params.id;
     const decisionParam = req.params.decision;
-    if (decisionParam !== 'approve' && decisionParam !== 'reject') {
-      res.status(400).json({ error: 'decision must be approve or reject' });
+    if (decisionParam !== 'approve' && decisionParam !== 'reject' && decisionParam !== 'approve_with_edits') {
+      res.status(400).json({ error: 'decision must be approve, reject, or approve_with_edits' });
       return;
     }
-    const decision: 'approve' | 'reject' = decisionParam;
+    const decision: 'approve' | 'reject' | 'approve_with_edits' = decisionParam;
+    // For approve_with_edits, the body carries the user's edited args
+    // (JSON-encoded string in `modifiedArgs`). Used by the dashboard
+    // EDIT button and Discord edit modal to substitute the tool's args
+    // before the SDK approves.
+    const modifiedArgs = decision === 'approve_with_edits'
+      ? (typeof (req.body as { modifiedArgs?: unknown })?.modifiedArgs === 'string'
+          ? (req.body as { modifiedArgs: string }).modifiedArgs
+          : undefined)
+      : undefined;
+    if (decision === 'approve_with_edits' && !modifiedArgs) {
+      res.status(400).json({ error: 'approve_with_edits requires modifiedArgs in body (JSON string)' });
+      return;
+    }
     const existing = approvalRegistry.get(id);
     if (!existing) {
       res.status(404).json({ error: 'approval not found' });
@@ -2806,12 +2819,18 @@ export function registerConsoleRoutes(
       return;
     }
 
+    // Map any approve-shaped decision to the audit-log "approved"
+    // resolution. The `approve_with_edits` flavor still resolves the
+    // approval row as approved — the edits are an in-flight
+    // substitution, not a separate trust state.
+    const auditResolution = decision === 'reject' ? 'rejected' : 'approved';
+
     const harnessSession = HarnessSession.load(existing.sessionId);
     const shouldResume = !!harnessSession?.loadInterruptState();
     if (!shouldResume) {
       const result = approvalRegistry.resolve(
         id,
-        decision === 'approve' ? 'approved' : 'rejected',
+        auditResolution,
         'desktop-command-center',
       );
       if (!result.ok) {
@@ -2821,7 +2840,7 @@ export function registerConsoleRoutes(
       res.json({
         ok: true,
         approval: result.row,
-        message: `Approval ${decision === 'approve' ? 'approved' : 'rejected'}: ${id}`,
+        message: `Approval ${decision === 'reject' ? 'rejected' : (decision === 'approve_with_edits' ? 'approved with edits' : 'approved')}: ${id}`,
         status: 'resolved-stale',
       });
       return;
@@ -2831,8 +2850,7 @@ export function registerConsoleRoutes(
     if (!auth.ok) { res.status(412).json({ error: auth.reason }); return; }
 
     const sessionId = existing.sessionId;
-    const resolution = decision === 'approve' ? 'approved' : 'rejected';
-    const result = approvalRegistry.resolve(id, resolution, 'desktop-command-center');
+    const result = approvalRegistry.resolve(id, auditResolution, 'desktop-command-center');
     if (!result.ok) {
       res.status(409).json({ error: result.reason ?? 'could not resolve approval', approval: result.row });
       return;
@@ -2844,7 +2862,7 @@ export function registerConsoleRoutes(
       sessionId,
       streamUrl: `/api/sessions/${sessionId}/events`,
       status: 'resuming',
-      message: `Approval ${decision === 'approve' ? 'approved' : 'rejected'}: ${id}`,
+      message: `Approval ${decision === 'reject' ? 'rejected' : (decision === 'approve_with_edits' ? 'approved with edits' : 'approved')}: ${id}`,
     });
 
     setImmediate(async () => {
@@ -2854,10 +2872,11 @@ export function registerConsoleRoutes(
           agent,
           sessionId,
           decision,
+          modifiedArgs,
         });
         const pending = approvalRegistry.listPending({ sessionId, status: 'pending' });
         for (const row of pending) {
-          approvalRegistry.resolve(row.approvalId, resolution, 'desktop-command-center');
+          approvalRegistry.resolve(row.approvalId, auditResolution, 'desktop-command-center');
         }
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -2924,6 +2943,15 @@ export function registerConsoleRoutes(
           urgency: 'high',
           approvalKind: 'harness',
           approvalId: approval.approvalId,
+          // Pass the tool name + args so the EDIT button can render a
+          // pre-filled textarea. For composio_execute_tool we surface
+          // the INNER args JSON (the actual tool payload).
+          approvalTool: approval.tool,
+          approvalArgs: approval.tool === 'composio_execute_tool'
+            && approval.args
+            && typeof (approval.args as { arguments?: unknown }).arguments === 'string'
+            ? (approval.args as { arguments: string }).arguments
+            : (approval.args ? JSON.stringify(approval.args, null, 2) : ''),
         })),
         ...planProposals.slice(0, 4).map((proposal) => ({
           kind: 'plan',

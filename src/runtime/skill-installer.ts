@@ -49,32 +49,70 @@ function appendOutput(job: SkillInstallJob, chunk: string): void {
 }
 
 /**
- * Accept https://github.com/owner/repo[.git] and git@github.com:owner/repo[.git].
- * Reject anything else — we only support public Git URLs.
+ * Resolve a user-supplied skill reference into a clone URL.
+ *
+ * Accepted shapes (all resolve to a github.com clone URL):
+ *   1. https://github.com/owner/repo[.git][/]
+ *   2. git@github.com:owner/repo[.git]
+ *   3. owner/repo                                  — shorthand
+ *   4. npx skills add owner/repo                   — pasted verbatim
+ *      from a marketing page (e.g. usehallmark.com)
+ *
+ * Form (4) is purely UX sugar — many skill landing pages now publish
+ * "npx skills add nutlope/hallmark"-style commands, and we don't want
+ * users to have to translate that into a GitHub URL by hand. We strip
+ * the prefix and treat the remainder as form (3).
+ *
+ * Anything else throws with an honest hint.
  *
  * Returns the normalized clone URL plus the inferred "repo basename"
  * (used as the default install name for single-SKILL.md repos).
  */
 export function normalizeRepoUrl(input: string): { url: string; basename: string; owner?: string; repo?: string } {
-  const trimmed = (input || '').trim();
+  let trimmed = (input || '').trim();
   if (!trimmed) throw new Error('Empty repo URL');
   if (trimmed.length > 400) throw new Error('Repo URL too long');
 
-  // https://github.com/owner/repo[.git][/]
+  // (4) "npx skills add owner/repo" — peel the prefix and fall through.
+  // Tolerate "npx -y skills add ...", "npx skills add @scope/repo",
+  // "pnpm dlx skills add ...", and "bunx skills add ..." for the same
+  // reason: copy-paste shouldn't care about the package manager.
+  const dlxPrefix = /^(?:npx(?:\s+-y)?|pnpm\s+dlx|yarn\s+dlx|bunx)\s+skills\s+add\s+/i;
+  if (dlxPrefix.test(trimmed)) {
+    trimmed = trimmed.replace(dlxPrefix, '').trim();
+  }
+
+  // (1) https://github.com/owner/repo[.git][/]
   let m = trimmed.match(/^https:\/\/github\.com\/([a-zA-Z0-9_.-]+)\/([a-zA-Z0-9_.-]+?)(?:\.git)?\/?$/);
   if (m) {
     const owner = m[1];
     const repo = m[2];
     return { url: `https://github.com/${owner}/${repo}.git`, basename: repo, owner, repo };
   }
-  // git@github.com:owner/repo[.git]
+  // (2) git@github.com:owner/repo[.git]
   m = trimmed.match(/^git@github\.com:([a-zA-Z0-9_.-]+)\/([a-zA-Z0-9_.-]+?)(?:\.git)?\/?$/);
   if (m) {
     const owner = m[1];
     const repo = m[2];
     return { url: `git@github.com:${owner}/${repo}.git`, basename: repo, owner, repo };
   }
-  throw new Error('Unsupported URL — paste a GitHub repo URL like https://github.com/owner/repo');
+  // (3) owner/repo shorthand. Allow a single optional leading "@" so
+  // pastes like "@nutlope/hallmark" still resolve. Reject anything that
+  // doesn't look like exactly one "/" with sane segments — we don't
+  // want to silently accept "foo" (no owner) or "a/b/c" (subpath).
+  m = trimmed.match(/^@?([a-zA-Z0-9_.-]+)\/([a-zA-Z0-9_.-]+?)(?:\.git)?\/?$/);
+  if (m) {
+    const owner = m[1];
+    const repo = m[2];
+    return { url: `https://github.com/${owner}/${repo}.git`, basename: repo, owner, repo };
+  }
+  throw new Error(
+    'Unsupported reference. Accepted formats:\n' +
+    '  • https://github.com/owner/repo\n' +
+    '  • git@github.com:owner/repo\n' +
+    '  • owner/repo (shorthand)\n' +
+    '  • npx skills add owner/repo (the command from skill marketing pages)',
+  );
 }
 
 function runGit(args: string[], cwd: string, onChunk: (s: string) => void, timeoutMs: number): Promise<{ code: number }> {

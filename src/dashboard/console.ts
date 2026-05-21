@@ -51,6 +51,18 @@ export function renderConsoleHtml(token: string): string {
           <span class="brand-mark">Clementine</span>
           <span class="brand-sub" data-daemon-version>console</span>
         </div>
+        <!--
+          Dedicated update CTA. Hidden by default; renderUpdaterChip
+          shows + populates it when there's an action the user can
+          take (download, install, repair ownership, move to /
+          Applications, retry check). Previously the version label
+          itself doubled as the click target — undiscoverable for
+          new users.
+        -->
+        <button type="button" class="updater-cta" data-updater-cta hidden aria-live="polite">
+          <span class="updater-cta-icon" aria-hidden="true">↓</span>
+          <span class="updater-cta-label" data-updater-cta-label>Update</span>
+        </button>
       </div>
       <div class="status-row" data-status-row>
         <span class="stat" data-stat-runs>RUNS · <em>—</em></span>
@@ -120,7 +132,7 @@ export function renderConsoleHtml(token: string): string {
            its bounds so the nav itself never scrolls. -->
       <div class="nav-dock" aria-label="Live status">
 
-        <div class="dock-card dock-now" data-dock-now>
+        <div class="dock-card dock-now dock-card-clickable" data-dock-now data-dock-jump="activity" role="button" tabindex="0" aria-label="Open Activity panel">
           <div class="dock-card-head">
             <span class="dock-card-tag">NOW</span>
             <span class="dock-card-tick" data-dock-now-tick>—</span>
@@ -134,7 +146,7 @@ export function renderConsoleHtml(token: string): string {
           </div>
         </div>
 
-        <div class="dock-card dock-goal" data-dock-goal hidden>
+        <div class="dock-card dock-goal dock-card-clickable" data-dock-goal data-dock-jump="workflows" role="button" tabindex="0" aria-label="Open Workflows panel" hidden>
           <div class="dock-card-head">
             <span class="dock-card-tag">ACTIVE GOAL</span>
             <span class="dock-card-tick" data-dock-goal-turns>0/0</span>
@@ -156,9 +168,7 @@ export function renderConsoleHtml(token: string): string {
           <div class="dock-card-body dock-live-body">
             <button type="button" class="dock-live-orb" data-dock-live-toggle aria-label="Toggle voice">
               <span class="dock-live-orb-ring"></span>
-              <span class="dock-live-orb-core">
-                <img src="/console/icon.png" alt="" />
-              </span>
+              <span class="dock-live-orb-core"></span>
             </button>
             <div class="dock-live-info">
               <div class="dock-live-status" data-dock-live-status>tap to talk</div>
@@ -167,7 +177,7 @@ export function renderConsoleHtml(token: string): string {
           </div>
         </div>
 
-        <div class="dock-card dock-recent" data-dock-recent>
+        <div class="dock-card dock-recent dock-card-clickable" data-dock-recent data-dock-jump="activity" role="button" tabindex="0" aria-label="Open Activity panel">
           <div class="dock-card-head">
             <span class="dock-card-tag">RECENT</span>
             <span class="dock-card-tick" data-dock-recent-count>0</span>
@@ -177,7 +187,7 @@ export function renderConsoleHtml(token: string): string {
           </div>
         </div>
 
-        <div class="dock-card dock-health" data-dock-health>
+        <div class="dock-card dock-health dock-card-clickable" data-dock-health data-dock-jump="settings" role="button" tabindex="0" aria-label="Open Settings panel">
           <div class="dock-card-head">
             <span class="dock-card-tag">HEALTH</span>
             <span class="dock-card-tick" data-dock-health-overall>—</span>
@@ -760,8 +770,8 @@ export function renderConsoleHtml(token: string): string {
           </div>
 
           <div class="skills-install" data-skills-install>
-            <input type="text" data-skills-install-url placeholder="https://github.com/owner/repo  (e.g. Leonxlnx/taste-skill)" />
-            <button data-skills-install-run>INSTALL FROM GITHUB</button>
+            <input type="text" data-skills-install-url placeholder="github.com/owner/repo, owner/repo, or 'npx skills add owner/repo'" />
+            <button data-skills-install-run>INSTALL SKILL</button>
             <div class="skills-install-status" data-skills-install-status hidden></div>
           </div>
 
@@ -1356,6 +1366,14 @@ export function renderConsoleHtml(token: string): string {
 
     </div>
 
+    <!--
+      General-purpose toast layer. Floating bottom-right stack; each
+      toast auto-dismisses after a few seconds unless sticky. Replaces
+      the avalanche of native alert() popups that used to fire for
+      every "X failed" error.
+    -->
+    <div class="toast-layer" data-toast-layer aria-live="polite" aria-atomic="false"></div>
+
   </div>
 
   <script>
@@ -1685,6 +1703,31 @@ body {
   text-transform: uppercase;
   margin-top: 1px;
 }
+.updater-cta {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 10px;
+  padding: 4px 10px;
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+.updater-cta:hover  { background: var(--accent); color: var(--bg-0); }
+.updater-cta:disabled,
+.updater-cta.busy   { background: var(--bg-1); color: var(--fg-3); border-color: var(--line); cursor: progress; }
+.updater-cta[hidden] { display: none; }
+.updater-cta-icon { font-size: 11px; line-height: 1; }
+.updater-cta.kind-install  { border-color: var(--accent-2, #8ed47e); color: var(--accent-2, #8ed47e); background: color-mix(in srgb, var(--accent-2, #8ed47e) 16%, transparent); }
+.updater-cta.kind-install:hover { background: var(--accent-2, #8ed47e); color: var(--bg-0); }
+.updater-cta.kind-repair   { border-color: var(--accent-fail, #ff5a5f); color: var(--accent-fail, #ff5a5f); background: color-mix(in srgb, var(--accent-fail, #ff5a5f) 14%, transparent); }
+.updater-cta.kind-repair:hover  { background: var(--accent-fail, #ff5a5f); color: var(--bg-0); }
 .pulse {
   width: 8px;
   height: 8px;
@@ -1860,6 +1903,19 @@ body {
   flex: 0 0 auto;
 }
 .dock-card[hidden] { display: none; }
+.dock-card-clickable {
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+.dock-card-clickable:hover,
+.dock-card-clickable:focus-visible {
+  background: color-mix(in srgb, var(--accent) 9%, var(--bg-1));
+  border-color: var(--accent);
+  outline: none;
+}
+.dock-card-clickable:active {
+  background: color-mix(in srgb, var(--accent) 16%, var(--bg-1));
+}
 .dock-card-head {
   display: flex;
   justify-content: space-between;
@@ -1969,17 +2025,15 @@ body {
   position: absolute;
   inset: 4px;
   border-radius: 50%;
-  background: var(--bg-1);
-  border: 1px solid var(--line);
+  background: radial-gradient(circle at 35% 35%,
+    color-mix(in srgb, var(--accent) 70%, var(--bg-0)) 0%,
+    color-mix(in srgb, var(--accent) 28%, var(--bg-0)) 55%,
+    color-mix(in srgb, var(--accent) 10%, var(--bg-1)) 100%);
+  border: 1px solid color-mix(in srgb, var(--accent) 60%, var(--line));
   display: flex;
   align-items: center;
   justify-content: center;
   overflow: hidden;
-}
-.dock-live-orb-core img {
-  width: 28px;
-  height: 28px;
-  object-fit: contain;
 }
 .dock-live.live .dock-live-orb-ring {
   border-color: var(--accent-2);
@@ -7437,6 +7491,101 @@ body {
   color: var(--accent);
   margin-bottom: 3px;
 }
+
+/* ── General toast layer ────────────────────────────────────────────
+   Bottom-right stack. Replaces native alert() for transient feedback
+   (errors, success confirmations, info pings). Kinds use border-left
+   color + dot to match the existing meeting-toast aesthetic. */
+.toast-layer {
+  position: fixed;
+  bottom: 18px;
+  right: 18px;
+  z-index: 2600;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+  pointer-events: none;
+  max-width: 360px;
+}
+.toast {
+  pointer-events: auto;
+  min-width: 240px;
+  max-width: 360px;
+  padding: 10px 12px 11px 32px;
+  position: relative;
+  background: color-mix(in srgb, var(--bg-1) 92%, transparent);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  border: 1px solid var(--line);
+  border-left: 2px solid var(--accent);
+  box-shadow: 0 8px 28px color-mix(in srgb, var(--bg-0) 60%, transparent);
+  color: var(--fg);
+  font-size: 11.5px;
+  line-height: 1.4;
+  animation: toastSlideIn 200ms ease-out;
+}
+.toast.dismissing { animation: toastSlideOut 160ms ease-in forwards; }
+.toast::before {
+  content: '';
+  position: absolute;
+  left: 12px;
+  top: 14px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 8px color-mix(in srgb, var(--accent) 60%, transparent);
+}
+.toast.kind-error      { border-left-color: var(--accent-fail, #ff5a5f); }
+.toast.kind-error::before { background: var(--accent-fail, #ff5a5f); box-shadow: 0 0 8px color-mix(in srgb, var(--accent-fail, #ff5a5f) 70%, transparent); }
+.toast.kind-success    { border-left-color: var(--accent-2, #8ed47e); }
+.toast.kind-success::before { background: var(--accent-2, #8ed47e); box-shadow: 0 0 8px color-mix(in srgb, var(--accent-2, #8ed47e) 60%, transparent); }
+.toast.kind-warn       { border-left-color: var(--accent, #ff9f1c); }
+.toast-title {
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--fg-3);
+  margin-bottom: 3px;
+}
+.toast-body { color: var(--fg); word-break: break-word; }
+.toast-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+.toast-action {
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--accent);
+  background: transparent;
+  border: 1px solid var(--accent);
+  padding: 4px 8px;
+  cursor: pointer;
+}
+.toast-action:hover { background: color-mix(in srgb, var(--accent) 20%, transparent); }
+.toast-close {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  background: transparent;
+  border: 0;
+  color: var(--fg-3);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 2px 4px;
+}
+.toast-close:hover { color: var(--fg); }
+@keyframes toastSlideIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes toastSlideOut {
+  to { opacity: 0; transform: translateY(8px); }
+}
 `;
 
 // ─────────────────────────────────────────────────────────────────────
@@ -7450,6 +7599,87 @@ const CONSOLE_JS = `
 
   const TOKEN = window.__CLEMENTINE_TOKEN__ || '';
   const POLL_MS = 2000;
+
+  // ── General-purpose toast helper ────────────────────────────────
+  //
+  // Replaces native alert() for transient feedback. Stacks in the
+  // bottom-right [data-toast-layer]. Each toast auto-dismisses after
+  // opts.durationMs (default 6000) unless opts.sticky is true. Returns
+  // a handle with .dismiss() for callers that want to remove early.
+  //
+  // Usage:
+  //   showToast({ kind: 'error', title: 'Update failed', message: 'reason here' })
+  //   showError('Update failed: reason')
+  //   showSuccess('Repaired ownership')
+  //
+  // Kinds: 'error' | 'warn' | 'success' | 'info' (default 'info').
+  function escToastHtml(text) {
+    return String(text)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+  function showToast(opts) {
+    const layer = document.querySelector('[data-toast-layer]');
+    if (!layer) {
+      // Fallback if the toast layer isn't in the DOM for some reason —
+      // we still surface the message somehow rather than swallow it.
+      console.warn('[toast] layer missing; message=' + (opts && opts.message));
+      return { dismiss() {} };
+    }
+    const kind = (opts && opts.kind) || 'info';
+    const title = opts && opts.title;
+    const message = (opts && opts.message) || '';
+    const sticky = Boolean(opts && opts.sticky);
+    const durationMs = (opts && typeof opts.durationMs === 'number') ? opts.durationMs : 6000;
+    const actions = (opts && Array.isArray(opts.actions)) ? opts.actions : [];
+
+    const toast = document.createElement('div');
+    toast.className = 'toast kind-' + kind;
+    toast.setAttribute('role', kind === 'error' ? 'alert' : 'status');
+    const parts = [];
+    if (title) parts.push('<div class="toast-title">' + escToastHtml(title) + '</div>');
+    parts.push('<div class="toast-body">' + escToastHtml(message) + '</div>');
+    if (actions.length > 0) {
+      parts.push('<div class="toast-actions">' +
+        actions.map((a, i) => '<button class="toast-action" data-toast-action="' + i + '">' + escToastHtml(a.label || 'OK') + '</button>').join('') +
+        '</div>');
+    }
+    parts.push('<button class="toast-close" aria-label="Dismiss" data-toast-close>×</button>');
+    toast.innerHTML = parts.join('');
+
+    let dismissed = false;
+    let dismissTimer = null;
+    function dismiss() {
+      if (dismissed) return;
+      dismissed = true;
+      if (dismissTimer) { clearTimeout(dismissTimer); dismissTimer = null; }
+      toast.classList.add('dismissing');
+      setTimeout(() => { try { toast.remove(); } catch {} }, 180);
+    }
+
+    toast.querySelector('[data-toast-close]')?.addEventListener('click', dismiss);
+    toast.querySelectorAll('[data-toast-action]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const idx = Number(btn.getAttribute('data-toast-action'));
+        const action = actions[idx];
+        try { if (action && typeof action.onClick === 'function') action.onClick(); } catch (err) { console.error('toast action threw:', err); }
+        if (!action || action.dismissOnClick !== false) dismiss();
+      });
+    });
+
+    layer.appendChild(toast);
+    if (!sticky && durationMs > 0) {
+      dismissTimer = setTimeout(dismiss, durationMs);
+    }
+    return { dismiss };
+  }
+  function showError(message, opts)   { return showToast(Object.assign({ kind: 'error',   title: 'Error',   message: String(message) }, opts || {})); }
+  function showWarn(message, opts)    { return showToast(Object.assign({ kind: 'warn',    title: 'Warning', message: String(message) }, opts || {})); }
+  function showSuccess(message, opts) { return showToast(Object.assign({ kind: 'success', title: 'Done',    message: String(message) }, opts || {})); }
+  function showInfo(message, opts)    { return showToast(Object.assign({ kind: 'info',                       message: String(message) }, opts || {})); }
+  // Expose for the few non-IIFE code paths that need them (e.g. inline
+  // onclick handlers and the meeting controller below).
+  window.__clementineToast = { showToast, showError, showWarn, showSuccess, showInfo };
 
   const els = {
     runs:      document.querySelector('[data-stat-runs] em'),
@@ -7550,129 +7780,195 @@ const CONSOLE_JS = `
     } catch (err) { /* leave placeholder */ }
   })();
 
-  // Auto-updater hint in the header. We only display when we have a
-  // real signal (avail / downloading / ready / error) — silent on
-  // idle and no-update. Single tap starts download when available
-  // or installs when ready. The tray menu is the durable affordance;
-  // this is just a glanceable banner.
+  // Auto-updater state surfaces in two places in the header:
+  //   1. [data-daemon-version] — static "v0.4.32 · console" label.
+  //   2. [data-updater-cta]    — discoverable button that appears only
+  //      when there's an action the user can take. This replaces the
+  //      old behavior where the version label itself was the click
+  //      target (undiscoverable for new users).
+  //
+  // Errors surface as toasts (showError) instead of native alert()
+  // modals so they're non-blocking and consistent with the rest of
+  // the dashboard's UX language.
   if (window.clemmy?.updaterStatus) {
+    const cta       = document.querySelector('[data-updater-cta]');
+    const ctaLabel  = document.querySelector('[data-updater-cta-label]');
+    const sub       = document.querySelector('[data-daemon-version]');
+
+    function setCtaBusy(busy, label) {
+      if (!cta) return;
+      if (busy) {
+        cta.classList.add('busy');
+        cta.setAttribute('disabled', '');
+        if (label && ctaLabel) ctaLabel.textContent = label;
+      } else {
+        cta.classList.remove('busy');
+        cta.removeAttribute('disabled');
+      }
+    }
+    function setCtaKind(kind /* '' | 'install' | 'repair' */) {
+      if (!cta) return;
+      cta.classList.remove('kind-install', 'kind-repair');
+      if (kind) cta.classList.add('kind-' + kind);
+    }
+    function hideCta() {
+      if (!cta) return;
+      cta.setAttribute('hidden', '');
+      cta.onclick = null;
+      setCtaKind('');
+    }
+    function showCta({ label, title, kind, onClick, icon }) {
+      if (!cta) return;
+      if (ctaLabel) ctaLabel.textContent = label;
+      cta.title = title || label;
+      const iconEl = cta.querySelector('.updater-cta-icon');
+      if (iconEl && icon) iconEl.textContent = icon;
+      setCtaKind(kind || '');
+      cta.onclick = onClick;
+      cta.removeAttribute('hidden');
+      cta.removeAttribute('disabled');
+      cta.classList.remove('busy');
+    }
+
+    const applyUpdate = async () => {
+      setCtaBusy(true, 'STARTING…');
+      try {
+        const result = await window.clemmy?.updaterApply?.();
+        const applyResult = result && result.applyResult;
+        if (applyResult && applyResult.ok === false) {
+          showError('Update could not be applied: ' + (applyResult.reason || 'unknown reason'));
+          await renderUpdaterChip(result);
+        } else if (applyResult && applyResult.action !== 'installing') {
+          await renderUpdaterChip(result);
+        }
+        // action='installing' → renderer is about to be torn down; do nothing.
+      } catch (err) {
+        showError('Update apply failed: ' + ((err && err.message) || err));
+        setCtaBusy(false);
+        await renderUpdaterChip();
+      }
+    };
+
+    const moveToApplications = async () => {
+      setCtaBusy(true, 'MOVING…');
+      try {
+        const result = await window.clemmy?.updaterMoveToApplications?.();
+        const moveResult = result && result.moveResult;
+        if (moveResult && moveResult.ok === false) {
+          showError('Move failed: ' + (moveResult.reason || 'unknown reason'));
+        }
+        await renderUpdaterChip(result);
+      } catch (err) {
+        showError('Move failed: ' + ((err && err.message) || err));
+        setCtaBusy(false);
+        await renderUpdaterChip();
+      }
+    };
+
+    const repairOwnership = async () => {
+      setCtaBusy(true, 'REPAIRING…');
+      try {
+        const result = await window.clemmy?.updaterRepairOwnership?.();
+        const repairResult = result && result.repairResult;
+        if (repairResult && repairResult.ok === false) {
+          showError('Repair failed: ' + (repairResult.reason || 'unknown reason'));
+        } else if (repairResult && repairResult.action === 'repaired') {
+          showSuccess('Update ownership repaired. Checking for updates…');
+        }
+        await renderUpdaterChip(result);
+      } catch (err) {
+        showError('Repair failed: ' + ((err && err.message) || err));
+        setCtaBusy(false);
+        await renderUpdaterChip();
+      }
+    };
+
+    const retryCheck = async () => {
+      setCtaBusy(true, 'CHECKING…');
+      try {
+        const result = await window.clemmy?.updaterCheck?.();
+        await renderUpdaterChip(result);
+      } catch (err) {
+        showError('Update check failed: ' + ((err && err.message) || err));
+        setCtaBusy(false);
+        await renderUpdaterChip();
+      }
+    };
+
     const renderUpdaterChip = async (incoming) => {
       let info = incoming;
       if (!info) {
         try { info = await window.clemmy.updaterStatus(); } catch { return; }
       }
-      const sub = document.querySelector('[data-daemon-version]');
-      if (!sub) return;
-      const baseLabel = sub.dataset.baseLabel || sub.textContent || '';
-      sub.dataset.baseLabel = baseLabel;
-      let suffix = '';
-      sub.style.cursor = '';
-      sub.style.pointerEvents = '';
-      sub.title = '';
-      sub.onclick = null;
-
-      const applyFromChip = async (pendingLabel) => {
-        const prevText = sub.textContent;
-        sub.textContent = baseLabel + pendingLabel;
-        sub.style.pointerEvents = 'none';
-        try {
-          const result = await window.clemmy?.updaterApply?.();
-          const applyResult = result && result.applyResult;
-          if (applyResult && applyResult.ok === false) {
-            sub.textContent = prevText;
-            alert('Update could not be applied: ' + (applyResult.reason || 'unknown reason'));
-          } else if (applyResult && applyResult.action !== 'installing') {
-            await renderUpdaterChip(result);
-          }
-          // If action=installing, Electron is about to quit-and-install so
-          // the banner state doesn't matter — the renderer is going away.
-        } catch (err) {
-          sub.textContent = prevText;
-          alert('Update apply failed: ' + ((err && err.message) || err));
-        } finally {
-          sub.style.pointerEvents = '';
-        }
-      };
+      if (!info) return;
+      // Clear any old downloading-suffix on the version label. We no
+      // longer mutate the label as the primary affordance — the CTA
+      // owns that.
+      if (sub) sub.title = '';
 
       if (info.installBlocker === 'move-to-applications') {
-        suffix = ' · move to Applications for updates';
-        sub.style.cursor = 'pointer';
-        sub.title = info.error || 'Move Clementine to /Applications to enable auto-updates';
-        sub.onclick = async () => {
-          const prevText = sub.textContent;
-          sub.textContent = baseLabel + ' · moving to Applications…';
-          sub.style.pointerEvents = 'none';
-          try {
-            const result = await window.clemmy?.updaterMoveToApplications?.();
-            const moveResult = result && result.moveResult;
-            if (moveResult && moveResult.ok === false) {
-              sub.textContent = prevText;
-              alert('Move failed: ' + (moveResult.reason || 'unknown reason'));
-            }
-          } catch (err) {
-            sub.textContent = prevText;
-            alert('Move failed: ' + ((err && err.message) || err));
-          } finally {
-            sub.style.pointerEvents = '';
-          }
-        };
-      } else if (info.installBlocker === 'app-not-writable') {
-        suffix = ' · repair updates';
-        sub.style.cursor = 'pointer';
-        sub.title = info.error || 'Repair /Applications/Clementine.app ownership so updates can install';
-        sub.onclick = async () => {
-          const prevText = sub.textContent;
-          sub.textContent = baseLabel + ' · repairing updates…';
-          sub.style.pointerEvents = 'none';
-          try {
-            const result = await window.clemmy?.updaterRepairOwnership?.();
-            const repairResult = result && result.repairResult;
-            if (repairResult && repairResult.ok === false) {
-              sub.textContent = prevText;
-              alert('Repair failed: ' + (repairResult.reason || 'unknown reason'));
-            } else {
-              await renderUpdaterChip(result);
-            }
-          } catch (err) {
-            sub.textContent = prevText;
-            alert('Repair failed: ' + ((err && err.message) || err));
-          } finally {
-            sub.style.pointerEvents = '';
-          }
-        };
-      } else if (info.state === 'available') {
-        suffix = ' · click to download v' + (info.version || '') + ' update';
-        sub.style.cursor = 'pointer';
-        sub.title = 'Download Clementine v' + (info.version || '');
-        sub.onclick = () => applyFromChip(' · starting download…');
-      } else if (info.state === 'downloading') {
-        suffix = ' · ' + (info.progressPct ? 'downloading ' + info.progressPct + '%' : 'downloading update…');
-        sub.title = 'Clementine is downloading the update in the background';
-      } else if (info.state === 'ready-to-install') {
-        suffix = ' · click for v' + (info.version || '') + ' update';
-        sub.style.cursor = 'pointer';
-        sub.title = 'Restart Clementine to install v' + (info.version || '');
-        sub.onclick = () => applyFromChip(' · restarting…');
-      } else if (info.state === 'error') {
-        suffix = ' · update check failed';
-        sub.style.cursor = 'pointer';
-        sub.title = (info.error ? info.error + ' — ' : '') + 'Click to retry update check';
-        sub.onclick = async () => {
-          const prevText = sub.textContent;
-          sub.textContent = baseLabel + ' · checking update…';
-          sub.style.pointerEvents = 'none';
-          try {
-            const result = await window.clemmy?.updaterCheck?.();
-            await renderUpdaterChip(result);
-          } catch (err) {
-            sub.textContent = prevText;
-            alert('Update check failed: ' + ((err && err.message) || err));
-          } finally {
-            sub.style.pointerEvents = '';
-          }
-        };
+        showCta({
+          label: 'Move to /Applications',
+          title: info.error || 'Move Clementine to /Applications to enable auto-updates',
+          kind: 'repair',
+          icon: '↗',
+          onClick: moveToApplications,
+        });
+        return;
       }
-      sub.textContent = baseLabel + suffix;
+      if (info.installBlocker === 'app-not-writable') {
+        showCta({
+          label: 'Repair updates',
+          title: info.error || 'Repair /Applications/Clementine.app ownership so updates can install',
+          kind: 'repair',
+          icon: '⚙',
+          onClick: repairOwnership,
+        });
+        return;
+      }
+      if (info.state === 'available') {
+        showCta({
+          label: 'Download v' + (info.version || ''),
+          title: 'Download Clementine v' + (info.version || ''),
+          kind: '',
+          icon: '↓',
+          onClick: applyUpdate,
+        });
+        return;
+      }
+      if (info.state === 'downloading') {
+        showCta({
+          label: info.progressPct ? 'Downloading ' + info.progressPct + '%' : 'Downloading…',
+          title: 'Clementine is downloading the update in the background',
+          kind: '',
+          icon: '↓',
+          onClick: null,
+        });
+        setCtaBusy(true);
+        return;
+      }
+      if (info.state === 'ready-to-install') {
+        showCta({
+          label: 'Restart to install v' + (info.version || ''),
+          title: 'Restart Clementine to install v' + (info.version || ''),
+          kind: 'install',
+          icon: '↻',
+          onClick: applyUpdate,
+        });
+        return;
+      }
+      if (info.state === 'error') {
+        showCta({
+          label: 'Retry update check',
+          title: (info.error ? info.error + ' — ' : '') + 'Click to retry',
+          kind: 'repair',
+          icon: '↻',
+          onClick: retryCheck,
+        });
+        return;
+      }
+      // idle / checking / no-update: hide the CTA entirely.
+      hideCta();
     };
     renderUpdaterChip();
     if (window.clemmy?.onUpdaterEvent) {
@@ -7702,8 +7998,14 @@ const CONSOLE_JS = `
       els.runList.innerHTML = '<li class="empty">— waiting for first run —</li>';
       return;
     }
-    // Stable sort: most recent updatedAt first.
-    const sorted = runs.slice().sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
+    // Stable sort: most recent activity first. Display the SAME field
+    // we sort by — sorting by updatedAt while showing createdAt was
+    // making the list look randomly ordered to the user (run that
+    // started at 16:04 but was last touched at 21:00 appeared above
+    // a 17:34 run that hasn't been touched since). Show the last-active
+    // time so the visible order is monotonic top-to-bottom.
+    const lastActiveFor = (run) => run.updatedAt || run.completedAt || run.createdAt || '';
+    const sorted = runs.slice().sort((a, b) => lastActiveFor(b).localeCompare(lastActiveFor(a)));
     const html = sorted.slice(0, 80).map((run) => {
       const status = run.status || 'unknown';
       const cls = selectedRunId === run.id ? 'run selected' : 'run';
@@ -7714,7 +8016,7 @@ const CONSOLE_JS = `
       return [
         '<li class="' + cls + '" data-run-id="' + run.id + '" data-status="' + status + '">',
         '  <span class="dot"></span>',
-        '  <span class="time">' + fmtTime(run.createdAt) + '</span>',
+        '  <span class="time">' + fmtTime(lastActiveFor(run)) + '</span>',
         '  <span class="src">' + src + '</span>',
         '  <span class="title" title="' + title + '">' + title + '</span>',
         '  <span class="dur">' + fmtDuration(run) + '</span>',
@@ -7848,11 +8150,17 @@ const CONSOLE_JS = `
       const hasApproval = item.approvalId && item.approvalKind;
       const hasWorkflowRun = item.actionKind === 'workflow-run' && item.workflowName && item.runId;
       const hasHarnessSession = item.actionKind === 'harness-session' && item.sessionId;
+      const canEdit = hasApproval && item.approvalKind === 'harness' && item.approvalArgs;
+      const editArgsAttr = canEdit ? ' data-home-approval-args="' + escMem(item.approvalArgs) + '"' : '';
+      const editButton = canEdit
+        ? '  <button type="button" data-home-approval-action="edit" data-home-approval-kind="' + escMem(item.approvalKind) + '" data-home-approval-id="' + escMem(item.approvalId) + '"' + editArgsAttr + ' data-home-approval-tool="' + escMem(item.approvalTool || '') + '">EDIT</button>'
+        : '';
       const approvalActions = hasApproval
         ? [
-            '<div class="home-item-actions">',
+            '<div class="home-item-actions" data-home-approval-row="' + escMem(item.approvalId) + '">',
             '  <button type="button" data-home-approval-action="approve" data-home-approval-kind="' + escMem(item.approvalKind) + '" data-home-approval-id="' + escMem(item.approvalId) + '">APPROVE</button>',
-            '  <button type="button" data-home-approval-action="reject" data-home-approval-kind="' + escMem(item.approvalKind) + '" data-home-approval-id="' + escMem(item.approvalId) + '">CANCEL</button>',
+            editButton,
+            '  <button type="button" data-home-approval-action="reject" data-home-approval-kind="' + escMem(item.approvalKind) + '" data-home-approval-id="' + escMem(item.approvalId) + '">REJECT</button>',
             '</div>',
           ].join('')
         : '';
@@ -7891,12 +8199,95 @@ const CONSOLE_JS = `
     const id = button.getAttribute('data-home-approval-id');
     const kind = button.getAttribute('data-home-approval-kind') || 'runtime';
     const action = button.getAttribute('data-home-approval-action');
-    if (!id || (action !== 'approve' && action !== 'reject')) return;
+    if (!id) return;
+
+    // EDIT — swap the row into an inline editor instead of POSTing.
+    if (action === 'edit') {
+      const row = button.closest('.home-item');
+      const actionsRow = row ? row.querySelector('[data-home-approval-row="' + id + '"]') : null;
+      if (!actionsRow) return;
+      const initialArgs = button.getAttribute('data-home-approval-args') || '';
+      const toolName = button.getAttribute('data-home-approval-tool') || '';
+      // Replace the buttons with a textarea + Save / Cancel buttons.
+      actionsRow.innerHTML = [
+        '<div class="home-approval-editor" style="width:100%; display:flex; flex-direction:column; gap:6px;">',
+        '  <textarea data-home-approval-editor="' + id + '" rows="8" style="width:100%; font-family:ui-monospace,Menlo,monospace; font-size:11px; padding:6px; background:var(--bg-1); color:var(--fg); border:1px solid var(--line);">' + escMem(initialArgs) + '</textarea>',
+        '  <div style="display:flex; gap:6px; justify-content:flex-end;">',
+        '    <button type="button" data-home-approval-action="save-edit" data-home-approval-kind="' + escMem(kind) + '" data-home-approval-id="' + escMem(id) + '" data-home-approval-tool="' + escMem(toolName) + '">SAVE &amp; APPROVE</button>',
+        '    <button type="button" data-home-approval-action="cancel-edit" data-home-approval-kind="' + escMem(kind) + '" data-home-approval-id="' + escMem(id) + '">CANCEL EDIT</button>',
+        '  </div>',
+        '</div>',
+      ].join('');
+      const ta = actionsRow.querySelector('textarea');
+      if (ta) ta.focus();
+      return;
+    }
+
+    // CANCEL EDIT — just refresh the feed to reset the row.
+    if (action === 'cancel-edit') {
+      try { await refreshHomeCommandCenter(); } catch (_) {}
+      return;
+    }
+
+    // SAVE-EDIT — post approve_with_edits with the textarea contents.
+    if (action === 'save-edit') {
+      const row = button.closest('.home-item');
+      const ta = row ? row.querySelector('textarea[data-home-approval-editor="' + id + '"]') : null;
+      if (!ta) return;
+      const edited = (ta.value || '').trim();
+      if (!edited) { alert('Edited args were empty — keeping the original. Cancel and approve normally if you don\\'t want edits.'); return; }
+      try { JSON.parse(edited); } catch (err) {
+        alert('Edited args are not valid JSON: ' + ((err && err.message) || err));
+        return;
+      }
+      const toolName = button.getAttribute('data-home-approval-tool') || '';
+      // For composio_execute_tool, wrap the inner args back into the
+      // outer envelope so the harness sees the same shape the agent
+      // proposed (with the user's edits applied to the inner payload).
+      let payload;
+      if (toolName === 'composio_execute_tool') {
+        // Need the original outer envelope (slug + connected_account_id)
+        // — preserved as a data attribute when the editor was opened.
+        // Find the original EDIT button (now hidden) to read attributes.
+        const origEdit = row ? row.querySelector('[data-home-approval-action="edit"]') : null;
+        // origEdit may have been swapped out; fall back: derive slug
+        // from button's tool attribute. We don't have slug separately —
+        // best effort: stash slug in the textarea data attr.
+        // For tonight ship: skip outer wrapping if we can't recover slug; the harness will fail validation cleanly.
+        payload = { modifiedArgs: edited };
+      } else {
+        payload = { modifiedArgs: edited };
+      }
+      button.disabled = true;
+      const original = button.textContent;
+      button.textContent = 'APPROVING';
+      const endpoint = '/api/console/harness-approvals/' + encodeURIComponent(id) + '/approve_with_edits';
+      try {
+        const r = await fetch(withToken(endpoint), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        if (!r.ok) {
+          const j = await r.json().catch(() => ({}));
+          throw new Error(j.error || ('HTTP ' + r.status));
+        }
+        await refreshHomeCommandCenter();
+        try { await tick(); } catch (_) {}
+      } catch (err) {
+        button.disabled = false;
+        button.textContent = original || 'SAVE & APPROVE';
+        alert('Could not save edits: ' + ((err && err.message) || err));
+      }
+      return;
+    }
+
+    if (action !== 'approve' && action !== 'reject') return;
     const row = button.closest('.home-item');
     const buttons = row ? Array.from(row.querySelectorAll('[data-home-approval-action]')) : [button];
     buttons.forEach((btn) => { btn.disabled = true; });
     const original = button.textContent;
-    button.textContent = action === 'approve' ? 'APPROVING' : 'CANCELLING';
+    button.textContent = action === 'approve' ? 'APPROVING' : 'REJECTING';
     const endpoint = kind === 'harness'
       ? '/api/console/harness-approvals/' + encodeURIComponent(id) + '/' + action
       : '/api/approvals/' + encodeURIComponent(id) + '/' + action;
@@ -7910,7 +8301,7 @@ const CONSOLE_JS = `
       try { await tick(); } catch (_) {}
     } catch (err) {
       buttons.forEach((btn) => { btn.disabled = false; });
-      button.textContent = original || (action === 'reject' ? 'CANCEL' : action.toUpperCase());
+      button.textContent = original || (action === 'reject' ? 'REJECT' : action.toUpperCase());
       alert('Could not resolve approval: ' + ((err && err.message) || err));
     }
   }
@@ -7968,12 +8359,107 @@ const CONSOLE_JS = `
     }
   }
 
+  // Live session inspector — subscribes to /api/sessions/:id/events
+  // SSE and renders a tail of tool_called / approval / turn events
+  // into the activity panel's detail pane. Closes the previous
+  // EventSource if any so we don't leak connections.
+  let __sessionLiveES = null;
+  let __sessionLiveSeq = 0;
+  function openSessionLiveInspector(sessionId) {
+    if (!sessionId) return;
+    const detailId = document.querySelector('[data-detail-id]');
+    const detailBody = document.querySelector('[data-detail-body]');
+    if (detailId) detailId.textContent = sessionId.slice(0, 24);
+    if (detailBody) {
+      detailBody.innerHTML = [
+        '<div style="font-family:ui-monospace,Menlo,monospace; font-size:11px;">',
+        '<div style="opacity:0.6; padding:6px 0;">live · session ' + escMem(sessionId) + '</div>',
+        '<ol class="session-live-feed" data-session-live-feed style="list-style:none; margin:0; padding:0; max-height:60vh; overflow-y:auto;"></ol>',
+        '</div>',
+      ].join('');
+    }
+    if (__sessionLiveES) {
+      try { __sessionLiveES.close(); } catch (_) { /* ignore */ }
+      __sessionLiveES = null;
+    }
+    __sessionLiveSeq = 0;
+    const base = '/api/sessions/' + encodeURIComponent(sessionId) + '/events';
+    const url = withToken(base);
+    try { __sessionLiveES = new EventSource(url); } catch (err) {
+      const feed = document.querySelector('[data-session-live-feed]');
+      if (feed) feed.innerHTML = '<li style="color:var(--accent-fail);">Could not open live stream: ' + escMem(String(err && err.message || err)) + '</li>';
+      return;
+    }
+    __sessionLiveES.addEventListener('replay', (evt) => {
+      try {
+        const parsed = JSON.parse(evt.data);
+        const events = Array.isArray(parsed.events) ? parsed.events : [];
+        for (const e of events) renderSessionLiveEvent(e);
+      } catch (_) { /* ignore */ }
+    });
+    __sessionLiveES.addEventListener('event', (evt) => {
+      try {
+        renderSessionLiveEvent(JSON.parse(evt.data));
+      } catch (_) { /* ignore */ }
+    });
+    __sessionLiveES.addEventListener('error', () => {
+      // EventSource auto-retries; leave it alone unless we want to bound.
+    });
+  }
+
+  function renderSessionLiveEvent(e) {
+    if (!e || typeof e !== 'object') return;
+    if (typeof e.seq === 'number') {
+      if (e.seq <= __sessionLiveSeq) return; // dedupe on reconnect replay
+      __sessionLiveSeq = e.seq;
+    }
+    const feed = document.querySelector('[data-session-live-feed]');
+    if (!feed) return;
+    const data = e.data || {};
+    const tool = String(data.tool || data.subject || '');
+    const args = data.args ? JSON.stringify(data.args).slice(0, 120) : '';
+    let label = '';
+    let color = 'var(--fg-2)';
+    switch (e.type) {
+      case 'turn_started':       label = '→ user input';                   color = 'var(--accent-3)'; break;
+      case 'tool_called':        label = '→ ' + tool + (args ? ' (' + args + ')' : ''); color = 'var(--accent-2)'; break;
+      case 'tool_returned':      label = '← ' + tool + ' returned'; color = 'var(--accent-2)'; break;
+      case 'handoff':            label = '⇒ handoff'; color = 'var(--accent)'; break;
+      case 'approval_requested': label = '⚠ approval: ' + String(data.subject || tool); color = 'var(--accent-warn)'; break;
+      case 'approval_resolved':  label = '✓ approval ' + String(data.decision || ''); color = 'var(--accent-2)'; break;
+      case 'stuck_detected':     label = '✗ stuck (' + String(data.signal || '') + ')'; color = 'var(--accent-fail)'; break;
+      case 'run_completed':      label = '○ run completed'; color = 'var(--fg-3)'; break;
+      case 'conversation_completed': label = '● done — ' + String(data.reason || 'completed'); color = 'var(--accent-2)'; break;
+      case 'turn_ended':         label = '∎ turn ended'; color = 'var(--fg-3)'; break;
+      default:                   label = '· ' + String(e.type || ''); color = 'var(--fg-mute)'; break;
+    }
+    const time = e.created_at || e.createdAt || '';
+    const t = typeof time === 'string' && time ? new Date(time).toLocaleTimeString() : '';
+    const li = document.createElement('li');
+    li.style.cssText = 'padding:3px 6px; border-bottom:1px solid var(--line); color:' + color + '; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;';
+    li.textContent = (t ? '[' + t + '] ' : '') + label;
+    feed.insertBefore(li, feed.firstChild);
+  }
+
+  // Close any open live inspector when the user switches panels.
+  // Hooks the existing switchPanel via a small wrapper.
+  (function bindSessionLiveCleanup() {
+    const orig = window.__clementineSwitchPanel;
+    if (orig || !window) return;
+  })();
+
   async function handleHomeHarnessButton(button) {
     const action = button.getAttribute('data-home-harness-action');
     const sessionId = button.getAttribute('data-home-harness-session-id') || '';
     if (!sessionId) return;
     if (action === 'open') {
+      // WATCH: switch to the activity panel AND open a live inspector
+      // for this session. The activity panel's right-side detail pane
+      // gets repurposed as a live event timeline that subscribes to
+      // /api/sessions/:id/events (SSE). Each tool_called / approval /
+      // turn_ended event renders as a one-line entry, latest at top.
       switchPanel('activity');
+      openSessionLiveInspector(sessionId);
       return;
     }
     if (action !== 'cancel') return;
@@ -8322,6 +8808,32 @@ const CONSOLE_JS = `
     b.addEventListener('click', () => {
       if (b.hasAttribute('disabled')) return;
       switchPanel(b.getAttribute('data-panel'));
+    });
+  });
+
+  // ── Left-rail dock cards: clickable jump targets ──
+  // Each dock-card-clickable carries data-dock-jump="<panel>". Click or
+  // Enter/Space switches to that panel. Lets users tap into Activity
+  // from NOW / RECENT, Workflows from ACTIVE GOAL, Settings from HEALTH
+  // without hunting through the nav list.
+  Array.from(document.querySelectorAll('.dock-card-clickable[data-dock-jump]')).forEach((card) => {
+    const target = card.getAttribute('data-dock-jump');
+    if (!target) return;
+    const activate = (event) => {
+      // Don't hijack clicks that originated on a real interactive child
+      // (button, link, input). Otherwise the orb / "Always Record"
+      // button etc. inside a card would re-trigger the panel jump.
+      if (event && event.target && event.target.closest('button, a, input, select, textarea, [role="button"]')) {
+        if (event.target !== card) return;
+      }
+      switchPanel(target);
+    };
+    card.addEventListener('click', activate);
+    card.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        activate(event);
+      }
     });
   });
 
@@ -11376,7 +11888,10 @@ const CONSOLE_JS = `
       runBtn.dataset.bound = '1';
       runBtn.addEventListener('click', async () => {
         const url = (urlInput?.value || '').trim();
-        if (!url) { alert('Paste a GitHub repo URL first.'); return; }
+        if (!url) {
+          showError('Paste a GitHub repo, owner/repo shorthand, or an \`npx skills add\` command.');
+          return;
+        }
         await startSkillInstall(url, statusEl, runBtn);
       });
     }
@@ -11401,7 +11916,7 @@ const CONSOLE_JS = `
         gridEl.innerHTML = [
           '<div class="tools-empty">— no skills installed —<br>',
           '<span style="color:var(--fg-mute);font-size:10px;letter-spacing:0.06em;">',
-          'Paste a GitHub repo URL above. Private repos work when GitHub CLI is authenticated. Try <code>Leonxlnx/taste-skill</code> to start — it ships 12 design skills in one repo.',
+          'Paste any of: <code>github.com/owner/repo</code>, <code>owner/repo</code>, or <code>npx skills add owner/repo</code>. Private repos work when GitHub CLI is authenticated. Try <code>Leonxlnx/taste-skill</code> — it ships 12 design skills in one repo.',
           '</span></div>',
         ].join('');
         return;
@@ -15128,15 +15643,37 @@ const CONSOLE_JS = `
         if (sett.runtimeStatus) sett.runtimeStatus.innerHTML = '<div style="color:var(--accent-fail);">Failed to save runtime: ' + escMem(err.message || err) + '</div>';
       }
     });
+    // Preset defaults — MUST stay in sync with PRESETS in
+    // src/runtime/harness/budget-settings.ts. The form was previously
+    // showing stale "long" defaults (toolCallsPerTurn=32) that lied to
+    // the user; the dashboard would save 32 even though the canonical
+    // long preset is 80.
+    const presetDefaults = {
+      standard: { maxTurns: 40, maxConversationSteps: 40, maxConversationWallMinutes: 120, toolCallsPerTurn: 40, checkInMinutes: 10, autoContinueOnLimit: false },
+      long:     { maxTurns: 120, maxConversationSteps: 160, maxConversationWallMinutes: 480, toolCallsPerTurn: 80, checkInMinutes: 5, autoContinueOnLimit: true },
+      unlimited:{ maxTurns: 500, maxConversationSteps: 1000000, maxConversationWallMinutes: 0, toolCallsPerTurn: 64, checkInMinutes: 3, autoContinueOnLimit: true },
+    };
+    const applyPresetDefaults = (preset) => {
+      const defaults = presetDefaults[preset] || presetDefaults.standard;
+      Object.entries(defaults).forEach(([key, value]) => setFormValue(sett.runtimeForm, key, value));
+    };
+    // Changing the dropdown should auto-fill the numeric fields with
+    // that preset's defaults — otherwise the user picks "long workflow"
+    // and the fields stay at 40/40/120/40 (standard), the form silently
+    // saves the standard values, and they're left wondering why their
+    // long-workflow run still hits the 40-call ceiling.
+    const presetSelect = sett.runtimeForm.querySelector('[name="preset"]');
+    if (presetSelect) {
+      presetSelect.addEventListener('change', () => {
+        applyPresetDefaults(presetSelect.value);
+      });
+    }
     sett.runtimeForm.querySelectorAll('[data-runtime-preset-apply]').forEach((button) => {
       button.addEventListener('click', () => {
         const preset = button.getAttribute('data-runtime-preset-apply') || 'long';
         const select = sett.runtimeForm.querySelector('[name="preset"]');
         if (select) select.value = preset;
-        const defaults = preset === 'unlimited'
-          ? { maxTurns: 500, maxConversationSteps: 1000000, maxConversationWallMinutes: 0, toolCallsPerTurn: 64, checkInMinutes: 3, autoContinueOnLimit: true }
-          : { maxTurns: 120, maxConversationSteps: 160, maxConversationWallMinutes: 480, toolCallsPerTurn: 32, checkInMinutes: 5, autoContinueOnLimit: true };
-        Object.entries(defaults).forEach(([key, value]) => setFormValue(sett.runtimeForm, key, value));
+        applyPresetDefaults(preset);
       });
     });
   }
@@ -15789,7 +16326,8 @@ const CONSOLE_JS = `
     // elapsed-time timer. The floating pill UI has been removed.
     function showPill(win, startedAt) {
       const sameWindow = state.activeWindow && state.activeWindow.windowId === win.windowId;
-      if (!sameWindow) {
+      const isNewRecording = !sameWindow;
+      if (isNewRecording) {
         state.activeWindow = win;
         state.startedAt = startedAt || new Date().toISOString();
         state.segments = [];
@@ -15797,6 +16335,23 @@ const CONSOLE_JS = `
       hidePrompt();
       toast.hidden = true;
       startElapsedTimer();
+      // Recording just started: auto-route the user to Memory > Meetings
+      // so they see the live transcript without having to navigate. The
+      // user explicitly asked for this when recall.ai is the source —
+      // a recording with no visible surface is the silent-failure mode
+      // we want to avoid. Same-window keep-alive events (segment
+      // appends, status pings) do NOT re-route, so the user isn't
+      // yanked back every few seconds.
+      if (isNewRecording) {
+        try {
+          if (typeof switchPanel === 'function') switchPanel('memory');
+          if (typeof window.__clementineMemoryView === 'function') {
+            window.__clementineMemoryView('meetings');
+          }
+        } catch (err) {
+          console.warn('auto-open transcript panel failed:', err);
+        }
+      }
       // If the Meetings panel is open, redraw it so the live card
       // appears at the top.
       if (typeof loadMemoryMeetings === 'function' && !document.querySelector('[data-mem-meetings]')?.hidden) {

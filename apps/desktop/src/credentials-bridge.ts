@@ -40,6 +40,7 @@ const HOME = os.homedir();
 const STATE_DIR = path.join(HOME, '.clementine-next', 'state');
 const VAULT_FILE = path.join(STATE_DIR, 'secrets-vault.json');
 const META_FILE = path.join(STATE_DIR, 'secrets-meta.json');
+const KEYCHAIN_MIGRATION_MARKER = path.join(STATE_DIR, 'keychain-migrated.json');
 
 const KEYCHAIN_SERVICE = 'com.clemmy.desktop.v1';
 
@@ -344,6 +345,123 @@ export async function resetAllCredentials(): Promise<{ keychainDeleted: string[]
     try { unlinkSync(META_FILE); metaDeleted = true; } catch { /* ignore */ }
   }
   return { keychainDeleted, fileVaultDeleted, metaDeleted };
+}
+
+export interface KeychainMigrationResult {
+  ran: boolean;            // false when marker was already present
+  skippedReason?: string;  // 'no_keytar' | 'already_migrated' | 'no_entries'
+  migrated: string[];      // accounts copied from keychain → file vault
+  alreadyInVault: string[];// accounts present in keychain but file vault already had them
+  errors: string[];
+}
+
+/**
+ * One-time migration of any Keychain entries under `com.clemmy.desktop.v1`
+ * into the file vault. Runs once per HOME (gated by the marker file at
+ * STATE_DIR/keychain-migrated.json) and is safe to call on every boot —
+ * the marker keeps it from re-prompting Keychain on subsequent launches.
+ *
+ * Why this exists: v0.4.16 → v0.4.29 wrote credentials into Keychain.
+ * v0.4.30+ writes to the file vault. Users upgrading skip the wizard
+ * (marker present) and would otherwise silently lose access to their
+ * Keychain-stored credentials because the runtime defaults
+ * `allowKeychain: false` everywhere. This bridges them.
+ *
+ * Behavior:
+ *   - Uses `findCredentials(KEYCHAIN_SERVICE)` so the user sees at most
+ *     one Keychain prompt (covers all entries), not one per credential.
+ *   - File vault wins on conflict — never overwrites an existing vault
+ *     entry with a Keychain value.
+ *   - Deletes the Keychain entry after a successful file-vault write
+ *     so future launches stay quiet even if the marker is removed.
+ *   - Marker is written unconditionally on the first successful run so
+ *     we don't keep poking Keychain if there's nothing to migrate.
+ */
+export async function migrateKeychainToFileVault(): Promise<KeychainMigrationResult> {
+  if (existsSync(KEYCHAIN_MIGRATION_MARKER)) {
+    return { ran: false, skippedReason: 'already_migrated', migrated: [], alreadyInVault: [], errors: [] };
+  }
+
+  const keychain = await loadKeytar();
+  if (!keychain) {
+    // No keytar — likely a non-Electron context or stripped build. Mark
+    // done so we don't keep re-attempting.
+    writeMigrationMarker({ result: 'no_keytar' });
+    return { ran: false, skippedReason: 'no_keytar', migrated: [], alreadyInVault: [], errors: [] };
+  }
+
+  const migrated: string[] = [];
+  const alreadyInVault: string[] = [];
+  const errors: string[] = [];
+
+  let entries: Array<{ account: string; password: string }> = [];
+  try {
+    entries = await keychain.findCredentials(KEYCHAIN_SERVICE);
+  } catch (err) {
+    errors.push(`findCredentials failed: ${err instanceof Error ? err.message : String(err)}`);
+    writeMigrationMarker({ result: 'find_failed', errors });
+    return { ran: true, migrated, alreadyInVault, errors };
+  }
+
+  if (entries.length === 0) {
+    writeMigrationMarker({ result: 'no_entries' });
+    return { ran: true, skippedReason: 'no_entries', migrated, alreadyInVault, errors };
+  }
+
+  const vault = readVault();
+  let dirty = false;
+  for (const { account, password } of entries) {
+    if (!password || password.length === 0) continue;
+    if (vault.entries[account] && vault.entries[account].length > 0) {
+      alreadyInVault.push(account);
+      continue;
+    }
+    vault.entries[account] = password;
+    migrated.push(account);
+    dirty = true;
+  }
+
+  if (dirty) {
+    writeVault(vault);
+  }
+
+  // Delete migrated accounts from Keychain only AFTER the file vault
+  // write succeeded. If delete fails (rare; ACL issues), the worst
+  // case is a redundant copy in Keychain — the file copy wins on
+  // subsequent reads because the runtime defaults allowKeychain=false.
+  for (const account of migrated) {
+    try {
+      await keychain.deletePassword(KEYCHAIN_SERVICE, account);
+    } catch (err) {
+      errors.push(`delete ${account}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    // Update credentials-meta so the dashboard shows source=file.
+    const knownName = KNOWN_CREDENTIALS.find((d) => d.name === account)?.name;
+    if (knownName) {
+      updateMeta(knownName, {
+        source: 'file',
+        status: 'connected',
+        lastSetAt: new Date().toISOString(),
+        lastError: undefined,
+      });
+    }
+  }
+
+  writeMigrationMarker({ result: 'completed', migrated, alreadyInVault, errors });
+  return { ran: true, migrated, alreadyInVault, errors };
+}
+
+function writeMigrationMarker(payload: Record<string, unknown>): void {
+  try {
+    ensureStateDir();
+    const tmp = `${KEYCHAIN_MIGRATION_MARKER}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify({ at: new Date().toISOString(), ...payload }, null, 2), { encoding: 'utf-8', mode: 0o600 });
+    renameSync(tmp, KEYCHAIN_MIGRATION_MARKER);
+    try { chmodSync(KEYCHAIN_MIGRATION_MARKER, 0o600); } catch { /* best-effort */ }
+  } catch {
+    // Marker write must never block boot. If we can't write it, we'll
+    // re-attempt migration next launch — annoying but not fatal.
+  }
 }
 
 /**

@@ -611,6 +611,10 @@ function approvalComponentsForState(state: DisplayState): unknown[] | null {
       type: 1, // ActionRow
       components: [
         { type: 2 /* Button */, style: 3 /* Success */, label: 'Approve', custom_id: `clementine:approve:${id}` },
+        // Edit opens a Discord modal pre-filled with the tool's args
+        // JSON. User can change time, recipient, content, etc. before
+        // approving. Cheaper than reject + ask the agent to retry.
+        { type: 2, style: 1 /* Primary */, label: 'Edit', custom_id: `clementine:edit:${id}` },
         { type: 2, style: 4 /* Danger */, label: 'Reject', custom_id: `clementine:reject:${id}` },
       ],
     },
@@ -633,6 +637,48 @@ function renderBody(state: DisplayState): string {
   const verb = state.currentAgent ? `${state.currentAgent} working…` : (state.status || 'working…');
   const body = `_${verb}_`;
   return body.length > MAX_DISCORD_MESSAGE ? body.slice(0, MAX_DISCORD_MESSAGE - 1) + '…' : body;
+}
+
+/**
+ * Translate raw harness/SDK error strings into user-facing copy that
+ * names the cause AND the fix. The default `run_failed.error` field
+ * carries the raw exception message ("Failed to run function tools:
+ * ToolCallsLimitExceeded..."), which tells the user nothing they can
+ * act on. Each case-match here turns one of those into plain English
+ * with the next step the user can actually take.
+ */
+function humanizeRunFailure(error: string): string {
+  const lower = error.toLowerCase();
+  if (lower.includes('toolcallslimitexceeded') || lower.includes('tool calls per turn exceeded')) {
+    const m = error.match(/limit of (\d+)/i);
+    const limit = m ? m[1] : 'the current';
+    return [
+      `🍊 I hit the per-turn tool budget (${limit} tool calls in one turn) and stopped before finishing.`,
+      '',
+      'This usually means I was doing more discovery / file reads than I should have. The single-agent shape lets one turn fan out to 30+ calls for real work, so the default ceiling has been raised — try the request again and I should fit comfortably.',
+      '',
+      'If it keeps happening on the same prompt, you can raise the limit further via the dashboard (Settings → Harness Budget → "Long workflow" preset, or set `HARNESS_TOOL_CALLS_PER_TURN=80` in `~/.clementine-next/.env`).',
+    ].join('\n');
+  }
+  if (lower.includes('maxturnsexceeded') || lower.includes('max_turns')) {
+    return [
+      '🍊 I hit the max-turns ceiling for this conversation and stopped.',
+      '',
+      'That usually means the work is too large for a single chat turn. Either narrow the scope ("just do step 1"), or switch the budget preset to "Long workflow" (Settings → Harness Budget).',
+    ].join('\n');
+  }
+  if (lower.includes('boundary') && lower.includes('codex')) {
+    return `🍊 The model boundary errored mid-turn:\n\n${error}\n\nRetry the same prompt — if it keeps happening, share the supervisor log.`;
+  }
+  if (lower.includes('timeout') || lower.includes('aborted')) {
+    return `🍊 A tool timed out. Raw error:\n\n${error}\n\nUsually a slow external API. Try once more, or skip the failing step and continue.`;
+  }
+  if (lower.includes('unauthorized') || lower.includes('401')) {
+    return `🍊 Got an auth failure mid-turn:\n\n${error}\n\nCheck the integration on the failing toolkit (Settings → Credentials) and reconnect if expired.`;
+  }
+  // Fallback: keep the raw error but frame it so the user knows it's
+  // an honest failure, not a fabricated past-tense lie.
+  return `🍊 The run hit an error and stopped:\n\n${error}\n\nRe-send your request to retry; share this message if it persists.`;
 }
 
 function humanHarnessText(value: unknown, fallback = ''): string {
@@ -1364,7 +1410,12 @@ export function applyEventToState(event: EventRow, state: DisplayState): void {
     }
     case 'run_failed': {
       const error = String(data.error ?? 'failed');
-      state.summary = `Error: ${error}`;
+      // Translate cryptic SDK / harness errors into plain English with
+      // an actionable next step. The default "Failed to run function
+      // tools: ToolCallsLimitExceeded" tells the user nothing they can
+      // act on; this case-matches common failure shapes and rewrites
+      // them into user-facing copy that names the cause and the fix.
+      state.summary = humanizeRunFailure(error);
       state.status = 'failed';
       state.done = true;
       return;

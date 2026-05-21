@@ -32,6 +32,7 @@ import {
   deleteCredential,
   ensureWebhookSecret,
   listCredentialRows,
+  migrateKeychainToFileVault,
   resetAllCredentials,
   setCredential,
   type CredentialName,
@@ -462,6 +463,23 @@ async function boot(): Promise<void> {
   // file vault (which the daemon's SecretStore reads at boot).
   cachedWebhookSecret = await ensureWebhookSecret();
 
+  // One-time migration of any Keychain entries from v0.4.16 → v0.4.29
+  // (when setCredential wrote to Keychain) into the file vault. Gated
+  // by a marker so subsequent launches stay silent. Best-effort: an
+  // unexpected failure here must NEVER block boot.
+  try {
+    const result = await migrateKeychainToFileVault();
+    if (result.ran && result.migrated.length > 0) {
+      try {
+        appendFileSync(LOG_FILE, `\n=== Keychain migration ${new Date().toISOString()} ===\nmoved to file vault: ${result.migrated.join(', ')}\n`);
+      } catch { /* log is best-effort */ }
+    }
+  } catch (err) {
+    try {
+      appendFileSync(LOG_FILE, `\n=== Keychain migration failed ${new Date().toISOString()} ===\n${err instanceof Error ? err.message : String(err)}\n`);
+    } catch { /* swallow */ }
+  }
+
   if (needsSetup()) {
     openSetupWindow();
   } else {
@@ -857,6 +875,20 @@ ipcMain.handle('clemmy:setup-skip', async () => {
   setupWindow = null;
   win?.close();
   await launchDaemon();
+  // Surface a one-time notification so the user knows the dashboard
+  // they're about to see isn't fully wired. Without this the silent-
+  // failure mode is: every agent call returns an empty error and the
+  // user doesn't know why. Tray ownership-repair message style — fast,
+  // honest, dismissible.
+  try {
+    new Notification({
+      title: 'Clementine is open, but no AI auth is set',
+      body: 'Add an OpenAI key or sign in with ChatGPT from Settings → Credentials to make chat work.',
+      silent: false,
+    }).show();
+  } catch {
+    /* notifications can fail on locked-down machines — non-fatal */
+  }
   return { ok: true };
 });
 

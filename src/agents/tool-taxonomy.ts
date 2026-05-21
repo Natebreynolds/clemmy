@@ -137,6 +137,28 @@ const ALWAYS_READ = new Set<string>([
   'mcp_list_tools',
   'local_cli_probe',
   'ping',
+  // 2026-05-21: explicit reads that previously fell through to the
+  // conservative 'write' default and approval-prompted the user on
+  // pure inspection. None of these mutate anything — they just list
+  // / fetch metadata.
+  'agent_runs_recent',
+  'agent_run_get',
+  'memory_list_facts',
+  'memory_read',
+  'memory_recall',
+  'memory_search',
+  'task_list',
+  'execution_list',
+  'execution_get',
+  'goal_get',
+  'goal_list',
+  'list_plans',
+  'tool_choice_recall',
+  'user_profile_read',
+  'desktop_status',
+  'local_cli_list',
+  'list_files',
+  'read_file',
 ]);
 
 /**

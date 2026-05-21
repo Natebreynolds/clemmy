@@ -19,7 +19,12 @@ import { shell } from 'electron';
  * the runtime reads this native auth store directly.
  */
 
-const AUTH_BASE_URL = 'https://auth.openai.com';
+// CODEX_OAUTH_AUTH_BASE_URL overrides the base URL for local testing
+// (smoke scripts stand up a fake OAuth server on localhost). Empty /
+// undefined falls back to production.
+const AUTH_BASE_URL = (process.env.CODEX_OAUTH_AUTH_BASE_URL && process.env.CODEX_OAUTH_AUTH_BASE_URL.length > 0)
+  ? process.env.CODEX_OAUTH_AUTH_BASE_URL.replace(/\/+$/, '')
+  : 'https://auth.openai.com';
 const AUTHORIZE_URL = `${AUTH_BASE_URL}/oauth/authorize`;
 const TOKEN_URL = `${AUTH_BASE_URL}/oauth/token`;
 const CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';

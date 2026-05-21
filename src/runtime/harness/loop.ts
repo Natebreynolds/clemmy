@@ -25,6 +25,7 @@ import * as approvalRegistry from './approval-registry.js';
 import { actionBus } from '../action-bus.js';
 import { BoundaryError } from '../boundary-error.js';
 import { getRuntimeEnv } from '../../config.js';
+import { captureInteractionSignals } from '../../memory/auto-capture.js';
 
 /**
  * Wrap appendEvent so a transient SQLite write failure (lock, disk
@@ -856,6 +857,41 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   });
   session.recordUserInput(options.input, turn);
 
+  // Memory writeback. The harness path was previously missing this —
+  // every user message went into the conversation log but no durable
+  // facts or profile patches were extracted. The recall side (loaded
+  // into the orchestrator's persistent context via harnessInstructions)
+  // therefore had nothing fresh to surface, even after months of use.
+  // Wiring it here means: every Discord/dashboard turn updates the
+  // user profile (preferred name, tone, formality) and consolidates
+  // durable facts (requirements, connected-app usage, project goals)
+  // *as they're said*. The next turn's persistent-context block then
+  // includes them automatically. Errors swallowed — capture failure
+  // must never block the conversation.
+  try {
+    const captured = captureInteractionSignals({
+      message: options.input,
+      sessionId: options.sessionId,
+    });
+    if (captured.facts.length > 0 || captured.profilePatch) {
+      safeAppend({
+        sessionId: options.sessionId,
+        turn,
+        role: 'system',
+        type: 'memory_signals_captured',
+        data: {
+          factCount: captured.facts.length,
+          factIds: captured.facts.map((f) => f.id),
+          profilePatch: captured.profilePatch ?? null,
+          reasons: captured.candidates.map((c) => c.reason),
+        },
+      });
+    }
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn('captureInteractionSignals failed:', err instanceof Error ? err.message : err);
+  }
+
   const toolCounter = new ToolCallsCounter(
     options.toolCallsPerTurn ?? defaultToolCallsPerTurn(),
   );
@@ -994,7 +1030,27 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
 export interface ResumePendingApprovalOptions {
   agent: Agent<any, any>;
   sessionId: string;
-  decision: 'approve' | 'reject';
+  /**
+   * 'approve'              — run the paused tool call with the args the
+   *                          agent originally proposed.
+   * 'reject'               — reject the call; agent sees rejection in
+   *                          its tool result and decides what to do.
+   * 'approve_with_edits'   — same as approve, BUT replace the tool
+   *                          call's arguments with `modifiedArgs`
+   *                          before running. Lets the user fix a slug
+   *                          arg (calendar time, recipient, etc.)
+   *                          inline instead of rejecting + asking the
+   *                          agent to retry.
+   */
+  decision: 'approve' | 'reject' | 'approve_with_edits';
+  /**
+   * When `decision === 'approve_with_edits'`, the JSON-encoded args
+   * object to substitute for the agent's original proposal. The shape
+   * must match the tool's expected input schema — invalid JSON or
+   * shape mismatches will surface as a normal tool error to the
+   * agent, which will recover.
+   */
+  modifiedArgs?: string;
   maxTurns?: number;
   toolCallsPerTurn?: number;
   /** Test injection. */
@@ -1076,10 +1132,59 @@ export async function resumePendingApproval(
   };
   const pending: unknown[] = stateApi.getInterruptions() ?? [];
   for (const item of pending) {
-    if (options.decision === 'approve') {
-      stateApi.approve(item);
+    if (options.decision === 'approve' || options.decision === 'approve_with_edits') {
+      // EDIT-AND-APPROVE: when the user supplied modifiedArgs (e.g.
+      // changed the calendar time in the dashboard / Discord edit
+      // modal), substitute those args on the interruption item's
+      // rawItem BEFORE calling approve(). The SDK's rawItem.arguments
+      // is a JSON string the tool will receive — mutating it here
+      // means the tool sees the user's edited values, not the agent's
+      // original proposal. Sticky approval is intentionally OFF when
+      // edits are supplied: if the agent makes the same call again
+      // later, we want it to pause again (the edited args were a
+      // one-time correction, not a blanket policy change).
+      //
+      // For `composio_execute_tool` the user edits the INNER tool
+      // payload (the actual Outlook/Salesforce/etc. fields), not the
+      // outer { tool_slug, arguments, connected_account_id } wrapper.
+      // We rebuild the wrapper around the user's edits so the SDK
+      // sees a well-formed function-call payload.
+      const editedArgs = options.decision === 'approve_with_edits' ? options.modifiedArgs : undefined;
+      if (editedArgs !== undefined) {
+        const rawItem = (item as { rawItem?: { name?: string; arguments?: unknown } } | null)?.rawItem;
+        if (rawItem && typeof editedArgs === 'string') {
+          let nextArgsJson = editedArgs;
+          if (rawItem.name === 'composio_execute_tool' && typeof rawItem.arguments === 'string') {
+            try {
+              const outer = JSON.parse(rawItem.arguments) as Record<string, unknown>;
+              // Validate that the inner edit parses as JSON (the UI/
+              // dashboard already validated; this is belt-and-suspenders).
+              JSON.parse(editedArgs);
+              outer.arguments = editedArgs;
+              nextArgsJson = JSON.stringify(outer);
+            } catch {
+              // Couldn't parse the outer envelope or the inner edit;
+              // fall back to passing the edited JSON through verbatim.
+              // The tool will return a normal validation error and the
+              // agent will recover.
+              nextArgsJson = editedArgs;
+            }
+          }
+          (rawItem as { arguments: string }).arguments = nextArgsJson;
+        }
+        stateApi.approve(item);
+      } else {
+        // STICKY APPROVAL: pass alwaysApprove so the SDK caches this
+        // decision for the remainder of the run. If the same tool gets
+        // invoked again later in the conversation (model retried, agent
+        // recovered from a fabricated reply, etc.), the SDK auto-resolves
+        // without re-prompting the user.
+        stateApi.approve(item, { alwaysApprove: true });
+      }
     } else {
-      stateApi.reject(item);
+      // Symmetric for rejections: future identical invocations stay
+      // rejected without re-asking the user.
+      stateApi.reject(item, { alwaysReject: true });
     }
     const raw = (item as { rawItem?: { name?: string } } | null)?.rawItem;
     safeAppend({
@@ -1087,7 +1192,12 @@ export async function resumePendingApproval(
       turn,
       role: 'system',
       type: 'approval_resolved',
-      data: { decision: options.decision, tool: raw?.name ?? 'unknown' },
+      data: {
+        decision: options.decision,
+        tool: raw?.name ?? 'unknown',
+        sticky: options.decision !== 'approve_with_edits',
+        edited: options.decision === 'approve_with_edits',
+      },
     });
   }
   safeAppend({
@@ -1242,7 +1352,9 @@ export async function resumePendingApproval(
 export async function runConversationFromResume(opts: {
   agent: Agent<any, any>;
   sessionId: string;
-  decision: 'approve' | 'reject';
+  decision: 'approve' | 'reject' | 'approve_with_edits';
+  /** Required when decision === 'approve_with_edits'. JSON-encoded args. */
+  modifiedArgs?: string;
   maxSteps?: number;
   maxWallClockMs?: number;
   maxTurns?: number;
@@ -1258,7 +1370,8 @@ export async function runConversationFromResume(opts: {
 async function runConversationFromResumeCore(opts: {
   agent: Agent<any, any>;
   sessionId: string;
-  decision: 'approve' | 'reject';
+  decision: 'approve' | 'reject' | 'approve_with_edits';
+  modifiedArgs?: string;
   maxSteps?: number;
   maxWallClockMs?: number;
   maxTurns?: number;
@@ -1286,6 +1399,7 @@ async function runConversationFromResumeCore(opts: {
     agent: opts.agent,
     sessionId: opts.sessionId,
     decision: opts.decision,
+    modifiedArgs: opts.modifiedArgs,
     maxTurns,
     toolCallsPerTurn,
     makeRunner: opts.makeRunner,
@@ -1987,11 +2101,118 @@ function extractInterruptionInfo(items: unknown[]): InterruptionInfo[] {
   return out;
 }
 
-/** Heuristic: pull a human-readable subject out of the tool args. */
+/**
+ * Pull a human-readable subject out of the tool args. The dashboard
+ * and Discord both render this in the approval card, so the more
+ * specific the better — "Create Outlook calendar event: 'Follow up
+ * with Marlowe Rary'" reads better than "composio_execute_tool".
+ *
+ * Recognized shapes:
+ *   composio_execute_tool({ tool_slug, arguments: <json string> })
+ *       → "<Toolkit Verb>: <subject from inner args>"
+ *   run_shell_command({ command })
+ *       → "Shell: <first 80 chars of command>"
+ *   write_file({ path, contents? })
+ *       → "Write file: <path>"
+ *   any other tool with args.subject / .title / .name / .command
+ *       → "<toolName>: <that field>"
+ *   fallback
+ *       → toolName
+ */
 function extractApprovalSubject(info: InterruptionInfo): string {
-  const args = info.args ?? {};
-  if (typeof args.subject === 'string') return args.subject;
-  if (typeof args.title === 'string') return args.title;
-  if (typeof args.action === 'string') return args.action;
+  const args = (info.args ?? {}) as Record<string, unknown>;
+
+  // composio_execute_tool: unwrap the inner args JSON.
+  if (info.toolName === 'composio_execute_tool') {
+    const slug = typeof args.tool_slug === 'string' ? args.tool_slug : '';
+    const innerRaw = typeof args.arguments === 'string' ? args.arguments : '';
+    let innerSubject = '';
+    if (innerRaw) {
+      try {
+        const inner = JSON.parse(innerRaw) as Record<string, unknown>;
+        innerSubject =
+          (typeof inner.subject === 'string' && inner.subject)
+          || (typeof inner.title === 'string' && inner.title)
+          || (typeof inner.name === 'string' && inner.name)
+          || (typeof inner.text === 'string' && inner.text)
+          || (typeof inner.message === 'string' && inner.message)
+          || (typeof inner.body === 'string' && (inner.body as string).slice(0, 80))
+          || '';
+      } catch {
+        // Inner args weren't JSON — fall through to slug-only label.
+      }
+    }
+    const verb = humanizeComposioSlug(slug);
+    if (innerSubject) return `${verb}: ${truncate(innerSubject, 100)}`;
+    return verb || info.toolName;
+  }
+
+  // run_shell_command: show the command itself, truncated.
+  if (info.toolName === 'run_shell_command') {
+    const cmd = typeof args.command === 'string' ? args.command : '';
+    if (cmd) return `Shell: ${truncate(cmd, 100)}`;
+    return 'Shell command';
+  }
+
+  // write_file: show path + body length.
+  if (info.toolName === 'write_file') {
+    const p = typeof args.path === 'string' ? args.path : '';
+    if (p) return `Write file: ${p}`;
+    return 'Write file';
+  }
+
+  // Generic: pull a meaningful field out of args.
+  for (const key of ['subject', 'title', 'name', 'action', 'command', 'message', 'directive']) {
+    const v = args[key];
+    if (typeof v === 'string' && v.length > 0) {
+      return `${info.toolName}: ${truncate(v, 100)}`;
+    }
+  }
   return info.toolName;
+}
+
+/**
+ * Turn a Composio slug like `OUTLOOK_CALENDAR_CREATE_EVENT` into a
+ * human phrase: "Create Outlook calendar event".
+ *
+ * Heuristic: known toolkit prefixes are capitalized; known verbs are
+ * moved to the front; the rest is title-cased.
+ */
+function humanizeComposioSlug(slug: string): string {
+  if (!slug) return '';
+  const parts = slug.split('_').filter(Boolean).map((p) => p.toLowerCase());
+  if (parts.length === 0) return '';
+
+  const TOOLKITS: Record<string, string> = {
+    outlook: 'Outlook', gmail: 'Gmail', slack: 'Slack', instagram: 'Instagram',
+    salesforce: 'Salesforce', github: 'GitHub', linear: 'Linear', notion: 'Notion',
+    trello: 'Trello', supabase: 'Supabase', stripe: 'Stripe', composio: 'Composio',
+    discord: 'Discord', google: 'Google', drive: 'Drive', calendar: 'Calendar',
+    sheets: 'Sheets', figma: 'Figma',
+  };
+  const VERBS = new Set([
+    'create', 'list', 'get', 'search', 'update', 'delete', 'send', 'post',
+    'fetch', 'read', 'write', 'add', 'remove', 'find', 'query', 'sync',
+    'invite', 'cancel', 'archive', 'star', 'unstar', 'reply',
+  ]);
+
+  const toolkit = parts[0];
+  const toolkitLabel = TOOLKITS[toolkit] ?? toolkit[0].toUpperCase() + toolkit.slice(1);
+
+  // Find the first verb in the slug; treat everything after as the object.
+  let verbIndex = -1;
+  for (let i = 1; i < parts.length; i += 1) {
+    if (VERBS.has(parts[i])) { verbIndex = i; break; }
+  }
+  if (verbIndex === -1) {
+    return [toolkitLabel, ...parts.slice(1)].join(' ');
+  }
+  const verb = parts[verbIndex][0].toUpperCase() + parts[verbIndex].slice(1);
+  const object = parts.slice(1, verbIndex).concat(parts.slice(verbIndex + 1)).join(' ');
+  return object ? `${verb} ${toolkitLabel} ${object}` : `${verb} ${toolkitLabel}`;
+}
+
+function truncate(s: string, n: number): string {
+  if (s.length <= n) return s;
+  return `${s.slice(0, n - 1)}…`;
 }

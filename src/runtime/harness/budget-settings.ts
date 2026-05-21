@@ -24,7 +24,15 @@ const PRESETS: Record<HarnessBudgetPreset, HarnessBudgetSettings> = {
     maxConversationSteps: 40,
     maxConversationWallMinutes: 120,
     maxTurns: 40,
-    toolCallsPerTurn: 16,
+    // Phase 3 single-agent shape needs a higher per-turn ceiling than the
+    // old orchestrator+sub-agent split did. A real multi-step turn now
+    // looks like: 4 recalls (parallel) + 3 discovery (parallel) +
+    // 3 remembers (parallel) + 4-8 mutating calls = 15-20 calls in
+    // ONE response. The 16 ceiling killed the lunar-audit run on
+    // 2026-05-21 — agent read SKILL.md + 6 source files and hit the
+    // wall before doing any actual work. 40 leaves room for real
+    // multi-step work while still catching runaway model behavior.
+    toolCallsPerTurn: 40,
     checkInMinutes: 10,
     autoContinueOnLimit: false,
   },
@@ -33,7 +41,7 @@ const PRESETS: Record<HarnessBudgetPreset, HarnessBudgetSettings> = {
     maxConversationSteps: 160,
     maxConversationWallMinutes: 480,
     maxTurns: 120,
-    toolCallsPerTurn: 32,
+    toolCallsPerTurn: 80,
     checkInMinutes: 5,
     autoContinueOnLimit: true,
   },

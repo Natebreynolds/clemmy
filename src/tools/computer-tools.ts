@@ -187,7 +187,21 @@ function resolveAllowedPath(input: string): string {
 
   const roots = workspaceRoots();
   if (!roots.some((root) => isInside(root, resolved))) {
-    throw new Error(`Path is outside allowed workspace roots: ${resolved}. Switch to YOLO mode in Settings → Proactivity Policy if you want the agent to act anywhere, or add this dir to WORKSPACE_DIRS in ~/.clementine-next/.env.`);
+    // List the valid roots IN the error so the agent self-corrects on
+    // the first retry instead of guessing again. Before this change,
+    // a bad cwd ("/Users/nate", "/Users/Shared", invented from
+    // preferredName) would loop 7-8 times against the same wrong path
+    // before the agent finally thought to call workspace_roots.
+    // Architectural fix beats a prompt nudge: the failing tool tells
+    // the agent the answer instead of relying on the model to remember.
+    const rootsList = roots.map((r) => `  - ${r}`).join('\n');
+    throw new Error(
+      `Path is outside allowed workspace roots: ${resolved}.\n`
+      + `Allowed roots:\n${rootsList}\n`
+      + `Pick one of these as cwd, or omit cwd to use the safe default (~/.clementine-next). `
+      + `If you genuinely need to act outside these roots, switch to YOLO mode in Settings → Proactivity Policy, `
+      + `or add the dir to WORKSPACE_DIRS in ~/.clementine-next/.env.`,
+    );
   }
   return resolved;
 }
@@ -240,6 +254,39 @@ function developerToolStubBlockMessage(command: string): string | null {
   return null;
 }
 
+/**
+ * Map raw shell stderr to actionable remediation hints. Without this,
+ * the model sees `EPERM: operation not permitted, uv_cwd` and either
+ * retries blindly or hands off with a confused error. Returns the
+ * original stderr, optionally with one extra line appended explaining
+ * what to do — visible to the model and to the dashboard reader.
+ */
+function annotateShellStderr(stderr: string, command: string): string {
+  if (!stderr) return stderr;
+  const hints: string[] = [];
+  if (/EPERM:\s*operation not permitted,?\s*uv_cwd/i.test(stderr)) {
+    hints.push(
+      'CLEMENTINE HINT: macOS TCC blocked this Node-embedding CLI when spawned by the desktop daemon. ' +
+      'Workarounds: (1) re-run via `clementine chat` in Terminal — the CLI entry point has no Electron parent and no TCC clamp; ' +
+      '(2) replace this CLI call with the equivalent Composio tool; ' +
+      '(3) grant Full Disk Access to Clementine.app in System Settings → Privacy & Security.',
+    );
+  } else if (/shell-init:\s*getcwd:\s*cannot access parent directories/i.test(stderr)) {
+    hints.push(
+      'CLEMENTINE HINT: bash could not resolve the current working directory. ' +
+      'This typically means the cwd was deleted or is inside a TCC-protected folder; pass `cwd: null` or a path under WORKSPACE_DIRS.',
+    );
+  } else if (/(command not found|: not found)/i.test(stderr)) {
+    const firstWord = command.trim().split(/\s+/)[0];
+    hints.push(
+      `CLEMENTINE HINT: "${firstWord}" is not on PATH. ` +
+      `Install it via Homebrew/npm (\`brew install ${firstWord}\` or \`npm install -g ${firstWord}\`), or pick a different tool.`,
+    );
+  }
+  if (hints.length === 0) return stderr;
+  return `${stderr}\n\n${hints.join('\n')}`;
+}
+
 function runCommand(command: string, cwd: string, timeoutMs: number): Promise<string> {
   assertCommandAllowed(command);
   const stubMessage = developerToolStubBlockMessage(command);
@@ -271,10 +318,11 @@ function runCommand(command: string, cwd: string, timeoutMs: number): Promise<st
     });
     child.on('close', (code) => {
       clearTimeout(timeout);
+      const annotated = annotateShellStderr(stderr, command);
       const output = [
         `exit_code: ${code ?? 0}`,
         stdout ? `stdout:\n${stdout}` : '',
-        stderr ? `stderr:\n${stderr}` : '',
+        annotated ? `stderr:\n${annotated}` : '',
       ].filter(Boolean).join('\n\n');
       resolve(output || `exit_code: ${code ?? 0}`);
     });
@@ -309,10 +357,11 @@ function runProcess(command: string, args: string[], cwd: string, timeoutMs: num
     });
     child.on('close', (code) => {
       clearTimeout(timeout);
+      const annotated = annotateShellStderr(stderr, command);
       const output = [
         `exit_code: ${code ?? 0}`,
         stdout ? `stdout:\n${stdout}` : '',
-        stderr ? `stderr:\n${stderr}` : '',
+        annotated ? `stderr:\n${annotated}` : '',
       ].filter(Boolean).join('\n\n');
       resolve(output || `exit_code: ${code ?? 0}`);
     });

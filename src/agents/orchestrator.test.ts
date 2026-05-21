@@ -95,67 +95,64 @@ test('Orchestrator carries the harness guardrails', async () => {
   assert.ok(outputNames.includes('secret_leak'));
 });
 
-test('Orchestrator tools include direct-execute Composio path + read-only discovery/memory', async () => {
-  // Updated 2026-05-20: the Orchestrator now carries composio_execute_tool
-  // for the recall-HIT fast path. Production data showed 86% of
-  // tool_choice_recall HIT → Executor handoff sessions stalled with zero
-  // post-handoff tool calls; the model that resolved the slug should call
-  // it. Approval gating is unchanged — mutating slugs still pause for
-  // user consent through the standard tool-taxonomy decideToolApproval()
-  // path, regardless of which agent invokes them.
+test('Orchestrator is now the single agent — carries the union of all action tools (Phase 3)', async () => {
+  // Phase 3 architecture (2026-05-20): no more sub-agent split. The
+  // Orchestrator IS the agent — it has discovery + memory + workspace
+  // + shell + composio + executions + tasks + plans + notes + git +
+  // profile all on one surface. Approval gating stays at the per-tool
+  // level via decideToolApproval() in tool-taxonomy.ts.
   //
-  // Shell + filesystem writes (run_shell_command, write_file) stay OFF
-  // the Orchestrator's surface — those remain Executor territory because
-  // they're the actually-needs-tracking work.
+  // Why: sub-agent .asTool() wrappers broke around approval pause/
+  // resume (the child sub-agent completed with empty output). Multi-
+  // step work degenerated into approve-fabricate-loop. The single-
+  // agent shape removes that failure class entirely.
   const agent = await buildOrchestratorAgent();
-  const toolNames = (agent.tools ?? []).map((t) => (t as { name?: string }).name).sort();
-  assert.deepEqual(
-    toolNames,
-    [
-      'ask_user_question',
-      'composio_execute_tool',
-      'composio_search_tools',
-      'desktop_status',
-      'draft_plan',
-      'local_cli_list',
-      'local_cli_probe',
-      'request_approval',
-      'skill_list',
-      'skill_read',
-      'tool_choice_invalidate',
-      'tool_choice_recall',
-      'tool_choice_remember',
-      // 2026-05-20: read-only context lookups so the Orchestrator
-      // can answer "what time zone am I in / what's on my list /
-      // what did we decide / what am I working on" without handing
-      // off to a sub-agent. Writes (memory_remember, task_add,
-      // task_update, execution_update_step, etc.) stay on sub-agents
-      // — the trust gradient is unchanged.
-      'execution_get',
-      'execution_list',
-      'memory_read',
-      'memory_recall',
-      'memory_search',
-      'task_list',
-      'user_profile_read',
-    ].sort(),
-  );
-  // Shell + filesystem writes remain Executor-only territory.
-  assert.equal(toolNames.includes('run_shell_command'), false);
-  assert.equal(toolNames.includes('write_file'), false);
+  const toolNames = (agent.tools ?? []).map((t) => (t as { name?: string }).name).filter(Boolean).sort();
+  // Don't pin the exact set — the surface will grow as the registry
+  // adds tools. Pin the CORE capabilities the single-agent shape
+  // requires for the north-star workflow ("get request → search
+  // memory → call tools → done").
+  const required = [
+    // Memory (read + write)
+    'memory_recall', 'memory_search', 'memory_read', 'memory_remember', 'memory_list_facts',
+    // Composio (discover + execute)
+    'composio_search_tools', 'composio_execute_tool', 'composio_status',
+    // Shell + filesystem
+    'run_shell_command', 'write_file', 'read_file', 'list_files',
+    // Workspace
+    'workspace_config', 'workspace_info', 'workspace_list', 'workspace_roots',
+    // Tasks + goals + executions
+    'task_list', 'task_add', 'task_update',
+    'goal_get', 'goal_update',
+    'execution_list', 'execution_get', 'execution_update_step', 'execution_complete', 'execution_mark_blocked',
+    // CLI discovery + probes
+    'local_cli_list', 'local_cli_probe',
+    // Tool-choice memoization
+    'tool_choice_recall', 'tool_choice_remember', 'tool_choice_invalidate',
+    // User profile (read + write)
+    'user_profile_read', 'user_profile_update',
+    // Conversation tools
+    'ask_user_question', 'request_approval', 'notify_user',
+    // Planning
+    'draft_plan',
+  ];
+  for (const name of required) {
+    assert.ok(toolNames.includes(name), `expected single-agent surface to include ${name}, got: ${toolNames.join(',')}`);
+  }
+  // Sub-agent run_* tools removed in Phase 3 — EXCEPT run_worker,
+  // which is the stateless parallel-fan-out primitive (kept because
+  // it doesn't have the approval-pause/.asTool() composition issue
+  // the other sub-agents had).
+  assert.ok(toolNames.includes('run_worker'), 'run_worker should remain available for parallel fan-out');
+  for (const name of ['run_researcher', 'run_writer', 'run_reviewer', 'run_executor', 'run_deployer']) {
+    assert.equal(toolNames.includes(name), false, `${name} should be removed in Phase 3`);
+  }
 });
 
-test('Orchestrator hands off to the five sub-agents by name', async () => {
+test('Orchestrator has NO handoffs in Phase 3 (single-agent architecture)', async () => {
   const agent = await buildOrchestratorAgent();
-  const handoffNames = (agent.handoffs ?? []).map((h) => {
-    const obj = h as { name?: string; agent?: { name?: string } };
-    return obj.name ?? obj.agent?.name ?? '';
-  });
-  assert.ok(handoffNames.includes('Researcher'), `missing Researcher in ${handoffNames}`);
-  assert.ok(handoffNames.includes('Writer'), `missing Writer in ${handoffNames}`);
-  assert.ok(handoffNames.includes('Reviewer'), `missing Reviewer in ${handoffNames}`);
-  assert.ok(handoffNames.includes('Executor'), `missing Executor in ${handoffNames}`);
-  assert.ok(handoffNames.includes('Deployer'), `missing Deployer in ${handoffNames}`);
+  const handoffs = agent.handoffs ?? [];
+  assert.equal(handoffs.length, 0, `expected no handoffs, got ${handoffs.length}`);
 });
 
 test('request_approval triggers the SDK interrupt for external/destructive actions', async () => {

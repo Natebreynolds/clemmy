@@ -731,7 +731,10 @@ const SETUP_JS = `
     if (currentStep > 0) { currentStep--; renderStep(); }
   });
   skipBtn.addEventListener('click', async () => {
-    if (!confirm('Skip the rest of setup?\\nYou can finish from Settings → Credentials later.')) return;
+    const msg = state.authChoice === 'skipped'
+      ? 'Skip setup without configuring AI auth?\\n\\nClementine will open, but every chat / agent call will fail until you add an OpenAI key or sign in with ChatGPT from Settings → Credentials.\\n\\nContinue anyway?'
+      : 'Skip the rest of setup?\\nYou can finish from Settings → Credentials later.';
+    if (!confirm(msg)) return;
     if (window.clemmy.setupSkip) await window.clemmy.setupSkip();
   });
   nextBtn.addEventListener('click', async () => {

@@ -29,6 +29,7 @@ import path from 'node:path';
 // off the default export instead.
 const { autoUpdater } = electronUpdater;
 import { accessSync, appendFileSync, constants, existsSync, mkdirSync } from 'node:fs';
+import { compareVersions } from './version-compare.js';
 
 const CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4 hours
 const MOVE_TO_APPLICATIONS_MESSAGE =
@@ -510,28 +511,6 @@ function beginUpdateDownload(log?: UpdaterLog): {
     updateStatus({ state: 'error', error: reason });
     return { ok: false, reason };
   }
-}
-
-function compareVersions(left: string, right: string): number {
-  const leftParts = normalizeVersionParts(left);
-  const rightParts = normalizeVersionParts(right);
-  const length = Math.max(leftParts.length, rightParts.length);
-  for (let index = 0; index < length; index += 1) {
-    const leftPart = leftParts[index] ?? 0;
-    const rightPart = rightParts[index] ?? 0;
-    if (leftPart > rightPart) return 1;
-    if (leftPart < rightPart) return -1;
-  }
-  return 0;
-}
-
-function normalizeVersionParts(version: string): number[] {
-  const clean = version.trim().replace(/^v/i, '');
-  const [core] = clean.split('-', 1);
-  return core.split('.').map((part) => {
-    const parsed = Number.parseInt(part, 10);
-    return Number.isFinite(parsed) ? parsed : 0;
-  });
 }
 
 function getInstallBlockerStatus(): Pick<UpdaterStatus, 'installBlocker' | 'appPath' | 'error'> {

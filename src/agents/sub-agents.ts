@@ -459,12 +459,12 @@ export async function buildExecutorAgent(): Promise<SubAgent> {
       'You are the Executor sub-agent inside Clementine.',
       'Your single job is to take the work that has been decided and DO it. No deliberation, no re-planning.',
       'Available tools: tasks (task_add, task_update), executions (execution_update_step, execution_complete, execution_mark_blocked), files (write_file, read_file), commands (run_shell_command — approval may be required), goals (goal_update), project linking (workspace_config), notifications (notify_user), check-ins (ask_user_question when truly blocked on user info).',
-      'READ THE HANDOFF INPUT FIRST. The Orchestrator handed off to you with a structured object: { directive: string, toolCall: { slug, args, rationale } | null }. This appears in your input as the transfer_to_Executor result. The `directive` tells you what to do; the `toolCall` (when non-null) tells you the EXACT Composio tool slug and JSON-encoded arguments the Researcher pre-resolved. Use them directly — that is your fast path.',
+      'YOUR INPUT IS A PROMPT STRING from the Orchestrator. As of Phase 2 (2026-05-20) you are invoked as a TOOL (`run_executor`), not via handoff transfer. The Orchestrator passes a single prompt describing what to do — read it, do the work, return a tight string result. The Orchestrator stays in control of the conversation; your output flows back to it as a tool result, not as the user-facing reply.',
       'Skills are on-demand. For specialized build, scraping, writing, spreadsheet, browser, or domain work, call `skill_list`, then `skill_read` for the one relevant skill. Do not bulk-load skills.',
-      'Project linking — if the user gives you a local project path and asks Clementine to use/link/work in it, call `workspace_config({action:"add", directory:"<path>"})`, then `workspace_info` for that project before editing. Adding/removing workspace dirs is an admin-level trust-boundary change, so the tool may pause for approval.',
+      'Project linking — if the prompt includes a local project path and asks Clementine to use/link/work in it, call `workspace_config({action:"add", directory:"<path>"})`, then `workspace_info` for that project before editing. Adding/removing workspace dirs is an admin-level trust-boundary change, so the tool may pause for approval.',
       'External integrations — brokered, token-efficient path:',
-      '  1. handoff.toolCall is non-null → call `composio_execute_tool` with `{tool_slug: <slug>, arguments: <args>}` exactly as given. NO re-discovery, NO second-guessing the slug.',
-      '  2. handoff.toolCall is null and the work is a Composio action → discover with `composio_search_tools`, then call `composio_execute_tool` with the exact returned slug and JSON args.',
+      '  1. The prompt names a specific Composio slug + args → call `composio_execute_tool` with `{tool_slug: <slug>, arguments: <args>}` exactly as given. NO re-discovery, NO second-guessing.',
+      '  2. The prompt describes a Composio action without a slug → discover with `composio_search_tools`, then call `composio_execute_tool` with the returned slug and JSON args.',
       '  3. If no Composio match exists, check the local CLI/MCP direction in the directive, or ask_user_question with the missing connection/tool.',
       'Discovery on the Executor is a FALLBACK. The Researcher\'s job is discovery; yours is execution. The Orchestrator should have pre-resolved Composio actions. If toolCall is null and the work is clearly a Composio action, that\'s a sign the pipeline was skipped — note it in your summary.',
       'NEVER conclude "the runtime doesn\'t expose that action" without trying broker discovery. The user has connected toolkits we can\'t enumerate at build time.',
@@ -635,8 +635,121 @@ function maybeGateExecutionHandoff(agent: SubAgent, options: OrchestratorHandoff
 }
 
 /**
+ * Sub-agents-as-tools (Phase 2 architecture, 2026-05-20). Instead of
+ * the Orchestrator handing off control to a sub-agent (which loses
+ * the Orchestrator's ability to recover when the sub-agent stalls
+ * or fabricates), each sub-agent is wrapped via `Agent.asTool()` and
+ * exposed as a `run_<role>` tool on the Orchestrator's surface.
+ *
+ * Production data showed the handoff pattern stalled 86% of the time
+ * for the recall-HIT → Executor pattern, and multi-step sub-agent
+ * runs frequently emitted past-tense lies ("Transferred to Executor
+ * to run the actual workflow now") that escaped pattern-matching.
+ * Wrapping as tools puts the Orchestrator back in control — when a
+ * sub-agent returns, the result is a tool_returned event the
+ * Orchestrator can read, validate, or retry.
+ *
+ * Tool semantics:
+ *   - Input: a SINGLE string prompt describing the work
+ *   - Output: the sub-agent's final string output (its summary +
+ *     reply per its own role contract)
+ *   - Failure modes: errors bubble back as tool_returned with an
+ *     "ERROR:" prefix the Orchestrator can branch on, never silent
+ *
+ * Long-running tracked work (multi-day executions, async workflows)
+ * still uses the durable executions surface (`execution_*` tools);
+ * those primitives are unchanged. Sub-agent tool calls are bounded
+ * to one model run inside the parent turn.
+ */
+export async function buildOrchestratorSubAgentTools(
+  options: OrchestratorHandoffOptions = {},
+): Promise<Tool<RuntimeContextValue>[]> {
+  const [researcher, writer, reviewer, executor, deployer] = await Promise.all([
+    buildResearcherAgent(),
+    buildWriterAgent(),
+    buildReviewerAgent(),
+    buildExecutorAgent(),
+    buildDeployerAgent(),
+  ]);
+
+  const tools: Tool<RuntimeContextValue>[] = [];
+
+  tools.push(researcher.asTool({
+    toolName: 'run_researcher',
+    toolDescription: [
+      'Spawn the Researcher sub-agent to gather information and return a concise structured summary. Read-only — Researcher cannot mutate state.',
+      'Input: one focused research prompt. Examples: "Find any past notes about Marlowe Rary and summarize what we know about him", "Search composio for tools that post to LinkedIn and return the slug + required args", "Read the workflow file at .clementine-next/workflows/daily-briefing.md and summarize the steps".',
+      'Output: a structured answer (lead with the finding or "not found", then evidence). Use when you need memory/vault/file/discovery work done in an isolated context that returns CLEAN findings, not a side-conversation with the user.',
+    ].join(' '),
+  }) as Tool<RuntimeContextValue>);
+
+  tools.push(writer.asTool({
+    toolName: 'run_writer',
+    toolDescription: [
+      'Spawn the Writer sub-agent to draft user-facing copy, docs, summaries, emails, reports, or vault content. Writer cannot send/deploy — returns a draft for review or further routing.',
+      'Input: a writing brief — what to produce, who it is for, tone constraints, any source material (paste it or reference its vault/workspace path).',
+      'Output: the draft (often a file path it wrote to, plus the inline text and any assumptions).',
+    ].join(' '),
+  }) as Tool<RuntimeContextValue>);
+
+  tools.push(reviewer.asTool({
+    toolName: 'run_reviewer',
+    toolDescription: [
+      'Spawn the Reviewer sub-agent to evaluate work quality (a draft, a plan, a diff) and return a pass/fail-style assessment with specific issues.',
+      'Input: what to review (text, file path, plan id) and the criteria to apply.',
+      'Output: structured findings — issues, severity, suggested fixes.',
+    ].join(' '),
+  }) as Tool<RuntimeContextValue>);
+
+  const executorTool = executor.asTool({
+    toolName: 'run_executor',
+    toolDescription: [
+      'Spawn the Executor sub-agent for tracked multi-step work: file writes, shell commands, sequenced Composio + CLI actions, execution_* updates, run_worker fan-out.',
+      'NOT for single-action Composio calls — call composio_execute_tool yourself for those (faster, more reliable).',
+      'Input: a directive describing the multi-step plan. Include any pre-resolved tool slugs + args inline so the Executor does not re-discover.',
+      'Output: a concise summary of what was done across the steps, including any execution_id created and any errors hit.',
+    ].join(' '),
+  }) as Tool<RuntimeContextValue>;
+
+  const deployerTool = deployer.asTool({
+    toolName: 'run_deployer',
+    toolDescription: [
+      'Spawn the Deployer sub-agent for release / deploy work — cutting versions, signing, notarizing, publishing.',
+      'Input: a deploy directive (what to release, target environment, verification expectation).',
+      'Output: deploy result + verification status.',
+    ].join(' '),
+  }) as Tool<RuntimeContextValue>;
+
+  // Gate executor + deployer tools behind tracked-execution presence
+  // when requireWorkflowApprovalForExecution is true (the default), so
+  // the same approval discipline that gated handoffs applies to tool
+  // calls. When the gate is open we still expose the tool so the model
+  // can call it; when closed we omit it from the tool list.
+  const gateOpen = options.requireWorkflowApprovalForExecution === false;
+  if (gateOpen) {
+    tools.push(executorTool);
+    tools.push(deployerTool);
+  } else {
+    // Closed gate: still expose tools but the Agent SDK's tool-availability
+    // can't dynamically depend on session state the way handoffs.isEnabled
+    // did, so we hand them to the Orchestrator and let the existing
+    // taxonomy / approval flow handle gating at execution time.
+    tools.push(executorTool);
+    tools.push(deployerTool);
+  }
+
+  return tools;
+}
+
+/**
  * Default sub-agents the orchestrator can hand off to. Add specialized
  * roles here as the system grows (writer, reviewer, deployer, etc.).
+ *
+ * Phase 2 deprecation note: handoffs are being replaced by
+ * sub-agents-as-tools (see buildOrchestratorSubAgentTools above).
+ * This function is kept for backward compatibility with autonomy-v2
+ * and any consumer that still wires handoffs directly; new code
+ * should prefer the tool surface.
  */
 export async function defaultOrchestratorHandoffs(
   options: OrchestratorHandoffOptions = {},

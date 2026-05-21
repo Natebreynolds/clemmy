@@ -10,12 +10,17 @@ import {
   Client,
   Events,
   GatewayIntentBits,
+  ModalBuilder,
   SlashCommandBuilder,
+  TextInputBuilder,
+  TextInputStyle,
   type ButtonInteraction,
   type ChatInputCommandInteraction,
+  type ModalSubmitInteraction,
   Partials,
   type Message,
 } from 'discord.js';
+import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import {
   DISCORD_ALLOWED_CHANNELS,
   ASSISTANT_NAME,
@@ -1300,6 +1305,81 @@ async function registerSlashCommands(client: Client): Promise<void> {
   }
 }
 
+/**
+ * Modal submit handler — fires when the user clicks Edit on an
+ * approval, modifies the args in the modal, and presses submit.
+ * Resolves the approval as approve_with_edits, passing the edited
+ * JSON args to the harness resume flow which substitutes them on the
+ * SDK's interruption item before calling approve().
+ *
+ * The user-facing payload Discord requires is: respond within 3
+ * seconds of the interaction OR defer + follow up. We defer + follow
+ * up so the dashboard resume has time to start without blocking the
+ * Discord UI.
+ */
+async function handleModalSubmit(interaction: ModalSubmitInteraction): Promise<void> {
+  if (!interaction.customId.startsWith(`${DISCORD_CUSTOM_ID_PREFIX}:edit-modal:`)) {
+    return;
+  }
+  const approvalId = interaction.customId.split(':')[2];
+  if (!approvalId || !approvalId.startsWith('apr-')) {
+    await interaction.reply({ content: 'Malformed edit submission.', ephemeral: true });
+    return;
+  }
+  let editedArgs = interaction.fields.getTextInputValue('args').trim();
+  if (!editedArgs) {
+    await interaction.reply({ content: 'Edited args were empty — submit cancelled.', ephemeral: true });
+    return;
+  }
+  // Validate that what the user submitted is real JSON. If not, refuse
+  // up-front rather than failing inside the tool with a cryptic error.
+  try {
+    JSON.parse(editedArgs);
+  } catch (err) {
+    await interaction.reply({
+      content: `Edited args are not valid JSON: ${err instanceof Error ? err.message : String(err)}. Click Edit again to fix.`,
+      ephemeral: true,
+    });
+    return;
+  }
+  const row = approvalRegistry.get(approvalId);
+  if (!row || row.status !== 'pending') {
+    await interaction.reply({
+      content: row ? `Approval \`${approvalId}\` is already ${row.status}.` : `Approval \`${approvalId}\` was not found.`,
+      ephemeral: true,
+    });
+    return;
+  }
+  await interaction.deferReply({ ephemeral: true });
+  // For composio_execute_tool the inner args are a JSON string nested
+  // inside an outer { tool_slug, arguments, connected_account_id }
+  // envelope. The loop.ts approve_with_edits handler wraps the inner
+  // edit back into the original envelope before calling SDK approve(),
+  // so the modal just sends the user's INNER edit verbatim — no
+  // wrapping needed here.
+  // Resolve via the dashboard harness-approval endpoint (same path the
+  // desktop dashboard uses), so the resume logic stays in one place.
+  // We hit it on localhost; auth via WEBHOOK_SECRET query param.
+  const url = `http://127.0.0.1:${WEBHOOK_PORT}/api/console/harness-approvals/${encodeURIComponent(approvalId)}/approve_with_edits?token=${encodeURIComponent(WEBHOOK_SECRET)}`;
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ modifiedArgs: editedArgs }),
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      await interaction.editReply({ content: `Edit-and-approve failed: ${response.status} ${text.slice(0, 200)}` });
+      return;
+    }
+    await interaction.editReply({ content: `🍊 Approved with edits. The agent is continuing with your updated args.` });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    await interaction.editReply({ content: `Edit-and-approve failed: ${message}` });
+  }
+}
+
 async function handleButtonInteraction(interaction: ButtonInteraction, assistant: ClementineAssistant): Promise<void> {
   if (!interaction.customId.startsWith(`${DISCORD_CUSTOM_ID_PREFIX}:`)) {
     return;
@@ -1327,6 +1407,58 @@ async function handleButtonInteraction(interaction: ButtonInteraction, assistant
         content: text,
         ephemeral: true,
       });
+      return;
+    }
+
+    if (action === 'edit') {
+      // EDIT button — open a modal with the tool's args JSON for the
+      // user to modify. On submit (handled in handleModalSubmit), the
+      // approval resolves as approve_with_edits with the edited args.
+      if (!targetId.startsWith('apr-')) {
+        await interaction.reply({ content: 'Edit is only available for runtime approvals.', ephemeral: true });
+        return;
+      }
+      const row = approvalRegistry.get(targetId);
+      if (!row || row.status !== 'pending') {
+        await interaction.reply({
+          content: row ? `Approval \`${targetId}\` is already ${row.status}.` : `Approval \`${targetId}\` was not found.`,
+          ephemeral: true,
+        });
+        return;
+      }
+      // Pull the editable args. For composio_execute_tool we want the
+      // INNER args (the actual tool payload), not the wrapper.
+      let initialArgs = '';
+      const args = row.args ?? {};
+      if (row.tool === 'composio_execute_tool' && typeof (args as { arguments?: unknown }).arguments === 'string') {
+        // Try to pretty-print for the editor.
+        try {
+          const parsed = JSON.parse((args as { arguments: string }).arguments);
+          initialArgs = JSON.stringify(parsed, null, 2);
+        } catch {
+          initialArgs = (args as { arguments: string }).arguments;
+        }
+      } else {
+        initialArgs = JSON.stringify(args, null, 2);
+      }
+      // Discord text-input value cap is 4000 chars. Truncate gracefully.
+      if (initialArgs.length > 3900) {
+        initialArgs = `${initialArgs.slice(0, 3900)}\n…[truncated for modal]`;
+      }
+      const modal = new ModalBuilder()
+        .setCustomId(`${DISCORD_CUSTOM_ID_PREFIX}:edit-modal:${targetId}`)
+        .setTitle(`Edit args: ${truncate(row.subject || row.tool || 'action', 40)}`)
+        .addComponents(
+          new ActionRowBuilder<TextInputBuilder>().addComponents(
+            new TextInputBuilder()
+              .setCustomId('args')
+              .setLabel('Tool args (JSON)')
+              .setStyle(TextInputStyle.Paragraph)
+              .setRequired(true)
+              .setValue(initialArgs),
+          ),
+        );
+      await interaction.showModal(modal);
       return;
     }
 
@@ -2044,6 +2176,10 @@ export async function startDiscordBot(assistant: ClementineAssistant): Promise<v
     client.on(Events.InteractionCreate, async (interaction) => {
       if (interaction.isButton()) {
         await handleButtonInteraction(interaction, assistant);
+        return;
+      }
+      if (interaction.isModalSubmit()) {
+        await handleModalSubmit(interaction);
         return;
       }
       if (interaction.isChatInputCommand()) {
