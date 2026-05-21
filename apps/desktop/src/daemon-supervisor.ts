@@ -94,9 +94,35 @@ export class DaemonSupervisor {
 
     const { command, args, runAsNode } = this.resolveDaemonCommand();
 
+    // GUI Mac apps launched by launchd get a bare PATH (/usr/bin:/bin
+    // :/usr/sbin:/sbin) — no /usr/local/bin, no /opt/homebrew/bin. Every
+    // user-installed CLI (sf, gh, composio, anything from Homebrew or
+    // npm globals) is invisible to the daemon's `run_shell_command`
+    // unless we augment PATH at spawn. Discovered 2026-05-21 when the
+    // user's Salesforce work suddenly failed with "sf: command not
+    // found" even though sf was on their shell PATH — the daemon's
+    // PATH had no /usr/local/bin. Insurance: add common user-tool dirs
+    // unconditionally. Idempotent — duplicates in PATH are harmless.
+    const COMMON_USER_BIN_DIRS = [
+      '/opt/homebrew/bin',     // Apple Silicon Homebrew
+      '/opt/homebrew/sbin',
+      '/usr/local/bin',        // Intel Mac Homebrew + npm globals
+      '/usr/local/sbin',
+      `${process.env.HOME ?? ''}/.cargo/bin`,    // Rust toolchain
+      `${process.env.HOME ?? ''}/.local/bin`,    // pipx, generic user installs
+      `${process.env.HOME ?? ''}/go/bin`,        // Go binaries
+    ].filter((p) => p && !p.endsWith('/'));
+    const existingPath = process.env.PATH ?? '';
+    const existingParts = new Set(existingPath.split(':').filter(Boolean));
+    const augmentedPath = [
+      ...COMMON_USER_BIN_DIRS.filter((p) => !existingParts.has(p)),
+      ...existingPath.split(':').filter(Boolean),
+    ].join(':');
+
     const env: NodeJS.ProcessEnv = {
       ...process.env,
       ...this.opts.envOverrides,
+      PATH: augmentedPath,
       WEBHOOK_ENABLED: 'true',
       WEBHOOK_PORT: String(this.chosenPort),
       // Forward Electron's process.resourcesPath so the daemon can
