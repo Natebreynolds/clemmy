@@ -900,14 +900,30 @@ export async function runDiscordHarnessConversation(opts: {
    * per-message cap, post the head into the existing message and the
    * tail as follow-up messages. The user sees the whole answer
    * instead of the previous `…obje…` truncation marker.
+   *
+   * Approval pauses are weird: the harness's approval_requested handler
+   * sets state.done=true so the subscriber unsubscribes (the turn is
+   * "done" from the harness POV — control belongs to the human now).
+   * But that means we hit finalFlush instead of the regular flush, and
+   * without attaching components here the Approve/Edit/Reject buttons
+   * never render on the message — leaving the user with text-only
+   * "approve apr-xxx" fallback (seen 2026-05-21 on workflow_schedule).
+   * Attach them in finalFlush too when state still carries an approval.
    */
   const finalFlush = async (): Promise<void> => {
     pendingEdit = null;
     lastEditAt = Date.now();
     const fullBody = renderFullBody(state);
     const chunks = splitForLongReply(fullBody);
+    const components = approvalComponentsForState(state);
+    const needsComponentUpdate = state.pendingApprovalId !== lastAttachedApprovalId || !!components;
     try {
-      await handle.edit(chunks[0] ?? '_working…_');
+      if (needsComponentUpdate) {
+        await handle.edit(chunks[0] ?? '_working…_', { components: components ?? [] });
+        lastAttachedApprovalId = state.pendingApprovalId;
+      } else {
+        await handle.edit(chunks[0] ?? '_working…_');
+      }
       if (chunks.length > 1 && transport.sendFollowup) {
         for (let i = 1; i < chunks.length; i++) {
           await transport.sendFollowup(chunks[i]);

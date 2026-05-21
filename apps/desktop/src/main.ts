@@ -907,6 +907,29 @@ process.on('uncaughtException', (err: Error) => {
   reportBootFailure('handle a fatal error', err);
 });
 
+// Single-instance lock. Without this, double-clicking Clementine.app
+// while it's already running launches a SECOND Electron process whose
+// own boot() runs against the same HOME — at minimum that pops the
+// setup wizard a second time on a fresh install (because the marker
+// write from instance #1 may not have landed yet); at worst it starts
+// a competing daemon supervisor on a different port. We claim the
+// lock here; if we can't, we hand focus to the existing instance and
+// exit. This is the textbook Electron pattern.
+const SINGLE_INSTANCE_LOCK = app.requestSingleInstanceLock();
+if (!SINGLE_INSTANCE_LOCK) {
+  app.quit();
+  process.exit(0);
+}
+app.on('second-instance', () => {
+  // Someone tried to launch Clementine again — bring our existing
+  // window to the front instead of starting a duplicate boot loop.
+  if (setupWindow && !setupWindow.isDestroyed()) {
+    revealWindow(setupWindow);
+  } else {
+    revealMainWindow();
+  }
+});
+
 app.on('ready', () => {
   // Wrap boot() so any sync or async failure surfaces as a dialog
   // rather than a hung process. Tray + updater still arm so the user

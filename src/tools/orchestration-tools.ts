@@ -262,7 +262,7 @@ export function registerOrchestrationTools(server: McpServer): void {
 
   server.tool(
     'workflow_create',
-    'Create a multi-step workflow definition in vault/00-System/workflows.',
+    "Create a recurring or multi-step automated workflow. Use this for ANY scheduled or repeated work (\"daily at 6pm\", \"every Monday morning\", \"when X happens, do Y\") INSTEAD of task_add (which is one-shot). A workflow is the WHAT (the steps); after this call, call workflow_schedule to set the cron — that's the WHEN. If the user describes a chain of actions that should happen on a trigger, this is the tool. Call workflow_list first if you want to see existing workflow shapes.",
     {
       name: z.string().min(1),
       description: z.string().min(1),

@@ -72,7 +72,7 @@ export function registerVaultTools(server: McpServer): void {
 
   server.tool(
     'task_add',
-    'Add a new task to the master task list.',
+    "Add a SINGLE one-shot task to the user's TODO list. Use ONLY for one-time todos like \"remind me to call Bob tomorrow\" or \"add to my list: review the Q3 plan\". DO NOT use for recurring or scheduled work (\"daily\", \"every Monday\", \"at 6pm\", \"weekly\", \"every hour\") — for those, call workflow_create + workflow_schedule instead (workflows actually fire on a cron; tasks just sit in the list). The handler rejects descriptions that contain recurring language to prevent misroutes.",
     {
       description: z.string().min(1),
       priority: z.enum(['high', 'medium', 'low']).optional(),
@@ -80,6 +80,28 @@ export function registerVaultTools(server: McpServer): void {
       project: z.string().optional(),
     },
     async ({ description, priority, due_date, project }) => {
+      // Tier-2 architectural guard: task_add is one-shot. If the model
+      // tried to use it for recurring/scheduled work (the lunar-audit-style
+      // miscall from sess-mpf3h80a where Clementine called task_add for a
+      // "daily at 6pm" request), refuse with a message that names the
+      // correct tools so the model self-corrects in one retry.
+      // Only match unambiguously recurring language. The earlier draft
+      // included `at\s+\d{1,2}\s*(am|pm)` which false-positived on
+      // common one-shot reminders like "remind me at 3pm tomorrow" —
+      // a perfectly valid task_add use case. Time-of-day alone is NOT
+      // a recurrence signal; recurrence is signaled by cadence words
+      // (daily/weekly/...) or quantifiers (every X, each X).
+      const RECURRING_PATTERN = /\b(daily|weekly|monthly|hourly|every\s+(day|week|month|hour|morning|afternoon|evening|night|weekday|weekend|monday|tuesday|wednesday|thursday|friday|saturday|sunday)|each\s+(day|week|month|hour|morning|afternoon|evening|night|weekday|weekend|monday|tuesday|wednesday|thursday|friday|saturday|sunday)|recurring|repeats?|on\s+a\s+schedule)\b/i;
+      const match = description.match(RECURRING_PATTERN);
+      if (match) {
+        return textResult(
+          `task_add refused: description contains recurring/scheduled language ("${match[0]}"). `
+          + `task_add is for one-shot todos only. For recurring or scheduled work, call workflow_create `
+          + `(to define the steps) + workflow_schedule (to set the cron) instead. `
+          + `Call workflow_list first if you want to see existing examples.`,
+        );
+      }
+
       ensureTasksFile();
       let body = readFileSync(TASKS_FILE, 'utf-8');
       const taskId = nextTaskId(body);

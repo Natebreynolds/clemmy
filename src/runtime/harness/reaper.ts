@@ -93,16 +93,35 @@ export function reapOnce(): approvalRegistry.PendingApprovalRow[] {
   const expired = approvalRegistry.expireStaleApprovals(new Date());
 
   // 2) Session-status-aware reap: if a pending approval is tied to a
-  // session that's no longer active (cancelled / completed / failed),
-  // it's dead — cancel the approval row so the dashboard "NEEDS YOU"
-  // surface stops showing it. Without this, an abandoned session
-  // leaves a ghost approval card hanging around for up to 24h.
-  // Discovered 2026-05-21: a 6-hour-old approval (apr-ynut for
-  // agent_runs_recent) sat in the home feed because its session was
-  // long gone but the TTL hadn't elapsed.
+  // session that's no longer active (cancelled / completed / failed)
+  // AND the approval is old enough to be a real orphan, cancel it so
+  // the dashboard "NEEDS YOU" surface stops showing it.
+  //
+  // Two guards added 2026-05-21 after sess-mpf4pkru where this reaper
+  // killed a LIVE workflow_schedule approval that had just been
+  // requested in a new turn. Root cause: session.markStatus('completed')
+  // fires when a turn ends, but a NEW user message starts another turn
+  // on the same session without resetting status back to 'active'. So
+  // the second turn's approvals point at a session row showing
+  // 'completed' even though the run is mid-flight.
+  //
+  // Guard 1 — `MIN_APPROVAL_AGE_MS`: don't reap approvals younger than
+  // 90s. A genuinely orphan approval will still be there 90s later;
+  // killing one that fresh is almost certainly a race against the
+  // session's revival.
+  //
+  // Guard 2 — interrupt-state present: if the session has a saved
+  // RunState blob, the SDK is actively paused on this very approval.
+  // It's by definition alive.
+  const MIN_APPROVAL_AGE_MS = 90_000;
+  const now = Date.now();
   try {
     const stillPending = approvalRegistry.listPending({ status: 'pending' });
     for (const row of stillPending) {
+      // Guard 1: skip freshly-registered approvals.
+      const requestedAtMs = Date.parse(row.requestedAt);
+      if (Number.isFinite(requestedAtMs) && now - requestedAtMs < MIN_APPROVAL_AGE_MS) continue;
+
       let dead = false;
       try {
         const session = HarnessSession.load(row.sessionId);
@@ -113,7 +132,14 @@ export function reapOnce(): approvalRegistry.PendingApprovalRow[] {
           || session.sessionRow.status === 'cancelled'
           || session.sessionRow.status === 'failed'
         ) {
-          dead = true;
+          // Guard 2: even if status looks dead, the run might be paused
+          // on this exact approval. Interrupt state is the source of
+          // truth for "is the SDK still alive on this session".
+          if (session.loadInterruptState()) {
+            dead = false;
+          } else {
+            dead = true;
+          }
         }
       } catch {
         // Session row malformed / missing — treat as dead.

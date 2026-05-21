@@ -93,6 +93,14 @@ try {
     version: 'v1',
     entries: { openai_api_key: 'sk-already-in-vault-DO-NOT-OVERWRITE' },
   }, null, 2), { mode: 0o600 });
+  // Pre-seed setup-complete.json so the migration treats this as an
+  // UPGRADER, not a fresh install. Without this, the new fresh-install
+  // fast-path skips the migration entirely.
+  writeFileSync(path.join(stateDir, 'setup-complete.json'), JSON.stringify({
+    completedAt: '2025-01-01T00:00:00.000Z',
+    version: 'v1',
+    configured: { auth: 'openai', discord: false, composio: false, workspaceCount: 0, profileSet: false },
+  }, null, 2));
 
   // Pre-seed fake keychain with mixed entries.
   fakeKeytar = fakeKeytarFactory({
@@ -174,6 +182,27 @@ try {
 
   if (existsSync(markerFile)) ok('marker written even when keychain was empty');
   else fail('marker not written for empty-keychain case');
+
+  console.log('\n→ Phase 4 · fresh-install: NO setup marker → must NOT call keychain');
+  // Wipe state to simulate fresh install: no setup-complete.json, no
+  // migration marker, no vault. Also instrument the fake keytar so we
+  // can detect if findCredentials() got called (which on real macOS
+  // would have triggered the Keychain auth prompt).
+  rmSync(markerFile, { force: true });
+  rmSync(path.join(stateDir, 'setup-complete.json'), { force: true });
+  rmSync(vaultFile, { force: true });
+  fakeKeychain.clear();
+  let findCredsCallCount = 0;
+  const originalFind = fakeKeytar.findCredentials.bind(fakeKeytar);
+  fakeKeytar.findCredentials = async (...args) => { findCredsCallCount += 1; return originalFind(...args); };
+
+  const result4 = await bridge.migrateKeychainToFileVault();
+  if (!result4.ran && result4.skippedReason === 'fresh_install') ok('fresh install → migration skipped (skippedReason=fresh_install)');
+  else fail(`fresh install case unexpected: ${JSON.stringify(result4)}`);
+  if (findCredsCallCount === 0) ok('findCredentials() was NOT called on fresh install (no keychain prompt would fire)');
+  else fail(`findCredentials() was called ${findCredsCallCount}x on fresh install — would prompt the user`);
+  if (existsSync(markerFile)) ok("marker written so we don't re-attempt on next boot");
+  else fail('marker not written for fresh-install case');
 
   if (process.exitCode === 1) {
     console.error('\n✗ keychain migration smoke FAILED');

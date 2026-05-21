@@ -339,6 +339,12 @@ export async function buildOrchestratorAgent(): Promise<
       // Memory writes
       'memory_remember',
       'memory_list_facts',
+      // memory_forget added 2026-05-21 after sess-mpf4pkru where the
+      // agent reported it couldn't delete fact #16 because the tool
+      // wasn't on its surface. Cleanup capability is load-bearing for
+      // the "ever-learning" loop — Clementine has to be able to correct
+      // her own memory, not just write to it.
+      'memory_forget',
       // Workspace + files
       'workspace_config',
       'workspace_roots',
@@ -353,6 +359,25 @@ export async function buildOrchestratorAgent(): Promise<
       // Tasks (writes)
       'task_add',
       'task_update',
+      // Workflows — full surface added 2026-05-21. Catalog had these
+      // registered but the orchestrator's discoveryTools array never
+      // included them, so the agent couldn't actually create the
+      // workflows it was being asked for (sess-mpf4pkru self-reported
+      // "those tools aren't on my surface" — that was accurate, not
+      // a hallucination). workflow_create defines the WHAT,
+      // workflow_schedule sets the WHEN, the rest is full CRUD so
+      // the agent can list/update/delete its own workflows without
+      // sub-agent handoff.
+      'workflow_create',
+      'workflow_list',
+      'workflow_get',
+      'workflow_run',
+      'workflow_run_status',
+      'workflow_update',
+      'workflow_delete',
+      'workflow_set_enabled',
+      'workflow_schedule',
+      'workflow_unschedule',
       // Goals
       'goal_get',
       'goal_list',

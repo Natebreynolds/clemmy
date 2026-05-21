@@ -349,7 +349,7 @@ export async function resetAllCredentials(): Promise<{ keychainDeleted: string[]
 
 export interface KeychainMigrationResult {
   ran: boolean;            // false when marker was already present
-  skippedReason?: string;  // 'no_keytar' | 'already_migrated' | 'no_entries'
+  skippedReason?: string;  // 'no_keytar' | 'already_migrated' | 'no_entries' | 'fresh_install'
   migrated: string[];      // accounts copied from keychain → file vault
   alreadyInVault: string[];// accounts present in keychain but file vault already had them
   errors: string[];
@@ -370,6 +370,12 @@ export interface KeychainMigrationResult {
  * Behavior:
  *   - Uses `findCredentials(KEYCHAIN_SERVICE)` so the user sees at most
  *     one Keychain prompt (covers all entries), not one per credential.
+ *   - **Fresh installs are skipped entirely.** If setup-complete.json
+ *     doesn't exist, the user has never used Clementine on this HOME
+ *     before — there's nothing to migrate, and we MUST NOT call
+ *     findCredentials() because macOS pops a Keychain auth prompt the
+ *     first time an app's signature touches the security framework,
+ *     EVEN when zero entries match the service filter.
  *   - File vault wins on conflict — never overwrites an existing vault
  *     entry with a Keychain value.
  *   - Deletes the Keychain entry after a successful file-vault write
@@ -380,6 +386,16 @@ export interface KeychainMigrationResult {
 export async function migrateKeychainToFileVault(): Promise<KeychainMigrationResult> {
   if (existsSync(KEYCHAIN_MIGRATION_MARKER)) {
     return { ran: false, skippedReason: 'already_migrated', migrated: [], alreadyInVault: [], errors: [] };
+  }
+
+  // Fresh-install fast path. A user that has never completed setup on
+  // this HOME literally cannot have v0.4.16 → v0.4.29 Keychain entries
+  // here. Calling findCredentials() would gratuitously trigger the
+  // macOS Keychain access dialog. Write the marker and move on.
+  const setupCompleteMarker = path.join(STATE_DIR, 'setup-complete.json');
+  if (!existsSync(setupCompleteMarker)) {
+    writeMigrationMarker({ result: 'fresh_install' });
+    return { ran: false, skippedReason: 'fresh_install', migrated: [], alreadyInVault: [], errors: [] };
   }
 
   const keychain = await loadKeytar();
