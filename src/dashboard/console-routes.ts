@@ -560,6 +560,7 @@ export function registerConsoleRoutes(
   app.get('/console/vendor/cytoscape.min.js', (_req, res) => {
     const candidates = [
       path.resolve(process.cwd(), 'node_modules', 'cytoscape', 'dist', 'cytoscape.min.js'),
+      path.resolve(process.env.CLEMENTINE_RESOURCES_PATH ?? '', 'daemon', 'node_modules', 'cytoscape', 'dist', 'cytoscape.min.js'),
       path.resolve((process as NodeJS.Process & { resourcesPath?: string }).resourcesPath ?? '', 'daemon', 'node_modules', 'cytoscape', 'dist', 'cytoscape.min.js'),
     ];
     for (const candidate of candidates) {
@@ -575,6 +576,7 @@ export function registerConsoleRoutes(
     const candidates = [
       path.resolve(process.cwd(), 'apps', 'desktop', 'build', 'icon.png'),
       path.resolve(process.cwd(), '..', '..', 'apps', 'desktop', 'build', 'icon.png'),
+      path.resolve(process.env.CLEMENTINE_RESOURCES_PATH ?? '', 'daemon', 'apps', 'desktop', 'build', 'icon.png'),
       path.resolve((process as NodeJS.Process & { resourcesPath?: string }).resourcesPath ?? '', 'daemon', 'apps', 'desktop', 'build', 'icon.png'),
       path.resolve(os.homedir(), 'Downloads', 'clementine.png'),
     ];

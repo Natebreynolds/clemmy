@@ -191,6 +191,9 @@ function extractAccountId(idToken?: string, accessToken?: string): string | unde
 }
 
 async function exchangeAuthorizationCode(code: string, redirectUri: string, codeVerifier: string): Promise<NativeCodexTokenSet> {
+  // 30s ceiling. Without this the daemon's CLI login (`clementine auth
+  // login-native`) hangs indefinitely on a flaky network. The AbortError
+  // gets converted to a human-readable timeout message.
   const response = await fetch(TOKEN_URL, {
     method: 'POST',
     headers: {
@@ -203,6 +206,12 @@ async function exchangeAuthorizationCode(code: string, redirectUri: string, code
       redirect_uri: redirectUri,
       code_verifier: codeVerifier,
     }),
+    signal: AbortSignal.timeout(30_000),
+  }).catch((err: Error & { name?: string }) => {
+    if (err?.name === 'TimeoutError' || err?.name === 'AbortError') {
+      throw new Error('Native OAuth token exchange timed out after 30s. Check your network connection and try again.');
+    }
+    throw err;
   });
 
   const text = await response.text();
@@ -245,6 +254,12 @@ export async function refreshNativeCodexTokens(refreshToken: string): Promise<Na
       client_id: CLIENT_ID,
       refresh_token: refreshToken,
     }),
+    signal: AbortSignal.timeout(30_000),
+  }).catch((err: Error & { name?: string }) => {
+    if (err?.name === 'TimeoutError' || err?.name === 'AbortError') {
+      throw new Error('Native OAuth refresh timed out after 30s. Check your network connection and try again.');
+    }
+    throw err;
   });
 
   const text = await response.text();

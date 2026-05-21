@@ -20,6 +20,8 @@
  */
 import { app, dialog, Notification } from 'electron';
 import electronUpdater, { type UpdateInfo } from 'electron-updater';
+import { execFile } from 'node:child_process';
+import os from 'node:os';
 import path from 'node:path';
 
 // electron-updater is published as CommonJS. Under Node ESM the named
@@ -32,7 +34,8 @@ const CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4 hours
 const MOVE_TO_APPLICATIONS_MESSAGE =
   'Clementine is running from a read-only or translocated location. Move Clementine to /Applications to enable auto-updates.';
 const APP_NOT_WRITABLE_MESSAGE =
-  'Clementine is installed in /Applications, but this user cannot replace the app bundle. Reinstall Clementine from the DMG, or fix /Applications/Clementine.app ownership so your user can update it.';
+  'Clementine is installed in /Applications, but this user cannot replace the app bundle. Use Repair ownership & enable updates to fix /Applications/Clementine.app ownership.';
+const APPLICATIONS_APP_BUNDLE = '/Applications/Clementine.app';
 
 export interface UpdaterStatus {
   /** Highest-level state — what to show in the tray. */
@@ -64,6 +67,8 @@ let status: UpdaterStatus = { state: 'idle' };
 let onStatusChangeListeners: Array<(s: UpdaterStatus) => void> = [];
 let periodicHandle: NodeJS.Timeout | null = null;
 let downloadInFlight = false;
+
+type UpdaterLog = (level: 'info' | 'warn' | 'error', msg: string, extra?: Record<string, unknown>) => void;
 
 function updateStatus(next: Partial<UpdaterStatus>): void {
   status = { ...status, ...next, ...getInstallBlockerStatus() };
@@ -156,27 +161,7 @@ export function applyUpdate(): {
   }
 
   if (status.state === 'available') {
-    if (downloadInFlight) {
-      return { ok: true, action: 'downloading', reason: 'Update download is already running.' };
-    }
-    try {
-      downloadInFlight = true;
-      updateStatus({ state: 'downloading', progressPct: status.progressPct ?? 0, error: undefined });
-      void autoUpdater.downloadUpdate()
-        .catch((err: unknown) => {
-          const reason = err instanceof Error ? err.message : String(err);
-          updateStatus({ state: 'error', error: reason });
-        })
-        .finally(() => {
-          downloadInFlight = false;
-        });
-      return { ok: true, action: 'download-started' };
-    } catch (err) {
-      downloadInFlight = false;
-      const reason = err instanceof Error ? err.message : String(err);
-      updateStatus({ state: 'error', error: reason });
-      return { ok: false, reason };
-    }
+    return beginUpdateDownload();
   }
 
   if (status.state === 'downloading') {
@@ -256,6 +241,70 @@ export function moveAppToApplicationsFolder(): { ok: boolean; action?: 'already-
   }
 }
 
+export async function repairAppOwnership(): Promise<{
+  ok: boolean;
+  action?: 'already-writable' | 'repaired';
+  reason?: string;
+}> {
+  if (process.platform !== 'darwin') {
+    return { ok: false, reason: 'Ownership repair is only available on macOS.' };
+  }
+  if (!app.isPackaged) {
+    return { ok: false, reason: 'Only the packaged Clementine.app can repair update ownership.' };
+  }
+
+  const appBundlePath = getAppBundlePath();
+  if (appBundlePath !== APPLICATIONS_APP_BUNDLE) {
+    return {
+      ok: false,
+      reason: `Refusing to repair unexpected app path: ${appBundlePath}`,
+    };
+  }
+
+  const blocker = getInstallBlockerStatus();
+  if (!blocker.installBlocker) {
+    updateStatus({ state: status.state, error: undefined, installBlocker: undefined });
+    return { ok: true, action: 'already-writable' };
+  }
+  if (blocker.installBlocker !== 'app-not-writable') {
+    return { ok: false, reason: blocker.error || MOVE_TO_APPLICATIONS_MESSAGE };
+  }
+
+  const username = os.userInfo().username;
+  const command = [
+    '/usr/sbin/chown',
+    '-R',
+    `${shellQuote(username)}:staff`,
+    shellQuote(APPLICATIONS_APP_BUNDLE),
+    '&&',
+    '/bin/chmod',
+    '-R',
+    'u+rwX',
+    shellQuote(APPLICATIONS_APP_BUNDLE),
+  ].join(' ');
+
+  updateStatus({ state: 'error', error: 'Repairing Clementine update ownership…' });
+
+  try {
+    await runAdminShellCommand(command);
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    updateStatus({ state: 'error', error: reason, ...getInstallBlockerStatus() });
+    return { ok: false, reason };
+  }
+
+  const repairedBlocker = getInstallBlockerStatus();
+  if (repairedBlocker.installBlocker) {
+    const reason = repairedBlocker.error || 'Ownership repair completed, but Clementine is still not writable.';
+    updateStatus({ state: 'error', error: reason, ...repairedBlocker });
+    return { ok: false, reason };
+  }
+
+  updateStatus({ state: 'checking', error: undefined, installBlocker: undefined });
+  armAutomaticChecks();
+  return { ok: true, action: 'repaired' };
+}
+
 /**
  * Wire up electron-updater. Call once from main.ts after app is ready.
  * `logFile` is the supervisor log path — updater events get appended
@@ -295,7 +344,7 @@ export function initAutoUpdater(opts: { logFile: string }): void {
   // the native install until the user explicitly clicks Restart. With
   // tray-resident apps, autoInstallOnAppQuit can leave ShipIt waiting
   // behind the scenes while the main app stays alive.
-  autoUpdater.autoDownload = true;
+  autoUpdater.autoDownload = false;
   autoUpdater.autoInstallOnAppQuit = false;
 
   autoUpdater.on('checking-for-update', () => {
@@ -304,6 +353,20 @@ export function initAutoUpdater(opts: { logFile: string }): void {
   });
 
   autoUpdater.on('update-available', (info: UpdateInfo) => {
+    const currentVersion = app.getVersion();
+    if (compareVersions(info.version, currentVersion) <= 0) {
+      log('warn', 'ignoring non-newer update', { version: info.version, currentVersion });
+      updateStatus({
+        state: 'no-update',
+        version: undefined,
+        releaseNotes: undefined,
+        progressPct: undefined,
+        lastCheckedAt: new Date().toISOString(),
+        error: undefined,
+      });
+      return;
+    }
+
     log('info', 'update available', { version: info.version });
     updateStatus({
       state: 'available',
@@ -312,6 +375,7 @@ export function initAutoUpdater(opts: { logFile: string }): void {
       progressPct: 0,
       error: undefined,
     });
+    beginUpdateDownload(log);
   });
 
   autoUpdater.on('update-not-available', () => {
@@ -330,6 +394,19 @@ export function initAutoUpdater(opts: { logFile: string }): void {
 
   autoUpdater.on('update-downloaded', (info: UpdateInfo) => {
     downloadInFlight = false;
+    const currentVersion = app.getVersion();
+    if (compareVersions(info.version, currentVersion) <= 0) {
+      log('warn', 'ignoring downloaded non-newer update', { version: info.version, currentVersion });
+      updateStatus({
+        state: 'no-update',
+        version: undefined,
+        releaseNotes: undefined,
+        progressPct: undefined,
+        lastCheckedAt: new Date().toISOString(),
+        error: undefined,
+      });
+      return;
+    }
     log('info', 'update downloaded — ready to install', { version: info.version });
     updateStatus({
       state: 'ready-to-install',
@@ -370,12 +447,7 @@ export function initAutoUpdater(opts: { logFile: string }): void {
       });
       return;
     }
-    autoUpdater.checkForUpdates().catch(() => { /* logged above */ });
-    periodicHandle = setInterval(() => {
-      autoUpdater.checkForUpdates().catch(() => { /* logged above */ });
-    }, CHECK_INTERVAL_MS);
-    // Don't keep the event loop alive just for the timer.
-    periodicHandle.unref?.();
+    armAutomaticChecks();
   } else {
     log('info', 'dev mode — auto-updater inert (still wired for IPC)');
   }
@@ -400,6 +472,68 @@ function ensureLogDir(logFile: string): void {
   }
 }
 
+function armAutomaticChecks(): void {
+  autoUpdater.checkForUpdates().catch(() => { /* logged by updater event */ });
+  if (periodicHandle) return;
+  periodicHandle = setInterval(() => {
+    autoUpdater.checkForUpdates().catch(() => { /* logged by updater event */ });
+  }, CHECK_INTERVAL_MS);
+  // Don't keep the event loop alive just for the timer.
+  periodicHandle.unref?.();
+}
+
+function beginUpdateDownload(log?: UpdaterLog): {
+  ok: boolean;
+  action?: 'download-started' | 'downloading';
+  reason?: string;
+} {
+  if (downloadInFlight) {
+    return { ok: true, action: 'downloading', reason: 'Update download is already running.' };
+  }
+  try {
+    downloadInFlight = true;
+    updateStatus({ state: 'downloading', progressPct: status.progressPct ?? 0, error: undefined });
+    void autoUpdater.downloadUpdate()
+      .catch((err: unknown) => {
+        const reason = err instanceof Error ? err.message : String(err);
+        log?.('error', 'updater download error', { err: reason });
+        updateStatus({ state: 'error', error: reason });
+      })
+      .finally(() => {
+        downloadInFlight = false;
+      });
+    return { ok: true, action: 'download-started' };
+  } catch (err) {
+    downloadInFlight = false;
+    const reason = err instanceof Error ? err.message : String(err);
+    log?.('error', 'updater download error', { err: reason });
+    updateStatus({ state: 'error', error: reason });
+    return { ok: false, reason };
+  }
+}
+
+function compareVersions(left: string, right: string): number {
+  const leftParts = normalizeVersionParts(left);
+  const rightParts = normalizeVersionParts(right);
+  const length = Math.max(leftParts.length, rightParts.length);
+  for (let index = 0; index < length; index += 1) {
+    const leftPart = leftParts[index] ?? 0;
+    const rightPart = rightParts[index] ?? 0;
+    if (leftPart > rightPart) return 1;
+    if (leftPart < rightPart) return -1;
+  }
+  return 0;
+}
+
+function normalizeVersionParts(version: string): number[] {
+  const clean = version.trim().replace(/^v/i, '');
+  const [core] = clean.split('-', 1);
+  return core.split('.').map((part) => {
+    const parsed = Number.parseInt(part, 10);
+    return Number.isFinite(parsed) ? parsed : 0;
+  });
+}
+
 function getInstallBlockerStatus(): Pick<UpdaterStatus, 'installBlocker' | 'appPath' | 'error'> {
   if (process.platform !== 'darwin' || !app.isPackaged) return {};
   const appPath = process.execPath;
@@ -410,7 +544,7 @@ function getInstallBlockerStatus(): Pick<UpdaterStatus, 'installBlocker' | 'appP
     return { installBlocker: undefined, appPath };
   }
 
-  const appBundlePath = path.resolve(appPath, '..', '..', '..');
+  const appBundlePath = getAppBundlePath();
   try {
     accessSync(appBundlePath, constants.W_OK);
     accessSync(path.join(appBundlePath, 'Contents'), constants.W_OK);
@@ -418,4 +552,29 @@ function getInstallBlockerStatus(): Pick<UpdaterStatus, 'installBlocker' | 'appP
     return { installBlocker: 'app-not-writable', appPath, error: APP_NOT_WRITABLE_MESSAGE };
   }
   return { installBlocker: undefined, appPath };
+}
+
+function getAppBundlePath(): string {
+  return path.resolve(process.execPath, '..', '..', '..');
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function appleScriptString(value: string): string {
+  return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+}
+
+function runAdminShellCommand(command: string): Promise<void> {
+  const script = `do shell script ${appleScriptString(command)} with administrator privileges`;
+  return new Promise((resolve, reject) => {
+    execFile('/usr/bin/osascript', ['-e', script], { timeout: 120_000 }, (error, _stdout, stderr) => {
+      if (error) {
+        reject(new Error((stderr || error.message).trim()));
+        return;
+      }
+      resolve();
+    });
+  });
 }

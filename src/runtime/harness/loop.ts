@@ -284,6 +284,81 @@ const CONTINUATION_INPUT =
   'Continue with the next step of your plan. If you have nothing left to do, set done=true and nextAction=completed.';
 
 /**
+ * Max times the conversation loop will silently retry after the stall
+ * detector fires on a sub-agent turn. The detector at
+ * `evaluateProgress()` is already the generic chokepoint for "model
+ * produced prose but called no tool" — hooking the retry here means
+ * every sub-agent and every tool surface inherits recovery for free.
+ *
+ * Retry shape: append a synthetic user message that names the failure
+ * ("your previous response was prose, not an action") and, when the
+ * most recent handoff input had a structured `toolCall` field, inlines
+ * the exact slug + args so the model can call it directly. If the
+ * retry ALSO stalls, the original `sub_agent_stalled` failure surfaces
+ * to the user — same behavior as today.
+ *
+ * Default 1 keeps blast radius small: one retry on the same model on
+ * the same turn is enough to absorb intermittent "I'll do X" outputs
+ * without burning extra roundtrips when the failure is genuine.
+ * Configurable via env for ops tuning.
+ */
+const MAX_STALL_RETRIES = positiveIntEnv('HARNESS_MAX_STALL_RETRIES', 1);
+
+/**
+ * Build the synthetic user message that drives the stall retry.
+ *
+ * Generic fallback first: name the failure, command an action, offer
+ * ask_user_question as an escape hatch. Works for any sub-agent and
+ * any tool surface.
+ *
+ * Opportunistic enrichment: scan recent `handoff` events for a
+ * structured `toolCall.slug + args` — when present, inline both so the
+ * model has the exact composio_execute_tool invocation it failed to
+ * make the first time. This is the path that recovers the most common
+ * failure shape (Orchestrator pre-resolved Composio action → Executor
+ * announced instead of executing).
+ *
+ * Reads from the eventlog only; never imports the model or SDK, so
+ * unit tests can exercise this with a stubbed runner.
+ */
+function buildStallRetryMessage(sessionId: string, stall: StallInfo): string {
+  let toolCallHint = '';
+  try {
+    const events = listEvents(sessionId);
+    for (let i = events.length - 1; i >= 0; i -= 1) {
+      const event = events[i];
+      if (event.type !== 'handoff') continue;
+      const input = (event.data as { input?: unknown })?.input;
+      if (!input || typeof input !== 'object') continue;
+      const toolCall = (input as { toolCall?: unknown }).toolCall;
+      if (!toolCall || typeof toolCall !== 'object') continue;
+      const slug = (toolCall as { slug?: unknown }).slug;
+      const args = (toolCall as { args?: unknown }).args;
+      if (typeof slug !== 'string' || !slug) continue;
+      if (typeof args !== 'string' || !args) continue;
+      toolCallHint =
+        ` The Orchestrator already resolved the action for you:` +
+        ` call composio_execute_tool with { tool_slug: "${slug}", arguments: ${args} } —` +
+        ` use those exact values, do not re-discover, do not modify the args.`;
+      break;
+    }
+  } catch {
+    // listEvents may throw in degraded states; the generic message
+    // still works without the structured hint.
+  }
+
+  const stallShape = stall.signal === 'A_zero_tools'
+    ? 'Your previous response was prose, not an action.'
+    : 'Your previous response did not make progress on the directive.';
+
+  return [
+    stallShape,
+    'You MUST call a tool now to make progress — do not emit any text before the tool call.',
+    toolCallHint || ' If the directive is ambiguous and you cannot pick a tool, call ask_user_question instead of producing announcement text.',
+  ].join('');
+}
+
+/**
  * Emit the terminal `runtime.completed` or `runtime.failed` action-bus
  * event for a finished `runConversation` call. The invariant
  * (T0.6 + T1.5): every runConversation invocation terminates with
@@ -353,6 +428,11 @@ async function runConversationCore(
   let nextInput = options.input;
   let lastDecision: OrchestratorDecisionShape | undefined;
   let lastTurn = 0;
+  // Stall-retry counter (scoped to this conversation). Incremented each
+  // time evaluateProgress() returns a stall AND we have retry budget
+  // remaining. Reset implicitly because it's a local — a fresh
+  // runConversation() call starts from zero.
+  let stallRetriesUsed = 0;
 
   while (stepIndex < maxSteps) {
     stepIndex += 1;
@@ -437,6 +517,35 @@ async function runConversationCore(
             ...stallInfo.detail,
           },
         });
+
+        // RETRY HOOK: before terminating the conversation, try ONCE
+        // more with a synthetic "act now" message. The detector is
+        // generic, so the retry inherits coverage across all sub-agents
+        // and tool types — no per-tool or per-agent enforcement needed.
+        // Opportunistic enrichment: when the most recent handoff input
+        // carried a structured `toolCall.slug + args`, we inline those
+        // values so the model has a single obvious action to take. The
+        // generic prose still works when no structured handoff exists
+        // (file writes, shell commands, non-Composio paths).
+        if (stallRetriesUsed < MAX_STALL_RETRIES) {
+          stallRetriesUsed += 1;
+          safeAppend({
+            sessionId: options.sessionId,
+            turn: turnResult.turn,
+            role: 'system',
+            type: 'stall_retry_attempted',
+            data: {
+              signal: stallInfo.signal,
+              attempt: stallRetriesUsed,
+              maxRetries: MAX_STALL_RETRIES,
+              rawOutput: stallInfo.rawOutput,
+            },
+          });
+          nextInput = buildStallRetryMessage(options.sessionId, stallInfo);
+          continue;
+        }
+        // Retry budget exhausted — fall through to the existing
+        // conversation_completed path with reason=sub_agent_stalled.
       }
 
       safeAppend({
@@ -1485,12 +1594,23 @@ function previewOutput(out: unknown): string {
  */
 const STALL_OUTPUT_PATTERN = /^(continuing|ok|okay|done|sure|got it|working on it|will do|on it|understood|noted|alright|certainly|yes)\.?$/i;
 
-// Verbose-announcement stall: the model produced future-tense
-// language describing work it's about to do, but didn't actually call
-// any tool to do it. Example: "Executing the Salesforce pull now —
-// I'll fetch 15 contacts ..." with 0 tool calls. This is a louder
-// version of "Continuing." and just as broken.
-const STALL_ANNOUNCEMENT_PATTERN = /\b(I[\u2018\u2019\u02bc' ]?ll\s|let me\s|executing\s|fetching\s|running\s|pulling\s|querying\s|about to\s|going to\s|on the way|in progress|kicking off|starting now)/i;
+// Verbose-announcement / false-claim stall. Two shapes the detector
+// catches; both end with zero tool calls in the sub-agent turn:
+//
+// (A) Future-tense announcement — "Executing the Salesforce pull
+//     now — I'll fetch 15 contacts..." Original repro 2026-05-19.
+//
+// (B) Past-tense FALSE CLAIM — "Handed off the exact Outlook action
+//     for execution with the required tool slug and arguments." or
+//     "Searched Outlook and found nothing." The model lies that
+//     work happened. Caught in sess-mper69si-1a163ec1 (2026-05-21)
+//     after a retry escaped the original future-tense filter.
+//     Strictly WORSE than (A) because the false claim looks like a
+//     real reply and the user trusts it.
+//
+// Boundary anchors (\b) prevent substring matches; the Unicode-
+// apostrophe class catches curly quotes models love to emit.
+const STALL_ANNOUNCEMENT_PATTERN = /\b(I[\u2018\u2019\u02bc' ]?ll\s|let me\s|executing\s|fetching\s|running\s|pulling\s|querying\s|about to\s|going to\s|on the way|in progress|kicking off|starting now|handed off\s|handing off\s|completed the\s|sent the\s|updated the\s|searched\s|pulled the\s|posted the\s|created the\s|drafted the\s|saved the\s|loaded the\s|fetched\s|queried\s|ran the\s)/i;
 
 export type StallSignal = 'A_zero_tools' | 'B_repeated_tool' | 'C_handoff_pingpong' | 'D_decision_json';
 

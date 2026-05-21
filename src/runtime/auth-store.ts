@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
@@ -96,8 +96,12 @@ export function getStoredCodexOAuthTokens(): StoredCodexOAuthTokens | null {
 }
 
 function saveLocalAuthState(state: LocalAuthState): void {
+  // Refresh tokens live here. Lock to 0600 so other accounts on the
+  // same machine can't read them. Pass mode at write time AND chmod
+  // after because some filesystems re-apply umask on creation.
   mkdirSync(path.dirname(AUTH_STATE_FILE), { recursive: true });
-  writeFileSync(AUTH_STATE_FILE, JSON.stringify(state, null, 2), 'utf-8');
+  writeFileSync(AUTH_STATE_FILE, JSON.stringify(state, null, 2), { encoding: 'utf-8', mode: 0o600 });
+  try { chmodSync(AUTH_STATE_FILE, 0o600); } catch { /* best-effort */ }
 }
 
 function loadCodexCliAuth(sourceFile = getCodexAuthSourceFile()): CodexCliAuthFile | null {
@@ -167,7 +171,8 @@ function writeCodexAuthFile(tokens: NonNullable<LocalAuthState['codexOauth']>, s
       account_id: tokens.accountId ?? null,
     },
     last_refresh: tokens.lastRefresh ?? new Date().toISOString(),
-  }, null, 2), 'utf-8');
+  }, null, 2), { encoding: 'utf-8', mode: 0o600 });
+  try { chmodSync(sourceFile, 0o600); } catch { /* best-effort */ }
 }
 
 function runInteractiveCommand(command: string, args: string[]): Promise<boolean> {

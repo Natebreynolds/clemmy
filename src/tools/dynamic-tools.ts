@@ -4,6 +4,7 @@ import path from 'node:path';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { BASE_DIR } from '../config.js';
+import { findSafeCliCommand } from '../runtime/cli-discovery.js';
 import { textResult } from './shared.js';
 
 export function registerDynamicTools(server: McpServer): void {
@@ -37,8 +38,24 @@ export function registerDynamicTools(server: McpServer): void {
       { args: z.string().optional().describe(argsDescription) },
       async ({ args }) => {
         try {
-          const command = file.endsWith('.py') ? 'python3' : filePath;
-          const commandArgs = file.endsWith('.py') ? [filePath, ...(args ? [args] : [])] : args ? [args] : [];
+          let command = filePath;
+          let commandArgs: string[] = args ? [args] : [];
+          if (file.endsWith('.py')) {
+            // Route python3 through the stub guard. On a fresh Mac with
+            // no Xcode/CLT installed, `/usr/bin/python3` is a shim that
+            // pops the CLT installer when invoked. The guard returns a
+            // clear "install python3 (or Xcode CLT) first" error instead
+            // of triggering Apple's system dialog.
+            const safe = findSafeCliCommand('python3');
+            if (!safe) {
+              return textResult('Tool error: python3 is not installed on $PATH. Install Python 3 (e.g. via Homebrew: `brew install python`) then retry.');
+            }
+            if (safe.skipped) {
+              return textResult(`Tool error: ${safe.reason}`);
+            }
+            command = safe.command;
+            commandArgs = [filePath, ...(args ? [args] : [])];
+          }
           const result = execFileSync(command, commandArgs, {
             cwd: BASE_DIR,
             encoding: 'utf-8',

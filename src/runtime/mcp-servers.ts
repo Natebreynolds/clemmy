@@ -63,6 +63,14 @@ function pathDirname(filePath: string): string {
   return path.dirname(filePath);
 }
 
+function localNodeCommand(): string {
+  // In packaged Electron, the daemon itself is already running under
+  // Clementine with ELECTRON_RUN_AS_NODE=1. Reuse that executable for
+  // the local MCP child so fresh Macs do not need a separate Node.js
+  // install just to run Clementine's built-in tools.
+  return process.execPath || 'node';
+}
+
 function createLocalServer(): MCPServerStdio | null {
   if (!LOCAL_MCP_ENABLED) return null;
 
@@ -72,7 +80,7 @@ function createLocalServer(): MCPServerStdio | null {
   if (existsSync(distEntry)) {
     return new MCPServerStdio({
       name: 'clementine-local',
-      command: 'node',
+      command: localNodeCommand(),
       args: [distEntry],
       env: mergedEnv({
         CLEMENTINE_HOME: BASE_DIR,

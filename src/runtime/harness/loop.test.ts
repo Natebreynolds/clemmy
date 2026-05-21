@@ -841,7 +841,11 @@ test('runConversation: stuck_detected fires Signal A when zero tools + generic a
     runRunner: runner,
   });
   const stuckEvents = listEventsForConv(sess.id, { types: ['stuck_detected'] });
-  assert.equal(stuckEvents.length, 1, 'expected one stuck_detected event');
+  // The harness retries once on stall (HARNESS_MAX_STALL_RETRIES=1
+  // default); the retry stalls too with this scripted runner, so the
+  // detector fires twice. What matters here is that the FIRST signal
+  // is correctly classified — that's the detector's contract.
+  assert.ok(stuckEvents.length >= 1, 'expected at least one stuck_detected event');
   assert.equal((stuckEvents[0].data as { signal: string }).signal, 'A_zero_tools');
 });
 
@@ -866,7 +870,11 @@ test('runConversation: Signal D fires when sub-agent emits OrchestratorDecision 
     runRunner: runner,
   });
   const stuckEvents = listEventsForConv(sess.id, { types: ['stuck_detected'] });
-  assert.equal(stuckEvents.length, 1);
+  // Like Signal A above: the auto-retry causes the detector to fire
+  // once per stalled turn. Assert the first signal is classified
+  // correctly — the retry-count assertion is in the new
+  // "stall triggers one auto-retry" test below.
+  assert.ok(stuckEvents.length >= 1);
   assert.equal((stuckEvents[0].data as { signal: string }).signal, 'D_decision_json');
   // The visible summary should be the model's reply (since it had a
   // usable one) — surfaced through the detector instead of silently
@@ -887,6 +895,144 @@ test('runConversation: a real "Added 5 rows" reply does NOT fire any stall signa
   });
   const stuckEvents = listEventsForConv(sess.id, { types: ['stuck_detected'] });
   assert.equal(stuckEvents.length, 0);
+});
+
+test('runConversation: past-tense FALSE CLAIM with zero tools is flagged (regression: sess-mper69si)', async () => {
+  // Repro from 2026-05-21 sess-mper69si-1a163ec1 turn 2:
+  // After the retry hook re-prompted the Executor with a clear
+  // "act now" directive, the model produced past-tense narrative
+  // claiming the work was done without calling a tool:
+  //   "Handed off the exact Outlook action for execution with the
+  //    required tool slug and arguments."
+  // The original future-tense-only regex missed this and surfaced
+  // the false claim to the user as a real reply. Broadening
+  // STALL_ANNOUNCEMENT_PATTERN to past-tense verbs catches it
+  // honestly so the user sees a failure message instead of a lie.
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const runner = scriptedRunner([
+    {
+      finalOutput:
+        'Handed off the exact Outlook action for execution with the required tool slug and arguments.',
+    },
+  ]);
+  await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'find that email',
+    makeRunner: makeRunnerStub,
+    runRunner: runner,
+  });
+  const stuckEvents = listEventsForConv(sess.id, { types: ['stuck_detected'] });
+  assert.ok(stuckEvents.length >= 1, 'expected past-tense false claim to fire stuck_detected');
+  assert.equal((stuckEvents[0].data as { signal: string }).signal, 'A_zero_tools');
+
+  const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] });
+  assert.equal(completed[0].data.reason, 'sub_agent_stalled');
+});
+
+test('runConversation: stall triggers one auto-retry; retry success completes conversation normally', async () => {
+  // Repro from the 2026-05-20 sess-mpepwb5r-348980f6 trace:
+  // Orchestrator did discovery + tool_choice_remember + handoff with
+  // structured toolCall, Executor announced "I'll search Outlook..."
+  // with zero post-handoff tool calls. Detector caught it, but the
+  // conversation died with sub_agent_stalled and the user saw the
+  // "announced work but didn't call the tool" error message.
+  //
+  // Fix E hooks the stall detector to one auto-retry with a synthetic
+  // "act now" message. If the retry succeeds (model emits a tool call
+  // on the second pass), the conversation completes normally and the
+  // user never sees the stall failure.
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  // Pre-seed an Orchestrator handoff event so buildStallRetryMessage()
+  // can find the structured toolCall and surface it in the retry.
+  const { appendEvent } = await import('./eventlog.js');
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'orchestrator',
+    type: 'handoff',
+    data: {
+      to: 'Executor',
+      input: {
+        directive: 'Search Nate’s Outlook for emails from Marlow today.',
+        toolCall: {
+          slug: 'OUTLOOK_LIST_MESSAGES',
+          args: '{"user_id":"me","folder":"allfolders","search":"Marlow","top":25}',
+          rationale: 'Pre-resolved by Orchestrator after discovery.',
+        },
+      },
+    },
+  });
+
+  // First turn stalls (announcement, zero tools). Second turn returns
+  // a real reply — simulates the retry working. The scripted runner
+  // walks turns sequentially, so the retry hits the second entry.
+  let scriptIndex = 0;
+  const scripted = [
+    'I’ll search Outlook for “Marlow” and check whether anything came in today.',
+    'Found 1 email from Marlowe Rary today, subject "Account question".',
+  ];
+  const runRunner: RunRunnerFn = async (_r, _a, items) => {
+    const output = scripted[scriptIndex] ?? scripted[scripted.length - 1];
+    scriptIndex += 1;
+    return { history: items, lastResponseId: undefined, finalOutput: output };
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'A prospect emailed me today Marlow can you find that',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  // The conversation completed (NOT stalled out).
+  assert.equal(result.status, 'completed');
+  const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] });
+  assert.notEqual(completed[0].data.reason, 'sub_agent_stalled', 'retry should have prevented sub_agent_stalled');
+
+  // The retry event was logged for observability.
+  const retryEvents = listEventsForConv(sess.id, { types: ['stall_retry_attempted'] });
+  assert.equal(retryEvents.length, 1, 'expected exactly one stall_retry_attempted event');
+  const retryData = retryEvents[0].data as {
+    attempt: number;
+    maxRetries: number;
+    signal: string;
+    rawOutput: string;
+  };
+  assert.equal(retryData.attempt, 1);
+  assert.equal(retryData.signal, 'A_zero_tools');
+  assert.match(retryData.rawOutput, /search Outlook for/);
+
+  // The retry message that drove turn 2 should mention the slug the
+  // Orchestrator pre-resolved — the model gets the action inlined.
+  const userInputs = listEventsForConv(sess.id, { types: ['user_input_received'] });
+  assert.ok(userInputs.length >= 2, 'expected the retry to inject a synthetic user input');
+  assert.match(userInputs[1].data.text as string, /OUTLOOK_LIST_MESSAGES/, 'retry message should inline the pre-resolved slug');
+});
+
+test('runConversation: stall retry that ALSO stalls falls through to sub_agent_stalled', async () => {
+  // Negative case: scripted runner stalls on every turn, so the retry
+  // also stalls. Budget exhausts, the original failure surfaces as
+  // today's behavior. Documents that the retry doesn't mask genuine
+  // model failure — it only absorbs intermittent ones.
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const runner = scriptedRunner([{ finalOutput: 'I’ll do that now.' }]);
+  await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'go',
+    makeRunner: makeRunnerStub,
+    runRunner: runner,
+  });
+  const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] });
+  assert.equal(completed[0].data.reason, 'sub_agent_stalled');
+  // Retry was attempted once before giving up.
+  const retryEvents = listEventsForConv(sess.id, { types: ['stall_retry_attempted'] });
+  assert.equal(retryEvents.length, 1);
 });
 
 test('runConversation: propagates run_failed status when a turn throws', async () => {

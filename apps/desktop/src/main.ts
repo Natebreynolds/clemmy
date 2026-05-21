@@ -13,7 +13,7 @@ import {
 } from 'electron';
 import path from 'node:path';
 import os from 'node:os';
-import { existsSync, readFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { DaemonSupervisor, locateDaemonProjectRoot, type SupervisorEvent } from './daemon-supervisor.js';
 import { needsSetup, hasCompletedSetup, writeSetupComplete, type SetupConfiguredSummary } from './setup-state.js';
 import { createSetupWindow } from './setup-window.js';
@@ -26,11 +26,11 @@ import {
   initAutoUpdater,
   moveAppToApplicationsFolder,
   onUpdaterStatusChange,
+  repairAppOwnership,
 } from './updater.js';
 import {
   deleteCredential,
   ensureWebhookSecret,
-  isKeychainAvailable,
   listCredentialRows,
   resetAllCredentials,
   setCredential,
@@ -91,6 +91,32 @@ let tray: Tray | null = null;
 let dashboardUrl = '';
 let recallCapture: RecallDesktopCapture | null = null;
 let quitPrepared = false;
+
+function revealWindow(win: BrowserWindow | null): void {
+  if (!win || win.isDestroyed()) return;
+  if (win.isMinimized()) win.restore();
+  win.show();
+  win.moveTop();
+  if (process.platform === 'darwin') {
+    try {
+      app.focus({ steal: true });
+    } catch {
+      app.focus();
+    }
+  }
+  win.focus();
+}
+
+function revealMainWindow(): void {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    if (dashboardUrl) {
+      mainWindow = createMainWindow(dashboardUrl);
+    } else {
+      return;
+    }
+  }
+  revealWindow(mainWindow);
+}
 let quitPreparing = false;
 let installQuitFallback: NodeJS.Timeout | null = null;
 let cachedWebhookSecret = '';
@@ -269,16 +295,7 @@ function rebuildTrayMenu(): void {
     { type: 'separator' },
     {
       label: 'Open Console',
-      click: () => {
-        if (!mainWindow || mainWindow.isDestroyed()) {
-          if (dashboardUrl) {
-            mainWindow = createMainWindow(dashboardUrl);
-          }
-        } else {
-          mainWindow.show();
-          mainWindow.focus();
-        }
-      },
+      click: () => revealMainWindow(),
     },
     { label: 'Open Console in Browser', click: () => dashboardUrl && shell.openExternal(dashboardUrl) },
     { label: 'Open Log File', click: () => shell.openPath(LOG_FILE) },
@@ -309,8 +326,8 @@ function buildUpdaterMenuItems(): Electron.MenuItemConstructorOptions[] {
     label = 'Move to Applications to enable updates';
     click = () => { moveAppToApplicationsFolder(); };
   } else if (u.installBlocker === 'app-not-writable') {
-    label = 'Reinstall Clementine to enable updates';
-    click = () => { void shell.openExternal('https://github.com/Natebreynolds/clemmy/releases/latest'); };
+    label = 'Repair ownership & enable updates';
+    click = () => { void repairUpdateOwnershipFromUi(); };
   } else if (u.state === 'available') {
     label = `Download update v${u.version || ''}`;
     click = () => { void applyUpdateFromUi(); };
@@ -380,6 +397,27 @@ async function applyUpdateFromUi(): Promise<ReturnType<typeof getUpdaterStatus> 
   return { ...getUpdaterStatus(), applyResult: result };
 }
 
+async function repairUpdateOwnershipFromUi(): Promise<ReturnType<typeof getUpdaterStatus> & { repairResult: Awaited<ReturnType<typeof repairAppOwnership>> }> {
+  const result = await repairAppOwnership().catch((err: unknown) => ({
+    ok: false as const,
+    reason: err instanceof Error ? err.message : String(err),
+  }));
+  if (result.ok) {
+    new Notification({
+      title: 'Clementine updates repaired',
+      body: 'Ownership is fixed. Checking for updates again…',
+      silent: true,
+    }).show();
+  } else {
+    dialog.showErrorBox(
+      'Clementine could not repair updates',
+      result.reason || 'Ownership repair failed. Reinstall Clementine from the latest DMG, then try again.',
+    );
+  }
+  rebuildTrayMenu();
+  return { ...getUpdaterStatus(), repairResult: result };
+}
+
 async function quitCleanly(): Promise<void> {
   (app as { isQuitting?: boolean }).isQuitting = true;
   await prepareForQuit();
@@ -428,6 +466,37 @@ async function boot(): Promise<void> {
     openSetupWindow();
   } else {
     await launchDaemon();
+  }
+}
+
+/**
+ * Convert any thrown error in the boot path into a visible dialog +
+ * structured log line. Without this, an unhandled rejection inside
+ * boot() leaves the user staring at a launched-but-blank Electron app
+ * (this is exactly how the 0.2.3 keytar interop bug presented).
+ *
+ * The dialog is informational — we don't auto-quit because the user
+ * may want to copy the error before closing. Tray + auto-updater still
+ * arm so they can install a fix once one ships.
+ */
+function reportBootFailure(stage: string, err: unknown): void {
+  const message = err instanceof Error ? err.stack ?? err.message : String(err);
+  // Log to the daemon supervisor log file so a later "Open Log File"
+  // tray action surfaces the error even after the dialog is dismissed.
+  try {
+    mkdirSync(path.dirname(LOG_FILE), { recursive: true });
+    appendFileSync(LOG_FILE, `\n=== Boot failure (${stage}) at ${new Date().toISOString()} ===\n${message}\n`);
+  } catch {
+    // If we can't even append to the log, fall through to the dialog.
+  }
+  try {
+    dialog.showErrorBox(
+      `Clementine couldn't ${stage}`,
+      `${message}\n\nLog file: ${LOG_FILE}\n\nTry quitting Clementine and relaunching. If this keeps happening, open the log and share it from Settings → Diagnostics.`,
+    );
+  } catch {
+    // dialog may not be ready (e.g. app.on('ready') hasn't fired yet);
+    // the log line is the durable record.
   }
 }
 
@@ -483,7 +552,7 @@ async function launchDaemon(): Promise<void> {
     });
     mainWindow = createMainWindow(dashboardUrl);
     mainWindow.once('ready-to-show', () => {
-      mainWindow?.show();
+      revealWindow(mainWindow);
       splashWindow?.close();
       splashWindow = null;
     });
@@ -610,6 +679,8 @@ ipcMain.handle('clemmy:updater-move-to-applications', () => {
   return { ...getUpdaterStatus(), moveResult: result };
 });
 
+ipcMain.handle('clemmy:updater-repair-ownership', () => repairUpdateOwnershipFromUi());
+
 function sendUpdaterEvent(status: ReturnType<typeof getUpdaterStatus>): void {
   for (const win of [mainWindow, splashWindow, setupWindow]) {
     if (win && !win.isDestroyed()) {
@@ -623,7 +694,11 @@ function sendUpdaterEvent(status: ReturnType<typeof getUpdaterStatus>): void {
 ipcMain.handle('clemmy:setup-status', async () => ({
   needsSetup: needsSetup(),
   hasCompleted: hasCompletedSetup(),
-  hasKeychain: await isKeychainAvailable(),
+  // Passive by design: do not even probe keytar here. On some macOS
+  // machines a Keychain availability probe can foreground Keychain
+  // Access and steal input from the setup/dashboard window. Explicit
+  // Keychain actions still use the live keychain path.
+  hasKeychain: false,
 }));
 
 ipcMain.handle('clemmy:credentials-list', async () => {
@@ -787,8 +862,24 @@ ipcMain.handle('clemmy:setup-skip', async () => {
 
 // ─── App lifecycle ─────────────────────────────────────────────────
 
+// Catch any unhandled rejection in the Electron main process so the
+// next bug class doesn't silently freeze boot. The 0.2.3 keytar interop
+// crash was an unhandled rejection inside ensureWebhookSecret() that
+// wedged boot() — the app launched, no window appeared, no user-visible
+// signal. These handlers convert any future silent freeze into a
+// visible dialog the user can act on (or screenshot to file a bug).
+process.on('unhandledRejection', (reason: unknown) => {
+  reportBootFailure('handle a background error', reason);
+});
+process.on('uncaughtException', (err: Error) => {
+  reportBootFailure('handle a fatal error', err);
+});
+
 app.on('ready', () => {
-  void boot();
+  // Wrap boot() so any sync or async failure surfaces as a dialog
+  // rather than a hung process. Tray + updater still arm so the user
+  // can install a fix once one ships.
+  boot().catch((err) => reportBootFailure('start up', err));
   setupTray();
   // Arm auto-updater after boot kicks off. Status changes flip the
   // tray label so the user sees "Restart to install vX.Y.Z" when an
@@ -805,11 +896,7 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') quitCleanly();
 });
 app.on('activate', () => {
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.show();
-  } else if (dashboardUrl) {
-    mainWindow = createMainWindow(dashboardUrl);
-  }
+  revealMainWindow();
 });
 app.on('before-quit', (event) => {
   if ((app as { isInstallingUpdate?: boolean }).isInstallingUpdate) {

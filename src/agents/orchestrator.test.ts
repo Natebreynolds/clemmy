@@ -95,20 +95,25 @@ test('Orchestrator carries the harness guardrails', async () => {
   assert.ok(outputNames.includes('secret_leak'));
 });
 
-test('Orchestrator tools are deliberation + read-only discovery/memory tools', async () => {
-  // composio_search_tools is read-only — it queries Composio for
-  // matching action slugs but doesn't mutate anything. Including it
-  // on the Orchestrator lets it own the "find the right tool"
-  // decision in code instead of via a Researcher detour. The
-  // execute counterpart (composio_execute_tool) is NOT here — it
-  // stays on the Executor side of the handoff so the
-  // zero-action-tools discipline holds for the Orchestrator.
+test('Orchestrator tools include direct-execute Composio path + read-only discovery/memory', async () => {
+  // Updated 2026-05-20: the Orchestrator now carries composio_execute_tool
+  // for the recall-HIT fast path. Production data showed 86% of
+  // tool_choice_recall HIT → Executor handoff sessions stalled with zero
+  // post-handoff tool calls; the model that resolved the slug should call
+  // it. Approval gating is unchanged — mutating slugs still pause for
+  // user consent through the standard tool-taxonomy decideToolApproval()
+  // path, regardless of which agent invokes them.
+  //
+  // Shell + filesystem writes (run_shell_command, write_file) stay OFF
+  // the Orchestrator's surface — those remain Executor territory because
+  // they're the actually-needs-tracking work.
   const agent = await buildOrchestratorAgent();
   const toolNames = (agent.tools ?? []).map((t) => (t as { name?: string }).name).sort();
   assert.deepEqual(
     toolNames,
     [
       'ask_user_question',
+      'composio_execute_tool',
       'composio_search_tools',
       'desktop_status',
       'draft_plan',
@@ -120,9 +125,22 @@ test('Orchestrator tools are deliberation + read-only discovery/memory tools', a
       'tool_choice_invalidate',
       'tool_choice_recall',
       'tool_choice_remember',
+      // 2026-05-20: read-only context lookups so the Orchestrator
+      // can answer "what time zone am I in / what's on my list /
+      // what did we decide / what am I working on" without handing
+      // off to a sub-agent. Writes (memory_remember, task_add,
+      // task_update, execution_update_step, etc.) stay on sub-agents
+      // — the trust gradient is unchanged.
+      'execution_get',
+      'execution_list',
+      'memory_read',
+      'memory_recall',
+      'memory_search',
+      'task_list',
+      'user_profile_read',
     ].sort(),
   );
-  assert.equal(toolNames.includes('composio_execute_tool'), false);
+  // Shell + filesystem writes remain Executor-only territory.
   assert.equal(toolNames.includes('run_shell_command'), false);
   assert.equal(toolNames.includes('write_file'), false);
 });

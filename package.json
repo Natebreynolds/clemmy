@@ -1,6 +1,6 @@
 {
   "name": "clemmy",
-  "version": "0.4.31",
+  "version": "0.4.32",
   "description": "Lightweight background agent system — proactive, customizable, runs out of the box",
   "license": "MIT",
   "homepage": "https://github.com/Natebreynolds/clemmy",
@@ -31,6 +31,9 @@
   "scripts": {
     "build": "tsc --outDir dist",
     "typecheck": "tsc --noEmit",
+    "test": "tsx --test src/**/*.test.ts",
+    "test:smoke": "node scripts/smoke-fresh-install.mjs && node scripts/smoke-fresh-install-e2e.mjs",
+    "test:smoke:gate": "node scripts/smoke-fresh-install.mjs",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
     "prepack": "npm run build",

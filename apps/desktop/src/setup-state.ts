@@ -11,16 +11,11 @@ import os from 'node:os';
  * (timestamp, version, what was configured) to drive a future
  * "re-run setup" flow without losing the user's existing config.
  *
- * Detection considers a state "needs setup" when:
- *   - The marker file is absent OR
- *   - No usable auth credential exists yet (neither OPENAI_API_KEY
- *     in env nor a codex auth.json on disk nor anything in the
- *     SecretStore file vault)
- *
- * Skipping the wizard with an existing .env-based setup is fine —
- * the env backend is a first-class fallback. The wizard surface
- * exists primarily for users who installed the .app via DMG and
- * have never touched a terminal.
+ * Detection considers a state "needs setup" when the marker file is
+ * absent. Existing env/Codex/vault credentials are still valid
+ * fallback inputs, but they must not silently skip the wizard on a
+ * fresh desktop install. The setup-complete marker is the only source
+ * of truth for "this app has been onboarded."
  */
 
 const HOME = os.homedir();
@@ -50,8 +45,8 @@ export interface SetupCompleteRecord {
 export type SetupConfiguredSummary = SetupCompleteRecord['configured'];
 
 /** True when the user already has SOME usable credential anywhere
- *  (env, file vault, or codex auth). Used to choose between the
- *  setup wizard and the dashboard. */
+ *  (env, file vault, or codex auth). Used for diagnostics and setup
+ *  copy, not as the first-run skip gate. */
 export function hasAnyUsableCredential(): boolean {
   // Check process env
   if (process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY.length > 0) return true;
@@ -104,8 +99,7 @@ export function hasCompletedSetup(): boolean {
 
 /** Final "is this a first-run install" decision used by main.ts. */
 export function needsSetup(): boolean {
-  if (hasCompletedSetup()) return false;
-  return !hasAnyUsableCredential();
+  return !hasCompletedSetup();
 }
 
 /** Read the marker so the dashboard or tray can surface "configured X days ago". */

@@ -6,13 +6,19 @@ import { BoundaryError } from './boundary-error.js';
 import { rateLimitedAlert } from './rate-limited-alert.js';
 import { withTimeout } from './harness/brackets.js';
 
-// Tighter client-side timeouts than the MCP SDK's default (~60s). Each
-// server that's unreachable used to burn the full 60s before
-// surfacing as a stub; on a daemon with 5 dead servers that's a
-// noticeable boot stall. With 5s/8s, a dead server fast-fails into the
-// backoff loop and stops being probed until its nextRetryAt elapses.
-const MCP_LIST_TOOLS_TIMEOUT_MS = 5_000;
-const MCP_CONNECT_TIMEOUT_MS = 8_000;
+// Bound MCP startup below the SDK's default (~60s), but leave enough
+// room for `npx`/`uvx` based servers on fresh machines. 5s/8s was too
+// aggressive: DataForSEO would print "running on stdio" just after
+// Clementine had already marked it unavailable.
+function positiveIntEnv(key: string, fallback: number): number {
+  const raw = process.env[key];
+  if (!raw) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+const MCP_LIST_TOOLS_TIMEOUT_MS = positiveIntEnv('MCP_LIST_TOOLS_TIMEOUT_MS', 20_000);
+const MCP_CONNECT_TIMEOUT_MS = positiveIntEnv('MCP_CONNECT_TIMEOUT_MS', 30_000);
 
 type MCPTool = Awaited<ReturnType<MCPServer['listTools']>>[number];
 type CallToolResultContent = Awaited<ReturnType<MCPServer['callTool']>>;

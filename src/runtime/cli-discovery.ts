@@ -335,7 +335,48 @@ function developerToolBackingPath(command: string): string | undefined {
   return undefined;
 }
 
+/**
+ * True if a real Xcode or Command Line Tools install backs the
+ * `/usr/bin/*` stubs. We detect this with file-stat only (never
+ * executes a binary — executing would itself trigger the installer).
+ *
+ * Result is cached for process lifetime: CLT either gets installed or
+ * it doesn't during a daemon run; we don't need to re-stat constantly.
+ * Tests can call `_resetCltDetectionCache()` if they need a fresh read.
+ */
+let cltInstalledCache: boolean | undefined;
+export function isDeveloperToolchainInstalled(): boolean {
+  if (cltInstalledCache !== undefined) return cltInstalledCache;
+  // `git` is present in both CLT and full Xcode install layouts. If a
+  // real backing binary exists at any of the known toolchain dirs, the
+  // toolchain is installed.
+  cltInstalledCache = Boolean(developerToolBackingPath('git'));
+  return cltInstalledCache;
+}
+
+/** Test-only: drop the cached CLT detection so the next call re-stats. */
+export function _resetCltDetectionCache(): void {
+  cltInstalledCache = undefined;
+}
+
 export function resolveSafeCliProbe(command: string, resolved: string): SafeCliProbe {
+  // STRUCTURAL GUARD: when no Xcode/CLT is installed, every binary at
+  // `/usr/bin/*` that isn't already known to the system is a potential
+  // CLT shim. Invoking ANY of them — git, cmpdylib, wish, future
+  // unknowns — pops Apple's installer GUI. Detect "no toolchain present"
+  // once via file-stat and short-circuit before we run anything.
+  //
+  // Binaries outside /usr/bin (Homebrew, asdf, npm globals, /usr/local)
+  // are real and fine to probe regardless of CLT state.
+  if (resolved.startsWith('/usr/bin/') && !isDeveloperToolchainInstalled()) {
+    return {
+      skipped: true,
+      command,
+      path: resolved,
+      reason: 'Skipped /usr/bin binary: macOS Command Line Tools not installed (would trigger the system installer). Install Xcode CLT or a non-system version of this binary, then retry.',
+    };
+  }
+
   if (SYSTEM_BINARIES_THAT_LAUNCH_GUI_OR_INSTALLER.has(command) && resolved.startsWith('/usr/bin/')) {
     return {
       skipped: true,

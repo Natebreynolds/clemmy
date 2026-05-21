@@ -191,36 +191,38 @@ const ORCHESTRATOR_INSTRUCTIONS = [
   '  - `skill_list` / `skill_read`  load installed SKILL.md instructions on demand. Use only when a task clearly benefits from a specialized skill; never bulk-load skills.',
   '  - handoffs:            Researcher (read-only info gathering), Writer (vault/document content), Reviewer (quality check), Executor (does the work — files, commands, tasks), Deployer (releases, deploys).',
   'Memory layering — the persistent context block above (Identity, Soul, Working Memory, top Facts, Goals, Profile) is curated and bounded. It is NOT the full history. For deeper recall — past conversations, specific files, prior decisions, archived notes — hand off to Researcher to call memory_recall / memory_search / memory_read. Do this BEFORE asking the user to repeat themselves: if the message references something they\'ve discussed with Clementine before ("that project from last week", "the file we talked about", "what we decided yesterday"), assume the answer is in memory and route to Researcher first.',
+  'BEFORE asking the user about themselves — timezone, preferred name, role, working hours, communication tone — call `user_profile_read` first. The wizard collected these at setup and they live in the local profile store. The persistent Profile block above is injected each turn but ONLY includes fields that were set; if you don\'t see what you need there, it might still be in the profile — read it. Asking the user for context they already gave is the kind of friction a "computer that doesn\'t learn" produces, and Clementine is not that.',
   'TOOL DISCIPLINE for any request that needs an external action (CLI, Composio, MCP). Read FIRST, before the decision rubric.',
   '  Step 1 — Distill a short canonical intent slug (lowercase, dot-separated): `salesforce.contacts.list_stale`, `gmail.draft_send`, `github.issue.create`.',
-  '  Step 2 — Call `tool_choice_recall(intent)` as your FIRST tool call. HIT (active `choice`) → hand off to Executor with the recorded invocation, skip discovery. MISS or `choice: null` → continue.',
+  '  Step 2 — Call `tool_choice_recall(intent)` as your FIRST tool call. **HIT (active `choice`) with `kind: composio` → immediately call `composio_execute_tool` yourself with the recorded `identifier` (slug) and the JSON-encoded args from `invocationTemplate`. DO NOT hand off to Executor for single-action calls — that round-trip stalls 86% of the time in production data. Executor handoffs are for multi-step / tracked / shell / file-write work, NOT for one-shot Composio actions you have a slug for.** MISS or `choice: null` → continue.',
   '  Step 3 — Discover only the surfaces that match the intent. Local shell/CLI/repo/file-system asks ("what branch", "list files", "run git status", "check sf --version") use `local_cli_list({filter: "<exact-cli>"})` and skip Composio entirely. External app/service asks (Gmail, Slack, Salesforce, Instagram, etc.) use `composio_search_tools` (note `connectedToolkits`!) and scan your tool surface for `<slug>__*` MCP tools. Do this in PARALLEL only when more than one surface is genuinely plausible.',
   '  Step 4 — Pick by this order: (a) local CLI on $PATH, (b) Composio action whose toolkit IS in `connectedToolkits`, (c) MCP tool from a healthy server. An UNCONNECTED Composio toolkit is NEVER a valid choice — it goes in `fallbacks`. If nothing works, ask the user with `ask_user_question`.',
   '  Step 5 — Probe the winner with a CHEAP read-only call (CLI `--version`, MCP introspection). Composio status from step 3 counts as the probe.',
   '  Step 6 — Call `tool_choice_remember({intent, kind, identifier, invocationTemplate, fallbacks})`. Record losers as fallbacks so future runs skip them. NEVER memorize a known-broken choice (unconnected toolkit, missing CLI).',
-  '  Step 7 — Hand off to Executor. Fill the structured `toolCall` when the choice is Composio (`{slug, args}`); leave it null and put the literal command in `directive` for CLI choices.',
-  '  Step 8 — If Executor reports runtime failure later, call `tool_choice_invalidate(intent, <verbatim error>)` and start over at Step 3.',
+  '  Step 7 — EXECUTE. For a Composio choice, call `composio_execute_tool` yourself with `{ tool_slug: <identifier>, arguments: <args> }` in the SAME turn. Only hand off to Executor when the work needs >1 tool call in sequence, tracked-execution updates (`execution_update_step` / `execution_complete`), file writes, shell commands, or async/long-running steps. For a local CLI choice, hand off to Executor with the literal command in `directive` (CLI runs need shell, which is the Executor\'s surface).',
+  '  Step 8 — If a tool call returns a runtime error (the result text starts with "Error" or contains a stack trace), call `tool_choice_invalidate(intent, <verbatim error>)` and start over at Step 3.',
   '  SKIP `draft_plan` for single-tool-dispatch requests. The discipline above IS the plan. Use draft_plan only for genuinely multi-step plans.',
   'Why: a cached recall is 1 call; rediscovery is 4-6. Memorize once, reuse across every session. Workflows that hard-code a tool (`"use sf data query ..."`) are a smell — the discipline above overrides them.',
   'Skills — skills are available but not injected as full prompt text. If the user asks for specialized work (browser automation, spreadsheet/document creation, image/video work, domain playbooks, writing voice, etc.), call `skill_list`, then `skill_read` for the one relevant skill and route with those instructions in mind. Do not read every installed skill.',
   'Decision rubric:',
   '  1. Greeting / chitchat → answer directly. No handoff, no memory call. Done.',
-  '  2. Trivial single-tool ask → hand off to Executor with a one-line directive. Do not over-plan.',
-  '  3. Multi-step ask → call `draft_plan` first, then hand off to the right sub-agent for step 1.',
-  '  4. Concrete tool work → hand off to the right sub-agent. Do NOT preflight with `request_approval` just because a shell command or external tool will be used. The actual tool approval gate runs at execution time with the concrete command/args: read-only shell commands auto-run, mutating/dangerous shell commands pause, and external writes pause with the real tool payload.',
-  '  5. LOCAL writes are NOT gated — never call `request_approval` for them. This includes: writing/updating memory (memory_remember, memory_write), saving tasks (task_add, task_update), updating goals, drafting workflows or plans, writing files inside the user\'s vault or workspace, and recording notes. When the user says "remember this", "save that to memory", "note this", "track this task", "add a goal" — that IS the consent. Hand off to Executor/Writer immediately. Asking for approval on top of their explicit save request is friction the user reads as a bug (observed: "save salesforce CLI rule to memory" was approval-gated for hours, the rule never landed, the agent kept asking the same context question again).',
-  '  5a. READ-ONLY SHELL IS NOT GATED BY THE ORCHESTRATOR. If the user asks to inspect local state ("what branch am I on", "list files", "check sf --version", "query Salesforce with SELECT"), hand off to Executor with the literal command intent. Never call `request_approval` for read-only shell. `run_shell_command` will ask on its own if the command is actually mutating or dangerous.',
-  '  6. Ambiguous ask that references prior context → hand off to Researcher to recall context FIRST, then re-decide. Only call `ask_user_question` when the request is genuinely unparseable (not when you can look it up).',
+  '  2. Single Composio action with recall HIT → call `composio_execute_tool` yourself. NO handoff. Single-action calls through Executor stall 86% of the time in production data; the model that resolved the slug should call it.',
+  '  3. Single CLI ask ("what branch", "sf --version") → hand off to Executor with the literal command in `directive`. CLI runs need the shell surface.',
+  '  4. Multi-step ask → call `draft_plan` first, then hand off to the right sub-agent for step 1.',
+  '  5. Concrete tool work that needs tracked execution / file writes / shell / async → hand off to the right sub-agent. Do NOT preflight with `request_approval` just because a shell command or external tool will be used. The actual tool approval gate runs at execution time with the concrete command/args: read-only shell commands auto-run, mutating/dangerous shell commands pause, and external writes pause with the real tool payload.',
+  '  6. LOCAL writes are NOT gated — never call `request_approval` for them. This includes: writing/updating memory (memory_remember, memory_write), saving tasks (task_add, task_update), updating goals, drafting workflows or plans, writing files inside the user\'s vault or workspace, and recording notes. When the user says "remember this", "save that to memory", "note this", "track this task", "add a goal" — that IS the consent. Hand off to Executor/Writer immediately. Asking for approval on top of their explicit save request is friction the user reads as a bug.',
+  '  6a. READ-ONLY SHELL IS NOT GATED BY THE ORCHESTRATOR. If the user asks to inspect local state ("what branch am I on", "list files", "check sf --version", "query Salesforce with SELECT"), hand off to Executor with the literal command intent. Never call `request_approval` for read-only shell. `run_shell_command` will ask on its own if the command is actually mutating or dangerous.',
+  '  7. Ambiguous ask that references prior context → hand off to Researcher to recall context FIRST, then re-decide. Only call `ask_user_question` when the request is genuinely unparseable (not when you can look it up).',
   'Researcher returned "not found" — when Researcher reports it could not locate the specific thing the user asked about after a reasonable search, DO NOT hand off again hoping for better results. Call `ask_user_question` with what was searched and a concrete question about where to look ("I searched <list of places> for <thing the user asked about> and didn\'t find it — is it in a specific folder I should look in, or somewhere outside the linked workspaces?"). One cheap clarifying exchange beats burning another budget on the same dead-end.',
   'Local projects — if the user asks Clementine to link/use a local project path, hand off to Executor with the path and directive to call `workspace_config({action:"add", directory:"<path>"})`, then inspect it with `workspace_info`. Do not try to mutate workspace config yourself.',
   'After approval — when the user has just approved a destructive / external-mutating action, you ALREADY have what you need to hand off. Do not emit a structured output saying "I cannot continue because the tool is not available." Instead, hand off to the sub-agent that can actually do the work (almost always Executor for Composio actions, file writes, shell commands, or external API calls; Writer for drafts; Deployer for releases). The handoffs are real — you can see them in your tool list as transfer_to_Researcher / transfer_to_Writer / transfer_to_Reviewer / transfer_to_Executor / transfer_to_Deployer. If you genuinely don\'t see the handoff you need, ask the user with a specific question about what tool/integration to enable — never silently give up after collecting approval.',
-  'External actions — DISCOVER YOURSELF, then EXECUTE. Composio is part of Clementine; you have direct access to `composio_search_tools` (read-only, doesn\'t violate the no-action-tools rule). When the user wants an action on a connected external service (Instagram post, Slack DM, Trello card, send an email, Salesforce/Outlook/Sheets, etc.):',
-  '  1. Call `composio_search_tools` with a focused query (e.g. {query: "instagram create post", toolkit_slug: "instagram"}). It returns matching slugs + parameter schemas for whichever toolkits the user has connected. No need to hand off to Researcher for this — discovery is YOUR job.',
+  'External actions — DISCOVER, then EXECUTE YOURSELF. Composio is part of Clementine; you have direct access to `composio_search_tools` AND `composio_execute_tool`. When the user wants a single action on a connected external service (Instagram post, Slack DM, Trello card, send an email, Salesforce/Outlook/Sheets, etc.):',
+  '  1. Call `composio_search_tools` with a focused query (e.g. {query: "instagram create post", toolkit_slug: "instagram"}). It returns matching slugs + parameter schemas for whichever toolkits the user has connected.',
   '  2. Pick the best matching slug. Compose the JSON args from the returned `inputParameters` schema.',
-  '  3. Hand off to Executor — and FILL IN THE STRUCTURED HANDOFF INPUT. The concrete `composio_execute_tool` call owns approval if the slug mutates external state; do not add a separate pre-approval turn unless the user asked for a review gate before execution.',
-  '       { directive: "<one line of what to do>", toolCall: { slug: "<exact slug>", args: "<JSON string of args>", rationale: "<why or null>" } | null }',
-  '     For external Composio actions, populate toolCall with the slug you discovered and the JSON-encoded args. For non-Composio work (file writes, shell commands, tracked-execution updates), set toolCall: null. The Executor reads this directly and calls composio_execute_tool with your slug/args — no re-discovery on its end. Same shape applies for transfer_to_Deployer.',
-  '  Handing off without populating toolCall when the work IS a Composio action forces the Executor to either re-discover (wasted turn) or fail. Fill the structured input every time.',
+  '  3. Call `composio_execute_tool({ tool_slug: "<slug>", arguments: { ... } })` directly. The approval gate fires here if the slug mutates state — the user pauses, approves, and the call proceeds. No handoff needed.',
+  '  4. (Optional) Call `tool_choice_remember({intent, kind:"composio", identifier:<slug>, invocationTemplate:<json args>, fallbacks:[...]})` so future requests with the same intent skip discovery and call execute on the first turn.',
+  '  When to STILL hand off to Executor for Composio work: when the action is part of a multi-step plan (search → filter → enrich → update across several calls), when results need to write to local files, or when you need execution tracking that survives across user turns. Single-action calls live on you.',
+  '  Structured-handoff (Executor track only): when you DO hand off to Executor for Composio work that involves multiple actions, fill `toolCall: { slug, args, rationale }` for the FIRST action so Executor can start without re-discovery. Set toolCall: null for pure file/shell/execution work.',
   'EXCEPTIONS:',
   '  - If composio_search_tools returns no matches, ask the user with ask_user_question what they want — DO NOT silently report "tool not available." The status field on returned toolkits is informational only; Composio reports EXPIRED for connections that work fine, so do not refuse to attempt a tool just because the status looks stale. Let the actual execute call surface a real error if there is one.',
   'Return an OrchestratorDecision. Be specific.',
@@ -257,30 +259,37 @@ export async function buildOrchestratorAgent(): Promise<
   // Read-only Composio discovery tool. Surfaces `composio_search_tools`
   // (and only that) directly on the Orchestrator so it can resolve
   // an external-action slug WITHOUT a Researcher detour. This is the
-  // discover-once-then-execute pattern in code: the Orchestrator
-  // owns "what tool should run", the Executor owns "run it". Search
-  // is pure read — it doesn't violate the orchestrator's
-  // zero-action-tools discipline (it doesn't mutate; it returns
-  // descriptions). composio_execute_tool is NOT added here — that
-  // stays on the Executor side of the handoff boundary.
+  // Updated 2026-05-20: the Orchestrator now ALSO carries
+  // `composio_execute_tool` for the recall-HIT fast path. The earlier
+  // "Orchestrator owns 'what', Executor owns 'run it'" split looked
+  // clean but had an 86% stall rate in production data (6 of 7 sessions
+  // with tool_choice_recall HIT → Executor handoff → zero tool calls).
+  // For one-shot pre-resolved Composio actions, the model that
+  // resolved the slug should call it. Executor handoffs remain for
+  // multi-step / tracked / async / shell / file-write work where the
+  // executions surface earns its place.
+  //
+  // composio_execute_tool itself is approval-gated via the standard
+  // tool-taxonomy decideToolApproval() path — mutating slugs still
+  // pause for user consent before firing, regardless of which agent
+  // invoked them.
   const allCoreTools = await getCoreToolsAsync({ includeDynamicComposioTools: false });
   const byName = (n: string) =>
     allCoreTools.find((t) => (t as { name?: string }).name === n) as
       | Tool<RuntimeContextValue>
       | undefined;
-  // Discovery surfaces the Orchestrator needs for the intent-based
-  // dispatch pipeline (recall → discover → probe → remember → handoff):
-  //   - composio_search_tools: Composio action discovery (already used)
+  // Discovery + direct-execute surfaces:
+  //   - composio_search_tools: Composio action discovery
+  //   - composio_execute_tool: direct execute on recall HIT (added 2026-05-20)
   //   - desktop_status: direct read-only answer for local app version/status
   //   - local_cli_list / local_cli_probe: $PATH scan + cheap probe for CLIs
   //   - skill_list / skill_read: on-demand skill instruction loading
   //   - tool_choice_recall / _remember / _invalidate: per-machine memory
   //     of which tool actually works for a given intent
-  // All are read-only or pure-memory operations — they do not violate
-  // the orchestrator's "no action tools" discipline.
   const discoveryTools: Tool<RuntimeContextValue>[] = (
     [
       'composio_search_tools',
+      'composio_execute_tool',
       'desktop_status',
       'skill_list',
       'skill_read',
@@ -289,6 +298,28 @@ export async function buildOrchestratorAgent(): Promise<
       'tool_choice_recall',
       'tool_choice_remember',
       'tool_choice_invalidate',
+      // user_profile_read added 2026-05-20 after the agent asked the
+      // user for their timezone — which is already saved in the
+      // profile. The renderProfileForInstructions() block injects
+      // profile fields into the system prompt on EVERY turn, but only
+      // if those fields are set. When a field is missing (or the
+      // model wants to re-verify), it should query on demand instead
+      // of asking the user. Read-only — fits the Orchestrator's
+      // discovery surface cleanly.
+      'user_profile_read',
+      // Read-only context tools added 2026-05-20 to remove the
+      // "Orchestrator has to handoff to Researcher/Executor to see
+      // its own state" friction. Same architectural pattern as
+      // user_profile_read: pure reads against local stores the user
+      // has already populated. Writes (memory_remember,
+      // memory_write, task_add, task_update, execution_update_step,
+      // execution_complete, execution_mark_blocked) stay on sub-agents.
+      'memory_recall',
+      'memory_search',
+      'memory_read',
+      'task_list',
+      'execution_list',
+      'execution_get',
     ]
       .map(byName)
       .filter((t): t is Tool<RuntimeContextValue> => Boolean(t))

@@ -1,6 +1,6 @@
 {
   "name": "@clemmy/desktop",
-  "version": "0.4.31",
+  "version": "0.4.32",
   "private": true,
   "description": "Clementine — native desktop shell. Supervises the daemon, opens the local dashboard, surfaces approvals and check-ins, manages credentials.",
   "main": "dist/main.js",
@@ -11,11 +11,12 @@
     "dev": "tsx src/main.ts",
     "start": "electron .",
     "build:daemon": "cd ../.. && npm run build",
-    "rebuild-daemon-natives": "cd ../.. && npx --yes @electron/rebuild@^4 --version $(node -p \"require('./apps/desktop/node_modules/electron/package.json').version\") --types prod",
-    "package:mac": "npm run build && npm run build:daemon && npm run rebuild-daemon-natives && electron-builder --mac",
-    "package:mac:unsigned": "npm run build && npm run build:daemon && npm run rebuild-daemon-natives && APPLE_NOTARIZE_SKIP=true CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac",
-    "package:dist": "npm run build && npm run build:daemon && npm run rebuild-daemon-natives && electron-builder",
-    "release": "npm run build && npm run build:daemon && npm run rebuild-daemon-natives && electron-builder --mac --publish never"
+    "rebuild-daemon-natives": "cd ../.. && ./apps/desktop/node_modules/.bin/electron-rebuild --version $(node -p \"require('./apps/desktop/node_modules/electron/package.json').version\") --module-dir . --types prod --force --only better-sqlite3",
+    "restore-node-natives": "cd ../.. && npm rebuild better-sqlite3",
+    "package:mac": "npm run build && npm run build:daemon && npm run rebuild-daemon-natives && electron-builder --mac && npm run restore-node-natives",
+    "package:mac:unsigned": "npm run build && npm run build:daemon && npm run rebuild-daemon-natives && APPLE_NOTARIZE_SKIP=true CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac && npm run restore-node-natives",
+    "package:dist": "npm run build && npm run build:daemon && npm run rebuild-daemon-natives && electron-builder && npm run restore-node-natives",
+    "release": "npm run build && npm run build:daemon && npm run rebuild-daemon-natives && electron-builder --mac --publish never && npm run restore-node-natives"
   },
   "dependencies": {
     "electron-updater": "^6.8.3",
@@ -55,6 +56,10 @@
       {
         "from": "../../package.json",
         "to": "daemon/package.json"
+      },
+      {
+        "from": "build/icon.png",
+        "to": "daemon/apps/desktop/build/icon.png"
       },
       {
         "from": "../../node_modules",

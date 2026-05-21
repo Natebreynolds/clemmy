@@ -30,7 +30,7 @@ import path from 'node:path';
 import { BASE_DIR } from '../config.js';
 import { loadMemoryContext } from '../memory/vault.js';
 import { renderFactsForInstructions } from '../memory/facts.js';
-import { renderProfileForInstructions } from '../runtime/user-profile.js';
+import { loadUserProfile, renderProfileForInstructions } from '../runtime/user-profile.js';
 
 const GOALS_DIR = path.join(BASE_DIR, 'goals');
 
@@ -46,6 +46,41 @@ interface GoalSummary {
 function section(title: string, body: string | undefined | null): string {
   if (!body || !body.trim()) return '';
   return `## ${title}\n${body.trim()}`;
+}
+
+/**
+ * Render the current local date/time, anchored to the user's saved
+ * timezone (or the daemon-host timezone if no profile timezone is set).
+ *
+ * Without this, the model has to guess today's date from training data
+ * (which is wrong by months) or ask the user — both bad. Calendar /
+ * scheduling / "what's on my agenda today" requests depend on the
+ * agent knowing what *now* is.
+ *
+ * Output shape:
+ *   "Today is 2026-05-20 (Wednesday), local time 18:53 (America/Los_Angeles)."
+ *
+ * Errors degrade silently — a malformed profile timezone falls back
+ * to the system's resolved timezone; if even that fails, the line is
+ * just omitted from the persistent context.
+ */
+function renderCurrentTimeForInstructions(): string {
+  try {
+    const profile = loadUserProfile();
+    const tz = profile.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+    const now = new Date();
+    // Use `en-CA` for ISO-style date (YYYY-MM-DD) — most locale-stable
+    // option for date formatting across runtimes.
+    const dateFmt = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' });
+    const weekdayFmt = new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday: 'long' });
+    const timeFmt = new Intl.DateTimeFormat('en-US', { timeZone: tz, hour: '2-digit', minute: '2-digit', hour12: false });
+    const date = dateFmt.format(now);
+    const weekday = weekdayFmt.format(now);
+    const time = timeFmt.format(now);
+    return `Today is ${date} (${weekday}), local time ${time} (${tz}). Use this for any date/time math, never invent or guess.`;
+  } catch {
+    return '';
+  }
 }
 
 function renderActiveGoals(): string {
@@ -109,8 +144,13 @@ export function renderHarnessMemoryContext(): string {
   }
 
   const goals = renderActiveGoals();
+  const nowLine = renderCurrentTimeForInstructions();
 
   const blocks = [
+    // Current date/time goes FIRST so the model reads it before any
+    // other context. Without this the model defaults to its training
+    // cutoff for date math, which is months stale.
+    section('Now', nowLine),
     section('User Preferences', profile),
     section('Persistent Facts', facts),
     section('Working Memory', memContext.workingMemory),

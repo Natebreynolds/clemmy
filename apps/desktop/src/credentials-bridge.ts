@@ -224,9 +224,9 @@ export interface CredentialRow {
   setupHint?: string;
 }
 
-export async function listCredentialRows(): Promise<CredentialRow[]> {
+export async function listCredentialRows(options: { includeKeychain?: boolean } = {}): Promise<CredentialRow[]> {
   const rows: CredentialRow[] = [];
-  const keychain = await loadKeytar();
+  const keychain = options.includeKeychain ? await loadKeytar() : null;
   const vault = readVault();
   for (const d of KNOWN_CREDENTIALS) {
     let source: CredentialSource = 'missing';

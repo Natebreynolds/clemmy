@@ -230,7 +230,7 @@ export async function executeComposioCliTool(
       result,
     );
   }
-  const output = compactOutput(result.stdout, result.stderr);
+  const output = cleanComposioCliOutput([result.stdout, result.stderr].filter(Boolean).join('\n'));
   if (!output) {
     throw new ComposioCliError(
       `Composio CLI execute produced no output for ${toolSlug}; run composio login or use the SDK backend.`,
@@ -254,7 +254,7 @@ export async function searchComposioCliTools(
       result,
     );
   }
-  const output = compactOutput(result.stdout, result.stderr);
+  const output = cleanComposioCliOutput([result.stdout, result.stderr].filter(Boolean).join('\n'));
   if (!output) {
     throw new ComposioCliError(
       'Composio CLI search produced no output; run composio login or use the SDK backend.',

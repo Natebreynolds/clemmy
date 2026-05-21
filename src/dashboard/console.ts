@@ -49,7 +49,7 @@ export function renderConsoleHtml(token: string): string {
         <img class="brand-icon" src="/console/icon.png" alt="" />
         <div class="brand-words">
           <span class="brand-mark">Clementine</span>
-          <span class="brand-sub" data-daemon-version>v0.1.0 · console</span>
+          <span class="brand-sub" data-daemon-version>console</span>
         </div>
       </div>
       <div class="status-row" data-status-row>
@@ -7617,11 +7617,28 @@ const CONSOLE_JS = `
           }
         };
       } else if (info.installBlocker === 'app-not-writable') {
-        suffix = ' · reinstall to enable updates';
+        suffix = ' · repair updates';
         sub.style.cursor = 'pointer';
-        sub.title = info.error || 'Clementine cannot replace /Applications/Clementine.app from this user account';
-        sub.onclick = () => {
-          alert(info.error || 'Clementine cannot replace /Applications/Clementine.app from this user account. Reinstall from the latest DMG, or fix app ownership, then relaunch.');
+        sub.title = info.error || 'Repair /Applications/Clementine.app ownership so updates can install';
+        sub.onclick = async () => {
+          const prevText = sub.textContent;
+          sub.textContent = baseLabel + ' · repairing updates…';
+          sub.style.pointerEvents = 'none';
+          try {
+            const result = await window.clemmy?.updaterRepairOwnership?.();
+            const repairResult = result && result.repairResult;
+            if (repairResult && repairResult.ok === false) {
+              sub.textContent = prevText;
+              alert('Repair failed: ' + (repairResult.reason || 'unknown reason'));
+            } else {
+              await renderUpdaterChip(result);
+            }
+          } catch (err) {
+            sub.textContent = prevText;
+            alert('Repair failed: ' + ((err && err.message) || err));
+          } finally {
+            sub.style.pointerEvents = '';
+          }
         };
       } else if (info.state === 'available') {
         suffix = ' · click to download v' + (info.version || '') + ' update';
@@ -13249,7 +13266,7 @@ const CONSOLE_JS = `
       btn.dataset.bound = '1';
       btn.addEventListener('click', async () => {
         const action = btn.getAttribute('data-hub-composio-cli-action') || 'auth';
-        if (action === 'install' && !confirm('Install the optional Composio universal CLI now?\n\nClementine can still connect apps with your Composio API key without this.')) return;
+        if (action === 'install' && !confirm('Install the optional Composio universal CLI now?\\n\\nClementine can still connect apps with your Composio API key without this.')) return;
         btn.disabled = true;
         btn.textContent = action === 'install' ? 'INSTALLING...' : 'STARTING...';
         try {
@@ -13408,7 +13425,7 @@ const CONSOLE_JS = `
       el.querySelectorAll('[data-hub-github-cli-action]').forEach((btn) => {
         btn.addEventListener('click', async () => {
           const action = btn.getAttribute('data-hub-github-cli-action') || 'auth';
-          if (action === 'install' && !confirm('Install optional GitHub CLI with Homebrew now?\n\nClementine can run without this. It is only needed for private skill repos and GitHub CLI workflows.')) return;
+          if (action === 'install' && !confirm('Install optional GitHub CLI with Homebrew now?\\n\\nClementine can run without this. It is only needed for private skill repos and GitHub CLI workflows.')) return;
           btn.disabled = true;
           btn.textContent = action === 'install' ? 'INSTALLING...' : 'STARTING...';
           try {
@@ -13472,7 +13489,7 @@ const CONSOLE_JS = `
       if (installBtn) {
         installBtn.disabled = missingPrereqs.length > 0;
         installBtn.addEventListener('click', async () => {
-          if (!confirm('Install optional Browser Harness now?\n\nClementine will clone browser-use/browser-harness into ~/Developer/browser-harness and run uv tool install -e .')) return;
+          if (!confirm('Install optional Browser Harness now?\\n\\nClementine will clone browser-use/browser-harness into ~/Developer/browser-harness and run uv tool install -e .')) return;
           installBtn.disabled = true;
           installBtn.textContent = 'INSTALLING...';
           const r = await fetch(withToken('/api/console/browser-harness/install'), { method: 'POST' });

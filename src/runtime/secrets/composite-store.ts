@@ -98,11 +98,19 @@ function updateMeta(name: SecretName, patch: Partial<SecretMetadata>): SecretMet
  */
 export class CompositeSecretStore {
   private keychainBackend: KeychainSecretBackend | null = null;
+  private keychainInitialized = false;
   private fileBackend = new FileSecretBackend();
   private envBackend = new EnvSecretBackend();
 
-  /** Initialize keychain (Electron only). Returns whether keychain is usable. */
+  /** Initialize keychain (Electron only). Returns whether keychain is usable.
+   *  This is intentionally explicit: normal dashboard/home/status paths
+   *  must not touch Keychain, because macOS can foreground a credential
+   *  prompt and block all clicks in the desktop window. */
   async init(): Promise<{ keychainAvailable: boolean }> {
+    if (this.keychainInitialized) {
+      return { keychainAvailable: Boolean(this.keychainBackend) };
+    }
+    this.keychainInitialized = true;
     const ok = await probeKeychain();
     this.keychainBackend = ok ? new KeychainSecretBackend() : null;
     return { keychainAvailable: ok };
@@ -113,7 +121,7 @@ export class CompositeSecretStore {
     this.keychainBackend = backend;
   }
 
-  async get(name: SecretName): Promise<SecretGetResult> {
+  async get(name: SecretName, options: { allowKeychain?: boolean } = {}): Promise<SecretGetResult> {
     // File backend first. This avoids macOS Keychain access prompts on
     // normal dashboard launch and after signed desktop updates.
     try {
@@ -135,10 +143,14 @@ export class CompositeSecretStore {
       return { name, value, source: 'env', status: 'env_only', metadata };
     }
 
-    // Keychain last. Existing users who already stored credentials in
-    // Keychain still work, but fresh installs and file-backed users
-    // avoid touching Keychain entirely during normal reads.
-    if (this.keychainBackend) {
+    // Keychain is opt-in. macOS can display a password dialog on read,
+    // so normal launch/status/tool checks stay file/env only. Explicit
+    // live health, migration, reset, and Repair Keychain paths can opt
+    // into this backend when the user asked for it.
+    if (options.allowKeychain) {
+      await this.init();
+    }
+    if (options.allowKeychain && this.keychainBackend) {
       try {
         const keychainValue = await this.keychainBackend.get(name);
         if (keychainValue !== undefined) {
@@ -195,6 +207,7 @@ export class CompositeSecretStore {
   /** Remove from ALL writable backends (keychain + file). Env is
    *  never touched — the user owns their .env. */
   async delete(name: SecretName): Promise<void> {
+    await this.init();
     if (this.keychainBackend) await this.keychainBackend.delete(name);
     await this.fileBackend.delete(name);
     const meta = readMeta();
@@ -218,6 +231,9 @@ export class CompositeSecretStore {
     if (value === undefined) {
       const metadata = updateMeta(name, { source: 'missing', status: 'missing' });
       return { name, source: 'missing', status: 'missing', metadata };
+    }
+    if (to === 'keychain') {
+      await this.init();
     }
     const destination = to === 'keychain' ? this.keychainBackend : this.fileBackend;
     if (!destination) {
@@ -317,7 +333,7 @@ export class CompositeSecretStore {
         });
         continue;
       }
-      const result = await this.get(desc.name);
+      const result = await this.get(desc.name, { allowKeychain: true });
       const envFallbackAvailable = Boolean(desc.envVarName && await this.envBackend.get(desc.name));
       rows.push({
         name: desc.name,
@@ -348,7 +364,7 @@ export class CompositeSecretStore {
     let tested = 0;
     for (const desc of listSecretDescriptors()) {
       tested++;
-      const result = await this.get(desc.name);
+      const result = await this.get(desc.name, { allowKeychain: true });
       if (result.status === 'connected' && result.source === 'keychain') {
         recovered.push(desc.name);
       }
@@ -372,6 +388,7 @@ export class CompositeSecretStore {
   }> {
     let keychainDeleted: string[] = [];
     let keychainFailed: string[] = [];
+    await this.init();
     if (this.keychainBackend) {
       const report = await KeychainSecretBackend.reset();
       keychainDeleted = report.deleted;
@@ -390,12 +407,13 @@ export class CompositeSecretStore {
 
 let singleton: CompositeSecretStore | null = null;
 
-/** Get the process-wide SecretStore singleton, initializing keychain
- *  probe lazily on first call. Safe to call from any module. */
+/** Get the process-wide SecretStore singleton. This deliberately does
+ *  NOT initialize Keychain: passive dashboard polling should never be
+ *  able to raise a macOS Keychain prompt and block the desktop UI.
+ *  Explicit Keychain operations call `init()` through their own paths. */
 export async function getSecretStore(): Promise<CompositeSecretStore> {
   if (!singleton) {
     singleton = new CompositeSecretStore();
-    await singleton.init();
   }
   return singleton;
 }

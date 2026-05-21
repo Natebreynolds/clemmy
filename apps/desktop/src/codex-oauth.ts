@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { createServer } from 'node:http';
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { shell } from 'electron';
@@ -263,6 +263,9 @@ function loadExistingCodexOAuthTokens(): CodexOAuthTokens | null {
 }
 
 async function exchangeAuthorizationCode(code: string, redirectUri: string, codeVerifier: string): Promise<CodexOAuthTokens> {
+  // 30s ceiling on the token endpoint call. Without a timeout, a slow
+  // or hung network leaves the wizard stuck on "Signing in…" until the
+  // user kills the app — see UX issue noted in the OAuth audit.
   const response = await fetch(TOKEN_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -273,6 +276,12 @@ async function exchangeAuthorizationCode(code: string, redirectUri: string, code
       redirect_uri: redirectUri,
       code_verifier: codeVerifier,
     }),
+    signal: AbortSignal.timeout(30_000),
+  }).catch((err: Error & { name?: string }) => {
+    if (err?.name === 'TimeoutError' || err?.name === 'AbortError') {
+      throw new Error('OAuth token exchange timed out after 30s. Check your network connection and try again.');
+    }
+    throw err;
   });
 
   const text = await response.text();
@@ -307,6 +316,12 @@ async function refreshCodexOAuthTokens(tokens: CodexOAuthTokens): Promise<CodexO
       client_id: CLIENT_ID,
       refresh_token: tokens.refreshToken,
     }),
+    signal: AbortSignal.timeout(30_000),
+  }).catch((err: Error & { name?: string }) => {
+    if (err?.name === 'TimeoutError' || err?.name === 'AbortError') {
+      throw new Error('OAuth refresh timed out after 30s. Check your network connection and try again.');
+    }
+    throw err;
   });
 
   const text = await response.text();
@@ -378,10 +393,17 @@ const CODEX_AUTH_DIR = path.join(HOME, '.codex');
 const CODEX_AUTH_FILE = path.join(CODEX_AUTH_DIR, 'auth.json');
 
 function atomicWriteJson(filePath: string, value: unknown): void {
+  // Tokens here include the OAuth refresh_token. macOS default umask
+  // lands new files at 0644 — world-readable. Lock to 0600 so other
+  // accounts on the same machine can't read the refresh token from
+  // these files. We pass mode at create time AND chmodSync after
+  // rename because rename preserves the temp file's mode, but some
+  // filesystems re-apply the umask on the destination.
   mkdirSync(path.dirname(filePath), { recursive: true });
   const tmp = `${filePath}.${process.pid}.tmp`;
-  writeFileSync(tmp, JSON.stringify(value, null, 2), 'utf-8');
+  writeFileSync(tmp, JSON.stringify(value, null, 2), { encoding: 'utf-8', mode: 0o600 });
   renameSync(tmp, filePath);
+  try { chmodSync(filePath, 0o600); } catch { /* best-effort; rename usually preserves the mode */ }
 }
 
 /**

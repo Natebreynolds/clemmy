@@ -53,6 +53,8 @@ const api = {
   updaterApply: () => ipcRenderer.invoke('clemmy:updater-apply') as Promise<Record<string, unknown>>,
   /** Move the packaged app to /Applications so macOS auto-updates can apply. */
   updaterMoveToApplications: () => ipcRenderer.invoke('clemmy:updater-move-to-applications') as Promise<Record<string, unknown>>,
+  /** Repair /Applications/Clementine.app ownership so auto-updates can apply. */
+  updaterRepairOwnership: () => ipcRenderer.invoke('clemmy:updater-repair-ownership') as Promise<Record<string, unknown>>,
   onUpdaterEvent: (cb: (event: Record<string, unknown>) => void) => {
     const handler = (_event: unknown, payload: Record<string, unknown>) => cb(payload);
     ipcRenderer.on('clemmy:updater-event', handler);

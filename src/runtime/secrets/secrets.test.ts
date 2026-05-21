@@ -222,6 +222,24 @@ test('composite: set writes to file even when keychain is available', async () =
   assert.equal(getResult.source, 'file');
 });
 
+test('composite: default get does not read keychain', async () => {
+  const store = new CompositeSecretStore();
+  await store.init();
+  const fake = {
+    name: 'keychain' as const,
+    isAvailable: true,
+    get: async () => {
+      throw new Error('default get must not read keychain');
+    },
+    set: async () => {},
+    delete: async () => {},
+  };
+  store.setKeychainBackend(fake as unknown as Parameters<typeof store.setKeychainBackend>[0]);
+  const result = await store.get('openai_api_key');
+  assert.equal(result.source, 'missing');
+  assert.equal(result.status, 'missing');
+});
+
 test('composite: file beats env in read priority', async () => {
   process.env.OPENAI_API_KEY = 'sk-from-env';
   const store = new CompositeSecretStore();

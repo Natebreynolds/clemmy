@@ -50,6 +50,12 @@ export const EVENT_TYPES = [
   'approval_resolved',
   'guardrail_tripped',
   'stuck_detected',
+  // Emitted from the conversation loop when stuck_detected fires AND
+  // the harness has retry budget remaining. The retry sends a synthetic
+  // "act now" message to the same sub-agent before giving up. If the
+  // retry also stalls, the original sub_agent_stalled outcome surfaces
+  // as today.
+  'stall_retry_attempted',
   'heartbeat',
   'kill_requested',
   'run_paused',
