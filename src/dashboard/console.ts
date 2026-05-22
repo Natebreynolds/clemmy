@@ -14572,6 +14572,14 @@ const CONSOLE_JS = `
               : statusKey === 'pending' || statusKey === 'initializing' ? 'pending'
               : statusKey === 'failed' ? 'failed'
               : 'disconnected';
+            // EXPIRED / FAILED / INACTIVE connections still appear in the
+            // connected list because the connection RECORD exists — but
+            // the underlying OAuth token is dead. Without a RECONNECT
+            // button users see "Gmail connected" yet every tool call
+            // errors with "can't get metadata" (Composio's stand-in for
+            // refresh-token failure). Adding RECONNECT here closes the
+            // loop without forcing a disconnect-then-reconnect dance.
+            const needsReauth = statusKey !== 'active' && statusKey !== 'pending' && statusKey !== 'initializing';
             // Distinguishing meta — needed when multiple connections share
             // the same toolkit slug (e.g. 1 ACTIVE outlook + 2 EXPIRED).
             // Without these, every duplicate card looked identical and
@@ -14584,12 +14592,17 @@ const CONSOLE_JS = `
             if (shortConnId) metaParts.push('id …' + shortConnId);
             if (createdAgo) metaParts.push(createdAgo);
             const metaLine = metaParts.join(' · ');
+            const expiredHint = needsReauth
+              ? '  <div class="hub-app-meta" style="color: var(--accent-warn);">⚠ Token ' + escMem(statusKey) + ' — tool calls will fail until you reconnect.</div>'
+              : '';
             return [
               '<div class="hub-app-card" data-hub-app-slug="' + escMem(slug) + '">',
               '  <div class="hub-app-name">' + escMem(friendlyAppName(slug)) + '</div>',
               '  <span class="hub-app-pill ' + pill + '">' + escMem((c.status || 'ACTIVE').toUpperCase()) + '</span>',
               metaLine ? '  <div class="hub-app-meta">' + escMem(metaLine) + '</div>' : '',
+              expiredHint,
               '  <div class="hub-app-card-actions">',
+              needsReauth ? '    <button class="connect" data-hub-app-connect="' + escMem(slug) + '" data-hub-app-needs-setup="0">RECONNECT</button>' : '',
               c.connectionId ? '    <button class="disconnect" data-hub-app-disconnect="' + escMem(slug) + '" data-conn="' + escMem(c.connectionId) + '">DISCONNECT</button>' : '',
               '  </div>',
               '</div>',

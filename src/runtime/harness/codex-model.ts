@@ -88,12 +88,31 @@ export class CodexResponsesModel implements Model {
       const seenOutputItems: CodexOutputItem[] = [];
       let responseId: string | undefined;
       let completedEvent: AnyCodexEvent | undefined;
-      let yieldedAnyContent = false;
-      // Defer response_started until the first piece of real content —
-      // so a failed attempt that only got `response.created` (no text,
-      // no items) can be silently retried without the SDK ever seeing
-      // a stale responseId.
+      // Retry-safety gate: ONLY text deltas + output_item.done count as
+      // "real content the SDK has surfaced to the user." If anything
+      // here fires and the stream then truncates, retrying would
+      // duplicate tokens — FORBIDDEN. Everything else (response_started,
+      // model pass-through frames for reasoning summaries / keep-alives
+      // / observability) is buffered below until we see first real
+      // content. If the stream truncates before any real content, we
+      // throw the buffer away and retry — the SDK never saw a stale
+      // responseId or duplicated metadata frame.
+      let yieldedRealContent = false;
+      // Buffered events held back until first real content arrives.
+      // pendingStart is the SINGLE response_started (one per response).
+      // pendingMetadata is every "model" pass-through event, in order.
+      // Both flush together the moment a content event arrives, or on
+      // a clean completedEvent path. On retry both are discarded.
       let pendingStart: StreamEvent | undefined;
+      let pendingMetadata: StreamEvent[] = [];
+
+      const flushBuffer = function* () {
+        if (pendingStart) { yield pendingStart; pendingStart = undefined; }
+        if (pendingMetadata.length > 0) {
+          for (const ev of pendingMetadata) yield ev;
+          pendingMetadata = [];
+        }
+      };
 
       for await (const evt of this.#streamCodex(request)) {
         if (evt.type === 'response.created' && evt.response?.id) {
@@ -102,8 +121,8 @@ export class CodexResponsesModel implements Model {
           continue;
         }
         if (evt.type === 'response.output_text.delta' && typeof evt.delta === 'string') {
-          if (pendingStart) { yield pendingStart; pendingStart = undefined; }
-          yieldedAnyContent = true;
+          yield* flushBuffer();
+          yieldedRealContent = true;
           yield {
             type: 'output_text_delta',
             delta: evt.delta,
@@ -112,8 +131,8 @@ export class CodexResponsesModel implements Model {
           continue;
         }
         if (evt.type === 'response.output_item.done' && evt.item) {
-          if (pendingStart) { yield pendingStart; pendingStart = undefined; }
-          yieldedAnyContent = true;
+          yield* flushBuffer();
+          yieldedRealContent = true;
           seenOutputItems.push(evt.item);
           continue;
         }
@@ -121,17 +140,25 @@ export class CodexResponsesModel implements Model {
           completedEvent = evt;
           continue;
         }
-        // Pass everything else through verbatim. The SDK doesn't act on
-        // these but trace/observability code can inspect them.
-        if (pendingStart) { yield pendingStart; pendingStart = undefined; }
-        yieldedAnyContent = true;
-        yield { type: 'model', event: evt } as StreamEvent;
+        // Metadata pass-through — buffer instead of yielding. Codex
+        // routinely emits one or two reasoning_summary / keep-alive
+        // frames before the first text delta; previously we yielded
+        // these immediately and that blocked the retry path when the
+        // stream then truncated. Now they sit in pendingMetadata until
+        // either (a) real content arrives and the buffer flushes in
+        // order, or (b) the stream truncates and the buffer is
+        // discarded on retry. Net effect: the SDK observes events in
+        // the SAME order, just delayed slightly into the same tick.
+        pendingMetadata.push({ type: 'model', event: evt } as StreamEvent);
       }
 
       if (completedEvent) {
-        // Success path — flush any deferred response_started (rare:
-        // completed with zero events between created and completed).
-        if (pendingStart) yield pendingStart;
+        // Success path — flush any deferred events (response_started +
+        // metadata frames) in arrival order before the response_done.
+        // For a "completed cleanly with no real content" trace (rare),
+        // this ensures the SDK still observes the start + reasoning
+        // events that fired during this attempt.
+        yield* flushBuffer();
         // Codex's response.completed has output: []. Stuff in the items
         // we accumulated so the SDK builds the right ModelResponse.
         const finalOutput = seenOutputItems.map(convertCodexItemToSdkOutputItem);
@@ -164,10 +191,15 @@ export class CodexResponsesModel implements Model {
       // before so the harness logs it + surfaces a real message.
       lastResponseId = responseId;
       lastItemCount = seenOutputItems.length;
-      if (!yieldedAnyContent && attempt < MAX_RETRY) {
+      if (!yieldedRealContent && attempt < MAX_RETRY) {
         // 750ms backoff. The Codex backend recovers fast in the common
         // case; this avoids stampeding it while still keeping latency
         // imperceptible for the user (they don't see the first attempt).
+        // Buffered events from the failed attempt are explicitly
+        // discarded so the new stream's response.created / metadata
+        // frames don't collide with stale ones.
+        pendingStart = undefined;
+        pendingMetadata = [];
         await new Promise((resolve) => setTimeout(resolve, 750));
         continue;
       }
