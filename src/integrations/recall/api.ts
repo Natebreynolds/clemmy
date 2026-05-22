@@ -108,13 +108,56 @@ async function recallApiRequest<T>(endpoint: string, opts: RecallApiOptions = {}
 }
 
 /**
- * Kick off an async transcript job for a recording. The result job
- * lands at `getTranscript(id)` and contains a download URL once
- * `status.code === 'done'`.
+ * Shape returned by GET /recording/<id>/. We only declare the fields
+ * we read; Recall returns much more (participant metadata, media URLs,
+ * status timestamps). `media_shortcuts.transcript.data.download_url`
+ * is present once Recall finishes transcribing the upload — it stays
+ * undefined while the recording is still being processed, which is
+ * the signal we poll for in the backfill.
+ */
+export interface RecallRecording {
+  id: string;
+  status?: { code?: string; sub_code?: string | null; updated_at?: string };
+  media_shortcuts?: {
+    transcript?: {
+      id?: string;
+      data?: { download_url?: string };
+      status?: { code?: string };
+    };
+    audio_mixed?: {
+      data?: { download_url?: string };
+      status?: { code?: string };
+    };
+  };
+  metadata?: Record<string, unknown>;
+}
+
+/**
+ * Fetch the recording metadata for a desktop SDK upload. For Recall's
+ * desktop SDK, transcription is automatic — you DON'T POST to
+ * /recording/<id>/create_transcript/ (that's the bot path and returns
+ * 404 here). Instead you poll this endpoint until
+ * `media_shortcuts.transcript.data.download_url` is populated.
  *
- * @param recordingId Recall recording ID returned in the desktop
- *   SDK `sdk_upload` flow (also surfaced as `record.recordingId` in
- *   Clementine's meeting record file).
+ * Mirrors the zoombot's `recall-desktop-transcript-done` worker job
+ * at breakthrough-coaching-zoombot-app/worker/index.ts:728.
+ */
+export async function getRecording(
+  recordingId: string,
+  options?: { apiKey?: string; region?: RecallRegion },
+): Promise<RecallRecording> {
+  return recallApiRequest<RecallRecording>(
+    `/recording/${recordingId}/`,
+    options,
+  );
+}
+
+/**
+ * BOT-MODE ONLY: kick off an async transcript job for a recording
+ * made by a Recall bot (one that joined a meeting via meeting URL).
+ * For desktop SDK uploads this returns 404 — those are transcribed
+ * automatically via the realtime endpoints configured at upload time.
+ * Use `getRecording()` for desktop SDK paths.
  */
 export async function requestAsyncTranscript(
   recordingId: string,
@@ -140,8 +183,9 @@ export async function requestAsyncTranscript(
 }
 
 /**
- * Poll the transcript job until it terminates. Returns the final
- * status payload — the caller decides what to do with `download_url`.
+ * BOT-MODE ONLY: poll a transcript job until it terminates. Pairs
+ * with `requestAsyncTranscript`. See getRecording() for the desktop
+ * SDK path.
  */
 export async function getTranscript(
   transcriptId: string,

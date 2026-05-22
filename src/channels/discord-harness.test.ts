@@ -61,11 +61,41 @@ test('turn_started → "thinking…" status only', () => {
   assert.equal(s.done, false);
 });
 
-test('tool_called → "using <name>"', () => {
+test('tool_called → "using <name>" when args missing', () => {
+  // Fallback path: no args means we can't build a rich preview, so we
+  // keep the existing "using <tool>" UX rather than dropping the
+  // verb. Without this fallback the user reads "read_file" as a noun.
   const s = freshState();
   applyEventToState(event('tool_called', { tool: 'read_file' }), s);
   assert.equal(s.status, 'using read_file');
   assert.equal(s.done, false);
+});
+
+test('tool_called → rich preview when args extract a useful field', () => {
+  // v0.5.5: 7-call run_shell_command sequences during skill execution
+  // used to show "using run_shell_command" 7 times — useless to the
+  // Discord viewer. Now we surface the actual command. Same idea for
+  // write_file (the path) and composio_execute_tool (the slug).
+  const shell = freshState();
+  applyEventToState(
+    event('tool_called', { tool: 'run_shell_command', arguments: JSON.stringify({ command: 'pwd && ls -la' }) }),
+    shell,
+  );
+  assert.equal(shell.status, 'running: pwd && ls -la');
+
+  const write = freshState();
+  applyEventToState(
+    event('tool_called', { tool: 'write_file', arguments: JSON.stringify({ path: '/tmp/foo.txt' }) }),
+    write,
+  );
+  assert.equal(write.status, 'writing /tmp/foo.txt');
+
+  const composio = freshState();
+  applyEventToState(
+    event('tool_called', { tool: 'composio_execute_tool', arguments: JSON.stringify({ tool_slug: 'OUTLOOK_LIST_MESSAGES' }) }),
+    composio,
+  );
+  assert.equal(composio.status, 'composio · OUTLOOK_LIST_MESSAGES');
 });
 
 test('handoff → "→ <target>"', () => {

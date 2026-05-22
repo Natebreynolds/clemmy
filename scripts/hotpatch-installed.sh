@@ -54,6 +54,23 @@ FILES=(
   "integrations/recall/backfill.js"
   "integrations/recall/meeting-capture.js"
   "integrations/recall/transcript-parser.js"
+  "runtime/notifications.js"
+  "runtime/mcp-namespace-shim.js"
+  "execution/background-tasks.js"
+  "dashboard/diagnostics.js"
+  "agents/tool-observability.js"
+  "integrations/cli-catalog/catalog.js"
+  # v0.5.5 daemon-side reliability + visibility additions
+  "runtime/approval-summary.js"
+  "runtime/harness/loop.js"
+  "runtime/harness/brackets.js"
+  "runtime/harness/codex-model.js"
+  "channels/discord.js"
+  "channels/discord-harness.js"
+  "daemon/runner.js"
+  "tools/computer-tools.js"
+  "agents/tool-taxonomy.js"
+  "integrations/composio/client.js"
 )
 
 # Sanity-check every source file exists in the local dist BEFORE we

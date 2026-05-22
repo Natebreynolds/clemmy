@@ -2,6 +2,7 @@ import { spawn, type ChildProcessByStdio } from 'node:child_process';
 import { createServer } from 'node:net';
 import { createWriteStream, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import os from 'node:os';
 import type { Readable } from 'node:stream';
 
@@ -47,6 +48,7 @@ export type SupervisorEvent =
   | { type: 'log'; stream: 'stdout' | 'stderr'; line: string }
   | { type: 'exit'; code: number | null; signal: NodeJS.Signals | null }
   | { type: 'restart-scheduled'; delayMs: number; attempt: number }
+  | { type: 'restart-counter-reset'; reason: string; priorAttempts: number }
   | { type: 'restart-skipped'; reason: string };
 
 const READINESS_TIMEOUT_MS = 30_000;
@@ -54,12 +56,25 @@ const READINESS_POLL_MS = 250;
 const SHUTDOWN_GRACE_MS = 5_000;
 const RESTART_BASE_MS = 1_000;
 const RESTART_MAX_MS = 30_000;
+// After this much continuous stable uptime, treat any future crash as
+// "fresh" (i.e. reset the restart counter to 0 before incrementing).
+// Without this, 8 transient crashes spread over a month would
+// permanently disable the supervisor — the counter never decayed even
+// though each crash was independent. 5 minutes is short enough that a
+// genuinely broken daemon (flapping start → crash → start → crash) still
+// trips the cap quickly, but long enough that a "normal" upgrade or
+// transient blip doesn't accumulate forever.
+const STABILITY_RESET_MS = 5 * 60_000;
 
 export class DaemonSupervisor {
   private child: ChildProcessByStdio<null, Readable, Readable> | null = null;
   private logStream: ReturnType<typeof createWriteStream> | null = null;
   private shuttingDown = false;
   private restartAttempts = 0;
+  /** Wall-clock of the most recent successful readiness signal. Used
+   *  by scheduleRestart() to detect "stable for long enough" → fresh
+   *  crash, decay counter. */
+  private lastReadyAt = 0;
   private chosenPort = 0;
   private readyPromise: Promise<{ port: number; url: string }> | null = null;
   private readyResolve: ((info: { port: number; url: string }) => void) | null = null;
@@ -180,6 +195,7 @@ export class DaemonSupervisor {
     void this.waitForReady().then(
       (info) => {
         this.restartAttempts = 0;
+        this.lastReadyAt = Date.now();
         this.readyResolve?.(info);
         this.emit({ type: 'ready', port: info.port, url: info.url });
       },
@@ -293,6 +309,17 @@ export class DaemonSupervisor {
   }
 
   private scheduleRestart(): void {
+    // If the daemon was stable for >= STABILITY_RESET_MS before this
+    // crash, treat it as a fresh failure: clear the prior count so a
+    // long-uptime user doesn't get permanently locked out after 8
+    // transient hiccups spread over weeks. We only decay the counter
+    // BEFORE the increment so the rapid back-to-back crash path (where
+    // lastReadyAt is recent) still trips the cap at 8.
+    const stableUptime = this.lastReadyAt > 0 && (Date.now() - this.lastReadyAt) >= STABILITY_RESET_MS;
+    if (stableUptime && this.restartAttempts > 0) {
+      this.emit({ type: 'restart-counter-reset', reason: 'daemon was stable >=5min before this crash', priorAttempts: this.restartAttempts });
+      this.restartAttempts = 0;
+    }
     this.restartAttempts++;
     if (this.restartAttempts > 8) {
       this.emit({ type: 'restart-skipped', reason: 'too many failures — manual intervention required' });
@@ -338,7 +365,10 @@ async function pickFreePort(preferred: number): Promise<number> {
 export function locateDaemonProjectRoot(): string {
   // Dev: this file lives at apps/desktop/src/daemon-supervisor.ts →
   // two levels up to apps/desktop, then one more to repo root.
-  const here = path.dirname(new URL(import.meta.url).pathname);
+  // fileURLToPath (not .pathname) so spaces and unicode in install
+  // paths get decoded properly — otherwise daemon spawn fails for
+  // users whose home dir or app path contains %-encoded chars.
+  const here = path.dirname(fileURLToPath(import.meta.url));
   const devCandidate = path.resolve(here, '..', '..', '..');
   if (existsSync(path.join(devCandidate, 'src', 'index.ts')) || existsSync(path.join(devCandidate, 'dist', 'index.js'))) {
     return devCandidate;

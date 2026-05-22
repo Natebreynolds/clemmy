@@ -80,6 +80,37 @@ export interface MCPNamespaceShimOptions {
  * Examples: "Bright Data" -> "bright_data", "ElevenLabs" -> "elevenlabs"
  *           "dataforseo" -> "dataforseo", "hostinger-mcp" -> "hostinger-mcp"
  */
+/**
+ * Lightweight, serializable MCP server status used by the dashboard's
+ * header pill + the /api/console/mcp/health endpoint. The slug is the
+ * stable identifier the UI displays. Tool count is reported on the
+ * latest successful listTools; `pending` means the shim has issued
+ * connect but neither connect nor failure has resolved yet.
+ */
+export interface MCPServerHealthSnapshot {
+  slug: string;
+  name: string;
+  state: 'connected' | 'connecting' | 'degraded' | 'unavailable';
+  toolCount: number;
+  failureCount: number;
+  lastError?: string;
+  nextRetryAt?: number;
+}
+
+// Module-level registry of all active shims' per-server health, keyed
+// by slug. Multiple shims can register into the same registry (today
+// there's only one shim — the global namespace shim — but the registry
+// is shim-agnostic so /api/console/mcp/health doesn't need to know
+// which shim each server belongs to). Cleared on shim close().
+const HEALTH_REGISTRY = new Map<string, MCPServerHealthSnapshot>();
+
+/** Read-only snapshot of all MCP server health. Sorted by slug for
+ *  stable rendering. */
+export function listMcpServerHealth(): MCPServerHealthSnapshot[] {
+  return Array.from(HEALTH_REGISTRY.values())
+    .sort((a, b) => a.slug.localeCompare(b.slug));
+}
+
 export function slugifyServerName(name: string): string {
   const slug = name
     .toLowerCase()
@@ -129,10 +160,28 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): MCPSer
     }
     slugToServer.set(slug, server);
     serverSlugs.set(server, slug);
+    // Seed registry with a "connecting" snapshot so the dashboard
+    // immediately shows what servers exist even before any connect
+    // attempt has resolved. Updated by syncHealthRegistry on transitions.
+    HEALTH_REGISTRY.set(slug, {
+      slug,
+      name: server.name,
+      state: 'connecting',
+      toolCount: 0,
+      failureCount: 0,
+    });
   }
 
   let cachedTools: MCPTool[] | null = null;
   let cachedToolToServer: Map<string, MCPServer> | null = null;
+
+  // Snapshot used by the dashboard's MCP status pill — last known
+  // health of each underlying server, keyed by slug (the stable string
+  // the UI displays). Updated synchronously inside markServerConnected
+  // / markServerFailed so the dashboard sees a fresh value on every
+  // /api/console/mcp/health poll. Module-scoped (not per-shim) so the
+  // dashboard route doesn't need a reference to the shim instance.
+  // KEY: slug. VALUE: lightweight serializable status.
 
   // Track per-server connection state. The OpenAI Agents SDK's
   // MCPServerStdio.connect() unconditionally spawns a fresh child
@@ -211,6 +260,7 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): MCPSer
         metadata: { slug, failureCount, lastError: errorObj.message },
       }).catch(() => { /* alert is best-effort */ });
     }
+    syncHealthRegistry(server);
     return next;
   }
 
@@ -220,6 +270,45 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): MCPSer
       failureCount: 0,
       nextRetryAt: 0,
       reconnectBackoffMs: BACKOFF_LADDER_MS[0],
+    });
+    syncHealthRegistry(server);
+  }
+
+  /** Mirror the in-shim ServerHealth into the module-level registry
+   *  the dashboard reads from. Called from every state transition so
+   *  /api/console/mcp/health is always fresh. `lastToolCount` is read
+   *  off the most recent successful listTools (cachedTools length for
+   *  THIS server). */
+  function syncHealthRegistry(server: MCPServer): void {
+    const slug = serverSlugs.get(server);
+    if (!slug) return;
+    const health = serverHealth.get(server);
+    const inflight = connectPromises.has(server);
+    let state: MCPServerHealthSnapshot['state'];
+    if (!health) {
+      state = inflight ? 'connecting' : 'connecting'; // unconnected yet
+    } else if (health.state === 'connected') {
+      state = 'connected';
+    } else if (inflight) {
+      state = 'connecting';
+    } else if (health.state === 'unavailable') {
+      state = 'unavailable';
+    } else {
+      state = 'degraded';
+    }
+    let toolCount = 0;
+    if (cachedTools) {
+      const prefix = `${slug}${SEPARATOR}`;
+      toolCount = cachedTools.filter((t) => t.name.startsWith(prefix) && !t.name.endsWith(`${SEPARATOR}unavailable`)).length;
+    }
+    HEALTH_REGISTRY.set(slug, {
+      slug,
+      name: server.name,
+      state,
+      toolCount,
+      failureCount: health?.failureCount ?? 0,
+      lastError: health?.lastError?.message,
+      nextRetryAt: health?.nextRetryAt && health.nextRetryAt > Date.now() ? health.nextRetryAt : undefined,
     });
   }
 

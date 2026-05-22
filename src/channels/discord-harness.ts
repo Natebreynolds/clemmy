@@ -31,6 +31,7 @@ import { runConversation, runConversationFromResume } from '../runtime/harness/l
 import { HarnessSession } from '../runtime/harness/session.js';
 import { openEventLog } from '../runtime/harness/eventlog.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
+import { previewToolCall } from '../runtime/approval-summary.js';
 import { buildOrchestratorAgent } from '../agents/orchestrator.js';
 
 const EDIT_DEBOUNCE_MS = 2_000;
@@ -46,6 +47,39 @@ const MAX_DISCORD_MESSAGE = 1_900;
 // diagnosed instead of guessed at. Pure observability — no behavior
 // change.
 const logger = pino({ name: 'clementine-next.discord-harness' });
+
+/**
+ * Discord interaction tokens issued at the start of a /command or
+ * button interaction are valid for ~15 minutes. After that, calls to
+ * the webhook (which is what `handle.edit()` ultimately hits) fail
+ * with one of:
+ *   - HTTP 401 "Invalid Webhook Token" (Discord error code 50027)
+ *   - HTTP 404 "Unknown Webhook" (Discord error code 10015)
+ *   - Discord.js DiscordAPIError with the same codes attached
+ *
+ * This helper recognizes all the shapes I've seen in the wild without
+ * blindly trusting any single field. False positives are cheap (we
+ * just stop trying to edit and use followups, which is the right
+ * behavior for any persistent edit failure anyway). False negatives
+ * mean we keep logging the same error every flush — annoying but not
+ * broken, and the structured-logging shipped in v0.5.3 makes it
+ * obvious in daemon.log when it happens.
+ */
+function isDiscordTokenExpired(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const e = err as { code?: unknown; status?: unknown; httpStatus?: unknown; message?: unknown };
+  const codeNum = typeof e.code === 'number'
+    ? e.code
+    : typeof e.code === 'string' && /^\d+$/.test(e.code) ? parseInt(e.code, 10) : NaN;
+  if (codeNum === 50027 || codeNum === 10015) return true;
+  const status = typeof e.status === 'number' ? e.status : (typeof e.httpStatus === 'number' ? e.httpStatus : NaN);
+  if (status === 401 || status === 404) return true;
+  const msg = typeof e.message === 'string' ? e.message.toLowerCase() : '';
+  return msg.includes('invalid webhook token')
+    || msg.includes('unknown webhook')
+    || msg.includes('interaction has expired')
+    || msg.includes('interaction expired');
+}
 
 /**
  * Per-channel harness session continuity. Without this, every DM
@@ -605,6 +639,12 @@ interface DisplayState {
   // message so the user clicks instead of typing "approve apr-xxxx".
   // Cleared on approval_resolved / awaiting_user_input / completion.
   pendingApprovalId?: string;
+  // Wall-clock when the turn started, in ms. Set on the first
+  // turn_started event. renderBody uses this to show an elapsed-time
+  // counter so the user can tell "still working at 4m 12s" vs
+  // "nothing happening." The heartbeat ticker also reads this so it
+  // can decide whether to push a "still working" pulse.
+  turnStartedAt?: number;
 }
 
 /**
@@ -641,13 +681,31 @@ function renderBody(state: DisplayState): string {
     const body = state.summary || '_done._';
     return body.length > MAX_DISCORD_MESSAGE ? body.slice(0, MAX_DISCORD_MESSAGE - 1) + '…' : body;
   }
-  // In-progress: ONE short status line. No tool-call history, no
-  // "Tools used: 4 (composio_search_tools, local_cli_list, ...)"
-  // — that was visual clutter the user reads as "the agent is
-  // confused / churning." Keep it tight: agent name + a tasteful verb.
-  const verb = state.currentAgent ? `${state.currentAgent} working…` : (state.status || 'working…');
-  const body = `_${verb}_`;
+  // In-progress: a short status line PLUS an elapsed-time counter so
+  // the user can tell "still working at 4m 12s" vs "nothing
+  // happening." Tool count is included once 3+ tools have fired —
+  // signals real progress, not churn. Still no full tool-call
+  // history — that read as "the agent is confused" in earlier UX.
+  const verb = state.currentAgent ? `${state.currentAgent} · ${state.status || 'working…'}` : (state.status || 'working…');
+  const elapsed = formatElapsedMs(state.turnStartedAt ? Date.now() - state.turnStartedAt : 0);
+  const counter = state.toolCount >= 3 ? ` · ${state.toolCount} tools` : '';
+  const body = elapsed
+    ? `_${verb} · ${elapsed}${counter}_`
+    : `_${verb}${counter}_`;
   return body.length > MAX_DISCORD_MESSAGE ? body.slice(0, MAX_DISCORD_MESSAGE - 1) + '…' : body;
+}
+
+/** Human-friendly "Ns" / "Nm Ms" / "Nh Mm" elapsed time. Returns
+ *  empty for sub-5-second runs so brand-new turns don't blink "1s"
+ *  on the very first flush. */
+function formatElapsedMs(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 5_000) return '';
+  const sec = Math.floor(ms / 1000);
+  if (sec < 60) return `${sec}s`;
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m ${sec % 60}s`;
+  const hr = Math.floor(min / 60);
+  return `${hr}h ${min % 60}m`;
 }
 
 /**
@@ -884,10 +942,26 @@ export async function runDiscordHarnessConversation(opts: {
   // subsequent flush after the approval resolves (or a new approval
   // arrives) clears/replaces them — passing components:[] drops them.
   let lastAttachedApprovalId: string | undefined;
+  // Discord interaction tokens expire 15 min after the initial
+  // interaction. Past that, `handle.edit()` throws (401 Invalid Webhook
+  // Token / 10015 Unknown Webhook). Without the fallback below, a
+  // multi-hour workflow would go SILENT on Discord after minute 15 —
+  // intermediate progress disappears, the final reply never arrives,
+  // and the user has no idea anything's still running. With this flag
+  // set, intermediate progress edits go quietly (no spam — the user
+  // wouldn't see them anyway since the token's gone) and the final
+  // reply routes through transport.sendFollowup so the user DOES see
+  // the answer as a fresh message in the same channel.
+  let tokenExpired = false;
 
   const flush = async (): Promise<void> => {
     pendingEdit = null;
     lastEditAt = Date.now();
+    // If the interaction token already expired, intermediate progress
+    // edits are silently dropped — the user wouldn't see them, and
+    // creating a new follow-up message every few seconds would spam
+    // the channel. The final reply still gets through via finalFlush().
+    if (tokenExpired) return;
     try {
       const components = approvalComponentsForState(state);
       const needsUpdate = state.pendingApprovalId !== lastAttachedApprovalId;
@@ -904,6 +978,14 @@ export async function runDiscordHarnessConversation(opts: {
       // limit, or — at minute 15+ — interaction-token expiry). The
       // next event will retry; nothing fatal. Log so long-workflow
       // failures are diagnosable instead of silent.
+      if (isDiscordTokenExpired(err)) {
+        tokenExpired = true;
+        logger.warn(
+          { sessionId: session.id, stage: 'flush-token-expired' },
+          'discord interaction token expired — switching to sendFollowup for final reply',
+        );
+        return;
+      }
       logger.warn(
         { err: err instanceof Error ? err.message : String(err), sessionId: session.id, stage: 'flush' },
         'discord edit failed',
@@ -934,6 +1016,27 @@ export async function runDiscordHarnessConversation(opts: {
     const chunks = splitForLongReply(fullBody);
     const components = approvalComponentsForState(state);
     const needsComponentUpdate = state.pendingApprovalId !== lastAttachedApprovalId || !!components;
+
+    // Token-expired path: skip handle.edit entirely and route the full
+    // reply through sendFollowup as a fresh message in the channel.
+    // Without this, runs that exceed 15 minutes go dark — the user
+    // never sees the result.
+    if (tokenExpired) {
+      if (transport.sendFollowup) {
+        try {
+          for (const chunk of chunks) {
+            await transport.sendFollowup(chunk);
+          }
+        } catch (err) {
+          logger.warn(
+            { err: err instanceof Error ? err.message : String(err), sessionId: session.id, stage: 'finalFlush-postExpiry' },
+            'discord final followup failed after token expiry',
+          );
+        }
+      }
+      return;
+    }
+
     try {
       if (needsComponentUpdate) {
         await handle.edit(chunks[0] ?? '_working…_', { components: components ?? [] });
@@ -947,6 +1050,29 @@ export async function runDiscordHarnessConversation(opts: {
         }
       }
     } catch (err) {
+      // Token expired DURING the final flush (run was just at the 15-min
+      // boundary). Try the whole thing via followup so the user still
+      // gets the answer.
+      if (isDiscordTokenExpired(err)) {
+        tokenExpired = true;
+        logger.warn(
+          { sessionId: session.id, stage: 'finalFlush-token-expired' },
+          'discord interaction token expired during final flush — falling back to sendFollowup',
+        );
+        if (transport.sendFollowup) {
+          try {
+            for (const chunk of chunks) {
+              await transport.sendFollowup(chunk);
+            }
+          } catch (followupErr) {
+            logger.warn(
+              { err: followupErr instanceof Error ? followupErr.message : String(followupErr), sessionId: session.id, stage: 'finalFlush-fallback' },
+              'discord followup fallback after token expiry also failed',
+            );
+          }
+        }
+        return;
+      }
       // Edit can transiently fail. Don't crash settle — the user can
       // re-ping if they don't see the full reply. Log so long-workflow
       // settle failures are diagnosable instead of silent.
@@ -966,6 +1092,32 @@ export async function runDiscordHarnessConversation(opts: {
     }, wait);
   };
 
+  // "Still working" pulse: every PROGRESS_PULSE_MS while the run is
+  // active, force a flush so the elapsed-time counter in renderBody
+  // ticks forward — even if no harness.event fires during that
+  // window. Without this, a tool that takes 90 seconds (e.g. the
+  // 84-second `draft_plan` we saw in sess-mpg7ue2d) leaves the
+  // Discord message frozen at its old timestamp, indistinguishable
+  // from a stuck run.
+  //
+  // Suppressed when:
+  //   - state.done (approval pause, awaiting input, completed) — the
+  //     message is already terminal; no pulse needed
+  //   - tokenExpired — Discord won't accept the edit anyway; the
+  //     followup-on-finalFlush path delivers the final answer
+  //
+  // The pulse goes through scheduleEdit, which already debounces +
+  // rate-limits, so EDIT_DEBOUNCE_MS still protects against burst
+  // edits if a real event fires right before a pulse tick.
+  const PROGRESS_PULSE_MS = 30_000;
+  let progressPulse: NodeJS.Timeout | null = setInterval(() => {
+    if (state.done) return;
+    if (tokenExpired) return;
+    if (!state.turnStartedAt) return;
+    scheduleEdit();
+  }, PROGRESS_PULSE_MS);
+  progressPulse?.unref?.();
+
   const finished: Promise<void> = new Promise((resolve) => {
     let unsubscribe: (() => void) | null = null;
     let safetyTimer: NodeJS.Timeout | null = null;
@@ -977,6 +1129,10 @@ export async function runDiscordHarnessConversation(opts: {
       if (pendingEdit) {
         clearTimeout(pendingEdit);
         pendingEdit = null;
+      }
+      if (progressPulse) {
+        clearInterval(progressPulse);
+        progressPulse = null;
       }
       await finalFlush();
       resolve();
@@ -1348,11 +1504,23 @@ export function applyEventToState(event: EventRow, state: DisplayState): void {
         : '';
       if (role) state.currentAgent = role;
       state.status = 'thinking…';
+      if (!state.turnStartedAt) state.turnStartedAt = Date.now();
       return;
     }
     case 'tool_called': {
       const tool = String(data.tool ?? data.name ?? 'tool');
-      state.status = `using ${tool}`;
+      // Richer status line: "running: pwd && ls -la" vs the bare
+      // "using run_shell_command". During a skill execution the agent
+      // can fire 7 sequential shell commands and "using
+      // run_shell_command" 7 times in a row gives the Discord viewer
+      // zero info. previewToolCall pulls the meaningful field from
+      // the args (command for shell, slug for composio, path for
+      // write_file) and renders one short label. When the helper
+      // can't extract anything useful, it returns the bare tool name
+      // — in that fallback case we still prepend "using " so the
+      // user reads it as an in-progress action instead of a noun.
+      const preview = previewToolCall(tool, data.arguments);
+      state.status = preview === tool ? `using ${tool}` : preview;
       state.toolsCalled.push(tool);
       state.toolCount += 1;
       return;

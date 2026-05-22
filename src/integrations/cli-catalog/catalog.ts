@@ -72,6 +72,22 @@ export const CLI_CATALOG: readonly CliCatalogEntry[] = [
     homepage: 'https://developer.salesforce.com/tools/salesforcecli',
   },
   {
+    id: 'higgsfield',
+    name: 'Higgsfield CLI',
+    command: 'higgsfield',
+    vendor: 'Higgsfield',
+    description: 'Run Higgsfield image, video, and Marketing Studio generative workflows from the terminal.',
+    tags: ['higgsfield', 'higgs', 'hf', 'video', 'image', 'generative', 'ai', 'marketing studio', 'soul-id', 'product-photoshoot'],
+    installCommand: 'npm install -g @higgsfield/cli',
+    installSource: 'npm',
+    authDocsUrl: 'https://higgsfield.ai/cli',
+    // Note: subcommand `auth login`, not bare `login` (verified against
+    // higgsfield 0.1.33). Surfaces as the post-install bootstrap step
+    // so the user knows the exact handshake command.
+    authCommand: 'higgsfield auth login',
+    homepage: 'https://higgsfield.ai',
+  },
+  {
     id: 'railway',
     name: 'Railway CLI',
     command: 'railway',

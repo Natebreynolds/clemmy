@@ -511,6 +511,13 @@ export function loadRecallMeetingAnalysis(meetingId: string): RecallMeetingAnaly
  * first. Used by the dashboard's "recent meetings" list. Cheap — even
  * 100 meetings is ~100 small JSON reads.
  */
+/** Records older than this with status='detected' and zero segments
+ *  are filtered out of the list — they're stale stubs from windows
+ *  the SDK saw briefly but the user never recorded on. The on-disk
+ *  file is left alone (so a real bug investigation can still find
+ *  them) but the dashboard doesn't show them. */
+const STALE_DETECTED_THRESHOLD_MS = 30 * 60 * 1000;
+
 export function listAllRecallMeetingRecords(): RecallMeetingRecord[] {
   if (!existsSync(RECORDS_DIR)) return [];
   const out: RecallMeetingRecord[] = [];
@@ -519,7 +526,21 @@ export function listAllRecallMeetingRecords(): RecallMeetingRecord[] {
       if (!entry.endsWith('.json')) continue;
       try {
         const parsed = JSON.parse(readFileSync(path.join(RECORDS_DIR, entry), 'utf-8')) as RecallMeetingRecord;
-        if (parsed && parsed.id) out.push(parsed);
+        if (!parsed || !parsed.id) continue;
+        // Drop stale "detected but never recorded" stubs. The SDK fires
+        // meeting-detected as soon as Zoom/Meet opens, even if the user
+        // closes it without ever clicking record. Without this filter
+        // those stubs accumulate forever in the captured list. See
+        // recall-capture.ts onMeetingClosed — it clears in-memory state
+        // but doesn't update the persisted record, so the file lingers.
+        const isEmptyDetected = parsed.status === 'detected' && (parsed.segments?.length ?? 0) === 0;
+        if (isEmptyDetected) {
+          const startedAt = Date.parse(parsed.startedAt ?? '');
+          if (Number.isFinite(startedAt) && Date.now() - startedAt > STALE_DETECTED_THRESHOLD_MS) {
+            continue;
+          }
+        }
+        out.push(parsed);
       } catch { /* skip corrupt entries */ }
     }
   } catch { /* dir disappeared between checks */ }
@@ -541,6 +562,34 @@ export interface RecallMeetingSummary {
   durationSeconds?: number;
 }
 
+/**
+ * Snapshot of existing analysis JSON files in ANALYSIS_DIR. Cached for
+ * 30s so we don't hammer the FS with 70 disk stats every time the
+ * dashboard re-renders the meetings list — readdirSync once is much
+ * cheaper than 2N existsSync calls where N=meeting count. 30s is short
+ * enough that a freshly-written analysis appears in the dashboard's
+ * next-but-one render, which is the same latency the polling already
+ * has, so no visible regression.
+ */
+let analysisExistsCache: { at: number; set: Set<string> } | null = null;
+const ANALYSIS_CACHE_TTL_MS = 30_000;
+function loadAnalysisFileSet(): Set<string> {
+  const now = Date.now();
+  if (analysisExistsCache && now - analysisExistsCache.at < ANALYSIS_CACHE_TTL_MS) {
+    return analysisExistsCache.set;
+  }
+  const set = new Set<string>();
+  try {
+    if (existsSync(ANALYSIS_DIR)) {
+      for (const entry of readdirSync(ANALYSIS_DIR)) {
+        set.add(path.join(ANALYSIS_DIR, entry));
+      }
+    }
+  } catch { /* dir disappeared mid-read */ }
+  analysisExistsCache = { at: now, set };
+  return set;
+}
+
 export function summarizeRecallMeeting(record: RecallMeetingRecord): RecallMeetingSummary {
   let durationSeconds: number | undefined;
   if (record.startedAt && record.endedAt) {
@@ -550,12 +599,13 @@ export function summarizeRecallMeeting(record: RecallMeetingRecord): RecallMeeti
   // Analysis path resolution: the agent writes via write_file directly to
   // the canonical path (analysisPathFor(id)) — it doesn't go through
   // saveRecallMeetingAnalysis, so the record itself won't have
-  // analysisPath set. Fall back to the canonical path so hasAnalysis
-  // reflects reality.
+  // analysisPath set. Use the cached file set to avoid 2N existsSync
+  // calls when rendering the meetings list.
   const canonical = analysisPathFor(record.id);
-  const resolvedAnalysisPath = record.analysisPath && existsSync(record.analysisPath)
+  const fileSet = loadAnalysisFileSet();
+  const resolvedAnalysisPath = record.analysisPath && fileSet.has(record.analysisPath)
     ? record.analysisPath
-    : (existsSync(canonical) ? canonical : undefined);
+    : (fileSet.has(canonical) ? canonical : undefined);
   return {
     id: record.id,
     windowId: record.windowId,

@@ -230,6 +230,25 @@ function sleepMs(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * Human-friendly "N units ago" string for ephemeral feedback when a
+ * user clicks a stale Discord button. Aimed at readability, not
+ * precision — "12 minutes ago" beats "743 seconds ago." Always
+ * returns at least "just now" for ms < 5s so the message reads well
+ * even on borderline-fresh clicks.
+ */
+function formatRelativeAgo(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 5_000) return 'just now';
+  const sec = Math.round(ms / 1000);
+  if (sec < 90) return `${sec} seconds ago`;
+  const min = Math.round(sec / 60);
+  if (min < 90) return `${min} minute${min === 1 ? '' : 's'} ago`;
+  const hr = Math.round(min / 60);
+  if (hr < 36) return `${hr} hour${hr === 1 ? '' : 's'} ago`;
+  const day = Math.round(hr / 24);
+  return `${day} day${day === 1 ? '' : 's'} ago`;
+}
+
 async function executeDiscordRequest(path: string, init?: { method?: string; body?: unknown }): Promise<Response> {
   const method = init?.method ?? 'GET';
   let attempt = 0;
@@ -1449,6 +1468,25 @@ async function handleButtonInteraction(interaction: ButtonInteraction, assistant
   try {
     if (action === 'approve' || action === 'reject') {
       const approved = action === 'approve';
+      // Stale-button guard: a Discord user can click an approval button
+      // on a historical message any time. If the underlying approval is
+      // already resolved/expired/cancelled, give the user clear
+      // ephemeral feedback INSTEAD of silently routing through the
+      // harness resume path (which returns false on non-pending rows
+      // and falls into resolveApprovalOrQueueBackgroundContinuation —
+      // that produces confusing output for a stale click).
+      if (targetId.startsWith('apr-')) {
+        const row = approvalRegistry.get(targetId);
+        if (row && row.status !== 'pending') {
+          const ageMs = Date.now() - new Date(row.resolvedAt ?? row.requestedAt).getTime();
+          const ageLabel = formatRelativeAgo(ageMs);
+          await interaction.reply({
+            content: `That approval (\`${targetId}\`) was already **${row.status}** ${ageLabel}${row.resolver ? ` by ${row.resolver}` : ''} — no action taken.`,
+            ephemeral: true,
+          });
+          return;
+        }
+      }
       if (DISCORD_HARNESS_ENABLED && targetId.startsWith('apr-')) {
         const handled = await tryHandleHarnessApprovalReply({
           channelId: interaction.channelId ?? '',

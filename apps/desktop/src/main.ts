@@ -12,6 +12,7 @@ import {
   type NativeImage,
 } from 'electron';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import os from 'node:os';
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { DaemonSupervisor, locateDaemonProjectRoot, type SupervisorEvent } from './daemon-supervisor.js';
@@ -224,7 +225,7 @@ function createMainWindow(url: string): BrowserWindow {
     backgroundColor: '#07070a',
     titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
     webPreferences: {
-      preload: path.join(path.dirname(new URL(import.meta.url).pathname), 'preload.cjs'),
+      preload: preloadPath(),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
@@ -384,7 +385,67 @@ function scheduleInstallQuitFallback(): void {
   installQuitFallback.unref?.();
 }
 
+/**
+ * Probe the daemon for "is anything actively running right now?" so
+ * the install flow can warn before killing user work. Returns null on
+ * any failure (daemon not ready, port not bound, parse error, etc.) —
+ * the caller treats that as "proceed without prompting" because we
+ * can't get worse than the prior behavior of installing blind.
+ *
+ * Counts: non-chat sessions in active/paused (workflow, execution,
+ * agent), pending harness approvals, in-flight background tasks.
+ * Chat sessions are excluded — they stay 'active' by design and would
+ * always trip the warning otherwise.
+ */
+async function probeActiveWorkBeforeInstall(): Promise<{
+  total: number;
+  summary: string;
+} | null> {
+  try {
+    const payload = await fetchDaemonJson<{ total?: unknown; summary?: unknown }>(
+      '/api/console/active-work',
+    );
+    const total = typeof payload.total === 'number' ? payload.total : 0;
+    const summary = typeof payload.summary === 'string' ? payload.summary : '';
+    return { total, summary };
+  } catch {
+    return null;
+  }
+}
+
 async function applyUpdateFromUi(): Promise<ReturnType<typeof getUpdaterStatus> & { applyResult: ReturnType<typeof applyUpdate> }> {
+  // BEFORE quitAndInstall — check whether anything's mid-flight. If
+  // active work is present, give the user a clear choice: defer
+  // (preserve the work) or install anyway (kill it). Without this
+  // check, the user clicks "Install Now" assuming benign UX and
+  // unknowingly drops a multi-hour workflow.
+  const activeWork = await probeActiveWorkBeforeInstall();
+  if (activeWork && activeWork.total > 0) {
+    const choice = dialog.showMessageBoxSync({
+      type: 'warning',
+      buttons: ['Defer Install', 'Install Anyway'],
+      defaultId: 0,
+      cancelId: 0,
+      noLink: true,
+      title: 'Active work in progress',
+      message: `Clementine has ${activeWork.summary}.`,
+      detail:
+        'Installing the update now will quit the daemon and stop these runs. They will not auto-resume.\n\n'
+        + 'Defer to install later — Clementine will keep this update ready and prompt again when no work is active.\n\n'
+        + 'Install Anyway to proceed (recommended only if you are sure these runs are safe to stop).',
+    });
+    if (choice === 0) {
+      return {
+        ...getUpdaterStatus(),
+        applyResult: {
+          ok: false,
+          reason: `Install deferred — ${activeWork.summary} in progress. Try again when those finish.`,
+        },
+      };
+    }
+    // choice === 1: user explicitly chose to install anyway. Fall through.
+  }
+
   if (getUpdaterStatus().state === 'ready-to-install') {
     // Let electron-updater/Squirrel own the install, but make every UI
     // entry point mark the app as intentionally quitting first. The tray
@@ -443,7 +504,17 @@ function showSupervisorEventNotification(event: SupervisorEvent): void {
 }
 
 function preloadPath(): string {
-  return path.join(path.dirname(new URL(import.meta.url).pathname), 'preload.cjs');
+  // CRITICAL: use fileURLToPath, NOT new URL(import.meta.url).pathname.
+  // The .pathname getter returns URL-encoded paths — '/Users/jane%20smith/...'
+  // for any user whose home or install path contains spaces, unicode,
+  // or other percent-encoded characters. Electron's preload loader
+  // expects a real filesystem path and silently fails to attach when
+  // given an encoded one. The renderer then shows "Setup bridge
+  // unavailable" because window.clemmy never materializes.
+  //
+  // fileURLToPath decodes the URL properly. This is the Node.js
+  // recommended idiom (see https://nodejs.org/api/url.html#urlfileurltopathurl).
+  return path.join(path.dirname(fileURLToPath(import.meta.url)), 'preload.cjs');
 }
 
 /**

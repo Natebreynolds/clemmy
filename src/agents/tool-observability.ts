@@ -76,10 +76,22 @@ export interface ToolLifecycleEvent {
   mcp?: boolean;
 }
 
-/** Best-effort append. Never throws. */
+/** Best-effort append. Never throws.
+ *
+ * Defaults an empty sessionId to a stable "unscoped:<date>" bucket so
+ * downstream tooling (the dashboard's diagnostics panel) can still
+ * group events that the runtime didn't tag. The runtime SHOULD pass
+ * sessionId for every event, but chat paths through the SDK Agent
+ * Runner have historically dropped it — this fallback keeps those
+ * events visible instead of having them coalesce into a single
+ * un-clickable bucket. Doesn't change tool execution; just adds a
+ * lookup key. */
 export function recordToolEvent(event: ToolLifecycleEvent): void {
   ensureDir();
-  const line = JSON.stringify(event) + '\n';
+  const tagged = event.sessionId && event.sessionId.length > 0
+    ? event
+    : { ...event, sessionId: `unscoped:${(event.at || new Date().toISOString()).slice(0, 10)}` };
+  const line = JSON.stringify(tagged) + '\n';
   try {
     appendFileSync(currentLogFile(), line, { encoding: 'utf-8' });
   } catch {

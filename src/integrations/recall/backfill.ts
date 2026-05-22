@@ -29,7 +29,7 @@
  */
 
 import pino from 'pino';
-import { requestAsyncTranscript, getTranscript, downloadTranscriptData } from './api.js';
+import { getRecording, downloadTranscriptData } from './api.js';
 import { parseTranscriptToSegments } from './transcript-parser.js';
 import {
   applyCanonicalTranscript,
@@ -70,10 +70,13 @@ export async function backfillCanonicalTranscript(input: {
   }
 
   try {
-    const job = await requestAsyncTranscript(record.recordingId);
-    logger.info({ id: record.id, transcriptId: job.id }, 'backfill: async transcript job created');
-
-    const ready = await pollForTranscriptReady(job.id, startedAt);
+    // Desktop SDK uploads have transcription configured at upload time
+    // (via realtime endpoints in the SDK init), so we DON'T trigger a
+    // new transcript job — we just poll the recording until Recall
+    // surfaces the transcript download URL in media_shortcuts. This
+    // is the same shape the zoombot's desktop worker uses
+    // (worker/index.ts:728), which is the battle-tested path.
+    const ready = await pollForRecordingTranscriptUrl(record.recordingId, startedAt);
     if (!ready.downloadUrl) {
       const updated = markCanonicalTranscriptIncomplete(record, 'timed_out', ready.lastStatus);
       logger.warn({ id: updated.id, lastStatus: ready.lastStatus }, 'backfill: poll timed out before transcript ready');
@@ -112,35 +115,53 @@ export async function backfillCanonicalTranscript(input: {
 }
 
 /**
- * Poll getTranscript every POLL_INTERVAL_MS until either status.code
- * indicates done (with a download_url) OR we exceed POLL_TIMEOUT_MS.
- * Returns `downloadUrl` when ready, `lastStatus` on timeout so the
- * caller can record what state we gave up in.
+ * Poll `GET /recording/<id>/` until Recall surfaces a transcript URL
+ * in media_shortcuts. This is the desktop SDK path — transcription
+ * is automatic; we're just waiting for the pipeline to finish.
+ *
+ * Tolerates two transient conditions:
+ *   - 404: the recording isn't in Recall's database yet (the upload
+ *     is still in flight). Sleep and retry — this is normal for the
+ *     first ~10s after the user clicks stop.
+ *   - 5xx / network errors: same, sleep and retry.
+ *
+ * Returns `downloadUrl` when it appears; otherwise `lastStatus`
+ * describes the final state we gave up in (recording.status.code,
+ * "404 not found", "poll error: ...", etc.) so the caller can stamp
+ * it onto the meeting record's canonicalError.
  */
-async function pollForTranscriptReady(
-  transcriptId: string,
+async function pollForRecordingTranscriptUrl(
+  recordingId: string,
   startedAt: number,
 ): Promise<{ downloadUrl?: string; lastStatus: string }> {
   let lastStatus = 'unknown';
   while (Date.now() - startedAt < POLL_TIMEOUT_MS) {
-    let snapshot: Awaited<ReturnType<typeof getTranscript>>;
+    let snapshot: Awaited<ReturnType<typeof getRecording>>;
     try {
-      snapshot = await getTranscript(transcriptId);
+      snapshot = await getRecording(recordingId);
     } catch (err) {
-      // Transient API errors during polling shouldn't fail the whole
-      // backfill — sleep and retry until the timeout window closes.
       const message = err instanceof Error ? err.message : String(err);
-      lastStatus = `poll error: ${message.slice(0, 120)}`;
+      const status = (err as Error & { status?: number }).status;
+      // 404 == upload still in flight; recording will materialize
+      // shortly. Don't bail.
+      if (status === 404) {
+        lastStatus = '404 — recording not yet ingested';
+      } else {
+        lastStatus = `poll error: ${message.slice(0, 120)}`;
+      }
       await sleep(POLL_INTERVAL_MS);
       continue;
     }
-    lastStatus = snapshot.status?.code ?? 'unknown';
-    if (lastStatus === 'done' && snapshot.download_url) {
-      return { downloadUrl: snapshot.download_url, lastStatus };
+    const transcript = snapshot.media_shortcuts?.transcript;
+    const downloadUrl = transcript?.data?.download_url;
+    if (downloadUrl) {
+      return { downloadUrl, lastStatus: transcript?.status?.code ?? 'done' };
     }
-    if (lastStatus === 'failed' || lastStatus === 'error') {
-      throw new Error(`Recall transcript job ended with status=${lastStatus}`);
-    }
+    // Use whatever status Recall is reporting so it's visible in the
+    // meeting record if we time out (e.g. "processing").
+    lastStatus = transcript?.status?.code
+      ?? snapshot.status?.code
+      ?? 'no transcript yet';
     await sleep(POLL_INTERVAL_MS);
   }
   return { lastStatus };

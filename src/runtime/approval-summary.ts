@@ -112,3 +112,105 @@ function trim(input: string, max: number): string {
   const clean = input.replace(/\s+/g, ' ').trim();
   return clean.length > max ? `${clean.slice(0, max - 1)}…` : clean;
 }
+
+/**
+ * Short human-readable preview of a live tool_called event for the
+ * status line (chat dock + Discord progress). Capped tight (~70 chars)
+ * so it fits in a one-line label. Where `summarizeApprovalAction`
+ * formats a multi-line approval card, this is for "what is the agent
+ * doing RIGHT NOW" — the user wants to know "running pwd && ls" not
+ * "run_shell_command(args={command: ...})". Without it, a 7-call
+ * sequence of run_shell_command shows up as the bare tool name 7 times
+ * and the user can't tell anything's progressing.
+ *
+ * `argsRaw` accepts either the JSON string emitted by the SDK or the
+ * already-parsed object — both are common shapes at call sites.
+ */
+export function previewToolCall(toolName: string, argsRaw: unknown): string {
+  const args = parseArgs(argsRaw);
+  if (!args) return toolName;
+  const MAX = 70;
+  switch (toolName) {
+    case 'run_shell_command':
+    case 'shell': {
+      const command = pickString(args, ['command', 'cmd']);
+      if (!command) return toolName;
+      return `running: ${trim(command, MAX)}`;
+    }
+    case 'write_file':
+    case 'edit_file': {
+      const file = pickString(args, ['file_path', 'path', 'filePath']);
+      return file ? `writing ${trim(file, MAX)}` : toolName;
+    }
+    case 'read_file': {
+      const file = pickString(args, ['file_path', 'path', 'filePath']);
+      return file ? `reading ${trim(file, MAX)}` : toolName;
+    }
+    case 'composio_execute_tool': {
+      const slug = pickString(args, ['tool_slug', 'slug']);
+      return slug ? `composio · ${trim(slug, MAX - 10)}` : toolName;
+    }
+    case 'composio_search_tools': {
+      const query = pickString(args, ['query', 'q']);
+      return query ? `searching composio · "${trim(query, MAX - 22)}"` : toolName;
+    }
+    case 'memory_recall':
+    case 'tool_choice_recall': {
+      const intent = pickString(args, ['intent', 'query', 'q']);
+      return intent ? `recall · ${trim(intent, MAX - 9)}` : toolName;
+    }
+    case 'memory_search': {
+      const query = pickString(args, ['query', 'q']);
+      return query ? `memory search · "${trim(query, MAX - 17)}"` : toolName;
+    }
+    case 'skill_read':
+    case 'skill_list': {
+      const name = pickString(args, ['name', 'skill', 'filter']);
+      return name ? `${toolName} · ${trim(name, MAX - toolName.length - 3)}` : toolName;
+    }
+    case 'discord_channel_send':
+    case 'send_message':
+    case 'notify_user':
+    case 'discord_dm': {
+      const title = pickString(args, ['title', 'subject']);
+      const text = pickString(args, ['message', 'content', 'text', 'body']);
+      return title || text ? `notify · ${trim(title || text, MAX - 9)}` : toolName;
+    }
+    case 'send_email':
+    case 'gmail_send':
+    case 'outlook_send_email': {
+      const to = pickString(args, ['to', 'recipient']);
+      return to ? `emailing ${trim(to, MAX - 9)}` : toolName;
+    }
+    case 'draft_plan': {
+      const input = pickString(args, ['input', 'objective', 'goal']);
+      return input ? `planning · ${trim(input, MAX - 11)}` : toolName;
+    }
+    case 'request_approval': {
+      const subject = pickString(args, ['subject', 'reason']);
+      return subject ? `requesting approval · ${trim(subject, MAX - 22)}` : toolName;
+    }
+    case 'goal_create':
+    case 'goal_update':
+    case 'task_add':
+    case 'task_update': {
+      const title = pickString(args, ['title', 'description', 'text', 'name']);
+      return title ? `${toolName} · ${trim(title, MAX - toolName.length - 3)}` : toolName;
+    }
+    default: {
+      return toolName;
+    }
+  }
+}
+
+function parseArgs(raw: unknown): Record<string, unknown> | undefined {
+  if (!raw) return undefined;
+  if (typeof raw === 'object') return raw as Record<string, unknown>;
+  if (typeof raw !== 'string') return undefined;
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : undefined;
+  } catch {
+    return undefined;
+  }
+}

@@ -69,6 +69,19 @@ export function renderConsoleHtml(token: string): string {
         <span class="stat" data-stat-memory>MEM · <em>—</em></span>
         <span class="stat" data-stat-approvals>APPRV · <em>—</em></span>
         <span class="stat" data-stat-policy>MODE · <em>—</em></span>
+        <!--
+          MCP server health pill. Polls /api/console/mcp/health every
+          3s. Click to jump to Settings → MCP Servers. Shows one of:
+            MCP · 3 READY            (all good — connected style)
+            MCP · 2/3 READY · 1 ⚠     (any degraded)
+            MCP · CONNECTING…        (anything still booting)
+            MCP · 1 DOWN             (anything unavailable — red)
+          Empty when zero servers configured (no clutter for fresh installs).
+        -->
+        <button class="stat mcp-stat" data-stat-mcp data-state="loading" type="button"
+                title="MCP server health · click for details" hidden>
+          MCP · <em data-stat-mcp-label>—</em>
+        </button>
         <span class="stat connection" data-stat-connection>
           <span class="pulse" aria-hidden="true"></span>
           <span data-conn-label>ONLINE</span>
@@ -1221,6 +1234,14 @@ export function renderConsoleHtml(token: string): string {
             </div>
 
             <div class="settings-block">
+              <div class="settings-block-head">PERSONALITY · how Clementine talks to you</div>
+              <div class="settings-info" style="line-height: 1.6;">
+                Personality + identity live as plain-text files Clementine reads on every turn — edits take effect on your next message, no restart.
+                Open the <button type="button" class="settings-secondary" data-tools-jump="context" style="font-size: 10.5px; padding: 4px 10px; vertical-align: baseline;">CONTEXT TAB</button> to edit them, pick from preset starters (terse + proactive, warm + explanatory, quiet executor), or start from scratch.
+              </div>
+            </div>
+
+            <div class="settings-block">
               <div class="settings-block-head">MEMORY INDEX</div>
               <div class="settings-info" data-settings-memory>—</div>
             </div>
@@ -1287,6 +1308,55 @@ export function renderConsoleHtml(token: string): string {
               <div class="creds-footnote">
                 Reset only deletes entries under <code>com.clemmy.desktop.v1</code> and the local file vault.
                 Your <code>.env</code> is never touched.
+              </div>
+            </div>
+          </div>
+
+          <!--
+            Diagnostics block — hidden behind a "Show diagnostics" toggle
+            at the top, revealed in-place. Power-user surface only;
+            renders today's tool-event summary, recent errors, MCP server
+            health, and storage stats from /api/console/diagnostics.
+            Pure read; no buttons that modify state.
+          -->
+          <div class="settings-col" data-diagnostics-wrap>
+            <div class="settings-block">
+              <label class="settings-toggle">
+                <input type="checkbox" data-diagnostics-toggle />
+                <span>Show diagnostics</span>
+              </label>
+              <p class="settings-block-hint">
+                Read-only panel that summarizes today's tool calls, recent errors, and MCP server health.
+                Useful for diagnosing why a particular session was fast or slow without grepping logs.
+              </p>
+            </div>
+            <div class="settings-block" data-diagnostics-panel hidden>
+              <div class="settings-block-head">
+                DIAGNOSTICS
+                <button type="button" class="settings-btn-mini" data-diagnostics-refresh title="Refresh">↻</button>
+              </div>
+              <div class="diag-summary" data-diag-summary>
+                <div class="settings-info">— loading —</div>
+              </div>
+              <div class="diag-section" data-diag-tool-events hidden>
+                <div class="diag-section-head">TODAY'S TOOL EVENTS</div>
+                <div class="diag-tool-events-body" data-diag-tool-events-body></div>
+              </div>
+              <div class="diag-section" data-diag-sessions hidden>
+                <div class="diag-section-head">SESSIONS (most active)</div>
+                <div class="diag-sessions-body" data-diag-sessions-body></div>
+              </div>
+              <div class="diag-section" data-diag-mcp hidden>
+                <div class="diag-section-head">MCP SERVERS</div>
+                <div class="diag-mcp-body" data-diag-mcp-body></div>
+              </div>
+              <div class="diag-section" data-diag-errors hidden>
+                <div class="diag-section-head">RECENT WARN/ERROR (filtered)</div>
+                <div class="diag-errors-body" data-diag-errors-body></div>
+              </div>
+              <div class="diag-section" data-diag-storage hidden>
+                <div class="diag-section-head">STORAGE</div>
+                <div class="diag-storage-body" data-diag-storage-body></div>
               </div>
             </div>
           </div>
@@ -1627,6 +1697,25 @@ body {
   background: var(--accent-fail);
   box-shadow: 0 0 8px rgba(255, 59, 90, 0.6);
 }
+
+/* ── MCP server status pill (header) ─────────────────────────── */
+.mcp-stat {
+  cursor: pointer;
+  border: 1px solid var(--line);
+  background: transparent;
+  font: inherit;
+  font-size: 11px;
+  color: var(--fg-2);
+  padding: 2px 8px;
+  border-radius: 4px;
+  transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
+}
+.mcp-stat[hidden] { display: none; }
+.mcp-stat:hover { color: var(--fg); border-color: var(--fg-2); }
+.mcp-stat[data-state="ready"]      { color: var(--accent-2, #5cd66a); border-color: color-mix(in srgb, var(--accent-2, #5cd66a) 60%, transparent); }
+.mcp-stat[data-state="connecting"] { color: var(--accent, #ff8f3c); border-color: color-mix(in srgb, var(--accent, #ff8f3c) 60%, transparent); }
+.mcp-stat[data-state="degraded"]   { color: var(--accent-warn, #f7b733); border-color: color-mix(in srgb, var(--accent-warn, #f7b733) 60%, transparent); }
+.mcp-stat[data-state="down"]       { color: var(--accent-fail, #ff5a5f); border-color: color-mix(in srgb, var(--accent-fail, #ff5a5f) 60%, transparent); }
 
 /* ── Theme toggle ─────────────────────────────────────────────── */
 .theme-toggle {
@@ -4241,6 +4330,35 @@ body {
   color: var(--fg-mute);
   font-size: 10px;
 }
+.context-file-presets {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-2);
+  font-size: 10.5px;
+}
+.context-file-presets label {
+  color: var(--fg-3);
+  letter-spacing: 0.06em;
+  font-size: 9.5px;
+}
+.context-file-presets select {
+  flex: 1;
+  max-width: 360px;
+}
+.context-file-preset-hint {
+  color: var(--fg-3);
+  font-size: 10px;
+}
+.context-file-livehint {
+  padding: 6px 12px;
+  color: var(--fg-3);
+  font-size: 10px;
+  border-bottom: 1px solid var(--line);
+  font-style: italic;
+}
 .context-fact-form {
   display: grid;
   grid-template-columns: 120px 1fr auto;
@@ -6515,6 +6633,84 @@ body {
   border: 1px solid var(--line);
   background: var(--bg-2);
 }
+/* Diagnostics panel — additive only; renders read-only data from
+   /api/console/diagnostics. Same look as other settings blocks. */
+.settings-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 14px 16px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.settings-toggle input { cursor: pointer; }
+.settings-block-hint {
+  padding: 0 16px 14px;
+  margin: 0;
+  font-size: 11px;
+  color: var(--fg-3);
+}
+.settings-btn-mini {
+  float: right;
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-3);
+  width: 22px;
+  height: 22px;
+  cursor: pointer;
+  font-size: 11px;
+}
+.settings-btn-mini:hover { color: var(--fg); border-color: var(--fg-2); }
+.diag-summary {
+  padding: 12px 16px;
+  font-size: 11px;
+  color: var(--fg-2);
+  border-bottom: 1px dashed var(--line);
+}
+.diag-summary strong { color: var(--fg); }
+.diag-section { padding: 10px 16px; border-bottom: 1px dashed var(--line); }
+.diag-section:last-child { border-bottom: 0; }
+.diag-section-head {
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  color: var(--fg-3);
+  margin-bottom: 8px;
+}
+.diag-row {
+  display: grid;
+  grid-template-columns: 1fr 60px;
+  font-size: 11px;
+  padding: 3px 0;
+  gap: 8px;
+  color: var(--fg-2);
+}
+.diag-row em { color: var(--fg); font-style: normal; text-align: right; }
+.diag-session-row {
+  display: grid;
+  grid-template-columns: 1fr 60px 100px;
+  font-size: 11px;
+  padding: 4px 0;
+  gap: 8px;
+  color: var(--fg-2);
+  border-bottom: 1px solid var(--line);
+}
+.diag-session-row .diag-pattern { font-size: 10px; text-align: right; }
+.diag-pattern[data-p="batch"]        { color: var(--accent-2, #5cd66a); }
+.diag-pattern[data-p="per-row-loop"] { color: var(--accent-fail, #ff5a5f); }
+.diag-pattern[data-p="mixed"]        { color: var(--accent-warn, #f7b733); }
+.diag-pattern[data-p="small"]        { color: var(--fg-3); }
+.diag-error-row {
+  display: grid;
+  grid-template-columns: 60px 1fr;
+  gap: 8px;
+  font-size: 10.5px;
+  padding: 3px 0;
+  color: var(--fg-2);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+.diag-error-row .diag-level { font-weight: 600; }
+.diag-error-row .diag-level.error { color: var(--accent-fail, #ff5a5f); }
+.diag-error-row .diag-level.warn  { color: var(--accent-warn, #f7b733); }
 .settings-block-head {
   padding: 8px 14px;
   background: var(--bg-1);
@@ -10176,16 +10372,60 @@ const CONSOLE_JS = `
       ctx.files.innerHTML = '<div class="settings-info">— no context files found —</div>';
       return;
     }
-    ctx.files.innerHTML = files.map((file) => [
-      '<article class="context-file" data-context-file="' + escMem(file.key) + '">',
-      '  <div class="context-file-head">',
-      '    <div><div class="context-file-title">' + escMem(file.title) + '</div><div class="context-file-desc">' + escMem(file.description) + '</div></div>',
-      '    <div class="context-file-meta"><span>' + escMem(shortenPath(file.path || '')) + '</span><span class="' + (file.empty ? 'warn' : '') + '">' + (file.empty ? 'NEEDS COPY' : 'READY') + '</span><span>' + (file.bytes || 0) + ' bytes</span></div>',
-      '  </div>',
-      '  <textarea data-context-file-input="' + escMem(file.key) + '" rows="8" spellcheck="true">' + escMem(file.content || '') + '</textarea>',
-      '  <div class="context-file-actions"><span data-context-file-status="' + escMem(file.key) + '">saved state: ' + (file.empty ? 'thin' : 'ready') + '</span><button type="button" data-context-file-save="' + escMem(file.key) + '">SAVE ' + escMem(String(file.title || '').toUpperCase()) + '</button></div>',
-      '</article>',
-    ].join('')).join('');
+    // Stash presets per file key so the change-handler can look them
+    // up by index after the user selects from the dropdown.
+    const presetsByKey = {};
+    files.forEach((file) => { presetsByKey[file.key] = Array.isArray(file.presets) ? file.presets : []; });
+    ctx.files.innerHTML = files.map((file) => {
+      const presets = Array.isArray(file.presets) ? file.presets : [];
+      const presetDropdown = presets.length === 0 ? '' : [
+        '  <div class="context-file-presets">',
+        '    <label>STARTERS</label>',
+        '    <select data-context-file-preset="' + escMem(file.key) + '">',
+        '      <option value="">— pick a starter to populate the editor —</option>',
+        presets.map((p, i) => '      <option value="' + i + '">' + escMem(p.label) + '</option>').join('\\n'),
+        '    </select>',
+        '    <span class="context-file-preset-hint">Selecting one fills the editor — you still have to click SAVE.</span>',
+        '  </div>',
+      ].join('\\n');
+      const liveHint = (file.key === 'soul' || file.key === 'identity')
+        ? '  <div class="context-file-livehint">Loaded fresh into every conversation — saves take effect on your next message, no restart.</div>'
+        : '';
+      return [
+        '<article class="context-file" data-context-file="' + escMem(file.key) + '">',
+        '  <div class="context-file-head">',
+        '    <div><div class="context-file-title">' + escMem(file.title) + '</div><div class="context-file-desc">' + escMem(file.description) + '</div></div>',
+        '    <div class="context-file-meta"><span>' + escMem(shortenPath(file.path || '')) + '</span><span class="' + (file.empty ? 'warn' : '') + '">' + (file.empty ? 'NEEDS COPY' : 'READY') + '</span><span>' + (file.bytes || 0) + ' bytes</span></div>',
+        '  </div>',
+        presetDropdown,
+        '  <textarea data-context-file-input="' + escMem(file.key) + '" rows="8" spellcheck="true">' + escMem(file.content || '') + '</textarea>',
+        liveHint,
+        '  <div class="context-file-actions"><span data-context-file-status="' + escMem(file.key) + '">saved state: ' + (file.empty ? 'thin' : 'ready') + '</span><button type="button" data-context-file-save="' + escMem(file.key) + '">SAVE ' + escMem(String(file.title || '').toUpperCase()) + '</button></div>',
+        '</article>',
+      ].join('');
+    }).join('');
+    ctx.files.querySelectorAll('[data-context-file-preset]').forEach((sel) => {
+      sel.addEventListener('change', () => {
+        const key = sel.getAttribute('data-context-file-preset');
+        const idx = parseInt(sel.value, 10);
+        const preset = presetsByKey[key] && presetsByKey[key][idx];
+        if (!preset) return;
+        const input = ctx.files.querySelector('[data-context-file-input="' + key + '"]');
+        if (!input) return;
+        // Confirm only if there's existing user content — empty/whitespace
+        // files can be overwritten silently. Avoids the "did I lose work?"
+        // moment without making the experience noisy for first-run users.
+        const existing = (input.value || '').trim();
+        if (existing.length > 20 && !window.confirm('Replace your current ' + key + ' content with this starter? You can edit afterward — nothing saves until you click SAVE.')) {
+          sel.value = '';
+          return;
+        }
+        input.value = preset.body;
+        sel.value = '';
+        const status = ctx.files.querySelector('[data-context-file-status="' + key + '"]');
+        if (status) status.textContent = 'starter loaded — click SAVE to apply';
+      });
+    });
     ctx.files.querySelectorAll('[data-context-file-save]').forEach((btn) => {
       btn.addEventListener('click', async () => {
         const key = btn.getAttribute('data-context-file-save');
@@ -12327,6 +12567,37 @@ const CONSOLE_JS = `
     try { return localStorage.getItem('clementine.useHarness') !== '0'; } catch (_) { return true; }
   }
 
+  // Elapsed-time SEND button helpers — flip to disabled + live counter
+  // when a turn fires, restore on finish/error. The bare 'THINKING …'
+  // gave no time signal so the user couldn't tell whether the agent
+  // was 5 seconds or 5 minutes deep. After 5s of thinking we start
+  // showing seconds; after 60s we shift to "Nm Ns". The setInterval is
+  // returned so the caller can clear it in a finally{} block.
+  function startThinkingButton(sendBtn) {
+    if (!sendBtn) return null;
+    sendBtn.setAttribute('disabled', 'true');
+    const startedAt = Date.now();
+    const update = () => {
+      const elapsed = Math.floor((Date.now() - startedAt) / 1000);
+      if (elapsed < 5) {
+        sendBtn.textContent = 'THINKING …';
+      } else if (elapsed < 60) {
+        sendBtn.textContent = 'THINKING · ' + elapsed + 's';
+      } else {
+        const min = Math.floor(elapsed / 60);
+        const sec = elapsed % 60;
+        sendBtn.textContent = 'THINKING · ' + min + 'm ' + sec + 's';
+      }
+    };
+    update();
+    const timer = setInterval(update, 1000);
+    return timer;
+  }
+  function stopThinkingButton(sendBtn, timer) {
+    if (timer) { try { clearInterval(timer); } catch (_) {} }
+    if (sendBtn) { sendBtn.removeAttribute('disabled'); sendBtn.textContent = 'SEND ↵'; }
+  }
+
   /**
    * Route a chat message through the 0.3 harness:
    * POST /api/harness/chat returns 202 + sessionId + streamUrl, then
@@ -12349,7 +12620,7 @@ const CONSOLE_JS = `
     assistantTurn && assistantTurn.classList.add('pending');
     setChatTurnStatus(assistantTurn, 'starting harness run');
 
-    if (send) { send.setAttribute('disabled', 'true'); send.textContent = 'THINKING …'; }
+    const thinkTimer = startThinkingButton(send);
 
     try {
       const r = await fetch(withToken('/api/harness/chat'), {
@@ -12375,7 +12646,7 @@ const CONSOLE_JS = `
       return { ok: false };
     } finally {
       assistantTurn?.classList.remove('pending');
-      if (send) { send.removeAttribute('disabled'); send.textContent = 'SEND ↵'; }
+      stopThinkingButton(send, thinkTimer);
     }
   }
 
@@ -12475,6 +12746,14 @@ const CONSOLE_JS = `
 
       const connect = () => {
         if (closed) return;
+        // Defensive close — match the convention used by the other two
+        // EventSource sites in this file (sessionLive at line ~8395 and
+        // actions-stream at line ~16516). The error path at line ~12627
+        // already closes prior 'es' before re-scheduling, but if any
+        // future code path calls connect() while a prior es is still
+        // open (manual reconnect button, IPC trigger, etc.), this guard
+        // prevents the leaked-EventSource path the P1-10 audit flagged.
+        if (es) { try { es.close(); } catch (_) {} es = null; }
         const base = '/api/sessions/' + encodeURIComponent(sessionId) + '/events';
         const url = withToken(lastSeq > 0 ? base + '?sinceSeq=' + lastSeq : base);
         es = new EventSource(url);
@@ -12521,6 +12800,91 @@ const CONSOLE_JS = `
     });
   }
 
+  // Mirror of src/runtime/approval-summary.ts previewToolCall(), in
+  // pure JS so the chat dock can render rich status without needing
+  // the daemon to enrich tool_called events. Cap at ~70 chars. Falls
+  // back to the bare tool name if the args can't be parsed. Touched
+  // here ONLY for visibility — the existing setChatTurnStatus +
+  // onStatus paths still fire regardless.
+  function previewToolCallJS(toolName, argsRaw) {
+    if (!toolName) return 'tool';
+    let args = null;
+    if (argsRaw && typeof argsRaw === 'object') args = argsRaw;
+    else if (typeof argsRaw === 'string' && argsRaw.length > 0) {
+      try { args = JSON.parse(argsRaw); } catch (_) { args = null; }
+    }
+    if (!args || typeof args !== 'object') return toolName;
+    const MAX = 70;
+    const pick = (keys) => {
+      for (const k of keys) {
+        const v = args[k];
+        if (typeof v === 'string' && v.length > 0) return v;
+      }
+      return '';
+    };
+    const clip = (s, max) => {
+      const clean = String(s || '').replace(/\s+/g, ' ').trim();
+      return clean.length > max ? clean.slice(0, max - 1) + '…' : clean;
+    };
+    switch (toolName) {
+      case 'run_shell_command':
+      case 'shell': {
+        const cmd = pick(['command', 'cmd']);
+        return cmd ? 'running: ' + clip(cmd, MAX) : toolName;
+      }
+      case 'write_file':
+      case 'edit_file': {
+        const file = pick(['file_path', 'path', 'filePath']);
+        return file ? 'writing ' + clip(file, MAX) : toolName;
+      }
+      case 'read_file': {
+        const file = pick(['file_path', 'path', 'filePath']);
+        return file ? 'reading ' + clip(file, MAX) : toolName;
+      }
+      case 'composio_execute_tool': {
+        const slug = pick(['tool_slug', 'slug']);
+        return slug ? 'composio · ' + clip(slug, MAX - 10) : toolName;
+      }
+      case 'composio_search_tools': {
+        const q = pick(['query', 'q']);
+        return q ? 'searching composio · "' + clip(q, MAX - 22) + '"' : toolName;
+      }
+      case 'memory_recall':
+      case 'tool_choice_recall': {
+        const intent = pick(['intent', 'query', 'q']);
+        return intent ? 'recall · ' + clip(intent, MAX - 9) : toolName;
+      }
+      case 'memory_search': {
+        const q = pick(['query', 'q']);
+        return q ? 'memory search · "' + clip(q, MAX - 17) + '"' : toolName;
+      }
+      case 'draft_plan': {
+        const input = pick(['input', 'objective', 'goal']);
+        return input ? 'planning · ' + clip(input, MAX - 11) : toolName;
+      }
+      case 'notify_user':
+      case 'send_message':
+      case 'discord_channel_send':
+      case 'discord_dm': {
+        const t = pick(['title', 'subject']) || pick(['message', 'content', 'text', 'body']);
+        return t ? 'notify · ' + clip(t, MAX - 9) : toolName;
+      }
+      case 'send_email':
+      case 'gmail_send':
+      case 'outlook_send_email': {
+        const to = pick(['to', 'recipient']);
+        return to ? 'emailing ' + clip(to, MAX - 9) : toolName;
+      }
+      case 'request_approval': {
+        const subject = pick(['subject', 'reason']);
+        return subject ? 'requesting approval · ' + clip(subject, MAX - 22) : toolName;
+      }
+      default: {
+        return toolName;
+      }
+    }
+  }
+
   function renderHarnessEvent(ev, turn, options) {
     if (!ev || !ev.type) return;
     switch (ev.type) {
@@ -12529,7 +12893,17 @@ const CONSOLE_JS = `
         return;
       case 'tool_called': {
         const t = (ev.data && (ev.data.tool || ev.data.name)) || 'tool';
-        setChatTurnStatus(turn, 'using ' + t);
+        // Rich status line: "running: pwd && ls" beats "using
+        // run_shell_command" by a wide margin during the 7-call shell
+        // sequences that show up in skill execution. When the helper
+        // can't extract a useful field from args, it returns the
+        // bare tool name — in that fallback case we still prepend
+        // "using " so the user reads it as an in-progress action.
+        // The bare tool name stays as the secondary onStatus signal
+        // so any other listener (Activity panel, etc.) keeps working
+        // unchanged.
+        const preview = previewToolCallJS(t, ev.data && ev.data.arguments);
+        setChatTurnStatus(turn, preview === t ? 'using ' + t : preview);
         if (options && options.onStatus) options.onStatus('Using: ' + t, 'tool');
         return;
       }
@@ -12616,7 +12990,7 @@ const CONSOLE_JS = `
     const buttons = actions ? Array.from(actions.querySelectorAll('button')) : [button];
     const send = document.querySelector('.home-chat-send');
     buttons.forEach((btn) => { btn.disabled = true; });
-    if (send) { send.setAttribute('disabled', 'true'); send.textContent = 'THINKING …'; }
+    const thinkTimer = startThinkingButton(send);
     button.textContent = decision === 'approve' ? 'Approved' : 'Rejected';
     turn?.classList?.add('pending');
     setChatTurnStatus(turn, (decision === 'approve' ? 'approved' : 'rejected') + ' · continuing…');
@@ -12642,7 +13016,7 @@ const CONSOLE_JS = `
       alert('Could not resolve approval: ' + ((err && err.message) || err));
     } finally {
       turn?.classList?.remove('pending');
-      if (send) { send.removeAttribute('disabled'); send.textContent = 'SEND ↵'; }
+      stopThinkingButton(send, thinkTimer);
     }
   }
 
@@ -12690,7 +13064,7 @@ const CONSOLE_JS = `
     assistantTurn?.classList.add('pending');
     setChatTurnStatus(assistantTurn, 'starting local run');
 
-    if (send) { send.setAttribute('disabled', 'true'); send.textContent = 'THINKING …'; }
+    const thinkTimer = startThinkingButton(send);
     let streamedText = '';
     let finalText = '';
     let pendingApprovalId = null;
@@ -12778,7 +13152,7 @@ const CONSOLE_JS = `
       return { ok: false, text: err.message || String(err) };
     } finally {
       assistantTurn?.classList.remove('pending');
-      if (send) { send.removeAttribute('disabled'); send.textContent = 'SEND ↵'; }
+      stopThinkingButton(send, thinkTimer);
       const input = document.querySelector('[data-home-chat-input]');
       if (input) input.focus();
     }
@@ -15106,8 +15480,114 @@ const CONSOLE_JS = `
       await refreshProposals();
       await refreshCheckIns();
       await refreshCredentialsHealth();
+      // Wire the diagnostics toggle once. Idempotent — if Settings is
+      // re-booted (e.g. panel re-opened) the handler stays bound from
+      // the first call and we don't re-bind.
+      initDiagnosticsToggle();
     } catch (err) {
       sett.authBox.innerHTML = '<div style="color:var(--accent-fail);">Failed to load settings: ' + escMem(err.message || err) + '</div>';
+    }
+  }
+
+  // ─── Diagnostics (hidden behind "Show diagnostics" toggle) ──────
+  // Pure read of /api/console/diagnostics — no state changes. Lazy-
+  // loaded so the API isn't hit unless the user flips the toggle on.
+  let diagnosticsBound = false;
+  function initDiagnosticsToggle() {
+    if (diagnosticsBound) return;
+    const toggle = document.querySelector('[data-diagnostics-toggle]');
+    const panel = document.querySelector('[data-diagnostics-panel]');
+    const refresh = document.querySelector('[data-diagnostics-refresh]');
+    if (!toggle || !panel) return;
+    diagnosticsBound = true;
+    toggle.addEventListener('change', () => {
+      if (toggle.checked) {
+        panel.removeAttribute('hidden');
+        loadDiagnostics();
+      } else {
+        panel.setAttribute('hidden', '');
+      }
+    });
+    if (refresh) refresh.addEventListener('click', () => loadDiagnostics());
+  }
+
+  async function loadDiagnostics() {
+    const summaryEl = document.querySelector('[data-diag-summary]');
+    if (summaryEl) summaryEl.innerHTML = '<div class="settings-info">— loading —</div>';
+    try {
+      const data = await fetchJSON('/api/console/diagnostics');
+      renderDiagnostics(data);
+    } catch (err) {
+      if (summaryEl) summaryEl.innerHTML = '<div class="settings-info" style="color:var(--accent-fail);">Failed to load diagnostics: ' + escMem((err && err.message) || err) + '</div>';
+    }
+  }
+
+  function renderDiagnostics(data) {
+    const summaryEl = document.querySelector('[data-diag-summary]');
+    const toolsEl = document.querySelector('[data-diag-tool-events-body]');
+    const sessionsEl = document.querySelector('[data-diag-sessions-body]');
+    const mcpEl = document.querySelector('[data-diag-mcp-body]');
+    const errorsEl = document.querySelector('[data-diag-errors-body]');
+    const storageEl = document.querySelector('[data-diag-storage-body]');
+    const fmtBytes = (n) => n > 1024 * 1024 ? (n / 1024 / 1024).toFixed(1) + 'MB' : n > 1024 ? (n / 1024).toFixed(1) + 'KB' : n + 'B';
+
+    if (summaryEl) {
+      const t = data.toolEvents || {};
+      const m = (data.mcp && data.mcp.summary) || {};
+      summaryEl.innerHTML =
+        '<strong>' + (t.totalEvents || 0) + '</strong> tool events across <strong>' + (t.totalSessions || 0) + '</strong> sessions today · ' +
+        '<strong>' + (m.connected || 0) + '/' + (m.total || 0) + '</strong> MCP servers ready · ' +
+        '<strong>' + ((data.recentErrors || []).length) + '</strong> recent warn/error log lines';
+    }
+
+    const sections = [
+      ['data-diag-tool-events', toolsEl, (t = data.toolEvents) => t && t.byTool && t.byTool.length > 0],
+      ['data-diag-sessions',    sessionsEl, () => data.toolEvents && data.toolEvents.bySession && data.toolEvents.bySession.length > 0],
+      ['data-diag-mcp',         mcpEl, () => data.mcp && data.mcp.servers && data.mcp.servers.length > 0],
+      ['data-diag-errors',      errorsEl, () => (data.recentErrors || []).length > 0],
+      ['data-diag-storage',     storageEl, () => true],
+    ];
+    sections.forEach(([sel, _el, predicate]) => {
+      const section = document.querySelector('[' + sel + ']');
+      if (section) (predicate() ? section.removeAttribute('hidden') : section.setAttribute('hidden', ''));
+    });
+
+    if (toolsEl && data.toolEvents) {
+      toolsEl.innerHTML = (data.toolEvents.byTool || []).slice(0, 10).map((t) =>
+        '<div class="diag-row"><span>' + escMem(t.toolName) + '</span><em>' + t.count + '</em></div>'
+      ).join('') || '<div class="settings-info">— none today —</div>';
+    }
+
+    if (sessionsEl && data.toolEvents) {
+      sessionsEl.innerHTML = (data.toolEvents.bySession || []).slice(0, 8).map((s) => {
+        const range = s.firstAt && s.lastAt ? (s.firstAt.slice(11, 19) + '→' + s.lastAt.slice(11, 19)) : '—';
+        return '<div class="diag-session-row">' +
+          '<span title="' + escMem(s.sessionId) + '">' + escMem(s.sessionId.slice(0, 36)) + '</span>' +
+          '<em>' + s.eventCount + ' calls</em>' +
+          '<span class="diag-pattern" data-p="' + escMem(s.suspectedPattern) + '" title="' + range + '">' + escMem(s.suspectedPattern) + '</span>' +
+        '</div>';
+      }).join('') || '<div class="settings-info">— no sessions today —</div>';
+    }
+
+    if (mcpEl && data.mcp) {
+      mcpEl.innerHTML = (data.mcp.servers || []).map((s) =>
+        '<div class="diag-row"><span>' + escMem(s.slug) + ' · ' + escMem(s.state) + (s.lastError ? ' · ' + escMem(s.lastError.slice(0, 80)) : '') + '</span><em>' + s.toolCount + '</em></div>'
+      ).join('') || '<div class="settings-info">— no MCP servers configured —</div>';
+    }
+
+    if (errorsEl) {
+      errorsEl.innerHTML = (data.recentErrors || []).slice(-20).map((e) =>
+        '<div class="diag-error-row"><span class="diag-level ' + e.level + '">' + e.level.toUpperCase() + '</span><span>' + escMem(e.source) + ' · ' + escMem(e.message) + '</span></div>'
+      ).join('') || '<div class="settings-info">— no warnings or errors recorded —</div>';
+    }
+
+    if (storageEl && data.storage) {
+      const st = data.storage;
+      storageEl.innerHTML =
+        '<div class="diag-row"><span>base dir</span><em title="' + escMem(st.baseDir) + '">' + escMem(st.baseDir.slice(-40)) + '</em></div>' +
+        '<div class="diag-row"><span>supervisor.log</span><em>' + fmtBytes(st.supervisorLogSizeBytes) + '</em></div>' +
+        '<div class="diag-row"><span>tool-events (today)</span><em>' + fmtBytes(st.toolEventsTodayBytes) + '</em></div>' +
+        '<div class="diag-row"><span>state JSON files</span><em>' + st.stateJsonCount + '</em></div>';
     }
   }
 
@@ -16168,6 +16648,11 @@ const CONSOLE_JS = `
       }
       const state = recBtn.getAttribute('data-state') || 'idle';
       if (state === 'recording') {
+        // Optimistic UI flip — don't make the user stare at "STOP
+        // RECORDING" for 2-3 seconds while the next refreshDockLive
+        // poll catches up to reality. If the stop call fails, the
+        // subsequent refresh will undo the flip.
+        recLbl.textContent = 'STOPPING…';
         recBtn.setAttribute('disabled', '');
         try {
           await window.clemmy.recallStop();
@@ -16183,6 +16668,11 @@ const CONSOLE_JS = `
       // Confirm only the start side — stopping mid-meeting should be
       // one click since the user can always restart.
       if (!confirm('Start recording this meeting?\\nMake sure participants are aware where required.')) return;
+      // Optimistic UI flip — show STARTING immediately so the user
+      // knows their click registered. The next refreshDockLive (which
+      // we kick after the IPC resolves) replaces this with the real
+      // state ("STOP RECORDING" + pulsing dot).
+      recLbl.textContent = 'STARTING…';
       recBtn.setAttribute('disabled', '');
       try {
         await window.clemmy.recallStartManual();
@@ -16281,6 +16771,65 @@ const CONSOLE_JS = `
   refreshNavDock();
   setInterval(refreshNavDock, 5000);
 
+  // MCP server health pill in the header. Polls a lightweight endpoint
+  // (in-memory registry, no disk I/O) every 3s so the user can see at
+  // a glance which servers are ready vs still connecting vs down. The
+  // pill is hidden when zero MCP servers are configured (most fresh
+  // installs). One-click jumps to Settings → MCP Servers so the user
+  // can reconnect / remove a broken server.
+  async function refreshMcpStat() {
+    const btn = document.querySelector('[data-stat-mcp]');
+    const label = document.querySelector('[data-stat-mcp-label]');
+    if (!btn || !label) return;
+    try {
+      const data = await fetchJSON('/api/console/mcp/health');
+      const summary = data?.summary || {};
+      const total = Number(summary.total ?? 0);
+      if (total === 0) {
+        btn.setAttribute('hidden', '');
+        return;
+      }
+      btn.removeAttribute('hidden');
+      const connected = Number(summary.connected ?? 0);
+      const connecting = Number(summary.connecting ?? 0);
+      const degraded = Number(summary.degraded ?? 0);
+      const unavailable = Number(summary.unavailable ?? 0);
+      // Build label + colour state based on the worst-case server.
+      // Order matters: down > degraded > connecting > ready.
+      let state = 'ready';
+      let text = total + ' READY';
+      if (unavailable > 0) {
+        state = 'down';
+        text = unavailable + ' DOWN · ' + connected + '/' + total + ' READY';
+      } else if (degraded > 0) {
+        state = 'degraded';
+        text = connected + '/' + total + ' READY · ' + degraded + ' ⚠';
+      } else if (connecting > 0) {
+        state = 'connecting';
+        text = connecting > 1
+          ? connecting + ' CONNECTING…'
+          : '1 CONNECTING…';
+        if (connected > 0) text = connected + '/' + total + ' READY · ' + connecting + ' CONNECTING…';
+      }
+      btn.setAttribute('data-state', state);
+      label.textContent = text;
+      const tooltip = (data?.servers || []).map((s) => s.slug + ' · ' + s.state + ' · ' + s.toolCount + ' tools').join('\\n');
+      btn.setAttribute('title', tooltip || 'MCP server health');
+    } catch (err) {
+      // Endpoint might not exist on an older daemon dist — hide rather
+      // than show "ERR", to keep the header clean.
+      btn.setAttribute('hidden', '');
+    }
+  }
+  const mcpBtn = document.querySelector('[data-stat-mcp]');
+  if (mcpBtn) {
+    mcpBtn.addEventListener('click', () => {
+      if (typeof switchPanel === 'function') switchPanel('integrations');
+    });
+  }
+  refreshMcpStat();
+  setInterval(refreshMcpStat, 3000);
+
   // ─── SSE-driven activity refresh ───────────────────────────────
   //
   // The standalone "LIVE" rail was removed (it caused routing confusion
@@ -16303,10 +16852,18 @@ const CONSOLE_JS = `
 
     // Coalesce bursts of events so a tool-call storm doesn't pummel
     // /api/dashboard. We schedule at most one tick() per 600ms window.
+    // Also refreshes the dock-live card so the RECORD MEETING button
+    // flips to RECORDING immediately on click (previously had to wait
+    // for the slow refreshDockLive poll). refreshDockLive() is a
+    // function defined earlier in this IIFE.
     let pending = null;
     function scheduleRefresh() {
       if (pending) return;
-      pending = setTimeout(() => { pending = null; try { tick(); } catch (_) {} }, 600);
+      pending = setTimeout(() => {
+        pending = null;
+        try { tick(); } catch (_) {}
+        try { if (typeof refreshDockLive === 'function') refreshDockLive(); } catch (_) {}
+      }, 600);
     }
 
     let es = null;

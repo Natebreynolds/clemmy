@@ -146,6 +146,11 @@ function emitBackgroundTaskCheckIn(
     progressCheckIns: (task.progressCheckIns ?? 0) + 1,
   }) ?? task;
 
+  // All check-ins — task started, tool-progress heartbeats, cancellation
+  // pings — are dashboard-only. The completed notification (which carries
+  // the actual analysis result) is dispatched separately and stays loud
+  // so Discord/email get the actually-useful signal without the burst
+  // of lifecycle pings for every tool call along the way.
   addNotification({
     id: `${Date.now()}-background-${task.id}-checkin-${updated.progressCheckIns ?? 1}`,
     kind: 'execution',
@@ -153,6 +158,7 @@ function emitBackgroundTaskCheckIn(
     body: input.body,
     createdAt: now,
     read: false,
+    silent: true,
     metadata: taskNotificationMetadata(updated, {
       runId: input.runId,
       ...(input.metadata ?? {}),
@@ -213,6 +219,10 @@ export function createBackgroundTask(input: CreateBackgroundTaskInput): Backgrou
     resumedFromTaskId: input.resumedFromTaskId,
   };
   writeTask(task);
+  // Dashboard-only — the queued ping is useful in the Activity panel
+  // but pushes pure noise to Discord since the task hasn't done
+  // anything yet. The "completed" notification (which has the actual
+  // result) is the one external destinations should see.
   addNotification({
     id: `${Date.now()}-background-${task.id}-queued`,
     kind: 'execution',
@@ -220,6 +230,7 @@ export function createBackgroundTask(input: CreateBackgroundTaskInput): Backgrou
     body: `Task ${task.id} is queued and will run in the daemon loop.`,
     createdAt,
     read: false,
+    silent: true,
     metadata: taskNotificationMetadata(task),
   });
   return task;

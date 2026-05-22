@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { isKillRequested } from './eventlog.js';
 import { getHarnessBudgetSettings } from './budget-settings.js';
+import { listPending as listPendingApprovals } from './approval-registry.js';
 
 /**
  * Reliability brackets — the safety primitives the harness loop weaves
@@ -214,17 +215,52 @@ export class TokenBudgetTracker {
  * on expiry. The underlying work continues in the background — we just
  * stop waiting; callers are responsible for any abort signal they wire
  * into the tool itself.
+ *
+ * Approval-pause awareness (added v0.5.5): the SDK pauses the tool
+ * BEFORE its execute body runs when the approval registry has a
+ * pending row for this session — i.e. the timer was started but the
+ * tool isn't actually doing work. Without this guard, a tool parked
+ * on approval for > timeoutMs (60s default, 10min for shell) throws
+ * ToolTimeout, dropping the run. With it: when the timer fires, we
+ * consult `options.isPaused()`. If true, we re-arm for another window
+ * (default 30s) and trust the approval registry; the user's "think
+ * time" stops blocking the timeout entirely. If false, we throw as
+ * before. Existing callers (MCP connect/list at mcp-namespace-shim
+ * lines 338/387) don't pass options and get unchanged behavior.
  */
-export function withTimeout<T>(work: Promise<T>, ms: number, toolName: string): Promise<T> {
+export function withTimeout<T>(
+  work: Promise<T>,
+  ms: number,
+  toolName: string,
+  options?: { isPaused?: () => boolean; pauseRecheckMs?: number },
+): Promise<T> {
+  const pauseRecheckMs = options?.pauseRecheckMs ?? 30_000;
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new ToolTimeout(toolName, ms)), ms);
+    let settled = false;
+    const fireOrDefer = (): void => {
+      if (settled) return;
+      // Approval pause check — if the registry shows a pending
+      // approval for this session, the tool is parked, not stuck.
+      // Re-arm without throwing. The reaper handles stale approvals
+      // on its own schedule (see [[project_long_running_audit]]) —
+      // if the registry is broken and reports pending forever, that's
+      // a separate bug we don't compensate for here.
+      let paused = false;
+      try { paused = options?.isPaused?.() ?? false; } catch { paused = false; }
+      if (paused) {
+        setTimeout(fireOrDefer, pauseRecheckMs).unref?.();
+        return;
+      }
+      reject(new ToolTimeout(toolName, ms));
+    };
+    setTimeout(fireOrDefer, ms).unref?.();
     work.then(
       (value) => {
-        clearTimeout(timer);
+        settled = true;
         resolve(value);
       },
       (err: unknown) => {
-        clearTimeout(timer);
+        settled = true;
         reject(err);
       },
     );
@@ -409,13 +445,36 @@ export function wrapToolForHarness<T extends WrappableTool>(
     //    against the tool promise; on expiry it throws ToolTimeout
     //    (the inner work continues unaborted — tools wire their own
     //    AbortSignal if they want to cancel cleanly).
+    //
+    // Approval-aware (v0.5.5): when the SDK pauses this tool waiting
+    // on user approval, the timer was ALREADY started — left to its
+    // own devices it would throw ToolTimeout 60 seconds in even though
+    // the tool is parked. The isPaused callback consults the approval
+    // registry at fire time. If a pending approval exists for this
+    // session, the timeout defers (re-arms) instead of throwing.
     const timeoutMs = options.timeoutMs
       ?? ctx?.defaultTimeoutMs
       ?? timeoutForTool(tool.name);
+    const sessionId = ctx?.sessionId;
+    const isPaused = sessionId
+      ? () => {
+          try {
+            const pending = listPendingApprovals({ sessionId, status: 'pending' });
+            return pending.length > 0;
+          } catch {
+            // If the registry is unavailable, fall back to old behavior
+            // (don't defer) so timeouts still fire for genuinely stuck
+            // tools — better to err on the side of dropping the run than
+            // hanging forever.
+            return false;
+          }
+        }
+      : undefined;
     return withTimeout(
       (async () => originalExecute(input, runContext))(),
       timeoutMs,
       tool.name,
+      { isPaused },
     );
   };
   return { ...tool, execute: wrappedExecute };

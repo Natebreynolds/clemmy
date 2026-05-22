@@ -143,6 +143,8 @@ import {
   type RecallRegion,
 } from '../integrations/recall/meeting-capture.js';
 import { startCanonicalTranscriptBackfill } from '../integrations/recall/backfill.js';
+import { listMcpServerHealth } from '../runtime/mcp-namespace-shim.js';
+import { collectDiagnostics } from './diagnostics.js';
 import {
   findCatalogEntry,
   forgetConnectedCli,
@@ -186,7 +188,83 @@ interface ContextFileDefinition {
   description: string;
   filePath: string;
   minUsefulChars: number;
+  /**
+   * Optional starter templates the dashboard surfaces in a dropdown
+   * next to the editor. Picking one populates the textarea (the user
+   * still has to click SAVE). Lets first-time users go from blank
+   * file to working personality in one click. See renderContextFiles
+   * in console.ts for the UI.
+   */
+  presets?: Array<{ label: string; body: string }>;
 }
+
+const SOUL_PRESETS = [
+  {
+    label: 'Terse + proactive — offer the next action',
+    body: `# Soul
+
+Clementine is sharp, practical, and aligned to me.
+
+## How to reply
+
+- After listing items needing action, end with ONE concrete offer for the most urgent one. "Want me to draft a reply to Gina?" beats "let me know if you want help."
+- Bullet points are fine for surveying items, but the bullets are the warm-up — the follow-up offer is the close.
+- When the next action is obvious (email → reply, meeting → schedule, doc → review), propose the specific action. Don't ask "what would you like me to do."
+- One offer per reply. Pick the most urgent.
+- Match my terseness in the OFFER. "Draft a reply to Gina?" not "Would you like me to compose a thoughtful response to Gina regarding her recent email?"
+`,
+  },
+  {
+    label: 'Warm + explanatory — walk me through your reasoning',
+    body: `# Soul
+
+Clementine is thoughtful, conversational, and aligned to me.
+
+## How to reply
+
+- When making a non-trivial decision, briefly explain WHY before showing the result. Two sentences max. "I checked X first because Y — here's what I found."
+- Acknowledge context: if I'm asking about a project, reference the relevant fact you remember. Don't repeat back at length — just signal continuity ("from the Scorpion thread —").
+- Tone is professional-warm. Not casual, not robotic.
+- When you're unsure between two paths, surface the tradeoff briefly and ask, instead of guessing.
+`,
+  },
+  {
+    label: 'Quiet executor — output only the result',
+    body: `# Soul
+
+Clementine is precise and quiet.
+
+## How to reply
+
+- Skip preambles. Skip "Sure" / "I'll get on that" / "Here's what I found." Output only the result or the next required question.
+- No bullet lists unless I asked for a list.
+- No "let me know if you need anything else" closers.
+- When something fails, one line: what failed and why. No apology, no padding.
+- When approval is needed, the question is the entire reply.
+`,
+  },
+];
+
+const IDENTITY_PRESETS = [
+  {
+    label: 'Personal productivity assistant',
+    body: `# Identity
+
+Clementine is my personal productivity assistant. She knows my work context, takes initiative on routine ops, and surfaces what matters before I have to ask.
+
+She does not pretend to know things she doesn't — she searches memory, checks tools, or asks. She acts on my behalf within the boundaries of the approval policy.
+`,
+  },
+  {
+    label: 'Senior executive partner',
+    body: `# Identity
+
+Clementine acts as a senior executive partner — proactive, candid, with strong opinions about priorities. She doesn't just complete tasks; she questions whether the task is the right one.
+
+She tells me when something doesn't add up, when a workflow is fragile, or when I'm about to repeat a pattern that didn't work last time.
+`,
+  },
+];
 
 const CONTEXT_FILES: ContextFileDefinition[] = [
   {
@@ -195,13 +273,15 @@ const CONTEXT_FILES: ContextFileDefinition[] = [
     description: 'Who the user is, what Clementine should know about them, and the durable north-star context.',
     filePath: IDENTITY_FILE,
     minUsefulChars: 80,
+    presets: IDENTITY_PRESETS,
   },
   {
     key: 'soul',
-    title: 'Core Personality',
-    description: 'The assistant persona: judgment, tone, operating style, and behavioral principles.',
+    title: 'Personality',
+    description: 'How Clementine talks to you: tone, reply shape, when to offer next actions. Loaded fresh on every turn — edits take effect on your next message.',
     filePath: SOUL_FILE,
     minUsefulChars: 120,
+    presets: SOUL_PRESETS,
   },
   {
     key: 'memory',
@@ -290,6 +370,10 @@ function readContextFile(def: ContextFileDefinition): Record<string, unknown> {
     usefulChars,
     empty: usefulChars < def.minUsefulChars,
     content,
+    // Surface presets to the dashboard so the editor can offer a
+    // one-click starter dropdown. Empty array if the file has no
+    // presets configured (working memory + long-term memory don't).
+    presets: def.presets ?? [],
   };
 }
 
@@ -1998,6 +2082,59 @@ export function registerConsoleRoutes(
   });
 
   /**
+   * Returns a snapshot of "is Clementine actively working right now?"
+   * Used by the desktop auto-updater to decide whether `quitAndInstall`
+   * would interrupt user work. Counts:
+   *   - Non-chat sessions with status active/paused (workflow + execution + agent)
+   *   - Pending harness approvals
+   *   - Background tasks in flight (running / pending / awaiting_approval)
+   *
+   * Chat sessions are excluded — they stay `active` between turns by
+   * design (see project_session_status_semantics) and would otherwise
+   * always block the update. A multi-hour workflow IS something we
+   * want to preserve; a quiet chat dock isn't.
+   */
+  app.get('/api/console/active-work', (_req, res) => {
+    // Intentionally unauthenticated — same daemon, local-only, used by
+    // the desktop process (which doesn't carry the webhook token by
+    // default for this lightweight probe). The endpoint returns counts,
+    // not user data, so the surface is minimal.
+    try {
+      const activeNonChatSessions = listHarnessSessions({
+        kind: ['workflow', 'execution', 'agent'],
+        status: ['active', 'paused'],
+        limit: 100,
+      });
+      const pendingApprovals = approvalRegistry.listPending({ status: 'pending' });
+      const activeBackgroundTasks = listBackgroundTasks().filter(
+        (task) => task.status === 'running' || task.status === 'pending' || task.status === 'awaiting_approval',
+      );
+      const total = activeNonChatSessions.length + pendingApprovals.length + activeBackgroundTasks.length;
+      // Build a human-readable summary for the auto-updater dialog so
+      // the user sees what's at stake before choosing "Install anyway."
+      const summaryParts: string[] = [];
+      if (activeNonChatSessions.length > 0) {
+        summaryParts.push(`${activeNonChatSessions.length} workflow${activeNonChatSessions.length === 1 ? '' : 's'} running`);
+      }
+      if (pendingApprovals.length > 0) {
+        summaryParts.push(`${pendingApprovals.length} pending approval${pendingApprovals.length === 1 ? '' : 's'}`);
+      }
+      if (activeBackgroundTasks.length > 0) {
+        summaryParts.push(`${activeBackgroundTasks.length} background task${activeBackgroundTasks.length === 1 ? '' : 's'}`);
+      }
+      res.json({
+        total,
+        activeSessions: activeNonChatSessions.length,
+        pendingApprovals: pendingApprovals.length,
+        activeBackgroundTasks: activeBackgroundTasks.length,
+        summary: summaryParts.join(', ') || 'no active work',
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
    * Recent tool events for the nav-dock RECENT card. Reads today's
    * NDJSON file (from src/agents/tool-observability.ts) and returns
    * the last N events newest-first.
@@ -2659,6 +2796,46 @@ export function registerConsoleRoutes(
       const discovered = discoverMcpServers();
       const user = loadUserMcpServers();
       res.json({ servers: discovered, userOverrides: user });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * Read-only diagnostics endpoint behind the Settings "Show
+   * diagnostics" toggle. Returns today's tool-event summary, recent
+   * supervisor.log errors (filtered to drop noisy updater XML dumps),
+   * and MCP server health. Pure read — no state changes.
+   */
+  app.get('/api/console/diagnostics', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      res.json(collectDiagnostics());
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * Live MCP server health snapshot — drives the dashboard's status
+   * pill in the header. Fast (no disk I/O — reads an in-memory
+   * registry maintained by the namespace shim), safe to poll every
+   * 2-3 seconds. Returns per-server slug, name, connection state, and
+   * the count of tools the server has surfaced. The dashboard
+   * renders a one-glance summary like "MCP · 3 ready · 1 connecting · 1 down".
+   */
+  app.get('/api/console/mcp/health', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const servers = listMcpServerHealth();
+      const summary = {
+        total: servers.length,
+        connected: servers.filter((s) => s.state === 'connected').length,
+        connecting: servers.filter((s) => s.state === 'connecting').length,
+        degraded: servers.filter((s) => s.state === 'degraded').length,
+        unavailable: servers.filter((s) => s.state === 'unavailable').length,
+      };
+      res.json({ servers, summary });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

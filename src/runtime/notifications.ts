@@ -97,6 +97,16 @@ export interface NotificationRecord {
   deliveryAttempts?: number;
   deliveryError?: string;
   deliveredDestinations?: string[];
+  /**
+   * When true, the notification is recorded for the dashboard but NOT
+   * pushed to external destinations (Discord, webhooks, email). Use
+   * this for high-volume lifecycle events — "Background task queued",
+   * "task heartbeat", "tool call observed" — that fill the dashboard's
+   * Activity panel with useful signal but spam channels like Discord
+   * with no substance. The "completed" notification (which carries
+   * the actual result) is the one that should hit external channels.
+   */
+  silent?: boolean;
 }
 
 export interface NotificationDestination {
@@ -216,17 +226,24 @@ export function addNotification(item: NotificationRecord): void {
   items.push(item);
   saveNotifications(items);
 
-  const queue = loadDeliveryQueue();
-  queue.push({
-    notificationId: item.id,
-    queuedAt: new Date().toISOString(),
-    completedDestinationIds: [],
-    failedDestinationIds: [],
-    attemptCountByDestination: {},
-    nextAttemptAtByDestination: {},
-    lastErrorByDestination: {},
-  });
-  saveDeliveryQueue(queue);
+  // Silent notifications are dashboard-only: skip the delivery queue so
+  // we don't fan out lifecycle pings (queued / started / heartbeat /
+  // tool-progress) to Discord and other external destinations. They
+  // still land in notifications.json so the Activity panel sees them,
+  // and the actionBus emit below still fires for live dashboard updates.
+  if (!item.silent) {
+    const queue = loadDeliveryQueue();
+    queue.push({
+      notificationId: item.id,
+      queuedAt: new Date().toISOString(),
+      completedDestinationIds: [],
+      failedDestinationIds: [],
+      attemptCountByDestination: {},
+      nextAttemptAtByDestination: {},
+      lastErrorByDestination: {},
+    });
+    saveDeliveryQueue(queue);
+  }
 
   actionBus.emit({ kind: 'notification.created', notification: item });
 }

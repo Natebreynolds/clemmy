@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import type { SecretBackend, SecretName } from './types.js';
 import { getSecretDescriptor } from './registry.js';
 
@@ -43,9 +44,10 @@ function readEnvFile(filePath: string): Record<string, string> {
 
 function packageDir(): string {
   // src/runtime/secrets/env-store.ts → up three levels to package root.
-  // import.meta.url isn't always set in the way we want; use the same
-  // resolution config.ts uses by walking up from this file.
-  const here = path.dirname(new URL(import.meta.url).pathname);
+  // fileURLToPath (not .pathname) so spaces and unicode in install
+  // paths get decoded properly — otherwise .env discovery fails for
+  // users whose home dir or app path contains percent-encoded chars.
+  const here = path.dirname(fileURLToPath(import.meta.url));
   return path.resolve(here, '..', '..', '..');
 }
 

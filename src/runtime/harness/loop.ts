@@ -1005,16 +1005,17 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
         toolCalls: toolCounter.currentCount,
       },
     });
-    // Chat sessions are inherently multi-turn — the user will type
-    // again. Marking them 'completed' at turn-end strands the chat
-    // dock on "THINKING…" forever (the frontend sees no event past the
-    // last reply because the session is no longer accepting new
-    // turns). Workflow / execution / agent sessions ARE one-shot here,
-    // so the original semantics hold for them. The conversation_completed
-    // event still fires for both — that's how the chat dock learns the
-    // turn ended; the session staying 'active' just keeps the door
-    // open for the next user message.
-    if (session.sessionRow.kind !== 'chat') {
+    // Chat sessions stay 'active' between turns (inherently multi-turn).
+    // Workflow / execution / agent sessions normally flip to 'completed'
+    // here BUT not if approvals are still pending — `markStatus('completed')`
+    // mid-approval was the root cause behind reaper false-reaps + the
+    // status-drift bug surfaced in P0-4. The reaper guards I shipped in
+    // v0.5.2 (90s grace + interrupt-state check) are workarounds; this
+    // is the actual fix. The conversation_completed event still fires
+    // for both branches — that's how the chat dock learns the turn
+    // ended; the session staying 'active' just keeps the door open for
+    // the next user message or approval resolution.
+    if (session.sessionRow.kind !== 'chat' && !approvalRegistry.hasPending(options.sessionId)) {
       session.markStatus('completed');
     }
     bumpTurnNumber(options.sessionId, turn);
@@ -1318,16 +1319,17 @@ export async function resumePendingApproval(
         toolCalls: toolCounter.currentCount,
       },
     });
-    // Chat sessions are inherently multi-turn — the user will type
-    // again. Marking them 'completed' at turn-end strands the chat
-    // dock on "THINKING…" forever (the frontend sees no event past the
-    // last reply because the session is no longer accepting new
-    // turns). Workflow / execution / agent sessions ARE one-shot here,
-    // so the original semantics hold for them. The conversation_completed
-    // event still fires for both — that's how the chat dock learns the
-    // turn ended; the session staying 'active' just keeps the door
-    // open for the next user message.
-    if (session.sessionRow.kind !== 'chat') {
+    // Chat sessions stay 'active' between turns (inherently multi-turn).
+    // Workflow / execution / agent sessions normally flip to 'completed'
+    // here BUT not if approvals are still pending — `markStatus('completed')`
+    // mid-approval was the root cause behind reaper false-reaps + the
+    // status-drift bug surfaced in P0-4. The reaper guards I shipped in
+    // v0.5.2 (90s grace + interrupt-state check) are workarounds; this
+    // is the actual fix. The conversation_completed event still fires
+    // for both branches — that's how the chat dock learns the turn
+    // ended; the session staying 'active' just keeps the door open for
+    // the next user message or approval resolution.
+    if (session.sessionRow.kind !== 'chat' && !approvalRegistry.hasPending(options.sessionId)) {
       session.markStatus('completed');
     }
     bumpTurnNumber(options.sessionId, turn);

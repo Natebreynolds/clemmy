@@ -520,18 +520,47 @@ function emitNoDestinationsPromptIfNeeded(deferredCount: number): void {
   });
 }
 
-function staleApprovalNotificationReason(notification: NotificationRecord): string | null {
+function staleApprovalNotificationReason(
+  notification: NotificationRecord,
+  assistant: ClementineAssistant,
+): string | null {
   if (notification.kind !== 'approval') return null;
   const approvalId = notification.metadata?.approvalId;
   if (typeof approvalId !== 'string' || approvalId.length === 0) return null;
+  // First check the harness sqlite registry — this catches every harness
+  // approval (apr-* IDs from request_approval, composio_execute_tool,
+  // write_file, etc.) generated from the orchestrator path.
   const approval = approvalRegistry.get(approvalId);
-  if (!approval) return 'approval_not_found';
-  if (approvalRegistry.isExpired(approval)) return 'approval_expired';
-  if (approval.status !== 'pending') return `approval_${approval.status}`;
-  return null;
+  if (approval) {
+    if (approvalRegistry.isExpired(approval)) return 'approval_expired';
+    if (approval.status !== 'pending') return `approval_${approval.status}`;
+    return null;
+  }
+  // Fallback to the codex-native runtime's in-memory ApprovalStore. This
+  // is where background tasks (meeting-capture analysis, summarizers,
+  // anything spawned through codex-native-runtime) park their approvals
+  // — UUID-style IDs, NOT in the sqlite registry. Without this branch,
+  // the prior call to approvalRegistry.get() returned undefined and the
+  // delivery loop silently skipped the notification as 'approval_not_found',
+  // so Nathan never saw Discord buttons for bg-task write_file approvals.
+  try {
+    const runtimeApproval = assistant
+      .getRuntime()
+      .listPendingApprovals()
+      .find((row) => row.id === approvalId);
+    if (runtimeApproval) {
+      if (runtimeApproval.status !== 'pending') return `approval_${runtimeApproval.status}`;
+      return null;
+    }
+  } catch {
+    // If the runtime isn't queryable, fall through to 'approval_not_found'
+    // — same as before — so we don't loop a notification forever waiting
+    // on a runtime that may have been replaced.
+  }
+  return 'approval_not_found';
 }
 
-async function processNotificationDeliveries(): Promise<void> {
+async function processNotificationDeliveries(assistant: ClementineAssistant): Promise<void> {
   const queue = listQueuedNotificationDeliveries();
   if (queue.length === 0) return;
 
@@ -543,7 +572,7 @@ async function processNotificationDeliveries(): Promise<void> {
       continue;
     }
 
-    const staleApprovalReason = staleApprovalNotificationReason(notification);
+    const staleApprovalReason = staleApprovalNotificationReason(notification, assistant);
     if (staleApprovalReason) {
       markNotificationRead(notification.id);
       updateNotificationDeliveryStatus(notification.id, {
@@ -753,7 +782,7 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
   const deliveryTimer = setInterval(() => {
     if (deliveryInFlight) return;
     deliveryInFlight = true;
-    processNotificationDeliveries()
+    processNotificationDeliveries(assistant)
       .catch((err) => {
         logger.warn(
           { err: err instanceof Error ? err.message : String(err) },
