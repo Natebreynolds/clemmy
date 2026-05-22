@@ -171,7 +171,14 @@ export const DISCORD_ENABLED = getEnv('DISCORD_ENABLED', 'false').toLowerCase() 
 // of the v0.2 gateway. Off by default so the desktop release ships the
 // stable path and we can flip per-deployment.
 export const DISCORD_HARNESS_ENABLED = getEnv('DISCORD_HARNESS_ENABLED', 'false').toLowerCase() === 'true';
-export const DISCORD_BOT_TOKEN = getEnv('DISCORD_BOT_TOKEN', '');
+// Vault fallback matches WEBHOOK_SECRET / OPENAI_API_KEY pattern — when
+// the user saves their bot token via the credentials UI it lands in
+// secrets-vault.json, NOT in .env. Without this fallback the daemon
+// reads only process.env and the bot stays offline even after restart.
+// Reported 2026-05-22: buddy added token via Integrations panel, saw
+// status "CONNECTED file", restarted Clementine — bot still showed as
+// offline because DISCORD_BOT_TOKEN was the empty string.
+export const DISCORD_BOT_TOKEN = getEnv('DISCORD_BOT_TOKEN', '') || readSecretFromFileVaultSync('discord_bot_token') || '';
 export const DISCORD_CLIENT_ID = getEnv('DISCORD_CLIENT_ID', '');
 export const DISCORD_REQUIRE_MENTION = getEnv('DISCORD_REQUIRE_MENTION', 'true').toLowerCase() === 'true';
 export const DISCORD_DM_ALLOWED_USERS = getEnv('DISCORD_DM_ALLOWED_USERS', '')
