@@ -378,6 +378,13 @@ export interface ConnectedCliRecord {
 interface ConnectedClisFile {
   version: 'v1';
   entries: Record<string, ConnectedCliRecord>;
+  /**
+   * Catalog ids the user EXPLICITLY chose to disconnect. We track this
+   * so autoPromoteInstalledClis() doesn't immediately re-promote a CLI
+   * the user just told us to forget. Empty/absent on fresh installs.
+   * Cleared per-id when the user clicks Reconnect.
+   */
+  forgotten?: string[];
 }
 
 export function readConnectedClis(): Record<string, ConnectedCliRecord> {
@@ -389,10 +396,27 @@ export function readConnectedClis(): Record<string, ConnectedCliRecord> {
   return {};
 }
 
-function writeConnectedClis(entries: Record<string, ConnectedCliRecord>): void {
+/** Same file as readConnectedClis but returns the forgotten ids list.
+ *  Kept as a separate function so callers don't have to know about the
+ *  full file shape. Returns [] when file is missing or malformed. */
+export function readForgottenCliIds(): string[] {
+  if (!existsSync(CONNECTED_FILE)) return [];
+  try {
+    const parsed = JSON.parse(readFileSync(CONNECTED_FILE, 'utf-8')) as ConnectedClisFile;
+    return Array.isArray(parsed.forgotten) ? parsed.forgotten : [];
+  } catch { return []; }
+}
+
+function writeConnectedClis(entries: Record<string, ConnectedCliRecord>, forgotten?: string[]): void {
   mkdirSync(path.dirname(CONNECTED_FILE), { recursive: true });
   const tmp = `${CONNECTED_FILE}.${process.pid}.tmp`;
-  writeFileSync(tmp, JSON.stringify({ version: 'v1', entries }, null, 2), 'utf-8');
+  // Preserve forgotten[] from disk if not explicitly passed in. That way
+  // callers that only need to update entries (recordConnectedCli) don't
+  // have to know about the forgotten list.
+  const finalForgotten = forgotten ?? readForgottenCliIds();
+  const payload: ConnectedClisFile = { version: 'v1', entries };
+  if (finalForgotten.length > 0) payload.forgotten = finalForgotten;
+  writeFileSync(tmp, JSON.stringify(payload, null, 2), 'utf-8');
   renameSync(tmp, CONNECTED_FILE);
 }
 
@@ -418,13 +442,82 @@ export function recordConnectedCli(entry: CliCatalogEntry): ConnectedCliRecord {
 }
 
 /**
- * Drop a connected-CLI record. Doesn't uninstall the binary — that's
- * out of scope for the dashboard. Just clears Clementine's note that
- * the user explicitly linked it.
+ * Drop a connected-CLI record AND remember that the user explicitly
+ * forgot it, so the auto-promote loop doesn't immediately re-add it on
+ * the next refresh. The binary on PATH is untouched — this just clears
+ * Clementine's note that the user wants this surfaced as connected.
  */
 export function forgetConnectedCli(id: string): void {
   const current = readConnectedClis();
-  if (!(id in current)) return;
-  delete current[id];
-  writeConnectedClis(current);
+  const forgotten = readForgottenCliIds();
+  const hadEntry = id in current;
+  if (hadEntry) delete current[id];
+  // Idempotent: add to forgotten if not already there.
+  const nextForgotten = forgotten.includes(id) ? forgotten : [...forgotten, id];
+  if (!hadEntry && nextForgotten.length === forgotten.length) return; // nothing to write
+  writeConnectedClis(current, nextForgotten);
+}
+
+/**
+ * Reconnect a previously-forgotten catalog CLI. Drops it from the
+ * forgotten list and records the connection. Used by the dashboard's
+ * "Reconnect" button when the user wants a CLI back after explicitly
+ * disconnecting it earlier.
+ */
+export function reconnectCli(id: string): ConnectedCliRecord | null {
+  const entry = findCatalogEntry(id);
+  if (!entry) return null;
+  const forgotten = readForgottenCliIds().filter((x) => x !== id);
+  const current = readConnectedClis();
+  const record: ConnectedCliRecord = {
+    id: entry.id,
+    command: entry.command,
+    vendor: entry.vendor,
+    name: entry.name,
+    installedAt: new Date().toISOString(),
+    authDocsUrl: entry.authDocsUrl,
+    authCommand: entry.authCommand,
+  };
+  current[entry.id] = record;
+  writeConnectedClis(current, forgotten);
+  return record;
+}
+
+/**
+ * Auto-promotion sweep — for every catalog entry whose binary resolves
+ * on PATH but isn't yet in the connected list AND wasn't explicitly
+ * forgotten, write a connected record. Idempotent + fast (one PATH
+ * resolution + one file write per missing entry).
+ *
+ * Why this exists: previously a user who installed Salesforce CLI via
+ * `npm install -g @salesforce/cli` BEFORE installing Clementine got
+ * `sf` on PATH but not in connected-clis.json. The agent could still
+ * find it via the global CLI scan, but the dashboard wouldn't surface
+ * it as a first-class integration and the agent missed the auth-
+ * command hint. This closes the gap: any installed catalog CLI
+ * becomes connected automatically, without making the user click
+ * through the install flow.
+ *
+ * Disconnect semantics preserved: an id in `forgotten[]` is skipped
+ * by this sweep. The user has to call reconnectCli(id) explicitly.
+ *
+ * Returns the list of promoted ids for logging + UI feedback.
+ */
+export function autoPromoteInstalledClis(): { promoted: string[]; skipped: string[] } {
+  const connected = readConnectedClis();
+  const forgotten = new Set(readForgottenCliIds());
+  const promoted: string[] = [];
+  const skipped: string[] = [];
+  for (const entry of CLI_CATALOG) {
+    if (connected[entry.id]) continue; // already connected
+    if (forgotten.has(entry.id)) { skipped.push(entry.id); continue; }
+    const resolved = whichOnPath(entry.command);
+    if (!resolved) continue;
+    const safe = resolveSafeCliProbe(entry.command, resolved);
+    if (!safe || safe.skipped) continue;
+    // Installed AND eligible — promote.
+    recordConnectedCli(entry);
+    promoted.push(entry.id);
+  }
+  return { promoted, skipped };
 }

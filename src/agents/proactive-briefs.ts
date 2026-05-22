@@ -135,13 +135,34 @@ export async function processProactiveBriefs(assistant: ClementineAssistant): Pr
     task.completedAt &&
     Date.now() - new Date(task.completedAt).getTime() <= RECENT_FAILURE_WINDOW_MS,
   );
-  const approvals = assistant.getRuntime().listPendingApprovals();
+  // Brief surfaces ONLY approvals that are stale enough to need a
+  // nudge. Fresh approvals (just requested) already get their own
+  // dedicated Discord card with Approve/Edit/Reject buttons — listing
+  // them in the brief moments later produced "Clementine needs
+  // approval" messages immediately following every approval request,
+  // which trained users to ignore the brief. The threshold is the
+  // brief's own cadence: if it's been longer than one cadence window
+  // since the approval was requested AND nothing has resolved it,
+  // surface it; otherwise stay quiet and trust the dedicated card.
+  const APPROVAL_BRIEF_AGE_MS = Math.max(15, policy.briefCadenceMinutes) * 60_000;
+  const rawApprovals = assistant.getRuntime().listPendingApprovals();
+  const approvals = rawApprovals.filter((approval) => {
+    const createdAt = (approval as { createdAt?: string }).createdAt;
+    if (!createdAt) return true; // unknown age — err on the side of surfacing
+    return Date.now() - new Date(createdAt).getTime() >= APPROVAL_BRIEF_AGE_MS;
+  });
   const blockedGoals = readGoals().filter((goal) => goal.status === 'blocked');
   const blockedExecutions = executions.filter((execution) => execution.status === 'blocked');
+  // Same idea for attention-needing background tasks: a task that's
+  // ONLY awaiting_approval is already represented by the approval row
+  // above (one card, one mention). Drop the duplicate "task needs
+  // attention" line in that case so each item shows up exactly once.
+  // Interrupted / cancelling tasks remain — those have no approval
+  // counterpart.
   const attentionTasks = activeTasks.filter((task) =>
-    task.status === 'awaiting_approval' ||
     task.status === 'interrupted' ||
-    task.status === 'cancelling',
+    task.status === 'cancelling' ||
+    (task.status === 'awaiting_approval' && !task.pendingApprovalId),
   );
   const urgent = approvals.length > 0 ||
     recentFailures.length > 0 ||

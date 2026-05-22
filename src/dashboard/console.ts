@@ -137,6 +137,16 @@ export function renderConsoleHtml(token: string): string {
         <span class="nav-key">11</span>
         <span class="nav-label">Settings</span>
       </button>
+      <!--
+        EVOLUTION (slot 12) — hidden by default. Revealed when the user
+        flips Settings → "Show diagnostics" because autoresearch is a
+        power-user feature. The toggle handler in initDiagnosticsToggle
+        also flips this nav button's hidden attr.
+      -->
+      <button class="nav" data-panel="evolution" data-nav-evolution hidden>
+        <span class="nav-key">12</span>
+        <span class="nav-label">Evolution</span>
+      </button>
 
       <!-- ── nav-dock: fills the dead space under the menu items ──
            Five stacked cards that surface monitoring + access to live
@@ -445,6 +455,20 @@ export function renderConsoleHtml(token: string): string {
 
             <div class="mem-section">
               <div class="mem-section-head">
+                <span>RECENT FILES <em style="color:var(--fg-3); font-style:normal; font-size:9.5px; letter-spacing:0.06em;">· all extensions</em></span>
+                <em data-mem-recent-files-count>—</em>
+              </div>
+              <input type="search" class="mem-files-filter" data-mem-recent-files-filter
+                placeholder="filter by name…"
+                autocomplete="off" spellcheck="false"
+                style="margin: 4px 8px 8px 8px; width: calc(100% - 16px); padding: 4px 6px; font-size: 11px; background: var(--bg-1); border: 1px solid var(--line); color: var(--fg);" />
+              <ol class="mem-file-list" data-mem-recent-files-list>
+                <li class="empty">— loading —</li>
+              </ol>
+            </div>
+
+            <div class="mem-section">
+              <div class="mem-section-head">
                 <span>DURABLE FACTS</span>
                 <em data-mem-facts-count>—</em>
               </div>
@@ -740,6 +764,27 @@ export function renderConsoleHtml(token: string): string {
                 Toggle, edit, or add new ones there — anything the agent can call is reflected back here as a tool.
               </div>
             </div>
+            <!--
+              LOCAL CLIs — view-only mirror of the connected-clis.json
+              registry. Surfaces "what command-line tools the agent has
+              first-class access to right now." Lifecycle (install /
+              configure / disconnect) lives in the Integrations panel.
+              Auto-promote covers fresh installs; this section is the
+              answer to "what's actually connected?"
+            -->
+            <div class="tools-section">
+              <div class="tools-section-head">
+                <span>LOCAL CLIs</span>
+                <em data-tools-cli-count>—</em>
+              </div>
+              <div class="tools-cli-list" data-tools-cli-list>
+                <div class="tools-empty">— loading —</div>
+              </div>
+              <div class="tools-empty" style="margin-top:8px;">
+                Install + manage CLIs in <a class="tools-jump" data-tools-jump="integrations">Integrations</a>.
+                Catalog CLIs already on your PATH get auto-promoted here — no install needed.
+              </div>
+            </div>
           </div>
 
         </div>
@@ -983,6 +1028,12 @@ export function renderConsoleHtml(token: string): string {
 
       <section class="panel-frame" data-section="settings" hidden>
         <div class="panel-tag">PANEL · 11 · SETTINGS</div>
+        <div class="panel-toolbar" style="display:flex; justify-content:flex-end; padding:8px 16px; border-bottom:1px solid var(--line);">
+          <label class="check-pill" style="cursor:pointer;">
+            <input type="checkbox" data-settings-advanced-toggle />
+            <span>Show advanced</span>
+          </label>
+        </div>
         <div class="panel-body settings-layout">
 
           <div class="settings-col">
@@ -1152,7 +1203,7 @@ export function renderConsoleHtml(token: string): string {
           </div>
 
           <div class="settings-col">
-            <div class="settings-block">
+            <div class="settings-block" data-advanced-block hidden>
               <div class="settings-block-head">PROACTIVITY POLICY</div>
               <form class="settings-form" data-settings-policy-form>
                 <div class="settings-field">
@@ -1361,6 +1412,34 @@ export function renderConsoleHtml(token: string): string {
             </div>
           </div>
 
+        </div>
+      </section>
+
+      <!--
+        PANEL · 12 · EVOLUTION
+        Power-user nav slot for autoresearch (hermes-style self-evolution).
+        Foundation only: daily observatory report from yesterday's traces.
+        Mutation phases (C/B/A) land here later behind an approval queue.
+      -->
+      <section class="panel-frame" data-section="evolution" hidden>
+        <div class="panel-tag">PANEL · 12 · EVOLUTION</div>
+        <div class="panel-body evolution-layout">
+          <div class="evolution-header">
+            <div>
+              <h2 class="evolution-title">Autoresearch</h2>
+              <p class="evolution-sub">Nightly observatory over Clementine's traces. Surfaces tool / workflow / skill health so you can decide what to evolve next. No mutations applied — read-only for now.</p>
+            </div>
+            <div class="evolution-actions">
+              <button type="button" class="evolution-btn" data-evolution-run title="Rebuild the report from current trace data">Run now</button>
+              <select class="evolution-history-pick" data-evolution-history>
+                <option value="">— history —</option>
+              </select>
+            </div>
+          </div>
+          <div class="evolution-meta" data-evolution-meta>— loading —</div>
+          <div class="evolution-report" data-evolution-report>
+            <div class="settings-info">— no report yet · click <strong>Run now</strong> to generate one —</div>
+          </div>
         </div>
       </section>
 
@@ -5479,6 +5558,51 @@ body {
   font-size: 11px;
 }
 .tools-empty { color: var(--fg-mute); padding: 14px; letter-spacing: 0.12em; line-height: 1.5; }
+/* LOCAL CLIs section — mirrors connected-clis.json in the Tools panel.
+   Cards match the visual weight of MCP/registered-tool rows. */
+.tools-cli-list {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 6px;
+  padding: 0 14px 8px;
+}
+.tools-cli-row {
+  display: grid;
+  grid-template-columns: 160px 1fr auto;
+  align-items: center;
+  gap: 14px;
+  padding: 8px 12px;
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  font-size: 11.5px;
+}
+.tools-cli-row .tools-cli-name {
+  color: var(--fg);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+.tools-cli-row .tools-cli-name code {
+  color: var(--accent);
+  font-size: 11px;
+  margin-right: 6px;
+}
+.tools-cli-row .tools-cli-meta {
+  color: var(--fg-3);
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+}
+.tools-cli-row .tools-cli-meta code {
+  background: var(--bg-1);
+  padding: 1px 5px;
+  border-radius: 3px;
+  color: var(--accent-2, #5cd66a);
+  font-size: 10.5px;
+}
+.tools-cli-row .tools-cli-when {
+  color: var(--fg-mute);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+}
 .tools-empty .tools-jump {
   color: var(--accent);
   text-decoration: none;
@@ -6635,6 +6759,95 @@ body {
 }
 /* Diagnostics panel — additive only; renders read-only data from
    /api/console/diagnostics. Same look as other settings blocks. */
+/* EVOLUTION panel (slot 12 — autoresearch).
+   Layout matches the other panel-bodies; the report is a scrollable
+   pre-rendered Markdown surface that we lightly style for readability. */
+.evolution-layout {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 16px;
+  height: 100%;
+  overflow: hidden;
+}
+.evolution-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+.evolution-title {
+  margin: 0 0 6px;
+  font-size: 16px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--fg);
+}
+.evolution-sub {
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--fg-3);
+  max-width: 720px;
+}
+.evolution-actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.evolution-btn {
+  background: transparent;
+  border: 1px solid var(--accent, #ff8f3c);
+  color: var(--accent, #ff8f3c);
+  padding: 6px 14px;
+  font: inherit;
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+.evolution-btn:hover { background: var(--accent, #ff8f3c); color: var(--bg-0); }
+.evolution-btn:disabled { opacity: 0.5; cursor: progress; }
+.evolution-history-pick {
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  padding: 6px 10px;
+  font: inherit;
+  font-size: 11px;
+  letter-spacing: 0.1em;
+}
+.evolution-meta {
+  font-size: 10.5px;
+  color: var(--fg-3);
+  letter-spacing: 0.08em;
+}
+.evolution-report {
+  flex: 1;
+  overflow-y: auto;
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  padding: 16px 20px;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--fg-2);
+}
+.evolution-report h1 { font-size: 16px; color: var(--fg); margin: 0 0 12px; }
+.evolution-report h2 { font-size: 13px; color: var(--fg); margin: 18px 0 10px; letter-spacing: 0.08em; text-transform: uppercase; }
+.evolution-report table { width: 100%; border-collapse: collapse; margin: 8px 0; font-size: 11.5px; }
+.evolution-report th, .evolution-report td {
+  border-bottom: 1px solid var(--line);
+  padding: 4px 8px;
+  text-align: left;
+}
+.evolution-report th { color: var(--fg-3); font-weight: 600; font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; }
+.evolution-report td:nth-child(n+2) { text-align: right; font-variant-numeric: tabular-nums; }
+.evolution-report code { background: var(--bg-1); padding: 1px 5px; border-radius: 3px; font-size: 11.5px; color: var(--accent, #ff8f3c); }
+.evolution-report ul { margin: 6px 0 12px 18px; padding: 0; }
+.evolution-report li { margin: 3px 0; }
+.evolution-report em { color: var(--fg-3); font-style: italic; }
+.evolution-report hr { border: 0; border-top: 1px solid var(--line); margin: 16px 0; }
+
 .settings-toggle {
   display: flex;
   align-items: center;
@@ -8943,6 +9156,10 @@ const CONSOLE_JS = `
       else refreshUsagePanel();
     } else if (name === 'settings') {
       if (!settingsBooted) { settingsBooted = true; bootSettingsPanel(); }
+    } else if (name === 'evolution') {
+      // Boot is idempotent; the panel re-fetches on every nav back so
+      // the user sees fresh data without manual refresh.
+      bootEvolutionPanel();
     }
   }
   navButtons.forEach((b) => {
@@ -9243,7 +9460,7 @@ const CONSOLE_JS = `
     }
   }
   async function refreshMemoryPanel() {
-    await Promise.all([refreshMemoryStatus(), refreshFileList(), refreshFactList()]);
+    await Promise.all([refreshMemoryStatus(), refreshFileList(), refreshRecentFiles(), refreshFactList()]);
   }
 
   // ─── Memory view toggle + graph ────────────────────────────────
@@ -10057,6 +10274,133 @@ const CONSOLE_JS = `
       mem.fileList.innerHTML = '<li class="empty">— failed: ' + escMem(err.message || err) + ' —</li>';
     }
   }
+
+  // Cached list of recent files so the filter input can re-render
+  // without re-fetching. Populated by refreshRecentFiles().
+  let __memRecentFilesCache = [];
+
+  async function refreshRecentFiles() {
+    const listEl = document.querySelector('[data-mem-recent-files-list]');
+    const countEl = document.querySelector('[data-mem-recent-files-count]');
+    const filterEl = document.querySelector('[data-mem-recent-files-filter]');
+    if (!listEl) return;
+    try {
+      const data = await fetchJSON('/api/console/files/recent?limit=60');
+      __memRecentFilesCache = Array.isArray(data.files) ? data.files : [];
+      if (countEl) countEl.textContent = String(data.total || __memRecentFilesCache.length);
+      renderRecentFiles(filterEl ? (filterEl.value || '').toLowerCase() : '');
+    } catch (err) {
+      listEl.innerHTML = '<li class="empty">— failed: ' + escMem(err.message || err) + ' —</li>';
+    }
+  }
+
+  function renderRecentFiles(filterText) {
+    const listEl = document.querySelector('[data-mem-recent-files-list]');
+    if (!listEl) return;
+    const filter = (filterText || '').toLowerCase().trim();
+    const files = filter
+      ? __memRecentFilesCache.filter((f) => f.name.toLowerCase().includes(filter) || (f.relPath || '').toLowerCase().includes(filter))
+      : __memRecentFilesCache;
+    if (files.length === 0) {
+      listEl.innerHTML = '<li class="empty">— ' + (filter ? 'no matches' : 'no files yet') + ' —</li>';
+      return;
+    }
+    const fmtBytes = (n) => {
+      if (n < 1024) return n + 'B';
+      if (n < 1024 * 1024) return (n / 1024).toFixed(0) + 'KB';
+      return (n / 1024 / 1024).toFixed(1) + 'MB';
+    };
+    const fmtTime = (ms) => {
+      try {
+        const d = new Date(ms);
+        const now = Date.now();
+        const ageMs = now - ms;
+        if (ageMs < 60_000) return 'just now';
+        if (ageMs < 3_600_000) return Math.floor(ageMs / 60_000) + 'm ago';
+        if (ageMs < 86_400_000) return Math.floor(ageMs / 3_600_000) + 'h ago';
+        return d.toISOString().slice(0, 10);
+      } catch (_) { return ''; }
+    };
+    listEl.innerHTML = files.slice(0, 60).map((f) => {
+      const parent = (f.relPath || '').split('/').slice(0, -1).join('/') || '';
+      const extBadge = f.ext ? ' · ' + f.ext.toUpperCase() : '';
+      return [
+        '<li class="file" data-recent-file-path="' + escMem(f.path) + '" data-recent-file-ext="' + escMem(f.ext || '') + '" style="cursor: pointer;">',
+        '  <span class="name" title="' + escMem(f.relPath) + '">' + escMem(f.name) + '</span>',
+        parent ? '  <span class="meta" style="opacity:0.7;">' + escMem(parent) + '</span>' : '',
+        '  <span class="meta">' + fmtBytes(f.bytes) + extBadge + ' · ' + fmtTime(f.mtimeMs) + '</span>',
+        '</li>',
+      ].join('');
+    }).join('');
+    Array.from(listEl.querySelectorAll('li.file')).forEach((li) => {
+      li.addEventListener('click', async () => {
+        const p = li.getAttribute('data-recent-file-path');
+        const ext = li.getAttribute('data-recent-file-ext');
+        // Text-ish extensions → load into the existing viewer pane.
+        // Binary / rich → open in the default app (Finder/Preview/Safari).
+        const TEXT = new Set(['md', 'txt', 'json', 'csv', 'tsv', 'html', 'htm', 'log', 'yaml', 'yml', 'xml']);
+        if (ext && TEXT.has(ext)) {
+          try {
+            const data = await fetchJSON('/api/console/files/preview?path=' + encodeURIComponent(p));
+            showRecentFilePreview(data);
+          } catch (err) {
+            alert('Preview failed: ' + (err.message || err));
+          }
+        } else {
+          try {
+            await fetch(withToken('/api/console/files/open?path=' + encodeURIComponent(p)), { method: 'POST' });
+          } catch (err) {
+            alert('Open failed: ' + (err.message || err));
+          }
+        }
+      });
+    });
+  }
+
+  function showRecentFilePreview(data) {
+    if (!mem.viewer) return;
+    // Switch the memory main pane to the viewer view.
+    if (typeof window.__clementineMemoryView === 'function') {
+      try { window.__clementineMemoryView('viewer'); } catch (_) {}
+    }
+    const escHtml = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    const body = data.previewable
+      ? '<pre style="margin:0; padding:12px; white-space:pre-wrap; word-break:break-word; font: 11px ui-monospace, monospace; max-height: 60vh; overflow:auto;">' + escHtml(data.content || '') + '</pre>'
+      + (data.truncated ? '<div style="padding:8px 12px; color: var(--accent-warn); font-size: 10px;">⚠ Preview truncated at 200KB. Open in Finder for the full file.</div>' : '')
+      : '<div style="padding:16px; color: var(--fg-3);">' + escHtml(data.reason || 'No preview available') + '</div>';
+    const openBtn = '<button type="button" data-recent-file-open-finder style="margin-left:auto;">Open in Finder</button>';
+    mem.viewer.innerHTML = [
+      '<div class="mem-viewer-head" style="display:flex; align-items:center; gap:12px; padding:8px 12px; border-bottom:1px solid var(--line);">',
+      '  <span style="font-size: 11px;">' + escHtml(data.relPath || data.path) + '</span>',
+      '  <span style="font-size: 10px; color: var(--fg-3);">' + (data.bytes || 0) + ' bytes' + (data.ext ? ' · ' + escHtml(data.ext.toUpperCase()) : '') + '</span>',
+      openBtn,
+      '</div>',
+      body,
+    ].join('');
+    mem.viewer.hidden = false;
+    const finderBtn = mem.viewer.querySelector('[data-recent-file-open-finder]');
+    if (finderBtn) {
+      finderBtn.addEventListener('click', async () => {
+        try {
+          await fetch(withToken('/api/console/files/open?path=' + encodeURIComponent(data.path)), { method: 'POST' });
+        } catch (err) {
+          alert('Open failed: ' + (err.message || err));
+        }
+      });
+    }
+  }
+
+  // Wire the filter input once — debounced re-render on input.
+  (function bindRecentFilesFilter() {
+    const filterEl = document.querySelector('[data-mem-recent-files-filter]');
+    if (!filterEl || filterEl.dataset.bound) return;
+    filterEl.dataset.bound = '1';
+    let t = null;
+    filterEl.addEventListener('input', () => {
+      if (t) clearTimeout(t);
+      t = setTimeout(() => renderRecentFiles(filterEl.value || ''), 80);
+    });
+  })();
 
   async function refreshFactList() {
     try {
@@ -11852,6 +12196,45 @@ const CONSOLE_JS = `
     } catch (err) {
       tools.grid.innerHTML = '<div class="tools-empty">— failed: ' + escMem(err.message || err) + ' —</div>';
     }
+    // Also load the LOCAL CLIs registry view (connected-clis.json mirror).
+    // Same endpoint Integrations uses, but rendered view-only here so the
+    // user has a clear answer to "what command-line tools does my agent
+    // have right now?" without switching panels.
+    refreshToolsCliList();
+  }
+
+  async function refreshToolsCliList() {
+    const listEl = document.querySelector('[data-tools-cli-list]');
+    const countEl = document.querySelector('[data-tools-cli-count]');
+    if (!listEl) return;
+    try {
+      const data = await fetchJSON('/api/console/cli-catalog');
+      const connected = data.connected || {};
+      const entries = Object.values(connected);
+      if (countEl) countEl.textContent = String(entries.length);
+      if (entries.length === 0) {
+        listEl.innerHTML = '<div class="tools-empty" style="padding:8px 12px;">— no local CLIs connected yet —</div>';
+        return;
+      }
+      // Sort newest first so freshly-promoted CLIs land at the top
+      entries.sort((a, b) => (b.installedAt || '').localeCompare(a.installedAt || ''));
+      listEl.innerHTML = entries.map((c) => {
+        const auth = c.authCommand ? '<div class="tools-cli-meta">auth: <code>' + escMem(c.authCommand) + '</code></div>' : '';
+        const when = c.installedAt ? '<span class="tools-cli-when">linked ' + escMem(c.installedAt.slice(0, 10)) + '</span>' : '';
+        return [
+          '<div class="tools-cli-row">',
+          '  <div class="tools-cli-name"><code>' + escMem(c.command) + '</code>' + escMem(c.name) + '</div>',
+          '  <div>',
+          '    <div class="tools-cli-meta">' + escMem(c.vendor) + '</div>',
+          auth,
+          '  </div>',
+          '  ' + when,
+          '</div>',
+        ].join('');
+      }).join('');
+    } catch (err) {
+      listEl.innerHTML = '<div class="tools-empty" style="padding:8px 12px;color:var(--accent-fail);">— failed: ' + escMem((err && err.message) || err) + ' —</div>';
+    }
   }
 
   function renderToolsCategories() {
@@ -12412,6 +12795,32 @@ const CONSOLE_JS = `
     runtimeForm: document.querySelector('[data-settings-runtime-form]'),
     runtimeStatus: document.querySelector('[data-settings-runtime-status]'),
   };
+
+  // Advanced-settings gate. Proactivity Policy (and any other block tagged
+  // data-advanced-block) is hidden by default — most users never need to
+  // touch the autonomy controls, and surfacing them by default invites
+  // accidental misconfiguration. The toggle persists in localStorage so
+  // power users don't have to flip it every reload.
+  (function setupAdvancedToggle() {
+    const toggle = document.querySelector('[data-settings-advanced-toggle]');
+    if (!toggle) return;
+    const STORAGE_KEY = 'clementine.settings.showAdvanced';
+    let showAdvanced = false;
+    try { showAdvanced = localStorage.getItem(STORAGE_KEY) === '1'; } catch (_) { /* private mode */ }
+    const apply = (visible) => {
+      document.querySelectorAll('[data-advanced-block]').forEach((el) => {
+        if (visible) el.removeAttribute('hidden');
+        else el.setAttribute('hidden', '');
+      });
+    };
+    toggle.checked = showAdvanced;
+    apply(showAdvanced);
+    toggle.addEventListener('change', () => {
+      const next = !!toggle.checked;
+      try { localStorage.setItem(STORAGE_KEY, next ? '1' : '0'); } catch (_) { /* private mode */ }
+      apply(next);
+    });
+  })();
 
   function setFormValue(form, name, value) {
     const el = form.querySelector('[name="' + name + '"]');
@@ -14748,13 +15157,28 @@ const CONSOLE_JS = `
       listEl.innerHTML = '<div class="settings-info">No catalog entry matches "' + escMem(hubCliCatQuery) + '". Try a different name — or paste an install command into the installer below.</div>';
       return;
     }
+    const connectedMap = (payload && payload.connected) || {};
     listEl.innerHTML = results.map((r) => {
       const installed = Boolean(r.installed);
-      const pillCls = installed ? 'active' : 'available';
-      const pillText = installed ? 'INSTALLED' : 'OPTIONAL';
-      const actionBtn = installed
-        ? '<a href="' + escMem(r.authDocsUrl) + '" target="_blank" rel="noopener" data-cli-cat-configure="' + escMem(r.id) + '">CONFIGURE ▸</a>'
-        : '<button data-cli-cat-install="' + escMem(r.id) + '">INSTALL</button>';
+      const connected = Boolean(connectedMap[r.id]);
+      // Three card states:
+      //   1) NOT INSTALLED — show "INSTALL" button (catalog install command)
+      //   2) INSTALLED + CONNECTED — show "CONFIGURE" link + DISCONNECT
+      //   3) INSTALLED + NOT CONNECTED — show "RECONNECT" button
+      //      (case 3 only happens after explicit DISCONNECT — auto-promote
+      //      handles fresh-installed CLIs automatically on the server)
+      let pillCls, pillText;
+      if (installed && connected) { pillCls = 'active'; pillText = 'CONNECTED'; }
+      else if (installed)         { pillCls = 'warn';   pillText = 'INSTALLED · NOT CONNECTED'; }
+      else                        { pillCls = 'available'; pillText = 'OPTIONAL'; }
+      let actionBtn;
+      if (!installed) {
+        actionBtn = '<button data-cli-cat-install="' + escMem(r.id) + '">INSTALL</button>';
+      } else if (!connected) {
+        actionBtn = '<button data-cli-cat-reconnect="' + escMem(r.id) + '" title="Re-link this CLI so Clementine\\'s agent can find it">RECONNECT</button>';
+      } else {
+        actionBtn = '<a href="' + escMem(r.authDocsUrl) + '" target="_blank" rel="noopener" data-cli-cat-configure="' + escMem(r.id) + '">CONFIGURE ▸</a>';
+      }
       const authLine = installed && r.authCommand
         ? '<div class="hub-app-meta">After connect: <code>' + escMem(r.authCommand) + '</code></div>'
         : '';
@@ -14770,7 +15194,7 @@ const CONSOLE_JS = `
         authLine,
         installPreview,
         '  <div class="hub-app-actions">' + actionBtn,
-        installed ? '<button class="cli-cat-forget" data-cli-cat-forget="' + escMem(r.id) + '">DISCONNECT</button>' : '',
+        connected ? '<button class="cli-cat-forget" data-cli-cat-forget="' + escMem(r.id) + '">DISCONNECT</button>' : '',
         '  </div>',
         '  <div class="hub-app-meta" data-cli-cat-job-status="' + escMem(r.id) + '"></div>',
         '</div>',
@@ -14841,6 +15265,37 @@ const CONSOLE_JS = `
           body: JSON.stringify({ id }),
         });
         refreshHubCliCatalog();
+      });
+    });
+    // Reconnect — for cards in the "installed but not connected" state.
+    // Calls /api/console/cli-catalog/reconnect which drops the id from
+    // forgotten[] and writes a fresh connected record so the agent gets
+    // the auth-command hint + the dashboard surfaces it.
+    rootEl.querySelectorAll('[data-cli-cat-reconnect]').forEach((btn) => {
+      if (btn.dataset.bound) return;
+      btn.dataset.bound = '1';
+      btn.addEventListener('click', async () => {
+        const id = btn.getAttribute('data-cli-cat-reconnect');
+        if (!id) return;
+        btn.disabled = true;
+        const originalText = btn.textContent;
+        btn.textContent = 'RECONNECTING…';
+        try {
+          const r = await fetch(withToken('/api/console/cli-catalog/reconnect'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id }),
+          });
+          const j = await r.json().catch(() => ({}));
+          if (!r.ok) { showError('Reconnect failed: ' + (j.error || r.status)); return; }
+          showSuccess('Reconnected. The agent now has its auth metadata.');
+          refreshHubCliCatalog();
+        } catch (err) {
+          showError('Reconnect failed: ' + ((err && err.message) || err));
+        } finally {
+          btn.disabled = false;
+          btn.textContent = originalText;
+        }
       });
     });
   }
@@ -15470,7 +15925,11 @@ const CONSOLE_JS = `
 
       const policy = (s.proactivity && s.proactivity.policy) || {};
       ['enabled','quietHoursEnabled','allowComputerActions','allowComposioActions','allowDiscordCheckIns'].forEach((k) => setFormValue(sett.policyForm, k, policy[k]));
-      ['mode','checkInMinutes','defaultLongTaskMinutes','briefCadenceMinutes','quietHoursStart','quietHoursEnd'].forEach((k) => setFormValue(sett.policyForm, k, policy[k]));
+      // autoApproveScope was historically omitted from this list — saved
+      // correctly to disk but never rendered back into the dropdown on
+      // load, so the value silently reverted to the HTML default
+      // ("strict") on every page refresh. Reported 2026-05-22.
+      ['mode','autoApproveScope','checkInMinutes','defaultLongTaskMinutes','briefCadenceMinutes','quietHoursStart','quietHoursEnd'].forEach((k) => setFormValue(sett.policyForm, k, policy[k]));
 
       renderAuthInfo(s.auth);
       renderModelPicker(s.models);
@@ -15498,17 +15957,34 @@ const CONSOLE_JS = `
     const toggle = document.querySelector('[data-diagnostics-toggle]');
     const panel = document.querySelector('[data-diagnostics-panel]');
     const refresh = document.querySelector('[data-diagnostics-refresh]');
+    const evolutionNav = document.querySelector('[data-nav-evolution]');
     if (!toggle || !panel) return;
     diagnosticsBound = true;
-    toggle.addEventListener('change', () => {
-      if (toggle.checked) {
+    const sync = () => {
+      const on = toggle.checked;
+      if (on) {
         panel.removeAttribute('hidden');
         loadDiagnostics();
       } else {
         panel.setAttribute('hidden', '');
       }
-    });
+      // EVOLUTION (slot 12) is a power-user surface. It rides on the
+      // same "Show diagnostics" toggle so end users don't see a nav
+      // button for the autoresearch panel until they opt in.
+      if (evolutionNav) {
+        if (on) evolutionNav.removeAttribute('hidden');
+        else evolutionNav.setAttribute('hidden', '');
+      }
+      // Persist toggle state so the panel/nav remember across reloads.
+      try { localStorage.setItem('clemmy.diagnostics.visible', on ? '1' : '0'); } catch (_) {}
+    };
+    toggle.addEventListener('change', sync);
     if (refresh) refresh.addEventListener('click', () => loadDiagnostics());
+    // Restore prior state on boot.
+    try {
+      const stored = localStorage.getItem('clemmy.diagnostics.visible');
+      if (stored === '1') { toggle.checked = true; sync(); }
+    } catch (_) {}
   }
 
   async function loadDiagnostics() {
@@ -15589,6 +16065,147 @@ const CONSOLE_JS = `
         '<div class="diag-row"><span>tool-events (today)</span><em>' + fmtBytes(st.toolEventsTodayBytes) + '</em></div>' +
         '<div class="diag-row"><span>state JSON files</span><em>' + st.stateJsonCount + '</em></div>';
     }
+  }
+
+  // ─── EVOLUTION panel (slot 12 — autoresearch observatory) ──────
+  // Power-user surface. Reads /api/console/autoresearch/report which
+  // is whatever the maintenance tick last wrote. "Run now" forces a
+  // fresh rebuild. No mutations yet — Foundation only.
+
+  // Tiny Markdown → HTML for the report content. We only support what
+  // observatory.ts emits: h1, h2, paragraphs, lists, tables, code spans,
+  // emphasis, hr.
+  //
+  // NOTE on escapes: this function lives inside an outer template
+  // literal (CONSOLE_JS). Every backslash-X inside this code gets
+  // evaluated by the template literal before it reaches the browser,
+  // so regex backslashes need DOUBLE-escaping (\\s, \\|, etc.). To
+  // minimize that hell we use startsWith/endsWith for prefix checks
+  // instead of regex, and only keep regex for the inline replacements
+  // (code, strong, em) where actually needed. The double-backslash
+  // sequences below become single backslashes after template-literal
+  // interpolation, then the rendered browser code sees properly-formed
+  // regex. Avoid backticks inside this comment — they would terminate
+  // the outer template literal.
+  function renderTinyMarkdown(md) {
+    if (!md) return '';
+    const esc = (s) => s.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+    // Avoid backticks in source — they collide with the outer template
+    // literal. Build the backtick regex via String.fromCharCode(96)
+    // instead. Strong + em regexes use only ASCII chars so they're
+    // safe in source as long as backslashes are double-escaped.
+    const BT = String.fromCharCode(96); // backtick
+    const codeRe = new RegExp(BT + '([^' + BT + ']+)' + BT, 'g');
+    const strongRe = new RegExp('\\\\*\\\\*([^\\\\*]+)\\\\*\\\\*', 'g');
+    const emRe = new RegExp('_([^_]+)_', 'g');
+    const inline = (s) => esc(s)
+      .replace(codeRe, '<code>$1</code>')
+      .replace(strongRe, '<strong>$1</strong>')
+      .replace(emRe, '<em>$1</em>');
+    const lines = md.split('\\n');
+    const out = [];
+    let i = 0;
+    const isTableSeparator = (s) => {
+      if (!s || !s.startsWith('|') || !s.endsWith('|')) return false;
+      // separator row has only |, -, :, and whitespace
+      for (let k = 0; k < s.length; k++) {
+        const c = s[k];
+        if (c !== '|' && c !== '-' && c !== ':' && c !== ' ' && c !== '\\t') return false;
+      }
+      return true;
+    };
+    const splitTableRow = (s) => s.slice(1, -1).split('|').map((c) => c.trim());
+    while (i < lines.length) {
+      const line = lines[i];
+      if (line.startsWith('# ')) { out.push('<h1>' + inline(line.slice(2)) + '</h1>'); i++; continue; }
+      if (line.startsWith('## ')) { out.push('<h2>' + inline(line.slice(3)) + '</h2>'); i++; continue; }
+      if (line === '---') { out.push('<hr/>'); i++; continue; }
+      if (line.startsWith('|') && line.endsWith('|') && i + 1 < lines.length && isTableSeparator(lines[i + 1])) {
+        const header = splitTableRow(line);
+        i += 2;
+        const rows = [];
+        while (i < lines.length && lines[i].startsWith('|') && lines[i].endsWith('|')) {
+          rows.push(splitTableRow(lines[i]));
+          i++;
+        }
+        const thead = '<thead><tr>' + header.map((c) => '<th>' + inline(c) + '</th>').join('') + '</tr></thead>';
+        const tbody = '<tbody>' + rows.map((r) => '<tr>' + r.map((c) => '<td>' + inline(c) + '</td>').join('') + '</tr>').join('') + '</tbody>';
+        out.push('<table>' + thead + tbody + '</table>');
+        continue;
+      }
+      if (line.startsWith('- ')) {
+        const items = [];
+        while (i < lines.length && lines[i].startsWith('- ')) {
+          items.push('<li>' + inline(lines[i].slice(2)) + '</li>');
+          i++;
+        }
+        out.push('<ul>' + items.join('') + '</ul>');
+        continue;
+      }
+      if (line.trim() === '') { i++; continue; }
+      out.push('<p>' + inline(line) + '</p>');
+      i++;
+    }
+    return out.join('\\n');
+  }
+
+  let evolutionBooted = false;
+  function bootEvolutionPanel() {
+    if (evolutionBooted) return;
+    const runBtn = document.querySelector('[data-evolution-run]');
+    const historyPick = document.querySelector('[data-evolution-history]');
+    const reportEl = document.querySelector('[data-evolution-report]');
+    const metaEl = document.querySelector('[data-evolution-meta]');
+    if (!reportEl) return;
+    evolutionBooted = true;
+
+    async function refresh() {
+      try {
+        const data = await fetchJSON('/api/console/autoresearch/report');
+        const latest = data.latest;
+        const history = data.history || [];
+        if (historyPick) {
+          // Drop everything but the leading placeholder, refill from history.
+          while (historyPick.children.length > 1) historyPick.removeChild(historyPick.lastChild);
+          for (const h of history) {
+            const opt = document.createElement('option');
+            opt.value = h.date;
+            opt.textContent = h.date;
+            historyPick.appendChild(opt);
+          }
+        }
+        if (!latest) {
+          if (metaEl) metaEl.textContent = 'No report yet — click Run now to generate one.';
+          reportEl.innerHTML = '<div class="settings-info">— no report yet · click <strong>Run now</strong> to generate one —</div>';
+          return;
+        }
+        if (metaEl) metaEl.textContent = 'Last refreshed: ' + latest.date + ' · ' + (latest.content.length) + ' bytes';
+        reportEl.innerHTML = renderTinyMarkdown(latest.content);
+      } catch (err) {
+        if (metaEl) metaEl.textContent = 'Failed to load: ' + ((err && err.message) || err);
+      }
+    }
+
+    if (runBtn) {
+      runBtn.addEventListener('click', async () => {
+        runBtn.setAttribute('disabled', '');
+        try {
+          const r = await fetch(withToken('/api/console/autoresearch/run'), { method: 'POST' });
+          const j = await r.json().catch(() => ({}));
+          if (!r.ok) { showError('Autoresearch run failed: ' + (j.error || r.status)); return; }
+          if (j.content) {
+            if (metaEl) metaEl.textContent = 'Refreshed just now · ' + (j.written ? 'new report written' : 'no-op (unchanged)');
+            reportEl.innerHTML = renderTinyMarkdown(j.content);
+            showSuccess(j.written ? 'Autoresearch report written.' : 'No changes — report already current.');
+          }
+        } catch (err) {
+          showError('Autoresearch run failed: ' + ((err && err.message) || err));
+        } finally {
+          runBtn.removeAttribute('disabled');
+        }
+      });
+    }
+    refresh();
   }
 
   // ─── Plan proposals (draft_plan → user review) ────────────────

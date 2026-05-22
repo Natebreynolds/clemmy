@@ -1,6 +1,7 @@
-import { app, BrowserWindow } from 'electron';
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { app, BrowserWindow, dialog, Notification } from 'electron';
+import { existsSync, mkdirSync, writeFileSync, appendFileSync } from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 
 /**
  * Setup wizard window — the first-run UX.
@@ -75,8 +76,102 @@ export function createSetupWindow(opts: SetupWindowOpts): BrowserWindow {
       sandbox: false,
     },
   });
+
+  // Defensive crash handling — without these, a renderer crash in
+  // the wizard shows macOS's native "Clementine quit unexpectedly"
+  // dialog with zero diagnostic info. Three failure paths to catch:
+  //
+  //   render-process-gone   → renderer crashed (OOM, uncaught throw,
+  //                            killed, etc.). Most "wizard quit
+  //                            unexpectedly" reports trace to this.
+  //   did-fail-load         → file:// load itself failed (rare —
+  //                            usually means the HTML file we wrote
+  //                            isn't readable due to perms/sandbox).
+  //   preload-error         → the contextBridge preload threw during
+  //                            init. v0.5.4 hit this when the install
+  //                            path had spaces / non-ASCII in the
+  //                            URL pathname; v0.5.5+ uses fileURLToPath
+  //                            but this handler keeps us safe against
+  //                            future regressions.
+  //
+  // On any crash: write a diagnostic to ~/.clementine-next/logs/desktop/
+  // setup-crash.log + show a macOS Notification + a follow-up dialog
+  // when the user clicks the notification. The user has SOMETHING to
+  // send us instead of a black box.
+  win.webContents.on('render-process-gone', (_e, details) => {
+    reportSetupCrash('renderer crashed', {
+      reason: details.reason,
+      exitCode: details.exitCode,
+    });
+  });
+  win.webContents.on('did-fail-load', (_e, errorCode, errorDescription, validatedURL) => {
+    // Frame loads happen during normal navigation; only treat MAIN
+    // frame failures as setup crashes. errorCode === -3 (ABORTED)
+    // happens when we ourselves close the window — ignore.
+    if (errorCode === -3) return;
+    reportSetupCrash('setup HTML failed to load', {
+      errorCode,
+      errorDescription,
+      validatedURL,
+    });
+  });
+  win.webContents.on('preload-error', (_e, preloadPath, error) => {
+    reportSetupCrash('preload script threw', {
+      preloadPath,
+      message: error instanceof Error ? error.message : String(error),
+    });
+  });
+
   win.loadFile(materializeSetupHtmlFile());
   return win;
+}
+
+/**
+ * Write a structured diagnostic when the setup wizard renderer dies.
+ * Designed so the user can run `cat ~/.clementine-next/logs/desktop/
+ * setup-crash.log` and email/paste the result. Never throws — best-
+ * effort logging only.
+ */
+function reportSetupCrash(stage: string, details: Record<string, unknown>): void {
+  const ts = new Date().toISOString();
+  const payload = {
+    at: ts,
+    stage,
+    appVersion: app.getVersion(),
+    platform: process.platform,
+    arch: process.arch,
+    nodeVersion: process.versions.node,
+    electronVersion: process.versions.electron,
+    home: os.homedir(),
+    locale: app.getLocale(),
+    details,
+  };
+  try {
+    const logDir = path.join(os.homedir(), '.clementine-next', 'logs', 'desktop');
+    if (!existsSync(logDir)) mkdirSync(logDir, { recursive: true });
+    appendFileSync(path.join(logDir, 'setup-crash.log'), JSON.stringify(payload) + '\n', 'utf-8');
+  } catch { /* logging is best-effort */ }
+  try {
+    new Notification({
+      title: 'Clementine setup hit an error',
+      body: `${stage}. A diagnostic was written to ~/.clementine-next/logs/desktop/setup-crash.log — please share that file if support asks.`,
+      urgency: 'critical',
+    }).show();
+  } catch { /* notification permissions can be denied */ }
+  // Defer the dialog so the notification appears first + the user
+  // sees something even if they have macOS notification banners
+  // disabled. The dialog blocks until they click OK.
+  setTimeout(() => {
+    try {
+      dialog.showMessageBoxSync({
+        type: 'error',
+        title: 'Clementine setup error',
+        message: `The setup wizard hit a problem: ${stage}`,
+        detail: `A diagnostic was written to:\n~/.clementine-next/logs/desktop/setup-crash.log\n\nPlease share that file when reporting the issue. Quit Clementine and reopen to try setup again.`,
+        buttons: ['OK'],
+      });
+    } catch { /* dialog can fail in some macOS states */ }
+  }, 300);
 }
 
 /**

@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomBytes } from 'node:crypto';
+import * as childProcess from 'node:child_process';
 import matter from 'gray-matter';
 import { renderConsoleHtml } from './console.js';
 import {
@@ -25,7 +26,7 @@ import { recallHybrid } from '../memory/recall.js';
 import { FACT_KINDS, forgetFact, listActiveFacts, listAllFacts, rememberFact } from '../memory/facts.js';
 import { openMemoryDb } from '../memory/db.js';
 import { readMemoryIndexStatus, reindexVault } from '../memory/indexer.js';
-import { IDENTITY_FILE, MEMORY_FILE, SOUL_FILE, WORKFLOWS_DIR, WORKING_MEMORY_FILE } from '../memory/vault.js';
+import { IDENTITY_FILE, MEMORY_FILE, SOUL_FILE, VAULT_DIR, WORKFLOWS_DIR, WORKING_MEMORY_FILE } from '../memory/vault.js';
 import { ensureDir, getWorkspaceDirs, listWorkspaceProjects, parseTasks, readBaseEnv, updateEnvKey, GOALS_DIR, TASKS_FILE, WORKFLOW_RUNS_DIR } from '../tools/shared.js';
 import {
   deleteWorkflow,
@@ -669,6 +670,79 @@ export function registerConsoleRoutes(
   });
 
   /**
+   * Force MEMORY.md auto-regeneration on demand (mostly: a "regenerate
+   * now" button in the Memory panel header). The maintenance tick
+   * already runs every ~30min; this skips the wait. Returns the
+   * builder's result metadata so the UI can show "0 → 25 facts
+   * written" feedback.
+   */
+  app.post('/api/console/memory/md/regenerate', async (_req, res) => {
+    if (!isAuthorized(_req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { regenerateMemoryMd } = await import('../memory/memory-md-builder.js');
+      const result = regenerateMemoryMd();
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * Force IDENTITY.md "Working with" auto-section regeneration on
+   * demand. Pulls from user_profile so the agent's per-turn prompt
+   * reflects any profile edits immediately rather than waiting for
+   * the 30-minute maintenance tick.
+   */
+  app.post('/api/console/memory/identity/regenerate', async (_req, res) => {
+    if (!isAuthorized(_req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { regenerateIdentityMd } = await import('../memory/identity-md-builder.js');
+      const result = regenerateIdentityMd();
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * Autoresearch — return the latest daily observatory report.
+   * Foundation-only: this is pure read of the report file the
+   * maintenance tick writes nightly. The EVOLUTION panel polls this.
+   */
+  app.get('/api/console/autoresearch/report', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { findLatestReport, listReports } = await import('../autoresearch/observatory.js');
+      const latest = findLatestReport();
+      const history = listReports().slice(0, 30);
+      res.json({ latest, history });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * Autoresearch — force-regenerate the report NOW (the "Run autoresearch
+   * now" button on the EVOLUTION panel). Returns the rebuilt content +
+   * a written: true|false flag so the UI can say "no-op, content unchanged."
+   */
+  app.post('/api/console/autoresearch/run', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { buildReport, writeReport, renderReportMarkdown } = await import('../autoresearch/observatory.js');
+      const report = buildReport();
+      const result = writeReport(report);
+      res.json({
+        ...result,
+        report,
+        content: renderReportMarkdown(report),
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
    * Soft-delete a fact (sets active=0). Used by the panel's forget button.
    * Hard delete intentionally not exposed here — that lives in MCP tools
    * for the agent itself.
@@ -835,6 +909,142 @@ export function registerConsoleRoutes(
       }
 
       res.json({ path: filePath, chunks, rawContent });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // ─── Vault file browser (Memory tab → "FILES" section) ─────────
+  //
+  // The vault FTS indexer only picks up .md — so HTML reports, JSON
+  // outputs, CSVs, and other deliverables Clementine produces are
+  // invisible from "Search Memory." These endpoints surface the full
+  // vault file system: list recently-touched files (any extension),
+  // preview text content (size-capped), and open in the user's
+  // default app for binary / rich formats. Read-only — write/delete
+  // intentionally NOT exposed here; the agent's write_file tool
+  // remains the only mutation path.
+
+  /** Walk the vault, return the N most-recently-modified files (any
+   *  extension). Used by the Memory tab's FILES section. Limit is
+   *  capped server-side so a misconfigured client can't ask for 10k. */
+  app.get('/api/console/files/recent', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    if (!fs.existsSync(VAULT_DIR)) { res.json({ files: [] }); return; }
+    const rawLimit = Number(req.query.limit ?? 30);
+    const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(200, Math.trunc(rawLimit))) : 30;
+    try {
+      const SKIP_DIRS = new Set(['node_modules', '.git', '.obsidian', '.DS_Store']);
+      const collected: Array<{ path: string; relPath: string; name: string; ext: string; bytes: number; mtimeMs: number }> = [];
+      const walk = (dir: string): void => {
+        let entries: fs.Dirent[];
+        try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
+        catch { return; }
+        for (const entry of entries) {
+          if (SKIP_DIRS.has(entry.name)) continue;
+          if (entry.name.startsWith('.')) continue;
+          const full = path.join(dir, entry.name);
+          if (entry.isDirectory()) {
+            walk(full);
+            continue;
+          }
+          if (!entry.isFile()) continue;
+          try {
+            const st = fs.statSync(full);
+            collected.push({
+              path: full,
+              relPath: path.relative(VAULT_DIR, full),
+              name: entry.name,
+              ext: path.extname(entry.name).slice(1).toLowerCase(),
+              bytes: st.size,
+              mtimeMs: st.mtimeMs,
+            });
+          } catch { /* skip unreadable entries */ }
+        }
+      };
+      walk(VAULT_DIR);
+      collected.sort((a, b) => b.mtimeMs - a.mtimeMs);
+      res.json({ files: collected.slice(0, limit), total: collected.length });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /** Read a file's text content for inline preview. Path MUST resolve
+   *  inside VAULT_DIR — anything outside is rejected. Binary-looking
+   *  files return a hint instead of content; the dashboard then offers
+   *  "Open in Finder" instead of trying to render bytes as text. */
+  app.get('/api/console/files/preview', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const raw = typeof req.query.path === 'string' ? req.query.path : '';
+    if (!raw) { res.status(400).json({ error: 'path required' }); return; }
+    try {
+      const resolved = path.resolve(raw);
+      const relCheck = path.relative(VAULT_DIR, resolved);
+      if (relCheck.startsWith('..') || path.isAbsolute(relCheck)) {
+        res.status(403).json({ error: 'path outside vault' });
+        return;
+      }
+      if (!fs.existsSync(resolved)) { res.status(404).json({ error: 'not found' }); return; }
+      const st = fs.statSync(resolved);
+      if (st.isDirectory()) { res.status(400).json({ error: 'is a directory' }); return; }
+      const MAX_PREVIEW = 200_000;
+      const TEXT_EXT = new Set(['md', 'txt', 'json', 'csv', 'tsv', 'html', 'htm', 'log', 'yaml', 'yml', 'xml', 'js', 'ts', 'py', 'sh']);
+      const ext = path.extname(resolved).slice(1).toLowerCase();
+      if (!TEXT_EXT.has(ext)) {
+        res.json({
+          path: resolved,
+          relPath: relCheck,
+          ext,
+          bytes: st.size,
+          previewable: false,
+          reason: `${ext || 'binary'} files preview in the default app — click Open in Finder`,
+        });
+        return;
+      }
+      const buf = fs.readFileSync(resolved);
+      const truncated = buf.byteLength > MAX_PREVIEW;
+      const content = (truncated ? buf.slice(0, MAX_PREVIEW) : buf).toString('utf-8');
+      res.json({
+        path: resolved,
+        relPath: relCheck,
+        ext,
+        bytes: st.size,
+        mtimeMs: st.mtimeMs,
+        previewable: true,
+        truncated,
+        content,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /** Open a vault file in the user's default app (macOS `open`). Pure
+   *  side effect — no body. Path safety identical to /preview. Used
+   *  for HTML reports, PDFs, screenshots, anything that's better
+   *  viewed in Finder/Preview/Safari than rendered inline. */
+  app.post('/api/console/files/open', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const raw = typeof req.query.path === 'string' ? req.query.path : '';
+    if (!raw) { res.status(400).json({ error: 'path required' }); return; }
+    try {
+      const resolved = path.resolve(raw);
+      const relCheck = path.relative(VAULT_DIR, resolved);
+      if (relCheck.startsWith('..') || path.isAbsolute(relCheck)) {
+        res.status(403).json({ error: 'path outside vault' });
+        return;
+      }
+      if (!fs.existsSync(resolved)) { res.status(404).json({ error: 'not found' }); return; }
+      if (process.platform !== 'darwin') {
+        res.status(501).json({ error: 'open only implemented on macOS — use Finder/Explorer manually' });
+        return;
+      }
+      // spawn is detached + unref'd so the spawn child doesn't block
+      // the request response on slow `open` dispatching.
+      const child = childProcess.spawn('open', [resolved], { detached: true, stdio: 'ignore' });
+      child.unref?.();
+      res.json({ ok: true });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -1837,15 +2047,43 @@ export function registerConsoleRoutes(
   // wraps startApprovedInstallCommand so the existing job machinery
   // streams output back.
 
-  app.get('/api/console/cli-catalog', (req, res) => {
+  app.get('/api/console/cli-catalog', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const q = typeof req.query.q === 'string' ? req.query.q : '';
     try {
+      // Auto-promote: any catalog CLI installed on PATH but not yet
+      // connected (and not explicitly forgotten) gets connected here.
+      // This closes the "I had sf already from before Clementine" gap
+      // so the friend's install just works — agent sees the auth
+      // metadata + dashboard surfaces it as a connected integration.
+      const { autoPromoteInstalledClis } = await import('../integrations/cli-catalog/catalog.js');
+      const promotion = autoPromoteInstalledClis();
       res.json({
         query: q,
         results: q ? statusForSearchResults(q) : [],
         connected: readConnectedClis(),
+        autoPromoted: promotion.promoted,
       });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * Reconnect a previously-forgotten catalog CLI. Drops the id from
+   * forgotten[] + writes a fresh connected record. Used by the
+   * dashboard's "Reconnect" button when the user wants a CLI back
+   * after explicitly disconnecting it.
+   */
+  app.post('/api/console/cli-catalog/reconnect', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const id = typeof req.body?.id === 'string' ? req.body.id : '';
+    if (!id) { res.status(400).json({ error: 'id required' }); return; }
+    try {
+      const { reconnectCli } = await import('../integrations/cli-catalog/catalog.js');
+      const record = reconnectCli(id);
+      if (!record) { res.status(404).json({ error: 'unknown catalog id: ' + id }); return; }
+      res.json({ record });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

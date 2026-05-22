@@ -82,6 +82,27 @@ const WORKFLOW_HEARTBEAT_INTERVAL_MS = 10 * 60_000;
  */
 const runsParkedOnApproval = new Set<string>();
 
+/**
+ * Current-step tracker per active workflow run. The for-step loop in
+ * executeWorkflow updates this before each executeStep call so the
+ * heartbeat can say "step 5 of 9 · enrich_missing_seo_once" instead of
+ * the previous generic "still running" — which left users staring at a
+ * 5-minute-old message with no signal whether the workflow was making
+ * progress or stuck. Cleared on workflow completion/failure.
+ */
+const runCurrentStep = new Map<string, { stepId: string; index: number; total: number }>();
+
+export function setWorkflowRunCurrentStep(
+  runId: string,
+  step: { stepId: string; index: number; total: number },
+): void {
+  runCurrentStep.set(runId, step);
+}
+
+export function clearWorkflowRunCurrentStep(runId: string): void {
+  runCurrentStep.delete(runId);
+}
+
 export function markWorkflowRunPausedForApproval(runId: string): void {
   runsParkedOnApproval.add(runId);
 }
@@ -103,11 +124,18 @@ function startWorkflowHeartbeat(
     if (runsParkedOnApproval.has(runId)) return;
     count += 1;
     const elapsedMin = Math.max(1, Math.round((Date.now() - startMs) / 60_000));
+    // v0.5.6: enrich the heartbeat with current step context so the
+    // user knows what's happening, not just that something is. Falls
+    // back to the old generic message when the step tracker is empty
+    // (e.g. during the synthesis pass or post-step cleanup).
+    const cur = runCurrentStep.get(runId);
+    const stepLabel = cur ? ` · step ${cur.index} of ${cur.total} · ${cur.stepId}` : '';
+    const stepBody = cur ? `Currently: \`${cur.stepId}\` (step ${cur.index}/${cur.total}). ` : '';
     addNotification({
       id: `workflow-heartbeat-${runId}-${count}`,
       kind: 'workflow',
-      title: `Workflow still running: ${workflowName}`,
-      body: `Run ${runId} has been working for ${elapsedMin} min. Will notify on completion or failure. Open Console → Activity for live status.`,
+      title: `Workflow still running: ${workflowName}${stepLabel}`,
+      body: `${stepBody}Run ${runId} has been working for ${elapsedMin} min. Will notify on completion or failure. Open Console → Activity for live status.`,
       createdAt: new Date().toISOString(),
       read: false,
       metadata: { workflow: workflowName, runId, heartbeat: true, elapsedMin },
@@ -745,12 +773,20 @@ async function executeWorkflow(
     ? workflow.steps.filter((s) => s.id === targetStepId)
     : workflow.steps;
 
-  for (const step of steps) {
+  for (let stepIndex = 0; stepIndex < steps.length; stepIndex++) {
+    const step = steps[stepIndex];
     throwIfWorkflowRunCancelled(runId);
     if (stepOutputs[step.id] !== undefined) {
       // Already completed in a prior pass — use the cached output.
       continue;
     }
+    // Update the heartbeat's view of the current step BEFORE executing
+    // so the next "still running" ping (if any) shows the right label.
+    setWorkflowRunCurrentStep(runId, {
+      stepId: step.id,
+      index: stepIndex + 1,
+      total: steps.length,
+    });
     const completedItems = resume.completedItems.get(step.id) ?? new Map();
     const output = await executeStep(step, {
       workflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems, forEachFailures,
@@ -758,6 +794,10 @@ async function executeWorkflow(
     throwIfWorkflowRunCancelled(runId);
     stepOutputs[step.id] = output;
   }
+  // Clear the step tracker before the synthesis pass + final cleanup
+  // so the heartbeat doesn't keep showing the LAST step name after
+  // the per-step loop is done.
+  clearWorkflowRunCurrentStep(runId);
 
   // Synthesis step (optional final pass over all step outputs). Skipped
   // when TRY is running a single step in isolation — the step's own

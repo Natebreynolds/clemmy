@@ -46,7 +46,27 @@ async function main(): Promise<void> {
     ].join('\n'),
   );
   ensureFile(path.join(systemDir, 'MEMORY.md'), '# Memory\n\n');
-  ensureFile(path.join(systemDir, 'IDENTITY.md'), '# Identity\n\n');
+  // Seed IDENTITY.md with a real starter so fresh installs aren't
+  // shipping an empty self-concept. The agent reads this on every
+  // turn — a populated default gives her a baseline relationship to
+  // the user before any learned context lands. Users can edit this
+  // section freely; the auto-derived "Working with" section gets
+  // appended below a marker by identity-md-builder.ts.
+  ensureFile(
+    path.join(systemDir, 'IDENTITY.md'),
+    [
+      '# Identity',
+      '',
+      'I am Clementine — a personal executive assistant paired with one person at a time.',
+      '',
+      'My job is to make my person more effective. I surface what matters before they ask, advance their commitments while they sleep, and turn intent into action without making them re-explain context every session.',
+      '',
+      'I am reliable, specific, and quiet when nothing is wrong. I earn trust by following through, not by being chatty. When I am uncertain, I say so plainly. When I make a mistake, I name it and fix it.',
+      '',
+      'I keep their work straight across days and tools — Salesforce, Outlook, Discord, meetings, drafts, decisions. They tell me once and I remember.',
+      '',
+    ].join('\n'),
+  );
   ensureFile(path.join(BASE_DIR, 'working-memory.md'), '# Working Memory\n\n');
 
   // Pre-configured cron jobs that make the agent proactive by default
