@@ -16722,6 +16722,16 @@ const CONSOLE_JS = `
           runtimeCredentialReady
             ? '    <span class="cred-action-note">ACTIVE VIA AUTH STORE</span>'
             : '    <button class="cred-set" type="button" data-cred-set="' + escMem(r.name) + '">' + (r.hasValue ? 'REPLACE' : 'SET') + ' ✎</button>',
+          // Codex re-auth: surfaced only on the ACCESS token row (to
+          // avoid duplicate buttons on the refresh row). The button
+          // calls window.clemmy.setupCodexLogin() — same IPC the setup
+          // wizard's "Sign in with ChatGPT/Codex" button uses. Without
+          // this, users with expired refresh tokens had no path back to
+          // working state from the dashboard; they had to delete
+          // ~/.codex/auth.json or run a CLI command. v0.5.9 fix.
+          (r.name === 'codex_oauth_access_token')
+            ? '    <button class="cred-reauth" type="button" data-cred-codex-reauth>RE-AUTHENTICATE ↻</button>'
+            : '',
           (!runtimeCredentialReady && r.status === 'env_only')
             ? '    <button class="cred-migrate" type="button" data-cred-migrate="' + escMem(r.name) + '">MOVE TO VAULT ⇢</button>'
             : '',
@@ -16807,6 +16817,45 @@ const CONSOLE_JS = `
           await fetch(withToken('/api/console/credentials/' + encodeURIComponent(name)), { method: 'DELETE' });
           await refreshCredentialsHealth();
         } catch (err) { alert('Delete failed: ' + (err.message || err)); }
+      });
+    });
+    // Codex re-auth: kicks off the same OAuth flow the setup wizard
+    // uses. Opens a browser window where the user signs in with their
+    // ChatGPT account; on success, fresh access + refresh tokens
+    // persist and the credentials list refreshes to reflect new
+    // "set at" timestamps. Available only when window.clemmy is
+    // present — i.e. running inside the Electron desktop app, not
+    // the dev tree or a remote browser pointed at a daemon.
+    root.querySelectorAll('[data-cred-codex-reauth]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const ipc = (window).clemmy && (window).clemmy.setupCodexLogin;
+        if (typeof ipc !== 'function') {
+          alert('Re-authentication is only available inside the Clementine desktop app. From the dev tree, run: npx tsx src/cli/index.ts auth login-native');
+          return;
+        }
+        const originalLabel = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = 'OPENING BROWSER…';
+        try {
+          const result = await ipc();
+          if (result && result.ok) {
+            btn.textContent = 'RE-AUTHENTICATED ✓';
+            await refreshCredentialsHealth();
+            setTimeout(() => {
+              btn.disabled = false;
+              btn.textContent = originalLabel;
+            }, 2000);
+          } else {
+            const message = (result && result.error) || 'Re-authentication did not complete';
+            alert('Re-auth failed: ' + message);
+            btn.disabled = false;
+            btn.textContent = originalLabel;
+          }
+        } catch (err) {
+          alert('Re-auth failed: ' + ((err && err.message) || err));
+          btn.disabled = false;
+          btn.textContent = originalLabel;
+        }
       });
     });
   }
