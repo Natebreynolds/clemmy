@@ -159,6 +159,29 @@ const ALWAYS_READ = new Set<string>([
   'local_cli_list',
   'list_files',
   'read_file',
+  // 2026-05-22: notify_user is a local-only side effect (desktop
+  // notification + Discord ping). It does NOT mutate external state.
+  // The verb-match pattern below classifies it as 'send' because of
+  // the `notify` verb, which (incorrectly) gates it on approval. Real
+  // failure mode: every workflow run that ends with notify_user (e.g.
+  // "Outlook triage complete", "End of day summary", scheduled
+  // synthesis steps) parks waiting for approval; the proactive brief
+  // then pings the user about it; the user dismisses but the pending
+  // approval lingers, creating a noise loop. Observed across 4+
+  // workflow runs on 2026-05-22.
+  //
+  // The same logic applies to a small set of "the agent tells the user
+  // something" affordances that have only local side effects:
+  'notify_user',
+  // ask_user_question — asks for clarifying input, doesn't mutate.
+  // The QUESTION itself isn't the approval gate; the AGENT's response
+  // to the user's answer might be, and that's a separate tool call.
+  'ask_user_question',
+  // draft_plan / propose_check_in_template / surface_plan — planning
+  // surfaces, agent-internal. Not network mutations.
+  'draft_plan',
+  'surface_plan',
+  'propose_check_in_template',
 ]);
 
 /**

@@ -22,6 +22,23 @@ export interface RunRequest {
    * unbounded runs (chat default — the user is watching).
    */
   maxWallClockMs?: number;
+  /**
+   * Per-call tool exclusion list. Runtimes that load the catalog from
+   * getCoreToolsAsync() must filter these names out before handing the
+   * tool surface to the model. Used as a code-level backstop when a
+   * caller's prompt already tells the model not to use certain tools
+   * (e.g. the Workflow Architect chat tells the model to propose diff
+   * ops instead of calling workflow_create — this list ensures the
+   * model can't reach the tool even if the prompt is ignored).
+   *
+   * Names are matched exactly. MCP-shimmed tools (server__tool) follow
+   * the same exact-match rule. Filtering does not affect the on-disk
+   * registry — only the tool surface visible to this single run.
+   *
+   * Has no effect on the CodexCliRuntime (codex_oauth mode), which
+   * spawns the Codex CLI subprocess with its own tool surface.
+   */
+  excludeToolNames?: string[];
 }
 
 export interface ToolActivity {
@@ -146,6 +163,9 @@ export interface AssistantRequest {
   shouldCancel?: () => boolean | Promise<boolean>;
   /** Wall-clock budget passed through to the runtime. See RunRequest. */
   maxWallClockMs?: number;
+  /** Tool names to hide from the model for this single call. See
+   *  RunRequest.excludeToolNames for the contract. */
+  excludeToolNames?: string[];
 }
 
 export interface AssistantResponse {

@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, s
 import path from 'node:path';
 import matter from 'gray-matter';
 import { WORKFLOWS_DIR } from './vault.js';
+import { emitWorkflowChange } from './workflow-change-bus.js';
 
 /**
  * Single source of truth for reading and writing Clementine workflows.
@@ -68,6 +69,17 @@ export interface WorkflowStepInput {
    * surface handed to each Agent.run().
    */
   allowedTools?: string[];
+  /**
+   * Reference to an installed skill — directory name under
+   * ~/.clementine-next/skills/<usesSkill>/. When set, the runner loads
+   * the skill's SKILL.md body and injects it ahead of this step's
+   * prompt so the model executes with the skill's instructions in
+   * scope. Lets a workflow compose installed expertise as a Lego block
+   * instead of re-prompting it inline.
+   *
+   * Serialized to YAML as `uses_skill`.
+   */
+  usesSkill?: string;
 }
 
 export interface WorkflowTrigger {
@@ -234,6 +246,15 @@ function readWorkflowFile(filePath: string): WorkflowDefinition | null {
       }
       const stepAllowed = parseAllowedTools(step.allowedTools);
       if (stepAllowed) result.allowedTools = stepAllowed.map((t) => (typeof t === 'string' ? t : t.name));
+      // Accept either `uses_skill` (yaml-idiomatic snake_case, what the
+      // architect emits) or `usesSkill` (camelCase, what the desktop UI
+      // sends). Either round-trips correctly.
+      const skillRef = typeof step.uses_skill === 'string'
+        ? step.uses_skill.trim()
+        : typeof step.usesSkill === 'string'
+          ? step.usesSkill.trim()
+          : '';
+      if (skillRef) result.usesSkill = skillRef;
       return result;
     });
     return {
@@ -332,6 +353,7 @@ function writeWorkflowToDir(dirPath: string, def: WorkflowDefinition): void {
       if (s.forEach) out.forEach = s.forEach;
       if (s.deterministic) out.deterministic = s.deterministic;
       if (s.allowedTools && s.allowedTools.length > 0) out.allowedTools = s.allowedTools;
+      if (s.usesSkill) out.uses_skill = s.usesSkill;
       return out;
     });
   }
@@ -425,6 +447,9 @@ export function listWorkflows(): WorkflowEntry[] {
 export function writeWorkflow(name: string, def: WorkflowDefinition): WorkflowEntry {
   ensureWorkflowsDir();
   const dirPath = path.join(WORKFLOWS_DIR, name);
+  // Detect created-vs-updated BEFORE the write so the event can carry
+  // the right op. existsSync on the directory is the canonical signal.
+  const isCreate = !existsSync(dirPath) && !existsSync(path.join(WORKFLOWS_DIR, `${name}.md`));
   // `name` is the directory slug; the human display label lives in
   // def.name (e.g. "Patch Validation Test"). Only fall back to the
   // slug when the caller didn't set one — otherwise we'd clobber the
@@ -439,6 +464,7 @@ export function writeWorkflow(name: string, def: WorkflowDefinition): WorkflowEn
   }
   const entry = readWorkflow(name);
   if (!entry) throw new Error(`writeWorkflow: failed to read back ${name} after write`);
+  emitWorkflowChange({ name, op: isCreate ? 'created' : 'updated' });
   return entry;
 }
 
@@ -456,5 +482,6 @@ export function deleteWorkflow(name: string): boolean {
   } else {
     try { unlinkSync(entry.filePath); } catch { return false; }
   }
+  emitWorkflowChange({ name, op: 'deleted' });
   return true;
 }

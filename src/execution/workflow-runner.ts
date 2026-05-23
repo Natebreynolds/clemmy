@@ -10,6 +10,7 @@ import {
   type WorkflowDefinition,
   type WorkflowStepInput,
 } from '../memory/workflow-store.js';
+import { loadSkill } from '../memory/skill-store.js';
 import {
   appendWorkflowEvent,
   computeResumeState,
@@ -213,6 +214,42 @@ function throwIfWorkflowRunCancelled(runId: string): void {
  * that bringing in a template engine is dead weight and risks
  * sandbox-escape footguns.
  */
+/**
+ * When the step declares `usesSkill`, load the skill's SKILL.md body
+ * and prepend it to the rendered prompt with explicit delimiters so the
+ * model can distinguish HOW (the skill instructions) from WHAT (the
+ * step task). Missing or malformed skills are surfaced as a one-line
+ * warning header — the step still runs with the raw prompt so a
+ * mistyped name doesn't silently strip context.
+ */
+export function applySkillToPrompt(step: WorkflowStepInput, rendered: string): string {
+  const skillName = step.usesSkill?.trim();
+  if (!skillName) return rendered;
+  const skill = loadSkill(skillName);
+  if (!skill) {
+    logger.warn({ stepId: step.id, usesSkill: skillName }, 'workflow step references skill that is not installed; running with raw prompt');
+    return [
+      `# WARNING: skill "${skillName}" is not installed; running this step without it.`,
+      '',
+      rendered,
+    ].join('\n');
+  }
+  const skillBody = (skill.body || '').trim();
+  if (!skillBody) return rendered;
+  return [
+    `=== SKILL: ${skill.name} ===`,
+    skill.frontmatter.description ? `Purpose: ${skill.frontmatter.description}` : '',
+    '',
+    skillBody,
+    '=== END SKILL ===',
+    '',
+    'Use the instructions above to complete the step task below.',
+    '',
+    '=== STEP TASK ===',
+    rendered,
+  ].filter(Boolean).join('\n');
+}
+
 function renderTemplate(
   template: string,
   inputs: Record<string, string>,
@@ -634,7 +671,7 @@ async function executeStep(
         itemKey: key,
       });
       try {
-        const prompt = renderTemplate(step.prompt, ctx.inputs, ctx.stepOutputs, item);
+        const prompt = applySkillToPrompt(step, renderTemplate(step.prompt, ctx.inputs, ctx.stepOutputs, item));
         const output = workflowHarnessEnabled(step)
           ? (await runStepViaHarness(
               step,
@@ -701,7 +738,7 @@ async function executeStep(
     kind: 'step_started',
     stepId: step.id,
   });
-  const prompt = renderTemplate(step.prompt, ctx.inputs, ctx.stepOutputs);
+  const prompt = applySkillToPrompt(step, renderTemplate(step.prompt, ctx.inputs, ctx.stepOutputs));
   let output: string;
   if (workflowHarnessEnabled(step)) {
     try {

@@ -53,6 +53,48 @@ export interface ConsolidatedFactRow {
   active: number; // 0 or 1
   created_at: string;
   updated_at: string;
+  // v3 (Phase 1 brain architecture) — derived-fact provenance fields.
+  // NULL when the fact was directly stated by the user / agent via
+  // memory_remember; populated when the reflection loop synthesized
+  // the fact from a tool return.
+  derived_from_session_id: string | null;
+  derived_from_call_id: string | null;
+  derived_from_tool: string | null;
+  trust_level: number | null; // 0.0–1.0; user-stated = 1.0; derived inferred ~0.6
+  extracted_at: string | null;
+  // v4 (brain architecture Phase 1 expansion — Stanford-faithful):
+  //   importance      — 1.0..10.0 poignancy score (Park et al §4.1). Used
+  //                     to gate reflection trigger (sum-importance ≥ 150)
+  //                     and as a retrieval weight in memory_search.
+  //   last_accessed_at — ISO timestamp; touched on every recall. Stanford
+  //                     §4.1 uses exp decay 0.995/hr from THIS column
+  //                     (not creation) for the recency component of the
+  //                     retrieval score.
+  importance: number | null;
+  last_accessed_at: string | null;
+}
+
+export type EntityType = 'person' | 'company' | 'project' | 'place' | 'thing';
+
+export interface EntityRow {
+  id: number;
+  entity_type: EntityType;
+  canonical_name: string;
+  canonical_name_lc: string;
+  aliases_json: string; // JSON array of alternate names
+  first_seen_at: string;
+  last_seen_at: string;
+  mention_count: number;
+}
+
+export interface EpisodicPointerRow {
+  id: number;
+  session_id: string;
+  call_id: string;
+  label: string;
+  tool: string | null;
+  source_uri: string | null; // e.g. "outlook:thread:abc123"
+  created_at: string;
 }
 
 let cached: Database.Database | null = null;
@@ -160,6 +202,87 @@ const MIGRATIONS: { version: number; sql: string }[] = [
       );
 
       CREATE INDEX IF NOT EXISTS idx_inbound_status ON inbound_messages(status, received_at);
+    `,
+  },
+  {
+    // v3 — Phase 1 brain architecture (Stanford Generative Agents
+    // reflection loop + Tulving's memory taxonomy).
+    //
+    // Three additions:
+    //  (a) Extend consolidated_facts with derivation provenance so a
+    //      fact synthesized from a tool return links back to its
+    //      source call_id. Enables the "go look at the original"
+    //      pointer-first model — see [[project_brain_architecture]].
+    //  (b) New `entities` table — first-class registry of people,
+    //      companies, projects the brain knows about. Aliases enable
+    //      cross-source matching ("Marlow" in Outlook = marlow@acme.com).
+    //  (c) New `episodic_pointers` table — short labels that point at a
+    //      specific tool_outputs row (session_id + call_id), so the
+    //      agent can refer to "the pricing convo" and recall fetches
+    //      the actual content via recall_tool_result.
+    version: 3,
+    sql: `
+      ALTER TABLE consolidated_facts ADD COLUMN derived_from_session_id TEXT;
+      ALTER TABLE consolidated_facts ADD COLUMN derived_from_call_id   TEXT;
+      ALTER TABLE consolidated_facts ADD COLUMN derived_from_tool      TEXT;
+      ALTER TABLE consolidated_facts ADD COLUMN trust_level             REAL;
+      ALTER TABLE consolidated_facts ADD COLUMN extracted_at            TEXT;
+
+      CREATE INDEX IF NOT EXISTS idx_facts_extracted_at
+        ON consolidated_facts(extracted_at DESC) WHERE extracted_at IS NOT NULL;
+
+      CREATE TABLE IF NOT EXISTS entities (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        entity_type       TEXT NOT NULL CHECK (entity_type IN ('person','company','project','place','thing')),
+        canonical_name    TEXT NOT NULL,
+        canonical_name_lc TEXT NOT NULL,
+        aliases_json      TEXT NOT NULL DEFAULT '[]',
+        first_seen_at     TEXT NOT NULL,
+        last_seen_at      TEXT NOT NULL,
+        mention_count     INTEGER NOT NULL DEFAULT 1,
+        UNIQUE(entity_type, canonical_name_lc)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_entities_last_seen
+        ON entities(last_seen_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_entities_type_name
+        ON entities(entity_type, canonical_name_lc);
+
+      CREATE TABLE IF NOT EXISTS episodic_pointers (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id  TEXT NOT NULL,
+        call_id     TEXT NOT NULL,
+        label       TEXT NOT NULL,
+        tool        TEXT,
+        source_uri  TEXT,
+        created_at  TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_episodic_session
+        ON episodic_pointers(session_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_episodic_call
+        ON episodic_pointers(call_id);
+    `,
+  },
+  {
+    // v4 — Brain architecture Phase 1 expansion, closing the Stanford
+    // Generative Agents research gaps documented in
+    // [[project_brain_phase1_gaps]]:
+    //   - `importance` (1.0–10.0): Park et al §4.1's poignancy score.
+    //     Used by reflection.ts to gate the trigger via sum-threshold
+    //     (Stanford uses 150) AND as a retrieval weight in memory_search.
+    //   - `last_accessed_at`: Stanford §4.1's "since last retrieval"
+    //     anchor for the recency component (exp decay 0.995/hr). Touched
+    //     on every memory_search/recall hit.
+    version: 4,
+    sql: `
+      ALTER TABLE consolidated_facts ADD COLUMN importance REAL;
+      ALTER TABLE consolidated_facts ADD COLUMN last_accessed_at TEXT;
+
+      CREATE INDEX IF NOT EXISTS idx_facts_importance
+        ON consolidated_facts(importance DESC) WHERE importance IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS idx_facts_last_accessed
+        ON consolidated_facts(last_accessed_at DESC) WHERE last_accessed_at IS NOT NULL;
     `,
   },
 ];

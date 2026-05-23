@@ -66,7 +66,12 @@ function createCodeChallenge(verifier: string): string {
   return base64UrlEncode(createHash('sha256').update(verifier).digest());
 }
 
-function buildAuthorizeUrl(redirectUri: string, state: string, codeChallenge: string): URL {
+function buildAuthorizeUrl(
+  redirectUri: string,
+  state: string,
+  codeChallenge: string,
+  prompt?: 'login' | 'select_account',
+): URL {
   const authorizeUrl = new URL(AUTHORIZE_URL);
   authorizeUrl.searchParams.set('response_type', 'code');
   authorizeUrl.searchParams.set('client_id', CLIENT_ID);
@@ -76,6 +81,12 @@ function buildAuthorizeUrl(redirectUri: string, state: string, codeChallenge: st
   authorizeUrl.searchParams.set('code_challenge', codeChallenge);
   authorizeUrl.searchParams.set('code_challenge_method', 'S256');
   authorizeUrl.searchParams.set('id_token_add_organizations', 'true');
+  // 2026-05-23: standard OIDC `prompt` param. Re-auth button passes
+  // 'select_account' so the IdP forces an account picker even when the
+  // user already has a ChatGPT session cookie — that's the affordance
+  // that enables account switching. First-run setup passes nothing so
+  // the happy path stays cookie-friendly.
+  if (prompt) authorizeUrl.searchParams.set('prompt', prompt);
   return authorizeUrl;
 }
 
@@ -87,6 +98,7 @@ function listenForOAuthCallback(
   state: string,
   codeChallenge: string,
   openUrl: (url: string) => Promise<void> | void,
+  prompt?: 'login' | 'select_account',
 ): Promise<OAuthCallbackResult> {
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -122,7 +134,7 @@ function listenForOAuthCallback(
 
       const port = CALLBACK_PORTS[index];
       const redirectUri = `http://localhost:${port}${CALLBACK_PATH}`;
-      const authorizeUrl = buildAuthorizeUrl(redirectUri, state, codeChallenge);
+      const authorizeUrl = buildAuthorizeUrl(redirectUri, state, codeChallenge, prompt);
       const server = createServer((req, res) => {
         const requestUrl = new URL(req.url ?? '/', redirectUri);
         if (!isOAuthCallbackPath(requestUrl.pathname)) {
@@ -370,7 +382,17 @@ export async function importUsableCodexOAuthTokens(): Promise<CodexOAuthTokens |
  * Tokens are NOT persisted by this function — call `persistCodexOAuthTokens`
  * after to write them to the daemon's auth stores.
  */
-export async function runCodexOAuthLogin(): Promise<CodexOAuthTokens> {
+export interface RunCodexOAuthLoginOptions {
+  /** OIDC `prompt` param. Pass `select_account` to force the IdP to
+   *  show the account picker even when the user has a session cookie —
+   *  the affordance the Settings RE-AUTHENTICATE button needs for
+   *  account switching. Omit for the cookie-friendly first-run path. */
+  prompt?: 'login' | 'select_account';
+}
+
+export async function runCodexOAuthLogin(
+  options: RunCodexOAuthLoginOptions = {},
+): Promise<CodexOAuthTokens> {
   const state = base64UrlEncode(randomBytes(24));
   const codeVerifier = createCodeVerifier();
   const codeChallenge = createCodeChallenge(codeVerifier);
@@ -378,6 +400,7 @@ export async function runCodexOAuthLogin(): Promise<CodexOAuthTokens> {
     state,
     codeChallenge,
     (url) => shell.openExternal(url),
+    options.prompt,
   );
 
   if (callback.error) {

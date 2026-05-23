@@ -71,6 +71,19 @@ test('classifyTool: read prefixes', () => {
   assert.equal(classifyTool('recall'), 'read');
 });
 
+test('classifyTool: local-side-effect tools never gate on approval', () => {
+  // Regression for the 2026-05-22 "proactive brief pings about notify_user
+  // approval in a loop" bug. notify_user matches the `notify` verb in the
+  // `send` category, but it has only LOCAL side effects (desktop notification
+  // + Discord ping) and must not require approval. Same logic for
+  // ask_user_question, draft_plan, surface_plan, propose_check_in_template.
+  assert.equal(classifyTool('notify_user'), 'read');
+  assert.equal(classifyTool('ask_user_question'), 'read');
+  assert.equal(classifyTool('draft_plan'), 'read');
+  assert.equal(classifyTool('surface_plan'), 'read');
+  assert.equal(classifyTool('propose_check_in_template'), 'read');
+});
+
 test('classifyTool: write prefixes', () => {
   assert.equal(classifyTool('write_file'), 'write');
   assert.equal(classifyTool('remember'), 'write');

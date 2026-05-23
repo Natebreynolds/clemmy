@@ -101,51 +101,50 @@ export function renderConsoleHtml(token: string): string {
         <span class="nav-key">02</span>
         <span class="nav-label">Activity</span>
       </button>
-      <button class="nav" data-panel="memory">
+      <!-- v0.5.11: Brain panel — single home for everything Clementine
+           knows + how it learns + how it's evolving. Consolidates the
+           legacy Memory / Context / Evolution top-level slots into one
+           panel with 5 sub-tabs (Overview / Knowledge / Events /
+           Profile / Evolution). See [[project_brain_architecture]]. -->
+      <button class="nav" data-panel="brain">
         <span class="nav-key">03</span>
-        <span class="nav-label">Memory</span>
-      </button>
-      <button class="nav" data-panel="context">
-        <span class="nav-key">04</span>
-        <span class="nav-label">Context</span>
+        <span class="nav-label">Brain</span>
       </button>
       <button class="nav" data-panel="workflows">
-        <span class="nav-key">05</span>
+        <span class="nav-key">04</span>
         <span class="nav-label">Workflows</span>
       </button>
       <button class="nav" data-panel="tools">
-        <span class="nav-key">06</span>
+        <span class="nav-key">05</span>
         <span class="nav-label">Tools</span>
       </button>
       <button class="nav" data-panel="projects">
-        <span class="nav-key">07</span>
+        <span class="nav-key">06</span>
         <span class="nav-label">Projects</span>
       </button>
       <button class="nav" data-panel="skills">
-        <span class="nav-key">08</span>
+        <span class="nav-key">07</span>
         <span class="nav-label">Skills</span>
       </button>
       <button class="nav" data-panel="integrations">
-        <span class="nav-key">09</span>
+        <span class="nav-key">08</span>
         <span class="nav-label">Integrations</span>
       </button>
       <button class="nav" data-panel="usage">
-        <span class="nav-key">10</span>
+        <span class="nav-key">09</span>
         <span class="nav-label">Usage</span>
       </button>
       <button class="nav" data-panel="settings">
-        <span class="nav-key">11</span>
+        <span class="nav-key">10</span>
         <span class="nav-label">Settings</span>
       </button>
-      <!--
-        EVOLUTION (slot 12) — hidden by default. Revealed when the user
-        flips Settings → "Show diagnostics" because autoresearch is a
-        power-user feature. The toggle handler in initDiagnosticsToggle
-        also flips this nav button's hidden attr.
-      -->
-      <button class="nav" data-panel="evolution" data-nav-evolution hidden>
-        <span class="nav-key">12</span>
-        <span class="nav-label">Evolution</span>
+      <!-- v0.5.11: dedicated Approvals panel. Surfaces pending approvals
+           with full context (subject, args, workflow source, age) and
+           per-row + bulk actions. Replaces the noise loop where briefs
+           pinged the user without enough context to act on. -->
+      <button class="nav" data-panel="approvals">
+        <span class="nav-key">A</span>
+        <span class="nav-label">Approvals <span class="approvals-badge" data-approvals-badge hidden></span></span>
       </button>
 
       <!-- ── nav-dock: fills the dead space under the menu items ──
@@ -430,246 +429,14 @@ export function renderConsoleHtml(token: string): string {
         </div>
       </section>
 
-      <section class="panel-frame" data-section="memory" hidden>
-        <div class="panel-tag">PANEL · 03 · MEMORY NAVIGATOR</div>
+      <!-- v0.5.11 brain-consolidation: Memory panel content moved to
+           Brain → Knowledge → Graph & Files. Nav button removed; this
+           empty shell is deleted in the same ship. -->
+      <!-- (memory shell removed) -->
 
-        <div class="panel-body memory-layout">
-
-          <aside class="mem-sidebar">
-            <div class="mem-stats" data-mem-stats>
-              <div class="mem-stat"><span>CHUNKS</span><em data-mem-chunks>—</em></div>
-              <div class="mem-stat"><span>FILES</span><em data-mem-files>—</em></div>
-              <div class="mem-stat"><span>FACTS</span><em data-mem-facts>—</em></div>
-              <div class="mem-stat"><span>EMBED</span><em data-mem-embed>—</em></div>
-            </div>
-
-            <div class="mem-section">
-              <div class="mem-section-head">
-                <span>INDEXED FILES</span>
-                <em data-mem-files-count>—</em>
-              </div>
-              <ol class="mem-file-list" data-mem-file-list>
-                <li class="empty">— loading —</li>
-              </ol>
-            </div>
-
-            <div class="mem-section">
-              <div class="mem-section-head">
-                <span>RECENT FILES <em style="color:var(--fg-3); font-style:normal; font-size:9.5px; letter-spacing:0.06em;">· all extensions</em></span>
-                <em data-mem-recent-files-count>—</em>
-              </div>
-              <input type="search" class="mem-files-filter" data-mem-recent-files-filter
-                placeholder="filter by name…"
-                autocomplete="off" spellcheck="false"
-                style="margin: 4px 8px 8px 8px; width: calc(100% - 16px); padding: 4px 6px; font-size: 11px; background: var(--bg-1); border: 1px solid var(--line); color: var(--fg);" />
-              <ol class="mem-file-list" data-mem-recent-files-list>
-                <li class="empty">— loading —</li>
-              </ol>
-            </div>
-
-            <div class="mem-section">
-              <div class="mem-section-head">
-                <span>DURABLE FACTS</span>
-                <em data-mem-facts-count>—</em>
-              </div>
-              <div class="mem-fact-kinds" data-mem-fact-kinds>
-                <button class="kind-pill active" data-kind="">ALL</button>
-                <button class="kind-pill" data-kind="user">USER</button>
-                <button class="kind-pill" data-kind="project">PROJECT</button>
-                <button class="kind-pill" data-kind="feedback">FEEDBACK</button>
-                <button class="kind-pill" data-kind="reference">REFERENCE</button>
-              </div>
-              <ol class="mem-fact-list" data-mem-fact-list>
-                <li class="empty">— loading —</li>
-              </ol>
-            </div>
-          </aside>
-
-          <div class="mem-main">
-            <div class="mem-toolbar">
-              <div class="mem-view-toggle">
-                <button class="mem-view-btn" data-mem-view="viewer" onclick="window.__clementineMemoryView && window.__clementineMemoryView('viewer'); return false;">VIEWER</button>
-                <button class="mem-view-btn active" data-mem-view="graph" onclick="window.__clementineMemoryView && window.__clementineMemoryView('graph'); return false;">GRAPH</button>
-                <button class="mem-view-btn" data-mem-view="meetings" onclick="window.__clementineMemoryView && window.__clementineMemoryView('meetings'); return false;">MEETINGS</button>
-              </div>
-              <div class="mem-search">
-                <input type="search" class="mem-search-input" data-mem-search
-                  placeholder="search vault · FTS + embedding rerank · ⏎ to query"
-                  autocomplete="off" spellcheck="false" />
-                <span class="mem-search-meta" data-mem-search-meta>—</span>
-              </div>
-            </div>
-
-            <div class="mem-viewer" data-mem-viewer hidden>
-              <div class="mem-empty">
-                <div class="mem-empty-mark">▢</div>
-                <div class="mem-empty-text">SEARCH OR SELECT A FILE / FACT</div>
-              </div>
-            </div>
-
-            <div class="mem-graph" data-mem-graph>
-              <div class="mem-graph-topbar">
-                <div class="mem-graph-controls">
-                  <button type="button" data-mem-graph-refresh>REFRESH</button>
-                  <button type="button" data-mem-graph-fit>FIT</button>
-                  <button type="button" data-mem-graph-reset>RESET</button>
-                </div>
-                <div class="mem-graph-filters">
-                  <select data-mem-graph-type aria-label="Filter graph node type">
-                    <option value="">ALL NODES</option>
-                    <option value="fact">FACTS</option>
-                    <option value="file">FILES</option>
-                    <option value="kind">KINDS</option>
-                  </select>
-                  <input type="search" data-mem-graph-search placeholder="filter graph…" autocomplete="off" spellcheck="false" />
-                </div>
-                <span class="mem-graph-meta" data-mem-graph-meta>—</span>
-              </div>
-              <div class="mem-graph-canvas" data-mem-graph-canvas>
-                <div class="mem-graph-sparse-hint" data-mem-graph-sparse-hint hidden>
-                  <strong>SPARSE LINKS</strong>
-                  Most current connections are kind clusters. More meeting notes, vault entries, and cross-file references will thicken the web.
-                </div>
-              </div>
-              <aside class="mem-graph-detail" data-mem-graph-detail>
-                <div class="mem-graph-detail-empty">Hover or click a node to inspect.</div>
-              </aside>
-              <div class="mem-graph-legend">
-                <span><i class="dot kind"></i> Kind<em data-mem-legend-kinds>—</em></span>
-                <span><i class="dot fact"></i> Fact<em data-mem-legend-facts>—</em></span>
-                <span><i class="dot file"></i> File<em data-mem-legend-files>—</em></span>
-              </div>
-            </div>
-
-            <!--
-              Meetings sub-view — listing of recent Recall captures with
-              their analysis. Hidden by default; activated by the
-              MEETINGS button in the mem-view-toggle.
-            -->
-            <div class="mem-meetings" data-mem-meetings hidden>
-              <div class="mem-meetings-head">
-                <span class="mem-meetings-tag">CAPTURED MEETINGS</span>
-                <span class="mem-meetings-meta" data-mem-meetings-meta>—</span>
-                <button type="button" class="mem-meetings-refresh" data-mem-meetings-refresh>REFRESH</button>
-              </div>
-              <div class="mem-meetings-list" data-mem-meetings-list>
-                <div class="mem-meetings-empty">— loading recent meetings —</div>
-              </div>
-              <div class="mem-meetings-detail" data-mem-meetings-detail>
-                <div class="mem-meetings-detail-empty">Pick a meeting on the left to see its summary, action items, and transcript.</div>
-              </div>
-            </div>
-          </div>
-
-        </div>
-      </section>
-
-      <section class="panel-frame" data-section="context" hidden>
-        <div class="panel-tag">PANEL · 04 · CONTEXT / IDENTITY</div>
-
-        <div class="panel-body context-layout">
-          <header class="context-header">
-            <div>
-              <h3>Agent Context</h3>
-              <p>What Clementine knows before it talks, acts, or listens. Keep the core identity files useful, then add durable facts and goals as the operating picture changes.</p>
-            </div>
-            <div class="context-stats" data-context-stats>
-              <div class="stat-card"><span>FILES</span><em data-context-files-count>—</em></div>
-              <div class="stat-card"><span>FACTS</span><em data-context-facts-count>—</em></div>
-              <div class="stat-card"><span>GOALS</span><em data-context-goals-count>—</em></div>
-              <div class="stat-card"><span>VOICE CTX</span><em data-context-voice-count>—</em></div>
-            </div>
-          </header>
-
-          <div class="context-grid">
-            <section class="context-card context-profile-card">
-              <div class="context-card-head">
-                <span>USER PROFILE</span>
-                <em data-context-profile-meta>—</em>
-              </div>
-              <form class="context-profile-form" data-context-profile-form>
-                <div class="context-form-grid">
-                  <label>Preferred name<input name="preferredName" data-context-profile-field autocomplete="off" /></label>
-                  <label>Role<input name="role" data-context-profile-field autocomplete="off" /></label>
-                  <label>Timezone<input name="timezone" data-context-profile-field placeholder="America/Los_Angeles" autocomplete="off" /></label>
-                  <label>Tone
-                    <select name="communicationTone" data-context-profile-field>
-                      <option value="terse">terse</option>
-                      <option value="balanced">balanced</option>
-                      <option value="verbose">verbose</option>
-                    </select>
-                  </label>
-                </div>
-                <label class="context-notes-label">Notes<textarea name="notes" data-context-profile-field rows="3" placeholder="Standing preferences, work style, people/projects Clementine should respect."></textarea></label>
-                <button type="submit" class="context-save">SAVE PROFILE ✎</button>
-              </form>
-            </section>
-
-            <section class="context-card context-health-card">
-              <div class="context-card-head">
-                <span>CONTEXT HEALTH</span>
-                <button type="button" data-context-refresh>REFRESH</button>
-              </div>
-              <div class="context-health-list" data-context-health-list>
-                <div class="settings-info">— loading —</div>
-              </div>
-            </section>
-          </div>
-
-          <section class="context-card">
-            <div class="context-card-head">
-              <span>CORE CONTEXT FILES</span>
-              <em>loaded into chat, Discord, and live voice</em>
-            </div>
-            <div class="context-files" data-context-files>
-              <div class="settings-info">— loading —</div>
-            </div>
-          </section>
-
-          <div class="context-grid lower">
-            <section class="context-card">
-              <div class="context-card-head">
-                <span>STANDING MEMORY</span>
-                <em>durable facts injected on every run</em>
-              </div>
-              <form class="context-fact-form" data-context-fact-form>
-                <select name="kind">
-                  <option value="user">user</option>
-                  <option value="project">project</option>
-                  <option value="feedback">feedback</option>
-                  <option value="reference">reference</option>
-                </select>
-                <input name="content" placeholder="Clementine should remember…" autocomplete="off" />
-                <button type="submit">REMEMBER</button>
-              </form>
-              <div class="context-facts-list" data-context-facts-list>
-                <div class="settings-info">— loading —</div>
-              </div>
-            </section>
-
-            <section class="context-card">
-              <div class="context-card-head">
-                <span>ACTIVE GOALS</span>
-                <em>what proactive work should optimize around</em>
-              </div>
-              <form class="context-goal-form" data-context-goal-form>
-                <input name="title" placeholder="Goal title" autocomplete="off" />
-                <select name="priority">
-                  <option value="high">high</option>
-                  <option value="medium" selected>medium</option>
-                  <option value="low">low</option>
-                </select>
-                <textarea name="description" rows="2" placeholder="Why this matters and what done looks like."></textarea>
-                <textarea name="nextActions" rows="2" placeholder="Next actions, one per line."></textarea>
-                <button type="submit">CREATE GOAL</button>
-              </form>
-              <div class="context-goals-list" data-context-goals-list>
-                <div class="settings-info">— loading —</div>
-              </div>
-            </section>
-          </div>
-        </div>
-      </section>
+      <!-- v0.5.11 brain-consolidation: Context panel content moved to
+           Brain → Profile. Nav button removed. -->
+      <!-- (context shell removed) -->
 
       <section class="panel-frame" data-section="workflows" hidden>
         <div class="panel-tag">PANEL · 05 · WORKFLOW STUDIO</div>
@@ -713,11 +480,26 @@ export function renderConsoleHtml(token: string): string {
             </div>
             <div class="wf-chat-log" data-wf-chat-log>
               <div class="wf-chat-intro">
-                Workflow Architect chat.<br>
-                Ask the agent to draft, refine, or critique the workflow on the left.
-                <br><br>
-                <em>e.g. "Add a step after research that drafts a weekly email" or "Tighten the schedule to weekdays 9am" or "Validate this for cycles".</em>
+                <strong>Describe what you want and the Architect builds it.</strong><br>
+                The Architect drafts, refines, or critiques the workflow on the left. Click a starter below or type your own.
               </div>
+            </div>
+            <!-- v0.5.11 UX: starter prompt chips. Context-aware via
+                 [data-wf-chat-chip data-wf-chat-chip-mode="new|edit"];
+                 the JS swaps which set is visible based on whether a
+                 workflow is open. Clicking a chip pre-fills the textarea
+                 and focuses it so the user can edit before sending. -->
+            <div class="wf-chat-chips" data-wf-chat-chips>
+              <!-- "new workflow" chips — visible when no draft is loaded -->
+              <button type="button" class="wf-chat-chip" data-wf-chat-chip-mode="new" data-wf-chat-chip="Draft a workflow that triages my inbox every hour and surfaces anything important.">📥 Hourly inbox triage</button>
+              <button type="button" class="wf-chat-chip" data-wf-chat-chip-mode="new" data-wf-chat-chip="Draft a morning briefing workflow that runs Mon-Fri at 8am and summarizes my calendar, overdue tasks, and any new emails I should know about.">☀ Morning briefing</button>
+              <button type="button" class="wf-chat-chip" data-wf-chat-chip-mode="new" data-wf-chat-chip="Draft a weekly review workflow that runs Mondays at 9am, pulls completed tasks from last week, and asks me what I want to focus on this week.">📅 Weekly review</button>
+              <button type="button" class="wf-chat-chip" data-wf-chat-chip-mode="new" data-wf-chat-chip="Draft a daily prospect outreach workflow that pulls cadence-eligible accounts from Salesforce, enriches them with SEO data via DataForSEO, drafts emails (no send), and surfaces drafts for my approval.">🎯 Prospect outreach</button>
+              <!-- "edit current workflow" chips — visible when a draft is loaded -->
+              <button type="button" class="wf-chat-chip" data-wf-chat-chip-mode="edit" data-wf-chat-chip="Add a step at the end that summarizes what just happened and sends me a notify_user." hidden>＋ Add a summary step</button>
+              <button type="button" class="wf-chat-chip" data-wf-chat-chip-mode="edit" data-wf-chat-chip="Change the schedule to weekdays at 9am Pacific." hidden>⏱ Change schedule</button>
+              <button type="button" class="wf-chat-chip" data-wf-chat-chip-mode="edit" data-wf-chat-chip="Validate this workflow for cycles, missing tools, and broken step dependencies. Tell me what you find." hidden>✓ Validate this workflow</button>
+              <button type="button" class="wf-chat-chip" data-wf-chat-chip-mode="edit" data-wf-chat-chip="Explain what this workflow does in plain English — assume I'm a non-developer." hidden>❔ Explain in plain English</button>
             </div>
             <form class="wf-chat-form" data-wf-chat-form>
               <textarea class="wf-chat-input" data-wf-chat-input
@@ -970,6 +752,432 @@ export function renderConsoleHtml(token: string): string {
             </div>
           </div>
 
+        </div>
+      </section>
+
+      <!--
+        v0.5.11 — Approvals panel. Lists every pending approval with FULL
+        context (subject, tool args, source workflow, age) so the user
+        can recognize each one without opening the underlying session.
+        Per-row approve/edit/reject + bulk "cancel all stale" actions.
+        Backed by /api/console/approvals/list + the existing
+        /api/console/harness-approvals/:id/:decision endpoint.
+      -->
+      <!--
+        v0.5.11 — Brain panel. Surfaces the derived facts, entities,
+        and episodic pointers the brain has accumulated. Four sub-sections:
+          Facts: sortable list of consolidated_facts, filterable by kind /
+            derivation / trust. Each row shows importance + last-accessed.
+          Entities: people / companies / projects with mention counts +
+            alias union (cross-source matching surface).
+          Pointers: episodic_pointers ("the pricing convo" → call_id),
+            click-to-recall via the recall_tool_result tool surface.
+          Health: reflection invocations, hallucinated call_ids,
+            conflict-resolver decisions (ADD/UPDATE/DELETE/NOOP).
+        Read-only — manage facts via memory_remember / memory_forget
+        from chat, manage approvals via the Approvals panel.
+      -->
+      <!--
+        v0.5.11 — Brain panel. Single home for everything Clementine
+        knows + how it learns. Consolidates the old Memory / Context /
+        Evolution sidebars into 5 sub-tabs:
+          Overview   — at-a-glance: health stats, recent learning,
+                       evolution latest report header
+          Knowledge  — semantic memory: facts + entities + cytoscape
+                       graph + indexed files (was: Memory + Brain.Facts
+                       + Brain.Entities)
+          Events     — episodic memory: pointers + recent reflection
+                       events (was: Brain.Pointers)
+          Profile    — procedural / standing-memory: user profile +
+                       goals + identity (was: Context)
+          Evolution  — autoresearch nightly reports + brain-about-itself
+                       (was: Evolution, previously hidden behind the
+                       diagnostics toggle)
+        Anchored on Tulving's semantic / episodic / procedural framing
+        — see [[project_brain_architecture]] + [[project_brain_phase1_gaps]].
+      -->
+      <section class="panel-frame" data-section="brain" hidden>
+        <div class="panel-tag">PANEL · B · BRAIN</div>
+        <div class="panel-body brain-layout">
+          <div class="brain-header">
+            <h3>Brain</h3>
+            <p>Everything Clementine knows about you, how it learns, and how it's evolving. Derived from tool returns, user statements, and reflection over time.</p>
+            <div class="brain-tabs">
+              <button class="brain-tab on" data-brain-tab="overview">Overview</button>
+              <button class="brain-tab" data-brain-tab="knowledge">Knowledge</button>
+              <button class="brain-tab" data-brain-tab="events">Events</button>
+              <button class="brain-tab" data-brain-tab="meetings">Meetings</button>
+              <button class="brain-tab" data-brain-tab="profile">Profile</button>
+              <button class="brain-tab" data-brain-tab="evolution">Evolution</button>
+            </div>
+          </div>
+
+          <!-- Overview: at-a-glance dashboard. Default tab. -->
+          <div class="brain-tab-pane" data-brain-pane="overview">
+            <div class="brain-overview" data-brain-overview>
+              <div class="settings-info">— loading —</div>
+            </div>
+          </div>
+
+          <!-- Knowledge: semantic memory. Four inner sub-tabs —
+               Facts (derived/direct facts list with filters)
+               Entities (people/companies/projects registry)
+               Graph (cytoscape view of the memory web)
+               Files (indexed vault files + vault search + viewer).
+               Meetings is its OWN OUTER tab (next sibling) since
+               meeting captures are episodic, not semantic. -->
+          <div class="brain-tab-pane" data-brain-pane="knowledge" hidden>
+            <div class="brain-subtabs">
+              <button class="brain-subtab on" data-brain-knowledge-tab="facts">Facts</button>
+              <button class="brain-subtab" data-brain-knowledge-tab="entities">Entities</button>
+              <button class="brain-subtab" data-brain-knowledge-tab="graph">Graph</button>
+              <button class="brain-subtab" data-brain-knowledge-tab="files">Files</button>
+            </div>
+            <div class="brain-knowledge-pane" data-brain-knowledge-pane="facts">
+              <div class="brain-controls">
+                <select data-brain-fact-kind>
+                  <option value="">all kinds</option>
+                  <option value="user">user</option>
+                  <option value="project">project</option>
+                  <option value="feedback">feedback</option>
+                  <option value="reference">reference</option>
+                </select>
+                <select data-brain-fact-sort>
+                  <option value="stanford">Stanford rank (importance × recency)</option>
+                  <option value="recent">recent first</option>
+                  <option value="important">most important first</option>
+                  <option value="trust">most trusted first</option>
+                </select>
+                <span class="brain-count" data-brain-fact-count></span>
+              </div>
+              <div class="brain-list" data-brain-fact-list>
+                <div class="settings-info">— loading —</div>
+              </div>
+            </div>
+            <div class="brain-knowledge-pane" data-brain-knowledge-pane="entities" hidden>
+              <div class="brain-controls">
+                <select data-brain-entity-type>
+                  <option value="">all types</option>
+                  <option value="person">people</option>
+                  <option value="company">companies</option>
+                  <option value="project">projects</option>
+                  <option value="place">places</option>
+                  <option value="thing">things</option>
+                </select>
+                <span class="brain-count" data-brain-entity-count></span>
+              </div>
+              <div class="brain-list" data-brain-entity-list>
+                <div class="settings-info">— loading —</div>
+              </div>
+            </div>
+            <!-- Graph — full-width cytoscape. Standalone (no sidebar)
+                 since file browsing now lives in its own Files sub-tab. -->
+            <div class="brain-knowledge-pane" data-brain-knowledge-pane="graph" hidden>
+              <div class="brain-graph-wrap">
+                <div class="mem-graph" data-mem-graph>
+                  <div class="mem-graph-topbar">
+                    <div class="mem-graph-controls">
+                      <button type="button" data-mem-graph-refresh>REFRESH</button>
+                      <button type="button" data-mem-graph-fit>FIT</button>
+                      <button type="button" data-mem-graph-reset>RESET</button>
+                    </div>
+                    <div class="mem-graph-filters">
+                      <select data-mem-graph-type aria-label="Filter graph node type">
+                        <option value="">ALL NODES</option>
+                        <option value="fact">FACTS</option>
+                        <option value="file">FILES</option>
+                        <option value="kind">KINDS</option>
+                      </select>
+                      <input type="search" data-mem-graph-search placeholder="filter graph…" autocomplete="off" spellcheck="false" />
+                    </div>
+                    <span class="mem-graph-meta" data-mem-graph-meta>—</span>
+                  </div>
+                  <div class="mem-graph-canvas" data-mem-graph-canvas>
+                    <div class="mem-graph-sparse-hint" data-mem-graph-sparse-hint hidden>
+                      <strong>SPARSE LINKS</strong>
+                      Most current connections are kind clusters. More meeting notes, vault entries, and cross-file references will thicken the web.
+                    </div>
+                  </div>
+                  <aside class="mem-graph-detail" data-mem-graph-detail>
+                    <div class="mem-graph-detail-empty">Hover or click a node to inspect.</div>
+                  </aside>
+                  <div class="mem-graph-legend">
+                    <span><i class="dot kind"></i> Kind<em data-mem-legend-kinds>—</em></span>
+                    <span><i class="dot fact"></i> Fact<em data-mem-legend-facts>—</em></span>
+                    <span><i class="dot file"></i> File<em data-mem-legend-files>—</em></span>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <!-- Files — vault browser. Stats + indexed files + recent
+                 files + vault search + viewer. The durable-facts list
+                 that lived in the legacy mem-sidebar is dropped here
+                 because the Facts sub-tab is now the canonical home
+                 for facts. The bootMemoryPanel selectors for
+                 data-mem-fact-list will null-resolve safely. -->
+            <div class="brain-knowledge-pane" data-brain-knowledge-pane="files" hidden>
+              <div class="memory-layout">
+                <aside class="mem-sidebar">
+                  <div class="mem-stats" data-mem-stats>
+                    <div class="mem-stat"><span>CHUNKS</span><em data-mem-chunks>—</em></div>
+                    <div class="mem-stat"><span>FILES</span><em data-mem-files>—</em></div>
+                    <div class="mem-stat"><span>FACTS</span><em data-mem-facts>—</em></div>
+                    <div class="mem-stat"><span>EMBED</span><em data-mem-embed>—</em></div>
+                  </div>
+                  <div class="mem-section">
+                    <div class="mem-section-head">
+                      <span>INDEXED FILES</span>
+                      <em data-mem-files-count>—</em>
+                    </div>
+                    <ol class="mem-file-list" data-mem-file-list>
+                      <li class="empty">— loading —</li>
+                    </ol>
+                  </div>
+                  <div class="mem-section">
+                    <div class="mem-section-head">
+                      <span>RECENT FILES <em style="color:var(--fg-3); font-style:normal; font-size:9.5px; letter-spacing:0.06em;">· all extensions</em></span>
+                      <em data-mem-recent-files-count>—</em>
+                    </div>
+                    <input type="search" class="mem-files-filter" data-mem-recent-files-filter
+                      placeholder="filter by name…"
+                      autocomplete="off" spellcheck="false"
+                      style="margin: 4px 8px 8px 8px; width: calc(100% - 16px); padding: 4px 6px; font-size: 11px; background: var(--bg-1); border: 1px solid var(--line); color: var(--fg);" />
+                    <ol class="mem-file-list" data-mem-recent-files-list>
+                      <li class="empty">— loading —</li>
+                    </ol>
+                  </div>
+                  <!-- Durable facts quick-list kept here so bootMemoryPanel's
+                       selectors all resolve. The CANONICAL home for fact
+                       browsing is Brain → Knowledge → Facts (which has
+                       filters, sort, provenance pills). This sidebar list
+                       is a compact quick-reference while the user is in
+                       the file browser. -->
+                  <div class="mem-section">
+                    <div class="mem-section-head">
+                      <span>DURABLE FACTS <em style="color:var(--fg-3); font-style:normal; font-size:9.5px; letter-spacing:0.06em;">· quick reference</em></span>
+                      <em data-mem-facts-count>—</em>
+                    </div>
+                    <div class="mem-fact-kinds" data-mem-fact-kinds>
+                      <button class="kind-pill active" data-kind="">ALL</button>
+                      <button class="kind-pill" data-kind="user">USER</button>
+                      <button class="kind-pill" data-kind="project">PROJECT</button>
+                      <button class="kind-pill" data-kind="feedback">FEEDBACK</button>
+                      <button class="kind-pill" data-kind="reference">REFERENCE</button>
+                    </div>
+                    <ol class="mem-fact-list" data-mem-fact-list>
+                      <li class="empty">— loading —</li>
+                    </ol>
+                  </div>
+                </aside>
+                <div class="mem-main">
+                  <div class="mem-toolbar">
+                    <div class="mem-search">
+                      <input type="search" class="mem-search-input" data-mem-search
+                        placeholder="search vault · FTS + embedding rerank · ⏎ to query"
+                        autocomplete="off" spellcheck="false" />
+                      <span class="mem-search-meta" data-mem-search-meta>—</span>
+                    </div>
+                  </div>
+                  <div class="mem-viewer" data-mem-viewer>
+                    <div class="mem-empty">
+                      <div class="mem-empty-mark">▢</div>
+                      <div class="mem-empty-text">SEARCH OR SELECT A FILE</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Events: episodic memory — pointers, reflection timeline.
+               Stays as the next outer sub-tab. The HTML below is its
+               existing pane (no changes from v0.5.11). -->
+          <!-- (no edit here — see the existing pane definition that
+               follows after Knowledge) -->
+
+          <!-- Meetings: recall meeting captures — promoted to its own
+               outer sub-tab so it's reachable in one click instead of
+               buried behind Knowledge → Graph & Files → MEETINGS
+               toggle. Migrated mem-meetings content. -->
+          <div class="brain-tab-pane" data-brain-pane="meetings" hidden>
+            <div class="brain-meetings-wrap">
+              <div class="mem-meetings" data-mem-meetings>
+                <div class="mem-meetings-head">
+                  <span class="mem-meetings-tag">CAPTURED MEETINGS</span>
+                  <span class="mem-meetings-meta" data-mem-meetings-meta>—</span>
+                  <button type="button" class="mem-meetings-refresh" data-mem-meetings-refresh>REFRESH</button>
+                </div>
+                <div class="mem-meetings-list" data-mem-meetings-list>
+                  <div class="mem-meetings-empty">— loading recent meetings —</div>
+                </div>
+                <div class="mem-meetings-detail" data-mem-meetings-detail>
+                  <div class="mem-meetings-detail-empty">Pick a meeting on the left to see its summary, action items, and transcript.</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Events: episodic memory — pointers, reflection timeline. -->
+          <div class="brain-tab-pane" data-brain-pane="events" hidden>
+            <p class="brain-help">Episodic pointers — short labels Clementine attached to specific tool calls. Click <code>RECALL</code> to fetch the verbatim source via <code>recall_tool_result</code>.</p>
+            <div class="brain-list" data-brain-pointer-list>
+              <div class="settings-info">— loading —</div>
+            </div>
+          </div>
+
+          <!-- Profile: user-stated standing memory + identity + goals.
+               Migrated from the legacy Context panel (was
+               /api/console/context/*). CSS classes (.context-layout,
+               .context-grid, .context-card etc.) are unchanged so all
+               existing styles + bootContextPanel selectors still apply. -->
+          <div class="brain-tab-pane" data-brain-pane="profile" hidden>
+            <div class="context-layout">
+              <header class="context-header">
+                <div>
+                  <h3>Agent Profile</h3>
+                  <p>What Clementine knows before it talks, acts, or listens. Keep the core identity files useful, then add durable facts and goals as the operating picture changes.</p>
+                </div>
+                <div class="context-stats" data-context-stats>
+                  <div class="stat-card"><span>FILES</span><em data-context-files-count>—</em></div>
+                  <div class="stat-card"><span>FACTS</span><em data-context-facts-count>—</em></div>
+                  <div class="stat-card"><span>GOALS</span><em data-context-goals-count>—</em></div>
+                  <div class="stat-card"><span>VOICE CTX</span><em data-context-voice-count>—</em></div>
+                </div>
+              </header>
+
+              <div class="context-grid">
+                <section class="context-card context-profile-card">
+                  <div class="context-card-head">
+                    <span>USER PROFILE</span>
+                    <em data-context-profile-meta>—</em>
+                  </div>
+                  <form class="context-profile-form" data-context-profile-form>
+                    <div class="context-form-grid">
+                      <label>Preferred name<input name="preferredName" data-context-profile-field autocomplete="off" /></label>
+                      <label>Role<input name="role" data-context-profile-field autocomplete="off" /></label>
+                      <label>Timezone<input name="timezone" data-context-profile-field placeholder="America/Los_Angeles" autocomplete="off" /></label>
+                      <label>Tone
+                        <select name="communicationTone" data-context-profile-field>
+                          <option value="terse">terse</option>
+                          <option value="balanced">balanced</option>
+                          <option value="verbose">verbose</option>
+                        </select>
+                      </label>
+                    </div>
+                    <label class="context-notes-label">Notes<textarea name="notes" data-context-profile-field rows="3" placeholder="Standing preferences, work style, people/projects Clementine should respect."></textarea></label>
+                    <button type="submit" class="context-save">SAVE PROFILE ✎</button>
+                  </form>
+                </section>
+
+                <section class="context-card context-health-card">
+                  <div class="context-card-head">
+                    <span>CONTEXT HEALTH</span>
+                    <button type="button" data-context-refresh>REFRESH</button>
+                  </div>
+                  <div class="context-health-list" data-context-health-list>
+                    <div class="settings-info">— loading —</div>
+                  </div>
+                </section>
+              </div>
+
+              <section class="context-card">
+                <div class="context-card-head">
+                  <span>CORE CONTEXT FILES</span>
+                  <em>loaded into chat, Discord, and live voice</em>
+                </div>
+                <div class="context-files" data-context-files>
+                  <div class="settings-info">— loading —</div>
+                </div>
+              </section>
+
+              <div class="context-grid lower">
+                <section class="context-card">
+                  <div class="context-card-head">
+                    <span>STANDING MEMORY</span>
+                    <em>durable facts injected on every run</em>
+                  </div>
+                  <form class="context-fact-form" data-context-fact-form>
+                    <select name="kind">
+                      <option value="user">user</option>
+                      <option value="project">project</option>
+                      <option value="feedback">feedback</option>
+                      <option value="reference">reference</option>
+                    </select>
+                    <input name="content" placeholder="Clementine should remember…" autocomplete="off" />
+                    <button type="submit">REMEMBER</button>
+                  </form>
+                  <div class="context-facts-list" data-context-facts-list>
+                    <div class="settings-info">— loading —</div>
+                  </div>
+                </section>
+
+                <section class="context-card">
+                  <div class="context-card-head">
+                    <span>ACTIVE GOALS</span>
+                    <em>what proactive work should optimize around</em>
+                  </div>
+                  <form class="context-goal-form" data-context-goal-form>
+                    <input name="title" placeholder="Goal title" autocomplete="off" />
+                    <select name="priority">
+                      <option value="high">high</option>
+                      <option value="medium" selected>medium</option>
+                      <option value="low">low</option>
+                    </select>
+                    <textarea name="description" rows="2" placeholder="Why this matters and what done looks like."></textarea>
+                    <textarea name="nextActions" rows="2" placeholder="Next actions, one per line."></textarea>
+                    <button type="submit">CREATE GOAL</button>
+                  </form>
+                  <div class="context-goals-list" data-context-goals-list>
+                    <div class="settings-info">— loading —</div>
+                  </div>
+                </section>
+              </div>
+            </div>
+          </div>
+
+          <!-- Evolution: autoresearch reports. Migrated from the legacy
+               Evolution panel (was hidden behind the diagnostics toggle).
+               CSS classes (.evolution-layout, .evolution-header etc.)
+               unchanged so bootEvolutionPanel still finds its selectors. -->
+          <div class="brain-tab-pane" data-brain-pane="evolution" hidden>
+            <div class="evolution-layout">
+              <div class="evolution-header">
+                <div>
+                  <h2 class="evolution-title">Autoresearch</h2>
+                  <p class="evolution-sub">Nightly observatory over Clementine's traces. Surfaces tool / workflow / skill health so you can decide what to evolve next. No mutations applied — read-only for now.</p>
+                </div>
+                <div class="evolution-actions">
+                  <button type="button" class="evolution-btn" data-evolution-run title="Rebuild the report from current trace data">Run now</button>
+                  <select class="evolution-history-pick" data-evolution-history>
+                    <option value="">— history —</option>
+                  </select>
+                </div>
+              </div>
+              <div class="evolution-meta" data-evolution-meta>— loading —</div>
+              <div class="evolution-report" data-evolution-report>
+                <div class="settings-info">— no report yet · click <strong>Run now</strong> to generate one —</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel-frame" data-section="approvals" hidden>
+        <div class="panel-tag">PANEL · A · APPROVALS</div>
+        <div class="panel-body approvals-layout">
+          <div class="approvals-header">
+            <div class="approvals-intro">
+              <h3>Pending Approvals</h3>
+              <p>Anything Clementine paused on, waiting for you to decide. Each row shows what's being asked, where it came from, and how long it's been waiting.</p>
+            </div>
+            <div class="approvals-toolbar">
+              <button class="hub-btn" data-approvals-refresh>REFRESH</button>
+              <button class="hub-btn-danger" data-approvals-cancel-stale title="Cancel approvals older than 1 hour">CANCEL ALL STALE</button>
+            </div>
+          </div>
+          <div class="approvals-list" data-approvals-list>
+            <div class="settings-info">— loading —</div>
+          </div>
         </div>
       </section>
 
@@ -1429,27 +1637,9 @@ export function renderConsoleHtml(token: string): string {
         Foundation only: daily observatory report from yesterday's traces.
         Mutation phases (C/B/A) land here later behind an approval queue.
       -->
-      <section class="panel-frame" data-section="evolution" hidden>
-        <div class="panel-tag">PANEL · 12 · EVOLUTION</div>
-        <div class="panel-body evolution-layout">
-          <div class="evolution-header">
-            <div>
-              <h2 class="evolution-title">Autoresearch</h2>
-              <p class="evolution-sub">Nightly observatory over Clementine's traces. Surfaces tool / workflow / skill health so you can decide what to evolve next. No mutations applied — read-only for now.</p>
-            </div>
-            <div class="evolution-actions">
-              <button type="button" class="evolution-btn" data-evolution-run title="Rebuild the report from current trace data">Run now</button>
-              <select class="evolution-history-pick" data-evolution-history>
-                <option value="">— history —</option>
-              </select>
-            </div>
-          </div>
-          <div class="evolution-meta" data-evolution-meta>— loading —</div>
-          <div class="evolution-report" data-evolution-report>
-            <div class="settings-info">— no report yet · click <strong>Run now</strong> to generate one —</div>
-          </div>
-        </div>
-      </section>
+      <!-- v0.5.11 brain-consolidation: Evolution panel content moved to
+           Brain → Evolution. Nav button removed. -->
+      <!-- (evolution shell removed) -->
 
     </main>
 
@@ -5415,6 +5605,32 @@ body {
   font-style: italic;
 }
 
+/* v0.5.11 UX — starter prompt chips above the architect input.
+   Two sets: "new" (when no workflow open) and "edit" (when one IS open).
+   JS toggles hidden on each chip based on context. Chips are clickable
+   pills that pre-fill the textarea. */
+.wf-chat-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 8px 8px 0;
+  background: var(--bg-1);
+}
+.wf-chat-chip {
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  padding: 5px 9px;
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  cursor: pointer;
+  border-radius: 0;
+  line-height: 1.2;
+  text-align: left;
+}
+.wf-chat-chip:hover { color: var(--accent); border-color: var(--accent); }
+.wf-chat-chip:active { transform: translateY(1px); }
+
 .wf-chat-form {
   border-top: 1px solid var(--line);
   background: var(--bg-1);
@@ -5452,6 +5668,198 @@ body {
   background: var(--bg-3);
   color: var(--fg-mute);
   cursor: wait;
+}
+
+/* Architect diff card — proposed changes the user can APPLY or DISCARD. */
+.wf-diff-card {
+  border: 1px solid color-mix(in srgb, var(--accent) 50%, var(--line));
+  background: color-mix(in srgb, var(--bg-1) 88%, var(--accent) 6%);
+}
+.wf-diff-card.applied { opacity: 0.7; border-color: var(--accent-2); }
+.wf-diff-card.discarded { opacity: 0.55; border-color: var(--line); }
+.wf-diff-head {
+  padding: 4px 9px;
+  background: var(--bg-2);
+  border-bottom: 1px solid var(--line);
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  color: var(--accent);
+}
+.wf-diff-summary {
+  padding: 8px 10px 4px;
+  font-size: 11px;
+  color: var(--fg);
+  line-height: 1.5;
+}
+.wf-diff-ops {
+  list-style: none;
+  margin: 0;
+  padding: 4px 12px 8px;
+  font-size: 11px;
+  line-height: 1.55;
+  color: var(--fg-2);
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+.wf-diff-ops li { padding: 1px 0; }
+.wf-diff-actions {
+  display: flex;
+  gap: 6px;
+  padding: 6px 10px 10px;
+}
+.wf-diff-apply, .wf-diff-discard {
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  padding: 5px 12px;
+  cursor: pointer;
+  border: 1px solid var(--line);
+  background: var(--bg-2);
+  color: var(--fg);
+  font-weight: 600;
+}
+.wf-diff-apply { background: var(--accent); color: var(--bg-0); border-color: var(--accent); }
+.wf-diff-apply:hover:not(:disabled) { background: color-mix(in srgb, var(--accent) 80%, white); }
+.wf-diff-discard:hover:not(:disabled) { border-color: var(--accent-fail); color: var(--accent-fail); }
+.wf-diff-apply:disabled, .wf-diff-discard:disabled {
+  background: var(--bg-3);
+  color: var(--fg-mute);
+  cursor: default;
+  border-color: var(--line);
+}
+.wf-diff-status {
+  padding: 0 10px 10px;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+}
+.wf-diff-applied { color: var(--accent-2); }
+.wf-diff-discarded { color: var(--fg-mute); }
+.wf-diff-warn {
+  margin-top: 4px;
+  letter-spacing: normal;
+  font-size: 10px;
+  color: var(--accent-warn);
+  line-height: 1.5;
+}
+
+/* @-mention tool picker — overlay floats above the active step textarea. */
+.wf-tool-picker {
+  position: absolute;
+  z-index: 1000;
+  min-width: 280px;
+  max-width: 380px;
+  max-height: 240px;
+  overflow-y: auto;
+  background: var(--bg-1);
+  border: 1px solid var(--accent);
+  box-shadow: 0 6px 18px rgba(0,0,0,0.4);
+  font-size: 11px;
+}
+.wf-tool-picker-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 9px;
+  cursor: pointer;
+  border-bottom: 1px solid var(--line);
+}
+.wf-tool-picker-row:last-child { border-bottom: 0; }
+.wf-tool-picker-row.active { background: color-mix(in srgb, var(--accent) 18%, var(--bg-2)); }
+.wf-tool-picker-row:hover { background: var(--bg-2); }
+.wf-tool-picker-name {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  color: var(--fg);
+}
+.wf-tool-picker-cat {
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  color: var(--fg-3);
+}
+.wf-tool-picker-cat.is-skill {
+  color: var(--accent-3);
+  background: color-mix(in srgb, var(--bg-2) 70%, var(--accent-3) 14%);
+  padding: 1px 6px;
+  border: 1px solid color-mix(in srgb, var(--accent-3) 50%, var(--line));
+}
+.wf-tool-picker-empty {
+  padding: 10px;
+  color: var(--fg-mute);
+  font-size: 11px;
+}
+
+/* Per-step "tools allowed" chip rail beneath each step's prompt textarea. */
+.wf-step-tools {
+  margin-top: 6px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: center;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+}
+.wf-step-tools-label {
+  color: var(--fg-3);
+  margin-right: 4px;
+}
+.wf-tool-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 4px 2px 7px;
+  border: 1px solid color-mix(in srgb, var(--accent-2) 50%, var(--line));
+  color: var(--accent-2);
+  background: color-mix(in srgb, var(--bg-2) 80%, var(--accent-2) 6%);
+  letter-spacing: normal;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 10px;
+}
+.wf-tool-chip-remove {
+  background: transparent;
+  border: 0;
+  color: var(--fg-3);
+  cursor: pointer;
+  padding: 0 2px;
+  font: inherit;
+  font-size: 11px;
+  line-height: 1;
+}
+.wf-tool-chip-remove:hover { color: var(--accent-fail); }
+.wf-tool-add {
+  background: transparent;
+  border: 1px dashed var(--line);
+  color: var(--fg-3);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  padding: 2px 7px;
+  cursor: pointer;
+}
+.wf-tool-add:hover { color: var(--accent); border-color: var(--accent); }
+
+/* Per-step skill binding (usesSkill). One skill per step; the runner
+   injects the skill's SKILL.md body into the step prompt at execution
+   time. Rendered as its own row beneath the TOOLS rail so composing
+   expertise reads as a distinct action from picking tools. */
+.wf-step-skill {
+  margin-top: 6px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: center;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+}
+.wf-skill-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 4px 2px 7px;
+  border: 1px solid color-mix(in srgb, var(--accent-3) 60%, var(--line));
+  color: var(--accent-3);
+  background: color-mix(in srgb, var(--bg-2) 80%, var(--accent-3) 10%);
+  letter-spacing: normal;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 10px;
 }
 
 /* ── Tools panel ─────────────────────────────────────────────── */
@@ -6630,6 +7038,194 @@ body {
 .usage-trim-row button:hover { color: var(--accent); border-color: var(--accent); }
 .usage-trim-row button.on { color: var(--accent); border-color: var(--accent); }
 .usage-trim-row button.danger { color: var(--accent-fail); border-color: var(--accent-fail); }
+
+/* v0.5.11 — Approvals panel */
+.approvals-layout { padding: 16px; }
+.approvals-header { display: flex; justify-content: space-between; gap: 16px; margin-bottom: 16px; }
+.approvals-intro h3 { margin: 0 0 4px; font-size: 14px; letter-spacing: 0.08em; }
+.approvals-intro p { margin: 0; color: var(--fg-3); font-size: 11px; max-width: 600px; }
+.approvals-toolbar { display: flex; gap: 8px; align-items: flex-start; }
+.approvals-list { display: flex; flex-direction: column; gap: 12px; }
+.approval-card {
+  border: 1px solid var(--line);
+  padding: 14px;
+  display: flex; flex-direction: column; gap: 10px;
+}
+.approval-card-head {
+  display: flex; justify-content: space-between; align-items: flex-start; gap: 12px;
+}
+.approval-subject { font-size: 13px; font-weight: 500; line-height: 1.4; flex: 1; }
+.approval-age { font-size: 10px; letter-spacing: 0.1em; color: var(--fg-3); white-space: nowrap; padding-top: 2px; }
+.approval-age.stale { color: var(--accent-warn); }
+.approval-age.very-stale { color: var(--accent-fail); }
+.approval-meta { font-size: 10px; color: var(--fg-3); letter-spacing: 0.04em; }
+.approval-meta code { background: var(--bg-2); padding: 1px 5px; border: 1px solid var(--line); }
+.approval-args {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px; padding: 8px 10px; background: var(--bg-2);
+  border: 1px solid var(--line); max-height: 180px; overflow-y: auto;
+  white-space: pre-wrap; word-break: break-word;
+}
+.approval-actions { display: flex; gap: 8px; }
+.approval-actions button {
+  font-size: 10px; padding: 6px 14px; letter-spacing: 0.14em;
+  background: transparent; border: 1px solid var(--line);
+  color: var(--fg-3); cursor: pointer;
+}
+.approval-actions button.approve { color: var(--accent-ok, #4ade80); border-color: var(--accent-ok, #4ade80); }
+.approval-actions button.reject { color: var(--accent-fail); border-color: var(--accent-fail); }
+.approval-actions button:hover { color: var(--accent); border-color: var(--accent); }
+.approval-actions button:disabled { opacity: 0.4; cursor: not-allowed; }
+.approvals-badge {
+  display: inline-block; min-width: 16px; padding: 0 5px;
+  font-size: 9px; line-height: 14px; border-radius: 8px;
+  background: var(--accent-fail); color: var(--bg-1);
+  text-align: center; margin-left: 4px;
+}
+
+/* v0.5.11 — Brain panel */
+.brain-layout { padding: 16px; }
+.brain-header h3 { margin: 0 0 4px; font-size: 14px; letter-spacing: 0.08em; }
+.brain-header p { margin: 0 0 12px; color: var(--fg-3); font-size: 11px; max-width: 640px; }
+.brain-tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); margin-bottom: 16px; }
+.brain-tab {
+  background: transparent; border: 1px solid var(--line); border-bottom: none;
+  padding: 6px 14px; font-size: 11px; letter-spacing: 0.1em; color: var(--fg-3);
+  cursor: pointer;
+}
+.brain-tab.on { color: var(--accent); border-color: var(--accent); background: var(--bg-2); }
+.brain-controls { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; }
+.brain-controls select {
+  font-size: 11px; padding: 4px 8px; background: var(--bg-2);
+  border: 1px solid var(--line); color: var(--fg-1);
+}
+.brain-count { font-size: 10px; color: var(--fg-3); letter-spacing: 0.08em; }
+.brain-help { font-size: 11px; color: var(--fg-3); margin: 0 0 12px; }
+.brain-help code { background: var(--bg-2); padding: 1px 5px; border: 1px solid var(--line); }
+.brain-list { display: flex; flex-direction: column; gap: 8px; }
+.brain-fact-row, .brain-entity-row, .brain-pointer-row {
+  border: 1px solid var(--line); padding: 10px 12px;
+}
+.brain-fact-row { display: flex; flex-direction: column; gap: 6px; }
+.brain-fact-content { font-size: 12px; line-height: 1.4; }
+.brain-fact-meta { font-size: 10px; color: var(--fg-3); letter-spacing: 0.04em; }
+.brain-fact-meta .pill {
+  display: inline-block; padding: 1px 6px; border: 1px solid var(--line);
+  background: var(--bg-2); margin-right: 4px;
+}
+.brain-fact-meta .pill.derived { color: var(--accent-warn); border-color: var(--accent-warn); }
+.brain-fact-meta .pill.direct { color: var(--accent-ok, #4ade80); border-color: var(--accent-ok, #4ade80); }
+.brain-fact-meta .pill.important { color: var(--accent); border-color: var(--accent); }
+.brain-entity-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+.brain-entity-name { font-size: 12px; font-weight: 500; }
+.brain-entity-type {
+  font-size: 9px; letter-spacing: 0.12em; color: var(--fg-3);
+  padding: 1px 6px; border: 1px solid var(--line); background: var(--bg-2);
+}
+.brain-entity-aliases { font-size: 10px; color: var(--fg-3); margin-top: 3px; }
+.brain-entity-stats { font-size: 10px; color: var(--fg-3); white-space: nowrap; }
+.brain-pointer-row { display: flex; justify-content: space-between; gap: 12px; align-items: center; }
+.brain-pointer-label { font-size: 12px; flex: 1; }
+.brain-pointer-meta { font-size: 10px; color: var(--fg-3); }
+.brain-pointer-row button {
+  font-size: 10px; padding: 4px 10px; letter-spacing: 0.14em;
+  background: transparent; border: 1px solid var(--line);
+  color: var(--fg-3); cursor: pointer;
+}
+.brain-pointer-row button:hover { color: var(--accent); border-color: var(--accent); }
+.brain-health-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px;
+}
+.brain-health-card {
+  border: 1px solid var(--line); padding: 12px;
+}
+.brain-health-card .label {
+  font-size: 9px; letter-spacing: 0.12em; color: var(--fg-3);
+}
+.brain-health-card .value {
+  font-size: 22px; margin-top: 4px;
+}
+.brain-health-card .sub { font-size: 10px; color: var(--fg-3); margin-top: 4px; }
+
+/* Inner Knowledge sub-tabs (Facts / Entities / Graph & Files) */
+.brain-subtabs {
+  display: flex; gap: 4px; margin-bottom: 12px;
+  border-bottom: 1px dashed var(--line); padding-bottom: 0;
+}
+.brain-subtab {
+  background: transparent; border: 1px solid transparent;
+  padding: 5px 12px; font-size: 10px; letter-spacing: 0.1em;
+  color: var(--fg-3); cursor: pointer;
+}
+.brain-subtab.on { color: var(--accent); border-bottom-color: var(--accent); }
+
+/* Overview tab cards */
+.brain-overview { display: block; }
+.brain-overview-grid {
+  display: grid;
+  grid-template-columns: 2fr 1fr;
+  gap: 14px;
+}
+.brain-overview-card {
+  border: 1px solid var(--line);
+  padding: 14px;
+}
+.brain-overview-stats { grid-column: span 2; }
+.overview-card-head {
+  font-size: 9px; letter-spacing: 0.14em; color: var(--fg-3);
+  margin-bottom: 10px;
+}
+.overview-card-head em { font-style: normal; opacity: 0.7; margin-left: 4px; }
+.overview-stat-row { display: flex; gap: 24px; }
+.overview-stat { display: flex; flex-direction: column; }
+.overview-stat em { font-style: normal; font-size: 22px; line-height: 1; }
+.overview-stat span {
+  font-size: 9px; letter-spacing: 0.12em; color: var(--fg-3);
+  margin-top: 4px;
+}
+.overview-fact-row {
+  display: flex; align-items: baseline; gap: 8px;
+  padding: 6px 0; border-bottom: 1px solid var(--line);
+  font-size: 11.5px; line-height: 1.4;
+}
+.overview-fact-row:last-child { border-bottom: none; }
+.overview-fact-text { flex: 1; }
+.overview-callid {
+  font-size: 9px; padding: 1px 5px;
+  background: var(--bg-2); border: 1px solid var(--line);
+}
+.overview-age { font-size: 10px; color: var(--fg-3); white-space: nowrap; }
+.overview-health-row {
+  font-size: 11px; padding: 4px 0; color: var(--fg-2);
+}
+.overview-health-row strong { color: var(--fg-1); }
+.overview-evolution-body { margin-bottom: 8px; }
+.overview-evolution-line { font-size: 11px; color: var(--fg-2); padding: 2px 0; }
+.overview-evolution-link {
+  font-size: 10px; letter-spacing: 0.1em; color: var(--accent);
+  text-decoration: none; border-bottom: 1px solid var(--accent);
+}
+.overview-evolution-link:hover { opacity: 0.8; }
+@media (max-width: 900px) {
+  .brain-overview-grid { grid-template-columns: 1fr; }
+  .brain-overview-stats { grid-column: span 1; }
+}
+
+/* Graph + Meetings — full-width wrappers inside Knowledge / Meetings tabs */
+.brain-graph-wrap { height: calc(100vh - 240px); min-height: 480px; }
+.brain-graph-wrap .mem-graph {
+  display: grid;
+  grid-template-columns: 1fr 280px;
+  grid-template-rows: auto 1fr auto;
+  height: 100%;
+}
+.brain-graph-wrap .mem-graph-topbar { grid-column: 1 / -1; }
+.brain-graph-wrap .mem-graph-canvas { grid-column: 1 / 2; }
+.brain-graph-wrap .mem-graph-detail { grid-column: 2 / 3; grid-row: 2 / 3; }
+.brain-graph-wrap .mem-graph-legend  { grid-column: 1 / -1; }
+
+.brain-meetings-wrap { height: calc(100vh - 240px); min-height: 480px; }
+.brain-meetings-wrap .mem-meetings { height: 100%; }
 
 .skills-grid {
   display: grid;
@@ -9116,6 +9712,9 @@ const CONSOLE_JS = `
   let settingsBooted = false;
   let integrationsBooted = false;
   let homeBooted = false;
+  let approvalsBooted = false;
+  let brainBooted = false;
+  let brainCurrentTab = 'overview';
 
   function switchPanel(name) {
     panelSections.forEach((s) => {
@@ -9133,13 +9732,12 @@ const CONSOLE_JS = `
       if (name === 'home') dockLive.setAttribute('hidden', '');
       else dockLive.removeAttribute('hidden');
     }
-    if (name === 'memory') {
-      if (!memoryBooted) { memoryBooted = true; bootMemoryPanel(); }
-      else refreshMemoryPanel();
-    } else if (name === 'context') {
-      if (!contextBooted) { contextBooted = true; bootContextPanel(); }
-      else refreshContextPanel();
-    } else if (name === 'workflows') {
+    // v0.5.11 brain-consolidation: 'memory' / 'context' / 'evolution'
+    // are no longer top-level panels — they live as sub-tabs inside
+    // Brain. The boot/refresh functions for those modules are now
+    // invoked lazily from inside bootBrainPanel when their tab is
+    // first selected.
+    if (name === 'workflows') {
       if (!workflowsBooted) {
         workflowsBooted = true;
         bootWorkflowsPanel();
@@ -9162,12 +9760,14 @@ const CONSOLE_JS = `
     } else if (name === 'usage') {
       if (!usageBooted) { usageBooted = true; bootUsagePanel(); }
       else refreshUsagePanel();
+    } else if (name === 'approvals') {
+      if (!approvalsBooted) { approvalsBooted = true; bootApprovalsPanel(); }
+      else refreshApprovalsPanel();
+    } else if (name === 'brain') {
+      if (!brainBooted) { brainBooted = true; bootBrainPanel(); }
+      else refreshBrainCurrentTab();
     } else if (name === 'settings') {
       if (!settingsBooted) { settingsBooted = true; bootSettingsPanel(); }
-    } else if (name === 'evolution') {
-      // Boot is idempotent; the panel re-fetches on every nav back so
-      // the user sees fresh data without manual refresh.
-      bootEvolutionPanel();
     }
   }
   navButtons.forEach((b) => {
@@ -10866,6 +11466,98 @@ const CONSOLE_JS = `
   let wfActiveRunPollTimer = null;
   let wfActiveRunLastEventAt = '';
 
+  /**
+   * v0.5.11 UX — humanize a cron expression for the workflow list.
+   * Best-effort: covers the common patterns Clementine generates
+   * (every day at H, weekdays at H, every N hours, specific days at H).
+   * Falls back to the raw expression for shapes we don't recognize —
+   * the title tooltip always shows the raw cron so power users keep
+   * access to the underlying syntax.
+   *
+   * Standard 5-field cron: minute hour dayOfMonth month dayOfWeek.
+   * Days of week: 0/7=Sun, 1=Mon, 2=Tue, 3=Wed, 4=Thu, 5=Fri, 6=Sat.
+   */
+  function humanizeCronExpression(expr) {
+    if (!expr || typeof expr !== 'string') return '';
+    // Source string in TS uses 4 backslashes so that after CONSOLE_JS
+    // template-literal interpolation, the JS source rendered into the
+    // page sees 2 backslashes, which parse as a single regex backslash.
+    // i.e. '\\\\s+' (TS) -> '\\s+' (rendered JS) -> /\s+/ (runtime regex).
+    const parts = expr.trim().split(new RegExp('\\\\s+'));
+    if (parts.length !== 5) return '';
+    const [minStr, hourStr, domStr, monStr, dowStr] = parts;
+    const formatTime = (hStr, mStr) => {
+      // Multiple hours (e.g. "8,13") → render as a comma list of times.
+      if (hStr.includes(',')) {
+        const hours = hStr.split(',').map((h) => Number.parseInt(h, 10)).filter((n) => Number.isFinite(n));
+        if (hours.length === 0) return null;
+        const minute = Number.parseInt(mStr, 10);
+        const minSuffix = Number.isFinite(minute) && minute !== 0 ? ':' + String(minute).padStart(2, '0') : '';
+        return hours.map((h) => {
+          const ampm = h >= 12 ? 'pm' : 'am';
+          const display = h === 0 ? 12 : (h > 12 ? h - 12 : h);
+          return display + minSuffix + ampm;
+        }).join(', ');
+      }
+      const h = Number.parseInt(hStr, 10);
+      const m = Number.parseInt(mStr, 10);
+      if (!Number.isFinite(h)) return null;
+      const ampm = h >= 12 ? 'pm' : 'am';
+      const display = h === 0 ? 12 : (h > 12 ? h - 12 : h);
+      const minSuffix = Number.isFinite(m) && m !== 0 ? ':' + String(m).padStart(2, '0') : '';
+      return display + minSuffix + ampm;
+    };
+    const formatDayOfWeek = (dowS) => {
+      if (dowS === '*' || dowS === '?') return null; // every day OR no DOW constraint
+      if (dowS === '1-5') return 'Mon-Fri';
+      if (dowS === '0,6' || dowS === '6,0' || dowS === '0-6' || dowS === '6-0') return 'weekends';
+      const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+      // Comma list of single-digit days
+      if (new RegExp('^[0-7](,[0-7])*$').test(dowS)) {
+        return dowS.split(',').map((d) => dayNames[Number.parseInt(d, 10) % 7]).join(', ');
+      }
+      // Single day
+      if (new RegExp('^[0-7]$').test(dowS)) return dayNames[Number.parseInt(dowS, 10) % 7];
+      return null;
+    };
+    // Pattern: every N minutes — minStr "*/N", everything else "*".
+    // Backslashes are 4x in TS source (see split() comment above) — each
+    // \\\\ renders as \\ in JS source which becomes \ in the regex char class.
+    if (new RegExp('^\\\\*/\\\\d+$').test(minStr) && hourStr === '*' && domStr === '*' && monStr === '*' && dowStr === '*') {
+      return 'every ' + minStr.slice(2) + ' min';
+    }
+    // Pattern: every N hours — hourStr "*/N"
+    if (minStr === '0' && new RegExp('^\\\\*/\\\\d+$').test(hourStr) && domStr === '*' && monStr === '*' && dowStr === '*') {
+      return 'every ' + hourStr.slice(2) + 'h';
+    }
+    // Pattern: every hour during a range — hourStr "A-B"
+    if (minStr === '0' && new RegExp('^\\\\d+-\\\\d+$').test(hourStr) && domStr === '*' && monStr === '*' && dowStr === '*') {
+      const [aStr, bStr] = hourStr.split('-');
+      const a = Number.parseInt(aStr, 10);
+      const b = Number.parseInt(bStr, 10);
+      if (Number.isFinite(a) && Number.isFinite(b)) {
+        const ampmA = a >= 12 ? 'pm' : 'am';
+        const ampmB = b >= 12 ? 'pm' : 'am';
+        const dispA = a === 0 ? 12 : (a > 12 ? a - 12 : a);
+        const dispB = b === 0 ? 12 : (b > 12 ? b - 12 : b);
+        return 'hourly ' + dispA + ampmA + '-' + dispB + ampmB;
+      }
+    }
+    // Pattern: daily at H — minStr digit, hourStr digit (or comma list), rest wild
+    if (new RegExp('^\\\\d+$').test(minStr) && new RegExp('^\\\\d+(,\\\\d+)*$').test(hourStr) && domStr === '*' && monStr === '*') {
+      const time = formatTime(hourStr, minStr);
+      if (!time) return '';
+      const dow = formatDayOfWeek(dowStr);
+      if (!dow) return 'every day at ' + time;
+      return dow + ' at ' + time;
+    }
+    // Pattern: every minute (* * * * *) — rare in Clementine
+    if (minStr === '*' && hourStr === '*' && domStr === '*' && monStr === '*' && dowStr === '*') {
+      return 'every minute';
+    }
+    return '';
+  }
+
   async function bootWorkflowsPanel() {
     // Document-level delegation is intentional: the single-file HTML is
     // heavily re-rendered, and these controls are identified by explicit
@@ -10926,6 +11618,36 @@ const CONSOLE_JS = `
     refreshCronList().catch((err) => {
       console.error('cron list refresh failed:', err);
     });
+    subscribeWorkflowChanges();
+  }
+
+  /**
+   * Open the workflow_changed SSE stream. Refreshes the list (no
+   * re-select, so the editor draft survives) whenever any workflow
+   * file changes on disk — fixes the "had to reload the app to see
+   * the new workflow" bug for every write path. EventSource handles
+   * reconnect automatically.
+   */
+  let wfEventsSource = null;
+  function subscribeWorkflowChanges() {
+    if (wfEventsSource) return;
+    try {
+      wfEventsSource = new EventSource(withToken('/api/console/workflows/events'));
+      wfEventsSource.addEventListener('workflow_changed', () => {
+        // Keep the user's draft intact; just refresh the list view so
+        // newly-created or just-deleted workflows appear/disappear.
+        refreshWorkflowList({ skipReselect: true }).catch((err) => {
+          console.error('workflow_changed refresh failed:', err);
+        });
+      });
+      wfEventsSource.addEventListener('error', () => {
+        // EventSource auto-reconnects; nothing to do here. Log so we
+        // notice if the daemon is hard-down (browser will retry).
+        // Avoid spamming the console — only log first failure.
+      });
+    } catch (err) {
+      console.error('failed to open workflow events stream:', err);
+    }
   }
 
   function fmtCronAgo(iso) {
@@ -11137,7 +11859,8 @@ const CONSOLE_JS = `
     }
   }
 
-  async function refreshWorkflowList() {
+  async function refreshWorkflowList(opts) {
+    const skipReselect = !!(opts && opts.skipReselect);
     try {
       const data = await fetchJSON('/api/console/workflows');
       const items = data.workflows || [];
@@ -11149,7 +11872,14 @@ const CONSOLE_JS = `
       wf.list.innerHTML = items.map((w) => {
         const cls = (wfSelectedName === w.name) ? 'wf selected' : 'wf';
         const enabledPill = w.enabled ? '<span class="pill on">● APPROVED</span>' : '<span class="pill off">○ DISABLED</span>';
-        const cronPill = w.triggerSchedule ? '<span class="pill cron">⏱ ' + escMem(w.triggerSchedule) + '</span>' : '';
+        // v0.5.11 UX: humanize cron expressions for the workflow list.
+        // The raw cron (e.g. 0 8,13 * * 1-5) stays in the title tooltip
+        // so power-users can read it without clicking. Non-power users
+        // see "Mon-Fri at 8am, 1pm" or similar.
+        const humanCron = w.triggerSchedule ? humanizeCronExpression(w.triggerSchedule) : '';
+        const cronPill = w.triggerSchedule
+          ? '<span class="pill cron" title="' + escMem(w.triggerSchedule) + '">⏱ ' + escMem(humanCron || w.triggerSchedule) + '</span>'
+          : '';
         const href = '#workflows/' + encodeURIComponent(w.name);
         return [
           '<li class="' + cls + '" data-wf-name="' + escMem(w.name) + '">',
@@ -11160,6 +11890,7 @@ const CONSOLE_JS = `
           '</li>',
         ].join('');
       }).join('');
+      if (skipReselect) return;
       const hashName = workflowNameFromHash();
       const nextSelection =
         hashName && items.some((item) => item.name === hashName) ? hashName
@@ -11203,6 +11934,7 @@ const CONSOLE_JS = `
         forEach: s.forEach,
         deterministic: s.deterministic,
         allowedTools: s.allowedTools,
+        usesSkill: s.usesSkill || s.uses_skill,
       })) : [],
       inputs: data.inputs || {},
       synthesisPrompt: data.synthesis && data.synthesis.prompt ? data.synthesis.prompt : '',
@@ -11525,22 +12257,55 @@ const CONSOLE_JS = `
       .filter((id) => id !== step.id)
       .map((id) => '<button type="button" class="dep-pill ' + (deps.includes(id) ? 'on' : '') + '" data-wf-dep="' + escMem(id) + '" data-wf-step-id="' + escMem(step.id) + '">' + escMem(id) + '</button>')
       .join('');
-    // Chips: forEach / deterministic / per-step allowed-tools — these
-    // are the agent-runtime hints the user picked. Showing them on the
-    // step makes the runner's behavior legible without opening the
-    // raw markdown.
+    // Chips: forEach / deterministic — agent-runtime hints. Tool
+    // allowlist now lives in its own editable rail (see toolRailHtml
+    // below) so we drop the read-only ⚡ chip to avoid duplication.
     const chips = [];
     if (step.forEach) chips.push('<span class="step-chip chip-forEach" title="Runs once per item in &quot;' + escMem(step.forEach) + '&quot;">⇢ forEach ' + escMem(step.forEach) + '</span>');
     if (step.deterministic && step.deterministic.runner) chips.push('<span class="step-chip chip-deterministic" title="Runs a script — no LLM call">⚙ ' + escMem(step.deterministic.runner) + '</span>');
-    if (Array.isArray(step.allowedTools) && step.allowedTools.length > 0) {
-      const toolNames = step.allowedTools.slice(0, 4).map((t) => typeof t === 'string' ? t : t.name).join(', ');
-      const more = step.allowedTools.length > 4 ? ' +' + (step.allowedTools.length - 4) : '';
-      chips.push('<span class="step-chip chip-tools" title="Tools this step may call">⚡ ' + escMem(toolNames + more) + '</span>');
-    }
     if (deps.length > 0) {
       chips.push('<span class="step-chip chip-deps">↑ depends on ' + escMem(deps.join(', ')) + '</span>');
     }
     if (step.model) chips.push('<span class="step-chip chip-model">model: ' + escMem(step.model) + '</span>');
+
+    // Editable allowed-tools rail. Each tool is a chip with an x; the
+    // + ADD TOOL button opens the picker. The rail is always visible
+    // so the user can see what the step can call without entering the
+    // raw-markdown edit mode.
+    const tools = Array.isArray(step.allowedTools) ? step.allowedTools : [];
+    const toolChipHtml = tools.map((t, ti) => {
+      const name = typeof t === 'string' ? t : (t && t.name) || '';
+      if (!name) return '';
+      return [
+        '<span class="wf-tool-chip" data-wf-tool-chip="' + escMem(name) + '" data-wf-step-index="' + index + '">',
+        '  ' + escMem(name),
+        '  <button type="button" class="wf-tool-chip-remove" data-wf-action="step-tool-remove" data-wf-step-index="' + index + '" data-wf-tool-index="' + ti + '" title="Remove ' + escMem(name) + '">×</button>',
+        '</span>',
+      ].join('');
+    }).join('');
+    const toolRailHtml = [
+      '<div class="wf-step-tools" data-wf-step-tools-rail data-wf-step-index="' + index + '">',
+      '  <span class="wf-step-tools-label">TOOLS:</span>',
+      toolChipHtml || '<span style="color:var(--fg-mute);font-size:10px;letter-spacing:normal;">none</span>',
+      '  <button type="button" class="wf-tool-add" data-wf-action="step-tool-add" data-wf-step-index="' + index + '" title="Pick a tool to allow in this step">+ ADD TOOL</button>',
+      '</div>',
+    ].join('');
+
+    // Skill rail — visible when this step binds to a SKILL. One skill
+    // per step (the runner injects its SKILL.md body into the prompt).
+    // Rendered as a distinct row so it doesn't get lost among tool
+    // chips, since composing a skill is a meaningfully different act.
+    const skillRailHtml = step.usesSkill
+      ? [
+          '<div class="wf-step-skill" data-wf-step-skill-rail data-wf-step-index="' + index + '">',
+          '  <span class="wf-step-tools-label">SKILL:</span>',
+          '  <span class="wf-skill-chip" title="Runner injects the skill instructions before the step prompt">',
+          '    ' + escMem(step.usesSkill),
+          '    <button type="button" class="wf-tool-chip-remove" data-wf-action="step-skill-remove" data-wf-step-index="' + index + '" title="Unlink skill">×</button>',
+          '  </span>',
+          '</div>',
+        ].join('')
+      : '';
 
     const promptDisplay = (step.prompt || '').trim() || '(empty prompt)';
     return [
@@ -11562,8 +12327,10 @@ const CONSOLE_JS = `
       '  </div>',
       '  <div class="wf-step-body">',
       isEditing
-        ? '    <textarea class="step-prompt" rows="4" data-wf-step-field="prompt" data-wf-step-index="' + index + '" placeholder="What this step should do, ideally referencing any tools it should call (e.g. memory_recall, notify_user).">' + escMem(step.prompt || '') + '</textarea>'
+        ? '    <textarea class="step-prompt" rows="4" data-wf-step-field="prompt" data-wf-step-index="' + index + '" data-wf-tool-mention placeholder="What this step should do. Type @ to pick a tool (e.g. @composio_gmail_send_email).">' + escMem(step.prompt || '') + '</textarea>'
         : '    <div class="step-prompt-display" data-wf-action="step-edit-toggle" data-wf-step-index="' + index + '" title="Click to edit, or use ✎ REFINE to ask the Architect">' + escMem(promptDisplay) + '</div>',
+      '    ' + toolRailHtml,
+      '    ' + skillRailHtml,
       chips.length > 0 ? '    <div class="step-chips">' + chips.join('') + '</div>' : '',
       isEditing ? (depPills ? '    <div class="step-deps"><span class="step-deps-label">DEPENDS ON ⇢</span>' + depPills + '</div>' : '    <div class="step-deps"><span class="step-deps-label">DEPENDS ON ⇢</span><span style="color:var(--fg-mute);">(no other steps to depend on)</span></div>') : '',
       '    <div class="step-output" hidden data-wf-step-output="' + escMem(step.id) + '"></div>',
@@ -11632,7 +12399,23 @@ const CONSOLE_JS = `
         if (action === 'save') return saveWorkflow();
         if (action === 'validate') return validateWorkflow();
         if (action === 'dry-run' || action === 'test') return runWorkflow(true);
-        if (action === 'run') return runWorkflow(false);
+        if (action === 'run') {
+          // v0.5.11 UX: confirm before firing a live RUN. The button
+          // sits next to DRY-RUN; one accidental click otherwise
+          // triggers real side-effects (Outlook sends, Salesforce
+          // writes, notify_user pings). The confirm() is dismissible
+          // for power-users who want quick repeated runs.
+          const name = (wfDraft && wfDraft.name) || 'this workflow';
+          // Escaped newlines: parent CONSOLE_JS template literal would
+          // otherwise interpolate the escape into a real newline, which
+          // would break the inner JS string literal across actual lines.
+          const ok = confirm(
+            'Run "' + name + '" now?\\n\\n' +
+            'This executes for real — any tools the workflow calls may write to Salesforce / send Outlook drafts / notify you via Discord. Use DRY-RUN if you want to see the plan without side effects.'
+          );
+          if (!ok) return;
+          return runWorkflow(false);
+        }
         if (action === 'toggle') return toggleEnabled();
         if (action === 'delete') return deleteWorkflow();
         if (action === 'duplicate') return duplicateWorkflow();
@@ -11717,6 +12500,48 @@ const CONSOLE_JS = `
           tryStep(step).catch((err) => console.error('try step failed', err));
           return;
         }
+        if (action === 'step-tool-add' && Number.isFinite(idx)) {
+          // Open the picker anchored to the + ADD TOOL button. Selecting
+          // a tool appends to the step's allowedTools (no insertion into
+          // the prompt text — the user clicked the button, not @-typed).
+          openToolPicker({
+            anchor: btn,
+            stepIndex: idx,
+            insertMention: false,
+          });
+          return;
+        }
+        if (action === 'step-tool-remove' && Number.isFinite(idx)) {
+          const toolIdx = parseInt(btn.getAttribute('data-wf-tool-index') || '-1', 10);
+          const step = wfDraft.steps[idx];
+          if (!step || !Array.isArray(step.allowedTools)) return;
+          if (toolIdx >= 0 && toolIdx < step.allowedTools.length) {
+            step.allowedTools.splice(toolIdx, 1);
+            if (step.allowedTools.length === 0) delete step.allowedTools;
+            renderEditor();
+          }
+          return;
+        }
+        if (action === 'step-skill-remove' && Number.isFinite(idx)) {
+          const step = wfDraft.steps[idx];
+          if (!step) return;
+          delete step.usesSkill;
+          renderEditor();
+          return;
+        }
+      });
+    });
+
+    // @-mention handlers on step prompt textareas. Typing '@' at a word
+    // boundary opens the tool picker anchored to the caret; further
+    // typing filters; Enter inserts. The textarea's input listener
+    // already updates wfDraft.steps[idx].prompt — we just observe.
+    wf.editor.querySelectorAll('[data-wf-tool-mention]').forEach((ta) => {
+      ta.addEventListener('input', (e) => onMentionTextareaInput(ta));
+      ta.addEventListener('keydown', (e) => onMentionTextareaKeydown(ta, e));
+      ta.addEventListener('blur', () => {
+        // Defer close so a click on a picker row registers first.
+        setTimeout(() => { if (toolPickerState.activeTextarea === ta) closeToolPicker(); }, 120);
       });
     });
   }
@@ -12119,6 +12944,268 @@ const CONSOLE_JS = `
     ].join('');
   }
 
+  // ─── @-mention tool picker ────────────────────────────────────
+  //
+  // Tools are sourced from /api/console/tools (same registry the Tools
+  // panel uses). We cache once on first picker open so the user gets
+  // instant fuzzy filtering. The picker is a single floating <div>
+  // reused across all step textareas — we re-anchor it each time it
+  // opens. Selection inserts the @toolname into the prompt (if opened
+  // via @-mention) and always adds the tool to the step's allowedTools.
+
+  // Entries in the picker are either kind:'tool' (allowedTools binding)
+  // or kind:'skill' (usesSkill binding). Both surface in the same fuzzy
+  // list — skills get a SKILL badge so they're visually distinct.
+  let wfPickerCache = null;
+  let wfPickerCachePromise = null;
+  const toolPickerState = {
+    el: null,
+    activeTextarea: null,
+    stepIndex: -1,
+    insertMention: false,
+    mentionStart: -1,            // index of '@' in textarea.value when opened via mention
+    filter: '',
+    matches: [],
+    activeRow: 0,
+  };
+
+  async function loadToolsForPicker() {
+    if (wfPickerCache) return wfPickerCache;
+    if (wfPickerCachePromise) return wfPickerCachePromise;
+    wfPickerCachePromise = fetchJSON('/api/console/tools')
+      .then((data) => {
+        const tools = (data && Array.isArray(data.tools)) ? data.tools : [];
+        const skills = (data && Array.isArray(data.skills)) ? data.skills : [];
+        const toolEntries = tools.map((t) => ({
+          kind: 'tool',
+          name: t.name || '',
+          category: t.category || 'Other',
+          description: t.description || '',
+        })).filter((t) => t.name);
+        const skillEntries = skills.map((s) => ({
+          kind: 'skill',
+          name: s.name || '',
+          category: 'Skill',
+          description: s.description || '',
+        })).filter((s) => s.name);
+        // Skills first when scores tie — they're the most expensive
+        // primitive to compose by hand, so surfacing them early pays
+        // off in authoring time.
+        wfPickerCache = [...skillEntries, ...toolEntries];
+        return wfPickerCache;
+      })
+      .catch((err) => {
+        console.error('tool picker: failed to load tools', err);
+        wfPickerCache = [];
+        return wfPickerCache;
+      })
+      .finally(() => { wfPickerCachePromise = null; });
+    return wfPickerCachePromise;
+  }
+
+  function ensureToolPickerEl() {
+    if (toolPickerState.el) return toolPickerState.el;
+    const el = document.createElement('div');
+    el.className = 'wf-tool-picker';
+    el.setAttribute('data-wf-tool-picker', '');
+    el.style.display = 'none';
+    document.body.appendChild(el);
+    el.addEventListener('mousedown', (e) => {
+      // Prevent the textarea blur from firing before the click handler.
+      e.preventDefault();
+    });
+    el.addEventListener('click', (e) => {
+      const row = e.target instanceof HTMLElement ? e.target.closest('[data-wf-tool-row]') : null;
+      if (!row) return;
+      const name = row.getAttribute('data-wf-tool-row');
+      const kind = row.getAttribute('data-wf-tool-kind') || 'tool';
+      selectToolFromPicker(name, kind);
+    });
+    toolPickerState.el = el;
+    return el;
+  }
+
+  function positionPicker(anchor) {
+    const el = toolPickerState.el;
+    if (!el || !anchor) return;
+    const rect = anchor.getBoundingClientRect();
+    // Anchor below the element; clamp to viewport.
+    const left = Math.max(8, Math.min(window.innerWidth - 300, rect.left));
+    const top = rect.bottom + 4 + window.scrollY;
+    el.style.left = left + 'px';
+    el.style.top = top + 'px';
+  }
+
+  /**
+   * Open the picker. Two modes:
+   *   - { anchor, stepIndex, insertMention: false }
+   *       Anchored to a button (+ ADD TOOL). No textarea interaction.
+   *   - { textarea, stepIndex, mentionStart }
+   *       User typed '@' in a step prompt. Filter follows characters
+   *       after the '@'. On select we insert @toolname into the prompt
+   *       at the mention position.
+   */
+  async function openToolPicker(opts) {
+    const el = ensureToolPickerEl();
+    await loadToolsForPicker();
+    toolPickerState.activeTextarea = opts.textarea || null;
+    toolPickerState.stepIndex = (opts.stepIndex !== undefined) ? opts.stepIndex : -1;
+    toolPickerState.insertMention = !!opts.insertMention;
+    toolPickerState.mentionStart = opts.mentionStart !== undefined ? opts.mentionStart : -1;
+    toolPickerState.filter = opts.filter || '';
+    toolPickerState.activeRow = 0;
+    const anchor = opts.anchor || opts.textarea;
+    positionPicker(anchor);
+    el.style.display = 'block';
+    renderToolPicker();
+  }
+
+  function closeToolPicker() {
+    const el = toolPickerState.el;
+    if (el) el.style.display = 'none';
+    toolPickerState.activeTextarea = null;
+    toolPickerState.stepIndex = -1;
+    toolPickerState.mentionStart = -1;
+    toolPickerState.filter = '';
+    toolPickerState.matches = [];
+    toolPickerState.activeRow = 0;
+  }
+
+  function filterTools(filter) {
+    const all = wfPickerCache || [];
+    if (!filter) return all.slice(0, 8);
+    const needle = filter.toLowerCase();
+    const scored = [];
+    for (const t of all) {
+      const nameLc = t.name.toLowerCase();
+      const catLc = t.category.toLowerCase();
+      let score = -1;
+      if (nameLc.startsWith(needle)) score = 100;
+      else if (nameLc.includes(needle)) score = 70;
+      else if (catLc.includes(needle)) score = 30;
+      if (score >= 0) {
+        // Boost skills slightly — they're rarer + higher-leverage so
+        // when a name matches both a tool and a skill, prefer surfacing
+        // the skill near the top.
+        if (t.kind === 'skill') score += 5;
+        scored.push({ t, score });
+      }
+    }
+    scored.sort((a, b) => b.score - a.score || a.t.name.localeCompare(b.t.name));
+    return scored.slice(0, 8).map((s) => s.t);
+  }
+
+  function renderToolPicker() {
+    const el = toolPickerState.el;
+    if (!el) return;
+    const matches = filterTools(toolPickerState.filter);
+    toolPickerState.matches = matches;
+    if (toolPickerState.activeRow >= matches.length) toolPickerState.activeRow = 0;
+    if (matches.length === 0) {
+      el.innerHTML = '<div class="wf-tool-picker-empty">— nothing matches "' + escMem(toolPickerState.filter) + '" —</div>';
+      return;
+    }
+    el.innerHTML = matches.map((t, i) => {
+      const cls = 'wf-tool-picker-row' + (i === toolPickerState.activeRow ? ' active' : '');
+      const kind = t.kind || 'tool';
+      const catLabel = kind === 'skill' ? 'SKILL' : (t.category || 'TOOL');
+      const catCls = kind === 'skill' ? 'wf-tool-picker-cat is-skill' : 'wf-tool-picker-cat';
+      return [
+        '<div class="' + cls + '" data-wf-tool-row="' + escMem(t.name) + '" data-wf-tool-kind="' + escMem(kind) + '">',
+        '  <span class="wf-tool-picker-name">' + escMem(t.name) + '</span>',
+        '  <span class="' + catCls + '">' + escMem(catLabel) + '</span>',
+        '</div>',
+      ].join('');
+    }).join('');
+  }
+
+  function selectToolFromPicker(name, kind) {
+    if (!name) return;
+    const idx = toolPickerState.stepIndex;
+    if (idx < 0 || !wfDraft || !wfDraft.steps[idx]) { closeToolPicker(); return; }
+    const step = wfDraft.steps[idx];
+    if (kind === 'skill') {
+      // Skills bind to step.usesSkill — one skill per step. Adding a
+      // new one replaces the prior binding (rare, but explicit beats
+      // surprising). Don't touch allowedTools.
+      step.usesSkill = name;
+    } else {
+      if (!Array.isArray(step.allowedTools)) step.allowedTools = [];
+      if (!step.allowedTools.includes(name)) step.allowedTools.push(name);
+    }
+
+    // If opened via @-mention, splice @name into the prompt at the
+    // mention position. Otherwise just update the chip rail.
+    if (toolPickerState.insertMention && toolPickerState.activeTextarea && toolPickerState.mentionStart >= 0) {
+      const ta = toolPickerState.activeTextarea;
+      const value = ta.value;
+      const before = value.slice(0, toolPickerState.mentionStart);
+      const afterStart = ta.selectionEnd ?? value.length;
+      const after = value.slice(afterStart);
+      const insertion = '@' + name + ' ';
+      ta.value = before + insertion + after;
+      step.prompt = ta.value;
+      const caret = before.length + insertion.length;
+      try { ta.setSelectionRange(caret, caret); } catch { /* tolerate */ }
+    }
+    closeToolPicker();
+    renderEditor();
+  }
+
+  function onMentionTextareaInput(ta) {
+    const value = ta.value;
+    const caret = ta.selectionStart ?? value.length;
+    // Find the nearest '@' before the caret that starts at a word
+    // boundary and has no whitespace between it and the caret.
+    let at = -1;
+    for (let i = caret - 1; i >= 0; i--) {
+      const ch = value[i];
+      if (ch === '@') { at = i; break; }
+      if (/\s/.test(ch)) break;
+    }
+    if (at < 0) { closeToolPicker(); return; }
+    if (at > 0 && /\S/.test(value[at - 1])) { closeToolPicker(); return; }
+    const filter = value.slice(at + 1, caret);
+    if (filter.length > 60) { closeToolPicker(); return; }
+    const idx = parseInt(ta.getAttribute('data-wf-step-index') || '-1', 10);
+    openToolPicker({
+      textarea: ta,
+      stepIndex: idx,
+      insertMention: true,
+      mentionStart: at,
+      filter,
+    });
+  }
+
+  function onMentionTextareaKeydown(ta, e) {
+    const open = toolPickerState.el && toolPickerState.el.style.display === 'block' && toolPickerState.activeTextarea === ta;
+    if (!open) return;
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      toolPickerState.activeRow = Math.min(toolPickerState.matches.length - 1, toolPickerState.activeRow + 1);
+      renderToolPicker();
+      return;
+    }
+    if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      toolPickerState.activeRow = Math.max(0, toolPickerState.activeRow - 1);
+      renderToolPicker();
+      return;
+    }
+    if (e.key === 'Enter' || e.key === 'Tab') {
+      const pick = toolPickerState.matches[toolPickerState.activeRow];
+      if (pick) {
+        e.preventDefault();
+        selectToolFromPicker(pick.name, pick.kind || 'tool');
+      }
+      return;
+    }
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      closeToolPicker();
+    }
+  }
+
   // ─── Architect chat ───────────────────────────────────────────
 
   function appendChatMessage(role, text) {
@@ -12131,6 +13218,245 @@ const CONSOLE_JS = `
     wf.chatLog.appendChild(div);
     wf.chatLog.scrollTop = wf.chatLog.scrollHeight;
     return div;
+  }
+
+  /**
+   * Render one architect-proposed diff as a card in the chat log with
+   * APPLY / DISCARD buttons. Ops are stashed on the DOM node so the
+   * delegated click handler can read them back without re-parsing.
+   */
+  function appendDiffCard(diff) {
+    if (!wf.chatLog || !diff || !Array.isArray(diff.ops) || diff.ops.length === 0) return null;
+    const intro = wf.chatLog.querySelector('.wf-chat-intro');
+    if (intro) intro.remove();
+    const card = document.createElement('div');
+    card.className = 'wf-diff-card';
+    card._wfOps = diff.ops;
+    const opsHtml = diff.ops.map((op) => '<li>' + escMem(describeDiffOp(op)) + '</li>').join('');
+    const summary = diff.summary ? '<div class="wf-diff-summary">' + escMem(diff.summary) + '</div>' : '';
+    card.innerHTML = [
+      '<div class="wf-diff-head">PROPOSED CHANGES · ' + diff.ops.length + ' OP' + (diff.ops.length === 1 ? '' : 'S') + '</div>',
+      summary,
+      '<ul class="wf-diff-ops">' + opsHtml + '</ul>',
+      '<div class="wf-diff-actions">',
+      '  <button type="button" class="wf-diff-apply" data-wf-diff-apply>APPLY ▸</button>',
+      '  <button type="button" class="wf-diff-discard" data-wf-diff-discard>DISCARD</button>',
+      '</div>',
+      '<div class="wf-diff-status" hidden></div>',
+    ].join('');
+    wf.chatLog.appendChild(card);
+    wf.chatLog.scrollTop = wf.chatLog.scrollHeight;
+    return card;
+  }
+
+  /** Human-readable one-liner per op for the diff card body. */
+  function describeDiffOp(op) {
+    if (!op || typeof op !== 'object') return '(invalid op)';
+    const t = op.type;
+    if (t === 'set_field') {
+      const v = typeof op.value === 'string' ? '"' + op.value + '"' : JSON.stringify(op.value);
+      return 'set ' + op.path + ' → ' + v;
+    }
+    if (t === 'add_step') {
+      const id = op.step && op.step.id ? op.step.id : '?';
+      const promptExcerpt = op.step && op.step.prompt ? op.step.prompt.slice(0, 70) : '';
+      const skill = op.step && (op.step.uses_skill || op.step.usesSkill);
+      const skillTag = skill ? ' [uses skill: ' + skill + ']' : '';
+      return '+ step ' + id + (promptExcerpt ? ': "' + promptExcerpt + (op.step.prompt.length > 70 ? '…' : '') + '"' : '') + skillTag;
+    }
+    if (t === 'update_step') {
+      const fields = op.patch ? Object.keys(op.patch).join(', ') : '';
+      return '~ step ' + op.id + (fields ? ': ' + fields + ' updated' : '');
+    }
+    if (t === 'remove_step') return '− step ' + op.id;
+    if (t === 'reorder_step') return '↕ step ' + op.id + ' moved after ' + (op.after || '(first)');
+    if (t === 'rename_step') return '∼ step ' + op.id + ' → ' + op.newId;
+    if (t === 'add_input') return '+ input ' + op.key;
+    if (t === 'remove_input') return '− input ' + op.key;
+    if (t === 'set_synthesis') return op.value ? 'set synthesis prompt' : 'clear synthesis prompt';
+    return '(unknown op: ' + String(t) + ')';
+  }
+
+  /**
+   * Apply an array of architect ops to a draft. Returns { draft, warnings }.
+   * Pure function — caller is responsible for re-rendering and validating.
+   * Unknown / invalid ops are skipped with a warning rather than throwing,
+   * so a partially-malformed diff still applies the good parts.
+   */
+  function applyDiff(currentDraft, ops) {
+    const warnings = [];
+    const base = currentDraft || {
+      name: 'new-workflow', description: '', enabled: false,
+      triggerSchedule: '', steps: [], inputs: {}, synthesisPrompt: '',
+    };
+    // Deep-ish clone — steps + inputs are the parts that get mutated.
+    const draft = {
+      ...base,
+      steps: (base.steps || []).map((s) => ({
+        ...s,
+        dependsOn: Array.isArray(s.dependsOn) ? s.dependsOn.slice() : [],
+        allowedTools: Array.isArray(s.allowedTools) ? s.allowedTools.slice() : s.allowedTools,
+      })),
+      inputs: { ...(base.inputs || {}) },
+    };
+    const findStepIndex = (id) => draft.steps.findIndex((s) => s.id === id);
+    const SET_FIELD_PATHS = { name: 1, description: 1, triggerSchedule: 1, enabled: 1, whenToUse: 1 };
+
+    for (const op of ops) {
+      if (!op || typeof op !== 'object') { warnings.push('skipped malformed op'); continue; }
+      switch (op.type) {
+        case 'set_field': {
+          if (!SET_FIELD_PATHS[op.path]) { warnings.push('unknown field: ' + op.path); break; }
+          draft[op.path] = op.value;
+          break;
+        }
+        case 'add_step': {
+          const step = op.step;
+          if (!step || typeof step.id !== 'string') { warnings.push('add_step missing id'); break; }
+          if (findStepIndex(step.id) >= 0) { warnings.push('step "' + step.id + '" already exists — skipped add_step'); break; }
+          // Accept architect's snake_case allowed_tools alongside camelCase.
+          const allowedTools = Array.isArray(step.allowed_tools) ? step.allowed_tools.slice()
+            : Array.isArray(step.allowedTools) ? step.allowedTools.slice() : undefined;
+          // Same snake/camel tolerance for uses_skill.
+          const usesSkill = typeof step.uses_skill === 'string' ? step.uses_skill.trim()
+            : typeof step.usesSkill === 'string' ? step.usesSkill.trim() : '';
+          draft.steps.push({
+            id: step.id,
+            prompt: typeof step.prompt === 'string' ? step.prompt : '',
+            dependsOn: Array.isArray(step.dependsOn) ? step.dependsOn.slice() : [],
+            ...(step.model ? { model: step.model } : {}),
+            ...(step.forEach ? { forEach: step.forEach } : {}),
+            ...(step.deterministic ? { deterministic: step.deterministic } : {}),
+            ...(allowedTools ? { allowedTools } : {}),
+            ...(usesSkill ? { usesSkill } : {}),
+          });
+          break;
+        }
+        case 'update_step': {
+          const idx = findStepIndex(op.id);
+          if (idx < 0) { warnings.push('update_step: no step "' + op.id + '" — skipped'); break; }
+          const patch = (op.patch && typeof op.patch === 'object') ? op.patch : {};
+          if (typeof patch.prompt === 'string') draft.steps[idx].prompt = patch.prompt;
+          if (Array.isArray(patch.dependsOn)) draft.steps[idx].dependsOn = patch.dependsOn.slice();
+          if (Array.isArray(patch.allowed_tools)) draft.steps[idx].allowedTools = patch.allowed_tools.slice();
+          else if (Array.isArray(patch.allowedTools)) draft.steps[idx].allowedTools = patch.allowedTools.slice();
+          if (typeof patch.model === 'string') draft.steps[idx].model = patch.model;
+          if (typeof patch.forEach === 'string') draft.steps[idx].forEach = patch.forEach;
+          if (patch.deterministic !== undefined) draft.steps[idx].deterministic = patch.deterministic;
+          // uses_skill: explicit null clears the binding; string sets it.
+          if ('uses_skill' in patch || 'usesSkill' in patch) {
+            const next = patch.uses_skill !== undefined ? patch.uses_skill : patch.usesSkill;
+            if (next === null || next === '') delete draft.steps[idx].usesSkill;
+            else if (typeof next === 'string') draft.steps[idx].usesSkill = next.trim();
+          }
+          break;
+        }
+        case 'remove_step': {
+          const idx = findStepIndex(op.id);
+          if (idx < 0) { warnings.push('remove_step: no step "' + op.id + '"'); break; }
+          draft.steps.splice(idx, 1);
+          // Also drop any references to it from other steps' dependsOn.
+          draft.steps.forEach((s) => {
+            if (Array.isArray(s.dependsOn)) s.dependsOn = s.dependsOn.filter((d) => d !== op.id);
+          });
+          break;
+        }
+        case 'reorder_step': {
+          const idx = findStepIndex(op.id);
+          if (idx < 0) { warnings.push('reorder_step: no step "' + op.id + '"'); break; }
+          const [moved] = draft.steps.splice(idx, 1);
+          if (op.after === null || op.after === undefined || op.after === '') {
+            draft.steps.unshift(moved);
+          } else {
+            const afterIdx = findStepIndex(op.after);
+            if (afterIdx < 0) {
+              // Anchor missing — push back roughly where it was.
+              draft.steps.splice(idx, 0, moved);
+              warnings.push('reorder_step: anchor "' + op.after + '" not found');
+            } else {
+              draft.steps.splice(afterIdx + 1, 0, moved);
+            }
+          }
+          break;
+        }
+        case 'rename_step': {
+          const idx = findStepIndex(op.id);
+          if (idx < 0) { warnings.push('rename_step: no step "' + op.id + '"'); break; }
+          if (typeof op.newId !== 'string' || !op.newId.trim()) { warnings.push('rename_step: invalid newId'); break; }
+          if (findStepIndex(op.newId) >= 0) { warnings.push('rename_step: "' + op.newId + '" already exists'); break; }
+          draft.steps[idx].id = op.newId;
+          // Rewrite dependsOn references across the rest of the steps.
+          draft.steps.forEach((s) => {
+            if (Array.isArray(s.dependsOn)) {
+              s.dependsOn = s.dependsOn.map((d) => (d === op.id ? op.newId : d));
+            }
+          });
+          break;
+        }
+        case 'add_input': {
+          if (typeof op.key !== 'string' || !op.key.trim()) { warnings.push('add_input: invalid key'); break; }
+          draft.inputs[op.key] = (op.value !== undefined && op.value !== null) ? op.value : '';
+          break;
+        }
+        case 'remove_input': {
+          if (typeof op.key !== 'string') { warnings.push('remove_input: invalid key'); break; }
+          delete draft.inputs[op.key];
+          break;
+        }
+        case 'set_synthesis': {
+          draft.synthesisPrompt = (op.value === null || op.value === undefined) ? '' : String(op.value);
+          break;
+        }
+        default:
+          warnings.push('unknown op type: ' + String(op.type));
+      }
+    }
+    return { draft, warnings };
+  }
+
+  // Delegated handler for APPLY / DISCARD on diff cards in the chat log.
+  if (wf.chatLog) {
+    wf.chatLog.addEventListener('click', (event) => {
+      const target = event.target;
+      if (!(target instanceof HTMLElement)) return;
+      const card = target.closest('.wf-diff-card');
+      if (!card) return;
+      if (target.closest('[data-wf-diff-apply]')) {
+        event.preventDefault();
+        const ops = card._wfOps || [];
+        const result = applyDiff(wfDraft, ops);
+        wfDraft = result.draft;
+        // If we were starting from an empty editor (no NEW yet), make sure
+        // we flip into "new workflow" mode so SAVE creates instead of patches.
+        if (!wfSelectedName && wfIsNew !== true) wfIsNew = true;
+        renderEditor();
+        // Mark the card as applied so the user can't double-apply it.
+        card.classList.add('applied');
+        const statusEl = card.querySelector('.wf-diff-status');
+        if (statusEl) {
+          statusEl.hidden = false;
+          const warningsHtml = result.warnings.length > 0
+            ? '<div class="wf-diff-warn">' + result.warnings.map((w) => escMem('⚠ ' + w)).join('<br>') + '</div>'
+            : '';
+          statusEl.innerHTML = '<span class="wf-diff-applied">✓ APPLIED</span>' + warningsHtml;
+        }
+        // Disable the action buttons.
+        const buttons = card.querySelectorAll('button');
+        buttons.forEach((b) => { b.disabled = true; });
+        return;
+      }
+      if (target.closest('[data-wf-diff-discard]')) {
+        event.preventDefault();
+        card.classList.add('discarded');
+        const statusEl = card.querySelector('.wf-diff-status');
+        if (statusEl) {
+          statusEl.hidden = false;
+          statusEl.innerHTML = '<span class="wf-diff-discarded">— DISCARDED —</span>';
+        }
+        const buttons = card.querySelectorAll('button');
+        buttons.forEach((b) => { b.disabled = true; });
+      }
+    });
   }
 
   wf.chatForm.addEventListener('submit', async (e) => {
@@ -12161,8 +13487,17 @@ const CONSOLE_JS = `
       if (!r.ok) {
         appendChatMessage('error', j.error || ('HTTP ' + r.status));
       } else {
-        appendChatMessage('assistant', j.text || '(no reply)');
-        wfChatHistory.push({ role: 'assistant', text: j.text || '' });
+        const text = (j.text || '').trim();
+        if (text) {
+          appendChatMessage('assistant', text);
+        }
+        if (j.diff && Array.isArray(j.diff.ops) && j.diff.ops.length > 0) {
+          appendDiffCard(j.diff);
+        } else if (!text) {
+          // Server returned nothing useful — keep the user oriented.
+          appendChatMessage('assistant', '(no reply)');
+        }
+        wfChatHistory.push({ role: 'assistant', text });
       }
     } catch (err) {
       if (thinkingNode) thinkingNode.remove();
@@ -12181,6 +13516,42 @@ const CONSOLE_JS = `
       wf.chatForm.dispatchEvent(new Event('submit', { cancelable: true }));
     }
   });
+
+  // v0.5.11 UX — wire architect chat starter chips. Clicking a chip
+  // pre-fills the textarea and focuses it so the user can edit before
+  // sending. Also toggle which chip set is visible based on whether a
+  // workflow draft is currently loaded ("new" chips when starting from
+  // scratch, "edit" chips when refining an existing workflow).
+  function syncArchitectChatChips() {
+    const hasDraft = !!wfDraft;
+    const chips = document.querySelectorAll('[data-wf-chat-chip-mode]');
+    chips.forEach(function (chip) {
+      const mode = chip.getAttribute('data-wf-chat-chip-mode');
+      const shouldShow = hasDraft ? mode === 'edit' : mode === 'new';
+      if (shouldShow) chip.removeAttribute('hidden');
+      else chip.setAttribute('hidden', '');
+    });
+  }
+  document.querySelectorAll('[data-wf-chat-chip]').forEach(function (chip) {
+    chip.addEventListener('click', function () {
+      const prompt = chip.getAttribute('data-wf-chat-chip');
+      if (!prompt || !wf.chatInput) return;
+      wf.chatInput.value = prompt;
+      wf.chatInput.focus();
+      // Move caret to end so user can append / edit naturally.
+      try {
+        const len = prompt.length;
+        wf.chatInput.setSelectionRange(len, len);
+      } catch (_) { /* not all browsers */ }
+    });
+  });
+  // Re-sync chips whenever the draft state changes. The draft can flip
+  // from null → object in many spots (workflow click in list, ＋ NEW,
+  // architect-applied diff). Easiest robust signal: poll a cheap flag
+  // on the same animation frame as the editor render. We use a
+  // setInterval at 500ms — chip toggling is purely UI, no API cost.
+  setInterval(syncArchitectChatChips, 500);
+  syncArchitectChatChips();
 
   // ─── Tools panel ──────────────────────────────────────────────
 
@@ -15794,6 +17165,524 @@ const CONSOLE_JS = `
     setInterval(refreshUsagePanel, 15000);
   }
 
+  // v0.5.11 — Approvals panel boot + render.
+  async function bootApprovalsPanel() {
+    const refreshBtn = document.querySelector('[data-approvals-refresh]');
+    if (refreshBtn && !refreshBtn.dataset.bound) {
+      refreshBtn.dataset.bound = '1';
+      refreshBtn.addEventListener('click', () => refreshApprovalsPanel());
+    }
+    const cancelStaleBtn = document.querySelector('[data-approvals-cancel-stale]');
+    if (cancelStaleBtn && !cancelStaleBtn.dataset.bound) {
+      cancelStaleBtn.dataset.bound = '1';
+      cancelStaleBtn.addEventListener('click', async () => {
+        if (!confirm('Cancel ALL approvals older than 1 hour? Their underlying workflow runs continue without action.')) return;
+        try {
+          await fetch(withToken('/api/console/approvals/cancel-stale'), { method: 'POST' });
+          await refreshApprovalsPanel();
+          await refreshApprovalsBadge();
+        } catch (err) { console.error('cancel-stale failed:', err); }
+      });
+    }
+    await refreshApprovalsPanel();
+    setInterval(() => { refreshApprovalsPanel(); refreshApprovalsBadge(); }, 20000);
+  }
+
+  function fmtApprovalAge(ms) {
+    if (!Number.isFinite(ms) || ms < 0) return '';
+    const min = Math.floor(ms / 60000);
+    if (min < 1) return 'just now';
+    if (min < 60) return min + 'm';
+    const h = Math.floor(min / 60);
+    if (h < 24) return h + 'h ' + (min % 60) + 'm';
+    return Math.floor(h / 24) + 'd ' + (h % 24) + 'h';
+  }
+
+  function approvalAgeClass(ms) {
+    if (ms > 6 * 3600_000) return 'very-stale';
+    if (ms > 60 * 60_000) return 'stale';
+    return '';
+  }
+
+  async function refreshApprovalsPanel() {
+    const listEl = document.querySelector('[data-approvals-list]');
+    if (!listEl) return;
+    try {
+      const data = await fetchJSON('/api/console/approvals/list');
+      const approvals = Array.isArray(data.approvals) ? data.approvals : [];
+      if (approvals.length === 0) {
+        listEl.innerHTML = '<div class="settings-info">No pending approvals. Clementine is not waiting on anything.</div>';
+        return;
+      }
+      const rows = approvals.map(function (a) {
+        const ageMs = a.requestedAt ? Date.now() - new Date(a.requestedAt).getTime() : 0;
+        const ageLabel = fmtApprovalAge(ageMs);
+        const ageCls = approvalAgeClass(ageMs);
+        let argsRendered = '';
+        if (a.args && typeof a.args === 'object') {
+          try { argsRendered = JSON.stringify(a.args, null, 2); } catch { argsRendered = String(a.args); }
+        }
+        const sessionShort = (a.sessionId || '').slice(0, 32);
+        const workflow = (a.args && typeof a.args === 'object' && typeof a.args.workflow === 'string') ? a.args.workflow : '';
+        return [
+          '<div class="approval-card" data-approval-id="' + escMem(a.approvalId || '') + '">',
+          '  <div class="approval-card-head">',
+          '    <div class="approval-subject">' + escMem(a.subject || a.tool || '(no subject)') + '</div>',
+          '    <div class="approval-age ' + ageCls + '">' + escMem(ageLabel) + '</div>',
+          '  </div>',
+          '  <div class="approval-meta">tool: <code>' + escMem(a.tool || 'unknown') + '</code>',
+          workflow ? ' · workflow: <code>' + escMem(workflow) + '</code>' : '',
+          ' · session: <code>' + escMem(sessionShort) + '</code>',
+          ' · id: <code>' + escMem(a.approvalId || '') + '</code></div>',
+          argsRendered ? '  <pre class="approval-args">' + escMem(argsRendered) + '</pre>' : '',
+          '  <div class="approval-actions">',
+          '    <button class="approve" data-approval-action="approve">APPROVE</button>',
+          '    <button class="reject" data-approval-action="reject">REJECT</button>',
+          '    <button data-approval-action="cancel">CANCEL RUN</button>',
+          '  </div>',
+          '</div>',
+        ].join('');
+      });
+      listEl.innerHTML = rows.join('');
+
+      // Bind action handlers
+      Array.from(listEl.querySelectorAll('[data-approval-action]')).forEach(function (btn) {
+        if (btn.dataset.bound) return;
+        btn.dataset.bound = '1';
+        btn.addEventListener('click', async function () {
+          const card = btn.closest('[data-approval-id]');
+          if (!card) return;
+          const id = card.getAttribute('data-approval-id');
+          const action = btn.getAttribute('data-approval-action');
+          if (!id || !action) return;
+          if (action === 'cancel' && !confirm('Cancel this run? It will stop without sending or completing.')) return;
+          Array.from(card.querySelectorAll('button')).forEach(function (b) { b.disabled = true; });
+          try {
+            await fetch(withToken('/api/console/harness-approvals/' + encodeURIComponent(id) + '/' + action), {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+            });
+            await refreshApprovalsPanel();
+            await refreshApprovalsBadge();
+          } catch (err) {
+            console.error('approval action failed:', err);
+            Array.from(card.querySelectorAll('button')).forEach(function (b) { b.disabled = false; });
+          }
+        });
+      });
+    } catch (err) {
+      console.error('approvals panel refresh failed:', err);
+      listEl.innerHTML = '<div class="settings-info">— failed to load: ' + escMem(String(err && err.message || err)) + ' —</div>';
+    }
+  }
+
+  async function refreshApprovalsBadge() {
+    const badge = document.querySelector('[data-approvals-badge]');
+    if (!badge) return;
+    try {
+      const data = await fetchJSON('/api/console/approvals/list');
+      const n = Array.isArray(data.approvals) ? data.approvals.length : 0;
+      if (n > 0) {
+        badge.textContent = String(n);
+        badge.hidden = false;
+      } else {
+        badge.hidden = true;
+      }
+    } catch { /* ignore */ }
+  }
+
+  // Refresh the nav badge in the background regardless of which panel
+  // is open — that's the "you have stale approvals" affordance.
+  setInterval(refreshApprovalsBadge, 30000);
+  refreshApprovalsBadge();
+
+  // ────────────────────────────────────────────────────────────────
+  // v0.5.11 — Brain panel. Five OUTER sub-tabs:
+  //   Overview / Knowledge / Events / Profile / Evolution
+  // Inside "Knowledge" there are three INNER sub-tabs (Facts / Entities /
+  // Graph & Files) — those reuse the v0.5.10-era facts + entities loaders.
+  // ────────────────────────────────────────────────────────────────
+
+  let brainKnowledgeSubtab = 'facts';
+
+  function refreshBrainCurrentTab() {
+    if (brainCurrentTab === 'overview') refreshBrainOverview();
+    else if (brainCurrentTab === 'knowledge') refreshBrainKnowledgeCurrentSub();
+    else if (brainCurrentTab === 'events') refreshBrainPointers();
+    else if (brainCurrentTab === 'meetings') refreshBrainMeetings();
+    else if (brainCurrentTab === 'profile') refreshBrainProfile();
+    else if (brainCurrentTab === 'evolution') refreshBrainEvolution();
+  }
+
+  async function refreshBrainKnowledgeCurrentSub() {
+    if (brainKnowledgeSubtab === 'facts') refreshBrainFacts();
+    else if (brainKnowledgeSubtab === 'entities') refreshBrainEntities();
+    else if (brainKnowledgeSubtab === 'graph') {
+      // Graph view — wire controls + ALWAYS force loadMemoryGraph on
+      // first visible contact. The legacy bootMemoryPanel may have
+      // run while the canvas container was hidden (0×0), leaving a
+      // degenerate cytoscape instance. force=true tears down + rebuilds
+      // with the now-correct dimensions.
+      if (typeof wireMemoryGraphControls === 'function') wireMemoryGraphControls();
+      if (memGraphCy) {
+        try { memGraphCy.resize(); memGraphCy.fit(undefined, 40); } catch (_) {}
+      }
+      if (typeof loadMemoryGraph === 'function') {
+        try { await loadMemoryGraph({ force: true }); } catch (err) { console.error('brain/graph load failed:', err); }
+      }
+    } else if (brainKnowledgeSubtab === 'files') {
+      // Files view — first contact runs the full bootMemoryPanel so
+      // every data-mem-* selector wires up (search input, viewer
+      // click handlers, kind pills). Subsequent visits just refresh
+      // the lists.
+      await ensureMemoryBooted();
+      if (typeof refreshMemoryPanel === 'function') {
+        try { await refreshMemoryPanel(); } catch (err) { console.error('brain/files refresh failed:', err); }
+      }
+    }
+  }
+
+  async function bootBrainPanel() {
+    // Outer tabs.
+    Array.from(document.querySelectorAll('[data-brain-tab]')).forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        const tab = btn.getAttribute('data-brain-tab');
+        if (!tab) return;
+        Array.from(document.querySelectorAll('.brain-tab')).forEach(function (t) { t.classList.toggle('on', t === btn); });
+        Array.from(document.querySelectorAll('.brain-tab-pane')).forEach(function (p) {
+          p.hidden = p.getAttribute('data-brain-pane') !== tab;
+        });
+        brainCurrentTab = tab;
+        refreshBrainCurrentTab();
+      });
+    });
+    // Inner Knowledge sub-tabs (Facts / Entities / Graph & Files).
+    Array.from(document.querySelectorAll('[data-brain-knowledge-tab]')).forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        const tab = btn.getAttribute('data-brain-knowledge-tab');
+        if (!tab) return;
+        Array.from(document.querySelectorAll('.brain-subtab')).forEach(function (t) { t.classList.toggle('on', t === btn); });
+        Array.from(document.querySelectorAll('.brain-knowledge-pane')).forEach(function (p) {
+          p.hidden = p.getAttribute('data-brain-knowledge-pane') !== tab;
+        });
+        brainKnowledgeSubtab = tab;
+        refreshBrainKnowledgeCurrentSub();
+      });
+    });
+    const kindSel = document.querySelector('[data-brain-fact-kind]');
+    const sortSel = document.querySelector('[data-brain-fact-sort]');
+    const entityTypeSel = document.querySelector('[data-brain-entity-type]');
+    if (kindSel) kindSel.addEventListener('change', refreshBrainFacts);
+    if (sortSel) sortSel.addEventListener('change', refreshBrainFacts);
+    if (entityTypeSel) entityTypeSel.addEventListener('change', refreshBrainEntities);
+    // Default tab is Overview — load it on boot.
+    await refreshBrainOverview();
+  }
+
+  function fmtAgoShort(iso) {
+    if (!iso) return '—';
+    const ms = Date.now() - new Date(iso).getTime();
+    if (!Number.isFinite(ms) || ms < 0) return '—';
+    const m = Math.floor(ms / 60000);
+    if (m < 1) return 'just now';
+    if (m < 60) return m + 'm ago';
+    const h = Math.floor(m / 60);
+    if (h < 24) return h + 'h ago';
+    return Math.floor(h / 24) + 'd ago';
+  }
+
+  async function refreshBrainFacts() {
+    const list = document.querySelector('[data-brain-fact-list]');
+    const cnt = document.querySelector('[data-brain-fact-count]');
+    if (!list) return;
+    const kind = (document.querySelector('[data-brain-fact-kind]') || {}).value || '';
+    const sort = (document.querySelector('[data-brain-fact-sort]') || {}).value || 'stanford';
+    try {
+      const q = new URLSearchParams();
+      if (kind) q.set('kind', kind);
+      q.set('sort', sort);
+      const data = await fetchJSON('/api/console/brain/facts?' + q.toString());
+      const facts = Array.isArray(data.facts) ? data.facts : [];
+      if (cnt) cnt.textContent = facts.length + ' / ' + (data.total || 0) + ' active';
+      if (facts.length === 0) {
+        list.innerHTML = '<div class="settings-info">No facts in this filter. Try a different kind or sort.</div>';
+        return;
+      }
+      list.innerHTML = facts.map(function (f) {
+        const isDerived = f.derivedFrom && (f.derivedFrom.callId || f.derivedFrom.sessionId);
+        const trustPill = isDerived
+          ? '<span class="pill derived">derived · trust ' + (f.trustLevel != null ? f.trustLevel.toFixed(1) : '?') + '</span>'
+          : '<span class="pill direct">direct · trust 1.0</span>';
+        // Only render the importance pill when it's actually scored —
+        // user-stated facts default to no importance and showing
+        // "imp ?" looks broken. The Stanford reflector sets importance
+        // for derived facts; show "imp 7.0" + highlight when ≥7.
+        const impPill = typeof f.importance === 'number' && f.importance > 0
+          ? '<span class="pill ' + (f.importance >= 7 ? 'important' : '') + '">imp ' + f.importance.toFixed(1) + '</span>'
+          : '';
+        const callIdRef = isDerived && f.derivedFrom.callId
+          ? ' · <code>' + escMem(f.derivedFrom.callId) + '</code>'
+          : '';
+        const toolRef = isDerived && f.derivedFrom.tool
+          ? ' · from <code>' + escMem(f.derivedFrom.tool) + '</code>'
+          : '';
+        return [
+          '<div class="brain-fact-row">',
+          '  <div class="brain-fact-content">' + escMem(f.content || '') + '</div>',
+          '  <div class="brain-fact-meta">',
+          '    ' + trustPill + ' ' + impPill,
+          '    <span class="pill">' + escMem(f.kind || '') + '</span>',
+          '    · last accessed ' + escMem(fmtAgoShort(f.lastAccessedAt || f.updatedAt)),
+          callIdRef, toolRef,
+          '  </div>',
+          '</div>',
+        ].join('');
+      }).join('');
+    } catch (err) {
+      console.error('brain facts refresh failed:', err);
+      list.innerHTML = '<div class="settings-info">— failed to load —</div>';
+    }
+  }
+
+  async function refreshBrainEntities() {
+    const list = document.querySelector('[data-brain-entity-list]');
+    const cnt = document.querySelector('[data-brain-entity-count]');
+    if (!list) return;
+    const type = (document.querySelector('[data-brain-entity-type]') || {}).value || '';
+    try {
+      const q = new URLSearchParams();
+      if (type) q.set('type', type);
+      const data = await fetchJSON('/api/console/brain/entities?' + q.toString());
+      const entities = Array.isArray(data.entities) ? data.entities : [];
+      if (cnt) cnt.textContent = entities.length + ' / ' + (data.total || 0) + ' total';
+      if (entities.length === 0) {
+        list.innerHTML = '<div class="settings-info">No entities recorded yet. The brain populates this as the reflection layer fires on tool returns mentioning people, companies, projects, etc.</div>';
+        return;
+      }
+      list.innerHTML = entities.map(function (e) {
+        const aliases = Array.isArray(e.aliases) && e.aliases.length > 0
+          ? '<div class="brain-entity-aliases">aka: ' + e.aliases.map(escMem).join(', ') + '</div>'
+          : '';
+        return [
+          '<div class="brain-entity-row">',
+          '  <div>',
+          '    <span class="brain-entity-type">' + escMem(e.entityType || '') + '</span>',
+          '    <span class="brain-entity-name"> ' + escMem(e.canonicalName || '') + '</span>',
+          aliases,
+          '  </div>',
+          '  <div class="brain-entity-stats">' + (e.mentionCount || 0) + ' mentions · last seen ' + escMem(fmtAgoShort(e.lastSeenAt)) + '</div>',
+          '</div>',
+        ].join('');
+      }).join('');
+    } catch (err) {
+      console.error('brain entities refresh failed:', err);
+      list.innerHTML = '<div class="settings-info">— failed to load —</div>';
+    }
+  }
+
+  async function refreshBrainPointers() {
+    const list = document.querySelector('[data-brain-pointer-list]');
+    if (!list) return;
+    try {
+      const data = await fetchJSON('/api/console/brain/pointers');
+      const pointers = Array.isArray(data.pointers) ? data.pointers : [];
+      if (pointers.length === 0) {
+        list.innerHTML = '<div class="settings-info">No episodic pointers yet. These get stored when the reflection layer extracts named events from tool returns (e.g. "the pricing convo with Marlow").</div>';
+        return;
+      }
+      list.innerHTML = pointers.map(function (p) {
+        return [
+          '<div class="brain-pointer-row">',
+          '  <div>',
+          '    <div class="brain-pointer-label">' + escMem(p.label || '') + '</div>',
+          '    <div class="brain-pointer-meta">',
+          '      tool: <code>' + escMem(p.tool || '?') + '</code>',
+          '      · call: <code>' + escMem(p.callId || '') + '</code>',
+          '      · ' + escMem(fmtAgoShort(p.createdAt)),
+          p.sourceUri ? ' · uri: <code>' + escMem(p.sourceUri) + '</code>' : '',
+          '    </div>',
+          '  </div>',
+          '  <div class="brain-pointer-meta">session: <code>' + escMem((p.sessionId || '').slice(0, 24)) + '</code></div>',
+          '</div>',
+        ].join('');
+      }).join('');
+    } catch (err) {
+      console.error('brain pointers refresh failed:', err);
+      list.innerHTML = '<div class="settings-info">— failed to load —</div>';
+    }
+  }
+
+  async function refreshBrainHealth() {
+    const wrap = document.querySelector('[data-brain-health]');
+    if (!wrap) return;
+    try {
+      const data = await fetchJSON('/api/console/brain/health');
+      wrap.innerHTML = [
+        '<div class="brain-health-grid">',
+        '  <div class="brain-health-card"><div class="label">ACTIVE FACTS</div><div class="value">' + (data.activeFacts || 0) + '</div><div class="sub">' + (data.derivedFacts || 0) + ' derived · ' + (data.directFacts || 0) + ' direct</div></div>',
+        '  <div class="brain-health-card"><div class="label">ENTITIES</div><div class="value">' + (data.entitiesTotal || 0) + '</div><div class="sub">' + (data.entitiesPerson || 0) + ' people · ' + (data.entitiesCompany || 0) + ' companies · ' + (data.entitiesProject || 0) + ' projects</div></div>',
+        '  <div class="brain-health-card"><div class="label">POINTERS</div><div class="value">' + (data.pointersTotal || 0) + '</div><div class="sub">last 7d: ' + (data.pointersRecent || 0) + '</div></div>',
+        '  <div class="brain-health-card"><div class="label">REFLECTIONS (24H)</div><div class="value">' + (data.reflections24h || 0) + '</div><div class="sub">' + (data.reflectionsSuccess || 0) + ' success · ' + (data.reflectionsSkipped || 0) + ' skipped · ' + (data.reflectionsFailed || 0) + ' failed</div></div>',
+        '  <div class="brain-health-card"><div class="label">CONFLICTS (24H)</div><div class="value">' + (data.factsUpdated || 0) + '</div><div class="sub">' + (data.factsUpdated || 0) + ' updates · ' + (data.factsDeleted || 0) + ' deletes · ' + (data.factsNoop || 0) + ' noops</div></div>',
+        '  <div class="brain-health-card"><div class="label">AVG IMPORTANCE</div><div class="value">' + (data.avgImportance != null ? data.avgImportance.toFixed(1) : '—') + '</div><div class="sub">across active derived facts</div></div>',
+        '</div>',
+      ].join('');
+    } catch (err) {
+      console.error('brain health refresh failed:', err);
+      wrap.innerHTML = '<div class="settings-info">— failed to load —</div>';
+    }
+  }
+
+  // ────────────────────────────────────────────────────────────────
+  // Brain — new outer-tab refreshers (Overview, Graph, Profile, Evolution)
+  // Each renders into a dedicated mount inside its sub-pane.
+  // Stages 2-4 land the migrated HTML; for now mounts show pending
+  // placeholders + Overview renders the at-a-glance dashboard.
+  // ────────────────────────────────────────────────────────────────
+
+  async function refreshBrainOverview() {
+    const wrap = document.querySelector('[data-brain-overview]');
+    if (!wrap) return;
+    try {
+      const [health, factsResp] = await Promise.all([
+        fetchJSON('/api/console/brain/health'),
+        fetchJSON('/api/console/brain/facts?sort=recent&kind=').catch(function () { return { facts: [] }; }),
+      ]);
+      // Recent Learning surfaces ONLY facts the reflection layer
+      // synthesized from tool returns (derivedFrom is set). User-
+      // stated facts (memory_remember calls) are not "learning" — they're
+      // direct authoring. Showing them here was misleading.
+      const allFacts = Array.isArray(factsResp.facts) ? factsResp.facts : [];
+      const recentFacts = allFacts
+        .filter(function (f) { return f.derivedFrom && (f.derivedFrom.callId || f.derivedFrom.sessionId); })
+        .slice(0, 4);
+      const recentLearningRows = recentFacts.length === 0
+        ? '<div class="settings-info">— nothing derived yet · reflection will populate this as it extracts facts from tool returns ≥500 chars (see Brain → Knowledge → Facts for everything stated directly) —</div>'
+        : recentFacts.map(function (f) {
+            const ref = f.derivedFrom && f.derivedFrom.callId
+              ? ' <code class="overview-callid">[' + escMem(f.derivedFrom.callId) + ']</code>'
+              : '';
+            const age = f.lastAccessedAt || f.updatedAt
+              ? '<span class="overview-age">' + escMem(fmtAgoShort(f.lastAccessedAt || f.updatedAt)) + '</span>'
+              : '';
+            return '<div class="overview-fact-row"><span class="overview-fact-text">' + escMem(f.content || '') + '</span>' + ref + age + '</div>';
+          }).join('');
+      wrap.innerHTML = [
+        '<div class="brain-overview-grid">',
+        '  <div class="brain-overview-card brain-overview-stats">',
+        '    <div class="overview-card-head">AT A GLANCE</div>',
+        '    <div class="overview-stat-row">',
+        '      <div class="overview-stat"><em>' + (health.activeFacts || 0) + '</em><span>FACTS</span></div>',
+        '      <div class="overview-stat"><em>' + (health.entitiesTotal || 0) + '</em><span>ENTITIES</span></div>',
+        '      <div class="overview-stat"><em>' + (health.pointersTotal || 0) + '</em><span>POINTERS</span></div>',
+        '      <div class="overview-stat"><em>' + (health.reflections24h || 0) + '</em><span>REFLECTIONS · 24H</span></div>',
+        '    </div>',
+        '  </div>',
+        '  <div class="brain-overview-card brain-overview-recent">',
+        '    <div class="overview-card-head">RECENT LEARNING <em>(last 24h)</em></div>',
+        '    ' + recentLearningRows,
+        '  </div>',
+        '  <div class="brain-overview-card brain-overview-health">',
+        '    <div class="overview-card-head">BRAIN HEALTH</div>',
+        '    <div class="overview-health-row">Reflections: <strong>' + (health.reflections24h || 0) + '</strong> fired · ' + (health.reflectionsSuccess || 0) + ' success · ' + (health.reflectionsSkipped || 0) + ' skipped · ' + (health.reflectionsFailed || 0) + ' failed</div>',
+        '    <div class="overview-health-row">Conflicts: ' + (health.factsUpdated || 0) + ' updates · ' + (health.factsDeleted || 0) + ' deletes · ' + (health.factsNoop || 0) + ' noops</div>',
+        '    <div class="overview-health-row">Avg importance: <strong>' + (health.avgImportance != null ? health.avgImportance.toFixed(1) : '—') + '</strong> across derived facts</div>',
+        '  </div>',
+        '  <div class="brain-overview-card brain-overview-evolution">',
+        '    <div class="overview-card-head">EVOLUTION</div>',
+        '    <div class="overview-evolution-body" data-brain-overview-evolution>',
+        '      <div class="settings-info">— loading latest autoresearch report —</div>',
+        '    </div>',
+        '    <a class="overview-evolution-link" href="#" data-brain-overview-evolution-open>Open Evolution →</a>',
+        '  </div>',
+        '</div>',
+      ].join('');
+      // Wire the "Open Evolution →" link to switch tabs.
+      const link = document.querySelector('[data-brain-overview-evolution-open]');
+      if (link) {
+        link.addEventListener('click', function (e) {
+          e.preventDefault();
+          const evolutionTabBtn = document.querySelector('[data-brain-tab="evolution"]');
+          if (evolutionTabBtn) evolutionTabBtn.click();
+        });
+      }
+      // Asynchronously populate the evolution mini-summary; best-effort.
+      try {
+        const report = await fetchJSON('/api/console/autoresearch/report').catch(function () { return null; });
+        const mount = document.querySelector('[data-brain-overview-evolution]');
+        if (mount) {
+          if (report && report.generatedAt) {
+            const totalCalls = report.totalToolCalls || 0;
+            const sessionCount = report.sessionCount || 0;
+            mount.innerHTML = '<div class="overview-evolution-line">Last report: <strong>' + escMem(String(report.generatedAt).slice(0, 16).replace('T', ' ')) + '</strong></div>'
+              + '<div class="overview-evolution-line">' + totalCalls + ' tool calls across ' + sessionCount + ' sessions</div>';
+          } else {
+            mount.innerHTML = '<div class="settings-info">— no report yet · use Evolution tab to generate one —</div>';
+          }
+        }
+      } catch (err) {
+        const mount = document.querySelector('[data-brain-overview-evolution]');
+        if (mount) mount.innerHTML = '<div class="settings-info">— autoresearch unavailable —</div>';
+      }
+    } catch (err) {
+      console.error('brain overview refresh failed:', err);
+      wrap.innerHTML = '<div class="settings-info">— failed to load overview —</div>';
+    }
+  }
+
+  // Memory-derived content (Graph, Files, Meetings) all share the
+  // same bootMemoryPanel initialization — it hydrates every data-mem-*
+  // selector across all three views. Lazy-boot once on first contact
+  // with any of them.
+  let brainMemoryBooted = false;
+  async function ensureMemoryBooted() {
+    if (brainMemoryBooted) return;
+    brainMemoryBooted = true;
+    if (typeof bootMemoryPanel === 'function') {
+      try { await bootMemoryPanel(); } catch (err) { console.error('brain memory boot failed:', err); }
+    }
+  }
+  // Backward-compat alias — kept so any lingering caller doesn't error.
+  async function refreshBrainGraph() {
+    await ensureMemoryBooted();
+    if (typeof window.__clementineMemoryView === 'function') {
+      window.__clementineMemoryView('graph');
+    }
+  }
+  // Meetings outer-tab handler. Calls the meetings loader DIRECTLY —
+  // it doesn't depend on the full bootMemoryPanel (which loads the
+  // graph cytoscape, file list, fact list etc.). loadMemoryMeetings
+  // is self-contained: hits /api/console/meetings/recall/recent and
+  // re-renders the list. Bypassing the full memory boot makes the
+  // Meetings tab load in <100ms on cold contact.
+  async function refreshBrainMeetings() {
+    if (typeof wireMemoryMeetingsControls === 'function') wireMemoryMeetingsControls();
+    if (typeof loadMemoryMeetings === 'function') {
+      try { await loadMemoryMeetings(); } catch (err) { console.error('brain/meetings load failed:', err); }
+    }
+  }
+
+  // Profile (Context panel content). Same lazy-boot pattern.
+  let brainProfileBooted = false;
+  async function refreshBrainProfile() {
+    if (!brainProfileBooted) {
+      brainProfileBooted = true;
+      if (typeof bootContextPanel === 'function') {
+        try { await bootContextPanel(); } catch (err) { console.error('brain/profile boot failed:', err); }
+      }
+    }
+  }
+
+  // Evolution (autoresearch). Same lazy-boot pattern.
+  let brainEvolutionBooted = false;
+  async function refreshBrainEvolution() {
+    if (!brainEvolutionBooted) {
+      brainEvolutionBooted = true;
+      if (typeof bootEvolutionPanel === 'function') {
+        try { await bootEvolutionPanel(); } catch (err) { console.error('brain/evolution boot failed:', err); }
+      }
+    }
+  }
+
   async function refreshUsagePanel() {
     try {
       const data = await fetchJSON('/api/console/usage');
@@ -16034,7 +17923,6 @@ const CONSOLE_JS = `
     const toggle = document.querySelector('[data-diagnostics-toggle]');
     const panel = document.querySelector('[data-diagnostics-panel]');
     const refresh = document.querySelector('[data-diagnostics-refresh]');
-    const evolutionNav = document.querySelector('[data-nav-evolution]');
     if (!toggle || !panel) return;
     diagnosticsBound = true;
     const sync = () => {
@@ -16045,14 +17933,12 @@ const CONSOLE_JS = `
       } else {
         panel.setAttribute('hidden', '');
       }
-      // EVOLUTION (slot 12) is a power-user surface. It rides on the
-      // same "Show diagnostics" toggle so end users don't see a nav
-      // button for the autoresearch panel until they opt in.
-      if (evolutionNav) {
-        if (on) evolutionNav.removeAttribute('hidden');
-        else evolutionNav.setAttribute('hidden', '');
-      }
-      // Persist toggle state so the panel/nav remember across reloads.
+      // v0.5.11 brain-consolidation: Evolution (autoresearch) is no
+      // longer a separate top-level nav. It lives as the 5th sub-tab
+      // inside Brain. The diagnostics toggle no longer needs to flip
+      // a nav-button visibility — the Brain tab is always visible and
+      // Evolution is one click deep inside it.
+      // Persist toggle state so the panel remembers across reloads.
       try { localStorage.setItem('clemmy.diagnostics.visible', on ? '1' : '0'); } catch (_) {}
     };
     toggle.addEventListener('change', sync);
@@ -16892,7 +18778,12 @@ const CONSOLE_JS = `
     // the dev tree or a remote browser pointed at a daemon.
     root.querySelectorAll('[data-cred-codex-reauth]').forEach((btn) => {
       btn.addEventListener('click', async () => {
-        const ipc = (window).clemmy && (window).clemmy.setupCodexLogin;
+        // 2026-05-23: switched from setupCodexLogin to codexReauth. The
+        // former short-circuits on existing fresh tokens and never opens
+        // the browser, so the button looked broken to users who already
+        // had valid creds and just wanted to refresh / switch accounts.
+        // codexReauth always runs the full OAuth dance.
+        const ipc = (window).clemmy && ((window).clemmy.codexReauth || (window).clemmy.setupCodexLogin);
         if (typeof ipc !== 'function') {
           alert('Re-authentication is only available inside the Clementine desktop app. From the dev tree, run: npx tsx src/cli/index.ts auth login-native');
           return;
@@ -17853,11 +19744,16 @@ const CONSOLE_JS = `
       const info = state.lastCompleted;
       if (!info?.artifactPath) { hideToast(); return; }
       // Route to the memory viewer so the user lands on the actual
-      // markdown file with chunk view + search.
+      // markdown file with chunk view + search. Post-brain-consolidation
+      // the viewer lives inside Brain → Knowledge → Graph & Files.
       switchMemoryView && switchMemoryView('viewer');
-      // Trigger navigation to the memory panel.
-      const navMemory = document.querySelector('.nav[data-panel="memory"]');
-      if (navMemory) navMemory.click();
+      // Trigger navigation to the Brain panel, then the Graph sub-tab.
+      const navBrain = document.querySelector('.nav[data-panel="brain"]');
+      if (navBrain) navBrain.click();
+      const knowledgeTab = document.querySelector('[data-brain-tab="knowledge"]');
+      if (knowledgeTab) knowledgeTab.click();
+      const graphSubtab = document.querySelector('[data-brain-knowledge-tab="graph"]');
+      if (graphSubtab) graphSubtab.click();
       try {
         await loadFileViewer(info.artifactPath);
       } catch (_) { /* loadFileViewer may not be in scope before user navigates */ }

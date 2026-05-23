@@ -124,6 +124,7 @@ export class ClementineAssistant {
         userId: request.userId,
         channel: request.channel,
         maxWallClockMs: request.maxWallClockMs,
+        excludeToolNames: request.excludeToolNames,
       }, {
         shouldCancel: request.shouldCancel,
         onToolActivity: async (activity) => {

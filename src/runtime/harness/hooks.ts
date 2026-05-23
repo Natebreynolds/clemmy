@@ -1,5 +1,6 @@
 import type { Runner } from '@openai/agents';
 import { appendEvent, writeToolOutput, type EventRow } from './eventlog.js';
+import { scheduleReflection, REFLECTION_MIN_CONTENT_CHARS } from '../../memory/reflection.js';
 
 /**
  * RunHooks → event log writer.
@@ -205,6 +206,20 @@ export function attachEventLogHooks(
       } catch {
         // Best-effort: a tool_outputs write failure must never block
         // the event-log write below.
+      }
+
+      // Phase 1 brain architecture (v0.5.11): fire-and-forget reflection
+      // on this tool return. Threshold-gated so trivial outputs (pings,
+      // short acknowledgements) don't spend tokens. Scheduling is
+      // microtask-deferred so the SDK's tool result is unblocked.
+      // See src/memory/reflection.ts + [[project_brain_architecture]].
+      if (callId && result.length >= REFLECTION_MIN_CONTENT_CHARS) {
+        scheduleReflection({
+          sessionId,
+          callId,
+          tool: tool?.name ?? null,
+          output: result,
+        });
       }
     }
     try {

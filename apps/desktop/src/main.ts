@@ -853,6 +853,12 @@ ipcMain.handle('clemmy:setup-codex-login', async () => {
   // mirror them into Keychain here; the runtime reads the native auth
   // store directly, and avoiding extra Keychain writes prevents repeated
   // macOS prompts during first-run setup.
+  //
+  // First-run path: importUsableCodexOAuthTokens() short-circuits when
+  // the user already has fresh tokens (e.g. from a prior codex CLI
+  // login). For the Settings RE-AUTHENTICATE button — which must ALWAYS
+  // open the browser — use the dedicated `clemmy:codex-reauth` handler
+  // below.
   try {
     const imported = await importUsableCodexOAuthTokens();
     const tokens = imported ?? await runCodexOAuthLogin();
@@ -862,6 +868,43 @@ ipcMain.handle('clemmy:setup-codex-login', async () => {
       accountId: tokens.accountId ?? '',
       lastRefresh: tokens.lastRefresh,
       reused: Boolean(imported),
+    };
+  } catch (err) {
+    return {
+      ok: false as const,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+});
+
+/**
+ * Force-fresh Codex OAuth — backs the Settings → Credentials
+ * RE-AUTHENTICATE button. Bypasses the import-and-reuse short-circuit
+ * in `setup-codex-login` so the browser ALWAYS opens. Use case: the
+ * user wants to switch accounts, or the runtime is failing on tokens
+ * that look valid on disk but aren't accepted by the backend.
+ *
+ * Old tokens are left in place until the new flow succeeds; on cancel
+ * or failure the user keeps the working credentials they had. On
+ * success, persistCodexOAuthTokens overwrites with the fresh pair.
+ *
+ * Reported 2026-05-23: the original button wired to
+ * `setup-codex-login` looked broken because fresh tokens import
+ * silently with no UI signal. This handler fixes that surface.
+ */
+ipcMain.handle('clemmy:codex-reauth', async () => {
+  try {
+    // `prompt: 'select_account'` forces auth.openai.com to render the
+    // account picker even when the user already has a ChatGPT session
+    // cookie. Without this the IdP would silently issue tokens for the
+    // currently-cached account, defeating the purpose of the
+    // Settings RE-AUTHENTICATE button (account switch + force-fresh).
+    const tokens = await runCodexOAuthLogin({ prompt: 'select_account' });
+    persistCodexOAuthTokens(tokens);
+    return {
+      ok: true as const,
+      accountId: tokens.accountId ?? '',
+      lastRefresh: tokens.lastRefresh,
     };
   } catch (err) {
     return {

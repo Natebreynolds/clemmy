@@ -110,6 +110,16 @@ export class OpenAIRuntime implements AgentRuntime {
     // (`composio_search_tools` -> `composio_execute_tool`) instead of
     // injecting one cx_* function per connected action into every run.
     const tools = await getCoreToolsAsync({ includeDynamicComposioTools: false });
+    const exclude = request.excludeToolNames && request.excludeToolNames.length > 0
+      ? new Set(request.excludeToolNames)
+      : null;
+    // Code-level backstop for per-call tool restriction. See
+    // RunRequest.excludeToolNames — used e.g. by the Workflow Architect
+    // chat to hide workflow_* tools so the model can't bypass the
+    // diff-card flow even if the prompt is ignored.
+    const filteredTools = exclude
+      ? tools.filter((t) => !exclude.has((t as { name?: string }).name ?? ''))
+      : tools;
     return new Agent<RuntimeContextValue>({
       name: ASSISTANT_NAME,
       instructions:
@@ -119,7 +129,7 @@ export class OpenAIRuntime implements AgentRuntime {
       // Core tool surface plus the Planner-as-tool — the orchestrator
       // can invoke `draft_plan` to think before executing on complex
       // multi-step work without transferring control.
-      tools: [...tools, buildPlannerTool()],
+      tools: [...filteredTools, buildPlannerTool()],
       // Chat path runs as the orchestrator: it can hand off to specialized
       // sub-agents (Researcher / Writer / Reviewer / Executor / Deployer)
       // exactly like the autonomy path. The Executor + Deployer handoffs

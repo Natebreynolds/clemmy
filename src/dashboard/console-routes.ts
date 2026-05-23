@@ -35,6 +35,8 @@ import {
   writeWorkflow,
   type WorkflowDefinition,
 } from '../memory/workflow-store.js';
+import { subscribeWorkflowChanges } from '../memory/workflow-change-bus.js';
+import { extractArchitectDiff } from './architect-diff.js';
 import { appendWorkflowEvent, listPendingRuns, readWorkflowEvents } from '../execution/workflow-events.js';
 import {
   validateWorkflowDefinition as runValidator,
@@ -546,6 +548,25 @@ function validateCronExpression(expr: string): boolean {
 function sanitizeWorkflowName(name: string): string {
   return name.replace(/[^a-zA-Z0-9_-]/g, '-').toLowerCase();
 }
+
+/**
+ * Tools the Workflow Architect chat is forbidden from calling. The
+ * architect must propose changes as JSON diff ops the user applies
+ * from the UI — never write to disk directly. This list is passed to
+ * assistant.respond({ excludeToolNames }) so the runtime drops these
+ * names from the tool surface before the model sees them, regardless
+ * of what the prompt says.
+ *
+ * Keep in sync with src/tools/orchestration-tools.ts — any new
+ * workflow_* mutation tool should be added here.
+ */
+const ARCHITECT_HIDDEN_TOOLS = [
+  'workflow_create',
+  'workflow_update',
+  'workflow_set_enabled',
+  'workflow_delete',
+  'workflow_run',
+];
 
 function validateWorkflowDefinition(data: WorkflowFrontmatter): WorkflowValidation {
   // Tool catalog lookup for slug checks: feed the validator the
@@ -1197,6 +1218,38 @@ export function registerConsoleRoutes(
     }
   });
 
+  /**
+   * SSE: pushes a `workflow_changed` event whenever any workflow file
+   * is written, updated, or deleted (via writeWorkflow / deleteWorkflow
+   * in memory/workflow-store.ts). Lets the dashboard refresh the list
+   * the moment something changes on disk — fixes the "had to reload to
+   * see the new workflow" bug for every write path, including the
+   * architect's workflow_create calls.
+   */
+  app.get('/api/console/workflows/events', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders?.();
+    // Initial comment so the EventSource considers the connection
+    // open before any real event arrives.
+    res.write(': workflow change stream\n\n');
+
+    const unsubscribe = subscribeWorkflowChanges((change) => {
+      res.write(`event: workflow_changed\ndata: ${JSON.stringify(change)}\n\n`);
+    });
+    const keepalive = setInterval(() => {
+      // SSE heartbeat — comment lines are ignored by EventSource but
+      // keep intermediaries from killing the idle connection.
+      res.write(': ping\n\n');
+    }, 25_000);
+    req.on('close', () => {
+      clearInterval(keepalive);
+      unsubscribe();
+    });
+  });
+
   app.get('/api/console/workflows/:name', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     // Accept lookup either by display name (data.name) or by directory
@@ -1486,11 +1539,42 @@ export function registerConsoleRoutes(
     const transcript = history.map((m: { role?: string; text?: string }) => `${m.role === 'assistant' ? 'Architect' : 'User'}: ${m.text ?? ''}`).join('\n\n');
     const draftBlock = draft ? `Current workflow draft (JSON):\n\`\`\`json\n${JSON.stringify(draft, null, 2)}\n\`\`\`` : 'No draft yet — agent is starting from scratch.';
 
+    // Surface installed skills so the architect can compose them
+    // (uses_skill on a step). Without this the model has no way to
+    // know which skills the user has installed — and skills are the
+    // most leverage primitive for re-using captured expertise.
+    const installedSkills = listSkills();
+    const skillsBlock = installedSkills.length > 0
+      ? [
+          'Installed skills (use them by setting `uses_skill: "<name>"` on a step — the runner injects the SKILL.md body before the step prompt):',
+          ...installedSkills.map((s) => `- ${s.name}: ${s.frontmatter.description || '(no description)'}`),
+        ].join('\n')
+      : '';
+
     const prompt = [
       'You are the Clementine Workflow Architect — a focused sub-mode that helps the user design and edit multi-step workflows.',
-      'Each workflow has: name, description, trigger (manual or cron schedule), steps (with id + prompt + optional dependsOn), inputs, optional synthesis prompt.',
-      'When the user asks for an edit, propose CONCRETE changes — step text, dependency edges, schedule expressions, input keys. Show the diff in plain language plus a short JSON snippet of the changed slice.',
-      'Be terse. No preamble. Lead with the answer.',
+      'Each workflow has: name, description, trigger (manual or cron schedule), steps (id + prompt + optional dependsOn + optional allowed_tools + optional uses_skill), inputs, optional synthesis prompt.',
+      'Be terse. No preamble. Lead with the answer. One short paragraph of prose at most.',
+      '',
+      'IMPORTANT — proposing changes:',
+      '• Do NOT call workflow_create or any workflow_* tool. The user will apply your proposed changes from the UI.',
+      '• If you are proposing ANY change to the draft, your reply MUST end with a single fenced ```json code block containing an object with shape { ops: [...], summary: "..." }.',
+      '• Each op is one of:',
+      '    { "type": "set_field",    "path": "name" | "description" | "triggerSchedule" | "enabled", "value": <value> }',
+      '    { "type": "add_step",     "step": { "id": "<id>", "prompt": "<text>", "dependsOn": ["<id>", ...], "allowed_tools": ["<tool>", ...], "uses_skill"?: "<skill-name>" } }',
+      '    { "type": "update_step",  "id": "<existing-id>", "patch": { "prompt"?: "...", "dependsOn"?: [...], "allowed_tools"?: [...], "uses_skill"?: "<skill-name> | null" } }',
+      '    { "type": "remove_step",  "id": "<existing-id>" }',
+      '    { "type": "reorder_step", "id": "<existing-id>", "after": "<other-id> | null (null = move to first)" }',
+      '    { "type": "rename_step",  "id": "<existing-id>", "newId": "<new-id>" }',
+      '    { "type": "add_input",    "key": "<key>", "value": "<default-or-empty>" }',
+      '    { "type": "remove_input", "key": "<key>" }',
+      '    { "type": "set_synthesis","value": "<prompt-text> | null (null clears it)" }',
+      '• Keep ops minimal. Use update_step (with only the fields you actually change) instead of remove + add.',
+      '• When proposing a step that calls a tool, populate allowed_tools with the minimum set needed (e.g. ["composio_gmail_send_email"]).',
+      '• When an installed skill already captures the expertise a step needs, set uses_skill instead of re-prompting that expertise inline. The runner injects the skill body automatically.',
+      '• If you have nothing to propose (pure question, validation, advice), omit the JSON block entirely.',
+      '',
+      skillsBlock,
       '',
       draftBlock,
       '',
@@ -1504,8 +1588,15 @@ export function registerConsoleRoutes(
         sessionId: `console:workflow-architect:${body.draftName ?? 'new'}`,
         channel: 'cli',
         userId: 'console',
+        // Code-level backstop for the prompt instruction above. The
+        // architect's reply MUST take the form of diff ops the user
+        // applies via the UI — hiding the workflow_* tools means the
+        // model cannot bypass the diff-card flow even if the prompt is
+        // ignored. See RunRequest.excludeToolNames.
+        excludeToolNames: ARCHITECT_HIDDEN_TOOLS,
       });
-      res.json({ text: response.text });
+      const { text, diff } = extractArchitectDiff(response.text ?? '');
+      res.json({ text, diff });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -1580,7 +1671,20 @@ export function registerConsoleRoutes(
         url: server.url,
       }));
 
-      res.json({ tools: allTools, mcpServers });
+      // Installed skills. Surfaced alongside tools so the Workflow
+      // Studio picker can offer them as @-mentionable primitives — a
+      // step can bind to a skill via usesSkill, which causes the
+      // runner to inject the SKILL.md body into the step's prompt.
+      // Read-only on this endpoint — install/uninstall lives elsewhere.
+      const skills = listSkills().map((s) => ({
+        name: s.name,
+        description: s.frontmatter.description || '',
+        bodyPreview: s.bodyPreview,
+        hasScripts: s.hasScripts,
+        hasReferences: s.hasReferences,
+      }));
+
+      res.json({ tools: allTools, mcpServers, skills });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -3159,6 +3263,285 @@ export function registerConsoleRoutes(
       await invalidateConfiguredMcpServers();
       clearAutonomyAgentCache();
       res.json({ server: current[name] });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * v0.5.11 — Brain panel endpoints. Read-only views of what the brain
+   * has learned (facts, entities, pointers, health stats). All
+   * sourced from the memory.db tables introduced in v0.5.11 migration
+   * v3 + v4 (see [[project_brain_architecture]] + [[project_brain_phase1_gaps]]).
+   */
+  app.get('/api/console/brain/facts', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { listActiveFacts, countActiveFacts } = await import('../memory/facts.js');
+      const kindParam = typeof req.query.kind === 'string' ? req.query.kind : '';
+      const sort = typeof req.query.sort === 'string' ? req.query.sort : 'stanford';
+      const allowedKinds = new Set(['user', 'project', 'feedback', 'reference']);
+      const kind = allowedKinds.has(kindParam) ? (kindParam as 'user' | 'project' | 'feedback' | 'reference') : undefined;
+      const limit = 100;
+      let facts = listActiveFacts({ limit, kind, ranking: sort === 'stanford' ? 'stanford' : 'score' });
+      if (sort === 'recent') {
+        facts = [...facts].sort((a, b) =>
+          (b.lastAccessedAt || b.updatedAt || '').localeCompare(a.lastAccessedAt || a.updatedAt || ''),
+        );
+      } else if (sort === 'important') {
+        facts = [...facts].sort((a, b) => (b.importance ?? 0) - (a.importance ?? 0));
+      } else if (sort === 'trust') {
+        facts = [...facts].sort((a, b) => (b.trustLevel ?? 0) - (a.trustLevel ?? 0));
+      }
+      res.json({ facts, total: countActiveFacts() });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.get('/api/console/brain/entities', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { openMemoryDb } = await import('../memory/db.js');
+      const db = openMemoryDb();
+      const typeParam = typeof req.query.type === 'string' ? req.query.type : '';
+      const allowed = new Set(['person', 'company', 'project', 'place', 'thing']);
+      const rows = (allowed.has(typeParam)
+        ? db.prepare('SELECT * FROM entities WHERE entity_type = ? ORDER BY mention_count DESC, last_seen_at DESC LIMIT 200')
+            .all(typeParam)
+        : db.prepare('SELECT * FROM entities ORDER BY mention_count DESC, last_seen_at DESC LIMIT 200')
+            .all()) as Array<{
+        id: number;
+        entity_type: string;
+        canonical_name: string;
+        canonical_name_lc: string;
+        aliases_json: string;
+        first_seen_at: string;
+        last_seen_at: string;
+        mention_count: number;
+      }>;
+      const entities = rows.map((r) => {
+        let aliases: string[] = [];
+        try {
+          const parsed = JSON.parse(r.aliases_json);
+          if (Array.isArray(parsed)) aliases = parsed.filter((a) => typeof a === 'string');
+        } catch { /* ignore */ }
+        return {
+          id: r.id,
+          entityType: r.entity_type,
+          canonicalName: r.canonical_name,
+          aliases,
+          firstSeenAt: r.first_seen_at,
+          lastSeenAt: r.last_seen_at,
+          mentionCount: r.mention_count,
+        };
+      });
+      const totalRow = db.prepare('SELECT COUNT(*) AS c FROM entities').get() as { c: number };
+      res.json({ entities, total: totalRow?.c ?? 0 });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.get('/api/console/brain/pointers', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { openMemoryDb } = await import('../memory/db.js');
+      const db = openMemoryDb();
+      const rows = db.prepare(
+        'SELECT * FROM episodic_pointers ORDER BY created_at DESC, id DESC LIMIT 100',
+      ).all() as Array<{
+        id: number;
+        session_id: string;
+        call_id: string;
+        label: string;
+        tool: string | null;
+        source_uri: string | null;
+        created_at: string;
+      }>;
+      const pointers = rows.map((r) => ({
+        id: r.id,
+        sessionId: r.session_id,
+        callId: r.call_id,
+        label: r.label,
+        tool: r.tool,
+        sourceUri: r.source_uri,
+        createdAt: r.created_at,
+      }));
+      res.json({ pointers });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.get('/api/console/brain/health', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { openMemoryDb } = await import('../memory/db.js');
+      const db = openMemoryDb();
+      const since24h = new Date(Date.now() - 24 * 3600_000).toISOString();
+      const since7d = new Date(Date.now() - 7 * 24 * 3600_000).toISOString();
+
+      const factCounts = db.prepare(`
+        SELECT
+          COUNT(*) AS active_total,
+          SUM(CASE WHEN derived_from_call_id IS NOT NULL OR derived_from_session_id IS NOT NULL THEN 1 ELSE 0 END) AS derived,
+          AVG(CASE WHEN derived_from_call_id IS NOT NULL THEN importance ELSE NULL END) AS avg_importance
+        FROM consolidated_facts WHERE active = 1
+      `).get() as { active_total: number; derived: number; avg_importance: number | null };
+
+      const entityTotals = db.prepare(`
+        SELECT entity_type, COUNT(*) AS c FROM entities GROUP BY entity_type
+      `).all() as Array<{ entity_type: string; c: number }>;
+      const entityMap: Record<string, number> = {};
+      for (const row of entityTotals) entityMap[row.entity_type] = row.c;
+      const entitiesTotal = Object.values(entityMap).reduce((sum, n) => sum + n, 0);
+
+      const pointersTotal = (db.prepare('SELECT COUNT(*) AS c FROM episodic_pointers').get() as { c: number })?.c ?? 0;
+      const pointersRecent = (db.prepare('SELECT COUNT(*) AS c FROM episodic_pointers WHERE created_at >= ?').get(since7d) as { c: number })?.c ?? 0;
+
+      // Reflection health is in the per-day tool-events ndjson + the
+      // harness.db condenser_applied / fact-conflict events we'd emit.
+      // For Phase 1, count successful 'reflection' tool events.
+      const reflectionsRow = (() => {
+        try {
+          const harnessDb = openMemoryDb(); // wrong handle; reflection events are in the harness DB
+          // Fall through — we tally from the harness event log.
+          return null;
+        } catch { return null; }
+      })();
+
+      let reflections24h = 0, reflectionsSuccess = 0, reflectionsSkipped = 0, reflectionsFailed = 0;
+      try {
+        const { openEventLog } = await import('../runtime/harness/eventlog.js');
+        const hdb = openEventLog();
+        // We emitted reflection lifecycle via recordToolEvent — those
+        // land in ~/.clementine-next/state/tool-events/<date>.ndjson,
+        // not harness.db. Reading those files directly here.
+        const path = await import('node:path');
+        const fs = await import('node:fs');
+        const dir = path.join(require('node:os').homedir(), '.clementine-next', 'state', 'tool-events');
+        const today = new Date().toISOString().slice(0, 10);
+        const file = path.join(dir, today + '.ndjson');
+        if (fs.existsSync(file)) {
+          const lines = fs.readFileSync(file, 'utf-8').split('\n');
+          for (const line of lines) {
+            if (!line.startsWith('{')) continue;
+            try {
+              const evt = JSON.parse(line) as { toolName?: string; outcome?: string; at?: string };
+              if (evt.toolName !== 'reflection') continue;
+              if (!evt.at || evt.at < since24h) continue;
+              reflections24h += 1;
+              if (evt.outcome === 'success') reflectionsSuccess += 1;
+              else if (evt.outcome === 'cancelled') reflectionsSkipped += 1;
+              else if (evt.outcome === 'error') reflectionsFailed += 1;
+            } catch { /* ignore */ }
+          }
+        }
+        // Suppress unused warning
+        void hdb;
+        void reflectionsRow;
+      } catch { /* ignore — health degrades gracefully */ }
+
+      res.json({
+        activeFacts: factCounts?.active_total ?? 0,
+        derivedFacts: factCounts?.derived ?? 0,
+        directFacts: Math.max(0, (factCounts?.active_total ?? 0) - (factCounts?.derived ?? 0)),
+        avgImportance: factCounts?.avg_importance ?? null,
+        entitiesTotal,
+        entitiesPerson: entityMap.person ?? 0,
+        entitiesCompany: entityMap.company ?? 0,
+        entitiesProject: entityMap.project ?? 0,
+        entitiesPlace: entityMap.place ?? 0,
+        entitiesThing: entityMap.thing ?? 0,
+        pointersTotal,
+        pointersRecent,
+        reflections24h,
+        reflectionsSuccess,
+        reflectionsSkipped,
+        reflectionsFailed,
+        factsUpdated: 0, // tally only available once we emit a dedicated event type for conflict outcomes
+        factsDeleted: 0,
+        factsNoop: 0,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * v0.5.11 — Approvals panel list endpoint.
+   *
+   * Returns every pending approval with the full context the user
+   * needs to decide: subject (what's being asked), tool, args (what
+   * would actually run), source workflow if present, requestedAt for
+   * relative-age display, and the approvalId for the action endpoint.
+   *
+   * Distinct from the runtime's listPendingApprovals() shape — that one
+   * exposes only toolName + sessionId, which is what created the
+   * "Approval needed: request_approval in sess-abc" noise loop that
+   * trained users to ignore the brief. This endpoint reads
+   * approval-registry directly so the dashboard sees the same rich
+   * shape the DB stores.
+   */
+  app.get('/api/console/approvals/list', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { listPending } = await import('../runtime/harness/approval-registry.js');
+      const rows = listPending({ status: 'pending' });
+      // Newest first — matches how Discord buttons order things.
+      const approvals = rows
+        .sort((a, b) => (b.requestedAt || '').localeCompare(a.requestedAt || ''))
+        .map((r) => ({
+          approvalId: r.approvalId,
+          sessionId: r.sessionId,
+          channel: r.channel,
+          channelId: r.channelId,
+          requestedAt: r.requestedAt,
+          expiresAt: r.expiresAt,
+          subject: r.subject,
+          tool: r.tool,
+          args: r.args,
+        }));
+      res.json({ approvals, count: approvals.length });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * v0.5.11 — Bulk cancel stale approvals (>1h old). Used by the
+   * Approvals panel "CANCEL ALL STALE" button. Marks each row
+   * `status='cancelled'` with resolution='cancelled_by_user'. Does NOT
+   * touch the underlying workflow sessions — those are independently
+   * reapable. The orchestrator that requested each approval will see
+   * the cancellation on its next pump and either retry or fail
+   * gracefully (per the runtime's resolveApproval contract).
+   */
+  app.post('/api/console/approvals/cancel-stale', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { listPending, resolve: resolveApprovalRow } = await import('../runtime/harness/approval-registry.js');
+      const rows = listPending({ status: 'pending' });
+      const cutoff = Date.now() - 60 * 60_000;
+      const stale = rows.filter((r) => {
+        const t = Date.parse(r.requestedAt);
+        return Number.isFinite(t) && t < cutoff;
+      });
+      let cancelled = 0;
+      for (const row of stale) {
+        try {
+          const result = resolveApprovalRow(
+            row.approvalId,
+            'cancelled_by_user',
+            'dashboard:bulk-cancel-stale',
+          );
+          if (result.ok) cancelled += 1;
+        } catch {
+          // Best-effort — one row failing must not block the rest.
+        }
+      }
+      res.json({ cancelled, total: stale.length });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

@@ -108,9 +108,19 @@ async function throwIfCancelled(callbacks?: AgentRuntimeCallbacks): Promise<void
  * elsewhere: list the MCP shim's tools, present them to the model,
  * route incoming function-calls back to the shim's `callTool`.
  */
-async function createCodexToolDefinitions() {
+/** Exported for unit tests — verifies excludeToolNames filters both
+ *  local SDK tools and MCP-shimmed tools. Not part of the public
+ *  runtime API. */
+export async function createCodexToolDefinitions(excludeToolNames?: string[]) {
   // 1. Local tools (Composio broker + computer + local runtime + planner shims).
   const local = await getCoreToolsAsync({ includeDynamicComposioTools: false });
+  // Code-level backstop for per-call tool restriction. See
+  // RunRequest.excludeToolNames — names listed here are dropped from
+  // both the local SDK tools and the MCP shim tools below so the
+  // model never sees them.
+  const exclude = excludeToolNames && excludeToolNames.length > 0
+    ? new Set(excludeToolNames)
+    : null;
 
   // 2. MCP tools through the namespace shim. We tolerate the shim
   //    being slow / partially broken — listTools() inside the shim
@@ -123,21 +133,24 @@ async function createCodexToolDefinitions() {
       await shim.connect();
     }
     const mcpTools = await shim.listTools();
-    mcpDefs = mcpTools.map((t) => ({
-      type: 'function',
-      name: t.name,
-      description: t.description ?? `MCP tool ${t.name}`,
-      // The MCP SDK gives us a JSON Schema in `inputSchema`. Codex
-      // accepts JSON Schema directly in the `parameters` field, same
-      // as OpenAI function-calling.
-      parameters: (t as { inputSchema?: unknown }).inputSchema ?? { type: 'object', additionalProperties: true },
-    }));
+    mcpDefs = mcpTools
+      .filter((t) => !exclude || !exclude.has(t.name))
+      .map((t) => ({
+        type: 'function',
+        name: t.name,
+        description: t.description ?? `MCP tool ${t.name}`,
+        // The MCP SDK gives us a JSON Schema in `inputSchema`. Codex
+        // accepts JSON Schema directly in the `parameters` field, same
+        // as OpenAI function-calling.
+        parameters: (t as { inputSchema?: unknown }).inputSchema ?? { type: 'object', additionalProperties: true },
+      }));
   } catch (err) {
     logger.warn({ err }, 'failed to enumerate MCP tools for Codex runtime; continuing without MCP');
   }
 
   const localDefs = local
     .filter((tool) => tool.type === 'function')
+    .filter((tool) => !exclude || !exclude.has(tool.name))
     .map((tool) => ({
       type: 'function' as const,
       name: tool.name,
@@ -444,7 +457,7 @@ async function performCodexRequest(
     store: false,
     stream: true,
     input,
-    tools: await createCodexToolDefinitions(),
+    tools: await createCodexToolDefinitions(request.excludeToolNames),
   };
   if (request.sessionId) {
     body.prompt_cache_key = request.sessionId;

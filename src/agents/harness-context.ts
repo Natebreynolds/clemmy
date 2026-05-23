@@ -29,7 +29,7 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import { BASE_DIR } from '../config.js';
 import { loadMemoryContext } from '../memory/vault.js';
-import { renderFactsForInstructions } from '../memory/facts.js';
+import { renderFactsForInstructions, renderRecentlyLearnedForInstructions } from '../memory/facts.js';
 import { loadUserProfile, renderProfileForInstructions } from '../runtime/user-profile.js';
 
 const GOALS_DIR = path.join(BASE_DIR, 'goals');
@@ -136,6 +136,19 @@ export function renderHarnessMemoryContext(): string {
     facts = '';
   }
 
+  // Phase 1 brain architecture (v0.5.11): "Recently Learned" surfaces
+  // derived facts the reflection layer synthesized from tool returns
+  // in the last 24h. Each line ends with [call_id] when the fact
+  // came from a specific tool call so the agent can recall the
+  // verbatim source via recall_tool_result. See
+  // [[project_brain_architecture]].
+  let recentlyLearned = '';
+  try {
+    recentlyLearned = renderRecentlyLearnedForInstructions(24, 15);
+  } catch {
+    recentlyLearned = '';
+  }
+
   let profile = '';
   try {
     profile = renderProfileForInstructions();
@@ -153,6 +166,7 @@ export function renderHarnessMemoryContext(): string {
     section('Now', nowLine),
     section('User Preferences', profile),
     section('Persistent Facts', facts),
+    section('Recently Learned (last 24h)', recentlyLearned),
     section('Working Memory', memContext.workingMemory),
     section('Identity', memContext.identity),
     section('Core Personality', memContext.soul),

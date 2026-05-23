@@ -10,6 +10,7 @@ import { isUserFacingExecution } from '../execution/scope.js';
 import { addNotification } from '../runtime/notifications.js';
 import { GOALS_DIR } from '../tools/shared.js';
 import { getProactivityPolicySnapshot } from './proactivity-policy.js';
+import { listPending as listApprovalRegistry, type PendingApprovalRow } from '../runtime/harness/approval-registry.js';
 
 const logger = pino({ name: 'clementine-next.proactive-briefs' });
 
@@ -145,11 +146,23 @@ export async function processProactiveBriefs(assistant: ClementineAssistant): Pr
   // since the approval was requested AND nothing has resolved it,
   // surface it; otherwise stay quiet and trust the dedicated card.
   const APPROVAL_BRIEF_AGE_MS = Math.max(15, policy.briefCadenceMinutes) * 60_000;
-  const rawApprovals = assistant.getRuntime().listPendingApprovals();
-  const approvals = rawApprovals.filter((approval) => {
-    const createdAt = (approval as { createdAt?: string }).createdAt;
-    if (!createdAt) return true; // unknown age — err on the side of surfacing
-    return Date.now() - new Date(createdAt).getTime() >= APPROVAL_BRIEF_AGE_MS;
+  // v0.5.11: read from approval-registry directly instead of the runtime
+  // wrapper. The runtime's PendingApproval only carries `toolName` —
+  // the registry row carries `subject` + `args` + `requestedAt`, which
+  // is what the user actually needs to recognize the request. Previously
+  // briefs said "Approval needed: request_approval in sess-abc" which
+  // told the user nothing about what was being asked.
+  const registryRows: PendingApprovalRow[] = (() => {
+    try {
+      return listApprovalRegistry({ status: 'pending' });
+    } catch {
+      return [];
+    }
+  })();
+  const approvals = registryRows.filter((approval) => {
+    const requestedAt = approval.requestedAt;
+    if (!requestedAt) return true;
+    return Date.now() - new Date(requestedAt).getTime() >= APPROVAL_BRIEF_AGE_MS;
   });
   const blockedGoals = readGoals().filter((goal) => goal.status === 'blocked');
   const blockedExecutions = executions.filter((execution) => execution.status === 'blocked');
@@ -174,7 +187,7 @@ export async function processProactiveBriefs(assistant: ClementineAssistant): Pr
     executions: executions.map((execution) => [execution.id, execution.status, execution.nextStep, execution.blocker]),
     activeTasks: activeTasks.map((task) => [task.id, task.status, task.lastCheckInMessage, task.pendingApprovalId]),
     recentFailures: recentFailures.map((task) => [task.id, task.status, task.error]),
-    approvals: approvals.map((approval) => [approval.id, approval.toolName, approval.sessionId]),
+    approvals: approvals.map((approval) => [approval.approvalId, approval.subject, approval.sessionId]),
     blockedGoals: blockedGoals.map((goal) => [goal.id, goal.title, goal.blockers?.[0]]),
   };
   const hasSignal = executions.length > 0 || activeTasks.length > 0 || recentFailures.length > 0 || approvals.length > 0 || blockedGoals.length > 0;
@@ -190,9 +203,25 @@ export async function processProactiveBriefs(assistant: ClementineAssistant): Pr
       : 'Quick status update on active Clementine work.',
     `${plural(executions.length, 'active run')}, ${plural(activeTasks.length, 'background task')}, ${plural(approvals.length, 'pending approval')}.`,
     '',
-    ...approvals.slice(0, 4).map((approval) =>
-      `- Approval needed: ${clean(approval.toolName)} in ${clean(approval.sessionId, 80)}.`,
-    ),
+    // v0.5.11: surface the actual SUBJECT (what the user is being asked
+    // to approve) + relative age so the user can recognize it without
+    // opening the dashboard. Add a dashboard deep-link footer so a single
+    // brief can point at the Approvals panel instead of N noise lines.
+    ...(approvals.length > 0
+      ? [
+          ...approvals.slice(0, 4).map((approval) => {
+            const ageMin = Math.max(0, Math.floor((Date.now() - new Date(approval.requestedAt).getTime()) / 60_000));
+            const ageLabel = ageMin >= 60 ? `${Math.floor(ageMin / 60)}h ${ageMin % 60}m` : `${ageMin}m`;
+            const subject = clean(approval.subject || approval.tool || 'unknown action', 200);
+            const sourceWorkflow = (approval.args && typeof approval.args === 'object' && typeof (approval.args as { workflow?: unknown }).workflow === 'string')
+              ? ` (workflow: ${clean((approval.args as { workflow: string }).workflow, 60)})`
+              : '';
+            return `- Pending ${ageLabel}: ${subject}${sourceWorkflow}`;
+          }),
+          ...(approvals.length > 4 ? [`- … +${approvals.length - 4} more pending.`] : []),
+          'Open the dashboard → Approvals panel to handle these (approve / edit / reject / cancel).',
+        ]
+      : []),
     ...blockedExecutions.slice(0, 4).map((execution) =>
       `- Blocked run: ${humanLabel(execution.title, execution.objective, `Run ${shortId(execution.id)}`)}${execution.blocker ? ` — ${clean(execution.blocker, 160)}` : ''}`,
     ),
