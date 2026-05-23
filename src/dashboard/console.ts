@@ -1016,6 +1016,14 @@ export function renderConsoleHtml(token: string): string {
           </div>
 
           <div class="usage-block">
+            <div class="usage-block-head">AUTO-COMPACT (last 24h)</div>
+            <p class="usage-trim-intro">When chat sessions get long, Clementine clips older tool outputs and (if needed) summarizes earlier turns so the model keeps fitting in its context window. Full originals stay recoverable via <code>recall_tool_result</code>.</p>
+            <div class="usage-compaction" data-usage-compaction>
+              <div class="settings-info">— loading —</div>
+            </div>
+          </div>
+
+          <div class="usage-block">
             <div class="usage-block-head">TRIM CONTROLS</div>
             <p class="usage-trim-intro">Pause expensive loops without losing the agentic component. Re-enable any time. None of these disable chat or harness runs.</p>
             <div class="usage-trim" data-usage-trim>
@@ -15873,8 +15881,64 @@ const CONSOLE_JS = `
       }
 
       await refreshUsageTrim();
+      await refreshUsageCompaction();
     } catch (err) {
       console.error('usage panel refresh failed:', err);
+    }
+  }
+
+  async function refreshUsageCompaction() {
+    const el = document.querySelector('[data-usage-compaction]');
+    if (!el) return;
+    try {
+      const c = await fetchJSON('/api/console/usage/compaction');
+      const total = c.totalCompactions || 0;
+      if (total === 0) {
+        el.innerHTML = '<div class="settings-info">No compactions yet. Auto-compact kicks in on long chat sessions (>30 messages or >50% of input budget). Most sessions never need it.</div>';
+        return;
+      }
+      const rows = [];
+      rows.push(
+        '<div class="usage-bymodel">',
+        '  <div class="stat-card"><span>COMPACTIONS</span><em>' + total + '</em></div>',
+        '  <div class="stat-card"><span>TOOL RESULTS CLIPPED</span><em>' + (c.totalClipped || 0) + '</em></div>',
+        '  <div class="stat-card"><span>SUMMARIES GENERATED</span><em>' + (c.totalSummaries || 0) + '</em></div>',
+        '  <div class="stat-card"><span>RECALL CALLS</span><em>' + (c.recallInvocations || 0) + '</em></div>',
+        '</div>',
+      );
+      if (Array.isArray(c.recent) && c.recent.length > 0) {
+        rows.push('<table class="usage-bysource" style="margin-top:12px;"><thead><tr><th>SESSION</th><th>WHEN</th><th>LAYERS</th><th>TOKENS</th></tr></thead><tbody>');
+        for (const r of c.recent.slice(0, 8)) {
+          const layers = [
+            r.layer1 ? 'L1(' + r.layer1Clipped + ')' : '',
+            r.layer2 ? 'L2(' + r.layer2RemovedItems + ')' : '',
+            r.layer3 ? 'L3-fork' : '',
+          ].filter(Boolean).join(' ');
+          const tokenDelta = r.beforeTokens && r.afterTokens
+            ? r.beforeTokens + '→' + r.afterTokens
+            : '—';
+          rows.push(
+            '<tr>',
+            '  <td><code>' + escMem((r.sessionId || '').slice(0, 24)) + '</code></td>',
+            '  <td>' + escMem(r.at || '') + '</td>',
+            '  <td>' + escMem(layers) + '</td>',
+            '  <td>' + escMem(tokenDelta) + '</td>',
+            '</tr>',
+          );
+        }
+        rows.push('</tbody></table>');
+      }
+      if ((c.hallucinatedCallIds || 0) > 0) {
+        rows.push(
+          '<div class="settings-info" style="margin-top:8px; color:var(--warn);">',
+          '⚠ ' + c.hallucinatedCallIds + ' hallucinated call_ids detected in Layer-2 summaries (sanitized to <code>[invalid call_id]</code>).',
+          '</div>',
+        );
+      }
+      el.innerHTML = rows.join('');
+    } catch (err) {
+      console.error('usage compaction refresh failed:', err);
+      el.innerHTML = '<div class="settings-info">— failed to load compaction stats —</div>';
     }
   }
 

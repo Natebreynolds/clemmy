@@ -361,9 +361,55 @@ export const DEFAULT_TOKEN_BUDGET: Readonly<TokenBudgetCounts> = Object.freeze({
 // wrapper so non-harness call paths (direct API, tests) aren't broken.
 // ───────────────────────────────────────────────────────────────
 
+/**
+ * Per-turn budget for recall_tool_result. After Layer 1 of auto-compact
+ * clips old tool outputs with stubs that name a call_id, the agent can
+ * call `recall_tool_result(call_id)` to retrieve the verbatim original.
+ * Without a budget the agent could pull 200KB × 3 calls back into the
+ * input prompt that we just compacted. Resets per-turn (the loop builds
+ * a new HarnessRunContext per `Runner.run`).
+ */
+export class RecallBudget {
+  private calls = 0;
+  private bytes = 0;
+
+  constructor(
+    public readonly maxCalls: number,
+    public readonly maxBytes: number,
+  ) {}
+
+  /**
+   * Returns null if budget remains; otherwise an error message the
+   * recall tool can return to the agent.
+   */
+  consume(returnBytes: number): string | null {
+    if (this.calls + 1 > this.maxCalls) {
+      return `recall budget exhausted this turn (max ${this.maxCalls} calls). Proceed with the summary or split work into a new turn.`;
+    }
+    if (this.bytes + returnBytes > this.maxBytes) {
+      return `recall byte budget exhausted this turn (max ${this.maxBytes} bytes; would push to ${this.bytes + returnBytes}). Recall a smaller slice or proceed with the summary.`;
+    }
+    this.calls += 1;
+    this.bytes += returnBytes;
+    return null;
+  }
+
+  snapshot(): { calls: number; bytes: number; maxCalls: number; maxBytes: number } {
+    return {
+      calls: this.calls,
+      bytes: this.bytes,
+      maxCalls: this.maxCalls,
+      maxBytes: this.maxBytes,
+    };
+  }
+}
+
 export interface HarnessRunContext {
   sessionId: string;
   counter: ToolCallsCounter;
+  /** Per-turn budget for recall_tool_result calls. Optional — when
+   *  absent (e.g. tests, non-harness call paths), recall is unmetered. */
+  recallBudget?: RecallBudget;
   /** Cap each tool's wall-clock execution to this. Overrides
    *  timeoutForTool(name) when set; otherwise the default per-name
    *  policy applies. */

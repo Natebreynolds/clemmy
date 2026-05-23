@@ -1,5 +1,5 @@
 import type { Runner } from '@openai/agents';
-import { appendEvent, type EventRow } from './eventlog.js';
+import { appendEvent, writeToolOutput, type EventRow } from './eventlog.js';
 
 /**
  * RunHooks → event log writer.
@@ -190,6 +190,23 @@ export function attachEventLogHooks(
     const callId = callIdFromDetails(details);
     const parentEventId = callId ? callIdToCalledEventId.get(callId) : undefined;
     if (callId) callIdToCalledEventId.delete(callId);
+    // Lossless write FIRST (up to 200KB, see eventlog.ts). The event
+    // log copy below is intentionally clipped for readability; the
+    // recall_tool_result tool reads from tool_outputs to retrieve the
+    // verbatim original.
+    if (callId && typeof result === 'string') {
+      try {
+        writeToolOutput({
+          sessionId,
+          callId,
+          tool: tool?.name ?? null,
+          output: result,
+        });
+      } catch {
+        // Best-effort: a tool_outputs write failure must never block
+        // the event-log write below.
+      }
+    }
     try {
       appendEvent({
         sessionId,

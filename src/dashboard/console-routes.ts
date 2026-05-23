@@ -4251,6 +4251,78 @@ export function registerConsoleRoutes(
   });
 
   /**
+   * Auto-compact summary for the Usage panel. Counts compactions in the
+   * last 24h across all sessions, summarizes layers / tokens / hallucinated
+   * call_ids, and lists the most recent 8 with per-session detail. Used
+   * by the dashboard "AUTO-COMPACT" block under Usage.
+   */
+  app.get('/api/console/usage/compaction', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { openEventLog } = await import('../runtime/harness/eventlog.js');
+      const db = openEventLog();
+      const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+      const rows = db.prepare(
+        `SELECT session_id, data_json, created_at FROM events
+         WHERE type = 'condenser_applied' AND created_at >= ?
+         ORDER BY seq DESC
+         LIMIT 200`,
+      ).all(since) as Array<{ session_id: string; data_json: string; created_at: string }>;
+
+      let totalClipped = 0;
+      let totalSummaries = 0;
+      let hallucinatedCallIds = 0;
+      const recent: Array<Record<string, unknown>> = [];
+      for (const row of rows) {
+        let d: { layer1?: { applied?: boolean; clipped?: number }; layer2?: { applied?: boolean; removedItems?: number; hallucinatedCallIds?: string[] }; layer3?: { forkRequested?: boolean }; beforeTokens?: number; afterTokens?: number } = {};
+        try { d = JSON.parse(row.data_json) as typeof d; } catch { /* ignore */ }
+        const l1Clipped = d.layer1?.clipped ?? 0;
+        const l2Removed = d.layer2?.removedItems ?? 0;
+        const hallucinated = (d.layer2?.hallucinatedCallIds ?? []).length;
+        totalClipped += l1Clipped;
+        if (d.layer2?.applied) totalSummaries += 1;
+        hallucinatedCallIds += hallucinated;
+        recent.push({
+          sessionId: row.session_id,
+          at: row.created_at,
+          layer1: Boolean(d.layer1?.applied),
+          layer1Clipped: l1Clipped,
+          layer2: Boolean(d.layer2?.applied),
+          layer2RemovedItems: l2Removed,
+          layer3: Boolean(d.layer3?.forkRequested),
+          beforeTokens: d.beforeTokens ?? null,
+          afterTokens: d.afterTokens ?? null,
+        });
+      }
+
+      // Recall invocations: count tool_called events for recall_tool_result.
+      let recallInvocations = 0;
+      try {
+        const r = db.prepare(
+          `SELECT COUNT(*) AS c FROM events
+           WHERE type = 'tool_called'
+             AND created_at >= ?
+             AND json_extract(data_json, '$.tool') = 'recall_tool_result'`,
+        ).get(since) as { c?: number } | undefined;
+        recallInvocations = r?.c ?? 0;
+      } catch {
+        recallInvocations = 0;
+      }
+
+      res.json({
+        totalCompactions: rows.length,
+        totalClipped,
+        totalSummaries,
+        hallucinatedCallIds,
+        recallInvocations,
+        recent,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
    * Cheap goal-state read for the dashboard's nav-dock GOAL card.
    *
    * The card used to refresh by POSTing `/goal status` to /chat every

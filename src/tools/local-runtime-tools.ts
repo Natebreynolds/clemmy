@@ -20,6 +20,7 @@ import { registerMcpStatusTools } from './mcp-status-tools.js';
 import { registerOrchestrationTools } from './orchestration-tools.js';
 import { registerPlanTools } from './plan-tools.js';
 import { registerProfileTools } from './profile-tools.js';
+import { registerRecallTools } from './recall-tools.js';
 import { registerSessionTools } from './session-tools.js';
 import { registerTeamTools } from './team-tools.js';
 import { registerVaultTools } from './vault-tools.js';
@@ -149,6 +150,7 @@ function captureLocalTools(): CapturedLocalTool[] {
   registerAutonomyActionTools(server);
   registerExecutionTools(server);
   registerProfileTools(server);
+  registerRecallTools(server);
   registerCapabilityTools(server);
   registerCliTools(server);
   registerSkillTools(server);

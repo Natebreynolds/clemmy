@@ -645,6 +645,11 @@ interface DisplayState {
   // "nothing happening." The heartbeat ticker also reads this so it
   // can decide whether to push a "still working" pulse.
   turnStartedAt?: number;
+  // v0.5.10 auto-compact: percent of input budget the most recent
+  // condenser_applied event reported. Used to render a small `[ctx
+  // 42%]` footer so the user sees the context filling up before it
+  // explodes. Only shown when > 30%.
+  contextPct?: number;
 }
 
 /**
@@ -689,9 +694,15 @@ function renderBody(state: DisplayState): string {
   const verb = state.currentAgent ? `${state.currentAgent} · ${state.status || 'working…'}` : (state.status || 'working…');
   const elapsed = formatElapsedMs(state.turnStartedAt ? Date.now() - state.turnStartedAt : 0);
   const counter = state.toolCount >= 3 ? ` · ${state.toolCount} tools` : '';
+  // Context-window footer: surfaces when auto-compact has reported the
+  // session at >30% of input budget. Lets the user see the meter climb
+  // and decide to /new before Layer 3 forks.
+  const ctx = typeof state.contextPct === 'number' && state.contextPct > 30
+    ? ` · ctx ${Math.min(99, Math.round(state.contextPct))}%`
+    : '';
   const body = elapsed
-    ? `_${verb} · ${elapsed}${counter}_`
-    : `_${verb}${counter}_`;
+    ? `_${verb} · ${elapsed}${counter}${ctx}_`
+    : `_${verb}${counter}${ctx}_`;
   return body.length > MAX_DISCORD_MESSAGE ? body.slice(0, MAX_DISCORD_MESSAGE - 1) + '…' : body;
 }
 
@@ -1578,6 +1589,17 @@ export function applyEventToState(event: EventRow, state: DisplayState): void {
       state.status = decision === 'approved' ? 'approved — continuing' : 'rejected — stopping';
       // Buttons are no longer relevant; clear so the next flush drops them.
       state.pendingApprovalId = undefined;
+      return;
+    }
+    case 'condenser_applied': {
+      // v0.5.10 — surface the post-compaction context fill so the user
+      // sees the meter, not just the result. afterTokens is the most
+      // recent post-Layer-1 (and post-Layer-2 if applied) estimate.
+      const after = Number(data.afterTokens);
+      const budget = Number(data.budgetTokens);
+      if (Number.isFinite(after) && Number.isFinite(budget) && budget > 0) {
+        state.contextPct = Math.max(0, Math.min(100, (after / budget) * 100));
+      }
       return;
     }
     case 'run_resumed': {

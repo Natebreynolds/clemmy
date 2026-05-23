@@ -255,6 +255,29 @@ const MIGRATIONS: { version: number; sql: string }[] = [
         ON pending_approvals(expires_at) WHERE status = 'pending';
     `,
   },
+  {
+    // v0.5.10 auto-compact: lossless tool-output storage keyed by call_id.
+    // The event log clips tool_returned payloads to 8KB at write-time
+    // (see hooks.ts:202) for readability; that loss broke the
+    // recall_tool_result promise. This table stores the full output
+    // (up to 200KB) so an agent that sees `[clipped: ... call
+    // recall_tool_result("call_xxx")]` can retrieve the verbatim
+    // original. Append-only; cascade-deleted with the session.
+    version: 3,
+    sql: `
+      CREATE TABLE IF NOT EXISTS tool_outputs (
+        session_id          TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        call_id             TEXT NOT NULL,
+        tool                TEXT,
+        output_full         TEXT NOT NULL,
+        content_bytes       INTEGER NOT NULL,
+        truncated_at_write  INTEGER NOT NULL DEFAULT 0,
+        created_at          TEXT NOT NULL,
+        PRIMARY KEY (session_id, call_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_tool_outputs_session ON tool_outputs(session_id);
+    `,
+  },
 ];
 
 function runMigrations(db: Database.Database): void {
@@ -610,4 +633,88 @@ export function isKillRequested(sessionId: string): boolean {
 export function clearKill(sessionId: string): void {
   const db = openEventLog();
   db.prepare('DELETE FROM kill_switches WHERE session_id = ?').run(sessionId);
+}
+
+export const TOOL_OUTPUT_MAX_BYTES = 200_000;
+
+export interface ToolOutputRecord {
+  output: string;
+  contentBytes: number;
+  truncatedAtWrite: boolean;
+  tool: string | null;
+  createdAt: string;
+}
+
+export interface WriteToolOutputInput {
+  sessionId: string;
+  callId: string;
+  tool?: string | null;
+  output: string;
+}
+
+/**
+ * Persist the full tool output keyed by (session_id, call_id) so the
+ * recall_tool_result tool can retrieve it after the event-log copy is
+ * clipped. Hard 200KB cap with explicit truncated_at_write marker —
+ * distinct from the per-turn `[clipped: ...]` stub Layer 1 emits.
+ *
+ * Idempotent on conflict: `(session_id, call_id)` is the primary key
+ * and we INSERT OR REPLACE so a duplicate tool_returned event (e.g.
+ * after a retry) cleanly overwrites the row.
+ */
+export function writeToolOutput(input: WriteToolOutputInput): void {
+  const db = openEventLog();
+  const original = input.output;
+  const originalBytes = Buffer.byteLength(original, 'utf8');
+  let stored = original;
+  let truncated = false;
+  if (originalBytes > TOOL_OUTPUT_MAX_BYTES) {
+    // Tail-truncate by char count, then re-check bytes (multi-byte
+    // chars can still push us over; clamp again if needed).
+    stored = original.slice(0, TOOL_OUTPUT_MAX_BYTES);
+    while (Buffer.byteLength(stored, 'utf8') > TOOL_OUTPUT_MAX_BYTES) {
+      stored = stored.slice(0, stored.length - 1);
+    }
+    truncated = true;
+  }
+  db.prepare(
+    `INSERT OR REPLACE INTO tool_outputs
+       (session_id, call_id, tool, output_full, content_bytes, truncated_at_write, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    input.sessionId,
+    input.callId,
+    input.tool ?? null,
+    stored,
+    originalBytes,
+    truncated ? 1 : 0,
+    nowIso(),
+  );
+}
+
+export function getToolOutput(sessionId: string, callId: string): ToolOutputRecord | null {
+  const db = openEventLog();
+  const row = db
+    .prepare(
+      `SELECT output_full, content_bytes, truncated_at_write, tool, created_at
+       FROM tool_outputs
+       WHERE session_id = ? AND call_id = ?`,
+    )
+    .get(sessionId, callId) as
+    | {
+        output_full: string;
+        content_bytes: number;
+        truncated_at_write: number;
+        tool: string | null;
+        created_at: string;
+      }
+    | undefined;
+  if (!row) return null;
+  return {
+    output: row.output_full,
+    contentBytes: row.content_bytes,
+    truncatedAtWrite: row.truncated_at_write === 1,
+    tool: row.tool,
+    createdAt: row.created_at,
+  };
 }

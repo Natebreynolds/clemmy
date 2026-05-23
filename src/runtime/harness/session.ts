@@ -127,6 +127,25 @@ export class HarnessSession {
   }
 
   /**
+   * Update the persisted conversation snapshot without emitting any
+   * event. Used by auto-compact (v0.5.10) between turns to write back
+   * the compacted items array. We can't use `recordTurnResult` here
+   * because that fires `turn_ended` — emitting it pre-turn would
+   * corrupt the audit-log boundary (two turn_ended events per turn, or
+   * one before turn_started).
+   */
+  updateConversationSnapshot(items: AgentInputItem[]): void {
+    const meta = { ...this.row.metadata };
+    const snapshot: PersistedConversation = {
+      items,
+      lastResponseId: this.conversation().lastResponseId,
+      updatedAt: new Date().toISOString(),
+    };
+    meta[META_CONVERSATION] = snapshot;
+    this.row = updateSession(this.row.id, { metadata: meta });
+  }
+
+  /**
    * Persist the SDK's post-run history snapshot + `lastResponseId`.
    * Also emits a `turn_ended` event so the audit log records the
    * boundary even when no semantic events fired this turn.

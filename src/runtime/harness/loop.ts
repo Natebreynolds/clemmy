@@ -13,12 +13,14 @@ import {
 import {
   assertNotKilled,
   KillRequested,
+  RecallBudget,
   ToolCallsCounter,
   ToolCallsLimitExceeded,
   maxTurnsForRole,
   defaultToolCallsPerTurn,
   withHarnessRunContext,
 } from './brackets.js';
+import { compactSessionIfNeeded } from './compaction.js';
 import { getHarnessBudgetSettings } from './budget-settings.js';
 import { attachEventLogHooks, extractSessionIdFromContext, type RunHooksLike } from './hooks.js';
 import * as approvalRegistry from './approval-registry.js';
@@ -928,8 +930,61 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     );
   }
 
+  // Auto-compact pass (v0.5.10). Runs Layer 1 deterministic trim and
+  // Layer 2 LLM summarization between turns BEFORE we serialize input
+  // for codex. Persists the compacted snapshot via
+  // updateConversationSnapshot — NOT recordTurnResult, because that
+  // would emit a phantom turn_ended pre-turn. The natural end-of-turn
+  // recordTurnResult call (downstream of runner.run) handles the real
+  // turn_ended emission.
+  const sessionItems = session.toInputItems();
+  let compactedItems = sessionItems;
+  let layer3WarningInjected = false;
+  try {
+    const { result, nextItems, forkRequest } = await compactSessionIfNeeded(session, sessionItems);
+    compactedItems = nextItems;
+    if (result.modified) {
+      session.updateConversationSnapshot(compactedItems);
+    }
+    if (forkRequest) {
+      // Layer 3 fire — inject a one-shot system message at the head of
+      // the items so the model surfaces the capacity warning in its
+      // reply. The condenser_applied event already fired (from
+      // compactSessionIfNeeded) so Discord/dashboard see the red ctx
+      // footer; this message ensures the user reads a clear "start a
+      // /new session" recommendation in the model's reply itself.
+      compactedItems = [
+        {
+          role: 'system',
+          content: '[CAPACITY WARNING] This conversation has reached the auto-compact ceiling (90%+ of input budget). Layer 1 + Layer 2 have already shrunk earlier turns. Complete this turn if you can, then politely recommend the user start a fresh session ("/new" in Discord, or a new chat in the dashboard) to continue with full headroom. Earlier tool results remain recallable via recall_tool_result if you need a specific detail.',
+        } as unknown as AgentInputItem,
+        ...compactedItems,
+      ];
+      layer3WarningInjected = true;
+    }
+  } catch (err) {
+    // Compaction must never block a turn. Log and proceed with the
+    // un-compacted items — the turn will either succeed naturally or
+    // fail with SSE-truncation; either way we have visibility.
+    // eslint-disable-next-line no-console
+    console.warn('[harness] compactSessionIfNeeded failed', err instanceof Error ? err.message : err);
+  }
+
+  // Layer 3 warning is one-shot per turn: not persisted into the
+  // conversation snapshot — only inserted into the items we send to
+  // codex for this turn. Drop a marker so the audit log knows.
+  if (layer3WarningInjected) {
+    safeAppend({
+      sessionId: options.sessionId,
+      turn,
+      role: 'system',
+      type: 'guardrail_tripped',
+      data: { kind: 'auto_compact_capacity_warning', reason: 'layer3_fork_threshold' },
+    });
+  }
+
   const items: AgentInputItem[] = [
-    ...session.toInputItems(),
+    ...compactedItems,
     { role: 'user', content: options.input },
   ];
 
@@ -964,13 +1019,20 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
         stage: 'turn',
       },
       async () => {
+        const recallBudget = new RecallBudget(3, 60_000);
         if (useToolWrapper) {
           return await withHarnessRunContext(
-            { sessionId: options.sessionId, counter: toolCounter },
+            { sessionId: options.sessionId, counter: toolCounter, recallBudget },
             () => run(runner, options.agent, items, opts),
           ) as RunOutcome;
         }
-        return await run(runner, options.agent, items, opts);
+        // Even without the tool-bracket wrapper, install the AsyncLocalStorage
+        // context so recall_tool_result can resolve the session id +
+        // per-turn budget.
+        return await withHarnessRunContext(
+          { sessionId: options.sessionId, counter: toolCounter, recallBudget },
+          () => run(runner, options.agent, items, opts),
+        ) as RunOutcome;
       },
     );
 
