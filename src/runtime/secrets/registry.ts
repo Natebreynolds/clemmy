@@ -1,4 +1,34 @@
-import type { SecretDescriptor, SecretName } from './types.js';
+import type { SecretDescriptor, SecretName, SecretValidationResult } from './types.js';
+
+// Generic HTTP probe used by validators. 401/403 → invalid; 2xx → valid;
+// everything else (5xx, timeout, DNS) → unknown so the user can still
+// save when the upstream service is the one having a bad day.
+async function probeBearer(url: string, key: string, authStyle: 'bearer' | 'x-api-key'): Promise<SecretValidationResult> {
+  const trimmed = key.trim();
+  if (!trimmed) return { result: 'invalid', message: 'Empty value.' };
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5_000);
+  try {
+    const headers: Record<string, string> = { accept: 'application/json' };
+    if (authStyle === 'bearer') headers.authorization = `Bearer ${trimmed}`;
+    else headers['x-api-key'] = trimmed;
+    const res = await fetch(url, { headers, signal: controller.signal });
+    if (res.status === 401 || res.status === 403) {
+      let detail: string | undefined;
+      try {
+        const body = await res.json() as { error?: { message?: string } | string };
+        detail = typeof body?.error === 'string' ? body.error : body?.error?.message;
+      } catch { /* ignore */ }
+      return { result: 'invalid', message: detail ?? `Server rejected key (HTTP ${res.status}).` };
+    }
+    if (res.ok) return { result: 'valid' };
+    return { result: 'unknown', message: `Server returned HTTP ${res.status} during validation; saved without confirmation.` };
+  } catch (err) {
+    return { result: 'unknown', message: `Could not reach service to validate (${err instanceof Error ? err.message : String(err)}); saved without confirmation.` };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 
 /**
  * The canonical registry of credentials this project recognizes.
@@ -24,6 +54,7 @@ export const SECRET_DESCRIPTORS: readonly SecretDescriptor[] = [
     envVarName: 'OPENAI_API_KEY',
     required: false, // codex_oauth path can substitute for some workloads
     setupHint: 'Get one at https://platform.openai.com/api-keys. Starts with sk-.',
+    validate: (value) => probeBearer('https://api.openai.com/v1/models', value, 'bearer'),
   },
   {
     name: 'discord_bot_token',
@@ -38,6 +69,7 @@ export const SECRET_DESCRIPTORS: readonly SecretDescriptor[] = [
     envVarName: 'COMPOSIO_API_KEY',
     required: false,
     setupHint: 'Sign up at https://composio.dev and create an API key.',
+    validate: (value) => probeBearer('https://backend.composio.dev/api/v3/connected_accounts?limit=1', value, 'x-api-key'),
   },
   {
     name: 'recall_api_key',

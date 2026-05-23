@@ -38,6 +38,7 @@ import {
   getComposioRuntimeStatus,
   resetComposioClient,
   saveComposioCredentials,
+  validateComposioApiKey,
   saveComposioExecutionBackend,
   setupApiKeyToolkit,
   setupOAuthToolkit,
@@ -290,12 +291,29 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
     }
   });
 
-  app.post('/api/composio/api-key', requireAuth, (req, res) => {
+  app.post('/api/composio/api-key', requireAuth, async (req, res) => {
     const apiKey = typeof req.body.api_key === 'string' ? req.body.api_key : '';
     const userId = typeof req.body.user_id === 'string' ? req.body.user_id : undefined;
     try {
-      saveComposioCredentials(apiKey, userId);
-      res.json({ ok: true, status: getComposioCredentialStatus() });
+      // Validate FIRST so a typo'd / revoked key doesn't silently land in
+      // .env (where it then poisons every downstream Composio call with
+      // an empty connections list — the failure mode that drove this
+      // check, observed 2026-05-23).
+      const validation = await validateComposioApiKey(apiKey);
+      if (validation.result === 'invalid') {
+        res.status(400).json({
+          error: validation.message ?? 'Composio rejected the API key.',
+          validation: 'invalid',
+        });
+        return;
+      }
+      await saveComposioCredentials(apiKey, userId);
+      res.json({
+        ok: true,
+        status: getComposioCredentialStatus(),
+        validation: validation.result,
+        ...(validation.result === 'unknown' ? { warning: validation.message } : {}),
+      });
     } catch (error) {
       res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
     }
@@ -538,7 +556,7 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
     res.redirect(302, `${url.pathname}?${url.searchParams.toString()}`);
   });
 
-  app.post('/dashboard/actions/composio/api-key', (req, res) => {
+  app.post('/dashboard/actions/composio/api-key', async (req, res) => {
     if (!isAuthorized(req)) {
       res.status(401).send('Unauthorized');
       return;
@@ -547,8 +565,16 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
     const apiKey = typeof req.body.api_key === 'string' ? req.body.api_key.trim() : '';
     const userId = typeof req.body.user_id === 'string' ? req.body.user_id.trim() : undefined;
     try {
-      saveComposioCredentials(apiKey, userId);
-      redirectDashboard(res, token, { kind: 'success', text: 'Composio API key saved. You can connect app toolkits now.' });
+      const validation = await validateComposioApiKey(apiKey);
+      if (validation.result === 'invalid') {
+        redirectDashboard(res, token, { kind: 'error', text: validation.message ?? 'Composio rejected the API key.' });
+        return;
+      }
+      await saveComposioCredentials(apiKey, userId);
+      const msg = validation.result === 'unknown'
+        ? `Saved, but ${validation.message ?? 'could not confirm with Composio'}.`
+        : 'Composio API key saved. You can connect app toolkits now.';
+      redirectDashboard(res, token, { kind: 'success', text: msg });
     } catch (error) {
       redirectDashboard(res, token, { kind: 'error', text: error instanceof Error ? error.message : String(error) });
     }

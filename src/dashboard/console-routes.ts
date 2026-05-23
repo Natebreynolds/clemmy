@@ -2860,10 +2860,35 @@ export function registerConsoleRoutes(
     const body = req.body ?? {};
     const name = typeof body.name === 'string' ? body.name : '';
     const value = typeof body.value === 'string' ? body.value : '';
-    const known = listSecretDescriptors().map((d) => d.name as string);
-    if (!known.includes(name)) { res.status(400).json({ error: 'unknown credential name' }); return; }
+    const descriptors = listSecretDescriptors();
+    const descriptor = descriptors.find((d) => d.name === name);
+    if (!descriptor) { res.status(400).json({ error: 'unknown credential name' }); return; }
     if (!value) { res.status(400).json({ error: 'value required' }); return; }
     try {
+      // Data-driven pre-save validation. Descriptors that supply
+      // `validate` (currently composio + openai) get a live probe before
+      // the bad value lands in the vault. Services without a cheap
+      // probe just save through. Network outages return 'unknown' so
+      // the user can still save when the upstream is the one that's
+      // down. (Pattern shipped 2026-05-23 after composio_api_key
+      // truncation slipped past the silent save path.)
+      if (descriptor.validate) {
+        const verdict = await descriptor.validate(value);
+        if (verdict.result === 'invalid') {
+          res.status(400).json({ error: verdict.message ?? 'Rejected by upstream service.', validation: 'invalid' });
+          return;
+        }
+        const store = await getSecretStore();
+        const result = await store.set(name as SecretName, value);
+        res.json({
+          name: result.name,
+          source: result.source,
+          status: result.status,
+          validation: verdict.result,
+          ...(verdict.result === 'unknown' ? { warning: verdict.message } : {}),
+        });
+        return;
+      }
       const store = await getSecretStore();
       const result = await store.set(name as SecretName, value);
       res.json({ name: result.name, source: result.source, status: result.status });
@@ -3488,21 +3513,43 @@ export function registerConsoleRoutes(
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
       const { listPending } = await import('../runtime/harness/approval-registry.js');
-      const rows = listPending({ status: 'pending' });
-      // Newest first — matches how Discord buttons order things.
-      const approvals = rows
-        .sort((a, b) => (b.requestedAt || '').localeCompare(a.requestedAt || ''))
-        .map((r) => ({
-          approvalId: r.approvalId,
-          sessionId: r.sessionId,
-          channel: r.channel,
-          channelId: r.channelId,
-          requestedAt: r.requestedAt,
-          expiresAt: r.expiresAt,
-          subject: r.subject,
-          tool: r.tool,
-          args: r.args,
-        }));
+      const harnessRows = listPending({ status: 'pending' });
+      const runtimeRows = assistant.getRuntime().listPendingApprovals();
+
+      const harnessApprovals = harnessRows.map((r) => ({
+        kind: 'harness' as const,
+        approvalId: r.approvalId,
+        sessionId: r.sessionId,
+        channel: r.channel,
+        channelId: r.channelId,
+        requestedAt: r.requestedAt,
+        expiresAt: r.expiresAt,
+        subject: r.subject,
+        tool: r.tool,
+        args: r.args,
+      }));
+
+      // Runtime approvals (request_approval / gated tool calls) previously
+      // showed up in Home → NEEDS YOU but NEVER reached the Approvals
+      // panel — clicking through to Approvals showed "0 pending" while
+      // Home said "4". (Observed 2026-05-23.) Map them to the same shape
+      // so this panel is the single authoritative source.
+      const runtimeApprovals = runtimeRows.map((approval) => ({
+        kind: 'runtime' as const,
+        approvalId: approval.id,
+        sessionId: approval.sessionId,
+        channel: approval.channel,
+        channelId: undefined as string | undefined,
+        requestedAt: approval.createdAt,
+        expiresAt: undefined as string | undefined,
+        subject: `Approve: ${summarizeApprovalAction(approval)}`,
+        tool: approval.toolName,
+        args: undefined as unknown,
+      }));
+
+      // Newest first across both registries.
+      const approvals = [...harnessApprovals, ...runtimeApprovals]
+        .sort((a, b) => (b.requestedAt || '').localeCompare(a.requestedAt || ''));
       res.json({ approvals, count: approvals.length });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
@@ -3667,8 +3714,10 @@ export function registerConsoleRoutes(
       const planProposals = listPlanProposals({ status: 'pending', limit: 20 });
       const checkInProposals = listProposals({ status: 'pending', limit: 20 });
       const openCheckIns = listOpenCheckIns();
+      // For WORKING NOW we only want executions the daemon is RUNNING
+      // right now. Blocked/paused are stalled — they show in Activity.
       const executions = new ExecutionStore().list(60)
-        .filter((execution) => execution.status === 'active' || execution.status === 'blocked' || execution.status === 'paused');
+        .filter((execution) => execution.status === 'active');
       const backgroundTasks = listBackgroundTasks().slice(0, 60);
       const activeBackgroundTasks = backgroundTasks.filter((task) =>
         task.status === 'pending' || task.status === 'running' || task.status === 'awaiting_approval' || task.status === 'interrupted',
@@ -3678,12 +3727,29 @@ export function registerConsoleRoutes(
       const policy = getProactivityPolicySnapshot();
       const pendingWorkflowRuns = listPendingRuns();
       const recentHarnessSessions = listHarnessSessions({ limit: 60 }).filter(isConsoleVisibleHarnessSession);
-      const activeHarnessSessions = recentHarnessSessions.filter((session) =>
-        session.status === 'active' || session.status === 'paused',
-      );
+      // Chat sessions stay status='active' BETWEEN turns (see
+      // project_session_status_semantics memory: that's what session
+      // 'active' actually means — open + addressable, not necessarily
+      // executing). For WORKING NOW we want only sessions the daemon
+      // is mid-turn on RIGHT NOW. Heuristic: status='active' AND last
+      // event within the last 60s (covers an LLM turn + a slow tool
+      // call). Idle sessions, even if 'active', live in Activity for
+      // resume/clear actions.
+      const activeWindowMs = 60_000;
+      const activeWindowCutoff = Date.now() - activeWindowMs;
+      const activeHarnessSessions = recentHarnessSessions.filter((session) => {
+        if (session.status !== 'active') return false;
+        const updatedMs = Date.parse(session.updatedAt);
+        return Number.isFinite(updatedMs) && updatedMs >= activeWindowCutoff;
+      });
 
+      // Uncapped per-source (was sliced) — the NEEDS YOU header count
+      // (counts.waiting = needsYou.length) is computed from this array,
+      // so capping silently dropped items and the header understated
+      // what's actually pending. (Observed 2026-05-23 alongside the
+      // approvals-panel/home mismatch.) Outer slice removed too.
       const needsYou = [
-        ...approvals.slice(0, 6).map((approval) => ({
+        ...approvals.map((approval) => ({
           kind: 'approval',
           // Lead with what's being approved, not just the bare tool name —
           // "Approve: git push origin main" beats "Approve run_shell_command"
@@ -3695,7 +3761,7 @@ export function registerConsoleRoutes(
           approvalKind: 'runtime',
           approvalId: approval.id,
         })),
-        ...harnessApprovals.slice(0, 8).map((approval) => ({
+        ...harnessApprovals.map((approval) => ({
           kind: 'harness-approval',
           title: `Approve: ${approval.subject}`,
           meta: `${approval.approvalId} · ${approval.tool || approval.sessionId}`,
@@ -3720,38 +3786,44 @@ export function registerConsoleRoutes(
             ? (approval.args as { arguments: string }).arguments
             : (approval.args ? JSON.stringify(approval.args, null, 2) : ''),
         })),
-        ...planProposals.slice(0, 4).map((proposal) => ({
+        ...planProposals.map((proposal) => ({
           kind: 'plan',
           title: proposal.plan?.objective || proposal.originatingRequest || proposal.id,
           meta: `plan ${proposal.id}`,
           panel: 'settings',
           urgency: 'high',
         })),
-        ...checkInProposals.slice(0, 3).map((proposal) => ({
+        ...checkInProposals.map((proposal) => ({
           kind: 'proposal',
           title: proposal.name || proposal.description || proposal.id,
           meta: 'check-in proposal',
           panel: 'settings',
           urgency: 'normal',
         })),
-        ...openCheckIns.slice(0, 5).map((checkIn) => ({
+        ...openCheckIns.map((checkIn) => ({
           kind: 'checkin',
           title: checkIn.question || '(check-in)',
           meta: checkIn.urgency !== 'normal' ? `${checkIn.urgency} · ${checkIn.askedAt.slice(11, 16)}` : `asked ${checkIn.askedAt.slice(11, 16)}`,
           panel: 'settings',
           urgency: checkIn.urgency === 'high' ? 'high' : 'normal',
         })),
-        ...activeBackgroundTasks.filter((task) => task.status === 'awaiting_approval').slice(0, 4).map((task) => ({
+        ...activeBackgroundTasks.filter((task) => task.status === 'awaiting_approval').map((task) => ({
           kind: 'background',
           title: task.title,
           meta: task.id,
           panel: 'activity',
           urgency: 'high',
         })),
-      ].slice(0, 10).map((item) => ({ ...item, title: trimConsoleTitle(item.title, 140) }));
+      ].map((item) => ({ ...item, title: trimConsoleTitle(item.title, 140) }));
 
+      // WORKING NOW is intentionally NARROW: only active chat sessions
+      // (harness) + workflow runs (pending + execution lifecycle).
+      // Background tasks live in their own surface; legacy channel runs
+      // are already covered by harness sessions for chat flows.
+      // (User direction 2026-05-23: "Working now should only be active
+      // working sessions from chat or workflows.")
       const workingNow = [
-        ...pendingWorkflowRuns.slice(0, 6).map((run) => {
+        ...pendingWorkflowRuns.map((run) => {
           const workflow = readWorkflow(run.workflowName);
           const title = workflow?.data?.name ?? run.workflowName;
           return {
@@ -3764,25 +3836,13 @@ export function registerConsoleRoutes(
             runId: run.runId,
           };
         }),
-        ...executions.slice(0, 6).map((execution) => ({
+        ...executions.map((execution) => ({
           kind: execution.status,
           title: execution.title || execution.objective || '(execution)',
           meta: execution.nextStep ? `next: ${execution.nextStep}` : execution.status,
           panel: 'activity',
         })),
-        ...activeBackgroundTasks.slice(0, 6).map((task) => ({
-          kind: task.status,
-          title: task.title,
-          meta: `${task.status} · ${task.id}`,
-          panel: 'activity',
-        })),
-        ...runs.filter((run) => run.status === 'running' || run.status === 'received' || run.status === 'queued').slice(0, 6).map((run) => ({
-          kind: run.status,
-          title: run.title || run.input || run.id,
-          meta: run.channel || run.source || run.id,
-          panel: 'activity',
-        })),
-        ...activeHarnessSessions.slice(0, 8).map((session) => ({
+        ...activeHarnessSessions.map((session) => ({
           kind: isDiscordHarnessSession(session) ? 'discord' : session.kind,
           title: session.title || session.objective || (isDiscordHarnessSession(session) ? 'Discord conversation' : 'Harness run'),
           meta: `${harnessSessionSourceLabel(session)} · ${session.status} · ${session.updatedAt.slice(11, 16)}`,
@@ -3790,7 +3850,7 @@ export function registerConsoleRoutes(
           actionKind: 'harness-session',
           sessionId: session.id,
         })),
-      ].slice(0, 10).map((item) => ({ ...item, title: trimConsoleTitle(item.title, 140), meta: trimConsoleTitle(item.meta || '', 100) }));
+      ].map((item) => ({ ...item, title: trimConsoleTitle(item.title, 140), meta: trimConsoleTitle(item.meta || '', 100) }));
 
       const recentCompleted = [
         ...backgroundTasks.filter((task) => task.status === 'done').slice(0, 5).map((task) => ({
@@ -3828,6 +3888,7 @@ export function registerConsoleRoutes(
           hasValue: row.hasValue,
           required: listSecretDescriptors().find((descriptor) => descriptor.name === row.name)?.required ?? false,
           source: row.source,
+          driftDetected: row.driftDetected,
         }));
       const requiredMissing = credentialHealth.filter((row) => {
         const descriptor = listSecretDescriptors().find((item) => item.name === row.name);
@@ -3840,7 +3901,10 @@ export function registerConsoleRoutes(
         memory.activeFacts === 0 ? 'no durable facts yet' : '',
       ].filter(Boolean);
 
-      const activeCount = executions.length + activeBackgroundTasks.length + pendingWorkflowRuns.length + activeHarnessSessions.length + runs.filter((run) => run.status === 'running' || run.status === 'received' || run.status === 'queued').length;
+      // counts.active mirrors the WORKING NOW list scope exactly: chat
+      // sessions + workflow runs/executions only. Background tasks and
+      // legacy channel runs have their own surfaces.
+      const activeCount = workingNow.length;
       const waitingCount = needsYou.length;
       const currentObjective = workingNow[0]?.title
         ?? needsYou[0]?.title

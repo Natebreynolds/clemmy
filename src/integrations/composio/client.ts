@@ -3,6 +3,7 @@ import path from 'node:path';
 import { Composio } from '@composio/core';
 import { BASE_DIR } from '../../config.js';
 import { readEnvFile, writeEnvFile } from '../../setup/env-file.js';
+import { getSecretStore } from '../../runtime/secrets/index.js';
 import {
   executeComposioCliTool,
   getComposioCliStatus,
@@ -160,13 +161,18 @@ function readSecretFromFileVaultSync(name: string): string | undefined {
 }
 
 function readComposioEnv(key: 'COMPOSIO_API_KEY' | 'COMPOSIO_USER_ID'): string {
+  // Precedence matches CompositeSecretStore: vault → env. Previously
+  // process.env won, which let a stale/bad value in .env silently mask
+  // a freshly-saved vault value. (Observed 2026-05-23: user had two
+  // different keys and the bad .env one beat the good vault one.)
+  if (key === 'COMPOSIO_API_KEY') {
+    const vaultValue = readSecretFromFileVaultSync('composio_api_key')?.trim();
+    if (vaultValue) return vaultValue;
+  }
   const fromProcess = process.env[key]?.trim();
   if (fromProcess) return fromProcess;
   const fromEnvFile = readLocalEnv()[key]?.trim();
   if (fromEnvFile) return fromEnvFile;
-  if (key === 'COMPOSIO_API_KEY') {
-    return readSecretFromFileVaultSync('composio_api_key')?.trim() ?? '';
-  }
   return '';
 }
 
@@ -263,26 +269,83 @@ export async function getComposioRuntimeStatus(): Promise<ReturnType<typeof getC
   return { ...credentials, cli };
 }
 
-export function saveComposioCredentials(apiKey: string, userId?: string): void {
+/**
+ * Validate an API key against Composio's API BEFORE writing it to .env.
+ * Distinguishes three cases:
+ *   - 'valid'   — Composio accepted the key (returned 2xx on a 1-item probe).
+ *   - 'invalid' — Composio rejected (401/403). The key text itself is wrong.
+ *   - 'unknown' — Network failure / 5xx / timeout. Caller should still
+ *                 allow the save (don't lock the user out when Composio
+ *                 is down or the laptop is offline).
+ *
+ * This is a single ~200ms round-trip on a 5s timeout. It does NOT touch
+ * the singleton client or any cache — the caller saves on its own.
+ */
+export async function validateComposioApiKey(apiKey: string): Promise<{
+  result: 'valid' | 'invalid' | 'unknown';
+  message?: string;
+}> {
+  const trimmed = apiKey.trim();
+  if (!trimmed) return { result: 'invalid', message: 'API key is empty.' };
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5_000);
+  try {
+    const res = await fetch('https://backend.composio.dev/api/v3/connected_accounts?limit=1', {
+      headers: { 'x-api-key': trimmed, 'accept': 'application/json' },
+      signal: controller.signal,
+    });
+    if (res.status === 401 || res.status === 403) {
+      let detail: string | undefined;
+      try {
+        const body = await res.json() as { error?: { message?: string } };
+        detail = body?.error?.message;
+      } catch { /* ignore */ }
+      return { result: 'invalid', message: detail ?? `Composio rejected the API key (HTTP ${res.status}).` };
+    }
+    if (res.ok) return { result: 'valid' };
+    // Other status codes (5xx, 429) are "unknown" — don't block save.
+    return { result: 'unknown', message: `Composio returned HTTP ${res.status} during validation; the key was saved without confirmation.` };
+  } catch (err) {
+    return {
+      result: 'unknown',
+      message: `Could not reach Composio to validate the key (${err instanceof Error ? err.message : String(err)}); the key was saved without confirmation.`,
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+export async function saveComposioCredentials(apiKey: string, userId?: string): Promise<void> {
   const trimmedKey = apiKey.trim();
   if (!trimmedKey) throw new Error('COMPOSIO_API_KEY is required.');
 
-  const env = readEnvFile(ENV_FILE);
-  env.COMPOSIO_API_KEY = trimmedKey;
+  // Canonical store (file vault) — same backend the SecretStore uses
+  // for every other credential. The dashboard used to write directly
+  // to .env which then DIVERGED from the vault when other paths wrote
+  // there too. Routing through the SecretStore makes the vault the
+  // single source of truth. (Drift detection added 2026-05-23 surfaces
+  // any remaining .env values inherited from older installs.)
+  const store = await getSecretStore();
+  await store.set('composio_api_key', trimmedKey);
+
+  // user_id has no SecretStore descriptor (not a credential), so it
+  // continues to live in .env. This is the value the user can override
+  // per-org; getPreferredUserId() auto-resolves when blank.
   if (userId !== undefined) {
+    const env = readEnvFile(ENV_FILE);
     const trimmedUserId = userId.trim();
-    if (trimmedUserId) {
-      env.COMPOSIO_USER_ID = trimmedUserId;
-    } else {
-      delete env.COMPOSIO_USER_ID;
-    }
-  }
-  writeEnvFile(ENV_FILE, env);
-  process.env.COMPOSIO_API_KEY = trimmedKey;
-  if (userId !== undefined) {
-    if (userId.trim()) process.env.COMPOSIO_USER_ID = userId.trim();
+    if (trimmedUserId) env.COMPOSIO_USER_ID = trimmedUserId;
+    else delete env.COMPOSIO_USER_ID;
+    writeEnvFile(ENV_FILE, env);
+    if (trimmedUserId) process.env.COMPOSIO_USER_ID = trimmedUserId;
     else delete process.env.COMPOSIO_USER_ID;
   }
+
+  // Also push into process.env so in-process reads see the new key
+  // immediately — readComposioEnv prefers vault now, but other code
+  // paths that read process.env directly (e.g. CLI subprocess env)
+  // still rely on this.
+  process.env.COMPOSIO_API_KEY = trimmedKey;
   resetComposioClient();
 }
 

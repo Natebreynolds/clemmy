@@ -72,6 +72,14 @@ export interface ConsolidatedFactRow {
   //                     retrieval score.
   importance: number | null;
   last_accessed_at: string | null;
+  // v5 (brain Phase 2 — recursive reflection / Stanford trees, §4.2):
+  //   derivation_depth      — 0 for atomic facts derived from tool returns
+  //                           (or direct user statements); 1 for first-level
+  //                           recursive patterns; 2 cap.
+  //   derived_from_fact_ids — JSON array of source fact ids when depth>0.
+  //                           NULL for depth=0 facts.
+  derivation_depth: number;
+  derived_from_fact_ids: string | null;
 }
 
 export type EntityType = 'person' | 'company' | 'project' | 'place' | 'thing';
@@ -283,6 +291,24 @@ const MIGRATIONS: { version: number; sql: string }[] = [
         ON consolidated_facts(importance DESC) WHERE importance IS NOT NULL;
       CREATE INDEX IF NOT EXISTS idx_facts_last_accessed
         ON consolidated_facts(last_accessed_at DESC) WHERE last_accessed_at IS NOT NULL;
+    `,
+  },
+  {
+    // v5 — Brain architecture Phase 2 (recursive reflection / Stanford
+    // trees, Park et al §4.2). Lets a nightly job synthesize higher-order
+    // patterns from accumulated atomic facts and record them in the same
+    // table with a depth marker + provenance back to the source facts.
+    //   derivation_depth      — 0 for atomic facts, 1 for first-level
+    //                           recursive reflections, capped at 2.
+    //   derived_from_fact_ids — JSON array of contributing fact ids; null
+    //                           when depth=0.
+    version: 5,
+    sql: `
+      ALTER TABLE consolidated_facts ADD COLUMN derivation_depth INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE consolidated_facts ADD COLUMN derived_from_fact_ids TEXT;
+
+      CREATE INDEX IF NOT EXISTS idx_facts_derivation_depth
+        ON consolidated_facts(derivation_depth, created_at DESC);
     `,
   },
 ];

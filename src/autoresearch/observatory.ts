@@ -28,6 +28,7 @@ import path from 'node:path';
 import pino from 'pino';
 import { BASE_DIR } from '../config.js';
 import { VAULT_DIR } from '../memory/vault.js';
+import { openMemoryDb } from '../memory/db.js';
 
 const logger = pino({ name: 'clementine-next.autoresearch.observatory' });
 
@@ -83,6 +84,41 @@ interface ReportInput {
   hoursBack?: number;
 }
 
+/**
+ * Brain Phase 2 health snapshot. Surfaces the reflection layer's
+ * behavior so the user can see whether the new importance-threshold
+ * gating + recursive reflection are doing useful work or wasting tokens.
+ * All numbers are computed from existing telemetry + the consolidated_facts
+ * table — no extra writes.
+ */
+interface BrainHealth {
+  reflectionCounts: {
+    success: number;
+    cancelledTooShort: number;
+    cancelledLowImportance: number;
+    cancelledAlreadyReflected: number;
+    cancelledDisabled: number;
+    extractorFailed: number;
+    error: number;
+  };
+  recursiveReflection: {
+    runs: number;
+    lastOutcome?: string;
+    patternsWrittenTotal: number;
+  };
+  factImportance: {
+    sample: number;
+    avg?: number;
+    p50?: number;
+    p90?: number;
+  };
+  factDepth: {
+    atomic: number;
+    depthOne: number;
+    depthTwo: number;
+  };
+}
+
 export interface ObservatoryReport {
   generatedAt: string;
   windowStart: string;
@@ -92,6 +128,7 @@ export interface ObservatoryReport {
   sessionCount: number;
   totalToolCalls: number;
   suggestions: string[];
+  brainHealth?: BrainHealth;
 }
 
 function loadJsonl(filePath: string, maxLines = 20_000): unknown[] {
@@ -272,6 +309,102 @@ function generateSuggestions(toolHealth: ToolHealth[]): string[] {
   return suggestions;
 }
 
+/**
+ * Brain Phase 2 health metrics. Pulls reflection-event counts from the
+ * 24h window's ndjson + queries the consolidated_facts table for
+ * importance + depth distribution. Pure read; null-safe in environments
+ * where the DB hasn't initialized.
+ */
+function computeBrainHealth(events: ToolEvent[]): BrainHealth | undefined {
+  const counts: BrainHealth['reflectionCounts'] = {
+    success: 0,
+    cancelledTooShort: 0,
+    cancelledLowImportance: 0,
+    cancelledAlreadyReflected: 0,
+    cancelledDisabled: 0,
+    extractorFailed: 0,
+    error: 0,
+  };
+  let recursiveRuns = 0;
+  let lastRecursiveOutcome: string | undefined;
+  let recursivePatternsTotal = 0;
+
+  for (const e of events) {
+    if (e.toolName === 'reflection' && e.phase === 'end') {
+      const summary = (e.argsSummary ?? '').toLowerCase();
+      if (e.outcome === 'success') {
+        counts.success += 1;
+      } else if (e.outcome === 'error') {
+        counts.error += 1;
+      } else if (e.outcome === 'cancelled') {
+        if (summary.includes('skipped=too_short')) counts.cancelledTooShort += 1;
+        else if (summary.includes('skipped=low_importance')) counts.cancelledLowImportance += 1;
+        else if (summary.includes('skipped=already_reflected')) counts.cancelledAlreadyReflected += 1;
+        else if (summary.includes('skipped=disabled')) counts.cancelledDisabled += 1;
+        else if (summary.includes('skipped=extractor_failed')) counts.extractorFailed += 1;
+      }
+    } else if (e.toolName === 'recursive_reflection' && e.phase === 'end') {
+      recursiveRuns += 1;
+      lastRecursiveOutcome = e.outcome;
+      const match = /written=(\d+)/.exec(e.argsSummary ?? '');
+      if (match) recursivePatternsTotal += Number.parseInt(match[1], 10) || 0;
+    }
+  }
+
+  let factImportance: BrainHealth['factImportance'] = { sample: 0 };
+  let factDepth: BrainHealth['factDepth'] = { atomic: 0, depthOne: 0, depthTwo: 0 };
+  try {
+    const db = openMemoryDb();
+    const sinceIso = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+    const importanceRows = db.prepare(`
+      SELECT importance FROM consolidated_facts
+      WHERE active = 1 AND importance IS NOT NULL
+        AND updated_at >= ?
+      ORDER BY importance ASC
+    `).all(sinceIso) as { importance: number }[];
+    if (importanceRows.length > 0) {
+      const vals = importanceRows.map((r) => r.importance);
+      const sum = vals.reduce((a, b) => a + b, 0);
+      const pick = (q: number) => vals[Math.min(vals.length - 1, Math.floor(q * vals.length))];
+      factImportance = {
+        sample: vals.length,
+        avg: Number((sum / vals.length).toFixed(2)),
+        p50: Number(pick(0.5).toFixed(2)),
+        p90: Number(pick(0.9).toFixed(2)),
+      };
+    }
+    const depthRows = db.prepare(`
+      SELECT derivation_depth AS d, COUNT(*) AS c FROM consolidated_facts
+      WHERE active = 1
+      GROUP BY derivation_depth
+    `).all() as { d: number; c: number }[];
+    for (const row of depthRows) {
+      if (row.d === 0) factDepth.atomic = row.c;
+      else if (row.d === 1) factDepth.depthOne = row.c;
+      else if (row.d === 2) factDepth.depthTwo = row.c;
+    }
+  } catch {
+    // Brain DB unavailable — return what we have from telemetry alone.
+  }
+
+  const anySignal =
+    counts.success > 0 || counts.cancelledTooShort > 0 || counts.cancelledLowImportance > 0 ||
+    counts.cancelledAlreadyReflected > 0 || counts.error > 0 || counts.extractorFailed > 0 ||
+    recursiveRuns > 0 || factImportance.sample > 0 || factDepth.atomic > 0;
+  if (!anySignal) return undefined;
+
+  return {
+    reflectionCounts: counts,
+    recursiveReflection: {
+      runs: recursiveRuns,
+      lastOutcome: lastRecursiveOutcome,
+      patternsWrittenTotal: recursivePatternsTotal,
+    },
+    factImportance,
+    factDepth,
+  };
+}
+
 export function buildReport(opts: ReportInput = {}): ObservatoryReport {
   const hoursBack = opts.hoursBack ?? 24;
   const now = opts.date ?? new Date();
@@ -293,6 +426,7 @@ export function buildReport(opts: ReportInput = {}): ObservatoryReport {
     sessionCount: sessionSet.size,
     totalToolCalls: toolHealth.reduce((sum, h) => sum + h.calls, 0),
     suggestions: generateSuggestions(toolHealth),
+    brainHealth: computeBrainHealth(events),
   };
 }
 
@@ -329,6 +463,35 @@ export function renderReportMarkdown(report: ObservatoryReport): string {
       const ok = r.stepErrors === 0 ? '✓' : '⚠';
       lines.push(`- ${ok} \`${r.workflow}\` · ${r.status} · ${r.stepCount} steps · ${r.stepErrors} step error(s) · started ${r.startedAt ?? '—'}`);
     }
+    lines.push('');
+  }
+
+  if (report.brainHealth) {
+    const bh = report.brainHealth;
+    const rc = bh.reflectionCounts;
+    const totalReflections = rc.success + rc.cancelledTooShort + rc.cancelledLowImportance +
+      rc.cancelledAlreadyReflected + rc.cancelledDisabled + rc.extractorFailed + rc.error;
+    lines.push('## Brain health');
+    lines.push('');
+    lines.push(`**Reflection — last 24h** · ${totalReflections} attempts`);
+    lines.push('');
+    lines.push('| Outcome | Count |');
+    lines.push('|---|---:|');
+    lines.push(`| success | ${rc.success} |`);
+    lines.push(`| cancelled · too short | ${rc.cancelledTooShort} |`);
+    lines.push(`| cancelled · low importance | ${rc.cancelledLowImportance} |`);
+    lines.push(`| cancelled · already reflected | ${rc.cancelledAlreadyReflected} |`);
+    lines.push(`| cancelled · disabled | ${rc.cancelledDisabled} |`);
+    lines.push(`| extractor failed | ${rc.extractorFailed} |`);
+    lines.push(`| error | ${rc.error} |`);
+    lines.push('');
+    lines.push(`**Recursive reflection (Stanford §4.2) — last 24h** · ${bh.recursiveReflection.runs} run${bh.recursiveReflection.runs === 1 ? '' : 's'}${bh.recursiveReflection.lastOutcome ? `, last outcome: ${bh.recursiveReflection.lastOutcome}` : ''}, ${bh.recursiveReflection.patternsWrittenTotal} pattern${bh.recursiveReflection.patternsWrittenTotal === 1 ? '' : 's'} written`);
+    lines.push('');
+    if (bh.factImportance.sample > 0) {
+      lines.push(`**Importance distribution — last 7 days** (n=${bh.factImportance.sample}) · avg ${bh.factImportance.avg} · p50 ${bh.factImportance.p50} · p90 ${bh.factImportance.p90}`);
+      lines.push('');
+    }
+    lines.push(`**Fact depth** · ${bh.factDepth.atomic} atomic · ${bh.factDepth.depthOne} pattern (depth 1) · ${bh.factDepth.depthTwo} meta-pattern (depth 2)`);
     lines.push('');
   }
 

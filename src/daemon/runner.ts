@@ -23,6 +23,7 @@ import { DISCORD_BOT_TOKEN, DISCORD_ENABLED, WEBHOOK_ENABLED, WEBHOOK_SECRET } f
 import { fullScan as warmCliScan } from '../runtime/cli-discovery.js';
 import { closePlanScope, openPlanScope } from '../agents/plan-scope.js';
 import { processMemoryMaintenance } from '../memory/maintenance.js';
+import { runRecursiveReflection } from '../memory/reflection.js';
 import {
   CRON_FILE,
 } from '../memory/vault.js';
@@ -72,6 +73,10 @@ interface DaemonState {
   // existing dedup map would prevent re-firing within the same minute,
   // and there's nothing to detect "scheduled but never ran" otherwise.
   lastHealthyTickAt?: string;
+  // Brain Phase 2: nightly recursive-reflection day-stamp (YYYY-MM-DD,
+  // local). Set after a successful run so we fire exactly once per
+  // local day even across daemon restarts.
+  lastRecursiveReflectionDay?: string;
 }
 
 const DELIVERY_MAX_ATTEMPTS = 5;
@@ -303,6 +308,40 @@ async function runCronJob(assistant: ClementineAssistant, job: CronJobRecord, so
   } finally {
     closePlanScope(`cron:${job.name}`, 'cron-run-finished');
     stopHeartbeat();
+  }
+}
+
+// Brain Phase 2 — Stanford recursive reflection.
+// Fires once per local day after 03:00, the canonical "nightly synthesis"
+// window. We use a state-persisted day stamp (not a cron expression)
+// because the daemon's YAML cron file is user-editable; the brain's
+// internal jobs should be system-level and undisturbed by user edits.
+// The job is cheap (<$0.01/night per the Phase 2 plan) so a missed-run
+// catch-up on next-boot is fine — no make-up scheduling needed.
+const RECURSIVE_REFLECTION_LOCAL_HOUR = 3;
+
+function localDayKey(at: Date): string {
+  const y = at.getFullYear();
+  const m = String(at.getMonth() + 1).padStart(2, '0');
+  const d = String(at.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+async function processRecursiveReflectionTick(state: DaemonState): Promise<void> {
+  const now = new Date();
+  if (now.getHours() < RECURSIVE_REFLECTION_LOCAL_HOUR) return;
+  const day = localDayKey(now);
+  if (state.lastRecursiveReflectionDay === day) return;
+  state.lastRecursiveReflectionDay = day;
+  saveState(state);
+  try {
+    const result = await runRecursiveReflection();
+    logger.info({ result }, 'Brain recursive reflection completed');
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'Brain recursive reflection failed (will retry tomorrow)',
+    );
   }
 }
 
@@ -847,6 +886,7 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
       annotateDueExecutionsAsPolicyPaused(proactivity);
     }
     await processMemoryMaintenance(tickCount);
+    await processRecursiveReflectionTick(state);
     // Notification delivery used to run inline here. It now ticks on
     // its own independent setInterval above, so deliveries keep
     // flowing while this loop is parked on a long workflow / cron /

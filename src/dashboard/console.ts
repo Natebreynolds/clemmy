@@ -7057,6 +7057,12 @@ body {
 .approval-subject { font-size: 13px; font-weight: 500; line-height: 1.4; flex: 1; }
 .approval-age { font-size: 10px; letter-spacing: 0.1em; color: var(--fg-3); white-space: nowrap; padding-top: 2px; }
 .approval-age.stale { color: var(--accent-warn); }
+.approval-kind-pill {
+  display: inline-block; padding: 0 5px; font-size: 9px; letter-spacing: 0.12em;
+  border: 1px solid var(--line); border-radius: 2px; text-transform: uppercase;
+}
+.approval-kind-pill.runtime { color: var(--accent); border-color: var(--accent); }
+.approval-kind-pill.harness { color: var(--fg-3); }
 .approval-age.very-stale { color: var(--accent-fail); }
 .approval-meta { font-size: 10px; color: var(--fg-3); letter-spacing: 0.04em; }
 .approval-meta code { background: var(--bg-2); padding: 1px 5px; border: 1px solid var(--line); }
@@ -7084,7 +7090,25 @@ body {
 }
 
 /* v0.5.11 — Brain panel */
-.brain-layout { padding: 16px; }
+.brain-layout {
+  padding: 16px;
+  /* Parent .panel-body is height:100% / overflow:hidden, so the brain
+     panel has to manage its own internal scroll. Flex column with the
+     header (tabs) staying fixed and the active tab pane filling the
+     remainder + scrolling. Hidden panes have display:none and don't
+     take flex space, so only the visible pane gets flex:1. */
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  box-sizing: border-box;
+}
+.brain-layout > .brain-header { flex: 0 0 auto; }
+.brain-tab-pane {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
 .brain-header h3 { margin: 0 0 4px; font-size: 14px; letter-spacing: 0.08em; }
 .brain-header p { margin: 0 0 12px; color: var(--fg-3); font-size: 11px; max-width: 640px; }
 .brain-tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); margin-bottom: 16px; }
@@ -8111,6 +8135,11 @@ body {
 .cred-source.file { color: var(--accent); }
 .cred-source.env { color: var(--accent-warn); }
 .cred-source.missing { color: var(--fg-mute); }
+.cred-drift {
+  font-size: 9px; letter-spacing: 0.16em;
+  color: var(--accent-fail); border: 1px solid var(--accent-fail);
+  padding: 1px 5px;
+}
 
 .cred-desc {
   margin-top: 6px;
@@ -15875,7 +15904,19 @@ const CONSOLE_JS = `
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ api_key: key }),
               });
-              if (!r.ok) { const j = await r.json().catch(() => ({})); alert('Save failed: ' + (j.error || r.status)); return; }
+              const j = await r.json().catch(() => ({}));
+              if (!r.ok) {
+                // Validation rejected (HTTP 400) lands here with a
+                // helpful message from Composio (e.g. "Invalid API key:
+                // ak_xxxx*****"). Surfacing the full text avoids the
+                // silent-failure mode where the user thought their key
+                // saved but no connections show up.
+                alert('Save failed: ' + (j.error || r.status));
+                return;
+              }
+              if (j.validation === 'unknown' && j.warning) {
+                alert('Saved, but ' + j.warning);
+              }
               await refreshHubApps();
             } catch (err) { alert('Save failed: ' + (err.message || err)); }
           });
@@ -17224,8 +17265,9 @@ const CONSOLE_JS = `
         }
         const sessionShort = (a.sessionId || '').slice(0, 32);
         const workflow = (a.args && typeof a.args === 'object' && typeof a.args.workflow === 'string') ? a.args.workflow : '';
+        const kind = a.kind === 'runtime' ? 'runtime' : 'harness';
         return [
-          '<div class="approval-card" data-approval-id="' + escMem(a.approvalId || '') + '">',
+          '<div class="approval-card" data-approval-id="' + escMem(a.approvalId || '') + '" data-approval-kind="' + kind + '">',
           '  <div class="approval-card-head">',
           '    <div class="approval-subject">' + escMem(a.subject || a.tool || '(no subject)') + '</div>',
           '    <div class="approval-age ' + ageCls + '">' + escMem(ageLabel) + '</div>',
@@ -17233,12 +17275,13 @@ const CONSOLE_JS = `
           '  <div class="approval-meta">tool: <code>' + escMem(a.tool || 'unknown') + '</code>',
           workflow ? ' · workflow: <code>' + escMem(workflow) + '</code>' : '',
           ' · session: <code>' + escMem(sessionShort) + '</code>',
-          ' · id: <code>' + escMem(a.approvalId || '') + '</code></div>',
+          ' · id: <code>' + escMem(a.approvalId || '') + '</code>',
+          ' · <span class="approval-kind-pill ' + kind + '">' + (kind === 'runtime' ? 'runtime' : 'tool') + '</span></div>',
           argsRendered ? '  <pre class="approval-args">' + escMem(argsRendered) + '</pre>' : '',
           '  <div class="approval-actions">',
           '    <button class="approve" data-approval-action="approve">APPROVE</button>',
           '    <button class="reject" data-approval-action="reject">REJECT</button>',
-          '    <button data-approval-action="cancel">CANCEL RUN</button>',
+          kind === 'harness' ? '    <button data-approval-action="cancel">CANCEL RUN</button>' : '',
           '  </div>',
           '</div>',
         ].join('');
@@ -17254,11 +17297,19 @@ const CONSOLE_JS = `
           if (!card) return;
           const id = card.getAttribute('data-approval-id');
           const action = btn.getAttribute('data-approval-action');
+          const kind = card.getAttribute('data-approval-kind') === 'runtime' ? 'runtime' : 'harness';
           if (!id || !action) return;
           if (action === 'cancel' && !confirm('Cancel this run? It will stop without sending or completing.')) return;
           Array.from(card.querySelectorAll('button')).forEach(function (b) { b.disabled = true; });
           try {
-            await fetch(withToken('/api/console/harness-approvals/' + encodeURIComponent(id) + '/' + action), {
+            // Runtime approvals go through the legacy /api/approvals route;
+            // harness (tool-gate) approvals through /api/console/harness-approvals.
+            // Mismatching the route silently 404s and leaves the user
+            // wondering why their click didn't do anything.
+            const url = kind === 'runtime'
+              ? '/api/approvals/' + encodeURIComponent(id) + '/' + action
+              : '/api/console/harness-approvals/' + encodeURIComponent(id) + '/' + action;
+            await fetch(withToken(url), {
               method: 'POST', headers: { 'Content-Type': 'application/json' },
             });
             await refreshApprovalsPanel();
@@ -18655,6 +18706,10 @@ const CONSOLE_JS = `
           '    <div class="cred-meta">',
           '      <span class="cred-status ' + escMem(display.className) + '">' + escMem(display.label) + '</span>',
           display.source && display.source !== 'none' ? '      <span class="cred-source ' + escMem(display.source) + '">' + escMem(display.source.toUpperCase()) + '</span>' : '',
+          // Drift warning: both .env and vault populated with different
+          // values. The reader silently picks the vault — surface this
+          // so the user can resolve before it bites them later.
+          r.driftDetected ? '      <span class="cred-drift" title="Both .env and vault hold different values for this key. The vault value is used. Click SET ✎ to overwrite the vault from the dashboard.">⚠ DRIFT</span>' : '',
           r.lastSetAt ? '      <span>set ' + escMem(r.lastSetAt.slice(0, 16).replace("T", " ")) + '</span>' : '',
           d.envVarName ? '      <span>env: ' + escMem(d.envVarName) + '</span>' : '',
           '    </div>',
@@ -19163,13 +19218,25 @@ const CONSOLE_JS = `
       if (activeCount > 0) {
         presence.className = 'presence-dot working';
         label.textContent = 'working';
-        detail.textContent = ((workingNow[0]?.title) || data.presence?.awayMessage || 'running').slice(0, 60);
+        // Make the count match what's shown: the body only renders ONE
+        // item's title, so naming "X of N" here removes the silent
+        // mismatch where the badge said "13" but only one work item
+        // appeared visible. (Observed 2026-05-23.) Click jumps to
+        // Activity for the full list.
+        const firstTitle = ((workingNow[0]?.title) || data.presence?.awayMessage || 'running').slice(0, 60);
+        detail.textContent = activeCount > 1
+          ? firstTitle + ' · +' + (activeCount - 1) + ' more →'
+          : firstTitle;
         tick.textContent = String(activeCount);
       } else if (approvalCount > 0 || needsYouCount > 0) {
         presence.className = 'presence-dot needs-you';
         label.textContent = 'needs you';
-        detail.textContent = (needsYou[0]?.title || 'approval pending').slice(0, 60);
-        tick.textContent = String(approvalCount || needsYouCount);
+        const firstNeed = (needsYou[0]?.title || 'approval pending').slice(0, 60);
+        const totalNeed = approvalCount || needsYouCount;
+        detail.textContent = totalNeed > 1
+          ? firstNeed + ' · +' + (totalNeed - 1) + ' more →'
+          : firstNeed;
+        tick.textContent = String(totalNeed);
       } else {
         presence.className = 'presence-dot';
         label.textContent = 'idle';

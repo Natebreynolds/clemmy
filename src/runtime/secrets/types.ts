@@ -90,6 +90,13 @@ export interface SecretHealthRow {
   lastValidatedAt?: string;
   envFallbackAvailable: boolean;
   envVarName: string;
+  /**
+   * True when BOTH the file vault AND the .env backend hold values for
+   * this secret AND those values disagree. Surfacing this prevents the
+   * silent-divergence bug where a stale value in one store masks the
+   * good value in the other (observed 2026-05-23 with COMPOSIO_API_KEY).
+   */
+  driftDetected?: boolean;
 }
 
 /**
@@ -113,6 +120,11 @@ export interface SecretBackend {
 
 /** Known credential descriptor — used by the registry to drive
  *  health() output and the dashboard's "Credentials" panel. */
+export interface SecretValidationResult {
+  result: 'valid' | 'invalid' | 'unknown';
+  message?: string;
+}
+
 export interface SecretDescriptor {
   name: SecretName;
   description: string;
@@ -123,4 +135,11 @@ export interface SecretDescriptor {
   required: boolean;
   /** Brief help text the dashboard shows in the "how to set this" hint. */
   setupHint?: string;
+  /** Optional pre-save probe. When present, /api/console/credentials/set
+   *  calls this with the candidate value BEFORE persisting. Returns
+   *  'invalid' to reject the save (with a helpful message); 'unknown'
+   *  to allow but warn (network outage, slow service); 'valid' to save
+   *  cleanly. Prevents the "saved a bad key, integration silently
+   *  fails" failure mode (observed 2026-05-23 with COMPOSIO_API_KEY). */
+  validate?: (value: string) => Promise<SecretValidationResult>;
 }

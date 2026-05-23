@@ -277,18 +277,25 @@ export class CompositeSecretStore {
       if (options.passive) {
         const metadata = meta?.entries[desc.name];
         const fileValue = await this.fileBackend.get(desc.name);
-        const envFallbackAvailable = Boolean(desc.envVarName && await this.envBackend.get(desc.name));
+        const envValue = desc.envVarName ? await this.envBackend.get(desc.name) : undefined;
+        const envFallbackAvailable = Boolean(envValue);
+        // Drift = both stores populated but values disagree. The
+        // composite reader picks file (vault) so an unhealthy env value
+        // is harmless on the read path, but a stale FILE value can mask
+        // a freshly-pasted .env entry the user expected to take effect.
+        const driftDetected = fileValue !== undefined && envValue !== undefined && fileValue !== envValue;
         if (fileValue !== undefined) {
           rows.push({
             name: desc.name,
             description: desc.description,
             source: 'file',
-            status: 'connected',
+            status: driftDetected ? 'needs_repair' : 'connected',
             hasValue: true,
             lastSetAt: metadata?.lastSetAt,
             lastValidatedAt: metadata?.lastValidatedAt,
             envFallbackAvailable,
             envVarName: desc.envVarName,
+            driftDetected: driftDetected || undefined,
           });
           continue;
         }

@@ -39,6 +39,10 @@ export interface ConsolidatedFact {
   // v4 — Stanford Generative Agents §4.1 poignancy + recency anchor.
   importance?: number | null;
   lastAccessedAt?: string | null;
+  // v5 — recursive reflection / Stanford trees (§4.2). 0 for atomic
+  // facts; 1+ for synthesized higher-order patterns.
+  derivationDepth?: number;
+  derivedFromFactIds?: number[] | null;
 }
 
 export const FACT_KINDS: ConsolidatedFactKind[] = ['user', 'project', 'feedback', 'reference'];
@@ -76,7 +80,21 @@ function rowToFact(row: ConsolidatedFactRow): ConsolidatedFact {
     extractedAt: row.extracted_at,
     importance: row.importance,
     lastAccessedAt: row.last_accessed_at,
+    derivationDepth: row.derivation_depth ?? 0,
+    derivedFromFactIds: row.derived_from_fact_ids
+      ? safeParseFactIds(row.derived_from_fact_ids)
+      : null,
   };
+}
+
+function safeParseFactIds(json: string): number[] | null {
+  try {
+    const parsed = JSON.parse(json);
+    if (Array.isArray(parsed) && parsed.every((n) => Number.isInteger(n))) {
+      return parsed as number[];
+    }
+  } catch { /* ignore */ }
+  return null;
 }
 
 export interface RememberInput {
@@ -99,6 +117,11 @@ export interface RememberInput {
   // derived facts → set by the reflection extractor. Used by retrieval
   // weighting and reflection-trigger sum-threshold.
   importance?: number;
+  // v5 — recursive reflection (Stanford §4.2). depth=0 (default) for
+  // atomic facts (direct + tool-derived). depth=1+ for synthesized
+  // higher-order patterns; derivedFromFactIds carries the source ids.
+  derivationDepth?: number;
+  derivedFromFactIds?: number[];
 }
 
 /**
@@ -163,16 +186,23 @@ export function rememberFact(input: RememberInput): ConsolidatedFact {
     return rowToFact(refreshed);
   }
 
+  const derivationDepth = Math.max(0, Math.min(2, input.derivationDepth ?? 0));
+  const derivedFromIdsJson = Array.isArray(input.derivedFromFactIds) && input.derivedFromFactIds.length > 0
+    ? JSON.stringify(input.derivedFromFactIds.filter((n) => Number.isInteger(n)))
+    : null;
+
   const info = db.prepare(`
     INSERT INTO consolidated_facts
       (kind, content, content_hash, source_session_id, source_path,
        score, active, created_at, updated_at,
        derived_from_session_id, derived_from_call_id, derived_from_tool,
-       trust_level, extracted_at, importance)
-    VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
+       trust_level, extracted_at, importance,
+       derivation_depth, derived_from_fact_ids)
+    VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(input.kind, content, hash, input.sessionId ?? null, input.path ?? null,
          initialScore, now, now,
-         dfSession, dfCall, dfTool, trust, extractedAt, importance);
+         dfSession, dfCall, dfTool, trust, extractedAt, importance,
+         derivationDepth, derivedFromIdsJson);
 
   const inserted = db.prepare('SELECT * FROM consolidated_facts WHERE id = ?')
     .get(info.lastInsertRowid) as ConsolidatedFactRow;

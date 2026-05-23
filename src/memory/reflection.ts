@@ -2,7 +2,7 @@ import { Agent, Runner } from '@openai/agents';
 import { z } from 'zod';
 import pino from 'pino';
 import { MODELS } from '../config.js';
-import { openMemoryDb, type EntityType, type EntityRow, type EpisodicPointerRow } from './db.js';
+import { openMemoryDb, type ConsolidatedFactKind, type ConsolidatedFactRow, type EntityType, type EntityRow, type EpisodicPointerRow } from './db.js';
 import {
   rememberFact,
   updateFact,
@@ -93,7 +93,7 @@ export interface ReflectionResult {
   entitiesUpserted: number;
   pointersStored: number;
   sumImportance?: number;
-  skipped?: 'too_short' | 'already_reflected' | 'extractor_failed' | 'disabled';
+  skipped?: 'too_short' | 'already_reflected' | 'extractor_failed' | 'disabled' | 'low_importance';
 }
 
 const PROMPT_PREAMBLE = [
@@ -130,6 +130,56 @@ function getReflectorModel(): string {
 function readDisableFlag(): boolean {
   const raw = (process.env.CLEMMY_REFLECTION ?? '').trim().toLowerCase();
   return raw === 'off' || raw === 'false' || raw === '0';
+}
+
+// Stanford §4.2: reflection fires when sum(importance) of recent
+// observations crosses a threshold. Their published agents use 150 on
+// a 1-10 importance scale. Clementine's event stream is sparser (tool
+// returns, not lived experience) so the default is half — calibrate
+// from autoresearch telemetry after a week of real use. Setting
+// CLEMMY_REFLECTION_THRESHOLD=0 disables importance gating entirely
+// (revert to v0.5.11 commit-every-extraction behavior).
+const DEFAULT_REFLECTION_THRESHOLD = 75;
+
+export function getReflectionThreshold(): number {
+  const raw = (process.env.CLEMMY_REFLECTION_THRESHOLD ?? '').trim();
+  if (!raw) return DEFAULT_REFLECTION_THRESHOLD;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_REFLECTION_THRESHOLD;
+  return parsed;
+}
+
+interface SessionImportanceCounter {
+  sum: number;
+  lastUpdatedAt: number;
+}
+const SESSION_IMPORTANCE = new Map<string, SessionImportanceCounter>();
+const SESSION_IMPORTANCE_IDLE_MS = 24 * 60 * 60 * 1000; // 24h reset
+
+function accumulateImportance(sessionId: string, delta: number): SessionImportanceCounter {
+  const now = Date.now();
+  const existing = SESSION_IMPORTANCE.get(sessionId);
+  if (!existing || now - existing.lastUpdatedAt > SESSION_IMPORTANCE_IDLE_MS) {
+    const fresh: SessionImportanceCounter = { sum: delta, lastUpdatedAt: now };
+    SESSION_IMPORTANCE.set(sessionId, fresh);
+    return fresh;
+  }
+  existing.sum += delta;
+  existing.lastUpdatedAt = now;
+  return existing;
+}
+
+function resetSessionImportance(sessionId: string): void {
+  SESSION_IMPORTANCE.delete(sessionId);
+}
+
+// Exported for tests only — lets the test suite peek/reset state
+// without exposing the internal map shape.
+export function _testOnly_peekSessionImportance(sessionId: string): number {
+  return SESSION_IMPORTANCE.get(sessionId)?.sum ?? 0;
+}
+export function _testOnly_resetAllSessionImportance(): void {
+  SESSION_IMPORTANCE.clear();
 }
 
 /**
@@ -359,11 +409,13 @@ export async function reflectOnToolReturn(input: ReflectionInput): Promise<Refle
       kind: 'read',
       phase: 'end',
       durationMs: Date.now() - startedAt,
-      outcome: result.skipped
-        ? 'cancelled'
-        : (result.factsWritten + result.entitiesUpserted + result.pointersStored > 0
-            ? 'success'
-            : 'error'),
+      // Outcome: 'cancelled' when a gate fired before commit (too short,
+      // low importance, etc); 'success' otherwise — empty-extraction is
+      // still success (the extractor correctly judged nothing worth
+      // remembering, e.g. for a JSON status tool return). Reserve 'error'
+      // for the few paths that actually throw, which already short-
+      // circuit before this emit.
+      outcome: result.skipped ? 'cancelled' : 'success',
       argsSummary: `source_tool=${input.tool ?? 'unknown'} call=${input.callId} facts=${result.factsWritten} entities=${result.entitiesUpserted} pointers=${result.pointersStored}${result.skipped ? ` skipped=${result.skipped}` : ''}`,
     });
     return result;
@@ -389,6 +441,30 @@ export async function reflectOnToolReturn(input: ReflectionInput): Promise<Refle
   const extraction = await runExtractor(`Tool: ${input.tool ?? 'unknown'}\nCall: ${input.callId}\n\n${serialized}`);
   if (!extraction) {
     return emitObservability({ factsWritten: 0, entitiesUpserted: 0, pointersStored: 0, skipped: 'extractor_failed' });
+  }
+
+  // Stanford §4.2: importance-threshold gating on the COMMIT step. The
+  // extractor already ran (cheap fast-tier call); we just decide
+  // whether the extracted facts clear the rolling sum-importance bar.
+  // Skipped extractions accumulate into the next call's budget so a
+  // session of low-signal tool returns eventually crosses the gate
+  // and writes.
+  const extractionImportance = extraction.facts.reduce((acc, f) => acc + (f.importance || 0), 0);
+  const threshold = getReflectionThreshold();
+  if (threshold > 0 && extractionImportance > 0) {
+    const counter = accumulateImportance(input.sessionId, extractionImportance);
+    if (counter.sum < threshold) {
+      return emitObservability({
+        factsWritten: 0,
+        entitiesUpserted: 0,
+        pointersStored: 0,
+        sumImportance: counter.sum,
+        skipped: 'low_importance',
+      });
+    }
+    // Crossed the threshold — reset so the next eligible window starts
+    // fresh. We still proceed with the current commit below.
+    resetSessionImportance(input.sessionId);
   }
 
   let factsWritten = 0;
@@ -503,4 +579,201 @@ export function scheduleReflection(input: ReflectionInput): void {
       logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'reflection: scheduled run errored');
     });
   });
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Recursive reflection — Stanford trees (Park et al §4.2)
+// ─────────────────────────────────────────────────────────────────
+//
+// Nightly job that reads the last 7 days of atomic facts (depth=0) and
+// already-synthesized patterns (depth=1) and emits higher-order
+// reflections grouped by kind. Stanford's published agents only went
+// 2 levels deep; we cap at the same.
+
+const RECURSIVE_REFLECTION_LOOKBACK_DAYS = 7;
+const RECURSIVE_REFLECTION_MIN_GROUP_SIZE = 5;
+const RECURSIVE_REFLECTION_MAX_GROUP_SIZE = 100;
+const RECURSIVE_REFLECTION_MAX_DEPTH = 2;
+
+const RecursivePatternSchema = z.object({
+  text: z.string().min(3).max(500),
+  importance: z.number().min(1).max(10),
+});
+const RecursiveExtractionSchema = z.object({
+  patterns: z.array(RecursivePatternSchema).max(3),
+});
+
+const RECURSIVE_PROMPT = [
+  'You are the recursive-reflection layer of a long-running personal assistant.',
+  'You will be shown a batch of recent atomic facts the assistant has learned about a single kind (user / project / feedback / reference). Identify 0-3 higher-order PATTERNS that emerge across these facts — themes, trends, shifts, recurring concerns — that would NOT be visible from any single fact alone.',
+  '',
+  'Return strict JSON:',
+  '{ "patterns": [{ "text": "<one-sentence pattern>", "importance": <1-10 per Park et al §4.1> }] }',
+  '',
+  'Rules:',
+  '- A pattern must reference EVIDENCE that spans ≥ 2 of the input facts. Single-fact restatements are NOT patterns.',
+  '- "text" is present-tense, third-person, atomic — same shape as the atomic facts.',
+  '- Score importance per Park et al: 1 mundane / 4 routine-recurring / 7 notable-actionable / 10 life-changing. Patterns typically score 5-8.',
+  '- If no patterns are warranted (facts are unrelated or already-summarized), return { "patterns": [] }. Empty is the correct answer most of the time.',
+  '- Output ONLY the JSON object. No markdown fences.',
+].join('\n');
+
+interface RecursiveReflectionResult {
+  patternsWritten: number;
+  patternsUpdated: number;
+  patternsNoop: number;
+  groupsProcessed: number;
+  groupsSkipped: number;
+  factsConsidered: number;
+}
+
+async function runRecursivePatternExtractor(
+  kind: ConsolidatedFactKind,
+  facts: ConsolidatedFactRow[],
+): Promise<{ patterns: { text: string; importance: number }[] } | null> {
+  const model = getReflectorModel();
+  try {
+    const agent = new Agent({
+      name: 'Recursive Reflection Extractor',
+      model,
+      instructions: RECURSIVE_PROMPT,
+    });
+    const runner = new Runner({ workflowName: 'clementine-recursive-reflection' });
+    const lines = facts.map((f) => `[id=${f.id}, depth=${f.derivation_depth}, importance=${f.importance ?? '?'}] ${f.content}`);
+    const prompt = `Kind: ${kind}\nFact count: ${facts.length}\n\nFacts:\n${lines.join('\n')}`;
+    const result = await runner.run(agent, prompt);
+    const text = typeof (result as { finalOutput?: unknown }).finalOutput === 'string'
+      ? (result as { finalOutput: string }).finalOutput
+      : String((result as { finalOutput?: unknown }).finalOutput ?? '');
+    if (!text || !text.trim()) return null;
+    const cleaned = text.replace(/^```(?:json)?\s*/, '').replace(/\s*```\s*$/, '').trim();
+    const validated = RecursiveExtractionSchema.safeParse(JSON.parse(cleaned));
+    if (!validated.success) {
+      logger.warn({ kind, issues: validated.error.issues.slice(0, 3) }, 'recursive-reflection extractor returned invalid shape');
+      return null;
+    }
+    return validated.data;
+  } catch (err) {
+    logger.warn({ kind, err: err instanceof Error ? err.message : String(err) }, 'recursive-reflection extractor failed');
+    return null;
+  }
+}
+
+/**
+ * Nightly synthesis pass. Reads the last week of facts grouped by kind,
+ * asks the fast-tier model to surface higher-order patterns, and writes
+ * each pattern as a new fact at derivation_depth = max(source depths) + 1.
+ * Patterns flow through the same Mem0 conflict resolver so a recurring
+ * theme gets UPDATEd next week instead of duplicated.
+ *
+ * Returns counts for observability. Safe to call from a cron tick or
+ * manually for testing. Honors CLEMMY_REFLECTION=off.
+ */
+export async function runRecursiveReflection(): Promise<RecursiveReflectionResult> {
+  const startedAt = Date.now();
+  const result: RecursiveReflectionResult = {
+    patternsWritten: 0,
+    patternsUpdated: 0,
+    patternsNoop: 0,
+    groupsProcessed: 0,
+    groupsSkipped: 0,
+    factsConsidered: 0,
+  };
+
+  const emit = (skipped?: 'disabled' | 'empty'): RecursiveReflectionResult => {
+    recordToolEvent({
+      at: new Date().toISOString(),
+      sessionId: 'cron:recursive-reflection',
+      toolName: 'recursive_reflection',
+      kind: 'read',
+      phase: 'end',
+      durationMs: Date.now() - startedAt,
+      // Same semantics as reflection.ts: extractor returning empty is
+      // still success (groups <5 facts get groupsSkipped++; runs that
+      // produced no patterns reflect a low-signal week, not a failure).
+      outcome: skipped ? 'cancelled' : 'success',
+      argsSummary: `groups=${result.groupsProcessed}/${result.groupsProcessed + result.groupsSkipped} facts=${result.factsConsidered} written=${result.patternsWritten} updated=${result.patternsUpdated} noop=${result.patternsNoop}${skipped ? ` skipped=${skipped}` : ''}`,
+    });
+    return result;
+  };
+
+  if (readDisableFlag()) return emit('disabled');
+
+  const db = openMemoryDb();
+  const sinceIso = new Date(Date.now() - RECURSIVE_REFLECTION_LOOKBACK_DAYS * 24 * 60 * 60 * 1000).toISOString();
+  const kinds: ConsolidatedFactKind[] = ['user', 'project', 'feedback', 'reference'];
+
+  let producedAnything = false;
+  for (const kind of kinds) {
+    const rows = db.prepare(`
+      SELECT * FROM consolidated_facts
+      WHERE active = 1
+        AND kind = ?
+        AND derivation_depth < ?
+        AND updated_at >= ?
+      ORDER BY updated_at DESC
+      LIMIT ?
+    `).all(kind, RECURSIVE_REFLECTION_MAX_DEPTH, sinceIso, RECURSIVE_REFLECTION_MAX_GROUP_SIZE) as ConsolidatedFactRow[];
+
+    if (rows.length < RECURSIVE_REFLECTION_MIN_GROUP_SIZE) {
+      result.groupsSkipped += 1;
+      continue;
+    }
+    result.factsConsidered += rows.length;
+
+    const extraction = await runRecursivePatternExtractor(kind, rows);
+    if (!extraction || extraction.patterns.length === 0) {
+      result.groupsProcessed += 1;
+      continue;
+    }
+    producedAnything = true;
+    result.groupsProcessed += 1;
+
+    const sourceIds = rows.map((r) => r.id);
+    const maxSourceDepth = rows.reduce((m, r) => Math.max(m, r.derivation_depth ?? 0), 0);
+    const targetDepth = Math.min(RECURSIVE_REFLECTION_MAX_DEPTH, maxSourceDepth + 1);
+
+    for (const pattern of extraction.patterns) {
+      try {
+        const similar = findSimilarFacts(pattern.text, { kind, topK: 5 });
+        const decision = await resolveConflict({ kind, text: pattern.text }, similar);
+
+        if (decision.decision === 'NOOP') {
+          result.patternsNoop += 1;
+          continue;
+        }
+        if (decision.decision === 'DELETE' && typeof decision.target_id === 'number') {
+          deleteFact(decision.target_id);
+        }
+        if (decision.decision === 'UPDATE' && typeof decision.target_id === 'number') {
+          const updated = updateFact(decision.target_id, {
+            content: decision.rewrite || pattern.text,
+            // Recursive patterns are inferences over inferences — keep
+            // trust strictly below direct-derived (0.6) so user-stated
+            // facts always win on conflict.
+            trustLevel: 0.5,
+            importance: pattern.importance,
+          });
+          if (updated) {
+            result.patternsUpdated += 1;
+            continue;
+          }
+        }
+        const remembered = rememberFact({
+          kind,
+          content: pattern.text,
+          importance: pattern.importance,
+          trustLevel: 0.5,
+          derivationDepth: targetDepth,
+          derivedFromFactIds: sourceIds,
+        });
+        if (remembered) result.patternsWritten += 1;
+      } catch (err) {
+        logger.warn({ err: err instanceof Error ? err.message : String(err), kind, pattern }, 'recursive-reflection: write failed');
+      }
+    }
+  }
+
+  if (!producedAnything && result.groupsProcessed === 0) return emit('empty');
+  return emit();
 }

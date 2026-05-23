@@ -84,10 +84,12 @@ export function getOpenAiApiKey(): string {
   // The composite SecretStore implements the full file/env/keychain read
   // order asynchronously; this sync helper keeps existing call sites
   // working without forcing async refactors.
-  const fromEnv = getRuntimeEnv('OPENAI_API_KEY', '');
-  if (fromEnv) return fromEnv;
+  // Vault first — matches CompositeSecretStore precedence. See
+  // WEBHOOK_SECRET comment + the 2026-05-23 Composio drift incident.
   const fromFile = readSecretFromFileVaultSync('openai_api_key');
-  return fromFile ?? '';
+  if (fromFile) return fromFile;
+  const fromEnv = getRuntimeEnv('OPENAI_API_KEY', '');
+  return fromEnv ?? '';
 }
 
 export const ASSISTANT_NAME = getEnv('ASSISTANT_NAME', 'Clementine');
@@ -164,7 +166,11 @@ export function getModelSettingsSnapshot(): {
 export const VAULT_DIR = path.join(BASE_DIR, 'vault');
 export const WEBHOOK_ENABLED = getEnv('WEBHOOK_ENABLED', 'false').toLowerCase() === 'true';
 export const WEBHOOK_PORT = parseInt(getEnv('WEBHOOK_PORT', '8420'), 10);
-export const WEBHOOK_SECRET = getEnv('WEBHOOK_SECRET', '') || readSecretFromFileVaultSync('webhook_secret') || '';
+// Vault first — matches CompositeSecretStore precedence (vault → env).
+// Previously env beat vault, which masked freshly-saved values when a
+// stale .env was present. (Observed 2026-05-23 for composio_api_key;
+// applied here for symmetry across all secrets.)
+export const WEBHOOK_SECRET = readSecretFromFileVaultSync('webhook_secret') || getEnv('WEBHOOK_SECRET', '') || '';
 export const DISCORD_ENABLED = getEnv('DISCORD_ENABLED', 'false').toLowerCase() === 'true';
 // When true, Discord routes incoming messages through the 0.3 harness
 // (Orchestrator + sub-agents + auto-continuation + live progress) instead
@@ -178,7 +184,7 @@ export const DISCORD_HARNESS_ENABLED = getEnv('DISCORD_HARNESS_ENABLED', 'false'
 // Reported 2026-05-22: buddy added token via Integrations panel, saw
 // status "CONNECTED file", restarted Clementine — bot still showed as
 // offline because DISCORD_BOT_TOKEN was the empty string.
-export const DISCORD_BOT_TOKEN = getEnv('DISCORD_BOT_TOKEN', '') || readSecretFromFileVaultSync('discord_bot_token') || '';
+export const DISCORD_BOT_TOKEN = readSecretFromFileVaultSync('discord_bot_token') || getEnv('DISCORD_BOT_TOKEN', '') || '';
 export const DISCORD_CLIENT_ID = getEnv('DISCORD_CLIENT_ID', '');
 export const DISCORD_REQUIRE_MENTION = getEnv('DISCORD_REQUIRE_MENTION', 'true').toLowerCase() === 'true';
 export const DISCORD_DM_ALLOWED_USERS = getEnv('DISCORD_DM_ALLOWED_USERS', '')
