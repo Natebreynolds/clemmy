@@ -25,6 +25,12 @@ import { getGitHubCliStatus } from '../integrations/github-cli.js';
 import { recallHybrid } from '../memory/recall.js';
 import { FACT_KINDS, forgetFact, listActiveFacts, listAllFacts, rememberFact } from '../memory/facts.js';
 import { openMemoryDb } from '../memory/db.js';
+import {
+  getFocusSnapshot,
+  activateFocus as activateFocusRow,
+  parkFocus as parkFocusRow,
+  clearFocus as clearFocusRow,
+} from '../memory/focus.js';
 import { readMemoryIndexStatus, reindexVault } from '../memory/indexer.js';
 import { IDENTITY_FILE, MEMORY_FILE, SOUL_FILE, VAULT_DIR, WORKFLOWS_DIR, WORKING_MEMORY_FILE } from '../memory/vault.js';
 import { ensureDir, getWorkspaceDirs, listWorkspaceProjects, parseTasks, readBaseEnv, updateEnvKey, GOALS_DIR, TASKS_FILE, WORKFLOW_RUNS_DIR } from '../tools/shared.js';
@@ -3950,10 +3956,71 @@ export function registerConsoleRoutes(
           runtimeAuth,
           credentials: credentialRows,
         },
+        // Current Focus snapshot — the working-memory attention pointer
+        // (separate from goals + facts). Tile + header chip read from
+        // here. Snapshot is cheap (one indexed SQL read).
+        focus: (() => {
+          try {
+            const snap = getFocusSnapshot();
+            return {
+              active: snap.active,
+              parked: snap.parked,
+              parkedCount: snap.parked.length,
+              needsConfirm: snap.needsConfirm,
+            };
+          } catch {
+            return null;
+          }
+        })(),
       });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
+  });
+
+  // Current Focus endpoints — used by the Home tile and the focus
+  // chip in the header to view + manage the active focus.
+  app.get('/api/console/focus', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const snap = getFocusSnapshot();
+      res.json({
+        active: snap.active,
+        parked: snap.parked,
+        needsConfirm: snap.needsConfirm,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/focus/:id/park', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isFinite(id) || id <= 0) { res.status(400).json({ error: 'invalid id' }); return; }
+    const reason = typeof req.body?.reason === 'string' ? req.body.reason : 'paused from dashboard';
+    const row = parkFocusRow(id, reason);
+    if (!row) { res.status(404).json({ error: 'focus not found' }); return; }
+    res.json({ focus: row });
+  });
+
+  app.post('/api/console/focus/:id/activate', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isFinite(id) || id <= 0) { res.status(400).json({ error: 'invalid id' }); return; }
+    const row = activateFocusRow(id);
+    if (!row) { res.status(404).json({ error: 'focus not found or not parked' }); return; }
+    res.json({ focus: row });
+  });
+
+  app.post('/api/console/focus/:id/clear', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isFinite(id) || id <= 0) { res.status(400).json({ error: 'invalid id' }); return; }
+    const resolution = req.body?.resolution === 'abandoned' ? 'abandoned' as const : 'completed' as const;
+    const row = clearFocusRow(id, resolution);
+    if (!row) { res.status(404).json({ error: 'focus not found' }); return; }
+    res.json({ focus: row });
   });
 
   /**

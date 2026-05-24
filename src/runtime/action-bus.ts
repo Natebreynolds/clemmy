@@ -75,6 +75,16 @@ export type ActionEvent =
       kind: 'runtime.completed';
       sessionId: string;
       runId?: string;
+    }
+  | {
+      // Current Focus changed — emitted by src/memory/focus.ts after
+      // any mutation. Discord uses this to update the bot's presence
+      // (Watching "<focus title>"); the dashboard uses it for live
+      // chip refresh without a polling tick.
+      kind: 'focus.changed';
+      reason: 'set' | 'park' | 'activate' | 'clear' | 'touch';
+      activeTitle: string | null;
+      activeId: number | null;
     };
 
 export interface ActionBus {

@@ -2,6 +2,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { registerMemoryTools } from './memory-tools.js';
+import { registerFocusTools } from './focus-tools.js';
 import { registerVaultTools } from './vault-tools.js';
 import { registerPlanTools } from './plan-tools.js';
 import { registerSessionTools } from './session-tools.js';
@@ -27,6 +28,7 @@ import type { PluginTool } from '../plugins/types.js';
 const server = new McpServer({ name: 'clementine-next-tools', version: '0.3.0' });
 
 registerMemoryTools(server);
+registerFocusTools(server);
 registerVaultTools(server);
 registerPlanTools(server);
 registerSessionTools(server);

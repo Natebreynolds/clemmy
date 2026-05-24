@@ -274,6 +274,29 @@ export function renderConsoleHtml(token: string): string {
             </div>
           </header>
 
+          <!--
+            CURRENT FOCUS — hero strip directly below the greeting so
+            "what we're working on" is the first thing you see on Home.
+            Hidden when no active or parked focus. Survives across
+            Discord channels and desktop chat.
+          -->
+          <div class="home-focus-hero" data-home-focus-card hidden>
+            <div class="home-focus-hero-marker">
+              <span class="home-focus-hero-label">CURRENT FOCUS</span>
+              <span class="home-focus-hero-parked" data-home-focus-parked-count></span>
+            </div>
+            <div class="home-focus-hero-body" data-home-focus-active>
+              <div class="home-focus-hero-title" data-home-focus-active-title>—</div>
+              <div class="home-focus-hero-summary" data-home-focus-active-summary>—</div>
+              <div class="home-focus-hero-meta" data-home-focus-active-meta>—</div>
+            </div>
+            <div class="home-focus-hero-actions">
+              <button type="button" data-home-focus-park>PARK</button>
+              <button type="button" data-home-focus-clear>DONE</button>
+            </div>
+            <div class="home-focus-parked" data-home-focus-parked-list></div>
+          </div>
+
           <div class="home-main">
 
             <div class="home-main-left">
@@ -300,6 +323,7 @@ export function renderConsoleHtml(token: string): string {
                   <div class="home-empty">— no active workers yet —</div>
                 </div>
               </div>
+
 
               <!--
                 CLEMENTINE LIVE — its own card on home. Click anywhere
@@ -2814,6 +2838,66 @@ body {
   flex-direction: column;
   overflow: hidden;
 }
+
+/* v0.5.13 — Current Focus hero strip on Home (top of the panel, below
+   greeting). Survives across Discord + desktop. Hidden when no focus. */
+.home-focus-hero {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 18px;
+  padding: 14px 18px;
+  margin-bottom: 4px;
+  border: 1px solid var(--accent);
+  border-left-width: 3px;
+  background: var(--bg-2);
+}
+.home-focus-hero-marker {
+  display: flex; flex-direction: column; gap: 4px;
+  min-width: 110px;
+}
+.home-focus-hero-label {
+  font-size: 9px; letter-spacing: 0.22em; color: var(--accent); font-weight: 600;
+}
+.home-focus-hero-parked { font-size: 10px; color: var(--fg-3); }
+.home-focus-hero-parked:empty { display: none; }
+.home-focus-hero-body { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.home-focus-hero-title {
+  font-size: 16px; font-weight: 500; color: var(--fg-1);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.home-focus-hero-summary {
+  font-size: 12px; color: var(--fg-2); line-height: 1.4;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.home-focus-hero-meta { font-size: 10px; color: var(--fg-3); letter-spacing: 0.04em; }
+.home-focus-hero-meta.needs-confirm { color: var(--accent-warn); }
+.home-focus-hero-actions { display: flex; gap: 6px; }
+.home-focus-hero-actions button {
+  background: transparent; border: 1px solid var(--line);
+  color: var(--fg-3); font-size: 10px; letter-spacing: 0.14em;
+  padding: 5px 12px; cursor: pointer;
+}
+.home-focus-hero-actions button:hover { color: var(--accent); border-color: var(--accent); }
+.home-focus-parked {
+  grid-column: 1 / -1;
+  border-top: 1px dashed var(--line); padding: 10px 0 0;
+  margin-top: 4px;
+  display: flex; flex-direction: column; gap: 6px;
+  font-size: 11px; color: var(--fg-3);
+}
+.home-focus-parked:empty { display: none; }
+.home-focus-parked-row {
+  display: flex; justify-content: space-between; align-items: center; gap: 12px;
+}
+.home-focus-parked-title { color: var(--fg-2); flex: 1; }
+.home-focus-parked-resume {
+  background: transparent; border: 1px solid var(--line);
+  color: var(--fg-3); font-size: 9px; letter-spacing: 0.14em;
+  padding: 2px 8px; cursor: pointer;
+}
+.home-focus-parked-resume:hover { color: var(--accent); border-color: var(--accent); }
 .home-block-head {
   padding: 8px 14px;
   border-bottom: 1px solid var(--line);
@@ -9121,6 +9205,93 @@ const CONSOLE_JS = `
     badge.className = 'nav-badge' + (tone ? ' ' + tone : '');
   }
 
+  // Render the Current Focus hero strip on Home from the command-center
+  // payload. Hidden when no active or parked focus.
+  function renderHomeFocus(focusSnap) {
+    const card = document.querySelector('[data-home-focus-card]');
+    if (!card) return;
+    const active = focusSnap && focusSnap.active;
+    const parked = (focusSnap && focusSnap.parked) || [];
+    const needsConfirm = focusSnap && focusSnap.needsConfirm;
+    if (!active && parked.length === 0) {
+      card.setAttribute('hidden', '');
+      return;
+    }
+    card.removeAttribute('hidden');
+    const parkedCountEl = card.querySelector('[data-home-focus-parked-count]');
+    if (parkedCountEl) parkedCountEl.textContent = parked.length > 0 ? parked.length + ' parked' : '';
+
+    const activeWrap = card.querySelector('[data-home-focus-active]');
+    if (active && activeWrap) {
+      activeWrap.removeAttribute('hidden');
+      const titleEl = card.querySelector('[data-home-focus-active-title]');
+      const summaryEl = card.querySelector('[data-home-focus-active-summary]');
+      const metaEl = card.querySelector('[data-home-focus-active-meta]');
+      if (titleEl) titleEl.textContent = active.title;
+      if (summaryEl) summaryEl.textContent = active.summary;
+      if (metaEl) {
+        const ageMin = Math.round((Date.now() - new Date(active.last_touched_at).getTime()) / 60000);
+        const ageLabel = ageMin < 1 ? 'just now' : ageMin < 60 ? ageMin + 'm ago' : Math.round(ageMin / 60) + 'h ago';
+        metaEl.textContent = active.resource_ref + ' · touched ' + ageLabel;
+        metaEl.classList.toggle('needs-confirm', !!needsConfirm);
+        if (needsConfirm) metaEl.textContent += ' · NEEDS CONFIRM';
+      }
+      const parkBtn = card.querySelector('[data-home-focus-park]');
+      const clearBtn = card.querySelector('[data-home-focus-clear]');
+      if (parkBtn) parkBtn.setAttribute('data-focus-id', String(active.id));
+      if (clearBtn) clearBtn.setAttribute('data-focus-id', String(active.id));
+    } else if (activeWrap) {
+      activeWrap.setAttribute('hidden', '');
+    }
+
+    const parkedList = card.querySelector('[data-home-focus-parked-list]');
+    if (parkedList) {
+      if (parked.length === 0) {
+        parkedList.innerHTML = '';
+      } else {
+        parkedList.innerHTML = parked.map((p) => (
+          '<div class="home-focus-parked-row">'
+          + '  <span class="home-focus-parked-title">' + escMem(p.title) + '</span>'
+          + '  <button type="button" class="home-focus-parked-resume" data-home-focus-resume="' + escMem(String(p.id)) + '">RESUME</button>'
+          + '</div>'
+        )).join('');
+      }
+    }
+
+    // Bind PARK / DONE buttons on the active card
+    const parkBtn = card.querySelector('[data-home-focus-park]');
+    const clearBtn = card.querySelector('[data-home-focus-clear]');
+    if (parkBtn && !parkBtn.dataset.bound) {
+      parkBtn.dataset.bound = '1';
+      parkBtn.addEventListener('click', async () => {
+        const id = parkBtn.getAttribute('data-focus-id'); if (!id) return;
+        await fetch(withToken('/api/console/focus/' + id + '/park'), { method: 'POST' });
+        await refreshHomeCommandCenter();
+      });
+    }
+    if (clearBtn && !clearBtn.dataset.bound) {
+      clearBtn.dataset.bound = '1';
+      clearBtn.addEventListener('click', async () => {
+        const id = clearBtn.getAttribute('data-focus-id'); if (!id) return;
+        await fetch(withToken('/api/console/focus/' + id + '/clear'), {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ resolution: 'completed' }),
+        });
+        await refreshHomeCommandCenter();
+      });
+    }
+    // Per-parked RESUME buttons (re-bound each render since the list is rebuilt)
+    if (parkedList) {
+      parkedList.querySelectorAll('[data-home-focus-resume]').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          const id = btn.getAttribute('data-home-focus-resume'); if (!id) return;
+          await fetch(withToken('/api/console/focus/' + id + '/activate'), { method: 'POST' });
+          await refreshHomeCommandCenter();
+        });
+      });
+    }
+  }
+
   function renderCommandItems(items, emptyText) {
     if (!items || items.length === 0) {
       return '<div class="home-empty">' + escMem(emptyText) + '</div>';
@@ -9588,6 +9759,8 @@ const CONSOLE_JS = `
       setNavBadge('memory', (data.memory?.warnings || []).length || '', 'warn');
       setNavBadge('integrations', data.integrations?.requiredMissing || '', 'warn');
       setNavBadge('settings', (counts.approvals || 0) + (counts.planProposals || 0) + (counts.checkInProposals || 0), 'hot');
+
+      renderHomeFocus(data.focus || null);
     } catch (err) {
       const needsEl = document.querySelector('[data-home-needs-list]');
       if (needsEl) needsEl.innerHTML = '<div class="home-empty">Command center failed: ' + escMem(err.message || err) + '</div>';

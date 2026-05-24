@@ -105,6 +105,25 @@ export interface EpisodicPointerRow {
   created_at: string;
 }
 
+export type FocusStatus = 'active' | 'paused' | 'completed' | 'abandoned';
+
+export interface FocusRow {
+  id: number;
+  resource_ref: string;
+  title: string;
+  summary: string;
+  status: FocusStatus;
+  resource_kind: string | null;
+  related_session_id: string | null;
+  related_goal_id: string | null;
+  created_at: string;
+  last_touched_at: string;
+  confirm_after: string;
+  parked_at: string | null;
+  parked_reason: string | null;
+  metadata_json: string;
+}
+
 let cached: Database.Database | null = null;
 
 function ensureStateDir(): void {
@@ -309,6 +328,42 @@ const MIGRATIONS: { version: number; sql: string }[] = [
 
       CREATE INDEX IF NOT EXISTS idx_facts_derivation_depth
         ON consolidated_facts(derivation_depth, created_at DESC);
+    `,
+  },
+  {
+    // v6 — Current Focus: an attention pointer separate from long-term
+    // goals (vault/goals/*.json) and from atomic facts. Solves the
+    // "every Discord message starts a new session and loses the thread"
+    // problem (2026-05-23). Single-active invariant enforced by a
+    // partial unique index so two parallel writes can't both be active.
+    // Per-user scoping deferred until multi-owner deployments exist;
+    // this Clementine install is single-owner.
+    version: 6,
+    sql: `
+      CREATE TABLE IF NOT EXISTS current_focus (
+        id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+        resource_ref        TEXT NOT NULL,
+        title               TEXT NOT NULL,
+        summary             TEXT NOT NULL,
+        status              TEXT NOT NULL CHECK (status IN ('active','paused','completed','abandoned')),
+        resource_kind       TEXT,
+        related_session_id  TEXT,
+        related_goal_id     TEXT,
+        created_at          TEXT NOT NULL,
+        last_touched_at     TEXT NOT NULL,
+        confirm_after       TEXT NOT NULL,
+        parked_at           TEXT,
+        parked_reason       TEXT,
+        metadata_json       TEXT NOT NULL DEFAULT '{}'
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_focus_status
+        ON current_focus(status, last_touched_at DESC);
+
+      -- DB-level enforcement: at most one row may be status='active'.
+      -- Switching focus must park the current active first.
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_focus_one_active
+        ON current_focus(status) WHERE status = 'active';
     `,
   },
 ];

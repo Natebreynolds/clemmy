@@ -30,6 +30,7 @@ import path from 'node:path';
 import { BASE_DIR } from '../config.js';
 import { loadMemoryContext } from '../memory/vault.js';
 import { renderFactsForInstructions, renderRecentlyLearnedForInstructions } from '../memory/facts.js';
+import { getFocusSnapshot } from '../memory/focus.js';
 import { loadUserProfile, renderProfileForInstructions } from '../runtime/user-profile.js';
 
 const GOALS_DIR = path.join(BASE_DIR, 'goals');
@@ -159,6 +160,35 @@ export function renderHarnessMemoryContext(): string {
   const goals = renderActiveGoals();
   const nowLine = renderCurrentTimeForInstructions();
 
+  // Current Focus block — surfaced in persistent context so the model
+  // has at-a-glance awareness without a focus_get tool call. The
+  // instructions still require focus_get at turn start for the most
+  // current state (the persistent block is rendered once per turn).
+  let focus = '';
+  try {
+    const snap = getFocusSnapshot();
+    if (snap.active) {
+      const confirmHint = snap.needsConfirm
+        ? `\n  ⚠ idle past confirm window — ASK "still on this, or new topic?" before doing unrelated work.`
+        : '';
+      focus = [
+        `ACTIVE focus #${snap.active.id}: ${snap.active.title}`,
+        `Summary: ${snap.active.summary}`,
+        `Resource: ${snap.active.resource_ref}${snap.active.resource_kind ? ` (${snap.active.resource_kind})` : ''}`,
+        `Last touched: ${snap.active.last_touched_at}${confirmHint}`,
+      ].join('\n');
+      if (snap.parked.length > 0) {
+        focus += `\n\nParked (resumable via focus_activate):\n`
+          + snap.parked.slice(0, 5).map((p) => `  - #${p.id} ${p.title}`).join('\n');
+      }
+    } else if (snap.parked.length > 0) {
+      focus = 'No active focus. Parked threads (resumable):\n'
+        + snap.parked.slice(0, 5).map((p) => `  - #${p.id} ${p.title} — ${p.summary}`).join('\n');
+    }
+  } catch {
+    focus = '';
+  }
+
   const blocks = [
     // Current date/time goes FIRST so the model reads it before any
     // other context. Without this the model defaults to its training
@@ -172,6 +202,7 @@ export function renderHarnessMemoryContext(): string {
     section('Core Personality', memContext.soul),
     section('Long-Term Memory', memContext.memory),
     section('Active Goals', goals),
+    section('Current Focus', focus),
   ].filter(Boolean);
 
   if (blocks.length === 0) return '';

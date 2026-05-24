@@ -97,6 +97,18 @@ const NEVER_GATE_LOCAL_MEMORY = new Set<string>([
   'task_update',
   'goal_create',
   'goal_update',
+  // Current focus — local SQLite attention pointer. Pure local writes,
+  // no external surface. Pausing for approval on these would force the
+  // user to confirm every "let's pin this as the current focus" — that's
+  // exactly the friction the focus feature is meant to remove.
+  'focus_get',
+  'focus_set',
+  'focus_touch',
+  'focus_park',
+  'focus_activate',
+  'focus_clear',
+  'focus_list',
+  'focus_inspect',
   // Execution-tracking writes are local state. The Orchestrator was
   // pausing on `execution_update_step` after every tool call, which
   // is friction the user reads as "why does it keep asking?"

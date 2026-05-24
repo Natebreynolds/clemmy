@@ -16,6 +16,7 @@ import { registerDynamicTools } from './dynamic-tools.js';
 import { registerExecutionTools } from './execution-tools.js';
 import { registerGoalTools } from './goal-tools.js';
 import { registerMemoryTools } from './memory-tools.js';
+import { registerFocusTools } from './focus-tools.js';
 import { registerMcpStatusTools } from './mcp-status-tools.js';
 import { registerOrchestrationTools } from './orchestration-tools.js';
 import { registerPlanTools } from './plan-tools.js';
@@ -139,6 +140,7 @@ function captureLocalTools(): CapturedLocalTool[] {
   const server = fakeServer as unknown as McpServer;
 
   registerMemoryTools(server);
+  registerFocusTools(server);
   registerVaultTools(server);
   registerPlanTools(server);
   registerSessionTools(server);

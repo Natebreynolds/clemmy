@@ -45,6 +45,14 @@ import { getOrCreateDiscordSessionId } from './discord-store.js';
 import { claimInbound, completeInbound } from './inbox-store.js';
 import type { ApprovalResolutionResult, PendingApproval, ToolActivity } from '../types.js';
 import { summarizeApprovalAction } from '../runtime/approval-summary.js';
+import { actionBus } from '../runtime/action-bus.js';
+import {
+  getActiveFocus,
+  listParkedFocuses,
+  clearFocus as clearFocusRow,
+  parkFocus as parkFocusRow,
+  activateFocus as activateFocusRow,
+} from '../memory/focus.js';
 import {
   getNotification,
   listNotifications,
@@ -103,6 +111,28 @@ const DISCORD_SLASH_COMMANDS = [
   new SlashCommandBuilder()
     .setName('help')
     .setDescription('Show the available Discord commands.'),
+  new SlashCommandBuilder()
+    .setName('focus')
+    .setDescription('View, switch, or clear Clementine\'s current attention focus.')
+    .addStringOption((option) =>
+      option
+        .setName('action')
+        .setDescription('Subcommand')
+        .setRequired(false)
+        .addChoices(
+          { name: 'view (default) — show active focus', value: 'view' },
+          { name: 'list — show parked focuses', value: 'list' },
+          { name: 'park — pause current active focus', value: 'park' },
+          { name: 'resume — activate a parked focus by id', value: 'resume' },
+          { name: 'clear — mark current active as done', value: 'clear' },
+        ),
+    )
+    .addIntegerOption((option) =>
+      option
+        .setName('id')
+        .setDescription('Focus id (for resume/clear)')
+        .setRequired(false),
+    ),
 ].map((command) => command.toJSON());
 
 let discordClient: Client | null = null;
@@ -1334,6 +1364,78 @@ async function registerSlashCommands(client: Client): Promise<void> {
 }
 
 /**
+ * Update the bot's Discord presence to reflect the current focus.
+ * "Watching <title>" when active, "Listening for messages" when no
+ * focus is pinned. Truncates long titles to fit Discord's 128-char
+ * activity-name limit with safe headroom.
+ */
+function applyFocusPresence(client: Client): void {
+  if (!client.isReady()) return;
+  let active: { title: string } | null = null;
+  try { active = getActiveFocus(); } catch { active = null; }
+  if (active) {
+    const name = active.title.length > 100 ? active.title.slice(0, 97) + '…' : active.title;
+    client.user.setPresence({
+      status: 'online',
+      activities: [{ name, type: ActivityType.Watching }],
+    });
+  } else {
+    client.user.setPresence({
+      status: 'online',
+      activities: [{ name: 'for messages', type: ActivityType.Listening }],
+    });
+  }
+}
+
+/**
+ * Handle /focus <action> [id]. Returns the reply text (always
+ * ephemeral). Read-only and mutation paths both routed through the
+ * focus.ts store, which emits actionBus events so the presence
+ * updater catches the change without an extra call here.
+ */
+async function handleFocusCommand(action: string, id: number | null): Promise<string> {
+  if (action === 'view') {
+    const active = getActiveFocus();
+    if (!active) return 'No active focus. Use `focus_set` (via agent) or pin a doc/sheet/repo to start tracking.';
+    return [
+      `**Active focus #${active.id}: ${active.title}**`,
+      active.summary,
+      `Resource: ${active.resource_ref}`,
+      `Touched: ${active.last_touched_at}`,
+    ].join('\n');
+  }
+  if (action === 'list') {
+    const active = getActiveFocus();
+    const parked = listParkedFocuses(10);
+    if (!active && parked.length === 0) return 'No focuses recorded.';
+    const lines: string[] = [];
+    if (active) lines.push(`★ #${active.id} ${active.title}`);
+    for (const p of parked) lines.push(`· #${p.id} ${p.title} (parked ${p.parked_at})`);
+    return lines.join('\n');
+  }
+  if (action === 'park') {
+    const active = getActiveFocus();
+    if (!active) return 'Nothing active to park.';
+    parkFocusRow(active.id, 'paused via /focus park');
+    return `Parked focus #${active.id}: ${active.title}.`;
+  }
+  if (action === 'resume') {
+    if (!id) return 'Need an id. Use `/focus list` to find one.';
+    const row = activateFocusRow(id);
+    if (!row) return `Focus ${id} not found or not parked.`;
+    return `Resumed focus #${row.id}: ${row.title}.`;
+  }
+  if (action === 'clear') {
+    const targetId = id ?? getActiveFocus()?.id ?? null;
+    if (!targetId) return 'Nothing to clear.';
+    const row = clearFocusRow(targetId, 'completed');
+    if (!row) return `Focus ${targetId} not found.`;
+    return `Cleared focus #${row.id}: ${row.title}.`;
+  }
+  return `Unknown action "${action}".`;
+}
+
+/**
  * Modal submit handler — fires when the user clicks Edit on an
  * approval, modifies the args in the modal, and presses submit.
  * Resolves the approval as approve_with_edits, passing the edited
@@ -1739,10 +1841,19 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction, assi
           '`/status`',
           '`/tasks`',
           '`/runs`',
+          '`/focus action:<view|list|park|resume|clear> id:<n>`',
           '`/help`',
         ].join('\n'),
         ephemeral: true,
       });
+      return;
+    }
+
+    if (interaction.commandName === 'focus') {
+      const action = interaction.options.getString('action', false) || 'view';
+      const id = interaction.options.getInteger('id', false);
+      const reply = await handleFocusCommand(action, id);
+      await interaction.reply({ content: reply, ephemeral: true });
       return;
     }
 
@@ -2260,15 +2371,10 @@ export async function startDiscordBot(assistant: ClementineAssistant): Promise<v
     });
 
     client.on(Events.ClientReady, (readyClient) => {
-      readyClient.user.setPresence({
-        status: 'online',
-        activities: [
-          {
-            name: 'for messages',
-            type: ActivityType.Listening,
-          },
-        ],
-      });
+      // Initial presence — reflects current focus if any, else the
+      // default "listening" state. The actionBus subscription below
+      // keeps it in sync when focus changes.
+      applyFocusPresence(readyClient);
       status = {
         enabled: true,
         connected: true,
@@ -2283,6 +2389,17 @@ export async function startDiscordBot(assistant: ClementineAssistant): Promise<v
         logger.error({ err: error }, 'Failed to register Discord slash commands');
       });
       startDiscordDmPolling(readyClient, assistant);
+
+      // Subscribe to focus changes so the bot's presence reflects the
+      // active attention pointer. "Watching <title>" makes it obvious
+      // from the Discord member list what Clementine is mid-work on,
+      // across all channels and across desktop+Discord.
+      actionBus.subscribe((event) => {
+        if (event.kind !== 'focus.changed') return;
+        try { applyFocusPresence(readyClient); } catch (err) {
+          logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'failed to update Discord presence on focus change');
+        }
+      });
     });
 
     client.on(Events.GuildCreate, (guild) => {
