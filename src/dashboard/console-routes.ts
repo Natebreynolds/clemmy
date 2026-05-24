@@ -30,6 +30,8 @@ import {
   activateFocus as activateFocusRow,
   parkFocus as parkFocusRow,
   clearFocus as clearFocusRow,
+  checkResourceMatchesFocus,
+  extractResourceIdFromApprovalArgs,
 } from '../memory/focus.js';
 import { readMemoryIndexStatus, reindexVault } from '../memory/indexer.js';
 import { IDENTITY_FILE, MEMORY_FILE, SOUL_FILE, VAULT_DIR, WORKFLOWS_DIR, WORKING_MEMORY_FILE } from '../memory/vault.js';
@@ -3522,18 +3524,33 @@ export function registerConsoleRoutes(
       const harnessRows = listPending({ status: 'pending' });
       const runtimeRows = assistant.getRuntime().listPendingApprovals();
 
-      const harnessApprovals = harnessRows.map((r) => ({
-        kind: 'harness' as const,
-        approvalId: r.approvalId,
-        sessionId: r.sessionId,
-        channel: r.channel,
-        channelId: r.channelId,
-        requestedAt: r.requestedAt,
-        expiresAt: r.expiresAt,
-        subject: r.subject,
-        tool: r.tool,
-        args: r.args,
-      }));
+      const harnessApprovals = harnessRows.map((r) => {
+        // Resource-fingerprint check: if the approval's args carry a
+        // resource id (sheet, doc, etc.) and the active focus has a
+        // resource_ref, surface a warning when they DON'T match.
+        // Catches the "agent picked the wrong sheet" failure mode
+        // (sess-mpjbmoez 2026-05-24) at decision time.
+        const resourceId = extractResourceIdFromApprovalArgs(r.args);
+        const fingerprint = checkResourceMatchesFocus(resourceId);
+        return {
+          kind: 'harness' as const,
+          approvalId: r.approvalId,
+          sessionId: r.sessionId,
+          channel: r.channel,
+          channelId: r.channelId,
+          requestedAt: r.requestedAt,
+          expiresAt: r.expiresAt,
+          subject: r.subject,
+          tool: r.tool,
+          args: r.args,
+          resourceFingerprint: fingerprint.result === 'unknown' ? undefined : {
+            result: fingerprint.result,
+            candidateId: resourceId,
+            focusRef: fingerprint.focusRef,
+            focusTitle: fingerprint.focusTitle,
+          },
+        };
+      });
 
       // Runtime approvals (request_approval / gated tool calls) previously
       // showed up in Home → NEEDS YOU but NEVER reached the Approvals

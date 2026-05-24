@@ -262,6 +262,71 @@ export function clearFocus(id: number, resolution: 'completed' | 'abandoned' = '
 }
 
 /**
+ * Compare a candidate resource id (extracted from a tool call's args
+ * — spreadsheet_id, document_id, etc.) against the active focus's
+ * resource_ref. Used by the approval surfaces (Discord card,
+ * dashboard panel) to flag when an agent is about to mutate a
+ * DIFFERENT resource than the one the user has been working on.
+ *
+ * Returns:
+ *   - 'match'    — candidate matches the active focus's resource
+ *   - 'mismatch' — both exist and don't match (the warning case)
+ *   - 'unknown'  — either no candidate or no active focus
+ */
+export type ResourceMatchResult = 'match' | 'mismatch' | 'unknown';
+export function checkResourceMatchesFocus(candidateId: string | null | undefined): {
+  result: ResourceMatchResult;
+  focusRef?: string;
+  focusTitle?: string;
+} {
+  if (!candidateId) return { result: 'unknown' };
+  const active = getActiveFocus();
+  if (!active) return { result: 'unknown' };
+  // Substring match: a focus stored as a URL (https://docs.google.com/.../<id>)
+  // legitimately matches an extracted bare id when that id appears in
+  // the URL. Tighten only if we see false matches in practice.
+  const candidateLower = candidateId.toLowerCase();
+  const refLower = active.resource_ref.toLowerCase();
+  const matched = candidateLower === refLower
+    || refLower.includes(candidateLower)
+    || candidateLower.includes(refLower);
+  return {
+    result: matched ? 'match' : 'mismatch',
+    focusRef: active.resource_ref,
+    focusTitle: active.title,
+  };
+}
+
+/**
+ * Best-effort extraction of a resource id (spreadsheet, document,
+ * etc.) from an approval's args payload. Args may be a string (JSON)
+ * or an object. Returns the first id found, or null.
+ */
+export function extractResourceIdFromApprovalArgs(args: unknown): string | null {
+  if (!args) return null;
+  let text: string;
+  if (typeof args === 'string') {
+    text = args;
+  } else {
+    try { text = JSON.stringify(args); } catch { return null; }
+  }
+  // Inner Composio args often nest as { tool_slug, arguments: "..." }
+  // where arguments is itself JSON. Match on either layer.
+  const patterns = [
+    /"spreadsheet_id"\s*:\s*"([A-Za-z0-9_-]{20,})"/,
+    /"document_id"\s*:\s*"([A-Za-z0-9_-]{20,})"/,
+    /"file_id"\s*:\s*"([A-Za-z0-9_-]{20,})"/,
+    /"repo"\s*:\s*"([A-Za-z0-9_./-]+)"/,
+    /"thread_id"\s*:\s*"([A-Za-z0-9_-]+)"/,
+  ];
+  for (const re of patterns) {
+    const match = text.match(re);
+    if (match && match[1]) return match[1];
+  }
+  return null;
+}
+
+/**
  * One-shot snapshot for the agent's `focus_get` tool. Returns the
  * active focus + a small stack of parked + whether the active is past
  * its confirm window (so the model knows to ask "still on X?").

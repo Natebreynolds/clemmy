@@ -7153,6 +7153,20 @@ body {
 }
 .approval-kind-pill.runtime { color: var(--accent); border-color: var(--accent); }
 .approval-kind-pill.harness { color: var(--fg-3); }
+.approval-card.has-mismatch { border-color: var(--accent-fail); border-width: 2px; }
+.approval-mismatch {
+  background: color-mix(in srgb, var(--accent-fail) 12%, transparent);
+  border-left: 3px solid var(--accent-fail);
+  padding: 10px 12px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--fg-1);
+}
+.approval-mismatch strong { color: var(--accent-fail); letter-spacing: 0.1em; }
+.approval-mismatch code {
+  background: var(--bg-2); padding: 1px 4px; border: 1px solid var(--line);
+  font-size: 10px; word-break: break-all;
+}
 .approval-age.very-stale { color: var(--accent-fail); }
 .approval-meta { font-size: 10px; color: var(--fg-3); letter-spacing: 0.04em; }
 .approval-meta code { background: var(--bg-2); padding: 1px 5px; border: 1px solid var(--line); }
@@ -17484,12 +17498,25 @@ const CONSOLE_JS = `
         const sessionShort = (a.sessionId || '').slice(0, 32);
         const workflow = (a.args && typeof a.args === 'object' && typeof a.args.workflow === 'string') ? a.args.workflow : '';
         const kind = a.kind === 'runtime' ? 'runtime' : 'harness';
+        const fingerprint = a.resourceFingerprint;
+        const mismatchBanner = fingerprint && fingerprint.result === 'mismatch'
+          ? [
+              '  <div class="approval-mismatch">',
+              '    <strong>⚠ RESOURCE MISMATCH</strong> &nbsp;',
+              'this tool would act on <code>' + escMem(String(fingerprint.candidateId || '')) + '</code>',
+              ', but your active focus is <strong>' + escMem(String(fingerprint.focusTitle || '')) + '</strong> ',
+              '(<code>' + escMem(String(fingerprint.focusRef || '')) + '</code>). ',
+              'Verify before approving.',
+              '  </div>',
+            ].join('')
+          : '';
         return [
-          '<div class="approval-card" data-approval-id="' + escMem(a.approvalId || '') + '" data-approval-kind="' + kind + '">',
+          '<div class="approval-card ' + (fingerprint && fingerprint.result === 'mismatch' ? 'has-mismatch' : '') + '" data-approval-id="' + escMem(a.approvalId || '') + '" data-approval-kind="' + kind + '">',
           '  <div class="approval-card-head">',
           '    <div class="approval-subject">' + escMem(a.subject || a.tool || '(no subject)') + '</div>',
           '    <div class="approval-age ' + ageCls + '">' + escMem(ageLabel) + '</div>',
           '  </div>',
+          mismatchBanner,
           '  <div class="approval-meta">tool: <code>' + escMem(a.tool || 'unknown') + '</code>',
           workflow ? ' · workflow: <code>' + escMem(workflow) + '</code>' : '',
           ' · session: <code>' + escMem(sessionShort) + '</code>',

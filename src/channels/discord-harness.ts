@@ -30,7 +30,12 @@ import {
 import { runConversation, runConversationFromResume } from '../runtime/harness/loop.js';
 import { HarnessSession } from '../runtime/harness/session.js';
 import { openEventLog } from '../runtime/harness/eventlog.js';
-import { getActiveFocus as getActiveFocusForPrefix } from '../memory/focus.js';
+import {
+  getActiveFocus as getActiveFocusForPrefix,
+  createFocus as createFocusForPrefix,
+  checkResourceMatchesFocus,
+  extractResourceIdFromApprovalArgs,
+} from '../memory/focus.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { previewToolCall } from '../runtime/approval-summary.js';
 import { buildOrchestratorAgent } from '../agents/orchestrator.js';
@@ -300,9 +305,23 @@ function seedCrossSessionPrefix(newSessionId: string, channelId: string, now: nu
   // session should treat it as authoritative context.
   let focusBlock = '';
   try {
-    const active = getActiveFocusForPrefix();
+    let active = getActiveFocusForPrefix();
+    // Auto-pin a focus when (a) no active focus exists, AND (b) the
+    // prior sessions had a clear "currently working on" resource we
+    // can extract from their tool calls. This is the automation that
+    // prevents the "agent re-discovers and picks the WRONG sheet"
+    // failure mode (sess-mpjbmoez 2026-05-24): without a focus
+    // anchor, memory_recall surfaced a similarly-named workflow
+    // SKILL.md whose sheet_id was different from the one the user
+    // had actually been editing across 5 prior sessions.
+    if (!active) {
+      const autoPinned = autoPinFocusFromPriorSessions(db, inWindow.map((r) => r.id));
+      if (autoPinned) {
+        active = autoPinned;
+      }
+    }
     if (active) {
-      focusBlock = `Active focus (cross-channel): #${active.id} "${active.title}" — ${active.summary}`;
+      focusBlock = `Active focus (cross-channel): #${active.id} "${active.title}" — ${active.summary}\nResource: ${active.resource_ref}`;
     }
   } catch { /* ignore */ }
 
@@ -329,6 +348,101 @@ function seedCrossSessionPrefix(newSessionId: string, channelId: string, now: nu
       ].join('\n'),
     },
   });
+}
+
+/**
+ * Heuristic auto-pin: scan the most recent prior-session events for
+ * a stable resource reference (Google Sheets id, Google Doc id, full
+ * URL). If found, pin it as the active focus so the new session
+ * inherits a hard anchor — the agent's resource-fingerprint check
+ * has something concrete to compare future tool calls against.
+ *
+ * Conservative: only fires when no active focus exists AND the prior
+ * session produced ≥ 2 composio_execute_tool calls against the same
+ * resource (signal that it was real work, not exploratory peeking).
+ * Returns the newly-created focus row, or null when nothing pinnable.
+ */
+function autoPinFocusFromPriorSessions(
+  db: ReturnType<typeof openEventLog>,
+  priorSessionIds: string[],
+): ReturnType<typeof getActiveFocusForPrefix> | null {
+  if (priorSessionIds.length === 0) return null;
+  const counts = new Map<string, { kind: string; count: number; sessionId: string }>();
+
+  for (const sid of priorSessionIds) {
+    const rows = db.prepare(
+      `SELECT data_json FROM events
+         WHERE session_id = ? AND type = 'tool_called'
+         ORDER BY seq DESC LIMIT 30`,
+    ).all(sid) as Array<{ data_json: string }>;
+    for (const row of rows) {
+      try {
+        const data = JSON.parse(row.data_json) as { tool?: string; arguments?: string };
+        if (data.tool !== 'composio_execute_tool' || typeof data.arguments !== 'string') continue;
+        const inner = JSON.parse(data.arguments) as { tool_slug?: string; arguments?: string };
+        const slug = inner.tool_slug ?? '';
+        const argText = typeof inner.arguments === 'string' ? inner.arguments : JSON.stringify(inner.arguments ?? {});
+        // Google Sheets / Docs id pattern: long alphanumeric + dashes/underscores.
+        const sheetMatch = argText.match(/"spreadsheet_id"\s*:\s*"([A-Za-z0-9_-]{20,})"/);
+        const docMatch = argText.match(/"document_id"\s*:\s*"([A-Za-z0-9_-]{20,})"/);
+        const id = sheetMatch?.[1] ?? docMatch?.[1] ?? null;
+        if (!id) continue;
+        const kind = slug.toLowerCase().startsWith('googlesheets') ? 'sheet'
+          : slug.toLowerCase().startsWith('googledocs') ? 'doc'
+          : 'resource';
+        const ref = kind === 'sheet'
+          ? `https://docs.google.com/spreadsheets/d/${id}`
+          : kind === 'doc'
+            ? `https://docs.google.com/document/d/${id}`
+            : id;
+        const existing = counts.get(ref);
+        if (existing) {
+          existing.count += 1;
+        } else {
+          counts.set(ref, { kind, count: 1, sessionId: sid });
+        }
+      } catch { /* skip */ }
+    }
+  }
+
+  // Need at least 2 hits on the same resource for it to count as
+  // "real work" worth auto-pinning. Picks the most-mentioned resource.
+  let best: { ref: string; kind: string; count: number; sessionId: string } | null = null;
+  for (const [ref, info] of counts.entries()) {
+    if (info.count < 2) continue;
+    if (!best || info.count > best.count) best = { ref, ...info };
+  }
+  if (!best) return null;
+
+  // Derive a title from the prior session's session title (which is
+  // the first ~60 chars of the user's first prompt) and a summary
+  // from the prior session's last conversation_completed summary.
+  const sessionRow = db.prepare(
+    `SELECT title FROM sessions WHERE id = ?`,
+  ).get(best.sessionId) as { title?: string } | undefined;
+  const lastSummaryRow = db.prepare(
+    `SELECT data_json FROM events
+       WHERE session_id = ? AND type = 'conversation_completed'
+       ORDER BY seq DESC LIMIT 1`,
+  ).get(best.sessionId) as { data_json?: string } | undefined;
+  let lastSummary = '';
+  try { lastSummary = String(JSON.parse(lastSummaryRow?.data_json ?? '{}')?.summary ?? '').slice(0, 300); } catch { /* ignore */ }
+
+  const title = (sessionRow?.title ?? `Work on ${best.kind}`).slice(0, 100);
+  const summary = lastSummary
+    || `Continuing work on this ${best.kind} from a prior session — auto-pinned because no focus was set.`;
+
+  try {
+    return createFocusForPrefix({
+      resourceRef: best.ref,
+      title: `${title}`,
+      summary,
+      resourceKind: best.kind,
+      relatedSessionId: best.sessionId,
+    });
+  } catch {
+    return null;
+  }
 }
 
 function pullRecentTurnsForSession(db: ReturnType<typeof openEventLog>, sessionId: string, maxTurns: number): PriorTurn[] {
@@ -1725,10 +1839,25 @@ export function applyEventToState(event: EventRow, state: DisplayState): void {
       // the body for clients that ignore components or for users who
       // prefer to type — never required.
       if (approvalId) state.pendingApprovalId = approvalId;
+
+      // Resource-fingerprint warning: if the approval's args mention a
+      // resource id that DOESN'T match the active focus, surface a
+      // visible warning so the user can catch a wrong-sheet mutation
+      // before approving. Catches the failure mode from sess-mpjbmoez
+      // (2026-05-24) where the agent updated the wrong Google Sheet.
+      let mismatchWarning = '';
+      try {
+        const resourceId = extractResourceIdFromApprovalArgs(data.args);
+        const fp = checkResourceMatchesFocus(resourceId);
+        if (fp.result === 'mismatch') {
+          mismatchWarning = `\n\n⚠ **RESOURCE MISMATCH** — this would act on \`${resourceId}\`, but your active focus is **${fp.focusTitle}** (\`${fp.focusRef}\`). Verify before approving.`;
+        }
+      } catch { /* graceful */ }
+
       const replyHint = approvalId
         ? `Tap **Approve** or **Reject** below — or type \`approve ${approvalId}\` / \`reject ${approvalId}\` if you prefer.`
         : 'Tap a button below — or reply **approve** / **reject**.';
-      state.summary = `Approval required: ${subject}\n\n${replyHint}`;
+      state.summary = `Approval required: ${subject}${mismatchWarning}\n\n${replyHint}`;
       state.status = 'approval required';
       state.done = true;
       return;

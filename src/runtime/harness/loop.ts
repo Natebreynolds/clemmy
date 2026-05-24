@@ -983,6 +983,34 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     });
   }
 
+  // Cross-session prefix injection. The seed function in discord-harness
+  // writes a cross_session_prefix event when a fresh session opens with
+  // prior same-channel context. Without injecting it into items here,
+  // the agent only sees it if it explicitly calls session_history —
+  // which it often skips. Prepending as a system message guarantees
+  // the agent reads the continuation context BEFORE deciding what tool
+  // to call. (Observed 2026-05-24 in sess-mpjbmoez: agent skipped
+  // session_history, called memory_recall, picked the wrong sheet.)
+  // Only on the FIRST turn — subsequent turns already have it in
+  // compactedItems via session history replay.
+  if (turn === 1 || compactedItems.length === 0) {
+    try {
+      const prefixEvents = listEvents(options.sessionId, { types: ['cross_session_prefix'] });
+      if (prefixEvents.length > 0) {
+        const prefixText = prefixEvents
+          .map((e) => {
+            const text = (e.data as { text?: unknown })?.text;
+            return typeof text === 'string' ? text : '';
+          })
+          .filter(Boolean)
+          .join('\n\n');
+        if (prefixText) {
+          compactedItems.unshift({ role: 'system', content: prefixText } as AgentInputItem);
+        }
+      }
+    } catch { /* graceful — never block a turn on prefix injection */ }
+  }
+
   const items: AgentInputItem[] = [
     ...compactedItems,
     { role: 'user', content: options.input },
