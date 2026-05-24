@@ -101,7 +101,7 @@ function registerAndEmitApprovals(
     safeAppend({
       sessionId: options.sessionId,
       turn: options.turn,
-      role: 'orchestrator',
+      role: 'Clem',
       type: 'approval_requested',
       data: {
         tool: interruption.toolName,
@@ -475,7 +475,7 @@ async function runConversationCore(
     safeAppend({
       sessionId: options.sessionId,
       turn: turnResult.turn,
-      role: 'orchestrator',
+      role: 'Clem',
       type: 'conversation_step',
       data: {
         step: stepIndex,
@@ -1679,7 +1679,7 @@ async function runConversationFromResumeCore(opts: {
     safeAppend({
       sessionId: opts.sessionId,
       turn: turnResult.turn,
-      role: 'orchestrator',
+      role: 'Clem',
       type: 'conversation_step',
       data: { step: stepIndex, decision: decision ?? null },
     });

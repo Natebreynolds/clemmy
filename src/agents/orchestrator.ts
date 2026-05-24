@@ -4,19 +4,18 @@ import { z } from 'zod';
 import { MODELS } from '../config.js';
 import type { RuntimeContextValue } from '../types.js';
 import { buildPlannerTool } from './planner.js';
-// Phase 3: sub-agents removed from the Orchestrator's surface. The
-// agent is single now — all action tools live directly on it. The
-// buildOrchestratorSubAgentTools / defaultOrchestratorHandoffs helpers
-// are still exported for autonomy-v2 (separate migration).
+// Phase 3 (v0.5.16): single-agent mode — Clem completes the user's
+// request without delegating. The 5 specialized sub-agents (Researcher
+// / Writer / Reviewer / Executor / Deployer) were removed after going
+// dormant under the single-agent prompt.
 //
-// EXCEPTION: the Worker. Worker is a STATELESS leaf agent for
-// parallel fan-out — the Orchestrator calls run_worker(prompt) N
-// times concurrently to process N independent items (50 Salesforce
-// tasks, 10 DataForSEO scrapes, etc.). Each call gets its own
-// isolated SDK context, so N=50 ≠ one balloon context with 50× the
-// tools. The Worker has no approval surface of its own (sticky
-// approvals from the parent cover composio writes); it just does
-// one job and returns.
+// EXCEPTION: the Worker. Worker is a STATELESS leaf agent for parallel
+// fan-out — Clem calls run_worker(prompt) N times concurrently to
+// process N independent items (50 Salesforce tasks, 10 DataForSEO
+// scrapes, etc.). Each call gets its own isolated SDK context, so
+// N=50 ≠ one balloon context with 50× the tools. The Worker has no
+// approval surface of its own (sticky approvals from the parent cover
+// composio writes); it just does one job and returns.
 import { buildWorkerAgent } from './sub-agents.js';
 import { harnessInstructions } from './harness-context.js';
 import { getCoreToolsAsync } from '../tools/registry.js';
@@ -30,24 +29,26 @@ import {
 import { DEFAULT_MAX_TURNS, wrapToolForHarness, type WrappableTool } from '../runtime/harness/brackets.js';
 
 /**
- * Orchestrator — the top of the 0.3 harness.
+ * Clem (display name) — the top of the 0.3 harness. Internally the
+ * Agent name is "Clem"; in logs, transcripts, the Discord bot status,
+ * and the dashboard activity feed everything reads "Clem" instead of
+ * the abstract "Orchestrator" label that was confusing on a
+ * single-agent setup.
  *
- * Plan contract: this agent has ZERO action tools. It physically
- * cannot mutate state. Its tool palette is three "deliberation"
- * tools and the handoff set:
- *
- *   - draft_plan           — Planner.asTool, returns a structured Plan
- *   - request_approval     — SDK needsApproval interrupt; the harness
- *                            pauses, persists state, resolves via UI,
- *                            and resumes the run
- *   - ask_user_question    — records an awaiting_user_input event;
- *                            the next turn carries the user's reply
- *   - handoffs to {Researcher, Writer, Reviewer, Executor, Deployer}
+ * Plan contract: this is now a SINGLE agent (Phase 3, v0.5.16). All
+ * action tools live directly on the orchestrator surface — no
+ * delegation, no handoffs. The five specialized sub-agents
+ * (Researcher / Writer / Reviewer / Executor / Deployer) were removed
+ * after going dormant under the single-agent prompt. Worker survives
+ * as a parallel-fan-out leaf invoked via `run_worker(prompt)` for
+ * N-independent-items work.
  *
  * outputType is structured (OrchestratorDecisionSchema) so the loop
  * can reason over `done` / `nextAction` without parsing free text.
- * Per the SDK, structured output disables parallel_tool_calls on
- * this agent — sub-agents stay free-form so they retain it.
+ * Per the SDK, structured output disables parallel_tool_calls on this
+ * agent — Worker fan-out happens via parallel tool calls to
+ * run_worker, which IS parallelizable because run_worker is a tool,
+ * not a handoff.
  *
  * Input + output guardrails come from the harness registry so the
  * SDK enforces policy_violation / missing_capability before any
@@ -179,7 +180,7 @@ export function buildAskUserQuestionTool() {
         appendEvent({
           sessionId,
           turn: extractTurn(runContext),
-          role: 'orchestrator',
+          role: 'Clem',
           type: 'awaiting_user_input',
           data: {
             question: args.question,
@@ -429,7 +430,7 @@ export async function buildOrchestratorAgent(): Promise<
   });
 
   return new Agent<RuntimeContextValue, typeof OrchestratorDecisionSchema>({
-    name: 'Orchestrator',
+    name: 'Clem',
     handoffDescription:
       'Routes work. Plans, decides, and hands off to sub-agents. Cannot mutate state directly.',
     // Function form so the SDK re-renders persistent memory context

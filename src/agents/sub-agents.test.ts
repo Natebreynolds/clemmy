@@ -1,23 +1,19 @@
 /**
  * Run: npx tsx --test src/agents/sub-agents.test.ts
+ *
+ * Phase 3 (v0.5.16) — the 5 specialized sub-agents (Researcher /
+ * Writer / Reviewer / Executor / Deployer) were removed after going
+ * dormant under the single-agent prompt. These tests cover what
+ * survives: Worker (parallel-fan-out leaf), defaultOrchestratorHandoffs
+ * (now empty), isOrchestratorSlug (slug discriminator for autonomy-v2).
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  SUB_AGENT_TOOL_ALLOWLISTS,
-  buildDeployerAgent,
-  buildExecutorAgent,
-  buildResearcherAgent,
-  buildReviewerAgent,
-  buildWriterAgent,
+  buildWorkerAgent,
   defaultOrchestratorHandoffs,
   isOrchestratorSlug,
 } from './sub-agents.js';
-
-function handoffDisplayName(entry: unknown): string | undefined {
-  const ref = entry as { name?: string; agentName?: string };
-  return ref.name ?? ref.agentName;
-}
 
 test('isOrchestratorSlug: clementine is the default orchestrator', () => {
   assert.equal(isOrchestratorSlug('clementine'), true);
@@ -42,127 +38,27 @@ test('isOrchestratorSlug: env var opts other slugs in', () => {
   }
 });
 
-test('researcher allowlist is read-only (no writes to user state)', () => {
-  const writeShaped = ['write_file', 'run_shell_command', 'task_add', 'task_update', 'goal_update', 'execution_update_step', 'execution_complete', 'memory_remember', 'memory_forget', 'composio_execute_tool'];
-  for (const name of writeShaped) {
-    assert.equal(SUB_AGENT_TOOL_ALLOWLISTS.researcher.has(name), false, `researcher should NOT have ${name}`);
-  }
-});
-
-test('researcher allowlist includes the core read tools', () => {
-  const required = ['memory_recall', 'memory_read', 'read_file', 'list_files', 'workspace_info', 'git_status', 'skill_list', 'skill_read'];
-  for (const name of required) {
-    assert.equal(SUB_AGENT_TOOL_ALLOWLISTS.researcher.has(name), true, `researcher should have ${name}`);
-  }
-});
-
-test('executor allowlist includes the core write tools', () => {
-  const required = ['task_add', 'execution_update_step', 'execution_complete', 'write_file', 'goal_update', 'notify_user', 'memory_remember', 'workspace_config', 'skill_list', 'skill_read'];
-  for (const name of required) {
-    assert.equal(SUB_AGENT_TOOL_ALLOWLISTS.executor.has(name), true, `executor should have ${name}`);
-  }
-});
-
-test('executor can ask the user when stuck (ask_user_question)', () => {
-  assert.equal(SUB_AGENT_TOOL_ALLOWLISTS.executor.has('ask_user_question'), true);
-});
-
-test('writer can draft files but cannot execute external delivery', () => {
-  assert.equal(SUB_AGENT_TOOL_ALLOWLISTS.writer.has('write_file'), true);
-  assert.equal(SUB_AGENT_TOOL_ALLOWLISTS.writer.has('skill_list'), true);
-  assert.equal(SUB_AGENT_TOOL_ALLOWLISTS.writer.has('skill_read'), true);
-  assert.equal(SUB_AGENT_TOOL_ALLOWLISTS.writer.has('composio_execute_tool'), false);
-  assert.equal(SUB_AGENT_TOOL_ALLOWLISTS.writer.has('run_shell_command'), false);
-});
-
-test('reviewer is read-only', () => {
-  for (const name of ['write_file', 'run_shell_command', 'task_add', 'goal_update', 'execution_update_step', 'composio_execute_tool']) {
-    assert.equal(SUB_AGENT_TOOL_ALLOWLISTS.reviewer.has(name), false, `reviewer should NOT have ${name}`);
-  }
-  assert.equal(SUB_AGENT_TOOL_ALLOWLISTS.reviewer.has('read_file'), true);
-  assert.equal(SUB_AGENT_TOOL_ALLOWLISTS.reviewer.has('agent_runs_recent'), true);
-  assert.equal(SUB_AGENT_TOOL_ALLOWLISTS.reviewer.has('skill_read'), true);
-});
-
-test('deployer has release tools and can ask for missing info', () => {
-  for (const name of ['run_shell_command', 'git_status', 'execution_update_step', 'execution_complete', 'ask_user_question', 'skill_read']) {
-    assert.equal(SUB_AGENT_TOOL_ALLOWLISTS.deployer.has(name), true, `deployer should have ${name}`);
-  }
-});
-
-test('researcher CANNOT ask user questions (it gathers, the orchestrator decides)', () => {
-  assert.equal(SUB_AGENT_TOOL_ALLOWLISTS.researcher.has('ask_user_question'), false);
-});
-
-test('buildResearcherAgent returns a configured Agent with handoffDescription', async () => {
-  const agent = await buildResearcherAgent();
-  assert.equal(agent.name, 'Researcher');
-  assert.ok(agent.handoffDescription, 'handoffDescription required so orchestrator knows when to delegate');
-  assert.match(agent.handoffDescription, /information|gather|read/i);
-});
-
-test('buildExecutorAgent returns a configured Agent with handoffDescription', async () => {
-  const agent = await buildExecutorAgent();
-  assert.equal(agent.name, 'Executor');
-  assert.ok(agent.handoffDescription);
-  assert.match(agent.handoffDescription, /work|decision|perform/i);
-});
-
-test('build specialized agents return configured Agents with handoffDescription', async () => {
-  for (const agent of await Promise.all([buildWriterAgent(), buildReviewerAgent(), buildDeployerAgent()])) {
-    assert.ok(agent.name);
-    assert.ok(agent.handoffDescription);
-  }
-});
-
-test('defaultOrchestratorHandoffs returns the specialized sub-agent set', async () => {
+test('defaultOrchestratorHandoffs returns empty (single-agent mode)', async () => {
   const handoffs = await defaultOrchestratorHandoffs();
-  assert.equal(handoffs.length, 5);
-  const names = handoffs.map(handoffDisplayName);
-  assert.ok(names.includes('Researcher'));
-  assert.ok(names.includes('Writer'));
-  assert.ok(names.includes('Reviewer'));
-  assert.ok(names.includes('Executor'));
-  assert.ok(names.includes('Deployer'));
+  assert.equal(handoffs.length, 0);
 });
 
-test('execution handoffs are gated by default and ungated by option', async () => {
-  // Both gated and ungated Executor handoffs are now always wrapped
-  // in handoff(...) so they can carry the ExecutorHandoffInput Zod
-  // schema. The difference is behavioral, not structural:
-  //   gated   → isEnabled callback returns false unless a tracked
-  //             execution is active in the session.
-  //   ungated → isEnabled is either absent OR returns true.
-  // Assert behavior, not property identity.
-  type EnabledFn = (opts: { runContext: { context: Record<string, unknown> } }) => boolean | Promise<boolean>;
-  type HandoffWithEnabled = { isEnabled?: EnabledFn };
-  const gated = await defaultOrchestratorHandoffs();
-  const gatedExecutor = gated.find((entry) => handoffDisplayName(entry) === 'Executor') as HandoffWithEnabled | undefined;
-  assert.equal(typeof gatedExecutor?.isEnabled, 'function');
-  const gatedResult = await gatedExecutor?.isEnabled?.({ runContext: { context: {} } });
-  assert.equal(gatedResult, false, 'gated executor handoff is disabled without a tracked execution');
-
-  const ungated = await defaultOrchestratorHandoffs({ requireWorkflowApprovalForExecution: false });
-  const ungatedExecutor = ungated.find((entry) => handoffDisplayName(entry) === 'Executor') as HandoffWithEnabled | undefined;
-  const ungatedResult = await ungatedExecutor?.isEnabled?.({ runContext: { context: {} } });
-  assert.ok(
-    ungatedResult === undefined || ungatedResult === true,
-    `ungated executor handoff should be reachable, got ${String(ungatedResult)}`,
-  );
+test('defaultOrchestratorHandoffs accepts the legacy options arg without throwing', async () => {
+  // openai runtime still passes { requireWorkflowApprovalForExecution: true }
+  // — the option is now a no-op but the signature must stay backward-compat.
+  const handoffs = await defaultOrchestratorHandoffs({ requireWorkflowApprovalForExecution: true });
+  assert.equal(handoffs.length, 0);
 });
 
-test('sub-agents do NOT have their own handoffs (they are leaves)', async () => {
-  const agents = await Promise.all([
-    buildResearcherAgent(),
-    buildWriterAgent(),
-    buildReviewerAgent(),
-    buildExecutorAgent(),
-    buildDeployerAgent(),
-  ]);
-  // SDK exposes handoffs on Agent; sub-agents leave it undefined / empty.
-  // We tolerate either undefined or empty array depending on SDK defaults.
-  for (const agent of agents) {
-    const handoffs = (agent as unknown as { handoffs?: unknown[] }).handoffs;
-    assert.ok(!handoffs || (Array.isArray(handoffs) && handoffs.length === 0), `${agent.name} should be a leaf`);
-  }
+test('buildWorkerAgent returns a configured stateless leaf', async () => {
+  const worker = await buildWorkerAgent();
+  assert.equal(worker.name, 'Worker');
+  assert.ok(worker.handoffDescription);
+  assert.match(worker.handoffDescription, /worker|fan-out|parallel/i);
+});
+
+test('Worker is a LEAF (has no handoffs of its own)', async () => {
+  const worker = await buildWorkerAgent();
+  const handoffs = (worker as unknown as { handoffs?: unknown[] }).handoffs;
+  assert.ok(!handoffs || (Array.isArray(handoffs) && handoffs.length === 0), 'Worker should be a leaf');
 });
