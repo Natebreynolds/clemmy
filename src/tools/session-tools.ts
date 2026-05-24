@@ -6,6 +6,7 @@ import { ExecutionStore } from '../execution/store.js';
 import { loadSessionBrief, listSessionBriefs, refreshSessionBrief, renderSessionResume, saveSessionManualHandoff } from '../memory/session-briefs.js';
 import { PlanStore } from '../planning/plan-store.js';
 import { GOALS_DIR, INBOX_DIR, TASKS_FILE, ensureDir, parseTasks, sessions, textResult } from './shared.js';
+import { listEvents as listHarnessEvents } from '../runtime/harness/eventlog.js';
 
 interface GoalRecord {
   id: string;
@@ -186,14 +187,34 @@ function renderDiscoveredWork(items: DiscoveredWorkItem[], limit: number): strin
 export function registerSessionTools(server: McpServer): void {
   server.tool(
     'session_history',
-    'Read recent conversation history for a session.',
+    'Read recent conversation history for a session. Falls back to harness cross-session-prefix events when the v0.2 transcript store is empty for the given session (Discord sessions live in the harness eventlog, not the v0.2 sessions store).',
     {
       session_id: z.string().min(1),
       max_turns: z.number().int().min(1).max(40).optional(),
     },
     async ({ session_id, max_turns }) => {
       const transcript = sessions.recentTranscript(session_id, max_turns ?? 12);
-      return textResult(transcript || 'No history yet for that session.');
+      if (transcript) return textResult(transcript);
+
+      // Fallback: harness sessions (Discord, workflow chat) record their
+      // transcript via the harness eventlog, not the v0.2 sessions store.
+      // Pull the cross_session_prefix + recent user_input/agent reply
+      // events so the agent sees the back-reference instead of "no
+      // history" on turn 1 of a freshly-created Discord session.
+      // (Fix shipped 2026-05-24 after the "Yep, let's do the first 10"
+      // incident — see [[project_session_status_semantics]].)
+      try {
+        const prefixEvents = listHarnessEvents(session_id, { types: ['cross_session_prefix'] });
+        if (prefixEvents.length > 0) {
+          const lines = prefixEvents.map((e) => {
+            const text = (e.data as { text?: unknown })?.text;
+            return typeof text === 'string' ? text : '';
+          }).filter(Boolean);
+          if (lines.length > 0) return textResult(lines.join('\n\n'));
+        }
+      } catch { /* ignore — graceful degradation */ }
+
+      return textResult('No history yet for that session.');
     },
   );
 

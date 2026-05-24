@@ -73,6 +73,13 @@ export const EVENT_TYPES = [
   // captureInteractionSignals. Lets the trace show "Clementine learned
   // X from this turn" so memory growth is observable.
   'memory_signals_captured',
+  // Cross-session prefix: when a new Discord (or other channel) session
+  // opens within the continuity window of a prior same-channel session,
+  // the harness prepends ONE event of this type carrying the prior
+  // session's last user message + agent reply. session_history then
+  // returns this context so back-references like "first 10 please"
+  // can be interpreted. Added 2026-05-24.
+  'cross_session_prefix',
 ] as const;
 export type EventType = (typeof EVENT_TYPES)[number];
 const EVENT_TYPE_SET: ReadonlySet<string> = new Set(EVENT_TYPES);

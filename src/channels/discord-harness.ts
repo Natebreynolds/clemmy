@@ -30,6 +30,7 @@ import {
 import { runConversation, runConversationFromResume } from '../runtime/harness/loop.js';
 import { HarnessSession } from '../runtime/harness/session.js';
 import { openEventLog } from '../runtime/harness/eventlog.js';
+import { getActiveFocus as getActiveFocusForPrefix } from '../memory/focus.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { previewToolCall } from '../runtime/approval-summary.js';
 import { buildOrchestratorAgent } from '../agents/orchestrator.js';
@@ -166,11 +167,18 @@ function getOrHydrateChannelSession(channelId: string): ChannelSessionEntry | nu
  * grafting. Prevents the failure mode where a 6-hour-old paused
  * session captures unrelated chat as a "continuation."
  *
- * 5 min is short enough to keep continuation feeling fluid in an
- * active conversation, long enough that a brief context switch
- * doesn't lose state.
+ * Bumped 5 min → 30 min on 2026-05-24. The 5-minute default was set
+ * for workflow-approval-era usage. Real chat conversations routinely
+ * gap 5-15 minutes (bathroom, quick call, reading a long agent
+ * reply). A 5:31-second gap fragmented one coherent "score the leads
+ * via firecrawl to fill the Keep/Drop dropdowns" thread into 5
+ * separate harness sessions, with the last message ("first 10 please")
+ * arriving in a fresh session that had no idea what "first 10" meant.
+ * 30 min is wide enough to absorb normal interruptions, tight enough
+ * that "this morning's conversation" doesn't bleed into "this evening's
+ * unrelated topic."
  */
-const STALE_SESSION_MS = 5 * 60 * 1000;
+const STALE_SESSION_MS = 30 * 60 * 1000;
 
 function resolveOrCreateSession(opts: {
   channelId: string;
@@ -210,7 +218,148 @@ function resolveOrCreateSession(opts: {
     },
   });
   channelSessions.set(opts.channelId, { sessionId: session.id, lastUsedAt: now });
+
+  // Cross-session prefix: a fresh session created within the
+  // CROSS_SESSION_PREFIX_WINDOW of a prior same-channel session gets
+  // a synthetic system event prepended with the prior session's last
+  // user message + agent reply. Without this, session_history returns
+  // empty on turn 1 of the new session and the agent can't interpret
+  // back-references like "first 10 please" against the prior plan.
+  // (Observed 2026-05-24: 5:31s gap fragmented one coherent scoring
+  // conversation; the new session asked for clarification on something
+  // the prior session had already specified — 25/batch via firecrawl.)
+  try {
+    seedCrossSessionPrefix(session.id, opts.channelId, now);
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : String(err), channelId: opts.channelId }, 'cross-session prefix seed failed (non-fatal)');
+  }
+
   return { id: session.id, isContinuation: false };
+}
+
+const CROSS_SESSION_PREFIX_WINDOW_MS = 2 * 60 * 60 * 1000; // 2 hours
+
+// Generous lookback so multi-turn back-references ("first 10 please" →
+// referring to a 25/batch decision made 2 turns ago) carry across the
+// session boundary. The user's principle: missing context is fatal,
+// extra context is fine. Pulls from the most recent N prior sessions
+// (not just the immediately previous one) so a workflow that spanned
+// e.g. five 5-minute sessions still surfaces its full arc.
+const PREFIX_LOOKBACK_SESSIONS = 4;
+const PREFIX_MAX_TURNS_PER_SESSION = 6;
+
+interface PriorTurn { who: 'user' | 'assistant'; text: string; at: string }
+
+function seedCrossSessionPrefix(newSessionId: string, channelId: string, now: number): void {
+  const db = openEventLog();
+  // Find the most recent N prior sessions for this channel (exclude
+  // the newly-created one). We walk multiple sessions because the
+  // arc may have been fragmented across several short sessions
+  // before STALE_SESSION_MS got bumped — and a "first 10" back-ref
+  // can land 30+ minutes after the planning turn it points to.
+  const priorRows = db.prepare(
+    `SELECT id, updated_at FROM sessions
+       WHERE channel = 'discord'
+         AND id != ?
+         AND json_extract(metadata_json, '$.channelId') = ?
+       ORDER BY updated_at DESC
+       LIMIT ?`,
+  ).all(newSessionId, channelId, PREFIX_LOOKBACK_SESSIONS) as Array<{ id: string; updated_at: string }>;
+  if (priorRows.length === 0) return;
+
+  // Filter to those still inside the prefix window.
+  const inWindow = priorRows.filter((r) => {
+    const ms = Date.parse(r.updated_at);
+    return Number.isFinite(ms) && now - ms <= CROSS_SESSION_PREFIX_WINDOW_MS;
+  });
+  if (inWindow.length === 0) return;
+
+  // Pull recent turns from each in-window session, oldest sessions
+  // first so the resulting text reads chronologically.
+  const sectionBlocks: string[] = [];
+  let totalChars = 0;
+  const MAX_TOTAL_CHARS = 8_000; // generous, but bounded
+  for (const session of inWindow.slice().reverse()) {
+    const turns = pullRecentTurnsForSession(db, session.id, PREFIX_MAX_TURNS_PER_SESSION);
+    if (turns.length === 0) continue;
+    const elapsedMin = Math.round((now - Date.parse(session.updated_at)) / 60_000);
+    const lines = [`--- Prior session ${session.id} (ended ~${elapsedMin} min ago) ---`];
+    for (const turn of turns) {
+      const label = turn.who === 'user' ? 'USER' : 'YOU';
+      const trimmed = turn.text.length > 800 ? turn.text.slice(0, 800) + '…' : turn.text;
+      lines.push(`  ${label}: ${trimmed}`);
+    }
+    const block = lines.join('\n');
+    if (totalChars + block.length > MAX_TOTAL_CHARS) break;
+    sectionBlocks.push(block);
+    totalChars += block.length;
+  }
+  if (sectionBlocks.length === 0) return;
+
+  // Surface active focus state too — if a focus is pinned, the new
+  // session should treat it as authoritative context.
+  let focusBlock = '';
+  try {
+    const active = getActiveFocusForPrefix();
+    if (active) {
+      focusBlock = `Active focus (cross-channel): #${active.id} "${active.title}" — ${active.summary}`;
+    }
+  } catch { /* ignore */ }
+
+  const headerLines = [
+    '[CONTINUATION CONTEXT — the user\'s message in this fresh session likely refers back to the recent conversation thread below. Treat this as authoritative context; do NOT ask the user to repeat decisions already made.]',
+  ];
+  if (focusBlock) headerLines.push('', focusBlock);
+
+  appendHarnessEvent({
+    sessionId: newSessionId,
+    turn: 0,
+    role: 'system',
+    type: 'cross_session_prefix',
+    data: {
+      priorSessionIds: inWindow.map((r) => r.id),
+      sessionsIncluded: sectionBlocks.length,
+      totalChars,
+      text: [
+        ...headerLines,
+        '',
+        ...sectionBlocks,
+        '',
+        '[End of continuation context. The user\'s next message follows.]',
+      ].join('\n'),
+    },
+  });
+}
+
+function pullRecentTurnsForSession(db: ReturnType<typeof openEventLog>, sessionId: string, maxTurns: number): PriorTurn[] {
+  // Read the last 2*maxTurns events (user inputs + agent completions)
+  // so we have headroom to filter and reorder chronologically.
+  const rows = db.prepare(
+    `SELECT type, data_json, created_at FROM events
+       WHERE session_id = ?
+         AND type IN ('user_input_received', 'conversation_completed')
+       ORDER BY seq DESC
+       LIMIT ?`,
+  ).all(sessionId, maxTurns * 2) as Array<{ type: string; data_json: string; created_at: string }>;
+  const turns: PriorTurn[] = [];
+  for (const row of rows) {
+    try {
+      const data = JSON.parse(row.data_json) as { text?: string; summary?: string; reply?: string };
+      if (row.type === 'user_input_received' && typeof data.text === 'string') {
+        turns.push({ who: 'user', text: data.text, at: row.created_at });
+      } else if (row.type === 'conversation_completed') {
+        // Prefer the user-facing summary (already trimmed); fall back
+        // to the reply field if summary is missing.
+        const text = typeof data.summary === 'string' && data.summary
+          ? data.summary
+          : (typeof data.reply === 'string' ? data.reply : '');
+        if (text) turns.push({ who: 'assistant', text, at: row.created_at });
+      }
+    } catch { /* skip malformed rows */ }
+  }
+  // Newest last (chronological); cap to maxTurns of each kind.
+  turns.reverse();
+  return turns.slice(-maxTurns * 2);
 }
 
 /** Exposed for tests / a future /new command — drop the channel's session. */

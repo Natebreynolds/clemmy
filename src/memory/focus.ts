@@ -174,6 +174,40 @@ export function listParkedFocuses(limit = 5): FocusRow[] {
   `).all(limit) as FocusRow[];
 }
 
+/**
+ * Evolve an existing focus IN PLACE — same id, same active status,
+ * but with updated title/summary/resource_kind. Use this when the
+ * plan develops within a single focus (e.g. "Q2 sheet · dropdowns"
+ * → "Q2 sheet · scoring 10/25 leads via firecrawl"). Distinct from
+ * createFocus, which parks the prior and starts a new id.
+ *
+ * Bumps last_touched_at + confirm_after as a side effect so an
+ * evolving focus stays warm.
+ */
+export interface UpdateFocusInput {
+  title?: string;
+  summary?: string;
+  resourceKind?: string;
+}
+export function updateFocus(id: number, patch: UpdateFocusInput): FocusRow | null {
+  const db = openMemoryDb();
+  const existing = getFocusById(id);
+  if (!existing) return null;
+  if (existing.status !== 'active' && existing.status !== 'paused') return null;
+  const now = nowIso();
+  const newTitle = (patch.title ?? '').trim() || existing.title;
+  const newSummary = (patch.summary ?? '').trim() || existing.summary;
+  const newKind = patch.resourceKind === undefined ? existing.resource_kind : (patch.resourceKind || null);
+  const info = db.prepare(`
+    UPDATE current_focus
+    SET title=?, summary=?, resource_kind=?,
+        last_touched_at=?, confirm_after=?
+    WHERE id=?
+  `).run(newTitle, newSummary, newKind, now, confirmAfterFromNow(), id);
+  if (info.changes > 0) emitChange('set');
+  return getFocusById(id);
+}
+
 export function touchFocus(id: number): FocusRow | null {
   const db = openMemoryDb();
   const now = nowIso();

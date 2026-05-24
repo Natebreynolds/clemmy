@@ -103,6 +103,7 @@ const NEVER_GATE_LOCAL_MEMORY = new Set<string>([
   // exactly the friction the focus feature is meant to remove.
   'focus_get',
   'focus_set',
+  'focus_update',
   'focus_touch',
   'focus_park',
   'focus_activate',

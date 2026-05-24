@@ -86,6 +86,27 @@ export function renderConsoleHtml(token: string): string {
           <span class="pulse" aria-hidden="true"></span>
           <span data-conn-label>ONLINE</span>
         </span>
+        <!--
+          CURRENT FOCUS chip — persistent across all panels. Shows the
+          active attention pointer's title; click to open a popover
+          with summary + park/done actions. Hidden when no focus.
+          See src/memory/focus.ts.
+        -->
+        <span class="stat stat-focus" data-stat-focus hidden>
+          <span class="stat-focus-label">FOCUS</span>
+          <span class="stat-focus-title" data-stat-focus-title>—</span>
+          <button type="button" class="stat-focus-clear" data-stat-focus-clear title="Clear focus">×</button>
+          <div class="stat-focus-popover" data-stat-focus-popover hidden>
+            <div class="stat-focus-popover-title" data-stat-focus-popover-title>—</div>
+            <div class="stat-focus-popover-summary" data-stat-focus-popover-summary>—</div>
+            <div class="stat-focus-popover-meta" data-stat-focus-popover-meta>—</div>
+            <div class="stat-focus-popover-actions">
+              <button type="button" data-stat-focus-park>PARK</button>
+              <button type="button" data-stat-focus-clear-popover>DONE</button>
+            </div>
+            <div class="stat-focus-popover-parked" data-stat-focus-popover-parked></div>
+          </div>
+        </span>
         <button class="theme-toggle" data-theme-toggle aria-label="Toggle light/dark mode" title="Toggle light/dark">
           <span class="theme-toggle-icon" data-theme-icon>◐</span>
         </button>
@@ -273,29 +294,6 @@ export function renderConsoleHtml(token: string): string {
               <span data-home-away-message>Reading the room…</span>
             </div>
           </header>
-
-          <!--
-            CURRENT FOCUS — hero strip directly below the greeting so
-            "what we're working on" is the first thing you see on Home.
-            Hidden when no active or parked focus. Survives across
-            Discord channels and desktop chat.
-          -->
-          <div class="home-focus-hero" data-home-focus-card hidden>
-            <div class="home-focus-hero-marker">
-              <span class="home-focus-hero-label">CURRENT FOCUS</span>
-              <span class="home-focus-hero-parked" data-home-focus-parked-count></span>
-            </div>
-            <div class="home-focus-hero-body" data-home-focus-active>
-              <div class="home-focus-hero-title" data-home-focus-active-title>—</div>
-              <div class="home-focus-hero-summary" data-home-focus-active-summary>—</div>
-              <div class="home-focus-hero-meta" data-home-focus-active-meta>—</div>
-            </div>
-            <div class="home-focus-hero-actions">
-              <button type="button" data-home-focus-park>PARK</button>
-              <button type="button" data-home-focus-clear>DONE</button>
-            </div>
-            <div class="home-focus-parked" data-home-focus-parked-list></div>
-          </div>
 
           <div class="home-main">
 
@@ -2455,7 +2453,10 @@ body {
 .home-greet-strip {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  /* flex-start (was space-between) so the right-side status sits next
+     to the greeting instead of being pushed to the far edge — that
+     gap left a huge empty middle on wide windows. */
+  justify-content: flex-start;
   gap: 18px;
   padding: 10px 14px;
   border: 1px solid var(--line);
@@ -2491,9 +2492,14 @@ body {
   display: flex;
   align-items: center;
   gap: 7px;
-  color: var(--fg);
+  color: var(--fg-3);
   font-size: 11px;
-  letter-spacing: 0.06em;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  /* Tight, short status only — long narration like the agent's last
+     reply belongs in the WORKING NOW card, not the header strip.
+     refreshHomeCommandCenter trims awayMessage to presence.label for
+     the header surface (see [data-home-away-message] update). */
   flex: 0 0 auto;
 }
 .presence-dot {
@@ -2839,65 +2845,65 @@ body {
   overflow: hidden;
 }
 
-/* v0.5.13 — Current Focus hero strip on Home (top of the panel, below
-   greeting). Survives across Discord + desktop. Hidden when no focus. */
-.home-focus-hero {
-  display: grid;
-  grid-template-columns: auto 1fr auto;
-  align-items: center;
-  gap: 18px;
-  padding: 14px 18px;
-  margin-bottom: 4px;
+/* v0.5.14 — Current Focus chip in the global status bar. Persistent
+   across every panel; hidden when no focus is active. Click the title
+   to open a small popover with summary + actions; the × clears. */
+.stat-focus {
+  display: inline-flex; align-items: center; gap: 6px;
   border: 1px solid var(--accent);
-  border-left-width: 3px;
   background: var(--bg-2);
+  padding: 0 4px 0 8px;
+  font-size: 10px; letter-spacing: 0.14em;
+  cursor: pointer; position: relative;
 }
-.home-focus-hero-marker {
-  display: flex; flex-direction: column; gap: 4px;
-  min-width: 110px;
-}
-.home-focus-hero-label {
-  font-size: 9px; letter-spacing: 0.22em; color: var(--accent); font-weight: 600;
-}
-.home-focus-hero-parked { font-size: 10px; color: var(--fg-3); }
-.home-focus-hero-parked:empty { display: none; }
-.home-focus-hero-body { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
-.home-focus-hero-title {
-  font-size: 16px; font-weight: 500; color: var(--fg-1);
+.stat-focus-label { color: var(--accent); font-weight: 600; }
+.stat-focus-title {
+  color: var(--fg-1); letter-spacing: 0;
+  max-width: 200px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.home-focus-hero-summary {
-  font-size: 12px; color: var(--fg-2); line-height: 1.4;
-  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
-  overflow: hidden;
+.stat-focus.needs-confirm { border-color: var(--accent-warn); }
+.stat-focus.needs-confirm .stat-focus-label { color: var(--accent-warn); }
+.stat-focus-clear {
+  background: transparent; border: none; color: var(--fg-3);
+  cursor: pointer; font-size: 14px; line-height: 1; padding: 0 4px;
 }
-.home-focus-hero-meta { font-size: 10px; color: var(--fg-3); letter-spacing: 0.04em; }
-.home-focus-hero-meta.needs-confirm { color: var(--accent-warn); }
-.home-focus-hero-actions { display: flex; gap: 6px; }
-.home-focus-hero-actions button {
+.stat-focus-clear:hover { color: var(--accent-fail); }
+.stat-focus-popover {
+  position: absolute; top: 100%; right: 0; margin-top: 6px;
+  min-width: 280px; max-width: 420px;
+  border: 1px solid var(--accent); background: var(--bg-1);
+  padding: 14px; z-index: 1000;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.stat-focus-popover[hidden] { display: none; }
+.stat-focus-popover-title { font-size: 13px; font-weight: 500; color: var(--fg-1); letter-spacing: 0; }
+.stat-focus-popover-summary { font-size: 11px; color: var(--fg-2); line-height: 1.4; letter-spacing: 0; }
+.stat-focus-popover-meta { font-size: 10px; color: var(--fg-3); letter-spacing: 0.04em; }
+.stat-focus-popover-meta.needs-confirm { color: var(--accent-warn); }
+.stat-focus-popover-actions { display: flex; gap: 6px; }
+.stat-focus-popover-actions button {
   background: transparent; border: 1px solid var(--line);
   color: var(--fg-3); font-size: 10px; letter-spacing: 0.14em;
-  padding: 5px 12px; cursor: pointer;
+  padding: 4px 10px; cursor: pointer;
 }
-.home-focus-hero-actions button:hover { color: var(--accent); border-color: var(--accent); }
-.home-focus-parked {
-  grid-column: 1 / -1;
-  border-top: 1px dashed var(--line); padding: 10px 0 0;
-  margin-top: 4px;
+.stat-focus-popover-actions button:hover { color: var(--accent); border-color: var(--accent); }
+.stat-focus-popover-parked {
+  border-top: 1px dashed var(--line); padding-top: 8px; margin-top: 4px;
   display: flex; flex-direction: column; gap: 6px;
-  font-size: 11px; color: var(--fg-3);
+  font-size: 11px; color: var(--fg-3); letter-spacing: 0;
 }
-.home-focus-parked:empty { display: none; }
-.home-focus-parked-row {
-  display: flex; justify-content: space-between; align-items: center; gap: 12px;
+.stat-focus-popover-parked:empty { display: none; }
+.stat-focus-popover-parked-row {
+  display: flex; justify-content: space-between; align-items: center; gap: 8px;
 }
-.home-focus-parked-title { color: var(--fg-2); flex: 1; }
-.home-focus-parked-resume {
+.stat-focus-popover-parked-title { color: var(--fg-2); flex: 1; }
+.stat-focus-popover-parked-resume {
   background: transparent; border: 1px solid var(--line);
   color: var(--fg-3); font-size: 9px; letter-spacing: 0.14em;
   padding: 2px 8px; cursor: pointer;
 }
-.home-focus-parked-resume:hover { color: var(--accent); border-color: var(--accent); }
+.stat-focus-popover-parked-resume:hover { color: var(--accent); border-color: var(--accent); }
 .home-block-head {
   padding: 8px 14px;
   border-bottom: 1px solid var(--line);
@@ -9205,90 +9211,125 @@ const CONSOLE_JS = `
     badge.className = 'nav-badge' + (tone ? ' ' + tone : '');
   }
 
-  // Render the Current Focus hero strip on Home from the command-center
-  // payload. Hidden when no active or parked focus.
-  function renderHomeFocus(focusSnap) {
-    const card = document.querySelector('[data-home-focus-card]');
-    if (!card) return;
+  // Render the Current Focus chip in the global status bar from the
+  // /home/command-center payload's .focus field. Persistent across
+  // every panel — same render path runs whether the user is on Home,
+  // Brain, Activity, etc. Hidden when no active or parked focus.
+  function renderStatusFocus(focusSnap) {
+    const chip = document.querySelector('[data-stat-focus]');
+    if (!chip) return;
     const active = focusSnap && focusSnap.active;
     const parked = (focusSnap && focusSnap.parked) || [];
     const needsConfirm = focusSnap && focusSnap.needsConfirm;
     if (!active && parked.length === 0) {
-      card.setAttribute('hidden', '');
+      chip.setAttribute('hidden', '');
       return;
     }
-    card.removeAttribute('hidden');
-    const parkedCountEl = card.querySelector('[data-home-focus-parked-count]');
-    if (parkedCountEl) parkedCountEl.textContent = parked.length > 0 ? parked.length + ' parked' : '';
+    chip.removeAttribute('hidden');
+    chip.classList.toggle('needs-confirm', !!needsConfirm);
 
-    const activeWrap = card.querySelector('[data-home-focus-active]');
-    if (active && activeWrap) {
-      activeWrap.removeAttribute('hidden');
-      const titleEl = card.querySelector('[data-home-focus-active-title]');
-      const summaryEl = card.querySelector('[data-home-focus-active-summary]');
-      const metaEl = card.querySelector('[data-home-focus-active-meta]');
-      if (titleEl) titleEl.textContent = active.title;
-      if (summaryEl) summaryEl.textContent = active.summary;
-      if (metaEl) {
-        const ageMin = Math.round((Date.now() - new Date(active.last_touched_at).getTime()) / 60000);
-        const ageLabel = ageMin < 1 ? 'just now' : ageMin < 60 ? ageMin + 'm ago' : Math.round(ageMin / 60) + 'h ago';
-        metaEl.textContent = active.resource_ref + ' · touched ' + ageLabel;
-        metaEl.classList.toggle('needs-confirm', !!needsConfirm);
-        if (needsConfirm) metaEl.textContent += ' · NEEDS CONFIRM';
-      }
-      const parkBtn = card.querySelector('[data-home-focus-park]');
-      const clearBtn = card.querySelector('[data-home-focus-clear]');
-      if (parkBtn) parkBtn.setAttribute('data-focus-id', String(active.id));
-      if (clearBtn) clearBtn.setAttribute('data-focus-id', String(active.id));
-    } else if (activeWrap) {
-      activeWrap.setAttribute('hidden', '');
-    }
+    const titleEl = chip.querySelector('[data-stat-focus-title]');
+    if (titleEl) titleEl.textContent = active ? active.title : (parked[0] ? parked[0].title + ' (parked)' : '—');
 
-    const parkedList = card.querySelector('[data-home-focus-parked-list]');
-    if (parkedList) {
-      if (parked.length === 0) {
-        parkedList.innerHTML = '';
+    const popover = chip.querySelector('[data-stat-focus-popover]');
+    if (popover) {
+      const ptitle = popover.querySelector('[data-stat-focus-popover-title]');
+      const psum = popover.querySelector('[data-stat-focus-popover-summary]');
+      const pmeta = popover.querySelector('[data-stat-focus-popover-meta]');
+      const ppark = popover.querySelector('[data-stat-focus-popover-parked]');
+      if (active) {
+        if (ptitle) ptitle.textContent = active.title;
+        if (psum) psum.textContent = active.summary;
+        if (pmeta) {
+          const ageMin = Math.round((Date.now() - new Date(active.last_touched_at).getTime()) / 60000);
+          const ageLabel = ageMin < 1 ? 'just now' : ageMin < 60 ? ageMin + 'm ago' : Math.round(ageMin / 60) + 'h ago';
+          pmeta.textContent = active.resource_ref + ' · touched ' + ageLabel + (needsConfirm ? ' · NEEDS CONFIRM' : '');
+          pmeta.classList.toggle('needs-confirm', !!needsConfirm);
+        }
       } else {
-        parkedList.innerHTML = parked.map((p) => (
-          '<div class="home-focus-parked-row">'
-          + '  <span class="home-focus-parked-title">' + escMem(p.title) + '</span>'
-          + '  <button type="button" class="home-focus-parked-resume" data-home-focus-resume="' + escMem(String(p.id)) + '">RESUME</button>'
-          + '</div>'
-        )).join('');
+        if (ptitle) ptitle.textContent = 'No active focus';
+        if (psum) psum.textContent = 'Parked threads below can be resumed.';
+        if (pmeta) pmeta.textContent = '';
+      }
+      // Wire the action buttons with current focus id
+      const parkBtn = popover.querySelector('[data-stat-focus-park]');
+      const doneBtn = popover.querySelector('[data-stat-focus-clear-popover]');
+      if (parkBtn) parkBtn.setAttribute('data-focus-id', active ? String(active.id) : '');
+      if (doneBtn) doneBtn.setAttribute('data-focus-id', active ? String(active.id) : '');
+      if (parkBtn) parkBtn.disabled = !active;
+      if (doneBtn) doneBtn.disabled = !active;
+      // Parked list with RESUME buttons
+      if (ppark) {
+        if (parked.length === 0) {
+          ppark.innerHTML = '';
+        } else {
+          ppark.innerHTML = parked.map((p) => (
+            '<div class="stat-focus-popover-parked-row">'
+            + '  <span class="stat-focus-popover-parked-title">' + escMem(p.title) + '</span>'
+            + '  <button type="button" class="stat-focus-popover-parked-resume" data-stat-focus-resume="' + escMem(String(p.id)) + '">RESUME</button>'
+            + '</div>'
+          )).join('');
+          ppark.querySelectorAll('[data-stat-focus-resume]').forEach((btn) => {
+            btn.addEventListener('click', async (event) => {
+              event.stopPropagation();
+              const id = btn.getAttribute('data-stat-focus-resume'); if (!id) return;
+              await fetch(withToken('/api/console/focus/' + id + '/activate'), { method: 'POST' });
+              await refreshHomeCommandCenter();
+            });
+          });
+        }
       }
     }
 
-    // Bind PARK / DONE buttons on the active card
-    const parkBtn = card.querySelector('[data-home-focus-park]');
-    const clearBtn = card.querySelector('[data-home-focus-clear]');
-    if (parkBtn && !parkBtn.dataset.bound) {
-      parkBtn.dataset.bound = '1';
-      parkBtn.addEventListener('click', async () => {
-        const id = parkBtn.getAttribute('data-focus-id'); if (!id) return;
-        await fetch(withToken('/api/console/focus/' + id + '/park'), { method: 'POST' });
-        await refreshHomeCommandCenter();
+    // One-time wiring (idempotent via dataset.bound)
+    if (!chip.dataset.bound) {
+      chip.dataset.bound = '1';
+      // Click chip body → toggle popover (but not when clicking buttons)
+      chip.addEventListener('click', (event) => {
+        const target = event.target;
+        if (target && (target.tagName === 'BUTTON' || target.closest('button'))) return;
+        if (popover) popover.toggleAttribute('hidden');
       });
-    }
-    if (clearBtn && !clearBtn.dataset.bound) {
-      clearBtn.dataset.bound = '1';
-      clearBtn.addEventListener('click', async () => {
-        const id = clearBtn.getAttribute('data-focus-id'); if (!id) return;
-        await fetch(withToken('/api/console/focus/' + id + '/clear'), {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ resolution: 'completed' }),
-        });
-        await refreshHomeCommandCenter();
+      // Close popover when clicking outside
+      document.addEventListener('click', (event) => {
+        if (!chip.contains(event.target)) {
+          if (popover) popover.setAttribute('hidden', '');
+        }
       });
-    }
-    // Per-parked RESUME buttons (re-bound each render since the list is rebuilt)
-    if (parkedList) {
-      parkedList.querySelectorAll('[data-home-focus-resume]').forEach((btn) => {
-        btn.addEventListener('click', async () => {
-          const id = btn.getAttribute('data-home-focus-resume'); if (!id) return;
-          await fetch(withToken('/api/console/focus/' + id + '/activate'), { method: 'POST' });
+      const xBtn = chip.querySelector('[data-stat-focus-clear]');
+      if (xBtn) {
+        xBtn.addEventListener('click', async (event) => {
+          event.stopPropagation();
+          if (!active) return;
+          if (!confirm('Clear current focus "' + active.title + '"?')) return;
+          await fetch(withToken('/api/console/focus/' + active.id + '/clear'), {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ resolution: 'completed' }),
+          });
           await refreshHomeCommandCenter();
         });
-      });
+      }
+      const parkBtn = chip.querySelector('[data-stat-focus-park]');
+      if (parkBtn) {
+        parkBtn.addEventListener('click', async (event) => {
+          event.stopPropagation();
+          const id = parkBtn.getAttribute('data-focus-id'); if (!id) return;
+          await fetch(withToken('/api/console/focus/' + id + '/park'), { method: 'POST' });
+          await refreshHomeCommandCenter();
+        });
+      }
+      const doneBtn = chip.querySelector('[data-stat-focus-clear-popover]');
+      if (doneBtn) {
+        doneBtn.addEventListener('click', async (event) => {
+          event.stopPropagation();
+          const id = doneBtn.getAttribute('data-focus-id'); if (!id) return;
+          await fetch(withToken('/api/console/focus/' + id + '/clear'), {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ resolution: 'completed' }),
+          });
+          await refreshHomeCommandCenter();
+        });
+      }
     }
   }
 
@@ -9714,7 +9755,11 @@ const CONSOLE_JS = `
       const toolsTile = document.querySelector('[data-home-tools-ready]');
 
       setPresence(presence.status);
-      if (awayEl) awayEl.textContent = presence.awayMessage || 'Standing by.';
+      // Header stays SHORT — just the status word (working / needs you /
+      // online). The long narration (presence.awayMessage) drives the
+      // WORKING NOW card and the FOCUS chip popover below; putting it
+      // in the header strip caused overflow and dead horizontal space.
+      if (awayEl) awayEl.textContent = presence.label || presence.status || 'idle';
       // The WORKING NOW banner is for active-work context — NOT the
       // pending check-in question or other "needs you" cues, which
       // already show in the NEEDS YOU card above. presence.awayMessage
@@ -9760,7 +9805,7 @@ const CONSOLE_JS = `
       setNavBadge('integrations', data.integrations?.requiredMissing || '', 'warn');
       setNavBadge('settings', (counts.approvals || 0) + (counts.planProposals || 0) + (counts.checkInProposals || 0), 'hot');
 
-      renderHomeFocus(data.focus || null);
+      renderStatusFocus(data.focus || null);
     } catch (err) {
       const needsEl = document.querySelector('[data-home-needs-list]');
       if (needsEl) needsEl.innerHTML = '<div class="home-empty">Command center failed: ' + escMem(err.message || err) + '</div>';

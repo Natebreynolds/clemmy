@@ -6,6 +6,7 @@ import {
   activateFocus,
   clearFocus,
   touchFocus,
+  updateFocus,
   getFocusSnapshot,
   listFocuses,
   getFocusById,
@@ -79,6 +80,22 @@ export function registerFocusTools(server: McpServer): void {
       } catch (err) {
         return textResult(`focus_set failed: ${err instanceof Error ? err.message : String(err)}`);
       }
+    },
+  );
+
+  server.tool(
+    'focus_update',
+    'Evolve an existing focus IN PLACE — same id, same active status, but updated title and/or summary. Use when the plan develops within a single focus (e.g. opening title "Q2 sheet · dropdowns" becomes "Q2 sheet · scoring 10/25 leads via firecrawl" after the user decides on the mechanism). Different from focus_set, which parks the prior and starts a new id. Bumps last_touched_at + extends the confirm window as a side effect.',
+    {
+      id: z.number().int().positive(),
+      title: z.string().min(1).max(120).optional(),
+      summary: z.string().min(3).max(500).optional(),
+      resource_kind: z.string().max(40).optional(),
+    },
+    async ({ id, title, summary, resource_kind }) => {
+      const row = updateFocus(id, { title, summary, resourceKind: resource_kind });
+      if (!row) return textResult(`focus_update: focus ${id} not found or not in an updatable state.`);
+      return textResult(`Updated focus #${row.id}: ${row.title}. Summary: ${row.summary}.`);
     },
   );
 
