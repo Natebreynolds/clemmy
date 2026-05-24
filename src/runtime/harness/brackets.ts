@@ -1,7 +1,13 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { isKillRequested } from './eventlog.js';
+import { isKillRequested, appendEvent, getSession } from './eventlog.js';
 import { getHarnessBudgetSettings } from './budget-settings.js';
 import { listPending as listPendingApprovals } from './approval-registry.js';
+import { evaluateToolCall, applyMode } from './tool-guardrail.js';
+import {
+  isMutatingExternalWrite,
+  isGateEnabled as isExecutionGateEnabled,
+  MissingExecutionWrapError,
+} from './execution-gate.js';
 
 /**
  * Reliability brackets — the safety primitives the harness loop weaves
@@ -267,11 +273,41 @@ export function withTimeout<T>(
   });
 }
 
-/** Recommended per-tool timeouts. Caller can override per-tool. */
+/**
+ * Recommended per-tool timeouts. Caller can override per-tool.
+ *
+ * Calibrated 2026-05-24 from real workloads observed in production:
+ *
+ *   - `default` (60s): internal tools — memory_*, workspace_*, file
+ *     reads, plan/note writes. All complete in <5s in practice; 60s
+ *     gives 12x headroom for slow disk or large vault re-indexes.
+ *
+ *   - `shell` (10min): `run_shell_command` and shell_* — covers long
+ *     Salesforce `sf` CLI queries, large `gh` API pages, slow npm
+ *     installs in workspaces. 10 min matches the prior production
+ *     value and has never false-killed a legitimate command.
+ *
+ *   - `externalApi` (5min, NEW): `composio_execute_tool` and any
+ *     other tool that fans out to a 3rd-party HTTP API. Without this
+ *     bucket, Composio calls fell to `default` (60s) and would
+ *     false-kill on a slow Salesforce SOQL or a large Google Sheets
+ *     `values.get`. 5 minutes covers the p99 of real Composio
+ *     calls observed in eventlog.
+ *
+ *   - `mcp` (10min, WAS 30s): MCP-namespaced tools like DataForSEO
+ *     scrapes, Supabase queries, browser tool. DataForSEO scrapes
+ *     ROUTINELY take 5-10 minutes — 30s would false-kill nearly
+ *     every legitimate scrape. The original comment in this file
+ *     called out "10-min DataForSEO scrape" as the justification for
+ *     the kill check, yet the mcp timeout was 30s — a latent bug
+ *     waiting for brackets to actually activate (which they did
+ *     2026-05-24 via F1 env injection).
+ */
 export const DEFAULT_TIMEOUTS_MS = {
   default: 60_000,
   shell: 600_000,
-  mcp: 30_000,
+  externalApi: 300_000,
+  mcp: 600_000,
 } as const;
 
 /** Pick a default timeout from the tool name. */
@@ -279,6 +315,12 @@ export function timeoutForTool(toolName: string): number {
   if (toolName === 'run_shell_command') return DEFAULT_TIMEOUTS_MS.shell;
   if (/^(exec|spawn|launch|run_shell|shell_)/.test(toolName)) {
     return DEFAULT_TIMEOUTS_MS.shell;
+  }
+  // External-API tools that fan out to 3rd-party services. The
+  // canonical case is composio_execute_tool (single tool, hundreds
+  // of upstream toolkits). Pattern-matches future siblings.
+  if (toolName === 'composio_execute_tool' || /^(composio|external_api)_/.test(toolName)) {
+    return DEFAULT_TIMEOUTS_MS.externalApi;
   }
   // MCP namespace shim separator is "__" (src/runtime/mcp-namespace-shim.ts).
   if (toolName.includes('__')) {
@@ -467,61 +509,227 @@ export function wrapToolForHarness<T extends WrappableTool>(
   tool: T,
   options: WrapToolOptions = {},
 ): T {
+  // Opt-in via HARNESS_TOOL_BRACKETS=on. As of v0.5.18 the flag
+  // ACTUALLY WORKS in production (F1 supervisor injection + F8
+  // wrap-via-invoke fix). Default stays OFF for this release because
+  // a default-on flip surfaced test fallout (loop.test.ts:839) that
+  // needs its own focused investigation. Tracked for v0.5.19.
+  // Users who want the reliability brackets active set the env via
+  // Settings → Runtime or directly in ~/.clementine-next/.env.
   if (process.env.HARNESS_TOOL_BRACKETS !== 'on') return tool;
-  const originalExecute = tool.execute;
-  if (!originalExecute) return tool; // pure declaration; no execute to wrap
-  const wrappedExecute = async (input: unknown, runContext?: unknown): Promise<unknown> => {
+  // CRITICAL: The OpenAI Agents SDK's `tool()` factory captures the
+  // original `execute` in a CLOSURE inside the returned `invoke`
+  // function (node_modules/@openai/agents-core/dist/tool.js:175).
+  // The Runner calls `tool.invoke(runContext, input, details)` — NOT
+  // `tool.execute`. So wrapping ONLY `execute` does nothing for SDK
+  // tools: the Runner goes through invoke, which calls the closured
+  // original execute. Discovered 2026-05-24 after weeks of brackets
+  // appearing inactive even with HARNESS_TOOL_BRACKETS=on.
+  //
+  // We support TWO tool shapes:
+  //   - SDK-built tools (have `.invoke`): wrap invoke. This is the
+  //     production path — orchestrator + sub-agent tools all flow here.
+  //   - Plain-object tools (have `.execute` only, no `.invoke`): wrap
+  //     execute. This is the test/legacy path; brackets.test.ts builds
+  //     tools as raw {name, execute} objects so we keep wrapping that
+  //     shape too.
+  const tt = tool as unknown as ToolWithInvoke;
+  const hasInvoke = typeof tt.invoke === 'function';
+  const hasExecute = typeof tool.execute === 'function';
+  if (!hasInvoke && !hasExecute) return tool; // pure declaration; nothing to wrap
+
+  const runBrackets = async (
+    sessionId: string,
+    parsedInput: unknown,
+  ): Promise<void> => {
     const ctx = harnessRunContextStorage.getStore();
-    if (ctx) {
-      // 1. Kill check — sync throw. The SDK records this tool call as
-      //    errored and the run halts cleanly. Without this, a long
-      //    tool (10-min DataForSEO scrape) ignores `clementine kill`
-      //    until it returns.
-      assertNotKilled(ctx.sessionId);
-      // 2. Counter cap — pre-increment check. If we're at the limit,
-      //    throw BEFORE the inner execute runs so no side effects
-      //    happen. The increment moves AFTER willExceed so a thrown
-      //    check doesn't bump the count.
-      if (ctx.counter.willExceed()) {
-        throw new ToolCallsLimitExceeded(ctx.counter.limit);
-      }
-      ctx.counter.increment();
+    if (!ctx) return; // no context = test fixture or out-of-band call; brackets degrade
+    // 1. Kill check
+    assertNotKilled(ctx.sessionId);
+    // 2. Counter cap (pre-increment)
+    if (ctx.counter.willExceed()) {
+      throw new ToolCallsLimitExceeded(ctx.counter.limit);
     }
-    // 3. Per-tool timeout. The withTimeout helper races a setTimeout
-    //    against the tool promise; on expiry it throws ToolTimeout
-    //    (the inner work continues unaborted — tools wire their own
-    //    AbortSignal if they want to cancel cleanly).
-    //
-    // Approval-aware (v0.5.5): when the SDK pauses this tool waiting
-    // on user approval, the timer was ALREADY started — left to its
-    // own devices it would throw ToolTimeout 60 seconds in even though
-    // the tool is parked. The isPaused callback consults the approval
-    // registry at fire time. If a pending approval exists for this
-    // session, the timeout defers (re-arms) instead of throwing.
-    const timeoutMs = options.timeoutMs
-      ?? ctx?.defaultTimeoutMs
-      ?? timeoutForTool(tool.name);
-    const sessionId = ctx?.sessionId;
-    const isPaused = sessionId
+    ctx.counter.increment();
+    // 2b. Tool-call guardrail (loop detection)
+    try {
+      const rawDecision = evaluateToolCall(ctx.sessionId, tool.name, parsedInput);
+      const decision = applyMode(rawDecision);
+      if (decision.action !== 'allow') {
+        try {
+          appendEvent({
+            sessionId: ctx.sessionId,
+            turn: 0,
+            role: 'system',
+            type: 'guardrail_tripped',
+            data: {
+              kind: 'tool_call_guardrail',
+              action: decision.action,
+              rule: decision.rule,
+              toolName: decision.toolName,
+              count: decision.count,
+              reason: decision.reason,
+            },
+          });
+        } catch { /* telemetry write must never block */ }
+      }
+      if (decision.action === 'block' || decision.action === 'halt') {
+        throw new ToolGuardrailBlocked(decision);
+      }
+    } catch (err) {
+      if (err instanceof ToolGuardrailBlocked) throw err;
+      // eslint-disable-next-line no-console
+      console.warn('[harness] tool guardrail evaluation threw (fail-open)', err instanceof Error ? err.message : err);
+    }
+    // 2c. Execution-wrap gate
+    try {
+      if (isExecutionGateEnabled() && isMutatingExternalWrite(tool.name, parsedInput)) {
+        const sessionRow = getSession(ctx.sessionId);
+        if (sessionRow?.kind === 'chat') {
+          const { ExecutionStore } = await import('../../execution/store.js');
+          const active = new ExecutionStore().getActiveForSession(ctx.sessionId);
+          if (!active) {
+            const slug = typeof parsedInput === 'object' && parsedInput
+              ? (parsedInput as { tool_slug?: string }).tool_slug
+              : undefined;
+            try {
+              appendEvent({
+                sessionId: ctx.sessionId,
+                turn: 0,
+                role: 'system',
+                type: 'guardrail_tripped',
+                data: {
+                  kind: 'execution_wrap_required',
+                  toolName: tool.name,
+                  toolSlug: slug ?? null,
+                  reason: 'mutating external write without active execution',
+                },
+              });
+            } catch { /* telemetry write must never block */ }
+            throw new MissingExecutionWrapError({
+              toolName: tool.name,
+              toolSlug: slug,
+              sessionId: ctx.sessionId,
+            });
+          }
+        }
+      }
+    } catch (err) {
+      if (err instanceof MissingExecutionWrapError) throw err;
+      // eslint-disable-next-line no-console
+      console.warn('[harness] execution-wrap gate threw (fail-open)', err instanceof Error ? err.message : err);
+    }
+    // (sessionId arg is unused — included for future per-session
+    // behavior without forcing callers to refactor.)
+    void sessionId;
+  };
+
+  // Resolve the per-tool timeout once at wrap time.
+  const timeoutMs = options.timeoutMs ?? timeoutForTool(tool.name);
+  const isPausedFactory = (sessionId?: string) =>
+    sessionId
       ? () => {
           try {
             const pending = listPendingApprovals({ sessionId, status: 'pending' });
             return pending.length > 0;
           } catch {
-            // If the registry is unavailable, fall back to old behavior
-            // (don't defer) so timeouts still fire for genuinely stuck
-            // tools — better to err on the side of dropping the run than
-            // hanging forever.
             return false;
           }
         }
       : undefined;
+
+  if (hasInvoke) {
+    // PRODUCTION PATH — wrap SDK invoke.
+    const originalInvoke = tt.invoke!;
+    const wrappedInvoke = async (
+      runContext: unknown,
+      input: unknown,
+      details?: unknown,
+    ): Promise<unknown> => {
+      // SDK passes raw JSON string to invoke. Parse for our internal
+      // classification (gate + guardrail). Fail-open on parse error.
+      let parsedInput: unknown = input;
+      if (typeof input === 'string') {
+        try {
+          parsedInput = JSON.parse(input);
+        } catch {
+          parsedInput = input;
+        }
+      }
+      const ctx = harnessRunContextStorage.getStore();
+      try {
+        await runBrackets(ctx?.sessionId ?? '', parsedInput);
+      } catch (err) {
+        // MissingExecutionWrapError should land as a SOFT tool error
+        // — return the message string so the model sees it as the
+        // tool's output and can self-correct (call execution_create,
+        // then retry). Throwing here would terminate the run because
+        // our wrap is OUTSIDE the SDK's _invoke catch (which would
+        // have converted the throw via defaultToolErrorFunction).
+        // Same treatment for ToolGuardrailBlocked + the counter
+        // ToolCallsLimitExceeded so the model can recover instead of
+        // the harness exploding on a guardrail decision.
+        if (
+          err instanceof MissingExecutionWrapError ||
+          err instanceof ToolGuardrailBlocked ||
+          err instanceof ToolCallsLimitExceeded
+        ) {
+          return `Tool call refused by harness: ${err instanceof Error ? err.message : String(err)}`;
+        }
+        // KillRequested + ToolTimeout + unknown errors propagate —
+        // these SHOULD abort the run (kill is user-requested abort;
+        // timeout means the underlying tool is genuinely stuck).
+        throw err;
+      }
+      return withTimeout(
+        (async () => originalInvoke.call(tt, runContext, input, details))(),
+        timeoutMs,
+        tool.name,
+        { isPaused: isPausedFactory(ctx?.sessionId) },
+      );
+    };
+    return { ...tool, invoke: wrappedInvoke } as T;
+  }
+
+  // LEGACY PATH — plain-object tool with execute only (tests, fixtures).
+  const originalExecute = tool.execute!;
+  const wrappedExecute = async (input: unknown, runContext?: unknown): Promise<unknown> => {
+    const ctx = harnessRunContextStorage.getStore();
+    await runBrackets(ctx?.sessionId ?? '', input);
     return withTimeout(
       (async () => originalExecute(input, runContext))(),
       timeoutMs,
       tool.name,
-      { isPaused },
+      { isPaused: isPausedFactory(ctx?.sessionId) },
     );
+    // NOTE: A tool-return truncator used to live here as part of
+    // Primitive 6 (v0.5.18 plan). Removed 2026-05-24 because hooks.ts
+    // `clipToolResult` + `writeToolOutput` + `clipOldToolResults`
+    // already cover (a) per-write inline trim with recall_tool_result
+    // marker, (b) lossless 200K side store, (c) compaction-driven
+    // history trim. Adding a fourth layer was redundant. The
+    // loop-detection half of Primitive 6 (evaluateToolCall above)
+    // stays — it's novel, not duplicative.
   };
   return { ...tool, execute: wrappedExecute };
+}
+
+/** Minimal shape for the SDK-built Tool with an invoke method.
+ *  Used internally to type-narrow tool objects from @openai/agents. */
+interface ToolWithInvoke {
+  name: string;
+  invoke?: (runContext: unknown, input: unknown, details?: unknown) => Promise<unknown>;
+}
+
+/** Thrown when the tool-call guardrail blocks a tool call. The SDK
+ *  surfaces this as a tool error; the agent sees the failure and
+ *  can recover. The decision object lets the harness route a clean
+ *  telemetry event without re-deriving the reason. */
+export class ToolGuardrailBlocked extends Error {
+  public readonly decision: import('./tool-guardrail.js').GuardrailDecision;
+  constructor(decision: import('./tool-guardrail.js').GuardrailDecision) {
+    super(`tool-call guardrail ${decision.action}: ${decision.reason}`);
+    this.name = 'ToolGuardrailBlocked';
+    this.decision = decision;
+  }
 }

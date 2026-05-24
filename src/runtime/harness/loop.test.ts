@@ -143,6 +143,49 @@ test('completed workflow run flips session status to completed (one-shot)', asyn
   assert.equal(reloaded!.sessionRow.status, 'completed', 'workflow sessions are one-shot');
 });
 
+// P0-4: even for one-shot workflow sessions, the row must NOT flip to
+// 'completed' while an approval is still pending. Otherwise the reaper
+// false-reaps the paused approval and the user-action surface
+// disappears mid-flight. The shipped guard at loop.ts:1080 + :1394 is
+// `kind !== 'chat' && !approvalRegistry.hasPending(sessionId)`.
+test('workflow run with a pending approval stays active (P0-4 guard)', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'workflow', title: 'paused-workflow' });
+
+  // Register a pending approval BEFORE the turn ends, mimicking a
+  // tool call that handed off to the approval bus mid-turn.
+  approvalRegistry.register({
+    sessionId: sess.id,
+    subject: 'mock approval gate',
+    tool: 'request_approval',
+  });
+
+  const runRunner: RunRunnerFn = async (_runner, _agent, items) => ({
+    history: [
+      ...items,
+      { role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'done' }] },
+    ],
+    lastResponseId: 'resp_paused',
+    finalOutput: { ok: true },
+  });
+
+  await runTurn({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'kick off workflow',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  const reloaded = HarnessSession.load(sess.id);
+  assert.ok(reloaded);
+  assert.equal(
+    reloaded!.sessionRow.status,
+    'active',
+    'pending approval must keep workflow session active; do not mark completed mid-pause',
+  );
+});
+
 test('previousResponseId is NOT passed to the SDK (codex requires full history each turn)', async () => {
   // Codex enforces `store: false`, so the server never persists
   // responses we could refer back to. Passing previousResponseId
@@ -271,7 +314,11 @@ test('ToolCallsLimitExceeded thrown by run surfaces as guardrail_tripped', async
   });
 
   assert.equal(result.status, 'limit_exceeded');
-  const tripped = listEvents(sess.id, { types: ['guardrail_tripped'] });
+  // Filter to the specific kind — v0.5.18 preflight gate now emits
+  // an additional guardrail_tripped(kind:preflight_budget_check) per
+  // turn for observability, so a length:1 assertion is too tight.
+  const tripped = listEvents(sess.id, { types: ['guardrail_tripped'] })
+    .filter((ev) => (ev.data as { kind?: unknown }).kind === 'tool_calls_limit');
   assert.equal(tripped.length, 1);
   assert.equal(tripped[0].data.kind, 'tool_calls_limit');
   assert.equal(tripped[0].data.limit, 8);

@@ -22,6 +22,13 @@ import {
 } from './brackets.js';
 import { compactSessionIfNeeded } from './compaction.js';
 import { getHarnessBudgetSettings } from './budget-settings.js';
+import {
+  checkBudget,
+  estimateMessagesTokens,
+  estimateTokens,
+  predictTurnCost,
+} from './budget.js';
+import { MODELS } from '../../config.js';
 import { attachEventLogHooks, extractSessionIdFromContext, type RunHooksLike } from './hooks.js';
 import * as approvalRegistry from './approval-registry.js';
 import { actionBus } from '../action-bus.js';
@@ -47,6 +54,93 @@ function safeAppend(input: AppendEventInput): void {
       turn: input.turn,
       err: err instanceof Error ? err.message : String(err),
     });
+  }
+}
+
+/**
+ * Adaptive prior estimator for the pre-flight budget gate.
+ *
+ * Scans the LAST N completed turns' tool_called + tool_returned events
+ * to compute realistic priors for THIS session's tool behavior:
+ *   - plannedToolCallCount: MAX tool calls seen in any single recent
+ *     turn, with a safety factor. If a session ever fired 6 parallel
+ *     calls, we assume the next turn might too.
+ *   - avgToolReturnTokens: MAX avg-per-turn return size seen, also
+ *     with safety factor. A session that returned 15K-per-call last
+ *     turn won't surprise the gate next turn.
+ *
+ * Falls back to conservative static defaults when the session has no
+ * tool history yet (first few turns of a fresh conversation). Bounded
+ * lookback (last 3 turns) keeps the scan cheap — no full session walk.
+ */
+const PRIOR_LOOKBACK_TURNS = 3;
+const PRIOR_MAX_EVENTS = 200; // safety cap on listEvents pull
+function inferTurnPriors(
+  sessionId: string,
+  currentTurn: number,
+  opts: { fallbackToolCount: number; fallbackAvgReturn: number; safetyFactor: number },
+): { plannedToolCallCount: number; avgToolReturnTokens: number } {
+  try {
+    // Pull recent events from this session. Most-recent-first ordering
+    // would be ideal but listEvents returns ascending by seq; we just
+    // grab the tail by capping pull size.
+    const events = listEvents(sessionId);
+    if (events.length === 0) {
+      return {
+        plannedToolCallCount: opts.fallbackToolCount,
+        avgToolReturnTokens: opts.fallbackAvgReturn,
+      };
+    }
+    // Bucket by turn number, then keep only the last PRIOR_LOOKBACK_TURNS.
+    const minTurn = Math.max(0, currentTurn - PRIOR_LOOKBACK_TURNS);
+    const recentEvents = events
+      .slice(-PRIOR_MAX_EVENTS)
+      .filter((e) => typeof e.turn === 'number' && e.turn >= minTurn && e.turn < currentTurn);
+    if (recentEvents.length === 0) {
+      return {
+        plannedToolCallCount: opts.fallbackToolCount,
+        avgToolReturnTokens: opts.fallbackAvgReturn,
+      };
+    }
+    const callsByTurn = new Map<number, number>();
+    const returnSizesByTurn = new Map<number, number[]>();
+    for (const ev of recentEvents) {
+      const t = ev.turn ?? 0;
+      if (ev.type === 'tool_called') {
+        callsByTurn.set(t, (callsByTurn.get(t) ?? 0) + 1);
+      } else if (ev.type === 'tool_returned') {
+        const dataJson = JSON.stringify(ev.data ?? {});
+        const tokens = estimateTokens(dataJson);
+        const bucket = returnSizesByTurn.get(t) ?? [];
+        bucket.push(tokens);
+        returnSizesByTurn.set(t, bucket);
+      }
+    }
+    let maxCalls = 0;
+    for (const c of callsByTurn.values()) maxCalls = Math.max(maxCalls, c);
+    let maxAvgReturn = 0;
+    for (const sizes of returnSizesByTurn.values()) {
+      if (sizes.length === 0) continue;
+      const avg = sizes.reduce((a, b) => a + b, 0) / sizes.length;
+      maxAvgReturn = Math.max(maxAvgReturn, avg);
+    }
+    // Apply safety factor, fall back to defaults when no signal.
+    const adaptiveCalls = maxCalls > 0
+      ? Math.ceil(maxCalls * opts.safetyFactor)
+      : opts.fallbackToolCount;
+    const adaptiveAvgReturn = maxAvgReturn > 0
+      ? Math.ceil(maxAvgReturn * opts.safetyFactor)
+      : opts.fallbackAvgReturn;
+    return {
+      plannedToolCallCount: Math.max(adaptiveCalls, opts.fallbackToolCount),
+      avgToolReturnTokens: Math.max(adaptiveAvgReturn, opts.fallbackAvgReturn),
+    };
+  } catch {
+    // Adaptive estimation is best-effort. Any failure → static priors.
+    return {
+      plannedToolCallCount: opts.fallbackToolCount,
+      avgToolReturnTokens: opts.fallbackAvgReturn,
+    };
   }
 }
 
@@ -1015,6 +1109,109 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     ...compactedItems,
     { role: 'user', content: options.input },
   ];
+
+  // Pre-flight budget gate — Capacity-Aware Clem v0.5.18 primitive 2a.
+  // Estimates the post-turn token cost BEFORE we call the SDK. If
+  // projected > block threshold, inject a system message forcing the
+  // orchestrator into plan-mode (propose_plan tool) instead of
+  // executing a turn that would blow upstream limits. Honors env
+  // flag CLEMMY_PREFLIGHT_GATE=off for revert. Fail-open: if the
+  // gate itself throws, we proceed with the un-gated turn rather
+  // than blocking work on a meta-failure.
+  //
+  // SCOPE: chat sessions only. Workflow turns are already approved
+  // upfront via the workflow definition (the workflow IS the plan)
+  // and don't have access to propose_plan. Injecting a "call
+  // propose_plan" message into a workflow turn would instruct the
+  // model to call a tool that doesn't exist on its surface.
+  // Workflows still benefit from the broader Capacity-Aware Clem
+  // primitives (batch_external_calls, tool-return guardrail, Codex
+  // resilience); they just skip the plan-mode interlude.
+  if (
+    (process.env.CLEMMY_PREFLIGHT_GATE ?? 'on').toLowerCase() !== 'off'
+    && session.sessionRow.kind === 'chat'
+  ) {
+    try {
+      const stateTokens = estimateMessagesTokens(
+        compactedItems as ReadonlyArray<{ content?: unknown; role?: string }>,
+      );
+      const userInputTokens = estimateTokens(
+        typeof options.input === 'string' ? options.input : JSON.stringify(options.input ?? ''),
+      );
+      // Adaptive priors — look at the prior 3 turns' actual tool
+      // behavior to predict this turn's cost. A session that just
+      // fired 6 parallel composio calls returning 15K each will see
+      // those priors (not the 2x2000 static fallback) and the gate
+      // will correctly project the next turn into block territory.
+      // Falls back to conservative static defaults if no history.
+      const STATIC_PLANNED_TOOL_CALLS = 2;
+      const STATIC_AVG_TOOL_RETURN = 2_000;
+      const EXPECTED_OUTPUT_PRIOR = 1_500;
+      const ADAPTIVE_SAFETY_FACTOR = 1.2;
+      const { plannedToolCallCount, avgToolReturnTokens } = inferTurnPriors(
+        options.sessionId,
+        turn,
+        { fallbackToolCount: STATIC_PLANNED_TOOL_CALLS, fallbackAvgReturn: STATIC_AVG_TOOL_RETURN, safetyFactor: ADAPTIVE_SAFETY_FACTOR },
+      );
+      const modelId = typeof (options.agent as { model?: unknown })?.model === 'string'
+        ? (options.agent as { model: string }).model
+        : MODELS.primary;
+      const predicted = predictTurnCost({
+        currentStateTokens: stateTokens,
+        userInputTokens,
+        plannedToolCallCount,
+        avgToolReturnTokens,
+        expectedOutputTokens: EXPECTED_OUTPUT_PRIOR,
+      });
+      const verdict = checkBudget({ predictedTokens: predicted, modelId });
+      // Always record telemetry for observability — even on 'ok'.
+      safeAppend({
+        sessionId: options.sessionId,
+        turn,
+        role: 'system',
+        type: 'guardrail_tripped',
+        data: {
+          kind: 'preflight_budget_check',
+          status: verdict.status,
+          predictedTokens: verdict.predictedTokens,
+          effectiveLimit: verdict.effectiveLimit,
+          fractionUsed: Number(verdict.fractionUsed.toFixed(3)),
+          plannedToolCallCount,
+          avgToolReturnTokens,
+          adaptive: plannedToolCallCount !== STATIC_PLANNED_TOOL_CALLS || avgToolReturnTokens !== STATIC_AVG_TOOL_RETURN,
+          reason: verdict.reason,
+        },
+      });
+      if (verdict.status === 'block') {
+        // Refuse to send this turn as-is. Inject a system message that
+        // FORCES the orchestrator to call propose_plan (the plan-mode
+        // tool from primitive 4). The user sees the plan, approves
+        // (or edits), then execution proceeds via batch_external_calls
+        // (primitive 3) instead of free-firing parallel tool calls
+        // that would balloon the context further.
+        const blockMessage =
+          `[PREFLIGHT BUDGET BLOCK] Predicted next-turn tokens ${verdict.predictedTokens.toLocaleString()} ` +
+          `would exceed ${(verdict.blockFraction * 100).toFixed(0)}% of the effective context limit ` +
+          `(${verdict.effectiveLimit.toLocaleString()} tokens). ` +
+          `You MUST call \`propose_plan\` to outline the work for user approval BEFORE executing any tool calls. ` +
+          `Do NOT fire external tool calls in this turn — the plan-mode interlude exists to keep this conversation alive. ` +
+          `If propose_plan is unavailable, reply asking the user to type \`/new continue\` to start a fresh session ` +
+          `(facts + focus carry over via the brain).`;
+        items.unshift({
+          role: 'system',
+          content: blockMessage,
+        } as AgentInputItem);
+      }
+    } catch (err) {
+      // Fail-open: a bug in the gate must not block the user's turn.
+      // We log loudly so the failure is visible in supervisor.log.
+      // eslint-disable-next-line no-console
+      console.warn(
+        '[harness] preflight budget gate threw (fail-open)',
+        err instanceof Error ? err.message : err,
+      );
+    }
+  }
 
   const opts: Record<string, unknown> = {
     context: { sessionId: options.sessionId, turn },

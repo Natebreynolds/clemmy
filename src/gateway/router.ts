@@ -58,6 +58,7 @@ type GatewayCommand =
   | { type: 'cancel_task'; id: string }
   | { type: 'resume_task'; id: string }
   | { type: 'list_runs' }
+  | { type: 'stop_active' }
   | { type: 'run_status'; id: string };
 
 function clean(value: string, maxChars = 200): string {
@@ -96,6 +97,15 @@ function parseCommand(message: string): GatewayCommand | null {
   const cancelMatch = withoutSlash.match(/^(?:stop|cancel|abort)\s+(bg-[a-z0-9]+-[a-f0-9]+)$/i);
   if (cancelMatch) {
     return { type: 'cancel_task', id: cancelMatch[1] };
+  }
+
+  // Bare "stop" (no id) — panic stop. Resolves to the most-recently-
+  // active thing on this channel/session at dispatch time. Added
+  // 2026-05-24 after the daily-prospect-outreach run kept advancing
+  // and the user's bare "stop" did nothing because the gateway only
+  // recognized the "stop <bg-task-id>" form.
+  if (/^(stop|cancel|abort|halt)$/i.test(withoutSlash)) {
+    return { type: 'stop_active' };
   }
 
   const resumeMatch = withoutSlash.match(/^(?:resume|continue)\s+(bg-[a-z0-9]+-[a-f0-9]+)$/i);
@@ -172,6 +182,103 @@ function renderRunStatus(run: RunRecord): string {
   ].filter(Boolean).join('\n');
 }
 
+/**
+ * Bare "stop" / "cancel" / "abort" handler — the panic-stop verb.
+ *
+ * Resolution order (most-recently-active wins):
+ *   1. Pending approvals for this sessionId (most recent) — reject it,
+ *      which unblocks the waiting workflow run so it cleans up.
+ *   2. Active background tasks for this user (most recent) — cancel it.
+ *   3. Nothing found — reply with what IS active (if anything) and
+ *      how to stop each one explicitly. Never silently no-op.
+ *
+ * Scoped per-session/per-user so bare "stop" can never accidentally
+ * kill a CRON-scheduled background task or work from a different
+ * conversation. Multi-target situations get a list + ask, never a
+ * silent best-guess. (Failure mode from 2026-05-24: user typed "stop"
+ * during an in-flight workflow run, the gateway didn't recognize
+ * bare "stop", message fell through as a chat prompt, the workflow
+ * kept advancing.)
+ */
+function handleStopActive(request: GatewayRequest): GatewayResponse {
+  // Lazy import to avoid pulling the eventlog into router boot when
+  // no one types "stop". Harness eventlog opens a SQLite connection.
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const approvalRegistry = require('../runtime/harness/approval-registry.js') as typeof import('../runtime/harness/approval-registry.js');
+
+  const candidates: Array<{ kind: 'approval' | 'task'; label: string; stopFn: () => string }> = [];
+
+  // 1) Pending approvals on this sessionId — sorted newest first
+  // already by approval-registry's ORDER BY requested_at DESC.
+  try {
+    const pendingApprovals = approvalRegistry.listPending({ sessionId: request.sessionId, status: 'pending' });
+    for (const row of pendingApprovals) {
+      candidates.push({
+        kind: 'approval',
+        label: `approval ${row.approvalId} — ${row.subject ?? row.tool ?? 'pending action'}`,
+        stopFn: () => {
+          const result = approvalRegistry.resolve(row.approvalId, 'rejected', request.userId ?? 'panic-stop');
+          return result.ok
+            ? `Rejected approval ${row.approvalId} (${row.subject ?? row.tool ?? 'pending action'}). The waiting run will unwind.`
+            : `Could not reject ${row.approvalId}: ${result.reason}.`;
+        },
+      });
+    }
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'stop_active: approval-registry probe failed');
+  }
+
+  // 2) Active background tasks for this user — pending, running, awaiting_approval
+  try {
+    const tasks = listBackgroundTasks({ userId: request.userId })
+      .filter((task) => task.status === 'pending' || task.status === 'running' || task.status === 'awaiting_approval')
+      .sort((a, b) => (b.updatedAt ?? '').localeCompare(a.updatedAt ?? ''));
+    for (const task of tasks) {
+      candidates.push({
+        kind: 'task',
+        label: `background task ${task.id} — ${task.title}`,
+        stopFn: () => {
+          const cancelled = cancelBackgroundTask(task.id);
+          return cancelled
+            ? `Cancelled background task ${task.id} (${task.title}).`
+            : `Could not cancel ${task.id} (already finished?).`;
+        },
+      });
+    }
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'stop_active: background-task probe failed');
+  }
+
+  if (candidates.length === 0) {
+    return {
+      sessionId: request.sessionId,
+      handledControl: true,
+      text: 'Nothing active to stop in this session. Use `tasks` to see all background tasks or `runs` for recent runs.',
+    };
+  }
+
+  if (candidates.length === 1) {
+    return {
+      sessionId: request.sessionId,
+      handledControl: true,
+      text: candidates[0].stopFn(),
+    };
+  }
+
+  // 2+ candidates — don't pick blindly. List + ask for the specific id.
+  const list = candidates.slice(0, 10).map((c) => `  • ${c.label}`).join('\n');
+  return {
+    sessionId: request.sessionId,
+    handledControl: true,
+    text: [
+      `${candidates.length} active items on this session — which one?`,
+      list,
+      '',
+      'Reply with `stop <id>` or `reject <approval-id>` to pick one. `stop all` is not implemented (yet) for safety.',
+    ].join('\n'),
+  };
+}
+
 export class ClementineGateway {
   constructor(private readonly assistant: ClementineAssistant) {}
 
@@ -229,6 +336,10 @@ export class ClementineGateway {
         handledControl: true,
         text: task ? `Task ${task.id} is now ${task.status}.` : `I could not find background task ${command.id}.`,
       };
+    }
+
+    if (command.type === 'stop_active') {
+      return handleStopActive(request);
     }
 
     const resumed = resumeBackgroundTask(command.id);

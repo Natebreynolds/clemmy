@@ -347,3 +347,57 @@ test('parseHarnessCommand: does NOT match substring matches or natural language'
   assert.equal(parseHarnessCommand("let's keep going on this"), null);
   assert.equal(parseHarnessCommand(''), null);
 });
+
+// ─── isDiscordTokenExpired — P0-1 detection layer (v0.5.x) ───────
+// Discord interaction tokens die at 15 minutes. When that happens
+// handle.edit() throws with one of several shapes (REST API code,
+// HTTP status, or message text). The detector must recognize ALL of
+// them so the flush/finalFlush fallback through sendFollowup
+// (discord-harness.ts:1141 + :1184) actually triggers. Missing a
+// shape means a long workflow goes dark past minute 15.
+
+test('isDiscordTokenExpired: numeric REST code 10015 (Unknown Webhook)', () => {
+  assert.equal(__test__.isDiscordTokenExpired({ code: 10015 }), true);
+});
+
+test('isDiscordTokenExpired: numeric REST code 50027 (Invalid Webhook Token)', () => {
+  assert.equal(__test__.isDiscordTokenExpired({ code: 50027 }), true);
+});
+
+test('isDiscordTokenExpired: string REST code is parsed as a number', () => {
+  // discord.js sometimes hands the code through as a string. The
+  // detector parses to make sure neither shape slips past.
+  assert.equal(__test__.isDiscordTokenExpired({ code: '10015' }), true);
+  assert.equal(__test__.isDiscordTokenExpired({ code: '50027' }), true);
+});
+
+test('isDiscordTokenExpired: HTTP status 401 and 404', () => {
+  assert.equal(__test__.isDiscordTokenExpired({ status: 401 }), true);
+  assert.equal(__test__.isDiscordTokenExpired({ status: 404 }), true);
+  // Some versions of @discordjs/rest expose httpStatus instead.
+  assert.equal(__test__.isDiscordTokenExpired({ httpStatus: 401 }), true);
+  assert.equal(__test__.isDiscordTokenExpired({ httpStatus: 404 }), true);
+});
+
+test('isDiscordTokenExpired: known message texts', () => {
+  // These are the substrings Discord's REST returns at minute 15+.
+  // Match must be case-insensitive — the detector lowercases first.
+  assert.equal(__test__.isDiscordTokenExpired({ message: 'Invalid Webhook Token' }), true);
+  assert.equal(__test__.isDiscordTokenExpired({ message: 'invalid webhook token' }), true);
+  assert.equal(__test__.isDiscordTokenExpired({ message: 'Unknown Webhook' }), true);
+  assert.equal(__test__.isDiscordTokenExpired({ message: 'Interaction has expired' }), true);
+  assert.equal(__test__.isDiscordTokenExpired({ message: 'interaction expired' }), true);
+});
+
+test('isDiscordTokenExpired: unrelated errors are NOT misclassified', () => {
+  // Rate limit, network blip, and generic errors must NOT trigger the
+  // fallback — otherwise every transient blip becomes a "fresh message
+  // in channel" instead of a retry on the existing handle.
+  assert.equal(__test__.isDiscordTokenExpired({ code: 429 }), false);
+  assert.equal(__test__.isDiscordTokenExpired({ status: 500 }), false);
+  assert.equal(__test__.isDiscordTokenExpired({ message: 'rate limit hit, retrying' }), false);
+  assert.equal(__test__.isDiscordTokenExpired(new Error('socket disconnected')), false);
+  assert.equal(__test__.isDiscordTokenExpired(null), false);
+  assert.equal(__test__.isDiscordTokenExpired(undefined), false);
+  assert.equal(__test__.isDiscordTokenExpired('plain string error'), false);
+});

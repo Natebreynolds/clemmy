@@ -66,6 +66,64 @@ const RESTART_MAX_MS = 30_000;
 // transient blip doesn't accumulate forever.
 const STABILITY_RESET_MS = 5 * 60_000;
 
+/**
+ * Parse a single .env file into a key/value map. Mirrors the parser in
+ * src/config.ts so user-edited .env files behave identically whether
+ * they're read by the daemon's own config module or by this supervisor
+ * before spawn.
+ *
+ * Returns {} on missing file or parse failure — never throws (a broken
+ * .env must not block daemon startup).
+ */
+function parseEnvFile(envPath: string): Record<string, string> {
+  if (!existsSync(envPath)) return {};
+  const result: Record<string, string> = {};
+  try {
+    for (const rawLine of readFileSync(envPath, 'utf-8').split('\n')) {
+      // Strip only leading whitespace + trailing \r so comment + trim
+      // semantics match config.ts; preserve trailing spaces on values.
+      const line = rawLine.replace(/^\s+|\r+$/g, '');
+      if (!line || line.startsWith('#')) continue;
+      const eqIndex = line.indexOf('=');
+      if (eqIndex === -1) continue;
+      const key = line.slice(0, eqIndex).trim();
+      let value = line.slice(eqIndex + 1);
+      if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+        value = value.slice(1, -1);
+      }
+      result[key] = value;
+    }
+  } catch {
+    // Best-effort — corrupt .env shouldn't crash the supervisor.
+  }
+  return result;
+}
+
+/**
+ * Collect .env files in the same precedence order src/config.ts uses
+ * (later wins): package dir, current working dir, $CLEMENTINE_HOME or
+ * ~/.clementine-next. Merging into the spawned daemon's process.env
+ * was missing — the daemon's env-flag reads (HARNESS_TOOL_BRACKETS,
+ * CLEMMY_TOOL_GUARDRAIL, CLEMMY_AUTO_COMPACT, etc.) hit `process.env`
+ * directly, so values in the user's home .env were invisible. Setting
+ * a flag in Settings → Runtime did nothing in production until this
+ * supervisor merge.
+ *
+ * Note: shell exports inherited via Electron's process.env still win
+ * over .env file values at spawn time (see the merge order in start()).
+ * That matches config.ts's `process.env[key] ?? env[key] ?? fallback`
+ * precedence so behavior is consistent across read paths.
+ */
+function loadDotenvBaseline(daemonProjectRoot: string): Record<string, string> {
+  const home = process.env.CLEMENTINE_HOME || path.join(os.homedir(), '.clementine-next');
+  const candidates = [
+    path.join(daemonProjectRoot, '.env'),
+    path.join(process.cwd(), '.env'),
+    path.join(home, '.env'),
+  ].filter((p, i, all) => all.indexOf(p) === i);
+  return Object.assign({}, ...candidates.map(parseEnvFile));
+}
+
 export class DaemonSupervisor {
   private child: ChildProcessByStdio<null, Readable, Readable> | null = null;
   private logStream: ReturnType<typeof createWriteStream> | null = null;
@@ -134,7 +192,18 @@ export class DaemonSupervisor {
       ...existingPath.split(':').filter(Boolean),
     ].join(':');
 
+    // Load .env files as a BASELINE before process.env. Order matters:
+    // shell exports (in process.env) override .env file values, which
+    // override nothing — but the daemon now actually SEES the .env
+    // values. Without this baseline merge, flags like
+    // HARNESS_TOOL_BRACKETS=on / CLEMMY_TOOL_GUARDRAIL=warn that the
+    // user (or Settings UI) wrote to ~/.clementine-next/.env were
+    // invisible to the daemon because the harness reads process.env
+    // directly. Diagnosed 2026-05-24 when v0.5.18 brackets work was
+    // silently inactive in production despite the flag being set.
+    const dotenvBaseline = loadDotenvBaseline(this.opts.daemonProjectRoot);
     const env: NodeJS.ProcessEnv = {
+      ...dotenvBaseline,
       ...process.env,
       ...this.opts.envOverrides,
       PATH: augmentedPath,

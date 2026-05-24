@@ -50,16 +50,69 @@ export function pickFocusTarget(query: string, active: ExecutionRecord[]): Focus
  *     inbox item) and continues
  *   - When the success criteria are met, it calls execution_complete
  *
- * Creation is deliberately NOT exposed here — chat / webhook / cron
- * flows create executions today, and we don't want the autonomy loop
- * spawning new long-running work from a single cycle's signal. Same
- * reason `mark_blocked` is paired with a check-in: blocking should
- * surface a path to unblock.
+ * Creation was previously NOT exposed here — chat / webhook / cron
+ * flows auto-created executions via assistant.respond's intake layer.
+ * That design assumed every chat went through assistant.respond. The
+ * harness path (Discord, /api/harness/chat, workflows) bypasses
+ * assistant.respond entirely, so NO execution ever auto-spawned for
+ * those sessions. With the execution-wrap gate (2026-05-24) forcing
+ * mutating external writes to require an active execution, Clem
+ * needs an explicit `execution_create` tool to comply. Exposing it
+ * with required objective + criteria fields ensures the audit-trail
+ * intent is satisfied (the gate exists precisely so the criteria
+ * exist in a queryable record, not just in the model's reasoning).
  */
 
 const store = new ExecutionStore();
 
 export function registerExecutionTools(server: McpServer): void {
+  server.tool(
+    'execution_create',
+    'Create a tracked execution lane for multi-step or mutating external work. REQUIRED before any mutating composio_execute_tool call (the execution-wrap gate enforces this). Audit-trail benefit: criteria + plan are queryable later via execution_get. Use objective for the WHAT, successCriteria for the rule you used to make decisions (e.g. "Dropped any account with no activity in 30 days OR ICP < 40"), nextStep for the immediate first action. Returns the created execution id — pass it to execution_update_step / execution_complete as work progresses.',
+    {
+      title: z.string().min(3).max(120).describe('Short scannable title (Discord presence + dashboard chip use this).'),
+      objective: z.string().min(10).max(800).describe('One-paragraph WHAT — the user-visible goal of this work.'),
+      successCriteria: z.string().min(5).max(800).describe('The rule applied to evaluate completion. For bulk decisions, the criteria that distinguish kept vs dropped / approved vs rejected items. This is the audit trail — future-you should be able to read this and answer "why did Clem make decision X?".'),
+      nextStep: z.string().min(3).max(400).describe('The immediate first action you will take (a verb + object).'),
+      reason: z.string().max(400).optional().describe('Optional one-line reason this execution was opened (defaults to "Audited execution lane opened by Clem to wrap mutating work.").'),
+    },
+    async ({ title, objective, successCriteria, nextStep, reason }) => {
+      const { harnessRunContextStorage } = await import('../runtime/harness/brackets.js');
+      const ctx = harnessRunContextStorage.getStore();
+      const sessionId = ctx?.sessionId ?? '';
+      if (!sessionId) {
+        return textResult('execution_create requires a harness session context. (Called from outside a harness-managed turn.)');
+      }
+      const existing = store.getActiveForSession(sessionId);
+      if (existing) {
+        return textResult(
+          `Active execution already exists for this session: ${existing.id} ("${existing.title}"). ` +
+            `Use execution_update_step to record progress, or execution_complete to close it before opening a new one.`,
+        );
+      }
+      const created = store.create({
+        sessionId,
+        title,
+        objective,
+        reason: reason ?? 'Audited execution lane opened by Clem to wrap mutating work.',
+        startedFromMessage: '(opened via execution_create tool)',
+        confidence: 1.0,
+        reasons: ['Explicit execution_create call'],
+        nextStep,
+        successCriteria,
+      });
+      return textResult(
+        `Created execution ${created.id} for session ${sessionId}.\n` +
+          `Title: ${created.title}\n` +
+          `Objective: ${created.objective}\n` +
+          `Success criteria: ${created.successCriteria}\n` +
+          `Next step: ${created.nextStep}\n\n` +
+          'You can now proceed with mutating external writes. Call execution_update_step between major sub-steps to record progress, and execution_complete when the success criteria are met.',
+      );
+    },
+  );
+
+
   server.tool(
     'execution_list',
     'List executions for inspection. Defaults to active + blocked; pass status="all" for everything. Use this to remind yourself what tasks are in flight.',

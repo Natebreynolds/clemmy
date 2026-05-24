@@ -51,6 +51,9 @@ import type { StreamEvent } from '@openai/agents-core/types';
 import { MODELS } from '../../config.js';
 import { loadFreshCodexAccessToken, extractAccountIdFromJwt } from './codex-client.js';
 import { BoundaryError } from '../boundary-error.js';
+import pino from 'pino';
+
+const logger = pino({ name: 'clementine.codex-model' });
 
 const CODEX_URL = 'https://chatgpt.com/backend-api/codex/responses';
 const CODEX_USER_AGENT = 'Codex/0.118.0';
@@ -59,6 +62,99 @@ const JWT_CLAIM_PATH = 'https://api.openai.com/auth';
 // ----------------------------------------------------------------------
 // Public API
 // ----------------------------------------------------------------------
+
+/**
+ * Per-attempt diagnostic capture for SSE failures. The throw site for
+ * `codex.sse_truncated` previously had no visibility into HTTP status,
+ * response headers, or request size — making real-world failures
+ * (rate-limit, backend incident, oversized request, transient TLS
+ * issue) indistinguishable. This shape is populated as the request
+ * progresses; the BoundaryError context attaches whatever fields are
+ * set when the truncation throw fires.
+ */
+interface StreamDiagnostics {
+  httpStatus?: number;
+  responseHeaders?: Record<string, string>;
+  startTs?: number;
+  firstByteTs?: number;
+  streamEndTs?: number;
+  requestBytes?: number;
+}
+
+/** Headers we care about for failure diagnostics. OpenAI/Codex
+ *  surfaces request id + rate-limit info via these; Cloudflare adds
+ *  cf-ray. Anything else would be noise. */
+const DIAGNOSTIC_HEADERS = [
+  'openai-request-id',
+  'openai-version',
+  'openai-organization',
+  'openai-processing-ms',
+  'x-ratelimit-limit-requests',
+  'x-ratelimit-remaining-requests',
+  'x-ratelimit-reset-requests',
+  'x-ratelimit-limit-tokens',
+  'x-ratelimit-remaining-tokens',
+  'x-ratelimit-reset-tokens',
+  'retry-after',
+  'cf-ray',
+] as const;
+
+function collectDiagnosticHeaders(headers: Headers): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const name of DIAGNOSTIC_HEADERS) {
+    const value = headers.get(name);
+    if (value != null && value !== '') out[name] = value;
+  }
+  return out;
+}
+
+interface RequestBodyBreakdown {
+  totalBytes: number;
+  instructionsBytes: number;
+  inputBytes: number;
+  inputItemCount: number;
+  toolsBytes: number;
+  toolCount: number;
+  /** Top-10 largest tools by serialized JSON size, for surgical
+   *  trimming. Sorted descending by bytes. */
+  topTools: Array<{ name: string; bytes: number }>;
+  otherBytes: number;
+}
+
+/**
+ * Break down a Codex request body into its top-level components so we
+ * can tell at-a-glance whether tool schema, input history, or
+ * instructions dominate the wire payload. Pure measurement — no I/O.
+ *
+ * Triggered from the SSE-truncation throw path when we suspect the
+ * request itself is the cause (oversized prefill). Lets a single
+ * trace tell the operator exactly which tools to trim.
+ */
+function sizeRequestComponents(body: CodexRequestBody): RequestBodyBreakdown {
+  const utf8 = (v: unknown): number => Buffer.byteLength(JSON.stringify(v) ?? '', 'utf8');
+  const instructionsBytes = Buffer.byteLength(body.instructions ?? '', 'utf8');
+  const inputBytes = utf8(body.input ?? []);
+  const inputItemCount = Array.isArray(body.input) ? body.input.length : 0;
+  const tools = Array.isArray(body.tools) ? body.tools : [];
+  const toolsBytes = utf8(tools);
+  const perTool: Array<{ name: string; bytes: number }> = tools.map((t) => {
+    const r = t as Record<string, unknown>;
+    const name = (r.name as string) ?? (r.function as { name?: string } | undefined)?.name ?? 'unknown';
+    return { name: String(name), bytes: utf8(t) };
+  });
+  perTool.sort((a, b) => b.bytes - a.bytes);
+  const totalBytes = utf8(body);
+  return {
+    totalBytes,
+    instructionsBytes,
+    inputBytes,
+    inputItemCount,
+    toolsBytes,
+    toolCount: tools.length,
+    topTools: perTool.slice(0, 10),
+    otherBytes: totalBytes - instructionsBytes - inputBytes - toolsBytes,
+  };
+}
 
 export class CodexResponsesModel implements Model {
   constructor(public readonly modelId: string) {}
@@ -83,11 +179,14 @@ export class CodexResponsesModel implements Model {
     const MAX_RETRY = 1;
     let lastResponseId: string | undefined;
     let lastItemCount = 0;
+    let lastDiag: StreamDiagnostics | undefined;
 
     for (let attempt = 0; attempt <= MAX_RETRY; attempt++) {
       const seenOutputItems: CodexOutputItem[] = [];
       let responseId: string | undefined;
       let completedEvent: AnyCodexEvent | undefined;
+      const diag: StreamDiagnostics = {};
+      lastDiag = diag;
       // Retry-safety gate: ONLY text deltas + output_item.done count as
       // "real content the SDK has surfaced to the user." If anything
       // here fires and the stream then truncates, retrying would
@@ -114,7 +213,7 @@ export class CodexResponsesModel implements Model {
         }
       };
 
-      for await (const evt of this.#streamCodex(request)) {
+      for await (const evt of this.#streamCodex(request, diag)) {
         if (evt.type === 'response.created' && evt.response?.id) {
           responseId = evt.response.id;
           pendingStart = { type: 'response_started', providerData: { responseId } } as StreamEvent;
@@ -212,16 +311,81 @@ export class CodexResponsesModel implements Model {
       // "connection dropped mid-stream." Throw a structured boundary
       // error instead so the harness logs it as codex.sse_truncated +
       // surfaces a real message to the user.
+      const durationMs =
+        lastDiag?.startTs != null
+          ? (lastDiag.streamEndTs ?? Date.now()) - lastDiag.startTs
+          : null;
+      const ttfbMs =
+        lastDiag?.startTs != null && lastDiag.firstByteTs != null
+          ? lastDiag.firstByteTs - lastDiag.startTs
+          : null;
+      // Rebuild the body shape so we can break it down by component.
+      // Cheap — same call we make in #streamCodex. Worth the duplication
+      // for the diagnostic since the body's not in scope here.
+      const body = buildCodexRequestBody(this.modelId, request);
+      const breakdown = sizeRequestComponents(body);
+      const diagContext = {
+        itemCount: lastItemCount,
+        responseId: lastResponseId ?? null,
+        attempts: attempt + 1,
+        modelId: this.modelId,
+        // Capture what was actually sent + what came back. Most opaque
+        // failures correlate to one of: oversized request, rate-limit
+        // (header surfaces it), or upstream incident (HTTP status or
+        // ttfb anomaly). Without this we were guessing.
+        httpStatus: lastDiag?.httpStatus ?? null,
+        responseHeaders: lastDiag?.responseHeaders ?? {},
+        requestBytes: lastDiag?.requestBytes ?? null,
+        durationMs,
+        ttfbMs,
+        bodyBreakdown: breakdown,
+      };
+      // Persist the full request body + breakdown to disk so we can
+      // post-mortem WHICH tools dominate the request. Mirrors the
+      // existing codex-4xx-trace pattern from #streamCodex. Stored in
+      // a separate folder so 4xx traces and SSE-truncation traces
+      // don't blur together.
+      try {
+        const { atomicJsonMutate } = await import('../atomic-json.js');
+        const path = await import('node:path');
+        const { BASE_DIR } = await import('../../config.js');
+        const tracePath = path.join(
+          BASE_DIR,
+          'state',
+          'codex-sse-truncated',
+          `${Date.now()}-${this.modelId}.json`,
+        );
+        await atomicJsonMutate(
+          tracePath,
+          () => ({
+            ts: new Date().toISOString(),
+            kind: 'codex.sse_truncated',
+            diagnostics: diagContext,
+            // Full body — the WHOLE thing. This is the only artifact
+            // that tells us which tools are dominating the schema.
+            // ~2-3 MB per trace is fine; we'll auto-prune after a
+            // few weeks if storage becomes a concern.
+            requestBody: body,
+          }),
+          {} as Record<string, unknown>,
+        );
+      } catch {
+        // best-effort: never block the throw path on a trace write
+      }
+      // Emit a structured log line BEFORE the throw so the failure is
+      // visible even if a downstream consumer swallows BoundaryError's
+      // .context. Pino warn level — surfaces in the supervisor log
+      // ndjson stream where operators look first.
+      logger.warn(
+        { ...diagContext, kind: 'codex.sse_truncated' },
+        'Codex SSE truncated — stream ended without response.completed',
+      );
       throw new BoundaryError({
         kind: 'codex.sse_truncated',
         retryable: true,
         userMessage: "Clementine's model backend dropped the connection before finishing this turn. Retry — if it persists, the Codex backend may be having an incident.",
-        operatorMessage: `getStreamedResponse: SSE ended without response.completed (items=${lastItemCount}, responseId=${lastResponseId ?? 'none'}, attempts=${attempt + 1})`,
-        context: {
-          itemCount: lastItemCount,
-          responseId: lastResponseId ?? null,
-          attempts: attempt + 1,
-        },
+        operatorMessage: `getStreamedResponse: SSE ended without response.completed (items=${lastItemCount}, responseId=${lastResponseId ?? 'none'}, attempts=${attempt + 1}, httpStatus=${lastDiag?.httpStatus ?? 'unknown'}, durationMs=${durationMs ?? 'unknown'})`,
+        context: diagContext,
       });
     }
   }
@@ -229,8 +393,15 @@ export class CodexResponsesModel implements Model {
   /**
    * Single source of truth for "make the codex request, yield SSE
    * events." Both getResponse and getStreamedResponse consume it.
+   *
+   * The optional `diag` parameter is a mutable diagnostics bag the
+   * caller passes when it wants HTTP metadata + timing to survive
+   * out of the generator scope (used by getStreamedResponse so the
+   * BoundaryError can carry real diagnostic context when an SSE
+   * truncation fires — without this every failure was indistinguish-
+   * able from every other).
    */
-  async *#streamCodex(request: ModelRequest): AsyncGenerator<AnyCodexEvent> {
+  async *#streamCodex(request: ModelRequest, diag?: StreamDiagnostics): AsyncGenerator<AnyCodexEvent> {
     const token = await loadFreshCodexAccessToken();
     const accountId = extractAccountIdFromJwt(token) ?? '';
     if (!accountId) {
@@ -241,12 +412,22 @@ export class CodexResponsesModel implements Model {
     }
 
     const body = buildCodexRequestBody(this.modelId, request);
+    const bodyJson = JSON.stringify(body);
+    if (diag) {
+      diag.startTs = Date.now();
+      diag.requestBytes = Buffer.byteLength(bodyJson, 'utf8');
+    }
     const res = await fetch(CODEX_URL, {
       method: 'POST',
       headers: buildCodexHeaders(token, accountId),
-      body: JSON.stringify(body),
+      body: bodyJson,
       signal: request.signal,
     });
+    if (diag) {
+      diag.httpStatus = res.status;
+      diag.responseHeaders = collectDiagnosticHeaders(res.headers);
+      diag.firstByteTs = Date.now();
+    }
 
     if (!res.ok) {
       const detail = await safeReadErrorBody(res);
@@ -302,7 +483,11 @@ export class CodexResponsesModel implements Model {
       throw new CodexModelError('Codex /responses returned an empty body.');
     }
 
-    yield* parseCodexSse(res.body);
+    try {
+      yield* parseCodexSse(res.body);
+    } finally {
+      if (diag) diag.streamEndTs = Date.now();
+    }
   }
 }
 

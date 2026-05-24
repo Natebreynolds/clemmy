@@ -775,6 +775,7 @@ function pendingDiscordApprovalsForChannel(channelId: string): approvalRegistry.
 
 export const __test__ = {
   approvalBelongsToDiscordChannel,
+  isDiscordTokenExpired,
 };
 
 /**

@@ -77,6 +77,34 @@ function clip(text: string | undefined | null, max: number): string | null {
   return `${text.slice(0, max)}…[+${text.length - max} chars]`;
 }
 
+/**
+ * Tool-return-specific clip. When the original is over the budget AND
+ * we have a callId, emit a marker the model can actually act on —
+ * `recall_tool_result("<call_id>")` retrieves the full payload from
+ * the `tool_outputs` side store (already written upstream of this
+ * call by writeToolOutput). Falls back to the bare `…[+N chars]`
+ * marker when callId is missing, since recall isn't possible without
+ * it. Matches the marker format Layer 1 compaction uses
+ * (compaction.ts:48) so the model sees the same recovery pattern
+ * everywhere — without this consistency, models hesitate to call
+ * recall_tool_result because the inline marker looked different.
+ */
+function clipToolResult(
+  text: string | undefined | null,
+  max: number,
+  callId: string | undefined,
+  toolName: string | null | undefined,
+): string | null {
+  if (text == null) return null;
+  if (text.length <= max) return text;
+  const head = text.slice(0, max);
+  if (callId) {
+    const iso = new Date().toISOString();
+    return `${head}\n[clipped: ${toolName ?? 'tool'} returned ${text.length} chars at ${iso} — call recall_tool_result("${callId}") for full output]`;
+  }
+  return `${head}…[+${text.length - max} chars]`;
+}
+
 function callIdFromDetails(details: ToolDetails | undefined): string | undefined {
   const call = details?.toolCall;
   return call?.callId ?? call?.id;
@@ -232,7 +260,12 @@ export function attachEventLogHooks(
         data: {
           tool: tool?.name ?? null,
           callId: callId ?? null,
-          result: clip(typeof result === 'string' ? result : null, maxResultChars),
+          result: clipToolResult(
+            typeof result === 'string' ? result : null,
+            maxResultChars,
+            callId,
+            tool?.name,
+          ),
         },
         parentEventId,
       });

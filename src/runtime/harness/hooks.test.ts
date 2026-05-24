@@ -126,6 +126,108 @@ test('tool_called and tool_returned correlate via callId', () => {
   assert.equal(returned[0].data.result, 'ok');
 });
 
+test('large tool_returned result uses recall_tool_result marker when callId present', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const stub = makeStub();
+  attachEventLogHooks(stub, {
+    getSessionId: extractSessionIdFromContext,
+    maxResultChars: 50,
+  });
+  const callId = 'call_recall_test';
+  const longResult = 'A'.repeat(500);
+  stub.emit(
+    'agent_tool_start',
+    ctx(sess.id),
+    { name: 'executor' },
+    { name: 'composio_execute_tool' },
+    { toolCall: { callId, arguments: '{}' } },
+  );
+  stub.emit(
+    'agent_tool_end',
+    ctx(sess.id),
+    { name: 'executor' },
+    { name: 'composio_execute_tool' },
+    longResult,
+    { toolCall: { callId } },
+  );
+
+  const returned = listEvents(sess.id, { types: ['tool_returned'] });
+  assert.equal(returned.length, 1);
+  const result = String(returned[0].data.result);
+  // Head preserved
+  assert.ok(result.startsWith('A'.repeat(50)), 'head preserved');
+  // Marker references the callId in the recall_tool_result form
+  assert.match(result, /recall_tool_result\("call_recall_test"\)/);
+  // Original length surfaced in the marker
+  assert.match(result, /returned 500 chars/);
+  // Tool name surfaced
+  assert.match(result, /composio_execute_tool/);
+});
+
+test('large tool_returned without callId falls back to basic +N chars marker', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const stub = makeStub();
+  attachEventLogHooks(stub, {
+    getSessionId: extractSessionIdFromContext,
+    maxResultChars: 50,
+  });
+  const longResult = 'B'.repeat(500);
+  stub.emit(
+    'agent_tool_start',
+    ctx(sess.id),
+    { name: 'executor' },
+    { name: 'mystery_tool' },
+    // No callId — recall_tool_result can't recover this anyway
+    { toolCall: {} },
+  );
+  stub.emit(
+    'agent_tool_end',
+    ctx(sess.id),
+    { name: 'executor' },
+    { name: 'mystery_tool' },
+    longResult,
+    { toolCall: {} },
+  );
+
+  const returned = listEvents(sess.id, { types: ['tool_returned'] });
+  assert.equal(returned.length, 1);
+  const result = String(returned[0].data.result);
+  assert.ok(result.startsWith('B'.repeat(50)), 'head preserved');
+  // Falls back to the basic marker — recall isn't possible without callId
+  assert.match(result, /\+450 chars\]/);
+  assert.ok(!result.includes('recall_tool_result'), 'no false recall hint when callId absent');
+});
+
+test('small tool_returned passes through unchanged regardless of callId', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const stub = makeStub();
+  attachEventLogHooks(stub, {
+    getSessionId: extractSessionIdFromContext,
+    maxResultChars: 50,
+  });
+  stub.emit(
+    'agent_tool_start',
+    ctx(sess.id),
+    { name: 'executor' },
+    { name: 'read_file' },
+    { toolCall: { callId: 'call_small' } },
+  );
+  stub.emit(
+    'agent_tool_end',
+    ctx(sess.id),
+    { name: 'executor' },
+    { name: 'read_file' },
+    'tiny',
+    { toolCall: { callId: 'call_small' } },
+  );
+
+  const returned = listEvents(sess.id, { types: ['tool_returned'] });
+  assert.equal(String(returned[0].data.result), 'tiny');
+});
+
 test('two parallel tool calls correlate independently', () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });

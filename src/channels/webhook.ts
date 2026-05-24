@@ -259,6 +259,21 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
       daemon_state: readDaemonState(),
       recent_cron_runs: readRecentJsonLines(DASHBOARD_CRON_RUNS_DIR, 10),
       recent_workflow_runs: readWorkflowRuns(10),
+      // Runtime flag introspection — surfaces the env-var values the
+      // harness actually sees at runtime, so a Settings-UI edit can
+      // be verified end-to-end (supervisor → daemon process.env).
+      // Added 2026-05-24 after the env-injection fix landed; without
+      // this there was no non-invasive way to confirm .env values
+      // reached the daemon.
+      runtime_flags: {
+        HARNESS_TOOL_BRACKETS: process.env.HARNESS_TOOL_BRACKETS ?? null,
+        CLEMMY_TOOL_GUARDRAIL: process.env.CLEMMY_TOOL_GUARDRAIL ?? null,
+        CLEMMY_PREFLIGHT_GATE: process.env.CLEMMY_PREFLIGHT_GATE ?? null,
+        CLEMMY_AUTO_COMPACT: process.env.CLEMMY_AUTO_COMPACT ?? null,
+        HARNESS_SESSION_LOCK: process.env.HARNESS_SESSION_LOCK ?? null,
+        OPENAI_MODEL_PRIMARY: process.env.OPENAI_MODEL_PRIMARY ?? null,
+        AUTH_MODE: process.env.AUTH_MODE ?? null,
+      },
     });
   });
 
