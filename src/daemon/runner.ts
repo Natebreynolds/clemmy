@@ -932,11 +932,17 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
         );
       }
     }
-    // Persist a daemon-alive heartbeat every ~minute so a future boot
-    // can detect outages and surface missed cron firings. Pinning to
-    // every 4 ticks (~60s) keeps disk traffic minimal while staying
-    // well inside cron's minute-resolution gap detection threshold.
-    if (tickCount % 4 === 0) {
+    // Persist a daemon-alive heartbeat. Two cadences:
+    //   - tick 1 (15s after boot): immediate write so a quick restart
+    //     cycle doesn't keep computing "offline X min" against a
+    //     stale pre-quit timestamp. Observed 2026-05-24 during hot-
+    //     patch cycles — three back-to-back restarts < 60s each
+    //     emitted three duplicate "offline" notifications with
+    //     compounding gap values because tickCount % 4 never reached.
+    //   - every 4 ticks (~60s) thereafter: steady-state cadence.
+    //     Keeps disk traffic minimal while staying inside cron's
+    //     minute-resolution gap detection threshold.
+    if (tickCount === 1 || tickCount % 4 === 0) {
       state.lastHealthyTickAt = new Date().toISOString();
       saveState(state);
     }

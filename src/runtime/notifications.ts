@@ -217,6 +217,16 @@ export function listNotifications(limit = 20): NotificationRecord[] {
 
 export function addNotification(item: NotificationRecord): void {
   const items = loadNotifications();
+  // ID dedup added 2026-05-24: callers (cron heartbeat, daemon-offline
+  // check, etc.) pass a STABLE id when they want at-most-once delivery.
+  // Without this, three daemon restarts within a minute emitted three
+  // "offline X min" notifications with the SAME id-key seed but
+  // recomputed gap values — confusing duplicate reports of the same
+  // outage. Content-dedup (proactive briefs, approvals) stays as a
+  // secondary safety net for kinds that don't bother setting a stable id.
+  if (item.id && items.some((existing) => existing.id === item.id)) {
+    return;
+  }
   if (items.some((existing) =>
     isRecentDuplicateProactiveBrief(existing, item) ||
     isDuplicateApprovalNotification(existing, item)

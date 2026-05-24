@@ -2275,6 +2275,19 @@ function extractApprovalSubject(info: InterruptionInfo): string {
     return 'Write file';
   }
 
+  // request_approval is itself an "ask for approval on X" tool — the
+  // subject IS the human label, so prefixing with the tool name
+  // ("request_approval: deploy to prod") is double-named noise. Mirror
+  // the special-case already in approval-summary.ts:previewToolCall.
+  if (info.toolName === 'request_approval') {
+    const subject =
+      (typeof args.subject === 'string' && args.subject)
+      || (typeof args.reason === 'string' && args.reason)
+      || '';
+    if (subject) return truncate(subject, 100);
+    return info.toolName;
+  }
+
   // Generic: pull a meaningful field out of args.
   for (const key of ['subject', 'title', 'name', 'action', 'command', 'message', 'directive']) {
     const v = args[key];

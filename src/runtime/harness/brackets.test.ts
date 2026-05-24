@@ -163,6 +163,45 @@ test('withTimeout propagates the underlying error', async () => {
   await assert.rejects(() => withTimeout(failing, 50, 'fail'), /boom/);
 });
 
+// P0-2 (v0.5.5): when the SDK pauses a tool for approval, the
+// withTimeout timer must NOT fire — the tool isn't stuck, it's parked.
+// The shipped fix re-arms the timer while isPaused() reports true.
+test('withTimeout does not fire while isPaused() returns true', async () => {
+  // Work that settles AFTER the nominal timeout. With isPaused
+  // permanently true, withTimeout must re-arm and let the work win.
+  const work = new Promise<string>((resolve) => setTimeout(() => resolve('done'), 80));
+  const value = await withTimeout(work, 20, 'parked_tool', {
+    isPaused: () => true,
+    pauseRecheckMs: 20,
+  });
+  assert.equal(value, 'done', 'withTimeout rejected while paused — re-arm regressed');
+});
+
+test('withTimeout fires once isPaused() returns false', async () => {
+  // Work outlives the test — only the timeout can settle withTimeout.
+  // Flip isPaused → false after one re-arm window so the next tick fires.
+  const work = new Promise<string>((resolve) => setTimeout(() => resolve('late'), 500));
+  let paused = true;
+  const flipTimer = setTimeout(() => { paused = false; }, 25);
+  try {
+    await assert.rejects(
+      () => withTimeout(work, 15, 'parked_then_unparked', {
+        isPaused: () => paused,
+        pauseRecheckMs: 15,
+      }),
+      (err: unknown) => {
+        assert.ok(err instanceof ToolTimeout);
+        assert.equal(err.toolName, 'parked_then_unparked');
+        return true;
+      },
+    );
+  } finally {
+    clearTimeout(flipTimer);
+  }
+  // Let the late work settle so the timer doesn't leak past the test.
+  await work;
+});
+
 test('timeoutForTool: run_shell_command uses the shell budget', () => {
   assert.equal(timeoutForTool('run_shell_command'), DEFAULT_TIMEOUTS_MS.shell);
 });

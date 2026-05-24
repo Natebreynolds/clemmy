@@ -316,7 +316,15 @@ export function sweepCrashedExecutions(staleAfterMs = 5 * 60 * 1000): number {
     const ageMinutes = Math.round((Date.now() - heartbeatTime) / 60000);
     transitionToFailed(
       execution,
-      `Controller heartbeat stalled for ${ageMinutes}m — daemon likely crashed mid-cycle.`,
+      // Honest framing: a stale heartbeat could be (a) the daemon
+      // actually crashed, or (b) the daemon was alive but didn't tick
+      // this execution's controller for too long (busy with a long
+      // user-facing turn, blocked sub-process, etc.). The earlier
+      // "daemon likely crashed mid-cycle" wording was misleading in
+      // case (b) — sent users hunting for a crash that wasn't there.
+      // Observed 2026-05-24 with a synthesis execution that starved
+      // while the daemon was alive and processing Discord.
+      `Controller heartbeat stalled for ${ageMinutes}m — the execution stopped getting controller cycles (the daemon may have been busy on other work or restarted).`,
       `sweep-crashed-${Date.now()}`,
     );
     swept += 1;
