@@ -3698,15 +3698,61 @@ export function registerConsoleRoutes(
     setImmediate(async () => {
       try {
         const agent = await buildOrchestratorAgent();
-        await runConversationFromResume({
-          agent,
-          sessionId,
-          decision,
-          modifiedArgs,
-        });
-        const pending = approvalRegistry.listPending({ sessionId, status: 'pending' });
-        for (const row of pending) {
-          approvalRegistry.resolve(row.approvalId, auditResolution, 'desktop-command-center');
+        // v0.5.19 Bug A fix — sticky-approval auto-resume.
+        // After the initial resume, the resumed turn may itself trigger
+        // a fresh approval pause (e.g. a composio_execute_tool inside the
+        // same logical workflow). Previously we resolved those new
+        // pending approvals here but never re-entered the runtime,
+        // leaving the session paused with all approvals resolved — a
+        // state inconsistency that needed a "/continue" nudge to escape.
+        // Now: loop resume → auto-resolve → resume until either no new
+        // pending approvals remain OR we hit a safety cap of 5 iterations
+        // (defense-in-depth against pathological prompts that approve
+        // unboundedly). Each iteration's auto-resolve uses the same
+        // decision the user originally chose for the first approval —
+        // that's the "sticky" semantic the audit event already records.
+        const MAX_STICKY_RESUMES = 5;
+        let resumeIter = 0;
+        // First resume always runs with the user's decision + modifiedArgs.
+        let currentDecision = decision;
+        let currentModifiedArgs = modifiedArgs;
+        while (resumeIter < MAX_STICKY_RESUMES) {
+          resumeIter += 1;
+          await runConversationFromResume({
+            agent,
+            sessionId,
+            decision: currentDecision,
+            modifiedArgs: currentModifiedArgs,
+          });
+          const pending = approvalRegistry.listPending({ sessionId, status: 'pending' });
+          if (pending.length === 0) break;
+          // Auto-resolve new pending approvals using the same audit
+          // resolution as the user's original choice, then loop to
+          // re-enter the runtime. After the first auto-resume,
+          // modifiedArgs no longer applies (the edit was a one-shot for
+          // the specific call the user reviewed).
+          for (const row of pending) {
+            approvalRegistry.resolve(row.approvalId, auditResolution, 'desktop-command-center');
+          }
+          currentDecision = decision === 'approve_with_edits' ? 'approve' : decision;
+          currentModifiedArgs = undefined;
+        }
+        if (resumeIter === MAX_STICKY_RESUMES) {
+          try {
+            appendHarnessEvent({
+              sessionId,
+              turn: 0,
+              role: 'system',
+              type: 'run_failed',
+              data: {
+                error: `Sticky-resume safety cap (${MAX_STICKY_RESUMES}) reached — agent kept creating new approvals every turn`,
+                stage: 'sticky_resume_cap',
+                resumeIter,
+              },
+            });
+          } catch {
+            // best effort
+          }
         }
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);

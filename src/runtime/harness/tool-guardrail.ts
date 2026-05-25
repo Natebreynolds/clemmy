@@ -27,8 +27,69 @@
 
 import { createHash } from 'node:crypto';
 import pino from 'pino';
+import { readGuardrailState, writeGuardrailState } from './eventlog.js';
 
 const logger = pino({ name: 'clementine.harness.tool-guardrail' });
+
+// ─────────────────────────────────────────────────────────────────
+// v0.5.19 F6 — sqlite persistence (write-through cache)
+// ─────────────────────────────────────────────────────────────────
+
+/** Write-through cadence — flush to sqlite every Nth call per session.
+ *  Bounded by the recentWindowSize anyway (~50 entries each holding a
+ *  signature + toolName + ms), so each row is a few KB. */
+const PERSIST_EVERY_N_CALLS = 5;
+
+function persistEnabled(): boolean {
+  const raw = (process.env.CLEMMY_GUARDRAIL_PERSIST ?? 'on').toLowerCase();
+  return raw !== 'off';
+}
+
+function rehydrateFromSqlite(sessionId: string): SessionTrackerState | null {
+  if (!persistEnabled()) return null;
+  let recentJson: string | null = null;
+  try {
+    recentJson = readGuardrailState(sessionId);
+  } catch (err) {
+    logger.warn({ sessionId, err: err instanceof Error ? err.message : err }, 'rehydrate read failed');
+    return null;
+  }
+  if (!recentJson) return null;
+  let recent: TrackedCall[];
+  try {
+    const parsed = JSON.parse(recentJson) as TrackedCall[];
+    if (!Array.isArray(parsed)) return null;
+    recent = parsed;
+  } catch {
+    return null;
+  }
+  // Rebuild derived state from `recent` so the in-memory shape is
+  // identical to a session that's been running in-process.
+  const countBySignature = new Map<string, number>();
+  const distinctArgsByMutTool = new Map<string, Set<string>>();
+  for (const call of recent) {
+    countBySignature.set(call.signature, (countBySignature.get(call.signature) ?? 0) + 1);
+    if (MUTATING_TOOLS.has(call.toolName)) {
+      let set = distinctArgsByMutTool.get(call.toolName);
+      if (!set) {
+        set = new Set();
+        distinctArgsByMutTool.set(call.toolName, set);
+      }
+      set.add(call.signature);
+    }
+  }
+  return { recent, countBySignature, distinctArgsByMutTool };
+}
+
+function persistTracker(sessionId: string, tracker: SessionTrackerState): void {
+  if (!persistEnabled()) return;
+  try {
+    writeGuardrailState(sessionId, JSON.stringify(tracker.recent));
+  } catch (err) {
+    // Don't block the tool call on a persistence failure — log once.
+    logger.warn({ sessionId, err: err instanceof Error ? err.message : err }, 'persist write failed');
+  }
+}
 
 // ─────────────────────────────────────────────────────────────────
 // Tool classification
@@ -157,7 +218,12 @@ const trackers = new Map<string, SessionTrackerState>();
 function getOrCreateTracker(sessionId: string): SessionTrackerState {
   let t = trackers.get(sessionId);
   if (!t) {
-    t = { recent: [], countBySignature: new Map(), distinctArgsByMutTool: new Map() };
+    // v0.5.19 F6 — first cache touch in this process: try rehydrating
+    // from sqlite. Multi-hour workflows that cross a daemon restart
+    // get their loop-detection state back. New sessions just see null
+    // and start fresh.
+    t = rehydrateFromSqlite(sessionId)
+      ?? { recent: [], countBySignature: new Map(), distinctArgsByMutTool: new Map() };
     trackers.set(sessionId, t);
   }
   return t;
@@ -237,6 +303,15 @@ export function evaluateToolCall(
     }
     set.add(signature);
   }
+
+  // v0.5.19 F6 — write-through to sqlite on every call. Bounded by
+  // recentWindowSize (~50 entries × ~100 bytes each = ~5KB per row),
+  // so cost is negligible vs the eventlog append already happening
+  // for every tool call. Failures are logged and ignored — the
+  // in-memory tracker is the source of truth for this process. The
+  // PERSIST_EVERY_N_CALLS knob is retained for future opt-out via
+  // env if the write cost ever becomes measurable.
+  persistTracker(sessionId, tracker);
 
   const exactCount = tracker.countBySignature.get(signature) ?? 1;
   const isMut = MUTATING_TOOLS.has(toolName);
@@ -332,8 +407,18 @@ export function applyMode(decision: GuardrailDecision, mode: GuardrailMode = rea
 /** Reset the per-session tracker for the given session. Used by
  *  tests + by session lifecycle hooks if we want to clear state on
  *  session end (currently we let the in-memory map grow until the
- *  daemon restarts). */
+ *  daemon restarts).
+ *  v0.5.19 F6: only clears the in-memory cache, NOT the sqlite row.
+ *  Use clearTrackerPersistent() to wipe both — that's the session-end
+ *  hook we'd wire when sessions transition to terminal states. */
 export function resetTracker(sessionId: string): void {
+  trackers.delete(sessionId);
+}
+
+/** Test-only: simulate a daemon restart by dropping the in-memory
+ *  cache without touching sqlite. The next getOrCreateTracker call
+ *  for this session will rehydrate from the persisted row. */
+export function _simulateRestartForTests(sessionId: string): void {
   trackers.delete(sessionId);
 }
 

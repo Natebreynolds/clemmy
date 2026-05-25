@@ -3,7 +3,15 @@
  *
  * Tool-call guardrail (primitive 6) — loop detection + tool-return
  * size enforcement. Pure-logic tests; no SDK, no DB.
+ *
+ * v0.5.19 F6 — these tests use synthetic session ids that don't
+ * exist in the sqlite sessions table, so the new write-through
+ * persistence would log FK constraint failures on every call.
+ * Bypass with the revert flag — the F6 sub-test in
+ * scripts/verify-long-running.mjs exercises the persistence path
+ * with real session rows.
  */
+process.env.CLEMMY_GUARDRAIL_PERSIST = 'off';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {

@@ -115,6 +115,44 @@ export function getHarnessBudgetSettings(): HarnessBudgetRuntime {
   };
 }
 
+/**
+ * v0.5.19 F2 — return an "elevated" version of the current budget
+ * runtime when the conversation looks like it'll need more headroom.
+ *
+ * Triggered by the preflight gate seeing `fractionUsed > 0.5` early
+ * in a `standard`-preset chat session. Standard's 40 steps / 40
+ * turns / 40 tools-per-turn caps trap a long-running task with no
+ * recourse (autoContinueOnLimit=false). The elevated runtime applies
+ * the `long` preset's defaults (160 / 120 / 80, autoContinue=true)
+ * for the remainder of THIS conversation only — no env mutation, no
+ * settings.json write. One-way ratchet: never downgrades.
+ *
+ * Honors env override `CLEMMY_AUTOBUMP_BUDGET=off` (default on).
+ */
+export function getElevatedBudget(current: HarnessBudgetRuntime): HarnessBudgetRuntime {
+  if ((getRuntimeEnv('CLEMMY_AUTOBUMP_BUDGET', 'on') ?? 'on').toLowerCase() === 'off') {
+    return current;
+  }
+  // Only elevate from standard. Already on long/unlimited? No change.
+  if (current.preset !== 'standard') return current;
+  const long = PRESETS.long;
+  const elevatedWallMinutes = Math.max(current.maxConversationWallMinutes, long.maxConversationWallMinutes);
+  return {
+    // Preset stays as the operator-selected named default — but the
+    // runtime caps reflect the elevated shape so the rest of the run
+    // gets headroom.
+    preset: current.preset,
+    maxConversationSteps: Math.max(current.maxConversationSteps, long.maxConversationSteps),
+    maxConversationWallMinutes: elevatedWallMinutes,
+    maxConversationWallMs: elevatedWallMinutes > 0 ? elevatedWallMinutes * 60 * 1000 : 0,
+    maxTurns: Math.max(current.maxTurns, long.maxTurns),
+    toolCallsPerTurn: Math.max(current.toolCallsPerTurn, long.toolCallsPerTurn),
+    checkInMinutes: Math.min(current.checkInMinutes, long.checkInMinutes),
+    autoContinueOnLimit: true, // critical — the standard preset's `false` is the trap
+    unlimited: current.unlimited,
+  };
+}
+
 export function getHarnessBudgetSnapshot(): {
   settings: HarnessBudgetRuntime;
   presets: typeof HARNESS_BUDGET_PRESETS;

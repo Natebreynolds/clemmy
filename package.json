@@ -1,6 +1,6 @@
 {
   "name": "clemmy",
-  "version": "0.5.18",
+  "version": "0.5.20",
   "description": "Lightweight background agent system — proactive, customizable, runs out of the box",
   "license": "MIT",
   "homepage": "https://github.com/Natebreynolds/clemmy",
@@ -58,7 +58,7 @@
     "@composio/core": "^0.10.0",
     "@inquirer/prompts": "^8.4.1",
     "@modelcontextprotocol/sdk": "^1.18.1",
-    "@openai/agents": "^0.1.11",
+    "@openai/agents": "^0.3.9",
     "better-sqlite3": "^11.7.0",
     "cytoscape": "^3.33.3",
     "discord.js": "^14.26.2",

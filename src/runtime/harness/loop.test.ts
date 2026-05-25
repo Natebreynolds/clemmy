@@ -26,6 +26,18 @@ const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-harness-loop-test-')
 process.env.CLEMENTINE_HOME = TMP_HOME;
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
+// v0.5.19 F4 — the new default behavior on stall-retry exhaustion is
+// to convert into a synthetic `ask_user_question` (status flips to
+// 'awaiting_user_input'). The existing tests in this file exercise
+// the LEGACY terminate-on-stall path (`sub_agent_stalled` reason,
+// status='completed') which is still supported via the revert flag.
+// Set the flag here so the legacy assertions remain valid AND set
+// MAX_STALL_RETRIES=1 (the pre-v0.5.19 default) so the retry-count
+// tests stay accurate. End-to-end coverage of the NEW default lives
+// in scripts/verify-long-running.mjs → stall-converts-to-question.
+process.env.HARNESS_STALL_ASK_USER = 'off';
+process.env.HARNESS_MAX_STALL_RETRIES = '1';
+
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';

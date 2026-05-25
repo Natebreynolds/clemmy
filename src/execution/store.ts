@@ -6,6 +6,10 @@ import type { ExecutionRecord, PlanRecord } from '../types.js';
 import { isUserFacingExecution } from './scope.js';
 import { actionBus } from '../runtime/action-bus.js';
 import { addNotification } from '../runtime/notifications.js';
+// v0.5.19 Bug F — pause-aware sweep needs these. Static ESM imports
+// (no circular dep: neither module imports from execution/store).
+import * as approvalRegistry from '../runtime/harness/approval-registry.js';
+import { listEvents as listHarnessEvents } from '../runtime/harness/eventlog.js';
 
 const STATE_DIR = path.join(BASE_DIR, 'state');
 const EXECUTIONS_FILE = path.join(STATE_DIR, 'executions.json');
@@ -313,6 +317,19 @@ export function sweepCrashedExecutions(staleAfterMs = 5 * 60 * 1000): number {
     if (!execution.lastHeartbeatAt) continue;
     const heartbeatTime = Date.parse(execution.lastHeartbeatAt);
     if (!Number.isFinite(heartbeatTime) || heartbeatTime > cutoff) continue;
+    // v0.5.19 Bug F fix — pause-aware sweep. If the execution's session
+    // is legitimately parked on a user prompt (pending approval, recent
+    // awaiting_user_input event from F4/Bug C), the heartbeat going
+    // stale is EXPECTED — the controller has nothing to do until the
+    // user replies. Auto-failing here kills the execution lane so when
+    // the user does reply, EXECUTION_WRAP_REQUIRED has no active lane
+    // and the next mutating call fails or requires a fresh wrap.
+    // Same architecture pattern as P0-2 (per-tool timeout during
+    // approval wait, fixed v0.5.5 via withTimeout's isPaused check).
+    // Honors CLEMMY_SWEEP_AWARE_OF_PAUSES=off to revert.
+    if (isExecutionLegitimatelyIdle(execution)) {
+      continue;
+    }
     const ageMinutes = Math.round((Date.now() - heartbeatTime) / 60000);
     transitionToFailed(
       execution,
@@ -331,6 +348,54 @@ export function sweepCrashedExecutions(staleAfterMs = 5 * 60 * 1000): number {
   }
   if (swept > 0) saveExecutions(executions);
   return swept;
+}
+
+/**
+ * v0.5.19 Bug F — pause-aware sweep helper. Returns true when the
+ * execution's session is in a state where the controller is RIGHT
+ * NOT to be ticking — pending approval, recent awaiting_user_input
+ * from F4/Bug C ask-user routing. The sweep should skip these.
+ *
+ * v0.5.19 follow-up: initial implementation used CommonJS require()
+ * which throws ReferenceError in this ESM package — the try/catch
+ * silently swallowed it and the function returned false for every
+ * call, defeating the fix. Now uses static ESM imports (no circular
+ * dep risk: neither eventlog nor approval-registry imports from
+ * execution/store).
+ *
+ * Honors CLEMMY_SWEEP_AWARE_OF_PAUSES=off to revert.
+ */
+function isExecutionLegitimatelyIdle(execution: { sessionId: string }): boolean {
+  if ((process.env.CLEMMY_SWEEP_AWARE_OF_PAUSES ?? 'on').toLowerCase() === 'off') {
+    return false;
+  }
+  try {
+    if (approvalRegistry.hasPending(execution.sessionId)) return true;
+  } catch {
+    // best-effort; better to sweep a real crash than to never reap
+  }
+  try {
+    const recent = listHarnessEvents(execution.sessionId, { types: ['awaiting_user_input'], limit: 1 });
+    if (recent.length > 0) {
+      // Treat any awaiting_user_input event in the LAST 24h as
+      // legitimate idle. After 24h the session is probably abandoned
+      // and the sweep should reap.
+      const evt = recent[0] as { type: string; createdAt?: string; ts?: string };
+      const ts = evt.createdAt ?? evt.ts;
+      if (ts) {
+        const evtTime = Date.parse(ts);
+        if (Number.isFinite(evtTime) && Date.now() - evtTime < 24 * 60 * 60 * 1000) {
+          return true;
+        }
+      } else {
+        // No timestamp — be generous and treat as idle.
+        return true;
+      }
+    }
+  } catch {
+    // best-effort
+  }
+  return false;
 }
 
 /**

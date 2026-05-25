@@ -1,4 +1,5 @@
 import type { PendingApproval } from '../types.js';
+import { listEvents as listHarnessEvents } from './harness/eventlog.js';
 
 /**
  * Build a short human-readable description of what a pending approval
@@ -53,6 +54,41 @@ export function summarizeApprovalAction(approval: PendingApproval): string {
     case 'task_update': {
       const title = pickString(args, ['title', 'description', 'text', 'name']);
       return title ? trim(title, 220) : `${tool}`;
+    }
+    case 'request_approval': {
+      // v0.5.20 Bug J — render subject + reason + preview so the user
+      // sees WHAT they are approving in the Discord card body, not
+      // just the generic step name. Preview can be (a) provided
+      // explicitly by the model via the `preview` arg, OR (b)
+      // auto-enriched by the runtime from the session's recent
+      // tool_returned events. The auto path means workflows + ad-hoc
+      // approvals get content visibility without per-workflow edits
+      // or relying on the model to remember to populate preview.
+      const subject = pickString(args, ['subject']);
+      const reason = pickString(args, ['reason']);
+      const explicit = args.preview as ApprovalPreview | undefined | null;
+      const preview = explicit ?? autoInferPreview(approval);
+      const lines: string[] = [];
+      if (subject) lines.push(trim(subject, 240));
+      if (reason) lines.push(`_Why:_ ${trim(reason, 240)}`);
+      if (preview) {
+        const countStr = typeof preview.count === 'number' ? `**${preview.count} item${preview.count === 1 ? '' : 's'}**` : '';
+        const samples = Array.isArray(preview.samples) ? preview.samples.slice(0, 5) : [];
+        if (countStr || samples.length > 0) {
+          lines.push('');
+          if (countStr) lines.push(countStr);
+          for (const s of samples) {
+            const label = s?.label ? `**${trim(s.label, 30)}:**` : '•';
+            const value = s?.value ? trim(s.value, 160) : '';
+            const sec = s?.secondary ? ` _(${trim(s.secondary, 120)})_` : '';
+            lines.push(`${label} ${value}${sec}`);
+          }
+          if (preview.inferred) {
+            lines.push('_(auto-inferred from recent tool output)_');
+          }
+        }
+      }
+      return lines.length > 0 ? lines.join('\n') : `${tool}`;
     }
     default: {
       return trim(JSON.stringify(args), 260);
@@ -213,4 +249,169 @@ function parseArgs(raw: unknown): Record<string, unknown> | undefined {
   } catch {
     return undefined;
   }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// v0.5.20 Bug J — automatic approval-preview enrichment
+// ─────────────────────────────────────────────────────────────────
+//
+// The model SHOULD pass `preview` on request_approval for batch
+// actions, but prompt rules are unreliable. Workflows authored
+// before this feature existed don't have it either. So the runtime
+// scans the approval's session for batch-shaped recent tool output
+// and synthesizes a preview automatically. No per-tool curation
+// — generic detection over JSON arrays in tool_returned results.
+//
+// Detection heuristic (cheap):
+//   1. Walk the LAST 10 tool_returned events for the approval's session
+//      in DESC order (newest first).
+//   2. For each, try to parse the result as JSON. If it contains an
+//      array of objects (or nested array under common keys like
+//      `data`, `values`, `drafts`, `rows`, `items`, `records`,
+//      `messages`, `emails`), treat that as the batch.
+//   3. From the first record, infer field names for a "primary"
+//      label (subject/title/name) and a "secondary" label
+//      (recipient/email/account/id).
+//   4. Build samples[] from the first 5 records.
+//
+// Returns null if nothing batch-shaped is found — in which case the
+// approval card just renders subject + reason like before. Safe
+// fallback; no regression.
+
+export interface ApprovalPreview {
+  count?: number | null;
+  samples?: Array<{
+    label?: string;
+    value?: string;
+    secondary?: string | null;
+  }> | null;
+  /** Marker for the renderer to surface a "(auto-inferred)" footer. */
+  inferred?: boolean;
+}
+
+const BATCH_CONTAINER_KEYS = [
+  'data', 'values', 'drafts', 'rows', 'items', 'records',
+  'messages', 'emails', 'tasks', 'results', 'updates',
+];
+const PRIMARY_FIELD_HINTS = [
+  'subject', 'title', 'name', 'summary', 'text', 'message',
+  'description', 'value', 'label',
+];
+const SECONDARY_FIELD_HINTS = [
+  'to', 'recipient', 'recipients', 'email', 'account', 'accountName',
+  'rowNumber', 'row', 'id', 'draftId', 'outlookDraftId', 'webLink', 'url',
+];
+
+function autoInferPreview(approval: PendingApproval): ApprovalPreview | null {
+  if (!approval.sessionId) return null;
+  let recent: ReturnType<typeof listHarnessEvents>;
+  try {
+    recent = listHarnessEvents(approval.sessionId, {
+      types: ['tool_returned'],
+      limit: 10,
+      desc: true,
+    });
+  } catch {
+    return null;
+  }
+  // Walk newest-first.
+  for (let i = recent.length - 1; i >= 0; i--) {
+    const evt = recent[i];
+    const data = evt.data as { tool?: string; result?: unknown } | undefined;
+    if (!data?.result) continue;
+    const batch = extractBatch(data.result);
+    if (!batch || batch.length === 0) continue;
+    return buildPreviewFromBatch(batch);
+  }
+  return null;
+}
+
+function extractBatch(result: unknown): Array<Record<string, unknown>> | null {
+  // Result can be a string (JSON-encoded) or already an object.
+  let parsed: unknown = result;
+  if (typeof result === 'string') {
+    // Skip short strings — almost certainly not a batch payload.
+    if (result.length < 30) return null;
+    try { parsed = JSON.parse(result); } catch { return null; }
+  }
+  return findArrayOfObjects(parsed, 4);
+}
+
+function findArrayOfObjects(value: unknown, depthBudget: number): Array<Record<string, unknown>> | null {
+  if (depthBudget <= 0 || value == null) return null;
+  if (Array.isArray(value)) {
+    // Must be array of objects (not scalars / not nested arrays).
+    if (value.length >= 2 && value.every((v) => v && typeof v === 'object' && !Array.isArray(v))) {
+      return value as Array<Record<string, unknown>>;
+    }
+    return null;
+  }
+  if (typeof value !== 'object') return null;
+  const obj = value as Record<string, unknown>;
+  // Try common container keys first.
+  for (const key of BATCH_CONTAINER_KEYS) {
+    if (key in obj) {
+      const found = findArrayOfObjects(obj[key], depthBudget - 1);
+      if (found) return found;
+    }
+  }
+  // Then any other key.
+  for (const k of Object.keys(obj)) {
+    if (BATCH_CONTAINER_KEYS.includes(k)) continue;
+    const found = findArrayOfObjects(obj[k], depthBudget - 1);
+    if (found) return found;
+  }
+  return null;
+}
+
+function buildPreviewFromBatch(batch: Array<Record<string, unknown>>): ApprovalPreview {
+  const count = batch.length;
+  const first = batch[0];
+  const primaryKey = pickFieldName(first, PRIMARY_FIELD_HINTS);
+  const secondaryKey = pickFieldName(first, SECONDARY_FIELD_HINTS, primaryKey);
+  const samples = batch.slice(0, 5).map((item) => {
+    const value = primaryKey ? coerceToString(item[primaryKey]) : coerceToString(Object.values(item)[0]);
+    const secondary = secondaryKey ? coerceToString(item[secondaryKey]) : null;
+    return {
+      label: primaryKey ? toTitleCase(primaryKey) : 'Item',
+      value: value ?? '(empty)',
+      secondary: secondary ?? null,
+    };
+  });
+  return { count, samples, inferred: true };
+}
+
+function pickFieldName(
+  record: Record<string, unknown>,
+  hints: string[],
+  exclude?: string | null,
+): string | null {
+  const keys = Object.keys(record);
+  const norm = (s: string) => s.toLowerCase().replace(/[_\s-]/g, '');
+  for (const hint of hints) {
+    const target = norm(hint);
+    const match = keys.find((k) => norm(k) === target && k !== exclude);
+    if (match) return match;
+  }
+  // Fallback to the first non-excluded string-valued key.
+  for (const k of keys) {
+    if (k === exclude) continue;
+    const v = record[k];
+    if (typeof v === 'string' && v.length > 0) return k;
+  }
+  return null;
+}
+
+function coerceToString(v: unknown): string | null {
+  if (v == null) return null;
+  if (typeof v === 'string') return v.length > 0 ? v : null;
+  if (typeof v === 'number' || typeof v === 'boolean') return String(v);
+  try { return JSON.stringify(v).slice(0, 200); } catch { return null; }
+}
+
+function toTitleCase(s: string): string {
+  return s
+    .replace(/([a-z])([A-Z])/g, '$1 $2')
+    .replace(/[_-]+/g, ' ')
+    .replace(/\b\w/g, (c) => c.toUpperCase());
 }

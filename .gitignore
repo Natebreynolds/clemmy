@@ -35,6 +35,10 @@ release/
 .tmp/
 tmp/
 
+# Per-user workflow run artifacts (audit CSVs, drafts, prompts) —
+# test scratch, not source to ship.
+runs/
+
 # Test artifacts
 coverage/
 .nyc_output/

@@ -44,6 +44,36 @@ const EDIT_DEBOUNCE_MS = 2_000;
 const SAFETY_TIMEOUT_MS = 35 * 60_000;
 const MAX_DISCORD_MESSAGE = 1_900;
 
+// v0.5.19 F8 — after a Discord interaction token expires (at minute 15),
+// the existing flush() returns silently because intermediate edits go
+// nowhere. For 80+ tool-call runs that span >15 min, the user sees
+// nothing until the very end. POST_EXPIRY_CHECKIN_MS spaces out
+// "still working" follow-ups via sendFollowup so the user knows the
+// bot didn't die. 5 minutes balances "I see progress" against
+// "Discord channel noise."
+export const POST_EXPIRY_CHECKIN_MS = 5 * 60_000;
+
+/**
+ * v0.5.19 F8 — exported predicate so the verify-long-running smoke
+ * can exercise the throttle logic without spinning up the full Discord
+ * harness closure. Returns true iff we should post a "still working"
+ * follow-up RIGHT NOW. Knob `CLEMMY_DISCORD_POST_EXPIRY_CHECKINS=off`
+ * forces false.
+ */
+export function shouldPostExpiryCheckIn(input: {
+  tokenExpired: boolean;
+  stateDone: boolean;
+  lastCheckInAt: number;
+  now: number;
+  hasSendFollowup: boolean;
+}): boolean {
+  if (!input.tokenExpired) return false;
+  if (input.stateDone) return false;
+  if (!input.hasSendFollowup) return false;
+  if ((process.env.CLEMMY_DISCORD_POST_EXPIRY_CHECKINS ?? 'on').toLowerCase() === 'off') return false;
+  return input.now - input.lastCheckInAt >= POST_EXPIRY_CHECKIN_MS;
+}
+
 // Structured logger for Discord edit failures. The previous
 // `catch { }` blocks at the edit sites swallowed errors silently —
 // rate limits, token expiry (Discord interaction tokens die at 15
@@ -1228,15 +1258,41 @@ export async function runDiscordHarnessConversation(opts: {
   // reply routes through transport.sendFollowup so the user DOES see
   // the answer as a fresh message in the same channel.
   let tokenExpired = false;
+  // v0.5.19 F8 — track the last post-expiry "still working" follow-up
+  // so we can throttle to one per POST_EXPIRY_CHECKIN_MS window.
+  let lastExpiryCheckInAt = 0;
 
   const flush = async (): Promise<void> => {
     pendingEdit = null;
     lastEditAt = Date.now();
     // If the interaction token already expired, intermediate progress
-    // edits are silently dropped — the user wouldn't see them, and
-    // creating a new follow-up message every few seconds would spam
-    // the channel. The final reply still gets through via finalFlush().
-    if (tokenExpired) return;
+    // edits are silently dropped — the user wouldn't see them. But
+    // v0.5.19 F8 keeps the user informed by posting one "still working"
+    // follow-up per POST_EXPIRY_CHECKIN_MS window so an 80-call run
+    // doesn't go dark past minute 15. Revert via
+    // CLEMMY_DISCORD_POST_EXPIRY_CHECKINS=off.
+    if (tokenExpired) {
+      if (shouldPostExpiryCheckIn({
+        tokenExpired,
+        stateDone: state.done,
+        lastCheckInAt: lastExpiryCheckInAt,
+        now: Date.now(),
+        hasSendFollowup: !!transport.sendFollowup,
+      })) {
+        lastExpiryCheckInAt = Date.now();
+        const tools = state.toolCount ?? 0;
+        const headline = `🍊 still working on this (${tools} tool${tools === 1 ? '' : 's'} so far)…`;
+        try {
+          await transport.sendFollowup!(headline);
+        } catch (err) {
+          logger.warn(
+            { err: err instanceof Error ? err.message : String(err), sessionId: session.id, stage: 'expiry-checkin' },
+            'discord post-expiry check-in failed',
+          );
+        }
+      }
+      return;
+    }
     try {
       const components = approvalComponentsForState(state);
       const needsUpdate = state.pendingApprovalId !== lastAttachedApprovalId;

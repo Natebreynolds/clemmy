@@ -130,6 +130,77 @@ interface RequestBodyBreakdown {
  * request itself is the cause (oversized prefill). Lets a single
  * trace tell the operator exactly which tools to trim.
  */
+/**
+ * v0.5.19 F5 — persist a Codex SSE-truncation trace to disk.
+ *
+ * The full request body + a tools breakdown is what unblocks the
+ * deferred tool-trim work. Until v0.5.19 the writer was inlined in
+ * the throw path and only fired on real-world truncation, which
+ * meant we had no captured traces and were guessing what to trim.
+ * Extracting this lets the F5 sub-test exercise the writer directly
+ * (with a synthetic body), proving the trace contains the breakdown
+ * the operator needs.
+ *
+ * Best-effort: never throws — a trace-write failure must NOT block
+ * the boundary-error throw it accompanies.
+ */
+export async function writeSseTruncationTrace(
+  modelId: string,
+  diagContext: Record<string, unknown>,
+  body: CodexRequestBody,
+): Promise<string | null> {
+  try {
+    const { atomicJsonMutate } = await import('../atomic-json.js');
+    const path = await import('node:path');
+    const fs = await import('node:fs');
+    const { BASE_DIR } = await import('../../config.js');
+    const traceDir = path.join(BASE_DIR, 'state', 'codex-sse-truncated');
+    // atomicJsonMutate creates the file's parent dir during the write
+    // step (atomic-json.ts:229), but the advisory `.lock` file is
+    // opened BEFORE that mkdir. Pre-create the dir so the lock open
+    // doesn't ENOENT on the first trace ever written.
+    fs.mkdirSync(traceDir, { recursive: true });
+    const tracePath = path.join(traceDir, `${Date.now()}-${modelId}.json`);
+    await atomicJsonMutate(
+      tracePath,
+      () => ({
+        ts: new Date().toISOString(),
+        kind: 'codex.sse_truncated',
+        diagnostics: diagContext,
+        // Full body — the WHOLE thing. This is the only artifact that
+        // tells us which tools are dominating the schema. ~2-3 MB per
+        // trace; auto-prune after a few weeks if storage becomes a concern.
+        requestBody: body,
+      }),
+      {} as Record<string, unknown>,
+    );
+    return tracePath;
+  } catch (err) {
+    // best-effort: never block the throw path on a trace write.
+    // Surface the error in supervisor.log so silent trace loss is
+    // diagnosable — but still return null so callers can proceed.
+    // eslint-disable-next-line no-console
+    console.warn(
+      '[codex-model] writeSseTruncationTrace failed (best-effort, returning null):',
+      err instanceof Error ? `${err.message}\n${err.stack ?? ''}` : err,
+    );
+    return null;
+  }
+}
+
+/**
+ * v0.5.19 F5 — test-only knob. Returns true when the operator has
+ * explicitly opted into forcing an SSE truncation for diagnostic
+ * purposes. Double-gated on NODE_ENV or CLEMMY_DEV_OVERRIDES so a
+ * production daemon cannot trip this even with the env set.
+ */
+export function shouldForceSseTruncation(): boolean {
+  if (process.env.CLEMMY_FORCE_SSE_TRUNCATE !== '1') return false;
+  if (process.env.NODE_ENV === 'test') return true;
+  if (process.env.CLEMMY_DEV_OVERRIDES === '1') return true;
+  return false;
+}
+
 function sizeRequestComponents(body: CodexRequestBody): RequestBodyBreakdown {
   const utf8 = (v: unknown): number => Buffer.byteLength(JSON.stringify(v) ?? '', 'utf8');
   const instructionsBytes = Buffer.byteLength(body.instructions ?? '', 'utf8');
@@ -213,7 +284,17 @@ export class CodexResponsesModel implements Model {
         }
       };
 
+      let eventsConsumed = 0;
       for await (const evt of this.#streamCodex(request, diag)) {
+        eventsConsumed += 1;
+        // v0.5.19 F5 — diagnostic knob: after 5 events, drop the
+        // stream as if it truncated. Double-gated (NODE_ENV=test or
+        // CLEMMY_DEV_OVERRIDES=1) so production cannot trip it. Lets
+        // an operator capture a real-traffic SSE-truncation trace
+        // without waiting for an organic failure.
+        if (eventsConsumed > 5 && shouldForceSseTruncation()) {
+          break;
+        }
         if (evt.type === 'response.created' && evt.response?.id) {
           responseId = evt.response.id;
           pendingStart = { type: 'response_started', providerData: { responseId } } as StreamEvent;
@@ -341,37 +422,13 @@ export class CodexResponsesModel implements Model {
         bodyBreakdown: breakdown,
       };
       // Persist the full request body + breakdown to disk so we can
-      // post-mortem WHICH tools dominate the request. Mirrors the
-      // existing codex-4xx-trace pattern from #streamCodex. Stored in
-      // a separate folder so 4xx traces and SSE-truncation traces
-      // don't blur together.
-      try {
-        const { atomicJsonMutate } = await import('../atomic-json.js');
-        const path = await import('node:path');
-        const { BASE_DIR } = await import('../../config.js');
-        const tracePath = path.join(
-          BASE_DIR,
-          'state',
-          'codex-sse-truncated',
-          `${Date.now()}-${this.modelId}.json`,
-        );
-        await atomicJsonMutate(
-          tracePath,
-          () => ({
-            ts: new Date().toISOString(),
-            kind: 'codex.sse_truncated',
-            diagnostics: diagContext,
-            // Full body — the WHOLE thing. This is the only artifact
-            // that tells us which tools are dominating the schema.
-            // ~2-3 MB per trace is fine; we'll auto-prune after a
-            // few weeks if storage becomes a concern.
-            requestBody: body,
-          }),
-          {} as Record<string, unknown>,
-        );
-      } catch {
-        // best-effort: never block the throw path on a trace write
-      }
+      // post-mortem WHICH tools dominate the request. Extracted into
+      // `writeSseTruncationTrace` (v0.5.19 F5) so the sub-test can
+      // exercise the trace-write path without booting the model
+      // streamer. Mirrors the existing codex-4xx-trace pattern from
+      // #streamCodex. Stored in a separate folder so 4xx traces and
+      // SSE-truncation traces don't blur together.
+      await writeSseTruncationTrace(this.modelId, diagContext, body);
       // Emit a structured log line BEFORE the throw so the failure is
       // visible even if a downstream consumer swallows BoundaryError's
       // .context. Pino warn level — surfaces in the supervisor log

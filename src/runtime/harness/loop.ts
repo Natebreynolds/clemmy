@@ -13,6 +13,7 @@ import {
 import {
   assertNotKilled,
   KillRequested,
+  ToolTimeout,
   RecallBudget,
   ToolCallsCounter,
   ToolCallsLimitExceeded,
@@ -21,7 +22,8 @@ import {
   withHarnessRunContext,
 } from './brackets.js';
 import { compactSessionIfNeeded } from './compaction.js';
-import { getHarnessBudgetSettings } from './budget-settings.js';
+import { getHarnessBudgetSettings, getElevatedBudget } from './budget-settings.js';
+import type { HarnessBudgetRuntime } from './budget-settings.js';
 import {
   checkBudget,
   estimateMessagesTokens,
@@ -275,7 +277,7 @@ export interface RunTurnOptions {
   runRunner?: RunRunnerFn;
 }
 
-export type RunTurnStatus = 'completed' | 'awaiting_approval' | 'killed' | 'limit_exceeded' | 'failed';
+export type RunTurnStatus = 'completed' | 'awaiting_approval' | 'awaiting_user_input' | 'killed' | 'limit_exceeded' | 'failed';
 
 export interface RunTurnResult {
   sessionId: string;
@@ -381,6 +383,82 @@ const CONTINUATION_INPUT =
   'Continue with the next step of your plan. If you have nothing left to do, set done=true and nextAction=completed.';
 
 /**
+ * v0.5.19 F2 — find the most recent preflight_budget_check event for
+ * this session at the given turn. Returns null if no preflight ran
+ * (e.g. workflow session, or chat session with the gate off). Used by
+ * the auto-elevate path in `runConversationCore` to read the verdict
+ * the preflight just emitted from inside `runTurn`.
+ */
+function findLatestPreflightVerdict(
+  sessionId: string,
+  turn: number,
+): { status: 'ok' | 'warn' | 'block'; fractionUsed: number; predictedTokens: number } | null {
+  try {
+    const events = listEvents(sessionId, { types: ['guardrail_tripped'] });
+    // Walk newest-first; first preflight_budget_check entry wins.
+    for (let i = events.length - 1; i >= 0; i--) {
+      const evt = events[i];
+      if (evt.turn !== turn) continue;
+      const data = evt.data as Record<string, unknown> | undefined;
+      if (data?.kind !== 'preflight_budget_check') continue;
+      const status = data.status as 'ok' | 'warn' | 'block' | undefined;
+      if (!status) continue;
+      const fractionUsed = typeof data.fractionUsed === 'number' ? data.fractionUsed : 0;
+      const predictedTokens = typeof data.predictedTokens === 'number' ? data.predictedTokens : 0;
+      return { status, fractionUsed, predictedTokens };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * v0.5.19 F1 — build the preflight-block system message that gets
+ * injected when the gate at `runTurn` projects the next turn would
+ * exceed budget. The v1 message named `propose_plan` and
+ * `batch_external_calls`, neither of which were ever registered as
+ * tools on Clem's surface — when the gate fired, the model was
+ * instructed to call nothing tools and gave up. v2 names only:
+ *   - `create_plan` — registered via MCP catalog (src/tools/plan-tools.ts:7)
+ *   - `ask_user_question` — registered inline (src/agents/orchestrator.ts:171)
+ *
+ * Revert lever: `CLEMMY_PREFLIGHT_BLOCK_MESSAGE_V2=off` falls back to
+ * the v1 wording. Removed entirely after v0.5.19 bakes.
+ */
+export function buildPreflightBlockMessage(input: {
+  predictedTokens: number;
+  blockFraction: number;
+  effectiveLimit: number;
+}): string {
+  const { predictedTokens, blockFraction, effectiveLimit } = input;
+  const useV2Message =
+    (getRuntimeEnv('CLEMMY_PREFLIGHT_BLOCK_MESSAGE_V2', 'on') ?? 'on').toLowerCase() !== 'off';
+  const header =
+    `[PREFLIGHT BUDGET BLOCK] Predicted next-turn tokens ${predictedTokens.toLocaleString()} ` +
+    `would exceed ${(blockFraction * 100).toFixed(0)}% of the effective context limit ` +
+    `(${effectiveLimit.toLocaleString()} tokens). `;
+  if (useV2Message) {
+    return (
+      header +
+      `Do NOT fire tool calls in this turn — that would blow upstream limits. ` +
+      `Take ONE of these two actions instead: ` +
+      `(a) call \`create_plan\` with a title + concrete steps outlining the work you intend, then STOP and let the user review; or ` +
+      `(b) call \`ask_user_question\` with a concise question if scope is unclear, then STOP. ` +
+      `If neither path fits, reply with a brief text summary asking the user to type \`/new continue\` ` +
+      `to start a fresh session (facts + focus carry over via the brain).`
+    );
+  }
+  return (
+    header +
+    `You MUST call \`propose_plan\` to outline the work for user approval BEFORE executing any tool calls. ` +
+    `Do NOT fire external tool calls in this turn — the plan-mode interlude exists to keep this conversation alive. ` +
+    `If propose_plan is unavailable, reply asking the user to type \`/new continue\` to start a fresh session ` +
+    `(facts + focus carry over via the brain).`
+  );
+}
+
+/**
  * Max times the conversation loop will silently retry after the stall
  * detector fires on a sub-agent turn. The detector at
  * `evaluateProgress()` is already the generic chokepoint for "model
@@ -394,12 +472,18 @@ const CONTINUATION_INPUT =
  * retry ALSO stalls, the original `sub_agent_stalled` failure surfaces
  * to the user — same behavior as today.
  *
- * Default 1 keeps blast radius small: one retry on the same model on
- * the same turn is enough to absorb intermittent "I'll do X" outputs
- * without burning extra roundtrips when the failure is genuine.
+ * v0.5.19 F4 bumped the default from 1 → 2 with exponential backoff
+ * between attempts (250ms, then 1s). On exhaustion the loop converts
+ * the stall into a user-facing `ask_user_question` instead of
+ * terminating silently with `sub_agent_stalled` (which strands the
+ * user — they see "Continuing." with no recourse). The ask-user
+ * fallback honors the "reports back without fail" north-star
+ * property. Disable via `HARNESS_STALL_ASK_USER=off` to fall back to
+ * the v0.5.18 terminate-on-stall behavior.
  * Configurable via env for ops tuning.
  */
-const MAX_STALL_RETRIES = positiveIntEnv('HARNESS_MAX_STALL_RETRIES', 1);
+const MAX_STALL_RETRIES = positiveIntEnv('HARNESS_MAX_STALL_RETRIES', 2);
+const STALL_RETRY_BACKOFF_MS = [250, 1000];
 
 /**
  * Build the synthetic user message that drives the stall retry.
@@ -509,15 +593,19 @@ export async function runConversation(
 async function runConversationCore(
   options: RunConversationOptions,
 ): Promise<RunConversationResult> {
-  const budget = getHarnessBudgetSettings();
+  // v0.5.19 F2 — `budget` is mutable so the elevate-on-warn path can
+  // rebind it mid-conversation. The cached locals below pick up new
+  // ceilings on the next loop iteration via the helper.
+  let budget: HarnessBudgetRuntime = getHarnessBudgetSettings();
+  let elevated = false;
   let maxSteps = options.maxSteps ?? budget.maxConversationSteps;
   if (options.maxSteps === undefined && budget.autoContinueOnLimit) {
     maxSteps = Math.max(maxSteps, 1_000_000);
   }
-  const maxWallMs = options.maxWallClockMs ?? budget.maxConversationWallMs;
-  const maxTurns = options.maxTurns ?? budget.maxTurns;
-  const toolCallsPerTurn = options.toolCallsPerTurn ?? budget.toolCallsPerTurn;
-  const checkInMs = Math.max(60_000, budget.checkInMinutes * 60 * 1000);
+  let maxWallMs = options.maxWallClockMs ?? budget.maxConversationWallMs;
+  let maxTurns = options.maxTurns ?? budget.maxTurns;
+  let toolCallsPerTurn = options.toolCallsPerTurn ?? budget.toolCallsPerTurn;
+  let checkInMs = Math.max(60_000, budget.checkInMinutes * 60 * 1000);
   const startedAt = Date.now();
   let lastCheckInAt = startedAt;
 
@@ -544,6 +632,47 @@ async function runConversationCore(
       runRunner: options.runRunner,
     });
     lastTurn = turnResult.turn;
+
+    // v0.5.19 F2 — elevate budget mid-conversation if the preflight
+    // gate just emitted warn/block AND we're still on `standard`.
+    // The 40/40/40 standard caps trap long-running tasks with no
+    // recourse (autoContinueOnLimit=false). One-way ratchet — once
+    // elevated this run stays elevated. Honors CLEMMY_AUTOBUMP_BUDGET.
+    if (!elevated && budget.preset === 'standard') {
+      const recentPreflight = findLatestPreflightVerdict(options.sessionId, lastTurn);
+      if (recentPreflight && (recentPreflight.status === 'warn' || recentPreflight.status === 'block')
+          && recentPreflight.fractionUsed > 0.5) {
+        const next = getElevatedBudget(budget);
+        // getElevatedBudget returns the same object when knob=off or
+        // preset !== standard; equality check avoids spurious events.
+        if (next !== budget) {
+          const prev = { maxSteps, maxTurns, toolCallsPerTurn, maxWallMs };
+          budget = next;
+          maxSteps = options.maxSteps ?? Math.max(maxSteps, budget.maxConversationSteps);
+          if (options.maxSteps === undefined && budget.autoContinueOnLimit) {
+            maxSteps = Math.max(maxSteps, 1_000_000);
+          }
+          maxWallMs = options.maxWallClockMs ?? Math.max(maxWallMs, budget.maxConversationWallMs);
+          maxTurns = options.maxTurns ?? Math.max(maxTurns, budget.maxTurns);
+          toolCallsPerTurn = options.toolCallsPerTurn ?? Math.max(toolCallsPerTurn, budget.toolCallsPerTurn);
+          checkInMs = Math.min(checkInMs, Math.max(60_000, budget.checkInMinutes * 60 * 1000));
+          elevated = true;
+          safeAppend({
+            sessionId: options.sessionId,
+            turn: lastTurn,
+            role: 'system',
+            type: 'budget_elevated',
+            data: {
+              reason: 'preflight_warn',
+              preflightStatus: recentPreflight.status,
+              fractionUsed: recentPreflight.fractionUsed,
+              from: prev,
+              to: { maxSteps, maxTurns, toolCallsPerTurn, maxWallMs },
+            },
+          });
+        }
+      }
+    }
 
     // Any non-completed status propagates immediately. The conversation
     // can't continue if the SDK paused for approval, the kill switch
@@ -638,11 +767,49 @@ async function runConversationCore(
               rawOutput: stallInfo.rawOutput,
             },
           });
+          // v0.5.19 F4 — exponential backoff between retries. The
+          // first retry fires almost immediately; the second waits a
+          // beat so a transient external-API blip has time to settle.
+          const backoffMs = STALL_RETRY_BACKOFF_MS[stallRetriesUsed - 1] ?? 1000;
+          if (backoffMs > 0) {
+            await new Promise((resolve) => setTimeout(resolve, backoffMs));
+          }
           nextInput = buildStallRetryMessage(options.sessionId, stallInfo);
           continue;
         }
-        // Retry budget exhausted — fall through to the existing
-        // conversation_completed path with reason=sub_agent_stalled.
+        // Retry budget exhausted. v0.5.19 F4 — instead of terminating
+        // with `sub_agent_stalled` (which strands the user with no
+        // recourse), emit a synthetic `awaiting_user_input` event
+        // mirroring the shape the registered `ask_user_question` tool
+        // emits at orchestrator.ts:184. The chat surface listens for
+        // this event and renders the question, so the user can
+        // course-correct (retry / change approach / stop). Honors the
+        // north-star "reports back without fail" property.
+        const askUserEnabled =
+          (getRuntimeEnv('HARNESS_STALL_ASK_USER', 'on') ?? 'on').toLowerCase() !== 'off';
+        if (askUserEnabled) {
+          safeAppend({
+            sessionId: options.sessionId,
+            turn: turnResult.turn,
+            role: 'Clem',
+            type: 'awaiting_user_input',
+            data: {
+              question:
+                "I've been unable to make progress on this — the model produced text without taking action twice in a row. Should I retry, switch approach, or stop here?",
+              options: ['Retry', 'Switch approach', 'Stop'],
+              source: 'stall_recovery',
+              signal: stallInfo?.signal ?? null,
+            },
+          });
+          return {
+            sessionId: options.sessionId,
+            status: 'awaiting_user_input',
+            steps: stepIndex,
+            lastDecision,
+            lastTurn,
+          };
+        }
+        // Knob=off — fall through to legacy terminate-on-stall.
       }
 
       safeAppend({
@@ -1110,27 +1277,55 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     { role: 'user', content: options.input },
   ];
 
+  // v0.5.19 Bug H + callModelInputFilter adoption (replaces the manual
+  // items.push approach). The retry-context inject is now defined
+  // below as a closure passed into `opts.callModelInputFilter` (see
+  // SDK's runner/types.d.ts CallModelInputFilter). The SDK invokes
+  // it just before the LLM call, with full access to the items +
+  // system instructions. Advantages over our previous in-line push:
+  //   1. Runs inside the SDK's tracing scope (each injection visible
+  //      in OpenAI's trace dashboard if tracing is enabled)
+  //   2. The SDK distinguishes "modelInput" (what the model sees)
+  //      from "persistedItems" (what gets committed to session
+  //      history), so transient injections like retry-context don't
+  //      pollute the conversation record on re-replay
+  //   3. Single canonical mutation point — future injections (e.g.
+  //      session-pinned-resources to fix the grounding-on-retry gap)
+  //      go in the same place
+  // The retryContextInputFilter is defined just before `opts` below.
+
   // Pre-flight budget gate — Capacity-Aware Clem v0.5.18 primitive 2a.
   // Estimates the post-turn token cost BEFORE we call the SDK. If
-  // projected > block threshold, inject a system message forcing the
-  // orchestrator into plan-mode (propose_plan tool) instead of
-  // executing a turn that would blow upstream limits. Honors env
-  // flag CLEMMY_PREFLIGHT_GATE=off for revert. Fail-open: if the
-  // gate itself throws, we proceed with the un-gated turn rather
-  // than blocking work on a meta-failure.
+  // projected > block threshold, inject a system message redirecting
+  // the orchestrator to plan-or-ask instead of executing a turn that
+  // would blow upstream limits. Honors env flag CLEMMY_PREFLIGHT_GATE=off
+  // for revert. Fail-open: if the gate itself throws, we proceed with
+  // the un-gated turn rather than blocking work on a meta-failure.
   //
-  // SCOPE: chat sessions only. Workflow turns are already approved
-  // upfront via the workflow definition (the workflow IS the plan)
-  // and don't have access to propose_plan. Injecting a "call
-  // propose_plan" message into a workflow turn would instruct the
-  // model to call a tool that doesn't exist on its surface.
-  // Workflows still benefit from the broader Capacity-Aware Clem
-  // primitives (batch_external_calls, tool-return guardrail, Codex
-  // resilience); they just skip the plan-mode interlude.
-  if (
-    (process.env.CLEMMY_PREFLIGHT_GATE ?? 'on').toLowerCase() !== 'off'
-    && session.sessionRow.kind === 'chat'
-  ) {
+  // SCOPE: chat sessions only. Workflow turns are pre-approved upfront
+  // via the workflow definition (the workflow IS the plan) and have no
+  // user to consult mid-step. Workflows benefit from the broader
+  // Capacity-Aware Clem primitives (tool-return guardrail, side-store
+  // recall, Codex SSE resilience); v0.5.19 F3 extends this telemetry
+  // leg to workflows + adds compaction enforcement.
+  //
+  // v0.5.19 F1: the block message references only tools that actually
+  // exist on the orchestrator surface (create_plan via MCP catalog,
+  // ask_user_question registered inline). The earlier message named
+  // `propose_plan` and `batch_external_calls` which were never
+  // registered — when the gate fired, the model was instructed to call
+  // tools that don't exist, defeating the gate's purpose.
+  // v0.5.19 F3 — telemetry leg runs for ALL session kinds (chat,
+  // workflow, execution, agent). Enforcement leg branches:
+  //   - chat → existing F1 block-message injection (create_plan /
+  //     ask_user_question — tools the orchestrator can actually call).
+  //   - workflow/execution/agent → emit `workflow_step_overbudget`
+  //     event for dashboard visibility + run a second compaction pass
+  //     in case the first one (upstream of the gate) didn't trim
+  //     enough. Workflows can't pause for user input mid-step so the
+  //     model is allowed to proceed — but we surface the risk loudly.
+  //     Honors CLEMMY_PREFLIGHT_WORKFLOW=off to revert workflow leg.
+  if ((process.env.CLEMMY_PREFLIGHT_GATE ?? 'on').toLowerCase() !== 'off') {
     try {
       const stateTokens = estimateMessagesTokens(
         compactedItems as ReadonlyArray<{ content?: unknown; role?: string }>,
@@ -1164,7 +1359,8 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
         expectedOutputTokens: EXPECTED_OUTPUT_PRIOR,
       });
       const verdict = checkBudget({ predictedTokens: predicted, modelId });
-      // Always record telemetry for observability — even on 'ok'.
+      const sessionKind = session.sessionRow.kind;
+      // Telemetry: always record — even on 'ok' for ANY kind.
       safeAppend({
         sessionId: options.sessionId,
         turn,
@@ -1172,6 +1368,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
         type: 'guardrail_tripped',
         data: {
           kind: 'preflight_budget_check',
+          sessionKind,
           status: verdict.status,
           predictedTokens: verdict.predictedTokens,
           effectiveLimit: verdict.effectiveLimit,
@@ -1183,24 +1380,39 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
         },
       });
       if (verdict.status === 'block') {
-        // Refuse to send this turn as-is. Inject a system message that
-        // FORCES the orchestrator to call propose_plan (the plan-mode
-        // tool from primitive 4). The user sees the plan, approves
-        // (or edits), then execution proceeds via batch_external_calls
-        // (primitive 3) instead of free-firing parallel tool calls
-        // that would balloon the context further.
-        const blockMessage =
-          `[PREFLIGHT BUDGET BLOCK] Predicted next-turn tokens ${verdict.predictedTokens.toLocaleString()} ` +
-          `would exceed ${(verdict.blockFraction * 100).toFixed(0)}% of the effective context limit ` +
-          `(${verdict.effectiveLimit.toLocaleString()} tokens). ` +
-          `You MUST call \`propose_plan\` to outline the work for user approval BEFORE executing any tool calls. ` +
-          `Do NOT fire external tool calls in this turn — the plan-mode interlude exists to keep this conversation alive. ` +
-          `If propose_plan is unavailable, reply asking the user to type \`/new continue\` to start a fresh session ` +
-          `(facts + focus carry over via the brain).`;
-        items.unshift({
-          role: 'system',
-          content: blockMessage,
-        } as AgentInputItem);
+        if (sessionKind === 'chat') {
+          // Inject the F1-rewritten block message pointing at real tools.
+          const blockMessage = buildPreflightBlockMessage({
+            predictedTokens: verdict.predictedTokens,
+            blockFraction: verdict.blockFraction,
+            effectiveLimit: verdict.effectiveLimit,
+          });
+          items.unshift({
+            role: 'system',
+            content: blockMessage,
+          } as AgentInputItem);
+        } else if ((process.env.CLEMMY_PREFLIGHT_WORKFLOW ?? 'on').toLowerCase() !== 'off') {
+          // Workflow / execution / agent path — no user to consult,
+          // no propose_plan interlude available. Emit a loud event
+          // so the dashboard surfaces the risk; the step proceeds
+          // (the workflow runner reads this event for retry/abort
+          // decisions if it wants to).
+          safeAppend({
+            sessionId: options.sessionId,
+            turn,
+            role: 'system',
+            type: 'workflow_step_overbudget',
+            data: {
+              predictedTokens: verdict.predictedTokens,
+              effectiveLimit: verdict.effectiveLimit,
+              fractionUsed: Number(verdict.fractionUsed.toFixed(3)),
+              plannedToolCallCount,
+              avgToolReturnTokens,
+              modelId,
+              note: 'Workflow step projected over context budget. Compaction already ran upstream of this gate. Step proceeds; consider splitting workflow if this fires repeatedly.',
+            },
+          });
+        }
       }
     } catch (err) {
       // Fail-open: a bug in the gate must not block the user's turn.
@@ -1213,9 +1425,59 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     }
   }
 
+  // v0.5.19 Bug H + callModelInputFilter adoption — build the closure
+  // the SDK will invoke just before the LLM call. Reads the most
+  // recent awaiting_user_input event for this session; if it's an
+  // infra_error_recovery pause AND the user input looks like a retry
+  // intent, appends a [RETRY CONTEXT] system message that pins the
+  // failed call so the model re-issues the same call instead of
+  // re-planning. Honors CLEMMY_RETRY_CONTEXT_INJECT=off to revert.
+  const retryContextInputFilter = ((args: {
+    modelData: { input: AgentInputItem[]; instructions?: string };
+  }) => {
+    try {
+      if ((getRuntimeEnv('CLEMMY_RETRY_CONTEXT_INJECT', 'on') ?? 'on').toLowerCase() === 'off') {
+        return args.modelData;
+      }
+      const recentAwaiting = listEvents(options.sessionId, { types: ['awaiting_user_input'], limit: 1, desc: true });
+      const last = recentAwaiting[recentAwaiting.length - 1];
+      const lastData = last?.data as
+        | { source?: string; retry_context?: Record<string, unknown> | null; boundaryKind?: string }
+        | undefined;
+      if (lastData?.source !== 'infra_error_recovery' || !lastData.retry_context) return args.modelData;
+      const userInputRaw = typeof options.input === 'string' ? options.input.trim() : '';
+      if (!/^(retry|yes|continue|resume|go|try again)$/i.test(userInputRaw)) return args.modelData;
+      const ctx = lastData.retry_context as {
+        failed_tool?: string;
+        failed_args?: string | null;
+        failed_call_id?: string | null;
+      };
+      const boundaryKind = lastData.boundaryKind ?? 'infra_error';
+      const argsStr = ctx.failed_args ? ` with arguments: ${ctx.failed_args}` : '';
+      const callIdNote = ctx.failed_call_id ? ` (prior call_id ${ctx.failed_call_id})` : '';
+      const retryMsg = {
+        role: 'system' as const,
+        content:
+          `[RETRY CONTEXT] Your previous turn was interrupted by ${boundaryKind} mid-call. ` +
+          `The user replied "${userInputRaw}" — they mean: re-issue the SAME call that failed${callIdNote}. ` +
+          `Failed tool: \`${ctx.failed_tool ?? 'unknown'}\`${argsStr}. ` +
+          `Do NOT re-plan, do NOT re-discover the toolkit, do NOT switch to a different task or resource. ` +
+          `If the same call is not the right move (e.g. the args genuinely need to change), call ` +
+          `\`ask_user_question\` to clarify — do not silently change resources or scope.`,
+      } as AgentInputItem;
+      return {
+        input: [...args.modelData.input, retryMsg],
+        instructions: args.modelData.instructions,
+      };
+    } catch {
+      return args.modelData; // best-effort
+    }
+  });
+
   const opts: Record<string, unknown> = {
     context: { sessionId: options.sessionId, turn },
     maxTurns: options.maxTurns ?? maxTurnsForRole('orchestrator'),
+    callModelInputFilter: retryContextInputFilter,
   };
   // DO NOT pass previousResponseId to the SDK when using the codex
   // backend. The SDK uses this flag to opt into a ServerConversationTracker
@@ -1952,7 +2214,133 @@ function handleRunError(
     bumpTurnNumber(sessionId, turn);
     return { sessionId, turn, status: 'limit_exceeded', error: err.message };
   }
+
+  // v0.5.20 Bug I — route ToolTimeout through the same F4 ask-user
+  // pattern as BoundaryError infra-kinds. Observed sess-mpktnbps:
+  // run_worker (parent's sub-agent fan-out for parallel LinkedIn
+  // lookups) hit 60s default timeout because the worker did
+  // firecrawl_search + scrape — easily >60s. Without this branch,
+  // ToolTimeout bubbled all the way to run_failed and killed the
+  // session. With it, the user sees "tool X timed out — retry?"
+  // and can choose to retry (with v0.5.20 Bug I increased timeouts)
+  // or stop. Same retry_context capture as Bug C so the model gets
+  // the failed call args back on the next turn.
+  if (err instanceof ToolTimeout) {
+    const askUserEnabled =
+      (getRuntimeEnv('HARNESS_INFRA_ASK_USER', 'on') ?? 'on').toLowerCase() !== 'off';
+    if (askUserEnabled) {
+      const toolMatch = err.message.match(/tool (\S+) timed out after (\d+)ms/);
+      const toolName = toolMatch?.[1] ?? 'unknown';
+      const timeoutMs = toolMatch?.[2] ?? '?';
+      let retryContext: Record<string, unknown> | null = null;
+      try {
+        const recentToolCalls = listEvents(sessionId, { types: ['tool_called'], limit: 1, desc: true });
+        if (recentToolCalls.length > 0) {
+          const tc = recentToolCalls[recentToolCalls.length - 1];
+          const tcData = tc.data as { tool?: string; arguments?: string; callId?: string } | undefined;
+          if (tcData?.tool) {
+            retryContext = {
+              failed_tool: tcData.tool,
+              failed_args: tcData.arguments ?? null,
+              failed_call_id: tcData.callId ?? null,
+              failed_turn: tc.turn ?? turn,
+            };
+          }
+        }
+      } catch { /* best-effort */ }
+      safeAppend({
+        sessionId,
+        turn,
+        role: 'Clem',
+        type: 'awaiting_user_input',
+        data: {
+          question:
+            `The \`${toolName}\` tool timed out after ${timeoutMs}ms. Should I retry (the same call), switch approach, or stop here?`,
+          options: ['Retry', 'Switch approach', 'Stop'],
+          source: 'infra_error_recovery',
+          boundaryKind: 'tool.timeout',
+          operatorMessage: clip(err.message, 400),
+          retry_context: retryContext,
+        },
+      });
+      bumpTurnNumber(sessionId, turn);
+      return { sessionId, turn, status: 'awaiting_user_input', error: err.message };
+    }
+  }
+
   const message = err instanceof Error ? err.message : String(err);
+
+  // v0.5.19 Bug C fix — Codex 5xx / SSE truncation / MCP unavailable
+  // surfaced as silent `run_failed`. The session died and the user
+  // saw "Session failed" with no recourse — couldn't retry without
+  // re-typing the whole prompt. F4 covers MODEL stalls (prose+no
+  // tools); this is the infra-error twin: a transient backend failure
+  // is exactly when "ask the user what to do" is the right answer.
+  // Honors HARNESS_INFRA_ASK_USER=off to revert.
+  if (err instanceof BoundaryError) {
+    const askUserKinds = new Set<string>([
+      'codex.http_5xx',
+      'codex.sse_truncated',
+      'codex.wall_clock',
+      'mcp.server_unavailable',
+    ]);
+    const askUserEnabled =
+      (getRuntimeEnv('HARNESS_INFRA_ASK_USER', 'on') ?? 'on').toLowerCase() !== 'off';
+    if (askUserEnabled && askUserKinds.has(err.kind)) {
+      const userMsg = err.userMessage || 'A backend error interrupted this turn.';
+      // v0.5.19 Bug H — capture retry context: which call was in
+      // flight when the infra error fired. The next turn (after the
+      // user replies "Retry") will read this and inject the exact
+      // failed call args as a system message, so the model can't
+      // pivot to a different task. This is the fix for the Bug B
+      // regression we saw on sess-mpkmiy4j: after a Codex 5xx the
+      // model lost the LinkedIn task context and proposed work on
+      // the wrong sheet entirely.
+      let retryContext: Record<string, unknown> | null = null;
+      try {
+        // desc:true + limit:1 → the single most recent tool_called
+        // event. Without desc, listEvents returns ASC oldest first
+        // and we'd capture the wrong call.
+        const recentToolCalls = listEvents(sessionId, { types: ['tool_called'], limit: 1, desc: true });
+        if (recentToolCalls.length > 0) {
+          const tc = recentToolCalls[recentToolCalls.length - 1];
+          const tcData = tc.data as { tool?: string; arguments?: string; callId?: string } | undefined;
+          if (tcData?.tool) {
+            retryContext = {
+              failed_tool: tcData.tool,
+              failed_args: tcData.arguments ?? null,
+              failed_call_id: tcData.callId ?? null,
+              failed_turn: tc.turn ?? turn,
+            };
+          }
+        }
+      } catch {
+        // best-effort
+      }
+      safeAppend({
+        sessionId,
+        turn,
+        role: 'Clem',
+        type: 'awaiting_user_input',
+        data: {
+          question:
+            `${userMsg} Should I retry the same call, switch approach, or stop here?`,
+          options: ['Retry', 'Switch approach', 'Stop'],
+          source: 'infra_error_recovery',
+          boundaryKind: err.kind,
+          operatorMessage: clip(err.operatorMessage ?? message, 400),
+          retry_context: retryContext,
+        },
+      });
+      bumpTurnNumber(sessionId, turn);
+      // Session stays active so the next user message resumes it; do
+      // NOT mark failed. Status returned to caller is
+      // 'awaiting_user_input' so runConversation surfaces the same
+      // shape as F4 stall recovery.
+      return { sessionId, turn, status: 'awaiting_user_input', error: message };
+    }
+  }
+
   safeAppend({
     sessionId,
     turn,

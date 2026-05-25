@@ -76,6 +76,13 @@ FILES=(
   "tools/computer-tools.js"
   "agents/tool-taxonomy.js"
   "integrations/composio/client.js"
+  # v0.5.19 — Bug A/B/C/D fixes + orchestrator prompt + budget/guardrail/eventlog updates
+  "agents/orchestrator.js"
+  "runtime/harness/budget-settings.js"
+  "runtime/harness/tool-guardrail.js"
+  "runtime/harness/eventlog.js"
+  # v0.5.19 — Bug F (heartbeat sweep pause-aware)
+  "execution/store.js"
 )
 
 # Sanity-check every source file exists in the local dist BEFORE we
@@ -113,6 +120,31 @@ for f in "${FILES[@]}"; do
   cp -p "$src" "$dst"
   size=$(stat -f%z "$dst")
   echo "  ✓ $f ($size bytes)"
+done
+
+# v0.5.19 — sync @openai/agents* packages to the installed app's
+# node_modules when the local SDK version differs from the installed
+# one. Only triggers on actual mismatch (cheap check via package.json
+# version field). This catches the case where the repo was upgraded
+# (npm install --save @openai/agents@new) but the installed
+# /Applications/Clementine.app still bundles the old version under
+# Contents/Resources/daemon/node_modules.
+INSTALLED_NM="$(dirname "$INSTALLED_DIST")/node_modules"
+echo
+echo "→ Checking @openai/agents* package sync"
+for pkg in @openai/agents @openai/agents-core @openai/agents-openai @openai/agents-realtime; do
+  local_pkg="$REPO_ROOT/node_modules/$pkg"
+  installed_pkg="$INSTALLED_NM/$pkg"
+  if [[ ! -d "$local_pkg" ]]; then continue; fi
+  local_v=$(node -e "try{console.log(require('$local_pkg/package.json').version)}catch{}" 2>/dev/null)
+  installed_v=$(node -e "try{console.log(require('$installed_pkg/package.json').version)}catch{}" 2>/dev/null)
+  if [[ "$local_v" != "$installed_v" && -n "$local_v" ]]; then
+    [[ -d "$installed_pkg" ]] && rm -rf "$installed_pkg"
+    cp -R "$local_pkg" "$installed_pkg"
+    echo "  ✓ $pkg → $local_v (was $installed_v)"
+  else
+    echo "  · $pkg already at $local_v (no copy)"
+  fi
 done
 
 echo

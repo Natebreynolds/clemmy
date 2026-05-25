@@ -38,7 +38,9 @@ test('getHarnessBudgetSettings uses the long-workflow preset defaults', async ()
   assert.equal(settings.maxConversationSteps, 160);
   assert.equal(settings.maxConversationWallMinutes, 480);
   assert.equal(settings.maxTurns, 120);
-  assert.equal(settings.toolCallsPerTurn, 32);
+  // long preset's toolCallsPerTurn was bumped 32 → 80 to support
+  // 80+-call tasks without burning sub-tests on overflow.
+  assert.equal(settings.toolCallsPerTurn, 80);
   assert.equal(settings.checkInMinutes, 5);
   assert.equal(settings.autoContinueOnLimit, true);
   assert.equal(settings.unlimited, false);

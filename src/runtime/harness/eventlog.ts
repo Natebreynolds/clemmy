@@ -80,6 +80,17 @@ export const EVENT_TYPES = [
   // returns this context so back-references like "first 10 please"
   // can be interpreted. Added 2026-05-24.
   'cross_session_prefix',
+  // v0.5.19 F2 — auto-elevate emits this when the preflight gate sees
+  // a 'warn' or 'block' verdict early in a `standard`-preset
+  // conversation. Carries the from/to caps so the dashboard can show
+  // why the budget changed mid-run.
+  'budget_elevated',
+  // v0.5.19 F3 — preflight gate fires this for workflow/execution/
+  // agent kinds when a turn projects over the context block
+  // threshold. Workflows have no user to consult mid-step so they
+  // proceed — but the dashboard now sees the risk and a future
+  // workflow-runner extension can react (split / abort / retry).
+  'workflow_step_overbudget',
 ] as const;
 export type EventType = (typeof EVENT_TYPES)[number];
 const EVENT_TYPE_SET: ReadonlySet<string> = new Set(EVENT_TYPES);
@@ -151,6 +162,10 @@ export interface ListEventsOptions {
   sinceSeq?: number;
   types?: EventType[];
   limit?: number;
+  /** v0.5.19 Bug H — sort by seq DESC instead of ASC. Useful when
+   *  combined with `limit` to get the MOST RECENT N events of a type.
+   *  Default false (legacy ASC behavior). */
+  desc?: boolean;
 }
 
 export interface ListSessionsOptions {
@@ -283,6 +298,24 @@ const MIGRATIONS: { version: number; sql: string }[] = [
         PRIMARY KEY (session_id, call_id)
       );
       CREATE INDEX IF NOT EXISTS idx_tool_outputs_session ON tool_outputs(session_id);
+    `,
+  },
+  {
+    // v0.5.19 F6 — persist tool-guardrail recent-call queue so the
+    // loop-detection thresholds survive daemon restarts. Until v0.5.19
+    // tool-guardrail.ts held SessionTrackerState only in-memory, which
+    // meant multi-hour workflows that crossed a restart (autonomy
+    // loops, cron-scheduled runs) lost their loop-detection history.
+    // Append-only blob — one row per session_id, replaced on every
+    // write-through (debounced every N calls). Cascade-deleted with
+    // the session.
+    version: 4,
+    sql: `
+      CREATE TABLE IF NOT EXISTS tool_guardrail_state (
+        session_id  TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+        recent_json TEXT NOT NULL,
+        updated_at  TEXT NOT NULL
+      );
     `,
   },
 ];
@@ -597,13 +630,18 @@ export function listEvents(sessionId: string, options: ListEventsOptions = {}): 
     clauses.push(`type IN (${placeholders})`);
     params.push(...options.types);
   }
-  let sql = `SELECT * FROM events WHERE ${clauses.join(' AND ')} ORDER BY seq ASC`;
+  const order = options.desc ? 'DESC' : 'ASC';
+  let sql = `SELECT * FROM events WHERE ${clauses.join(' AND ')} ORDER BY seq ${order}`;
   if (options.limit !== undefined) {
     sql += ` LIMIT ?`;
     params.push(options.limit);
   }
   const rows = db.prepare(sql).all(...params) as RawEventRow[];
-  return rows.map(rowToEvent);
+  const mapped = rows.map(rowToEvent);
+  // For desc + limit: the caller usually wants chronological order
+  // back, so reverse the result. The caller can post-reverse if they
+  // truly want newest-first.
+  return options.desc ? mapped.reverse() : mapped;
 }
 
 export function getLatestEventSeq(sessionId: string): number {
@@ -724,4 +762,38 @@ export function getToolOutput(sessionId: string, callId: string): ToolOutputReco
     tool: row.tool,
     createdAt: row.created_at,
   };
+}
+
+// ─── v0.5.19 F6 — tool-guardrail state persistence ────────────────
+//
+// The tool-guardrail keeps a per-session sliding window of recent
+// tool calls so it can detect loops (same args repeated; mutating
+// tool spamming distinct args). Before v0.5.19 this state lived only
+// in-memory, so long workflows that crossed a daemon restart lost
+// their loop-detection history. Persist the recent[] queue here;
+// the guardrail rebuilds derived state (signature counts, distinct
+// mutating-tool args) from it on rehydrate.
+
+export function writeGuardrailState(sessionId: string, recentJson: string): void {
+  const db = openEventLog();
+  db.prepare(
+    `INSERT INTO tool_guardrail_state (session_id, recent_json, updated_at)
+     VALUES (?, ?, ?)
+     ON CONFLICT(session_id) DO UPDATE SET
+       recent_json = excluded.recent_json,
+       updated_at  = excluded.updated_at`,
+  ).run(sessionId, recentJson, new Date().toISOString());
+}
+
+export function readGuardrailState(sessionId: string): string | null {
+  const db = openEventLog();
+  const row = db
+    .prepare('SELECT recent_json FROM tool_guardrail_state WHERE session_id = ?')
+    .get(sessionId) as { recent_json: string } | undefined;
+  return row?.recent_json ?? null;
+}
+
+export function clearGuardrailState(sessionId: string): void {
+  const db = openEventLog();
+  db.prepare('DELETE FROM tool_guardrail_state WHERE session_id = ?').run(sessionId);
 }

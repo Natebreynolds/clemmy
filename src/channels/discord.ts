@@ -21,6 +21,10 @@ import {
   type Message,
 } from 'discord.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
+// v0.5.20 Bug K — live presence reads pending approvals + active
+// workflow sessions to drive what shows in the Discord bot status.
+const listPendingHarnessApprovals = approvalRegistry.listPending;
+import { listSessions as listHarnessSessions } from '../runtime/harness/eventlog.js';
 import {
   DISCORD_ALLOWED_CHANNELS,
   ASSISTANT_NAME,
@@ -1364,13 +1368,70 @@ async function registerSlashCommands(client: Client): Promise<void> {
 }
 
 /**
- * Update the bot's Discord presence to reflect the current focus.
- * "Watching <title>" when active, "Listening for messages" when no
- * focus is pinned. Truncates long titles to fit Discord's 128-char
- * activity-name limit with safe headroom.
+ * Update the bot's Discord presence to reflect the highest-priority
+ * live state. Priority order (highest first):
+ *   1. Pending approval — "Awaiting approval: <subject>"
+ *   2. Active workflow turn — "Watching <workflow>.<step> · Nm"
+ *   3. Active focus — "Watching <focus title>"
+ *   4. Default — "Listening for messages"
+ *
+ * v0.5.20 Bug K — extended from focus-only to also cover workflow +
+ * approval state so the user can glance at Clem's Discord presence
+ * for a "still running / waiting on me" signal without cluttering
+ * the channel with heartbeat edits.
+ *
+ * Truncates long names to fit Discord's 128-char activity-name limit
+ * with safe headroom.
  */
-function applyFocusPresence(client: Client): void {
+function applyLivePresence(client: Client): void {
   if (!client.isReady()) return;
+
+  // Priority 1 — any pending approval for any session.
+  try {
+    const pending = listPendingHarnessApprovals({ status: 'pending' });
+    if (pending.length > 0) {
+      const row = pending[0];
+      // Subject preferred over tool name. Trim aggressively because
+      // Discord caps activity name at 128 chars; we leave room for
+      // the "Awaiting approval: " prefix.
+      const subject = row.subject || row.tool || 'a step';
+      const trimmed = subject.length > 90 ? subject.slice(0, 87) + '…' : subject;
+      client.user.setPresence({
+        status: 'online',
+        activities: [{ name: `Awaiting approval: ${trimmed}`, type: ActivityType.Watching }],
+      });
+      return;
+    }
+  } catch { /* fall through to next priority */ }
+
+  // Priority 2 — any active workflow session (kind='workflow', status='active').
+  try {
+    const activeWorkflows = listHarnessSessions({ kind: 'workflow', status: 'active', limit: 1 });
+    if (activeWorkflows.length > 0) {
+      const wf = activeWorkflows[0];
+      // Workflow session titles are formatted "<workflow>::<step>" by
+      // the workflow runner. Format presence as "<workflow>.<step> · Nm".
+      const title = wf.title ?? 'workflow';
+      const parts = title.split('::');
+      const display = parts.length >= 2
+        ? `${parts[0]}.${parts.slice(1).join('.')}`
+        : title;
+      const created = wf.createdAt ? Date.parse(wf.createdAt) : NaN;
+      const elapsedMs = Number.isFinite(created) ? Date.now() - created : 0;
+      const elapsedMin = Math.max(0, Math.round(elapsedMs / 60000));
+      const elapsedStr = elapsedMin > 0 ? ` · ${elapsedMin}m` : '';
+      const base = display.length > 90 - elapsedStr.length
+        ? display.slice(0, 87 - elapsedStr.length) + '…'
+        : display;
+      client.user.setPresence({
+        status: 'online',
+        activities: [{ name: `${base}${elapsedStr}`, type: ActivityType.Watching }],
+      });
+      return;
+    }
+  } catch { /* fall through */ }
+
+  // Priority 3 — focus pointer (existing behavior).
   let active: { title: string } | null = null;
   try { active = getActiveFocus(); } catch { active = null; }
   if (active) {
@@ -1379,13 +1440,18 @@ function applyFocusPresence(client: Client): void {
       status: 'online',
       activities: [{ name, type: ActivityType.Watching }],
     });
-  } else {
-    client.user.setPresence({
-      status: 'online',
-      activities: [{ name: 'for messages', type: ActivityType.Listening }],
-    });
+    return;
   }
+
+  // Priority 4 — default listening state.
+  client.user.setPresence({
+    status: 'online',
+    activities: [{ name: 'for messages', type: ActivityType.Listening }],
+  });
 }
+
+// Back-compat alias — older callsites used applyFocusPresence.
+const applyFocusPresence = applyLivePresence;
 
 /**
  * Handle /focus <action> [id]. Returns the reply text (always
@@ -2390,16 +2456,47 @@ export async function startDiscordBot(assistant: ClementineAssistant): Promise<v
       });
       startDiscordDmPolling(readyClient, assistant);
 
-      // Subscribe to focus changes so the bot's presence reflects the
-      // active attention pointer. "Watching <title>" makes it obvious
-      // from the Discord member list what Clementine is mid-work on,
-      // across all channels and across desktop+Discord.
+      // Subscribe to live state events so the bot's presence reflects
+      // the highest-priority state (approval > workflow > focus). Goal
+      // is a glanceable "still alive / waiting on me" signal in the
+      // Discord member list without cluttering the channel with
+      // heartbeat messages. v0.5.20 Bug K extends from focus-only.
       actionBus.subscribe((event) => {
-        if (event.kind !== 'focus.changed') return;
-        try { applyFocusPresence(readyClient); } catch (err) {
-          logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'failed to update Discord presence on focus change');
+        // Only listen for events that change the live-state picture.
+        if (
+          event.kind !== 'focus.changed'
+          && event.kind !== 'approval.created'
+          && event.kind !== 'approval.resolved'
+          && event.kind !== 'execution.transitioned'
+          && event.kind !== 'runtime.completed'
+          && event.kind !== 'runtime.failed'
+          && event.kind !== 'harness.event'
+        ) return;
+        // For harness.event, only refresh on session lifecycle markers
+        // (workflow start / end / approval flips). Skip per-tool noise.
+        if (event.kind === 'harness.event') {
+          const t = event.event?.type;
+          if (
+            t !== 'turn_started'
+            && t !== 'conversation_completed'
+            && t !== 'run_completed'
+            && t !== 'run_failed'
+            && t !== 'approval_requested'
+            && t !== 'approval_resolved'
+          ) return;
+        }
+        try { applyLivePresence(readyClient); } catch (err) {
+          logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'failed to update Discord presence on live state change');
         }
       });
+      // Periodic refresh so the elapsed-minute counter in the workflow
+      // presence string stays accurate even when the workflow is
+      // mid-step with no new events. Every 30s.
+      setInterval(() => {
+        try { applyLivePresence(readyClient); } catch (err) {
+          logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'failed to refresh Discord presence on tick');
+        }
+      }, 30_000).unref();
     });
 
     client.on(Events.GuildCreate, (guild) => {

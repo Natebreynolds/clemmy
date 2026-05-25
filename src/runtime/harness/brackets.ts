@@ -322,6 +322,15 @@ export function timeoutForTool(toolName: string): number {
   if (toolName === 'composio_execute_tool' || /^(composio|external_api)_/.test(toolName)) {
     return DEFAULT_TIMEOUTS_MS.externalApi;
   }
+  // v0.5.20 Bug I — run_worker spawns a sub-agent that itself does
+  // tool calls (scrapes, SERP queries, file reads). Default 60s
+  // was way too short — observed sess-mpktnbps timeout at 60s on
+  // a worker doing firecrawl_search for LinkedIn URL lookup. The
+  // worker IS the external-API surface from the parent agent's
+  // perspective. 5min externalApi bucket is the right shape.
+  if (toolName === 'run_worker' || /^run_worker/.test(toolName)) {
+    return DEFAULT_TIMEOUTS_MS.externalApi;
+  }
   // MCP namespace shim separator is "__" (src/runtime/mcp-namespace-shim.ts).
   if (toolName.includes('__')) {
     return DEFAULT_TIMEOUTS_MS.mcp;
