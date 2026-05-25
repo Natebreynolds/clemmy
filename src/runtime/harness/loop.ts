@@ -2225,11 +2225,22 @@ function handleRunError(
   // and can choose to retry (with v0.5.20 Bug I increased timeouts)
   // or stop. Same retry_context capture as Bug C so the model gets
   // the failed call args back on the next turn.
-  if (err instanceof ToolTimeout) {
+  // v0.5.21.1 — also catch the SDK-wrapped envelope. The SDK
+  // re-throws our ToolTimeout inside a UserError with the message:
+  //   "Failed to run function tools: ToolTimeout: tool X timed out after Yms"
+  // The instanceof check fails on that wrapping. Verified 2026-05-25
+  // sess-mplmvrqu: draft_plan timed out → run_failed instead of the
+  // Retry card. Match by message pattern as a second-class catch.
+  const wrappedToolTimeoutMatch = (!(err instanceof ToolTimeout) && err instanceof Error)
+    ? err.message.match(/ToolTimeout: tool (\S+) timed out after (\d+)ms/)
+    : null;
+  if (err instanceof ToolTimeout || wrappedToolTimeoutMatch) {
     const askUserEnabled =
       (getRuntimeEnv('HARNESS_INFRA_ASK_USER', 'on') ?? 'on').toLowerCase() !== 'off';
     if (askUserEnabled) {
-      const toolMatch = err.message.match(/tool (\S+) timed out after (\d+)ms/);
+      const toolMatch = err instanceof ToolTimeout
+        ? err.message.match(/tool (\S+) timed out after (\d+)ms/)
+        : wrappedToolTimeoutMatch;
       const toolName = toolMatch?.[1] ?? 'unknown';
       const timeoutMs = toolMatch?.[2] ?? '?';
       let retryContext: Record<string, unknown> | null = null;
@@ -2259,12 +2270,12 @@ function handleRunError(
           options: ['Retry', 'Switch approach', 'Stop'],
           source: 'infra_error_recovery',
           boundaryKind: 'tool.timeout',
-          operatorMessage: clip(err.message, 400),
+          operatorMessage: clip(err instanceof Error ? err.message : String(err), 400),
           retry_context: retryContext,
         },
       });
       bumpTurnNumber(sessionId, turn);
-      return { sessionId, turn, status: 'awaiting_user_input', error: err.message };
+      return { sessionId, turn, status: 'awaiting_user_input', error: err instanceof Error ? err.message : String(err) };
     }
   }
 

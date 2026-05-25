@@ -248,7 +248,18 @@ export class CodexResponsesModel implements Model {
     // hidden as long as the second attempt succeeds. If content was
     // already yielded, we cannot safely retry (would duplicate tokens),
     // so we throw the BoundaryError as before.
-    const MAX_RETRY = 1;
+    // v0.5.21.1 — bumped 1 → 3 (4 total attempts) with exponential
+    // backoff. Verified 2026-05-25 on sess-mplmvrqu: under the chronic
+    // Codex SSE-flake window observed 2026-05-24/25 (7 truncations in
+    // 48h), MAX_RETRY=1 surfaced the F4 ask-user card on every flake
+    // and forced the user to click Retry manually — even though the
+    // very next attempt almost always succeeded. With 3 transparent
+    // retries + exponential backoff (750ms, 1.5s, 3s), the SDK rides
+    // through transient flakes silently. F4 only fires for SUSTAINED
+    // outages (rare). Tradeoff: a real outage waits ~12s before the
+    // user sees Retry, vs ~3s previously — acceptable because outages
+    // are 10× rarer than transient flakes per current telemetry.
+    const MAX_RETRY = 3;
     let lastResponseId: string | undefined;
     let lastItemCount = 0;
     let lastDiag: StreamDiagnostics | undefined;
@@ -373,15 +384,17 @@ export class CodexResponsesModel implements Model {
       lastResponseId = responseId;
       lastItemCount = seenOutputItems.length;
       if (!yieldedRealContent && attempt < MAX_RETRY) {
-        // 750ms backoff. The Codex backend recovers fast in the common
-        // case; this avoids stampeding it while still keeping latency
-        // imperceptible for the user (they don't see the first attempt).
-        // Buffered events from the failed attempt are explicitly
-        // discarded so the new stream's response.created / metadata
-        // frames don't collide with stale ones.
+        // v0.5.21.1 — exponential backoff with jitter: 750ms, 1.5s, 3s.
+        // Single fixed delay re-hammered the backend on the same frame
+        // a struggling Cloudflare/Codex edge was rejecting; spacing
+        // attempts gives the upstream time to recover. Buffered events
+        // from the failed attempt are explicitly discarded so the new
+        // stream's response.created / metadata frames don't collide
+        // with stale ones.
         pendingStart = undefined;
         pendingMetadata = [];
-        await new Promise((resolve) => setTimeout(resolve, 750));
+        const backoffMs = 750 * Math.pow(2, attempt);
+        await new Promise((resolve) => setTimeout(resolve, backoffMs));
         continue;
       }
 

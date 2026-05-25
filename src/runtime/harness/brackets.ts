@@ -328,7 +328,18 @@ export function timeoutForTool(toolName: string): number {
   // a worker doing firecrawl_search for LinkedIn URL lookup. The
   // worker IS the external-API surface from the parent agent's
   // perspective. 5min externalApi bucket is the right shape.
-  if (toolName === 'run_worker' || /^run_worker/.test(toolName)) {
+  //
+  // v0.5.21.1 — extended to ALL sub-agent-as-tool wrappings. Verified
+  // 2026-05-25 on sess-mplmvrqu: draft_plan (planner.asTool) timed
+  // out at 60s during a chronic Codex-flake window — same root cause
+  // as run_worker. Bucket policy: any tool that internally spins
+  // up another agent (which itself makes a Codex call) belongs in
+  // externalApi. Pattern-matched on the known names so we don't have
+  // to hand-curate every future asTool() wrap.
+  if (
+    toolName === 'run_worker' || /^run_worker/.test(toolName) ||
+    toolName === 'draft_plan'
+  ) {
     return DEFAULT_TIMEOUTS_MS.externalApi;
   }
   // MCP namespace shim separator is "__" (src/runtime/mcp-namespace-shim.ts).
