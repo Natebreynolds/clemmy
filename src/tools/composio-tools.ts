@@ -10,6 +10,7 @@ import {
   listComposioToolkitTools,
   listConnectedToolkits,
 } from '../integrations/composio/client.js';
+import { truncateToolText } from './shared.js';
 
 const DYNAMIC_TOOL_PREFIX = 'cx_';
 const MAX_TOOL_NAME_LENGTH = 64;
@@ -30,8 +31,19 @@ const DEFAULT_SEARCH_TOTAL_LIMIT = 25;
 // (classifyComposioSlug). The previous ad-hoc READ_ONLY_PREFIXES /
 // MUTATING_WORDS heuristic was deleted along with composioToolNeedsApproval.
 
+/**
+ * Format a composio result as JSON, capped at DEFAULT_TOOL_RESULT_MAX_CHARS.
+ *
+ * v0.5.22 — previously dumped raw JSON without truncation, which let
+ * firecrawl/sheets/drive results accumulate megabytes into chat
+ * history. Verified 2026-05-25 sess-mplmvrqu: 4 firecrawl_search
+ * returns left the conversation at 1.4MB and the next Codex turn
+ * SSE-truncated. The recall_tool_result tool persists the full raw
+ * output to disk; this truncation just keeps the in-conversation copy
+ * small enough that Codex accepts the next turn.
+ */
 function prettyJson(value: unknown): string {
-  return JSON.stringify(value, null, 2);
+  return truncateToolText(JSON.stringify(value, null, 2));
 }
 
 function parseArgumentsJson(value: string | null | undefined): Record<string, unknown> {

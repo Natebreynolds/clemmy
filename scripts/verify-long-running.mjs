@@ -96,6 +96,7 @@ const SUB_TESTS = {
   'approval-preview-auto-enrichment': testApprovalPreviewAutoEnrichment,
   'codex-transport-timeout-routes-to-f4': testCodexTransportTimeoutRoutesToF4,
   'cli-discovery-surfaces-in-diagnostics': testCliDiscoverySurfacesInDiagnostics,
+  'tool-outputs-reaper-honors-ttl': testToolOutputsReaperHonorsTtl,
 };
 
 // ─── F1 — preflight-block-references-real-tools ────────────────────
@@ -1220,6 +1221,90 @@ async function testCliDiscoverySurfacesInDiagnostics() {
     pass('cli-discovery-surfaces-in-diagnostics', `${checks.length} assertions passed`);
   } else {
     fail('cli-discovery-surfaces-in-diagnostics', `${failed.length} failed: ${failed.map((f) => f.label).join('; ')}`);
+  }
+}
+
+// ─── v0.5.22 — tool-outputs-reaper-honors-ttl ──────────────────────
+//
+// Without this reaper, harness.db grows unbounded — observed
+// 2026-05-25 with 29.6MB of tool_outputs across 1414 rows over 3 days.
+// Verify: (1) the reaper drops rows older than the TTL, (2) it keeps
+// rows newer than the TTL, (3) env override CLEMMY_TOOL_OUTPUT_TTL_DAYS
+// is honored, (4) running on an empty table is a no-op.
+
+async function testToolOutputsReaperHonorsTtl() {
+  const eventlog = await import(pathToFileURL(path.join(DAEMON_DIST, 'runtime/harness/eventlog.js')).href);
+  const sessionMod = await import(pathToFileURL(path.join(DAEMON_DIST, 'runtime/harness/session.js')).href);
+
+  eventlog.resetEventLog?.();
+  const checks = [];
+
+  // (4) Empty table: reaper returns 0.
+  const emptyResult = eventlog.reapStaleToolOutputs(14);
+  checks.push({ ok: emptyResult === 0, label: 'reaper returns 0 on empty table' });
+
+  // Seed: one session with 3 outputs at known ages.
+  const sess = sessionMod.HarnessSession.create({ kind: 'chat', title: 'reaper smoke' });
+  const now = new Date();
+  const tsRecent = new Date(now.getTime() - 1 * 24 * 60 * 60 * 1000).toISOString();      // 1 day ago
+  const tsMidAge = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString();      // 7 days ago
+  const tsAncient = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000).toISOString();    // 30 days ago
+
+  // writeToolOutput stamps created_at with nowIso(), so to test
+  // age-based reaping we have to backdate via direct SQL.
+  const fs = await import('node:fs');
+  const path2 = await import('node:path');
+  const home = process.env.CLEMENTINE_HOME ?? path2.join(os.homedir(), '.clementine-next');
+  const dbPath = path2.join(home, 'state', 'harness.db');
+
+  // Use the same prepared-statement path the reaper uses by writing
+  // via writeToolOutput then UPDATE'ing created_at directly. This
+  // doesn't bypass the schema — same rows the reaper will see.
+  eventlog.writeToolOutput({ sessionId: sess.id, callId: 'call_recent', tool: 'tool_a', output: 'recent payload' });
+  eventlog.writeToolOutput({ sessionId: sess.id, callId: 'call_midage', tool: 'tool_b', output: 'midage payload' });
+  eventlog.writeToolOutput({ sessionId: sess.id, callId: 'call_ancient', tool: 'tool_c', output: 'ancient payload' });
+
+  // Backdate via a direct sqlite open.
+  const Database = (await import('better-sqlite3')).default;
+  const directDb = new Database(dbPath);
+  directDb.prepare(`UPDATE tool_outputs SET created_at = ? WHERE call_id = ?`).run(tsRecent, 'call_recent');
+  directDb.prepare(`UPDATE tool_outputs SET created_at = ? WHERE call_id = ?`).run(tsMidAge, 'call_midage');
+  directDb.prepare(`UPDATE tool_outputs SET created_at = ? WHERE call_id = ?`).run(tsAncient, 'call_ancient');
+  directDb.close();
+
+  // (1) + (2): TTL=14 days. Should drop only the 30-day-old row.
+  const dropped14 = eventlog.reapStaleToolOutputs(14);
+  checks.push({ ok: dropped14 === 1, label: `TTL=14 drops 1 row (ancient), got ${dropped14}` });
+  checks.push({ ok: eventlog.getToolOutput(sess.id, 'call_recent') !== null, label: '1-day-old row preserved' });
+  checks.push({ ok: eventlog.getToolOutput(sess.id, 'call_midage') !== null, label: '7-day-old row preserved (< 14-day TTL)' });
+  checks.push({ ok: eventlog.getToolOutput(sess.id, 'call_ancient') === null, label: '30-day-old row dropped' });
+
+  // (1) again, tighter TTL: drop the 7-day row too.
+  const dropped5 = eventlog.reapStaleToolOutputs(5);
+  checks.push({ ok: dropped5 === 1, label: `TTL=5 drops 1 row (midage), got ${dropped5}` });
+  checks.push({ ok: eventlog.getToolOutput(sess.id, 'call_midage') === null, label: '7-day-old row dropped with TTL=5' });
+  checks.push({ ok: eventlog.getToolOutput(sess.id, 'call_recent') !== null, label: '1-day-old row still preserved' });
+
+  // (3) Env override picked up when arg is undefined.
+  // Re-seed the midage row via direct backdate.
+  eventlog.writeToolOutput({ sessionId: sess.id, callId: 'call_midage2', tool: 'tool_d', output: 'midage v2' });
+  const directDb2 = new Database(dbPath);
+  directDb2.prepare(`UPDATE tool_outputs SET created_at = ? WHERE call_id = ?`).run(tsMidAge, 'call_midage2');
+  directDb2.close();
+  process.env.CLEMMY_TOOL_OUTPUT_TTL_DAYS = '3';
+  const droppedEnv = eventlog.reapStaleToolOutputs();
+  checks.push({ ok: droppedEnv === 1, label: `env CLEMMY_TOOL_OUTPUT_TTL_DAYS=3 drops the 7-day row, got ${droppedEnv}` });
+  delete process.env.CLEMMY_TOOL_OUTPUT_TTL_DAYS;
+
+  // (5) Invalid env clamped — passing 0 returns 0.
+  const droppedZero = eventlog.reapStaleToolOutputs(0);
+  checks.push({ ok: droppedZero === 0, label: 'TTL=0 returns 0 (no rows deleted)' });
+
+  const failed = checks.filter((c) => !c.ok);
+  if (failed.length === 0) {
+    pass('tool-outputs-reaper-honors-ttl', `${checks.length} assertions passed`);
+  } else {
+    fail('tool-outputs-reaper-honors-ttl', `${failed.length} failed: ${failed.map((f) => f.label).join('; ')}`);
   }
 }
 

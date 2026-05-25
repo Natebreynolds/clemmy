@@ -4,6 +4,7 @@ import { reindexVault } from './indexer.js';
 import { tickMemoryMdRefresh } from './memory-md-builder.js';
 import { tickIdentityMdRefresh } from './identity-md-builder.js';
 import { tickAutoresearchObservatory } from '../autoresearch/observatory.js';
+import { reapStaleToolOutputs } from '../runtime/harness/eventlog.js';
 
 /**
  * Memory maintenance for the daemon tick.
@@ -50,6 +51,13 @@ const MEMORY_MD_EVERY_N_TICKS = 120; // ~30min with a 15s tick
 const AUTORESEARCH_EVERY_N_TICKS = 1440; // ~6h with a 15s tick
 const AUTORESEARCH_NIGHTLY_HOUR = 3;     // 3:00 AM local
 const AUTORESEARCH_NIGHTLY_MINUTE = 0;
+
+// v0.5.22 — tool_outputs reaper. The table grew unbounded (~10MB/day
+// at observed rates) because the recall_tool_result store had no TTL.
+// Runs once per hour: catches today's writes before the next tick,
+// cheap (single DELETE with index on created_at). Each row is 4KB-200KB
+// so even on a busy day the delete-set is bounded.
+const EVENTLOG_REAPER_EVERY_N_TICKS = 240; // ~1h with a 15s tick
 // Track the last calendar day on which we fired the nightly run so we
 // don't re-fire 240 times across the matching minute window (15s ticks
 // inside 3:00–3:00:59 would otherwise all match). Reset per-process —
@@ -99,6 +107,20 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
   // inside writeReport). Cold path: ~50-200ms for a busy day.
   if (tickCount % AUTORESEARCH_EVERY_N_TICKS === 0) {
     tickAutoresearchObservatory();
+  }
+
+  // v0.5.22 — drop stale tool_outputs (default 14-day TTL). Without
+  // this, harness.db grows ~10MB/day. The reaper itself is one indexed
+  // DELETE; log only when rows were actually dropped.
+  if (tickCount % EVENTLOG_REAPER_EVERY_N_TICKS === 0) {
+    try {
+      const deleted = reapStaleToolOutputs();
+      if (deleted > 0) {
+        logger.info({ deleted }, 'tool_outputs reaper tick');
+      }
+    } catch (err) {
+      logger.warn({ err }, 'tool_outputs reaper tick failed');
+    }
   }
 
   // Explicit nightly fire at 3:00 AM local. Independent of the periodic

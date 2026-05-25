@@ -737,6 +737,29 @@ export function writeToolOutput(input: WriteToolOutputInput): void {
   );
 }
 
+/**
+ * Drop `tool_outputs` rows older than `maxAgeDays` (default 14). Called
+ * from the daemon's hourly maintenance tick — without this, the table
+ * grows unbounded (~10 MB/day at observed write rates) and the harness
+ * sqlite file balloons over weeks. The 14-day window covers any
+ * plausible follow-up where the agent might want to `recall_tool_result`
+ * on a prior call; beyond that the conversation has almost certainly
+ * compacted past the clip placeholder anyway, so the recall is moot.
+ *
+ * Returns the number of rows deleted. Operator-overridable via
+ * `CLEMMY_TOOL_OUTPUT_TTL_DAYS` env (clamped to [1, 365]).
+ */
+export function reapStaleToolOutputs(maxAgeDays?: number): number {
+  const env = process.env.CLEMMY_TOOL_OUTPUT_TTL_DAYS;
+  const ttl = maxAgeDays ?? (env ? Math.max(1, Math.min(365, Number(env))) : 14);
+  if (!Number.isFinite(ttl) || ttl <= 0) return 0;
+  const db = openEventLog();
+  const result = db
+    .prepare(`DELETE FROM tool_outputs WHERE created_at < datetime('now', ?)`)
+    .run(`-${Math.floor(ttl)} days`);
+  return result.changes;
+}
+
 export function getToolOutput(sessionId: string, callId: string): ToolOutputRecord | null {
   const db = openEventLog();
   const row = db

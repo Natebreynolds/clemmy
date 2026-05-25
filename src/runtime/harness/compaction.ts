@@ -31,11 +31,22 @@ import { estimateInputTokens } from './token-estimator.js';
  * budget — see brackets.ts:331.
  */
 
-const DEFAULT_LAYER1_ITEM_THRESHOLD = 30;
-const DEFAULT_LAYER1_RETAIN_TURNS = 8;
+// v0.5.22 — tightened all four numbers after sess-mplmvrqu (2026-05-25)
+// hit a 1.4MB Codex request body that consistently SSE-truncated. The
+// previous defaults were tuned for "stop the worst offenders"; the new
+// defaults are tuned for "keep request bodies under Codex's truncation
+// cliff." Concrete moves:
+//   - Layer 1 trigger 0.5 → 0.3  (clip older tool outputs at 30% of
+//     budget instead of waiting for 50%)
+//   - Layer 1 retain turns 8 → 4  (keep less raw history; agent can
+//     `recall_tool_result(callId)` to re-fetch any clipped output)
+//   - Layer 1 item threshold 30 → 15  (kick in earlier on chatty turns)
+//   - Layer 2 trigger 0.7 → 0.55 (summarize older messages sooner)
+const DEFAULT_LAYER1_ITEM_THRESHOLD = 15;
+const DEFAULT_LAYER1_RETAIN_TURNS = 4;
 const DEFAULT_LAYER2_RETAIN_MESSAGES = 6;
-const DEFAULT_LAYER1_TOKEN_FRACTION = 0.5;
-const DEFAULT_LAYER2_TOKEN_FRACTION = 0.7;
+const DEFAULT_LAYER1_TOKEN_FRACTION = 0.3;
+const DEFAULT_LAYER2_TOKEN_FRACTION = 0.55;
 const DEFAULT_LAYER3_TOKEN_FRACTION = 0.9;
 const DEFAULT_INPUT_BUDGET_TOKENS = 200_000;
 

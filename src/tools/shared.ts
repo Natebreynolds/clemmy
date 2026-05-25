@@ -45,16 +45,23 @@ export const WORKFLOW_RUNS_DIR = path.join(BASE_DIR, 'workflows', 'runs');
 /**
  * Cap a single tool result so a runaway tool output (a 50KB file dump,
  * a giant JSON blob) doesn't fill the model's context. Defaults to
- * ~8000 chars, which is generous for normal responses but stops the
- * worst offenders. Callers that genuinely need raw fidelity (e.g.
- * read_file with an explicit byte budget) can pass a higher maxChars.
+ * 4000 chars (~1000 tokens), which fits normal responses comfortably
+ * but stops the worst offenders. Callers that genuinely need raw
+ * fidelity (e.g. read_file with an explicit byte budget) can pass a
+ * higher maxChars.
+ *
+ * v0.5.22 — lowered 8000 → 4000 after sess-mplmvrqu (2026-05-25) hit
+ * a 1.4MB Codex request body that consistently SSE-truncated. Tool
+ * returns accumulated unbounded across 31 history items; tighter
+ * default keeps long sessions under Codex's request-size cliff.
  *
  * The truncation marker tells the model the response was cut and how
  * much was dropped, so it can choose to re-call with a narrower scope
- * (offset/limit, filter, more specific query) instead of guessing at
- * the missing bytes.
+ * (offset/limit, filter, more specific query) or call
+ * `recall_tool_result(callId)` to pull the original full output from
+ * disk without re-invoking the upstream tool.
  */
-export const DEFAULT_TOOL_RESULT_MAX_CHARS = 8000;
+export const DEFAULT_TOOL_RESULT_MAX_CHARS = 4000;
 
 export function truncateToolText(text: string, maxChars: number = DEFAULT_TOOL_RESULT_MAX_CHARS): string {
   if (text.length <= maxChars) return text;

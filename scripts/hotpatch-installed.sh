@@ -89,6 +89,13 @@ FILES=(
   "runtime/boundary-error-renderer.js"
   "runtime/codex-native-runtime.js"
   "assistant/core.js"
+  # v0.5.22 — tighter compaction + tool-output truncation
+  "runtime/harness/compaction.js"
+  "tools/shared.js"
+  "tools/composio-tools.js"
+  # v0.5.22 — tool_outputs reaper (14-day TTL)
+  "runtime/harness/eventlog.js"
+  "memory/maintenance.js"
 )
 
 # Sanity-check every source file exists in the local dist BEFORE we
