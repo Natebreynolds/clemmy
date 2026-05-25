@@ -51,6 +51,7 @@ import type { StreamEvent } from '@openai/agents-core/types';
 import { MODELS } from '../../config.js';
 import { loadFreshCodexAccessToken, extractAccountIdFromJwt } from './codex-client.js';
 import { BoundaryError } from '../boundary-error.js';
+import { codexDispatcher, detectUndiciTimeout, buildTransportTimeoutError } from '../codex-dispatcher.js';
 import pino from 'pino';
 
 const logger = pino({ name: 'clementine.codex-model' });
@@ -474,12 +475,33 @@ export class CodexResponsesModel implements Model {
       diag.startTs = Date.now();
       diag.requestBytes = Buffer.byteLength(bodyJson, 'utf8');
     }
-    const res = await fetch(CODEX_URL, {
-      method: 'POST',
-      headers: buildCodexHeaders(token, accountId),
-      body: bodyJson,
-      signal: request.signal,
-    });
+    let res: Response;
+    try {
+      // v0.5.21 Phase 2 — pass `dispatcher: codexDispatcher` so undici
+      // enforces headersTimeout (15s) and bodyTimeout (30s) on this
+      // request. Default undici timeouts are 5min each, which hung
+      // chat indefinitely on a Cloudflare edge stall (2026-05-25
+      // sess-mplfm14j-f0985a98). Detect UND_ERR_HEADERS_TIMEOUT here
+      // (the body-timeout case is detected inside the streaming
+      // generator below).
+      res = await fetch(CODEX_URL, {
+        method: 'POST',
+        headers: buildCodexHeaders(token, accountId),
+        body: bodyJson,
+        signal: request.signal,
+        dispatcher: codexDispatcher,
+      } as RequestInit & { dispatcher?: unknown });
+    } catch (err) {
+      const undiciCode = detectUndiciTimeout(err);
+      if (undiciCode) {
+        throw buildTransportTimeoutError(undiciCode, {
+          modelId: this.modelId,
+          requestBytes: diag?.requestBytes ?? null,
+          phase: 'headers',
+        }, err);
+      }
+      throw err;
+    }
     if (diag) {
       diag.httpStatus = res.status;
       diag.responseHeaders = collectDiagnosticHeaders(res.headers);
@@ -542,6 +564,21 @@ export class CodexResponsesModel implements Model {
 
     try {
       yield* parseCodexSse(res.body);
+    } catch (err) {
+      // v0.5.21 Phase 2 — undici body-timeout fires here (no SSE bytes
+      // for 30s after headers arrived). Same routing as header-timeout
+      // above: throw a BoundaryError(kind='codex.transport_timeout')
+      // so loop.ts's F4 ask-user routing converts it to Retry/Switch/Stop.
+      const undiciCode = detectUndiciTimeout(err);
+      if (undiciCode) {
+        throw buildTransportTimeoutError(undiciCode, {
+          modelId: this.modelId,
+          requestBytes: diag?.requestBytes ?? null,
+          httpStatus: diag?.httpStatus ?? null,
+          phase: 'body',
+        }, err);
+      }
+      throw err;
     } finally {
       if (diag) diag.streamEndTs = Date.now();
     }

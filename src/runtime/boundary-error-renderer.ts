@@ -81,6 +81,8 @@ function titleForKind(kind: BoundaryErrorKind): string {
       return 'Codex auth expired';
     case 'codex.wall_clock':
       return 'Hit the time budget on this turn';
+    case 'codex.transport_timeout':
+      return 'Model backend stopped responding';
     case 'codex.grace_turn_failed':
       return "Couldn't write a recap after hitting the budget";
     case 'mcp.server_unavailable':
@@ -120,6 +122,7 @@ function actionHintForKind(
     case 'codex.http_5xx':
     case 'codex.sse_truncated':
     case 'codex.wall_clock':
+    case 'codex.transport_timeout':
       return 'Try again in a minute. If it persists, check status.openai.com.';
     case 'codex.auth_expired':
       return surface === 'cli'
@@ -156,6 +159,7 @@ function severityForKind(kind: BoundaryErrorKind): 'warn' | 'error' | 'critical'
     case 'codex.http_5xx':
     case 'codex.sse_truncated':
     case 'codex.wall_clock':
+    case 'codex.transport_timeout':
     case 'mcp.server_unavailable':
     case 'notification.delivery_failed':
     case 'notification.partial_chunk':

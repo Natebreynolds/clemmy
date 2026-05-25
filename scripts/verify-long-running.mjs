@@ -94,6 +94,8 @@ const SUB_TESTS = {
   '80-tool-call-end-to-end-chat-dock': test80ToolCallEndToEnd,
   'retry-context-injection': testRetryContextInjection,
   'approval-preview-auto-enrichment': testApprovalPreviewAutoEnrichment,
+  'codex-transport-timeout-routes-to-f4': testCodexTransportTimeoutRoutesToF4,
+  'cli-discovery-surfaces-in-diagnostics': testCliDiscoverySurfacesInDiagnostics,
 };
 
 // ─── F1 — preflight-block-references-real-tools ────────────────────
@@ -996,6 +998,228 @@ async function testApprovalPreviewAutoEnrichment() {
     pass('approval-preview-auto-enrichment', `${checks.length} assertions passed`);
   } else {
     fail('approval-preview-auto-enrichment', `${failed.length} failed: ${failed.map((f) => f.label).join('; ')}`);
+  }
+}
+
+// ─── v0.5.21 Phase 2 — codex-transport-timeout-routes-to-f4 ────────
+//
+// Three-layer verification of the chronic-Codex-flake fix:
+//   (1) Unit:   detectUndiciTimeout classifies the two undici error
+//               shapes (UND_ERR_HEADERS_TIMEOUT, UND_ERR_BODY_TIMEOUT)
+//               and rejects everything else.
+//   (2) Unit:   buildTransportTimeoutError produces a BoundaryError
+//               with kind='codex.transport_timeout', retryable=true,
+//               and a real userMessage.
+//   (3) E2E:    runTurn catches a BoundaryError(kind=transport_timeout)
+//               thrown from runRunner and routes it through F4 to an
+//               `awaiting_user_input` event with source=infra_error_recovery
+//               and boundaryKind='codex.transport_timeout'. Same shape
+//               as Bug C/I — same Retry/Switch/Stop card.
+//
+// Why this matters: today's hung Salesforce chat (sess-mplfm14j-f0985a98)
+// silently sat for 3+ minutes because undici defaults are 5 min and
+// chat had no wall-clock. With these layers, the same Cloudflare-edge
+// stall fast-fails in 15-30s and the user sees a Retry button.
+
+async function testCodexTransportTimeoutRoutesToF4() {
+  const dispatcher = await import(pathToFileURL(path.join(DAEMON_DIST, 'runtime/codex-dispatcher.js')).href);
+  const boundaryMod = await import(pathToFileURL(path.join(DAEMON_DIST, 'runtime/boundary-error.js')).href);
+  const eventlog = await import(pathToFileURL(path.join(DAEMON_DIST, 'runtime/harness/eventlog.js')).href);
+  const sessionMod = await import(pathToFileURL(path.join(DAEMON_DIST, 'runtime/harness/session.js')).href);
+  const loop = await import(pathToFileURL(path.join(DAEMON_DIST, 'runtime/harness/loop.js')).href);
+
+  const checks = [];
+
+  // ─── (1) detectUndiciTimeout classifier ──────────────────────────
+  // Undici nests its error code under `.cause.code` when wrapped by
+  // global fetch's TypeError, OR sets `.code` directly on the error
+  // when the caller used undici's own fetch. Both shapes must work.
+  const nested = { cause: { code: 'UND_ERR_HEADERS_TIMEOUT' } };
+  const direct = { code: 'UND_ERR_BODY_TIMEOUT' };
+  const unrelated = { code: 'UND_ERR_SOCKET' };
+  const random = new TypeError('something else');
+  checks.push({ ok: dispatcher.detectUndiciTimeout(nested) === 'UND_ERR_HEADERS_TIMEOUT', label: 'detects headers-timeout via cause.code' });
+  checks.push({ ok: dispatcher.detectUndiciTimeout(direct) === 'UND_ERR_BODY_TIMEOUT', label: 'detects body-timeout via direct .code' });
+  checks.push({ ok: dispatcher.detectUndiciTimeout(unrelated) === null, label: 'returns null on unrelated undici code' });
+  checks.push({ ok: dispatcher.detectUndiciTimeout(random) === null, label: 'returns null on non-undici error' });
+  checks.push({ ok: dispatcher.detectUndiciTimeout(null) === null, label: 'returns null on null input' });
+
+  // ─── (2) buildTransportTimeoutError shape ────────────────────────
+  const headerErr = dispatcher.buildTransportTimeoutError('UND_ERR_HEADERS_TIMEOUT', { phase: 'headers', sessionId: 'sess-test' });
+  checks.push({ ok: headerErr instanceof boundaryMod.BoundaryError, label: 'returns a BoundaryError instance' });
+  checks.push({ ok: headerErr.kind === 'codex.transport_timeout', label: 'kind is codex.transport_timeout' });
+  checks.push({ ok: headerErr.retryable === true, label: 'retryable is true' });
+  checks.push({ ok: typeof headerErr.userMessage === 'string' && headerErr.userMessage.length > 0, label: 'userMessage is non-empty' });
+  checks.push({ ok: headerErr.context.undiciCode === 'UND_ERR_HEADERS_TIMEOUT', label: 'context preserves undiciCode' });
+  checks.push({ ok: typeof headerErr.context.budgetMs === 'number', label: 'context preserves budgetMs' });
+  checks.push({ ok: boundaryMod.BoundaryError.isTransient(headerErr), label: 'isTransient classifies as transient' });
+
+  // ─── (3) E2E — runTurn routes the BoundaryError through F4 ──────
+  // Same pattern as the existing http_5xx/sse_truncated paths in
+  // loop.ts:2281-2289. Seed a tool_called event so retry_context can
+  // populate, then have runRunner throw a transport_timeout.
+  eventlog.resetEventLog?.();
+  // Default behavior: HARNESS_INFRA_ASK_USER unset = on. Ensure no
+  // stale env from a prior sub-test forces it off.
+  delete process.env.HARNESS_INFRA_ASK_USER;
+
+  const sess = sessionMod.HarnessSession.create({ kind: 'chat', title: 'transport timeout smoke' });
+  // Seed a tool_called event so loop.ts's retry-context lookup finds
+  // SOMETHING to attach. Mirrors what would have been logged just
+  // before a real Codex transport timeout.
+  eventlog.appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'Clem',
+    type: 'tool_called',
+    data: {
+      tool: 'sf_query',
+      arguments: '{"q":"SELECT Owner.Name FROM Account WHERE Website=\'swainlawtexas.com\'"}',
+      callId: 'call_sf_test',
+    },
+  });
+
+  const makeRunnerStub = () => new EventEmitter();
+  let runRunnerInvoked = 0;
+  const runRunner = async () => {
+    runRunnerInvoked += 1;
+    // Simulate the codex-dispatcher path: detected an undici body
+    // timeout mid-stream, threw a transport_timeout BoundaryError.
+    throw dispatcher.buildTransportTimeoutError('UND_ERR_BODY_TIMEOUT', {
+      sessionId: sess.id,
+      model: 'gpt-5.5',
+      phase: 'body',
+    });
+  };
+
+  const result = await loop.runTurn({
+    agent: { model: 'gpt-5.5' },
+    sessionId: sess.id,
+    input: 'who owns the swain law texas account in salesforce',
+    runRunner,
+    makeRunner: makeRunnerStub,
+  });
+
+  checks.push({ ok: runRunnerInvoked === 1, label: 'runRunner invoked exactly once' });
+  checks.push({ ok: result?.status === 'awaiting_user_input', label: 'runTurn returns status=awaiting_user_input (not failed)' });
+
+  // Find the awaiting_user_input event the F4 path wrote.
+  const events = eventlog.listEvents(sess.id, { types: ['awaiting_user_input'] });
+  checks.push({ ok: events.length === 1, label: 'exactly one awaiting_user_input event emitted' });
+  if (events.length === 1) {
+    const data = events[0].data ?? {};
+    checks.push({ ok: data.source === 'infra_error_recovery', label: 'source=infra_error_recovery (Bug C/I family)' });
+    checks.push({ ok: data.boundaryKind === 'codex.transport_timeout', label: 'boundaryKind=codex.transport_timeout' });
+    checks.push({ ok: Array.isArray(data.options) && data.options.includes('Retry'), label: 'Retry option present' });
+    checks.push({ ok: Array.isArray(data.options) && data.options.includes('Stop'), label: 'Stop option present' });
+    checks.push({ ok: data.retry_context && data.retry_context.failed_tool === 'sf_query', label: 'retry_context captures the failed tool from seeded tool_called event' });
+    checks.push({ ok: data.retry_context?.failed_call_id === 'call_sf_test', label: 'retry_context captures call_id' });
+  }
+
+  // Verify the env-gate revert still works — HARNESS_INFRA_ASK_USER=off
+  // should bypass F4 entirely and surface as a normal error.
+  process.env.HARNESS_INFRA_ASK_USER = 'off';
+  eventlog.resetEventLog?.();
+  const sess2 = sessionMod.HarnessSession.create({ kind: 'chat', title: 'transport timeout — env off' });
+  let normalErrorPath = false;
+  try {
+    await loop.runTurn({
+      agent: { model: 'gpt-5.5' },
+      sessionId: sess2.id,
+      input: 'q',
+      runRunner: async () => { throw dispatcher.buildTransportTimeoutError('UND_ERR_HEADERS_TIMEOUT', {}); },
+      makeRunner: makeRunnerStub,
+    });
+    // No throw with knob=off but the result should not be awaiting_user_input.
+    const evts2 = eventlog.listEvents(sess2.id, { types: ['awaiting_user_input'] });
+    normalErrorPath = evts2.length === 0;
+  } catch {
+    // A surfaced error (rather than awaiting_user_input) is also valid evidence the gate flipped.
+    normalErrorPath = true;
+  }
+  checks.push({ ok: normalErrorPath, label: 'HARNESS_INFRA_ASK_USER=off bypasses F4 (revert lever works)' });
+  delete process.env.HARNESS_INFRA_ASK_USER;
+
+  const failed = checks.filter((c) => !c.ok);
+  if (failed.length === 0) {
+    pass('codex-transport-timeout-routes-to-f4', `${checks.length} assertions passed`);
+  } else {
+    fail('codex-transport-timeout-routes-to-f4', `${failed.length} failed: ${failed.map((f) => f.label).join('; ')}`);
+  }
+}
+
+// ─── v0.5.21 Phase 2.5 — cli-discovery-surfaces-in-diagnostics ─────
+//
+// The dashboard summary now shows "N CLIs discovered" alongside
+// "X/Y MCP servers ready" (mirror of the existing chip pattern, so
+// the user has live visibility into PATH discovery without opening a
+// terminal). This requires the diagnostics endpoint to surface a
+// `cli: { count, lastScannedAt }` field — verify both directions:
+//   (1) Shape: `collectDiagnostics()` includes the `cli` field with
+//       the expected keys (number|null + string|null).
+//   (2) Population: after seeding the cli-discovery cache with a
+//       known scan, the diagnostics surface reports that count back.
+
+async function testCliDiscoverySurfacesInDiagnostics() {
+  const diag = await import(pathToFileURL(path.join(DAEMON_DIST, 'dashboard/diagnostics.js')).href);
+  const cliDiscovery = await import(pathToFileURL(path.join(DAEMON_DIST, 'runtime/cli-discovery.js')).href);
+
+  if (typeof diag.collectDiagnostics !== 'function') {
+    return fail('cli-discovery-surfaces-in-diagnostics', 'collectDiagnostics not exported from dashboard/diagnostics.js');
+  }
+
+  const checks = [];
+
+  // ─── (1) Shape — cli field is always present, even with no cache ─
+  cliDiscovery.invalidateCachedScan?.();
+  const empty = diag.collectDiagnostics();
+  checks.push({ ok: empty && typeof empty === 'object', label: 'collectDiagnostics returns an object' });
+  checks.push({ ok: 'cli' in empty, label: 'diagnostics has a `cli` field (always present)' });
+  if ('cli' in empty) {
+    checks.push({ ok: empty.cli.count === null, label: 'cli.count is null when no scan cache exists' });
+    checks.push({ ok: empty.cli.lastScannedAt === null, label: 'cli.lastScannedAt is null when no scan cache exists' });
+  }
+
+  // ─── (2) Population — seed scan, assert diagnostics reflects it ─
+  // We can't call into the live scanner (it would hit the real PATH,
+  // making the assertion machine-dependent). Instead, write a cache
+  // file directly using the same shape the runtime writes, then re-
+  // read via diagnostics.
+  const fs = await import('node:fs');
+  const stateDir = path.join(process.env.CLEMENTINE_HOME ?? path.join(os.homedir(), '.clementine-next'), 'state');
+  fs.mkdirSync(stateDir, { recursive: true });
+  const cliCachePath = path.join(stateDir, 'cli-scan.json');
+  const sampleScan = {
+    detected: [
+      { command: 'higgsfield', path: '/Users/test/.nvm/versions/node/v22/bin/higgsfield' },
+      { command: 'sf', path: '/opt/homebrew/bin/sf' },
+      { command: 'gh', path: '/opt/homebrew/bin/gh' },
+    ],
+    clis: [
+      { command: 'higgsfield', path: '/Users/test/.nvm/versions/node/v22/bin/higgsfield', version: null, helpHead: null, isLikelyCli: true },
+      { command: 'sf', path: '/opt/homebrew/bin/sf', version: '2.50.0', helpHead: 'sf — Salesforce CLI', isLikelyCli: true },
+      { command: 'gh', path: '/opt/homebrew/bin/gh', version: '2.40.0', helpHead: 'gh — GitHub CLI', isLikelyCli: true },
+    ],
+    scannedAt: new Date().toISOString(),
+  };
+  fs.writeFileSync(cliCachePath, JSON.stringify(sampleScan, null, 2));
+
+  const populated = diag.collectDiagnostics();
+  checks.push({ ok: populated.cli && populated.cli.count === 3, label: 'cli.count reflects seeded scan (3 CLIs)' });
+  checks.push({ ok: typeof populated.cli?.lastScannedAt === 'string', label: 'cli.lastScannedAt is a string after scan' });
+  checks.push({
+    ok: populated.cli?.lastScannedAt === sampleScan.scannedAt,
+    label: 'cli.lastScannedAt matches the cache file timestamp exactly',
+  });
+
+  // Clean up so other sub-tests aren't affected.
+  cliDiscovery.invalidateCachedScan?.();
+
+  const failed = checks.filter((c) => !c.ok);
+  if (failed.length === 0) {
+    pass('cli-discovery-surfaces-in-diagnostics', `${checks.length} assertions passed`);
+  } else {
+    fail('cli-discovery-surfaces-in-diagnostics', `${failed.length} failed: ${failed.map((f) => f.label).join('; ')}`);
   }
 }
 

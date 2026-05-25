@@ -2282,6 +2282,7 @@ function handleRunError(
       'codex.http_5xx',
       'codex.sse_truncated',
       'codex.wall_clock',
+      'codex.transport_timeout',
       'mcp.server_unavailable',
     ]);
     const askUserEnabled =

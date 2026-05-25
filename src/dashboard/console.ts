@@ -18269,9 +18269,17 @@ const CONSOLE_JS = `
     if (summaryEl) {
       const t = data.toolEvents || {};
       const m = (data.mcp && data.mcp.summary) || {};
+      // v0.5.21 Phase 2.5 — surface the local-CLI discovery count
+      // alongside the existing MCP-ready chip. Shows "scanning…" when
+      // the cli-discovery cache hasn't populated yet.
+      const c = data.cli || {};
+      const cliChip = (c.count == null)
+        ? '<strong>scanning</strong> CLIs…'
+        : '<strong>' + c.count + '</strong> CLI' + (c.count === 1 ? '' : 's') + ' discovered';
       summaryEl.innerHTML =
         '<strong>' + (t.totalEvents || 0) + '</strong> tool events across <strong>' + (t.totalSessions || 0) + '</strong> sessions today · ' +
         '<strong>' + (m.connected || 0) + '/' + (m.total || 0) + '</strong> MCP servers ready · ' +
+        cliChip + ' · ' +
         '<strong>' + ((data.recentErrors || []).length) + '</strong> recent warn/error log lines';
     }
 

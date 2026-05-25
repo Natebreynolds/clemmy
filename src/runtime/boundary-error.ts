@@ -33,6 +33,7 @@ export type BoundaryErrorKind =
   | 'codex.sse_truncated'
   | 'codex.auth_expired'
   | 'codex.wall_clock'
+  | 'codex.transport_timeout'
   | 'codex.grace_turn_failed'
   // MCP fleet
   | 'mcp.server_unavailable'
@@ -140,6 +141,7 @@ export class BoundaryError extends Error {
       case 'codex.http_5xx':
       case 'codex.sse_truncated':
       case 'codex.wall_clock':
+      case 'codex.transport_timeout':
       case 'mcp.server_unavailable':
       case 'notification.delivery_failed':
         return true;

@@ -20,6 +20,7 @@ import { existsSync, readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { BASE_DIR } from '../config.js';
 import { listMcpServerHealth, type MCPServerHealthSnapshot } from '../runtime/mcp-namespace-shim.js';
+import { readCachedScan } from '../runtime/cli-discovery.js';
 
 const SUPERVISOR_LOG_PATH = path.join(BASE_DIR, 'logs', 'desktop', 'supervisor.log');
 const TOOL_EVENTS_DIR = path.join(BASE_DIR, 'state', 'tool-events');
@@ -29,6 +30,12 @@ export interface DiagnosticsSummary {
   toolEvents: ToolEventsSummary;
   recentErrors: LogLine[];
   mcp: { servers: MCPServerHealthSnapshot[]; summary: McpHealthSummary };
+  /** v0.5.21 Phase 2.5 — CLI discovery readiness chip in the
+   *  diagnostics summary, mirroring the existing MCP-ready chip.
+   *  count is the number of CLIs found on $PATH by the most recent
+   *  scan; null when no scan has run yet. lastScannedAt is the ISO
+   *  timestamp from the cli-discovery cache. */
+  cli: { count: number | null; lastScannedAt: string | null };
   storage: StorageStats;
 }
 
@@ -239,11 +246,16 @@ export function collectDiagnostics(): DiagnosticsSummary {
     degraded: servers.filter((s) => s.state === 'degraded').length,
     unavailable: servers.filter((s) => s.state === 'unavailable').length,
   };
+  const cliScan = readCachedScan();
   return {
     generatedAt: new Date().toISOString(),
     toolEvents: summarizeToolEvents(),
     recentErrors: readRecentErrors(40),
     mcp: { servers, summary: mcpSummary },
+    cli: {
+      count: cliScan ? cliScan.clis.length : null,
+      lastScannedAt: cliScan ? cliScan.scannedAt : null,
+    },
     storage: readStorageStats(),
   };
 }

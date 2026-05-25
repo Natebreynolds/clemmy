@@ -5,6 +5,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import os from 'node:os';
 import type { Readable } from 'node:stream';
+import { extractShellPath } from './shell-path-extractor.js';
+import { readCache as readShellPathCache, writeCache as writeShellPathCache, mergePaths } from './shell-path-cache.js';
 
 /**
  * Daemon supervisor — owns the lifecycle of the local Clementine daemon
@@ -185,12 +187,59 @@ export class DaemonSupervisor {
       `${process.env.HOME ?? ''}/.local/bin`,    // pipx, generic user installs
       `${process.env.HOME ?? ''}/go/bin`,        // Go binaries
     ].filter((p) => p && !p.endsWith('/'));
-    const existingPath = process.env.PATH ?? '';
-    const existingParts = new Set(existingPath.split(':').filter(Boolean));
-    const augmentedPath = [
-      ...COMMON_USER_BIN_DIRS.filter((p) => !existingParts.has(p)),
-      ...existingPath.split(':').filter(Boolean),
-    ].join(':');
+
+    // v0.5.21 Phase 2.5 — merge in the user's shell PATH so version
+    // managers (nvm, asdf, mise, volta, fnm, rbenv, pyenv, sdkman)
+    // become visible. Without this, anything installed via
+    // `npm install -g X` while on nvm is invisible to `local_cli_list`
+    // (verified 2026-05-25: Higgsfield at ~/.nvm/.../bin/higgsfield
+    // was missed). Cache-first: read instantly at boot; async-refresh
+    // in background and write a new cache when it changes. Daemon
+    // picks up the refreshed PATH at the next restart (no IPC).
+    const cachedShellPath = readShellPathCache()?.path ?? null;
+    const augmentedPath = mergePaths(
+      COMMON_USER_BIN_DIRS.join(':'),
+      cachedShellPath,
+      process.env.PATH ?? '',
+    );
+    // Kick off the async re-extraction; logging only — never blocks.
+    extractShellPath()
+      .then((result) => {
+        if (!result.path) {
+          this.emit({
+            type: 'log',
+            stream: 'stderr',
+            line: `[supervisor] shell-path extraction failed: ${result.failureReason ?? 'unknown'} (${result.durationMs}ms)`,
+          });
+          return;
+        }
+        const prior = readShellPathCache()?.path ?? null;
+        if (prior === result.path) return; // unchanged → skip write
+        try {
+          writeShellPathCache(result.path);
+          this.emit({
+            type: 'log',
+            stream: 'stdout',
+            line: `[supervisor] shell-path cache updated via ${result.shell} (${result.durationMs}ms) — daemon will see new CLIs on next restart`,
+          });
+        } catch (err) {
+          this.emit({
+            type: 'log',
+            stream: 'stderr',
+            line: `[supervisor] shell-path cache write failed: ${err instanceof Error ? err.message : String(err)}`,
+          });
+        }
+      })
+      .catch((err) => {
+        // Defensive — extractShellPath() returns a result envelope and
+        // shouldn't reject, but a programming bug shouldn't crash the
+        // supervisor either.
+        this.emit({
+          type: 'log',
+          stream: 'stderr',
+          line: `[supervisor] shell-path extraction threw: ${err instanceof Error ? err.message : String(err)}`,
+        });
+      });
 
     // Load .env files as a BASELINE before process.env. Order matters:
     // shell exports (in process.env) override .env file values, which
@@ -330,6 +379,18 @@ export class DaemonSupervisor {
 
   private emit(event: SupervisorEvent): void {
     this.opts.onEvent?.(event);
+    // v0.5.21 Phase 2.5 — supervisor's own log events also go to the
+    // supervisor.log file (which previously only captured daemon
+    // stdout/stderr). Without this, operator-relevant signals like
+    // "shell-path cache updated" never landed in the log file the
+    // dashboard + ops tail. Best-effort: write failures must never
+    // crash the supervisor.
+    try {
+      if (event.type === 'log' && this.logStream) {
+        const text = event.line.endsWith('\n') ? event.line : event.line + '\n';
+        this.logStream.write(text);
+      }
+    } catch { /* swallow — logging must never break the runtime */ }
   }
 
   private resolveDaemonCommand(): { command: string; args: string[]; runAsNode: boolean } {

@@ -83,6 +83,12 @@ FILES=(
   "runtime/harness/eventlog.js"
   # v0.5.19 — Bug F (heartbeat sweep pause-aware)
   "execution/store.js"
+  # v0.5.21 Phase 2 — Codex transport timeouts + chat wall-clock
+  "runtime/codex-dispatcher.js"
+  "runtime/boundary-error.js"
+  "runtime/boundary-error-renderer.js"
+  "runtime/codex-native-runtime.js"
+  "assistant/core.js"
 )
 
 # Sanity-check every source file exists in the local dist BEFORE we

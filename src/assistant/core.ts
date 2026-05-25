@@ -16,6 +16,27 @@ import { addRunEvent } from '../runtime/run-events.js';
 import { isUserFacingSession, looksLikeInternalPrompt } from '../execution/scope.js';
 import { classifyMessageIntent } from './message-intent.js';
 
+/**
+ * v0.5.21 Phase 2 — default wall-clock budget for chat turns.
+ *
+ * Workflows and controller decisions both pass an explicit
+ * maxWallClockMs (`WORKFLOW_STEP_WALL_CLOCK_MS`,
+ * `CONTROLLER_DECISION_WALL_CLOCK_MS`). Chat callers (Discord DM,
+ * dashboard) historically passed nothing, so a hung Codex SSE stream
+ * had no end-to-end budget and a stalled call could sit indefinitely
+ * (verified 2026-05-25 — sess-mplfm14j-f0985a98 hung 3+ minutes).
+ *
+ * 120s is the backstop AFTER the codex-dispatcher transport timeouts
+ * (15s headers / 30s body). Most chat-side hangs surface in 15-30s
+ * via undici; this wall-clock only fires for an exotic "slow drip"
+ * where small bytes flow steadily but the turn exceeds 2 minutes.
+ *
+ * Discord's deferReply interaction window is 15 minutes, so 2 minutes
+ * leaves plenty of room for legitimate long-thinking responses while
+ * still aborting indefinite stalls.
+ */
+export const CHAT_WALL_CLOCK_MS = 120_000;
+
 function shouldUseExecutionTracking(request: AssistantRequest): boolean {
   return isUserFacingSession(request.sessionId, request.channel) &&
     !looksLikeInternalPrompt(request.message);
@@ -123,7 +144,7 @@ export class ClementineAssistant {
         sessionId: request.sessionId,
         userId: request.userId,
         channel: request.channel,
-        maxWallClockMs: request.maxWallClockMs,
+        maxWallClockMs: request.maxWallClockMs ?? CHAT_WALL_CLOCK_MS,
         excludeToolNames: request.excludeToolNames,
       }, {
         shouldCancel: request.shouldCancel,

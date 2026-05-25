@@ -13,6 +13,7 @@ import { beginToolEvent, recordPendingApproval, recordToolEvent } from '../agent
 import { recordUsage, type UsageEvent } from './usage-log.js';
 import { truncateToolText } from '../tools/shared.js';
 import type { RuntimeContextValue, ToolActivity } from '../types.js';
+import { codexDispatcher, detectUndiciTimeout, buildTransportTimeoutError } from './codex-dispatcher.js';
 
 const logger = pino({ name: 'clementine-next.codex-native-runtime' });
 
@@ -509,7 +510,11 @@ async function performCodexRequest(
       // connect per call costs a few ms; the alternative is a
       // multi-hour outage of every chat run. Same fix as embeddings.
       keepalive: false,
-    });
+      // v0.5.21 Phase 2 — scoped undici Agent with 15s headersTimeout
+      // and 30s bodyTimeout. Catches Cloudflare-edge stalls that
+      // wouldn't otherwise fire until undici's 5min defaults expired.
+      dispatcher: codexDispatcher,
+    } as RequestInit & { dispatcher?: unknown });
 	  } catch (error) {
 	    if (abortController?.signal.aborted) {
 	      if (wallClockTimedOut) {
@@ -518,6 +523,16 @@ async function performCodexRequest(
 	        );
 	      }
 	      throw new AgentRuntimeCancelledError();
+	    }
+	    // v0.5.21 Phase 2 — detect undici headers-timeout and throw a
+	    // BoundaryError so loop.ts F4 routing turns it into Retry/Switch/Stop.
+	    const undiciCode = detectUndiciTimeout(error);
+	    if (undiciCode) {
+	      throw buildTransportTimeoutError(undiciCode, {
+	        sessionId: request.sessionId,
+	        model: request.model,
+	        phase: 'headers',
+	      }, error);
 	    }
 	    throw error;
 	  }
@@ -598,6 +613,15 @@ async function performCodexRequest(
 	            );
 	          }
 	          throw new AgentRuntimeCancelledError();
+	        }
+	        // v0.5.21 Phase 2 — undici body-timeout during SSE read.
+	        const undiciCode = detectUndiciTimeout(error);
+	        if (undiciCode) {
+	          throw buildTransportTimeoutError(undiciCode, {
+	            sessionId: request.sessionId,
+	            model: request.model,
+	            phase: 'body',
+	          }, error);
 	        }
 	        throw error;
 	      }
@@ -1352,7 +1376,12 @@ export class CodexNativeRuntime implements AgentRuntime {
         // See note above on the main fetch site — avoid the long-
         // uptime keep-alive pool poisoning that breaks chat.
         keepalive: false,
-      });
+        // v0.5.21 Phase 2 — share the scoped Codex dispatcher so the
+        // grace turn also fast-fails on Cloudflare-edge stalls. The
+        // catch below already returns null on any failure; tighter
+        // timeouts just mean the failure is detected sooner.
+        dispatcher: codexDispatcher,
+      } as RequestInit & { dispatcher?: unknown });
     } catch (err) {
       logger.warn({ err }, 'grace turn fetch failed');
       return null;
