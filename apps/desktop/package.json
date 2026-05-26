@@ -1,6 +1,6 @@
 {
   "name": "@clemmy/desktop",
-  "version": "0.5.23",
+  "version": "0.5.24",
   "private": true,
   "description": "Clementine — native desktop shell. Supervises the daemon, opens the local dashboard, surfaces approvals and check-ins, manages credentials.",
   "main": "dist/main.js",
@@ -16,7 +16,7 @@
     "package:mac": "npm run build && npm run build:daemon && npm run rebuild-daemon-natives && electron-builder --mac && npm run restore-node-natives",
     "package:mac:unsigned": "npm run build && npm run build:daemon && npm run rebuild-daemon-natives && APPLE_NOTARIZE_SKIP=true CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac && npm run restore-node-natives",
     "package:dist": "npm run build && npm run build:daemon && npm run rebuild-daemon-natives && electron-builder && npm run restore-node-natives",
-    "release": "npm run build && npm run build:daemon && npm run rebuild-daemon-natives && electron-builder --mac --publish never && npm run restore-node-natives"
+    "release": "./scripts/release-mac-dual-arch.sh"
   },
   "dependencies": {
     "electron-updater": "^6.8.3",
