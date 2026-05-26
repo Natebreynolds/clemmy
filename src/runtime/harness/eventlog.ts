@@ -711,6 +711,16 @@ export function writeToolOutput(input: WriteToolOutputInput): void {
   const db = openEventLog();
   const original = input.output;
   const originalBytes = Buffer.byteLength(original, 'utf8');
+
+  const existing = db.prepare(
+    `SELECT content_bytes
+       FROM tool_outputs
+      WHERE session_id = ? AND call_id = ?`,
+  ).get(input.sessionId, input.callId) as { content_bytes: number } | undefined;
+  if (existing && existing.content_bytes > originalBytes) {
+    return;
+  }
+
   let stored = original;
   let truncated = false;
   if (originalBytes > TOOL_OUTPUT_MAX_BYTES) {

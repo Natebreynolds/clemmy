@@ -91,8 +91,11 @@ FILES=(
   "assistant/core.js"
   # v0.5.22 — tighter compaction + tool-output truncation
   "runtime/harness/compaction.js"
+  "runtime/harness/tool-output-context.js"
+  "runtime/harness/tool-output-format.js"
   "tools/shared.js"
   "tools/composio-tools.js"
+  "tools/recall-tools.js"
   # v0.5.22 — tool_outputs reaper (14-day TTL)
   "runtime/harness/eventlog.js"
   "memory/maintenance.js"

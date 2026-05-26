@@ -10,6 +10,8 @@ import { getWorkspaceDirs } from './shared.js';
 import { loadProactivityPolicy } from '../agents/proactivity-policy.js';
 import { needsApprovalFromTaxonomy } from '../agents/tool-taxonomy.js';
 import { findSafeCliCommand } from '../runtime/cli-discovery.js';
+import { formatRecallableToolText } from '../runtime/harness/tool-output-format.js';
+import { callIdFromToolDetails, sessionIdFromRunContext } from '../runtime/harness/tool-output-context.js';
 
 /**
  * Approval gate for SDK-native tools — delegates to the global
@@ -164,7 +166,7 @@ function needsApprovalForShellSmart() {
   };
 }
 
-const MAX_COMMAND_OUTPUT_CHARS = 12000;
+const MAX_COMMAND_CAPTURE_CHARS = 200_000;
 const DEFAULT_TIMEOUT_MS = 30_000;
 
 function expandHome(input: string): string {
@@ -254,9 +256,11 @@ function resolveAllowedCwd(input?: string): string {
   return resolveAllowedPath(input?.trim() || BASE_DIR);
 }
 
-function truncateOutput(value: string, maxChars = MAX_COMMAND_OUTPUT_CHARS): string {
-  if (value.length <= maxChars) return value;
-  return `${value.slice(0, maxChars)}\n...[truncated ${value.length - maxChars} chars]`;
+function appendCapturedOutput(current: string, chunk: string): string {
+  if (current.length >= MAX_COMMAND_CAPTURE_CHARS) return current;
+  const next = current + chunk;
+  if (next.length <= MAX_COMMAND_CAPTURE_CHARS) return next;
+  return `${next.slice(0, MAX_COMMAND_CAPTURE_CHARS)}\n...[capture stopped after ${MAX_COMMAND_CAPTURE_CHARS} chars]`;
 }
 
 function assertCommandAllowed(command: string): void {
@@ -344,10 +348,10 @@ function runCommand(command: string, cwd: string, timeoutMs: number): Promise<st
     }, timeoutMs);
 
     child.stdout.on('data', (chunk) => {
-      stdout = truncateOutput(stdout + String(chunk));
+      stdout = appendCapturedOutput(stdout, String(chunk));
     });
     child.stderr.on('data', (chunk) => {
-      stderr = truncateOutput(stderr + String(chunk));
+      stderr = appendCapturedOutput(stderr, String(chunk));
     });
     child.on('error', (error) => {
       clearTimeout(timeout);
@@ -383,10 +387,10 @@ function runProcess(command: string, args: string[], cwd: string, timeoutMs: num
     }, timeoutMs);
 
     child.stdout.on('data', (chunk) => {
-      stdout = truncateOutput(stdout + String(chunk));
+      stdout = appendCapturedOutput(stdout, String(chunk));
     });
     child.stderr.on('data', (chunk) => {
-      stderr = truncateOutput(stderr + String(chunk));
+      stderr = appendCapturedOutput(stderr, String(chunk));
     });
     child.on('error', (error) => {
       clearTimeout(timeout);
@@ -418,11 +422,23 @@ function listDirectory(dir: string, limit: number): string {
 }
 
 export function getComputerTools(): Tool<RuntimeContextValue>[] {
+  const formatToolOutput = (toolName: string, runContext: unknown, details: unknown, output: string): string =>
+    formatRecallableToolText(output, {
+      toolName,
+      sessionId: sessionIdFromRunContext(runContext),
+      callId: callIdFromToolDetails(details),
+    });
+
   const workspace_roots = tool({
     name: 'workspace_roots',
     description: 'List directories Clementine is allowed to inspect or operate in.',
     parameters: z.object({}),
-    execute: async () => workspaceRoots().map((root, index) => `${index + 1}. ${root}`).join('\n'),
+    execute: async (_input, runContext, details) => formatToolOutput(
+      'workspace_roots',
+      runContext,
+      details,
+      workspaceRoots().map((root, index) => `${index + 1}. ${root}`).join('\n'),
+    ),
   });
 
   const list_files = tool({
@@ -432,7 +448,12 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
       directory: z.string().nullable(),
       limit: z.number().min(1).max(500).nullable(),
     }),
-    execute: async ({ directory, limit }) => listDirectory(directory || process.cwd(), limit ?? 120),
+    execute: async ({ directory, limit }, runContext, details) => formatToolOutput(
+      'list_files',
+      runContext,
+      details,
+      listDirectory(directory || process.cwd(), limit ?? 120),
+    ),
   });
 
   const read_file = tool({
@@ -442,11 +463,16 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
       path: z.string().min(1),
       max_chars: z.number().min(1).max(50000).nullable(),
     }),
-    execute: async (input) => {
+    execute: async (input, runContext, details) => {
       const filePath = resolveAllowedPath(input.path);
       if (!existsSync(filePath)) return `File does not exist: ${filePath}`;
       if (!statSync(filePath).isFile()) return `Not a file: ${filePath}`;
-      return readFileSync(filePath, 'utf-8').slice(0, input.max_chars ?? 20000);
+      return formatToolOutput(
+        'read_file',
+        runContext,
+        details,
+        readFileSync(filePath, 'utf-8').slice(0, input.max_chars ?? 20000),
+      );
     },
   });
 
@@ -479,9 +505,14 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
       timeout_ms: z.number().min(1000).max(120000).nullable(),
     }),
     needsApproval: needsApprovalForShellSmart(),
-    execute: async (input) => {
+    execute: async (input, runContext, details) => {
       const cwd = resolveAllowedCwd(input.cwd ?? undefined);
-      return runCommand(input.command, cwd, input.timeout_ms ?? DEFAULT_TIMEOUT_MS);
+      return formatToolOutput(
+        'run_shell_command',
+        runContext,
+        details,
+        await runCommand(input.command, cwd, input.timeout_ms ?? DEFAULT_TIMEOUT_MS),
+      );
     },
   });
 
@@ -491,13 +522,18 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
     parameters: z.object({
       cwd: z.string().nullable(),
     }),
-    execute: async ({ cwd }) => {
+    execute: async ({ cwd }, runContext, details) => {
       const git = findSafeCliCommand('git');
       if (!git || git.skipped) {
         const reason = git?.skipped ? git.reason : 'git was not found on PATH.';
         return `Git is unavailable: ${reason} Install Xcode Command Line Tools or a standalone Git binary to use git_status.`;
       }
-      return runProcess(git.command, ['status', '--short', '--branch'], resolveAllowedCwd(cwd ?? undefined), 10_000);
+      return formatToolOutput(
+        'git_status',
+        runContext,
+        details,
+        await runProcess(git.command, ['status', '--short', '--branch'], resolveAllowedCwd(cwd ?? undefined), 10_000),
+      );
     },
   });
 

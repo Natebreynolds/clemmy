@@ -87,7 +87,8 @@ export function registerRecallTools(server: McpServer): void {
         .filter(Boolean)
         .join(' • ');
 
-      return textResult(`${header}\n\n${slice}`);
+      const body = `${header}\n\n${slice}`;
+      return textResult(body, { maxChars: body.length });
     },
   );
 }

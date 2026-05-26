@@ -26,6 +26,8 @@ import { registerSessionTools } from './session-tools.js';
 import { registerTeamTools } from './team-tools.js';
 import { registerVaultTools } from './vault-tools.js';
 import { ensureToolDirectories, textResult } from './shared.js';
+import { formatRecallableToolText } from '../runtime/harness/tool-output-format.js';
+import { toolOutputContextFromSdk, withToolOutputContext } from '../runtime/harness/tool-output-context.js';
 
 type LocalToolHandler = (input: Record<string, unknown>) => Promise<unknown> | unknown;
 
@@ -42,7 +44,7 @@ interface CapturedLocalTool {
 // list is read-only, add/remove are admin.
 
 function resultToText(result: unknown): string {
-  if (typeof result === 'string') return result;
+  if (typeof result === 'string') return formatRecallableToolText(result);
   if (result && typeof result === 'object') {
     const content = (result as { content?: unknown }).content;
     if (Array.isArray(content)) {
@@ -55,14 +57,14 @@ function resultToText(result: unknown): string {
         })
         .filter(Boolean)
         .join('\n');
-      if (text) return text;
+      if (text) return formatRecallableToolText(text);
     }
   }
 
   try {
-    return JSON.stringify(result, null, 2);
+    return formatRecallableToolText(JSON.stringify(result, null, 2));
   } catch {
-    return String(result);
+    return formatRecallableToolText(String(result));
   }
 }
 
@@ -153,6 +155,9 @@ export function getLocalRuntimeTools(): Tool<RuntimeContextValue>[] {
       isDestructive: (input) =>
         Boolean(localTool.approvalRequired) || localDestructiveHint(localTool.name, input),
     }),
-    execute: async (input) => resultToText(await localTool.handler(input as Record<string, unknown>)),
+    execute: async (input, runContext, details) => withToolOutputContext(
+      toolOutputContextFromSdk(localTool.name, runContext, details),
+      async () => resultToText(await localTool.handler(input as Record<string, unknown>)),
+    ),
   }));
 }

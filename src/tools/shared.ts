@@ -23,6 +23,11 @@ import {
   ensureTodayNote,
   ensureVaultScaffold,
 } from '../memory/vault.js';
+import {
+  DEFAULT_TOOL_RESULT_MAX_CHARS,
+  formatRecallableToolText,
+  truncateToolText as truncateToolTextCanonical,
+} from '../runtime/harness/tool-output-format.js';
 
 export const plans = new PlanStore();
 export const sessions = new SessionStore();
@@ -61,17 +66,16 @@ export const WORKFLOW_RUNS_DIR = path.join(BASE_DIR, 'workflows', 'runs');
  * `recall_tool_result(callId)` to pull the original full output from
  * disk without re-invoking the upstream tool.
  */
-export const DEFAULT_TOOL_RESULT_MAX_CHARS = 4000;
-
 export function truncateToolText(text: string, maxChars: number = DEFAULT_TOOL_RESULT_MAX_CHARS): string {
-  if (text.length <= maxChars) return text;
-  const head = text.slice(0, maxChars);
-  const dropped = text.length - maxChars;
-  return `${head}\n\n…[truncated — ${dropped.toLocaleString()} of ${text.length.toLocaleString()} chars omitted; re-call with a narrower scope (offset/limit, filter, specific query) if you need the rest]`;
+  return truncateToolTextCanonical(text, maxChars);
 }
 
+export { DEFAULT_TOOL_RESULT_MAX_CHARS };
+
 export function textResult(text: string, options?: { maxChars?: number }): { content: Array<{ type: 'text'; text: string }> } {
-  const capped = truncateToolText(text, options?.maxChars ?? DEFAULT_TOOL_RESULT_MAX_CHARS);
+  const capped = formatRecallableToolText(text, {
+    maxChars: options?.maxChars ?? DEFAULT_TOOL_RESULT_MAX_CHARS,
+  });
   return { content: [{ type: 'text', text: capped }] };
 }
 

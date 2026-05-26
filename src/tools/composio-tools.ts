@@ -10,7 +10,8 @@ import {
   listComposioToolkitTools,
   listConnectedToolkits,
 } from '../integrations/composio/client.js';
-import { truncateToolText } from './shared.js';
+import { formatRecallableToolText } from '../runtime/harness/tool-output-format.js';
+import { callIdFromToolDetails, sessionIdFromRunContext } from '../runtime/harness/tool-output-context.js';
 
 const DYNAMIC_TOOL_PREFIX = 'cx_';
 const MAX_TOOL_NAME_LENGTH = 64;
@@ -31,19 +32,33 @@ const DEFAULT_SEARCH_TOTAL_LIMIT = 25;
 // (classifyComposioSlug). The previous ad-hoc READ_ONLY_PREFIXES /
 // MUTATING_WORDS heuristic was deleted along with composioToolNeedsApproval.
 
+export interface FormatComposioToolOutputOptions {
+  context?: unknown;
+  details?: unknown;
+  toolName?: string;
+  maxChars?: number;
+}
+
 /**
- * Format a composio result as JSON, capped at DEFAULT_TOOL_RESULT_MAX_CHARS.
+ * Format a Composio result as prompt-safe JSON while preserving the
+ * full payload for recall when the harness gives us a session + call id.
  *
- * v0.5.22 — previously dumped raw JSON without truncation, which let
- * firecrawl/sheets/drive results accumulate megabytes into chat
- * history. Verified 2026-05-25 sess-mplmvrqu: 4 firecrawl_search
- * returns left the conversation at 1.4MB and the next Codex turn
- * SSE-truncated. The recall_tool_result tool persists the full raw
- * output to disk; this truncation just keeps the in-conversation copy
- * small enough that Codex accepts the next turn.
+ * The model-facing copy stays capped so long runs do not accumulate
+ * megabytes of app data in Codex request bodies. The full JSON is
+ * written before clipping, so `recall_tool_result("call_xxx")` can
+ * recover details without re-running a side-effecting upstream tool.
  */
-function prettyJson(value: unknown): string {
-  return truncateToolText(JSON.stringify(value, null, 2));
+export function formatComposioToolOutput(
+  value: unknown,
+  options: FormatComposioToolOutputOptions = {},
+): string {
+  const text = JSON.stringify(value, null, 2);
+  return formatRecallableToolText(text, {
+    maxChars: options.maxChars,
+    toolName: options.toolName ?? 'composio tool',
+    sessionId: sessionIdFromRunContext(options.context),
+    callId: callIdFromToolDetails(options.details),
+  });
 }
 
 function parseArgumentsJson(value: string | null | undefined): Record<string, unknown> {
@@ -187,11 +202,14 @@ export async function getDynamicComposioRuntimeTools(options: {
         // (read for GET/LIST/etc., send for everything else), then
         // consults the scope policy (yolo → auto, strict → ask, etc.).
         needsApproval: needsApprovalFromTaxonomy(name),
-        execute: async (input) => prettyJson(await executeComposioTool(
-          toolSlug,
-          normalizeToolInput(input),
-          defaultConnectionId,
-        )),
+        execute: async (input, context, details) => formatComposioToolOutput(
+          await executeComposioTool(
+            toolSlug,
+            normalizeToolInput(input),
+            defaultConnectionId,
+          ),
+          { context, details, toolName: name },
+        ),
       }));
     }
   }
@@ -204,10 +222,10 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
     name: 'composio_status',
     description: 'Inspect whether Composio is configured and list active third-party app connections available to Clementine.',
     parameters: z.object({}),
-    execute: async () => {
+    execute: async (_input, context, details) => {
       const credentials = await getComposioRuntimeStatus();
       const connections = credentials.enabled ? await listConnectedToolkits() : [];
-      return prettyJson({
+      return formatComposioToolOutput({
         ...credentials,
         connections: connections.map((connection) => ({
           toolkit: connection.slug,
@@ -215,7 +233,7 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
           status: connection.status,
           account: connection.accountLabel ?? connection.alias ?? null,
         })),
-      });
+      }, { context, details, toolName: 'composio_status' });
     },
   });
 
@@ -226,9 +244,9 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
       toolkit_slug: z.string().min(1),
       limit: z.number().int().positive().max(200).nullable(),
     }),
-    execute: async ({ toolkit_slug, limit }) => {
+    execute: async ({ toolkit_slug, limit }, context, details) => {
       const tools = await listComposioToolkitTools(toolkit_slug, limit ?? 80);
-      return prettyJson({
+      return formatComposioToolOutput({
         toolkit: toolkit_slug,
         count: tools.length,
         tools: tools.map((item) => ({
@@ -237,7 +255,7 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
           description: item.description,
           inputParameters: item.inputParameters,
         })),
-      });
+      }, { context, details, toolName: 'composio_list_tools' });
     },
   });
 
@@ -249,14 +267,14 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
       toolkit_slug: z.string().min(1).nullable(),
       limit: z.number().int().positive().max(50).nullable(),
     }),
-    execute: async ({ query, toolkit_slug, limit }) => {
+    execute: async ({ query, toolkit_slug, limit }, context, details) => {
       const credentials = getComposioCredentialStatus();
       if (!credentials.enabled) {
-        return prettyJson({
+        return formatComposioToolOutput({
           configured: false,
           message: 'COMPOSIO_API_KEY is not configured. Connect Composio in the dashboard first.',
           matches: [],
-        });
+        }, { context, details, toolName: 'composio_search_tools' });
       }
 
       // DO NOT filter by `status === 'ACTIVE'` here. Composio's
@@ -313,7 +331,7 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
       }
 
       matches.sort((left, right) => right.score - left.score || left.slug.localeCompare(right.slug));
-      return prettyJson({
+      return formatComposioToolOutput({
         configured: true,
         connectedToolkits: allConnections.map((connection) => ({
           toolkit: connection.slug,
@@ -330,7 +348,7 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
         count: Math.min(matches.length, maxResults),
         matches: matches.slice(0, maxResults),
         nextStep: 'Pick the best match, then call `composio_execute_tool` with `tool_slug` set to the exact slug from this result and `arguments` as a JSON object string built from the action\'s `inputParameters` schema.',
-      });
+      }, { context, details, toolName: 'composio_search_tools' });
     },
   });
 
@@ -346,9 +364,9 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
     // GOOGLESHEETS_BATCH_GET autos through while GMAIL_SEND_EMAIL pauses
     // (or autos in YOLO).
     needsApproval: needsApprovalFromTaxonomy('composio_execute_tool'),
-    execute: async ({ tool_slug, arguments: args, connected_account_id }) => {
+    execute: async ({ tool_slug, arguments: args, connected_account_id }, context, details) => {
       const result = await executeComposioTool(tool_slug, parseArgumentsJson(args), connected_account_id ?? undefined);
-      return prettyJson(result);
+      return formatComposioToolOutput(result, { context, details, toolName: 'composio_execute_tool' });
     },
   });
 
