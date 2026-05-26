@@ -58,6 +58,19 @@ test('resolveSafeCliProbe never skips paths outside /usr/bin regardless of CLT s
   }
 });
 
+test('resolveSafeCliProbe skips wish even outside /usr/bin', () => {
+  for (const [command, p] of [
+    ['wish', '/opt/homebrew/bin/wish'],
+    ['wish8.6', '/usr/local/bin/wish8.6'],
+  ]) {
+    const result = resolveSafeCliProbe(command, p);
+    assert.equal(result.skipped, true, `${command} at ${p} should be skipped`);
+    if (result.skipped) {
+      assert.match(result.reason, /wish|GUI/i);
+    }
+  }
+});
+
 test('resolveSafeCliProbe skips known CLT stubs at /usr/bin', () => {
   // git is in the curated stub list. With or without CLT detection,
   // /usr/bin/git resolves to a backing path or returns {skipped: true}.
