@@ -499,6 +499,7 @@ export function renderConsoleHtml(token: string): string {
             <div class="wf-chat-head">
               <span class="wf-chat-title">ARCHITECT</span>
               <span class="wf-chat-meta" data-wf-chat-meta>idle</span>
+              <button type="button" class="wf-chat-collapse" data-wf-chat-toggle title="Collapse architect">⇥</button>
             </div>
             <div class="wf-chat-log" data-wf-chat-log>
               <div class="wf-chat-intro">
@@ -1272,10 +1273,18 @@ export function renderConsoleHtml(token: string): string {
             <span>Show advanced</span>
           </label>
         </div>
+        <div class="settings-tabs" data-settings-tabs>
+          <button type="button" class="settings-tab" data-settings-tab-target="profile">PROFILE</button>
+          <button type="button" class="settings-tab" data-settings-tab-target="runtime">RUNTIME</button>
+          <button type="button" class="settings-tab" data-settings-tab-target="autonomy">AUTONOMY</button>
+          <button type="button" class="settings-tab" data-settings-tab-target="memory">MEMORY</button>
+          <button type="button" class="settings-tab" data-settings-tab-target="credentials">CREDENTIALS</button>
+          <button type="button" class="settings-tab" data-settings-tab-target="diagnostics">DIAGNOSTICS</button>
+        </div>
         <div class="panel-body settings-layout">
 
-          <div class="settings-col">
-            <div class="settings-block">
+          <div class="settings-col" data-settings-col>
+            <div class="settings-block" data-settings-tab-panel="profile">
               <div class="settings-block-head">USER PROFILE</div>
               <form class="settings-form" data-settings-profile-form>
                 <div class="settings-field">
@@ -1340,12 +1349,12 @@ export function renderConsoleHtml(token: string): string {
               </form>
             </div>
 
-            <div class="settings-block">
+            <div class="settings-block" data-settings-tab-panel="runtime">
               <div class="settings-block-head">RUNTIME AUTH</div>
               <div class="settings-info" data-settings-auth>—</div>
             </div>
 
-            <div class="settings-block">
+            <div class="settings-block" data-settings-tab-panel="runtime">
               <div class="settings-block-head">MODEL PICKER</div>
               <form class="settings-form" data-settings-models-form>
                 <div class="settings-model-row">
@@ -1386,11 +1395,11 @@ export function renderConsoleHtml(token: string): string {
               <div class="settings-info" data-settings-models-status>—</div>
             </div>
 
-            <div class="settings-block">
+            <div class="settings-block" data-settings-tab-panel="runtime">
               <div class="settings-block-head">RUNTIME BUDGETS</div>
               <form class="settings-form" data-settings-runtime-form>
                 <div class="settings-field">
-                  <label>WORKFLOW MODE</label>
+                  <label>WORK MODE</label>
                   <select name="preset" data-runtime-field data-runtime-preset>
                     <option value="standard">standard — normal chat + tasks</option>
                     <option value="long">long workflow — higher budget + check-ins</option>
@@ -1399,27 +1408,27 @@ export function renderConsoleHtml(token: string): string {
                 </div>
                 <div class="settings-grid-2">
                   <div class="settings-field">
-                    <label>MAX SDK TURNS</label>
+                    <label>MODEL TURNS</label>
                     <input type="number" name="maxTurns" data-runtime-field min="1" max="2000" />
                   </div>
                   <div class="settings-field">
-                    <label>MAX CONVERSATION STEPS</label>
+                    <label>WORK STEPS</label>
                     <input type="number" name="maxConversationSteps" data-runtime-field min="1" max="1000000" />
                   </div>
                 </div>
                 <div class="settings-grid-2">
                   <div class="settings-field">
-                    <label>WALL-CLOCK MINUTES</label>
+                    <label>MAX WORK MINUTES</label>
                     <input type="number" name="maxConversationWallMinutes" data-runtime-field min="0" max="525600" />
                   </div>
                   <div class="settings-field">
-                    <label>TOOL CALLS PER TURN</label>
+                    <label>TOOL ACTIONS PER TURN</label>
                     <input type="number" name="toolCallsPerTurn" data-runtime-field min="1" max="256" />
                   </div>
                 </div>
                 <div class="settings-grid-2">
                   <div class="settings-field">
-                    <label>VISIBLE CHECK-IN MINUTES</label>
+                    <label>CHECK-IN EVERY</label>
                     <input type="number" name="checkInMinutes" data-runtime-field min="1" max="240" />
                   </div>
                   <div class="settings-field">
@@ -1440,8 +1449,8 @@ export function renderConsoleHtml(token: string): string {
             </div>
           </div>
 
-          <div class="settings-col">
-            <div class="settings-block" data-advanced-block hidden>
+          <div class="settings-col" data-settings-col>
+            <div class="settings-block" data-settings-tab-panel="autonomy" data-advanced-block hidden>
               <div class="settings-block-head">PROACTIVITY POLICY</div>
               <form class="settings-form" data-settings-policy-form>
                 <div class="settings-field">
@@ -1522,7 +1531,7 @@ export function renderConsoleHtml(token: string): string {
               </form>
             </div>
 
-            <div class="settings-block">
+            <div class="settings-block" data-settings-tab-panel="profile">
               <div class="settings-block-head">PERSONALITY · how Clementine talks to you</div>
               <div class="settings-info" style="line-height: 1.6;">
                 Personality + identity live as plain-text files Clementine reads on every turn — edits take effect on your next message, no restart.
@@ -1530,12 +1539,12 @@ export function renderConsoleHtml(token: string): string {
               </div>
             </div>
 
-            <div class="settings-block">
+            <div class="settings-block" data-settings-tab-panel="memory">
               <div class="settings-block-head">MEMORY INDEX</div>
               <div class="settings-info" data-settings-memory>—</div>
             </div>
 
-            <div class="settings-block">
+            <div class="settings-block" data-settings-tab-panel="autonomy">
               <div class="settings-block-head">
                 PROPOSED PLANS
                 <span class="creds-meta" data-plan-proposals-meta>—</span>
@@ -1548,7 +1557,7 @@ export function renderConsoleHtml(token: string): string {
               </div>
             </div>
 
-            <div class="settings-block">
+            <div class="settings-block" data-settings-tab-panel="autonomy">
               <div class="settings-block-head">
                 PROPOSED BY AGENT
                 <span class="creds-meta" data-proposals-meta>—</span>
@@ -1561,7 +1570,7 @@ export function renderConsoleHtml(token: string): string {
               </div>
             </div>
 
-            <div class="settings-block">
+            <div class="settings-block" data-settings-tab-panel="autonomy">
               <div class="settings-block-head">
                 PROACTIVE CHECK-INS
                 <span class="creds-meta" data-checkins-meta>—</span>
@@ -1578,7 +1587,7 @@ export function renderConsoleHtml(token: string): string {
               </div>
             </div>
 
-            <div class="settings-block">
+            <div class="settings-block" data-settings-tab-panel="credentials">
               <div class="settings-block-head">
                 CREDENTIAL VAULT
                 <span class="creds-meta" data-creds-meta>—</span>
@@ -1608,8 +1617,8 @@ export function renderConsoleHtml(token: string): string {
             health, and storage stats from /api/console/diagnostics.
             Pure read; no buttons that modify state.
           -->
-          <div class="settings-col" data-diagnostics-wrap>
-            <div class="settings-block">
+          <div class="settings-col" data-settings-col data-diagnostics-wrap>
+            <div class="settings-block" data-settings-tab-panel="diagnostics">
               <label class="settings-toggle">
                 <input type="checkbox" data-diagnostics-toggle />
                 <span>Show diagnostics</span>
@@ -1619,7 +1628,7 @@ export function renderConsoleHtml(token: string): string {
                 Useful for diagnosing why a particular session was fast or slow without grepping logs.
               </p>
             </div>
-            <div class="settings-block" data-diagnostics-panel hidden>
+            <div class="settings-block" data-settings-tab-panel="diagnostics" data-diagnostics-panel hidden>
               <div class="settings-block-head">
                 DIAGNOSTICS
                 <button type="button" class="settings-btn-mini" data-diagnostics-refresh title="Refresh">↻</button>
@@ -4783,6 +4792,9 @@ body {
   height: 100%;
   overflow: hidden;
 }
+.wf-layout.architect-collapsed {
+  grid-template-columns: 200px minmax(0, 1fr) 44px;
+}
 .wf-list-pane,
 .wf-editor,
 .wf-chat-pane {
@@ -4798,6 +4810,7 @@ body {
   background: var(--bg-1);
   border-bottom: 1px solid var(--line);
   display: flex;
+  gap: 8px;
   justify-content: space-between;
   align-items: center;
   font-size: 10px;
@@ -4806,6 +4819,36 @@ body {
 }
 .wf-chat-title { color: var(--fg); }
 .wf-chat-meta { color: var(--accent); font-size: 10px; }
+.wf-chat-collapse {
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--fg-3);
+  font: inherit;
+  font-size: 10px;
+  line-height: 1;
+  padding: 3px 6px;
+  cursor: pointer;
+}
+.wf-chat-collapse:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.wf-layout.architect-collapsed .wf-chat-pane {
+  min-width: 0;
+}
+.wf-layout.architect-collapsed .wf-chat-head {
+  height: 100%;
+  padding: 8px 0;
+  justify-content: flex-start;
+  flex-direction: column;
+}
+.wf-layout.architect-collapsed .wf-chat-title,
+.wf-layout.architect-collapsed .wf-chat-meta,
+.wf-layout.architect-collapsed .wf-chat-log,
+.wf-layout.architect-collapsed .wf-chat-chips,
+.wf-layout.architect-collapsed .wf-chat-form {
+  display: none;
+}
 .wf-new-btn {
   display: inline-block;
   background: transparent;
@@ -5200,6 +5243,78 @@ body {
 .wf-add-input:hover { color: var(--accent); border-color: var(--accent); }
 
 /* Recent runs in the editor */
+.wf-run-strip {
+  border: 1px solid var(--line);
+  background: var(--bg-1);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  padding: 9px 11px;
+}
+.wf-run-strip-main {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.wf-run-strip-main strong {
+  color: var(--fg);
+  font-size: 12px;
+  font-weight: 600;
+}
+.wf-run-strip-main span {
+  color: var(--fg-3);
+  font-size: 10.5px;
+}
+.wf-run-strip-meta {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  flex-wrap: wrap;
+  color: var(--fg-3);
+  font-size: 10px;
+}
+.wf-run-strip-status {
+  font-size: 9px !important;
+  letter-spacing: 0.16em;
+  padding: 2px 6px;
+  border: 1px solid var(--line);
+  color: var(--fg-3) !important;
+}
+.wf-run-strip-status.status-queued,
+.wf-run-strip-status.status-running {
+  color: var(--accent-3) !important;
+  border-color: var(--accent-3);
+}
+.wf-run-strip-status.status-completed,
+.wf-run-strip-status.status-success {
+  color: var(--accent-2) !important;
+  border-color: var(--accent-2);
+}
+.wf-run-strip-status.status-error,
+.wf-run-strip-status.status-failed {
+  color: var(--accent-fail) !important;
+  border-color: var(--accent-fail);
+}
+.wf-run-strip .wf-run-action,
+.wf-run-runtime-jump {
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  padding: 3px 7px;
+  cursor: pointer;
+}
+.wf-run-strip .wf-run-action:hover,
+.wf-run-runtime-jump:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
 .wf-runs { display: flex; flex-direction: column; gap: 6px; }
 .wf-runs-head {
   font-size: 10px;
@@ -7472,22 +7587,82 @@ body {
 }
 
 /* ── Settings panel ──────────────────────────────────────────── */
+.settings-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-0);
+}
+.settings-tab {
+  border: 1px solid var(--line);
+  background: var(--bg-1);
+  color: var(--fg-3);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  padding: 6px 10px;
+  cursor: pointer;
+}
+.settings-tab:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.settings-tab.active {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, var(--bg-1));
+}
 .settings-layout {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(3, minmax(260px, 1fr));
   gap: 14px;
   height: 100%;
-  overflow: hidden;
+  overflow-y: auto;
+  align-items: start;
+  padding: 14px;
 }
 .settings-col {
   display: flex;
   flex-direction: column;
   gap: 14px;
-  overflow-y: auto;
+  overflow: visible;
+}
+.settings-col[hidden],
+.settings-block[hidden],
+.settings-block[data-tab-hidden="true"] {
+  display: none !important;
 }
 .settings-block {
   border: 1px solid var(--line);
   background: var(--bg-2);
+}
+@media (max-width: 1260px) {
+  .settings-layout { grid-template-columns: repeat(2, minmax(260px, 1fr)); }
+}
+@media (max-width: 840px) {
+  .settings-layout { grid-template-columns: 1fr; }
+  .wf-layout,
+  .wf-layout.architect-collapsed {
+    grid-template-columns: 1fr;
+    overflow-y: auto;
+  }
+  .wf-layout.architect-collapsed .wf-chat-pane,
+  .wf-layout.architect-collapsed .wf-chat-head {
+    height: auto;
+  }
+  .wf-layout.architect-collapsed .wf-chat-log,
+  .wf-layout.architect-collapsed .wf-chat-chips,
+  .wf-layout.architect-collapsed .wf-chat-form {
+    display: none;
+  }
+  .wf-run-strip {
+    grid-template-columns: 1fr;
+  }
+  .wf-run-strip-meta {
+    justify-content: flex-start;
+  }
 }
 /* Diagnostics panel — additive only; renders read-only data from
    /api/console/diagnostics. Same look as other settings blocks. */
@@ -10137,6 +10312,14 @@ const CONSOLE_JS = `
     event.preventDefault();
     const panel = jump.getAttribute('data-tools-jump');
     switchPanel(panel);
+    const settingsTab = jump.getAttribute('data-settings-tab-open');
+    if (panel === 'settings' && settingsTab) {
+      setTimeout(() => {
+        if (typeof window.__clementineSetSettingsTab === 'function') {
+          window.__clementineSetSettingsTab(settingsTab);
+        }
+      }, 0);
+    }
     // Drill-link: if the clicked NEEDS-YOU item carries a specific
     // session/run id, load that exact item in the destination panel's
     // inspector after the panel renders. setTimeout lets the panel
@@ -11732,6 +11915,7 @@ const CONSOLE_JS = `
   // ─── Workflow Studio ──────────────────────────────────────────
 
   const wf = {
+    layout:    document.querySelector('.wf-layout'),
     list:      document.querySelector('[data-wf-list]'),
     editor:    document.querySelector('[data-wf-editor]'),
     newBtn:    document.querySelector('[data-wf-new]'),
@@ -11740,6 +11924,7 @@ const CONSOLE_JS = `
     chatInput: document.querySelector('[data-wf-chat-input]'),
     chatSend:  document.querySelector('[data-wf-chat-send]'),
     chatMeta:  document.querySelector('[data-wf-chat-meta]'),
+    chatToggle: document.querySelector('[data-wf-chat-toggle]'),
   };
 
   /** Local draft state — what the editor shows; not yet saved unless
@@ -11853,6 +12038,7 @@ const CONSOLE_JS = `
   }
 
   async function bootWorkflowsPanel() {
+    setupWorkflowArchitectToggle();
     // Document-level delegation is intentional: the single-file HTML is
     // heavily re-rendered, and these controls are identified by explicit
     // data-wf-* attributes.
@@ -11913,6 +12099,26 @@ const CONSOLE_JS = `
       console.error('cron list refresh failed:', err);
     });
     subscribeWorkflowChanges();
+  }
+
+  function setupWorkflowArchitectToggle() {
+    if (!wf.layout || !wf.chatToggle) return;
+    const STORAGE_KEY = 'clementine.workflow.architectCollapsed';
+    const apply = (collapsed) => {
+      wf.layout.classList.toggle('architect-collapsed', !!collapsed);
+      wf.chatToggle.textContent = collapsed ? '⇤' : '⇥';
+      wf.chatToggle.title = collapsed ? 'Expand architect' : 'Collapse architect';
+    };
+    let collapsed = false;
+    try { collapsed = localStorage.getItem(STORAGE_KEY) === '1'; } catch (_) { /* private mode */ }
+    apply(collapsed);
+    wf.chatToggle.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const next = !wf.layout.classList.contains('architect-collapsed');
+      try { localStorage.setItem(STORAGE_KEY, next ? '1' : '0'); } catch (_) { /* private mode */ }
+      apply(next);
+    });
   }
 
   /**
@@ -12165,7 +12371,7 @@ const CONSOLE_JS = `
       }
       wf.list.innerHTML = items.map((w) => {
         const cls = (wfSelectedName === w.name) ? 'wf selected' : 'wf';
-        const enabledPill = w.enabled ? '<span class="pill on">● APPROVED</span>' : '<span class="pill off">○ DISABLED</span>';
+        const enabledPill = w.enabled ? '<span class="pill on">● ENABLED</span>' : '<span class="pill off">○ DISABLED</span>';
         // v0.5.11 UX: humanize cron expressions for the workflow list.
         // The raw cron (e.g. 0 8,13 * * 1-5) stays in the title tooltip
         // so power-users can read it without clicking. Non-power users
@@ -12314,6 +12520,7 @@ const CONSOLE_JS = `
       wfIsNew ? '' : '  </div>',
       '</div>',
     ].join('');
+    const runSummary = wfIsNew ? '' : renderWorkflowRunSummary([]);
 
     const body = [
       '<div class="wf-edit-body">',
@@ -12360,10 +12567,106 @@ const CONSOLE_JS = `
       '</div>',
     ].join('');
 
-    wf.editor.innerHTML = head + controls + body;
+    wf.editor.innerHTML = head + controls + runSummary + body;
     bindEditorEvents();
     bindSchedulePicker(wf.editor);
     refreshWorkflowRuns();
+  }
+
+  function workflowRunInputsLabel(run) {
+    return run && run.inputs && Object.keys(run.inputs).length > 0
+      ? Object.entries(run.inputs).map(([k, v]) => k + '=' + String(v).slice(0, 30)).join(' · ')
+      : '';
+  }
+
+  function workflowRunTimeLabel(run) {
+    const created = (run && run.createdAt) || '';
+    const day = created.slice(0, 10);
+    const when = created.slice(11, 19);
+    return (day || when) ? (day + ' ' + when).trim() : 'not started yet';
+  }
+
+  function renderWorkflowRunSummary(runs, errorMessage) {
+    if (errorMessage) {
+      return [
+        '<div class="wf-run-strip" data-wf-run-summary>',
+        '  <div class="wf-run-strip-main">',
+        '    <span class="wf-run-strip-status status-error">ERROR</span>',
+        '    <strong>Run history unavailable</strong>',
+        '    <span>' + escMem(errorMessage) + '</span>',
+        '  </div>',
+        '  <div class="wf-run-strip-meta">',
+        '    <button type="button" class="wf-run-runtime-jump" data-tools-jump="settings" data-settings-tab-open="runtime">RUNTIME SETTINGS</button>',
+        '  </div>',
+        '</div>',
+      ].join('');
+    }
+    const latest = Array.isArray(runs) && runs.length > 0 ? runs[0] : null;
+    if (!latest) {
+      return [
+        '<div class="wf-run-strip" data-wf-run-summary>',
+        '  <div class="wf-run-strip-main">',
+        '    <span class="wf-run-strip-status">READY</span>',
+        '    <strong>No runs yet</strong>',
+        '    <span>Dry-run first, then run when the steps look right.</span>',
+        '  </div>',
+        '  <div class="wf-run-strip-meta">',
+        '    <span>uses global runtime budget</span>',
+        '    <button type="button" class="wf-run-runtime-jump" data-tools-jump="settings" data-settings-tab-open="runtime">RUNTIME SETTINGS</button>',
+        '  </div>',
+        '</div>',
+      ].join('');
+    }
+    const status = (latest.status || 'unknown').toString();
+    const canCancel = status === 'queued' || status === 'running';
+    const inputs = workflowRunInputsLabel(latest);
+    return [
+      '<div class="wf-run-strip" data-wf-run-summary>',
+      '  <div class="wf-run-strip-main">',
+      '    <span class="wf-run-strip-status status-' + escMem(status) + '">' + escMem(status.toUpperCase()) + '</span>',
+      '    <strong>Latest run</strong>',
+      '    <span>' + escMem(workflowRunTimeLabel(latest)) + '</span>',
+      inputs ? '    <span>' + escMem(inputs) + '</span>' : '',
+      '  </div>',
+      '  <div class="wf-run-strip-meta">',
+      '    <span>' + escMem(latest.id || '') + '</span>',
+      '    <button type="button" class="wf-run-runtime-jump" data-tools-jump="settings" data-settings-tab-open="runtime">RUNTIME SETTINGS</button>',
+      canCancel ? '    <button type="button" class="wf-run-action" data-wf-run-cancel="' + escMem(latest.id) + '">CANCEL</button>' : '',
+      '  </div>',
+      '</div>',
+    ].join('');
+  }
+
+  function bindWorkflowRunCancelButtons(root) {
+    Array.from((root || document).querySelectorAll('[data-wf-run-cancel]')).forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        if (!wfSelectedName) return;
+        const runId = btn.getAttribute('data-wf-run-cancel');
+        if (!runId) return;
+        btn.disabled = true;
+        const original = btn.textContent;
+        btn.textContent = 'CANCELLING';
+        try {
+          const endpoint = '/api/console/workflows/' + encodeURIComponent(wfSelectedName)
+            + '/runs/' + encodeURIComponent(runId) + '/cancel';
+          const r = await fetch(withToken(endpoint), {
+            method: 'POST',
+            headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+            body: JSON.stringify({ reason: 'Cancelled from Workflow Studio.' }),
+          });
+          if (!r.ok) {
+            const j = await r.json().catch(() => ({}));
+            throw new Error(j.error || ('HTTP ' + r.status));
+          }
+          await refreshWorkflowRuns();
+          await refreshHomeCommandCenter();
+        } catch (err) {
+          btn.disabled = false;
+          btn.textContent = original || 'CANCEL';
+          alert('Could not cancel run: ' + ((err && err.message) || err));
+        }
+      });
+    });
   }
 
   const SCHED_DAY_LABELS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
@@ -13119,6 +13422,7 @@ const CONSOLE_JS = `
   /** Recent runs for the currently-selected workflow. */
   async function refreshWorkflowRuns() {
     const slot = document.querySelector('[data-wf-runs]');
+    const summarySlot = document.querySelector('[data-wf-run-summary]');
     if (!slot || !wfSelectedName || wfIsNew) {
       if (slot) slot.innerHTML = '';
       return;
@@ -13126,8 +13430,10 @@ const CONSOLE_JS = `
     try {
       const data = await fetchJSON('/api/console/workflows/' + encodeURIComponent(wfSelectedName) + '/runs?limit=5');
       const runs = data.runs || [];
+      if (summarySlot) summarySlot.outerHTML = renderWorkflowRunSummary(runs);
       if (runs.length === 0) {
         slot.innerHTML = '<div class="wf-runs-empty">— no runs yet. Click RUN ▶ to kick one off. —</div>';
+        bindWorkflowRunCancelButtons(wf.editor);
         return;
       }
       slot.innerHTML = [
@@ -13135,17 +13441,13 @@ const CONSOLE_JS = `
         '<ol class="wf-runs-list">',
            runs.map((r) => {
              const status = (r.status || 'unknown').toString();
-             const when = (r.createdAt || '').slice(11, 19);
-             const day = (r.createdAt || '').slice(0, 10);
              const canCancel = status === 'queued' || status === 'running';
-             const inputs = r.inputs && Object.keys(r.inputs).length > 0
-               ? Object.entries(r.inputs).map(([k, v]) => k + '=' + String(v).slice(0, 30)).join(' · ')
-               : '';
+             const inputs = workflowRunInputsLabel(r);
              return [
                '<li class="wf-run">',
                '  <span class="wf-run-status status-' + escMem(status) + '">' + escMem(status.toUpperCase()) + '</span>',
                '  <span class="wf-run-id">' + escMem(r.id) + '</span>',
-               '  <span class="wf-run-time">' + escMem(day + ' ' + when) + '</span>',
+               '  <span class="wf-run-time">' + escMem(workflowRunTimeLabel(r)) + '</span>',
                inputs ? '  <span class="wf-run-inputs">' + escMem(inputs) + '</span>' : '',
                canCancel ? '  <button type="button" class="wf-run-action" data-wf-run-cancel="' + escMem(r.id) + '">CANCEL</button>' : '',
                '</li>',
@@ -13153,36 +13455,9 @@ const CONSOLE_JS = `
            }).join(''),
         '</ol>',
       ].join('');
-      Array.from(slot.querySelectorAll('[data-wf-run-cancel]')).forEach((btn) => {
-        btn.addEventListener('click', async () => {
-          if (!wfSelectedName) return;
-          const runId = btn.getAttribute('data-wf-run-cancel');
-          if (!runId) return;
-          btn.disabled = true;
-          const original = btn.textContent;
-          btn.textContent = 'CANCELLING';
-          try {
-            const endpoint = '/api/console/workflows/' + encodeURIComponent(wfSelectedName)
-              + '/runs/' + encodeURIComponent(runId) + '/cancel';
-            const r = await fetch(withToken(endpoint), {
-              method: 'POST',
-              headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
-              body: JSON.stringify({ reason: 'Cancelled from Workflow Studio.' }),
-            });
-            if (!r.ok) {
-              const j = await r.json().catch(() => ({}));
-              throw new Error(j.error || ('HTTP ' + r.status));
-            }
-            await refreshWorkflowRuns();
-            await refreshHomeCommandCenter();
-          } catch (err) {
-            btn.disabled = false;
-            btn.textContent = original || 'CANCEL';
-            alert('Could not cancel run: ' + ((err && err.message) || err));
-          }
-        });
-      });
+      bindWorkflowRunCancelButtons(wf.editor);
     } catch (err) {
+      if (summarySlot) summarySlot.outerHTML = renderWorkflowRunSummary([], err.message || String(err));
       slot.innerHTML = '<div class="wf-runs-empty">runs unavailable: ' + escMem(err.message || err) + '</div>';
     }
   }
@@ -14485,6 +14760,9 @@ const CONSOLE_JS = `
         if (visible) el.removeAttribute('hidden');
         else el.setAttribute('hidden', '');
       });
+      if (typeof window.__clementineRefreshSettingsTabColumns === 'function') {
+        window.__clementineRefreshSettingsTabColumns();
+      }
     };
     toggle.checked = showAdvanced;
     apply(showAdvanced);
@@ -14493,6 +14771,44 @@ const CONSOLE_JS = `
       try { localStorage.setItem(STORAGE_KEY, next ? '1' : '0'); } catch (_) { /* private mode */ }
       apply(next);
     });
+  })();
+
+  (function setupSettingsTabs() {
+    const buttons = Array.from(document.querySelectorAll('[data-settings-tab-target]'));
+    const blocks = Array.from(document.querySelectorAll('[data-settings-tab-panel]'));
+    const columns = Array.from(document.querySelectorAll('[data-settings-col]'));
+    if (buttons.length === 0 || blocks.length === 0) return;
+    const STORAGE_KEY = 'clementine.settings.activeTab';
+    const refreshColumns = () => {
+      columns.forEach((col) => {
+        const visible = Array.from(col.querySelectorAll('[data-settings-tab-panel]')).some((block) => (
+          block.getAttribute('data-tab-hidden') !== 'true' && !block.hasAttribute('hidden')
+        ));
+        if (visible) col.removeAttribute('hidden');
+        else col.setAttribute('hidden', '');
+      });
+    };
+    const apply = (tab) => {
+      const valid = buttons.some((button) => button.getAttribute('data-settings-tab-target') === tab);
+      const next = valid ? tab : 'profile';
+      buttons.forEach((button) => {
+        button.classList.toggle('active', button.getAttribute('data-settings-tab-target') === next);
+      });
+      blocks.forEach((block) => {
+        if (block.getAttribute('data-settings-tab-panel') === next) block.removeAttribute('data-tab-hidden');
+        else block.setAttribute('data-tab-hidden', 'true');
+      });
+      try { localStorage.setItem(STORAGE_KEY, next); } catch (_) { /* private mode */ }
+      refreshColumns();
+    };
+    window.__clementineRefreshSettingsTabColumns = refreshColumns;
+    window.__clementineSetSettingsTab = apply;
+    buttons.forEach((button) => {
+      button.addEventListener('click', () => apply(button.getAttribute('data-settings-tab-target') || 'profile'));
+    });
+    let initial = 'profile';
+    try { initial = localStorage.getItem(STORAGE_KEY) || initial; } catch (_) { /* private mode */ }
+    apply(initial);
   })();
 
   function setFormValue(form, name, value) {
