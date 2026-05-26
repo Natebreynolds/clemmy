@@ -37,6 +37,7 @@ import { actionBus } from '../action-bus.js';
 import { BoundaryError } from '../boundary-error.js';
 import { getRuntimeEnv } from '../../config.js';
 import { captureInteractionSignals } from '../../memory/auto-capture.js';
+import { maybeAutoFocusSession } from './auto-focus.js';
 
 /**
  * Wrap appendEvent so a transient SQLite write failure (lock, disk
@@ -56,6 +57,15 @@ function safeAppend(input: AppendEventInput): void {
       turn: input.turn,
       err: err instanceof Error ? err.message : String(err),
     });
+  }
+}
+
+function safeMaybeAutoFocus(sessionId: string, summaryHint?: unknown): void {
+  try {
+    maybeAutoFocusSession({ sessionId, summaryHint });
+  } catch (err) {
+    // Focus is a context aid, not a reason to fail the user's turn.
+    console.warn('[harness] auto-focus failed', err instanceof Error ? err.message : err);
   }
 }
 
@@ -1583,6 +1593,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
         toolCalls: toolCounter.currentCount,
       },
     });
+    safeMaybeAutoFocus(options.sessionId, outcome.finalOutput);
     // Chat sessions stay 'active' between turns (inherently multi-turn).
     // Workflow / execution / agent sessions normally flip to 'completed'
     // here BUT not if approvals are still pending — `markStatus('completed')`
@@ -1923,6 +1934,7 @@ export async function resumePendingApproval(
         toolCalls: toolCounter.currentCount,
       },
     });
+    safeMaybeAutoFocus(options.sessionId, outcome.finalOutput);
     // Chat sessions stay 'active' between turns (inherently multi-turn).
     // Workflow / execution / agent sessions normally flip to 'completed'
     // here BUT not if approvals are still pending — `markStatus('completed')`

@@ -90,6 +90,7 @@ FILES=(
   "runtime/codex-native-runtime.js"
   "assistant/core.js"
   # v0.5.22 — tighter compaction + tool-output truncation
+  "runtime/harness/auto-focus.js"
   "runtime/harness/compaction.js"
   "runtime/harness/tool-output-context.js"
   "runtime/harness/tool-output-format.js"
