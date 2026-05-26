@@ -38,6 +38,8 @@ import { BoundaryError } from '../boundary-error.js';
 import { getRuntimeEnv } from '../../config.js';
 import { captureInteractionSignals } from '../../memory/auto-capture.js';
 import { maybeAutoFocusSession } from './auto-focus.js';
+import { getPlanScope, openPlanScope } from '../../agents/plan-scope.js';
+import { classifyTool } from '../../agents/tool-taxonomy.js';
 
 /**
  * Wrap appendEvent so a transient SQLite write failure (lock, disk
@@ -222,6 +224,102 @@ function registerAndEmitApprovals(
   return approvalIds;
 }
 
+function extractComposioSlugFromApprovalArgs(args: Record<string, unknown> | null | undefined): string | null {
+  if (!args || typeof args !== 'object') return null;
+  const slug = args.tool_slug ?? args.toolSlug;
+  return typeof slug === 'string' && slug.length > 0 ? slug : null;
+}
+
+function collectBatchScopeCandidate(row: approvalRegistry.PendingApprovalRow): {
+  key: string;
+  allowedTool: string;
+  allowedComposioSlug?: string;
+  label: string;
+} | null {
+  if (!row.tool) return null;
+  const kind = classifyTool(row.tool, { args: row.args ?? undefined });
+  if (kind !== 'send') return null;
+
+  if (row.tool === 'composio_execute_tool') {
+    const slug = extractComposioSlugFromApprovalArgs(row.args);
+    if (!slug) return null;
+    return {
+      key: `composio:${slug}`,
+      allowedTool: 'composio_execute_tool',
+      allowedComposioSlug: slug,
+      label: slug,
+    };
+  }
+
+  return {
+    key: `tool:${row.tool}`,
+    allowedTool: row.tool,
+    label: row.tool,
+  };
+}
+
+function openScopedApprovalForApprovedBatch(
+  rows: approvalRegistry.PendingApprovalRow[],
+  decision: 'approve' | 'reject' | 'approve_with_edits',
+): void {
+  if (decision !== 'approve' || rows.length < 2) return;
+
+  const counts = new Map<string, {
+    count: number;
+    allowedTool: string;
+    allowedComposioSlug?: string;
+    label: string;
+  }>();
+  const sessionId = rows[0]?.sessionId;
+  if (!sessionId) return;
+
+  for (const row of rows) {
+    if (row.sessionId !== sessionId) continue;
+    const candidate = collectBatchScopeCandidate(row);
+    if (!candidate) continue;
+    const existing = counts.get(candidate.key);
+    counts.set(candidate.key, {
+      count: (existing?.count ?? 0) + 1,
+      allowedTool: candidate.allowedTool,
+      allowedComposioSlug: candidate.allowedComposioSlug,
+      label: candidate.label,
+    });
+  }
+
+  const eligible = [...counts.values()].filter((candidate) => candidate.count >= 2);
+  if (eligible.length === 0) return;
+
+  const currentScope = getPlanScope(sessionId);
+  const allowedTools = new Set(currentScope && !currentScope.closedAt ? currentScope.allowedTools : []);
+  const allowedComposioSlugs = new Set(
+    currentScope && !currentScope.closedAt ? currentScope.allowedComposioSlugs ?? [] : [],
+  );
+  const labels: string[] = [];
+  for (const candidate of eligible) {
+    allowedTools.add(candidate.allowedTool);
+    if (candidate.allowedComposioSlug) allowedComposioSlugs.add(candidate.allowedComposioSlug);
+    labels.push(candidate.label);
+  }
+
+  try {
+    openPlanScope({
+      sessionId,
+      planProposalId: `tool_batch_approval:${Date.now()}`,
+      approvedPlanObjective: `Approved batch of external mutations: ${labels.join(', ')}`,
+      allowedTools: [...allowedTools],
+      allowedComposioSlugs: allowedComposioSlugs.size > 0 ? [...allowedComposioSlugs] : undefined,
+      ttlMs: 60 * 60 * 1000,
+    });
+  } catch (err) {
+    console.error('[harness] failed to open scoped approval for approved batch', {
+      sessionId,
+      allowedTools: [...allowedTools],
+      allowedComposioSlugs: [...allowedComposioSlugs],
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
 function resolveSnapshotApprovalsForResume(
   rows: approvalRegistry.PendingApprovalRow[],
   decision: 'approve' | 'reject' | 'approve_with_edits',
@@ -240,6 +338,7 @@ function resolveSnapshotApprovalsForResume(
       });
     }
   }
+  openScopedApprovalForApprovedBatch(rows, decision);
 }
 
 /**

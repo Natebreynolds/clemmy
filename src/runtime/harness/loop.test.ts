@@ -50,6 +50,7 @@ type RunRunnerFn = import('./loop.js').RunRunnerFn;
 const { ToolCallsLimitExceeded } = await import('./brackets.js');
 const { listEvents: listEventsForConv } = await import('./eventlog.js');
 const approvalRegistry = await import('./approval-registry.js');
+const { getPlanScope, isAutoApprovedByScope } = await import('../../agents/plan-scope.js');
 
 test.after(() => {
   try {
@@ -73,22 +74,29 @@ function makeAgentStub(): import('@openai/agents').Agent<any, any> {
 }
 
 function makeApprovalRunState(agent: import('@openai/agents').Agent<any, any>, toolName: string): string {
+  return makeApprovalRunStateWithInterruptions(agent, [
+    { toolName, argumentsJson: '{}', callId: `${toolName}_call` },
+  ]);
+}
+
+function makeApprovalRunStateWithInterruptions(
+  agent: import('@openai/agents').Agent<any, any>,
+  interruptions: Array<{ toolName: string; argumentsJson?: string; callId?: string }>,
+): string {
   const state = new RunState(new RunContext({}), 'approve this', agent, null);
   const json = state.toJSON() as Record<string, unknown>;
   json.currentStep = {
     type: 'next_step_interruption',
     data: {
-      interruptions: [
-        {
-          rawItem: {
-            type: 'function_call',
-            name: toolName,
-            callId: `${toolName}_call`,
-            arguments: '{}',
-          },
-          toolName,
+      interruptions: interruptions.map((interruption, index) => ({
+        rawItem: {
+          type: 'function_call',
+          name: interruption.toolName,
+          callId: interruption.callId ?? `${interruption.toolName}_call_${index}`,
+          arguments: interruption.argumentsJson ?? '{}',
         },
-      ],
+        toolName: interruption.toolName,
+      })),
     },
   };
   return JSON.stringify(json);
@@ -513,6 +521,160 @@ test('resume resolves the approval rows present before the resumed run requests 
     'approval_resolved',
     'approval_requested',
   ]);
+});
+
+test('resume opens a slug-scoped plan scope after approving a Composio external mutation batch', async () => {
+  resetEventLog();
+  const agent = new Agent({ name: 'ResumeBatchApprovalTest', instructions: 'test' });
+  const sess = HarnessSession.create({ kind: 'chat', title: 'resume-batch-approval' });
+  const draftArgs = [
+    { tool_slug: 'SALESFORCE_CREATE_TASK', arguments: JSON.stringify({ account_id: 'a', subject: 'A' }) },
+    { tool_slug: 'SALESFORCE_CREATE_TASK', arguments: JSON.stringify({ account_id: 'b', subject: 'B' }) },
+  ];
+  sess.saveInterruptState(makeApprovalRunStateWithInterruptions(agent, draftArgs.map((args, index) => ({
+    toolName: 'composio_execute_tool',
+    callId: `draft_call_${index}`,
+    argumentsJson: JSON.stringify(args),
+  }))));
+  for (const [index, args] of draftArgs.entries()) {
+    approvalRegistry.register({
+      sessionId: sess.id,
+      subject: `Create Outlook draft ${index + 1}`,
+      tool: 'composio_execute_tool',
+      args,
+    });
+  }
+
+  const runRunner: RunRunnerFn = async () => ({
+    history: [],
+    lastResponseId: undefined,
+    finalOutput: { ok: true },
+  });
+
+  const result = await resumePendingApproval({
+    agent,
+    sessionId: sess.id,
+    decision: 'approve',
+    resolver: 'unit-test',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(result.status, 'completed');
+  const scope = getPlanScope(sess.id);
+  assert.deepEqual(scope?.allowedTools, ['composio_execute_tool']);
+  assert.deepEqual(scope?.allowedComposioSlugs, ['SALESFORCE_CREATE_TASK']);
+  assert.equal(
+    isAutoApprovedByScope(sess.id, 'composio_execute_tool', { tool_slug: 'SALESFORCE_CREATE_TASK' }),
+    true,
+  );
+  assert.equal(
+    isAutoApprovedByScope(sess.id, 'composio_execute_tool', { tool_slug: 'OUTLOOK_SEND_EMAIL' }),
+    false,
+  );
+});
+
+test('resume opens an exact-tool scope after approving a direct external mutation batch', async () => {
+  resetEventLog();
+  const agent = new Agent({ name: 'ResumeDirectExternalBatchTest', instructions: 'test' });
+  const sess = HarnessSession.create({ kind: 'chat', title: 'resume-direct-external-batch' });
+  const toolName = 'slack_post_message';
+  sess.saveInterruptState(makeApprovalRunStateWithInterruptions(agent, [
+    { toolName, callId: 'slack_call_1', argumentsJson: JSON.stringify({ channel: 'sales', text: 'A' }) },
+    { toolName, callId: 'slack_call_2', argumentsJson: JSON.stringify({ channel: 'sales', text: 'B' }) },
+  ]));
+  for (let index = 0; index < 2; index++) {
+    approvalRegistry.register({
+      sessionId: sess.id,
+      subject: `Post Slack message ${index + 1}`,
+      tool: toolName,
+      args: { channel: 'sales', text: String(index) },
+    });
+  }
+
+  const runRunner: RunRunnerFn = async () => ({
+    history: [],
+    lastResponseId: undefined,
+    finalOutput: { ok: true },
+  });
+
+  const result = await resumePendingApproval({
+    agent,
+    sessionId: sess.id,
+    decision: 'approve',
+    resolver: 'unit-test',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(result.status, 'completed');
+  const scope = getPlanScope(sess.id);
+  assert.deepEqual(scope?.allowedTools, [toolName]);
+  assert.equal(isAutoApprovedByScope(sess.id, toolName, { channel: 'sales', text: 'C' }), true);
+  assert.equal(isAutoApprovedByScope(sess.id, 'run_shell_command', { command: 'echo nope' }), false);
+});
+
+test('resume does not open a scoped plan scope for non-external or single-call approvals', async () => {
+  resetEventLog();
+  const agent = new Agent({ name: 'ResumeSingleApprovalTest', instructions: 'test' });
+  const sess = HarnessSession.create({ kind: 'chat', title: 'resume-single-approval' });
+  const args = { tool_slug: 'OUTLOOK_CREATE_DRAFT', arguments: JSON.stringify({ to: 'a@example.com', subject: 'A' }) };
+  sess.saveInterruptState(makeApprovalRunStateWithInterruptions(agent, [{
+    toolName: 'composio_execute_tool',
+    callId: 'draft_call_1',
+    argumentsJson: JSON.stringify(args),
+  }]));
+  approvalRegistry.register({
+    sessionId: sess.id,
+    subject: 'Create one Outlook draft',
+    tool: 'composio_execute_tool',
+    args,
+  });
+
+  const runRunner: RunRunnerFn = async () => ({
+    history: [],
+    lastResponseId: undefined,
+    finalOutput: { ok: true },
+  });
+
+  const result = await resumePendingApproval({
+    agent,
+    sessionId: sess.id,
+    decision: 'approve',
+    resolver: 'unit-test',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(result.status, 'completed');
+  assert.equal(getPlanScope(sess.id), null);
+
+  resetEventLog();
+  const shellSess = HarnessSession.create({ kind: 'chat', title: 'resume-shell-batch' });
+  shellSess.saveInterruptState(makeApprovalRunStateWithInterruptions(agent, [
+    { toolName: 'run_shell_command', callId: 'shell_call_1', argumentsJson: JSON.stringify({ command: 'touch a' }) },
+    { toolName: 'run_shell_command', callId: 'shell_call_2', argumentsJson: JSON.stringify({ command: 'touch b' }) },
+  ]));
+  for (let index = 0; index < 2; index++) {
+    approvalRegistry.register({
+      sessionId: shellSess.id,
+      subject: `Run shell command ${index + 1}`,
+      tool: 'run_shell_command',
+      args: { command: `touch ${index}` },
+    });
+  }
+
+  const shellResult = await resumePendingApproval({
+    agent,
+    sessionId: shellSess.id,
+    decision: 'approve',
+    resolver: 'unit-test',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(shellResult.status, 'completed');
+  assert.equal(getPlanScope(shellSess.id), null);
 });
 
 test('interruption with no rich args falls back to the tool name as subject', async () => {
