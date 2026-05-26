@@ -56,6 +56,12 @@ export interface PlanScope {
   approvedPlanObjective: string;
   /** Tool names that the plan-approval covers. `*` means all non-admin/non-destructive tools. */
   allowedTools: string[];
+  /**
+   * Optional argument-level narrowing for the generic Composio broker.
+   * When present, `composio_execute_tool` is covered only for these
+   * exact Composio slugs.
+   */
+  allowedComposioSlugs?: string[];
   openedAt: string;
   expiresAt: string;
   /** Audit trail of auto-approved calls inside this scope. */
@@ -99,6 +105,7 @@ export interface OpenPlanScopeInput {
   approvedPlanObjective: string;
   ttlMs?: number;
   allowedTools?: string[];
+  allowedComposioSlugs?: string[];
 }
 
 export const DEFAULT_SCOPE_ALLOWED_TOOLS = ['run_shell_command', 'write_file'];
@@ -112,6 +119,9 @@ export function openPlanScope(input: OpenPlanScopeInput): PlanScope {
     planProposalId: input.planProposalId,
     approvedPlanObjective: input.approvedPlanObjective,
     allowedTools: input.allowedTools && input.allowedTools.length > 0 ? input.allowedTools : DEFAULT_SCOPE_ALLOWED_TOOLS,
+    allowedComposioSlugs: input.allowedComposioSlugs && input.allowedComposioSlugs.length > 0
+      ? input.allowedComposioSlugs
+      : undefined,
     openedAt: new Date(now).toISOString(),
     expiresAt: new Date(now + ttl).toISOString(),
     autoApprovals: [],
@@ -127,6 +137,7 @@ export function openPlanScope(input: OpenPlanScopeInput): PlanScope {
     planProposalId: scope.planProposalId,
     expiresAt: scope.expiresAt,
     allowedTools: scope.allowedTools,
+    allowedComposioSlugs: scope.allowedComposioSlugs,
   }, 'plan scope opened');
 
   return scope;
@@ -162,18 +173,42 @@ export function closePlanScope(sessionId: string, reason: string = 'closed'): Pl
  * Pure check — does the session have an active, unexpired plan scope
  * that covers `toolName`? Does not mutate.
  */
-export function isAutoApprovedByScope(sessionId: string | undefined, toolName: string): boolean {
+export function isAutoApprovedByScope(sessionId: string | undefined, toolName: string, args?: unknown): boolean {
   if (!sessionId) return false;
   const scope = getPlanScope(sessionId);
   if (!scope) return false;
   if (scope.closedAt) return false;
   if (scope.allowedTools.includes('*')) return true;
-  if (scope.allowedTools.includes(toolName)) return true;
+  if (scope.allowedTools.includes(toolName)) {
+    if (
+      toolName === 'composio_execute_tool'
+      && scope.allowedComposioSlugs
+      && scope.allowedComposioSlugs.length > 0
+    ) {
+      const slug = extractComposioSlug(args);
+      return !!slug && scope.allowedComposioSlugs.includes(slug);
+    }
+    return true;
+  }
   const prefixMatch = scope.allowedTools.some((allowed) => (
     allowed.endsWith('*') && toolName.startsWith(allowed.slice(0, -1))
   ));
   if (!prefixMatch) return false;
   return true;
+}
+
+function extractComposioSlug(args: unknown): string | undefined {
+  if (!args) return undefined;
+  if (typeof args === 'string') {
+    try {
+      return extractComposioSlug(JSON.parse(args) as unknown);
+    } catch {
+      return undefined;
+    }
+  }
+  if (typeof args !== 'object') return undefined;
+  const slug = (args as Record<string, unknown>).tool_slug;
+  return typeof slug === 'string' && slug.length > 0 ? slug : undefined;
 }
 
 /**
@@ -197,10 +232,11 @@ export interface AutoApproveDecision {
 export function evaluateAutoApprove(input: {
   sessionId: string | undefined;
   toolName: string;
+  args?: unknown;
   scope: 'strict' | 'workspace' | 'yolo';
   insideWorkspace: boolean;
 }): AutoApproveDecision {
-  if (isAutoApprovedByScope(input.sessionId, input.toolName)) {
+  if (isAutoApprovedByScope(input.sessionId, input.toolName, input.args)) {
     return { autoApproved: true, reason: 'plan-scope' };
   }
   if (input.scope === 'yolo') {

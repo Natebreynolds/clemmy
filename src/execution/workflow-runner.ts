@@ -577,6 +577,7 @@ async function runStepViaHarness(
         agent,
         sessionId: realSessionId,
         decision,
+        resolver: 'workflow-runner',
       });
       // Resume returned — the run is moving again. Clear the heartbeat
       // gate so the next "still running" interval can fire normally

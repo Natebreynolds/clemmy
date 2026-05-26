@@ -59,6 +59,7 @@ const logger = pino({ name: 'clementine.codex-model' });
 const CODEX_URL = 'https://chatgpt.com/backend-api/codex/responses';
 const CODEX_USER_AGENT = 'Codex/0.118.0';
 const JWT_CLAIM_PATH = 'https://api.openai.com/auth';
+const CODEX_TRANSPARENT_MAX_RETRIES = 3;
 
 // ----------------------------------------------------------------------
 // Public API
@@ -228,20 +229,96 @@ function sizeRequestComponents(body: CodexRequestBody): RequestBodyBreakdown {
   };
 }
 
+function isRealContentCodexEvent(evt: AnyCodexEvent): boolean {
+  return evt.type === 'response.output_text.delta' || evt.type === 'response.output_item.done';
+}
+
+function isTransparentCodexRetryError(err: unknown): err is BoundaryError {
+  return err instanceof BoundaryError
+    && (err.kind === 'codex.transport_timeout' || err.kind === 'codex.sse_truncated')
+    && BoundaryError.isTransient(err);
+}
+
+function shouldRetryTransparentCodexFailure(
+  err: unknown,
+  yieldedRealContent: boolean,
+  attempt: number,
+): boolean {
+  return isTransparentCodexRetryError(err)
+    && !yieldedRealContent
+    && attempt < CODEX_TRANSPARENT_MAX_RETRIES;
+}
+
+function transparentCodexRetryDelayMs(attempt: number): number {
+  const override = process.env.CLEMMY_CODEX_TRANSPARENT_RETRY_DELAY_MS;
+  if ((process.env.NODE_ENV === 'test' || process.env.CLEMMY_DEV_OVERRIDES === '1') && override != null) {
+    const parsed = Number(override);
+    if (Number.isFinite(parsed) && parsed >= 0) return parsed;
+  }
+  return 750 * Math.pow(2, attempt);
+}
+
+async function waitBeforeTransparentCodexRetry(
+  err: unknown,
+  attempt: number,
+  path: 'getResponse' | 'getStreamedResponse',
+): Promise<void> {
+  const backoffMs = transparentCodexRetryDelayMs(attempt);
+  const boundary = err instanceof BoundaryError ? err : null;
+  logger.warn(
+    {
+      path,
+      attempt: attempt + 1,
+      nextAttempt: attempt + 2,
+      maxRetries: CODEX_TRANSPARENT_MAX_RETRIES,
+      backoffMs,
+      kind: boundary?.kind ?? null,
+      context: boundary?.context ?? {},
+    },
+    'Codex model call failed before real content; retrying transparently',
+  );
+  if (backoffMs > 0) {
+    await new Promise((resolve) => setTimeout(resolve, backoffMs));
+  }
+}
+
 export class CodexResponsesModel implements Model {
   constructor(public readonly modelId: string) {}
 
   async getResponse(request: ModelRequest): Promise<ModelResponse> {
-    const events: AnyCodexEvent[] = [];
-    for await (const evt of this.#streamCodex(request)) {
-      events.push(evt);
+    for (let attempt = 0; attempt <= CODEX_TRANSPARENT_MAX_RETRIES; attempt++) {
+      const events: AnyCodexEvent[] = [];
+      try {
+        for await (const evt of this.streamCodex(request)) {
+          events.push(evt);
+        }
+        return assembleModelResponse(events);
+      } catch (err) {
+        const yieldedRealContent = events.some(isRealContentCodexEvent);
+        if (shouldRetryTransparentCodexFailure(err, yieldedRealContent, attempt)) {
+          await waitBeforeTransparentCodexRetry(err, attempt, 'getResponse');
+          continue;
+        }
+        throw err;
+      }
     }
-    return assembleModelResponse(events);
+    throw new CodexModelError('Codex retry loop exhausted unexpectedly.');
   }
 
   async *getStreamedResponse(request: ModelRequest): AsyncIterable<StreamEvent> {
-    // Up to one transparent retry on `codex.sse_truncated` when NO
-    // content was yielded to the SDK yet. Common case from the field:
+    // Transparent retry on retryable Codex transport/SSE failures when
+    // NO content was yielded to the SDK yet. Common field cases:
+    // - UND_ERR_HEADERS_TIMEOUT before the backend sends headers.
+    // - UND_ERR_BODY_TIMEOUT before any real model content.
+    // - `codex.sse_truncated` after response.created but before content.
+    //
+    // A prior migration attempt moved the harness to Agents SDK 0.11.5
+    // but relied on SDK-level retry behavior; the first Codex call then
+    // surfaced `UND_ERR_HEADERS_TIMEOUT` and the workflow stalled before
+    // any tools fired. Keep this retry inside the Codex adapter, where
+    // we know exactly which events have escaped to the SDK.
+    //
+    // Existing SSE case from the field:
     // the upstream Codex stream emits `response.created` and then drops
     // before any output_text.delta / output_item.done — items=0,
     // responseId set. With this retry, the user-visible failure is
@@ -259,12 +336,11 @@ export class CodexResponsesModel implements Model {
     // outages (rare). Tradeoff: a real outage waits ~12s before the
     // user sees Retry, vs ~3s previously — acceptable because outages
     // are 10× rarer than transient flakes per current telemetry.
-    const MAX_RETRY = 3;
     let lastResponseId: string | undefined;
     let lastItemCount = 0;
     let lastDiag: StreamDiagnostics | undefined;
 
-    for (let attempt = 0; attempt <= MAX_RETRY; attempt++) {
+    for (let attempt = 0; attempt <= CODEX_TRANSPARENT_MAX_RETRIES; attempt++) {
       const seenOutputItems: CodexOutputItem[] = [];
       let responseId: string | undefined;
       let completedEvent: AnyCodexEvent | undefined;
@@ -297,51 +373,63 @@ export class CodexResponsesModel implements Model {
       };
 
       let eventsConsumed = 0;
-      for await (const evt of this.#streamCodex(request, diag)) {
-        eventsConsumed += 1;
-        // v0.5.19 F5 — diagnostic knob: after 5 events, drop the
-        // stream as if it truncated. Double-gated (NODE_ENV=test or
-        // CLEMMY_DEV_OVERRIDES=1) so production cannot trip it. Lets
-        // an operator capture a real-traffic SSE-truncation trace
-        // without waiting for an organic failure.
-        if (eventsConsumed > 5 && shouldForceSseTruncation()) {
-          break;
+      try {
+        for await (const evt of this.streamCodex(request, diag)) {
+          eventsConsumed += 1;
+          // v0.5.19 F5 — diagnostic knob: after 5 events, drop the
+          // stream as if it truncated. Double-gated (NODE_ENV=test or
+          // CLEMMY_DEV_OVERRIDES=1) so production cannot trip it. Lets
+          // an operator capture a real-traffic SSE-truncation trace
+          // without waiting for an organic failure.
+          if (eventsConsumed > 5 && shouldForceSseTruncation()) {
+            break;
+          }
+          if (evt.type === 'response.created' && evt.response?.id) {
+            responseId = evt.response.id;
+            pendingStart = { type: 'response_started', providerData: { responseId } } as StreamEvent;
+            continue;
+          }
+          if (evt.type === 'response.output_text.delta' && typeof evt.delta === 'string') {
+            yield* flushBuffer();
+            yieldedRealContent = true;
+            yield {
+              type: 'output_text_delta',
+              delta: evt.delta,
+              providerData: { sequence_number: evt.sequence_number },
+            } as StreamEvent;
+            continue;
+          }
+          if (evt.type === 'response.output_item.done' && evt.item) {
+            yield* flushBuffer();
+            yieldedRealContent = true;
+            seenOutputItems.push(evt.item);
+            continue;
+          }
+          if (evt.type === 'response.completed' || evt.type === 'response.done') {
+            completedEvent = evt;
+            continue;
+          }
+          // Metadata pass-through — buffer instead of yielding. Codex
+          // routinely emits one or two reasoning_summary / keep-alive
+          // frames before the first text delta; previously we yielded
+          // these immediately and that blocked the retry path when the
+          // stream then truncated. Now they sit in pendingMetadata until
+          // either (a) real content arrives and the buffer flushes in
+          // order, or (b) the stream truncates and the buffer is
+          // discarded on retry. Net effect: the SDK observes events in
+          // the SAME order, just delayed slightly into the same tick.
+          pendingMetadata.push({ type: 'model', event: evt } as StreamEvent);
         }
-        if (evt.type === 'response.created' && evt.response?.id) {
-          responseId = evt.response.id;
-          pendingStart = { type: 'response_started', providerData: { responseId } } as StreamEvent;
+      } catch (err) {
+        lastResponseId = responseId;
+        lastItemCount = seenOutputItems.length;
+        if (shouldRetryTransparentCodexFailure(err, yieldedRealContent, attempt)) {
+          pendingStart = undefined;
+          pendingMetadata = [];
+          await waitBeforeTransparentCodexRetry(err, attempt, 'getStreamedResponse');
           continue;
         }
-        if (evt.type === 'response.output_text.delta' && typeof evt.delta === 'string') {
-          yield* flushBuffer();
-          yieldedRealContent = true;
-          yield {
-            type: 'output_text_delta',
-            delta: evt.delta,
-            providerData: { sequence_number: evt.sequence_number },
-          } as StreamEvent;
-          continue;
-        }
-        if (evt.type === 'response.output_item.done' && evt.item) {
-          yield* flushBuffer();
-          yieldedRealContent = true;
-          seenOutputItems.push(evt.item);
-          continue;
-        }
-        if (evt.type === 'response.completed' || evt.type === 'response.done') {
-          completedEvent = evt;
-          continue;
-        }
-        // Metadata pass-through — buffer instead of yielding. Codex
-        // routinely emits one or two reasoning_summary / keep-alive
-        // frames before the first text delta; previously we yielded
-        // these immediately and that blocked the retry path when the
-        // stream then truncated. Now they sit in pendingMetadata until
-        // either (a) real content arrives and the buffer flushes in
-        // order, or (b) the stream truncates and the buffer is
-        // discarded on retry. Net effect: the SDK observes events in
-        // the SAME order, just delayed slightly into the same tick.
-        pendingMetadata.push({ type: 'model', event: evt } as StreamEvent);
+        throw err;
       }
 
       if (completedEvent) {
@@ -383,7 +471,7 @@ export class CodexResponsesModel implements Model {
       // before so the harness logs it + surfaces a real message.
       lastResponseId = responseId;
       lastItemCount = seenOutputItems.length;
-      if (!yieldedRealContent && attempt < MAX_RETRY) {
+      if (!yieldedRealContent && attempt < CODEX_TRANSPARENT_MAX_RETRIES) {
         // v0.5.21.1 — exponential backoff with jitter: 750ms, 1.5s, 3s.
         // Single fixed delay re-hammered the backend on the same frame
         // a struggling Cloudflare/Codex edge was rejecting; spacing
@@ -393,8 +481,17 @@ export class CodexResponsesModel implements Model {
         // with stale ones.
         pendingStart = undefined;
         pendingMetadata = [];
-        const backoffMs = 750 * Math.pow(2, attempt);
-        await new Promise((resolve) => setTimeout(resolve, backoffMs));
+        await waitBeforeTransparentCodexRetry(
+          new BoundaryError({
+            kind: 'codex.sse_truncated',
+            retryable: true,
+            userMessage: "Clementine's model backend dropped the connection before finishing this turn. Retry — if it persists, the Codex backend may be having an incident.",
+            operatorMessage: 'Codex SSE ended without response.completed before real content.',
+            context: { responseId: lastResponseId ?? null, itemCount: lastItemCount },
+          }),
+          attempt,
+          'getStreamedResponse',
+        );
         continue;
       }
 
@@ -472,7 +569,7 @@ export class CodexResponsesModel implements Model {
    * truncation fires — without this every failure was indistinguish-
    * able from every other).
    */
-  async *#streamCodex(request: ModelRequest, diag?: StreamDiagnostics): AsyncGenerator<AnyCodexEvent> {
+  protected async *streamCodex(request: ModelRequest, diag?: StreamDiagnostics): AsyncGenerator<AnyCodexEvent> {
     const token = await loadFreshCodexAccessToken();
     const accountId = extractAccountIdFromJwt(token) ?? '';
     if (!accountId) {

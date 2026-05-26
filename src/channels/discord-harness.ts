@@ -805,6 +805,7 @@ function pendingDiscordApprovalsForChannel(channelId: string): approvalRegistry.
 
 export const __test__ = {
   approvalBelongsToDiscordChannel,
+  approvalComponentsForState,
   isDiscordTokenExpired,
 };
 
@@ -933,6 +934,7 @@ interface DisplayState {
   // message so the user clicks instead of typing "approve apr-xxxx".
   // Cleared on approval_resolved / awaiting_user_input / completion.
   pendingApprovalId?: string;
+  pendingApprovalIds?: string[];
   // Wall-clock when the turn started, in ms. Set on the first
   // turn_started event. renderBody uses this to show an elapsed-time
   // counter so the user can tell "still working at 4m 12s" vs
@@ -954,21 +956,118 @@ interface DisplayState {
  * apr-xxxx id and triggers `runDiscordHarnessResume`.
  */
 function approvalComponentsForState(state: DisplayState): unknown[] | null {
-  if (!state.pendingApprovalId) return null;
-  const id = state.pendingApprovalId;
+  const ids = state.pendingApprovalIds && state.pendingApprovalIds.length > 0
+    ? state.pendingApprovalIds
+    : state.pendingApprovalId
+      ? [state.pendingApprovalId]
+      : [];
+  if (ids.length === 0) return null;
+  const id = ids[0];
+  const count = ids.length;
+  const approveLabel = count > 1 ? `Approve all ${count}` : 'Approve';
+  const rejectLabel = count > 1 ? `Reject all ${count}` : 'Reject';
+  const buttons: Array<Record<string, unknown>> = [
+    { type: 2 /* Button */, style: 3 /* Success */, label: approveLabel, custom_id: `clementine:approve:${id}` },
+  ];
+  if (count === 1) {
+    buttons.push(
+      // Edit opens a Discord modal pre-filled with the tool's args
+      // JSON. User can change time, recipient, content, etc. before
+      // approving. Cheaper than reject + ask the agent to retry.
+      { type: 2, style: 1 /* Primary */, label: 'Edit', custom_id: `clementine:edit:${id}` },
+    );
+  }
+  buttons.push({ type: 2, style: 4 /* Danger */, label: rejectLabel, custom_id: `clementine:reject:${id}` });
   return [
     {
       type: 1, // ActionRow
-      components: [
-        { type: 2 /* Button */, style: 3 /* Success */, label: 'Approve', custom_id: `clementine:approve:${id}` },
-        // Edit opens a Discord modal pre-filled with the tool's args
-        // JSON. User can change time, recipient, content, etc. before
-        // approving. Cheaper than reject + ask the agent to retry.
-        { type: 2, style: 1 /* Primary */, label: 'Edit', custom_id: `clementine:edit:${id}` },
-        { type: 2, style: 4 /* Danger */, label: 'Reject', custom_id: `clementine:reject:${id}` },
-      ],
+      components: buttons,
     },
   ];
+}
+
+function trimDiscordText(input: string, max: number): string {
+  const clean = input.replace(/\s+/g, ' ').trim();
+  return clean.length > max ? `${clean.slice(0, max - 1)}…` : clean;
+}
+
+function parseMaybeJson(value: unknown): unknown {
+  if (typeof value !== 'string') return value;
+  try {
+    return JSON.parse(value) as unknown;
+  } catch {
+    return value;
+  }
+}
+
+function describeRecipient(value: unknown): string {
+  if (typeof value === 'string') return trimDiscordText(value, 110);
+  if (!value || typeof value !== 'object') return '';
+  const record = value as Record<string, unknown>;
+  const email = typeof record.email === 'string' ? record.email : '';
+  const name = typeof record.name === 'string' ? record.name : '';
+  if (name && email) return `${trimDiscordText(name, 40)} <${trimDiscordText(email, 70)}>`;
+  return trimDiscordText(email || name, 110);
+}
+
+function approvalRowDetail(row: approvalRegistry.PendingApprovalRow): string {
+  const args = row.args ?? {};
+  if (row.tool === 'composio_execute_tool') {
+    const slug = typeof args.tool_slug === 'string' ? args.tool_slug : '';
+    const inner = parseMaybeJson(args.arguments);
+    if (inner && typeof inner === 'object') {
+      const record = inner as Record<string, unknown>;
+      const subject = typeof record.subject === 'string' ? trimDiscordText(record.subject, 90) : '';
+      const recipients = Array.isArray(record.to_recipients) ? record.to_recipients : [];
+      const to = recipients.length > 0 ? describeRecipient(recipients[0]) : '';
+      return [slug, to ? `to ${to}` : '', subject && !row.subject.includes(subject) ? subject : '']
+        .filter(Boolean)
+        .join(' · ');
+    }
+    return slug;
+  }
+  if (row.tool === 'request_approval') {
+    const reason = typeof args.reason === 'string' ? trimDiscordText(args.reason, 140) : '';
+    const preview = args.preview && typeof args.preview === 'object' ? args.preview as { count?: unknown } : null;
+    const count = typeof preview?.count === 'number' ? `${preview.count} item${preview.count === 1 ? '' : 's'}` : '';
+    return [count, reason].filter(Boolean).join(' · ');
+  }
+  if (row.tool === 'execution_create') {
+    const objective = typeof args.objective === 'string' ? trimDiscordText(args.objective, 150) : '';
+    return objective;
+  }
+  return previewToolCall(row.tool || 'approval', row.args);
+}
+
+async function refreshPendingApprovalDisplay(state: DisplayState, sessionId: string): Promise<void> {
+  if (!state.pendingApprovalId && (!state.pendingApprovalIds || state.pendingApprovalIds.length === 0)) return;
+  // Approval interruptions can arrive as a burst of sibling events in
+  // the same SDK pause. Give the registry a short tick so the Discord
+  // card can summarize the whole batch instead of only the first row.
+  await new Promise((resolve) => setTimeout(resolve, 75));
+  const rows = approvalRegistry
+    .listPending({ sessionId, status: 'pending' })
+    .filter((row) => approvalRegistry.isActionable(row));
+  if (rows.length === 0) return;
+  state.pendingApprovalIds = rows.map((row) => row.approvalId);
+  state.pendingApprovalId = state.pendingApprovalIds[0];
+  const lines: string[] = [];
+  if (rows.length === 1) {
+    const row = rows[0];
+    lines.push(`Approval required: ${row.subject}`);
+    const detail = approvalRowDetail(row);
+    if (detail) lines.push('', detail);
+    lines.push('', `Tap **Approve**, **Edit**, or **Reject** below — or type \`approve ${row.approvalId}\` / \`reject ${row.approvalId}\`.`);
+  } else {
+    lines.push(`Approval required for ${rows.length} actions:`);
+    for (const row of rows.slice(0, 5)) {
+      const detail = approvalRowDetail(row);
+      lines.push(`• ${row.subject}${detail ? ` — ${detail}` : ''}`);
+    }
+    if (rows.length > 5) lines.push(`• +${rows.length - 5} more`);
+    lines.push('', `Tap **Approve all ${rows.length}** or **Reject all ${rows.length}** below. Buttons apply to this paused batch.`);
+  }
+  state.summary = lines.join('\n');
 }
 
 function renderBody(state: DisplayState): string {
@@ -1343,6 +1442,7 @@ export async function runDiscordHarnessConversation(opts: {
   const finalFlush = async (): Promise<void> => {
     pendingEdit = null;
     lastEditAt = Date.now();
+    await refreshPendingApprovalDisplay(state, session.id);
     const fullBody = renderFullBody(state);
     const chunks = splitForLongReply(fullBody);
     const components = approvalComponentsForState(state);
@@ -1653,12 +1753,20 @@ async function runDiscordHarnessResume(opts: {
   };
   let lastEditAt = 0;
   let pendingEdit: NodeJS.Timeout | null = null;
+  let lastAttachedApprovalId: string | undefined;
 
   const flush = async (): Promise<void> => {
     pendingEdit = null;
     lastEditAt = Date.now();
     try {
-      await handle.edit(renderBody(state));
+      const components = approvalComponentsForState(state);
+      const needsUpdate = state.pendingApprovalId !== lastAttachedApprovalId;
+      if (components || needsUpdate) {
+        await handle.edit(renderBody(state), { components: components ?? [] });
+        lastAttachedApprovalId = state.pendingApprovalId;
+      } else {
+        await handle.edit(renderBody(state));
+      }
     } catch {
       /* transient — next event retries */
     }
@@ -1670,10 +1778,18 @@ async function runDiscordHarnessResume(opts: {
   const finalFlush = async (): Promise<void> => {
     pendingEdit = null;
     lastEditAt = Date.now();
+    await refreshPendingApprovalDisplay(state, sessionId);
     const fullBody = renderFullBody(state);
     const chunks = splitForLongReply(fullBody);
+    const components = approvalComponentsForState(state);
+    const needsComponentUpdate = state.pendingApprovalId !== lastAttachedApprovalId || !!components;
     try {
-      await handle.edit(chunks[0] ?? '_working…_');
+      if (needsComponentUpdate) {
+        await handle.edit(chunks[0] ?? '_working…_', { components: components ?? [] });
+        lastAttachedApprovalId = state.pendingApprovalId;
+      } else {
+        await handle.edit(chunks[0] ?? '_working…_');
+      }
       if (chunks.length > 1 && transport.sendFollowup) {
         for (let i = 1; i < chunks.length; i++) {
           await transport.sendFollowup(chunks[i]);
@@ -1734,20 +1850,8 @@ async function runDiscordHarnessResume(opts: {
         agent,
         sessionId,
         decision,
+        resolver: 'discord-user',
       });
-      // Resolve every still-pending registry row for this session.
-      // The SDK's resume processes ALL interrupted tool calls at once
-      // (it's a single state, not per-tool), so we mirror that by
-      // marking every pending apr-xxx for this session as resolved
-      // with the user's chosen decision. Best-effort — if the row was
-      // already expired by the reaper between user click and resume,
-      // the resolve() returns ok:false reason:'already_resolved' and
-      // we move on.
-      const pendingForSession = approvalRegistry.listPending({ sessionId, status: 'pending' });
-      const resolution = decision === 'approve' ? 'approved' : 'rejected';
-      for (const row of pendingForSession) {
-        approvalRegistry.resolve(row.approvalId, resolution, 'discord-user');
-      }
       // If reject — the run pivoted to "no work to do" and the
       // conversation is effectively done. Force the UI into the
       // completed state so the placeholder updates with a final
@@ -1895,7 +1999,12 @@ export function applyEventToState(event: EventRow, state: DisplayState): void {
       // standard buildApprovalActions helper). Text fallback stays in
       // the body for clients that ignore components or for users who
       // prefer to type — never required.
-      if (approvalId) state.pendingApprovalId = approvalId;
+      if (approvalId) {
+        const ids = state.pendingApprovalIds ?? [];
+        if (!ids.includes(approvalId)) ids.push(approvalId);
+        state.pendingApprovalIds = ids;
+        state.pendingApprovalId = ids[0] ?? approvalId;
+      }
 
       // Resource-fingerprint warning: if the approval's args mention a
       // resource id that DOESN'T match the active focus, surface a
@@ -1924,6 +2033,7 @@ export function applyEventToState(event: EventRow, state: DisplayState): void {
       state.status = decision === 'approved' ? 'approved — continuing' : 'rejected — stopping';
       // Buttons are no longer relevant; clear so the next flush drops them.
       state.pendingApprovalId = undefined;
+      state.pendingApprovalIds = undefined;
       return;
     }
     case 'condenser_applied': {
@@ -1942,8 +2052,9 @@ export function applyEventToState(event: EventRow, state: DisplayState): void {
       return;
     }
     case 'guardrail_tripped': {
-      const name = String(data.name ?? 'guardrail');
-      state.status = `⚠ ${name}`;
+      // Guardrails are internal safety telemetry. They should stay in
+      // the event log, but never replace the public Discord progress
+      // line with implementation language like "guardrail".
       return;
     }
     case 'awaiting_user_input': {

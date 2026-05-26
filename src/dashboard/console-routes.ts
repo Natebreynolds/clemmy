@@ -357,6 +357,24 @@ function harnessSessionSourceLabel(session: HarnessSessionRow): string {
   return session.channel || session.kind;
 }
 
+function isHarnessTerminalEvent(type: HarnessEventRow['type']): boolean {
+  return type === 'conversation_completed'
+    || type === 'run_completed'
+    || type === 'run_failed'
+    || type === 'approval_requested'
+    || type === 'awaiting_user_input'
+    || type === 'conversation_limit_exceeded';
+}
+
+function isHarnessSessionCurrentlyWorking(session: HarnessSessionRow, activeWindowCutoff: number): boolean {
+  if (session.status !== 'active') return false;
+  const updatedMs = Date.parse(session.updatedAt);
+  if (!Number.isFinite(updatedMs) || updatedMs < activeWindowCutoff) return false;
+  const latest = listHarnessEvents(session.id, { limit: 1, desc: true })[0];
+  if (!latest) return false;
+  return !isHarnessTerminalEvent(latest.type);
+}
+
 function actionEventTime(event: ActionEvent): string {
   if (event.kind === 'run.event') return event.event.createdAt;
   if (event.kind === 'harness.event') return event.event.createdAt;
@@ -3723,6 +3741,7 @@ export function registerConsoleRoutes(
             sessionId,
             decision: currentDecision,
             modifiedArgs: currentModifiedArgs,
+            resolver: 'desktop-command-center',
           });
           const pending = approvalRegistry.listPending({ sessionId, status: 'pending' });
           if (pending.length === 0) break;
@@ -3806,11 +3825,9 @@ export function registerConsoleRoutes(
       // resume/clear actions.
       const activeWindowMs = 60_000;
       const activeWindowCutoff = Date.now() - activeWindowMs;
-      const activeHarnessSessions = recentHarnessSessions.filter((session) => {
-        if (session.status !== 'active') return false;
-        const updatedMs = Date.parse(session.updatedAt);
-        return Number.isFinite(updatedMs) && updatedMs >= activeWindowCutoff;
-      });
+      const activeHarnessSessions = recentHarnessSessions.filter((session) =>
+        isHarnessSessionCurrentlyWorking(session, activeWindowCutoff),
+      );
 
       // Uncapped per-source (was sliced) — the NEEDS YOU header count
       // (counts.waiting = needsYou.length) is computed from this array,
@@ -3913,7 +3930,7 @@ export function registerConsoleRoutes(
         })),
         ...activeHarnessSessions.map((session) => ({
           kind: isDiscordHarnessSession(session) ? 'discord' : session.kind,
-          title: session.title || session.objective || (isDiscordHarnessSession(session) ? 'Discord conversation' : 'Harness run'),
+          title: session.title || session.objective || (isDiscordHarnessSession(session) ? 'Discord conversation' : 'Clementine run'),
           meta: `${harnessSessionSourceLabel(session)} · ${session.status} · ${session.updatedAt.slice(11, 16)}`,
           panel: 'activity',
           actionKind: 'harness-session',
@@ -3936,7 +3953,7 @@ export function registerConsoleRoutes(
         })),
         ...recentHarnessSessions.filter((session) => session.status === 'completed').slice(0, 5).map((session) => ({
           kind: 'done',
-          title: session.title || session.objective || 'Harness conversation',
+          title: session.title || session.objective || 'Clementine conversation',
           meta: `${harnessSessionSourceLabel(session)} done ${session.updatedAt.slice(11, 16)}`,
           panel: 'activity',
         })),
@@ -4297,7 +4314,7 @@ export function registerConsoleRoutes(
       const replayHarnessEvents: ActionEvent[] = [];
       const recentHarnessSessions = listHarnessSessions({ limit: 25 }).filter(isConsoleVisibleHarnessSession);
       for (const session of recentHarnessSessions) {
-        const events = listHarnessEvents(session.id, { limit: 500 })
+        const events = listHarnessEvents(session.id, { limit: 500, desc: true })
           .filter((event) => CONSOLE_HARNESS_REPLAY_TYPES.has(event.type))
           .slice(-8);
         for (const event of events) {
@@ -4613,17 +4630,8 @@ export function registerConsoleRoutes(
             agent,
             sessionId,
             decision: intent.decision,
+            resolver: 'chat-dock-user',
           });
-          // Resolve the pending approval registry rows for this
-          // session so the addressable-approval state machine reflects
-          // the user's choice. Matches the discord-harness path.
-          const { listPending: listPendingApprovals, resolve: resolveApproval } =
-            await import('../runtime/harness/approval-registry.js');
-          const pending = listPendingApprovals({ sessionId, status: 'pending' });
-          const resolution = intent.decision === 'approve' ? 'approved' : 'rejected';
-          for (const row of pending) {
-            resolveApproval(row.approvalId, resolution, 'chat-dock-user');
-          }
           return;
         }
         await runConversation({ agent, sessionId, input: turnInput });

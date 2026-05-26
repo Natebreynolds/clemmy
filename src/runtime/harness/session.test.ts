@@ -133,6 +133,17 @@ test('clearInterruptState is a no-op when nothing was saved', () => {
   assert.equal(resumed.length, 0, 'no resume event when there was no pause');
 });
 
+test('clearInterruptState can suppress the generic run_resumed event', () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  sess.saveInterruptState('state');
+  sess.clearInterruptState({ emitEvent: false });
+
+  assert.equal(sess.loadInterruptState(), null);
+  const resumed = listEvents(sess.id, { types: ['run_resumed'] });
+  assert.equal(resumed.length, 0);
+});
+
 test('markStatus updates the session row but does NOT emit a terminal event', () => {
   // The harness loop owns the terminal event (with rich payload —
   // toolCalls count, finalOutput preview); markStatus only flips

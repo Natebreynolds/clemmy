@@ -7,6 +7,7 @@ import { getOpenAiApiKey, getRuntimeEnv, MODELS } from '../config.js';
 import { getCoreTools } from '../tools/registry.js';
 import { getOrCreateConfiguredMcpServers } from '../runtime/mcp-servers.js';
 import { autonomyV2OutputGuardrails } from './autonomy-guardrails.js';
+import { normalizeZodForCodexStrict } from '../runtime/schema-normalizer.js';
 import { getProactivityPolicySnapshot, type ProactivityPolicy, type ProactivityPolicySnapshot } from './proactivity-policy.js';
 import { renderOpenCheckInsForAgent } from './check-ins.js';
 import { getProposalFeedback, renderProposalFeedback } from './proposal-feedback.js';
@@ -589,7 +590,8 @@ async function getAgent(record: TeamAgentRecord, policy: ProactivityPolicy): Pro
     name: record.name,
     instructions: buildAgentInstructions(record, policy),
     model: record.model ?? MODELS.fast,
-    outputType: AgentDecisionSchema,
+    // v0.5.22 — Codex-strict-compatible via centralized normalizer.
+    outputType: normalizeZodForCodexStrict(AgentDecisionSchema) as typeof AgentDecisionSchema,
     outputGuardrails: autonomyV2OutputGuardrails,
     tools,
     handoffs,

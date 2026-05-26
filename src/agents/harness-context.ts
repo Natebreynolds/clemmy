@@ -167,15 +167,25 @@ export function renderHarnessMemoryContext(): string {
   let focus = '';
   try {
     const snap = getFocusSnapshot();
-    if (snap.active) {
-      const confirmHint = snap.needsConfirm
-        ? `\n  ⚠ idle past confirm window — ASK "still on this, or new topic?" before doing unrelated work.`
-        : '';
+    if (snap.active && !snap.needsConfirm) {
       focus = [
         `ACTIVE focus #${snap.active.id}: ${snap.active.title}`,
         `Summary: ${snap.active.summary}`,
         `Resource: ${snap.active.resource_ref}${snap.active.resource_kind ? ` (${snap.active.resource_kind})` : ''}`,
-        `Last touched: ${snap.active.last_touched_at}${confirmHint}`,
+        `Last touched: ${snap.active.last_touched_at}`,
+      ].join('\n');
+      if (snap.parked.length > 0) {
+        focus += `\n\nParked (resumable via focus_activate):\n`
+          + snap.parked.slice(0, 5).map((p) => `  - #${p.id} ${p.title}`).join('\n');
+      }
+    } else if (snap.active && snap.needsConfirm) {
+      focus = [
+        'No confirmed active focus.',
+        `STALE focus #${snap.active.id}: ${snap.active.title}`,
+        `Summary: ${snap.active.summary}`,
+        `Resource: ${snap.active.resource_ref}${snap.active.resource_kind ? ` (${snap.active.resource_kind})` : ''}`,
+        `Last touched: ${snap.active.last_touched_at}`,
+        'Do not treat the stale focus as authoritative. If the user is clearly continuing it, call focus_touch(id). If the user moved on or asks for unrelated work, call focus_clear(id, resolution:"abandoned") or focus_park(id, reason) before proceeding.',
       ].join('\n');
       if (snap.parked.length > 0) {
         focus += `\n\nParked (resumable via focus_activate):\n`

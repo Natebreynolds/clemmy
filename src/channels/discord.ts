@@ -1622,6 +1622,59 @@ async function handleModalSubmit(interaction: ModalSubmitInteraction): Promise<v
   }
 }
 
+/**
+ * v0.5.21.2 — collapse an approval card after the click is handled so the
+ * buttons can't be re-clicked into a stale state. Keeps the original card
+ * content (the user's context for WHAT they approved) and appends a
+ * one-line status footer; strips components so the card visibly "dies".
+ *
+ * Why update vs reply: ephemeral replies confirm the click TO THE CLICKER
+ * but leave the card live for anyone else in the channel — and live for
+ * the same user the next time they scroll past. update() mutates the
+ * source message so the card itself shows the outcome.
+ *
+ * Idempotent: if Discord refuses the update (interaction expired,
+ * permissions changed, message deleted), fall back to an ephemeral reply
+ * so the user still gets feedback.
+ */
+async function collapseApprovalCard(
+  interaction: ButtonInteraction,
+  status: 'approved' | 'rejected' | 'already-resolved' | 'failed',
+  footerDetail?: string,
+): Promise<void> {
+  const original = interaction.message?.content ?? '';
+  const emoji =
+    status === 'approved' ? '✅' :
+    status === 'rejected' ? '❌' :
+    status === 'failed' ? '⚠️' :
+    'ℹ️';
+  const label = status.replace('-', ' ');
+  const footer = `\n\n${emoji} **${label}**${footerDetail ? ` — ${footerDetail}` : ''}`;
+  // Discord message hard limit is 2000 chars; trim original if the
+  // combined message would overflow. Preserve the footer (the new
+  // signal) over the original content tail.
+  const room = 1900 - footer.length;
+  const trimmedOriginal = original.length > room
+    ? `${original.slice(0, room - 1)}…`
+    : original;
+  try {
+    await interaction.update({ content: `${trimmedOriginal}${footer}`, components: [] });
+  } catch (err) {
+    // Likely DiscordAPIError 10062 (unknown interaction) or 50001 (no
+    // permission). Fall back to an ephemeral reply so the click isn't
+    // silent.
+    try {
+      await interaction.reply({
+        content: `${emoji} ${label}${footerDetail ? ` — ${footerDetail}` : ''} (could not update original card: ${err instanceof Error ? err.message : 'unknown'})`,
+        ephemeral: true,
+      });
+    } catch {
+      // Both paths failed (interaction is fully gone). Nothing we can
+      // do; the harness already executed the underlying resolve.
+    }
+  }
+}
+
 async function handleButtonInteraction(interaction: ButtonInteraction, assistant: ClementineAssistant): Promise<void> {
   if (!interaction.customId.startsWith(`${DISCORD_CUSTOM_ID_PREFIX}:`)) {
     return;
@@ -1648,10 +1701,17 @@ async function handleButtonInteraction(interaction: ButtonInteraction, assistant
         if (row && row.status !== 'pending') {
           const ageMs = Date.now() - new Date(row.resolvedAt ?? row.requestedAt).getTime();
           const ageLabel = formatRelativeAgo(ageMs);
-          await interaction.reply({
-            content: `That approval (\`${targetId}\`) was already **${row.status}** ${ageLabel}${row.resolver ? ` by ${row.resolver}` : ''} — no action taken.`,
-            ephemeral: true,
-          });
+          // v0.5.21.2 — collapse the stale card (drop buttons + add
+          // status footer) so the same card can't be re-clicked into
+          // the same confusing "already resolved" state. The user's
+          // "button doesn't work" complaint was here: an apparently
+          // live button that, on click, just returned an ephemeral
+          // explanation while the card stayed clickable.
+          await collapseApprovalCard(
+            interaction,
+            'already-resolved',
+            `was already ${row.status} ${ageLabel}${row.resolver ? ` by ${row.resolver}` : ''}`,
+          );
           return;
         }
       }
@@ -1661,13 +1721,31 @@ async function handleButtonInteraction(interaction: ButtonInteraction, assistant
           prompt: `${approved ? 'approve' : 'reject'} ${targetId}`,
           transport: buildButtonHarnessTransport(interaction),
         });
+        // v0.5.21.2 — if the harness handled the interaction, its
+        // transport already consumed the deferUpdate/reply. We can no
+        // longer call interaction.update here (it'd throw "interaction
+        // already acknowledged"). The harness path will be card-aware
+        // in a follow-up; for now the buttons stay live on harness
+        // approvals but the explicit text reply tells the user it
+        // worked.
         if (handled) return;
       }
       const text = await resolveApprovalOrQueueBackgroundContinuation(assistant, targetId, approved);
-      await interaction.reply({
-        content: text,
-        ephemeral: true,
-      });
+      // v0.5.21.2 — collapse the card so it can't be re-clicked into a
+      // stale state. The full result text goes as an ephemeral followUp
+      // so the clicker still sees runtime details (queued continuation
+      // id, etc.) without polluting the channel.
+      const headline = text.split('\n')[0]?.slice(0, 200) ?? (approved ? 'approved' : 'rejected');
+      await collapseApprovalCard(interaction, approved ? 'approved' : 'rejected', headline);
+      const remainder = text.split('\n').slice(1).join('\n').trim();
+      if (remainder) {
+        try {
+          await interaction.followUp({ content: remainder.slice(0, 1900), ephemeral: true });
+        } catch {
+          // followUp can fail if the interaction window expired; the
+          // primary update() already gave the user feedback.
+        }
+      }
       return;
     }
 

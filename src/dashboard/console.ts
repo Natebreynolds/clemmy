@@ -8785,8 +8785,41 @@ const CONSOLE_JS = `
     return path + sep + 'token=' + encodeURIComponent(TOKEN);
   }
 
+  async function reconnectToSupervisorDaemonIfNeeded() {
+    const api = window.clemmy;
+    if (!api || typeof api.supervisorStatus !== 'function') return false;
+    let status = null;
+    try {
+      status = await api.supervisorStatus();
+    } catch (_) {
+      return false;
+    }
+    if (!status || !status.running || !status.url) return false;
+    let target = null;
+    try {
+      target = new URL(status.url, window.location.href);
+    } catch (_) {
+      return false;
+    }
+    if (target.origin === window.location.origin) return false;
+    window.location.assign(target.href);
+    return true;
+  }
+
+  async function fetchWithToken(path, init) {
+    try {
+      return await fetch(withToken(path), init);
+    } catch (err) {
+      const reconnecting = await reconnectToSupervisorDaemonIfNeeded();
+      if (reconnecting) {
+        throw new Error('Reconnected to the live daemon. Send that message again.');
+      }
+      throw err;
+    }
+  }
+
   async function fetchJSON(path) {
-    const r = await fetch(withToken(path), { headers: { Accept: 'application/json' } });
+    const r = await fetchWithToken(path, { headers: { Accept: 'application/json' } });
     if (!r.ok) throw new Error('HTTP ' + r.status);
     return r.json();
   }
@@ -14667,12 +14700,12 @@ const CONSOLE_JS = `
     homeChatHistory.push({ role: 'user', text });
     const assistantTurn = appendChatTurn('assistant', '');
     assistantTurn && assistantTurn.classList.add('pending');
-    setChatTurnStatus(assistantTurn, 'starting harness run');
+    setChatTurnStatus(assistantTurn, 'Clem is starting up...');
 
     const thinkTimer = startThinkingButton(send);
 
     try {
-      const r = await fetch(withToken('/api/harness/chat'), {
+      const r = await fetchWithToken('/api/harness/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ input: text, sessionId: __harnessSessionId }),
@@ -14971,8 +15004,8 @@ const CONSOLE_JS = `
         return;
       }
       case 'guardrail_tripped': {
-        const name = (ev.data && ev.data.name) || 'guardrail';
-        setChatTurnStatus(turn, '⚠ ' + name);
+        // Internal safety telemetry; keep the user-facing turn status
+        // on the actual work instead of surfacing SDK jargon.
         return;
       }
     }
@@ -15045,7 +15078,7 @@ const CONSOLE_JS = `
     setChatTurnStatus(turn, (decision === 'approve' ? 'approved' : 'rejected') + ' · continuing…');
     try {
       const input = decision + (approvalId ? ' ' + approvalId : '');
-      const r = await fetch(withToken('/api/harness/chat'), {
+      const r = await fetchWithToken('/api/harness/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ input, sessionId }),
@@ -15118,7 +15151,7 @@ const CONSOLE_JS = `
     let finalText = '';
     let pendingApprovalId = null;
     try {
-      const r = await fetch(withToken('/api/console/home/chat/stream'), {
+      const r = await fetchWithToken('/api/console/home/chat/stream', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ message: text, history: homeChatHistory.slice(-10) }),
       });

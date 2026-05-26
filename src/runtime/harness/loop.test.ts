@@ -41,11 +41,11 @@ process.env.HARNESS_MAX_STALL_RETRIES = '1';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import type { AgentInputItem, Runner } from '@openai/agents';
+import { Agent, RunContext, RunState, type AgentInputItem, type Runner } from '@openai/agents';
 
 const { resetEventLog, requestKill, listEvents, createSession } = await import('./eventlog.js');
 const { HarnessSession } = await import('./session.js');
-const { runTurn, runConversation } = await import('./loop.js');
+const { runTurn, runConversation, resumePendingApproval } = await import('./loop.js');
 type RunRunnerFn = import('./loop.js').RunRunnerFn;
 const { ToolCallsLimitExceeded } = await import('./brackets.js');
 const { listEvents: listEventsForConv } = await import('./eventlog.js');
@@ -70,6 +70,28 @@ function makeRunnerStub(): Runner {
 // the runRunner sees the agent.
 function makeAgentStub(): import('@openai/agents').Agent<any, any> {
   return {} as import('@openai/agents').Agent<any, any>;
+}
+
+function makeApprovalRunState(agent: import('@openai/agents').Agent<any, any>, toolName: string): string {
+  const state = new RunState(new RunContext({}), 'approve this', agent, null);
+  const json = state.toJSON() as Record<string, unknown>;
+  json.currentStep = {
+    type: 'next_step_interruption',
+    data: {
+      interruptions: [
+        {
+          rawItem: {
+            type: 'function_call',
+            name: toolName,
+            callId: `${toolName}_call`,
+            arguments: '{}',
+          },
+          toolName,
+        },
+      ],
+    },
+  };
+  return JSON.stringify(json);
 }
 
 test('completed chat run snapshots conversation, emits run_completed, leaves session active', async () => {
@@ -437,6 +459,60 @@ test('interruption registers Discord channel id for approval routing', async () 
   assert.equal(rows.length, 1);
   assert.equal(rows[0].channel, 'discord');
   assert.equal(rows[0].channelId, 'discord-channel-123');
+});
+
+test('resume resolves the approval rows present before the resumed run requests a new approval', async () => {
+  resetEventLog();
+  const agent = new Agent({ name: 'ResumeTest', instructions: 'test' });
+  const sess = HarnessSession.create({ kind: 'chat', title: 'resume-approval' });
+  sess.saveInterruptState(makeApprovalRunState(agent, 'old_tool'));
+  const oldApproval = approvalRegistry.register({
+    sessionId: sess.id,
+    subject: 'old pending approval',
+    tool: 'old_tool',
+  });
+
+  const runRunner: RunRunnerFn = async () => ({
+    history: [],
+    lastResponseId: undefined,
+    finalOutput: undefined,
+    hasInterruptions: true,
+    serializedState: makeApprovalRunState(agent, 'new_tool'),
+    interruptions: [
+      {
+        toolName: 'new_tool',
+        rawArgs: '{"subject":"new pending approval"}',
+        args: { subject: 'new pending approval' },
+      },
+    ],
+  });
+
+  const result = await resumePendingApproval({
+    agent,
+    sessionId: sess.id,
+    decision: 'approve',
+    resolver: 'unit-test',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(result.status, 'awaiting_approval');
+  const allRows = approvalRegistry.listPending({ sessionId: sess.id, status: 'any' });
+  const resolvedOld = allRows.find((row) => row.approvalId === oldApproval.approvalId);
+  assert.equal(resolvedOld?.status, 'resolved');
+  assert.equal(resolvedOld?.resolution, 'approved');
+  assert.equal(resolvedOld?.resolver, 'unit-test');
+
+  const pendingRows = approvalRegistry.listPending({ sessionId: sess.id, status: 'pending' });
+  assert.equal(pendingRows.length, 1);
+  assert.equal(pendingRows[0].tool, 'new_tool');
+  assert.equal(pendingRows[0].subject, 'new_tool: new pending approval');
+
+  const approvalEvents = listEvents(sess.id, { types: ['approval_resolved', 'approval_requested'] });
+  assert.deepEqual(approvalEvents.map((event) => event.type), [
+    'approval_resolved',
+    'approval_requested',
+  ]);
 });
 
 test('interruption with no rich args falls back to the tool name as subject', async () => {

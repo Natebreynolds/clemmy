@@ -66,50 +66,15 @@ function resultToText(result: unknown): string {
   }
 }
 
-function withDescription(source: z.ZodTypeAny, target: z.ZodTypeAny): z.ZodTypeAny {
-  return source.description ? target.describe(source.description) : target;
-}
-
-function normalizeZodForResponses(schema: z.ZodTypeAny): z.ZodTypeAny {
-  const def = (schema as any)._def as { typeName?: string; [key: string]: unknown };
-
-  switch (def.typeName) {
-    case 'ZodOptional':
-      return withDescription(schema, normalizeZodForResponses(def.innerType as z.ZodTypeAny).nullable());
-    case 'ZodNullable':
-      return withDescription(schema, normalizeZodForResponses(def.innerType as z.ZodTypeAny).nullable());
-    case 'ZodObject': {
-      const shape = typeof (schema as any).shape === 'function' ? (schema as any).shape() : (schema as any).shape;
-      const normalizedShape = Object.fromEntries(
-        Object.entries(shape as z.ZodRawShape).map(([key, value]) => [key, normalizeZodForResponses(value)]),
-      );
-      return withDescription(schema, z.object(normalizedShape));
-    }
-    case 'ZodArray':
-      return withDescription(schema, z.array(normalizeZodForResponses(def.type as z.ZodTypeAny)));
-    case 'ZodRecord': {
-      const valueType = def.valueType ? normalizeZodForResponses(def.valueType as z.ZodTypeAny) : z.string();
-      return withDescription(schema, z.record(z.string(), valueType));
-    }
-    case 'ZodAny':
-    case 'ZodUnknown':
-      return withDescription(schema, z.string());
-    case 'ZodUnion': {
-      const options = Array.isArray(def.options) ? def.options.map((item) => normalizeZodForResponses(item as z.ZodTypeAny)) : [];
-      if (options.length === 0) return withDescription(schema, z.string());
-      if (options.length === 1) return withDescription(schema, options[0]);
-      return withDescription(schema, z.union(options as [z.ZodTypeAny, z.ZodTypeAny, ...z.ZodTypeAny[]]));
-    }
-    default:
-      return schema;
-  }
-}
-
-function normalizeShapeForResponses(shape: z.ZodRawShape): z.ZodRawShape {
-  return Object.fromEntries(
-    Object.entries(shape).map(([key, value]) => [key, normalizeZodForResponses(value)]),
-  );
-}
+// v0.5.22 — moved the body of this normalizer to
+// `src/runtime/schema-normalizer.ts` so agent outputType schemas can
+// share the same transformation. The helpers below are thin re-exports
+// to keep the existing call sites in this file compiling unchanged.
+import {
+  normalizeZodForCodexStrict as normalizeZodForResponses,
+  normalizeShapeForCodexStrict as normalizeShapeForResponses,
+} from '../runtime/schema-normalizer.js';
+export { normalizeZodForResponses, normalizeShapeForResponses };
 
 /**
  * Per-call destructive-hint override for the handful of local tools

@@ -3,7 +3,7 @@
  *
  * Static contracts the Orchestrator must keep — no Runner invocation
  * (that needs OpenAI credentials). We verify the structural promises:
- *   - Orchestrator constructs with the right name and output schema
+ *   - Clem constructs with the right name and output schema
  *   - It exposes ONLY deliberation/discovery tools (zero action tools)
  *   - Handoffs include the five sub-agents
  *   - inputGuardrails + outputGuardrails are wired to the harness
@@ -25,6 +25,7 @@ import assert from 'node:assert/strict';
 import { z } from 'zod';
 
 const { resetEventLog, createSession, listEvents } = await import('../runtime/harness/eventlog.js');
+const { getPlanScope } = await import('./plan-scope.js');
 const {
   buildOrchestratorAgent,
   OrchestratorDecisionSchema,
@@ -73,11 +74,18 @@ test('OrchestratorDecisionSchema rejects unknown nextAction values', () => {
   );
 });
 
-test('Orchestrator is named "Orchestrator" with structured outputType', async () => {
+test('Orchestrator builds the Clem single-agent with structured outputType', async () => {
   const agent = await buildOrchestratorAgent();
-  assert.equal(agent.name, 'Orchestrator');
-  // The outputType wires through; we recognize the schema reference.
-  assert.equal(agent.outputType, OrchestratorDecisionSchema);
+  assert.equal(agent.name, 'Clem');
+  assert.ok(agent.outputType, 'expected structured outputType to be set');
+  const parsed = (agent.outputType as z.ZodTypeAny).safeParse({
+    summary: 'verified the structured output schema',
+    reply: null,
+    done: false,
+    nextAction: 'awaiting_user_input',
+    reason: null,
+  });
+  assert.equal(parsed.success, true);
 });
 
 test('Orchestrator carries the harness guardrails', async () => {
@@ -227,6 +235,7 @@ test('request_approval execute carries auto-approval reason when the action was 
       subject: 'Save Salesforce CLI rule to memory',
       reason: 'User preference',
       destructive: false,
+      preview: null,
     },
     { sessionId: sess.id, turn: 1 },
   );
@@ -263,13 +272,42 @@ test('request_approval execute returns an "approved" acknowledgement after resum
   const t = buildRequestApprovalTool();
   const result = await invokeFunctionTool(
     t,
-    { subject: 'deploy to prod', reason: 'staging green', destructive: true },
+    { subject: 'deploy to prod', reason: 'staging green', destructive: true, preview: null },
     { sessionId: sess.id, turn: 3 },
   );
   assert.match(result, /Approved: deploy to prod/);
   // No approval_requested event from execute — the loop owns that.
   const events = listEvents(sess.id, { types: ['approval_requested'] });
   assert.equal(events.length, 0);
+});
+
+test('request_approval execute opens a slug-scoped plan scope for Outlook draft batches', async () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const t = buildRequestApprovalTool();
+  const result = await invokeFunctionTool(
+    t,
+    {
+      subject: 'Create 15 personalized Outlook drafts',
+      reason: 'Write draft emails into Outlook for review, without sending.',
+      destructive: false,
+      preview: {
+        count: 15,
+        samples: [
+          {
+            label: 'Draft',
+            value: 'Scorpion has been the best choice for us.',
+            secondary: 'To: Pat Dunphy <pdunphy@example.com>',
+          },
+        ],
+      },
+    },
+    { sessionId: sess.id, turn: 4 },
+  );
+  assert.match(result, /Approved scope opened for OUTLOOK_CREATE_DRAFT/);
+  const scope = getPlanScope(sess.id);
+  assert.deepEqual(scope?.allowedTools, ['composio_execute_tool']);
+  assert.deepEqual(scope?.allowedComposioSlugs, ['OUTLOOK_CREATE_DRAFT']);
 });
 
 test('ask_user_question emits awaiting_user_input with options', async () => {

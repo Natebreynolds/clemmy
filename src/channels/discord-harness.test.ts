@@ -137,6 +137,35 @@ test('approval_requested falls back to tool name when no subject', () => {
   assert.ok(s.summary.startsWith('Approval required: cx_zendesk_create_ticket'));
 });
 
+test('approval buttons render for a single pending approval', () => {
+  const s = freshState();
+  applyEventToState(event('approval_requested', { subject: 'create draft', tool: 'request_approval', approvalId: 'apr-1111' }), s);
+  const rows = __test__.approvalComponentsForState(s) as Array<{ components: Array<{ label: string; custom_id: string }> }>;
+  assert.equal(rows[0].components[0].label, 'Approve');
+  assert.equal(rows[0].components[0].custom_id, 'clementine:approve:apr-1111');
+  assert.equal(rows[0].components[1].label, 'Edit');
+  assert.equal(rows[0].components[2].label, 'Reject');
+});
+
+test('approval buttons collapse sibling approvals into one batch action', () => {
+  const s = freshState();
+  applyEventToState(event('approval_requested', { subject: 'draft one', tool: 'composio_execute_tool', approvalId: 'apr-1111' }), s);
+  applyEventToState(event('approval_requested', { subject: 'draft two', tool: 'composio_execute_tool', approvalId: 'apr-2222' }), s);
+  const rows = __test__.approvalComponentsForState(s) as Array<{ components: Array<{ label: string; custom_id: string }> }>;
+  assert.equal(rows[0].components.length, 2);
+  assert.equal(rows[0].components[0].label, 'Approve all 2');
+  assert.equal(rows[0].components[0].custom_id, 'clementine:approve:apr-1111');
+  assert.equal(rows[0].components[1].label, 'Reject all 2');
+});
+
+test('guardrail_tripped stays internal and does not overwrite Discord status', () => {
+  const s = { summary: 'Approval required: create sheet', status: 'approval required', done: true, toolsCalled: [], toolCount: 0 };
+  applyEventToState(event('guardrail_tripped', { name: 'guardrail' }), s);
+  assert.equal(s.summary, 'Approval required: create sheet');
+  assert.equal(s.status, 'approval required');
+  assert.equal(s.done, true);
+});
+
 test('awaiting_user_input promotes the question to the summary and marks done', () => {
   const s = freshState();
   applyEventToState(event('awaiting_user_input', { question: 'which environment?' }), s);

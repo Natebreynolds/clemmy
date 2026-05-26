@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { MODELS } from '../config.js';
 import { getCoreTools } from '../tools/registry.js';
 import type { RuntimeContextValue } from '../types.js';
+import { normalizeZodForCodexStrict } from '../runtime/schema-normalizer.js';
 
 /**
  * Planner sub-agent — the deliberate planning step the orchestrator
@@ -110,7 +111,8 @@ export function buildPlannerAgent(): Agent<RuntimeContextValue, typeof PlanSchem
       'Return one plan. The orchestrator decides what happens next.',
     ].join('\n\n'),
     model: MODELS.fast,
-    outputType: PlanSchema,
+    // v0.5.22 — Codex-strict-compatible via centralized normalizer.
+    outputType: normalizeZodForCodexStrict(PlanSchema) as typeof PlanSchema,
     tools,
   });
 }

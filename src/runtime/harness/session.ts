@@ -195,11 +195,12 @@ export class HarnessSession {
     return typeof raw === 'string' ? raw : null;
   }
 
-  clearInterruptState(): void {
+  clearInterruptState(options: { emitEvent?: boolean } = {}): void {
     if (!(META_INTERRUPT in this.row.metadata)) return;
     const meta = { ...this.row.metadata };
     delete meta[META_INTERRUPT];
     this.row = updateSession(this.row.id, { metadata: meta });
+    if (options.emitEvent === false) return;
     appendEvent({
       sessionId: this.row.id,
       turn: 0,

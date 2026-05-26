@@ -88,6 +88,13 @@ test('isMutatingExternalWrite: FIRECRAWL_SCRAPE is exempt (external read, not mu
   );
 });
 
+test('isMutatingExternalWrite: FIRECRAWL_BATCH_SCRAPE is exempt (provider-side read job)', () => {
+  assert.equal(
+    isMutatingExternalWrite('composio_execute_tool', { tool_slug: 'FIRECRAWL_BATCH_SCRAPE' }),
+    false,
+  );
+});
+
 // ─── isMutatingExternalWrite — exempt tool names ──────────────
 
 test('isMutatingExternalWrite: execution_create is exempt (this is HOW Clem satisfies the gate)', () => {

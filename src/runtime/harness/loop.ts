@@ -212,6 +212,26 @@ function registerAndEmitApprovals(
   return approvalIds;
 }
 
+function resolveSnapshotApprovalsForResume(
+  rows: approvalRegistry.PendingApprovalRow[],
+  decision: 'approve' | 'reject' | 'approve_with_edits',
+  resolver: string,
+): void {
+  const resolution: approvalRegistry.ApprovalResolution =
+    decision === 'reject' ? 'rejected' : 'approved';
+  for (const row of rows) {
+    try {
+      approvalRegistry.resolve(row.approvalId, resolution, resolver);
+    } catch (err) {
+      console.error('[harness] approval-registry.resolve failed during resume', {
+        approvalId: row.approvalId,
+        sessionId: row.sessionId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+}
+
 /**
  * The harness loop — `runTurn(options)`.
  *
@@ -1478,6 +1498,15 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     context: { sessionId: options.sessionId, turn },
     maxTurns: options.maxTurns ?? maxTurnsForRole('orchestrator'),
     callModelInputFilter: retryContextInputFilter,
+    // v0.5.22 SDK 0.11.5 — cap parallel function-tool execution at 8.
+    // Documented production incident pre-v0.5.20: the model emitted 50
+    // parallel firecrawl_search calls and the resulting tool-result
+    // payload (1MB+) crashed Codex SSE. With this cap the SDK paces
+    // the same N tool calls in batches of 8 — same final result count
+    // but fewer simultaneous network calls, lower peak memory, and
+    // friendlier on external API rate limits. Does NOT change
+    // provider-side parallelToolCalls (model still decides to parallelize).
+    toolExecution: { maxFunctionToolConcurrency: 8 },
   };
   // DO NOT pass previousResponseId to the SDK when using the codex
   // backend. The SDK uses this flag to opt into a ServerConversationTracker
@@ -1612,6 +1641,14 @@ export interface ResumePendingApprovalOptions {
    * agent, which will recover.
    */
   modifiedArgs?: string;
+  /**
+   * Audit source recorded when the durable approval row is resolved.
+   * Callers pass the surface that accepted the approval; the harness
+   * resolves the pre-resume row before continuing the SDK run so a
+   * second approval requested by that run does not inherit the old
+   * decision.
+   */
+  resolver?: string;
   maxTurns?: number;
   toolCallsPerTurn?: number;
   /** Test injection. */
@@ -1692,6 +1729,10 @@ export async function resumePendingApproval(
     reject(i: unknown, opts?: { alwaysReject?: boolean }): void;
   };
   const pending: unknown[] = stateApi.getInterruptions() ?? [];
+  const approvalRowsAtResume = pending.length > 0
+    ? approvalRegistry.listPending({ sessionId: options.sessionId, status: 'pending' })
+    : [];
+  const resolvedApprovals: Array<{ tool: string; }> = [];
   for (const item of pending) {
     if (options.decision === 'approve' || options.decision === 'approve_with_edits') {
       // EDIT-AND-APPROVE: when the user supplied modifiedArgs (e.g.
@@ -1748,6 +1789,16 @@ export async function resumePendingApproval(
       stateApi.reject(item, { alwaysReject: true });
     }
     const raw = (item as { rawItem?: { name?: string } } | null)?.rawItem;
+    resolvedApprovals.push({ tool: raw?.name ?? 'unknown' });
+  }
+  if (approvalRowsAtResume.length > 0) {
+    resolveSnapshotApprovalsForResume(
+      approvalRowsAtResume,
+      options.decision,
+      options.resolver ?? 'harness-resume',
+    );
+  }
+  for (const resolvedApproval of resolvedApprovals) {
     safeAppend({
       sessionId: options.sessionId,
       turn,
@@ -1755,7 +1806,7 @@ export async function resumePendingApproval(
       type: 'approval_resolved',
       data: {
         decision: options.decision,
-        tool: raw?.name ?? 'unknown',
+        tool: resolvedApproval.tool,
         sticky: options.decision !== 'approve_with_edits',
         edited: options.decision === 'approve_with_edits',
       },
@@ -1768,7 +1819,7 @@ export async function resumePendingApproval(
     type: 'run_resumed',
     data: { pending: pending.length, decision: options.decision },
   });
-  session.clearInterruptState();
+  session.clearInterruptState({ emitEvent: false });
 
   const toolCounter = new ToolCallsCounter(
     options.toolCallsPerTurn ?? defaultToolCallsPerTurn(),
@@ -1803,6 +1854,10 @@ export async function resumePendingApproval(
   const opts: Record<string, unknown> = {
     context: { sessionId: options.sessionId, turn },
     maxTurns: options.maxTurns ?? maxTurnsForRole('orchestrator'),
+    // Match runTurn(): SDK 0.11.5 can execute many function tools in
+    // parallel. Keep resumed approval runs on the same bounded local
+    // concurrency path so a resumed batch cannot spike tool payloads.
+    toolExecution: { maxFunctionToolConcurrency: 8 },
   };
 
   try {
@@ -1928,6 +1983,7 @@ export async function runConversationFromResume(opts: {
   decision: 'approve' | 'reject' | 'approve_with_edits';
   /** Required when decision === 'approve_with_edits'. JSON-encoded args. */
   modifiedArgs?: string;
+  resolver?: string;
   maxSteps?: number;
   maxWallClockMs?: number;
   maxTurns?: number;
@@ -1945,6 +2001,7 @@ async function runConversationFromResumeCore(opts: {
   sessionId: string;
   decision: 'approve' | 'reject' | 'approve_with_edits';
   modifiedArgs?: string;
+  resolver?: string;
   maxSteps?: number;
   maxWallClockMs?: number;
   maxTurns?: number;
@@ -1973,6 +2030,7 @@ async function runConversationFromResumeCore(opts: {
     sessionId: opts.sessionId,
     decision: opts.decision,
     modifiedArgs: opts.modifiedArgs,
+    resolver: opts.resolver,
     maxTurns,
     toolCallsPerTurn,
     makeRunner: opts.makeRunner,

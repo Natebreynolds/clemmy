@@ -65,7 +65,7 @@ export const summarySubstanceGuardrail: OutputGuardrail<Schema> = {
         outputInfo: `Summary is empty or placeholder-shaped ("${decision.summary.slice(0, 60)}"). Be specific about what you actually did or chose not to do.`,
       };
     }
-    return { tripwireTriggered: false, outputInfo: undefined };
+    return { tripwireTriggered: false, outputInfo: null };
   },
 };
 
@@ -92,7 +92,7 @@ export const commitmentRealismGuardrail: OutputGuardrail<Schema> = {
         outputInfo: `Too many commitments (${decision.commitments.length}). Pick the most important 1–3. Overcommitting on a cycle dilutes follow-through.`,
       };
     }
-    return { tripwireTriggered: false, outputInfo: undefined };
+    return { tripwireTriggered: false, outputInfo: null };
   },
 };
 
@@ -109,7 +109,7 @@ export const followUpRealismGuardrail: OutputGuardrail<Schema> = {
     const decision = agentOutput as AgentDecision;
     if (decision.followUpMinutes === undefined) {
       // Omitting is fine — cadence applies.
-      return { tripwireTriggered: false, outputInfo: undefined };
+      return { tripwireTriggered: false, outputInfo: null };
     }
     if (decision.followUpMinutes < 5) {
       return {
@@ -117,7 +117,7 @@ export const followUpRealismGuardrail: OutputGuardrail<Schema> = {
         outputInfo: `followUpMinutes ${decision.followUpMinutes} is below the floor of 5. Either omit it or pick a real interval.`,
       };
     }
-    return { tripwireTriggered: false, outputInfo: undefined };
+    return { tripwireTriggered: false, outputInfo: null };
   },
 };
 

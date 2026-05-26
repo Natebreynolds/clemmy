@@ -63,8 +63,10 @@ const MUTATING_VERBS: ReadonlySet<string> = new Set([
 const EXEMPT_COMPOSIO_SLUG_PATTERNS: RegExp[] = [
   // DataForSEO uses CREATE/POST for queueing scans, not for user data writes.
   /^DATAFORSEO_/,
-  // Firecrawl SCRAPE / MAP are reads from external URLs, not writes.
-  /^FIRECRAWL_(SCRAPE|MAP)/,
+  // Firecrawl search/scrape/map/crawl are reads from external URLs,
+  // not writes to the user's data. BATCH_SCRAPE still only creates a
+  // provider-side read job.
+  /^FIRECRAWL_(BATCH_)?(SCRAPE|MAP|SEARCH|CRAWL)/,
 ];
 
 /**

@@ -96,6 +96,24 @@ FILES=(
   # v0.5.22 — tool_outputs reaper (14-day TTL)
   "runtime/harness/eventlog.js"
   "memory/maintenance.js"
+  # v0.5.21.2 — Discord UX patch:
+  #   plan-proposals.js — render ALL plan steps (drop slice(0,4))
+  #   discord.js       — collapse approval card on click (stale + happy paths)
+  "agents/plan-proposals.js"
+  "channels/discord.js"
+  # SDK 0.11.5 + zod 4 migration
+  "runtime/schema-normalizer.js"
+  "tools/local-runtime-tools.js"
+  "tools/dynamic-tools.js"
+  "tools/mcp-server.js"
+  "memory/reflection.js"
+  "agents/orchestrator.js"
+  "agents/planner.js"
+  "agents/autonomy-v2.js"
+  "agents/autonomy-guardrails.js"
+  "runtime/harness/guardrails.js"
+  "runtime/harness/loop.js"
+  "runtime/harness/codex-model.js"
 )
 
 # Sanity-check every source file exists in the local dist BEFORE we
@@ -141,11 +159,13 @@ done
 # version field). This catches the case where the repo was upgraded
 # (npm install --save @openai/agents@new) but the installed
 # /Applications/Clementine.app still bundles the old version under
-# Contents/Resources/daemon/node_modules.
+# Contents/Resources/daemon/node_modules. SDK 0.11.5 also needs zod 4
+# synced with the built dist; a zod-4-built daemon on zod 3 crashes
+# during agents-core schema handling.
 INSTALLED_NM="$(dirname "$INSTALLED_DIST")/node_modules"
 echo
-echo "→ Checking @openai/agents* package sync"
-for pkg in @openai/agents @openai/agents-core @openai/agents-openai @openai/agents-realtime; do
+echo "→ Checking @openai/agents* + zod package sync"
+for pkg in @openai/agents @openai/agents-core @openai/agents-openai @openai/agents-realtime zod; do
   local_pkg="$REPO_ROOT/node_modules/$pkg"
   installed_pkg="$INSTALLED_NM/$pkg"
   if [[ ! -d "$local_pkg" ]]; then continue; fi

@@ -105,7 +105,7 @@ export const policyViolationGuardrail: InputGuardrail = {
       };
     }
 
-    return { tripwireTriggered: false, outputInfo: undefined };
+    return { tripwireTriggered: false, outputInfo: null };
   },
 };
 
@@ -125,10 +125,10 @@ export const missingCapabilityGuardrail: InputGuardrail = {
   name: 'missing_capability',
   execute: async ({ input }) => {
     const text = extractInputText(input);
-    if (!text.trim()) return { tripwireTriggered: false, outputInfo: undefined };
+    if (!text.trim()) return { tripwireTriggered: false, outputInfo: null };
 
     const known = listKnownCapabilities().map((c) => c.name);
-    if (known.length === 0) return { tripwireTriggered: false, outputInfo: undefined };
+    if (known.length === 0) return { tripwireTriggered: false, outputInfo: null };
 
     const pattern = new RegExp(`\\b(${known.map(escapeRegex).join('|')})\\b`, 'g');
     const mentions = new Set<string>();
@@ -136,7 +136,7 @@ export const missingCapabilityGuardrail: InputGuardrail = {
       mentions.add(match[1]);
     }
     if (mentions.size === 0) {
-      return { tripwireTriggered: false, outputInfo: undefined };
+      return { tripwireTriggered: false, outputInfo: null };
     }
 
     const checks = await Promise.all(
@@ -144,7 +144,7 @@ export const missingCapabilityGuardrail: InputGuardrail = {
     );
     const missing = checks.filter((c) => !c.result.available);
     if (missing.length === 0) {
-      return { tripwireTriggered: false, outputInfo: undefined };
+      return { tripwireTriggered: false, outputInfo: null };
     }
 
     return {
@@ -218,7 +218,7 @@ export const secretLeakGuardrail: OutputGuardrail = {
     const text = stringifyOutput(agentOutput);
     const matches = scanSecrets(text);
     if (matches.length === 0) {
-      return { tripwireTriggered: false, outputInfo: undefined };
+      return { tripwireTriggered: false, outputInfo: null };
     }
     return {
       tripwireTriggered: true,

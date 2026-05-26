@@ -116,6 +116,24 @@ test('isAutoApprovedByScope: false for tool NOT in allowedTools', () => {
   assert.equal(isAutoApprovedByScope('sess-narrow', 'write_file'), false);
 });
 
+test('isAutoApprovedByScope: allowedComposioSlugs narrows generic broker approvals', () => {
+  openPlanScope({
+    sessionId: 'sess-composio-slug',
+    planProposalId: 'plan-slug',
+    approvedPlanObjective: 'create outlook drafts',
+    allowedTools: ['composio_execute_tool'],
+    allowedComposioSlugs: ['OUTLOOK_CREATE_DRAFT'],
+  });
+  assert.equal(
+    isAutoApprovedByScope('sess-composio-slug', 'composio_execute_tool', { tool_slug: 'OUTLOOK_CREATE_DRAFT' }),
+    true,
+  );
+  assert.equal(
+    isAutoApprovedByScope('sess-composio-slug', 'composio_execute_tool', { tool_slug: 'OUTLOOK_SEND_EMAIL' }),
+    false,
+  );
+});
+
 test('isAutoApprovedByScope: wildcard and prefix wildcards cover matching tools', () => {
   openPlanScope({
     sessionId: 'sess-wide',

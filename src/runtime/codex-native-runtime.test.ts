@@ -15,6 +15,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createCodexToolDefinitions, expandParallelHallucination, type CodexFunctionCall } from './codex-native-runtime.js';
+import { invalidateConfiguredMcpServers } from './mcp-servers.js';
+
+test.after(async () => {
+  await invalidateConfiguredMcpServers();
+});
 
 test('expander: pass-through when no synthetic call is present', () => {
   const input: CodexFunctionCall[] = [

@@ -35,7 +35,10 @@ export function registerDynamicTools(server: McpServer): void {
     server.tool(
       toolName,
       description,
-      { args: z.string().optional().describe(argsDescription) },
+      // v0.5.22 — .nullable() instead of .optional(); Codex strict mode
+      // requires every property in `required` (optional fields must be
+      // nullable so the field is present with possibly-null value).
+      { args: z.string().nullable().describe(argsDescription) },
       async ({ args }) => {
         try {
           let command = filePath;

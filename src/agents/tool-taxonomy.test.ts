@@ -82,6 +82,7 @@ test('classifyTool: local-side-effect tools never gate on approval', () => {
   assert.equal(classifyTool('draft_plan'), 'read');
   assert.equal(classifyTool('surface_plan'), 'read');
   assert.equal(classifyTool('propose_check_in_template'), 'read');
+  assert.equal(classifyTool('execution_create'), 'read');
 });
 
 test('classifyTool: write prefixes', () => {
@@ -104,6 +105,10 @@ test('classifyTool: send (network mutation) prefixes', () => {
 test('classifyTool: composio_execute_tool routes through tool_slug', () => {
   assert.equal(
     classifyTool('composio_execute_tool', { args: { tool_slug: 'GOOGLESHEETS_BATCH_GET' } }),
+    'read',
+  );
+  assert.equal(
+    classifyTool('composio_execute_tool', { args: { tool_slug: 'FIRECRAWL_BATCH_SCRAPE' } }),
     'read',
   );
   assert.equal(

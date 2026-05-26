@@ -2,6 +2,7 @@ import { Agent, Runner } from '@openai/agents';
 import { z } from 'zod';
 import pino from 'pino';
 import { MODELS } from '../config.js';
+import { normalizeZodForCodexStrict } from '../runtime/schema-normalizer.js';
 import { openMemoryDb, type ConsolidatedFactKind, type ConsolidatedFactRow, type EntityType, type EntityRow, type EpisodicPointerRow } from './db.js';
 import {
   rememberFact,
@@ -181,6 +182,15 @@ export function _testOnly_peekSessionImportance(sessionId: string): number {
 export function _testOnly_resetAllSessionImportance(): void {
   SESSION_IMPORTANCE.clear();
 }
+/**
+ * Pure handle on the extractor for smoke testing. Bypasses the public
+ * reflectOnToolReturn entry (which also touches the memory DB) so a
+ * smoke test can hammer real Codex N times without polluting state.
+ * Returns `null` when the extractor fails (thrown OR invalid-shape).
+ */
+export async function _testOnly_runExtractor(serialized: string): Promise<Extraction | null> {
+  return runExtractor(serialized);
+}
 
 /**
  * Per-process de-dup so the same (session_id, call_id) doesn't get
@@ -206,26 +216,22 @@ function markReflected(key: string): void {
 async function runExtractor(serialized: string): Promise<Extraction | null> {
   const model = getReflectorModel();
   try {
-    const agent = new Agent({
+    // v0.5.22.1 — outputType binds ExtractionSchema to the SDK's structured-
+    // output path, so OpenAI's grammar-constrained sampling guarantees a
+    // schema-conforming response (no more "reflection extractor returned
+    // invalid shape" warnings). normalizeZodForCodexStrict rewrites
+    // .optional() → .nullable() so Codex's strict-mode validator accepts.
+    const agent = new Agent<unknown, typeof ExtractionSchema>({
       name: 'Reflection Extractor',
       model,
       instructions: PROMPT_PREAMBLE,
+      outputType: normalizeZodForCodexStrict(ExtractionSchema) as typeof ExtractionSchema,
     });
     const runner = new Runner({ workflowName: 'clementine-reflection' });
     const result = await runner.run(agent, serialized);
-    const text = typeof (result as { finalOutput?: unknown }).finalOutput === 'string'
-      ? (result as { finalOutput: string }).finalOutput
-      : String((result as { finalOutput?: unknown }).finalOutput ?? '');
-    if (!text || !text.trim()) return null;
-    // Strip optional fenced output defensively.
-    const cleaned = text.replace(/^```(?:json)?\s*/, '').replace(/\s*```\s*$/, '').trim();
-    const parsed = JSON.parse(cleaned);
-    const validated = ExtractionSchema.safeParse(parsed);
-    if (!validated.success) {
-      logger.warn({ issues: validated.error.issues.slice(0, 3) }, 'reflection extractor returned invalid shape');
-      return null;
-    }
-    return validated.data;
+    const final = (result as { finalOutput?: unknown }).finalOutput;
+    if (!final || typeof final !== 'object') return null;
+    return final as Extraction;
   } catch (err) {
     logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'reflection extractor failed');
     return null;
@@ -272,10 +278,11 @@ async function resolveConflict(
   if (similar.length === 0) return { decision: 'ADD' };
   const model = getReflectorModel();
   try {
-    const agent = new Agent({
+    const agent = new Agent<unknown, typeof ConflictDecisionSchema>({
       name: 'Memory Conflict Resolver',
       model,
       instructions: CONFLICT_PROMPT,
+      outputType: normalizeZodForCodexStrict(ConflictDecisionSchema) as typeof ConflictDecisionSchema,
     });
     const runner = new Runner({ workflowName: 'clementine-conflict-resolver' });
     const prompt = [
@@ -285,14 +292,9 @@ async function resolveConflict(
       ...similar.map((f) => `  [id=${f.id}, kind=${f.kind}, trust=${f.trustLevel ?? '?'}, importance=${f.importance ?? '?'}] "${f.content}"`),
     ].join('\n');
     const result = await runner.run(agent, prompt);
-    const text = typeof (result as { finalOutput?: unknown }).finalOutput === 'string'
-      ? (result as { finalOutput: string }).finalOutput
-      : String((result as { finalOutput?: unknown }).finalOutput ?? '');
-    if (!text || !text.trim()) return { decision: 'ADD' };
-    const cleaned = text.replace(/^```(?:json)?\s*/, '').replace(/\s*```\s*$/, '').trim();
-    const parsed = ConflictDecisionSchema.safeParse(JSON.parse(cleaned));
-    if (!parsed.success) return { decision: 'ADD' };
-    return parsed.data;
+    const final = (result as { finalOutput?: unknown }).finalOutput;
+    if (!final || typeof final !== 'object') return { decision: 'ADD' };
+    return final as ConflictDecision;
   } catch {
     // Conservative: on any failure, ADD. Better to have a duplicate
     // than to lose a real fact.
@@ -633,26 +635,19 @@ async function runRecursivePatternExtractor(
 ): Promise<{ patterns: { text: string; importance: number }[] } | null> {
   const model = getReflectorModel();
   try {
-    const agent = new Agent({
+    const agent = new Agent<unknown, typeof RecursiveExtractionSchema>({
       name: 'Recursive Reflection Extractor',
       model,
       instructions: RECURSIVE_PROMPT,
+      outputType: normalizeZodForCodexStrict(RecursiveExtractionSchema) as typeof RecursiveExtractionSchema,
     });
     const runner = new Runner({ workflowName: 'clementine-recursive-reflection' });
     const lines = facts.map((f) => `[id=${f.id}, depth=${f.derivation_depth}, importance=${f.importance ?? '?'}] ${f.content}`);
     const prompt = `Kind: ${kind}\nFact count: ${facts.length}\n\nFacts:\n${lines.join('\n')}`;
     const result = await runner.run(agent, prompt);
-    const text = typeof (result as { finalOutput?: unknown }).finalOutput === 'string'
-      ? (result as { finalOutput: string }).finalOutput
-      : String((result as { finalOutput?: unknown }).finalOutput ?? '');
-    if (!text || !text.trim()) return null;
-    const cleaned = text.replace(/^```(?:json)?\s*/, '').replace(/\s*```\s*$/, '').trim();
-    const validated = RecursiveExtractionSchema.safeParse(JSON.parse(cleaned));
-    if (!validated.success) {
-      logger.warn({ kind, issues: validated.error.issues.slice(0, 3) }, 'recursive-reflection extractor returned invalid shape');
-      return null;
-    }
-    return validated.data;
+    const final = (result as { finalOutput?: unknown }).finalOutput;
+    if (!final || typeof final !== 'object') return null;
+    return final as { patterns: { text: string; importance: number }[] };
   } catch (err) {
     logger.warn({ kind, err: err instanceof Error ? err.message : String(err) }, 'recursive-reflection extractor failed');
     return null;

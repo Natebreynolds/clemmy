@@ -18,10 +18,13 @@ import { buildPlannerTool } from './planner.js';
 // composio writes); it just does one job and returns.
 import { buildWorkerAgent } from './sub-agents.js';
 import { harnessInstructions } from './harness-context.js';
+import { normalizeZodForCodexStrict } from '../runtime/schema-normalizer.js';
 import { getCoreToolsAsync } from '../tools/registry.js';
 import { getOrCreateExternalMcpServers } from '../runtime/mcp-servers.js';
 import type { Tool } from '@openai/agents';
 import { appendEvent } from '../runtime/harness/eventlog.js';
+import { openPlanScope } from './plan-scope.js';
+import { loadProactivityPolicy } from './proactivity-policy.js';
 import {
   harnessInputGuardrails,
   harnessOutputGuardrails,
@@ -155,6 +158,8 @@ const requestApprovalParams = z.object({
  */
 const LOCAL_SAVE_PATTERN = /\b(memory|vault|note|fact|task|plan|goal|workflow|cron|preference|rule|reminder)\b/i;
 const LOCAL_VERB_PATTERN = /\b(save|record|remember|write|note|track|add|update|log|store|persist)\b/i;
+type RequestApprovalArgs = z.infer<typeof requestApprovalParams>;
+
 function isLocalSaveApproval(args: { subject: string; reason: string | null; destructive: boolean }): boolean {
   if (args.destructive) return false;
   const subject = args.subject;
@@ -164,6 +169,41 @@ function isLocalSaveApproval(args: { subject: string; reason: string | null; des
   // must appear. Single-pattern matches are too loose — "save the email"
   // could refer to a remote service.
   return LOCAL_VERB_PATTERN.test(combined) && LOCAL_SAVE_PATTERN.test(combined);
+}
+
+function isYoloAutoApprovalPolicy(): boolean {
+  try {
+    return loadProactivityPolicy().autoApproveScope === 'yolo';
+  } catch {
+    return false;
+  }
+}
+
+function inferApprovedComposioSlugs(args: RequestApprovalArgs): string[] {
+  const sampleText = args.preview?.samples
+    ?.flatMap((sample) => [sample.label, sample.value, sample.secondary ?? ''])
+    .join(' ') ?? '';
+  const combined = `${args.subject} ${args.reason ?? ''} ${sampleText}`;
+  if (/\boutlook\b/i.test(combined) && /\bdrafts?\b/i.test(combined)) {
+    return ['OUTLOOK_CREATE_DRAFT'];
+  }
+  return [];
+}
+
+function openRequestApprovalScope(args: RequestApprovalArgs, runContext: unknown): string[] {
+  if (args.destructive) return [];
+  const sessionId = extractSessionId(runContext);
+  if (!sessionId) return [];
+  const allowedComposioSlugs = inferApprovedComposioSlugs(args);
+  if (allowedComposioSlugs.length === 0) return [];
+  openPlanScope({
+    sessionId,
+    planProposalId: `request_approval:${extractTurn(runContext)}:${Date.now()}`,
+    approvedPlanObjective: args.subject,
+    allowedTools: ['composio_execute_tool'],
+    allowedComposioSlugs,
+  });
+  return allowedComposioSlugs;
 }
 
 export function buildRequestApprovalTool() {
@@ -179,11 +219,25 @@ export function buildRequestApprovalTool() {
     // memory" + destructive:false, the runtime guard turns it into a
     // no-op so the user doesn't see a phantom approval prompt and the
     // orchestrator can keep moving.
-    needsApproval: async (_ctx, input) => !isLocalSaveApproval(input as z.infer<typeof requestApprovalParams>),
-    execute: async (args) =>
-      isLocalSaveApproval(args)
-        ? `Auto-approved (local save — no external mutation): ${args.subject}. Proceed with the save and report back what landed.`
-        : `Approved: ${args.subject}. Proceed with the action you described.`,
+    needsApproval: async (_ctx, input) => {
+      const args = input as RequestApprovalArgs;
+      if (isLocalSaveApproval(args)) return false;
+      if (isYoloAutoApprovalPolicy()) return false;
+      return true;
+    },
+    execute: async (args, runContext) => {
+      if (isLocalSaveApproval(args)) {
+        return `Auto-approved (local save — no external mutation): ${args.subject}. Proceed with the save and report back what landed.`;
+      }
+      if (isYoloAutoApprovalPolicy()) {
+        return `Auto-approved by YOLO mode: ${args.subject}. Proceed with the action you described.`;
+      }
+      const scopedSlugs = openRequestApprovalScope(args, runContext);
+      const scopeText = scopedSlugs.length > 0
+        ? ` Approved scope opened for ${scopedSlugs.join(', ')} in this session, so matching concrete tool calls should not ask again.`
+        : '';
+      return `Approved: ${args.subject}. Proceed with the action you described.${scopeText}`;
+    },
   });
 }
 
@@ -225,6 +279,7 @@ export function buildAskUserQuestionTool() {
 
 const ORCHESTRATOR_INSTRUCTIONS = [
   'You are Clementine — a single agent that completes the user\'s request without delegating to other agents. The persistent context block above (Now, User Preferences, Persistent Facts, Recently Learned, Working Memory, Identity, Soul, Long-Term Memory, Active Goals, Current Focus) is loaded fresh each turn. Use it as ground truth about who the user is and what they\'re working on. "Recently Learned" lists facts the reflection layer synthesized from tool returns in the last 24h — each line ending with [call_xxx] means you can call `recall_tool_result("call_xxx")` to retrieve the verbatim source if you need exact detail. "Current Focus" is the active attention pointer — what the user is mid-work on right now, survives across Discord channels and desktop chat (see the FOCUS rules below).',
+  'NORTH STAR — accomplish the real-world job end-to-end, not just the next chat reply. Chain local files, shell/CLI, MCP, Composio, web/browser, skills, and generated artifacts when the task calls for them; verify the result before saying done. If missing specifics make success ambiguous or risky, ask ONE clarifying question before acting. If the path is clear, execute decisively and keep going until the deliverable exists.',
   'How you work: receive request → search your own memory if useful → decide what to do → call the right tools → keep going until the work is done → reply with the outcome. You stay in control across the whole conversation. No sub-agents, no handoffs.',
   'Your toolset is comprehensive. Memory (memory_recall, memory_search, memory_read, memory_remember). Workspace + files (workspace_*, list_files, read_file, write_file, git_status). Shell (run_shell_command — mutating commands pause for approval, read-only ones run automatically). External services (composio_search_tools, composio_execute_tool, composio_status, composio_list_tools). Local CLIs ($PATH-scanned, local_cli_list / local_cli_probe). Tasks, goals, executions, plans, notes. User profile (user_profile_read / user_profile_update). Notifications, ask_user_question, request_approval. Skills (skill_list / skill_read on demand).',
   'Tool-choice memoization — call `tool_choice_recall(intent)` BEFORE doing discovery for any external/CLI action. HIT (kind:composio) → call `composio_execute_tool({tool_slug: <identifier>, arguments: <args>})` directly. HIT (kind:cli) → call `run_shell_command(<cli command>)`. MISS → discover (composio_search_tools / local_cli_list), pick the best fit, optionally `tool_choice_remember` so the next request with the same intent is one tool call instead of five. If a call returns a runtime error mentioning the tool, call `tool_choice_invalidate(intent, <verbatim error>)` and rediscover.',
@@ -476,7 +531,12 @@ export async function buildOrchestratorAgent(): Promise<
     // restarting the daemon.
     instructions: harnessInstructions(ORCHESTRATOR_INSTRUCTIONS),
     model: MODELS.primary,
-    outputType: OrchestratorDecisionSchema,
+    // v0.5.22 — normalize via the centralized helper so the schema
+    // serializes Codex-strict compatible (every property in `required`,
+    // optional fields as nullable). Without this, .nullish() reply
+    // produces a JSON schema with reply absent from required, which
+    // Codex rejects under SDK 0.11.5 strict mode.
+    outputType: normalizeZodForCodexStrict(OrchestratorDecisionSchema) as typeof OrchestratorDecisionSchema,
     // T2.1 — wrapToolForHarness adds the per-tool timeout + mid-turn
     // kill check + pre-increment limit check. No-op when
     // HARNESS_TOOL_BRACKETS is off, so this is safe to leave in even

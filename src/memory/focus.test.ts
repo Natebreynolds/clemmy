@@ -28,6 +28,7 @@ const {
   activateFocus,
   clearFocus,
   getFocusSnapshot,
+  checkResourceMatchesFocus,
 } = await import('./focus.js');
 
 test('createFocus: inserts an active row', () => {
@@ -138,6 +139,19 @@ test('getFocusSnapshot: needsConfirm false when fresh', () => {
   const snap = getFocusSnapshot();
   assert.equal(snap.needsConfirm, false);
   assert.equal(snap.active?.title, 'A');
+});
+
+test('checkResourceMatchesFocus ignores stale focus that needs confirmation', () => {
+  resetMemoryDb();
+  process.env.CLEMMY_FOCUS_CONFIRM_MS = '1';
+  try {
+    createFocus({ resourceRef: 'sheet-a', title: 'A', summary: 'one' });
+    const start = Date.now();
+    while (Date.now() - start < 5) { /* spin */ }
+    assert.deepEqual(checkResourceMatchesFocus('sheet-b'), { result: 'unknown' });
+  } finally {
+    delete process.env.CLEMMY_FOCUS_CONFIRM_MS;
+  }
 });
 
 process.on('exit', () => {

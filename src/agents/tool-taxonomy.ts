@@ -113,6 +113,7 @@ const NEVER_GATE_LOCAL_MEMORY = new Set<string>([
   // Execution-tracking writes are local state. The Orchestrator was
   // pausing on `execution_update_step` after every tool call, which
   // is friction the user reads as "why does it keep asking?"
+  'execution_create',
   'execution_update_step',
   'execution_complete',
   'execution_mark_blocked',
@@ -163,6 +164,7 @@ const ALWAYS_READ = new Set<string>([
   'task_list',
   'execution_list',
   'execution_get',
+  'execution_create',
   'goal_get',
   'goal_list',
   'list_plans',
@@ -301,6 +303,12 @@ function normalizeForMatch(name: string): string {
  */
 function classifyComposioSlug(slug: string): ToolKind {
   const upper = slug.toUpperCase();
+  // Firecrawl search/scrape/map/crawl actions may enqueue work on
+  // Firecrawl, but from the user's perspective they only read public
+  // web pages. Do not ask before normal research/enrichment.
+  if (/^FIRECRAWL_(BATCH_)?(SCRAPE|MAP|SEARCH|CRAWL)(_|$)/.test(upper)) {
+    return 'read';
+  }
   // Read prefixes / contains
   if (
     /^(GET|LIST|SEARCH|FIND|FETCH|READ|QUERY|LOOKUP|RETRIEVE)_/.test(upper) ||

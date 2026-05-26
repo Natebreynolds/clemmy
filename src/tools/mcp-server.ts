@@ -71,7 +71,11 @@ function registerPluginTool(server: McpServer, tool: PluginTool): void {
       zodType = z.string();
     }
     if (!required.has(key)) {
-      zodType = zodType.optional();
+      // v0.5.22 — .nullable() instead of .optional(). Codex strict mode
+      // (SDK 0.11.5 default) requires every property in `required`;
+      // optional fields must serialize as nullable so the field is
+      // present with possibly-null value.
+      zodType = zodType.nullable();
     }
     shape[key] = zodType;
   }

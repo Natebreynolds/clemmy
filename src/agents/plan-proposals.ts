@@ -126,13 +126,17 @@ export function surfacePlan(input: SurfacePlanInput): PlanProposal {
   };
   writeProposal(proposal);
 
+  // v0.5.21.2 — render ALL steps. Previously sliced to first 4 with a
+  // "…and N more steps" tail, which left Discord users unable to see
+  // the rest of the plan before approving. The Discord delivery layer
+  // (sendDiscordDirectMessage / sendDiscordChannelMessageWithComponents)
+  // already chunks bodies via splitMessage and attaches the action row
+  // to the LAST chunk only — so a long plan renders as one card +
+  // follow-up plain message(s), with the Approve/Reject buttons under
+  // the final chunk where the user lands after scrolling.
   const stepSummary = proposal.plan.steps
-    .slice(0, 4)
     .map((s) => `  ${s.n}. ${s.action}`)
     .join('\n');
-  const moreSteps = proposal.plan.steps.length > 4
-    ? `\n  …and ${proposal.plan.steps.length - 4} more steps`
-    : '';
   const questionsBlock = proposal.plan.needsUserInput.length > 0
     ? `\n\nQuestions before I start:\n${proposal.plan.needsUserInput.map((q) => `  · ${q}`).join('\n')}`
     : '';
@@ -145,7 +149,7 @@ export function surfacePlan(input: SurfacePlanInput): PlanProposal {
       `Complexity: ${proposal.plan.estimatedComplexity}.`,
       proposal.context ? `\nContext: ${proposal.context}` : '',
       `\nObjective: ${proposal.plan.objective}`,
-      `\nSteps:\n${stepSummary}${moreSteps}`,
+      `\nSteps:\n${stepSummary}`,
       questionsBlock,
       '\n\nReview and approve in the dashboard or reply to approve / reject here.',
     ].filter(Boolean).join(''),

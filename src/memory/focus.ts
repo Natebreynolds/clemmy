@@ -280,7 +280,8 @@ export function checkResourceMatchesFocus(candidateId: string | null | undefined
   focusTitle?: string;
 } {
   if (!candidateId) return { result: 'unknown' };
-  const active = getActiveFocus();
+  const snap = getFocusSnapshot();
+  const active = snap.needsConfirm ? null : snap.active;
   if (!active) return { result: 'unknown' };
   // Substring match: a focus stored as a URL (https://docs.google.com/.../<id>)
   // legitimately matches an extracted bare id when that id appears in

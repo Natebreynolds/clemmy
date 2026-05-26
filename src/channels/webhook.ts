@@ -13,7 +13,13 @@ import { DASHBOARD_CRON_RUNS_DIR, buildDashboardSnapshot, loadCronJobs, loadWork
 // without these fallbacks, clicking a harness session or workflow run
 // in the dashboard's Live Runs feed 404s and the inspector shows
 // "Run not found".
-import { getSession as harnessGetSession, listEvents as harnessListEvents } from '../runtime/harness/eventlog.js';
+import {
+  getSession as harnessGetSession,
+  listEvents as harnessListEvents,
+  listSessions as harnessListSessions,
+  type EventRow as HarnessEventRow,
+  type SessionRow as HarnessSessionRow,
+} from '../runtime/harness/eventlog.js';
 import { registerConsoleRoutes } from '../dashboard/console-routes.js';
 import {
   addNotification,
@@ -64,6 +70,107 @@ import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 const logger = pino({ name: 'clementine-next.webhook' });
 const CRON_TRIGGERS_DIR = path.join(BASE_DIR, 'cron', 'triggers');
 const WORKFLOW_RUNS_DIR = path.join(BASE_DIR, 'workflows', 'runs');
+
+function isDiscordHarnessSession(session: HarnessSessionRow): boolean {
+  return session.channel === 'discord'
+    || session.channel === 'discord-dm'
+    || session.metadata.source === 'discord';
+}
+
+function isActivityVisibleHarnessSession(session: HarnessSessionRow): boolean {
+  return session.kind === 'chat'
+    || session.kind === 'workflow'
+    || session.status === 'active'
+    || session.status === 'paused'
+    || isDiscordHarnessSession(session)
+    || session.channel === 'workflow'
+    || session.metadata.source === 'workflow'
+    || session.metadata.source === 'desktop';
+}
+
+function harnessSource(session: HarnessSessionRow) {
+  return isDiscordHarnessSession(session) ? 'discord' : 'daemon';
+}
+
+function harnessEventMessage(event: HarnessEventRow): string {
+  const data = event.data ?? {};
+  switch (event.type) {
+    case 'tool_called':
+      return `Tool started: ${String(data.tool || data.name || 'unknown')}`;
+    case 'tool_returned':
+      return `Tool returned: ${String(data.tool || data.name || 'unknown')}`;
+    case 'approval_requested':
+      return `Approval requested: ${String(data.subject || data.tool || 'tool call')}`;
+    case 'approval_resolved':
+      return `Approval ${String(data.decision || data.resolution || 'resolved')}`;
+    case 'conversation_completed':
+      return String(data.summary || data.reply || 'Conversation completed');
+    case 'run_completed':
+      return 'Run completed';
+    case 'run_failed':
+      return String(data.error || 'Run failed');
+    case 'guardrail_tripped':
+      return 'Internal safety check completed';
+    case 'turn_started':
+      return 'Turn started';
+    case 'turn_ended':
+      return 'Turn ended';
+    default:
+      return event.type;
+  }
+}
+
+function effectiveHarnessStatus(session: HarnessSessionRow, events: HarnessEventRow[]): string {
+  const newestFirst = events.slice().reverse();
+  const terminal = newestFirst.find((event) =>
+    event.type === 'conversation_completed'
+    || event.type === 'run_completed'
+    || event.type === 'run_failed'
+    || event.type === 'approval_requested',
+  );
+  if (terminal?.type === 'run_failed') return 'failed';
+  if (terminal?.type === 'approval_requested') return 'awaiting_approval';
+  if (terminal?.type === 'conversation_completed' || terminal?.type === 'run_completed') return 'completed';
+  if (session.status === 'paused') return 'awaiting_approval';
+  if (session.status === 'active') {
+    const updatedMs = Date.parse(session.updatedAt);
+    if (Number.isFinite(updatedMs) && Date.now() - updatedMs > 2 * 60_000) return 'idle';
+    return 'running';
+  }
+  return session.status;
+}
+
+function harnessSessionAsActivityRun(session: HarnessSessionRow) {
+  const events = harnessListEvents(session.id, { limit: 80, desc: true });
+  const status = effectiveHarnessStatus(session, events);
+  const completion = events.slice().reverse().find((event) =>
+    event.type === 'conversation_completed' || event.type === 'run_completed',
+  );
+  const outputPreview = completion
+    ? String(completion.data.summary || completion.data.reply || '').slice(0, 1200)
+    : '';
+  return {
+    id: session.id,
+    sessionId: session.id,
+    userId: session.userId ?? undefined,
+    channel: session.channel ?? undefined,
+    source: harnessSource(session),
+    title: session.title || session.objective || (isDiscordHarnessSession(session) ? 'Discord conversation' : 'Clementine session'),
+    input: session.objective || session.title || '',
+    status,
+    createdAt: session.createdAt,
+    updatedAt: session.updatedAt,
+    completedAt: status === 'completed' ? session.updatedAt : undefined,
+    outputPreview,
+    events: events.map((event) => ({
+      id: event.id,
+      type: event.type,
+      message: harnessEventMessage(event),
+      createdAt: event.createdAt,
+      data: event.data,
+    })),
+  };
+}
 
 interface DashboardCronJobRecord {
   name: string;
@@ -1301,7 +1408,18 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
 
   app.get('/api/runs', requireAuth, (req, res) => {
     const limit = typeof req.query.limit === 'string' ? Number.parseInt(req.query.limit, 10) : 30;
-    res.json({ runs: listRuns(Number.isFinite(limit) ? limit : 30) });
+    const resolvedLimit = Number.isFinite(limit) ? Math.max(1, Math.min(120, limit)) : 30;
+    const legacyRuns = listRuns(Math.max(resolvedLimit, 40));
+    const harnessRuns = harnessListSessions({ limit: Math.max(resolvedLimit, 80) })
+      .filter(isActivityVisibleHarnessSession)
+      .map(harnessSessionAsActivityRun);
+    const runs = [...harnessRuns, ...legacyRuns]
+      .sort((left, right) =>
+        String(right.updatedAt || right.completedAt || right.createdAt || '')
+          .localeCompare(String(left.updatedAt || left.completedAt || left.createdAt || '')),
+      )
+      .slice(0, resolvedLimit);
+    res.json({ runs });
   });
 
   app.get('/api/runs/:id', requireAuth, (req, res) => {
@@ -1317,28 +1435,24 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
       if (id.startsWith('sess-')) {
         const session = harnessGetSession(id);
         if (session) {
-          const events = harnessListEvents(id) ?? [];
+          const events = harnessListEvents(id, { limit: 500, desc: true }) ?? [];
+          const status = effectiveHarnessStatus(session, events);
           res.json({ run: {
             id,
             sessionId: id,
             kind: (session as { kind?: unknown }).kind ?? 'harness',
             channel: (session as { channel?: unknown }).channel ?? '—',
             source: 'harness',
-            title: (session as { title?: unknown }).title ?? '(harness session)',
-            status: (session as { status?: unknown }).status ?? 'unknown',
+            title: (session as { title?: unknown }).title ?? '(Clementine session)',
+            status,
             createdAt: (session as { createdAt?: unknown }).createdAt,
             updatedAt: (session as { updatedAt?: unknown }).updatedAt,
+            completedAt: status === 'completed' ? (session as { updatedAt?: unknown }).updatedAt : undefined,
             events: events.map((ev) => ({
               id: (ev as { id?: unknown }).id,
               type: (ev as { type?: unknown }).type,
               createdAt: (ev as { createdAt?: unknown }).createdAt,
-              message: (() => {
-                const dj = (ev as { data_json?: unknown }).data_json;
-                if (typeof dj === 'string') {
-                  return dj.length > 220 ? dj.slice(0, 220) + '…' : dj;
-                }
-                return '';
-              })(),
+              message: harnessEventMessage(ev),
             })),
           } });
           return;
