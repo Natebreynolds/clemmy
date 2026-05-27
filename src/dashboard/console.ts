@@ -16749,7 +16749,7 @@ const CONSOLE_JS = `
         controlsEl.innerHTML = [
           '<input type="text" class="secret-input" placeholder="Composio API key (sk_…)" data-hub-composio-key autocomplete="off" data-1p-ignore="true" data-lpignore="true" spellcheck="false" name="api-key-composio-no-autofill" />',
           '<button data-hub-composio-save>SAVE API KEY</button>',
-          '<a href="https://platform.composio.dev" target="_blank" rel="noopener" style="font-size:10px;letter-spacing:0.14em;color:var(--fg-3);">get a key →</a>',
+          '<a href="https://dashboard.composio.dev/~/project/settings" target="_blank" rel="noopener" style="font-size:10px;letter-spacing:0.14em;color:var(--fg-3);">get a key →</a>',
           renderComposioCliChip(status),
           renderComposioCliActions(status),
         ].join('');
@@ -16941,7 +16941,7 @@ const CONSOLE_JS = `
               // Fetch the toolkit's auth scheme so we route to the right
               // setup flow (API_KEY → in-app modal; OAUTH2 → auto-create
               // composio-managed config + OAuth window; other → fall
-              // back to platform.composio.dev). Without this, Gmail and
+              // back to Composio's auth-configs page). Without this, Gmail and
               // other OAuth toolkits hit my api-key modal which makes
               // no sense (no API key exists for OAuth).
               let metaForRouting = null;
@@ -16960,7 +16960,7 @@ const CONSOLE_JS = `
                   const setupRes = await fetch(withToken('/api/composio/toolkits/' + encodeURIComponent(slug) + '/setup-oauth'), { method: 'POST' });
                   if (!setupRes.ok) {
                     const j = await setupRes.json().catch(() => ({}));
-                    alert('OAuth setup failed: ' + (j.error || setupRes.status) + '\\n\\nIf this toolkit uses bring-your-own credentials, set them up at platform.composio.dev/auth-configs.');
+                    alert('OAuth setup failed: ' + (j.error || setupRes.status) + '\\n\\nIf this toolkit uses bring-your-own credentials, set them up at dashboard.composio.dev/~/project/auth-configs.');
                     btn.textContent = 'SET UP AUTH';
                     return;
                   }
@@ -16991,7 +16991,7 @@ const CONSOLE_JS = `
                 // the user configures it there. We can't easily support
                 // every scheme inline.
                 if (confirm(name + ' uses ' + scheme + ' authentication which isn\\'t supported inline yet. Open the Composio auth-configs page to set it up there?')) {
-                  window.open('https://platform.composio.dev/auth-configs', '_blank');
+                  window.open('https://dashboard.composio.dev/~/project/auth-configs', '_blank');
                 }
                 return;
               }

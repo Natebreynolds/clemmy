@@ -20,6 +20,7 @@ const CONNECTIONS_TTL_MS = 60_000;
 const CATALOG_TTL_MS = 60 * 60_000;
 const USER_ID_TTL_MS = 60_000;
 const BACKEND_VALUES = ['auto', 'sdk', 'cli'] as const;
+export const COMPOSIO_AUTH_CONFIGS_URL = 'https://dashboard.composio.dev/~/project/auth-configs';
 
 export type ToolkitAuthMode = 'managed' | 'byo' | 'none';
 export type ComposioExecutionBackend = typeof BACKEND_VALUES[number];
@@ -630,9 +631,62 @@ export async function listToolkitSlugsWithAuthConfig(): Promise<Set<string>> {
   }
 }
 
+function authConfigToolkitSlug(item: Record<string, unknown>): string | undefined {
+  const toolkit = obj(item.toolkit);
+  const authConfig = obj(item.auth_config);
+  return str(toolkit.slug)
+    ?? str(item.toolkit_slug)
+    ?? str(item.toolkitSlug)
+    ?? str(authConfig.toolkit_slug)
+    ?? str(authConfig.toolkitSlug);
+}
+
+function authConfigId(item: Record<string, unknown>): string | undefined {
+  const authConfig = obj(item.auth_config);
+  return str(item.id)
+    ?? str(item.nanoid)
+    ?? str(item.auth_config_id)
+    ?? str(item.authConfigId)
+    ?? str(authConfig.id)
+    ?? str(authConfig.nanoid);
+}
+
+function selectAuthConfigIdForToolkit(items: Array<Record<string, unknown>>, slug: string): string | null {
+  const normalizedSlug = slug.trim().toLowerCase();
+  for (const item of items) {
+    const itemSlug = authConfigToolkitSlug(item)?.toLowerCase();
+    const id = authConfigId(item);
+    if (id && itemSlug === normalizedSlug) return id;
+  }
+  return null;
+}
+
+async function findToolkitAuthConfigId(composio: Composio, slug: string): Promise<string | null> {
+  const collect = (resp: unknown): Array<Record<string, unknown>> => {
+    const items = Array.isArray(resp) ? resp : (obj(resp).items ?? []);
+    return Array.isArray(items) ? items.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object')) : [];
+  };
+
+  // Prefer the server-side toolkit filter when available, but keep a
+  // fallback for SDK/API shape drift. Composio has changed auth-config
+  // response casing a few times, so selectAuthConfigIdForToolkit()
+  // intentionally accepts both snake_case and camelCase.
+  try {
+    const filtered = collect(await (composio as any).authConfigs.list({ limit: 20, toolkit: slug }));
+    const id = selectAuthConfigIdForToolkit(filtered, slug)
+      ?? (filtered.length === 1 ? authConfigId(filtered[0]) : null);
+    if (id) return id;
+  } catch {
+    // Fall through to the broader list.
+  }
+
+  const resp = await (composio as any).authConfigs.list({ limit: 200 });
+  return selectAuthConfigIdForToolkit(collect(resp), slug);
+}
+
 export class ComposioNeedsAuthConfigError extends Error {
   constructor(public readonly slug: string, public readonly underlying: string) {
-    super(`Toolkit "${slug}" needs an auth config in Composio before OAuth can start. Open https://platform.composio.dev/auth-configs and add the toolkit to your project.`);
+    super(`Toolkit "${slug}" needs an auth config in Composio before OAuth can start. Open ${COMPOSIO_AUTH_CONFIGS_URL} and add the toolkit to your project.`);
     this.name = 'ComposioNeedsAuthConfigError';
   }
 }
@@ -641,30 +695,21 @@ export async function authorizeToolkit(slug: string): Promise<{ redirectUrl: str
   const composio = getComposio();
   if (!composio) throw new Error('COMPOSIO_API_KEY is not configured.');
 
-  // Pre-flight check: if Composio has no auth_config for this toolkit,
-  // toolkits.authorize() still returns a redirectUrl — but the hosted
-  // OAuth page errors out with "Something went wrong. Clear your
-  // session." (seen 2026-05-21 with apify + firecrawl). Skip the bad
-  // dance and surface the proper "needs setup" path immediately.
-  try {
-    const configured = await listToolkitSlugsWithAuthConfig();
-    if (!configured.has(slug)) {
-      throw new ComposioNeedsAuthConfigError(
-        slug,
-        `No auth_config for "${slug}" in this Composio project. Add one at platform.composio.dev/auth-configs before connecting.`,
-      );
-    }
-  } catch (error) {
-    // Re-throw the structured needs-setup error; swallow listing
-    // failures (rare — network blip etc.) and fall through to the
-    // legacy authorize call which still has its own 400/401/403
-    // fallback.
-    if (error instanceof ComposioNeedsAuthConfigError) throw error;
-  }
-
   const userId = await getPreferredUserId();
   try {
-    const connection = await (composio as any).toolkits.authorize(userId, slug);
+    const authConfigIdToUse = await findToolkitAuthConfigId(composio, slug);
+    if (!authConfigIdToUse) {
+      throw new ComposioNeedsAuthConfigError(
+        slug,
+        `No auth_config for "${slug}" in this Composio project. Add one at ${COMPOSIO_AUTH_CONFIGS_URL} before connecting.`,
+      );
+    }
+
+    // Do not use composio.toolkits.authorize() here. In @composio/core
+    // 0.10.0 it still delegates to connectedAccounts.initiate(), and
+    // Composio is retiring that path for managed OAuth orgs in favor of
+    // Connect Link (/api/v3/connected_accounts/link).
+    const connection = await (composio as any).connectedAccounts.link(userId, authConfigIdToUse, { allowMultiple: true });
     detectedPreferredUserId = null;
     connectionsCache = null;
     return {
@@ -747,12 +792,18 @@ export async function getToolkitSetupMeta(slug: string): Promise<{
  * load correctly (it loads broken when there's no auth_config).
  *
  * If Composio has NO managed creds for the toolkit, callers fall
- * back to platform.composio.dev — there's no way to skip the manual
+ * back to Composio's auth-configs page — there's no way to skip the manual
  * BYO setup in that case.
  */
 export async function setupOAuthToolkit(slug: string): Promise<{ ok: true; authConfigId: string }> {
   const composioApiKey = readComposioEnv('COMPOSIO_API_KEY');
   if (!composioApiKey) throw new Error('COMPOSIO_API_KEY is not configured.');
+  const composio = getComposio();
+  if (composio) {
+    const existing = await findToolkitAuthConfigId(composio, slug);
+    if (existing) return { ok: true, authConfigId: existing };
+  }
+
   const res = await fetch('https://backend.composio.dev/api/v3/auth_configs', {
     method: 'POST',
     headers: {
@@ -1079,3 +1130,9 @@ export async function buildComposioDashboardSnapshot(): Promise<ComposioDashboar
     catalogError,
   };
 }
+
+export const __test__ = {
+  authConfigId,
+  authConfigToolkitSlug,
+  selectAuthConfigIdForToolkit,
+};

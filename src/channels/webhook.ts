@@ -38,6 +38,7 @@ import { readEnvFile, writeEnvFile } from '../setup/env-file.js';
 import {
   authorizeToolkit,
   buildComposioDashboardSnapshot,
+  COMPOSIO_AUTH_CONFIGS_URL,
   ComposioNeedsAuthConfigError,
   disconnectToolkit,
   getComposioCredentialStatus,
@@ -461,7 +462,7 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
           error: error.message,
           needsAuthConfig: true,
           toolkit: slug,
-          setupUrl: 'https://platform.composio.dev/auth-configs',
+          setupUrl: COMPOSIO_AUTH_CONFIGS_URL,
         });
         return;
       }
@@ -755,7 +756,7 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
       redirectDashboard(res, token, { kind: 'success', text: `Composio connection started for ${slug}.` });
     } catch (error) {
       const text = error instanceof ComposioNeedsAuthConfigError
-        ? `${error.message} Open https://platform.composio.dev/auth-configs, then try again.`
+        ? `${error.message} Open ${COMPOSIO_AUTH_CONFIGS_URL}, then try again.`
         : error instanceof Error ? error.message : String(error);
       redirectDashboard(res, token, { kind: 'error', text });
     }
