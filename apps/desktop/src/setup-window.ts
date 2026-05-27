@@ -1,5 +1,6 @@
 import { app, BrowserWindow, dialog, Notification } from 'electron';
 import { existsSync, mkdirSync, writeFileSync, appendFileSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -67,13 +68,7 @@ export function createSetupWindow(opts: SetupWindowOpts): BrowserWindow {
       preload: opts.preloadPath,
       contextIsolation: true,
       nodeIntegration: false,
-      // sandbox: false. The wizard is trusted internal UI (no remote
-      // content) and `sandbox: true` blocked contextBridge from
-      // exposing window.clemmy on the data: URL we used to load.
-      // Loading from a file:// would have worked even with sandbox,
-      // but turning it off here also lets the preload import a few
-      // node modules without ceremony if we ever need to.
-      sandbox: false,
+      sandbox: true,
     },
   });
 
@@ -190,10 +185,12 @@ function materializeSetupHtmlFile(): string {
 }
 
 function renderSetupHtml(): string {
+  const nonce = randomBytes(16).toString('base64');
   return /* html */ `<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="UTF-8" /><title>Clementine — Setup</title>
-<style>${SETUP_CSS}</style>
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; img-src 'self' data:; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}'" />
+<style nonce="${nonce}">${SETUP_CSS}</style>
 </head><body>
   <div class="wiz">
     <header class="wiz-head">
@@ -213,7 +210,7 @@ function renderSetupHtml(): string {
     </footer>
   </div>
 
-  <script>${SETUP_JS}</script>
+  <script nonce="${nonce}">${SETUP_JS}</script>
 </body></html>`;
 }
 

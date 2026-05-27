@@ -1,12 +1,20 @@
 import express from 'express';
 import pino from 'pino';
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import matter from 'gray-matter';
 import { ClementineAssistant } from '../assistant/core.js';
-import { BASE_DIR, WEBHOOK_PORT, WEBHOOK_SECRET } from '../config.js';
+import {
+  BASE_DIR,
+  WEBHOOK_ALLOW_LAN,
+  WEBHOOK_HOST,
+  WEBHOOK_PORT,
+  WEBHOOK_SECRET,
+  WEBHOOK_SECRET_IS_STRONG,
+  isLoopbackWebhookHost,
+} from '../config.js';
 import { DASHBOARD_CRON_RUNS_DIR, buildDashboardSnapshot, loadCronJobs, loadWorkflows, readDaemonState, readRecentJsonLines, readWorkflowRuns } from '../dashboard/state.js';
 // Added 2026-05-21: /api/runs/:id fallbacks for harness sessions and
 // workflow runs. The legacy run-store only knows about run-xxx IDs;
@@ -32,7 +40,6 @@ import {
   upsertNotificationDestination,
 } from '../runtime/notifications.js';
 import { testNotificationDestination } from '../runtime/notification-delivery.js';
-import { getAuthStatus } from '../runtime/auth-store.js';
 import { fetchDiscordInstallInfo } from './discord-install.js';
 import { readEnvFile, writeEnvFile } from '../setup/env-file.js';
 import {
@@ -316,17 +323,41 @@ async function resolveApprovalOrQueueBackgroundContinuation(
 
 export async function startWebhookServer(assistant: ClementineAssistant): Promise<void> {
   const app = express();
-  app.use(express.json());
-  app.use(express.urlencoded({ extended: true }));
+  const dashboardSessionCookieName = 'clementine_dashboard_session';
+  const dashboardSessionToken = randomBytes(32).toString('base64url');
+
+  app.use((_req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
+    res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+    res.setHeader(
+      'Content-Security-Policy',
+      [
+        "default-src 'self'",
+        "base-uri 'none'",
+        "frame-ancestors 'none'",
+        "object-src 'none'",
+        "img-src 'self' data:",
+        "script-src 'self' 'unsafe-inline'",
+        "style-src 'self' 'unsafe-inline'",
+        "connect-src 'self' https://api.openai.com wss://api.openai.com",
+      ].join('; '),
+    );
+    next();
+  });
+  app.use(express.json({ limit: '1mb' }));
+  app.use(express.urlencoded({ extended: false, limit: '1mb', parameterLimit: 1000 }));
 
   function buildConsoleRedirectPath(token: string, flash?: { kind: 'success' | 'error'; text: string }): string {
     const url = new URL('/console', 'http://localhost');
-    url.searchParams.set('token', token);
+    void token;
     if (flash) {
       url.searchParams.set('flash', flash.kind);
       url.searchParams.set('message', flash.text);
     }
-    return `${url.pathname}?${url.searchParams.toString()}`;
+    const query = url.searchParams.toString();
+    return query ? `${url.pathname}?${query}` : url.pathname;
   }
 
   function redirectDashboard(res: express.Response, token: string, flash?: { kind: 'success' | 'error'; text: string }): void {
@@ -337,7 +368,41 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
     const authHeader = req.headers.authorization ?? '';
     const bearer = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
     const queryToken = typeof req.query.token === 'string' ? req.query.token : '';
-    return Boolean(WEBHOOK_SECRET) && (bearer === WEBHOOK_SECRET || queryToken === WEBHOOK_SECRET);
+    const cookies = parseCookies(req.headers.cookie ?? '');
+    const sessionCookie = cookies[dashboardSessionCookieName] ?? '';
+    return (Boolean(WEBHOOK_SECRET) && (safeEqual(bearer, WEBHOOK_SECRET) || safeEqual(queryToken, WEBHOOK_SECRET)))
+      || safeEqual(sessionCookie, dashboardSessionToken);
+  }
+
+  function safeEqual(left: string, right: string): boolean {
+    if (!left || !right) return false;
+    const leftBuffer = Buffer.from(left);
+    const rightBuffer = Buffer.from(right);
+    return leftBuffer.length === rightBuffer.length && timingSafeEqual(leftBuffer, rightBuffer);
+  }
+
+  function parseCookies(header: string): Record<string, string> {
+    const cookies: Record<string, string> = {};
+    for (const part of header.split(';')) {
+      const index = part.indexOf('=');
+      if (index === -1) continue;
+      const key = part.slice(0, index).trim();
+      const value = part.slice(index + 1).trim();
+      if (key) {
+        try { cookies[key] = decodeURIComponent(value); }
+        catch { cookies[key] = value; }
+      }
+    }
+    return cookies;
+  }
+
+  function setDashboardSessionCookie(res: express.Response): void {
+    res.cookie(dashboardSessionCookieName, dashboardSessionToken, {
+      httpOnly: true,
+      sameSite: 'strict',
+      path: '/',
+      maxAge: 7 * 24 * 60 * 60 * 1000,
+    });
   }
 
   function requireAuth(
@@ -357,8 +422,6 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
       status: 'ok',
       uptime: process.uptime(),
       timestamp: new Date().toISOString(),
-      auth: getAuthStatus(),
-      daemon_state_present: Object.keys(readDaemonState()).length > 0,
     });
   });
 
@@ -660,6 +723,21 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
 
   // /console is the primary UI surface. /dashboard remains only as a
   // compatibility redirect for stale bookmarks and older local installs.
+  app.get('/console', (req, res, next) => {
+    const queryToken = typeof req.query.token === 'string' ? req.query.token : '';
+    if (!WEBHOOK_SECRET || !safeEqual(queryToken, WEBHOOK_SECRET)) {
+      next();
+      return;
+    }
+    setDashboardSessionCookie(res);
+    const url = new URL('/console', 'http://localhost');
+    for (const [key, value] of Object.entries(req.query)) {
+      if (key === 'token') continue;
+      if (typeof value === 'string') url.searchParams.set(key, value);
+    }
+    const query = url.searchParams.toString();
+    res.redirect(302, query ? `${url.pathname}?${query}` : url.pathname);
+  });
   registerConsoleRoutes(app, isAuthorized, assistant);
 
   app.get('/dashboard', (req, res) => {
@@ -669,14 +747,13 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
     }
     const url = new URL('/console', 'http://localhost');
     for (const [key, value] of Object.entries(req.query)) {
+      if (key === 'token') continue;
       if (typeof value === 'string') {
         url.searchParams.set(key, value);
       }
     }
-    if (!url.searchParams.has('token')) {
-      url.searchParams.set('token', WEBHOOK_SECRET);
-    }
-    res.redirect(302, `${url.pathname}?${url.searchParams.toString()}`);
+    const query = url.searchParams.toString();
+    res.redirect(302, query ? `${url.pathname}?${query}` : url.pathname);
   });
 
   app.post('/dashboard/actions/composio/api-key', async (req, res) => {
@@ -1514,8 +1591,18 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
   });
 
   await new Promise<void>((resolve, reject) => {
-    const server = app.listen(WEBHOOK_PORT, '0.0.0.0', () => {
-      logger.info({ port: WEBHOOK_PORT }, 'Webhook server listening');
+    if (!isLoopbackWebhookHost(WEBHOOK_HOST)) {
+      if (!WEBHOOK_ALLOW_LAN) {
+        reject(new Error(`Refusing to bind webhook server to ${WEBHOOK_HOST}. Set WEBHOOK_ALLOW_LAN=true to opt in.`));
+        return;
+      }
+      if (!WEBHOOK_SECRET_IS_STRONG) {
+        reject(new Error('Refusing LAN webhook bind because WEBHOOK_SECRET is missing, weak, or placeholder-like.'));
+        return;
+      }
+    }
+    const server = app.listen(WEBHOOK_PORT, WEBHOOK_HOST, () => {
+      logger.info({ host: WEBHOOK_HOST, port: WEBHOOK_PORT }, 'Webhook server listening');
       resolve();
     });
     server.on('error', (error) => {

@@ -13,7 +13,6 @@ import {
   DEFAULT_MODELS,
   LOCAL_MCP_ENABLED,
   MODEL_ENV_KEYS,
-  WEBHOOK_SECRET,
   getModelSettingsSnapshot,
   getOpenAiApiKey,
   getRuntimeEnv,
@@ -624,7 +623,7 @@ export function registerConsoleRoutes(
       res.status(401).send('Unauthorized');
       return;
     }
-    const queryToken = typeof req.query.token === 'string' ? req.query.token : WEBHOOK_SECRET;
+    const queryToken = typeof req.query.token === 'string' ? req.query.token : '';
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     res.setHeader('Pragma', 'no-cache');
     res.setHeader('Expires', '0');
@@ -916,7 +915,8 @@ export function registerConsoleRoutes(
     }
   });
 
-  app.get('/api/console/memory/files', (_req, res) => {
+  app.get('/api/console/memory/files', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
       const db = openMemoryDb();
       const rows = db.prepare(`
@@ -2465,11 +2465,8 @@ export function registerConsoleRoutes(
    * always block the update. A multi-hour workflow IS something we
    * want to preserve; a quiet chat dock isn't.
    */
-  app.get('/api/console/active-work', (_req, res) => {
-    // Intentionally unauthenticated — same daemon, local-only, used by
-    // the desktop process (which doesn't carry the webhook token by
-    // default for this lightweight probe). The endpoint returns counts,
-    // not user data, so the surface is minimal.
+  app.get('/api/console/active-work', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
       const activeNonChatSessions = listHarnessSessions({
         kind: ['workflow', 'execution', 'agent'],
@@ -4473,6 +4470,36 @@ export function registerConsoleRoutes(
     };
     res.on('close', cleanup);
     res.on('error', cleanup);
+  });
+
+  /**
+   * JSON replay fallback for the chat dock. EventSource can fail before
+   * exposing an HTTP status to the renderer (auth cookie race, transient
+   * network restart, sleeping tab), and the previous UI would remain on
+   * "Clem is starting up..." even though the backend had completed the
+   * run. This endpoint lets the client poll/replay the same session
+   * events over normal fetch auth and recover the visible turn.
+   */
+  app.get('/api/sessions/:sessionId/events/recent', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const sessionId = req.params.sessionId;
+    const session = getHarnessSession(sessionId);
+    if (!session) { res.status(404).json({ error: 'session not found' }); return; }
+    const sinceSeqRaw = typeof req.query.sinceSeq === 'string' ? Number(req.query.sinceSeq) : 0;
+    const sinceSeq = Number.isFinite(sinceSeqRaw) && sinceSeqRaw > 0 ? sinceSeqRaw : 0;
+    const limitRaw = typeof req.query.limit === 'string' ? Number(req.query.limit) : 500;
+    const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(500, Math.trunc(limitRaw))) : 500;
+    try {
+      const events = listHarnessEvents(sessionId, { sinceSeq, limit });
+      res.json({
+        sessionId,
+        sessionStatus: session.status,
+        latestSeq: getLatestHarnessEventSeq(sessionId),
+        events,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
   });
 
   app.post('/api/console/harness-sessions/:sessionId/cancel', async (req, res) => {

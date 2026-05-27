@@ -27,6 +27,7 @@ const listPendingHarnessApprovals = approvalRegistry.listPending;
 import { listSessions as listHarnessSessions } from '../runtime/harness/eventlog.js';
 import {
   DISCORD_ALLOWED_CHANNELS,
+  DISCORD_ALLOWED_USERS,
   ASSISTANT_NAME,
   BASE_DIR,
   DISCORD_BOT_TOKEN,
@@ -784,6 +785,19 @@ function channelAllowedById(channelId: string, type: ChannelType | null): boolea
   return DISCORD_ALLOWED_CHANNELS.includes(channelId);
 }
 
+function userAllowedById(userId: string): boolean {
+  return DISCORD_ALLOWED_USERS.includes(userId);
+}
+
+async function rejectUnauthorizedInteraction(interaction: ButtonInteraction | ChatInputCommandInteraction | ModalSubmitInteraction): Promise<void> {
+  const content = 'This Discord user is not allowed to control Clementine. Add the user id to `DISCORD_ALLOWED_USERS` in Settings.';
+  if (interaction.deferred || interaction.replied) {
+    await interaction.followUp({ content, ephemeral: true }).catch(() => {});
+    return;
+  }
+  await interaction.reply({ content, ephemeral: true }).catch(() => {});
+}
+
 function extractPrompt(message: Message<boolean>): string {
   const mentionPattern = new RegExp(`<@!?${message.client.user?.id}>`, 'g');
   const stripped = message.content.replace(mentionPattern, '').trim();
@@ -795,6 +809,7 @@ function extractPrompt(message: Message<boolean>): string {
 
 function shouldRespond(message: Message<boolean>): boolean {
   if (message.author.bot) return false;
+  if (!userAllowedById(message.author.id)) return false;
   if (!message.content.trim()) return false;
   if (!channelAllowed(message)) return false;
   if (message.channel.type === ChannelType.DM) return true;
@@ -1642,6 +1657,10 @@ async function handleModalSubmit(interaction: ModalSubmitInteraction): Promise<v
   if (!interaction.customId.startsWith(`${DISCORD_CUSTOM_ID_PREFIX}:edit-modal:`)) {
     return;
   }
+  if (!userAllowedById(interaction.user.id) || !channelAllowedById(interaction.channelId ?? '', interaction.channel?.type ?? null)) {
+    await rejectUnauthorizedInteraction(interaction);
+    return;
+  }
   // customId format: `clementine:edit-modal:<approvalId>` (legacy) OR
   // `clementine:edit-modal:<approvalId>:<plain|json>` (2026-05-21+).
   // The mode suffix tells us whether the user edited a single field
@@ -1726,12 +1745,16 @@ async function handleModalSubmit(interaction: ModalSubmitInteraction): Promise<v
   // wrapping needed here.
   // Resolve via the dashboard harness-approval endpoint (same path the
   // desktop dashboard uses), so the resume logic stays in one place.
-  // We hit it on localhost; auth via WEBHOOK_SECRET query param.
-  const url = `http://127.0.0.1:${WEBHOOK_PORT}/api/console/harness-approvals/${encodeURIComponent(approvalId)}/approve_with_edits?token=${encodeURIComponent(WEBHOOK_SECRET)}`;
+  // We hit it on localhost; auth stays in a Bearer header so the
+  // webhook token never appears in logs, Discord, or URL history.
+  const url = `http://127.0.0.1:${WEBHOOK_PORT}/api/console/harness-approvals/${encodeURIComponent(approvalId)}/approve_with_edits`;
   try {
     const response = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${WEBHOOK_SECRET}`,
+      },
       body: JSON.stringify({ modifiedArgs: editedArgs }),
       signal: AbortSignal.timeout(15_000),
     });
@@ -1802,6 +1825,10 @@ async function collapseApprovalCard(
 
 async function handleButtonInteraction(interaction: ButtonInteraction, assistant: ClementineAssistant): Promise<void> {
   if (!interaction.customId.startsWith(`${DISCORD_CUSTOM_ID_PREFIX}:`)) {
+    return;
+  }
+  if (!userAllowedById(interaction.user.id) || !channelAllowedById(interaction.channelId ?? '', interaction.channel?.type ?? null)) {
+    await rejectUnauthorizedInteraction(interaction);
     return;
   }
 
@@ -2019,16 +2046,11 @@ async function handleButtonInteraction(interaction: ButtonInteraction, assistant
         await interaction.reply({ content: `Plan \`${targetId}\` was not found.`, ephemeral: true });
         return;
       }
-      // Deep link to the dashboard plan list. Token in querystring is the
-      // dashboard's existing auth pattern.
-      const tokenPart = WEBHOOK_SECRET ? `?token=${encodeURIComponent(WEBHOOK_SECRET)}` : '';
-      const url = `http://localhost:${WEBHOOK_PORT}/console${tokenPart}`;
       await interaction.reply({
         content: [
           `**${proposal.plan.objective}**`,
           `Complexity: ${proposal.plan.estimatedComplexity}; ${proposal.plan.steps.length} step(s).`,
-          `Open the dashboard to view full steps, success criteria, risks, and edit before approving:`,
-          url,
+          'Open Clementine Desktop → Proposals to view full steps, success criteria, risks, and edit before approving.',
         ].join('\n'),
         ephemeral: true,
       });
@@ -2107,6 +2129,11 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction, assi
     guildId: interaction.guildId,
     userId: interaction.user.id,
   }, 'Discord slash command received');
+
+  if (!userAllowedById(interaction.user.id)) {
+    await rejectUnauthorizedInteraction(interaction);
+    return;
+  }
 
   if (!channelAllowedById(interaction.channelId, interaction.channel?.type ?? null)) {
     await interaction.reply({
@@ -2432,7 +2459,7 @@ async function pollDiscordDirectMessages(client: Client, assistant: ClementineAs
       }
 
       const pending = messages
-        .filter((message) => !message.author.bot && compareSnowflakes(message.id, lastSeen) > 0)
+        .filter((message) => !message.author.bot && message.author.id === userId && userAllowedById(message.author.id) && compareSnowflakes(message.id, lastSeen) > 0)
         .sort((left, right) => compareSnowflakes(left.id, right.id));
 
       for (const message of pending) {

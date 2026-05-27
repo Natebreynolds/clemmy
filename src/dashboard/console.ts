@@ -9028,6 +9028,7 @@ const CONSOLE_JS = `
   let lastRunsJSON = '';
 
   function withToken(path) {
+    if (!TOKEN) return path;
     const sep = path.includes('?') ? '&' : '?';
     return path + sep + 'token=' + encodeURIComponent(TOKEN);
   }
@@ -15370,15 +15371,19 @@ const CONSOLE_JS = `
       let attempts = 0;
       let es = null;
       let closed = false;
+      let sawEvent = false;
+      let fallbackTimer = null;
 
       const finish = () => {
         if (closed) return;
         closed = true;
         try { if (es) es.close(); } catch (_) {}
+        if (fallbackTimer) { try { clearInterval(fallbackTimer); } catch (_) {} fallbackTimer = null; }
         resolve();
       };
 
       const handleEvent = (ev) => {
+        sawEvent = true;
         if (ev && typeof ev.seq === 'number' && ev.seq > lastSeq) lastSeq = ev.seq;
         renderHarnessEvent(ev, turn, options);
         if (ev.type === 'conversation_completed') {
@@ -15424,6 +15429,22 @@ const CONSOLE_JS = `
         }
       };
 
+      const pollReplayFallback = async () => {
+        if (closed) return;
+        try {
+          const base = '/api/sessions/' + encodeURIComponent(sessionId) + '/events/recent';
+          const sep = base.includes('?') ? '&' : '?';
+          const data = await fetchJSON(base + sep + 'sinceSeq=' + encodeURIComponent(String(lastSeq)) + '&limit=500');
+          const events = Array.isArray(data.events) ? data.events : [];
+          for (const ev of events) {
+            handleEvent(ev);
+            if (closed) break;
+          }
+        } catch (_) {
+          // Best-effort only. EventSource is still the primary stream.
+        }
+      };
+
       const connect = () => {
         if (closed) return;
         // Defensive close — match the convention used by the other two
@@ -15460,14 +15481,21 @@ const CONSOLE_JS = `
           if (closed) return;
           if (es && es.readyState === EventSource.CLOSED) {
             // Server-side close (terminal session, auth failure, etc).
-            // Don't reconnect — the user-visible state is already final.
-            finish();
+            // EventSource hides the HTTP status, so before giving up
+            // use the JSON replay fallback; a finished backend run
+            // should still become visible in the chat card.
+            pollReplayFallback().finally(() => {
+              if (!closed && sawEvent) return;
+              finish();
+            });
             return;
           }
           attempts += 1;
           if (attempts > MAX_RECONNECTS) {
-            setChatTurnStatus(turn, 'lost connection');
-            finish();
+            pollReplayFallback().finally(() => {
+              if (!closed && !sawEvent) setChatTurnStatus(turn, 'lost connection');
+              if (!closed) finish();
+            });
             return;
           }
           try { if (es) es.close(); } catch (_) {}
@@ -15476,6 +15504,11 @@ const CONSOLE_JS = `
         };
       };
 
+      // Poll as a safety net. This is intentionally light: it only
+      // fetches events after lastSeq and stops as soon as the turn hits
+      // a terminal state. It covers renderer/EventSource drops without
+      // changing the backend run path.
+      fallbackTimer = setInterval(pollReplayFallback, 2500);
       connect();
     });
   }
@@ -20494,7 +20527,7 @@ const CONSOLE_JS = `
 
     function connect() {
       if (es) { try { es.close(); } catch (_) {} es = null; }
-      const url = '/api/console/actions/stream?token=' + encodeURIComponent(TOKEN);
+      const url = withToken('/api/console/actions/stream');
       try {
         es = new EventSource(url);
       } catch (err) {

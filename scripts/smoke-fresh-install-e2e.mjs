@@ -198,7 +198,7 @@ while (Date.now() < deadline) {
   // Phase 2: hit the dashboard route. Cold start can pay for indexer
   // + DB warmup on the first hit, so we give it 15s.
   try {
-    const r = await fetch(`http://localhost:${daemonPort}/api/dashboard?token=${encodeURIComponent(webhookSecret)}`, {
+    const r = await fetch(`http://127.0.0.1:${daemonPort}/api/dashboard?token=${encodeURIComponent(webhookSecret)}`, {
       signal: AbortSignal.timeout(15_000),
     });
     if (r.status === 200 || r.status === 401) {
@@ -224,9 +224,18 @@ if (!ready) {
 
 section('Phase 3 · /console renders HTML and authenticates with the wizard token');
 
-const consoleUrl = `http://localhost:${daemonPort}/console?token=${encodeURIComponent(webhookSecret)}`;
+const consoleUrl = `http://127.0.0.1:${daemonPort}/console?token=${encodeURIComponent(webhookSecret)}`;
 try {
-  const r = await fetch(consoleUrl, { signal: AbortSignal.timeout(5000) });
+  const bootstrap = await fetch(consoleUrl, { redirect: 'manual', signal: AbortSignal.timeout(5000) });
+  const cookie = (bootstrap.headers.get('set-cookie') || '').split(';')[0];
+  const location = bootstrap.headers.get('location') || '/console';
+  if (bootstrap.status !== 302 || !cookie || location.includes('token=')) {
+    fail('/console token bootstrap sets a cookie and redirects without token leakage', `status=${bootstrap.status} location=${location}`);
+  }
+  const r = await fetch(new URL(location, `http://127.0.0.1:${daemonPort}`), {
+    headers: cookie ? { Cookie: cookie } : {},
+    signal: AbortSignal.timeout(5000),
+  });
   const body = await r.text();
   if (r.status !== 200) fail(`/console returned 200`, `got ${r.status}, body: ${body.slice(0, 200)}`);
   else if (!body.includes('<') || body.length < 200) fail(`/console returned HTML`, `body too small (${body.length} chars), starts with: ${body.slice(0, 200)}`);
@@ -237,7 +246,7 @@ try {
 
 // Also probe the WRONG token to make sure auth actually works.
 try {
-  const r = await fetch(`http://localhost:${daemonPort}/console?token=wrong-token`, { signal: AbortSignal.timeout(5000) });
+  const r = await fetch(`http://127.0.0.1:${daemonPort}/console?token=wrong-token`, { signal: AbortSignal.timeout(5000) });
   // Some routes redirect, some return 401 — anything other than 200 with full HTML means auth is working.
   // We just care that the wizard-issued token is the one that unlocks it.
   if (r.status === 200) {
@@ -259,7 +268,7 @@ try {
 section('Phase 4 · dashboard sees the wizard-written openai_api_key');
 
 try {
-  const r = await fetch(`http://localhost:${daemonPort}/api/console/credentials?token=${encodeURIComponent(webhookSecret)}`, {
+  const r = await fetch(`http://127.0.0.1:${daemonPort}/api/console/credentials?token=${encodeURIComponent(webhookSecret)}`, {
     signal: AbortSignal.timeout(5000),
   });
   const body = await r.text();

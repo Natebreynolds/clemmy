@@ -396,7 +396,7 @@ function reportBootSetupIssues(): void {
     issues.push({
       slug: 'webhook-secret',
       title: 'Webhook secret is the default placeholder',
-      body: 'The dashboard / webhook endpoint is using a placeholder WEBHOOK_SECRET. Anyone on your network could reach the API. Set a real secret in `~/.clementine-next/.env` and restart the daemon.',
+      body: 'The dashboard / webhook endpoint is using a placeholder WEBHOOK_SECRET. Local access is protected by loopback binding, but you should still set a real secret in `~/.clementine-next/.env` before enabling LAN access.',
     });
   }
 

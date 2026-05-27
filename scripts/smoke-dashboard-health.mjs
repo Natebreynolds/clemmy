@@ -93,7 +93,7 @@ child.on('exit', (code, signal) => {
   }
 });
 
-const dashUrl = `http://localhost:${PORT}`;
+const dashUrl = `http://127.0.0.1:${PORT}`;
 
 // Two-phase readiness: same pattern as smoke-fresh-install-e2e.mjs.
 // Phase 1 (TCP probe via net.createConnection) proves the port is
@@ -151,7 +151,14 @@ try {
   ok(`daemon bound port ${PORT}`);
 
   // ─── 2. fetch /console ─────────────────────────────────────────
-  const consoleRes = await fetch(`${dashUrl}/console?token=${encodeURIComponent(TOKEN)}`);
+  const bootstrapRes = await fetch(`${dashUrl}/console?token=${encodeURIComponent(TOKEN)}`, { redirect: 'manual' });
+  const cookie = (bootstrapRes.headers.get('set-cookie') || '').split(';')[0];
+  const location = bootstrapRes.headers.get('location') || '/console';
+  if (bootstrapRes.status !== 302 || !cookie || location.includes('token=')) {
+    fail(`/console token bootstrap should set a cookie and redirect without leaking token (status=${bootstrapRes.status}, location=${location})`);
+    throw new Error('console-bootstrap-failed');
+  }
+  const consoleRes = await fetch(new URL(location, dashUrl), { headers: { Cookie: cookie } });
   if (consoleRes.status !== 200) {
     fail(`/console returned ${consoleRes.status}`);
     throw new Error('console-not-200');

@@ -34,6 +34,7 @@ interface VaultShape {
 function ensureStateDir(): void {
   const dir = path.dirname(VAULT_FILE);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  try { chmodSync(dir, 0o700); } catch { /* best-effort on platforms that ignore mode */ }
 }
 
 function readVault(): VaultShape {

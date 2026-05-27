@@ -12,6 +12,7 @@ import { needsApprovalFromTaxonomy } from '../agents/tool-taxonomy.js';
 import { findSafeCliCommand } from '../runtime/cli-discovery.js';
 import { formatRecallableToolText } from '../runtime/harness/tool-output-format.js';
 import { callIdFromToolDetails, sessionIdFromRunContext } from '../runtime/harness/tool-output-context.js';
+import { isSensitivePath, redactSensitiveText, shellCommandTouchesSensitiveData } from '../runtime/security.js';
 
 /**
  * Approval gate for SDK-native tools — delegates to the global
@@ -29,7 +30,7 @@ import { callIdFromToolDetails, sessionIdFromRunContext } from '../runtime/harne
 function resolveTargetPath(toolName: string, input: unknown): string | null {
   if (!input || typeof input !== 'object') return null;
   const obj = input as Record<string, unknown>;
-  const target = toolName === 'write_file'
+  const target = toolName === 'write_file' || toolName === 'read_file'
     ? (typeof obj.path === 'string' ? obj.path : '')
     : (typeof obj.cwd === 'string' && obj.cwd ? obj.cwd : process.cwd());
   if (!target) return null;
@@ -159,10 +160,28 @@ function needsApprovalForShellSmart() {
   // truly catastrophic shapes (rm -rf /, sudo, shutdown).
   return async (runContext: unknown, input: unknown): Promise<boolean> => {
     const command = (input && typeof input === 'object' ? (input as Record<string, unknown>).command : undefined);
+    if (typeof command === 'string' && shellCommandTouchesSensitiveData(command)) return true;
     if (!shellCommandNeedsApproval(command)) return false;
     // Destructive pattern matched — still honor plan-scope so an
     // approved plan can pre-cover the whole thing.
     return needsApprovalUnlessInPlanScope('run_shell_command')(runContext, input);
+  };
+}
+
+function inputTargetsSensitivePath(toolName: string, input: unknown): boolean {
+  const resolved = resolveTargetPath(toolName, input);
+  return Boolean(resolved && isSensitivePath(resolved));
+}
+
+function needsApprovalForReadFile() {
+  return async (_runContext: unknown, input: unknown): Promise<boolean> => inputTargetsSensitivePath('read_file', input);
+}
+
+function needsApprovalForWriteFile() {
+  const base = needsApprovalUnlessInPlanScope('write_file');
+  return async (runContext: unknown, input: unknown): Promise<boolean> => {
+    if (inputTargetsSensitivePath('write_file', input)) return true;
+    return base(runContext, input);
   };
 }
 
@@ -427,7 +446,7 @@ function listDirectory(dir: string, limit: number): string {
 
 export function getComputerTools(): Tool<RuntimeContextValue>[] {
   const formatToolOutput = (toolName: string, runContext: unknown, details: unknown, output: string): string =>
-    formatRecallableToolText(output, {
+    formatRecallableToolText(redactSensitiveText(output), {
       toolName,
       sessionId: sessionIdFromRunContext(runContext),
       callId: callIdFromToolDetails(details),
@@ -467,6 +486,7 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
       path: z.string().min(1),
       max_chars: z.number().min(1).max(50000).nullable(),
     }),
+    needsApproval: needsApprovalForReadFile(),
     execute: async (input, runContext, details) => {
       const filePath = resolveAllowedPath(input.path);
       if (!existsSync(filePath)) return `File does not exist: ${filePath}`;
@@ -494,7 +514,7 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
       content: z.string(),
       mode: z.enum(['create', 'append', 'overwrite']).nullable(),
     }),
-    needsApproval: needsApprovalUnlessInPlanScope('write_file'),
+    needsApproval: needsApprovalForWriteFile(),
     execute: async (input) => {
       const filePath = resolveAllowedPath(input.path);
       const mode = input.mode ?? 'create';

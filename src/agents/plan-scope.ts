@@ -3,6 +3,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import pino from 'pino';
 import { BASE_DIR } from '../config.js';
+import { redactSensitiveText } from '../runtime/security.js';
 
 /**
  * Plan-scoped approval — the consent boundary that turns the
@@ -276,16 +277,17 @@ export function summarizeToolArgs(toolName: string, input: unknown): string {
     case 'run_shell_command': {
       const cmd = typeof obj.command === 'string' ? obj.command : '';
       const cwd = typeof obj.cwd === 'string' ? obj.cwd : '';
-      return cwd ? `[cwd=${cwd}] ${cmd.slice(0, 240)}` : cmd.slice(0, 240);
+      const summary = cwd ? `[cwd=${cwd}] ${cmd.slice(0, 240)}` : cmd.slice(0, 240);
+      return redactSensitiveText(summary);
     }
     case 'write_file': {
       const p = typeof obj.path === 'string' ? obj.path : '';
       const mode = typeof obj.mode === 'string' ? `${obj.mode} ` : '';
       const len = typeof obj.content === 'string' ? obj.content.length : 0;
-      return `${mode}${p} (${len} chars)`;
+      return redactSensitiveText(`${mode}${p} (${len} chars)`);
     }
     default:
-      return Object.entries(obj).slice(0, 4).map(([k, v]) => `${k}=${String(v).slice(0, 60)}`).join(' · ');
+      return redactSensitiveText(Object.entries(obj).slice(0, 4).map(([k, v]) => `${k}=${String(v).slice(0, 60)}`).join(' · '));
   }
 }
 

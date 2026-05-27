@@ -70,7 +70,7 @@ export const KNOWN_CREDENTIALS: readonly CredentialDescriptor[] = [
   { name: 'recall_api_key', envVarName: 'RECALL_API_KEY', description: 'Recall.ai API key — optional desktop meeting capture and transcripts.', setupHint: 'Sign up at recall.ai and create an API key.', required: false },
   { name: 'codex_oauth_access_token', envVarName: '', description: 'Codex OAuth access token — primary runtime auth for ChatGPT/Codex subscribers.', required: false },
   { name: 'codex_oauth_refresh_token', envVarName: '', description: 'Codex OAuth refresh token — renews ChatGPT/Codex auth silently.', required: false },
-  { name: 'webhook_secret', envVarName: 'WEBHOOK_SECRET', description: 'Dashboard auth secret (URL token).', setupHint: 'Auto-generated on first launch.', required: true },
+  { name: 'webhook_secret', envVarName: 'WEBHOOK_SECRET', description: 'Dashboard and local API auth secret.', setupHint: 'Auto-generated on first launch.', required: true },
 ];
 
 interface VaultShape { version: 'v1'; entries: Record<string, string>; }
@@ -131,6 +131,7 @@ export async function isKeychainAvailable(): Promise<boolean> {
 
 function ensureStateDir(): void {
   if (!existsSync(STATE_DIR)) mkdirSync(STATE_DIR, { recursive: true });
+  try { chmodSync(STATE_DIR, 0o700); } catch { /* ignore */ }
 }
 
 function readVault(): VaultShape {

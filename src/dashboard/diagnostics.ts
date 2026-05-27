@@ -21,6 +21,7 @@ import path from 'node:path';
 import { BASE_DIR } from '../config.js';
 import { listMcpServerHealth, type MCPServerHealthSnapshot } from '../runtime/mcp-namespace-shim.js';
 import { readCachedScan } from '../runtime/cli-discovery.js';
+import { redactSensitiveText, redactSensitiveValue } from '../runtime/security.js';
 
 const SUPERVISOR_LOG_PATH = path.join(BASE_DIR, 'logs', 'desktop', 'supervisor.log');
 const TOOL_EVENTS_DIR = path.join(BASE_DIR, 'state', 'tool-events');
@@ -207,8 +208,8 @@ function readRecentErrors(limit = 50): LogLine[] {
       out.push({
         at: d.time ? new Date(Number(d.time)).toISOString() : new Date().toISOString(),
         level: level >= 50 ? 'error' : 'warn',
-        source: String(d.name ?? '?').replace(/^clementine-next\./, ''),
-        message: msg,
+        source: redactSensitiveText(String(d.name ?? '?').replace(/^clementine-next\./, '')),
+        message: redactSensitiveText(msg),
       });
     } catch { /* skip malformed */ }
   }
@@ -238,7 +239,7 @@ function readStorageStats(): StorageStats {
 }
 
 export function collectDiagnostics(): DiagnosticsSummary {
-  const servers = listMcpServerHealth();
+  const servers = redactSensitiveValue(listMcpServerHealth());
   const mcpSummary: McpHealthSummary = {
     total: servers.length,
     connected: servers.filter((s) => s.state === 'connected').length,

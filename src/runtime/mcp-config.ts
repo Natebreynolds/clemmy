@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { MCP_SERVERS_FILE, getRuntimeEnv } from '../config.js';
@@ -150,7 +150,10 @@ export function loadUserMcpServers(): Record<string, Partial<ManagedMcpServer>> 
 }
 
 export function saveUserMcpServers(servers: Record<string, Partial<ManagedMcpServer>>): void {
-  mkdirSync(path.dirname(MCP_SERVERS_FILE), { recursive: true });
-  writeFileSync(MCP_SERVERS_FILE, JSON.stringify(servers, null, 2));
+  const dir = path.dirname(MCP_SERVERS_FILE);
+  mkdirSync(dir, { recursive: true });
+  try { chmodSync(dir, 0o700); } catch { /* best-effort */ }
+  writeFileSync(MCP_SERVERS_FILE, JSON.stringify(servers, null, 2), { encoding: 'utf-8', mode: 0o600 });
+  try { chmodSync(MCP_SERVERS_FILE, 0o600); } catch { /* best-effort */ }
   invalidateMcpServerDiscoveryCache();
 }

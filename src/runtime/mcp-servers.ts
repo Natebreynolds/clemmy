@@ -8,6 +8,20 @@ import { filterMcpToolsForScope } from './mcp-tool-filter.js';
 import type { McpToolScope } from './mcp-tool-scope.js';
 import type { ManagedMcpServer } from '../types.js';
 
+function positiveIntEnv(key: string, fallback: number): number {
+  const raw = process.env[key];
+  if (!raw) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+// The Agents SDK defaults the MCP client initialize/listTools timeout to
+// 5 seconds. That is too low for cold `npx` servers and packaged Electron
+// startup on slower Macs, so Clementine opts into a bounded but realistic
+// handshake window while the namespace shim still caps first-turn discovery.
+const MCP_CLIENT_SESSION_TIMEOUT_SECONDS = positiveIntEnv('MCP_CLIENT_SESSION_TIMEOUT_SECONDS', 30);
+const MCP_REQUEST_TIMEOUT_MS = positiveIntEnv('MCP_REQUEST_TIMEOUT_MS', 10 * 60 * 1000);
+
 function mergedEnv(extra: Record<string, string> = {}): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [key, value] of Object.entries(process.env)) {
@@ -84,6 +98,8 @@ function createLocalServer(): MCPServerStdio | null {
       name: 'clementine-local',
       command: localNodeCommand(),
       args: [distEntry],
+      clientSessionTimeoutSeconds: MCP_CLIENT_SESSION_TIMEOUT_SECONDS,
+      timeout: MCP_REQUEST_TIMEOUT_MS,
       env: mergedEnv({
         CLEMENTINE_HOME: BASE_DIR,
       }),
@@ -95,6 +111,8 @@ function createLocalServer(): MCPServerStdio | null {
     name: 'clementine-local',
     command: 'npx',
     args: ['tsx', srcEntry],
+    clientSessionTimeoutSeconds: MCP_CLIENT_SESSION_TIMEOUT_SECONDS,
+    timeout: MCP_REQUEST_TIMEOUT_MS,
     env: mergedEnv({
       CLEMENTINE_HOME: BASE_DIR,
     }),
@@ -110,6 +128,8 @@ function createExternalServer(server: ManagedMcpServer): MCPServer | null {
       name: server.name,
       command: server.command,
       args: server.args ?? [],
+      clientSessionTimeoutSeconds: MCP_CLIENT_SESSION_TIMEOUT_SECONDS,
+      timeout: MCP_REQUEST_TIMEOUT_MS,
       env: mergedEnv(server.env),
       cwd: BASE_DIR,
     });
@@ -119,6 +139,8 @@ function createExternalServer(server: ManagedMcpServer): MCPServer | null {
     return new MCPServerStreamableHttp({
       name: server.name,
       url: server.url,
+      clientSessionTimeoutSeconds: MCP_CLIENT_SESSION_TIMEOUT_SECONDS,
+      timeout: MCP_REQUEST_TIMEOUT_MS,
       requestInit: server.headers ? { headers: server.headers } : undefined,
     });
   }
@@ -127,6 +149,8 @@ function createExternalServer(server: ManagedMcpServer): MCPServer | null {
     return new MCPServerSSE({
       name: server.name,
       url: server.url,
+      clientSessionTimeoutSeconds: MCP_CLIENT_SESSION_TIMEOUT_SECONDS,
+      timeout: MCP_REQUEST_TIMEOUT_MS,
       eventSourceInit: server.headers ? { fetch: (input: RequestInfo | URL, init?: RequestInit) => fetch(input, { ...init, headers: server.headers }) } : undefined,
     });
   }
