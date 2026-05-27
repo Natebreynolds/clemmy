@@ -5,6 +5,13 @@ import { tickMemoryMdRefresh } from './memory-md-builder.js';
 import { tickIdentityMdRefresh } from './identity-md-builder.js';
 import { tickAutoresearchObservatory } from '../autoresearch/observatory.js';
 import { reapStaleToolOutputs } from '../runtime/harness/eventlog.js';
+import {
+  reapStuckRecallRecordings,
+  loadRecallMeetingSettings,
+  buildAnalyzerPrompt,
+} from '../integrations/recall/meeting-capture.js';
+import { startCanonicalTranscriptBackfill } from '../integrations/recall/backfill.js';
+import { createBackgroundTask } from '../execution/background-tasks.js';
 
 /**
  * Memory maintenance for the daemon tick.
@@ -58,6 +65,14 @@ const AUTORESEARCH_NIGHTLY_MINUTE = 0;
 // cheap (single DELETE with index on created_at). Each row is 4KB-200KB
 // so even on a busy day the delete-set is bounded.
 const EVENTLOG_REAPER_EVERY_N_TICKS = 240; // ~1h with a 15s tick
+// Recall stuck-recording reaper. Some captures (notably the
+// desktop-audio fallback, which isn't tied to a meeting window) never
+// get the SDK's recording-ended event, so they hang in 'recording'
+// forever — a perpetual "LIVE" ghost in the meetings panel with no
+// analysis. Check every ~5 min; reapStuckRecallRecordings only
+// finalizes records idle (no new transcript) for 60+ min, so a live
+// call is never cut off. Cheap: a readdir + per-record timestamp check.
+const RECALL_REAPER_EVERY_N_TICKS = 20; // ~5min with a 15s tick
 // Track the last calendar day on which we fired the nightly run so we
 // don't re-fire 240 times across the matching minute window (15s ticks
 // inside 3:00–3:00:59 would otherwise all match). Reset per-process —
@@ -120,6 +135,42 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
       }
     } catch (err) {
       logger.warn({ err }, 'tool_outputs reaper tick failed');
+    }
+  }
+
+  // Recall stuck-recording reaper — finalize abandoned 'recording'
+  // records so they stop showing as live and get analyzed. Mirrors the
+  // post-processing the /api/console/meetings/recall/complete route does
+  // on a normal recording-ended: reindex the vault, queue the analyzer,
+  // and (when there's a recordingId) kick the canonical-transcript
+  // backfill.
+  if (tickCount % RECALL_REAPER_EVERY_N_TICKS === 0) {
+    try {
+      const finalized = reapStuckRecallRecordings();
+      if (finalized.length > 0) {
+        const settings = loadRecallMeetingSettings();
+        let reindexed = false;
+        for (const { record, artifactPath } of finalized) {
+          if (artifactPath && !reindexed) {
+            try { reindexVault(); reindexed = true; } catch { /* maintenance reindex tick will retry */ }
+          }
+          if (record.recordingId) {
+            startCanonicalTranscriptBackfill({ windowId: record.windowId, recordingId: record.recordingId });
+          }
+          if (artifactPath && settings.analyzeOnComplete) {
+            createBackgroundTask({
+              title: `Analyze meeting transcript: ${record.title || record.platform || record.id}`,
+              prompt: buildAnalyzerPrompt(record, artifactPath),
+              source: 'daemon',
+              channel: 'electron:meeting-capture',
+              maxMinutes: 30,
+            });
+          }
+        }
+        logger.info({ count: finalized.length }, 'recall stuck-recording reaper finalized abandoned captures');
+      }
+    } catch (err) {
+      logger.warn({ err }, 'recall stuck-recording reaper tick failed');
     }
   }
 

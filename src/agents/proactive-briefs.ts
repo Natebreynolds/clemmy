@@ -10,7 +10,7 @@ import { isUserFacingExecution } from '../execution/scope.js';
 import { addNotification } from '../runtime/notifications.js';
 import { GOALS_DIR } from '../tools/shared.js';
 import { getProactivityPolicySnapshot } from './proactivity-policy.js';
-import { listPending as listApprovalRegistry, type PendingApprovalRow } from '../runtime/harness/approval-registry.js';
+import { isActionable as isActionableApproval, listPending as listApprovalRegistry, type PendingApprovalRow } from '../runtime/harness/approval-registry.js';
 
 const logger = pino({ name: 'clementine-next.proactive-briefs' });
 
@@ -33,6 +33,42 @@ interface GoalRecord {
   nextActions?: string[];
   blockers?: string[];
   updatedAt?: string;
+}
+
+export interface BriefBackgroundTaskLike {
+  status: string;
+  pendingApprovalId?: string;
+}
+
+export function isActiveBackgroundTaskForBrief(
+  task: BriefBackgroundTaskLike,
+  actionableApprovalIds: ReadonlySet<string>,
+): boolean {
+  const isActive =
+    task.status === 'pending' ||
+    task.status === 'running' ||
+    task.status === 'cancelling' ||
+    task.status === 'awaiting_approval' ||
+    task.status === 'interrupted';
+  if (!isActive) return false;
+
+  // Some old background tasks can be left in awaiting_approval after their
+  // approval row has been resolved, expired, or migrated away. They are not
+  // actionable, so they should not inflate Discord "background task" counts.
+  if (task.status === 'awaiting_approval' && task.pendingApprovalId) {
+    return actionableApprovalIds.has(task.pendingApprovalId);
+  }
+  return true;
+}
+
+export function singleApprovalMetadataForBrief(approvals: PendingApprovalRow[]): Record<string, string> {
+  if (approvals.length !== 1) return {};
+  const approval = approvals[0];
+  return {
+    approvalId: approval.approvalId,
+    approvalSessionId: approval.sessionId,
+    approvalSubject: approval.subject,
+  };
 }
 
 function ensureStateDir(): void {
@@ -123,19 +159,6 @@ export async function processProactiveBriefs(assistant: ClementineAssistant): Pr
       (execution.status === 'active' || execution.status === 'blocked') &&
       isUserFacingExecution(execution),
     );
-  const backgroundTasks = listBackgroundTasks().slice(0, 50);
-  const activeTasks = backgroundTasks.filter((task) =>
-    task.status === 'pending' ||
-    task.status === 'running' ||
-    task.status === 'cancelling' ||
-    task.status === 'awaiting_approval' ||
-    task.status === 'interrupted',
-  );
-  const recentFailures = backgroundTasks.filter((task) =>
-    (task.status === 'failed' || task.status === 'aborted') &&
-    task.completedAt &&
-    Date.now() - new Date(task.completedAt).getTime() <= RECENT_FAILURE_WINDOW_MS,
-  );
   // Brief surfaces ONLY approvals that are stale enough to need a
   // nudge. Fresh approvals (just requested) already get their own
   // dedicated Discord card with Approve/Edit/Reject buttons — listing
@@ -159,7 +182,30 @@ export async function processProactiveBriefs(assistant: ClementineAssistant): Pr
       return [];
     }
   })();
-  const approvals = registryRows.filter((approval) => {
+  const actionableRegistryRows = registryRows.filter((approval) => isActionableApproval(approval));
+  const runtimePendingApprovalIds = new Set<string>();
+  try {
+    for (const approval of assistant.getRuntime().listPendingApprovals()) {
+      if (approval.status === 'pending') runtimePendingApprovalIds.add(approval.id);
+    }
+  } catch {
+    // Runtime approval state is best-effort for brief hygiene. The harness
+    // registry above remains the authoritative source for new approvals.
+  }
+  const actionableApprovalIds = new Set<string>([
+    ...actionableRegistryRows.map((approval) => approval.approvalId),
+    ...runtimePendingApprovalIds,
+  ]);
+  const backgroundTasks = listBackgroundTasks().slice(0, 50);
+  const activeTasks = backgroundTasks.filter((task) =>
+    isActiveBackgroundTaskForBrief(task, actionableApprovalIds),
+  );
+  const recentFailures = backgroundTasks.filter((task) =>
+    (task.status === 'failed' || task.status === 'aborted') &&
+    task.completedAt &&
+    Date.now() - new Date(task.completedAt).getTime() <= RECENT_FAILURE_WINDOW_MS,
+  );
+  const approvals = actionableRegistryRows.filter((approval) => {
     const requestedAt = approval.requestedAt;
     if (!requestedAt) return true;
     return Date.now() - new Date(requestedAt).getTime() >= APPROVAL_BRIEF_AGE_MS;
@@ -219,7 +265,9 @@ export async function processProactiveBriefs(assistant: ClementineAssistant): Pr
             return `- Pending ${ageLabel}: ${subject}${sourceWorkflow}`;
           }),
           ...(approvals.length > 4 ? [`- … +${approvals.length - 4} more pending.`] : []),
-          'Open the dashboard → Approvals panel to handle these (approve / edit / reject / cancel).',
+          approvals.length === 1
+            ? `Tap Approve, Edit, or Reject below — or reply \`approve ${approvals[0].approvalId}\` / \`reject ${approvals[0].approvalId}\`.`
+            : 'Reply `approvals` to get individual approval cards, or open the Approvals panel.',
         ]
       : []),
     ...blockedExecutions.slice(0, 4).map((execution) =>
@@ -254,6 +302,7 @@ export async function processProactiveBriefs(assistant: ClementineAssistant): Pr
     : urgent
       ? 'Clementine needs attention'
       : 'Clementine work update';
+  const approvalMetadata = singleApprovalMetadataForBrief(approvals);
 
   addNotification({
     id: `${Date.now()}-proactive-brief`,
@@ -269,6 +318,7 @@ export async function processProactiveBriefs(assistant: ClementineAssistant): Pr
       activeBackgroundTaskCount: activeTasks.length,
       pendingApprovalCount: approvals.length,
       blockedGoalCount: blockedGoals.length,
+      ...approvalMetadata,
     },
   });
 

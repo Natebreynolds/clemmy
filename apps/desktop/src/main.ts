@@ -729,6 +729,13 @@ ipcMain.handle('clemmy:recall-start-manual', async () => {
   return recallCapture?.startManualRecording() ?? null;
 });
 
+// Primary "RECORD MEETING" path — records the detected meeting window
+// when one is open, else falls back to desktop audio. See
+// RecallDesktopCapture.recordActiveMeetingOrDesktop.
+ipcMain.handle('clemmy:recall-record-active', async () => {
+  return recallCapture?.recordActiveMeetingOrDesktop() ?? null;
+});
+
 ipcMain.handle('clemmy:recall-record-detected', async (_evt: IpcMainInvokeEvent, payload: { windowId: string }) => {
   const id = (payload?.windowId ?? '').trim();
   if (!id) throw new Error('windowId required');

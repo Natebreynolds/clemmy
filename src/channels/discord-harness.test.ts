@@ -158,6 +158,20 @@ test('approval buttons collapse sibling approvals into one batch action', () => 
   assert.equal(rows[0].components[1].label, 'Reject all 2');
 });
 
+test('approval picker gives each ambiguous global approval explicit buttons', () => {
+  const rows = __test__.approvalPickerComponents([
+    approvalRow({ approvalId: 'apr-1111', subject: 'first approval' }),
+    approvalRow({ approvalId: 'apr-2222', subject: 'second approval' }),
+  ]) as Array<{ components: Array<{ label: string; custom_id: string }> }>;
+
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].components[0].label, 'Approve apr-1111');
+  assert.equal(rows[0].components[0].custom_id, 'clementine:approve:apr-1111');
+  assert.equal(rows[0].components[1].custom_id, 'clementine:reject:apr-1111');
+  assert.equal(rows[1].components[0].custom_id, 'clementine:approve:apr-2222');
+  assert.equal(rows[1].components[1].custom_id, 'clementine:reject:apr-2222');
+});
+
 test('guardrail_tripped stays internal and does not overwrite Discord status', () => {
   const s = { summary: 'Approval required: create sheet', status: 'approval required', done: true, toolsCalled: [], toolCount: 0 };
   applyEventToState(event('guardrail_tripped', { name: 'guardrail' }), s);

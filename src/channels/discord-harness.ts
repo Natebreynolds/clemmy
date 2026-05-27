@@ -803,9 +803,53 @@ function pendingDiscordApprovalsForChannel(channelId: string): approvalRegistry.
     .filter((row) => approvalBelongsToDiscordChannel(row, channelId));
 }
 
+function globalApprovalRowsForDm(channelId: string): approvalRegistry.PendingApprovalRow[] {
+  return approvalRegistry
+    .listPending({ status: 'pending' })
+    .filter((row) => {
+      if (!approvalRegistry.isActionable(row)) return false;
+      if (!isDiscordApproval(row)) return true;
+      return row.channelId === channelId;
+    });
+}
+
+function approvalPickerComponents(rows: approvalRegistry.PendingApprovalRow[]): unknown[] {
+  return rows.slice(0, 5).map((row) => ({
+    type: 1,
+    components: [
+      { type: 2, style: 3, label: `Approve ${row.approvalId}`, custom_id: `clementine:approve:${row.approvalId}` },
+      { type: 2, style: 4, label: `Reject ${row.approvalId}`, custom_id: `clementine:reject:${row.approvalId}` },
+    ],
+  }));
+}
+
+async function sendApprovalPicker(
+  transport: DiscordHarnessTransport,
+  rows: approvalRegistry.PendingApprovalRow[],
+  decision: 'approve' | 'reject',
+): Promise<void> {
+  const verb = decision === 'approve' ? 'approve' : 'reject';
+  const lines = [
+    `I found ${rows.length} pending approval${rows.length === 1 ? '' : 's'}. Pick the one you mean:`,
+    '',
+    ...rows.slice(0, 5).map((row) => `- \`${row.approvalId}\` — ${row.subject}`),
+    ...(rows.length > 5 ? [`- +${rows.length - 5} more in the Approvals panel`] : []),
+    '',
+    `Tap a button below, or reply \`${verb} apr-xxxx\`.`,
+  ];
+  const body = lines.join('\n');
+  const handle = await transport.sendInitial(body);
+  const components = approvalPickerComponents(rows);
+  if (components.length > 0) {
+    await handle.edit(body, { components });
+  }
+}
+
 export const __test__ = {
   approvalBelongsToDiscordChannel,
   approvalComponentsForState,
+  approvalPickerComponents,
+  globalApprovalRowsForDm,
   isDiscordTokenExpired,
 };
 
@@ -826,6 +870,7 @@ export async function tryHandleHarnessApprovalReply(opts: {
   channelId: string;
   prompt: string;
   transport: DiscordHarnessTransport;
+  allowGlobalApprovalFallback?: boolean;
 }): Promise<boolean> {
   const intent = parseApprovalIntent(opts.prompt);
   if (!intent) return false;
@@ -865,6 +910,18 @@ export async function tryHandleHarnessApprovalReply(opts: {
         return true;
       }
 
+      const detachedSession = HarnessSession.load(row.sessionId);
+      if (row.channel !== 'workflow' && detachedSession?.loadInterruptState()) {
+        await runDiscordHarnessResume({
+          channelId: opts.channelId,
+          decision: intent.decision,
+          approvalId: intent.approvalId,
+          transport: opts.transport,
+          allowDetachedNonDiscord: true,
+        });
+        return true;
+      }
+
       const resolution = intent.decision === 'approve' ? 'approved' : 'rejected';
       const result = approvalRegistry.resolve(row.approvalId, resolution, 'discord-user');
       try {
@@ -874,6 +931,37 @@ export async function tryHandleHarnessApprovalReply(opts: {
             : `Couldn't resolve \`${row.approvalId}\`: ${result.reason ?? 'unknown'}`,
         );
       } catch { /* transport is best-effort */ }
+      return true;
+    }
+  }
+  if (opts.allowGlobalApprovalFallback) {
+    const rows = globalApprovalRowsForDm(opts.channelId);
+    if (rows.length === 1) {
+      const row = rows[0];
+      const detachedSession = HarnessSession.load(row.sessionId);
+      if (!isDiscordApproval(row) && row.channel !== 'workflow' && detachedSession?.loadInterruptState()) {
+        await runDiscordHarnessResume({
+          channelId: opts.channelId,
+          decision: intent.decision,
+          approvalId: row.approvalId,
+          transport: opts.transport,
+          allowDetachedNonDiscord: true,
+        });
+        return true;
+      }
+      const resolution = intent.decision === 'approve' ? 'approved' : 'rejected';
+      const result = approvalRegistry.resolve(row.approvalId, resolution, 'discord-user');
+      try {
+        await opts.transport.sendInitial(
+          result.ok
+            ? `🍊 ${resolution === 'approved' ? 'approved' : 'rejected'} \`${row.approvalId}\` — ${row.subject}`
+            : `Couldn't resolve \`${row.approvalId}\`: ${result.reason ?? 'unknown'}`,
+        );
+      } catch { /* transport is best-effort */ }
+      return true;
+    }
+    if (rows.length > 1) {
+      await sendApprovalPicker(opts.transport, rows, intent.decision);
       return true;
     }
   }
@@ -1628,6 +1716,7 @@ async function runDiscordHarnessResume(opts: {
    *  session, losing work on the older one (audit 2026-05-18). */
   approvalId?: string;
   transport: DiscordHarnessTransport;
+  allowDetachedNonDiscord?: boolean;
 }): Promise<void> {
   const { channelId, decision, approvalId, transport } = opts;
 
@@ -1674,13 +1763,18 @@ async function runDiscordHarnessResume(opts: {
       return;
     }
     if (!approvalBelongsToDiscordChannel(row, channelId)) {
-      // Cross-channel approvals are intentionally blocked for Discord
-      // sessions. Workflow approvals are resolved by
-      // tryHandleHarnessApprovalReply before this resume helper runs.
-      await transport.sendError(`Approval \`${approvalId}\` belongs to a different or stale Discord conversation.`);
-      return;
+      if (opts.allowDetachedNonDiscord && !isDiscordApproval(row) && row.channel !== 'workflow') {
+        sessionId = row.sessionId;
+      } else {
+        // Cross-channel approvals are intentionally blocked for Discord
+        // sessions. Workflow approvals are resolved by
+        // tryHandleHarnessApprovalReply before this resume helper runs.
+        await transport.sendError(`Approval \`${approvalId}\` belongs to a different or stale Discord conversation.`);
+        return;
+      }
+    } else {
+      sessionId = row.sessionId;
     }
-    sessionId = row.sessionId;
   } else {
     const pendingOnChannel = pendingDiscordApprovalsForChannel(channelId);
     const distinctSessions = [...new Set(pendingOnChannel.map((r) => r.sessionId))];

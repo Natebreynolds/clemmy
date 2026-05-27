@@ -33,6 +33,9 @@ const api = {
   recallConfigure: (settings: Record<string, unknown>) => ipcRenderer.invoke('clemmy:recall-configure', settings) as Promise<Record<string, unknown> | null>,
   recallRequestPermissions: () => ipcRenderer.invoke('clemmy:recall-request-permissions') as Promise<Record<string, unknown> | null>,
   recallStartManual: () => ipcRenderer.invoke('clemmy:recall-start-manual') as Promise<Record<string, unknown> | null>,
+  /** Primary "RECORD MEETING" button — records the detected meeting
+   *  window when one is open, else falls back to desktop audio. */
+  recallRecordActive: () => ipcRenderer.invoke('clemmy:recall-record-active') as Promise<Record<string, unknown> | null>,
   /** Start recording a specific window the SDK has detected. Drives
    *  the "Record this meeting" prompt button. */
   recallRecordDetected: (windowId: string) => ipcRenderer.invoke('clemmy:recall-record-detected', { windowId }) as Promise<Record<string, unknown> | null>,

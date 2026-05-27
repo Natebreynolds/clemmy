@@ -802,12 +802,55 @@ function renderApprovalList(approvals: PendingApproval[]): string {
     .join('\n');
 }
 
+function isDiscordHarnessRow(row: approvalRegistry.PendingApprovalRow): boolean {
+  return row.channel === 'discord' || row.channel === 'discord-dm';
+}
+
+function relevantHarnessApprovalsForContext(input: {
+  channelId: string;
+  guildId?: string | null;
+}): approvalRegistry.PendingApprovalRow[] {
+  const rows = approvalRegistry.listPending({ status: 'pending' })
+    .filter((row) => approvalRegistry.isActionable(row));
+  if (input.guildId) return rows.filter((row) => row.channelId === input.channelId);
+  return rows.filter((row) => row.channelId === input.channelId || !isDiscordHarnessRow(row));
+}
+
+function renderHarnessApprovalList(approvals: approvalRegistry.PendingApprovalRow[]): string {
+  if (approvals.length === 0) return '';
+  return approvals
+    .slice(0, 15)
+    .map((approval) => `- **${approval.subject}** — ${approval.tool ?? 'approval'} _(id \`${approval.approvalId}\`)_`)
+    .join('\n');
+}
+
+function renderCombinedApprovalList(
+  runtimeApprovals: PendingApproval[],
+  harnessApprovals: approvalRegistry.PendingApprovalRow[],
+): string {
+  if (runtimeApprovals.length === 0 && harnessApprovals.length === 0) {
+    return 'No pending approvals.';
+  }
+  return [
+    harnessApprovals.length > 0 ? renderHarnessApprovalList(harnessApprovals) : '',
+    runtimeApprovals.length > 0 ? renderApprovalList(runtimeApprovals) : '',
+  ].filter(Boolean).join('\n');
+}
+
 function renderApprovalCardContent(approval: PendingApproval): string {
   return [
     `🔐 **Approval needed — ${approval.toolName}**`,
     summarizeApprovalAction(approval),
     `_session ${approval.sessionId} · id \`${approval.id.slice(0, 8)}\`_`,
   ].join('\n');
+}
+
+function renderHarnessApprovalCardContent(approval: approvalRegistry.PendingApprovalRow): string {
+  return [
+    `🔐 **Approval needed — ${approval.subject}**`,
+    approval.tool ? approval.tool : '',
+    `_session ${approval.sessionId} · id \`${approval.approvalId}\`_`,
+  ].filter(Boolean).join('\n');
 }
 
 function buildApprovalActions(approvalId: string) {
@@ -1167,7 +1210,17 @@ async function handleDiscordCommand(message: Message<boolean>, assistant: Clemen
 
   if (/^(approvals|pending approvals)$/i.test(normalized)) {
     const approvals = relevantApprovalsForMessage(message, runtime.listPendingApprovals());
-    await sendChunks(message.channel, renderApprovalList(approvals), message);
+    const harnessApprovals = relevantHarnessApprovalsForContext({
+      channelId: message.channelId,
+      guildId: message.guildId,
+    });
+    await sendChunks(message.channel, renderCombinedApprovalList(approvals, harnessApprovals), message);
+    for (const approval of harnessApprovals.slice(0, 5)) {
+      await sendComponentMessage(message.channel, {
+        content: renderHarnessApprovalCardContent(approval),
+        components: buildApprovalActions(approval.approvalId),
+      });
+    }
     for (const approval of approvals.slice(0, 5)) {
       await sendComponentMessage(message.channel, {
         content: renderApprovalCardContent(approval),
@@ -1259,7 +1312,14 @@ async function handleDiscordRestCommand(input: {
 
   if (/^(approvals|pending approvals)$/i.test(normalized)) {
     const approvals = relevantApprovalsForContext(input, runtime.listPendingApprovals());
-    await send(renderApprovalList(approvals));
+    const harnessApprovals = relevantHarnessApprovalsForContext(input);
+    await send(renderCombinedApprovalList(approvals, harnessApprovals));
+    for (const approval of harnessApprovals.slice(0, 5)) {
+      await sendDiscordRestComponentMessage(input.channelId, {
+        content: renderHarnessApprovalCardContent(approval),
+        components: buildApprovalActions(approval.approvalId),
+      });
+    }
     for (const approval of approvals.slice(0, 5)) {
       await sendDiscordRestComponentMessage(input.channelId, {
         content: renderApprovalCardContent(approval),
@@ -1720,6 +1780,7 @@ async function handleButtonInteraction(interaction: ButtonInteraction, assistant
           channelId: interaction.channelId ?? '',
           prompt: `${approved ? 'approve' : 'reject'} ${targetId}`,
           transport: buildButtonHarnessTransport(interaction),
+          allowGlobalApprovalFallback: false,
         });
         // v0.5.21.2 — if the harness handled the interaction, its
         // transport already consumed the deferUpdate/reply. We can no
@@ -2141,6 +2202,7 @@ async function handleMessage(message: Message<boolean>, assistant: ClementineAss
       channelId: message.channelId,
       prompt,
       transport: gatewayTransport,
+      allowGlobalApprovalFallback: message.channel.type === ChannelType.DM,
     })) {
       return;
     }
@@ -2316,6 +2378,7 @@ async function pollDiscordDirectMessages(client: Client, assistant: ClementineAs
               channelId: dm.id,
               prompt,
               transport: dmTransport,
+              allowGlobalApprovalFallback: true,
             });
           } catch (err) {
             // Mark seen so we don't re-poll a permanently-broken

@@ -511,13 +511,6 @@ export function loadRecallMeetingAnalysis(meetingId: string): RecallMeetingAnaly
  * first. Used by the dashboard's "recent meetings" list. Cheap — even
  * 100 meetings is ~100 small JSON reads.
  */
-/** Records older than this with status='detected' and zero segments
- *  are filtered out of the list — they're stale stubs from windows
- *  the SDK saw briefly but the user never recorded on. The on-disk
- *  file is left alone (so a real bug investigation can still find
- *  them) but the dashboard doesn't show them. */
-const STALE_DETECTED_THRESHOLD_MS = 30 * 60 * 1000;
-
 export function listAllRecallMeetingRecords(): RecallMeetingRecord[] {
   if (!existsSync(RECORDS_DIR)) return [];
   const out: RecallMeetingRecord[] = [];
@@ -527,19 +520,16 @@ export function listAllRecallMeetingRecords(): RecallMeetingRecord[] {
       try {
         const parsed = JSON.parse(readFileSync(path.join(RECORDS_DIR, entry), 'utf-8')) as RecallMeetingRecord;
         if (!parsed || !parsed.id) continue;
-        // Drop stale "detected but never recorded" stubs. The SDK fires
-        // meeting-detected as soon as Zoom/Meet opens, even if the user
-        // closes it without ever clicking record. Without this filter
-        // those stubs accumulate forever in the captured list. See
-        // recall-capture.ts onMeetingClosed — it clears in-memory state
-        // but doesn't update the persisted record, so the file lingers.
+        // Drop "detected but never recorded" stubs entirely. The SDK
+        // fires meeting-detected as soon as Zoom/Meet/Teams opens — even
+        // if the user never records — so these stubs accumulate (one per
+        // call window the SDK ever saw) and bury the meetings that
+        // actually have content. They carry no transcript and aren't
+        // actionable from the list (the floating prompt is what offers
+        // recording), so the dashboard never shows them. The on-disk
+        // file is left alone so a bug investigation can still find them.
         const isEmptyDetected = parsed.status === 'detected' && (parsed.segments?.length ?? 0) === 0;
-        if (isEmptyDetected) {
-          const startedAt = Date.parse(parsed.startedAt ?? '');
-          if (Number.isFinite(startedAt) && Date.now() - startedAt > STALE_DETECTED_THRESHOLD_MS) {
-            continue;
-          }
-        }
+        if (isEmptyDetected) continue;
         out.push(parsed);
       } catch { /* skip corrupt entries */ }
     }
@@ -628,6 +618,60 @@ export function listRecentRecallMeetingSummaries(limit = 20): RecallMeetingSumma
 
 export function loadRecallMeetingById(meetingId: string): RecallMeetingRecord | null {
   return listAllRecallMeetingRecords().find((r) => r.id === meetingId) ?? null;
+}
+
+/**
+ * Newest activity timestamp for a record — the last segment's timestamp
+ * if any segments exist, else startedAt. Used by the stuck-recording
+ * reaper to tell an abandoned capture from a live one.
+ */
+function lastActivityMs(record: RecallMeetingRecord): number {
+  const segs = record.segments ?? [];
+  const lastSeg = segs.length > 0 ? Date.parse(segs[segs.length - 1]?.timestamp ?? '') : NaN;
+  if (Number.isFinite(lastSeg)) return lastSeg;
+  const started = Date.parse(record.startedAt ?? '');
+  return Number.isFinite(started) ? started : 0;
+}
+
+/**
+ * Finalize meeting records stuck in `recording` with no transcript
+ * activity for a long idle window. Some captures never receive the
+ * SDK's `recording-ended`/`meeting-closed` event — notably the
+ * desktop-audio fallback, which isn't tied to a meeting window — so
+ * they linger in `recording` forever, showing as a perpetual "LIVE"
+ * ghost and never producing analysis. A live meeting streams segments
+ * continuously, so a long activity gap is a near-certain abandoned
+ * capture. We finalize via the normal path (writes the artifact +
+ * lets the caller queue analysis), reusing finalizeRecallMeeting.
+ *
+ * Conservative by design: the idle threshold is long enough that we
+ * won't cut off a genuinely active call. If a stray segment arrives
+ * after finalize, appendRecallTranscriptSegment simply re-opens the
+ * record — no data loss.
+ *
+ * Returns the finalized records so the daemon tick can queue analysis
+ * + reindex for each, mirroring the /complete route.
+ */
+export function reapStuckRecallRecordings(opts: { idleMs?: number } = {}): Array<{
+  record: RecallMeetingRecord;
+  artifactPath?: string;
+  segmentCount: number;
+}> {
+  const idleMs = opts.idleMs ?? 60 * 60 * 1000; // 60 min of no transcript activity
+  const now = Date.now();
+  const finalized: Array<{ record: RecallMeetingRecord; artifactPath?: string; segmentCount: number }> = [];
+  for (const record of listAllRecallMeetingRecords()) {
+    if (record.status !== 'recording') continue;
+    if (now - lastActivityMs(record) < idleMs) continue;
+    const result = finalizeRecallMeeting({
+      windowId: record.windowId,
+      recordingId: record.recordingId,
+      platform: record.platform,
+      title: record.title,
+    });
+    finalized.push({ record: result.record, artifactPath: result.artifactPath, segmentCount: result.segmentCount });
+  }
+  return finalized;
 }
 
 /**

@@ -2333,6 +2333,7 @@ body {
   background: var(--accent-fail, #ff5a5f);
   box-shadow: 0 0 5px color-mix(in srgb, var(--accent-fail, #ff5a5f) 60%, transparent);
 }
+.dock-live.live { cursor: pointer; }
 .dock-live.live .dock-live-rec {
   background: var(--accent-fail, #ff5a5f);
   color: var(--bg-0);
@@ -4184,6 +4185,18 @@ body {
   padding: 18px 14px;
   font-size: 11px;
   color: var(--fg-mute);
+}
+.mem-meetings-section {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 8px 14px 6px;
+  font-size: 9px;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--fg-mute);
+  background: var(--bg-1);
+  border-bottom: 1px solid var(--line);
 }
 .mem-meeting-row {
   display: flex;
@@ -8738,6 +8751,20 @@ body {
   border-bottom: 1px dashed color-mix(in srgb, var(--line) 70%, transparent);
 }
 .meeting-segment:last-child { border-bottom: 0; padding-bottom: 0; }
+/* Interim (partial) transcript line — dimmed + italic so it reads as
+   "still being spoken", with a soft caret. Replaced by the final. */
+.meeting-segment.interim {
+  color: var(--fg-mute);
+  font-style: italic;
+  border-bottom: 0;
+}
+.meeting-segment.interim::after {
+  content: '▍';
+  margin-left: 2px;
+  opacity: 0.6;
+  animation: meeting-interim-blink 1s steps(2, start) infinite;
+}
+@keyframes meeting-interim-blink { 50% { opacity: 0; } }
 .meeting-segment-speaker {
   display: block;
   font-size: 9px;
@@ -10098,7 +10125,8 @@ const CONSOLE_JS = `
       } else if (kind === 'activity') {
         switchPanel('activity');
       } else if (kind === 'memory') {
-        switchPanel('memory');
+        // 'memory' panel was consolidated into 'brain'.
+        switchPanel('brain');
       } else if (kind === 'integrations') {
         switchPanel('integrations');
       }
@@ -10245,6 +10273,25 @@ const CONSOLE_JS = `
       switchPanel(b.getAttribute('data-panel'));
     });
   });
+
+  // Navigate to the live meeting transcript: Brain panel → Meetings tab.
+  // The old code routed to a 'memory' panel + __clementineMemoryView,
+  // but post brain-consolidation there is no 'memory' panel — meetings
+  // live under Brain's "meetings" tab. switchPanel('memory') matched
+  // nothing and hid every panel (blank screen). Clicking the real nav +
+  // tab buttons reuses their wired handlers (boot + load), which is the
+  // robust path.
+  function openBrainMeetings() {
+    try {
+      const navBrain = document.querySelector('.nav[data-panel="brain"]');
+      if (navBrain) navBrain.click(); else switchPanel('brain');
+      const meetingsTab = document.querySelector('[data-brain-tab="meetings"]');
+      if (meetingsTab) meetingsTab.click();
+    } catch (err) {
+      console.warn('openBrainMeetings failed:', err);
+    }
+  }
+  window.__clementineOpenBrainMeetings = openBrainMeetings;
 
   // ── Left-rail dock cards: clickable jump targets ──
   // Each dock-card-clickable carries data-dock-jump="<panel>". Click or
@@ -10787,8 +10834,16 @@ const CONSOLE_JS = `
       const meetings = data.meetings || [];
       memMeetingsCache = meetings;
       const liveCard = renderLiveMeetingCard();
-      const haveLive = liveCard !== '';
-      if (meta) meta.textContent = (haveLive ? '1 live · ' : '') + meetings.length + ' captured';
+      // Records still in 'recording' status belong in the LIVE section
+      // (the streaming card above already covers the SDK-tracked active
+      // meeting, but a record can be 'recording' without local live
+      // state — e.g. after a reload, or a stuck capture). Everything
+      // else is a past capture.
+      const liveMeetings = meetings.filter((m) => m.status === 'recording');
+      const pastMeetings = meetings.filter((m) => m.status !== 'recording');
+      const haveLive = liveCard !== '' || liveMeetings.length > 0;
+      const liveCount = (liveCard !== '' ? 1 : 0) + liveMeetings.length;
+      if (meta) meta.textContent = (haveLive ? liveCount + ' live · ' : '') + pastMeetings.length + ' captured';
       if (meetings.length === 0 && !haveLive) {
         list.innerHTML = [
           '<div class="mem-meetings-empty">',
@@ -10798,7 +10853,7 @@ const CONSOLE_JS = `
         renderMemoryMeetingDetail(null);
         return;
       }
-      list.innerHTML = liveCard + meetings.map((m) => {
+      const renderRow = (m) => {
         const cls = memMeetingsSelected === m.id ? 'mem-meeting-row selected' : 'mem-meeting-row';
         const platform = m.platform || 'meeting';
         const statusLabel = m.status === 'recording' ? 'RECORDING'
@@ -10819,7 +10874,20 @@ const CONSOLE_JS = `
           '  <div class="mem-meeting-row-meta">' + fmtMeetingDate(m.startedAt) + ' · ' + fmtMeetingDuration(m.durationSeconds) + ' · ' + (m.segmentCount || 0) + ' segments</div>',
           '</div>',
         ].join('');
-      }).join('');
+      };
+      const sectionHead = (label, count) =>
+        '<div class="mem-meetings-section">' + escMem(label) + (count != null ? ' · ' + count : '') + '</div>';
+      const parts = [];
+      if (haveLive) {
+        parts.push(sectionHead('LIVE NOW', liveCount));
+        if (liveCard) parts.push(liveCard);
+        parts.push(...liveMeetings.map(renderRow));
+      }
+      parts.push(sectionHead('CAPTURED', pastMeetings.length));
+      parts.push(pastMeetings.length > 0
+        ? pastMeetings.map(renderRow).join('')
+        : '<div class="mem-meetings-empty">— no past captures yet —</div>');
+      list.innerHTML = parts.join('');
       Array.from(list.querySelectorAll('[data-mem-meeting-id]')).forEach((row) => {
         row.addEventListener('click', () => {
           const id = row.getAttribute('data-mem-meeting-id');
@@ -19909,7 +19977,10 @@ const CONSOLE_JS = `
           if (recLbl) recLbl.textContent = 'STOP RECORDING';
           recBtn.setAttribute('data-state', 'recording');
         } else {
-          if (recLbl) recLbl.textContent = 'RECORD MEETING';
+          // Label tracks what the button will actually do: record the
+          // detected meeting window, or (no meeting open) generic
+          // desktop audio.
+          if (recLbl) recLbl.textContent = recall?.hasActiveMeetingWindow ? 'RECORD MEETING' : 'RECORD AUDIO';
           recBtn.setAttribute('data-state', 'idle');
         }
       }
@@ -19945,7 +20016,7 @@ const CONSOLE_JS = `
       // The orb is a sibling button — clicking REC shouldn't bubble
       // into the dock-card-clickable jump-target logic we added today.
       event.stopPropagation();
-      if (!window.clemmy?.recallStartManual || !window.clemmy?.recallStop) {
+      if (!window.clemmy?.recallRecordActive || !window.clemmy?.recallStop) {
         showError('Recall controls require the Clementine desktop app.');
         return;
       }
@@ -19969,8 +20040,16 @@ const CONSOLE_JS = `
         return;
       }
       // Confirm only the start side — stopping mid-meeting should be
-      // one click since the user can always restart.
-      if (!confirm('Start recording this meeting?\\nMake sure participants are aware where required.')) return;
+      // one click since the user can always restart. The message
+      // reflects whether we'll record the detected meeting or fall
+      // back to generic desktop audio (no meeting window open).
+      let recallNow = null;
+      try { recallNow = await window.clemmy.recallStatus(); } catch { /* best-effort */ }
+      const hasMeeting = Boolean(recallNow && recallNow.hasActiveMeetingWindow);
+      const confirmMsg = hasMeeting
+        ? 'Start recording this meeting?\\nMake sure participants are aware where required.'
+        : 'No meeting detected — start a generic desktop-audio recording instead?\\nMake sure participants are aware where required.';
+      if (!confirm(confirmMsg)) return;
       // Optimistic UI flip — show STARTING immediately so the user
       // knows their click registered. The next refreshDockLive (which
       // we kick after the IPC resolves) replaces this with the real
@@ -19978,14 +20057,30 @@ const CONSOLE_JS = `
       recLbl.textContent = 'STARTING…';
       recBtn.setAttribute('disabled', '');
       try {
-        await window.clemmy.recallStartManual();
-        showSuccess('Recording started.');
+        await window.clemmy.recallRecordActive();
+        showSuccess(hasMeeting ? 'Recording started.' : 'Desktop-audio recording started.');
       } catch (err) {
         showError('Recording failed to start: ' + ((err && err.message) || err));
       } finally {
         recBtn.removeAttribute('disabled');
         refreshDockLive();
       }
+    });
+  })();
+
+  // Make the dock-live card a jump-to-transcript target while recording.
+  // The card isn't a generic data-dock-jump card (it hosts the voice orb
+  // + REC button), but when a meeting is recording the user's most
+  // likely intent on tapping it is "show me the live transcript." Route
+  // to Memory → Meetings, skipping clicks that landed on the orb or REC
+  // button (those have their own handlers).
+  (function bindDockLiveJumpToTranscript() {
+    const card = document.querySelector('[data-dock-live]');
+    if (!card) return;
+    card.addEventListener('click', (event) => {
+      if (!card.classList.contains('live')) return;
+      if (event.target && event.target.closest('button, [role="button"]')) return;
+      if (typeof openBrainMeetings === 'function') openBrainMeetings();
     });
   })();
 
@@ -20321,14 +20416,10 @@ const CONSOLE_JS = `
       // appends, status pings) do NOT re-route, so the user isn't
       // yanked back every few seconds.
       if (isNewRecording) {
-        try {
-          if (typeof switchPanel === 'function') switchPanel('memory');
-          if (typeof window.__clementineMemoryView === 'function') {
-            window.__clementineMemoryView('meetings');
-          }
-        } catch (err) {
-          console.warn('auto-open transcript panel failed:', err);
-        }
+        // Brain → Meetings. (Was switchPanel('memory') — a panel that no
+        // longer exists post brain-consolidation, which blanked the UI
+        // the moment a recording actually started.)
+        if (typeof openBrainMeetings === 'function') openBrainMeetings();
       }
       // If the Meetings panel is open, redraw it so the live card
       // appears at the top.
@@ -20358,6 +20449,10 @@ const CONSOLE_JS = `
       if (liveBody) {
         const empty = liveBody.querySelector('.mem-meeting-live-empty');
         if (empty) empty.remove();
+        // A finalized segment supersedes whatever interim text was
+        // showing — drop the rolling partial line before committing.
+        const interim = liveBody.querySelector('.meeting-segment.interim');
+        if (interim) interim.remove();
         const node = document.createElement('div');
         node.className = 'meeting-segment';
         const speaker = segment.speaker || '';
@@ -20365,6 +20460,26 @@ const CONSOLE_JS = `
         liveBody.appendChild(node);
         liveBody.scrollTop = liveBody.scrollHeight;
       }
+    }
+
+    // Interim (partial) transcript — a single rolling line that updates
+    // in place as the speaker talks, then gets replaced by the final
+    // segment via appendSegment. Not persisted; purely the live feel.
+    function showInterimSegment(segment) {
+      if (!segment || !segment.text) return;
+      const liveBody = document.querySelector('[data-mem-meeting-live-body]');
+      if (!liveBody) return;
+      const empty = liveBody.querySelector('.mem-meeting-live-empty');
+      if (empty) empty.remove();
+      let node = liveBody.querySelector('.meeting-segment.interim');
+      if (!node) {
+        node = document.createElement('div');
+        node.className = 'meeting-segment interim';
+        liveBody.appendChild(node);
+      }
+      const speaker = segment.speaker || '';
+      node.innerHTML = (speaker ? '<span class="meeting-segment-speaker">' + escMem(speaker) + '</span>' : '') + escMem(segment.text);
+      liveBody.scrollTop = liveBody.scrollHeight;
     }
 
     function showToast(meetingInfo) {
@@ -20550,6 +20665,8 @@ const CONSOLE_JS = `
         if (event.recordingId) state.activeRecordingId = event.recordingId;
       } else if (t === 'transcript') {
         appendSegment({ speaker: event.speaker, text: event.text });
+      } else if (t === 'transcript-partial') {
+        showInterimSegment({ speaker: event.speaker, text: event.text });
       } else if (t === 'recording-ended') {
         const complete = event.complete || {};
         const recordInfo = complete.record || {};

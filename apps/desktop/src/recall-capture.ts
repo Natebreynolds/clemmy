@@ -46,6 +46,13 @@ export interface RecallCaptureStatus {
     detectedAt: string;
     recording?: boolean;
   }>;
+  /**
+   * True when the SDK currently sees an open, non-dismissed meeting
+   * window. Drives the dashboard's RECORD MEETING vs RECORD AUDIO
+   * label so the user knows whether the primary button will capture
+   * their actual meeting or fall back to generic desktop audio.
+   */
+  hasActiveMeetingWindow: boolean;
   settings: RecallCaptureSettings;
 }
 
@@ -133,7 +140,14 @@ function extractTranscript(event: RecallRealtimeEvent): {
   recordingId?: string;
   isFinal: boolean;
 } | null {
-  if (event.event !== 'transcript.data') return null;
+  // recallai_streaming (mode: prioritize_low_latency) emits interim
+  // `transcript.partial_data` as the speaker talks and a finalized
+  // `transcript.data` when the utterance settles. We process both: the
+  // partials drive the smooth live word-by-word feel in the UI, the
+  // finals are what we persist. Anything else (audio/video frames) is
+  // not a transcript.
+  if (event.event !== 'transcript.data' && event.event !== 'transcript.partial_data') return null;
+  const isFinal = event.event === 'transcript.data';
   const data = event.data;
   const directText = getNestedString(data, ['text'])
     ?? getNestedString(data, ['transcript'])
@@ -167,7 +181,7 @@ function extractTranscript(event: RecallRealtimeEvent): {
   const recordingId = getNestedString(data, ['recording_id'])
     ?? getNestedString(data, ['recordingId'])
     ?? getNestedString(data, ['data', 'recording_id']);
-  return { text, speaker, recordingId, isFinal: true };
+  return { text, speaker, recordingId, isFinal };
 }
 
 export class RecallDesktopCapture {
@@ -232,6 +246,7 @@ export class RecallDesktopCapture {
       detectedWindows: Array.from(this.detectedWindows.values()).map((w) => (
         this.userDismissedWindows.has(w.windowId) ? { ...w, recording: false } : w
       )),
+      hasActiveMeetingWindow: this.pickActiveMeetingWindow() !== undefined,
       settings: this.settings,
     };
   }
@@ -271,6 +286,53 @@ export class RecallDesktopCapture {
     const windowId = await this.sdk.prepareDesktopAudioRecording();
     await this.startRecording(windowId, { platform: 'desktop-audio', title: 'Manual desktop audio recording' });
     return this.status();
+  }
+
+  /**
+   * The "RECORD MEETING" path the dashboard's primary button should use.
+   * If the SDK has an open meeting window (Zoom/Meet/Teams) it records
+   * THAT window — giving per-participant transcripts and a real meeting
+   * title — instead of falling back to a generic desktop-audio capture.
+   * Only when no meeting window is detected do we fall back to mixed
+   * desktop audio.
+   *
+   * Previously the dock REC button called startManualRecording()
+   * directly, so even with Zoom detected the user got a "Manual desktop
+   * audio recording" tagged platform:'desktop-audio' and the actual
+   * meeting never recorded. This is the single source of truth that
+   * fixes that — both UI buttons route here.
+   */
+  async recordActiveMeetingOrDesktop(): Promise<RecallCaptureStatus> {
+    await this.initialize();
+    const windowId = this.pickActiveMeetingWindow();
+    if (windowId) {
+      return this.recordDetectedWindow(windowId);
+    }
+    return this.startManualRecording();
+  }
+
+  /**
+   * Newest open detected meeting window the user hasn't dismissed, or
+   * undefined if none. "Open" = still in detectedWindows (cleared on
+   * meeting-closed). Used to decide whether RECORD MEETING records a
+   * real meeting or falls back to desktop audio.
+   */
+  private pickActiveMeetingWindow(): string | undefined {
+    let best: { windowId: string; detectedAt: string } | undefined;
+    for (const win of this.detectedWindows.values()) {
+      if (this.userDismissedWindows.has(win.windowId)) continue;
+      if (!best || (win.detectedAt || '') > best.detectedAt) {
+        best = { windowId: win.windowId, detectedAt: win.detectedAt || '' };
+      }
+    }
+    return best?.windowId;
+  }
+
+  /** Whether the SDK currently sees an open, non-dismissed meeting
+   *  window. Lets the dashboard label the button RECORD MEETING vs
+   *  RECORD AUDIO without reaching into private state. */
+  hasActiveMeetingWindow(): boolean {
+    return this.pickActiveMeetingWindow() !== undefined;
   }
 
   async stopRecording(): Promise<RecallCaptureStatus> {
@@ -687,6 +749,18 @@ export class RecallDesktopCapture {
     const transcript = extractTranscript(event);
     const windowId = event.window?.id ?? this.currentWindowId;
     if (!transcript || !windowId) return;
+
+    // Interim (partial) segments drive the live UI only — emit them as a
+    // transient `transcript-partial` so the live card can show a rolling
+    // line that gets replaced when the final lands. We deliberately do
+    // NOT persist partials: they'd bloat the stored transcript with
+    // near-duplicate fragments and waste tokens in the post-meeting
+    // analyzer. Only finalized `transcript.data` is written to disk.
+    if (!transcript.isFinal) {
+      this.emit('transcript-partial', { windowId, speaker: transcript.speaker, text: transcript.text });
+      return;
+    }
+
     await this.postDaemon('/api/console/meetings/recall/transcript-event', {
       windowId,
       recordingId: transcript.recordingId ?? this.currentRecordingId,
