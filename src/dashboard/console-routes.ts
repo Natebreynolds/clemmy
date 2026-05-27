@@ -132,6 +132,7 @@ import {
 } from '../runtime/harness/eventlog.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { runConversation, runConversationFromResume } from '../runtime/harness/loop.js';
+import { runPlanFirstPreflight, shouldUsePlanFirst } from '../runtime/harness/plan-first.js';
 import { getHarnessBudgetSnapshot, saveHarnessBudgetSettings } from '../runtime/harness/budget-settings.js';
 import { HarnessSession } from '../runtime/harness/session.js';
 import { parseApprovalIntent, parseHarnessCommand } from '../channels/discord-harness.js';
@@ -141,6 +142,7 @@ import { summarizeApprovalAction } from '../runtime/approval-summary.js';
 import {
   appendRecallTranscriptSegment,
   buildAnalyzerPrompt,
+  buildMeetingChatPrompt,
   createRecallSdkUpload,
   finalizeRecallMeeting,
   listRecentRecallMeetingSummaries,
@@ -2856,6 +2858,19 @@ export function registerConsoleRoutes(
     }
   });
 
+  app.get('/api/console/meetings/recall/:meetingId/chat-prompt', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const meetingId = req.params.meetingId;
+    try {
+      const record = loadRecallMeetingById(meetingId);
+      if (!record) { res.status(404).json({ error: 'meeting not found' }); return; }
+      const analysis = loadRecallMeetingAnalysis(meetingId);
+      res.json({ prompt: buildMeetingChatPrompt(record, analysis) });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   // User rename: sets a locked 'user' title and re-files the note (title
   // into frontmatter + heading). File path is unchanged, so the vault
   // index stays consistent — we just reindex to pick up the new text.
@@ -3735,7 +3750,7 @@ export function registerConsoleRoutes(
 
     setImmediate(async () => {
       try {
-        const agent = await buildOrchestratorAgent();
+        const agent = await buildOrchestratorAgent({ sessionId });
         // v0.5.19 Bug A fix — sticky-approval auto-resume.
         // After the initial resume, the resumed turn may itself trigger
         // a fresh approval pause (e.g. a composio_execute_tool inside the
@@ -4522,6 +4537,7 @@ export function registerConsoleRoutes(
 
     const existingId = typeof body.sessionId === 'string' ? body.sessionId : '';
     let session = existingId ? getHarnessSession(existingId) : null;
+    const freshSession = !session;
     if (existingId && !session) { res.status(404).json({ error: 'session not found' }); return; }
     if (!session) {
       session = createHarnessSession({
@@ -4633,18 +4649,28 @@ export function registerConsoleRoutes(
     const isPausedOnApproval = !!harnessSession && !!harnessSession.loadInterruptState();
     const intent = isPausedOnApproval ? parseApprovalIntent(input) : null;
     const sinceSeq = getLatestHarnessEventSeq(sessionId);
+    const planFirst = !intent && shouldUsePlanFirst({ input: turnInput, freshSession });
 
     res.status(202).json({
       sessionId,
       streamUrl,
-      status: intent ? 'resuming' : 'started',
-      mode: intent ? `approval-${intent.decision}` : 'fresh',
+      status: intent ? 'resuming' : planFirst ? 'planning' : 'started',
+      mode: intent ? `approval-${intent.decision}` : planFirst ? 'plan-first' : 'fresh',
       sinceSeq,
     });
 
     setImmediate(async () => {
       try {
-        const agent = await buildOrchestratorAgent();
+        if (planFirst) {
+          const preflight = await runPlanFirstPreflight({
+            input: turnInput,
+            sessionId,
+            channel: 'desktop',
+            freshSession,
+          });
+          if (preflight.surfaced) return;
+        }
+        const agent = await buildOrchestratorAgent({ userInput: turnInput, sessionId });
         if (intent && harnessSession) {
           await runConversationFromResume({
             agent,

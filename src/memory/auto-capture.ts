@@ -1,5 +1,6 @@
 import type { ConsolidatedFactKind } from './db.js';
-import { rememberFact, type ConsolidatedFact } from './facts.js';
+import type { ConsolidatedFact } from './facts.js';
+import { consolidateFact } from './reflection.js';
 import { saveUserProfile, type UserProfile } from '../runtime/user-profile.js';
 
 export interface AutoMemoryCandidate {
@@ -10,6 +11,10 @@ export interface AutoMemoryCandidate {
 
 export interface AutoCaptureResult {
   candidates: AutoMemoryCandidate[];
+  /** Always empty now — user-stated facts are consolidated asynchronously
+   *  through the Mem0 conflict resolver (see captureInteractionSignals),
+   *  so committed rows aren't known synchronously. Kept for back-compat;
+   *  callers should report on `candidates` instead. */
   facts: ConsolidatedFact[];
   profilePatch?: Record<string, unknown>;
   profile?: UserProfile;
@@ -121,19 +126,23 @@ export function captureInteractionSignals(input: {
   maxFacts?: number;
 }): AutoCaptureResult {
   const candidates = extractAutoMemoryCandidates(input.message, input.maxFacts ?? 3);
-  const facts: ConsolidatedFact[] = [];
 
   for (const candidate of candidates) {
-    try {
-      facts.push(rememberFact({
-        kind: candidate.kind,
-        content: candidate.content,
-        sessionId: input.sessionId,
-        score: 1.2,
-      }));
-    } catch {
-      // Memory capture should never block the chat turn.
-    }
+    // Fire-and-forget: route the user-stated fact through the SAME Mem0
+    // conflict resolver the tool-return reflection path uses, so a user
+    // restating a preference ("actually, Wednesday now") UPDATEs/DELETEs
+    // the stale fact instead of stacking a duplicate. trustLevel 1.0
+    // keeps user statements authoritative over derived (0.6) facts on
+    // conflict. The resolver makes an LLM call, so we never await it on
+    // the chat turn — memory capture must never block the conversation.
+    queueMicrotask(() => {
+      consolidateFact(
+        { kind: candidate.kind, text: candidate.content, trustLevel: 1.0 },
+        { sessionId: input.sessionId },
+      ).catch(() => {
+        // Swallow — a capture failure must never surface to the turn.
+      });
+    });
   }
 
   const profilePatch = extractProfilePatchFromMessage(input.message);
@@ -148,7 +157,7 @@ export function captureInteractionSignals(input: {
 
   return {
     candidates,
-    facts,
+    facts: [],
     profilePatch,
     profile,
   };

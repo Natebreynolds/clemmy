@@ -85,6 +85,18 @@ export const EVENT_TYPES = [
   // conversation. Carries the from/to caps so the dashboard can show
   // why the budget changed mid-run.
   'budget_elevated',
+  // Tool-injection scoping: emitted at agent construction so traces can
+  // explain why a run saw a small external MCP surface instead of every
+  // configured server tool.
+  'mcp_tool_scope',
+  // Planner-first gate: fresh complex requests get a read-only plan
+  // proposal before the full external MCP surface is opened.
+  'plan_first_started',
+  'plan_first_failed',
+  // Flag-only native Codex compaction proof: emitted when the harness
+  // persists a Codex `compaction` item from raw model responses and
+  // prunes replay history for the next continuation turn.
+  'native_compaction_applied',
   // v0.5.19 F3 — preflight gate fires this for workflow/execution/
   // agent kinds when a turn projects over the context block
   // threshold. Workflows have no user to consult mid-step so they

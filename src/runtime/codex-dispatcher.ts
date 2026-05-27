@@ -53,6 +53,11 @@ export const codexDispatcher = new Agent({
  * Returns the matching code string ('UND_ERR_HEADERS_TIMEOUT' |
  * 'UND_ERR_BODY_TIMEOUT'), or null if the error is something else.
  */
+export type CodexTransportFailureCode =
+  | 'UND_ERR_HEADERS_TIMEOUT'
+  | 'UND_ERR_BODY_TIMEOUT'
+  | 'FETCH_TERMINATED';
+
 export function detectUndiciTimeout(err: unknown): 'UND_ERR_HEADERS_TIMEOUT' | 'UND_ERR_BODY_TIMEOUT' | null {
   if (!err || typeof err !== 'object') return null;
   const direct = (err as { code?: unknown }).code;
@@ -66,6 +71,29 @@ export function detectUndiciTimeout(err: unknown): 'UND_ERR_HEADERS_TIMEOUT' | '
 }
 
 /**
+ * Undici can also surface a dropped fetch body as a bare
+ * `TypeError("terminated")` with no UND_ERR_* code. Treat that as the
+ * same retryable Codex transport class, so the adapter's "retry only
+ * before visible/tool output" safety gate can handle it.
+ */
+export function detectCodexTransportFailure(err: unknown): CodexTransportFailureCode | null {
+  const timeoutCode = detectUndiciTimeout(err);
+  if (timeoutCode) return timeoutCode;
+  if (!err || typeof err !== 'object') return null;
+  const message = err instanceof Error ? err.message : String((err as { message?: unknown }).message ?? '');
+  const cause = (err as { cause?: unknown }).cause;
+  const causeMessage = cause instanceof Error
+    ? cause.message
+    : typeof cause === 'object' && cause != null
+      ? String((cause as { message?: unknown }).message ?? '')
+      : '';
+  if (message === 'terminated' || causeMessage === 'terminated') {
+    return 'FETCH_TERMINATED';
+  }
+  return null;
+}
+
+/**
  * Construct the BoundaryError for a Codex transport-level timeout.
  * The harness loop's F4 ask-user routing recognizes
  * `codex.transport_timeout` and converts it to a Retry/Switch/Stop
@@ -73,17 +101,29 @@ export function detectUndiciTimeout(err: unknown): 'UND_ERR_HEADERS_TIMEOUT' | '
  * event (loop.ts:2281).
  */
 export function buildTransportTimeoutError(
-  code: 'UND_ERR_HEADERS_TIMEOUT' | 'UND_ERR_BODY_TIMEOUT',
+  code: CodexTransportFailureCode,
   context: Record<string, unknown> = {},
   cause?: unknown,
 ): BoundaryError {
-  const phase = code === 'UND_ERR_HEADERS_TIMEOUT' ? 'before any response headers' : 'mid-stream after headers';
-  const budgetMs = code === 'UND_ERR_HEADERS_TIMEOUT' ? CODEX_HEADERS_TIMEOUT_MS : CODEX_BODY_TIMEOUT_MS;
+  const phase =
+    code === 'UND_ERR_HEADERS_TIMEOUT'
+      ? 'before any response headers'
+      : code === 'UND_ERR_BODY_TIMEOUT'
+        ? 'mid-stream after headers'
+        : 'connection terminated by the fetch runtime';
+  const budgetMs =
+    code === 'UND_ERR_HEADERS_TIMEOUT'
+      ? CODEX_HEADERS_TIMEOUT_MS
+      : code === 'UND_ERR_BODY_TIMEOUT'
+        ? CODEX_BODY_TIMEOUT_MS
+        : null;
   return new BoundaryError({
     kind: 'codex.transport_timeout',
     retryable: true,
     userMessage: "Clementine's model backend stopped responding. Retry — if this persists, the Codex backend may be having an incident.",
-    operatorMessage: `Codex fetch aborted by undici ${code} after ${budgetMs}ms (${phase}).`,
+    operatorMessage: budgetMs == null
+      ? `Codex fetch terminated by undici (${phase}).`
+      : `Codex fetch aborted by undici ${code} after ${budgetMs}ms (${phase}).`,
     context: { ...context, undiciCode: code, budgetMs },
     cause,
   });

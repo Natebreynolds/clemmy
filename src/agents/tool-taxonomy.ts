@@ -10,6 +10,8 @@
  *   decision function, the trust gradient is global:
  *
  *     strict     → every non-read action asks
+ *                  except write_file to an allowed local workspace path,
+ *                  which is treated as the file artifact the user requested
  *     workspace  → writes/executes auto inside the workspace, else ask;
  *                  network 'send' always asks (no workspace concept for
  *                  external mutations)
@@ -30,6 +32,7 @@
 import { evaluateAutoApprove, recordAutoApproval, summarizeToolArgs } from './plan-scope.js';
 import { loadProactivityPolicy } from './proactivity-policy.js';
 import type { AutoApproveScope } from './proactivity-policy.js';
+import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
 
 export type ToolKind =
   | 'read'      // pure lookup; never asks
@@ -419,6 +422,7 @@ export interface ApprovalDecision {
     | 'destructive-hint'
     | 'read-always-auto'
     | 'agent-owned-dir'
+    | 'local-workspace-write'
     | 'plan-scope'
     | 'workspace-policy'
     | 'yolo-policy'
@@ -476,6 +480,7 @@ export function decideToolApproval(input: ApprovalDecisionInput): ApprovalDecisi
   const decision = evaluateAutoApprove({
     sessionId: input.sessionId,
     toolName: input.toolName,
+    args: input.args,
     scope: policy.autoApproveScope satisfies AutoApproveScope,
     insideWorkspace: kind === 'send' ? false : Boolean(input.insideWorkspaceHint),
   });
@@ -494,6 +499,23 @@ export function decideToolApproval(input: ApprovalDecisionInput): ApprovalDecisi
       : decision.reason === 'yolo-policy' ? 'yolo-policy'
       : 'unknown';
     return { needsApproval: false, reason, kind };
+  }
+
+  // `write_file` is Clementine's local artifact surface. If the path
+  // resolved inside the same allowed roots that the tool can write to,
+  // do not interrupt the turn for an approval: the user already gave
+  // consent by asking for a report, proposal, CSV, draft, etc. Network
+  // sends, shell commands, admin ops, and destructive hints still use
+  // the normal approval gates above/below.
+  if (input.toolName === 'write_file' && input.insideWorkspaceHint) {
+    if (input.sessionId) {
+      recordAutoApproval(
+        input.sessionId,
+        input.toolName,
+        `[local-workspace-write] kind=${kind} ${summarizeToolArgs(input.toolName, input.args)}`,
+      );
+    }
+    return { needsApproval: false, reason: 'local-workspace-write', kind };
   }
 
   return { needsApproval: true, reason: 'strict-policy', kind };
@@ -541,9 +563,16 @@ export function needsApprovalFromTaxonomy(
 }
 
 function extractSessionId(runContext: unknown): string | undefined {
-  if (!runContext || typeof runContext !== 'object') return undefined;
-  const ctx = (runContext as { context?: unknown }).context;
-  if (!ctx || typeof ctx !== 'object') return undefined;
-  const sid = (ctx as { sessionId?: unknown }).sessionId;
-  return typeof sid === 'string' ? sid : undefined;
+  if (runContext && typeof runContext === 'object') {
+    const ctx = (runContext as { context?: unknown }).context;
+    if (ctx && typeof ctx === 'object') {
+      const sid = (ctx as { sessionId?: unknown }).sessionId;
+      if (typeof sid === 'string' && sid) return sid;
+    }
+  }
+  // Worker/asTool sub-runs do not always carry the SDK context object
+  // through needsApproval, but they still execute under the harness
+  // AsyncLocalStorage. Fall back to that session so batch plan-scopes
+  // cover child-worker Composio writes too.
+  return harnessRunContextStorage.getStore()?.sessionId;
 }

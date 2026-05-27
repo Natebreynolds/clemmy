@@ -76,12 +76,14 @@ export class ClementineAssistant {
         message: request.message,
         sessionId: request.sessionId,
       });
-      if (request.runId && (captured.facts.length > 0 || captured.profilePatch)) {
+      if (request.runId && (captured.candidates.length > 0 || captured.profilePatch)) {
+        // Facts are consolidated asynchronously through the Mem0 resolver
+        // now, so committed row ids aren't known here — report the
+        // captured candidate signals instead.
         addRunEvent(request.runId, {
           type: 'status',
-          message: `Captured ${captured.facts.length} durable memory signal${captured.facts.length === 1 ? '' : 's'}${captured.profilePatch ? ' and updated profile preferences' : ''}.`,
+          message: `Captured ${captured.candidates.length} durable memory signal${captured.candidates.length === 1 ? '' : 's'}${captured.profilePatch ? ' and updated profile preferences' : ''}.`,
           data: {
-            factIds: captured.facts.map((fact) => fact.id),
             profilePatch: captured.profilePatch,
             reasons: captured.candidates.map((candidate) => candidate.reason),
           },

@@ -371,6 +371,14 @@ test('parseHarnessCommand: recognizes /new and bare new', () => {
   assert.equal(parseHarnessCommand('  New  '), 'new');
 });
 
+test('parseHarnessCommand: recognizes /sessions and bare sessions', () => {
+  assert.equal(parseHarnessCommand('/sessions'), 'sessions');
+  assert.equal(parseHarnessCommand('sessions'), 'sessions');
+  assert.equal(parseHarnessCommand('/session'), 'sessions');
+  assert.equal(parseHarnessCommand('session'), 'sessions');
+  assert.equal(parseHarnessCommand('  Sessions  '), 'sessions');
+});
+
 test('parseHarnessCommand: recognizes /continue, continue, and "keep going" (T1.3)', () => {
   assert.equal(parseHarnessCommand('/continue'), 'continue');
   assert.equal(parseHarnessCommand('continue'), 'continue');
@@ -387,8 +395,39 @@ test('parseHarnessCommand: does NOT match substring matches or natural language'
   assert.equal(parseHarnessCommand('start a new project'), null);
   assert.equal(parseHarnessCommand('/cancel-this'), null);
   assert.equal(parseHarnessCommand('continue the conversation'), null);
+  assert.equal(parseHarnessCommand('show active sessions please'), null);
   assert.equal(parseHarnessCommand("let's keep going on this"), null);
   assert.equal(parseHarnessCommand(''), null);
+});
+
+test('session picker renders resume and pending approval buttons', () => {
+  const option = {
+    session: {
+      id: 'sess-test-1234',
+      kind: 'chat',
+      channel: 'electron',
+      userId: null,
+      createdAt: '2026-05-27T12:00:00.000Z',
+      updatedAt: '2026-05-27T12:01:00.000Z',
+      status: 'paused',
+      title: 'Desktop meeting follow-up',
+      objective: null,
+      tokenBudget: null,
+      tokensUsed: 0,
+      currentPlanId: null,
+      metadata: {},
+    },
+    pendingApprovals: [approvalRow({ approvalId: 'apr-abcd', sessionId: 'sess-test-1234' })],
+    isBound: false,
+    rank: 1,
+  };
+  const text = __test__.renderSessionPickerText([option] as never, 'chan-a');
+  assert.match(text, /Desktop meeting follow-up/);
+  assert.match(text, /1 approval waiting/);
+  const rows = __test__.sessionPickerComponents([option] as never) as Array<{ components: Array<{ custom_id: string; label: string }> }>;
+  assert.equal(rows[0].components[0].custom_id, 'clementine:session-resume:sess-test-1234');
+  assert.equal(rows[0].components[1].custom_id, 'clementine:approve:apr-abcd');
+  assert.equal(rows[0].components[2].custom_id, 'clementine:reject:apr-abcd');
 });
 
 // ─── isDiscordTokenExpired — P0-1 detection layer (v0.5.x) ───────

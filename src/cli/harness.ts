@@ -64,7 +64,7 @@ async function harnessRun(opts: HarnessRunOptions): Promise<number> {
 
   let result;
   try {
-    const agent = await buildOrchestratorAgent();
+    const agent = await buildOrchestratorAgent({ userInput: opts.prompt, sessionId: session.id });
     result = await runConversation({
       agent,
       sessionId: session.id,

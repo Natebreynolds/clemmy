@@ -257,6 +257,7 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): MCPSer
           `Last error: ${errorObj.message.slice(0, 200)}. ` +
           `Reconnect from Settings → MCP Servers or check the server's config.`,
         kind: 'system',
+        silent: true,
         metadata: { slug, failureCount, lastError: errorObj.message },
       }).catch(() => { /* alert is best-effort */ });
     }

@@ -15,6 +15,7 @@ const {
   finalizeRecallMeeting,
   saveRecallMeetingAnalysis,
   fileMeetingFromAnalysis,
+  buildMeetingChatPrompt,
   loadRecallMeetingById,
   recordMeetingTitle,
   renameMeeting,
@@ -145,4 +146,32 @@ test('live transcript refresh preserves a user title lock', () => {
   assert.equal(afterAnalysis?.title, 'Client Follow-up');
   assert.equal(afterAnalysis?.titleSource, 'user');
   assert.match(readFileSync(artifactPath as string, 'utf-8'), /^# Client Follow-up$/m);
+});
+
+test('buildMeetingChatPrompt requires the full transcript and asks for next action', () => {
+  const windowId = 'win-chat-prompt';
+  appendRecallTranscriptSegment({
+    windowId,
+    event: 'transcript.data',
+    speaker: 'Nate',
+    text: 'we need to follow up with the design partner after the onboarding call',
+  });
+  const { record, artifactPath } = finalizeRecallMeeting({ windowId, platform: 'zoom', title: 'Design partner onboarding' });
+  assert.ok(artifactPath);
+
+  saveRecallMeetingAnalysis(record.id, {
+    title: 'Design Partner Onboarding',
+    summary: 'Discussed onboarding and follow-up.',
+    actionItems: [{ text: 'Follow up with the design partner', owner: 'Nate' }],
+    generatedAt: new Date().toISOString(),
+    source: 'agent',
+  });
+
+  const prompt = buildMeetingChatPrompt(loadRecallMeetingById(record.id)!);
+  assert.match(prompt, /Read the FULL transcript end-to-end/);
+  assert.match(prompt, new RegExp(artifactPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.match(prompt, /What would you like me to act on/);
+  assert.match(prompt, /likely follow-up tasks/i);
+  assert.match(prompt, /Do not refer to yourself as Clementine/i);
+  assert.match(prompt, /Do not send messages, schedule events, update sheets, or create tasks/);
 });

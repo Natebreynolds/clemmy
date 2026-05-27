@@ -51,10 +51,10 @@ function renderToolNameCrib(skill: Skill): string {
  *   1. `skill_list()` — what skills are installed, with descriptions
  *   2. `skill_read(name)` — pull the full SKILL.md body into context
  *
- * Skills are not auto-injected into every system prompt (that would
- * bloat context for users with many installed). The agent reads
- * skill_list once at the start of a task, picks the most relevant
- * skill(s) by description, and pulls them in with skill_read.
+ * The harness injects only the compact skill index (name +
+ * description) into persistent context. Full skill bodies stay
+ * on-demand: the agent picks the relevant skill(s) by description and
+ * pulls them in with skill_read.
  */
 
 export function registerSkillTools(server: McpServer): void {

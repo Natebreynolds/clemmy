@@ -25,7 +25,10 @@ import {
   appendEvent as appendHarnessEvent,
   createSession as createHarnessSession,
   getSession as getHarnessSession,
+  listSessions as listHarnessSessions,
+  updateSession as updateHarnessSession,
   type EventRow,
+  type SessionRow,
 } from '../runtime/harness/eventlog.js';
 import { runConversation, runConversationFromResume } from '../runtime/harness/loop.js';
 import { HarnessSession } from '../runtime/harness/session.js';
@@ -39,6 +42,7 @@ import {
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { previewToolCall } from '../runtime/approval-summary.js';
 import { buildOrchestratorAgent } from '../agents/orchestrator.js';
+import { runPlanFirstPreflight, shouldUsePlanFirst } from '../runtime/harness/plan-first.js';
 
 const EDIT_DEBOUNCE_MS = 2_000;
 const SAFETY_TIMEOUT_MS = 35 * 60_000;
@@ -150,25 +154,18 @@ function findMostRecentChannelSession(channelId: string): { sessionId: string; u
     const row = db
       .prepare(
         `SELECT id, updated_at FROM sessions
-           WHERE channel = 'discord'
-             AND json_extract(metadata_json, '$.channelId') = ?
+           WHERE (
+             (channel = 'discord' AND json_extract(metadata_json, '$.channelId') = ?)
+             OR json_extract(metadata_json, '$.source') = 'discord'
+                AND json_extract(metadata_json, '$.channelId') = ?
+             OR json_extract(metadata_json, '$.discordChannelId') = ?
+           )
            ORDER BY updated_at DESC
            LIMIT 1`,
       )
-      .get(channelId) as { id?: string; updated_at?: string } | undefined;
-    // Older sessions did not populate the `channel` column, so keep
-    // the metadata fallback to preserve continuity across upgrades.
-    const matched = row ?? (db
-      .prepare(
-        `SELECT id, updated_at FROM sessions
-           WHERE json_extract(metadata_json, '$.source') = 'discord'
-             AND json_extract(metadata_json, '$.channelId') = ?
-           ORDER BY updated_at DESC
-           LIMIT 1`,
-      )
-      .get(channelId) as { id?: string; updated_at?: string } | undefined);
-    if (!matched?.id || !matched.updated_at) return null;
-    return { sessionId: matched.id, updatedAt: new Date(matched.updated_at).getTime() };
+      .get(channelId, channelId, channelId) as { id?: string; updated_at?: string } | undefined;
+    if (!row?.id || !row.updated_at) return null;
+    return { sessionId: row.id, updatedAt: new Date(row.updated_at).getTime() };
   } catch {
     return null;
   }
@@ -252,7 +249,12 @@ function resolveOrCreateSession(opts: {
       guildId: opts.guildId,
     },
   });
-  channelSessions.set(opts.channelId, { sessionId: session.id, lastUsedAt: now });
+  bindDiscordHarnessSession({
+    channelId: opts.channelId,
+    sessionId: session.id,
+    userId: opts.userId,
+    guildId: opts.guildId,
+  });
 
   // Cross-session prefix: a fresh session created within the
   // CROSS_SESSION_PREFIX_WINDOW of a prior same-channel session gets
@@ -511,6 +513,35 @@ export function clearDiscordHarnessSession(channelId: string): void {
   channelSessions.delete(channelId);
 }
 
+export function bindDiscordHarnessSession(input: {
+  channelId: string;
+  sessionId: string;
+  userId?: string | null;
+  guildId?: string | null;
+}): boolean {
+  const row = getHarnessSession(input.sessionId);
+  if (!row) return false;
+  const now = Date.now();
+  channelSessions.set(input.channelId, { sessionId: input.sessionId, lastUsedAt: now });
+  try {
+    updateHarnessSession(input.sessionId, {
+      metadata: {
+        ...row.metadata,
+        discordChannelId: input.channelId,
+        discordUserId: input.userId ?? row.metadata.discordUserId ?? null,
+        discordGuildId: input.guildId ?? row.metadata.discordGuildId ?? null,
+        discordBoundAt: new Date(now).toISOString(),
+      },
+    });
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err), sessionId: input.sessionId, channelId: input.channelId },
+      'failed to persist Discord harness session binding',
+    );
+  }
+  return true;
+}
+
 /**
  * /cancel handler — abandon paused approvals on this channel, clear
  * the session's interrupt state, mark the session 'cancelled', and
@@ -611,6 +642,145 @@ async function handleHarnessNew(opts: {
   }
 }
 
+interface DiscordSessionOption {
+  session: SessionRow;
+  pendingApprovals: approvalRegistry.PendingApprovalRow[];
+  isBound: boolean;
+  rank: number;
+}
+
+function sessionAgeLabel(iso: string): string {
+  const ms = Date.now() - Date.parse(iso);
+  if (!Number.isFinite(ms) || ms < 0) return 'just now';
+  const min = Math.floor(ms / 60_000);
+  if (min < 1) return 'just now';
+  if (min < 60) return `${min}m ago`;
+  const hours = Math.floor(min / 60);
+  if (hours < 24) return `${hours}h ${min % 60}m ago`;
+  return `${Math.floor(hours / 24)}d ago`;
+}
+
+function sessionTitle(row: SessionRow): string {
+  const title = (row.title || row.objective || row.id).replace(/\s+/g, ' ').trim();
+  return title.length > 72 ? `${title.slice(0, 69)}...` : title;
+}
+
+function collectDiscordSessionOptions(channelId: string): DiscordSessionOption[] {
+  const byId = new Map<string, DiscordSessionOption>();
+  const pendingRows = approvalRegistry
+    .listPending({ status: 'pending' })
+    .filter((row) => approvalRegistry.isActionable(row));
+  const pendingBySession = new Map<string, approvalRegistry.PendingApprovalRow[]>();
+  for (const row of pendingRows) {
+    const rows = pendingBySession.get(row.sessionId) ?? [];
+    rows.push(row);
+    pendingBySession.set(row.sessionId, rows);
+  }
+
+  const add = (session: SessionRow | null, rank: number, isBound = false): void => {
+    if (!session) return;
+    const existing = byId.get(session.id);
+    const pendingApprovals = pendingBySession.get(session.id) ?? [];
+    if (existing) {
+      existing.rank = Math.min(existing.rank, rank);
+      existing.isBound = existing.isBound || isBound;
+      existing.pendingApprovals = pendingApprovals;
+      return;
+    }
+    byId.set(session.id, { session, pendingApprovals, isBound, rank });
+  };
+
+  const memoryBound = channelSessions.get(channelId);
+  if (memoryBound) add(getHarnessSession(memoryBound.sessionId), 0, true);
+  const persistedBound = findMostRecentChannelSession(channelId);
+  if (persistedBound) add(getHarnessSession(persistedBound.sessionId), 1, true);
+
+  for (const row of pendingRows) add(getHarnessSession(row.sessionId), 2, false);
+  for (const row of listHarnessSessions({ status: ['active', 'paused'], limit: 30 })) add(row, 3, false);
+  const recentCutoff = new Date(Date.now() - 24 * 60 * 60_000).toISOString();
+  for (const row of listHarnessSessions({ status: 'any', updatedAfter: recentCutoff, limit: 30 })) add(row, 4, false);
+
+  return [...byId.values()]
+    .sort((left, right) => {
+      const isRecent = (option: DiscordSessionOption): boolean => {
+        const ageMs = Date.now() - Date.parse(option.session.updatedAt);
+        return Number.isFinite(ageMs) && ageMs >= 0 && ageMs < 4 * 60 * 60_000;
+      };
+      const priority = (option: DiscordSessionOption): number => {
+        if (option.isBound && (isRecent(option) || option.pendingApprovals.length > 0)) return 0;
+        if (option.session.kind === 'chat' && option.session.status === 'active' && isRecent(option)) return 1;
+        if (option.pendingApprovals.length > 0) return 2;
+        if (option.session.status === 'paused') return 3;
+        if (option.isBound) return 4;
+        return 5;
+      };
+      return (priority(left) - priority(right))
+        || (left.rank - right.rank)
+        || right.session.updatedAt.localeCompare(left.session.updatedAt);
+    })
+    .slice(0, 8);
+}
+
+function renderSessionPickerText(options: DiscordSessionOption[], channelId: string): string {
+  if (options.length === 0) {
+    return 'No active or recent Clementine sessions are available to attach here.';
+  }
+  const lines = [
+    'Clementine sessions',
+    'Tap **Resume here** to bind this Discord thread to the same live harness session the desktop app uses.',
+    '',
+  ];
+  options.forEach((option, index) => {
+    const approvals = option.pendingApprovals.length > 0
+      ? ` · ${option.pendingApprovals.length} approval${option.pendingApprovals.length === 1 ? '' : 's'} waiting`
+      : '';
+    const bound = option.isBound ? ' · bound here' : '';
+    const channel = option.session.channel ? ` · ${option.session.channel}` : '';
+    lines.push(
+      `${index + 1}. ${sessionTitle(option.session)}`
+      + `\n   \`${option.session.id}\` · ${option.session.status}${channel} · ${sessionAgeLabel(option.session.updatedAt)}${approvals}${bound}`,
+    );
+  });
+  lines.push('', `Channel: \`${channelId}\``);
+  return lines.join('\n');
+}
+
+function sessionPickerComponents(options: DiscordSessionOption[]): unknown[] {
+  return options.slice(0, 5).map((option, index) => {
+    const components: Array<Record<string, unknown>> = [
+      {
+        type: 2,
+        style: 1,
+        label: `Resume ${index + 1}`,
+        custom_id: `clementine:session-resume:${option.session.id}`,
+      },
+    ];
+    const firstApproval = option.pendingApprovals[0];
+    if (firstApproval) {
+      components.push(
+        { type: 2, style: 3, label: 'Approve', custom_id: `clementine:approve:${firstApproval.approvalId}` },
+        { type: 2, style: 4, label: 'Reject', custom_id: `clementine:reject:${firstApproval.approvalId}` },
+      );
+    }
+    return { type: 1, components };
+  });
+}
+
+export async function handleHarnessSessions(opts: {
+  channelId: string;
+  userId?: string | null;
+  guildId?: string | null;
+  transport: DiscordHarnessTransport;
+}): Promise<void> {
+  const options = collectDiscordSessionOptions(opts.channelId);
+  const body = renderSessionPickerText(options, opts.channelId);
+  const handle = await opts.transport.sendInitial(body);
+  const components = sessionPickerComponents(options);
+  if (components.length > 0) {
+    await handle.edit(body, { components });
+  }
+}
+
 /**
  * Detect approve / reject intent in a Discord prompt. Conservative —
  * only matches at the start of the message and only when a session
@@ -704,11 +874,12 @@ export function parseApprovalIntent(prompt: string): ParsedApprovalIntent | null
  * Accepts both `/cancel` and bare `cancel` / `new` on a line by
  * itself, so the user doesn't need to know the prefix.
  */
-export type HarnessCommand = 'cancel' | 'new' | 'continue';
+export type HarnessCommand = 'cancel' | 'new' | 'continue' | 'sessions';
 export function parseHarnessCommand(prompt: string): HarnessCommand | null {
   const t = prompt.trim().toLowerCase();
   if (t === '/cancel' || t === 'cancel') return 'cancel';
   if (t === '/new' || t === 'new') return 'new';
+  if (t === '/sessions' || t === 'sessions' || t === '/session' || t === 'session') return 'sessions';
   // /continue (T1.3 graceful continue) — the loop emits a "Reply
   // `continue` to keep going" message when it hits a step or wall-clock
   // limit. Honor a bare `continue` or `keep going` so the user can
@@ -849,8 +1020,11 @@ export const __test__ = {
   approvalBelongsToDiscordChannel,
   approvalComponentsForState,
   approvalPickerComponents,
+  collectDiscordSessionOptions,
   globalApprovalRowsForDm,
   isDiscordTokenExpired,
+  renderSessionPickerText,
+  sessionPickerComponents,
 };
 
 /**
@@ -1369,6 +1543,10 @@ export async function runDiscordHarnessConversation(opts: {
     // sees the confirmation and can send their real first message.
     return;
   }
+  if (command === 'sessions') {
+    await handleHarnessSessions({ channelId, userId, guildId, transport });
+    return;
+  }
   if (command === 'continue') {
     // /continue is only meaningful when the session's last
     // conversation_completed was an "awaiting_continue" — the
@@ -1406,6 +1584,7 @@ export async function runDiscordHarnessConversation(opts: {
   }
 
   const session = resolveOrCreateSession({ channelId, userId, guildId, prompt });
+  const planFirst = shouldUsePlanFirst({ input: prompt, freshSession: !session.isContinuation });
 
   let handle: DiscordHarnessReplyHandle;
   try {
@@ -1677,7 +1856,16 @@ export async function runDiscordHarnessConversation(opts: {
 
   void (async () => {
     try {
-      const agent = await buildOrchestratorAgent();
+      if (planFirst) {
+        const preflight = await runPlanFirstPreflight({
+          input: prompt,
+          sessionId: session.id,
+          channel: `discord:${channelId}`,
+          freshSession: !session.isContinuation,
+        });
+        if (preflight.surfaced) return;
+      }
+      const agent = await buildOrchestratorAgent({ userInput: prompt, sessionId: session.id });
       await runConversation({ agent, sessionId: session.id, input: prompt });
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
@@ -1808,11 +1996,12 @@ async function runDiscordHarnessResume(opts: {
   const entry = channelSessions.get(channelId);
   if (entry && entry.sessionId === sessionId) {
     entry.lastUsedAt = Date.now();
+    bindDiscordHarnessSession({ channelId, sessionId });
   } else {
     // The chosen session may not be the channel-cached one (when
     // routing by approvalId). Update the cache so subsequent
     // interactions in this channel target the now-active session.
-    channelSessions.set(channelId, { sessionId, lastUsedAt: Date.now() });
+    bindDiscordHarnessSession({ channelId, sessionId });
   }
 
   let handle: DiscordHarnessReplyHandle;
@@ -1939,7 +2128,7 @@ async function runDiscordHarnessResume(opts: {
 
   void (async () => {
     try {
-      const agent = await buildOrchestratorAgent();
+      const agent = await buildOrchestratorAgent({ sessionId });
       const result = await runConversationFromResume({
         agent,
         sessionId,

@@ -1,7 +1,7 @@
 /**
  * Run: npx tsx --test src/agents/harness-context.test.ts
  */
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -15,6 +15,28 @@ import assert from 'node:assert/strict';
 const { resetMemoryDb } = await import('../memory/db.js');
 const { createFocus } = await import('../memory/focus.js');
 const { renderHarnessMemoryContext } = await import('./harness-context.js');
+
+test('persistent context includes compact installed skills index', () => {
+  const skillDir = path.join(TMP_HOME, 'skills', 'proposal-style');
+  mkdirSync(skillDir, { recursive: true });
+  writeFileSync(
+    path.join(skillDir, 'SKILL.md'),
+    [
+      '---',
+      'name: Proposal Style',
+      'description: Brand rules for polished proposal artifacts.',
+      '---',
+      '',
+      'Full body should remain behind skill_read.',
+    ].join('\n'),
+    'utf-8',
+  );
+
+  const context = renderHarnessMemoryContext();
+  assert.match(context, /## Available Skills/);
+  assert.match(context, /`proposal-style`: Brand rules for polished proposal artifacts\./);
+  assert.doesNotMatch(context, /Full body should remain behind skill_read/);
+});
 
 test('stale focus is not rendered as active persistent context', () => {
   resetMemoryDb();

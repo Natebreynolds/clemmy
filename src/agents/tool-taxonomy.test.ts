@@ -40,12 +40,19 @@ function setScope(scope: 'strict' | 'workspace' | 'yolo'): void {
 // Bind these in `before` so the dynamic import resolves once env is set.
 let classifyTool: typeof import('./tool-taxonomy.js').classifyTool;
 let decideToolApproval: typeof import('./tool-taxonomy.js').decideToolApproval;
+let needsApprovalFromTaxonomy: typeof import('./tool-taxonomy.js').needsApprovalFromTaxonomy;
+let openPlanScope: typeof import('./plan-scope.js').openPlanScope;
+let withHarnessRunContext: typeof import('../runtime/harness/brackets.js').withHarnessRunContext;
+let ToolCallsCounter: typeof import('../runtime/harness/brackets.js').ToolCallsCounter;
 
 before(async () => {
   setScope('strict');
   const mod = await import('./tool-taxonomy.js');
   classifyTool = mod.classifyTool;
   decideToolApproval = mod.decideToolApproval;
+  needsApprovalFromTaxonomy = mod.needsApprovalFromTaxonomy;
+  ({ openPlanScope } = await import('./plan-scope.js'));
+  ({ withHarnessRunContext, ToolCallsCounter } = await import('../runtime/harness/brackets.js'));
 });
 
 // ---------- classifyTool ----------
@@ -219,6 +226,23 @@ test('decideToolApproval: workspace scope auto-approves writes inside workspace 
   assert.equal(outside.needsApproval, true);
 });
 
+test('decideToolApproval: write_file inside an allowed local path auto-approves even in strict', () => {
+  setScope('strict');
+  const inside = decideToolApproval({
+    toolName: 'write_file',
+    insideWorkspaceHint: true,
+  });
+  assert.equal(inside.needsApproval, false);
+  assert.equal(inside.reason, 'local-workspace-write');
+
+  const outside = decideToolApproval({
+    toolName: 'write_file',
+    insideWorkspaceHint: false,
+  });
+  assert.equal(outside.needsApproval, true);
+  assert.equal(outside.reason, 'strict-policy');
+});
+
 test('decideToolApproval: workspace scope still asks for send (no workspace concept)', () => {
   setScope('workspace');
   const { needsApproval } = decideToolApproval({
@@ -226,6 +250,32 @@ test('decideToolApproval: workspace scope still asks for send (no workspace conc
     insideWorkspaceHint: true, // hint should be ignored for 'send'
   });
   assert.equal(needsApproval, true);
+});
+
+test('decideToolApproval: composio send slugs honor approved plan scope', () => {
+  setScope('strict');
+  openPlanScope({
+    sessionId: 'sess-composio-plan',
+    planProposalId: 'batch-approval',
+    approvedPlanObjective: 'Create Outlook drafts',
+    allowedTools: ['composio_execute_tool'],
+    allowedComposioSlugs: ['OUTLOOK_CREATE_DRAFT'],
+  });
+
+  const approved = decideToolApproval({
+    sessionId: 'sess-composio-plan',
+    toolName: 'composio_execute_tool',
+    args: { tool_slug: 'OUTLOOK_CREATE_DRAFT' },
+  });
+  assert.equal(approved.needsApproval, false);
+  assert.equal(approved.reason, 'plan-scope');
+
+  const unrelated = decideToolApproval({
+    sessionId: 'sess-composio-plan',
+    toolName: 'composio_execute_tool',
+    args: { tool_slug: 'OUTLOOK_SEND_EMAIL' },
+  });
+  assert.equal(unrelated.needsApproval, true);
 });
 
 test('decideToolApproval: agent-owned-dir short-circuits even under strict scope', () => {
@@ -285,6 +335,28 @@ test('decideToolApproval: kindHint overrides the classifier', () => {
   });
   assert.equal(kind, 'admin');
   assert.equal(needsApproval, true);
+});
+
+test('needsApprovalFromTaxonomy: worker sub-runs inherit harness plan scope', async () => {
+  setScope('strict');
+  openPlanScope({
+    sessionId: 'sess-worker-scope',
+    planProposalId: 'request-approval-batch',
+    approvedPlanObjective: 'Create Outlook drafts',
+    allowedTools: ['composio_execute_tool'],
+    allowedComposioSlugs: ['OUTLOOK_CREATE_DRAFT'],
+  });
+  const needsApproval = needsApprovalFromTaxonomy('composio_execute_tool');
+
+  const result = await withHarnessRunContext(
+    { sessionId: 'sess-worker-scope', counter: new ToolCallsCounter(16) },
+    () => needsApproval(
+      {},
+      { tool_slug: 'OUTLOOK_CREATE_DRAFT', arguments: JSON.stringify({ subject: 'A' }) },
+    ),
+  );
+
+  assert.equal(result, false);
 });
 
 // Cleanup the temp HOME directory at the end of the suite.

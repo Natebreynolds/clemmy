@@ -366,6 +366,28 @@ const MIGRATIONS: { version: number; sql: string }[] = [
         ON current_focus(status) WHERE status = 'active';
     `,
   },
+  {
+    // v7 — Fact embeddings. The `embeddings` table (v1) is keyed to
+    // vault_chunks only, so consolidated_facts had no semantic search:
+    // the reflection conflict-resolver's candidate retrieval
+    // (findSimilarFacts) fell back to LIKE-token matching and missed
+    // paraphrased contradictions ("prefers Tuesday" vs "Wednesdays work
+    // best"). This table gives facts the same Float32-BLOB treatment as
+    // chunks. `content_hash` lets the backfill detect a fact whose
+    // content changed (updateFact rewrites the hash) and re-embed it.
+    // FK-cascaded so a hard fact delete drops its embedding for free.
+    version: 7,
+    sql: `
+      CREATE TABLE IF NOT EXISTS fact_embeddings (
+        fact_id      INTEGER PRIMARY KEY REFERENCES consolidated_facts(id) ON DELETE CASCADE,
+        model        TEXT NOT NULL,
+        dim          INTEGER NOT NULL,
+        vector       BLOB NOT NULL,
+        content_hash TEXT NOT NULL,
+        created_at   TEXT NOT NULL
+      );
+    `,
+  },
 ];
 
 function runMigrations(db: Database.Database): void {

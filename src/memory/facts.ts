@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { openMemoryDb, type ConsolidatedFactKind, type ConsolidatedFactRow } from './db.js';
+import { cosine, embedQuery, isEmbeddingsEnabled, loadFactEmbeddings } from './embeddings.js';
 
 /**
  * Read/write API for durable, agent-curated facts.
@@ -306,19 +307,70 @@ export function deleteFact(id: number): boolean {
  * LLM can decide ADD / UPDATE / DELETE / NOOP. Mirrors Mem0's
  * "Update Phase" (Chhikara et al §2.1).
  *
- * For Phase 1 simplicity we use FTS5 (already wired) — semantic
- * embeddings remain the future upgrade path. The conflict resolver's
- * LLM call provides the actual contradiction-vs-complement judgment;
- * this retrieval just narrows the candidate pool.
+ * Semantic-first: when embeddings are configured we rank the active
+ * (kind-filtered) fact pool by cosine similarity to the candidate, so a
+ * paraphrased contradiction with no shared tokens still surfaces for the
+ * resolver. Falls back to the LIKE-token ranker when embeddings are
+ * disabled, the query embed fails, or no pooled fact is embedded yet
+ * (the backfill warms it over time) — preserving behavior for no-key
+ * (codex_oauth) installs. The conflict resolver's LLM call provides the
+ * actual contradiction-vs-complement judgment; this retrieval just
+ * narrows the candidate pool.
  */
-export function findSimilarFacts(
+export async function findSimilarFacts(
   content: string,
   options: { kind?: ConsolidatedFactKind; topK?: number } = {},
-): ConsolidatedFact[] {
+): Promise<ConsolidatedFact[]> {
   const db = openMemoryDb();
   const topK = Math.max(1, Math.min(20, options.topK ?? 5));
   const normalized = normalizeContent(content);
   if (!normalized) return [];
+
+  // Semantic path — cosine over the embedded fact pool.
+  if (isEmbeddingsEnabled()) {
+    try {
+      // Cap the candidate pool so we never load every embedding on a
+      // large vault. Most-recently-updated facts are the relevant
+      // contradiction targets. Load stored vectors before embedding the
+      // query; fresh installs often have facts but no fact_embeddings yet,
+      // and making a network call just to discover an empty comparison
+      // pool adds latency without improving recall.
+      const poolRows = (options.kind
+        ? db.prepare('SELECT id FROM consolidated_facts WHERE active = 1 AND kind = ? ORDER BY updated_at DESC LIMIT 500').all(options.kind)
+        : db.prepare('SELECT id FROM consolidated_facts WHERE active = 1 ORDER BY updated_at DESC LIMIT 500').all()) as { id: number }[];
+      const ids = poolRows.map((r) => r.id);
+      const vectors = loadFactEmbeddings(ids);
+      if (vectors.size > 0) {
+        const queryVector = await embedQuery(normalized);
+        if (queryVector) {
+          const scored: Array<{ id: number; sim: number }> = [];
+          for (const id of ids) {
+            const vec = vectors.get(id);
+            if (!vec) continue;
+            scored.push({ id, sim: cosine(queryVector, vec) });
+          }
+          scored.sort((a, b) => b.sim - a.sim);
+          const topIds = scored.slice(0, topK).map((s) => s.id);
+          if (topIds.length > 0) {
+            const placeholders = topIds.map(() => '?').join(',');
+            const factRows = db.prepare(
+              `SELECT * FROM consolidated_facts WHERE id IN (${placeholders})`
+            ).all(...topIds) as ConsolidatedFactRow[];
+            const byId = new Map(factRows.map((r) => [r.id, r]));
+            // Preserve cosine order.
+            return topIds
+              .map((id) => byId.get(id))
+              .filter((r): r is ConsolidatedFactRow => Boolean(r))
+              .map(rowToFact);
+          }
+        }
+      }
+      // Embeddings on but pool not yet embedded — fall through to LIKE.
+    } catch {
+      // Any failure (embed timeout, circuit breaker) → LIKE fallback.
+    }
+  }
+
   // Light tokenization → FTS5 OR-match over content. We don't use the
   // full searchVault path because the conflict resolver wants ONLY
   // consolidated_facts (no vault chunks).

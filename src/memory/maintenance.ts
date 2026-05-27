@@ -1,6 +1,6 @@
 import { statSync } from 'node:fs';
 import pino from 'pino';
-import { embedMissingChunks, isEmbeddingsEnabled } from './embeddings.js';
+import { embedMissingChunks, embedMissingFacts, isEmbeddingsEnabled } from './embeddings.js';
 import { reindexVault } from './indexer.js';
 import { tickMemoryMdRefresh } from './memory-md-builder.js';
 import { tickIdentityMdRefresh } from './identity-md-builder.js';
@@ -111,6 +111,17 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
       }
     } catch (err) {
       logger.warn({ err }, 'embedding backfill tick failed');
+    }
+    // Facts get the same incremental, circuit-broken backfill so the
+    // conflict resolver's semantic findSimilarFacts has vectors to rank
+    // against. Re-embeds facts whose content changed (Mem0 UPDATE).
+    try {
+      const factStats = await embedMissingFacts({ maxChunks: BACKFILL_BATCH });
+      if (factStats.embedded > 0 || factStats.failed > 0) {
+        logger.info({ stats: factStats }, 'fact embedding backfill tick');
+      }
+    } catch (err) {
+      logger.warn({ err }, 'fact embedding backfill tick failed');
     }
   }
 

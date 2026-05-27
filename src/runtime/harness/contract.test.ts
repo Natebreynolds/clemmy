@@ -84,6 +84,92 @@ function findItems(body: { input: unknown[] }, type: string): WireItem[] {
   return (body.input as WireItem[]).filter((it) => it && it.type === type);
 }
 
+function buildRequest(input: unknown[], overrides: Record<string, unknown> = {}) {
+  return {
+    input,
+    tools: [],
+    handoffs: [],
+    modelSettings: {},
+    outputType: 'text',
+    tracing: false,
+    ...overrides,
+  } as unknown as Parameters<typeof buildCodexRequestBody>[1];
+}
+
+async function withNativeCompactionEnv<T>(
+  value: string | undefined,
+  threshold: string | undefined,
+  fn: () => T | Promise<T>,
+): Promise<T> {
+  const previousValue = process.env.CLEMMY_CODEX_NATIVE_COMPACTION;
+  const previousThreshold = process.env.CLEMMY_CODEX_NATIVE_COMPACTION_THRESHOLD;
+  if (value == null) delete process.env.CLEMMY_CODEX_NATIVE_COMPACTION;
+  else process.env.CLEMMY_CODEX_NATIVE_COMPACTION = value;
+  if (threshold == null) delete process.env.CLEMMY_CODEX_NATIVE_COMPACTION_THRESHOLD;
+  else process.env.CLEMMY_CODEX_NATIVE_COMPACTION_THRESHOLD = threshold;
+  try {
+    return await fn();
+  } finally {
+    if (previousValue == null) delete process.env.CLEMMY_CODEX_NATIVE_COMPACTION;
+    else process.env.CLEMMY_CODEX_NATIVE_COMPACTION = previousValue;
+    if (previousThreshold == null) delete process.env.CLEMMY_CODEX_NATIVE_COMPACTION_THRESHOLD;
+    else process.env.CLEMMY_CODEX_NATIVE_COMPACTION_THRESHOLD = previousThreshold;
+  }
+}
+
+test('native Codex compaction is omitted by default and previous_response_id is never sent', async () => {
+  await withNativeCompactionEnv(undefined, undefined, () => {
+    const body = buildCodexRequestBody('gpt-5', buildRequest(
+      [{ role: 'user', content: 'hello' }],
+      { previousResponseId: 'resp_forbidden' },
+    ));
+    const wire = body as unknown as Record<string, unknown>;
+    assert.equal(wire.context_management, undefined);
+    assert.equal(wire.previous_response_id, undefined);
+    assert.equal(wire.previousResponseId, undefined);
+  });
+});
+
+test('native Codex compaction flag sends SDK context_management with backend-safe snake-case threshold', async () => {
+  await withNativeCompactionEnv('1', '4', () => {
+    const body = buildCodexRequestBody('gpt-5', buildRequest([{ role: 'user', content: 'hello' }]));
+    assert.deepEqual(body.context_management, [{ type: 'compaction', compact_threshold: 1000 }]);
+  });
+
+  await withNativeCompactionEnv('1', undefined, () => {
+    const body = buildCodexRequestBody('gpt-5', buildRequest(
+      [{ role: 'user', content: 'hello' }],
+      {
+        modelSettings: {
+          contextManagement: [{ type: 'compaction', compactThreshold: 1234, keep: 'provider-data' }],
+        },
+      },
+    ));
+    assert.deepEqual(body.context_management, [{ type: 'compaction', compact_threshold: 1234, keep: 'provider-data' }]);
+  });
+});
+
+test('compaction input items round-trip only when native Codex compaction flag is enabled', async () => {
+  const input = [
+    { role: 'user', content: 'hello' },
+    { type: 'compaction', id: 'cmp_1', encrypted_content: 'ciphertext', created_by: 'server' },
+  ];
+
+  await withNativeCompactionEnv(undefined, undefined, () => {
+    const body = buildCodexRequestBody('gpt-5', buildRequest(input));
+    assert.equal(findItems(body, 'compaction').length, 0);
+  });
+
+  await withNativeCompactionEnv('1', '4', () => {
+    const body = buildCodexRequestBody('gpt-5', buildRequest(input));
+    const compactions = findItems(body, 'compaction') as Array<Record<string, unknown>>;
+    assert.equal(compactions.length, 1);
+    assert.equal(compactions[0].id, 'cmp_1');
+    assert.equal(compactions[0].encrypted_content, 'ciphertext');
+    assert.equal(compactions[0].created_by, 'server');
+  });
+});
+
 test('handoff round-trip: function_call and function_call_output both reach the wire with matching call_id', () => {
   const callId = 'call_FcJvAFqYbLnNZlg62XKGdiFt';
   const [fc, fcr] = buildHandoffPair(callId);
@@ -94,7 +180,7 @@ test('handoff round-trip: function_call and function_call_output both reach the 
   ];
   // Cast: ModelRequest's input typing is strict; the test deliberately
   // uses a hand-built shape that mirrors the SDK's runtime output.
-  const body = buildCodexRequestBody('gpt-5', { input, tools: [], handoffs: [] } as unknown as Parameters<typeof buildCodexRequestBody>[1]);
+  const body = buildCodexRequestBody('gpt-5', buildRequest(input));
 
   const calls = findItems(body, 'function_call');
   const outputs = findItems(body, 'function_call_output');
@@ -128,7 +214,7 @@ test('regular tool call round-trip: same pairing contract holds', () => {
       status: 'completed',
     },
   ];
-  const body = buildCodexRequestBody('gpt-5', { input, tools: [], handoffs: [] } as unknown as Parameters<typeof buildCodexRequestBody>[1]);
+  const body = buildCodexRequestBody('gpt-5', buildRequest(input));
   const calls = findItems(body, 'function_call');
   const outputs = findItems(body, 'function_call_output');
 
@@ -384,7 +470,7 @@ test('multi-tool turn: every function_call has a paired function_call_output on 
       status: 'completed',
     });
   }
-  const body = buildCodexRequestBody('gpt-5', { input, tools: [], handoffs: [] } as unknown as Parameters<typeof buildCodexRequestBody>[1]);
+  const body = buildCodexRequestBody('gpt-5', buildRequest(input));
   const calls = findItems(body, 'function_call');
   const outputs = findItems(body, 'function_call_output');
 

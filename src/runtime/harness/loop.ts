@@ -379,6 +379,8 @@ export interface RunOutcome {
   history: AgentInputItem[];
   lastResponseId: string | undefined;
   finalOutput: unknown;
+  /** Raw SDK model responses. Used only for flag-only native Codex compaction research. */
+  rawResponses?: unknown[];
   /** Serialized RunState for interrupt-resume; only set when paused. */
   serializedState?: string;
   /** True when the underlying RunResult had interruptions[]. */
@@ -393,6 +395,143 @@ export type RunRunnerFn = (
   items: AgentInputItem[],
   opts: Record<string, unknown>,
 ) => Promise<RunOutcome>;
+
+interface NativeCompactionRewrite {
+  history: AgentInputItem[];
+  applied: boolean;
+  previousItems: number;
+  nextItems: number;
+  compactionItemsSeen: number;
+  latestCompactionId: string | null;
+  latestCompactionBytes: number;
+  preservedAssistantMessage: boolean;
+}
+
+function isHarnessNativeCodexCompactionEnabled(): boolean {
+  const value = (process.env.CLEMMY_CODEX_NATIVE_COMPACTION ?? '').trim().toLowerCase();
+  return value === '1' || value === 'true' || value === 'on';
+}
+
+function getItemType(item: unknown): string | null {
+  return item && typeof item === 'object' && typeof (item as { type?: unknown }).type === 'string'
+    ? (item as { type: string }).type
+    : null;
+}
+
+function getNativeCompactionEncryptedContent(item: unknown): string | null {
+  if (!item || typeof item !== 'object') return null;
+  const row = item as { encrypted_content?: unknown; encryptedContent?: unknown };
+  if (typeof row.encrypted_content === 'string' && row.encrypted_content.length > 0) {
+    return row.encrypted_content;
+  }
+  if (typeof row.encryptedContent === 'string' && row.encryptedContent.length > 0) {
+    return row.encryptedContent;
+  }
+  return null;
+}
+
+function normalizeNativeCompactionItem(item: unknown): AgentInputItem | null {
+  if (getItemType(item) !== 'compaction') return null;
+  const encryptedContent = getNativeCompactionEncryptedContent(item);
+  if (!encryptedContent) return null;
+  const row = item as {
+    id?: unknown;
+    created_by?: unknown;
+    createdBy?: unknown;
+    providerData?: unknown;
+  };
+  return {
+    type: 'compaction',
+    id: typeof row.id === 'string' ? row.id : undefined,
+    encrypted_content: encryptedContent,
+    created_by:
+      typeof row.created_by === 'string'
+        ? row.created_by
+        : typeof row.createdBy === 'string'
+          ? row.createdBy
+          : undefined,
+    providerData: row.providerData && typeof row.providerData === 'object' ? row.providerData : undefined,
+  } as unknown as AgentInputItem;
+}
+
+function extractNativeCompactionItems(rawResponses: unknown[] | undefined): AgentInputItem[] {
+  if (!Array.isArray(rawResponses)) return [];
+  const out: AgentInputItem[] = [];
+  for (const response of rawResponses) {
+    const output = response && typeof response === 'object'
+      ? (response as { output?: unknown }).output
+      : undefined;
+    if (!Array.isArray(output)) continue;
+    for (const item of output) {
+      const compacted = normalizeNativeCompactionItem(item);
+      if (compacted) out.push(compacted);
+    }
+  }
+  return out;
+}
+
+function findLatestAssistantMessage(history: AgentInputItem[]): AgentInputItem | null {
+  for (let i = history.length - 1; i >= 0; i -= 1) {
+    const item = history[i] as { type?: unknown; role?: unknown } | undefined;
+    if (!item || typeof item !== 'object') continue;
+    const type = typeof item.type === 'string' ? item.type : null;
+    if ((type === 'message' || type == null) && item.role === 'assistant') {
+      return history[i];
+    }
+  }
+  return null;
+}
+
+export function rewriteHistoryWithNativeCompaction(
+  history: AgentInputItem[],
+  rawResponses: unknown[] | undefined,
+): NativeCompactionRewrite {
+  const previousItems = history.length;
+  if (!isHarnessNativeCodexCompactionEnabled()) {
+    return {
+      history,
+      applied: false,
+      previousItems,
+      nextItems: history.length,
+      compactionItemsSeen: 0,
+      latestCompactionId: null,
+      latestCompactionBytes: 0,
+      preservedAssistantMessage: false,
+    };
+  }
+
+  const compactionItems = extractNativeCompactionItems(rawResponses);
+  if (compactionItems.length === 0) {
+    return {
+      history,
+      applied: false,
+      previousItems,
+      nextItems: history.length,
+      compactionItemsSeen: 0,
+      latestCompactionId: null,
+      latestCompactionBytes: 0,
+      preservedAssistantMessage: false,
+    };
+  }
+
+  const latestCompaction = compactionItems[compactionItems.length - 1];
+  const latestAssistant = findLatestAssistantMessage(history);
+  const nextHistory = latestAssistant
+    ? [latestCompaction, latestAssistant]
+    : [latestCompaction];
+  const latest = latestCompaction as { id?: unknown; encrypted_content?: unknown; encryptedContent?: unknown };
+  const encryptedContent = getNativeCompactionEncryptedContent(latestCompaction) ?? '';
+  return {
+    history: nextHistory,
+    applied: true,
+    previousItems,
+    nextItems: nextHistory.length,
+    compactionItemsSeen: compactionItems.length,
+    latestCompactionId: typeof latest.id === 'string' ? latest.id : null,
+    latestCompactionBytes: Buffer.byteLength(encryptedContent, 'utf8'),
+    preservedAssistantMessage: Boolean(latestAssistant),
+  };
+}
 
 export interface RunTurnOptions {
   agent: Agent<any, any>;
@@ -835,6 +974,73 @@ async function runConversationCore(
       },
     });
 
+    const structuredStallInfo = decision
+      ? evaluateStructuredDecisionStall({
+          decision,
+          toolCalls: turnResult.toolCalls ?? 0,
+          sessionId: options.sessionId,
+          turn: turnResult.turn,
+        })
+      : undefined;
+    if (structuredStallInfo) {
+      safeAppend({
+        sessionId: options.sessionId,
+        turn: turnResult.turn,
+        role: 'system',
+        type: 'stuck_detected',
+        data: {
+          signal: structuredStallInfo.signal,
+          ...structuredStallInfo.detail,
+        },
+      });
+
+      if (stallRetriesUsed < MAX_STALL_RETRIES) {
+        stallRetriesUsed += 1;
+        safeAppend({
+          sessionId: options.sessionId,
+          turn: turnResult.turn,
+          role: 'system',
+          type: 'stall_retry_attempted',
+          data: {
+            signal: structuredStallInfo.signal,
+            attempt: stallRetriesUsed,
+            maxRetries: MAX_STALL_RETRIES,
+            rawOutput: structuredStallInfo.rawOutput,
+          },
+        });
+        const backoffMs = STALL_RETRY_BACKOFF_MS[stallRetriesUsed - 1] ?? 1000;
+        if (backoffMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, backoffMs));
+        }
+        nextInput = `${buildStallRetryMessage(options.sessionId, structuredStallInfo)} The tool surface is available in this run; do not ask the user to resend a tool-enabled message. Pick the needed local, shell, web, memory, or external-service tool and call it now.`;
+        continue;
+      }
+      const askUserEnabled =
+        (getRuntimeEnv('HARNESS_STALL_ASK_USER', 'on') ?? 'on').toLowerCase() !== 'off';
+      if (askUserEnabled) {
+        safeAppend({
+          sessionId: options.sessionId,
+          turn: turnResult.turn,
+          role: 'Clem',
+          type: 'awaiting_user_input',
+          data: {
+            question:
+              "I've been unable to make progress because the model claimed tools were unavailable instead of using them. Should I retry, switch approach, or stop here?",
+            options: ['Retry', 'Switch approach', 'Stop'],
+            source: 'stall_recovery',
+            signal: structuredStallInfo.signal,
+          },
+        });
+        return {
+          sessionId: options.sessionId,
+          status: 'awaiting_user_input',
+          steps: stepIndex,
+          lastDecision,
+          lastTurn,
+        };
+      }
+    }
+
     if (!decision) {
       // No structured decision = nothing to recurse on. End cleanly.
       // This usually means a handoff target (Executor/Researcher/etc.)
@@ -1265,15 +1471,17 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
       message: options.input,
       sessionId: options.sessionId,
     });
-    if (captured.facts.length > 0 || captured.profilePatch) {
+    if (captured.candidates.length > 0 || captured.profilePatch) {
+      // Facts now consolidate asynchronously through the Mem0 resolver,
+      // so committed row ids aren't known synchronously — record the
+      // captured candidate signals instead.
       safeAppend({
         sessionId: options.sessionId,
         turn,
         role: 'system',
         type: 'memory_signals_captured',
         data: {
-          factCount: captured.facts.length,
-          factIds: captured.facts.map((f) => f.id),
+          factCount: captured.candidates.length,
           profilePatch: captured.profilePatch ?? null,
           reasons: captured.candidates.map((c) => c.reason),
         },
@@ -1677,8 +1885,26 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
       return { sessionId: options.sessionId, turn, status: 'awaiting_approval' };
     }
 
+    const compactionRewrite = rewriteHistoryWithNativeCompaction(outcome.history, outcome.rawResponses);
+    if (compactionRewrite.applied) {
+      safeAppend({
+        sessionId: options.sessionId,
+        turn,
+        role: 'system',
+        type: 'native_compaction_applied',
+        data: {
+          previousItems: compactionRewrite.previousItems,
+          nextItems: compactionRewrite.nextItems,
+          compactionItemsSeen: compactionRewrite.compactionItemsSeen,
+          latestCompactionId: compactionRewrite.latestCompactionId,
+          latestCompactionBytes: compactionRewrite.latestCompactionBytes,
+          preservedAssistantMessage: compactionRewrite.preservedAssistantMessage,
+        },
+      });
+    }
+
     session.recordTurnResult({
-      history: outcome.history,
+      history: compactionRewrite.history,
       lastResponseId: outcome.lastResponseId,
       turn,
     });
@@ -2018,8 +2244,26 @@ export async function resumePendingApproval(
       return { sessionId: options.sessionId, turn, status: 'awaiting_approval' };
     }
 
+    const compactionRewrite = rewriteHistoryWithNativeCompaction(outcome.history, outcome.rawResponses);
+    if (compactionRewrite.applied) {
+      safeAppend({
+        sessionId: options.sessionId,
+        turn,
+        role: 'system',
+        type: 'native_compaction_applied',
+        data: {
+          previousItems: compactionRewrite.previousItems,
+          nextItems: compactionRewrite.nextItems,
+          compactionItemsSeen: compactionRewrite.compactionItemsSeen,
+          latestCompactionId: compactionRewrite.latestCompactionId,
+          latestCompactionBytes: compactionRewrite.latestCompactionBytes,
+          preservedAssistantMessage: compactionRewrite.preservedAssistantMessage,
+        },
+      });
+    }
+
     session.recordTurnResult({
-      history: outcome.history,
+      history: compactionRewrite.history,
       lastResponseId: outcome.lastResponseId,
       turn,
     });
@@ -2605,6 +2849,19 @@ const STALL_OUTPUT_PATTERN = /^(continuing|ok|okay|done|sure|got it|working on i
 // Boundary anchors (\b) prevent substring matches; the Unicode-
 // apostrophe class catches curly quotes models love to emit.
 const STALL_ANNOUNCEMENT_PATTERN = /\b(I[\u2018\u2019\u02bc' ]?ll\s|let me\s|executing\s|fetching\s|running\s|pulling\s|querying\s|about to\s|going to\s|on the way|in progress|kicking off|starting now|handed off\s|handing off\s|completed the\s|sent the\s|updated the\s|searched\s|pulled the\s|posted the\s|created the\s|drafted the\s|saved the\s|loaded the\s|fetched\s|queried\s|ran the\s|transferred to\s|transferring to\s|routed to\s|routing to\s|dispatched the\s|dispatching the\s|delegated to\s|delegating to\s|kicked off\s|invoked the\s|invoking the\s|launched the\s|launching the\s|triggered the\s|triggering the\s|forwarded to\s|forwarding to\s)/i;
+const STRUCTURED_TOOL_UNAVAILABLE_PATTERN = /\b(tool[- ]?enabled run|tool runtime|tool access|tool surface.{0,80}not available|tools? (?:were|was|are|is) (?:not )?available|no (?:commentary\/)?tool calls? (?:were|was|are|is) available|no executable tool results|no completed tool results|handoff summary|without tool access|resend ["“]?continue["”]?.*tool|please resend.*tool[- ]?enabled|cannot (?:create|read|write|search|execute|run).{0,80}(?:this turn|without tools?))\b/i;
+const TOOL_SURFACE_PROBE_TOOLS = new Set([
+  'check_capability',
+  'list_capabilities',
+  'workspace_roots',
+  'workspace_info',
+  'workspace_list',
+  'session_history',
+  'memory_recall',
+  'memory_search',
+  'memory_list_facts',
+  'skill_list',
+]);
 
 export type StallSignal = 'A_zero_tools' | 'B_repeated_tool' | 'C_handoff_pingpong' | 'D_decision_json';
 
@@ -2614,6 +2871,87 @@ interface StallInfo {
   userVisibleMessage: string;
   /** Structured detail for the stuck_detected event / dashboard panel. */
   detail: Record<string, unknown>;
+}
+
+function evaluateStructuredDecisionStall(opts: {
+  decision: OrchestratorDecisionShape;
+  toolCalls: number;
+  sessionId?: string;
+  turn?: number;
+}): StallInfo | undefined {
+  const { decision, toolCalls } = opts;
+  const combined = [decision.reply, decision.summary, decision.reason]
+    .filter((part): part is string => typeof part === 'string' && part.trim().length > 0)
+    .join('\n')
+    .trim();
+  if (!combined) return undefined;
+  const onlyProbeTools =
+    toolCalls > 0 && opts.sessionId && opts.turn
+      ? turnOnlyUsedToolSurfaceProbeTools(opts.sessionId, opts.turn)
+      : false;
+  const noMeaningfulTools = toolCalls === 0 || onlyProbeTools;
+  if (
+    noMeaningfulTools &&
+    (
+      decision.nextAction === 'awaiting_user_input' ||
+      decision.nextAction === 'awaiting_handoff_result' ||
+      decision.nextAction === 'abandoned'
+    ) &&
+    STRUCTURED_TOOL_UNAVAILABLE_PATTERN.test(combined)
+  ) {
+    return {
+      signal: 'A_zero_tools',
+      rawOutput: combined.slice(0, 220),
+      userVisibleMessage:
+        `_(Clementine claimed tool access was unavailable but made zero tool calls. ` +
+        `The harness will retry and force an actual tool action.)_`,
+      detail: {
+        kind: 'structured_tool_unavailable',
+        rawOutput: combined.slice(0, 220),
+        toolCalls,
+        onlyProbeTools,
+        nextAction: decision.nextAction,
+        done: decision.done,
+        summary: decision.summary,
+      },
+    };
+  }
+  if (toolCalls !== 0) return undefined;
+  if (decision.nextAction === 'completed' && STALL_ANNOUNCEMENT_PATTERN.test(combined)) {
+    return {
+      signal: 'A_zero_tools',
+      rawOutput: combined.slice(0, 220),
+      userVisibleMessage:
+        `_(Clementine claimed action was completed but made zero tool calls. ` +
+        `The harness will retry and require the actual tools.)_`,
+      detail: {
+        kind: 'structured_zero_tool_claim',
+        rawOutput: combined.slice(0, 220),
+        toolCalls,
+        nextAction: decision.nextAction,
+        done: decision.done,
+        summary: decision.summary,
+      },
+    };
+  }
+
+  return undefined;
+}
+
+function turnOnlyUsedToolSurfaceProbeTools(sessionId: string, turn: number): boolean {
+  try {
+    const toolNames = listEvents(sessionId)
+      .filter((event) => event.turn === turn && event.type === 'tool_called')
+      .map((event) => {
+        const tool = event.data.tool;
+        return typeof tool === 'string' ? tool : null;
+      })
+      .filter((tool): tool is string => Boolean(tool));
+    if (toolNames.length === 0) return false;
+    return toolNames.every((tool) => TOOL_SURFACE_PROBE_TOOLS.has(tool));
+  } catch {
+    return false;
+  }
 }
 
 function finalHandoffProgress(
@@ -2927,6 +3265,7 @@ const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
     lastResponseId: string | undefined;
     finalOutput: unknown;
     interruptions?: unknown[];
+    rawResponses?: unknown[];
     state?: { toString(): string };
     completed: Promise<void>;
   };
@@ -2947,6 +3286,7 @@ const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
     history: result.history,
     lastResponseId: result.lastResponseId,
     finalOutput: result.finalOutput,
+    rawResponses: result.rawResponses,
     hasInterruptions,
     interruptions: hasInterruptions ? extractInterruptionInfo(result.interruptions ?? []) : undefined,
     serializedState: hasInterruptions ? result.state?.toString() : undefined,

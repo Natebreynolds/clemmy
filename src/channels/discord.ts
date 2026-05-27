@@ -38,7 +38,9 @@ import {
   DISCORD_REQUIRE_MENTION,
 } from '../config.js';
 import {
+  bindDiscordHarnessSession,
   handleDiscordHarnessMessage,
+  handleHarnessSessions,
   runDiscordHarnessConversation,
   type DiscordHarnessTransport,
   tryHandleHarnessApprovalReply,
@@ -112,6 +114,9 @@ const DISCORD_SLASH_COMMANDS = [
   new SlashCommandBuilder()
     .setName('runs')
     .setDescription('List recent assistant runs.'),
+  new SlashCommandBuilder()
+    .setName('sessions')
+    .setDescription('Show active Clementine sessions and reattach this Discord thread.'),
   new SlashCommandBuilder()
     .setName('help')
     .setDescription('Show the available Discord commands.'),
@@ -413,6 +418,33 @@ function buildDiscordRestTransport(channelId: string) {
     },
     async sendError(content: string) {
       await sendDiscordRestChunks(channelId, content);
+    },
+  };
+}
+
+function buildDiscordMessageHarnessTransport(message: Message<boolean>): DiscordHarnessTransport {
+  return {
+    async sendInitial(content: string) {
+      const reply = (await message.reply(content.slice(0, 1900))) as unknown as {
+        edit(opts: { content: string; components?: unknown[] }): Promise<unknown>;
+      };
+      return {
+        edit: async (next: string, options?: { components?: unknown[] }) => {
+          const editPayload: { content: string; components?: unknown[] } = {
+            content: next.slice(0, 1900),
+          };
+          if (options && Array.isArray(options.components)) {
+            editPayload.components = options.components;
+          }
+          await reply.edit(editPayload);
+        },
+      };
+    },
+    async sendError(content: string) {
+      await message.reply(content.slice(0, 1900));
+    },
+    async sendFollowup(content: string) {
+      await message.reply(content.slice(0, 1900));
     },
   };
 }
@@ -789,6 +821,11 @@ function normalizeCommandText(input: string): string {
   return withoutSlash.replace(assistantPrefix, '').trim();
 }
 
+function isSessionsCommand(input: string): boolean {
+  return /^(sessions?|sesson|active sessions|show sessions|show active sessions|list sessions|list active sessions)$/i
+    .test(input.trim());
+}
+
 function renderApprovalList(approvals: PendingApproval[]): string {
   if (approvals.length === 0) {
     return 'No pending approvals.';
@@ -1160,6 +1197,16 @@ async function handleDiscordCommand(message: Message<boolean>, assistant: Clemen
   const normalized = normalizeCommandText(prompt);
   const runtime = assistant.getRuntime();
 
+  if (isSessionsCommand(normalized)) {
+    await handleHarnessSessions({
+      channelId: message.channelId,
+      userId: message.author.id,
+      guildId: message.guildId,
+      transport: buildDiscordMessageHarnessTransport(message),
+    });
+    return true;
+  }
+
   if (await resolveNaturalApproval({
     assistant,
     text: normalized,
@@ -1180,6 +1227,7 @@ async function handleDiscordCommand(message: Message<boolean>, assistant: Clemen
         '`status`',
         '`tasks`',
         '`runs`',
+        '`sessions`',
         '`status <task_id>`',
         '`status <run_id>`',
         '`stop <task_id>`',
@@ -1298,6 +1346,16 @@ async function handleDiscordRestCommand(input: {
   const normalized = normalizeCommandText(input.prompt);
   const runtime = input.assistant.getRuntime();
   const send = (text: string) => sendDiscordRestChunks(input.channelId, text);
+
+  if (isSessionsCommand(normalized)) {
+    await handleHarnessSessions({
+      channelId: input.channelId,
+      userId: input.userId,
+      guildId: input.guildId,
+      transport: buildDiscordRestTransport(input.channelId),
+    });
+    return true;
+  }
 
   if (await resolveNaturalApproval({
     assistant: input.assistant,
@@ -1420,6 +1478,13 @@ function buildButtonHarnessTransport(interaction: ButtonInteraction): DiscordHar
 
 async function registerSlashCommands(client: Client): Promise<void> {
   if (!client.isReady()) return;
+
+  try {
+    await client.application.commands.set(DISCORD_SLASH_COMMANDS);
+    logger.info({ scope: 'global', commandCount: DISCORD_SLASH_COMMANDS.length }, 'Registered global Discord slash commands');
+  } catch (error) {
+    logger.warn({ err: error }, 'Failed to register global Discord slash commands');
+  }
 
   for (const guild of client.guilds.cache.values()) {
     await guild.commands.set(DISCORD_SLASH_COMMANDS);
@@ -1747,6 +1812,26 @@ async function handleButtonInteraction(interaction: ButtonInteraction, assistant
   }
 
   try {
+    if (action === 'session-resume') {
+      if (!targetId.startsWith('sess-')) {
+        await interaction.reply({ content: 'That session button is malformed. Run `/sessions` again.', ephemeral: true });
+        return;
+      }
+      const bound = bindDiscordHarnessSession({
+        channelId: interaction.channelId ?? '',
+        sessionId: targetId,
+        userId: interaction.user.id,
+        guildId: interaction.guildId,
+      });
+      await interaction.reply({
+        content: bound
+          ? `Bound this Discord thread to \`${targetId}\`. Your next reply will continue that same Clementine session.`
+          : `Session \`${targetId}\` was not found. Run \`/sessions\` again.`,
+        ephemeral: true,
+      });
+      return;
+    }
+
     if (action === 'approve' || action === 'reject') {
       const approved = action === 'approve';
       // Stale-button guard: a Discord user can click an approval button
@@ -2046,6 +2131,7 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction, assi
           '`/status`',
           '`/tasks`',
           '`/runs`',
+          '`/sessions`',
           '`/focus action:<view|list|park|resume|clear> id:<n>`',
           '`/help`',
         ].join('\n'),
@@ -2112,6 +2198,35 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction, assi
       return;
     }
 
+    if (interaction.commandName === 'sessions') {
+      await handleHarnessSessions({
+        channelId: interaction.channelId,
+        userId: interaction.user.id,
+        guildId: interaction.guildId,
+        transport: {
+          async sendInitial(content: string) {
+            const first = content.slice(0, 1900);
+            if (interaction.deferred || interaction.replied) {
+              await interaction.editReply({ content: first });
+            } else {
+              await interaction.reply({ content: first, ephemeral: true });
+            }
+            return {
+              edit: async (next: string, options?: { components?: unknown[] }) => {
+                const payload: { content: string; components?: unknown[] } = { content: next.slice(0, 1900) };
+                if (options && Array.isArray(options.components)) payload.components = options.components;
+                await interaction.editReply(payload as Parameters<ChatInputCommandInteraction['editReply']>[0]);
+              },
+            };
+          },
+          async sendError(content: string) {
+            await sendInteractionChunks(interaction, content, { ephemeral: true });
+          },
+        },
+      });
+      return;
+    }
+
     if (interaction.commandName === 'ask') {
       const prompt = interaction.options.getString('prompt', true).trim();
       if (!prompt) {
@@ -2173,31 +2288,7 @@ async function handleMessage(message: Message<boolean>, assistant: ClementineAss
   // approval store, which knows nothing about the pause and would
   // reply "No pending approval".
   if (DISCORD_HARNESS_ENABLED) {
-    const gatewayTransport = {
-      async sendInitial(content: string) {
-        const reply = (await message.reply(content)) as unknown as {
-          edit(opts: { content: string; components?: unknown[] }): Promise<unknown>;
-        };
-        return {
-          edit: async (next: string, options?: { components?: unknown[] }) => {
-            const editPayload: { content: string; components?: unknown[] } = {
-              content: next,
-            };
-            // Pass components through so approval Approve/Reject buttons
-            // render on the gateway path (DMs over gateway, guild
-            // channels). Without this, the harness sets `pendingApprovalId`
-            // and the components array is built — then silently dropped here.
-            if (options && Array.isArray(options.components)) {
-              editPayload.components = options.components;
-            }
-            await reply.edit(editPayload);
-          },
-        };
-      },
-      async sendError(content: string) {
-        await message.reply(content);
-      },
-    };
+    const gatewayTransport = buildDiscordMessageHarnessTransport(message);
     if (await tryHandleHarnessApprovalReply({
       channelId: message.channelId,
       prompt,

@@ -9946,6 +9946,7 @@ const CONSOLE_JS = `
     const sessionId = button.getAttribute('data-home-harness-session-id') || '';
     if (!sessionId) return;
     if (action === 'open') {
+      setHomeHarnessSessionId(sessionId, 'watching');
       // WATCH: switch to the activity panel AND open a live inspector
       // for this session. The activity panel's right-side detail pane
       // gets repurposed as a live event timeline that subscribes to
@@ -11144,23 +11145,8 @@ const CONSOLE_JS = `
           btn.disabled = true;
           btn.textContent = 'SENDING…';
           try {
-            const fresh = await fetchJSON('/api/console/meetings/recall/' + encodeURIComponent(id));
-            const a = fresh.analysis;
-            let msg;
-            if (a && a.summary) {
-              const parts = ['Meeting summary:', '', a.summary];
-              if (Array.isArray(a.actionItems) && a.actionItems.length > 0) {
-                parts.push('', 'Action items:');
-                for (const x of a.actionItems) parts.push('- ' + (x.owner ? x.owner + ': ' : '') + x.text);
-              }
-              if (Array.isArray(a.decisions) && a.decisions.length > 0) {
-                parts.push('', 'Decisions:');
-                for (const d of a.decisions) parts.push('- ' + (typeof d === 'string' ? d : (d.text || JSON.stringify(d))));
-              }
-              msg = parts.join('\\n');
-            } else {
-              msg = 'Captured meeting transcript is at ' + (fresh.record?.artifactPath || '(path unknown)') + '. Read it and give me the summary + action items.';
-            }
+            const promptPayload = await fetchJSON('/api/console/meetings/recall/' + encodeURIComponent(id) + '/chat-prompt');
+            const msg = promptPayload.prompt || 'Read the full meeting transcript, summarize it, then ask what actions I want to take from it.';
             // SWITCH TO HOME PANEL FIRST. Without this the message lands
             // on the home chat thread (which exists in the DOM but is
             // hidden) and the user — still looking at Memory > Captured
@@ -15107,6 +15093,7 @@ const CONSOLE_JS = `
   async function bootHomePanel() {
     const form = document.querySelector('[data-home-chat-form]');
     const input = document.querySelector('[data-home-chat-input]');
+    restoreHomeHarnessSessionId();
     if (form && input) {
       form.addEventListener('submit', async (event) => {
         event.preventDefault();
@@ -15207,8 +15194,37 @@ const CONSOLE_JS = `
 
   // 0.3 harness session — kept across turns within the same chat
   // dock so follow-up messages continue the same conversation.
-  // Reset whenever the toggle flips.
+  // Persisted so an app reload can still pick up the last watched chat.
+  const HOME_HARNESS_SESSION_KEY = 'clementine.homeHarnessSessionId';
   let __harnessSessionId = null;
+
+  function updateHomeChatMeta(text) {
+    const meta = document.querySelector('[data-home-chat-meta]');
+    if (meta) meta.textContent = text || 'local session';
+  }
+
+  function setHomeHarnessSessionId(sessionId, label) {
+    const next = typeof sessionId === 'string' && sessionId.trim() ? sessionId.trim() : null;
+    __harnessSessionId = next;
+    try {
+      if (next) localStorage.setItem(HOME_HARNESS_SESSION_KEY, next);
+      else localStorage.removeItem(HOME_HARNESS_SESSION_KEY);
+    } catch (_) {}
+    if (next) {
+      const shortId = next.length > 18 ? next.slice(0, 18) + '…' : next;
+      updateHomeChatMeta((label || 'session') + ' · ' + shortId);
+    } else {
+      updateHomeChatMeta('local session');
+    }
+  }
+
+  function restoreHomeHarnessSessionId() {
+    if (__harnessSessionId) return;
+    try {
+      const stored = localStorage.getItem(HOME_HARNESS_SESSION_KEY);
+      if (stored) setHomeHarnessSessionId(stored, 'resume');
+    } catch (_) {}
+  }
 
   function harnessModeOn() {
     // Harness is the default chat runtime as of 0.3. The localStorage
@@ -15276,21 +15292,32 @@ const CONSOLE_JS = `
     const thinkTimer = startThinkingButton(send);
 
     try {
+      const activeSessionId = options.sessionId || __harnessSessionId || null;
       const r = await fetchWithToken('/api/harness/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ input: text, sessionId: __harnessSessionId }),
+        body: JSON.stringify({ input: text, sessionId: activeSessionId }),
       });
       if (!r.ok) {
         const j = await r.json().catch(() => ({}));
+        if (r.status === 404 && activeSessionId) {
+          setHomeHarnessSessionId(null);
+        }
         const msg = j.error || ('HTTP ' + r.status);
         setChatTurnText(assistantTurn, 'Error: ' + msg);
         setChatTurnStatus(assistantTurn, 'failed');
         return { ok: false, text: msg };
       }
       const body = await r.json();
-      __harnessSessionId = body.sessionId;
+      if (body.status === 'new-pending' || body.status === 'cancelled') {
+        setHomeHarnessSessionId(body.sessionId, 'closing');
+      } else {
+        setHomeHarnessSessionId(body.sessionId, body.status === 'resuming' ? 'resuming' : 'chat');
+      }
       await streamHarnessSession(body.sessionId, assistantTurn, { ...options, sinceSeq: body.sinceSeq || 0 });
+      if (body.status === 'new-pending' || body.status === 'cancelled') {
+        setHomeHarnessSessionId(null);
+      }
       homeChatHistory.push({ role: 'assistant', text: assistantTurn.querySelector('[data-home-chat-turn-text]')?.textContent || '' });
       return { ok: true };
     } catch (err) {
@@ -15659,7 +15686,7 @@ const CONSOLE_JS = `
         throw new Error(j.error || ('HTTP ' + r.status));
       }
       const body = await r.json();
-      __harnessSessionId = body.sessionId || sessionId;
+      setHomeHarnessSessionId(body.sessionId || sessionId, 'resuming');
       await streamHarnessSession(__harnessSessionId, turn, { ...(options || {}), sinceSeq: body.sinceSeq || 0 });
       homeChatHistory.push({ role: 'assistant', text: turn?.querySelector?.('[data-home-chat-turn-text]')?.textContent || '' });
     } catch (err) {

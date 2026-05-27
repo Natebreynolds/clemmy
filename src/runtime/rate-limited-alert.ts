@@ -90,6 +90,8 @@ export interface RateLimitedAlertInput {
   windowMs?: number;
   /** Optional metadata attached to the notification record. */
   metadata?: Record<string, unknown>;
+  /** Record in dashboard/activity without pushing to external destinations. */
+  silent?: boolean;
 }
 
 export interface RateLimitedAlertResult {
@@ -135,6 +137,7 @@ export async function rateLimitedAlert(
     body: input.body,
     createdAt: new Date(now).toISOString(),
     read: false,
+    silent: input.silent,
     metadata: { alertKey: key, ...(input.metadata ?? {}) },
   });
 

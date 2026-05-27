@@ -95,6 +95,7 @@ const SUB_TESTS = {
   'retry-context-injection': testRetryContextInjection,
   'approval-preview-auto-enrichment': testApprovalPreviewAutoEnrichment,
   'codex-transport-timeout-routes-to-f4': testCodexTransportTimeoutRoutesToF4,
+  'codex-native-compaction-wire-contract': testCodexNativeCompactionWireContract,
   'cli-discovery-surfaces-in-diagnostics': testCliDiscoverySurfacesInDiagnostics,
   'tool-outputs-reaper-honors-ttl': testToolOutputsReaperHonorsTtl,
 };
@@ -1146,6 +1147,177 @@ async function testCodexTransportTimeoutRoutesToF4() {
     pass('codex-transport-timeout-routes-to-f4', `${checks.length} assertions passed`);
   } else {
     fail('codex-transport-timeout-routes-to-f4', `${failed.length} failed: ${failed.map((f) => f.label).join('; ')}`);
+  }
+}
+
+// ─── v0.5.28 research — codex-native-compaction-wire-contract ───────
+//
+// Native Responses compaction in the Agents SDK is not automatically
+// active for Clementine because Clementine speaks ChatGPT Codex through a
+// custom Model adapter. This offline smoke proves the guarded adapter
+// pieces are wired before any real Codex experiment:
+//   (1) default behavior sends no context_management and no
+//       previous_response_id.
+//   (2) CLEMMY_CODEX_NATIVE_COMPACTION=1 sends SDK-style
+//       context_management with a backend-safe compact_threshold.
+//   (3) compaction input/output items round-trip only behind the flag.
+//   (4) compaction-only truncation can retry, while tool-call truncation
+//       still does not replay.
+
+async function testCodexNativeCompactionWireContract() {
+  const codexModel = await import(pathToFileURL(path.join(DAEMON_DIST, 'runtime/harness/codex-model.js')).href);
+  const boundaryMod = await import(pathToFileURL(path.join(DAEMON_DIST, 'runtime/boundary-error.js')).href);
+  const checks = [];
+
+  const previousFlag = process.env.CLEMMY_CODEX_NATIVE_COMPACTION;
+  const previousThreshold = process.env.CLEMMY_CODEX_NATIVE_COMPACTION_THRESHOLD;
+  const previousDevOverrides = process.env.CLEMMY_DEV_OVERRIDES;
+  const restoreEnv = () => {
+    if (previousFlag == null) delete process.env.CLEMMY_CODEX_NATIVE_COMPACTION;
+    else process.env.CLEMMY_CODEX_NATIVE_COMPACTION = previousFlag;
+    if (previousThreshold == null) delete process.env.CLEMMY_CODEX_NATIVE_COMPACTION_THRESHOLD;
+    else process.env.CLEMMY_CODEX_NATIVE_COMPACTION_THRESHOLD = previousThreshold;
+    if (previousDevOverrides == null) delete process.env.CLEMMY_DEV_OVERRIDES;
+    else process.env.CLEMMY_DEV_OVERRIDES = previousDevOverrides;
+  };
+
+  class ScriptedCodexModel extends codexModel.CodexResponsesModel {
+    attempts = 0;
+    constructor(script) {
+      super('gpt-5.5');
+      this.script = script;
+    }
+    async *streamCodex(request, diag) {
+      this.attempts += 1;
+      yield* this.script(this.attempts, request, diag);
+    }
+  }
+
+  async function* successfulTurn(responseId = 'resp_ok') {
+    yield { type: 'response.created', response: { id: responseId } };
+    yield { type: 'response.output_text.delta', delta: 'ok', sequence_number: 1 };
+    yield {
+      type: 'response.output_item.done',
+      item: {
+        id: 'msg_1',
+        type: 'message',
+        role: 'assistant',
+        status: 'completed',
+        content: [{ type: 'output_text', text: 'ok' }],
+      },
+    };
+    yield {
+      type: 'response.completed',
+      response: {
+        id: responseId,
+        usage: {
+          input_tokens: 1,
+          output_tokens: 1,
+          total_tokens: 2,
+          input_tokens_details: {},
+          output_tokens_details: {},
+        },
+      },
+    };
+  }
+
+  try {
+    delete process.env.CLEMMY_CODEX_NATIVE_COMPACTION;
+    delete process.env.CLEMMY_CODEX_NATIVE_COMPACTION_THRESHOLD;
+    const disabledBody = codexModel.buildCodexRequestBody('gpt-5', {
+      input: [{ role: 'user', content: 'hello' }],
+      previousResponseId: 'resp_forbidden',
+      tools: [],
+      handoffs: [],
+      modelSettings: {},
+      outputType: 'text',
+      tracing: false,
+    });
+    checks.push({ ok: disabledBody.context_management === undefined, label: 'default omits context_management' });
+    checks.push({ ok: disabledBody.previous_response_id === undefined && disabledBody.previousResponseId === undefined, label: 'never sends previous_response_id' });
+
+    process.env.CLEMMY_CODEX_NATIVE_COMPACTION = '1';
+    process.env.CLEMMY_CODEX_NATIVE_COMPACTION_THRESHOLD = '4';
+    const enabledBody = codexModel.buildCodexRequestBody('gpt-5', {
+      input: [
+        { role: 'user', content: 'hello' },
+        { type: 'compaction', id: 'cmp_1', encrypted_content: 'ciphertext', created_by: 'server' },
+      ],
+      tools: [],
+      handoffs: [],
+      modelSettings: {},
+      outputType: 'text',
+      tracing: false,
+    });
+    checks.push({ ok: JSON.stringify(enabledBody.context_management) === JSON.stringify([{ type: 'compaction', compact_threshold: 1000 }]), label: 'flag clamps compact_threshold to backend minimum' });
+    checks.push({ ok: enabledBody.input.some((item) => item?.type === 'compaction' && item.encrypted_content === 'ciphertext'), label: 'flag round-trips compaction input item' });
+
+    const compactionModel = new ScriptedCodexModel(async function* () {
+      yield { type: 'response.created', response: { id: 'resp_compact' } };
+      yield {
+        type: 'response.output_item.done',
+        item: { id: 'cmp_2', type: 'compaction', encrypted_content: 'ciphertext-2', created_by: 'server' },
+      };
+      yield {
+        type: 'response.completed',
+        response: {
+          id: 'resp_compact',
+          usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2, input_tokens_details: {}, output_tokens_details: {} },
+        },
+      };
+    });
+    const compactResponse = await compactionModel.getResponse({ input: [], tools: [], handoffs: [], modelSettings: {}, outputType: 'text', tracing: false });
+    checks.push({ ok: compactResponse.output[0]?.type === 'compaction', label: 'flag converts compaction output item' });
+
+    process.env.CLEMMY_DEV_OVERRIDES = '1';
+    process.env.CLEMMY_CODEX_TRANSPARENT_RETRY_DELAY_MS = '0';
+    const retryModel = new ScriptedCodexModel(async function* (attempt) {
+      if (attempt === 1) {
+        yield { type: 'response.created', response: { id: 'resp_compact_truncated' } };
+        yield {
+          type: 'response.output_item.done',
+          item: { id: 'cmp_3', type: 'compaction', encrypted_content: 'ciphertext-3', created_by: 'server' },
+        };
+        return;
+      }
+      yield* successfulTurn('resp_after_compaction_retry');
+    });
+    const retryEvents = [];
+    for await (const event of retryModel.getStreamedResponse({ input: [], tools: [], handoffs: [], modelSettings: {}, outputType: 'text', tracing: false })) {
+      retryEvents.push(event);
+    }
+    checks.push({ ok: retryModel.attempts === 2, label: 'compaction-only truncation retries' });
+    checks.push({ ok: retryEvents.at(-1)?.response?.id === 'resp_after_compaction_retry', label: 'compaction retry completes cleanly' });
+
+    const noReplayModel = new ScriptedCodexModel(async function* () {
+      yield { type: 'response.created', response: { id: 'resp_tool_truncated' } };
+      yield {
+        type: 'response.output_item.done',
+        item: { id: 'fc_1', type: 'function_call', call_id: 'call_1', name: 'write_file', arguments: '{}', status: 'completed' },
+      };
+    });
+    let caught = null;
+    const noReplayEvents = [];
+    try {
+      for await (const event of noReplayModel.getStreamedResponse({ input: [], tools: [], handoffs: [], modelSettings: {}, outputType: 'text', tracing: false })) {
+        noReplayEvents.push(event);
+      }
+    } catch (err) {
+      caught = err;
+    }
+    checks.push({ ok: noReplayModel.attempts === 1, label: 'tool-call truncation does not retry' });
+    checks.push({ ok: caught instanceof boundaryMod.BoundaryError && caught.kind === 'codex.sse_truncated', label: 'tool-call truncation surfaces sse_truncated' });
+    checks.push({ ok: noReplayEvents.map((event) => event.type).join(',') === 'response_started', label: 'tool-call truncation only exposed response_started' });
+  } finally {
+    delete process.env.CLEMMY_CODEX_TRANSPARENT_RETRY_DELAY_MS;
+    restoreEnv();
+  }
+
+  const failed = checks.filter((c) => !c.ok);
+  if (failed.length === 0) {
+    pass('codex-native-compaction-wire-contract', `${checks.length} assertions passed`);
+  } else {
+    fail('codex-native-compaction-wire-contract', `${failed.length} failed: ${failed.map((f) => f.label).join('; ')}`);
   }
 }
 

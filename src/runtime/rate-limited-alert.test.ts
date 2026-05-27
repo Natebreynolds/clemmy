@@ -12,7 +12,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 const { rateLimitedAlert, __resetAlertBuckets } = await import('./rate-limited-alert.js');
-const { listNotifications } = await import('./notifications.js');
+const { listNotifications, listQueuedNotificationDeliveries } = await import('./notifications.js');
 
 test.beforeEach(async () => {
   await __resetAlertBuckets();
@@ -101,6 +101,24 @@ test('custom kind is honored', async () => {
   );
   assert.equal(ours.length, 1);
   assert.equal(ours[0].kind, 'workflow');
+});
+
+test('silent alerts are recorded without delivery fanout', async () => {
+  await rateLimitedAlert('silent-test', {
+    title: 'MCP server unavailable',
+    body: 'diagnostic only',
+    silent: true,
+  });
+  const items = listNotifications(10);
+  const ours = items.filter((n) =>
+    (n.metadata as { alertKey?: string } | undefined)?.alertKey === 'silent-test',
+  );
+  assert.equal(ours.length, 1);
+  assert.equal(ours[0].silent, true);
+  assert.equal(
+    listQueuedNotificationDeliveries().some((job) => job.notificationId === ours[0].id),
+    false,
+  );
 });
 
 test('metadata passed in is preserved on the notification', async () => {

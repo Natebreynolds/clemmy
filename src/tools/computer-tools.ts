@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { tool, type Tool } from '@openai/agents';
@@ -43,11 +43,11 @@ function resolveTargetPath(toolName: string, input: unknown): string | null {
 function inputIsInsideWorkspace(toolName: string, input: unknown): boolean {
   const resolved = resolveTargetPath(toolName, input);
   if (!resolved) return false;
-  // Auto-approve hint uses the narrow user-workspace list (no $HOME).
-  // The hard-boundary check in resolveAllowedPath() still uses the
-  // wider workspaceRoots() so explicit "save to ~/Documents/foo.txt"
-  // calls succeed once approved.
-  return userWorkspaceRoots().some((root) => isInside(root, resolved));
+  // Shell/execute auto-approval uses the narrow user-workspace list
+  // (no $HOME). write_file is Clementine's local artifact surface, so
+  // it uses the same allowed-root list as resolveAllowedPath().
+  const roots = toolName === 'write_file' ? workspaceRoots() : userWorkspaceRoots();
+  return roots.some((root) => isInside(root, resolved));
 }
 
 function inputIsInsideAgentOwnedDir(toolName: string, input: unknown): boolean {
@@ -243,6 +243,10 @@ function resolveAllowedPath(input: string): string {
     );
   }
   return resolved;
+}
+
+function ensureTrailingNewline(content: string): string {
+  return content.endsWith('\n') ? content : `${content}\n`;
 }
 
 function resolveAllowedCwd(input?: string): string {
@@ -478,17 +482,42 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
 
   const write_file = tool({
     name: 'write_file',
-    description: 'Write a UTF-8 file inside an allowed workspace. Requires approval because it modifies disk. Auto-approved if the session has an open PlanScope covering write_file.',
+    description: [
+      'Create, append to, or overwrite a UTF-8 file inside an allowed local workspace path.',
+      'mode=create or null creates a new file and refuses to replace an existing one.',
+      'mode=append appends content to the existing file, adding a newline boundary when needed.',
+      'mode=overwrite replaces the entire file; use only when the user asks to replace it or after reading the current file and preparing the full replacement.',
+      'Auto-approved for allowed local paths; destructive/system paths remain blocked by the path boundary.',
+    ].join('\n'),
     parameters: z.object({
       path: z.string().min(1),
       content: z.string(),
+      mode: z.enum(['create', 'append', 'overwrite']).nullable(),
     }),
     needsApproval: needsApprovalUnlessInPlanScope('write_file'),
     execute: async (input) => {
       const filePath = resolveAllowedPath(input.path);
+      const mode = input.mode ?? 'create';
       mkdirSync(path.dirname(filePath), { recursive: true });
-      writeFileSync(filePath, input.content.endsWith('\n') ? input.content : `${input.content}\n`, 'utf-8');
-      return `Wrote ${filePath} (${input.content.length} chars).`;
+      const exists = existsSync(filePath);
+      if (exists && !statSync(filePath).isFile()) return `Refused to write ${filePath}: target exists and is not a file.`;
+      const content = ensureTrailingNewline(input.content);
+
+      if (mode === 'append') {
+        const needsBoundary = exists && statSync(filePath).size > 0 && !readFileSync(filePath, 'utf-8').endsWith('\n');
+        appendFileSync(filePath, `${needsBoundary ? '\n' : ''}${content}`, 'utf-8');
+        return `Appended ${filePath} (${input.content.length} chars).`;
+      }
+
+      if (mode === 'create' && exists) {
+        return [
+          `Refused to overwrite existing file: ${filePath}.`,
+          'Use mode="append" to add content, or mode="overwrite" only after reading the file and preparing the full replacement.',
+        ].join(' ');
+      }
+
+      writeFileSync(filePath, content, 'utf-8');
+      return `${mode === 'overwrite' ? 'Overwrote' : 'Wrote'} ${filePath} (${input.content.length} chars).`;
     },
   });
 

@@ -15,7 +15,7 @@
  *   - IDENTITY.md      → who Clementine is
  *   - MEMORY.md        → long-term curated context
  *   - working-memory.md → recent / current focus, written by auto-capture
- *   - facts store      → renderFactsForInstructions (Pinecone-backed embedding memory)
+ *   - facts store      → renderFactsForInstructions (SQLite consolidated_facts, Stanford-ranked)
  *   - user profile     → renderProfileForInstructions
  *   - goals dir        → top active goals
  *
@@ -31,6 +31,7 @@ import { BASE_DIR } from '../config.js';
 import { loadMemoryContext } from '../memory/vault.js';
 import { renderFactsForInstructions, renderRecentlyLearnedForInstructions } from '../memory/facts.js';
 import { getFocusSnapshot } from '../memory/focus.js';
+import { renderSkillsIndex } from '../memory/skill-store.js';
 import { loadUserProfile, renderProfileForInstructions } from '../runtime/user-profile.js';
 
 const GOALS_DIR = path.join(BASE_DIR, 'goals');
@@ -160,6 +161,13 @@ export function renderHarnessMemoryContext(): string {
   const goals = renderActiveGoals();
   const nowLine = renderCurrentTimeForInstructions();
 
+  let skills = '';
+  try {
+    skills = renderSkillsIndex();
+  } catch {
+    skills = '';
+  }
+
   // Current Focus block — surfaced in persistent context so the model
   // has at-a-glance awareness without a focus_get tool call. The
   // instructions still require focus_get at turn start for the most
@@ -213,6 +221,7 @@ export function renderHarnessMemoryContext(): string {
     section('Long-Term Memory', memContext.memory),
     section('Active Goals', goals),
     section('Current Focus', focus),
+    section('Available Skills', skills),
   ].filter(Boolean);
 
   if (blocks.length === 0) return '';

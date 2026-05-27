@@ -280,8 +280,9 @@ export function summarizeToolArgs(toolName: string, input: unknown): string {
     }
     case 'write_file': {
       const p = typeof obj.path === 'string' ? obj.path : '';
+      const mode = typeof obj.mode === 'string' ? `${obj.mode} ` : '';
       const len = typeof obj.content === 'string' ? obj.content.length : 0;
-      return `${p} (${len} chars)`;
+      return `${mode}${p} (${len} chars)`;
     }
     default:
       return Object.entries(obj).slice(0, 4).map(([k, v]) => `${k}=${String(v).slice(0, 60)}`).join(' · ');

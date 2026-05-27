@@ -494,10 +494,9 @@ async function runStepViaHarness(
   try {
     // Build a fresh orchestrator each call so it picks up current memory
     // context + connected toolkit list.
-    const agent = await buildOrchestratorAgent();
-
     // Initial turn.
     const message = `Workflow: ${workflowName}\nStep: ${step.id}\n\n${promptBody}`;
+    const agent = await buildOrchestratorAgent({ userInput: message, sessionId: realSessionId });
     let result = await runConversation({
       agent,
       sessionId: realSessionId,

@@ -869,3 +869,54 @@ export function buildAnalyzerPrompt(record: RecallMeetingRecord, artifactPath: s
     '- The JSON must be valid (no trailing commas, no comments).',
   ].filter((line) => line !== '').join('\n');
 }
+
+export function buildMeetingChatPrompt(
+  record: RecallMeetingRecord,
+  analysis: RecallMeetingAnalysis | null = loadRecallMeetingAnalysis(record.id),
+): string {
+  const transcriptText = record.segments
+    .map((segment) => `[${segment.timestamp}] ${segment.speaker ? `${segment.speaker}: ` : ''}${segment.text}`)
+    .join('\n');
+  const lines = [
+    'Please summarize this captured meeting for me, then ask what I want you to act on from it.',
+    '',
+    'Important rules:',
+    '- Read the FULL transcript end-to-end before summarizing. Do not rely only on the analysis summary or meeting title.',
+    '- Use the transcript as the source of truth if the summary and transcript disagree.',
+    '- After the summary, name 1-3 likely follow-up tasks if the transcript supports them. If it does not, say you do not see obvious follow-up tasks.',
+    '- End with one first-person follow-up question: "What would you like me to act on?" Do not refer to yourself as Clementine in that question.',
+    '- Do not send messages, schedule events, update sheets, or create tasks unless I explicitly ask for those actions after the summary.',
+    '',
+    `Meeting id: ${record.id}`,
+    `Meeting title: ${record.title || '(untitled meeting)'}`,
+    `Platform: ${record.platform || '(unknown)'}`,
+    record.startedAt ? `Started: ${record.startedAt}` : '',
+    record.endedAt ? `Ended: ${record.endedAt}` : '',
+    record.artifactPath
+      ? `Full transcript file: ${record.artifactPath}`
+      : 'Full transcript file: (not available; use the inline transcript below)',
+    '',
+    analysis?.summary
+      ? [
+        'Existing machine summary for context only; verify against the full transcript:',
+        analysis.summary,
+      ].join('\n')
+      : '',
+    analysis?.decisions?.length
+      ? ['Existing extracted decisions for context only:', ...analysis.decisions.map((item) => `- ${item}`)].join('\n')
+      : '',
+    analysis?.actionItems?.length
+      ? [
+        'Existing extracted action items for context only:',
+        ...analysis.actionItems.map((item) => {
+          const meta = [item.owner ? `owner: ${item.owner}` : '', item.dueDate ? `due: ${item.dueDate}` : '']
+            .filter(Boolean)
+            .join(', ');
+          return `- ${item.text}${meta ? ` (${meta})` : ''}`;
+        }),
+      ].join('\n')
+      : '',
+    record.artifactPath ? '' : ['Inline full transcript:', transcriptText || '(empty transcript)'].join('\n'),
+  ];
+  return lines.filter((line) => line !== '').join('\n');
+}

@@ -26,8 +26,9 @@ import assert from 'node:assert/strict';
 import type { AgentInputItem } from '@openai/agents';
 
 const { resetEventLog, createSession, writeToolOutput, getToolOutput } = await import('./eventlog.js');
-const { clipOldToolResults, validateCallIdReferences } = await import('./compaction.js');
+const { clipOldToolResults, collapseOldCompletedToolPairs, compactSessionIfNeeded, validateCallIdReferences } = await import('./compaction.js');
 const { estimateInputTokens } = await import('./token-estimator.js');
+const { HarnessSession } = await import('./session.js');
 
 function userMessage(text: string): AgentInputItem {
   return { role: 'user', content: text } as unknown as AgentInputItem;
@@ -136,6 +137,102 @@ test('clipOldToolResults — preserves callId pairing (no Codex 400 risk)', () =
     );
     assert.ok(hasResult, `result missing for ${id} after clipping`);
   }
+});
+
+test('collapseOldCompletedToolPairs — removes old recallable pairs and keeps the recent tail paired', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const items: AgentInputItem[] = [];
+  for (let i = 0; i < 10; i++) {
+    const callId = `call_${i}`;
+    items.push(userMessage(`turn ${i}`));
+    items.push(toolCall(callId, 'seo.audit', `{"site":"https://example-${i}.com"}`));
+    items.push(toolResult(callId, `important result ${i} ${'x'.repeat(1200)}`));
+    writeToolOutput({ sessionId: sess.id, callId, tool: 'seo.audit', output: `important result ${i} ${'x'.repeat(1200)}` });
+  }
+
+  const collapsed = collapseOldCompletedToolPairs(items, 3, sess.id);
+  assert.equal(collapsed.collapsed, 7);
+  assert.equal(collapsed.callIds[0], 'call_0');
+  assert.equal(collapsed.callIds.at(-1), 'call_6');
+
+  const summary = collapsed.nextItems.find((it) => {
+    const any = it as Record<string, unknown>;
+    return any.role === 'system' && typeof any.content === 'string' && any.content.startsWith('[summary of older completed tool activity]');
+  }) as Record<string, unknown> | undefined;
+  assert.ok(summary, 'collapsed history should include a summary message');
+  assert.match(String(summary.content), /recall_tool_result\("call_0"\)/);
+  assert.match(String(summary.content), /https:\/\/example-0\.com/);
+
+  const remainingCallIds = new Set<string>();
+  const remainingOutputIds = new Set<string>();
+  for (const item of collapsed.nextItems) {
+    const any = item as Record<string, unknown>;
+    if (any.type === 'function_call') remainingCallIds.add(String(any.callId));
+    if (any.type === 'function_call_result') remainingOutputIds.add(String(any.callId));
+  }
+
+  for (let i = 0; i < 7; i++) {
+    assert.equal(remainingCallIds.has(`call_${i}`), false, `old call_${i} should be collapsed`);
+    assert.equal(remainingOutputIds.has(`call_${i}`), false, `old output call_${i} should be collapsed`);
+  }
+  for (let i = 7; i < 10; i++) {
+    assert.equal(remainingCallIds.has(`call_${i}`), true, `recent call_${i} should remain`);
+    assert.equal(remainingOutputIds.has(`call_${i}`), true, `recent output call_${i} should remain`);
+  }
+});
+
+test('collapseOldCompletedToolPairs — skips old pairs that are not recallable in tool_outputs', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const items: AgentInputItem[] = [];
+  for (let i = 0; i < 5; i++) {
+    const callId = `call_${i}`;
+    items.push(userMessage(`turn ${i}`));
+    items.push(toolCall(callId, 'tool'));
+    items.push(toolResult(callId, `result ${i}`));
+  }
+  writeToolOutput({ sessionId: sess.id, callId: 'call_0', tool: 'tool', output: 'result 0' });
+
+  const collapsed = collapseOldCompletedToolPairs(items, 1, sess.id);
+  assert.equal(collapsed.collapsed, 1, 'only recallable old pair should collapse');
+
+  const remainingCallIds = new Set(
+    collapsed.nextItems
+      .filter((it) => (it as Record<string, unknown>).type === 'function_call')
+      .map((it) => String((it as Record<string, unknown>).callId)),
+  );
+  assert.equal(remainingCallIds.has('call_0'), false);
+  assert.equal(remainingCallIds.has('call_1'), true, 'unrecallable old pair should stay verbatim');
+});
+
+test('compactSessionIfNeeded — applies pair collapse during layer 1 preflight', async () => {
+  resetEventLog();
+  const session = HarnessSession.create({ kind: 'chat', title: 'collapse test' });
+  const items: AgentInputItem[] = [];
+  for (let i = 0; i < 16; i++) {
+    const callId = `call_${i}`;
+    items.push(userMessage(`turn ${i}`));
+    items.push(toolCall(callId, 'scrape.site', `{"url":"https://site-${i}.test"}`));
+    items.push(toolResult(callId, `site ${i} result ${'z'.repeat(1000)}`));
+    writeToolOutput({ sessionId: session.id, callId, tool: 'scrape.site', output: `site ${i} result ${'z'.repeat(1000)}` });
+  }
+  session.updateConversationSnapshot(items);
+
+  const { result, nextItems } = await compactSessionIfNeeded(session, items, {
+    disable: 'layer1_only',
+    layer1ItemThreshold: 1,
+    layer1RetainToolPairs: 4,
+  });
+
+  assert.equal(result.modified, true);
+  assert.equal(result.layer1.collapsedToolPairs, 12);
+  assert.ok(result.afterTokens < result.beforeTokens, 'collapsed preflight should reduce estimated tokens');
+  const oldPairs = nextItems.filter((it) => {
+    const any = it as Record<string, unknown>;
+    return (any.type === 'function_call' || any.type === 'function_call_result') && String(any.callId).startsWith('call_0');
+  });
+  assert.equal(oldPairs.length, 0, 'oldest completed pair should no longer be replayed');
 });
 
 test('validateCallIdReferences — sanitizes hallucinated ids', () => {
