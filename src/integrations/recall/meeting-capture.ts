@@ -32,6 +32,10 @@ export interface RecallMeetingRecord {
   recordingId?: string;
   platform?: string;
   title?: string;
+  /** Who set `title`. 'user' titles are locked — the analyzer / auto-filing
+   *  never overwrites them. Absent/'analyzer' means auto-generated and
+   *  safe to refine. */
+  titleSource?: 'user' | 'analyzer';
   status: 'detected' | 'recording' | 'completed';
   startedAt: string;
   endedAt?: string;
@@ -67,6 +71,11 @@ export interface RecallMeetingRecord {
 }
 
 export interface RecallMeetingAnalysis {
+  /** Short, human-readable title derived from the transcript by the
+   *  analyzer (e.g. "Clementine onboarding walkthrough"). Used to retitle
+   *  the meeting in the dashboard list + the filed vault note, replacing
+   *  the generic platform/type label. */
+  title?: string;
   summary?: string;
   decisions?: string[];
   actionItems?: Array<{
@@ -279,11 +288,16 @@ export function noteRecallMeetingDetected(input: {
     recordingId: input.recordingId ?? existing?.recordingId,
     platform: input.platform ?? existing?.platform,
     title: input.title ?? existing?.title,
+    titleSource: existing?.titleSource,
     status: input.status ?? existing?.status ?? 'detected',
     startedAt: existing?.startedAt ?? nowIso(),
     endedAt: existing?.endedAt,
     segments: existing?.segments ?? [],
     artifactPath: existing?.artifactPath,
+    analysisPath: existing?.analysisPath,
+    canonicalStatus: existing?.canonicalStatus,
+    canonicalUpdatedAt: existing?.canonicalUpdatedAt,
+    canonicalError: existing?.canonicalError,
   };
   return saveMeetingRecord(record);
 }
@@ -317,7 +331,54 @@ export function appendRecallTranscriptSegment(input: Omit<RecallTranscriptSegmen
  * using the exact same layout — keeps the dashboard / vault reader
  * stable across the streamed→canonical transition.
  */
-function renderTranscriptArtifactBody(record: RecallMeetingRecord, sourceLabel: string): string {
+// Delimiters for the analyzer-derived block folded into the vault note
+// by fileMeetingFromAnalysis. Bumping the version forces the reconcile
+// tick to re-file existing notes (e.g. when the rendered shape changes).
+// The marker is what the reconcile tick greps for to decide "already
+// filed?" without re-reading/parsing the whole analysis.
+const ANALYSIS_BLOCK_START = '<!-- clem:analysis:start v1 -->';
+const ANALYSIS_BLOCK_END = '<!-- clem:analysis:end -->';
+
+/**
+ * Render the analyzer-derived section (summary / decisions / action items
+ * / topics / participants) as markdown lines, wrapped in the managed-block
+ * markers. Returns [] when there's nothing worth folding in. Kept separate
+ * so the indexer sees the SAME high-signal text the dashboard shows from
+ * the analysis JSON — that's what makes meetings searchable by outcome,
+ * not just by raw transcript.
+ */
+function renderAnalysisSection(analysis: RecallMeetingAnalysis | null | undefined): string[] {
+  if (!analysis) return [];
+  const lines: string[] = [ANALYSIS_BLOCK_START];
+  if (analysis.summary) {
+    lines.push('## Summary', analysis.summary);
+  }
+  if (analysis.decisions && analysis.decisions.length > 0) {
+    lines.push('## Decisions', ...analysis.decisions.map((d) => `- ${d}`));
+  }
+  if (analysis.actionItems && analysis.actionItems.length > 0) {
+    lines.push('## Action Items', ...analysis.actionItems.map((a) => {
+      const meta = [a.owner ? `owner: ${a.owner}` : '', a.dueDate ? `due: ${a.dueDate}` : '']
+        .filter(Boolean).join(', ');
+      return `- ${a.text}${meta ? ` (${meta})` : ''}`;
+    }));
+  }
+  if (analysis.topics && analysis.topics.length > 0) {
+    lines.push('## Topics', analysis.topics.join(', '));
+  }
+  if (analysis.participants && analysis.participants.length > 0) {
+    lines.push('## Participants', analysis.participants.join(', '));
+  }
+  lines.push(ANALYSIS_BLOCK_END);
+  // Nothing but the markers ⇒ no analysis content worth folding in.
+  return lines.length > 2 ? lines : [];
+}
+
+function renderTranscriptArtifactBody(
+  record: RecallMeetingRecord,
+  sourceLabel: string,
+  analysis?: RecallMeetingAnalysis | null,
+): string {
   const transcriptText = record.segments
     .map((segment) => `[${segment.timestamp}] ${segment.speaker ? `${segment.speaker}: ` : ''}${segment.text}`)
     .join('\n');
@@ -329,12 +390,14 @@ function renderTranscriptArtifactBody(record: RecallMeetingRecord, sourceLabel: 
     `window_id: ${record.windowId}`,
     record.recordingId ? `recording_id: ${record.recordingId}` : '',
     record.platform ? `platform: ${record.platform}` : '',
+    record.title ? `title: ${record.title}` : '',
     `started_at: ${record.startedAt}`,
     record.endedAt ? `ended_at: ${record.endedAt}` : '',
     '---',
     '',
     `# ${record.title || 'Meeting Capture'}`,
     '',
+    ...renderAnalysisSection(analysis),
     '## Capture',
     '',
     `- Source: ${sourceLabel}`,
@@ -421,7 +484,14 @@ export function applyCanonicalTranscript(
   let artifactPath = record.artifactPath;
   if (canonicalSegments.length > 0 && !isSyntheticRecallCapture(updated)) {
     if (!artifactPath) artifactPath = defaultArtifactPath(updated);
-    const body = renderTranscriptArtifactBody(updated, 'recall.ai async transcript (canonical)');
+    // Preserve any already-filed analysis block when the canonical
+    // transcript rewrites the note — otherwise the title + summary would
+    // vanish until the next reconcile tick re-files it.
+    const body = renderTranscriptArtifactBody(
+      updated,
+      'recall.ai async transcript (canonical)',
+      loadRecallMeetingAnalysis(updated.id),
+    );
     writeFileSync(artifactPath, body, 'utf-8');
     updated.artifactPath = artifactPath;
   }
@@ -481,6 +551,91 @@ export function recordAnalysisPath(meetingId: string, analysisPath: string): Rec
   const target = allRecords.find((r) => r.id === meetingId);
   if (!target) return null;
   return saveMeetingRecord({ ...target, analysisPath });
+}
+
+/**
+ * Idempotent — set the human-readable title on the meeting record so the
+ * dashboard list + filed vault note stop showing the generic
+ * platform/type label. Mirrors recordAnalysisPath.
+ *
+ * `source` records who set it: a 'user' rename is locked (see
+ * fileMeetingFromAnalysis), an 'analyzer' title is auto-generated and may
+ * be refined later — but never downgrades a 'user' title back to
+ * 'analyzer'.
+ */
+export function recordMeetingTitle(
+  meetingId: string,
+  title: string,
+  source: 'user' | 'analyzer' = 'analyzer',
+): RecallMeetingRecord | null {
+  const trimmed = title.trim();
+  if (!trimmed) return null;
+  const target = listAllRecallMeetingRecords().find((r) => r.id === meetingId);
+  if (!target) return null;
+  // Never let an analyzer pass downgrade or overwrite a user-set title.
+  if (source === 'analyzer' && target.titleSource === 'user') return target;
+  if (target.title === trimmed && target.titleSource === source) return target;
+  return saveMeetingRecord({ ...target, title: trimmed, titleSource: source });
+}
+
+/**
+ * Re-render a meeting's vault note from its record + (optional) analysis
+ * via the shared renderer and write it back if the content changed. The
+ * file PATH never changes — only its contents — so the vault index stays
+ * consistent (reindex re-chunks by mtime; no orphaned rows). Returns true
+ * when it wrote a changed file (caller can trigger a reindex).
+ */
+function rewriteMeetingArtifact(meetingId: string): boolean {
+  const record = loadRecallMeetingById(meetingId);
+  if (!record) return false;
+  const artifactPath = record.artifactPath && existsSync(record.artifactPath)
+    ? record.artifactPath
+    : (existsSync(defaultArtifactPath(record)) ? defaultArtifactPath(record) : undefined);
+  if (!artifactPath) return false;
+  const sourceLabel = record.canonicalStatus === 'ready'
+    ? 'recall.ai async transcript (canonical)'
+    : 'recall.ai-desktop-sdk (streamed)';
+  const body = renderTranscriptArtifactBody(record, sourceLabel, loadRecallMeetingAnalysis(meetingId));
+  const existing = readFileSync(artifactPath, 'utf-8');
+  if (existing === body) return false;
+  writeFileSync(artifactPath, body, 'utf-8');
+  return true;
+}
+
+/**
+ * "File" a meeting: fold its analyzer-derived title + summary into the
+ * vault note so the existing indexer (reindexVault → embeddings) makes
+ * the high-signal content searchable, not just the raw transcript.
+ *
+ * Deterministic + idempotent: re-renders the whole note from the record +
+ * analysis, so re-running produces byte-identical output. A user-set title
+ * is never overwritten by the analyzer's title.
+ *
+ * Returns true when it wrote a changed file (caller can trigger a reindex).
+ */
+export function fileMeetingFromAnalysis(meetingId: string): boolean {
+  const record = loadRecallMeetingById(meetingId);
+  if (!record) return false;
+  const analysis = loadRecallMeetingAnalysis(meetingId);
+  if (!analysis) return false;
+
+  // Adopt the analyzer's title onto the record (recordMeetingTitle refuses
+  // to overwrite a user-locked title), then re-render from the record.
+  if (analysis.title && analysis.title.trim()) {
+    recordMeetingTitle(meetingId, analysis.title, 'analyzer');
+  }
+  return rewriteMeetingArtifact(meetingId);
+}
+
+/**
+ * User-driven rename: set a locked 'user' title and re-file the note so
+ * the new title shows in the vault frontmatter + heading immediately.
+ * Memory-safe — the file path is unchanged, so search/index stay correct.
+ * Returns true when the note content changed.
+ */
+export function renameMeeting(meetingId: string, title: string): boolean {
+  if (!recordMeetingTitle(meetingId, title, 'user')) return false;
+  return rewriteMeetingArtifact(meetingId);
 }
 
 /**
@@ -696,6 +851,7 @@ export function buildAnalyzerPrompt(record: RecallMeetingRecord, artifactPath: s
     '1. Read the transcript file end-to-end.',
     '2. Produce a single JSON object with exactly these keys:',
     '   {',
+    '     "title": "concise 4–8 word descriptive title of what the meeting was about",',
     '     "summary": "3–5 sentence overview, neutral tone",',
     '     "decisions": ["decision 1", ...],            // empty array if none',
     '     "actionItems": [                             // empty array if none',

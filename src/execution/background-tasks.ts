@@ -55,6 +55,10 @@ export interface BackgroundTaskRecord {
   };
   resumedFromTaskId?: string;
   resumeCount?: number;
+  /** Set on a resumed-from task once a resume has been spawned, so the
+   *  boot-time auto-resumer never re-spawns the same interrupted task on
+   *  every restart. */
+  resumedIntoTaskId?: string;
   lastCheckInAt?: string;
   lastCheckInMessage?: string;
   progressCheckIns?: number;
@@ -72,11 +76,13 @@ export interface CreateBackgroundTaskInput {
   maxMinutes?: number;
   source?: BackgroundTaskRecord['source'];
   resumedFromTaskId?: string;
+  resumeCount?: number;
 }
 
 const BACKGROUND_TASK_DIR = path.join(BASE_DIR, 'state', 'background-tasks');
 const RESULT_TRUNCATE_CHARS = 4000;
 const PROGRESS_CHECKIN_TOOL_INTERVAL = 5;
+const DAEMON_RESTART_INTERRUPT_REASON = 'Daemon restarted while task was running.';
 
 function ensureTaskDir(): void {
   mkdirSync(BACKGROUND_TASK_DIR, { recursive: true });
@@ -217,6 +223,7 @@ export function createBackgroundTask(input: CreateBackgroundTaskInput): Backgrou
     createdAt,
     updatedAt: createdAt,
     resumedFromTaskId: input.resumedFromTaskId,
+    resumeCount: input.resumeCount,
   };
   writeTask(task);
   // Dashboard-only — the queued ping is useful in the Activity panel
@@ -393,7 +400,7 @@ export function resumeBackgroundTask(id: string): BackgroundTaskRecord | null {
   if (task.status !== 'interrupted' && task.status !== 'failed' && task.status !== 'aborted') {
     return null;
   }
-  return createBackgroundTask({
+  const resumed = createBackgroundTask({
     title: `Resume ${task.title}`,
     prompt: [
       `Resume background task ${task.id}.`,
@@ -410,7 +417,33 @@ export function resumeBackgroundTask(id: string): BackgroundTaskRecord | null {
     maxMinutes: task.maxMinutes,
     source: task.source,
     resumedFromTaskId: task.id,
+    resumeCount: (task.resumeCount ?? 0) + 1,
   });
+  // Stamp the original so the boot-time auto-resumer (and the UI) can tell
+  // it's already been carried forward and won't re-spawn it.
+  updateBackgroundTask(task.id, { resumedIntoTaskId: resumed.id });
+  return resumed;
+}
+
+/**
+ * Boot-time recovery: re-queue background tasks that were marked
+ * `interrupted` by interruptStaleRunningBackgroundTasks (a daemon
+ * restart/crash mid-run) so the work resumes instead of stranding.
+ *
+ * Bounded two ways so a task that reliably crashes the daemon can't loop
+ * forever: we skip tasks already carried forward (`resumedIntoTaskId`) and
+ * tasks whose `resumeCount` has reached `cap`. Returns the number resumed.
+ */
+export function resumeInterruptedBackgroundTasks(opts: { cap?: number } = {}): number {
+  const cap = Math.max(1, opts.cap ?? 2);
+  let resumedCount = 0;
+  for (const task of listBackgroundTasks({ status: 'interrupted' })) {
+    if (task.error !== DAEMON_RESTART_INTERRUPT_REASON) continue;
+    if (task.resumedIntoTaskId) continue;          // already carried forward
+    if ((task.resumeCount ?? 0) >= cap) continue;  // give up after cap retries
+    if (resumeBackgroundTask(task.id)) resumedCount += 1;
+  }
+  return resumedCount;
 }
 
 export function queueBackgroundTaskApprovalResolution(approvalId: string, approved: boolean): BackgroundTaskRecord | null {
@@ -446,7 +479,7 @@ export function interruptStaleRunningBackgroundTasks(): number {
   let interrupted = 0;
   for (const task of listBackgroundTasks()) {
     if (task.status === 'running' || task.status === 'cancelling') {
-      markBackgroundTaskFailed(task.id, 'Daemon restarted while task was running.', 'interrupted');
+      markBackgroundTaskFailed(task.id, DAEMON_RESTART_INTERRUPT_REASON, 'interrupted');
       interrupted += 1;
     }
   }

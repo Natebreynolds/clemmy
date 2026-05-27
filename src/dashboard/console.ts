@@ -131,6 +131,16 @@ export function renderConsoleHtml(token: string): string {
         <span class="nav-key">03</span>
         <span class="nav-label">Brain</span>
       </button>
+      <!-- Meetings — promoted to a top-level slot only when Recall.ai
+           meeting capture is enabled. Hidden by default; revealed by
+           syncMeetingsPlacement() once recallStatus().enabled is true.
+           When not configured, meetings stay under Brain's "meetings"
+           sub-tab (status quo). Letter key "M" mirrors Approvals' "A"
+           so the 01–10 numbering never shifts. -->
+      <button class="nav" data-panel="meetings" data-meetings-nav hidden>
+        <span class="nav-key">M</span>
+        <span class="nav-label">Meetings</span>
+      </button>
       <button class="nav" data-panel="workflows">
         <span class="nav-key">04</span>
         <span class="nav-label">Workflows</span>
@@ -819,6 +829,20 @@ export function renderConsoleHtml(token: string): string {
         Anchored on Tulving's semantic / episodic / procedural framing
         — see [[project_brain_architecture]] + [[project_brain_phase1_gaps]].
       -->
+      <!-- Top-level Meetings panel. Empty by default — the single
+           .mem-meetings node (defined once inside the Brain "meetings"
+           sub-pane) is RELOCATED into [data-meetings-mount] by
+           syncMeetingsPlacement() when Recall capture is enabled, and
+           moved back under Brain when disabled. There is only ever one
+           .mem-meetings block because every loader queries it by a
+           single selector (data-mem-meetings*). -->
+      <section class="panel-frame" data-section="meetings" hidden>
+        <div class="panel-tag">PANEL · M · MEETINGS</div>
+        <div class="panel-body">
+          <div data-meetings-mount></div>
+        </div>
+      </section>
+
       <section class="panel-frame" data-section="brain" hidden>
         <div class="panel-tag">PANEL · B · BRAIN</div>
         <div class="panel-body brain-layout">
@@ -1027,6 +1051,7 @@ export function renderConsoleHtml(token: string): string {
               <div class="mem-meetings" data-mem-meetings>
                 <div class="mem-meetings-head">
                   <span class="mem-meetings-tag">CAPTURED MEETINGS</span>
+                  <input type="search" class="mem-meetings-search" data-mem-meetings-search placeholder="Search meetings…" aria-label="Search meetings" />
                   <span class="mem-meetings-meta" data-mem-meetings-meta>—</span>
                   <button type="button" class="mem-meetings-refresh" data-mem-meetings-refresh>REFRESH</button>
                 </div>
@@ -4158,6 +4183,18 @@ body {
   color: var(--accent);
   font-weight: 600;
 }
+.mem-meetings-search {
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  color: var(--fg);
+  font: inherit;
+  font-size: 11px;
+  padding: 4px 9px;
+  min-width: 200px;
+  flex: 0 1 260px;
+}
+.mem-meetings-search:focus { outline: none; border-color: var(--accent); }
+.mem-meetings-search::placeholder { color: var(--fg-mute); }
 .mem-meetings-meta {
   font-size: 10px;
   letter-spacing: 0.12em;
@@ -7482,6 +7519,14 @@ body {
 
 .brain-meetings-wrap { height: calc(100vh - 240px); min-height: 480px; }
 .brain-meetings-wrap .mem-meetings { height: 100%; }
+/* Top-level Meetings panel: the .mem-meetings node is relocated into
+   [data-meetings-mount] when Recall is configured. Pass the panel-body's
+   bounded height (panel-frame/panel-body are both height:100%) down the
+   chain so .mem-meetings' grid gets a definite height — otherwise the
+   detail pane's overflow-y:auto has nothing to scroll against and a long
+   summary can't be scrolled past. Mirrors .brain-meetings-wrap. */
+[data-meetings-mount] { height: 100%; min-height: 0; }
+[data-meetings-mount] .mem-meetings { height: 100%; }
 
 .skills-grid {
   display: grid;
@@ -10212,6 +10257,9 @@ const CONSOLE_JS = `
   let approvalsBooted = false;
   let brainBooted = false;
   let brainCurrentTab = 'overview';
+  // Tracks whether Meetings is promoted to the top-level sidebar slot
+  // (Recall capture enabled). Flipped by syncMeetingsPlacement().
+  let meetingsPromoted = false;
 
   function switchPanel(name) {
     panelSections.forEach((s) => {
@@ -10265,6 +10313,15 @@ const CONSOLE_JS = `
       else refreshBrainCurrentTab();
     } else if (name === 'settings') {
       if (!settingsBooted) { settingsBooted = true; bootSettingsPanel(); }
+    } else if (name === 'meetings') {
+      // Meetings has no heavy boot — loadMemoryMeetings is self-contained
+      // (hits /api/console/meetings/recall/recent). wireMemoryMeetingsControls
+      // is idempotent (guarded by memMeetingsBound), same call the Brain
+      // sub-tab made via refreshBrainMeetings.
+      if (typeof wireMemoryMeetingsControls === 'function') wireMemoryMeetingsControls();
+      if (typeof loadMemoryMeetings === 'function') {
+        loadMemoryMeetings().catch((err) => console.error('meetings load failed:', err));
+      }
     }
   }
   navButtons.forEach((b) => {
@@ -10274,15 +10331,49 @@ const CONSOLE_JS = `
     });
   });
 
-  // Navigate to the live meeting transcript: Brain panel → Meetings tab.
-  // The old code routed to a 'memory' panel + __clementineMemoryView,
-  // but post brain-consolidation there is no 'memory' panel — meetings
-  // live under Brain's "meetings" tab. switchPanel('memory') matched
-  // nothing and hid every panel (blank screen). Clicking the real nav +
-  // tab buttons reuses their wired handlers (boot + load), which is the
-  // robust path.
+  // Promote/demote Meetings between the top-level sidebar slot (Recall
+  // capture enabled) and the Brain "meetings" sub-tab (status quo).
+  // Idempotent: the early-return on unchanged state makes it safe to call
+  // on every 5s recall poll tick. Relocates the SINGLE .mem-meetings node
+  // (there can only be one — all loaders query it by single selector) and
+  // toggles the nav button + Brain sub-tab entry to match.
+  function syncMeetingsPlacement(status) {
+    const configured = Boolean(status && status.enabled);
+    if (configured === meetingsPromoted) return;
+    const navBtn = document.querySelector('[data-meetings-nav]');
+    const memNode = document.querySelector('[data-mem-meetings]');
+    const mount = document.querySelector('[data-meetings-mount]');
+    const brainPane = document.querySelector('[data-brain-pane="meetings"]');
+    const brainWrap = document.querySelector('.brain-meetings-wrap');
+    const brainTab = document.querySelector('[data-brain-tab="meetings"]');
+    if (!navBtn || !memNode || !mount || !brainPane || !brainWrap || !brainTab) return;
+    if (configured) {
+      mount.appendChild(memNode);   // move the node up to the top-level panel
+      navBtn.hidden = false;
+      brainTab.hidden = true;       // hide the now-empty Brain sub-tab entry
+    } else {
+      brainWrap.appendChild(memNode); // move it back under Brain's sized wrapper
+      navBtn.hidden = true;
+      brainTab.hidden = false;
+      // Don't strand the user on a panel that's about to be hidden.
+      if ((location.hash || '') === '#meetings') switchPanel('brain');
+    }
+    meetingsPromoted = configured;
+  }
+  window.__clementineSyncMeetingsPlacement = syncMeetingsPlacement;
+
+  // Navigate to the live meeting transcript. When Meetings is promoted to
+  // the top-level slot, jump straight there; otherwise fall back to the
+  // Brain panel → Meetings sub-tab. Clicking the real nav / tab buttons
+  // reuses their wired handlers (boot + load), the robust path. (Pre-
+  // consolidation this routed to a 'memory' panel that no longer exists.)
   function openBrainMeetings() {
     try {
+      if (meetingsPromoted) {
+        const navMeetings = document.querySelector('[data-meetings-nav]');
+        if (navMeetings) navMeetings.click(); else switchPanel('meetings');
+        return;
+      }
       const navBrain = document.querySelector('.nav[data-panel="brain"]');
       if (navBrain) navBrain.click(); else switchPanel('brain');
       const meetingsTab = document.querySelector('[data-brain-tab="meetings"]');
@@ -10754,7 +10845,21 @@ const CONSOLE_JS = `
     if (memMeetingsBound) return;
     memMeetingsBound = true;
     const refresh = document.querySelector('[data-mem-meetings-refresh]');
-    refresh?.addEventListener('click', () => loadMemoryMeetings());
+    refresh?.addEventListener('click', () => {
+      const search = document.querySelector('[data-mem-meetings-search]');
+      if (search) search.value = '';
+      loadMemoryMeetings();
+    });
+    const search = document.querySelector('[data-mem-meetings-search]');
+    let searchTimer = null;
+    search?.addEventListener('input', () => {
+      clearTimeout(searchTimer);
+      const q = search.value.trim();
+      searchTimer = setTimeout(() => {
+        if (!q) loadMemoryMeetings();
+        else searchMeetings(q);
+      }, 250);
+    });
   }
 
   function platformClass(platform) {
@@ -10825,6 +10930,75 @@ const CONSOLE_JS = `
     });
   }
 
+  // Shared row markup for both the recent list and search results.
+  function renderMeetingRow(m) {
+    const cls = memMeetingsSelected === m.id ? 'mem-meeting-row selected' : 'mem-meeting-row';
+    const platform = m.platform || 'meeting';
+    const statusLabel = m.status === 'recording' ? 'RECORDING'
+      : m.hasAnalysis ? 'ANALYSIS READY'
+      : m.status === 'completed' ? 'ANALYSIS PENDING'
+      : (m.status || 'unknown').toUpperCase();
+    const statusCls = m.status === 'recording' ? 'recording'
+      : m.hasAnalysis ? 'analysis-ready'
+      : m.status === 'completed' ? 'analysis-pending'
+      : '';
+    return [
+      '<div class="' + cls + '" data-mem-meeting-id="' + escMem(m.id) + '">',
+      '  <div class="mem-meeting-row-head">',
+      '    <span class="mem-meeting-platform ' + platformClass(platform) + '">' + escMem(platform) + '</span>',
+      '    <span class="mem-meeting-status ' + statusCls + '">' + escMem(statusLabel) + '</span>',
+      '  </div>',
+      '  <div class="mem-meeting-row-title" title="' + escMem(m.title || m.windowId) + '">' + escMem(m.title || '(untitled meeting)') + '</div>',
+      '  <div class="mem-meeting-row-meta">' + fmtMeetingDate(m.startedAt) + ' · ' + fmtMeetingDuration(m.durationSeconds) + ' · ' + (m.segmentCount || 0) + ' segments</div>',
+      '</div>',
+    ].join('');
+  }
+
+  // Attach click→select→load-detail to every row inside the list.
+  function wireMeetingRowClicks(list) {
+    Array.from(list.querySelectorAll('[data-mem-meeting-id]')).forEach((row) => {
+      row.addEventListener('click', () => {
+        const id = row.getAttribute('data-mem-meeting-id');
+        memMeetingsSelected = id;
+        Array.from(list.querySelectorAll('.mem-meeting-row')).forEach((el) => el.classList.toggle('selected', el === row));
+        loadMemoryMeetingDetail(id);
+      });
+    });
+  }
+
+  // Search captured meetings via the vault index (FTS + embedding rerank),
+  // scoped to the 04-Meetings folder. Matches titles, summaries, AND
+  // transcripts — the filing work folded summaries into the notes, so a
+  // search for an outcome ("salesforce") finds the meeting even if that
+  // word was never spoken. Empty query restores the recent list.
+  async function searchMeetings(q) {
+    const list = document.querySelector('[data-mem-meetings-list]');
+    const meta = document.querySelector('[data-mem-meetings-meta]');
+    if (!list) return;
+    list.innerHTML = '<div class="mem-meetings-empty">searching…</div>';
+    try {
+      const data = await fetchJSON('/api/console/memory/search?q=' + encodeURIComponent(q) + '&limit=25');
+      const hits = (data.hits || []).filter((h) => (h.filePath || '').includes('/04-Meetings/'));
+      const byPath = new Map();
+      for (const m of memMeetingsCache) if (m.artifactPath) byPath.set(m.artifactPath, m);
+      const seen = new Set();
+      const matched = [];
+      for (const h of hits) {
+        const m = byPath.get(h.filePath);
+        if (m && !seen.has(m.id)) { seen.add(m.id); matched.push(m); }
+      }
+      if (meta) meta.textContent = matched.length + ' match' + (matched.length === 1 ? '' : 'es');
+      if (matched.length === 0) {
+        list.innerHTML = '<div class="mem-meetings-empty">No meetings match &ldquo;' + escMem(q) + '&rdquo;.</div>';
+        return;
+      }
+      list.innerHTML = matched.map(renderMeetingRow).join('');
+      wireMeetingRowClicks(list);
+    } catch (err) {
+      list.innerHTML = '<div class="mem-meetings-empty" style="color:var(--accent-fail);">Search failed: ' + escMem(err.message || err) + '</div>';
+    }
+  }
+
   async function loadMemoryMeetings() {
     const list = document.querySelector('[data-mem-meetings-list]');
     const meta = document.querySelector('[data-mem-meetings-meta]');
@@ -10853,28 +11027,7 @@ const CONSOLE_JS = `
         renderMemoryMeetingDetail(null);
         return;
       }
-      const renderRow = (m) => {
-        const cls = memMeetingsSelected === m.id ? 'mem-meeting-row selected' : 'mem-meeting-row';
-        const platform = m.platform || 'meeting';
-        const statusLabel = m.status === 'recording' ? 'RECORDING'
-          : m.hasAnalysis ? 'ANALYSIS READY'
-          : m.status === 'completed' ? 'ANALYSIS PENDING'
-          : (m.status || 'unknown').toUpperCase();
-        const statusCls = m.status === 'recording' ? 'recording'
-          : m.hasAnalysis ? 'analysis-ready'
-          : m.status === 'completed' ? 'analysis-pending'
-          : '';
-        return [
-          '<div class="' + cls + '" data-mem-meeting-id="' + escMem(m.id) + '">',
-          '  <div class="mem-meeting-row-head">',
-          '    <span class="mem-meeting-platform ' + platformClass(platform) + '">' + escMem(platform) + '</span>',
-          '    <span class="mem-meeting-status ' + statusCls + '">' + escMem(statusLabel) + '</span>',
-          '  </div>',
-          '  <div class="mem-meeting-row-title" title="' + escMem(m.title || m.windowId) + '">' + escMem(m.title || '(untitled meeting)') + '</div>',
-          '  <div class="mem-meeting-row-meta">' + fmtMeetingDate(m.startedAt) + ' · ' + fmtMeetingDuration(m.durationSeconds) + ' · ' + (m.segmentCount || 0) + ' segments</div>',
-          '</div>',
-        ].join('');
-      };
+      const renderRow = renderMeetingRow;
       const sectionHead = (label, count) =>
         '<div class="mem-meetings-section">' + escMem(label) + (count != null ? ' · ' + count : '') + '</div>';
       const parts = [];
@@ -10888,14 +11041,7 @@ const CONSOLE_JS = `
         ? pastMeetings.map(renderRow).join('')
         : '<div class="mem-meetings-empty">— no past captures yet —</div>');
       list.innerHTML = parts.join('');
-      Array.from(list.querySelectorAll('[data-mem-meeting-id]')).forEach((row) => {
-        row.addEventListener('click', () => {
-          const id = row.getAttribute('data-mem-meeting-id');
-          memMeetingsSelected = id;
-          Array.from(list.querySelectorAll('.mem-meeting-row')).forEach((el) => el.classList.toggle('selected', el === row));
-          loadMemoryMeetingDetail(id);
-        });
-      });
+      wireMeetingRowClicks(list);
       wireLiveMeetingCardActions();
       if (memMeetingsSelected && meetings.some((m) => m.id === memMeetingsSelected)) {
         loadMemoryMeetingDetail(memMeetingsSelected);
@@ -10945,6 +11091,7 @@ const CONSOLE_JS = `
       lines.push('<button data-meeting-action="transcript" data-path="' + escMem(rec.artifactPath) + '">OPEN TRANSCRIPT</button>');
     }
     lines.push('<button class="primary" data-meeting-action="send-summary" data-id="' + escMem(rec.id) + '">SUMMARIZE IN CHAT</button>');
+    lines.push('<button data-meeting-action="rename" data-id="' + escMem(rec.id) + '">RENAME</button>');
     lines.push('</div>');
 
     if (analysis) {
@@ -11035,6 +11182,46 @@ const CONSOLE_JS = `
             btn.disabled = false;
             btn.textContent = originalLabel;
           }
+        } else if (action === 'rename') {
+          const id = btn.getAttribute('data-id');
+          if (!id) return;
+          const h3 = detail.querySelector('.mem-meeting-detail h3');
+          if (!h3) return;
+          const currentRaw = h3.textContent || '';
+          const current = currentRaw === '(untitled meeting)' ? '' : currentRaw;
+          // Swap the title for an inline editor. Cancel/Esc restores the
+          // detail by reloading it; Save PATCHes then reloads detail+list.
+          h3.innerHTML = '<input class="mem-rename-input" type="text" maxlength="120" /> '
+            + '<button class="mem-rename-save">SAVE</button> '
+            + '<button class="mem-rename-cancel">CANCEL</button>';
+          const input = h3.querySelector('.mem-rename-input');
+          input.value = current;
+          input.focus();
+          input.select();
+          const cancel = () => { loadMemoryMeetingDetail(id); };
+          const save = async () => {
+            const val = input.value.trim();
+            if (!val) { input.focus(); return; }
+            try {
+              const r = await fetchWithToken('/api/console/meetings/recall/' + encodeURIComponent(id) + '/title', {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+                body: JSON.stringify({ title: val }),
+              });
+              if (!r.ok) throw new Error('HTTP ' + r.status);
+              await loadMemoryMeetingDetail(id);   // re-render with new title
+              await loadMemoryMeetings();           // refresh list label too
+            } catch (err) {
+              alert('Rename failed: ' + (err && err.message ? err.message : String(err)));
+              cancel();
+            }
+          };
+          h3.querySelector('.mem-rename-save').addEventListener('click', save);
+          h3.querySelector('.mem-rename-cancel').addEventListener('click', cancel);
+          input.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') { e.preventDefault(); save(); }
+            else if (e.key === 'Escape') { e.preventDefault(); cancel(); }
+          });
         }
       });
     });
@@ -20600,6 +20787,11 @@ const CONSOLE_JS = `
       try { status = await window.clemmy.recallStatus(); }
       catch { return; }
       if (!status || typeof status !== 'object') return;
+
+      // Promote/demote the top-level Meetings sidebar item to match
+      // whether Recall capture is enabled. Idempotent + cheap; this poll
+      // (initial 600ms + every 5s) is also what surfaces Meetings on boot.
+      try { window.__clementineSyncMeetingsPlacement?.(status); } catch (_) {}
 
       const captureEnabled = Boolean(status.enabled);
       const daemonRecording = Boolean(status.recording);

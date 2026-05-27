@@ -12,7 +12,7 @@ import { ensureSeedTemplates, processProactiveCheckIns } from '../agents/check-i
 import { MODELS } from '../config.js';
 import { processExecutionController } from '../execution/controller.js';
 import { ExecutionStore } from '../execution/store.js';
-import { interruptStaleRunningBackgroundTasks, processBackgroundTasks } from '../execution/background-tasks.js';
+import { interruptStaleRunningBackgroundTasks, resumeInterruptedBackgroundTasks, processBackgroundTasks } from '../execution/background-tasks.js';
 import { processWorkflowRuns, reconcilePendingWorkflowRuns } from '../execution/workflow-runner.js';
 import { processWorkflowSchedules, reapStaleWorkflowRuns } from '../execution/workflow-scheduler.js';
 import { sweepStaleExecutions, sweepCrashedExecutions, sweepStaleBlockedExecutions } from '../execution/store.js';
@@ -730,6 +730,12 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
   const interrupted = interruptStaleRunningBackgroundTasks();
   if (interrupted > 0) {
     logger.warn({ interrupted }, 'Marked stale running background tasks as interrupted');
+  }
+  // Re-queue tasks interrupted by a previous restart/crash so the work
+  // resumes instead of stranding (bounded by resumeCount to avoid loops).
+  const autoResumed = resumeInterruptedBackgroundTasks({ cap: 2 });
+  if (autoResumed > 0) {
+    logger.warn({ autoResumed }, 'Auto-resumed interrupted background tasks on boot');
   }
   // Sweep records that got stuck active across a previous crash/restart.
   // Without this, the dashboard "NOW" panel still reports phantom in-flight

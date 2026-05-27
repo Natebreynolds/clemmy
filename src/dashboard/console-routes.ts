@@ -148,6 +148,7 @@ import {
   loadRecallMeetingById,
   loadRecallMeetingSettings,
   noteRecallMeetingDetected,
+  renameMeeting,
   RECALL_REGIONS,
   saveRecallMeetingSettings,
   type RecallMeetingSettings,
@@ -2850,6 +2851,25 @@ export function registerConsoleRoutes(
       if (!record) { res.status(404).json({ error: 'meeting not found' }); return; }
       const analysis = loadRecallMeetingAnalysis(meetingId);
       res.json({ record, analysis });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // User rename: sets a locked 'user' title and re-files the note (title
+  // into frontmatter + heading). File path is unchanged, so the vault
+  // index stays consistent — we just reindex to pick up the new text.
+  app.patch('/api/console/meetings/recall/:meetingId/title', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const meetingId = req.params.meetingId;
+    const title = typeof (req.body?.title) === 'string' ? req.body.title.trim() : '';
+    if (!title) { res.status(400).json({ error: 'title required' }); return; }
+    try {
+      const record = loadRecallMeetingById(meetingId);
+      if (!record) { res.status(404).json({ error: 'meeting not found' }); return; }
+      const changed = renameMeeting(meetingId, title);
+      if (changed) { try { reindexVault(); } catch { /* maintenance will retry */ } }
+      res.json({ record: loadRecallMeetingById(meetingId), changed });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
