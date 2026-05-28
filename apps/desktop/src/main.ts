@@ -236,6 +236,7 @@ function createSplashWindow(): BrowserWindow {
     alwaysOnTop: true,
     backgroundColor: '#07070a',
     webPreferences: {
+      partition: 'clementine-splash',
       // Without the preload, window.clemmy isn't defined, so the
       // splash's status-text updater never wires up and the user
       // sees "starting daemon…" for the entire boot. The supervisor
@@ -300,6 +301,12 @@ function createMainWindow(url: string): BrowserWindow {
     backgroundColor: '#07070a',
     titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
     webPreferences: {
+      // Use a non-persistent Electron session. The dashboard gets a
+      // fresh local bootstrap URL on every launch, so it does not need
+      // durable Chromium cookies/cache. Keeping this in-memory avoids
+      // Electron/Chromium Safe Storage touching macOS Keychain just to
+      // encrypt a local dashboard cookie.
+      partition: 'clementine-dashboard',
       preload: preloadPath(),
       contextIsolation: true,
       nodeIntegration: false,
@@ -610,21 +617,25 @@ async function boot(): Promise<void> {
   // file vault (which the daemon's SecretStore reads at boot).
   cachedWebhookSecret = await ensureWebhookSecret();
 
-  // One-time migration of any Keychain entries from v0.4.16 → v0.4.29
-  // (when setCredential wrote to Keychain) into the file vault. Gated
-  // by a marker so subsequent launches stay silent. Best-effort: an
-  // unexpected failure here must NEVER block boot.
-  try {
-    const result = await migrateKeychainToFileVault();
-    if (result.ran && result.migrated.length > 0) {
-      try {
-        appendFileSync(LOG_FILE, `\n=== Keychain migration ${new Date().toISOString()} ===\nmoved to file vault: ${result.migrated.join(', ')}\n`);
-      } catch { /* log is best-effort */ }
-    }
-  } catch (err) {
+  // Keychain is now explicit only. Even a one-time `findCredentials`
+  // migration can raise a macOS Keychain prompt on clean installs or
+  // after a signature change, which is worse than asking legacy users
+  // to click Settings → Credentials → Import Legacy Keychain. Keep the
+  // old startup migration reachable behind an operator flag for manual
+  // recovery/testing, but never run it during normal launch.
+  if (process.env.CLEMMY_ENABLE_LEGACY_KEYCHAIN_MIGRATION === '1') {
     try {
-      appendFileSync(LOG_FILE, `\n=== Keychain migration failed ${new Date().toISOString()} ===\n${err instanceof Error ? err.message : String(err)}\n`);
-    } catch { /* swallow */ }
+      const result = await migrateKeychainToFileVault();
+      if (result.ran && result.migrated.length > 0) {
+        try {
+          appendFileSync(LOG_FILE, `\n=== Keychain migration ${new Date().toISOString()} ===\nmoved to file vault: ${result.migrated.join(', ')}\n`);
+        } catch { /* log is best-effort */ }
+      }
+    } catch (err) {
+      try {
+        appendFileSync(LOG_FILE, `\n=== Keychain migration failed ${new Date().toISOString()} ===\n${err instanceof Error ? err.message : String(err)}\n`);
+      } catch { /* swallow */ }
+    }
   }
 
   if (needsSetup()) {

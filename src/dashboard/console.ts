@@ -1657,11 +1657,12 @@ Create the proposal artifact.</pre>
                 <div class="settings-info">— loading —</div>
               </div>
               <div class="creds-actions">
-                <button class="creds-btn-repair" data-creds-repair>REPAIR KEYCHAIN ⟲</button>
+                <button class="creds-btn-repair" data-creds-repair>IMPORT LEGACY KEYCHAIN ⇢</button>
                 <button class="creds-btn-reset" data-creds-reset>RESET CREDENTIALS ▣</button>
               </div>
               <div class="creds-footnote">
-                Reset only deletes entries under <code>com.clemmy.desktop.v1</code> and the local file vault.
+                Keychain import is only for users upgrading from old Clementine builds.
+                Reset deletes entries under <code>com.clemmy.desktop.v1</code> and the local file vault.
                 Your <code>.env</code> is never touched.
               </div>
             </div>
@@ -19948,20 +19949,21 @@ const CONSOLE_JS = `
   const resetBtn  = document.querySelector('[data-creds-reset]');
   if (repairBtn) {
     repairBtn.addEventListener('click', async () => {
-      repairBtn.textContent = 'REPAIRING…';
+      if (!confirm('Import legacy Clementine Keychain entries into the local vault?\\n\\nmacOS may show a Keychain prompt. This is only needed for old installs that stored secrets in Keychain.')) return;
+      repairBtn.textContent = 'IMPORTING…';
       try {
         const r = await fetch(withToken('/api/console/credentials/repair-keychain'), { method: 'POST' });
         const j = await r.json();
         if (!j.probed) {
           alert('Keychain not available — keytar is not installed in this build.\\nThis is expected for the daemon-only / CLI install; install the desktop app to use Keychain.');
         } else {
-          alert('Keychain repair complete. Tested ' + j.tested + ' credentials, recovered ' + (j.recovered?.length || 0) + ' to keychain status.');
+          alert('Legacy Keychain import complete.\\n\\nScanned: ' + (j.scanned || 0) + '\\nMoved to vault: ' + (j.migrated?.length || 0) + '\\nAlready in vault: ' + (j.alreadyInVault?.length || 0) + '\\nRemoved Keychain duplicates: ' + (j.deleted?.length || 0));
         }
         await refreshCredentialsHealth();
       } catch (err) {
-        alert('Repair failed: ' + (err.message || err));
+        alert('Import failed: ' + (err.message || err));
       } finally {
-        repairBtn.textContent = 'REPAIR KEYCHAIN ⟲';
+        repairBtn.textContent = 'IMPORT LEGACY KEYCHAIN ⇢';
       }
     });
   }

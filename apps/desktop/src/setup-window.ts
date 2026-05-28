@@ -65,6 +65,10 @@ export function createSetupWindow(opts: SetupWindowOpts): BrowserWindow {
     minimizable: true,
     maximizable: false,
     webPreferences: {
+      // The setup wizard does not need durable Chromium storage; keeping
+      // it in-memory avoids Electron Safe Storage touching macOS
+      // Keychain for form state, cookies, or autofill artifacts.
+      partition: 'clementine-setup',
       preload: opts.preloadPath,
       contextIsolation: true,
       nodeIntegration: false,

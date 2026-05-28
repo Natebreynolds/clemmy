@@ -2975,7 +2975,7 @@ export function registerConsoleRoutes(
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
       const store = await getSecretStore();
-      const report = await store.repairKeychain();
+      const report = await store.importLegacyKeychainToVault();
       res.json(report);
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });

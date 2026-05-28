@@ -53,7 +53,7 @@ export type SupervisorEvent =
   | { type: 'restart-counter-reset'; reason: string; priorAttempts: number }
   | { type: 'restart-skipped'; reason: string };
 
-const READINESS_TIMEOUT_MS = 30_000;
+const READINESS_TIMEOUT_MS = 90_000;
 const READINESS_POLL_MS = 250;
 const SHUTDOWN_GRACE_MS = 5_000;
 const RESTART_BASE_MS = 1_000;
@@ -149,8 +149,8 @@ export class DaemonSupervisor {
     if (!existsSync(logDir)) mkdirSync(logDir, { recursive: true });
   }
 
-  /** Start (or restart) the daemon. Resolves when the dashboard URL
-   *  returns a 200, rejects after READINESS_TIMEOUT_MS. */
+  /** Start (or restart) the daemon. Resolves when the daemon's minimal
+   *  health route answers, rejects after READINESS_TIMEOUT_MS. */
   async start(): Promise<{ port: number; url: string }> {
     if (this.child) {
       // Already running — return the existing ready promise.
@@ -421,15 +421,20 @@ export class DaemonSupervisor {
   }
 
   private async waitForReady(): Promise<{ port: number; url: string }> {
-    const url = `http://${WEBHOOK_HOST}:${this.chosenPort}/api/dashboard`;
+    // Probe the smallest public health route, not `/api/dashboard`.
+    // `/api/dashboard` can do real work (state aggregation, MCP status,
+    // memory/runs/approvals) and on a cold packaged launch it can cross
+    // the old 30s supervisor window even though the daemon is alive.
+    // `/api/status` is intentionally minimal and is the correct boot
+    // readiness signal.
+    const url = `http://${WEBHOOK_HOST}:${this.chosenPort}/api/status`;
     const deadline = Date.now() + READINESS_TIMEOUT_MS;
     while (Date.now() < deadline) {
       if (this.shuttingDown) throw new Error('Daemon shutting down before ready');
       if (!this.child) throw new Error('Daemon exited before ready');
       try {
         const r = await fetch(url, { signal: AbortSignal.timeout(2000) });
-        // 200 OK or 401 (auth required) both mean the server is up.
-        if (r.status === 200 || r.status === 401) {
+        if (r.status === 200) {
           return { port: this.chosenPort, url: `http://${WEBHOOK_HOST}:${this.chosenPort}` };
         }
       } catch {

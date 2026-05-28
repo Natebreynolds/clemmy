@@ -367,6 +367,7 @@ export class CompositeSecretStore {
     const probed = await probeKeychain();
     if (!probed) return { probed: false, tested: 0, recovered: [] };
     this.keychainBackend = new KeychainSecretBackend();
+    this.keychainInitialized = true;
     const recovered: SecretName[] = [];
     let tested = 0;
     for (const desc of listSecretDescriptors()) {
@@ -377,6 +378,79 @@ export class CompositeSecretStore {
       }
     }
     return { probed: true, tested, recovered };
+  }
+
+  /**
+   * Explicit legacy import — copies any old `com.clemmy.desktop.v1`
+   * Keychain entries into the file vault and removes the duplicate
+   * Keychain item after readback succeeds. This replaces automatic
+   * startup migration so fresh installs never raise a macOS Keychain
+   * prompt during normal launch.
+   */
+  async importLegacyKeychainToVault(): Promise<{
+    probed: boolean;
+    scanned: number;
+    migrated: SecretName[];
+    alreadyInVault: SecretName[];
+    deleted: string[];
+    failed: string[];
+    errors: string[];
+  }> {
+    const probed = await probeKeychain();
+    if (!probed) {
+      return { probed: false, scanned: 0, migrated: [], alreadyInVault: [], deleted: [], failed: [], errors: [] };
+    }
+
+    this.keychainBackend = new KeychainSecretBackend();
+    this.keychainInitialized = true;
+
+    const known = new Map(listSecretDescriptors().map((desc) => [desc.name, desc]));
+    const entries = await KeychainSecretBackend.readEntries();
+    const migrated: SecretName[] = [];
+    const alreadyInVault: SecretName[] = [];
+    const deleted: string[] = [];
+    const failed: string[] = [];
+    const errors: string[] = [];
+
+    for (const { account, password } of entries) {
+      const desc = known.get(account as SecretName);
+      if (!desc || !password) continue;
+
+      try {
+        const existing = await this.fileBackend.get(desc.name);
+        if (existing !== undefined) {
+          alreadyInVault.push(desc.name);
+          try {
+            await this.keychainBackend.delete(desc.name);
+            deleted.push(account);
+          } catch (err) {
+            failed.push(account);
+            errors.push(`delete ${account}: ${err instanceof Error ? err.message : String(err)}`);
+          }
+          continue;
+        }
+
+        const result = await this.set(desc.name, password);
+        if (result.source === 'file' && result.status === 'connected') {
+          migrated.push(desc.name);
+          try {
+            await this.keychainBackend.delete(desc.name);
+            deleted.push(account);
+          } catch (err) {
+            failed.push(account);
+            errors.push(`delete ${account}: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        } else {
+          failed.push(account);
+          errors.push(`import ${account}: ${result.status}`);
+        }
+      } catch (err) {
+        failed.push(account);
+        errors.push(`${account}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+
+    return { probed: true, scanned: entries.length, migrated, alreadyInVault, deleted, failed, errors };
   }
 
   /**

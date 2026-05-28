@@ -36,6 +36,16 @@ export function invalidateMcpServerDiscoveryCache(): void {
   cacheExpiry = 0;
 }
 
+function hardenUserMcpConfigPermissions(): void {
+  const dir = path.dirname(MCP_SERVERS_FILE);
+  try {
+    if (existsSync(dir)) chmodSync(dir, 0o700);
+  } catch { /* best-effort */ }
+  try {
+    if (existsSync(MCP_SERVERS_FILE)) chmodSync(MCP_SERVERS_FILE, 0o600);
+  } catch { /* best-effort */ }
+}
+
 function normalizeServerName(name: string): string {
   return name.trim().toLowerCase().replace(/[\s_]+/g, '-');
 }
@@ -126,6 +136,7 @@ export function discoverMcpServers(): ManagedMcpServer[] {
 
   if (existsSync(MCP_SERVERS_FILE)) {
     try {
+      hardenUserMcpConfigPermissions();
       const data = JSON.parse(readFileSync(MCP_SERVERS_FILE, 'utf-8')) as Record<string, Record<string, unknown>>;
       for (const [name, config] of Object.entries(data)) {
         addServer(servers, name, config, 'user');
@@ -143,6 +154,7 @@ export function discoverMcpServers(): ManagedMcpServer[] {
 export function loadUserMcpServers(): Record<string, Partial<ManagedMcpServer>> {
   if (!existsSync(MCP_SERVERS_FILE)) return {};
   try {
+    hardenUserMcpConfigPermissions();
     return JSON.parse(readFileSync(MCP_SERVERS_FILE, 'utf-8')) as Record<string, Partial<ManagedMcpServer>>;
   } catch {
     return {};
@@ -152,8 +164,8 @@ export function loadUserMcpServers(): Record<string, Partial<ManagedMcpServer>> 
 export function saveUserMcpServers(servers: Record<string, Partial<ManagedMcpServer>>): void {
   const dir = path.dirname(MCP_SERVERS_FILE);
   mkdirSync(dir, { recursive: true });
-  try { chmodSync(dir, 0o700); } catch { /* best-effort */ }
+  hardenUserMcpConfigPermissions();
   writeFileSync(MCP_SERVERS_FILE, JSON.stringify(servers, null, 2), { encoding: 'utf-8', mode: 0o600 });
-  try { chmodSync(MCP_SERVERS_FILE, 0o600); } catch { /* best-effort */ }
+  hardenUserMcpConfigPermissions();
   invalidateMcpServerDiscoveryCache();
 }
