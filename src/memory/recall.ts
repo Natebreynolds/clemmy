@@ -2,6 +2,7 @@ import path from 'node:path';
 import pino from 'pino';
 import { openMemoryDb } from './db.js';
 import {
+  bufferToVector,
   cosine,
   embedQuery,
   isEmbeddingsEnabled,
@@ -31,6 +32,8 @@ const RERANK_CANDIDATE_POOL = 40;
 /** Reciprocal Rank Fusion constant. 60 is the standard from the IR
  *  literature; small changes here barely move ordering. */
 const RRF_K = 60;
+/** Bound pure-vector fallback scans so personal vaults stay snappy. */
+const SEMANTIC_FALLBACK_MAX_SCAN = 5000;
 
 interface RecallChunkRow {
   id: number;
@@ -39,6 +42,14 @@ interface RecallChunkRow {
   content: string;
   rank: number;
   snip: string;
+}
+
+interface SemanticChunkRow {
+  id: number;
+  path: string;
+  title: string | null;
+  content: string;
+  vector: Buffer;
 }
 
 /**
@@ -142,6 +153,63 @@ function rowsToHits(rows: RecallChunkRow[]): MemorySearchHit[] {
   });
 }
 
+async function semanticFallback(query: string, options: RecallOptions, limit: number): Promise<MemorySearchHit[]> {
+  if (!isEmbeddingsEnabled()) return [];
+  const db = openMemoryDb();
+  let sql = `
+    SELECT
+      vc.id      AS id,
+      vc.path    AS path,
+      vc.title   AS title,
+      vc.content AS content,
+      e.vector   AS vector
+    FROM embeddings e
+    JOIN vault_chunks vc ON vc.id = e.chunk_id
+  `;
+  const params: unknown[] = [];
+  if (options.pathPrefix) {
+    sql += ' WHERE vc.path LIKE ?';
+    params.push(`${options.pathPrefix}%`);
+  }
+  sql += ' ORDER BY vc.id DESC LIMIT ?';
+  params.push(SEMANTIC_FALLBACK_MAX_SCAN);
+
+  let rows: SemanticChunkRow[] = [];
+  try {
+    rows = db.prepare(sql).all(...params) as SemanticChunkRow[];
+  } catch (err) {
+    logger.warn({ err, query }, 'semantic fallback query failed');
+    return [];
+  }
+  if (rows.length === 0) return [];
+
+  const queryVector = await embedQuery(query);
+  if (!queryVector) return [];
+
+  const scored = rows
+    .map((row) => ({
+      row,
+      score: cosine(queryVector, bufferToVector(row.vector)),
+    }))
+    .filter((entry) => Number.isFinite(entry.score))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit);
+
+  return scored.map((entry) => ({
+    filePath: entry.row.path,
+    title: deriveTitle({
+      id: entry.row.id,
+      path: entry.row.path,
+      title: entry.row.title,
+      content: entry.row.content,
+      rank: 0,
+      snip: '',
+    }),
+    snippet: entry.row.content.slice(0, 240).replace(/\s+/g, ' '),
+    score: Number((Math.max(0, entry.score) * 10).toFixed(3)),
+  }));
+}
+
 /**
  * Sync FTS-only recall. Use when you don't have an event loop budget
  * for embeddings (CLI prints, simple tool callbacks).
@@ -162,7 +230,9 @@ export async function recallHybrid(query: string, options: RecallOptions = {}): 
   const limit = Math.max(1, options.limit ?? 6);
   const poolSize = Math.max(limit, RERANK_CANDIDATE_POOL);
   const candidates = fetchFtsCandidates(query, options, poolSize);
-  if (candidates.length === 0) return [];
+  if (candidates.length === 0) {
+    return semanticFallback(query, options, limit);
+  }
 
   // FTS-only fast path when embeddings aren't available.
   if (!isEmbeddingsEnabled()) {

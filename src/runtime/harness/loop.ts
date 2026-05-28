@@ -37,6 +37,7 @@ import { actionBus } from '../action-bus.js';
 import { BoundaryError } from '../boundary-error.js';
 import { getRuntimeEnv } from '../../config.js';
 import { captureInteractionSignals } from '../../memory/auto-capture.js';
+import { formatSearchHits, searchVault, searchVaultAsync } from '../../memory/search.js';
 import { maybeAutoFocusSession } from './auto-focus.js';
 import { getPlanScope, openPlanScope } from '../../agents/plan-scope.js';
 import { classifyTool } from '../../agents/tool-taxonomy.js';
@@ -752,6 +753,137 @@ export function buildPreflightBlockMessage(input: {
  */
 const MAX_STALL_RETRIES = positiveIntEnv('HARNESS_MAX_STALL_RETRIES', 2);
 const STALL_RETRY_BACKOFF_MS = [250, 1000];
+const TURN_MEMORY_PRIMER_TOP_K = positiveIntEnv('CLEMMY_TURN_MEMORY_PRIMER_TOP_K', 6);
+const TURN_MEMORY_PRIMER_MAX_CHARS = positiveIntEnv('CLEMMY_TURN_MEMORY_PRIMER_MAX_CHARS', 2600);
+const TURN_MEMORY_PRIMER_HYBRID_TIMEOUT_MS = positiveIntEnv('CLEMMY_TURN_MEMORY_PRIMER_HYBRID_TIMEOUT_MS', 800);
+
+function isSyntheticStallRetryInput(text: string): boolean {
+  return text.startsWith('Your previous response was prose, not an action.')
+    || text.startsWith('Your previous response did not make progress on the directive.');
+}
+
+function latestHumanInputForStallRetry(sessionId: string): string | undefined {
+  const events = listEvents(sessionId);
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const event = events[i];
+    if (event.type !== 'user_input_received') continue;
+    const text = (event.data as { text?: unknown })?.text;
+    if (typeof text !== 'string') continue;
+    const trimmed = text.trim();
+    if (!trimmed || isSyntheticStallRetryInput(trimmed)) continue;
+    return trimmed;
+  }
+  return undefined;
+}
+
+function looksLikeExistingWorkReference(input: string): boolean {
+  const text = input.toLowerCase();
+  if (!text.trim()) return false;
+
+  const action = /\b(work on|edit|edits|revise|revision|update|change|fix|finish|continue|resume|pick back up|go back|make more)\b/.test(text);
+  const referencedObject = /\b(that|this|these|those|previous|earlier|last|current|existing|project|file|post|animation|video|draft|sheet|proposal|deck|transcript|meeting|workflow|report)\b/.test(text);
+  const namedCreativeWork = /\b(gala|silent|silet|auction|acution|animation|post|reel|hyperframes?)\b/.test(text);
+
+  return (action && referencedObject) || (action && namedCreativeWork);
+}
+
+function buildMemoryFirstStallRetryHint(sessionId: string): string {
+  try {
+    const input = latestHumanInputForStallRetry(sessionId);
+    if (!input || !looksLikeExistingWorkReference(input)) return '';
+    const query = input.replace(/\s+/g, ' ').slice(0, 500);
+    return (
+      ` The user's original request appears to reference existing work: ${JSON.stringify(query)}.` +
+      ' Before calling ask_user_question, call focus_get. If focus_get does not identify the target,' +
+      ' call memory_search or memory_recall with that request or its key nouns. Only ask the user' +
+      ' after focus and memory return no useful match.'
+    );
+  } catch {
+    return '';
+  }
+}
+
+interface TurnMemoryPrimer {
+  enabled: boolean;
+  query: string;
+  hitCount: number;
+  injectedBytes: number;
+  source?: 'fts5' | 'hybrid' | 'fts5_hybrid_timeout' | 'fts5_hybrid_error';
+  text?: string;
+  skippedReason?: string;
+}
+
+function formatTurnMemoryPrimer(query: string, hits: ReturnType<typeof searchVault>, source: TurnMemoryPrimer['source']): TurnMemoryPrimer {
+  const formatted = formatSearchHits(hits, TURN_MEMORY_PRIMER_MAX_CHARS);
+  if (!formatted) {
+    return { enabled: true, query, hitCount: hits.length, injectedBytes: 0, source, skippedReason: 'no_hits' };
+  }
+  const sourceLabel = source === 'hybrid'
+    ? 'local FTS5 plus semantic rerank'
+    : 'local FTS5';
+  const text = [
+    '[MEMORY PRIMER]',
+    `A ${sourceLabel} memory search ran for the latest user message before this model call.`,
+    'Use these hits to steer the first response and tool choice. Treat snippets as candidate memory, not proof; before mutating external resources or creating source-backed artifacts, load the source with memory_read/read_file/recall_tool_result or call memory_recall for more context.',
+    '',
+    formatted,
+  ].join('\n');
+  return { enabled: true, query, hitCount: hits.length, injectedBytes: text.length, source, text };
+}
+
+async function searchVaultAsyncWithTimeout(query: string): Promise<ReturnType<typeof searchVault> | null> {
+  const timeout = new Promise<null>((resolve) => {
+    setTimeout(() => resolve(null), TURN_MEMORY_PRIMER_HYBRID_TIMEOUT_MS);
+  });
+  return await Promise.race([
+    searchVaultAsync(query, TURN_MEMORY_PRIMER_TOP_K),
+    timeout,
+  ]);
+}
+
+async function buildTurnMemoryPrimer(input: string): Promise<TurnMemoryPrimer> {
+  const enabled = (getRuntimeEnv('CLEMMY_TURN_MEMORY_PRIMER', 'on') ?? 'on').toLowerCase() !== 'off';
+  const hybridEnabled = (getRuntimeEnv('CLEMMY_TURN_MEMORY_PRIMER_HYBRID', 'on') ?? 'on').toLowerCase() !== 'off';
+  const query = input.replace(/\s+/g, ' ').trim();
+  if (!enabled) return { enabled: false, query, hitCount: 0, injectedBytes: 0, skippedReason: 'disabled' };
+  if (!query) return { enabled: true, query, hitCount: 0, injectedBytes: 0, skippedReason: 'empty_input' };
+  if (isSyntheticStallRetryInput(query)) {
+    return { enabled: true, query, hitCount: 0, injectedBytes: 0, skippedReason: 'synthetic_retry' };
+  }
+
+  try {
+    const ftsHits = searchVault(query, TURN_MEMORY_PRIMER_TOP_K);
+    if (!hybridEnabled) return formatTurnMemoryPrimer(query, ftsHits, 'fts5');
+
+    try {
+      const hybridHits = await searchVaultAsyncWithTimeout(query);
+      if (hybridHits && hybridHits.length > 0) {
+        return formatTurnMemoryPrimer(query, hybridHits, 'hybrid');
+      }
+      if (hybridHits === null) {
+        return {
+          ...formatTurnMemoryPrimer(query, ftsHits, 'fts5_hybrid_timeout'),
+          skippedReason: ftsHits.length > 0 ? 'hybrid_timeout' : 'hybrid_timeout_no_fts_hits',
+        };
+      }
+    } catch {
+      return {
+        ...formatTurnMemoryPrimer(query, ftsHits, 'fts5_hybrid_error'),
+        skippedReason: ftsHits.length > 0 ? 'hybrid_error' : 'hybrid_error_no_fts_hits',
+      };
+    }
+
+    return formatTurnMemoryPrimer(query, ftsHits, 'fts5');
+  } catch (err) {
+    return {
+      enabled: true,
+      query,
+      hitCount: 0,
+      injectedBytes: 0,
+      skippedReason: err instanceof Error ? `error:${err.message}` : 'error',
+    };
+  }
+}
 
 /**
  * Build the synthetic user message that drives the stall retry.
@@ -799,11 +931,14 @@ function buildStallRetryMessage(sessionId: string, stall: StallInfo): string {
   const stallShape = stall.signal === 'A_zero_tools'
     ? 'Your previous response was prose, not an action.'
     : 'Your previous response did not make progress on the directive.';
+  const fallbackHint = toolCallHint
+    || buildMemoryFirstStallRetryHint(sessionId)
+    || ' If the directive is ambiguous and you cannot pick a tool, call ask_user_question instead of producing announcement text.';
 
   return [
     stallShape,
     'You MUST call a tool now to make progress — do not emit any text before the tool call.',
-    toolCallHint || ' If the directive is ambiguous and you cannot pick a tool, call ask_user_question instead of producing announcement text.',
+    fallbackHint,
   ].join('');
 }
 
@@ -1629,7 +1764,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   //   3. Single canonical mutation point — future injections (e.g.
   //      session-pinned-resources to fix the grounding-on-retry gap)
   //      go in the same place
-  // The retryContextInputFilter is defined just before `opts` below.
+  // The combined modelInputFilter is defined just before `opts` below.
 
   // Pre-flight budget gate — Capacity-Aware Clem v0.5.18 primitive 2a.
   // Estimates the post-turn token cost BEFORE we call the SDK. If
@@ -1762,28 +1897,55 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     }
   }
 
+  const turnMemoryPrimer = await buildTurnMemoryPrimer(options.input);
+  safeAppend({
+    sessionId: options.sessionId,
+    turn,
+    role: 'system',
+    type: 'turn_memory_primer',
+    data: {
+      enabled: turnMemoryPrimer.enabled,
+      queryPreview: clip(turnMemoryPrimer.query, 160),
+      hitCount: turnMemoryPrimer.hitCount,
+      injected: Boolean(turnMemoryPrimer.text),
+      injectedBytes: turnMemoryPrimer.injectedBytes,
+      source: turnMemoryPrimer.source ?? null,
+      skippedReason: turnMemoryPrimer.skippedReason ?? null,
+    },
+  });
+
   // v0.5.19 Bug H + callModelInputFilter adoption — build the closure
-  // the SDK will invoke just before the LLM call. Reads the most
-  // recent awaiting_user_input event for this session; if it's an
-  // infra_error_recovery pause AND the user input looks like a retry
-  // intent, appends a [RETRY CONTEXT] system message that pins the
-  // failed call so the model re-issues the same call instead of
-  // re-planning. Honors CLEMMY_RETRY_CONTEXT_INJECT=off to revert.
-  const retryContextInputFilter = ((args: {
+  // the SDK will invoke just before the LLM call. It appends transient
+  // model-only context that should NOT persist into session history:
+  // (1) a per-turn memory primer from local FTS/hybrid recall, and
+  // (2) retry context for infra-error recovery. Honors
+  // CLEMMY_TURN_MEMORY_PRIMER=off and CLEMMY_RETRY_CONTEXT_INJECT=off.
+  const modelInputFilter = ((args: {
     modelData: { input: AgentInputItem[]; instructions?: string };
   }) => {
+    let modelData = args.modelData;
     try {
+      if (turnMemoryPrimer.text) {
+        modelData = {
+          input: [
+            ...modelData.input,
+            { role: 'system', content: turnMemoryPrimer.text } as AgentInputItem,
+          ],
+          instructions: modelData.instructions,
+        };
+      }
+
       if ((getRuntimeEnv('CLEMMY_RETRY_CONTEXT_INJECT', 'on') ?? 'on').toLowerCase() === 'off') {
-        return args.modelData;
+        return modelData;
       }
       const recentAwaiting = listEvents(options.sessionId, { types: ['awaiting_user_input'], limit: 1, desc: true });
       const last = recentAwaiting[recentAwaiting.length - 1];
       const lastData = last?.data as
         | { source?: string; retry_context?: Record<string, unknown> | null; boundaryKind?: string }
         | undefined;
-      if (lastData?.source !== 'infra_error_recovery' || !lastData.retry_context) return args.modelData;
+      if (lastData?.source !== 'infra_error_recovery' || !lastData.retry_context) return modelData;
       const userInputRaw = typeof options.input === 'string' ? options.input.trim() : '';
-      if (!/^(retry|yes|continue|resume|go|try again)$/i.test(userInputRaw)) return args.modelData;
+      if (!/^(retry|yes|continue|resume|go|try again)$/i.test(userInputRaw)) return modelData;
       const ctx = lastData.retry_context as {
         failed_tool?: string;
         failed_args?: string | null;
@@ -1803,18 +1965,18 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
           `\`ask_user_question\` to clarify — do not silently change resources or scope.`,
       } as AgentInputItem;
       return {
-        input: [...args.modelData.input, retryMsg],
-        instructions: args.modelData.instructions,
+        input: [...modelData.input, retryMsg],
+        instructions: modelData.instructions,
       };
     } catch {
-      return args.modelData; // best-effort
+      return modelData; // best-effort
     }
   });
 
   const opts: Record<string, unknown> = {
     context: { sessionId: options.sessionId, turn },
     maxTurns: options.maxTurns ?? maxTurnsForRole('orchestrator'),
-    callModelInputFilter: retryContextInputFilter,
+    callModelInputFilter: modelInputFilter,
     // v0.5.22 SDK 0.11.5 — cap parallel function-tool execution at 8.
     // Documented production incident pre-v0.5.20: the model emitted 50
     // parallel firecrawl_search calls and the resulting tool-result

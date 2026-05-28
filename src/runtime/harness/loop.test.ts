@@ -18,13 +18,23 @@
  * (returns a Node EventEmitter stub) and runRunner (synthesizes a
  * RunOutcome). That keeps the loop test fast and offline.
  */
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-harness-loop-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
+mkdirSync(path.join(TMP_HOME, 'vault', '02-Projects'), { recursive: true });
+writeFileSync(
+  path.join(TMP_HOME, 'vault', '02-Projects', 'salesforce-prospecting.md'),
+  [
+    '# Salesforce prospecting',
+    '',
+    'User has durable Salesforce prospecting context: prioritize stale untouched accounts, use Salesforce CLI data first, enrich with SEO signals, and draft careful outbound sequences only after reviewing the source account facts.',
+  ].join('\n'),
+  'utf-8',
+);
 
 // v0.5.19 F4 — the new default behavior on stall-retry exhaustion is
 // to convert into a synthetic `ask_user_question` (status flips to
@@ -347,6 +357,51 @@ test('previousResponseId is NOT passed to the SDK (codex requires full history e
   assert.equal(seenOpts.length, 2);
   assert.equal(seenOpts[0].previousResponseId, undefined, 'first turn never sets prior');
   assert.equal(seenOpts[1].previousResponseId, undefined, 'second turn also never sets prior — full history is inlined into items instead');
+});
+
+test('runTurn injects a transient memory primer before the first model response', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  let filteredInput: AgentInputItem[] = [];
+
+  const runRunner: RunRunnerFn = async (_runner, _agent, items, opts) => {
+    const filter = opts.callModelInputFilter as
+      | ((args: { modelData: { input: AgentInputItem[]; instructions?: string } }) => { input: AgentInputItem[]; instructions?: string })
+      | undefined;
+    assert.equal(typeof filter, 'function', 'expected harness to pass callModelInputFilter');
+    filteredInput = filter!({ modelData: { input: items, instructions: 'base instructions' } }).input;
+    return {
+      history: [
+        ...items,
+        { role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'ok' }] },
+      ],
+      lastResponseId: undefined,
+      finalOutput: 'ok',
+    };
+  };
+
+  await runTurn({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'can you help me with some Salesforce prospecting',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  const primer = filteredInput.find((item) =>
+    (item as { role?: unknown }).role === 'system'
+    && typeof (item as { content?: unknown }).content === 'string'
+    && ((item as { content: string }).content.includes('[MEMORY PRIMER]')),
+  ) as { content: string } | undefined;
+  assert.ok(primer, 'expected memory primer to be appended to model input');
+  assert.match(primer.content, /memory search ran/i);
+  assert.match(primer.content, /Salesforce prospecting/i);
+  assert.match(primer.content, /stale untouched accounts/i);
+
+  const primerEvents = listEvents(sess.id, { types: ['turn_memory_primer'] });
+  assert.equal(primerEvents.length, 1);
+  assert.equal(primerEvents[0].data.injected, true);
+  assert.ok((primerEvents[0].data.hitCount as number) > 0);
 });
 
 test('turn numbers monotonically increment across runs', async () => {
@@ -1451,6 +1506,68 @@ test('runConversation: stall triggers one auto-retry; retry success completes co
   const userInputs = listEventsForConv(sess.id, { types: ['user_input_received'] });
   assert.ok(userInputs.length >= 2, 'expected the retry to inject a synthetic user input');
   assert.match(userInputs[1].data.text as string, /OUTLOOK_LIST_MESSAGES/, 'retry message should inline the pre-resolved slug');
+});
+
+test('runConversation: existing-work stall retry forces focus and memory before asking user', async () => {
+  // Repro class from sess-mposxsah-8b67f103: the user referenced a
+  // known prior creative project ("gala silet acution animation post"),
+  // but the first model response asked for a file/path without trying
+  // focus or memory. On the retry, that shape should be treated as a
+  // reference to existing work, so ask_user_question is only allowed
+  // after focus/memory fail to find a target.
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const runner = scriptedRunner([
+    { finalOutput: 'I’ll edit the gala silent auction animation post now.' },
+    { finalOutput: 'I found the gala-reel project in memory and loaded it.' },
+  ]);
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'Hey can we work on edits for the gala silet acution animation post please',
+    makeRunner: makeRunnerStub,
+    runRunner: runner,
+  });
+
+  assert.equal(result.status, 'completed');
+  const userInputs = listEventsForConv(sess.id, { types: ['user_input_received'] });
+  assert.ok(userInputs.length >= 2, 'expected a synthetic stall-retry input');
+  const retryText = userInputs[1].data.text as string;
+  assert.match(retryText, /existing work/i);
+  assert.match(retryText, /gala silet acution animation post/i);
+  assert.match(retryText, /focus_get/);
+  assert.match(retryText, /memory_search or memory_recall/);
+  assert.doesNotMatch(
+    retryText,
+    /call ask_user_question instead of producing announcement text/,
+    'existing-work retry must not use the generic ask-user escape hatch first',
+  );
+});
+
+test('runConversation: fresh stall retry keeps generic ask-user fallback', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const runner = scriptedRunner([
+    { finalOutput: 'I’ll write a quick greeting now.' },
+    { finalOutput: 'Hello there.' },
+  ]);
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'write a quick greeting',
+    makeRunner: makeRunnerStub,
+    runRunner: runner,
+  });
+
+  assert.equal(result.status, 'completed');
+  const userInputs = listEventsForConv(sess.id, { types: ['user_input_received'] });
+  assert.ok(userInputs.length >= 2, 'expected a synthetic stall-retry input');
+  const retryText = userInputs[1].data.text as string;
+  assert.match(retryText, /call ask_user_question instead of producing announcement text/);
+  assert.doesNotMatch(retryText, /existing work/i);
+  assert.doesNotMatch(retryText, /memory_search or memory_recall/);
 });
 
 test('runConversation: stall retry that ALSO stalls falls through to sub_agent_stalled', async () => {

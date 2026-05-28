@@ -89,6 +89,11 @@ export const EVENT_TYPES = [
   // explain why a run saw a small external MCP surface instead of every
   // configured server tool.
   'mcp_tool_scope',
+  // Per-turn memory primer: emitted when the harness runs the local
+  // FTS memory lookup for the latest user message before the model call.
+  // The actual hits are injected transiently through callModelInputFilter
+  // so they do not bloat persisted conversation history.
+  'turn_memory_primer',
   // Planner-first gate: fresh complex requests get a read-only plan
   // proposal before the full external MCP surface is opened.
   'plan_first_started',
