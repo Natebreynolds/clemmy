@@ -479,7 +479,10 @@ export function renderConsoleHtml(token: string): string {
           <aside class="wf-list-pane">
             <div class="wf-list-head">
               <span>WORKFLOWS</span>
-              <span class="wf-new-btn" data-wf-new role="button" tabindex="0" title="Create new workflow" onclick="window.__clementineStartNewWorkflow && window.__clementineStartNewWorkflow();">＋ NEW</span>
+              <span class="wf-list-actions">
+                <button type="button" class="wf-home-btn" data-wf-home title="Workflow home">HOME</button>
+                <span class="wf-new-btn" data-wf-new role="button" tabindex="0" title="Create new workflow" onclick="window.__clementineStartNewWorkflow && window.__clementineStartNewWorkflow();">＋ NEW</span>
+              </span>
             </div>
             <ol class="wf-list" data-wf-list>
               <li class="empty">— loading —</li>
@@ -4902,6 +4905,26 @@ body {
 }
 .wf-chat-title { color: var(--fg); }
 .wf-chat-meta { color: var(--accent); font-size: 10px; }
+.wf-list-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.wf-home-btn {
+  display: inline-block;
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-3);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  padding: 3px 8px;
+  cursor: pointer;
+}
+.wf-home-btn:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
 .wf-chat-collapse {
   border: 1px solid var(--line);
   background: transparent;
@@ -5224,6 +5247,227 @@ body {
   white-space: pre;
   font-size: 11px;
   line-height: 1.45;
+}
+
+.wf-home {
+  height: 100%;
+  overflow-y: auto;
+  padding: 18px 20px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.wf-home-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: flex-start;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 14px;
+}
+.wf-home-head h2 {
+  margin: 0 0 6px;
+  color: var(--fg);
+  font-size: 16px;
+  letter-spacing: 0.04em;
+}
+.wf-home-head p {
+  margin: 0;
+  color: var(--fg-3);
+  font-size: 11px;
+  line-height: 1.5;
+  letter-spacing: 0;
+}
+.wf-home-head-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.wf-home-stats {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+.wf-home-stat {
+  border: 1px solid var(--line);
+  background: var(--bg-1);
+  padding: 10px 12px;
+  min-height: 64px;
+}
+.wf-home-stat span {
+  display: block;
+  color: var(--fg-3);
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  margin-bottom: 8px;
+}
+.wf-home-stat strong {
+  color: var(--fg);
+  font-size: 22px;
+  font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+  letter-spacing: 0;
+}
+.wf-home-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.wf-home-section-head {
+  color: var(--fg-3);
+  font-size: 10px;
+  letter-spacing: 0.18em;
+}
+.wf-agenda,
+.wf-recent-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.wf-agenda-day {
+  border: 1px solid var(--line);
+  background: var(--bg-1);
+}
+.wf-agenda-day-head {
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--line);
+  color: var(--fg-3);
+  font-size: 9px;
+  letter-spacing: 0.18em;
+}
+.wf-agenda-item,
+.wf-recent-run {
+  display: grid;
+  grid-template-columns: 74px minmax(0, 1fr) minmax(120px, 0.6fr) auto;
+  gap: 8px;
+  align-items: center;
+  padding: 8px 10px;
+  border-top: 1px solid var(--line);
+  font-size: 11px;
+  color: var(--fg-2);
+}
+.wf-agenda-day .wf-agenda-item:first-of-type { border-top: 0; }
+.wf-agenda-item.active {
+  border: 1px solid var(--line);
+  background: var(--bg-1);
+  border-left: 2px solid var(--accent-3);
+}
+.wf-agenda-time,
+.wf-recent-status {
+  color: var(--accent-3);
+  font-size: 9px;
+  letter-spacing: 0.16em;
+}
+.wf-agenda-title,
+.wf-recent-title {
+  color: var(--fg);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.wf-agenda-meta,
+.wf-recent-meta,
+.wf-recent-error {
+  color: var(--fg-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.wf-recent-run {
+  border: 1px solid var(--line);
+  background: var(--bg-1);
+}
+.wf-recent-run.ok { border-left: 2px solid var(--accent-2); }
+.wf-recent-run.err { border-left: 2px solid #e25656; }
+.wf-recent-run.run { border-left: 2px solid var(--accent-3); }
+.wf-recent-run.mute { opacity: 0.75; }
+.wf-home-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 10px;
+}
+.wf-home-card {
+  border: 1px solid var(--line);
+  background: var(--bg-1);
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.wf-home-card-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+.wf-home-card h3 {
+  margin: 0 0 5px;
+  color: var(--fg);
+  font-size: 13px;
+  letter-spacing: 0.03em;
+}
+.wf-home-card p {
+  margin: 0;
+  color: var(--fg-3);
+  font-size: 11px;
+  line-height: 1.45;
+  letter-spacing: 0;
+}
+.wf-home-pill {
+  align-self: flex-start;
+  border: 1px solid var(--line);
+  padding: 3px 6px;
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  color: var(--fg-3);
+  white-space: nowrap;
+}
+.wf-home-pill.on { color: var(--accent-2); border-color: var(--accent-2); }
+.wf-home-pill.off { color: var(--fg-mute); }
+.wf-home-pill.run { color: var(--accent-3); border-color: var(--accent-3); }
+.wf-home-card-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.wf-home-card-meta span {
+  border: 1px solid var(--line);
+  color: var(--fg-3);
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  padding: 3px 6px;
+}
+.wf-home-card-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.wf-home-card-actions button,
+.wf-home-mini {
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  padding: 6px 8px;
+  cursor: pointer;
+}
+.wf-home-card-actions button:hover,
+.wf-home-mini:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.wf-home-empty {
+  border: 1px dashed var(--line);
+  color: var(--fg-mute);
+  padding: 14px;
+  font-size: 11px;
+  text-align: center;
+  letter-spacing: 0.12em;
+}
+.wf-home-framework {
+  width: 100%;
+  margin-top: 0;
 }
 
 .wf-edit-head {
@@ -12327,6 +12571,9 @@ const CONSOLE_JS = `
   let wfSelectedName = null;
   let wfIsNew = false;
   let wfItems = [];
+  let wfHomeData = null;
+  let wfMode = 'home';
+  let wfHomePollTimer = null;
   let wfChatHistory = [];
   let wfChatBusy = false;
   // Set of step indices currently in edit mode. Cleared on workflow
@@ -12444,6 +12691,19 @@ const CONSOLE_JS = `
           ? rawTarget.parentElement
           : null;
       if (!target) return;
+      if (target.closest('[data-wf-home]')) {
+        event.preventDefault();
+        showWorkflowHome({ refresh: true });
+        return;
+      }
+      const homeAction = target.closest('[data-wf-home-action]');
+      if (homeAction) {
+        event.preventDefault();
+        const name = homeAction.getAttribute('data-wf-home-name');
+        const action = homeAction.getAttribute('data-wf-home-action');
+        handleWorkflowHomeAction(action, name);
+        return;
+      }
       const workflowSelect = target.closest('[data-wf-select]');
       const workflowRow = workflowSelect
         ? workflowSelect.closest('li[data-wf-name]')
@@ -12648,6 +12908,7 @@ const CONSOLE_JS = `
 
   function selectCronByName(name) {
     if (!name || !wf.editor) return;
+    stopWorkflowHomePolling();
     cronSelectedName = name;
     // Deselect any selected workflow — clicking a cron is a different
     // surface than the workflow editor; clear so the user sees the
@@ -12715,10 +12976,316 @@ const CONSOLE_JS = `
 
   window.__clementineSelectCron = selectCronByName;
 
-  function selectWorkflowByName(name) {
+  function workflowStatusClass(status) {
+    const s = String(status || '').toLowerCase();
+    if (s === 'completed') return 'ok';
+    if (s === 'error' || s === 'failed') return 'err';
+    if (s === 'running' || s === 'queued') return 'run';
+    if (s === 'cancelled') return 'mute';
+    return '';
+  }
+
+  function workflowRunLabel(run) {
+    if (!run) return 'no runs yet';
+    const status = String(run.status || 'unknown');
+    const when = run.finishedAt || run.startedAt || run.createdAt || '';
+    return status + (when ? ' · ' + fmtCronAgo(when) : '');
+  }
+
+  function workflowHomeDayLabel(day) {
+    if (!day) return 'unscheduled';
+    const today = new Date().toISOString().slice(0, 10);
+    const tomorrowDate = new Date();
+    tomorrowDate.setDate(tomorrowDate.getDate() + 1);
+    const tomorrow = tomorrowDate.toISOString().slice(0, 10);
+    if (day === today) return 'TODAY';
+    if (day === tomorrow) return 'TOMORROW';
+    try {
+      return new Date(day + 'T12:00:00').toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' }).toUpperCase();
+    } catch {
+      return day;
+    }
+  }
+
+  function renderWorkflowHome(data) {
+    if (!wf.editor) return;
+    scheduleWorkflowHomePolling(data);
+    const counts = (data && data.counts) || {};
+    const workflows = Array.isArray(data && data.workflows) ? data.workflows : [];
+    const activeRuns = Array.isArray(data && data.activeRuns) ? data.activeRuns : [];
+    const upcoming = Array.isArray(data && data.upcoming) ? data.upcoming : [];
+    const recentRuns = Array.isArray(data && data.recentRuns) ? data.recentRuns : [];
+    const upcomingByDay = upcoming.reduce((acc, item) => {
+      const day = item.day || (item.at || '').slice(0, 10) || 'later';
+      if (!acc[day]) acc[day] = [];
+      acc[day].push(item);
+      return acc;
+    }, {});
+    const dayKeys = Object.keys(upcomingByDay).sort();
+    const stats = [
+      { label: 'WORKFLOWS', value: counts.workflows || 0 },
+      { label: 'ACTIVE RUNS', value: counts.activeRuns || 0 },
+      { label: 'FAILED RECENT', value: counts.failedRecent || 0 },
+      { label: 'UPCOMING', value: counts.upcoming || 0 },
+    ].map((item) => [
+      '<div class="wf-home-stat">',
+      '  <span>' + escMem(item.label) + '</span>',
+      '  <strong>' + escMem(String(item.value)) + '</strong>',
+      '</div>',
+    ].join('')).join('');
+    const activeHtml = activeRuns.length
+      ? activeRuns.slice(0, 6).map((run) => [
+        '<div class="wf-agenda-item active">',
+        '  <span class="wf-agenda-time">' + escMem(String(run.status || 'RUNNING').toUpperCase()) + '</span>',
+        '  <span class="wf-agenda-title">' + escMem(run.workflowName || 'workflow') + '</span>',
+        run.inFlightStepId ? '  <span class="wf-agenda-meta">step ' + escMem(run.inFlightStepId) + '</span>' : '',
+        '  <button type="button" class="wf-home-mini" data-wf-home-action="runs" data-wf-home-name="' + escMem(run.workflowName || '') + '">VIEW</button>',
+        '</div>',
+      ].join('')).join('')
+      : '<div class="wf-home-empty">— no active workflow runs —</div>';
+    const agendaHtml = dayKeys.length
+      ? dayKeys.map((day) => [
+        '<div class="wf-agenda-day">',
+        '  <div class="wf-agenda-day-head">' + escMem(workflowHomeDayLabel(day)) + '</div>',
+        upcomingByDay[day].slice(0, 8).map((item) => [
+          '<div class="wf-agenda-item">',
+          '  <span class="wf-agenda-time">' + escMem(item.time || '—') + '</span>',
+          '  <span class="wf-agenda-title">' + escMem(item.workflowName || 'workflow') + '</span>',
+          '  <span class="wf-agenda-meta">' + escMem(humanizeCronExpression(item.schedule) || item.schedule || '') + '</span>',
+          '</div>',
+        ].join('')).join(''),
+        '</div>',
+      ].join('')).join('')
+      : '<div class="wf-home-empty">— no enabled workflows scheduled in the next 7 days —</div>';
+    const recentHtml = recentRuns.length
+      ? recentRuns.slice(0, 8).map((run) => [
+        '<div class="wf-recent-run ' + workflowStatusClass(run.status) + '">',
+        '  <span class="wf-recent-status">' + escMem(String(run.status || 'unknown').toUpperCase()) + '</span>',
+        '  <span class="wf-recent-title">' + escMem(run.workflow || 'workflow') + '</span>',
+        '  <span class="wf-recent-meta">' + escMem(workflowRunLabel(run)) + '</span>',
+        run.error ? '  <span class="wf-recent-error">' + escMem(String(run.error).slice(0, 120)) + '</span>' : '',
+        '</div>',
+      ].join('')).join('')
+      : '<div class="wf-home-empty">— no workflow run history yet —</div>';
+    const workflowCards = workflows.length
+      ? workflows.map((item) => {
+        const schedule = item.triggerSchedule ? (humanizeCronExpression(item.triggerSchedule) || item.triggerSchedule) : 'manual only';
+        const last = item.lastRun ? workflowRunLabel(item.lastRun) : 'no runs yet';
+        const status = item.activeRun ? 'ACTIVE' : (item.enabled ? 'ENABLED' : 'DISABLED');
+        return [
+          '<article class="wf-home-card">',
+          '  <div class="wf-home-card-head">',
+          '    <div>',
+          '      <h3>' + escMem(item.name) + '</h3>',
+          '      <p>' + escMem(item.description || 'No description yet.') + '</p>',
+          '    </div>',
+          '    <span class="wf-home-pill ' + (item.activeRun ? 'run' : item.enabled ? 'on' : 'off') + '">' + status + '</span>',
+          '  </div>',
+          '  <div class="wf-home-card-meta">',
+          '    <span>' + escMem(item.stepCount || 0) + ' steps</span>',
+          '    <span>' + escMem(schedule) + '</span>',
+          '    <span>' + escMem(last) + '</span>',
+          '  </div>',
+          '  <div class="wf-home-card-actions">',
+          '    <button type="button" data-wf-home-action="edit" data-wf-home-name="' + escMem(item.name) + '">EDIT WITH CLEMENTINE</button>',
+          '    <button type="button" data-wf-home-action="run" data-wf-home-name="' + escMem(item.name) + '">RUN</button>',
+          '    <button type="button" data-wf-home-action="toggle" data-wf-home-name="' + escMem(item.name) + '">' + (item.enabled ? 'DISABLE' : 'ENABLE') + '</button>',
+          '    <button type="button" data-wf-home-action="runs" data-wf-home-name="' + escMem(item.name) + '">VIEW RUNS</button>',
+          '  </div>',
+          '</article>',
+        ].join('');
+      }).join('')
+      : '<div class="wf-home-empty">— no workflows yet —</div>';
+
+    wf.editor.innerHTML = [
+      '<div class="wf-home">',
+      '  <div class="wf-home-head">',
+      '    <div>',
+      '      <h2>Workflow home</h2>',
+      '      <p>Plan, run, schedule, and edit long-running workflow frameworks from one place.</p>',
+      '    </div>',
+      '    <div class="wf-home-head-actions">',
+      '      <button type="button" class="wf-empty-btn" data-wf-home>REFRESH</button>',
+      '      <button type="button" class="wf-empty-btn primary" data-wf-new onclick="window.__clementineStartNewWorkflow && window.__clementineStartNewWorkflow();">＋ NEW WORKFLOW</button>',
+      '    </div>',
+      '  </div>',
+      '  <div class="wf-home-stats">' + stats + '</div>',
+      '  <section class="wf-home-section">',
+      '    <div class="wf-home-section-head">RUNNING NOW</div>',
+      '    <div class="wf-agenda">' + activeHtml + '</div>',
+      '  </section>',
+      '  <section class="wf-home-section">',
+      '    <div class="wf-home-section-head">AGENDA · NEXT 7 DAYS</div>',
+      '    <div class="wf-agenda">' + agendaHtml + '</div>',
+      '  </section>',
+      '  <section class="wf-home-section">',
+      '    <div class="wf-home-section-head">RECENT OUTCOMES</div>',
+      '    <div class="wf-recent-list">' + recentHtml + '</div>',
+      '  </section>',
+      '  <section class="wf-home-section">',
+      '    <div class="wf-home-section-head">WORKFLOW LIBRARY</div>',
+      '    <div class="wf-home-grid">' + workflowCards + '</div>',
+      '  </section>',
+      '  <section class="wf-framework-guide wf-home-framework">',
+      '    <div class="wf-framework-guide-head">BUILD OUTSIDE CLEMENTINE</div>',
+      '    <p>Create a repo or folder with a workflow <code>SKILL.md</code>. Clementine can import a single root workflow, <code>workflows/*/SKILL.md</code>, or <code>.clementine/workflows/*/SKILL.md</code>.</p>',
+      '    <pre>proposal-audit/\\n  SKILL.md\\n  references/\\n  scripts/</pre>',
+      '    <pre>---\\nname: proposal-audit\\ndescription: Build a branded SEO proposal audit.\\nenabled: true\\ntrigger: { manual: true }\\nallowed_tools:\\n  - read_file\\n  - write_file\\nsteps:\\n  - id: research\\n    allowedTools: [read_file]\\n  - id: build\\n    dependsOn: [research]\\n    uses_skill: proposal-builder\\nsynthesis:\\n  prompt: Return the finished file path and the client-ready summary.\\n---\\nMarkdown body here.\\n\\n## step: research\\nRead the inputs and gather the facts.\\n\\n## step: build\\nCreate the proposal artifact.</pre>',
+      '  </section>',
+      '</div>',
+    ].join('');
+  }
+
+  function stopWorkflowHomePolling() {
+    if (wfHomePollTimer) {
+      clearInterval(wfHomePollTimer);
+      wfHomePollTimer = null;
+    }
+  }
+
+  function scheduleWorkflowHomePolling(data) {
+    stopWorkflowHomePolling();
+    const activeCount = data && data.counts && Number(data.counts.activeRuns || 0);
+    if (wfMode !== 'home' || activeCount <= 0) return;
+    wfHomePollTimer = setInterval(() => {
+      if (wfMode !== 'home') {
+        stopWorkflowHomePolling();
+        return;
+      }
+      loadWorkflowHome({ silent: true });
+    }, 5000);
+  }
+
+  async function loadWorkflowHome(opts) {
+    if (!wf.editor) return;
+    if (!(opts && opts.silent)) {
+      wf.editor.innerHTML = '<div class="wf-empty"><div class="wf-empty-mark">↻</div><div class="wf-empty-text">Loading workflow home…</div></div>';
+    }
+    try {
+      wfHomeData = await fetchJSON('/api/console/workflows/home');
+      renderWorkflowHome(wfHomeData);
+    } catch (err) {
+      wf.editor.innerHTML = '<div class="wf-empty"><div class="wf-empty-mark">!</div><div class="wf-empty-text">' + escMem(err.message || err) + '</div></div>';
+    }
+  }
+
+  function resetWorkflowArchitectIntro() {
+    if (!wf.chatLog) return;
+    wf.chatLog.innerHTML = [
+      '<div class="wf-chat-intro">',
+      '<strong>Describe what you want and the Architect builds it.</strong><br>',
+      'The Architect drafts, refines, or critiques the workflow on the left. Click a starter below or type your own.',
+      '</div>',
+    ].join('');
+  }
+
+  function showWorkflowHome(opts) {
+    wfMode = 'home';
+    wfDraft = null;
+    wfSelectedName = null;
+    wfIsNew = false;
+    wfChatHistory = [];
+    wfEditingStepIndices.clear();
+    stopActiveRunPolling();
+    if (wf.list) Array.from(wf.list.querySelectorAll('li.wf')).forEach((el) => el.classList.remove('selected'));
+    resetWorkflowArchitectIntro();
+    syncArchitectChatChips();
+    if (opts && opts.refresh !== false) {
+      loadWorkflowHome();
+    } else if (wfHomeData) {
+      renderWorkflowHome(wfHomeData);
+    } else {
+      loadWorkflowHome();
+    }
+  }
+
+  function expandWorkflowArchitect() {
+    if (!wf.layout || !wf.chatToggle) return;
+    wf.layout.classList.remove('architect-collapsed');
+    wf.chatToggle.textContent = '⇥';
+    wf.chatToggle.title = 'Collapse architect';
+    try { localStorage.setItem('clementine.workflow.architectCollapsed', '0'); } catch (_) { /* private mode */ }
+  }
+
+  function primeArchitectForWorkflow(name) {
+    expandWorkflowArchitect();
+    wfChatHistory = [];
+    if (wf.chatLog) wf.chatLog.innerHTML = '';
+    appendChatMessage(
+      'assistant',
+      'I loaded "' + name + '". I can edit the schedule, steps, tools, inputs, skill bindings, or synthesis. What would you like me to change?',
+    );
+    if (wf.chatInput) wf.chatInput.focus();
+    syncArchitectChatChips();
+  }
+
+  async function queueWorkflowFromHome(name) {
+    const item = cachedWorkflowData(name);
+    if (item && item.inputs && Object.keys(item.inputs).length > 0) {
+      selectWorkflowByName(name);
+      appendChatMessage('assistant', 'I opened "' + name + '" so you can provide runtime inputs before running it.');
+      return;
+    }
+    try {
+      const r = await fetch(withToken('/api/console/workflows/' + encodeURIComponent(name) + '/run'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dryRun: false, inputs: {} }),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+      await loadWorkflowHome();
+      appendChatMessage('assistant', 'Queued "' + name + '" as workflow run ' + (j.id || '') + '.');
+    } catch (err) {
+      appendChatMessage('error', 'Could not queue "' + name + '": ' + (err.message || err));
+    }
+  }
+
+  async function toggleWorkflowFromHome(name) {
+    const item = cachedWorkflowData(name);
+    if (!item) return;
+    const next = !item.enabled;
+    try {
+      const r = await fetch(withToken('/api/console/workflows/' + encodeURIComponent(name) + '/set-enabled'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: next }),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+      await refreshWorkflowList({ skipReselect: true });
+      await loadWorkflowHome();
+    } catch (err) {
+      appendChatMessage('error', 'Could not update "' + name + '": ' + (err.message || err));
+    }
+  }
+
+  function handleWorkflowHomeAction(action, name) {
+    if (!name) return;
+    if (action === 'edit') {
+      selectWorkflowByName(name, { primeArchitect: true });
+      return;
+    }
+    if (action === 'run') {
+      queueWorkflowFromHome(name);
+      return;
+    }
+    if (action === 'toggle') {
+      toggleWorkflowFromHome(name);
+      return;
+    }
+    if (action === 'runs') {
+      selectWorkflowByName(name);
+    }
+  }
+
+  function selectWorkflowByName(name, opts) {
     if (!name || !wf.list) return;
+    wfMode = 'editor';
+    stopWorkflowHomePolling();
     wfSelectedName = name;
     wfIsNew = false;
+    cronSelectedName = null;
     const rows = Array.from(wf.list.querySelectorAll('li.wf'));
     rows.forEach((el) => el.classList.toggle('selected', el.getAttribute('data-wf-name') === name));
     if (wf.editor) {
@@ -12726,10 +13293,10 @@ const CONSOLE_JS = `
     }
     const cached = cachedWorkflowData(name);
     if (cached && Array.isArray(cached.steps)) {
-      setWorkflowDraftFromData(cached);
+      setWorkflowDraftFromData(cached, opts);
       return;
     }
-    loadWorkflow(name);
+    loadWorkflow(name, opts);
   }
 
   window.__clementineSelectWorkflow = selectWorkflowByName;
@@ -12761,6 +13328,9 @@ const CONSOLE_JS = `
       wfItems = items;
       if (items.length === 0) {
         wf.list.innerHTML = '<li class="empty">— no workflows — ＋ NEW to start —</li>';
+        if (!skipReselect) {
+          showWorkflowHome({ refresh: true });
+        }
         return;
       }
       wf.list.innerHTML = items.map((w) => {
@@ -12784,27 +13354,32 @@ const CONSOLE_JS = `
           '</li>',
         ].join('');
       }).join('');
-      if (skipReselect) return;
+      if (skipReselect) {
+        if (wfMode === 'home') loadWorkflowHome().catch((err) => console.error('workflow home refresh failed:', err));
+        return;
+      }
       const hashName = workflowNameFromHash();
       const nextSelection =
         hashName && items.some((item) => item.name === hashName) ? hashName
         : wfSelectedName && items.some((item) => item.name === wfSelectedName) ? wfSelectedName
-        : items[0]?.name;
+        : null;
       if (nextSelection) {
         selectWorkflowByName(nextSelection);
+      } else if (!wfDraft) {
+        showWorkflowHome({ refresh: true });
       }
     } catch (err) {
       wf.list.innerHTML = '<li class="empty">— failed: ' + escMem(err.message || err) + ' —</li>';
     }
   }
 
-  async function loadWorkflow(name) {
+  async function loadWorkflow(name, opts) {
     try {
       const cached = cachedWorkflowData(name);
       const data = cached && Array.isArray(cached.steps)
         ? cached
         : await fetchJSON('/api/console/workflows/' + encodeURIComponent(name));
-      setWorkflowDraftFromData(data);
+      setWorkflowDraftFromData(data, opts);
     } catch (err) {
       wf.editor.innerHTML = '<div class="wf-empty"><div class="wf-empty-mark">!</div><div class="wf-empty-text">' + escMem(err.message || err) + '</div></div>';
     }
@@ -12814,7 +13389,7 @@ const CONSOLE_JS = `
     return wfItems.find((item) => item && item.name === name);
   }
 
-  function setWorkflowDraftFromData(data) {
+  function setWorkflowDraftFromData(data, opts) {
     wfDraft = {
       name: data.name,
       description: data.description || '',
@@ -12841,9 +13416,14 @@ const CONSOLE_JS = `
     wfEditingStepIndices.clear();
     stopActiveRunPolling();
     renderEditor();
+    if (opts && opts.primeArchitect) {
+      primeArchitectForWorkflow(data.name || wfDraft.name);
+    }
   }
 
   function startNewWorkflow() {
+    wfMode = 'editor';
+    stopWorkflowHomePolling();
     wfSelectedName = null;
     wfIsNew = true;
     // Friendly starter template: a 3-step research-draft-synthesize
@@ -12897,6 +13477,8 @@ const CONSOLE_JS = `
       ].join('');
       return;
     }
+    wfMode = 'editor';
+    stopWorkflowHomePolling();
     const d = wfDraft;
     const stepIds = d.steps.map((s) => s.id);
     const head = [
@@ -13892,8 +14474,8 @@ const CONSOLE_JS = `
       if (!r.ok) return;
       wfDraft = null;
       wfSelectedName = null;
-      renderEditor();
-      refreshWorkflowList();
+      showWorkflowHome({ refresh: true });
+      refreshWorkflowList({ skipReselect: true });
     } catch (_) {}
   }
 

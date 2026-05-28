@@ -612,6 +612,156 @@ function validateWorkflowDefinition(data: WorkflowFrontmatter): WorkflowValidati
   return runValidator(data, { knownToolNames });
 }
 
+interface WorkflowRunRecordSummary {
+  id: string;
+  workflow: string;
+  status: string;
+  createdAt: string | null;
+  startedAt: string | null;
+  finishedAt: string | null;
+  source: string | null;
+  error: string | null;
+  targetStepId: string | null;
+}
+
+function stringField(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() ? value : null;
+}
+
+function normalizeWorkflowRunRecord(raw: Record<string, unknown>): WorkflowRunRecordSummary | null {
+  const id = stringField(raw.id);
+  const workflow = stringField(raw.workflow);
+  if (!id || !workflow) return null;
+  return {
+    id,
+    workflow,
+    status: stringField(raw.status) ?? 'unknown',
+    createdAt: stringField(raw.createdAt),
+    startedAt: stringField(raw.startedAt),
+    finishedAt: stringField(raw.finishedAt) ?? stringField(raw.completedAt),
+    source: stringField(raw.source),
+    error: stringField(raw.error),
+    targetStepId: stringField(raw.targetStepId),
+  };
+}
+
+function readWorkflowRunRecords(): WorkflowRunRecordSummary[] {
+  if (!fs.existsSync(WORKFLOW_RUNS_DIR)) return [];
+  const records: WorkflowRunRecordSummary[] = [];
+  for (const file of fs.readdirSync(WORKFLOW_RUNS_DIR)) {
+    if (!file.endsWith('.json')) continue;
+    try {
+      const raw = JSON.parse(fs.readFileSync(path.join(WORKFLOW_RUNS_DIR, file), 'utf-8')) as Record<string, unknown>;
+      const normalized = normalizeWorkflowRunRecord(raw);
+      if (normalized) records.push(normalized);
+    } catch {
+      // Malformed run records should not break the Workflows home page.
+    }
+  }
+  records.sort((a, b) => String(b.createdAt ?? b.startedAt ?? '').localeCompare(String(a.createdAt ?? a.startedAt ?? '')));
+  return records;
+}
+
+function expandCronField(field: string, min: number, max: number): number[] | null {
+  const values = new Set<number>();
+  const addRange = (start: number, end: number, step = 1): boolean => {
+    if (!Number.isInteger(start) || !Number.isInteger(end) || start < min || end > max || start > end || step < 1) return false;
+    for (let n = start; n <= end; n += step) values.add(n);
+    return true;
+  };
+  for (const part of field.split(',')) {
+    if (!part) return null;
+    if (part === '*') {
+      if (!addRange(min, max)) return null;
+      continue;
+    }
+    const stepMatch = part.match(/^(\*|\d+-\d+)\/(\d+)$/);
+    if (stepMatch) {
+      const step = Number.parseInt(stepMatch[2], 10);
+      if (stepMatch[1] === '*') {
+        if (!addRange(min, max, step)) return null;
+      } else {
+        const [a, b] = stepMatch[1].split('-').map((x) => Number.parseInt(x, 10));
+        if (!addRange(a, b, step)) return null;
+      }
+      continue;
+    }
+    const rangeMatch = part.match(/^(\d+)-(\d+)$/);
+    if (rangeMatch) {
+      if (!addRange(Number.parseInt(rangeMatch[1], 10), Number.parseInt(rangeMatch[2], 10))) return null;
+      continue;
+    }
+    if (/^\d+$/.test(part)) {
+      const n = Number.parseInt(part, 10);
+      if (n < min || n > max) return null;
+      values.add(n);
+      continue;
+    }
+    return null;
+  }
+  return Array.from(values).sort((a, b) => a - b);
+}
+
+function expandCronDow(field: string): number[] | null {
+  const raw = expandCronField(field, 0, 7);
+  if (!raw) return null;
+  return Array.from(new Set(raw.map((n) => (n === 7 ? 0 : n)))).sort((a, b) => a - b);
+}
+
+function formatLocalDate(date: Date): string {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+}
+
+export function upcomingWorkflowOccurrences(
+  workflows: ReturnType<typeof listWorkflows>,
+  now = new Date(),
+  daysAhead = 7,
+): Array<{ workflowName: string; at: string; day: string; time: string; schedule: string }> {
+  const out: Array<{ workflowName: string; at: string; day: string; time: string; schedule: string }> = [];
+  const start = new Date(now);
+  start.setSeconds(0, 0);
+  const end = new Date(start);
+  end.setDate(end.getDate() + daysAhead + 1);
+  end.setHours(23, 59, 59, 999);
+
+  for (const entry of workflows) {
+    const schedule = entry.data.trigger.schedule?.trim();
+    if (!entry.data.enabled || !schedule) continue;
+    const parts = schedule.split(/\s+/);
+    if (parts.length !== 5) continue;
+    const [minuteField, hourField, domField, monthField, dowField] = parts;
+    if (domField !== '*' || monthField !== '*') continue;
+    const minutes = expandCronField(minuteField, 0, 59);
+    const hours = expandCronField(hourField, 0, 23);
+    const dows = expandCronDow(dowField);
+    if (!minutes || !hours || !dows) continue;
+
+    for (let offset = 0; offset <= daysAhead; offset += 1) {
+      const day = new Date(start);
+      day.setDate(start.getDate() + offset);
+      const dow = day.getDay();
+      if (dowField !== '*' && !dows.includes(dow)) continue;
+      for (const hour of hours) {
+        for (const minute of minutes) {
+          const at = new Date(day);
+          at.setHours(hour, minute, 0, 0);
+          if (at < start || at > end) continue;
+          out.push({
+            workflowName: entry.data.name,
+            at: at.toISOString(),
+            day: formatLocalDate(at),
+            time: `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`,
+            schedule,
+          });
+        }
+      }
+    }
+  }
+
+  out.sort((a, b) => a.at.localeCompare(b.at));
+  return out.slice(0, 100);
+}
+
 
 export function registerConsoleRoutes(
   app: Express,
@@ -1242,6 +1392,92 @@ export function registerConsoleRoutes(
           whenToUse: entry.data.whenToUse ?? null,
         }));
       res.json({ workflows: items });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.get('/api/console/workflows/home', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const workflows = listWorkflows().sort((a, b) => a.data.name.localeCompare(b.data.name));
+      const runRecords = readWorkflowRunRecords();
+      const pending = listPendingRuns();
+      const workflowNameBySlug = new Map(workflows.map((entry) => [entry.name, entry.data.name]));
+      const activeByRunId = new Map<string, {
+        workflowName: string;
+        workflowSlug: string | null;
+        runId: string;
+        status: string;
+        lastEventAt: string | null;
+        inFlightStepId: string | null;
+      }>();
+
+      for (const run of pending) {
+        activeByRunId.set(run.runId, {
+          workflowName: workflowNameBySlug.get(run.workflowName) ?? run.workflowName,
+          workflowSlug: run.workflowName,
+          runId: run.runId,
+          status: 'running',
+          lastEventAt: run.lastEventAt ?? null,
+          inFlightStepId: run.inFlightStepId ?? null,
+        });
+      }
+      for (const run of runRecords) {
+        if (run.status !== 'queued' && run.status !== 'running') continue;
+        if (activeByRunId.has(run.id)) continue;
+        activeByRunId.set(run.id, {
+          workflowName: run.workflow,
+          workflowSlug: null,
+          runId: run.id,
+          status: run.status,
+          lastEventAt: run.startedAt ?? run.createdAt,
+          inFlightStepId: run.targetStepId,
+        });
+      }
+
+      const activeRuns = Array.from(activeByRunId.values())
+        .sort((a, b) => String(b.lastEventAt ?? '').localeCompare(String(a.lastEventAt ?? '')));
+      const recentRuns = runRecords.slice(0, 20);
+      const recentCutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+      const failedRecent = runRecords.filter((run) => {
+        if (run.status !== 'error' && run.status !== 'failed') return false;
+        const timestamp = Date.parse(run.finishedAt ?? run.startedAt ?? run.createdAt ?? '');
+        return Number.isFinite(timestamp) ? timestamp >= recentCutoff : true;
+      }).length;
+      const upcoming = upcomingWorkflowOccurrences(workflows, new Date(), 7);
+
+      const workflowSummaries = workflows.map((entry) => {
+        const runs = runRecords.filter((run) => run.workflow === entry.data.name || run.workflow === entry.name);
+        const activeRun = activeRuns.find((run) => run.workflowName === entry.data.name || run.workflowSlug === entry.name) ?? null;
+        return {
+          name: entry.data.name,
+          file: entry.layout === 'directory' ? `${entry.name}/SKILL.md` : `${entry.name}.md`,
+          description: entry.data.description,
+          enabled: entry.data.enabled,
+          triggerSchedule: entry.data.trigger.schedule ?? null,
+          stepCount: entry.data.steps.length,
+          inputCount: Object.keys(entry.data.inputs ?? {}).length,
+          hasSynthesis: !!entry.data.synthesis?.prompt,
+          activeRun,
+          lastRun: runs[0] ?? null,
+        };
+      });
+
+      res.json({
+        generatedAt: new Date().toISOString(),
+        counts: {
+          workflows: workflows.length,
+          enabled: workflows.filter((entry) => entry.data.enabled !== false).length,
+          activeRuns: activeRuns.length,
+          failedRecent,
+          upcoming: upcoming.length,
+        },
+        workflows: workflowSummaries,
+        activeRuns,
+        upcoming,
+        recentRuns,
+      });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
