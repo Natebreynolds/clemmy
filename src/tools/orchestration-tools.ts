@@ -23,6 +23,11 @@ import {
   ensureDir,
   textResult,
 } from './shared.js';
+import {
+  getWorkflowImportJob,
+  listRecentWorkflowImportJobs,
+  startWorkflowFrameworkImport,
+} from '../runtime/workflow-installer.js';
 
 interface CronJobRecord {
   name: string;
@@ -262,7 +267,7 @@ export function registerOrchestrationTools(server: McpServer): void {
 
   server.tool(
     'workflow_create',
-    "Create a recurring or multi-step automated workflow. Use this for ANY scheduled or repeated work (\"daily at 6pm\", \"every Monday morning\", \"when X happens, do Y\") INSTEAD of task_add (which is one-shot). A workflow is the WHAT (the steps); after this call, call workflow_schedule to set the cron — that's the WHEN. If the user describes a chain of actions that should happen on a trigger, this is the tool. Call workflow_list first if you want to see existing workflow shapes.",
+    "Create a recurring or multi-step automated workflow. Use this for ANY scheduled or repeated work (\"daily at 6pm\", \"every Monday morning\", \"when X happens, do Y\") INSTEAD of task_add (which is one-shot). A workflow is the WHAT (the steps); after this call, call workflow_schedule to set the cron — that's the WHEN. Steps with the same satisfied dependsOn run in parallel; use forEach for per-item fan-out. Call workflow_list first if you want to see existing workflow shapes.",
     {
       name: z.string().min(1),
       description: z.string().min(1),
@@ -273,6 +278,10 @@ export function registerOrchestrationTools(server: McpServer): void {
         model: z.string().optional(),
         tier: z.number().optional(),
         maxTurns: z.number().optional(),
+        useHarness: z.boolean().optional(),
+        forEach: z.string().optional(),
+        allowedTools: z.array(z.string()).optional(),
+        usesSkill: z.string().optional(),
       })).min(1),
       trigger_schedule: z.string().optional(),
       inputs: z.record(z.string(), z.object({
@@ -309,6 +318,10 @@ export function registerOrchestrationTools(server: McpServer): void {
           model: s.model,
           tier: s.tier,
           maxTurns: s.maxTurns,
+          useHarness: s.useHarness,
+          forEach: s.forEach,
+          allowedTools: s.allowedTools,
+          usesSkill: s.usesSkill,
         })),
         inputs: inputs && Object.keys(inputs).length > 0 ? inputs : undefined,
         synthesis: synthesis_prompt ? { prompt: synthesis_prompt } : undefined,
@@ -417,6 +430,10 @@ export function registerOrchestrationTools(server: McpServer): void {
         model: z.string().optional(),
         tier: z.number().optional(),
         maxTurns: z.number().optional(),
+        useHarness: z.boolean().optional(),
+        forEach: z.string().optional(),
+        allowedTools: z.array(z.string()).optional(),
+        usesSkill: z.string().optional(),
       })).optional(),
       trigger_schedule: z.string().optional(),
       clear_trigger_schedule: z.boolean().optional().describe('Pass true to remove an existing schedule (e.g. switch back to manual-only).'),
@@ -454,6 +471,10 @@ export function registerOrchestrationTools(server: McpServer): void {
           model: s.model,
           tier: s.tier,
           maxTurns: s.maxTurns,
+          useHarness: s.useHarness,
+          forEach: s.forEach,
+          allowedTools: s.allowedTools,
+          usesSkill: s.usesSkill,
         }));
       }
       if (inputs) next.inputs = inputs;
@@ -469,6 +490,63 @@ export function registerOrchestrationTools(server: McpServer): void {
 
       writeWorkflow(entry.name, next);
       return textResult(`Workflow "${name}" updated.`);
+    },
+  );
+
+  server.tool(
+    'workflow_import_framework',
+    'Import workflow framework packages from a local folder or GitHub repo. Discovers workflows/<name>/SKILL.md and .clementine/workflows/<name>/SKILL.md, preserves scripts/references/tests, and writes source metadata. Use dryRun=true first when reviewing third-party packages.',
+    {
+      source: z.string().min(1).describe('Local folder path, GitHub URL, git@github.com URL, owner/repo shorthand, or npx skills add owner/repo style reference.'),
+      dryRun: z.boolean().optional().describe('Preview discovered workflows without copying files. Default false.'),
+      overwrite: z.boolean().optional().describe('Replace existing framework files for same-named workflows, preserving runs/. Default false.'),
+    },
+    async ({ source, dryRun, overwrite }) => {
+      try {
+        const job = startWorkflowFrameworkImport(source, { dryRun, overwrite });
+        return textResult([
+          `Started workflow framework import ${job.id}.`,
+          `Status: ${job.status}`,
+          `Source: ${job.normalizedSource}`,
+          `Dry run: ${job.dryRun ? 'yes' : 'no'}`,
+          `Overwrite: ${job.overwrite ? 'yes' : 'no'}`,
+          'Call workflow_import_status with this job id for results.',
+        ].join('\n'));
+      } catch (err) {
+        return textResult(`Workflow import failed to start: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    },
+  );
+
+  server.tool(
+    'workflow_import_status',
+    'Check a workflow framework import job. Omit job_id to list recent import jobs.',
+    {
+      job_id: z.string().optional(),
+    },
+    async ({ job_id }) => {
+      if (!job_id) {
+        const recent = listRecentWorkflowImportJobs().slice(0, 10);
+        if (recent.length === 0) return textResult('No workflow import jobs yet.');
+        return textResult(recent.map((job) =>
+          `- ${job.id} [${job.status}] source=${job.normalizedSource} discovered=${job.discovered.length} installed=${job.installed.length} skipped=${job.skipped.length}`,
+        ).join('\n'));
+      }
+      const job = getWorkflowImportJob(job_id);
+      if (!job) return textResult(`No workflow import job found with id ${job_id}.`);
+      return textResult([
+        `Workflow import ${job.id}`,
+        `Status: ${job.status}`,
+        `Source: ${job.normalizedSource}`,
+        `Discovered: ${job.discovered.length}`,
+        ...job.discovered.map((item) => `  - ${item.name}: ${item.pathInSource}`),
+        `Installed: ${job.installed.length}`,
+        ...job.installed.map((item) => `  - ${item.name}: ${item.filePath}`),
+        `Skipped: ${job.skipped.length}`,
+        ...job.skipped.map((item) => `  - ${item.name}: ${item.reason}`),
+        job.error ? `Error: ${job.error}` : '',
+        job.output ? `\nLog:\n${job.output}` : '',
+      ].filter(Boolean).join('\n'));
     },
   );
 

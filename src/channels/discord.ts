@@ -119,6 +119,9 @@ const DISCORD_SLASH_COMMANDS = [
     .setName('sessions')
     .setDescription('Show active Clementine sessions and reattach this Discord thread.'),
   new SlashCommandBuilder()
+    .setName('approvals')
+    .setDescription('Show live pending Clementine approvals with action buttons.'),
+  new SlashCommandBuilder()
     .setName('help')
     .setDescription('Show the available Discord commands.'),
   new SlashCommandBuilder()
@@ -144,6 +147,10 @@ const DISCORD_SLASH_COMMANDS = [
         .setRequired(false),
     ),
 ].map((command) => command.toJSON());
+
+export function discordSlashCommandNamesForTest(): string[] {
+  return DISCORD_SLASH_COMMANDS.map((command) => String(command.name));
+}
 
 let discordClient: Client | null = null;
 let startPromise: Promise<void> | null = null;
@@ -868,6 +875,20 @@ function relevantHarnessApprovalsForContext(input: {
   return rows.filter((row) => row.channelId === input.channelId || !isDiscordHarnessRow(row));
 }
 
+function liveHarnessApprovalsForContext(input: {
+  channelId: string;
+  guildId?: string | null;
+}): approvalRegistry.PendingApprovalRow[] {
+  const rows = approvalRegistry.listPending({ status: 'pending' })
+    .filter((row) => approvalRegistry.isActionable(row));
+  const currentChannelRows = rows.filter((row) => row.channelId === input.channelId);
+  const globalWorkflowRows = rows.filter((row) => !isDiscordHarnessRow(row));
+  const merged = [...currentChannelRows, ...globalWorkflowRows];
+  return merged.filter((row, index) =>
+    merged.findIndex((candidate) => candidate.approvalId === row.approvalId) === index,
+  );
+}
+
 function renderHarnessApprovalList(approvals: approvalRegistry.PendingApprovalRow[]): string {
   if (approvals.length === 0) return '';
   return approvals
@@ -1416,6 +1437,42 @@ async function handleDiscordRestCommand(input: {
   }
 
   return false;
+}
+
+async function sendLiveApprovalsInteraction(
+  interaction: ChatInputCommandInteraction,
+  assistant: ClementineAssistant,
+): Promise<void> {
+  const runtimeApprovals = relevantApprovalsForContext({
+    userId: interaction.user.id,
+    channelId: interaction.channelId,
+    guildId: interaction.guildId,
+  }, assistant.getRuntime().listPendingApprovals());
+  const harnessApprovals = liveHarnessApprovalsForContext({
+    channelId: interaction.channelId,
+    guildId: interaction.guildId,
+  });
+
+  const summary = [
+    '**Live Clementine approvals**',
+    renderCombinedApprovalList(runtimeApprovals, harnessApprovals),
+  ].join('\n');
+  await interaction.reply({ content: summary.slice(0, 1900), ephemeral: true });
+
+  for (const approval of harnessApprovals.slice(0, 10)) {
+    await interaction.followUp({
+      content: renderHarnessApprovalCardContent(approval).slice(0, 1900),
+      components: buildApprovalActions(approval.approvalId),
+      ephemeral: true,
+    });
+  }
+  for (const approval of runtimeApprovals.slice(0, 10)) {
+    await interaction.followUp({
+      content: renderApprovalCardContent(approval).slice(0, 1900),
+      components: buildApprovalActions(approval.id),
+      ephemeral: true,
+    });
+  }
 }
 
 async function sendChunks(channel: Message['channel'], text: string, replyTo?: Message<boolean>): Promise<void> {
@@ -2159,6 +2216,7 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction, assi
           '`/tasks`',
           '`/runs`',
           '`/sessions`',
+          '`/approvals`',
           '`/focus action:<view|list|park|resume|clear> id:<n>`',
           '`/help`',
         ].join('\n'),
@@ -2251,6 +2309,11 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction, assi
           },
         },
       });
+      return;
+    }
+
+    if (interaction.commandName === 'approvals') {
+      await sendLiveApprovalsInteraction(interaction, assistant);
       return;
     }
 

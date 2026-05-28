@@ -501,6 +501,38 @@ export function renderConsoleHtml(token: string): string {
                 <button class="wf-empty-btn primary" data-wf-new onclick="window.__clementineStartNewWorkflow && window.__clementineStartNewWorkflow();">＋ NEW WORKFLOW</button>
                 <button class="wf-empty-btn" data-wf-empty-architect>ASK ARCHITECT TO DRAFT ONE →</button>
               </div>
+              <div class="wf-framework-guide">
+                <div class="wf-framework-guide-head">BUILD OUTSIDE CLEMENTINE</div>
+                <p>Create a repo or folder with a workflow <code>SKILL.md</code>. Clementine can import a single root workflow, <code>workflows/*/SKILL.md</code>, or <code>.clementine/workflows/*/SKILL.md</code>.</p>
+                <pre>proposal-audit/
+  SKILL.md
+  references/
+  scripts/</pre>
+                <pre>---
+name: proposal-audit
+description: Build a branded SEO proposal audit.
+enabled: true
+trigger: { manual: true }
+allowed_tools:
+  - read_file
+  - write_file
+steps:
+  - id: research
+    allowedTools: [read_file]
+  - id: build
+    dependsOn: [research]
+    uses_skill: proposal-builder
+synthesis:
+  prompt: Return the finished file path and the client-ready summary.
+---
+Markdown body here.
+
+## step: research
+Read the inputs and gather the facts.
+
+## step: build
+Create the proposal artifact.</pre>
+              </div>
             </div>
           </div>
 
@@ -5156,6 +5188,42 @@ body {
 .wf-empty-btn:hover { border-color: var(--accent); color: var(--accent); }
 .wf-empty-btn.primary { border-color: var(--accent); color: var(--accent); }
 .wf-empty-btn.primary:hover { background: var(--accent); color: var(--bg-0); }
+.wf-framework-guide {
+  width: min(620px, 100%);
+  margin-top: 10px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  background: var(--bg-1);
+  color: var(--fg-3);
+  text-align: left;
+  letter-spacing: 0;
+}
+.wf-framework-guide-head {
+  color: var(--fg);
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  margin-bottom: 8px;
+}
+.wf-framework-guide p {
+  margin: 0 0 10px;
+  font-size: 11px;
+  line-height: 1.55;
+}
+.wf-framework-guide code {
+  color: var(--fg);
+  font-size: 11px;
+}
+.wf-framework-guide pre {
+  margin: 8px 0 0;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  background: var(--bg-2);
+  color: var(--fg-2);
+  overflow-x: auto;
+  white-space: pre;
+  font-size: 11px;
+  line-height: 1.45;
+}
 
 .wf-edit-head {
   padding: 10px 14px;
@@ -7516,6 +7584,22 @@ body {
 .brain-graph-wrap .mem-graph-canvas { grid-column: 1 / 2; }
 .brain-graph-wrap .mem-graph-detail { grid-column: 2 / 3; grid-row: 2 / 3; }
 .brain-graph-wrap .mem-graph-legend  { grid-column: 1 / -1; }
+@media (max-width: 1040px) {
+  .brain-graph-wrap .mem-graph {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto minmax(360px, 1fr) auto;
+  }
+  .brain-graph-wrap .mem-graph-canvas {
+    grid-column: 1;
+  }
+  .brain-graph-wrap .mem-graph-detail {
+    grid-column: 1;
+    grid-row: auto;
+    border-left: 0;
+    border-top: 1px solid var(--line);
+    max-height: 220px;
+  }
+}
 
 .brain-meetings-wrap { height: calc(100vh - 240px); min-height: 480px; }
 .brain-meetings-wrap .mem-meetings { height: 100%; }
@@ -7674,7 +7758,8 @@ body {
 }
 .settings-layout {
   display: grid;
-  grid-template-columns: repeat(3, minmax(260px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(min(360px, 100%), 1fr));
+  grid-auto-flow: row dense;
   gap: 14px;
   height: 100%;
   overflow-y: auto;
@@ -7682,10 +7767,7 @@ body {
   padding: 14px;
 }
 .settings-col {
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-  overflow: visible;
+  display: contents;
 }
 .settings-col[hidden],
 .settings-block[hidden],
@@ -7695,12 +7777,31 @@ body {
 .settings-block {
   border: 1px solid var(--line);
   background: var(--bg-2);
+  min-width: 0;
 }
-@media (max-width: 1260px) {
-  .settings-layout { grid-template-columns: repeat(2, minmax(260px, 1fr)); }
+.settings-block[data-settings-tab-panel="memory"],
+.settings-block[data-settings-tab-panel="credentials"],
+.settings-block[data-settings-tab-panel="diagnostics"] {
+  grid-column: 1 / -1;
+}
+.settings-block-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+.settings-block-head > .creds-meta,
+.settings-block-head > [data-plan-proposals-meta],
+.settings-block-head > [data-proposals-meta],
+.settings-block-head > [data-checkins-meta],
+.settings-block-head > [data-creds-meta] {
+  margin-left: auto;
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  color: var(--fg-3);
+  text-transform: none;
 }
 @media (max-width: 840px) {
-  .settings-layout { grid-template-columns: 1fr; }
   .wf-layout,
   .wf-layout.architect-collapsed {
     grid-template-columns: 1fr;
@@ -7848,6 +7949,25 @@ body {
 .diag-summary strong { color: var(--fg); }
 .diag-section { padding: 10px 16px; border-bottom: 1px dashed var(--line); }
 .diag-section:last-child { border-bottom: 0; }
+.settings-block[data-diagnostics-panel] {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(320px, 100%), 1fr));
+  gap: 8px;
+  padding: 0 8px 8px;
+}
+.settings-block[data-diagnostics-panel] > .settings-block-head,
+.settings-block[data-diagnostics-panel] > .diag-summary {
+  grid-column: 1 / -1;
+  margin: 0 -8px;
+}
+.settings-block[data-diagnostics-panel] > .diag-section,
+.settings-block[data-diagnostics-panel] > .diag-section:last-child {
+  border: 1px solid var(--line);
+  background: var(--bg-1);
+  padding: 10px 12px;
+  margin: 0;
+  min-width: 0;
+}
 .diag-section-head {
   font-size: 10px;
   letter-spacing: 0.16em;
@@ -8017,6 +8137,32 @@ body {
 .settings-info .row .v { color: var(--fg); }
 .settings-info .row .v.on { color: var(--accent-2); }
 .settings-info .row .v.off { color: var(--fg-mute); }
+.settings-block[data-settings-tab-panel="memory"] .settings-info {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(200px, 100%), 1fr));
+  gap: 8px;
+  padding: 14px 16px;
+}
+.settings-block[data-settings-tab-panel="memory"] .settings-info .row,
+.settings-block[data-settings-tab-panel="memory"] .settings-info .row:last-child {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: flex-start;
+  gap: 4px;
+  border: 1px solid var(--line);
+  background: var(--bg-1);
+  padding: 10px 12px;
+}
+.settings-block[data-settings-tab-panel="memory"] .settings-info .row .k {
+  font-size: 9px;
+  letter-spacing: 0.16em;
+}
+.settings-block[data-settings-tab-panel="memory"] .settings-info .row .v {
+  font-size: 13px;
+  letter-spacing: 0.04em;
+  word-break: break-word;
+}
 .settings-note {
   margin: 10px 0 0;
   color: var(--fg-mute);
@@ -8422,19 +8568,24 @@ body {
   letter-spacing: 0.14em;
 }
 .creds-list {
-  padding: 0;
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(360px, 100%), 1fr));
+  gap: 10px;
+  padding: 12px 16px;
 }
 .cred-row {
-  padding: 12px 16px;
-  border-bottom: 1px solid var(--line);
+  padding: 12px;
+  border: 1px solid var(--line);
+  background: var(--bg-1);
   display: grid;
   grid-template-columns: 1fr auto;
   gap: 8px;
   align-items: start;
 }
-.cred-row:last-child { border-bottom: 0; }
+@media (max-width: 720px) {
+  .cred-row { grid-template-columns: 1fr; }
+  .cred-row .cred-actions { flex-direction: row; flex-wrap: wrap; min-width: 0; }
+}
 .cred-row .cred-main { min-width: 0; }
 .cred-row .cred-name {
   font-size: 11px;
@@ -12734,6 +12885,12 @@ const CONSOLE_JS = `
         '  <div class="wf-empty-actions">',
         '    <button class="wf-empty-btn primary" data-wf-new onclick="window.__clementineStartNewWorkflow && window.__clementineStartNewWorkflow();">＋ NEW WORKFLOW</button>',
         '    <button class="wf-empty-btn" data-wf-empty-architect>ASK ARCHITECT TO DRAFT ONE →</button>',
+        '  </div>',
+        '  <div class="wf-framework-guide">',
+        '    <div class="wf-framework-guide-head">BUILD OUTSIDE CLEMENTINE</div>',
+        '    <p>Create a repo or folder with a workflow <code>SKILL.md</code>. Clementine can import a single root workflow, <code>workflows/*/SKILL.md</code>, or <code>.clementine/workflows/*/SKILL.md</code>.</p>',
+        '    <pre>proposal-audit/\\n  SKILL.md\\n  references/\\n  scripts/</pre>',
+        '    <pre>---\\nname: proposal-audit\\ndescription: Build a branded SEO proposal audit.\\nenabled: true\\ntrigger: { manual: true }\\nallowed_tools:\\n  - read_file\\n  - write_file\\nsteps:\\n  - id: research\\n    allowedTools: [read_file]\\n  - id: build\\n    dependsOn: [research]\\n    uses_skill: proposal-builder\\nsynthesis:\\n  prompt: Return the finished file path and the client-ready summary.\\n---\\nMarkdown body here.\\n\\n## step: research\\nRead the inputs and gather the facts.\\n\\n## step: build\\nCreate the proposal artifact.</pre>',
         '  </div>',
         '</div>',
       ].join('');

@@ -783,12 +783,66 @@ async function executeStep(
   return output;
 }
 
+export function planWorkflowExecutionBatches(
+  steps: WorkflowStepInput[],
+  completedStepIds: Set<string> = new Set(),
+): WorkflowStepInput[][] {
+  const stepIds = new Set(steps.map((step) => step.id));
+  const pending = new Map(steps
+    .filter((step) => !completedStepIds.has(step.id))
+    .map((step) => [step.id, step]));
+  const batches: WorkflowStepInput[][] = [];
+  const completed = new Set(completedStepIds);
+
+  while (pending.size > 0) {
+    const ready = Array.from(pending.values()).filter((step) =>
+      (step.dependsOn ?? []).every((dep) => {
+        if (!stepIds.has(dep)) {
+          throw new Error(`Workflow step "${step.id}" depends on unknown step "${dep}".`);
+        }
+        return completed.has(dep);
+      }));
+
+    if (ready.length === 0) {
+      const blocked = Array.from(pending.values())
+        .map((step) => `${step.id} waits for ${(step.dependsOn ?? []).filter((dep) => !completed.has(dep)).join(', ') || '(unknown)'}`)
+        .join('; ');
+      throw new Error(`Workflow dependency graph is blocked or cyclic: ${blocked}`);
+    }
+
+    batches.push(ready);
+    for (const step of ready) {
+      pending.delete(step.id);
+      completed.add(step.id);
+    }
+  }
+
+  return batches;
+}
+
+function formatStepOutputs(steps: WorkflowStepInput[], stepOutputs: Record<string, unknown>): string {
+  return steps
+    .filter((step) => stepOutputs[step.id] !== undefined)
+    .map((step) => {
+      const out = stepOutputs[step.id];
+      return `## ${step.id}\n${typeof out === 'string' ? out : JSON.stringify(out, null, 2)}`;
+    })
+    .join('\n\n');
+}
+
+function parallelStepLabel(steps: WorkflowStepInput[]): string {
+  if (steps.length === 1) return steps[0].id;
+  const labels = steps.map((step) => step.id);
+  const preview = labels.slice(0, 3).join(' + ');
+  return labels.length > 3 ? `parallel: ${preview} + ${labels.length - 3} more` : `parallel: ${preview}`;
+}
+
 /**
- * Run the full step DAG to completion. Topological order is currently
- * file-declaration order; dependsOn is validated by the writer but
- * not yet enforced at runtime (single sequential pass works for the
- * existing workflows because authors list steps in dependency order).
- * Adding a topological sort here is a follow-up.
+ * Run the full step DAG to completion. Steps whose dependencies are
+ * already satisfied run in the same batch, capped by
+ * CLEMENTINE_WORKFLOW_CONCURRENCY. This is what makes workflow
+ * frameworks fast: normalize once, fan out independent research
+ * branches, then aggregate when all parents complete.
  */
 async function executeWorkflow(
   workflow: WorkflowDefinition,
@@ -810,26 +864,63 @@ async function executeWorkflow(
     ? workflow.steps.filter((s) => s.id === targetStepId)
     : workflow.steps;
 
-  for (let stepIndex = 0; stepIndex < steps.length; stepIndex++) {
-    const step = steps[stepIndex];
+  if (targetStepId) {
+    const step = steps[0];
+    if (!step) {
+      throw new Error(`Workflow step "${targetStepId}" not found.`);
+    }
     throwIfWorkflowRunCancelled(runId);
     if (stepOutputs[step.id] !== undefined) {
       // Already completed in a prior pass — use the cached output.
-      continue;
+    } else {
+      setWorkflowRunCurrentStep(runId, {
+        stepId: step.id,
+        index: 1,
+        total: 1,
+      });
+      const completedItems = resume.completedItems.get(step.id) ?? new Map();
+      const output = await executeStep(step, {
+        workflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems, forEachFailures,
+      });
+      throwIfWorkflowRunCancelled(runId);
+      stepOutputs[step.id] = output;
     }
-    // Update the heartbeat's view of the current step BEFORE executing
-    // so the next "still running" ping (if any) shows the right label.
-    setWorkflowRunCurrentStep(runId, {
-      stepId: step.id,
-      index: stepIndex + 1,
-      total: steps.length,
-    });
-    const completedItems = resume.completedItems.get(step.id) ?? new Map();
-    const output = await executeStep(step, {
-      workflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems, forEachFailures,
-    });
-    throwIfWorkflowRunCancelled(runId);
-    stepOutputs[step.id] = output;
+  } else {
+    let completedStepIds = new Set(Object.keys(stepOutputs));
+    while (completedStepIds.size < steps.length) {
+      const readyBatch = planWorkflowExecutionBatches(steps, completedStepIds)[0] ?? [];
+      const batch = readyBatch.slice(0, Math.max(1, RUNNER_CONCURRENCY));
+      const batchIndex = completedStepIds.size + 1;
+      setWorkflowRunCurrentStep(runId, {
+        stepId: parallelStepLabel(batch),
+        index: batchIndex,
+        total: steps.length,
+      });
+
+      const settled = await Promise.allSettled(batch.map(async (step) => {
+        throwIfWorkflowRunCancelled(runId);
+        const completedItems = resume.completedItems.get(step.id) ?? new Map();
+        const output = await executeStep(step, {
+          workflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems, forEachFailures,
+        });
+        return { step, output };
+      }));
+
+      const errors: string[] = [];
+      for (const result of settled) {
+        if (result.status === 'fulfilled') {
+          stepOutputs[result.value.step.id] = result.value.output;
+          completedStepIds.add(result.value.step.id);
+        } else {
+          errors.push(result.reason instanceof Error ? result.reason.message : String(result.reason));
+        }
+      }
+      throwIfWorkflowRunCancelled(runId);
+      if (errors.length > 0) {
+        throw new Error(errors.length === 1 ? errors[0] : `Workflow batch failed: ${errors.join('; ')}`);
+      }
+      completedStepIds = new Set(Object.keys(stepOutputs));
+    }
   }
   // Clear the step tracker before the synthesis pass + final cleanup
   // so the heartbeat doesn't keep showing the LAST step name after
@@ -846,9 +937,7 @@ async function executeWorkflow(
       kind: 'step_started',
       stepId: '__synthesis__',
     });
-    const stepOutputsAsText = Object.entries(stepOutputs)
-      .map(([id, out]) => `## ${id}\n${typeof out === 'string' ? out : JSON.stringify(out, null, 2)}`)
-      .join('\n\n');
+    const stepOutputsAsText = formatStepOutputs(workflow.steps, stepOutputs);
     const synthesisPrompt = renderTemplate(workflow.synthesis.prompt, inputs, stepOutputs);
     const response = await assistant.respond({
       sessionId: `workflow:${runId}:synthesis`,
@@ -865,9 +954,7 @@ async function executeWorkflow(
       output: finalOutput,
     });
   } else {
-    finalOutput = Object.entries(stepOutputs)
-      .map(([id, out]) => `## ${id}\n${typeof out === 'string' ? out : JSON.stringify(out, null, 2)}`)
-      .join('\n\n');
+    finalOutput = formatStepOutputs(workflow.steps, stepOutputs);
   }
 
   // Record string-coerced step outputs on the run record for the

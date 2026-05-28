@@ -35,6 +35,7 @@ process.env.CLEMENTINE_HOME = TMP_HOME;
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 const { sweepCrashedExecutions, sweepStaleBlockedExecutions } = await import('./store.js');
+const { appendEvent, createSession, resetEventLog } = await import('../runtime/harness/eventlog.js');
 
 const EXECUTIONS_FILE = path.join(TMP_HOME, 'state', 'executions.json');
 
@@ -76,13 +77,61 @@ test.after(() => {
 
 test('sweepCrashedExecutions: active with stale heartbeat is auto-failed', () => {
   seedExecutions([
-    baseExecution({ id: 'crashed', status: 'active', lastHeartbeatAt: nowMinusMinutes(10) }),
+    baseExecution({
+      id: 'crashed',
+      status: 'active',
+      lastHeartbeatAt: nowMinusMinutes(10),
+      updatedAt: nowMinusMinutes(10),
+      lastActivityAt: nowMinusMinutes(10),
+    }),
   ]);
   const swept = sweepCrashedExecutions();
   assert.equal(swept, 1);
   const after = readExecutions();
   assert.equal(after[0].status, 'completed');
   assert.match(String(after[0].blocker), /Controller heartbeat stalled/);
+});
+
+test('sweepCrashedExecutions: stale heartbeat but recent execution activity is left alone', () => {
+  seedExecutions([
+    baseExecution({
+      id: 'recent-activity',
+      status: 'active',
+      lastHeartbeatAt: nowMinusMinutes(10),
+      updatedAt: nowMinusMinutes(1),
+      lastActivityAt: nowMinusMinutes(1),
+    }),
+  ]);
+  const swept = sweepCrashedExecutions();
+  assert.equal(swept, 0);
+  const after = readExecutions();
+  assert.equal(after[0].status, 'active');
+});
+
+test('sweepCrashedExecutions: stale heartbeat but recent harness activity is left alone', () => {
+  resetEventLog();
+  createSession({ id: 'sess-recent-harness', kind: 'chat', title: 'recent harness' });
+  appendEvent({
+    sessionId: 'sess-recent-harness',
+    turn: 1,
+    role: 'assistant',
+    type: 'tool_returned',
+    data: { tool: 'run_shell_command' },
+  });
+  seedExecutions([
+    baseExecution({
+      id: 'recent-harness',
+      sessionId: 'sess-recent-harness',
+      status: 'active',
+      lastHeartbeatAt: nowMinusMinutes(10),
+      updatedAt: nowMinusMinutes(10),
+      lastActivityAt: nowMinusMinutes(10),
+    }),
+  ]);
+  const swept = sweepCrashedExecutions();
+  assert.equal(swept, 0);
+  const after = readExecutions();
+  assert.equal(after[0].status, 'active');
 });
 
 test('sweepCrashedExecutions: active with fresh heartbeat is left alone', () => {
@@ -117,7 +166,13 @@ test('sweepCrashedExecutions: blocked execution is NOT swept by the crash reaper
 
 test('sweepCrashedExecutions: custom threshold honored', () => {
   seedExecutions([
-    baseExecution({ id: 'mid', status: 'active', lastHeartbeatAt: nowMinusMinutes(2) }),
+    baseExecution({
+      id: 'mid',
+      status: 'active',
+      lastHeartbeatAt: nowMinusMinutes(2),
+      updatedAt: nowMinusMinutes(2),
+      lastActivityAt: nowMinusMinutes(2),
+    }),
   ]);
   // 60s threshold — 2-min-old heartbeat IS stale.
   const swept = sweepCrashedExecutions(60_000);

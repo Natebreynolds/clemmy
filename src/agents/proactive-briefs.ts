@@ -21,6 +21,7 @@ const URGENT_REPEAT_MINUTES = 4 * 60;
 interface ProactiveBriefState {
   lastBriefAt?: string;
   lastSignature?: string;
+  lastAttentionSignature?: string;
   lastTitle?: string;
   lastSummary?: string;
 }
@@ -61,13 +62,11 @@ export function isActiveBackgroundTaskForBrief(
   return true;
 }
 
-export function singleApprovalMetadataForBrief(approvals: PendingApprovalRow[]): Record<string, string> {
-  if (approvals.length !== 1) return {};
-  const approval = approvals[0];
+export function approvalSummaryMetadataForBrief(approvals: PendingApprovalRow[]): Record<string, unknown> {
+  if (approvals.length === 0) return {};
   return {
-    approvalId: approval.approvalId,
-    approvalSessionId: approval.sessionId,
-    approvalSubject: approval.subject,
+    approvalIds: approvals.map((approval) => approval.approvalId),
+    approvalSubjects: approvals.slice(0, 4).map((approval) => approval.subject),
   };
 }
 
@@ -135,14 +134,31 @@ function signatureFor(input: Record<string, unknown>): string {
   return createHash('sha256').update(JSON.stringify(input)).digest('hex').slice(0, 16);
 }
 
-function shouldSendBrief(state: ProactiveBriefState, signature: string, cadenceMinutes: number, urgent: boolean): boolean {
+export function shouldSendBrief(
+  state: ProactiveBriefState,
+  signature: string,
+  attentionSignature: string | undefined,
+  cadenceMinutes: number,
+  urgent: boolean,
+  nowMs = Date.now(),
+): boolean {
   if (!state.lastBriefAt) return true;
-  const elapsedMs = Date.now() - new Date(state.lastBriefAt).getTime();
-  if (state.lastSignature === signature) {
-    return urgent && elapsedMs >= Math.max(URGENT_REPEAT_MINUTES, cadenceMinutes * 60_000);
+  const elapsedMs = nowMs - new Date(state.lastBriefAt).getTime();
+  const repeatWindowMs = Math.max(URGENT_REPEAT_MINUTES, cadenceMinutes * 60_000);
+
+  if (urgent) {
+    if (attentionSignature && state.lastAttentionSignature === attentionSignature) {
+      return elapsedMs >= repeatWindowMs;
+    }
+    return true;
   }
-  if (urgent) return true;
+
+  if (state.lastSignature === signature) return false;
   return elapsedMs >= cadenceMinutes * 60_000;
+}
+
+function sortedBriefTuples(items: Array<Array<string | null | undefined>>): Array<Array<string | null | undefined>> {
+  return [...items].sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
 }
 
 export function getProactiveBriefState(): ProactiveBriefState {
@@ -236,12 +252,20 @@ export async function processProactiveBriefs(assistant: ClementineAssistant): Pr
     approvals: approvals.map((approval) => [approval.approvalId, approval.subject, approval.sessionId]),
     blockedGoals: blockedGoals.map((goal) => [goal.id, goal.title, goal.blockers?.[0]]),
   };
+  const attentionSignal = {
+    approvals: sortedBriefTuples(approvals.map((approval) => [approval.approvalId, approval.sessionId, approval.subject])),
+    blockedExecutions: sortedBriefTuples(blockedExecutions.map((execution) => [execution.id, execution.blocker])),
+    attentionTasks: sortedBriefTuples(attentionTasks.map((task) => [task.id, task.status, task.pendingApprovalId])),
+    recentFailures: sortedBriefTuples(recentFailures.map((task) => [task.id, task.status, task.error])),
+    blockedGoals: sortedBriefTuples(blockedGoals.map((goal) => [goal.id, goal.title, goal.blockers?.[0]])),
+  };
   const hasSignal = executions.length > 0 || activeTasks.length > 0 || recentFailures.length > 0 || approvals.length > 0 || blockedGoals.length > 0;
   if (!hasSignal) return;
 
   const state = loadState();
   const signature = signatureFor(signal);
-  if (!shouldSendBrief(state, signature, policy.briefCadenceMinutes, urgent)) return;
+  const attentionSignature = urgent ? signatureFor(attentionSignal) : undefined;
+  if (!shouldSendBrief(state, signature, attentionSignature, policy.briefCadenceMinutes, urgent)) return;
 
   const lines = [
     urgent
@@ -266,7 +290,7 @@ export async function processProactiveBriefs(assistant: ClementineAssistant): Pr
           }),
           ...(approvals.length > 4 ? [`- … +${approvals.length - 4} more pending.`] : []),
           approvals.length === 1
-            ? `Tap Approve, Edit, or Reject below — or reply \`approve ${approvals[0].approvalId}\` / \`reject ${approvals[0].approvalId}\`.`
+            ? `Reply \`approve ${approvals[0].approvalId}\` / \`reject ${approvals[0].approvalId}\`, or open the Approvals panel.`
             : 'Reply `approvals` to get individual approval cards, or open the Approvals panel.',
         ]
       : []),
@@ -297,12 +321,10 @@ export async function processProactiveBriefs(assistant: ClementineAssistant): Pr
   ].filter(Boolean);
 
   const now = new Date().toISOString();
-  const title = approvals.length > 0
-    ? 'Clementine needs approval'
-    : urgent
+  const title = urgent
       ? 'Clementine needs attention'
       : 'Clementine work update';
-  const approvalMetadata = singleApprovalMetadataForBrief(approvals);
+  const approvalMetadata = approvalSummaryMetadataForBrief(approvals);
 
   addNotification({
     id: `${Date.now()}-proactive-brief`,
@@ -318,6 +340,7 @@ export async function processProactiveBriefs(assistant: ClementineAssistant): Pr
       activeBackgroundTaskCount: activeTasks.length,
       pendingApprovalCount: approvals.length,
       blockedGoalCount: blockedGoals.length,
+      attentionSignature,
       ...approvalMetadata,
     },
   });
@@ -325,6 +348,7 @@ export async function processProactiveBriefs(assistant: ClementineAssistant): Pr
   saveState({
     lastBriefAt: now,
     lastSignature: signature,
+    lastAttentionSignature: attentionSignature ?? state.lastAttentionSignature,
     lastTitle: title,
     lastSummary: lines.slice(0, 8).join('\n'),
   });

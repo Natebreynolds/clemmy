@@ -317,6 +317,12 @@ export function sweepCrashedExecutions(staleAfterMs = 5 * 60 * 1000): number {
     if (!execution.lastHeartbeatAt) continue;
     const heartbeatTime = Date.parse(execution.lastHeartbeatAt);
     if (!Number.isFinite(heartbeatTime) || heartbeatTime > cutoff) continue;
+    const recordActivityTimes = [execution.lastActivityAt, execution.updatedAt]
+      .map((value) => Date.parse(value || ''))
+      .filter(Number.isFinite);
+    const recentRecordActivity = recordActivityTimes.length > 0 ? Math.max(...recordActivityTimes) : NaN;
+    if (Number.isFinite(recentRecordActivity) && recentRecordActivity > cutoff) continue;
+    if (hasRecentHarnessActivity(execution.sessionId, cutoff)) continue;
     // v0.5.19 Bug F fix — pause-aware sweep. If the execution's session
     // is legitimately parked on a user prompt (pending approval, recent
     // awaiting_user_input event from F4/Bug C), the heartbeat going
@@ -396,6 +402,18 @@ function isExecutionLegitimatelyIdle(execution: { sessionId: string }): boolean 
     // best-effort
   }
   return false;
+}
+
+function hasRecentHarnessActivity(sessionId: string, cutoff: number): boolean {
+  try {
+    const recent = listHarnessEvents(sessionId, { limit: 1, desc: true });
+    const latest = recent[0];
+    if (!latest) return false;
+    const eventTime = Date.parse(latest.createdAt);
+    return Number.isFinite(eventTime) && eventTime > cutoff;
+  } catch {
+    return false;
+  }
 }
 
 /**

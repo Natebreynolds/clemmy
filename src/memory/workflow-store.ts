@@ -214,7 +214,7 @@ function parseBody(body: string): ParsedBody {
   return { description_body, stepPrompts };
 }
 
-function readWorkflowFile(filePath: string): WorkflowDefinition | null {
+export function readWorkflowDefinitionFile(filePath: string): WorkflowDefinition | null {
   try {
     const raw = readFileSync(filePath, 'utf-8');
     const parsed = matter(raw);
@@ -305,7 +305,7 @@ export function migrateLegacyWorkflowsOnce(): string[] {
       try { unlinkSync(flatPath); } catch { /* best effort */ }
       continue;
     }
-    const def = readWorkflowFile(flatPath);
+    const def = readWorkflowDefinitionFile(flatPath);
     if (!def) continue;
     if (!existsSync(dirPath)) mkdirSync(dirPath, { recursive: true });
     writeWorkflowToDir(dirPath, def);
@@ -388,13 +388,13 @@ export function readWorkflow(name: string): WorkflowEntry | null {
   const dirPath = path.join(WORKFLOWS_DIR, name);
   const skillPath = path.join(dirPath, 'SKILL.md');
   if (existsSync(skillPath)) {
-    const data = readWorkflowFile(skillPath);
+    const data = readWorkflowDefinitionFile(skillPath);
     if (!data) return null;
     return { name, dir: dirPath, filePath: skillPath, layout: 'directory', data };
   }
   const flatPath = path.join(WORKFLOWS_DIR, `${name}.md`);
   if (existsSync(flatPath)) {
-    const data = readWorkflowFile(flatPath);
+    const data = readWorkflowDefinitionFile(flatPath);
     if (!data) return null;
     return { name, dir: WORKFLOWS_DIR, filePath: flatPath, layout: 'flat', data };
   }
@@ -420,7 +420,7 @@ export function listWorkflows(): WorkflowEntry[] {
     if (stat.isDirectory()) {
       const skillPath = path.join(fullPath, 'SKILL.md');
       if (!existsSync(skillPath)) continue;
-      const data = readWorkflowFile(skillPath);
+      const data = readWorkflowDefinitionFile(skillPath);
       if (!data) continue;
       seenNames.add(entry);
       entries.push({ name: entry, dir: fullPath, filePath: skillPath, layout: 'directory', data });
@@ -429,7 +429,7 @@ export function listWorkflows(): WorkflowEntry[] {
       // Skip the flat file if a directory of the same name already
       // exists — the directory wins.
       if (seenNames.has(name)) continue;
-      const data = readWorkflowFile(fullPath);
+      const data = readWorkflowDefinitionFile(fullPath);
       if (!data) continue;
       seenNames.add(name);
       entries.push({ name, dir: WORKFLOWS_DIR, filePath: fullPath, layout: 'flat', data });

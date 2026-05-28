@@ -34,7 +34,7 @@ writeFileSync(
 
 // Imports MUST come after the env var + file setup, since skill-store
 // resolves BASE_DIR at module load.
-const { applySkillToPrompt } = await import('./workflow-runner.js');
+const { applySkillToPrompt, planWorkflowExecutionBatches } = await import('./workflow-runner.js');
 
 test('applySkillToPrompt: no usesSkill returns prompt unchanged', () => {
   const out = applySkillToPrompt(
@@ -73,6 +73,54 @@ test('applySkillToPrompt: empty usesSkill string is treated as unset', () => {
     'do thing carefully',
   );
   assert.equal(out, 'do thing carefully');
+});
+
+test('planWorkflowExecutionBatches: fans out independent dependsOn branches', () => {
+  const batches = planWorkflowExecutionBatches([
+    { id: 'normalize', prompt: 'normalize' },
+    { id: 'site', prompt: 'site', dependsOn: ['normalize'] },
+    { id: 'seo', prompt: 'seo', dependsOn: ['normalize'] },
+    { id: 'reviews', prompt: 'reviews', dependsOn: ['normalize'] },
+    { id: 'aggregate', prompt: 'aggregate', dependsOn: ['site', 'seo', 'reviews'] },
+    { id: 'render', prompt: 'render', dependsOn: ['aggregate'] },
+  ]);
+
+  assert.deepEqual(
+    batches.map((batch) => batch.map((step) => step.id)),
+    [
+      ['normalize'],
+      ['site', 'seo', 'reviews'],
+      ['aggregate'],
+      ['render'],
+    ],
+  );
+});
+
+test('planWorkflowExecutionBatches: resumes after completed steps', () => {
+  const batches = planWorkflowExecutionBatches([
+    { id: 'normalize', prompt: 'normalize' },
+    { id: 'site', prompt: 'site', dependsOn: ['normalize'] },
+    { id: 'seo', prompt: 'seo', dependsOn: ['normalize'] },
+    { id: 'aggregate', prompt: 'aggregate', dependsOn: ['site', 'seo'] },
+  ], new Set(['normalize', 'site']));
+
+  assert.deepEqual(
+    batches.map((batch) => batch.map((step) => step.id)),
+    [
+      ['seo'],
+      ['aggregate'],
+    ],
+  );
+});
+
+test('planWorkflowExecutionBatches: rejects cyclic graphs', () => {
+  assert.throws(
+    () => planWorkflowExecutionBatches([
+      { id: 'a', prompt: 'a', dependsOn: ['b'] },
+      { id: 'b', prompt: 'b', dependsOn: ['a'] },
+    ]),
+    /blocked or cyclic/,
+  );
 });
 
 // Cleanup the temp BASE_DIR.

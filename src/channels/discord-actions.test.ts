@@ -11,7 +11,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { buildActionsForNotification } from './discord.js';
+import { buildActionsForNotification, discordSlashCommandNamesForTest } from './discord.js';
 
 function customIds(rows: ReturnType<typeof buildActionsForNotification>): string[] {
   if (!rows) return [];
@@ -66,4 +66,8 @@ test('buildActionsForNotification: planProposalId beats approvalId when both pre
 test('buildActionsForNotification: ignores non-string ids', () => {
   assert.equal(buildActionsForNotification({ planProposalId: 42 as unknown as string }), undefined);
   assert.equal(buildActionsForNotification({ approvalId: null as unknown as string }), undefined);
+});
+
+test('Discord slash commands include live approvals pull surface', () => {
+  assert.ok(discordSlashCommandNamesForTest().includes('approvals'));
 });

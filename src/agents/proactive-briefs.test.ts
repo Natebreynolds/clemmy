@@ -4,8 +4,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  approvalSummaryMetadataForBrief,
   isActiveBackgroundTaskForBrief,
-  singleApprovalMetadataForBrief,
+  shouldSendBrief,
 } from './proactive-briefs.js';
 import type { PendingApprovalRow } from '../runtime/harness/approval-registry.js';
 
@@ -45,12 +46,39 @@ test('brief task filter drops awaiting_approval tasks whose approval no longer e
   );
 });
 
-test('brief metadata exposes one approval id for Discord buttons only when unambiguous', () => {
-  assert.deepEqual(singleApprovalMetadataForBrief([approvalRow()]), {
-    approvalId: 'apr-live',
-    approvalSessionId: 'sess-live',
-    approvalSubject: 'Send the pending cold-prospect emails from the outreach sheet',
+test('brief metadata summarizes approvals without creating Discord action buttons', () => {
+  assert.deepEqual(approvalSummaryMetadataForBrief([approvalRow()]), {
+    approvalIds: ['apr-live'],
+    approvalSubjects: ['Send the pending cold-prospect emails from the outreach sheet'],
   });
-  assert.deepEqual(singleApprovalMetadataForBrief([]), {});
-  assert.deepEqual(singleApprovalMetadataForBrief([approvalRow(), approvalRow({ approvalId: 'apr-other' })]), {});
+  assert.deepEqual(approvalSummaryMetadataForBrief([]), {});
+  assert.deepEqual(approvalSummaryMetadataForBrief([approvalRow(), approvalRow({ approvalId: 'apr-other', subject: 'Second approval' })]), {
+    approvalIds: ['apr-live', 'apr-other'],
+    approvalSubjects: ['Send the pending cold-prospect emails from the outreach sheet', 'Second approval'],
+  });
+});
+
+test('brief dedupe suppresses same urgent attention when active work churns', () => {
+  const now = Date.parse('2026-05-28T04:40:00.000Z');
+  const recentState = {
+    lastBriefAt: new Date(now - 10 * 60_000).toISOString(),
+    lastSignature: 'old-active-work-signature',
+    lastAttentionSignature: 'same-approval',
+  };
+
+  assert.equal(
+    shouldSendBrief(recentState, 'new-active-work-signature', 'same-approval', 60, true, now),
+    false,
+  );
+  assert.equal(
+    shouldSendBrief(recentState, 'new-active-work-signature', 'different-approval', 60, true, now),
+    true,
+  );
+  assert.equal(
+    shouldSendBrief({
+      ...recentState,
+      lastBriefAt: new Date(now - 5 * 60 * 60_000).toISOString(),
+    }, 'new-active-work-signature', 'same-approval', 60, true, now),
+    true,
+  );
 });
