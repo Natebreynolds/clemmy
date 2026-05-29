@@ -50,6 +50,13 @@ jobs:
         working-directory: apps/desktop
         run: npm ci
 
+      - name: Install mobile-web deps
+        # package:dist runs build:mobile-web (tsc + vite), which needs
+        # apps/mobile-web's own deps (e.g. vite/client types). The other
+        # install steps don't cover this nested workspace.
+        working-directory: apps/mobile-web
+        run: npm ci
+
       - name: Verify release secrets
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
