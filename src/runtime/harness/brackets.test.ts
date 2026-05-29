@@ -423,7 +423,7 @@ test('confirm-first gate: off by default — batch passes when the flag is unset
   const prevConfirm = process.env.CLEMMY_CONFIRM_FIRST;
   const prevExecGate = process.env.CLEMMY_EXECUTION_GATE;
   process.env.HARNESS_TOOL_BRACKETS = 'on';
-  delete process.env.CLEMMY_CONFIRM_FIRST; // default off
+  process.env.CLEMMY_CONFIRM_FIRST = 'off'; // explicitly off (default flipped to on for release)
   process.env.CLEMMY_EXECUTION_GATE = 'off';
   resetEventLog();
   const sess = createSession({ kind: 'chat' });

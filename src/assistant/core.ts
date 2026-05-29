@@ -121,7 +121,7 @@ export class ClementineAssistant {
       : undefined;
     const executionPrompt = executionIntent ? buildExecutionPromptBlock(executionIntent, activeExecution) : '';
     const { memoryContext, retrievalText } = await assemblePromptContextAsync(request.sessionId, request.message, transcriptBeforeReply);
-    const instructions = buildAssistantInstructions(memoryContext, request.channel, messageIntent.intent);
+    const instructions = buildAssistantInstructions(memoryContext, request.channel, messageIntent.intent, request.message);
 
     const promptParts = [
       request.channel ? `Channel: ${request.channel}` : '',

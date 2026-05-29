@@ -43,6 +43,28 @@ test('detectBlockedSteps finds blocked results (object + JSON string), skips syn
   assert.equal(blocked.find((b) => b.stepId === 'b')?.reason, 'missing sheet id');
 });
 
+test('detectBlockedSteps catches PROSE blocks (root no longer missed)', () => {
+  const blocked = detectBlockedSteps({
+    a: 'Blocked the workflow step because the Google Drive connection is expired.',
+    b: { ok: true },
+    c: 'Could not find any results, but here is a summary.', // NOT a block (no block prefix)
+  });
+  const ids = blocked.map((x) => x.stepId);
+  assert.deepEqual(ids, ['a']);
+  assert.match(blocked[0].reason, /Drive connection is expired/);
+});
+
+test('detectBlockedSteps orders by stepOrder so the ROOT (earliest) is first', () => {
+  const stepOutputs = {
+    // detected in this object order, but DAG order is tracker → contact
+    select_best_contact: { blocked: true, reason: 'shell needs approval (a guess)' },
+    find_or_create_tracker: 'Blocked the workflow step because Drive is expired.',
+  };
+  const blocked = detectBlockedSteps(stepOutputs, ['find_or_create_tracker', 'select_best_contact']);
+  assert.equal(blocked[0].stepId, 'find_or_create_tracker'); // root first
+  assert.equal(blocked[1].stepId, 'select_best_contact');
+});
+
 test('humanizeStepOutput surfaces human content, not raw JSON', () => {
   assert.equal(humanizeStepOutput({ notified: true, body: 'Good morning, Nate.' }), 'Good morning, Nate.');
   assert.equal(humanizeStepOutput({ summary: 'Scanned 10 emails.' }), 'Scanned 10 emails.');

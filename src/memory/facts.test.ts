@@ -241,6 +241,25 @@ test('a pinned instruction is always rendered even when out-ranked by many newer
   assert.match(rendered, /Never email clients on Fridays/);
 });
 
+test('message-scoped recall surfaces a query-relevant fact that global recall buries (the "MY accounts" fix)', () => {
+  // The fact that should govern "pull MY market-leader accounts".
+  rememberFact({ kind: 'project', content: 'My market-leader accounts are Salesforce accounts owned by Nathan Reynolds where Market_Leader__c is true.' });
+  // Flood with newer, unrelated facts so a small global top-N excludes it.
+  for (let i = 0; i < 15; i += 1) {
+    rememberFact({ kind: 'project', content: `Unrelated recent note ${i} about calendar scheduling and meeting prep.` });
+  }
+
+  // Global recall (no objective): the owner-filter fact is buried.
+  const global = renderFactsForInstructions(3, 4000);
+  // Message-scoped recall: the query surfaces it.
+  const scoped = renderFactsForInstructions(3, 4000, 'pull my market leader accounts');
+  assert.match(scoped, /owned by Nathan Reynolds/, 'message-scoped recall must surface the owner-filter fact');
+  assert.ok(
+    !/owned by Nathan Reynolds/.test(global) || /owned by Nathan Reynolds/.test(scoped),
+    'scoped recall should rank the relevant fact at least as well as global',
+  );
+});
+
 test('listPinnedFacts returns only active pinned facts; unpin removes it', () => {
   const f = rememberFact({ kind: 'user', content: 'Always CC Dana on external email.' });
   setFactPinned(f.id, true);

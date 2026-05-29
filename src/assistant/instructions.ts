@@ -4,7 +4,7 @@ import { ASSISTANT_NAME, BASE_DIR, OWNER_NAME } from '../config.js';
 import type { MemoryContext } from '../types.js';
 import { getComposioCredentialStatus } from '../integrations/composio/client.js';
 import { renderFactsForInstructions } from '../memory/facts.js';
-import { getActiveObjective } from '../memory/focus.js';
+import { getRecallObjective } from '../memory/focus.js';
 import { renderProfileForInstructions } from '../runtime/user-profile.js';
 import { getProposalFeedback, renderProposalFeedback } from '../agents/proposal-feedback.js';
 import { renderMcpServersForInstructions } from '../runtime/mcp-config.js';
@@ -182,19 +182,22 @@ export function renderActionDisciplineDirective(intent?: MessageIntent): string 
   if (intent !== 'action' && intent !== 'tool_intent') return '';
   return [
     'Action discipline (this turn is editing / multi-step work):',
+    '- RESOLVE SCOPE BEFORE YOU QUERY OR MUTATE. If the request uses possessive or relative scope ("my", "our", "mine", "the usual", "again", or a bare person / account / project / list name) or is otherwise ambiguous about WHO or WHICH records it covers, do NOT guess. FIRST call memory_recall (scoped to the request) to resolve it — e.g. "my market-leader accounts" means accounts the user OWNS (Owner = the user / Nathan Reynolds), not every market-leader account; "the usual sheet" means a specific known sheet. If recall does not resolve the scope, ask ONE concise clarifying question before running the query or mutation. Never silently drop a scope filter (like an owner filter) or invent one.',
     '- Surface tradeoffs. If two interpretations of the request lead to materially different work, name them in one sentence and pick one — don\'t silently choose. Name your load-bearing assumptions inline rather than burying them in a diff.',
     '- Touch only what the request requires. Don\'t refactor adjacent code, fix unrelated formatting, or sneak in "while-I\'m-here" cleanups. Match the existing style even when you\'d write it differently. If you notice unrelated dead code, mention it, don\'t delete it.',
   ].join('\n');
 }
 
-export function buildAssistantInstructions(context: MemoryContext, channel?: string, intent?: MessageIntent): string {
+export function buildAssistantInstructions(context: MemoryContext, channel?: string, intent?: MessageIntent, message?: string): string {
   const owner = OWNER_NAME || 'the user';
   const goalsContext = buildGoalsContext();
   const integrationsContext = buildIntegrationsContext();
-  // Move 1 (scoped recall): scope persistent facts to the active focus
-  // so off-objective facts don't leak into the prompt. No focus / flag
-  // off → getActiveObjective() returns undefined → unchanged top-12.
-  const persistentFacts = renderFactsForInstructions(12, 1600, getActiveObjective());
+  // Scoped recall: scope persistent facts to the CURRENT MESSAGE blended
+  // with the active focus, so a per-turn query surfaces query-relevant
+  // facts (e.g. "pull MY market-leader accounts" surfaces the
+  // "accounts owned by Nathan Reynolds" fact and the owner filter sticks).
+  // No message+focus / flag off → undefined → unchanged global top-12.
+  const persistentFacts = renderFactsForInstructions(12, 1600, getRecallObjective(message));
   const userPreferences = renderProfileForInstructions();
   const channelDirective = renderChannelDirective(channel);
   const actionDirective = renderActionDisciplineDirective(intent);

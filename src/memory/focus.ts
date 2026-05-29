@@ -163,6 +163,24 @@ export function getActiveObjective(): string | undefined {
   }
 }
 
+/**
+ * Recall objective for a single turn = the CURRENT MESSAGE blended with the
+ * active focus. getActiveObjective() alone scopes recall to the focus, so a
+ * one-off chat query ("pull MY market-leader accounts") with no matching
+ * focus fell back to global top-N recall and never surfaced the query-
+ * relevant fact ("accounts owned by Nathan Reynolds"). Scoping to the
+ * message fixes that. Same CLEMMY_SCOPED_RECALL flag → off = undefined =
+ * today's global recall, byte-for-byte.
+ */
+export function getRecallObjective(message?: string): string | undefined {
+  const enabled = (getRuntimeEnv('CLEMMY_SCOPED_RECALL', 'on') ?? 'on').toLowerCase() !== 'off';
+  if (!enabled) return undefined;
+  const focus = getActiveObjective();
+  const parts = [message?.trim(), focus].filter((p): p is string => Boolean(p));
+  const joined = parts.join(' ').slice(0, 600).trim();
+  return joined || undefined;
+}
+
 export function getFocusById(id: number): FocusRow | null {
   const db = openMemoryDb();
   const row = db.prepare(`SELECT * FROM current_focus WHERE id=?`).get(id) as FocusRow | undefined;

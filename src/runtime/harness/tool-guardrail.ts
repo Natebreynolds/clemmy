@@ -323,7 +323,7 @@ export function evaluateToolCall(
       action: 'block',
       signature,
       toolName,
-      reason: `${toolName} called ${exactCount}× with identical args in recent window — strong signal of a model loop`,
+      reason: `Loop detected: ${toolName} has been called ${exactCount}× with IDENTICAL arguments and keeps failing/returning the same result. Repeating it will not help. STOP — do something different: change the arguments, try another tool/approach, or if you're blocked, report the specific blocker to the user. Do NOT call ${toolName} with these same arguments again.`,
       rule: 'exact_args_repeat',
       count: exactCount,
     };
@@ -384,7 +384,27 @@ export function evaluateToolCall(
 export function applyMode(decision: GuardrailDecision, mode: GuardrailMode = readMode()): GuardrailDecision {
   if (mode === 'off') return { ...decision, action: 'allow' };
   if (mode === 'strict') return decision;
-  // warn mode (default): demote block/halt to warn
+  // warn mode (default).
+  //
+  // An EXACT-args repeat (same tool, byte-identical args, ≥ block threshold)
+  // is hard-blocked even in the default mode — BUT ONLY for MUTATING tools.
+  // That's the dangerous runaway: 137× workflow_run with the same inputs,
+  // repeated sends, etc. — stopped at the source, agent forced to
+  // reconsider. READ/poll tools (workflow_run_status, list/get/search) are
+  // non-destructive, and repeating the identical call is LEGITIMATE
+  // (polling an async result, re-reading) — never block a poll; demote to
+  // warn. (A read loop wastes tokens but can't corrupt/spawn/send and is
+  // bounded by the turn's limits.)
+  if (
+    decision.action === 'block'
+    && decision.rule === 'exact_args_repeat'
+    && MUTATING_TOOLS.has(decision.toolName)
+  ) {
+    return decision;
+  }
+  // Everything else (read loops, and same-tool/different-args signals that
+  // may be legitimate varied/batch work) stays demoted to warn in the
+  // default mode; strict mode enforces them.
   if (decision.action === 'block' || decision.action === 'halt') {
     return { ...decision, action: 'warn' };
   }

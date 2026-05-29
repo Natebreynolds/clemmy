@@ -28,10 +28,12 @@ const {
 type RecallHandler = (input: Record<string, unknown>) => Promise<{ content: Array<{ type: 'text'; text: string }> }>;
 
 function captureRecallHandler(): RecallHandler {
+  // registerRecallTools now registers BOTH recall_tool_result and
+  // tool_output_query — capture by name so we grab the right one.
   let handler: RecallHandler | null = null;
   registerRecallTools({
-    tool: (_name: string, _description: string, _schema: unknown, cb: RecallHandler) => {
-      handler = cb;
+    tool: (name: string, _description: string, _schema: unknown, cb: RecallHandler) => {
+      if (name === 'recall_tool_result') handler = cb;
     },
   } as any);
   assert.ok(handler);

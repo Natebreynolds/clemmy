@@ -38,7 +38,7 @@ import { checkWorkflowForWrite } from './workflow-enforce.js';
 const logger = pino({ name: 'clementine-next.workflow-diagnosis' });
 
 export function selfHealEnabled(): boolean {
-  return (getRuntimeEnv('WORKFLOW_SELF_HEAL', 'off') ?? 'off').toLowerCase() === 'on';
+  return (getRuntimeEnv('WORKFLOW_SELF_HEAL', 'on') ?? 'on').toLowerCase() === 'on';
 }
 
 // ─── 1. Detect blocked steps ─────────────────────────────────────────
@@ -58,19 +58,44 @@ function coerceObject(raw: unknown): Record<string, unknown> | null {
   return v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
 }
 
+// A step agent is told to block via structured `{blocked:true}`, but it
+// sometimes returns a prose block instead ("Blocked the workflow step
+// because …"). Catch that too, or the ROOT block (e.g. an expired
+// connection in step 1) is missed and the Doctor diagnoses a downstream
+// symptom. Tight prefix match → minimal false positives (a normal step
+// returns structured data or a terse summary, not text starting with
+// "Blocked").
+const PROSE_BLOCK_RE = /^\s*(?:blocked\b|the (?:workflow )?step (?:is|was) blocked|step blocked\b)/i;
+
 /**
  * A step is "blocked" when its structured result carries `blocked:true`
- * (the explicit clean-block channel from STEP_INSTRUCTIONS). Synthesis
- * (`__synthesis__`) is excluded — it's a summary, not work.
+ * (the explicit clean-block channel) OR its prose output starts with a
+ * block declaration. Synthesis (`__synthesis__`) is excluded.
+ *
+ * When `stepOrder` (the DAG/execution order of step ids) is given, the
+ * result is sorted so the EARLIEST blocked step is first — that's the
+ * root cause; later blocks are usually cascades that inherited it.
  */
-export function detectBlockedSteps(stepOutputs: Record<string, unknown>): BlockedStep[] {
+export function detectBlockedSteps(
+  stepOutputs: Record<string, unknown>,
+  stepOrder?: string[],
+): BlockedStep[] {
   const blocked: BlockedStep[] = [];
   for (const [stepId, raw] of Object.entries(stepOutputs)) {
     if (stepId.startsWith('__')) continue;
     const obj = coerceObject(raw);
     if (obj && obj.blocked === true) {
       blocked.push({ stepId, reason: String(obj.reason ?? 'No reason was provided.').slice(0, 600) });
+    } else if (typeof raw === 'string' && PROSE_BLOCK_RE.test(raw.trim())) {
+      blocked.push({ stepId, reason: raw.trim().slice(0, 600) });
     }
+  }
+  if (stepOrder && stepOrder.length > 0) {
+    const rank = (id: string) => {
+      const i = stepOrder.indexOf(id);
+      return i < 0 ? Number.MAX_SAFE_INTEGER : i;
+    };
+    blocked.sort((a, b) => rank(a.stepId) - rank(b.stepId));
   }
   return blocked;
 }
@@ -95,7 +120,8 @@ export const WorkflowDiagnosisSchema = z.object({
 export type WorkflowDiagnosis = z.infer<typeof WorkflowDiagnosisSchema>;
 
 const DOCTOR_INSTRUCTIONS = [
-  'You are the Workflow Doctor. A step of an automated workflow blocked instead of completing. Diagnose WHY and propose ONE concrete fix.',
+  'You are the Workflow Doctor. A step of an automated workflow blocked instead of completing. Diagnose the ROOT cause and propose ONE concrete fix.',
+  'You are given the blocked steps in execution order — the FIRST is the ROOT (the earliest failure). Diagnose THAT one. Later steps usually just inherited the failure, and their stated reasons are often GUESSES or even wrong (a downstream agent may invent a plausible-sounding blocker like "shell needs approval" when the truth is "the upstream step never produced my input"). Trust the root step + the tool errors over downstream rationalizations.',
   'You are read-only: you do NOT call tools or change anything. You only produce the structured diagnosis. The fix is applied later, only if the user approves.',
   'Be concrete and plain-spoken — the summary and fix.description are shown directly to a non-engineer. No JSON, no tool-call jargon in those fields.',
   'Common root causes and the right fix kind:',

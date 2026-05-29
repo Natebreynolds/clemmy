@@ -7,6 +7,9 @@ import os from 'node:os';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-composio-tools-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
+// Legacy clip-and-recall path (LARGE_TOOL_OUTPUT_DIGEST ships on; digest
+// path covered by tool-output-digest.test.ts).
+process.env.LARGE_TOOL_OUTPUT_DIGEST = 'off';
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 import { test } from 'node:test';

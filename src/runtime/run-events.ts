@@ -30,7 +30,7 @@ export interface RunRecord {
   sessionId: string;
   userId?: string;
   channel?: string;
-  source?: 'discord' | 'webhook' | 'cli' | 'gateway' | 'daemon' | 'mobile';
+  source?: 'discord' | 'webhook' | 'cli' | 'gateway' | 'daemon' | 'mobile' | 'workflow';
   title: string;
   input: string;
   status: RunStatus;
