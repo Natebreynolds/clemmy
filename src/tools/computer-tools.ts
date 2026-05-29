@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { tool, type Tool } from '@openai/agents';
@@ -10,6 +10,9 @@ import { getWorkspaceDirs } from './shared.js';
 import { loadProactivityPolicy } from '../agents/proactivity-policy.js';
 import { needsApprovalFromTaxonomy } from '../agents/tool-taxonomy.js';
 import { findSafeCliCommand } from '../runtime/cli-discovery.js';
+import { formatRecallableToolText } from '../runtime/harness/tool-output-format.js';
+import { callIdFromToolDetails, sessionIdFromRunContext } from '../runtime/harness/tool-output-context.js';
+import { isSensitivePath, redactSensitiveText, shellCommandTouchesSensitiveData } from '../runtime/security.js';
 
 /**
  * Approval gate for SDK-native tools — delegates to the global
@@ -27,7 +30,7 @@ import { findSafeCliCommand } from '../runtime/cli-discovery.js';
 function resolveTargetPath(toolName: string, input: unknown): string | null {
   if (!input || typeof input !== 'object') return null;
   const obj = input as Record<string, unknown>;
-  const target = toolName === 'write_file'
+  const target = toolName === 'write_file' || toolName === 'read_file'
     ? (typeof obj.path === 'string' ? obj.path : '')
     : (typeof obj.cwd === 'string' && obj.cwd ? obj.cwd : process.cwd());
   if (!target) return null;
@@ -41,11 +44,11 @@ function resolveTargetPath(toolName: string, input: unknown): string | null {
 function inputIsInsideWorkspace(toolName: string, input: unknown): boolean {
   const resolved = resolveTargetPath(toolName, input);
   if (!resolved) return false;
-  // Auto-approve hint uses the narrow user-workspace list (no $HOME).
-  // The hard-boundary check in resolveAllowedPath() still uses the
-  // wider workspaceRoots() so explicit "save to ~/Documents/foo.txt"
-  // calls succeed once approved.
-  return userWorkspaceRoots().some((root) => isInside(root, resolved));
+  // Shell/execute auto-approval uses the narrow user-workspace list
+  // (no $HOME). write_file is Clementine's local artifact surface, so
+  // it uses the same allowed-root list as resolveAllowedPath().
+  const roots = toolName === 'write_file' ? workspaceRoots() : userWorkspaceRoots();
+  return roots.some((root) => isInside(root, resolved));
 }
 
 function inputIsInsideAgentOwnedDir(toolName: string, input: unknown): boolean {
@@ -157,6 +160,7 @@ function needsApprovalForShellSmart() {
   // truly catastrophic shapes (rm -rf /, sudo, shutdown).
   return async (runContext: unknown, input: unknown): Promise<boolean> => {
     const command = (input && typeof input === 'object' ? (input as Record<string, unknown>).command : undefined);
+    if (typeof command === 'string' && shellCommandTouchesSensitiveData(command)) return true;
     if (!shellCommandNeedsApproval(command)) return false;
     // Destructive pattern matched — still honor plan-scope so an
     // approved plan can pre-cover the whole thing.
@@ -164,7 +168,24 @@ function needsApprovalForShellSmart() {
   };
 }
 
-const MAX_COMMAND_OUTPUT_CHARS = 12000;
+function inputTargetsSensitivePath(toolName: string, input: unknown): boolean {
+  const resolved = resolveTargetPath(toolName, input);
+  return Boolean(resolved && isSensitivePath(resolved));
+}
+
+function needsApprovalForReadFile() {
+  return async (_runContext: unknown, input: unknown): Promise<boolean> => inputTargetsSensitivePath('read_file', input);
+}
+
+function needsApprovalForWriteFile() {
+  const base = needsApprovalUnlessInPlanScope('write_file');
+  return async (runContext: unknown, input: unknown): Promise<boolean> => {
+    if (inputTargetsSensitivePath('write_file', input)) return true;
+    return base(runContext, input);
+  };
+}
+
+const MAX_COMMAND_CAPTURE_CHARS = 200_000;
 const DEFAULT_TIMEOUT_MS = 30_000;
 
 function expandHome(input: string): string {
@@ -243,6 +264,10 @@ function resolveAllowedPath(input: string): string {
   return resolved;
 }
 
+function ensureTrailingNewline(content: string): string {
+  return content.endsWith('\n') ? content : `${content}\n`;
+}
+
 function resolveAllowedCwd(input?: string): string {
   // Default to BASE_DIR (~/.clementine-next) rather than process.cwd() or
   // os.homedir(). The daemon writes to BASE_DIR constantly, so macOS App
@@ -254,9 +279,11 @@ function resolveAllowedCwd(input?: string): string {
   return resolveAllowedPath(input?.trim() || BASE_DIR);
 }
 
-function truncateOutput(value: string, maxChars = MAX_COMMAND_OUTPUT_CHARS): string {
-  if (value.length <= maxChars) return value;
-  return `${value.slice(0, maxChars)}\n...[truncated ${value.length - maxChars} chars]`;
+function appendCapturedOutput(current: string, chunk: string): string {
+  if (current.length >= MAX_COMMAND_CAPTURE_CHARS) return current;
+  const next = current + chunk;
+  if (next.length <= MAX_COMMAND_CAPTURE_CHARS) return next;
+  return `${next.slice(0, MAX_COMMAND_CAPTURE_CHARS)}\n...[capture stopped after ${MAX_COMMAND_CAPTURE_CHARS} chars]`;
 }
 
 function assertCommandAllowed(command: string): void {
@@ -344,10 +371,10 @@ function runCommand(command: string, cwd: string, timeoutMs: number): Promise<st
     }, timeoutMs);
 
     child.stdout.on('data', (chunk) => {
-      stdout = truncateOutput(stdout + String(chunk));
+      stdout = appendCapturedOutput(stdout, String(chunk));
     });
     child.stderr.on('data', (chunk) => {
-      stderr = truncateOutput(stderr + String(chunk));
+      stderr = appendCapturedOutput(stderr, String(chunk));
     });
     child.on('error', (error) => {
       clearTimeout(timeout);
@@ -383,10 +410,10 @@ function runProcess(command: string, args: string[], cwd: string, timeoutMs: num
     }, timeoutMs);
 
     child.stdout.on('data', (chunk) => {
-      stdout = truncateOutput(stdout + String(chunk));
+      stdout = appendCapturedOutput(stdout, String(chunk));
     });
     child.stderr.on('data', (chunk) => {
-      stderr = truncateOutput(stderr + String(chunk));
+      stderr = appendCapturedOutput(stderr, String(chunk));
     });
     child.on('error', (error) => {
       clearTimeout(timeout);
@@ -418,11 +445,23 @@ function listDirectory(dir: string, limit: number): string {
 }
 
 export function getComputerTools(): Tool<RuntimeContextValue>[] {
+  const formatToolOutput = (toolName: string, runContext: unknown, details: unknown, output: string): string =>
+    formatRecallableToolText(redactSensitiveText(output), {
+      toolName,
+      sessionId: sessionIdFromRunContext(runContext),
+      callId: callIdFromToolDetails(details),
+    });
+
   const workspace_roots = tool({
     name: 'workspace_roots',
     description: 'List directories Clementine is allowed to inspect or operate in.',
     parameters: z.object({}),
-    execute: async () => workspaceRoots().map((root, index) => `${index + 1}. ${root}`).join('\n'),
+    execute: async (_input, runContext, details) => formatToolOutput(
+      'workspace_roots',
+      runContext,
+      details,
+      workspaceRoots().map((root, index) => `${index + 1}. ${root}`).join('\n'),
+    ),
   });
 
   const list_files = tool({
@@ -432,7 +471,12 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
       directory: z.string().nullable(),
       limit: z.number().min(1).max(500).nullable(),
     }),
-    execute: async ({ directory, limit }) => listDirectory(directory || process.cwd(), limit ?? 120),
+    execute: async ({ directory, limit }, runContext, details) => formatToolOutput(
+      'list_files',
+      runContext,
+      details,
+      listDirectory(directory || process.cwd(), limit ?? 120),
+    ),
   });
 
   const read_file = tool({
@@ -442,27 +486,58 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
       path: z.string().min(1),
       max_chars: z.number().min(1).max(50000).nullable(),
     }),
-    execute: async (input) => {
+    needsApproval: needsApprovalForReadFile(),
+    execute: async (input, runContext, details) => {
       const filePath = resolveAllowedPath(input.path);
       if (!existsSync(filePath)) return `File does not exist: ${filePath}`;
       if (!statSync(filePath).isFile()) return `Not a file: ${filePath}`;
-      return readFileSync(filePath, 'utf-8').slice(0, input.max_chars ?? 20000);
+      return formatToolOutput(
+        'read_file',
+        runContext,
+        details,
+        readFileSync(filePath, 'utf-8').slice(0, input.max_chars ?? 20000),
+      );
     },
   });
 
   const write_file = tool({
     name: 'write_file',
-    description: 'Write a UTF-8 file inside an allowed workspace. Requires approval because it modifies disk. Auto-approved if the session has an open PlanScope covering write_file.',
+    description: [
+      'Create, append to, or overwrite a UTF-8 file inside an allowed local workspace path.',
+      'mode=create or null creates a new file and refuses to replace an existing one.',
+      'mode=append appends content to the existing file, adding a newline boundary when needed.',
+      'mode=overwrite replaces the entire file; use only when the user asks to replace it or after reading the current file and preparing the full replacement.',
+      'Auto-approved for allowed local paths; destructive/system paths remain blocked by the path boundary.',
+    ].join('\n'),
     parameters: z.object({
       path: z.string().min(1),
       content: z.string(),
+      mode: z.enum(['create', 'append', 'overwrite']).nullable(),
     }),
-    needsApproval: needsApprovalUnlessInPlanScope('write_file'),
+    needsApproval: needsApprovalForWriteFile(),
     execute: async (input) => {
       const filePath = resolveAllowedPath(input.path);
+      const mode = input.mode ?? 'create';
       mkdirSync(path.dirname(filePath), { recursive: true });
-      writeFileSync(filePath, input.content.endsWith('\n') ? input.content : `${input.content}\n`, 'utf-8');
-      return `Wrote ${filePath} (${input.content.length} chars).`;
+      const exists = existsSync(filePath);
+      if (exists && !statSync(filePath).isFile()) return `Refused to write ${filePath}: target exists and is not a file.`;
+      const content = ensureTrailingNewline(input.content);
+
+      if (mode === 'append') {
+        const needsBoundary = exists && statSync(filePath).size > 0 && !readFileSync(filePath, 'utf-8').endsWith('\n');
+        appendFileSync(filePath, `${needsBoundary ? '\n' : ''}${content}`, 'utf-8');
+        return `Appended ${filePath} (${input.content.length} chars).`;
+      }
+
+      if (mode === 'create' && exists) {
+        return [
+          `Refused to overwrite existing file: ${filePath}.`,
+          'Use mode="append" to add content, or mode="overwrite" only after reading the file and preparing the full replacement.',
+        ].join(' ');
+      }
+
+      writeFileSync(filePath, content, 'utf-8');
+      return `${mode === 'overwrite' ? 'Overwrote' : 'Wrote'} ${filePath} (${input.content.length} chars).`;
     },
   });
 
@@ -479,9 +554,14 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
       timeout_ms: z.number().min(1000).max(120000).nullable(),
     }),
     needsApproval: needsApprovalForShellSmart(),
-    execute: async (input) => {
+    execute: async (input, runContext, details) => {
       const cwd = resolveAllowedCwd(input.cwd ?? undefined);
-      return runCommand(input.command, cwd, input.timeout_ms ?? DEFAULT_TIMEOUT_MS);
+      return formatToolOutput(
+        'run_shell_command',
+        runContext,
+        details,
+        await runCommand(input.command, cwd, input.timeout_ms ?? DEFAULT_TIMEOUT_MS),
+      );
     },
   });
 
@@ -491,13 +571,18 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
     parameters: z.object({
       cwd: z.string().nullable(),
     }),
-    execute: async ({ cwd }) => {
+    execute: async ({ cwd }, runContext, details) => {
       const git = findSafeCliCommand('git');
       if (!git || git.skipped) {
         const reason = git?.skipped ? git.reason : 'git was not found on PATH.';
         return `Git is unavailable: ${reason} Install Xcode Command Line Tools or a standalone Git binary to use git_status.`;
       }
-      return runProcess(git.command, ['status', '--short', '--branch'], resolveAllowedCwd(cwd ?? undefined), 10_000);
+      return formatToolOutput(
+        'git_status',
+        runContext,
+        details,
+        await runProcess(git.command, ['status', '--short', '--branch'], resolveAllowedCwd(cwd ?? undefined), 10_000),
+      );
     },
   });
 

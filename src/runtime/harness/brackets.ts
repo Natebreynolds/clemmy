@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { isKillRequested, appendEvent, getSession } from './eventlog.js';
+import { isKillRequested, appendEvent, getSession, listEvents } from './eventlog.js';
 import { getHarnessBudgetSettings } from './budget-settings.js';
 import { listPending as listPendingApprovals } from './approval-registry.js';
 import { evaluateToolCall, applyMode } from './tool-guardrail.js';
@@ -8,6 +8,12 @@ import {
   isGateEnabled as isExecutionGateEnabled,
   MissingExecutionWrapError,
 } from './execution-gate.js';
+import {
+  classifyExternalWrite,
+  decideInstructionReview,
+  isConfirmFirstEnabled,
+  ConfirmFirstRequiredError,
+} from './confirm-first-gate.js';
 
 /**
  * Reliability brackets — the safety primitives the harness loop weaves
@@ -639,6 +645,87 @@ export function wrapToolForHarness<T extends WrappableTool>(
       // eslint-disable-next-line no-console
       console.warn('[harness] execution-wrap gate threw (fail-open)', err instanceof Error ? err.message : err);
     }
+    // 2d. Confirm-first gate — a BATCH of same-shape external writes
+    // needs an instruction-reviewed plan scope before it proceeds. Runs
+    // for chat sessions only and aggregates across workers (they share
+    // ctx.sessionId via AsyncLocalStorage). Counts durable external_write
+    // events the gate itself emits, so worker writes are counted even if
+    // they don't log tool_called under the parent session.
+    try {
+      if (isConfirmFirstEnabled()) {
+        const sessionRow = getSession(ctx.sessionId);
+        if (sessionRow?.kind === 'chat') {
+          const shape = classifyExternalWrite(tool.name, parsedInput);
+          if (shape.mutating && shape.shapeKey) {
+            // Count prior same-shape writes already allowed this session.
+            let prior = 0;
+            try {
+              for (const ev of listEvents(ctx.sessionId, { types: ['external_write'] })) {
+                const d = ev.data as { shapeKey?: string } | undefined;
+                if (d?.shapeKey === shape.shapeKey) prior += 1;
+              }
+            } catch { /* count is best-effort; fail toward not-a-batch */ }
+
+            const { loadProactivityPolicy } = await import('../../agents/proactivity-policy.js');
+            const threshold = loadProactivityPolicy().batchConfirmThreshold;
+            const review = decideInstructionReview({ priorSameShapeCount: prior, threshold });
+
+            // An instruction-reviewed plan scope satisfies the gate.
+            const { getPlanScope } = await import('../../agents/plan-scope.js');
+            const scope = getPlanScope(ctx.sessionId);
+            const hasReviewedScope = !!scope && !scope.closedAt;
+
+            if (review.required && !hasReviewedScope) {
+              try {
+                appendEvent({
+                  sessionId: ctx.sessionId,
+                  turn: 0,
+                  role: 'system',
+                  type: 'guardrail_tripped',
+                  data: {
+                    kind: 'confirm_first_required',
+                    toolName: tool.name,
+                    shapeKey: shape.shapeKey,
+                    count: review.count,
+                    threshold,
+                    irreversible: shape.irreversible,
+                  },
+                });
+              } catch { /* telemetry write must never block */ }
+              throw new ConfirmFirstRequiredError({
+                toolName: tool.name,
+                shapeKey: shape.shapeKey,
+                count: review.count,
+                threshold,
+                sessionId: ctx.sessionId,
+              });
+            }
+
+            // Allowed through — record the write so subsequent same-shape
+            // calls (including worker fan-out) count toward the batch.
+            try {
+              appendEvent({
+                sessionId: ctx.sessionId,
+                turn: 0,
+                role: 'system',
+                type: 'external_write',
+                data: {
+                  shapeKey: shape.shapeKey,
+                  toolName: tool.name,
+                  irreversible: shape.irreversible,
+                  count: review.count,
+                  underScope: hasReviewedScope,
+                },
+              });
+            } catch { /* telemetry write must never block */ }
+          }
+        }
+      }
+    } catch (err) {
+      if (err instanceof ConfirmFirstRequiredError) throw err;
+      // eslint-disable-next-line no-console
+      console.warn('[harness] confirm-first gate threw (fail-open)', err instanceof Error ? err.message : err);
+    }
     // (sessionId arg is unused — included for future per-session
     // behavior without forcing callers to refactor.)
     void sessionId;
@@ -691,6 +778,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
         // the harness exploding on a guardrail decision.
         if (
           err instanceof MissingExecutionWrapError ||
+          err instanceof ConfirmFirstRequiredError ||
           err instanceof ToolGuardrailBlocked ||
           err instanceof ToolCallsLimitExceeded
         ) {

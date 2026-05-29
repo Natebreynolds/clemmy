@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { AuthMode, Models } from './types.js';
+import { isStrongLocalSecret } from './runtime/security.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -45,6 +46,26 @@ const env = Object.assign({}, ...ACTIVE_ENV_FILES.map((filePath) => parseEnvFile
 
 function getEnv(key: string, fallback = ''): string {
   return process.env[key] ?? env[key] ?? fallback;
+}
+
+function parseCsvEnv(value: string): string[] {
+  return value
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
+export function normalizeWebhookHost(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed || trimmed === 'localhost') return '127.0.0.1';
+  if (trimmed === '::1') return '::1';
+  if (trimmed === '0.0.0.0' || trimmed === '::') return trimmed;
+  if (/^[A-Za-z0-9.-]+$/.test(trimmed) || /^[0-9a-f:.]+$/i.test(trimmed)) return trimmed;
+  return '127.0.0.1';
+}
+
+export function isLoopbackWebhookHost(host: string): boolean {
+  return host === '127.0.0.1' || host === '::1' || host === 'localhost';
 }
 
 export function getRuntimeEnv(key: string, fallback = ''): string {
@@ -166,11 +187,14 @@ export function getModelSettingsSnapshot(): {
 export const VAULT_DIR = path.join(BASE_DIR, 'vault');
 export const WEBHOOK_ENABLED = getEnv('WEBHOOK_ENABLED', 'false').toLowerCase() === 'true';
 export const WEBHOOK_PORT = parseInt(getEnv('WEBHOOK_PORT', '8420'), 10);
+export const WEBHOOK_HOST = normalizeWebhookHost(getEnv('WEBHOOK_HOST', '127.0.0.1'));
+export const WEBHOOK_ALLOW_LAN = getEnv('WEBHOOK_ALLOW_LAN', 'false').toLowerCase() === 'true';
 // Vault first — matches CompositeSecretStore precedence (vault → env).
 // Previously env beat vault, which masked freshly-saved values when a
 // stale .env was present. (Observed 2026-05-23 for composio_api_key;
 // applied here for symmetry across all secrets.)
 export const WEBHOOK_SECRET = readSecretFromFileVaultSync('webhook_secret') || getEnv('WEBHOOK_SECRET', '') || '';
+export const WEBHOOK_SECRET_IS_STRONG = isStrongLocalSecret(WEBHOOK_SECRET);
 export const DISCORD_ENABLED = getEnv('DISCORD_ENABLED', 'false').toLowerCase() === 'true';
 // When true, Discord routes incoming messages through the 0.3 harness
 // (Orchestrator + sub-agents + auto-continuation + live progress) instead
@@ -187,15 +211,13 @@ export const DISCORD_HARNESS_ENABLED = getEnv('DISCORD_HARNESS_ENABLED', 'false'
 export const DISCORD_BOT_TOKEN = readSecretFromFileVaultSync('discord_bot_token') || getEnv('DISCORD_BOT_TOKEN', '') || '';
 export const DISCORD_CLIENT_ID = getEnv('DISCORD_CLIENT_ID', '');
 export const DISCORD_REQUIRE_MENTION = getEnv('DISCORD_REQUIRE_MENTION', 'true').toLowerCase() === 'true';
-export const DISCORD_DM_ALLOWED_USERS = getEnv('DISCORD_DM_ALLOWED_USERS', '')
-  .split(',')
-  .map((value) => value.trim())
-  .filter(Boolean);
+export const DISCORD_DM_ALLOWED_USERS = parseCsvEnv(getEnv('DISCORD_DM_ALLOWED_USERS', ''));
+export const DISCORD_ALLOWED_USERS = parseCsvEnv(
+  getEnv('DISCORD_ALLOWED_USERS', getEnv('DISCORD_DM_ALLOWED_USERS', '')),
+);
 export const DISCORD_DM_POLL_INTERVAL_MS = parseInt(getEnv('DISCORD_DM_POLL_INTERVAL_MS', '5000'), 10);
-export const DISCORD_ALLOWED_CHANNELS = getEnv('DISCORD_ALLOWED_CHANNELS', '')
-  .split(',')
-  .map((value) => value.trim())
-  .filter(Boolean);
+export const DISCORD_ALLOWED_CHANNELS = parseCsvEnv(getEnv('DISCORD_ALLOWED_CHANNELS', ''));
+export const DISCORD_PUSH_PROACTIVE_BRIEFS = getEnv('DISCORD_PUSH_PROACTIVE_BRIEFS', 'false').toLowerCase() === 'true';
 export const LOCAL_MCP_ENABLED = getEnv('LOCAL_MCP_ENABLED', 'true').toLowerCase() === 'true';
 export const MCP_AUTO_IMPORT_ENABLED = getEnv('MCP_AUTO_IMPORT_ENABLED', 'false').toLowerCase() === 'true';
 export const MCP_SERVERS_FILE = path.join(BASE_DIR, 'mcp', 'servers.json');

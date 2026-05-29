@@ -15,7 +15,7 @@
  *   - IDENTITY.md      → who Clementine is
  *   - MEMORY.md        → long-term curated context
  *   - working-memory.md → recent / current focus, written by auto-capture
- *   - facts store      → renderFactsForInstructions (Pinecone-backed embedding memory)
+ *   - facts store      → renderFactsForInstructions (SQLite consolidated_facts, Stanford-ranked)
  *   - user profile     → renderProfileForInstructions
  *   - goals dir        → top active goals
  *
@@ -30,7 +30,8 @@ import path from 'node:path';
 import { BASE_DIR } from '../config.js';
 import { loadMemoryContext } from '../memory/vault.js';
 import { renderFactsForInstructions, renderRecentlyLearnedForInstructions } from '../memory/facts.js';
-import { getFocusSnapshot } from '../memory/focus.js';
+import { getActiveObjective, getFocusSnapshot } from '../memory/focus.js';
+import { renderSkillsIndex } from '../memory/skill-store.js';
 import { loadUserProfile, renderProfileForInstructions } from '../runtime/user-profile.js';
 
 const GOALS_DIR = path.join(BASE_DIR, 'goals');
@@ -132,7 +133,11 @@ export function renderHarnessMemoryContext(): string {
 
   let facts = '';
   try {
-    facts = renderFactsForInstructions();
+    // Move 1 (scoped recall): scope injected facts to the active focus's
+    // objective so an off-topic fact can't leak into a focused session.
+    // getActiveObjective() returns undefined when there's no focus or the
+    // flag is off → identical to the global ranking (no regression).
+    facts = renderFactsForInstructions(10, 1600, getActiveObjective());
   } catch {
     facts = '';
   }
@@ -159,6 +164,13 @@ export function renderHarnessMemoryContext(): string {
 
   const goals = renderActiveGoals();
   const nowLine = renderCurrentTimeForInstructions();
+
+  let skills = '';
+  try {
+    skills = renderSkillsIndex();
+  } catch {
+    skills = '';
+  }
 
   // Current Focus block — surfaced in persistent context so the model
   // has at-a-glance awareness without a focus_get tool call. The
@@ -213,6 +225,7 @@ export function renderHarnessMemoryContext(): string {
     section('Long-Term Memory', memContext.memory),
     section('Active Goals', goals),
     section('Current Focus', focus),
+    section('Available Skills', skills),
   ].filter(Boolean);
 
   if (blocks.length === 0) return '';

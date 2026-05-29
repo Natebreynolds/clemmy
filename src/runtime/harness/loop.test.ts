@@ -18,13 +18,23 @@
  * (returns a Node EventEmitter stub) and runRunner (synthesizes a
  * RunOutcome). That keeps the loop test fast and offline.
  */
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-harness-loop-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
+mkdirSync(path.join(TMP_HOME, 'vault', '02-Projects'), { recursive: true });
+writeFileSync(
+  path.join(TMP_HOME, 'vault', '02-Projects', 'salesforce-prospecting.md'),
+  [
+    '# Salesforce prospecting',
+    '',
+    'User has durable Salesforce prospecting context: prioritize stale untouched accounts, use Salesforce CLI data first, enrich with SEO signals, and draft careful outbound sequences only after reviewing the source account facts.',
+  ].join('\n'),
+  'utf-8',
+);
 
 // v0.5.19 F4 — the new default behavior on stall-retry exhaustion is
 // to convert into a synthetic `ask_user_question` (status flips to
@@ -43,13 +53,14 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { Agent, RunContext, RunState, type AgentInputItem, type Runner } from '@openai/agents';
 
-const { resetEventLog, requestKill, listEvents, createSession } = await import('./eventlog.js');
+const { resetEventLog, requestKill, listEvents, createSession, appendEvent } = await import('./eventlog.js');
 const { HarnessSession } = await import('./session.js');
 const { runTurn, runConversation, resumePendingApproval } = await import('./loop.js');
 type RunRunnerFn = import('./loop.js').RunRunnerFn;
 const { ToolCallsLimitExceeded } = await import('./brackets.js');
 const { listEvents: listEventsForConv } = await import('./eventlog.js');
 const approvalRegistry = await import('./approval-registry.js');
+const { getPlanScope, isAutoApprovedByScope } = await import('../../agents/plan-scope.js');
 
 test.after(() => {
   try {
@@ -73,22 +84,29 @@ function makeAgentStub(): import('@openai/agents').Agent<any, any> {
 }
 
 function makeApprovalRunState(agent: import('@openai/agents').Agent<any, any>, toolName: string): string {
+  return makeApprovalRunStateWithInterruptions(agent, [
+    { toolName, argumentsJson: '{}', callId: `${toolName}_call` },
+  ]);
+}
+
+function makeApprovalRunStateWithInterruptions(
+  agent: import('@openai/agents').Agent<any, any>,
+  interruptions: Array<{ toolName: string; argumentsJson?: string; callId?: string }>,
+): string {
   const state = new RunState(new RunContext({}), 'approve this', agent, null);
   const json = state.toJSON() as Record<string, unknown>;
   json.currentStep = {
     type: 'next_step_interruption',
     data: {
-      interruptions: [
-        {
-          rawItem: {
-            type: 'function_call',
-            name: toolName,
-            callId: `${toolName}_call`,
-            arguments: '{}',
-          },
-          toolName,
+      interruptions: interruptions.map((interruption, index) => ({
+        rawItem: {
+          type: 'function_call',
+          name: interruption.toolName,
+          callId: interruption.callId ?? `${interruption.toolName}_call_${index}`,
+          arguments: interruption.argumentsJson ?? '{}',
         },
-      ],
+        toolName: interruption.toolName,
+      })),
     },
   };
   return JSON.stringify(json);
@@ -142,6 +160,79 @@ test('completed chat run snapshots conversation, emits run_completed, leaves ses
   const userInputs = listEvents(sess.id, { types: ['user_input_received'] });
   assert.equal(userInputs.length, 1);
   assert.equal(userInputs[0].data.text, 'do the thing');
+});
+
+test('runTurn persists latest native Codex compaction item for replay when flag is enabled', async () => {
+  resetEventLog();
+  const previousFlag = process.env.CLEMMY_CODEX_NATIVE_COMPACTION;
+  process.env.CLEMMY_CODEX_NATIVE_COMPACTION = '1';
+  try {
+    const sess = HarnessSession.create({ kind: 'chat', title: 'native compaction' });
+    const runRunner: RunRunnerFn = async (_runner, _agent, items, _opts) => {
+      const assistantMessage = {
+        id: 'msg_after_compaction',
+        type: 'message',
+        role: 'assistant',
+        status: 'completed',
+        content: [{ type: 'output_text', text: 'I will continue from the compacted state.' }],
+      } as unknown as AgentInputItem;
+      return {
+        history: [
+          ...items,
+          {
+            id: 'fc_1',
+            type: 'function_call',
+            callId: 'call_1',
+            name: 'expensive_tool',
+            arguments: '{}',
+            status: 'completed',
+          } as unknown as AgentInputItem,
+          {
+            type: 'function_call_result',
+            callId: 'call_1',
+            output: { type: 'text', text: 'large tool result' },
+            status: 'completed',
+          } as unknown as AgentInputItem,
+          assistantMessage,
+        ],
+        lastResponseId: 'resp_compacted',
+        finalOutput: { done: false, nextAction: 'completed', summary: 'compacted' },
+        rawResponses: [
+          { output: [{ type: 'compaction', id: 'cmp_old', encrypted_content: 'old-state' }] },
+          { output: [{ type: 'compaction', id: 'cmp_new', encrypted_content: 'new-state' }] },
+        ],
+      };
+    };
+
+    const result = await runTurn({
+      agent: makeAgentStub(),
+      sessionId: sess.id,
+      input: 'continue the long run',
+      makeRunner: makeRunnerStub,
+      runRunner,
+    });
+
+    assert.equal(result.status, 'completed');
+    const replay = HarnessSession.load(sess.id)?.toInputItems() ?? [];
+    assert.equal(replay.length, 2);
+    assert.equal((replay[0] as { type?: string }).type, 'compaction');
+    assert.equal((replay[0] as { id?: string }).id, 'cmp_new');
+    assert.equal((replay[0] as { encrypted_content?: string }).encrypted_content, 'new-state');
+    assert.equal((replay[1] as { role?: string }).role, 'assistant');
+
+    const events = listEvents(sess.id, { types: ['native_compaction_applied'] });
+    assert.equal(events.length, 1);
+    assert.equal(events[0].data.previousItems, 4);
+    assert.equal(events[0].data.nextItems, 2);
+    assert.equal(events[0].data.compactionItemsSeen, 2);
+    assert.equal(events[0].data.latestCompactionId, 'cmp_new');
+  } finally {
+    if (previousFlag == null) {
+      delete process.env.CLEMMY_CODEX_NATIVE_COMPACTION;
+    } else {
+      process.env.CLEMMY_CODEX_NATIVE_COMPACTION = previousFlag;
+    }
+  }
 });
 
 test('completed workflow run flips session status to completed (one-shot)', async () => {
@@ -266,6 +357,51 @@ test('previousResponseId is NOT passed to the SDK (codex requires full history e
   assert.equal(seenOpts.length, 2);
   assert.equal(seenOpts[0].previousResponseId, undefined, 'first turn never sets prior');
   assert.equal(seenOpts[1].previousResponseId, undefined, 'second turn also never sets prior — full history is inlined into items instead');
+});
+
+test('runTurn injects a transient memory primer before the first model response', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  let filteredInput: AgentInputItem[] = [];
+
+  const runRunner: RunRunnerFn = async (_runner, _agent, items, opts) => {
+    const filter = opts.callModelInputFilter as
+      | ((args: { modelData: { input: AgentInputItem[]; instructions?: string } }) => { input: AgentInputItem[]; instructions?: string })
+      | undefined;
+    assert.equal(typeof filter, 'function', 'expected harness to pass callModelInputFilter');
+    filteredInput = filter!({ modelData: { input: items, instructions: 'base instructions' } }).input;
+    return {
+      history: [
+        ...items,
+        { role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'ok' }] },
+      ],
+      lastResponseId: undefined,
+      finalOutput: 'ok',
+    };
+  };
+
+  await runTurn({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'can you help me with some Salesforce prospecting',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  const primer = filteredInput.find((item) =>
+    (item as { role?: unknown }).role === 'system'
+    && typeof (item as { content?: unknown }).content === 'string'
+    && ((item as { content: string }).content.includes('[MEMORY PRIMER]')),
+  ) as { content: string } | undefined;
+  assert.ok(primer, 'expected memory primer to be appended to model input');
+  assert.match(primer.content, /memory search ran/i);
+  assert.match(primer.content, /Salesforce prospecting/i);
+  assert.match(primer.content, /stale untouched accounts/i);
+
+  const primerEvents = listEvents(sess.id, { types: ['turn_memory_primer'] });
+  assert.equal(primerEvents.length, 1);
+  assert.equal(primerEvents[0].data.injected, true);
+  assert.ok((primerEvents[0].data.hitCount as number) > 0);
 });
 
 test('turn numbers monotonically increment across runs', async () => {
@@ -515,6 +651,160 @@ test('resume resolves the approval rows present before the resumed run requests 
   ]);
 });
 
+test('resume opens a slug-scoped plan scope after approving a Composio external mutation batch', async () => {
+  resetEventLog();
+  const agent = new Agent({ name: 'ResumeBatchApprovalTest', instructions: 'test' });
+  const sess = HarnessSession.create({ kind: 'chat', title: 'resume-batch-approval' });
+  const draftArgs = [
+    { tool_slug: 'SALESFORCE_CREATE_TASK', arguments: JSON.stringify({ account_id: 'a', subject: 'A' }) },
+    { tool_slug: 'SALESFORCE_CREATE_TASK', arguments: JSON.stringify({ account_id: 'b', subject: 'B' }) },
+  ];
+  sess.saveInterruptState(makeApprovalRunStateWithInterruptions(agent, draftArgs.map((args, index) => ({
+    toolName: 'composio_execute_tool',
+    callId: `draft_call_${index}`,
+    argumentsJson: JSON.stringify(args),
+  }))));
+  for (const [index, args] of draftArgs.entries()) {
+    approvalRegistry.register({
+      sessionId: sess.id,
+      subject: `Create Outlook draft ${index + 1}`,
+      tool: 'composio_execute_tool',
+      args,
+    });
+  }
+
+  const runRunner: RunRunnerFn = async () => ({
+    history: [],
+    lastResponseId: undefined,
+    finalOutput: { ok: true },
+  });
+
+  const result = await resumePendingApproval({
+    agent,
+    sessionId: sess.id,
+    decision: 'approve',
+    resolver: 'unit-test',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(result.status, 'completed');
+  const scope = getPlanScope(sess.id);
+  assert.deepEqual(scope?.allowedTools, ['composio_execute_tool']);
+  assert.deepEqual(scope?.allowedComposioSlugs, ['SALESFORCE_CREATE_TASK']);
+  assert.equal(
+    isAutoApprovedByScope(sess.id, 'composio_execute_tool', { tool_slug: 'SALESFORCE_CREATE_TASK' }),
+    true,
+  );
+  assert.equal(
+    isAutoApprovedByScope(sess.id, 'composio_execute_tool', { tool_slug: 'OUTLOOK_SEND_EMAIL' }),
+    false,
+  );
+});
+
+test('resume opens an exact-tool scope after approving a direct external mutation batch', async () => {
+  resetEventLog();
+  const agent = new Agent({ name: 'ResumeDirectExternalBatchTest', instructions: 'test' });
+  const sess = HarnessSession.create({ kind: 'chat', title: 'resume-direct-external-batch' });
+  const toolName = 'slack_post_message';
+  sess.saveInterruptState(makeApprovalRunStateWithInterruptions(agent, [
+    { toolName, callId: 'slack_call_1', argumentsJson: JSON.stringify({ channel: 'sales', text: 'A' }) },
+    { toolName, callId: 'slack_call_2', argumentsJson: JSON.stringify({ channel: 'sales', text: 'B' }) },
+  ]));
+  for (let index = 0; index < 2; index++) {
+    approvalRegistry.register({
+      sessionId: sess.id,
+      subject: `Post Slack message ${index + 1}`,
+      tool: toolName,
+      args: { channel: 'sales', text: String(index) },
+    });
+  }
+
+  const runRunner: RunRunnerFn = async () => ({
+    history: [],
+    lastResponseId: undefined,
+    finalOutput: { ok: true },
+  });
+
+  const result = await resumePendingApproval({
+    agent,
+    sessionId: sess.id,
+    decision: 'approve',
+    resolver: 'unit-test',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(result.status, 'completed');
+  const scope = getPlanScope(sess.id);
+  assert.deepEqual(scope?.allowedTools, [toolName]);
+  assert.equal(isAutoApprovedByScope(sess.id, toolName, { channel: 'sales', text: 'C' }), true);
+  assert.equal(isAutoApprovedByScope(sess.id, 'run_shell_command', { command: 'echo nope' }), false);
+});
+
+test('resume does not open a scoped plan scope for non-external or single-call approvals', async () => {
+  resetEventLog();
+  const agent = new Agent({ name: 'ResumeSingleApprovalTest', instructions: 'test' });
+  const sess = HarnessSession.create({ kind: 'chat', title: 'resume-single-approval' });
+  const args = { tool_slug: 'OUTLOOK_CREATE_DRAFT', arguments: JSON.stringify({ to: 'a@example.com', subject: 'A' }) };
+  sess.saveInterruptState(makeApprovalRunStateWithInterruptions(agent, [{
+    toolName: 'composio_execute_tool',
+    callId: 'draft_call_1',
+    argumentsJson: JSON.stringify(args),
+  }]));
+  approvalRegistry.register({
+    sessionId: sess.id,
+    subject: 'Create one Outlook draft',
+    tool: 'composio_execute_tool',
+    args,
+  });
+
+  const runRunner: RunRunnerFn = async () => ({
+    history: [],
+    lastResponseId: undefined,
+    finalOutput: { ok: true },
+  });
+
+  const result = await resumePendingApproval({
+    agent,
+    sessionId: sess.id,
+    decision: 'approve',
+    resolver: 'unit-test',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(result.status, 'completed');
+  assert.equal(getPlanScope(sess.id), null);
+
+  resetEventLog();
+  const shellSess = HarnessSession.create({ kind: 'chat', title: 'resume-shell-batch' });
+  shellSess.saveInterruptState(makeApprovalRunStateWithInterruptions(agent, [
+    { toolName: 'run_shell_command', callId: 'shell_call_1', argumentsJson: JSON.stringify({ command: 'touch a' }) },
+    { toolName: 'run_shell_command', callId: 'shell_call_2', argumentsJson: JSON.stringify({ command: 'touch b' }) },
+  ]));
+  for (let index = 0; index < 2; index++) {
+    approvalRegistry.register({
+      sessionId: shellSess.id,
+      subject: `Run shell command ${index + 1}`,
+      tool: 'run_shell_command',
+      args: { command: `touch ${index}` },
+    });
+  }
+
+  const shellResult = await resumePendingApproval({
+    agent,
+    sessionId: shellSess.id,
+    decision: 'approve',
+    resolver: 'unit-test',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(shellResult.status, 'completed');
+  assert.equal(getPlanScope(shellSess.id), null);
+});
+
 test('interruption with no rich args falls back to the tool name as subject', async () => {
   resetEventLog();
   const sess = HarnessSession.create({ kind: 'chat' });
@@ -693,7 +983,8 @@ test('runConversation: stops on first completed decision', async () => {
   const runner = scriptedRunner([
     {
       finalOutput: {
-        summary: 'created the README in one shot',
+        summary: 'Answered the user directly',
+        reply: 'The README should include setup, usage, and test commands.',
         done: true,
         nextAction: 'completed',
         reason: null,
@@ -1217,6 +1508,68 @@ test('runConversation: stall triggers one auto-retry; retry success completes co
   assert.match(userInputs[1].data.text as string, /OUTLOOK_LIST_MESSAGES/, 'retry message should inline the pre-resolved slug');
 });
 
+test('runConversation: existing-work stall retry forces focus and memory before asking user', async () => {
+  // Repro class from sess-mposxsah-8b67f103: the user referenced a
+  // known prior creative project ("gala silet acution animation post"),
+  // but the first model response asked for a file/path without trying
+  // focus or memory. On the retry, that shape should be treated as a
+  // reference to existing work, so ask_user_question is only allowed
+  // after focus/memory fail to find a target.
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const runner = scriptedRunner([
+    { finalOutput: 'I’ll edit the gala silent auction animation post now.' },
+    { finalOutput: 'I found the gala-reel project in memory and loaded it.' },
+  ]);
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'Hey can we work on edits for the gala silet acution animation post please',
+    makeRunner: makeRunnerStub,
+    runRunner: runner,
+  });
+
+  assert.equal(result.status, 'completed');
+  const userInputs = listEventsForConv(sess.id, { types: ['user_input_received'] });
+  assert.ok(userInputs.length >= 2, 'expected a synthetic stall-retry input');
+  const retryText = userInputs[1].data.text as string;
+  assert.match(retryText, /existing work/i);
+  assert.match(retryText, /gala silet acution animation post/i);
+  assert.match(retryText, /focus_get/);
+  assert.match(retryText, /memory_search or memory_recall/);
+  assert.doesNotMatch(
+    retryText,
+    /call ask_user_question instead of producing announcement text/,
+    'existing-work retry must not use the generic ask-user escape hatch first',
+  );
+});
+
+test('runConversation: fresh stall retry keeps generic ask-user fallback', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const runner = scriptedRunner([
+    { finalOutput: 'I’ll write a quick greeting now.' },
+    { finalOutput: 'Hello there.' },
+  ]);
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'write a quick greeting',
+    makeRunner: makeRunnerStub,
+    runRunner: runner,
+  });
+
+  assert.equal(result.status, 'completed');
+  const userInputs = listEventsForConv(sess.id, { types: ['user_input_received'] });
+  assert.ok(userInputs.length >= 2, 'expected a synthetic stall-retry input');
+  const retryText = userInputs[1].data.text as string;
+  assert.match(retryText, /call ask_user_question instead of producing announcement text/);
+  assert.doesNotMatch(retryText, /existing work/i);
+  assert.doesNotMatch(retryText, /memory_search or memory_recall/);
+});
+
 test('runConversation: stall retry that ALSO stalls falls through to sub_agent_stalled', async () => {
   // Negative case: scripted runner stalls on every turn, so the retry
   // also stalls. Budget exhausts, the original failure surfaces as
@@ -1235,6 +1588,261 @@ test('runConversation: stall retry that ALSO stalls falls through to sub_agent_s
   const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] });
   assert.equal(completed[0].data.reason, 'sub_agent_stalled');
   // Retry was attempted once before giving up.
+  const retryEvents = listEventsForConv(sess.id, { types: ['stall_retry_attempted'] });
+  assert.equal(retryEvents.length, 1);
+});
+
+test('runConversation: structured false tool-unavailable decision is retried', async () => {
+  // Repro from the native compaction desktop smoke, 2026-05-27:
+  // Clem had file/shell/search tools on the agent, but returned a
+  // structured OrchestratorDecision saying it needed a "tool-enabled
+  // run" and asked the user to resend continue. That strands long
+  // autonomous tasks in a user-input state even though the runtime is
+  // healthy. Treat that as the same zero-tool stall class and retry
+  // with an action-only nudge.
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  let scriptIndex = 0;
+  const scripted: unknown[] = [
+    {
+      summary: 'Need to continue the local file test but no tools are available.',
+      reply:
+        'I need tool access in this turn to create/read the local files. Please resend continue in a tool-enabled run.',
+      done: false,
+      nextAction: 'awaiting_user_input',
+      reason: 'No commentary/tool calls were available in this turn.',
+    },
+    {
+      summary: 'All set after retry.',
+      reply: 'Done after retry.',
+      done: true,
+      nextAction: 'completed',
+      reason: null,
+    },
+  ];
+  const runRunner: RunRunnerFn = async (_r, _a, items) => {
+    const output = scripted[scriptIndex] ?? scripted[scripted.length - 1];
+    scriptIndex += 1;
+    return { history: items, lastResponseId: undefined, finalOutput: output };
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'create the native-compaction proof files',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(result.status, 'completed');
+  const stuckEvents = listEventsForConv(sess.id, { types: ['stuck_detected'] });
+  assert.equal(stuckEvents.length, 1);
+  assert.equal((stuckEvents[0].data as { kind: string }).kind, 'structured_tool_unavailable');
+
+  const retryEvents = listEventsForConv(sess.id, { types: ['stall_retry_attempted'] });
+  assert.equal(retryEvents.length, 1);
+
+  const userInputs = listEventsForConv(sess.id, { types: ['user_input_received'] });
+  assert.ok(userInputs.length >= 2, 'expected retry to inject a synthetic user input');
+  assert.match(userInputs[1].data.text as string, /tool surface is available/i);
+});
+
+test('runConversation: structured tool-unavailable after only probe tools is retried', async () => {
+  // Live desktop repro, 2026-05-27: after native compaction Clem called
+  // workspace_roots, then claimed local/file tools were unavailable and
+  // asked the user to continue in another tool-enabled turn. A single
+  // probe call is not meaningful progress; retry instead of stranding.
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  let scriptIndex = 0;
+  const scripted: unknown[] = [
+    {
+      summary:
+        'Could not continue tool execution because the available tool surface in this turn does not include the required local/file tools.',
+      reply:
+        'I am blocked because the local/file tool surface I need to write the markdown report is not available in this turn.',
+      done: false,
+      nextAction: 'awaiting_user_input',
+      reason: 'Need a follow-up turn with local/file tools available to complete the report write.',
+    },
+    {
+      summary: 'All set after probe-only retry.',
+      reply: 'Done after retry.',
+      done: true,
+      nextAction: 'completed',
+      reason: null,
+    },
+  ];
+  const runRunner: RunRunnerFn = async (runner, _a, items) => {
+    const output = scripted[scriptIndex] ?? scripted[scripted.length - 1];
+    scriptIndex += 1;
+    if (scriptIndex === 1) {
+      (runner as unknown as EventEmitter).emit('agent_tool_start');
+      appendEvent({
+        sessionId: sess.id,
+        turn: 1,
+        role: 'Clem',
+        type: 'tool_called',
+        data: { tool: 'workspace_roots', callId: 'call_probe', arguments: '{}' },
+      });
+    }
+    return { history: items, lastResponseId: undefined, finalOutput: output };
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'finish the SEO audit report',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(result.status, 'completed');
+  const stuckEvents = listEventsForConv(sess.id, { types: ['stuck_detected'] });
+  assert.equal(stuckEvents.length, 1);
+  assert.equal((stuckEvents[0].data as { kind: string }).kind, 'structured_tool_unavailable');
+  assert.equal((stuckEvents[0].data as { onlyProbeTools: boolean }).onlyProbeTools, true);
+  const retryEvents = listEventsForConv(sess.id, { types: ['stall_retry_attempted'] });
+  assert.equal(retryEvents.length, 1);
+});
+
+test('runConversation: structured awaiting_handoff_result tool-runtime stall is retried', async () => {
+  // Live desktop repro, 2026-05-27: the Orchestrator returned
+  // nextAction=awaiting_handoff_result with zero tool calls and said it
+  // needed the "tool runtime" / "no executable tool results". That is
+  // not a legitimate handoff; retry with an action-only nudge.
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  let scriptIndex = 0;
+  const scripted: unknown[] = [
+    {
+      summary:
+        'Need to run the Market Leader workflow with tools, but this turn only had a handoff summary and no executable tool results.',
+      reply:
+        'I need the tool runtime to continue this properly: query Salesforce, gather SEO signals, write the markdown report, then request one approval before creating drafts.',
+      done: false,
+      nextAction: 'awaiting_handoff_result',
+      reason: 'Proceed by calling Salesforce/SEO/file/approval tools in the next tool-enabled step.',
+    },
+    {
+      summary: 'All set after handoff retry.',
+      reply: 'Done after retry.',
+      done: true,
+      nextAction: 'completed',
+      reason: null,
+    },
+  ];
+  const runRunner: RunRunnerFn = async (_r, _a, items) => {
+    const output = scripted[scriptIndex] ?? scripted[scripted.length - 1];
+    scriptIndex += 1;
+    return { history: items, lastResponseId: undefined, finalOutput: output };
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'run the Market Leader workflow',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(result.status, 'completed');
+  const stuckEvents = listEventsForConv(sess.id, { types: ['stuck_detected'] });
+  assert.equal(stuckEvents.length, 1);
+  assert.equal((stuckEvents[0].data as { kind: string }).kind, 'structured_tool_unavailable');
+  assert.equal((stuckEvents[0].data as { nextAction: string }).nextAction, 'awaiting_handoff_result');
+  const retryEvents = listEventsForConv(sess.id, { types: ['stall_retry_attempted'] });
+  assert.equal(retryEvents.length, 1);
+});
+
+test('runConversation: structured abandoned tool-unavailable decision is retried', async () => {
+  // Same failure as above, but the model may use nextAction=abandoned
+  // instead of awaiting_user_input. That should not bypass recovery
+  // when the reason is a false "tool surface unavailable" claim.
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  let scriptIndex = 0;
+  const scripted: unknown[] = [
+    {
+      summary: 'Prepared to create files but local file tools are unavailable.',
+      reply: 'I do not have the local file/web tool surface available in this turn.',
+      done: true,
+      nextAction: 'abandoned',
+      reason: 'Required local file and web-search tools were not available in the active tool surface.',
+    },
+    {
+      summary: 'All set after abandoned retry.',
+      reply: 'Done after retry.',
+      done: true,
+      nextAction: 'completed',
+      reason: null,
+    },
+  ];
+  const runRunner: RunRunnerFn = async (_r, _a, items) => {
+    const output = scripted[scriptIndex] ?? scripted[scripted.length - 1];
+    scriptIndex += 1;
+    return { history: items, lastResponseId: undefined, finalOutput: output };
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'create the native-compaction proof files',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(result.status, 'completed');
+  const stuckEvents = listEventsForConv(sess.id, { types: ['stuck_detected'] });
+  assert.equal(stuckEvents.length, 1);
+  assert.equal((stuckEvents[0].data as { kind: string }).kind, 'structured_tool_unavailable');
+  const retryEvents = listEventsForConv(sess.id, { types: ['stall_retry_attempted'] });
+  assert.equal(retryEvents.length, 1);
+});
+
+test('runConversation: structured zero-tool completion claim is retried', async () => {
+  // Repro from the native compaction desktop smoke, 2026-05-27:
+  // Clem returned a structured "Done — created files, searched web"
+  // answer with toolCalls=0 and no artifacts on disk. Structured
+  // output should not bypass the same zero-tool false-claim guard
+  // used for plain-text sub-agent stalls.
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  let scriptIndex = 0;
+  const scripted: unknown[] = [
+    {
+      summary: 'Created the local proof files, verified them, searched for a web source, and confirmed completion.',
+      reply: 'Done — created 3 files and searched the web source.',
+      done: true,
+      nextAction: 'completed',
+      reason: null,
+    },
+    {
+      summary: 'Completed after retry with actual tool calls.',
+      reply: 'Done after retry.',
+      done: true,
+      nextAction: 'completed',
+      reason: null,
+    },
+  ];
+  const runRunner: RunRunnerFn = async (_r, _a, items) => {
+    const output = scripted[scriptIndex] ?? scripted[scripted.length - 1];
+    scriptIndex += 1;
+    return { history: items, lastResponseId: undefined, finalOutput: output };
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'create files and search the web',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(result.status, 'completed');
+  const stuckEvents = listEventsForConv(sess.id, { types: ['stuck_detected'] });
+  assert.equal(stuckEvents.length, 1);
+  assert.equal((stuckEvents[0].data as { kind: string }).kind, 'structured_zero_tool_claim');
   const retryEvents = listEventsForConv(sess.id, { types: ['stall_retry_attempted'] });
   assert.equal(retryEvents.length, 1);
 });

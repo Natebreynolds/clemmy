@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import matter from 'gray-matter';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -15,6 +15,7 @@ import {
   type WorkflowDefinition,
   type WorkflowEntry,
 } from '../memory/workflow-store.js';
+import { checkWorkflowForWrite } from '../execution/workflow-enforce.js';
 import {
   CRON_PROGRESS_DIR,
   CRON_RUNS_DIR,
@@ -23,6 +24,15 @@ import {
   ensureDir,
   textResult,
 } from './shared.js';
+import {
+  getWorkflowImportJob,
+  listRecentWorkflowImportJobs,
+  startWorkflowFrameworkImport,
+} from '../runtime/workflow-installer.js';
+import {
+  missingWorkflowRunInputs,
+  normalizeWorkflowRunInputs,
+} from '../execution/workflow-inputs.js';
 
 interface CronJobRecord {
   name: string;
@@ -135,6 +145,41 @@ function readRunHistory(jobName: string, limit = 10): Array<{ status?: string; s
 // expose the basename here for log readability.
 function listWorkflowFiles(): WorkflowEntry[] {
   return listWorkflows();
+}
+
+function stableJson(value: unknown): string {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return JSON.stringify(value);
+  const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b));
+  return JSON.stringify(Object.fromEntries(entries));
+}
+
+function findDuplicateQueuedWorkflowRun(workflowName: string, inputs: Record<string, string>): { id: string; status: string } | null {
+  if (!existsSync(WORKFLOW_RUNS_DIR)) return null;
+  const wanted = stableJson(inputs);
+  for (const file of readdirSync(WORKFLOW_RUNS_DIR).filter((entry) => entry.endsWith('.json')).sort().reverse()) {
+    try {
+      const parsed = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, file), 'utf-8')) as {
+        id?: unknown;
+        workflow?: unknown;
+        inputs?: unknown;
+        status?: unknown;
+      };
+      const status = typeof parsed.status === 'string' ? parsed.status : 'queued';
+      if (status !== 'queued' && status !== 'running') continue;
+      if (parsed.workflow !== workflowName) continue;
+      const existingInputs = normalizeWorkflowRunInputs(
+        parsed.inputs && typeof parsed.inputs === 'object' && !Array.isArray(parsed.inputs)
+          ? parsed.inputs as Record<string, string>
+          : {},
+      );
+      if (stableJson(existingInputs) !== wanted) continue;
+      const id = typeof parsed.id === 'string' ? parsed.id : path.basename(file, '.json');
+      return { id, status };
+    } catch {
+      continue;
+    }
+  }
+  return null;
 }
 
 export function registerOrchestrationTools(server: McpServer): void {
@@ -262,7 +307,11 @@ export function registerOrchestrationTools(server: McpServer): void {
 
   server.tool(
     'workflow_create',
-    "Create a recurring or multi-step automated workflow. Use this for ANY scheduled or repeated work (\"daily at 6pm\", \"every Monday morning\", \"when X happens, do Y\") INSTEAD of task_add (which is one-shot). A workflow is the WHAT (the steps); after this call, call workflow_schedule to set the cron — that's the WHEN. If the user describes a chain of actions that should happen on a trigger, this is the tool. Call workflow_list first if you want to see existing workflow shapes.",
+    "Create a recurring or multi-step automated workflow. Use this for ANY scheduled or repeated work (\"daily at 6pm\", \"every Monday morning\", \"when X happens, do Y\") INSTEAD of task_add (which is one-shot). A workflow is the WHAT (the steps); after this call, call workflow_schedule to set the cron — that's the WHEN. "
+      + "AUTHORING MODEL (important): workflows are AUTONOMOUS BY DEFAULT — an enabled workflow runs every step end-to-end on the user's one-time consent (enabling it), WITHOUT pausing for per-step approval. Do NOT put `request_approval` in step prompts. "
+      + "Each step does ONE job and its result flows to the next step: a downstream step references an upstream result with `{{steps.<stepId>.output}}` (the runner passes the real structured data, not a summary). "
+      + "If — and only if — a step does something IRREVERSIBLE the user should sign off on first (e.g. sending emails, publishing), set `requiresApproval: true` on THAT ONE step and a short `approvalPreview`; the runner surfaces a single batch approval and holds the run there, then continues. Prefer ZERO gates for read/research/draft/deploy-for-review workflows. "
+      + "Steps with the same satisfied dependsOn run in parallel; use forEach for per-item fan-out. Call workflow_list first if you want to see existing workflow shapes.",
     {
       name: z.string().min(1),
       description: z.string().min(1),
@@ -273,6 +322,12 @@ export function registerOrchestrationTools(server: McpServer): void {
         model: z.string().optional(),
         tier: z.number().optional(),
         maxTurns: z.number().optional(),
+        useHarness: z.boolean().optional(),
+        forEach: z.string().optional(),
+        allowedTools: z.array(z.string()).optional(),
+        usesSkill: z.string().optional(),
+        requiresApproval: z.boolean().optional(),
+        approvalPreview: z.string().optional(),
       })).min(1),
       trigger_schedule: z.string().optional(),
       inputs: z.record(z.string(), z.object({
@@ -309,10 +364,25 @@ export function registerOrchestrationTools(server: McpServer): void {
           model: s.model,
           tier: s.tier,
           maxTurns: s.maxTurns,
+          useHarness: s.useHarness,
+          forEach: s.forEach,
+          allowedTools: s.allowedTools,
+          usesSkill: s.usesSkill,
+          requiresApproval: s.requiresApproval,
+          approvalPreview: s.approvalPreview,
         })),
         inputs: inputs && Object.keys(inputs).length > 0 ? inputs : undefined,
         synthesis: synthesis_prompt ? { prompt: synthesis_prompt } : undefined,
       };
+      // P2: refuse to create a workflow whose data can't flow (unbound
+      // inputs, malformed {{tokens}}, dangling deps). Flag-gated → no-op
+      // when WORKFLOW_TYPED_CONTRACT is off.
+      const createCheck = checkWorkflowForWrite(def);
+      if (!createCheck.ok) {
+        return textResult(
+          `Workflow "${name}" was NOT created — fix these first:\n- ${createCheck.errors.join('\n- ')}`,
+        );
+      }
       writeWorkflow(dirName, def);
       return textResult(`Created workflow "${name}" at workflows/${dirName}/SKILL.md.`);
     },
@@ -320,7 +390,7 @@ export function registerOrchestrationTools(server: McpServer): void {
 
   server.tool(
     'workflow_run',
-    'Queue a workflow run by writing a run request to local workflow state.',
+    'Queue a workflow run by writing a run request to local workflow state. Call workflow_get first and pass every required input, for example inputs.url for URL-based audit workflows. Missing required inputs are rejected without queuing.',
     {
       name: z.string().min(1),
       inputs: z.record(z.string(), z.string()).optional(),
@@ -330,7 +400,25 @@ export function registerOrchestrationTools(server: McpServer): void {
       if (!workflow) return textResult(`Workflow "${name}" not found.`);
       if (!workflow.data.enabled) return textResult(`Workflow "${name}" is disabled.`);
 
+      const normalizedInputs = normalizeWorkflowRunInputs(inputs);
+      const missing = missingWorkflowRunInputs(workflow.data, normalizedInputs);
+      if (missing.length > 0) {
+        return textResult(
+          [
+            `Workflow "${name}" was not queued because required input${missing.length === 1 ? '' : 's'} ${missing.map((key) => `"${key}"`).join(', ')} ${missing.length === 1 ? 'is' : 'are'} missing.`,
+            `Call workflow_run again with inputs including ${missing.map((key) => `"${key}": "<value>"`).join(', ')}.`,
+          ].join('\n'),
+        );
+      }
+
       ensureDir(WORKFLOW_RUNS_DIR);
+      const duplicate = findDuplicateQueuedWorkflowRun(name, normalizedInputs);
+      if (duplicate) {
+        return textResult(
+          `Workflow "${name}" is already ${duplicate.status} as run ${duplicate.id} with the same inputs. No duplicate was queued. Use workflow_run_status with run_id="${duplicate.id}" to check progress.`,
+        );
+      }
+
       const id = `${Date.now()}-${randomBytes(3).toString('hex')}`;
       const filePath = path.join(WORKFLOW_RUNS_DIR, `${id}.json`);
       writeFileSync(
@@ -338,7 +426,7 @@ export function registerOrchestrationTools(server: McpServer): void {
         JSON.stringify({
           id,
           workflow: name,
-          inputs: inputs ?? {},
+          inputs: normalizedInputs,
           status: 'queued',
           createdAt: new Date().toISOString(),
         }, null, 2),
@@ -399,6 +487,16 @@ export function registerOrchestrationTools(server: McpServer): void {
     async ({ name, enabled }) => {
       const entry = listWorkflowFiles().find((w) => w.data.name === name);
       if (!entry) return textResult(`Workflow "${name}" not found.`);
+      // P2: a workflow whose data can't flow can't be ENABLED (disabling
+      // is always allowed). Flag-gated → no-op when the flag is off.
+      if (enabled) {
+        const check = checkWorkflowForWrite({ ...entry.data, enabled: true });
+        if (!check.ok) {
+          return textResult(
+            `Workflow "${name}" was NOT enabled — fix these first:\n- ${check.errors.join('\n- ')}`,
+          );
+        }
+      }
       writeWorkflow(entry.name, { ...entry.data, enabled });
       return textResult(`Workflow "${name}" is now ${enabled ? 'approved (enabled)' : 'disabled'}.`);
     },
@@ -417,6 +515,10 @@ export function registerOrchestrationTools(server: McpServer): void {
         model: z.string().optional(),
         tier: z.number().optional(),
         maxTurns: z.number().optional(),
+        useHarness: z.boolean().optional(),
+        forEach: z.string().optional(),
+        allowedTools: z.array(z.string()).optional(),
+        usesSkill: z.string().optional(),
       })).optional(),
       trigger_schedule: z.string().optional(),
       clear_trigger_schedule: z.boolean().optional().describe('Pass true to remove an existing schedule (e.g. switch back to manual-only).'),
@@ -454,6 +556,10 @@ export function registerOrchestrationTools(server: McpServer): void {
           model: s.model,
           tier: s.tier,
           maxTurns: s.maxTurns,
+          useHarness: s.useHarness,
+          forEach: s.forEach,
+          allowedTools: s.allowedTools,
+          usesSkill: s.usesSkill,
         }));
       }
       if (inputs) next.inputs = inputs;
@@ -469,6 +575,63 @@ export function registerOrchestrationTools(server: McpServer): void {
 
       writeWorkflow(entry.name, next);
       return textResult(`Workflow "${name}" updated.`);
+    },
+  );
+
+  server.tool(
+    'workflow_import_framework',
+    'Import workflow framework packages from a local folder or GitHub repo. Discovers workflows/<name>/SKILL.md and .clementine/workflows/<name>/SKILL.md, preserves scripts/references/tests, and writes source metadata. Use dryRun=true first when reviewing third-party packages.',
+    {
+      source: z.string().min(1).describe('Local folder path, GitHub URL, git@github.com URL, owner/repo shorthand, or npx skills add owner/repo style reference.'),
+      dryRun: z.boolean().optional().describe('Preview discovered workflows without copying files. Default false.'),
+      overwrite: z.boolean().optional().describe('Replace existing framework files for same-named workflows, preserving runs/. Default false.'),
+    },
+    async ({ source, dryRun, overwrite }) => {
+      try {
+        const job = startWorkflowFrameworkImport(source, { dryRun, overwrite });
+        return textResult([
+          `Started workflow framework import ${job.id}.`,
+          `Status: ${job.status}`,
+          `Source: ${job.normalizedSource}`,
+          `Dry run: ${job.dryRun ? 'yes' : 'no'}`,
+          `Overwrite: ${job.overwrite ? 'yes' : 'no'}`,
+          'Call workflow_import_status with this job id for results.',
+        ].join('\n'));
+      } catch (err) {
+        return textResult(`Workflow import failed to start: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    },
+  );
+
+  server.tool(
+    'workflow_import_status',
+    'Check a workflow framework import job. Omit job_id to list recent import jobs.',
+    {
+      job_id: z.string().optional(),
+    },
+    async ({ job_id }) => {
+      if (!job_id) {
+        const recent = listRecentWorkflowImportJobs().slice(0, 10);
+        if (recent.length === 0) return textResult('No workflow import jobs yet.');
+        return textResult(recent.map((job) =>
+          `- ${job.id} [${job.status}] source=${job.normalizedSource} discovered=${job.discovered.length} installed=${job.installed.length} skipped=${job.skipped.length}`,
+        ).join('\n'));
+      }
+      const job = getWorkflowImportJob(job_id);
+      if (!job) return textResult(`No workflow import job found with id ${job_id}.`);
+      return textResult([
+        `Workflow import ${job.id}`,
+        `Status: ${job.status}`,
+        `Source: ${job.normalizedSource}`,
+        `Discovered: ${job.discovered.length}`,
+        ...job.discovered.map((item) => `  - ${item.name}: ${item.pathInSource}`),
+        `Installed: ${job.installed.length}`,
+        ...job.installed.map((item) => `  - ${item.name}: ${item.filePath}`),
+        `Skipped: ${job.skipped.length}`,
+        ...job.skipped.map((item) => `  - ${item.name}: ${item.reason}`),
+        job.error ? `Error: ${job.error}` : '',
+        job.output ? `\nLog:\n${job.output}` : '',
+      ].filter(Boolean).join('\n'));
     },
   );
 

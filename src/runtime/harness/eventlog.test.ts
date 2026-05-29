@@ -32,6 +32,8 @@ const {
   listSessions,
   appendEvent,
   listEvents,
+  writeToolOutput,
+  getToolOutput,
   getLatestEventSeq,
   requestKill,
   isKillRequested,
@@ -309,4 +311,29 @@ test('actionBus subscribers filtered by sessionId never see other sessions', asy
 
   unsubscribe();
   assert.deepEqual(onlyA, ['turn_started', 'turn_ended']);
+});
+
+test('writeToolOutput preserves an existing larger payload for the same call id', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const full = 'full payload '.repeat(1000);
+  const clipped = 'full payload\n[clipped: composio_execute_tool returned 13000 chars at 2026-05-26T00:00:00.000Z — call recall_tool_result("call_keep_full") for full output]';
+
+  writeToolOutput({
+    sessionId: sess.id,
+    callId: 'call_keep_full',
+    tool: 'composio_execute_tool',
+    output: full,
+  });
+  writeToolOutput({
+    sessionId: sess.id,
+    callId: 'call_keep_full',
+    tool: 'composio_execute_tool',
+    output: clipped,
+  });
+
+  const row = getToolOutput(sess.id, 'call_keep_full');
+  assert.ok(row);
+  assert.equal(row.output, full);
+  assert.equal(row.contentBytes, Buffer.byteLength(full, 'utf8'));
 });

@@ -53,7 +53,7 @@ export type SupervisorEvent =
   | { type: 'restart-counter-reset'; reason: string; priorAttempts: number }
   | { type: 'restart-skipped'; reason: string };
 
-const READINESS_TIMEOUT_MS = 30_000;
+const READINESS_TIMEOUT_MS = 90_000;
 const READINESS_POLL_MS = 250;
 const SHUTDOWN_GRACE_MS = 5_000;
 const RESTART_BASE_MS = 1_000;
@@ -67,6 +67,7 @@ const RESTART_MAX_MS = 30_000;
 // trips the cap quickly, but long enough that a "normal" upgrade or
 // transient blip doesn't accumulate forever.
 const STABILITY_RESET_MS = 5 * 60_000;
+const WEBHOOK_HOST = '127.0.0.1';
 
 /**
  * Parse a single .env file into a key/value map. Mirrors the parser in
@@ -148,8 +149,8 @@ export class DaemonSupervisor {
     if (!existsSync(logDir)) mkdirSync(logDir, { recursive: true });
   }
 
-  /** Start (or restart) the daemon. Resolves when the dashboard URL
-   *  returns a 200, rejects after READINESS_TIMEOUT_MS. */
+  /** Start (or restart) the daemon. Resolves when the daemon's minimal
+   *  health route answers, rejects after READINESS_TIMEOUT_MS. */
   async start(): Promise<{ port: number; url: string }> {
     if (this.child) {
       // Already running — return the existing ready promise.
@@ -158,7 +159,7 @@ export class DaemonSupervisor {
     }
 
     this.shuttingDown = false;
-    this.chosenPort = await pickFreePort(this.opts.preferredPort ?? 8520);
+    this.chosenPort = await pickFreePort(this.opts.preferredPort ?? 8520, WEBHOOK_HOST);
 
     this.readyPromise = new Promise((resolve, reject) => {
       this.readyResolve = resolve;
@@ -258,6 +259,7 @@ export class DaemonSupervisor {
       PATH: augmentedPath,
       WEBHOOK_ENABLED: 'true',
       WEBHOOK_PORT: String(this.chosenPort),
+      WEBHOOK_HOST,
       // Forward Electron's process.resourcesPath so the daemon can
       // resolve native modules (keytar) bundled in app.asar.unpacked.
       // Without this, the daemon's node_modules walk doesn't see the
@@ -359,7 +361,7 @@ export class DaemonSupervisor {
   }
 
   getDashboardUrl(token?: string): string {
-    const base = `http://localhost:${this.chosenPort}/console`;
+    const base = `http://${WEBHOOK_HOST}:${this.chosenPort}/console`;
     return token ? `${base}?token=${encodeURIComponent(token)}` : base;
   }
 
@@ -419,16 +421,21 @@ export class DaemonSupervisor {
   }
 
   private async waitForReady(): Promise<{ port: number; url: string }> {
-    const url = `http://localhost:${this.chosenPort}/api/dashboard`;
+    // Probe the smallest public health route, not `/api/dashboard`.
+    // `/api/dashboard` can do real work (state aggregation, MCP status,
+    // memory/runs/approvals) and on a cold packaged launch it can cross
+    // the old 30s supervisor window even though the daemon is alive.
+    // `/api/status` is intentionally minimal and is the correct boot
+    // readiness signal.
+    const url = `http://${WEBHOOK_HOST}:${this.chosenPort}/api/status`;
     const deadline = Date.now() + READINESS_TIMEOUT_MS;
     while (Date.now() < deadline) {
       if (this.shuttingDown) throw new Error('Daemon shutting down before ready');
       if (!this.child) throw new Error('Daemon exited before ready');
       try {
         const r = await fetch(url, { signal: AbortSignal.timeout(2000) });
-        // 200 OK or 401 (auth required) both mean the server is up.
-        if (r.status === 200 || r.status === 401) {
-          return { port: this.chosenPort, url: `http://localhost:${this.chosenPort}` };
+        if (r.status === 200) {
+          return { port: this.chosenPort, url: `http://${WEBHOOK_HOST}:${this.chosenPort}` };
         }
       } catch {
         // Connection refused / abort — keep polling.
@@ -471,18 +478,16 @@ function sleep(ms: number): Promise<void> {
 
 /** Try to bind to `preferred`; if busy, walk forward until we find one
  *  that's free. Caps at 50 attempts. */
-async function pickFreePort(preferred: number): Promise<number> {
-  // Probe on 0.0.0.0 to match how the daemon actually binds. Probing on
-  // 127.0.0.1 could falsely succeed when another process has 0.0.0.0:p
-  // (the loopback test slot is technically distinct from the wildcard
-  // bind on some kernels), letting us hand out a port the daemon will
-  // immediately fail to acquire with EADDRINUSE.
+async function pickFreePort(preferred: number, host: string): Promise<number> {
+  // Probe the exact host the daemon binds to. The daemon is loopback-only
+  // by default; probing 0.0.0.0 would unnecessarily reserve a LAN-facing
+  // port and can fail on locked-down machines.
   for (let p = preferred; p < preferred + 50; p++) {
     const ok = await new Promise<boolean>((resolve) => {
       const server = createServer();
       server.once('error', () => resolve(false));
       server.once('listening', () => server.close(() => resolve(true)));
-      server.listen(p, '0.0.0.0');
+      server.listen(p, host);
     });
     if (ok) return p;
   }

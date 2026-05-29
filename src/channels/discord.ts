@@ -27,6 +27,7 @@ const listPendingHarnessApprovals = approvalRegistry.listPending;
 import { listSessions as listHarnessSessions } from '../runtime/harness/eventlog.js';
 import {
   DISCORD_ALLOWED_CHANNELS,
+  DISCORD_ALLOWED_USERS,
   ASSISTANT_NAME,
   BASE_DIR,
   DISCORD_BOT_TOKEN,
@@ -38,7 +39,9 @@ import {
   DISCORD_REQUIRE_MENTION,
 } from '../config.js';
 import {
+  bindDiscordHarnessSession,
   handleDiscordHarnessMessage,
+  handleHarnessSessions,
   runDiscordHarnessConversation,
   type DiscordHarnessTransport,
   tryHandleHarnessApprovalReply,
@@ -66,6 +69,7 @@ import {
 } from '../runtime/notifications.js';
 import { buildDiscordInstallUrl } from './discord-install.js';
 import { getPlanProposal, rejectPlanProposal } from '../agents/plan-proposals.js';
+import { answerCheckIn, getCheckIn, listOpenCheckIns, type CheckInRecord } from '../agents/check-ins.js';
 import { approvePlanAndQueueBackgroundTask } from '../execution/approved-plan-tasks.js';
 import { queueBackgroundTaskApprovalResolution } from '../execution/background-tasks.js';
 import { WEBHOOK_PORT, WEBHOOK_SECRET } from '../config.js';
@@ -113,6 +117,12 @@ const DISCORD_SLASH_COMMANDS = [
     .setName('runs')
     .setDescription('List recent assistant runs.'),
   new SlashCommandBuilder()
+    .setName('sessions')
+    .setDescription('Show active Clementine sessions and reattach this Discord thread.'),
+  new SlashCommandBuilder()
+    .setName('approvals')
+    .setDescription('Show live pending Clementine approvals with action buttons.'),
+  new SlashCommandBuilder()
     .setName('help')
     .setDescription('Show the available Discord commands.'),
   new SlashCommandBuilder()
@@ -138,6 +148,10 @@ const DISCORD_SLASH_COMMANDS = [
         .setRequired(false),
     ),
 ].map((command) => command.toJSON());
+
+export function discordSlashCommandNamesForTest(): string[] {
+  return DISCORD_SLASH_COMMANDS.map((command) => String(command.name));
+}
 
 let discordClient: Client | null = null;
 let startPromise: Promise<void> | null = null;
@@ -413,6 +427,33 @@ function buildDiscordRestTransport(channelId: string) {
     },
     async sendError(content: string) {
       await sendDiscordRestChunks(channelId, content);
+    },
+  };
+}
+
+function buildDiscordMessageHarnessTransport(message: Message<boolean>): DiscordHarnessTransport {
+  return {
+    async sendInitial(content: string) {
+      const reply = (await message.reply(content.slice(0, 1900))) as unknown as {
+        edit(opts: { content: string; components?: unknown[] }): Promise<unknown>;
+      };
+      return {
+        edit: async (next: string, options?: { components?: unknown[] }) => {
+          const editPayload: { content: string; components?: unknown[] } = {
+            content: next.slice(0, 1900),
+          };
+          if (options && Array.isArray(options.components)) {
+            editPayload.components = options.components;
+          }
+          await reply.edit(editPayload);
+        },
+      };
+    },
+    async sendError(content: string) {
+      await message.reply(content.slice(0, 1900));
+    },
+    async sendFollowup(content: string) {
+      await message.reply(content.slice(0, 1900));
     },
   };
 }
@@ -752,6 +793,19 @@ function channelAllowedById(channelId: string, type: ChannelType | null): boolea
   return DISCORD_ALLOWED_CHANNELS.includes(channelId);
 }
 
+function userAllowedById(userId: string): boolean {
+  return DISCORD_ALLOWED_USERS.includes(userId);
+}
+
+async function rejectUnauthorizedInteraction(interaction: ButtonInteraction | ChatInputCommandInteraction | ModalSubmitInteraction): Promise<void> {
+  const content = 'This Discord user is not allowed to control Clementine. Add the user id to `DISCORD_ALLOWED_USERS` in Settings.';
+  if (interaction.deferred || interaction.replied) {
+    await interaction.followUp({ content, ephemeral: true }).catch(() => {});
+    return;
+  }
+  await interaction.reply({ content, ephemeral: true }).catch(() => {});
+}
+
 function extractPrompt(message: Message<boolean>): string {
   const mentionPattern = new RegExp(`<@!?${message.client.user?.id}>`, 'g');
   const stripped = message.content.replace(mentionPattern, '').trim();
@@ -763,6 +817,7 @@ function extractPrompt(message: Message<boolean>): string {
 
 function shouldRespond(message: Message<boolean>): boolean {
   if (message.author.bot) return false;
+  if (!userAllowedById(message.author.id)) return false;
   if (!message.content.trim()) return false;
   if (!channelAllowed(message)) return false;
   if (message.channel.type === ChannelType.DM) return true;
@@ -789,6 +844,11 @@ function normalizeCommandText(input: string): string {
   return withoutSlash.replace(assistantPrefix, '').trim();
 }
 
+function isSessionsCommand(input: string): boolean {
+  return /^(sessions?|sesson|active sessions|show sessions|show active sessions|list sessions|list active sessions)$/i
+    .test(input.trim());
+}
+
 function renderApprovalList(approvals: PendingApproval[]): string {
   if (approvals.length === 0) {
     return 'No pending approvals.';
@@ -802,11 +862,85 @@ function renderApprovalList(approvals: PendingApproval[]): string {
     .join('\n');
 }
 
+function isDiscordHarnessRow(row: approvalRegistry.PendingApprovalRow): boolean {
+  return row.channel === 'discord' || row.channel === 'discord-dm';
+}
+
+function relevantHarnessApprovalsForContext(input: {
+  channelId: string;
+  guildId?: string | null;
+}): approvalRegistry.PendingApprovalRow[] {
+  const rows = approvalRegistry.listPending({ status: 'pending' })
+    .filter((row) => approvalRegistry.isActionable(row));
+  if (input.guildId) return rows.filter((row) => row.channelId === input.channelId);
+  return rows.filter((row) => row.channelId === input.channelId || !isDiscordHarnessRow(row));
+}
+
+function liveHarnessApprovalsForContext(input: {
+  channelId: string;
+  guildId?: string | null;
+}): approvalRegistry.PendingApprovalRow[] {
+  const rows = approvalRegistry.listPending({ status: 'pending' })
+    .filter((row) => approvalRegistry.isActionable(row));
+  const currentChannelRows = rows.filter((row) => row.channelId === input.channelId);
+  const globalWorkflowRows = rows.filter((row) => !isDiscordHarnessRow(row));
+  const merged = [...currentChannelRows, ...globalWorkflowRows];
+  return merged.filter((row, index) =>
+    merged.findIndex((candidate) => candidate.approvalId === row.approvalId) === index,
+  );
+}
+
+function renderHarnessApprovalList(approvals: approvalRegistry.PendingApprovalRow[]): string {
+  if (approvals.length === 0) return '';
+  return approvals
+    .slice(0, 15)
+    .map((approval) => `- **${approval.subject}** — ${approval.tool ?? 'approval'} _(id \`${approval.approvalId}\`)_`)
+    .join('\n');
+}
+
+function renderCombinedApprovalList(
+  runtimeApprovals: PendingApproval[],
+  harnessApprovals: approvalRegistry.PendingApprovalRow[],
+  checkIns: CheckInRecord[] = [],
+): string {
+  if (runtimeApprovals.length === 0 && harnessApprovals.length === 0 && checkIns.length === 0) {
+    return 'No pending approvals or questions.';
+  }
+  return [
+    harnessApprovals.length > 0 ? renderHarnessApprovalList(harnessApprovals) : '',
+    runtimeApprovals.length > 0 ? renderApprovalList(runtimeApprovals) : '',
+    checkIns.length > 0 ? renderCheckInList(checkIns) : '',
+  ].filter(Boolean).join('\n');
+}
+
 function renderApprovalCardContent(approval: PendingApproval): string {
   return [
     `🔐 **Approval needed — ${approval.toolName}**`,
     summarizeApprovalAction(approval),
     `_session ${approval.sessionId} · id \`${approval.id.slice(0, 8)}\`_`,
+  ].join('\n');
+}
+
+function renderHarnessApprovalCardContent(approval: approvalRegistry.PendingApprovalRow): string {
+  return [
+    `🔐 **Approval needed — ${approval.subject}**`,
+    approval.tool ? approval.tool : '',
+    `_session ${approval.sessionId} · id \`${approval.approvalId}\`_`,
+  ].filter(Boolean).join('\n');
+}
+
+function renderCheckInList(checkIns: CheckInRecord[]): string {
+  return [
+    `**Open questions (${checkIns.length})**`,
+    ...checkIns.slice(0, 10).map((item) => `- \`${item.id}\` ${truncate(item.question.replace(/\s+/g, ' '), 120)}`),
+  ].join('\n');
+}
+
+function renderCheckInCardContent(checkIn: CheckInRecord): string {
+  return [
+    `❔ **Question from ${checkIn.agentSlug}**`,
+    truncate(checkIn.question, 1500),
+    `_id \`${checkIn.id}\`_`,
   ].join('\n');
 }
 
@@ -868,12 +1002,32 @@ function buildPlanProposalActions(planProposalId: string) {
   ];
 }
 
+function buildCheckInActions(checkInId: string) {
+  return [
+    new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`${DISCORD_CUSTOM_ID_PREFIX}:checkin-approve:${checkInId}`)
+        .setLabel('Approve')
+        .setStyle(ButtonStyle.Success),
+      new ButtonBuilder()
+        .setCustomId(`${DISCORD_CUSTOM_ID_PREFIX}:checkin-answer:${checkInId}`)
+        .setLabel('Answer / Edit')
+        .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId(`${DISCORD_CUSTOM_ID_PREFIX}:checkin-reject:${checkInId}`)
+        .setLabel('Reject')
+        .setStyle(ButtonStyle.Danger),
+    ),
+  ];
+}
+
 /**
  * Resolve which ActionRow to attach to an outbound notification, based
  * on the notification's metadata. The notification queue tags
  * approval-kind items with either `approvalId` (SDK interrupt) or
- * `planProposalId` (Plan Proposal). When neither is present we send
- * the plain notification — no buttons to click.
+ * `planProposalId` (Plan Proposal). Check-ins are also actionable:
+ * users can answer from Discord instead of typing an untracked reply.
+ * When none is present we send the plain notification.
  */
 export function buildActionsForNotification(metadata: Record<string, unknown> | undefined): ActionRowBuilder<ButtonBuilder>[] | undefined {
   if (!metadata || typeof metadata !== 'object') return undefined;
@@ -881,6 +1035,8 @@ export function buildActionsForNotification(metadata: Record<string, unknown> | 
   if (planProposalId) return buildPlanProposalActions(planProposalId);
   const approvalId = typeof metadata.approvalId === 'string' ? metadata.approvalId : undefined;
   if (approvalId) return buildApprovalActions(approvalId);
+  const checkInId = typeof metadata.checkInId === 'string' ? metadata.checkInId : undefined;
+  if (checkInId) return buildCheckInActions(checkInId);
   return undefined;
 }
 
@@ -946,6 +1102,22 @@ async function resolveNaturalApproval(input: {
   }, runtime.listPendingApprovals()).sort((left, right) => right.createdAt.localeCompare(left.createdAt));
 
   if (approvals.length === 0) {
+    const approve = action.startsWith('approve');
+    const recentCheckIns = listOpenCheckIns()
+      .filter((item) => Date.now() - Date.parse(item.askedAt) < 24 * 60 * 60 * 1000)
+      .sort((left, right) => right.askedAt.localeCompare(left.askedAt));
+    if (action.endsWith('_one') && recentCheckIns.length === 1) {
+      const checkIn = recentCheckIns[0];
+      const resolved = answerCheckIn(checkIn.id, approve ? 'approve' : 'reject');
+      if (resolved) {
+        await input.send(`Recorded ${approve ? 'approval' : 'rejection'} for check-in \`${checkIn.id}\`.`);
+        return true;
+      }
+    }
+    if (action.endsWith('_one') && recentCheckIns.length > 1) {
+      await input.send(`No pending tool approval is waiting on this Discord thread. I found ${recentCheckIns.length} recent open questions; use the buttons or /approvals so I resolve the right one.`);
+      return true;
+    }
     await input.send('No pending approval is waiting on this Discord thread.');
     return true;
   }
@@ -1117,6 +1289,16 @@ async function handleDiscordCommand(message: Message<boolean>, assistant: Clemen
   const normalized = normalizeCommandText(prompt);
   const runtime = assistant.getRuntime();
 
+  if (isSessionsCommand(normalized)) {
+    await handleHarnessSessions({
+      channelId: message.channelId,
+      userId: message.author.id,
+      guildId: message.guildId,
+      transport: buildDiscordMessageHarnessTransport(message),
+    });
+    return true;
+  }
+
   if (await resolveNaturalApproval({
     assistant,
     text: normalized,
@@ -1137,6 +1319,7 @@ async function handleDiscordCommand(message: Message<boolean>, assistant: Clemen
         '`status`',
         '`tasks`',
         '`runs`',
+        '`sessions`',
         '`status <task_id>`',
         '`status <run_id>`',
         '`stop <task_id>`',
@@ -1167,11 +1350,28 @@ async function handleDiscordCommand(message: Message<boolean>, assistant: Clemen
 
   if (/^(approvals|pending approvals)$/i.test(normalized)) {
     const approvals = relevantApprovalsForMessage(message, runtime.listPendingApprovals());
-    await sendChunks(message.channel, renderApprovalList(approvals), message);
+    const harnessApprovals = relevantHarnessApprovalsForContext({
+      channelId: message.channelId,
+      guildId: message.guildId,
+    });
+    const checkIns = listOpenCheckIns();
+    await sendChunks(message.channel, renderCombinedApprovalList(approvals, harnessApprovals, checkIns), message);
+    for (const approval of harnessApprovals.slice(0, 5)) {
+      await sendComponentMessage(message.channel, {
+        content: renderHarnessApprovalCardContent(approval),
+        components: buildApprovalActions(approval.approvalId),
+      });
+    }
     for (const approval of approvals.slice(0, 5)) {
       await sendComponentMessage(message.channel, {
         content: renderApprovalCardContent(approval),
         components: buildApprovalActions(approval.id),
+      });
+    }
+    for (const checkIn of checkIns.slice(0, 5)) {
+      await sendComponentMessage(message.channel, {
+        content: renderCheckInCardContent(checkIn),
+        components: buildCheckInActions(checkIn.id),
       });
     }
     return true;
@@ -1246,6 +1446,16 @@ async function handleDiscordRestCommand(input: {
   const runtime = input.assistant.getRuntime();
   const send = (text: string) => sendDiscordRestChunks(input.channelId, text);
 
+  if (isSessionsCommand(normalized)) {
+    await handleHarnessSessions({
+      channelId: input.channelId,
+      userId: input.userId,
+      guildId: input.guildId,
+      transport: buildDiscordRestTransport(input.channelId),
+    });
+    return true;
+  }
+
   if (await resolveNaturalApproval({
     assistant: input.assistant,
     text: normalized,
@@ -1259,11 +1469,25 @@ async function handleDiscordRestCommand(input: {
 
   if (/^(approvals|pending approvals)$/i.test(normalized)) {
     const approvals = relevantApprovalsForContext(input, runtime.listPendingApprovals());
-    await send(renderApprovalList(approvals));
+    const harnessApprovals = relevantHarnessApprovalsForContext(input);
+    const checkIns = listOpenCheckIns();
+    await send(renderCombinedApprovalList(approvals, harnessApprovals, checkIns));
+    for (const approval of harnessApprovals.slice(0, 5)) {
+      await sendDiscordRestComponentMessage(input.channelId, {
+        content: renderHarnessApprovalCardContent(approval),
+        components: buildApprovalActions(approval.approvalId),
+      });
+    }
     for (const approval of approvals.slice(0, 5)) {
       await sendDiscordRestComponentMessage(input.channelId, {
         content: renderApprovalCardContent(approval),
         components: buildApprovalActions(approval.id),
+      });
+    }
+    for (const checkIn of checkIns.slice(0, 5)) {
+      await sendDiscordRestComponentMessage(input.channelId, {
+        content: renderCheckInCardContent(checkIn),
+        components: buildCheckInActions(checkIn.id),
       });
     }
     return true;
@@ -1283,6 +1507,50 @@ async function handleDiscordRestCommand(input: {
   }
 
   return false;
+}
+
+async function sendLiveApprovalsInteraction(
+  interaction: ChatInputCommandInteraction,
+  assistant: ClementineAssistant,
+): Promise<void> {
+  const runtimeApprovals = relevantApprovalsForContext({
+    userId: interaction.user.id,
+    channelId: interaction.channelId,
+    guildId: interaction.guildId,
+  }, assistant.getRuntime().listPendingApprovals());
+  const harnessApprovals = liveHarnessApprovalsForContext({
+    channelId: interaction.channelId,
+    guildId: interaction.guildId,
+  });
+  const checkIns = listOpenCheckIns();
+
+  const summary = [
+    '**Live Clementine approvals**',
+    renderCombinedApprovalList(runtimeApprovals, harnessApprovals, checkIns),
+  ].join('\n');
+  await interaction.reply({ content: summary.slice(0, 1900), ephemeral: true });
+
+  for (const approval of harnessApprovals.slice(0, 10)) {
+    await interaction.followUp({
+      content: renderHarnessApprovalCardContent(approval).slice(0, 1900),
+      components: buildApprovalActions(approval.approvalId),
+      ephemeral: true,
+    });
+  }
+  for (const approval of runtimeApprovals.slice(0, 10)) {
+    await interaction.followUp({
+      content: renderApprovalCardContent(approval).slice(0, 1900),
+      components: buildApprovalActions(approval.id),
+      ephemeral: true,
+    });
+  }
+  for (const checkIn of checkIns.slice(0, 10)) {
+    await interaction.followUp({
+      content: renderCheckInCardContent(checkIn).slice(0, 1900),
+      components: buildCheckInActions(checkIn.id),
+      ephemeral: true,
+    });
+  }
 }
 
 async function sendChunks(channel: Message['channel'], text: string, replyTo?: Message<boolean>): Promise<void> {
@@ -1334,7 +1602,11 @@ function buildButtonHarnessTransport(interaction: ButtonInteraction): DiscordHar
       if (interaction.deferred || interaction.replied) {
         await interaction.editReply({ content: first });
       } else {
-        await interaction.reply({ content: first });
+        // Button-driven approval resumes should replace the original
+        // approval card instead of posting a second message. That
+        // removes stale clickable buttons and makes the conversation
+        // read as one resolved decision.
+        await interaction.update({ content: first, components: [] });
       }
       return {
         edit: async (next: string, options?: { components?: unknown[] }) => {
@@ -1360,6 +1632,13 @@ function buildButtonHarnessTransport(interaction: ButtonInteraction): DiscordHar
 
 async function registerSlashCommands(client: Client): Promise<void> {
   if (!client.isReady()) return;
+
+  try {
+    await client.application.commands.set(DISCORD_SLASH_COMMANDS);
+    logger.info({ scope: 'global', commandCount: DISCORD_SLASH_COMMANDS.length }, 'Registered global Discord slash commands');
+  } catch (error) {
+    logger.warn({ err: error }, 'Failed to register global Discord slash commands');
+  }
 
   for (const guild of client.guilds.cache.values()) {
     await guild.commands.set(DISCORD_SLASH_COMMANDS);
@@ -1514,7 +1793,40 @@ async function handleFocusCommand(action: string, id: number | null): Promise<st
  * Discord UI.
  */
 async function handleModalSubmit(interaction: ModalSubmitInteraction): Promise<void> {
+  if (interaction.customId.startsWith(`${DISCORD_CUSTOM_ID_PREFIX}:checkin-modal:`)) {
+    if (!userAllowedById(interaction.user.id) || !channelAllowedById(interaction.channelId ?? '', interaction.channel?.type ?? null)) {
+      await rejectUnauthorizedInteraction(interaction);
+      return;
+    }
+    const [, , checkInId] = interaction.customId.split(':');
+    if (!checkInId || !checkInId.startsWith('chk-')) {
+      await interaction.reply({ content: 'Malformed check-in answer.', ephemeral: true });
+      return;
+    }
+    const answer = interaction.fields.getTextInputValue('answer').trim();
+    if (!answer) {
+      await interaction.reply({ content: 'Answer was empty — submit cancelled.', ephemeral: true });
+      return;
+    }
+    const record = answerCheckIn(checkInId, answer);
+    if (!record) {
+      await interaction.reply({ content: `Check-in \`${checkInId}\` was not found.`, ephemeral: true });
+      return;
+    }
+    await interaction.reply({
+      content: record.status === 'answered'
+        ? `Recorded your answer for \`${checkInId}\`.`
+        : `Check-in \`${checkInId}\` is already ${record.status}.`,
+      ephemeral: true,
+    });
+    return;
+  }
+
   if (!interaction.customId.startsWith(`${DISCORD_CUSTOM_ID_PREFIX}:edit-modal:`)) {
+    return;
+  }
+  if (!userAllowedById(interaction.user.id) || !channelAllowedById(interaction.channelId ?? '', interaction.channel?.type ?? null)) {
+    await rejectUnauthorizedInteraction(interaction);
     return;
   }
   // customId format: `clementine:edit-modal:<approvalId>` (legacy) OR
@@ -1601,12 +1913,16 @@ async function handleModalSubmit(interaction: ModalSubmitInteraction): Promise<v
   // wrapping needed here.
   // Resolve via the dashboard harness-approval endpoint (same path the
   // desktop dashboard uses), so the resume logic stays in one place.
-  // We hit it on localhost; auth via WEBHOOK_SECRET query param.
-  const url = `http://127.0.0.1:${WEBHOOK_PORT}/api/console/harness-approvals/${encodeURIComponent(approvalId)}/approve_with_edits?token=${encodeURIComponent(WEBHOOK_SECRET)}`;
+  // We hit it on localhost; auth stays in a Bearer header so the
+  // webhook token never appears in logs, Discord, or URL history.
+  const url = `http://127.0.0.1:${WEBHOOK_PORT}/api/console/harness-approvals/${encodeURIComponent(approvalId)}/approve_with_edits`;
   try {
     const response = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${WEBHOOK_SECRET}`,
+      },
       body: JSON.stringify({ modifiedArgs: editedArgs }),
       signal: AbortSignal.timeout(15_000),
     });
@@ -1679,6 +1995,10 @@ async function handleButtonInteraction(interaction: ButtonInteraction, assistant
   if (!interaction.customId.startsWith(`${DISCORD_CUSTOM_ID_PREFIX}:`)) {
     return;
   }
+  if (!userAllowedById(interaction.user.id) || !channelAllowedById(interaction.channelId ?? '', interaction.channel?.type ?? null)) {
+    await rejectUnauthorizedInteraction(interaction);
+    return;
+  }
 
   const [, action, targetId] = interaction.customId.split(':');
   if (!action || !targetId) {
@@ -1687,6 +2007,26 @@ async function handleButtonInteraction(interaction: ButtonInteraction, assistant
   }
 
   try {
+    if (action === 'session-resume') {
+      if (!targetId.startsWith('sess-')) {
+        await interaction.reply({ content: 'That session button is malformed. Run `/sessions` again.', ephemeral: true });
+        return;
+      }
+      const bound = bindDiscordHarnessSession({
+        channelId: interaction.channelId ?? '',
+        sessionId: targetId,
+        userId: interaction.user.id,
+        guildId: interaction.guildId,
+      });
+      await interaction.reply({
+        content: bound
+          ? `Bound this Discord thread to \`${targetId}\`. Your next reply will continue that same Clementine session.`
+          : `Session \`${targetId}\` was not found. Run \`/sessions\` again.`,
+        ephemeral: true,
+      });
+      return;
+    }
+
     if (action === 'approve' || action === 'reject') {
       const approved = action === 'approve';
       // Stale-button guard: a Discord user can click an approval button
@@ -1720,6 +2060,7 @@ async function handleButtonInteraction(interaction: ButtonInteraction, assistant
           channelId: interaction.channelId ?? '',
           prompt: `${approved ? 'approve' : 'reject'} ${targetId}`,
           transport: buildButtonHarnessTransport(interaction),
+          allowGlobalApprovalFallback: false,
         });
         // v0.5.21.2 — if the harness handled the interaction, its
         // transport already consumed the deferUpdate/reply. We can no
@@ -1837,20 +2178,65 @@ async function handleButtonInteraction(interaction: ButtonInteraction, assistant
       return;
     }
 
+    if (action === 'checkin-approve' || action === 'checkin-reject') {
+      const record = getCheckIn(targetId);
+      if (!record) {
+        await interaction.reply({ content: `Check-in \`${targetId}\` was not found.`, ephemeral: true });
+        return;
+      }
+      if (record.status !== 'open') {
+        await collapseApprovalCard(interaction, 'already-resolved', `check-in is already ${record.status}`);
+        return;
+      }
+      const approved = action === 'checkin-approve';
+      const resolved = answerCheckIn(targetId, approved ? 'approve' : 'reject');
+      if (!resolved) {
+        await interaction.reply({ content: `Check-in \`${targetId}\` was not found.`, ephemeral: true });
+        return;
+      }
+      await collapseApprovalCard(interaction, approved ? 'approved' : 'rejected', `recorded answer for ${targetId}`);
+      return;
+    }
+
+    if (action === 'checkin-answer') {
+      const record = getCheckIn(targetId);
+      if (!record) {
+        await interaction.reply({ content: `Check-in \`${targetId}\` was not found.`, ephemeral: true });
+        return;
+      }
+      if (record.status !== 'open') {
+        await interaction.reply({ content: `Check-in \`${targetId}\` is already ${record.status}.`, ephemeral: true });
+        return;
+      }
+      const title = 'Answer Clementine';
+      const modal = new ModalBuilder()
+        .setCustomId(`${DISCORD_CUSTOM_ID_PREFIX}:checkin-modal:${targetId}`)
+        .setTitle(title)
+        .addComponents(
+          new ActionRowBuilder<TextInputBuilder>().addComponents(
+            new TextInputBuilder()
+              .setCustomId('answer')
+              .setLabel('Your answer')
+              .setStyle(TextInputStyle.Paragraph)
+              .setRequired(true)
+              .setPlaceholder(record.question.slice(0, 100)),
+          ),
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
     if (action === 'plan-approve') {
       const result = approvePlanAndQueueBackgroundTask(targetId);
       if (!result) {
         await interaction.reply({ content: `Plan \`${targetId}\` was not found or already resolved.`, ephemeral: true });
         return;
       }
-      await interaction.reply({
-        content: [
-          `✓ Plan approved: **${result.proposal.plan.objective}**`,
-          `Queued durable background task: \`${result.task.id}\`.`,
-          'A 15-minute auto-approval window is open for the approved plan scope.',
-        ].join('\n'),
-        ephemeral: true,
-      });
+      await collapseApprovalCard(
+        interaction,
+        'approved',
+        `queued background task ${result.task.id}; plan scope is open for 15 minutes`,
+      );
       return;
     }
 
@@ -1860,10 +2246,7 @@ async function handleButtonInteraction(interaction: ButtonInteraction, assistant
         await interaction.reply({ content: `Plan \`${targetId}\` was not found.`, ephemeral: true });
         return;
       }
-      await interaction.reply({
-        content: `✗ Plan rejected: **${result.plan.objective}**\nThe agent will not proceed with this plan.`,
-        ephemeral: true,
-      });
+      await collapseApprovalCard(interaction, 'rejected', `plan rejected: ${result.plan.objective.slice(0, 120)}`);
       return;
     }
 
@@ -1873,16 +2256,11 @@ async function handleButtonInteraction(interaction: ButtonInteraction, assistant
         await interaction.reply({ content: `Plan \`${targetId}\` was not found.`, ephemeral: true });
         return;
       }
-      // Deep link to the dashboard plan list. Token in querystring is the
-      // dashboard's existing auth pattern.
-      const tokenPart = WEBHOOK_SECRET ? `?token=${encodeURIComponent(WEBHOOK_SECRET)}` : '';
-      const url = `http://localhost:${WEBHOOK_PORT}/console${tokenPart}`;
       await interaction.reply({
         content: [
           `**${proposal.plan.objective}**`,
           `Complexity: ${proposal.plan.estimatedComplexity}; ${proposal.plan.steps.length} step(s).`,
-          `Open the dashboard to view full steps, success criteria, risks, and edit before approving:`,
-          url,
+          'Open Clementine Desktop → Proposals to view full steps, success criteria, risks, and edit before approving.',
         ].join('\n'),
         ephemeral: true,
       });
@@ -1962,6 +2340,11 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction, assi
     userId: interaction.user.id,
   }, 'Discord slash command received');
 
+  if (!userAllowedById(interaction.user.id)) {
+    await rejectUnauthorizedInteraction(interaction);
+    return;
+  }
+
   if (!channelAllowedById(interaction.channelId, interaction.channel?.type ?? null)) {
     await interaction.reply({
       content: 'This channel is not allowed by `DISCORD_ALLOWED_CHANNELS`.',
@@ -1985,6 +2368,8 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction, assi
           '`/status`',
           '`/tasks`',
           '`/runs`',
+          '`/sessions`',
+          '`/approvals`',
           '`/focus action:<view|list|park|resume|clear> id:<n>`',
           '`/help`',
         ].join('\n'),
@@ -2051,6 +2436,40 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction, assi
       return;
     }
 
+    if (interaction.commandName === 'sessions') {
+      await handleHarnessSessions({
+        channelId: interaction.channelId,
+        userId: interaction.user.id,
+        guildId: interaction.guildId,
+        transport: {
+          async sendInitial(content: string) {
+            const first = content.slice(0, 1900);
+            if (interaction.deferred || interaction.replied) {
+              await interaction.editReply({ content: first });
+            } else {
+              await interaction.reply({ content: first, ephemeral: true });
+            }
+            return {
+              edit: async (next: string, options?: { components?: unknown[] }) => {
+                const payload: { content: string; components?: unknown[] } = { content: next.slice(0, 1900) };
+                if (options && Array.isArray(options.components)) payload.components = options.components;
+                await interaction.editReply(payload as Parameters<ChatInputCommandInteraction['editReply']>[0]);
+              },
+            };
+          },
+          async sendError(content: string) {
+            await sendInteractionChunks(interaction, content, { ephemeral: true });
+          },
+        },
+      });
+      return;
+    }
+
+    if (interaction.commandName === 'approvals') {
+      await sendLiveApprovalsInteraction(interaction, assistant);
+      return;
+    }
+
     if (interaction.commandName === 'ask') {
       const prompt = interaction.options.getString('prompt', true).trim();
       if (!prompt) {
@@ -2112,35 +2531,12 @@ async function handleMessage(message: Message<boolean>, assistant: ClementineAss
   // approval store, which knows nothing about the pause and would
   // reply "No pending approval".
   if (DISCORD_HARNESS_ENABLED) {
-    const gatewayTransport = {
-      async sendInitial(content: string) {
-        const reply = (await message.reply(content)) as unknown as {
-          edit(opts: { content: string; components?: unknown[] }): Promise<unknown>;
-        };
-        return {
-          edit: async (next: string, options?: { components?: unknown[] }) => {
-            const editPayload: { content: string; components?: unknown[] } = {
-              content: next,
-            };
-            // Pass components through so approval Approve/Reject buttons
-            // render on the gateway path (DMs over gateway, guild
-            // channels). Without this, the harness sets `pendingApprovalId`
-            // and the components array is built — then silently dropped here.
-            if (options && Array.isArray(options.components)) {
-              editPayload.components = options.components;
-            }
-            await reply.edit(editPayload);
-          },
-        };
-      },
-      async sendError(content: string) {
-        await message.reply(content);
-      },
-    };
+    const gatewayTransport = buildDiscordMessageHarnessTransport(message);
     if (await tryHandleHarnessApprovalReply({
       channelId: message.channelId,
       prompt,
       transport: gatewayTransport,
+      allowGlobalApprovalFallback: message.channel.type === ChannelType.DM,
     })) {
       return;
     }
@@ -2279,7 +2675,7 @@ async function pollDiscordDirectMessages(client: Client, assistant: ClementineAs
       }
 
       const pending = messages
-        .filter((message) => !message.author.bot && compareSnowflakes(message.id, lastSeen) > 0)
+        .filter((message) => !message.author.bot && message.author.id === userId && userAllowedById(message.author.id) && compareSnowflakes(message.id, lastSeen) > 0)
         .sort((left, right) => compareSnowflakes(left.id, right.id));
 
       for (const message of pending) {
@@ -2316,6 +2712,7 @@ async function pollDiscordDirectMessages(client: Client, assistant: ClementineAs
               channelId: dm.id,
               prompt,
               transport: dmTransport,
+              allowGlobalApprovalFallback: true,
             });
           } catch (err) {
             // Mark seen so we don't re-poll a permanently-broken

@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import pino from 'pino';
-import { BASE_DIR, DISCORD_DM_ALLOWED_USERS } from '../config.js';
+import { BASE_DIR, DISCORD_DM_ALLOWED_USERS, DISCORD_PUSH_PROACTIVE_BRIEFS } from '../config.js';
 import type { ClementineAssistant } from '../assistant/core.js';
 import { listBackgroundTasks } from '../execution/background-tasks.js';
 import { ExecutionStore } from '../execution/store.js';
@@ -10,7 +10,7 @@ import { isUserFacingExecution } from '../execution/scope.js';
 import { addNotification } from '../runtime/notifications.js';
 import { GOALS_DIR } from '../tools/shared.js';
 import { getProactivityPolicySnapshot } from './proactivity-policy.js';
-import { listPending as listApprovalRegistry, type PendingApprovalRow } from '../runtime/harness/approval-registry.js';
+import { isActionable as isActionableApproval, listPending as listApprovalRegistry, type PendingApprovalRow } from '../runtime/harness/approval-registry.js';
 
 const logger = pino({ name: 'clementine-next.proactive-briefs' });
 
@@ -21,6 +21,7 @@ const URGENT_REPEAT_MINUTES = 4 * 60;
 interface ProactiveBriefState {
   lastBriefAt?: string;
   lastSignature?: string;
+  lastAttentionSignature?: string;
   lastTitle?: string;
   lastSummary?: string;
 }
@@ -33,6 +34,45 @@ interface GoalRecord {
   nextActions?: string[];
   blockers?: string[];
   updatedAt?: string;
+}
+
+export interface BriefBackgroundTaskLike {
+  status: string;
+  pendingApprovalId?: string;
+}
+
+export function isActiveBackgroundTaskForBrief(
+  task: BriefBackgroundTaskLike,
+  actionableApprovalIds: ReadonlySet<string>,
+): boolean {
+  const isActive =
+    task.status === 'pending' ||
+    task.status === 'running' ||
+    task.status === 'cancelling' ||
+    task.status === 'awaiting_approval' ||
+    task.status === 'interrupted';
+  if (!isActive) return false;
+
+  // Some old background tasks can be left in awaiting_approval after their
+  // approval row has been resolved, expired, or migrated away. They are not
+  // actionable, so they should not inflate Discord "background task" counts.
+  if (task.status === 'awaiting_approval' && task.pendingApprovalId) {
+    return actionableApprovalIds.has(task.pendingApprovalId);
+  }
+  return true;
+}
+
+export function approvalSummaryMetadataForBrief(approvals: PendingApprovalRow[]): Record<string, unknown> {
+  if (approvals.length === 0) return {};
+  return {
+    approvalIds: approvals.map((approval) => approval.approvalId),
+    approvalSubjects: approvals.slice(0, 4).map((approval) => approval.subject),
+  };
+}
+
+export function discordUserIdForProactiveBrief(allowDiscordCheckIns: boolean): string | undefined {
+  if (!allowDiscordCheckIns || !DISCORD_PUSH_PROACTIVE_BRIEFS) return undefined;
+  return DISCORD_DM_ALLOWED_USERS[0];
 }
 
 function ensureStateDir(): void {
@@ -99,14 +139,33 @@ function signatureFor(input: Record<string, unknown>): string {
   return createHash('sha256').update(JSON.stringify(input)).digest('hex').slice(0, 16);
 }
 
-function shouldSendBrief(state: ProactiveBriefState, signature: string, cadenceMinutes: number, urgent: boolean): boolean {
+export function shouldSendBrief(
+  state: ProactiveBriefState,
+  signature: string,
+  attentionSignature: string | undefined,
+  cadenceMinutes: number,
+  urgent: boolean,
+  nowMs = Date.now(),
+): boolean {
   if (!state.lastBriefAt) return true;
-  const elapsedMs = Date.now() - new Date(state.lastBriefAt).getTime();
-  if (state.lastSignature === signature) {
-    return urgent && elapsedMs >= Math.max(URGENT_REPEAT_MINUTES, cadenceMinutes * 60_000);
+  const elapsedMs = nowMs - new Date(state.lastBriefAt).getTime();
+  const repeatWindowMs = Math.max(URGENT_REPEAT_MINUTES, cadenceMinutes * 60_000);
+  const repeatStaleAttention = /^(1|true|on|yes)$/i.test(process.env.CLEMMY_PROACTIVE_REPEAT_STALE_ATTENTION ?? '');
+
+  if (urgent) {
+    if (attentionSignature && state.lastAttentionSignature === attentionSignature) {
+      if (!repeatStaleAttention) return false;
+      return elapsedMs >= repeatWindowMs;
+    }
+    return true;
   }
-  if (urgent) return true;
+
+  if (state.lastSignature === signature) return false;
   return elapsedMs >= cadenceMinutes * 60_000;
+}
+
+function sortedBriefTuples(items: Array<Array<string | null | undefined>>): Array<Array<string | null | undefined>> {
+  return [...items].sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
 }
 
 export function getProactiveBriefState(): ProactiveBriefState {
@@ -123,19 +182,6 @@ export async function processProactiveBriefs(assistant: ClementineAssistant): Pr
       (execution.status === 'active' || execution.status === 'blocked') &&
       isUserFacingExecution(execution),
     );
-  const backgroundTasks = listBackgroundTasks().slice(0, 50);
-  const activeTasks = backgroundTasks.filter((task) =>
-    task.status === 'pending' ||
-    task.status === 'running' ||
-    task.status === 'cancelling' ||
-    task.status === 'awaiting_approval' ||
-    task.status === 'interrupted',
-  );
-  const recentFailures = backgroundTasks.filter((task) =>
-    (task.status === 'failed' || task.status === 'aborted') &&
-    task.completedAt &&
-    Date.now() - new Date(task.completedAt).getTime() <= RECENT_FAILURE_WINDOW_MS,
-  );
   // Brief surfaces ONLY approvals that are stale enough to need a
   // nudge. Fresh approvals (just requested) already get their own
   // dedicated Discord card with Approve/Edit/Reject buttons — listing
@@ -159,7 +205,30 @@ export async function processProactiveBriefs(assistant: ClementineAssistant): Pr
       return [];
     }
   })();
-  const approvals = registryRows.filter((approval) => {
+  const actionableRegistryRows = registryRows.filter((approval) => isActionableApproval(approval));
+  const runtimePendingApprovalIds = new Set<string>();
+  try {
+    for (const approval of assistant.getRuntime().listPendingApprovals()) {
+      if (approval.status === 'pending') runtimePendingApprovalIds.add(approval.id);
+    }
+  } catch {
+    // Runtime approval state is best-effort for brief hygiene. The harness
+    // registry above remains the authoritative source for new approvals.
+  }
+  const actionableApprovalIds = new Set<string>([
+    ...actionableRegistryRows.map((approval) => approval.approvalId),
+    ...runtimePendingApprovalIds,
+  ]);
+  const backgroundTasks = listBackgroundTasks().slice(0, 50);
+  const activeTasks = backgroundTasks.filter((task) =>
+    isActiveBackgroundTaskForBrief(task, actionableApprovalIds),
+  );
+  const recentFailures = backgroundTasks.filter((task) =>
+    (task.status === 'failed' || task.status === 'aborted') &&
+    task.completedAt &&
+    Date.now() - new Date(task.completedAt).getTime() <= RECENT_FAILURE_WINDOW_MS,
+  );
+  const approvals = actionableRegistryRows.filter((approval) => {
     const requestedAt = approval.requestedAt;
     if (!requestedAt) return true;
     return Date.now() - new Date(requestedAt).getTime() >= APPROVAL_BRIEF_AGE_MS;
@@ -190,12 +259,20 @@ export async function processProactiveBriefs(assistant: ClementineAssistant): Pr
     approvals: approvals.map((approval) => [approval.approvalId, approval.subject, approval.sessionId]),
     blockedGoals: blockedGoals.map((goal) => [goal.id, goal.title, goal.blockers?.[0]]),
   };
+  const attentionSignal = {
+    approvals: sortedBriefTuples(approvals.map((approval) => [approval.approvalId, approval.sessionId, approval.subject])),
+    blockedExecutions: sortedBriefTuples(blockedExecutions.map((execution) => [execution.id, execution.blocker])),
+    attentionTasks: sortedBriefTuples(attentionTasks.map((task) => [task.id, task.status, task.pendingApprovalId])),
+    recentFailures: sortedBriefTuples(recentFailures.map((task) => [task.id, task.status, task.error])),
+    blockedGoals: sortedBriefTuples(blockedGoals.map((goal) => [goal.id, goal.title, goal.blockers?.[0]])),
+  };
   const hasSignal = executions.length > 0 || activeTasks.length > 0 || recentFailures.length > 0 || approvals.length > 0 || blockedGoals.length > 0;
   if (!hasSignal) return;
 
   const state = loadState();
   const signature = signatureFor(signal);
-  if (!shouldSendBrief(state, signature, policy.briefCadenceMinutes, urgent)) return;
+  const attentionSignature = urgent ? signatureFor(attentionSignal) : undefined;
+  if (!shouldSendBrief(state, signature, attentionSignature, policy.briefCadenceMinutes, urgent)) return;
 
   const lines = [
     urgent
@@ -219,7 +296,9 @@ export async function processProactiveBriefs(assistant: ClementineAssistant): Pr
             return `- Pending ${ageLabel}: ${subject}${sourceWorkflow}`;
           }),
           ...(approvals.length > 4 ? [`- … +${approvals.length - 4} more pending.`] : []),
-          'Open the dashboard → Approvals panel to handle these (approve / edit / reject / cancel).',
+          approvals.length === 1
+            ? `Reply \`approve ${approvals[0].approvalId}\` / \`reject ${approvals[0].approvalId}\`, or open the Approvals panel.`
+            : 'Reply `approvals` to get individual approval cards, or open the Approvals panel.',
         ]
       : []),
     ...blockedExecutions.slice(0, 4).map((execution) =>
@@ -249,11 +328,10 @@ export async function processProactiveBriefs(assistant: ClementineAssistant): Pr
   ].filter(Boolean);
 
   const now = new Date().toISOString();
-  const title = approvals.length > 0
-    ? 'Clementine needs approval'
-    : urgent
+  const title = urgent
       ? 'Clementine needs attention'
       : 'Clementine work update';
+  const approvalMetadata = approvalSummaryMetadataForBrief(approvals);
 
   addNotification({
     id: `${Date.now()}-proactive-brief`,
@@ -264,17 +342,20 @@ export async function processProactiveBriefs(assistant: ClementineAssistant): Pr
     read: false,
     metadata: {
       proactiveBrief: true,
-      discordUserId: policy.allowDiscordCheckIns ? DISCORD_DM_ALLOWED_USERS[0] : undefined,
+      discordUserId: discordUserIdForProactiveBrief(policy.allowDiscordCheckIns),
       activeExecutionCount: executions.length,
       activeBackgroundTaskCount: activeTasks.length,
       pendingApprovalCount: approvals.length,
       blockedGoalCount: blockedGoals.length,
+      attentionSignature,
+      ...approvalMetadata,
     },
   });
 
   saveState({
     lastBriefAt: now,
     lastSignature: signature,
+    lastAttentionSignature: attentionSignature ?? state.lastAttentionSignature,
     lastTitle: title,
     lastSummary: lines.slice(0, 8).join('\n'),
   });

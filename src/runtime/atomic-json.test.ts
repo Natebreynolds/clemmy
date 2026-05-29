@@ -6,6 +6,7 @@ import assert from 'node:assert/strict';
 import { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { performance } from 'node:perf_hooks';
 
 const TMP = mkdtempSync(path.join(os.tmpdir(), 'clemmy-atomic-json-test-'));
 test.after(() => {
@@ -39,20 +40,28 @@ test('atomicJsonMutate runs mutators in PARALLEL across different files', async 
   // each other — different files = different locks.
   const f1 = path.join(TMP, 'c1.json');
   const f2 = path.join(TMP, 'c2.json');
-  const start = Date.now();
+  const intervals: Array<{ name: string; start: number; end: number }> = [];
+  const slowMutator = (name: string) => async (cur: { v: number }) => {
+    const start = performance.now();
+    await new Promise((r) => setTimeout(r, 100));
+    const end = performance.now();
+    intervals.push({ name, start, end });
+    return { v: cur.v + 1 };
+  };
+
   await Promise.all([
-    atomicJsonMutate<{ v: number }>(f1, async (cur) => {
-      await new Promise((r) => setTimeout(r, 100));
-      return { v: cur.v + 1 };
-    }, { v: 0 }),
-    atomicJsonMutate<{ v: number }>(f2, async (cur) => {
-      await new Promise((r) => setTimeout(r, 100));
-      return { v: cur.v + 1 };
-    }, { v: 0 }),
+    atomicJsonMutate<{ v: number }>(f1, slowMutator('c1'), { v: 0 }),
+    atomicJsonMutate<{ v: number }>(f2, slowMutator('c2'), { v: 0 }),
   ]);
-  const elapsed = Date.now() - start;
-  // If they serialized, elapsed > 200ms. Parallel = ~100ms + jitter.
-  assert.ok(elapsed < 180, `expected parallel execution, got ${elapsed}ms`);
+
+  assert.equal(intervals.length, 2);
+  const [a, b] = intervals;
+  assert.ok(a && b);
+  const overlapped = a.start < b.end && b.start < a.end;
+  assert.ok(
+    overlapped,
+    `expected mutators for different files to overlap, got ${JSON.stringify(intervals)}`,
+  );
 });
 
 test('atomicJsonMutate skips the write when mutator returns undefined', async () => {

@@ -374,7 +374,7 @@ export async function runSetupWizard(): Promise<number> {
   if (doctorCode === 0) {
     console.log(`  ${GREEN}${BOLD}All set!${RESET}`);
     console.log();
-    info(`Console:   ${CYAN}http://localhost:${values.WEBHOOK_PORT}/console?token=${encodeURIComponent(values.WEBHOOK_SECRET)}${RESET}`);
+    info(`Console:   ${CYAN}http://127.0.0.1:${values.WEBHOOK_PORT}/console${RESET}`);
     info(`Start:     ${CYAN}clementine daemon start${RESET}`);
     info(`Chat:      ${CYAN}clementine chat${RESET}`);
   } else {

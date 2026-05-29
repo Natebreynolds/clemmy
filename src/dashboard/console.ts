@@ -131,6 +131,16 @@ export function renderConsoleHtml(token: string): string {
         <span class="nav-key">03</span>
         <span class="nav-label">Brain</span>
       </button>
+      <!-- Meetings — promoted to a top-level slot only when Recall.ai
+           meeting capture is enabled. Hidden by default; revealed by
+           syncMeetingsPlacement() once recallStatus().enabled is true.
+           When not configured, meetings stay under Brain's "meetings"
+           sub-tab (status quo). Letter key "M" mirrors Approvals' "A"
+           so the 01–10 numbering never shifts. -->
+      <button class="nav" data-panel="meetings" data-meetings-nav hidden>
+        <span class="nav-key">M</span>
+        <span class="nav-label">Meetings</span>
+      </button>
       <button class="nav" data-panel="workflows">
         <span class="nav-key">04</span>
         <span class="nav-label">Workflows</span>
@@ -166,6 +176,10 @@ export function renderConsoleHtml(token: string): string {
       <button class="nav" data-panel="approvals">
         <span class="nav-key">A</span>
         <span class="nav-label">Approvals <span class="approvals-badge" data-approvals-badge hidden></span></span>
+      </button>
+      <button class="nav" data-panel="mobile-access">
+        <span class="nav-key">M</span>
+        <span class="nav-label">Mobile</span>
       </button>
 
       <!-- ── nav-dock: fills the dead space under the menu items ──
@@ -322,6 +336,16 @@ export function renderConsoleHtml(token: string): string {
                 </div>
               </div>
 
+              <div class="home-block home-completed">
+                <div class="home-block-head">
+                  <span>COMPLETED</span>
+                  <em data-home-recent-count>—</em>
+                </div>
+                <div class="home-block-body command-list compact" data-home-recent-list>
+                  <div class="home-empty">— nothing completed recently —</div>
+                </div>
+              </div>
+
 
               <!--
                 CLEMENTINE LIVE — its own card on home. Click anywhere
@@ -372,7 +396,10 @@ export function renderConsoleHtml(token: string): string {
               <div class="home-block home-chat home-chat-dock">
                 <div class="home-block-head">
                   <span>CHAT DOCK</span>
-                  <span class="home-chat-meta" data-home-chat-meta>local session</span>
+                  <span class="home-chat-head-actions">
+                    <button type="button" class="home-chat-live-btn" data-home-live-open title="Open Clementine Live">LIVE</button>
+                    <span class="home-chat-meta" data-home-chat-meta>local session</span>
+                  </span>
                 </div>
                 <div class="home-chat-thread" data-home-chat-thread>
                   <div class="home-chat-hint">
@@ -469,7 +496,10 @@ export function renderConsoleHtml(token: string): string {
           <aside class="wf-list-pane">
             <div class="wf-list-head">
               <span>WORKFLOWS</span>
-              <span class="wf-new-btn" data-wf-new role="button" tabindex="0" title="Create new workflow" onclick="window.__clementineStartNewWorkflow && window.__clementineStartNewWorkflow();">＋ NEW</span>
+              <span class="wf-list-actions">
+                <button type="button" class="wf-home-btn" data-wf-home title="Workflow home">HOME</button>
+                <span class="wf-new-btn" data-wf-new role="button" tabindex="0" title="Create new workflow" onclick="window.__clementineStartNewWorkflow && window.__clementineStartNewWorkflow();">＋ NEW</span>
+              </span>
             </div>
             <ol class="wf-list" data-wf-list>
               <li class="empty">— loading —</li>
@@ -483,14 +513,9 @@ export function renderConsoleHtml(token: string): string {
 
           <!-- Editor (middle) -->
           <div class="wf-editor" data-wf-editor>
-            <div class="wf-empty wf-empty-onboarding">
-              <div class="wf-empty-mark">⊟</div>
-              <div class="wf-empty-text">No workflow selected</div>
-              <p class="wf-empty-sub">A workflow is a multi-step task you can run on demand or on a schedule. Steps can depend on each other, share inputs, and synthesize a final output.</p>
-              <div class="wf-empty-actions">
-                <button class="wf-empty-btn primary" data-wf-new onclick="window.__clementineStartNewWorkflow && window.__clementineStartNewWorkflow();">＋ NEW WORKFLOW</button>
-                <button class="wf-empty-btn" data-wf-empty-architect>ASK ARCHITECT TO DRAFT ONE →</button>
-              </div>
+            <div class="wf-empty">
+              <div class="wf-empty-mark">↻</div>
+              <div class="wf-empty-text">Loading workflow home…</div>
             </div>
           </div>
 
@@ -499,6 +524,7 @@ export function renderConsoleHtml(token: string): string {
             <div class="wf-chat-head">
               <span class="wf-chat-title">ARCHITECT</span>
               <span class="wf-chat-meta" data-wf-chat-meta>idle</span>
+              <button type="button" class="wf-chat-collapse" data-wf-chat-toggle title="Collapse architect">⇥</button>
             </div>
             <div class="wf-chat-log" data-wf-chat-log>
               <div class="wf-chat-intro">
@@ -818,6 +844,20 @@ export function renderConsoleHtml(token: string): string {
         Anchored on Tulving's semantic / episodic / procedural framing
         — see [[project_brain_architecture]] + [[project_brain_phase1_gaps]].
       -->
+      <!-- Top-level Meetings panel. Empty by default — the single
+           .mem-meetings node (defined once inside the Brain "meetings"
+           sub-pane) is RELOCATED into [data-meetings-mount] by
+           syncMeetingsPlacement() when Recall capture is enabled, and
+           moved back under Brain when disabled. There is only ever one
+           .mem-meetings block because every loader queries it by a
+           single selector (data-mem-meetings*). -->
+      <section class="panel-frame" data-section="meetings" hidden>
+        <div class="panel-tag">PANEL · M · MEETINGS</div>
+        <div class="panel-body">
+          <div data-meetings-mount></div>
+        </div>
+      </section>
+
       <section class="panel-frame" data-section="brain" hidden>
         <div class="panel-tag">PANEL · B · BRAIN</div>
         <div class="panel-body brain-layout">
@@ -1026,6 +1066,7 @@ export function renderConsoleHtml(token: string): string {
               <div class="mem-meetings" data-mem-meetings>
                 <div class="mem-meetings-head">
                   <span class="mem-meetings-tag">CAPTURED MEETINGS</span>
+                  <input type="search" class="mem-meetings-search" data-mem-meetings-search placeholder="Search meetings…" aria-label="Search meetings" />
                   <span class="mem-meetings-meta" data-mem-meetings-meta>—</span>
                   <button type="button" class="mem-meetings-refresh" data-mem-meetings-refresh>REFRESH</button>
                 </div>
@@ -1272,10 +1313,18 @@ export function renderConsoleHtml(token: string): string {
             <span>Show advanced</span>
           </label>
         </div>
+        <div class="settings-tabs" data-settings-tabs>
+          <button type="button" class="settings-tab" data-settings-tab-target="profile">PROFILE</button>
+          <button type="button" class="settings-tab" data-settings-tab-target="runtime">RUNTIME</button>
+          <button type="button" class="settings-tab" data-settings-tab-target="autonomy">AUTONOMY</button>
+          <button type="button" class="settings-tab" data-settings-tab-target="memory">MEMORY</button>
+          <button type="button" class="settings-tab" data-settings-tab-target="credentials">CREDENTIALS</button>
+          <button type="button" class="settings-tab" data-settings-tab-target="diagnostics">DIAGNOSTICS</button>
+        </div>
         <div class="panel-body settings-layout">
 
-          <div class="settings-col">
-            <div class="settings-block">
+          <div class="settings-col" data-settings-col>
+            <div class="settings-block" data-settings-tab-panel="profile">
               <div class="settings-block-head">USER PROFILE</div>
               <form class="settings-form" data-settings-profile-form>
                 <div class="settings-field">
@@ -1340,12 +1389,12 @@ export function renderConsoleHtml(token: string): string {
               </form>
             </div>
 
-            <div class="settings-block">
+            <div class="settings-block" data-settings-tab-panel="runtime">
               <div class="settings-block-head">RUNTIME AUTH</div>
               <div class="settings-info" data-settings-auth>—</div>
             </div>
 
-            <div class="settings-block">
+            <div class="settings-block" data-settings-tab-panel="runtime">
               <div class="settings-block-head">MODEL PICKER</div>
               <form class="settings-form" data-settings-models-form>
                 <div class="settings-model-row">
@@ -1386,11 +1435,11 @@ export function renderConsoleHtml(token: string): string {
               <div class="settings-info" data-settings-models-status>—</div>
             </div>
 
-            <div class="settings-block">
+            <div class="settings-block" data-settings-tab-panel="runtime">
               <div class="settings-block-head">RUNTIME BUDGETS</div>
               <form class="settings-form" data-settings-runtime-form>
                 <div class="settings-field">
-                  <label>WORKFLOW MODE</label>
+                  <label>WORK MODE</label>
                   <select name="preset" data-runtime-field data-runtime-preset>
                     <option value="standard">standard — normal chat + tasks</option>
                     <option value="long">long workflow — higher budget + check-ins</option>
@@ -1399,27 +1448,27 @@ export function renderConsoleHtml(token: string): string {
                 </div>
                 <div class="settings-grid-2">
                   <div class="settings-field">
-                    <label>MAX SDK TURNS</label>
+                    <label>MODEL TURNS</label>
                     <input type="number" name="maxTurns" data-runtime-field min="1" max="2000" />
                   </div>
                   <div class="settings-field">
-                    <label>MAX CONVERSATION STEPS</label>
+                    <label>WORK STEPS</label>
                     <input type="number" name="maxConversationSteps" data-runtime-field min="1" max="1000000" />
                   </div>
                 </div>
                 <div class="settings-grid-2">
                   <div class="settings-field">
-                    <label>WALL-CLOCK MINUTES</label>
+                    <label>MAX WORK MINUTES</label>
                     <input type="number" name="maxConversationWallMinutes" data-runtime-field min="0" max="525600" />
                   </div>
                   <div class="settings-field">
-                    <label>TOOL CALLS PER TURN</label>
+                    <label>TOOL ACTIONS PER TURN</label>
                     <input type="number" name="toolCallsPerTurn" data-runtime-field min="1" max="256" />
                   </div>
                 </div>
                 <div class="settings-grid-2">
                   <div class="settings-field">
-                    <label>VISIBLE CHECK-IN MINUTES</label>
+                    <label>CHECK-IN EVERY</label>
                     <input type="number" name="checkInMinutes" data-runtime-field min="1" max="240" />
                   </div>
                   <div class="settings-field">
@@ -1440,8 +1489,8 @@ export function renderConsoleHtml(token: string): string {
             </div>
           </div>
 
-          <div class="settings-col">
-            <div class="settings-block" data-advanced-block hidden>
+          <div class="settings-col" data-settings-col>
+            <div class="settings-block" data-settings-tab-panel="autonomy" data-advanced-block hidden>
               <div class="settings-block-head">PROACTIVITY POLICY</div>
               <form class="settings-form" data-settings-policy-form>
                 <div class="settings-field">
@@ -1522,7 +1571,7 @@ export function renderConsoleHtml(token: string): string {
               </form>
             </div>
 
-            <div class="settings-block">
+            <div class="settings-block" data-settings-tab-panel="profile">
               <div class="settings-block-head">PERSONALITY · how Clementine talks to you</div>
               <div class="settings-info" style="line-height: 1.6;">
                 Personality + identity live as plain-text files Clementine reads on every turn — edits take effect on your next message, no restart.
@@ -1530,12 +1579,12 @@ export function renderConsoleHtml(token: string): string {
               </div>
             </div>
 
-            <div class="settings-block">
+            <div class="settings-block" data-settings-tab-panel="memory">
               <div class="settings-block-head">MEMORY INDEX</div>
               <div class="settings-info" data-settings-memory>—</div>
             </div>
 
-            <div class="settings-block">
+            <div class="settings-block" data-settings-tab-panel="autonomy">
               <div class="settings-block-head">
                 PROPOSED PLANS
                 <span class="creds-meta" data-plan-proposals-meta>—</span>
@@ -1548,7 +1597,7 @@ export function renderConsoleHtml(token: string): string {
               </div>
             </div>
 
-            <div class="settings-block">
+            <div class="settings-block" data-settings-tab-panel="autonomy">
               <div class="settings-block-head">
                 PROPOSED BY AGENT
                 <span class="creds-meta" data-proposals-meta>—</span>
@@ -1561,7 +1610,7 @@ export function renderConsoleHtml(token: string): string {
               </div>
             </div>
 
-            <div class="settings-block">
+            <div class="settings-block" data-settings-tab-panel="autonomy">
               <div class="settings-block-head">
                 PROACTIVE CHECK-INS
                 <span class="creds-meta" data-checkins-meta>—</span>
@@ -1578,7 +1627,7 @@ export function renderConsoleHtml(token: string): string {
               </div>
             </div>
 
-            <div class="settings-block">
+            <div class="settings-block" data-settings-tab-panel="credentials">
               <div class="settings-block-head">
                 CREDENTIAL VAULT
                 <span class="creds-meta" data-creds-meta>—</span>
@@ -1591,11 +1640,12 @@ export function renderConsoleHtml(token: string): string {
                 <div class="settings-info">— loading —</div>
               </div>
               <div class="creds-actions">
-                <button class="creds-btn-repair" data-creds-repair>REPAIR KEYCHAIN ⟲</button>
+                <button class="creds-btn-repair" data-creds-repair>IMPORT LEGACY KEYCHAIN ⇢</button>
                 <button class="creds-btn-reset" data-creds-reset>RESET CREDENTIALS ▣</button>
               </div>
               <div class="creds-footnote">
-                Reset only deletes entries under <code>com.clemmy.desktop.v1</code> and the local file vault.
+                Keychain import is only for users upgrading from old Clementine builds.
+                Reset deletes entries under <code>com.clemmy.desktop.v1</code> and the local file vault.
                 Your <code>.env</code> is never touched.
               </div>
             </div>
@@ -1608,8 +1658,8 @@ export function renderConsoleHtml(token: string): string {
             health, and storage stats from /api/console/diagnostics.
             Pure read; no buttons that modify state.
           -->
-          <div class="settings-col" data-diagnostics-wrap>
-            <div class="settings-block">
+          <div class="settings-col" data-settings-col data-diagnostics-wrap>
+            <div class="settings-block" data-settings-tab-panel="diagnostics">
               <label class="settings-toggle">
                 <input type="checkbox" data-diagnostics-toggle />
                 <span>Show diagnostics</span>
@@ -1619,7 +1669,7 @@ export function renderConsoleHtml(token: string): string {
                 Useful for diagnosing why a particular session was fast or slow without grepping logs.
               </p>
             </div>
-            <div class="settings-block" data-diagnostics-panel hidden>
+            <div class="settings-block" data-settings-tab-panel="diagnostics" data-diagnostics-panel hidden>
               <div class="settings-block-head">
                 DIAGNOSTICS
                 <button type="button" class="settings-btn-mini" data-diagnostics-refresh title="Refresh">↻</button>
@@ -1651,6 +1701,550 @@ export function renderConsoleHtml(token: string): string {
           </div>
 
         </div>
+      </section>
+
+      <section class="panel-frame" data-section="mobile-access" hidden>
+        <div class="panel-tag">PANEL · M · MOBILE</div>
+        <div class="panel-body" data-mobile-access-panel>
+          <header class="hub-header">
+            <div>
+              <h3>Mobile Access</h3>
+              <p>Start a mobile link, scan the QR with your phone, and keep working with Clementine away from the desktop. Custom domains live under Advanced.</p>
+            </div>
+            <div class="hub-stats">
+              <div class="stat-card"><span>STATUS</span><em data-ma-status>—</em></div>
+              <div class="stat-card"><span>SESSIONS</span><em data-ma-session-count>—</em></div>
+            </div>
+          </header>
+
+          <div class="hub-block" data-ma-step="pair">
+            <div class="hub-block-head">
+              <span class="hub-block-title">Pair your phone</span>
+              <span class="hub-block-meta" data-ma-qr-meta>—</span>
+            </div>
+            <p class="hub-block-intro">Use the temporary link first. It needs no Cloudflare account or domain, and it gives you a QR in about a minute. The link changes after restarts, so use Advanced only when you want a permanent URL.</p>
+            <div class="hub-qr" data-ma-qr></div>
+            <div class="hub-actions" data-ma-pair-actions></div>
+          </div>
+
+          <details class="ma-advanced" data-ma-advanced>
+            <summary>
+              <span>Advanced custom domain</span>
+              <em>Permanent URL, Cloudflare Access, custom DNS</em>
+            </summary>
+            <div class="ma-advanced-body">
+          <div class="hub-block" data-ma-step="binary">
+            <div class="hub-block-head">
+              <span class="hub-block-title">cloudflared</span>
+              <span class="hub-block-meta" data-ma-binary-meta>—</span>
+            </div>
+            <p class="hub-block-intro">Cloudflare's tunnel agent. Temporary links and custom domains both use this local helper.</p>
+            <div class="settings-info" data-ma-binary-info>— loading —</div>
+            <div class="hub-actions">
+              <button type="button" class="btn" data-ma-action="install">Install via Homebrew</button>
+              <button type="button" class="btn btn-secondary" data-ma-action="detect">Re-detect</button>
+            </div>
+            <pre class="hub-output" data-ma-install-output hidden></pre>
+          </div>
+
+          <div class="hub-block" data-ma-step="remote-url">
+            <div class="hub-block-head">
+              <span class="hub-block-title">Sign into Cloudflare</span>
+              <span class="hub-block-meta" data-ma-login-meta>—</span>
+            </div>
+            <p class="hub-block-intro">Only needed for a permanent custom domain. Temporary links skip this entirely.</p>
+            <div class="settings-info" data-ma-login-info>— loading —</div>
+            <div class="hub-actions">
+              <button type="button" class="btn" data-ma-action="login">Start Cloudflare sign-in</button>
+              <button type="button" class="btn btn-secondary" data-ma-action="login-cancel" hidden>Cancel</button>
+            </div>
+            <p class="hub-block-intro" style="margin-top:8px; color: var(--fg-3);">Don't have a Cloudflare account or domain yet? <a href="https://dash.cloudflare.com/sign-up/registrar" target="_blank" rel="noopener">Buy a domain through Cloudflare</a> (~$10/yr, no markup) — that's the cheapest path. If your domain is elsewhere, you'll need to move its nameservers to Cloudflare first.</p>
+          </div>
+
+          <div class="hub-block">
+            <div class="hub-block-head">
+              <span class="hub-block-title">Pick a hostname</span>
+              <span class="hub-block-meta" data-ma-tunnel-meta>—</span>
+            </div>
+            <p class="hub-block-intro">Creates a named tunnel and points a hostname at it. Pick something memorable, like <code>clem.yourdomain.com</code>.</p>
+            <form class="settings-form" data-ma-configure-form>
+              <div class="settings-field">
+                <label>TUNNEL NAME</label>
+                <input type="text" name="tunnelName" placeholder="clem-laptop" autocomplete="off" />
+              </div>
+              <div class="settings-field">
+                <label>HOSTNAME (e.g. clem.yourdomain.com)</label>
+                <input type="text" name="hostname" placeholder="clem.yourdomain.com" autocomplete="off" />
+              </div>
+              <div class="hub-actions">
+                <button type="submit" class="btn">Create tunnel + route DNS</button>
+              </div>
+            </form>
+            <div class="settings-info" data-ma-configure-info></div>
+          </div>
+
+          <div class="hub-block ma-access" data-ma-access-card hidden>
+            <div class="hub-block-head">
+              <span class="hub-block-title">★ Lock it down with Cloudflare Access</span>
+              <span class="hub-block-meta" data-ma-access-meta>strongly recommended</span>
+            </div>
+            <p class="hub-block-intro"><strong>Read this before sharing your URL.</strong> Your custom domain is in public DNS — anyone who knows it can hit your daemon. Right now the only barrier between them and Clementine is your PIN. Clementine has computer access, so a brute-forced PIN means an attacker can prompt Clem to run shell commands.</p>
+            <p class="hub-block-intro">Cloudflare Access closes that gap. It puts a Google sign-in (or one-time email PIN) in front of your tunnel — only YOUR email can get through, and only after authenticating. Attackers hit a login page from Cloudflare, not your daemon. <strong>Free up to 50 users.</strong></p>
+            <p class="hub-block-intro">Three minutes to set up:</p>
+            <ol class="ma-access-steps">
+              <li>Open the <a href="https://one.dash.cloudflare.com/" target="_blank" rel="noopener">Cloudflare Zero Trust dashboard</a> for your account.</li>
+              <li>Access → Applications → <strong>Add an application → Self-hosted</strong>. Application name: <code>Clementine</code>. Application domain: your hostname (e.g. <code>clem.yourdomain.com</code>).</li>
+              <li>Add a policy: name it <code>Just me</code>. Action <strong>Allow</strong>. Include rule: <strong>Emails → your-email@example.com</strong>. Save.</li>
+            </ol>
+            <p class="hub-block-intro">After that, opening your URL takes you through a Google login (or email PIN) before Clementine's PIN screen. If you don't trust Google SSO, the email-PIN option works without any third-party account.</p>
+            <div class="hub-actions">
+              <a class="btn" href="https://one.dash.cloudflare.com/" target="_blank" rel="noopener">Open Cloudflare Zero Trust</a>
+              <button type="button" class="btn btn-secondary" data-ma-action="access-ack">I've enabled Access</button>
+              <button type="button" class="btn btn-secondary" data-ma-action="access-skip">Skip (less secure)</button>
+            </div>
+            <p class="settings-info" data-ma-access-info></p>
+          </div>
+
+          <div class="hub-block">
+            <div class="hub-block-head">
+              <span class="hub-block-title">Run the custom-domain tunnel</span>
+              <span class="hub-block-meta" data-ma-run-meta>—</span>
+            </div>
+            <p class="hub-block-intro">Start cloudflared for the custom domain. The temporary link starts from the Pair your phone card.</p>
+            <div class="hub-actions">
+              <button type="button" class="btn" data-ma-action="tunnel-start">Start tunnel</button>
+              <button type="button" class="btn btn-secondary" data-ma-action="tunnel-stop">Stop tunnel</button>
+            </div>
+            <div class="settings-info" data-ma-run-info></div>
+          </div>
+            </div>
+          </details>
+
+          <div class="hub-block">
+            <div class="hub-block-head">
+              <span class="hub-block-title">Mobile PIN fallback</span>
+              <span class="hub-block-meta" data-ma-pin-meta>—</span>
+            </div>
+            <p class="hub-block-intro">An 8–64 character PIN (letters, digits, and symbols all welcome) for manual unlock when QR pairing isn't available. Clementine stores only a hash, so the current PIN cannot be shown; set a new one here whenever you need it. Rotating the PIN invalidates every active mobile session.</p>
+            <form class="settings-form" data-ma-pin-form>
+              <div class="settings-field">
+                <label>NEW PIN</label>
+                <input type="password" name="pin" minlength="8" maxlength="64" autocomplete="new-password" placeholder="At least 8 characters" />
+              </div>
+              <div class="hub-actions">
+                <button type="submit" class="btn">Save PIN</button>
+              </div>
+            </form>
+            <div class="settings-info" data-ma-pin-info></div>
+          </div>
+
+          <div class="hub-block">
+            <div class="hub-block-head">
+              <span class="hub-block-title">Connected devices</span>
+              <span class="hub-block-meta" data-ma-devices-meta>—</span>
+            </div>
+            <div class="hub-devices" data-ma-devices></div>
+            <div class="hub-actions">
+              <button type="button" class="btn btn-danger" data-ma-action="sessions-revoke-all">Disconnect all devices</button>
+            </div>
+          </div>
+        </div>
+        <script>
+          (function() {
+            const root = document.querySelector('[data-mobile-access-panel]');
+            if (!root) return;
+            const $ = (sel) => root.querySelector(sel);
+            const $$ = (sel) => Array.from(root.querySelectorAll(sel));
+            let lastStatus = null;
+            let installPollTimer = null;
+            let installJobId = null;
+
+            async function api(path, init) {
+              const opts = Object.assign({ headers: {} }, init || {});
+              const token = new URLSearchParams(location.search).get('token');
+              if (token) {
+                const sep = path.includes('?') ? '&' : '?';
+                path = path + sep + 'token=' + encodeURIComponent(token);
+              }
+              if (opts.body && !opts.headers['content-type']) {
+                opts.headers['content-type'] = 'application/json';
+              }
+              const res = await fetch(path, opts);
+              const text = await res.text();
+              let body = null;
+              try { body = text ? JSON.parse(text) : null; } catch { body = { error: text }; }
+              if (!res.ok) throw new Error((body && body.error) || ('HTTP ' + res.status));
+              return body;
+            }
+
+            function setText(sel, text) { const el = $(sel); if (el) el.textContent = text; }
+            function setHtml(sel, html) { const el = $(sel); if (el) el.innerHTML = html; }
+            function show(el) { if (el) el.hidden = false; }
+            function hide(el) { if (el) el.hidden = true; }
+            function esc(s) {
+              return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({
+                '&': '&amp;',
+                '<': '&lt;',
+                '>': '&gt;',
+                '"': '&quot;',
+                "'": '&#39;',
+              }[c]));
+            }
+
+            function statusLabel(status) {
+              switch (status) {
+                case 'inactive': return 'Inactive';
+                case 'installing': return 'Installing cloudflared';
+                case 'awaiting-login': return 'Waiting for Cloudflare login';
+                case 'configuring': return 'Configuring';
+                case 'running': return 'Running';
+                case 'error': return 'Error';
+                default: return status || '—';
+              }
+            }
+
+            function render(payload) {
+              lastStatus = payload;
+              setText('[data-ma-status]', statusLabel(payload.state.status));
+              setText('[data-ma-session-count]', String(payload.sessions.length));
+
+              // Step 1 — binary
+              if (payload.detect.binary) {
+                setText('[data-ma-binary-meta]', 'installed');
+                setText('[data-ma-binary-info]', payload.detect.binary + ' (v' + (payload.detect.version || 'unknown') + ', ' + payload.detect.source + ')');
+              } else {
+                setText('[data-ma-binary-meta]', 'not installed');
+                setText('[data-ma-binary-info]', 'Click "Install via Homebrew" — needs Homebrew on macOS.');
+              }
+
+              // Step 2 — login
+              if (payload.login.certPresent) {
+                setText('[data-ma-login-meta]', 'logged in');
+                setText('[data-ma-login-info]', 'cert.pem present (updated ' + (payload.login.certUpdatedAt || '?') + ')');
+                hide($('[data-ma-action="login-cancel"]'));
+              } else if (payload.login.active) {
+                setText('[data-ma-login-meta]', 'waiting for browser');
+                const url = payload.login.url || '(URL not captured yet)';
+                setHtml('[data-ma-login-info]', 'Open this URL in your browser: <a href="' + url + '" target="_blank" rel="noopener">' + url + '</a>');
+                show($('[data-ma-action="login-cancel"]'));
+              } else if (payload.login.outcome && payload.login.outcome.ok === false) {
+                setText('[data-ma-login-meta]', 'failed');
+                setText('[data-ma-login-info]', 'Login failed: ' + payload.login.outcome.error);
+                hide($('[data-ma-action="login-cancel"]'));
+              } else {
+                setText('[data-ma-login-meta]', 'not logged in');
+                setText('[data-ma-login-info]', 'Click "Start login" to authorize cloudflared on your Cloudflare account.');
+                hide($('[data-ma-action="login-cancel"]'));
+              }
+
+              // Step 3 — tunnel
+              if (payload.state.tunnel && payload.state.tunnel.hostname) {
+                setText('[data-ma-tunnel-meta]', 'configured');
+                setText('[data-ma-configure-info]', payload.state.tunnel.name + ' (' + payload.state.tunnel.id + ') → ' + payload.state.tunnel.hostname);
+              } else if (payload.state.tunnel) {
+                setText('[data-ma-tunnel-meta]', 'tunnel created, hostname pending');
+                setText('[data-ma-configure-info]', 'Tunnel ' + payload.state.tunnel.name + ' exists; add a hostname above.');
+              } else {
+                setText('[data-ma-tunnel-meta]', 'not configured');
+                setText('[data-ma-configure-info]', '');
+              }
+
+              // ★ Cloudflare Access recommendation card — only for
+              // configured custom-domain (named) tunnels. Skip for
+              // the temporary quick tunnel (different threat model:
+              // URL isn't subdomain-enumerable). Hide once the user
+              // acknowledged (either enabled or explicitly skipped).
+              const accessCard = $('[data-ma-access-card]');
+              if (accessCard) {
+                const ack = payload.state.cloudflareAccess;
+                const isNamedTunnel = payload.state.tunnel
+                  && payload.state.tunnel.mode !== 'quick'
+                  && payload.state.tunnel.hostname;
+                const ackMatchesHostname = ack
+                  && ack.acknowledged
+                  && payload.state.tunnel
+                  && ack.hostname === payload.state.tunnel.hostname;
+                if (isNamedTunnel && !ackMatchesHostname) {
+                  accessCard.hidden = false;
+                  setText('[data-ma-access-meta]', 'not confirmed');
+                  setText('[data-ma-access-info]', '');
+                } else if (isNamedTunnel && ackMatchesHostname) {
+                  accessCard.hidden = false;
+                  if (ack.enabled) {
+                    setText('[data-ma-access-meta]', 'enabled · confirmed');
+                    setText('[data-ma-access-info]', 'You confirmed Cloudflare Access on ' + ack.acknowledgedAt + '. Click "I\\'ve enabled Access" again if you turn it off or change hostnames.');
+                  } else {
+                    setText('[data-ma-access-meta]', 'opted out');
+                    setText('[data-ma-access-info]', 'You chose to skip Cloudflare Access on ' + ack.acknowledgedAt + '. The mobile PIN is the only barrier; consider enabling Access from the Cloudflare dashboard.');
+                  }
+                } else {
+                  accessCard.hidden = true;
+                }
+              }
+
+              // Step 4 — PIN
+              if (payload.pin.configured) {
+                setText('[data-ma-pin-meta]', 'configured');
+                setText('[data-ma-pin-info]', 'PIN saved' + (payload.pin.updatedAt ? ' (last rotated ' + payload.pin.updatedAt + ')' : '') + '. Saving again rotates it and invalidates all sessions.');
+              } else {
+                setText('[data-ma-pin-meta]', 'not configured');
+                setText('[data-ma-pin-info]', 'No PIN set — your phone cannot log in until you save one here.');
+              }
+
+              // Step 5 — run
+              if (payload.tunnel.running) {
+                setText('[data-ma-run-meta]', payload.tunnel.connected ? 'running · connected' : 'running · connecting');
+                setText('[data-ma-run-info]', 'Started ' + (payload.tunnel.startedAt || '?'));
+              } else {
+                setText('[data-ma-run-meta]', 'stopped');
+                setText('[data-ma-run-info]', '');
+              }
+
+              // Step 6 — QR (load lazily; only re-fetch when the target URL changes)
+              const qrEl = $('[data-ma-qr]');
+              const pairActions = $('[data-ma-pair-actions]');
+              if (pairActions) pairActions.innerHTML = '';
+              function setPairActionHtml(html) {
+                if (pairActions) pairActions.innerHTML = html;
+              }
+              if (payload.targetUrl) {
+                if (payload.targetMode === 'local-preview') {
+                  setText('[data-ma-qr-meta]', 'remote URL needed');
+                  if (qrEl && qrEl.dataset.url !== 'local-preview') {
+                    qrEl.dataset.url = 'local-preview';
+                    qrEl.dataset.fetchedAt = '';
+                    qrEl.innerHTML = '';
+                    const info = document.createElement('div');
+                    info.className = 'settings-info';
+                    info.textContent = 'This Mac is only exposing the mobile app at 127.0.0.1, which works for desktop preview but not from an iPhone. Start a temporary mobile link and the phone QR will appear here.';
+                    const link = document.createElement('a');
+                    link.href = payload.targetUrl;
+                    link.target = '_blank';
+                    link.rel = 'noopener';
+                    link.textContent = 'Open local preview on this Mac';
+                    qrEl.appendChild(info);
+                    qrEl.appendChild(link);
+                  }
+                  if (!payload.detect.binary) {
+                    setPairActionHtml('<button type="button" class="btn" data-ma-action="install">Install cloudflared</button><button type="button" class="btn btn-secondary" data-ma-action="detect">Re-detect</button>');
+                  } else if (payload.state.status === 'configuring' || (payload.tunnel.running && !payload.state.tunnel?.hostname)) {
+                    setPairActionHtml('<button type="button" class="btn btn-secondary" disabled>Starting mobile link…</button><button type="button" class="btn btn-secondary" data-ma-action="tunnel-stop">Stop</button>');
+                  } else if (!payload.tunnel.running) {
+                    const advanced = payload.login.active
+                      ? '<button type="button" class="btn btn-secondary" data-ma-action="login-cancel">Cancel Cloudflare login</button>'
+                      : '<button type="button" class="btn btn-secondary" data-ma-jump="remote-url">Advanced custom domain</button>';
+                    setPairActionHtml('<button type="button" class="btn" data-ma-action="quick-start">Start temporary mobile link</button>' + advanced);
+                  }
+                } else {
+                if (!payload.tunnel.running) {
+                  setText('[data-ma-qr-meta]', 'remote URL stopped');
+                  if (qrEl && qrEl.dataset.url !== 'remote-stopped') {
+                    qrEl.dataset.url = 'remote-stopped';
+                    qrEl.dataset.fetchedAt = '';
+                    qrEl.innerHTML = '<div class="settings-info">The remote URL is configured, but the tunnel is not running. Start it, then scan the QR from your phone.</div>';
+                  }
+                  setPairActionHtml('<button type="button" class="btn" data-ma-action="tunnel-start">Start remote URL</button>');
+                } else {
+                setText('[data-ma-qr-meta]', payload.targetUrl + (payload.tunnel.connected ? ' · remote' : ' · starting'));
+                const qrKey = payload.targetUrl + '|' + (payload.targetMode || '');
+                const fetchedAt = qrEl && qrEl.dataset.fetchedAt ? Number(qrEl.dataset.fetchedAt) : 0;
+                const stale = !fetchedAt || (Date.now() - fetchedAt > 9 * 60 * 1000);
+                if (qrEl && (qrEl.dataset.url !== qrKey || stale)) {
+                  qrEl.dataset.url = qrKey;
+                  fetch('/api/console/mobile-access/qr' + (new URLSearchParams(location.search).get('token') ? '?token=' + encodeURIComponent(new URLSearchParams(location.search).get('token')) : ''))
+                    .then((r) => {
+                      if (!r.ok) return Promise.reject('qr fetch failed');
+                      const expiresAt = r.headers.get('X-Pairing-Expires-At') || '';
+                      return r.text().then((svg) => ({ svg, expiresAt }));
+                    })
+                    .then(({ svg, expiresAt }) => {
+                      qrEl.innerHTML = svg + (expiresAt ? '<div class="settings-info">QR expires ' + expiresAt + '</div>' : '');
+                      qrEl.dataset.fetchedAt = String(Date.now());
+                    })
+                    .catch(() => { qrEl.textContent = 'QR generation failed'; });
+                }
+                }
+                }
+              } else {
+                setText('[data-ma-qr-meta]', 'waiting for mobile URL');
+                if (qrEl) { qrEl.innerHTML = ''; qrEl.dataset.url = ''; }
+              }
+
+              // Devices
+              setText('[data-ma-devices-meta]', String(payload.sessions.length));
+              const devicesEl = $('[data-ma-devices]');
+              if (devicesEl) {
+                if (payload.sessions.length === 0) {
+                  devicesEl.innerHTML = '<div class="settings-info">No active sessions.</div>';
+                } else {
+                  devicesEl.innerHTML = payload.sessions.map((s) =>
+                    '<div class="hub-device">'
+                    + '<div class="hub-device-main">'
+                    + '<strong title="' + esc(s.deviceLabel || 'device') + '">' + esc(s.deviceLabel || 'device') + '</strong>'
+                    + '<span class="meta">created ' + esc(s.createdAt) + '</span>'
+                    + '<span class="meta">last seen ' + esc(s.lastSeenAt) + '</span>'
+                    + '<span class="meta">push: ' + (s.pushSubscribed ? 'yes' : 'no') + '</span>'
+                    + '</div>'
+                    + '<button type="button" data-ma-action="session-revoke" data-device-id="' + esc(s.deviceId) + '">Disconnect</button>'
+                    + '</div>'
+                  ).join('');
+                }
+              }
+            }
+
+            async function refresh() {
+              try {
+                const payload = await api('/api/console/mobile-access/status');
+                render(payload);
+              } catch (err) {
+                setText('[data-ma-status]', 'error');
+                setText('[data-ma-binary-info]', String(err.message || err));
+              }
+            }
+
+            async function pollInstall() {
+              if (!installJobId) return;
+              try {
+                const data = await api('/api/console/mobile-access/install/' + installJobId);
+                const job = data.job;
+                const outEl = $('[data-ma-install-output]');
+                if (outEl) {
+                  outEl.hidden = false;
+                  outEl.textContent = job.lines.map((l) => l.text).join('\\n');
+                }
+                if (job.status !== 'running') {
+                  if (installPollTimer) clearInterval(installPollTimer);
+                  installPollTimer = null;
+                  installJobId = null;
+                  refresh();
+                }
+              } catch { /* job missing — stop polling */
+                if (installPollTimer) clearInterval(installPollTimer);
+                installPollTimer = null;
+                installJobId = null;
+              }
+            }
+
+            root.addEventListener('click', async (ev) => {
+              const jump = ev.target.closest('[data-ma-jump]');
+              if (jump) {
+                ev.preventDefault();
+                const target = root.querySelector('[data-ma-step="' + jump.dataset.maJump + '"]');
+                const details = target ? target.closest('details') : null;
+                if (details) details.open = true;
+                if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                return;
+              }
+              const btn = ev.target.closest('[data-ma-action]');
+              if (!btn) return;
+              ev.preventDefault();
+              const action = btn.dataset.maAction;
+              btn.disabled = true;
+              try {
+                if (action === 'install') {
+                  const { job } = await api('/api/console/mobile-access/install', { method: 'POST' });
+                  installJobId = job.id;
+                  if (installPollTimer) clearInterval(installPollTimer);
+                  installPollTimer = setInterval(pollInstall, 1500);
+                  pollInstall();
+                } else if (action === 'detect') {
+                  await refresh();
+                } else if (action === 'login') {
+                  await api('/api/console/mobile-access/login', { method: 'POST' });
+                  await refresh();
+                } else if (action === 'login-cancel') {
+                  await api('/api/console/mobile-access/login/cancel', { method: 'POST' });
+                  await refresh();
+                } else if (action === 'quick-start') {
+                  await api('/api/console/mobile-access/quick/start', { method: 'POST' });
+                  await refresh();
+                } else if (action === 'tunnel-start') {
+                  await api('/api/console/mobile-access/tunnel/start', { method: 'POST' });
+                  await refresh();
+                } else if (action === 'tunnel-stop') {
+                  await api('/api/console/mobile-access/tunnel/stop', { method: 'POST' });
+                  await refresh();
+                } else if (action === 'access-ack') {
+                  await api('/api/console/mobile-access/access-ack', { method: 'POST', body: JSON.stringify({ enabled: true }) });
+                  await refresh();
+                } else if (action === 'access-skip') {
+                  await api('/api/console/mobile-access/access-ack', { method: 'POST', body: JSON.stringify({ enabled: false }) });
+                  await refresh();
+                } else if (action === 'session-revoke') {
+                  const deviceId = btn.dataset.deviceId || '';
+                  if (!deviceId) return;
+                  if (!confirm('Disconnect this mobile session? The device will need a fresh QR or PIN login to connect again.')) return;
+                  await api('/api/console/mobile-access/sessions/' + encodeURIComponent(deviceId), { method: 'DELETE' });
+                  await refresh();
+                } else if (action === 'sessions-revoke-all') {
+                  if (!confirm('Disconnect every mobile device? Use this if you suspect fraud. Every phone will need a fresh QR or PIN login.')) return;
+                  await api('/api/console/mobile-access/sessions', { method: 'DELETE' });
+                  await refresh();
+                }
+              } catch (err) {
+                alert((err && err.message) || String(err));
+              } finally {
+                btn.disabled = false;
+              }
+            });
+
+            const configureForm = $('[data-ma-configure-form]');
+            if (configureForm) {
+              configureForm.addEventListener('submit', async (ev) => {
+                ev.preventDefault();
+                const fd = new FormData(configureForm);
+                try {
+                  await api('/api/console/mobile-access/configure', {
+                    method: 'POST',
+                    body: JSON.stringify({
+                      tunnelName: fd.get('tunnelName'),
+                      hostname: fd.get('hostname'),
+                    }),
+                  });
+                  setText('[data-ma-configure-info]', 'Tunnel configured.');
+                  await refresh();
+                } catch (err) {
+                  setText('[data-ma-configure-info]', 'Error: ' + (err.message || err));
+                }
+              });
+            }
+
+            const pinForm = $('[data-ma-pin-form]');
+            if (pinForm) {
+              pinForm.addEventListener('submit', async (ev) => {
+                ev.preventDefault();
+                const fd = new FormData(pinForm);
+                try {
+                  const result = await api('/api/console/mobile-access/pin', {
+                    method: 'POST',
+                    body: JSON.stringify({ pin: fd.get('pin') }),
+                  });
+                  setText('[data-ma-pin-info]', 'PIN saved. Revoked ' + result.revokedSessions + ' previous session(s).');
+                  pinForm.reset();
+                  await refresh();
+                } catch (err) {
+                  setText('[data-ma-pin-info]', 'Error: ' + (err.message || err));
+                }
+              });
+            }
+
+            // Poll while the panel is visible. We re-check visibility
+            // each tick rather than wiring into the global nav handler.
+            let pollTimer = null;
+            function startPolling() {
+              if (pollTimer) return;
+              refresh();
+              pollTimer = setInterval(() => {
+                const visible = !root.closest('.panel-frame[data-section="mobile-access"]').hidden;
+                if (visible) refresh();
+              }, 3000);
+            }
+            // Kick off on first render — the panel may be hidden, the
+            // tick guards itself. This also primes the QR + state on
+            // first nav click without waiting 3s.
+            startPolling();
+          })();
+        </script>
       </section>
 
       <!--
@@ -2324,6 +2918,7 @@ body {
   background: var(--accent-fail, #ff5a5f);
   box-shadow: 0 0 5px color-mix(in srgb, var(--accent-fail, #ff5a5f) 60%, transparent);
 }
+.dock-live.live { cursor: pointer; }
 .dock-live.live .dock-live-rec {
   background: var(--accent-fail, #ff5a5f);
   color: var(--bg-0);
@@ -2514,7 +3109,7 @@ body {
 .presence-dot.warn { background: var(--accent-warn); box-shadow: 0 0 9px color-mix(in srgb, var(--accent-warn) 52%, transparent); }
 .presence-dot.working { background: var(--accent-3); box-shadow: 0 0 9px color-mix(in srgb, var(--accent-3) 52%, transparent); }
 .presence-dot.offline { background: var(--accent-fail); box-shadow: 0 0 9px color-mix(in srgb, var(--accent-fail) 52%, transparent); }
-/* Two-column main: agenda + LIVE on the left, CHAT on the right.
+/* Two-column main: work queues on the left, CHAT on the right.
    Both columns fill the available height (1fr in the parent grid).
    Each card inside uses min-height: 0 so its body can scroll instead
    of expanding the page. */
@@ -2526,7 +3121,7 @@ body {
 }
 .home-main-left {
   display: grid;
-  grid-template-rows: minmax(0, 1fr) minmax(0, 1fr) auto;
+  grid-template-rows: minmax(0, 1fr) minmax(0, 1fr) minmax(130px, 0.72fr);
   gap: 12px;
   min-height: 0;
 }
@@ -2535,7 +3130,8 @@ body {
   min-height: 0;
 }
 .home-needs,
-.home-working {
+.home-working,
+.home-completed {
   min-height: 0;
 }
 .home-current-objective {
@@ -2578,7 +3174,7 @@ body {
   text-align: left;
   cursor: pointer;
   padding: 0;
-  display: flex;
+  display: none;
   flex-direction: column;
   transition: border-color 160ms, background 160ms;
   overflow: hidden;
@@ -2692,6 +3288,7 @@ body {
   min-height: 0;
 }
 .home-layout.live-takeover .home-live {
+  display: flex;
   cursor: default;
   min-height: 0;
   position: relative;
@@ -2843,6 +3440,12 @@ body {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+}
+.home-main-left > .home-live {
+  display: none !important;
+}
+.home-layout.live-takeover .home-main-left > .home-live {
+  display: flex !important;
 }
 
 /* v0.5.14 — Current Focus chip in the global status bar. Persistent
@@ -3096,6 +3699,27 @@ body {
   font-size: 9px;
   letter-spacing: 0.16em;
   color: var(--fg-mute);
+}
+.home-chat-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.home-chat-live-btn {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--accent);
+  font: inherit;
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  padding: 3px 8px;
+  cursor: pointer;
+}
+.home-chat-live-btn:hover {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--bg-0);
 }
 .home-chat-turn {
   display: flex;
@@ -4148,6 +4772,18 @@ body {
   color: var(--accent);
   font-weight: 600;
 }
+.mem-meetings-search {
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  color: var(--fg);
+  font: inherit;
+  font-size: 11px;
+  padding: 4px 9px;
+  min-width: 200px;
+  flex: 0 1 260px;
+}
+.mem-meetings-search:focus { outline: none; border-color: var(--accent); }
+.mem-meetings-search::placeholder { color: var(--fg-mute); }
 .mem-meetings-meta {
   font-size: 10px;
   letter-spacing: 0.12em;
@@ -4175,6 +4811,18 @@ body {
   padding: 18px 14px;
   font-size: 11px;
   color: var(--fg-mute);
+}
+.mem-meetings-section {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 8px 14px 6px;
+  font-size: 9px;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--fg-mute);
+  background: var(--bg-1);
+  border-bottom: 1px solid var(--line);
 }
 .mem-meeting-row {
   display: flex;
@@ -4783,6 +5431,9 @@ body {
   height: 100%;
   overflow: hidden;
 }
+.wf-layout.architect-collapsed {
+  grid-template-columns: 200px minmax(0, 1fr) 44px;
+}
 .wf-list-pane,
 .wf-editor,
 .wf-chat-pane {
@@ -4798,6 +5449,7 @@ body {
   background: var(--bg-1);
   border-bottom: 1px solid var(--line);
   display: flex;
+  gap: 8px;
   justify-content: space-between;
   align-items: center;
   font-size: 10px;
@@ -4806,6 +5458,56 @@ body {
 }
 .wf-chat-title { color: var(--fg); }
 .wf-chat-meta { color: var(--accent); font-size: 10px; }
+.wf-list-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.wf-home-btn {
+  display: inline-block;
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-3);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  padding: 3px 8px;
+  cursor: pointer;
+}
+.wf-home-btn:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.wf-chat-collapse {
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--fg-3);
+  font: inherit;
+  font-size: 10px;
+  line-height: 1;
+  padding: 3px 6px;
+  cursor: pointer;
+}
+.wf-chat-collapse:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.wf-layout.architect-collapsed .wf-chat-pane {
+  min-width: 0;
+}
+.wf-layout.architect-collapsed .wf-chat-head {
+  height: 100%;
+  padding: 8px 0;
+  justify-content: flex-start;
+  flex-direction: column;
+}
+.wf-layout.architect-collapsed .wf-chat-title,
+.wf-layout.architect-collapsed .wf-chat-meta,
+.wf-layout.architect-collapsed .wf-chat-log,
+.wf-layout.architect-collapsed .wf-chat-chips,
+.wf-layout.architect-collapsed .wf-chat-form {
+  display: none;
+}
 .wf-new-btn {
   display: inline-block;
   background: transparent;
@@ -5063,6 +5765,368 @@ body {
 .wf-empty-btn:hover { border-color: var(--accent); color: var(--accent); }
 .wf-empty-btn.primary { border-color: var(--accent); color: var(--accent); }
 .wf-empty-btn.primary:hover { background: var(--accent); color: var(--bg-0); }
+.wf-framework-guide {
+  width: min(620px, 100%);
+  margin-top: 10px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  background: var(--bg-1);
+  color: var(--fg-3);
+  text-align: left;
+  letter-spacing: 0;
+}
+.wf-framework-guide-head {
+  color: var(--fg);
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  margin-bottom: 8px;
+}
+.wf-framework-guide p {
+  margin: 0 0 10px;
+  font-size: 11px;
+  line-height: 1.55;
+}
+.wf-framework-guide code {
+  color: var(--fg);
+  font-size: 11px;
+}
+.wf-framework-guide pre {
+  margin: 8px 0 0;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  background: var(--bg-2);
+  color: var(--fg-2);
+  overflow-x: auto;
+  white-space: pre;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.wf-home {
+  height: 100%;
+  overflow-y: auto;
+  padding: 18px 20px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.wf-home-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: flex-start;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 14px;
+}
+.wf-home-head h2 {
+  margin: 0 0 6px;
+  color: var(--fg);
+  font-size: 16px;
+  letter-spacing: 0.04em;
+}
+.wf-home-head p {
+  margin: 0;
+  color: var(--fg-3);
+  font-size: 11px;
+  line-height: 1.5;
+  letter-spacing: 0;
+}
+.wf-home-head-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.wf-home-stats {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+.wf-home-stat {
+  border: 1px solid var(--line);
+  background: var(--bg-1);
+  padding: 10px 12px;
+  min-height: 64px;
+}
+.wf-home-stat span {
+  display: block;
+  color: var(--fg-3);
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  margin-bottom: 8px;
+}
+.wf-home-stat strong {
+  color: var(--fg);
+  font-size: 22px;
+  font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+  letter-spacing: 0;
+}
+.wf-home-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.wf-home-section-head {
+  color: var(--fg-3);
+  font-size: 10px;
+  letter-spacing: 0.18em;
+}
+.wf-agenda,
+.wf-recent-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.wf-agenda-day {
+  border: 1px solid var(--line);
+  background: var(--bg-1);
+}
+.wf-agenda-day-head {
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--line);
+  color: var(--fg-3);
+  font-size: 9px;
+  letter-spacing: 0.18em;
+}
+.wf-agenda-item,
+.wf-recent-run {
+  display: grid;
+  grid-template-columns: 74px minmax(0, 1fr) minmax(120px, 0.6fr) auto;
+  gap: 8px;
+  align-items: center;
+  padding: 8px 10px;
+  border-top: 1px solid var(--line);
+  font-size: 11px;
+  color: var(--fg-2);
+}
+.wf-agenda-day .wf-agenda-item:first-of-type { border-top: 0; }
+.wf-agenda-item.active {
+  border: 1px solid var(--line);
+  background: var(--bg-1);
+  border-left: 2px solid var(--accent-3);
+}
+.wf-agenda-time,
+.wf-recent-status {
+  color: var(--accent-3);
+  font-size: 9px;
+  letter-spacing: 0.16em;
+}
+.wf-agenda-title,
+.wf-recent-title {
+  color: var(--fg);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.wf-agenda-meta,
+.wf-recent-meta,
+.wf-recent-error {
+  color: var(--fg-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.wf-recent-run {
+  border: 1px solid var(--line);
+  background: var(--bg-1);
+}
+.wf-recent-run.ok { border-left: 2px solid var(--accent-2); }
+.wf-recent-run.err { border-left: 2px solid #e25656; }
+.wf-recent-run.run { border-left: 2px solid var(--accent-3); }
+.wf-recent-run.mute { opacity: 0.75; }
+.wf-home-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 10px;
+}
+.wf-home-card {
+  border: 1px solid var(--line);
+  background: var(--bg-1);
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.wf-home-card-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+.wf-home-card h3 {
+  margin: 0 0 5px;
+  color: var(--fg);
+  font-size: 13px;
+  letter-spacing: 0.03em;
+}
+.wf-home-card p {
+  margin: 0;
+  color: var(--fg-3);
+  font-size: 11px;
+  line-height: 1.45;
+  letter-spacing: 0;
+}
+.wf-home-pill {
+  align-self: flex-start;
+  border: 1px solid var(--line);
+  padding: 3px 6px;
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  color: var(--fg-3);
+  white-space: nowrap;
+}
+.wf-home-pill.on { color: var(--accent-2); border-color: var(--accent-2); }
+.wf-home-pill.off { color: var(--fg-mute); }
+.wf-home-pill.run { color: var(--accent-3); border-color: var(--accent-3); }
+.wf-home-card-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.wf-home-card-meta span {
+  border: 1px solid var(--line);
+  color: var(--fg-3);
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  padding: 3px 6px;
+}
+.wf-home-card-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.wf-home-card-actions button,
+.wf-home-mini {
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  padding: 6px 8px;
+  cursor: pointer;
+}
+.wf-home-card-actions button:hover,
+.wf-home-mini:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.wf-home-empty {
+  border: 1px dashed var(--line);
+  color: var(--fg-mute);
+  padding: 14px;
+  font-size: 11px;
+  text-align: center;
+  letter-spacing: 0.12em;
+}
+.wf-home-framework {
+  width: 100%;
+  margin-top: 0;
+}
+
+.wf-create {
+  height: 100%;
+  overflow-y: auto;
+  padding: 18px 20px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.wf-create-head {
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 12px;
+}
+.wf-create-head h2 {
+  margin: 0 0 6px;
+  color: var(--fg);
+  font-size: 16px;
+  letter-spacing: 0.04em;
+}
+.wf-create-head p {
+  margin: 0;
+  color: var(--fg-3);
+  font-size: 11px;
+  line-height: 1.5;
+  letter-spacing: 0;
+}
+.wf-create-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 10px;
+}
+.wf-create-card {
+  border: 1px solid var(--line);
+  background: var(--bg-1);
+  padding: 13px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.wf-create-card h3 {
+  margin: 0;
+  color: var(--fg);
+  font-size: 12px;
+  letter-spacing: 0.1em;
+}
+.wf-create-card p {
+  margin: 0;
+  color: var(--fg-3);
+  font-size: 11px;
+  line-height: 1.45;
+  letter-spacing: 0;
+}
+.wf-create-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: auto;
+}
+.wf-create-actions button {
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  padding: 7px 10px;
+  cursor: pointer;
+}
+.wf-create-actions button.primary {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.wf-create-actions button:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.wf-import-form {
+  display: grid;
+  gap: 8px;
+}
+.wf-import-form input[type="text"] {
+  border: 1px solid var(--line);
+  background: var(--bg-2);
+  color: var(--fg);
+  font: inherit;
+  padding: 8px 10px;
+  min-width: 0;
+}
+.wf-import-options {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  color: var(--fg-3);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+}
+.wf-import-status {
+  border: 1px solid var(--line);
+  background: var(--bg-1);
+  padding: 10px 12px;
+  color: var(--fg-3);
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
 
 .wf-edit-head {
   padding: 10px 14px;
@@ -5200,6 +6264,78 @@ body {
 .wf-add-input:hover { color: var(--accent); border-color: var(--accent); }
 
 /* Recent runs in the editor */
+.wf-run-strip {
+  border: 1px solid var(--line);
+  background: var(--bg-1);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  padding: 9px 11px;
+}
+.wf-run-strip-main {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.wf-run-strip-main strong {
+  color: var(--fg);
+  font-size: 12px;
+  font-weight: 600;
+}
+.wf-run-strip-main span {
+  color: var(--fg-3);
+  font-size: 10.5px;
+}
+.wf-run-strip-meta {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  flex-wrap: wrap;
+  color: var(--fg-3);
+  font-size: 10px;
+}
+.wf-run-strip-status {
+  font-size: 9px !important;
+  letter-spacing: 0.16em;
+  padding: 2px 6px;
+  border: 1px solid var(--line);
+  color: var(--fg-3) !important;
+}
+.wf-run-strip-status.status-queued,
+.wf-run-strip-status.status-running {
+  color: var(--accent-3) !important;
+  border-color: var(--accent-3);
+}
+.wf-run-strip-status.status-completed,
+.wf-run-strip-status.status-success {
+  color: var(--accent-2) !important;
+  border-color: var(--accent-2);
+}
+.wf-run-strip-status.status-error,
+.wf-run-strip-status.status-failed {
+  color: var(--accent-fail) !important;
+  border-color: var(--accent-fail);
+}
+.wf-run-strip .wf-run-action,
+.wf-run-runtime-jump {
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  padding: 3px 7px;
+  cursor: pointer;
+}
+.wf-run-strip .wf-run-action:hover,
+.wf-run-runtime-jump:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
 .wf-runs { display: flex; flex-direction: column; gap: 6px; }
 .wf-runs-head {
   font-size: 10px;
@@ -6643,6 +7779,236 @@ body {
 }
 .hub-key-actions button:hover { border-color: var(--accent); color: var(--accent); }
 
+/* ─ Mobile Access ─ */
+.panel-body[data-mobile-access-panel] {
+  height: 100%;
+  box-sizing: border-box;
+  overflow-y: auto;
+  overflow-x: hidden;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding-bottom: 28px;
+}
+.panel-body[data-mobile-access-panel] > * {
+  flex: 0 0 auto;
+}
+.hub-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 4px;
+}
+.hub-actions .btn {
+  background: transparent;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  padding: 6px 12px;
+  cursor: pointer;
+}
+.hub-actions .btn:hover { background: var(--accent); color: var(--bg-0); }
+.hub-actions .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.hub-actions .btn-secondary { border-color: var(--line); color: var(--fg-2); }
+.hub-actions .btn-secondary:hover { background: var(--bg-2); color: var(--fg); }
+.hub-actions .btn-danger { border-color: var(--accent-fail); color: var(--accent-fail); }
+.hub-actions .btn-danger:hover { background: var(--accent-fail); color: var(--bg-0); }
+.hub-output {
+  margin-top: 6px;
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: var(--fg-2);
+  padding: 8px 10px;
+  max-height: 240px;
+  overflow: auto;
+  white-space: pre-wrap;
+}
+.hub-qr {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  gap: 10px;
+  background: #fff;
+  padding: 12px;
+  min-height: 220px;
+  text-align: center;
+}
+.hub-qr svg { display: block; max-width: 280px; width: 100%; height: auto; }
+.hub-qr .settings-info {
+  margin: 0;
+  max-width: 720px;
+  color: var(--fg-2);
+}
+.hub-qr a {
+  color: var(--accent);
+  font-size: 11px;
+}
+.hub-devices { display: flex; flex-direction: column; gap: 6px; }
+.hub-device {
+  border: 1px solid var(--line);
+  padding: 8px 10px;
+  font-size: 11px;
+  color: var(--fg-2);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+}
+.hub-device strong { color: var(--fg); }
+.hub-device-main {
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  align-items: baseline;
+}
+.hub-device-main strong {
+  max-width: min(520px, 100%);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.hub-device .meta { color: var(--fg-3); font-size: 10px; }
+.hub-device button {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  padding: 5px 9px;
+  cursor: pointer;
+}
+.hub-device button:hover {
+  border-color: var(--accent-fail);
+  color: var(--accent-fail);
+}
+
+.ma-advanced {
+  border: 1px solid var(--line);
+  background: var(--bg-1);
+}
+.ma-advanced summary {
+  list-style: none;
+  cursor: pointer;
+  padding: 12px 18px;
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  border-bottom: 1px solid transparent;
+}
+.ma-advanced summary::-webkit-details-marker { display: none; }
+.ma-advanced summary span {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--fg);
+}
+.ma-advanced summary em {
+  font-style: normal;
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  color: var(--fg-3);
+}
+.ma-advanced[open] summary {
+  border-bottom-color: var(--line);
+}
+.ma-advanced-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 12px;
+}
+
+/* ─ Mobile Access wizard: two-path picker + Cloudflare Access card ─ */
+.ma-paths { background: var(--bg-2); }
+.ma-paths-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 12px;
+  margin-top: 8px;
+}
+.ma-path-card {
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.ma-path-card-primary { border-color: var(--accent); }
+.ma-path-tag {
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  color: var(--fg-3);
+  text-transform: uppercase;
+}
+.ma-path-card-primary .ma-path-tag { color: var(--accent); }
+.ma-path-card h4 {
+  margin: 0;
+  font-size: 14px;
+  color: var(--fg);
+}
+.ma-path-card p {
+  margin: 0;
+  font-size: 11px;
+  color: var(--fg-2);
+  line-height: 1.55;
+}
+.ma-path-card p strong { color: var(--fg); }
+.ma-path-card ul {
+  margin: 0;
+  padding-left: 16px;
+  font-size: 11px;
+  color: var(--fg-2);
+  line-height: 1.55;
+}
+.ma-path-card code {
+  background: var(--bg-2);
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 11px;
+}
+.ma-paths-note {
+  margin-top: 12px;
+  font-size: 10px;
+  color: var(--fg-3);
+  line-height: 1.55;
+}
+
+.ma-access { border-color: var(--accent-warn); }
+.ma-access .hub-block-title { color: var(--accent-warn); }
+.ma-access .hub-block-intro a { color: var(--accent); }
+.ma-access .hub-block-intro code {
+  background: var(--bg-2);
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 11px;
+}
+.ma-access-steps {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 11px;
+  color: var(--fg-2);
+  line-height: 1.65;
+}
+.ma-access-steps li { margin-bottom: 6px; }
+.ma-access-steps code {
+  background: var(--bg-2);
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 11px;
+}
+.ma-access-steps strong { color: var(--fg); }
+
 /* ─ Apps list (Composio) ─ */
 .hub-apps-controls {
   display: flex;
@@ -7130,12 +8496,25 @@ body {
 .usage-trim-row button.danger { color: var(--accent-fail); border-color: var(--accent-fail); }
 
 /* v0.5.11 — Approvals panel */
-.approvals-layout { padding: 16px; }
+.approvals-layout {
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-height: 0;
+}
 .approvals-header { display: flex; justify-content: space-between; gap: 16px; margin-bottom: 16px; }
 .approvals-intro h3 { margin: 0 0 4px; font-size: 14px; letter-spacing: 0.08em; }
 .approvals-intro p { margin: 0; color: var(--fg-3); font-size: 11px; max-width: 600px; }
 .approvals-toolbar { display: flex; gap: 8px; align-items: flex-start; }
-.approvals-list { display: flex; flex-direction: column; gap: 12px; }
+.approvals-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  overflow-y: auto;
+  min-height: 0;
+  padding-right: 8px;
+}
 .approval-card {
   border: 1px solid var(--line);
   padding: 14px;
@@ -7145,6 +8524,12 @@ body {
   display: flex; justify-content: space-between; align-items: flex-start; gap: 12px;
 }
 .approval-subject { font-size: 13px; font-weight: 500; line-height: 1.4; flex: 1; }
+.approval-source {
+  margin-top: 4px;
+  font-size: 10px;
+  color: var(--fg-3);
+  line-height: 1.35;
+}
 .approval-age { font-size: 10px; letter-spacing: 0.1em; color: var(--fg-3); white-space: nowrap; padding-top: 2px; }
 .approval-age.stale { color: var(--accent-warn); }
 .approval-kind-pill {
@@ -7168,8 +8553,67 @@ body {
   font-size: 10px; word-break: break-all;
 }
 .approval-age.very-stale { color: var(--accent-fail); }
+.approval-reason {
+  border-left: 3px solid var(--accent);
+  padding: 8px 10px;
+  background: var(--bg-1);
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--fg);
+}
+.approval-reason span {
+  display: inline-block;
+  margin-right: 8px;
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  color: var(--accent);
+}
+.approval-preview {
+  border: 1px solid var(--line);
+  background: var(--bg-0);
+  padding: 8px 10px;
+  font-size: 11px;
+  line-height: 1.4;
+}
+.approval-preview-count {
+  color: var(--fg);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  margin-bottom: 4px;
+}
+.approval-preview ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 4px;
+}
+.approval-preview li {
+  display: grid;
+  grid-template-columns: minmax(80px, 0.35fr) minmax(0, 1fr);
+  gap: 8px;
+}
+.approval-preview li span { color: var(--fg-3); }
+.approval-preview li strong { font-weight: 500; color: var(--fg); }
+.approval-preview li em {
+  grid-column: 2;
+  color: var(--fg-3);
+  font-style: normal;
+}
+.approval-preview-note {
+  margin-top: 6px;
+  color: var(--fg-3);
+  font-size: 10px;
+}
 .approval-meta { font-size: 10px; color: var(--fg-3); letter-spacing: 0.04em; }
 .approval-meta code { background: var(--bg-2); padding: 1px 5px; border: 1px solid var(--line); }
+.approval-details summary {
+  cursor: pointer;
+  color: var(--fg-3);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
 .approval-args {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 11px; padding: 8px 10px; background: var(--bg-2);
@@ -7351,9 +8795,33 @@ body {
 .brain-graph-wrap .mem-graph-canvas { grid-column: 1 / 2; }
 .brain-graph-wrap .mem-graph-detail { grid-column: 2 / 3; grid-row: 2 / 3; }
 .brain-graph-wrap .mem-graph-legend  { grid-column: 1 / -1; }
+@media (max-width: 1040px) {
+  .brain-graph-wrap .mem-graph {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto minmax(360px, 1fr) auto;
+  }
+  .brain-graph-wrap .mem-graph-canvas {
+    grid-column: 1;
+  }
+  .brain-graph-wrap .mem-graph-detail {
+    grid-column: 1;
+    grid-row: auto;
+    border-left: 0;
+    border-top: 1px solid var(--line);
+    max-height: 220px;
+  }
+}
 
 .brain-meetings-wrap { height: calc(100vh - 240px); min-height: 480px; }
 .brain-meetings-wrap .mem-meetings { height: 100%; }
+/* Top-level Meetings panel: the .mem-meetings node is relocated into
+   [data-meetings-mount] when Recall is configured. Pass the panel-body's
+   bounded height (panel-frame/panel-body are both height:100%) down the
+   chain so .mem-meetings' grid gets a definite height — otherwise the
+   detail pane's overflow-y:auto has nothing to scroll against and a long
+   summary can't be scrolled past. Mirrors .brain-meetings-wrap. */
+[data-meetings-mount] { height: 100%; min-height: 0; }
+[data-meetings-mount] .mem-meetings { height: 100%; }
 
 .skills-grid {
   display: grid;
@@ -7472,22 +8940,99 @@ body {
 }
 
 /* ── Settings panel ──────────────────────────────────────────── */
+.settings-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-0);
+}
+.settings-tab {
+  border: 1px solid var(--line);
+  background: var(--bg-1);
+  color: var(--fg-3);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  padding: 6px 10px;
+  cursor: pointer;
+}
+.settings-tab:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.settings-tab.active {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, var(--bg-1));
+}
 .settings-layout {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(auto-fill, minmax(min(360px, 100%), 1fr));
+  grid-auto-flow: row dense;
   gap: 14px;
   height: 100%;
-  overflow: hidden;
+  overflow-y: auto;
+  align-items: start;
+  padding: 14px;
 }
 .settings-col {
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-  overflow-y: auto;
+  display: contents;
+}
+.settings-col[hidden],
+.settings-block[hidden],
+.settings-block[data-tab-hidden="true"] {
+  display: none !important;
 }
 .settings-block {
   border: 1px solid var(--line);
   background: var(--bg-2);
+  min-width: 0;
+}
+.settings-block[data-settings-tab-panel="memory"],
+.settings-block[data-settings-tab-panel="credentials"],
+.settings-block[data-settings-tab-panel="diagnostics"] {
+  grid-column: 1 / -1;
+}
+.settings-block-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+.settings-block-head > .creds-meta,
+.settings-block-head > [data-plan-proposals-meta],
+.settings-block-head > [data-proposals-meta],
+.settings-block-head > [data-checkins-meta],
+.settings-block-head > [data-creds-meta] {
+  margin-left: auto;
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  color: var(--fg-3);
+  text-transform: none;
+}
+@media (max-width: 840px) {
+  .wf-layout,
+  .wf-layout.architect-collapsed {
+    grid-template-columns: 1fr;
+    overflow-y: auto;
+  }
+  .wf-layout.architect-collapsed .wf-chat-pane,
+  .wf-layout.architect-collapsed .wf-chat-head {
+    height: auto;
+  }
+  .wf-layout.architect-collapsed .wf-chat-log,
+  .wf-layout.architect-collapsed .wf-chat-chips,
+  .wf-layout.architect-collapsed .wf-chat-form {
+    display: none;
+  }
+  .wf-run-strip {
+    grid-template-columns: 1fr;
+  }
+  .wf-run-strip-meta {
+    justify-content: flex-start;
+  }
 }
 /* Diagnostics panel — additive only; renders read-only data from
    /api/console/diagnostics. Same look as other settings blocks. */
@@ -7615,6 +9160,25 @@ body {
 .diag-summary strong { color: var(--fg); }
 .diag-section { padding: 10px 16px; border-bottom: 1px dashed var(--line); }
 .diag-section:last-child { border-bottom: 0; }
+.settings-block[data-diagnostics-panel] {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(320px, 100%), 1fr));
+  gap: 8px;
+  padding: 0 8px 8px;
+}
+.settings-block[data-diagnostics-panel] > .settings-block-head,
+.settings-block[data-diagnostics-panel] > .diag-summary {
+  grid-column: 1 / -1;
+  margin: 0 -8px;
+}
+.settings-block[data-diagnostics-panel] > .diag-section,
+.settings-block[data-diagnostics-panel] > .diag-section:last-child {
+  border: 1px solid var(--line);
+  background: var(--bg-1);
+  padding: 10px 12px;
+  margin: 0;
+  min-width: 0;
+}
 .diag-section-head {
   font-size: 10px;
   letter-spacing: 0.16em;
@@ -7784,6 +9348,32 @@ body {
 .settings-info .row .v { color: var(--fg); }
 .settings-info .row .v.on { color: var(--accent-2); }
 .settings-info .row .v.off { color: var(--fg-mute); }
+.settings-block[data-settings-tab-panel="memory"] .settings-info {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(200px, 100%), 1fr));
+  gap: 8px;
+  padding: 14px 16px;
+}
+.settings-block[data-settings-tab-panel="memory"] .settings-info .row,
+.settings-block[data-settings-tab-panel="memory"] .settings-info .row:last-child {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: flex-start;
+  gap: 4px;
+  border: 1px solid var(--line);
+  background: var(--bg-1);
+  padding: 10px 12px;
+}
+.settings-block[data-settings-tab-panel="memory"] .settings-info .row .k {
+  font-size: 9px;
+  letter-spacing: 0.16em;
+}
+.settings-block[data-settings-tab-panel="memory"] .settings-info .row .v {
+  font-size: 13px;
+  letter-spacing: 0.04em;
+  word-break: break-word;
+}
 .settings-note {
   margin: 10px 0 0;
   color: var(--fg-mute);
@@ -8189,19 +9779,24 @@ body {
   letter-spacing: 0.14em;
 }
 .creds-list {
-  padding: 0;
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(360px, 100%), 1fr));
+  gap: 10px;
+  padding: 12px 16px;
 }
 .cred-row {
-  padding: 12px 16px;
-  border-bottom: 1px solid var(--line);
+  padding: 12px;
+  border: 1px solid var(--line);
+  background: var(--bg-1);
   display: grid;
   grid-template-columns: 1fr auto;
   gap: 8px;
   align-items: start;
 }
-.cred-row:last-child { border-bottom: 0; }
+@media (max-width: 720px) {
+  .cred-row { grid-template-columns: 1fr; }
+  .cred-row .cred-actions { flex-direction: row; flex-wrap: wrap; min-width: 0; }
+}
 .cred-row .cred-main { min-width: 0; }
 .cred-row .cred-name {
   font-size: 11px;
@@ -8563,6 +10158,20 @@ body {
   border-bottom: 1px dashed color-mix(in srgb, var(--line) 70%, transparent);
 }
 .meeting-segment:last-child { border-bottom: 0; padding-bottom: 0; }
+/* Interim (partial) transcript line — dimmed + italic so it reads as
+   "still being spoken", with a soft caret. Replaced by the final. */
+.meeting-segment.interim {
+  color: var(--fg-mute);
+  font-style: italic;
+  border-bottom: 0;
+}
+.meeting-segment.interim::after {
+  content: '▍';
+  margin-left: 2px;
+  opacity: 0.6;
+  animation: meeting-interim-blink 1s steps(2, start) infinite;
+}
+@keyframes meeting-interim-blink { 50% { opacity: 0; } }
 .meeting-segment-speaker {
   display: block;
   font-size: 9px;
@@ -8781,6 +10390,7 @@ const CONSOLE_JS = `
   let lastRunsJSON = '';
 
   function withToken(path) {
+    if (!TOKEN) return path;
     const sep = path.includes('?') ? '&' : '?';
     return path + sep + 'token=' + encodeURIComponent(TOKEN);
   }
@@ -9208,6 +10818,75 @@ const CONSOLE_JS = `
     }
   }
 
+  async function openBackgroundTaskDetail(taskId) {
+    if (!taskId) return;
+    try {
+      selectedRunId = 'background:' + taskId;
+      if (els.runList) {
+        Array.from(els.runList.querySelectorAll('li.run')).forEach((el) => el.classList.remove('selected'));
+      }
+      const data = await fetchJSON('/api/console/background-tasks/' + encodeURIComponent(taskId));
+      const task = data.task || {};
+      const detail = data.detail || {};
+      if (els.detailId) els.detailId.textContent = task.id || taskId;
+      const result = task.resultFull || task.result || '';
+      const headLines = [
+        ['STATUS', task.status || '—'],
+        ['SOURCE', task.source || '—'],
+        ['CHANNEL', task.channel || '—'],
+        ['CREATED', task.createdAt || '—'],
+        ['COMPLETED', task.completedAt || '—'],
+        ['TITLE', task.title || '—'],
+      ];
+      const resultPath = task.resultPath || '';
+      const resultPathHtml = resultPath
+        ? '<div class="detail-block"><div class="detail-block-head">FULL RESULT FILE</div><div class="detail-block-body"><pre>' + esc(resultPath) + '</pre></div></div>'
+        : '';
+      const outputHtml = result
+        ? '<div class="detail-block"><div class="detail-block-head">WHAT COMPLETED</div><div class="detail-block-body"><pre>' + esc(result) + '</pre></div></div>'
+        : '<div class="detail-block"><div class="detail-block-head">WHAT COMPLETED</div><div class="detail-block-body"><p class="hint" style="margin:8px 0;">No result text was recorded.</p></div></div>';
+      const promptHtml = task.prompt
+        ? '<details class="detail-block"><summary class="detail-block-head">ORIGINAL REQUEST</summary><div class="detail-block-body"><pre>' + esc(task.prompt) + '</pre></div></details>'
+        : '';
+      const approvals = Array.isArray(detail.pendingApprovals) ? detail.pendingApprovals : [];
+      const approvalsHtml = approvals.length
+        ? '<div class="detail-block"><div class="detail-block-head">PENDING APPROVALS</div><div class="detail-block-body"><pre>'
+          + approvals.map((approval) => esc((approval.approvalId || 'approval') + ' · ' + (approval.subject || approval.tool || 'needs approval'))).join('\\n')
+          + '</pre></div></div>'
+        : '';
+      const toolEvents = Array.isArray(detail.toolEvents) ? detail.toolEvents.slice(-12) : [];
+      const toolEventsHtml = toolEvents.length
+        ? '<div class="detail-block"><div class="detail-block-head">RECENT TOOL ACTIVITY</div><div class="detail-block-body"><pre>'
+          + toolEvents.map((event) => esc(
+            (event.at ? event.at.slice(11, 19) : '--:--:--') + ' ' +
+            (event.toolName || 'tool') + ' ' +
+            (event.phase || 'event') +
+            (event.outcome ? ' ' + event.outcome : '') +
+            (event.durationMs ? ' ' + event.durationMs + 'ms' : '') +
+            (event.argsSummary ? ' · ' + event.argsSummary : ''),
+          )).join('\\n')
+          + '</pre></div></div>'
+        : '';
+      const notifications = Array.isArray(detail.notifications) ? detail.notifications.slice(-5) : [];
+      const notificationsHtml = notifications.length
+        ? '<div class="detail-block"><div class="detail-block-head">TASK NOTIFICATIONS</div><div class="detail-block-body"><pre>'
+          + notifications.map((notification) => esc(
+            (notification.createdAt ? notification.createdAt.slice(11, 19) : '--:--:--') + ' ' +
+            (notification.title || 'notification') +
+            (notification.silent ? ' (dashboard-only)' : ''),
+          )).join('\\n')
+          + '</pre></div></div>'
+        : '';
+      const headerHtml = '<div class="detail-block"><div class="detail-block-head">BACKGROUND TASK</div><div class="detail-block-body"><pre>'
+        + headLines.map((kv) => kv[0].padEnd(10) + ' ' + esc(kv[1])).join('\\n')
+        + '</pre></div></div>';
+      if (els.detailBody) els.detailBody.innerHTML = headerHtml + approvalsHtml + resultPathHtml + outputHtml + toolEventsHtml + notificationsHtml + promptHtml;
+    } catch (err) {
+      if (els.detailId) els.detailId.textContent = taskId;
+      if (els.detailBody) els.detailBody.innerHTML = '<p class="hint">Failed to load background task · ' + esc(err.message || err) + '</p>';
+    }
+  }
+
   // Home tile counts that don't come from /api/dashboard.
   // Refreshed in the background so the tiles aren't always pinned to '—'.
   let homePlanCount = null;
@@ -9388,6 +11067,7 @@ const CONSOLE_JS = `
       const hasApproval = item.approvalId && item.approvalKind;
       const hasWorkflowRun = item.actionKind === 'workflow-run' && item.workflowName && item.runId;
       const hasHarnessSession = item.actionKind === 'harness-session' && item.sessionId;
+      const hasBackgroundTask = item.actionKind === 'background-task' && item.taskId;
       const canEdit = hasApproval && item.approvalKind === 'harness' && item.approvalArgs;
       const editArgsAttr = canEdit ? ' data-home-approval-args="' + escMem(item.approvalArgs) + '"' : '';
       const editButton = canEdit
@@ -9418,6 +11098,13 @@ const CONSOLE_JS = `
             '</div>',
           ].join('')
         : '';
+      const backgroundActions = hasBackgroundTask
+        ? [
+            '<div class="home-item-actions">',
+            '  <button type="button" data-home-background-action="open" data-home-background-task-id="' + escMem(item.taskId) + '">VIEW RESULT</button>',
+            '</div>',
+          ].join('')
+        : '';
       // Drill-target: if the item carries a sessionId or runId, attach
       // it as a data attribute. The click handler at line ~8693 reads
       // these and, AFTER switching panels, loads the inspector detail
@@ -9426,8 +11113,14 @@ const CONSOLE_JS = `
       const targetSessionAttr = item.targetSessionId
         ? ' data-home-target-session-id="' + escMem(item.targetSessionId) + '"'
         : '';
+      const targetRunAttr = item.targetRunId
+        ? ' data-home-target-run-id="' + escMem(item.targetRunId) + '"'
+        : '';
+      const targetBackgroundAttr = hasBackgroundTask
+        ? ' data-home-background-task-id="' + escMem(item.taskId) + '"'
+        : '';
       return [
-      '<div class="home-item command-item" data-tools-jump="' + escMem(item.panel || 'activity') + '"' + targetSessionAttr + '>',
+      '<div class="home-item command-item" data-tools-jump="' + escMem(item.panel || 'activity') + '"' + targetSessionAttr + targetRunAttr + targetBackgroundAttr + '>',
       '  <span class="home-item-kind ' + escMem(item.kind || 'task') + '">' + escMem(String(item.kind || 'item').toUpperCase()) + '</span>',
       '  <div style="flex:1; min-width:0;">',
       '    <div class="home-item-text">' + escMem(item.title || '') + '</div>',
@@ -9435,6 +11128,7 @@ const CONSOLE_JS = `
       approvalActions,
       workflowActions,
       harnessActions,
+      backgroundActions,
       '  </div>',
       '</div>',
     ].join('');
@@ -9699,6 +11393,7 @@ const CONSOLE_JS = `
     const sessionId = button.getAttribute('data-home-harness-session-id') || '';
     if (!sessionId) return;
     if (action === 'open') {
+      setHomeHarnessSessionId(sessionId, 'watching');
       // WATCH: switch to the activity panel AND open a live inspector
       // for this session. The activity panel's right-side detail pane
       // gets repurposed as a live event timeline that subscribes to
@@ -9923,7 +11618,8 @@ const CONSOLE_JS = `
       } else if (kind === 'activity') {
         switchPanel('activity');
       } else if (kind === 'memory') {
-        switchPanel('memory');
+        // 'memory' panel was consolidated into 'brain'.
+        switchPanel('brain');
       } else if (kind === 'integrations') {
         switchPanel('integrations');
       }
@@ -10009,6 +11705,9 @@ const CONSOLE_JS = `
   let approvalsBooted = false;
   let brainBooted = false;
   let brainCurrentTab = 'overview';
+  // Tracks whether Meetings is promoted to the top-level sidebar slot
+  // (Recall capture enabled). Flipped by syncMeetingsPlacement().
+  let meetingsPromoted = false;
 
   function switchPanel(name) {
     panelSections.forEach((s) => {
@@ -10062,6 +11761,15 @@ const CONSOLE_JS = `
       else refreshBrainCurrentTab();
     } else if (name === 'settings') {
       if (!settingsBooted) { settingsBooted = true; bootSettingsPanel(); }
+    } else if (name === 'meetings') {
+      // Meetings has no heavy boot — loadMemoryMeetings is self-contained
+      // (hits /api/console/meetings/recall/recent). wireMemoryMeetingsControls
+      // is idempotent (guarded by memMeetingsBound), same call the Brain
+      // sub-tab made via refreshBrainMeetings.
+      if (typeof wireMemoryMeetingsControls === 'function') wireMemoryMeetingsControls();
+      if (typeof loadMemoryMeetings === 'function') {
+        loadMemoryMeetings().catch((err) => console.error('meetings load failed:', err));
+      }
     }
   }
   navButtons.forEach((b) => {
@@ -10070,6 +11778,59 @@ const CONSOLE_JS = `
       switchPanel(b.getAttribute('data-panel'));
     });
   });
+
+  // Promote/demote Meetings between the top-level sidebar slot (Recall
+  // capture enabled) and the Brain "meetings" sub-tab (status quo).
+  // Idempotent: the early-return on unchanged state makes it safe to call
+  // on every 5s recall poll tick. Relocates the SINGLE .mem-meetings node
+  // (there can only be one — all loaders query it by single selector) and
+  // toggles the nav button + Brain sub-tab entry to match.
+  function syncMeetingsPlacement(status) {
+    const configured = Boolean(status && status.enabled);
+    if (configured === meetingsPromoted) return;
+    const navBtn = document.querySelector('[data-meetings-nav]');
+    const memNode = document.querySelector('[data-mem-meetings]');
+    const mount = document.querySelector('[data-meetings-mount]');
+    const brainPane = document.querySelector('[data-brain-pane="meetings"]');
+    const brainWrap = document.querySelector('.brain-meetings-wrap');
+    const brainTab = document.querySelector('[data-brain-tab="meetings"]');
+    if (!navBtn || !memNode || !mount || !brainPane || !brainWrap || !brainTab) return;
+    if (configured) {
+      mount.appendChild(memNode);   // move the node up to the top-level panel
+      navBtn.hidden = false;
+      brainTab.hidden = true;       // hide the now-empty Brain sub-tab entry
+    } else {
+      brainWrap.appendChild(memNode); // move it back under Brain's sized wrapper
+      navBtn.hidden = true;
+      brainTab.hidden = false;
+      // Don't strand the user on a panel that's about to be hidden.
+      if ((location.hash || '') === '#meetings') switchPanel('brain');
+    }
+    meetingsPromoted = configured;
+  }
+  window.__clementineSyncMeetingsPlacement = syncMeetingsPlacement;
+
+  // Navigate to the live meeting transcript. When Meetings is promoted to
+  // the top-level slot, jump straight there; otherwise fall back to the
+  // Brain panel → Meetings sub-tab. Clicking the real nav / tab buttons
+  // reuses their wired handlers (boot + load), the robust path. (Pre-
+  // consolidation this routed to a 'memory' panel that no longer exists.)
+  function openBrainMeetings() {
+    try {
+      if (meetingsPromoted) {
+        const navMeetings = document.querySelector('[data-meetings-nav]');
+        if (navMeetings) navMeetings.click(); else switchPanel('meetings');
+        return;
+      }
+      const navBrain = document.querySelector('.nav[data-panel="brain"]');
+      if (navBrain) navBrain.click(); else switchPanel('brain');
+      const meetingsTab = document.querySelector('[data-brain-tab="meetings"]');
+      if (meetingsTab) meetingsTab.click();
+    } catch (err) {
+      console.warn('openBrainMeetings failed:', err);
+    }
+  }
+  window.__clementineOpenBrainMeetings = openBrainMeetings;
 
   // ── Left-rail dock cards: clickable jump targets ──
   // Each dock-card-clickable carries data-dock-jump="<panel>". Click or
@@ -10132,11 +11893,58 @@ const CONSOLE_JS = `
       handleHomeHarnessButton(harnessButton);
       return;
     }
+    const backgroundButton = target.closest('[data-home-background-action]');
+    if (backgroundButton) {
+      event.preventDefault();
+      event.stopPropagation();
+      const taskId = backgroundButton.getAttribute('data-home-background-task-id') || '';
+      if (taskId) {
+        switchPanel('activity');
+        setTimeout(() => openBackgroundTaskDetail(taskId), 0);
+      }
+      return;
+    }
     const jump = target.closest('[data-tools-jump]');
     if (!jump) return;
     event.preventDefault();
     const panel = jump.getAttribute('data-tools-jump');
+    const targetBackgroundTaskId = jump.getAttribute('data-home-background-task-id');
+    if (targetBackgroundTaskId && panel === 'activity') {
+      switchPanel('activity');
+      setTimeout(() => {
+        openBackgroundTaskDetail(targetBackgroundTaskId);
+      }, 0);
+      return;
+    }
+    const targetRunId = jump.getAttribute('data-home-target-run-id');
+    if (targetRunId && panel === 'activity') {
+      switchPanel('activity');
+      setTimeout(() => {
+        try {
+          selectedRunId = targetRunId;
+          if (typeof loadDetail === 'function') loadDetail(targetRunId);
+          if (els && els.runList) {
+            Array.from(els.runList.querySelectorAll('li.run')).forEach((el) => {
+              el.classList.toggle('selected', el.getAttribute('data-run-id') === targetRunId);
+            });
+            const selectedLi = els.runList.querySelector('li.run.selected');
+            if (selectedLi && typeof selectedLi.scrollIntoView === 'function') {
+              selectedLi.scrollIntoView({ block: 'center', behavior: 'smooth' });
+            }
+          }
+        } catch (err) { console.error('run drill-link failed:', err); }
+      }, 80);
+      return;
+    }
     switchPanel(panel);
+    const settingsTab = jump.getAttribute('data-settings-tab-open');
+    if (panel === 'settings' && settingsTab) {
+      setTimeout(() => {
+        if (typeof window.__clementineSetSettingsTab === 'function') {
+          window.__clementineSetSettingsTab(settingsTab);
+        }
+      }, 0);
+    }
     // Drill-link: if the clicked NEEDS-YOU item carries a specific
     // session/run id, load that exact item in the destination panel's
     // inspector after the panel renders. setTimeout lets the panel
@@ -10356,7 +12164,8 @@ const CONSOLE_JS = `
     wireMemoryViewToggle();
     wireMemoryGraphControls();
     await Promise.all([refreshMemoryStatus(), refreshFileList(), refreshFactList()]);
-    if (!memGraphLoaded) {
+    const graphPane = document.querySelector('[data-brain-knowledge-pane="graph"]');
+    if (!memGraphLoaded && graphPane && !graphPane.hidden) {
       memGraphLoaded = true;
       await loadMemoryGraph();
     }
@@ -10373,6 +12182,43 @@ const CONSOLE_JS = `
   let memGraphPinnedNode = null;
   let memViewToggleBound = false;
   let memGraphActionsBound = false;
+  let cytoscapeLoadPromise = null;
+
+  function ensureCytoscapeLoaded() {
+    if (typeof window.cytoscape === 'function') return Promise.resolve(true);
+    if (cytoscapeLoadPromise) return cytoscapeLoadPromise;
+    cytoscapeLoadPromise = new Promise((resolve) => {
+      const started = Date.now();
+      let done = false;
+      let timer = null;
+      const finish = (ok) => {
+        if (done) return;
+        done = true;
+        if (timer) clearInterval(timer);
+        resolve(!!ok && typeof window.cytoscape === 'function');
+      };
+      const poll = () => {
+        if (typeof window.cytoscape === 'function') {
+          finish(true);
+        } else if (Date.now() - started > 5000) {
+          finish(false);
+        }
+      };
+      const existing = document.querySelector('script[src="/console/vendor/cytoscape.min.js"]');
+      const script = existing || document.createElement('script');
+      if (!existing) {
+        script.src = '/console/vendor/cytoscape.min.js';
+        script.async = true;
+        script.setAttribute('data-cytoscape-loader', '1');
+        document.head.appendChild(script);
+      }
+      script.addEventListener('load', () => finish(true), { once: true });
+      script.addEventListener('error', () => finish(false), { once: true });
+      timer = setInterval(poll, 50);
+      poll();
+    });
+    return cytoscapeLoadPromise;
+  }
 
   function wireMemoryViewToggle() {
     document.querySelectorAll('[data-mem-view]').forEach((button) => {
@@ -10524,7 +12370,21 @@ const CONSOLE_JS = `
     if (memMeetingsBound) return;
     memMeetingsBound = true;
     const refresh = document.querySelector('[data-mem-meetings-refresh]');
-    refresh?.addEventListener('click', () => loadMemoryMeetings());
+    refresh?.addEventListener('click', () => {
+      const search = document.querySelector('[data-mem-meetings-search]');
+      if (search) search.value = '';
+      loadMemoryMeetings();
+    });
+    const search = document.querySelector('[data-mem-meetings-search]');
+    let searchTimer = null;
+    search?.addEventListener('input', () => {
+      clearTimeout(searchTimer);
+      const q = search.value.trim();
+      searchTimer = setTimeout(() => {
+        if (!q) loadMemoryMeetings();
+        else searchMeetings(q);
+      }, 250);
+    });
   }
 
   function platformClass(platform) {
@@ -10595,6 +12455,75 @@ const CONSOLE_JS = `
     });
   }
 
+  // Shared row markup for both the recent list and search results.
+  function renderMeetingRow(m) {
+    const cls = memMeetingsSelected === m.id ? 'mem-meeting-row selected' : 'mem-meeting-row';
+    const platform = m.platform || 'meeting';
+    const statusLabel = m.status === 'recording' ? 'RECORDING'
+      : m.hasAnalysis ? 'ANALYSIS READY'
+      : m.status === 'completed' ? 'ANALYSIS PENDING'
+      : (m.status || 'unknown').toUpperCase();
+    const statusCls = m.status === 'recording' ? 'recording'
+      : m.hasAnalysis ? 'analysis-ready'
+      : m.status === 'completed' ? 'analysis-pending'
+      : '';
+    return [
+      '<div class="' + cls + '" data-mem-meeting-id="' + escMem(m.id) + '">',
+      '  <div class="mem-meeting-row-head">',
+      '    <span class="mem-meeting-platform ' + platformClass(platform) + '">' + escMem(platform) + '</span>',
+      '    <span class="mem-meeting-status ' + statusCls + '">' + escMem(statusLabel) + '</span>',
+      '  </div>',
+      '  <div class="mem-meeting-row-title" title="' + escMem(m.title || m.windowId) + '">' + escMem(m.title || '(untitled meeting)') + '</div>',
+      '  <div class="mem-meeting-row-meta">' + fmtMeetingDate(m.startedAt) + ' · ' + fmtMeetingDuration(m.durationSeconds) + ' · ' + (m.segmentCount || 0) + ' segments</div>',
+      '</div>',
+    ].join('');
+  }
+
+  // Attach click→select→load-detail to every row inside the list.
+  function wireMeetingRowClicks(list) {
+    Array.from(list.querySelectorAll('[data-mem-meeting-id]')).forEach((row) => {
+      row.addEventListener('click', () => {
+        const id = row.getAttribute('data-mem-meeting-id');
+        memMeetingsSelected = id;
+        Array.from(list.querySelectorAll('.mem-meeting-row')).forEach((el) => el.classList.toggle('selected', el === row));
+        loadMemoryMeetingDetail(id);
+      });
+    });
+  }
+
+  // Search captured meetings via the vault index (FTS + embedding rerank),
+  // scoped to the 04-Meetings folder. Matches titles, summaries, AND
+  // transcripts — the filing work folded summaries into the notes, so a
+  // search for an outcome ("salesforce") finds the meeting even if that
+  // word was never spoken. Empty query restores the recent list.
+  async function searchMeetings(q) {
+    const list = document.querySelector('[data-mem-meetings-list]');
+    const meta = document.querySelector('[data-mem-meetings-meta]');
+    if (!list) return;
+    list.innerHTML = '<div class="mem-meetings-empty">searching…</div>';
+    try {
+      const data = await fetchJSON('/api/console/memory/search?q=' + encodeURIComponent(q) + '&limit=25');
+      const hits = (data.hits || []).filter((h) => (h.filePath || '').includes('/04-Meetings/'));
+      const byPath = new Map();
+      for (const m of memMeetingsCache) if (m.artifactPath) byPath.set(m.artifactPath, m);
+      const seen = new Set();
+      const matched = [];
+      for (const h of hits) {
+        const m = byPath.get(h.filePath);
+        if (m && !seen.has(m.id)) { seen.add(m.id); matched.push(m); }
+      }
+      if (meta) meta.textContent = matched.length + ' match' + (matched.length === 1 ? '' : 'es');
+      if (matched.length === 0) {
+        list.innerHTML = '<div class="mem-meetings-empty">No meetings match &ldquo;' + escMem(q) + '&rdquo;.</div>';
+        return;
+      }
+      list.innerHTML = matched.map(renderMeetingRow).join('');
+      wireMeetingRowClicks(list);
+    } catch (err) {
+      list.innerHTML = '<div class="mem-meetings-empty" style="color:var(--accent-fail);">Search failed: ' + escMem(err.message || err) + '</div>';
+    }
+  }
+
   async function loadMemoryMeetings() {
     const list = document.querySelector('[data-mem-meetings-list]');
     const meta = document.querySelector('[data-mem-meetings-meta]');
@@ -10604,8 +12533,16 @@ const CONSOLE_JS = `
       const meetings = data.meetings || [];
       memMeetingsCache = meetings;
       const liveCard = renderLiveMeetingCard();
-      const haveLive = liveCard !== '';
-      if (meta) meta.textContent = (haveLive ? '1 live · ' : '') + meetings.length + ' captured';
+      // Records still in 'recording' status belong in the LIVE section
+      // (the streaming card above already covers the SDK-tracked active
+      // meeting, but a record can be 'recording' without local live
+      // state — e.g. after a reload, or a stuck capture). Everything
+      // else is a past capture.
+      const liveMeetings = meetings.filter((m) => m.status === 'recording');
+      const pastMeetings = meetings.filter((m) => m.status !== 'recording');
+      const haveLive = liveCard !== '' || liveMeetings.length > 0;
+      const liveCount = (liveCard !== '' ? 1 : 0) + liveMeetings.length;
+      if (meta) meta.textContent = (haveLive ? liveCount + ' live · ' : '') + pastMeetings.length + ' captured';
       if (meetings.length === 0 && !haveLive) {
         list.innerHTML = [
           '<div class="mem-meetings-empty">',
@@ -10615,36 +12552,21 @@ const CONSOLE_JS = `
         renderMemoryMeetingDetail(null);
         return;
       }
-      list.innerHTML = liveCard + meetings.map((m) => {
-        const cls = memMeetingsSelected === m.id ? 'mem-meeting-row selected' : 'mem-meeting-row';
-        const platform = m.platform || 'meeting';
-        const statusLabel = m.status === 'recording' ? 'RECORDING'
-          : m.hasAnalysis ? 'ANALYSIS READY'
-          : m.status === 'completed' ? 'ANALYSIS PENDING'
-          : (m.status || 'unknown').toUpperCase();
-        const statusCls = m.status === 'recording' ? 'recording'
-          : m.hasAnalysis ? 'analysis-ready'
-          : m.status === 'completed' ? 'analysis-pending'
-          : '';
-        return [
-          '<div class="' + cls + '" data-mem-meeting-id="' + escMem(m.id) + '">',
-          '  <div class="mem-meeting-row-head">',
-          '    <span class="mem-meeting-platform ' + platformClass(platform) + '">' + escMem(platform) + '</span>',
-          '    <span class="mem-meeting-status ' + statusCls + '">' + escMem(statusLabel) + '</span>',
-          '  </div>',
-          '  <div class="mem-meeting-row-title" title="' + escMem(m.title || m.windowId) + '">' + escMem(m.title || '(untitled meeting)') + '</div>',
-          '  <div class="mem-meeting-row-meta">' + fmtMeetingDate(m.startedAt) + ' · ' + fmtMeetingDuration(m.durationSeconds) + ' · ' + (m.segmentCount || 0) + ' segments</div>',
-          '</div>',
-        ].join('');
-      }).join('');
-      Array.from(list.querySelectorAll('[data-mem-meeting-id]')).forEach((row) => {
-        row.addEventListener('click', () => {
-          const id = row.getAttribute('data-mem-meeting-id');
-          memMeetingsSelected = id;
-          Array.from(list.querySelectorAll('.mem-meeting-row')).forEach((el) => el.classList.toggle('selected', el === row));
-          loadMemoryMeetingDetail(id);
-        });
-      });
+      const renderRow = renderMeetingRow;
+      const sectionHead = (label, count) =>
+        '<div class="mem-meetings-section">' + escMem(label) + (count != null ? ' · ' + count : '') + '</div>';
+      const parts = [];
+      if (haveLive) {
+        parts.push(sectionHead('LIVE NOW', liveCount));
+        if (liveCard) parts.push(liveCard);
+        parts.push(...liveMeetings.map(renderRow));
+      }
+      parts.push(sectionHead('CAPTURED', pastMeetings.length));
+      parts.push(pastMeetings.length > 0
+        ? pastMeetings.map(renderRow).join('')
+        : '<div class="mem-meetings-empty">— no past captures yet —</div>');
+      list.innerHTML = parts.join('');
+      wireMeetingRowClicks(list);
       wireLiveMeetingCardActions();
       if (memMeetingsSelected && meetings.some((m) => m.id === memMeetingsSelected)) {
         loadMemoryMeetingDetail(memMeetingsSelected);
@@ -10694,6 +12616,7 @@ const CONSOLE_JS = `
       lines.push('<button data-meeting-action="transcript" data-path="' + escMem(rec.artifactPath) + '">OPEN TRANSCRIPT</button>');
     }
     lines.push('<button class="primary" data-meeting-action="send-summary" data-id="' + escMem(rec.id) + '">SUMMARIZE IN CHAT</button>');
+    lines.push('<button data-meeting-action="rename" data-id="' + escMem(rec.id) + '">RENAME</button>');
     lines.push('</div>');
 
     if (analysis) {
@@ -10746,23 +12669,8 @@ const CONSOLE_JS = `
           btn.disabled = true;
           btn.textContent = 'SENDING…';
           try {
-            const fresh = await fetchJSON('/api/console/meetings/recall/' + encodeURIComponent(id));
-            const a = fresh.analysis;
-            let msg;
-            if (a && a.summary) {
-              const parts = ['Meeting summary:', '', a.summary];
-              if (Array.isArray(a.actionItems) && a.actionItems.length > 0) {
-                parts.push('', 'Action items:');
-                for (const x of a.actionItems) parts.push('- ' + (x.owner ? x.owner + ': ' : '') + x.text);
-              }
-              if (Array.isArray(a.decisions) && a.decisions.length > 0) {
-                parts.push('', 'Decisions:');
-                for (const d of a.decisions) parts.push('- ' + (typeof d === 'string' ? d : (d.text || JSON.stringify(d))));
-              }
-              msg = parts.join('\\n');
-            } else {
-              msg = 'Captured meeting transcript is at ' + (fresh.record?.artifactPath || '(path unknown)') + '. Read it and give me the summary + action items.';
-            }
+            const promptPayload = await fetchJSON('/api/console/meetings/recall/' + encodeURIComponent(id) + '/chat-prompt');
+            const msg = promptPayload.prompt || 'Read the full meeting transcript, summarize it, then ask what actions I want to take from it.';
             // SWITCH TO HOME PANEL FIRST. Without this the message lands
             // on the home chat thread (which exists in the DOM but is
             // hidden) and the user — still looking at Memory > Captured
@@ -10784,6 +12692,46 @@ const CONSOLE_JS = `
             btn.disabled = false;
             btn.textContent = originalLabel;
           }
+        } else if (action === 'rename') {
+          const id = btn.getAttribute('data-id');
+          if (!id) return;
+          const h3 = detail.querySelector('.mem-meeting-detail h3');
+          if (!h3) return;
+          const currentRaw = h3.textContent || '';
+          const current = currentRaw === '(untitled meeting)' ? '' : currentRaw;
+          // Swap the title for an inline editor. Cancel/Esc restores the
+          // detail by reloading it; Save PATCHes then reloads detail+list.
+          h3.innerHTML = '<input class="mem-rename-input" type="text" maxlength="120" /> '
+            + '<button class="mem-rename-save">SAVE</button> '
+            + '<button class="mem-rename-cancel">CANCEL</button>';
+          const input = h3.querySelector('.mem-rename-input');
+          input.value = current;
+          input.focus();
+          input.select();
+          const cancel = () => { loadMemoryMeetingDetail(id); };
+          const save = async () => {
+            const val = input.value.trim();
+            if (!val) { input.focus(); return; }
+            try {
+              const r = await fetchWithToken('/api/console/meetings/recall/' + encodeURIComponent(id) + '/title', {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+                body: JSON.stringify({ title: val }),
+              });
+              if (!r.ok) throw new Error('HTTP ' + r.status);
+              await loadMemoryMeetingDetail(id);   // re-render with new title
+              await loadMemoryMeetings();           // refresh list label too
+            } catch (err) {
+              alert('Rename failed: ' + (err && err.message ? err.message : String(err)));
+              cancel();
+            }
+          };
+          h3.querySelector('.mem-rename-save').addEventListener('click', save);
+          h3.querySelector('.mem-rename-cancel').addEventListener('click', cancel);
+          input.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') { e.preventDefault(); save(); }
+            else if (e.key === 'Escape') { e.preventDefault(); cancel(); }
+          });
         }
       });
     });
@@ -10793,7 +12741,8 @@ const CONSOLE_JS = `
     const canvas = document.querySelector('[data-mem-graph-canvas]');
     const detail = document.querySelector('[data-mem-graph-detail]');
     if (!canvas) return;
-    if (typeof window.cytoscape !== 'function') {
+    if (canvas.closest('[hidden]') && !options.force) return;
+    if (!(await ensureCytoscapeLoaded())) {
       canvas.innerHTML = '<div class="mem-empty" style="padding:24px;">Cytoscape failed to load. Reload the page once the daemon is up.</div>';
       return;
     }
@@ -11732,6 +13681,7 @@ const CONSOLE_JS = `
   // ─── Workflow Studio ──────────────────────────────────────────
 
   const wf = {
+    layout:    document.querySelector('.wf-layout'),
     list:      document.querySelector('[data-wf-list]'),
     editor:    document.querySelector('[data-wf-editor]'),
     newBtn:    document.querySelector('[data-wf-new]'),
@@ -11740,6 +13690,7 @@ const CONSOLE_JS = `
     chatInput: document.querySelector('[data-wf-chat-input]'),
     chatSend:  document.querySelector('[data-wf-chat-send]'),
     chatMeta:  document.querySelector('[data-wf-chat-meta]'),
+    chatToggle: document.querySelector('[data-wf-chat-toggle]'),
   };
 
   /** Local draft state — what the editor shows; not yet saved unless
@@ -11748,6 +13699,9 @@ const CONSOLE_JS = `
   let wfSelectedName = null;
   let wfIsNew = false;
   let wfItems = [];
+  let wfHomeData = null;
+  let wfMode = 'home';
+  let wfHomePollTimer = null;
   let wfChatHistory = [];
   let wfChatBusy = false;
   // Set of step indices currently in edit mode. Cleared on workflow
@@ -11853,6 +13807,7 @@ const CONSOLE_JS = `
   }
 
   async function bootWorkflowsPanel() {
+    setupWorkflowArchitectToggle();
     // Document-level delegation is intentional: the single-file HTML is
     // heavily re-rendered, and these controls are identified by explicit
     // data-wf-* attributes.
@@ -11864,6 +13819,40 @@ const CONSOLE_JS = `
           ? rawTarget.parentElement
           : null;
       if (!target) return;
+      if (target.closest('[data-wf-home]')) {
+        event.preventDefault();
+        showWorkflowHome({ refresh: true });
+        return;
+      }
+      const createAction = target.closest('[data-wf-create-action]');
+      if (createAction) {
+        event.preventDefault();
+        const action = createAction.getAttribute('data-wf-create-action');
+        if (action === 'starter') {
+          startStarterWorkflow();
+          return;
+        }
+        if (action === 'architect') {
+          expandWorkflowArchitect();
+          if (wf.chatInput) {
+            wf.chatInput.value = 'Draft me a workflow for ';
+            wf.chatInput.focus();
+          }
+          return;
+        }
+        if (action === 'import') {
+          startWorkflowImportFromCreate();
+          return;
+        }
+      }
+      const homeAction = target.closest('[data-wf-home-action]');
+      if (homeAction) {
+        event.preventDefault();
+        const name = homeAction.getAttribute('data-wf-home-name');
+        const action = homeAction.getAttribute('data-wf-home-action');
+        handleWorkflowHomeAction(action, name);
+        return;
+      }
       const workflowSelect = target.closest('[data-wf-select]');
       const workflowRow = workflowSelect
         ? workflowSelect.closest('li[data-wf-name]')
@@ -11913,6 +13902,26 @@ const CONSOLE_JS = `
       console.error('cron list refresh failed:', err);
     });
     subscribeWorkflowChanges();
+  }
+
+  function setupWorkflowArchitectToggle() {
+    if (!wf.layout || !wf.chatToggle) return;
+    const STORAGE_KEY = 'clementine.workflow.architectCollapsed';
+    const apply = (collapsed) => {
+      wf.layout.classList.toggle('architect-collapsed', !!collapsed);
+      wf.chatToggle.textContent = collapsed ? '⇤' : '⇥';
+      wf.chatToggle.title = collapsed ? 'Expand architect' : 'Collapse architect';
+    };
+    let collapsed = false;
+    try { collapsed = localStorage.getItem(STORAGE_KEY) === '1'; } catch (_) { /* private mode */ }
+    apply(collapsed);
+    wf.chatToggle.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const next = !wf.layout.classList.contains('architect-collapsed');
+      try { localStorage.setItem(STORAGE_KEY, next ? '1' : '0'); } catch (_) { /* private mode */ }
+      apply(next);
+    });
   }
 
   /**
@@ -12048,6 +14057,7 @@ const CONSOLE_JS = `
 
   function selectCronByName(name) {
     if (!name || !wf.editor) return;
+    stopWorkflowHomePolling();
     cronSelectedName = name;
     // Deselect any selected workflow — clicking a cron is a different
     // surface than the workflow editor; clear so the user sees the
@@ -12115,10 +14125,456 @@ const CONSOLE_JS = `
 
   window.__clementineSelectCron = selectCronByName;
 
-  function selectWorkflowByName(name) {
+  function workflowStatusClass(status) {
+    const s = String(status || '').toLowerCase();
+    if (s === 'completed') return 'ok';
+    if (s === 'error' || s === 'failed') return 'err';
+    if (s === 'running' || s === 'queued') return 'run';
+    if (s === 'cancelled') return 'mute';
+    return '';
+  }
+
+  function workflowRunLabel(run) {
+    if (!run) return 'no runs yet';
+    const status = String(run.status || 'unknown');
+    const when = run.finishedAt || run.startedAt || run.createdAt || '';
+    return status + (when ? ' · ' + fmtCronAgo(when) : '');
+  }
+
+  function workflowHomeDayLabel(day) {
+    if (!day) return 'unscheduled';
+    const today = new Date().toISOString().slice(0, 10);
+    const tomorrowDate = new Date();
+    tomorrowDate.setDate(tomorrowDate.getDate() + 1);
+    const tomorrow = tomorrowDate.toISOString().slice(0, 10);
+    if (day === today) return 'TODAY';
+    if (day === tomorrow) return 'TOMORROW';
+    try {
+      return new Date(day + 'T12:00:00').toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' }).toUpperCase();
+    } catch {
+      return day;
+    }
+  }
+
+  function renderWorkflowHome(data, opts) {
+    if (!wf.editor) return;
+    const previousScroll = opts && opts.preserveScroll
+      ? ((wf.editor.querySelector('.wf-home') && wf.editor.querySelector('.wf-home').scrollTop) || 0)
+      : 0;
+    scheduleWorkflowHomePolling(data);
+    const counts = (data && data.counts) || {};
+    const workflows = Array.isArray(data && data.workflows) ? data.workflows : [];
+    const activeRuns = Array.isArray(data && data.activeRuns) ? data.activeRuns : [];
+    const upcoming = Array.isArray(data && data.upcoming) ? data.upcoming : [];
+    const recentRuns = Array.isArray(data && data.recentRuns) ? data.recentRuns : [];
+    const upcomingByDay = upcoming.reduce((acc, item) => {
+      const day = item.day || (item.at || '').slice(0, 10) || 'later';
+      if (!acc[day]) acc[day] = [];
+      acc[day].push(item);
+      return acc;
+    }, {});
+    const dayKeys = Object.keys(upcomingByDay).sort();
+    const stats = [
+      { label: 'WORKFLOWS', value: counts.workflows || 0 },
+      { label: 'ACTIVE RUNS', value: counts.activeRuns || 0 },
+      { label: 'FAILED RECENT', value: counts.failedRecent || 0 },
+      { label: 'UPCOMING', value: counts.upcoming || 0 },
+    ].map((item) => [
+      '<div class="wf-home-stat">',
+      '  <span>' + escMem(item.label) + '</span>',
+      '  <strong>' + escMem(String(item.value)) + '</strong>',
+      '</div>',
+    ].join('')).join('');
+    const activeHtml = activeRuns.length
+      ? activeRuns.slice(0, 6).map((run) => [
+        '<div class="wf-agenda-item active">',
+        '  <span class="wf-agenda-time">' + escMem(String(run.status || 'RUNNING').toUpperCase()) + '</span>',
+        '  <span class="wf-agenda-title">' + escMem(run.workflowName || 'workflow') + '</span>',
+        run.inFlightStepId ? '  <span class="wf-agenda-meta">step ' + escMem(run.inFlightStepId) + '</span>' : '',
+        '  <button type="button" class="wf-home-mini" data-wf-home-action="runs" data-wf-home-name="' + escMem(run.workflowName || '') + '">VIEW</button>',
+        '</div>',
+      ].join('')).join('')
+      : '<div class="wf-home-empty">— no active workflow runs —</div>';
+    const agendaHtml = dayKeys.length
+      ? dayKeys.map((day) => [
+        '<div class="wf-agenda-day">',
+        '  <div class="wf-agenda-day-head">' + escMem(workflowHomeDayLabel(day)) + '</div>',
+        upcomingByDay[day].slice(0, 8).map((item) => [
+          '<div class="wf-agenda-item">',
+          '  <span class="wf-agenda-time">' + escMem(item.time || '—') + '</span>',
+          '  <span class="wf-agenda-title">' + escMem(item.workflowName || 'workflow') + '</span>',
+          '  <span class="wf-agenda-meta">' + escMem(humanizeCronExpression(item.schedule) || item.schedule || '') + '</span>',
+          '</div>',
+        ].join('')).join(''),
+        '</div>',
+      ].join('')).join('')
+      : '<div class="wf-home-empty">— no enabled workflows scheduled in the next 7 days —</div>';
+    const recentHtml = recentRuns.length
+      ? recentRuns.slice(0, 8).map((run) => [
+        '<div class="wf-recent-run ' + workflowStatusClass(run.status) + '">',
+        '  <span class="wf-recent-status">' + escMem(String(run.status || 'unknown').toUpperCase()) + '</span>',
+        '  <span class="wf-recent-title">' + escMem(run.workflow || 'workflow') + '</span>',
+        '  <span class="wf-recent-meta">' + escMem(workflowRunLabel(run)) + '</span>',
+        run.error ? '  <span class="wf-recent-error">' + escMem(String(run.error).slice(0, 120)) + '</span>' : '',
+        '</div>',
+      ].join('')).join('')
+      : '<div class="wf-home-empty">— no workflow run history yet —</div>';
+    const workflowCards = workflows.length
+      ? workflows.map((item) => {
+        const schedule = item.triggerSchedule ? (humanizeCronExpression(item.triggerSchedule) || item.triggerSchedule) : 'manual only';
+        const last = item.lastRun ? workflowRunLabel(item.lastRun) : 'no runs yet';
+        const status = item.activeRun ? 'ACTIVE' : (item.enabled ? 'ENABLED' : 'DISABLED');
+        return [
+          '<article class="wf-home-card">',
+          '  <div class="wf-home-card-head">',
+          '    <div>',
+          '      <h3>' + escMem(item.name) + '</h3>',
+          '      <p>' + escMem(item.description || 'No description yet.') + '</p>',
+          '    </div>',
+          '    <span class="wf-home-pill ' + (item.activeRun ? 'run' : item.enabled ? 'on' : 'off') + '">' + status + '</span>',
+          '  </div>',
+          '  <div class="wf-home-card-meta">',
+          '    <span>' + escMem(item.stepCount || 0) + ' steps</span>',
+          '    <span>' + escMem(schedule) + '</span>',
+          '    <span>' + escMem(last) + '</span>',
+          '  </div>',
+          '  <div class="wf-home-card-actions">',
+          '    <button type="button" data-wf-home-action="edit" data-wf-home-name="' + escMem(item.name) + '">EDIT WITH CLEMENTINE</button>',
+          '    <button type="button" data-wf-home-action="run" data-wf-home-name="' + escMem(item.name) + '">RUN</button>',
+          '    <button type="button" data-wf-home-action="toggle" data-wf-home-name="' + escMem(item.name) + '">' + (item.enabled ? 'DISABLE' : 'ENABLE') + '</button>',
+          '    <button type="button" data-wf-home-action="runs" data-wf-home-name="' + escMem(item.name) + '">VIEW RUNS</button>',
+          '  </div>',
+          '</article>',
+        ].join('');
+      }).join('')
+      : '<div class="wf-home-empty">— no workflows yet —</div>';
+
+    wf.editor.innerHTML = [
+      '<div class="wf-home">',
+      '  <div class="wf-home-head">',
+      '    <div>',
+      '      <h2>Workflow home</h2>',
+      '      <p>Plan, run, schedule, and edit long-running workflow frameworks from one place.</p>',
+      '    </div>',
+      '    <div class="wf-home-head-actions">',
+      '      <button type="button" class="wf-empty-btn" data-wf-home>REFRESH</button>',
+      '      <button type="button" class="wf-empty-btn primary" data-wf-new onclick="window.__clementineStartNewWorkflow && window.__clementineStartNewWorkflow();">＋ NEW WORKFLOW</button>',
+      '    </div>',
+      '  </div>',
+      '  <div class="wf-home-stats">' + stats + '</div>',
+      '  <section class="wf-home-section">',
+      '    <div class="wf-home-section-head">RUNNING NOW</div>',
+      '    <div class="wf-agenda">' + activeHtml + '</div>',
+      '  </section>',
+      '  <section class="wf-home-section">',
+      '    <div class="wf-home-section-head">AGENDA · NEXT 7 DAYS</div>',
+      '    <div class="wf-agenda">' + agendaHtml + '</div>',
+      '  </section>',
+      '  <section class="wf-home-section">',
+      '    <div class="wf-home-section-head">RECENT OUTCOMES</div>',
+      '    <div class="wf-recent-list">' + recentHtml + '</div>',
+      '  </section>',
+      '  <section class="wf-home-section">',
+      '    <div class="wf-home-section-head">WORKFLOW LIBRARY</div>',
+      '    <div class="wf-home-grid">' + workflowCards + '</div>',
+      '  </section>',
+      '  <section class="wf-framework-guide wf-home-framework">',
+      '    <div class="wf-framework-guide-head">BUILD OUTSIDE CLEMENTINE</div>',
+      '    <p>Create a repo or folder with a workflow <code>SKILL.md</code>. Clementine can import a single root workflow, <code>workflows/*/SKILL.md</code>, or <code>.clementine/workflows/*/SKILL.md</code>.</p>',
+      '    <pre>proposal-audit/\\n  SKILL.md\\n  references/\\n  scripts/</pre>',
+      '    <pre>---\\nname: proposal-audit\\ndescription: Build a branded SEO proposal audit.\\nenabled: true\\ntrigger: { manual: true }\\nallowed_tools:\\n  - read_file\\n  - write_file\\nsteps:\\n  - id: research\\n    allowedTools: [read_file]\\n  - id: build\\n    dependsOn: [research]\\n    uses_skill: proposal-builder\\nsynthesis:\\n  prompt: Return the finished file path and the client-ready summary.\\n---\\nMarkdown body here.\\n\\n## step: research\\nRead the inputs and gather the facts.\\n\\n## step: build\\nCreate the proposal artifact.</pre>',
+      '  </section>',
+      '</div>',
+    ].join('');
+    if (opts && opts.preserveScroll) {
+      requestAnimationFrame(() => {
+        const homeEl = wf.editor && wf.editor.querySelector('.wf-home');
+        if (homeEl) homeEl.scrollTop = previousScroll;
+      });
+    }
+  }
+
+  function stopWorkflowHomePolling() {
+    if (wfHomePollTimer) {
+      clearInterval(wfHomePollTimer);
+      wfHomePollTimer = null;
+    }
+  }
+
+  function scheduleWorkflowHomePolling(data) {
+    stopWorkflowHomePolling();
+    const activeCount = data && data.counts && Number(data.counts.activeRuns || 0);
+    if (wfMode !== 'home' || activeCount <= 0) return;
+    wfHomePollTimer = setInterval(() => {
+      if (wfMode !== 'home') {
+        stopWorkflowHomePolling();
+        return;
+      }
+      loadWorkflowHome({ silent: true });
+    }, 5000);
+  }
+
+  async function loadWorkflowHome(opts) {
+    if (!wf.editor) return;
+    if (!(opts && opts.silent)) {
+      wf.editor.innerHTML = '<div class="wf-empty"><div class="wf-empty-mark">↻</div><div class="wf-empty-text">Loading workflow home…</div></div>';
+    }
+    try {
+      wfHomeData = await fetchJSON('/api/console/workflows/home');
+      if (wfMode !== 'home') return;
+      renderWorkflowHome(wfHomeData, { preserveScroll: !!(opts && (opts.preserveScroll || opts.silent)) });
+    } catch (err) {
+      if (wfMode !== 'home') return;
+      wf.editor.innerHTML = '<div class="wf-empty"><div class="wf-empty-mark">!</div><div class="wf-empty-text">' + escMem(err.message || err) + '</div></div>';
+    }
+  }
+
+  function renderWorkflowCreate() {
+    if (!wf.editor) return;
+    wf.editor.innerHTML = [
+      '<div class="wf-create">',
+      '  <div class="wf-create-head">',
+      '    <h2>Create workflow</h2>',
+      '    <p>Start from a safe starter template, ask the Architect to draft the workflow, or import a framework from a local folder or Git repo.</p>',
+      '  </div>',
+      '  <div class="wf-create-grid">',
+      '    <article class="wf-create-card">',
+      '      <h3>ARCHITECT</h3>',
+      '      <p>Describe the process in plain language. Clementine proposes diff cards; nothing mutates until you apply and save.</p>',
+      '      <div class="wf-create-actions">',
+      '        <button type="button" class="primary" data-wf-create-action="architect">ASK ARCHITECT</button>',
+      '      </div>',
+      '    </article>',
+      '    <article class="wf-create-card">',
+      '      <h3>STARTER TEMPLATE</h3>',
+      '      <p>Create a small research → draft workflow you can edit manually or refine with Architect.</p>',
+      '      <div class="wf-create-actions">',
+      '        <button type="button" class="primary" data-wf-create-action="starter">START FROM TEMPLATE</button>',
+      '      </div>',
+      '    </article>',
+      '    <article class="wf-create-card">',
+      '      <h3>IMPORT FRAMEWORK</h3>',
+      '      <p>Import a workflow package from a local folder, GitHub URL, SSH URL, or owner/repo shorthand. Dry run first to preview what will be installed.</p>',
+      '      <div class="wf-import-form">',
+      '        <input type="text" data-wf-import-source placeholder="~/path/to/workflow-framework or owner/repo" spellcheck="false" />',
+      '        <div class="wf-import-options">',
+      '          <label><input type="checkbox" data-wf-import-dry-run checked /> DRY RUN</label>',
+      '          <label><input type="checkbox" data-wf-import-overwrite /> OVERWRITE EXISTING</label>',
+      '        </div>',
+      '        <div class="wf-create-actions">',
+      '          <button type="button" class="primary" data-wf-create-action="import">IMPORT</button>',
+      '        </div>',
+      '      </div>',
+      '    </article>',
+      '  </div>',
+      '  <section class="wf-framework-guide wf-home-framework">',
+      '    <div class="wf-framework-guide-head">BUILD OUTSIDE CLEMENTINE</div>',
+      '    <p>Create a repo or folder with a workflow <code>SKILL.md</code>. Clementine can import a single root workflow, <code>workflows/*/SKILL.md</code>, or <code>.clementine/workflows/*/SKILL.md</code>.</p>',
+      '    <pre>proposal-audit/\\n  SKILL.md\\n  references/\\n  scripts/</pre>',
+      '    <pre>---\\nname: proposal-audit\\ndescription: Build a branded SEO proposal audit.\\nenabled: true\\ntrigger: { manual: true }\\nallowed_tools:\\n  - read_file\\n  - write_file\\nsteps:\\n  - id: research\\n    allowedTools: [read_file]\\n  - id: build\\n    dependsOn: [research]\\n    uses_skill: proposal-builder\\nsynthesis:\\n  prompt: Return the finished file path and the client-ready summary.\\n---\\nMarkdown body here.\\n\\n## step: research\\nRead the inputs and gather the facts.\\n\\n## step: build\\nCreate the proposal artifact.</pre>',
+      '  </section>',
+      '  <div class="wf-import-status" data-wf-import-status hidden></div>',
+      '</div>',
+    ].join('');
+  }
+
+  function showWorkflowCreate() {
+    wfMode = 'create';
+    wfDraft = null;
+    wfSelectedName = null;
+    wfIsNew = false;
+    cronSelectedName = null;
+    wfChatHistory = [];
+    wfEditingStepIndices.clear();
+    stopWorkflowHomePolling();
+    stopActiveRunPolling();
+    if (wf.list) Array.from(wf.list.querySelectorAll('li.wf')).forEach((el) => el.classList.remove('selected'));
+    resetWorkflowArchitectIntro();
+    syncArchitectChatChips();
+    renderWorkflowCreate();
+  }
+
+  function setWorkflowImportStatus(text, busy) {
+    const status = wf.editor && wf.editor.querySelector('[data-wf-import-status]');
+    if (!status) return;
+    status.hidden = false;
+    status.textContent = text || '';
+    status.classList.toggle('busy', !!busy);
+  }
+
+  async function pollWorkflowImportJob(jobId) {
+    if (!jobId) return null;
+    let lastJob = null;
+    for (let i = 0; i < 60; i += 1) {
+      const data = await fetchJSON('/api/console/workflows/import/jobs/' + encodeURIComponent(jobId));
+      const job = data.job || {};
+      lastJob = job;
+      setWorkflowImportStatus([
+        'Import ' + job.id,
+        'Status: ' + job.status,
+        'Source: ' + job.normalizedSource,
+        'Discovered: ' + (job.discovered || []).length,
+        'Installed: ' + (job.installed || []).length,
+        'Skipped: ' + (job.skipped || []).length,
+        '',
+        (job.output || '').slice(-4000),
+      ].join('\\n'), job.status !== 'succeeded' && job.status !== 'failed');
+      if (job.status === 'succeeded' || job.status === 'failed') return job;
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+    return lastJob;
+  }
+
+  async function startWorkflowImportFromCreate() {
+    const sourceEl = wf.editor && wf.editor.querySelector('[data-wf-import-source]');
+    const dryRunEl = wf.editor && wf.editor.querySelector('[data-wf-import-dry-run]');
+    const overwriteEl = wf.editor && wf.editor.querySelector('[data-wf-import-overwrite]');
+    const source = sourceEl && sourceEl.value ? sourceEl.value.trim() : '';
+    if (!source) {
+      setWorkflowImportStatus('Enter a local folder, GitHub URL, SSH URL, or owner/repo shorthand first.', false);
+      if (sourceEl) sourceEl.focus();
+      return;
+    }
+    try {
+      setWorkflowImportStatus('Starting import…', true);
+      const r = await fetch(withToken('/api/console/workflows/import'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          source,
+          dryRun: !dryRunEl || dryRunEl.checked,
+          overwrite: !!(overwriteEl && overwriteEl.checked),
+        }),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+      const job = await pollWorkflowImportJob(j.job && j.job.id);
+      await refreshWorkflowList({ skipReselect: true });
+      if (job && job.status === 'succeeded' && !job.dryRun && Array.isArray(job.installed) && job.installed.length > 0) {
+        setWorkflowImportStatus('Import complete. Installed: ' + job.installed.map((item) => item.name).join(', '), false);
+      }
+    } catch (err) {
+      setWorkflowImportStatus('Import failed: ' + (err.message || err), false);
+    }
+  }
+
+  function resetWorkflowArchitectIntro() {
+    if (!wf.chatLog) return;
+    wf.chatLog.innerHTML = [
+      '<div class="wf-chat-intro">',
+      '<strong>Describe what you want and the Architect builds it.</strong><br>',
+      'The Architect drafts, refines, or critiques the workflow on the left. Click a starter below or type your own.',
+      '</div>',
+    ].join('');
+  }
+
+  function showWorkflowHome(opts) {
+    wfMode = 'home';
+    wfDraft = null;
+    wfSelectedName = null;
+    wfIsNew = false;
+    wfChatHistory = [];
+    wfEditingStepIndices.clear();
+    stopActiveRunPolling();
+    if (wf.list) Array.from(wf.list.querySelectorAll('li.wf')).forEach((el) => el.classList.remove('selected'));
+    resetWorkflowArchitectIntro();
+    syncArchitectChatChips();
+    if (opts && opts.refresh !== false) {
+      loadWorkflowHome();
+    } else if (wfHomeData) {
+      renderWorkflowHome(wfHomeData);
+    } else {
+      loadWorkflowHome();
+    }
+  }
+
+  function expandWorkflowArchitect() {
+    if (!wf.layout || !wf.chatToggle) return;
+    wf.layout.classList.remove('architect-collapsed');
+    wf.chatToggle.textContent = '⇥';
+    wf.chatToggle.title = 'Collapse architect';
+    try { localStorage.setItem('clementine.workflow.architectCollapsed', '0'); } catch (_) { /* private mode */ }
+  }
+
+  function primeArchitectForWorkflow(name) {
+    expandWorkflowArchitect();
+    wfChatHistory = [];
+    if (wf.chatLog) wf.chatLog.innerHTML = '';
+    appendChatMessage(
+      'assistant',
+      'I loaded "' + name + '". I can edit the schedule, steps, tools, inputs, skill bindings, or synthesis. What would you like me to change?',
+    );
+    if (wf.chatInput) wf.chatInput.focus();
+    syncArchitectChatChips();
+  }
+
+  async function queueWorkflowFromHome(name) {
+    const item = cachedWorkflowData(name);
+    if (item && item.inputs && Object.keys(item.inputs).length > 0) {
+      selectWorkflowByName(name);
+      appendChatMessage('assistant', 'I opened "' + name + '" so you can provide runtime inputs before running it.');
+      return;
+    }
+    try {
+      const r = await fetch(withToken('/api/console/workflows/' + encodeURIComponent(name) + '/run'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dryRun: false, inputs: {} }),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+      await loadWorkflowHome();
+      appendChatMessage('assistant', 'Queued "' + name + '" as workflow run ' + (j.id || '') + '.');
+    } catch (err) {
+      appendChatMessage('error', 'Could not queue "' + name + '": ' + (err.message || err));
+    }
+  }
+
+  async function toggleWorkflowFromHome(name) {
+    const item = cachedWorkflowData(name);
+    if (!item) return;
+    const next = !item.enabled;
+    try {
+      const r = await fetch(withToken('/api/console/workflows/' + encodeURIComponent(name) + '/set-enabled'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: next }),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+      await refreshWorkflowList({ skipReselect: true });
+      await loadWorkflowHome();
+    } catch (err) {
+      appendChatMessage('error', 'Could not update "' + name + '": ' + (err.message || err));
+    }
+  }
+
+  function handleWorkflowHomeAction(action, name) {
+    if (!name) return;
+    if (action === 'edit') {
+      selectWorkflowByName(name, { primeArchitect: true });
+      return;
+    }
+    if (action === 'run') {
+      queueWorkflowFromHome(name);
+      return;
+    }
+    if (action === 'toggle') {
+      toggleWorkflowFromHome(name);
+      return;
+    }
+    if (action === 'runs') {
+      selectWorkflowByName(name);
+    }
+  }
+
+  function selectWorkflowByName(name, opts) {
     if (!name || !wf.list) return;
+    wfMode = 'editor';
+    stopWorkflowHomePolling();
     wfSelectedName = name;
     wfIsNew = false;
+    cronSelectedName = null;
     const rows = Array.from(wf.list.querySelectorAll('li.wf'));
     rows.forEach((el) => el.classList.toggle('selected', el.getAttribute('data-wf-name') === name));
     if (wf.editor) {
@@ -12126,10 +14582,10 @@ const CONSOLE_JS = `
     }
     const cached = cachedWorkflowData(name);
     if (cached && Array.isArray(cached.steps)) {
-      setWorkflowDraftFromData(cached);
+      setWorkflowDraftFromData(cached, opts);
       return;
     }
-    loadWorkflow(name);
+    loadWorkflow(name, opts);
   }
 
   window.__clementineSelectWorkflow = selectWorkflowByName;
@@ -12161,11 +14617,14 @@ const CONSOLE_JS = `
       wfItems = items;
       if (items.length === 0) {
         wf.list.innerHTML = '<li class="empty">— no workflows — ＋ NEW to start —</li>';
+        if (!skipReselect && wfMode !== 'create') {
+          showWorkflowHome({ refresh: true });
+        }
         return;
       }
       wf.list.innerHTML = items.map((w) => {
         const cls = (wfSelectedName === w.name) ? 'wf selected' : 'wf';
-        const enabledPill = w.enabled ? '<span class="pill on">● APPROVED</span>' : '<span class="pill off">○ DISABLED</span>';
+        const enabledPill = w.enabled ? '<span class="pill on">● ENABLED</span>' : '<span class="pill off">○ DISABLED</span>';
         // v0.5.11 UX: humanize cron expressions for the workflow list.
         // The raw cron (e.g. 0 8,13 * * 1-5) stays in the title tooltip
         // so power-users can read it without clicking. Non-power users
@@ -12184,27 +14643,32 @@ const CONSOLE_JS = `
           '</li>',
         ].join('');
       }).join('');
-      if (skipReselect) return;
+      if (skipReselect) {
+        if (wfMode === 'home') loadWorkflowHome({ silent: true, preserveScroll: true }).catch((err) => console.error('workflow home refresh failed:', err));
+        return;
+      }
       const hashName = workflowNameFromHash();
       const nextSelection =
         hashName && items.some((item) => item.name === hashName) ? hashName
         : wfSelectedName && items.some((item) => item.name === wfSelectedName) ? wfSelectedName
-        : items[0]?.name;
+        : null;
       if (nextSelection) {
         selectWorkflowByName(nextSelection);
+      } else if (!wfDraft && wfMode !== 'create') {
+        showWorkflowHome({ refresh: true });
       }
     } catch (err) {
       wf.list.innerHTML = '<li class="empty">— failed: ' + escMem(err.message || err) + ' —</li>';
     }
   }
 
-  async function loadWorkflow(name) {
+  async function loadWorkflow(name, opts) {
     try {
       const cached = cachedWorkflowData(name);
       const data = cached && Array.isArray(cached.steps)
         ? cached
         : await fetchJSON('/api/console/workflows/' + encodeURIComponent(name));
-      setWorkflowDraftFromData(data);
+      setWorkflowDraftFromData(data, opts);
     } catch (err) {
       wf.editor.innerHTML = '<div class="wf-empty"><div class="wf-empty-mark">!</div><div class="wf-empty-text">' + escMem(err.message || err) + '</div></div>';
     }
@@ -12214,7 +14678,7 @@ const CONSOLE_JS = `
     return wfItems.find((item) => item && item.name === name);
   }
 
-  function setWorkflowDraftFromData(data) {
+  function setWorkflowDraftFromData(data, opts) {
     wfDraft = {
       name: data.name,
       description: data.description || '',
@@ -12241,9 +14705,18 @@ const CONSOLE_JS = `
     wfEditingStepIndices.clear();
     stopActiveRunPolling();
     renderEditor();
+    if (opts && opts.primeArchitect) {
+      primeArchitectForWorkflow(data.name || wfDraft.name);
+    }
   }
 
   function startNewWorkflow() {
+    showWorkflowCreate();
+  }
+
+  function startStarterWorkflow() {
+    wfMode = 'editor';
+    stopWorkflowHomePolling();
     wfSelectedName = null;
     wfIsNew = true;
     // Friendly starter template: a 3-step research-draft-synthesize
@@ -12287,10 +14760,18 @@ const CONSOLE_JS = `
         '    <button class="wf-empty-btn primary" data-wf-new onclick="window.__clementineStartNewWorkflow && window.__clementineStartNewWorkflow();">＋ NEW WORKFLOW</button>',
         '    <button class="wf-empty-btn" data-wf-empty-architect>ASK ARCHITECT TO DRAFT ONE →</button>',
         '  </div>',
+        '  <div class="wf-framework-guide">',
+        '    <div class="wf-framework-guide-head">BUILD OUTSIDE CLEMENTINE</div>',
+        '    <p>Create a repo or folder with a workflow <code>SKILL.md</code>. Clementine can import a single root workflow, <code>workflows/*/SKILL.md</code>, or <code>.clementine/workflows/*/SKILL.md</code>.</p>',
+        '    <pre>proposal-audit/\\n  SKILL.md\\n  references/\\n  scripts/</pre>',
+        '    <pre>---\\nname: proposal-audit\\ndescription: Build a branded SEO proposal audit.\\nenabled: true\\ntrigger: { manual: true }\\nallowed_tools:\\n  - read_file\\n  - write_file\\nsteps:\\n  - id: research\\n    allowedTools: [read_file]\\n  - id: build\\n    dependsOn: [research]\\n    uses_skill: proposal-builder\\nsynthesis:\\n  prompt: Return the finished file path and the client-ready summary.\\n---\\nMarkdown body here.\\n\\n## step: research\\nRead the inputs and gather the facts.\\n\\n## step: build\\nCreate the proposal artifact.</pre>',
+        '  </div>',
         '</div>',
       ].join('');
       return;
     }
+    wfMode = 'editor';
+    stopWorkflowHomePolling();
     const d = wfDraft;
     const stepIds = d.steps.map((s) => s.id);
     const head = [
@@ -12314,6 +14795,7 @@ const CONSOLE_JS = `
       wfIsNew ? '' : '  </div>',
       '</div>',
     ].join('');
+    const runSummary = wfIsNew ? '' : renderWorkflowRunSummary([]);
 
     const body = [
       '<div class="wf-edit-body">',
@@ -12360,10 +14842,106 @@ const CONSOLE_JS = `
       '</div>',
     ].join('');
 
-    wf.editor.innerHTML = head + controls + body;
+    wf.editor.innerHTML = head + controls + runSummary + body;
     bindEditorEvents();
     bindSchedulePicker(wf.editor);
     refreshWorkflowRuns();
+  }
+
+  function workflowRunInputsLabel(run) {
+    return run && run.inputs && Object.keys(run.inputs).length > 0
+      ? Object.entries(run.inputs).map(([k, v]) => k + '=' + String(v).slice(0, 30)).join(' · ')
+      : '';
+  }
+
+  function workflowRunTimeLabel(run) {
+    const created = (run && run.createdAt) || '';
+    const day = created.slice(0, 10);
+    const when = created.slice(11, 19);
+    return (day || when) ? (day + ' ' + when).trim() : 'not started yet';
+  }
+
+  function renderWorkflowRunSummary(runs, errorMessage) {
+    if (errorMessage) {
+      return [
+        '<div class="wf-run-strip" data-wf-run-summary>',
+        '  <div class="wf-run-strip-main">',
+        '    <span class="wf-run-strip-status status-error">ERROR</span>',
+        '    <strong>Run history unavailable</strong>',
+        '    <span>' + escMem(errorMessage) + '</span>',
+        '  </div>',
+        '  <div class="wf-run-strip-meta">',
+        '    <button type="button" class="wf-run-runtime-jump" data-tools-jump="settings" data-settings-tab-open="runtime">RUNTIME SETTINGS</button>',
+        '  </div>',
+        '</div>',
+      ].join('');
+    }
+    const latest = Array.isArray(runs) && runs.length > 0 ? runs[0] : null;
+    if (!latest) {
+      return [
+        '<div class="wf-run-strip" data-wf-run-summary>',
+        '  <div class="wf-run-strip-main">',
+        '    <span class="wf-run-strip-status">READY</span>',
+        '    <strong>No runs yet</strong>',
+        '    <span>Dry-run first, then run when the steps look right.</span>',
+        '  </div>',
+        '  <div class="wf-run-strip-meta">',
+        '    <span>uses global runtime budget</span>',
+        '    <button type="button" class="wf-run-runtime-jump" data-tools-jump="settings" data-settings-tab-open="runtime">RUNTIME SETTINGS</button>',
+        '  </div>',
+        '</div>',
+      ].join('');
+    }
+    const status = (latest.status || 'unknown').toString();
+    const canCancel = status === 'queued' || status === 'running';
+    const inputs = workflowRunInputsLabel(latest);
+    return [
+      '<div class="wf-run-strip" data-wf-run-summary>',
+      '  <div class="wf-run-strip-main">',
+      '    <span class="wf-run-strip-status status-' + escMem(status) + '">' + escMem(status.toUpperCase()) + '</span>',
+      '    <strong>Latest run</strong>',
+      '    <span>' + escMem(workflowRunTimeLabel(latest)) + '</span>',
+      inputs ? '    <span>' + escMem(inputs) + '</span>' : '',
+      '  </div>',
+      '  <div class="wf-run-strip-meta">',
+      '    <span>' + escMem(latest.id || '') + '</span>',
+      '    <button type="button" class="wf-run-runtime-jump" data-tools-jump="settings" data-settings-tab-open="runtime">RUNTIME SETTINGS</button>',
+      canCancel ? '    <button type="button" class="wf-run-action" data-wf-run-cancel="' + escMem(latest.id) + '">CANCEL</button>' : '',
+      '  </div>',
+      '</div>',
+    ].join('');
+  }
+
+  function bindWorkflowRunCancelButtons(root) {
+    Array.from((root || document).querySelectorAll('[data-wf-run-cancel]')).forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        if (!wfSelectedName) return;
+        const runId = btn.getAttribute('data-wf-run-cancel');
+        if (!runId) return;
+        btn.disabled = true;
+        const original = btn.textContent;
+        btn.textContent = 'CANCELLING';
+        try {
+          const endpoint = '/api/console/workflows/' + encodeURIComponent(wfSelectedName)
+            + '/runs/' + encodeURIComponent(runId) + '/cancel';
+          const r = await fetch(withToken(endpoint), {
+            method: 'POST',
+            headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+            body: JSON.stringify({ reason: 'Cancelled from Workflow Studio.' }),
+          });
+          if (!r.ok) {
+            const j = await r.json().catch(() => ({}));
+            throw new Error(j.error || ('HTTP ' + r.status));
+          }
+          await refreshWorkflowRuns();
+          await refreshHomeCommandCenter();
+        } catch (err) {
+          btn.disabled = false;
+          btn.textContent = original || 'CANCEL';
+          alert('Could not cancel run: ' + ((err && err.message) || err));
+        }
+      });
+    });
   }
 
   const SCHED_DAY_LABELS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
@@ -13119,6 +15697,7 @@ const CONSOLE_JS = `
   /** Recent runs for the currently-selected workflow. */
   async function refreshWorkflowRuns() {
     const slot = document.querySelector('[data-wf-runs]');
+    const summarySlot = document.querySelector('[data-wf-run-summary]');
     if (!slot || !wfSelectedName || wfIsNew) {
       if (slot) slot.innerHTML = '';
       return;
@@ -13126,8 +15705,10 @@ const CONSOLE_JS = `
     try {
       const data = await fetchJSON('/api/console/workflows/' + encodeURIComponent(wfSelectedName) + '/runs?limit=5');
       const runs = data.runs || [];
+      if (summarySlot) summarySlot.outerHTML = renderWorkflowRunSummary(runs);
       if (runs.length === 0) {
         slot.innerHTML = '<div class="wf-runs-empty">— no runs yet. Click RUN ▶ to kick one off. —</div>';
+        bindWorkflowRunCancelButtons(wf.editor);
         return;
       }
       slot.innerHTML = [
@@ -13135,17 +15716,13 @@ const CONSOLE_JS = `
         '<ol class="wf-runs-list">',
            runs.map((r) => {
              const status = (r.status || 'unknown').toString();
-             const when = (r.createdAt || '').slice(11, 19);
-             const day = (r.createdAt || '').slice(0, 10);
              const canCancel = status === 'queued' || status === 'running';
-             const inputs = r.inputs && Object.keys(r.inputs).length > 0
-               ? Object.entries(r.inputs).map(([k, v]) => k + '=' + String(v).slice(0, 30)).join(' · ')
-               : '';
+             const inputs = workflowRunInputsLabel(r);
              return [
                '<li class="wf-run">',
                '  <span class="wf-run-status status-' + escMem(status) + '">' + escMem(status.toUpperCase()) + '</span>',
                '  <span class="wf-run-id">' + escMem(r.id) + '</span>',
-               '  <span class="wf-run-time">' + escMem(day + ' ' + when) + '</span>',
+               '  <span class="wf-run-time">' + escMem(workflowRunTimeLabel(r)) + '</span>',
                inputs ? '  <span class="wf-run-inputs">' + escMem(inputs) + '</span>' : '',
                canCancel ? '  <button type="button" class="wf-run-action" data-wf-run-cancel="' + escMem(r.id) + '">CANCEL</button>' : '',
                '</li>',
@@ -13153,36 +15730,9 @@ const CONSOLE_JS = `
            }).join(''),
         '</ol>',
       ].join('');
-      Array.from(slot.querySelectorAll('[data-wf-run-cancel]')).forEach((btn) => {
-        btn.addEventListener('click', async () => {
-          if (!wfSelectedName) return;
-          const runId = btn.getAttribute('data-wf-run-cancel');
-          if (!runId) return;
-          btn.disabled = true;
-          const original = btn.textContent;
-          btn.textContent = 'CANCELLING';
-          try {
-            const endpoint = '/api/console/workflows/' + encodeURIComponent(wfSelectedName)
-              + '/runs/' + encodeURIComponent(runId) + '/cancel';
-            const r = await fetch(withToken(endpoint), {
-              method: 'POST',
-              headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
-              body: JSON.stringify({ reason: 'Cancelled from Workflow Studio.' }),
-            });
-            if (!r.ok) {
-              const j = await r.json().catch(() => ({}));
-              throw new Error(j.error || ('HTTP ' + r.status));
-            }
-            await refreshWorkflowRuns();
-            await refreshHomeCommandCenter();
-          } catch (err) {
-            btn.disabled = false;
-            btn.textContent = original || 'CANCEL';
-            alert('Could not cancel run: ' + ((err && err.message) || err));
-          }
-        });
-      });
+      bindWorkflowRunCancelButtons(wf.editor);
     } catch (err) {
+      if (summarySlot) summarySlot.outerHTML = renderWorkflowRunSummary([], err.message || String(err));
       slot.innerHTML = '<div class="wf-runs-empty">runs unavailable: ' + escMem(err.message || err) + '</div>';
     }
   }
@@ -13217,8 +15767,8 @@ const CONSOLE_JS = `
       if (!r.ok) return;
       wfDraft = null;
       wfSelectedName = null;
-      renderEditor();
-      refreshWorkflowList();
+      showWorkflowHome({ refresh: true });
+      refreshWorkflowList({ skipReselect: true });
     } catch (_) {}
   }
 
@@ -14485,6 +17035,9 @@ const CONSOLE_JS = `
         if (visible) el.removeAttribute('hidden');
         else el.setAttribute('hidden', '');
       });
+      if (typeof window.__clementineRefreshSettingsTabColumns === 'function') {
+        window.__clementineRefreshSettingsTabColumns();
+      }
     };
     toggle.checked = showAdvanced;
     apply(showAdvanced);
@@ -14493,6 +17046,44 @@ const CONSOLE_JS = `
       try { localStorage.setItem(STORAGE_KEY, next ? '1' : '0'); } catch (_) { /* private mode */ }
       apply(next);
     });
+  })();
+
+  (function setupSettingsTabs() {
+    const buttons = Array.from(document.querySelectorAll('[data-settings-tab-target]'));
+    const blocks = Array.from(document.querySelectorAll('[data-settings-tab-panel]'));
+    const columns = Array.from(document.querySelectorAll('[data-settings-col]'));
+    if (buttons.length === 0 || blocks.length === 0) return;
+    const STORAGE_KEY = 'clementine.settings.activeTab';
+    const refreshColumns = () => {
+      columns.forEach((col) => {
+        const visible = Array.from(col.querySelectorAll('[data-settings-tab-panel]')).some((block) => (
+          block.getAttribute('data-tab-hidden') !== 'true' && !block.hasAttribute('hidden')
+        ));
+        if (visible) col.removeAttribute('hidden');
+        else col.setAttribute('hidden', '');
+      });
+    };
+    const apply = (tab) => {
+      const valid = buttons.some((button) => button.getAttribute('data-settings-tab-target') === tab);
+      const next = valid ? tab : 'profile';
+      buttons.forEach((button) => {
+        button.classList.toggle('active', button.getAttribute('data-settings-tab-target') === next);
+      });
+      blocks.forEach((block) => {
+        if (block.getAttribute('data-settings-tab-panel') === next) block.removeAttribute('data-tab-hidden');
+        else block.setAttribute('data-tab-hidden', 'true');
+      });
+      try { localStorage.setItem(STORAGE_KEY, next); } catch (_) { /* private mode */ }
+      refreshColumns();
+    };
+    window.__clementineRefreshSettingsTabColumns = refreshColumns;
+    window.__clementineSetSettingsTab = apply;
+    buttons.forEach((button) => {
+      button.addEventListener('click', () => apply(button.getAttribute('data-settings-tab-target') || 'profile'));
+    });
+    let initial = 'profile';
+    try { initial = localStorage.getItem(STORAGE_KEY) || initial; } catch (_) { /* private mode */ }
+    apply(initial);
   })();
 
   function setFormValue(form, name, value) {
@@ -14536,6 +17127,7 @@ const CONSOLE_JS = `
   async function bootHomePanel() {
     const form = document.querySelector('[data-home-chat-form]');
     const input = document.querySelector('[data-home-chat-input]');
+    restoreHomeHarnessSessionId();
     if (form && input) {
       form.addEventListener('submit', async (event) => {
         event.preventDefault();
@@ -14636,8 +17228,37 @@ const CONSOLE_JS = `
 
   // 0.3 harness session — kept across turns within the same chat
   // dock so follow-up messages continue the same conversation.
-  // Reset whenever the toggle flips.
+  // Persisted so an app reload can still pick up the last watched chat.
+  const HOME_HARNESS_SESSION_KEY = 'clementine.homeHarnessSessionId';
   let __harnessSessionId = null;
+
+  function updateHomeChatMeta(text) {
+    const meta = document.querySelector('[data-home-chat-meta]');
+    if (meta) meta.textContent = text || 'local session';
+  }
+
+  function setHomeHarnessSessionId(sessionId, label) {
+    const next = typeof sessionId === 'string' && sessionId.trim() ? sessionId.trim() : null;
+    __harnessSessionId = next;
+    try {
+      if (next) localStorage.setItem(HOME_HARNESS_SESSION_KEY, next);
+      else localStorage.removeItem(HOME_HARNESS_SESSION_KEY);
+    } catch (_) {}
+    if (next) {
+      const shortId = next.length > 18 ? next.slice(0, 18) + '…' : next;
+      updateHomeChatMeta((label || 'session') + ' · ' + shortId);
+    } else {
+      updateHomeChatMeta('local session');
+    }
+  }
+
+  function restoreHomeHarnessSessionId() {
+    if (__harnessSessionId) return;
+    try {
+      const stored = localStorage.getItem(HOME_HARNESS_SESSION_KEY);
+      if (stored) setHomeHarnessSessionId(stored, 'resume');
+    } catch (_) {}
+  }
 
   function harnessModeOn() {
     // Harness is the default chat runtime as of 0.3. The localStorage
@@ -14705,21 +17326,32 @@ const CONSOLE_JS = `
     const thinkTimer = startThinkingButton(send);
 
     try {
+      const activeSessionId = options.sessionId || __harnessSessionId || null;
       const r = await fetchWithToken('/api/harness/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ input: text, sessionId: __harnessSessionId }),
+        body: JSON.stringify({ input: text, sessionId: activeSessionId }),
       });
       if (!r.ok) {
         const j = await r.json().catch(() => ({}));
+        if (r.status === 404 && activeSessionId) {
+          setHomeHarnessSessionId(null);
+        }
         const msg = j.error || ('HTTP ' + r.status);
         setChatTurnText(assistantTurn, 'Error: ' + msg);
         setChatTurnStatus(assistantTurn, 'failed');
         return { ok: false, text: msg };
       }
       const body = await r.json();
-      __harnessSessionId = body.sessionId;
+      if (body.status === 'new-pending' || body.status === 'cancelled') {
+        setHomeHarnessSessionId(body.sessionId, 'closing');
+      } else {
+        setHomeHarnessSessionId(body.sessionId, body.status === 'resuming' ? 'resuming' : 'chat');
+      }
       await streamHarnessSession(body.sessionId, assistantTurn, { ...options, sinceSeq: body.sinceSeq || 0 });
+      if (body.status === 'new-pending' || body.status === 'cancelled') {
+        setHomeHarnessSessionId(null);
+      }
       homeChatHistory.push({ role: 'assistant', text: assistantTurn.querySelector('[data-home-chat-turn-text]')?.textContent || '' });
       return { ok: true };
     } catch (err) {
@@ -14772,22 +17404,29 @@ const CONSOLE_JS = `
       let attempts = 0;
       let es = null;
       let closed = false;
+      let sawEvent = false;
+      let fallbackTimer = null;
 
       const finish = () => {
         if (closed) return;
         closed = true;
         try { if (es) es.close(); } catch (_) {}
+        if (fallbackTimer) { try { clearInterval(fallbackTimer); } catch (_) {} fallbackTimer = null; }
         resolve();
       };
 
       const handleEvent = (ev) => {
+        sawEvent = true;
         if (ev && typeof ev.seq === 'number' && ev.seq > lastSeq) lastSeq = ev.seq;
         renderHarnessEvent(ev, turn, options);
         if (ev.type === 'conversation_completed') {
           const summary = humanHarnessText(ev.data && (ev.data.reply || ev.data.summary), '');
           const reason = ev.data && ev.data.reason;
+          const planProposalId = ev.data && typeof ev.data.planProposalId === 'string' ? ev.data.planProposalId : '';
           const existing = turn?.querySelector?.('[data-home-chat-turn-text]')?.textContent || '';
-          if (summary) {
+          if (reason === 'plan_first' && planProposalId) {
+            setChatTurnPlanApproval(turn, summary, planProposalId);
+          } else if (summary) {
             setChatTurnText(turn, summary);
           } else if (!existing) {
             // No final summary and no intermediate text — fall back to a
@@ -14796,7 +17435,9 @@ const CONSOLE_JS = `
               ? '(Finished without a written reply.)'
               : '(Done.)');
           }
-          setChatTurnStatus(turn, reason === 'abandoned_by_orchestrator' ? 'abandoned' : 'complete');
+          setChatTurnStatus(turn, reason === 'plan_first'
+            ? 'awaiting plan approval'
+            : reason === 'abandoned_by_orchestrator' ? 'abandoned' : 'complete');
           finish();
         } else if (ev.type === 'run_failed') {
           const msg = (ev.data && ev.data.error) || 'failed';
@@ -14823,6 +17464,22 @@ const CONSOLE_JS = `
           setChatTurnApproval(turn, { subject: subj, reason, approvalId: apr }, sessionId, options);
           setChatTurnStatus(turn, 'awaiting approval');
           finish();
+        }
+      };
+
+      const pollReplayFallback = async () => {
+        if (closed) return;
+        try {
+          const base = '/api/sessions/' + encodeURIComponent(sessionId) + '/events/recent';
+          const sep = base.includes('?') ? '&' : '?';
+          const data = await fetchJSON(base + sep + 'sinceSeq=' + encodeURIComponent(String(lastSeq)) + '&limit=500');
+          const events = Array.isArray(data.events) ? data.events : [];
+          for (const ev of events) {
+            handleEvent(ev);
+            if (closed) break;
+          }
+        } catch (_) {
+          // Best-effort only. EventSource is still the primary stream.
         }
       };
 
@@ -14862,14 +17519,21 @@ const CONSOLE_JS = `
           if (closed) return;
           if (es && es.readyState === EventSource.CLOSED) {
             // Server-side close (terminal session, auth failure, etc).
-            // Don't reconnect — the user-visible state is already final.
-            finish();
+            // EventSource hides the HTTP status, so before giving up
+            // use the JSON replay fallback; a finished backend run
+            // should still become visible in the chat card.
+            pollReplayFallback().finally(() => {
+              if (!closed && sawEvent) return;
+              finish();
+            });
             return;
           }
           attempts += 1;
           if (attempts > MAX_RECONNECTS) {
-            setChatTurnStatus(turn, 'lost connection');
-            finish();
+            pollReplayFallback().finally(() => {
+              if (!closed && !sawEvent) setChatTurnStatus(turn, 'lost connection');
+              if (!closed) finish();
+            });
             return;
           }
           try { if (es) es.close(); } catch (_) {}
@@ -14878,6 +17542,11 @@ const CONSOLE_JS = `
         };
       };
 
+      // Poll as a safety net. This is intentionally light: it only
+      // fetches events after lastSeq and stops as soon as the turn hits
+      // a terminal state. It covers renderer/EventSource drops without
+      // changing the backend run path.
+      fallbackTimer = setInterval(pollReplayFallback, 2500);
       connect();
     });
   }
@@ -15067,6 +17736,83 @@ const CONSOLE_JS = `
     body.appendChild(actions);
   }
 
+  function setChatTurnPlanApproval(turn, text, planProposalId) {
+    const body = turn?.querySelector?.('[data-home-chat-turn-text]');
+    if (!body) return;
+    body.innerHTML = renderTextWithLinks(text || '');
+
+    if (!planProposalId) return;
+    const actions = document.createElement('div');
+    actions.className = 'home-chat-turn-actions';
+
+    const approve = document.createElement('button');
+    approve.type = 'button';
+    approve.textContent = 'Approve & proceed';
+    approve.addEventListener('click', () => {
+      resolvePlanProposalFromChat(approve, 'approve', planProposalId, turn);
+    });
+
+    const reject = document.createElement('button');
+    reject.type = 'button';
+    reject.textContent = 'Reject';
+    reject.addEventListener('click', () => {
+      resolvePlanProposalFromChat(reject, 'reject', planProposalId, turn);
+    });
+
+    actions.appendChild(approve);
+    actions.appendChild(reject);
+    body.appendChild(actions);
+  }
+
+  async function resolvePlanProposalFromChat(button, decision, planProposalId, turn) {
+    const actions = button.closest('.home-chat-turn-actions');
+    const buttons = actions ? Array.from(actions.querySelectorAll('button')) : [button];
+    buttons.forEach((btn) => { btn.disabled = true; });
+    const original = button.textContent;
+    button.textContent = decision === 'approve' ? 'Approving...' : 'Rejecting...';
+    try {
+      const endpoint = '/api/console/plan-proposals/' + encodeURIComponent(planProposalId) + '/' + decision;
+      const payload = decision === 'reject' ? { reason: 'Rejected from chat dock.' } : {};
+      const r = await fetchWithToken(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+
+      if (decision === 'approve') {
+        const taskId = j.queuedTask && j.queuedTask.id ? String(j.queuedTask.id) : '';
+        const noteText = taskId
+          ? 'Plan approved. I queued it as background task ' + taskId + '.'
+          : 'Plan approved. I queued the work.';
+        button.textContent = 'Approved';
+        setChatTurnStatus(turn, 'plan approved');
+        if (actions) {
+          const note = document.createElement('div');
+          note.style.width = '100%';
+          note.textContent = noteText;
+          actions.appendChild(note);
+        }
+      } else {
+        button.textContent = 'Rejected';
+        setChatTurnStatus(turn, 'plan rejected');
+      }
+
+      if (typeof refreshPlanProposals === 'function') {
+        try { await refreshPlanProposals(); } catch (_) {}
+      }
+      if (typeof refreshHomeCommandCenter === 'function') {
+        try { await refreshHomeCommandCenter(); } catch (_) {}
+      }
+    } catch (err) {
+      buttons.forEach((btn) => { btn.disabled = false; });
+      button.textContent = original || (decision === 'approve' ? 'Approve & proceed' : 'Reject');
+      setChatTurnStatus(turn, decision === 'approve' ? 'approval failed' : 'reject failed');
+      alert('Could not ' + decision + ' plan: ' + ((err && err.message) || err));
+    }
+  }
+
   async function resumeHarnessApprovalFromButton(button, decision, approvalId, sessionId, turn, options) {
     const actions = button.closest('.home-chat-turn-actions');
     const buttons = actions ? Array.from(actions.querySelectorAll('button')) : [button];
@@ -15088,7 +17834,7 @@ const CONSOLE_JS = `
         throw new Error(j.error || ('HTTP ' + r.status));
       }
       const body = await r.json();
-      __harnessSessionId = body.sessionId || sessionId;
+      setHomeHarnessSessionId(body.sessionId || sessionId, 'resuming');
       await streamHarnessSession(__harnessSessionId, turn, { ...(options || {}), sinceSeq: body.sinceSeq || 0 });
       homeChatHistory.push({ role: 'assistant', text: turn?.querySelector?.('[data-home-chat-turn-text]')?.textContent || '' });
     } catch (err) {
@@ -15549,6 +18295,7 @@ const CONSOLE_JS = `
     const toggle = document.querySelector('[data-home-voice-toggle]');
     const handoff = document.querySelector('[data-home-voice-handoff]');
     const liveCard = document.querySelector('[data-home-live-card]');
+    const liveOpenButtons = Array.from(document.querySelectorAll('[data-home-live-open]'));
     const closeBtn = document.querySelector('[data-home-live-close]');
     const layout = document.querySelector('[data-home-layout]');
     const takeoverChrome = document.querySelector('[data-home-live-takeover]');
@@ -15608,6 +18355,15 @@ const CONSOLE_JS = `
         }
       });
     }
+    liveOpenButtons.forEach((button) => {
+      if (button.dataset.bound) return;
+      button.dataset.bound = 'true';
+      button.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        setHomeTakeover(true);
+      });
+    });
     if (closeBtn && !closeBtn.dataset.bound) {
       closeBtn.dataset.bound = 'true';
       closeBtn.addEventListener('click', (event) => {
@@ -16151,7 +18907,7 @@ const CONSOLE_JS = `
         controlsEl.innerHTML = [
           '<input type="text" class="secret-input" placeholder="Composio API key (sk_…)" data-hub-composio-key autocomplete="off" data-1p-ignore="true" data-lpignore="true" spellcheck="false" name="api-key-composio-no-autofill" />',
           '<button data-hub-composio-save>SAVE API KEY</button>',
-          '<a href="https://platform.composio.dev" target="_blank" rel="noopener" style="font-size:10px;letter-spacing:0.14em;color:var(--fg-3);">get a key →</a>',
+          '<a href="https://dashboard.composio.dev/~/project/settings" target="_blank" rel="noopener" style="font-size:10px;letter-spacing:0.14em;color:var(--fg-3);">get a key →</a>',
           renderComposioCliChip(status),
           renderComposioCliActions(status),
         ].join('');
@@ -16343,7 +19099,7 @@ const CONSOLE_JS = `
               // Fetch the toolkit's auth scheme so we route to the right
               // setup flow (API_KEY → in-app modal; OAUTH2 → auto-create
               // composio-managed config + OAuth window; other → fall
-              // back to platform.composio.dev). Without this, Gmail and
+              // back to Composio's auth-configs page). Without this, Gmail and
               // other OAuth toolkits hit my api-key modal which makes
               // no sense (no API key exists for OAuth).
               let metaForRouting = null;
@@ -16362,7 +19118,7 @@ const CONSOLE_JS = `
                   const setupRes = await fetch(withToken('/api/composio/toolkits/' + encodeURIComponent(slug) + '/setup-oauth'), { method: 'POST' });
                   if (!setupRes.ok) {
                     const j = await setupRes.json().catch(() => ({}));
-                    alert('OAuth setup failed: ' + (j.error || setupRes.status) + '\\n\\nIf this toolkit uses bring-your-own credentials, set them up at platform.composio.dev/auth-configs.');
+                    alert('OAuth setup failed: ' + (j.error || setupRes.status) + '\\n\\nIf this toolkit uses bring-your-own credentials, set them up at dashboard.composio.dev/~/project/auth-configs.');
                     btn.textContent = 'SET UP AUTH';
                     return;
                   }
@@ -16393,7 +19149,7 @@ const CONSOLE_JS = `
                 // the user configures it there. We can't easily support
                 // every scheme inline.
                 if (confirm(name + ' uses ' + scheme + ' authentication which isn\\'t supported inline yet. Open the Composio auth-configs page to set it up there?')) {
-                  window.open('https://platform.composio.dev/auth-configs', '_blank');
+                  window.open('https://dashboard.composio.dev/~/project/auth-configs', '_blank');
                 }
                 return;
               }
@@ -17510,6 +20266,30 @@ const CONSOLE_JS = `
     return '';
   }
 
+  function renderApprovalPreview(preview) {
+    if (!preview || typeof preview !== 'object') return '';
+    const samples = Array.isArray(preview.samples) ? preview.samples.slice(0, 5) : [];
+    const countLine = typeof preview.count === 'number'
+      ? '<div class="approval-preview-count">' + escMem(preview.count + ' item' + (preview.count === 1 ? '' : 's')) + '</div>'
+      : '';
+    const sampleLines = samples.map(function (sample) {
+      if (!sample || typeof sample !== 'object') return '';
+      const label = sample.label ? '<span>' + escMem(sample.label) + '</span>' : '';
+      const value = sample.value ? '<strong>' + escMem(sample.value) + '</strong>' : '';
+      const secondary = sample.secondary ? '<em>' + escMem(sample.secondary) + '</em>' : '';
+      return '<li>' + label + value + secondary + '</li>';
+    }).filter(Boolean).join('');
+    const inferred = preview.inferred ? '<div class="approval-preview-note">auto-inferred from recent tool output</div>' : '';
+    if (!countLine && !sampleLines && !inferred) return '';
+    return [
+      '<div class="approval-preview">',
+      countLine,
+      sampleLines ? '<ul>' + sampleLines + '</ul>' : '',
+      inferred,
+      '</div>',
+    ].join('');
+  }
+
   async function refreshApprovalsPanel() {
     const listEl = document.querySelector('[data-approvals-list]');
     if (!listEl) return;
@@ -17532,6 +20312,10 @@ const CONSOLE_JS = `
         const workflow = (a.args && typeof a.args === 'object' && typeof a.args.workflow === 'string') ? a.args.workflow : '';
         const kind = a.kind === 'runtime' ? 'runtime' : 'harness';
         const fingerprint = a.resourceFingerprint;
+        const summary = a.summary || a.subject || a.tool || '(approval required)';
+        const reason = a.reason || '';
+        const source = a.sourceTitle ? (a.sourceKind ? a.sourceKind + ': ' : '') + a.sourceTitle : '';
+        const previewHtml = renderApprovalPreview(a.preview);
         const mismatchBanner = fingerprint && fingerprint.result === 'mismatch'
           ? [
               '  <div class="approval-mismatch">',
@@ -17546,16 +20330,21 @@ const CONSOLE_JS = `
         return [
           '<div class="approval-card ' + (fingerprint && fingerprint.result === 'mismatch' ? 'has-mismatch' : '') + '" data-approval-id="' + escMem(a.approvalId || '') + '" data-approval-kind="' + kind + '">',
           '  <div class="approval-card-head">',
-          '    <div class="approval-subject">' + escMem(a.subject || a.tool || '(no subject)') + '</div>',
+          '    <div>',
+          '      <div class="approval-subject">' + escMem(summary) + '</div>',
+          source ? '      <div class="approval-source">' + escMem(source) + '</div>' : '',
+          '    </div>',
           '    <div class="approval-age ' + ageCls + '">' + escMem(ageLabel) + '</div>',
           '  </div>',
           mismatchBanner,
+          reason ? '  <div class="approval-reason"><span>WHY</span>' + escMem(reason) + '</div>' : '',
+          previewHtml,
           '  <div class="approval-meta">tool: <code>' + escMem(a.tool || 'unknown') + '</code>',
           workflow ? ' · workflow: <code>' + escMem(workflow) + '</code>' : '',
           ' · session: <code>' + escMem(sessionShort) + '</code>',
           ' · id: <code>' + escMem(a.approvalId || '') + '</code>',
           ' · <span class="approval-kind-pill ' + kind + '">' + (kind === 'runtime' ? 'runtime' : 'tool') + '</span></div>',
-          argsRendered ? '  <pre class="approval-args">' + escMem(argsRendered) + '</pre>' : '',
+          argsRendered ? '  <details class="approval-details"><summary>raw request details</summary><pre class="approval-args">' + escMem(argsRendered) + '</pre></details>' : '',
           '  <div class="approval-actions">',
           '    <button class="approve" data-approval-action="approve">APPROVE</button>',
           '    <button class="reject" data-approval-action="reject">REJECT</button>',
@@ -19160,20 +21949,21 @@ const CONSOLE_JS = `
   const resetBtn  = document.querySelector('[data-creds-reset]');
   if (repairBtn) {
     repairBtn.addEventListener('click', async () => {
-      repairBtn.textContent = 'REPAIRING…';
+      if (!confirm('Import legacy Clementine Keychain entries into the local vault?\\n\\nmacOS may show a Keychain prompt. This is only needed for old installs that stored secrets in Keychain.')) return;
+      repairBtn.textContent = 'IMPORTING…';
       try {
         const r = await fetch(withToken('/api/console/credentials/repair-keychain'), { method: 'POST' });
         const j = await r.json();
         if (!j.probed) {
           alert('Keychain not available — keytar is not installed in this build.\\nThis is expected for the daemon-only / CLI install; install the desktop app to use Keychain.');
         } else {
-          alert('Keychain repair complete. Tested ' + j.tested + ' credentials, recovered ' + (j.recovered?.length || 0) + ' to keychain status.');
+          alert('Legacy Keychain import complete.\\n\\nScanned: ' + (j.scanned || 0) + '\\nMoved to vault: ' + (j.migrated?.length || 0) + '\\nAlready in vault: ' + (j.alreadyInVault?.length || 0) + '\\nRemoved Keychain duplicates: ' + (j.deleted?.length || 0));
         }
         await refreshCredentialsHealth();
       } catch (err) {
-        alert('Repair failed: ' + (err.message || err));
+        alert('Import failed: ' + (err.message || err));
       } finally {
-        repairBtn.textContent = 'REPAIR KEYCHAIN ⟲';
+        repairBtn.textContent = 'IMPORT LEGACY KEYCHAIN ⇢';
       }
     });
   }
@@ -19593,7 +22383,10 @@ const CONSOLE_JS = `
           if (recLbl) recLbl.textContent = 'STOP RECORDING';
           recBtn.setAttribute('data-state', 'recording');
         } else {
-          if (recLbl) recLbl.textContent = 'RECORD MEETING';
+          // Label tracks what the button will actually do: record the
+          // detected meeting window, or (no meeting open) generic
+          // desktop audio.
+          if (recLbl) recLbl.textContent = recall?.hasActiveMeetingWindow ? 'RECORD MEETING' : 'RECORD AUDIO';
           recBtn.setAttribute('data-state', 'idle');
         }
       }
@@ -19629,7 +22422,7 @@ const CONSOLE_JS = `
       // The orb is a sibling button — clicking REC shouldn't bubble
       // into the dock-card-clickable jump-target logic we added today.
       event.stopPropagation();
-      if (!window.clemmy?.recallStartManual || !window.clemmy?.recallStop) {
+      if (!window.clemmy?.recallRecordActive || !window.clemmy?.recallStop) {
         showError('Recall controls require the Clementine desktop app.');
         return;
       }
@@ -19653,8 +22446,16 @@ const CONSOLE_JS = `
         return;
       }
       // Confirm only the start side — stopping mid-meeting should be
-      // one click since the user can always restart.
-      if (!confirm('Start recording this meeting?\\nMake sure participants are aware where required.')) return;
+      // one click since the user can always restart. The message
+      // reflects whether we'll record the detected meeting or fall
+      // back to generic desktop audio (no meeting window open).
+      let recallNow = null;
+      try { recallNow = await window.clemmy.recallStatus(); } catch { /* best-effort */ }
+      const hasMeeting = Boolean(recallNow && recallNow.hasActiveMeetingWindow);
+      const confirmMsg = hasMeeting
+        ? 'Start recording this meeting?\\nMake sure participants are aware where required.'
+        : 'No meeting detected — start a generic desktop-audio recording instead?\\nMake sure participants are aware where required.';
+      if (!confirm(confirmMsg)) return;
       // Optimistic UI flip — show STARTING immediately so the user
       // knows their click registered. The next refreshDockLive (which
       // we kick after the IPC resolves) replaces this with the real
@@ -19662,14 +22463,30 @@ const CONSOLE_JS = `
       recLbl.textContent = 'STARTING…';
       recBtn.setAttribute('disabled', '');
       try {
-        await window.clemmy.recallStartManual();
-        showSuccess('Recording started.');
+        await window.clemmy.recallRecordActive();
+        showSuccess(hasMeeting ? 'Recording started.' : 'Desktop-audio recording started.');
       } catch (err) {
         showError('Recording failed to start: ' + ((err && err.message) || err));
       } finally {
         recBtn.removeAttribute('disabled');
         refreshDockLive();
       }
+    });
+  })();
+
+  // Make the dock-live card a jump-to-transcript target while recording.
+  // The card isn't a generic data-dock-jump card (it hosts the voice orb
+  // + REC button), but when a meeting is recording the user's most
+  // likely intent on tapping it is "show me the live transcript." Route
+  // to Memory → Meetings, skipping clicks that landed on the orb or REC
+  // button (those have their own handlers).
+  (function bindDockLiveJumpToTranscript() {
+    const card = document.querySelector('[data-dock-live]');
+    if (!card) return;
+    card.addEventListener('click', (event) => {
+      if (!card.classList.contains('live')) return;
+      if (event.target && event.target.closest('button, [role="button"]')) return;
+      if (typeof openBrainMeetings === 'function') openBrainMeetings();
     });
   })();
 
@@ -19869,7 +22686,7 @@ const CONSOLE_JS = `
 
     function connect() {
       if (es) { try { es.close(); } catch (_) {} es = null; }
-      const url = '/api/console/actions/stream?token=' + encodeURIComponent(TOKEN);
+      const url = withToken('/api/console/actions/stream');
       try {
         es = new EventSource(url);
       } catch (err) {
@@ -20005,14 +22822,10 @@ const CONSOLE_JS = `
       // appends, status pings) do NOT re-route, so the user isn't
       // yanked back every few seconds.
       if (isNewRecording) {
-        try {
-          if (typeof switchPanel === 'function') switchPanel('memory');
-          if (typeof window.__clementineMemoryView === 'function') {
-            window.__clementineMemoryView('meetings');
-          }
-        } catch (err) {
-          console.warn('auto-open transcript panel failed:', err);
-        }
+        // Brain → Meetings. (Was switchPanel('memory') — a panel that no
+        // longer exists post brain-consolidation, which blanked the UI
+        // the moment a recording actually started.)
+        if (typeof openBrainMeetings === 'function') openBrainMeetings();
       }
       // If the Meetings panel is open, redraw it so the live card
       // appears at the top.
@@ -20042,6 +22855,10 @@ const CONSOLE_JS = `
       if (liveBody) {
         const empty = liveBody.querySelector('.mem-meeting-live-empty');
         if (empty) empty.remove();
+        // A finalized segment supersedes whatever interim text was
+        // showing — drop the rolling partial line before committing.
+        const interim = liveBody.querySelector('.meeting-segment.interim');
+        if (interim) interim.remove();
         const node = document.createElement('div');
         node.className = 'meeting-segment';
         const speaker = segment.speaker || '';
@@ -20049,6 +22866,26 @@ const CONSOLE_JS = `
         liveBody.appendChild(node);
         liveBody.scrollTop = liveBody.scrollHeight;
       }
+    }
+
+    // Interim (partial) transcript — a single rolling line that updates
+    // in place as the speaker talks, then gets replaced by the final
+    // segment via appendSegment. Not persisted; purely the live feel.
+    function showInterimSegment(segment) {
+      if (!segment || !segment.text) return;
+      const liveBody = document.querySelector('[data-mem-meeting-live-body]');
+      if (!liveBody) return;
+      const empty = liveBody.querySelector('.mem-meeting-live-empty');
+      if (empty) empty.remove();
+      let node = liveBody.querySelector('.meeting-segment.interim');
+      if (!node) {
+        node = document.createElement('div');
+        node.className = 'meeting-segment interim';
+        liveBody.appendChild(node);
+      }
+      const speaker = segment.speaker || '';
+      node.innerHTML = (speaker ? '<span class="meeting-segment-speaker">' + escMem(speaker) + '</span>' : '') + escMem(segment.text);
+      liveBody.scrollTop = liveBody.scrollHeight;
     }
 
     function showToast(meetingInfo) {
@@ -20170,6 +23007,11 @@ const CONSOLE_JS = `
       catch { return; }
       if (!status || typeof status !== 'object') return;
 
+      // Promote/demote the top-level Meetings sidebar item to match
+      // whether Recall capture is enabled. Idempotent + cheap; this poll
+      // (initial 600ms + every 5s) is also what surfaces Meetings on boot.
+      try { window.__clementineSyncMeetingsPlacement?.(status); } catch (_) {}
+
       const captureEnabled = Boolean(status.enabled);
       const daemonRecording = Boolean(status.recording);
       const currentId = status.currentWindowId || '';
@@ -20234,6 +23076,8 @@ const CONSOLE_JS = `
         if (event.recordingId) state.activeRecordingId = event.recordingId;
       } else if (t === 'transcript') {
         appendSegment({ speaker: event.speaker, text: event.text });
+      } else if (t === 'transcript-partial') {
+        showInterimSegment({ speaker: event.speaker, text: event.text });
       } else if (t === 'recording-ended') {
         const complete = event.complete || {};
         const recordInfo = complete.record || {};

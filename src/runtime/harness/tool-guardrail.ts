@@ -103,7 +103,7 @@ const IDEMPOTENT_TOOLS = new Set<string>([
   'memory_search', 'memory_recall', 'memory_read', 'memory_list_facts',
   'composio_search_tools', 'composio_list_tools', 'composio_status',
   'tool_choice_recall',
-  'session_history', 'agent_runs_recent', 'agent_run_get',
+  'session_history', 'agent_runs_recent', 'agent_run_get', 'background_tasks_recent', 'background_task_status',
   'goal_list', 'goal_get', 'task_list',
   'list_plans', 'discover_work',
   'user_profile_read',

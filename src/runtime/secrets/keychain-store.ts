@@ -131,11 +131,18 @@ export class KeychainSecretBackend implements SecretBackend {
    *  Reset Credentials flow so the dashboard can show exactly what
    *  it would delete before confirming with the user. */
   static async listEntries(): Promise<string[]> {
+    return (await KeychainSecretBackend.readEntries()).map((c) => c.account);
+  }
+
+  /** Read every entry under our stable service name. This is used only
+   *  by explicit legacy-import/reset actions; normal startup and passive
+   *  health checks must not call it because macOS may show a Keychain
+   *  access prompt. */
+  static async readEntries(): Promise<Array<{ account: string; password: string }>> {
     const keytar = await loadKeytar();
     if (!keytar) return [];
     try {
-      const creds = await keytar.findCredentials(KEYCHAIN_SERVICE);
-      return creds.map((c) => c.account);
+      return await keytar.findCredentials(KEYCHAIN_SERVICE);
     } catch {
       return [];
     }

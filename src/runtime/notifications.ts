@@ -112,11 +112,21 @@ export interface NotificationRecord {
 export interface NotificationDestination {
   id: string;
   name: string;
-  type: 'generic_webhook' | 'discord_webhook' | 'discord_channel' | 'discord_user';
+  type: 'generic_webhook' | 'discord_webhook' | 'discord_channel' | 'discord_user' | 'web_push';
   url?: string;
   channelId?: string;
   guildId?: string;
   userId?: string;
+  /** Web Push subscription endpoint (push service URL). */
+  pushEndpoint?: string;
+  /** Web Push subscription P-256 public key (base64url). */
+  pushP256dh?: string;
+  /** Web Push subscription auth secret (base64url). */
+  pushAuth?: string;
+  /** Mobile session/device that owns this push subscription. */
+  deviceId?: string;
+  /** Expiration hint reported by the browser (Unix ms), if any. */
+  pushExpirationTime?: number | null;
   enabled: boolean;
   createdAt: string;
 }
@@ -313,6 +323,65 @@ export function removeNotificationDestination(id: string): boolean {
   if (next.length === items.length) return false;
   saveDestinations(next);
   return true;
+}
+
+/**
+ * Idempotent upsert for Web Push subscriptions, keyed by endpoint URL.
+ * Re-subscribing the same browser produces the same endpoint and updates
+ * the existing row in place rather than creating a duplicate.
+ */
+export function upsertWebPushDestination(input: {
+  endpoint: string;
+  p256dh: string;
+  auth: string;
+  deviceId: string;
+  deviceLabel?: string;
+  expirationTime?: number | null;
+}): NotificationDestination {
+  const items = loadDestinations();
+  const existing = items.find(
+    (entry) => entry.type === 'web_push' && entry.pushEndpoint === input.endpoint,
+  );
+  const id = existing?.id ?? `web-push-${input.deviceId}-${Date.now().toString(36)}`;
+  const destination: NotificationDestination = {
+    id,
+    name: input.deviceLabel?.trim() || `Mobile device ${input.deviceId}`,
+    type: 'web_push',
+    pushEndpoint: input.endpoint,
+    pushP256dh: input.p256dh,
+    pushAuth: input.auth,
+    deviceId: input.deviceId,
+    pushExpirationTime: input.expirationTime ?? null,
+    enabled: true,
+    createdAt: existing?.createdAt ?? new Date().toISOString(),
+  };
+  if (existing) {
+    items[items.indexOf(existing)] = destination;
+  } else {
+    items.push(destination);
+  }
+  saveDestinations(items);
+  return destination;
+}
+
+export function removeWebPushDestinationByEndpoint(endpoint: string): boolean {
+  const items = loadDestinations();
+  const next = items.filter(
+    (entry) => !(entry.type === 'web_push' && entry.pushEndpoint === endpoint),
+  );
+  if (next.length === items.length) return false;
+  saveDestinations(next);
+  return true;
+}
+
+export function removeWebPushDestinationsByDeviceId(deviceId: string): number {
+  const items = loadDestinations();
+  const next = items.filter(
+    (entry) => !(entry.type === 'web_push' && entry.deviceId === deviceId),
+  );
+  const removed = items.length - next.length;
+  if (removed > 0) saveDestinations(next);
+  return removed;
 }
 
 export function listQueuedNotificationDeliveries(): NotificationDeliveryJob[] {

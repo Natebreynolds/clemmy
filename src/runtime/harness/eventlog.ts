@@ -85,12 +85,42 @@ export const EVENT_TYPES = [
   // conversation. Carries the from/to caps so the dashboard can show
   // why the budget changed mid-run.
   'budget_elevated',
+  // Tool-injection scoping: emitted at agent construction so traces can
+  // explain why a run saw a small external MCP surface instead of every
+  // configured server tool.
+  'mcp_tool_scope',
+  // Per-turn memory primer: emitted when the harness runs the local
+  // FTS memory lookup for the latest user message before the model call.
+  // The actual hits are injected transiently through callModelInputFilter
+  // so they do not bloat persisted conversation history.
+  'turn_memory_primer',
+  // Per-turn deterministic context packet: summarizes the memory
+  // primer, likely skills/workflows, MCP health, local health, and
+  // complexity classification that were injected transiently before
+  // the model call.
+  'agent_context_packet',
+  // Planner-first gate: fresh complex requests get a read-only plan
+  // proposal before the full external MCP surface is opened.
+  'plan_first_started',
+  'plan_first_failed',
+  // Flag-only native Codex compaction proof: emitted when the harness
+  // persists a Codex `compaction` item from raw model responses and
+  // prunes replay history for the next continuation turn.
+  'native_compaction_applied',
   // v0.5.19 F3 — preflight gate fires this for workflow/execution/
   // agent kinds when a turn projects over the context block
   // threshold. Workflows have no user to consult mid-step so they
   // proceed — but the dashboard now sees the risk and a future
   // workflow-runner extension can react (split / abort / retry).
   'workflow_step_overbudget',
+  // Move 2 (confirm-first gate): emitted by the tool-boundary gate each
+  // time a mutating external write is ALLOWED through. The gate counts
+  // these per session+shape to detect a batch (≥ threshold same-shape
+  // writes) and require an instruction-reviewed plan scope before the
+  // batch proceeds. Emitted from the gate (not hooks) so worker/sub-agent
+  // writes — which share the parent session via AsyncLocalStorage but may
+  // not log tool_called under it — are counted reliably.
+  'external_write',
 ] as const;
 export type EventType = (typeof EVENT_TYPES)[number];
 const EVENT_TYPE_SET: ReadonlySet<string> = new Set(EVENT_TYPES);
@@ -711,6 +741,16 @@ export function writeToolOutput(input: WriteToolOutputInput): void {
   const db = openEventLog();
   const original = input.output;
   const originalBytes = Buffer.byteLength(original, 'utf8');
+
+  const existing = db.prepare(
+    `SELECT content_bytes
+       FROM tool_outputs
+      WHERE session_id = ? AND call_id = ?`,
+  ).get(input.sessionId, input.callId) as { content_bytes: number } | undefined;
+  if (existing && existing.content_bytes > originalBytes) {
+    return;
+  }
+
   let stored = original;
   let truncated = false;
   if (originalBytes > TOOL_OUTPUT_MAX_BYTES) {

@@ -80,6 +80,9 @@ export interface ConsolidatedFactRow {
   //                           NULL for depth=0 facts.
   derivation_depth: number;
   derived_from_fact_ids: string | null;
+  // v8 — pinned standing instruction. 1 = always injected into the
+  // prompt, exempt from the top-N cap and recency decay.
+  pinned: number;
 }
 
 export type EntityType = 'person' | 'company' | 'project' | 'place' | 'thing';
@@ -364,6 +367,41 @@ const MIGRATIONS: { version: number; sql: string }[] = [
       -- Switching focus must park the current active first.
       CREATE UNIQUE INDEX IF NOT EXISTS idx_focus_one_active
         ON current_focus(status) WHERE status = 'active';
+    `,
+  },
+  {
+    // v7 — Fact embeddings. The `embeddings` table (v1) is keyed to
+    // vault_chunks only, so consolidated_facts had no semantic search:
+    // the reflection conflict-resolver's candidate retrieval
+    // (findSimilarFacts) fell back to LIKE-token matching and missed
+    // paraphrased contradictions ("prefers Tuesday" vs "Wednesdays work
+    // best"). This table gives facts the same Float32-BLOB treatment as
+    // chunks. `content_hash` lets the backfill detect a fact whose
+    // content changed (updateFact rewrites the hash) and re-embed it.
+    // FK-cascaded so a hard fact delete drops its embedding for free.
+    version: 7,
+    sql: `
+      CREATE TABLE IF NOT EXISTS fact_embeddings (
+        fact_id      INTEGER PRIMARY KEY REFERENCES consolidated_facts(id) ON DELETE CASCADE,
+        model        TEXT NOT NULL,
+        dim          INTEGER NOT NULL,
+        vector       BLOB NOT NULL,
+        content_hash TEXT NOT NULL,
+        created_at   TEXT NOT NULL
+      );
+    `,
+  },
+  {
+    // v8 — Pinned standing instructions. A pinned fact is ALWAYS injected
+    // into the prompt, exempt from the top-N recency/relevance cap, so a
+    // durable rule ("never email clients on Fridays") can't silently age
+    // out of context as the fact pool grows. Additive column, default 0.
+    version: 8,
+    sql: `
+      ALTER TABLE consolidated_facts ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;
+
+      CREATE INDEX IF NOT EXISTS idx_facts_pinned
+        ON consolidated_facts(pinned, active);
     `,
   },
 ];

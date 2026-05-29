@@ -37,6 +37,7 @@ const PLANNER_TOOL_NAMES = new Set<string>([
   'memory_recall',
   'memory_read',
   'memory_list_facts',
+  'memory_review_instructions',
   'workspace_roots',
   'workspace_list',
   'workspace_info',
@@ -50,6 +51,8 @@ const PLANNER_TOOL_NAMES = new Set<string>([
   'list_plans',
   'agent_runs_recent',
   'agent_run_get',
+  'background_tasks_recent',
+  'background_task_status',
   'discover_work',
   // Pre-flight capability detection so the planner can verify a CLI
   // exists before writing steps that depend on it.
@@ -88,6 +91,9 @@ export const PlanSchema = z.object({
   needsUserInput: z.array(z.string()).max(5).describe(
     'Questions the orchestrator should ask the user before executing. Empty if the plan is fully specified.',
   ),
+  appliedInstructions: z.array(z.string()).max(8).describe(
+    'Standing instructions / durable preferences from memory that THIS plan is consciously following, each as a short line (quote the instruction, add a "(source: …)" hint when known). Populate by recalling memory scoped to the objective BEFORE planning. Empty array only if a genuine memory check surfaced nothing relevant — never skip the check for mutating or batch work.',
+  ),
 });
 
 export type Plan = z.infer<typeof PlanSchema>;
@@ -100,6 +106,7 @@ export function buildPlannerAgent(): Agent<RuntimeContextValue, typeof PlanSchem
       'You are the Planner. Your job is to turn a user request into a clear, inspectable plan — nothing more.',
       'You DO NOT execute. You DO NOT mutate state. You produce a plan and return.',
       'Use read-only tools to gather context first when the request references existing work, files, goals, memory, or workspace state. Don\'t plan blind.',
+      'MANDATORY memory check before mutating or batch work (sending messages, creating/updating records, filling sheets, posting): call `memory_recall` / `memory_list_facts` scoped to the objective FIRST, and list every standing instruction or durable preference the plan will follow in `appliedInstructions` (quote it, add a "(source: …)" hint when you can tell where it came from). This is how the user sees "here is what I am about to do, and the instructions I am following" before approving. If a recalled instruction looks IRRELEVANT or CONFLICTING with this objective (e.g. a home-services rule surfacing during legal work), do NOT silently apply it — add a `needsUserInput` line flagging it and asking whether to drop it. Only return an empty `appliedInstructions` when a real memory check surfaced nothing relevant.',
       'PRE-FLIGHT CLI check: if your plan will rely on a local CLI, call `local_cli_list` (or `local_cli_probe` for a specific binary) to confirm it is actually on $PATH BEFORE writing steps that depend on it. There is no curated allowlist — whatever the user has installed is fair game; whatever they do not have is not. If a needed CLI is missing, either populate `needsUserInput` with a short question (offer the canonical install command for that tool) or include the install as the first step when low-friction and clearly desired. Never write steps that assume a missing CLI will work.',
       'Steps must be concrete. Bad: "set up the integration." Good: "Read src/integrations/composio/client.ts to confirm the current auth path, then add a `refreshToken` handler that calls /oauth/refresh on 401."',
       'Group trivial steps. Don\'t list "open the file" as a step. The reader is another LLM — they know.',
@@ -131,7 +138,7 @@ export function buildPlannerTool(): Tool<RuntimeContextValue> {
       'Use when the user\'s request is multi-step OR the path is not obvious from the message alone.',
       'Do NOT use for trivial single-tool actions or read-only lookups.',
       'The planner is read-only — calling it does not mutate anything.',
-      'Returns a JSON plan with objective, steps, successCriteria, risks, estimatedComplexity, recommendsTrackedExecution, and needsUserInput.',
+      'Returns a JSON plan with objective, steps, successCriteria, risks, estimatedComplexity, recommendsTrackedExecution, needsUserInput, and appliedInstructions (the standing instructions from memory this plan follows — surfaced to the user for review).',
       'After receiving the plan, decide: (a) execute it yourself or hand off to Executor, (b) ask the user the needsUserInput questions first, (c) refine by calling draft_plan again with more context, or (d) tell the user the plan and let them approve.',
     ].join(' '),
     customOutputExtractor: async (output) => {

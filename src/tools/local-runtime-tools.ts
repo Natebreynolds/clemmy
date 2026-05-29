@@ -6,6 +6,7 @@ import { needsApprovalFromTaxonomy } from '../agents/tool-taxonomy.js';
 import { registerAdminTools } from './admin-tools.js';
 import { registerAgentRunsTools } from './agent-runs-tools.js';
 import { registerAutonomyActionTools } from './autonomy-action-tools.js';
+import { registerBackgroundTaskTools } from './background-task-tools.js';
 import { registerBrowserHarnessTools } from './browser-harness-tools.js';
 import { registerCapabilityTools } from './capability-tools.js';
 import { registerCliTools } from './cli-tools.js';
@@ -19,6 +20,7 @@ import { registerMemoryTools } from './memory-tools.js';
 import { registerFocusTools } from './focus-tools.js';
 import { registerMcpStatusTools } from './mcp-status-tools.js';
 import { registerOrchestrationTools } from './orchestration-tools.js';
+import { registerStepResultTool } from './step-result-tool.js';
 import { registerPlanTools } from './plan-tools.js';
 import { registerProfileTools } from './profile-tools.js';
 import { registerRecallTools } from './recall-tools.js';
@@ -26,6 +28,8 @@ import { registerSessionTools } from './session-tools.js';
 import { registerTeamTools } from './team-tools.js';
 import { registerVaultTools } from './vault-tools.js';
 import { ensureToolDirectories, textResult } from './shared.js';
+import { formatRecallableToolText } from '../runtime/harness/tool-output-format.js';
+import { toolOutputContextFromSdk, withToolOutputContext } from '../runtime/harness/tool-output-context.js';
 
 type LocalToolHandler = (input: Record<string, unknown>) => Promise<unknown> | unknown;
 
@@ -42,7 +46,7 @@ interface CapturedLocalTool {
 // list is read-only, add/remove are admin.
 
 function resultToText(result: unknown): string {
-  if (typeof result === 'string') return result;
+  if (typeof result === 'string') return formatRecallableToolText(result);
   if (result && typeof result === 'object') {
     const content = (result as { content?: unknown }).content;
     if (Array.isArray(content)) {
@@ -55,14 +59,14 @@ function resultToText(result: unknown): string {
         })
         .filter(Boolean)
         .join('\n');
-      if (text) return text;
+      if (text) return formatRecallableToolText(text);
     }
   }
 
   try {
-    return JSON.stringify(result, null, 2);
+    return formatRecallableToolText(JSON.stringify(result, null, 2));
   } catch {
-    return String(result);
+    return formatRecallableToolText(String(result));
   }
 }
 
@@ -113,7 +117,9 @@ function captureLocalTools(): CapturedLocalTool[] {
   registerAdminTools(server);
   registerTeamTools(server);
   registerOrchestrationTools(server);
+  registerStepResultTool(server);
   registerAgentRunsTools(server);
+  registerBackgroundTaskTools(server);
   registerAutonomyActionTools(server);
   registerExecutionTools(server);
   registerProfileTools(server);
@@ -153,6 +159,9 @@ export function getLocalRuntimeTools(): Tool<RuntimeContextValue>[] {
       isDestructive: (input) =>
         Boolean(localTool.approvalRequired) || localDestructiveHint(localTool.name, input),
     }),
-    execute: async (input) => resultToText(await localTool.handler(input as Record<string, unknown>)),
+    execute: async (input, runContext, details) => withToolOutputContext(
+      toolOutputContextFromSdk(localTool.name, runContext, details),
+      async () => resultToText(await localTool.handler(input as Record<string, unknown>)),
+    ),
   }));
 }

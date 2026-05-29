@@ -11,7 +11,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { buildActionsForNotification } from './discord.js';
+import { buildActionsForNotification, discordSlashCommandNamesForTest } from './discord.js';
 
 function customIds(rows: ReturnType<typeof buildActionsForNotification>): string[] {
   if (!rows) return [];
@@ -52,6 +52,15 @@ test('buildActionsForNotification: approvalId attaches SDK approve/edit/reject',
   assert.ok(ids.some((id) => id.includes('reject:appr-xyz789')));
 });
 
+test('buildActionsForNotification: checkInId attaches answer buttons', () => {
+  const rows = buildActionsForNotification({ checkInId: 'chk-abc123' });
+  const ids = customIds(rows);
+  assert.equal(ids.length, 3, 'expected 3 buttons: approve, answer, reject');
+  assert.ok(ids.some((id) => id.includes('checkin-approve:chk-abc123')));
+  assert.ok(ids.some((id) => id.includes('checkin-answer:chk-abc123')));
+  assert.ok(ids.some((id) => id.includes('checkin-reject:chk-abc123')));
+});
+
 test('buildActionsForNotification: planProposalId beats approvalId when both present', () => {
   const rows = buildActionsForNotification({
     planProposalId: 'plan-p1',
@@ -66,4 +75,8 @@ test('buildActionsForNotification: planProposalId beats approvalId when both pre
 test('buildActionsForNotification: ignores non-string ids', () => {
   assert.equal(buildActionsForNotification({ planProposalId: 42 as unknown as string }), undefined);
   assert.equal(buildActionsForNotification({ approvalId: null as unknown as string }), undefined);
+});
+
+test('Discord slash commands include live approvals pull surface', () => {
+  assert.ok(discordSlashCommandNamesForTest().includes('approvals'));
 });

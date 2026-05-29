@@ -23,7 +23,7 @@ export interface GatewayRequest {
   userId?: string;
   channel?: string;
   model?: string;
-  source?: 'discord' | 'webhook' | 'cli' | 'gateway';
+  source?: 'discord' | 'webhook' | 'cli' | 'gateway' | 'mobile';
   runId?: string;
   /** Streaming-text delta callback. Forwarded to assistant.respond,
    *  which forwards it to the runtime. Only fires when the underlying

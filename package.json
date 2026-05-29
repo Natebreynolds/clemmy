@@ -1,6 +1,6 @@
 {
   "name": "clemmy",
-  "version": "0.5.22",
+  "version": "0.5.35",
   "description": "Lightweight background agent system — proactive, customizable, runs out of the box",
   "license": "MIT",
   "homepage": "https://github.com/Natebreynolds/clemmy",
@@ -25,18 +25,21 @@
   },
   "files": [
     "dist",
+    "apps/mobile-web/dist",
     "README.md",
     ".env.example"
   ],
   "scripts": {
     "build": "tsc --outDir dist",
+    "build:mobile-web": "npm --prefix apps/mobile-web run build",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test src/**/*.test.ts",
     "test:smoke": "node scripts/smoke-fresh-install.mjs && node scripts/smoke-fresh-install-e2e.mjs",
     "test:smoke:gate": "node scripts/smoke-fresh-install.mjs",
+    "smoke:codex-native-compaction": "node scripts/smoke-codex-native-compaction.mjs",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
-    "prepack": "npm run build",
+    "prepack": "npm run build && npm run build:mobile-web",
     "pack:local": "npm pack",
     "chat": "tsx src/index.ts chat",
     "daemon": "tsx src/index.ts daemon",
@@ -64,16 +67,27 @@
     "@openai/agents-realtime": "^0.11.5",
     "better-sqlite3": "^11.7.0",
     "cytoscape": "^3.33.3",
-    "discord.js": "^14.26.2",
-    "express": "^4.21.2",
+    "discord.js": "^14.26.4",
+    "express": "^4.22.2",
     "gray-matter": "^4.0.3",
     "pino": "^9.6.0",
+    "qrcode": "^1.5.4",
+    "web-push": "^3.6.7",
     "zod": "^4.4.3"
+  },
+  "overrides": {
+    "fast-uri": "^3.1.2",
+    "hono": "^4.12.23",
+    "ip-address": "^10.2.0",
+    "qs": "^6.15.2",
+    "ws": "^8.21.0"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
     "@types/express": "^5.0.3",
     "@types/node": "^22.12.0",
+    "@types/qrcode": "^1.5.5",
+    "@types/web-push": "^3.6.4",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0"
   },

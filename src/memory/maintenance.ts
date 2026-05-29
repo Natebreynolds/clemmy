@@ -1,10 +1,21 @@
+import { statSync } from 'node:fs';
 import pino from 'pino';
-import { embedMissingChunks, isEmbeddingsEnabled } from './embeddings.js';
+import { embedMissingChunks, embedMissingFacts, isEmbeddingsEnabled } from './embeddings.js';
 import { reindexVault } from './indexer.js';
 import { tickMemoryMdRefresh } from './memory-md-builder.js';
 import { tickIdentityMdRefresh } from './identity-md-builder.js';
 import { tickAutoresearchObservatory } from '../autoresearch/observatory.js';
 import { reapStaleToolOutputs } from '../runtime/harness/eventlog.js';
+import {
+  reapStuckRecallRecordings,
+  loadRecallMeetingSettings,
+  buildAnalyzerPrompt,
+  listAllRecallMeetingRecords,
+  analysisPathFor,
+  fileMeetingFromAnalysis,
+} from '../integrations/recall/meeting-capture.js';
+import { startCanonicalTranscriptBackfill } from '../integrations/recall/backfill.js';
+import { createBackgroundTask } from '../execution/background-tasks.js';
 
 /**
  * Memory maintenance for the daemon tick.
@@ -58,6 +69,21 @@ const AUTORESEARCH_NIGHTLY_MINUTE = 0;
 // cheap (single DELETE with index on created_at). Each row is 4KB-200KB
 // so even on a busy day the delete-set is bounded.
 const EVENTLOG_REAPER_EVERY_N_TICKS = 240; // ~1h with a 15s tick
+// Recall stuck-recording reaper. Some captures (notably the
+// desktop-audio fallback, which isn't tied to a meeting window) never
+// get the SDK's recording-ended event, so they hang in 'recording'
+// forever — a perpetual "LIVE" ghost in the meetings panel with no
+// analysis. Check every ~5 min; reapStuckRecallRecordings only
+// finalizes records idle (no new transcript) for 60+ min, so a live
+// call is never cut off. Cheap: a readdir + per-record timestamp check.
+const RECALL_REAPER_EVERY_N_TICKS = 20; // ~5min with a 15s tick
+// Meeting filing reconcile. Folds the analyzer-derived title + summary
+// into each meeting's vault note so the existing reindex/embedding ticks
+// make the high-signal content searchable (not just the raw transcript).
+// Backfills existing meetings automatically on first run after update.
+// Cheap: skips any note already newer than its analysis JSON (2 stats),
+// so steady-state work is ~0 once everything is filed.
+const MEETING_FILING_EVERY_N_TICKS = 8; // ~2min with a 15s tick
 // Track the last calendar day on which we fired the nightly run so we
 // don't re-fire 240 times across the matching minute window (15s ticks
 // inside 3:00–3:00:59 would otherwise all match). Reset per-process —
@@ -85,6 +111,17 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
       }
     } catch (err) {
       logger.warn({ err }, 'embedding backfill tick failed');
+    }
+    // Facts get the same incremental, circuit-broken backfill so the
+    // conflict resolver's semantic findSimilarFacts has vectors to rank
+    // against. Re-embeds facts whose content changed (Mem0 UPDATE).
+    try {
+      const factStats = await embedMissingFacts({ maxChunks: BACKFILL_BATCH });
+      if (factStats.embedded > 0 || factStats.failed > 0) {
+        logger.info({ stats: factStats }, 'fact embedding backfill tick');
+      }
+    } catch (err) {
+      logger.warn({ err }, 'fact embedding backfill tick failed');
     }
   }
 
@@ -123,6 +160,58 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
     }
   }
 
+  // Recall stuck-recording reaper — finalize abandoned 'recording'
+  // records so they stop showing as live and get analyzed. Mirrors the
+  // post-processing the /api/console/meetings/recall/complete route does
+  // on a normal recording-ended: reindex the vault, queue the analyzer,
+  // and (when there's a recordingId) kick the canonical-transcript
+  // backfill.
+  if (tickCount % RECALL_REAPER_EVERY_N_TICKS === 0) {
+    try {
+      const finalized = reapStuckRecallRecordings();
+      if (finalized.length > 0) {
+        const settings = loadRecallMeetingSettings();
+        let reindexed = false;
+        for (const { record, artifactPath } of finalized) {
+          if (artifactPath && !reindexed) {
+            try { reindexVault(); reindexed = true; } catch { /* maintenance reindex tick will retry */ }
+          }
+          if (record.recordingId) {
+            startCanonicalTranscriptBackfill({ windowId: record.windowId, recordingId: record.recordingId });
+          }
+          if (artifactPath && settings.analyzeOnComplete) {
+            createBackgroundTask({
+              title: `Analyze meeting transcript: ${record.title || record.platform || record.id}`,
+              prompt: buildAnalyzerPrompt(record, artifactPath),
+              source: 'daemon',
+              channel: 'electron:meeting-capture',
+              maxMinutes: 30,
+            });
+          }
+        }
+        logger.info({ count: finalized.length }, 'recall stuck-recording reaper finalized abandoned captures');
+      }
+    } catch (err) {
+      logger.warn({ err }, 'recall stuck-recording reaper tick failed');
+    }
+  }
+
+  // Meeting filing — fold analyzer title + summary into vault notes so
+  // they become searchable. Runs the reindex inline when it files
+  // anything so the new content is queryable without waiting for the
+  // separate reindex tick.
+  if (tickCount % MEETING_FILING_EVERY_N_TICKS === 0) {
+    try {
+      const filed = tickMeetingFiling();
+      if (filed > 0) {
+        try { reindexVault(); } catch { /* reindex tick will retry */ }
+        logger.info({ filed }, 'meeting filing tick folded analysis into vault');
+      }
+    } catch (err) {
+      logger.warn({ err }, 'meeting filing tick failed');
+    }
+  }
+
   // Explicit nightly fire at 3:00 AM local. Independent of the periodic
   // cadence above — users want a guaranteed "fresh report when I wake
   // up." We check hour+minute, dedupe by calendar day so we fire ONCE
@@ -135,4 +224,34 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
       tickAutoresearchObservatory();
     }
   }
+}
+
+/**
+ * For every meeting whose analysis JSON is newer than its filed vault
+ * note (or never filed), fold the title + summary into the note. The
+ * mtime comparison is the cheap idempotency guard: once a note is filed
+ * it's newer than its analysis, so steady-state passes do ~no work and
+ * re-analysis (which bumps the JSON mtime) re-files automatically.
+ * Returns the number of notes actually rewritten.
+ */
+export function tickMeetingFiling(): number {
+  let filed = 0;
+  for (const record of listAllRecallMeetingRecords()) {
+    const artifactPath = record.artifactPath;
+    if (!artifactPath) continue;
+    const analysisPath = analysisPathFor(record.id);
+    let analysisMtime: number;
+    let artifactMtime: number;
+    try {
+      analysisMtime = statSync(analysisPath).mtimeMs;
+    } catch { continue; } // no analysis yet — nothing to fold in
+    try {
+      artifactMtime = statSync(artifactPath).mtimeMs;
+    } catch { continue; } // note vanished — skip
+    if (artifactMtime >= analysisMtime) continue; // already filed since last analysis
+    try {
+      if (fileMeetingFromAnalysis(record.id)) filed += 1;
+    } catch { /* skip this one; next tick retries */ }
+  }
+  return filed;
 }

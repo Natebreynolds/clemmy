@@ -40,6 +40,7 @@ import {
 } from './credentials-bridge.js';
 import { addWorkspaceDir, ensureHomeEnv, saveUserProfile, setHomeEnv, type ProfilePatch } from './setup-bridge.js';
 import { importUsableCodexOAuthTokens, persistCodexOAuthTokens, runCodexOAuthLogin } from './codex-oauth.js';
+import { redactSensitiveText } from './redaction.js';
 
 /**
  * Clementine Desktop — Electron main process.
@@ -51,7 +52,7 @@ import { importUsableCodexOAuthTokens, persistCodexOAuthTokens, runCodexOAuthLog
  *   4. Start DaemonSupervisor — spawns the child, picks a port, waits
  *      for readiness
  *   5. Replace splash with dashboard BrowserWindow pointing at
- *      http://localhost:PORT/console?token=WEBHOOK_SECRET
+ *      http://127.0.0.1:PORT/console after one-time local session bootstrap
  *   6. Tray icon for quick access + status
  *   7. On window-all-closed: hide instead of quitting (Mac tray pattern)
  *   8. On app quit: stop daemon, drain log stream, exit
@@ -123,6 +124,79 @@ let quitPreparing = false;
 let installQuitFallback: NodeJS.Timeout | null = null;
 let cachedWebhookSecret = '';
 
+type RendererSurface = 'dashboard' | 'setup' | 'splash';
+
+function dashboardOrigin(): string | null {
+  if (!dashboardUrl) return null;
+  try {
+    return new URL(dashboardUrl).origin;
+  } catch {
+    return null;
+  }
+}
+
+function isSafeExternalHttps(rawUrl: string): boolean {
+  try {
+    const url = new URL(rawUrl);
+    if (url.protocol !== 'https:') return false;
+    const host = url.hostname.toLowerCase();
+    return host === 'discord.com'
+      || host.endsWith('.discord.com')
+      || host === 'dashboard.composio.dev'
+      || host === 'app.composio.dev'
+      || host === 'platform.openai.com'
+      || host === 'auth.openai.com'
+      || host === 'github.com';
+  } catch {
+    return false;
+  }
+}
+
+function senderSurface(url: string): RendererSurface | null {
+  if (url.startsWith('data:text/html')) return 'splash';
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol === 'file:') {
+      const filePath = fileURLToPath(parsed);
+      const setupRoot = path.join(app.getPath('userData'), 'wizard');
+      if (filePath.startsWith(setupRoot + path.sep) || filePath === path.join(setupRoot, 'setup.html')) return 'setup';
+    }
+    const origin = dashboardOrigin();
+    if (origin && parsed.origin === origin) return 'dashboard';
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function assertIpcSender(event: IpcMainInvokeEvent, allowed: RendererSurface[]): void {
+  const url = event.senderFrame?.url || event.sender.getURL();
+  const surface = senderSurface(url);
+  if (!surface || !allowed.includes(surface)) {
+    throw new Error(`Blocked IPC call from unauthorized renderer: ${redactSensitiveText(url || 'unknown')}`);
+  }
+}
+
+function guardWindow(win: BrowserWindow, allowed: RendererSurface[]): void {
+  function allowedUrl(rawUrl: string): boolean {
+    const surface = senderSurface(rawUrl);
+    return Boolean(surface && allowed.includes(surface));
+  }
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    if (isSafeExternalHttps(url)) {
+      void shell.openExternal(url);
+    }
+    return { action: 'deny' };
+  });
+  win.webContents.on('will-navigate', (event, url) => {
+    if (allowedUrl(url)) return;
+    event.preventDefault();
+    if (isSafeExternalHttps(url)) {
+      void shell.openExternal(url);
+    }
+  });
+}
+
 function getWebhookSecret(): string {
   if (cachedWebhookSecret) return cachedWebhookSecret;
   // Read the same secret the daemon will read so the dashboard URL we
@@ -162,6 +236,7 @@ function createSplashWindow(): BrowserWindow {
     alwaysOnTop: true,
     backgroundColor: '#07070a',
     webPreferences: {
+      partition: 'clementine-splash',
       // Without the preload, window.clemmy isn't defined, so the
       // splash's status-text updater never wires up and the user
       // sees "starting daemon…" for the entire boot. The supervisor
@@ -172,6 +247,7 @@ function createSplashWindow(): BrowserWindow {
       nodeIntegration: false,
     },
   });
+  guardWindow(win, ['splash']);
   const html = `<!DOCTYPE html>
 <html><head><meta charset="utf-8" /><title>Clementine</title>
 <style>
@@ -225,12 +301,19 @@ function createMainWindow(url: string): BrowserWindow {
     backgroundColor: '#07070a',
     titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
     webPreferences: {
+      // Use a non-persistent Electron session. The dashboard gets a
+      // fresh local bootstrap URL on every launch, so it does not need
+      // durable Chromium cookies/cache. Keeping this in-memory avoids
+      // Electron/Chromium Safe Storage touching macOS Keychain just to
+      // encrypt a local dashboard cookie.
+      partition: 'clementine-dashboard',
       preload: preloadPath(),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
     },
   });
+  guardWindow(win, ['dashboard']);
   win.loadURL(url);
   // Auto-open DevTools when running unpackaged (dev mode) so renderer
   // errors are visible without the user having to know ⌘⌥I.
@@ -534,21 +617,25 @@ async function boot(): Promise<void> {
   // file vault (which the daemon's SecretStore reads at boot).
   cachedWebhookSecret = await ensureWebhookSecret();
 
-  // One-time migration of any Keychain entries from v0.4.16 → v0.4.29
-  // (when setCredential wrote to Keychain) into the file vault. Gated
-  // by a marker so subsequent launches stay silent. Best-effort: an
-  // unexpected failure here must NEVER block boot.
-  try {
-    const result = await migrateKeychainToFileVault();
-    if (result.ran && result.migrated.length > 0) {
-      try {
-        appendFileSync(LOG_FILE, `\n=== Keychain migration ${new Date().toISOString()} ===\nmoved to file vault: ${result.migrated.join(', ')}\n`);
-      } catch { /* log is best-effort */ }
-    }
-  } catch (err) {
+  // Keychain is now explicit only. Even a one-time `findCredentials`
+  // migration can raise a macOS Keychain prompt on clean installs or
+  // after a signature change, which is worse than asking legacy users
+  // to click Settings → Credentials → Import Legacy Keychain. Keep the
+  // old startup migration reachable behind an operator flag for manual
+  // recovery/testing, but never run it during normal launch.
+  if (process.env.CLEMMY_ENABLE_LEGACY_KEYCHAIN_MIGRATION === '1') {
     try {
-      appendFileSync(LOG_FILE, `\n=== Keychain migration failed ${new Date().toISOString()} ===\n${err instanceof Error ? err.message : String(err)}\n`);
-    } catch { /* swallow */ }
+      const result = await migrateKeychainToFileVault();
+      if (result.ran && result.migrated.length > 0) {
+        try {
+          appendFileSync(LOG_FILE, `\n=== Keychain migration ${new Date().toISOString()} ===\nmoved to file vault: ${result.migrated.join(', ')}\n`);
+        } catch { /* log is best-effort */ }
+      }
+    } catch (err) {
+      try {
+        appendFileSync(LOG_FILE, `\n=== Keychain migration failed ${new Date().toISOString()} ===\n${err instanceof Error ? err.message : String(err)}\n`);
+      } catch { /* swallow */ }
+    }
   }
 
   if (needsSetup()) {
@@ -602,6 +689,7 @@ function openSetupWindow(): void {
       await launchDaemon();
     },
   });
+  guardWindow(setupWindow, ['setup']);
   setupWindow.on('closed', () => { setupWindow = null; });
 }
 
@@ -611,7 +699,7 @@ async function launchDaemon(): Promise<void> {
   const daemonRoot = locateDaemonProjectRoot();
   if (!recallCapture) {
     recallCapture = new RecallDesktopCapture({
-      getDaemonBaseUrl: () => supervisor?.getPort() ? `http://localhost:${supervisor.getPort()}` : '',
+      getDaemonBaseUrl: () => supervisor?.getPort() ? `http://127.0.0.1:${supervisor.getPort()}` : '',
       getWebhookToken: () => getWebhookSecret(),
       emit: (event) => {
         mainWindow?.webContents.send('clemmy:recall-event', event);
@@ -635,7 +723,7 @@ async function launchDaemon(): Promise<void> {
   try {
     const info = await supervisor.start();
     const token = getWebhookSecret();
-    dashboardUrl = token ? `${info.url}/console?token=${encodeURIComponent(token)}` : `${info.url}/console`;
+    dashboardUrl = supervisor.getDashboardUrl(token);
     await syncRecallCaptureFromDaemon().catch((error) => {
       console.error('[recall] initial sync failed:', error instanceof Error ? error.message : error);
     });
@@ -669,9 +757,10 @@ async function fetchDaemonJson<T>(pathname: string, init?: RequestInit): Promise
   const port = supervisor?.getPort();
   const token = getWebhookSecret();
   if (!port || !token) throw new Error('daemon is not ready');
-  const url = new URL(pathname, `http://localhost:${port}`);
-  url.searchParams.set('token', token);
-  const response = await fetch(url, init);
+  const url = new URL(pathname, `http://127.0.0.1:${port}`);
+  const headers = new Headers(init?.headers);
+  headers.set('Authorization', `Bearer ${token}`);
+  const response = await fetch(url, { ...init, headers });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
     const message = payload && typeof payload === 'object' && 'error' in payload
@@ -691,61 +780,83 @@ async function syncRecallCaptureFromDaemon(): Promise<void> {
 
 // ─── IPC handlers ──────────────────────────────────────────────────
 
-ipcMain.handle('clemmy:supervisor-status', () => ({
+ipcMain.handle('clemmy:supervisor-status', (evt: IpcMainInvokeEvent) => {
+  assertIpcSender(evt, ['dashboard']);
+  return {
   running: supervisor?.isRunning() ?? false,
   port: supervisor?.getPort() ?? 0,
   url: dashboardUrl,
-}));
+  };
+});
 
-ipcMain.handle('clemmy:restart-daemon', async () => {
+ipcMain.handle('clemmy:restart-daemon', async (evt: IpcMainInvokeEvent) => {
+  assertIpcSender(evt, ['dashboard']);
   await supervisor?.restart();
   rebuildTrayMenu();
   return { ok: true };
 });
 
-ipcMain.handle('clemmy:tail-log', (_evt: IpcMainInvokeEvent, maxLines?: number) => {
-  return { lines: supervisor?.tailLog(maxLines ?? 200) ?? [] };
+ipcMain.handle('clemmy:tail-log', (evt: IpcMainInvokeEvent, maxLines?: number) => {
+  assertIpcSender(evt, ['dashboard']);
+  return { lines: (supervisor?.tailLog(maxLines ?? 200) ?? []).map((line) => redactSensitiveText(line)) };
 });
 
-ipcMain.handle('clemmy:open-logs', async () => {
+ipcMain.handle('clemmy:open-logs', async (evt: IpcMainInvokeEvent) => {
+  assertIpcSender(evt, ['dashboard']);
   await shell.openPath(LOG_FILE);
   return { opened: true };
 });
 
-ipcMain.handle('clemmy:recall-status', async () => {
+ipcMain.handle('clemmy:recall-status', async (evt: IpcMainInvokeEvent) => {
+  assertIpcSender(evt, ['dashboard']);
   await syncRecallCaptureFromDaemon().catch(() => { /* status still returns local state */ });
   return recallCapture?.status() ?? null;
 });
 
-ipcMain.handle('clemmy:recall-configure', async (_evt: IpcMainInvokeEvent, settings: Partial<RecallCaptureSettings>) => {
+ipcMain.handle('clemmy:recall-configure', async (evt: IpcMainInvokeEvent, settings: Partial<RecallCaptureSettings>) => {
+  assertIpcSender(evt, ['dashboard']);
   return recallCapture?.configure(settings ?? {}) ?? null;
 });
 
-ipcMain.handle('clemmy:recall-request-permissions', async () => {
+ipcMain.handle('clemmy:recall-request-permissions', async (evt: IpcMainInvokeEvent) => {
+  assertIpcSender(evt, ['dashboard']);
   return recallCapture?.requestPermissions() ?? null;
 });
 
-ipcMain.handle('clemmy:recall-start-manual', async () => {
+ipcMain.handle('clemmy:recall-start-manual', async (evt: IpcMainInvokeEvent) => {
+  assertIpcSender(evt, ['dashboard']);
   return recallCapture?.startManualRecording() ?? null;
 });
 
-ipcMain.handle('clemmy:recall-record-detected', async (_evt: IpcMainInvokeEvent, payload: { windowId: string }) => {
+// Primary "RECORD MEETING" path — records the detected meeting window
+// when one is open, else falls back to desktop audio. See
+// RecallDesktopCapture.recordActiveMeetingOrDesktop.
+ipcMain.handle('clemmy:recall-record-active', async (evt: IpcMainInvokeEvent) => {
+  assertIpcSender(evt, ['dashboard']);
+  return recallCapture?.recordActiveMeetingOrDesktop() ?? null;
+});
+
+ipcMain.handle('clemmy:recall-record-detected', async (evt: IpcMainInvokeEvent, payload: { windowId: string }) => {
+  assertIpcSender(evt, ['dashboard']);
   const id = (payload?.windowId ?? '').trim();
   if (!id) throw new Error('windowId required');
   return recallCapture?.recordDetectedWindow(id) ?? null;
 });
 
-ipcMain.handle('clemmy:recall-auto-record', async (_evt: IpcMainInvokeEvent, payload: { windowId: string }) => {
+ipcMain.handle('clemmy:recall-auto-record', async (evt: IpcMainInvokeEvent, payload: { windowId: string }) => {
+  assertIpcSender(evt, ['dashboard']);
   const id = (payload?.windowId ?? '').trim();
   if (!id) throw new Error('windowId required');
   return recallCapture?.enableAutoRecordAndRecord(id) ?? null;
 });
 
-ipcMain.handle('clemmy:recall-stop', async () => {
+ipcMain.handle('clemmy:recall-stop', async (evt: IpcMainInvokeEvent) => {
+  assertIpcSender(evt, ['dashboard']);
   return recallCapture?.stopRecording() ?? null;
 });
 
-ipcMain.handle('clemmy:recall-test', async () => {
+ipcMain.handle('clemmy:recall-test', async (evt: IpcMainInvokeEvent) => {
+  assertIpcSender(evt, ['dashboard']);
   // Force an SDK init (if enabled) and return the full status incl.
   // permissionStatuses + detectedWindows so the dashboard's
   // "Test Connection" button can diagnose why recording isn't firing.
@@ -755,20 +866,31 @@ ipcMain.handle('clemmy:recall-test', async () => {
 
 // ─── Auto-update IPC ────────────────────────────────────────────────
 
-ipcMain.handle('clemmy:updater-status', () => getUpdaterStatus());
+ipcMain.handle('clemmy:updater-status', (evt: IpcMainInvokeEvent) => {
+  assertIpcSender(evt, ['dashboard']);
+  return getUpdaterStatus();
+});
 
-ipcMain.handle('clemmy:updater-check', async () => {
+ipcMain.handle('clemmy:updater-check', async (evt: IpcMainInvokeEvent) => {
+  assertIpcSender(evt, ['dashboard']);
   return checkForUpdatesNow();
 });
 
-ipcMain.handle('clemmy:updater-apply', () => applyUpdateFromUi());
+ipcMain.handle('clemmy:updater-apply', (evt: IpcMainInvokeEvent) => {
+  assertIpcSender(evt, ['dashboard']);
+  return applyUpdateFromUi();
+});
 
-ipcMain.handle('clemmy:updater-move-to-applications', () => {
+ipcMain.handle('clemmy:updater-move-to-applications', (evt: IpcMainInvokeEvent) => {
+  assertIpcSender(evt, ['dashboard']);
   const result = moveAppToApplicationsFolder();
   return { ...getUpdaterStatus(), moveResult: result };
 });
 
-ipcMain.handle('clemmy:updater-repair-ownership', () => repairUpdateOwnershipFromUi());
+ipcMain.handle('clemmy:updater-repair-ownership', (evt: IpcMainInvokeEvent) => {
+  assertIpcSender(evt, ['dashboard']);
+  return repairUpdateOwnershipFromUi();
+});
 
 function sendUpdaterEvent(status: ReturnType<typeof getUpdaterStatus>): void {
   for (const win of [mainWindow, splashWindow, setupWindow]) {
@@ -780,7 +902,9 @@ function sendUpdaterEvent(status: ReturnType<typeof getUpdaterStatus>): void {
 
 // ─── Setup wizard IPC handlers ─────────────────────────────────────
 
-ipcMain.handle('clemmy:setup-status', async () => ({
+ipcMain.handle('clemmy:setup-status', async (evt: IpcMainInvokeEvent) => {
+  assertIpcSender(evt, ['setup']);
+  return {
   needsSetup: needsSetup(),
   hasCompleted: hasCompletedSetup(),
   // Passive by design: do not even probe keytar here. On some macOS
@@ -788,14 +912,17 @@ ipcMain.handle('clemmy:setup-status', async () => ({
   // Access and steal input from the setup/dashboard window. Explicit
   // Keychain actions still use the live keychain path.
   hasKeychain: false,
-}));
+  };
+});
 
-ipcMain.handle('clemmy:credentials-list', async () => {
+ipcMain.handle('clemmy:credentials-list', async (evt: IpcMainInvokeEvent) => {
+  assertIpcSender(evt, ['setup']);
   const rows = await listCredentialRows();
   return { rows };
 });
 
-ipcMain.handle('clemmy:credentials-set', async (_evt: IpcMainInvokeEvent, payload: { name: string; value: string }) => {
+ipcMain.handle('clemmy:credentials-set', async (evt: IpcMainInvokeEvent, payload: { name: string; value: string }) => {
+  assertIpcSender(evt, ['setup']);
   const knownNames: CredentialName[] = [
     'openai_api_key', 'discord_bot_token', 'composio_api_key', 'recall_api_key',
     'codex_oauth_access_token', 'codex_oauth_refresh_token', 'webhook_secret',
@@ -806,7 +933,8 @@ ipcMain.handle('clemmy:credentials-set', async (_evt: IpcMainInvokeEvent, payloa
   return setCredential(payload.name as CredentialName, payload.value);
 });
 
-ipcMain.handle('clemmy:credentials-delete', async (_evt: IpcMainInvokeEvent, payload: { name: string }) => {
+ipcMain.handle('clemmy:credentials-delete', async (evt: IpcMainInvokeEvent, payload: { name: string }) => {
+  assertIpcSender(evt, ['setup']);
   const knownNames: CredentialName[] = [
     'openai_api_key', 'discord_bot_token', 'composio_api_key', 'recall_api_key',
     'codex_oauth_access_token', 'codex_oauth_refresh_token', 'webhook_secret',
@@ -818,18 +946,21 @@ ipcMain.handle('clemmy:credentials-delete', async (_evt: IpcMainInvokeEvent, pay
   return { ok: true };
 });
 
-ipcMain.handle('clemmy:credentials-reset', async () => {
+ipcMain.handle('clemmy:credentials-reset', async (evt: IpcMainInvokeEvent) => {
+  assertIpcSender(evt, ['setup']);
   return resetAllCredentials();
 });
 
-ipcMain.handle('clemmy:setup-save-workspace', async (_evt: IpcMainInvokeEvent, payload: { path: string }) => {
+ipcMain.handle('clemmy:setup-save-workspace', async (evt: IpcMainInvokeEvent, payload: { path: string }) => {
+  assertIpcSender(evt, ['setup']);
   const p = (payload?.path ?? '').trim();
   if (!p) throw new Error('path required');
   addWorkspaceDir(p);
   return { ok: true };
 });
 
-ipcMain.handle('clemmy:setup-pick-workspace-folder', async () => {
+ipcMain.handle('clemmy:setup-pick-workspace-folder', async (evt: IpcMainInvokeEvent) => {
+  assertIpcSender(evt, ['setup']);
   // Native folder picker so the wizard doesn't ask the user to type a
   // path. Resolves to { path } when the user picks a folder, or
   // { path: '' } when they cancel.
@@ -846,7 +977,8 @@ ipcMain.handle('clemmy:setup-pick-workspace-folder', async () => {
   return { path: result.filePaths[0] };
 });
 
-ipcMain.handle('clemmy:setup-codex-login', async () => {
+ipcMain.handle('clemmy:setup-codex-login', async (evt: IpcMainInvokeEvent) => {
+  assertIpcSender(evt, ['setup', 'dashboard']);
   // Run the OAuth dance from the Electron main process so the user
   // never sees a terminal. Tokens are persisted to BOTH the daemon's
   // local auth store and the codex CLI compatibility file. We do not
@@ -892,7 +1024,8 @@ ipcMain.handle('clemmy:setup-codex-login', async () => {
  * `setup-codex-login` looked broken because fresh tokens import
  * silently with no UI signal. This handler fixes that surface.
  */
-ipcMain.handle('clemmy:codex-reauth', async () => {
+ipcMain.handle('clemmy:codex-reauth', async (evt: IpcMainInvokeEvent) => {
+  assertIpcSender(evt, ['dashboard']);
   try {
     // `prompt: 'select_account'` forces auth.openai.com to render the
     // account picker even when the user already has a ChatGPT session
@@ -914,7 +1047,8 @@ ipcMain.handle('clemmy:codex-reauth', async () => {
   }
 });
 
-ipcMain.handle('clemmy:setup-discord-verify', async (_evt: IpcMainInvokeEvent, payload: { token: string }) => {
+ipcMain.handle('clemmy:setup-discord-verify', async (evt: IpcMainInvokeEvent, payload: { token: string }) => {
+  assertIpcSender(evt, ['setup']);
   const token = (payload?.token ?? '').trim();
   if (!token) return { ok: false as const, error: 'token required' };
   try {
@@ -940,28 +1074,35 @@ ipcMain.handle('clemmy:setup-discord-verify', async (_evt: IpcMainInvokeEvent, p
   }
 });
 
-ipcMain.handle('clemmy:setup-open-external', async (_evt: IpcMainInvokeEvent, payload: { url: string }) => {
+ipcMain.handle('clemmy:setup-open-external', async (evt: IpcMainInvokeEvent, payload: { url: string }) => {
+  assertIpcSender(evt, ['setup']);
   const url = (payload?.url ?? '').trim();
   if (!url) throw new Error('url required');
-  if (!/^https?:\/\//i.test(url)) throw new Error('only http(s) urls are allowed');
+  if (!isSafeExternalHttps(url)) throw new Error('URL is not on the Clementine setup allowlist');
   await shell.openExternal(url);
   return { ok: true };
 });
 
-ipcMain.handle('clemmy:setup-save-discord-config', async (_evt: IpcMainInvokeEvent, payload: { clientId?: string; ownerId?: string }) => {
+ipcMain.handle('clemmy:setup-save-discord-config', async (evt: IpcMainInvokeEvent, payload: { clientId?: string; ownerId?: string }) => {
+  assertIpcSender(evt, ['setup']);
   const env: Record<string, string> = {};
   if (payload?.clientId !== undefined) env.DISCORD_CLIENT_ID = payload.clientId.trim();
-  if (payload?.ownerId !== undefined) env.DISCORD_DM_ALLOWED_USERS = payload.ownerId.trim();
+  if (payload?.ownerId !== undefined) {
+    env.DISCORD_DM_ALLOWED_USERS = payload.ownerId.trim();
+    env.DISCORD_ALLOWED_USERS = payload.ownerId.trim();
+  }
   if (Object.keys(env).length > 0) setHomeEnv(env);
   return { ok: true };
 });
 
-ipcMain.handle('clemmy:setup-save-profile', async (_evt: IpcMainInvokeEvent, patch: ProfilePatch) => {
+ipcMain.handle('clemmy:setup-save-profile', async (evt: IpcMainInvokeEvent, patch: ProfilePatch) => {
+  assertIpcSender(evt, ['setup']);
   saveUserProfile(patch);
   return { ok: true };
 });
 
-ipcMain.handle('clemmy:setup-complete', async (_evt: IpcMainInvokeEvent, record: { configured: SetupConfiguredSummary }) => {
+ipcMain.handle('clemmy:setup-complete', async (evt: IpcMainInvokeEvent, record: { configured: SetupConfiguredSummary }) => {
+  assertIpcSender(evt, ['setup']);
   // Persist AUTH_MODE so the daemon reads the right runtime on boot.
   // Without this, a user who picked Codex OAuth still gets AUTH_MODE=
   // api_key (the config.ts default) and the runtime tries to use an
@@ -981,7 +1122,8 @@ ipcMain.handle('clemmy:setup-complete', async (_evt: IpcMainInvokeEvent, record:
   return { ok: true };
 });
 
-ipcMain.handle('clemmy:setup-skip', async () => {
+ipcMain.handle('clemmy:setup-skip', async (evt: IpcMainInvokeEvent) => {
+  assertIpcSender(evt, ['setup']);
   writeSetupComplete({
     configured: { auth: 'skipped', discord: false, composio: false, workspaceCount: 0, profileSet: false },
   });

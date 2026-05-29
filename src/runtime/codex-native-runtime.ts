@@ -11,7 +11,7 @@ import { getOrCreateConfiguredMcpServers } from './mcp-servers.js';
 import { classifyTool, decideToolApproval } from '../agents/tool-taxonomy.js';
 import { beginToolEvent, recordPendingApproval, recordToolEvent } from '../agents/tool-observability.js';
 import { recordUsage, type UsageEvent } from './usage-log.js';
-import { truncateToolText } from '../tools/shared.js';
+import { formatRecallableToolText } from './harness/tool-output-format.js';
 import type { RuntimeContextValue, ToolActivity } from '../types.js';
 import { codexDispatcher, detectUndiciTimeout, buildTransportTimeoutError } from './codex-dispatcher.js';
 
@@ -186,9 +186,9 @@ function isMcpToolName(name: string): boolean {
  * for SDK function-tool outputs.
  */
 function stringifyMcpResult(result: unknown): string {
-  if (typeof result === 'string') return truncateToolText(result);
+  if (typeof result === 'string') return result;
   if (Array.isArray(result)) {
-    return truncateToolText(result.map(stringifyMcpResult).join('\n'));
+    return result.map(stringifyMcpResult).join('\n');
   }
   if (result && typeof result === 'object') {
     const r = result as Record<string, unknown>;
@@ -201,10 +201,10 @@ function stringifyMcpResult(result: unknown): string {
           parts.push(JSON.stringify(item));
         }
       }
-      if (parts.length) return truncateToolText(parts.join('\n'));
+      if (parts.length) return parts.join('\n');
     }
     try {
-      return truncateToolText(JSON.stringify(result, null, 2));
+      return JSON.stringify(result, null, 2);
     } catch {
       return String(result);
     }
@@ -730,17 +730,12 @@ function extractResponseId(payload: Record<string, unknown>): string | undefined
   return undefined;
 }
 
-function truncateToolOutput(value: string, maxChars = 18_000): string {
-  if (value.length <= maxChars) return value;
-  return `${value.slice(0, maxChars)}\n...[truncated ${value.length - maxChars} chars]`;
-}
-
 function stringifyToolOutput(value: unknown): string {
-  if (typeof value === 'string') return truncateToolOutput(value);
+  if (typeof value === 'string') return value;
   try {
-    return truncateToolOutput(JSON.stringify(value, null, 2));
+    return JSON.stringify(value, null, 2);
   } catch {
-    return truncateToolOutput(String(value));
+    return String(value);
   }
 }
 
@@ -963,7 +958,13 @@ export class CodexNativeRuntime implements AgentRuntime {
 	      });
 	      await throwIfCancelled(callbacks);
 	      finishEvent('success');
-	      return { output: stringifyToolOutput(output) };
+	      return {
+          output: formatRecallableToolText(stringifyToolOutput(output), {
+            sessionId,
+            callId,
+            toolName: name,
+          }),
+        };
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       logger.warn({ err: error, tool: name }, 'Native Codex tool execution failed');
@@ -1036,10 +1037,17 @@ export class CodexNativeRuntime implements AgentRuntime {
     });
     try {
       await throwIfCancelled(callbacks);
+      const callId = toolCall.call_id ?? toolCall.id ?? randomUUID();
       const output = await this.invokeMcpToolByName(name, args);
       await throwIfCancelled(callbacks);
       finishEvent('success');
-      return { output };
+      return {
+        output: formatRecallableToolText(output, {
+          sessionId,
+          callId,
+          toolName: name,
+        }),
+      };
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       logger.warn({ err: error, tool: name }, 'MCP tool execution failed (Codex runtime)');
@@ -1129,9 +1137,14 @@ export class CodexNativeRuntime implements AgentRuntime {
         mcp: true,
       });
       try {
+        const callId = toolCall.call_id ?? toolCall.id ?? randomUUID();
         const out = await this.invokeMcpToolByName(name, args);
         finish('success');
-        return out;
+        return formatRecallableToolText(out, {
+          sessionId,
+          callId,
+          toolName: name,
+        });
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
         finish('error', msg);
@@ -1170,7 +1183,11 @@ export class CodexNativeRuntime implements AgentRuntime {
         } as any,
       });
       finish('success');
-      return stringifyToolOutput(output);
+      return formatRecallableToolText(stringifyToolOutput(output), {
+        sessionId,
+        callId,
+        toolName: name,
+      });
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       logger.warn({ err: error, tool: name }, 'Approved native Codex tool execution failed');

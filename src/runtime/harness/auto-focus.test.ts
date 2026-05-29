@@ -1,0 +1,193 @@
+/**
+ * Run: npx tsx --test src/runtime/harness/auto-focus.test.ts
+ */
+import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+
+const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-auto-focus-test-'));
+process.env.CLEMENTINE_HOME = TMP_HOME;
+mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
+
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+
+const { resetEventLog, createSession, appendEvent, closeEventLog } = await import('./eventlog.js');
+const { resetMemoryDb } = await import('../../memory/db.js');
+const { getActiveFocus, createFocus } = await import('../../memory/focus.js');
+const { maybeAutoFocusSession } = await import('./auto-focus.js');
+
+function resetAll(): void {
+  closeEventLog();
+  resetEventLog();
+  resetMemoryDb();
+}
+
+test.after(() => {
+  try {
+    closeEventLog();
+    rmSync(TMP_HOME, { recursive: true, force: true });
+  } catch {
+    /* best effort */
+  }
+});
+
+test('maybeAutoFocusSession does not pin one-off chat turns', () => {
+  resetAll();
+  const sess = createSession({ kind: 'chat', title: 'quick status' });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'system',
+    type: 'user_input_received',
+    data: { text: 'show me the last email' },
+  });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'Clem',
+    type: 'tool_called',
+    data: { tool: 'composio_execute_tool', arguments: '{"tool_slug":"OUTLOOK_LIST_EMAILS","arguments":"{}"}' },
+  });
+
+  assert.equal(maybeAutoFocusSession({ sessionId: sess.id }), null);
+  assert.equal(getActiveFocus(), null);
+});
+
+test('maybeAutoFocusSession pins repeated Google Sheet work to the concrete resource', () => {
+  resetAll();
+  const sess = createSession({ kind: 'chat', title: 'market leader sheet' });
+  const spreadsheetId = '1JTqfpx0MbNFg0iC-VG4D5aj7Jt0PNP5zgZURi1Cmxlc';
+  for (let turn = 1; turn <= 2; turn += 1) {
+    appendEvent({
+      sessionId: sess.id,
+      turn,
+      role: 'system',
+      type: 'user_input_received',
+      data: { text: turn === 1 ? 'update the market leader sheet' : 'continue the sheet work' },
+    });
+    appendEvent({
+      sessionId: sess.id,
+      turn,
+      role: 'Clem',
+      type: 'tool_called',
+      data: {
+        tool: 'composio_execute_tool',
+        arguments: JSON.stringify({
+          tool_slug: 'GOOGLESHEETS_UPDATE_VALUES',
+          arguments: JSON.stringify({ spreadsheet_id: spreadsheetId, range: 'A1:B2' }),
+        }),
+      },
+    });
+  }
+
+  const result = maybeAutoFocusSession({
+    sessionId: sess.id,
+    summaryHint: { summary: 'Updating the market leader sheet with enriched prospect rows.' },
+  });
+
+  assert.ok(result);
+  const active = getActiveFocus();
+  assert.equal(active?.resource_kind, 'sheet');
+  assert.equal(active?.resource_ref, `https://docs.google.com/spreadsheets/d/${spreadsheetId}`);
+  assert.equal(active?.related_session_id, sess.id);
+});
+
+test('maybeAutoFocusSession pins a thread focus for substantive multi-turn work without one resource', () => {
+  resetAll();
+  const sess = createSession({ kind: 'chat', title: 'draft outreach emails' });
+  for (let turn = 1; turn <= 2; turn += 1) {
+    appendEvent({
+      sessionId: sess.id,
+      turn,
+      role: 'system',
+      type: 'user_input_received',
+      data: { text: turn === 1 ? 'build the draft batch' : 'draft them please' },
+    });
+  }
+  for (let i = 0; i < 4; i += 1) {
+    appendEvent({
+      sessionId: sess.id,
+      turn: 2,
+      role: 'Clem',
+      type: 'tool_called',
+      data: {
+        tool: 'composio_execute_tool',
+        arguments: JSON.stringify({
+          tool_slug: 'OUTLOOK_CREATE_DRAFT',
+          arguments: JSON.stringify({ subject: `Draft ${i + 1}` }),
+        }),
+      },
+    });
+  }
+
+  const result = maybeAutoFocusSession({
+    sessionId: sess.id,
+    summaryHint: { summary: 'Drafting AI visibility outreach emails for the current prospect batch.' },
+  });
+
+  assert.ok(result);
+  const active = getActiveFocus();
+  assert.equal(active?.resource_kind, 'thread');
+  assert.equal(active?.resource_ref, `session:${sess.id}`);
+  assert.match(active?.title ?? '', /AI visibility outreach/);
+});
+
+test('maybeAutoFocusSession pins a thread focus for one-turn high-tool work', () => {
+  resetAll();
+  const sess = createSession({ kind: 'chat', title: 'research and draft a proposal' });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'system',
+    type: 'user_input_received',
+    data: { text: 'research this company and build the proposal' },
+  });
+  for (let i = 0; i < 8; i += 1) {
+    appendEvent({
+      sessionId: sess.id,
+      turn: 1,
+      role: 'Clem',
+      type: 'tool_called',
+      data: { tool: 'run_shell_command', arguments: JSON.stringify({ command: `step-${i}` }) },
+    });
+  }
+
+  const result = maybeAutoFocusSession({
+    sessionId: sess.id,
+    summaryHint: { summary: 'Researching the company and building a proposal artifact.' },
+  });
+
+  assert.ok(result);
+  assert.equal(getActiveFocus()?.resource_ref, `session:${sess.id}`);
+});
+
+test('maybeAutoFocusSession leaves an existing active focus alone', () => {
+  resetAll();
+  const existing = createFocus({
+    resourceRef: 'session:already-active',
+    title: 'Existing focus',
+    summary: 'Keep this active.',
+    resourceKind: 'thread',
+  });
+  const sess = createSession({ kind: 'chat', title: 'new work' });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'system',
+    type: 'user_input_received',
+    data: { text: 'do a substantial thing' },
+  });
+  for (let i = 0; i < 5; i += 1) {
+    appendEvent({
+      sessionId: sess.id,
+      turn: 1,
+      role: 'Clem',
+      type: 'tool_called',
+      data: { tool: 'run_shell_command', arguments: JSON.stringify({ command: `echo ${i}` }) },
+    });
+  }
+
+  assert.equal(maybeAutoFocusSession({ sessionId: sess.id }), null);
+  assert.equal(getActiveFocus()?.id, existing.id);
+});

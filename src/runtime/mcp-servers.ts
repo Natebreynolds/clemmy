@@ -4,7 +4,23 @@ import { MCPServerSSE, MCPServerStdio, MCPServerStreamableHttp, type MCPServer }
 import { BASE_DIR, LOCAL_MCP_ENABLED, PKG_DIR } from '../config.js';
 import { discoverMcpServers } from './mcp-config.js';
 import { createMcpNamespaceShim } from './mcp-namespace-shim.js';
+import { filterMcpToolsForScope } from './mcp-tool-filter.js';
+import type { McpToolScope } from './mcp-tool-scope.js';
 import type { ManagedMcpServer } from '../types.js';
+
+function positiveIntEnv(key: string, fallback: number): number {
+  const raw = process.env[key];
+  if (!raw) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+// The Agents SDK defaults the MCP client initialize/listTools timeout to
+// 5 seconds. That is too low for cold `npx` servers and packaged Electron
+// startup on slower Macs, so Clementine opts into a bounded but realistic
+// handshake window while the namespace shim still caps first-turn discovery.
+const MCP_CLIENT_SESSION_TIMEOUT_SECONDS = positiveIntEnv('MCP_CLIENT_SESSION_TIMEOUT_SECONDS', 30);
+const MCP_REQUEST_TIMEOUT_MS = positiveIntEnv('MCP_REQUEST_TIMEOUT_MS', 10 * 60 * 1000);
 
 function mergedEnv(extra: Record<string, string> = {}): Record<string, string> {
   const env: Record<string, string> = {};
@@ -82,6 +98,8 @@ function createLocalServer(): MCPServerStdio | null {
       name: 'clementine-local',
       command: localNodeCommand(),
       args: [distEntry],
+      clientSessionTimeoutSeconds: MCP_CLIENT_SESSION_TIMEOUT_SECONDS,
+      timeout: MCP_REQUEST_TIMEOUT_MS,
       env: mergedEnv({
         CLEMENTINE_HOME: BASE_DIR,
       }),
@@ -93,6 +111,8 @@ function createLocalServer(): MCPServerStdio | null {
     name: 'clementine-local',
     command: 'npx',
     args: ['tsx', srcEntry],
+    clientSessionTimeoutSeconds: MCP_CLIENT_SESSION_TIMEOUT_SECONDS,
+    timeout: MCP_REQUEST_TIMEOUT_MS,
     env: mergedEnv({
       CLEMENTINE_HOME: BASE_DIR,
     }),
@@ -108,6 +128,8 @@ function createExternalServer(server: ManagedMcpServer): MCPServer | null {
       name: server.name,
       command: server.command,
       args: server.args ?? [],
+      clientSessionTimeoutSeconds: MCP_CLIENT_SESSION_TIMEOUT_SECONDS,
+      timeout: MCP_REQUEST_TIMEOUT_MS,
       env: mergedEnv(server.env),
       cwd: BASE_DIR,
     });
@@ -117,6 +139,8 @@ function createExternalServer(server: ManagedMcpServer): MCPServer | null {
     return new MCPServerStreamableHttp({
       name: server.name,
       url: server.url,
+      clientSessionTimeoutSeconds: MCP_CLIENT_SESSION_TIMEOUT_SECONDS,
+      timeout: MCP_REQUEST_TIMEOUT_MS,
       requestInit: server.headers ? { headers: server.headers } : undefined,
     });
   }
@@ -125,6 +149,8 @@ function createExternalServer(server: ManagedMcpServer): MCPServer | null {
     return new MCPServerSSE({
       name: server.name,
       url: server.url,
+      clientSessionTimeoutSeconds: MCP_CLIENT_SESSION_TIMEOUT_SECONDS,
+      timeout: MCP_REQUEST_TIMEOUT_MS,
       eventSourceInit: server.headers ? { fetch: (input: RequestInfo | URL, init?: RequestInit) => fetch(input, { ...init, headers: server.headers }) } : undefined,
     });
   }
@@ -144,7 +170,20 @@ function createExternalServer(server: ManagedMcpServer): MCPServer | null {
  * AND through registry.ts would create dup tools the model has to
  * disambiguate between (memory_remember vs clementine-local__memory_remember).
  */
-function buildRawMcpServers(options: { excludeLocal?: boolean } = {}): MCPServer[] {
+function normalizeServerSlug(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, '');
+}
+
+function serverMatchesAllowedSlugs(server: ManagedMcpServer, allowedServerSlugs?: string[]): boolean {
+  if (!allowedServerSlugs || allowedServerSlugs.length === 0) return true;
+  const name = normalizeServerSlug(server.name);
+  return allowedServerSlugs.some((slug) => {
+    const normalized = normalizeServerSlug(slug);
+    return normalized.length > 0 && (name === normalized || name.includes(normalized) || normalized.includes(name));
+  });
+}
+
+function buildRawMcpServers(options: { excludeLocal?: boolean; allowedServerSlugs?: string[] } = {}): MCPServer[] {
   const servers: MCPServer[] = [];
   if (!options.excludeLocal) {
     const local = createLocalServer();
@@ -152,6 +191,7 @@ function buildRawMcpServers(options: { excludeLocal?: boolean } = {}): MCPServer
   }
 
   for (const config of discoverMcpServers()) {
+    if (!serverMatchesAllowedSlugs(config, options.allowedServerSlugs)) continue;
     const server = createExternalServer(config);
     if (server) servers.push(server);
   }
@@ -188,6 +228,22 @@ export function createConfiguredMcpServers(): MCPServer {
  */
 let cachedShim: MCPServer | null = null;
 let cachedExternalShim: MCPServer | null = null;
+let cachedScopedExternalBaseShims: Map<string, MCPServer> = new Map();
+let cachedScopedExternalShims: Map<string, MCPServer> = new Map();
+
+const emptyExternalShim: MCPServer = {
+  cacheToolsList: false,
+  name: 'clementine-external-empty',
+  async connect() {},
+  async close() {},
+  async listTools() {
+    return [];
+  },
+  async callTool(toolName) {
+    throw new Error(`external MCP tool is not available in this turn: ${toolName}`);
+  },
+  async invalidateToolsCache() {},
+};
 
 export function getOrCreateConfiguredMcpServers(): MCPServer {
   if (!cachedShim) {
@@ -206,13 +262,71 @@ export function getOrCreateConfiguredMcpServers(): MCPServer {
  * Same daemon-lifetime cache pattern — stdio children spawn once and
  * are reused across every Orchestrator/Executor/Researcher build.
  */
-export function getOrCreateExternalMcpServers(): MCPServer {
-  if (!cachedExternalShim) {
-    cachedExternalShim = createMcpNamespaceShim({
-      servers: buildRawMcpServers({ excludeLocal: true }),
-    });
+function scopeCacheKey(scope: McpToolScope): string {
+  return JSON.stringify({
+    allowAll: !!scope.allowAll,
+    allowedServerSlugs: [...(scope.allowedServerSlugs ?? [])].sort(),
+    toolPatterns: [...(scope.toolPatterns ?? [])].sort(),
+    priorityKeywords: [...(scope.priorityKeywords ?? [])].sort(),
+    maxTools: scope.maxTools ?? null,
+  });
+}
+
+function createScopedExternalShim(base: MCPServer, scope: McpToolScope): MCPServer {
+  return {
+    cacheToolsList: base.cacheToolsList,
+    toolFilter: base.toolFilter,
+    get name() {
+      return `${base.name}:scoped`;
+    },
+    async connect() {
+      await base.connect?.();
+    },
+    async close() {
+      // Shared daemon-lifetime base shim owns the underlying stdio child
+      // processes. Per-scope wrappers are cheap views and must not close it.
+    },
+    async listTools() {
+      const tools = await base.listTools();
+      return filterMcpToolsForScope(tools, scope);
+    },
+    async callTool(toolName, args) {
+      return base.callTool(toolName, args);
+    },
+    async invalidateToolsCache() {
+      await base.invalidateToolsCache?.();
+    },
+  };
+}
+
+export function getOrCreateExternalMcpServers(scope?: McpToolScope): MCPServer {
+  if (!scope || scope.allowAll) {
+    if (!cachedExternalShim) {
+      cachedExternalShim = createMcpNamespaceShim({
+        servers: buildRawMcpServers({ excludeLocal: true }),
+      });
+    }
+    return cachedExternalShim;
   }
-  return cachedExternalShim;
+
+  if ((scope.maxTools ?? 0) === 0 || (scope.allowedServerSlugs ?? []).length === 0) {
+    return emptyExternalShim;
+  }
+
+  const key = scopeCacheKey(scope);
+  const cached = cachedScopedExternalShims.get(key);
+  if (cached) return cached;
+
+  const base = createMcpNamespaceShim({
+    servers: buildRawMcpServers({
+      excludeLocal: true,
+      allowedServerSlugs: scope.allowedServerSlugs,
+    }),
+  });
+  const scoped = createScopedExternalShim(base, scope);
+  cachedScopedExternalBaseShims.set(key, base);
+  cachedScopedExternalShims.set(key, scoped);
+  return scoped;
 }
 
 /**
@@ -226,9 +340,15 @@ export function getOrCreateExternalMcpServers(): MCPServer {
  * the NEXT chat request, without a daemon restart.
  */
 export async function invalidateConfiguredMcpServers(): Promise<void> {
-  const targets = [cachedShim, cachedExternalShim].filter((s): s is MCPServer => s !== null);
+  const targets = [
+    cachedShim,
+    cachedExternalShim,
+    ...cachedScopedExternalBaseShims.values(),
+  ].filter((s): s is MCPServer => s !== null);
   cachedShim = null;
   cachedExternalShim = null;
+  cachedScopedExternalBaseShims = new Map();
+  cachedScopedExternalShims = new Map();
   await Promise.all(
     targets.map((s) => (typeof s.close === 'function' ? s.close().catch(() => undefined) : undefined)),
   );

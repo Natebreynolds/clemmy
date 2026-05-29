@@ -51,7 +51,8 @@ import type { StreamEvent } from '@openai/agents-core/types';
 import { MODELS } from '../../config.js';
 import { loadFreshCodexAccessToken, extractAccountIdFromJwt } from './codex-client.js';
 import { BoundaryError } from '../boundary-error.js';
-import { codexDispatcher, detectUndiciTimeout, buildTransportTimeoutError } from '../codex-dispatcher.js';
+import { codexDispatcher, detectCodexTransportFailure, buildTransportTimeoutError } from '../codex-dispatcher.js';
+import { estimateInputTokens } from './token-estimator.js';
 import pino from 'pino';
 
 const logger = pino({ name: 'clementine.codex-model' });
@@ -60,6 +61,8 @@ const CODEX_URL = 'https://chatgpt.com/backend-api/codex/responses';
 const CODEX_USER_AGENT = 'Codex/0.118.0';
 const JWT_CLAIM_PATH = 'https://api.openai.com/auth';
 const CODEX_TRANSPARENT_MAX_RETRIES = 3;
+const MIN_NATIVE_COMPACTION_THRESHOLD = 1000;
+const DEFAULT_NATIVE_COMPACTION_THRESHOLD = 8192;
 
 // ----------------------------------------------------------------------
 // Public API
@@ -229,8 +232,94 @@ function sizeRequestComponents(body: CodexRequestBody): RequestBodyBreakdown {
   };
 }
 
+function countSerializedInputRisk(input: unknown[]): {
+  functionCallCount: number;
+  functionCallOutputCount: number;
+  compactionInputItemCount: number;
+  orphanFunctionCallOutputs: number;
+  unmatchedFunctionCalls: number;
+} {
+  const calls = new Set<string>();
+  const outputs = new Set<string>();
+  let compactionInputItemCount = 0;
+
+  for (const item of input) {
+    if (!item || typeof item !== 'object') continue;
+    const row = item as { type?: unknown; call_id?: unknown };
+    if (row.type === 'compaction') compactionInputItemCount += 1;
+    if (row.type === 'function_call' && typeof row.call_id === 'string') calls.add(row.call_id);
+    if (row.type === 'function_call_output' && typeof row.call_id === 'string') outputs.add(row.call_id);
+  }
+
+  let orphanFunctionCallOutputs = 0;
+  for (const callId of outputs) {
+    if (!calls.has(callId)) orphanFunctionCallOutputs += 1;
+  }
+  let unmatchedFunctionCalls = 0;
+  for (const callId of calls) {
+    if (!outputs.has(callId)) unmatchedFunctionCalls += 1;
+  }
+
+  return {
+    functionCallCount: calls.size,
+    functionCallOutputCount: outputs.size,
+    compactionInputItemCount,
+    orphanFunctionCallOutputs,
+    unmatchedFunctionCalls,
+  };
+}
+
+function logNativeCompactionRequestTelemetry(request: ModelRequest, body: CodexRequestBody): void {
+  if (!isNativeCodexCompactionEnabled()) return;
+  const rawInputItemCount = typeof request.input === 'string' ? 1 : request.input.length;
+  const approximateRawInputTokens = typeof request.input === 'string'
+    ? Math.ceil(request.input.length / 4)
+    : estimateInputTokens(request.input);
+  const serializedInput = Array.isArray(body.input) ? body.input : [];
+  const serializedRisk = countSerializedInputRisk(serializedInput);
+  logger.info(
+    {
+      modelId: body.model,
+      contextManagementSent: Array.isArray(body.context_management) && body.context_management.length > 0,
+      contextManagement: body.context_management ?? [],
+      rawInputItemCount,
+      serializedInputItemCount: serializedInput.length,
+      approximateRawInputTokens,
+      bodyBreakdown: sizeRequestComponents(body),
+      ...serializedRisk,
+    },
+    'Codex native compaction request telemetry',
+  );
+}
+
+export function isNativeCodexCompactionEnabled(): boolean {
+  const value = (process.env.CLEMMY_CODEX_NATIVE_COMPACTION ?? '').trim().toLowerCase();
+  return value === '1' || value === 'true' || value === 'on';
+}
+
+function nativeCodexCompactionThreshold(): number {
+  const raw = process.env.CLEMMY_CODEX_NATIVE_COMPACTION_THRESHOLD;
+  if (raw != null && raw.trim() !== '') {
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return Math.max(MIN_NATIVE_COMPACTION_THRESHOLD, Math.floor(parsed));
+    }
+  }
+  return DEFAULT_NATIVE_COMPACTION_THRESHOLD;
+}
+
+function isRetryUnsafeCodexOutputItem(item: CodexOutputItem | undefined): boolean {
+  if (!item) return false;
+  if (item.type === 'compaction' && isNativeCodexCompactionEnabled()) {
+    return false;
+  }
+  return true;
+}
+
 function isRealContentCodexEvent(evt: AnyCodexEvent): boolean {
-  return evt.type === 'response.output_text.delta' || evt.type === 'response.output_item.done';
+  if (evt.type === 'response.output_text.delta') return true;
+  if (evt.type === 'response.output_item.done') return isRetryUnsafeCodexOutputItem(evt.item);
+  return false;
 }
 
 function isTransparentCodexRetryError(err: unknown): err is BoundaryError {
@@ -239,23 +328,40 @@ function isTransparentCodexRetryError(err: unknown): err is BoundaryError {
     && BoundaryError.isTransient(err);
 }
 
+/**
+ * A Codex 429 (rate limit) is safe to retry transparently: it's thrown
+ * at the non-OK response stage, BEFORE any SSE content, so no tokens
+ * have been yielded and a retry can't duplicate output. Without this, a
+ * transient rate limit (e.g. a burst of concurrent workflow runs) hard-
+ * fails the run and fires a "workflow failed" notice — which is how
+ * outreach runs were silently/noisily failing on the $100 plan during a
+ * concurrency spike. Sustained limits still fail after the retry budget,
+ * so genuine exhaustion is still reported.
+ */
+export function isRetryableCodexRateLimit(err: unknown): boolean {
+  return err instanceof CodexModelError && err.status === 429;
+}
+
 function shouldRetryTransparentCodexFailure(
   err: unknown,
   yieldedRealContent: boolean,
   attempt: number,
 ): boolean {
-  return isTransparentCodexRetryError(err)
+  return (isTransparentCodexRetryError(err) || isRetryableCodexRateLimit(err))
     && !yieldedRealContent
     && attempt < CODEX_TRANSPARENT_MAX_RETRIES;
 }
 
-function transparentCodexRetryDelayMs(attempt: number): number {
+function transparentCodexRetryDelayMs(attempt: number, isRateLimit = false): number {
   const override = process.env.CLEMMY_CODEX_TRANSPARENT_RETRY_DELAY_MS;
   if ((process.env.NODE_ENV === 'test' || process.env.CLEMMY_DEV_OVERRIDES === '1') && override != null) {
     const parsed = Number(override);
     if (Number.isFinite(parsed) && parsed >= 0) return parsed;
   }
-  return 750 * Math.pow(2, attempt);
+  // Rate limits need real seconds to clear, not sub-second jitter:
+  // 2s, 4s, 8s vs the transport-failure 750ms, 1.5s, 3s.
+  const base = isRateLimit ? 2000 : 750;
+  return base * Math.pow(2, attempt);
 }
 
 async function waitBeforeTransparentCodexRetry(
@@ -263,7 +369,8 @@ async function waitBeforeTransparentCodexRetry(
   attempt: number,
   path: 'getResponse' | 'getStreamedResponse',
 ): Promise<void> {
-  const backoffMs = transparentCodexRetryDelayMs(attempt);
+  const rateLimited = isRetryableCodexRateLimit(err);
+  const backoffMs = transparentCodexRetryDelayMs(attempt, rateLimited);
   const boundary = err instanceof BoundaryError ? err : null;
   logger.warn(
     {
@@ -272,7 +379,8 @@ async function waitBeforeTransparentCodexRetry(
       nextAttempt: attempt + 2,
       maxRetries: CODEX_TRANSPARENT_MAX_RETRIES,
       backoffMs,
-      kind: boundary?.kind ?? null,
+      rateLimited,
+      kind: boundary?.kind ?? (rateLimited ? 'codex.rate_limited' : null),
       context: boundary?.context ?? {},
     },
     'Codex model call failed before real content; retrying transparently',
@@ -400,8 +508,10 @@ export class CodexResponsesModel implements Model {
             continue;
           }
           if (evt.type === 'response.output_item.done' && evt.item) {
-            yield* flushBuffer();
-            yieldedRealContent = true;
+            if (isRetryUnsafeCodexOutputItem(evt.item)) {
+              yield* flushBuffer();
+              yieldedRealContent = true;
+            }
             seenOutputItems.push(evt.item);
             continue;
           }
@@ -581,6 +691,7 @@ export class CodexResponsesModel implements Model {
 
     const body = buildCodexRequestBody(this.modelId, request);
     const bodyJson = JSON.stringify(body);
+    logNativeCompactionRequestTelemetry(request, body);
     if (diag) {
       diag.startTs = Date.now();
       diag.requestBytes = Buffer.byteLength(bodyJson, 'utf8');
@@ -602,7 +713,7 @@ export class CodexResponsesModel implements Model {
         dispatcher: codexDispatcher,
       } as RequestInit & { dispatcher?: unknown });
     } catch (err) {
-      const undiciCode = detectUndiciTimeout(err);
+      const undiciCode = detectCodexTransportFailure(err);
       if (undiciCode) {
         throw buildTransportTimeoutError(undiciCode, {
           modelId: this.modelId,
@@ -679,7 +790,7 @@ export class CodexResponsesModel implements Model {
       // for 30s after headers arrived). Same routing as header-timeout
       // above: throw a BoundaryError(kind='codex.transport_timeout')
       // so loop.ts's F4 ask-user routing converts it to Retry/Switch/Stop.
-      const undiciCode = detectUndiciTimeout(err);
+      const undiciCode = detectCodexTransportFailure(err);
       if (undiciCode) {
         throw buildTransportTimeoutError(undiciCode, {
           modelId: this.modelId,
@@ -736,6 +847,7 @@ interface CodexRequestBody {
   max_output_tokens?: number;
   truncation?: 'auto' | 'disabled';
   reasoning?: { effort?: string; summary?: string };
+  context_management?: Array<Record<string, unknown>>;
 }
 
 // Exported so contract tests can assert the wire shape without
@@ -774,6 +886,10 @@ export function buildCodexRequestBody(modelId: string, request: ModelRequest): C
       summary: request.modelSettings.reasoning.summary ?? 'auto',
     };
   }
+  const contextManagement = buildNativeCodexContextManagement(request.modelSettings?.contextManagement);
+  if (contextManagement) {
+    body.context_management = contextManagement;
+  }
 
   const responseFormat = buildResponseFormat(request.outputType, request.modelSettings?.text);
   if (responseFormat) {
@@ -781,6 +897,34 @@ export function buildCodexRequestBody(modelId: string, request: ModelRequest): C
   }
 
   return body;
+}
+
+function buildNativeCodexContextManagement(
+  contextManagement: ModelRequest['modelSettings']['contextManagement'] | undefined,
+): Array<Record<string, unknown>> | undefined {
+  if (!isNativeCodexCompactionEnabled()) return undefined;
+  const threshold = nativeCodexCompactionThreshold();
+  const source = contextManagement && contextManagement.length > 0
+    ? contextManagement
+    : [{ type: 'compaction', compact_threshold: threshold }];
+  return source.map((entry) => {
+    const out: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(entry)) {
+      if (value === undefined) continue;
+      if (key === 'compactThreshold') {
+        out.compact_threshold = value;
+      } else {
+        out[key] = value;
+      }
+    }
+    if (out.type === 'compaction') {
+      const compactThreshold = Number(out.compact_threshold);
+      out.compact_threshold = Number.isFinite(compactThreshold) && compactThreshold > 0
+        ? Math.max(MIN_NATIVE_COMPACTION_THRESHOLD, Math.floor(compactThreshold))
+        : threshold;
+    }
+    return out;
+  });
 }
 
 function normalizeToolChoice(
@@ -887,6 +1031,23 @@ function serializeInputItem(item: AgentInputItem): unknown {
       type: 'reasoning',
       summary: reasoningContent?.map((c) => ({ type: 'summary_text', text: c.text })) ?? [],
       encrypted_content: providerData?.encryptedContent,
+    };
+  }
+  if (anyItem.type === 'compaction') {
+    if (!isNativeCodexCompactionEnabled()) return undefined;
+    const encryptedContent = typeof anyItem.encrypted_content === 'string'
+      ? anyItem.encrypted_content
+      : typeof anyItem.encryptedContent === 'string'
+        ? anyItem.encryptedContent
+        : undefined;
+    if (!encryptedContent) {
+      throw new CodexModelError('Compaction item missing encrypted_content.');
+    }
+    return {
+      type: 'compaction',
+      id: anyItem.id,
+      encrypted_content: encryptedContent,
+      created_by: anyItem.created_by,
     };
   }
   // Anything else (computer calls, hosted tools, etc.) we don't
@@ -1096,6 +1257,31 @@ function convertCodexItemToSdkOutputItem(item: CodexOutputItem): AgentOutputItem
       type: 'reasoning',
       content: (summary ?? []).map((s) => ({ type: 'summary_text', text: s.text })),
       providerData: { ...providerData, encryptedContent: encrypted_content },
+    } as unknown as AgentOutputItem;
+  }
+  if (item.type === 'compaction') {
+    const { id, type, encrypted_content, created_by, ...providerData } = item;
+    if (!isNativeCodexCompactionEnabled()) {
+      return { id, type: 'unknown', providerData: item } as unknown as AgentOutputItem;
+    }
+    if (typeof encrypted_content !== 'string' || encrypted_content.length === 0) {
+      throw new CodexModelError('Compaction item missing encrypted_content.');
+    }
+    logger.info(
+      {
+        id: id ?? null,
+        createdBy: created_by ?? null,
+        encryptedContentBytes: Buffer.byteLength(encrypted_content, 'utf8'),
+        providerKeys: Object.keys(providerData),
+      },
+      'Codex native compaction item received',
+    );
+    return {
+      id,
+      type: 'compaction',
+      encrypted_content,
+      created_by,
+      providerData,
     } as unknown as AgentOutputItem;
   }
   // Unknown item — keep as-is so the SDK can decide what to do.

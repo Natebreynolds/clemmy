@@ -99,7 +99,7 @@ export const SECRET_DESCRIPTORS: readonly SecretDescriptor[] = [
   },
   {
     name: 'webhook_secret',
-    description: 'Dashboard / webhook auth secret. Used as ?token=... on dashboard URLs.',
+    description: 'Dashboard / webhook auth secret. Used for local session bootstrap and Bearer auth.',
     envVarName: 'WEBHOOK_SECRET',
     required: true,
     setupHint: 'Auto-generated on setup. Treat as a session token.',

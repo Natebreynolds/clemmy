@@ -237,6 +237,25 @@ test('shim: connect() tolerates one server failing', async () => {
   assert.equal(b._connected, 1);
 });
 
+test('shim: connect() returns quickly even when a server connect is slow', async () => {
+  const slow: MCPServer = {
+    name: 'slow',
+    cacheToolsList: false,
+    toolFilter: undefined,
+    async connect() {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    },
+    async close() {},
+    async listTools() { return []; },
+    async callTool() { return { content: [] } as any; },
+    async invalidateToolsCache() {},
+  };
+  const shim = createMcpNamespaceShim({ servers: [slow], cacheToolsList: false });
+  const start = Date.now();
+  await shim.connect!();
+  assert.ok(Date.now() - start < 100, 'non-blocking eager connect should not wait for slow MCP server');
+});
+
 test('shim: close() reaches every server and swallows close errors', async () => {
   const a = makeFakeServer({ name: 'alpha', tools: [], failClose: true });
   const b = makeFakeServer({ name: 'beta', tools: [] });

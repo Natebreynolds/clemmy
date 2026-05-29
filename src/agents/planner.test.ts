@@ -35,6 +35,7 @@ test('PlanSchema: accepts a minimal valid plan', () => {
     estimatedComplexity: 'moderate',
     recommendsTrackedExecution: false,
     needsUserInput: [],
+    appliedInstructions: [],
   });
   assert.equal(plan.objective.startsWith('Add a refresh'), true);
   assert.equal(plan.steps[0].n, 1);

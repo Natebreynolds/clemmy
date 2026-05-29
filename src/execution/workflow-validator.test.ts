@@ -178,6 +178,51 @@ test('resolved {{steps.X.output}} reference → ok', () => {
   );
 });
 
+test('missing usesSkill reference → warning', () => {
+  const result = validateWorkflowDefinition({
+    name: 'wf',
+    description: 'Workflow with a skill binding',
+    steps: [
+      { id: 'build', prompt: 'Build the proposal.', usesSkill: 'proposal-builder' },
+    ],
+  }, { installedSkillNames: new Set(['other-skill']) });
+
+  assert.ok(
+    result.warnings.some((warning) => warning.includes('missing skill "proposal-builder"')),
+    `expected missing-skill warning, got: ${JSON.stringify(result.warnings)}`,
+  );
+});
+
+test('multi-item step without forEach → parallelism warning', () => {
+  const result = validateWorkflowDefinition({
+    name: 'wf',
+    description: 'Workflow that should fan out',
+    steps: [
+      { id: 'enrich', prompt: 'For each of the 20 sites, scrape and audit the SEO signals.' },
+    ],
+  });
+
+  assert.ok(
+    result.warnings.some((warning) => warning.includes('has no forEach')),
+    `expected forEach warning, got: ${JSON.stringify(result.warnings)}`,
+  );
+});
+
+test('deterministic config without runner → warning', () => {
+  const result = validateWorkflowDefinition({
+    name: 'wf',
+    description: 'Workflow with bad deterministic config',
+    steps: [
+      { id: 'script', prompt: 'Run the helper.', deterministic: {} },
+    ],
+  });
+
+  assert.ok(
+    result.warnings.some((warning) => warning.includes('deterministic config but no runner')),
+    `expected deterministic warning, got: ${JSON.stringify(result.warnings)}`,
+  );
+});
+
 test('tool slug catalog check — unknown slug → warning', () => {
   const knownToolNames = new Set(['notify_user', 'run_shell_command', 'memory_remember']);
   const result = validateWorkflowDefinition({
@@ -228,4 +273,109 @@ test('REGRESSION: daily-prospect-outreach surface_for_approval prompt is rejecte
     result.errors.some((e) => e.toLowerCase().includes('hand-off') || e.includes('future turn')),
     `expected hand-off error from "future turn handles the resume", got: ${JSON.stringify(result.errors)}`,
   );
+});
+
+// ── Autonomous-by-default model: declarative approval gate ────────────
+
+test('in-step request_approval (no gate) → warns to use requiresApproval', () => {
+  const result = validateWorkflowDefinition({
+    name: 'legacy-approval',
+    steps: [
+      { id: 'send', prompt: 'Draft the emails then call request_approval. After approval, call OUTLOOK_SEND for each row.' },
+    ],
+  });
+  assert.ok(
+    result.warnings.some((w) => /requiresApproval/i.test(w) && /declarative gate/i.test(w)),
+    `expected a nudge toward requiresApproval; got: ${JSON.stringify(result.warnings)}`,
+  );
+});
+
+test('declarative gate (requiresApproval) suppresses the request_approval error/nudge', () => {
+  const result = validateWorkflowDefinition({
+    name: 'gated',
+    steps: [
+      {
+        id: 'send',
+        prompt: 'This step is gated by the runner; you do not request_approval yourself. Send the approved emails.',
+        requiresApproval: true,
+      },
+    ],
+  });
+  assert.equal(result.ok, true, `expected ok; errors: ${JSON.stringify(result.errors)}`);
+  assert.ok(!result.warnings.some((w) => /requiresApproval/i.test(w)), 'gated step must not be nudged');
+});
+
+test('snake_case requires_approval is honored too', () => {
+  const result = validateWorkflowDefinition({
+    name: 'gated-snake',
+    steps: [
+      { id: 'send', prompt: 'Gated send; runner owns request_approval.', requires_approval: true },
+    ],
+  });
+  assert.deepEqual(result.errors, []);
+});
+
+// ── Typed-contract template-token checks (P1) ─────────────────────────
+
+test('unrecognized bare token {{url}} is flagged (the revill-audit bug)', () => {
+  const result = validateWorkflowDefinition({
+    name: 'typo',
+    steps: [{ id: 'normalize', prompt: 'Normalize the prospect URL {{url}}.' }],
+  });
+  assert.ok(
+    result.errors.some((e) => /\{\{url\}\}/.test(e) && /input\.url/.test(e)),
+    `expected a malformed-token error suggesting {{input.url}}; got ${JSON.stringify(result.errors)}`,
+  );
+});
+
+test('a known token {{input.url}} with a common key validates clean', () => {
+  const result = validateWorkflowDefinition({
+    name: 'ok',
+    steps: [{ id: 'normalize', prompt: 'Normalize the prospect URL {{input.url}}.' }],
+  });
+  assert.ok(!result.errors.some((e) => /template token|input\./.test(e)), JSON.stringify(result.errors));
+});
+
+test('{{input.X}} with no declared/common binding is flagged', () => {
+  const result = validateWorkflowDefinition({
+    name: 'unbound',
+    steps: [{ id: 's', prompt: 'Use {{input.spreadsheetId}} to write rows.' }],
+  });
+  assert.ok(result.errors.some((e) => /spreadsheetId/.test(e) && /declare/i.test(e)), JSON.stringify(result.errors));
+});
+
+test('{{input.X}} declared in workflow inputs validates clean', () => {
+  const result = validateWorkflowDefinition({
+    name: 'declared',
+    inputs: { spreadsheetId: { type: 'string' } },
+    steps: [{ id: 's', prompt: 'Use {{input.spreadsheetId}}.' }],
+  });
+  assert.ok(!result.errors.some((e) => /spreadsheetId/.test(e)), JSON.stringify(result.errors));
+});
+
+test('{{input.X}} declared on the STEP validates clean', () => {
+  const result = validateWorkflowDefinition({
+    name: 'step-declared',
+    steps: [{ id: 's', prompt: 'Use {{input.sheet}}.', inputs: { sheet: { type: 'string' } } }],
+  });
+  assert.ok(!result.errors.some((e) => /sheet/.test(e)), JSON.stringify(result.errors));
+});
+
+test('{{steps.X.output}} and {{item}} tokens are not flagged as malformed', () => {
+  const result = validateWorkflowDefinition({
+    name: 'tokens',
+    steps: [
+      { id: 'a', prompt: 'produce data' },
+      { id: 'b', prompt: 'consume {{steps.a.output}} and {{item}} and {{item.id}} and {{date}}', dependsOn: ['a'] },
+    ],
+  });
+  assert.ok(!result.errors.some((e) => /unrecognized template token/.test(e)), JSON.stringify(result.errors));
+});
+
+test('literal {{...}} ellipsis in prompt documentation is NOT flagged (no false positive)', () => {
+  const result = validateWorkflowDefinition({
+    name: 'doc',
+    steps: [{ id: 'validate', prompt: 'Reject placeholder tokens like {{...}}, TODO, or [insert].' }],
+  });
+  assert.ok(!result.errors.some((e) => /unrecognized template token/.test(e)), JSON.stringify(result.errors));
 });

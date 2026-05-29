@@ -300,6 +300,118 @@ export function loadEmbeddingsForChunks(chunkIds: number[]): Map<number, Float32
   return out;
 }
 
+/**
+ * Find consolidated_facts that don't yet have an embedding — or whose
+ * stored embedding is stale because the fact's content changed — and
+ * embed them. Mirrors `embedMissingChunks` exactly (same batching,
+ * circuit breaker, idempotency) but over the `fact_embeddings` table.
+ *
+ * Staleness check: `fact_embeddings.content_hash != consolidated_facts.
+ * content_hash`. updateFact recomputes the fact's content_hash, so a
+ * Mem0 UPDATE naturally re-embeds on the next backfill tick.
+ */
+export async function embedMissingFacts(options: { maxChunks?: number } = {}): Promise<EmbedBackfillStats> {
+  const start = Date.now();
+  const stats: EmbedBackfillStats = {
+    enabled: isEmbeddingsEnabled(),
+    candidateChunks: 0,
+    batched: 0,
+    embedded: 0,
+    failed: 0,
+    durationMs: 0,
+  };
+
+  if (!stats.enabled) {
+    stats.reason = 'OPENAI_API_KEY not set';
+    stats.durationMs = Date.now() - start;
+    return stats;
+  }
+  if (inCooldown()) {
+    stats.reason = 'circuit breaker open — skipping this backfill tick';
+    stats.durationMs = Date.now() - start;
+    return stats;
+  }
+
+  const db = openMemoryDb();
+  const limit = Math.max(1, options.maxChunks ?? 200);
+
+  const rows = db.prepare(`
+    SELECT cf.id AS id, cf.content AS content, cf.content_hash AS hash
+    FROM consolidated_facts cf
+    LEFT JOIN fact_embeddings fe ON fe.fact_id = cf.id
+    WHERE cf.active = 1
+      AND (fe.fact_id IS NULL OR fe.content_hash != cf.content_hash)
+    ORDER BY cf.id ASC
+    LIMIT ?
+  `).all(limit) as { id: number; content: string; hash: string }[];
+
+  stats.candidateChunks = rows.length;
+  if (rows.length === 0) {
+    stats.durationMs = Date.now() - start;
+    return stats;
+  }
+
+  const insert = db.prepare(`
+    INSERT OR REPLACE INTO fact_embeddings (fact_id, model, dim, vector, content_hash, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `);
+  const now = new Date().toISOString();
+
+  for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+    const batch = rows.slice(i, i + BATCH_SIZE);
+    stats.batched++;
+    let vectors: Float32Array[] = [];
+    try {
+      vectors = await embedBatch(batch.map((r) => r.content));
+      recordSuccess();
+    } catch (err) {
+      recordFailure();
+      stats.failed += batch.length;
+      logger.warn({ err, batchStart: i, batchSize: batch.length }, 'embed fact batch failed');
+      if (inCooldown()) {
+        stats.reason = 'circuit breaker opened mid-tick';
+        break;
+      }
+      continue;
+    }
+
+    const tx = db.transaction(() => {
+      for (let j = 0; j < batch.length; j++) {
+        const vector = vectors[j];
+        if (!vector) continue;
+        insert.run(batch[j].id, EMBEDDING_MODEL, vector.length, vectorToBuffer(vector), batch[j].hash, now);
+        stats.embedded++;
+      }
+    });
+    try {
+      tx();
+    } catch (err) {
+      stats.failed += batch.length;
+      logger.warn({ err, batchStart: i }, 'embed fact batch insert failed');
+    }
+  }
+
+  stats.durationMs = Date.now() - start;
+  return stats;
+}
+
+/**
+ * Load embeddings for a set of fact ids. Returns a Map for O(1) lookup
+ * during the semantic findSimilarFacts rerank. Mirrors
+ * `loadEmbeddingsForChunks`.
+ */
+export function loadFactEmbeddings(factIds: number[]): Map<number, Float32Array> {
+  const out = new Map<number, Float32Array>();
+  if (factIds.length === 0) return out;
+  const db = openMemoryDb();
+  const placeholders = factIds.map(() => '?').join(',');
+  const rows = db.prepare(
+    `SELECT fact_id AS id, vector FROM fact_embeddings WHERE fact_id IN (${placeholders})`
+  ).all(...factIds) as { id: number; vector: Buffer }[];
+  for (const row of rows) out.set(row.id, bufferToVector(row.vector));
+  return out;
+}
+
 export interface EmbeddingStats {
   enabled: boolean;
   count: number;

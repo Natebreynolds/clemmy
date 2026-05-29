@@ -3,6 +3,7 @@ import { Agent, Runner } from '@openai/agents';
 import { MODELS } from '../../config.js';
 import {
   appendEvent,
+  getToolOutput,
   listEvents,
   type EventRow,
 } from './eventlog.js';
@@ -44,11 +45,13 @@ import { estimateInputTokens } from './token-estimator.js';
 //   - Layer 2 trigger 0.7 → 0.55 (summarize older messages sooner)
 const DEFAULT_LAYER1_ITEM_THRESHOLD = 15;
 const DEFAULT_LAYER1_RETAIN_TURNS = 4;
+const DEFAULT_LAYER1_RETAIN_TOOL_PAIRS = 12;
 const DEFAULT_LAYER2_RETAIN_MESSAGES = 6;
 const DEFAULT_LAYER1_TOKEN_FRACTION = 0.3;
 const DEFAULT_LAYER2_TOKEN_FRACTION = 0.55;
 const DEFAULT_LAYER3_TOKEN_FRACTION = 0.9;
 const DEFAULT_INPUT_BUDGET_TOKENS = 200_000;
+const COLLAPSED_TOOL_SUMMARY_MAX_CHARS = 12_000;
 
 const CLIP_PLACEHOLDER = (
   toolName: string | null,
@@ -69,6 +72,7 @@ export interface CompactionOptions {
   inputBudgetTokens?: number;
   layer1ItemThreshold?: number;
   layer1RetainTurns?: number;
+  layer1RetainToolPairs?: number;
   layer2RetainMessages?: number;
   layer1TokenFraction?: number;
   layer2TokenFraction?: number;
@@ -82,7 +86,7 @@ export interface CompactionOptions {
 export interface CompactionResult {
   /** True if anything changed; caller should persist via session.recordTurnResult. */
   modified: boolean;
-  layer1: { applied: boolean; clipped: number };
+  layer1: { applied: boolean; clipped: number; collapsedToolPairs: number };
   layer2: { applied: boolean; removedItems: number; summaryItems: number; callIdsReferenced: string[]; hallucinatedCallIds: string[]; modelUsed: string | null; error?: string };
   layer3: { applied: boolean; forkRequested: boolean };
   beforeTokens: number;
@@ -196,6 +200,167 @@ export function clipOldToolResults(
   }
 
   return clipped;
+}
+
+function oneLine(value: string, maxChars: number): string {
+  const clean = value.replace(/\s+/g, ' ').trim();
+  if (clean.length <= maxChars) return clean;
+  return `${clean.slice(0, maxChars).trimEnd()}...`;
+}
+
+function outputTextOf(item: Record<string, unknown>): string {
+  const output = item.output as { type?: string; text?: string } | string | undefined;
+  if (typeof output === 'string') return output;
+  if (output && typeof output === 'object' && typeof output.text === 'string') return output.text;
+  return '';
+}
+
+function recallableToolOutputExists(sessionId: string | undefined, callId: string): boolean {
+  if (!sessionId) return true;
+  try {
+    return getToolOutput(sessionId, callId) != null;
+  } catch {
+    return false;
+  }
+}
+
+interface CompletedToolPair {
+  callId: string;
+  callIndex: number;
+  resultIndex: number;
+  name: string;
+  args: string;
+  resultText: string;
+}
+
+function collapsedPairLine(pair: CompletedToolPair): string {
+  const args = pair.args ? oneLine(pair.args, 180) : '{}';
+  const clippedMarker = pair.resultText.match(/\[clipped:[^\]]*recall_tool_result\("[^"]+"\)[^\]]*\]/)?.[0];
+  const result = clippedMarker ?? oneLine(pair.resultText, 220);
+  return `- ${pair.name} [${pair.callId}] args: ${args}; result: ${result || '(empty)'} [clipped: ${pair.name} collapsed before this turn - call recall_tool_result("${pair.callId}") for full output]`;
+}
+
+function buildCollapsedToolPairsSummary(pairs: CompletedToolPair[]): AgentInputItem {
+  const lines: string[] = [
+    '[summary of older completed tool activity]',
+    `${pairs.length} older completed tool call/result pairs were collapsed before this turn to keep the first model request small. Recent tool calls remain verbatim. Exact older outputs remain available with recall_tool_result("call_id").`,
+  ];
+
+  let chars = lines.join('\n').length;
+  let omitted = 0;
+  for (let i = 0; i < pairs.length; i++) {
+    const line = collapsedPairLine(pairs[i]);
+    if (chars + line.length + 1 > COLLAPSED_TOOL_SUMMARY_MAX_CHARS) {
+      omitted = pairs.length - i;
+      break;
+    }
+    lines.push(line);
+    chars += line.length + 1;
+  }
+  if (omitted > 0) {
+    lines.push(`- ${omitted} additional older completed tool calls were also collapsed; use the visible recent context first, then ask for a specific recall if needed.`);
+  }
+
+  return {
+    role: 'system',
+    content: lines.join('\n'),
+  } as unknown as AgentInputItem;
+}
+
+/**
+ * Layer 1b - deterministic pair collapse.
+ *
+ * Clipping shrinks old tool outputs, but the SDK history can still carry
+ * dozens of completed function_call/function_call_result pairs. Codex
+ * only requires paired structure for items we actually replay. For old,
+ * completed, recallable pairs we can remove BOTH sides and replace them
+ * with one system summary that points back to recall_tool_result.
+ *
+ * Safety rules:
+ *   - keep the most recent retainPairs pairs verbatim
+ *   - collapse only pairs with both call and result present
+ *   - when sessionId is provided, collapse only if tool_outputs has a
+ *     recallable full payload for the call_id
+ *   - remove call and result together, so no orphan outputs are created
+ */
+export function collapseOldCompletedToolPairs(
+  items: AgentInputItem[],
+  retainPairs: number = DEFAULT_LAYER1_RETAIN_TOOL_PAIRS,
+  sessionId?: string,
+): { nextItems: AgentInputItem[]; collapsed: number; callIds: string[] } {
+  if (items.length === 0) return { nextItems: items, collapsed: 0, callIds: [] };
+
+  const normalizedRetain = Math.max(0, Math.floor(retainPairs));
+  const calls = new Map<string, { index: number; item: Record<string, unknown> }>();
+  const results = new Map<string, { index: number; item: Record<string, unknown> }>();
+  const resultOrder: string[] = [];
+
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i] as Record<string, unknown>;
+    const callId = typeof item.callId === 'string' ? item.callId : null;
+    if (!callId) continue;
+    if (item.type === 'function_call' && !calls.has(callId)) {
+      calls.set(callId, { index: i, item });
+    } else if (item.type === 'function_call_result' && !results.has(callId)) {
+      results.set(callId, { index: i, item });
+      resultOrder.push(callId);
+    }
+  }
+
+  const completedIds = resultOrder.filter((callId) => calls.has(callId));
+  if (completedIds.length <= normalizedRetain) {
+    return { nextItems: items, collapsed: 0, callIds: [] };
+  }
+
+  const keepIds = new Set(completedIds.slice(-normalizedRetain));
+  const pairs: CompletedToolPair[] = [];
+  for (const callId of completedIds) {
+    if (keepIds.has(callId)) continue;
+    const call = calls.get(callId);
+    const result = results.get(callId);
+    if (!call || !result) continue;
+    if (call.index > result.index) continue;
+    if (!recallableToolOutputExists(sessionId, callId)) continue;
+
+    pairs.push({
+      callId,
+      callIndex: call.index,
+      resultIndex: result.index,
+      name: typeof call.item.name === 'string' ? call.item.name : 'tool',
+      args: typeof call.item.arguments === 'string' ? call.item.arguments : '',
+      resultText: outputTextOf(result.item),
+    });
+  }
+
+  if (pairs.length === 0) return { nextItems: items, collapsed: 0, callIds: [] };
+
+  const collapseIds = new Set(pairs.map((pair) => pair.callId));
+  const summary = buildCollapsedToolPairsSummary(pairs);
+  const nextItems: AgentInputItem[] = [];
+  let inserted = false;
+
+  for (const item of items) {
+    const any = item as Record<string, unknown>;
+    const callId = typeof any.callId === 'string' ? any.callId : null;
+    const shouldCollapse = callId != null
+      && collapseIds.has(callId)
+      && (any.type === 'function_call' || any.type === 'function_call_result');
+
+    if (shouldCollapse) {
+      if (!inserted) {
+        nextItems.push(summary);
+        inserted = true;
+      }
+      continue;
+    }
+    nextItems.push(item);
+  }
+
+  return {
+    nextItems,
+    collapsed: pairs.length,
+    callIds: pairs.map((pair) => pair.callId),
+  };
 }
 
 /**
@@ -508,6 +673,7 @@ export async function compactSessionIfNeeded(
   const budget = opts.inputBudgetTokens ?? DEFAULT_INPUT_BUDGET_TOKENS;
   const itemThreshold = opts.layer1ItemThreshold ?? DEFAULT_LAYER1_ITEM_THRESHOLD;
   const retainTurns = opts.layer1RetainTurns ?? DEFAULT_LAYER1_RETAIN_TURNS;
+  const retainToolPairs = opts.layer1RetainToolPairs ?? Math.max(DEFAULT_LAYER1_RETAIN_TOOL_PAIRS, retainTurns * 3);
   const retainMessages = opts.layer2RetainMessages ?? DEFAULT_LAYER2_RETAIN_MESSAGES;
   const l1Frac = opts.layer1TokenFraction ?? DEFAULT_LAYER1_TOKEN_FRACTION;
   const l2Frac = opts.layer2TokenFraction ?? DEFAULT_LAYER2_TOKEN_FRACTION;
@@ -516,7 +682,7 @@ export async function compactSessionIfNeeded(
   const beforeTokens = estimateInputTokens(items);
   const result: CompactionResult = {
     modified: false,
-    layer1: { applied: false, clipped: 0 },
+    layer1: { applied: false, clipped: 0, collapsedToolPairs: 0 },
     layer2: { applied: false, removedItems: 0, summaryItems: 0, callIdsReferenced: [], hallucinatedCallIds: [], modelUsed: null },
     layer3: { applied: false, forkRequested: false },
     beforeTokens,
@@ -528,17 +694,21 @@ export async function compactSessionIfNeeded(
     return { result, nextItems: items };
   }
 
+  let nextItems = items;
+
   // Layer 1
   const layer1Trigger =
     items.length > itemThreshold || beforeTokens > budget * l1Frac;
   if (layer1Trigger) {
-    const clipped = clipOldToolResults(items, retainTurns, opts);
-    result.layer1.applied = clipped > 0;
+    const clipped = clipOldToolResults(nextItems, retainTurns, opts);
+    const collapsed = collapseOldCompletedToolPairs(nextItems, retainToolPairs, session.id);
+    nextItems = collapsed.nextItems;
+    result.layer1.applied = clipped > 0 || collapsed.collapsed > 0;
     result.layer1.clipped = clipped;
-    if (clipped > 0) result.modified = true;
+    result.layer1.collapsedToolPairs = collapsed.collapsed;
+    if (clipped > 0 || collapsed.collapsed > 0) result.modified = true;
   }
 
-  let nextItems = items;
   let postL1Tokens = estimateInputTokens(nextItems);
   result.afterTokens = postL1Tokens;
 

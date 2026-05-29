@@ -28,6 +28,7 @@
 import { appendFileSync, existsSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { BASE_DIR } from '../config.js';
+import { redactSensitiveValue } from '../runtime/security.js';
 import { summarizeToolArgs } from './plan-scope.js';
 import type { ToolKind } from './tool-taxonomy.js';
 
@@ -91,7 +92,7 @@ export function recordToolEvent(event: ToolLifecycleEvent): void {
   const tagged = event.sessionId && event.sessionId.length > 0
     ? event
     : { ...event, sessionId: `unscoped:${(event.at || new Date().toISOString()).slice(0, 10)}` };
-  const line = JSON.stringify(tagged) + '\n';
+  const line = JSON.stringify(redactSensitiveValue(tagged)) + '\n';
   try {
     appendFileSync(currentLogFile(), line, { encoding: 'utf-8' });
   } catch {

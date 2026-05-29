@@ -21,6 +21,7 @@
  * milliseconds; no LLM calls, no network. Errors block save; warnings
  * surface as soft signals the user can override.
  */
+import { COMMON_WORKFLOW_INPUT_KEYS } from './workflow-inputs.js';
 
 /**
  * Shape of a workflow's parsed frontmatter — kept loose because the
@@ -34,6 +35,15 @@ export interface WorkflowStepShape {
   model?: string;
   tier?: number;
   maxTurns?: number;
+  forEach?: string;
+  deterministic?: { runner?: string };
+  usesSkill?: string;
+  uses_skill?: string;
+  requiresApproval?: boolean;
+  requires_approval?: boolean;
+  /** Typed step contract (P0). Keys = declared input names. */
+  inputs?: Record<string, unknown>;
+  output?: Record<string, unknown>;
 }
 
 export interface WorkflowFrontmatter {
@@ -113,11 +123,30 @@ function checkHandoffLanguage(stepId: string, prompt: string): string[] {
 // calls. Otherwise the agent stops at the approval and the workflow
 // effectively dies between steps.
 
-function checkApprovalCoherence(stepId: string, prompt: string): { errors: string[]; warnings: string[] } {
+function checkApprovalCoherence(
+  stepId: string,
+  prompt: string,
+  requiresApproval = false,
+): { errors: string[]; warnings: string[] } {
   const errors: string[] = [];
   const warnings: string[] = [];
   const mentionsApproval = /\brequest_approval\b/i.test(prompt);
   if (!mentionsApproval) return { errors, warnings };
+
+  // Declarative gate already in place: the runner owns the approval, so
+  // the prompt mentioning request_approval (e.g. "do NOT call
+  // request_approval — the runner handles it") is fine. No error/warning.
+  if (requiresApproval) return { errors, warnings };
+
+  // Autonomous-by-default model: a step should NOT drive its own
+  // approval via the prompt. Prefer the declarative gate, which the
+  // runner owns (and which the constrained step agent supports).
+  warnings.push(
+    `Step "${stepId}" calls request_approval in its prompt. Prefer the declarative gate: set `
+    + '`requiresApproval: true` (+ a short `approvalPreview`) on this step instead. The runner then '
+    + 'surfaces ONE batch approval and holds the run — the step agent never calls request_approval, '
+    + 'and the workflow stays autonomous everywhere else.',
+  );
 
   // Must have explicit post-approval instructions.
   const hasPostApprovalAction = /\b(?:after\s+approval|once\s+approved|when\s+approved|if\s+approved|on\s+approval)\b[\s\S]*?(?:call|invoke|run|execute|use|fire)\s+[`a-z_]/i
@@ -165,6 +194,58 @@ function checkStepOutputReferences(
       errors.push(
         `Step "${stepId}" references {{steps.${referenced}.output}} but no upstream step has that id. `
         + 'The reference will render as an empty string and the agent will silently get nothing.',
+      );
+    }
+  }
+  return errors;
+}
+
+// ─── Template-token sanity (typed-workflow-contract P1, report-only) ──
+//
+// The engine only substitutes a fixed set of token shapes. A token that
+// matches NONE of them (e.g. `{{url}}` instead of `{{input.url}}`, or a
+// typo `{{ourput}}`) renders as literal text and silently swallows the
+// value — the exact class that blocked the revill audit. These checks
+// surface that at author/validate time. (P1 = report-only; P2 wires
+// validation into create/enable so a broken workflow can't be enabled.)
+
+const KNOWN_TOKEN = /^(?:date|input\.[a-zA-Z0-9_-]+|steps\.[a-zA-Z0-9_-]+\.output(?:\.[a-zA-Z0-9_.-]+)?|item(?:\.[a-zA-Z0-9_.-]+)?)$/;
+
+function checkMalformedTokens(stepId: string, prompt: string): string[] {
+  const errors: string[] = [];
+  const tokenPattern = /\{\{\s*([^{}]+?)\s*\}\}/g;
+  let match;
+  while ((match = tokenPattern.exec(prompt)) !== null) {
+    const token = match[1].trim();
+    // Only flag things that LOOK like an intended placeholder: an
+    // identifier (optionally dotted) starting with a word char. This
+    // skips prose/punctuation like the literal `{{...}}` ellipsis that
+    // prompts use as documentation ("no placeholder tokens like {{...}}").
+    const looksLikeToken = /^[A-Za-z0-9_][A-Za-z0-9_.-]*$/.test(token);
+    if (looksLikeToken && !KNOWN_TOKEN.test(token)) {
+      const hint = /^[a-zA-Z0-9_-]+$/.test(token) ? ` Did you mean {{input.${token}}}?` : '';
+      errors.push(
+        `Step "${stepId}" uses an unrecognized template token {{${token}}} — it renders as literal text and silently drops the value.${hint}`,
+      );
+    }
+  }
+  return errors;
+}
+
+function checkInputTokenBinding(
+  stepId: string,
+  prompt: string,
+  declaredInputKeys: Set<string>,
+): string[] {
+  const errors: string[] = [];
+  const inputPattern = /\{\{\s*input\.([a-zA-Z0-9_-]+)\s*\}\}/g;
+  let match;
+  while ((match = inputPattern.exec(prompt)) !== null) {
+    const key = match[1];
+    if (!declaredInputKeys.has(key) && !COMMON_WORKFLOW_INPUT_KEYS.has(key)) {
+      errors.push(
+        `Step "${stepId}" references {{input.${key}}} but no workflow/step input declares "${key}". `
+        + 'Declare it under the workflow `inputs:` (or the step `inputs:`) so the engine binds it — otherwise it renders empty.',
       );
     }
   }
@@ -257,6 +338,36 @@ export interface ValidateOptions {
    *  Caller fetches this from the runtime tool registry. When omitted,
    *  the slug check is skipped (no false positives). */
   knownToolNames?: Set<string>;
+  /** Optional set of installed skill directory names. Missing refs warn. */
+  installedSkillNames?: Set<string>;
+}
+
+const MULTI_ITEM_PROMPT_RE = /\b(?:for each|each one|each account|each site|each firm|for every|all \d+|top \d+|\d+\s+(?:accounts?|sites?|firms?|leads?|contacts?|emails?|rows?))\b/i;
+const SERIAL_WORK_RE = /\b(?:scrape|crawl|research|enrich|audit|draft|create|write|send|update)\b/i;
+
+function checkParallelismHint(step: WorkflowStepShape): string | null {
+  if (step.forEach) return null;
+  if (!MULTI_ITEM_PROMPT_RE.test(step.prompt) || !SERIAL_WORK_RE.test(step.prompt)) return null;
+  return `Step "${step.id}" looks like multi-item work but has no forEach. Consider splitting the upstream list and running this step with forEach so Clementine can parallelize safely.`;
+}
+
+function checkDeterministicRunner(step: WorkflowStepShape): string | null {
+  if (!step.deterministic) return null;
+  const runner = typeof step.deterministic.runner === 'string' ? step.deterministic.runner.trim() : '';
+  if (!runner) return `Step "${step.id}" has deterministic config but no runner. Add deterministic.runner pointing at a scripts/ helper or remove deterministic.`;
+  if (runner.includes('..') || runner.startsWith('/') || /\s/.test(runner)) {
+    return `Step "${step.id}" deterministic runner must be a relative scripts/ path with no inline arguments.`;
+  }
+  return null;
+}
+
+function checkSkillReference(step: WorkflowStepShape, installedSkillNames: Set<string> | undefined): string | null {
+  const skill = (step.usesSkill ?? step.uses_skill ?? '').trim();
+  if (!skill || !installedSkillNames) return null;
+  if (!installedSkillNames.has(skill)) {
+    return `Step "${step.id}" references missing skill "${skill}". Install it or remove usesSkill before relying on this workflow.`;
+  }
+  return null;
 }
 
 export function validateWorkflowDefinition(
@@ -307,9 +418,25 @@ export function validateWorkflowDefinition(
     warnings.push('Workflow is currently disabled — scheduled triggers will not fire.');
   }
 
+  // Workflow-level declared input keys (typed-workflow-contract).
+  const workflowInputKeys = new Set(Object.keys(data.inputs ?? {}));
+
   // ── Per-step semantic checks (the new 2026-05-21 additions) ──
   for (const step of steps) {
     if (!step.id || !step.prompt) continue;
+
+    // Template-token sanity (typed-workflow-contract P1, report-only):
+    // unrecognized tokens ({{url}} vs {{input.url}}, typos) and
+    // {{input.X}} that no declared/common input binds → errors. Declared
+    // keys = workflow-level inputs ∪ this step's declared inputs.
+    for (const issue of checkMalformedTokens(step.id, step.prompt)) errors.push(issue);
+    const declaredInputKeys = new Set([
+      ...workflowInputKeys,
+      ...Object.keys(step.inputs ?? {}),
+    ]);
+    for (const issue of checkInputTokenBinding(step.id, step.prompt, declaredInputKeys)) {
+      errors.push(issue);
+    }
 
     // Hand-off language → errors (these break workflows in production)
     for (const issue of checkHandoffLanguage(step.id, step.prompt)) {
@@ -317,7 +444,11 @@ export function validateWorkflowDefinition(
     }
 
     // Approval coherence → errors when broken
-    const approval = checkApprovalCoherence(step.id, step.prompt);
+    const approval = checkApprovalCoherence(
+      step.id,
+      step.prompt,
+      step.requiresApproval === true || step.requires_approval === true,
+    );
     for (const issue of approval.errors) errors.push(issue);
     for (const issue of approval.warnings) warnings.push(issue);
 
@@ -335,6 +466,15 @@ export function validateWorkflowDefinition(
     for (const issue of checkToolSlugs(step.id, step.prompt, opts.knownToolNames)) {
       warnings.push(issue);
     }
+
+    const missingSkill = checkSkillReference(step, opts.installedSkillNames);
+    if (missingSkill) warnings.push(missingSkill);
+
+    const deterministicIssue = checkDeterministicRunner(step);
+    if (deterministicIssue) warnings.push(deterministicIssue);
+
+    const parallelismIssue = checkParallelismHint(step);
+    if (parallelismIssue) warnings.push(parallelismIssue);
   }
 
   return {

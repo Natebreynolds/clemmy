@@ -55,7 +55,7 @@ The first launch:
 1. Splash window appears.
 2. Daemon child process spawns from `../../` (this repo's parent project).
 3. Supervisor probes the dashboard URL until ready (≤30s).
-4. Main window loads `http://localhost:PORT/console?token=…`.
+4. Main window bootstraps a daemon-local dashboard session, then loads `http://127.0.0.1:PORT/console`.
 5. Tray icon appears with daemon status + quick actions.
 
 Quit via Cmd-Q or tray → Quit Clementine. The supervisor sends SIGTERM

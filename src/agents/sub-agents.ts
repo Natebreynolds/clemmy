@@ -3,6 +3,7 @@ import type { Handoff, Tool } from '@openai/agents';
 import { MODELS, getRuntimeEnv } from '../config.js';
 import { getCoreToolsAsync } from '../tools/registry.js';
 import { getOrCreateExternalMcpServers } from '../runtime/mcp-servers.js';
+import type { McpToolScope } from '../runtime/mcp-tool-scope.js';
 import type { RuntimeContextValue } from '../types.js';
 import { wrapToolForHarness, type WrappableTool } from '../runtime/harness/brackets.js';
 
@@ -104,7 +105,7 @@ const WORKER_TOOL_NAMES = new Set<string>([
   'composio_execute_tool',
 ]);
 
-export async function buildWorkerAgent(): Promise<SubAgent> {
+export async function buildWorkerAgent(options: { mcpToolScope?: McpToolScope } = {}): Promise<SubAgent> {
   const all = await getCoreToolsAsync({ includeDynamicComposioTools: false });
   const tools = filterToolsByNames(all, WORKER_TOOL_NAMES) as Tool<RuntimeContextValue>[];
   return new Agent<RuntimeContextValue>({
@@ -129,7 +130,7 @@ export async function buildWorkerAgent(): Promise<SubAgent> {
     // Local clementine MCP is excluded — those tools are already in
     // `tools` via getCoreToolsAsync(), and duplicating would force the
     // model to disambiguate (memory_remember vs clementine-local__memory_remember).
-    mcpServers: [getOrCreateExternalMcpServers()],
+    mcpServers: [getOrCreateExternalMcpServers(options.mcpToolScope)],
   });
 }
 

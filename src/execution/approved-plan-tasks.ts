@@ -38,6 +38,7 @@ function renderApprovedPlanPrompt(proposal: PlanProposal, plan: Plan): string {
     '',
     'Run this approved plan as a durable background task. Work through the steps in order, use tools when useful, and continue until the objective is complete, blocked, or requires another approval.',
     'Stay within the approved objective. If the work materially changes scope, stop and ask for a new approval.',
+    'Treat the approved plan as the user accepting its stated assumptions and safe defaults. Do not re-ask questions already surfaced in the approved plan; choose the safest stated option. Ask again only when required data is absent and there is no safe no-send/no-mutation default.',
     '',
     `Original user request:\n${proposal.originatingRequest}`,
     '',
@@ -98,6 +99,7 @@ export function approvePlanAndQueueBackgroundTask(
     ].join('\n'),
     createdAt: new Date().toISOString(),
     read: false,
+    silent: true,
     metadata: {
       planProposalId: proposal.id,
       backgroundTaskId: task.id,

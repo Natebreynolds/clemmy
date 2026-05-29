@@ -271,7 +271,7 @@ interface ConflictDecision {
   reason?: string;
 }
 
-async function resolveConflict(
+export async function resolveConflict(
   candidate: { kind: 'user' | 'project' | 'feedback' | 'reference'; text: string },
   similar: ConsolidatedFact[],
 ): Promise<ConflictDecision> {
@@ -300,6 +300,96 @@ async function resolveConflict(
     // than to lose a real fact.
     return { decision: 'ADD' };
   }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Shared fact consolidation (Mem0 ADD/UPDATE/DELETE/NOOP application)
+// ─────────────────────────────────────────────────────────────────
+
+export interface ConsolidateCandidate {
+  kind: ConsolidatedFactKind;
+  text: string;
+  /** Stanford §4.1 poignancy. Defaults handled by rememberFact (5.0). */
+  importance?: number;
+  /** 0.0–1.0. User-stated facts pass 1.0 so they win conflicts; tool-
+   *  derived facts leave this undefined → rememberFact defaults to 0.6. */
+  trustLevel?: number;
+}
+
+export interface ConsolidateContext {
+  sessionId?: string;
+  derivedFrom?: { sessionId?: string; callId?: string; tool?: string };
+}
+
+export interface ConsolidateOutcome {
+  written: number;
+  updated: number;
+  deleted: number;
+  noop: number;
+  importanceAdded: number;
+}
+
+/**
+ * Consolidate a single candidate fact into memory via the Mem0 update
+ * phase (Chhikara et al §2.1): retrieve similar existing facts, let the
+ * LLM decide ADD / UPDATE / DELETE / NOOP, and apply it. The single
+ * write path shared by both the tool-return reflection loop AND the
+ * user-statement path (auto-capture) — so a user restating a preference
+ * supersedes the stale fact instead of stacking a duplicate.
+ *
+ * Falls back to ADD on any resolver failure — we never lose a fact.
+ */
+export async function consolidateFact(
+  candidate: ConsolidateCandidate,
+  ctx: ConsolidateContext = {},
+): Promise<ConsolidateOutcome> {
+  const out: ConsolidateOutcome = { written: 0, updated: 0, deleted: 0, noop: 0, importanceAdded: 0 };
+
+  const similar = await findSimilarFacts(candidate.text, { kind: candidate.kind, topK: 5 });
+  const decision = await resolveConflict({ kind: candidate.kind, text: candidate.text }, similar);
+
+  if (decision.decision === 'NOOP') {
+    out.noop = 1;
+    return out;
+  }
+
+  if (decision.decision === 'DELETE' && typeof decision.target_id === 'number') {
+    if (deleteFact(decision.target_id)) out.deleted = 1;
+    // After delete we still ADD the new fact below — the deleted row
+    // was the OLD state; the candidate captures the current state.
+  }
+
+  if (decision.decision === 'UPDATE' && typeof decision.target_id === 'number') {
+    const updated = updateFact(decision.target_id, {
+      content: decision.rewrite || candidate.text,
+      // Tool-derived candidates keep the historical 0.6; user candidates
+      // pass 1.0. updateFact MAX-merges trust, so user always wins.
+      trustLevel: candidate.trustLevel ?? 0.6,
+      importance: candidate.importance,
+      sessionId: ctx.sessionId,
+    });
+    if (updated) {
+      out.updated = 1;
+      out.importanceAdded += candidate.importance ?? 0;
+      return out; // UPDATE replaces ADD; no additional row
+    }
+    // Target row gone — fall through to ADD.
+  }
+
+  const rememberInput: RememberInput = {
+    kind: candidate.kind,
+    content: candidate.text,
+    sessionId: ctx.sessionId,
+    derivedFrom: ctx.derivedFrom,
+    importance: candidate.importance,
+    // Leave undefined for tool-derived (rememberFact derives 0.6 from
+    // derivedFrom); user path passes 1.0 explicitly.
+    trustLevel: candidate.trustLevel,
+  };
+  rememberFact(rememberInput);
+  out.written = 1;
+  out.importanceAdded += candidate.importance ?? 0;
+  return out;
 }
 
 /**
@@ -479,57 +569,28 @@ export async function reflectOnToolReturn(input: ReflectionInput): Promise<Refle
 
   for (const fact of extraction.facts) {
     try {
-      // Mem0-style conflict resolution (Chhikara et al §2.1): before
-      // writing, find similar existing facts and let the LLM decide
-      // ADD / UPDATE / DELETE / NOOP. Falls back to ADD if anything
-      // fails — we never lose information silently.
-      const similar = findSimilarFacts(fact.text, { kind: fact.kind, topK: 5 });
-      const decision = await resolveConflict({ kind: fact.kind, text: fact.text }, similar);
-
-      if (decision.decision === 'NOOP') {
-        factsNoop += 1;
-        continue;
-      }
-
-      if (decision.decision === 'DELETE' && typeof decision.target_id === 'number') {
-        const ok = deleteFact(decision.target_id);
-        if (ok) factsDeleted += 1;
-        // After delete we still ADD the new fact, since the user's
-        // current state may need to be stored (e.g. "user now prefers
-        // tea"). The deleted fact represented the OLD state.
-      }
-
-      if (decision.decision === 'UPDATE' && typeof decision.target_id === 'number') {
-        const updated = updateFact(decision.target_id, {
-          content: decision.rewrite || fact.text,
-          trustLevel: 0.6,
-          importance: fact.importance,
+      // Mem0-style conflict resolution (Chhikara et al §2.1) via the
+      // shared consolidation path: find similar existing facts and let
+      // the LLM decide ADD / UPDATE / DELETE / NOOP. Falls back to ADD
+      // if anything fails — we never lose information silently.
+      const outcome = await consolidateFact(
+        { kind: fact.kind, text: fact.text, importance: fact.importance },
+        {
           sessionId: input.sessionId,
-        });
-        if (updated) {
-          factsUpdated += 1;
-          sumImportance += fact.importance;
-          continue; // UPDATE replaces ADD; no additional row
-        }
-        // If the target row is gone, fall through to ADD.
-      }
-
-      const rememberInput: RememberInput = {
-        kind: fact.kind,
-        content: fact.text,
-        sessionId: input.sessionId,
-        derivedFrom: {
-          sessionId: input.sessionId,
-          callId: input.callId,
-          tool: input.tool ?? undefined,
+          derivedFrom: {
+            sessionId: input.sessionId,
+            callId: input.callId,
+            tool: input.tool ?? undefined,
+          },
         },
-        importance: fact.importance,
-      };
-      rememberFact(rememberInput);
-      factsWritten += 1;
-      sumImportance += fact.importance;
+      );
+      factsWritten += outcome.written;
+      factsUpdated += outcome.updated;
+      factsDeleted += outcome.deleted;
+      factsNoop += outcome.noop;
+      sumImportance += outcome.importanceAdded;
     } catch (err) {
-      logger.warn({ err: err instanceof Error ? err.message : String(err), fact }, 'reflection: rememberFact failed');
+      logger.warn({ err: err instanceof Error ? err.message : String(err), fact }, 'reflection: consolidateFact failed');
     }
   }
 
@@ -730,7 +791,7 @@ export async function runRecursiveReflection(): Promise<RecursiveReflectionResul
 
     for (const pattern of extraction.patterns) {
       try {
-        const similar = findSimilarFacts(pattern.text, { kind, topK: 5 });
+        const similar = await findSimilarFacts(pattern.text, { kind, topK: 5 });
         const decision = await resolveConflict({ kind, text: pattern.text }, similar);
 
         if (decision.decision === 'NOOP') {

@@ -9,11 +9,13 @@ import { processMonitors } from '../agents/monitors.js';
 import { getProactivityPolicySnapshot } from '../agents/proactivity-policy.js';
 import { processProactiveBriefs } from '../agents/proactive-briefs.js';
 import { ensureSeedTemplates, processProactiveCheckIns } from '../agents/check-in-templates.js';
-import { MODELS } from '../config.js';
+import { MODELS, getRuntimeEnv } from '../config.js';
 import { processExecutionController } from '../execution/controller.js';
 import { ExecutionStore } from '../execution/store.js';
-import { interruptStaleRunningBackgroundTasks, processBackgroundTasks } from '../execution/background-tasks.js';
+import { interruptStaleRunningBackgroundTasks, resumeInterruptedBackgroundTasks, processBackgroundTasks } from '../execution/background-tasks.js';
 import { processWorkflowRuns, reconcilePendingWorkflowRuns } from '../execution/workflow-runner.js';
+import { runWorkflowWatchdog } from '../execution/workflow-watchdog.js';
+import { getBuildInfo, describeBuild } from '../runtime/build-info.js';
 import { processWorkflowSchedules, reapStaleWorkflowRuns } from '../execution/workflow-scheduler.js';
 import { sweepStaleExecutions, sweepCrashedExecutions, sweepStaleBlockedExecutions } from '../execution/store.js';
 import { sweepStaleRuns } from '../runtime/run-events.js';
@@ -396,7 +398,7 @@ function reportBootSetupIssues(): void {
     issues.push({
       slug: 'webhook-secret',
       title: 'Webhook secret is the default placeholder',
-      body: 'The dashboard / webhook endpoint is using a placeholder WEBHOOK_SECRET. Anyone on your network could reach the API. Set a real secret in `~/.clementine-next/.env` and restart the daemon.',
+      body: 'The dashboard / webhook endpoint is using a placeholder WEBHOOK_SECRET. Local access is protected by loopback binding, but you should still set a real secret in `~/.clementine-next/.env` before enabling LAN access.',
     });
   }
 
@@ -717,6 +719,9 @@ async function processNotificationDeliveries(assistant: ClementineAssistant): Pr
 }
 
 export async function startDaemon(assistant: ClementineAssistant): Promise<void> {
+  // Surface exactly which build is running so a stale packaged bundle
+  // can't masquerade as the latest src silently (see build-info.ts).
+  logger.info({ build: getBuildInfo() }, `Clementine daemon build: ${describeBuild()}`);
   ensureDir(CRON_PROGRESS_DIR);
   const state = loadState();
   // Surface "we missed N scheduled runs while you were offline" BEFORE
@@ -730,6 +735,12 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
   const interrupted = interruptStaleRunningBackgroundTasks();
   if (interrupted > 0) {
     logger.warn({ interrupted }, 'Marked stale running background tasks as interrupted');
+  }
+  // Re-queue tasks interrupted by a previous restart/crash so the work
+  // resumes instead of stranding (bounded by resumeCount to avoid loops).
+  const autoResumed = resumeInterruptedBackgroundTasks({ cap: 2 });
+  if (autoResumed > 0) {
+    logger.warn({ autoResumed }, 'Auto-resumed interrupted background tasks on boot');
   }
   // Sweep records that got stuck active across a previous crash/restart.
   // Without this, the dashboard "NOW" panel still reports phantom in-flight
@@ -834,6 +845,62 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
   }, 15_000);
   deliveryTimer.unref?.();
 
+  // Background tasks should not wait behind the main daemon loop.
+  // A long workflow/autonomy pass can occupy that loop for minutes,
+  // which made approved plans appear as "queued" with no visible
+  // progress. Drain the background queue independently; the processor
+  // itself has an in-flight guard, so explicit approval kicks and this
+  // timer cannot double-run the same task.
+  const drainBackgroundTasks = () => {
+    processBackgroundTasks(assistant).catch((err) => {
+      logger.warn(
+        { err: err instanceof Error ? err.message : String(err) },
+        'Independent background task tick failed',
+      );
+    });
+  };
+  setImmediate(drainBackgroundTasks);
+  const backgroundTimer = setInterval(drainBackgroundTasks, 15_000);
+  backgroundTimer.unref?.();
+
+  // Workflow watchdog — reports-back safety net. Runs on its OWN timer
+  // (not the main loop) precisely because the failure it catches is the
+  // main loop being starved: a run stuck `queued` with no signal. It
+  // only observes + notifies (deduped), never mutates run state.
+  const tickWatchdog = () => {
+    try {
+      runWorkflowWatchdog();
+    } catch (err) {
+      logger.warn(
+        { err: err instanceof Error ? err.message : String(err) },
+        'Workflow watchdog tick failed',
+      );
+    }
+  };
+  const watchdogTimer = setInterval(tickWatchdog, 60_000);
+  watchdogTimer.unref?.();
+
+  // Workflow-run lane: drain queued runs on an independent timer so one
+  // long/parked run can't starve the main loop (cron, schedules,
+  // autonomy, watchdog) — the exact failure that left audit runs queued
+  // with no progress. processWorkflowRuns single-flights internally, so
+  // overlapping ticks are safe. Disable with CLEMMY_WORKFLOW_RUN_LANE=off
+  // to fall back to draining inline on the main tick.
+  const workflowRunLane = (getRuntimeEnv('CLEMMY_WORKFLOW_RUN_LANE', 'on') ?? 'on').toLowerCase() !== 'off';
+  if (workflowRunLane) {
+    const drainWorkflowRunsTick = () => {
+      processWorkflowRuns(assistant).catch((err) => {
+        logger.warn(
+          { err: err instanceof Error ? err.message : String(err) },
+          'Independent workflow-run drain tick failed',
+        );
+      });
+    };
+    setImmediate(drainWorkflowRunsTick);
+    const workflowRunTimer = setInterval(drainWorkflowRunsTick, 15_000);
+    workflowRunTimer.unref?.();
+  }
+
   // Stagger monitor runs — don't run them every 15s tick
   let tickCount = 0;
 
@@ -844,8 +911,12 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
     // Match workflows with trigger.schedule against the wall clock and
     // enqueue runs. processWorkflowRuns (below) then drains the queue.
     await processWorkflowSchedules();
-    await processWorkflowRuns(assistant);
-    await processBackgroundTasks(assistant);
+    // When the run lane is active, draining happens on its own timer
+    // (above) so a long run can't block this loop. Only drain inline
+    // when the lane is disabled.
+    if (!workflowRunLane) {
+      await processWorkflowRuns(assistant);
+    }
     const proactivity = getProactivityPolicySnapshot();
 
     // Run monitors every 4 ticks (~60s) - they have their own internal rate limiting.

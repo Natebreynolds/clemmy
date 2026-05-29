@@ -1,5 +1,6 @@
 import type { ConsolidatedFactKind } from './db.js';
-import { rememberFact, type ConsolidatedFact } from './facts.js';
+import type { ConsolidatedFact } from './facts.js';
+import { consolidateFact } from './reflection.js';
 import { saveUserProfile, type UserProfile } from '../runtime/user-profile.js';
 
 export interface AutoMemoryCandidate {
@@ -10,6 +11,10 @@ export interface AutoMemoryCandidate {
 
 export interface AutoCaptureResult {
   candidates: AutoMemoryCandidate[];
+  /** Always empty now — user-stated facts are consolidated asynchronously
+   *  through the Mem0 conflict resolver (see captureInteractionSignals),
+   *  so committed rows aren't known synchronously. Kept for back-compat;
+   *  callers should report on `candidates` instead. */
   facts: ConsolidatedFact[];
   profilePatch?: Record<string, unknown>;
   profile?: UserProfile;
@@ -104,7 +109,16 @@ export function extractAutoMemoryCandidates(message: string, maxCandidates = 3):
     });
   }
 
-  if (candidates.length === 0 && /\bremember (?:that|this|my|i|we)\b/i.test(text)) {
+  // Explicit store request. Broadened from the old
+  // `remember (that|this|my|i|we)` — that dropped "remember to call the
+  // vendor", "remember: ship Friday", and "note that …" / "don't forget
+  // …". A "do you remember X?" question is NOT a store request, so we
+  // exclude leading interrogatives.
+  if (
+    candidates.length === 0
+    && !/^\s*(?:do|did|does|can|could|would|will)\b/i.test(text)
+    && /\b(?:remember|note|keep in mind|don'?t forget|make a note)\b/i.test(text)
+  ) {
     addCandidate(candidates, {
       kind: 'user',
       content: `User explicitly asked Clementine to remember: ${text}`,
@@ -112,7 +126,44 @@ export function extractAutoMemoryCandidates(message: string, maxCandidates = 3):
     });
   }
 
+  // Declarative-fact fallback (broaden beyond the four keyword gates).
+  // If nothing matched but the message is a substantial first-person /
+  // possessive declarative ("My CFO is Dana", "We bank with First
+  // Republic", "The Henderson contract closes March 3"), capture it.
+  // This is ADDITIVE — it only fires when the cued paths found nothing,
+  // so it never reduces what's captured today. Questions and commands
+  // are excluded so we don't store "what's my balance?" as a fact.
+  if (candidates.length === 0 && isDurableDeclarative(text)) {
+    addCandidate(candidates, {
+      kind: 'user',
+      content: text,
+      reason: 'durable first-person declarative',
+    });
+  }
+
   return candidates.slice(0, maxCandidates);
+}
+
+/**
+ * Conservative test for "this looks like a durable fact worth keeping"
+ * without relying on the four keyword gates. Intentionally strict to
+ * avoid storing chit-chat: needs first-person/possessive subject, a
+ * stative verb, real length, and must not be a question or an
+ * imperative task ("send the email").
+ */
+function isDurableDeclarative(text: string): boolean {
+  if (text.length < 20 || text.length > 400) return false;
+  if (/[?]\s*$/.test(text)) return false; // questions aren't facts
+  // First-person / possessive / "the X is/are" declaratives with a
+  // stative verb. e.g. "my … is", "we use …", "I work at …", "our … are".
+  const declarative =
+    /\b(?:my|our)\b[\s\w'-]{1,40}\b(?:is|are|was|were|uses?|prefers?|lives?|works?|has|have|owns?|runs?|manages?|reports?)\b/i.test(text)
+    || /\b(?:i|we)\b\s+(?:am|are|was|were|use|prefer|live|work|have|own|run|manage|report|always|never|usually|typically)\b/i.test(text)
+    || /^\s*the\b[\s\w'-]{1,50}\b(?:is|are|was|were|closes?|starts?|ends?|happens?|moved?)\b/i.test(text);
+  if (!declarative) return false;
+  // Exclude obvious imperative tasks ("send …", "create …", "schedule …").
+  if (/^\s*(?:send|create|update|delete|schedule|draft|write|make|post|add|remove|fix|build|run|call|email|book)\b/i.test(text)) return false;
+  return true;
 }
 
 export function captureInteractionSignals(input: {
@@ -121,19 +172,23 @@ export function captureInteractionSignals(input: {
   maxFacts?: number;
 }): AutoCaptureResult {
   const candidates = extractAutoMemoryCandidates(input.message, input.maxFacts ?? 3);
-  const facts: ConsolidatedFact[] = [];
 
   for (const candidate of candidates) {
-    try {
-      facts.push(rememberFact({
-        kind: candidate.kind,
-        content: candidate.content,
-        sessionId: input.sessionId,
-        score: 1.2,
-      }));
-    } catch {
-      // Memory capture should never block the chat turn.
-    }
+    // Fire-and-forget: route the user-stated fact through the SAME Mem0
+    // conflict resolver the tool-return reflection path uses, so a user
+    // restating a preference ("actually, Wednesday now") UPDATEs/DELETEs
+    // the stale fact instead of stacking a duplicate. trustLevel 1.0
+    // keeps user statements authoritative over derived (0.6) facts on
+    // conflict. The resolver makes an LLM call, so we never await it on
+    // the chat turn — memory capture must never block the conversation.
+    queueMicrotask(() => {
+      consolidateFact(
+        { kind: candidate.kind, text: candidate.content, trustLevel: 1.0 },
+        { sessionId: input.sessionId },
+      ).catch(() => {
+        // Swallow — a capture failure must never surface to the turn.
+      });
+    });
   }
 
   const profilePatch = extractProfilePatchFromMessage(input.message);
@@ -148,7 +203,7 @@ export function captureInteractionSignals(input: {
 
   return {
     candidates,
-    facts,
+    facts: [],
     profilePatch,
     profile,
   };

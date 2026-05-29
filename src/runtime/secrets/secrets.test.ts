@@ -21,6 +21,26 @@ const { listSecretDescriptors, getSecretDescriptor, KEYCHAIN_SERVICE } = await i
 const VAULT = path.join(TEST_HOME, 'state', 'secrets-vault.json');
 const META  = path.join(TEST_HOME, 'state', 'secrets-meta.json');
 
+function writeFakeKeytar(resourcesPath: string): void {
+  const keytarDir = path.join(resourcesPath, 'app.asar.unpacked', 'node_modules', 'keytar');
+  rmSync(resourcesPath, { recursive: true, force: true });
+  mkdirSync(keytarDir, { recursive: true });
+  writeFileSync(path.join(keytarDir, 'index.js'), [
+    'const entries = new Map();',
+    'module.exports = {',
+    '  async getPassword(service, account) { return entries.get(`${service}:${account}`) ?? null; },',
+    '  async setPassword(service, account, password) { entries.set(`${service}:${account}`, password); },',
+    '  async deletePassword(service, account) { return entries.delete(`${service}:${account}`); },',
+    '  async findCredentials(service) {',
+    '    return [...entries.entries()]',
+    '      .filter(([key]) => key.startsWith(`${service}:`))',
+    '      .map(([key, password]) => ({ account: key.slice(service.length + 1), password }));',
+    '  },',
+    '};',
+    '',
+  ].join('\n'));
+}
+
 before(() => {
   rmSync(TEST_HOME, { recursive: true, force: true });
   mkdirSync(TEST_HOME + '/state', { recursive: true });
@@ -60,23 +80,7 @@ test('registry: KEYCHAIN_SERVICE is the stable v1 name (NEVER change)', () => {
 test('keychain backend: resolves bundled keytar from Electron resources path', async () => {
   const oldResourcesPath = process.env.CLEMENTINE_RESOURCES_PATH;
   const resourcesPath = path.join(TEST_HOME, 'fake-electron-resources');
-  const keytarDir = path.join(resourcesPath, 'app.asar.unpacked', 'node_modules', 'keytar');
-  rmSync(resourcesPath, { recursive: true, force: true });
-  mkdirSync(keytarDir, { recursive: true });
-  writeFileSync(path.join(keytarDir, 'index.js'), [
-    'const entries = new Map();',
-    'module.exports = {',
-    '  async getPassword(service, account) { return entries.get(`${service}:${account}`) ?? null; },',
-    '  async setPassword(service, account, password) { entries.set(`${service}:${account}`, password); },',
-    '  async deletePassword(service, account) { return entries.delete(`${service}:${account}`); },',
-    '  async findCredentials(service) {',
-    '    return [...entries.entries()]',
-    '      .filter(([key]) => key.startsWith(`${service}:`))',
-    '      .map(([key, password]) => ({ account: key.slice(service.length + 1), password }));',
-    '  },',
-    '};',
-    '',
-  ].join('\n'));
+  writeFakeKeytar(resourcesPath);
 
   process.env.CLEMENTINE_RESOURCES_PATH = resourcesPath;
   const { KeychainSecretBackend, probeKeychain, resetKeychainProbe } = await import('./keychain-store.js');
@@ -388,4 +392,38 @@ test('composite: readback failure during explicit keychain migration is recorded
   store.setKeychainBackend(fake as unknown as Parameters<typeof store.setKeychainBackend>[0]);
   const result = await store.migrate('openai_api_key', 'env', 'keychain');
   assert.equal(result.status, 'needs_repair');
+});
+
+test('composite: legacy Keychain import moves entries to file vault and deletes duplicates', async () => {
+  const oldResourcesPath = process.env.CLEMENTINE_RESOURCES_PATH;
+  const resourcesPath = path.join(TEST_HOME, 'fake-electron-resources-import');
+  writeFakeKeytar(resourcesPath);
+
+  process.env.CLEMENTINE_RESOURCES_PATH = resourcesPath;
+  const { KeychainSecretBackend, resetKeychainProbe } = await import('./keychain-store.js');
+  resetKeychainProbe();
+
+  try {
+    const keychain = new KeychainSecretBackend();
+    await keychain.set('openai_api_key', 'sk-legacy-keychain');
+
+    const store = new CompositeSecretStore();
+    await store.init();
+    const report = await store.importLegacyKeychainToVault();
+
+    assert.equal(report.probed, true);
+    assert.equal(report.scanned, 1);
+    assert.deepEqual(report.migrated, ['openai_api_key']);
+    assert.deepEqual(report.deleted, ['openai_api_key']);
+    assert.deepEqual(report.failed, []);
+
+    const result = await store.get('openai_api_key');
+    assert.equal(result.source, 'file');
+    assert.equal(result.value, 'sk-legacy-keychain');
+    assert.equal(await keychain.get('openai_api_key'), undefined);
+  } finally {
+    resetKeychainProbe();
+    if (oldResourcesPath === undefined) delete process.env.CLEMENTINE_RESOURCES_PATH;
+    else process.env.CLEMENTINE_RESOURCES_PATH = oldResourcesPath;
+  }
 });

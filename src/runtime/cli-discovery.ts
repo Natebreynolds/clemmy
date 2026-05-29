@@ -386,6 +386,15 @@ export function resolveSafeCliProbe(command: string, resolved: string): SafeCliP
     };
   }
 
+  if (/^wish(?:\d+(?:\.\d+)?)?$/.test(command)) {
+    return {
+      skipped: true,
+      command,
+      path: resolved,
+      reason: 'Skipped Tcl/Tk wish because probing it opens a GUI app instead of behaving like a CLI.',
+    };
+  }
+
   if (!STUB_BINARIES_THAT_TRIGGER_SYSTEM_INSTALLER.has(command)) {
     return { skipped: false, command, path: resolved };
   }

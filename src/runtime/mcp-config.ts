@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { MCP_SERVERS_FILE, getRuntimeEnv } from '../config.js';
@@ -34,6 +34,16 @@ let cacheExpiry = 0;
 export function invalidateMcpServerDiscoveryCache(): void {
   cachedServers = null;
   cacheExpiry = 0;
+}
+
+function hardenUserMcpConfigPermissions(): void {
+  const dir = path.dirname(MCP_SERVERS_FILE);
+  try {
+    if (existsSync(dir)) chmodSync(dir, 0o700);
+  } catch { /* best-effort */ }
+  try {
+    if (existsSync(MCP_SERVERS_FILE)) chmodSync(MCP_SERVERS_FILE, 0o600);
+  } catch { /* best-effort */ }
 }
 
 function normalizeServerName(name: string): string {
@@ -126,6 +136,7 @@ export function discoverMcpServers(): ManagedMcpServer[] {
 
   if (existsSync(MCP_SERVERS_FILE)) {
     try {
+      hardenUserMcpConfigPermissions();
       const data = JSON.parse(readFileSync(MCP_SERVERS_FILE, 'utf-8')) as Record<string, Record<string, unknown>>;
       for (const [name, config] of Object.entries(data)) {
         addServer(servers, name, config, 'user');
@@ -143,6 +154,7 @@ export function discoverMcpServers(): ManagedMcpServer[] {
 export function loadUserMcpServers(): Record<string, Partial<ManagedMcpServer>> {
   if (!existsSync(MCP_SERVERS_FILE)) return {};
   try {
+    hardenUserMcpConfigPermissions();
     return JSON.parse(readFileSync(MCP_SERVERS_FILE, 'utf-8')) as Record<string, Partial<ManagedMcpServer>>;
   } catch {
     return {};
@@ -150,7 +162,10 @@ export function loadUserMcpServers(): Record<string, Partial<ManagedMcpServer>> 
 }
 
 export function saveUserMcpServers(servers: Record<string, Partial<ManagedMcpServer>>): void {
-  mkdirSync(path.dirname(MCP_SERVERS_FILE), { recursive: true });
-  writeFileSync(MCP_SERVERS_FILE, JSON.stringify(servers, null, 2));
+  const dir = path.dirname(MCP_SERVERS_FILE);
+  mkdirSync(dir, { recursive: true });
+  hardenUserMcpConfigPermissions();
+  writeFileSync(MCP_SERVERS_FILE, JSON.stringify(servers, null, 2), { encoding: 'utf-8', mode: 0o600 });
+  hardenUserMcpConfigPermissions();
   invalidateMcpServerDiscoveryCache();
 }
