@@ -33,48 +33,53 @@ import { OrchestratorDecisionSchema } from './orchestrator.js';
  * runStepViaHarness works unchanged.
  */
 
-// Task-scoped whitelist. Deliberately EXCLUDES: workflow_run /
-// workflow_create / workflow_schedule / workflow_unschedule (recursion +
-// meta), run_worker (unbounded fan-out), notify_user / ask_user_question
-// / request_approval / surface_plan (a step doesn't drive the
-// conversation — mutating tools still pause via the taxonomy SDK-interrupt
-// path, which runStepViaHarness handles). filterToolsByNames intersects
-// with the real tool pool, so listing a name that doesn't exist is a
-// harmless no-op.
-export const WORKFLOW_STEP_TOOL_NAMES = new Set<string>([
-  // the explicit structured-output channel (the whole point)
-  'workflow_step_result',
-  // reads / memory / context
-  'memory_recall',
-  'memory_search',
-  'memory_read',
-  'memory_list_facts',
-  'memory_remember',
-  'recall_tool_result',
-  'user_profile_read',
-  'workspace_roots',
-  'workspace_list',
-  'workspace_info',
-  'list_files',
-  'read_file',
-  'git_status',
-  'local_cli_list',
-  'local_cli_probe',
-  'skill_list',
-  'skill_read',
-  // action tools a step legitimately needs
-  'write_file',
-  'run_shell_command',
-  'execution_update_step',
-  'task_add',
-  // external service execution (discovery → execute)
-  'composio_list_tools',
-  'composio_search_tools',
-  'composio_execute_tool',
+// BLOCKLIST, not a whitelist. A step gets the SAME open-ended work-tool
+// surface the orchestrator has (reads, file/shell, composio_status +
+// composio_execute_tool gateway, notify_user, the MCP servers, …) MINUS
+// only the small, stable set of recursion / fan-out / authoring / planning
+// vectors that caused the 2026-05-28 run-explosion. Curating an allow-list
+// of WORK tools is the anti-pattern (it silently strips whatever a real
+// workflow needs — e.g. it broke outlook-triage-hourly by removing
+// composio_status + notify_user); the meta vectors to remove ARE a small
+// stable set, so name those instead. (feedback_no_hardcoded_tool_lists)
+//
+// KEPT on purpose: notify_user (a step whose job is to report — triage,
+// briefings — needs it), request_approval (legacy in-prompt gates still
+// work; the declarative requires_approval gate is the forward path),
+// composio_status + the composio_execute_tool gateway (named tools like
+// OUTLOOK_LIST_MESSAGES are reached THROUGH the gateway / MCP, not
+// preloaded), and workflow_list/get/run_status (harmless reads).
+export const WORKFLOW_STEP_BLOCKED_TOOL_NAMES = new Set<string>([
+  // recursion / re-entrancy: a step must never re-run a workflow
+  'workflow_run',
+  // workflow authoring / mutation: a step executes work, it doesn't
+  // author, edit, delete, toggle, or import workflows
+  'workflow_create',
+  'workflow_update',
+  'workflow_delete',
+  'workflow_set_enabled',
+  'workflow_import_framework',
+  // scheduling / cron: a step doesn't schedule or trigger future work
+  'add_cron_job',
+  'trigger_cron_job',
+  // tool authoring
+  'create_tool',
+  // unbounded fan-out
+  'run_worker',
+  // planning surface: a deterministic step does work, it doesn't plan/re-plan
+  'surface_plan',
+  'propose_plan',
+  'create_plan',
+  // conversational question: cannot be answered inside a background run
+  // (would hang the run) — block cleanly via workflow_step_result instead
+  'ask_user_question',
 ]);
 
-function filterToolsByNames<T extends { name?: string }>(tools: T[], allowed: Set<string>): T[] {
-  return tools.filter((tool) => typeof tool?.name === 'string' && allowed.has(tool.name));
+/** Remove only the recursion/meta vectors; keep every work tool. */
+export function filterToolsForStep<T extends { name?: string }>(tools: T[]): T[] {
+  return tools.filter(
+    (tool) => !(typeof tool?.name === 'string' && WORKFLOW_STEP_BLOCKED_TOOL_NAMES.has(tool.name)),
+  );
 }
 
 const STEP_INSTRUCTIONS = [
@@ -83,7 +88,7 @@ const STEP_INSTRUCTIONS = [
   'If a "=== STEP CONTEXT ===" block appears below, it is your bound inputs as authoritative structured DATA — trust it over the prose, and use those values directly. If a value you need is empty or absent there, call `workflow_step_result({"blocked":true,"reason":"<what is missing>"})` rather than guessing or inventing one.',
   'When you have the result, you MUST call `workflow_step_result(data)` EXACTLY ONCE as your final action, passing the COMPLETE structured payload the next step needs (e.g. the full array of records as JSON) — not a summary. The next step reads exactly what you pass here; a prose summary will starve it.',
   'If you genuinely cannot produce the result (missing required input, a tool failed), call `workflow_step_result(data)` with `{ "blocked": true, "reason": "<concrete blocker>" }` and stop. Do NOT try to re-run the workflow or work around it — blocking cleanly is correct.',
-  'You cannot start or schedule workflows, spawn workers, or message the user. Just produce this step\'s structured result.',
+  'You cannot start, author, or schedule workflows, spawn workers, or re-plan. You CAN use the work tools the step needs — read/shell/file tools, the composio_status + composio_execute_tool gateway (and named tools through it), and notify_user when the step prompt asks you to report or summarize. Always finish by calling `workflow_step_result(data)`.',
 ].join('\n\n');
 
 export interface BuildWorkflowStepAgentOptions {
@@ -96,7 +101,7 @@ export async function buildWorkflowStepAgent(
   options: BuildWorkflowStepAgentOptions = {},
 ): Promise<Agent<RuntimeContextValue, typeof OrchestratorDecisionSchema>> {
   const all = await getCoreToolsAsync({ includeDynamicComposioTools: false });
-  const tools = filterToolsByNames(all, WORKFLOW_STEP_TOOL_NAMES) as Tool<RuntimeContextValue>[];
+  const tools = filterToolsForStep(all) as Tool<RuntimeContextValue>[];
   return new Agent<RuntimeContextValue, typeof OrchestratorDecisionSchema>({
     name: 'WorkflowStep',
     instructions: harnessInstructions(STEP_INSTRUCTIONS),
