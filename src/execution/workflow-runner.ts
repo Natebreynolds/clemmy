@@ -29,6 +29,16 @@ import {
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { buildOrchestratorAgent } from '../agents/orchestrator.js';
 import { buildWorkflowStepAgent } from '../agents/workflow-step-agent.js';
+import {
+  detectBlockedSteps,
+  diagnoseWorkflowBlock,
+  recordProposedFix,
+  renderLegibleOutcome,
+  renderSuccessBody,
+  selfHealEnabled,
+  type WorkflowDiagnosis,
+  type ProposedFix,
+} from './workflow-diagnosis.js';
 import { takeStepResult } from '../tools/step-result-tool.js';
 import { configureHarnessRuntime } from '../runtime/harness/codex-client.js';
 import { closePlanScope, openPlanScope } from '../agents/plan-scope.js';
@@ -186,6 +196,13 @@ interface QueuedRunRecord {
    * the user can see what it does in isolation.
    */
   targetStepId?: string;
+  /**
+   * Self-heal: a run can "complete" with steps that cleanly blocked. These
+   * mark it as needing attention and link the proposed fix (if diagnosed).
+   */
+  needsAttention?: boolean;
+  blockedSteps?: Array<{ stepId: string; reason: string }>;
+  proposedFixId?: string | null;
 }
 
 function readRunRecord(filePath: string): QueuedRunRecord | null {
@@ -1628,13 +1645,38 @@ async function processOneRunFile(
       const resume = computeResumeState(workflow.name, run.id);
       const stepOutputs = stringifyOutputs(Object.fromEntries(resume.completedSteps));
       appendWorkflowEvent(workflow.name, run.id, { kind: 'run_completed' });
+
+      // Self-heal: a step that returned {blocked:true} ran cleanly but
+      // could not finish its job. Today that still marks "completed" and
+      // dumps raw JSON. Detect it, diagnose the root cause, and offer a
+      // fix — instead of silently reporting a misleading success.
+      const blockedSteps = detectBlockedSteps(stepOutputs);
+      let diagnosis: WorkflowDiagnosis | null = null;
+      let proposedFix: ProposedFix | null = null;
+      if (blockedSteps.length > 0 && selfHealEnabled()) {
+        diagnosis = await diagnoseWorkflowBlock({
+          workflow: workflow.data,
+          blockedSteps,
+          // The step's blocked reason usually carries the real tool error.
+          toolErrors: blockedSteps.map((b) => b.reason),
+        });
+        if (diagnosis) {
+          proposedFix = recordProposedFix(workflow.name, run.id, diagnosis);
+        }
+      }
+      const needsAttention = blockedSteps.length > 0;
+
       writeRunRecord(filePath, {
         ...run,
         status: 'completed',
         finishedAt: new Date().toISOString(),
         stepOutputs,
         output: finalOutput,
+        ...(needsAttention
+          ? { needsAttention: true, blockedSteps, proposedFixId: proposedFix?.id ?? null }
+          : {}),
       });
+
       // Partial-success surfacing: if any forEach items errored, lift
       // them into the user-visible notification so a "completed" run
       // can't masquerade as all-green when items quietly dropped.
@@ -1645,25 +1687,46 @@ async function processOneRunFile(
             .map((f) => `- ${f.stepId} · ${f.itemKey}: ${f.error.slice(0, 200)}`)
             .join('\n')}${forEachFailures.length > 5 ? `\n(+${forEachFailures.length - 5} more)` : ''}`
         : '';
+
+      // Legible reporting: when steps blocked, say "needs attention" (not
+      // "completed") and explain in plain language — with the diagnosis +
+      // fix offer when self-heal produced one. Otherwise today's body.
+      // Success body: human-readable (synthesis prose or humanized step
+      // results), never a raw JSON dump of the step bookkeeping.
+      const successBody = `${renderSuccessBody({
+        steps: workflow.data.steps,
+        stepOutputs,
+        finalOutput,
+        hasSynthesis: Boolean(workflow.data.synthesis?.prompt) && !run.targetStepId,
+      })}${failureSummary}`;
+      const outcome = renderLegibleOutcome({
+        workflowName: workflow.data.name,
+        blockedSteps,
+        diagnosis,
+        fixId: proposedFix?.id ?? null,
+        fallbackBody: successBody,
+      });
       addNotification({
         id: `${Date.now()}-workflow-${run.id}`,
         kind: 'workflow',
-        title: hasFailures
+        title: hasFailures && !needsAttention
           ? `Workflow completed with ${forEachFailures.length} failure${forEachFailures.length === 1 ? '' : 's'}: ${workflow.data.name}`
-          : `Workflow completed: ${workflow.data.name}`,
+          : outcome.title,
         // Send the full body. Discord delivery splits long content into
         // multiple messages; previous 2000-char slice cut off workflow
         // results above that length with no continuation.
-        body: `${finalOutput}${failureSummary}`,
+        body: needsAttention ? outcome.body : successBody,
         createdAt: new Date().toISOString(),
         read: false,
         metadata: {
           workflow: workflow.data.name,
           runId: run.id,
           forEachFailures: hasFailures ? forEachFailures : undefined,
+          needsAttention: needsAttention || undefined,
+          proposedFixId: proposedFix?.id,
         },
       });
-      logger.info({ workflow: workflow.data.name, runId: run.id, partialFailures: forEachFailures.length }, 'Workflow run completed');
+      logger.info({ workflow: workflow.data.name, runId: run.id, partialFailures: forEachFailures.length, blockedSteps: blockedSteps.length, diagnosed: !!diagnosis }, 'Workflow run completed');
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const cancelled = error instanceof WorkflowRunCancelledError || isWorkflowRunCancelled(run.id);

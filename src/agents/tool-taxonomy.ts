@@ -130,6 +130,11 @@ const NEVER_GATE_LOCAL_MEMORY = new Set<string>([
   // Session bookkeeping
   'session_pause',
   'session_resume',
+  // Workflow step output channel — records THIS step's structured result
+  // locally (keyed by sessionId), consumed by the next step. No external
+  // surface. Gating it made every workflow step stop for "approve
+  // workflow_step_result" in Discord — friction on the step's own output.
+  'workflow_step_result',
 ]);
 
 /**
