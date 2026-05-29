@@ -1650,7 +1650,7 @@ async function processOneRunFile(
       // could not finish its job. Today that still marks "completed" and
       // dumps raw JSON. Detect it, diagnose the root cause, and offer a
       // fix — instead of silently reporting a misleading success.
-      const blockedSteps = detectBlockedSteps(stepOutputs);
+      const blockedSteps = detectBlockedSteps(stepOutputs, workflow.data.steps.map((s) => s.id));
       let diagnosis: WorkflowDiagnosis | null = null;
       let proposedFix: ProposedFix | null = null;
       if (blockedSteps.length > 0 && selfHealEnabled()) {
