@@ -7,6 +7,7 @@ import { MODELS, getRuntimeEnv } from '../config.js';
 import { runBoundedPool } from './bounded-pool.js';
 import { bindStepInputs } from './step-binding.js';
 import { addNotification } from '../runtime/notifications.js';
+import { startRun, finishRun } from '../runtime/run-events.js';
 import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
 import { WORKFLOWS_DIR } from '../memory/vault.js';
 import {
@@ -1637,6 +1638,20 @@ async function processOneRunFile(
       kind: isResume ? 'run_resumed' : 'run_started',
       meta: { inputs, source: run.source, targetStepId: run.targetStepId ?? null },
     });
+    // Reports-back: surface this workflow run in the unified Activity feed
+    // (run-events / listRuns) so it shows alongside chat + background tasks,
+    // not only on the Workflows page. startRun upserts (id = run.id), so any
+    // trigger source (chat, scheduler, dashboard, API) lands here.
+    try {
+      startRun({
+        id: run.id,
+        sessionId: `workflow:${run.id}`,
+        channel: 'workflow',
+        source: 'workflow',
+        title: `Workflow: ${workflow.data.name}`,
+        message: `${isResume ? 'Resuming' : 'Running'} workflow "${workflow.data.name}"${run.targetStepId ? ` · step ${run.targetStepId}` : ''}`,
+      });
+    } catch { /* run-events is best-effort; never block the run */ }
 
     const stopHeartbeat = startWorkflowHeartbeat(workflow.data.name, run.id, Date.now());
     try {
@@ -1726,6 +1741,15 @@ async function processOneRunFile(
           proposedFixId: proposedFix?.id,
         },
       });
+      try {
+        finishRun(run.id, {
+          status: 'completed',
+          message: needsAttention
+            ? `Needs attention — ${blockedSteps.length} step${blockedSteps.length === 1 ? '' : 's'} blocked`
+            : `Completed${hasFailures ? ` with ${forEachFailures.length} item failure${forEachFailures.length === 1 ? '' : 's'}` : ''}`,
+          outputPreview: (needsAttention ? outcome.body : successBody).slice(0, 800),
+        });
+      } catch { /* best-effort */ }
       logger.info({ workflow: workflow.data.name, runId: run.id, partialFailures: forEachFailures.length, blockedSteps: blockedSteps.length, diagnosed: !!diagnosis }, 'Workflow run completed');
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -1747,6 +1771,13 @@ async function processOneRunFile(
         read: false,
         metadata: { workflow: run.workflow, runId: run.id, status: cancelled ? 'cancelled' : 'error' },
       });
+      try {
+        finishRun(run.id, {
+          status: cancelled ? 'cancelled' : 'failed',
+          message: cancelled ? 'Workflow run cancelled' : `Workflow failed: ${message}`,
+          error: cancelled ? undefined : message,
+        });
+      } catch { /* best-effort */ }
     } finally {
       stopHeartbeat();
     }

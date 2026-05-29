@@ -39,7 +39,7 @@ export interface BackgroundTaskRecord {
   channel?: string;
   model?: string;
   maxMinutes: number;
-  source: 'discord' | 'webhook' | 'cli' | 'gateway' | 'daemon' | 'mobile';
+  source: 'discord' | 'webhook' | 'cli' | 'gateway' | 'daemon' | 'mobile' | 'workflow';
   createdAt: string;
   updatedAt: string;
   startedAt?: string;
