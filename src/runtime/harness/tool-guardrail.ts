@@ -323,7 +323,7 @@ export function evaluateToolCall(
       action: 'block',
       signature,
       toolName,
-      reason: `${toolName} called ${exactCount}× with identical args in recent window — strong signal of a model loop`,
+      reason: `Loop detected: ${toolName} has been called ${exactCount}× with IDENTICAL arguments and keeps failing/returning the same result. Repeating it will not help. STOP — do something different: change the arguments, try another tool/approach, or if you're blocked, report the specific blocker to the user. Do NOT call ${toolName} with these same arguments again.`,
       rule: 'exact_args_repeat',
       count: exactCount,
     };
@@ -384,7 +384,21 @@ export function evaluateToolCall(
 export function applyMode(decision: GuardrailDecision, mode: GuardrailMode = readMode()): GuardrailDecision {
   if (mode === 'off') return { ...decision, action: 'allow' };
   if (mode === 'strict') return decision;
-  // warn mode (default): demote block/halt to warn
+  // warn mode (default).
+  //
+  // An EXACT-args repeat (same tool, byte-identical args, ≥ block threshold)
+  // is an unambiguous model loop for ANY tool — there is no legitimate
+  // reason to make the identical failing call 5+ times. Keep it a HARD
+  // BLOCK even in the default mode, so a runaway (e.g. 137× workflow_run
+  // with the same inputs) is stopped at the source for every Clem, in any
+  // task or workflow — and the agent is forced to reconsider instead of
+  // spinning. This is the general fix; symptom-specific patches are not.
+  if (decision.action === 'block' && decision.rule === 'exact_args_repeat') {
+    return decision;
+  }
+  // Other signals (same tool, DIFFERENT args — possibly legitimate varied
+  // / batch work) stay demoted to warn in the default mode to avoid
+  // stopping real work; strict mode enforces them.
   if (decision.action === 'block' || decision.action === 'halt') {
     return { ...decision, action: 'warn' };
   }

@@ -1183,7 +1183,9 @@ export class CodexNativeRuntime implements AgentRuntime {
     });
     try {
       const callId = toolCall.call_id ?? toolCall.id ?? randomUUID();
-      const output = await tool.invoke(runContext, toolCall.arguments ?? '{}', {
+      const output = await withToolOutputContext(
+        { sessionId, callId, toolName: name },
+        () => tool.invoke(runContext, toolCall.arguments ?? '{}', {
         toolCall: {
           id: toolCall.id ?? callId,
           call_id: callId,
@@ -1191,7 +1193,8 @@ export class CodexNativeRuntime implements AgentRuntime {
           name,
           arguments: toolCall.arguments ?? '{}',
         } as any,
-      });
+        }),
+      );
       finish('success');
       return formatRecallableToolText(stringifyToolOutput(output), {
         sessionId,

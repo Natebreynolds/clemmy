@@ -41,6 +41,15 @@ export function collectRequiredWorkflowInputs(workflow: WorkflowDefinition): str
     }
   }
 
+  // A declared input with a non-empty default is ALWAYS satisfiable, so it
+  // is never "required" — even if a step prompt references it via
+  // {{input.X}}. Without this, a fully-defaulted workflow rejected an
+  // empty-inputs workflow_run ("required inputs … missing"), which led the
+  // chat agent to retry the same call ~137× — a runaway + 429 storm.
+  for (const [key, meta] of Object.entries(declaredInputs)) {
+    if (meta.default && meta.default.trim().length > 0) required.delete(key);
+  }
+
   return [...required].sort();
 }
 

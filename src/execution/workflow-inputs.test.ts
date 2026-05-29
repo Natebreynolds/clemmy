@@ -38,6 +38,21 @@ test('collectRequiredWorkflowInputs reads declared and legacy placeholders', () 
   );
 });
 
+test('a defaulted input referenced via {{input.X}} is NOT required (the 137x-runaway fix)', () => {
+  const def = workflow({
+    steps: [{ id: 'main', prompt: 'Pull {{input.account_limit}} accounts, cadence {{input.cadence_days}}, sheet {{input.target_sheet_id}}.' }],
+    inputs: {
+      account_limit: { type: 'string', default: '10' },
+      cadence_days: { type: 'string', default: '3' },
+      target_sheet_id: { type: 'string', default: '1vV-abc' },
+    },
+  });
+  // All three are referenced via {{input.X}} but all have defaults → none
+  // required, so an empty-inputs workflow_run is accepted (no reject→retry loop).
+  assert.deepEqual(collectRequiredWorkflowInputs(def), []);
+  assert.deepEqual(missingWorkflowRunInputs(def, {}), []);
+});
+
 test('normalizeWorkflowRunInputs trims values and maps website/domain aliases to url', () => {
   assert.deepEqual(normalizeWorkflowRunInputs({ website: ' https://example.com ', empty: '   ' }), {
     website: 'https://example.com',

@@ -112,17 +112,34 @@ test('evaluateToolCall: idempotent tool with many distinct args is NOT flagged b
 
 // ─── applyMode — mode-based action demotion ──────────────────────
 
-test('applyMode: warn mode demotes block/halt to warn', () => {
-  const blockDecision = {
+test('applyMode: warn mode HARD-BLOCKS an exact-args loop (general runaway stop)', () => {
+  // Same tool, identical args, ≥ block threshold = an unambiguous loop for
+  // ANY tool. Must stay a block even in the default warn mode so a runaway
+  // (e.g. 137× workflow_run with identical inputs) is stopped at the source
+  // and the agent is forced to reconsider.
+  const exactLoop = {
     action: 'block' as const,
     signature: 'sig',
-    toolName: 'memory_search',
-    reason: 'test',
+    toolName: 'workflow_run',
+    reason: 'loop',
     rule: 'exact_args_repeat' as const,
     count: 5,
   };
-  assert.equal(applyMode(blockDecision, 'warn').action, 'warn');
-  assert.equal(applyMode({ ...blockDecision, action: 'halt' }, 'warn').action, 'warn');
+  assert.equal(applyMode(exactLoop, 'warn').action, 'block');
+});
+
+test('applyMode: warn mode still demotes non-exact-args block/halt to warn', () => {
+  // Same tool, DIFFERENT args (possibly legitimate varied/batch work) stays
+  // demoted in the default mode; strict mode enforces it.
+  const variedHalt = {
+    action: 'halt' as const,
+    signature: 'sig',
+    toolName: 'composio_execute_tool',
+    reason: 'varied',
+    rule: 'same_mut_tool_repeat' as const,
+    count: 8,
+  };
+  assert.equal(applyMode(variedHalt, 'warn').action, 'warn');
 });
 
 test('applyMode: strict mode passes block/halt through unchanged', () => {
