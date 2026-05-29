@@ -12,6 +12,7 @@ import { classifyTool, decideToolApproval } from '../agents/tool-taxonomy.js';
 import { beginToolEvent, recordPendingApproval, recordToolEvent } from '../agents/tool-observability.js';
 import { recordUsage, type UsageEvent } from './usage-log.js';
 import { formatRecallableToolText } from './harness/tool-output-format.js';
+import { withToolOutputContext } from './harness/tool-output-context.js';
 import type { RuntimeContextValue, ToolActivity } from '../types.js';
 import { codexDispatcher, detectUndiciTimeout, buildTransportTimeoutError } from './codex-dispatcher.js';
 
@@ -947,7 +948,15 @@ export class CodexNativeRuntime implements AgentRuntime {
 	    try {
 	      await throwIfCancelled(callbacks);
 	      const callId = toolCall.call_id ?? toolCall.id ?? randomUUID();
-	      const output = await tool.invoke(runContext, toolCall.arguments ?? '{}', {
+	      // Establish the tool-output-context so a tool that formats its OWN
+	      // output internally (run_shell_command, composio, local-runtime via
+	      // formatRecallableToolText) can resolve sessionId/callId — the manual
+	      // codex-native dispatch doesn't propagate them through the SDK
+	      // runContext the way the harness Runner does. Without this, large
+	      // chat outputs fell to plain truncation (no digest, no recall).
+	      const output = await withToolOutputContext(
+	        { sessionId, callId, toolName: name },
+	        () => tool.invoke(runContext, toolCall.arguments ?? '{}', {
         toolCall: {
           id: toolCall.id ?? callId,
           call_id: callId,
@@ -955,7 +964,8 @@ export class CodexNativeRuntime implements AgentRuntime {
           name,
           arguments: toolCall.arguments ?? '{}',
         } as any,
-	      });
+	        }),
+	      );
 	      await throwIfCancelled(callbacks);
 	      finishEvent('success');
 	      return {
