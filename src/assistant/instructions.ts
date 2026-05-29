@@ -182,6 +182,7 @@ export function renderActionDisciplineDirective(intent?: MessageIntent): string 
   if (intent !== 'action' && intent !== 'tool_intent') return '';
   return [
     'Action discipline (this turn is editing / multi-step work):',
+    '- RESOLVE SCOPE BEFORE YOU QUERY OR MUTATE. If the request uses possessive or relative scope ("my", "our", "mine", "the usual", "again", or a bare person / account / project / list name) or is otherwise ambiguous about WHO or WHICH records it covers, do NOT guess. FIRST call memory_recall (scoped to the request) to resolve it — e.g. "my market-leader accounts" means accounts the user OWNS (Owner = the user / Nathan Reynolds), not every market-leader account; "the usual sheet" means a specific known sheet. If recall does not resolve the scope, ask ONE concise clarifying question before running the query or mutation. Never silently drop a scope filter (like an owner filter) or invent one.',
     '- Surface tradeoffs. If two interpretations of the request lead to materially different work, name them in one sentence and pick one — don\'t silently choose. Name your load-bearing assumptions inline rather than burying them in a diff.',
     '- Touch only what the request requires. Don\'t refactor adjacent code, fix unrelated formatting, or sneak in "while-I\'m-here" cleanups. Match the existing style even when you\'d write it differently. If you notice unrelated dead code, mention it, don\'t delete it.',
   ].join('\n');
