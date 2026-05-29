@@ -447,9 +447,18 @@ async function prepareForQuit(): Promise<void> {
   quitPreparing = false;
 }
 
-async function prepareForUpdateInstall(): Promise<void> {
+function markUpdateInstallIntent(): void {
   (app as { isQuitting?: boolean; isInstallingUpdate?: boolean }).isQuitting = true;
   (app as { isInstallingUpdate?: boolean }).isInstallingUpdate = true;
+}
+
+function clearUpdateInstallIntent(): void {
+  (app as { isQuitting?: boolean; isInstallingUpdate?: boolean }).isQuitting = false;
+  (app as { isInstallingUpdate?: boolean }).isInstallingUpdate = false;
+}
+
+async function prepareForUpdateInstall(): Promise<void> {
+  markUpdateInstallIntent();
   await recallCapture?.shutdown().catch(() => { /* ignore */ });
   await supervisor?.stop().catch(() => { /* ignore */ });
 }
@@ -458,8 +467,7 @@ function scheduleInstallQuitFallback(): void {
   if (installQuitFallback) return;
   installQuitFallback = setTimeout(() => {
     installQuitFallback = null;
-    (app as { isQuitting?: boolean; isInstallingUpdate?: boolean }).isQuitting = true;
-    (app as { isInstallingUpdate?: boolean }).isInstallingUpdate = true;
+    markUpdateInstallIntent();
     app.quit();
     setTimeout(() => {
       app.exit(0);
@@ -529,15 +537,21 @@ async function applyUpdateFromUi(): Promise<ReturnType<typeof getUpdaterStatus> 
     // choice === 1: user explicitly chose to install anyway. Fall through.
   }
 
-  if (getUpdaterStatus().state === 'ready-to-install') {
-    // Let electron-updater/Squirrel own the install, but make every UI
-    // entry point mark the app as intentionally quitting first. The tray
-    // path used to skip this and macOS would keep the app alive.
-    await prepareForUpdateInstall();
+  const wasReadyToInstall = getUpdaterStatus().state === 'ready-to-install';
+  if (wasReadyToInstall) {
+    // Mark intent before quitAndInstall so before-quit does not block the
+    // native updater. Do not stop the daemon until quitAndInstall accepts
+    // the handoff; otherwise a synchronous updater failure leaves Clem
+    // half-closed with no install.
+    markUpdateInstallIntent();
   }
   const result = applyUpdate();
+  if (!result.ok && wasReadyToInstall) {
+    clearUpdateInstallIntent();
+  }
   if (result.ok && result.action === 'installing') {
     scheduleInstallQuitFallback();
+    await prepareForUpdateInstall();
   }
   return { ...getUpdaterStatus(), applyResult: result };
 }

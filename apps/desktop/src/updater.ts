@@ -68,6 +68,7 @@ let status: UpdaterStatus = { state: 'idle' };
 let onStatusChangeListeners: Array<(s: UpdaterStatus) => void> = [];
 let periodicHandle: NodeJS.Timeout | null = null;
 let downloadInFlight = false;
+let updaterLog: UpdaterLog | undefined;
 
 type UpdaterLog = (level: 'info' | 'warn' | 'error', msg: string, extra?: Record<string, unknown>) => void;
 
@@ -177,13 +178,19 @@ export function applyUpdate(): {
   }
 
   try {
+    autoUpdater.autoRunAppAfterInstall = true;
+    if (process.platform === 'darwin') {
+      autoUpdater.autoInstallOnAppQuit = true;
+    }
     // isSilent=false: show the standard installer UI.
-    // isForceRunAfter=true: relaunch Clementine post-update so the user
-    //   doesn't have to manually re-open it.
+    // isForceRunAfter=true: relaunch Clementine post-update on non-mac
+    // updaters. MacUpdater ignores this argument and reads
+    // autoRunAppAfterInstall instead, so keep that property set above.
     autoUpdater.quitAndInstall(false, true);
     return { ok: true, action: 'installing' };
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
+    updaterLog?.('error', 'quitAndInstall failed before install handoff', { err: reason });
     return { ok: false, reason };
   }
 }
@@ -329,6 +336,7 @@ export function initAutoUpdater(opts: { logFile: string }): void {
       // Logging must never throw — drop the line.
     }
   };
+  updaterLog = log;
 
   // Pipe electron-updater's internal logs into our supervisor file so
   // they appear alongside daemon events. The package accepts any
@@ -341,12 +349,14 @@ export function initAutoUpdater(opts: { logFile: string }): void {
     debug: () => {},
   } as unknown as typeof autoUpdater.logger;
 
-  // We download in the background but do not ask Squirrel.Mac to stage
-  // the native install until the user explicitly clicks Restart. With
-  // tray-resident apps, autoInstallOnAppQuit can leave ShipIt waiting
-  // behind the scenes while the main app stays alive.
+  // Download in the background. On macOS, keep autoInstallOnAppQuit
+  // enabled so Squirrel fetches/stages the ZIP during download; disabling
+  // it can leave electron-updater with only a cached ZIP, and a later
+  // explicit quitAndInstall() may hit Electron's disabled native
+  // checkForUpdates path instead of relaunching.
   autoUpdater.autoDownload = false;
-  autoUpdater.autoInstallOnAppQuit = false;
+  autoUpdater.autoInstallOnAppQuit = process.platform === 'darwin';
+  autoUpdater.autoRunAppAfterInstall = true;
 
   autoUpdater.on('checking-for-update', () => {
     log('info', 'checking for updates');
