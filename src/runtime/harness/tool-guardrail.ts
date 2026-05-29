@@ -387,18 +387,24 @@ export function applyMode(decision: GuardrailDecision, mode: GuardrailMode = rea
   // warn mode (default).
   //
   // An EXACT-args repeat (same tool, byte-identical args, ≥ block threshold)
-  // is an unambiguous model loop for ANY tool — there is no legitimate
-  // reason to make the identical failing call 5+ times. Keep it a HARD
-  // BLOCK even in the default mode, so a runaway (e.g. 137× workflow_run
-  // with the same inputs) is stopped at the source for every Clem, in any
-  // task or workflow — and the agent is forced to reconsider instead of
-  // spinning. This is the general fix; symptom-specific patches are not.
-  if (decision.action === 'block' && decision.rule === 'exact_args_repeat') {
+  // is hard-blocked even in the default mode — BUT ONLY for MUTATING tools.
+  // That's the dangerous runaway: 137× workflow_run with the same inputs,
+  // repeated sends, etc. — stopped at the source, agent forced to
+  // reconsider. READ/poll tools (workflow_run_status, list/get/search) are
+  // non-destructive, and repeating the identical call is LEGITIMATE
+  // (polling an async result, re-reading) — never block a poll; demote to
+  // warn. (A read loop wastes tokens but can't corrupt/spawn/send and is
+  // bounded by the turn's limits.)
+  if (
+    decision.action === 'block'
+    && decision.rule === 'exact_args_repeat'
+    && MUTATING_TOOLS.has(decision.toolName)
+  ) {
     return decision;
   }
-  // Other signals (same tool, DIFFERENT args — possibly legitimate varied
-  // / batch work) stay demoted to warn in the default mode to avoid
-  // stopping real work; strict mode enforces them.
+  // Everything else (read loops, and same-tool/different-args signals that
+  // may be legitimate varied/batch work) stays demoted to warn in the
+  // default mode; strict mode enforces them.
   if (decision.action === 'block' || decision.action === 'halt') {
     return { ...decision, action: 'warn' };
   }

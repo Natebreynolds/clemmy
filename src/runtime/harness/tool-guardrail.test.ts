@@ -112,20 +112,33 @@ test('evaluateToolCall: idempotent tool with many distinct args is NOT flagged b
 
 // ─── applyMode — mode-based action demotion ──────────────────────
 
-test('applyMode: warn mode HARD-BLOCKS an exact-args loop (general runaway stop)', () => {
-  // Same tool, identical args, ≥ block threshold = an unambiguous loop for
-  // ANY tool. Must stay a block even in the default warn mode so a runaway
-  // (e.g. 137× workflow_run with identical inputs) is stopped at the source
-  // and the agent is forced to reconsider.
+test('applyMode: warn mode HARD-BLOCKS an exact-args loop on a MUTATING tool (runaway stop)', () => {
+  // Mutating tool, identical args, ≥ block threshold = the dangerous runaway
+  // (e.g. 137× workflow_run with identical inputs). Hard-block in default mode.
   const exactLoop = {
     action: 'block' as const,
     signature: 'sig',
-    toolName: 'workflow_run',
+    toolName: 'workflow_run', // mutating
     reason: 'loop',
     rule: 'exact_args_repeat' as const,
     count: 5,
   };
   assert.equal(applyMode(exactLoop, 'warn').action, 'block');
+});
+
+test('applyMode: warn mode does NOT block an exact-args loop on a READ/poll tool (polling is legit)', () => {
+  // Polling workflow_run_status (a read) for an async result repeats the
+  // identical call — legitimate + non-destructive. Must NOT hard-block;
+  // demote to warn so the poll continues.
+  const pollLoop = {
+    action: 'block' as const,
+    signature: 'sig',
+    toolName: 'workflow_run_status', // read, not in MUTATING_TOOLS
+    reason: 'loop',
+    rule: 'exact_args_repeat' as const,
+    count: 6,
+  };
+  assert.equal(applyMode(pollLoop, 'warn').action, 'warn');
 });
 
 test('applyMode: warn mode still demotes non-exact-args block/halt to warn', () => {
