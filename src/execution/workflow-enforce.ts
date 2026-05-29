@@ -18,7 +18,7 @@ import { validateWorkflowDefinition, type WorkflowFrontmatter } from './workflow
  */
 
 export function typedContractEnforced(): boolean {
-  return (getRuntimeEnv('WORKFLOW_TYPED_CONTRACT', 'off') ?? 'off').toLowerCase() === 'on';
+  return (getRuntimeEnv('WORKFLOW_TYPED_CONTRACT', 'on') ?? 'on').toLowerCase() === 'on';
 }
 
 /** Project a typed WorkflowDefinition onto the validator's loose

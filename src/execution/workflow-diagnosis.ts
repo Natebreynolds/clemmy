@@ -38,7 +38,7 @@ import { checkWorkflowForWrite } from './workflow-enforce.js';
 const logger = pino({ name: 'clementine-next.workflow-diagnosis' });
 
 export function selfHealEnabled(): boolean {
-  return (getRuntimeEnv('WORKFLOW_SELF_HEAL', 'off') ?? 'off').toLowerCase() === 'on';
+  return (getRuntimeEnv('WORKFLOW_SELF_HEAL', 'on') ?? 'on').toLowerCase() === 'on';
 }
 
 // ─── 1. Detect blocked steps ─────────────────────────────────────────

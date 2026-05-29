@@ -1481,14 +1481,14 @@ function runDrainConcurrency(): number {
 // flip to 'on' to make workflow steps deterministic units that emit
 // structured results and cannot re-trigger their own workflow.
 function useWorkflowStepAgent(): boolean {
-  return (getRuntimeEnv('WORKFLOW_STEP_AGENT', 'off') ?? 'off').toLowerCase() === 'on';
+  return (getRuntimeEnv('WORKFLOW_STEP_AGENT', 'on') ?? 'on').toLowerCase() === 'on';
 }
 
 // Flag-gate for the typed step-I/O contract (binding + structured
 // delivery + bind-time fast-fail). Default OFF → a step with no declared
 // `inputs` takes today's template-only path byte-for-byte.
 function useTypedContract(): boolean {
-  return (getRuntimeEnv('WORKFLOW_TYPED_CONTRACT', 'off') ?? 'off').toLowerCase() === 'on';
+  return (getRuntimeEnv('WORKFLOW_TYPED_CONTRACT', 'on') ?? 'on').toLowerCase() === 'on';
 }
 
 // Render the bound inputs + upstream outputs as an authoritative

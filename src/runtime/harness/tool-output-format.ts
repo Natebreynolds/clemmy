@@ -13,7 +13,7 @@ export const DEFAULT_TOOL_RESULT_MAX_CHARS = 12000;
 function digestEnabled(): boolean {
   // getRuntimeEnv reads the .env files (the daemon does not load them into
   // process.env), matching how every other flag is gated.
-  return (getRuntimeEnv('LARGE_TOOL_OUTPUT_DIGEST', 'off') || 'off').trim().toLowerCase() === 'on';
+  return (getRuntimeEnv('LARGE_TOOL_OUTPUT_DIGEST', 'on') || 'on').trim().toLowerCase() === 'on';
 }
 
 export interface RecallableToolTextOptions {

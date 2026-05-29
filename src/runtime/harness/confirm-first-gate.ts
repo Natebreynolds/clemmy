@@ -107,7 +107,7 @@ export function decideInstructionReview(opts: {
 }
 
 export function isConfirmFirstEnabled(): boolean {
-  const raw = (getRuntimeEnv('CLEMMY_CONFIRM_FIRST', 'off') ?? 'off').toLowerCase();
+  const raw = (getRuntimeEnv('CLEMMY_CONFIRM_FIRST', 'on') ?? 'on').toLowerCase();
   return raw === 'on' || raw === 'strict' || raw === 'true' || raw === '1';
 }
 

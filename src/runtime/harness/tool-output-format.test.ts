@@ -7,6 +7,10 @@ import os from 'node:os';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-tool-output-format-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
+// These tests cover the LEGACY clip-and-recall path (now non-default since
+// LARGE_TOOL_OUTPUT_DIGEST ships on). Force it off here; the digest path is
+// covered by tool-output-digest.test.ts.
+process.env.LARGE_TOOL_OUTPUT_DIGEST = 'off';
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 import { test } from 'node:test';
