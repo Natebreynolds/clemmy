@@ -13,6 +13,7 @@ import {
 import { MODELS } from '../config.js';
 import { addRunEvent, finishRun, getRun, listRuns, startRun, type RunRecord } from '../runtime/run-events.js';
 import { loadProactivityPolicy } from '../agents/proactivity-policy.js';
+import { applyProposedFix, dismissProposedFix, listProposedFixes, loadProposedFix } from '../execution/workflow-diagnosis.js';
 import type { ToolActivity } from '../types.js';
 
 const logger = pino({ name: 'clementine-next.gateway' });
@@ -59,7 +60,10 @@ type GatewayCommand =
   | { type: 'resume_task'; id: string }
   | { type: 'list_runs' }
   | { type: 'stop_active' }
-  | { type: 'run_status'; id: string };
+  | { type: 'run_status'; id: string }
+  | { type: 'list_fixes' }
+  | { type: 'apply_fix'; id: string }
+  | { type: 'dismiss_fix'; id: string };
 
 function clean(value: string, maxChars = 200): string {
   return value.replace(/\s+/g, ' ').trim().slice(0, maxChars);
@@ -111,6 +115,19 @@ function parseCommand(message: string): GatewayCommand | null {
   const resumeMatch = withoutSlash.match(/^(?:resume|continue)\s+(bg-[a-z0-9]+-[a-f0-9]+)$/i);
   if (resumeMatch) {
     return { type: 'resume_task', id: resumeMatch[1] };
+  }
+
+  // Self-heal: approve/skip a proposed workflow fix Clem diagnosed.
+  if (/^(fixes|list fixes|proposed fixes)$/i.test(withoutSlash)) {
+    return { type: 'list_fixes' };
+  }
+  const applyFixMatch = withoutSlash.match(/^(?:apply|approve|accept)\s+fix\s+(fix-[a-z0-9]+)$/i);
+  if (applyFixMatch) {
+    return { type: 'apply_fix', id: applyFixMatch[1].toLowerCase() };
+  }
+  const dismissFixMatch = withoutSlash.match(/^(?:dismiss|skip|reject|decline)\s+fix\s+(fix-[a-z0-9]+)$/i);
+  if (dismissFixMatch) {
+    return { type: 'dismiss_fix', id: dismissFixMatch[1].toLowerCase() };
   }
 
   return null;
@@ -340,6 +357,41 @@ export class ClementineGateway {
 
     if (command.type === 'stop_active') {
       return handleStopActive(request);
+    }
+
+    // Self-heal: the user approves/skips a workflow fix Clem proposed.
+    if (command.type === 'list_fixes') {
+      const fixes = listProposedFixes().slice(0, 10);
+      const text = fixes.length === 0
+        ? 'No proposed workflow fixes right now.'
+        : [
+            'Proposed workflow fixes:',
+            ...fixes.map((f) => `- \`${f.id}\` | ${f.workflow} · ${f.stepId} | ${f.diagnosis.fix.description}${f.diagnosis.fix.autoApplicable ? '' : ' (needs manual action)'}`),
+            '',
+            'Apply one with `apply fix <id>`, or skip with `dismiss fix <id>`.',
+          ].join('\n');
+      return { sessionId: request.sessionId, handledControl: true, text };
+    }
+
+    if (command.type === 'apply_fix') {
+      const fix = loadProposedFix(command.id);
+      if (!fix) {
+        return { sessionId: request.sessionId, handledControl: true, text: `I couldn't find proposed fix ${command.id}. Use \`fixes\` to list current ones.` };
+      }
+      const result = applyProposedFix(command.id);
+      const text = result.ok
+        ? `✅ ${result.message}`
+        : `I didn't apply ${command.id}: ${result.message}${result.errors?.length ? `\n${result.errors.join('\n')}` : ''}`;
+      return { sessionId: request.sessionId, handledControl: true, text };
+    }
+
+    if (command.type === 'dismiss_fix') {
+      const dismissed = dismissProposedFix(command.id);
+      return {
+        sessionId: request.sessionId,
+        handledControl: true,
+        text: dismissed ? `Dismissed proposed fix ${command.id}.` : `I couldn't find proposed fix ${command.id}.`,
+      };
     }
 
     const resumed = resumeBackgroundTask(command.id);
