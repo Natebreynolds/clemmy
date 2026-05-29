@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import pino from 'pino';
-import { BASE_DIR, DISCORD_DM_ALLOWED_USERS } from '../config.js';
+import { BASE_DIR, DISCORD_DM_ALLOWED_USERS, DISCORD_PUSH_PROACTIVE_BRIEFS } from '../config.js';
 import type { ClementineAssistant } from '../assistant/core.js';
 import { listBackgroundTasks } from '../execution/background-tasks.js';
 import { ExecutionStore } from '../execution/store.js';
@@ -68,6 +68,11 @@ export function approvalSummaryMetadataForBrief(approvals: PendingApprovalRow[])
     approvalIds: approvals.map((approval) => approval.approvalId),
     approvalSubjects: approvals.slice(0, 4).map((approval) => approval.subject),
   };
+}
+
+export function discordUserIdForProactiveBrief(allowDiscordCheckIns: boolean): string | undefined {
+  if (!allowDiscordCheckIns || !DISCORD_PUSH_PROACTIVE_BRIEFS) return undefined;
+  return DISCORD_DM_ALLOWED_USERS[0];
 }
 
 function ensureStateDir(): void {
@@ -145,9 +150,11 @@ export function shouldSendBrief(
   if (!state.lastBriefAt) return true;
   const elapsedMs = nowMs - new Date(state.lastBriefAt).getTime();
   const repeatWindowMs = Math.max(URGENT_REPEAT_MINUTES, cadenceMinutes * 60_000);
+  const repeatStaleAttention = /^(1|true|on|yes)$/i.test(process.env.CLEMMY_PROACTIVE_REPEAT_STALE_ATTENTION ?? '');
 
   if (urgent) {
     if (attentionSignature && state.lastAttentionSignature === attentionSignature) {
+      if (!repeatStaleAttention) return false;
       return elapsedMs >= repeatWindowMs;
     }
     return true;
@@ -335,7 +342,7 @@ export async function processProactiveBriefs(assistant: ClementineAssistant): Pr
     read: false,
     metadata: {
       proactiveBrief: true,
-      discordUserId: policy.allowDiscordCheckIns ? DISCORD_DM_ALLOWED_USERS[0] : undefined,
+      discordUserId: discordUserIdForProactiveBrief(policy.allowDiscordCheckIns),
       activeExecutionCount: executions.length,
       activeBackgroundTaskCount: activeTasks.length,
       pendingApprovalCount: approvals.length,

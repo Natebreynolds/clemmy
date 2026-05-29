@@ -140,6 +140,13 @@ export function surfacePlan(input: SurfacePlanInput): PlanProposal {
   const questionsBlock = proposal.plan.needsUserInput.length > 0
     ? `\n\nQuestions before I start:\n${proposal.plan.needsUserInput.map((q) => `  · ${q}`).join('\n')}`
     : '';
+  // Move 3 — surface the standing instructions this plan is following so
+  // the user can confirm (or prune) them before approving. Older plans
+  // (pre-Move-3) have no appliedInstructions field → block is omitted.
+  const appliedInstructions = proposal.plan.appliedInstructions ?? [];
+  const instructionsBlock = appliedInstructions.length > 0
+    ? `\n\nInstructions I'm following (from memory — tell me if any are wrong):\n${appliedInstructions.map((i) => `  · ${i}`).join('\n')}`
+    : '';
 
   addNotification({
     id: `${Date.now()}-plan-proposal-${proposal.id}`,
@@ -150,6 +157,7 @@ export function surfacePlan(input: SurfacePlanInput): PlanProposal {
       proposal.context ? `\nContext: ${proposal.context}` : '',
       `\nObjective: ${proposal.plan.objective}`,
       `\nSteps:\n${stepSummary}`,
+      instructionsBlock,
       questionsBlock,
       '\n\nReview and approve in the dashboard or reply to approve / reject here.',
     ].filter(Boolean).join(''),
@@ -261,6 +269,7 @@ export function approvePlanProposal(id: string, options: ApprovePlanProposalOpti
     ].join(' '),
     createdAt: new Date().toISOString(),
     read: false,
+    silent: true,
     metadata: { planProposalId: proposal.id, sessionId: proposal.sessionId, kind: 'plan_proposal' },
   });
 

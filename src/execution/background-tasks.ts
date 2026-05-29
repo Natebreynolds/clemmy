@@ -39,7 +39,7 @@ export interface BackgroundTaskRecord {
   channel?: string;
   model?: string;
   maxMinutes: number;
-  source: 'discord' | 'webhook' | 'cli' | 'gateway' | 'daemon';
+  source: 'discord' | 'webhook' | 'cli' | 'gateway' | 'daemon' | 'mobile';
   createdAt: string;
   updatedAt: string;
   startedAt?: string;
@@ -83,6 +83,7 @@ const BACKGROUND_TASK_DIR = path.join(BASE_DIR, 'state', 'background-tasks');
 const RESULT_TRUNCATE_CHARS = 4000;
 const PROGRESS_CHECKIN_TOOL_INTERVAL = 5;
 const DAEMON_RESTART_INTERRUPT_REASON = 'Daemon restarted while task was running.';
+let backgroundProcessorInFlight = false;
 
 function ensureTaskDir(): void {
   mkdirSync(BACKGROUND_TASK_DIR, { recursive: true });
@@ -487,12 +488,15 @@ export function interruptStaleRunningBackgroundTasks(): number {
 }
 
 export async function processBackgroundTasks(assistant: ClementineAssistant, limit?: number): Promise<number> {
-  const policy = loadProactivityPolicy();
-  const requestedLimit = typeof limit === 'number' ? limit : policy.maxConcurrentBackgroundTasks;
-  const effectiveLimit = Math.max(1, Math.min(requestedLimit, policy.maxConcurrentBackgroundTasks));
-  const progressCheckInMinMs = getBackgroundCheckInMs(policy);
-  const pending = listBackgroundTasks({ status: 'pending' }).slice(0, effectiveLimit);
-  let processed = 0;
+  if (backgroundProcessorInFlight) return 0;
+  backgroundProcessorInFlight = true;
+  try {
+    const policy = loadProactivityPolicy();
+    const requestedLimit = typeof limit === 'number' ? limit : policy.maxConcurrentBackgroundTasks;
+    const effectiveLimit = Math.max(1, Math.min(requestedLimit, policy.maxConcurrentBackgroundTasks));
+    const progressCheckInMinMs = getBackgroundCheckInMs(policy);
+    const pending = listBackgroundTasks({ status: 'pending' }).slice(0, effectiveLimit);
+    let processed = 0;
 
 	  for (const queued of pending) {
 	    const runningTask = markBackgroundTaskRunning(queued.id);
@@ -700,7 +704,10 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	    }
   }
 
-  return processed;
+    return processed;
+  } finally {
+    backgroundProcessorInFlight = false;
+  }
 }
 
 export function renderBackgroundTask(task: BackgroundTaskRecord): string {

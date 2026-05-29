@@ -52,6 +52,8 @@ echo "-> Building desktop shell"
 echo "-> Building daemon"
 (cd "$ROOT_DIR" && npm run build)
 
+echo "-> Building mobile web app"
+(cd "$ROOT_DIR" && npm run build:mobile-web)
+
 build_arch arm64 arm64
 build_arch x64 x86_64
-

@@ -160,6 +160,8 @@ const ALWAYS_READ = new Set<string>([
   // / fetch metadata.
   'agent_runs_recent',
   'agent_run_get',
+  'background_tasks_recent',
+  'background_task_status',
   'memory_list_facts',
   'memory_read',
   'memory_recall',
@@ -200,6 +202,11 @@ const ALWAYS_READ = new Set<string>([
   'draft_plan',
   'surface_plan',
   'propose_check_in_template',
+  // workflow_run only queues a local workflow run record. The workflow
+  // runner still gates external writes/sends inside the workflow, so
+  // approving the queue action itself created duplicate approval noise
+  // without adding safety.
+  'workflow_run',
 ]);
 
 /**

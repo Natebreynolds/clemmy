@@ -1,10 +1,14 @@
-import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
 import path from 'node:path';
 import pino from 'pino';
 import type { ClementineAssistant } from '../assistant/core.js';
-import { MODELS } from '../config.js';
+import { MODELS, getRuntimeEnv } from '../config.js';
+import { runBoundedPool } from './bounded-pool.js';
+import { bindStepInputs } from './step-binding.js';
 import { addNotification } from '../runtime/notifications.js';
 import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
+import { WORKFLOWS_DIR } from '../memory/vault.js';
 import {
   listWorkflows,
   type WorkflowDefinition,
@@ -17,11 +21,18 @@ import {
   listPendingRuns,
 } from './workflow-events.js';
 import { HarnessSession } from '../runtime/harness/session.js';
-import { runConversation, runConversationFromResume } from '../runtime/harness/loop.js';
+import {
+  runConversation,
+  runConversationFromResume,
+  type RunConversationResult,
+} from '../runtime/harness/loop.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { buildOrchestratorAgent } from '../agents/orchestrator.js';
+import { buildWorkflowStepAgent } from '../agents/workflow-step-agent.js';
+import { takeStepResult } from '../tools/step-result-tool.js';
 import { configureHarnessRuntime } from '../runtime/harness/codex-client.js';
 import { closePlanScope, openPlanScope } from '../agents/plan-scope.js';
+import { missingWorkflowRunInputs, normalizeWorkflowRunInputs } from './workflow-inputs.js';
 
 const logger = pino({ name: 'clementine-next.workflow-runner' });
 
@@ -33,10 +44,10 @@ const logger = pino({ name: 'clementine-next.workflow-runner' });
  * ways based on the step's shape:
  *
  *   1. **deterministic step** — `step.deterministic.runner` is set.
- *      Bypass the LLM, execute the named helper from scripts/. Right
- *      now we just record a no-op event; the actual script-spawn
- *      machinery is staged behind an explicit user enablement so we
- *      don't shell out arbitrary code by accident.
+ *      Bypass the LLM and execute a named helper from this workflow's
+ *      scripts/ directory with structured JSON on stdin. The runner is
+ *      constrained to bundled scripts so imported frameworks can use
+ *      deterministic helpers without opening a generic shell surface.
  *
  *   2. **forEach step** — `step.forEach` names an upstream output
  *      that resolved to an array. Iterate that array with bounded
@@ -63,6 +74,7 @@ const RUNNER_CONCURRENCY = parseInt(process.env.CLEMENTINE_WORKFLOW_CONCURRENCY 
 // it should be a tight rollup, not exploration.
 const WORKFLOW_STEP_WALL_CLOCK_MS = parseInt(process.env.CLEMENTINE_WORKFLOW_STEP_WALL_MS ?? `${15 * 60_000}`, 10);
 const WORKFLOW_SYNTHESIS_WALL_CLOCK_MS = parseInt(process.env.CLEMENTINE_WORKFLOW_SYNTHESIS_WALL_MS ?? `${5 * 60_000}`, 10);
+const WORKFLOW_DETERMINISTIC_TIMEOUT_MS = parseInt(process.env.CLEMENTINE_WORKFLOW_DETERMINISTIC_TIMEOUT_MS ?? `${5 * 60_000}`, 10);
 
 // Workflow run heartbeats — same pattern as cron. A 30-min fan-out
 // over 50 items shouldn't go silent between "started" and "completed".
@@ -281,6 +293,165 @@ function renderTemplate(
     });
 }
 
+interface DeterministicStepPayload {
+  workflow: string;
+  workflowSlug: string;
+  runId: string;
+  stepId: string;
+  inputs: Record<string, string>;
+  stepOutputs: Record<string, unknown>;
+}
+
+function redactProcessOutput(text: string): string {
+  return text
+    .replace(/sk-[A-Za-z0-9_-]{8,}/g, (m) => `${m.slice(0, 11)}...REDACTED`)
+    .replace(/Bearer\s+[A-Za-z0-9._-]+/gi, 'Bearer [REDACTED]')
+    .replace(/([A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD)\s*[=:]\s*)\S+/gi, '$1[REDACTED]');
+}
+
+function resolveDeterministicRunner(workflowSlug: string, runner: string): { command: string; args: string[]; cwd: string; target: string } {
+  const raw = runner.trim();
+  if (!raw) throw new Error('deterministic runner is empty');
+  if (/\s/.test(raw)) {
+    throw new Error('deterministic runner must be a script path under scripts/ without inline arguments');
+  }
+  if (path.isAbsolute(raw) || raw.split(/[\\/]/).includes('..')) {
+    throw new Error('deterministic runner must stay inside the workflow scripts/ directory');
+  }
+
+  const workflowDir = path.resolve(WORKFLOWS_DIR, workflowSlug);
+  const scriptsDir = path.resolve(workflowDir, 'scripts');
+  const rel = raw.startsWith('scripts/') || raw.startsWith('scripts\\') ? raw : path.join('scripts', raw);
+  const target = path.resolve(workflowDir, rel);
+  if (target !== scriptsDir && !target.startsWith(`${scriptsDir}${path.sep}`)) {
+    throw new Error('deterministic runner resolved outside scripts/');
+  }
+  if (!existsSync(target)) {
+    throw new Error(`deterministic runner not found: ${rel}`);
+  }
+
+  const ext = path.extname(target).toLowerCase();
+  if (ext === '.js' || ext === '.mjs' || ext === '.cjs') {
+    return { command: process.execPath, args: [target], cwd: workflowDir, target };
+  }
+  if (ext === '.py') {
+    return { command: 'python3', args: [target], cwd: workflowDir, target };
+  }
+  if (ext === '.sh' || ext === '.bash') {
+    return { command: 'bash', args: [target], cwd: workflowDir, target };
+  }
+
+  const mode = statSync(target).mode;
+  if ((mode & 0o111) !== 0) {
+    return { command: target, args: [], cwd: workflowDir, target };
+  }
+  throw new Error(`unsupported deterministic runner extension for ${rel}; use .js, .mjs, .cjs, .py, .sh, or an executable file`);
+}
+
+export async function runDeterministicWorkflowStepForTest(
+  runner: string,
+  payload: DeterministicStepPayload,
+): Promise<unknown> {
+  return runDeterministicWorkflowStep(runner, payload);
+}
+
+/**
+ * Turn a raw child-process spawn failure into an actionable message.
+ * The important case: on the PACKAGED macOS app, child scripts spawned
+ * by the Electron daemon get EPERM on uv_cwd (TCC sandbox) — a cryptic
+ * failure that looks like a bug. Name it so the user knows the fix is
+ * entitlements, not the workflow. Pure + exported for tests.
+ */
+export function explainDeterministicSpawnError(err: unknown, target: string): Error {
+  const msg = err instanceof Error ? err.message : String(err);
+  const code = (err as { code?: string } | null)?.code;
+  if (code === 'EPERM' || code === 'EACCES' || /\bEPERM\b|uv_cwd|operation not permitted/i.test(msg)) {
+    return new Error(
+      `deterministic runner could not launch (${code ?? 'permission denied'}): ${target}. ` +
+      'On the packaged macOS app, child scripts are blocked by the app sandbox (TCC) until Clementine has ' +
+      'filesystem entitlements / a launchd context. Run this workflow from the dev build, or grant the ' +
+      `entitlement, then retry. (original: ${msg})`,
+    );
+  }
+  if (code === 'ENOENT') {
+    return new Error(
+      `deterministic runner not launchable — interpreter or script missing for ${target}: ${msg}`,
+    );
+  }
+  return err instanceof Error ? err : new Error(msg);
+}
+
+async function runDeterministicWorkflowStep(
+  runner: string,
+  payload: DeterministicStepPayload,
+): Promise<unknown> {
+  const resolved = resolveDeterministicRunner(payload.workflowSlug, runner);
+  const input = JSON.stringify(payload);
+  const startedAt = Date.now();
+  return await new Promise<unknown>((resolve, reject) => {
+    const child = spawn(resolved.command, resolved.args, {
+      cwd: resolved.cwd,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: {
+        PATH: process.env.PATH ?? '',
+        HOME: process.env.HOME ?? '',
+        TMPDIR: process.env.TMPDIR ?? '',
+        CLEMENTINE_HOME: process.env.CLEMENTINE_HOME ?? '',
+        CLEMENTINE_WORKFLOW_RUN_ID: payload.runId,
+        CLEMENTINE_WORKFLOW_STEP_ID: payload.stepId,
+      },
+    });
+    let stdout = '';
+    let stderr = '';
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill('SIGTERM');
+      setTimeout(() => child.kill('SIGKILL'), 2_000).unref?.();
+    }, WORKFLOW_DETERMINISTIC_TIMEOUT_MS);
+    timer.unref?.();
+
+    child.stdout.setEncoding('utf-8');
+    child.stderr.setEncoding('utf-8');
+    child.stdout.on('data', (chunk) => { stdout += String(chunk); });
+    child.stderr.on('data', (chunk) => { stderr += String(chunk); });
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      reject(explainDeterministicSpawnError(err, resolved.target));
+    });
+    child.on('close', (code, signal) => {
+      clearTimeout(timer);
+      const cleanStdout = redactProcessOutput(stdout.trim());
+      const cleanStderr = redactProcessOutput(stderr.trim());
+      if (timedOut) {
+        reject(new Error(`deterministic runner timed out after ${WORKFLOW_DETERMINISTIC_TIMEOUT_MS}ms`));
+        return;
+      }
+      if (code !== 0) {
+        reject(new Error(`deterministic runner failed (${signal ?? `exit ${code}`}): ${cleanStderr || cleanStdout || 'no output'}`));
+        return;
+      }
+      logger.info({
+        workflow: payload.workflow,
+        runId: payload.runId,
+        stepId: payload.stepId,
+        runner,
+        durationMs: Date.now() - startedAt,
+      }, 'deterministic workflow step completed');
+      if (!cleanStdout) {
+        resolve({ ok: true, stdout: '', stderr: cleanStderr || undefined });
+        return;
+      }
+      try {
+        resolve(JSON.parse(cleanStdout));
+      } catch {
+        resolve(cleanStdout);
+      }
+    });
+    child.stdin.end(input);
+  });
+}
+
 /**
  * Try to coerce a step output into an iterable array for forEach.
  * Strategy, in order:
@@ -435,11 +606,87 @@ function workflowAutoApprovalTools(workflow: WorkflowDefinition, step: WorkflowS
 }
 
 interface HarnessStepResult {
-  output: string;
+  /** Structured when the step emitted workflow_step_result; the agent's
+   *  prose reply/summary otherwise (backward-compat fallback). */
+  output: unknown;
   /** True if any pauses-and-resumes happened during the step. */
   hadApprovals: boolean;
   approvalIds: string[];
+  /** True when `output` came from an explicit workflow_step_result call
+   *  rather than the prose fallback (telemetry / migration signal). */
+  usedStructuredResult?: boolean;
 }
+
+function workflowHarnessMetadataMatches(
+  session: HarnessSession,
+  workflowName: string,
+  stepId: string,
+): boolean {
+  const metadata = session.sessionRow.metadata;
+  return session.sessionRow.kind === 'workflow'
+    && metadata.source === 'workflow'
+    && metadata.workflowName === workflowName
+    && metadata.stepId === stepId;
+}
+
+function findParkedWorkflowHarnessSession(
+  workflowName: string,
+  stepId: string,
+  workflowRunId: string,
+): HarnessSession | null {
+  const pending = approvalRegistry.listPending({ status: 'pending' });
+  let fallback: HarnessSession | null = null;
+
+  for (const row of pending) {
+    const session = HarnessSession.load(row.sessionId);
+    if (!session || !workflowHarnessMetadataMatches(session, workflowName, stepId)) continue;
+
+    const metadata = session.sessionRow.metadata;
+    if (metadata.workflowRunId === workflowRunId) return session;
+
+    // Sessions created before workflowRunId was persisted still need to
+    // resume cleanly after a daemon restart. Pick the newest pending
+    // legacy session as a fallback; listPending is ordered newest first.
+    if (metadata.workflowRunId === undefined && fallback === null) {
+      fallback = session;
+    }
+  }
+
+  return fallback;
+}
+
+function getWorkflowHarnessSession(
+  workflowName: string,
+  stepId: string,
+  workflowRunId: string,
+  sessionIdSuffix: string,
+): HarnessSession {
+  const deterministicSessionId = `workflow:${sessionIdSuffix}`;
+  const existing = HarnessSession.load(deterministicSessionId);
+  if (existing) return existing;
+
+  const parked = findParkedWorkflowHarnessSession(workflowName, stepId, workflowRunId);
+  if (parked) return parked;
+
+  return HarnessSession.create({
+    id: deterministicSessionId,
+    kind: 'workflow',
+    channel: 'workflow',
+    title: `${workflowName}::${stepId}`,
+    metadata: {
+      source: 'workflow',
+      workflowName,
+      workflowRunId,
+      stepId,
+      sessionIdSuffix,
+    },
+  });
+}
+
+export const workflowRunnerInternalsForTest = {
+  findParkedWorkflowHarnessSession,
+  getWorkflowHarnessSession,
+};
 
 async function runStepViaHarness(
   step: WorkflowStepInput,
@@ -448,6 +695,7 @@ async function runStepViaHarness(
   workflowName: string,
   allowedTools: string[],
   workflowRunId: string,
+  stepContext?: { values: Record<string, unknown>; upstream: Record<string, unknown>; item?: unknown },
 ): Promise<HarnessStepResult> {
   // T-WF-1 — configure the codex OAuth bridge BEFORE the SDK runner
   // touches the model. Discord + chat-dock paths do this at every
@@ -461,23 +709,16 @@ async function runStepViaHarness(
       `Codex auth not configured for workflow step "${step.id}": ${auth.reason ?? 'unknown'}`,
     );
   }
-  // Create a per-step harness session. The session id is namespaced
-  // by workflow run + step id so resume across daemon restarts is
-  // possible (the registry rows survive; the session row survives;
-  // the next runner can pick up).
-  const sessionId = `workflow:${sessionIdSuffix}`;
-  const session = HarnessSession.create({
-    kind: 'workflow',
-    channel: 'workflow',
-    title: `${workflowName}::${step.id}`,
-    metadata: {
-      source: 'workflow',
-      workflowName,
-      stepId: step.id,
-    },
-  });
-  // ↑ HarnessSession.create generates its own session.id; we use that
-  // rather than the suffix-derived one. The suffix is informational.
+  // Per-step harness sessions must be stable across daemon restarts.
+  // If the prior process parked on approval, reusing the same session
+  // is what prevents a second approval from being minted for the same
+  // workflow step.
+  const session = getWorkflowHarnessSession(
+    workflowName,
+    step.id,
+    workflowRunId,
+    sessionIdSuffix,
+  );
   const realSessionId = session.id;
   openPlanScope({
     sessionId: realSessionId,
@@ -495,13 +736,37 @@ async function runStepViaHarness(
     // Build a fresh orchestrator each call so it picks up current memory
     // context + connected toolkit list.
     // Initial turn.
-    const message = `Workflow: ${workflowName}\nStep: ${step.id}\n\n${promptBody}`;
-    const agent = await buildOrchestratorAgent({ userInput: message, sessionId: realSessionId });
-    let result = await runConversation({
-      agent,
-      sessionId: realSessionId,
-      input: message,
-    });
+    const proseMessage = `Workflow: ${workflowName}\nStep: ${step.id}\n\n${promptBody}`;
+    // Typed-contract delivery (P1): when the step declared inputs and the
+    // contract flag + step agent are on, append the BOUND inputs/upstream
+    // as a structured block AFTER the prose (never replacing it). This is
+    // authoritative data the step can use even if a template token typo
+    // dropped a value from the prose — it cannot be falsely starved.
+    const message = useTypedContract() && useWorkflowStepAgent() && stepContext
+      ? `${proseMessage}\n\n${renderStepContextBlock(stepContext)}`
+      : proseMessage;
+    // Flag-gated (WORKFLOW_STEP_AGENT): the constrained step agent emits
+    // structured output via workflow_step_result and CANNOT re-trigger
+    // workflows (no recursion). Default off → the full orchestrator +
+    // prose capture, byte-identical to prior behavior.
+    const agent = useWorkflowStepAgent()
+      ? await buildWorkflowStepAgent({ userInput: message, sessionId: realSessionId })
+      : await buildOrchestratorAgent({ userInput: message, sessionId: realSessionId });
+    let result: RunConversationResult;
+    if (session.loadInterruptState() || approvalRegistry.hasPending(realSessionId)) {
+      result = {
+        sessionId: realSessionId,
+        status: 'awaiting_approval',
+        steps: 0,
+        lastTurn: 0,
+      };
+    } else {
+      result = await runConversation({
+        agent,
+        sessionId: realSessionId,
+        input: message,
+      });
+    }
 
     // Loop until terminal (completed / failed / awaiting_user_input).
     while (result.status === 'awaiting_approval') {
@@ -526,7 +791,11 @@ async function runStepViaHarness(
           approvalIds.push(row.approvalId);
           try {
             addNotification({
-              id: `wf-approval-${row.approvalId}-${Date.now()}`,
+              // Same stable ID as the harness approval notification.
+              // addNotification dedupes by id, so workflow parking
+              // enriches the dashboard/runtime state without creating
+              // a second Discord/mobile card for the same decision.
+              id: `approval-${row.approvalId}`,
               kind: 'approval',
               title: `Workflow ${workflowName} · ${step.id} needs approval`,
               body: `**${row.subject}**\n\nTap **Approve**, **Edit**, or **Reject** below — or reply \`approve ${row.approvalId}\` / \`reject ${row.approvalId}\` if you prefer. The workflow is parked on step \`${step.id}\` until you respond.`,
@@ -597,13 +866,22 @@ async function runStepViaHarness(
     const completed = listHarnessEvents(realSessionId, { types: ['conversation_completed'] });
     const lastCompletion = completed[completed.length - 1];
     const lastDecision = result.lastDecision;
-    const output = (lastDecision?.reply && lastDecision.reply.trim())
+    const prose = (lastDecision?.reply && lastDecision.reply.trim())
       || (lastDecision?.summary)
       || (lastCompletion?.data?.reply as string | undefined)
       || (lastCompletion?.data?.summary as string | undefined)
       || '';
 
-    return { output, hadApprovals, approvalIds };
+    // Prefer the explicit structured result the step emitted via
+    // workflow_step_result (captured full, unclipped, keyed by session).
+    // Fall back to the agent's prose when the step didn't emit one — so a
+    // step (or the legacy orchestrator path) that never calls the tool
+    // behaves exactly as before.
+    const captured = takeStepResult(realSessionId);
+    if (captured.found) {
+      return { output: captured.value, hadApprovals, approvalIds, usedStructuredResult: true };
+    }
+    return { output: prose, hadApprovals, approvalIds, usedStructuredResult: false };
   } finally {
     // Belt + suspenders: clear the heartbeat gate in finally so a throw
     // mid-resume doesn't leave the heartbeat permanently suppressed
@@ -619,23 +897,162 @@ async function runStepViaHarness(
  * Returns the step's output for downstream template rendering and the
  * final synthesis. Throws on irrecoverable errors.
  */
+/**
+ * Declarative approval gate (autonomous-by-default workflow model). The
+ * runner — not the agent — owns the pause: it registers ONE approval for
+ * (runId, stepId), surfaces a single notification, and polls until the
+ * user resolves it. Resume-safe: the registry row is keyed by a stable
+ * gate session id, so a daemon restart re-finds the pending/resolved
+ * approval instead of re-prompting. Approved → return (step proceeds);
+ * rejected/expired → throw (the run fails loudly and reports back).
+ */
+async function awaitDeclarativeStepApproval(
+  ctx: StepExecutionContext,
+  step: WorkflowStepInput,
+): Promise<void> {
+  const gateSessionId = `workflow-gate:${ctx.runId}:${step.id}`;
+  const startedAt = Date.now();
+
+  const settledResolution = (): string | undefined =>
+    approvalRegistry
+      .listPending({ sessionId: gateSessionId, status: 'any' })
+      .find((r) => r.resolution)?.resolution ?? undefined;
+
+  // Already resolved on a prior pass (resume) — honor it without re-prompting.
+  const prior = settledResolution();
+  if (prior) {
+    if (prior === 'approved') return;
+    throw new Error(`workflow step "${step.id}" was not approved (${prior})`);
+  }
+
+  // Register the gate once (idempotent across resumes: only if none pending).
+  const pending = approvalRegistry.listPending({ sessionId: gateSessionId, status: 'pending' });
+  let row = pending[0];
+  if (!row) {
+    const subject = (step.approvalPreview && step.approvalPreview.trim())
+      || `Approve "${ctx.workflow.name}" step "${step.id}" before it runs`;
+    row = approvalRegistry.register({
+      sessionId: gateSessionId,
+      subject,
+      tool: 'workflow_approval_gate',
+      ttlMs: WORKFLOW_HARNESS_APPROVAL_MAX_WAIT_MS,
+    });
+    appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
+      kind: 'step_started',
+      stepId: step.id,
+      meta: { gate: 'awaiting_approval', approvalId: row.approvalId },
+    });
+    try {
+      addNotification({
+        id: `approval-${row.approvalId}`,
+        kind: 'approval',
+        title: `Workflow ${ctx.workflow.name} · ${step.id} needs approval`,
+        body: `**${subject}**\n\nApprove to let the workflow continue, or reject to stop it — reply \`approve ${row.approvalId}\` / \`reject ${row.approvalId}\`. The run is parked on \`${step.id}\` until you respond.`,
+        createdAt: new Date().toISOString(),
+        read: false,
+        metadata: { approvalId: row.approvalId, workflowName: ctx.workflow.name, stepId: step.id, gate: true },
+      });
+    } catch { /* notification best-effort; apr id is in the dashboard */ }
+  }
+
+  markWorkflowRunPausedForApproval(ctx.runId);
+  try {
+    while (true) {
+      await new Promise((resolve) => setTimeout(resolve, WORKFLOW_HARNESS_POLL_MS));
+      throwIfWorkflowRunCancelled(ctx.runId);
+      const resolution = settledResolution();
+      if (resolution) {
+        if (resolution === 'approved') return;
+        throw new Error(`workflow step "${step.id}" was not approved (${resolution})`);
+      }
+      if (Date.now() - startedAt > WORKFLOW_HARNESS_APPROVAL_MAX_WAIT_MS) {
+        throw new Error(`workflow step "${step.id}" exceeded approval wait budget (${WORKFLOW_HARNESS_APPROVAL_MAX_WAIT_MS}ms)`);
+      }
+    }
+  } finally {
+    clearWorkflowRunPausedForApproval(ctx.runId);
+  }
+}
+
+/**
+ * Bind a step's declared inputs (typed contract). Returns the structured
+ * context to deliver to the step, or undefined when the step declares no
+ * `inputs` (today's path). When the typed-contract flag is on and a
+ * REQUIRED input is unresolved, emit `step_failed` and throw a named
+ * error BEFORE the step runs — the bind-time fast-fail that converts
+ * silent empty-string starvation into a loud, debuggable failure.
+ */
+function bindStepContext(
+  step: WorkflowStepInput,
+  ctx: StepExecutionContext,
+  item?: unknown,
+): { values: Record<string, unknown>; upstream: Record<string, unknown>; item?: unknown } | undefined {
+  if (!step.inputs || Object.keys(step.inputs).length === 0) return undefined;
+  const bound = bindStepInputs(step, ctx.inputs, ctx.stepOutputs, item);
+  if (useTypedContract() && bound.missing.length > 0) {
+    const message =
+      `Step "${step.id}" missing required input(s): ${bound.missing.join(', ')}`
+      + ` — expected from input.<key> or steps.<dep>.output. Fix the step's \`inputs\` bindings or the run inputs.`;
+    appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
+      kind: 'step_failed',
+      stepId: step.id,
+      error: message,
+      meta: { reason: 'unbound_required_input', missing: bound.missing },
+    });
+    throw new Error(message);
+  }
+  return { values: bound.values, upstream: bound.upstream, item };
+}
+
 async function executeStep(
   step: WorkflowStepInput,
   ctx: StepExecutionContext,
 ): Promise<unknown> {
-  // 1. Deterministic helper — skip the LLM entirely. Right now we
-  //    don't actually shell out (that requires user enablement and a
-  //    sandbox); we record a no-op event so the workflow_runner can
-  //    light up the deterministic path once the scripts/ surface is
-  //    finalised. Returning a sentinel lets template rendering see
-  //    something meaningful for downstream steps.
+  // 0. Opt-in approval gate (autonomous-by-default model). When a step
+  //    declares requiresApproval, the RUNNER surfaces ONE batch approval
+  //    and holds the run here until the user resolves it — then the rest
+  //    of the workflow proceeds autonomously. Declarative + runner-owned,
+  //    so the constrained step agent never needs request_approval and a
+  //    workflow pauses at most where it explicitly opts in.
+  if (step.requiresApproval) {
+    await awaitDeclarativeStepApproval(ctx, step);
+  }
+
+  // 1. Deterministic helper — skip the LLM entirely and run a bundled
+  //    script from this workflow's scripts/ directory. The runner
+  //    receives structured JSON on stdin and emits stdout that is
+  //    parsed as JSON when possible.
   if (step.deterministic?.runner) {
     appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
-      kind: 'step_skipped',
+      kind: 'step_started',
       stepId: step.id,
-      meta: { reason: 'deterministic-not-yet-implemented', runner: step.deterministic.runner },
+      meta: { mode: 'deterministic', runner: step.deterministic.runner },
     });
-    return { deterministic: step.deterministic.runner, note: 'Script execution will be wired in once the scripts/ surface is enabled.' };
+    try {
+      const output = await runDeterministicWorkflowStep(step.deterministic.runner, {
+        workflow: ctx.workflow.name,
+        workflowSlug: ctx.workflowSlug,
+        runId: ctx.runId,
+        stepId: step.id,
+        inputs: ctx.inputs,
+        stepOutputs: ctx.stepOutputs,
+      });
+      appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
+        kind: 'step_completed',
+        stepId: step.id,
+        output,
+        meta: { mode: 'deterministic', runner: step.deterministic.runner },
+      });
+      return output;
+    } catch (err) {
+      appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
+        kind: 'step_failed',
+        stepId: step.id,
+        error: err instanceof Error ? err.message : String(err),
+        meta: { mode: 'deterministic', runner: step.deterministic.runner },
+      });
+      throw err;
+    }
   }
 
   // 2. forEach — iterate an upstream output with bounded concurrency.
@@ -671,6 +1088,9 @@ async function executeStep(
         itemKey: key,
       });
       try {
+        // Bind this item's declared inputs + fast-fail on missing (no-op
+        // when the step declares no `inputs`). `item` is in scope here.
+        const itemContext = bindStepContext(step, ctx, item);
         const prompt = applySkillToPrompt(step, renderTemplate(step.prompt, ctx.inputs, ctx.stepOutputs, item));
         const output = workflowHarnessEnabled(step)
           ? (await runStepViaHarness(
@@ -680,6 +1100,7 @@ async function executeStep(
               ctx.workflow.name,
               workflowAutoApprovalTools(ctx.workflow, step),
               ctx.runId,
+              itemContext,
             )).output
           : (await ctx.assistant.respond({
               sessionId: `workflow:${ctx.runId}:${step.id}:${key}`,
@@ -734,12 +1155,15 @@ async function executeStep(
   //     apr-xxxx code. Real tool outputs flow into stepOutputs.
   //   - LEGACY path: original assistant.respond — preserved for
   //     workflows authored before the harness existed.
+  // Bind declared inputs + fast-fail on a missing required input (no-op
+  // when the step declares no `inputs`).
+  const stepContext = bindStepContext(step, ctx);
   appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
     kind: 'step_started',
     stepId: step.id,
   });
   const prompt = applySkillToPrompt(step, renderTemplate(step.prompt, ctx.inputs, ctx.stepOutputs));
-  let output: string;
+  let output: unknown;
   if (workflowHarnessEnabled(step)) {
     try {
       const result = await runStepViaHarness(
@@ -749,6 +1173,7 @@ async function executeStep(
         ctx.workflow.name,
         workflowAutoApprovalTools(ctx.workflow, step),
         ctx.runId,
+        stepContext,
       );
       output = result.output;
       if (result.hadApprovals) {
@@ -939,14 +1364,38 @@ async function executeWorkflow(
     });
     const stepOutputsAsText = formatStepOutputs(workflow.steps, stepOutputs);
     const synthesisPrompt = renderTemplate(workflow.synthesis.prompt, inputs, stepOutputs);
-    const response = await assistant.respond({
-      sessionId: `workflow:${runId}:synthesis`,
-      channel: 'workflow',
-      message: `${synthesisPrompt}\n\nStep outputs:\n\n${stepOutputsAsText}`,
+    const synthesisStep: WorkflowStepInput = {
+      id: '__synthesis__',
+      prompt: synthesisPrompt,
       model: MODELS.primary,
-      maxWallClockMs: WORKFLOW_SYNTHESIS_WALL_CLOCK_MS,
-    });
-    finalOutput = response.text;
+      maxTurns: 8,
+    };
+    const synthesisResult = await runStepViaHarness(
+      synthesisStep,
+      `${runId}:synthesis`,
+      [
+        'Workflow synthesis pass. Produce the final user-facing result from the completed step outputs.',
+        'Do not start new external research or mutate external systems during synthesis unless the user explicitly asked for that in the workflow synthesis prompt.',
+        '',
+        synthesisPrompt,
+        '',
+        'Step outputs:',
+        '',
+        stepOutputsAsText,
+      ].join('\n'),
+      workflow.name,
+      [],
+      runId,
+    );
+    // Synthesis output is the final user-facing report (a string). The
+    // step result is `unknown` now, so coerce: keep strings as-is,
+    // JSON-render an (unexpected) structured synthesis result.
+    const synthesisText = typeof synthesisResult.output === 'string'
+      ? synthesisResult.output
+      : synthesisResult.output != null
+        ? JSON.stringify(synthesisResult.output, null, 2)
+        : '';
+    finalOutput = synthesisText || formatStepOutputs(workflow.steps, stepOutputs);
     throwIfWorkflowRunCancelled(runId);
     appendWorkflowEvent(workflowSlug, runId, {
       kind: 'step_completed',
@@ -974,9 +1423,84 @@ function stringifyOutputs(stepOutputs: Record<string, unknown>): Record<string, 
  * Main entry — drains the queued-runs directory. Replaces the inline
  * runner that used to live in src/daemon/runner.ts.
  */
+// Single-flight guard. When the drain runs on its own daemon timer
+// (CLEMMY_WORKFLOW_RUN_LANE), the interval can re-fire while a previous
+// drain is still awaiting a long run. This boolean keeps exactly one
+// drain pass in flight at a time so the same run file is never picked
+// up twice concurrently. (True run-level parallelism — draining several
+// runs at once — is a separate, test-gated change; see the work-scheduler
+// follow-up.)
+let workflowDrainInFlight = false;
+
 export async function processWorkflowRuns(assistant: ClementineAssistant): Promise<void> {
   if (!existsSync(WORKFLOW_RUNS_DIR)) return;
+  if (workflowDrainInFlight) return;
+  workflowDrainInFlight = true;
+  try {
+    await drainWorkflowRuns(assistant);
+  } finally {
+    workflowDrainInFlight = false;
+  }
+}
+
+// Per-runId guard so the same run file is never processed by two
+// concurrent slots (or two overlapping drain passes). Module-scoped so
+// it persists across passes.
+const inFlightRunIds = new Set<string>();
+
+// How many queued runs may execute at once. Read at call time so it's
+// runtime-configurable and testable. Default 1 = today's sequential
+// behavior (forward-only: no behavior change until explicitly raised);
+// set CLEMENTINE_WORKFLOW_RUN_CONCURRENCY=3 (etc.) to let independent
+// runs progress in parallel once you've soaked it.
+function runDrainConcurrency(): number {
+  const raw = parseInt(getRuntimeEnv('CLEMENTINE_WORKFLOW_RUN_CONCURRENCY', '1') || '1', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 1;
+}
+
+// Flag-gate for the constrained, structured-output step agent. Default
+// OFF so this lands dark (no behavior change) until verified + soaked;
+// flip to 'on' to make workflow steps deterministic units that emit
+// structured results and cannot re-trigger their own workflow.
+function useWorkflowStepAgent(): boolean {
+  return (getRuntimeEnv('WORKFLOW_STEP_AGENT', 'off') ?? 'off').toLowerCase() === 'on';
+}
+
+// Flag-gate for the typed step-I/O contract (binding + structured
+// delivery + bind-time fast-fail). Default OFF → a step with no declared
+// `inputs` takes today's template-only path byte-for-byte.
+function useTypedContract(): boolean {
+  return (getRuntimeEnv('WORKFLOW_TYPED_CONTRACT', 'off') ?? 'off').toLowerCase() === 'on';
+}
+
+// Render the bound inputs + upstream outputs as an authoritative
+// structured block appended after the prose. Each value is clipped to
+// keep the prompt within budget (token-efficiency north star) — the full
+// value still reaches downstream steps via stepOutputs.
+const STEP_CONTEXT_VALUE_CLIP = 8000;
+function clipForContext(value: unknown): unknown {
+  let json: string;
+  try { json = JSON.stringify(value); } catch { return '[unserializable]'; }
+  if (json.length <= STEP_CONTEXT_VALUE_CLIP) return value;
+  return `[clipped ${json.length} chars — full value available to this step's tools]`;
+}
+function renderStepContextBlock(ctx: { values: Record<string, unknown>; upstream: Record<string, unknown>; item?: unknown }): string {
+  const payload: Record<string, unknown> = {
+    input: Object.fromEntries(Object.entries(ctx.values).map(([k, v]) => [k, clipForContext(v)])),
+    upstream: Object.fromEntries(Object.entries(ctx.upstream).map(([k, v]) => [k, clipForContext(v)])),
+  };
+  if (ctx.item !== undefined) payload.item = clipForContext(ctx.item);
+  return [
+    '=== STEP CONTEXT (structured, authoritative) ===',
+    'This is your bound inputs as real data — it overrides the prose above. If a value you need is empty/absent here, call workflow_step_result({"blocked":true,"reason":"<what is missing>"}) instead of guessing or fabricating.',
+    JSON.stringify(payload, null, 2),
+    '=== END STEP CONTEXT ===',
+  ].join('\n');
+}
+
+async function drainWorkflowRuns(assistant: ClementineAssistant): Promise<void> {
   const workflows = listWorkflows();
+  const eligible: Array<{ file: string; filePath: string; run: QueuedRunRecord }> = [];
   for (const file of readdirSync(WORKFLOW_RUNS_DIR).filter((entry) => entry.endsWith('.json'))) {
     const filePath = path.join(WORKFLOW_RUNS_DIR, file);
     const run = readRunRecord(filePath);
@@ -984,34 +1508,107 @@ export async function processWorkflowRuns(assistant: ClementineAssistant): Promi
     // Pick up queued runs and runs marked as running but never
     // completed (resume after daemon restart).
     if (run.status && run.status !== 'queued' && run.status !== 'running') continue;
+    if (inFlightRunIds.has(run.id)) continue; // already draining in another slot
+    eligible.push({ file, filePath, run });
+  }
+  if (eligible.length === 0) return;
 
+  await runBoundedPool(
+    eligible,
+    runDrainConcurrency(),
+    async (item) => {
+      if (inFlightRunIds.has(item.run.id)) return;
+      inFlightRunIds.add(item.run.id);
+      try {
+        await processOneRunFile(item.file, item.filePath, item.run, workflows, assistant);
+      } finally {
+        inFlightRunIds.delete(item.run.id);
+      }
+    },
+    (err, item) => logger.error({ err, file: item.file }, 'Workflow run drain task crashed'),
+  );
+}
+
+async function processOneRunFile(
+  file: string,
+  filePath: string,
+  run: QueuedRunRecord,
+  workflows: ReturnType<typeof listWorkflows>,
+  assistant: ClementineAssistant,
+): Promise<void> {
     const workflow = workflows.find((entry) => entry.data.name === run.workflow);
     if (!workflow) {
+      const message = `Workflow not found: "${run.workflow}". It may have been renamed or deleted.`;
       writeRunRecord(filePath, {
         ...run,
         status: 'error',
-        error: 'Workflow not found',
+        error: message,
         finishedAt: new Date().toISOString(),
       });
-      continue;
+      // Reports-back: a run that can't even resolve its workflow must not
+      // die silently (the user queued it and is waiting).
+      addNotification({
+        id: `workflow-${run.id}-not-found`,
+        kind: 'workflow',
+        title: `Workflow failed before start: ${run.workflow}`,
+        body: `${message} Check the workflow name in Console → Workflows, then re-run.`,
+        createdAt: new Date().toISOString(),
+        read: false,
+        metadata: { workflow: run.workflow, runId: run.id },
+      });
+      return;
     }
     // TRY (single-step) runs bypass the workflow enabled gate — they're
     // explicit dashboard actions on a draft. Full runs still require
     // the workflow to be approved.
     if (!run.targetStepId && !workflow.data.enabled) {
+      const message = `Workflow "${workflow.data.name}" is disabled — approve/enable it before it can run.`;
+      appendWorkflowEvent(workflow.name, run.id, { kind: 'run_failed', error: message });
       writeRunRecord(filePath, {
         ...run,
         status: 'error',
-        error: 'Workflow is disabled — approve it first',
+        error: message,
         finishedAt: new Date().toISOString(),
       });
-      continue;
+      addNotification({
+        id: `workflow-${run.id}-disabled`,
+        kind: 'workflow',
+        title: `Workflow not run: ${workflow.data.name}`,
+        body: `${message} Enable it in Console → Workflows, then re-run.`,
+        createdAt: new Date().toISOString(),
+        read: false,
+        metadata: { workflow: workflow.data.name, runId: run.id },
+      });
+      return;
     }
 
-    const inputs: Record<string, string> = {
+    const inputs: Record<string, string> = normalizeWorkflowRunInputs({
       ...Object.fromEntries(Object.entries(workflow.data.inputs ?? {}).map(([key, meta]) => [key, meta.default ?? ''])),
       ...(run.inputs ?? {}),
-    };
+    });
+    const missingInputs = missingWorkflowRunInputs(workflow.data, inputs);
+    if (missingInputs.length > 0) {
+      const message = `Missing required workflow input${missingInputs.length === 1 ? '' : 's'}: ${missingInputs.join(', ')}`;
+      appendWorkflowEvent(workflow.name, run.id, { kind: 'run_failed', error: message });
+      writeRunRecord(filePath, {
+        ...run,
+        inputs,
+        status: 'error',
+        error: message,
+        finishedAt: new Date().toISOString(),
+      });
+      addNotification({
+        id: `${Date.now()}-workflow-${run.id}-missing-inputs`,
+        kind: 'workflow',
+        title: `Workflow failed before start: ${workflow.data.name}`,
+        body: `${message}. Re-run the workflow with the missing input values.`,
+        createdAt: new Date().toISOString(),
+        read: false,
+        metadata: { workflow: workflow.data.name, runId: run.id, status: 'error' },
+      });
+      logger.warn({ workflow: workflow.data.name, runId: run.id, missingInputs }, 'Workflow run rejected before start: missing required inputs');
+      return;
+    }
 
     const isResume = run.status === 'running';
     writeRunRecord(filePath, {
@@ -1090,7 +1687,6 @@ export async function processWorkflowRuns(assistant: ClementineAssistant): Promi
     } finally {
       stopHeartbeat();
     }
-  }
 }
 
 /**

@@ -34,7 +34,16 @@ writeFileSync(
 
 // Imports MUST come after the env var + file setup, since skill-store
 // resolves BASE_DIR at module load.
-const { applySkillToPrompt, planWorkflowExecutionBatches } = await import('./workflow-runner.js');
+const {
+  applySkillToPrompt,
+  planWorkflowExecutionBatches,
+  runDeterministicWorkflowStepForTest,
+  workflowRunnerInternalsForTest,
+  explainDeterministicSpawnError,
+} = await import('./workflow-runner.js');
+const { HarnessSession } = await import('../runtime/harness/session.js');
+const { resetEventLog } = await import('../runtime/harness/eventlog.js');
+const approvalRegistry = await import('../runtime/harness/approval-registry.js');
 
 test('applySkillToPrompt: no usesSkill returns prompt unchanged', () => {
   const out = applySkillToPrompt(
@@ -123,7 +132,121 @@ test('planWorkflowExecutionBatches: rejects cyclic graphs', () => {
   );
 });
 
+test('workflow harness sessions are deterministic per run step', () => {
+  resetEventLog();
+  const first = workflowRunnerInternalsForTest.getWorkflowHarnessSession(
+    'Daily Outreach',
+    'surface_for_approval',
+    'run-123',
+    'run-123:surface_for_approval',
+  );
+  const second = workflowRunnerInternalsForTest.getWorkflowHarnessSession(
+    'Daily Outreach',
+    'surface_for_approval',
+    'run-123',
+    'run-123:surface_for_approval',
+  );
+
+  assert.equal(first.id, 'workflow:run-123:surface_for_approval');
+  assert.equal(second.id, first.id);
+  assert.equal(second.sessionRow.metadata.workflowRunId, 'run-123');
+});
+
+test('workflow harness resume reuses already parked legacy approval session', () => {
+  resetEventLog();
+  const legacy = HarnessSession.create({
+    kind: 'workflow',
+    channel: 'workflow',
+    title: 'Daily Outreach::surface_for_approval',
+    metadata: {
+      source: 'workflow',
+      workflowName: 'Daily Outreach',
+      stepId: 'surface_for_approval',
+    },
+  });
+  approvalRegistry.register({
+    sessionId: legacy.id,
+    subject: 'Send the pending cold-prospect emails',
+    tool: 'request_approval',
+  });
+
+  const resumed = workflowRunnerInternalsForTest.getWorkflowHarnessSession(
+    'Daily Outreach',
+    'surface_for_approval',
+    'run-123',
+    'run-123:surface_for_approval',
+  );
+
+  assert.equal(resumed.id, legacy.id);
+  assert.equal(HarnessSession.load('workflow:run-123:surface_for_approval'), null);
+});
+
+test('deterministic workflow step runs a bundled scripts/ helper with JSON stdin', async () => {
+  const workflowDir = path.join(tmp, 'vault', '00-System', 'workflows', 'deterministic-test');
+  const scriptsDir = path.join(workflowDir, 'scripts');
+  mkdirSync(scriptsDir, { recursive: true });
+  writeFileSync(
+    path.join(scriptsDir, 'echo.mjs'),
+    [
+      'let input = "";',
+      'process.stdin.setEncoding("utf-8");',
+      'process.stdin.on("data", (chunk) => input += chunk);',
+      'process.stdin.on("end", () => {',
+      '  const payload = JSON.parse(input);',
+      '  process.stdout.write(JSON.stringify({ stepId: payload.stepId, account: payload.inputs.account, prior: payload.stepOutputs.prior }));',
+      '});',
+    ].join('\n'),
+    'utf-8',
+  );
+
+  const output = await runDeterministicWorkflowStepForTest('echo.mjs', {
+    workflow: 'Deterministic Test',
+    workflowSlug: 'deterministic-test',
+    runId: 'run-1',
+    stepId: 'script',
+    inputs: { account: 'Acme' },
+    stepOutputs: { prior: ['one'] },
+  });
+
+  assert.deepEqual(output, { stepId: 'script', account: 'Acme', prior: ['one'] });
+});
+
+test('deterministic workflow step rejects runners outside scripts/', async () => {
+  await assert.rejects(
+    () => runDeterministicWorkflowStepForTest('../bad.sh', {
+      workflow: 'Deterministic Test',
+      workflowSlug: 'deterministic-test',
+      runId: 'run-1',
+      stepId: 'script',
+      inputs: {},
+      stepOutputs: {},
+    }),
+    /inside the workflow scripts|outside scripts|must stay inside/,
+  );
+});
+
 // Cleanup the temp BASE_DIR.
 test.after(() => {
   try { rmSync(tmp, { recursive: true, force: true }); } catch { /* ignore */ }
+});
+
+// ---- #4: deterministic-step spawn error is made legible ----
+
+test('explainDeterministicSpawnError: EPERM names the packaged-app TCC sandbox cause', () => {
+  const err = Object.assign(new Error('spawn EPERM'), { code: 'EPERM' });
+  const out = explainDeterministicSpawnError(err, 'scripts/fetch.py');
+  assert.match(out.message, /sandbox|TCC|entitlement/i);
+  assert.match(out.message, /scripts\/fetch\.py/);
+});
+
+test('explainDeterministicSpawnError: ENOENT points at a missing interpreter/script', () => {
+  const err = Object.assign(new Error('spawn python ENOENT'), { code: 'ENOENT' });
+  const out = explainDeterministicSpawnError(err, 'scripts/fetch.py');
+  assert.match(out.message, /missing/i);
+});
+
+test('explainDeterministicSpawnError: an unrelated error passes through unchanged', () => {
+  const err = new Error('some other failure');
+  const out = explainDeterministicSpawnError(err, 'scripts/x.sh');
+  assert.equal(out.message, 'some other failure');
 });

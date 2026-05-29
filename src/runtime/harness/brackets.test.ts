@@ -360,3 +360,89 @@ test('wrapToolForHarness: applies per-tool timeout via withTimeout', async () =>
     process.env.HARNESS_TOOL_BRACKETS = prev;
   }
 });
+
+// ─── Move 2: confirm-first gate (batch external writes / worker fan-out) ───
+
+test('confirm-first gate: same-shape writes accrue across calls and the batch trips at the threshold', async () => {
+  const prevBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  const prevConfirm = process.env.CLEMMY_CONFIRM_FIRST;
+  const prevExecGate = process.env.CLEMMY_EXECUTION_GATE;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  process.env.CLEMMY_CONFIRM_FIRST = 'on';
+  // Isolate confirm-first: turn the execution-wrap gate off so the only
+  // thing that can block is the batch gate under test.
+  process.env.CLEMMY_EXECUTION_GATE = 'off';
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const { ConfirmFirstRequiredError } = await import('./confirm-first-gate.js');
+  const { openPlanScope, closePlanScope } = await import('../../agents/plan-scope.js');
+  try {
+    // Default batchConfirmThreshold is 5 → writes 1..4 pass, #5 blocks.
+    const counter = new ToolCallsCounter(100);
+    const wrapped = wrapToolForHarness({
+      name: 'composio_execute_tool',
+      // Same slug each time (same shape), different args (like 25 emails
+      // to different recipients fanned across workers) so loop-detection
+      // doesn't fire on identical signatures.
+      execute: async (_input: unknown) => 'sent',
+    });
+
+    const sendNo = (n: number) =>
+      withHarnessRunContext({ sessionId: sess.id, counter }, () =>
+        wrapped.execute!({ tool_slug: 'GMAIL_SEND_EMAIL', arguments: JSON.stringify({ to: `person${n}@x.com` }) }),
+      );
+
+    // Writes 1..4 succeed.
+    for (let n = 1; n <= 4; n += 1) {
+      assert.equal(await sendNo(n), 'sent', `write #${n} should pass below threshold`);
+    }
+    // Write #5 trips the batch gate — no instruction-reviewed plan scope.
+    await assert.rejects(async () => { await sendNo(5); }, (err: Error) => err instanceof ConfirmFirstRequiredError);
+
+    // Approving a plan opens a scope that covers the rest of the batch.
+    openPlanScope({
+      sessionId: sess.id,
+      planProposalId: 'plan-test',
+      approvedPlanObjective: 'Send the reviewed batch of emails',
+      allowedTools: ['composio_execute_tool'],
+    });
+    assert.equal(await sendNo(5), 'sent', 'write passes once a plan scope exists');
+
+    // Closing the scope re-arms the gate.
+    closePlanScope(sess.id, 'test');
+    await assert.rejects(async () => { await sendNo(6); }, (err: Error) => err instanceof ConfirmFirstRequiredError);
+  } finally {
+    process.env.HARNESS_TOOL_BRACKETS = prevBrackets;
+    process.env.CLEMMY_CONFIRM_FIRST = prevConfirm;
+    process.env.CLEMMY_EXECUTION_GATE = prevExecGate;
+  }
+});
+
+test('confirm-first gate: off by default — batch passes when the flag is unset', async () => {
+  const prevBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  const prevConfirm = process.env.CLEMMY_CONFIRM_FIRST;
+  const prevExecGate = process.env.CLEMMY_EXECUTION_GATE;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  delete process.env.CLEMMY_CONFIRM_FIRST; // default off
+  process.env.CLEMMY_EXECUTION_GATE = 'off';
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  try {
+    const counter = new ToolCallsCounter(100);
+    const wrapped = wrapToolForHarness({
+      name: 'composio_execute_tool',
+      execute: async (_input: unknown) => 'sent',
+    });
+    // 8 same-shape writes, well past the threshold — all pass with flag off.
+    for (let n = 1; n <= 8; n += 1) {
+      const r = await withHarnessRunContext({ sessionId: sess.id, counter }, () =>
+        wrapped.execute!({ tool_slug: 'GMAIL_SEND_EMAIL', arguments: JSON.stringify({ to: `p${n}@x.com` }) }),
+      );
+      assert.equal(r, 'sent', `write #${n} should pass when confirm-first is off`);
+    }
+  } finally {
+    process.env.HARNESS_TOOL_BRACKETS = prevBrackets;
+    process.env.CLEMMY_CONFIRM_FIRST = prevConfirm;
+    process.env.CLEMMY_EXECUTION_GATE = prevExecGate;
+  }
+});

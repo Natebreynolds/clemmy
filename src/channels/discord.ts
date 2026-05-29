@@ -69,6 +69,7 @@ import {
 } from '../runtime/notifications.js';
 import { buildDiscordInstallUrl } from './discord-install.js';
 import { getPlanProposal, rejectPlanProposal } from '../agents/plan-proposals.js';
+import { answerCheckIn, getCheckIn, listOpenCheckIns, type CheckInRecord } from '../agents/check-ins.js';
 import { approvePlanAndQueueBackgroundTask } from '../execution/approved-plan-tasks.js';
 import { queueBackgroundTaskApprovalResolution } from '../execution/background-tasks.js';
 import { WEBHOOK_PORT, WEBHOOK_SECRET } from '../config.js';
@@ -900,13 +901,15 @@ function renderHarnessApprovalList(approvals: approvalRegistry.PendingApprovalRo
 function renderCombinedApprovalList(
   runtimeApprovals: PendingApproval[],
   harnessApprovals: approvalRegistry.PendingApprovalRow[],
+  checkIns: CheckInRecord[] = [],
 ): string {
-  if (runtimeApprovals.length === 0 && harnessApprovals.length === 0) {
-    return 'No pending approvals.';
+  if (runtimeApprovals.length === 0 && harnessApprovals.length === 0 && checkIns.length === 0) {
+    return 'No pending approvals or questions.';
   }
   return [
     harnessApprovals.length > 0 ? renderHarnessApprovalList(harnessApprovals) : '',
     runtimeApprovals.length > 0 ? renderApprovalList(runtimeApprovals) : '',
+    checkIns.length > 0 ? renderCheckInList(checkIns) : '',
   ].filter(Boolean).join('\n');
 }
 
@@ -924,6 +927,21 @@ function renderHarnessApprovalCardContent(approval: approvalRegistry.PendingAppr
     approval.tool ? approval.tool : '',
     `_session ${approval.sessionId} · id \`${approval.approvalId}\`_`,
   ].filter(Boolean).join('\n');
+}
+
+function renderCheckInList(checkIns: CheckInRecord[]): string {
+  return [
+    `**Open questions (${checkIns.length})**`,
+    ...checkIns.slice(0, 10).map((item) => `- \`${item.id}\` ${truncate(item.question.replace(/\s+/g, ' '), 120)}`),
+  ].join('\n');
+}
+
+function renderCheckInCardContent(checkIn: CheckInRecord): string {
+  return [
+    `❔ **Question from ${checkIn.agentSlug}**`,
+    truncate(checkIn.question, 1500),
+    `_id \`${checkIn.id}\`_`,
+  ].join('\n');
 }
 
 function buildApprovalActions(approvalId: string) {
@@ -984,12 +1002,32 @@ function buildPlanProposalActions(planProposalId: string) {
   ];
 }
 
+function buildCheckInActions(checkInId: string) {
+  return [
+    new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`${DISCORD_CUSTOM_ID_PREFIX}:checkin-approve:${checkInId}`)
+        .setLabel('Approve')
+        .setStyle(ButtonStyle.Success),
+      new ButtonBuilder()
+        .setCustomId(`${DISCORD_CUSTOM_ID_PREFIX}:checkin-answer:${checkInId}`)
+        .setLabel('Answer / Edit')
+        .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId(`${DISCORD_CUSTOM_ID_PREFIX}:checkin-reject:${checkInId}`)
+        .setLabel('Reject')
+        .setStyle(ButtonStyle.Danger),
+    ),
+  ];
+}
+
 /**
  * Resolve which ActionRow to attach to an outbound notification, based
  * on the notification's metadata. The notification queue tags
  * approval-kind items with either `approvalId` (SDK interrupt) or
- * `planProposalId` (Plan Proposal). When neither is present we send
- * the plain notification — no buttons to click.
+ * `planProposalId` (Plan Proposal). Check-ins are also actionable:
+ * users can answer from Discord instead of typing an untracked reply.
+ * When none is present we send the plain notification.
  */
 export function buildActionsForNotification(metadata: Record<string, unknown> | undefined): ActionRowBuilder<ButtonBuilder>[] | undefined {
   if (!metadata || typeof metadata !== 'object') return undefined;
@@ -997,6 +1035,8 @@ export function buildActionsForNotification(metadata: Record<string, unknown> | 
   if (planProposalId) return buildPlanProposalActions(planProposalId);
   const approvalId = typeof metadata.approvalId === 'string' ? metadata.approvalId : undefined;
   if (approvalId) return buildApprovalActions(approvalId);
+  const checkInId = typeof metadata.checkInId === 'string' ? metadata.checkInId : undefined;
+  if (checkInId) return buildCheckInActions(checkInId);
   return undefined;
 }
 
@@ -1062,6 +1102,22 @@ async function resolveNaturalApproval(input: {
   }, runtime.listPendingApprovals()).sort((left, right) => right.createdAt.localeCompare(left.createdAt));
 
   if (approvals.length === 0) {
+    const approve = action.startsWith('approve');
+    const recentCheckIns = listOpenCheckIns()
+      .filter((item) => Date.now() - Date.parse(item.askedAt) < 24 * 60 * 60 * 1000)
+      .sort((left, right) => right.askedAt.localeCompare(left.askedAt));
+    if (action.endsWith('_one') && recentCheckIns.length === 1) {
+      const checkIn = recentCheckIns[0];
+      const resolved = answerCheckIn(checkIn.id, approve ? 'approve' : 'reject');
+      if (resolved) {
+        await input.send(`Recorded ${approve ? 'approval' : 'rejection'} for check-in \`${checkIn.id}\`.`);
+        return true;
+      }
+    }
+    if (action.endsWith('_one') && recentCheckIns.length > 1) {
+      await input.send(`No pending tool approval is waiting on this Discord thread. I found ${recentCheckIns.length} recent open questions; use the buttons or /approvals so I resolve the right one.`);
+      return true;
+    }
     await input.send('No pending approval is waiting on this Discord thread.');
     return true;
   }
@@ -1298,7 +1354,8 @@ async function handleDiscordCommand(message: Message<boolean>, assistant: Clemen
       channelId: message.channelId,
       guildId: message.guildId,
     });
-    await sendChunks(message.channel, renderCombinedApprovalList(approvals, harnessApprovals), message);
+    const checkIns = listOpenCheckIns();
+    await sendChunks(message.channel, renderCombinedApprovalList(approvals, harnessApprovals, checkIns), message);
     for (const approval of harnessApprovals.slice(0, 5)) {
       await sendComponentMessage(message.channel, {
         content: renderHarnessApprovalCardContent(approval),
@@ -1309,6 +1366,12 @@ async function handleDiscordCommand(message: Message<boolean>, assistant: Clemen
       await sendComponentMessage(message.channel, {
         content: renderApprovalCardContent(approval),
         components: buildApprovalActions(approval.id),
+      });
+    }
+    for (const checkIn of checkIns.slice(0, 5)) {
+      await sendComponentMessage(message.channel, {
+        content: renderCheckInCardContent(checkIn),
+        components: buildCheckInActions(checkIn.id),
       });
     }
     return true;
@@ -1407,7 +1470,8 @@ async function handleDiscordRestCommand(input: {
   if (/^(approvals|pending approvals)$/i.test(normalized)) {
     const approvals = relevantApprovalsForContext(input, runtime.listPendingApprovals());
     const harnessApprovals = relevantHarnessApprovalsForContext(input);
-    await send(renderCombinedApprovalList(approvals, harnessApprovals));
+    const checkIns = listOpenCheckIns();
+    await send(renderCombinedApprovalList(approvals, harnessApprovals, checkIns));
     for (const approval of harnessApprovals.slice(0, 5)) {
       await sendDiscordRestComponentMessage(input.channelId, {
         content: renderHarnessApprovalCardContent(approval),
@@ -1418,6 +1482,12 @@ async function handleDiscordRestCommand(input: {
       await sendDiscordRestComponentMessage(input.channelId, {
         content: renderApprovalCardContent(approval),
         components: buildApprovalActions(approval.id),
+      });
+    }
+    for (const checkIn of checkIns.slice(0, 5)) {
+      await sendDiscordRestComponentMessage(input.channelId, {
+        content: renderCheckInCardContent(checkIn),
+        components: buildCheckInActions(checkIn.id),
       });
     }
     return true;
@@ -1452,10 +1522,11 @@ async function sendLiveApprovalsInteraction(
     channelId: interaction.channelId,
     guildId: interaction.guildId,
   });
+  const checkIns = listOpenCheckIns();
 
   const summary = [
     '**Live Clementine approvals**',
-    renderCombinedApprovalList(runtimeApprovals, harnessApprovals),
+    renderCombinedApprovalList(runtimeApprovals, harnessApprovals, checkIns),
   ].join('\n');
   await interaction.reply({ content: summary.slice(0, 1900), ephemeral: true });
 
@@ -1470,6 +1541,13 @@ async function sendLiveApprovalsInteraction(
     await interaction.followUp({
       content: renderApprovalCardContent(approval).slice(0, 1900),
       components: buildApprovalActions(approval.id),
+      ephemeral: true,
+    });
+  }
+  for (const checkIn of checkIns.slice(0, 10)) {
+    await interaction.followUp({
+      content: renderCheckInCardContent(checkIn).slice(0, 1900),
+      components: buildCheckInActions(checkIn.id),
       ephemeral: true,
     });
   }
@@ -1524,7 +1602,11 @@ function buildButtonHarnessTransport(interaction: ButtonInteraction): DiscordHar
       if (interaction.deferred || interaction.replied) {
         await interaction.editReply({ content: first });
       } else {
-        await interaction.reply({ content: first });
+        // Button-driven approval resumes should replace the original
+        // approval card instead of posting a second message. That
+        // removes stale clickable buttons and makes the conversation
+        // read as one resolved decision.
+        await interaction.update({ content: first, components: [] });
       }
       return {
         edit: async (next: string, options?: { components?: unknown[] }) => {
@@ -1711,6 +1793,35 @@ async function handleFocusCommand(action: string, id: number | null): Promise<st
  * Discord UI.
  */
 async function handleModalSubmit(interaction: ModalSubmitInteraction): Promise<void> {
+  if (interaction.customId.startsWith(`${DISCORD_CUSTOM_ID_PREFIX}:checkin-modal:`)) {
+    if (!userAllowedById(interaction.user.id) || !channelAllowedById(interaction.channelId ?? '', interaction.channel?.type ?? null)) {
+      await rejectUnauthorizedInteraction(interaction);
+      return;
+    }
+    const [, , checkInId] = interaction.customId.split(':');
+    if (!checkInId || !checkInId.startsWith('chk-')) {
+      await interaction.reply({ content: 'Malformed check-in answer.', ephemeral: true });
+      return;
+    }
+    const answer = interaction.fields.getTextInputValue('answer').trim();
+    if (!answer) {
+      await interaction.reply({ content: 'Answer was empty — submit cancelled.', ephemeral: true });
+      return;
+    }
+    const record = answerCheckIn(checkInId, answer);
+    if (!record) {
+      await interaction.reply({ content: `Check-in \`${checkInId}\` was not found.`, ephemeral: true });
+      return;
+    }
+    await interaction.reply({
+      content: record.status === 'answered'
+        ? `Recorded your answer for \`${checkInId}\`.`
+        : `Check-in \`${checkInId}\` is already ${record.status}.`,
+      ephemeral: true,
+    });
+    return;
+  }
+
   if (!interaction.customId.startsWith(`${DISCORD_CUSTOM_ID_PREFIX}:edit-modal:`)) {
     return;
   }
@@ -2067,20 +2178,65 @@ async function handleButtonInteraction(interaction: ButtonInteraction, assistant
       return;
     }
 
+    if (action === 'checkin-approve' || action === 'checkin-reject') {
+      const record = getCheckIn(targetId);
+      if (!record) {
+        await interaction.reply({ content: `Check-in \`${targetId}\` was not found.`, ephemeral: true });
+        return;
+      }
+      if (record.status !== 'open') {
+        await collapseApprovalCard(interaction, 'already-resolved', `check-in is already ${record.status}`);
+        return;
+      }
+      const approved = action === 'checkin-approve';
+      const resolved = answerCheckIn(targetId, approved ? 'approve' : 'reject');
+      if (!resolved) {
+        await interaction.reply({ content: `Check-in \`${targetId}\` was not found.`, ephemeral: true });
+        return;
+      }
+      await collapseApprovalCard(interaction, approved ? 'approved' : 'rejected', `recorded answer for ${targetId}`);
+      return;
+    }
+
+    if (action === 'checkin-answer') {
+      const record = getCheckIn(targetId);
+      if (!record) {
+        await interaction.reply({ content: `Check-in \`${targetId}\` was not found.`, ephemeral: true });
+        return;
+      }
+      if (record.status !== 'open') {
+        await interaction.reply({ content: `Check-in \`${targetId}\` is already ${record.status}.`, ephemeral: true });
+        return;
+      }
+      const title = 'Answer Clementine';
+      const modal = new ModalBuilder()
+        .setCustomId(`${DISCORD_CUSTOM_ID_PREFIX}:checkin-modal:${targetId}`)
+        .setTitle(title)
+        .addComponents(
+          new ActionRowBuilder<TextInputBuilder>().addComponents(
+            new TextInputBuilder()
+              .setCustomId('answer')
+              .setLabel('Your answer')
+              .setStyle(TextInputStyle.Paragraph)
+              .setRequired(true)
+              .setPlaceholder(record.question.slice(0, 100)),
+          ),
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
     if (action === 'plan-approve') {
       const result = approvePlanAndQueueBackgroundTask(targetId);
       if (!result) {
         await interaction.reply({ content: `Plan \`${targetId}\` was not found or already resolved.`, ephemeral: true });
         return;
       }
-      await interaction.reply({
-        content: [
-          `✓ Plan approved: **${result.proposal.plan.objective}**`,
-          `Queued durable background task: \`${result.task.id}\`.`,
-          'A 15-minute auto-approval window is open for the approved plan scope.',
-        ].join('\n'),
-        ephemeral: true,
-      });
+      await collapseApprovalCard(
+        interaction,
+        'approved',
+        `queued background task ${result.task.id}; plan scope is open for 15 minutes`,
+      );
       return;
     }
 
@@ -2090,10 +2246,7 @@ async function handleButtonInteraction(interaction: ButtonInteraction, assistant
         await interaction.reply({ content: `Plan \`${targetId}\` was not found.`, ephemeral: true });
         return;
       }
-      await interaction.reply({
-        content: `✗ Plan rejected: **${result.plan.objective}**\nThe agent will not proceed with this plan.`,
-        ephemeral: true,
-      });
+      await collapseApprovalCard(interaction, 'rejected', `plan rejected: ${result.plan.objective.slice(0, 120)}`);
       return;
     }
 

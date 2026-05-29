@@ -1,0 +1,113 @@
+/**
+ * Run: npx tsx --test src/memory/workflow-store.test.ts
+ *
+ * The declarative approval gate must survive the YAML round-trip:
+ * writeWorkflow → readWorkflow preserves requiresApproval + approvalPreview
+ * (and accepts snake_case from hand-authored SKILL.md).
+ */
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+
+const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-wfstore-test-'));
+process.env.CLEMENTINE_HOME = TMP_HOME;
+
+const { writeWorkflow, readWorkflow } = await import('./workflow-store.js');
+const { WORKFLOWS_DIR } = await import('./vault.js');
+
+test.after(() => { try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* ignore */ } });
+
+test('requiresApproval + approvalPreview round-trip through write→read', () => {
+  writeWorkflow('gate-rt', {
+    name: 'gate-rt',
+    description: 'round-trip test',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [
+      { id: 'prep', prompt: 'Prepare the batch.' },
+      {
+        id: 'send',
+        prompt: 'Send the batch.',
+        dependsOn: ['prep'],
+        requiresApproval: true,
+        approvalPreview: 'Send 25 emails',
+      },
+    ],
+  });
+
+  const wf = readWorkflow('gate-rt');
+  assert.ok(wf, 'workflow reads back');
+  const send = wf!.data.steps.find((s) => s.id === 'send');
+  assert.equal(send?.requiresApproval, true);
+  assert.equal(send?.approvalPreview, 'Send 25 emails');
+  // The ungated step stays autonomous (no flag).
+  const prep = wf!.data.steps.find((s) => s.id === 'prep');
+  assert.notEqual(prep?.requiresApproval, true);
+});
+
+test('hand-authored snake_case (requires_approval / approval_preview) is parsed', () => {
+  const dir = path.join(WORKFLOWS_DIR, 'gate-snake');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    path.join(dir, 'SKILL.md'),
+    [
+      '---',
+      'name: gate-snake',
+      'description: snake-case gate',
+      'enabled: true',
+      'steps:',
+      '  - id: send',
+      '    requires_approval: true',
+      '    approval_preview: Publish the post',
+      '---',
+      '',
+      '## step: send',
+      '',
+      'Publish it.',
+      '',
+    ].join('\n'),
+    'utf-8',
+  );
+  const wf = readWorkflow('gate-snake');
+  const send = wf!.data.steps.find((s) => s.id === 'send');
+  assert.equal(send?.requiresApproval, true);
+  assert.equal(send?.approvalPreview, 'Publish the post');
+});
+
+test('typed step contract (inputs/output) round-trips through write→read', () => {
+  writeWorkflow('contract-rt', {
+    name: 'contract-rt',
+    description: 'contract round-trip',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [
+      {
+        id: 'normalize',
+        prompt: 'Normalize {{input.url}}.',
+        inputs: { url: { type: 'string', required: true, from: 'input.url' } },
+        output: { type: 'object', required_keys: ['domain', 'clientName'] },
+      },
+    ],
+  });
+  const wf = readWorkflow('contract-rt');
+  const s = wf!.data.steps.find((x) => x.id === 'normalize');
+  assert.equal(s?.inputs?.url?.required, true);
+  assert.equal(s?.inputs?.url?.from, 'input.url');
+  assert.equal(s?.output?.type, 'object');
+  assert.deepEqual(s?.output?.required_keys, ['domain', 'clientName']);
+});
+
+test('output.verify (verifiable handles) round-trips', () => {
+  writeWorkflow('verify-rt', {
+    name: 'verify-rt', description: 'verify round-trip', enabled: true, trigger: { manual: true },
+    steps: [{
+      id: 'deploy', prompt: 'Deploy.',
+      output: { type: 'object', verify: { path_exists: ['indexPath'], url_present: ['netlifyUrl'] } },
+    }],
+  });
+  const s = readWorkflow('verify-rt')!.data.steps.find((x) => x.id === 'deploy');
+  assert.deepEqual(s?.output?.verify?.path_exists, ['indexPath']);
+  assert.deepEqual(s?.output?.verify?.url_present, ['netlifyUrl']);
+});

@@ -5,6 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   approvalSummaryMetadataForBrief,
+  discordUserIdForProactiveBrief,
   isActiveBackgroundTaskForBrief,
   shouldSendBrief,
 } from './proactive-briefs.js';
@@ -58,6 +59,11 @@ test('brief metadata summarizes approvals without creating Discord action button
   });
 });
 
+test('proactive briefs do not fan out to Discord by default', () => {
+  assert.equal(discordUserIdForProactiveBrief(true), undefined);
+  assert.equal(discordUserIdForProactiveBrief(false), undefined);
+});
+
 test('brief dedupe suppresses same urgent attention when active work churns', () => {
   const now = Date.parse('2026-05-28T04:40:00.000Z');
   const recentState = {
@@ -79,6 +85,25 @@ test('brief dedupe suppresses same urgent attention when active work churns', ()
       ...recentState,
       lastBriefAt: new Date(now - 5 * 60 * 60_000).toISOString(),
     }, 'new-active-work-signature', 'same-approval', 60, true, now),
-    true,
+    false,
   );
+});
+
+test('brief dedupe can explicitly repeat stale attention when opted in', () => {
+  const previous = process.env.CLEMMY_PROACTIVE_REPEAT_STALE_ATTENTION;
+  process.env.CLEMMY_PROACTIVE_REPEAT_STALE_ATTENTION = 'true';
+  try {
+    const now = Date.parse('2026-05-28T04:40:00.000Z');
+    assert.equal(
+      shouldSendBrief({
+        lastBriefAt: new Date(now - 5 * 60 * 60_000).toISOString(),
+        lastSignature: 'old-active-work-signature',
+        lastAttentionSignature: 'same-approval',
+      }, 'new-active-work-signature', 'same-approval', 60, true, now),
+      true,
+    );
+  } finally {
+    if (previous === undefined) delete process.env.CLEMMY_PROACTIVE_REPEAT_STALE_ATTENTION;
+    else process.env.CLEMMY_PROACTIVE_REPEAT_STALE_ATTENTION = previous;
+  }
 });

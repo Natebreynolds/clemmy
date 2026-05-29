@@ -177,6 +177,10 @@ export function renderConsoleHtml(token: string): string {
         <span class="nav-key">A</span>
         <span class="nav-label">Approvals <span class="approvals-badge" data-approvals-badge hidden></span></span>
       </button>
+      <button class="nav" data-panel="mobile-access">
+        <span class="nav-key">M</span>
+        <span class="nav-label">Mobile</span>
+      </button>
 
       <!-- ── nav-dock: fills the dead space under the menu items ──
            Five stacked cards that surface monitoring + access to live
@@ -332,6 +336,16 @@ export function renderConsoleHtml(token: string): string {
                 </div>
               </div>
 
+              <div class="home-block home-completed">
+                <div class="home-block-head">
+                  <span>COMPLETED</span>
+                  <em data-home-recent-count>—</em>
+                </div>
+                <div class="home-block-body command-list compact" data-home-recent-list>
+                  <div class="home-empty">— nothing completed recently —</div>
+                </div>
+              </div>
+
 
               <!--
                 CLEMENTINE LIVE — its own card on home. Click anywhere
@@ -382,7 +396,10 @@ export function renderConsoleHtml(token: string): string {
               <div class="home-block home-chat home-chat-dock">
                 <div class="home-block-head">
                   <span>CHAT DOCK</span>
-                  <span class="home-chat-meta" data-home-chat-meta>local session</span>
+                  <span class="home-chat-head-actions">
+                    <button type="button" class="home-chat-live-btn" data-home-live-open title="Open Clementine Live">LIVE</button>
+                    <span class="home-chat-meta" data-home-chat-meta>local session</span>
+                  </span>
                 </div>
                 <div class="home-chat-thread" data-home-chat-thread>
                   <div class="home-chat-hint">
@@ -496,46 +513,9 @@ export function renderConsoleHtml(token: string): string {
 
           <!-- Editor (middle) -->
           <div class="wf-editor" data-wf-editor>
-            <div class="wf-empty wf-empty-onboarding">
-              <div class="wf-empty-mark">⊟</div>
-              <div class="wf-empty-text">No workflow selected</div>
-              <p class="wf-empty-sub">A workflow is a multi-step task you can run on demand or on a schedule. Steps can depend on each other, share inputs, and synthesize a final output.</p>
-              <div class="wf-empty-actions">
-                <button class="wf-empty-btn primary" data-wf-new onclick="window.__clementineStartNewWorkflow && window.__clementineStartNewWorkflow();">＋ NEW WORKFLOW</button>
-                <button class="wf-empty-btn" data-wf-empty-architect>ASK ARCHITECT TO DRAFT ONE →</button>
-              </div>
-              <div class="wf-framework-guide">
-                <div class="wf-framework-guide-head">BUILD OUTSIDE CLEMENTINE</div>
-                <p>Create a repo or folder with a workflow <code>SKILL.md</code>. Clementine can import a single root workflow, <code>workflows/*/SKILL.md</code>, or <code>.clementine/workflows/*/SKILL.md</code>.</p>
-                <pre>proposal-audit/
-  SKILL.md
-  references/
-  scripts/</pre>
-                <pre>---
-name: proposal-audit
-description: Build a branded SEO proposal audit.
-enabled: true
-trigger: { manual: true }
-allowed_tools:
-  - read_file
-  - write_file
-steps:
-  - id: research
-    allowedTools: [read_file]
-  - id: build
-    dependsOn: [research]
-    uses_skill: proposal-builder
-synthesis:
-  prompt: Return the finished file path and the client-ready summary.
----
-Markdown body here.
-
-## step: research
-Read the inputs and gather the facts.
-
-## step: build
-Create the proposal artifact.</pre>
-              </div>
+            <div class="wf-empty">
+              <div class="wf-empty-mark">↻</div>
+              <div class="wf-empty-text">Loading workflow home…</div>
             </div>
           </div>
 
@@ -1723,6 +1703,550 @@ Create the proposal artifact.</pre>
         </div>
       </section>
 
+      <section class="panel-frame" data-section="mobile-access" hidden>
+        <div class="panel-tag">PANEL · M · MOBILE</div>
+        <div class="panel-body" data-mobile-access-panel>
+          <header class="hub-header">
+            <div>
+              <h3>Mobile Access</h3>
+              <p>Start a mobile link, scan the QR with your phone, and keep working with Clementine away from the desktop. Custom domains live under Advanced.</p>
+            </div>
+            <div class="hub-stats">
+              <div class="stat-card"><span>STATUS</span><em data-ma-status>—</em></div>
+              <div class="stat-card"><span>SESSIONS</span><em data-ma-session-count>—</em></div>
+            </div>
+          </header>
+
+          <div class="hub-block" data-ma-step="pair">
+            <div class="hub-block-head">
+              <span class="hub-block-title">Pair your phone</span>
+              <span class="hub-block-meta" data-ma-qr-meta>—</span>
+            </div>
+            <p class="hub-block-intro">Use the temporary link first. It needs no Cloudflare account or domain, and it gives you a QR in about a minute. The link changes after restarts, so use Advanced only when you want a permanent URL.</p>
+            <div class="hub-qr" data-ma-qr></div>
+            <div class="hub-actions" data-ma-pair-actions></div>
+          </div>
+
+          <details class="ma-advanced" data-ma-advanced>
+            <summary>
+              <span>Advanced custom domain</span>
+              <em>Permanent URL, Cloudflare Access, custom DNS</em>
+            </summary>
+            <div class="ma-advanced-body">
+          <div class="hub-block" data-ma-step="binary">
+            <div class="hub-block-head">
+              <span class="hub-block-title">cloudflared</span>
+              <span class="hub-block-meta" data-ma-binary-meta>—</span>
+            </div>
+            <p class="hub-block-intro">Cloudflare's tunnel agent. Temporary links and custom domains both use this local helper.</p>
+            <div class="settings-info" data-ma-binary-info>— loading —</div>
+            <div class="hub-actions">
+              <button type="button" class="btn" data-ma-action="install">Install via Homebrew</button>
+              <button type="button" class="btn btn-secondary" data-ma-action="detect">Re-detect</button>
+            </div>
+            <pre class="hub-output" data-ma-install-output hidden></pre>
+          </div>
+
+          <div class="hub-block" data-ma-step="remote-url">
+            <div class="hub-block-head">
+              <span class="hub-block-title">Sign into Cloudflare</span>
+              <span class="hub-block-meta" data-ma-login-meta>—</span>
+            </div>
+            <p class="hub-block-intro">Only needed for a permanent custom domain. Temporary links skip this entirely.</p>
+            <div class="settings-info" data-ma-login-info>— loading —</div>
+            <div class="hub-actions">
+              <button type="button" class="btn" data-ma-action="login">Start Cloudflare sign-in</button>
+              <button type="button" class="btn btn-secondary" data-ma-action="login-cancel" hidden>Cancel</button>
+            </div>
+            <p class="hub-block-intro" style="margin-top:8px; color: var(--fg-3);">Don't have a Cloudflare account or domain yet? <a href="https://dash.cloudflare.com/sign-up/registrar" target="_blank" rel="noopener">Buy a domain through Cloudflare</a> (~$10/yr, no markup) — that's the cheapest path. If your domain is elsewhere, you'll need to move its nameservers to Cloudflare first.</p>
+          </div>
+
+          <div class="hub-block">
+            <div class="hub-block-head">
+              <span class="hub-block-title">Pick a hostname</span>
+              <span class="hub-block-meta" data-ma-tunnel-meta>—</span>
+            </div>
+            <p class="hub-block-intro">Creates a named tunnel and points a hostname at it. Pick something memorable, like <code>clem.yourdomain.com</code>.</p>
+            <form class="settings-form" data-ma-configure-form>
+              <div class="settings-field">
+                <label>TUNNEL NAME</label>
+                <input type="text" name="tunnelName" placeholder="clem-laptop" autocomplete="off" />
+              </div>
+              <div class="settings-field">
+                <label>HOSTNAME (e.g. clem.yourdomain.com)</label>
+                <input type="text" name="hostname" placeholder="clem.yourdomain.com" autocomplete="off" />
+              </div>
+              <div class="hub-actions">
+                <button type="submit" class="btn">Create tunnel + route DNS</button>
+              </div>
+            </form>
+            <div class="settings-info" data-ma-configure-info></div>
+          </div>
+
+          <div class="hub-block ma-access" data-ma-access-card hidden>
+            <div class="hub-block-head">
+              <span class="hub-block-title">★ Lock it down with Cloudflare Access</span>
+              <span class="hub-block-meta" data-ma-access-meta>strongly recommended</span>
+            </div>
+            <p class="hub-block-intro"><strong>Read this before sharing your URL.</strong> Your custom domain is in public DNS — anyone who knows it can hit your daemon. Right now the only barrier between them and Clementine is your PIN. Clementine has computer access, so a brute-forced PIN means an attacker can prompt Clem to run shell commands.</p>
+            <p class="hub-block-intro">Cloudflare Access closes that gap. It puts a Google sign-in (or one-time email PIN) in front of your tunnel — only YOUR email can get through, and only after authenticating. Attackers hit a login page from Cloudflare, not your daemon. <strong>Free up to 50 users.</strong></p>
+            <p class="hub-block-intro">Three minutes to set up:</p>
+            <ol class="ma-access-steps">
+              <li>Open the <a href="https://one.dash.cloudflare.com/" target="_blank" rel="noopener">Cloudflare Zero Trust dashboard</a> for your account.</li>
+              <li>Access → Applications → <strong>Add an application → Self-hosted</strong>. Application name: <code>Clementine</code>. Application domain: your hostname (e.g. <code>clem.yourdomain.com</code>).</li>
+              <li>Add a policy: name it <code>Just me</code>. Action <strong>Allow</strong>. Include rule: <strong>Emails → your-email@example.com</strong>. Save.</li>
+            </ol>
+            <p class="hub-block-intro">After that, opening your URL takes you through a Google login (or email PIN) before Clementine's PIN screen. If you don't trust Google SSO, the email-PIN option works without any third-party account.</p>
+            <div class="hub-actions">
+              <a class="btn" href="https://one.dash.cloudflare.com/" target="_blank" rel="noopener">Open Cloudflare Zero Trust</a>
+              <button type="button" class="btn btn-secondary" data-ma-action="access-ack">I've enabled Access</button>
+              <button type="button" class="btn btn-secondary" data-ma-action="access-skip">Skip (less secure)</button>
+            </div>
+            <p class="settings-info" data-ma-access-info></p>
+          </div>
+
+          <div class="hub-block">
+            <div class="hub-block-head">
+              <span class="hub-block-title">Run the custom-domain tunnel</span>
+              <span class="hub-block-meta" data-ma-run-meta>—</span>
+            </div>
+            <p class="hub-block-intro">Start cloudflared for the custom domain. The temporary link starts from the Pair your phone card.</p>
+            <div class="hub-actions">
+              <button type="button" class="btn" data-ma-action="tunnel-start">Start tunnel</button>
+              <button type="button" class="btn btn-secondary" data-ma-action="tunnel-stop">Stop tunnel</button>
+            </div>
+            <div class="settings-info" data-ma-run-info></div>
+          </div>
+            </div>
+          </details>
+
+          <div class="hub-block">
+            <div class="hub-block-head">
+              <span class="hub-block-title">Mobile PIN fallback</span>
+              <span class="hub-block-meta" data-ma-pin-meta>—</span>
+            </div>
+            <p class="hub-block-intro">An 8–64 character PIN (letters, digits, and symbols all welcome) for manual unlock when QR pairing isn't available. Clementine stores only a hash, so the current PIN cannot be shown; set a new one here whenever you need it. Rotating the PIN invalidates every active mobile session.</p>
+            <form class="settings-form" data-ma-pin-form>
+              <div class="settings-field">
+                <label>NEW PIN</label>
+                <input type="password" name="pin" minlength="8" maxlength="64" autocomplete="new-password" placeholder="At least 8 characters" />
+              </div>
+              <div class="hub-actions">
+                <button type="submit" class="btn">Save PIN</button>
+              </div>
+            </form>
+            <div class="settings-info" data-ma-pin-info></div>
+          </div>
+
+          <div class="hub-block">
+            <div class="hub-block-head">
+              <span class="hub-block-title">Connected devices</span>
+              <span class="hub-block-meta" data-ma-devices-meta>—</span>
+            </div>
+            <div class="hub-devices" data-ma-devices></div>
+            <div class="hub-actions">
+              <button type="button" class="btn btn-danger" data-ma-action="sessions-revoke-all">Disconnect all devices</button>
+            </div>
+          </div>
+        </div>
+        <script>
+          (function() {
+            const root = document.querySelector('[data-mobile-access-panel]');
+            if (!root) return;
+            const $ = (sel) => root.querySelector(sel);
+            const $$ = (sel) => Array.from(root.querySelectorAll(sel));
+            let lastStatus = null;
+            let installPollTimer = null;
+            let installJobId = null;
+
+            async function api(path, init) {
+              const opts = Object.assign({ headers: {} }, init || {});
+              const token = new URLSearchParams(location.search).get('token');
+              if (token) {
+                const sep = path.includes('?') ? '&' : '?';
+                path = path + sep + 'token=' + encodeURIComponent(token);
+              }
+              if (opts.body && !opts.headers['content-type']) {
+                opts.headers['content-type'] = 'application/json';
+              }
+              const res = await fetch(path, opts);
+              const text = await res.text();
+              let body = null;
+              try { body = text ? JSON.parse(text) : null; } catch { body = { error: text }; }
+              if (!res.ok) throw new Error((body && body.error) || ('HTTP ' + res.status));
+              return body;
+            }
+
+            function setText(sel, text) { const el = $(sel); if (el) el.textContent = text; }
+            function setHtml(sel, html) { const el = $(sel); if (el) el.innerHTML = html; }
+            function show(el) { if (el) el.hidden = false; }
+            function hide(el) { if (el) el.hidden = true; }
+            function esc(s) {
+              return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({
+                '&': '&amp;',
+                '<': '&lt;',
+                '>': '&gt;',
+                '"': '&quot;',
+                "'": '&#39;',
+              }[c]));
+            }
+
+            function statusLabel(status) {
+              switch (status) {
+                case 'inactive': return 'Inactive';
+                case 'installing': return 'Installing cloudflared';
+                case 'awaiting-login': return 'Waiting for Cloudflare login';
+                case 'configuring': return 'Configuring';
+                case 'running': return 'Running';
+                case 'error': return 'Error';
+                default: return status || '—';
+              }
+            }
+
+            function render(payload) {
+              lastStatus = payload;
+              setText('[data-ma-status]', statusLabel(payload.state.status));
+              setText('[data-ma-session-count]', String(payload.sessions.length));
+
+              // Step 1 — binary
+              if (payload.detect.binary) {
+                setText('[data-ma-binary-meta]', 'installed');
+                setText('[data-ma-binary-info]', payload.detect.binary + ' (v' + (payload.detect.version || 'unknown') + ', ' + payload.detect.source + ')');
+              } else {
+                setText('[data-ma-binary-meta]', 'not installed');
+                setText('[data-ma-binary-info]', 'Click "Install via Homebrew" — needs Homebrew on macOS.');
+              }
+
+              // Step 2 — login
+              if (payload.login.certPresent) {
+                setText('[data-ma-login-meta]', 'logged in');
+                setText('[data-ma-login-info]', 'cert.pem present (updated ' + (payload.login.certUpdatedAt || '?') + ')');
+                hide($('[data-ma-action="login-cancel"]'));
+              } else if (payload.login.active) {
+                setText('[data-ma-login-meta]', 'waiting for browser');
+                const url = payload.login.url || '(URL not captured yet)';
+                setHtml('[data-ma-login-info]', 'Open this URL in your browser: <a href="' + url + '" target="_blank" rel="noopener">' + url + '</a>');
+                show($('[data-ma-action="login-cancel"]'));
+              } else if (payload.login.outcome && payload.login.outcome.ok === false) {
+                setText('[data-ma-login-meta]', 'failed');
+                setText('[data-ma-login-info]', 'Login failed: ' + payload.login.outcome.error);
+                hide($('[data-ma-action="login-cancel"]'));
+              } else {
+                setText('[data-ma-login-meta]', 'not logged in');
+                setText('[data-ma-login-info]', 'Click "Start login" to authorize cloudflared on your Cloudflare account.');
+                hide($('[data-ma-action="login-cancel"]'));
+              }
+
+              // Step 3 — tunnel
+              if (payload.state.tunnel && payload.state.tunnel.hostname) {
+                setText('[data-ma-tunnel-meta]', 'configured');
+                setText('[data-ma-configure-info]', payload.state.tunnel.name + ' (' + payload.state.tunnel.id + ') → ' + payload.state.tunnel.hostname);
+              } else if (payload.state.tunnel) {
+                setText('[data-ma-tunnel-meta]', 'tunnel created, hostname pending');
+                setText('[data-ma-configure-info]', 'Tunnel ' + payload.state.tunnel.name + ' exists; add a hostname above.');
+              } else {
+                setText('[data-ma-tunnel-meta]', 'not configured');
+                setText('[data-ma-configure-info]', '');
+              }
+
+              // ★ Cloudflare Access recommendation card — only for
+              // configured custom-domain (named) tunnels. Skip for
+              // the temporary quick tunnel (different threat model:
+              // URL isn't subdomain-enumerable). Hide once the user
+              // acknowledged (either enabled or explicitly skipped).
+              const accessCard = $('[data-ma-access-card]');
+              if (accessCard) {
+                const ack = payload.state.cloudflareAccess;
+                const isNamedTunnel = payload.state.tunnel
+                  && payload.state.tunnel.mode !== 'quick'
+                  && payload.state.tunnel.hostname;
+                const ackMatchesHostname = ack
+                  && ack.acknowledged
+                  && payload.state.tunnel
+                  && ack.hostname === payload.state.tunnel.hostname;
+                if (isNamedTunnel && !ackMatchesHostname) {
+                  accessCard.hidden = false;
+                  setText('[data-ma-access-meta]', 'not confirmed');
+                  setText('[data-ma-access-info]', '');
+                } else if (isNamedTunnel && ackMatchesHostname) {
+                  accessCard.hidden = false;
+                  if (ack.enabled) {
+                    setText('[data-ma-access-meta]', 'enabled · confirmed');
+                    setText('[data-ma-access-info]', 'You confirmed Cloudflare Access on ' + ack.acknowledgedAt + '. Click "I\\'ve enabled Access" again if you turn it off or change hostnames.');
+                  } else {
+                    setText('[data-ma-access-meta]', 'opted out');
+                    setText('[data-ma-access-info]', 'You chose to skip Cloudflare Access on ' + ack.acknowledgedAt + '. The mobile PIN is the only barrier; consider enabling Access from the Cloudflare dashboard.');
+                  }
+                } else {
+                  accessCard.hidden = true;
+                }
+              }
+
+              // Step 4 — PIN
+              if (payload.pin.configured) {
+                setText('[data-ma-pin-meta]', 'configured');
+                setText('[data-ma-pin-info]', 'PIN saved' + (payload.pin.updatedAt ? ' (last rotated ' + payload.pin.updatedAt + ')' : '') + '. Saving again rotates it and invalidates all sessions.');
+              } else {
+                setText('[data-ma-pin-meta]', 'not configured');
+                setText('[data-ma-pin-info]', 'No PIN set — your phone cannot log in until you save one here.');
+              }
+
+              // Step 5 — run
+              if (payload.tunnel.running) {
+                setText('[data-ma-run-meta]', payload.tunnel.connected ? 'running · connected' : 'running · connecting');
+                setText('[data-ma-run-info]', 'Started ' + (payload.tunnel.startedAt || '?'));
+              } else {
+                setText('[data-ma-run-meta]', 'stopped');
+                setText('[data-ma-run-info]', '');
+              }
+
+              // Step 6 — QR (load lazily; only re-fetch when the target URL changes)
+              const qrEl = $('[data-ma-qr]');
+              const pairActions = $('[data-ma-pair-actions]');
+              if (pairActions) pairActions.innerHTML = '';
+              function setPairActionHtml(html) {
+                if (pairActions) pairActions.innerHTML = html;
+              }
+              if (payload.targetUrl) {
+                if (payload.targetMode === 'local-preview') {
+                  setText('[data-ma-qr-meta]', 'remote URL needed');
+                  if (qrEl && qrEl.dataset.url !== 'local-preview') {
+                    qrEl.dataset.url = 'local-preview';
+                    qrEl.dataset.fetchedAt = '';
+                    qrEl.innerHTML = '';
+                    const info = document.createElement('div');
+                    info.className = 'settings-info';
+                    info.textContent = 'This Mac is only exposing the mobile app at 127.0.0.1, which works for desktop preview but not from an iPhone. Start a temporary mobile link and the phone QR will appear here.';
+                    const link = document.createElement('a');
+                    link.href = payload.targetUrl;
+                    link.target = '_blank';
+                    link.rel = 'noopener';
+                    link.textContent = 'Open local preview on this Mac';
+                    qrEl.appendChild(info);
+                    qrEl.appendChild(link);
+                  }
+                  if (!payload.detect.binary) {
+                    setPairActionHtml('<button type="button" class="btn" data-ma-action="install">Install cloudflared</button><button type="button" class="btn btn-secondary" data-ma-action="detect">Re-detect</button>');
+                  } else if (payload.state.status === 'configuring' || (payload.tunnel.running && !payload.state.tunnel?.hostname)) {
+                    setPairActionHtml('<button type="button" class="btn btn-secondary" disabled>Starting mobile link…</button><button type="button" class="btn btn-secondary" data-ma-action="tunnel-stop">Stop</button>');
+                  } else if (!payload.tunnel.running) {
+                    const advanced = payload.login.active
+                      ? '<button type="button" class="btn btn-secondary" data-ma-action="login-cancel">Cancel Cloudflare login</button>'
+                      : '<button type="button" class="btn btn-secondary" data-ma-jump="remote-url">Advanced custom domain</button>';
+                    setPairActionHtml('<button type="button" class="btn" data-ma-action="quick-start">Start temporary mobile link</button>' + advanced);
+                  }
+                } else {
+                if (!payload.tunnel.running) {
+                  setText('[data-ma-qr-meta]', 'remote URL stopped');
+                  if (qrEl && qrEl.dataset.url !== 'remote-stopped') {
+                    qrEl.dataset.url = 'remote-stopped';
+                    qrEl.dataset.fetchedAt = '';
+                    qrEl.innerHTML = '<div class="settings-info">The remote URL is configured, but the tunnel is not running. Start it, then scan the QR from your phone.</div>';
+                  }
+                  setPairActionHtml('<button type="button" class="btn" data-ma-action="tunnel-start">Start remote URL</button>');
+                } else {
+                setText('[data-ma-qr-meta]', payload.targetUrl + (payload.tunnel.connected ? ' · remote' : ' · starting'));
+                const qrKey = payload.targetUrl + '|' + (payload.targetMode || '');
+                const fetchedAt = qrEl && qrEl.dataset.fetchedAt ? Number(qrEl.dataset.fetchedAt) : 0;
+                const stale = !fetchedAt || (Date.now() - fetchedAt > 9 * 60 * 1000);
+                if (qrEl && (qrEl.dataset.url !== qrKey || stale)) {
+                  qrEl.dataset.url = qrKey;
+                  fetch('/api/console/mobile-access/qr' + (new URLSearchParams(location.search).get('token') ? '?token=' + encodeURIComponent(new URLSearchParams(location.search).get('token')) : ''))
+                    .then((r) => {
+                      if (!r.ok) return Promise.reject('qr fetch failed');
+                      const expiresAt = r.headers.get('X-Pairing-Expires-At') || '';
+                      return r.text().then((svg) => ({ svg, expiresAt }));
+                    })
+                    .then(({ svg, expiresAt }) => {
+                      qrEl.innerHTML = svg + (expiresAt ? '<div class="settings-info">QR expires ' + expiresAt + '</div>' : '');
+                      qrEl.dataset.fetchedAt = String(Date.now());
+                    })
+                    .catch(() => { qrEl.textContent = 'QR generation failed'; });
+                }
+                }
+                }
+              } else {
+                setText('[data-ma-qr-meta]', 'waiting for mobile URL');
+                if (qrEl) { qrEl.innerHTML = ''; qrEl.dataset.url = ''; }
+              }
+
+              // Devices
+              setText('[data-ma-devices-meta]', String(payload.sessions.length));
+              const devicesEl = $('[data-ma-devices]');
+              if (devicesEl) {
+                if (payload.sessions.length === 0) {
+                  devicesEl.innerHTML = '<div class="settings-info">No active sessions.</div>';
+                } else {
+                  devicesEl.innerHTML = payload.sessions.map((s) =>
+                    '<div class="hub-device">'
+                    + '<div class="hub-device-main">'
+                    + '<strong title="' + esc(s.deviceLabel || 'device') + '">' + esc(s.deviceLabel || 'device') + '</strong>'
+                    + '<span class="meta">created ' + esc(s.createdAt) + '</span>'
+                    + '<span class="meta">last seen ' + esc(s.lastSeenAt) + '</span>'
+                    + '<span class="meta">push: ' + (s.pushSubscribed ? 'yes' : 'no') + '</span>'
+                    + '</div>'
+                    + '<button type="button" data-ma-action="session-revoke" data-device-id="' + esc(s.deviceId) + '">Disconnect</button>'
+                    + '</div>'
+                  ).join('');
+                }
+              }
+            }
+
+            async function refresh() {
+              try {
+                const payload = await api('/api/console/mobile-access/status');
+                render(payload);
+              } catch (err) {
+                setText('[data-ma-status]', 'error');
+                setText('[data-ma-binary-info]', String(err.message || err));
+              }
+            }
+
+            async function pollInstall() {
+              if (!installJobId) return;
+              try {
+                const data = await api('/api/console/mobile-access/install/' + installJobId);
+                const job = data.job;
+                const outEl = $('[data-ma-install-output]');
+                if (outEl) {
+                  outEl.hidden = false;
+                  outEl.textContent = job.lines.map((l) => l.text).join('\\n');
+                }
+                if (job.status !== 'running') {
+                  if (installPollTimer) clearInterval(installPollTimer);
+                  installPollTimer = null;
+                  installJobId = null;
+                  refresh();
+                }
+              } catch { /* job missing — stop polling */
+                if (installPollTimer) clearInterval(installPollTimer);
+                installPollTimer = null;
+                installJobId = null;
+              }
+            }
+
+            root.addEventListener('click', async (ev) => {
+              const jump = ev.target.closest('[data-ma-jump]');
+              if (jump) {
+                ev.preventDefault();
+                const target = root.querySelector('[data-ma-step="' + jump.dataset.maJump + '"]');
+                const details = target ? target.closest('details') : null;
+                if (details) details.open = true;
+                if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                return;
+              }
+              const btn = ev.target.closest('[data-ma-action]');
+              if (!btn) return;
+              ev.preventDefault();
+              const action = btn.dataset.maAction;
+              btn.disabled = true;
+              try {
+                if (action === 'install') {
+                  const { job } = await api('/api/console/mobile-access/install', { method: 'POST' });
+                  installJobId = job.id;
+                  if (installPollTimer) clearInterval(installPollTimer);
+                  installPollTimer = setInterval(pollInstall, 1500);
+                  pollInstall();
+                } else if (action === 'detect') {
+                  await refresh();
+                } else if (action === 'login') {
+                  await api('/api/console/mobile-access/login', { method: 'POST' });
+                  await refresh();
+                } else if (action === 'login-cancel') {
+                  await api('/api/console/mobile-access/login/cancel', { method: 'POST' });
+                  await refresh();
+                } else if (action === 'quick-start') {
+                  await api('/api/console/mobile-access/quick/start', { method: 'POST' });
+                  await refresh();
+                } else if (action === 'tunnel-start') {
+                  await api('/api/console/mobile-access/tunnel/start', { method: 'POST' });
+                  await refresh();
+                } else if (action === 'tunnel-stop') {
+                  await api('/api/console/mobile-access/tunnel/stop', { method: 'POST' });
+                  await refresh();
+                } else if (action === 'access-ack') {
+                  await api('/api/console/mobile-access/access-ack', { method: 'POST', body: JSON.stringify({ enabled: true }) });
+                  await refresh();
+                } else if (action === 'access-skip') {
+                  await api('/api/console/mobile-access/access-ack', { method: 'POST', body: JSON.stringify({ enabled: false }) });
+                  await refresh();
+                } else if (action === 'session-revoke') {
+                  const deviceId = btn.dataset.deviceId || '';
+                  if (!deviceId) return;
+                  if (!confirm('Disconnect this mobile session? The device will need a fresh QR or PIN login to connect again.')) return;
+                  await api('/api/console/mobile-access/sessions/' + encodeURIComponent(deviceId), { method: 'DELETE' });
+                  await refresh();
+                } else if (action === 'sessions-revoke-all') {
+                  if (!confirm('Disconnect every mobile device? Use this if you suspect fraud. Every phone will need a fresh QR or PIN login.')) return;
+                  await api('/api/console/mobile-access/sessions', { method: 'DELETE' });
+                  await refresh();
+                }
+              } catch (err) {
+                alert((err && err.message) || String(err));
+              } finally {
+                btn.disabled = false;
+              }
+            });
+
+            const configureForm = $('[data-ma-configure-form]');
+            if (configureForm) {
+              configureForm.addEventListener('submit', async (ev) => {
+                ev.preventDefault();
+                const fd = new FormData(configureForm);
+                try {
+                  await api('/api/console/mobile-access/configure', {
+                    method: 'POST',
+                    body: JSON.stringify({
+                      tunnelName: fd.get('tunnelName'),
+                      hostname: fd.get('hostname'),
+                    }),
+                  });
+                  setText('[data-ma-configure-info]', 'Tunnel configured.');
+                  await refresh();
+                } catch (err) {
+                  setText('[data-ma-configure-info]', 'Error: ' + (err.message || err));
+                }
+              });
+            }
+
+            const pinForm = $('[data-ma-pin-form]');
+            if (pinForm) {
+              pinForm.addEventListener('submit', async (ev) => {
+                ev.preventDefault();
+                const fd = new FormData(pinForm);
+                try {
+                  const result = await api('/api/console/mobile-access/pin', {
+                    method: 'POST',
+                    body: JSON.stringify({ pin: fd.get('pin') }),
+                  });
+                  setText('[data-ma-pin-info]', 'PIN saved. Revoked ' + result.revokedSessions + ' previous session(s).');
+                  pinForm.reset();
+                  await refresh();
+                } catch (err) {
+                  setText('[data-ma-pin-info]', 'Error: ' + (err.message || err));
+                }
+              });
+            }
+
+            // Poll while the panel is visible. We re-check visibility
+            // each tick rather than wiring into the global nav handler.
+            let pollTimer = null;
+            function startPolling() {
+              if (pollTimer) return;
+              refresh();
+              pollTimer = setInterval(() => {
+                const visible = !root.closest('.panel-frame[data-section="mobile-access"]').hidden;
+                if (visible) refresh();
+              }, 3000);
+            }
+            // Kick off on first render — the panel may be hidden, the
+            // tick guards itself. This also primes the QR + state on
+            // first nav click without waiting 3s.
+            startPolling();
+          })();
+        </script>
+      </section>
+
       <!--
         PANEL · 12 · EVOLUTION
         Power-user nav slot for autoresearch (hermes-style self-evolution).
@@ -2585,7 +3109,7 @@ body {
 .presence-dot.warn { background: var(--accent-warn); box-shadow: 0 0 9px color-mix(in srgb, var(--accent-warn) 52%, transparent); }
 .presence-dot.working { background: var(--accent-3); box-shadow: 0 0 9px color-mix(in srgb, var(--accent-3) 52%, transparent); }
 .presence-dot.offline { background: var(--accent-fail); box-shadow: 0 0 9px color-mix(in srgb, var(--accent-fail) 52%, transparent); }
-/* Two-column main: agenda + LIVE on the left, CHAT on the right.
+/* Two-column main: work queues on the left, CHAT on the right.
    Both columns fill the available height (1fr in the parent grid).
    Each card inside uses min-height: 0 so its body can scroll instead
    of expanding the page. */
@@ -2597,7 +3121,7 @@ body {
 }
 .home-main-left {
   display: grid;
-  grid-template-rows: minmax(0, 1fr) minmax(0, 1fr) auto;
+  grid-template-rows: minmax(0, 1fr) minmax(0, 1fr) minmax(130px, 0.72fr);
   gap: 12px;
   min-height: 0;
 }
@@ -2606,7 +3130,8 @@ body {
   min-height: 0;
 }
 .home-needs,
-.home-working {
+.home-working,
+.home-completed {
   min-height: 0;
 }
 .home-current-objective {
@@ -2649,7 +3174,7 @@ body {
   text-align: left;
   cursor: pointer;
   padding: 0;
-  display: flex;
+  display: none;
   flex-direction: column;
   transition: border-color 160ms, background 160ms;
   overflow: hidden;
@@ -2763,6 +3288,7 @@ body {
   min-height: 0;
 }
 .home-layout.live-takeover .home-live {
+  display: flex;
   cursor: default;
   min-height: 0;
   position: relative;
@@ -2914,6 +3440,12 @@ body {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+}
+.home-main-left > .home-live {
+  display: none !important;
+}
+.home-layout.live-takeover .home-main-left > .home-live {
+  display: flex !important;
 }
 
 /* v0.5.14 — Current Focus chip in the global status bar. Persistent
@@ -3167,6 +3699,27 @@ body {
   font-size: 9px;
   letter-spacing: 0.16em;
   color: var(--fg-mute);
+}
+.home-chat-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.home-chat-live-btn {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--accent);
+  font: inherit;
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  padding: 3px 8px;
+  cursor: pointer;
+}
+.home-chat-live-btn:hover {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--bg-0);
 }
 .home-chat-turn {
   display: flex;
@@ -5470,6 +6023,111 @@ body {
   margin-top: 0;
 }
 
+.wf-create {
+  height: 100%;
+  overflow-y: auto;
+  padding: 18px 20px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.wf-create-head {
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 12px;
+}
+.wf-create-head h2 {
+  margin: 0 0 6px;
+  color: var(--fg);
+  font-size: 16px;
+  letter-spacing: 0.04em;
+}
+.wf-create-head p {
+  margin: 0;
+  color: var(--fg-3);
+  font-size: 11px;
+  line-height: 1.5;
+  letter-spacing: 0;
+}
+.wf-create-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 10px;
+}
+.wf-create-card {
+  border: 1px solid var(--line);
+  background: var(--bg-1);
+  padding: 13px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.wf-create-card h3 {
+  margin: 0;
+  color: var(--fg);
+  font-size: 12px;
+  letter-spacing: 0.1em;
+}
+.wf-create-card p {
+  margin: 0;
+  color: var(--fg-3);
+  font-size: 11px;
+  line-height: 1.45;
+  letter-spacing: 0;
+}
+.wf-create-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: auto;
+}
+.wf-create-actions button {
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  padding: 7px 10px;
+  cursor: pointer;
+}
+.wf-create-actions button.primary {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.wf-create-actions button:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.wf-import-form {
+  display: grid;
+  gap: 8px;
+}
+.wf-import-form input[type="text"] {
+  border: 1px solid var(--line);
+  background: var(--bg-2);
+  color: var(--fg);
+  font: inherit;
+  padding: 8px 10px;
+  min-width: 0;
+}
+.wf-import-options {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  color: var(--fg-3);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+}
+.wf-import-status {
+  border: 1px solid var(--line);
+  background: var(--bg-1);
+  padding: 10px 12px;
+  color: var(--fg-3);
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
 .wf-edit-head {
   padding: 10px 14px;
   border-bottom: 1px solid var(--line);
@@ -7121,6 +7779,236 @@ body {
 }
 .hub-key-actions button:hover { border-color: var(--accent); color: var(--accent); }
 
+/* ─ Mobile Access ─ */
+.panel-body[data-mobile-access-panel] {
+  height: 100%;
+  box-sizing: border-box;
+  overflow-y: auto;
+  overflow-x: hidden;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding-bottom: 28px;
+}
+.panel-body[data-mobile-access-panel] > * {
+  flex: 0 0 auto;
+}
+.hub-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 4px;
+}
+.hub-actions .btn {
+  background: transparent;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  padding: 6px 12px;
+  cursor: pointer;
+}
+.hub-actions .btn:hover { background: var(--accent); color: var(--bg-0); }
+.hub-actions .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.hub-actions .btn-secondary { border-color: var(--line); color: var(--fg-2); }
+.hub-actions .btn-secondary:hover { background: var(--bg-2); color: var(--fg); }
+.hub-actions .btn-danger { border-color: var(--accent-fail); color: var(--accent-fail); }
+.hub-actions .btn-danger:hover { background: var(--accent-fail); color: var(--bg-0); }
+.hub-output {
+  margin-top: 6px;
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: var(--fg-2);
+  padding: 8px 10px;
+  max-height: 240px;
+  overflow: auto;
+  white-space: pre-wrap;
+}
+.hub-qr {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  gap: 10px;
+  background: #fff;
+  padding: 12px;
+  min-height: 220px;
+  text-align: center;
+}
+.hub-qr svg { display: block; max-width: 280px; width: 100%; height: auto; }
+.hub-qr .settings-info {
+  margin: 0;
+  max-width: 720px;
+  color: var(--fg-2);
+}
+.hub-qr a {
+  color: var(--accent);
+  font-size: 11px;
+}
+.hub-devices { display: flex; flex-direction: column; gap: 6px; }
+.hub-device {
+  border: 1px solid var(--line);
+  padding: 8px 10px;
+  font-size: 11px;
+  color: var(--fg-2);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+}
+.hub-device strong { color: var(--fg); }
+.hub-device-main {
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  align-items: baseline;
+}
+.hub-device-main strong {
+  max-width: min(520px, 100%);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.hub-device .meta { color: var(--fg-3); font-size: 10px; }
+.hub-device button {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  padding: 5px 9px;
+  cursor: pointer;
+}
+.hub-device button:hover {
+  border-color: var(--accent-fail);
+  color: var(--accent-fail);
+}
+
+.ma-advanced {
+  border: 1px solid var(--line);
+  background: var(--bg-1);
+}
+.ma-advanced summary {
+  list-style: none;
+  cursor: pointer;
+  padding: 12px 18px;
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  border-bottom: 1px solid transparent;
+}
+.ma-advanced summary::-webkit-details-marker { display: none; }
+.ma-advanced summary span {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--fg);
+}
+.ma-advanced summary em {
+  font-style: normal;
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  color: var(--fg-3);
+}
+.ma-advanced[open] summary {
+  border-bottom-color: var(--line);
+}
+.ma-advanced-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 12px;
+}
+
+/* ─ Mobile Access wizard: two-path picker + Cloudflare Access card ─ */
+.ma-paths { background: var(--bg-2); }
+.ma-paths-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 12px;
+  margin-top: 8px;
+}
+.ma-path-card {
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.ma-path-card-primary { border-color: var(--accent); }
+.ma-path-tag {
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  color: var(--fg-3);
+  text-transform: uppercase;
+}
+.ma-path-card-primary .ma-path-tag { color: var(--accent); }
+.ma-path-card h4 {
+  margin: 0;
+  font-size: 14px;
+  color: var(--fg);
+}
+.ma-path-card p {
+  margin: 0;
+  font-size: 11px;
+  color: var(--fg-2);
+  line-height: 1.55;
+}
+.ma-path-card p strong { color: var(--fg); }
+.ma-path-card ul {
+  margin: 0;
+  padding-left: 16px;
+  font-size: 11px;
+  color: var(--fg-2);
+  line-height: 1.55;
+}
+.ma-path-card code {
+  background: var(--bg-2);
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 11px;
+}
+.ma-paths-note {
+  margin-top: 12px;
+  font-size: 10px;
+  color: var(--fg-3);
+  line-height: 1.55;
+}
+
+.ma-access { border-color: var(--accent-warn); }
+.ma-access .hub-block-title { color: var(--accent-warn); }
+.ma-access .hub-block-intro a { color: var(--accent); }
+.ma-access .hub-block-intro code {
+  background: var(--bg-2);
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 11px;
+}
+.ma-access-steps {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 11px;
+  color: var(--fg-2);
+  line-height: 1.65;
+}
+.ma-access-steps li { margin-bottom: 6px; }
+.ma-access-steps code {
+  background: var(--bg-2);
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 11px;
+}
+.ma-access-steps strong { color: var(--fg); }
+
 /* ─ Apps list (Composio) ─ */
 .hub-apps-controls {
   display: flex;
@@ -7608,12 +8496,25 @@ body {
 .usage-trim-row button.danger { color: var(--accent-fail); border-color: var(--accent-fail); }
 
 /* v0.5.11 — Approvals panel */
-.approvals-layout { padding: 16px; }
+.approvals-layout {
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-height: 0;
+}
 .approvals-header { display: flex; justify-content: space-between; gap: 16px; margin-bottom: 16px; }
 .approvals-intro h3 { margin: 0 0 4px; font-size: 14px; letter-spacing: 0.08em; }
 .approvals-intro p { margin: 0; color: var(--fg-3); font-size: 11px; max-width: 600px; }
 .approvals-toolbar { display: flex; gap: 8px; align-items: flex-start; }
-.approvals-list { display: flex; flex-direction: column; gap: 12px; }
+.approvals-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  overflow-y: auto;
+  min-height: 0;
+  padding-right: 8px;
+}
 .approval-card {
   border: 1px solid var(--line);
   padding: 14px;
@@ -7623,6 +8524,12 @@ body {
   display: flex; justify-content: space-between; align-items: flex-start; gap: 12px;
 }
 .approval-subject { font-size: 13px; font-weight: 500; line-height: 1.4; flex: 1; }
+.approval-source {
+  margin-top: 4px;
+  font-size: 10px;
+  color: var(--fg-3);
+  line-height: 1.35;
+}
 .approval-age { font-size: 10px; letter-spacing: 0.1em; color: var(--fg-3); white-space: nowrap; padding-top: 2px; }
 .approval-age.stale { color: var(--accent-warn); }
 .approval-kind-pill {
@@ -7646,8 +8553,67 @@ body {
   font-size: 10px; word-break: break-all;
 }
 .approval-age.very-stale { color: var(--accent-fail); }
+.approval-reason {
+  border-left: 3px solid var(--accent);
+  padding: 8px 10px;
+  background: var(--bg-1);
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--fg);
+}
+.approval-reason span {
+  display: inline-block;
+  margin-right: 8px;
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  color: var(--accent);
+}
+.approval-preview {
+  border: 1px solid var(--line);
+  background: var(--bg-0);
+  padding: 8px 10px;
+  font-size: 11px;
+  line-height: 1.4;
+}
+.approval-preview-count {
+  color: var(--fg);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  margin-bottom: 4px;
+}
+.approval-preview ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 4px;
+}
+.approval-preview li {
+  display: grid;
+  grid-template-columns: minmax(80px, 0.35fr) minmax(0, 1fr);
+  gap: 8px;
+}
+.approval-preview li span { color: var(--fg-3); }
+.approval-preview li strong { font-weight: 500; color: var(--fg); }
+.approval-preview li em {
+  grid-column: 2;
+  color: var(--fg-3);
+  font-style: normal;
+}
+.approval-preview-note {
+  margin-top: 6px;
+  color: var(--fg-3);
+  font-size: 10px;
+}
 .approval-meta { font-size: 10px; color: var(--fg-3); letter-spacing: 0.04em; }
 .approval-meta code { background: var(--bg-2); padding: 1px 5px; border: 1px solid var(--line); }
+.approval-details summary {
+  cursor: pointer;
+  color: var(--fg-3);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
 .approval-args {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 11px; padding: 8px 10px; background: var(--bg-2);
@@ -9852,6 +10818,75 @@ const CONSOLE_JS = `
     }
   }
 
+  async function openBackgroundTaskDetail(taskId) {
+    if (!taskId) return;
+    try {
+      selectedRunId = 'background:' + taskId;
+      if (els.runList) {
+        Array.from(els.runList.querySelectorAll('li.run')).forEach((el) => el.classList.remove('selected'));
+      }
+      const data = await fetchJSON('/api/console/background-tasks/' + encodeURIComponent(taskId));
+      const task = data.task || {};
+      const detail = data.detail || {};
+      if (els.detailId) els.detailId.textContent = task.id || taskId;
+      const result = task.resultFull || task.result || '';
+      const headLines = [
+        ['STATUS', task.status || '—'],
+        ['SOURCE', task.source || '—'],
+        ['CHANNEL', task.channel || '—'],
+        ['CREATED', task.createdAt || '—'],
+        ['COMPLETED', task.completedAt || '—'],
+        ['TITLE', task.title || '—'],
+      ];
+      const resultPath = task.resultPath || '';
+      const resultPathHtml = resultPath
+        ? '<div class="detail-block"><div class="detail-block-head">FULL RESULT FILE</div><div class="detail-block-body"><pre>' + esc(resultPath) + '</pre></div></div>'
+        : '';
+      const outputHtml = result
+        ? '<div class="detail-block"><div class="detail-block-head">WHAT COMPLETED</div><div class="detail-block-body"><pre>' + esc(result) + '</pre></div></div>'
+        : '<div class="detail-block"><div class="detail-block-head">WHAT COMPLETED</div><div class="detail-block-body"><p class="hint" style="margin:8px 0;">No result text was recorded.</p></div></div>';
+      const promptHtml = task.prompt
+        ? '<details class="detail-block"><summary class="detail-block-head">ORIGINAL REQUEST</summary><div class="detail-block-body"><pre>' + esc(task.prompt) + '</pre></div></details>'
+        : '';
+      const approvals = Array.isArray(detail.pendingApprovals) ? detail.pendingApprovals : [];
+      const approvalsHtml = approvals.length
+        ? '<div class="detail-block"><div class="detail-block-head">PENDING APPROVALS</div><div class="detail-block-body"><pre>'
+          + approvals.map((approval) => esc((approval.approvalId || 'approval') + ' · ' + (approval.subject || approval.tool || 'needs approval'))).join('\\n')
+          + '</pre></div></div>'
+        : '';
+      const toolEvents = Array.isArray(detail.toolEvents) ? detail.toolEvents.slice(-12) : [];
+      const toolEventsHtml = toolEvents.length
+        ? '<div class="detail-block"><div class="detail-block-head">RECENT TOOL ACTIVITY</div><div class="detail-block-body"><pre>'
+          + toolEvents.map((event) => esc(
+            (event.at ? event.at.slice(11, 19) : '--:--:--') + ' ' +
+            (event.toolName || 'tool') + ' ' +
+            (event.phase || 'event') +
+            (event.outcome ? ' ' + event.outcome : '') +
+            (event.durationMs ? ' ' + event.durationMs + 'ms' : '') +
+            (event.argsSummary ? ' · ' + event.argsSummary : ''),
+          )).join('\\n')
+          + '</pre></div></div>'
+        : '';
+      const notifications = Array.isArray(detail.notifications) ? detail.notifications.slice(-5) : [];
+      const notificationsHtml = notifications.length
+        ? '<div class="detail-block"><div class="detail-block-head">TASK NOTIFICATIONS</div><div class="detail-block-body"><pre>'
+          + notifications.map((notification) => esc(
+            (notification.createdAt ? notification.createdAt.slice(11, 19) : '--:--:--') + ' ' +
+            (notification.title || 'notification') +
+            (notification.silent ? ' (dashboard-only)' : ''),
+          )).join('\\n')
+          + '</pre></div></div>'
+        : '';
+      const headerHtml = '<div class="detail-block"><div class="detail-block-head">BACKGROUND TASK</div><div class="detail-block-body"><pre>'
+        + headLines.map((kv) => kv[0].padEnd(10) + ' ' + esc(kv[1])).join('\\n')
+        + '</pre></div></div>';
+      if (els.detailBody) els.detailBody.innerHTML = headerHtml + approvalsHtml + resultPathHtml + outputHtml + toolEventsHtml + notificationsHtml + promptHtml;
+    } catch (err) {
+      if (els.detailId) els.detailId.textContent = taskId;
+      if (els.detailBody) els.detailBody.innerHTML = '<p class="hint">Failed to load background task · ' + esc(err.message || err) + '</p>';
+    }
+  }
+
   // Home tile counts that don't come from /api/dashboard.
   // Refreshed in the background so the tiles aren't always pinned to '—'.
   let homePlanCount = null;
@@ -10032,6 +11067,7 @@ const CONSOLE_JS = `
       const hasApproval = item.approvalId && item.approvalKind;
       const hasWorkflowRun = item.actionKind === 'workflow-run' && item.workflowName && item.runId;
       const hasHarnessSession = item.actionKind === 'harness-session' && item.sessionId;
+      const hasBackgroundTask = item.actionKind === 'background-task' && item.taskId;
       const canEdit = hasApproval && item.approvalKind === 'harness' && item.approvalArgs;
       const editArgsAttr = canEdit ? ' data-home-approval-args="' + escMem(item.approvalArgs) + '"' : '';
       const editButton = canEdit
@@ -10062,6 +11098,13 @@ const CONSOLE_JS = `
             '</div>',
           ].join('')
         : '';
+      const backgroundActions = hasBackgroundTask
+        ? [
+            '<div class="home-item-actions">',
+            '  <button type="button" data-home-background-action="open" data-home-background-task-id="' + escMem(item.taskId) + '">VIEW RESULT</button>',
+            '</div>',
+          ].join('')
+        : '';
       // Drill-target: if the item carries a sessionId or runId, attach
       // it as a data attribute. The click handler at line ~8693 reads
       // these and, AFTER switching panels, loads the inspector detail
@@ -10070,8 +11113,14 @@ const CONSOLE_JS = `
       const targetSessionAttr = item.targetSessionId
         ? ' data-home-target-session-id="' + escMem(item.targetSessionId) + '"'
         : '';
+      const targetRunAttr = item.targetRunId
+        ? ' data-home-target-run-id="' + escMem(item.targetRunId) + '"'
+        : '';
+      const targetBackgroundAttr = hasBackgroundTask
+        ? ' data-home-background-task-id="' + escMem(item.taskId) + '"'
+        : '';
       return [
-      '<div class="home-item command-item" data-tools-jump="' + escMem(item.panel || 'activity') + '"' + targetSessionAttr + '>',
+      '<div class="home-item command-item" data-tools-jump="' + escMem(item.panel || 'activity') + '"' + targetSessionAttr + targetRunAttr + targetBackgroundAttr + '>',
       '  <span class="home-item-kind ' + escMem(item.kind || 'task') + '">' + escMem(String(item.kind || 'item').toUpperCase()) + '</span>',
       '  <div style="flex:1; min-width:0;">',
       '    <div class="home-item-text">' + escMem(item.title || '') + '</div>',
@@ -10079,6 +11128,7 @@ const CONSOLE_JS = `
       approvalActions,
       workflowActions,
       harnessActions,
+      backgroundActions,
       '  </div>',
       '</div>',
     ].join('');
@@ -10843,10 +11893,49 @@ const CONSOLE_JS = `
       handleHomeHarnessButton(harnessButton);
       return;
     }
+    const backgroundButton = target.closest('[data-home-background-action]');
+    if (backgroundButton) {
+      event.preventDefault();
+      event.stopPropagation();
+      const taskId = backgroundButton.getAttribute('data-home-background-task-id') || '';
+      if (taskId) {
+        switchPanel('activity');
+        setTimeout(() => openBackgroundTaskDetail(taskId), 0);
+      }
+      return;
+    }
     const jump = target.closest('[data-tools-jump]');
     if (!jump) return;
     event.preventDefault();
     const panel = jump.getAttribute('data-tools-jump');
+    const targetBackgroundTaskId = jump.getAttribute('data-home-background-task-id');
+    if (targetBackgroundTaskId && panel === 'activity') {
+      switchPanel('activity');
+      setTimeout(() => {
+        openBackgroundTaskDetail(targetBackgroundTaskId);
+      }, 0);
+      return;
+    }
+    const targetRunId = jump.getAttribute('data-home-target-run-id');
+    if (targetRunId && panel === 'activity') {
+      switchPanel('activity');
+      setTimeout(() => {
+        try {
+          selectedRunId = targetRunId;
+          if (typeof loadDetail === 'function') loadDetail(targetRunId);
+          if (els && els.runList) {
+            Array.from(els.runList.querySelectorAll('li.run')).forEach((el) => {
+              el.classList.toggle('selected', el.getAttribute('data-run-id') === targetRunId);
+            });
+            const selectedLi = els.runList.querySelector('li.run.selected');
+            if (selectedLi && typeof selectedLi.scrollIntoView === 'function') {
+              selectedLi.scrollIntoView({ block: 'center', behavior: 'smooth' });
+            }
+          }
+        } catch (err) { console.error('run drill-link failed:', err); }
+      }, 80);
+      return;
+    }
     switchPanel(panel);
     const settingsTab = jump.getAttribute('data-settings-tab-open');
     if (panel === 'settings' && settingsTab) {
@@ -11075,7 +12164,8 @@ const CONSOLE_JS = `
     wireMemoryViewToggle();
     wireMemoryGraphControls();
     await Promise.all([refreshMemoryStatus(), refreshFileList(), refreshFactList()]);
-    if (!memGraphLoaded) {
+    const graphPane = document.querySelector('[data-brain-knowledge-pane="graph"]');
+    if (!memGraphLoaded && graphPane && !graphPane.hidden) {
       memGraphLoaded = true;
       await loadMemoryGraph();
     }
@@ -11092,6 +12182,43 @@ const CONSOLE_JS = `
   let memGraphPinnedNode = null;
   let memViewToggleBound = false;
   let memGraphActionsBound = false;
+  let cytoscapeLoadPromise = null;
+
+  function ensureCytoscapeLoaded() {
+    if (typeof window.cytoscape === 'function') return Promise.resolve(true);
+    if (cytoscapeLoadPromise) return cytoscapeLoadPromise;
+    cytoscapeLoadPromise = new Promise((resolve) => {
+      const started = Date.now();
+      let done = false;
+      let timer = null;
+      const finish = (ok) => {
+        if (done) return;
+        done = true;
+        if (timer) clearInterval(timer);
+        resolve(!!ok && typeof window.cytoscape === 'function');
+      };
+      const poll = () => {
+        if (typeof window.cytoscape === 'function') {
+          finish(true);
+        } else if (Date.now() - started > 5000) {
+          finish(false);
+        }
+      };
+      const existing = document.querySelector('script[src="/console/vendor/cytoscape.min.js"]');
+      const script = existing || document.createElement('script');
+      if (!existing) {
+        script.src = '/console/vendor/cytoscape.min.js';
+        script.async = true;
+        script.setAttribute('data-cytoscape-loader', '1');
+        document.head.appendChild(script);
+      }
+      script.addEventListener('load', () => finish(true), { once: true });
+      script.addEventListener('error', () => finish(false), { once: true });
+      timer = setInterval(poll, 50);
+      poll();
+    });
+    return cytoscapeLoadPromise;
+  }
 
   function wireMemoryViewToggle() {
     document.querySelectorAll('[data-mem-view]').forEach((button) => {
@@ -11614,7 +12741,8 @@ const CONSOLE_JS = `
     const canvas = document.querySelector('[data-mem-graph-canvas]');
     const detail = document.querySelector('[data-mem-graph-detail]');
     if (!canvas) return;
-    if (typeof window.cytoscape !== 'function') {
+    if (canvas.closest('[hidden]') && !options.force) return;
+    if (!(await ensureCytoscapeLoaded())) {
       canvas.innerHTML = '<div class="mem-empty" style="padding:24px;">Cytoscape failed to load. Reload the page once the daemon is up.</div>';
       return;
     }
@@ -12696,6 +13824,27 @@ const CONSOLE_JS = `
         showWorkflowHome({ refresh: true });
         return;
       }
+      const createAction = target.closest('[data-wf-create-action]');
+      if (createAction) {
+        event.preventDefault();
+        const action = createAction.getAttribute('data-wf-create-action');
+        if (action === 'starter') {
+          startStarterWorkflow();
+          return;
+        }
+        if (action === 'architect') {
+          expandWorkflowArchitect();
+          if (wf.chatInput) {
+            wf.chatInput.value = 'Draft me a workflow for ';
+            wf.chatInput.focus();
+          }
+          return;
+        }
+        if (action === 'import') {
+          startWorkflowImportFromCreate();
+          return;
+        }
+      }
       const homeAction = target.closest('[data-wf-home-action]');
       if (homeAction) {
         event.preventDefault();
@@ -13007,8 +14156,11 @@ const CONSOLE_JS = `
     }
   }
 
-  function renderWorkflowHome(data) {
+  function renderWorkflowHome(data, opts) {
     if (!wf.editor) return;
+    const previousScroll = opts && opts.preserveScroll
+      ? ((wf.editor.querySelector('.wf-home') && wf.editor.querySelector('.wf-home').scrollTop) || 0)
+      : 0;
     scheduleWorkflowHomePolling(data);
     const counts = (data && data.counts) || {};
     const workflows = Array.isArray(data && data.workflows) ? data.workflows : [];
@@ -13134,6 +14286,12 @@ const CONSOLE_JS = `
       '  </section>',
       '</div>',
     ].join('');
+    if (opts && opts.preserveScroll) {
+      requestAnimationFrame(() => {
+        const homeEl = wf.editor && wf.editor.querySelector('.wf-home');
+        if (homeEl) homeEl.scrollTop = previousScroll;
+      });
+    }
   }
 
   function stopWorkflowHomePolling() {
@@ -13163,9 +14321,140 @@ const CONSOLE_JS = `
     }
     try {
       wfHomeData = await fetchJSON('/api/console/workflows/home');
-      renderWorkflowHome(wfHomeData);
+      if (wfMode !== 'home') return;
+      renderWorkflowHome(wfHomeData, { preserveScroll: !!(opts && (opts.preserveScroll || opts.silent)) });
     } catch (err) {
+      if (wfMode !== 'home') return;
       wf.editor.innerHTML = '<div class="wf-empty"><div class="wf-empty-mark">!</div><div class="wf-empty-text">' + escMem(err.message || err) + '</div></div>';
+    }
+  }
+
+  function renderWorkflowCreate() {
+    if (!wf.editor) return;
+    wf.editor.innerHTML = [
+      '<div class="wf-create">',
+      '  <div class="wf-create-head">',
+      '    <h2>Create workflow</h2>',
+      '    <p>Start from a safe starter template, ask the Architect to draft the workflow, or import a framework from a local folder or Git repo.</p>',
+      '  </div>',
+      '  <div class="wf-create-grid">',
+      '    <article class="wf-create-card">',
+      '      <h3>ARCHITECT</h3>',
+      '      <p>Describe the process in plain language. Clementine proposes diff cards; nothing mutates until you apply and save.</p>',
+      '      <div class="wf-create-actions">',
+      '        <button type="button" class="primary" data-wf-create-action="architect">ASK ARCHITECT</button>',
+      '      </div>',
+      '    </article>',
+      '    <article class="wf-create-card">',
+      '      <h3>STARTER TEMPLATE</h3>',
+      '      <p>Create a small research → draft workflow you can edit manually or refine with Architect.</p>',
+      '      <div class="wf-create-actions">',
+      '        <button type="button" class="primary" data-wf-create-action="starter">START FROM TEMPLATE</button>',
+      '      </div>',
+      '    </article>',
+      '    <article class="wf-create-card">',
+      '      <h3>IMPORT FRAMEWORK</h3>',
+      '      <p>Import a workflow package from a local folder, GitHub URL, SSH URL, or owner/repo shorthand. Dry run first to preview what will be installed.</p>',
+      '      <div class="wf-import-form">',
+      '        <input type="text" data-wf-import-source placeholder="~/path/to/workflow-framework or owner/repo" spellcheck="false" />',
+      '        <div class="wf-import-options">',
+      '          <label><input type="checkbox" data-wf-import-dry-run checked /> DRY RUN</label>',
+      '          <label><input type="checkbox" data-wf-import-overwrite /> OVERWRITE EXISTING</label>',
+      '        </div>',
+      '        <div class="wf-create-actions">',
+      '          <button type="button" class="primary" data-wf-create-action="import">IMPORT</button>',
+      '        </div>',
+      '      </div>',
+      '    </article>',
+      '  </div>',
+      '  <section class="wf-framework-guide wf-home-framework">',
+      '    <div class="wf-framework-guide-head">BUILD OUTSIDE CLEMENTINE</div>',
+      '    <p>Create a repo or folder with a workflow <code>SKILL.md</code>. Clementine can import a single root workflow, <code>workflows/*/SKILL.md</code>, or <code>.clementine/workflows/*/SKILL.md</code>.</p>',
+      '    <pre>proposal-audit/\\n  SKILL.md\\n  references/\\n  scripts/</pre>',
+      '    <pre>---\\nname: proposal-audit\\ndescription: Build a branded SEO proposal audit.\\nenabled: true\\ntrigger: { manual: true }\\nallowed_tools:\\n  - read_file\\n  - write_file\\nsteps:\\n  - id: research\\n    allowedTools: [read_file]\\n  - id: build\\n    dependsOn: [research]\\n    uses_skill: proposal-builder\\nsynthesis:\\n  prompt: Return the finished file path and the client-ready summary.\\n---\\nMarkdown body here.\\n\\n## step: research\\nRead the inputs and gather the facts.\\n\\n## step: build\\nCreate the proposal artifact.</pre>',
+      '  </section>',
+      '  <div class="wf-import-status" data-wf-import-status hidden></div>',
+      '</div>',
+    ].join('');
+  }
+
+  function showWorkflowCreate() {
+    wfMode = 'create';
+    wfDraft = null;
+    wfSelectedName = null;
+    wfIsNew = false;
+    cronSelectedName = null;
+    wfChatHistory = [];
+    wfEditingStepIndices.clear();
+    stopWorkflowHomePolling();
+    stopActiveRunPolling();
+    if (wf.list) Array.from(wf.list.querySelectorAll('li.wf')).forEach((el) => el.classList.remove('selected'));
+    resetWorkflowArchitectIntro();
+    syncArchitectChatChips();
+    renderWorkflowCreate();
+  }
+
+  function setWorkflowImportStatus(text, busy) {
+    const status = wf.editor && wf.editor.querySelector('[data-wf-import-status]');
+    if (!status) return;
+    status.hidden = false;
+    status.textContent = text || '';
+    status.classList.toggle('busy', !!busy);
+  }
+
+  async function pollWorkflowImportJob(jobId) {
+    if (!jobId) return null;
+    let lastJob = null;
+    for (let i = 0; i < 60; i += 1) {
+      const data = await fetchJSON('/api/console/workflows/import/jobs/' + encodeURIComponent(jobId));
+      const job = data.job || {};
+      lastJob = job;
+      setWorkflowImportStatus([
+        'Import ' + job.id,
+        'Status: ' + job.status,
+        'Source: ' + job.normalizedSource,
+        'Discovered: ' + (job.discovered || []).length,
+        'Installed: ' + (job.installed || []).length,
+        'Skipped: ' + (job.skipped || []).length,
+        '',
+        (job.output || '').slice(-4000),
+      ].join('\\n'), job.status !== 'succeeded' && job.status !== 'failed');
+      if (job.status === 'succeeded' || job.status === 'failed') return job;
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+    return lastJob;
+  }
+
+  async function startWorkflowImportFromCreate() {
+    const sourceEl = wf.editor && wf.editor.querySelector('[data-wf-import-source]');
+    const dryRunEl = wf.editor && wf.editor.querySelector('[data-wf-import-dry-run]');
+    const overwriteEl = wf.editor && wf.editor.querySelector('[data-wf-import-overwrite]');
+    const source = sourceEl && sourceEl.value ? sourceEl.value.trim() : '';
+    if (!source) {
+      setWorkflowImportStatus('Enter a local folder, GitHub URL, SSH URL, or owner/repo shorthand first.', false);
+      if (sourceEl) sourceEl.focus();
+      return;
+    }
+    try {
+      setWorkflowImportStatus('Starting import…', true);
+      const r = await fetch(withToken('/api/console/workflows/import'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          source,
+          dryRun: !dryRunEl || dryRunEl.checked,
+          overwrite: !!(overwriteEl && overwriteEl.checked),
+        }),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+      const job = await pollWorkflowImportJob(j.job && j.job.id);
+      await refreshWorkflowList({ skipReselect: true });
+      if (job && job.status === 'succeeded' && !job.dryRun && Array.isArray(job.installed) && job.installed.length > 0) {
+        setWorkflowImportStatus('Import complete. Installed: ' + job.installed.map((item) => item.name).join(', '), false);
+      }
+    } catch (err) {
+      setWorkflowImportStatus('Import failed: ' + (err.message || err), false);
     }
   }
 
@@ -13328,7 +14617,7 @@ const CONSOLE_JS = `
       wfItems = items;
       if (items.length === 0) {
         wf.list.innerHTML = '<li class="empty">— no workflows — ＋ NEW to start —</li>';
-        if (!skipReselect) {
+        if (!skipReselect && wfMode !== 'create') {
           showWorkflowHome({ refresh: true });
         }
         return;
@@ -13355,7 +14644,7 @@ const CONSOLE_JS = `
         ].join('');
       }).join('');
       if (skipReselect) {
-        if (wfMode === 'home') loadWorkflowHome().catch((err) => console.error('workflow home refresh failed:', err));
+        if (wfMode === 'home') loadWorkflowHome({ silent: true, preserveScroll: true }).catch((err) => console.error('workflow home refresh failed:', err));
         return;
       }
       const hashName = workflowNameFromHash();
@@ -13365,7 +14654,7 @@ const CONSOLE_JS = `
         : null;
       if (nextSelection) {
         selectWorkflowByName(nextSelection);
-      } else if (!wfDraft) {
+      } else if (!wfDraft && wfMode !== 'create') {
         showWorkflowHome({ refresh: true });
       }
     } catch (err) {
@@ -13422,6 +14711,10 @@ const CONSOLE_JS = `
   }
 
   function startNewWorkflow() {
+    showWorkflowCreate();
+  }
+
+  function startStarterWorkflow() {
     wfMode = 'editor';
     stopWorkflowHomePolling();
     wfSelectedName = null;
@@ -16129,8 +17422,11 @@ const CONSOLE_JS = `
         if (ev.type === 'conversation_completed') {
           const summary = humanHarnessText(ev.data && (ev.data.reply || ev.data.summary), '');
           const reason = ev.data && ev.data.reason;
+          const planProposalId = ev.data && typeof ev.data.planProposalId === 'string' ? ev.data.planProposalId : '';
           const existing = turn?.querySelector?.('[data-home-chat-turn-text]')?.textContent || '';
-          if (summary) {
+          if (reason === 'plan_first' && planProposalId) {
+            setChatTurnPlanApproval(turn, summary, planProposalId);
+          } else if (summary) {
             setChatTurnText(turn, summary);
           } else if (!existing) {
             // No final summary and no intermediate text — fall back to a
@@ -16139,7 +17435,9 @@ const CONSOLE_JS = `
               ? '(Finished without a written reply.)'
               : '(Done.)');
           }
-          setChatTurnStatus(turn, reason === 'abandoned_by_orchestrator' ? 'abandoned' : 'complete');
+          setChatTurnStatus(turn, reason === 'plan_first'
+            ? 'awaiting plan approval'
+            : reason === 'abandoned_by_orchestrator' ? 'abandoned' : 'complete');
           finish();
         } else if (ev.type === 'run_failed') {
           const msg = (ev.data && ev.data.error) || 'failed';
@@ -16436,6 +17734,83 @@ const CONSOLE_JS = `
     actions.appendChild(approve);
     actions.appendChild(reject);
     body.appendChild(actions);
+  }
+
+  function setChatTurnPlanApproval(turn, text, planProposalId) {
+    const body = turn?.querySelector?.('[data-home-chat-turn-text]');
+    if (!body) return;
+    body.innerHTML = renderTextWithLinks(text || '');
+
+    if (!planProposalId) return;
+    const actions = document.createElement('div');
+    actions.className = 'home-chat-turn-actions';
+
+    const approve = document.createElement('button');
+    approve.type = 'button';
+    approve.textContent = 'Approve & proceed';
+    approve.addEventListener('click', () => {
+      resolvePlanProposalFromChat(approve, 'approve', planProposalId, turn);
+    });
+
+    const reject = document.createElement('button');
+    reject.type = 'button';
+    reject.textContent = 'Reject';
+    reject.addEventListener('click', () => {
+      resolvePlanProposalFromChat(reject, 'reject', planProposalId, turn);
+    });
+
+    actions.appendChild(approve);
+    actions.appendChild(reject);
+    body.appendChild(actions);
+  }
+
+  async function resolvePlanProposalFromChat(button, decision, planProposalId, turn) {
+    const actions = button.closest('.home-chat-turn-actions');
+    const buttons = actions ? Array.from(actions.querySelectorAll('button')) : [button];
+    buttons.forEach((btn) => { btn.disabled = true; });
+    const original = button.textContent;
+    button.textContent = decision === 'approve' ? 'Approving...' : 'Rejecting...';
+    try {
+      const endpoint = '/api/console/plan-proposals/' + encodeURIComponent(planProposalId) + '/' + decision;
+      const payload = decision === 'reject' ? { reason: 'Rejected from chat dock.' } : {};
+      const r = await fetchWithToken(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+
+      if (decision === 'approve') {
+        const taskId = j.queuedTask && j.queuedTask.id ? String(j.queuedTask.id) : '';
+        const noteText = taskId
+          ? 'Plan approved. I queued it as background task ' + taskId + '.'
+          : 'Plan approved. I queued the work.';
+        button.textContent = 'Approved';
+        setChatTurnStatus(turn, 'plan approved');
+        if (actions) {
+          const note = document.createElement('div');
+          note.style.width = '100%';
+          note.textContent = noteText;
+          actions.appendChild(note);
+        }
+      } else {
+        button.textContent = 'Rejected';
+        setChatTurnStatus(turn, 'plan rejected');
+      }
+
+      if (typeof refreshPlanProposals === 'function') {
+        try { await refreshPlanProposals(); } catch (_) {}
+      }
+      if (typeof refreshHomeCommandCenter === 'function') {
+        try { await refreshHomeCommandCenter(); } catch (_) {}
+      }
+    } catch (err) {
+      buttons.forEach((btn) => { btn.disabled = false; });
+      button.textContent = original || (decision === 'approve' ? 'Approve & proceed' : 'Reject');
+      setChatTurnStatus(turn, decision === 'approve' ? 'approval failed' : 'reject failed');
+      alert('Could not ' + decision + ' plan: ' + ((err && err.message) || err));
+    }
   }
 
   async function resumeHarnessApprovalFromButton(button, decision, approvalId, sessionId, turn, options) {
@@ -16920,6 +18295,7 @@ const CONSOLE_JS = `
     const toggle = document.querySelector('[data-home-voice-toggle]');
     const handoff = document.querySelector('[data-home-voice-handoff]');
     const liveCard = document.querySelector('[data-home-live-card]');
+    const liveOpenButtons = Array.from(document.querySelectorAll('[data-home-live-open]'));
     const closeBtn = document.querySelector('[data-home-live-close]');
     const layout = document.querySelector('[data-home-layout]');
     const takeoverChrome = document.querySelector('[data-home-live-takeover]');
@@ -16979,6 +18355,15 @@ const CONSOLE_JS = `
         }
       });
     }
+    liveOpenButtons.forEach((button) => {
+      if (button.dataset.bound) return;
+      button.dataset.bound = 'true';
+      button.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        setHomeTakeover(true);
+      });
+    });
     if (closeBtn && !closeBtn.dataset.bound) {
       closeBtn.dataset.bound = 'true';
       closeBtn.addEventListener('click', (event) => {
@@ -18881,6 +20266,30 @@ const CONSOLE_JS = `
     return '';
   }
 
+  function renderApprovalPreview(preview) {
+    if (!preview || typeof preview !== 'object') return '';
+    const samples = Array.isArray(preview.samples) ? preview.samples.slice(0, 5) : [];
+    const countLine = typeof preview.count === 'number'
+      ? '<div class="approval-preview-count">' + escMem(preview.count + ' item' + (preview.count === 1 ? '' : 's')) + '</div>'
+      : '';
+    const sampleLines = samples.map(function (sample) {
+      if (!sample || typeof sample !== 'object') return '';
+      const label = sample.label ? '<span>' + escMem(sample.label) + '</span>' : '';
+      const value = sample.value ? '<strong>' + escMem(sample.value) + '</strong>' : '';
+      const secondary = sample.secondary ? '<em>' + escMem(sample.secondary) + '</em>' : '';
+      return '<li>' + label + value + secondary + '</li>';
+    }).filter(Boolean).join('');
+    const inferred = preview.inferred ? '<div class="approval-preview-note">auto-inferred from recent tool output</div>' : '';
+    if (!countLine && !sampleLines && !inferred) return '';
+    return [
+      '<div class="approval-preview">',
+      countLine,
+      sampleLines ? '<ul>' + sampleLines + '</ul>' : '',
+      inferred,
+      '</div>',
+    ].join('');
+  }
+
   async function refreshApprovalsPanel() {
     const listEl = document.querySelector('[data-approvals-list]');
     if (!listEl) return;
@@ -18903,6 +20312,10 @@ const CONSOLE_JS = `
         const workflow = (a.args && typeof a.args === 'object' && typeof a.args.workflow === 'string') ? a.args.workflow : '';
         const kind = a.kind === 'runtime' ? 'runtime' : 'harness';
         const fingerprint = a.resourceFingerprint;
+        const summary = a.summary || a.subject || a.tool || '(approval required)';
+        const reason = a.reason || '';
+        const source = a.sourceTitle ? (a.sourceKind ? a.sourceKind + ': ' : '') + a.sourceTitle : '';
+        const previewHtml = renderApprovalPreview(a.preview);
         const mismatchBanner = fingerprint && fingerprint.result === 'mismatch'
           ? [
               '  <div class="approval-mismatch">',
@@ -18917,16 +20330,21 @@ const CONSOLE_JS = `
         return [
           '<div class="approval-card ' + (fingerprint && fingerprint.result === 'mismatch' ? 'has-mismatch' : '') + '" data-approval-id="' + escMem(a.approvalId || '') + '" data-approval-kind="' + kind + '">',
           '  <div class="approval-card-head">',
-          '    <div class="approval-subject">' + escMem(a.subject || a.tool || '(no subject)') + '</div>',
+          '    <div>',
+          '      <div class="approval-subject">' + escMem(summary) + '</div>',
+          source ? '      <div class="approval-source">' + escMem(source) + '</div>' : '',
+          '    </div>',
           '    <div class="approval-age ' + ageCls + '">' + escMem(ageLabel) + '</div>',
           '  </div>',
           mismatchBanner,
+          reason ? '  <div class="approval-reason"><span>WHY</span>' + escMem(reason) + '</div>' : '',
+          previewHtml,
           '  <div class="approval-meta">tool: <code>' + escMem(a.tool || 'unknown') + '</code>',
           workflow ? ' · workflow: <code>' + escMem(workflow) + '</code>' : '',
           ' · session: <code>' + escMem(sessionShort) + '</code>',
           ' · id: <code>' + escMem(a.approvalId || '') + '</code>',
           ' · <span class="approval-kind-pill ' + kind + '">' + (kind === 'runtime' ? 'runtime' : 'tool') + '</span></div>',
-          argsRendered ? '  <pre class="approval-args">' + escMem(argsRendered) + '</pre>' : '',
+          argsRendered ? '  <details class="approval-details"><summary>raw request details</summary><pre class="approval-args">' + escMem(argsRendered) + '</pre></details>' : '',
           '  <div class="approval-actions">',
           '    <button class="approve" data-approval-action="approve">APPROVE</button>',
           '    <button class="reject" data-approval-action="reject">REJECT</button>',

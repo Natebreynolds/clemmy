@@ -1,10 +1,13 @@
+import webPush from 'web-push';
 import type { NotificationDestination, NotificationRecord } from './notifications.js';
+import { removeWebPushDestinationByEndpoint } from './notifications.js';
 import {
   buildActionsForNotification,
   sendDiscordChannelMessage,
   sendDiscordChannelMessageWithComponents,
   sendDiscordDirectMessage,
 } from '../channels/discord.js';
+import { getVapidKeys } from './web-push-keys.js';
 
 // Discord caps a single message at 2000 chars. We aim slightly lower
 // to leave headroom for markdown / part labels.
@@ -65,20 +68,103 @@ function buildGenericPayload(notification: NotificationRecord): Record<string, u
   };
 }
 
+/**
+ * Sanitized payload for Web Push. We deliberately strip everything
+ * beyond a short generic title + body so the push payload that lands
+ * on Apple/Google's relay carries no sensitive content. The PWA fetches
+ * the full notification via `/m/api/events/<id>` after the user taps.
+ */
+function buildWebPushPayload(notification: NotificationRecord): {
+  title: string;
+  body: string;
+  url: string;
+  notificationId: string;
+  kind: string;
+} {
+  // Approvals show a slightly more specific title so the user knows
+  // a yes/no is waiting; everything else is generic.
+  const isApproval = notification.kind === 'approval';
+  return {
+    title: isApproval ? 'Approval pending' : 'Clementine',
+    body: isApproval
+      ? `Tap to review${notification.metadata?.tool ? ` (${String(notification.metadata.tool)})` : ''}`
+      : (notification.title || 'You have an update.'),
+    url: isApproval ? '/m/?tab=inbox' : '/m/',
+    notificationId: notification.id,
+    kind: notification.kind,
+  };
+}
+
+function shouldDeliverDiscordNotification(notification: NotificationRecord): boolean {
+  if (notification.silent) return false;
+
+  const title = notification.title.trim().toLowerCase();
+  if (notification.kind === 'system' && title.startsWith('plan approved:')) return false;
+  if (notification.kind === 'execution' && title.startsWith('approved plan queued:')) return false;
+  if (notification.kind === 'execution' && title.startsWith('background task queued:')) return false;
+  if (notification.kind === 'execution' && title.startsWith('background task started:')) return false;
+  if (notification.kind === 'execution' && title.startsWith('background task progress:')) return false;
+  if (notification.kind === 'execution' && title.startsWith('background task heartbeat:')) return false;
+
+  return true;
+}
+
+function buildDiscordComponentsForNotification(notification: NotificationRecord) {
+  if (notification.kind !== 'approval') return undefined;
+  return buildActionsForNotification(notification.metadata);
+}
+
 export async function deliverNotificationToDestination(
   notification: NotificationRecord,
   destination: NotificationDestination,
 ): Promise<void> {
+  if (destination.type === 'web_push') {
+    if (!destination.pushEndpoint || !destination.pushP256dh || !destination.pushAuth) {
+      throw new Error('web_push destination is missing endpoint / keys.');
+    }
+    const vapid = getVapidKeys();
+    const payload = JSON.stringify(buildWebPushPayload(notification));
+    try {
+      await webPush.sendNotification(
+        {
+          endpoint: destination.pushEndpoint,
+          keys: { p256dh: destination.pushP256dh, auth: destination.pushAuth },
+        },
+        payload,
+        {
+          vapidDetails: {
+            subject: vapid.subject,
+            publicKey: vapid.publicKey,
+            privateKey: vapid.privateKey,
+          },
+          TTL: 60 * 5, // approval pings stay relevant for ~5 minutes
+        },
+      );
+    } catch (err) {
+      // 404/410 from the push service means the subscription is gone
+      // (user uninstalled, revoked permission, switched devices).
+      // Reap the destination so the queue stops retrying forever.
+      const status = (err as { statusCode?: number }).statusCode;
+      if (status === 404 || status === 410) {
+        removeWebPushDestinationByEndpoint(destination.pushEndpoint);
+        throw new Error(`Web Push subscription gone (HTTP ${status}); destination removed.`);
+      }
+      throw err;
+    }
+    return;
+  }
+
   if (destination.type === 'discord_user') {
     if (!destination.userId) {
       throw new Error('Discord user destination is missing userId.');
     }
+    if (!shouldDeliverDiscordNotification(notification)) return;
     // Attach approval buttons when the notification carries an
     // actionable target (approvalId for SDK interrupts, planProposalId
     // for plan proposals). Plain text otherwise. sendDiscordDirectMessage
     // splits long content automatically (src/channels/discord.ts:splitMessage)
     // and keeps the components on the last chunk only.
-    const components = buildActionsForNotification(notification.metadata);
+    const components = buildDiscordComponentsForNotification(notification);
     await sendDiscordDirectMessage(destination.userId, buildDiscordBotMessage(notification), { components });
     return;
   }
@@ -87,7 +173,8 @@ export async function deliverNotificationToDestination(
     if (!destination.channelId) {
       throw new Error('Discord channel destination is missing channelId.');
     }
-    const components = buildActionsForNotification(notification.metadata);
+    if (!shouldDeliverDiscordNotification(notification)) return;
+    const components = buildDiscordComponentsForNotification(notification);
     if (components && components.length > 0) {
       await sendDiscordChannelMessageWithComponents(destination.channelId, buildDiscordBotMessage(notification), components);
     } else {
@@ -166,3 +253,8 @@ export async function testNotificationDestination(destination: NotificationDesti
     destination,
   );
 }
+
+export const notificationDeliveryInternalsForTest = {
+  buildDiscordComponentsForNotification,
+  shouldDeliverDiscordNotification,
+};

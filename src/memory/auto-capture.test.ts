@@ -53,3 +53,33 @@ test('extractProfilePatchFromMessage captures urgency tolerance', () => {
   assert.equal(extractProfilePatchFromMessage('This is too noisy, notify sparingly.')?.urgencyTolerance, 'low');
   assert.equal(extractProfilePatchFromMessage('Keep me updated with proactive check-ins.')?.urgencyTolerance, 'high');
 });
+
+// ---- #5: broadened capture (no longer dropped) ----
+
+test('captures "remember to ..." (was dropped by the narrow regex)', () => {
+  const c = extractAutoMemoryCandidates('Remember to call the vendor on Friday about the renewal.');
+  assert.equal(c.length, 1);
+  assert.match(c[0].content, /remember/i);
+  assert.match(c[0].content, /vendor/i);
+});
+
+test('captures "note that ..." / "don\'t forget ..." store requests', () => {
+  assert.equal(extractAutoMemoryCandidates('Note that the board meeting moved to the 14th.').length, 1);
+  assert.equal(extractAutoMemoryCandidates("Don't forget the renewal is due end of month.").length, 1);
+});
+
+test('declarative fallback captures an un-cued durable fact', () => {
+  const c = extractAutoMemoryCandidates('My CFO is Dana Wilson and she approves all spend over 5k.');
+  assert.equal(c.length, 1);
+  assert.equal(c[0].kind, 'user');
+  assert.match(c[0].content, /Dana Wilson/);
+});
+
+test('declarative fallback ignores questions and imperative tasks', () => {
+  assert.deepEqual(extractAutoMemoryCandidates('What is my current Salesforce pipeline total?'), []);
+  assert.deepEqual(extractAutoMemoryCandidates('Send the quarterly report to the leadership team today.'), []);
+});
+
+test('a "do you remember ..." question is not treated as a store request', () => {
+  assert.deepEqual(extractAutoMemoryCandidates('Do you remember what we decided about pricing?'), []);
+});

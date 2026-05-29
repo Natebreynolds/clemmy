@@ -22,6 +22,7 @@ import {
   withHarnessRunContext,
 } from './brackets.js';
 import { compactSessionIfNeeded } from './compaction.js';
+import { buildAgentContextPacket } from './context-packet.js';
 import { getHarnessBudgetSettings, getElevatedBudget } from './budget-settings.js';
 import type { HarnessBudgetRuntime } from './budget-settings.js';
 import {
@@ -34,6 +35,7 @@ import { MODELS } from '../../config.js';
 import { attachEventLogHooks, extractSessionIdFromContext, type RunHooksLike } from './hooks.js';
 import * as approvalRegistry from './approval-registry.js';
 import { actionBus } from '../action-bus.js';
+import { addNotification } from '../notifications.js';
 import { BoundaryError } from '../boundary-error.js';
 import { getRuntimeEnv } from '../../config.js';
 import { captureInteractionSignals } from '../../memory/auto-capture.js';
@@ -184,6 +186,8 @@ function registerAndEmitApprovals(
     : typeof metadata.discordChannelId === 'string'
       ? metadata.discordChannelId
       : null;
+  const workflowName = typeof metadata.workflowName === 'string' ? metadata.workflowName : null;
+  const stepId = typeof metadata.stepId === 'string' ? metadata.stepId : null;
   for (const interruption of interruptions) {
     const subject = extractApprovalSubject(interruption);
     let approvalId: string | null = null;
@@ -197,6 +201,37 @@ function registerAndEmitApprovals(
         args: interruption.args ?? null,
       });
       approvalId = row.approvalId;
+      // Fan out to the notification delivery queue so every enabled
+      // destination (Discord DMs, web_push subscriptions on the mobile
+      // PWA, generic webhooks) hears about the new approval. The
+      // dedupe in addNotification keys on the stable approvalId
+      // metadata so multiple harness turns registering the same
+      // approval don't spam.
+      try {
+        addNotification({
+          id: `approval-${row.approvalId}`,
+          kind: 'approval',
+          title: 'Approval pending',
+          body: subject || (interruption.toolName ? `${interruption.toolName} needs approval` : 'A tool call is paused waiting for your decision.'),
+          createdAt: new Date().toISOString(),
+          read: false,
+          metadata: {
+            approvalId: row.approvalId,
+            tool: interruption.toolName,
+            sessionId: options.sessionId,
+            workflowName,
+            stepId,
+          },
+        });
+      } catch (notifyErr) {
+        // Notification failures must not break the approval pause —
+        // the approval still lives in approvalRegistry and the
+        // dashboard surfaces it.
+        console.error('[harness] addNotification for approval failed', {
+          approvalId: row.approvalId,
+          error: notifyErr instanceof Error ? notifyErr.message : String(notifyErr),
+        });
+      }
     } catch (err) {
       // Best-effort. The hot-patch flow today exercises a DB where the
       // table may be missing if migrations didn't run yet; we don't
@@ -1898,6 +1933,13 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   }
 
   const turnMemoryPrimer = await buildTurnMemoryPrimer(options.input);
+  const contextPacket = buildAgentContextPacket(options.input, {
+    enabled: turnMemoryPrimer.enabled,
+    hitCount: turnMemoryPrimer.hitCount,
+    source: turnMemoryPrimer.source ?? null,
+    injected: Boolean(turnMemoryPrimer.text),
+    skippedReason: turnMemoryPrimer.skippedReason ?? null,
+  });
   safeAppend({
     sessionId: options.sessionId,
     turn,
@@ -1913,6 +1955,23 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
       skippedReason: turnMemoryPrimer.skippedReason ?? null,
     },
   });
+  safeAppend({
+    sessionId: options.sessionId,
+    turn,
+    role: 'system',
+    type: 'agent_context_packet',
+    data: {
+      inputPreview: contextPacket.inputPreview,
+      complexity: contextPacket.complexity,
+      memory: contextPacket.memory,
+      skills: contextPacket.skills,
+      workflows: contextPacket.workflows,
+      toolScope: contextPacket.toolScope,
+      mcp: contextPacket.mcp,
+      healthWarnings: contextPacket.healthWarnings,
+      injectedBytes: contextPacket.text.length,
+    },
+  });
 
   // v0.5.19 Bug H + callModelInputFilter adoption — build the closure
   // the SDK will invoke just before the LLM call. It appends transient
@@ -1925,6 +1984,16 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   }) => {
     let modelData = args.modelData;
     try {
+      if (contextPacket.text) {
+        modelData = {
+          input: [
+            ...modelData.input,
+            { role: 'system', content: contextPacket.text } as AgentInputItem,
+          ],
+          instructions: modelData.instructions,
+        };
+      }
+
       if (turnMemoryPrimer.text) {
         modelData = {
           input: [

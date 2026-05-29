@@ -53,6 +53,9 @@ npm run build
 echo "→ Building daemon (parent project)"
 npm run build:daemon
 
+echo "→ Building mobile web app"
+npm run build:mobile-web
+
 # ──────────────────────────────────────────────────────────────────────
 # Rebuild the DAEMON's native modules for Electron's Node ABI.
 #

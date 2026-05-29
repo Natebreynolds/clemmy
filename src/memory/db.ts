@@ -80,6 +80,9 @@ export interface ConsolidatedFactRow {
   //                           NULL for depth=0 facts.
   derivation_depth: number;
   derived_from_fact_ids: string | null;
+  // v8 — pinned standing instruction. 1 = always injected into the
+  // prompt, exempt from the top-N cap and recency decay.
+  pinned: number;
 }
 
 export type EntityType = 'person' | 'company' | 'project' | 'place' | 'thing';
@@ -386,6 +389,19 @@ const MIGRATIONS: { version: number; sql: string }[] = [
         content_hash TEXT NOT NULL,
         created_at   TEXT NOT NULL
       );
+    `,
+  },
+  {
+    // v8 — Pinned standing instructions. A pinned fact is ALWAYS injected
+    // into the prompt, exempt from the top-N recency/relevance cap, so a
+    // durable rule ("never email clients on Fridays") can't silently age
+    // out of context as the fact pool grows. Additive column, default 0.
+    version: 8,
+    sql: `
+      ALTER TABLE consolidated_facts ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;
+
+      CREATE INDEX IF NOT EXISTS idx_facts_pinned
+        ON consolidated_facts(pinned, active);
     `,
   },
 ];

@@ -217,6 +217,7 @@ export const DISCORD_ALLOWED_USERS = parseCsvEnv(
 );
 export const DISCORD_DM_POLL_INTERVAL_MS = parseInt(getEnv('DISCORD_DM_POLL_INTERVAL_MS', '5000'), 10);
 export const DISCORD_ALLOWED_CHANNELS = parseCsvEnv(getEnv('DISCORD_ALLOWED_CHANNELS', ''));
+export const DISCORD_PUSH_PROACTIVE_BRIEFS = getEnv('DISCORD_PUSH_PROACTIVE_BRIEFS', 'false').toLowerCase() === 'true';
 export const LOCAL_MCP_ENABLED = getEnv('LOCAL_MCP_ENABLED', 'true').toLowerCase() === 'true';
 export const MCP_AUTO_IMPORT_ENABLED = getEnv('MCP_AUTO_IMPORT_ENABLED', 'false').toLowerCase() === 'true';
 export const MCP_SERVERS_FILE = path.join(BASE_DIR, 'mcp', 'servers.json');

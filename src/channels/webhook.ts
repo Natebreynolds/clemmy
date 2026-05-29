@@ -29,6 +29,8 @@ import {
   type SessionRow as HarnessSessionRow,
 } from '../runtime/harness/eventlog.js';
 import { registerConsoleRoutes } from '../dashboard/console-routes.js';
+import { createMobileRouter } from './mobile-routes.js';
+import { readMobileAccess } from '../runtime/mobile-access-state.js';
 import {
   addNotification,
   listNotifications,
@@ -126,6 +128,40 @@ function harnessEventMessage(event: HarnessEventRow): string {
     default:
       return event.type;
   }
+}
+
+function normalizeHostHeader(value: unknown): string {
+  if (typeof value !== 'string') return '';
+  const first = value.split(',')[0]?.trim().toLowerCase() ?? '';
+  if (!first) return '';
+  if (first.startsWith('[')) {
+    const end = first.indexOf(']');
+    return end >= 0 ? first.slice(1, end) : first.replace(/^\[/, '');
+  }
+  return first.replace(/:\d+$/, '');
+}
+
+function isConfiguredMobileHost(req: express.Request): boolean {
+  const host = normalizeHostHeader(req.headers.host);
+  if (!host) return false;
+  const mobileHost = readMobileAccess().tunnel?.hostname?.trim().toLowerCase() ?? '';
+  return Boolean(mobileHost && host === mobileHost);
+}
+
+function requireMobileSurfaceForMobileHost(
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction,
+): void {
+  if (!isConfiguredMobileHost(req)) {
+    next();
+    return;
+  }
+  if (req.path === '/m' || req.path.startsWith('/m/')) {
+    next();
+    return;
+  }
+  res.status(404).type('text/plain').send('Not found');
 }
 
 function effectiveHarnessStatus(session: HarnessSessionRow, events: HarnessEventRow[]): string {
@@ -346,6 +382,7 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
     );
     next();
   });
+  app.use(requireMobileSurfaceForMobileHost);
   app.use(express.json({ limit: '1mb' }));
   app.use(express.urlencoded({ extended: false, limit: '1mb', parameterLimit: 1000 }));
 
@@ -739,6 +776,7 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
     res.redirect(302, query ? `${url.pathname}?${query}` : url.pathname);
   });
   registerConsoleRoutes(app, isAuthorized, assistant);
+  app.use('/m', createMobileRouter({ isAdminAuthorized: isAuthorized, assistant }));
 
   app.get('/dashboard', (req, res) => {
     if (!isAuthorized(req)) {

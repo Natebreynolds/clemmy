@@ -1,6 +1,6 @@
 {
   "name": "@clemmy/desktop",
-  "version": "0.5.34",
+  "version": "0.5.35",
   "private": true,
   "description": "Clementine — native desktop shell. Supervises the daemon, opens the local dashboard, surfaces approvals and check-ins, manages credentials.",
   "main": "dist/main.js",
@@ -11,11 +11,12 @@
     "dev": "tsx src/main.ts",
     "start": "electron .",
     "build:daemon": "cd ../.. && npm run build",
+    "build:mobile-web": "cd ../mobile-web && npm run build",
     "rebuild-daemon-natives": "cd ../.. && ./apps/desktop/node_modules/.bin/electron-rebuild --version $(node -p \"require('./apps/desktop/node_modules/electron/package.json').version\") --module-dir . --types prod --force --only better-sqlite3",
     "restore-node-natives": "cd ../.. && npm rebuild better-sqlite3",
     "package:mac": "./scripts/release-mac-dual-arch.sh",
     "package:mac:unsigned": "APPLE_NOTARIZE_SKIP=true CSC_IDENTITY_AUTO_DISCOVERY=false ./scripts/release-mac-dual-arch.sh",
-    "package:dist": "npm run build && npm run build:daemon && npm run rebuild-daemon-natives && electron-builder && npm run restore-node-natives",
+    "package:dist": "npm run build && npm run build:daemon && npm run build:mobile-web && npm run rebuild-daemon-natives && electron-builder && npm run restore-node-natives",
     "release": "./scripts/release-mac-dual-arch.sh"
   },
   "dependencies": {
@@ -56,6 +57,13 @@
       {
         "from": "../../package.json",
         "to": "daemon/package.json"
+      },
+      {
+        "from": "../mobile-web/dist",
+        "to": "daemon/apps/mobile-web/dist",
+        "filter": [
+          "**/*"
+        ]
       },
       {
         "from": "build/icon.png",

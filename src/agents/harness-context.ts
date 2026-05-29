@@ -30,7 +30,7 @@ import path from 'node:path';
 import { BASE_DIR } from '../config.js';
 import { loadMemoryContext } from '../memory/vault.js';
 import { renderFactsForInstructions, renderRecentlyLearnedForInstructions } from '../memory/facts.js';
-import { getFocusSnapshot } from '../memory/focus.js';
+import { getActiveObjective, getFocusSnapshot } from '../memory/focus.js';
 import { renderSkillsIndex } from '../memory/skill-store.js';
 import { loadUserProfile, renderProfileForInstructions } from '../runtime/user-profile.js';
 
@@ -133,7 +133,11 @@ export function renderHarnessMemoryContext(): string {
 
   let facts = '';
   try {
-    facts = renderFactsForInstructions();
+    // Move 1 (scoped recall): scope injected facts to the active focus's
+    // objective so an off-topic fact can't leak into a focused session.
+    // getActiveObjective() returns undefined when there's no focus or the
+    // flag is off → identical to the global ranking (no regression).
+    facts = renderFactsForInstructions(10, 1600, getActiveObjective());
   } catch {
     facts = '';
   }

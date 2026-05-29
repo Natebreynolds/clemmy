@@ -44,6 +44,9 @@ export interface ConsolidatedFact {
   // facts; 1+ for synthesized higher-order patterns.
   derivationDepth?: number;
   derivedFromFactIds?: number[] | null;
+  // v8 — pinned standing instruction: always injected into the prompt,
+  // exempt from the top-N cap and recency decay.
+  pinned?: boolean;
 }
 
 export const FACT_KINDS: ConsolidatedFactKind[] = ['user', 'project', 'feedback', 'reference'];
@@ -85,6 +88,7 @@ function rowToFact(row: ConsolidatedFactRow): ConsolidatedFact {
     derivedFromFactIds: row.derived_from_fact_ids
       ? safeParseFactIds(row.derived_from_fact_ids)
       : null,
+    pinned: row.pinned === 1,
   };
 }
 
@@ -481,6 +485,129 @@ export function stanfordRecallScore(fact: ConsolidatedFact, nowMs: number = Date
   return recency + importance;
 }
 
+// Tiny stopword set so common words don't manufacture false relevance.
+const RELEVANCE_STOPWORDS = new Set([
+  'the', 'and', 'for', 'are', 'but', 'not', 'you', 'all', 'any', 'can', 'her',
+  'was', 'one', 'our', 'out', 'his', 'has', 'had', 'how', 'its', 'who', 'get',
+  'this', 'that', 'with', 'have', 'from', 'they', 'will', 'your', 'them',
+  'then', 'than', 'into', 'when', 'what', 'their', 'about', 'would', 'there',
+  'should', 'these', 'those', 'want', 'need', 'make', 'like', 'just', 'also',
+]);
+
+function relevanceTokens(text: string): Set<string> {
+  const tokens = (text.toLowerCase().match(/[a-z0-9]+/g) ?? [])
+    .filter((tok) => tok.length >= 3 && !RELEVANCE_STOPWORDS.has(tok));
+  return new Set(tokens);
+}
+
+/**
+ * Synchronous lexical relevance of a fact to the current objective,
+ * in [0,1]. Token-overlap (a fact's significant tokens that appear in
+ * the objective, normalized by the fact's token count). Deliberately
+ * NOT embeddings: this runs on the synchronous prompt-assembly path, so
+ * it must never block or make a network call. It is a coarse demotion
+ * signal — enough to keep an off-objective fact (home-services on a
+ * legal task) out of the limited prompt slots when an objective exists.
+ */
+export function lexicalRelevance(objective: string, content: string): number {
+  const objTokens = relevanceTokens(objective);
+  if (objTokens.size === 0) return 0;
+  const factTokens = relevanceTokens(content);
+  if (factTokens.size === 0) return 0;
+  let hits = 0;
+  for (const tok of factTokens) if (objTokens.has(tok)) hits += 1;
+  return hits / factTokens.size;
+}
+
+// Weights for the objective-scoped blend (Move 1 — scoped recall).
+// stanfordRecallScore tops out near 2.0 (recency≤1 + importance≤1).
+// RELEVANCE_WEIGHT is set high enough that a clearly on-objective fact
+// reliably out-ranks an off-objective high-importance one, so the leak
+// (off-topic fact occupying a prompt slot) is closed. TRUST_WEIGHT lets
+// user-stated facts (trust 1.0) edge out derived ones (≈0.6) on ties.
+// Bonus-only: facts never lose their base score, so a fact that is
+// eligible today can only be re-ordered, never dropped below something
+// that wasn't already eligible.
+const RELEVANCE_WEIGHT = 2.0;
+const TRUST_WEIGHT = 0.25;
+
+function scopedRecallScore(fact: ConsolidatedFact, objective: string, nowMs: number): number {
+  const base = stanfordRecallScore(fact, nowMs);
+  const relevance = lexicalRelevance(objective, fact.content);
+  const trust = typeof fact.trustLevel === 'number' ? fact.trustLevel : 1.0;
+  return base + RELEVANCE_WEIGHT * relevance + TRUST_WEIGHT * trust;
+}
+
+/** Human-readable provenance hint for a fact, for surfacing at the
+ *  confirm-first turn so the user can see WHERE a standing instruction
+ *  came from before deciding to keep or prune it. */
+function sourceHintOf(fact: ConsolidatedFact): string {
+  const when = (fact.updatedAt || fact.createdAt || '').slice(0, 10);
+  let origin = '';
+  if (fact.derivedFrom?.tool) origin = `learned from ${fact.derivedFrom.tool}`;
+  else if (fact.source?.path) origin = `from ${fact.source.path}`;
+  else if (fact.derivedFrom?.sessionId || fact.source?.sessionId) origin = 'stated in chat';
+  else origin = 'stated by you';
+  return when ? `${origin} · ${when}` : origin;
+}
+
+export interface StandingInstructionReview {
+  id: number;
+  kind: ConsolidatedFactKind;
+  content: string;
+  importance: number;
+  /** 0–1 lexical relevance to the objective (0 when no objective given). */
+  relevance: number;
+  /** Where this instruction came from, for the user's review. */
+  sourceHint: string;
+  /** Whether this is a pinned standing instruction (always applied). */
+  pinned: boolean;
+}
+
+/**
+ * Move 4 (in-loop prune): list the active standing instructions /
+ * durable preferences, annotated with relevance to the current
+ * objective, importance, and provenance — so the confirm-first turn can
+ * show the user exactly which stored instructions are in play and let
+ * them prune a stale one via `memory_forget`.
+ *
+ * Deliberately returns ALL of them (least-relevant first) with the
+ * relevance SCORE rather than auto-flagging "delete this": lexical
+ * zero-overlap is a safe demotion signal (a fact merely loses prompt
+ * slots) but a dangerous deletion signal — a genuinely relevant rule can
+ * share no tokens with the objective phrasing. The keep/drop judgment
+ * stays with the model + user; this just hands them accurate, sourced,
+ * id-bearing data to judge from.
+ */
+export function reviewStandingInstructions(
+  objective: string | undefined,
+  opts: { limit?: number } = {},
+): StandingInstructionReview[] {
+  const limit = Math.max(1, opts.limit ?? 20);
+  const obj = objective?.trim() ?? '';
+  let facts: ConsolidatedFact[];
+  try {
+    facts = listActiveFacts({ limit: 200, ranking: 'stanford' });
+  } catch {
+    return [];
+  }
+  return facts
+    .map((fact) => ({
+      id: fact.id,
+      kind: fact.kind,
+      content: fact.content,
+      importance: typeof fact.importance === 'number' ? fact.importance : 5,
+      relevance: obj ? lexicalRelevance(obj, fact.content) : 0,
+      sourceHint: sourceHintOf(fact),
+      pinned: fact.pinned === true,
+    }))
+    // Least-relevant first so a potentially off-objective instruction is
+    // easy to spot at the top; break ties by importance (loudest rules
+    // first).
+    .sort((a, b) => (a.relevance - b.relevance) || (b.importance - a.importance))
+    .slice(0, limit);
+}
+
 export function listActiveFacts(options: {
   limit?: number;
   kind?: ConsolidatedFactKind;
@@ -488,10 +615,17 @@ export function listActiveFacts(options: {
    *  instead of legacy score DESC. The instructions-render path now
    *  uses this so important + recently-accessed facts surface first. */
   ranking?: 'score' | 'stanford';
+  /** Move 1 (scoped recall): when set (and ranking is 'stanford'), blend
+   *  a lexical-relevance + trust bonus on top of the Stanford score so
+   *  facts relevant to the current objective win the limited prompt
+   *  slots. Omitted/empty → identical to the plain Stanford ranking, so
+   *  the no-focus path is byte-for-byte unchanged. */
+  objective?: string;
 } = {}): ConsolidatedFact[] {
   const db = openMemoryDb();
   const limit = Math.max(1, options.limit ?? 12);
   const ranking = options.ranking ?? 'score';
+  const objective = options.objective?.trim();
 
   if (ranking === 'stanford') {
     // Over-fetch then sort in JS by Stanford recall score. Keeps the
@@ -513,9 +647,12 @@ export function listActiveFacts(options: {
           LIMIT ?
         `).all(candidatePool) as ConsolidatedFactRow[];
     const now = Date.now();
+    const scoreOf = objective
+      ? (fact: ConsolidatedFact) => scopedRecallScore(fact, objective, now)
+      : (fact: ConsolidatedFact) => stanfordRecallScore(fact, now);
     return rows
       .map(rowToFact)
-      .map((fact) => ({ fact, s: stanfordRecallScore(fact, now) }))
+      .map((fact) => ({ fact, s: scoreOf(fact) }))
       .sort((a, b) => b.s - a.s)
       .slice(0, limit)
       .map((x) => x.fact);
@@ -572,33 +709,86 @@ export function forgetFact(id: number, options: { hard?: boolean } = {}): boolea
 }
 
 /**
+ * Pin / unpin a fact as a standing instruction (v8). Pinned facts are
+ * ALWAYS injected into the prompt, exempt from the top-N cap and recency
+ * decay — so a durable rule can't age out as the fact pool grows.
+ */
+export function setFactPinned(id: number, pinned: boolean): boolean {
+  const db = openMemoryDb();
+  const info = db.prepare(`
+    UPDATE consolidated_facts
+    SET pinned = ?, updated_at = ?
+    WHERE id = ?
+  `).run(pinned ? 1 : 0, new Date().toISOString(), id);
+  return Number(info.changes ?? 0) > 0;
+}
+
+/** Active pinned facts (standing instructions), newest-first. Capped so
+ *  a runaway pin count can't blow the prompt budget. */
+export function listPinnedFacts(limit = 12): ConsolidatedFact[] {
+  const db = openMemoryDb();
+  const rows = db.prepare(`
+    SELECT * FROM consolidated_facts
+    WHERE active = 1 AND pinned = 1
+    ORDER BY updated_at DESC
+    LIMIT ?
+  `).all(Math.max(1, limit)) as ConsolidatedFactRow[];
+  return rows.map(rowToFact);
+}
+
+/**
  * Render the top-N active facts as a compact block for the assistant's
  * instructions. Empty string when no facts exist — keeps the prompt clean.
  */
-export function renderFactsForInstructions(limit = 10, maxChars = 1600): string {
+export function renderFactsForInstructions(limit = 10, maxChars = 1600, objective?: string): string {
   let facts: ConsolidatedFact[] = [];
   try {
     // v4: Stanford-ranked retrieval. Important + recently-accessed
     // facts surface first. Touching last_accessed_at below shifts the
     // recency anchor so a fact the agent just used stays warm in the
     // next turn's context.
-    facts = listActiveFacts({ limit, ranking: 'stanford' });
+    //
+    // Move 1 (scoped recall): when an objective is supplied, facts
+    // relevant to it are promoted into the limited slots so an
+    // off-objective fact (e.g. a home-services rule during legal work)
+    // doesn't leak in. No objective → unchanged global ranking.
+    facts = listActiveFacts({ limit, ranking: 'stanford', objective });
   } catch {
     // Don't ever break prompt assembly because the index is unhappy.
     return '';
   }
-  if (facts.length === 0) return '';
+
+  // v8 — pinned standing instructions are ALWAYS injected, regardless of
+  // the scored top-N, so a durable rule never silently ages out. They get
+  // their own section and are removed from the scored set to avoid
+  // double-rendering.
+  let pinned: ConsolidatedFact[] = [];
+  try {
+    pinned = listPinnedFacts(12);
+  } catch {
+    pinned = [];
+  }
+  const pinnedIds = new Set(pinned.map((f) => f.id));
+  const scored = facts.filter((f) => !pinnedIds.has(f.id));
+
+  if (pinned.length === 0 && scored.length === 0) return '';
 
   // Touch last_accessed for every fact we're about to expose to the
   // model (the act of rendering = an access in Stanford's framework).
-  for (const fact of facts) touchFactAccess(fact.id);
+  for (const fact of [...pinned, ...scored]) touchFactAccess(fact.id);
+
+  const sections: string[] = [];
+
+  if (pinned.length > 0) {
+    const lines = pinned.map((fact) => `- ${fact.content}`).join('\n');
+    sections.push(`**Standing instructions (always apply)**\n${lines}`);
+  }
 
   const byKind: Record<ConsolidatedFactKind, ConsolidatedFact[]> = {
     user: [], project: [], feedback: [], reference: [],
   };
-  for (const fact of facts) byKind[fact.kind].push(fact);
+  for (const fact of scored) byKind[fact.kind].push(fact);
 
-  const sections: string[] = [];
   const titles: Record<ConsolidatedFactKind, string> = {
     user: 'About the user',
     project: 'Project context',

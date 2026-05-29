@@ -90,6 +90,7 @@ test('classifyTool: local-side-effect tools never gate on approval', () => {
   assert.equal(classifyTool('surface_plan'), 'read');
   assert.equal(classifyTool('propose_check_in_template'), 'read');
   assert.equal(classifyTool('execution_create'), 'read');
+  assert.equal(classifyTool('workflow_run'), 'read');
 });
 
 test('classifyTool: write prefixes', () => {

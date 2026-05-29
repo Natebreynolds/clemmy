@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { formatSearchHits, searchVaultAsync } from '../memory/search.js';
 import { recallHybrid } from '../memory/recall.js';
 import { embedMissingChunks, isEmbeddingsEnabled, readEmbeddingStats } from '../memory/embeddings.js';
-import { FACT_KINDS, forgetFact, listActiveFacts, listAllFacts, rememberFact } from '../memory/facts.js';
+import { FACT_KINDS, forgetFact, getFact, listActiveFacts, listAllFacts, rememberFact, reviewStandingInstructions, setFactPinned } from '../memory/facts.js';
 import { WORKING_MEMORY_FILE } from '../memory/vault.js';
 import { readText, replaceFile, resolveMemoryTarget, textResult } from './shared.js';
 
@@ -169,6 +169,46 @@ export function registerMemoryTools(server: McpServer): void {
     async ({ id, hard }) => {
       const ok = forgetFact(id, { hard });
       return textResult(ok ? `Forgot fact #${id}${hard ? ' (hard delete)' : ''}.` : `No fact found with id ${id}.`);
+    },
+  );
+
+  server.tool(
+    'memory_pin',
+    'Pin a fact as a STANDING INSTRUCTION (always injected into context, exempt from the recency/relevance cap so it never ages out) — or unpin it. Use when the user says "always …", "never …", or "from now on …". Pin sparingly: only durable rules that should hold across every session, not one-off facts.',
+    {
+      id: z.number().int().positive(),
+      pinned: z.boolean().optional(),
+    },
+    async ({ id, pinned }) => {
+      const want = pinned !== false;
+      const fact = getFact(id);
+      if (!fact) return textResult(`No fact found with id ${id}.`);
+      const ok = setFactPinned(id, want);
+      return textResult(
+        ok
+          ? `${want ? 'Pinned' : 'Unpinned'} fact #${id}${want ? ' — it will always be applied' : ''}: ${fact.content}`
+          : `Could not update fact #${id}.`,
+      );
+    },
+  );
+
+  server.tool(
+    'memory_review_instructions',
+    'Before a batch/irreversible external write, review the standing instructions in play. Pass the objective to sort by relevance (least-relevant first, so a possibly off-objective rule is easy to spot). Returns each as "#id [kind, imp N, rel R] content — sourceHint" so you can show the user what you are following and, if one looks stale or wrong for this objective, ask them and then call memory_forget(id). Relevance is a lexical hint, not a verdict — use your judgment, do not auto-delete.',
+    {
+      objective: z.string().optional(),
+      limit: z.number().int().min(1).max(50).optional(),
+    },
+    async ({ objective, limit }) => {
+      const items = reviewStandingInstructions(objective, { limit: limit ?? 20 });
+      if (items.length === 0) return textResult('No standing instructions recorded.');
+      const lines = items.map((i) =>
+        `- #${i.id} [${i.kind}, imp ${i.importance.toFixed(0)}, rel ${i.relevance.toFixed(2)}${i.pinned ? ', 📌pinned' : ''}] ${i.content} — ${i.sourceHint}`,
+      );
+      return textResult(
+        `Standing instructions in play${objective ? ` (vs objective: ${objective.slice(0, 80)})` : ''}:\n${lines.join('\n')}\n\n` +
+        'If any look unrelated or wrong for this objective, ask the user before applying — and offer to memory_forget(id) the stale one.',
+      );
     },
   );
 }

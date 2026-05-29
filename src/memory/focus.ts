@@ -1,5 +1,6 @@
 import { openMemoryDb, type FocusRow, type FocusStatus } from './db.js';
 import { actionBus } from '../runtime/action-bus.js';
+import { getRuntimeEnv } from '../config.js';
 
 /**
  * Current Focus — the assistant's working-memory attention pointer.
@@ -139,6 +140,27 @@ export function getActiveFocus(): FocusRow | null {
     `SELECT * FROM current_focus WHERE status='active' LIMIT 1`,
   ).get() as FocusRow | undefined;
   return row ?? null;
+}
+
+/**
+ * Move 1 (scoped recall): the objective string used to scope which
+ * facts get injected into the prompt this turn. Returns the active
+ * focus's title + summary, or undefined when there is no active focus
+ * or the CLEMMY_SCOPED_RECALL flag is off. Single source of truth so
+ * every fact-injection path scopes identically. Fail-safe: any error
+ * returns undefined (→ unchanged global ranking), never throws into
+ * prompt assembly.
+ */
+export function getActiveObjective(): string | undefined {
+  const enabled = (getRuntimeEnv('CLEMMY_SCOPED_RECALL', 'on') ?? 'on').toLowerCase() !== 'off';
+  if (!enabled) return undefined;
+  try {
+    const focus = getActiveFocus();
+    if (!focus) return undefined;
+    return `${focus.title} ${focus.summary}`.trim() || undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export function getFocusById(id: number): FocusRow | null {

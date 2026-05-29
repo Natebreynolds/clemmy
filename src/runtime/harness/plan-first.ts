@@ -51,12 +51,11 @@ function domainCount(input: string): number {
 
 export function shouldUsePlanFirst(input: PlanFirstInput): boolean {
   if (planFirstDisabled()) return false;
-  if (!input.freshSession) return false;
 
   const text = input.input.trim();
   if (text.length < 80) return false;
   if (CONTROL_RE.test(text)) return false;
-  if (text.length < 180 && EXECUTION_CONTINUATION_RE.test(text)) return false;
+  if (EXECUTION_CONTINUATION_RE.test(text) && text.length < 240) return false;
 
   const domains = domainCount(text);
   const hasRead = READ_RE.test(text);
@@ -64,10 +63,21 @@ export function shouldUsePlanFirst(input: PlanFirstInput): boolean {
   const hasBatch = BATCH_RE.test(text);
   const hasSequence = SEQUENCE_RE.test(text);
 
-  if (domains >= 3 && (hasRead || hasWrite)) return true;
-  if (domains >= 2 && hasRead && hasWrite) return true;
-  if (domains >= 2 && hasBatch && hasSequence) return true;
-  if (text.length >= 350 && hasRead && hasWrite && (hasBatch || hasSequence)) return true;
+  if (input.freshSession) {
+    if (domains >= 3 && (hasRead || hasWrite)) return true;
+    if (domains >= 2 && hasRead && hasWrite) return true;
+    if (domains >= 2 && hasBatch && hasSequence) return true;
+    if (text.length >= 350 && hasRead && hasWrite && (hasBatch || hasSequence)) return true;
+    return false;
+  }
+
+  // Existing sessions should not get replanned for ordinary
+  // continuations, but a user can pivot into a brand-new complex
+  // objective inside the same chat. Catch those pivots so Clem surfaces
+  // a quick plan before opening many external tools.
+  if (domains >= 3 && hasRead && hasWrite) return true;
+  if (domains >= 2 && hasRead && hasWrite && (hasBatch || hasSequence)) return true;
+  if (text.length >= 450 && domains >= 1 && hasRead && hasWrite && (hasBatch || hasSequence)) return true;
 
   return false;
 }
@@ -101,6 +111,34 @@ function renderPlanReply(plan: Plan, proposalId: string): string {
     '',
     `Review and approve plan ${proposalId} when you want me to proceed.`,
   ].filter(Boolean).join('\n');
+}
+
+export function renderPlanFirstFailureReply(): string {
+  return [
+    'I tried to draft a plan before starting, but the planner did not finish cleanly.',
+    '',
+    'I did not start the tool work. Reply with one of these:',
+    '- `retry plan` to try the planning step again',
+    '- `simplify` to ask me for the smallest missing details first',
+    '- `proceed` to continue with normal tool execution and the usual approval gates',
+  ].join('\n');
+}
+
+function surfacePlanFirstFailure(input: PlanFirstRunInput, error: string): PlanFirstResult {
+  appendEvent({
+    sessionId: input.sessionId,
+    turn: 0,
+    role: 'Clem',
+    type: 'conversation_completed',
+    data: {
+      reason: 'plan_first_failed',
+      summary: 'Planner did not finish; tool work was not started.',
+      reply: renderPlanFirstFailureReply(),
+      plannerError: error,
+    },
+  });
+
+  return { surfaced: true, error };
 }
 
 export async function runPlanFirstPreflight(input: PlanFirstRunInput): Promise<PlanFirstResult> {
@@ -162,7 +200,15 @@ export async function runPlanFirstPreflight(input: PlanFirstRunInput): Promise<P
     });
     const parsed = PlanSchema.safeParse(result.finalOutput);
     if (!parsed.success) {
-      return { surfaced: false, error: parsed.error.message };
+      const message = parsed.error.message;
+      appendEvent({
+        sessionId: input.sessionId,
+        turn: 0,
+        role: 'system',
+        type: 'plan_first_failed',
+        data: { error: message, stage: 'schema_parse' },
+      });
+      return surfacePlanFirstFailure(input, message);
     }
 
     const proposal = surfacePlan({
@@ -195,6 +241,6 @@ export async function runPlanFirstPreflight(input: PlanFirstRunInput): Promise<P
       type: 'plan_first_failed',
       data: { error: message },
     });
-    return { surfaced: false, error: message };
+    return surfacePlanFirstFailure(input, message);
   }
 }

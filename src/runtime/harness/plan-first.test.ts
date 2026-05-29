@@ -3,7 +3,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { shouldUsePlanFirst } from './plan-first.js';
+import { renderPlanFirstFailureReply, shouldUsePlanFirst } from './plan-first.js';
 
 test('shouldUsePlanFirst: fresh multi-system batch work gets planner-first gate', () => {
   const input =
@@ -29,11 +29,18 @@ test('shouldUsePlanFirst: continuations and approvals do not get replanned', () 
   );
 });
 
-test('shouldUsePlanFirst: existing chat sessions do not get forced through first-turn gate', () => {
+test('shouldUsePlanFirst: simple existing chat continuations do not get forced through first-turn gate', () => {
   const input =
-    'Find 8 Salesforce accounts, gather SEO signals, write a report, and create Outlook draft emails.';
+    'Can we go back to the social media post and make that caption a little warmer before we publish?';
 
   assert.equal(shouldUsePlanFirst({ input, freshSession: false }), false);
+});
+
+test('shouldUsePlanFirst: complex existing-session pivots get planner-first gate', () => {
+  const input =
+    'Find 8 Salesforce accounts, gather SEO signals for each firm, write a local report, and create Outlook draft emails with my Chili Piper link.';
+
+  assert.equal(shouldUsePlanFirst({ input, freshSession: false }), true);
 });
 
 test('shouldUsePlanFirst: simple local or conversational asks run normally', () => {
@@ -51,4 +58,23 @@ test('shouldUsePlanFirst: simple local or conversational asks run normally', () 
     }),
     false,
   );
+});
+
+test('shouldUsePlanFirst: vague prospecting help stays conversational so Clem can clarify', () => {
+  assert.equal(
+    shouldUsePlanFirst({
+      input: 'hey i could use your help with some prospecting emails',
+      freshSession: true,
+    }),
+    false,
+  );
+});
+
+test('renderPlanFirstFailureReply: planner failures stop before tool execution', () => {
+  const reply = renderPlanFirstFailureReply();
+
+  assert.match(reply, /did not start the tool work/i);
+  assert.match(reply, /retry plan/);
+  assert.match(reply, /simplify/);
+  assert.match(reply, /proceed/);
 });

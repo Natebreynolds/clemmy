@@ -25,6 +25,7 @@ const {
   deletePlanProposal,
   supersedePlanProposal,
 } = await import('./plan-proposals.js');
+const { listNotifications } = await import('../runtime/notifications.js');
 
 before(() => {
   rmSync(TEST_HOME, { recursive: true, force: true });
@@ -47,6 +48,7 @@ function aPlan(overrides = {}) {
     estimatedComplexity: 'moderate' as const,
     recommendsTrackedExecution: false,
     needsUserInput: [],
+    appliedInstructions: [],
     ...overrides,
   };
 }
@@ -64,6 +66,36 @@ test('surfacePlan: writes a pending proposal', () => {
   assert.equal(p.plan.objective.startsWith('Add a refresh token'), true);
 });
 
+test('surfacePlan: round-trips appliedInstructions onto the persisted proposal', () => {
+  const p = surfacePlan({
+    plan: aPlan({ appliedInstructions: ['Always CC Dana on client emails (source: user, 2026-05-01)'] }),
+    originatingRequest: 'Draft the client update emails.',
+  });
+  const reloaded = getPlanProposal(p.id);
+  assert.deepEqual(reloaded?.plan.appliedInstructions, ['Always CC Dana on client emails (source: user, 2026-05-01)']);
+});
+
+test('surfacePlan: renders the "Instructions I\'m following" block when present', () => {
+  const p = surfacePlan({
+    plan: aPlan({ appliedInstructions: ['Never email clients on Fridays (source: feedback)'] }),
+    originatingRequest: 'Send the weekly client digest.',
+  });
+  const notif = listNotifications(50).find((n) => (n.metadata as { planProposalId?: string })?.planProposalId === p.id);
+  assert.ok(notif, 'a plan_proposal notification was queued for this proposal');
+  assert.match(notif!.body, /Instructions I'm following/);
+  assert.match(notif!.body, /Never email clients on Fridays/);
+});
+
+test('surfacePlan: omits the instructions block when none apply', () => {
+  const p = surfacePlan({
+    plan: aPlan({ appliedInstructions: [] }),
+    originatingRequest: 'A request with no standing instructions in play.',
+  });
+  const notif = listNotifications(50).find((n) => (n.metadata as { planProposalId?: string })?.planProposalId === p.id);
+  assert.ok(notif);
+  assert.doesNotMatch(notif!.body, /Instructions I'm following/);
+});
+
 test('surfacePlan: rejects too-short originatingRequest', () => {
   assert.throws(
     () => surfacePlan({ plan: aPlan(), originatingRequest: 'eh' }),
@@ -75,7 +107,7 @@ test('surfacePlan: rejects plan without objective or steps', () => {
   assert.throws(
     () => surfacePlan({
       // @ts-expect-error — missing objective on purpose
-      plan: { steps: [], successCriteria: [], risks: [], estimatedComplexity: 'trivial', recommendsTrackedExecution: false, needsUserInput: [] },
+      plan: { steps: [], successCriteria: [], risks: [], estimatedComplexity: 'trivial', recommendsTrackedExecution: false, needsUserInput: [], appliedInstructions: [] },
       originatingRequest: 'do the thing',
     }),
     /plan must include objective/,

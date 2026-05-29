@@ -35,6 +35,8 @@ test('local runtime tools include autonomy, execution, run tracking, and profile
     'execution_focus',
     'execution_clear_focus',
     'agent_runs_recent',
+    'background_tasks_recent',
+    'background_task_status',
     'user_profile_read',
     'user_profile_update',
     'check_capability',

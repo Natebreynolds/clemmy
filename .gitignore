@@ -16,6 +16,8 @@ logs/
 # Build / packaging artifacts
 *.tgz
 release/
+# Local hot-patch staging copies of the built desktop app (feedback_clemmy_desktop_patch)
+apps/desktop/release-*/
 *.dmg
 *.zip
 *.AppImage

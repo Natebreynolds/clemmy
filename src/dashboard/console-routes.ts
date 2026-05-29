@@ -49,9 +49,11 @@ import {
   validateWorkflowDefinition as runValidator,
   type WorkflowValidation,
 } from '../execution/workflow-validator.js';
+import { checkWorkflowForWrite } from '../execution/workflow-enforce.js';
 import { ExecutionStore } from '../execution/store.js';
 import { listOpenCheckIns } from '../agents/check-ins.js';
 import type { ClementineAssistant } from '../assistant/core.js';
+import type { PendingApproval } from '../types.js';
 import { buildRealtimeVoiceInstructions } from '../assistant/voice-context.js';
 import { LOCAL_MCP_TOOL_NAMES } from '../tools/catalog.js';
 import { getCoreToolsAsync } from '../tools/registry.js';
@@ -64,9 +66,33 @@ import {
   startApprovedInstallCommand,
   startBrowserHarnessInstall,
 } from '../integrations/browser-harness.js';
+import {
+  cancelLogin as mobileCancelLogin,
+  configureTunnel as mobileConfigureTunnel,
+  fetchAvailableTunnels as mobileListTunnels,
+  generateQrSvg as mobileGenerateQrSvg,
+  getInstallJob as getMobileInstallJob,
+  getMobileAccessStatusPayload,
+  rotatePin as mobileRotatePin,
+  startInstallJob as startMobileInstallJob,
+  startLogin as startMobileLogin,
+  startQuickTunnel as startMobileQuickTunnel,
+  startTunnel as startMobileTunnel,
+  stopTunnel as stopMobileTunnel,
+} from '../integrations/mobile-access.js';
+import {
+  revokeAllSessions as revokeAllMobileSessions,
+  revokeSession as revokeMobileSession,
+  revokeSessionByDeviceId as revokeMobileSessionByDeviceId,
+} from '../runtime/mobile-sessions.js';
 import { getManagedCliJob, startManagedCliJob, type ManagedCliAction, type ManagedCliKind } from '../runtime/managed-cli-jobs.js';
 import { discoverMcpServers, loadUserMcpServers, saveUserMcpServers } from '../runtime/mcp-config.js';
 import { invalidateConfiguredMcpServers } from '../runtime/mcp-servers.js';
+import {
+  getWorkflowImportJob,
+  listRecentWorkflowImportJobs,
+  startWorkflowFrameworkImport,
+} from '../runtime/workflow-installer.js';
 import { clearAutonomyAgentCache } from '../agents/autonomy-v2.js';
 import { classifyTool } from '../agents/tool-taxonomy.js';
 import { loadPlugins, PLUGINS_DIR } from '../plugins/loader.js';
@@ -113,7 +139,8 @@ import {
 import { PlanSchema } from '../agents/planner.js';
 import { closePlanScope, listActiveScopes, listAllScopes } from '../agents/plan-scope.js';
 import type { CheckInUrgency } from '../agents/check-ins.js';
-import { createBackgroundTask, listBackgroundTasks } from '../execution/background-tasks.js';
+import { createBackgroundTask, getBackgroundTask, listBackgroundTasks, processBackgroundTasks } from '../execution/background-tasks.js';
+import { getBackgroundTaskStatus } from '../execution/background-task-status.js';
 import { listRuns } from '../runtime/run-events.js';
 import { listNotifications } from '../runtime/notifications.js';
 import { actionBus, type ActionEvent } from '../runtime/action-bus.js';
@@ -319,6 +346,75 @@ function contextFileForKey(key: string): ContextFileDefinition | undefined {
 function trimConsoleTitle(text: string, max = 120): string {
   const clean = text.replace(/\s+/g, ' ').trim();
   return clean.length > max ? clean.slice(0, Math.max(0, max - 1)) + '…' : clean;
+}
+
+interface ApprovalPreviewSample {
+  label?: string;
+  value?: string;
+  secondary?: string;
+}
+
+interface ApprovalPreviewPayload {
+  count?: number;
+  samples?: ApprovalPreviewSample[];
+  inferred?: boolean;
+}
+
+function pickApprovalString(record: Record<string, unknown> | undefined | null, keys: string[]): string {
+  if (!record) return '';
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return '';
+}
+
+function normalizeApprovalPreview(raw: unknown): ApprovalPreviewPayload | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const input = raw as Record<string, unknown>;
+  const samples = Array.isArray(input.samples)
+    ? input.samples
+      .filter((sample): sample is Record<string, unknown> => Boolean(sample) && typeof sample === 'object')
+      .slice(0, 5)
+      .map((sample) => ({
+        label: typeof sample.label === 'string' ? trimConsoleTitle(sample.label, 40) : undefined,
+        value: typeof sample.value === 'string' ? trimConsoleTitle(sample.value, 180) : undefined,
+        secondary: typeof sample.secondary === 'string' ? trimConsoleTitle(sample.secondary, 140) : undefined,
+      }))
+      .filter((sample) => sample.label || sample.value || sample.secondary)
+    : undefined;
+  const count = typeof input.count === 'number' && Number.isFinite(input.count) ? input.count : undefined;
+  const inferred = input.inferred === true;
+  if (count === undefined && (!samples || samples.length === 0) && !inferred) return undefined;
+  return { count, samples, inferred };
+}
+
+function extractRuntimeApprovalArgs(approval: PendingApproval): Record<string, unknown> | undefined {
+  if (!approval.state) return undefined;
+  try {
+    const parsed = JSON.parse(approval.state) as { toolCall?: { arguments?: string | Record<string, unknown> } };
+    const args = parsed.toolCall?.arguments;
+    if (typeof args === 'string') {
+      try {
+        return JSON.parse(args) as Record<string, unknown>;
+      } catch {
+        return undefined;
+      }
+    }
+    if (args && typeof args === 'object') return args as Record<string, unknown>;
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
+function approvalSummaryFromArgs(args: Record<string, unknown> | undefined, fallback: string): string {
+  const subject = pickApprovalString(args, ['subject', 'title', 'name']);
+  return trimConsoleTitle(subject || fallback || 'Approval required', 180);
+}
+
+function approvalReasonFromArgs(args: Record<string, unknown> | undefined): string {
+  return trimConsoleTitle(pickApprovalString(args, ['reason', 'why', 'description']), 260);
 }
 
 const CONSOLE_HARNESS_REPLAY_TYPES = new Set<HarnessEventRow['type']>([
@@ -1483,6 +1579,39 @@ export function registerConsoleRoutes(
     }
   });
 
+  app.post('/api/console/workflows/import', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const source = typeof req.body?.source === 'string' ? req.body.source.trim() : '';
+    if (!source) {
+      res.status(400).json({ error: 'source is required' });
+      return;
+    }
+    try {
+      const job = startWorkflowFrameworkImport(source, {
+        dryRun: req.body?.dryRun !== false,
+        overwrite: req.body?.overwrite === true,
+      });
+      res.json({ job });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.get('/api/console/workflows/import/jobs', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    res.json({ jobs: listRecentWorkflowImportJobs().slice(0, 10) });
+  });
+
+  app.get('/api/console/workflows/import/jobs/:id', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const job = getWorkflowImportJob(req.params.id);
+    if (!job) {
+      res.status(404).json({ error: 'workflow import job not found' });
+      return;
+    }
+    res.json({ job });
+  });
+
   /**
    * SSE: pushes a `workflow_changed` event whenever any workflow file
    * is written, updated, or deleted (via writeWorkflow / deleteWorkflow
@@ -1612,6 +1741,15 @@ export function registerConsoleRoutes(
     if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
     const body = req.body ?? {};
     if (typeof body.enabled !== 'boolean') { res.status(400).json({ error: 'enabled (boolean) required' }); return; }
+    // P2: a workflow whose data can't flow can't be ENABLED (disabling
+    // always allowed). Flag-gated → no-op when WORKFLOW_TYPED_CONTRACT off.
+    if (body.enabled) {
+      const check = checkWorkflowForWrite({ ...entry.data, enabled: true });
+      if (!check.ok) {
+        res.status(400).json({ error: 'workflow failed validation', errors: check.errors });
+        return;
+      }
+    }
     writeWorkflow(entry.name, { ...entry.data, enabled: body.enabled });
     res.json({ updated: true, enabled: body.enabled });
   });
@@ -2408,6 +2546,172 @@ export function registerConsoleRoutes(
     }
   });
 
+  // ─── Mobile Access (PWA companion + Cloudflare Tunnel) ───────────
+  //
+  // GETs are auth-checked but read-only and return JSON. Mutating POSTs
+  // (install, login, configure, start/stop tunnel, rotate PIN) are
+  // gated by isAuthorized — the Bearer/cookie that lets you reach the
+  // console at all is sufficient to drive the wizard.
+
+  app.get('/api/console/mobile-access/status', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      res.json(await getMobileAccessStatusPayload());
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/mobile-access/install', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const job = await startMobileInstallJob();
+      res.json({ job });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.get('/api/console/mobile-access/install/:id', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const job = getMobileInstallJob(req.params.id);
+    if (!job) { res.status(404).json({ error: 'install job not found' }); return; }
+    res.json({ job });
+  });
+
+  app.post('/api/console/mobile-access/login', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      res.json({ login: await startMobileLogin() });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/mobile-access/login/cancel', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    mobileCancelLogin();
+    res.json({ ok: true });
+  });
+
+  app.get('/api/console/mobile-access/tunnels', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      res.json({ tunnels: await mobileListTunnels() });
+    } catch (err) {
+      // Most common: not logged in. Return 200 + empty so the UI can
+      // render a "log in first" hint instead of throwing.
+      res.json({ tunnels: [], error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/mobile-access/configure', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const tunnelName = typeof req.body?.tunnelName === 'string' ? req.body.tunnelName.trim() : '';
+    const hostname = typeof req.body?.hostname === 'string' ? req.body.hostname.trim() : '';
+    if (!tunnelName || !hostname) {
+      res.status(400).json({ error: 'tunnelName and hostname are required' });
+      return;
+    }
+    try {
+      const record = await mobileConfigureTunnel({ tunnelName, hostname });
+      res.json({ ok: true, state: record });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/mobile-access/tunnel/start', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const result = await startMobileTunnel();
+      if (!result.ok) { res.status(400).json(result); return; }
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/mobile-access/quick/start', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const result = await startMobileQuickTunnel();
+      if (!result.ok) { res.status(400).json(result); return; }
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/mobile-access/tunnel/stop', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      res.json(await stopMobileTunnel());
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/mobile-access/pin', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const pin = typeof req.body?.pin === 'string' ? req.body.pin : '';
+    const { validatePinForSet: validatePin } = await import('../runtime/mobile-pin.js');
+    const pinError = validatePin(pin);
+    if (pinError) {
+      res.status(400).json({ error: pinError.message, code: pinError.code });
+      return;
+    }
+    try {
+      const result = await mobileRotatePin(pin);
+      res.json({ ok: true, ...result });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.delete('/api/console/mobile-access/sessions/:deviceId', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const id = req.params.deviceId;
+    const removed = id.startsWith('dev-')
+      ? await revokeMobileSessionByDeviceId(id)
+      : await revokeMobileSession(id);
+    res.json({ ok: true, removed });
+  });
+
+  app.delete('/api/console/mobile-access/sessions', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const removed = await revokeAllMobileSessions();
+    res.json({ ok: true, removed });
+  });
+
+  app.post('/api/console/mobile-access/access-ack', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const enabled = req.body?.enabled === true;
+    try {
+      const { setMobileAccessAccessAck } = await import('../runtime/mobile-access-state.js');
+      const record = await setMobileAccessAccessAck({ enabled });
+      res.json({ ok: true, cloudflareAccess: record.cloudflareAccess ?? null });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.get('/api/console/mobile-access/qr', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const hostname = typeof req.query.hostname === 'string' ? req.query.hostname : undefined;
+    try {
+      const result = await mobileGenerateQrSvg(hostname);
+      res.setHeader('Content-Type', 'image/svg+xml; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-store');
+      res.setHeader('X-Target-Url', result.targetUrl);
+      res.setHeader('X-Target-Mode', result.targetMode);
+      res.setHeader('X-Pairing-Expires-At', result.expiresAt);
+      res.send(result.svg);
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   // ─── CLI catalog (search-driven curated installs) ─────────────────
   //
   // The dashboard's CLI section is a search box, not a grid. The user
@@ -2714,11 +3018,40 @@ export function registerConsoleRoutes(
         (task) => task.status === 'running' || task.status === 'pending' || task.status === 'awaiting_approval',
       );
       const total = activeNonChatSessions.length + pendingApprovals.length + activeBackgroundTasks.length;
+      const activeWorkItems = [
+        ...activeNonChatSessions.map((session) => ({
+          type: 'session',
+          id: session.id,
+          kind: session.kind,
+          status: session.status,
+          title: session.title || session.objective || session.id,
+          updatedAt: session.updatedAt,
+        })),
+        ...pendingApprovals.map((approval) => ({
+          type: 'approval',
+          id: approval.approvalId,
+          kind: 'harness-approval',
+          status: approval.status,
+          title: approval.subject || approval.tool || approval.approvalId,
+          sessionId: approval.sessionId,
+          tool: approval.tool,
+          updatedAt: approval.requestedAt,
+        })),
+        ...activeBackgroundTasks.map((task) => ({
+          type: 'background-task',
+          id: task.id,
+          kind: task.source,
+          status: task.status,
+          title: task.title,
+          updatedAt: task.updatedAt,
+          pendingApprovalId: task.pendingApprovalId,
+        })),
+      ];
       // Build a human-readable summary for the auto-updater dialog so
       // the user sees what's at stake before choosing "Install anyway."
       const summaryParts: string[] = [];
       if (activeNonChatSessions.length > 0) {
-        summaryParts.push(`${activeNonChatSessions.length} workflow${activeNonChatSessions.length === 1 ? '' : 's'} running`);
+        summaryParts.push(`${activeNonChatSessions.length} tracked run${activeNonChatSessions.length === 1 ? '' : 's'} active or paused`);
       }
       if (pendingApprovals.length > 0) {
         summaryParts.push(`${pendingApprovals.length} pending approval${pendingApprovals.length === 1 ? '' : 's'}`);
@@ -2731,6 +3064,7 @@ export function registerConsoleRoutes(
         activeSessions: activeNonChatSessions.length,
         pendingApprovals: pendingApprovals.length,
         activeBackgroundTasks: activeBackgroundTasks.length,
+        items: activeWorkItems,
         summary: summaryParts.join(', ') || 'no active work',
       });
     } catch (err) {
@@ -2788,6 +3122,16 @@ export function registerConsoleRoutes(
       composio: 'unknown',
     };
 
+    // Build/version self-report — so the dashboard can show (and warn)
+    // exactly which build is serving this, packaged vs dev.
+    let build: import('../runtime/build-info.js').BuildInfo | undefined;
+    try {
+      const { getBuildInfo } = await import('../runtime/build-info.js');
+      build = getBuildInfo();
+    } catch {
+      build = undefined;
+    }
+
     try {
       const { openMemoryDb } = await import('../memory/db.js');
       const db = openMemoryDb();
@@ -2820,7 +3164,7 @@ export function registerConsoleRoutes(
       snapshot.composio = 'err';
     }
 
-    res.json(snapshot);
+    res.json({ ...snapshot, build });
   });
 
   app.patch('/api/console/settings/profile', (req, res) => {
@@ -3407,6 +3751,11 @@ export function registerConsoleRoutes(
     const allowedTools = Array.isArray(body.allowedTools) ? body.allowedTools.filter((t: unknown) => typeof t === 'string') : undefined;
     const result = approvePlanAndQueueBackgroundTask(req.params.id, { editedPlan, scopeTtlMs, allowedTools });
     if (!result) { res.status(404).json({ error: 'plan proposal not found or already resolved' }); return; }
+    setImmediate(() => {
+      processBackgroundTasks(assistant, 1).catch((err) => {
+        console.warn('Immediate background task processor failed after plan approval:', err);
+      });
+    });
     res.json({ proposal: result.proposal, queuedTask: result.task, run: result.run });
   });
 
@@ -3809,6 +4158,11 @@ export function registerConsoleRoutes(
       const { listPending } = await import('../runtime/harness/approval-registry.js');
       const harnessRows = listPending({ status: 'pending' });
       const runtimeRows = assistant.getRuntime().listPendingApprovals();
+      const backgroundTaskByApprovalId = new Map(
+        listBackgroundTasks()
+          .filter((task) => task.pendingApprovalId)
+          .map((task) => [task.pendingApprovalId as string, task]),
+      );
 
       const harnessApprovals = harnessRows.map((r) => {
         // Resource-fingerprint check: if the approval's args carry a
@@ -3818,6 +4172,7 @@ export function registerConsoleRoutes(
         // (sess-mpjbmoez 2026-05-24) at decision time.
         const resourceId = extractResourceIdFromApprovalArgs(r.args);
         const fingerprint = checkResourceMatchesFocus(resourceId);
+        const preview = normalizeApprovalPreview(r.args?.preview);
         return {
           kind: 'harness' as const,
           approvalId: r.approvalId,
@@ -3827,6 +4182,11 @@ export function registerConsoleRoutes(
           requestedAt: r.requestedAt,
           expiresAt: r.expiresAt,
           subject: r.subject,
+          summary: approvalSummaryFromArgs(r.args ?? undefined, r.subject),
+          reason: approvalReasonFromArgs(r.args ?? undefined),
+          preview,
+          sourceTitle: undefined as string | undefined,
+          sourceKind: undefined as string | undefined,
           tool: r.tool,
           args: r.args,
           resourceFingerprint: fingerprint.result === 'unknown' ? undefined : {
@@ -3843,23 +4203,52 @@ export function registerConsoleRoutes(
       // panel — clicking through to Approvals showed "0 pending" while
       // Home said "4". (Observed 2026-05-23.) Map them to the same shape
       // so this panel is the single authoritative source.
-      const runtimeApprovals = runtimeRows.map((approval) => ({
-        kind: 'runtime' as const,
-        approvalId: approval.id,
-        sessionId: approval.sessionId,
-        channel: approval.channel,
-        channelId: undefined as string | undefined,
-        requestedAt: approval.createdAt,
-        expiresAt: undefined as string | undefined,
-        subject: `Approve: ${summarizeApprovalAction(approval)}`,
-        tool: approval.toolName,
-        args: undefined as unknown,
-      }));
+      const runtimeApprovals = runtimeRows.map((approval) => {
+        const args = extractRuntimeApprovalArgs(approval);
+        const task = backgroundTaskByApprovalId.get(approval.id);
+        return {
+          kind: 'runtime' as const,
+          approvalId: approval.id,
+          sessionId: approval.sessionId,
+          channel: approval.channel,
+          channelId: undefined as string | undefined,
+          requestedAt: approval.createdAt,
+          expiresAt: undefined as string | undefined,
+          subject: `Approve: ${summarizeApprovalAction(approval)}`,
+          summary: approvalSummaryFromArgs(args, summarizeApprovalAction(approval)),
+          reason: approvalReasonFromArgs(args),
+          preview: normalizeApprovalPreview(args?.preview),
+          sourceTitle: task?.title,
+          sourceKind: task ? 'background task' : undefined,
+          tool: approval.toolName,
+          args,
+        };
+      });
 
       // Newest first across both registries.
       const approvals = [...harnessApprovals, ...runtimeApprovals]
         .sort((a, b) => (b.requestedAt || '').localeCompare(a.requestedAt || ''));
       res.json({ approvals, count: approvals.length });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.get('/api/console/background-tasks/:id', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const task = getBackgroundTask(req.params.id);
+      if (!task) {
+        res.status(404).json({ error: 'background task not found' });
+        return;
+      }
+      let resultFull = task.result;
+      if (task.resultPath && existsSync(task.resultPath)) {
+        const full = readFileSync(task.resultPath, 'utf-8');
+        resultFull = full.length > 50_000 ? `${full.slice(0, 50_000)}\n\n...[truncated for console preview]` : full;
+      }
+      const detail = getBackgroundTaskStatus(task.id);
+      res.json({ task: { ...task, resultFull }, detail });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -4078,6 +4467,11 @@ export function registerConsoleRoutes(
       const activeBackgroundTasks = backgroundTasks.filter((task) =>
         task.status === 'pending' || task.status === 'running' || task.status === 'awaiting_approval' || task.status === 'interrupted',
       );
+      const backgroundTaskByApprovalId = new Map(
+        backgroundTasks
+          .filter((task) => task.pendingApprovalId)
+          .map((task) => [task.pendingApprovalId as string, task]),
+      );
       const credentialHealth = await (await getSecretStore()).health({ passive: true });
       const runtimeAuth = getAuthStatus();
       const policy = getProactivityPolicySnapshot();
@@ -4103,43 +4497,62 @@ export function registerConsoleRoutes(
       // what's actually pending. (Observed 2026-05-23 alongside the
       // approvals-panel/home mismatch.) Outer slice removed too.
       const needsYou = [
-        ...approvals.map((approval) => ({
-          kind: 'approval',
-          // Lead with what's being approved, not just the bare tool name —
-          // "Approve: git push origin main" beats "Approve run_shell_command"
-          // any day from the dashboard sidebar.
-          title: `Approve: ${summarizeApprovalAction(approval)}`,
-          meta: `${approval.toolName} · ${approval.sessionId || approval.id}`,
-          panel: 'settings',
-          urgency: 'high',
-          approvalKind: 'runtime',
-          approvalId: approval.id,
-        })),
-        ...harnessApprovals.map((approval) => ({
-          kind: 'harness-approval',
-          title: `Approve: ${approval.subject}`,
-          meta: `${approval.approvalId} · ${approval.tool || approval.sessionId}`,
-          panel: 'activity',
-          urgency: 'high',
-          approvalKind: 'harness',
-          approvalId: approval.approvalId,
-          // Drill-target: when the user clicks this NEEDS YOU item body,
-          // the dashboard switches to Activity AND loads the inspector
-          // for this exact session. Without this attribute the user
-          // landed on Activity showing "everything" with no anchor to
-          // the specific approval that brought them here (the visibility
-          // gap Nathan flagged 2026-05-21).
-          targetSessionId: approval.sessionId,
-          // Pass the tool name + args so the EDIT button can render a
-          // pre-filled textarea. For composio_execute_tool we surface
-          // the INNER args JSON (the actual tool payload).
-          approvalTool: approval.tool,
-          approvalArgs: approval.tool === 'composio_execute_tool'
-            && approval.args
-            && typeof (approval.args as { arguments?: unknown }).arguments === 'string'
-            ? (approval.args as { arguments: string }).arguments
-            : (approval.args ? JSON.stringify(approval.args, null, 2) : ''),
-        })),
+        ...approvals.map((approval) => {
+          const args = extractRuntimeApprovalArgs(approval);
+          const task = backgroundTaskByApprovalId.get(approval.id);
+          const summary = approvalSummaryFromArgs(args, summarizeApprovalAction(approval));
+          const reason = approvalReasonFromArgs(args);
+          const preview = normalizeApprovalPreview(args?.preview);
+          const previewMeta = typeof preview?.count === 'number' ? `${preview.count} item${preview.count === 1 ? '' : 's'}` : '';
+          return {
+            kind: task ? 'background-approval' : 'approval',
+            title: `Approve: ${summary}`,
+            meta: [
+              task ? `background ${task.id}` : approval.toolName,
+              reason ? `why: ${trimConsoleTitle(reason, 90)}` : '',
+              previewMeta,
+            ].filter(Boolean).join(' · ') || `${approval.sessionId || approval.id}`,
+            panel: 'approvals',
+            urgency: 'high',
+            approvalKind: 'runtime',
+            approvalId: approval.id,
+          };
+        }),
+        ...harnessApprovals.map((approval) => {
+          const reason = approvalReasonFromArgs(approval.args ?? undefined);
+          const preview = normalizeApprovalPreview(approval.args?.preview);
+          const previewMeta = typeof preview?.count === 'number' ? `${preview.count} item${preview.count === 1 ? '' : 's'}` : '';
+          return {
+            kind: 'harness-approval',
+            title: `Approve: ${approvalSummaryFromArgs(approval.args ?? undefined, approval.subject)}`,
+            meta: [
+              approval.approvalId,
+              approval.tool || approval.sessionId,
+              reason ? `why: ${trimConsoleTitle(reason, 90)}` : '',
+              previewMeta,
+            ].filter(Boolean).join(' · '),
+            panel: 'approvals',
+            urgency: 'high',
+            approvalKind: 'harness',
+            approvalId: approval.approvalId,
+            // Drill-target: when the user clicks this NEEDS YOU item body,
+            // the dashboard switches to Activity AND loads the inspector
+            // for this exact session. Without this attribute the user
+            // landed on Activity showing "everything" with no anchor to
+            // the specific approval that brought them here (the visibility
+            // gap Nathan flagged 2026-05-21).
+            targetSessionId: approval.sessionId,
+            // Pass the tool name + args so the EDIT button can render a
+            // pre-filled textarea. For composio_execute_tool we surface
+            // the INNER args JSON (the actual tool payload).
+            approvalTool: approval.tool,
+            approvalArgs: approval.tool === 'composio_execute_tool'
+              && approval.args
+              && typeof (approval.args as { arguments?: unknown }).arguments === 'string'
+              ? (approval.args as { arguments: string }).arguments
+              : (approval.args ? JSON.stringify(approval.args, null, 2) : ''),
+          };
+        }),
         ...planProposals.map((proposal) => ({
           kind: 'plan',
           title: proposal.plan?.objective || proposal.originatingRequest || proposal.id,
@@ -4161,22 +4574,41 @@ export function registerConsoleRoutes(
           panel: 'settings',
           urgency: checkIn.urgency === 'high' ? 'high' : 'normal',
         })),
-        ...activeBackgroundTasks.filter((task) => task.status === 'awaiting_approval').map((task) => ({
+        ...activeBackgroundTasks.filter((task) => task.status === 'awaiting_approval' && !task.pendingApprovalId).map((task) => ({
           kind: 'background',
           title: task.title,
           meta: task.id,
-          panel: 'activity',
+          panel: 'approvals',
           urgency: 'high',
         })),
       ].map((item) => ({ ...item, title: trimConsoleTitle(item.title, 140) }));
 
-      // WORKING NOW is intentionally NARROW: only active chat sessions
-      // (harness) + workflow runs (pending + execution lifecycle).
-      // Background tasks live in their own surface; legacy channel runs
-      // are already covered by harness sessions for chat flows.
-      // (User direction 2026-05-23: "Working now should only be active
-      // working sessions from chat or workflows.")
+      // WORKING NOW shows anything the daemon has accepted as active
+      // or queued work. A plan-approved background task can sit
+      // pending for one daemon tick before it starts; hiding that made
+      // the chat say "queued" while Home looked empty.
       const workingNow = [
+        ...activeBackgroundTasks.map((task) => {
+          const runtimeApproval = task.pendingApprovalId
+            ? approvals.find((approval) => approval.id === task.pendingApprovalId)
+            : undefined;
+          const args = runtimeApproval ? extractRuntimeApprovalArgs(runtimeApproval) : undefined;
+          const summary = runtimeApproval
+            ? approvalSummaryFromArgs(args, summarizeApprovalAction(runtimeApproval))
+            : task.title;
+          return {
+            kind: task.status === 'pending' ? 'queued' : task.status,
+            title: task.status === 'awaiting_approval'
+              ? `Waiting for approval: ${summary}`
+              : task.title,
+            meta: task.lastCheckInMessage
+              ? `${task.id} · ${task.lastCheckInMessage}`
+              : `${task.id} · ${task.status}`,
+            panel: task.status === 'awaiting_approval' ? 'approvals' : 'activity',
+            approvalKind: runtimeApproval ? 'runtime' : undefined,
+            approvalId: runtimeApproval?.id,
+          };
+        }),
         ...pendingWorkflowRuns.map((run) => {
           const workflow = readWorkflow(run.workflowName);
           const title = workflow?.data?.name ?? run.workflowName;
@@ -4210,20 +4642,26 @@ export function registerConsoleRoutes(
         ...backgroundTasks.filter((task) => task.status === 'done').slice(0, 5).map((task) => ({
           kind: 'done',
           title: task.title,
-          meta: task.completedAt ? `done ${task.completedAt.slice(11, 16)}` : task.id,
+          meta: task.result
+            ? trimConsoleTitle(task.result.replace(/^#+\s*/gm, '').split('\n').find((line) => line.trim() && !line.includes('/Users/')) || task.result, 120)
+            : task.completedAt ? `done ${task.completedAt.slice(11, 16)}` : task.id,
           panel: 'activity',
+          actionKind: 'background-task',
+          taskId: task.id,
         })),
         ...runs.filter((run) => run.status === 'completed').slice(0, 5).map((run) => ({
           kind: 'done',
           title: run.title || run.input || run.id,
           meta: run.completedAt ? `done ${run.completedAt.slice(11, 16)}` : run.id,
           panel: 'activity',
+          targetRunId: run.id,
         })),
         ...recentHarnessSessions.filter((session) => session.status === 'completed').slice(0, 5).map((session) => ({
           kind: 'done',
           title: session.title || session.objective || 'Clementine conversation',
           meta: `${harnessSessionSourceLabel(session)} done ${session.updatedAt.slice(11, 16)}`,
           panel: 'activity',
+          targetSessionId: session.id,
         })),
       ].slice(0, 6).map((item) => ({ ...item, title: trimConsoleTitle(item.title, 120), meta: trimConsoleTitle(item.meta || '', 100) }));
 

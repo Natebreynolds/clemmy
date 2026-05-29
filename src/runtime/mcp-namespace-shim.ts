@@ -19,6 +19,8 @@ function positiveIntEnv(key: string, fallback: number): number {
 
 const MCP_LIST_TOOLS_TIMEOUT_MS = positiveIntEnv('MCP_LIST_TOOLS_TIMEOUT_MS', 20_000);
 const MCP_CONNECT_TIMEOUT_MS = positiveIntEnv('MCP_CONNECT_TIMEOUT_MS', 30_000);
+const MCP_EAGER_CONNECT_BLOCKING =
+  /^(1|true|on|yes)$/i.test(process.env.MCP_EAGER_CONNECT_BLOCKING ?? '');
 
 type MCPTool = Awaited<ReturnType<MCPServer['listTools']>>[number];
 type CallToolResultContent = Awaited<ReturnType<MCPServer['callTool']>>;
@@ -450,17 +452,23 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): MCPSer
 
     async connect() {
       // Eager connect for the easy servers so first listTools() is
-      // faster. Each call is deduped via `ensureConnected` — repeated
-      // shim.connect() calls don't respawn child processes.
-      await Promise.allSettled(
-        servers.map(async (server) => {
-          try {
-            await ensureConnected(server);
-          } catch (err) {
-            logger.warn({ server: server.name, err: err instanceof Error ? err.message : String(err) }, 'MCP server connect failed; will retry on first use');
-          }
-        }),
-      );
+      // faster. By default this is deliberately non-blocking: a dead
+      // local MCP server should not make daemon startup look hung.
+      // listTools() still awaits connection when a run actually needs
+      // tool definitions. Set MCP_EAGER_CONNECT_BLOCKING=true for old
+      // blocking behavior in diagnostics.
+      const tasks = servers.map(async (server) => {
+        try {
+          await ensureConnected(server);
+        } catch (err) {
+          logger.warn({ server: server.name, err: err instanceof Error ? err.message : String(err) }, 'MCP server connect failed; will retry on first use');
+        }
+      });
+      if (MCP_EAGER_CONNECT_BLOCKING) {
+        await Promise.allSettled(tasks);
+      } else {
+        for (const task of tasks) task.catch(() => { /* logged above */ });
+      }
     },
 
     async close() {

@@ -4,6 +4,7 @@ import { ASSISTANT_NAME, BASE_DIR, OWNER_NAME } from '../config.js';
 import type { MemoryContext } from '../types.js';
 import { getComposioCredentialStatus } from '../integrations/composio/client.js';
 import { renderFactsForInstructions } from '../memory/facts.js';
+import { getActiveObjective } from '../memory/focus.js';
 import { renderProfileForInstructions } from '../runtime/user-profile.js';
 import { getProposalFeedback, renderProposalFeedback } from '../agents/proposal-feedback.js';
 import { renderMcpServersForInstructions } from '../runtime/mcp-config.js';
@@ -190,7 +191,10 @@ export function buildAssistantInstructions(context: MemoryContext, channel?: str
   const owner = OWNER_NAME || 'the user';
   const goalsContext = buildGoalsContext();
   const integrationsContext = buildIntegrationsContext();
-  const persistentFacts = renderFactsForInstructions(12);
+  // Move 1 (scoped recall): scope persistent facts to the active focus
+  // so off-objective facts don't leak into the prompt. No focus / flag
+  // off → getActiveObjective() returns undefined → unchanged top-12.
+  const persistentFacts = renderFactsForInstructions(12, 1600, getActiveObjective());
   const userPreferences = renderProfileForInstructions();
   const channelDirective = renderChannelDirective(channel);
   const actionDirective = renderActionDisciplineDirective(intent);

@@ -30,6 +30,10 @@ export interface ProactivityPolicy {
   briefCadenceMinutes: number;
   defaultLongTaskMinutes: number;
   maxConcurrentBackgroundTasks: number;
+  /** Move 2 (confirm-first gate): a batch of this many same-shape
+   *  external writes in a session requires an instruction-reviewed plan
+   *  scope before it proceeds. Floored at 2 by the gate. */
+  batchConfirmThreshold: number;
   quietHoursEnabled: boolean;
   quietHoursStart: string;
   quietHoursEnd: string;
@@ -58,6 +62,7 @@ export const DEFAULT_PROACTIVITY_POLICY: ProactivityPolicy = {
   briefCadenceMinutes: 60,
   defaultLongTaskMinutes: 90,
   maxConcurrentBackgroundTasks: 1,
+  batchConfirmThreshold: 5,
   quietHoursEnabled: false,
   quietHoursStart: '22:00',
   quietHoursEnd: '07:00',
@@ -105,6 +110,7 @@ function normalizePolicy(input: RawProactivityPolicy = {}): ProactivityPolicy {
     briefCadenceMinutes: clampInteger(input.briefCadenceMinutes, DEFAULT_PROACTIVITY_POLICY.briefCadenceMinutes, 10, 1440),
     defaultLongTaskMinutes: clampInteger(input.defaultLongTaskMinutes, DEFAULT_PROACTIVITY_POLICY.defaultLongTaskMinutes, 5, 240),
     maxConcurrentBackgroundTasks: clampInteger(input.maxConcurrentBackgroundTasks, DEFAULT_PROACTIVITY_POLICY.maxConcurrentBackgroundTasks, 1, 5),
+    batchConfirmThreshold: clampInteger(input.batchConfirmThreshold, DEFAULT_PROACTIVITY_POLICY.batchConfirmThreshold, 2, 100),
     quietHoursEnabled: input.quietHoursEnabled === true,
     quietHoursStart: normalizeTime(input.quietHoursStart, DEFAULT_PROACTIVITY_POLICY.quietHoursStart),
     quietHoursEnd: normalizeTime(input.quietHoursEnd, DEFAULT_PROACTIVITY_POLICY.quietHoursEnd),

@@ -62,6 +62,8 @@ export const LOCAL_MCP_TOOL_NAMES = [
   'cron_progress_write',
   'agent_runs_recent',
   'agent_run_get',
+  'background_tasks_recent',
+  'background_task_status',
   'notify_user',
   'ask_user_question',
   'list_pending_check_ins',

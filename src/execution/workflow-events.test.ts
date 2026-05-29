@@ -94,6 +94,19 @@ test('computeResumeState surfaces completed steps + items', () => {
   assert.equal(state.terminal, false);
 });
 
+test('computeResumeState round-trips STRUCTURED step output (no schema change needed)', () => {
+  // The step_result refactor stores structured objects as step output.
+  // This proves resume restores the object intact across a restart —
+  // the event log + completedSteps Map are already <unknown>, so a
+  // downstream step gets real data, not a truncated/prose summary.
+  const structured = { accounts: [{ id: 'A1', score: 9 }, { id: 'A2', score: 4 }], total: 2 };
+  appendWorkflowEvent('structured', 'r1', { kind: 'run_started' });
+  appendWorkflowEvent('structured', 'r1', { kind: 'step_completed', stepId: 'fetch', output: structured });
+
+  const state = computeResumeState('structured', 'r1');
+  assert.deepEqual(state.completedSteps.get('fetch'), structured, 'structured output survives persist + resume');
+});
+
 test('computeResumeState detects terminal run_completed', () => {
   appendWorkflowEvent('terminal-ok', 'r1', { kind: 'run_started' });
   appendWorkflowEvent('terminal-ok', 'r1', { kind: 'run_completed' });

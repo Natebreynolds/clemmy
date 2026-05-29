@@ -94,6 +94,11 @@ export const EVENT_TYPES = [
   // The actual hits are injected transiently through callModelInputFilter
   // so they do not bloat persisted conversation history.
   'turn_memory_primer',
+  // Per-turn deterministic context packet: summarizes the memory
+  // primer, likely skills/workflows, MCP health, local health, and
+  // complexity classification that were injected transiently before
+  // the model call.
+  'agent_context_packet',
   // Planner-first gate: fresh complex requests get a read-only plan
   // proposal before the full external MCP surface is opened.
   'plan_first_started',
@@ -108,6 +113,14 @@ export const EVENT_TYPES = [
   // proceed — but the dashboard now sees the risk and a future
   // workflow-runner extension can react (split / abort / retry).
   'workflow_step_overbudget',
+  // Move 2 (confirm-first gate): emitted by the tool-boundary gate each
+  // time a mutating external write is ALLOWED through. The gate counts
+  // these per session+shape to detect a batch (≥ threshold same-shape
+  // writes) and require an instruction-reviewed plan scope before the
+  // batch proceeds. Emitted from the gate (not hooks) so worker/sub-agent
+  // writes — which share the parent session via AsyncLocalStorage but may
+  // not log tool_called under it — are counted reliably.
+  'external_write',
 ] as const;
 export type EventType = (typeof EVENT_TYPES)[number];
 const EVENT_TYPE_SET: ReadonlySet<string> = new Set(EVENT_TYPES);

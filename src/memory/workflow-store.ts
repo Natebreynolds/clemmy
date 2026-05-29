@@ -80,6 +80,70 @@ export interface WorkflowStepInput {
    * Serialized to YAML as `uses_skill`.
    */
   usesSkill?: string;
+  /**
+   * Opt-in approval gate. When true, the workflow RUNNER surfaces ONE
+   * batch approval before this step runs and holds the run until the
+   * user approves — then the rest of the workflow proceeds autonomously.
+   * This is the declarative replacement for calling `request_approval`
+   * inside a step prompt: the runner owns the gate, so the (constrained)
+   * step agent never needs the approval tool, and a workflow pauses at
+   * most where it explicitly opts in. Default: autonomous (no pause).
+   * Serialized to YAML as `requires_approval` / `approval_preview`.
+   */
+  requiresApproval?: boolean;
+  /** Optional one-line preview shown on the approval card (what's about
+   *  to happen, e.g. "Send 25 prospect emails"). */
+  approvalPreview?: string;
+  /**
+   * Typed step CONTRACT (P0 of the typed-workflow-contract redesign).
+   * Both optional → when absent the step runs today's template-only
+   * path byte-identically. Serialized to YAML as `inputs` / `output`.
+   *
+   * `inputs` declares what the step NEEDS; the engine binds each from
+   * `from` (or the conventional source) and fast-fails before the step
+   * runs if a required input is unresolved (no more silent empty-string
+   * starvation). `from`: `input.<key>` | `steps.<id>.output[.path]` |
+   * `item[.path]`.
+   */
+  inputs?: Record<string, WorkflowStepInputBinding>;
+  /** Declares what the step PRODUCES (shallow shape check on the
+   *  captured workflow_step_result). Absent → no output validation. */
+  output?: WorkflowStepOutputContract;
+}
+
+export type WorkflowContractType = 'string' | 'number' | 'boolean' | 'object' | 'array';
+
+export interface WorkflowStepInputBinding {
+  type?: WorkflowContractType;
+  /** Required defaults to true unless a `default` is present. */
+  required?: boolean;
+  /** Explicit binding source: `input.<key>`, `steps.<id>.output[.path]`,
+   *  or `item[.path]`. Omitted → conventional resolution by the input's
+   *  own name. */
+  from?: string;
+  default?: unknown;
+  description?: string;
+}
+
+export interface WorkflowStepOutputContract {
+  type?: WorkflowContractType;
+  /** Top-level keys that must be present on an object result (shallow). */
+  required_keys?: string[];
+  /**
+   * Verifiable concrete handles (Hermes-style artifact verification):
+   * after the step returns, the engine confirms the named output values
+   * are REAL, not just well-shaped — so "produced a brief" can't pass
+   * when the file/URL doesn't actually exist (the revill "deploy
+   * blocked, no URL" class). Values are dot-paths into the output.
+   * Engine-checked in P3.5 (verifyStepOutput).
+   */
+  verify?: {
+    /** Output dot-paths whose value must be an existing filesystem path. */
+    path_exists?: string[];
+    /** Output dot-paths whose value must be a non-empty http(s) URL. */
+    url_present?: string[];
+  };
+  description?: string;
 }
 
 export interface WorkflowTrigger {
@@ -88,7 +152,8 @@ export interface WorkflowTrigger {
 }
 
 export interface WorkflowInputDef {
-  type?: 'string' | 'number';
+  type?: WorkflowContractType;
+  required?: boolean;
   default?: string;
   description?: string;
 }
@@ -255,6 +320,25 @@ export function readWorkflowDefinitionFile(filePath: string): WorkflowDefinition
           ? step.usesSkill.trim()
           : '';
       if (skillRef) result.usesSkill = skillRef;
+      // Opt-in approval gate. Accept snake_case (yaml-idiomatic) or
+      // camelCase. The runner pauses ONCE before this step.
+      if (step.requires_approval === true || step.requiresApproval === true) {
+        result.requiresApproval = true;
+      }
+      const preview = typeof step.approval_preview === 'string'
+        ? step.approval_preview.trim()
+        : typeof step.approvalPreview === 'string'
+          ? step.approvalPreview.trim()
+          : '';
+      if (preview) result.approvalPreview = preview;
+      // Typed step contract (P0). Pure passthrough — structure is
+      // validated/consumed by the binder + validator, not here.
+      if (step.inputs && typeof step.inputs === 'object' && !Array.isArray(step.inputs)) {
+        result.inputs = step.inputs as WorkflowStepInput['inputs'];
+      }
+      if (step.output && typeof step.output === 'object' && !Array.isArray(step.output)) {
+        result.output = step.output as WorkflowStepInput['output'];
+      }
       return result;
     });
     return {
@@ -354,6 +438,10 @@ function writeWorkflowToDir(dirPath: string, def: WorkflowDefinition): void {
       if (s.deterministic) out.deterministic = s.deterministic;
       if (s.allowedTools && s.allowedTools.length > 0) out.allowedTools = s.allowedTools;
       if (s.usesSkill) out.uses_skill = s.usesSkill;
+      if (s.requiresApproval) out.requires_approval = true;
+      if (s.approvalPreview) out.approval_preview = s.approvalPreview;
+      if (s.inputs && Object.keys(s.inputs).length > 0) out.inputs = s.inputs;
+      if (s.output && Object.keys(s.output).length > 0) out.output = s.output;
       return out;
     });
   }

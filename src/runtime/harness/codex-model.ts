@@ -328,23 +328,40 @@ function isTransparentCodexRetryError(err: unknown): err is BoundaryError {
     && BoundaryError.isTransient(err);
 }
 
+/**
+ * A Codex 429 (rate limit) is safe to retry transparently: it's thrown
+ * at the non-OK response stage, BEFORE any SSE content, so no tokens
+ * have been yielded and a retry can't duplicate output. Without this, a
+ * transient rate limit (e.g. a burst of concurrent workflow runs) hard-
+ * fails the run and fires a "workflow failed" notice — which is how
+ * outreach runs were silently/noisily failing on the $100 plan during a
+ * concurrency spike. Sustained limits still fail after the retry budget,
+ * so genuine exhaustion is still reported.
+ */
+export function isRetryableCodexRateLimit(err: unknown): boolean {
+  return err instanceof CodexModelError && err.status === 429;
+}
+
 function shouldRetryTransparentCodexFailure(
   err: unknown,
   yieldedRealContent: boolean,
   attempt: number,
 ): boolean {
-  return isTransparentCodexRetryError(err)
+  return (isTransparentCodexRetryError(err) || isRetryableCodexRateLimit(err))
     && !yieldedRealContent
     && attempt < CODEX_TRANSPARENT_MAX_RETRIES;
 }
 
-function transparentCodexRetryDelayMs(attempt: number): number {
+function transparentCodexRetryDelayMs(attempt: number, isRateLimit = false): number {
   const override = process.env.CLEMMY_CODEX_TRANSPARENT_RETRY_DELAY_MS;
   if ((process.env.NODE_ENV === 'test' || process.env.CLEMMY_DEV_OVERRIDES === '1') && override != null) {
     const parsed = Number(override);
     if (Number.isFinite(parsed) && parsed >= 0) return parsed;
   }
-  return 750 * Math.pow(2, attempt);
+  // Rate limits need real seconds to clear, not sub-second jitter:
+  // 2s, 4s, 8s vs the transport-failure 750ms, 1.5s, 3s.
+  const base = isRateLimit ? 2000 : 750;
+  return base * Math.pow(2, attempt);
 }
 
 async function waitBeforeTransparentCodexRetry(
@@ -352,7 +369,8 @@ async function waitBeforeTransparentCodexRetry(
   attempt: number,
   path: 'getResponse' | 'getStreamedResponse',
 ): Promise<void> {
-  const backoffMs = transparentCodexRetryDelayMs(attempt);
+  const rateLimited = isRetryableCodexRateLimit(err);
+  const backoffMs = transparentCodexRetryDelayMs(attempt, rateLimited);
   const boundary = err instanceof BoundaryError ? err : null;
   logger.warn(
     {
@@ -361,7 +379,8 @@ async function waitBeforeTransparentCodexRetry(
       nextAttempt: attempt + 2,
       maxRetries: CODEX_TRANSPARENT_MAX_RETRIES,
       backoffMs,
-      kind: boundary?.kind ?? null,
+      rateLimited,
+      kind: boundary?.kind ?? (rateLimited ? 'codex.rate_limited' : null),
       context: boundary?.context ?? {},
     },
     'Codex model call failed before real content; retrying transparently',
