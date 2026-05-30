@@ -1141,12 +1141,22 @@ const RETRY_BACKOFF_BASE_MS = parseInt(
  * real bug. ParkRunSignal / cancellation are handled by the caller before
  * this is consulted.
  */
-const TRANSIENT_RE = /\b(ETIMEDOUT|ECONNRESET|ECONNREFUSED|EAI_AGAIN|ENOTFOUND|EPIPE|socket hang up|network|timed? ?out|timeout|rate.?limit|too many requests|temporarily unavailable|service unavailable|bad gateway|gateway timeout|\b(429|500|502|503|504)\b)/i;
+// Transient SIGNALS matched against the error message (network/infra hiccups).
+// Bare HTTP status NUMBERS are deliberately NOT matched here — a message that
+// merely contains "500" (e.g. "expected 500 rows") must not be retried. HTTP
+// status is only honored via the structured `err.status` field below.
+const TRANSIENT_RE = /\b(ETIMEDOUT|ECONNRESET|ECONNREFUSED|EAI_AGAIN|ENOTFOUND|EPIPE|socket hang up|network error|timed? ?out|timeout|rate.?limit|too many requests|temporarily unavailable|service unavailable|bad gateway|gateway timeout)\b/i;
+// Deterministic workflow failures that must NEVER be retried even though their
+// message text can contain a transient token (e.g. "timed out waiting for
+// approval" contains "timed out"). This override wins over TRANSIENT_RE.
+const NON_RETRYABLE_RE = /(waiting for approval|exceeded approval wait budget|was not approved|missing required input|failed its contract|deterministic runner)/i;
+const TRANSIENT_STATUS = new Set([408, 429, 500, 502, 503, 504]);
 export function isTransientStepError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err ?? '');
+  if (NON_RETRYABLE_RE.test(msg)) return false;
   const code = (err as { code?: string; status?: number } | null);
   if (code?.code && TRANSIENT_RE.test(code.code)) return true;
-  if (typeof code?.status === 'number' && [408, 429, 500, 502, 503, 504].includes(code.status)) return true;
+  if (typeof code?.status === 'number' && TRANSIENT_STATUS.has(code.status)) return true;
   return TRANSIENT_RE.test(msg);
 }
 

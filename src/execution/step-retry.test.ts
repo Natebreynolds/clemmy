@@ -4,20 +4,31 @@ import { isTransientStepError, runWithStepRetry } from './workflow-runner.js';
 
 // ── isTransientStepError ───────────────────────────────────────────
 
-test('isTransientStepError: network/timeout/5xx/rate-limit are transient', () => {
+test('isTransientStepError: network/timeout/rate-limit signals are transient', () => {
   assert.ok(isTransientStepError(new Error('socket hang up')));
   assert.ok(isTransientStepError(new Error('request timed out after 30s')));
   assert.ok(isTransientStepError(new Error('Service Unavailable')));
   assert.ok(isTransientStepError(new Error('429 Too Many Requests')));
-  assert.ok(isTransientStepError(new Error('upstream 503')));
   assert.ok(isTransientStepError(Object.assign(new Error('boom'), { code: 'ETIMEDOUT' })));
   assert.ok(isTransientStepError(Object.assign(new Error('boom'), { status: 502 })));
 });
 
-test('isTransientStepError: deterministic failures are NOT transient', () => {
+test('isTransientStepError: bare HTTP numbers in a message are NOT transient (only structured status is)', () => {
+  // "expected 500 rows" must not be retried just because it contains 500.
+  assert.ok(!isTransientStepError(new Error('expected 500 rows but got 0')));
+  assert.ok(!isTransientStepError(new Error('account 502 not found')));
+  assert.ok(!isTransientStepError(new Error('network_id field is required')));
+  // ...but a structured status field IS honored.
+  assert.ok(isTransientStepError(Object.assign(new Error('upstream failed'), { status: 503 })));
+});
+
+test('isTransientStepError: deterministic + approval failures are NOT transient (override wins)', () => {
   assert.ok(!isTransientStepError(new Error('missing required input "url"')));
   assert.ok(!isTransientStepError(new Error('output failed its contract: missing key id')));
   assert.ok(!isTransientStepError(new Error('was not approved (rejected)')));
+  // The approval-timeout message contains "timed out" but must NOT retry.
+  assert.ok(!isTransientStepError(new Error('workflow step "send" timed out waiting for approval after 86400s')));
+  assert.ok(!isTransientStepError(new Error('workflow step "send" exceeded approval wait budget (86400000ms)')));
   assert.ok(!isTransientStepError(new Error('TypeError: x is not a function')));
   assert.ok(!isTransientStepError(undefined));
 });
