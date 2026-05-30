@@ -411,7 +411,14 @@ function contextInjectEnabled(): boolean {
  *
  * Token-efficiency (north star): one tight line per choice, hard cap.
  */
-export function renderToolChoicesForContext(limit = 12): string {
+// Per-line + whole-block caps so enabling context injection can't bloat the
+// persistent prefix on every turn (the renderFactsForInstructions discipline:
+// an explicit budget, not just a count). A long invocationTemplate is clipped,
+// not dropped — the agent still sees the intent→tool mapping.
+const TOOL_CHOICE_LINE_MAX = 160;
+const TOOL_CHOICE_BLOCK_MAX = 1400;
+
+export function renderToolChoicesForContext(limit = 12, maxChars = TOOL_CHOICE_BLOCK_MAX): string {
   if (!contextInjectEnabled()) return '';
   let records: ToolChoiceRecord[];
   try {
@@ -424,13 +431,20 @@ export function renderToolChoicesForContext(limit = 12): string {
     .sort((a, b) => (b.choice!.testedAt ?? '').localeCompare(a.choice!.testedAt ?? ''))
     .slice(0, limit);
   if (active.length === 0) return '';
-  const lines = active.map((r) => {
+  const header = 'These tools previously worked for these intents on this machine. Prefer them directly — skip rediscovery (composio_search_tools / local_cli_list). If one fails, call tool_choice_invalidate and rediscover.';
+  const clip = (s: string): string => (s.length <= TOOL_CHOICE_LINE_MAX ? s : `${s.slice(0, TOOL_CHOICE_LINE_MAX - 1)}…`);
+  // Accumulate lines until the block budget is hit (header counts toward it),
+  // so the most-recently-tested choices win the space.
+  const lines: string[] = [];
+  let used = header.length;
+  for (const r of active) {
     const c = r.choice!;
     const how = c.invocationTemplate ? ` → \`${c.invocationTemplate}\`` : '';
-    return `- ${r.intent}: ${c.kind}:${c.identifier}${how}`;
-  });
-  return [
-    'These tools previously worked for these intents on this machine. Prefer them directly — skip rediscovery (composio_search_tools / local_cli_list). If one fails, call tool_choice_invalidate and rediscover.',
-    ...lines,
-  ].join('\n');
+    const line = clip(`- ${r.intent}: ${c.kind}:${c.identifier}${how}`);
+    if (used + 1 + line.length > maxChars) break;
+    lines.push(line);
+    used += 1 + line.length;
+  }
+  if (lines.length === 0) return '';
+  return [header, ...lines].join('\n');
 }

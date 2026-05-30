@@ -35,6 +35,7 @@ const {
   rememberToolChoice,
   invalidateToolChoice,
   listToolChoices,
+  renderToolChoicesForContext,
   slugifyIntent,
 } = await import('./tool-choice-store.js');
 
@@ -159,6 +160,51 @@ test('listToolChoices returns all records under the current machine', () => {
   assert.ok(intents.has('composio.discovery.example'));
   assert.ok(intents.has('invalidation.test'));
   assert.ok(intents.has('machine.isolation.check'));
+});
+
+test('renderToolChoicesForContext respects per-line and block budgets', () => {
+  const previous = process.env.TOOL_CHOICE_CONTEXT_INJECT;
+  process.env.TOOL_CHOICE_CONTEXT_INJECT = 'on';
+  try {
+    const longTemplate = `sf data query --json --query "${'SELECT Id, Name, OwnerId FROM Account WHERE '.repeat(8)}"`;
+    for (const n of [1, 2, 3]) {
+      rememberToolChoice({
+        intent: `budget.render.${n}`,
+        choice: {
+          kind: 'cli',
+          identifier: `sf-${n}`,
+          invocationTemplate: longTemplate,
+          testedAt: `2099-01-0${n}T00:00:00.000Z`,
+        },
+      });
+    }
+
+    const rendered = renderToolChoicesForContext(3, 420);
+    assert.ok(rendered.length <= 420, `rendered block exceeded budget: ${rendered.length}`);
+    const lines = rendered.split('\n').slice(1);
+    assert.ok(lines.length > 0, 'expected at least one remembered choice');
+    assert.ok(lines.length < 3, 'block budget should stop before all records fit');
+    assert.ok(lines.every((line) => line.length <= 160), 'every rendered choice line should fit the line budget');
+    assert.match(lines[0], /…$/, 'long invocation templates should be clipped, not omitted');
+  } finally {
+    if (previous === undefined) delete process.env.TOOL_CHOICE_CONTEXT_INJECT;
+    else process.env.TOOL_CHOICE_CONTEXT_INJECT = previous;
+  }
+});
+
+test('renderToolChoicesForContext returns empty when no choice fits the budget', () => {
+  const previous = process.env.TOOL_CHOICE_CONTEXT_INJECT;
+  process.env.TOOL_CHOICE_CONTEXT_INJECT = 'on';
+  try {
+    rememberToolChoice({
+      intent: 'budget.render.too-small',
+      choice: { kind: 'cli', identifier: 'tiny', testedAt: '2099-02-01T00:00:00.000Z' },
+    });
+    assert.equal(renderToolChoicesForContext(1, 10), '');
+  } finally {
+    if (previous === undefined) delete process.env.TOOL_CHOICE_CONTEXT_INJECT;
+    else process.env.TOOL_CHOICE_CONTEXT_INJECT = previous;
+  }
 });
 
 // Cleanup
