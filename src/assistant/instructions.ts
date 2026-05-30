@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
-import { ASSISTANT_NAME, BASE_DIR, OWNER_NAME } from '../config.js';
+import { ASSISTANT_NAME, BASE_DIR, OWNER_NAME, getRuntimeEnv } from '../config.js';
 import type { MemoryContext } from '../types.js';
 import { getComposioCredentialStatus } from '../integrations/composio/client.js';
 import { renderFactsForInstructions } from '../memory/facts.js';
@@ -178,8 +178,29 @@ export function renderChannelDirective(channel?: string): string {
  * lookup, and meta_clarify turns get no extra prompt — they don't have
  * the change/edit failure modes these rules guard against.
  */
-export function renderActionDisciplineDirective(intent?: MessageIntent): string {
-  if (intent !== 'action' && intent !== 'tool_intent') return '';
+/**
+ * P3 unified scope gate (flag UNIFIED_SCOPE_GATE, default off). Conservative,
+ * high-precision detector for possessive / relative scope markers — the
+ * "WHO/WHICH is implied, not stated" words. Deliberately does NOT try to
+ * detect bare named entities (too many false positives). Exported for tests.
+ */
+const SCOPE_MARKER_RE = /\b(my|our|mine|ours|the usual|the same|as before|like last time)\b/i;
+export function hasScopedLanguage(message: string): boolean {
+  return SCOPE_MARKER_RE.test(message ?? '');
+}
+
+function scopeGateEnabled(): boolean {
+  return (getRuntimeEnv('UNIFIED_SCOPE_GATE', 'off') ?? 'off').toLowerCase() === 'on';
+}
+
+export function renderActionDisciplineDirective(intent?: MessageIntent, message = ''): string {
+  const actiony = intent === 'action' || intent === 'tool_intent';
+  // P3: a scoped READ (lookup with possessive/relative language like "my"/
+  // "our"/"the usual") carries the same silent-scope-drop risk as an action
+  // ("show MY accounts" → all accounts). Gate it too when the flag is on.
+  // Flag-off → action/tool_intent only (byte-identical to today).
+  const scopedLookup = scopeGateEnabled() && intent === 'lookup' && hasScopedLanguage(message);
+  if (!actiony && !scopedLookup) return '';
   return [
     'Action discipline (this turn is editing / multi-step work):',
     '- RESOLVE SCOPE BEFORE YOU QUERY OR MUTATE. If the request uses possessive or relative scope ("my", "our", "mine", "the usual", "again", or a bare person / account / project / list name) or is otherwise ambiguous about WHO or WHICH records it covers, do NOT guess. FIRST call memory_recall (scoped to the request) to resolve it — e.g. "my market-leader accounts" means accounts the user OWNS (Owner = the user / Nathan Reynolds), not every market-leader account; "the usual sheet" means a specific known sheet. If recall does not resolve the scope, ask ONE concise clarifying question before running the query or mutation. Never silently drop a scope filter (like an owner filter) or invent one.',
@@ -200,7 +221,7 @@ export function buildAssistantInstructions(context: MemoryContext, channel?: str
   const persistentFacts = renderFactsForInstructions(12, 1600, getRecallObjective(message));
   const userPreferences = renderProfileForInstructions();
   const channelDirective = renderChannelDirective(channel);
-  const actionDirective = renderActionDisciplineDirective(intent);
+  const actionDirective = renderActionDisciplineDirective(intent, message);
   const proposalFeedback = renderProposalFeedback(getProposalFeedback({ windowDays: 30 }));
 
   return [
