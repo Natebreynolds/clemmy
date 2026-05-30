@@ -18747,7 +18747,16 @@ const CONSOLE_JS = `
     const dispatchLine = (line) => {
       const trimmed = line.trim();
       if (!trimmed) return;
-      const event = JSON.parse(trimmed);
+      // Tolerate a single malformed/truncated NDJSON line (partial flush,
+      // stray keep-alive) by skipping it instead of throwing out of the
+      // whole read loop — one bad line must not abort an otherwise-healthy
+      // stream or surface a raw SyntaxError to the user.
+      let event;
+      try {
+        event = JSON.parse(trimmed);
+      } catch (_) {
+        return;
+      }
       eventCount += 1;
       if (isTerminalEvent(event)) sawTerminal = true;
       onEvent(event);
