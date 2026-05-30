@@ -44,6 +44,7 @@ import { takeStepResult } from '../tools/step-result-tool.js';
 import { configureHarnessRuntime } from '../runtime/harness/codex-client.js';
 import { closePlanScope, openPlanScope } from '../agents/plan-scope.js';
 import { missingWorkflowRunInputs, normalizeWorkflowRunInputs } from './workflow-inputs.js';
+import { verifyStepOutput } from './step-output-verify.js';
 
 const logger = pino({ name: 'clementine-next.workflow-runner' });
 
@@ -1103,6 +1104,40 @@ function bindStepContext(
   return { values: bound.values, upstream: bound.upstream, item };
 }
 
+/**
+ * P4 typed-contract EXIT half (flag WORKFLOW_CONTRACT_OUTPUT, default off).
+ * Run executeStep, then — when the step declared an `output` contract —
+ * verify the emitted value actually matches it (type / required_keys /
+ * verify.path_exists / verify.url_present). A contract failure is a real
+ * failure: emit step_failed + throw so the run reports back loudly instead
+ * of feeding malformed or fabricated data downstream (the revill
+ * "claimed success, no URL" class). Flag-off → no verification, today's path.
+ */
+function contractOutputEnabled(): boolean {
+  return (getRuntimeEnv('WORKFLOW_CONTRACT_OUTPUT', 'off') ?? 'off').toLowerCase() === 'on';
+}
+
+async function executeStepVerified(
+  step: WorkflowStepInput,
+  ctx: StepExecutionContext,
+): Promise<unknown> {
+  const output = await executeStep(step, ctx);
+  if (contractOutputEnabled() && step.output) {
+    const result = verifyStepOutput(step.output, output);
+    if (!result.ok) {
+      const message = `Step "${step.id}" output failed its contract: ${result.problems.join('; ')}`;
+      appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
+        kind: 'step_failed',
+        stepId: step.id,
+        error: message,
+        meta: { reason: 'output_contract', problems: result.problems },
+      });
+      throw new Error(message);
+    }
+  }
+  return output;
+}
+
 async function executeStep(
   step: WorkflowStepInput,
   ctx: StepExecutionContext,
@@ -1404,7 +1439,7 @@ async function executeWorkflow(
         total: 1,
       });
       const completedItems = resume.completedItems.get(step.id) ?? new Map();
-      const output = await executeStep(step, {
+      const output = await executeStepVerified(step, {
         workflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems, forEachFailures,
       });
       throwIfWorkflowRunCancelled(runId);
@@ -1425,7 +1460,7 @@ async function executeWorkflow(
       const settled = await Promise.allSettled(batch.map(async (step) => {
         throwIfWorkflowRunCancelled(runId);
         const completedItems = resume.completedItems.get(step.id) ?? new Map();
-        const output = await executeStep(step, {
+        const output = await executeStepVerified(step, {
           workflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems, forEachFailures,
         });
         return { step, output };
