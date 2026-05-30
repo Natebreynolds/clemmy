@@ -1709,6 +1709,12 @@ export function reapResolvedParkedRuns(): void {
     if (!run || run.status !== 'parked' || !run.parked) continue;
     const watched = run.parked.parkedSteps.flatMap((s) => s.approvalIds);
     if (watched.some((id) => pendingIds.has(id))) continue; // still waiting on a human
+    // The run is about to resume, so it is no longer "parked on approval".
+    // Clear the in-memory heartbeat-suppression flag here so an in-process
+    // resume (approval resolved without a daemon restart) doesn't inherit a
+    // stale flag that silences the resumed run's heartbeats. Covers every
+    // park path (declarative gate throws before its own finally can clear).
+    clearWorkflowRunPausedForApproval(run.id);
     writeRunRecord(filePath, { ...run, status: 'running' });
     logger.info(
       { workflow: run.workflow, runId: run.id, parkedSteps: run.parked.parkedSteps.map((s) => s.stepId) },
