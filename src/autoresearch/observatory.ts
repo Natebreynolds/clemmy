@@ -119,6 +119,24 @@ interface BrainHealth {
   };
 }
 
+/**
+ * P2 measured-learning-loop snapshot. Computed from the synthetic
+ * `tool_choice` events emitted by tool-choice-store. The headline is the
+ * recall HIT-RATE: the share of recalls that found a remembered tool
+ * (exact or fuzzy) instead of missing and forcing rediscovery. A rising
+ * hit-rate week-over-week is the concrete proof of the north-star claim
+ * that Clem "gets measurably better at your work."
+ */
+interface ToolChoiceHealth {
+  recalls: number;
+  hits: number;        // exact
+  fuzzyHits: number;
+  misses: number;
+  hitRatePct: number;  // (hits + fuzzyHits) / recalls
+  remembers: number;
+  invalidations: number;
+}
+
 export interface ObservatoryReport {
   generatedAt: string;
   windowStart: string;
@@ -129,6 +147,7 @@ export interface ObservatoryReport {
   totalToolCalls: number;
   suggestions: string[];
   brainHealth?: BrainHealth;
+  toolChoiceHealth?: ToolChoiceHealth;
 }
 
 function loadJsonl(filePath: string, maxLines = 20_000): unknown[] {
@@ -405,6 +424,36 @@ function computeBrainHealth(events: ToolEvent[]): BrainHealth | undefined {
   };
 }
 
+/**
+ * Parse the synthetic `tool_choice` events into a recall hit-rate
+ * snapshot. Mirrors computeBrainHealth's "synthetic toolName + parse
+ * argsSummary" pattern. Returns undefined when no tool-choice activity
+ * happened in the window (keeps the report clean).
+ */
+function computeToolChoiceHealth(events: ToolEvent[]): ToolChoiceHealth | undefined {
+  let hits = 0, fuzzyHits = 0, misses = 0, remembers = 0, invalidations = 0;
+  for (const e of events) {
+    if (e.toolName !== 'tool_choice' || e.phase !== 'end') continue;
+    const summary = e.argsSummary ?? '';
+    if (summary.includes('action=recall_hit_fuzzy')) fuzzyHits += 1;
+    else if (summary.includes('action=recall_hit')) hits += 1;
+    else if (summary.includes('action=recall_miss')) misses += 1;
+    else if (summary.includes('action=remember')) remembers += 1;
+    else if (summary.includes('action=invalidate')) invalidations += 1;
+  }
+  const recalls = hits + fuzzyHits + misses;
+  if (recalls === 0 && remembers === 0 && invalidations === 0) return undefined;
+  return {
+    recalls,
+    hits,
+    fuzzyHits,
+    misses,
+    hitRatePct: recalls > 0 ? Math.round(((hits + fuzzyHits) / recalls) * 100) : 0,
+    remembers,
+    invalidations,
+  };
+}
+
 export function buildReport(opts: ReportInput = {}): ObservatoryReport {
   const hoursBack = opts.hoursBack ?? 24;
   const now = opts.date ?? new Date();
@@ -427,6 +476,7 @@ export function buildReport(opts: ReportInput = {}): ObservatoryReport {
     totalToolCalls: toolHealth.reduce((sum, h) => sum + h.calls, 0),
     suggestions: generateSuggestions(toolHealth),
     brainHealth: computeBrainHealth(events),
+    toolChoiceHealth: computeToolChoiceHealth(events),
   };
 }
 
@@ -492,6 +542,18 @@ export function renderReportMarkdown(report: ObservatoryReport): string {
       lines.push('');
     }
     lines.push(`**Fact depth** · ${bh.factDepth.atomic} atomic · ${bh.factDepth.depthOne} pattern (depth 1) · ${bh.factDepth.depthTwo} meta-pattern (depth 2)`);
+    lines.push('');
+  }
+
+  if (report.toolChoiceHealth) {
+    const tc = report.toolChoiceHealth;
+    lines.push('## Tool-choice learning (last 24h)');
+    lines.push('');
+    lines.push(`**Recall hit-rate: ${tc.hitRatePct}%** (${tc.hits + tc.fuzzyHits}/${tc.recalls} recalls found a remembered tool${tc.fuzzyHits > 0 ? `, ${tc.fuzzyHits} via fuzzy match` : ''})`);
+    lines.push('');
+    lines.push(`${tc.remembers} new choice${tc.remembers === 1 ? '' : 's'} saved · ${tc.invalidations} invalidated · ${tc.misses} miss${tc.misses === 1 ? '' : 'es'} (forced rediscovery)`);
+    lines.push('');
+    lines.push('_A rising hit-rate week-over-week means Clem is reusing proven tools instead of re-searching — the measured "gets better at your work" signal._');
     lines.push('');
   }
 

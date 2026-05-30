@@ -3,6 +3,7 @@ import path from 'node:path';
 import matter from 'gray-matter';
 import { BASE_DIR } from '../config.js';
 import { getMachineId } from '../runtime/machine-id.js';
+import { recordToolEvent } from '../agents/tool-observability.js';
 
 /**
  * Tool-choice memory store.
@@ -217,15 +218,18 @@ export function recallToolChoice(intent: string): ToolChoiceRecord | null {
 
   const exactPath = path.join(machineDir(), `${slug}.md`);
   const exact = parseRecord(exactPath);
-  if (exact) return exact;
+  if (exact) {
+    emitToolChoiceEvent('recall_hit', intent, exact.choice?.identifier);
+    return exact;
+  }
 
   // Fuzzy fallback
   const dir = machineDir();
-  if (!existsSync(dir)) return null;
+  if (!existsSync(dir)) { emitToolChoiceEvent('recall_miss', intent); return null; }
   const slugs = readdirSync(dir)
     .filter((f) => f.endsWith('.md'))
     .map((f) => f.slice(0, -3));
-  if (slugs.length === 0) return null;
+  if (slugs.length === 0) { emitToolChoiceEvent('recall_miss', intent); return null; }
 
   const queryTokens = tokenize(slug);
   const scored = slugs.map((existing) => ({
@@ -235,9 +239,11 @@ export function recallToolChoice(intent: string): ToolChoiceRecord | null {
 
   const best = scored[0];
   const runnerUp = scored[1];
-  if (!best || best.score < 0.5) return null;
-  if (runnerUp && runnerUp.score >= best.score) return null;
-  return parseRecord(path.join(dir, `${best.slug}.md`));
+  if (!best || best.score < 0.5) { emitToolChoiceEvent('recall_miss', intent); return null; }
+  if (runnerUp && runnerUp.score >= best.score) { emitToolChoiceEvent('recall_miss', intent); return null; }
+  const fuzzy = parseRecord(path.join(dir, `${best.slug}.md`));
+  emitToolChoiceEvent(fuzzy ? 'recall_hit_fuzzy' : 'recall_miss', intent, fuzzy?.choice?.identifier);
+  return fuzzy;
 }
 
 function tokenize(slug: string): Set<string> {
@@ -276,13 +282,15 @@ export function rememberToolChoice(input: RememberToolChoiceInput): ToolChoiceRe
     testedAt: input.choice.testedAt ?? now,
     testEvidence: input.choice.testEvidence,
   };
-  return writeRecord({
+  const saved = writeRecord({
     intent: input.intent,
     description: input.description ?? existing?.description,
     choice,
     fallbacks: merged,
     body: input.body ?? existing?.body ?? defaultBodyFor(input.intent, input.description ?? existing?.description),
   });
+  emitToolChoiceEvent('remember', input.intent, choice.identifier);
+  return saved;
 }
 
 function mergeFallbacks(
@@ -329,7 +337,8 @@ export function invalidateToolChoice(intent: string, reason: string): ToolChoice
         } as ToolChoiceRecordFallback,
       ]
     : existing.fallbacks;
-  return writeRecord({
+  const invalidatedIdentifier = existing.choice?.identifier;
+  const updated = writeRecord({
     intent: existing.intent,
     description: existing.description,
     choice: null,
@@ -337,6 +346,8 @@ export function invalidateToolChoice(intent: string, reason: string): ToolChoice
     body: existing.body,
     filePath: existing.filePath,
   });
+  emitToolChoiceEvent('invalidate', intent, invalidatedIdentifier);
+  return updated;
 }
 
 /** List all recorded tool choices on this machine. Test/debug helper. */
@@ -350,4 +361,76 @@ export function listToolChoices(): ToolChoiceRecord[] {
     if (rec) out.push(rec);
   }
   return out;
+}
+
+// ─────────────────────────────────────────────────────────────────
+// P2 — measured learning loop
+// ─────────────────────────────────────────────────────────────────
+
+/**
+ * Emit a synthetic `tool_choice` telemetry event so the observatory can
+ * compute a recall hit-rate over time (proving the north-star claim that
+ * Clem "gets measurably better at your work"). Mirrors the `reflection`
+ * synthetic-event pattern (observatory computeBrainHealth): toolName is a
+ * stable label, the action + intent live in argsSummary for the reader to
+ * parse. Always-on + best-effort: it's the measurement, and it must never
+ * perturb a recall/remember path. The CONTEXT INJECTION (behavior change)
+ * is what's flag-gated, not this measurement.
+ */
+type ToolChoiceAction = 'recall_hit' | 'recall_hit_fuzzy' | 'recall_miss' | 'remember' | 'invalidate';
+function emitToolChoiceEvent(action: ToolChoiceAction, intent: string, identifier?: string): void {
+  try {
+    recordToolEvent({
+      at: new Date().toISOString(),
+      toolName: 'tool_choice',
+      kind: 'read',
+      phase: 'end',
+      outcome: action === 'recall_miss' ? 'cancelled' : 'success',
+      argsSummary: `action=${action} intent=${slugifyIntent(intent)}${identifier ? ` id=${identifier}` : ''}`,
+    });
+  } catch {
+    /* telemetry is best-effort — never break a tool-choice operation */
+  }
+}
+
+/**
+ * P2 flag: inject remembered tool choices into the persistent context
+ * block so the agent recalls a proven tool by READING, not only by
+ * calling tool_choice_recall (which the prompt teaches but cannot
+ * guarantee). Default OFF → context is byte-identical to today.
+ */
+function contextInjectEnabled(): boolean {
+  return (process.env.TOOL_CHOICE_CONTEXT_INJECT ?? 'off').toLowerCase() === 'on';
+}
+
+/**
+ * Render the most-relevant remembered tool choices as a compact context
+ * block. Active choices only (an invalidated, not-yet-rediscovered choice
+ * is noise here), most-recently-tested first, capped at `limit`. Returns
+ * '' when the flag is off or nothing is remembered → no context change.
+ *
+ * Token-efficiency (north star): one tight line per choice, hard cap.
+ */
+export function renderToolChoicesForContext(limit = 12): string {
+  if (!contextInjectEnabled()) return '';
+  let records: ToolChoiceRecord[];
+  try {
+    records = listToolChoices();
+  } catch {
+    return '';
+  }
+  const active = records
+    .filter((r) => r.choice)
+    .sort((a, b) => (b.choice!.testedAt ?? '').localeCompare(a.choice!.testedAt ?? ''))
+    .slice(0, limit);
+  if (active.length === 0) return '';
+  const lines = active.map((r) => {
+    const c = r.choice!;
+    const how = c.invocationTemplate ? ` → \`${c.invocationTemplate}\`` : '';
+    return `- ${r.intent}: ${c.kind}:${c.identifier}${how}`;
+  });
+  return [
+    'These tools previously worked for these intents on this machine. Prefer them directly — skip rediscovery (composio_search_tools / local_cli_list). If one fails, call tool_choice_invalidate and rediscover.',
+    ...lines,
+  ].join('\n');
 }

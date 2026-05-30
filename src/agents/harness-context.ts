@@ -32,6 +32,7 @@ import { loadMemoryContext } from '../memory/vault.js';
 import { renderFactsForInstructions, renderRecentlyLearnedForInstructions } from '../memory/facts.js';
 import { getActiveObjective, getFocusSnapshot } from '../memory/focus.js';
 import { renderSkillsIndex } from '../memory/skill-store.js';
+import { renderToolChoicesForContext } from '../memory/tool-choice-store.js';
 import { loadUserProfile, renderProfileForInstructions } from '../runtime/user-profile.js';
 
 const GOALS_DIR = path.join(BASE_DIR, 'goals');
@@ -155,6 +156,18 @@ export function renderHarnessMemoryContext(): string {
     recentlyLearned = '';
   }
 
+  // P2 (measured learning loop): inject remembered tool choices so the
+  // agent recalls a proven tool by READING the context, not only by
+  // calling tool_choice_recall. Flag-gated (TOOL_CHOICE_CONTEXT_INJECT,
+  // default off) — returns '' when off, so context is unchanged.
+  // [[project_measured_learning_loop]].
+  let toolChoices = '';
+  try {
+    toolChoices = renderToolChoicesForContext(12);
+  } catch {
+    toolChoices = '';
+  }
+
   let profile = '';
   try {
     profile = renderProfileForInstructions();
@@ -219,6 +232,7 @@ export function renderHarnessMemoryContext(): string {
     section('User Preferences', profile),
     section('Persistent Facts', facts),
     section('Recently Learned (last 24h)', recentlyLearned),
+    section('Remembered Tool Choices', toolChoices),
     section('Working Memory', memContext.workingMemory),
     section('Identity', memContext.identity),
     section('Core Personality', memContext.soul),
