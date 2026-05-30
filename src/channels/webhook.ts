@@ -64,6 +64,17 @@ import { computeAvailability, KNOWN_SERVICES, loadToolPreferences, saveToolPrefe
 import { discoverMcpServers } from '../runtime/mcp-config.js';
 import { ClementineGateway } from '../gateway/router.js';
 import { addRunEvent, finishRun, getRun, listRuns, startRun } from '../runtime/run-events.js';
+import {
+  friendlyEventMessage,
+  friendlyKindLabel,
+  friendlyStatusLabel,
+  friendlyTimeline,
+  isLive,
+  liveLine,
+  runFilterCategory,
+  runPreview,
+  type ActivityRunLike,
+} from '../runtime/activity-format.js';
 import { readMemoryIndexStatus, rebuildVaultIndex } from '../memory/indexer.js';
 import { embedMissingChunks } from '../memory/embeddings.js';
 import { CRON_FILE } from '../memory/vault.js';
@@ -102,32 +113,10 @@ function harnessSource(session: HarnessSessionRow) {
   return isDiscordHarnessSession(session) ? 'discord' : 'daemon';
 }
 
+// Friendly per-event phrasing lives in the shared activity-format module so it
+// cannot drift between the desktop console, mobile-web, and Discord surfaces.
 function harnessEventMessage(event: HarnessEventRow): string {
-  const data = event.data ?? {};
-  switch (event.type) {
-    case 'tool_called':
-      return `Tool started: ${String(data.tool || data.name || 'unknown')}`;
-    case 'tool_returned':
-      return `Tool returned: ${String(data.tool || data.name || 'unknown')}`;
-    case 'approval_requested':
-      return `Approval requested: ${String(data.subject || data.tool || 'tool call')}`;
-    case 'approval_resolved':
-      return `Approval ${String(data.decision || data.resolution || 'resolved')}`;
-    case 'conversation_completed':
-      return String(data.summary || data.reply || 'Conversation completed');
-    case 'run_completed':
-      return 'Run completed';
-    case 'run_failed':
-      return String(data.error || 'Run failed');
-    case 'guardrail_tripped':
-      return 'Internal safety check completed';
-    case 'turn_started':
-      return 'Turn started';
-    case 'turn_ended':
-      return 'Turn ended';
-    default:
-      return event.type;
-  }
+  return friendlyEventMessage({ type: event.type, data: event.data });
 }
 
 function normalizeHostHeader(value: unknown): string {
@@ -213,6 +202,40 @@ function harnessSessionAsActivityRun(session: HarnessSessionRow) {
       createdAt: event.createdAt,
       data: event.data,
     })),
+  };
+}
+
+/**
+ * Decorate an activity run (legacy run-store record OR harness-session-derived
+ * run) with the user-facing fields the Activity inbox renders. Additive only —
+ * every original field is preserved, so older clients keep working.
+ */
+function enrichActivityRun<T extends ActivityRunLike>(run: T) {
+  return {
+    ...run,
+    kindLabel: friendlyKindLabel(run),
+    statusLabel: friendlyStatusLabel(run.status),
+    category: runFilterCategory(run),
+    live: isLive(run.status),
+    liveLine: liveLine(run),
+    preview: runPreview(run),
+  };
+}
+
+/**
+ * Detail variant — adds the clean milestone `timeline` and a `summary` block
+ * (ask / result / error) for the reading pane, on top of the inbox fields. The
+ * raw `events` array is preserved untouched for the "Technical details" toggle.
+ */
+function enrichActivityRunDetail<T extends ActivityRunLike>(run: T) {
+  return {
+    ...enrichActivityRun(run),
+    timeline: friendlyTimeline(run.events),
+    summary: {
+      ask: String(run.input || run.objective || run.title || '').trim(),
+      result: run.outputPreview ?? '',
+      error: run.error ?? '',
+    },
   };
 }
 
@@ -1534,7 +1557,8 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
         String(right.updatedAt || right.completedAt || right.createdAt || '')
           .localeCompare(String(left.updatedAt || left.completedAt || left.createdAt || '')),
       )
-      .slice(0, resolvedLimit);
+      .slice(0, resolvedLimit)
+      .map(enrichActivityRun);
     res.json({ runs });
   });
 
@@ -1543,7 +1567,7 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
     // Legacy run-store lookup first (run-xxx IDs).
     const run = getRun(id);
     if (run) {
-      res.json({ run });
+      res.json({ run: enrichActivityRunDetail(run) });
       return;
     }
     // Fallback A — harness session (sess-xxx IDs).
@@ -1553,24 +1577,29 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
         if (session) {
           const events = harnessListEvents(id, { limit: 500, desc: true }) ?? [];
           const status = effectiveHarnessStatus(session, events);
-          res.json({ run: {
+          res.json({ run: enrichActivityRunDetail({
             id,
             sessionId: id,
-            kind: (session as { kind?: unknown }).kind ?? 'harness',
-            channel: (session as { channel?: unknown }).channel ?? '—',
-            source: 'harness',
-            title: (session as { title?: unknown }).title ?? '(Clementine session)',
+            kind: ((session as { kind?: unknown }).kind ?? 'harness') as string,
+            channel: ((session as { channel?: unknown }).channel ?? undefined) as string | undefined,
+            source: harnessSource(session),
+            title: ((session as { title?: unknown }).title ?? '(Clementine session)') as string,
+            objective: ((session as { objective?: unknown }).objective ?? undefined) as string | undefined,
+            metadata: (session as { metadata?: Record<string, unknown> }).metadata,
             status,
-            createdAt: (session as { createdAt?: unknown }).createdAt,
-            updatedAt: (session as { updatedAt?: unknown }).updatedAt,
-            completedAt: status === 'completed' ? (session as { updatedAt?: unknown }).updatedAt : undefined,
+            createdAt: (session as { createdAt?: unknown }).createdAt as string | undefined,
+            updatedAt: (session as { updatedAt?: unknown }).updatedAt as string | undefined,
+            completedAt: status === 'completed' ? (session as { updatedAt?: unknown }).updatedAt as string | undefined : undefined,
+            // Keep `data` so the clean timeline can name tools/steps; `message`
+            // is the pre-rendered friendly line for the raw view.
             events: events.map((ev) => ({
-              id: (ev as { id?: unknown }).id,
-              type: (ev as { type?: unknown }).type,
-              createdAt: (ev as { createdAt?: unknown }).createdAt,
+              id: (ev as { id?: unknown }).id as string | undefined,
+              type: (ev as { type?: unknown }).type as string | undefined,
+              createdAt: (ev as { createdAt?: unknown }).createdAt as string | undefined,
+              data: (ev as { data?: Record<string, unknown> }).data,
               message: harnessEventMessage(ev),
             })),
-          } });
+          }) });
           return;
         }
       }
@@ -1578,7 +1607,7 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
       const runPath = path.join(WORKFLOW_RUNS_DIR, `${id}.json`);
       if (existsSync(runPath)) {
         const wfRun = JSON.parse(readFileSync(runPath, 'utf-8')) as Record<string, unknown>;
-        res.json({ run: {
+        res.json({ run: enrichActivityRunDetail({
           id,
           sessionId: id,
           kind: 'workflow',
@@ -1590,8 +1619,9 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
           createdAt: wfRun.createdAt as string | undefined,
           updatedAt: (wfRun.finishedAt as string | undefined) ?? (wfRun.startedAt as string | undefined),
           outputPreview: typeof wfRun.output === 'string' ? wfRun.output.slice(0, 2000) : '',
+          error: typeof wfRun.error === 'string' ? wfRun.error : undefined,
           events: [],
-        } });
+        }) });
         return;
       }
     } catch (err) {
