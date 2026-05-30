@@ -225,11 +225,19 @@ function countWrongPickHints(events: ToolEvent[], targetTool: string): number {
   return hints;
 }
 
+// Synthetic telemetry channels emitted as fake tool events (they have a
+// dedicated report section, not a real tool). Excluded from the tool-health
+// table + totalToolCalls so they don't appear as phantom "tools" or inflate
+// counts. tool_choice → computeToolChoiceHealth; reflection/recursive_reflection
+// → computeBrainHealth.
+const SYNTHETIC_TOOL_EVENTS = new Set(['tool_choice', 'reflection', 'recursive_reflection']);
+
 function computeToolHealth(events: ToolEvent[]): ToolHealth[] {
   // Group by toolName, only consider start-phase events for total count,
   // pair with end-phase events for outcome.
   const byTool = new Map<string, { calls: ToolEvent[]; endsByCallTime: Map<string, ToolEvent> }>();
   for (const e of events) {
+    if (SYNTHETIC_TOOL_EVENTS.has(e.toolName)) continue;
     const bucket = byTool.get(e.toolName) ?? { calls: [], endsByCallTime: new Map<string, ToolEvent>() };
     if (e.phase === 'start' || e.phase === undefined) bucket.calls.push(e);
     if (e.phase === 'end' || e.phase === 'error') bucket.endsByCallTime.set(e.at ?? '', e);

@@ -53,6 +53,10 @@ test('observatory computes tool-choice recall hit-rate from synthetic events', (
   const md = renderReportMarkdown(report);
   assert.ok(md.includes('Tool-choice learning'), 'section rendered');
   assert.ok(md.includes('Recall hit-rate: 67%'), 'hit-rate rendered');
+  // The synthetic tool_choice events must NOT appear as a phantom row in the
+  // tool-health table, and must not inflate totalToolCalls.
+  assert.ok(!report.toolHealth.some((h) => h.toolName === 'tool_choice'), 'tool_choice excluded from tool-health');
+  assert.equal(report.totalToolCalls, 0, 'synthetic events do not inflate total tool calls');
 });
 
 test('observatory omits tool-choice section when there is no tool-choice activity', () => {

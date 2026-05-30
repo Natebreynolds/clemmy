@@ -1580,13 +1580,23 @@ async function executeWorkflow(
         }
       }
       throwIfWorkflowRunCancelled(runId);
-      // A genuine error fails the run even if a sibling parked. Otherwise,
-      // if any sibling parked, park the whole run: completed siblings are
-      // already durable in events.jsonl, so resume re-runs only the parked
-      // and not-yet-started steps.
+      // A genuine error fails the run even if a sibling parked. Before failing,
+      // CLEAN UP any sibling that parked: its approval row + heartbeat flag were
+      // registered, and the run is about to go terminal (error). Cancel those
+      // pending approvals (else the user sees an approval card for a dead run the
+      // reaper can never re-admit) and clear the heartbeat flag.
       if (errors.length > 0) {
+        if (parkedSteps.length > 0) {
+          for (const id of parkedSteps.flatMap((s) => s.approvalIds)) {
+            try { approvalRegistry.resolve(id, 'cancelled_by_user', 'batch-sibling-failed'); } catch { /* best-effort */ }
+          }
+          clearWorkflowRunPausedForApproval(runId);
+        }
         throw new Error(errors.length === 1 ? errors[0] : `Workflow batch failed: ${errors.join('; ')}`);
       }
+      // No genuine error. If any sibling parked, park the whole run: completed
+      // siblings are already durable in events.jsonl, so resume re-runs only the
+      // parked and not-yet-started steps.
       if (parkedSteps.length > 0) {
         throw new ParkRunSignal(parkedSteps);
       }
