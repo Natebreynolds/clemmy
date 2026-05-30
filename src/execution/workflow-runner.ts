@@ -1223,11 +1223,32 @@ async function executeStepVerified(
     },
     afterBackoff: () => throwIfWorkflowRunCancelled(ctx.runId),
   });
+  return output;
+}
+
+/**
+ * Single chokepoint for "this step finished with this output". Verifies the
+ * output against its declared contract BEFORE recording step_completed, then
+ * emits step_completed. Verifying first guarantees a contract-rejected output
+ * is NEVER written as a completed step — otherwise computeResumeState (and any
+ * re-queue) would treat the bad value as a valid done step and feed it
+ * downstream. On contract failure: emit step_failed + throw (a deterministic
+ * error, so the retry wrapper won't re-run it). Flag-off / no contract → a
+ * straight step_completed emit, byte-identical to before. Every step shape
+ * (deterministic / forEach / plain / synthesis) routes through this.
+ */
+function finalizeStepOutput(
+  workflowSlug: string,
+  runId: string,
+  step: WorkflowStepInput,
+  output: unknown,
+  meta?: Record<string, unknown>,
+): unknown {
   if (contractOutputEnabled() && step.output) {
     const result = verifyStepOutput(step.output, output);
     if (!result.ok) {
       const message = `Step "${step.id}" output failed its contract: ${result.problems.join('; ')}`;
-      appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
+      appendWorkflowEvent(workflowSlug, runId, {
         kind: 'step_failed',
         stepId: step.id,
         error: message,
@@ -1236,6 +1257,12 @@ async function executeStepVerified(
       throw new Error(message);
     }
   }
+  appendWorkflowEvent(workflowSlug, runId, {
+    kind: 'step_completed',
+    stepId: step.id,
+    output,
+    ...(meta ? { meta } : {}),
+  });
   return output;
 }
 
@@ -1375,13 +1402,9 @@ async function executeStep(
       const key = itemKey(items[i], i);
       ctx.forEachFailures.push({ stepId: step.id, itemKey: key, error: r.error });
     }
-    appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
-      kind: 'step_completed',
-      stepId: step.id,
-      output: aggregate,
-      meta: { mode: 'forEach', completed: successes.length, failed },
+    return finalizeStepOutput(ctx.workflowSlug, ctx.runId, step, aggregate, {
+      mode: 'forEach', completed: successes.length, failed,
     });
-    return aggregate;
   }
 
   // 3. Plain LLM step. Two paths:
@@ -1436,12 +1459,7 @@ async function executeStep(
     });
     output = response.text;
   }
-  appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
-    kind: 'step_completed',
-    stepId: step.id,
-    output,
-  });
-  return output;
+  return finalizeStepOutput(ctx.workflowSlug, ctx.runId, step, output);
 }
 
 export function planWorkflowExecutionBatches(
@@ -1655,11 +1673,7 @@ async function executeWorkflow(
         : '';
     finalOutput = synthesisText || formatStepOutputs(workflow.steps, stepOutputs);
     throwIfWorkflowRunCancelled(runId);
-    appendWorkflowEvent(workflowSlug, runId, {
-      kind: 'step_completed',
-      stepId: '__synthesis__',
-      output: finalOutput,
-    });
+    finalizeStepOutput(workflowSlug, runId, synthesisStep, finalOutput);
   } else {
     finalOutput = formatStepOutputs(workflow.steps, stepOutputs);
   }
