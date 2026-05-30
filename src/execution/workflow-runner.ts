@@ -204,6 +204,32 @@ interface QueuedRunRecord {
   needsAttention?: boolean;
   blockedSteps?: Array<{ stepId: string; reason: string }>;
   proposedFixId?: string | null;
+  /**
+   * P0 event-driven approval parking (flag WORKFLOW_APPROVAL_PARKING).
+   * When a step pauses on a human approval, the runner records the
+   * resume coordinates here, sets status='parked', and RETURNS — freeing
+   * the bounded-pool slot instead of holding it through the (up-to-24h)
+   * approval wait. `reapResolvedParkedRuns` flips status back to
+   * 'running' once every watched approval clears; the next drain pass
+   * resumes from the parked step (no completed step re-runs — resume is
+   * driven by events.jsonl / computeResumeState).
+   */
+  parked?: ParkedRunState;
+}
+
+interface ParkedStepRef {
+  stepId: string;
+  /** 'gate' = declarative requiresApproval gate; 'sdk' = per-tool SDK interrupt. */
+  kind: 'gate' | 'sdk';
+  /** Approval rows this parked step waits on (watched by the reaper scan). */
+  approvalIds: string[];
+  /** SDK-interrupt sessions key by the deterministic harness session id. */
+  sessionId?: string;
+}
+
+interface ParkedRunState {
+  parkedSteps: ParkedStepRef[];
+  parkedAt: string;
 }
 
 function readRunRecord(filePath: string): QueuedRunRecord | null {
@@ -220,6 +246,32 @@ class WorkflowRunCancelledError extends Error {
     super('Workflow run cancelled by user.');
     this.name = 'WorkflowRunCancelledError';
   }
+}
+
+/**
+ * Thrown when a step pauses on a human approval and parking is enabled.
+ * Unwinds cleanly up to `processOneRunFile`, which checkpoints the run as
+ * 'parked' and returns (releasing the bounded-pool slot) instead of
+ * treating it as a failure. Carries the resume coordinates the reaper
+ * scan needs to know which approvals to watch.
+ */
+class ParkRunSignal extends Error {
+  readonly parkedSteps: ParkedStepRef[];
+  constructor(parkedSteps: ParkedStepRef[]) {
+    super('Workflow run parked on approval.');
+    this.name = 'ParkRunSignal';
+    this.parkedSteps = parkedSteps;
+  }
+}
+
+/**
+ * P0 flag: event-driven approval parking. Default OFF → the in-place
+ * poll loop (today's exact behavior) holds the worker until the approval
+ * resolves. ON → a parked step releases its slot and is resumed by the
+ * reaper scan once the approval clears.
+ */
+function parkingEnabled(): boolean {
+  return (getRuntimeEnv('WORKFLOW_APPROVAL_PARKING', 'off') ?? 'off').toLowerCase() === 'on';
 }
 
 function isWorkflowRunCancelled(runId: string): boolean {
@@ -714,6 +766,11 @@ async function runStepViaHarness(
   allowedTools: string[],
   workflowRunId: string,
   stepContext?: { values: Record<string, unknown>; upstream: Record<string, unknown>; item?: unknown },
+  // P0 parking: true only at call sites where a thrown ParkRunSignal can
+  // unwind to processOneRunFile (plain step + synthesis). forEach items
+  // run inside a per-item try/catch that would swallow the signal as an
+  // item failure, so those pass false and keep the in-place poll.
+  canPark = false,
 ): Promise<HarnessStepResult> {
   // T-WF-1 — configure the codex OAuth bridge BEFORE the SDK runner
   // touches the model. Discord + chat-dock paths do this at every
@@ -835,17 +892,30 @@ async function runStepViaHarness(
         }
       }
 
-      // Poll for resolution. The reaper might expire stale rows; the
-      // user might approve/reject; or all pending rows might clear via
-      // a /cancel command. Loop until the session has no more pending.
-      while (true) {
-        await new Promise((resolve) => setTimeout(resolve, WORKFLOW_HARNESS_POLL_MS));
-        const stillPending = approvalRegistry.listPending({ sessionId: realSessionId, status: 'pending' });
-        if (stillPending.length === 0) break;
-        if (Date.now() - startedAt > WORKFLOW_HARNESS_APPROVAL_MAX_WAIT_MS) {
-          throw new Error(
-            `workflow step "${step.id}" exceeded approval wait budget (${WORKFLOW_HARNESS_APPROVAL_MAX_WAIT_MS}ms)`,
-          );
+      // P0 parking (flag on + parkable call site): if approvals are still
+      // pending, release the slot instead of polling — unwind via
+      // ParkRunSignal; `reapResolvedParkedRuns` resumes this run once they
+      // clear. On re-entry after resume the pending set is empty, so we
+      // skip the poll and fall through to the decision + resume below.
+      // Flag-off (or a non-parkable forEach item) keeps the in-place poll
+      // byte-identical to today.
+      const stillPendingNow = approvalRegistry.listPending({ sessionId: realSessionId, status: 'pending' });
+      if (parkingEnabled() && canPark && stillPendingNow.length > 0) {
+        throw new ParkRunSignal([{ stepId: step.id, kind: 'sdk', approvalIds: [...approvalIds], sessionId: realSessionId }]);
+      }
+      if (stillPendingNow.length > 0) {
+        // Poll for resolution. The reaper might expire stale rows; the
+        // user might approve/reject; or all pending rows might clear via
+        // a /cancel command. Loop until the session has no more pending.
+        while (true) {
+          await new Promise((resolve) => setTimeout(resolve, WORKFLOW_HARNESS_POLL_MS));
+          const stillPending = approvalRegistry.listPending({ sessionId: realSessionId, status: 'pending' });
+          if (stillPending.length === 0) break;
+          if (Date.now() - startedAt > WORKFLOW_HARNESS_APPROVAL_MAX_WAIT_MS) {
+            throw new Error(
+              `workflow step "${step.id}" exceeded approval wait budget (${WORKFLOW_HARNESS_APPROVAL_MAX_WAIT_MS}ms)`,
+            );
+          }
         }
       }
 
@@ -971,6 +1041,17 @@ async function awaitDeclarativeStepApproval(
         metadata: { approvalId: row.approvalId, workflowName: ctx.workflow.name, stepId: step.id, gate: true },
       });
     } catch { /* notification best-effort; apr id is in the dashboard */ }
+  }
+
+  // P0 parking (flag on): the gate is registered + the user notified, so
+  // there is nothing left to do but wait on a human. Release the slot —
+  // unwind via ParkRunSignal; `reapResolvedParkedRuns` resumes this run
+  // once the approval clears, and the `prior` check at the top of this
+  // function honors the resolution on re-entry. Flag-off keeps the
+  // in-place poll below byte-identical to today.
+  if (parkingEnabled()) {
+    markWorkflowRunPausedForApproval(ctx.runId);
+    throw new ParkRunSignal([{ stepId: step.id, kind: 'gate', approvalIds: [row.approvalId] }]);
   }
 
   markWorkflowRunPausedForApproval(ctx.runId);
@@ -1192,6 +1273,7 @@ async function executeStep(
         workflowAutoApprovalTools(ctx.workflow, step),
         ctx.runId,
         stepContext,
+        true, // canPark: plain step unwinds cleanly to processOneRunFile
       );
       output = result.output;
       if (result.hadApprovals) {
@@ -1350,17 +1432,27 @@ async function executeWorkflow(
       }));
 
       const errors: string[] = [];
+      const parkedSteps: ParkedStepRef[] = [];
       for (const result of settled) {
         if (result.status === 'fulfilled') {
           stepOutputs[result.value.step.id] = result.value.output;
           completedStepIds.add(result.value.step.id);
+        } else if (result.reason instanceof ParkRunSignal) {
+          parkedSteps.push(...result.reason.parkedSteps);
         } else {
           errors.push(result.reason instanceof Error ? result.reason.message : String(result.reason));
         }
       }
       throwIfWorkflowRunCancelled(runId);
+      // A genuine error fails the run even if a sibling parked. Otherwise,
+      // if any sibling parked, park the whole run: completed siblings are
+      // already durable in events.jsonl, so resume re-runs only the parked
+      // and not-yet-started steps.
       if (errors.length > 0) {
         throw new Error(errors.length === 1 ? errors[0] : `Workflow batch failed: ${errors.join('; ')}`);
+      }
+      if (parkedSteps.length > 0) {
+        throw new ParkRunSignal(parkedSteps);
       }
       completedStepIds = new Set(Object.keys(stepOutputs));
     }
@@ -1404,6 +1496,8 @@ async function executeWorkflow(
       workflow.name,
       [],
       runId,
+      undefined,
+      true, // canPark: synthesis runs outside any batch/forEach
     );
     // Synthesis output is the final user-facing report (a string). The
     // step result is `unknown` now, so coerce: keep strings as-is,
@@ -1458,6 +1552,42 @@ export async function processWorkflowRuns(assistant: ClementineAssistant): Promi
     await drainWorkflowRuns(assistant);
   } finally {
     workflowDrainInFlight = false;
+  }
+}
+
+/**
+ * P0 event-driven approval parking — the resolution scan. Runs on the
+ * workflow-run lane tick (and on boot). For each run checkpointed as
+ * 'parked', re-admit it (flip status -> 'running') once EVERY approval it
+ * was waiting on has cleared (approved / rejected / expired / cancelled).
+ * The two-phase flip guarantees a still-pending parked run is never
+ * handed a bounded-pool slot. `processOneRunFile` sees status==='running'
+ * and resumes from the parked step (run_resumed event + computeResumeState
+ * skip of completed steps). No-op when the flag is off — under flag-off no
+ * run is ever written as 'parked', so this scan finds nothing.
+ */
+export function reapResolvedParkedRuns(): void {
+  if (!parkingEnabled()) return;
+  if (!existsSync(WORKFLOW_RUNS_DIR)) return;
+  let pendingIds: Set<string>;
+  try {
+    pendingIds = new Set(
+      approvalRegistry.listPending({ status: 'pending' }).map((r) => r.approvalId),
+    );
+  } catch {
+    return; // registry unavailable this tick — try again next tick
+  }
+  for (const file of readdirSync(WORKFLOW_RUNS_DIR).filter((entry) => entry.endsWith('.json'))) {
+    const filePath = path.join(WORKFLOW_RUNS_DIR, file);
+    const run = readRunRecord(filePath);
+    if (!run || run.status !== 'parked' || !run.parked) continue;
+    const watched = run.parked.parkedSteps.flatMap((s) => s.approvalIds);
+    if (watched.some((id) => pendingIds.has(id))) continue; // still waiting on a human
+    writeRunRecord(filePath, { ...run, status: 'running' });
+    logger.info(
+      { workflow: run.workflow, runId: run.id, parkedSteps: run.parked.parkedSteps.map((s) => s.stepId) },
+      'Parked workflow run re-admitted — approval(s) resolved',
+    );
   }
 }
 
@@ -1752,6 +1882,26 @@ async function processOneRunFile(
       } catch { /* best-effort */ }
       logger.info({ workflow: workflow.data.name, runId: run.id, partialFailures: forEachFailures.length, blockedSteps: blockedSteps.length, diagnosed: !!diagnosis }, 'Workflow run completed');
     } catch (error) {
+      // P0 parking: the run paused on a human approval. Checkpoint the
+      // resume coordinates as status='parked' and RETURN — this is NOT a
+      // failure. processOneRunFile returning frees the bounded-pool slot;
+      // `reapResolvedParkedRuns` flips the run back to 'running' once every
+      // watched approval clears, and the next drain resumes from the
+      // parked step (events.jsonl drives resume, so completed steps are
+      // never re-run). The heartbeat is torn down in the finally below.
+      if (error instanceof ParkRunSignal) {
+        writeRunRecord(filePath, {
+          ...run,
+          status: 'parked',
+          startedAt: run.startedAt ?? new Date().toISOString(),
+          parked: { parkedSteps: error.parkedSteps, parkedAt: new Date().toISOString() },
+        });
+        logger.info(
+          { workflow: workflow.data.name, runId: run.id, parkedSteps: error.parkedSteps.map((p) => p.stepId) },
+          'Workflow run parked on approval — bounded-pool slot released',
+        );
+        return;
+      }
       const message = error instanceof Error ? error.message : String(error);
       const cancelled = error instanceof WorkflowRunCancelledError || isWorkflowRunCancelled(run.id);
       logger[cancelled ? 'info' : 'error']({ err: error, file }, cancelled ? 'Workflow run cancelled' : 'Workflow run failed');

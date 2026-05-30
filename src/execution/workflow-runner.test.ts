@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -40,10 +40,91 @@ const {
   runDeterministicWorkflowStepForTest,
   workflowRunnerInternalsForTest,
   explainDeterministicSpawnError,
+  reapResolvedParkedRuns,
 } = await import('./workflow-runner.js');
 const { HarnessSession } = await import('../runtime/harness/session.js');
 const { resetEventLog } = await import('../runtime/harness/eventlog.js');
 const approvalRegistry = await import('../runtime/harness/approval-registry.js');
+const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
+
+// ---------------------------------------------------------------------------
+// P0 — event-driven approval parking (WORKFLOW_APPROVAL_PARKING)
+// ---------------------------------------------------------------------------
+
+function writeParkedRun(runId: string, approvalIds: string[]): string {
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  const filePath = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+  writeFileSync(
+    filePath,
+    JSON.stringify({
+      id: runId,
+      workflow: 'Test Parking WF',
+      status: 'parked',
+      parked: {
+        parkedSteps: [{ stepId: 'send_step', kind: 'gate', approvalIds }],
+        parkedAt: new Date().toISOString(),
+      },
+    }, null, 2),
+    'utf-8',
+  );
+  return filePath;
+}
+
+const statusOf = (filePath: string): string | undefined =>
+  JSON.parse(readFileSync(filePath, 'utf-8')).status;
+
+test('reapResolvedParkedRuns keeps a run parked while its approval is pending, re-admits once resolved', () => {
+  process.env.WORKFLOW_APPROVAL_PARKING = 'on';
+  const sid1 = 'workflow-gate:park-test-1:send_step';
+  HarnessSession.create({ id: sid1, kind: 'workflow', channel: 'workflow', title: 'park-test-1', metadata: { source: 'workflow' } });
+  const row = approvalRegistry.register({
+    sessionId: sid1,
+    subject: 'Approve the send',
+    tool: 'workflow_approval_gate',
+    ttlMs: 60_000,
+  });
+  const filePath = writeParkedRun('park-test-1', [row.approvalId]);
+
+  // Approval still pending → the run stays parked (slot stays free; it is
+  // NOT re-admitted to the drain).
+  reapResolvedParkedRuns();
+  assert.equal(statusOf(filePath), 'parked');
+
+  // Approval resolved → the two-phase flip re-admits it as 'running' so the
+  // next drain pass resumes from the parked step.
+  approvalRegistry.resolve(row.approvalId, 'approved', 'parking-test');
+  reapResolvedParkedRuns();
+  assert.equal(statusOf(filePath), 'running');
+
+  rmSync(filePath, { force: true });
+  delete process.env.WORKFLOW_APPROVAL_PARKING;
+});
+
+test('reapResolvedParkedRuns re-admits on a rejected approval too (run fails loudly, never stuck)', () => {
+  process.env.WORKFLOW_APPROVAL_PARKING = 'on';
+  const sid2 = 'workflow-gate:park-test-2:send_step';
+  HarnessSession.create({ id: sid2, kind: 'workflow', channel: 'workflow', title: 'park-test-2', metadata: { source: 'workflow' } });
+  const row = approvalRegistry.register({
+    sessionId: sid2,
+    subject: 'Approve the send',
+    tool: 'workflow_approval_gate',
+    ttlMs: 60_000,
+  });
+  const filePath = writeParkedRun('park-test-2', [row.approvalId]);
+  approvalRegistry.resolve(row.approvalId, 'rejected', 'parking-test');
+  reapResolvedParkedRuns();
+  assert.equal(statusOf(filePath), 'running');
+  rmSync(filePath, { force: true });
+  delete process.env.WORKFLOW_APPROVAL_PARKING;
+});
+
+test('reapResolvedParkedRuns is a no-op when WORKFLOW_APPROVAL_PARKING is off', () => {
+  delete process.env.WORKFLOW_APPROVAL_PARKING;
+  const filePath = writeParkedRun('park-test-off', ['apr-irrelevant']);
+  reapResolvedParkedRuns();
+  assert.equal(statusOf(filePath), 'parked'); // scan disabled → untouched
+  rmSync(filePath, { force: true });
+});
 
 test('applySkillToPrompt: no usesSkill returns prompt unchanged', () => {
   const out = applySkillToPrompt(

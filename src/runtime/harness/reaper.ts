@@ -177,6 +177,22 @@ export function reapOnce(): approvalRegistry.PendingApprovalRow[] {
         { err: err instanceof Error ? err.message : err, sessionId: row.sessionId },
         'reaper failed to clear interrupt state',
       );
+      // Reports-back (P1): don't let a failed cleanup stay invisible. If
+      // the interrupt state couldn't be cleared, the session may be wedged
+      // — tell the user instead of leaving a ghost pause only in the logs.
+      try {
+        addNotification({
+          id: `interrupt-clear-failed-${row.approvalId}-${randomUUID().slice(0, 8)}`,
+          kind: 'system',
+          title: 'Session cleanup failed after approval expired',
+          body: `The expired approval on **${row.subject}** could not be cleared from its session, which may leave it stuck. If that session stops responding, restart the daemon.`,
+          createdAt: new Date().toISOString(),
+          read: false,
+          metadata: { approvalId: row.approvalId, sessionId: row.sessionId },
+        });
+      } catch {
+        /* best-effort — the warning above is still in the logs */
+      }
     }
 
     // Surface the loss to the user. Without this, the user has no

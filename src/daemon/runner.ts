@@ -13,7 +13,7 @@ import { MODELS, getRuntimeEnv } from '../config.js';
 import { processExecutionController } from '../execution/controller.js';
 import { ExecutionStore } from '../execution/store.js';
 import { interruptStaleRunningBackgroundTasks, resumeInterruptedBackgroundTasks, processBackgroundTasks } from '../execution/background-tasks.js';
-import { processWorkflowRuns, reconcilePendingWorkflowRuns } from '../execution/workflow-runner.js';
+import { processWorkflowRuns, reconcilePendingWorkflowRuns, reapResolvedParkedRuns } from '../execution/workflow-runner.js';
 import { runWorkflowWatchdog } from '../execution/workflow-watchdog.js';
 import { getBuildInfo, describeBuild } from '../runtime/build-info.js';
 import { processWorkflowSchedules, reapStaleWorkflowRuns } from '../execution/workflow-scheduler.js';
@@ -708,6 +708,29 @@ async function processNotificationDeliveries(assistant: ClementineAssistant): Pr
     });
 
     if (terminal) {
+      // Reports-back (P1): a notification that exhausted its retries to one
+      // or more destinations must NOT vanish silently — that is the single
+      // worst outcome per the north star. Surface a follow-up so the user
+      // knows delivery failed and how to fix it. Guard against an alert
+      // about a failed alert looping forever: a delivery-failure alert that
+      // itself fails does not spawn another.
+      if (failed.size > 0 && !notification.metadata?.deliveryFailureAlert) {
+        try {
+          addNotification({
+            id: `delivery-failed-${notification.id}`,
+            kind: 'system',
+            title: 'Notification delivery failed',
+            body: `Couldn't deliver "${notification.title}" after ${DELIVERY_MAX_ATTEMPTS} attempts to ${failed.size} destination${failed.size === 1 ? '' : 's'}: ${lastError || 'unknown error'}. Re-check the destination (e.g. your Discord webhook) in Console → Settings, or add another — the original message is still in Activity.`,
+            createdAt: new Date().toISOString(),
+            read: false,
+            metadata: {
+              deliveryFailureAlert: true,
+              failedNotificationId: notification.id,
+              failedDestinationIds: [...failed],
+            },
+          });
+        } catch { /* best-effort; the failure is also on the notification record */ }
+      }
       continue;
     }
 
@@ -889,6 +912,13 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
   const workflowRunLane = (getRuntimeEnv('CLEMMY_WORKFLOW_RUN_LANE', 'on') ?? 'on').toLowerCase() !== 'off';
   if (workflowRunLane) {
     const drainWorkflowRunsTick = () => {
+      // P0 parking: re-admit any run whose approvals have resolved (no-op
+      // when WORKFLOW_APPROVAL_PARKING is off) BEFORE draining, so a freed
+      // parked run is picked up in the same tick. setImmediate below also
+      // runs this on boot, covering approvals resolved during downtime.
+      try { reapResolvedParkedRuns(); } catch (err) {
+        logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'reapResolvedParkedRuns tick failed');
+      }
       processWorkflowRuns(assistant).catch((err) => {
         logger.warn(
           { err: err instanceof Error ? err.message : String(err) },
@@ -915,6 +945,12 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
     // (above) so a long run can't block this loop. Only drain inline
     // when the lane is disabled.
     if (!workflowRunLane) {
+      // P0 parking: re-admit resolved parked runs on the inline path too
+      // (no-op when WORKFLOW_APPROVAL_PARKING is off). Keeps parking
+      // correct even when the independent run lane is disabled.
+      try { reapResolvedParkedRuns(); } catch (err) {
+        logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'reapResolvedParkedRuns inline tick failed');
+      }
       await processWorkflowRuns(assistant);
     }
     const proactivity = getProactivityPolicySnapshot();
