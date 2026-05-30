@@ -10,6 +10,7 @@ import {
   classifyExternalWrite,
   decideInstructionReview,
   ConfirmFirstRequiredError,
+  isConfirmFirstEnabled,
 } from './confirm-first-gate.js';
 
 // ─── classifyExternalWrite ────────────────────────────────────────
@@ -68,6 +69,21 @@ test('decideInstructionReview: threshold floored at 2 — a 0/1 config cannot ga
   assert.equal(d.required, false, 'first write must not be gated even with a misconfigured threshold');
   // but the SECOND write (prior 1 → count 2) does trip the floored threshold of 2
   assert.equal(decideInstructionReview({ priorSameShapeCount: 1, threshold: 1 }).required, true);
+});
+
+test('isConfirmFirstEnabled: defaults on with an explicit off escape hatch', () => {
+  const previous = process.env.CLEMMY_CONFIRM_FIRST;
+  try {
+    delete process.env.CLEMMY_CONFIRM_FIRST;
+    assert.equal(isConfirmFirstEnabled(), true);
+    process.env.CLEMMY_CONFIRM_FIRST = 'off';
+    assert.equal(isConfirmFirstEnabled(), false);
+    process.env.CLEMMY_CONFIRM_FIRST = 'true';
+    assert.equal(isConfirmFirstEnabled(), true);
+  } finally {
+    if (previous === undefined) delete process.env.CLEMMY_CONFIRM_FIRST;
+    else process.env.CLEMMY_CONFIRM_FIRST = previous;
+  }
 });
 
 // ─── ConfirmFirstRequiredError message ────────────────────────────

@@ -113,6 +113,7 @@ interface PlanCardProps {
 }
 
 function PlanCard({ row, acting, onAct }: PlanCardProps) {
+  const needsInput = row.needsUserInput.length > 0;
   return (
     <div class="approval-card plan-card">
       <div class="head">
@@ -136,11 +137,13 @@ function PlanCard({ row, acting, onAct }: PlanCardProps) {
         </ol>
       </div>
       <div class="actions">
-        <button class="approve" disabled={acting} onClick={() => onAct(row.id, 'approve')}>
-          {acting ? '…' : 'Approve & Proceed'}
-        </button>
+        {needsInput ? <span class="muted">Answer the question in chat before this can run.</span> : (
+          <button class="approve" disabled={acting} onClick={() => onAct(row.id, 'approve')}>
+            {acting ? '…' : 'Approve & Proceed'}
+          </button>
+        )}
         <button class="reject" disabled={acting} onClick={() => onAct(row.id, 'reject')}>
-          {acting ? '…' : 'Reject'}
+          {acting ? '…' : needsInput ? 'Dismiss' : 'Reject'}
         </button>
       </div>
     </div>

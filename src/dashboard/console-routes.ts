@@ -125,6 +125,7 @@ import {
   deletePlanProposal,
   getPlanProposal,
   listPlanProposals,
+  planProposalNeedsUserInput,
   rejectPlanProposal,
 } from '../agents/plan-proposals.js';
 import { approvePlanAndQueueBackgroundTask } from '../execution/approved-plan-tasks.js';
@@ -3737,6 +3738,14 @@ export function registerConsoleRoutes(
 
   app.post('/api/console/plan-proposals/:id/approve', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const existing = getPlanProposal(req.params.id);
+    if (existing && planProposalNeedsUserInput(existing)) {
+      res.status(409).json({
+        error: 'plan needs user input before approval',
+        needsUserInput: existing.plan.needsUserInput,
+      });
+      return;
+    }
     const body = req.body ?? {};
     let editedPlan: ReturnType<typeof PlanSchema.parse> | undefined;
     if (body.editedPlan && typeof body.editedPlan === 'object') {

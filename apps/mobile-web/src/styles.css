@@ -186,6 +186,12 @@ input { font: inherit; }
 .approval-card .actions .approve { background: var(--accent-2); color: var(--bg-0); }
 .approval-card .actions .reject { background: var(--bg-3); color: var(--fg-2); border-color: var(--line); }
 .approval-card .actions button:disabled { opacity: 0.5; }
+.approval-card .actions .muted {
+  color: var(--fg-3);
+  flex: 1 1 160px;
+  font-size: 11px;
+  line-height: 1.4;
+}
 .plan-card .subject {
   font-weight: 700;
 }

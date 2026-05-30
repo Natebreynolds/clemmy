@@ -277,6 +277,7 @@ interface RenderableRow {
   subtitle?: string;
   planProposalId?: string;
   planProposalStatus?: 'pending' | 'approved' | 'rejected';
+  planProposalNeedsUserInput?: boolean;
   at: number;
 }
 
@@ -313,6 +314,7 @@ function eventToRow(event: ChatEvent): RenderableRow | null {
         text,
         planProposalId,
         planProposalStatus,
+        planProposalNeedsUserInput: event.data.planProposalNeedsUserInput === true,
         at: event.createdAt,
       };
     }
@@ -364,7 +366,7 @@ function Bubble({
     return (
       <div class="bubble bubble-assistant">
         <div class="bubble-text">{row.text}</div>
-        {row.planProposalId && row.planProposalStatus === 'pending' ? (
+        {row.planProposalId && row.planProposalStatus === 'pending' && !row.planProposalNeedsUserInput ? (
           <div class="plan-actions">
             <button
               class="approve"
@@ -381,6 +383,9 @@ function Bubble({
               {planActing ? '…' : 'Reject'}
             </button>
           </div>
+        ) : null}
+        {row.planProposalId && row.planProposalStatus === 'pending' && row.planProposalNeedsUserInput ? (
+          <div class="plan-status">Reply with the missing detail before this can run.</div>
         ) : null}
         {row.planProposalId && row.planProposalStatus !== 'pending' ? (
           <div class="plan-status">Plan {row.planProposalStatus}.</div>

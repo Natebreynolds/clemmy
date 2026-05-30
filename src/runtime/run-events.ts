@@ -12,6 +12,7 @@ export type RunEventType =
   | 'model_started'
   | 'tool_started'
   | 'approval_required'
+  | 'run_resumed'
   | 'completed'
   | 'failed'
   | 'cancelled'

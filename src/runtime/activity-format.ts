@@ -27,6 +27,7 @@ export interface ActivityEventLike {
 
 export interface ActivityRunLike {
   id?: string;
+  sessionId?: string;
   kind?: string;
   source?: string;
   channel?: string | null;
@@ -37,12 +38,28 @@ export interface ActivityRunLike {
   outputPreview?: string;
   error?: string;
   queuedTaskId?: string;
+  createdAt?: string;
+  updatedAt?: string;
+  completedAt?: string;
   metadata?: Record<string, unknown> | null;
   events?: ActivityEventLike[];
 }
 
 export type EventVisibility = 'milestone' | 'noise';
 export type RunCategory = 'chat' | 'workflow' | 'scheduled' | 'background';
+export type UserFacingRunState =
+  | 'planning'
+  | 'executing'
+  | 'queued'
+  | 'waiting_for_approval'
+  | 'waiting_for_input'
+  | 'stalled'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+  | 'idle';
+
+const STALE_LIVE_RUN_MS = 20 * 60_000;
 
 /**
  * Event types that represent a user-meaningful MILESTONE — the things a person
@@ -68,6 +85,7 @@ const MILESTONE_TYPES: ReadonlySet<string> = new Set([
   'step_failed',
   'handoff',
   'awaiting_user_input',
+  'plan_drafted',
   'run_completed',
   'run_failed',
   'run_paused',
@@ -119,6 +137,25 @@ function firstLine(value: unknown, max = 160): string {
 }
 
 /**
+ * Return events in chronological (oldest-first) order regardless of how the
+ * caller supplied them. Harness sessions are fetched newest-first (`desc`)
+ * while legacy runs are appended oldest-first — without this, liveLine would
+ * pick the oldest milestone and the timeline would render reversed for one of
+ * the two sources.
+ */
+function chronological(events: ActivityEventLike[]): ActivityEventLike[] {
+  return events
+    .map((event, index) => ({ event, index }))
+    .sort((a, b) => {
+      const at = a.event.createdAt ?? '';
+      const bt = b.event.createdAt ?? '';
+      if (at !== bt) return at < bt ? -1 : 1;
+      return a.index - b.index; // stable for equal/missing timestamps
+    })
+    .map((entry) => entry.event);
+}
+
+/**
  * Translate a single event into a plain-English, past-tense line suitable for
  * the clean "what happened" timeline. Absorbs the old `harnessEventMessage`
  * phrasing so there is one canonical map.
@@ -165,6 +202,8 @@ export function friendlyEventMessage(event: ActivityEventLike): string {
     }
     case 'run_started':
       return 'Started';
+    case 'plan_drafted':
+      return 'Drafted a plan';
     case 'run_paused':
       return 'Paused';
     case 'run_resumed':
@@ -193,11 +232,15 @@ export function runFilterCategory(run: ActivityRunLike): RunCategory {
   const source = (run.source ?? '').toLowerCase();
   const channel = (run.channel ?? '').toString().toLowerCase();
   const kind = (run.kind ?? '').toLowerCase();
+  const id = (run.id ?? '').toString().toLowerCase();
+  const sessionId = (run.sessionId ?? '').toString().toLowerCase();
   const metaSource = String((run.metadata ?? {}).source ?? '').toLowerCase();
 
   if (kind === 'workflow' || channel === 'workflow' || source === 'workflow' || metaSource === 'workflow') {
     return 'workflow';
   }
+  // Cron/scheduled — internal channel 'cron' or a `cron:` session prefix
+  // (see src/execution/scope.ts INTERNAL_SESSION_PREFIXES).
   if (
     source === 'cron'
     || metaSource === 'cron'
@@ -205,10 +248,26 @@ export function runFilterCategory(run: ActivityRunLike): RunCategory {
     || metaSource === 'scheduled'
     || channel.startsWith('cron')
     || channel.startsWith('schedule')
+    || sessionId.startsWith('cron:')
   ) {
     return 'scheduled';
   }
-  if (run.queuedTaskId || kind === 'agent' || kind === 'execution') {
+  // Background task runs are created with channel 'background', a
+  // `background:<id>` session id, and `run-bg-…` run ids (see
+  // src/execution/background-tasks.ts). Autonomy/agent + execution-controller
+  // work is background to the user too.
+  if (
+    run.queuedTaskId
+    || kind === 'agent'
+    || kind === 'execution'
+    || channel === 'background'
+    || channel === 'agent'
+    || channel === 'execution-controller'
+    || id.startsWith('run-bg')
+    || sessionId.startsWith('background:')
+    || sessionId.startsWith('agent:')
+    || sessionId.startsWith('execution:')
+  ) {
     return 'background';
   }
   return 'chat';
@@ -243,7 +302,12 @@ export function friendlyStatusLabel(status: string | undefined): string {
     case 'queued':
       return 'Queued';
     case 'awaiting_approval':
+    case 'parked':
       return 'Waiting for your approval';
+    case 'awaiting_user_input':
+      return 'Waiting for your input';
+    case 'stalled':
+      return 'Needs attention';
     case 'idle':
       return 'Idle';
     case 'paused':
@@ -265,8 +329,103 @@ export function friendlyStatusLabel(status: string | undefined): string {
 export function isLive(status: string | undefined): boolean {
   return status === 'running'
     || status === 'received'
+    || status === 'active'
     || status === 'queued'
-    || status === 'awaiting_approval';
+    || status === 'awaiting_approval'
+    || status === 'parked'
+    || status === 'awaiting_user_input';
+}
+
+function parseTimeMs(value: string | undefined): number | null {
+  if (!value) return null;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+function latestActivityMs(run: ActivityRunLike): number | null {
+  const candidates = [
+    parseTimeMs(run.updatedAt),
+    parseTimeMs(run.completedAt),
+    parseTimeMs(run.createdAt),
+    ...(run.events ?? []).map((event) => parseTimeMs(event.createdAt)),
+  ].filter((value): value is number => typeof value === 'number');
+  if (candidates.length === 0) return null;
+  return Math.max(...candidates);
+}
+
+function latestMilestone(run: ActivityRunLike): ActivityEventLike | null {
+  const events = chronological(run.events ?? [])
+    .filter((event) => eventVisibility(event.type) === 'milestone');
+  return events.length ? events[events.length - 1] : null;
+}
+
+function hasExecutionMilestone(run: ActivityRunLike): boolean {
+  return chronological(run.events ?? []).some((event) =>
+    event.type === 'tool_called'
+    || event.type === 'tool_started'
+    || event.type === 'step_started'
+    || event.type === 'step_completed'
+    || event.type === 'step_verified'
+    || event.type === 'handoff',
+  );
+}
+
+export function userFacingRunState(run: ActivityRunLike, nowMs = Date.now()): UserFacingRunState {
+  const status = (run.status ?? '').toLowerCase();
+  const latest = latestMilestone(run);
+  const latestType = latest?.type ?? '';
+
+  if (status === 'failed' || latestType === 'run_failed' || latestType === 'failed' || run.error) return 'failed';
+  if (status === 'cancelled' || latestType === 'cancelled') return 'cancelled';
+  if (status === 'completed' || latestType === 'run_completed' || latestType === 'completed' || latestType === 'conversation_completed') return 'completed';
+  if (status === 'awaiting_approval' || status === 'parked' || status === 'paused' || latestType === 'approval_requested' || latestType === 'approval_required') return 'waiting_for_approval';
+  if (status === 'awaiting_user_input' || latestType === 'awaiting_user_input') return 'waiting_for_input';
+  if (status === 'queued' || latestType === 'queued_background') return 'queued';
+
+  if (status === 'running' || status === 'received' || status === 'active') {
+    const lastMs = latestActivityMs(run);
+    if (lastMs !== null && nowMs - lastMs > STALE_LIVE_RUN_MS) return 'stalled';
+    if (!hasExecutionMilestone(run) && (latestType === 'received' || latestType === 'run_started' || latestType === 'plan_drafted' || !latestType)) {
+      return 'planning';
+    }
+    return 'executing';
+  }
+
+  if (status === 'idle') return 'idle';
+  return 'idle';
+}
+
+export function userFacingRunStateLabel(state: UserFacingRunState): string {
+  switch (state) {
+    case 'planning':
+      return 'Planning';
+    case 'executing':
+      return 'Working';
+    case 'queued':
+      return 'Queued';
+    case 'waiting_for_approval':
+      return 'Waiting for your approval';
+    case 'waiting_for_input':
+      return 'Waiting for your input';
+    case 'stalled':
+      return 'Needs attention';
+    case 'completed':
+      return 'Done';
+    case 'failed':
+      return 'Failed';
+    case 'cancelled':
+      return 'Cancelled';
+    case 'idle':
+      return 'Idle';
+  }
+}
+
+export function userFacingRunStateIsLive(state: UserFacingRunState): boolean {
+  return state === 'planning'
+    || state === 'executing'
+    || state === 'queued'
+    || state === 'waiting_for_approval'
+    || state === 'waiting_for_input';
 }
 
 /**
@@ -275,11 +434,14 @@ export function isLive(status: string | undefined): boolean {
  * are not live.
  */
 export function liveLine(run: ActivityRunLike): string {
-  if (!isLive(run.status)) return '';
-  if (run.status === 'awaiting_approval') return 'Waiting for your approval';
-  if (run.status === 'queued') return 'Queued to start';
+  const state = userFacingRunState(run);
+  if (!userFacingRunStateIsLive(state)) return '';
+  if (state === 'waiting_for_approval') return 'Waiting for your approval';
+  if (state === 'waiting_for_input') return 'Waiting for your input';
+  if (state === 'queued') return 'Queued to start';
+  if (state === 'planning') return 'Planning the next steps…';
 
-  const events = run.events ?? [];
+  const events = chronological(run.events ?? []);
   const stepsStarted = events.filter((e) => e.type === 'step_started').length;
 
   for (let i = events.length - 1; i >= 0; i -= 1) {
@@ -296,20 +458,22 @@ export function liveLine(run: ActivityRunLike): string {
 
 /** A single secondary "preview" line for an inbox row — like an email snippet. */
 export function runPreview(run: ActivityRunLike): string {
-  if (isLive(run.status)) {
+  const state = userFacingRunState(run);
+  if (state === 'stalled') return 'No recent progress — needs attention';
+  if (userFacingRunStateIsLive(state)) {
     const line = liveLine(run);
     if (line) return line;
   }
   if (run.error) return firstLine(run.error, 160);
   if (run.outputPreview) return firstLine(run.outputPreview, 160);
-  return friendlyStatusLabel(run.status);
+  return userFacingRunStateLabel(state);
 }
 
 /** Milestone-only, human-readable timeline for the clean detail view. */
 export function friendlyTimeline(
   events: ActivityEventLike[] | undefined,
 ): Array<{ type: string; message: string; createdAt?: string }> {
-  return (events ?? [])
+  return chronological(events ?? [])
     .filter((event) => eventVisibility(event.type) === 'milestone')
     .map((event) => ({
       type: event.type ?? '',

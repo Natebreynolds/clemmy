@@ -118,7 +118,8 @@ export function registerAutonomyActionTools(server: McpServer): void {
     'surface_plan',
     [
       'Surface a Plan you just received from `draft_plan` to the user for review.',
-      'Use when the plan is significant or large enough that the user should see it before any mutation happens — typically when estimatedComplexity is "significant" or "large", or when recommendsTrackedExecution is true, or when needsUserInput is non-empty.',
+      'Use when the plan is significant or large enough that the user should see it before any mutation happens — typically when estimatedComplexity is "significant" or "large", or when recommendsTrackedExecution is true.',
+      'Do NOT use this when needsUserInput is non-empty. Ask the user the missing question first; an unanswered clarification is not approvable.',
       'The plan is persisted as a PlanProposal and the user is notified via Discord + dashboard. Your reply to the user should say "I drafted a plan for X — review and approve when ready."',
       'Pass the EXACT plan JSON you received from draft_plan in the `planJson` argument. Do not paraphrase or summarize — preserve the structured fields.',
       'For trivial / moderate work, do NOT surface — execute against the plan directly.',
@@ -140,6 +141,14 @@ export function registerAutonomyActionTools(server: McpServer): void {
       const planResult = PlanSchema.safeParse(parsed);
       if (!planResult.success) {
         return textResult(`surface_plan failed: planJson did not match PlanSchema. ${planResult.error.message}`);
+      }
+      if (planResult.data.needsUserInput.length > 0) {
+        return textResult([
+          'surface_plan refused: the plan still needs user input, so it cannot be approved yet.',
+          'Ask the user this clarification first:',
+          ...planResult.data.needsUserInput.map((q) => `- ${q}`),
+          'After the user answers, draft or revise the plan and only surface it if it is executable.',
+        ].join('\n'));
       }
       try {
         const proposal = surfacePlan({

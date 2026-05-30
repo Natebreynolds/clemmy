@@ -30,18 +30,17 @@ function customIds(rows: ReturnType<typeof notificationDeliveryInternalsForTest.
   return ids;
 }
 
-test('Discord delivery: only actionable approval notifications get plan buttons', () => {
+test('Discord delivery: stale plan metadata still delivers but has no dead buttons', () => {
   const approval = notification({
     kind: 'approval',
-    title: 'Plan ready for review: smoke test',
+    title: 'Review before I start: smoke test',
     metadata: { planProposalId: 'plan-abc123' },
   });
   const components = notificationDeliveryInternalsForTest.buildDiscordComponentsForNotification(approval);
   const ids = customIds(components);
 
   assert.equal(notificationDeliveryInternalsForTest.shouldDeliverDiscordNotification(approval), true);
-  assert.equal(ids.length, 3);
-  assert.ok(ids.some((id) => id.includes('plan-approve:plan-abc123')));
+  assert.equal(ids.length, 0);
 });
 
 test('Discord delivery: plan-approved lifecycle notification is dashboard-only and has no buttons', () => {

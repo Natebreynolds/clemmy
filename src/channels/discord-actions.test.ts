@@ -32,13 +32,10 @@ test('buildActionsForNotification: no metadata returns undefined (plain text DM)
   assert.equal(buildActionsForNotification({ foo: 'bar' }), undefined);
 });
 
-test('buildActionsForNotification: planProposalId attaches plan buttons', () => {
+test('buildActionsForNotification: stale planProposalId does not attach dead buttons', () => {
   const rows = buildActionsForNotification({ planProposalId: 'plan-abc123' });
   const ids = customIds(rows);
-  assert.equal(ids.length, 3, 'expected 3 buttons: approve, reject, view');
-  assert.ok(ids.some((id) => id.includes('plan-approve:plan-abc123')));
-  assert.ok(ids.some((id) => id.includes('plan-reject:plan-abc123')));
-  assert.ok(ids.some((id) => id.includes('plan-view:plan-abc123')));
+  assert.equal(ids.length, 0, 'missing plan records should not render approval buttons');
 });
 
 test('buildActionsForNotification: approvalId attaches SDK approve/edit/reject', () => {
@@ -61,14 +58,16 @@ test('buildActionsForNotification: checkInId attaches answer buttons', () => {
   assert.ok(ids.some((id) => id.includes('checkin-reject:chk-abc123')));
 });
 
-test('buildActionsForNotification: planProposalId beats approvalId when both present', () => {
+test('buildActionsForNotification: stale planProposalId suppresses lower-level approvalId', () => {
   const rows = buildActionsForNotification({
     planProposalId: 'plan-p1',
     approvalId: 'appr-a1',
   });
   const ids = customIds(rows);
-  // Plan buttons should win; SDK approve/reject should not appear.
-  assert.ok(ids.some((id) => id.includes('plan-approve:plan-p1')));
+  // Plan metadata still wins; if the plan is missing, do not fall back
+  // to the lower-level SDK approval because that can approve the wrong
+  // layer of work.
+  assert.equal(ids.length, 0);
   assert.ok(!ids.some((id) => /\bclementine:approve:appr-a1\b/.test(id)));
 });
 

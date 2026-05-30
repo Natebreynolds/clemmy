@@ -24,9 +24,8 @@
  * across worker sub-agents.
  *
  * Env flag (escape hatch / soak control): `CLEMMY_CONFIRM_FIRST`.
- * Defaults OFF — this gate can block work that the execution-wrap gate
- * alone would have allowed, so per the forward-only discipline it lands
- * dark and is flipped on after local verification + soak.
+ * Defaults ON. Set `CLEMMY_CONFIRM_FIRST=off` to temporarily return to
+ * execution-wrap-only behavior while debugging a false positive.
  *
  * Pure logic (classification + threshold decision) is exported and
  * tested in confirm-first-gate.test.ts with no SDK / DB / eventlog.

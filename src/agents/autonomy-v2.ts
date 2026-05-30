@@ -439,7 +439,7 @@ function buildAgentInstructions(agent: TeamAgentRecord, policy: ProactivityPolic
       '- `memory_recall` to look something up before deciding.',
       '- `propose_check_in_template` when you notice a recurring rhythm in the user\'s work (weekly deploys, daily standups, monthly reviews) or a condition that should trigger a future nudge. DO NOT auto-install — the user approves from Settings → Proactive Check-Ins. Always include a clear `rationale` referencing the specific pattern you observed.',
       '- `draft_plan` BEFORE you act on complex multi-step work — it returns a structured plan (objective, steps, risks, needsUserInput, recommendsTrackedExecution) without mutating anything. Skip it for trivial actions.',
-      '- `surface_plan` after `draft_plan` when the plan is significant/large, recommendsTrackedExecution, or needsUserInput is non-empty. Persists the plan as a PlanProposal and notifies the user for review. Wait for approval before executing against the plan. Skip surface_plan when the plan is trivial/moderate and unambiguous — just execute it.',
+      '- `surface_plan` after `draft_plan` only when the plan is executable and significant/large or recommendsTrackedExecution. If needsUserInput is non-empty, ask that clarification first; incomplete plans are not approvable. Skip surface_plan when the plan is trivial/moderate and unambiguous — just execute it.',
       '- If there\'s nothing useful to do this cycle, take no action and say so in your summary.',
       '- If you receive an inbox item of type `check_in_answered`, the user just answered a question you previously asked. Pick up where you left off and use the answer to make progress.',
     ].join('\n'),

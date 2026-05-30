@@ -17,6 +17,9 @@ import {
   liveLine,
   runFilterCategory,
   runPreview,
+  userFacingRunState,
+  userFacingRunStateIsLive,
+  userFacingRunStateLabel,
   type ActivityRunLike,
 } from './activity-format.js';
 
@@ -66,14 +69,25 @@ test('runFilterCategory buckets for the filter chips', () => {
   assert.equal(runFilterCategory({ metadata: { source: 'cron' } }), 'scheduled');
   assert.equal(runFilterCategory({ kind: 'agent' }), 'background');
   assert.equal(runFilterCategory({ queuedTaskId: 'bg-1' }), 'background');
+  // Background-task runs as actually created (channel + session-id + run-id),
+  // none of which set queuedTaskId/kind — these regressed to 'chat' before.
+  assert.equal(runFilterCategory({ channel: 'background', source: 'gateway' }), 'background');
+  assert.equal(runFilterCategory({ sessionId: 'background:abc', source: 'daemon' }), 'background');
+  assert.equal(runFilterCategory({ id: 'run-bg-xyz', source: 'daemon' }), 'background');
+  // Cron via the `cron:` session prefix (not just channel).
+  assert.equal(runFilterCategory({ sessionId: 'cron:nightly' }), 'scheduled');
+  // Autonomy agent work is background to the user, not a chat.
+  assert.equal(runFilterCategory({ channel: 'agent', source: 'daemon' }), 'background');
 });
 
 test('friendlyStatusLabel and isLive agree on live states', () => {
   assert.equal(friendlyStatusLabel('running'), 'Running…');
   assert.equal(friendlyStatusLabel('awaiting_approval'), 'Waiting for your approval');
+  assert.equal(friendlyStatusLabel('parked'), 'Waiting for your approval');
   assert.equal(friendlyStatusLabel('completed'), 'Done');
   assert.equal(isLive('running'), true);
   assert.equal(isLive('awaiting_approval'), true);
+  assert.equal(isLive('parked'), true);
   assert.equal(isLive('idle'), false); // active-but-stale chat must not pin to "Now"
   assert.equal(isLive('completed'), false);
 });
@@ -99,6 +113,7 @@ test('liveLine reflects the current action', () => {
   assert.equal(liveLine(stepping), 'Working on step 2…');
 
   assert.equal(liveLine({ status: 'awaiting_approval', events: [] }), 'Waiting for your approval');
+  assert.equal(liveLine({ status: 'parked', events: [] }), 'Waiting for your approval');
   assert.equal(liveLine({ status: 'completed', events: [] }), ''); // not live → empty
 });
 
@@ -109,6 +124,69 @@ test('runPreview is an email-like snippet', () => {
   );
   assert.equal(runPreview({ status: 'completed', outputPreview: 'All 3 emails sent.' }), 'All 3 emails sent.');
   assert.equal(runPreview({ status: 'failed', error: 'Network timeout' }), 'Network timeout');
+});
+
+test('userFacingRunState distinguishes planning, execution, waiting, and stale work', () => {
+  const now = Date.parse('2026-05-29T10:30:00Z');
+
+  assert.equal(userFacingRunState({
+    status: 'running',
+    updatedAt: '2026-05-29T10:29:00Z',
+    events: [{ type: 'plan_drafted', createdAt: '2026-05-29T10:29:00Z' }],
+  }, now), 'planning');
+
+  assert.equal(userFacingRunState({
+    status: 'running',
+    updatedAt: '2026-05-29T10:29:30Z',
+    events: [{ type: 'tool_called', data: { tool: 'memory_search' }, createdAt: '2026-05-29T10:29:30Z' }],
+  }, now), 'executing');
+
+  assert.equal(userFacingRunState({
+    status: 'running',
+    updatedAt: '2026-05-29T10:29:30Z',
+    events: [{ type: 'awaiting_user_input', createdAt: '2026-05-29T10:29:30Z' }],
+  }, now), 'waiting_for_input');
+
+  assert.equal(userFacingRunState({
+    status: 'parked',
+    updatedAt: '2026-05-29T10:29:30Z',
+    events: [{ type: 'approval_required', createdAt: '2026-05-29T10:29:30Z' }],
+  }, now), 'waiting_for_approval');
+
+  assert.equal(userFacingRunState({
+    status: 'running',
+    updatedAt: '2026-05-29T10:00:00Z',
+    events: [{ type: 'tool_called', data: { tool: 'Outlook' }, createdAt: '2026-05-29T10:00:00Z' }],
+  }, now), 'stalled');
+
+  assert.equal(userFacingRunStateLabel('stalled'), 'Needs attention');
+  assert.equal(userFacingRunStateIsLive('executing'), true);
+  assert.equal(userFacingRunStateIsLive('stalled'), false);
+  assert.equal(runPreview({
+    status: 'running',
+    updatedAt: '2020-01-01T10:00:00Z',
+    events: [{ type: 'tool_called', data: { tool: 'Outlook' }, createdAt: '2020-01-01T10:00:00Z' }],
+  }), 'No recent progress — needs attention');
+});
+
+test('liveLine + timeline are order-agnostic (harness events arrive newest-first)', () => {
+  // Descending (newest-first), as harness sessions are fetched.
+  const desc: ActivityRunLike = {
+    status: 'running',
+    updatedAt: '2999-05-29T10:00:03Z',
+    events: [
+      { type: 'tool_called', data: { tool: 'Slack' }, createdAt: '2999-05-29T10:00:03Z' },
+      { type: 'tool_called', data: { tool: 'Gmail' }, createdAt: '2999-05-29T10:00:02Z' },
+      { type: 'received', createdAt: '2999-05-29T10:00:01Z' },
+    ],
+  };
+  // Newest milestone is the Slack call — must not pick the older Gmail one.
+  assert.equal(liveLine(desc), 'Using Slack…');
+  // Timeline must render oldest-first regardless of input order.
+  assert.deepEqual(
+    friendlyTimeline(desc.events).map((e) => e.message),
+    ['Received your request', 'Used Gmail', 'Used Slack'],
+  );
 });
 
 test('friendlyTimeline drops noise events', () => {

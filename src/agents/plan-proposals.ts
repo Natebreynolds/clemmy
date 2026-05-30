@@ -99,6 +99,69 @@ export interface SurfacePlanInput {
   context?: string;
 }
 
+export function planNeedsUserInput(plan: Plan): boolean {
+  return Array.isArray(plan.needsUserInput) && plan.needsUserInput.some((item) => item.trim().length > 0);
+}
+
+export function planProposalNeedsUserInput(proposal: PlanProposal): boolean {
+  return planNeedsUserInput(proposal.approvedPlan ?? proposal.plan);
+}
+
+function compactWhitespace(value: string): string {
+  return value.replace(/\s+/g, ' ').trim();
+}
+
+function truncateForNotification(value: string, max = 220): string {
+  const compact = compactWhitespace(value);
+  if (compact.length <= max) return compact;
+  return `${compact.slice(0, Math.max(0, max - 1)).trimEnd()}...`;
+}
+
+function sanitizeAppliedInstructionForNotification(value: string): string {
+  let text = compactWhitespace(value)
+    .replace(/\s*\((?:source|from):[^)]*\)\s*$/gi, '')
+    .replace(/`[^`]*(?:SKILL\.md|workflows?)[^`]*`/gi, 'the saved workflow')
+    .replace(/(?:^|\s)(?:~\/|\/)?[A-Za-z0-9_.-]*(?:\/[A-Za-z0-9_.-]+)+(?:SKILL\.md|\.md)?/g, ' the saved workflow');
+
+  if (/proposal|audit|brief/i.test(value) && /workflow|SKILL\.md|workflows/i.test(value)) {
+    text = 'Use the relevant saved proposal workflow for the research and briefing steps.';
+  } else if (/outbound|Scorpion|law[- ]firm|SEO jargon|booking URL/i.test(value)) {
+    text = 'Use the saved outbound-writing guidance: clear law-firm language, low jargon, and no raw booking URLs unless asked.';
+  }
+
+  return truncateForNotification(text.replace(/[“”]/g, '"').replace(/[‘’]/g, "'"), 180);
+}
+
+function renderPlanNotificationBody(proposal: PlanProposal): string {
+  const steps = proposal.plan.steps
+    .map((s) => `${s.n}. ${truncateForNotification(s.action, 180)}`)
+    .join('\n');
+  const appliedInstructions = (proposal.plan.appliedInstructions ?? [])
+    .map(sanitizeAppliedInstructionForNotification)
+    .filter((item, index, items) => item.length > 0 && items.indexOf(item) === index)
+    .slice(0, 4);
+  const contextBlock = appliedInstructions.length > 0
+    ? `\n\nContext I will use:\n${appliedInstructions.map((item) => `- ${item}`).join('\n')}`
+    : '';
+  const questionsBlock = proposal.plan.needsUserInput.length > 0
+    ? `\n\nI need this before I can start:\n${proposal.plan.needsUserInput.map((q) => `- ${truncateForNotification(q, 220)}`).join('\n')}`
+    : '';
+  const closing = proposal.plan.needsUserInput.length > 0
+    ? '\n\nReply with the missing detail. I will not start until this is clear.'
+    : '\n\nApprove when you want me to start, or reject if this is not the right plan.';
+
+  return [
+    'I made a plan before starting.',
+    '',
+    `Goal: ${truncateForNotification(proposal.plan.objective, 260)}`,
+    '',
+    `What I will do:\n${steps}`,
+    contextBlock,
+    questionsBlock,
+    closing,
+  ].filter(Boolean).join('\n');
+}
+
 /**
  * Persist a Plan as a PlanProposal and queue an approval notification.
  * The orchestrator calls this when work is significant enough that the
@@ -110,6 +173,9 @@ export function surfacePlan(input: SurfacePlanInput): PlanProposal {
   }
   if (!input.plan || !input.plan.objective || input.plan.steps.length === 0) {
     throw new Error('plan must include objective and at least one step');
+  }
+  if (planNeedsUserInput(input.plan)) {
+    throw new Error('plan has unresolved needsUserInput; ask the user for that input before surfacing the plan for approval');
   }
   const now = new Date().toISOString();
   const proposal: PlanProposal = {
@@ -126,41 +192,11 @@ export function surfacePlan(input: SurfacePlanInput): PlanProposal {
   };
   writeProposal(proposal);
 
-  // v0.5.21.2 — render ALL steps. Previously sliced to first 4 with a
-  // "…and N more steps" tail, which left Discord users unable to see
-  // the rest of the plan before approving. The Discord delivery layer
-  // (sendDiscordDirectMessage / sendDiscordChannelMessageWithComponents)
-  // already chunks bodies via splitMessage and attaches the action row
-  // to the LAST chunk only — so a long plan renders as one card +
-  // follow-up plain message(s), with the Approve/Reject buttons under
-  // the final chunk where the user lands after scrolling.
-  const stepSummary = proposal.plan.steps
-    .map((s) => `  ${s.n}. ${s.action}`)
-    .join('\n');
-  const questionsBlock = proposal.plan.needsUserInput.length > 0
-    ? `\n\nQuestions before I start:\n${proposal.plan.needsUserInput.map((q) => `  · ${q}`).join('\n')}`
-    : '';
-  // Move 3 — surface the standing instructions this plan is following so
-  // the user can confirm (or prune) them before approving. Older plans
-  // (pre-Move-3) have no appliedInstructions field → block is omitted.
-  const appliedInstructions = proposal.plan.appliedInstructions ?? [];
-  const instructionsBlock = appliedInstructions.length > 0
-    ? `\n\nInstructions I'm following (from memory — tell me if any are wrong):\n${appliedInstructions.map((i) => `  · ${i}`).join('\n')}`
-    : '';
-
   addNotification({
     id: `${Date.now()}-plan-proposal-${proposal.id}`,
     kind: 'approval',
-    title: `Plan ready for review: ${proposal.plan.objective.slice(0, 80)}`,
-    body: [
-      `Complexity: ${proposal.plan.estimatedComplexity}.`,
-      proposal.context ? `\nContext: ${proposal.context}` : '',
-      `\nObjective: ${proposal.plan.objective}`,
-      `\nSteps:\n${stepSummary}`,
-      instructionsBlock,
-      questionsBlock,
-      '\n\nReview and approve in the dashboard or reply to approve / reject here.',
-    ].filter(Boolean).join(''),
+    title: `Review before I start: ${truncateForNotification(proposal.plan.objective, 80)}`,
+    body: renderPlanNotificationBody(proposal),
     createdAt: now,
     read: false,
     metadata: {
@@ -231,6 +267,7 @@ export function approvePlanProposal(id: string, options: ApprovePlanProposalOpti
   if (!proposal) return null;
   if (proposal.status !== 'pending') return null;
   const approvedPlan = options.editedPlan ?? proposal.plan;
+  if (planNeedsUserInput(approvedPlan)) return null;
   const resolved: PlanProposal = {
     ...proposal,
     status: 'approved',

@@ -65,7 +65,7 @@ type ConsolidatedFactKind = 'user' | 'project' | 'feedback' | 'reference';
 import { listWorkflows } from '../memory/workflow-store.js';
 import { readWorkflowEvents } from '../execution/workflow-events.js';
 import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
-import { getPlanProposal, listPlanProposals, rejectPlanProposal, type PlanProposal } from '../agents/plan-proposals.js';
+import { getPlanProposal, listPlanProposals, planProposalNeedsUserInput, rejectPlanProposal, type PlanProposal } from '../agents/plan-proposals.js';
 import { approvePlanAndQueueBackgroundTask } from '../execution/approved-plan-tasks.js';
 import { processBackgroundTasks } from '../execution/background-tasks.js';
 
@@ -143,6 +143,7 @@ function serializeEventForMobile(event: HarnessEventRow): {
           reason: data.reason,
           planProposalId,
           planProposalStatus,
+          planProposalNeedsUserInput: planProposal ? planProposalNeedsUserInput(planProposal) : false,
         };
       }
       break;
@@ -636,6 +637,14 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
 
   router.post('/api/plan-proposals/:id/approve', requireMobileSession, (req, res) => {
     const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+    const existing = getPlanProposal(id);
+    if (existing && planProposalNeedsUserInput(existing)) {
+      res.status(409).json({
+        error: 'plan needs user input before approval',
+        needsUserInput: existing.plan.needsUserInput,
+      });
+      return;
+    }
     const result = approvePlanAndQueueBackgroundTask(id);
     if (!result) {
       res.status(404).json({ error: 'PLAN_PROPOSAL_NOT_FOUND_OR_RESOLVED' });

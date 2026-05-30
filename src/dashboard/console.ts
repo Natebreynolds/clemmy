@@ -107,6 +107,9 @@ export function renderConsoleHtml(token: string): string {
             <div class="stat-focus-popover-parked" data-stat-focus-popover-parked></div>
           </div>
         </span>
+        <button class="theme-toggle sidebar-toggle" data-sidebar-toggle aria-label="Collapse sidebar" title="Collapse sidebar">
+          <span class="sidebar-toggle-icon" data-sidebar-toggle-icon>«</span>
+        </button>
         <button class="theme-toggle" data-theme-toggle aria-label="Toggle light/dark mode" title="Toggle light/dark">
           <span class="theme-toggle-icon" data-theme-icon>◐</span>
         </button>
@@ -121,6 +124,7 @@ export function renderConsoleHtml(token: string): string {
       <button class="nav" data-panel="activity">
         <span class="nav-key">02</span>
         <span class="nav-label">Activity</span>
+        <span class="nav-badge" data-activity-badge hidden>0</span>
       </button>
       <!-- v0.5.11: Brain panel — single home for everything Clementine
            knows + how it learns + how it's evolving. Consolidates the
@@ -145,28 +149,24 @@ export function renderConsoleHtml(token: string): string {
         <span class="nav-key">04</span>
         <span class="nav-label">Workflows</span>
       </button>
-      <button class="nav" data-panel="tools">
-        <span class="nav-key">05</span>
-        <span class="nav-label">Tools</span>
-      </button>
       <button class="nav" data-panel="projects">
-        <span class="nav-key">06</span>
+        <span class="nav-key">05</span>
         <span class="nav-label">Projects</span>
       </button>
       <button class="nav" data-panel="skills">
-        <span class="nav-key">07</span>
+        <span class="nav-key">06</span>
         <span class="nav-label">Skills</span>
       </button>
       <button class="nav" data-panel="integrations">
-        <span class="nav-key">08</span>
+        <span class="nav-key">07</span>
         <span class="nav-label">Integrations</span>
       </button>
       <button class="nav" data-panel="usage">
-        <span class="nav-key">09</span>
+        <span class="nav-key">08</span>
         <span class="nav-label">Usage</span>
       </button>
       <button class="nav" data-panel="settings">
-        <span class="nav-key">10</span>
+        <span class="nav-key">09</span>
         <span class="nav-label">Settings</span>
       </button>
       <!-- v0.5.11: dedicated Approvals panel. Surfaces pending approvals
@@ -447,31 +447,35 @@ export function renderConsoleHtml(token: string): string {
       </section>
 
       <section class="panel-frame" data-section="activity" hidden>
-        <div class="panel-tag">PANEL · 02 · ACTIVITY PULSE</div>
+        <div class="panel-tag">PANEL · 02 · ACTIVITY</div>
 
-        <div class="panel-body activity-layout">
+        <div class="panel-body inbox-layout">
 
-          <div class="activity-feed">
-            <div class="feed-header">
-              <span class="feed-title">LIVE RUNS</span>
-              <span class="feed-meta">
-                <span class="feed-stat">TOTAL · <em data-feed-total>0</em></span>
-                <span class="feed-stat">RUNNING · <em data-feed-running>0</em></span>
-                <span class="feed-stat">FAILED · <em data-feed-failed>0</em></span>
-              </span>
+          <div class="inbox-pane">
+            <div class="inbox-toolbar">
+              <input type="search" class="inbox-search" data-inbox-search
+                     placeholder="Search activity…" aria-label="Search activity" />
+              <div class="inbox-filters" data-inbox-filters>
+                <button type="button" class="inbox-chip active" data-filter="all">All</button>
+                <button type="button" class="inbox-chip" data-filter="chat">Chats</button>
+                <button type="button" class="inbox-chip" data-filter="workflow">Workflows</button>
+                <button type="button" class="inbox-chip" data-filter="scheduled">Scheduled</button>
+                <button type="button" class="inbox-chip" data-filter="background">Background</button>
+                <button type="button" class="inbox-chip" data-filter="approval">Needs approval</button>
+              </div>
             </div>
-            <ol class="run-list" data-run-list aria-live="polite">
-              <li class="empty">— waiting for first run —</li>
-            </ol>
+            <div class="inbox-list" data-inbox-list aria-live="polite">
+              <div class="inbox-empty">— waiting for first activity —</div>
+            </div>
           </div>
 
-          <aside class="activity-detail">
-            <div class="detail-header">
-              <span class="detail-title">RUN INSPECTOR</span>
-              <span class="detail-meta" data-detail-id>—</span>
+          <aside class="reading-pane">
+            <div class="reading-header">
+              <span class="reading-title" data-reading-title>Select an item</span>
+              <span class="reading-status" data-reading-status></span>
             </div>
-            <div class="detail-body" data-detail-body>
-              <p class="hint">Select a run to inspect its event timeline.</p>
+            <div class="reading-body" data-reading-body>
+              <p class="reading-hint">Pick something on the left to see what Clementine did — what you asked, what happened, and the result.</p>
             </div>
           </aside>
 
@@ -488,7 +492,7 @@ export function renderConsoleHtml(token: string): string {
       <!-- (context shell removed) -->
 
       <section class="panel-frame" data-section="workflows" hidden>
-        <div class="panel-tag">PANEL · 05 · WORKFLOW STUDIO</div>
+        <div class="panel-tag">PANEL · 04 · WORKFLOW STUDIO</div>
 
         <div class="panel-body wf-layout">
 
@@ -560,68 +564,8 @@ export function renderConsoleHtml(token: string): string {
         </div>
       </section>
 
-      <section class="panel-frame" data-section="tools" hidden>
-        <div class="panel-tag">PANEL · 06 · TOOLS</div>
-        <div class="panel-body tools-layout">
-
-          <aside class="tools-side">
-            <div class="tools-filter">
-              <input class="tools-search" data-tools-search type="search" placeholder="filter tools · category, name…" />
-              <span class="tools-count" data-tools-count>—</span>
-            </div>
-            <div class="tools-categories" data-tools-categories>
-              <!-- pills populated by JS -->
-            </div>
-          </aside>
-
-          <div class="tools-main">
-            <div class="tools-section">
-              <div class="tools-section-head">
-                <span>REGISTERED TOOLS</span>
-                <em data-tools-shown>—</em>
-              </div>
-              <div class="tools-grid" data-tools-grid>
-                <div class="tools-empty">— loading —</div>
-              </div>
-            </div>
-            <div class="tools-section">
-              <div class="tools-section-head">
-                <span>MCP SERVERS</span>
-                <em data-mcp-count>—</em>
-              </div>
-              <div class="tools-empty">
-                Discovered + custom MCP servers live in <a class="tools-jump" data-tools-jump="integrations">Integrations</a>.
-                Toggle, edit, or add new ones there — anything the agent can call is reflected back here as a tool.
-              </div>
-            </div>
-            <!--
-              LOCAL CLIs — view-only mirror of the connected-clis.json
-              registry. Surfaces "what command-line tools the agent has
-              first-class access to right now." Lifecycle (install /
-              configure / disconnect) lives in the Integrations panel.
-              Auto-promote covers fresh installs; this section is the
-              answer to "what's actually connected?"
-            -->
-            <div class="tools-section">
-              <div class="tools-section-head">
-                <span>LOCAL CLIs</span>
-                <em data-tools-cli-count>—</em>
-              </div>
-              <div class="tools-cli-list" data-tools-cli-list>
-                <div class="tools-empty">— loading —</div>
-              </div>
-              <div class="tools-empty" style="margin-top:8px;">
-                Install + manage CLIs in <a class="tools-jump" data-tools-jump="integrations">Integrations</a>.
-                Catalog CLIs already on your PATH get auto-promoted here — no install needed.
-              </div>
-            </div>
-          </div>
-
-        </div>
-      </section>
-
       <section class="panel-frame" data-section="projects" hidden>
-        <div class="panel-tag">PANEL · 07 · PROJECTS</div>
+        <div class="panel-tag">PANEL · 05 · PROJECTS</div>
         <div class="panel-body projects-layout">
 
           <aside class="proj-side">
@@ -652,7 +596,7 @@ export function renderConsoleHtml(token: string): string {
       </section>
 
       <section class="panel-frame" data-section="skills" hidden>
-        <div class="panel-tag">PANEL · 08 · SKILLS</div>
+        <div class="panel-tag">PANEL · 06 · SKILLS</div>
         <div class="panel-body skills-layout">
 
           <div class="skills-header">
@@ -675,13 +619,13 @@ export function renderConsoleHtml(token: string): string {
             <div class="tools-empty">— loading —</div>
           </div>
 
-          <p class="skills-footer">Skills install to <code data-skills-dir>~/.clementine-next/skills/</code>. Want custom executable tools instead? Drop a JS plugin under <code>~/.clementine-next/plugins/</code> — they show up in the Tools panel as Custom Tools.</p>
+          <p class="skills-footer">Skills install to <code data-skills-dir>~/.clementine-next/skills/</code>. Want custom executable tools instead? Drop a JS plugin under <code>~/.clementine-next/plugins/</code> — they show up in Settings → Tools as Custom Tools.</p>
 
         </div>
       </section>
 
       <section class="panel-frame" data-section="integrations" hidden>
-        <div class="panel-tag">PANEL · 09 · INTEGRATIONS</div>
+        <div class="panel-tag">PANEL · 07 · INTEGRATIONS</div>
 
         <div class="panel-body integrations-layout">
 
@@ -1245,7 +1189,7 @@ export function renderConsoleHtml(token: string): string {
       </section>
 
       <section class="panel-frame" data-section="usage" hidden>
-        <div class="panel-tag">PANEL · 10 · USAGE</div>
+        <div class="panel-tag">PANEL · 08 · USAGE</div>
         <div class="panel-body usage-layout">
 
           <div class="usage-header">
@@ -1306,7 +1250,7 @@ export function renderConsoleHtml(token: string): string {
       </section>
 
       <section class="panel-frame" data-section="settings" hidden>
-        <div class="panel-tag">PANEL · 11 · SETTINGS</div>
+        <div class="panel-tag">PANEL · 09 · SETTINGS</div>
         <div class="panel-toolbar" style="display:flex; justify-content:flex-end; padding:8px 16px; border-bottom:1px solid var(--line);">
           <label class="check-pill" style="cursor:pointer;">
             <input type="checkbox" data-settings-advanced-toggle />
@@ -1319,6 +1263,7 @@ export function renderConsoleHtml(token: string): string {
           <button type="button" class="settings-tab" data-settings-tab-target="autonomy">AUTONOMY</button>
           <button type="button" class="settings-tab" data-settings-tab-target="memory">MEMORY</button>
           <button type="button" class="settings-tab" data-settings-tab-target="credentials">CREDENTIALS</button>
+          <button type="button" class="settings-tab" data-settings-tab-target="tools">TOOLS</button>
           <button type="button" class="settings-tab" data-settings-tab-target="diagnostics">DIAGNOSTICS</button>
         </div>
         <div class="panel-body settings-layout">
@@ -1576,6 +1521,61 @@ export function renderConsoleHtml(token: string): string {
               <div class="settings-info" style="line-height: 1.6;">
                 Personality + identity live as plain-text files Clementine reads on every turn — edits take effect on your next message, no restart.
                 Open the <button type="button" class="settings-secondary" data-tools-jump="context" style="font-size: 10.5px; padding: 4px 10px; vertical-align: baseline;">CONTEXT TAB</button> to edit them, pick from preset starters (terse + proactive, warm + explanatory, quiet executor), or start from scratch.
+              </div>
+            </div>
+
+            <div class="settings-block settings-tools-block" data-settings-tab-panel="tools">
+              <div class="settings-block-head">
+                <span>TOOL CATALOG</span>
+                <span class="creds-meta" data-tools-shown>—</span>
+              </div>
+              <div class="settings-info">
+                Read-only inventory of the tools Clementine can call. Connect, install, or configure tools from <a class="tools-jump" data-tools-jump="integrations">Integrations</a>.
+              </div>
+              <div class="settings-tools-catalog tools-layout">
+                <aside class="tools-side">
+                  <div class="tools-filter">
+                    <input class="tools-search" data-tools-search type="search" placeholder="filter tools · category, name…" />
+                    <span class="tools-count" data-tools-count>—</span>
+                  </div>
+                  <div class="tools-categories" data-tools-categories>
+                    <!-- pills populated by JS -->
+                  </div>
+                </aside>
+
+                <div class="tools-main">
+                  <div class="tools-section">
+                    <div class="tools-section-head">
+                      <span>REGISTERED TOOLS</span>
+                    </div>
+                    <div class="tools-grid" data-tools-grid>
+                      <div class="tools-empty">— loading —</div>
+                    </div>
+                  </div>
+                  <div class="tools-section">
+                    <div class="tools-section-head">
+                      <span>MCP SERVERS</span>
+                      <em data-mcp-count>—</em>
+                    </div>
+                    <div class="tools-empty">
+                      Discovered + custom MCP servers live in <a class="tools-jump" data-tools-jump="integrations">Integrations</a>.
+                      Toggle, edit, or add new ones there — anything the agent can call is reflected back here as a tool.
+                    </div>
+                  </div>
+                  <div class="tools-section">
+                    <div class="tools-section-head">
+                      <span>LOCAL CLIs</span>
+                      <em data-tools-cli-count>—</em>
+                    </div>
+                    <div class="tools-cli-list" data-tools-cli-list>
+                      <div class="tools-empty">— loading —</div>
+                    </div>
+                    <div class="tools-empty" style="margin-top:8px;">
+                      Install + manage CLIs in <a class="tools-jump" data-tools-jump="integrations">Integrations</a>.
+                      Catalog CLIs already on your PATH get auto-promoted here — no install needed.
+                    </div>
+                  </div>
+                </div>
               </div>
             </div>
 
@@ -2446,6 +2446,15 @@ body {
 .sidebar     { grid-area: sidebar; }
 .panel       { grid-area: panel; overflow: hidden; }
 .foot-bar    { grid-area: foot; }
+
+/* Collapsible sidebar — toggled from the header (« / ») so the main
+   panel can use the full window width. State is persisted per-machine
+   in localStorage. The column animates to 0 and the sidebar contents
+   are hidden so nothing bleeds into the panel. */
+.grid { transition: grid-template-columns 160ms ease; }
+.grid.sidebar-collapsed { grid-template-columns: 0 1fr; }
+.grid.sidebar-collapsed .sidebar { display: none; }
+.sidebar-toggle-icon { font-size: 14px; line-height: 1; }
 
 /* ── Status bar (top) ─────────────────────────────────────────── */
 .status-bar {
@@ -4173,16 +4182,34 @@ body {
 }
 
 /* ── Activity panel ───────────────────────────────────────────── */
-.activity-layout {
+/* ── Activity nav live badge ──────────────────────────────────── */
+.nav-badge {
+  margin-left: auto;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--accent-3);
+  color: var(--bg-1);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 16px;
+  text-align: center;
+  box-shadow: 0 0 8px rgba(54, 197, 255, 0.5);
+  animation: pulse 1.6s ease-in-out infinite;
+}
+
+/* ── Activity "inbox" ─────────────────────────────────────────── */
+.inbox-layout {
   display: grid;
-  grid-template-columns: 1fr 380px;
+  grid-template-columns: minmax(320px, 1fr) minmax(380px, 1.2fr);
   gap: 18px;
   height: 100%;
   overflow: hidden;
 }
 
-.activity-feed,
-.activity-detail {
+.inbox-pane,
+.reading-pane {
   border: 1px solid var(--line);
   background: var(--bg-2);
   display: flex;
@@ -4190,77 +4217,249 @@ body {
   overflow: hidden;
 }
 
-.feed-header,
-.detail-header {
-  padding: 8px 14px;
+.inbox-toolbar {
+  padding: 10px 12px;
   border-bottom: 1px solid var(--line);
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
   background: var(--bg-1);
-  font-size: 10px;
-  letter-spacing: 0.18em;
-  color: var(--fg-3);
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
 }
-.feed-title, .detail-title { color: var(--fg); }
-.feed-stat { margin-left: 14px; }
-.feed-stat em { font-style: normal; color: var(--fg); margin-left: 4px; }
-.detail-meta { color: var(--accent); font-size: 11px; }
+.inbox-search {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 7px 10px;
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--fg);
+  font: 12px/1.3 var(--sans, inherit);
+}
+.inbox-search:focus { outline: none; border-color: var(--accent); }
+.inbox-search::placeholder { color: var(--fg-mute); }
 
-.run-list {
-  list-style: none;
-  margin: 0; padding: 0;
-  overflow-y: auto;
-  font-size: 12px;
+.inbox-filters { display: flex; flex-wrap: wrap; gap: 6px; }
+.inbox-chip {
+  padding: 4px 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--fg-2);
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+  transition: background 100ms, color 100ms, border-color 100ms;
 }
-.run-list .empty {
-  padding: 24px;
+.inbox-chip:hover { background: var(--bg-3); color: var(--fg); }
+.inbox-chip.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--bg-1);
+  font-weight: 600;
+}
+
+.inbox-list { overflow-y: auto; flex: 1; }
+.inbox-empty {
+  padding: 28px;
   text-align: center;
   color: var(--fg-mute);
-  letter-spacing: 0.1em;
+  letter-spacing: 0.08em;
+  font-size: 12px;
 }
-.run-list li.run {
-  padding: 10px 14px;
+.inbox-group {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 7px 14px;
+  background: var(--bg-1);
   border-bottom: 1px solid var(--line);
-  display: grid;
-  grid-template-columns: 14px 64px 80px 1fr 70px;
-  gap: 10px;
-  align-items: baseline;
-  cursor: pointer;
-  transition: background 100ms, color 100ms;
-  position: relative;
+  color: var(--fg-3);
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
 }
-.run-list li.run:hover { background: var(--bg-3); }
-.run-list li.run.selected {
+.inbox-group.now { color: var(--accent-3); }
+
+.inbox-item {
+  width: 100%;
+  box-sizing: border-box;
+  text-align: left;
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  padding: 11px 14px 11px 12px;
+  display: grid;
+  grid-template-columns: 12px 1fr;
+  gap: 10px;
+  cursor: pointer;
+  transition: background 100ms;
+}
+.inbox-item:hover { background: var(--bg-3); }
+.inbox-item.selected {
   background: var(--bg-3);
   box-shadow: inset 2px 0 0 var(--accent);
 }
-.run-list li.run .dot {
+.inbox-item .ii-dot {
   width: 8px; height: 8px;
   border-radius: 50%;
   background: var(--fg-mute);
-  margin-top: 6px;
+  margin-top: 5px;
 }
-.run-list li.run[data-status="running"] .dot,
-.run-list li.run[data-status="received"] .dot {
+.inbox-item[data-status="running"] .ii-dot,
+.inbox-item[data-status="received"] .ii-dot {
   background: var(--accent-3);
   box-shadow: 0 0 8px rgba(54, 197, 255, 0.55);
   animation: pulse 1.4s ease-in-out infinite;
 }
-.run-list li.run[data-status="completed"] .dot { background: var(--accent-2); }
-.run-list li.run[data-status="failed"] .dot    { background: var(--accent-fail); }
-.run-list li.run[data-status="queued"] .dot,
-.run-list li.run[data-status="awaiting_approval"] .dot { background: var(--accent-warn); }
-
-.run-list li.run .time { color: var(--fg-3); font-size: 10px; letter-spacing: 0.04em; }
-.run-list li.run .src  { color: var(--fg-2); font-size: 10px; text-transform: uppercase; letter-spacing: 0.12em; }
-.run-list li.run .title {
+.inbox-item[data-status="completed"] .ii-dot { background: var(--accent-2); }
+.inbox-item[data-status="failed"] .ii-dot    { background: var(--accent-fail); }
+.inbox-item[data-status="queued"] .ii-dot,
+.inbox-item[data-status="awaiting_approval"] .ii-dot {
+  background: var(--accent-warn);
+  animation: pulse 1.6s ease-in-out infinite;
+}
+.inbox-item .ii-main { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.inbox-item .ii-top {
+  display: flex; justify-content: space-between; align-items: baseline; gap: 8px;
+}
+.inbox-item .ii-kind {
+  color: var(--fg-2);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+}
+.inbox-item .ii-time { color: var(--fg-3); font-size: 10px; white-space: nowrap; }
+.inbox-item .ii-title {
   color: var(--fg);
+  font-size: 13px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.run-list li.run .dur  { color: var(--fg-3); font-size: 10px; text-align: right; }
+.inbox-item .ii-preview {
+  color: var(--fg-3);
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.inbox-item[data-status="running"] .ii-preview,
+.inbox-item[data-status="received"] .ii-preview,
+.inbox-item[data-status="planning"] .ii-preview,
+.inbox-item[data-status="executing"] .ii-preview { color: var(--accent-3); }
+.inbox-item[data-status="awaiting_approval"] .ii-preview,
+.inbox-item[data-status="waiting_for_approval"] .ii-preview,
+.inbox-item[data-status="waiting_for_input"] .ii-preview,
+.inbox-item[data-status="stalled"] .ii-preview { color: var(--accent-warn); }
+.inbox-item[data-status="failed"] .ii-preview { color: var(--accent-fail); }
+
+/* ── Reading pane ─────────────────────────────────────────────── */
+.reading-header {
+  padding: 11px 14px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-1);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+.reading-title {
+  color: var(--fg);
+  font-size: 14px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.reading-status {
+  font-size: 11px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  white-space: nowrap;
+}
+.reading-status[data-status="running"],
+.reading-status[data-status="received"] { color: var(--accent-3); border-color: var(--accent-3); }
+.reading-status[data-status="completed"] { color: var(--accent-2); border-color: var(--accent-2); }
+.reading-status[data-status="failed"] { color: var(--accent-fail); border-color: var(--accent-fail); }
+.reading-status[data-status="queued"],
+.reading-status[data-status="awaiting_approval"] { color: var(--accent-warn); border-color: var(--accent-warn); }
+
+.reading-body {
+  flex: 1;
+  padding: 14px 16px;
+  overflow-y: auto;
+}
+.reading-hint {
+  color: var(--fg-mute);
+  text-align: center;
+  margin-top: 40px;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.read-block { margin-bottom: 18px; }
+.read-block-head {
+  color: var(--fg-3);
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  margin-bottom: 7px;
+}
+.read-ask, .read-result {
+  color: var(--fg);
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.read-result { color: var(--fg-2); }
+.read-error {
+  color: var(--accent-fail);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.timeline { list-style: none; margin: 0; padding: 0; }
+.timeline li {
+  display: grid;
+  grid-template-columns: 52px 1fr;
+  gap: 10px;
+  padding: 6px 0;
+  align-items: baseline;
+  border-bottom: 1px dashed var(--line);
+}
+.timeline li:last-child { border-bottom: 0; }
+.timeline .tl-time { color: var(--fg-3); font-size: 10px; }
+.timeline .tl-msg { color: var(--fg); font-size: 12px; line-height: 1.45; }
+.timeline-empty { color: var(--fg-mute); font-size: 12px; }
+
+.read-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 18px; }
+.read-btn {
+  padding: 7px 14px;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--accent);
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 100ms, color 100ms;
+}
+.read-btn:hover { background: var(--accent); color: var(--bg-1); }
+.read-btn[disabled] { opacity: 0.5; cursor: default; }
+
+.read-tech { margin-top: 6px; }
+.read-tech > summary {
+  cursor: pointer;
+  color: var(--fg-3);
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  list-style: revert;
+}
+.read-tech > summary:hover { color: var(--fg); }
+.read-tech[open] > summary { margin-bottom: 8px; }
 
 /* ── Detail (inspector) ──────────────────────────────────────── */
 .detail-body {
@@ -7088,7 +7287,7 @@ body {
   font-size: 10px;
 }
 
-/* ── Tools panel ─────────────────────────────────────────────── */
+/* ── Tools catalog ───────────────────────────────────────────── */
 .tools-layout {
   display: grid;
   grid-template-columns: 240px 1fr;
@@ -7200,7 +7399,7 @@ body {
   font-size: 11px;
 }
 .tools-empty { color: var(--fg-mute); padding: 14px; letter-spacing: 0.12em; line-height: 1.5; }
-/* LOCAL CLIs section — mirrors connected-clis.json in the Tools panel.
+/* LOCAL CLIs section — mirrors connected-clis.json in Settings → Tools.
    Cards match the visual weight of MCP/registered-tool rows. */
 .tools-cli-list {
   display: grid;
@@ -8992,8 +9191,20 @@ body {
 }
 .settings-block[data-settings-tab-panel="memory"],
 .settings-block[data-settings-tab-panel="credentials"],
+.settings-block[data-settings-tab-panel="tools"],
 .settings-block[data-settings-tab-panel="diagnostics"] {
   grid-column: 1 / -1;
+}
+.settings-tools-block {
+  min-height: 0;
+}
+.settings-tools-block > .settings-info {
+  padding-bottom: 10px;
+}
+.settings-tools-catalog {
+  height: min(70vh, 760px);
+  min-height: 520px;
+  padding: 0 14px 14px;
 }
 .settings-block-head {
   display: flex;
@@ -10376,18 +10587,42 @@ const CONSOLE_JS = `
     approvals: document.querySelector('[data-stat-approvals] em'),
     policy:    document.querySelector('[data-stat-policy] em'),
     conn:      document.querySelector('[data-stat-connection]'),
-    runList:   document.querySelector('[data-run-list]'),
-    feedTotal: document.querySelector('[data-feed-total]'),
-    feedRun:   document.querySelector('[data-feed-running]'),
-    feedFail:  document.querySelector('[data-feed-failed]'),
-    detailId:  document.querySelector('[data-detail-id]'),
-    detailBody:document.querySelector('[data-detail-body]'),
+    inboxList:    document.querySelector('[data-inbox-list]'),
+    inboxSearch:  document.querySelector('[data-inbox-search]'),
+    inboxFilters: document.querySelector('[data-inbox-filters]'),
+    readingTitle: document.querySelector('[data-reading-title]'),
+    readingStatus:document.querySelector('[data-reading-status]'),
+    activityBadge:document.querySelector('[data-activity-badge]'),
+    // detailBody / detailId are aliases to the reading-pane nodes so the
+    // background-task detail renderer (which writes detail-block markup)
+    // keeps working unchanged.
+    detailId:  document.querySelector('[data-reading-status]'),
+    detailBody:document.querySelector('[data-reading-body]'),
     lastSync:  document.querySelector('[data-last-sync]'),
   };
+
+  // Activity inbox: filter chips + search re-render from the cached list
+  // (no refetch) so the UI stays responsive between 2s polls.
+  if (els.inboxFilters) {
+    Array.from(els.inboxFilters.querySelectorAll('.inbox-chip')).forEach((chip) => {
+      chip.addEventListener('click', () => {
+        activeFilter = chip.getAttribute('data-filter') || 'all';
+        Array.from(els.inboxFilters.querySelectorAll('.inbox-chip')).forEach((c) => c.classList.toggle('active', c === chip));
+        renderInbox(lastInboxList);
+      });
+    });
+  }
+  if (els.inboxSearch) {
+    els.inboxSearch.addEventListener('input', () => {
+      searchQuery = els.inboxSearch.value || '';
+      renderInbox(lastInboxList);
+    });
+  }
 
   let selectedRunId = null;
   let lastSnapshotJSON = '';
   let lastRunsJSON = '';
+  let lastDetailSig = '';
 
   function withToken(path) {
     if (!TOKEN) return path;
@@ -10478,6 +10713,33 @@ const CONSOLE_JS = `
     });
   }
   initTheme();
+
+  // Collapsible sidebar — toggled from the header so the main panel can
+  // use the full window width. Persisted per-machine in localStorage.
+  const SIDEBAR_KEY = 'clemmy.sidebar.collapsed';
+  const gridEl = document.querySelector('.grid');
+  const sidebarToggleBtn = document.querySelector('[data-sidebar-toggle]');
+  const sidebarToggleIcon = document.querySelector('[data-sidebar-toggle-icon]');
+  function applySidebarCollapsed(collapsed) {
+    if (!gridEl) return;
+    gridEl.classList.toggle('sidebar-collapsed', collapsed);
+    if (sidebarToggleIcon) sidebarToggleIcon.textContent = collapsed ? '»' : '«';
+    if (sidebarToggleBtn) {
+      const label = collapsed ? 'Expand sidebar' : 'Collapse sidebar';
+      sidebarToggleBtn.setAttribute('aria-label', label);
+      sidebarToggleBtn.setAttribute('title', label);
+    }
+    try { localStorage.setItem(SIDEBAR_KEY, collapsed ? '1' : '0'); } catch (err) { /* private mode */ }
+  }
+  if (sidebarToggleBtn) {
+    sidebarToggleBtn.addEventListener('click', () => {
+      const isCollapsed = !!(gridEl && gridEl.classList.contains('sidebar-collapsed'));
+      applySidebarCollapsed(!isCollapsed);
+    });
+  }
+  let sidebarSaved = '0';
+  try { sidebarSaved = localStorage.getItem(SIDEBAR_KEY) || '0'; } catch (err) { /* private mode */ }
+  applySidebarCollapsed(sidebarSaved === '1');
 
   // Populate version chips from /api/console/build-info — done once at
   // page load. If the call fails we keep the placeholder dash.
@@ -10707,6 +10969,22 @@ const CONSOLE_JS = `
     return iso.slice(11, 19);
   }
 
+  // Compact "2m ago" style for inbox rows; falls back to clock time for
+  // anything older than a day so the day-group header carries the date.
+  function fmtRelative(iso) {
+    if (!iso) return '';
+    const t = new Date(iso).getTime();
+    if (Number.isNaN(t)) return '';
+    const secs = Math.floor((Date.now() - t) / 1000);
+    if (secs < 5) return 'now';
+    if (secs < 60) return secs + 's ago';
+    const mins = Math.floor(secs / 60);
+    if (mins < 60) return mins + 'm ago';
+    const hours = Math.floor(mins / 60);
+    if (hours < 24) return hours + 'h ago';
+    return iso.slice(11, 16);
+  }
+
   function fmtDuration(rec) {
     if (!rec.createdAt) return '';
     const end = rec.completedAt || new Date().toISOString();
@@ -10716,88 +10994,215 @@ const CONSOLE_JS = `
     return Math.round(ms / 1000) + 's';
   }
 
-  function renderRunList(runs) {
-    if (!runs || runs.length === 0) {
-      els.runList.innerHTML = '<li class="empty">— waiting for first run —</li>';
+  // ── Activity inbox state ────────────────────────────────────────
+  // Most-recent-activity-first ordering uses the SAME field we display
+  // (last-active time) so the visible order is monotonic top-to-bottom.
+  const lastActiveFor = (run) => run.updatedAt || run.completedAt || run.createdAt || '';
+  let activeFilter = 'all';
+  let searchQuery = '';
+  let lastInboxList = [];
+
+  function dayBucket(iso) {
+    if (!iso) return 'Earlier';
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return 'Earlier';
+    const now = new Date();
+    const startToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+    const t = d.getTime();
+    if (t >= startToday) return 'Today';
+    if (t >= startToday - 86400000) return 'Yesterday';
+    return 'Earlier';
+  }
+
+  function matchesFilter(run) {
+    if (activeFilter === 'all') return true;
+    if (activeFilter === 'approval') return (run.runState || run.status) === 'waiting_for_approval' || run.status === 'awaiting_approval';
+    return (run.category || 'chat') === activeFilter;
+  }
+
+  function buildInboxItem(run) {
+    const status = run.runState || run.status || 'unknown';
+    const cls = selectedRunId === run.id ? 'inbox-item selected' : 'inbox-item';
+    const title = esc(run.title || run.input || '(untitled)');
+    const kind = esc(run.kindLabel || (run.source || 'Activity'));
+    const iso = lastActiveFor(run);
+    const time = esc(fmtRelative(iso));
+    const preview = esc(run.preview || run.statusLabel || '');
+    return '<button type="button" class="' + cls + '" data-run-id="' + esc(run.id) + '" data-status="' + esc(status) + '">'
+      + '<span class="ii-dot"></span>'
+      + '<span class="ii-main">'
+      +   '<span class="ii-top"><span class="ii-kind">' + kind + '</span><span class="ii-time" title="' + esc(fmtTime(iso)) + '">' + time + '</span></span>'
+      +   '<span class="ii-title" title="' + title + '">' + title + '</span>'
+      +   '<span class="ii-preview">' + preview + '</span>'
+      + '</span>'
+      + '</button>';
+  }
+
+  // Renders the inbox: live runs pinned under "Happening now", the rest
+  // grouped Today / Yesterday / Earlier, after the active filter + search.
+  function renderInbox(runs) {
+    lastInboxList = Array.isArray(runs) ? runs : (Array.isArray(lastInboxList) ? lastInboxList : []);
+    const q = searchQuery.trim().toLowerCase();
+    const filtered = lastInboxList.filter((run) => {
+      if (!matchesFilter(run)) return false;
+      if (!q) return true;
+      const hay = ((run.title || '') + ' ' + (run.preview || '') + ' ' + (run.kindLabel || '') + ' ' + (run.input || '')).toLowerCase();
+      return hay.includes(q);
+    });
+    if (filtered.length === 0) {
+      els.inboxList.innerHTML = '<div class="inbox-empty">'
+        + (lastInboxList.length === 0 ? '— waiting for first activity —' : '— nothing matches —')
+        + '</div>';
       return;
     }
-    // Stable sort: most recent activity first. Display the SAME field
-    // we sort by — sorting by updatedAt while showing createdAt was
-    // making the list look randomly ordered to the user (run that
-    // started at 16:04 but was last touched at 21:00 appeared above
-    // a 17:34 run that hasn't been touched since). Show the last-active
-    // time so the visible order is monotonic top-to-bottom.
-    const lastActiveFor = (run) => run.updatedAt || run.completedAt || run.createdAt || '';
-    const sorted = runs.slice().sort((a, b) => lastActiveFor(b).localeCompare(lastActiveFor(a)));
-    const html = sorted.slice(0, 80).map((run) => {
-      const status = run.status || 'unknown';
-      const cls = selectedRunId === run.id ? 'run selected' : 'run';
-      const title = (run.title || run.input || '(no title)').replace(/[<>&]/g, (c) => ({
-        '<': '&lt;', '>': '&gt;', '&': '&amp;',
-      }[c]));
-      const src = (run.source || '?').toUpperCase();
-      return [
-        '<li class="' + cls + '" data-run-id="' + run.id + '" data-status="' + status + '">',
-        '  <span class="dot"></span>',
-        '  <span class="time">' + fmtTime(lastActiveFor(run)) + '</span>',
-        '  <span class="src">' + src + '</span>',
-        '  <span class="title" title="' + title + '">' + title + '</span>',
-        '  <span class="dur">' + fmtDuration(run) + '</span>',
-        '</li>',
-      ].join('');
-    }).join('');
-    els.runList.innerHTML = html;
-    Array.from(els.runList.querySelectorAll('li.run')).forEach((li) => {
-      li.addEventListener('click', () => {
-        selectedRunId = li.getAttribute('data-run-id');
-        Array.from(els.runList.querySelectorAll('li.run')).forEach((el) => el.classList.toggle('selected', el === li));
+    const sorted = filtered.slice().sort((a, b) => lastActiveFor(b).localeCompare(lastActiveFor(a)));
+    const live = sorted.filter((r) => r.live);
+    const rest = sorted.filter((r) => !r.live);
+    let html = '';
+    if (live.length) {
+      html += '<div class="inbox-group now">Happening now</div>';
+      html += live.map(buildInboxItem).join('');
+    }
+    let lastBucket = '';
+    rest.forEach((run) => {
+      const bucket = dayBucket(lastActiveFor(run));
+      if (bucket !== lastBucket) { html += '<div class="inbox-group">' + bucket + '</div>'; lastBucket = bucket; }
+      html += buildInboxItem(run);
+    });
+    els.inboxList.innerHTML = html;
+    Array.from(els.inboxList.querySelectorAll('.inbox-item')).forEach((el) => {
+      el.addEventListener('click', () => {
+        selectedRunId = el.getAttribute('data-run-id');
+        Array.from(els.inboxList.querySelectorAll('.inbox-item')).forEach((n) => n.classList.toggle('selected', n === el));
         loadDetail(selectedRunId);
       });
     });
   }
 
-  function renderDetail(run) {
-    if (!run) {
-      els.detailId.textContent = '—';
-      els.detailBody.innerHTML = '<p class="hint">Run not found.</p>';
+  async function handleReadingAction(action, run) {
+    if (action === 'approval') { switchPanel('approvals'); return; }
+    if (action === 'cancel') {
+      const btn = els.detailBody.querySelector('[data-read-action="cancel"]');
+      if (btn) { btn.disabled = true; btn.textContent = 'Stopping…'; }
+      // Harness chat sessions cancel via their own JSON endpoint; everything
+      // else routes through the run-cancel action (which resolves the linked
+      // or own background task).
+      const endpoint = String(run.id || '').indexOf('sess-') === 0
+        ? '/api/console/harness-sessions/' + encodeURIComponent(run.id) + '/cancel'
+        : '/dashboard/actions/runs/' + encodeURIComponent(run.id) + '/cancel';
+      try {
+        const r = await fetch(withToken(endpoint), { method: 'POST', headers: { Accept: 'application/json' } });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        if (window.__clementineToast) window.__clementineToast.showSuccess('Stop requested.');
+        try { await tick(); } catch (_) {}
+      } catch (err) {
+        if (btn) { btn.disabled = false; btn.textContent = 'Stop'; }
+        if (window.__clementineToast) window.__clementineToast.showError('Could not stop: ' + ((err && err.message) || err));
+      }
       return;
     }
-    els.detailId.textContent = run.id;
-    const headLines = [
-      ['STATUS',  run.status],
-      ['AGENT',   run.userId || run.sessionId || '—'],
-      ['CHANNEL', run.channel || '—'],
-      ['SOURCE',  run.source || '—'],
-      ['TITLE',   run.title || '—'],
-    ];
-    const headHtml = '<div class="detail-block"><div class="detail-block-head">HEADER</div><div class="detail-block-body"><pre>'
-      + headLines.map((kv) => kv[0].padEnd(8) + ' ' + esc(kv[1])).join('\\n')
-      + '</pre></div></div>';
+    if (action === 'retry') {
+      const btn = els.detailBody.querySelector('[data-read-action="retry"]');
+      if (btn) { btn.disabled = true; btn.textContent = 'Retrying…'; }
+      try {
+        const r = await fetch(withToken('/dashboard/actions/runs/' + encodeURIComponent(run.id) + '/retry'), {
+          method: 'POST', headers: { Accept: 'application/json' },
+        });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        if (window.__clementineToast) window.__clementineToast.showSuccess('Retry queued as a background task.');
+        try { await tick(); } catch (_) {}
+      } catch (err) {
+        if (btn) { btn.disabled = false; btn.textContent = 'Retry'; }
+        if (window.__clementineToast) window.__clementineToast.showError('Could not queue retry: ' + ((err && err.message) || err));
+      }
+    }
+  }
 
-    const events = (run.events || []).slice(-40);
-    const eventsHtml = '<div class="detail-block"><div class="detail-block-head">TIMELINE · ' + events.length + ' / ' + (run.events || []).length + '</div><div class="detail-block-body">'
-      + (events.length === 0
-        ? '<p class="hint" style="margin:8px 0;">No events recorded.</p>'
-        : events.map((ev) =>
+  // Renders the reading pane: a plain-English "email" of the run — what you
+  // asked, what happened (milestones only), the result, with the raw event
+  // firehose tucked behind a collapsed "Technical details" toggle.
+  function renderReading(run) {
+    if (!run) {
+      els.readingTitle.textContent = 'Not found';
+      els.readingStatus.textContent = '';
+      els.readingStatus.removeAttribute('data-status');
+      els.detailBody.innerHTML = '<p class="reading-hint">That item could not be loaded.</p>';
+      return;
+    }
+    els.readingTitle.textContent = run.title || run.input || '(untitled)';
+    els.readingStatus.textContent = run.statusLabel || run.status || '';
+    els.readingStatus.setAttribute('data-status', run.runState || run.status || '');
+
+    const summary = run.summary || {};
+    const ask = summary.ask || run.input || run.objective || '';
+    const result = summary.result || run.outputPreview || '';
+    const error = summary.error || run.error || '';
+    const timeline = Array.isArray(run.timeline) ? run.timeline : [];
+
+    let html = '';
+
+    const actions = [];
+    if ((run.runState || run.status) === 'waiting_for_approval' || run.status === 'awaiting_approval') {
+      actions.push('<button type="button" class="read-btn" data-read-action="approval">Review approval →</button>');
+    }
+    // Stop is offered for live runs we can actually cancel: harness chat
+    // sessions, and runs backed by a background task. Workflow runs are
+    // cancelled from the Workflows page (different id scheme) — omitted here.
+    const id = String(run.id || '');
+    const cancellable = run.live
+      && (id.indexOf('sess-') === 0 || run.queuedTaskId || id.indexOf('run-bg') === 0 || (run.category === 'background' && id.indexOf('run-') === 0));
+    if (cancellable) {
+      actions.push('<button type="button" class="read-btn" data-read-action="cancel">Stop</button>');
+    }
+    if (((run.runState || run.status) === 'failed' || run.status === 'failed') && id.indexOf('run-') === 0) {
+      actions.push('<button type="button" class="read-btn" data-read-action="retry">Retry</button>');
+    }
+    if (actions.length) html += '<div class="read-actions">' + actions.join('') + '</div>';
+
+    if (ask) {
+      html += '<div class="read-block"><div class="read-block-head">What you asked</div><div class="read-ask">' + esc(ask) + '</div></div>';
+    }
+
+    html += '<div class="read-block"><div class="read-block-head">What happened</div>';
+    if (timeline.length) {
+      html += '<ol class="timeline">' + timeline.map((ev) =>
+        '<li><span class="tl-time">' + esc(fmtTime(ev.createdAt)) + '</span><span class="tl-msg">' + esc(ev.message) + '</span></li>',
+      ).join('') + '</ol>';
+    } else if (run.live) {
+      html += '<p class="timeline-empty">' + esc(run.liveLine || 'Working…') + '</p>';
+    } else {
+      html += '<p class="timeline-empty">No detailed steps were recorded.</p>';
+    }
+    html += '</div>';
+
+    if (result) {
+      html += '<div class="read-block"><div class="read-block-head">Result</div><div class="read-result">' + esc(result) + '</div></div>';
+    }
+    if (error) {
+      html += '<div class="read-block"><div class="read-block-head">Error</div><div class="read-error">' + esc(error) + '</div></div>';
+    }
+
+    const rawEvents = (run.events || []).slice(-60);
+    html += '<details class="read-tech"><summary>Technical details</summary>';
+    if (rawEvents.length === 0) {
+      html += '<p class="timeline-empty" style="margin-top:8px;">No raw events recorded.</p>';
+    } else {
+      html += '<div class="detail-block"><div class="detail-block-body">'
+        + rawEvents.map((ev) =>
           '<div class="detail-event" data-type="' + esc(ev.type) + '">'
-          + '<span class="ev-time">' + fmtTime(ev.createdAt) + '</span>'
+          + '<span class="ev-time">' + esc(fmtTime(ev.createdAt)) + '</span>'
           + '<span class="ev-type">' + esc(ev.type) + '</span>'
           + '<span class="ev-msg">' + esc(ev.message) + '</span>'
-          + '</div>'
-        ).join(''))
-      + '</div></div>';
-
-    let outputHtml = '';
-    if (run.outputPreview) {
-      outputHtml = '<div class="detail-block"><div class="detail-block-head">OUTPUT PREVIEW</div><div class="detail-block-body"><pre>'
-        + esc(run.outputPreview) + '</pre></div></div>';
+          + '</div>',
+        ).join('')
+        + '</div></div>';
     }
-    if (run.error) {
-      outputHtml += '<div class="detail-block"><div class="detail-block-head" style="color:var(--accent-fail);">ERROR</div><div class="detail-block-body"><pre>'
-        + esc(run.error) + '</pre></div></div>';
-    }
+    html += '</details>';
 
-    els.detailBody.innerHTML = headHtml + eventsHtml + outputHtml;
+    els.detailBody.innerHTML = html;
+    Array.from(els.detailBody.querySelectorAll('[data-read-action]')).forEach((btn) => {
+      btn.addEventListener('click', () => handleReadingAction(btn.getAttribute('data-read-action'), run));
+    });
   }
 
   function esc(s) {
@@ -10810,11 +11215,11 @@ const CONSOLE_JS = `
     try {
       const data = await fetchJSON('/api/runs/' + encodeURIComponent(id));
       // /api/runs/:id returns { run: {...} } envelope; older clients
-      // expected the bare run object. Unwrap defensively so renderDetail
+      // expected the bare run object. Unwrap defensively so renderReading
       // gets the run regardless of which shape the server returns.
-      renderDetail(data && data.run ? data.run : data);
+      renderReading(data && data.run ? data.run : data);
     } catch (err) {
-      els.detailBody.innerHTML = '<p class="hint">Failed to load run · ' + esc(err.message || err) + '</p>';
+      els.detailBody.innerHTML = '<p class="reading-hint">Failed to load · ' + esc(err.message || err) + '</p>';
     }
   }
 
@@ -10822,13 +11227,15 @@ const CONSOLE_JS = `
     if (!taskId) return;
     try {
       selectedRunId = 'background:' + taskId;
-      if (els.runList) {
-        Array.from(els.runList.querySelectorAll('li.run')).forEach((el) => el.classList.remove('selected'));
+      if (els.inboxList) {
+        Array.from(els.inboxList.querySelectorAll('.inbox-item')).forEach((el) => el.classList.remove('selected'));
       }
       const data = await fetchJSON('/api/console/background-tasks/' + encodeURIComponent(taskId));
       const task = data.task || {};
       const detail = data.detail || {};
-      if (els.detailId) els.detailId.textContent = task.id || taskId;
+      if (els.readingTitle) els.readingTitle.textContent = task.title || 'Background task';
+      if (els.readingStatus) els.readingStatus.setAttribute('data-status', task.status || '');
+      if (els.detailId) els.detailId.textContent = task.status || task.id || taskId;
       const result = task.resultFull || task.result || '';
       const headLines = [
         ['STATUS', task.status || '—'],
@@ -11307,9 +11714,11 @@ const CONSOLE_JS = `
   let __sessionLiveSeq = 0;
   function openSessionLiveInspector(sessionId) {
     if (!sessionId) return;
-    const detailId = document.querySelector('[data-detail-id]');
-    const detailBody = document.querySelector('[data-detail-body]');
-    if (detailId) detailId.textContent = sessionId.slice(0, 24);
+    const detailId = document.querySelector('[data-reading-status]');
+    const detailBody = document.querySelector('[data-reading-body]');
+    const detailTitle = document.querySelector('[data-reading-title]');
+    if (detailTitle) detailTitle.textContent = 'Live · ' + sessionId.slice(0, 18);
+    if (detailId) { detailId.textContent = 'Live'; detailId.setAttribute('data-status', 'running'); }
     if (detailBody) {
       detailBody.innerHTML = [
         '<div style="font-family:ui-monospace,Menlo,monospace; font-size:11px;">',
@@ -11658,23 +12067,42 @@ const CONSOLE_JS = `
       updateHome(snapWithApprovals);
 
       const list = runs.runs || runs || [];
-      const running = list.filter((r) => r.status === 'running' || r.status === 'received').length;
-      const failed  = list.filter((r) => r.status === 'failed').length;
-      els.feedTotal.textContent = list.length;
-      els.feedRun.textContent   = running;
-      els.feedFail.textContent  = failed;
+
+      // Live-count badge on the Activity nav so background/live work is
+      // visible without opening the panel.
+      if (els.activityBadge) {
+        const liveCount = list.filter((r) => r.live).length;
+        if (liveCount > 0) {
+          els.activityBadge.textContent = liveCount > 99 ? '99+' : String(liveCount);
+          els.activityBadge.removeAttribute('hidden');
+        } else {
+          els.activityBadge.setAttribute('hidden', '');
+        }
+      }
 
       const snapshotJSON = JSON.stringify({ chunks: memIdx.chunks, facts: memIdx.activeFacts, approvals: totalApprovalCount, mode: snap.proactivity && snap.proactivity.policy && snap.proactivity.policy.mode });
-      const runsJSON = JSON.stringify(list.map((r) => [r.id, r.status, r.updatedAt]));
+      // Include live status + preview line in the signature so the inbox
+      // re-renders when a live run's current activity changes (not just on
+      // status/timestamp transitions).
+      const runsJSON = JSON.stringify(list.map((r) => [r.id, r.status, r.runState, r.updatedAt, r.live, r.liveLine, r.preview, r.needsAttention]));
       if (runsJSON !== lastRunsJSON) {
-        renderRunList(list);
+        renderInbox(list);
         lastRunsJSON = runsJSON;
+      } else {
+        lastInboxList = list;
       }
       lastSnapshotJSON = snapshotJSON;
 
       if (selectedRunId) {
         const stillThere = list.find((r) => r.id === selectedRunId);
-        if (stillThere) loadDetail(selectedRunId);
+        if (stillThere) {
+          // Re-fetch the detail only when the selection is live (timeline
+          // still moving) or its data actually changed. Avoids collapsing an
+          // open "Technical details" toggle on a finished run every 2s.
+          const sig = stillThere.id + '|' + stillThere.status + '|' + (stillThere.runState || '') + '|' + stillThere.updatedAt + '|' + (stillThere.liveLine || '');
+          if (stillThere.live || sig !== lastDetailSig) loadDetail(selectedRunId);
+          lastDetailSig = sig;
+        }
       }
 
       els.lastSync.textContent = new Date().toLocaleTimeString();
@@ -11710,6 +12138,15 @@ const CONSOLE_JS = `
   let meetingsPromoted = false;
 
   function switchPanel(name) {
+    if (name === 'tools') {
+      switchPanel('settings');
+      setTimeout(() => {
+        if (typeof window.__clementineSetSettingsTab === 'function') {
+          window.__clementineSetSettingsTab('tools');
+        }
+      }, 0);
+      return;
+    }
     panelSections.forEach((s) => {
       const match = s.getAttribute('data-section') === name;
       if (match) s.removeAttribute('hidden');
@@ -11738,8 +12175,6 @@ const CONSOLE_JS = `
         refreshWorkflowList();
         refreshCronList().catch((err) => console.error('cron list refresh failed:', err));
       }
-    } else if (name === 'tools') {
-      if (!toolsBooted) { toolsBooted = true; bootToolsPanel(); }
     } else if (name === 'projects') {
       if (!projectsBooted) { projectsBooted = true; bootProjectsPanel(); }
     } else if (name === 'skills') {
@@ -11861,6 +12296,14 @@ const CONSOLE_JS = `
   function panelFromHash() {
     const requested = (location.hash || '').replace(/^#/, '').trim();
     if (!requested) return 'home';
+    if (requested === 'tools') {
+      setTimeout(() => {
+        if (typeof window.__clementineSetSettingsTab === 'function') {
+          window.__clementineSetSettingsTab('tools');
+        }
+      }, 0);
+      return 'settings';
+    }
     const panelName = requested.startsWith('workflows/') ? 'workflows' : requested;
     return panelSections.some((section) => section.getAttribute('data-section') === panelName)
       ? panelName
@@ -11923,11 +12366,11 @@ const CONSOLE_JS = `
         try {
           selectedRunId = targetRunId;
           if (typeof loadDetail === 'function') loadDetail(targetRunId);
-          if (els && els.runList) {
-            Array.from(els.runList.querySelectorAll('li.run')).forEach((el) => {
+          if (els && els.inboxList) {
+            Array.from(els.inboxList.querySelectorAll('.inbox-item')).forEach((el) => {
               el.classList.toggle('selected', el.getAttribute('data-run-id') === targetRunId);
             });
-            const selectedLi = els.runList.querySelector('li.run.selected');
+            const selectedLi = els.inboxList.querySelector('.inbox-item.selected');
             if (selectedLi && typeof selectedLi.scrollIntoView === 'function') {
               selectedLi.scrollIntoView({ block: 'center', behavior: 'smooth' });
             }
@@ -11957,12 +12400,12 @@ const CONSOLE_JS = `
         try {
           selectedRunId = targetSessionId;
           if (typeof loadDetail === 'function') loadDetail(targetSessionId);
-          if (els && els.runList) {
-            Array.from(els.runList.querySelectorAll('li.run')).forEach((el) => {
+          if (els && els.inboxList) {
+            Array.from(els.inboxList.querySelectorAll('.inbox-item')).forEach((el) => {
               el.classList.toggle('selected', el.getAttribute('data-run-id') === targetSessionId);
             });
             // Scroll the selected row into view if it exists.
-            const selectedLi = els.runList.querySelector('li.run.selected');
+            const selectedLi = els.inboxList.querySelector('.inbox-item.selected');
             if (selectedLi && typeof selectedLi.scrollIntoView === 'function') {
               selectedLi.scrollIntoView({ block: 'center', behavior: 'smooth' });
             }
@@ -16397,7 +16840,7 @@ const CONSOLE_JS = `
   setInterval(syncArchitectChatChips, 500);
   syncArchitectChatChips();
 
-  // ─── Tools panel ──────────────────────────────────────────────
+  // ─── Tools catalog (Settings → Tools) ─────────────────────────
 
   const tools = {
     search:     document.querySelector('[data-tools-search]'),
@@ -16417,7 +16860,9 @@ const CONSOLE_JS = `
       renderToolsGrid();
       if (tools.mcpCount) tools.mcpCount.textContent = (toolsData.mcpServers || []).length;
     } catch (err) {
-      tools.grid.innerHTML = '<div class="tools-empty">— failed: ' + escMem(err.message || err) + ' —</div>';
+      if (tools.grid) {
+        tools.grid.innerHTML = '<div class="tools-empty">— failed: ' + escMem(err.message || err) + ' —</div>';
+      }
     }
     // Also load the LOCAL CLIs registry view (connected-clis.json mirror).
     // Same endpoint Integrations uses, but rendered view-only here so the
@@ -16461,6 +16906,7 @@ const CONSOLE_JS = `
   }
 
   function renderToolsCategories() {
+    if (!toolsData || !tools.categories || !tools.count) return;
     const counts = new Map();
     toolsData.tools.forEach((t) => counts.set(t.category, (counts.get(t.category) || 0) + 1));
     const total = toolsData.tools.length;
@@ -16484,8 +16930,8 @@ const CONSOLE_JS = `
   }
 
   function renderToolsGrid() {
-    if (!toolsData) return;
-    const q = (tools.search.value || '').trim().toLowerCase();
+    if (!toolsData || !tools.grid || !tools.shown) return;
+    const q = ((tools.search && tools.search.value) || '').trim().toLowerCase();
     const filtered = toolsData.tools.filter((t) =>
       (toolsActiveCategory === '' || t.category === toolsActiveCategory) &&
       (q === '' || t.name.toLowerCase().includes(q) || (t.description || '').toLowerCase().includes(q) || t.category.toLowerCase().includes(q)),
@@ -16508,7 +16954,7 @@ const CONSOLE_JS = `
     ].join('')).join('');
   }
 
-  tools.search.addEventListener('input', () => renderToolsGrid());
+  if (tools.search) tools.search.addEventListener('input', () => renderToolsGrid());
 
   // ─── Projects panel ────────────────────────────────────────────
 
@@ -17074,6 +17520,10 @@ const CONSOLE_JS = `
         else block.setAttribute('data-tab-hidden', 'true');
       });
       try { localStorage.setItem(STORAGE_KEY, next); } catch (_) { /* private mode */ }
+      if (next === 'tools' && !toolsBooted) {
+        toolsBooted = true;
+        bootToolsPanel();
+      }
       refreshColumns();
     };
     window.__clementineRefreshSettingsTabColumns = refreshColumns;
@@ -17348,12 +17798,12 @@ const CONSOLE_JS = `
       } else {
         setHomeHarnessSessionId(body.sessionId, body.status === 'resuming' ? 'resuming' : 'chat');
       }
-      await streamHarnessSession(body.sessionId, assistantTurn, { ...options, sinceSeq: body.sinceSeq || 0 });
+      const streamResult = await streamHarnessSession(body.sessionId, assistantTurn, { ...options, sinceSeq: body.sinceSeq || 0 });
       if (body.status === 'new-pending' || body.status === 'cancelled') {
         setHomeHarnessSessionId(null);
       }
       homeChatHistory.push({ role: 'assistant', text: assistantTurn.querySelector('[data-home-chat-turn-text]')?.textContent || '' });
-      return { ok: true };
+      return { ok: !streamResult || streamResult.ok !== false };
     } catch (err) {
       setChatTurnText(assistantTurn, 'Network error: ' + ((err && err.message) || err));
       setChatTurnStatus(assistantTurn, 'failed');
@@ -17399,24 +17849,46 @@ const CONSOLE_JS = `
 
   function streamHarnessSession(sessionId, turn, options) {
     const MAX_RECONNECTS = 5;
+    const IDLE_TIMEOUT_MS = 10 * 60 * 1000;
     return new Promise((resolve) => {
       let lastSeq = Number(options && options.sinceSeq) || 0;
       let attempts = 0;
       let es = null;
       let closed = false;
       let sawEvent = false;
+      let streamError = '';
       let fallbackTimer = null;
+      let idleTimer = null;
 
       const finish = () => {
         if (closed) return;
         closed = true;
         try { if (es) es.close(); } catch (_) {}
         if (fallbackTimer) { try { clearInterval(fallbackTimer); } catch (_) {} fallbackTimer = null; }
-        resolve();
+        if (idleTimer) { try { clearTimeout(idleTimer); } catch (_) {} idleTimer = null; }
+        resolve({ ok: !streamError, error: streamError || null });
+      };
+
+      const failStream = (message) => {
+        if (closed) return;
+        streamError = message || 'stream interrupted';
+        const existing = turn?.querySelector?.('[data-home-chat-turn-text]')?.textContent || '';
+        const note = 'I lost the live connection before Clementine reported that this turn finished. Check Activity for the latest run state, or send “continue” if you want me to pick it back up.';
+        setChatTurnText(turn, existing ? (existing + '\\n\\n' + note) : note);
+        setChatTurnStatus(turn, 'stream interrupted');
+        finish();
+      };
+
+      const resetIdleTimer = () => {
+        if (idleTimer) { try { clearTimeout(idleTimer); } catch (_) {} }
+        idleTimer = setTimeout(() => {
+          failStream('no progress event received');
+        }, IDLE_TIMEOUT_MS);
       };
 
       const handleEvent = (ev) => {
         sawEvent = true;
+        resetIdleTimer();
         if (ev && typeof ev.seq === 'number' && ev.seq > lastSeq) lastSeq = ev.seq;
         renderHarnessEvent(ev, turn, options);
         if (ev.type === 'conversation_completed') {
@@ -17523,16 +17995,14 @@ const CONSOLE_JS = `
             // use the JSON replay fallback; a finished backend run
             // should still become visible in the chat card.
             pollReplayFallback().finally(() => {
-              if (!closed && sawEvent) return;
-              finish();
+              if (!closed) failStream(sawEvent ? 'event stream closed before a terminal event' : 'event stream closed before any event');
             });
             return;
           }
           attempts += 1;
           if (attempts > MAX_RECONNECTS) {
             pollReplayFallback().finally(() => {
-              if (!closed && !sawEvent) setChatTurnStatus(turn, 'lost connection');
-              if (!closed) finish();
+              if (!closed) failStream(sawEvent ? 'event stream could not reconnect before completion' : 'event stream could not connect');
             });
             return;
           }
@@ -17547,6 +18017,7 @@ const CONSOLE_JS = `
       // a terminal state. It covers renderer/EventSource drops without
       // changing the backend run path.
       fallbackTimer = setInterval(pollReplayFallback, 2500);
+      resetIdleTimer();
       connect();
     });
   }
@@ -17744,24 +18215,64 @@ const CONSOLE_JS = `
     if (!planProposalId) return;
     const actions = document.createElement('div');
     actions.className = 'home-chat-turn-actions';
-
-    const approve = document.createElement('button');
-    approve.type = 'button';
-    approve.textContent = 'Approve & proceed';
-    approve.addEventListener('click', () => {
-      resolvePlanProposalFromChat(approve, 'approve', planProposalId, turn);
-    });
-
-    const reject = document.createElement('button');
-    reject.type = 'button';
-    reject.textContent = 'Reject';
-    reject.addEventListener('click', () => {
-      resolvePlanProposalFromChat(reject, 'reject', planProposalId, turn);
-    });
-
-    actions.appendChild(approve);
-    actions.appendChild(reject);
     body.appendChild(actions);
+
+    const showBlocked = (message) => {
+      actions.innerHTML = '';
+      const note = document.createElement('div');
+      note.style.width = '100%';
+      note.textContent = message;
+      actions.appendChild(note);
+
+      const dismiss = document.createElement('button');
+      dismiss.type = 'button';
+      dismiss.textContent = 'Dismiss';
+      dismiss.addEventListener('click', () => {
+        resolvePlanProposalFromChat(dismiss, 'reject', planProposalId, turn);
+      });
+      actions.appendChild(dismiss);
+    };
+
+    const showApprovalButtons = () => {
+      actions.innerHTML = '';
+      const approve = document.createElement('button');
+      approve.type = 'button';
+      approve.textContent = 'Approve & proceed';
+      approve.addEventListener('click', () => {
+        resolvePlanProposalFromChat(approve, 'approve', planProposalId, turn);
+      });
+
+      const reject = document.createElement('button');
+      reject.type = 'button';
+      reject.textContent = 'Reject';
+      reject.addEventListener('click', () => {
+        resolvePlanProposalFromChat(reject, 'reject', planProposalId, turn);
+      });
+
+      actions.appendChild(approve);
+      actions.appendChild(reject);
+    };
+
+    const loading = document.createElement('div');
+    loading.style.width = '100%';
+    loading.textContent = 'Checking plan status...';
+    actions.appendChild(loading);
+    fetchWithToken('/api/console/plan-proposals/' + encodeURIComponent(planProposalId))
+      .then(async (r) => {
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+        const needsInput = (((j.proposal || {}).plan || {}).needsUserInput || [])
+          .filter((q) => typeof q === 'string' && q.trim().length > 0);
+        if (needsInput.length > 0) {
+          setChatTurnStatus(turn, 'awaiting reply');
+          showBlocked('Answer the question above before this plan can run.');
+        } else {
+          showApprovalButtons();
+        }
+      })
+      .catch(() => {
+        showBlocked('Open the Approvals panel to review this plan.');
+      });
   }
 
   async function resolvePlanProposalFromChat(button, decision, planProposalId, turn) {
@@ -17853,25 +18364,64 @@ const CONSOLE_JS = `
     if (status) status.textContent = text || '';
   }
 
-  async function readNdjsonStream(response, onEvent) {
+  async function readNdjsonStream(response, onEvent, options) {
     if (!response.body) throw new Error('Streaming response did not include a body.');
+    const opts = options || {};
+    const idleMs = Number(opts.idleMs) > 0 ? Number(opts.idleMs) : 150000;
+    const isTerminalEvent = typeof opts.isTerminalEvent === 'function'
+      ? opts.isTerminalEvent
+      : (event) => event && (event.type === 'done' || event.type === 'error');
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
+    let eventCount = 0;
+    let sawTerminal = false;
+
+    const readWithTimeout = () => new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        try { reader.cancel(); } catch (_) {}
+        reject(new Error('No stream progress for ' + Math.round(idleMs / 1000) + 's.'));
+      }, idleMs);
+      reader.read().then((result) => {
+        clearTimeout(timer);
+        resolve(result);
+      }, (err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+    });
+
+    const dispatchLine = (line) => {
+      const trimmed = line.trim();
+      if (!trimmed) return;
+      const event = JSON.parse(trimmed);
+      eventCount += 1;
+      if (isTerminalEvent(event)) sawTerminal = true;
+      onEvent(event);
+    };
+
     while (true) {
-      const { value, done } = await reader.read();
+      const { value, done } = await readWithTimeout();
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split('\\n');
       buffer = lines.pop() || '';
       for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-        onEvent(JSON.parse(trimmed));
+        dispatchLine(line);
+        if (sawTerminal && opts.stopOnTerminal !== false) {
+          try { reader.cancel(); } catch (_) {}
+          return { eventCount, terminal: true };
+        }
       }
     }
     const tail = buffer.trim();
-    if (tail) onEvent(JSON.parse(tail));
+    if (tail) dispatchLine(tail);
+    if (opts.requireTerminal && !sawTerminal) {
+      throw new Error(eventCount > 0
+        ? 'Stream ended before Clementine reported completion.'
+        : 'Stream ended before Clementine sent any events.');
+    }
+    return { eventCount, terminal: sawTerminal };
   }
 
   async function sendHomeChat(text, options = {}) {
@@ -17968,6 +18518,11 @@ const CONSOLE_JS = `
           setChatTurnStatus(assistantTurn, 'failed');
           options.onStatus?.(finalText, 'error');
         }
+      }, {
+        idleMs: 150000,
+        requireTerminal: true,
+        stopOnTerminal: true,
+        isTerminalEvent: (event) => event && (event.type === 'done' || event.type === 'error'),
       });
 
       const textOut = finalText || streamedText || '(no reply)';
@@ -17975,9 +18530,11 @@ const CONSOLE_JS = `
       homeChatHistory.push({ role: 'assistant', text: textOut });
       return { ok: !textOut.startsWith('Error:'), text: textOut, pendingApprovalId };
     } catch (err) {
-      setChatTurnText(assistantTurn, 'Network error: ' + (err.message || err));
-      setChatTurnStatus(assistantTurn, 'failed');
-      return { ok: false, text: err.message || String(err) };
+      const message = (err && err.message) || String(err);
+      const note = 'I lost the live connection before Clementine reported that this turn finished. Check Activity for the latest run state, or send “continue” if you want me to pick it back up.';
+      setChatTurnText(assistantTurn, streamedText ? (streamedText + '\\n\\n' + note) : note);
+      setChatTurnStatus(assistantTurn, message.startsWith('No stream progress') ? 'stream timed out' : 'stream interrupted');
+      return { ok: false, text: message };
     } finally {
       assistantTurn?.classList.remove('pending');
       stopThinkingButton(send, thinkTimer);
@@ -21313,6 +21870,7 @@ const CONSOLE_JS = `
       }
       listEl.innerHTML = items.map((p) => {
         const plan = p.plan || {};
+        const needsInput = (plan.needsUserInput || []).length > 0;
         const proposedAt = (p.proposedAt || '').slice(0, 16).replace('T', ' ');
         const steps = (plan.steps || []).map((s) => (
           '<li><span class="plan-step-n">' + s.n + '.</span> ' +
@@ -21325,9 +21883,22 @@ const CONSOLE_JS = `
         const risks = (plan.risks || []).length > 0
           ? '<div class="plan-section"><span class="plan-label">RISKS</span><ul class="plan-risks">' + plan.risks.map((r) => '<li>' + escMem(r) + '</li>').join('') + '</ul></div>'
           : '';
-        const questions = (plan.needsUserInput || []).length > 0
+        const questions = needsInput
           ? '<div class="plan-section"><span class="plan-label">QUESTIONS</span><ul class="plan-questions">' + plan.needsUserInput.map((q) => '<li>' + escMem(q) + '</li>').join('') + '</ul></div>'
           : '';
+        const actions = needsInput
+          ? [
+              '  <div class="plan-actions">',
+              '    <span class="settings-info">Answer the question in chat before this plan can run.</span>',
+              '    <button class="plan-btn-reject" data-plan-reject="' + escMem(p.id) + '">DISMISS ▣</button>',
+              '  </div>',
+            ].join('')
+          : [
+              '  <div class="plan-actions">',
+              '    <button class="plan-btn-approve" data-plan-approve="' + escMem(p.id) + '">APPROVE & PROCEED ✓</button>',
+              '    <button class="plan-btn-reject" data-plan-reject="' + escMem(p.id) + '">REJECT ▣</button>',
+              '  </div>',
+            ].join('');
         const trackedPill = plan.recommendsTrackedExecution
           ? '<span class="pill plan-tracked">RECOMMENDS TRACKED EXECUTION</span>'
           : '';
@@ -21348,10 +21919,7 @@ const CONSOLE_JS = `
           '  <div class="plan-section"><span class="plan-label">SUCCESS</span><ul class="plan-success">' + successCriteria + '</ul></div>',
           risks,
           questions,
-          '  <div class="plan-actions">',
-          '    <button class="plan-btn-approve" data-plan-approve="' + escMem(p.id) + '">APPROVE & PROCEED ✓</button>',
-          '    <button class="plan-btn-reject" data-plan-reject="' + escMem(p.id) + '">REJECT ▣</button>',
-          '  </div>',
+          actions,
           '</div>',
         ].join('');
       }).join('');
@@ -22273,6 +22841,27 @@ const CONSOLE_JS = `
   tick();
   setInterval(tick, POLL_MS);
 
+  // ── Activity live stream ──────────────────────────────────────────
+  // Subscribe to the in-process action bus (SSE) so the inbox reflects
+  // run/session changes within ~300ms instead of waiting up to one 2s
+  // poll. The 2s poll above stays as the safety net (and EventSource
+  // auto-reconnects), so a dropped stream degrades gracefully.
+  (function initActivityLiveStream() {
+    if (typeof EventSource === 'undefined') return;
+    let refreshTimer = null;
+    const scheduleRefresh = () => {
+      if (refreshTimer) return;
+      refreshTimer = setTimeout(() => { refreshTimer = null; tick().catch(() => {}); }, 300);
+    };
+    try {
+      const es = new EventSource(withToken('/api/console/actions/stream'));
+      es.addEventListener('run.event', scheduleRefresh);
+      es.addEventListener('harness.event', scheduleRefresh);
+      es.addEventListener('approval.created', scheduleRefresh);
+      es.addEventListener('approval.resolved', scheduleRefresh);
+    } catch (_) { /* polling remains the fallback */ }
+  })();
+
   // ── Nav-dock data wiring ──────────────────────────────────────────
   // Pulls live state from the same endpoints the home panel uses, plus
   // the recall IPC for live voice. Refreshes every 5s — same cadence
@@ -22501,6 +23090,12 @@ const CONSOLE_JS = `
     'memory_search', 'monitor_list', 'task_list',
   ]);
 
+  // Last rendered signature for the RECENT list. The dock refreshes every
+  // 5s; re-writing innerHTML on every tick repaints the whole list and
+  // makes the card visibly flash. We only touch the DOM when the rendered
+  // rows actually change.
+  let lastDockRecentSig = '';
+
   async function refreshDockRecent() {
     const list = document.querySelector('[data-dock-recent-list]');
     const count = document.querySelector('[data-dock-recent-count]');
@@ -22510,6 +23105,11 @@ const CONSOLE_JS = `
       const data = await fetchJSON('/api/console/tool-events/recent?limit=24');
       const rawEvents = Array.isArray(data?.events) ? data.events : [];
       const events = rawEvents.filter((e) => !DOCK_RECENT_HIDDEN.has(e.toolName)).slice(0, 6);
+      // Signature-guard the DOM write so an unchanged list doesn't repaint
+      // (and flash) every 5s.
+      const sig = events.length + '|' + events.map((e) => (e.at || '') + ':' + (e.toolName || '') + ':' + (e.outcome || e.phase || '')).join(',');
+      if (sig === lastDockRecentSig) return;
+      lastDockRecentSig = sig;
       count.textContent = String(events.length);
       if (events.length === 0) {
         list.innerHTML = '<div class="dock-empty">— quiet —</div>';
@@ -22525,7 +23125,10 @@ const CONSOLE_JS = `
         return '<div class="dock-recent-row ' + ok + '"><span class="t">' + escMem(t) + '</span><span class="n">' + glyph + ' ' + escMem(e.toolName || '?') + '</span></div>';
       }).join('');
     } catch {
-      list.innerHTML = '<div class="dock-empty">— activity feed offline —</div>';
+      if (lastDockRecentSig !== '__offline__') {
+        list.innerHTML = '<div class="dock-empty">— activity feed offline —</div>';
+        lastDockRecentSig = '__offline__';
+      }
     }
   }
 

@@ -68,7 +68,7 @@ import {
   requeueNotificationDelivery,
 } from '../runtime/notifications.js';
 import { buildDiscordInstallUrl } from './discord-install.js';
-import { getPlanProposal, rejectPlanProposal } from '../agents/plan-proposals.js';
+import { getPlanProposal, planProposalNeedsUserInput, rejectPlanProposal } from '../agents/plan-proposals.js';
 import { answerCheckIn, getCheckIn, listOpenCheckIns, type CheckInRecord } from '../agents/check-ins.js';
 import { approvePlanAndQueueBackgroundTask } from '../execution/approved-plan-tasks.js';
 import { queueBackgroundTaskApprovalResolution } from '../execution/background-tasks.js';
@@ -1002,6 +1002,21 @@ function buildPlanProposalActions(planProposalId: string) {
   ];
 }
 
+function buildPlanClarificationActions(planProposalId: string) {
+  return [
+    new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`${DISCORD_CUSTOM_ID_PREFIX}:plan-view:${planProposalId}`)
+        .setLabel('View in Dashboard')
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId(`${DISCORD_CUSTOM_ID_PREFIX}:plan-reject:${planProposalId}`)
+        .setLabel('Dismiss')
+        .setStyle(ButtonStyle.Danger),
+    ),
+  ];
+}
+
 function buildCheckInActions(checkInId: string) {
   return [
     new ActionRowBuilder<ButtonBuilder>().addComponents(
@@ -1032,7 +1047,12 @@ function buildCheckInActions(checkInId: string) {
 export function buildActionsForNotification(metadata: Record<string, unknown> | undefined): ActionRowBuilder<ButtonBuilder>[] | undefined {
   if (!metadata || typeof metadata !== 'object') return undefined;
   const planProposalId = typeof metadata.planProposalId === 'string' ? metadata.planProposalId : undefined;
-  if (planProposalId) return buildPlanProposalActions(planProposalId);
+  if (planProposalId) {
+    const proposal = getPlanProposal(planProposalId);
+    if (!proposal) return undefined;
+    if (planProposalNeedsUserInput(proposal)) return buildPlanClarificationActions(planProposalId);
+    return buildPlanProposalActions(planProposalId);
+  }
   const approvalId = typeof metadata.approvalId === 'string' ? metadata.approvalId : undefined;
   if (approvalId) return buildApprovalActions(approvalId);
   const checkInId = typeof metadata.checkInId === 'string' ? metadata.checkInId : undefined;
@@ -2227,6 +2247,18 @@ async function handleButtonInteraction(interaction: ButtonInteraction, assistant
     }
 
     if (action === 'plan-approve') {
+      const proposal = getPlanProposal(targetId);
+      if (proposal && planProposalNeedsUserInput(proposal)) {
+        await interaction.reply({
+          content: [
+            'This plan still needs a clarification before it can run:',
+            ...proposal.plan.needsUserInput.map((q) => `- ${q}`),
+            'Reply with the missing detail, then Clementine can revise the plan.',
+          ].join('\n'),
+          ephemeral: true,
+        });
+        return;
+      }
       const result = approvePlanAndQueueBackgroundTask(targetId);
       if (!result) {
         await interaction.reply({ content: `Plan \`${targetId}\` was not found or already resolved.`, ephemeral: true });
@@ -2259,8 +2291,8 @@ async function handleButtonInteraction(interaction: ButtonInteraction, assistant
       await interaction.reply({
         content: [
           `**${proposal.plan.objective}**`,
-          `Complexity: ${proposal.plan.estimatedComplexity}; ${proposal.plan.steps.length} step(s).`,
-          'Open Clementine Desktop → Proposals to view full steps, success criteria, risks, and edit before approving.',
+          `${proposal.plan.steps.length} planned step${proposal.plan.steps.length === 1 ? '' : 's'}.`,
+          'Open Clementine Desktop -> Proposals to view details, edit, or decide.',
         ].join('\n'),
         ephemeral: true,
       });

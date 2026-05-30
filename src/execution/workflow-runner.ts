@@ -7,7 +7,7 @@ import { MODELS, getRuntimeEnv } from '../config.js';
 import { runBoundedPool } from './bounded-pool.js';
 import { bindStepInputs } from './step-binding.js';
 import { addNotification } from '../runtime/notifications.js';
-import { startRun, finishRun } from '../runtime/run-events.js';
+import { addRunEvent, startRun, finishRun } from '../runtime/run-events.js';
 import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
 import { WORKFLOWS_DIR } from '../memory/vault.js';
 import {
@@ -1777,6 +1777,18 @@ export function reapResolvedParkedRuns(): void {
     // park path (declarative gate throws before its own finally can clear).
     clearWorkflowRunPausedForApproval(run.id);
     writeRunRecord(filePath, { ...run, status: 'running' });
+    try {
+      addRunEvent(run.id, {
+        type: 'run_resumed',
+        status: 'running',
+        message: 'Workflow approval resolved. Resuming the run.',
+        data: {
+          workflow: run.workflow,
+          parkedSteps: run.parked.parkedSteps.map((s) => s.stepId),
+          approvalIds: watched,
+        },
+      });
+    } catch { /* run-events is best-effort; never block resume */ }
     logger.info(
       { workflow: run.workflow, runId: run.id, parkedSteps: run.parked.parkedSteps.map((s) => s.stepId) },
       'Parked workflow run re-admitted — approval(s) resolved',
@@ -2083,12 +2095,35 @@ async function processOneRunFile(
       // parked step (events.jsonl drives resume, so completed steps are
       // never re-run). The heartbeat is torn down in the finally below.
       if (error instanceof ParkRunSignal) {
+        const parkedAt = new Date().toISOString();
+        const approvalIds = error.parkedSteps.flatMap((step) => step.approvalIds);
         writeRunRecord(filePath, {
           ...run,
           status: 'parked',
           startedAt: run.startedAt ?? new Date().toISOString(),
-          parked: { parkedSteps: error.parkedSteps, parkedAt: new Date().toISOString() },
+          parked: { parkedSteps: error.parkedSteps, parkedAt },
         });
+        try {
+          finishRun(run.id, {
+            status: 'awaiting_approval',
+            message: `Workflow is waiting for approval: ${error.parkedSteps.map((step) => step.stepId).join(', ') || 'approval step'}`,
+            pendingApprovalId: approvalIds[0],
+            outputPreview: 'This workflow is parked until you approve or reject the pending approval.',
+          });
+        } catch {
+          try {
+            addRunEvent(run.id, {
+              type: 'approval_required',
+              status: 'awaiting_approval',
+              message: 'Workflow is waiting for approval.',
+              data: {
+                workflow: workflow.data.name,
+                parkedSteps: error.parkedSteps.map((step) => step.stepId),
+                approvalIds,
+              },
+            });
+          } catch { /* run-events is best-effort; never block parking */ }
+        }
         logger.info(
           { workflow: workflow.data.name, runId: run.id, parkedSteps: error.parkedSteps.map((p) => p.stepId) },
           'Workflow run parked on approval — bounded-pool slot released',

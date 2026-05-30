@@ -418,7 +418,7 @@ test('confirm-first gate: same-shape writes accrue across calls and the batch tr
   }
 });
 
-test('confirm-first gate: off by default — batch passes when the flag is unset', async () => {
+test('confirm-first gate: explicit off escape hatch lets batches pass', async () => {
   const prevBrackets = process.env.HARNESS_TOOL_BRACKETS;
   const prevConfirm = process.env.CLEMMY_CONFIRM_FIRST;
   const prevExecGate = process.env.CLEMMY_EXECUTION_GATE;

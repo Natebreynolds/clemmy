@@ -162,6 +162,24 @@ test('listToolChoices returns all records under the current machine', () => {
   assert.ok(intents.has('machine.isolation.check'));
 });
 
+test('renderToolChoicesForContext is on by default and can be disabled', () => {
+  const previous = process.env.TOOL_CHOICE_CONTEXT_INJECT;
+  try {
+    delete process.env.TOOL_CHOICE_CONTEXT_INJECT;
+    rememberToolChoice({
+      intent: 'default.render.enabled',
+      choice: { kind: 'cli', identifier: 'default-tool', testedAt: '2099-03-01T00:00:00.000Z' },
+    });
+    assert.match(renderToolChoicesForContext(1), /default\.render\.enabled/);
+
+    process.env.TOOL_CHOICE_CONTEXT_INJECT = 'off';
+    assert.equal(renderToolChoicesForContext(1), '');
+  } finally {
+    if (previous === undefined) delete process.env.TOOL_CHOICE_CONTEXT_INJECT;
+    else process.env.TOOL_CHOICE_CONTEXT_INJECT = previous;
+  }
+});
+
 test('renderToolChoicesForContext respects per-line and block budgets', () => {
   const previous = process.env.TOOL_CHOICE_CONTEXT_INJECT;
   process.env.TOOL_CHOICE_CONTEXT_INJECT = 'on';
@@ -174,7 +192,7 @@ test('renderToolChoicesForContext respects per-line and block budgets', () => {
           kind: 'cli',
           identifier: `sf-${n}`,
           invocationTemplate: longTemplate,
-          testedAt: `2099-01-0${n}T00:00:00.000Z`,
+          testedAt: `2099-04-0${n}T00:00:00.000Z`,
         },
       });
     }

@@ -158,8 +158,8 @@ export function renderHarnessMemoryContext(): string {
 
   // P2 (measured learning loop): inject remembered tool choices so the
   // agent recalls a proven tool by READING the context, not only by
-  // calling tool_choice_recall. Flag-gated (TOOL_CHOICE_CONTEXT_INJECT,
-  // default off) — returns '' when off, so context is unchanged.
+  // calling tool_choice_recall. Enabled by default with a hard prompt
+  // budget; TOOL_CHOICE_CONTEXT_INJECT=off is the escape hatch.
   // [[project_measured_learning_loop]].
   let toolChoices = '';
   try {

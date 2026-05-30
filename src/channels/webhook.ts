@@ -73,6 +73,9 @@ import {
   liveLine,
   runFilterCategory,
   runPreview,
+  userFacingRunState,
+  userFacingRunStateIsLive,
+  userFacingRunStateLabel,
   type ActivityRunLike,
 } from '../runtime/activity-format.js';
 import { readMemoryIndexStatus, rebuildVaultIndex } from '../memory/indexer.js';
@@ -98,7 +101,21 @@ function isDiscordHarnessSession(session: HarnessSessionRow): boolean {
     || session.metadata.source === 'discord';
 }
 
+// A workflow runs each step in its own harness session (see
+// getWorkflowHarnessSession in workflow-runner.ts: id `workflow:<suffix>`,
+// title `<workflow>::<stepId>`, metadata.workflowRunId+stepId). Those are
+// internal SUB-UNITS of a run — the run itself is surfaced as a single legacy
+// run ("Workflow: <name>", id = workflowRunId) or its workflows/runs/*.json
+// record. Without this guard a 5-step workflow spawned 6 inbox rows.
+function isWorkflowStepSession(session: HarnessSessionRow): boolean {
+  const md = session.metadata ?? {};
+  return Boolean(md.stepId)
+    || Boolean(md.workflowRunId)
+    || String(session.id).startsWith('workflow:');
+}
+
 function isActivityVisibleHarnessSession(session: HarnessSessionRow): boolean {
+  if (isWorkflowStepSession(session)) return false;
   return session.kind === 'chat'
     || session.kind === 'workflow'
     || session.status === 'active'
@@ -154,7 +171,11 @@ function requireMobileSurfaceForMobileHost(
 }
 
 function effectiveHarnessStatus(session: HarnessSessionRow, events: HarnessEventRow[]): string {
-  const newestFirst = events.slice().reverse();
+  // Both callers pass events newest-first (desc), so the MOST RECENT terminal
+  // event must win — e.g. a run that requested approval and then completed is
+  // 'completed', not stuck on 'awaiting_approval'. (Previously this reversed to
+  // oldest-first under a misleading name and returned the stale state.)
+  const newestFirst = events;
   const terminal = newestFirst.find((event) =>
     event.type === 'conversation_completed'
     || event.type === 'run_completed'
@@ -176,7 +197,9 @@ function effectiveHarnessStatus(session: HarnessSessionRow, events: HarnessEvent
 function harnessSessionAsActivityRun(session: HarnessSessionRow) {
   const events = harnessListEvents(session.id, { limit: 80, desc: true });
   const status = effectiveHarnessStatus(session, events);
-  const completion = events.slice().reverse().find((event) =>
+  // events are newest-first (desc), so find() returns the MOST RECENT
+  // completion — i.e. the latest reply/summary, not the first one.
+  const completion = events.find((event) =>
     event.type === 'conversation_completed' || event.type === 'run_completed',
   );
   const outputPreview = completion
@@ -195,7 +218,9 @@ function harnessSessionAsActivityRun(session: HarnessSessionRow) {
     updatedAt: session.updatedAt,
     completedAt: status === 'completed' ? session.updatedAt : undefined,
     outputPreview,
-    events: events.map((event) => ({
+    // Harness events are fetched newest-first; emit them oldest-first so the
+    // timeline and liveLine match legacy runs (which are appended in order).
+    events: events.slice().reverse().map((event) => ({
       id: event.id,
       type: event.type,
       message: harnessEventMessage(event),
@@ -211,14 +236,23 @@ function harnessSessionAsActivityRun(session: HarnessSessionRow) {
  * every original field is preserved, so older clients keep working.
  */
 function enrichActivityRun<T extends ActivityRunLike>(run: T) {
+  const runState = userFacingRunState(run);
   return {
     ...run,
     kindLabel: friendlyKindLabel(run),
-    statusLabel: friendlyStatusLabel(run.status),
+    rawStatusLabel: friendlyStatusLabel(run.status),
+    statusLabel: userFacingRunStateLabel(runState),
+    runState,
+    runStateLabel: userFacingRunStateLabel(runState),
     category: runFilterCategory(run),
-    live: isLive(run.status),
+    live: userFacingRunStateIsLive(runState),
+    rawLive: isLive(run.status),
     liveLine: liveLine(run),
     preview: runPreview(run),
+    needsAttention: runState === 'waiting_for_approval'
+      || runState === 'waiting_for_input'
+      || runState === 'stalled'
+      || runState === 'failed',
   };
 }
 
@@ -1221,12 +1255,17 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
       redirectDashboard(res, token, { kind: 'error', text: `Run not found: ${id}` });
       return;
     }
-    if (!run.queuedTaskId) {
+    // Resolve the background task either from the originating run's link, or
+    // from the run id itself when this IS a background task's own run
+    // (id `run-<taskid>`, which carries no queuedTaskId).
+    const ownTask = run.id.startsWith('run-') ? getBackgroundTask(run.id.slice(4)) : null;
+    const taskId = run.queuedTaskId ?? ownTask?.id;
+    if (!taskId) {
       redirectDashboard(res, token, { kind: 'error', text: `Run ${id} is not linked to a background task.` });
       return;
     }
 
-    const task = getBackgroundTask(run.queuedTaskId);
+    const task = getBackgroundTask(taskId);
     if (!task) {
       redirectDashboard(res, token, { kind: 'error', text: `Background task not found: ${run.queuedTaskId}` });
       return;
@@ -1552,7 +1591,39 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
     const harnessRuns = harnessListSessions({ limit: Math.max(resolvedLimit, 80) })
       .filter(isActivityVisibleHarnessSession)
       .map(harnessSessionAsActivityRun);
-    const runs = [...harnessRuns, ...legacyRuns]
+    // Dedup: a chat can produce BOTH a harness session (sess-…) and a legacy
+    // run record sharing the same sessionId. Prefer the harness session (it
+    // carries the richer event timeline) and drop the duplicate legacy row so
+    // the same conversation never shows twice in the inbox.
+    const harnessSessionIds = new Set(harnessRuns.map((run) => run.sessionId || run.id));
+    const dedupedLegacy = legacyRuns.filter((run) => !harnessSessionIds.has(run.sessionId));
+    // Workflow runs queued via the API exist only as workflows/runs/<id>.json
+    // until the runner starts them (which upserts a legacy run with the SAME
+    // id). Surface those file records so a queued/orphaned workflow run is
+    // visible in the inbox too — deduped by id against runs already collected.
+    const knownIds = new Set([...harnessRuns, ...dedupedLegacy].map((run) => run.id));
+    const workflowFileRuns = readWorkflowRuns(Math.max(resolvedLimit, 40))
+      .filter((rec) => typeof rec.id === 'string' && !knownIds.has(rec.id as string))
+      .map((rec) => {
+        const wfStatus = (rec.status as string | undefined) ?? 'queued';
+        return {
+          id: rec.id as string,
+          sessionId: `workflow:${rec.id as string}`,
+          kind: 'workflow',
+          channel: 'workflow',
+          source: 'workflow',
+          title: rec.workflow ? `Workflow: ${rec.workflow as string}` : 'Workflow run',
+          input: '',
+          status: wfStatus,
+          createdAt: rec.createdAt as string | undefined,
+          updatedAt: (rec.finishedAt as string | undefined) ?? (rec.startedAt as string | undefined) ?? (rec.createdAt as string | undefined),
+          completedAt: ['completed', 'failed', 'cancelled'].includes(wfStatus) ? (rec.finishedAt as string | undefined) : undefined,
+          outputPreview: typeof rec.output === 'string' ? rec.output.slice(0, 1200) : '',
+          error: typeof rec.error === 'string' ? rec.error : undefined,
+          events: [] as Array<Record<string, unknown>>,
+        };
+      });
+    const runs = [...harnessRuns, ...dedupedLegacy, ...workflowFileRuns]
       .sort((left, right) =>
         String(right.updatedAt || right.completedAt || right.createdAt || '')
           .localeCompare(String(left.updatedAt || left.completedAt || left.createdAt || '')),
@@ -1577,6 +1648,14 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
         if (session) {
           const events = harnessListEvents(id, { limit: 500, desc: true }) ?? [];
           const status = effectiveHarnessStatus(session, events);
+          // Most-recent reply/summary for the reading pane "Result" block
+          // (events are newest-first, so find() returns the latest).
+          const completion = events.find((event) =>
+            event.type === 'conversation_completed' || event.type === 'run_completed',
+          );
+          const outputPreview = completion
+            ? String(completion.data?.summary || completion.data?.reply || '').slice(0, 1200)
+            : '';
           res.json({ run: enrichActivityRunDetail({
             id,
             sessionId: id,
@@ -1587,12 +1666,14 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
             objective: ((session as { objective?: unknown }).objective ?? undefined) as string | undefined,
             metadata: (session as { metadata?: Record<string, unknown> }).metadata,
             status,
+            outputPreview,
             createdAt: (session as { createdAt?: unknown }).createdAt as string | undefined,
             updatedAt: (session as { updatedAt?: unknown }).updatedAt as string | undefined,
             completedAt: status === 'completed' ? (session as { updatedAt?: unknown }).updatedAt as string | undefined : undefined,
             // Keep `data` so the clean timeline can name tools/steps; `message`
-            // is the pre-rendered friendly line for the raw view.
-            events: events.map((ev) => ({
+            // is the pre-rendered friendly line for the raw view. Reverse to
+            // oldest-first (events are fetched newest-first via desc).
+            events: events.slice().reverse().map((ev) => ({
               id: (ev as { id?: unknown }).id as string | undefined,
               type: (ev as { type?: unknown }).type as string | undefined,
               createdAt: (ev as { createdAt?: unknown }).createdAt as string | undefined,

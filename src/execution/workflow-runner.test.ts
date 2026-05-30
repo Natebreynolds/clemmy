@@ -45,6 +45,7 @@ const {
 const { HarnessSession } = await import('../runtime/harness/session.js');
 const { resetEventLog } = await import('../runtime/harness/eventlog.js');
 const approvalRegistry = await import('../runtime/harness/approval-registry.js');
+const runEvents = await import('../runtime/run-events.js');
 const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
 
 // ---------------------------------------------------------------------------
@@ -95,6 +96,38 @@ test('reapResolvedParkedRuns keeps a run parked while its approval is pending, r
   approvalRegistry.resolve(row.approvalId, 'approved', 'parking-test');
   reapResolvedParkedRuns();
   assert.equal(statusOf(filePath), 'running');
+
+  rmSync(filePath, { force: true });
+  delete process.env.WORKFLOW_APPROVAL_PARKING;
+});
+
+test('reapResolvedParkedRuns marks the Activity run as resumed when approval clears', () => {
+  process.env.WORKFLOW_APPROVAL_PARKING = 'on';
+  const runId = 'park-test-activity';
+  const sid = `workflow-gate:${runId}:send_step`;
+  HarnessSession.create({ id: sid, kind: 'workflow', channel: 'workflow', title: runId, metadata: { source: 'workflow' } });
+  const row = approvalRegistry.register({
+    sessionId: sid,
+    subject: 'Approve the send',
+    tool: 'workflow_approval_gate',
+    ttlMs: 60_000,
+  });
+  const filePath = writeParkedRun(runId, [row.approvalId]);
+  runEvents.startRun({
+    id: runId,
+    sessionId: `workflow:${runId}`,
+    channel: 'workflow',
+    source: 'workflow',
+    title: 'Workflow: Test Parking WF',
+    message: 'Running workflow "Test Parking WF"',
+  });
+
+  approvalRegistry.resolve(row.approvalId, 'approved', 'parking-test');
+  reapResolvedParkedRuns();
+
+  const activityRun = runEvents.getRun(runId);
+  assert.equal(activityRun?.status, 'running');
+  assert.equal(activityRun?.events.at(-1)?.type, 'run_resumed');
 
   rmSync(filePath, { force: true });
   delete process.env.WORKFLOW_APPROVAL_PARKING;

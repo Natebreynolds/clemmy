@@ -394,13 +394,14 @@ function emitToolChoiceEvent(action: ToolChoiceAction, intent: string, identifie
 }
 
 /**
- * P2 flag: inject remembered tool choices into the persistent context
+ * P2: inject remembered tool choices into the persistent context
  * block so the agent recalls a proven tool by READING, not only by
  * calling tool_choice_recall (which the prompt teaches but cannot
- * guarantee). Default OFF → context is byte-identical to today.
+ * guarantee). Default ON with an escape hatch because this is now
+ * budget-capped and per-machine.
  */
 function contextInjectEnabled(): boolean {
-  return (process.env.TOOL_CHOICE_CONTEXT_INJECT ?? 'off').toLowerCase() === 'on';
+  return (process.env.TOOL_CHOICE_CONTEXT_INJECT ?? 'on').toLowerCase() !== 'off';
 }
 
 /**

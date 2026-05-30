@@ -3,7 +3,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { renderPlanFirstFailureReply, shouldUsePlanFirst } from './plan-first.js';
+import { renderPlanFirstFailureReply, renderPlanNeedsInputReply, shouldUsePlanFirst } from './plan-first.js';
 
 test('shouldUsePlanFirst: fresh multi-system batch work gets planner-first gate', () => {
   const input =
@@ -77,4 +77,34 @@ test('renderPlanFirstFailureReply: planner failures stop before tool execution',
   assert.match(reply, /retry plan/);
   assert.match(reply, /simplify/);
   assert.match(reply, /proceed/);
+});
+
+test('renderPlanNeedsInputReply: asks for clarification without approval language', () => {
+  const reply = renderPlanNeedsInputReply({
+    objective: 'Prepare a local SEO opportunity brief.',
+    steps: [
+      {
+        n: 1,
+        action: 'Read relevant memory and workflow context.',
+        rationale: 'Use Clementine context before asking for outside data.',
+        verification: null,
+      },
+      {
+        n: 2,
+        action: 'Draft the local markdown brief.',
+        rationale: 'Produce the requested artifact after context is clear.',
+        verification: null,
+      },
+    ],
+    successCriteria: ['The brief names the firm and sources used.'],
+    risks: [],
+    estimatedComplexity: 'moderate',
+    recommendsTrackedExecution: false,
+    needsUserInput: ['Which local law firm should I brief?'],
+    appliedInstructions: [],
+  });
+
+  assert.match(reply, /Before I start, I need:/);
+  assert.match(reply, /Which local law firm/);
+  assert.doesNotMatch(reply, /approve/i);
 });

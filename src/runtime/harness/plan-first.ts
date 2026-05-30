@@ -86,6 +86,7 @@ function buildPlannerPrompt(input: string): string {
   return [
     'Draft a preflight plan for this fresh Clementine request before any external writes or long-running execution begins.',
     'Do not execute the work. Do not call mutating tools. Produce an inspectable plan the user can approve.',
+    'If required information is missing, put the shortest possible question in needsUserInput. A plan with needsUserInput is NOT approvable yet.',
     'Name the likely tool families or systems in the step text when they are obvious from the request.',
     '',
     `User request:\n${input}`,
@@ -110,6 +111,29 @@ function renderPlanReply(plan: Plan, proposalId: string): string {
     questions,
     '',
     `Review and approve plan ${proposalId} when you want me to proceed.`,
+  ].filter(Boolean).join('\n');
+}
+
+export function renderPlanNeedsInputReply(plan: Plan): string {
+  const steps = plan.steps
+    .slice(0, 6)
+    .map((step) => `${step.n}. ${step.action}`)
+    .join('\n');
+  const more = plan.steps.length > 6 ? `\n...and ${plan.steps.length - 6} more step${plan.steps.length - 6 === 1 ? '' : 's'}.` : '';
+  const questions = plan.needsUserInput
+    .map((q) => `- ${q}`)
+    .join('\n');
+  return [
+    'I drafted the plan before starting the tool work.',
+    '',
+    `Objective: ${plan.objective}`,
+    '',
+    `Plan:\n${steps}${more}`,
+    '',
+    'Before I start, I need:',
+    questions,
+    '',
+    'Reply with that detail and I’ll continue from this plan.',
   ].filter(Boolean).join('\n');
 }
 
@@ -209,6 +233,35 @@ export async function runPlanFirstPreflight(input: PlanFirstRunInput): Promise<P
         data: { error: message, stage: 'schema_parse' },
       });
       return surfacePlanFirstFailure(input, message);
+    }
+
+    const plan = parsed.data;
+    appendEvent({
+      sessionId: input.sessionId,
+      turn: 0,
+      role: 'system',
+      type: 'plan_drafted',
+      data: {
+        objective: plan.objective,
+        estimatedComplexity: plan.estimatedComplexity,
+        stepCount: plan.steps.length,
+        needsUserInput: plan.needsUserInput,
+      },
+    });
+
+    if (plan.needsUserInput.length > 0) {
+      appendEvent({
+        sessionId: input.sessionId,
+        turn: 0,
+        role: 'Clem',
+        type: 'awaiting_user_input',
+        data: {
+          reason: 'plan_first_needs_input',
+          question: renderPlanNeedsInputReply(plan),
+          needsUserInput: plan.needsUserInput,
+        },
+      });
+      return { surfaced: true };
     }
 
     const proposal = surfacePlan({
