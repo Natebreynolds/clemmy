@@ -3,7 +3,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { renderChannelDirective } from './instructions.js';
+import { renderChannelDirective, renderActionDisciplineDirective, hasScopedLanguage } from './instructions.js';
 
 test('discord: requests tight conversational replies under ~500 chars', () => {
   const d = renderChannelDirective('discord');
