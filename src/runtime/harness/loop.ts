@@ -221,6 +221,17 @@ function registerAndEmitApprovals(
             sessionId: options.sessionId,
             workflowName,
             stepId,
+            // When this approval came from a live Discord conversation,
+            // the Discord harness transport already attaches Approve/
+            // Reject buttons INLINE on the conversational reply
+            // (discord-harness.ts `approval_requested`). Flag the
+            // notification so the notification-delivery queue does NOT
+            // post a SECOND Discord approval card for the same id — that
+            // duplicate is what produced "double approvals in Discord"
+            // (desktop only renders the notification surface, so it never
+            // doubled). Other destinations (web_push/PWA, dashboard) and
+            // non-Discord channels are unaffected.
+            discordInlineHandled: channel === 'discord' && Boolean(channelId),
           },
         });
       } catch (notifyErr) {
@@ -736,21 +747,27 @@ export function buildPreflightBlockMessage(input: {
   effectiveLimit: number;
 }): string {
   const { predictedTokens, blockFraction, effectiveLimit } = input;
-  const useV2Message =
-    (getRuntimeEnv('CLEMMY_PREFLIGHT_BLOCK_MESSAGE_V2', 'on') ?? 'on').toLowerCase() !== 'off';
+  // ADVISORY, not an override. Guardrails inform the agent's decision;
+  // they never make it. This message used to hard-instruct "do NOT fire
+  // tool calls / you MUST propose_plan", which stopped Clem from doing
+  // its actual job (live 2026-05-30: "I need plan mode to do batch
+  // rates"). It now surfaces the cost as context and trusts the model to
+  // drive — be economical, or split big work via create_plan, but keep
+  // the task moving. The opt-out env stays for parity with old behavior.
+  const useLegacyBlock =
+    (getRuntimeEnv('CLEMMY_PREFLIGHT_LEGACY_BLOCK', 'off') ?? 'off').toLowerCase() === 'on';
   const header =
-    `[PREFLIGHT BUDGET BLOCK] Predicted next-turn tokens ${predictedTokens.toLocaleString()} ` +
-    `would exceed ${(blockFraction * 100).toFixed(0)}% of the effective context limit ` +
+    `[CONTEXT BUDGET NOTICE] This turn is projected at ~${predictedTokens.toLocaleString()} tokens, ` +
+    `nearing ${(blockFraction * 100).toFixed(0)}% of the effective context limit ` +
     `(${effectiveLimit.toLocaleString()} tokens). `;
-  if (useV2Message) {
+  if (!useLegacyBlock) {
     return (
       header +
-      `Do NOT fire tool calls in this turn — that would blow upstream limits. ` +
-      `Take ONE of these two actions instead: ` +
-      `(a) call \`create_plan\` with a title + concrete steps outlining the work you intend, then STOP and let the user review; or ` +
-      `(b) call \`ask_user_question\` with a concise question if scope is unclear, then STOP. ` +
-      `If neither path fits, reply with a brief text summary asking the user to type \`/new continue\` ` +
-      `to start a fresh session (facts + focus carry over via the brain).`
+      `This is guidance, not a stop — proceed if the work is worth it. To stay within budget, prefer ` +
+      `narrow tool calls (request only the fields you need) and avoid re-reading large outputs. ` +
+      `If this is a big multi-step effort, you MAY outline it with \`create_plan\` so it survives ` +
+      `context limits, but only if that genuinely helps — do not pause a task that you can finish now. ` +
+      `Use your judgment and keep moving.`
     );
   }
   return (
@@ -1865,7 +1882,14 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
         avgToolReturnTokens,
         expectedOutputTokens: EXPECTED_OUTPUT_PRIOR,
       });
-      const verdict = checkBudget({ predictedTokens: predicted, modelId });
+      // "Inform, rarely block": raise the block ceiling well above the
+      // 0.85 default so the gate only fires when a turn is genuinely
+      // near the wall. Env-tunable for emergencies. warn stays at 0.75.
+      const blockFractionEnv = Number.parseFloat(getRuntimeEnv('CLEMMY_PREFLIGHT_BLOCK_FRACTION', '0.92') ?? '0.92');
+      const blockFraction = Number.isFinite(blockFractionEnv) && blockFractionEnv > 0.75 && blockFractionEnv < 1
+        ? blockFractionEnv
+        : 0.92;
+      const verdict = checkBudget({ predictedTokens: predicted, modelId, blockFraction });
       const sessionKind = session.sessionRow.kind;
       // Telemetry: always record — even on 'ok' for ANY kind.
       safeAppend({

@@ -3,6 +3,7 @@ import { isKillRequested, appendEvent, getSession, listEvents } from './eventlog
 import { getHarnessBudgetSettings } from './budget-settings.js';
 import { listPending as listPendingApprovals } from './approval-registry.js';
 import { evaluateToolCall, applyMode } from './tool-guardrail.js';
+import { getRuntimeEnv } from '../../config.js';
 import {
   isMutatingExternalWrite,
   isGateEnabled as isExecutionGateEnabled,
@@ -675,7 +676,25 @@ export function wrapToolForHarness<T extends WrappableTool>(
             const scope = getPlanScope(ctx.sessionId);
             const hasReviewedScope = !!scope && !scope.closedAt;
 
-            if (review.required && !hasReviewedScope) {
+            // SEVERITY GATE (2026-05-30): only genuinely IRREVERSIBLE
+            // batches (SEND/PUBLISH — emails sent, posts published) must
+            // wait for a reviewed plan scope. A reversible write
+            // (GOOGLESHEETS_UPDATE/BATCH, a spreadsheet edit you can undo)
+            // is NOT worth deadlocking a capable agent over — it kept the
+            // confirm-first gate firing in chat sessions where nothing
+            // opens a scope, wedging the agent with no reachable exit
+            // (live: the 48-row Closed-Won sheet, email-analysis dropped).
+            // The runaway-loop guard (2b) + the per-tool SDK approval are
+            // the safety floor for reversible writes; this gate now only
+            // adds friction where the blast radius is truly irreversible.
+            // Philosophy: prevent irreversible mistakes, don't over-gate
+            // reversible execution. Env escape hatch keeps the old
+            // gate-everything behavior available if ever needed.
+            const gateAllMutating =
+              (getRuntimeEnv('CLEMMY_CONFIRM_FIRST_ALL_WRITES', 'off') ?? 'off').toLowerCase() === 'on';
+            const severityRequiresGate = gateAllMutating || shape.irreversible;
+
+            if (review.required && severityRequiresGate && !hasReviewedScope) {
               try {
                 appendEvent({
                   sessionId: ctx.sessionId,

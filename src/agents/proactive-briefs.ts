@@ -252,12 +252,22 @@ export async function processProactiveBriefs(assistant: ClementineAssistant): Pr
     blockedExecutions.length > 0 ||
     attentionTasks.length > 0;
 
+  // ORDER-INDEPENDENT signal. The source lists are sorted by `updatedAt`
+  // (most-recent first), so their ORDER shifts whenever any item updates —
+  // which made the non-urgent signature change on every tick even when the
+  // exact same work with the exact same statuses was in flight. That was a
+  // root of the Discord clutter: a fresh "work update" every cadence
+  // window for work the user already knew about. Sorting each list (the
+  // attention path already does this via sortedBriefTuples) makes the
+  // signature depend only on the SET of items, so a brief re-fires only
+  // when the work or a status actually CHANGES. (2026-05-30,
+  // [[feedback_desktop_discord_parity]].)
   const signal = {
-    executions: executions.map((execution) => [execution.id, execution.status, execution.nextStep, execution.blocker]),
-    activeTasks: activeTasks.map((task) => [task.id, task.status, task.lastCheckInMessage, task.pendingApprovalId]),
-    recentFailures: recentFailures.map((task) => [task.id, task.status, task.error]),
-    approvals: approvals.map((approval) => [approval.approvalId, approval.subject, approval.sessionId]),
-    blockedGoals: blockedGoals.map((goal) => [goal.id, goal.title, goal.blockers?.[0]]),
+    executions: sortedBriefTuples(executions.map((execution) => [execution.id, execution.status, execution.nextStep, execution.blocker])),
+    activeTasks: sortedBriefTuples(activeTasks.map((task) => [task.id, task.status, task.lastCheckInMessage, task.pendingApprovalId])),
+    recentFailures: sortedBriefTuples(recentFailures.map((task) => [task.id, task.status, task.error])),
+    approvals: sortedBriefTuples(approvals.map((approval) => [approval.approvalId, approval.subject, approval.sessionId])),
+    blockedGoals: sortedBriefTuples(blockedGoals.map((goal) => [goal.id, goal.title, goal.blockers?.[0]])),
   };
   const attentionSignal = {
     approvals: sortedBriefTuples(approvals.map((approval) => [approval.approvalId, approval.sessionId, approval.subject])),

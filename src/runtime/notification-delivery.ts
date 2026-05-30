@@ -98,6 +98,14 @@ function buildWebPushPayload(notification: NotificationRecord): {
 function shouldDeliverDiscordNotification(notification: NotificationRecord): boolean {
   if (notification.silent) return false;
 
+  // The Discord harness transport already showed an INLINE approval card
+  // (Approve/Reject buttons on the conversational reply). Suppress the
+  // duplicate notification-delivery card for the same approval so Discord
+  // matches the desktop app's single-surface behavior. Set in
+  // loop.ts registerAndEmitApprovals only for live Discord sessions; a
+  // non-Discord or non-conversational approval still delivers normally.
+  if (notification.metadata?.discordInlineHandled === true) return false;
+
   const title = notification.title.trim().toLowerCase();
   if (notification.kind === 'system' && title.startsWith('plan approved:')) return false;
   if (notification.kind === 'execution' && title.startsWith('approved plan queued:')) return false;

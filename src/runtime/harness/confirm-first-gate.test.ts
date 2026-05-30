@@ -71,6 +71,37 @@ test('decideInstructionReview: threshold floored at 2 — a 0/1 config cannot ga
   assert.equal(decideInstructionReview({ priorSameShapeCount: 1, threshold: 1 }).required, true);
 });
 
+// SEVERITY GATE (2026-05-30, brackets.ts:696) — the confirm-first batch
+// gate fires only when the batch crosses the threshold AND the write is
+// genuinely irreversible. A reversible batch (a Google Sheets edit you
+// can undo) must NOT gate, even far past the threshold: gating it in a
+// chat session where nothing opens a plan scope wedged the agent with no
+// reachable exit (live: the 48-row Closed-Won sheet; the email-analysis
+// writes were dropped and the run falsely reported "Done"). These tests
+// pin the decision the gate now makes, composing the two pure helpers
+// exactly as brackets.ts does.
+function gateFires(slug: string, priorSameShapeCount: number, threshold = 5, gateAllMutating = false): boolean {
+  const shape = classifyExternalWrite('composio_execute_tool', { tool_slug: slug });
+  if (!shape.mutating || !shape.shapeKey) return false;
+  const review = decideInstructionReview({ priorSameShapeCount, threshold });
+  const severityRequiresGate = gateAllMutating || shape.irreversible;
+  return review.required && severityRequiresGate;
+}
+
+test('severity gate: reversible Sheets batch never gates, even far past threshold', () => {
+  assert.equal(gateFires('GOOGLESHEETS_BATCH_UPDATE', 4), false);
+  assert.equal(gateFires('GOOGLESHEETS_BATCH_UPDATE', 50), false);
+});
+
+test('severity gate: irreversible email send gates at threshold', () => {
+  assert.equal(gateFires('GMAIL_SEND_EMAIL', 3), false, 'below threshold: no gate');
+  assert.equal(gateFires('GMAIL_SEND_EMAIL', 4), true, 'at threshold: gate');
+});
+
+test('severity gate: escape hatch re-gates all mutating writes when enabled', () => {
+  assert.equal(gateFires('GOOGLESHEETS_BATCH_UPDATE', 4, 5, true), true);
+});
+
 test('isConfirmFirstEnabled: defaults on with an explicit off escape hatch', () => {
   const previous = process.env.CLEMMY_CONFIRM_FIRST;
   try {

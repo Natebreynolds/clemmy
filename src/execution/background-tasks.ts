@@ -11,6 +11,8 @@ import path from 'node:path';
 import pino from 'pino';
 import { BASE_DIR, MODELS } from '../config.js';
 import { addNotification } from '../runtime/notifications.js';
+import { ExecutionStore } from './store.js';
+import type { RunStoppedReason } from '../types.js';
 import type { ClementineAssistant } from '../assistant/core.js';
 import { addRunEvent, finishRun, startRun } from '../runtime/run-events.js';
 import { AgentRuntimeCancelledError } from '../runtime/provider.js';
@@ -24,6 +26,15 @@ export type BackgroundTaskStatus =
   | 'cancelling'
   | 'awaiting_approval'
   | 'done'
+  // 'blocked' = the run stopped because it could NOT finish the objective
+  // (missing data, missing access, an unmet prerequisite) — distinct from
+  // 'done' (succeeded), 'failed' (errored), and 'awaiting_approval'
+  // (paused on a decision it can resume from). A blocked task must report
+  // honestly and wait for the user; it is NEVER reported as done and is
+  // NOT auto-resumed. Added 2026-05-30 after a task shipped an empty
+  // Google Sheet because the Salesforce pull came back empty yet the run
+  // still marked itself 'done'.
+  | 'blocked'
   | 'failed'
   | 'aborted'
   | 'interrupted';
@@ -343,6 +354,44 @@ export function markBackgroundTaskAwaitingApproval(id: string, approvalId: strin
   return updated;
 }
 
+/**
+ * Mark a task BLOCKED: it could not complete the objective because a
+ * prerequisite was missing (no data, no access, an unmet dependency).
+ * This is the honest terminal state for "I tried, I can't finish this
+ * without X" — never silently a 'done'. The notification is `approval`
+ * kind so it surfaces with attention; the body carries the concrete
+ * blocker + what the user can do. The task is NOT auto-resumed (resume
+ * would just re-block); the user re-runs once the blocker is cleared.
+ */
+export function markBackgroundTaskBlocked(id: string, reason: string, resultText: string): BackgroundTaskRecord | null {
+  const updated = updateBackgroundTask(id, {
+    status: 'blocked',
+    completedAt: nowIso(),
+    error: clean(reason, 1000),
+    result: resultText.slice(0, RESULT_TRUNCATE_CHARS),
+    pendingApprovalId: undefined,
+    approvalResolution: undefined,
+  });
+  if (updated) {
+    addNotification({
+      id: `${Date.now()}-background-${updated.id}-blocked`,
+      kind: 'approval',
+      title: `Background task blocked: ${updated.title}`,
+      body: [
+        `I couldn't finish this — I'm blocked, so I did NOT ship a partial/empty result.`,
+        ``,
+        `Blocker: ${clean(reason, 600)}`,
+        ``,
+        `Re-run once that's resolved and I'll continue.`,
+      ].join('\n'),
+      createdAt: nowIso(),
+      read: false,
+      metadata: taskNotificationMetadata(updated, { status: 'blocked' }),
+    });
+  }
+  return updated;
+}
+
 export function markBackgroundTaskFailed(id: string, error: string, status: Extract<BackgroundTaskStatus, 'failed' | 'aborted' | 'interrupted'> = 'failed'): BackgroundTaskRecord | null {
   const updated = updateBackgroundTask(id, {
     status,
@@ -362,6 +411,75 @@ export function markBackgroundTaskFailed(id: string, error: string, status: Extr
     });
   }
   return updated;
+}
+
+/**
+ * Decide the HONEST terminal state of a finished worker turn before we
+ * stamp it 'done'. The runtime can return normally (no pending approval,
+ * no thrown error) while the task did NOT actually achieve its objective
+ * — it left a blocked execution, or its own final text says it's blocked
+ * / waiting on input / produced nothing usable. Reporting that as 'done'
+ * is the failure the owner hit: an empty Google Sheet shipped because the
+ * Salesforce pull came back empty yet the run still "completed".
+ *
+ * Signals (any one ⇒ blocked):
+ *  - the worker left an execution in `blocked` status for this session
+ *    (it called execution_mark_blocked), or
+ *  - its final text matches a blocked/needs-input/approval-pending shape.
+ *
+ * Deliberately conservative: we only divert to `blocked` on a positive
+ * signal. A genuinely-complete run with no blocked markers stays 'done'.
+ */
+const BLOCKED_TEXT_PATTERNS: RegExp[] = [
+  /\bapproval required\b/i,
+  /\bpending approval id\b/i,
+  /\bi('?m| am)\s+blocked\b/i,
+  /\bi can('?t|not)\s+(complete|finish|proceed|continue)\b/i,
+  /\bunable to (complete|finish|proceed|continue|access|retrieve|pull)\b/i,
+  /\bcannot (complete|finish|proceed|continue) (this|the) (task|work|objective)\b/i,
+  /\bneed (more|additional|your) (input|information|access|approval|credentials)\b/i,
+  /\bwaiting (on|for) (your|user|the user)\b/i,
+  /\bblocked (on|by)\b/i,
+  /\bmissing (data|access|credentials|the required)\b/i,
+];
+
+export function classifyBackgroundTaskOutcome(
+  task: Pick<BackgroundTaskRecord, 'runSessionId'>,
+  finalText: string,
+  stoppedReason?: RunStoppedReason,
+): { outcome: 'done' | 'blocked'; reason?: string } {
+  // 1) Structured signal: did the worker explicitly mark an execution
+  //    blocked in its own session? This is the strongest signal — it's
+  //    the agent telling us, in code, that it could not proceed.
+  try {
+    const blockedExecution = new ExecutionStore()
+      .list(40)
+      .find((e) => e.sessionId === task.runSessionId && e.status === 'blocked');
+    if (blockedExecution) {
+      return { outcome: 'blocked', reason: blockedExecution.blocker || 'Execution marked blocked by the agent.' };
+    }
+  } catch {
+    // store read is best-effort; fall through to text heuristics
+  }
+
+  // 2) The runtime stopped while still pending an approval but the caller
+  //    didn't catch it (defense-in-depth; the explicit pendingApprovalId
+  //    branch normally handles this first).
+  if (stoppedReason === 'pending-approval') {
+    return { outcome: 'blocked', reason: 'Stopped awaiting an approval that was not surfaced.' };
+  }
+
+  // 3) Text heuristic: the agent's own final words say it's blocked.
+  const text = (finalText || '').trim();
+  if (text) {
+    for (const pattern of BLOCKED_TEXT_PATTERNS) {
+      if (pattern.test(text)) {
+        return { outcome: 'blocked', reason: text.slice(0, 400) };
+      }
+    }
+  }
+
+  return { outcome: 'done' };
 }
 
 export function cancelBackgroundTask(id: string, reason = 'Cancelled by user.'): BackgroundTaskRecord | null {
@@ -593,6 +711,17 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
           continue;
         }
 
+        const postApprovalOutcome = classifyBackgroundTaskOutcome(task, result.text);
+        if (postApprovalOutcome.outcome === 'blocked') {
+          markBackgroundTaskBlocked(task.id, postApprovalOutcome.reason ?? 'Task could not be completed.', result.text);
+          finishRun(run.id, {
+            status: 'failed',
+            message: `Background task ${task.id} blocked after approval ${resolution.approvalId}: ${postApprovalOutcome.reason ?? 'could not complete'}`,
+            outputPreview: result.text,
+          });
+          logger.warn({ taskId: task.id, approvalId: resolution.approvalId, reason: postApprovalOutcome.reason }, 'Background task blocked after approval continuation (not marked done)');
+          continue;
+        }
         markBackgroundTaskDone(task.id, result.text);
         finishRun(run.id, {
           status: 'completed',
