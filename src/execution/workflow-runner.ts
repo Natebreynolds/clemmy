@@ -757,6 +757,7 @@ function getWorkflowHarnessSession(
 export const workflowRunnerInternalsForTest = {
   findParkedWorkflowHarnessSession,
   getWorkflowHarnessSession,
+  awaitDeclarativeStepApproval,
 };
 
 async function runStepViaHarness(
@@ -1020,6 +1021,29 @@ async function awaitDeclarativeStepApproval(
   if (!row) {
     const subject = (step.approvalPreview && step.approvalPreview.trim())
       || `Approve "${ctx.workflow.name}" step "${step.id}" before it runs`;
+    // The approvals table has `session_id REFERENCES sessions(id)` with
+    // foreign_keys=ON, so a gate approval can only be registered once a
+    // sessions row exists for the gate id. The declarative gate uses its
+    // OWN synthetic session id (workflow-gate:<runId>:<stepId>) that no
+    // other path creates — so ensure it here (load-or-create, idempotent
+    // across resume) before register(), exactly as getWorkflowHarnessSession
+    // does for the step session. Without this, register() throws
+    // "FOREIGN KEY constraint failed" and the run fails before it can park.
+    if (!HarnessSession.load(gateSessionId)) {
+      HarnessSession.create({
+        id: gateSessionId,
+        kind: 'workflow',
+        channel: 'workflow',
+        title: `${ctx.workflow.name}::${step.id} (approval gate)`,
+        metadata: {
+          source: 'workflow',
+          workflowName: ctx.workflow.name,
+          workflowRunId: ctx.runId,
+          stepId: step.id,
+          gate: true,
+        },
+      });
+    }
     row = approvalRegistry.register({
       sessionId: gateSessionId,
       subject,
@@ -1729,10 +1753,10 @@ export async function processWorkflowRuns(assistant: ClementineAssistant): Promi
 export function reapResolvedParkedRuns(): void {
   if (!parkingEnabled()) return;
   if (!existsSync(WORKFLOW_RUNS_DIR)) return;
-  let pendingIds: Set<string>;
+  let approvalsById: Map<string, approvalRegistry.PendingApprovalRow>;
   try {
-    pendingIds = new Set(
-      approvalRegistry.listPending({ status: 'pending' }).map((r) => r.approvalId),
+    approvalsById = new Map(
+      approvalRegistry.listPending({ status: 'any' }).map((row) => [row.approvalId, row]),
     );
   } catch {
     return; // registry unavailable this tick — try again next tick
@@ -1741,8 +1765,11 @@ export function reapResolvedParkedRuns(): void {
     const filePath = path.join(WORKFLOW_RUNS_DIR, file);
     const run = readRunRecord(filePath);
     if (!run || run.status !== 'parked' || !run.parked) continue;
-    const watched = run.parked.parkedSteps.flatMap((s) => s.approvalIds);
-    if (watched.some((id) => pendingIds.has(id))) continue; // still waiting on a human
+    const watched = run.parked.parkedSteps.flatMap((s) => s.approvalIds).filter((id) => id.trim().length > 0);
+    if (watched.length === 0) continue; // malformed parked checkpoint; watchdog should surface it
+    const rows = watched.map((id) => approvalsById.get(id));
+    if (rows.some((row) => !row)) continue; // lost registry row: never auto-approve by absence
+    if (rows.some((row) => row?.status === 'pending')) continue; // still waiting on a human
     // The run is about to resume, so it is no longer "parked on approval".
     // Clear the in-memory heartbeat-suppression flag here so an in-process
     // resume (approval resolved without a daemon restart) doesn't inherit a

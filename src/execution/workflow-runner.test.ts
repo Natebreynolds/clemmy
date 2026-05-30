@@ -349,3 +349,41 @@ test('reapResolvedParkedRuns does NOT re-admit a parked run with empty watched a
   assert.equal(statusOf(filePath), 'parked');
   delete process.env.WORKFLOW_APPROVAL_PARKING;
 });
+
+test('awaitDeclarativeStepApproval creates the gate session so register() does not FK (live regression)', async () => {
+  // Repro of the live e2e bug: a requires_approval gate registered an approval
+  // under workflow-gate:<runId>:<stepId> with NO sessions row → pending_approvals
+  // FK violation → run_failed before it could park. The fix creates the gate
+  // session first. With parking on, the gate registers then throws to release
+  // the slot — assert it throws but NOT a FK error, and the row was created.
+  process.env.WORKFLOW_APPROVAL_PARKING = 'on';
+  const runId = 'gate-fk-regression';
+  const gateSessionId = `workflow-gate:${runId}:send`;
+  assert.equal(HarnessSession.load(gateSessionId), null, 'no pre-existing gate session (the bug condition)');
+
+  const ctx = {
+    workflow: { name: 'Gate FK WF', steps: [] },
+    workflowSlug: 'gate-fk-wf',
+    runId,
+    inputs: {},
+    stepOutputs: {},
+    assistant: {} as never,
+    completedItems: new Map(),
+    forEachFailures: [],
+  } as never;
+  const step = { id: 'send', prompt: 'send it', requiresApproval: true, approvalPreview: 'Send the thing' } as never;
+
+  let threw: Error | null = null;
+  try {
+    await workflowRunnerInternalsForTest.awaitDeclarativeStepApproval(ctx, step);
+  } catch (e) {
+    threw = e as Error;
+  }
+  assert.ok(threw, 'parking path throws (ParkRunSignal) to release the slot');
+  assert.ok(!/FOREIGN KEY/i.test(threw!.message), `must not FK: ${threw!.message}`);
+  assert.ok(HarnessSession.load(gateSessionId), 'gate session row was created');
+  const pending = approvalRegistry.listPending({ sessionId: gateSessionId, status: 'pending' });
+  assert.equal(pending.length, 1, 'exactly one pending gate approval registered');
+
+  delete process.env.WORKFLOW_APPROVAL_PARKING;
+});
