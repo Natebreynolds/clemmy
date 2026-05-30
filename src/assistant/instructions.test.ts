@@ -77,3 +77,39 @@ test('case-insensitive match', () => {
   assert.match(renderChannelDirective('DISCORD'), /Discord/);
   assert.match(renderChannelDirective('Discord'), /Discord/);
 });
+
+// ── P3 unified scope gate ──────────────────────────────────────────
+
+test('hasScopedLanguage detects possessive/relative markers, ignores plain reads', () => {
+  assert.ok(hasScopedLanguage('show my market-leader accounts'));
+  assert.ok(hasScopedLanguage('pull the usual sheet'));
+  assert.ok(hasScopedLanguage('do it like last time'));
+  assert.ok(!hasScopedLanguage('list all accounts in the org'));
+  assert.ok(!hasScopedLanguage('what is the weather today'));
+});
+
+test('P3 flag off: scoped lookup gets NO directive (today behavior preserved)', () => {
+  delete process.env.UNIFIED_SCOPE_GATE;
+  const out = renderActionDisciplineDirective('lookup', 'show my market-leader accounts');
+  assert.ok(!out.includes('RESOLVE SCOPE'), 'lookup stays bare under flag-off');
+});
+
+test('P3 flag on: scoped lookup GETS the scope directive', () => {
+  process.env.UNIFIED_SCOPE_GATE = 'on';
+  const out = renderActionDisciplineDirective('lookup', 'show my market-leader accounts');
+  assert.ok(out.includes('RESOLVE SCOPE'), 'scoped lookup now resolves scope before querying');
+  delete process.env.UNIFIED_SCOPE_GATE;
+});
+
+test('P3 flag on: non-scoped lookup stays token-free (no waste on plain reads)', () => {
+  process.env.UNIFIED_SCOPE_GATE = 'on';
+  const out = renderActionDisciplineDirective('lookup', 'list all accounts in the org');
+  assert.ok(!out.includes('RESOLVE SCOPE'), 'plain read gets no directive');
+  delete process.env.UNIFIED_SCOPE_GATE;
+});
+
+test('P3: action intent always gets the directive regardless of flag/message', () => {
+  delete process.env.UNIFIED_SCOPE_GATE;
+  const out = renderActionDisciplineDirective('action', 'whatever');
+  assert.ok(out.includes('RESOLVE SCOPE'));
+});
