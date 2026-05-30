@@ -331,3 +331,21 @@ test('explainDeterministicSpawnError: an unrelated error passes through unchange
   const out = explainDeterministicSpawnError(err, 'scripts/x.sh');
   assert.equal(out.message, 'some other failure');
 });
+
+test('reapResolvedParkedRuns does NOT re-admit when a watched approval row is missing (no auto-approve on a lost row)', () => {
+  process.env.WORKFLOW_APPROVAL_PARKING = 'on';
+  // 'apr-ghost' was never registered → get() returns undefined → cannot
+  // confirm resolution → the run must stay parked (the watchdog surfaces it).
+  const filePath = writeParkedRun('park-ghost', ['apr-ghost-never-registered']);
+  reapResolvedParkedRuns();
+  assert.equal(statusOf(filePath), 'parked');
+  delete process.env.WORKFLOW_APPROVAL_PARKING;
+});
+
+test('reapResolvedParkedRuns does NOT re-admit a parked run with empty watched approvalIds (thrash guard)', () => {
+  process.env.WORKFLOW_APPROVAL_PARKING = 'on';
+  const filePath = writeParkedRun('park-empty', []);
+  reapResolvedParkedRuns();
+  assert.equal(statusOf(filePath), 'parked');
+  delete process.env.WORKFLOW_APPROVAL_PARKING;
+});
