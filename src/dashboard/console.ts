@@ -884,6 +884,7 @@ export function renderConsoleHtml(token: string): string {
                   <div class="mem-graph-topbar">
                     <div class="mem-graph-controls">
                       <button type="button" data-mem-graph-3d-toggle aria-pressed="true" title="Switch to 2D graph">3D</button>
+                      <button type="button" data-mem-graph-layout-toggle title="Toggle force / semantic layout">FORCE</button>
                       <button type="button" data-mem-graph-refresh>REFRESH</button>
                       <button type="button" data-mem-graph-fit>FIT</button>
                       <button type="button" data-mem-graph-reset>RESET</button>
@@ -12644,6 +12645,13 @@ const CONSOLE_JS = `
     const savedGraphMode = localStorage.getItem('clemmy.graph.mode');
     if (savedGraphMode === '2d' || savedGraphMode === '3d') graphMode = savedGraphMode;
   } catch (_) { /* private mode */ }
+  // 3D layout sub-mode: 'force' (default) or 'semantic' (positions facts by
+  // embedding similarity). Persisted separately from the 2D/3D mode.
+  let graph3dLayout = 'force';
+  try {
+    const savedLayout = localStorage.getItem('clemmy.graph.layout');
+    if (savedLayout === 'force' || savedLayout === 'semantic') graph3dLayout = savedLayout;
+  } catch (_) { /* private mode */ }
 
   function ensureForceGraph3DLoaded() {
     if (typeof window.ForceGraph3D === 'function') return Promise.resolve(true);
@@ -12815,6 +12823,17 @@ const CONSOLE_JS = `
         memGraphPinnedNode = null;
         syncGraphModeToggle();
         loadGraphForMode({ force: true });
+      });
+    }
+    const layoutToggle = document.querySelector('[data-mem-graph-layout-toggle]');
+    if (layoutToggle && !layoutToggle.dataset.bound) {
+      layoutToggle.dataset.bound = '1';
+      layoutToggle.addEventListener('click', () => {
+        graph3dLayout = graph3dLayout === 'semantic' ? 'force' : 'semantic';
+        try { localStorage.setItem('clemmy.graph.layout', graph3dLayout); } catch (_) { /* private mode */ }
+        syncGraphModeToggle();
+        // Re-fetch so the server (re)computes / drops semantic positions.
+        if (graphMode === '3d') loadMemoryGraph3D({ force: true });
       });
     }
     if (!memGraphActionsBound) {
@@ -13649,7 +13668,7 @@ const CONSOLE_JS = `
       return loadMemoryGraph(options);
     }
     try {
-      const data = await fetchJSON('/api/console/memory/graph');
+      const data = await fetchJSON('/api/console/memory/graph' + (graph3dLayout === 'semantic' ? '?layout=semantic' : ''));
       memGraphData = data;
       if (options.force) destroyGraph3d();
 
@@ -13753,6 +13772,13 @@ const CONSOLE_JS = `
       btn.textContent = graphMode === '3d' ? '3D' : '2D';
       btn.setAttribute('aria-pressed', graphMode === '3d' ? 'true' : 'false');
       btn.setAttribute('title', graphMode === '3d' ? 'Switch to 2D graph' : 'Switch to 3D graph');
+    }
+    // The force/semantic layout toggle only applies to the 3D renderer.
+    const layoutBtn = document.querySelector('[data-mem-graph-layout-toggle]');
+    if (layoutBtn) {
+      layoutBtn.textContent = graph3dLayout === 'semantic' ? 'SEMANTIC' : 'FORCE';
+      if (graphMode === '3d') layoutBtn.removeAttribute('hidden');
+      else layoutBtn.setAttribute('hidden', '');
     }
   }
 

@@ -22,6 +22,7 @@ import {
 import { getComposioRuntimeStatus } from '../integrations/composio/client.js';
 import { getGitHubCliStatus } from '../integrations/github-cli.js';
 import { recallHybrid } from '../memory/recall.js';
+import { bufferToVector } from '../memory/embeddings.js';
 import { FACT_KINDS, forgetFact, listActiveFacts, listAllFacts, rememberFact } from '../memory/facts.js';
 import { openMemoryDb } from '../memory/db.js';
 import {
@@ -339,6 +340,118 @@ const CONTEXT_FILES: ContextFileDefinition[] = [
     minUsefulChars: 80,
   },
 ];
+
+// ── Semantic 3D layout for the knowledge graph ──────────────────────
+// Project fact embeddings (1536-dim) → 3D via PCA so semantically similar
+// facts cluster in space. Uses the Gram-matrix trick (features ≫ samples):
+// the top-3 eigenvectors of the N×N Gram matrix give the PCA scores
+// directly as score_k(i) = √λ_k · u_k[i]. Dependency-free power iteration;
+// N ≤ 300 so this is cheap. Result cached by fact-set signature.
+let semanticPosCache: { key: string; positions: Map<number, [number, number, number]> } | null = null;
+
+function computeSemanticFactPositions(
+  db: ReturnType<typeof openMemoryDb>,
+  factIds: number[],
+): Map<number, [number, number, number]> | null {
+  if (factIds.length < 4) return null;
+  const key = factIds.slice().sort((a, b) => a - b).join(',');
+  if (semanticPosCache && semanticPosCache.key === key) return semanticPosCache.positions;
+
+  const placeholders = factIds.map(() => '?').join(',');
+  const rows = db.prepare(
+    `SELECT fact_id, vector FROM fact_embeddings WHERE fact_id IN (${placeholders})`,
+  ).all(...factIds) as Array<{ fact_id: number; vector: Buffer }>;
+  if (rows.length < 4) return null;
+
+  const ids: number[] = [];
+  const vecs: Float32Array[] = [];
+  for (const r of rows) {
+    const v = bufferToVector(r.vector);
+    if (v && v.length > 0) { ids.push(r.fact_id); vecs.push(v); }
+  }
+  const n = vecs.length;
+  if (n < 4) return null;
+  const dim = vecs[0].length;
+
+  // Center the vectors (subtract the mean) — PCA operates on centered data.
+  const mean = new Float64Array(dim);
+  for (const v of vecs) for (let d = 0; d < dim; d++) mean[d] += v[d];
+  for (let d = 0; d < dim; d++) mean[d] /= n;
+  const centered: Float64Array[] = vecs.map((v) => {
+    const c = new Float64Array(dim);
+    for (let d = 0; d < dim; d++) c[d] = v[d] - mean[d];
+    return c;
+  });
+
+  // Gram matrix G = Xc · Xcᵀ  (n × n, symmetric).
+  const G: Float64Array[] = [];
+  for (let i = 0; i < n; i++) {
+    const gi = new Float64Array(n);
+    for (let j = 0; j <= i; j++) {
+      let dot = 0;
+      const a = centered[i], b = centered[j];
+      for (let d = 0; d < dim; d++) dot += a[d] * b[d];
+      gi[j] = dot;
+      if (j < i) G[j][i] = dot; // symmetric fill
+    }
+    G.push(gi);
+  }
+  for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) G[i][j] = G[j][i];
+
+  // Deterministic non-degenerate seed (no Math.random → stable + cacheable).
+  const seed = (i: number) => Math.sin((i + 1) * 12.9898) * 43758.5453 % 1;
+  const matVec = (M: Float64Array[], x: Float64Array) => {
+    const y = new Float64Array(n);
+    for (let i = 0; i < n; i++) { let s = 0; const row = M[i]; for (let j = 0; j < n; j++) s += row[j] * x[j]; y[i] = s; }
+    return y;
+  };
+  const norm = (x: Float64Array) => { let s = 0; for (let i = 0; i < n; i++) s += x[i] * x[i]; return Math.sqrt(s); };
+
+  // Power iteration + deflation for the top 3 eigenpairs.
+  const comps: Array<{ vec: Float64Array; val: number }> = [];
+  const work = G.map((r) => Float64Array.from(r)); // deflated copy
+  for (let k = 0; k < 3; k++) {
+    let x = new Float64Array(n);
+    for (let i = 0; i < n; i++) x[i] = seed(i + k * 7) || 0.01;
+    let nrm = norm(x) || 1;
+    for (let i = 0; i < n; i++) x[i] /= nrm;
+    let lambda = 0;
+    for (let iter = 0; iter < 100; iter++) {
+      const y = matVec(work, x);
+      nrm = norm(y);
+      if (nrm < 1e-9) break;
+      for (let i = 0; i < n; i++) y[i] /= nrm;
+      let diff = 0; for (let i = 0; i < n; i++) diff += Math.abs(y[i] - x[i]);
+      x = y;
+      lambda = nrm;
+      if (diff < 1e-6) break;
+    }
+    comps.push({ vec: x, val: lambda });
+    // Deflate: work -= lambda · x xᵀ
+    for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) work[i][j] -= lambda * x[i] * x[j];
+  }
+
+  // Scores: coord_k(i) = √λ_k · u_k[i]. Then scale to a pleasant range.
+  const coords: Array<[number, number, number]> = [];
+  let maxAbs = 1e-6;
+  for (let i = 0; i < n; i++) {
+    const c: [number, number, number] = [
+      Math.sqrt(Math.max(0, comps[0].val)) * comps[0].vec[i],
+      Math.sqrt(Math.max(0, comps[1].val)) * comps[1].vec[i],
+      Math.sqrt(Math.max(0, comps[2].val)) * comps[2].vec[i],
+    ];
+    coords.push(c);
+    maxAbs = Math.max(maxAbs, Math.abs(c[0]), Math.abs(c[1]), Math.abs(c[2]));
+  }
+  const scale = 160 / maxAbs;
+  const positions = new Map<number, [number, number, number]>();
+  for (let i = 0; i < n; i++) {
+    positions.set(ids[i], [coords[i][0] * scale, coords[i][1] * scale, coords[i][2] * scale]);
+  }
+
+  semanticPosCache = { key, positions };
+  return positions;
+}
 
 function contextFileForKey(key: string): ContextFileDefinition | undefined {
   return CONTEXT_FILES.find((file) => file.key === key);
@@ -1167,6 +1280,79 @@ export function registerConsoleRoutes(
         });
       }
 
+      // Entity nodes — the `entities` registry (people/companies/projects/
+      // places/things). There is NO stored fact↔entity link, so edges are
+      // DERIVED by matching an entity's canonical name / aliases (≥4 chars)
+      // inside fact content — the same substring technique used for files.
+      const entitiesLimit = Math.max(0, Math.min(150, parseInt(typeof req.query.entities === 'string' ? req.query.entities : '80', 10) || 80));
+      if (entitiesLimit > 0) {
+        const entityRows = db.prepare(`
+          SELECT id, entity_type, canonical_name, canonical_name_lc, aliases_json, mention_count
+          FROM entities
+          ORDER BY mention_count DESC, last_seen_at DESC
+          LIMIT ?
+        `).all(entitiesLimit) as Array<{ id: number; entity_type: string; canonical_name: string; canonical_name_lc: string; aliases_json: string | null; mention_count: number }>;
+
+        const entityMatchers = entityRows.map((e) => {
+          const names = new Set<string>();
+          if (e.canonical_name_lc && e.canonical_name_lc.length >= 4) names.add(e.canonical_name_lc);
+          try {
+            const aliases = e.aliases_json ? JSON.parse(e.aliases_json) : [];
+            if (Array.isArray(aliases)) {
+              for (const a of aliases) {
+                const al = String(a || '').trim().toLowerCase();
+                if (al.length >= 4) names.add(al);
+              }
+            }
+          } catch { /* malformed aliases — skip */ }
+          return { row: e, names: Array.from(names) };
+        });
+
+        const referencedEntityIds = new Set<number>();
+        for (const fact of facts) {
+          const lower = (fact.content || '').toLowerCase();
+          if (!lower) continue;
+          for (const m of entityMatchers) {
+            if (m.names.some((n) => lower.includes(n))) {
+              referencedEntityIds.add(m.row.id);
+              edges.push({ id: `fact:${fact.id}->entity:${m.row.id}`, source: `fact:${fact.id}`, target: `entity:${m.row.id}`, type: 'entity' });
+            }
+          }
+        }
+
+        // Include an entity node if it linked to a fact OR is among the
+        // top ~30 most-mentioned (so prominent entities still show).
+        const topEntityIds = new Set(entityRows.slice(0, 30).map((e) => e.id));
+        for (const e of entityRows) {
+          if (!referencedEntityIds.has(e.id) && !topEntityIds.has(e.id)) continue;
+          nodes.push({
+            id: `entity:${e.id}`,
+            label: e.canonical_name,
+            type: 'entity',
+            data: { entity_type: e.entity_type, mention_count: e.mention_count },
+          });
+        }
+      }
+
+      // Phase 4 — optional semantic 3D layout. ?layout=semantic projects
+      // fact embeddings (1536-dim) → 3D via PCA and attaches fixed fx/fy/fz
+      // to fact nodes so semantically-similar facts cluster in space.
+      if (req.query.layout === 'semantic') {
+        try {
+          const positions = computeSemanticFactPositions(db, facts.map((f) => f.id));
+          if (positions) {
+            for (const node of nodes) {
+              if (node.type !== 'fact') continue;
+              const fid = Number(String(node.id).slice('fact:'.length));
+              const p = positions.get(fid);
+              if (p) {
+                node.data = { ...(node.data || {}), fx: p[0], fy: p[1], fz: p[2] };
+              }
+            }
+          }
+        } catch { /* embeddings unavailable — fall back to force layout */ }
+      }
+
       res.json({
         nodes,
         edges,
@@ -1174,7 +1360,9 @@ export function registerConsoleRoutes(
           factCount: facts.length,
           fileCount: nodes.filter((n) => n.type === 'file').length,
           kindCount: kinds.length,
+          entityCount: nodes.filter((n) => n.type === 'entity').length,
           edgeCount: edges.length,
+          semantic: req.query.layout === 'semantic',
         },
       });
     } catch (err) {
