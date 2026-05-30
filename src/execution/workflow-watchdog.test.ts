@@ -68,3 +68,39 @@ test('the audit-pileup scenario: five same-workflow runs all queued and old → 
   const stalled = findStalledRuns(runs, T0, { queuedStallMs: FIVE_MIN });
   assert.equal(stalled.length, 5);
 });
+
+// ── parked-run orphan safety net ────────────────────────────────────
+
+test('findStalledRuns flags a run parked past the parked threshold (ages from parkedAt)', () => {
+  const now = Date.parse('2026-05-28T02:00:00Z');
+  const stalled = findStalledRuns(
+    [{ id: 'p1', workflow: 'wf', status: 'parked', createdAt: '2026-05-27T00:00:00Z', parkedAt: '2026-05-28T00:30:00Z' }],
+    now,
+    { queuedStallMs: 5 * 60_000, parkedStallMs: 60 * 60_000 },
+  );
+  assert.equal(stalled.length, 1);
+  assert.equal(stalled[0].id, 'p1');
+  assert.equal(stalled[0].reason, 'parked_awaiting_approval');
+  assert.equal(Math.round(stalled[0].ageMs / 60_000), 90);
+});
+
+test('findStalledRuns ignores a freshly-parked run within the parked threshold', () => {
+  const now = Date.parse('2026-05-28T00:50:00Z');
+  const stalled = findStalledRuns(
+    [{ id: 'p1', workflow: 'wf', status: 'parked', parkedAt: '2026-05-28T00:30:00Z' }],
+    now,
+    { queuedStallMs: 5 * 60_000, parkedStallMs: 60 * 60_000 },
+  );
+  assert.equal(stalled.length, 0);
+});
+
+test('findStalledRuns falls back to createdAt for a legacy parked run with no parkedAt', () => {
+  const now = Date.parse('2026-05-28T02:00:00Z');
+  const stalled = findStalledRuns(
+    [{ id: 'p1', workflow: 'wf', status: 'parked', createdAt: '2026-05-28T00:30:00Z' }],
+    now,
+    { queuedStallMs: 5 * 60_000, parkedStallMs: 60 * 60_000 },
+  );
+  assert.equal(stalled.length, 1);
+  assert.equal(stalled[0].reason, 'parked_awaiting_approval');
+});

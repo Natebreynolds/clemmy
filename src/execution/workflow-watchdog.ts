@@ -27,19 +27,29 @@ const logger = pino({ name: 'clementine-next.workflow-watchdog' });
 
 /** A run created more than this long ago and still `queued` is stalled. */
 const DEFAULT_QUEUED_STALL_MS = 5 * 60_000;
+/**
+ * A run `parked` on a human approval longer than this is surfaced. This is the
+ * orphan safety net: if WORKFLOW_APPROVAL_PARKING is turned OFF while a run is
+ * parked, that run is non-drainable, non-reaped, and non-resumable, so without
+ * this it would sit silent forever. 1h is long enough not to nag during a
+ * normal approval wait (the approval card already fired); dedup is per run id.
+ */
+const DEFAULT_PARKED_STALL_MS = 60 * 60_000;
 
 export interface WatchdogRunView {
   id: string;
   workflow: string;
   status?: string;
   createdAt?: string;
+  /** ISO time the run was checkpointed as parked (run.parked.parkedAt). */
+  parkedAt?: string;
 }
 
 export interface StalledRun {
   id: string;
   workflow: string;
   ageMs: number;
-  reason: 'queued_not_draining';
+  reason: 'queued_not_draining' | 'parked_awaiting_approval';
 }
 
 /**
@@ -50,17 +60,30 @@ export interface StalledRun {
 export function findStalledRuns(
   runs: WatchdogRunView[],
   now: number,
-  opts: { queuedStallMs: number },
+  opts: { queuedStallMs: number; parkedStallMs?: number },
 ): StalledRun[] {
+  const parkedStallMs = opts.parkedStallMs ?? DEFAULT_PARKED_STALL_MS;
   const out: StalledRun[] = [];
   for (const run of runs) {
     const status = run.status ?? 'queued';
-    if (status !== 'queued') continue;
-    const created = run.createdAt ? Date.parse(run.createdAt) : Number.NaN;
-    if (!Number.isFinite(created)) continue;
-    const ageMs = now - created;
-    if (ageMs >= opts.queuedStallMs) {
-      out.push({ id: run.id, workflow: run.workflow, ageMs, reason: 'queued_not_draining' });
+    if (status === 'queued') {
+      const created = run.createdAt ? Date.parse(run.createdAt) : Number.NaN;
+      if (!Number.isFinite(created)) continue;
+      const ageMs = now - created;
+      if (ageMs >= opts.queuedStallMs) {
+        out.push({ id: run.id, workflow: run.workflow, ageMs, reason: 'queued_not_draining' });
+      }
+    } else if (status === 'parked') {
+      // Age from parkedAt (when it actually parked), not createdAt — a run that
+      // parked recently shouldn't fire just because it was created long ago.
+      // Falls back to createdAt for legacy records with no parkedAt.
+      const ref = run.parkedAt ?? run.createdAt;
+      const parkedAt = ref ? Date.parse(ref) : Number.NaN;
+      if (!Number.isFinite(parkedAt)) continue;
+      const ageMs = now - parkedAt;
+      if (ageMs >= parkedStallMs) {
+        out.push({ id: run.id, workflow: run.workflow, ageMs, reason: 'parked_awaiting_approval' });
+      }
     }
   }
   return out;
@@ -73,6 +96,11 @@ function isEnabled(): boolean {
 function queuedStallMs(): number {
   const raw = Number.parseInt(getRuntimeEnv('CLEMMY_WORKFLOW_QUEUED_STALL_MS', '') || '', 10);
   return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_QUEUED_STALL_MS;
+}
+
+function parkedStallMs(): number {
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_WORKFLOW_PARKED_STALL_MS', '') || '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_PARKED_STALL_MS;
 }
 
 /**
