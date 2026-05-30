@@ -111,3 +111,20 @@ test('output.verify (verifiable handles) round-trips', () => {
   assert.deepEqual(s?.output?.verify?.path_exists, ['indexPath']);
   assert.deepEqual(s?.output?.verify?.url_present, ['netlifyUrl']);
 });
+
+test('retryBudget round-trips as retry_budget and clamps malformed values', () => {
+  writeWorkflow('retry-rt', {
+    name: 'retry-rt', description: 'retry round-trip', enabled: true, trigger: { manual: true },
+    steps: [
+      { id: 'a', prompt: 'do a', retryBudget: 3 },
+      { id: 'b', prompt: 'do b', retryBudget: 999 },  // clamps to 10
+      { id: 'c', prompt: 'do c', retryBudget: 0 },     // dropped (no retry)
+      { id: 'd', prompt: 'do d', retryBudget: 2.7 },   // floors to 2
+    ] as never,
+  });
+  const steps = readWorkflow('retry-rt')!.data.steps;
+  assert.equal(steps.find((x) => x.id === 'a')?.retryBudget, 3);
+  assert.equal(steps.find((x) => x.id === 'b')?.retryBudget, 10);
+  assert.equal(steps.find((x) => x.id === 'c')?.retryBudget, undefined);
+  assert.equal(steps.find((x) => x.id === 'd')?.retryBudget, 2);
+});

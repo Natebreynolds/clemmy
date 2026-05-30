@@ -348,6 +348,14 @@ export function readWorkflowDefinitionFile(filePath: string): WorkflowDefinition
       if (step.output && typeof step.output === 'object' && !Array.isArray(step.output)) {
         result.output = step.output as WorkflowStepInput['output'];
       }
+      // retryBudget / retry_budget — clamp to a sane non-negative integer
+      // (0..10) so a malformed value can't spin the runner.
+      const rawRetry = typeof step.retryBudget === 'number'
+        ? step.retryBudget
+        : (step as Record<string, unknown>).retry_budget;
+      if (typeof rawRetry === 'number' && Number.isFinite(rawRetry) && rawRetry > 0) {
+        result.retryBudget = Math.min(10, Math.floor(rawRetry));
+      }
       return result;
     });
     return {
@@ -451,6 +459,7 @@ function writeWorkflowToDir(dirPath: string, def: WorkflowDefinition): void {
       if (s.approvalPreview) out.approval_preview = s.approvalPreview;
       if (s.inputs && Object.keys(s.inputs).length > 0) out.inputs = s.inputs;
       if (s.output && Object.keys(s.output).length > 0) out.output = s.output;
+      if (s.retryBudget && s.retryBudget > 0) out.retry_budget = s.retryBudget;
       return out;
     });
   }
