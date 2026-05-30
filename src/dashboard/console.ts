@@ -883,6 +883,7 @@ export function renderConsoleHtml(token: string): string {
                 <div class="mem-graph" data-mem-graph>
                   <div class="mem-graph-topbar">
                     <div class="mem-graph-controls">
+                      <button type="button" data-mem-graph-3d-toggle aria-pressed="true" title="Switch to 2D graph">3D</button>
                       <button type="button" data-mem-graph-refresh>REFRESH</button>
                       <button type="button" data-mem-graph-fit>FIT</button>
                       <button type="button" data-mem-graph-reset>RESET</button>
@@ -893,6 +894,7 @@ export function renderConsoleHtml(token: string): string {
                         <option value="fact">FACTS</option>
                         <option value="file">FILES</option>
                         <option value="kind">KINDS</option>
+                        <option value="entity">ENTITIES</option>
                       </select>
                       <input type="search" data-mem-graph-search placeholder="filter graph…" autocomplete="off" spellcheck="false" />
                     </div>
@@ -911,6 +913,7 @@ export function renderConsoleHtml(token: string): string {
                     <span><i class="dot kind"></i> Kind<em data-mem-legend-kinds>—</em></span>
                     <span><i class="dot fact"></i> Fact<em data-mem-legend-facts>—</em></span>
                     <span><i class="dot file"></i> File<em data-mem-legend-files>—</em></span>
+                    <span><i class="dot entity"></i> Entity<em data-mem-legend-entities>—</em></span>
                   </div>
                 </div>
               </div>
@@ -4874,6 +4877,7 @@ body {
 .mem-graph-legend .dot.fact { background: var(--accent); box-shadow: 0 0 8px rgba(255, 90, 53, 0.55); }
 .mem-graph-legend .dot.file { background: var(--accent-3); box-shadow: 0 0 8px rgba(54, 197, 255, 0.45); border-radius: 1px; width: 8px; height: 8px; }
 .mem-graph-legend .dot.kind { background: var(--accent-2); box-shadow: 0 0 10px rgba(185, 255, 54, 0.55); width: 11px; height: 11px; }
+.mem-graph-legend .dot.entity { background: #c77dff; box-shadow: 0 0 8px rgba(199, 125, 255, 0.5); }
 
 /* Sparse-data hint that floats above the canvas instead of crowding
    the detail pane. Less ceremonial than the prior inline note. */
@@ -12610,7 +12614,7 @@ const CONSOLE_JS = `
     const graphPane = document.querySelector('[data-brain-knowledge-pane="graph"]');
     if (!memGraphLoaded && graphPane && !graphPane.hidden) {
       memGraphLoaded = true;
-      await loadMemoryGraph();
+      await loadGraphForMode();
     }
   }
   async function refreshMemoryPanel() {
@@ -12626,6 +12630,53 @@ const CONSOLE_JS = `
   let memViewToggleBound = false;
   let memGraphActionsBound = false;
   let cytoscapeLoadPromise = null;
+
+  // ── 3D knowledge graph (3d-force-graph / three.js) ──────────────
+  let memGraph3d = null;            // ForceGraph3D instance, lazy-init
+  let forceGraph3dLoadPromise = null;
+  let memGraph3dAdjacency = null;   // id -> Set(neighbor id), for highlight
+  let memGraph3dHighlight = null;   // Set of lit node ids, or null = all lit
+  // Render mode: '3d' is the default (owner's choice); '2d' is the
+  // cytoscape fallback. Persisted per-machine; auto-reverts to '2d' if
+  // WebGL is unavailable.
+  let graphMode = '3d';
+  try {
+    const savedGraphMode = localStorage.getItem('clemmy.graph.mode');
+    if (savedGraphMode === '2d' || savedGraphMode === '3d') graphMode = savedGraphMode;
+  } catch (_) { /* private mode */ }
+
+  function ensureForceGraph3DLoaded() {
+    if (typeof window.ForceGraph3D === 'function') return Promise.resolve(true);
+    if (forceGraph3dLoadPromise) return forceGraph3dLoadPromise;
+    forceGraph3dLoadPromise = new Promise((resolve) => {
+      const started = Date.now();
+      let done = false;
+      let timer = null;
+      const finish = (ok) => {
+        if (done) return;
+        done = true;
+        if (timer) clearInterval(timer);
+        resolve(!!ok && typeof window.ForceGraph3D === 'function');
+      };
+      const poll = () => {
+        if (typeof window.ForceGraph3D === 'function') finish(true);
+        else if (Date.now() - started > 8000) finish(false);
+      };
+      const existing = document.querySelector('script[src="/console/vendor/3d-force-graph.min.js"]');
+      const script = existing || document.createElement('script');
+      if (!existing) {
+        script.src = '/console/vendor/3d-force-graph.min.js';
+        script.async = true;
+        script.setAttribute('data-forcegraph3d-loader', '1');
+        document.head.appendChild(script);
+      }
+      script.addEventListener('load', () => finish(true), { once: true });
+      script.addEventListener('error', () => finish(false), { once: true });
+      timer = setInterval(poll, 50);
+      poll();
+    });
+    return forceGraph3dLoadPromise;
+  }
 
   function ensureCytoscapeLoaded() {
     if (typeof window.cytoscape === 'function') return Promise.resolve(true);
@@ -12692,11 +12743,12 @@ const CONSOLE_JS = `
     const reset = document.querySelector('[data-mem-graph-reset]');
     if (refresh && !refresh.dataset.bound) {
       refresh.dataset.bound = '1';
-      refresh.addEventListener('click', () => loadMemoryGraph({ force: true }));
+      refresh.addEventListener('click', () => loadGraphForMode({ force: true }));
     }
     if (fit && !fit.dataset.bound) {
       fit.dataset.bound = '1';
       fit.addEventListener('click', () => {
+        if (graphMode === '3d') { if (memGraph3d) memGraph3d.zoomToFit(500, 40); return; }
         if (!memGraphCy) return;
         memGraphCy.resize();
         memGraphCy.fit(undefined, 42);
@@ -12705,6 +12757,13 @@ const CONSOLE_JS = `
     if (reset && !reset.dataset.bound) {
       reset.dataset.bound = '1';
       reset.addEventListener('click', () => {
+        if (graphMode === '3d') {
+          memGraphPinnedNode = null;
+          resetHighlight3D();
+          applyMemoryGraphFilters3D();
+          if (memGraph3d && typeof memGraph3d.d3ReheatSimulation === 'function') memGraph3d.d3ReheatSimulation();
+          return;
+        }
         if (!memGraphCy) return;
         memGraphCy.elements().removeClass('dimmed related pinned');
         memGraphPinnedNode = null;
@@ -12733,11 +12792,30 @@ const CONSOLE_JS = `
     }
     if (mem.graphType && !mem.graphType.dataset.bound) {
       mem.graphType.dataset.bound = '1';
-      mem.graphType.addEventListener('change', applyMemoryGraphFilters);
+      mem.graphType.addEventListener('change', applyGraphFilters);
     }
     if (mem.graphSearch && !mem.graphSearch.dataset.bound) {
       mem.graphSearch.dataset.bound = '1';
-      mem.graphSearch.addEventListener('input', applyMemoryGraphFilters);
+      mem.graphSearch.addEventListener('input', applyGraphFilters);
+    }
+    const modeToggle = document.querySelector('[data-mem-graph-3d-toggle]');
+    if (modeToggle && !modeToggle.dataset.bound) {
+      modeToggle.dataset.bound = '1';
+      syncGraphModeToggle();
+      modeToggle.addEventListener('click', () => {
+        // Swap renderers: tear down the inactive one so two engines never
+        // fight over the same canvas, then load the now-active mode.
+        graphMode = graphMode === '3d' ? '2d' : '3d';
+        try { localStorage.setItem('clemmy.graph.mode', graphMode); } catch (_) { /* private mode */ }
+        if (graphMode === '3d') {
+          if (memGraphCy) { try { memGraphCy.destroy(); } catch (_) { /* ignore */ } memGraphCy = null; }
+        } else {
+          destroyGraph3d();
+        }
+        memGraphPinnedNode = null;
+        syncGraphModeToggle();
+        loadGraphForMode({ force: true });
+      });
     }
     if (!memGraphActionsBound) {
       memGraphActionsBound = true;
@@ -12765,7 +12843,7 @@ const CONSOLE_JS = `
         } else if (type === 'forget-fact' && value) {
           if (!confirm('Soft-delete fact #' + value + '?')) return;
           await fetch(withToken('/api/console/memory/facts/' + encodeURIComponent(value) + '/forget'), { method: 'POST' });
-          await Promise.all([refreshFactList(), refreshMemoryStatus(), loadMemoryGraph({ force: true })]);
+          await Promise.all([refreshFactList(), refreshMemoryStatus(), loadGraphForMode({ force: true })]);
         }
       });
     }
@@ -12790,7 +12868,14 @@ const CONSOLE_JS = `
       wireMemoryGraphControls();
       if (!memGraphLoaded) {
         memGraphLoaded = true;
-        loadMemoryGraph();
+        loadGraphForMode();
+      } else if (graphMode === '3d') {
+        if (memGraph3d) {
+          memGraph3d.width(document.querySelector('[data-mem-graph-canvas]')?.clientWidth || 600);
+          memGraph3d.height(document.querySelector('[data-mem-graph-canvas]')?.clientHeight || 420);
+        } else {
+          loadGraphForMode();
+        }
       } else if (memGraphCy) {
         memGraphCy.resize();
         memGraphCy.fit(undefined, 40);
@@ -13426,6 +13511,248 @@ const CONSOLE_JS = `
       applyMemoryGraphFilters();
     } catch (err) {
       canvas.innerHTML = '<div class="mem-empty" style="padding:24px; color:var(--accent-fail);">Failed: ' + escMem(err.message || err) + '</div>';
+    }
+  }
+
+  // ── 3D graph (default) — interactive force-directed via three.js ──
+  // Strictly additive: reuses the SAME /api/console/memory/graph data and
+  // the SAME detail pane (renderGraphDetail). The 2D cytoscape path above
+  // is untouched and remains the WebGL-less fallback.
+
+  function loadGraphForMode(options = {}) {
+    return graphMode === '3d' ? loadMemoryGraph3D(options) : loadMemoryGraph(options);
+  }
+
+  function applyGraphFilters() {
+    if (graphMode === '3d') applyMemoryGraphFilters3D();
+    else applyMemoryGraphFilters();
+  }
+
+  // Shared stats/legend update (meta line, legend counts, sparse hint).
+  // Used by the 3D path; the 2D path keeps its own inline copy so its
+  // behavior stays byte-identical.
+  function updateGraphStats(visible, visibleByType, nodesLen, edgesLen) {
+    const sparse = edgesLen <= Math.max(2, Math.floor(nodesLen / 3));
+    if (mem.graphMeta) {
+      mem.graphMeta.textContent = visible + '/' + nodesLen + ' nodes · ' + edgesLen + ' links' + (sparse ? ' · sparse' : '');
+    }
+    const map = {
+      kinds: document.querySelector('[data-mem-legend-kinds]'),
+      facts: document.querySelector('[data-mem-legend-facts]'),
+      files: document.querySelector('[data-mem-legend-files]'),
+      entities: document.querySelector('[data-mem-legend-entities]'),
+    };
+    if (map.kinds) map.kinds.textContent = String(visibleByType.kind || 0);
+    if (map.facts) map.facts.textContent = String(visibleByType.fact || 0);
+    if (map.files) map.files.textContent = String(visibleByType.file || 0);
+    if (map.entities) map.entities.textContent = String(visibleByType.entity || 0);
+    const hint = document.querySelector('[data-mem-graph-sparse-hint]');
+    if (hint) {
+      if (sparse && nodesLen > 0) hint.removeAttribute('hidden');
+      else hint.setAttribute('hidden', '');
+    }
+  }
+
+  function graph3dNodeColor(n) {
+    const css = getComputedStyle(document.documentElement);
+    const dim = 'rgba(130,130,145,0.10)';
+    if (memGraph3dHighlight && !memGraph3dHighlight.has(n.id)) return dim;
+    const accent = css.getPropertyValue('--accent').trim() || '#ff5a35';
+    const accent2 = css.getPropertyValue('--accent-2').trim() || '#b9ff36';
+    const accent3 = css.getPropertyValue('--accent-3').trim() || '#36c5ff';
+    const accent4 = css.getPropertyValue('--accent-4').trim() || '#c77dff';
+    if (n.type === 'kind') return accent2;
+    if (n.type === 'file') return accent3;
+    if (n.type === 'entity') return accent4;
+    return accent; // fact
+  }
+
+  function graph3dNodeVal(n) {
+    if (n.type === 'kind') return 8;
+    if (n.type === 'entity') return 4;
+    if (n.type === 'file') return 2;
+    return 3; // fact
+  }
+
+  function nodeVisible3d(n) {
+    const type = mem.graphType?.value || '';
+    const q = (mem.graphSearch?.value || '').trim().toLowerCase();
+    const hay = [n.label, n.content, n.kind, n.id].filter(Boolean).join(' ').toLowerCase();
+    return (!type || n.type === type) && (!q || hay.includes(q));
+  }
+
+  function focusCamera3D(node) {
+    if (!memGraph3d || typeof node.x !== 'number') return;
+    const dist = 120;
+    const hyp = Math.hypot(node.x, node.y, node.z) || 1;
+    const ratio = 1 + dist / hyp;
+    memGraph3d.cameraPosition(
+      { x: node.x * ratio, y: node.y * ratio, z: node.z * ratio },
+      node,
+      800,
+    );
+  }
+
+  function highlightNeighborhood3D(node) {
+    if (!memGraph3dAdjacency) return;
+    const lit = new Set([node.id]);
+    const neighbors = memGraph3dAdjacency.get(node.id);
+    if (neighbors) neighbors.forEach((id) => lit.add(id));
+    memGraph3dHighlight = lit;
+    if (memGraph3d) memGraph3d.nodeColor(graph3dNodeColor).linkColor(graph3dLinkColor).linkOpacity(0.5);
+  }
+
+  function resetHighlight3D() {
+    memGraph3dHighlight = null;
+    if (memGraph3d) memGraph3d.nodeColor(graph3dNodeColor).linkColor(graph3dLinkColor).linkOpacity(0.32);
+  }
+
+  function graph3dLinkColor(link) {
+    const css = getComputedStyle(document.documentElement);
+    const accent2 = css.getPropertyValue('--accent-2').trim() || '#b9ff36';
+    const accent3 = css.getPropertyValue('--accent-3').trim() || '#36c5ff';
+    const fg2 = css.getPropertyValue('--fg-2').trim() || '#a0a0aa';
+    if (memGraph3dHighlight) {
+      const s = typeof link.source === 'object' ? link.source.id : link.source;
+      const t = typeof link.target === 'object' ? link.target.id : link.target;
+      if (!memGraph3dHighlight.has(s) || !memGraph3dHighlight.has(t)) return 'rgba(130,130,145,0.05)';
+    }
+    if (link.type === 'kind') return accent2;
+    if (link.type === 'mentions') return accent3;
+    return fg2;
+  }
+
+  function destroyGraph3d() {
+    if (memGraph3d && typeof memGraph3d._destructor === 'function') {
+      try { memGraph3d._destructor(); } catch (_) { /* ignore */ }
+    }
+    memGraph3d = null;
+    memGraph3dHighlight = null;
+  }
+
+  // Wrap a plain 3D node object so the existing renderGraphDetail (which
+  // calls node.data()) works unchanged — zero detail-pane rewrite.
+  function renderGraphDetail3D(detail, node, pinned) {
+    renderGraphDetail(detail, { data: () => node }, pinned);
+  }
+
+  async function loadMemoryGraph3D(options = {}) {
+    const canvas = document.querySelector('[data-mem-graph-canvas]');
+    const detail = document.querySelector('[data-mem-graph-detail]');
+    if (!canvas) return;
+    if (canvas.closest('[hidden]') && !options.force) return;
+    if (!(await ensureForceGraph3DLoaded())) {
+      // 3D engine unavailable — fall back to the proven 2D renderer.
+      graphMode = '2d';
+      try { localStorage.setItem('clemmy.graph.mode', '2d'); } catch (_) { /* private mode */ }
+      syncGraphModeToggle();
+      return loadMemoryGraph(options);
+    }
+    try {
+      const data = await fetchJSON('/api/console/memory/graph');
+      memGraphData = data;
+      if (options.force) destroyGraph3d();
+
+      // Adjacency for neighborhood highlight.
+      memGraph3dAdjacency = new Map();
+      (data.edges || []).forEach((e) => {
+        if (!memGraph3dAdjacency.has(e.source)) memGraph3dAdjacency.set(e.source, new Set());
+        if (!memGraph3dAdjacency.has(e.target)) memGraph3dAdjacency.set(e.target, new Set());
+        memGraph3dAdjacency.get(e.source).add(e.target);
+        memGraph3dAdjacency.get(e.target).add(e.source);
+      });
+
+      if (!data.nodes || data.nodes.length === 0) {
+        canvas.innerHTML = [
+          '<div class="mem-graph-empty">',
+          '  <div class="mem-graph-empty-ring"></div>',
+          '  <h4>NOTHING TO ORBIT YET</h4>',
+          '  <p>Memory grows as Clementine works. Chat, meeting transcripts, and vault notes seed the kinds; cross-references make the web denser. Come back after a few sessions.</p>',
+          '</div>',
+        ].join('');
+        updateGraphStats(0, {}, 0, 0);
+        return;
+      }
+
+      // ForceGraph3D mounts its own <canvas>; clear any prior content
+      // (2D leftovers / empty-state) before mounting.
+      canvas.innerHTML = '';
+      memGraph3dHighlight = null;
+      const css = getComputedStyle(document.documentElement);
+      const bg0 = css.getPropertyValue('--bg-0').trim() || '#07070a';
+
+      const nodes = data.nodes.map((n) => ({ id: n.id, label: n.label, type: n.type, ...(n.data || {}) }));
+      const links = (data.edges || []).map((e) => ({ id: e.id, source: e.source, target: e.target, type: e.type }));
+
+      let instance;
+      try {
+        instance = window.ForceGraph3D()(canvas);
+      } catch (webglErr) {
+        // No WebGL context — revert to 2D for good.
+        graphMode = '2d';
+        try { localStorage.setItem('clemmy.graph.mode', '2d'); } catch (_) { /* private mode */ }
+        syncGraphModeToggle();
+        return loadMemoryGraph(options);
+      }
+      memGraph3d = instance
+        .width(canvas.clientWidth || 600)
+        .height(canvas.clientHeight || 420)
+        .backgroundColor(bg0)
+        .graphData({ nodes, links })
+        .nodeColor(graph3dNodeColor)
+        .nodeVal(graph3dNodeVal)
+        .nodeOpacity(0.92)
+        .nodeLabel((n) => escMem(n.label || ''))
+        .nodeResolution(12)
+        .linkColor(graph3dLinkColor)
+        .linkOpacity(0.32)
+        .linkWidth((l) => (l.type === 'kind' ? 0.6 : 0.3))
+        .nodeVisibility(nodeVisible3d)
+        .linkVisibility((l) => nodeVisible3d(typeof l.source === 'object' ? l.source : { id: l.source }) && nodeVisible3d(typeof l.target === 'object' ? l.target : { id: l.target }))
+        // Perf at the 300-fact / 200-file cap: hover labels (no always-on
+        // sprites), no flowing particles, let the sim settle then stop.
+        .cooldownTicks(120)
+        .onNodeHover((n) => { if (!memGraphPinnedNode && n) renderGraphDetail3D(detail, n); })
+        .onNodeClick((n) => {
+          memGraphPinnedNode = n;
+          focusCamera3D(n);
+          highlightNeighborhood3D(n);
+          renderGraphDetail3D(detail, n, true);
+        })
+        .onBackgroundClick(() => { memGraphPinnedNode = null; resetHighlight3D(); });
+      memGraph3d.onEngineStop(() => { try { memGraph3d.zoomToFit(500, 40); } catch (_) { /* ignore */ } });
+      applyMemoryGraphFilters3D();
+    } catch (err) {
+      canvas.innerHTML = '<div class="mem-empty" style="padding:24px; color:var(--accent-fail);">Failed: ' + escMem(err.message || err) + '</div>';
+    }
+  }
+
+  function applyMemoryGraphFilters3D() {
+    if (!memGraph3d || !memGraphData) return;
+    let visible = 0;
+    const visibleByType = { kind: 0, fact: 0, file: 0, entity: 0 };
+    (memGraphData.nodes || []).forEach((n) => {
+      if (nodeVisible3d(n)) {
+        visible += 1;
+        if (visibleByType[n.type] !== undefined) visibleByType[n.type] += 1;
+      }
+    });
+    // Re-assert visibility accessors so the engine re-evaluates the live
+    // filter state without a full re-simulation.
+    memGraph3d.nodeVisibility(nodeVisible3d).linkVisibility((l) =>
+      nodeVisible3d(typeof l.source === 'object' ? l.source : { id: l.source }) &&
+      nodeVisible3d(typeof l.target === 'object' ? l.target : { id: l.target }));
+    const nodesLen = (memGraphData.nodes || []).length;
+    const edgesLen = (memGraphData.edges || []).length;
+    updateGraphStats(visible, visibleByType, nodesLen, edgesLen);
+  }
+
+  function syncGraphModeToggle() {
+    const btn = document.querySelector('[data-mem-graph-3d-toggle]');
+    if (btn) {
+      btn.textContent = graphMode === '3d' ? '3D' : '2D';
+      btn.setAttribute('aria-pressed', graphMode === '3d' ? 'true' : 'false');
+      btn.setAttribute('title', graphMode === '3d' ? 'Switch to 2D graph' : 'Switch to 3D graph');
     }
   }
 
@@ -21002,7 +21329,7 @@ const CONSOLE_JS = `
         try { memGraphCy.resize(); memGraphCy.fit(undefined, 40); } catch (_) {}
       }
       if (typeof loadMemoryGraph === 'function') {
-        try { await loadMemoryGraph({ force: true }); } catch (err) { console.error('brain/graph load failed:', err); }
+        try { await loadGraphForMode({ force: true }); } catch (err) { console.error('brain/graph load failed:', err); }
       }
     } else if (brainKnowledgeSubtab === 'files') {
       // Files view — first contact runs the full bootMemoryPanel so

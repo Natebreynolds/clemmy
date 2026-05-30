@@ -904,6 +904,26 @@ export function registerConsoleRoutes(
     res.status(404).send('// cytoscape not bundled');
   });
 
+  // 3d-force-graph (three.js + d3-force-3d, single self-contained UMD
+  // bundle, global `ForceGraph3D`) — served offline exactly like cytoscape
+  // above. Powers the interactive 3D knowledge graph. Lazy-loaded by the
+  // console only when the 3D view is active, so the 1.3 MB is never paid
+  // for by the 2D fallback path.
+  app.get('/console/vendor/3d-force-graph.min.js', (_req, res) => {
+    const candidates = [
+      path.resolve(process.cwd(), 'node_modules', '3d-force-graph', 'dist', '3d-force-graph.min.js'),
+      path.resolve(process.env.CLEMENTINE_RESOURCES_PATH ?? '', 'daemon', 'node_modules', '3d-force-graph', 'dist', '3d-force-graph.min.js'),
+      path.resolve((process as NodeJS.Process & { resourcesPath?: string }).resourcesPath ?? '', 'daemon', 'node_modules', '3d-force-graph', 'dist', '3d-force-graph.min.js'),
+    ];
+    for (const candidate of candidates) {
+      if (fs.existsSync(candidate)) {
+        res.type('application/javascript').sendFile(candidate);
+        return;
+      }
+    }
+    res.status(404).send('// 3d-force-graph not bundled');
+  });
+
   app.get('/console/icon.png', (_req, res) => {
     const candidates = [
       path.resolve(process.cwd(), 'apps', 'desktop', 'build', 'icon.png'),
