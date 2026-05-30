@@ -109,6 +109,15 @@ export interface WorkflowStepInput {
   /** Declares what the step PRODUCES (shallow shape check on the
    *  captured workflow_step_result). Absent → no output validation. */
   output?: WorkflowStepOutputContract;
+  /**
+   * How many times to RETRY this step on a transient failure before the
+   * run fails (long-running-without-failing). 0 / absent → no retry
+   * (today's behavior). The runner retries with exponential backoff and
+   * only on failures that look transient (network/timeout/5xx/rate-limit);
+   * a deterministic failure (bad input, contract mismatch) is not retried.
+   * Serialized to YAML as `retry_budget`.
+   */
+  retryBudget?: number;
 }
 
 export type WorkflowContractType = 'string' | 'number' | 'boolean' | 'object' | 'array';

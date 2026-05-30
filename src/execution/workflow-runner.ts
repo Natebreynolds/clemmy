@@ -1117,11 +1117,102 @@ function contractOutputEnabled(): boolean {
   return (getRuntimeEnv('WORKFLOW_CONTRACT_OUTPUT', 'off') ?? 'off').toLowerCase() === 'on';
 }
 
+/**
+ * P4 step retry (flag WORKFLOW_STEP_RETRY, default off). A step that fails
+ * with a TRANSIENT error (network blip, timeout, 5xx, rate-limit) is
+ * retried up to its declared `retryBudget` with exponential backoff, so a
+ * momentary hiccup doesn't halt a long-running workflow. Deterministic
+ * failures (bad input, contract mismatch, approval rejection) are NOT
+ * retried — retrying them just burns time and tokens. Flag-off or
+ * retryBudget=0 → today's behavior (fail on first throw).
+ */
+function stepRetryEnabled(): boolean {
+  return (getRuntimeEnv('WORKFLOW_STEP_RETRY', 'off') ?? 'off').toLowerCase() === 'on';
+}
+
+const RETRY_BACKOFF_BASE_MS = parseInt(
+  process.env.CLEMENTINE_WORKFLOW_RETRY_BASE_MS ?? '2000', 10,
+);
+
+/**
+ * Classify an error as transient (worth retrying) vs deterministic. Pure
+ * + exported for tests. Conservative: only well-known transient signals
+ * match; anything else is treated as deterministic so we never loop on a
+ * real bug. ParkRunSignal / cancellation are handled by the caller before
+ * this is consulted.
+ */
+const TRANSIENT_RE = /\b(ETIMEDOUT|ECONNRESET|ECONNREFUSED|EAI_AGAIN|ENOTFOUND|EPIPE|socket hang up|network|timed? ?out|timeout|rate.?limit|too many requests|temporarily unavailable|service unavailable|bad gateway|gateway timeout|\b(429|500|502|503|504)\b)/i;
+export function isTransientStepError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err ?? '');
+  const code = (err as { code?: string; status?: number } | null);
+  if (code?.code && TRANSIENT_RE.test(code.code)) return true;
+  if (typeof code?.status === 'number' && [408, 429, 500, 502, 503, 504].includes(code.status)) return true;
+  return TRANSIENT_RE.test(msg);
+}
+
+/**
+ * Pure retry harness around an execution thunk. Retries on a transient
+ * error up to `budget` times with exponential backoff. `isRetryable`
+ * lets the caller veto (park/cancel signals must propagate immediately).
+ * `onRetry` is the side-effect hook (event log). Exported for tests so
+ * the loop logic is verified without the full step machinery.
+ */
+export async function runWithStepRetry<T>(
+  run: () => Promise<T>,
+  opts: {
+    budget: number;
+    backoffBaseMs: number;
+    isRetryable: (err: unknown) => boolean;
+    onRetry?: (info: { attempt: number; budget: number; delayMs: number; err: unknown }) => void;
+    sleep?: (ms: number) => Promise<void>;
+    afterBackoff?: () => void;
+  },
+): Promise<T> {
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  let attempt = 0;
+  for (;;) {
+    try {
+      return await run();
+    } catch (err) {
+      if (attempt >= opts.budget || !opts.isRetryable(err)) throw err;
+      attempt += 1;
+      const delayMs = opts.backoffBaseMs * 2 ** (attempt - 1);
+      opts.onRetry?.({ attempt, budget: opts.budget, delayMs, err });
+      await sleep(delayMs);
+      opts.afterBackoff?.();
+    }
+  }
+}
+
 async function executeStepVerified(
   step: WorkflowStepInput,
   ctx: StepExecutionContext,
 ): Promise<unknown> {
-  const output = await executeStep(step, ctx);
+  const budget = stepRetryEnabled() && step.retryBudget && step.retryBudget > 0 ? step.retryBudget : 0;
+  // Retry loop wraps EXECUTION only. Verification (below) is deterministic
+  // and never retried. Park/cancel signals propagate immediately (they are
+  // not "retryable").
+  const output = await runWithStepRetry(() => executeStep(step, ctx), {
+    budget,
+    backoffBaseMs: RETRY_BACKOFF_BASE_MS,
+    isRetryable: (err) =>
+      !(err instanceof ParkRunSignal) &&
+      !(err instanceof WorkflowRunCancelledError) &&
+      isTransientStepError(err),
+    onRetry: ({ attempt, budget: b, delayMs, err }) => {
+      appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
+        kind: 'step_retry',
+        stepId: step.id,
+        error: err instanceof Error ? err.message : String(err),
+        meta: { attempt, budget: b, delayMs, reason: 'transient' },
+      });
+      logger.warn(
+        { stepId: step.id, attempt, budget: b, delayMs, err: err instanceof Error ? err.message : String(err) },
+        'workflow step failed transiently — retrying after backoff',
+      );
+    },
+    afterBackoff: () => throwIfWorkflowRunCancelled(ctx.runId),
+  });
   if (contractOutputEnabled() && step.output) {
     const result = verifyStepOutput(step.output, output);
     if (!result.ok) {
