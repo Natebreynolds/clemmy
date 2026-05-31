@@ -144,7 +144,7 @@ import type { CheckInUrgency } from '../agents/check-ins.js';
 import { createBackgroundTask, getBackgroundTask, listBackgroundTasks, processBackgroundTasks } from '../execution/background-tasks.js';
 import { getBackgroundTaskStatus } from '../execution/background-task-status.js';
 import { listRuns } from '../runtime/run-events.js';
-import { listNotifications } from '../runtime/notifications.js';
+import { listNotifications, markStaleApprovalNotificationsRead } from '../runtime/notifications.js';
 import { actionBus, type ActionEvent } from '../runtime/action-bus.js';
 import {
   appendEvent as appendHarnessEvent,
@@ -4682,9 +4682,25 @@ export function registerConsoleRoutes(
       const executions = new ExecutionStore().list(60)
         .filter((execution) => execution.status === 'active');
       const backgroundTasks = listBackgroundTasks().slice(0, 60);
-      const activeBackgroundTasks = backgroundTasks.filter((task) =>
-        task.status === 'pending' || task.status === 'running' || task.status === 'awaiting_approval' || task.status === 'interrupted',
-      );
+      const pendingApprovalIds = new Set<string>([
+        ...approvals.map((approval) => approval.id),
+        ...harnessApprovals.map((approval) => approval.approvalId),
+      ]);
+      try {
+        markStaleApprovalNotificationsRead(pendingApprovalIds, {
+          approvalStatus: 'not_pending',
+          reconciledBy: 'command-center',
+        });
+      } catch {
+        // Best-effort dashboard cleanup. The live approval stores above
+        // remain the source of truth for actionable decisions.
+      }
+      const activeBackgroundTasks = backgroundTasks.filter((task) => {
+        if (task.status === 'awaiting_approval') {
+          return task.pendingApprovalId ? pendingApprovalIds.has(task.pendingApprovalId) : true;
+        }
+        return task.status === 'pending' || task.status === 'running' || task.status === 'interrupted';
+      });
       const backgroundTaskByApprovalId = new Map(
         backgroundTasks
           .filter((task) => task.pendingApprovalId)

@@ -32,6 +32,7 @@ export interface WorkflowStepShape {
   id: string;
   prompt: string;
   dependsOn?: string[];
+  orderingOnlyDeps?: string[];
   model?: string;
   tier?: number;
   maxTurns?: number;
@@ -424,6 +425,12 @@ export function validateWorkflowDefinition(
   // ── Per-step semantic checks (the new 2026-05-21 additions) ──
   for (const step of steps) {
     if (!step.id || !step.prompt) continue;
+
+    if (Array.isArray(step.orderingOnlyDeps) && step.orderingOnlyDeps.length > 0) {
+      warnings.push(
+        `Step "${step.id}" uses deprecated orderingOnlyDeps. dependsOn now carries upstream outputs automatically; remove orderingOnlyDeps when you next edit this workflow.`,
+      );
+    }
 
     // Template-token sanity (typed-workflow-contract P1, report-only):
     // unrecognized tokens ({{url}} vs {{input.url}}, typos) and

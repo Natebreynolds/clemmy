@@ -36,10 +36,9 @@ export interface WorkflowStepInput {
   id: string;
   prompt: string;
   dependsOn?: string[];
-  /** Dep ids this step waits for but does NOT consume — exempts them from
-   *  the author-time data-binding requirement (checkDependencyBinding).
-   *  Use ONLY for genuine ordering; if you need the data, reference
-   *  {{steps.<id>.output}} instead. Serialized to YAML as orderingOnlyDeps. */
+  /** Deprecated compatibility field from the older ordering-only dependency
+   *  model. dependsOn now carries upstream outputs into STEP CONTEXT
+   *  automatically, so new workflows should omit this. */
   orderingOnlyDeps?: string[];
   model?: string;
   tier?: number;

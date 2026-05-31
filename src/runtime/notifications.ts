@@ -277,6 +277,71 @@ export function markNotificationRead(id: string): NotificationRecord | undefined
   return item;
 }
 
+export function markNotificationsReadByApprovalId(
+  approvalId: string,
+  metadataPatch: Record<string, unknown> = {},
+): NotificationRecord[] {
+  const items = loadNotifications();
+  const changed: NotificationRecord[] = [];
+  const resolvedAt = new Date().toISOString();
+  for (const item of items) {
+    const matchesStableId = item.id === `approval-${approvalId}`;
+    const matchesMetadata = item.metadata?.approvalId === approvalId;
+    if (item.kind !== 'approval' && !matchesStableId && !matchesMetadata) continue;
+    if (!matchesStableId && !matchesMetadata) continue;
+    const nextMetadata = {
+      ...(item.metadata ?? {}),
+      resolvedAt,
+      ...metadataPatch,
+    };
+    let didChange = false;
+    if (!item.read) {
+      item.read = true;
+      didChange = true;
+    }
+    if (JSON.stringify(item.metadata ?? {}) !== JSON.stringify(nextMetadata)) {
+      item.metadata = nextMetadata;
+      didChange = true;
+    }
+    if (didChange) changed.push(item);
+  }
+  if (changed.length > 0) saveNotifications(items);
+  return changed;
+}
+
+export function markStaleApprovalNotificationsRead(
+  activeApprovalIds: Iterable<string>,
+  metadataPatch: Record<string, unknown> = {},
+): NotificationRecord[] {
+  const active = new Set(activeApprovalIds);
+  const items = loadNotifications();
+  const changed: NotificationRecord[] = [];
+  const reconciledAt = new Date().toISOString();
+  for (const item of items) {
+    if (item.kind !== 'approval') continue;
+    const approvalId = item.metadata?.approvalId;
+    if (typeof approvalId !== 'string' || approvalId.length === 0) continue;
+    if (active.has(approvalId)) continue;
+    const nextMetadata = {
+      ...(item.metadata ?? {}),
+      reconciledAt,
+      ...metadataPatch,
+    };
+    let didChange = false;
+    if (!item.read) {
+      item.read = true;
+      didChange = true;
+    }
+    if (JSON.stringify(item.metadata ?? {}) !== JSON.stringify(nextMetadata)) {
+      item.metadata = nextMetadata;
+      didChange = true;
+    }
+    if (didChange) changed.push(item);
+  }
+  if (changed.length > 0) saveNotifications(items);
+  return changed;
+}
+
 export function getNotification(id: string): NotificationRecord | undefined {
   return loadNotifications().find((entry) => entry.id === id);
 }

@@ -178,6 +178,28 @@ test('resolved {{steps.X.output}} reference → ok', () => {
   );
 });
 
+test('orderingOnlyDeps is deprecated warning, not error', () => {
+  const result = validateWorkflowDefinition({
+    name: 'legacy-ordering',
+    description: 'Workflow with a legacy ordering-only dependency marker',
+    steps: [
+      { id: 'fetch', prompt: 'Fetch data.' },
+      {
+        id: 'summarize',
+        prompt: 'Summarize the fetched data.',
+        dependsOn: ['fetch'],
+        orderingOnlyDeps: ['fetch'],
+      },
+    ],
+  });
+
+  assert.equal(result.ok, true);
+  assert.ok(
+    result.warnings.some((warning) => /orderingOnlyDeps/.test(warning) && /deprecated/i.test(warning)),
+    `expected orderingOnlyDeps deprecation warning, got: ${JSON.stringify(result.warnings)}`,
+  );
+});
+
 test('missing usesSkill reference → warning', () => {
   const result = validateWorkflowDefinition({
     name: 'wf',

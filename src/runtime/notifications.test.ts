@@ -30,7 +30,12 @@ process.env.CLEMENTINE_HOME = TMP_HOME;
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 const { actionBus } = await import('./action-bus.js');
-const { addNotification, listNotifications } = await import('./notifications.js');
+const {
+  addNotification,
+  listNotifications,
+  markStaleApprovalNotificationsRead,
+  markNotificationsReadByApprovalId,
+} = await import('./notifications.js');
 
 const NOTIFICATIONS_FILE = path.join(TMP_HOME, 'state', 'notifications.json');
 const DELIVERY_FILE = path.join(TMP_HOME, 'state', 'notification-delivery-queue.json');
@@ -131,4 +136,72 @@ test('delivery queue: corrupted JSON is quarantined and surfaced too', () => {
   assert.equal(quarantined.length, 1, `expected one quarantine file, got: ${state.join(',')}`);
   // We don't need to assert the actionBus event again — the same code path
   // emits it, and the earlier test already validates that emission.
+});
+
+test('markNotificationsReadByApprovalId marks stable and metadata approval notifications read', () => {
+  addNotification({
+    id: 'approval-apr-test',
+    kind: 'approval',
+    title: 'Approval pending',
+    body: 'approve this',
+    createdAt: new Date().toISOString(),
+    read: false,
+    metadata: { approvalId: 'apr-test' },
+  });
+  addNotification({
+    id: '1670000000000-approval-apr-test',
+    kind: 'approval',
+    title: 'Approval required',
+    body: 'runtime approval',
+    createdAt: new Date().toISOString(),
+    read: false,
+    metadata: { approvalId: 'apr-test' },
+  });
+  addNotification({
+    id: 'approval-apr-other',
+    kind: 'approval',
+    title: 'Other approval',
+    body: 'do not touch',
+    createdAt: new Date().toISOString(),
+    read: false,
+    metadata: { approvalId: 'apr-other' },
+  });
+
+  const changed = markNotificationsReadByApprovalId('apr-test', { approvalStatus: 'resolved' });
+  assert.equal(changed.length, 2);
+  const items = listNotifications(50);
+  const mine = items.filter((item) => item.metadata?.approvalId === 'apr-test');
+  assert.equal(mine.length, 2);
+  assert.ok(mine.every((item) => item.read));
+  assert.ok(mine.every((item) => item.metadata?.approvalStatus === 'resolved'));
+  assert.equal(items.find((item) => item.id === 'approval-apr-other')?.read, false);
+});
+
+test('markStaleApprovalNotificationsRead leaves active approvals unread and clears stale ones', () => {
+  addNotification({
+    id: 'approval-apr-active',
+    kind: 'approval',
+    title: 'Active approval',
+    body: 'still pending',
+    createdAt: new Date().toISOString(),
+    read: false,
+    metadata: { approvalId: 'apr-active' },
+  });
+  addNotification({
+    id: 'approval-apr-stale',
+    kind: 'approval',
+    title: 'Stale approval',
+    body: 'already gone',
+    createdAt: new Date().toISOString(),
+    read: false,
+    metadata: { approvalId: 'apr-stale' },
+  });
+
+  const changed = markStaleApprovalNotificationsRead(['apr-active'], { approvalStatus: 'not_pending' });
+  assert.ok(changed.some((item) => item.id === 'approval-apr-stale'));
+  const items = listNotifications(100);
+  assert.equal(items.find((item) => item.id === 'approval-apr-active')?.read, false);
+  const stale = items.find((item) => item.id === 'approval-apr-stale');
+  assert.equal(stale?.read, true);
+  assert.equal(stale?.metadata?.approvalStatus, 'not_pending');
 });

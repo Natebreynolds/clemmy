@@ -67,5 +67,5 @@ test('context packet ranks relevant skills and workflows for the current request
   assert.match(packet.text, /AGENT CONTEXT PACKET/);
   assert.match(packet.text, /External MCP scope: dataforseo/);
   assert.match(packet.text, /call skill_read/);
-  assert.match(packet.text, /workflow_get or workflow_run/);
+  assert.match(packet.text, /reusable-process candidates/);
 });

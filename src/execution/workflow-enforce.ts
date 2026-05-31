@@ -6,7 +6,7 @@ import { collectRequiredWorkflowInputs, COMMON_WORKFLOW_INPUT_KEYS } from './wor
  * Author/enable-time enforcement (typed-workflow-contract).
  *
  * A workflow that can't get its data shouldn't be creatable or
- * enablable. The validator computes the errors (token-binding +
+ * enablable. The validator computes the errors (token sanity +
  * runnability + send-gate); this wires it into the three WRITE seams —
  * workflow_create + both enable seams — so a broken workflow is refused
  * at the boundary instead of failing at 2am.
@@ -148,61 +148,19 @@ export function checkRunnabilityConstraints(def: WorkflowDefinition): string[] {
 }
 
 /**
- * Author-time DATA-BINDING check — the decisive lever against the
- * "depends-on-but-never-uses" bug class.
+ * Deprecated author-time data-binding check.
  *
- * `dependsOn` only ORDERS steps; it does NOT pass data. A downstream step
- * only receives an upstream output if its prompt references
- * `{{steps.<id>.output}}` OR a per-step `inputs:` binding pulls
- * `steps.<id>...`. The model keeps authoring steps that `dependsOn:[X]`
- * but reference X nowhere → empty STEP CONTEXT → {blocked:true} at run
- * time. This rule refuses such a step at create/enable.
- *
- * Escape hatch: `orderingOnlyDeps` lists deps the step waits for purely
- * for sequencing (it does NOT consume their output) — those are exempt.
- *
- * Exemptions: forEach / usesSkill / deterministic steps consume upstream
- * differently (item fan-out, skill input, scripted runner), so the token
- * heuristic doesn't apply — skip them.
- *
- * Runs INDEPENDENTLY of any prompt-presence loop so a prompt-less but
- * wired step is still checked.
+ * `dependsOn` now carries upstream step outputs into the downstream
+ * structured STEP CONTEXT automatically. Explicit `{{steps.x.output}}`
+ * tokens and per-step `inputs.from` bindings are still useful when a step
+ * needs a precise subpath or a named typed value, but they are no longer
+ * required just to receive dependency data. Keep this exported as a no-op
+ * during the migration so older callers/tests can be updated without
+ * reintroducing the hard failure.
  */
 export function checkDependencyBinding(def: WorkflowDefinition): string[] {
-  const errors: string[] = [];
-  for (const step of def.steps) {
-    const deps = step.dependsOn ?? [];
-    if (deps.length === 0) continue;
-    // These consume upstream differently — exempt from the token heuristic.
-    if (step.forEach || step.usesSkill || step.deterministic) continue;
-
-    const orderingOnly = new Set(step.orderingOnlyDeps ?? []);
-    const inputsObj: Record<string, unknown> = (step.inputs ?? {}) as Record<string, unknown>;
-    // Stringified inputs let a binding that carries the upstream ref be
-    // caught too (e.g. {"rows":{"from":"steps.X.output"}}), whether the ref
-    // sits in a value string OR a nested {from:'steps.X...'} field.
-    const inputsJson = JSON.stringify(inputsObj);
-
-    for (const dep of deps) {
-      if (orderingOnly.has(dep)) continue; // intentional ordering-only
-
-      // dep ids are [a-z0-9_-] in practice, but escape defensively so a
-      // stray metachar can't break the matcher.
-      const escaped = dep.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      const stepsToken = new RegExp(`\\{\\{\\s*steps\\.${escaped}\\b`, 'i');
-      const referenced =
-        stepsToken.test(step.prompt ?? '') || inputsJson.includes(`steps.${dep}`);
-      if (!referenced) {
-        errors.push(
-          `Step "${step.id}" depends on "${dep}" but never uses its output. `
-          + `dependsOn only orders steps — to use an upstream output, add {{steps.${dep}.output}} `
-          + `to this step's prompt or declare an inputs binding. If the dependency is intentional `
-          + `ordering-only, add "${dep}" to this step's orderingOnlyDeps.`,
-        );
-      }
-    }
-  }
-  return errors;
+  void def;
+  return [];
 }
 
 /**

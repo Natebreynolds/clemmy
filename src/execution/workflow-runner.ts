@@ -779,6 +779,8 @@ export const workflowRunnerInternalsForTest = {
   findParkedWorkflowHarnessSession,
   getWorkflowHarnessSession,
   awaitDeclarativeStepApproval,
+  bindStepContext,
+  renderStepContextBlock,
 };
 
 async function runStepViaHarness(
@@ -1120,19 +1122,16 @@ async function awaitDeclarativeStepApproval(
 }
 
 /**
- * Bind a step's declared inputs (typed contract). Returns the structured
- * context to deliver to the step, or undefined when the step declares no
- * `inputs` (today's path). When the typed-contract flag is on and a
- * REQUIRED input is unresolved, emit `step_failed` and throw a named
- * error BEFORE the step runs — the bind-time fast-fail that converts
- * silent empty-string starvation into a loud, debuggable failure.
+ * Bind a step's declared inputs plus dependency outputs. `dependsOn`
+ * always carries upstream data into the structured step context; explicit
+ * `inputs` remain the typed contract for named values and missing-required
+ * fast-fail behavior.
  */
 function bindStepContext(
   step: WorkflowStepInput,
   ctx: StepExecutionContext,
   item?: unknown,
 ): { values: Record<string, unknown>; upstream: Record<string, unknown>; item?: unknown } | undefined {
-  if (!step.inputs || Object.keys(step.inputs).length === 0) return undefined;
   const bound = bindStepInputs(step, ctx.inputs, ctx.stepOutputs, item);
   if (bound.missing.length > 0) {
     const message =
@@ -1146,6 +1145,10 @@ function bindStepContext(
     });
     throw new Error(message);
   }
+  const hasValues = Object.keys(bound.values).length > 0;
+  const hasUpstream = Object.keys(bound.upstream).length > 0;
+  const hasItem = item !== undefined;
+  if (!hasValues && !hasUpstream && !hasItem) return undefined;
   return { values: bound.values, upstream: bound.upstream, item };
 }
 
@@ -1842,14 +1845,15 @@ function useWorkflowStepAgent(): boolean {
 
 // Render the bound inputs + upstream outputs as an authoritative
 // structured block appended after the prose. Each value is clipped to
-// keep the prompt within budget (token-efficiency north star) — the full
-// value still reaches downstream steps via stepOutputs.
+// keep the prompt within budget (token-efficiency north star). If a workflow
+// needs a precise large subfield, declare an explicit `inputs.from` binding
+// or split the upstream step output into smaller structured values.
 const STEP_CONTEXT_VALUE_CLIP = 8000;
 function clipForContext(value: unknown): unknown {
   let json: string;
   try { json = JSON.stringify(value); } catch { return '[unserializable]'; }
   if (json.length <= STEP_CONTEXT_VALUE_CLIP) return value;
-  return `[clipped ${json.length} chars — full value available to this step's tools]`;
+  return `[clipped ${json.length} chars — use explicit inputs.from binding for precise large subfields]`;
 }
 function renderStepContextBlock(ctx: { values: Record<string, unknown>; upstream: Record<string, unknown>; item?: unknown }): string {
   const payload: Record<string, unknown> = {
@@ -1859,7 +1863,7 @@ function renderStepContextBlock(ctx: { values: Record<string, unknown>; upstream
   if (ctx.item !== undefined) payload.item = clipForContext(ctx.item);
   return [
     '=== STEP CONTEXT (structured, authoritative) ===',
-    'This is your bound inputs as real data — it overrides the prose above. If a value you need is empty/absent here, call workflow_step_result({"blocked":true,"reason":"<what is missing>"}) instead of guessing or fabricating.',
+    'This is real workflow data. `input` contains declared step inputs; `upstream` contains outputs from every completed dependsOn step. Use it over prose. If a value you need is empty/absent here, call workflow_step_result({"blocked":true,"reason":"<what is missing>"}) instead of guessing or fabricating.',
     JSON.stringify(payload, null, 2),
     '=== END STEP CONTEXT ===',
   ].join('\n');

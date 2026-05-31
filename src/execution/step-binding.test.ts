@@ -13,9 +13,14 @@ import type { WorkflowStepInput } from '../memory/workflow-store.js';
 const step = (inputs: WorkflowStepInput['inputs'], dependsOn?: string[]): WorkflowStepInput =>
   ({ id: 's', prompt: 'p', inputs, dependsOn });
 
-test('no declared inputs → empty binding, no missing (today\'s path)', () => {
+test('no declared inputs and no deps → empty binding, no missing', () => {
   const r = bindStepInputs({ id: 's', prompt: 'p' }, { url: 'x' }, {});
   assert.deepEqual(r, { values: {}, upstream: {}, missing: [] });
+});
+
+test('no declared inputs still carries dependsOn outputs for STEP CONTEXT', () => {
+  const r = bindStepInputs({ id: 's', prompt: 'p', dependsOn: ['fetch'] }, {}, { fetch: { rows: [1, 2] } });
+  assert.deepEqual(r, { values: {}, upstream: { fetch: { rows: [1, 2] } }, missing: [] });
 });
 
 test('conventional resolution: input by its own name', () => {

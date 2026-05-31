@@ -246,6 +246,37 @@ test('planWorkflowExecutionBatches: rejects cyclic graphs', () => {
   );
 });
 
+test('bindStepContext carries dependsOn outputs even without explicit step inputs', () => {
+  const ctx = {
+    inputs: {},
+    stepOutputs: {
+      fetch_accounts: { rows: [{ id: 'A1', domain: 'example.com' }], count: 1 },
+      unrelated: { ignored: true },
+    },
+    workflowSlug: 'test-workflow',
+    runId: 'run-context-test',
+  };
+
+  const bound = workflowRunnerInternalsForTest.bindStepContext(
+    { id: 'summarize', prompt: 'Summarize the fetched accounts.', dependsOn: ['fetch_accounts'] },
+    ctx as never,
+  );
+
+  assert.ok(bound);
+  assert.deepEqual(bound, {
+    values: {},
+    upstream: {
+      fetch_accounts: { rows: [{ id: 'A1', domain: 'example.com' }], count: 1 },
+    },
+    item: undefined,
+  });
+  const rendered = workflowRunnerInternalsForTest.renderStepContextBlock(bound);
+  assert.match(rendered, /STEP CONTEXT/);
+  assert.match(rendered, /fetch_accounts/);
+  assert.match(rendered, /example\.com/);
+  assert.doesNotMatch(rendered, /unrelated/);
+});
+
 test('workflow harness sessions are deterministic per run step', () => {
   resetEventLog();
   const first = workflowRunnerInternalsForTest.getWorkflowHarnessSession(

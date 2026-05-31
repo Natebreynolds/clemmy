@@ -3,6 +3,7 @@ import path from 'node:path';
 import { BASE_DIR } from '../config.js';
 import type { PendingApproval } from '../types.js';
 import { actionBus } from './action-bus.js';
+import { markNotificationsReadByApprovalId } from './notifications.js';
 
 function emitIfResolved(previous: PendingApproval | undefined, next: PendingApproval): void {
   // `pending → approved` and `pending → rejected` are the transitions
@@ -10,6 +11,14 @@ function emitIfResolved(previous: PendingApproval | undefined, next: PendingAppr
   // shouldn't generate a notification.
   if (!previous || previous.status === next.status) return;
   if (next.status === 'approved' || next.status === 'rejected') {
+    try {
+      markNotificationsReadByApprovalId(next.id, {
+        approvalStatus: next.status,
+      });
+    } catch {
+      // Best-effort dashboard cleanup; the approval store remains the
+      // source of truth when notification state is temporarily unavailable.
+    }
     actionBus.emit({ kind: 'approval.resolved', approval: next, resolution: next.status });
   }
 }

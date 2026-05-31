@@ -31,6 +31,7 @@
 
 import { randomBytes } from 'node:crypto';
 import { openEventLog } from './eventlog.js';
+import { markNotificationsReadByApprovalId } from '../notifications.js';
 
 export type PendingApprovalStatus = 'pending' | 'resolved' | 'expired' | 'cancelled';
 export type ApprovalResolution = 'approved' | 'rejected' | 'expired' | 'cancelled_by_user';
@@ -291,6 +292,17 @@ export function resolve(
   const row = db
     .prepare('SELECT * FROM pending_approvals WHERE approval_id = ?')
     .get(approvalId) as ApprovalSqlRow;
+  try {
+    markNotificationsReadByApprovalId(approvalId, {
+      approvalStatus: nextStatus,
+      approvalResolution: resolution,
+      approvalResolver: resolver,
+    });
+  } catch {
+    // Notification cleanup is best-effort; approval resolution is the
+    // source of truth and must not fail because the dashboard queue is
+    // temporarily unavailable.
+  }
   return { ok: true, row: rowToPublic(row) };
 }
 

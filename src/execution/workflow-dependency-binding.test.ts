@@ -4,14 +4,11 @@ import { checkDependencyBinding } from './workflow-enforce.js';
 import type { WorkflowDefinition, WorkflowStepInput } from '../memory/workflow-store.js';
 
 /**
- * Author-time data-binding rule (checkDependencyBinding).
+ * Deprecated author-time data-binding rule (checkDependencyBinding).
  *
- * `dependsOn` only ORDERS steps — it does NOT pass data. A step that
- * declares a dependency but never references its output (no
- * {{steps.<id>.output}} token, no inputs binding pulling steps.<id>) gets
- * an empty STEP CONTEXT and blocks at run time. These tests pin the rule
- * that refuses such a step at create/enable, plus the orderingOnlyDeps
- * escape hatch and the forEach/usesSkill/deterministic exemptions.
+ * `dependsOn` now carries upstream output into STEP CONTEXT automatically.
+ * Explicit {{steps.<id>.output}} tokens and inputs bindings are optional
+ * precision tools, not a hard author-time requirement.
  */
 
 function def(steps: WorkflowStepInput[]): WorkflowDefinition {
@@ -49,19 +46,17 @@ test('dependsOn X + an inputs binding referencing steps.X → no error', () => {
   assert.deepEqual(errors, []);
 });
 
-test('dependsOn X but references X nowhere → ERROR naming X + orderingOnlyDeps hint', () => {
+test('dependsOn X with no explicit token is allowed because STEP CONTEXT carries upstream', () => {
   const errors = checkDependencyBinding(
     def([
       { id: 'fetch', prompt: 'Fetch the data.' },
       { id: 'use', prompt: 'Summarize the data into bullets.', dependsOn: ['fetch'] },
     ]),
   );
-  assert.equal(errors.length, 1);
-  assert.match(errors[0], /Step "use" depends on "fetch"/);
-  assert.match(errors[0], /orderingOnlyDeps/);
+  assert.deepEqual(errors, []);
 });
 
-test('dependsOn X but X in orderingOnlyDeps → no error (escape works)', () => {
+test('legacy orderingOnlyDeps remains harmless while workflows migrate', () => {
   const errors = checkDependencyBinding(
     def([
       { id: 'fetch', prompt: 'Fetch the data.' },
@@ -130,7 +125,5 @@ test('real incident shape: one bound dep, one unbound dep → ERROR for the unbo
       },
     ]),
   );
-  assert.equal(errors.length, 1);
-  assert.match(errors[0], /Step "upsert_account_rows" depends on "enrich_missing_seo_once"/);
-  assert.doesNotMatch(errors[0], /depends on "find_or_create_tracker"/);
+  assert.deepEqual(errors, []);
 });

@@ -14,6 +14,7 @@ import assert from 'node:assert/strict';
 
 const reg = await import('./approval-registry.js');
 const { createSession, closeEventLog, openEventLog } = await import('./eventlog.js');
+const { addNotification, listNotifications } = await import('../notifications.js');
 
 test.beforeEach(() => {
   // Tests share one DB across the file; wipe the registry rows so each
@@ -98,6 +99,26 @@ test('resolve is atomic — only one of two racing resolves wins', () => {
   assert.equal(second.reason, 'already_resolved');
   // Second's row reflects the winning resolution.
   assert.equal(second.row?.resolution, 'approved');
+});
+
+test('resolve marks matching approval notifications read', () => {
+  const session = createSession({ kind: 'chat' });
+  const r = reg.register({ sessionId: session.id, subject: 'notify cleanup' });
+  addNotification({
+    id: `approval-${r.approvalId}`,
+    kind: 'approval',
+    title: 'Approval pending',
+    body: 'waiting',
+    createdAt: new Date().toISOString(),
+    read: false,
+    metadata: { approvalId: r.approvalId },
+  });
+
+  const result = reg.resolve(r.approvalId, 'approved', 'unit-test');
+  assert.equal(result.ok, true);
+  const notification = listNotifications(20).find((item) => item.id === `approval-${r.approvalId}`);
+  assert.equal(notification?.read, true);
+  assert.equal(notification?.metadata?.approvalResolution, 'approved');
 });
 
 test('resolve reports not_found for unknown ids', () => {

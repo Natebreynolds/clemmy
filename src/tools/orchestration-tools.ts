@@ -39,6 +39,7 @@ import {
   unrequestedWorkflowRunMessage,
   workflowExplicitlyRequested,
 } from './workflow-run-guard.js';
+import { addNotification } from '../runtime/notifications.js';
 
 /**
  * Parse the workflow_run `inputs` field, which the model passes as a JSON
@@ -364,19 +365,19 @@ export function registerOrchestrationTools(server: McpServer): void {
     'workflow_create',
     "Create a recurring or multi-step automated workflow. Use this for ANY scheduled or repeated work (\"daily at 6pm\", \"every Monday morning\", \"when X happens, do Y\") INSTEAD of task_add (which is one-shot). A workflow is the WHAT (the steps); after this call, call workflow_schedule to set the cron — that's the WHEN. "
       + "AUTHORING MODEL (important): workflows are AUTONOMOUS BY DEFAULT — an enabled workflow runs every step end-to-end on the user's one-time consent (enabling it), WITHOUT pausing for per-step approval. Do NOT put `request_approval` in step prompts. "
-      + "Each step does ONE job and its result flows to the next step: a downstream step references an upstream result with `{{steps.<stepId>.output}}` (the runner passes the real structured data, not a summary). "
+      + "Each step does ONE job and its result flows to dependent steps automatically: every `dependsOn` output is injected into the downstream STEP CONTEXT as real structured data. Use `{{steps.<stepId>.output}}` or step inputs only when you need a precise subpath or a named typed value. "
       + "If — and only if — a step does something IRREVERSIBLE the user should sign off on first (e.g. sending emails, publishing), set `requiresApproval: true` on THAT ONE step and a short `approvalPreview`; the runner surfaces a single batch approval and holds the run there, then continues. Prefer ZERO gates for read/research/draft/deploy-for-review workflows. "
       + "Steps with the same satisfied dependsOn run in parallel; use forEach for per-item fan-out. "
-      + "Design THIN agentic steps: a few capable steps (each doing a whole meaningful chunk), not many micro-steps. dependsOn orders steps; bind data with {{steps.<id>.output}} or inputs — a step that depends on another but never references its output will be REJECTED. "
+      + "Design THIN agentic steps: a few capable steps (each doing a whole meaningful chunk), not many micro-steps. `dependsOn` both orders steps and carries upstream outputs into the downstream STEP CONTEXT. "
       + "Call workflow_list first if you want to see existing workflow shapes.",
     {
       name: z.string().min(1),
       description: z.string().min(1),
       steps: z.array(z.object({
         id: z.string().min(1),
-        prompt: z.string().min(1).describe('The step task. Reference an upstream output with {{steps.<id>.output}} (real structured data, not a summary); reference a workflow input with {{input.<key>}}; iterate with {{item}} under forEach.'),
-        dependsOn: z.array(z.string()).optional().describe('Step IDs this step waits for. IMPORTANT: dependsOn only ORDERS execution — it does NOT pass data. To USE an upstream step output you MUST reference {{steps.<id>.output}} in this step prompt or declare an inputs binding. If you depend on a step only for ordering (you do not need its output), list that id in orderingOnlyDeps.'),
-        orderingOnlyDeps: z.array(z.string()).optional().describe('Dep ids this step waits for but does NOT consume — exempts them from the data-binding requirement. Use ONLY for genuine ordering; if you need the data, reference {{steps.<id>.output}} instead.'),
+        prompt: z.string().min(1).describe('The step task. Outputs from dependsOn steps arrive automatically in STEP CONTEXT.upstream; reference {{steps.<id>.output}} only when a precise inline value is useful. Reference a workflow input with {{input.<key>}}; iterate with {{item}} under forEach.'),
+        dependsOn: z.array(z.string()).optional().describe('Step IDs this step waits for. Their outputs are automatically available to this step in STEP CONTEXT.upstream.'),
+        orderingOnlyDeps: z.array(z.string()).optional().describe('Deprecated compatibility field. dependsOn now carries data automatically; omit this for new workflows.'),
         model: z.string().optional(),
         tier: z.number().optional(),
         maxTurns: z.number().optional(),
@@ -616,15 +617,15 @@ export function registerOrchestrationTools(server: McpServer): void {
   server.tool(
     'workflow_update',
     'Modify an existing workflow: update description, trigger schedule, steps, inputs, or synthesis. Pass only the fields you want to change — others are preserved. Step IDs and dependencies are re-validated. '
-      + 'Design THIN agentic steps: a few capable steps (each doing a whole meaningful chunk), not many micro-steps. dependsOn orders steps; bind data with {{steps.<id>.output}} or inputs — a step that depends on another but never references its output will be REJECTED.',
+      + 'Design THIN agentic steps: a few capable steps (each doing a whole meaningful chunk), not many micro-steps. `dependsOn` both orders steps and carries upstream outputs into the downstream STEP CONTEXT.',
     {
       name: z.string().min(1),
       description: z.string().optional(),
       steps: z.array(z.object({
         id: z.string().min(1),
-        prompt: z.string().min(1).describe('The step task. Reference an upstream output with {{steps.<id>.output}} (real structured data, not a summary); reference a workflow input with {{input.<key>}}; iterate with {{item}} under forEach.'),
-        dependsOn: z.array(z.string()).optional().describe('Step IDs this step waits for. IMPORTANT: dependsOn only ORDERS execution — it does NOT pass data. To USE an upstream step output you MUST reference {{steps.<id>.output}} in this step prompt or declare an inputs binding. If you depend on a step only for ordering (you do not need its output), list that id in orderingOnlyDeps.'),
-        orderingOnlyDeps: z.array(z.string()).optional().describe('Dep ids this step waits for but does NOT consume — exempts them from the data-binding requirement. Use ONLY for genuine ordering; if you need the data, reference {{steps.<id>.output}} instead.'),
+        prompt: z.string().min(1).describe('The step task. Outputs from dependsOn steps arrive automatically in STEP CONTEXT.upstream; reference {{steps.<id>.output}} only when a precise inline value is useful. Reference a workflow input with {{input.<key>}}; iterate with {{item}} under forEach.'),
+        dependsOn: z.array(z.string()).optional().describe('Step IDs this step waits for. Their outputs are automatically available to this step in STEP CONTEXT.upstream.'),
+        orderingOnlyDeps: z.array(z.string()).optional().describe('Deprecated compatibility field. dependsOn now carries data automatically; omit this for new workflows.'),
         model: z.string().optional(),
         tier: z.number().optional(),
         maxTurns: z.number().optional(),
@@ -688,6 +689,29 @@ export function registerOrchestrationTools(server: McpServer): void {
       }
 
       writeWorkflow(entry.name, next);
+      const changed = [
+        description !== undefined ? 'description' : '',
+        steps ? 'steps' : '',
+        inputs ? 'inputs' : '',
+        synthesis_prompt !== undefined ? 'synthesis' : '',
+        trigger_schedule !== undefined || clear_trigger_schedule ? 'schedule' : '',
+      ].filter(Boolean);
+      addNotification({
+        id: `workflow-update-${entry.name}-${Date.now()}`,
+        kind: 'workflow',
+        title: `Workflow updated: ${entry.name}`,
+        body: changed.length > 0
+          ? `Saved workflow changes (${changed.join(', ')}).`
+          : 'Saved workflow changes.',
+        createdAt: new Date().toISOString(),
+        read: false,
+        silent: true,
+        metadata: {
+          source: 'workflow_update',
+          workflowName: entry.name,
+          changed,
+        },
+      });
       return textResult(`Workflow "${name}" updated.`);
     },
   );
