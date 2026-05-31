@@ -135,3 +135,43 @@ test('the error reason includes the error text', () => {
   assert.equal(out.length, 1);
   assert.match(out[0].reason, /auth token expired/);
 });
+
+// ─── kind: self_reported_failure must NOT route to the prompt-rewrite Doctor ───
+// A step that RAN but self-declared a failure (missing data / provider) is a
+// real outcome, not a bad prompt. It is tagged 'self_reported_failure' so the
+// runner surfaces needs-attention WITHOUT proposing a bogus edit_step fix.
+// An explicit {blocked:true} / prose block stays 'blocked' (Doctor-eligible).
+
+test('a self-reported failure (validationStatus:fail) is tagged self_reported_failure', () => {
+  const out = detectBlockedSteps({ audit: { validationStatus: 'fail' } });
+  assert.equal(out.length, 1);
+  assert.equal(out[0].kind, 'self_reported_failure');
+});
+
+test('ok:false is tagged self_reported_failure', () => {
+  const out = detectBlockedSteps({ deliver: { ok: false } });
+  assert.equal(out[0].kind, 'self_reported_failure');
+});
+
+test('an explicit {blocked:true} is tagged blocked (Doctor-eligible)', () => {
+  const out = detectBlockedSteps({ s: { blocked: true, reason: 'connection expired' } });
+  assert.equal(out[0].kind, 'blocked');
+});
+
+test('a prose block is tagged blocked', () => {
+  const out = detectBlockedSteps({ s: 'Blocked: Drive connection expired.' });
+  assert.equal(out[0].kind, 'blocked');
+});
+
+test('mixed run: explicit block is Doctor-eligible, polite failure is not', () => {
+  const out = detectBlockedSteps(
+    { a: { blocked: true, reason: 'drive expired' }, b: { deployStatus: 'not_deployed' } },
+    ['a', 'b'],
+  );
+  const byId = Object.fromEntries(out.map((o) => [o.stepId, o.kind]));
+  assert.equal(byId.a, 'blocked');
+  assert.equal(byId.b, 'self_reported_failure');
+  // The runner filters to kind==='blocked' before calling the Doctor.
+  const doctorEligible = out.filter((o) => o.kind === 'blocked');
+  assert.deepEqual(doctorEligible.map((o) => o.stepId), ['a']);
+});

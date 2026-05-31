@@ -46,6 +46,17 @@ export function selfHealEnabled(): boolean {
 export interface BlockedStep {
   stepId: string;
   reason: string;
+  /**
+   * 'blocked'  — the step explicitly blocked ({blocked:true} / prose block):
+   *              a prompt / connection / missing-input cause the Doctor can
+   *              propose a fix for.
+   * 'self_reported_failure' — the step RAN to completion but its output
+   *              declared a failure (ok:false / *status:"fail" / error). This
+   *              is a real outcome (often missing data or a provider), NOT a
+   *              bad prompt — so it must NOT be routed into the prompt-rewrite
+   *              Doctor, only surfaced as needs-attention.
+   */
+  kind: 'blocked' | 'self_reported_failure';
 }
 
 function coerceObject(raw: unknown): Record<string, unknown> | null {
@@ -133,16 +144,18 @@ export function detectBlockedSteps(
     if (stepId.startsWith('__')) continue;
     const obj = coerceObject(raw);
     if (obj && obj.blocked === true) {
-      blocked.push({ stepId, reason: String(obj.reason ?? 'No reason was provided.').slice(0, 600) });
+      blocked.push({ stepId, reason: String(obj.reason ?? 'No reason was provided.').slice(0, 600), kind: 'blocked' });
     } else if (typeof raw === 'string' && PROSE_BLOCK_RE.test(raw.trim())) {
-      blocked.push({ stepId, reason: raw.trim().slice(0, 600) });
+      blocked.push({ stepId, reason: raw.trim().slice(0, 600), kind: 'blocked' });
     } else if (obj) {
       // Additive, domain-agnostic: a step that returned normal JSON but
       // self-reported a failure (ok:false / error string / *status in the
       // failure vocab) is a soft needs-attention signal — same channel,
-      // not a hard abort.
+      // not a hard abort. Tagged 'self_reported_failure' so the runner
+      // surfaces it as needs-attention but does NOT route it into the
+      // prompt-rewrite Doctor (the failure is an outcome, not a bad prompt).
       const reason = detectSelfReportedFailure(obj);
-      if (reason) blocked.push({ stepId, reason: `step "${stepId}" ${reason}`.slice(0, 600) });
+      if (reason) blocked.push({ stepId, reason: `step "${stepId}" ${reason}`.slice(0, 600), kind: 'self_reported_failure' });
     }
   }
   if (stepOrder && stepOrder.length > 0) {

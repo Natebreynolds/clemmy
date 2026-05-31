@@ -2015,14 +2015,23 @@ async function processOneRunFile(
       // dumps raw JSON. Detect it, diagnose the root cause, and offer a
       // fix — instead of silently reporting a misleading success.
       const blockedSteps = detectBlockedSteps(stepOutputs, workflow.data.steps.map((s) => s.id));
+      // Only GENUINE blocks (explicit {blocked:true} / prose) are routed to the
+      // Doctor — its remedies (rewrite the prompt, reconnect a service, fix an
+      // input) presume a prompt/connection/input cause. A step that RAN but
+      // self-reported a failure (validationStatus:"fail", ok:false — usually
+      // missing data or an unprovisioned provider) is a real outcome, not a bad
+      // prompt; diagnosing it would auto-propose a bogus prompt rewrite. Such
+      // steps still mark the run needs-attention (reports-back), just without a
+      // fix offer.
+      const diagnosableBlocks = blockedSteps.filter((b) => b.kind === 'blocked');
       let diagnosis: WorkflowDiagnosis | null = null;
       let proposedFix: ProposedFix | null = null;
-      if (blockedSteps.length > 0 && selfHealEnabled()) {
+      if (diagnosableBlocks.length > 0 && selfHealEnabled()) {
         diagnosis = await diagnoseWorkflowBlock({
           workflow: workflow.data,
-          blockedSteps,
+          blockedSteps: diagnosableBlocks,
           // The step's blocked reason usually carries the real tool error.
-          toolErrors: blockedSteps.map((b) => b.reason),
+          toolErrors: diagnosableBlocks.map((b) => b.reason),
         });
         if (diagnosis) {
           proposedFix = recordProposedFix(workflow.name, run.id, diagnosis);
