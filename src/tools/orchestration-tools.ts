@@ -33,6 +33,12 @@ import {
   missingWorkflowRunInputs,
   normalizeWorkflowRunInputs,
 } from '../execution/workflow-inputs.js';
+import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
+import { listEvents } from '../runtime/harness/eventlog.js';
+import {
+  unrequestedWorkflowRunMessage,
+  workflowExplicitlyRequested,
+} from './workflow-run-guard.js';
 
 /**
  * Parse the workflow_run `inputs` field, which the model passes as a JSON
@@ -448,6 +454,52 @@ export function registerOrchestrationTools(server: McpServer): void {
       const workflow = listWorkflowFiles().find((entry) => entry.data.name === name);
       if (!workflow) return textResult(`Workflow "${name}" not found.`);
       if (!workflow.data.enabled) return textResult(`Workflow "${name}" is disabled.`);
+
+      // Soft boundary guard (2026-05-31 incident): do NOT silently auto-run a
+      // workflow the user did not explicitly name in their recent request.
+      // Scheduled/cron runs do not pass through this tool (they are driven by
+      // the daemon runner), so this is naturally chat/agent-scoped. When there
+      // is no session context (internal/test/non-chat caller) we SKIP the guard
+      // and allow the run — that no-context skip is also what keeps the
+      // existing orchestration-tools tests green.
+      const guardCtx = getToolOutputContext();
+      if (guardCtx?.sessionId) {
+        let recentUserText = '';
+        try {
+          const inputEvents = listEvents(guardCtx.sessionId, {
+            types: ['user_input_received'],
+            desc: true,
+            limit: 5,
+          });
+          recentUserText = inputEvents
+            .map((event) => {
+              const data = event.data as { text?: unknown };
+              // The canonical user-message text lives in data.text (see
+              // session.ts / plan-first.ts append sites; discord-harness.ts
+              // reads data.text). Fall back to stringifying the whole data
+              // object so a future field rename can't silently no-op the guard.
+              return typeof data?.text === 'string' ? data.text : JSON.stringify(event.data ?? {});
+            })
+            .join('\n');
+        } catch {
+          // Event-log read failure must not block a legitimate run.
+          recentUserText = '';
+        }
+
+        // Use the workflow store name + directory basename as slug variants.
+        // Take only the basename of dir (never the full absolute path) so an
+        // unrelated path segment can't produce a spurious "explicitly
+        // requested" match.
+        const slugCandidates = [workflow.name, path.basename(workflow.dir)].filter(
+          (value): value is string => typeof value === 'string' && value.length > 0,
+        );
+        if (
+          recentUserText.trim() !== '' &&
+          !workflowExplicitlyRequested(name, slugCandidates, recentUserText)
+        ) {
+          return textResult(unrequestedWorkflowRunMessage(name));
+        }
+      }
 
       let parsedInputs: Record<string, string>;
       try {
