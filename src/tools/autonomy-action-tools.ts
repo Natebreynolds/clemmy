@@ -1,6 +1,7 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { addNotification } from '../runtime/notifications.js';
+import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { answerCheckIn, closeCheckIn, createCheckIn, listOpenCheckIns, validateCheckInQuestion } from '../agents/check-ins.js';
 import { proposeCheckInTemplate } from '../agents/check-in-proposals.js';
 import { surfacePlan } from '../agents/plan-proposals.js';
@@ -36,6 +37,11 @@ export function registerAutonomyActionTools(server: McpServer): void {
 	      const notificationKind = kind === 'approval' || kind === 'execution' || kind === 'workflow' || kind === 'cron'
 	        ? kind
 	        : 'system';
+	      const ctx = getToolOutputContext();
+	      const workflowRunId =
+	        ctx?.sessionId && ctx.sessionId.startsWith('workflow:')
+	          ? ctx.sessionId.split(':')[1]
+	          : undefined;
 	      addNotification({
 	        id,
 	        kind: notificationKind,
@@ -43,7 +49,9 @@ export function registerAutonomyActionTools(server: McpServer): void {
         body,
         createdAt: new Date().toISOString(),
         read: false,
-        metadata: { source: 'notify_user_tool' },
+        metadata: workflowRunId
+          ? { source: 'notify_user_tool', workflowRunId }
+          : { source: 'notify_user_tool' },
       });
       return textResult(`Notification queued: ${id}`);
     },

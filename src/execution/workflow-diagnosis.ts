@@ -67,6 +67,54 @@ function coerceObject(raw: unknown): Record<string, unknown> | null {
 // "Blocked").
 const PROSE_BLOCK_RE = /^\s*(?:blocked\b|the (?:workflow )?step (?:is|was) blocked|step blocked\b)/i;
 
+// A step can fail "politely" — returning a normal JSON object that
+// DESCRIBES its own failure without the literal `blocked:true`. The engine
+// then reports the run as a clean "completed" success despite the step's
+// self-declared failure, breaking "reports back without fail". This
+// domain-AGNOSTIC check treats such an object as a soft needs-attention
+// signal. It keys on the GENERIC shape, never on specific field names:
+//   1. ok === false                     (universal success boolean)
+//   2. a non-empty top-level `error` string
+//   3. any top-level `*status` key whose lowercased/trimmed string value is
+//      in a SMALL fixed failure vocabulary (so `validationStatus:"fail"` and
+//      `deployStatus:"not_deployed"` are caught without naming them)
+// CONFIRMED small set — values NOT listed (deployed, pass, ok, active,
+// success, complete, done, …) must NOT match. 'unavailable' and
+// 'incomplete' are deliberately EXCLUDED: a healthy step legitimately
+// reports a sub-source as "unavailable" (e.g. adsStatus:"unavailable")
+// while completing fine — flagging those would false-positive on
+// degraded-but-complete runs. 'fail'/'not_deployed' already catch the
+// real self-declared failures.
+const FAILURE_STATUS_VOCAB = new Set([
+  'fail',
+  'failed',
+  'error',
+  'errored',
+  'not_deployed',
+  'blocked',
+]);
+const STATUS_KEY_RE = /^[a-z0-9]*status$/i;
+
+/**
+ * Returns an actionable reason string when a step's parsed-JSON object
+ * (top-level only) self-reports a failure, or null when it looks healthy.
+ * Soft signal only — never a hard abort.
+ */
+export function detectSelfReportedFailure(obj: Record<string, unknown>): string | null {
+  if (obj.ok === false) return 'reported ok=false';
+  if (typeof obj.error === 'string' && obj.error.trim()) {
+    return `reported error="${obj.error.trim().slice(0, 200)}"`;
+  }
+  for (const [key, value] of Object.entries(obj)) {
+    if (typeof value !== 'string') continue;
+    if (!STATUS_KEY_RE.test(key)) continue;
+    if (FAILURE_STATUS_VOCAB.has(value.trim().toLowerCase())) {
+      return `reported ${key}="${value.trim()}"`;
+    }
+  }
+  return null;
+}
+
 /**
  * A step is "blocked" when its structured result carries `blocked:true`
  * (the explicit clean-block channel) OR its prose output starts with a
@@ -88,6 +136,13 @@ export function detectBlockedSteps(
       blocked.push({ stepId, reason: String(obj.reason ?? 'No reason was provided.').slice(0, 600) });
     } else if (typeof raw === 'string' && PROSE_BLOCK_RE.test(raw.trim())) {
       blocked.push({ stepId, reason: raw.trim().slice(0, 600) });
+    } else if (obj) {
+      // Additive, domain-agnostic: a step that returned normal JSON but
+      // self-reported a failure (ok:false / error string / *status in the
+      // failure vocab) is a soft needs-attention signal — same channel,
+      // not a hard abort.
+      const reason = detectSelfReportedFailure(obj);
+      if (reason) blocked.push({ stepId, reason: `step "${stepId}" ${reason}`.slice(0, 600) });
     }
   }
   if (stepOrder && stepOrder.length > 0) {

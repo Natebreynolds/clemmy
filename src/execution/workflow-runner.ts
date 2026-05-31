@@ -6,7 +6,7 @@ import type { ClementineAssistant } from '../assistant/core.js';
 import { MODELS, getRuntimeEnv } from '../config.js';
 import { runBoundedPool } from './bounded-pool.js';
 import { bindStepInputs } from './step-binding.js';
-import { addNotification } from '../runtime/notifications.js';
+import { addNotification, loadNotifications } from '../runtime/notifications.js';
 import { addRunEvent, startRun, finishRun } from '../runtime/run-events.js';
 import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
 import { WORKFLOWS_DIR } from '../memory/vault.js';
@@ -47,6 +47,27 @@ import { missingWorkflowRunInputs, normalizeWorkflowRunInputs } from './workflow
 import { verifyStepOutput } from './step-output-verify.js';
 
 const logger = pino({ name: 'clementine-next.workflow-runner' });
+
+/**
+ * Decide whether the runner's SUCCESS completion notification should be
+ * recorded dashboard-only (silent) instead of delivered. A self-notifying
+ * workflow (a step that called notify_user) already surfaced a user-facing
+ * message for this run; delivering the runner completion too would double-post
+ * to Discord. Correlation is strictly by runId (race-safe across concurrent
+ * drains). A needs-attention run ALWAYS delivers — reports-back is never silenced.
+ */
+export function shouldSilenceCompletionEcho(opts: {
+  needsAttention: boolean;
+  runId: string;
+  notifications: Array<{ metadata?: Record<string, unknown> }>;
+}): boolean {
+  if (opts.needsAttention) return false;
+  return opts.notifications.some(
+    (n) =>
+      n.metadata?.source === 'notify_user_tool' &&
+      n.metadata?.workflowRunId === opts.runId,
+  );
+}
 
 /**
  * Process queued workflow runs.
@@ -2049,6 +2070,17 @@ async function processOneRunFile(
         fixId: proposedFix?.id ?? null,
         fallbackBody: successBody,
       });
+      // A self-notifying workflow (a step called notify_user) would otherwise
+      // double-post to Discord: once from the step, once from this runner
+      // completion. When the run SUCCEEDED and a step already surfaced a
+      // user-facing notification for THIS run, make the runner's completion
+      // dashboard-only (silent) to avoid the duplicate. A needs-attention run
+      // ALWAYS delivers — reports-back must never be silenced.
+      const stepAlreadyNotified = shouldSilenceCompletionEcho({
+        needsAttention,
+        runId: run.id,
+        notifications: loadNotifications(),
+      });
       addNotification({
         id: `${Date.now()}-workflow-${run.id}`,
         kind: 'workflow',
@@ -2061,6 +2093,7 @@ async function processOneRunFile(
         body: needsAttention ? outcome.body : successBody,
         createdAt: new Date().toISOString(),
         read: false,
+        silent: stepAlreadyNotified,
         metadata: {
           workflow: workflow.data.name,
           runId: run.id,

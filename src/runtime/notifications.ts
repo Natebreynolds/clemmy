@@ -145,7 +145,7 @@ function uniqueStrings(items: string[]): string[] {
   return [...new Set(items.filter(Boolean))];
 }
 
-function loadNotifications(): NotificationRecord[] {
+export function loadNotifications(): NotificationRecord[] {
   const result = loadJsonResilient<NotificationRecord[]>(NOTIFICATIONS_FILE, []);
   if (result.corrupted) surfaceCorruption(NOTIFICATIONS_FILE);
   return result.value;
