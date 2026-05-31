@@ -106,7 +106,7 @@ test('renderLegibleOutcome: clean completion when nothing blocked', () => {
 test('renderLegibleOutcome: blocked + auto-applicable diagnosis offers the fix command', () => {
   const out = renderLegibleOutcome({
     workflowName: 'morning-prospect-prep',
-    blockedSteps: [{ stepId: 'find_or_create_tracker', reason: 'Drive search failed' }],
+    blockedSteps: [{ stepId: 'find_or_create_tracker', reason: 'Drive search failed', kind: 'blocked' as const }],
     diagnosis: {
       summary: 'The tracker sheet could not be found.',
       rootCause: 'The Drive query syntax was wrong.',

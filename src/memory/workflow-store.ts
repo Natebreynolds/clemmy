@@ -36,6 +36,11 @@ export interface WorkflowStepInput {
   id: string;
   prompt: string;
   dependsOn?: string[];
+  /** Dep ids this step waits for but does NOT consume — exempts them from
+   *  the author-time data-binding requirement (checkDependencyBinding).
+   *  Use ONLY for genuine ordering; if you need the data, reference
+   *  {{steps.<id>.output}} instead. Serialized to YAML as orderingOnlyDeps. */
+  orderingOnlyDeps?: string[];
   model?: string;
   tier?: number;
   maxTurns?: number;
@@ -309,6 +314,7 @@ export function readWorkflowDefinitionFile(filePath: string): WorkflowDefinition
         : String(step.prompt ?? '');
       const result: WorkflowStepInput = { id, prompt };
       if (Array.isArray(step.dependsOn)) result.dependsOn = step.dependsOn.map(String);
+      if (Array.isArray(step.orderingOnlyDeps)) result.orderingOnlyDeps = step.orderingOnlyDeps.map(String);
       if (typeof step.model === 'string') result.model = step.model;
       if (typeof step.tier === 'number') result.tier = step.tier;
       if (typeof step.maxTurns === 'number') result.maxTurns = step.maxTurns;
@@ -448,6 +454,7 @@ function writeWorkflowToDir(dirPath: string, def: WorkflowDefinition): void {
     frontmatter.steps = def.steps.map((s) => {
       const out: Record<string, unknown> = { id: s.id };
       if (s.dependsOn && s.dependsOn.length > 0) out.dependsOn = s.dependsOn;
+    if (s.orderingOnlyDeps && s.orderingOnlyDeps.length > 0) out.orderingOnlyDeps = s.orderingOnlyDeps;
       if (s.model) out.model = s.model;
       if (s.tier !== undefined) out.tier = s.tier;
       if (s.maxTurns !== undefined) out.maxTurns = s.maxTurns;

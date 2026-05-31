@@ -366,21 +366,24 @@ export function registerOrchestrationTools(server: McpServer): void {
       + "AUTHORING MODEL (important): workflows are AUTONOMOUS BY DEFAULT — an enabled workflow runs every step end-to-end on the user's one-time consent (enabling it), WITHOUT pausing for per-step approval. Do NOT put `request_approval` in step prompts. "
       + "Each step does ONE job and its result flows to the next step: a downstream step references an upstream result with `{{steps.<stepId>.output}}` (the runner passes the real structured data, not a summary). "
       + "If — and only if — a step does something IRREVERSIBLE the user should sign off on first (e.g. sending emails, publishing), set `requiresApproval: true` on THAT ONE step and a short `approvalPreview`; the runner surfaces a single batch approval and holds the run there, then continues. Prefer ZERO gates for read/research/draft/deploy-for-review workflows. "
-      + "Steps with the same satisfied dependsOn run in parallel; use forEach for per-item fan-out. Call workflow_list first if you want to see existing workflow shapes.",
+      + "Steps with the same satisfied dependsOn run in parallel; use forEach for per-item fan-out. "
+      + "Design THIN agentic steps: a few capable steps (each doing a whole meaningful chunk), not many micro-steps. dependsOn orders steps; bind data with {{steps.<id>.output}} or inputs — a step that depends on another but never references its output will be REJECTED. "
+      + "Call workflow_list first if you want to see existing workflow shapes.",
     {
       name: z.string().min(1),
       description: z.string().min(1),
       steps: z.array(z.object({
         id: z.string().min(1),
-        prompt: z.string().min(1),
-        dependsOn: z.array(z.string()).optional(),
+        prompt: z.string().min(1).describe('The step task. Reference an upstream output with {{steps.<id>.output}} (real structured data, not a summary); reference a workflow input with {{input.<key>}}; iterate with {{item}} under forEach.'),
+        dependsOn: z.array(z.string()).optional().describe('Step IDs this step waits for. IMPORTANT: dependsOn only ORDERS execution — it does NOT pass data. To USE an upstream step output you MUST reference {{steps.<id>.output}} in this step prompt or declare an inputs binding. If you depend on a step only for ordering (you do not need its output), list that id in orderingOnlyDeps.'),
+        orderingOnlyDeps: z.array(z.string()).optional().describe('Dep ids this step waits for but does NOT consume — exempts them from the data-binding requirement. Use ONLY for genuine ordering; if you need the data, reference {{steps.<id>.output}} instead.'),
         model: z.string().optional(),
         tier: z.number().optional(),
         maxTurns: z.number().optional(),
         useHarness: z.boolean().optional(),
         forEach: z.string().optional(),
         allowedTools: z.array(z.string()).optional(),
-        usesSkill: z.string().optional(),
+        usesSkill: z.string().optional().describe('Installed skill directory name (under skills/). For repeatable transforms, prefer one usesSkill step over many hand-wired prompt steps.'),
         requiresApproval: z.boolean().optional(),
         approvalPreview: z.string().optional(),
       })).min(1),
@@ -416,6 +419,7 @@ export function registerOrchestrationTools(server: McpServer): void {
           id: s.id,
           prompt: s.prompt,
           dependsOn: s.dependsOn,
+          orderingOnlyDeps: s.orderingOnlyDeps,
           model: s.model,
           tier: s.tier,
           maxTurns: s.maxTurns,
@@ -611,21 +615,23 @@ export function registerOrchestrationTools(server: McpServer): void {
 
   server.tool(
     'workflow_update',
-    'Modify an existing workflow: update description, trigger schedule, steps, inputs, or synthesis. Pass only the fields you want to change — others are preserved. Step IDs and dependencies are re-validated.',
+    'Modify an existing workflow: update description, trigger schedule, steps, inputs, or synthesis. Pass only the fields you want to change — others are preserved. Step IDs and dependencies are re-validated. '
+      + 'Design THIN agentic steps: a few capable steps (each doing a whole meaningful chunk), not many micro-steps. dependsOn orders steps; bind data with {{steps.<id>.output}} or inputs — a step that depends on another but never references its output will be REJECTED.',
     {
       name: z.string().min(1),
       description: z.string().optional(),
       steps: z.array(z.object({
         id: z.string().min(1),
-        prompt: z.string().min(1),
-        dependsOn: z.array(z.string()).optional(),
+        prompt: z.string().min(1).describe('The step task. Reference an upstream output with {{steps.<id>.output}} (real structured data, not a summary); reference a workflow input with {{input.<key>}}; iterate with {{item}} under forEach.'),
+        dependsOn: z.array(z.string()).optional().describe('Step IDs this step waits for. IMPORTANT: dependsOn only ORDERS execution — it does NOT pass data. To USE an upstream step output you MUST reference {{steps.<id>.output}} in this step prompt or declare an inputs binding. If you depend on a step only for ordering (you do not need its output), list that id in orderingOnlyDeps.'),
+        orderingOnlyDeps: z.array(z.string()).optional().describe('Dep ids this step waits for but does NOT consume — exempts them from the data-binding requirement. Use ONLY for genuine ordering; if you need the data, reference {{steps.<id>.output}} instead.'),
         model: z.string().optional(),
         tier: z.number().optional(),
         maxTurns: z.number().optional(),
         useHarness: z.boolean().optional(),
         forEach: z.string().optional(),
         allowedTools: z.array(z.string()).optional(),
-        usesSkill: z.string().optional(),
+        usesSkill: z.string().optional().describe('Installed skill directory name (under skills/). For repeatable transforms, prefer one usesSkill step over many hand-wired prompt steps.'),
       })).optional(),
       trigger_schedule: z.string().optional(),
       clear_trigger_schedule: z.boolean().optional().describe('Pass true to remove an existing schedule (e.g. switch back to manual-only).'),
@@ -660,6 +666,7 @@ export function registerOrchestrationTools(server: McpServer): void {
           id: s.id,
           prompt: s.prompt,
           dependsOn: s.dependsOn,
+          orderingOnlyDeps: s.orderingOnlyDeps,
           model: s.model,
           tier: s.tier,
           maxTurns: s.maxTurns,
