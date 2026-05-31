@@ -1,25 +1,22 @@
-import { getRuntimeEnv } from '../config.js';
 import type { WorkflowDefinition } from '../memory/workflow-store.js';
 import { validateWorkflowDefinition, type WorkflowFrontmatter } from './workflow-validator.js';
+import { collectRequiredWorkflowInputs, COMMON_WORKFLOW_INPUT_KEYS } from './workflow-inputs.js';
 
 /**
- * Author/enable-time enforcement (typed-workflow-contract P2).
+ * Author/enable-time enforcement (typed-workflow-contract).
  *
  * A workflow that can't get its data shouldn't be creatable or
- * enablable. The validator already computes the errors (P1 added the
- * token-binding checks in report-only mode); P2 wires it into the three
- * WRITE seams — workflow_create + both enable seams — so a broken
- * workflow is refused at the boundary instead of failing at 2am.
+ * enablable. The validator computes the errors (token-binding +
+ * runnability + send-gate); this wires it into the three WRITE seams —
+ * workflow_create + both enable seams — so a broken workflow is refused
+ * at the boundary instead of failing at 2am.
  *
- * Flag-gated on WORKFLOW_TYPED_CONTRACT (default off): when off this is a
- * no-op and create/enable behave exactly as today. The token-binding
- * errors only fire on tokens that ALREADY render empty today, so turning
- * the flag on cannot break a workflow that was actually working.
+ * UNCONDITIONAL (2026-05-31): the WORKFLOW_TYPED_CONTRACT rollout flag was
+ * removed — validation is now the single behavior. Every error it raises
+ * describes a workflow that would ALREADY fail at run time, so rejecting
+ * at create/enable is strictly safer. (feedback_no_rollout_flags: ship the
+ * validated behavior as the default path; safety = tests, not flags.)
  */
-
-export function typedContractEnforced(): boolean {
-  return (getRuntimeEnv('WORKFLOW_TYPED_CONTRACT', 'on') ?? 'on').toLowerCase() === 'on';
-}
 
 /** Project a typed WorkflowDefinition onto the validator's loose
  *  frontmatter shape, carrying the step-level inputs/output declarations
@@ -111,13 +108,52 @@ export function checkSendGate(def: WorkflowDefinition): string[] {
 }
 
 /**
+ * Author/enable-time RUNNABILITY check — "Clem can never author/enable a
+ * workflow she can't actually run."
+ *
+ * The failure this guards: a workflow declares a required input (no
+ * default) but nothing can SUPPLY it at run time. For a manual-trigger
+ * workflow the agent/user passes inputs to workflow_run, so any required
+ * input is satisfiable. For a SCHEDULE-only trigger there is no caller to
+ * pass inputs — the scheduler fires it with none — so a required input
+ * with no default and no recognized auto-supply path will ALWAYS fail.
+ *
+ * Conservative by design (owner's "don't make simple workflows hard"):
+ * COMMON_WORKFLOW_INPUT_KEYS (url/website/domain/client/...) are treated
+ * as injectable and never blocked; only a non-common required input with
+ * no default on a schedule-only trigger is an error. A manual path (even
+ * alongside a schedule) means a caller can supply inputs → never blocked.
+ */
+export function checkRunnabilityConstraints(def: WorkflowDefinition): string[] {
+  const trigger = def.trigger ?? {};
+  const scheduleOnly = Boolean(trigger.schedule) && trigger.manual !== true;
+  if (!scheduleOnly) return [];
+
+  const declared = def.inputs ?? {};
+  const offenders = collectRequiredWorkflowInputs(def).filter((key) => {
+    if (COMMON_WORKFLOW_INPUT_KEYS.has(key)) return false; // injectable
+    const meta = declared[key];
+    const hasDefault = Boolean(meta && typeof meta.default === 'string' && meta.default.trim().length > 0);
+    return !hasDefault;
+  });
+  if (offenders.length === 0) return [];
+
+  return [
+    `Workflow "${def.name}" runs on a schedule with no manual trigger, but required input`
+    + `${offenders.length === 1 ? '' : 's'} ${offenders.map((k) => `"${k}"`).join(', ')} `
+    + `${offenders.length === 1 ? 'has' : 'have'} no default and no way to be supplied on a scheduled run — `
+    + 'it would fail every time it fires. Give each a default (inputs.<name>.default), or add a manual '
+    + 'trigger so a caller can pass them.',
+  ];
+}
+
+/**
  * Gate a workflow write (create / enable). Returns {ok:true} when the
- * flag is off (no enforcement) or the workflow validates; otherwise
- * {ok:false, errors} so the caller can refuse and surface the fixes.
+ * workflow validates; otherwise {ok:false, errors} so the caller can
+ * refuse and surface the fixes. Validation is unconditional (no flag).
  */
 export function checkWorkflowForWrite(def: WorkflowDefinition): WorkflowWriteCheck {
-  if (!typedContractEnforced()) return { ok: true, errors: [] };
   const result = validateWorkflowDefinition(toFrontmatter(def));
-  const errors = [...result.errors, ...checkSendGate(def)];
+  const errors = [...result.errors, ...checkSendGate(def), ...checkRunnabilityConstraints(def)];
   return { ok: errors.length === 0, errors };
 }

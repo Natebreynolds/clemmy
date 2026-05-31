@@ -600,11 +600,19 @@ export function wrapToolForHarness<T extends WrappableTool>(
           });
         } catch { /* telemetry write must never block */ }
       }
+      // Terminal: an unrecoverable identical-args mutating loop. Thrown
+      // before the block check so it wins at high counts. NOT a soft error —
+      // it ends the turn (handleRunError → limit_exceeded) instead of
+      // letting the model retry a call it cannot vary (the 84×/3-min hang).
+      if (decision.action === 'escalate') {
+        throw new ToolGuardrailEscalated(decision);
+      }
       if (decision.action === 'block' || decision.action === 'halt') {
         throw new ToolGuardrailBlocked(decision);
       }
     } catch (err) {
       if (err instanceof ToolGuardrailBlocked) throw err;
+      if (err instanceof ToolGuardrailEscalated) throw err;
       // eslint-disable-next-line no-console
       console.warn('[harness] tool guardrail evaluation threw (fail-open)', err instanceof Error ? err.message : err);
     }
@@ -803,6 +811,8 @@ export function wrapToolForHarness<T extends WrappableTool>(
         ) {
           return `Tool call refused by harness: ${err instanceof Error ? err.message : String(err)}`;
         }
+        // ToolGuardrailEscalated is NOT a soft error — it propagates so the
+        // turn ends (the model is stuck and can't recover by retrying).
         // KillRequested + ToolTimeout + unknown errors propagate —
         // these SHOULD abort the run (kill is user-requested abort;
         // timeout means the underlying tool is genuinely stuck).
@@ -857,6 +867,25 @@ export class ToolGuardrailBlocked extends Error {
   constructor(decision: import('./tool-guardrail.js').GuardrailDecision) {
     super(`tool-call guardrail ${decision.action}: ${decision.reason}`);
     this.name = 'ToolGuardrailBlocked';
+    this.decision = decision;
+  }
+}
+
+/**
+ * Terminal guardrail stop. Unlike ToolGuardrailBlocked (a SOFT, retryable
+ * tool error), this is thrown when a MUTATING tool is called with
+ * byte-identical args past the escalate threshold — the model is provably
+ * stuck and cannot recover by retrying (e.g. a schema it can't satisfy, an
+ * input it can't supply). It is NOT converted to a soft error string; it
+ * propagates so the harness loop ends the turn (handleRunError →
+ * limit_exceeded). This is the fix for the 84×/3-min workflow_run hang that
+ * a soft block could not stop.
+ */
+export class ToolGuardrailEscalated extends Error {
+  public readonly decision: import('./tool-guardrail.js').GuardrailDecision;
+  constructor(decision: import('./tool-guardrail.js').GuardrailDecision) {
+    super(`tool-call guardrail escalated: ${decision.reason}`);
+    this.name = 'ToolGuardrailEscalated';
     this.decision = decision;
   }
 }

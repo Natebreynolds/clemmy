@@ -1,125 +1,89 @@
 /**
  * Run: npx tsx --test src/execution/workflow-enforce.test.ts
  *
- * P2 author/enable-time enforcement: flag-gated (WORKFLOW_TYPED_CONTRACT).
- * Off → no-op (today's behavior). On → a workflow whose data can't flow
- * (malformed/unbound tokens) is refused.
+ * Author/enable-time enforcement of the typed workflow contract.
+ * Validation is UNCONDITIONAL (the WORKFLOW_TYPED_CONTRACT rollout flag was
+ * removed 2026-05-31 — feedback_no_rollout_flags). Every error describes a
+ * workflow that would already fail at run time.
  */
-import { test } from 'node:test';
+import test from 'node:test';
 import assert from 'node:assert/strict';
+import { checkWorkflowForWrite, checkRunnabilityConstraints } from './workflow-enforce.js';
 import type { WorkflowDefinition } from '../memory/workflow-store.js';
-import { checkWorkflowForWrite, checkSendGate } from './workflow-enforce.js';
 
-const broken: WorkflowDefinition = {
-  name: 'broken',
-  description: 'has a malformed token that silently drops the value',
-  enabled: true,
-  trigger: { manual: true },
-  steps: [{ id: 'normalize', prompt: 'Normalize {{url}} into a profile.' }],
-};
-
-const clean: WorkflowDefinition = {
-  name: 'clean',
-  description: 'uses the proper input token',
-  enabled: true,
-  trigger: { manual: true },
-  steps: [{ id: 'normalize', prompt: 'Normalize {{input.url}} into a profile.' }],
-};
-
-function withFlag(value: string | undefined, fn: () => void) {
-  const prev = process.env.WORKFLOW_TYPED_CONTRACT;
-  if (value === undefined) delete process.env.WORKFLOW_TYPED_CONTRACT;
-  else process.env.WORKFLOW_TYPED_CONTRACT = value;
-  try { fn(); } finally {
-    if (prev === undefined) delete process.env.WORKFLOW_TYPED_CONTRACT;
-    else process.env.WORKFLOW_TYPED_CONTRACT = prev;
-  }
+function wf(overrides: Partial<WorkflowDefinition> = {}): WorkflowDefinition {
+  return {
+    name: 'demo',
+    description: 'demo workflow',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{ id: 'a', prompt: 'do a thing' }],
+    ...overrides,
+  } as WorkflowDefinition;
 }
 
-test('flag OFF → no enforcement, even a broken workflow passes (forward-only)', () => {
-  withFlag('off', () => {
-    assert.deepEqual(checkWorkflowForWrite(broken), { ok: true, errors: [] });
-  });
+test('checkWorkflowForWrite: a clean manual workflow validates ok', () => {
+  const result = checkWorkflowForWrite(wf());
+  assert.equal(result.ok, true);
+  assert.equal(result.errors.length, 0);
 });
 
-test('flag ON → a workflow with a malformed {{url}} token is refused', () => {
-  withFlag('on', () => {
-    const c = checkWorkflowForWrite(broken);
-    assert.equal(c.ok, false);
-    assert.ok(c.errors.some((e) => /\{\{url\}\}/.test(e)), JSON.stringify(c.errors));
+test('checkWorkflowForWrite: enabled send workflow without approval gate is rejected', () => {
+  const offending = wf({
+    steps: [{ id: 'send', prompt: 'send the emails to the leads' }],
   });
+  const result = checkWorkflowForWrite(offending);
+  assert.equal(result.ok, false);
+  assert.match(result.errors.join(' '), /approval gate/i);
 });
 
-test('flag ON → a clean workflow ({{input.url}}) is allowed', () => {
-  withFlag('on', () => {
-    assert.equal(checkWorkflowForWrite(clean).ok, true);
+// ─── runnability (the "can't author an unrunnable workflow" guarantee) ───
+
+test('checkRunnabilityConstraints: schedule-only + required non-common input with no default → error', () => {
+  // 'segment' is NOT in COMMON_WORKFLOW_INPUT_KEYS, so it has no auto-supply
+  // path on a scheduled run — must be flagged.
+  const def = wf({
+    trigger: { schedule: '0 9 * * *' }, // schedule, no manual
+    inputs: { segment: { type: 'string' } } as WorkflowDefinition['inputs'],
+    steps: [{ id: 'a', prompt: 'audit {{input.segment}}' }],
   });
+  const errors = checkRunnabilityConstraints(def);
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /no default and no way to be supplied/i);
+  assert.match(errors[0], /segment/);
 });
 
-// ─── send-gate: an enabled workflow that sends must carry an enforced gate ───
-
-const ungatedSend: WorkflowDefinition = {
-  name: 'midday-outreach',
-  description: 'drafts and sends outreach',
-  enabled: true,
-  trigger: { schedule: '0 12 * * 1-5' },
-  steps: [{ id: 'main', prompt: 'Draft targeted outreach emails and then send approved emails, updating the sheet.' }],
-};
-
-const gatedSend: WorkflowDefinition = {
-  name: 'midday-outreach',
-  description: 'drafts and sends outreach behind a gate',
-  enabled: true,
-  trigger: { schedule: '0 12 * * 1-5' },
-  steps: [
-    { id: 'draft', prompt: 'Draft targeted outreach emails for each prospect row.' },
-    { id: 'send', prompt: 'Send the approved outreach emails to each prospect.', requiresApproval: true },
-  ],
-};
-
-const readsEmail: WorkflowDefinition = {
-  name: 'triage',
-  description: 'reads inbox, never sends',
-  enabled: true,
-  trigger: { schedule: '0 9 * * *' },
-  steps: [{ id: 'main', prompt: 'Read my email inbox, summarize unread messages, and update the tracking sheet. Create drafts but do not send.' }],
-};
-
-test('flag ON → an ENABLED send workflow with NO enforced gate is refused', () => {
-  withFlag('on', () => {
-    const c = checkWorkflowForWrite(ungatedSend);
-    assert.equal(c.ok, false);
-    assert.ok(c.errors.some((e) => /approval gate/i.test(e)), JSON.stringify(c.errors));
+test('checkRunnabilityConstraints: schedule-only + required COMMON input (url) is allowed (injectable)', () => {
+  const def = wf({
+    trigger: { schedule: '0 9 * * *' },
+    steps: [{ id: 'a', prompt: 'audit {{input.url}}' }],
   });
+  assert.deepEqual(checkRunnabilityConstraints(def), []);
 });
 
-test('flag ON → a send workflow WITH an enforced requiresApproval gate is allowed', () => {
-  withFlag('on', () => {
-    assert.equal(checkWorkflowForWrite(gatedSend).ok, true);
+test('checkRunnabilityConstraints: manual trigger never blocks a required input (caller supplies it)', () => {
+  const def = wf({
+    trigger: { manual: true },
+    inputs: { segment: { type: 'string' } } as WorkflowDefinition['inputs'],
+    steps: [{ id: 'a', prompt: 'audit {{input.segment}}' }],
   });
+  assert.deepEqual(checkRunnabilityConstraints(def), []);
 });
 
-test('flag ON → a disabled send workflow is allowed (can\'t fire; disable to draft)', () => {
-  withFlag('on', () => {
-    assert.equal(checkWorkflowForWrite({ ...ungatedSend, enabled: false }).ok, true);
+test('checkRunnabilityConstraints: schedule-only + required input WITH a default is allowed', () => {
+  const def = wf({
+    trigger: { schedule: '0 9 * * *' },
+    inputs: { segment: { type: 'string', default: 'enterprise' } } as WorkflowDefinition['inputs'],
+    steps: [{ id: 'a', prompt: 'audit {{input.segment}}' }],
   });
+  assert.deepEqual(checkRunnabilityConstraints(def), []);
 });
 
-test('flag ON → reading/creating-drafts (no actual send) is NOT flagged (no false-positive)', () => {
-  withFlag('on', () => {
-    assert.equal(checkWorkflowForWrite(readsEmail).ok, true);
+test('checkRunnabilityConstraints: schedule + manual together never blocks (a caller can pass inputs)', () => {
+  const def = wf({
+    trigger: { schedule: '0 9 * * *', manual: true },
+    inputs: { segment: { type: 'string' } } as WorkflowDefinition['inputs'],
+    steps: [{ id: 'a', prompt: 'audit {{input.segment}}' }],
   });
-});
-
-test('flag OFF → ungated send passes (forward-only, no enforcement)', () => {
-  withFlag('off', () => {
-    assert.equal(checkWorkflowForWrite(ungatedSend).ok, true);
-  });
-});
-
-test('checkSendGate is flag-independent (pure): flags the ungated send directly', () => {
-  assert.equal(checkSendGate(ungatedSend).length, 1);
-  assert.equal(checkSendGate(gatedSend).length, 0);
-  assert.equal(checkSendGate(readsEmail).length, 0);
-  assert.equal(checkSendGate({ ...ungatedSend, enabled: false }).length, 0);
+  assert.deepEqual(checkRunnabilityConstraints(def), []);
 });

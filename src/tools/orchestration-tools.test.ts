@@ -67,11 +67,22 @@ beforeEach(() => {
 test('workflow_run rejects missing required legacy template inputs without queueing', async () => {
   writeAuditWorkflow();
 
-  const result = await workflowRun()({ name: 'proposal-audit-brief', inputs: {} });
+  // New contract: inputs is a JSON STRING (mirrors composio arguments).
+  const result = await workflowRun()({ name: 'proposal-audit-brief', inputs: '{}' });
   const text = resultText(result);
 
   assert.match(text, /was not queued/);
   assert.match(text, /"url"/);
+  assert.throws(() => readdirSync(WORKFLOW_RUNS_DIR), /ENOENT/);
+});
+
+test('workflow_run rejects malformed inputs JSON without queueing', async () => {
+  writeAuditWorkflow();
+
+  const result = await workflowRun()({ name: 'proposal-audit-brief', inputs: '{url: not json}' });
+  const text = resultText(result);
+
+  assert.match(text, /invalid workflow inputs json/i);
   assert.throws(() => readdirSync(WORKFLOW_RUNS_DIR), /ENOENT/);
 });
 
@@ -80,7 +91,7 @@ test('workflow_run queues with normalized URL aliases', async () => {
 
   const result = await workflowRun()({
     name: 'proposal-audit-brief',
-    inputs: { website: ' https://www.aldouslaw.com/ ' },
+    inputs: JSON.stringify({ website: ' https://www.aldouslaw.com/ ' }),
   });
   const text = resultText(result);
 
@@ -99,13 +110,13 @@ test('workflow_run does not queue duplicate active runs for identical inputs', a
 
   const first = await workflowRun()({
     name: 'proposal-audit-brief',
-    inputs: { url: 'https://www.aldouslaw.com/' },
+    inputs: JSON.stringify({ url: 'https://www.aldouslaw.com/' }),
   });
   assert.match(resultText(first), /Queued workflow/);
 
   const second = await workflowRun()({
     name: 'proposal-audit-brief',
-    inputs: { url: 'https://www.aldouslaw.com/' },
+    inputs: JSON.stringify({ url: 'https://www.aldouslaw.com/' }),
   });
   assert.match(resultText(second), /already queued/);
   assert.match(resultText(second), /No duplicate was queued/);

@@ -170,7 +170,13 @@ function readThresholds(): Thresholds {
 // ─────────────────────────────────────────────────────────────────
 
 export type GuardrailMode = 'off' | 'warn' | 'strict';
-export type GuardrailAction = 'allow' | 'warn' | 'block' | 'halt';
+// 'escalate' = a MUTATING tool called with byte-identical args so many times
+// that the agent is provably stuck in an unrecoverable loop (e.g. a tool whose
+// schema the model can't satisfy). Unlike 'block' (a SOFT, retryable refusal),
+// 'escalate' ENDS the turn — it is never downgraded to warn, even in warn mode,
+// because letting the model retry a call it cannot vary just spins (the live
+// 84×/3-min workflow_run hang). See brackets.ts ToolGuardrailEscalated.
+export type GuardrailAction = 'allow' | 'warn' | 'block' | 'halt' | 'escalate';
 
 export interface GuardrailDecision {
   action: GuardrailAction;
@@ -317,7 +323,23 @@ export function evaluateToolCall(
   const isMut = MUTATING_TOOLS.has(toolName);
   const isIdem = IDEMPOTENT_TOOLS.has(toolName);
 
-  // Exact-args repeat rule
+  // Exact-args repeat rule.
+  // ESCALATE (mutating only): a few soft blocks give the model a chance to
+  // vary the call; if it STILL repeats byte-identical args past blockAt+2,
+  // the loop is unrecoverable (e.g. a schema it can't satisfy) — return a
+  // TERMINAL action so the harness ends the turn instead of spinning. This
+  // is the fix for the 84×/3-min workflow_run hang that a soft block could
+  // not stop. Read/idempotent tools never escalate (polling is legitimate).
+  if (isMut && exactCount >= thresholds.exactArgsBlockAt + 2) {
+    return {
+      action: 'escalate',
+      signature,
+      toolName,
+      reason: `${toolName} called ${exactCount}× with IDENTICAL arguments — stuck in an unrecoverable loop. Ending the turn.`,
+      rule: 'exact_args_repeat',
+      count: exactCount,
+    };
+  }
   if (exactCount >= thresholds.exactArgsBlockAt) {
     return {
       action: 'block',
@@ -383,6 +405,11 @@ export function evaluateToolCall(
  *  In strict mode, decisions enforce as-is. Off mode always allows. */
 export function applyMode(decision: GuardrailDecision, mode: GuardrailMode = readMode()): GuardrailDecision {
   if (mode === 'off') return { ...decision, action: 'allow' };
+  // 'escalate' is a terminal-stuck signal — it is NEVER downgraded (even in
+  // warn mode) because the model cannot recover by retrying. The ONLY way to
+  // suppress it is mode 'off' (handled above). This is what actually stops the
+  // 84×/3-min hang that 'block' (soft, retryable) could not.
+  if (decision.action === 'escalate') return decision;
   if (mode === 'strict') return decision;
   // warn mode (default).
   //

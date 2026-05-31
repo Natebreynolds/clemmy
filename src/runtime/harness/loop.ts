@@ -17,6 +17,7 @@ import {
   RecallBudget,
   ToolCallsCounter,
   ToolCallsLimitExceeded,
+  ToolGuardrailEscalated,
   maxTurnsForRole,
   defaultToolCallsPerTurn,
   withHarnessRunContext,
@@ -2877,6 +2878,28 @@ function handleRunError(
       role: 'system',
       type: 'guardrail_tripped',
       data: { kind: 'tool_calls_limit', limit: err.limit },
+    });
+    session.markStatus('failed');
+    bumpTurnNumber(sessionId, turn);
+    return { sessionId, turn, status: 'limit_exceeded', error: err.message };
+  }
+  if (err instanceof ToolGuardrailEscalated) {
+    // A mutating tool was called with byte-identical args past the escalate
+    // threshold — an unrecoverable loop. End the turn cleanly instead of
+    // letting the model spin (the 84×/3-min workflow_run hang).
+    safeAppend({
+      sessionId,
+      turn,
+      role: 'system',
+      type: 'guardrail_tripped',
+      data: {
+        kind: 'tool_call_guardrail',
+        action: 'escalate',
+        rule: err.decision.rule,
+        toolName: err.decision.toolName,
+        count: err.decision.count,
+        reason: err.decision.reason,
+      },
     });
     session.markStatus('failed');
     bumpTurnNumber(sessionId, turn);

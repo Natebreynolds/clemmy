@@ -34,6 +34,55 @@ import {
   normalizeWorkflowRunInputs,
 } from '../execution/workflow-inputs.js';
 
+/**
+ * Parse the workflow_run `inputs` field, which the model passes as a JSON
+ * string (mirrors composio_execute_tool's `arguments`). A JSON-string param
+ * fills reliably under the codex strict-mode function-calling that an open
+ * `z.record` map does NOT (the map was emitted `{}` 223/223 in history).
+ * Empty/whitespace → {}. Throws a descriptive error on malformed JSON so the
+ * model self-corrects instead of looping. Values are coerced toward strings
+ * downstream by normalizeWorkflowRunInputs.
+ */
+export function parseWorkflowRunInputsJson(raw: string | null | undefined): Record<string, string> {
+  if (raw === null || raw === undefined) return {};
+  const trimmed = raw.trim();
+  if (trimmed === '') return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch (error) {
+    throw new Error(`Invalid workflow inputs JSON: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new Error('Workflow inputs must be a JSON object, e.g. {"url":"https://example.com"}.');
+  }
+  return parsed as Record<string, string>;
+}
+
+/**
+ * Parse the workflow_create/_update `inputs` SCHEMA field — a JSON string
+ * mapping input names to per-input metadata {type?, default?, description?}.
+ * Same JSON-string rationale as parseWorkflowRunInputsJson; distinct because
+ * the values are objects, not flat strings.
+ */
+export function parseWorkflowInputsSchemaJson(
+  raw: string | null | undefined,
+): Record<string, { type?: 'string' | 'number'; default?: string; description?: string }> {
+  if (raw === null || raw === undefined) return {};
+  const trimmed = raw.trim();
+  if (trimmed === '') return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch (error) {
+    throw new Error(`Invalid workflow inputs schema JSON: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new Error('Workflow inputs schema must be a JSON object mapping input names to {type, default, description}.');
+  }
+  return parsed as Record<string, { type?: 'string' | 'number'; default?: string; description?: string }>;
+}
+
 interface CronJobRecord {
   name: string;
   schedule: string;
@@ -393,14 +442,20 @@ export function registerOrchestrationTools(server: McpServer): void {
     'Queue a workflow run by writing a run request to local workflow state. Call workflow_get first and pass every required input, for example inputs.url for URL-based audit workflows. Missing required inputs are rejected without queuing.',
     {
       name: z.string().min(1),
-      inputs: z.record(z.string(), z.string()).optional(),
+      inputs: z.string().optional().describe('JSON object of the workflow\'s inputs, e.g. {"url":"https://example.com"}. Call workflow_get first to see the required input names.'),
     },
     async ({ name, inputs }) => {
       const workflow = listWorkflowFiles().find((entry) => entry.data.name === name);
       if (!workflow) return textResult(`Workflow "${name}" not found.`);
       if (!workflow.data.enabled) return textResult(`Workflow "${name}" is disabled.`);
 
-      const normalizedInputs = normalizeWorkflowRunInputs(inputs);
+      let parsedInputs: Record<string, string>;
+      try {
+        parsedInputs = parseWorkflowRunInputsJson(inputs);
+      } catch (error) {
+        return textResult(error instanceof Error ? error.message : String(error));
+      }
+      const normalizedInputs = normalizeWorkflowRunInputs(parsedInputs);
       const missing = missingWorkflowRunInputs(workflow.data, normalizedInputs);
       if (missing.length > 0) {
         return textResult(

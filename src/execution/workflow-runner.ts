@@ -819,7 +819,7 @@ async function runStepViaHarness(
     // as a structured block AFTER the prose (never replacing it). This is
     // authoritative data the step can use even if a template token typo
     // dropped a value from the prose — it cannot be falsely starved.
-    const message = useTypedContract() && useWorkflowStepAgent() && stepContext
+    const message = useWorkflowStepAgent() && stepContext
       ? `${proseMessage}\n\n${renderStepContextBlock(stepContext)}`
       : proseMessage;
     // Flag-gated (WORKFLOW_STEP_AGENT): the constrained step agent emits
@@ -1113,7 +1113,7 @@ function bindStepContext(
 ): { values: Record<string, unknown>; upstream: Record<string, unknown>; item?: unknown } | undefined {
   if (!step.inputs || Object.keys(step.inputs).length === 0) return undefined;
   const bound = bindStepInputs(step, ctx.inputs, ctx.stepOutputs, item);
-  if (useTypedContract() && bound.missing.length > 0) {
+  if (bound.missing.length > 0) {
     const message =
       `Step "${step.id}" missing required input(s): ${bound.missing.join(', ')}`
       + ` — expected from input.<key> or steps.<dep>.output. Fix the step's \`inputs\` bindings or the run inputs.`;
@@ -1817,13 +1817,6 @@ function runDrainConcurrency(): number {
 // structured results and cannot re-trigger their own workflow.
 function useWorkflowStepAgent(): boolean {
   return (getRuntimeEnv('WORKFLOW_STEP_AGENT', 'on') ?? 'on').toLowerCase() === 'on';
-}
-
-// Flag-gate for the typed step-I/O contract (binding + structured
-// delivery + bind-time fast-fail). Default OFF → a step with no declared
-// `inputs` takes today's template-only path byte-for-byte.
-function useTypedContract(): boolean {
-  return (getRuntimeEnv('WORKFLOW_TYPED_CONTRACT', 'on') ?? 'on').toLowerCase() === 'on';
 }
 
 // Render the bound inputs + upstream outputs as an authoritative
