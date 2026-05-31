@@ -234,7 +234,7 @@ export function evaluateAutoApprove(input: {
   sessionId: string | undefined;
   toolName: string;
   args?: unknown;
-  scope: 'strict' | 'workspace' | 'yolo';
+  scope: 'strict' | 'balanced' | 'workspace' | 'yolo';
   insideWorkspace: boolean;
 }): AutoApproveDecision {
   if (isAutoApprovedByScope(input.sessionId, input.toolName, input.args)) {
@@ -246,6 +246,10 @@ export function evaluateAutoApprove(input: {
   if (input.scope === 'workspace' && input.insideWorkspace) {
     return { autoApproved: true, reason: 'workspace-policy' };
   }
+  // 'balanced' and 'strict' are identical on the EXECUTION gate: a
+  // mutating shell/file write still needs an active plan scope. Balanced's
+  // looseness lives on the CONVERSATION side (plan-first clarify depth),
+  // not in extra execution auto-approval. Keeps execution conservative.
   return { autoApproved: false, reason: 'denied' };
 }
 

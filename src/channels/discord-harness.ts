@@ -43,6 +43,11 @@ import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { previewToolCall } from '../runtime/approval-summary.js';
 import { buildOrchestratorAgent } from '../agents/orchestrator.js';
 import { runPlanFirstPreflight, shouldUsePlanFirst } from '../runtime/harness/plan-first.js';
+import {
+  planContinuityEnabled,
+  routeOpenQuestionPlan,
+} from '../runtime/harness/plan-continuity.js';
+import { loadProactivityPolicy } from '../agents/proactivity-policy.js';
 
 const EDIT_DEBOUNCE_MS = 2_000;
 const SAFETY_TIMEOUT_MS = 35 * 60_000;
@@ -1584,7 +1589,8 @@ export async function runDiscordHarnessConversation(opts: {
   }
 
   const session = resolveOrCreateSession({ channelId, userId, guildId, prompt });
-  const planFirst = shouldUsePlanFirst({ input: prompt, freshSession: !session.isContinuation });
+  const autonomy = loadProactivityPolicy().autoApproveScope;
+  const planFirst = shouldUsePlanFirst({ input: prompt, freshSession: !session.isContinuation, autonomy });
 
   let handle: DiscordHarnessReplyHandle;
   try {
@@ -1856,12 +1862,35 @@ export async function runDiscordHarnessConversation(opts: {
 
   void (async () => {
     try {
+      // ── plan-continuity routing (flag CLEMMY_PLAN_CONTINUITY, default off) ──
+      // If a prior plan on this channel still awaits the user's answers,
+      // classify this message against it BEFORE normal plan-first routing.
+      // Flag off → this whole block is skipped (byte-identical to legacy).
+      // It runs inside this IIFE so re-entering runPlanFirstPreflight emits
+      // its events into the same live-edit loop and `return` short-circuits
+      // the orchestrator exactly like the existing planFirst block below.
+      if (planContinuityEnabled()) {
+        const channelKey = `discord:${channelId}`;
+        const continuity = await routeOpenQuestionPlan({
+          channel: channelKey,
+          input: prompt,
+          sessionId: session.id,
+          autonomy,
+          sendNote: transport.sendFollowup
+            ? async (message) => {
+                try { await transport.sendFollowup!(message); } catch { /* note is best-effort */ }
+              }
+            : undefined,
+        });
+        if (continuity.handled) return;
+      }
       if (planFirst) {
         const preflight = await runPlanFirstPreflight({
           input: prompt,
           sessionId: session.id,
           channel: `discord:${channelId}`,
           freshSession: !session.isContinuation,
+          autonomy,
         });
         if (preflight.surfaced) return;
       }

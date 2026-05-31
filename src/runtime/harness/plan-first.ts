@@ -1,17 +1,39 @@
 import { Runner } from '@openai/agents';
-import { surfacePlan } from '../../agents/plan-proposals.js';
+import { surfacePlan, surfaceAskingPlan } from '../../agents/plan-proposals.js';
 import { buildPlannerAgent, PlanSchema, type Plan } from '../../agents/planner.js';
 import { captureInteractionSignals } from '../../memory/auto-capture.js';
+import { getRuntimeEnv } from '../../config.js';
+import type { AutoApproveScope } from '../../agents/proactivity-policy.js';
 import { appendEvent } from './eventlog.js';
 
 export interface PlanFirstInput {
   input: string;
   freshSession: boolean;
+  /**
+   * Autonomy dial from the proactivity policy. Kept for caller parity;
+   * plan-first no longer uses it to route ordinary ambiguity. Clarify /
+   * plan / act belongs to the main orchestrator loop.
+   */
+  autonomy?: AutoApproveScope;
 }
 
 export interface PlanFirstRunInput extends PlanFirstInput {
   sessionId: string;
   channel?: string;
+  /**
+   * Force the planner path even if the normal first-turn heuristic would
+   * skip it. Used when resuming a saved asking-plan: the existence of the
+   * saved plan is the routing signal, not the wording of the user's short
+   * answer.
+   */
+  force?: boolean;
+  /**
+   * Answers the user already supplied to a prior plan's open questions.
+   * When present (plan-continuity re-entry), the planner is told to fold
+   * these in and produce a now-COMPLETE plan with needsUserInput empty,
+   * rather than re-asking. Flag-gated upstream (CLEMMY_PLAN_CONTINUITY).
+   */
+  priorAnswers?: string;
 }
 
 export interface PlanFirstResult {
@@ -25,7 +47,6 @@ const EXECUTION_CONTINUATION_RE =
   /\b(?:go ahead|proceed|do it|send those|create those|make those|yes|approved?|continue)\b/i;
 const SEQUENCE_RE = /\b(?:then|after that|afterward|for each|each one|before .* then|once .* then|first .* then)\b/i;
 const BATCH_RE = /\b(?:\d+|top\s+\d+|several|many|multiple|batch|bulk|list of|all of them)\b/i;
-const READ_RE = /\b(?:find|pull|query|search|scrape|crawl|research|audit|summarize|analyze|gather)\b/i;
 const WRITE_RE =
   /\b(?:create|draft|send|write|update|append|post|publish|host|deploy|file|sheet|email|proposal|report)\b/i;
 
@@ -45,95 +66,211 @@ function planFirstDisabled(): boolean {
   return typeof raw === 'string' && /^(0|false|off|no)$/i.test(raw.trim());
 }
 
+/**
+ * Flag gate for plan-continuity (persist the asking plan + fold in answers
+ * on the next message). Default on because it only activates after the
+ * planner has already asked a concrete question; set
+ * CLEMMY_PLAN_CONTINUITY=off to return to legacy fire-and-forget asks.
+ */
+function planContinuityEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_PLAN_CONTINUITY', 'on') ?? 'on').toLowerCase() !== 'off';
+}
+
 function domainCount(input: string): number {
   return DOMAIN_PATTERNS.reduce((count, pattern) => count + (pattern.test(input) ? 1 : 0), 0);
 }
+
+const DATA_FETCH_VERB_RE = /\b(?:get|pull|list|grab|fetch|compile|put together)\b/i;
+const DATA_NOUN_RE =
+  /\b(?:deals?|accounts?|leads?|contacts?|opportunit(?:y|ies)|emails?|customers?|prospects?|rows?|records?|report|list|sheet|data)\b/i;
+const VAGUE_RECENCY_RE = /\b(?:recent|recently|lately|some|a few|the latest|current)\b/i;
+const CONCRETE_SCOPE_RE =
+  /(?:\d|\blast\s+\w+\b|\bmy\b|\bour\b|\bowner\b|"[^"]+"|'[^']+'|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\b|\b(?:january|february|march|april|june|july|august|september|october|november|december)\b|\b(?:today|yesterday|week|month|quarter|year)\b)/i;
+const DEST_IMPLIED_RE =
+  /\b(?:somewhere|put it|place to look|where i can|save|store)\b/i;
+const CONCRETE_DEST_RE =
+  /\b(?:sheet|spreadsheet|docs?|document|email|file|notion|slack|message)\b/i;
+const QUESTION_LEAD_RE = /^(?:what|when|where|who|why|how)\b/i;
+
+/**
+ * Conservative ambiguity detector for the conversation side. Returns which
+ * required slots (source / scope / destination) a request leaves unfilled.
+ * MUST NOT fire on simple clear asks ("what's on my calendar today") or
+ * pure questions — those should execute or answer directly.
+ */
+export function detectAmbiguousAction(
+  input: string,
+): { ambiguous: boolean; missing: Array<'source' | 'scope' | 'destination'> } {
+  const text = (input ?? '').trim();
+  const lower = text.toLowerCase();
+
+  // Pure questions never count as ambiguous actions.
+  if (QUESTION_LEAD_RE.test(text) && text.endsWith('?')) {
+    return { ambiguous: false, missing: [] };
+  }
+
+  // Must look like an ACTION on data / a deliverable.
+  const isWrite = WRITE_RE.test(text);
+  const isDataFetch = DATA_FETCH_VERB_RE.test(text) && DATA_NOUN_RE.test(text);
+  if (!isWrite && !isDataFetch) {
+    return { ambiguous: false, missing: [] };
+  }
+
+  const missing: Array<'source' | 'scope' | 'destination'> = [];
+
+  // source: no system/tool family named yet it's asking for data.
+  const asksForData = DATA_NOUN_RE.test(text);
+  if (domainCount(lower) === 0 && asksForData) {
+    missing.push('source');
+  }
+
+  // scope: vague recency/quantity word with no concrete window/filter.
+  if (VAGUE_RECENCY_RE.test(text) && !CONCRETE_SCOPE_RE.test(text)) {
+    missing.push('scope');
+  }
+
+  // destination: implies an output but names no concrete target.
+  if (DEST_IMPLIED_RE.test(text) && !CONCRETE_DEST_RE.test(text)) {
+    missing.push('destination');
+  }
+
+  return { ambiguous: missing.length >= 1, missing };
+}
+
+const EXPLICIT_PLAN_FIRST_RE =
+  /\b(?:plan\s+first|draft\s+(?:me\s+)?a\s+plan|create\s+(?:me\s+)?a\s+plan|make\s+(?:me\s+)?a\s+plan|show\s+me\s+(?:the\s+)?plan|before\s+you\s+start[, ]+(?:plan|outline)|approve\s+(?:the\s+)?plan)\b/i;
+const EXTERNAL_MUTATION_RE =
+  /\b(?:send|post|publish|deploy|host|update|append|create|draft|write|delete|remove)\b[\s\S]{0,90}\b(?:outlook|email|emails|salesforce|crm|airtable|google\s+sheets?|googlesheets?|spreadsheet|slack|github|pull\s+request|netlify|vercel|railway)\b|\b(?:outlook|email|emails|salesforce|crm|airtable|google\s+sheets?|googlesheets?|spreadsheet|slack|github|pull\s+request|netlify|vercel|railway)\b[\s\S]{0,90}\b(?:send|post|publish|deploy|host|update|append|create|draft|write|delete|remove)\b/i;
 
 export function shouldUsePlanFirst(input: PlanFirstInput): boolean {
   if (planFirstDisabled()) return false;
 
   const text = input.input.trim();
-  if (text.length < 80) return false;
+  // Control words ("approve", "cancel", "continue") and bare execution
+  // continuations never plan-first — these guards run FIRST, ahead of the
+  // ambiguity branch and the length floor, so neither path can re-engage on
+  // a control reply. (Reordered ahead of the length floor 2026-05-30;
+  // result-identical to the legacy order for flag-off — all three are
+  // early-return-false guards, so their order doesn't change the outcome.)
   if (CONTROL_RE.test(text)) return false;
   if (EXECUTION_CONTINUATION_RE.test(text) && text.length < 240) return false;
 
+  // Right architecture: ordinary ambiguity stays with the main
+  // orchestrator, which can search memory, ask one conversational
+  // question, or proceed. The separate planner is reserved for explicit
+  // planning requests and high-risk external/batch work.
+  if (EXPLICIT_PLAN_FIRST_RE.test(text)) return true;
+
+  if (text.length < 80) return false;
+
   const domains = domainCount(text);
-  const hasRead = READ_RE.test(text);
-  const hasWrite = WRITE_RE.test(text);
+  const hasExternalMutation = EXTERNAL_MUTATION_RE.test(text);
   const hasBatch = BATCH_RE.test(text);
   const hasSequence = SEQUENCE_RE.test(text);
 
   if (input.freshSession) {
-    if (domains >= 3 && (hasRead || hasWrite)) return true;
-    if (domains >= 2 && hasRead && hasWrite) return true;
-    if (domains >= 2 && hasBatch && hasSequence) return true;
-    if (text.length >= 350 && hasRead && hasWrite && (hasBatch || hasSequence)) return true;
+    if (hasExternalMutation && domains >= 3 && (hasBatch || hasSequence)) return true;
+    if (hasExternalMutation && domains >= 2 && hasBatch && hasSequence) return true;
+    if (hasExternalMutation && text.length >= 450 && (hasBatch || hasSequence)) return true;
     return false;
   }
 
   // Existing sessions should not get replanned for ordinary
-  // continuations, but a user can pivot into a brand-new complex
-  // objective inside the same chat. Catch those pivots so Clem surfaces
-  // a quick plan before opening many external tools.
-  if (domains >= 3 && hasRead && hasWrite) return true;
-  if (domains >= 2 && hasRead && hasWrite && (hasBatch || hasSequence)) return true;
-  if (text.length >= 450 && domains >= 1 && hasRead && hasWrite && (hasBatch || hasSequence)) return true;
+  // continuations. Only a high-risk external/batch pivot gets the
+  // separate planner; everything else flows through the orchestrator.
+  if (hasExternalMutation && domains >= 3 && (hasBatch || hasSequence)) return true;
+  if (hasExternalMutation && text.length >= 550 && (hasBatch || hasSequence)) return true;
 
   return false;
 }
 
-function buildPlannerPrompt(input: string): string {
-  return [
+function buildPlannerPrompt(input: string, priorAnswers?: string): string {
+  const lines = [
     'Draft a preflight plan for this fresh Clementine request before any external writes or long-running execution begins.',
     'Do not execute the work. Do not call mutating tools. Produce an inspectable plan the user can approve.',
     'If required information is missing, put the shortest possible question in needsUserInput. A plan with needsUserInput is NOT approvable yet.',
     'Name the likely tool families or systems in the step text when they are obvious from the request.',
-    '',
-    `User request:\n${input}`,
-  ].join('\n\n');
+  ];
+  if (priorAnswers && priorAnswers.trim().length > 0) {
+    lines.push(
+      `The user has answered the open questions: ${priorAnswers.trim()}. Produce a now-COMPLETE plan with needsUserInput EMPTY; apply safe defaults (e.g. create a NEW Google Sheet unless told to update an existing one) rather than re-asking.`,
+    );
+  }
+  lines.push('', `User request:\n${input}`);
+  return lines.join('\n\n');
 }
 
-function renderPlanReply(plan: Plan, proposalId: string): string {
-  const steps = plan.steps
-    .slice(0, 6)
-    .map((step) => `${step.n}. ${step.action}`)
-    .join('\n');
-  const more = plan.steps.length > 6 ? `\n...and ${plan.steps.length - 6} more step${plan.steps.length - 6 === 1 ? '' : 's'}.` : '';
-  const questions = plan.needsUserInput.length > 0
-    ? `\n\nBefore I start, I need:\n${plan.needsUserInput.map((q) => `- ${q}`).join('\n')}`
+const EXTERNAL_WRITE_RE =
+  /\b(?:send|sent|post|publish|deploy|host|netlify|vercel|railway|notify(?:\s+externally|\s+prospects?)?|salesforce|crm|airtable|google\s+sheets?|googlesheets?|spreadsheet|outlook|email|emails|draft\s+emails?|create\s+drafts?|slack|github|pull\s+request|commit|delete|remove|mutate\s+external)\b/i;
+const LOCAL_ONLY_SAFE_RE =
+  /\b(?:local(?:ly)?|markdown|file|report|brief)\b[\s\S]{0,140}\b(?:only|review|reviewable|save|saved|no\s+external|do\s+not\s+send|stop\s+before|without\s+sending)\b/i;
+const EXTERNAL_WRITE_NEGATED_RE =
+  /\b(?:no\s+external|do\s+not\s+(?:send|post|publish|deploy|host|notify|update|mutate)|stop\s+before\s+(?:any\s+)?external|without\s+(?:sending|posting|publishing|deploying|updating|notifying))\b/i;
+
+function compact(value: string, max = 220): string {
+  const text = value.replace(/\s+/g, ' ').trim();
+  if (text.length <= max) return text;
+  return `${text.slice(0, Math.max(0, max - 1)).trimEnd()}...`;
+}
+
+function planText(plan: Plan, input: string): string {
+  return [
+    input,
+    plan.objective,
+    ...plan.steps.map((step) => step.action),
+    ...(plan.successCriteria ?? []),
+    ...(plan.risks ?? []),
+  ].join('\n');
+}
+
+export function planRequiresUserApproval(plan: Plan, input: string): boolean {
+  const text = planText(plan, input);
+  if (plan.estimatedComplexity === 'significant' || plan.estimatedComplexity === 'large') return true;
+  if (plan.recommendsTrackedExecution) return true;
+  if (LOCAL_ONLY_SAFE_RE.test(text) && EXTERNAL_WRITE_NEGATED_RE.test(text)) return false;
+  if (LOCAL_ONLY_SAFE_RE.test(text) && !EXTERNAL_WRITE_RE.test(text)) return false;
+  return EXTERNAL_WRITE_RE.test(text);
+}
+
+function planHighlights(plan: Plan): string[] {
+  const actions = plan.steps
+    .map((step) => compact(step.action, 120))
+    .filter(Boolean);
+  if (actions.length <= 2) return actions;
+  return [
+    actions[0],
+    actions[actions.length - 1],
+  ];
+}
+
+export function renderPlanReply(plan: Plan, proposalId: string): string {
+  const highlights = planHighlights(plan);
+  const highlightBlock = highlights.length > 0
+    ? `\n\nWhat I’ll do:\n${highlights.map((item) => `- ${item}`).join('\n')}`
     : '';
   return [
-    'I drafted the plan before starting the tool work.',
+    `I can do that. I’ll ${compact(plan.objective, 180)}`,
+    highlightBlock,
     '',
-    `Objective: ${plan.objective}`,
-    '',
-    `Plan:\n${steps}${more}`,
-    questions,
-    '',
-    `Review and approve plan ${proposalId} when you want me to proceed.`,
+    `Approve this plan when you want me to start. (${proposalId})`,
   ].filter(Boolean).join('\n');
 }
 
 export function renderPlanNeedsInputReply(plan: Plan): string {
-  const steps = plan.steps
-    .slice(0, 6)
-    .map((step) => `${step.n}. ${step.action}`)
-    .join('\n');
-  const more = plan.steps.length > 6 ? `\n...and ${plan.steps.length - 6} more step${plan.steps.length - 6 === 1 ? '' : 's'}.` : '';
   const questions = plan.needsUserInput
-    .map((q) => `- ${q}`)
+    .slice(0, 2)
+    .map((q) => `- ${compact(q, 180)}`)
     .join('\n');
+  const firstAction = plan.steps[0]?.action
+    ? compact(plan.steps[0].action, 140).replace(/\.$/, '')
+    : '';
+  const context = firstAction
+    ? `I’ll use ${firstAction.charAt(0).toLowerCase()}${firstAction.slice(1)} once that’s clear.`
+    : '';
   return [
-    'I drafted the plan before starting the tool work.',
-    '',
-    `Objective: ${plan.objective}`,
-    '',
-    `Plan:\n${steps}${more}`,
-    '',
-    'Before I start, I need:',
+    `I can help with that. Before I start, I need one detail:`,
     questions,
-    '',
-    'Reply with that detail and I’ll continue from this plan.',
+    context,
   ].filter(Boolean).join('\n');
 }
 
@@ -166,7 +303,7 @@ function surfacePlanFirstFailure(input: PlanFirstRunInput, error: string): PlanF
 }
 
 export async function runPlanFirstPreflight(input: PlanFirstRunInput): Promise<PlanFirstResult> {
-  if (!shouldUsePlanFirst(input)) return { surfaced: false };
+  if (!input.force && !shouldUsePlanFirst(input)) return { surfaced: false };
 
   appendEvent({
     sessionId: input.sessionId,
@@ -217,7 +354,7 @@ export async function runPlanFirstPreflight(input: PlanFirstRunInput): Promise<P
       workflowName: 'clementine-plan-first',
       groupId: input.sessionId,
     });
-    const result = await runner.run(buildPlannerAgent(), buildPlannerPrompt(input.input), {
+    const result = await runner.run(buildPlannerAgent(), buildPlannerPrompt(input.input, input.priorAnswers), {
       context: { sessionId: input.sessionId, turn: 0 },
       maxTurns: 8,
       toolExecution: { maxFunctionToolConcurrency: 4 },
@@ -250,6 +387,24 @@ export async function runPlanFirstPreflight(input: PlanFirstRunInput): Promise<P
     });
 
     if (plan.needsUserInput.length > 0) {
+      // Plan-continuity (flag-gated): persist the ASKING plan so the user's
+      // next message can be classified against it and folded back in, even
+      // across session rollover. Flag off → no proposal persisted (legacy).
+      let askingProposalId: string | undefined;
+      if (planContinuityEnabled()) {
+        try {
+          const askingProposal = surfaceAskingPlan({
+            plan,
+            originatingRequest: input.input,
+            sessionId: input.sessionId,
+            channel: input.channel,
+            context: 'Plan awaiting your answers before execution.',
+          });
+          askingProposalId = askingProposal?.id;
+        } catch {
+          // Persisting the asking plan must never break the ask itself.
+        }
+      }
       appendEvent({
         sessionId: input.sessionId,
         turn: 0,
@@ -259,9 +414,29 @@ export async function runPlanFirstPreflight(input: PlanFirstRunInput): Promise<P
           reason: 'plan_first_needs_input',
           question: renderPlanNeedsInputReply(plan),
           needsUserInput: plan.needsUserInput,
+          ...(askingProposalId ? { planProposalId: askingProposalId } : {}),
         },
       });
-      return { surfaced: true };
+      return { surfaced: true, ...(askingProposalId ? { proposalId: askingProposalId } : {}) };
+    }
+
+    if (!planRequiresUserApproval(parsed.data, input.input)) {
+      appendEvent({
+        sessionId: input.sessionId,
+        turn: 0,
+        role: 'system',
+        type: 'conversation_step',
+        data: {
+          decision: {
+            summary: `Prepared a safe local plan and continued without an approval gate: ${parsed.data.objective}`,
+            reply: null,
+            done: false,
+            nextAction: 'continue_to_execution',
+            reason: 'plan_first_safe_local',
+          },
+        },
+      });
+      return { surfaced: false };
     }
 
     const proposal = surfacePlan({

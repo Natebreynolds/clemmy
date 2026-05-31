@@ -20,7 +20,20 @@ export type ProactivityMode = 'watch' | 'balanced' | 'hands_on';
  *               root check on run_shell_command + write_file so the
  *               agent can act anywhere the user can.
  */
-export type AutoApproveScope = 'strict' | 'workspace' | 'yolo';
+// Autonomy dial. Governs execution approvals (evaluateAutoApprove).
+// Conversational clarify / plan / act is owned by the main orchestrator;
+// this value is passed as context, but no longer routes ordinary ambiguity
+// through a separate plan-first gate. User-facing names:
+// strict=Careful, balanced=Balanced (default), yolo=YOLO. 'workspace'
+// stays a power-user execution option.
+//   - strict/Careful : nothing auto-approves without a plan scope.
+//   - balanced       : execution behaves like strict (plan scope still
+//                       required for shell/file writes — see
+//                       evaluateAutoApprove).
+//   - yolo/YOLO      : auto-approve everything (the hard catastrophic
+//                       denylist in assertCommandAllowed + 'admin' tools
+//                       still always confirm).
+export type AutoApproveScope = 'strict' | 'balanced' | 'workspace' | 'yolo';
 
 export interface ProactivityPolicy {
   enabled: boolean;
@@ -57,7 +70,7 @@ const POLICY_FILE = path.join(BASE_DIR, 'state', 'proactivity-policy.json');
 export const DEFAULT_PROACTIVITY_POLICY: ProactivityPolicy = {
   enabled: true,
   mode: 'balanced',
-  autoApproveScope: 'strict',
+  autoApproveScope: 'balanced',
   checkInMinutes: 3,
   briefCadenceMinutes: 60,
   defaultLongTaskMinutes: 90,
@@ -98,7 +111,9 @@ function normalizeMode(value: unknown): ProactivityMode {
 }
 
 function normalizeAutoApproveScope(value: unknown): AutoApproveScope {
-  return value === 'workspace' || value === 'yolo' || value === 'strict' ? value : 'strict';
+  return value === 'workspace' || value === 'yolo' || value === 'strict' || value === 'balanced'
+    ? value
+    : 'balanced';
 }
 
 function normalizePolicy(input: RawProactivityPolicy = {}): ProactivityPolicy {

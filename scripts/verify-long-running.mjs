@@ -103,17 +103,18 @@ const SUB_TESTS = {
 // ─── F1 — preflight-block-references-real-tools ────────────────────
 //
 // Calls the exported `buildPreflightBlockMessage` helper directly with
-// a synthetic verdict and asserts the v2 message references the two
-// real tools (create_plan, ask_user_question) and does NOT reference
-// the v1 phantom tools (propose_plan, batch_external_calls).
+// a synthetic verdict and asserts the default message is advisory: it
+// references the real planning option (create_plan), does NOT reference
+// the v1 phantom tools (propose_plan, batch_external_calls), and does
+// not hard-stop the agent from continuing useful work.
 
 async function testPreflightBlockReferencesRealTools() {
   const loop = await import(pathToFileURL(path.join(DAEMON_DIST, 'runtime/harness/loop.js')).href);
   if (typeof loop.buildPreflightBlockMessage !== 'function') {
     return fail('preflight-block-references-real-tools', 'buildPreflightBlockMessage not exported from loop.js');
   }
-  // Ensure v2 is on (default behavior).
-  delete process.env.CLEMMY_PREFLIGHT_BLOCK_MESSAGE_V2;
+  // Ensure advisory mode is on (default behavior).
+  delete process.env.CLEMMY_PREFLIGHT_LEGACY_BLOCK;
   const msg = loop.buildPreflightBlockMessage({
     predictedTokens: 300_000,
     blockFraction: 0.85,
@@ -121,19 +122,19 @@ async function testPreflightBlockReferencesRealTools() {
   });
   const checks = [
     { ok: msg.includes('create_plan'), label: 'mentions create_plan' },
-    { ok: msg.includes('ask_user_question'), label: 'mentions ask_user_question' },
+    { ok: /guidance, not a stop|keep moving|proceed if the work is worth it/i.test(msg), label: 'default is advisory / keep-moving' },
     { ok: !msg.includes('propose_plan'), label: 'does NOT mention propose_plan (phantom)' },
     { ok: !msg.includes('batch_external_calls'), label: 'does NOT mention batch_external_calls (phantom)' },
-    { ok: msg.includes('PREFLIGHT BUDGET BLOCK'), label: 'preserves operator-visible header' },
+    { ok: msg.includes('CONTEXT BUDGET NOTICE'), label: 'preserves operator-visible budget notice header' },
     { ok: msg.includes('300,000'), label: 'interpolates predicted tokens with locale formatting' },
   ];
-  // Revert lever still works: with v2=off, v1 wording returns.
-  process.env.CLEMMY_PREFLIGHT_BLOCK_MESSAGE_V2 = 'off';
-  const v1Msg = loop.buildPreflightBlockMessage({
+  // Revert lever still works: with legacy block on, v1 wording returns.
+  process.env.CLEMMY_PREFLIGHT_LEGACY_BLOCK = 'on';
+  const legacyMsg = loop.buildPreflightBlockMessage({
     predictedTokens: 1, blockFraction: 0.85, effectiveLimit: 1,
   });
-  checks.push({ ok: v1Msg.includes('propose_plan'), label: 'v1 fallback still emits propose_plan when knob=off' });
-  delete process.env.CLEMMY_PREFLIGHT_BLOCK_MESSAGE_V2;
+  checks.push({ ok: legacyMsg.includes('propose_plan'), label: 'legacy fallback still emits propose_plan when knob=on' });
+  delete process.env.CLEMMY_PREFLIGHT_LEGACY_BLOCK;
 
   const failed = checks.filter((c) => !c.ok);
   if (failed.length === 0) {

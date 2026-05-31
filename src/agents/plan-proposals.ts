@@ -212,6 +212,46 @@ export function surfacePlan(input: SurfacePlanInput): PlanProposal {
   return proposal;
 }
 
+/**
+ * Persist a Plan that still has open `needsUserInput` questions as a
+ * pending PlanProposal — the "asking plan." This is the plan-continuity
+ * path: unlike `surfacePlan` (which refuses unresolved questions because
+ * those plans are not yet approvable), this records the asking plan so the
+ * user's NEXT message can be classified against it and folded back in,
+ * even across session rollover.
+ *
+ * It deliberately does NOT queue an approval notification — the plan is not
+ * approvable yet, and the questions are surfaced to the user through the
+ * caller's `awaiting_user_input` event. This only durably stores the plan.
+ */
+export function surfaceAskingPlan(input: SurfacePlanInput): PlanProposal {
+  if (!input.originatingRequest || input.originatingRequest.trim().length < 4) {
+    throw new Error('originatingRequest required (min 4 chars) — what was the user asking for?');
+  }
+  if (!input.plan || !input.plan.objective || input.plan.steps.length === 0) {
+    throw new Error('plan must include objective and at least one step');
+  }
+  const now = new Date().toISOString();
+  const proposal: PlanProposal = {
+    id: `plan-${randomUUID().slice(0, 8)}`,
+    proposedAt: now,
+    proposedByAgent: input.proposedByAgent ?? 'clementine',
+    status: 'pending',
+    originatingRequest: input.originatingRequest.trim(),
+    sessionId: input.sessionId,
+    channel: input.channel,
+    plan: input.plan,
+    context: input.context?.trim() || undefined,
+    version: 'v1',
+  };
+  writeProposal(proposal);
+  logger.info(
+    { proposalId: proposal.id, openQuestions: proposal.plan.needsUserInput.length, channel: proposal.channel },
+    'asking plan persisted (plan-continuity)',
+  );
+  return proposal;
+}
+
 export function getPlanProposal(id: string): PlanProposal | null {
   return readProposal(id);
 }
@@ -219,6 +259,8 @@ export function getPlanProposal(id: string): PlanProposal | null {
 export interface ListPlanProposalsFilter {
   status?: PlanProposalStatus | 'all';
   sessionId?: string;
+  /** Filter to proposals that originated on this channel (e.g. discord:<id>). */
+  channel?: string;
   limit?: number;
 }
 
@@ -232,6 +274,7 @@ export function listPlanProposals(filter: ListPlanProposalsFilter = {}): PlanPro
       const p = JSON.parse(readFileSync(path.join(PROPOSALS_DIR, entry), 'utf-8')) as PlanProposal;
       if (wantedStatus !== 'all' && p.status !== wantedStatus) continue;
       if (filter.sessionId && p.sessionId !== filter.sessionId) continue;
+      if (filter.channel && p.channel !== filter.channel) continue;
       items.push(p);
     } catch { continue; }
   }

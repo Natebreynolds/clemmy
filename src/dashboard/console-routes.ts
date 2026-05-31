@@ -101,7 +101,7 @@ import { loadUserProfile, saveUserProfile } from '../runtime/user-profile.js';
 import { getOrRefreshScan, probe, readCachedScan } from '../runtime/cli-discovery.js';
 import { SKILLS_DIR, listSkills, uninstallSkill } from '../memory/skill-store.js';
 import { getSkillInstallJob, startSkillInstall } from '../runtime/skill-installer.js';
-import { getProactivityPolicySnapshot, saveProactivityPolicy } from '../agents/proactivity-policy.js';
+import { getProactivityPolicySnapshot, loadProactivityPolicy, saveProactivityPolicy } from '../agents/proactivity-policy.js';
 import { getAuthStatus } from '../runtime/auth-store.js';
 import { getSecretStore, listSecretDescriptors, type SecretName } from '../runtime/secrets/index.js';
 import {
@@ -161,6 +161,7 @@ import {
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { runConversation, runConversationFromResume } from '../runtime/harness/loop.js';
 import { runPlanFirstPreflight, shouldUsePlanFirst } from '../runtime/harness/plan-first.js';
+import { routeOpenQuestionPlan } from '../runtime/harness/plan-continuity.js';
 import { getHarnessBudgetSnapshot, saveHarnessBudgetSettings } from '../runtime/harness/budget-settings.js';
 import { HarnessSession } from '../runtime/harness/session.js';
 import { parseApprovalIntent, parseHarnessCommand } from '../channels/discord-harness.js';
@@ -5567,7 +5568,8 @@ export function registerConsoleRoutes(
     const isPausedOnApproval = !!harnessSession && !!harnessSession.loadInterruptState();
     const intent = isPausedOnApproval ? parseApprovalIntent(input) : null;
     const sinceSeq = getLatestHarnessEventSeq(sessionId);
-    const planFirst = !intent && shouldUsePlanFirst({ input: turnInput, freshSession });
+    const autonomy = loadProactivityPolicy().autoApproveScope;
+    const planFirst = !intent && shouldUsePlanFirst({ input: turnInput, freshSession, autonomy });
 
     res.status(202).json({
       sessionId,
@@ -5579,12 +5581,22 @@ export function registerConsoleRoutes(
 
     setImmediate(async () => {
       try {
+        if (!intent) {
+          const continuity = await routeOpenQuestionPlan({
+            channel: 'desktop',
+            input: turnInput,
+            sessionId,
+            autonomy,
+          });
+          if (continuity.handled) return;
+        }
         if (planFirst) {
           const preflight = await runPlanFirstPreflight({
             input: turnInput,
             sessionId,
             channel: 'desktop',
             freshSession,
+            autonomy,
           });
           if (preflight.surfaced) return;
         }

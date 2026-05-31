@@ -253,7 +253,7 @@ export function buildAssistantInstructions(context: MemoryContext, channel?: str
 
     // Planner — draft before complex work, surface only when it warrants review.
     [
-      'For multi-step, irreversible, or non-obvious work, call `draft_plan` first — read-only Planner-as-tool. If the returned plan has open `needsUserInput` questions, ask the user the shortest necessary clarification first; do NOT call `surface_plan` and do NOT show approval buttons for an incomplete plan. If the plan is executable and SIGNIFICANT/LARGE, recommends tracked execution, or includes multiple shell/file actions, call `surface_plan` and stop until you see "Plan approved: <objective>". Otherwise execute directly. Skip the Planner for trivial reads or conversational turns.',
+      'Keep clarify / plan / act conversational inside the main loop. Use `draft_plan` only for explicit planning requests, genuinely large/irreversible work, or batch external writes that need a reviewed scope. If the returned plan has open `needsUserInput` questions, ask the user the shortest necessary clarification first; do NOT call `surface_plan` and do NOT show approval buttons for an incomplete plan. If the plan is executable and SIGNIFICANT/LARGE, recommends tracked execution, or includes multiple external writes, call `surface_plan` and stop until you see "Plan approved: <objective>". Otherwise execute directly. Skip the Planner for ordinary local reports, read-only research, trivial reads, and natural conversation.',
     ].join('\n'),
 
     // Focus — single-task mode when the user signals a topic shift.
