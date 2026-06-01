@@ -451,21 +451,10 @@ export function persistCodexOAuthTokens(tokens: CodexOAuthTokens): void {
       lastRefresh: tokens.lastRefresh,
     },
   };
+  // Clementine's OWN vault only. We intentionally no longer mirror the token
+  // into ~/.codex/auth.json: sharing that file with the external `codex` CLI
+  // co-mingled the rotating refresh-token family, so a separate `codex`
+  // invocation could consume Clementine's token and trip reuse-detection
+  // (token_revoked). Clementine owns its grant; the codex CLI owns its own.
   atomicWriteJson(LOCAL_AUTH_FILE, localState);
-
-  let cliFile: Record<string, unknown> = {};
-  if (existsSync(CODEX_AUTH_FILE)) {
-    try { cliFile = JSON.parse(readFileSync(CODEX_AUTH_FILE, 'utf-8')) ?? {}; }
-    catch { cliFile = {}; }
-  }
-  cliFile.auth_mode = 'chatgpt';
-  cliFile.OPENAI_API_KEY = null;
-  cliFile.tokens = {
-    id_token: tokens.idToken,
-    access_token: tokens.accessToken,
-    refresh_token: tokens.refreshToken,
-    account_id: tokens.accountId,
-  };
-  cliFile.last_refresh = tokens.lastRefresh;
-  atomicWriteJson(CODEX_AUTH_FILE, cliFile);
 }

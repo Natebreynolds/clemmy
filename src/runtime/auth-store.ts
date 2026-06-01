@@ -252,21 +252,11 @@ export function getCodexInstallHint(): string {
   return `Install Codex first: npm install -g ${CODEX_INSTALL_PACKAGE}`;
 }
 
-function writeCodexAuthFile(tokens: NonNullable<LocalAuthState['codexOauth']>, sourceFile = getCodexAuthSourceFile()): void {
-  mkdirSync(path.dirname(sourceFile), { recursive: true });
-  writeFileSync(sourceFile, JSON.stringify({
-    auth_mode: 'chatgpt',
-    OPENAI_API_KEY: null,
-    tokens: {
-      id_token: tokens.idToken ?? null,
-      access_token: tokens.accessToken ?? null,
-      refresh_token: tokens.refreshToken ?? null,
-      account_id: tokens.accountId ?? null,
-    },
-    last_refresh: tokens.lastRefresh ?? new Date().toISOString(),
-  }, null, 2), { encoding: 'utf-8', mode: 0o600 });
-  try { chmodSync(sourceFile, 0o600); } catch { /* best-effort */ }
-}
+// (writeCodexAuthFile removed) Clementine no longer mirrors its rotating token
+// into ~/.codex/auth.json — login + refresh persist to its OWN vault only, so a
+// separate `codex` CLI invocation can't consume/rotate the shared family and
+// trip reuse-detection (token_revoked). The CLI file is still READ as a one-time
+// import bootstrap (loadCodexCliAuth), never written.
 
 function runInteractiveCommand(command: string, args: string[]): Promise<boolean> {
   return new Promise((resolve) => {
@@ -306,9 +296,14 @@ export async function installCodexCli(): Promise<{ ok: boolean; message: string 
   };
 }
 
-export async function loginWithNativeOAuth(sourceFile = getCodexAuthSourceFile()): Promise<{ ok: boolean; message: string }> {
+export async function loginWithNativeOAuth(_sourceFile = getCodexAuthSourceFile()): Promise<{ ok: boolean; message: string }> {
   try {
     const tokens = await loginWithNativeCodexOAuth();
+    // Persist to Clementine's OWN vault ONLY — do NOT write ~/.codex/auth.json.
+    // Clementine owns its grant; the external `codex` CLI owns its own. Sharing
+    // that file lets a separate `codex` invocation rotate/consume our refresh
+    // token and trip reuse-detection (token_revoked). See the notes near
+    // REFRESH_LOCK_FILE; this is the "Clem holds her own auth token" decouple.
     saveLocalAuthState({
       importedAt: new Date().toISOString(),
       source: 'native',
@@ -320,16 +315,9 @@ export async function loginWithNativeOAuth(sourceFile = getCodexAuthSourceFile()
         lastRefresh: tokens.lastRefresh,
       },
     });
-    writeCodexAuthFile({
-      accessToken: tokens.accessToken,
-      refreshToken: tokens.refreshToken,
-      idToken: tokens.idToken,
-      accountId: tokens.accountId,
-      lastRefresh: tokens.lastRefresh,
-    }, sourceFile);
     return {
       ok: true,
-      message: `Native ChatGPT/Codex sign-in completed and credentials were saved to ${sourceFile}.`,
+      message: 'Signed in to ChatGPT/Codex. Clementine stored its own credentials (independent of the Codex CLI).',
     };
   } catch (error) {
     return {
