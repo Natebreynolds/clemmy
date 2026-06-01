@@ -219,17 +219,46 @@ export function attachEventLogHooks(
     const callId = callIdFromDetails(details);
     const parentEventId = callId ? callIdToCalledEventId.get(callId) : undefined;
     if (callId) callIdToCalledEventId.delete(callId);
+    // Normalize the result to a string up front. The SDK *usually* hands us a
+    // string, but a tool (or a worker via Agent.asTool) can return an
+    // object/array/error. Previously the lossless write + clip footer were
+    // gated on `typeof result === 'string'`, so a non-string result skipped
+    // the side-store ENTIRELY — making it unrecoverable via recall_tool_result
+    // even when a callId existed. Stringify defensively so every non-empty
+    // result is persisted and recoverable (report-back integrity, 2026-06-01).
+    const resultStr: string | null =
+      typeof result === 'string'
+        ? result
+        : result == null
+          ? null
+          : (() => {
+              // Cycle-safe stringify so a circular/object result stays
+              // recoverable via recall_tool_result rather than collapsing to a
+              // lossy "[object Object]".
+              try {
+                const seen = new WeakSet<object>();
+                return JSON.stringify(result, (_k, v) => {
+                  if (typeof v === 'object' && v !== null) {
+                    if (seen.has(v)) return '[Circular]';
+                    seen.add(v);
+                  }
+                  return v;
+                });
+              } catch {
+                return String(result);
+              }
+            })();
     // Lossless write FIRST (up to 200KB, see eventlog.ts). The event
     // log copy below is intentionally clipped for readability; the
     // recall_tool_result tool reads from tool_outputs to retrieve the
     // verbatim original.
-    if (callId && typeof result === 'string') {
+    if (callId && resultStr !== null) {
       try {
         writeToolOutput({
           sessionId,
           callId,
           tool: tool?.name ?? null,
-          output: result,
+          output: resultStr,
         });
       } catch {
         // Best-effort: a tool_outputs write failure must never block
@@ -242,12 +271,12 @@ export function attachEventLogHooks(
       // `cancelled` telemetry event — that's what feeds the Brain ->
       // Evolution panel's calibration story. Scheduling is
       // microtask-deferred so the SDK's tool result is unblocked.
-      if (result.length > 0) {
+      if (resultStr.length > 0) {
         scheduleReflection({
           sessionId,
           callId,
           tool: tool?.name ?? null,
-          output: result,
+          output: resultStr,
         });
       }
     }
@@ -261,7 +290,7 @@ export function attachEventLogHooks(
           tool: tool?.name ?? null,
           callId: callId ?? null,
           result: clipToolResult(
-            typeof result === 'string' ? result : null,
+            resultStr,
             maxResultChars,
             callId,
             tool?.name,

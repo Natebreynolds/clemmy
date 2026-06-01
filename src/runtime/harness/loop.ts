@@ -2970,27 +2970,50 @@ function handleRunError(
     bumpTurnNumber(sessionId, turn);
     return { sessionId, turn, status: 'limit_exceeded', error: err.message };
   }
-  if (err instanceof ToolGuardrailEscalated) {
-    // A mutating tool was called with byte-identical args past the escalate
-    // threshold — an unrecoverable loop. End the turn cleanly instead of
-    // letting the model spin (the 84×/3-min workflow_run hang).
-    safeAppend({
-      sessionId,
-      turn,
-      role: 'system',
-      type: 'guardrail_tripped',
-      data: {
-        kind: 'tool_call_guardrail',
-        action: 'escalate',
-        rule: err.decision.rule,
-        toolName: err.decision.toolName,
-        count: err.decision.count,
-        reason: err.decision.reason,
-      },
-    });
+  // A mutating tool was called with byte-identical args past the escalate
+  // threshold — an unrecoverable loop. End the turn cleanly instead of
+  // letting the model spin (the 84×/3-min workflow_run hang). The SDK
+  // RE-WRAPS our throw as "Failed to run function tools: ToolGuardrailEscalated:
+  // …", which slips past a bare `instanceof` check and dumped the raw
+  // exception at the user (observed live 2026-06-01). Match the wrapped form
+  // too, and surface a plain-language, actionable message — never the raw
+  // "Failed to run function tools" string.
+  const escalated =
+    err instanceof ToolGuardrailEscalated
+      ? err
+      : err instanceof Error
+          && /ToolGuardrailEscalated|tool-call guardrail escalated/.test(err.message)
+        ? err
+        : null;
+  if (escalated) {
+    const decision = escalated instanceof ToolGuardrailEscalated ? escalated.decision : undefined;
+    const loopedTool =
+      decision?.toolName
+      ?? escalated.message.match(/([a-z_]+) called \d+× with IDENTICAL/i)?.[1]
+      ?? 'a tool';
+    if (decision) {
+      safeAppend({
+        sessionId,
+        turn,
+        role: 'system',
+        type: 'guardrail_tripped',
+        data: {
+          kind: 'tool_call_guardrail',
+          action: 'escalate',
+          rule: decision.rule,
+          toolName: decision.toolName,
+          count: decision.count,
+          reason: decision.reason,
+        },
+      });
+    }
     session.markStatus('failed');
     bumpTurnNumber(sessionId, turn);
-    return { sessionId, turn, status: 'limit_exceeded', error: err.message };
+    const friendly =
+      `I stopped because I kept calling \`${loopedTool}\` with the same arguments and wasn't making progress — `
+      + `repeating it identically won't change the result, so I cut it off rather than spin. `
+      + `Tell me how you'd like to adjust (different parameters, a different tool/approach, or any detail I was missing) and I'll pick it back up.`;
+    return { sessionId, turn, status: 'limit_exceeded', error: friendly };
   }
 
   // v0.5.20 Bug I — route ToolTimeout through the same F4 ask-user

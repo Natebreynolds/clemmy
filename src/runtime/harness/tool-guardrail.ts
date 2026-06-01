@@ -28,6 +28,7 @@
 import { createHash } from 'node:crypto';
 import pino from 'pino';
 import { readGuardrailState, writeGuardrailState } from './eventlog.js';
+import { MUTATING_VERBS } from './execution-gate.js';
 
 const logger = pino({ name: 'clementine.harness.tool-guardrail' });
 
@@ -132,6 +133,53 @@ const MUTATING_TOOLS = new Set<string>([
 ]);
 
 // ─────────────────────────────────────────────────────────────────
+// composio_execute_tool is a GATEWAY: it wraps a read (AIRTABLE_LIST_RECORDS,
+// *_GET_*, *_SEARCH_*) just as often as a write. Classifying the wrapper as
+// flatly mutating means a looping READ gets escalate-KILLED with a raw error
+// ("AIRTABLE_LIST_RECORDS called 7× … Ending the turn" — observed live
+// 2026-06-01), which is wrong: repeating a read wastes budget but never
+// corrupts state, so it should get the soft "do something different" block,
+// never a turn-kill. Classify by the INNER slug.
+//
+// Reuse the CANONICAL write-verb set + TOKEN matching from execution-gate.ts
+// (the execution-wrap gate). Token matching (split on '_', check each segment)
+// — NOT a substring regex — so a read slug like AIRTABLE_LIST_RECORDS,
+// HUBSPOT_GET_OFFSET, *_ADDRESS_* is never misclassified as a write by an
+// incidental "SET"/"ADD" substring. Single source of truth: if a verb is
+// added there, the guardrail tracks it automatically.
+function composioSlugOf(args: unknown): string | undefined {
+  if (!args || typeof args !== 'object') return undefined;
+  const slug = (args as Record<string, unknown>).tool_slug;
+  return typeof slug === 'string' && slug.length > 0 ? slug : undefined;
+}
+
+function composioSlugIsMutating(slug: string): boolean {
+  for (const part of slug.split('_')) {
+    if (MUTATING_VERBS.has(part.toUpperCase())) return true;
+  }
+  return false;
+}
+
+/** Slug-aware: a composio_execute_tool call is mutating only when its inner
+ *  slug names a write. Unknown slug → mutating (safe default). */
+function isMutatingCall(toolName: string, args: unknown): boolean {
+  if (toolName === 'composio_execute_tool') {
+    const slug = composioSlugOf(args);
+    if (!slug) return true;
+    return composioSlugIsMutating(slug);
+  }
+  return MUTATING_TOOLS.has(toolName);
+}
+
+/** Slug-aware: a composio read slug is idempotent (looping is legitimate). */
+function isIdempotentCall(toolName: string, args: unknown): boolean {
+  if (toolName === 'composio_execute_tool') {
+    const slug = composioSlugOf(args);
+    if (slug) return !composioSlugIsMutating(slug);
+  }
+  return IDEMPOTENT_TOOLS.has(toolName);
+}
+
 // Thresholds (tunable via env)
 // ─────────────────────────────────────────────────────────────────
 
@@ -301,7 +349,7 @@ export function evaluateToolCall(
   }
   tracker.countBySignature.set(signature, (tracker.countBySignature.get(signature) ?? 0) + 1);
 
-  if (MUTATING_TOOLS.has(toolName)) {
+  if (isMutatingCall(toolName, args)) {
     let set = tracker.distinctArgsByMutTool.get(toolName);
     if (!set) {
       set = new Set();
@@ -320,8 +368,8 @@ export function evaluateToolCall(
   persistTracker(sessionId, tracker);
 
   const exactCount = tracker.countBySignature.get(signature) ?? 1;
-  const isMut = MUTATING_TOOLS.has(toolName);
-  const isIdem = IDEMPOTENT_TOOLS.has(toolName);
+  const isMut = isMutatingCall(toolName, args);
+  const isIdem = isIdempotentCall(toolName, args);
 
   // Exact-args repeat rule.
   // ESCALATE (mutating only): a few soft blocks give the model a chance to

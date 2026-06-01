@@ -2,6 +2,7 @@ import { Agent } from '@openai/agents';
 import type { Handoff, Tool } from '@openai/agents';
 import { MODELS, getRuntimeEnv } from '../config.js';
 import { getCoreToolsAsync } from '../tools/registry.js';
+import { WORKFLOW_STEP_BLOCKED_TOOL_NAMES } from './workflow-step-agent.js';
 import { getOrCreateExternalMcpServers } from '../runtime/mcp-servers.js';
 import type { McpToolScope } from '../runtime/mcp-tool-scope.js';
 import type { RuntimeContextValue } from '../types.js';
@@ -57,17 +58,6 @@ function wrapTools(tools: Tool<RuntimeContextValue>[]): Tool<RuntimeContextValue
   );
 }
 
-function filterToolsByNames<T extends { name?: string }>(
-  tools: T[],
-  allowed: Set<string>,
-): T[] {
-  return tools.filter((tool) => {
-    const name = tool?.name;
-    if (typeof name !== 'string') return false;
-    return allowed.has(name);
-  });
-}
-
 // Worker = a stateless leaf agent the Orchestrator (or any parent) can
 // invoke as a TOOL via Agent.asTool(). When the parent calls the worker
 // tool N times in one turn, the SDK runs N workers in PARALLEL, each
@@ -75,39 +65,49 @@ function filterToolsByNames<T extends { name?: string }>(
 // gets fan-out: the parent's model fires the worker tool in parallel
 // batches, and each worker handles ONE item in isolation.
 //
-// What it does NOT have:
-//   - task/execution mutation tools (no state collision with siblings)
-//   - notify_user, ask_user_question (workers are silent)
-//   - handoffs (workers are leaves, not transferers)
-// What it HAS:
-//   - all data-fetch composio tools, shell, file reads, memory reads
-//   - the discovery+execute composio pair so unknown actions still work
-//   - write_file (workers often produce per-item artifacts)
-const WORKER_TOOL_NAMES = new Set<string>([
-  'memory_recall',
-  'memory_search',
-  'memory_read',
-  'user_profile_read',
-  'workspace_roots',
-  'workspace_list',
-  'workspace_info',
-  'list_files',
-  'read_file',
-  'write_file',
-  'run_shell_command',
-  'git_status',
-  'local_cli_list',
-  'local_cli_probe',
-  'skill_list',
-  'skill_read',
-  'composio_list_tools',
-  'composio_search_tools',
-  'composio_execute_tool',
-]);
+// TOOL SURFACE — BLOCKLIST, NOT ALLOWLIST (changed 2026-06-01).
+// Previously a hard 20-name allowlist (`WORKER_TOOL_NAMES`). That was the
+// root cause of "Clementine dispatches a worker to use tool X, the worker
+// doesn't have X": any NATIVE tool not pre-listed was invisible, so the
+// worker punted, looped, or reported a tool "isn't exposed" on data that
+// was right there. Native tools are CHEAP (the schemas are small + bounded);
+// gating them bought ~no tokens and caused the silliness. The expensive
+// long tail (thousands of Composio actions) is reached by DISCOVERY
+// (composio_search_tools → composio_execute_tool), never preloaded — so
+// the worker context stays ~10K regardless.
+//
+// So: the worker now gets the FULL native surface MINUS the same
+// recursion/meta vectors a workflow step is denied (WORKFLOW_STEP_BLOCKED_
+// TOOL_NAMES: no run_worker/workflow-authoring/run/cron/create_tool/
+// plan-authoring/ask_user_question), PLUS `notify_user` — a parallel fan-out
+// of workers each pinging the user is collision/clutter, and a worker can't
+// meaningfully converse mid-item. Everything else (memory, files, shell,
+// git, ALL composio, recall_tool_result/tool_output_query, skills, CLIs,
+// executions, capability, browser, vault) is reachable. If the orchestrator
+// tells a worker to use a native tool, the worker now HAS it.
+// Lazily computed: sub-agents ← orchestrator ← workflow-step-agent forms an
+// import cycle, so reading WORKFLOW_STEP_BLOCKED_TOOL_NAMES at module-eval time
+// hits a TDZ ReferenceError. Defer the read to first call, by which point all
+// modules are initialized.
+let _workerBlockedToolNames: Set<string> | null = null;
+function workerBlockedToolNames(): Set<string> {
+  if (!_workerBlockedToolNames) {
+    _workerBlockedToolNames = new Set<string>([...WORKFLOW_STEP_BLOCKED_TOOL_NAMES, 'notify_user']);
+  }
+  return _workerBlockedToolNames;
+}
+
+/** Full native surface minus the recursion/meta/collision vectors. */
+function filterToolsForWorker<T extends { name?: string }>(tools: T[]): T[] {
+  const blocked = workerBlockedToolNames();
+  return tools.filter(
+    (tool) => !(typeof tool?.name === 'string' && blocked.has(tool.name)),
+  );
+}
 
 export async function buildWorkerAgent(options: { mcpToolScope?: McpToolScope } = {}): Promise<SubAgent> {
   const all = await getCoreToolsAsync({ includeDynamicComposioTools: false });
-  const tools = filterToolsByNames(all, WORKER_TOOL_NAMES) as Tool<RuntimeContextValue>[];
+  const tools = filterToolsForWorker(all) as Tool<RuntimeContextValue>[];
   return new Agent<RuntimeContextValue>({
     name: 'Worker',
     handoffDescription: 'Stateless per-item worker. Use via run_worker tool for parallel fan-out.',
@@ -120,7 +120,8 @@ export async function buildWorkerAgent(options: { mcpToolScope?: McpToolScope } 
       '  - Use the smallest set of tool calls needed. Discovery → execute when the action is external and not already resolved by the parent packet.',
       '  - If the parent named a specific skill or the item clearly needs installed skill rules, call `skill_read` for that skill. Otherwise do not spend worker context on skill discovery.',
       '  - Return a TIGHT, structured result on the last line: a single sentence, a JSON object, or a bullet list. The parent will aggregate hundreds of these — keep yours compact.',
-      '  - If a tool call fails or returns a result missing the data you need, fix and retry that call ONCE: re-run discovery to get the exact slug/id, narrow the query, or adjust arguments from the error. A failing tool result is information, not a stop sign.',
+      '  - If a tool call fails or returns a result missing the data you need, fix and retry that call ONCE: re-run discovery to get the exact slug/id, narrow the query, or adjust arguments from the error. A failing tool result is information, not a stop sign. Do NOT re-issue the SAME call with identical arguments — that is a loop and will be cut off; change something or move on.',
+      '  - If a tool result shows a `[clipped: …]` or `[digest: …]` footer with a call_id, the full payload is stored and retrievable RIGHT NOW: call `tool_output_query("call_id", …)` for specific records or `recall_tool_result("call_id")` for the raw output. Never report that the data is unavailable, that a reader "isn\'t exposed", or that a completed call is still pending — pull it.',
       '  - Only after one genuine retry fails should you give up. Return a single line starting with "ERROR:" and the specific reason, including which tool failed and what data was missing. Never return a normal-looking result when the item did not actually complete.',
       '  - Fill per-item artifacts (email/Outlook draft, record, message) with the REAL identity values from your data. If your item is "draft an email to account X", the draft carries X\'s actual recipient address and a real first-name greeting from the data you were given or fetched — never a blank or "Hi there". If a required identity field (recipient email, contact first name) is genuinely missing for your item and one retry to fetch it fails, do NOT produce a hollow draft — return "ERROR: missing <field> for <item>" so the parent can decide.',
       '  - Do NOT call notify_user, ask_user_question, or write to shared tasks/executions — those mutate state your sibling workers also touch and create race conditions.',

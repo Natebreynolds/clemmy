@@ -86,19 +86,64 @@ test('evaluateToolCall: per-session isolation — two sessions don\'t cross-cont
 
 test('evaluateToolCall: mutating tool with N distinct arg sets hits warn at 3, halt at 8', () => {
   _resetAllTrackersForTests();
+  // composio_execute_tool is classified by its INNER slug (2026-06-01): a
+  // write slug (SEND/CREATE/…) is mutating, a read slug (LIST/GET/…) is not.
+  // Use a write slug here so the same-mut-tool runaway rule engages.
   for (let i = 0; i < 2; i += 1) {
-    evaluateToolCall('sess-3', 'composio_execute_tool', { tool_slug: 'X', arguments: `${i}` });
+    evaluateToolCall('sess-3', 'composio_execute_tool', { tool_slug: 'GMAIL_SEND_EMAIL', arguments: `${i}` });
   }
   // 3rd distinct args → warn
-  const d3 = evaluateToolCall('sess-3', 'composio_execute_tool', { tool_slug: 'X', arguments: 'distinct-3' });
+  const d3 = evaluateToolCall('sess-3', 'composio_execute_tool', { tool_slug: 'GMAIL_SEND_EMAIL', arguments: 'distinct-3' });
   assert.equal(d3.action, 'warn');
   assert.equal(d3.rule, 'same_mut_tool_repeat');
   for (let i = 4; i < 8; i += 1) {
-    evaluateToolCall('sess-3', 'composio_execute_tool', { tool_slug: 'X', arguments: `distinct-${i}` });
+    evaluateToolCall('sess-3', 'composio_execute_tool', { tool_slug: 'GMAIL_SEND_EMAIL', arguments: `distinct-${i}` });
   }
   // 8th distinct args → halt
-  const d8 = evaluateToolCall('sess-3', 'composio_execute_tool', { tool_slug: 'X', arguments: 'distinct-8' });
+  const d8 = evaluateToolCall('sess-3', 'composio_execute_tool', { tool_slug: 'GMAIL_SEND_EMAIL', arguments: 'distinct-8' });
   assert.equal(d8.action, 'halt');
+});
+
+test('evaluateToolCall: a looping composio READ slug never escalates to a turn-kill', () => {
+  // Regression guard for the 2026-06-01 live incident: AIRTABLE_LIST_RECORDS
+  // (a READ) repeated 7× got escalate-KILLED with a raw error because
+  // composio_execute_tool was classified flatly mutating. A read slug must
+  // never escalate — repeating it wastes budget but cannot corrupt state, so
+  // it gets the soft 'block' corrective instead.
+  _resetAllTrackersForTests();
+  const readArgs = { tool_slug: 'AIRTABLE_LIST_RECORDS', arguments: '{"baseId":"app1","tableIdOrName":"tbl1"}' };
+  let last;
+  for (let i = 0; i < 12; i += 1) {
+    last = evaluateToolCall('sess-read', 'composio_execute_tool', readArgs);
+  }
+  // After many identical repeats it is blocked (corrective), NOT escalated.
+  assert.notEqual(last?.action, 'escalate');
+  assert.equal(last?.action, 'block');
+
+  // A WRITE slug with the same repetition DOES escalate (turn-kill is correct).
+  _resetAllTrackersForTests();
+  const writeArgs = { tool_slug: 'AIRTABLE_CREATE_RECORDS', arguments: '{"baseId":"app1"}' };
+  let lastWrite;
+  for (let i = 0; i < 12; i += 1) {
+    lastWrite = evaluateToolCall('sess-write', 'composio_execute_tool', writeArgs);
+  }
+  assert.equal(lastWrite?.action, 'escalate');
+});
+
+test('evaluateToolCall: read slugs with SET/ADD SUBSTRINGS are not misclassified as writes (token match)', () => {
+  // Guard for the 2026-06-01 review finding: classification must be TOKEN-based
+  // (split on '_', match canonical MUTATING_VERBS), not a substring regex.
+  // Otherwise a read slug whose tokens merely CONTAIN "SET"/"ADD" (OFFSET,
+  // ADDRESS, RESET, ASSET) would be flagged mutating and escalate-killed.
+  for (const readSlug of ['HUBSPOT_LIST_OFFSET_RECORDS', 'CRM_GET_ADDRESS', 'X_GET_ASSET_LIST']) {
+    _resetAllTrackersForTests();
+    const args = { tool_slug: readSlug, arguments: '{}' };
+    let last;
+    for (let i = 0; i < 12; i += 1) {
+      last = evaluateToolCall('sess-sub', 'composio_execute_tool', args);
+    }
+    assert.notEqual(last?.action, 'escalate', `${readSlug} (a read) must never escalate-kill`);
+  }
 });
 
 test('evaluateToolCall: idempotent tool with many distinct args is NOT flagged by same-mut-tool rule', () => {

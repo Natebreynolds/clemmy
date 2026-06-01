@@ -159,7 +159,21 @@ export async function writeSseTruncationTrace(
     const path = await import('node:path');
     const fs = await import('node:fs');
     const { BASE_DIR } = await import('../../config.js');
-    const traceDir = path.join(BASE_DIR, 'state', 'codex-sse-truncated');
+    // Under test, the harness loop's truncation path is exercised by
+    // ScriptedCodexModel with a synthetic empty request — and it lands
+    // here on the throw path. Writing to the real BASE_DIR pollutes the
+    // operator's live SSE-truncation dataset (99 of 105 captures observed
+    // 2026-06-01 were these test artifacts, drowning out the 6 genuine
+    // truncations the compaction research relies on). Under test we ALWAYS
+    // redirect to a temp dir — unconditionally, not gated on CLEMENTINE_HOME
+    // — so a parent-exported CLEMENTINE_HOME pointing at a real state dir
+    // can never be polluted by a test run. No test reads the trace file
+    // (the writer returns the path), so the redirect is transparent.
+    const os = await import('node:os');
+    const baseRoot = process.env.NODE_ENV === 'test'
+      ? path.join(os.tmpdir(), 'clementine-sse-trace-test')
+      : path.join(BASE_DIR, 'state');
+    const traceDir = path.join(baseRoot, 'codex-sse-truncated');
     // atomicJsonMutate creates the file's parent dir during the write
     // step (atomic-json.ts:229), but the advisory `.lock` file is
     // opened BEFORE that mkdir. Pre-create the dir so the lock open

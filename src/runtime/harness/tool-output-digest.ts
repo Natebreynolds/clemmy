@@ -43,7 +43,15 @@ function collectFields(arr: unknown[], sample = 12): string[] {
 
 function recoveryHint(callId: string | null | undefined): string {
   if (!callId) return 'Re-run the call with a narrower scope (filter / fewer fields / a smaller range) to get the rest.';
-  return `Get any slice with tool_output_query("${callId}", {offset, limit, fields, filter}), or recall_tool_result("${callId}") for the raw payload.`;
+  // The full result is parked losslessly under this call_id — these two
+  // readers are available to you RIGHT NOW. Spell that out so the model
+  // pulls the data instead of declaring it unavailable / still pending /
+  // "the reader isn't exposed" (observed live, 2026-06-01).
+  return (
+    `The full result is stored — call tool_output_query("${callId}", {offset, limit, fields, filter}) ` +
+    `to pull specific records, or recall_tool_result("${callId}") for the raw payload. ` +
+    `These readers are available now; do NOT say the data is unavailable or that the call is still pending.`
+  );
 }
 
 function digestArray(arr: unknown[], totalChars: number, maxChars: number, toolName: string, callId: string | null | undefined): string {

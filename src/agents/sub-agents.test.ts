@@ -73,3 +73,32 @@ test('Worker instructions honor parent-planned packets and one retry', async () 
   assert.match(instructions, /retry that call ONCE/);
   assert.match(instructions, /Return a single line starting with "ERROR:"/);
 });
+
+test('Worker gets the full native surface minus only recursion/meta vectors (blocklist, not allowlist)', async () => {
+  // Regression guard for the 2026-06-01 ungating: the worker surface used to
+  // be a hard 20-name allowlist, so a worker dispatched to use a native tool
+  // it wasn't pre-listed for couldn't see it ("the reader isn't exposed").
+  // It's now a BLOCKLIST: full native surface minus recursion/meta/collision
+  // vectors. Assert (a) the recovery + work tools are present, (b) a tool that
+  // was NOT on the old allowlist is now reachable, (c) the blocked vectors stay
+  // out.
+  const worker = await buildWorkerAgent();
+  const toolNames = new Set(
+    ((worker as unknown as { tools?: Array<{ name?: string }> }).tools ?? []).map((t) => t.name),
+  );
+
+  // Recovery + core work tools the worker must have.
+  for (const must of ['recall_tool_result', 'tool_output_query', 'composio_execute_tool', 'read_file', 'run_shell_command']) {
+    assert.ok(toolNames.has(must), `worker must have ${must}`);
+  }
+
+  // Previously-gated native tools that are now reachable (proves un-gating).
+  for (const nowReachable of ['execution_list', 'task_list']) {
+    assert.ok(toolNames.has(nowReachable), `worker should now reach ${nowReachable}`);
+  }
+
+  // Recursion / meta / collision vectors that MUST stay blocked.
+  for (const blocked of ['run_worker', 'workflow_run', 'workflow_create', 'add_cron_job', 'create_tool', 'ask_user_question', 'notify_user']) {
+    assert.ok(!toolNames.has(blocked), `worker must NOT have ${blocked}`);
+  }
+});

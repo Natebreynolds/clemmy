@@ -818,12 +818,36 @@ export function wrapToolForHarness<T extends WrappableTool>(
         // timeout means the underlying tool is genuinely stuck).
         throw err;
       }
-      return withTimeout(
+      const invokePromise = withTimeout(
         (async () => originalInvoke.call(tt, runContext, input, details))(),
         timeoutMs,
         tool.name,
         { isPaused: isPausedFactory(ctx?.sessionId) },
       );
+      // run_worker (Agent.asTool fan-out leaf) MUST return something into the
+      // orchestrator's context even on timeout. withTimeout sits OUTSIDE the
+      // try/catch above, so a ToolTimeout here propagates straight out of
+      // wrappedInvoke → the SDK's agent_tool_end never fires → no tool_returned
+      // event is logged → the orchestrator is blind to a worker that ran for
+      // minutes then timed out (can't tell "timed out mid-item" from "never
+      // ran"). Convert the worker timeout to a string result so agent_tool_end
+      // fires normally and the parent can mark the item failed and continue.
+      // Other tools keep PROPAGATING ToolTimeout — the loop surfaces an
+      // ask-user Retry card for those (loop.ts), which we don't want to change.
+      if (tool.name === 'run_worker') {
+        try {
+          return await invokePromise;
+        } catch (err) {
+          if (err instanceof ToolTimeout) {
+            return (
+              `ERROR: run_worker timed out after ${Math.round(timeoutMs / 1000)}s — this item did NOT complete. `
+              + `Treat it as failed: do not assume it succeeded. Continue with the other items and report this one as needs-attention.`
+            );
+          }
+          throw err;
+        }
+      }
+      return invokePromise;
     };
     return { ...tool, invoke: wrappedInvoke } as T;
   }

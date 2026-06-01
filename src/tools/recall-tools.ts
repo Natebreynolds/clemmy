@@ -29,7 +29,8 @@ export function registerRecallTools(server: McpServer): void {
     'recall_tool_result',
     [
       'Retrieve the full verbatim output of a prior tool call by its call_id.',
-      'Use this ONLY when you see `[clipped: ... call recall_tool_result("call_xxx") for full output]` in the conversation AND the summary lacks a specific detail you need (URLs, IDs, exact figures, ranking positions, etc.).',
+      'Use this whenever the conversation shows a `[clipped: …]` stub OR a `[digest: …]` footer carrying a call_id and you need a detail the shortened view dropped (URLs, IDs, exact figures, ranking positions, full records, etc.).',
+      'This reader is ALWAYS available to you inside a turn — the full payload is stored losslessly. Never tell the user the data is unavailable, that the reader "isn\'t exposed", or that a completed call is still pending: call this instead.',
       'Returns up to 30KB of original output. Counts against a per-turn budget of 3 calls / 60KB total — use sparingly.',
     ].join(' '),
     {
@@ -102,6 +103,7 @@ export function registerRecallTools(server: McpServer): void {
     [
       'Query a slice of a large prior tool output by its call_id, without loading the whole payload.',
       'Use after you see a `[digest: … tool_output_query("call_xxx", …)]` footer (or a `[clipped: …]` stub) and you need specific records the digest did not show.',
+      'This reader is ALWAYS available inside a turn — the full result is parked losslessly. Never claim the data is unavailable, the reader "isn\'t exposed", or that the call is still pending; call this to pull exactly the rows/fields you need.',
       'For a JSON array result: filter rows, project fields, and paginate. For a JSON object: project top-level keys. Returns compact JSON plus a "showing X of N" header.',
     ].join(' '),
     {

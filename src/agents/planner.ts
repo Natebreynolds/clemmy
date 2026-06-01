@@ -32,6 +32,15 @@ import { normalizeZodForCodexStrict } from '../runtime/schema-normalizer.js';
 // Read-only tools the Planner can use to gather context before
 // producing a plan. Same shape as Researcher's allowlist — if you can
 // research it, you can plan against it.
+//
+// READ-ONLY IS LOAD-BEARING — do NOT "ungate" this into the full surface.
+// The orchestrator NEVER executes the planner's tool calls; it consumes the
+// planner's PlanSchema JSON, surfaces it for approval, then runs its OWN tool
+// calls wrapped in execution_create (the approval + audit boundary). If the
+// planner could mutate, external writes would bypass that boundary entirely.
+// This is the ONE allowlist that is a real invariant, not over-indexed gating
+// (workers were ungated to the full native surface 2026-06-01; the planner
+// deliberately was not — planning never gets "dispatched to use a tool").
 const PLANNER_TOOL_NAMES = new Set<string>([
   'memory_search',
   'memory_recall',
@@ -58,6 +67,14 @@ const PLANNER_TOOL_NAMES = new Set<string>([
   // exists before writing steps that depend on it.
   'check_capability',
   'list_capabilities',
+  // Lossless read-back for the planner's own clipped/digested reads.
+  // `read_file` / `session_history` can return payloads big enough to be
+  // clipped by the tool-output digest; the footer then names these two
+  // readers. Same class as the worker gap — keep them reachable so the
+  // planner never plans against half-read context. Read-only, budget-
+  // capped (3 calls / 60KB per turn).
+  'recall_tool_result',
+  'tool_output_query',
 ]);
 
 function filterToolsByNames<T extends { name?: string }>(tools: T[], allow: Set<string>): T[] {
