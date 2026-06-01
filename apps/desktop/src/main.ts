@@ -152,6 +152,26 @@ function isSafeExternalHttps(rawUrl: string): boolean {
   }
 }
 
+/**
+ * Should a link the user CLICKS in the dashboard open in their external
+ * browser? Any well-formed http(s) URL qualifies. Clementine surfaces links
+ * to anything — a Salesforce record, a client's site, a doc — and a curated
+ * host allowlist (the old `isSafeExternalHttps` gate) silently swallowed every
+ * link not on it. That was the "I can't click links in the desktop app" bug.
+ * We still block non-web schemes (file:, javascript:, custom app schemes) so a
+ * crafted link can't trigger a local handler via shell.openExternal.
+ * `isSafeExternalHttps` stays the tighter allowlist for PROGRAMMATIC opens
+ * (the setup auth flow), where the narrow set is the correct posture.
+ */
+function isExternalHttpUrl(rawUrl: string): boolean {
+  try {
+    const protocol = new URL(rawUrl).protocol;
+    return protocol === 'https:' || protocol === 'http:';
+  } catch {
+    return false;
+  }
+}
+
 function senderSurface(url: string): RendererSurface | null {
   if (url.startsWith('data:text/html')) return 'splash';
   try {
@@ -183,7 +203,9 @@ function guardWindow(win: BrowserWindow, allowed: RendererSurface[]): void {
     return Boolean(surface && allowed.includes(surface));
   }
   win.webContents.setWindowOpenHandler(({ url }) => {
-    if (isSafeExternalHttps(url)) {
+    // A clicked link (target=_blank / window.open) → open in the user's
+    // browser. Any http(s) URL, not a curated allowlist.
+    if (isExternalHttpUrl(url)) {
       void shell.openExternal(url);
     }
     return { action: 'deny' };
@@ -191,7 +213,8 @@ function guardWindow(win: BrowserWindow, allowed: RendererSurface[]): void {
   win.webContents.on('will-navigate', (event, url) => {
     if (allowedUrl(url)) return;
     event.preventDefault();
-    if (isSafeExternalHttps(url)) {
+    // A same-window link to somewhere outside the dashboard → open externally.
+    if (isExternalHttpUrl(url)) {
       void shell.openExternal(url);
     }
   });
