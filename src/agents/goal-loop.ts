@@ -189,6 +189,7 @@ export const JUDGE_SYSTEM_PROMPT = [
   '- Do NOT accept proxy signals (e.g. "I have updated the records", "task complete", "✓") as completion by themselves. Require the artifact or its output.',
   '- A plan, intention, or "I will work on this next" is NOT complete.',
   '- Partial completion of multiple deliverables is NOT complete unless the objective only asked for one.',
+  '- HONEST BLOCKER: if the response delivers the results it COULD produce AND explicitly names the specific part it could not, with a concrete reason that part is genuinely blocked (a named tool/endpoint unavailable, a record/field that does not exist, access denied), treat that as DONE — do NOT demand it retry a capability that is genuinely unavailable. Mark not-done ONLY when the assistant could plausibly still finish with the tools it has (it punted, guessed, promised, or stopped without actually trying).',
   '- If the objective is ambiguous, lean toward not-done so the user can clarify rather than the loop terminating prematurely.',
   '',
   'Output ONLY a JSON object on one line with no prose: {"done": <boolean>, "reason": "<one short sentence naming the missing evidence or the artifact that satisfied the objective>"}.',

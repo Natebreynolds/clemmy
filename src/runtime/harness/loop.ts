@@ -33,7 +33,7 @@ import {
   predictTurnCost,
 } from './budget.js';
 import { MODELS } from '../../config.js';
-import { judgeObjectiveComplete, type ObjectiveJudgeFn } from './objective-judge.js';
+import { judgeObjectiveComplete, shouldRunObjectiveJudge, type ObjectiveJudgeFn } from './objective-judge.js';
 import { classifyMessageIntent } from '../../assistant/message-intent.js';
 import { attachEventLogHooks, extractSessionIdFromContext, type RunHooksLike } from './hooks.js';
 import * as approvalRegistry from './approval-registry.js';
@@ -1088,17 +1088,28 @@ async function runConversationCore(
   let stallRetriesUsed = 0;
 
   // Independent objective-completion judge (Hermes-style). Only for interactive
-  // chat callers (opt-in) AND multi-step ACTION objectives — so trivial
-  // lookups/chat and workflow steps are never judged. The judge catches the
-  // model declaring "done" before the artifact actually exists, and injects a
-  // continuation instead of yielding. Bounded so a stubborn judge can't loop
-  // forever; fails open (judge defaults to done) so it never wedges.
+  // chat callers (opt-in). The judge catches the model declaring "done" before
+  // the artifact actually exists, and injects a continuation instead of
+  // yielding. Bounded so a stubborn judge can't loop forever; fails open (judge
+  // defaults to done) so it never wedges.
+  //
+  // Gating is on OBSERVED WORK, not phrasing: a turn that ran several tool calls
+  // did substantive multi-step work and is worth verifying — even when the
+  // request reads as a "lookup" ("find me the accounts and drop them in a
+  // sheet" classifies as lookup but is real multi-step action). The intent
+  // branch keeps the cheap path: a clear ACTION objective is judged even if it
+  // somehow finished with few tool calls. A trivial lookup ("what's on my
+  // calendar") makes 1–2 tool calls and is below threshold → never judged.
   const objectiveJudge = options.judgeFn ?? judgeObjectiveComplete;
-  const objectiveJudgeEnabled =
-    options.judgeCompletion === true && classifyMessageIntent(options.input).intent === 'action';
+  const objectiveJudgeOptIn = options.judgeCompletion === true;
+  const objectiveJudgeActionIntent = classifyMessageIntent(options.input).intent === 'action';
   const objective = options.input;
   const MAX_OBJECTIVE_JUDGE_CONTINUATIONS = 3;
+  // A turn that fired this many tool calls did real multi-step work, regardless
+  // of how the request was phrased.
+  const OBJECTIVE_JUDGE_WORK_THRESHOLD = 3;
   let objectiveJudgeContinuations = 0;
+  let totalToolCalls = 0;
 
   while (stepIndex < maxSteps) {
     stepIndex += 1;
@@ -1113,6 +1124,7 @@ async function runConversationCore(
       runRunner: options.runRunner,
     });
     lastTurn = turnResult.turn;
+    totalToolCalls += turnResult.toolCalls ?? 0;
 
     // v0.5.19 F2 — elevate budget mid-conversation if the preflight
     // gate just emitted warn/block AND we're still on `standard`.
@@ -1396,9 +1408,15 @@ async function runConversationCore(
       // judge sees no real evidence, inject a continuation and keep working.
       // Bounded + fail-open (judge defaults to done) so it can never wedge.
       if (
-        objectiveJudgeEnabled &&
-        decision.nextAction === 'completed' &&
-        objectiveJudgeContinuations < MAX_OBJECTIVE_JUDGE_CONTINUATIONS
+        shouldRunObjectiveJudge({
+          optIn: objectiveJudgeOptIn,
+          actionIntent: objectiveJudgeActionIntent,
+          totalToolCalls,
+          workThreshold: OBJECTIVE_JUDGE_WORK_THRESHOLD,
+          continuationsUsed: objectiveJudgeContinuations,
+          maxContinuations: MAX_OBJECTIVE_JUDGE_CONTINUATIONS,
+          nextAction: decision.nextAction,
+        })
       ) {
         const responseText = decision.reply && decision.reply.trim() ? decision.reply : decision.summary;
         const verdict = await objectiveJudge(objective, responseText ?? '');

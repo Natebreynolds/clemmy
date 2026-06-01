@@ -23,6 +23,42 @@ export interface ObjectiveJudgeVerdict {
   reason: string;
 }
 
+export interface ObjectiveJudgeGateInput {
+  /** The chat caller opted in (workflow steps never do). */
+  optIn: boolean;
+  /** The objective classified as an explicit ACTION ("build/deploy/set up…"). */
+  actionIntent: boolean;
+  /** Tool calls made across the whole conversation so far. */
+  totalToolCalls: number;
+  /** A turn at/above this many tool calls did substantive multi-step work. */
+  workThreshold: number;
+  /** Independent judge continuations already spent this turn. */
+  continuationsUsed: number;
+  /** Hard cap on judge continuations. */
+  maxContinuations: number;
+  /** The orchestrator's self-declared next action. */
+  nextAction: string;
+}
+
+/**
+ * Whether to run the independent completion judge on a self-declared `done`.
+ *
+ * Gate on OBSERVED WORK, not phrasing. A turn that fired several tool calls did
+ * real multi-step work and is worth verifying — even when the request reads as
+ * a "lookup" ("find me the accounts and drop them in a sheet" classifies as
+ * lookup but is multi-step action). The intent branch keeps the cheap path for
+ * a clearly-phrased ACTION objective. A trivial lookup ("what's on my
+ * calendar") stays below the work threshold and is never judged.
+ */
+export function shouldRunObjectiveJudge(input: ObjectiveJudgeGateInput): boolean {
+  return (
+    input.optIn &&
+    input.nextAction === 'completed' &&
+    input.continuationsUsed < input.maxContinuations &&
+    (input.actionIntent || input.totalToolCalls >= input.workThreshold)
+  );
+}
+
 export type ObjectiveJudgeFn = (
   objective: string,
   assistantResponse: string,
