@@ -416,6 +416,7 @@ export function renderConsoleHtml(token: string): string {
                   <input type="text" class="home-chat-input" data-home-chat-input
                     placeholder="message Clementine…" autocomplete="off" />
                   <button type="submit" class="home-chat-send">SEND ↵</button>
+                  <button type="button" class="home-chat-stop" data-home-chat-stop hidden title="Stop the current turn">■ STOP</button>
                 </form>
               </div>
             </div>
@@ -3831,6 +3832,19 @@ body {
   opacity: 0.5;
   cursor: progress;
 }
+.home-chat-stop {
+  background: transparent;
+  border: 1px solid var(--accent-fail, #ff5a35);
+  color: var(--accent-fail, #ff5a35);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  padding: 6px 14px;
+  cursor: pointer;
+}
+.home-chat-stop:hover { background: var(--accent-fail, #ff5a35); color: var(--bg-0); }
+.home-chat-stop[hidden] { display: none; }
+.home-chat-stop:disabled { opacity: 0.5; cursor: progress; }
 .home-voice-panel {
   position: relative;
   display: grid;
@@ -17949,6 +17963,18 @@ const CONSOLE_JS = `
         await sendHomeChat(text);
       });
     }
+    // STOP — abort the in-flight turn from the composer. The SEND button is
+    // disabled while a turn streams, so this is the only stop affordance the
+    // user has where they are. Hits the harness-session cancel endpoint AND
+    // optimistically ends the local stream so the composer frees instantly.
+    const stopBtn = document.querySelector('[data-home-chat-stop]');
+    if (stopBtn) {
+      stopBtn.addEventListener('click', async () => {
+        stopBtn.setAttribute('disabled', 'true');
+        try { await cancelActiveHarnessTurn(); }
+        finally { stopBtn.removeAttribute('disabled'); }
+      });
+    }
     // 0.3 harness toggle removed — harness is the default chat runtime
     // now. The localStorage key clementine.useHarness stays as a
     // debug-only escape hatch (set to "0" to force legacy v0.2 chat),
@@ -18043,6 +18069,32 @@ const CONSOLE_JS = `
   // Persisted so an app reload can still pick up the last watched chat.
   const HOME_HARNESS_SESSION_KEY = 'clementine.homeHarnessSessionId';
   let __harnessSessionId = null;
+  // Handle to end the CURRENT live SSE stream early (set by
+  // streamHarnessSession while a turn is in flight, cleared when it finishes).
+  // Turns are sequential per the await in sendHarnessChat, so there is only
+  // ever one active stream. Used by cancelActiveHarnessTurn (the STOP button).
+  let __activeHarnessFinish = null;
+
+  // Stop the in-flight turn: fire the server-side kill switch (interrupts at
+  // the next bracket boundary) AND end the local stream immediately so the
+  // composer frees up even if the backend is wedged in a long tool/model call.
+  async function cancelActiveHarnessTurn() {
+    const sid = __harnessSessionId;
+    // Optimistic local stop first — the user gets control back instantly.
+    try { if (typeof __activeHarnessFinish === 'function') __activeHarnessFinish(); }
+    catch (_) {}
+    if (sid) {
+      try {
+        await fetchWithToken('/api/console/harness-sessions/' + encodeURIComponent(sid) + '/cancel', {
+          method: 'POST',
+          headers: { Accept: 'application/json' },
+        });
+      } catch (_) { /* best-effort — the local stop already freed the UI */ }
+    }
+    // The session is now cancelled (a kill switch is set on it); start the
+    // next message on a fresh session so a lingering kill can't pre-empt it.
+    setHomeHarnessSessionId(null);
+  }
 
   function updateHomeChatMeta(text) {
     const meta = document.querySelector('[data-home-chat-meta]');
@@ -18091,6 +18143,8 @@ const CONSOLE_JS = `
   function startThinkingButton(sendBtn) {
     if (!sendBtn) return null;
     sendBtn.setAttribute('disabled', 'true');
+    const stopBtn = document.querySelector('[data-home-chat-stop]');
+    if (stopBtn) stopBtn.removeAttribute('hidden');
     const startedAt = Date.now();
     const update = () => {
       const elapsed = Math.floor((Date.now() - startedAt) / 1000);
@@ -18111,6 +18165,8 @@ const CONSOLE_JS = `
   function stopThinkingButton(sendBtn, timer) {
     if (timer) { try { clearInterval(timer); } catch (_) {} }
     if (sendBtn) { sendBtn.removeAttribute('disabled'); sendBtn.textContent = 'SEND ↵'; }
+    const stopBtn = document.querySelector('[data-home-chat-stop]');
+    if (stopBtn) stopBtn.setAttribute('hidden', '');
   }
 
   /**
@@ -18225,10 +18281,20 @@ const CONSOLE_JS = `
       const finish = () => {
         if (closed) return;
         closed = true;
+        __activeHarnessFinish = null;
         try { if (es) es.close(); } catch (_) {}
         if (fallbackTimer) { try { clearInterval(fallbackTimer); } catch (_) {} fallbackTimer = null; }
         if (idleTimer) { try { clearTimeout(idleTimer); } catch (_) {} idleTimer = null; }
         resolve({ ok: !streamError, error: streamError || null });
+      };
+
+      // Expose an early-stop handle for the composer STOP button. Marks the
+      // turn stopped and resolves the stream; the server-side kill (posted by
+      // cancelActiveHarnessTurn) lands independently at the next checkpoint.
+      __activeHarnessFinish = () => {
+        if (closed) return;
+        setChatTurnStatus(turn, 'stopped');
+        finish();
       };
 
       const failStream = (message) => {
