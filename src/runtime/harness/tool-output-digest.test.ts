@@ -36,12 +36,30 @@ test('JSON array digest reports the true total, field list, and recovery path', 
   assert.match(digest, /recall_tool_result\("call_x1"/);
 });
 
-test('JSON object: digests top-level shape, not raw truncation', () => {
+test('JSON object: shows real CONTENT of nested arrays, not just array(N) shape', () => {
   const obj = { status: 'ok', count: 100, rows: accounts, nested: { a: 1, b: 2 } };
   const digest = digestToolOutput(JSON.stringify(obj), { maxChars: 1500, toolName: 't', callId: 'call_o1' });
   assert.match(digest, /top-level key/);
-  assert.match(digest, /rows: array\(47\)/);
+  // rows is now EXPANDED to real elements + an accurate "+N more of 47", not collapsed to array(47).
+  assert.match(digest, /rows: \[/);
+  assert.match(digest, /"Website":"http/); // actual record content is visible
+  assert.match(digest, /more of 47/);
+  assert.doesNotMatch(digest, /rows: array\(47\)/);
   assert.match(digest, /tool_output_query\("call_o1"/);
+});
+
+test('Composio envelope: digest surfaces the data payload (tables/ids), not data: object(1 keys)', () => {
+  // The exact shape that broke Airtable: a wrapped result whose payload is the
+  // thing the model needs. The old shape-only digest hid it entirely.
+  const tables = Array.from({ length: 8 }, (_, i) => ({
+    id: `tbl${i}AAAAAAAAAAA`, name: `Prospecting ${i}`,
+    fields: Array.from({ length: 12 }, (_, f) => ({ id: `fld${i}_${f}`, name: 'col' + f, type: 'singleLineText' })),
+  }));
+  const envelope = { data: { tables }, successful: true, error: null, logId: 'log_abc' };
+  const digest = digestToolOutput(JSON.stringify(envelope), { maxChars: 2500, toolName: 'composio_execute_tool', callId: 'call_env' });
+  assert.doesNotMatch(digest, /data: object\(1 keys\)/); // the old useless output
+  assert.match(digest, /tbl0AAAAAAAAAAA/);               // a real table id is now visible
+  assert.match(digest, /Prospecting 0/);                 // and its name
 });
 
 test('plain text: head+tail + line/char count, points to recall', () => {

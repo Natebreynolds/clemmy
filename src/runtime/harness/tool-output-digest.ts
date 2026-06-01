@@ -69,6 +69,53 @@ function digestArray(arr: unknown[], totalChars: number, maxChars: number, toolN
   return body + footer;
 }
 
+/**
+ * Render a value showing real CONTENT (not just shape), bounded by `budget`.
+ * Arrays show their first complete elements + "(+N more)"; nested objects
+ * recurse one or two levels then collapse. This is what lets a wrapped result
+ * — e.g. Composio's `{ data: { tables: [...] } }` — surface the actual tables
+ * (ids, names, fields) instead of the useless `data: object(1 keys)` the old
+ * shape-only digest produced for EVERY Composio/MCP return.
+ */
+function renderValue(v: unknown, budget: number, depth: number): string {
+  if (v === null) return 'null';
+  if (typeof v !== 'object') {
+    const s = JSON.stringify(v);
+    if (typeof v === 'string' && s.length > 200) return `${JSON.stringify(v.slice(0, 160))}… (${s.length} chars)`;
+    return s;
+  }
+  if (Array.isArray(v)) {
+    if (v.length === 0) return '[]';
+    const shown: unknown[] = [];
+    let used = 2;
+    for (const el of v) {
+      const s = JSON.stringify(el);
+      if (used + s.length + 2 > budget && shown.length > 0) break;
+      shown.push(el);
+      used += s.length + 2;
+      if (shown.length >= 25) break;
+    }
+    const more = v.length - shown.length;
+    return `${JSON.stringify(shown)}${more > 0 ? ` …(+${more} more of ${v.length})` : ''}`;
+  }
+  const obj = v as Record<string, unknown>;
+  const keys = Object.keys(obj);
+  if (depth >= 3) return `object(${keys.length} keys)`;
+  const parts: string[] = [];
+  let used = 2;
+  let shown = 0;
+  for (const [k, val] of Object.entries(obj)) {
+    const rv = renderValue(val, Math.max(120, budget - used), depth + 1);
+    const seg = `${JSON.stringify(k)}: ${rv}`;
+    if (used + seg.length + 2 > budget && shown > 0) break;
+    parts.push(seg);
+    used += seg.length + 2;
+    shown++;
+  }
+  const moreKeys = keys.length - shown;
+  return `{ ${parts.join(', ')}${moreKeys > 0 ? `, …(+${moreKeys} more key${moreKeys === 1 ? '' : 's'})` : ''} }`;
+}
+
 function digestObject(obj: Record<string, unknown>, totalChars: number, maxChars: number, toolName: string, callId: string | null | undefined): string {
   const entries = Object.entries(obj);
   const lines: string[] = [];
@@ -77,12 +124,10 @@ function digestObject(obj: Record<string, unknown>, totalChars: number, maxChars
   let used = 0;
   let shownKeys = 0;
   for (const [k, v] of entries) {
-    let desc: string;
-    if (v === null) desc = 'null';
-    else if (Array.isArray(v)) desc = `array(${v.length})`;
-    else if (typeof v === 'object') desc = `object(${Object.keys(v as object).length} keys)`;
-    else if (typeof v === 'string') desc = v.length <= 80 ? JSON.stringify(v) : `string(${v.length} chars): ${JSON.stringify(v.slice(0, 77))}…`;
-    else desc = JSON.stringify(v);
+    // Show CONTENT, not just shape — recurse into the value within the
+    // remaining budget so the model sees the actual payload (tables, records,
+    // fields), not `array(N)` / `object(K keys)`.
+    const desc = renderValue(v, Math.max(160, budget - used), 1);
     const line = `  ${k}: ${desc}`;
     if (used + line.length + 1 > budget && shownKeys > 0) break;
     lines.push(line);
