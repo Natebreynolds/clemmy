@@ -168,16 +168,3 @@ test('composioThrownErrorOutput: a THROWN composio error (not-found/auth/APIErro
   assert.match(out, /DISCOVER the real options first|composio_search_tools/);
 });
 
-test('extractComposioIdIndex: surfaces table id=name index from a base-schema result', async () => {
-  const { extractComposioIdIndex } = await import('./composio-tools.js');
-  const schema = { successful: true, data: { tables: [
-    { id: 'tblhR3PKuHx1AfPO5', name: 'Prospecting Accounts', fields: [{ id: 'fld1', name: 'x' }] },
-    { id: 'tblJ3l4l9B5iLUsJq', name: 'Prospecting Contacts' },
-  ] } };
-  const idx = extractComposioIdIndex(schema);
-  assert.match(idx, /tblhR3PKuHx1AfPO5 = Prospecting Accounts/);
-  assert.match(idx, /tblJ3l4l9B5iLUsJq = Prospecting Contacts/);
-  assert.match(idx, /do NOT guess/i);
-  // A non-list result (e.g. a single created record) yields no index.
-  assert.equal(extractComposioIdIndex({ data: { display_url: 'x' } }), '');
-});

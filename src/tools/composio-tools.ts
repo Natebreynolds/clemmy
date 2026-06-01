@@ -154,51 +154,8 @@ export function formatComposioExecuteOutput(
 ): string {
   const body = formatComposioToolOutput(value, options);
   const { failed, summary, notFound } = detectComposioFailure(value);
-  if (failed) {
-    return composioFailureCorrective(summary, { toolName: options.toolName, toolSlug: options.toolSlug, notFound }) + '\n\n' + body;
-  }
-  // Surface the addressable ids ABOVE the clipped/digested body. A schema/list
-  // result (e.g. AIRTABLE_GET_BASE_SCHEMA → data.tables) is large and the
-  // digest drops the ids the model needs to target — which sent it back to
-  // "discover the ids", read a stripped result, then guess and loop. The
-  // compact id index is never clipped, so discovery actually yields usable ids.
-  const idIndex = extractComposioIdIndex(value);
-  return idIndex ? idIndex + '\n\n' + body : body;
-}
-
-/**
- * Pull a compact `id=name` index out of a Composio result that lists
- * addressable resources (Airtable base tables, etc.). The full result gets
- * digested/clipped and can lose the ids; this index is prepended uncllipped so
- * the model always sees the EXACT ids and stops guessing names. Returns '' when
- * the result isn't a resource list.
- */
-export function extractComposioIdIndex(value: unknown): string {
-  if (!isRecord(value)) return '';
-  const data = isRecord(value.data) ? value.data : undefined;
-  if (!data) return '';
-  const arrays: unknown[] = [];
-  const collect = (container: Record<string, unknown>) => {
-    for (const key of ['tables', 'items', 'results', 'views', 'list', 'bases']) {
-      const v = container[key];
-      if (Array.isArray(v)) arrays.push(...v);
-    }
-  };
-  collect(data);
-  if (isRecord(data.data)) collect(data.data); // nested data.data.tables shape
-  const pairs: string[] = [];
-  const seen = new Set<string>();
-  for (const item of arrays) {
-    if (!isRecord(item)) continue;
-    const id = typeof item.id === 'string' ? item.id : typeof item.key === 'string' ? item.key : '';
-    const name = typeof item.name === 'string' ? item.name : typeof item.title === 'string' ? item.title : '';
-    if (!id || !name || seen.has(id)) continue;
-    seen.add(id);
-    pairs.push(`${id} = ${name}`);
-    if (pairs.length >= 40) break;
-  }
-  if (pairs.length === 0) return '';
-  return `📋 Available ids (use these EXACT ids in your next call — do NOT guess names):\n  ${pairs.join('\n  ')}`;
+  if (!failed) return body; // success: the GLOBAL id-index (formatRecallableToolText) handles resource lists
+  return composioFailureCorrective(summary, { toolName: options.toolName, toolSlug: options.toolSlug, notFound }) + '\n\n' + body;
 }
 
 /**
