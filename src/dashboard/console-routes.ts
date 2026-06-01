@@ -144,7 +144,7 @@ import type { CheckInUrgency } from '../agents/check-ins.js';
 import { createBackgroundTask, getBackgroundTask, listBackgroundTasks, processBackgroundTasks } from '../execution/background-tasks.js';
 import { getBackgroundTaskStatus } from '../execution/background-task-status.js';
 import { listRuns } from '../runtime/run-events.js';
-import { listNotifications, markStaleApprovalNotificationsRead } from '../runtime/notifications.js';
+import { addNotification, listNotifications, markStaleApprovalNotificationsRead } from '../runtime/notifications.js';
 import { actionBus, type ActionEvent } from '../runtime/action-bus.js';
 import {
   appendEvent as appendHarnessEvent,
@@ -5459,6 +5459,21 @@ export function registerConsoleRoutes(
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
       const result = await loginWithNativeOAuth();
+      if (result.ok) {
+        // Clear in-app confirmation (the button label flips for only ~2s and is
+        // easy to miss). Also clears the 'codex-auth-revoked' alert's relevance.
+        try {
+          addNotification({
+            id: `codex-reauth-success-${new Date().toISOString()}`,
+            kind: 'system',
+            title: 'Codex sign-in refreshed',
+            body: 'Clementine re-authenticated with ChatGPT/Codex. You can resume where you left off.',
+            createdAt: new Date().toISOString(),
+            read: false,
+            metadata: { reason: 'codex_reauth_success' },
+          });
+        } catch { /* notification is best-effort */ }
+      }
       res.status(result.ok ? 200 : 400).json(result);
     } catch (err) {
       res.status(500).json({ ok: false, message: err instanceof Error ? err.message : String(err) });
