@@ -35,6 +35,24 @@ const DEFAULT_QUEUED_STALL_MS = 5 * 60_000;
  * normal approval wait (the approval card already fired); dedup is per run id.
  */
 const DEFAULT_PARKED_STALL_MS = 60 * 60_000;
+/**
+ * A run that reached a terminal status (completed/error) but never got its
+ * `notifiedAt` marker is a silent report-back failure — the process crashed
+ * between the status write and the notify, or addNotification threw. Surface
+ * it once the marker has had time to land (terminal + notify happen in the
+ * same synchronous tick, so a few minutes is ample).
+ */
+const DEFAULT_TERMINAL_UNNOTIFIED_STALL_MS = 3 * 60_000;
+/**
+ * Upper bound on the terminal-unnotified window. Runs that finished longer ago
+ * than this are not flagged — this is purely to avoid alerting on the entire
+ * historical backlog of pre-marker runs the first time this code ships (those
+ * legacy records have no `notifiedAt` but were already reported back at the
+ * time). Dedup makes each alert one-shot regardless.
+ */
+const DEFAULT_TERMINAL_UNNOTIFIED_MAX_MS = 12 * 60 * 60_000;
+
+const TERMINAL_STATUSES = new Set(['completed', 'error']);
 
 export interface WatchdogRunView {
   id: string;
@@ -43,13 +61,17 @@ export interface WatchdogRunView {
   createdAt?: string;
   /** ISO time the run was checkpointed as parked (run.parked.parkedAt). */
   parkedAt?: string;
+  /** ISO time the run reached a terminal status. */
+  finishedAt?: string;
+  /** ISO time the terminal user notification was delivered (report-back marker). */
+  notifiedAt?: string;
 }
 
 export interface StalledRun {
   id: string;
   workflow: string;
   ageMs: number;
-  reason: 'queued_not_draining' | 'parked_awaiting_approval';
+  reason: 'queued_not_draining' | 'parked_awaiting_approval' | 'terminal_unnotified';
 }
 
 /**
@@ -60,9 +82,11 @@ export interface StalledRun {
 export function findStalledRuns(
   runs: WatchdogRunView[],
   now: number,
-  opts: { queuedStallMs: number; parkedStallMs?: number },
+  opts: { queuedStallMs: number; parkedStallMs?: number; terminalUnnotifiedStallMs?: number; terminalUnnotifiedMaxMs?: number },
 ): StalledRun[] {
   const parkedStallMs = opts.parkedStallMs ?? DEFAULT_PARKED_STALL_MS;
+  const terminalStallMs = opts.terminalUnnotifiedStallMs ?? DEFAULT_TERMINAL_UNNOTIFIED_STALL_MS;
+  const terminalMaxMs = opts.terminalUnnotifiedMaxMs ?? DEFAULT_TERMINAL_UNNOTIFIED_MAX_MS;
   const out: StalledRun[] = [];
   for (const run of runs) {
     const status = run.status ?? 'queued';
@@ -84,6 +108,15 @@ export function findStalledRuns(
       if (ageMs >= parkedStallMs) {
         out.push({ id: run.id, workflow: run.workflow, ageMs, reason: 'parked_awaiting_approval' });
       }
+    } else if (TERMINAL_STATUSES.has(status) && !run.notifiedAt) {
+      // Reached terminal but the report-back marker never landed — the notify
+      // crashed or was lost. Surface it inside a bounded window (see constants).
+      const finished = run.finishedAt ? Date.parse(run.finishedAt) : Number.NaN;
+      if (!Number.isFinite(finished)) continue;
+      const ageMs = now - finished;
+      if (ageMs >= terminalStallMs && ageMs <= terminalMaxMs) {
+        out.push({ id: run.id, workflow: run.workflow, ageMs, reason: 'terminal_unnotified' });
+      }
     }
   }
   return out;
@@ -101,6 +134,35 @@ function queuedStallMs(): number {
 function parkedStallMs(): number {
   const raw = Number.parseInt(getRuntimeEnv('CLEMMY_WORKFLOW_PARKED_STALL_MS', '') || '', 10);
   return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_PARKED_STALL_MS;
+}
+
+/** Reason-specific alert copy for a stalled run. */
+function watchdogAlert(run: StalledRun, minutes: number): { title: string; body: string } {
+  switch (run.reason) {
+    case 'parked_awaiting_approval':
+      return {
+        title: `Workflow waiting on approval: ${run.workflow}`,
+        body:
+          `Run \`${run.id}\` for **${run.workflow}** has been parked on an approval for ${minutes} min. ` +
+          `Approve or decline it in Console → Activity, or it will keep waiting.`,
+      };
+    case 'terminal_unnotified':
+      return {
+        title: `Workflow finished but its result wasn't delivered: ${run.workflow}`,
+        body:
+          `Run \`${run.id}\` for **${run.workflow}** reached a terminal state ${minutes} min ago but never reported back ` +
+          `(the notification was lost — likely a restart mid-finish). Open Console → Activity to see the result.`,
+      };
+    case 'queued_not_draining':
+    default:
+      return {
+        title: `Workflow stuck in queue: ${run.workflow}`,
+        body:
+          `Run \`${run.id}\` for **${run.workflow}** has been queued ${minutes} min without starting — the run queue isn't draining. ` +
+          `Likely the workflow is disabled, or the daemon is busy/stuck on another run. ` +
+          `Open Console → Activity to check, or restart Clementine to drain the queue.`,
+      };
+  }
 }
 
 /**
@@ -123,21 +185,26 @@ export function runWorkflowWatchdog(now: number = Date.now()): { stalled: number
     }
   }
 
-  const stalled = findStalledRuns(runs, now, { queuedStallMs: queuedStallMs() });
+  const stalled = findStalledRuns(runs, now, { queuedStallMs: queuedStallMs(), parkedStallMs: parkedStallMs() });
   for (const run of stalled) {
     const minutes = Math.max(1, Math.round(run.ageMs / 60_000));
+    const alert = watchdogAlert(run, minutes);
     addNotification({
-      // Stable id → dedupes to exactly one alert per stuck run.
-      id: `workflow-stalled-${run.id}`,
+      // Stable id → dedupes to one alert per stuck run. The two pre-existing
+      // reasons (queued_not_draining, parked_awaiting_approval) keep the
+      // original `workflow-stalled-<id>` key so this change does NOT re-fire
+      // alerts already delivered to deployed users. Only the NEW
+      // terminal_unnotified reason gets its own namespace (a run can be parked
+      // and later finish unnotified — distinct, both worth surfacing).
+      id: run.reason === 'terminal_unnotified'
+        ? `workflow-stalled-terminal-${run.id}`
+        : `workflow-stalled-${run.id}`,
       kind: 'workflow',
-      title: `Workflow stuck in queue: ${run.workflow}`,
-      body:
-        `Run \`${run.id}\` for **${run.workflow}** has been queued ${minutes} min without starting — the run queue isn't draining. ` +
-        `Likely the workflow is disabled, or the daemon is busy/stuck on another run. ` +
-        `Open Console → Activity to check, or restart Clementine to drain the queue.`,
+      title: alert.title,
+      body: alert.body,
       createdAt: new Date(now).toISOString(),
       read: false,
-      metadata: { workflow: run.workflow, runId: run.id, stalled: true, ageMs: run.ageMs },
+      metadata: { workflow: run.workflow, runId: run.id, stalled: true, reason: run.reason, ageMs: run.ageMs },
     });
   }
 

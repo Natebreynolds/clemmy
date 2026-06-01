@@ -104,3 +104,52 @@ test('findStalledRuns falls back to createdAt for a legacy parked run with no pa
   assert.equal(stalled.length, 1);
   assert.equal(stalled[0].reason, 'parked_awaiting_approval');
 });
+
+// ── terminal-unnotified report-back backstop ────────────────────────
+
+test('flags a completed run that finished past the threshold but was never notified', () => {
+  const runs: WatchdogRunView[] = [
+    { id: 't1', workflow: 'wf', status: 'completed', finishedAt: iso(5 * 60_000) },
+  ];
+  const stalled = findStalledRuns(runs, T0, { queuedStallMs: FIVE_MIN });
+  assert.equal(stalled.length, 1);
+  assert.equal(stalled[0].id, 't1');
+  assert.equal(stalled[0].reason, 'terminal_unnotified');
+});
+
+test('flags an errored run that was never notified', () => {
+  const runs: WatchdogRunView[] = [
+    { id: 't2', workflow: 'wf', status: 'error', finishedAt: iso(10 * 60_000) },
+  ];
+  const stalled = findStalledRuns(runs, T0, { queuedStallMs: FIVE_MIN });
+  assert.equal(stalled.length, 1);
+  assert.equal(stalled[0].reason, 'terminal_unnotified');
+});
+
+test('does NOT flag a terminal run that WAS notified', () => {
+  const runs: WatchdogRunView[] = [
+    { id: 't3', workflow: 'wf', status: 'completed', finishedAt: iso(10 * 60_000), notifiedAt: iso(10 * 60_000) },
+  ];
+  assert.equal(findStalledRuns(runs, T0, { queuedStallMs: FIVE_MIN }).length, 0);
+});
+
+test('does NOT flag a just-finished terminal run (notify may still be landing this tick)', () => {
+  const runs: WatchdogRunView[] = [
+    { id: 't4', workflow: 'wf', status: 'completed', finishedAt: iso(30_000) },
+  ];
+  assert.equal(findStalledRuns(runs, T0, { queuedStallMs: FIVE_MIN }).length, 0);
+});
+
+test('does NOT flag an ancient unnotified terminal run (outside the backlog window)', () => {
+  const runs: WatchdogRunView[] = [
+    { id: 't5', workflow: 'wf', status: 'completed', finishedAt: iso(24 * 60 * 60_000) },
+  ];
+  assert.equal(findStalledRuns(runs, T0, { queuedStallMs: FIVE_MIN }).length, 0);
+});
+
+test('skips a terminal-unnotified run with no finishedAt (cannot age it)', () => {
+  const runs: WatchdogRunView[] = [
+    { id: 't6', workflow: 'wf', status: 'completed' },
+  ];
+  assert.equal(findStalledRuns(runs, T0, { queuedStallMs: FIVE_MIN }).length, 0);
+});

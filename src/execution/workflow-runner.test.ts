@@ -41,7 +41,9 @@ const {
   workflowRunnerInternalsForTest,
   explainDeterministicSpawnError,
   reapResolvedParkedRuns,
+  executeStep,
 } = await import('./workflow-runner.js');
+const { readWorkflowEvents } = await import('./workflow-events.js');
 const { HarnessSession } = await import('../runtime/harness/session.js');
 const { resetEventLog } = await import('../runtime/harness/eventlog.js');
 const approvalRegistry = await import('../runtime/harness/approval-registry.js');
@@ -180,14 +182,15 @@ test('applySkillToPrompt: injects skill body when usesSkill resolves', () => {
   assert.ok(out.indexOf('=== SKILL') < out.indexOf('=== STEP TASK'), 'skill precedes task');
 });
 
-test('applySkillToPrompt: missing skill yields warning header but preserves prompt', () => {
-  const out = applySkillToPrompt(
-    { id: 'a', prompt: 'do thing', usesSkill: 'does-not-exist' },
-    'do thing carefully',
+test('applySkillToPrompt: missing skill fails loud (no silent downgrade)', () => {
+  assert.throws(
+    () => applySkillToPrompt(
+      { id: 'a', prompt: 'do thing', usesSkill: 'does-not-exist' },
+      'do thing carefully',
+    ),
+    /does-not-exist/,
+    'a missing declared skill must throw so the step fails and reports back, not run the raw prompt',
   );
-  assert.ok(out.includes('WARNING'), 'warning surfaced');
-  assert.ok(out.includes('does-not-exist'), 'mistyped name surfaced for debugging');
-  assert.ok(out.includes('do thing carefully'), 'prompt still present so the run can proceed');
 });
 
 test('applySkillToPrompt: empty usesSkill string is treated as unset', () => {
@@ -368,6 +371,45 @@ test('deterministic workflow step rejects runners outside scripts/', async () =>
     }),
     /inside the workflow scripts|outside scripts|must stay inside/,
   );
+});
+
+test('deterministic step ENFORCES its output contract (regression guard: routes through finalizeStepOutput)', async () => {
+  const scriptsDir = path.join(tmp, 'vault', '00-System', 'workflows', 'det-contract-test', 'scripts');
+  mkdirSync(scriptsDir, { recursive: true });
+  writeFileSync(
+    path.join(scriptsDir, 'emit.mjs'),
+    [
+      'let i = ""; process.stdin.setEncoding("utf-8");',
+      'process.stdin.on("data", (c) => i += c);',
+      'process.stdin.on("end", () => process.stdout.write(JSON.stringify({ ok: true })));',
+    ].join('\n'),
+    'utf-8',
+  );
+  const mkCtx = (runId: string) => ({
+    workflow: { name: 'Det Contract Test', steps: [] },
+    workflowSlug: 'det-contract-test',
+    runId,
+    inputs: {},
+    stepOutputs: {},
+    assistant: {},
+    completedItems: new Map(),
+    forEachFailures: [],
+  } as unknown as Parameters<typeof executeStep>[1]);
+
+  // The script emits { ok: true }; the contract requires a `url` key → the
+  // deterministic step must FAIL its contract (previously this was silently
+  // accepted because the deterministic path bypassed verification).
+  const failStep = { id: 'd_fail', prompt: 'x', deterministic: { runner: 'emit.mjs' }, output: { type: 'object', required_keys: ['url'] } } as unknown as Parameters<typeof executeStep>[0];
+  await assert.rejects(() => executeStep(failStep, mkCtx('det-fail')), /failed its contract/);
+  const failKinds = readWorkflowEvents('det-contract-test', 'det-fail').map((e) => e.kind);
+  assert.ok(failKinds.includes('step_failed'), 'deterministic contract violation → step_failed');
+  assert.ok(!failKinds.includes('step_completed'), 'deterministic contract violation must NOT record step_completed');
+
+  // No declared contract → unverified, completes (backward-compatible).
+  const okStep = { id: 'd_ok', prompt: 'x', deterministic: { runner: 'emit.mjs' } } as unknown as Parameters<typeof executeStep>[0];
+  const out = await executeStep(okStep, mkCtx('det-ok'));
+  assert.deepEqual(out, { ok: true });
+  assert.ok(readWorkflowEvents('det-contract-test', 'det-ok').map((e) => e.kind).includes('step_completed'));
 });
 
 // Cleanup the temp BASE_DIR.

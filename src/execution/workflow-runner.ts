@@ -237,6 +237,15 @@ interface QueuedRunRecord {
    * driven by events.jsonl / computeResumeState).
    */
   parked?: ParkedRunState;
+  /**
+   * Report-back backstop (north star: REPORTS BACK WITHOUT FAIL). Set
+   * once the terminal (completed/error) user notification has been
+   * delivered. A terminal run that reaches its finishedAt but never gets
+   * this marker — because the process crashed between the status write and
+   * the notify, or addNotification threw — is surfaced by the watchdog so
+   * the result never dies silently.
+   */
+  notifiedAt?: string;
 }
 
 interface ParkedStepRef {
@@ -261,6 +270,20 @@ function readRunRecord(filePath: string): QueuedRunRecord | null {
 
 function writeRunRecord(filePath: string, record: QueuedRunRecord): void {
   writeFileSync(filePath, JSON.stringify(record, null, 2), 'utf-8');
+}
+
+/**
+ * Stamp `notifiedAt` on a terminal run AFTER its user notification has been
+ * delivered. Call immediately after the terminal addNotification — if the
+ * notify throws or the process dies before this runs, the marker stays unset
+ * and the watchdog re-surfaces the run. Best-effort: a failed marker write is
+ * the same failure mode the watchdog already covers, so never let it throw.
+ */
+function markRunNotified(filePath: string): void {
+  try {
+    const rec = readRunRecord(filePath);
+    if (rec) writeRunRecord(filePath, { ...rec, notifiedAt: new Date().toISOString() });
+  } catch { /* best-effort; watchdog backstops an unmarked terminal run */ }
 }
 
 class WorkflowRunCancelledError extends Error {
@@ -322,21 +345,26 @@ function throwIfWorkflowRunCancelled(runId: string): void {
  * When the step declares `usesSkill`, load the skill's SKILL.md body
  * and prepend it to the rendered prompt with explicit delimiters so the
  * model can distinguish HOW (the skill instructions) from WHAT (the
- * step task). Missing or malformed skills are surfaced as a one-line
- * warning header — the step still runs with the raw prompt so a
- * mistyped name doesn't silently strip context.
+ * step task).
+ *
+ * FAIL LOUD (no silent downgrade): when a step declares `usesSkill` but the
+ * skill isn't installed at run time, throw so the step fails with a clear
+ * error and reports back — never run the raw prompt without the declared
+ * instructions, which produces unpredictable output. Author/enable-time
+ * `checkSkillReference` already blocks unknown skills at create/enable; this
+ * closes the run-time window (skill removed or unsynced after authoring).
  */
 export function applySkillToPrompt(step: WorkflowStepInput, rendered: string): string {
   const skillName = step.usesSkill?.trim();
   if (!skillName) return rendered;
   const skill = loadSkill(skillName);
   if (!skill) {
-    logger.warn({ stepId: step.id, usesSkill: skillName }, 'workflow step references skill that is not installed; running with raw prompt');
-    return [
-      `# WARNING: skill "${skillName}" is not installed; running this step without it.`,
-      '',
-      rendered,
-    ].join('\n');
+    logger.error({ stepId: step.id, usesSkill: skillName }, 'workflow step references skill that is not installed; failing step');
+    throw new Error(
+      `Step "${step.id}" declares usesSkill "${skillName}" but that skill is not installed `
+      + '— refusing to run the step without its instructions. Install/sync the skill, or remove '
+      + 'the usesSkill reference from the step.',
+    );
   }
   const skillBody = (skill.body || '').trim();
   if (!skillBody) return rendered;
@@ -1153,31 +1181,24 @@ function bindStepContext(
 }
 
 /**
- * P4 typed-contract EXIT half (flag WORKFLOW_CONTRACT_OUTPUT, default off).
- * Run executeStep, then — when the step declared an `output` contract —
- * verify the emitted value actually matches it (type / required_keys /
- * verify.path_exists / verify.url_present). A contract failure is a real
- * failure: emit step_failed + throw so the run reports back loudly instead
- * of feeding malformed or fabricated data downstream (the revill
- * "claimed success, no URL" class). Flag-off → no verification, today's path.
- */
-function contractOutputEnabled(): boolean {
-  return (getRuntimeEnv('WORKFLOW_CONTRACT_OUTPUT', 'off') ?? 'off').toLowerCase() === 'on';
-}
-
-/**
- * P4 step retry (flag WORKFLOW_STEP_RETRY, default off). A step that fails
- * with a TRANSIENT error (network blip, timeout, 5xx, rate-limit) is
- * retried up to its declared `retryBudget` with exponential backoff, so a
+ * Typed-contract EXIT half — now UNCONDITIONAL (the WORKFLOW_CONTRACT_OUTPUT
+ * rollout flag was removed per feedback_no_rollout_flags; validated behavior
+ * is the default). When a step declares an `output` contract, the runner
+ * verifies the emitted value actually matches it (type / required_keys /
+ * verify.path_exists / verify.url_present) BEFORE recording step_completed. A
+ * contract failure is a real failure: emit step_failed + throw so the run
+ * reports back loudly instead of feeding malformed or fabricated data
+ * downstream (the revill "claimed success, no URL" class). A step with NO
+ * declared contract is unverified — byte-identical to before — so existing
+ * workflows are unaffected; the contract IS the per-step opt-in.
+ *
+ * Step retry is likewise unconditional (WORKFLOW_STEP_RETRY removed): a step
+ * that fails with a TRANSIENT error (network blip, timeout, 5xx, rate-limit)
+ * is retried up to its declared `retryBudget` with exponential backoff, so a
  * momentary hiccup doesn't halt a long-running workflow. Deterministic
- * failures (bad input, contract mismatch, approval rejection) are NOT
- * retried — retrying them just burns time and tokens. Flag-off or
- * retryBudget=0 → today's behavior (fail on first throw).
+ * failures (bad input, contract mismatch, approval rejection) are NEVER
+ * retried. retryBudget defaults to 0 → no retry unless the step opts in.
  */
-function stepRetryEnabled(): boolean {
-  return (getRuntimeEnv('WORKFLOW_STEP_RETRY', 'off') ?? 'off').toLowerCase() === 'on';
-}
-
 const RETRY_BACKOFF_BASE_MS = parseInt(
   process.env.CLEMENTINE_WORKFLOW_RETRY_BASE_MS ?? '2000', 10,
 );
@@ -1246,7 +1267,7 @@ async function executeStepVerified(
   step: WorkflowStepInput,
   ctx: StepExecutionContext,
 ): Promise<unknown> {
-  const budget = stepRetryEnabled() && step.retryBudget && step.retryBudget > 0 ? step.retryBudget : 0;
+  const budget = step.retryBudget && step.retryBudget > 0 ? step.retryBudget : 0;
   // Retry loop wraps EXECUTION only. Verification (below) is deterministic
   // and never retried. Park/cancel signals propagate immediately (they are
   // not "retryable").
@@ -1285,14 +1306,14 @@ async function executeStepVerified(
  * straight step_completed emit, byte-identical to before. Every step shape
  * (deterministic / forEach / plain / synthesis) routes through this.
  */
-function finalizeStepOutput(
+export function finalizeStepOutput(
   workflowSlug: string,
   runId: string,
   step: WorkflowStepInput,
   output: unknown,
   meta?: Record<string, unknown>,
 ): unknown {
-  if (contractOutputEnabled() && step.output) {
+  if (step.output) {
     const result = verifyStepOutput(step.output, output);
     if (!result.ok) {
       const message = `Step "${step.id}" output failed its contract: ${result.problems.join('; ')}`;
@@ -1314,7 +1335,7 @@ function finalizeStepOutput(
   return output;
 }
 
-async function executeStep(
+export async function executeStep(
   step: WorkflowStepInput,
   ctx: StepExecutionContext,
 ): Promise<unknown> {
@@ -1338,8 +1359,9 @@ async function executeStep(
       stepId: step.id,
       meta: { mode: 'deterministic', runner: step.deterministic.runner },
     });
+    let detOutput: unknown;
     try {
-      const output = await runDeterministicWorkflowStep(step.deterministic.runner, {
+      detOutput = await runDeterministicWorkflowStep(step.deterministic.runner, {
         workflow: ctx.workflow.name,
         workflowSlug: ctx.workflowSlug,
         runId: ctx.runId,
@@ -1347,13 +1369,6 @@ async function executeStep(
         inputs: ctx.inputs,
         stepOutputs: ctx.stepOutputs,
       });
-      appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
-        kind: 'step_completed',
-        stepId: step.id,
-        output,
-        meta: { mode: 'deterministic', runner: step.deterministic.runner },
-      });
-      return output;
     } catch (err) {
       appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
         kind: 'step_failed',
@@ -1363,6 +1378,15 @@ async function executeStep(
       });
       throw err;
     }
+    // Route through the SAME verification chokepoint as forEach/plain/synthesis
+    // so a deterministic step's declared output contract is enforced BEFORE
+    // step_completed is recorded — never silently bypassed. (finalizeStepOutput
+    // emits step_failed + throws on a contract violation; the throw is a
+    // deterministic error so the retry wrapper above won't re-run it.)
+    return finalizeStepOutput(ctx.workflowSlug, ctx.runId, step, detOutput, {
+      mode: 'deterministic',
+      runner: step.deterministic.runner,
+    });
   }
 
   // 2. forEach — iterate an upstream output with bounded concurrency.
@@ -1927,6 +1951,7 @@ async function processOneRunFile(
         read: false,
         metadata: { workflow: run.workflow, runId: run.id },
       });
+      markRunNotified(filePath);
       return;
     }
     // TRY (single-step) runs bypass the workflow enabled gate — they're
@@ -1950,6 +1975,7 @@ async function processOneRunFile(
         read: false,
         metadata: { workflow: workflow.data.name, runId: run.id },
       });
+      markRunNotified(filePath);
       return;
     }
 
@@ -1977,6 +2003,7 @@ async function processOneRunFile(
         read: false,
         metadata: { workflow: workflow.data.name, runId: run.id, status: 'error' },
       });
+      markRunNotified(filePath);
       logger.warn({ workflow: workflow.data.name, runId: run.id, missingInputs }, 'Workflow run rejected before start: missing required inputs');
       return;
     }
@@ -2115,6 +2142,7 @@ async function processOneRunFile(
           proposedFixId: proposedFix?.id,
         },
       });
+      markRunNotified(filePath);
       try {
         finishRun(run.id, {
           status: 'completed',
@@ -2188,6 +2216,7 @@ async function processOneRunFile(
         read: false,
         metadata: { workflow: run.workflow, runId: run.id, status: cancelled ? 'cancelled' : 'error' },
       });
+      markRunNotified(filePath);
       try {
         finishRun(run.id, {
           status: cancelled ? 'cancelled' : 'failed',
