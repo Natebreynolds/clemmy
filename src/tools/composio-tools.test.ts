@@ -94,6 +94,30 @@ test('detectComposioFailure: flags Composio API error shapes, ignores successes'
   assert.equal(detectComposioFailure('a plain string').failed, false);
 });
 
+test('detectComposioFailure: flags the NOT-FOUND (wrong table/record/object) case distinctly', () => {
+  // The live Airtable shape — fused permissions/not-found → treat as not-found.
+  const air = detectComposioFailure({ successful: false, data: { http_error: '403', message: 'Airtable API error (INVALID_PERMISSIONS_OR_MODEL_NOT_FOUND): …' } });
+  assert.equal(air.failed, true);
+  assert.equal(air.notFound, true);
+  // Other not-found vocabularies.
+  assert.equal(detectComposioFailure({ successful: false, error: 'Table "Current Prospects" not found' }).notFound, true);
+  assert.equal(detectComposioFailure({ successful: false, error: 'no such object: Foo__c' }).notFound, true);
+  // A plain bad-request that is NOT a not-found stays generic.
+  assert.equal(detectComposioFailure({ successful: false, data: { status_code: 400, message: 'missing required field title' } }).notFound, false);
+});
+
+test('formatComposioExecuteOutput: NOT-FOUND failures tell her to DISCOVER ids, not guess', () => {
+  resetEventLog();
+  const notFound = { successful: false, data: { http_error: '403', message: 'Airtable API error (INVALID_PERMISSIONS_OR_MODEL_NOT_FOUND): …' } };
+  const out = formatComposioExecuteOutput(notFound, { toolSlug: 'AIRTABLE_LIST_RECORDS' });
+  assert.match(out, /NOT FOUND \(slug=AIRTABLE_LIST_RECORDS\)/);
+  assert.match(out, /DISCOVER the real options first/);
+  assert.match(out, /AIRTABLE_GET_BASE_SCHEMA/);
+  assert.match(out, /Do NOT guess/);
+  // Not a generic "fix the arguments" message — it's the discovery path.
+  assert.doesNotMatch(out, /SAME arguments will return the SAME error/);
+});
+
 test('formatComposioExecuteOutput: prepends a do-not-retry corrective on a failed call', () => {
   resetEventLog();
   const failed = {
@@ -126,7 +150,8 @@ test('detectComposioFailure: successful:true with an advisory error string is NO
 
 test('formatComposioExecuteOutput: header names the actual tool (cx_<slug> path), not always composio_execute_tool', () => {
   resetEventLog();
-  const failed = { successful: false, data: { http_error: '404 Not Found', status_code: 404 } };
+  // A generic (non-not-found) validation error → the "FAILED" corrective, named by the actual tool.
+  const failed = { successful: false, data: { status_code: 400, message: 'missing required field title' } };
   const out = formatComposioExecuteOutput(failed, { toolName: 'cx_airtable_create_records', toolSlug: 'AIRTABLE_CREATE_RECORDS' });
   assert.match(out, /cx_airtable_create_records FAILED \(slug=AIRTABLE_CREATE_RECORDS\)/);
 });
@@ -137,7 +162,8 @@ test('composioThrownErrorOutput: a THROWN composio error (not-found/auth/APIErro
     new Error('ComposioToolNotFoundError: no such slug AIRTABLE_FROB'),
     { toolName: 'composio_execute_tool', toolSlug: 'AIRTABLE_FROB' },
   );
-  assert.match(out, /FAILED \(slug=AIRTABLE_FROB\)/);
+  // A ToolNotFound throw is a not-found → routes to the discover-the-options corrective.
+  assert.match(out, /NOT FOUND \(slug=AIRTABLE_FROB\)/);
   assert.match(out, /ComposioToolNotFoundError/);
-  assert.match(out, /Do NOT repeat this identical call/);
+  assert.match(out, /DISCOVER the real options first|composio_search_tools/);
 });

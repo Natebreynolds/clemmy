@@ -53,8 +53,17 @@ export interface FormatComposioToolOutputOptions {
  * the loop guard. We classify strictly off Composio's own error markers so
  * synthesized outputs (status/search/list) never false-positive.
  */
-export function detectComposioFailure(value: unknown): { failed: boolean; summary: string } {
-  if (!isRecord(value)) return { failed: false, summary: '' };
+/** A failure whose cause is "the thing you referenced doesn't exist" — a wrong
+ *  table/object/record/field id, not a permissions or connection problem. The
+ *  cure is to DISCOVER the valid ids (list/schema), not to guess another name.
+ *  Note: Airtable fuses both into INVALID_PERMISSIONS_OR_MODEL_NOT_FOUND, so we
+ *  treat that as not-found-capable and tell the model to list options first. */
+const COMPOSIO_NOT_FOUND_RE =
+  /INVALID_PERMISSIONS_OR_MODEL_NOT_FOUND|model[_\s-]?not[_\s-]?found|not[_\s-]?found|no such (?:table|object|record|model|view|base|field|column)|unknown (?:table|object|record|field|column)|does\s*n.?t exist|could not be found|NOT_FOUND/i;
+
+export function detectComposioFailure(value: unknown): { failed: boolean; summary: string; notFound: boolean } {
+  const none = { failed: false, summary: '', notFound: false } as const;
+  if (!isRecord(value)) return { ...none };
   const data = isRecord(value.data) ? value.data : undefined;
   // Authoritative markers: `successful === false` and `http_error` are
   // composio's own failure envelope. `status_code >= 400` and a bare top-level
@@ -70,13 +79,16 @@ export function detectComposioFailure(value: unknown): { failed: boolean; summar
     httpError.length > 0 ||
     (statusCode !== undefined && statusCode >= 400) ||
     (topError.length > 0 && !explicitSuccess);
-  if (!failed) return { failed: false, summary: '' };
+  if (!failed) return { ...none };
   const dataMessage = data && typeof data.message === 'string' ? data.message : '';
   const summary = (httpError || topError || dataMessage || `status ${statusCode ?? 'error'}`)
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, 240);
-  return { failed: true, summary };
+  // Test not-found against ALL the error fields, not just the one that won the
+  // summary — Airtable puts http_error="403" but the not-found phrase in message.
+  const notFound = COMPOSIO_NOT_FOUND_RE.test(`${httpError} ${topError} ${dataMessage}`);
+  return { failed: true, summary, notFound };
 }
 
 /** Loud, self-correcting header prepended to a failed Composio execution so
@@ -85,10 +97,20 @@ export function detectComposioFailure(value: unknown): { failed: boolean; summar
  *  `cx_<slug>`) and the slug, so the corrective is unambiguous on both paths. */
 function composioFailureCorrective(
   summary: string,
-  opts: { toolName?: string; toolSlug?: string } = {},
+  opts: { toolName?: string; toolSlug?: string; notFound?: boolean } = {},
 ): string {
   const label = opts.toolName || 'composio_execute_tool';
   const where = opts.toolSlug ? ` (slug=${opts.toolSlug})` : '';
+  if (opts.notFound) {
+    // The referenced resource (table/object/record/field id) doesn't exist or
+    // wasn't matched — DISCOVER the valid ids, don't guess another name. This
+    // is general: list/schema action exists for every toolkit.
+    return [
+      `⚠️ ${label} NOT FOUND${where}: ${summary}`,
+      `This is almost certainly a WRONG identifier (table/object/record/field), NOT a permissions or connection problem — the connection works, the id you used doesn't exist.`,
+      `Do this, in order: (1) DISCOVER the real options first — call the toolkit's schema/list action (e.g. AIRTABLE_GET_BASE_SCHEMA for a base's tables, GOOGLESHEETS list, SALESFORCE describe, or composio_search_tools) and read the EXACT ids it returns; (2) retry with one of those exact ids. Do NOT guess another table/field name — guessing returns the same not-found error.`,
+    ].join('\n');
+  }
   return [
     `⚠️ ${label} FAILED${where}: ${summary}`,
     `This is a HARD failure — calling it again with the SAME arguments will return the SAME error.`,
@@ -131,9 +153,9 @@ export function formatComposioExecuteOutput(
   options: FormatComposioToolOutputOptions = {},
 ): string {
   const body = formatComposioToolOutput(value, options);
-  const { failed, summary } = detectComposioFailure(value);
+  const { failed, summary, notFound } = detectComposioFailure(value);
   if (!failed) return body;
-  return composioFailureCorrective(summary, { toolName: options.toolName, toolSlug: options.toolSlug }) + '\n\n' + body;
+  return composioFailureCorrective(summary, { toolName: options.toolName, toolSlug: options.toolSlug, notFound }) + '\n\n' + body;
 }
 
 /**
@@ -150,8 +172,9 @@ export function composioThrownErrorOutput(
 ): string {
   const message = (err instanceof Error ? err.message : String(err)).replace(/\s+/g, ' ').trim();
   const summary = message.slice(0, 240) || 'unknown error';
+  const notFound = COMPOSIO_NOT_FOUND_RE.test(message);
   const body = formatComposioToolOutput({ error: message, toolSlug: options.toolSlug ?? null }, options);
-  return composioFailureCorrective(summary, { toolName: options.toolName, toolSlug: options.toolSlug }) + '\n\n' + body;
+  return composioFailureCorrective(summary, { toolName: options.toolName, toolSlug: options.toolSlug, notFound }) + '\n\n' + body;
 }
 
 /** Run a Composio execution and format BOTH outcomes through the corrective
