@@ -134,6 +134,40 @@ test('workflow_create accepts an inputs SCHEMA as a JSON string and persists it'
   assert.deepEqual(entry!.data.inputs, { url: { type: 'string', description: 'Site to audit' } });
 });
 
+test('workflow_create persists a step OUTPUT contract (declarable verification unlock)', async () => {
+  const contract = { type: 'object' as const, required_keys: ['url'], verify: { url_present: ['url'] }, description: 'the created sheet' };
+  const result = await workflowCreate()({
+    name: 'contract-wf',
+    description: 'Build a sheet and return its URL.',
+    steps: [{ id: 'deliver', prompt: 'Create the sheet and return its URL.', output: contract }],
+  });
+  assert.match(resultText(result), /Created workflow "contract-wf"/);
+  assert.deepEqual(readWorkflow('contract-wf')!.data.steps[0].output, contract);
+});
+
+test('workflow_create without an output contract leaves step.output undefined (no-regression)', async () => {
+  await workflowCreate()({
+    name: 'plain-wf',
+    description: 'x',
+    steps: [{ id: 's', prompt: 'Fetch and summarize the prospect site.' }],
+  });
+  assert.equal(readWorkflow('plain-wf')!.data.steps[0].output, undefined);
+});
+
+test('workflow_update can add an output contract to an existing step', async () => {
+  await workflowCreate()({
+    name: 'upc-wf',
+    description: 'x',
+    steps: [{ id: 's', prompt: 'Fetch and summarize the prospect site.' }],
+  });
+  const contract = { type: 'object' as const, required_keys: ['summary'] };
+  await workflowUpdate()({
+    name: 'upc-wf',
+    steps: [{ id: 's', prompt: 'Fetch and summarize the prospect site.', output: contract }],
+  });
+  assert.deepEqual(readWorkflow('upc-wf')!.data.steps[0].output, contract);
+});
+
 test('workflow_create rejects malformed inputs schema JSON without creating', async () => {
   const result = await workflowCreate()({
     name: 'bad-wf',

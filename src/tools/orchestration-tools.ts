@@ -92,6 +92,33 @@ export function parseWorkflowInputsSchemaJson(
   return parsed as Record<string, { type?: 'string' | 'number'; default?: string; description?: string }>;
 }
 
+/**
+ * Step OUTPUT contract (WorkflowStepOutputContract). Shared by workflow_create
+ * + workflow_update so authors can DECLARE what a step produces. Optional, by
+ * design: a step with no `output` is unverified — byte-identical to before
+ * (the gradual-typing / Dagster-asset-check posture). When declared, the engine
+ * verifies the step's output against it before recording completion
+ * (verifyStepOutput, runtime-enforced). Named properties (not an open map), so
+ * it fills reliably under strict-mode function-calling.
+ */
+const WorkflowStepOutputContractSchema = z.object({
+  type: z.enum(['string', 'number', 'boolean', 'object', 'array']).optional()
+    .describe('The shape the step must produce.'),
+  required_keys: z.array(z.string()).optional()
+    .describe('For an object output: top-level keys that must be present and non-null.'),
+  verify: z.object({
+    path_exists: z.array(z.string()).optional()
+      .describe('Dot-paths in the output whose value must be an existing file path.'),
+    url_present: z.array(z.string()).optional()
+      .describe('Dot-paths in the output whose value must be a non-empty http(s) URL.'),
+  }).optional()
+    .describe('Concrete-handle checks — confirm the named output values are REAL (a file that exists, a non-empty URL), so "produced a brief" cannot pass when the file/URL does not actually exist.'),
+  description: z.string().optional().describe('One-line note on what this step produces.'),
+});
+
+const STEP_OUTPUT_CONTRACT_DESC =
+  'OPTIONAL output contract — what this step PRODUCES. When declared, the engine verifies the step output against it BEFORE recording completion; a violation fails the step loudly (reports back) instead of feeding bad data to the next step. Declare it on any step whose output a later step depends on, and ALWAYS on the step that produces the final deliverable (e.g. a created sheet/file/URL), so the result is verified, not just claimed. Omit it for free-form/conversational steps.';
+
 interface CronJobRecord {
   name: string;
   schedule: string;
@@ -336,6 +363,7 @@ export function registerOrchestrationTools(server: McpServer): void {
       + "If — and only if — a step does something IRREVERSIBLE the user should sign off on first (e.g. sending emails, publishing), set `requiresApproval: true` on THAT ONE step and a short `approvalPreview`; the runner surfaces a single batch approval and holds the run there, then continues. Prefer ZERO gates for read/research/draft/deploy-for-review workflows. "
       + "Steps with the same satisfied dependsOn run in parallel; use forEach for per-item fan-out. "
       + "Design THIN agentic steps: a few capable steps (each doing a whole meaningful chunk), not many micro-steps. `dependsOn` both orders steps and carries upstream outputs into the downstream STEP CONTEXT. "
+      + "DECLARE OUTPUT CONTRACTS: on any step whose output a later step depends on, and ALWAYS on the step that produces the final deliverable, set `output` to what it must produce — `type` (object/array/string/...), `required_keys` for an object, and `verify.url_present` / `verify.path_exists` for concrete handles (a created sheet/file URL, a saved file path). The engine verifies the step's output against the contract before continuing, so a hollow result (\"done\" with no real URL/file) fails loudly and reports back instead of feeding garbage downstream. Omit `output` for free-form/conversational steps — an undeclared step is simply unverified. "
       + "Call workflow_list first if you want to see existing workflow shapes.",
     {
       name: z.string().min(1),
@@ -354,6 +382,7 @@ export function registerOrchestrationTools(server: McpServer): void {
         usesSkill: z.string().optional().describe('Installed skill directory name (under skills/). For repeatable transforms, prefer one usesSkill step over many hand-wired prompt steps.'),
         requiresApproval: z.boolean().optional(),
         approvalPreview: z.string().optional(),
+        output: WorkflowStepOutputContractSchema.optional().describe(STEP_OUTPUT_CONTRACT_DESC),
       })).min(1),
       trigger_schedule: z.string().optional(),
       inputs: z.string().optional().describe('JSON object mapping input NAMES to {type?, default?, description?}, e.g. {"url":{"type":"string","description":"Site to audit"}}. A JSON string fills reliably under strict-mode function-calling where an open map does not.'),
@@ -399,6 +428,7 @@ export function registerOrchestrationTools(server: McpServer): void {
           usesSkill: s.usesSkill,
           requiresApproval: s.requiresApproval,
           approvalPreview: s.approvalPreview,
+          output: s.output,
         })),
         inputs: Object.keys(inputsSchema).length > 0 ? inputsSchema : undefined,
         synthesis: synthesis_prompt ? { prompt: synthesis_prompt } : undefined,
@@ -599,6 +629,7 @@ export function registerOrchestrationTools(server: McpServer): void {
         forEach: z.string().optional(),
         allowedTools: z.array(z.string()).optional(),
         usesSkill: z.string().optional().describe('Installed skill directory name (under skills/). For repeatable transforms, prefer one usesSkill step over many hand-wired prompt steps.'),
+        output: WorkflowStepOutputContractSchema.optional().describe(STEP_OUTPUT_CONTRACT_DESC),
       })).optional(),
       trigger_schedule: z.string().optional(),
       clear_trigger_schedule: z.boolean().optional().describe('Pass true to remove an existing schedule (e.g. switch back to manual-only).'),
@@ -644,6 +675,7 @@ export function registerOrchestrationTools(server: McpServer): void {
           forEach: s.forEach,
           allowedTools: s.allowedTools,
           usesSkill: s.usesSkill,
+          output: s.output,
         }));
       }
       if (inputsProvided) next.inputs = inputsSchema;
