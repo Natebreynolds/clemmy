@@ -37,6 +37,63 @@ export interface FormatComposioToolOutputOptions {
   details?: unknown;
   toolName?: string;
   maxChars?: number;
+  /** The Composio action slug, when this output is a real tool execution.
+   *  Used to make a failure corrective specific (`slug=…`). */
+  toolSlug?: string;
+}
+
+/**
+ * Detect whether a Composio EXECUTION result is actually a failure.
+ *
+ * Composio returns API errors as a normal result payload (it does NOT throw):
+ *   { successful: false, error: "…", data: { http_error: "400 …",
+ *     status_code: 400, message: "…" } }
+ * The model, seeing bland JSON, reads this as a retryable "result" and calls
+ * the SAME slug with the SAME args again — the composio-thrash that grinds into
+ * the loop guard. We classify strictly off Composio's own error markers so
+ * synthesized outputs (status/search/list) never false-positive.
+ */
+export function detectComposioFailure(value: unknown): { failed: boolean; summary: string } {
+  if (!isRecord(value)) return { failed: false, summary: '' };
+  const data = isRecord(value.data) ? value.data : undefined;
+  // Authoritative markers: `successful === false` and `http_error` are
+  // composio's own failure envelope. `status_code >= 400` and a bare top-level
+  // `error` string are best-effort SECONDARY signals — the bare-error branch is
+  // AND-gated on `successful !== true` so a successful action that carries a
+  // non-empty advisory `error` string isn't mislabelled.
+  const httpError = data && typeof data.http_error === 'string' ? data.http_error.trim() : '';
+  const statusCode = data && typeof data.status_code === 'number' ? data.status_code : undefined;
+  const topError = typeof value.error === 'string' ? value.error.trim() : '';
+  const explicitSuccess = value.successful === true;
+  const failed =
+    value.successful === false ||
+    httpError.length > 0 ||
+    (statusCode !== undefined && statusCode >= 400) ||
+    (topError.length > 0 && !explicitSuccess);
+  if (!failed) return { failed: false, summary: '' };
+  const dataMessage = data && typeof data.message === 'string' ? data.message : '';
+  const summary = (httpError || topError || dataMessage || `status ${statusCode ?? 'error'}`)
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 240);
+  return { failed: true, summary };
+}
+
+/** Loud, self-correcting header prepended to a failed Composio execution so
+ *  the model adapts on failure #1 instead of retrying identically. Names the
+ *  tool the model actually called (`composio_execute_tool` or the dynamic
+ *  `cx_<slug>`) and the slug, so the corrective is unambiguous on both paths. */
+function composioFailureCorrective(
+  summary: string,
+  opts: { toolName?: string; toolSlug?: string } = {},
+): string {
+  const label = opts.toolName || 'composio_execute_tool';
+  const where = opts.toolSlug ? ` (slug=${opts.toolSlug})` : '';
+  return [
+    `⚠️ ${label} FAILED${where}: ${summary}`,
+    `This is a HARD failure — calling it again with the SAME arguments will return the SAME error.`,
+    `Do ONE of these instead: (1) fix the arguments — re-check the action's exact required field names/shape (a 4xx almost always means a wrong, missing, or misnamed field); (2) use a different action or tool for this (e.g. composio_search_tools to find the right slug); (3) if you can't resolve it, STOP and tell the user the specific blocker. Do NOT repeat this identical call.`,
+  ].join('\n');
 }
 
 /**
@@ -59,6 +116,58 @@ export function formatComposioToolOutput(
     sessionId: sessionIdFromRunContext(options.context),
     callId: callIdFromToolDetails(options.details),
   });
+}
+
+/**
+ * Format the output of a real Composio tool EXECUTION. Identical to
+ * formatComposioToolOutput on success; on a Composio-reported failure it
+ * prepends a loud, actionable corrective (kept ABOVE the recall-clipped body
+ * so it's never truncated) so the model fixes/abandons the call instead of
+ * retrying identical args into the loop guard. Use this only for paths that
+ * run executeComposioTool — NOT for synthesized status/search/list outputs.
+ */
+export function formatComposioExecuteOutput(
+  value: unknown,
+  options: FormatComposioToolOutputOptions = {},
+): string {
+  const body = formatComposioToolOutput(value, options);
+  const { failed, summary } = detectComposioFailure(value);
+  if (!failed) return body;
+  return composioFailureCorrective(summary, { toolName: options.toolName, toolSlug: options.toolSlug }) + '\n\n' + body;
+}
+
+/**
+ * The OTHER composio failure channel: executeComposioTool also THROWS — for a
+ * not-found slug, an auth/connection error, or any non-2xx the SDK surfaces as
+ * an APIError. Left to propagate, the SDK renders these as "An error occurred …
+ * Please try again", which invites the exact identical-retry thrash. Catch the
+ * throw at the execute wrapper and route it through the same loud corrective so
+ * BOTH channels (returned error envelope + thrown error) make the model adapt.
+ */
+export function composioThrownErrorOutput(
+  err: unknown,
+  options: FormatComposioToolOutputOptions = {},
+): string {
+  const message = (err instanceof Error ? err.message : String(err)).replace(/\s+/g, ' ').trim();
+  const summary = message.slice(0, 240) || 'unknown error';
+  const body = formatComposioToolOutput({ error: message, toolSlug: options.toolSlug ?? null }, options);
+  return composioFailureCorrective(summary, { toolName: options.toolName, toolSlug: options.toolSlug }) + '\n\n' + body;
+}
+
+/** Run a Composio execution and format BOTH outcomes through the corrective
+ *  path: returned error envelopes and thrown errors. */
+async function runComposioExecute(
+  toolSlug: string,
+  args: Record<string, unknown>,
+  connectedAccountId: string | undefined,
+  options: FormatComposioToolOutputOptions,
+): Promise<string> {
+  try {
+    const result = await executeComposioTool(toolSlug, args, connectedAccountId);
+    return formatComposioExecuteOutput(result, { ...options, toolSlug });
+  } catch (err) {
+    return composioThrownErrorOutput(err, { ...options, toolSlug });
+  }
 }
 
 function parseArgumentsJson(value: string | null | undefined): Record<string, unknown> {
@@ -202,12 +311,10 @@ export async function getDynamicComposioRuntimeTools(options: {
         // (read for GET/LIST/etc., send for everything else), then
         // consults the scope policy (yolo → auto, strict → ask, etc.).
         needsApproval: needsApprovalFromTaxonomy(name),
-        execute: async (input, context, details) => formatComposioToolOutput(
-          await executeComposioTool(
-            toolSlug,
-            normalizeToolInput(input),
-            defaultConnectionId,
-          ),
+        execute: async (input, context, details) => runComposioExecute(
+          toolSlug,
+          normalizeToolInput(input),
+          defaultConnectionId,
           { context, details, toolName: name },
         ),
       }));
@@ -365,8 +472,19 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
     // (or autos in YOLO).
     needsApproval: needsApprovalFromTaxonomy('composio_execute_tool'),
     execute: async ({ tool_slug, arguments: args, connected_account_id }, context, details) => {
-      const result = await executeComposioTool(tool_slug, parseArgumentsJson(args), connected_account_id ?? undefined);
-      return formatComposioToolOutput(result, { context, details, toolName: 'composio_execute_tool' });
+      let parsedArgs: Record<string, unknown>;
+      try {
+        parsedArgs = parseArgumentsJson(args);
+      } catch (err) {
+        // Malformed JSON args is its own retry-inviting failure — make it a
+        // corrective so the model fixes the JSON instead of resending it.
+        return composioThrownErrorOutput(err, { context, details, toolName: 'composio_execute_tool', toolSlug: tool_slug });
+      }
+      return runComposioExecute(tool_slug, parsedArgs, connected_account_id ?? undefined, {
+        context,
+        details,
+        toolName: 'composio_execute_tool',
+      });
     },
   });
 
