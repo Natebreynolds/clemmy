@@ -1,9 +1,9 @@
-import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import pino from 'pino';
 import { getRuntimeEnv } from '../config.js';
 import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
-import { addNotification } from '../runtime/notifications.js';
+import { addNotification, loadNotifications } from '../runtime/notifications.js';
 
 /**
  * Workflow watchdog (north star: REPORTS BACK WITHOUT FAIL).
@@ -122,6 +122,72 @@ export function findStalledRuns(
   return out;
 }
 
+/**
+ * Ground-truth report-back filter (pure).
+ *
+ * A `terminal_unnotified` candidate is only a real "lost result" if the run
+ * genuinely never reported back. The `notifiedAt` marker on the run file is a
+ * fast cache, but it can be ABSENT for a run that DID report back — e.g. a run
+ * completed + notified under a prior code version that predates the marker, or
+ * a daemon restart across the finish boundary. The durable source of truth is
+ * the notification log: if any non-watchdog notification carries this run's
+ * `runId`, the user already heard about it.
+ *
+ * So: given the set of runIds that have a delivered (non-watchdog) notification,
+ * drop the `terminal_unnotified` candidates that are in it. The other two
+ * reasons (queued_not_draining, parked_awaiting_approval) are about runs that
+ * have NOT finished, so they pass through untouched.
+ */
+export function dropReportedBackTerminalRuns(
+  stalled: StalledRun[],
+  reportedBackRunIds: Set<string>,
+): StalledRun[] {
+  return stalled.filter(
+    (run) => !(run.reason === 'terminal_unnotified' && reportedBackRunIds.has(run.id)),
+  );
+}
+
+/**
+ * Read the notification log and collect every runId that has a DELIVERED
+ * notification — i.e. one the user actually saw. We exclude the watchdog's own
+ * `workflow-stalled-*` alerts (those reference a runId but are NOT the run
+ * reporting back). Best-effort: a corrupt/missing log yields an empty set, so
+ * the watchdog falls back to the marker alone (prior behavior).
+ */
+function collectReportedBackRunIds(): Set<string> {
+  const out = new Set<string>();
+  try {
+    for (const n of loadNotifications()) {
+      if (typeof n.id === 'string' && n.id.startsWith('workflow-stalled-')) continue;
+      const runId = n.metadata?.runId;
+      if (typeof runId === 'string' && runId) out.add(runId);
+    }
+  } catch {
+    // Best-effort — never let a bad notification log break the watchdog.
+  }
+  return out;
+}
+
+/**
+ * Self-heal: stamp `notifiedAt` on a run file we've confirmed reported back via
+ * the notification log, so subsequent scans skip it via the fast marker (no
+ * re-read of the log) and it stays correct even if the log is later pruned.
+ * Best-effort — never throws into the watchdog.
+ */
+function stampNotifiedAt(runId: string, now: number): void {
+  try {
+    const file = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+    if (!existsSync(file)) return;
+    const rec = JSON.parse(readFileSync(file, 'utf-8')) as { notifiedAt?: string };
+    if (rec && !rec.notifiedAt) {
+      rec.notifiedAt = new Date(now).toISOString();
+      writeFileSync(file, JSON.stringify(rec, null, 2), 'utf-8');
+    }
+  } catch {
+    // Best-effort — a write failure just means we re-check the log next tick.
+  }
+}
+
 function isEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_WORKFLOW_WATCHDOG', 'on') ?? 'on').toLowerCase() !== 'off';
 }
@@ -185,7 +251,18 @@ export function runWorkflowWatchdog(now: number = Date.now()): { stalled: number
     }
   }
 
-  const stalled = findStalledRuns(runs, now, { queuedStallMs: queuedStallMs(), parkedStallMs: parkedStallMs() });
+  const candidates = findStalledRuns(runs, now, { queuedStallMs: queuedStallMs(), parkedStallMs: parkedStallMs() });
+
+  // Ground-truth report-back check: a terminal run that already has a delivered
+  // notification DID report back — drop it (and self-heal the marker) so the
+  // backstop never fires a false "result wasn't delivered" alarm for a run that
+  // finished under a prior code version or across a restart boundary.
+  const reportedBack = collectReportedBackRunIds();
+  const stalled = dropReportedBackTerminalRuns(candidates, reportedBack);
+  for (const run of candidates) {
+    if (run.reason === 'terminal_unnotified' && reportedBack.has(run.id)) stampNotifiedAt(run.id, now);
+  }
+
   for (const run of stalled) {
     const minutes = Math.max(1, Math.round(run.ageMs / 60_000));
     const alert = watchdogAlert(run, minutes);

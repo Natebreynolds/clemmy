@@ -6,7 +6,12 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { findStalledRuns, type WatchdogRunView } from './workflow-watchdog.js';
+import {
+  findStalledRuns,
+  dropReportedBackTerminalRuns,
+  type WatchdogRunView,
+  type StalledRun,
+} from './workflow-watchdog.js';
 
 const T0 = 1_780_000_000_000; // fixed reference "now"
 const iso = (msAgo: number) => new Date(T0 - msAgo).toISOString();
@@ -152,4 +157,35 @@ test('skips a terminal-unnotified run with no finishedAt (cannot age it)', () =>
     { id: 't6', workflow: 'wf', status: 'completed' },
   ];
   assert.equal(findStalledRuns(runs, T0, { queuedStallMs: FIVE_MIN }).length, 0);
+});
+
+// ── ground-truth report-back filter (deploy-boundary false-positive guard) ──
+
+test('dropReportedBackTerminalRuns: drops a terminal_unnotified run that has a delivered notification', () => {
+  const stalled: StalledRun[] = [
+    { id: 'legacy-done', workflow: 'outlook-triage-hourly', ageMs: 8 * 60_000, reason: 'terminal_unnotified' },
+  ];
+  // The run completed + reported back under a prior code version → no notifiedAt
+  // marker, but the completion notification carries its runId. Must NOT alarm.
+  const kept = dropReportedBackTerminalRuns(stalled, new Set(['legacy-done']));
+  assert.equal(kept.length, 0);
+});
+
+test('dropReportedBackTerminalRuns: KEEPS a terminal_unnotified run with no delivered notification (genuine loss)', () => {
+  const stalled: StalledRun[] = [
+    { id: 'truly-lost', workflow: 'wf', ageMs: 8 * 60_000, reason: 'terminal_unnotified' },
+  ];
+  const kept = dropReportedBackTerminalRuns(stalled, new Set(['some-other-run']));
+  assert.deepEqual(kept.map((r) => r.id), ['truly-lost']);
+});
+
+test('dropReportedBackTerminalRuns: never suppresses queued/parked reasons even if the runId reported before', () => {
+  // A run can finish, report back, then be re-queued/parked under the same id —
+  // the report-back set must only gate terminal_unnotified, not live stalls.
+  const stalled: StalledRun[] = [
+    { id: 'shared', workflow: 'wf', ageMs: 9 * 60_000, reason: 'queued_not_draining' },
+    { id: 'shared2', workflow: 'wf', ageMs: 90 * 60_000, reason: 'parked_awaiting_approval' },
+  ];
+  const kept = dropReportedBackTerminalRuns(stalled, new Set(['shared', 'shared2']));
+  assert.equal(kept.length, 2);
 });
