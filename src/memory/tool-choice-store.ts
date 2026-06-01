@@ -286,6 +286,10 @@ export function stripBakedConnectionId(template: string | undefined): string | u
     .replace(/connected_account_id\s*[=:]\s*["'][^"']*["']\s*,?\s*/g, '')
     .replace(/,\s*\)/g, ')')
     .replace(/\(\s*,\s*/g, '(')
+    // Also clean the JSON-object/array case (e.g. stripping a mid-object
+    // `connected_account_id` can leave a dangling `, }` or `{ ,`).
+    .replace(/,\s*([}\]])/g, '$1')
+    .replace(/([{[])\s*,/g, '$1')
     .trim();
 }
 

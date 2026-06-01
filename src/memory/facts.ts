@@ -775,7 +775,16 @@ export function renderFactsForInstructions(limit = 10, maxChars = 1600, objectiv
 
   // Touch last_accessed for every fact we're about to expose to the
   // model (the act of rendering = an access in Stanford's framework).
-  for (const fact of [...pinned, ...scored]) touchFactAccess(fact.id);
+  // NON-CRITICAL recency bookkeeping — must NEVER break prompt assembly.
+  // Previously unguarded: a transient SQLite WAL/busy error here threw
+  // straight out of renderFactsForInstructions and could fail the whole
+  // turn. Swallow per-loop so the facts still render even if the touch
+  // can't be written this tick.
+  try {
+    for (const fact of [...pinned, ...scored]) touchFactAccess(fact.id);
+  } catch {
+    // recency anchor will just be slightly stale — never a turn-breaker.
+  }
 
   const sections: string[] = [];
 

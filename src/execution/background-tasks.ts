@@ -11,6 +11,7 @@ import path from 'node:path';
 import pino from 'pino';
 import { BASE_DIR, MODELS } from '../config.js';
 import { addNotification } from '../runtime/notifications.js';
+import { SessionStore } from '../memory/session-store.js';
 import { ExecutionStore } from './store.js';
 import type { RunStoppedReason } from '../types.js';
 import type { ClementineAssistant } from '../assistant/core.js';
@@ -81,6 +82,14 @@ export interface BackgroundTaskRecord {
 export interface CreateBackgroundTaskInput {
   title: string;
   prompt: string;
+  /**
+   * The CHAT session that spawned this task, if any. On completion the task's
+   * result is fed back into THIS session's transcript (see
+   * enqueueBackgroundTaskResultTurn) so Clementine resumes from it. Pass it
+   * whenever a task is kicked off from an interactive session. Leave undefined
+   * for autonomous/cron spawns (meeting analysis, maintenance) that have no
+   * session to wake — those report back only via notification.
+   */
   originSessionId?: string;
   userId?: string;
   channel?: string;
@@ -304,6 +313,67 @@ export function markBackgroundTaskRunning(id: string): BackgroundTaskRecord | nu
   });
 }
 
+/**
+ * Async report-back. When a background task finishes, feed its result back
+ * into the ORIGINATING session's transcript so Clementine re-enters that
+ * context on her next turn and can keep working — instead of the result
+ * dead-ending in a notification that never reaches her reasoning loop.
+ *
+ * No new MCP tool is needed: re-entry is via turn history (the model already
+ * reads `recentTranscript`), and the embedded `background_task_status('<id>')`
+ * hint lets her pull the FULL payload on demand if the inline preview is
+ * clipped. The existing read tools are how she self-serves; this just makes
+ * sure the completion is IN her context.
+ *
+ * Best-effort + idempotent: a completion must never fail on a session write,
+ * and `markBackgroundTaskDone` is called from both the normal drain and the
+ * post-approval path, so a retried/double completion must not append twice
+ * (guarded by a content-marker scan — ConversationTurn has no id to dedup on).
+ * Tasks with no `originSessionId` (cron / autonomous spawns with no session to
+ * wake) are a no-op, by design.
+ */
+type BackgroundTaskOutcome = 'done' | 'failed' | 'blocked';
+
+function enqueueBackgroundTaskOutcomeTurn(
+  task: BackgroundTaskRecord,
+  outcome: BackgroundTaskOutcome,
+  detail: string,
+): void {
+  try {
+    const sessionId = task.originSessionId;
+    if (!sessionId) return;
+    // State-agnostic id prefix: a task reaches exactly ONE terminal state, so
+    // scanning for the id alone makes the report-back idempotent across retries
+    // AND prevents a done+failed double-report for the same id.
+    const idPrefix = `[background task ${task.id} `;
+    const store = new SessionStore();
+    const existing = store.get(sessionId);
+    if (existing.turns.some((t) => typeof t.text === 'string' && t.text.startsWith(idPrefix))) {
+      return; // already reported — idempotent
+    }
+    const head =
+      outcome === 'done' ? `${idPrefix}completed]`
+        : outcome === 'failed' ? `${idPrefix}FAILED]`
+          : `${idPrefix}BLOCKED]`;
+    const guidance =
+      outcome === 'done'
+        ? `This work ran in the background and just finished — continue from here. For the complete result call background_task_status('${task.id}').`
+        : outcome === 'failed'
+          ? `This background task FAILED — it did NOT complete. Decide whether to retry with an adjusted approach or tell the user; do not assume it succeeded. Details via background_task_status('${task.id}').`
+          : `This background task is BLOCKED — it could not finish without a prerequisite. Surface the blocker to the user or resolve it, then re-run. Details via background_task_status('${task.id}').`;
+    const preview =
+      detail.length > RESULT_TRUNCATE_CHARS ? `${detail.slice(0, RESULT_TRUNCATE_CHARS)}\n…[truncated]` : detail;
+    const text = `${head} ${task.title}\n\n${preview}\n\n(${guidance})`;
+    store.appendTurn(sessionId, { role: 'user', text, createdAt: nowIso() });
+    logger.info({ taskId: task.id, sessionId, outcome }, 'Background task outcome enqueued into origin session');
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : err, taskId: task.id },
+      'enqueueBackgroundTaskOutcomeTurn failed (best-effort; task state not blocked)',
+    );
+  }
+}
+
 export function markBackgroundTaskDone(id: string, result: string): BackgroundTaskRecord | null {
   const task = getBackgroundTask(id);
   if (!task) return null;
@@ -327,6 +397,9 @@ export function markBackgroundTaskDone(id: string, result: string): BackgroundTa
       read: false,
       metadata: taskNotificationMetadata(updated),
     });
+    // Async report-back: also feed the result into the origin session's
+    // context so Clementine resumes from it, not just a notification.
+    enqueueBackgroundTaskOutcomeTurn(updated, 'done', result);
   }
   return updated;
 }
@@ -389,6 +462,9 @@ export function markBackgroundTaskBlocked(id: string, reason: string, resultText
       read: false,
       metadata: taskNotificationMetadata(updated, { status: 'blocked' }),
     });
+    // Report-back without fail: a BLOCKED task must reach Clementine's context,
+    // not just a notification — so she can surface the blocker or resolve it.
+    enqueueBackgroundTaskOutcomeTurn(updated, 'blocked', reason);
   }
   return updated;
 }
@@ -410,6 +486,13 @@ export function markBackgroundTaskFailed(id: string, error: string, status: Extr
       read: false,
       metadata: taskNotificationMetadata(updated),
     });
+    // Report-back without fail: a genuine FAILURE re-enters the origin session
+    // so Clementine can retry/adjust or tell the user. Skip 'interrupted'
+    // (a daemon-restart transient that is auto-resumed) and 'aborted' (the
+    // user cancelled it — they already know).
+    if (status === 'failed') {
+      enqueueBackgroundTaskOutcomeTurn(updated, 'failed', updated.error ?? error);
+    }
   }
   return updated;
 }

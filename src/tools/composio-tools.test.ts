@@ -168,3 +168,53 @@ test('composioThrownErrorOutput: a THROWN composio error (not-found/auth/APIErro
   assert.match(out, /DISCOVER the real options first|composio_search_tools/);
 });
 
+
+// ─── Ever-learning: tool choices memorize themselves (auto-commit) ──────
+const { noteComposioSearchIntent, maybeAutoRememberComposioChoice } = await import('./composio-tools.js');
+const { recallToolChoice } = await import('../memory/tool-choice-store.js');
+
+test('auto-remember: a successful execute after a search memorizes intent→slug', () => {
+  const intent = 'get google serp organic rankings';
+  noteComposioSearchIntent('sess-auto-1', intent);
+  maybeAutoRememberComposioChoice(
+    'DATAFORSEO_SERP_GOOGLE_ORGANIC_LIVE_ADVANCED',
+    { keyword: 'criminal defense lawyer', location_name: 'Chattanooga' },
+    { successful: true, data: { items: [] } },
+    'sess-auto-1',
+  );
+  const rec = recallToolChoice(intent);
+  assert.equal(rec?.choice?.identifier, 'DATAFORSEO_SERP_GOOGLE_ORGANIC_LIVE_ADVANCED');
+  assert.equal(rec?.choice?.kind, 'composio');
+  // connection ids must never be baked into the memo
+  assert.ok(!(rec?.choice?.invocationTemplate ?? '').includes('connected_account_id'));
+});
+
+test('auto-remember: a FAILED execute memorizes nothing', () => {
+  const intent = 'send an outlook email failing';
+  noteComposioSearchIntent('sess-auto-2', intent);
+  maybeAutoRememberComposioChoice(
+    'OUTLOOK_SEND_EMAIL',
+    { to: 'x@y.com' },
+    { successful: false, error: 'Invalid request data provided' },
+    'sess-auto-2',
+  );
+  assert.equal(recallToolChoice(intent), null, 'a failed call must not be memorized');
+});
+
+test('auto-remember: an execute with NO prior search learns nothing (slug was already known/recalled)', () => {
+  const intent = 'intent-with-no-search';
+  // No noteComposioSearchIntent for this session.
+  maybeAutoRememberComposioChoice('SOME_KNOWN_SLUG', {}, { successful: true }, 'sess-auto-3');
+  assert.equal(recallToolChoice(intent), null);
+});
+
+test('auto-remember: a search query is single-use (a later unrelated execute is not mis-keyed)', () => {
+  const intent = 'one-shot search intent';
+  noteComposioSearchIntent('sess-auto-4', intent);
+  // First execute consumes the pending search.
+  maybeAutoRememberComposioChoice('FIRST_SLUG', {}, { successful: true }, 'sess-auto-4');
+  // Second execute in the same session has no pending search → must not re-key.
+  maybeAutoRememberComposioChoice('SECOND_SLUG', {}, { successful: true }, 'sess-auto-4');
+  const rec = recallToolChoice(intent);
+  assert.equal(rec?.choice?.identifier, 'FIRST_SLUG', 'only the first execute after the search is keyed');
+});

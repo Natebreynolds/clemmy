@@ -12,6 +12,7 @@ import {
 } from '../integrations/composio/client.js';
 import { formatRecallableToolText } from '../runtime/harness/tool-output-format.js';
 import { callIdFromToolDetails, sessionIdFromRunContext } from '../runtime/harness/tool-output-context.js';
+import { rememberToolChoice, stripBakedConnectionId } from '../memory/tool-choice-store.js';
 
 const DYNAMIC_TOOL_PREFIX = 'cx_';
 const MAX_TOOL_NAME_LENGTH = 64;
@@ -179,6 +180,82 @@ export function composioThrownErrorOutput(
 
 /** Run a Composio execution and format BOTH outcomes through the corrective
  *  path: returned error envelopes and thrown errors. */
+// ─── Ever-learning: tool choices memorize THEMSELVES (north-star contract) ──
+//
+// The recall half of procedural memory is already always-on (proven choices
+// are injected into context every turn). The COMMIT half was missing: nothing
+// persisted a working (intent → slug) automatically, so the model had to
+// manually `tool_choice_remember` (which it rarely did) and discovery re-ran
+// every turn — the exact token leak the north star calls a "reliability bug".
+//
+// Close the loop in code: when `composio_search_tools(query)` is the thing that
+// surfaced a slug and the subsequent `composio_execute_tool(slug)` SUCCEEDS,
+// auto-persist `intent=query → slug`. Keyed by the SEARCH QUERY because that is
+// the same string the model recalls by next time. This naturally fires only on
+// FIRST discovery of an intent: once remembered, the choice is injected, the
+// model stops re-searching it, and the hint goes quiet.
+const AUTO_REMEMBER_WINDOW_MS = 5 * 60 * 1000;
+const lastComposioSearchBySession = new Map<string, { query: string; at: number }>();
+
+/** Record the discovery query so a following successful execute can learn from it.
+ *  Exported for tests. */
+export function noteComposioSearchIntent(sessionId: string | undefined, query: string): void {
+  if (!sessionId || !query.trim()) return;
+  // Bound the map — tiny entries, but don't leak across a long-lived daemon.
+  if (lastComposioSearchBySession.size > 500) {
+    const cutoff = Date.now() - AUTO_REMEMBER_WINDOW_MS;
+    for (const [k, v] of lastComposioSearchBySession) {
+      if (v.at < cutoff) lastComposioSearchBySession.delete(k);
+    }
+  }
+  lastComposioSearchBySession.set(sessionId, { query: query.trim(), at: Date.now() });
+}
+
+/** On a SUCCESSFUL execute that followed a fresh discovery, memorize the choice.
+ *  Exported for tests. */
+export function maybeAutoRememberComposioChoice(
+  toolSlug: string,
+  args: Record<string, unknown>,
+  result: unknown,
+  sessionId: string | undefined,
+): void {
+  try {
+    if (detectComposioFailure(result).failed) return; // only learn from successes
+    const sid = sessionId;
+    if (!sid) return;
+    const pending = lastComposioSearchBySession.get(sid);
+    if (!pending) return; // slug wasn't just discovered — nothing new to learn
+    // Single-use + freshness: a search only teaches the execute that closely
+    // follows it, so a much-later unrelated execute can't be mis-keyed.
+    lastComposioSearchBySession.delete(sid);
+    if (Date.now() - pending.at > AUTO_REMEMBER_WINDOW_MS) return;
+    const intent = pending.query.trim();
+    if (!intent) return;
+    // Compact, connection-free args example as the invocation hint. NEVER bake a
+    // connected_account_id into the memo (stale-connection class bug, v0.5.47).
+    let template: string | undefined;
+    try {
+      const compact = JSON.stringify(args ?? {});
+      template = compact && compact.length <= 600 ? stripBakedConnectionId(compact) : undefined;
+    } catch {
+      template = undefined;
+    }
+    rememberToolChoice({
+      intent,
+      description: 'Auto-remembered: this Composio slug satisfied the searched intent.',
+      choice: {
+        kind: 'composio',
+        identifier: toolSlug,
+        invocationTemplate: template,
+        testEvidence: 'auto-remembered after a successful composio_execute_tool call',
+      },
+    });
+  } catch {
+    // North star: learning is ADDITIVE — a memory-write failure must never
+    // break the tool call. Silent here is correct (the call already succeeded).
+  }
+}
+
 async function runComposioExecute(
   toolSlug: string,
   args: Record<string, unknown>,
@@ -187,7 +264,9 @@ async function runComposioExecute(
 ): Promise<string> {
   try {
     const result = await executeComposioTool(toolSlug, args, connectedAccountId);
-    return formatComposioExecuteOutput(result, { ...options, toolSlug });
+    const output = formatComposioExecuteOutput(result, { ...options, toolSlug });
+    maybeAutoRememberComposioChoice(toolSlug, args, result, sessionIdFromRunContext(options.context));
+    return output;
   } catch (err) {
     return composioThrownErrorOutput(err, { ...options, toolSlug });
   }
@@ -398,6 +477,9 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
       limit: z.number().int().positive().max(50).nullable(),
     }),
     execute: async ({ query, toolkit_slug, limit }, context, details) => {
+      // Remember this discovery query so a successful execute that follows can
+      // auto-memorize the proven (intent → slug). See maybeAutoRememberComposioChoice.
+      noteComposioSearchIntent(sessionIdFromRunContext(context), query);
       const credentials = getComposioCredentialStatus();
       if (!credentials.enabled) {
         return formatComposioToolOutput({

@@ -21,12 +21,14 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 const {
   createBackgroundTask,
   markBackgroundTaskFailed,
+  markBackgroundTaskDone,
   getBackgroundTask,
   listBackgroundTasks,
   resumeInterruptedBackgroundTasks,
   processBackgroundTasks,
 } = await import('./background-tasks.js');
 const { isAutoApprovedByScope, getPlanScope } = await import('../agents/plan-scope.js');
+const { SessionStore } = await import('../memory/session-store.js');
 
 test.after(() => {
   rmSync(TMP_HOME, { recursive: true, force: true });
@@ -115,4 +117,62 @@ test('processBackgroundTasks opens a sticky plan scope so mutating tools auto-ap
   assert.ok(scope, 'a plan scope should exist for the run session');
   assert.deepEqual(scope!.allowedTools, ['*'], 'background run scope covers all non-read tools');
   assert.equal(scope!.planProposalId, `background-task:${task.id}`);
+});
+
+test('markBackgroundTaskDone feeds the result back into the origin session (async report-back)', () => {
+  const sessionId = 'sess-reportback-1';
+  const task = createBackgroundTask({
+    title: 'Pull DataForSEO rankings',
+    prompt: 'do it',
+    originSessionId: sessionId,
+  });
+
+  markBackgroundTaskDone(task.id, 'Top organic result: Yates & Wheland at #3.');
+
+  const store = new SessionStore();
+  const turns = store.get(sessionId).turns;
+  const marker = `[background task ${task.id} completed]`;
+  const reportTurns = turns.filter((t) => typeof t.text === 'string' && t.text.startsWith(marker));
+  assert.equal(reportTurns.length, 1, 'exactly one report-back turn appended');
+  assert.match(reportTurns[0].text, /Yates & Wheland/, 'result text is carried into context');
+  assert.match(reportTurns[0].text, new RegExp(`background_task_status\\('${task.id}'\\)`), 'full-result hint embedded');
+
+  // Idempotent: a retried/double completion must not append twice.
+  markBackgroundTaskDone(task.id, 'Top organic result: Yates & Wheland at #3.');
+  const after = store.get(sessionId).turns.filter((t) => typeof t.text === 'string' && t.text.startsWith(marker));
+  assert.equal(after.length, 1, 'double-complete does not duplicate the report-back turn');
+});
+
+test('markBackgroundTaskDone with NO origin session is a no-op for transcripts (autonomous spawn)', () => {
+  const task = createBackgroundTask({ title: 'Analyze meeting transcript: zoom', prompt: 'analyze' });
+  // Should not throw and should not create any session.
+  const updated = markBackgroundTaskDone(task.id, 'summary');
+  assert.equal(updated?.status, 'done');
+  const store = new SessionStore();
+  // No session id to wake → no session record created by the report-back path.
+  assert.equal(store.list(50).some((s) => s.turns.some((t) => t.text?.includes(task.id))), false);
+});
+
+test('markBackgroundTaskFailed reports a genuine failure back into the origin session', () => {
+  const sessionId = 'sess-reportback-fail';
+  const task = createBackgroundTask({ title: 'Enrich prospects', prompt: 'do it', originSessionId: sessionId });
+  markBackgroundTaskFailed(task.id, 'DataForSEO returned 402 payment required', 'failed');
+
+  const store = new SessionStore();
+  const turns = store.get(sessionId).turns;
+  const reported = turns.filter((t) => typeof t.text === 'string' && t.text.startsWith(`[background task ${task.id} `));
+  assert.equal(reported.length, 1, 'a failed task re-enters the session exactly once');
+  assert.match(reported[0].text, /FAILED/);
+  assert.match(reported[0].text, /402 payment required/);
+});
+
+test('markBackgroundTaskFailed with status=interrupted does NOT report back (auto-resumed transient)', () => {
+  const sessionId = 'sess-reportback-interrupted';
+  const task = createBackgroundTask({ title: 'Long pull', prompt: 'do it', originSessionId: sessionId });
+  markBackgroundTaskFailed(task.id, 'Daemon restarted while task was running.', 'interrupted');
+
+  const store = new SessionStore();
+  const turns = store.get(sessionId).turns;
+  const reported = turns.filter((t) => typeof t.text === 'string' && t.text.startsWith(`[background task ${task.id} `));
+  assert.equal(reported.length, 0, 'interrupted (auto-resumed) must not spam the session with a failure');
 });
