@@ -2932,6 +2932,14 @@ function isKillBeforeStart(
   }
 }
 
+/** A Codex OAuth revocation/expiry (HTTP 401 token_revoked) surfaced from the
+ *  model call. The token can't recover by retrying — the user must re-auth — so
+ *  we surface a clear instruction instead of the raw provider JSON. */
+export function isCodexAuthRevoked(err: unknown, message: string): boolean {
+  if ((err as { status?: unknown } | null)?.status === 401) return true;
+  return /token_revoked|invalidated oauth token|401 unauthorized/i.test(message);
+}
+
 function handleRunError(
   sessionId: string,
   turn: number,
@@ -3121,6 +3129,38 @@ function handleRunError(
       // shape as F4 stall recovery.
       return { sessionId, turn, status: 'awaiting_user_input', error: message };
     }
+  }
+
+  // Codex OAuth revoked/expired: the raw `Codex /responses returned 401 …
+  // token_revoked` JSON is useless to the user, and retrying a revoked token
+  // never recovers. Surface a clear re-auth instruction + one deduped
+  // notification (so they know even if they're not watching), then end cleanly.
+  if (isCodexAuthRevoked(err, message)) {
+    const friendly =
+      'Your Codex sign-in expired or was revoked, so I can’t reach the model right now. '
+      + 'Re-authenticate in Settings → Credentials → RE-AUTHENTICATE '
+      + '(or run `clementine auth login-native`), then try again.';
+    safeAppend({
+      sessionId,
+      turn,
+      role: 'system',
+      type: 'run_failed',
+      data: { error: friendly, reason: 'codex_auth_revoked' },
+    });
+    try {
+      addNotification({
+        id: 'codex-auth-revoked', // stable → one alert per revocation, not per failed turn
+        kind: 'system',
+        title: 'Codex sign-in expired — re-authenticate',
+        body: friendly,
+        createdAt: new Date().toISOString(),
+        read: false,
+        metadata: { reason: 'codex_auth_revoked' },
+      });
+    } catch { /* notification is best-effort */ }
+    session.markStatus('failed');
+    bumpTurnNumber(sessionId, turn);
+    return { sessionId, turn, status: 'failed', error: friendly };
   }
 
   safeAppend({

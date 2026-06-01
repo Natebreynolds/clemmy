@@ -55,7 +55,7 @@ import { Agent, RunContext, RunState, type AgentInputItem, type Runner } from '@
 
 const { resetEventLog, requestKill, listEvents, createSession, appendEvent } = await import('./eventlog.js');
 const { HarnessSession } = await import('./session.js');
-const { runTurn, runConversation, resumePendingApproval } = await import('./loop.js');
+const { runTurn, runConversation, resumePendingApproval, isCodexAuthRevoked } = await import('./loop.js');
 type RunRunnerFn = import('./loop.js').RunRunnerFn;
 const { ToolCallsLimitExceeded } = await import('./brackets.js');
 const { listEvents: listEventsForConv } = await import('./eventlog.js');
@@ -1940,4 +1940,16 @@ test('runConversation: propagates run_failed status when a turn throws', async (
   });
   assert.equal(result.status, 'failed');
   assert.match(result.error ?? '', /scripted_throw/);
+});
+
+test('isCodexAuthRevoked: detects 401/token_revoked and ignores unrelated errors', () => {
+  // CodexModelError-shaped: carries status 401
+  assert.equal(isCodexAuthRevoked({ status: 401 }, 'Codex /responses returned 401 Unauthorized'), true);
+  // CodexRuntimeError-shaped: message-only signal
+  assert.equal(isCodexAuthRevoked(new Error('Encountered invalidated oauth token for user, failing request'), 'Encountered invalidated oauth token for user, failing request'), true);
+  assert.equal(isCodexAuthRevoked({}, 'token_revoked'), true);
+  // Not auth: a 429 rate limit or a generic failure must NOT be misclassified
+  assert.equal(isCodexAuthRevoked({ status: 429 }, 'Codex /responses returned 429'), false);
+  assert.equal(isCodexAuthRevoked(new Error('scripted_throw'), 'scripted_throw'), false);
+  assert.equal(isCodexAuthRevoked(null, 'some tool failed'), false);
 });
