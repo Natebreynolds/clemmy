@@ -156,31 +156,21 @@ export function shouldUsePlanFirst(input: PlanFirstInput): boolean {
   if (CONTROL_RE.test(text)) return false;
   if (EXECUTION_CONTINUATION_RE.test(text) && text.length < 240) return false;
 
-  // Right architecture: ordinary ambiguity stays with the main
-  // orchestrator, which can search memory, ask one conversational
-  // question, or proceed. The separate planner is reserved for explicit
-  // planning requests and high-risk external/batch work.
+  // The separate preflight planner engages ONLY when the user EXPLICITLY
+  // asks for a plan ("plan this first", "draft me a plan"). Everything
+  // else — including batch/external/multi-step action requests — stays
+  // with the main conversational orchestrator, which reads the
+  // conversation + memory + tools, asks as many clarifying questions as
+  // it needs (converse until aligned), plans the work itself, and fires
+  // execution once the user agrees, gating only irreversible writes.
+  //
+  // 2026-06-01 (feedback_converse_until_aligned): the prior heuristics
+  // (length floor + external-mutation/batch/sequence/domain count)
+  // auto-tripped a formal APPROVE/REJECT plan card on ordinary requests
+  // ("create 10 Outlook drafts"), short-circuiting the conversation the
+  // user wants. The planner-first preflight was restricting the model;
+  // it is now opt-in via an explicit request only.
   if (EXPLICIT_PLAN_FIRST_RE.test(text)) return true;
-
-  if (text.length < 80) return false;
-
-  const domains = domainCount(text);
-  const hasExternalMutation = EXTERNAL_MUTATION_RE.test(text);
-  const hasBatch = BATCH_RE.test(text);
-  const hasSequence = SEQUENCE_RE.test(text);
-
-  if (input.freshSession) {
-    if (hasExternalMutation && domains >= 3 && (hasBatch || hasSequence)) return true;
-    if (hasExternalMutation && domains >= 2 && hasBatch && hasSequence) return true;
-    if (hasExternalMutation && text.length >= 450 && (hasBatch || hasSequence)) return true;
-    return false;
-  }
-
-  // Existing sessions should not get replanned for ordinary
-  // continuations. Only a high-risk external/batch pivot gets the
-  // separate planner; everything else flows through the orchestrator.
-  if (hasExternalMutation && domains >= 3 && (hasBatch || hasSequence)) return true;
-  if (hasExternalMutation && text.length >= 550 && (hasBatch || hasSequence)) return true;
 
   return false;
 }

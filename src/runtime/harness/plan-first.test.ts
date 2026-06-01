@@ -44,11 +44,26 @@ function makePlan(overrides: Partial<Plan> = {}): Plan {
   };
 }
 
-test('shouldUsePlanFirst: fresh multi-system batch work gets planner-first gate', () => {
+test('shouldUsePlanFirst: fresh multi-system batch work STAYS conversational (no auto plan gate)', () => {
+  // 2026-06-01 (feedback_converse_until_aligned): batch/external/multi-step
+  // action requests no longer auto-trip a formal plan card — they flow to the
+  // conversational orchestrator, which converses + recalls + plans itself and
+  // gates only the irreversible write. The planner-first preflight is opt-in.
   const input =
     'Find 8 law firm accounts from Salesforce that fit our Market Leader outreach lane. For each one, gather one concrete SEO or web visibility signal, create a local markdown report, then draft Outlook emails for the top 3 with my Chili Piper link.';
 
-  assert.equal(shouldUsePlanFirst({ input, freshSession: true }), true);
+  assert.equal(shouldUsePlanFirst({ input, freshSession: true }), false);
+});
+
+test('shouldUsePlanFirst: an EXPLICIT plan request still engages the preflight planner', () => {
+  assert.equal(
+    shouldUsePlanFirst({ input: 'Draft me a plan first before you do anything.', freshSession: true }),
+    true,
+  );
+  assert.equal(
+    shouldUsePlanFirst({ input: 'Before you start, plan out the steps for this outreach.', freshSession: true }),
+    true,
+  );
 });
 
 test('shouldUsePlanFirst: continuations and approvals do not get replanned', () => {
@@ -75,11 +90,13 @@ test('shouldUsePlanFirst: simple existing chat continuations do not get forced t
   assert.equal(shouldUsePlanFirst({ input, freshSession: false }), false);
 });
 
-test('shouldUsePlanFirst: complex existing-session pivots get planner-first gate', () => {
+test('shouldUsePlanFirst: complex existing-session pivots STAY conversational (no auto plan gate)', () => {
+  // Same principle for existing sessions: a complex pivot is handled by the
+  // orchestrator conversationally, not force-routed into a plan card.
   const input =
     'Find 8 Salesforce accounts, gather SEO signals for each firm, write a local report, and create Outlook draft emails with my Chili Piper link.';
 
-  assert.equal(shouldUsePlanFirst({ input, freshSession: false }), true);
+  assert.equal(shouldUsePlanFirst({ input, freshSession: false }), false);
 });
 
 test('shouldUsePlanFirst: simple local or conversational asks run normally', () => {
