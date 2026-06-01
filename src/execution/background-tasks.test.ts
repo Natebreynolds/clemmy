@@ -24,7 +24,9 @@ const {
   getBackgroundTask,
   listBackgroundTasks,
   resumeInterruptedBackgroundTasks,
+  processBackgroundTasks,
 } = await import('./background-tasks.js');
+const { isAutoApprovedByScope, getPlanScope } = await import('../agents/plan-scope.js');
 
 test.after(() => {
   rmSync(TMP_HOME, { recursive: true, force: true });
@@ -66,4 +68,51 @@ test('resumeInterruptedBackgroundTasks ignores non-restart interrupted tasks', (
 
   assert.equal(resumeInterruptedBackgroundTasks({ cap: 2 }), 0);
   assert.equal(getBackgroundTask(task.id)?.resumedIntoTaskId, undefined);
+});
+
+// ─── sticky approval: launching a background task IS the approval ──────
+//
+// A background-task worker run is autonomous-by-default — the user
+// consented when they kicked it off, so internal mutating tools must NOT
+// re-pause mid-run. processBackgroundTasks opens a plan scope (the canonical
+// approval mechanism) keyed on the task's runSessionId, covering `*`, before
+// the worker run executes. This test drives processBackgroundTasks with a
+// stub assistant and asserts: (1) at the moment respond() runs, a mutating
+// tool inside that run is auto-approved by the scope; (2) the scope persists
+// on the run session and covers `*`.
+test('processBackgroundTasks opens a sticky plan scope so mutating tools auto-approve mid-run', async () => {
+  const task = createBackgroundTask({ title: 'Pull deals and write a sheet', prompt: 'do the autonomous thing' });
+
+  let approvedDuringRun: boolean | undefined;
+  let runSessionSeen: string | undefined;
+
+  // Minimal ClementineAssistant stub. respond() stands in for the worker
+  // run; we probe the scope from inside it (the exact window where internal
+  // tools would otherwise re-prompt).
+  const stubAssistant = {
+    getRuntime() {
+      return {} as never;
+    },
+    async respond(request: { sessionId: string }) {
+      runSessionSeen = request.sessionId;
+      // A representative mutating tool (write_file) must be auto-approved by
+      // the scope the processor opened for this run session.
+      approvedDuringRun = isAutoApprovedByScope(request.sessionId, 'write_file', { path: '/tmp/out.csv' });
+      return { text: 'done', sessionId: request.sessionId };
+    },
+  };
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const processed = await processBackgroundTasks(stubAssistant as any, 1);
+  assert.equal(processed, 1, 'the queued task should be processed');
+
+  assert.ok(runSessionSeen, 'respond should have been called with the run session id');
+  assert.equal(runSessionSeen, task.runSessionId);
+  assert.equal(approvedDuringRun, true, 'mutating tool must be pre-approved by the sticky scope mid-run');
+
+  // The scope persists and covers all non-read tools for this run session.
+  const scope = getPlanScope(task.runSessionId);
+  assert.ok(scope, 'a plan scope should exist for the run session');
+  assert.deepEqual(scope!.allowedTools, ['*'], 'background run scope covers all non-read tools');
+  assert.equal(scope!.planProposalId, `background-task:${task.id}`);
 });

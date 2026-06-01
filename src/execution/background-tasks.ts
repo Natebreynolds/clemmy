@@ -17,6 +17,7 @@ import type { ClementineAssistant } from '../assistant/core.js';
 import { addRunEvent, finishRun, startRun } from '../runtime/run-events.js';
 import { AgentRuntimeCancelledError } from '../runtime/provider.js';
 import { getBackgroundCheckInMs, loadProactivityPolicy } from '../agents/proactivity-policy.js';
+import { openPlanScope } from '../agents/plan-scope.js';
 
 const logger = pino({ name: 'clementine-next.background-tasks' });
 
@@ -622,6 +623,34 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	    let task: BackgroundTaskRecord = runningTask;
 	    processed += 1;
 	    logger.info({ taskId: task.id, title: task.title }, 'Background task started');
+
+	    // Sticky approval: launching a background task IS the user's approval
+	    // for the work it does. A background run is autonomous-by-default —
+	    // the user already consented when they kicked it off, so internal
+	    // mutating tools must NOT re-pause mid-run ("approve once, runs to
+	    // completion"). We reuse the canonical plan-scope mechanism (the same
+	    // one request_approval and plan-first approval open) keyed on this
+	    // task's run session. allowedTools `*` covers every non-read tool that
+	    // survives the taxonomy safety floor — admin tools and destructive-hint
+	    // invocations are still gated BEFORE evaluateAutoApprove is consulted
+	    // (decideToolApproval), so the parking sites below remain a real
+	    // fallback for a genuinely un-coverable approval. Scoped strictly to
+	    // this worker run's session; interactive chat/Discord/console turns are
+	    // untouched.
+	    try {
+	      openPlanScope({
+	        sessionId: task.runSessionId,
+	        planProposalId: `background-task:${task.id}`,
+	        approvedPlanObjective: task.title,
+	        ttlMs: task.maxMinutes * 60_000,
+	        allowedTools: ['*'],
+	      });
+	    } catch (scopeErr) {
+	      // Opening the scope is best-effort plumbing; a failure here must
+	      // never block the task. Without it, the parking fallback still
+	      // protects the user — they just see the legacy per-tool prompts.
+	      logger.warn({ err: scopeErr, taskId: task.id }, 'Failed to open background-task plan scope; falling back to per-tool approval');
+	    }
 	    const run = startRun({
       id: `run-${task.id}`,
       sessionId: task.runSessionId,

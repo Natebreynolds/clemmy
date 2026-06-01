@@ -187,7 +187,12 @@ export async function routeOpenQuestionPlan(
       freshSession: false,
       autonomy: input.autonomy,
       priorAnswers: answers ?? input.input,
-      force: true,
+      // No `force`: plan-first is now opt-in (commit 396ba57). Let
+      // shouldUsePlanFirst gate this re-entry like everywhere else — an
+      // explicit-plan originating request ("draft me a plan…") still
+      // re-engages the planner; an ordinary request returns
+      // {surfaced:false} and the caller falls through to the normal
+      // conversational orchestrator turn with the user's message.
     });
     return {
       handled: continued.surfaced,
@@ -204,7 +209,10 @@ export async function routeOpenQuestionPlan(
       channel: input.channel,
       freshSession: false,
       autonomy: input.autonomy,
-      force: true,
+      // No `force`: see the answers branch above. An explicit "resume"
+      // of an explicit-plan request still re-surfaces the plan; an
+      // ordinary resumed request returns {surfaced:false} → handled:false
+      // → caller runs the normal conversational turn.
     });
     return {
       handled: reasked.surfaced,

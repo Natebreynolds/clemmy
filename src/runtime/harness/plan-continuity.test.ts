@@ -23,6 +23,7 @@ const { surfaceAskingPlan, surfacePlan, listPlanProposals, supersedePlanProposal
   await import('../../agents/plan-proposals.js');
 const { findOpenQuestionPlan, planContinuityEnabled, buildClassifierPrompt } =
   await import('./plan-continuity.js');
+const { shouldUsePlanFirst } = await import('./plan-first.js');
 
 function aPlan(overrides: Record<string, unknown> = {}) {
   return {
@@ -137,6 +138,45 @@ test('planContinuityEnabled: reflects the env flag', () => {
     if (prev === undefined) delete process.env.CLEMMY_PLAN_CONTINUITY;
     else process.env.CLEMMY_PLAN_CONTINUITY = prev;
   }
+});
+
+// ─── force-replan removal contract ─────────────────────────────
+//
+// routeOpenQuestionPlan used to pass `force: true` into
+// runPlanFirstPreflight, which bypassed shouldUsePlanFirst and re-surfaced
+// a formal plan card for ANY resumed/answered request. Since plan-first is
+// now opt-in (commit 396ba57), `force` was removed so re-entry is gated by
+// shouldUsePlanFirst(openPlan.originatingRequest) exactly like every other
+// caller. These pure tests pin that contract: an ORDINARY originating
+// request must NOT re-engage the planner (preflight returns surfaced:false →
+// handled:false → caller runs the normal conversational turn), while an
+// EXPLICIT-plan originating request still does.
+
+test('continuity re-entry gate: an ordinary originating request does NOT force a plan', () => {
+  const ordinary = surfaceAskingPlan({
+    plan: aPlan(),
+    originatingRequest: 'get me the deals we closed and put them in a sheet',
+    channel: 'discord:gate-ordinary',
+  });
+  // This is the value continuity now feeds runPlanFirstPreflight (no force).
+  assert.equal(
+    shouldUsePlanFirst({ input: ordinary.originatingRequest, freshSession: false }),
+    false,
+    'ordinary resumed/answered request must fall through to the conversational orchestrator, not a plan card',
+  );
+});
+
+test('continuity re-entry gate: an EXPLICIT-plan originating request still engages the planner', () => {
+  const explicit = surfaceAskingPlan({
+    plan: aPlan(),
+    originatingRequest: 'Draft me a plan first to pull the closed deals into a sheet.',
+    channel: 'discord:gate-explicit',
+  });
+  assert.equal(
+    shouldUsePlanFirst({ input: explicit.originatingRequest, freshSession: false }),
+    true,
+    'an explicit-plan originating request must still re-surface the plan when resumed',
+  );
 });
 
 // ─── classifier prompt builder (pure) ──────────────────────────
