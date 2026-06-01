@@ -2,6 +2,7 @@ import { Runner } from '@openai/agents';
 import { surfacePlan, surfaceAskingPlan } from '../../agents/plan-proposals.js';
 import { buildPlannerAgent, PlanSchema, type Plan } from '../../agents/planner.js';
 import { captureInteractionSignals } from '../../memory/auto-capture.js';
+import { recallHybrid } from '../../memory/recall.js';
 import { getRuntimeEnv } from '../../config.js';
 import type { AutoApproveScope } from '../../agents/proactivity-policy.js';
 import { appendEvent } from './eventlog.js';
@@ -184,11 +185,12 @@ export function shouldUsePlanFirst(input: PlanFirstInput): boolean {
   return false;
 }
 
-function buildPlannerPrompt(input: string, priorAnswers?: string): string {
+export function buildPlannerPrompt(input: string, priorAnswers?: string, memoryContext?: string): string {
   const lines = [
     'Draft a preflight plan for this fresh Clementine request before any external writes or long-running execution begins.',
     'Do not execute the work. Do not call mutating tools. Produce an inspectable plan the user can approve.',
     'If required information is missing, put the shortest possible question in needsUserInput. A plan with needsUserInput is NOT approvable yet.',
+    "If the 'What Clementine already knows' block answers a detail, treat it as known and put it in the plan — only list a question in needsUserInput when memory and the request genuinely do not provide it.",
     'Name the likely tool families or systems in the step text when they are obvious from the request.',
   ];
   if (priorAnswers && priorAnswers.trim().length > 0) {
@@ -197,6 +199,9 @@ function buildPlannerPrompt(input: string, priorAnswers?: string): string {
     );
   }
   lines.push('', `User request:\n${input}`);
+  if (memoryContext && memoryContext.trim().length > 0) {
+    lines.push('', memoryContext.trim());
+  }
   return lines.join('\n\n');
 }
 
@@ -342,6 +347,42 @@ export async function runPlanFirstPreflight(input: PlanFirstRunInput): Promise<P
     // Planning must never fail because opportunistic memory capture failed.
   }
 
+  // Memory-IN: prime the planner with what Clementine already knows BEFORE
+  // it drafts the plan, so it FILLS slots from memory instead of re-asking
+  // the user details memory already holds. Mirrors the main loop's
+  // buildTurnMemoryPrimer; recall must NEVER block planning.
+  let memoryContext = '';
+  let memoryHitCount = 0;
+  try {
+    const hits = await recallHybrid(input.input, { limit: 6 });
+    memoryHitCount = hits.length;
+    const lines = hits
+      .filter((h) => (h.score ?? 0) > 0)
+      .map((h) => `- ${h.title ?? 'note'}: ${h.snippet}`.slice(0, 300));
+    if (lines.length) {
+      memoryContext = `What Clementine already knows (from memory — use this to FILL slots; do NOT ask the user for anything answered here):\n${lines.join('\n')}`;
+    }
+  } catch {
+    // Recall must never block planning — fall through to no memoryContext.
+  }
+  try {
+    appendEvent({
+      sessionId: input.sessionId,
+      turn: 0,
+      role: 'system',
+      type: 'turn_memory_primer',
+      data: {
+        enabled: true,
+        queryPreview: input.input.slice(0, 160),
+        hitCount: memoryHitCount,
+        injected: Boolean(memoryContext),
+        source: 'plan_first',
+      },
+    });
+  } catch {
+    // Event emission must never block planning.
+  }
+
   try {
     appendEvent({
       sessionId: input.sessionId,
@@ -354,7 +395,7 @@ export async function runPlanFirstPreflight(input: PlanFirstRunInput): Promise<P
       workflowName: 'clementine-plan-first',
       groupId: input.sessionId,
     });
-    const result = await runner.run(buildPlannerAgent(), buildPlannerPrompt(input.input, input.priorAnswers), {
+    const result = await runner.run(buildPlannerAgent(), buildPlannerPrompt(input.input, input.priorAnswers, memoryContext), {
       context: { sessionId: input.sessionId, turn: 0 },
       maxTurns: 8,
       toolExecution: { maxFunctionToolConcurrency: 4 },

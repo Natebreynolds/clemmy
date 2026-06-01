@@ -4,6 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  buildPlannerPrompt,
   detectAmbiguousAction,
   planRequiresUserApproval,
   renderPlanFirstFailureReply,
@@ -322,6 +323,42 @@ test('shouldUsePlanFirst: local SEO brief runs through the main orchestrator', (
     }),
     false,
   );
+});
+
+test('buildPlannerPrompt: injects the memory block when memoryContext is provided', () => {
+  const input = 'Pull 10 Salesforce accounts not on the Market Leader list and create Outlook drafts';
+  const memoryContext =
+    'What Clementine already knows (from memory — use this to FILL slots; do NOT ask the user for anything answered here):\n' +
+    '- Market Leader list: salesforce.accounts.nate_market_leaders_stale\n' +
+    '- Outreach template: outlook.email.send standard draft';
+  const prompt = buildPlannerPrompt(input, undefined, memoryContext);
+
+  assert.match(prompt, /User request:/);
+  // The recalled snippet content is injected verbatim.
+  assert.match(prompt, /nate_market_leaders_stale/);
+  assert.match(prompt, /Market Leader list: salesforce\.accounts/);
+  // The planner guidance line must tell it to treat memory as known.
+  assert.match(prompt, /treat it as known and put it in the plan/);
+  // The injected memory block (with its recalled snippet) comes AFTER the
+  // user request. Key off snippet content, not the shared label phrase —
+  // the guidance line also contains "What Clementine already knows".
+  assert.ok(
+    prompt.indexOf('nate_market_leaders_stale') > prompt.indexOf('User request:'),
+    'memory block should follow the user request',
+  );
+});
+
+test('buildPlannerPrompt: unchanged from baseline when memoryContext is empty or absent', () => {
+  const input = 'Pull 10 Salesforce accounts and create Outlook drafts';
+  const baseline = buildPlannerPrompt(input);
+
+  assert.equal(buildPlannerPrompt(input, undefined, ''), baseline);
+  assert.equal(buildPlannerPrompt(input, undefined, '   '), baseline);
+  assert.equal(buildPlannerPrompt(input, undefined, undefined), baseline);
+  // No injected memory snippet leaks into the baseline prompt. (The guidance
+  // line legitimately mentions the "What Clementine already knows" label;
+  // what must NOT appear is an actual recalled snippet block.)
+  assert.doesNotMatch(baseline, /from memory — use this to FILL slots/);
 });
 
 test('shouldUsePlanFirst: a control reply never engages even with the flag on', () => {

@@ -10635,7 +10635,8 @@ const CONSOLE_JS = `
     return path + sep + 'token=' + encodeURIComponent(TOKEN);
   }
 
-  async function reconnectToSupervisorDaemonIfNeeded() {
+  async function reconnectToSupervisorDaemonIfNeeded(options) {
+    const opts = options || {};
     const api = window.clemmy;
     if (!api || typeof api.supervisorStatus !== 'function') return false;
     let status = null;
@@ -10651,14 +10652,22 @@ const CONSOLE_JS = `
     } catch (_) {
       return false;
     }
-    if (target.origin === window.location.origin) return false;
+    if (!opts.forceBootstrap && target.origin === window.location.origin) return false;
+    if (target.href === window.location.href && !opts.forceBootstrap) return false;
     window.location.assign(target.href);
     return true;
   }
 
   async function fetchWithToken(path, init) {
     try {
-      return await fetch(withToken(path), init);
+      const response = await fetch(withToken(path), init);
+      if (response.status === 401 && !TOKEN) {
+        const reconnecting = await reconnectToSupervisorDaemonIfNeeded({ forceBootstrap: true });
+        if (reconnecting) {
+          throw new Error('Reconnected to the live daemon. Send that message again.');
+        }
+      }
+      return response;
     } catch (err) {
       const reconnecting = await reconnectToSupervisorDaemonIfNeeded();
       if (reconnecting) {
@@ -18252,7 +18261,13 @@ const CONSOLE_JS = `
           if (reason === 'plan_first' && planProposalId) {
             setChatTurnPlanApproval(turn, summary, planProposalId);
           } else if (summary) {
-            setChatTurnText(turn, summary);
+            const hasPlanPreview = turn?.dataset?.planPreview === '1';
+            if (hasPlanPreview && existing) {
+              setChatTurnText(turn, existing + '\\n\\nResult:\\n' + summary);
+              if (turn?.dataset) turn.dataset.planPreview = '0';
+            } else {
+              setChatTurnText(turn, summary);
+            }
           } else if (!existing) {
             // No final summary and no intermediate text — fall back to a
             // human-readable reason so the bubble isn't visually blank.
@@ -18488,9 +18503,23 @@ const CONSOLE_JS = `
         return;
       }
       case 'conversation_step': {
+        if (ev.data && ev.data.kind === 'plan_preview') {
+          const decision = ev.data.decision;
+          const stepText = decision ? humanHarnessText(decision.reply || decision.summary, '') : '';
+          if (stepText) {
+            setChatTurnText(turn, stepText);
+            if (turn?.dataset) turn.dataset.planPreview = '1';
+            setChatTurnStatus(turn, 'working plan');
+          }
+          return;
+        }
         const decision = ev.data && ev.data.decision;
         const stepText = decision ? humanHarnessText(decision.reply || decision.summary, '') : '';
         if (stepText) {
+          if (turn?.dataset?.planPreview === '1') {
+            setChatTurnStatus(turn, 'step ' + (ev.data.step || '?'));
+            return;
+          }
           setChatTurnText(turn, stepText);
           setChatTurnStatus(turn, 'step ' + (ev.data.step || '?'));
         }
