@@ -271,6 +271,24 @@ function jaccardOverlap(a: Set<string>, b: Set<string>): number {
  *   - `description` updates only if the input provides one.
  *   - `body` updates only if the input provides one.
  */
+/**
+ * Strip a hardcoded `connected_account_id` (Composio connection id, `ca_…`)
+ * from a saved invocation template. Connection ids ROT — they get re-issued,
+ * duplicated, or revoked — and a stale one baked into a tool-choice silently
+ * breaks the WHOLE toolkit (observed 2026-06-01: Airtable returned
+ * INVALID_PERMISSIONS for every records call because the cached template
+ * pinned a dead `ca_…`). We never persist a specific connection; the composio
+ * client resolves the LIVE connection for the toolkit at call time instead.
+ */
+export function stripBakedConnectionId(template: string | undefined): string | undefined {
+  if (!template) return template;
+  return template
+    .replace(/connected_account_id\s*[=:]\s*["'][^"']*["']\s*,?\s*/g, '')
+    .replace(/,\s*\)/g, ')')
+    .replace(/\(\s*,\s*/g, '(')
+    .trim();
+}
+
 export function rememberToolChoice(input: RememberToolChoiceInput): ToolChoiceRecord {
   const existing = parseRecord(filePathFor(input.intent));
   const now = new Date().toISOString();
@@ -278,7 +296,7 @@ export function rememberToolChoice(input: RememberToolChoiceInput): ToolChoiceRe
   const choice: ToolChoiceRecordChoice = {
     kind: input.choice.kind,
     identifier: input.choice.identifier,
-    invocationTemplate: input.choice.invocationTemplate,
+    invocationTemplate: stripBakedConnectionId(input.choice.invocationTemplate),
     testedAt: input.choice.testedAt ?? now,
     testEvidence: input.choice.testEvidence,
   };

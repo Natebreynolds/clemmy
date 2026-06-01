@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { COMPOSIO_AUTH_CONFIGS_URL, __test__ } from './client.js';
+import { COMPOSIO_AUTH_CONFIGS_URL, __test__, pickToolkitConnection } from './client.js';
 
 test('selectAuthConfigIdForToolkit handles current auth config response shapes', () => {
   const items = [
@@ -19,4 +19,32 @@ test('selectAuthConfigIdForToolkit handles current auth config response shapes',
 
 test('Composio auth-config fallback URL uses the current dashboard path', () => {
   assert.equal(COMPOSIO_AUTH_CONFIGS_URL, 'https://dashboard.composio.dev/~/project/auth-configs');
+});
+
+test('pickToolkitConnection: resolves the live connection only when unambiguous (no stale-id guessing)', () => {
+  const c = (slug: string, connectionId: string, status: string) => ({ slug, connectionId, status });
+  // One connection for the toolkit → deterministic pick.
+  assert.equal(
+    pickToolkitConnection('AIRTABLE_LIST_RECORDS', [c('airtable', 'ca_only', 'ACTIVE')]),
+    'ca_only',
+  );
+  // The real incident: two airtable connections, one dead — pick the single ACTIVE, never the stale one.
+  assert.equal(
+    pickToolkitConnection('AIRTABLE_LIST_RECORDS', [
+      c('airtable', 'ca_dead', 'EXPIRED'),
+      c('airtable', 'ca_good', 'ACTIVE'),
+      c('gmail', 'ca_gmail', 'ACTIVE'), // unrelated toolkit ignored
+    ]),
+    'ca_good',
+  );
+  // Genuinely ambiguous (two ACTIVE for the toolkit) → defer to composio's default.
+  assert.equal(
+    pickToolkitConnection('AIRTABLE_LIST_RECORDS', [
+      c('airtable', 'ca_a', 'ACTIVE'),
+      c('airtable', 'ca_b', 'ACTIVE'),
+    ]),
+    undefined,
+  );
+  // No connection for the toolkit → undefined (composio surfaces a clear no-connection error).
+  assert.equal(pickToolkitConnection('AIRTABLE_LIST_RECORDS', [c('gmail', 'ca_gmail', 'ACTIVE')]), undefined);
 });

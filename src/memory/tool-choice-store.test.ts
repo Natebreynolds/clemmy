@@ -37,10 +37,38 @@ const {
   listToolChoices,
   renderToolChoicesForContext,
   slugifyIntent,
+  stripBakedConnectionId,
 } = await import('./tool-choice-store.js');
 
 test('recallToolChoice returns null when there is no record', () => {
   assert.equal(recallToolChoice('something.that.was.never.remembered'), null);
+});
+
+test('stripBakedConnectionId: a saved choice never pins a (rot-prone) composio connection id', () => {
+  // The exact shape from the Airtable incident.
+  const dirty = 'composio_execute_tool(tool_slug="AIRTABLE_LIST_RECORDS", connected_account_id="ca_RIVsBNuVxfyI", arguments="{...}")';
+  const clean = stripBakedConnectionId(dirty);
+  assert.doesNotMatch(clean ?? '', /connected_account_id/);
+  assert.doesNotMatch(clean ?? '', /ca_RIVsBNuVxfyI/);
+  assert.match(clean ?? '', /tool_slug="AIRTABLE_LIST_RECORDS"/);
+  assert.match(clean ?? '', /arguments=/);
+  assert.doesNotMatch(clean ?? '', /,\s*\)|\(\s*,/); // no dangling comma artifacts
+  // Trailing-position + single-quote variant.
+  assert.doesNotMatch(stripBakedConnectionId("foo(tool_slug='X', connected_account_id='ca_z')") ?? '', /connected_account_id/);
+  // No-op when absent / undefined.
+  assert.equal(stripBakedConnectionId('composio_execute_tool(tool_slug="X", arguments="{}")'), 'composio_execute_tool(tool_slug="X", arguments="{}")');
+  assert.equal(stripBakedConnectionId(undefined), undefined);
+});
+
+test('rememberToolChoice strips a pinned connection id before persisting', () => {
+  rememberToolChoice({
+    intent: 'airtable.records.list',
+    description: 'list',
+    choice: { kind: 'composio', identifier: 'AIRTABLE_LIST_RECORDS', invocationTemplate: 'composio_execute_tool(tool_slug="AIRTABLE_LIST_RECORDS", connected_account_id="ca_STALE123", arguments="{}")' },
+  });
+  const rec = recallToolChoice('airtable.records.list');
+  assert.ok(rec?.choice?.invocationTemplate);
+  assert.doesNotMatch(rec.choice.invocationTemplate ?? '', /connected_account_id|ca_STALE123/);
 });
 
 test('rememberToolChoice + recallToolChoice round-trip by exact slug', () => {

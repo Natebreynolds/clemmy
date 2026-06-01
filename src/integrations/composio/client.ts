@@ -996,13 +996,48 @@ export async function executeComposioTool(
 
   const composio = getComposio();
   if (!composio) throw new Error('COMPOSIO_API_KEY is not configured.');
+  // "Know about the connection, then query the right one": when the caller
+  // didn't pin a connection, deliberately resolve the toolkit's LIVE connection
+  // from connectedAccounts rather than relying on a stale baked id or an opaque
+  // default. resolveToolkitConnectionId only picks when UNAMBIGUOUS, so it can
+  // never guess wrong (falls back to composio's default otherwise).
+  const resolvedConnection = connectedAccountId ?? (await resolveToolkitConnectionId(toolSlug));
   const body: Record<string, unknown> = {
     userId,
     arguments: args,
     dangerouslySkipVersionCheck: true,
   };
-  if (connectedAccountId) body.connectedAccountId = connectedAccountId;
+  if (resolvedConnection) body.connectedAccountId = resolvedConnection;
   return (composio as any).tools.execute(toolSlug, body);
+}
+
+/**
+ * Resolve the connection to use for a toolkit when the caller pinned none.
+ * Returns a connectionId ONLY when unambiguous — exactly one connection for the
+ * toolkit, or exactly one ACTIVE among several — so it never guesses wrong. For
+ * zero or genuinely-ambiguous-multiple it returns undefined and the caller
+ * falls back to composio's own default resolution. This is the durable fix for
+ * stale-connection rot: the live connection is queried per call, never cached
+ * into a tool-choice (see stripBakedConnectionId).
+ */
+export async function resolveToolkitConnectionId(toolSlug: string): Promise<string | undefined> {
+  try {
+    return pickToolkitConnection(toolSlug, await listConnectedToolkits());
+  } catch {
+    return undefined;
+  }
+}
+
+/** Pure selection core of resolveToolkitConnectionId (testable without a live
+ *  Composio call). Picks a connectionId ONLY when unambiguous. */
+export function pickToolkitConnection(toolSlug: string, conns: ConnectedToolkit[]): string | undefined {
+  const lower = toolSlug.toLowerCase();
+  const matched = conns.filter(
+    (c) => c.slug && c.connectionId && lower.startsWith(c.slug.toLowerCase()),
+  );
+  if (matched.length <= 1) return matched[0]?.connectionId; // 0 → undefined; 1 → deterministic
+  const active = matched.filter((c) => /active|enabled|initiat/i.test(c.status));
+  return active.length === 1 ? active[0].connectionId : undefined; // single active wins; else defer
 }
 
 export async function searchComposioToolsViaCli(
