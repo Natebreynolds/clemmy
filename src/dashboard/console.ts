@@ -22933,22 +22933,24 @@ const CONSOLE_JS = `
     // the dev tree or a remote browser pointed at a daemon.
     root.querySelectorAll('[data-cred-codex-reauth]').forEach((btn) => {
       btn.addEventListener('click', async () => {
-        // 2026-05-23: switched from setupCodexLogin to codexReauth. The
-        // former short-circuits on existing fresh tokens and never opens
-        // the browser, so the button looked broken to users who already
-        // had valid creds and just wanted to refresh / switch accounts.
-        // codexReauth always runs the full OAuth dance.
-        const ipc = (window).clemmy && ((window).clemmy.codexReauth || (window).clemmy.setupCodexLogin);
-        if (typeof ipc !== 'function') {
-          alert('Re-authentication is only available inside the Clementine desktop app. From the dev tree, run: npx tsx src/cli/index.ts auth login-native');
-          return;
-        }
+        // Route through the DAEMON's proven native OAuth flow (POST
+        // /api/console/auth/codex-login -> loginWithNativeOAuth) — the SAME path
+        // "clementine auth login-native" uses. We deliberately do NOT call the
+        // Electron-side codex-oauth.ts port: it was a duplicate OAuth
+        // implementation that diverged and failed (the "reauth failed" toast)
+        // while the daemon flow worked. The daemon opens the browser + runs the
+        // localhost callback and writes Clementine's OWN vault only; we await
+        // the full flow, so the button spins until the user finishes signing in.
         const originalLabel = btn.textContent;
         btn.disabled = true;
         btn.textContent = 'OPENING BROWSER…';
         try {
-          const result = await ipc();
-          if (result && result.ok) {
+          const r = await fetchWithToken('/api/console/auth/codex-login', {
+            method: 'POST',
+            headers: { Accept: 'application/json' },
+          });
+          const result = await r.json().catch(() => ({}));
+          if (r.ok && result && result.ok) {
             btn.textContent = 'RE-AUTHENTICATED ✓';
             await refreshCredentialsHealth();
             setTimeout(() => {
@@ -22956,7 +22958,7 @@ const CONSOLE_JS = `
               btn.textContent = originalLabel;
             }, 2000);
           } else {
-            const message = (result && result.error) || 'Re-authentication did not complete';
+            const message = (result && (result.message || result.error)) || ('HTTP ' + r.status);
             alert('Re-auth failed: ' + message);
             btn.disabled = false;
             btn.textContent = originalLabel;

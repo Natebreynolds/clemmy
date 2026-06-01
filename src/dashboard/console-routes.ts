@@ -102,7 +102,7 @@ import { getOrRefreshScan, probe, readCachedScan } from '../runtime/cli-discover
 import { SKILLS_DIR, listSkills, uninstallSkill } from '../memory/skill-store.js';
 import { getSkillInstallJob, startSkillInstall } from '../runtime/skill-installer.js';
 import { getProactivityPolicySnapshot, loadProactivityPolicy, saveProactivityPolicy } from '../agents/proactivity-policy.js';
-import { getAuthStatus } from '../runtime/auth-store.js';
+import { getAuthStatus, loginWithNativeOAuth } from '../runtime/auth-store.js';
 import { getSecretStore, listSecretDescriptors, type SecretName } from '../runtime/secrets/index.js';
 import {
   createCheckInTemplate,
@@ -5442,6 +5442,26 @@ export function registerConsoleRoutes(
       res.json({ ok: true, sessionId, cancelledApprovals: pending.length });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * Re-authenticate Codex via the DAEMON's proven native OAuth flow (the same
+   * path as `clementine auth login-native`). The desktop RE-AUTHENTICATE button
+   * calls this instead of the Electron-side codex-oauth.ts port — one OAuth
+   * implementation, no divergence, and it writes Clementine's OWN vault only
+   * (loginWithNativeOAuth no longer touches ~/.codex/auth.json). The request
+   * awaits the full browser flow (the daemon opens the browser + runs the
+   * localhost callback), so the button shows a spinner until the user finishes
+   * signing in; loginWithNativeCodexOAuth caps the wait at 15 min.
+   */
+  app.post('/api/console/auth/codex-login', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const result = await loginWithNativeOAuth();
+      res.status(result.ok ? 200 : 400).json(result);
+    } catch (err) {
+      res.status(500).json({ ok: false, message: err instanceof Error ? err.message : String(err) });
     }
   });
 
