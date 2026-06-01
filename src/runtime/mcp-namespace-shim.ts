@@ -229,6 +229,17 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): MCPSer
   }
 
   function markServerFailed(server: MCPServer, err: unknown): ServerHealth {
+    // Clear the (possibly resolved) connect promise so the NEXT attempt after
+    // the backoff window actually re-runs server.connect() and respawns the
+    // child. Without this, a server that connected once and whose transport
+    // later died (detected in listTools/callTool, not in connect) keeps the
+    // stale resolved promise forever — ensureConnected short-circuits with
+    // `await existing; return`, so it never truly reconnects ("keeps
+    // disconnecting"), and syncHealthRegistry reads connectPromises.has() as
+    // still-inflight and reports a permanent "connecting…". The connect-path
+    // catch already deletes this; doing it here covers the transport-death path
+    // too, making the fix general for every way a server can fail.
+    connectPromises.delete(server);
     const existing = serverHealth.get(server) ?? {
       state: 'connected' as const,
       failureCount: 0,

@@ -20,6 +20,7 @@ import {
   namespaceToolName,
   parseNamespacedTool,
   slugifyServerName,
+  listMcpServerHealth,
 } from './mcp-namespace-shim.js';
 
 /**
@@ -369,4 +370,69 @@ test('T2.3: callTool on the stub throws BoundaryError(mcp.server_unavailable)', 
       return isBoundary && hasUserMessage;
     },
   );
+});
+
+// --------------------------------------------------------------------
+// Reconnect after transport death — "native MCP servers keep
+// disconnecting" / stuck "CONNECTING…". A server that connected fine
+// and whose transport LATER dies (failure surfaces in listTools, not
+// connect) must (a) not appear permanently "connecting", and (b) be
+// able to actually reconnect — the connect promise must be cleared on
+// failure so ensureConnected re-runs server.connect() and respawns it.
+
+/** Fake server with mutable failure + a live connect counter. */
+function makeFlakyServer(name: string) {
+  const state = { connects: 0, listShouldFail: false };
+  const server: MCPServer = {
+    name,
+    cacheToolsList: false,
+    toolFilter: undefined,
+    async connect() { state.connects++; },
+    async close() {},
+    async listTools() {
+      if (state.listShouldFail) throw new Error(`${name}: transport closed`);
+      return [{ name: 'ping', description: 'p' }] as any;
+    },
+    async callTool() { return { content: [] } as any; },
+    async invalidateToolsCache() {},
+  };
+  return { server, state };
+}
+
+test('shim: a transport death flips health to degraded — NOT stuck "connecting" (stale connect promise)', async () => {
+  const { server, state } = makeFlakyServer('flaky-health-probe');
+  const shim = createMcpNamespaceShim({ servers: [server], cacheToolsList: false });
+
+  await shim.listTools();
+  assert.equal(state.connects, 1);
+  assert.equal(listMcpServerHealth().find((s) => s.slug === 'flaky-health-probe')?.state, 'connected');
+
+  // Transport dies — next listTools surfaces the failure.
+  state.listShouldFail = true;
+  await shim.listTools();
+  const snap = listMcpServerHealth().find((s) => s.slug === 'flaky-health-probe');
+  assert.notEqual(snap?.state, 'connecting', 'a failed server must not read as "connecting" (stale in-flight promise)');
+  assert.equal(snap?.state, 'degraded'); // 1 failure (< 3) → degraded
+});
+
+test('shim: after a transport death + backoff window, the server actually reconnects (connect() re-runs)', async () => {
+  const { server, state } = makeFlakyServer('flaky-reconnect-probe');
+  const shim = createMcpNamespaceShim({ servers: [server], cacheToolsList: false });
+
+  await shim.listTools();
+  assert.equal(state.connects, 1);
+
+  // Kill the transport and let one pass record the failure (failureCount
+  // = 1 → 1s backoff). The stale-promise bug would keep connects at 1
+  // forever; the fix clears the promise so the post-backoff pass reconnects.
+  state.listShouldFail = true;
+  await shim.listTools();
+  assert.equal(state.connects, 1, 'no reconnect yet — inside the backoff window');
+
+  await new Promise((r) => setTimeout(r, 1100)); // first-failure backoff is 1000ms
+  state.listShouldFail = false;
+  await shim.listTools();
+
+  assert.equal(state.connects, 2, 'server.connect() must re-run after the backoff window — a real reconnect');
+  assert.equal(listMcpServerHealth().find((s) => s.slug === 'flaky-reconnect-probe')?.state, 'connected');
 });
