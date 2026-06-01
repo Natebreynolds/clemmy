@@ -1,6 +1,7 @@
 import type { Runner } from '@openai/agents';
 import { appendEvent, writeToolOutput, type EventRow } from './eventlog.js';
 import { scheduleReflection } from '../../memory/reflection.js';
+import { autoInvalidateOnFailure } from './auto-invalidate.js';
 
 /**
  * RunHooks → event log writer.
@@ -301,6 +302,14 @@ export function attachEventLogHooks(
     } catch {
       // see onToolStart
     }
+    // Evolving procedural memory: if this call was a HARD failure of a
+    // remembered tool, self-correct (invalidate the stale memo so the next run
+    // rediscovers). Best-effort; runs AFTER the tool_returned event is logged.
+    autoInvalidateOnFailure({
+      toolName: tool?.name ?? null,
+      args: (details as { toolCall?: { arguments?: unknown } } | undefined)?.toolCall?.arguments,
+      resultStr,
+    });
   };
 
   hooks.on('agent_start', onAgentStart);

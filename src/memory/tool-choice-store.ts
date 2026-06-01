@@ -344,22 +344,28 @@ function mergeFallbacks(
  *
  * Returns the updated record, or null if no record existed.
  */
-export function invalidateToolChoice(intent: string, reason: string): ToolChoiceRecord | null {
+export function invalidateToolChoice(
+  intent: string,
+  reason: string,
+  opts: { automatic?: boolean } = {},
+): ToolChoiceRecord | null {
   const existing = parseRecord(filePathFor(intent));
   if (!existing) return null;
+  // Idempotent: already invalidated (choice null) → no-op success, no re-emit.
+  // This makes a manual invalidate after the automatic one (or vice-versa) a
+  // clean no-op instead of double-counting / re-writing.
+  if (!existing.choice) return existing;
   const now = new Date().toISOString();
-  const newFallbacks = existing.choice
-    ? [
-        ...existing.fallbacks,
-        {
-          kind: existing.choice.kind,
-          identifier: existing.choice.identifier,
-          failedAt: now,
-          reason,
-        } as ToolChoiceRecordFallback,
-      ]
-    : existing.fallbacks;
-  const invalidatedIdentifier = existing.choice?.identifier;
+  const newFallbacks = [
+    ...existing.fallbacks,
+    {
+      kind: existing.choice.kind,
+      identifier: existing.choice.identifier,
+      failedAt: now,
+      reason,
+    } as ToolChoiceRecordFallback,
+  ];
+  const invalidatedIdentifier = existing.choice.identifier;
   const updated = writeRecord({
     intent: existing.intent,
     description: existing.description,
@@ -368,8 +374,21 @@ export function invalidateToolChoice(intent: string, reason: string): ToolChoice
     body: existing.body,
     filePath: existing.filePath,
   });
-  emitToolChoiceEvent('invalidate', intent, invalidatedIdentifier);
+  // Split the telemetry action so background self-correction (automatic) is
+  // visible to operators WITHOUT skewing the recall-hit-rate metric that the
+  // agent-behavior `invalidate` feeds.
+  emitToolChoiceEvent(opts.automatic ? 'auto_invalidate' : 'invalidate', intent, invalidatedIdentifier);
   return updated;
+}
+
+/**
+ * Non-emitting read of a tool-choice record (no recall telemetry). For internal
+ * callers (e.g. additive auto-commit) that must check whether an active choice
+ * already exists WITHOUT firing a recall_hit/recall_miss event and skewing the
+ * north-star recall-hit-rate metric.
+ */
+export function peekToolChoice(intent: string): ToolChoiceRecord | null {
+  return parseRecord(filePathFor(intent));
 }
 
 /** List all recorded tool choices on this machine. Test/debug helper. */
@@ -399,7 +418,7 @@ export function listToolChoices(): ToolChoiceRecord[] {
  * perturb a recall/remember path. The CONTEXT INJECTION (behavior change)
  * is what's flag-gated, not this measurement.
  */
-type ToolChoiceAction = 'recall_hit' | 'recall_hit_fuzzy' | 'recall_miss' | 'remember' | 'invalidate';
+type ToolChoiceAction = 'recall_hit' | 'recall_hit_fuzzy' | 'recall_miss' | 'remember' | 'invalidate' | 'auto_invalidate';
 function emitToolChoiceEvent(action: ToolChoiceAction, intent: string, identifier?: string): void {
   try {
     recordToolEvent({

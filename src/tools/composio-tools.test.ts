@@ -218,3 +218,25 @@ test('auto-remember: a search query is single-use (a later unrelated execute is 
   const rec = recallToolChoice(intent);
   assert.equal(rec?.choice?.identifier, 'FIRST_SLUG', 'only the first execute after the search is keyed');
 });
+
+test('auto-remember is ADDITIVE: it does not overwrite an existing active choice', async () => {
+  const { rememberToolChoice, recallToolChoice } = await import('../memory/tool-choice-store.js');
+  const intent = 'additive guard intent';
+  // A curated/active choice already exists for this intent.
+  rememberToolChoice({ intent, choice: { kind: 'composio', identifier: 'CURATED_SLUG' } });
+  noteComposioSearchIntent('sess-additive', intent);
+  maybeAutoRememberComposioChoice('DIFFERENT_SLUG', {}, { successful: true }, 'sess-additive');
+  // The active choice is untouched — a "better option" routes through a model proposal, not a silent clobber.
+  assert.equal(recallToolChoice(intent)?.choice?.identifier, 'CURATED_SLUG');
+});
+
+test('auto-remember RE-LEARNS after a choice was invalidated (choice cleared → fill again)', async () => {
+  const { rememberToolChoice, invalidateToolChoice, peekToolChoice } = await import('../memory/tool-choice-store.js');
+  const intent = 're-learn after invalidate intent';
+  rememberToolChoice({ intent, choice: { kind: 'composio', identifier: 'OLD_SLUG' } });
+  invalidateToolChoice(intent, 'failed', { automatic: true });
+  assert.equal(peekToolChoice(intent)?.choice, null, 'precondition: choice invalidated');
+  noteComposioSearchIntent('sess-relearn', intent);
+  maybeAutoRememberComposioChoice('NEW_WORKING_SLUG', {}, { successful: true }, 'sess-relearn');
+  assert.equal(peekToolChoice(intent)?.choice?.identifier, 'NEW_WORKING_SLUG', 'auto-commit re-fills an invalidated intent');
+});

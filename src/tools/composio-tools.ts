@@ -12,7 +12,7 @@ import {
 } from '../integrations/composio/client.js';
 import { formatRecallableToolText } from '../runtime/harness/tool-output-format.js';
 import { callIdFromToolDetails, sessionIdFromRunContext } from '../runtime/harness/tool-output-context.js';
-import { rememberToolChoice, stripBakedConnectionId } from '../memory/tool-choice-store.js';
+import { rememberToolChoice, peekToolChoice, stripBakedConnectionId } from '../memory/tool-choice-store.js';
 
 const DYNAMIC_TOOL_PREFIX = 'cx_';
 const MAX_TOOL_NAME_LENGTH = 64;
@@ -231,6 +231,15 @@ export function maybeAutoRememberComposioChoice(
     if (Date.now() - pending.at > AUTO_REMEMBER_WINDOW_MS) return;
     const intent = pending.query.trim();
     if (!intent) return;
+    // Additive only (north star: "propose before update"). Never silently
+    // overwrite an ACTIVE choice — a curated or already-proven one. We fill an
+    // empty intent (first discovery) or a just-invalidated one (choice===null,
+    // post-failure re-learn). A genuinely BETTER option for an already-active
+    // intent is the model's call: it proposes the swap and only the user's
+    // approval triggers a manual tool_choice_remember. Non-emitting peek so
+    // this existence check doesn't skew recall-hit-rate telemetry.
+    const existingChoice = peekToolChoice(intent);
+    if (existingChoice?.choice) return;
     // Compact, connection-free args example as the invocation hint. NEVER bake a
     // connected_account_id into the memo (stale-connection class bug, v0.5.47).
     let template: string | undefined;
