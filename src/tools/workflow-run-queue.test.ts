@@ -6,7 +6,7 @@
  */
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, readdirSync } from 'node:fs';
+import { mkdtempSync, rmSync, readdirSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -14,7 +14,7 @@ const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-wf-queue-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
 process.env.HOME = TMP_HOME;
 
-const { queueWorkflowRun, resumeWorkflowRun } = await import('./workflow-run-queue.js');
+const { queueWorkflowRun, resumeWorkflowRun, requeueWorkflowFromRun } = await import('./workflow-run-queue.js');
 const { writeWorkflow } = await import('../memory/workflow-store.js');
 const { WORKFLOWS_DIR } = await import('../memory/vault.js');
 const { WORKFLOW_RUNS_DIR } = await import('./shared.js');
@@ -85,6 +85,32 @@ test('resumeWorkflowRun: disabled workflow → disabled', () => {
   const result = resumeWorkflowRun('audit-brief', { url: 'https://x.com' });
   assert.equal(result.status, 'disabled');
   assert.equal(runFiles().length, 0);
+});
+
+test('requeueWorkflowFromRun re-queues a failed run with its original inputs (build→fix→re-run loop)', () => {
+  writeAuditWorkflow();
+  // Simulate a prior FAILED run record (terminal → not a dedupe target).
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  const origId = 'orig-failed-run';
+  writeFileSync(
+    path.join(WORKFLOW_RUNS_DIR, `${origId}.json`),
+    JSON.stringify({ id: origId, workflow: 'audit-brief', inputs: { url: 'https://revill.co.uk' }, status: 'error' }),
+    'utf-8',
+  );
+  const rq = requeueWorkflowFromRun(origId);
+  assert.equal(rq.status, 'queued');
+  // A NEW queued run exists for the same workflow + inputs.
+  const queued = readdirSync(WORKFLOW_RUNS_DIR)
+    .filter((f) => f.endsWith('.json') && f !== `${origId}.json`)
+    .map((f) => JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, f), 'utf-8')) as { workflow: string; inputs: Record<string, string>; status: string });
+  assert.equal(queued.length, 1);
+  assert.equal(queued[0].workflow, 'audit-brief');
+  assert.equal(queued[0].inputs.url, 'https://revill.co.uk');
+  assert.equal(queued[0].status, 'queued');
+});
+
+test('requeueWorkflowFromRun: missing original run → not_found (best-effort, no throw)', () => {
+  assert.equal(requeueWorkflowFromRun('does-not-exist').status, 'not_found');
 });
 
 test.after(() => {

@@ -42,6 +42,7 @@ const {
   explainDeterministicSpawnError,
   reapResolvedParkedRuns,
   executeStep,
+  findContractViolationStep,
 } = await import('./workflow-runner.js');
 const { readWorkflowEvents } = await import('./workflow-events.js');
 const { HarnessSession } = await import('../runtime/harness/session.js');
@@ -410,6 +411,22 @@ test('deterministic step ENFORCES its output contract (regression guard: routes 
   const out = await executeStep(okStep, mkCtx('det-ok'));
   assert.deepEqual(out, { ok: true });
   assert.ok(readWorkflowEvents('det-contract-test', 'det-ok').map((e) => e.kind).includes('step_completed'));
+});
+
+test('findContractViolationStep: finds the most-recent output_contract failure with its problems', () => {
+  const events = [
+    { t: '1', kind: 'step_started', stepId: 'a' },
+    { t: '2', kind: 'step_failed', stepId: 'a', meta: { reason: 'output_contract', problems: ['missing required output key "url"'] } },
+  ] as never;
+  const cv = findContractViolationStep(events);
+  assert.equal(cv?.stepId, 'a');
+  assert.deepEqual(cv?.problems, ['missing required output key "url"']);
+});
+
+test('findContractViolationStep: null when the failure is not a contract violation', () => {
+  assert.equal(findContractViolationStep([{ t: '1', kind: 'step_failed', stepId: 'a', meta: { reason: 'transient' } }] as never), null);
+  assert.equal(findContractViolationStep([{ t: '1', kind: 'step_completed', stepId: 'a' }] as never), null);
+  assert.equal(findContractViolationStep([] as never), null);
 });
 
 // Cleanup the temp BASE_DIR.

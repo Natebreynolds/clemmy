@@ -118,3 +118,39 @@ export function resumeWorkflowRun(name: string, rawInputs: Record<string, string
   const queued = queueWorkflowRun(name, normalized);
   return { status: queued.status, id: queued.id, message: queued.message };
 }
+
+export interface RequeueResult {
+  status: 'queued' | 'duplicate' | 'not_found';
+  id?: string;
+  message: string;
+}
+
+/**
+ * Re-queue a workflow from a PRIOR run's record — the build→fail→fix→re-run
+ * loop: after an approved Doctor fix is applied to the workflow definition, run
+ * it again with the SAME inputs so the fix is exercised immediately. Reads the
+ * prior run file by id; returns not_found if it's gone (best-effort, never
+ * throws into the caller — the fix is already applied either way).
+ */
+export function requeueWorkflowFromRun(originalRunId: string): RequeueResult {
+  const safe = originalRunId.replace(/[^a-zA-Z0-9_.:-]/g, '');
+  const file = path.join(WORKFLOW_RUNS_DIR, `${safe}.json`);
+  if (!existsSync(file)) {
+    return { status: 'not_found', message: `Original run "${originalRunId}" not found; nothing to re-queue.` };
+  }
+  let rec: { workflow?: unknown; inputs?: unknown };
+  try {
+    rec = JSON.parse(readFileSync(file, 'utf-8')) as { workflow?: unknown; inputs?: unknown };
+  } catch {
+    return { status: 'not_found', message: 'Original run record unreadable; nothing to re-queue.' };
+  }
+  const workflow = typeof rec.workflow === 'string' ? rec.workflow : undefined;
+  if (!workflow) return { status: 'not_found', message: 'Original run record has no workflow name.' };
+  const inputs = normalizeWorkflowRunInputs(
+    rec.inputs && typeof rec.inputs === 'object' && !Array.isArray(rec.inputs)
+      ? (rec.inputs as Record<string, string>)
+      : {},
+  );
+  const queued = queueWorkflowRun(workflow, inputs);
+  return { status: queued.status, id: queued.id, message: queued.message };
+}

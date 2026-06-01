@@ -14,6 +14,7 @@ import { MODELS } from '../config.js';
 import { addRunEvent, finishRun, getRun, listRuns, startRun, type RunRecord } from '../runtime/run-events.js';
 import { loadProactivityPolicy } from '../agents/proactivity-policy.js';
 import { applyProposedFix, dismissProposedFix, listProposedFixes, loadProposedFix } from '../execution/workflow-diagnosis.js';
+import { requeueWorkflowFromRun } from '../tools/workflow-run-queue.js';
 import type { ToolActivity } from '../types.js';
 
 const logger = pino({ name: 'clementine-next.gateway' });
@@ -379,9 +380,19 @@ export class ClementineGateway {
         return { sessionId: request.sessionId, handledControl: true, text: `I couldn't find proposed fix ${command.id}. Use \`fixes\` to list current ones.` };
       }
       const result = applyProposedFix(command.id);
-      const text = result.ok
+      let text = result.ok
         ? `✅ ${result.message}`
         : `I didn't apply ${command.id}: ${result.message}${result.errors?.length ? `\n${result.errors.join('\n')}` : ''}`;
+      if (result.ok) {
+        // Close the loop: re-run the workflow with the original inputs so the
+        // approved fix is exercised immediately. Best-effort — the fix is
+        // applied regardless of whether the re-queue succeeds.
+        try {
+          const requeue = requeueWorkflowFromRun(fix.runId);
+          if (requeue.status === 'queued') text += `\n↻ Re-running "${fix.workflow}" now — ${requeue.message}`;
+          else if (requeue.status === 'duplicate') text += `\n(An identical run is already queued; not duplicating.)`;
+        } catch { /* re-queue is best-effort */ }
+      }
       return { sessionId: request.sessionId, handledControl: true, text };
     }
 

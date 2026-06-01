@@ -20,6 +20,8 @@ import {
   appendWorkflowEvent,
   computeResumeState,
   listPendingRuns,
+  readWorkflowEvents,
+  type WorkflowEvent,
 } from './workflow-events.js';
 import { HarnessSession } from '../runtime/harness/session.js';
 import {
@@ -39,6 +41,7 @@ import {
   selfHealEnabled,
   type WorkflowDiagnosis,
   type ProposedFix,
+  type BlockedStep,
 } from './workflow-diagnosis.js';
 import { takeStepResult } from '../tools/step-result-tool.js';
 import { configureHarnessRuntime } from '../runtime/harness/codex-client.js';
@@ -1335,6 +1338,31 @@ export function finalizeStepOutput(
   return output;
 }
 
+/**
+ * Find the step that FAILED its declared output contract from a run's events
+ * (most recent first). Contract violations THROW (vs the {blocked:true}
+ * channel), so they land in the run's error path and never reach the
+ * success-with-blocked diagnosis. The error path uses this to route the
+ * violation into the Doctor for an approval-gated fix. Pure + exported for tests.
+ */
+export function findContractViolationStep(
+  events: WorkflowEvent[],
+): { stepId: string; problems: string[] } | null {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i];
+    if (e.kind !== 'step_failed') continue;
+    const meta = (e as { meta?: { reason?: unknown; problems?: unknown } }).meta;
+    if (!meta || meta.reason !== 'output_contract') continue;
+    const stepId = typeof e.stepId === 'string' ? e.stepId : undefined;
+    if (!stepId) continue;
+    const problems = Array.isArray(meta.problems)
+      ? meta.problems.filter((p): p is string => typeof p === 'string')
+      : [];
+    return { stepId, problems };
+  }
+  return null;
+}
+
 export async function executeStep(
   step: WorkflowStepInput,
   ctx: StepExecutionContext,
@@ -2207,14 +2235,59 @@ async function processOneRunFile(
         finishedAt: new Date().toISOString(),
         error: message,
       });
+      // Contract-aware self-heal: a step that FAILED its declared output
+      // contract throws to here (contract failures throw, so they bypass the
+      // success-with-blocked diagnosis above). Route it to the Doctor for an
+      // approval-gated fix offer + a legible message. Additive + gated: only
+      // when self-heal is on AND a real contract violation is found, so
+      // non-contract / cancelled failures are byte-identical to before.
+      let healTitle: string | undefined;
+      let healBody: string | undefined;
+      let healFixId: string | null = null;
+      if (!cancelled && selfHealEnabled()) {
+        try {
+          const cv = findContractViolationStep(readWorkflowEvents(workflow.name, run.id));
+          if (cv) {
+            const blocked: BlockedStep[] = [{
+              stepId: cv.stepId,
+              reason: `output contract violation: ${cv.problems.join('; ') || message}`,
+              kind: 'blocked',
+            }];
+            const diagnosis = await diagnoseWorkflowBlock({
+              workflow: workflow.data,
+              blockedSteps: blocked,
+              toolErrors: cv.problems.length ? cv.problems : [message],
+            });
+            if (diagnosis) {
+              healFixId = recordProposedFix(workflow.name, run.id, diagnosis)?.id ?? null;
+              const outcome = renderLegibleOutcome({
+                workflowName: run.workflow,
+                blockedSteps: blocked,
+                diagnosis,
+                fixId: healFixId,
+                fallbackBody: message,
+              });
+              healTitle = outcome.title;
+              healBody = outcome.body;
+            }
+          }
+        } catch (healErr) {
+          logger.warn({ err: healErr, runId: run.id }, 'contract-violation self-heal failed (best-effort)');
+        }
+      }
       addNotification({
         id: `${Date.now()}-workflow-${run.id}-${cancelled ? 'cancelled' : 'error'}`,
         kind: 'workflow',
-        title: cancelled ? `Workflow cancelled: ${run.workflow}` : `Workflow failed: ${run.workflow}`,
-        body: message,
+        title: healTitle ?? (cancelled ? `Workflow cancelled: ${run.workflow}` : `Workflow failed: ${run.workflow}`),
+        body: healBody ?? message,
         createdAt: new Date().toISOString(),
         read: false,
-        metadata: { workflow: run.workflow, runId: run.id, status: cancelled ? 'cancelled' : 'error' },
+        metadata: {
+          workflow: run.workflow,
+          runId: run.id,
+          status: cancelled ? 'cancelled' : 'error',
+          ...(healFixId ? { proposedFixId: healFixId, needsAttention: true } : {}),
+        },
       });
       markRunNotified(filePath);
       try {
