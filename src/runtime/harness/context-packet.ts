@@ -270,7 +270,7 @@ export function buildAgentContextPacket(
     ...renderCandidates('Likely skills', skills, 'If one is relevant, call skill_read before creating the deliverable.'),
     ...renderCandidates('Likely workflows', workflows, 'Use these as reusable-process candidates. Run one only if the user explicitly named or asked for that workflow; otherwise do the work directly and offer to save a workflow later.'),
     healthWarnings.length > 0 ? `Health warnings:\n${healthWarnings.map((w) => `- ${w}`).join('\n')}` : 'Health warnings: none.',
-    'Parallelism reminder: for independent batches, call run_worker in parallel or use an existing workflow forEach instead of serial one-by-one work.',
+    'Parallelism reminder: for independent batches, resolve shared tools/context once, then call run_worker with one structured packet per item in parallel or use an existing workflow forEach.',
     'Approval reminder: batch related writes/sends under one clear approval with a preview whenever possible.',
   ].filter((line): line is string => Boolean(line));
 

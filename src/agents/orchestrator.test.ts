@@ -142,7 +142,7 @@ test('Orchestrator is now the single agent — carries the union of all action t
     // Conversation tools
     'ask_user_question', 'request_approval', 'notify_user',
     // Planning
-    'draft_plan',
+    'draft_plan', 'share_plan',
   ];
   for (const name of required) {
     assert.ok(toolNames.includes(name), `expected single-agent surface to include ${name}, got: ${toolNames.join(',')}`);
@@ -155,6 +155,33 @@ test('Orchestrator is now the single agent — carries the union of all action t
   for (const name of ['run_researcher', 'run_writer', 'run_reviewer', 'run_executor', 'run_deployer']) {
     assert.equal(toolNames.includes(name), false, `${name} should be removed in Phase 3`);
   }
+});
+
+test('run_worker requires a structured parent-planned job packet', async () => {
+  const agent = await buildOrchestratorAgent();
+  const runWorker = (agent.tools ?? []).find((t) => (t as { name?: string }).name === 'run_worker') as {
+    description?: string;
+    parameters?: {
+      properties?: Record<string, unknown>;
+      required?: string[];
+      additionalProperties?: boolean;
+    };
+  } | undefined;
+
+  assert.ok(runWorker, 'expected run_worker on orchestrator surface');
+  assert.match(runWorker.description ?? '', /structured parent-planned job packet/);
+  assert.match(runWorker.description ?? '', /exact resolved tool slugs/);
+  assert.deepEqual(runWorker.parameters?.required, [
+    'objective',
+    'item',
+    'resolvedTools',
+    'context',
+    'instructions',
+    'expectedOutput',
+  ]);
+  assert.equal(runWorker.parameters?.additionalProperties, false);
+  assert.ok(runWorker.parameters?.properties?.resolvedTools);
+  assert.equal(Object.hasOwn(runWorker.parameters?.properties ?? {}, 'input'), false);
 });
 
 test('Orchestrator has NO handoffs in Phase 3 (single-agent architecture)', async () => {

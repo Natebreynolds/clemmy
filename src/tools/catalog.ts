@@ -69,6 +69,7 @@ export const LOCAL_MCP_TOOL_NAMES = [
   'list_pending_check_ins',
   'answer_check_in',
   'propose_check_in_template',
+  'share_plan',
   'surface_plan',
   'execution_list',
   'execution_get',

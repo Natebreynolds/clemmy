@@ -2,10 +2,11 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { addNotification } from '../runtime/notifications.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
+import { appendEvent } from '../runtime/harness/eventlog.js';
 import { answerCheckIn, closeCheckIn, createCheckIn, listOpenCheckIns, validateCheckInQuestion } from '../agents/check-ins.js';
 import { proposeCheckInTemplate } from '../agents/check-in-proposals.js';
 import { surfacePlan } from '../agents/plan-proposals.js';
-import { PlanSchema } from '../agents/planner.js';
+import { PlanSchema, type Plan } from '../agents/planner.js';
 import { textResult } from './shared.js';
 
 /**
@@ -22,6 +23,47 @@ import { textResult } from './shared.js';
  * delegate, reply_request) needs context-aware identity propagation —
  * that lands in Phase 3 alongside native handoffs.
  */
+
+function compactLine(value: string, max = 180): string {
+  const compact = value.replace(/\s+/g, ' ').trim();
+  if (compact.length <= max) return compact;
+  return `${compact.slice(0, Math.max(0, max - 1)).trimEnd()}...`;
+}
+
+function renderSharedPlan(plan: Plan, message?: string): string {
+  const steps = plan.steps
+    .slice(0, 6)
+    .map((step) => `${step.n}. ${compactLine(step.action, 220)}`);
+  const criteria = plan.successCriteria
+    .slice(0, 4)
+    .map((item) => `- ${compactLine(item, 180)}`);
+  const instructions = (plan.appliedInstructions ?? [])
+    .slice(0, 4)
+    .map((item) => `- ${compactLine(item, 180)}`);
+  const risks = plan.risks
+    .slice(0, 3)
+    .map((item) => `- ${compactLine(item, 180)}`);
+
+  return [
+    message?.trim() || 'Here is the working plan I am using before I start the tool work.',
+    '',
+    `Goal: ${compactLine(plan.objective, 260)}`,
+    '',
+    'Plan:',
+    ...steps,
+    criteria.length ? '' : null,
+    criteria.length ? 'Success check:' : null,
+    ...criteria,
+    instructions.length ? '' : null,
+    instructions.length ? "Instructions I'm following:" : null,
+    ...instructions,
+    risks.length ? '' : null,
+    risks.length ? 'Risks / constraints:' : null,
+    ...risks,
+  ]
+    .filter((part): part is string => typeof part === 'string')
+    .join('\n');
+}
 
 export function registerAutonomyActionTools(server: McpServer): void {
   server.tool(
@@ -119,6 +161,90 @@ export function registerAutonomyActionTools(server: McpServer): void {
       if (!resolved) return textResult(`No check-in found with id ${id}.`);
       if (resolved.status !== 'answered') return textResult(`Check-in ${id} was already in status ${resolved.status} — no change.`);
       return textResult(`Check-in ${id} answered. The agent (${resolved.agentSlug}) will pick this up on its next cycle.`);
+    },
+  );
+
+  server.tool(
+    'share_plan',
+    [
+      'Share a non-blocking working plan in the current chat before continuing.',
+      'Use after `draft_plan` for complex but safe local/read-only work where the user should see how you will proceed, but no approval is required.',
+      'Do NOT use when needsUserInput is non-empty — ask the missing question instead.',
+      'Do NOT use for significant/large/tracked/external-write plans that require review; use `surface_plan` for those.',
+      'This does not persist a PlanProposal, does not notify Discord separately, and does not create approval buttons. It only makes your plan visible in the live chat/event trace.',
+      'Pass the EXACT plan JSON you received from draft_plan in the `planJson` argument.',
+    ].join(' '),
+    {
+      planJson: z.string().min(20).describe('The JSON plan exactly as draft_plan returned it. Will be parsed and validated against PlanSchema.'),
+      originatingRequest: z.string().min(4).max(2000).describe('The user request that triggered the plan. Used only as trace context.'),
+      sessionId: z.string().optional().describe('The chat/session to render the plan into. Defaults to the current tool-output context session.'),
+      message: z.string().min(8).max(500).optional().describe('Optional concise preface, e.g. "I found enough context to proceed; here is the working plan."'),
+    },
+    async ({ planJson, originatingRequest, sessionId, message }) => {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(planJson);
+      } catch (err) {
+        return textResult(`share_plan failed: planJson is not valid JSON (${err instanceof Error ? err.message : String(err)}).`);
+      }
+      const planResult = PlanSchema.safeParse(parsed);
+      if (!planResult.success) {
+        return textResult(`share_plan failed: planJson did not match PlanSchema. ${planResult.error.message}`);
+      }
+      if (planResult.data.needsUserInput.length > 0) {
+        return textResult([
+          'share_plan refused: the plan still needs user input.',
+          'Ask the user this clarification instead:',
+          ...planResult.data.needsUserInput.map((q) => `- ${q}`),
+        ].join('\n'));
+      }
+
+      const ctx = getToolOutputContext();
+      const targetSessionId = sessionId?.trim() || ctx?.sessionId;
+      const preview = renderSharedPlan(planResult.data, message);
+      if (!targetSessionId) {
+        return textResult([
+          'Working plan ready, but no sessionId was available to render it into chat.',
+          preview,
+        ].join('\n\n'));
+      }
+
+      try {
+        appendEvent({
+          sessionId: targetSessionId,
+          turn: 0,
+          role: 'Clem',
+          type: 'conversation_step',
+          data: {
+            kind: 'plan_preview',
+            originatingRequest,
+            decision: {
+              summary: `Shared working plan: ${planResult.data.objective}`,
+              reply: preview,
+              done: false,
+              nextAction: 'completed',
+            },
+            plan: {
+              objective: planResult.data.objective,
+              estimatedComplexity: planResult.data.estimatedComplexity,
+              recommendsTrackedExecution: planResult.data.recommendsTrackedExecution,
+              steps: planResult.data.steps.map((step) => ({
+                n: step.n,
+                action: step.action,
+              })),
+            },
+          },
+        });
+      } catch (err) {
+        return textResult(`share_plan failed to render in chat: ${err instanceof Error ? err.message : String(err)}`);
+      }
+
+      return textResult([
+        'Working plan shared in the current chat.',
+        `Objective: ${planResult.data.objective}`,
+        `Complexity: ${planResult.data.estimatedComplexity}; ${planResult.data.steps.length} step(s).`,
+        'Continue executing the plan now unless a later tool boundary asks for approval.',
+      ].join('\n'));
     },
   );
 

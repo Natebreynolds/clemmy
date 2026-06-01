@@ -299,6 +299,7 @@ function createMainWindow(url: string): BrowserWindow {
     minHeight: 720,
     title: 'Clementine',
     backgroundColor: '#07070a',
+    acceptFirstMouse: true,
     titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
     webPreferences: {
       // Use a non-persistent Electron session. The dashboard gets a
@@ -315,9 +316,9 @@ function createMainWindow(url: string): BrowserWindow {
   });
   guardWindow(win, ['dashboard']);
   win.loadURL(url);
-  // Auto-open DevTools when running unpackaged (dev mode) so renderer
-  // errors are visible without the user having to know ⌘⌥I.
-  if (!app.isPackaged) {
+  // Keep DevTools opt-in for local testing; attached DevTools changes
+  // focus/click behavior enough to make the dev app feel broken.
+  if (!app.isPackaged && process.env.CLEMMY_DESKTOP_DEVTOOLS === '1') {
     win.webContents.openDevTools({ mode: 'right' });
   }
   win.on('close', (event: { preventDefault(): void }) => {

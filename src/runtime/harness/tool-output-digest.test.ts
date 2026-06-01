@@ -58,3 +58,82 @@ test('no callId: still a digest, but recovery hint is the re-run advice', () => 
   assert.match(digest, /narrower scope/);
   assert.doesNotMatch(digest, /tool_output_query/);
 });
+
+test('Composio search catalog digest preserves exact slugs and compact input fields', () => {
+  const catalog = {
+    configured: true,
+    connectedToolkits: Array.from({ length: 50 }, (_, i) => ({
+      toolkit: `toolkit_${i}`,
+      connectionId: `ca_${i}`,
+      status: 'ACTIVE',
+    })),
+    searchedToolkits: ['dataforseo'],
+    query: 'dataforseo keyword research',
+    count: 2,
+    matches: [
+      {
+        toolkit: 'dataforseo',
+        slug: 'DATAFORSEO_LABS_GOOGLE_KEYWORDS_FOR_SITE',
+        name: 'Keywords for site',
+        description: 'Returns Google keywords for a target website with volume and cost data.',
+        score: 27,
+        inputParameters: {
+          type: 'object',
+          required: ['target', 'location_name'],
+          properties: {
+            target: { type: 'string', description: 'Domain or URL to research' },
+            location_name: { type: 'string' },
+            language_name: { type: 'string' },
+          },
+        },
+      },
+      {
+        toolkit: 'dataforseo',
+        slug: 'DATAFORSEO_SERP_GOOGLE_ORGANIC_LIVE_ADVANCED',
+        name: 'Organic SERP live advanced',
+        description: 'Returns live organic SERP results.',
+        score: 18,
+      },
+    ],
+    nextStep: 'Pick the best match, then call composio_execute_tool.',
+  };
+
+  const digest = digestToolOutput(JSON.stringify(catalog), {
+    maxChars: 1800,
+    toolName: 'composio_search_tools',
+    callId: 'call_catalog',
+  });
+
+  assert.match(digest, /composio_catalog/);
+  assert.match(digest, /DATAFORSEO_LABS_GOOGLE_KEYWORDS_FOR_SITE/);
+  assert.match(digest, /DATAFORSEO_SERP_GOOGLE_ORGANIC_LIVE_ADVANCED/);
+  assert.match(digest, /target:string/);
+  assert.match(digest, /location_name/);
+  assert.match(digest, /tool_output_query\("call_catalog"/);
+});
+
+test('Composio list catalog digest keeps slug index instead of only top-level shape', () => {
+  const tools = Array.from({ length: 60 }, (_, i) => ({
+    slug: `DATAFORSEO_TOOL_${String(i).padStart(2, '0')}`,
+    name: `DataForSEO tool ${i}`,
+    description: `Detailed schema-heavy action ${i}`,
+    inputParameters: {
+      type: 'object',
+      properties: {
+        target: { type: 'string' },
+        location_name: { type: 'string' },
+      },
+    },
+  }));
+
+  const digest = digestToolOutput(JSON.stringify({ toolkit: 'dataforseo', count: tools.length, tools }), {
+    maxChars: 2400,
+    toolName: 'composio_list_tools',
+    callId: 'call_list',
+  });
+
+  assert.match(digest, /availableSlugs/);
+  assert.match(digest, /DATAFORSEO_TOOL_00/);
+  assert.match(digest, /DATAFORSEO_TOOL_10/);
+  assert.doesNotMatch(digest, /top-level key/);
+});

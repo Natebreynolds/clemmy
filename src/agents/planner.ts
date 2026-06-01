@@ -139,7 +139,7 @@ export function buildPlannerTool(): Tool<RuntimeContextValue> {
       'Do NOT use for trivial single-tool actions or read-only lookups.',
       'The planner is read-only — calling it does not mutate anything.',
       'Returns a JSON plan with objective, steps, successCriteria, risks, estimatedComplexity, recommendsTrackedExecution, needsUserInput, and appliedInstructions (the standing instructions from memory this plan follows — surfaced to the user for review).',
-      'After receiving the plan, decide: (a) execute it yourself or hand off to Executor, (b) ask the user the needsUserInput questions first, (c) refine by calling draft_plan again with more context, or (d) tell the user the plan and let them approve.',
+      'After receiving the plan, decide: (a) execute it yourself, using share_plan first when the user should see a safe working plan, (b) ask the user the needsUserInput questions first, (c) refine by calling draft_plan again with more context, or (d) surface_plan when it needs review/approval.',
     ].join(' '),
     customOutputExtractor: async (output) => {
       // The planner agent's finalOutput is the parsed PlanSchema value.

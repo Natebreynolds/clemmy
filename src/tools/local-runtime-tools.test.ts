@@ -28,6 +28,7 @@ test('local runtime tools include autonomy, execution, run tracking, and profile
   for (const required of [
     'ask_user_question',
     'notify_user',
+    'share_plan',
     'execution_update_step',
     'execution_complete',
     'execution_pause',

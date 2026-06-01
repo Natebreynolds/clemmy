@@ -202,9 +202,10 @@ const ALWAYS_READ = new Set<string>([
   // The QUESTION itself isn't the approval gate; the AGENT's response
   // to the user's answer might be, and that's a separate tool call.
   'ask_user_question',
-  // draft_plan / propose_check_in_template / surface_plan — planning
+  // draft_plan / share_plan / propose_check_in_template / surface_plan — planning
   // surfaces, agent-internal. Not network mutations.
   'draft_plan',
+  'share_plan',
   'surface_plan',
   'propose_check_in_template',
   // workflow_run only queues a local workflow run record. The workflow

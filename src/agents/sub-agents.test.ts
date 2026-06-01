@@ -62,3 +62,14 @@ test('Worker is a LEAF (has no handoffs of its own)', async () => {
   const handoffs = (worker as unknown as { handoffs?: unknown[] }).handoffs;
   assert.ok(!handoffs || (Array.isArray(handoffs) && handoffs.length === 0), 'Worker should be a leaf');
 });
+
+test('Worker instructions honor parent-planned packets and one retry', async () => {
+  const worker = await buildWorkerAgent();
+  const instructions = (worker as unknown as { instructions?: string }).instructions ?? '';
+
+  assert.match(instructions, /\[WORKER JOB PACKET\]/);
+  assert.match(instructions, /resolvedTools\/context\/instructions as authoritative/);
+  assert.match(instructions, /do NOT rediscover those same capabilities/);
+  assert.match(instructions, /retry that call ONCE/);
+  assert.match(instructions, /Return a single line starting with "ERROR:"/);
+});

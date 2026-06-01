@@ -96,6 +96,127 @@ function digestObject(obj: Record<string, unknown>, totalChars: number, maxChars
   return `{\n${lines.join('\n')}\n}${footer}`;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === 'object' && !Array.isArray(value));
+}
+
+function asStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is string => typeof item === 'string');
+}
+
+function truncate(value: string | undefined, max = 240): string | undefined {
+  if (!value) return undefined;
+  return value.length <= max ? value : `${value.slice(0, max - 1)}…`;
+}
+
+function schemaSummary(inputParameters: unknown): Record<string, unknown> | undefined {
+  if (!isRecord(inputParameters)) return undefined;
+  const properties = isRecord(inputParameters.properties) ? inputParameters.properties : undefined;
+  const required = asStringArray(inputParameters.required);
+  const fields: string[] = [];
+
+  if (properties) {
+    for (const [name, value] of Object.entries(properties)) {
+      const field = isRecord(value) ? value : {};
+      const type = typeof field.type === 'string' ? field.type : 'unknown';
+      const description = typeof field.description === 'string' ? ` — ${truncate(field.description, 80)}` : '';
+      fields.push(`${name}:${type}${description}`);
+      if (fields.length >= 24) break;
+    }
+  }
+
+  const out: Record<string, unknown> = {};
+  if (required.length) out.required = required.slice(0, 24);
+  if (fields.length) out.fields = fields;
+  return Object.keys(out).length ? out : undefined;
+}
+
+function compactComposioCatalogItem(item: unknown): Record<string, unknown> | null {
+  if (!isRecord(item)) return null;
+  const slug = typeof item.slug === 'string' ? item.slug : undefined;
+  if (!slug) return null;
+
+  const compact: Record<string, unknown> = { slug };
+  if (typeof item.toolkit === 'string') compact.toolkit = item.toolkit;
+  if (typeof item.name === 'string') compact.name = item.name;
+  if (typeof item.description === 'string') compact.description = truncate(item.description);
+  if (typeof item.score === 'number') compact.score = item.score;
+  const inputSummary = schemaSummary(item.inputParameters);
+  if (inputSummary) compact.inputParameters = inputSummary;
+  return compact;
+}
+
+function fitStringList(values: string[], maxChars: number): { shown: string[]; omitted: number } {
+  const shown: string[] = [];
+  let used = 2; // []
+  for (const value of values) {
+    const serialized = JSON.stringify(value);
+    if (used + serialized.length + 1 > maxChars && shown.length > 0) break;
+    shown.push(value);
+    used += serialized.length + 1;
+  }
+  return { shown, omitted: values.length - shown.length };
+}
+
+function digestComposioCatalog(
+  obj: Record<string, unknown>,
+  totalChars: number,
+  maxChars: number,
+  toolName: string,
+  callId: string | null | undefined,
+): string | null {
+  if (toolName !== 'composio_search_tools' && toolName !== 'composio_list_tools') return null;
+
+  const listKey = Array.isArray(obj.matches) ? 'matches' : Array.isArray(obj.tools) ? 'tools' : null;
+  if (!listKey) return null;
+
+  const records = (obj[listKey] as unknown[]).map(compactComposioCatalogItem).filter((item): item is Record<string, unknown> => Boolean(item));
+  const slugs = records.map((item) => item.slug).filter((slug): slug is string => typeof slug === 'string');
+  const budget = Math.max(700, maxChars - 520);
+  const slugBudget = Math.max(240, Math.min(4000, Math.floor(budget * 0.4)));
+  const fittedSlugs = fitStringList(slugs, slugBudget);
+  const slugKey = listKey === 'matches' ? 'matchingSlugs' : 'availableSlugs';
+
+  const base: Record<string, unknown> = {
+    digestKind: 'composio_catalog',
+  };
+  if (typeof obj.configured === 'boolean') base.configured = obj.configured;
+  if (typeof obj.toolkit === 'string') base.toolkit = obj.toolkit;
+  if (typeof obj.query === 'string') base.query = obj.query;
+  if (Array.isArray(obj.searchedToolkits)) base.searchedToolkits = obj.searchedToolkits;
+  if (typeof obj.count === 'number') base.count = obj.count;
+  base[slugKey] = fittedSlugs.shown;
+  if (fittedSlugs.omitted > 0) base.omittedSlugs = fittedSlugs.omitted;
+
+  const shown: Record<string, unknown>[] = [];
+  const build = () => JSON.stringify({
+    ...base,
+    [listKey]: shown,
+    nextStep: obj.nextStep ?? `Pick an exact slug from ${slugKey}, then call composio_execute_tool with that slug.`,
+  }, null, 1);
+
+  let body = build();
+  for (const record of records) {
+    shown.push(record);
+    const candidate = build();
+    if (candidate.length > budget && shown.length > 1) {
+      shown.pop();
+      break;
+    }
+    body = candidate;
+    if (body.length > budget) break;
+  }
+
+  const moreRecords = records.length - shown.length;
+  const footer =
+    `\n[digest: ${toolName} returned a Composio tool catalog with ${records.length} slug${records.length === 1 ? '' : 's'} ` +
+    `(~${totalChars.toLocaleString()} chars). Preserved ${fittedSlugs.shown.length} exact slug${fittedSlugs.shown.length === 1 ? '' : 's'} ` +
+    `and ${shown.length} compact record${shown.length === 1 ? '' : 's'}${moreRecords > 0 ? `; ${moreRecords} compact record(s) not shown` : ''}. ` +
+    `${recoveryHint(callId)}]`;
+  return body + footer;
+}
+
 function digestText(text: string, maxChars: number, toolName: string, callId: string | null | undefined): string {
   const lines = text.split('\n');
   const footerReserve = 300;
@@ -121,6 +242,9 @@ export function digestToolOutput(text: string, options: DigestOptions = {}): str
   const callId = options.callId ?? null;
   const parsed = tryParse(text);
   if (Array.isArray(parsed)) return digestArray(parsed, text.length, maxChars, toolName, callId);
-  if (parsed && typeof parsed === 'object') return digestObject(parsed as Record<string, unknown>, text.length, maxChars, toolName, callId);
+  if (parsed && typeof parsed === 'object') {
+    const obj = parsed as Record<string, unknown>;
+    return digestComposioCatalog(obj, text.length, maxChars, toolName, callId) ?? digestObject(obj, text.length, maxChars, toolName, callId);
+  }
   return digestText(text, maxChars, toolName, callId);
 }

@@ -132,8 +132,9 @@ export class ConfirmFirstRequiredError extends Error {
     const shapePart = opts.shapeKey ? ` (${opts.shapeKey})` : '';
     super(
       `CONFIRM_FIRST_REQUIRED: this is same-shape external write #${opts.count}${shapePart} — a batch (threshold ${opts.threshold}) with no instruction-reviewed plan for this session. ` +
-        `Before continuing the batch, call \`draft_plan\` then \`surface_plan\` with: what you're about to do, the standing instructions you're following, and a preview — then STOP until the user approves ("Plan approved: <objective>"). ` +
-        `Approval opens a plan scope that covers the rest of the batch (including worker fan-out). If a stored instruction looks wrong for this objective, flag it and offer to remove it before proceeding.`,
+        `Before continuing the batch, surface the plan for approval (\`draft_plan\` then \`surface_plan\`) and STOP until the user approves ("Plan approved: <objective>"). ` +
+        `State what you'll do as you'd say it to a colleague — a plain one-line summary plus a short preview; do NOT recite this message or list the instructions you reviewed. ` +
+        `Approval opens a plan scope that covers the rest of the batch (including worker fan-out). If a stored instruction looks wrong for this objective, flag that one and offer to remove it before proceeding.`,
     );
     this.name = 'ConfirmFirstRequiredError';
     this.toolName = opts.toolName;
