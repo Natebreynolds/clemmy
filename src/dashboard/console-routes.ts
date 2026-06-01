@@ -5603,6 +5603,20 @@ export function registerConsoleRoutes(
             input: turnInput,
             sessionId,
             autonomy,
+            // Surface continuity notes (workflow resumed, set-aside, re-ask)
+            // into the desktop stream the same way the cancel path does, so
+            // desktop reaches parity with Discord's sendFollowup.
+            sendNote: async (message: string) => {
+              try {
+                appendHarnessEvent({
+                  sessionId,
+                  turn: 0,
+                  role: 'system',
+                  type: 'conversation_completed',
+                  data: { summary: message, reason: 'plan_continuity_note', steps: 0 },
+                });
+              } catch { /* note is best-effort */ }
+            },
           });
           if (continuity.handled) return;
         }
@@ -5626,7 +5640,7 @@ export function registerConsoleRoutes(
           });
           return;
         }
-        await runConversation({ agent, sessionId, input: turnInput });
+        await runConversation({ agent, sessionId, input: turnInput, judgeCompletion: true });
       } catch (err) {
         // The loop emits its own run_failed when a turn throws. If we
         // got here, the throw happened BEFORE any turn started

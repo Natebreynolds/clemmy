@@ -19,9 +19,9 @@ import path from 'node:path';
 const TEST_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-plan-continuity-'));
 process.env.CLEMENTINE_HOME = TEST_HOME;
 
-const { surfaceAskingPlan, surfacePlan, listPlanProposals, supersedePlanProposal, rejectPlanProposal } =
+const { surfaceAskingPlan, surfacePlan, listPlanProposals, supersedePlanProposal, rejectPlanProposal, surfaceWorkflowPendingInputs, setWorkflowPendingInputValues, getPlanProposal } =
   await import('../../agents/plan-proposals.js');
-const { findOpenQuestionPlan, planContinuityEnabled, buildClassifierPrompt } =
+const { findOpenQuestionPlan, findOpenWorkflowPendingInputs, buildClassifierPrompt, buildWorkflowInputClassifierPrompt } =
   await import('./plan-continuity.js');
 const { shouldUsePlanFirst } = await import('./plan-first.js');
 
@@ -121,25 +121,6 @@ test('listPlanProposals: filters by channel', () => {
   assert.equal(a[0].channel, 'discord:A');
 });
 
-// ─── flag gating ───────────────────────────────────────────────
-
-test('planContinuityEnabled: reflects the env flag', () => {
-  const prev = process.env.CLEMMY_PLAN_CONTINUITY;
-  try {
-    delete process.env.CLEMMY_PLAN_CONTINUITY;
-    assert.equal(planContinuityEnabled(), true);
-    process.env.CLEMMY_PLAN_CONTINUITY = 'off';
-    assert.equal(planContinuityEnabled(), false);
-    process.env.CLEMMY_PLAN_CONTINUITY = 'on';
-    assert.equal(planContinuityEnabled(), true);
-    process.env.CLEMMY_PLAN_CONTINUITY = 'ON';
-    assert.equal(planContinuityEnabled(), true);
-  } finally {
-    if (prev === undefined) delete process.env.CLEMMY_PLAN_CONTINUITY;
-    else process.env.CLEMMY_PLAN_CONTINUITY = prev;
-  }
-});
-
 // ─── force-replan removal contract ─────────────────────────────
 //
 // routeOpenQuestionPlan used to pass `force: true` into
@@ -177,6 +158,55 @@ test('continuity re-entry gate: an EXPLICIT-plan originating request still engag
     true,
     'an explicit-plan originating request must still re-surface the plan when resumed',
   );
+});
+
+// ─── workflow ask-then-resume (data-flow, no model) ────────────
+
+test('surfaceWorkflowPendingInputs → findOpenWorkflowPendingInputs round-trips by session', () => {
+  surfaceWorkflowPendingInputs({
+    workflowName: 'audit-brief',
+    requiredInputs: ['url'],
+    providedInputs: {},
+    sessionId: 'sess-wf-1',
+    originatingRequest: 'Run the "audit-brief" workflow',
+  });
+  const found = findOpenWorkflowPendingInputs('sess-wf-1');
+  assert.ok(found, 'pending workflow-inputs record found by session');
+  assert.equal(found!.kind, 'workflow_pending_inputs');
+  assert.equal(found!.workflowName, 'audit-brief');
+  assert.deepEqual(found!.requiredInputs, ['url']);
+  // scoped to the session
+  assert.equal(findOpenWorkflowPendingInputs('sess-other'), null);
+});
+
+test('findOpenQuestionPlan ignores workflow_pending_inputs records (they route by session)', () => {
+  surfaceWorkflowPendingInputs({
+    workflowName: 'audit-brief',
+    requiredInputs: ['url'],
+    sessionId: 'sess-wf-2',
+    channel: 'desktop',
+  });
+  // Even on a matching channel, the channel path must not claim it.
+  assert.equal(findOpenQuestionPlan('desktop'), null);
+});
+
+test('setWorkflowPendingInputValues accumulates supplied values', () => {
+  const p = surfaceWorkflowPendingInputs({
+    workflowName: 'multi-wf',
+    requiredInputs: ['url', 'topic'],
+    providedInputs: { url: 'https://x.com' },
+    sessionId: 'sess-wf-3',
+  });
+  setWorkflowPendingInputValues(p.id, { topic: 'SEO' });
+  const updated = getPlanProposal(p.id);
+  assert.deepEqual(updated!.pendingInputValues, { url: 'https://x.com', topic: 'SEO' });
+});
+
+test('buildWorkflowInputClassifierPrompt includes workflow name, missing inputs, and the message', () => {
+  const prompt = buildWorkflowInputClassifierPrompt('audit-brief', ['url', 'topic'], 'use https://revill.co.uk');
+  assert.match(prompt, /audit-brief/);
+  assert.match(prompt, /url, topic/);
+  assert.match(prompt, /use https:\/\/revill\.co\.uk/);
 });
 
 // ─── classifier prompt builder (pure) ──────────────────────────

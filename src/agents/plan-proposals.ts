@@ -65,6 +65,21 @@ export interface PlanProposal {
    * approved. The original `plan` field is preserved for audit.
    */
   approvedPlan?: Plan;
+  /**
+   * Discriminator. Default (absent) === 'plan' — an ordinary drafted plan.
+   * 'workflow_pending_inputs' is the ask-then-resume record: a workflow that
+   * could not run because required inputs were missing. The user's next reply
+   * supplies them and the run resumes (see plan-continuity). Carries the
+   * workflow-specific fields below; its synthetic `plan` exists only so the
+   * shared persistence + classifier machinery works unchanged.
+   */
+  kind?: 'plan' | 'workflow_pending_inputs';
+  /** workflow_pending_inputs: the workflow to resume. */
+  workflowName?: string;
+  /** workflow_pending_inputs: required input names that were missing. */
+  requiredInputs?: string[];
+  /** workflow_pending_inputs: inputs accumulated so far across replies. */
+  pendingInputValues?: Record<string, string>;
   version: 'v1';
 }
 
@@ -250,6 +265,87 @@ export function surfaceAskingPlan(input: SurfacePlanInput): PlanProposal {
     'asking plan persisted (plan-continuity)',
   );
   return proposal;
+}
+
+export interface SurfaceWorkflowPendingInputsInput {
+  workflowName: string;
+  /** Required input names that were missing on the attempted run. */
+  requiredInputs: string[];
+  /** Inputs already supplied on the attempted run (carried forward). */
+  providedInputs?: Record<string, string>;
+  sessionId?: string;
+  channel?: string;
+  originatingRequest?: string;
+}
+
+/**
+ * Persist a "workflow can't run — inputs missing" record so the user's NEXT
+ * reply can supply the values and resume the run, instead of the model being
+ * told to retry a call its schema can't vary (the 84× loop). Like
+ * surfaceAskingPlan, this does NOT queue an approval notification — the short
+ * ask is surfaced to the user through the tool's text result; this only
+ * durably records what we're waiting on, keyed by session.
+ */
+export function surfaceWorkflowPendingInputs(input: SurfaceWorkflowPendingInputsInput): PlanProposal {
+  const missing = input.requiredInputs.map((k) => k.trim()).filter((k) => k.length > 0);
+  if (missing.length === 0) {
+    throw new Error('surfaceWorkflowPendingInputs requires at least one missing input name');
+  }
+  const objective = `Run the "${input.workflowName}" workflow`;
+  const plan: Plan = {
+    objective,
+    steps: [
+      {
+        n: 1,
+        action: `Queue the "${input.workflowName}" workflow once its required input(s) are supplied: ${missing.join(', ')}.`,
+        rationale: 'The workflow cannot run until every required input has a value.',
+        verification: null,
+      },
+    ],
+    successCriteria: [`The "${input.workflowName}" workflow is queued with all required inputs.`],
+    risks: [],
+    estimatedComplexity: 'trivial',
+    recommendsTrackedExecution: false,
+    needsUserInput: missing.slice(0, 5).map((key) => `What is the value for "${key}"?`),
+    appliedInstructions: [],
+  };
+  const now = new Date().toISOString();
+  const proposal: PlanProposal = {
+    id: `wfask-${randomUUID().slice(0, 8)}`,
+    proposedAt: now,
+    proposedByAgent: 'clementine',
+    status: 'pending',
+    originatingRequest: input.originatingRequest?.trim() || objective,
+    sessionId: input.sessionId,
+    channel: input.channel,
+    plan,
+    kind: 'workflow_pending_inputs',
+    workflowName: input.workflowName,
+    requiredInputs: missing,
+    pendingInputValues: { ...(input.providedInputs ?? {}) },
+    version: 'v1',
+  };
+  writeProposal(proposal);
+  logger.info(
+    { proposalId: proposal.id, workflowName: input.workflowName, missing, sessionId: input.sessionId },
+    'workflow pending-inputs ask surfaced',
+  );
+  return proposal;
+}
+
+/**
+ * Merge newly-supplied input values into a pending workflow-inputs proposal.
+ * Returns the updated record, or null if the proposal is gone / resolved.
+ */
+export function setWorkflowPendingInputValues(id: string, values: Record<string, string>): PlanProposal | null {
+  const proposal = readProposal(id);
+  if (!proposal || proposal.status !== 'pending') return null;
+  const updated: PlanProposal = {
+    ...proposal,
+    pendingInputValues: { ...(proposal.pendingInputValues ?? {}), ...values },
+  };
+  writeProposal(updated);
+  return updated;
 }
 
 export function getPlanProposal(id: string): PlanProposal | null {

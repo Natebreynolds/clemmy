@@ -33,6 +33,8 @@ import {
   predictTurnCost,
 } from './budget.js';
 import { MODELS } from '../../config.js';
+import { judgeObjectiveComplete, type ObjectiveJudgeFn } from './objective-judge.js';
+import { classifyMessageIntent } from '../../assistant/message-intent.js';
 import { attachEventLogHooks, extractSessionIdFromContext, type RunHooksLike } from './hooks.js';
 import * as approvalRegistry from './approval-registry.js';
 import { actionBus } from '../action-bus.js';
@@ -669,6 +671,16 @@ export interface RunConversationOptions {
   maxTurns?: number;
   /** Forwarded to each underlying runTurn(). */
   toolCallsPerTurn?: number;
+  /**
+   * Opt-in: gate the orchestrator's self-declared completion with an
+   * INDEPENDENT objective-completion judge (Hermes-style). Only interactive
+   * chat callers set this; workflow-step executions (which also use
+   * runConversation) leave it off so step contracts own their own completion.
+   * Even when true, the judge only fires for multi-step ACTION objectives.
+   */
+  judgeCompletion?: boolean;
+  /** Test injection for the objective judge (defaults to judgeObjectiveComplete). */
+  judgeFn?: ObjectiveJudgeFn;
   /** Test injection. */
   makeRunner?: () => Runner;
   /** Test injection. */
@@ -1075,6 +1087,19 @@ async function runConversationCore(
   // runConversation() call starts from zero.
   let stallRetriesUsed = 0;
 
+  // Independent objective-completion judge (Hermes-style). Only for interactive
+  // chat callers (opt-in) AND multi-step ACTION objectives — so trivial
+  // lookups/chat and workflow steps are never judged. The judge catches the
+  // model declaring "done" before the artifact actually exists, and injects a
+  // continuation instead of yielding. Bounded so a stubborn judge can't loop
+  // forever; fails open (judge defaults to done) so it never wedges.
+  const objectiveJudge = options.judgeFn ?? judgeObjectiveComplete;
+  const objectiveJudgeEnabled =
+    options.judgeCompletion === true && classifyMessageIntent(options.input).intent === 'action';
+  const objective = options.input;
+  const MAX_OBJECTIVE_JUDGE_CONTINUATIONS = 3;
+  let objectiveJudgeContinuations = 0;
+
   while (stepIndex < maxSteps) {
     stepIndex += 1;
 
@@ -1363,6 +1388,42 @@ async function runConversationCore(
     }
 
     if (decision.done) {
+      // Independent completion gate (Hermes-style): the model just declared
+      // itself done. For a multi-step action objective, verify with an
+      // INDEPENDENT judge before yielding — LLMs over-declare completion
+      // ("here's what I'd do", a promise instead of the artifact), which is
+      // what turns the agent back into a chatbot you have to re-prompt. If the
+      // judge sees no real evidence, inject a continuation and keep working.
+      // Bounded + fail-open (judge defaults to done) so it can never wedge.
+      if (
+        objectiveJudgeEnabled &&
+        decision.nextAction === 'completed' &&
+        objectiveJudgeContinuations < MAX_OBJECTIVE_JUDGE_CONTINUATIONS
+      ) {
+        const responseText = decision.reply && decision.reply.trim() ? decision.reply : decision.summary;
+        const verdict = await objectiveJudge(objective, responseText ?? '');
+        if (!verdict.done) {
+          objectiveJudgeContinuations += 1;
+          safeAppend({
+            sessionId: options.sessionId,
+            turn: turnResult.turn,
+            role: 'system',
+            type: 'heartbeat',
+            data: {
+              kind: 'progress_check_in',
+              steps: stepIndex,
+              message: 'Checked the objective — not done yet, continuing.',
+              objectiveJudge: { attempt: objectiveJudgeContinuations, reason: verdict.reason },
+            },
+          });
+          nextInput = [
+            `You marked this objective complete, but an independent verification check found it is NOT finished: ${verdict.reason}.`,
+            'Do not stop and do not ask the user — keep working and actually produce the missing deliverable.',
+            'Only set done=true with nextAction=completed once the real artifact or verifiable evidence (a URL, file path, emitted result) genuinely exists.',
+          ].join(' ');
+          continue;
+        }
+      }
       // Render priority on the chat surface: prefer `reply` (the
       // natural-language message intended for the user) over `summary`
       // (an internal log entry).

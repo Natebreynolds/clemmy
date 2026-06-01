@@ -179,7 +179,7 @@ interface JudgeResult {
  * a confident-sounding but incomplete assistant response usually
  * fails on.
  */
-const JUDGE_SYSTEM_PROMPT = [
+export const JUDGE_SYSTEM_PROMPT = [
   'You are a goal-completion judge. You receive (1) a user objective and (2) the most recent assistant response.',
   '',
   'Use an AUDIT CHECKLIST: enumerate the concrete, verifiable deliverables the objective implies, then check each one against the assistant\'s response.',

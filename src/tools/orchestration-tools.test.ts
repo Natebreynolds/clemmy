@@ -12,7 +12,7 @@ process.env.CLEMENTINE_HOME = TMP_HOME;
 process.env.HOME = TMP_HOME;
 
 const { registerOrchestrationTools } = await import('./orchestration-tools.js');
-const { writeWorkflow } = await import('../memory/workflow-store.js');
+const { writeWorkflow, readWorkflow } = await import('../memory/workflow-store.js');
 const { WORKFLOWS_DIR } = await import('../memory/vault.js');
 const { WORKFLOW_RUNS_DIR } = await import('./shared.js');
 
@@ -34,6 +34,18 @@ function resetState(): void {
 function workflowRun(): ToolHandler {
   const handler = handlers.get('workflow_run');
   assert.ok(handler, 'workflow_run registered');
+  return handler;
+}
+
+function workflowCreate(): ToolHandler {
+  const handler = handlers.get('workflow_create');
+  assert.ok(handler, 'workflow_create registered');
+  return handler;
+}
+
+function workflowUpdate(): ToolHandler {
+  const handler = handlers.get('workflow_update');
+  assert.ok(handler, 'workflow_update registered');
   return handler;
 }
 
@@ -103,6 +115,48 @@ test('workflow_run queues with normalized URL aliases', async () => {
   };
   assert.equal(run.inputs.url, 'https://www.aldouslaw.com/');
   assert.equal(run.inputs.website, 'https://www.aldouslaw.com/');
+});
+
+test('workflow_create accepts an inputs SCHEMA as a JSON string and persists it', async () => {
+  // New contract: workflow_create/_update `inputs` is a JSON STRING (the open
+  // z.record map filled {} under strict mode). The model authors the schema as
+  // a JSON object string; the handler parses it into def.inputs.
+  const result = await workflowCreate()({
+    name: 'audit-wf',
+    description: 'Audit a site.',
+    steps: [{ id: 'normalize', prompt: 'Normalize {{input.url}}.' }],
+    inputs: JSON.stringify({ url: { type: 'string', description: 'Site to audit' } }),
+  });
+  assert.match(resultText(result), /Created workflow "audit-wf"/);
+
+  const entry = readWorkflow('audit-wf');
+  assert.ok(entry, 'workflow persisted');
+  assert.deepEqual(entry!.data.inputs, { url: { type: 'string', description: 'Site to audit' } });
+});
+
+test('workflow_create rejects malformed inputs schema JSON without creating', async () => {
+  const result = await workflowCreate()({
+    name: 'bad-wf',
+    description: 'x',
+    steps: [{ id: 's', prompt: 'Fetch and summarize the prospect site.' }],
+    inputs: '{url: not json}',
+  });
+  assert.match(resultText(result), /invalid workflow inputs schema json/i);
+  assert.equal(readWorkflow('bad-wf'), null);
+});
+
+test('workflow_update accepts an inputs SCHEMA JSON string and updates def.inputs', async () => {
+  await workflowCreate()({
+    name: 'up-wf',
+    description: 'x',
+    steps: [{ id: 's', prompt: 'Fetch and summarize the prospect site.' }],
+  });
+  const result = await workflowUpdate()({
+    name: 'up-wf',
+    inputs: JSON.stringify({ domain: { type: 'string' } }),
+  });
+  assert.match(resultText(result), /updated/);
+  assert.deepEqual(readWorkflow('up-wf')!.data.inputs, { domain: { type: 'string' } });
 });
 
 test('workflow_run does not queue duplicate active runs for identical inputs', async () => {

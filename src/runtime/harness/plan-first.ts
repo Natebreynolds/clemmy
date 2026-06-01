@@ -3,7 +3,6 @@ import { surfacePlan, surfaceAskingPlan } from '../../agents/plan-proposals.js';
 import { buildPlannerAgent, PlanSchema, type Plan } from '../../agents/planner.js';
 import { captureInteractionSignals } from '../../memory/auto-capture.js';
 import { recallHybrid } from '../../memory/recall.js';
-import { getRuntimeEnv } from '../../config.js';
 import type { AutoApproveScope } from '../../agents/proactivity-policy.js';
 import { appendEvent } from './eventlog.js';
 
@@ -65,16 +64,6 @@ const DOMAIN_PATTERNS: RegExp[] = [
 function planFirstDisabled(): boolean {
   const raw = process.env.CLEMMY_PLAN_FIRST;
   return typeof raw === 'string' && /^(0|false|off|no)$/i.test(raw.trim());
-}
-
-/**
- * Flag gate for plan-continuity (persist the asking plan + fold in answers
- * on the next message). Default on because it only activates after the
- * planner has already asked a concrete question; set
- * CLEMMY_PLAN_CONTINUITY=off to return to legacy fire-and-forget asks.
- */
-function planContinuityEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_PLAN_CONTINUITY', 'on') ?? 'on').toLowerCase() !== 'off';
 }
 
 function domainCount(input: string): number {
@@ -140,8 +129,6 @@ export function detectAmbiguousAction(
 
 const EXPLICIT_PLAN_FIRST_RE =
   /\b(?:plan\s+first|draft\s+(?:me\s+)?a\s+plan|create\s+(?:me\s+)?a\s+plan|make\s+(?:me\s+)?a\s+plan|show\s+me\s+(?:the\s+)?plan|before\s+you\s+start[, ]+(?:plan|outline)|approve\s+(?:the\s+)?plan)\b/i;
-const EXTERNAL_MUTATION_RE =
-  /\b(?:send|post|publish|deploy|host|update|append|create|draft|write|delete|remove)\b[\s\S]{0,90}\b(?:outlook|email|emails|salesforce|crm|airtable|google\s+sheets?|googlesheets?|spreadsheet|slack|github|pull\s+request|netlify|vercel|railway)\b|\b(?:outlook|email|emails|salesforce|crm|airtable|google\s+sheets?|googlesheets?|spreadsheet|slack|github|pull\s+request|netlify|vercel|railway)\b[\s\S]{0,90}\b(?:send|post|publish|deploy|host|update|append|create|draft|write|delete|remove)\b/i;
 
 export function shouldUsePlanFirst(input: PlanFirstInput): boolean {
   if (planFirstDisabled()) return false;
@@ -418,23 +405,21 @@ export async function runPlanFirstPreflight(input: PlanFirstRunInput): Promise<P
     });
 
     if (plan.needsUserInput.length > 0) {
-      // Plan-continuity (flag-gated): persist the ASKING plan so the user's
-      // next message can be classified against it and folded back in, even
-      // across session rollover. Flag off → no proposal persisted (legacy).
+      // Plan-continuity: persist the ASKING plan so the user's next message
+      // can be classified against it and folded back in, even across session
+      // rollover. Always on (rollout flag removed per feedback_no_rollout_flags).
       let askingProposalId: string | undefined;
-      if (planContinuityEnabled()) {
-        try {
-          const askingProposal = surfaceAskingPlan({
-            plan,
-            originatingRequest: input.input,
-            sessionId: input.sessionId,
-            channel: input.channel,
-            context: 'Plan awaiting your answers before execution.',
-          });
-          askingProposalId = askingProposal?.id;
-        } catch {
-          // Persisting the asking plan must never break the ask itself.
-        }
+      try {
+        const askingProposal = surfaceAskingPlan({
+          plan,
+          originatingRequest: input.input,
+          sessionId: input.sessionId,
+          channel: input.channel,
+          context: 'Plan awaiting your answers before execution.',
+        });
+        askingProposalId = askingProposal?.id;
+      } catch {
+        // Persisting the asking plan must never break the ask itself.
       }
       appendEvent({
         sessionId: input.sessionId,

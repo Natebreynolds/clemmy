@@ -1,14 +1,16 @@
 import { Agent, Runner } from '@openai/agents';
 import { z } from 'zod';
-import { MODELS, getRuntimeEnv } from '../../config.js';
-import { listPlanProposals, supersedePlanProposal, type PlanProposal } from '../../agents/plan-proposals.js';
+import { MODELS } from '../../config.js';
+import { listPlanProposals, setWorkflowPendingInputValues, supersedePlanProposal, type PlanProposal } from '../../agents/plan-proposals.js';
+import { resumeWorkflowRun } from '../../tools/workflow-run-queue.js';
 import type { AutoApproveScope } from '../../agents/proactivity-policy.js';
 import type { RuntimeContextValue } from '../../types.js';
 import { normalizeZodForCodexStrict } from '../schema-normalizer.js';
 import { runPlanFirstPreflight } from './plan-first.js';
 
 /**
- * Plan continuity (flag `CLEMMY_PLAN_CONTINUITY`, default on).
+ * Plan continuity (always on — the CLEMMY_PLAN_CONTINUITY rollout flag was
+ * removed per feedback_no_rollout_flags; validated behavior is the default).
  *
  * When Clementine drafts a plan that ASKS the user a question, that asking
  * plan is now persisted as a pending PlanProposal (see surfaceAskingPlan).
@@ -20,10 +22,6 @@ import { runPlanFirstPreflight } from './plan-first.js';
  * after the session compacted or rolled over (the proposal is on disk, keyed
  * by channel).
  */
-
-export function planContinuityEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_PLAN_CONTINUITY', 'on') ?? 'on').toLowerCase() !== 'off';
-}
 
 function proposalNeedsUserInput(proposal: PlanProposal): boolean {
   const plan = proposal.plan;
@@ -39,7 +37,25 @@ export function findOpenQuestionPlan(channel: string): PlanProposal | null {
   // listPlanProposals already sorts newest-first by proposedAt.
   const pending = listPlanProposals({ status: 'pending', channel });
   for (const proposal of pending) {
+    // workflow_pending_inputs records are routed by session (the tool that
+    // creates them has no channel) — never let the channel path claim one.
+    if (proposal.kind === 'workflow_pending_inputs') continue;
     if (proposalNeedsUserInput(proposal)) return proposal;
+  }
+  return null;
+}
+
+/**
+ * Find the most-recent pending workflow_pending_inputs record for this
+ * session. These are created inside the workflow_run tool (which only has a
+ * sessionId, not a channel), so they are keyed and resumed by session — chat
+ * sessions stay stable across turns, so the next reply finds the record.
+ */
+export function findOpenWorkflowPendingInputs(sessionId: string): PlanProposal | null {
+  if (!sessionId) return null;
+  const pending = listPlanProposals({ status: 'pending', sessionId });
+  for (const proposal of pending) {
+    if (proposal.kind === 'workflow_pending_inputs' && proposal.workflowName) return proposal;
   }
   return null;
 }
@@ -146,6 +162,110 @@ export async function classifyAgainstPlan(
   }
 }
 
+// ── workflow-input continuity ────────────────────────────────────────────
+// A pending workflow run needs NAMED input values. The classifier returns an
+// ARRAY of {name,value} pairs (named properties fill reliably under codex
+// strict mode, unlike an open map — the same lesson as the workflow_run bug)
+// plus an intent label so a clear pivot or "never mind" doesn't get parsed as
+// a value.
+
+const WorkflowInputClassificationSchema = z.object({
+  kind: z.enum(['answers', 'new_topic', 'abandon']).describe(
+    'How the new message relates to the workflow we are waiting to run: answers=it supplies input value(s); new_topic=a clearly different request; abandon=drop the run.',
+  ),
+  values: z.array(
+    z.object({
+      name: z.string().describe('Exactly one of the required input names listed.'),
+      value: z.string().describe('The value the user supplied for that input.'),
+    }),
+  ).describe('Input name/value pairs extracted from the message. Empty array if none.'),
+  confidence: z.number().min(0).max(1).describe('0..1 confidence in the kind label.'),
+  reason: z.string().describe('One short sentence explaining the classification.'),
+});
+
+export function buildWorkflowInputClassifierPrompt(
+  workflowName: string,
+  missingInputs: string[],
+  message: string,
+): string {
+  return [
+    `Clementine tried to run the "${workflowName}" workflow but is waiting on required input value(s) before it can start. The user just sent a new message. Decide how it relates and extract any values.`,
+    '',
+    `Required input names still needed: ${missingInputs.join(', ')}`,
+    '',
+    `The user's new message:\n${message}`,
+    '',
+    'Choose exactly one kind:',
+    '- answers: the message supplies value(s) for one or more of the required inputs. Put each into values as {name, value}, using ONLY the names listed above. If a single input is needed and the whole message is plainly that value, return it as that input.',
+    '- new_topic: a clearly different request, unrelated to the inputs the workflow needs.',
+    '- abandon: the user wants to drop the run ("never mind", "forget it", "cancel that").',
+    '',
+    'Bias toward "answers" whenever the message plausibly supplies a needed value. Normalize obvious wrappers (e.g. "use https://x.com" → value "https://x.com").',
+  ].join('\n');
+}
+
+function buildWorkflowInputClassifierAgent(): Agent<RuntimeContextValue, typeof WorkflowInputClassificationSchema> {
+  return new Agent<RuntimeContextValue, typeof WorkflowInputClassificationSchema>({
+    name: 'WorkflowInputClassifier',
+    instructions: [
+      'You extract workflow input values from a user message and classify intent.',
+      'Return only the structured classification. Do not call tools. Do not execute anything.',
+    ].join('\n\n'),
+    model: MODELS.fast,
+    outputType: normalizeZodForCodexStrict(WorkflowInputClassificationSchema) as typeof WorkflowInputClassificationSchema,
+    tools: [],
+  });
+}
+
+export interface WorkflowInputClassification {
+  kind: 'answers' | 'new_topic' | 'abandon';
+  values: Record<string, string>;
+  confidence: number;
+  reason: string;
+}
+
+/**
+ * Classify a reply against a pending workflow run + extract named input
+ * values. Fails SAFE: on any error, if exactly one input is still missing the
+ * whole message is taken as that value (the user was just asked for it), so a
+ * classifier hiccup never strands the run.
+ */
+export async function classifyWorkflowInputAnswers(
+  workflowName: string,
+  missingInputs: string[],
+  message: string,
+): Promise<WorkflowInputClassification> {
+  const singleInputFallback = (): WorkflowInputClassification => ({
+    kind: 'answers',
+    values: missingInputs.length === 1 ? { [missingInputs[0]]: message.trim() } : {},
+    confidence: 0.3,
+    reason: 'classifier unavailable — defaulting to treat the reply as the answer',
+  });
+  try {
+    const runner = new Runner({ workflowName: 'clementine-workflow-input-continuity' });
+    const result = await runner.run(
+      buildWorkflowInputClassifierAgent(),
+      buildWorkflowInputClassifierPrompt(workflowName, missingInputs, message),
+      { maxTurns: 1 },
+    );
+    const parsed = WorkflowInputClassificationSchema.safeParse(result.finalOutput);
+    if (!parsed.success) return singleInputFallback();
+    const allowed = new Set(missingInputs);
+    const values: Record<string, string> = {};
+    for (const pair of parsed.data.values) {
+      if (allowed.has(pair.name) && pair.value.trim().length > 0) values[pair.name] = pair.value.trim();
+    }
+    // The model said "answers" but didn't map a value, and only one input is
+    // outstanding → take the whole message as that value.
+    if (parsed.data.kind === 'answers' && Object.keys(values).length === 0 && missingInputs.length === 1) {
+      values[missingInputs[0]] = message.trim();
+    }
+    return { kind: parsed.data.kind, values, confidence: parsed.data.confidence, reason: parsed.data.reason };
+  } catch {
+    return singleInputFallback();
+  }
+}
+
 export interface PlanContinuityRouteInput {
   channel: string;
   input: string;
@@ -167,10 +287,71 @@ export interface PlanContinuityRouteResult {
  * future harness surface should all use the same continuity decision so a
  * user's short answer does not become a fresh unrelated turn.
  */
+/**
+ * Resume a workflow that stalled on missing inputs: classify the reply, merge
+ * any supplied values, and either queue the run, re-ask for what's still
+ * missing (once, bounded by the next user reply), or set it aside on a pivot.
+ * Never re-enters a model-driven retry — the queue is done in code.
+ */
+async function routeWorkflowPendingInputs(
+  openWf: PlanProposal,
+  input: PlanContinuityRouteInput,
+): Promise<PlanContinuityRouteResult> {
+  const workflowName = openWf.workflowName as string;
+  const have = openWf.pendingInputValues ?? {};
+  const required = openWf.requiredInputs ?? [];
+  const missingBefore = required.filter((k) => !have[k] || have[k].trim().length === 0);
+  const cls = await classifyWorkflowInputAnswers(
+    workflowName,
+    missingBefore.length > 0 ? missingBefore : required,
+    input.input,
+  );
+
+  if (cls.kind === 'abandon' || cls.kind === 'new_topic') {
+    supersedePlanProposal(openWf.id);
+    if (input.sendNote) {
+      await input.sendNote(
+        cls.kind === 'abandon'
+          ? `🍊 Okay, I've dropped the "${workflowName}" run.`
+          : `🍊 I've set the "${workflowName}" run aside. On your new request:`,
+      );
+    }
+    return { handled: false, kind: cls.kind, proposalId: openWf.id, reason: cls.reason };
+  }
+
+  const merged = { ...have, ...cls.values };
+  const result = resumeWorkflowRun(workflowName, merged);
+
+  if (result.status === 'queued' || result.status === 'duplicate') {
+    supersedePlanProposal(openWf.id);
+    if (input.sendNote) await input.sendNote(`🍊 Got it — ${result.message}`);
+    return { handled: true, kind: 'answers', proposalId: openWf.id, reason: cls.reason };
+  }
+
+  if (result.status === 'missing_inputs') {
+    setWorkflowPendingInputValues(openWf.id, cls.values);
+    const stillNeed = result.missing ?? [];
+    if (input.sendNote) {
+      await input.sendNote(
+        `🍊 Thanks. I still need ${stillNeed.join(', ')} to run "${workflowName}". Reply with ${stillNeed.length === 1 ? 'it' : 'them'}.`,
+      );
+    }
+    return { handled: true, kind: 'answers', proposalId: openWf.id, reason: cls.reason };
+  }
+
+  // not_found / disabled — the workflow changed out from under the ask.
+  supersedePlanProposal(openWf.id);
+  if (input.sendNote) await input.sendNote(`🍊 ${result.message}`);
+  return { handled: true, kind: 'answers', proposalId: openWf.id, reason: result.message };
+}
+
 export async function routeOpenQuestionPlan(
   input: PlanContinuityRouteInput,
 ): Promise<PlanContinuityRouteResult> {
-  if (!planContinuityEnabled()) return { handled: false };
+  // Session-keyed workflow ask-then-resume takes priority over the channel
+  // path (the workflow_run tool that creates these has only a sessionId).
+  const openWf = findOpenWorkflowPendingInputs(input.sessionId);
+  if (openWf) return routeWorkflowPendingInputs(openWf, input);
 
   const openPlan = findOpenQuestionPlan(input.channel);
   if (!openPlan) return { handled: false };

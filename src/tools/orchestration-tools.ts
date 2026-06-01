@@ -33,6 +33,8 @@ import {
   missingWorkflowRunInputs,
   normalizeWorkflowRunInputs,
 } from '../execution/workflow-inputs.js';
+import { queueWorkflowRun } from './workflow-run-queue.js';
+import { surfaceWorkflowPendingInputs } from '../agents/plan-proposals.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { listEvents } from '../runtime/harness/eventlog.js';
 import {
@@ -203,41 +205,6 @@ function listWorkflowFiles(): WorkflowEntry[] {
   return listWorkflows();
 }
 
-function stableJson(value: unknown): string {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return JSON.stringify(value);
-  const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b));
-  return JSON.stringify(Object.fromEntries(entries));
-}
-
-function findDuplicateQueuedWorkflowRun(workflowName: string, inputs: Record<string, string>): { id: string; status: string } | null {
-  if (!existsSync(WORKFLOW_RUNS_DIR)) return null;
-  const wanted = stableJson(inputs);
-  for (const file of readdirSync(WORKFLOW_RUNS_DIR).filter((entry) => entry.endsWith('.json')).sort().reverse()) {
-    try {
-      const parsed = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, file), 'utf-8')) as {
-        id?: unknown;
-        workflow?: unknown;
-        inputs?: unknown;
-        status?: unknown;
-      };
-      const status = typeof parsed.status === 'string' ? parsed.status : 'queued';
-      if (status !== 'queued' && status !== 'running') continue;
-      if (parsed.workflow !== workflowName) continue;
-      const existingInputs = normalizeWorkflowRunInputs(
-        parsed.inputs && typeof parsed.inputs === 'object' && !Array.isArray(parsed.inputs)
-          ? parsed.inputs as Record<string, string>
-          : {},
-      );
-      if (stableJson(existingInputs) !== wanted) continue;
-      const id = typeof parsed.id === 'string' ? parsed.id : path.basename(file, '.json');
-      return { id, status };
-    } catch {
-      continue;
-    }
-  }
-  return null;
-}
-
 export function registerOrchestrationTools(server: McpServer): void {
   server.tool(
     'cron_run_history',
@@ -389,14 +356,16 @@ export function registerOrchestrationTools(server: McpServer): void {
         approvalPreview: z.string().optional(),
       })).min(1),
       trigger_schedule: z.string().optional(),
-      inputs: z.record(z.string(), z.object({
-        type: z.enum(['string', 'number']).optional(),
-        default: z.string().optional(),
-        description: z.string().optional(),
-      })).optional(),
+      inputs: z.string().optional().describe('JSON object mapping input NAMES to {type?, default?, description?}, e.g. {"url":{"type":"string","description":"Site to audit"}}. A JSON string fills reliably under strict-mode function-calling where an open map does not.'),
       synthesis_prompt: z.string().optional(),
     },
     async ({ name, description, steps, trigger_schedule, inputs, synthesis_prompt }) => {
+      let inputsSchema: Record<string, { type?: 'string' | 'number'; default?: string; description?: string }>;
+      try {
+        inputsSchema = parseWorkflowInputsSchemaJson(inputs);
+      } catch (error) {
+        return textResult(error instanceof Error ? error.message : String(error));
+      }
       const ids = new Set(steps.map((step) => step.id));
       if (ids.size !== steps.length) return textResult('Duplicate workflow step IDs found.');
       for (const step of steps) {
@@ -431,7 +400,7 @@ export function registerOrchestrationTools(server: McpServer): void {
           requiresApproval: s.requiresApproval,
           approvalPreview: s.approvalPreview,
         })),
-        inputs: inputs && Object.keys(inputs).length > 0 ? inputs : undefined,
+        inputs: Object.keys(inputsSchema).length > 0 ? inputsSchema : undefined,
         synthesis: synthesis_prompt ? { prompt: synthesis_prompt } : undefined,
       };
       // P2: refuse to create a workflow whose data can't flow (unbound
@@ -515,6 +484,25 @@ export function registerOrchestrationTools(server: McpServer): void {
       const normalizedInputs = normalizeWorkflowRunInputs(parsedInputs);
       const missing = missingWorkflowRunInputs(workflow.data, normalizedInputs);
       if (missing.length > 0) {
+        // Ask-then-resume: in a chat context, surface a pending-inputs proposal
+        // keyed to the session so the user's NEXT reply supplies the values and
+        // we resume the run (see plan-continuity). This replaces the old
+        // model-directed retry message that the strict-mode schema could not
+        // satisfy — the call that drove the 84× / 3-min hang. No session context
+        // (tests / internal callers) → keep the deterministic rejection.
+        if (guardCtx?.sessionId) {
+          surfaceWorkflowPendingInputs({
+            workflowName: name,
+            requiredInputs: missing,
+            providedInputs: normalizedInputs,
+            sessionId: guardCtx.sessionId,
+            originatingRequest: `Run the "${name}" workflow`,
+          });
+          const inputList = missing.map((key) => `\`${key}\``).join(', ');
+          return textResult(
+            `I need ${inputList} to run the "${name}" workflow. Reply with ${missing.length === 1 ? 'it' : 'them'} and I'll run it.`,
+          );
+        }
         return textResult(
           [
             `Workflow "${name}" was not queued because required input${missing.length === 1 ? '' : 's'} ${missing.map((key) => `"${key}"`).join(', ')} ${missing.length === 1 ? 'is' : 'are'} missing.`,
@@ -523,29 +511,7 @@ export function registerOrchestrationTools(server: McpServer): void {
         );
       }
 
-      ensureDir(WORKFLOW_RUNS_DIR);
-      const duplicate = findDuplicateQueuedWorkflowRun(name, normalizedInputs);
-      if (duplicate) {
-        return textResult(
-          `Workflow "${name}" is already ${duplicate.status} as run ${duplicate.id} with the same inputs. No duplicate was queued. Use workflow_run_status with run_id="${duplicate.id}" to check progress.`,
-        );
-      }
-
-      const id = `${Date.now()}-${randomBytes(3).toString('hex')}`;
-      const filePath = path.join(WORKFLOW_RUNS_DIR, `${id}.json`);
-      writeFileSync(
-        filePath,
-        JSON.stringify({
-          id,
-          workflow: name,
-          inputs: normalizedInputs,
-          status: 'queued',
-          createdAt: new Date().toISOString(),
-        }, null, 2),
-        'utf-8',
-      );
-
-      return textResult(`Queued workflow "${name}" (run ${id}).`);
+      return textResult(queueWorkflowRun(name, normalizedInputs).message);
     },
   );
 
@@ -636,14 +602,17 @@ export function registerOrchestrationTools(server: McpServer): void {
       })).optional(),
       trigger_schedule: z.string().optional(),
       clear_trigger_schedule: z.boolean().optional().describe('Pass true to remove an existing schedule (e.g. switch back to manual-only).'),
-      inputs: z.record(z.string(), z.object({
-        type: z.enum(['string', 'number']).optional(),
-        default: z.string().optional(),
-        description: z.string().optional(),
-      })).optional(),
+      inputs: z.string().optional().describe('JSON object mapping input NAMES to {type?, default?, description?}, e.g. {"url":{"type":"string","description":"Site to audit"}}. Pass only to change the input schema; omit to preserve it.'),
       synthesis_prompt: z.string().optional(),
     },
     async ({ name, description, steps, trigger_schedule, clear_trigger_schedule, inputs, synthesis_prompt }) => {
+      let inputsSchema: Record<string, { type?: 'string' | 'number'; default?: string; description?: string }>;
+      try {
+        inputsSchema = parseWorkflowInputsSchemaJson(inputs);
+      } catch (error) {
+        return textResult(error instanceof Error ? error.message : String(error));
+      }
+      const inputsProvided = Object.keys(inputsSchema).length > 0;
       const entry = listWorkflowFiles().find((w) => w.data.name === name);
       if (!entry) return textResult(`Workflow "${name}" not found.`);
 
@@ -677,7 +646,7 @@ export function registerOrchestrationTools(server: McpServer): void {
           usesSkill: s.usesSkill,
         }));
       }
-      if (inputs) next.inputs = inputs;
+      if (inputsProvided) next.inputs = inputsSchema;
       if (synthesis_prompt !== undefined) next.synthesis = { prompt: synthesis_prompt };
 
       const currentTrigger = next.trigger ?? { manual: true };
@@ -692,7 +661,7 @@ export function registerOrchestrationTools(server: McpServer): void {
       const changed = [
         description !== undefined ? 'description' : '',
         steps ? 'steps' : '',
-        inputs ? 'inputs' : '',
+        inputsProvided ? 'inputs' : '',
         synthesis_prompt !== undefined ? 'synthesis' : '',
         trigger_schedule !== undefined || clear_trigger_schedule ? 'schedule' : '',
       ].filter(Boolean);

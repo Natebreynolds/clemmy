@@ -1007,6 +1007,87 @@ test('runConversation: stops on first completed decision', async () => {
   assert.equal(events.filter((e) => e.type === 'conversation_completed').length, 1);
 });
 
+test('objective judge: gates premature completion and continues (action intent)', async () => {
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const runner = scriptedRunner([
+    { finalOutput: { summary: 'Said what I would do', reply: 'Here is what I would do to build the report.', done: true, nextAction: 'completed', reason: null } },
+    { finalOutput: { summary: 'Built the report', reply: 'Done — report saved to /tmp/report.md', done: true, nextAction: 'completed', reason: null } },
+  ]);
+  const judgeCalls: string[] = [];
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'build me a research report on solar adoption',
+    judgeCompletion: true,
+    judgeFn: async (_objective, response) => {
+      judgeCalls.push(response);
+      return judgeCalls.length === 1 ? { done: false, reason: 'no artifact produced yet' } : { done: true, reason: 'report saved' };
+    },
+    makeRunner: makeRunnerStub,
+    runRunner: runner,
+  });
+  assert.equal(result.status, 'completed');
+  assert.equal(result.steps, 2, 'judge forced a second step before completing');
+  assert.equal(judgeCalls.length, 2);
+});
+
+test('objective judge: does NOT fire for a non-action (lookup) intent', async () => {
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const runner = scriptedRunner([
+    { finalOutput: { summary: 'answered', reply: 'Paris.', done: true, nextAction: 'completed', reason: null } },
+  ]);
+  let judgeInvoked = false;
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'what is the capital of France',
+    judgeCompletion: true,
+    judgeFn: async () => { judgeInvoked = true; return { done: false, reason: 'x' }; },
+    makeRunner: makeRunnerStub,
+    runRunner: runner,
+  });
+  assert.equal(result.status, 'completed');
+  assert.equal(result.steps, 1);
+  assert.equal(judgeInvoked, false, 'lookup intent must not invoke the objective judge');
+});
+
+test('objective judge: off by default (no judgeCompletion opt-in)', async () => {
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const runner = scriptedRunner([
+    { finalOutput: { summary: 'said what I would do', reply: 'Here is what I would do.', done: true, nextAction: 'completed', reason: null } },
+  ]);
+  let judgeInvoked = false;
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'build me a research report on solar adoption',
+    judgeFn: async () => { judgeInvoked = true; return { done: false, reason: 'x' }; },
+    makeRunner: makeRunnerStub,
+    runRunner: runner,
+  });
+  assert.equal(result.status, 'completed');
+  assert.equal(judgeInvoked, false, 'judge must not run unless judgeCompletion is opted in');
+});
+
+test('objective judge: continuation budget caps at 3, then accepts the model\'s done', async () => {
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const premature = { finalOutput: { summary: 'promised again', reply: 'I will do it.', done: true, nextAction: 'completed', reason: null } };
+  const runner = scriptedRunner([premature, premature, premature, premature, premature]);
+  let judgeCalls = 0;
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'build me a research report on solar adoption',
+    judgeCompletion: true,
+    judgeFn: async () => { judgeCalls++; return { done: false, reason: 'still nothing produced' }; },
+    makeRunner: makeRunnerStub,
+    runRunner: runner,
+  });
+  assert.equal(result.status, 'completed');
+  assert.equal(judgeCalls, 3, 'judge fires up to the continuation budget then stops gating');
+  assert.equal(result.steps, 4, '3 judge-forced continuations + the accepted 4th completion');
+});
+
 test('runConversation: recurses through done=false steps until done=true', async () => {
   const sess = HarnessSession.create({ kind: 'chat' });
   const runner = scriptedRunner([

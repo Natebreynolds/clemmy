@@ -43,10 +43,7 @@ import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { previewToolCall } from '../runtime/approval-summary.js';
 import { buildOrchestratorAgent } from '../agents/orchestrator.js';
 import { runPlanFirstPreflight, shouldUsePlanFirst } from '../runtime/harness/plan-first.js';
-import {
-  planContinuityEnabled,
-  routeOpenQuestionPlan,
-} from '../runtime/harness/plan-continuity.js';
+import { routeOpenQuestionPlan } from '../runtime/harness/plan-continuity.js';
 import { loadProactivityPolicy } from '../agents/proactivity-policy.js';
 
 const EDIT_DEBOUNCE_MS = 2_000;
@@ -1862,14 +1859,13 @@ export async function runDiscordHarnessConversation(opts: {
 
   void (async () => {
     try {
-      // ── plan-continuity routing (flag CLEMMY_PLAN_CONTINUITY, default off) ──
+      // ── plan-continuity routing (always on) ──
       // If a prior plan on this channel still awaits the user's answers,
       // classify this message against it BEFORE normal plan-first routing.
-      // Flag off → this whole block is skipped (byte-identical to legacy).
       // It runs inside this IIFE so re-entering runPlanFirstPreflight emits
       // its events into the same live-edit loop and `return` short-circuits
       // the orchestrator exactly like the existing planFirst block below.
-      if (planContinuityEnabled()) {
+      {
         const channelKey = `discord:${channelId}`;
         const continuity = await routeOpenQuestionPlan({
           channel: channelKey,
@@ -1895,7 +1891,7 @@ export async function runDiscordHarnessConversation(opts: {
         if (preflight.surfaced) return;
       }
       const agent = await buildOrchestratorAgent({ userInput: prompt, sessionId: session.id });
-      await runConversation({ agent, sessionId: session.id, input: prompt });
+      await runConversation({ agent, sessionId: session.id, input: prompt, judgeCompletion: true });
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
       try {
