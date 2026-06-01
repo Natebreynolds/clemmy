@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
@@ -7,6 +7,99 @@ import type { AuthStatus } from '../types.js';
 import { loginWithNativeCodexOAuth, refreshNativeCodexTokens } from './codex-native-oauth.js';
 
 const AUTH_STATE_FILE = path.join(BASE_DIR, 'state', 'auth.json');
+
+// ─────────────────────────────────────────────────────────────────
+// Codex OAuth refresh concurrency control.
+//
+// Codex/ChatGPT OAuth uses ROTATING refresh tokens with reuse-detection:
+// POSTing grant_type=refresh_token with RT1 returns RT2 and INVALIDATES RT1.
+// If a second caller POSTs the already-consumed RT1, the server treats it as
+// token theft and REVOKES THE ENTIRE TOKEN FAMILY (`token_revoked`) — bricking
+// auth until the user re-signs-in.
+//
+// The harness runs many agents concurrently, each calling
+// loadFreshCodexAccessToken() per model request. At the ~50-min refresh
+// boundary they ALL see a stale token and would each fire a refresh with the
+// same RT → reuse → revoke. We enforce: WITHIN CLEMENTINE'S OWN PROCESSES, a
+// refresh token is used for at most one refresh, and only one refresh runs at a
+// time.
+//
+//   1. In-process single-flight — concurrent callers share one refresh promise.
+//   2. Cross-process advisory lock — serializes refreshes across daemon
+//      instances (e.g. a restart overlap). Fail-open + stale-steal so a crashed
+//      holder can never deadlock auth.
+//   3. Skip-if-just-refreshed — after acquiring the lock, if another holder
+//      refreshed within the last 2 min, reuse their token instead of POSTing
+//      the (now-rotated) RT again.
+//
+// Two residual reuse paths this CANNOT close (both pre-existing, both strictly
+// improved vs the old N-way retry storm):
+//   - EXTERNAL Codex CLI: writeCodexAuthFile syncs ~/.codex/auth.json and
+//     getStoredCodexOAuthTokens reads it as a fallback, so a concurrently-run
+//     `codex` binary rotates the SAME family while honoring neither this lock
+//     nor skip-if-recent. The clean decouple is a dedicated Clementine login
+//     (a separate grant), not a lock. We stop pushing rotated tokens to that
+//     file on refresh (below) to at least not feed it our rotating RT.
+//   - At-least-once: if the refresh POST reaches the server (RT rotated) but
+//     the ACK is lost (timeout fires post-rotation), lastRefresh is NOT
+//     advanced and the consumed RT stays on disk → the next caller replays it →
+//     revoke. No lock can close server-side consumption with a lost ack.
+const REFRESH_LOCK_FILE = path.join(BASE_DIR, 'state', 'codex-refresh.lock');
+// STALE must comfortably exceed the 30s refresh HTTP timeout so a slow-but-ALIVE
+// holder's lock is never stolen mid-rotation — stealing a live holder is the ONE
+// path that re-creates the reuse→revoke this fix prevents. The harness starves
+// the event loop under concurrent agents, so the acquire→fetch-resolve gap can
+// run well past 30s; 90s (3× the HTTP ceiling) leaves room for that while still
+// re-admitting a genuinely crashed holder. WAIT matches STALE so a waiter never
+// fails open before a live holder is even eligible to be declared dead.
+const REFRESH_LOCK_WAIT_MS = 90_000;   // bound the wait, then fail-open
+const REFRESH_LOCK_STALE_MS = 90_000;  // steal only a crashed holder, never a slow live one
+const REFRESH_SKIP_IF_WITHIN_MS = 2 * 60 * 1000; // a sibling just refreshed → reuse it
+
+let inflightRefresh: Promise<{ ok: boolean; message: string }> | null = null;
+
+// Test seam: substitute the network token rotation with a stub so the
+// single-flight + lock behavior is verifiable without hitting OpenAI.
+let refreshTokenImpl: typeof refreshNativeCodexTokens = refreshNativeCodexTokens;
+export function __setRefreshTokenImplForTests(fn: typeof refreshNativeCodexTokens | null): void {
+  refreshTokenImpl = fn ?? refreshNativeCodexTokens;
+}
+
+const delay = (ms: number): Promise<void> => new Promise((resolve) => { setTimeout(resolve, ms); });
+
+/** Acquire the cross-process refresh lock. Returns an fd on success, or null
+ *  if it couldn't be acquired within the wait budget (caller proceeds anyway —
+ *  fail-open, since blocking a refresh forever guarantees a 401). */
+async function acquireRefreshLock(): Promise<number | null> {
+  const deadline = Date.now() + REFRESH_LOCK_WAIT_MS;
+  mkdirSync(path.dirname(REFRESH_LOCK_FILE), { recursive: true });
+  for (;;) {
+    try {
+      const fd = openSync(REFRESH_LOCK_FILE, 'wx'); // O_EXCL — fails if held
+      try { writeFileSync(fd, `${process.pid}`); } catch { /* best-effort marker */ }
+      return fd;
+    } catch {
+      // Held by someone. Steal it if it's stale (crashed holder), else wait.
+      try {
+        const st = statSync(REFRESH_LOCK_FILE);
+        if (Date.now() - st.mtimeMs > REFRESH_LOCK_STALE_MS) {
+          rmSync(REFRESH_LOCK_FILE, { force: true });
+          continue; // retry immediately
+        }
+      } catch {
+        continue; // lock vanished between open and stat — retry
+      }
+      if (Date.now() >= deadline) return null; // fail-open
+      await delay(150);
+    }
+  }
+}
+
+function releaseRefreshLock(fd: number | null): void {
+  if (fd === null) return;
+  try { closeSync(fd); } catch { /* ignore */ }
+  try { rmSync(REFRESH_LOCK_FILE, { force: true }); } catch { /* ignore */ }
+}
 
 function getCodexAuthSourceFile(): string {
   return getRuntimeEnv(
@@ -246,17 +339,55 @@ export async function loginWithNativeOAuth(sourceFile = getCodexAuthSourceFile()
   }
 }
 
+/** Refresh the stored native Codex OAuth tokens. SAFE under concurrency: the
+ *  rotating refresh token is used for at most one refresh per token-age window,
+ *  even when many agents call this at once (single-flight) or another daemon
+ *  races it (cross-process lock + skip-if-just-refreshed). See the concurrency
+ *  notes near REFRESH_LOCK_FILE for why this matters (reuse → token_revoked). */
 export async function refreshStoredNativeOAuth(sourceFile = getCodexAuthSourceFile()): Promise<{ ok: boolean; message: string }> {
-  const local = loadLocalAuthState();
-  const refreshToken = local.codexOauth?.refreshToken;
-  if (!refreshToken) {
-    return {
-      ok: false,
-      message: 'No locally stored native refresh token is available.',
-    };
-  }
+  // 1. In-process single-flight: concurrent callers share ONE refresh.
+  if (inflightRefresh) return inflightRefresh;
+  inflightRefresh = doRefreshStoredNativeOAuth(sourceFile);
   try {
-    const tokens = await refreshNativeCodexTokens(refreshToken);
+    return await inflightRefresh;
+  } finally {
+    inflightRefresh = null;
+  }
+}
+
+function refreshedWithinSkipWindow(lastRefreshIso: string | undefined): boolean {
+  if (!lastRefreshIso) return false;
+  const last = Date.parse(lastRefreshIso);
+  return Number.isFinite(last) && Date.now() - last < REFRESH_SKIP_IF_WITHIN_MS;
+}
+
+async function doRefreshStoredNativeOAuth(_sourceFile: string): Promise<{ ok: boolean; message: string }> {
+  // lockFd starts null + the lock is acquired INSIDE the try, so any throw from
+  // acquireRefreshLock (e.g. a state-dir mkdir EACCES) still returns ok:false
+  // rather than rejecting the caller's model request.
+  let lockFd: number | null = null;
+  try {
+    // 2. Cross-process lock — only one process refreshes at a time.
+    lockFd = await acquireRefreshLock();
+    // Re-read AFTER acquiring the lock: another holder may have just rotated
+    // the token while we waited. Using the freshest on-disk RT (never a stale
+    // snapshot) is what prevents submitting an already-consumed RT.
+    const local = loadLocalAuthState();
+    const refreshToken = local.codexOauth?.refreshToken;
+    if (!refreshToken) {
+      return { ok: false, message: 'No locally stored native refresh token is available.' };
+    }
+    // 3. Skip if a sibling just refreshed — reuse their token instead of
+    // POSTing the now-rotated RT again (which would trip reuse-detection).
+    if (refreshedWithinSkipWindow(local.codexOauth?.lastRefresh)) {
+      return { ok: true, message: 'Token was just refreshed by another holder; reusing it.' };
+    }
+    const tokens = await refreshTokenImpl(refreshToken);
+    // Persist to CLEMENTINE'S OWN vault only. We deliberately do NOT write the
+    // rotated token back to ~/.codex/auth.json (the external Codex CLI's file):
+    // pushing our rotating RT there lets a separate `codex` invocation consume
+    // it and trip reuse-detection. Clementine owns its grant; the codex CLI owns
+    // its own. (Initial login/import still seeds the CLI file — see those paths.)
     saveLocalAuthState({
       importedAt: new Date().toISOString(),
       source: local.source ?? 'native',
@@ -268,22 +399,11 @@ export async function refreshStoredNativeOAuth(sourceFile = getCodexAuthSourceFi
         lastRefresh: tokens.lastRefresh,
       },
     });
-    writeCodexAuthFile({
-      accessToken: tokens.accessToken,
-      refreshToken: tokens.refreshToken,
-      idToken: tokens.idToken,
-      accountId: tokens.accountId ?? local.codexOauth?.accountId,
-      lastRefresh: tokens.lastRefresh,
-    }, sourceFile);
-    return {
-      ok: true,
-      message: 'Native ChatGPT/Codex tokens refreshed and synced.',
-    };
+    return { ok: true, message: 'Native ChatGPT/Codex tokens refreshed.' };
   } catch (error) {
-    return {
-      ok: false,
-      message: error instanceof Error ? error.message : String(error),
-    };
+    return { ok: false, message: error instanceof Error ? error.message : String(error) };
+  } finally {
+    releaseRefreshLock(lockFd);
   }
 }
 
