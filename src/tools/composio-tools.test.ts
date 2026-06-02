@@ -252,6 +252,68 @@ test('fan-out advisory fires ONCE on the 3rd distinct-item call of the same slug
   assert.equal(maybeFanoutAdvisory('DATAFORSEO_SERP', { q: 'item4' }, sid), null, 'item 4: advice does not repeat');
 });
 
+test('fan-out advisory RE-EMITS, hard-capped at 2 per bucket (P1 re-arm)', async () => {
+  const { maybeFanoutAdvisory } = await import('./composio-tools.js');
+  const sid = 'sess-fanout-rearm';
+  const slug = 'DATAFORSEO_SERP';
+  const fires: number[] = [];
+  // 12 distinct items in series; same slug + same arg-shape => one bucket.
+  for (let i = 1; i <= 12; i++) {
+    const advice = maybeFanoutAdvisory(slug, { q: `item${i}` }, sid);
+    if (advice) fires.push(i);
+  }
+  // Spaced at the 3rd and 6th distinct items, then silent (cap = 2).
+  assert.deepEqual(fires, [3, 6], 'must re-emit at 3 and 6, then stay capped');
+  fires.forEach((i) => assert.ok(i, `fire ${i}`));
+});
+
+test('fan-out advisory keeps SEPARATE buckets per slug+arg-shape', async () => {
+  const { maybeFanoutAdvisory } = await import('./composio-tools.js');
+  const sid = 'sess-fanout-buckets';
+  // "10 prospects" via one shape...
+  assert.equal(maybeFanoutAdvisory('TOOL_A', { url: 'p1' }, sid), null);
+  assert.equal(maybeFanoutAdvisory('TOOL_A', { url: 'p2' }, sid), null);
+  const aAdvice = maybeFanoutAdvisory('TOOL_A', { url: 'p3' }, sid);
+  assert.ok(aAdvice, 'bucket A fires on its own 3rd item');
+  // ...then "5 accounts" via a DIFFERENT shape — its own fresh bucket, not
+  // suppressed by bucket A having already advised.
+  assert.equal(maybeFanoutAdvisory('TOOL_B', { accountId: 'a1' }, sid), null, 'bucket B item 1');
+  assert.equal(maybeFanoutAdvisory('TOOL_B', { accountId: 'a2' }, sid), null, 'bucket B item 2');
+  const bAdvice = maybeFanoutAdvisory('TOOL_B', { accountId: 'a3' }, sid);
+  assert.ok(bAdvice, 'bucket B fires independently of bucket A');
+});
+
+test('fan-out advisory reverts to fire-once when CLEMMY_FANOUT_DIRECTIVE=off', async () => {
+  const { maybeFanoutAdvisory } = await import('./composio-tools.js');
+  const prev = process.env.CLEMMY_FANOUT_DIRECTIVE;
+  process.env.CLEMMY_FANOUT_DIRECTIVE = 'off';
+  try {
+    const sid = 'sess-fanout-off';
+    const fires: number[] = [];
+    for (let i = 1; i <= 12; i++) {
+      if (maybeFanoutAdvisory('DATAFORSEO_SERP', { q: `item${i}` }, sid)) fires.push(i);
+    }
+    assert.deepEqual(fires, [3], 'off: legacy fire-once-per-session latch');
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_FANOUT_DIRECTIVE;
+    else process.env.CLEMMY_FANOUT_DIRECTIVE = prev;
+  }
+});
+
+test('fan-out advisory never throws on malformed / unserializable args', async () => {
+  const { maybeFanoutAdvisory } = await import('./composio-tools.js');
+  const sid = 'sess-fanout-malformed';
+  const circular: Record<string, unknown> = {};
+  circular.self = circular; // JSON.stringify would throw
+  assert.doesNotThrow(() => {
+    for (let i = 0; i < 5; i++) maybeFanoutAdvisory('TOOL_C', circular, sid);
+    // @ts-expect-error proving robustness against a non-object args value
+    maybeFanoutAdvisory('TOOL_C', null, sid);
+    // @ts-expect-error proving robustness against a missing slug
+    maybeFanoutAdvisory(undefined, { q: 'x' }, sid);
+  });
+});
+
 test('fan-out advisory does NOT fire for the SAME args repeated (that is a loop, not a batch)', async () => {
   const { maybeFanoutAdvisory } = await import('./composio-tools.js');
   const sid = 'sess-fanout-2';

@@ -2052,7 +2052,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     source: turnMemoryPrimer.source ?? null,
     injected: Boolean(turnMemoryPrimer.text),
     skippedReason: turnMemoryPrimer.skippedReason ?? null,
-  });
+  }, { sessionKind: session.sessionRow.kind, sessionId: options.sessionId });
   safeAppend({
     sessionId: options.sessionId,
     turn,
@@ -2082,6 +2082,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
       toolScope: contextPacket.toolScope,
       mcp: contextPacket.mcp,
       healthWarnings: contextPacket.healthWarnings,
+      multiItem: contextPacket.multiItem,
       injectedBytes: contextPacket.text.length,
     },
   });

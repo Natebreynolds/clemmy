@@ -44,7 +44,7 @@ writeFileSync(
   'utf-8',
 );
 
-const { buildAgentContextPacket } = await import('./context-packet.js');
+const { buildAgentContextPacket, detectMultiItemIntent } = await import('./context-packet.js');
 
 test.after(() => {
   try {
@@ -68,4 +68,139 @@ test('context packet ranks relevant skills and workflows for the current request
   assert.match(packet.text, /External MCP scope: dataforseo/);
   assert.match(packet.text, /call skill_read/);
   assert.match(packet.text, /reusable-process candidates/);
+});
+
+// ─── P0: detectMultiItemIntent unit table ──────────────────────────────────
+
+test('detectMultiItemIntent FIRES on independent same-shape multi-item work', () => {
+  const prospects = detectMultiItemIntent('Research these 10 prospects and log what each firm does.');
+  assert.equal(prospects.isMultiItem, true, '"research these 10 prospects" must fire');
+  assert.equal(prospects.itemCount, 10);
+  assert.equal(prospects.itemKind, 'prospects');
+  assert.equal(prospects.sameShapeWork, true);
+
+  // The 44-firm class — both the inline-count phrasing and a pasted list.
+  const firms = detectMultiItemIntent('Scrape these 44 law firms and pull each one’s contact page.');
+  assert.equal(firms.isMultiItem, true, '"scrape these 44 firms" must fire');
+  assert.equal(firms.itemCount, 44);
+
+  const listInput = [
+    'Audit each of these firms:',
+    '1. Foo & Bar LLP',
+    '2. Baz Law Group',
+    '3. Qux Legal',
+    '4. Quux Attorneys',
+  ].join('\n');
+  const listed = detectMultiItemIntent(listInput);
+  assert.equal(listed.isMultiItem, true, 'an enumerated 4-item list with a work verb must fire');
+  assert.equal(listed.itemCount, 4);
+});
+
+test('detectMultiItemIntent uses size-aware boundaries (soft < 8, imperative >= 8)', () => {
+  const small = detectMultiItemIntent('Draft outreach emails for these 4 prospects.');
+  assert.equal(small.isMultiItem, true);
+  assert.equal(small.itemCount, 4);
+  const large = detectMultiItemIntent('Draft outreach emails for these 12 prospects.');
+  assert.equal(large.isMultiItem, true);
+  assert.equal(large.itemCount, 12);
+});
+
+test('detectMultiItemIntent does NOT fire on the no-fire cases', () => {
+  const cases: Array<[string, string]> = [
+    ['Tell me 3 jokes.', 'conversational, no per-item tool work'],
+    ['Show my last 5 emails.', 'single paginated collection read'],
+    ["Research this firm's 10 competitors.", 'internal cardinality (one parent)'],
+    ['First do A, then B, then C.', 'sequential A->B->C chain'],
+    ['Give me 3 options for the headline.', 'conversational ideation'],
+    ['Pull the 200 rows from the leads table.', 'paginated one-table job'],
+    ['Summarize the last 30 days of activity.', 'time span, not items'],
+    ['Research this firm and its competitors.', 'no explicit count'],
+  ];
+  for (const [input, why] of cases) {
+    assert.equal(detectMultiItemIntent(input).isMultiItem, false, `must NOT fire: "${input}" (${why})`);
+  }
+});
+
+test('detectMultiItemIntent is total — never throws, handles junk input', () => {
+  assert.equal(detectMultiItemIntent('').isMultiItem, false);
+  assert.equal(detectMultiItemIntent('   ').isMultiItem, false);
+  // @ts-expect-error intentionally passing a non-string to prove fail-open
+  assert.equal(detectMultiItemIntent(undefined).isMultiItem, false);
+  // @ts-expect-error intentionally passing a non-string to prove fail-open
+  assert.equal(detectMultiItemIntent({ nope: true }).isMultiItem, false);
+});
+
+// ─── P0: packet wiring (chat-only directive, size-aware, suppression) ───────
+
+const NO_MEMORY = { enabled: false, hitCount: 0, source: null, injected: false } as const;
+
+test('packet injects the IMPERATIVE fan-out directive for chat sessions with N>=8', () => {
+  const packet = buildAgentContextPacket(
+    'Research these 10 prospects and capture each firm’s SEO posture.',
+    NO_MEMORY,
+    { sessionKind: 'chat', sessionId: 'sess-chat-1' },
+  );
+  assert.equal(packet.multiItem.detected, true);
+  assert.equal(packet.multiItem.itemCount, 10);
+  assert.equal(packet.multiItem.offered, true);
+  assert.match(packet.text, /Fan-out directive: this turn names 10 independent same-shape/);
+  assert.match(packet.text, /Do NOT serialize/);
+  // P2 — the N>=8 workflow-suggestion clause rides along.
+  assert.match(packet.text, /save it as a forEach workflow/);
+  // The static reminder must be GONE when the directive is offered.
+  assert.ok(!/Parallelism reminder:/.test(packet.text), 'static reminder replaced by directive');
+});
+
+test('packet uses the SOFT hint for 3<=N<8 (no imperative, no workflow clause)', () => {
+  const packet = buildAgentContextPacket(
+    'Research these 4 prospects.',
+    NO_MEMORY,
+    { sessionKind: 'chat', sessionId: 'sess-chat-soft' },
+  );
+  assert.equal(packet.multiItem.offered, true);
+  assert.match(packet.text, /Fan-out hint: this turn names 4 independent same-shape/);
+  assert.ok(!/Do NOT serialize/.test(packet.text), 'small-N must not be imperative');
+  assert.ok(!/save it as a forEach workflow/.test(packet.text), 'small-N must not offer a workflow');
+});
+
+test('packet keeps the static line (no directive) for NON-chat sessions even when multi-item', () => {
+  for (const kind of ['workflow', 'execution', 'agent']) {
+    const packet = buildAgentContextPacket(
+      'Research these 10 prospects.',
+      NO_MEMORY,
+      { sessionKind: kind, sessionId: `${kind === 'workflow' ? 'workflow:run-x:step' : kind}-sess` },
+    );
+    assert.equal(packet.multiItem.detected, true, `${kind}: still detects`);
+    assert.equal(packet.multiItem.offered, false, `${kind}: directive suppressed`);
+    assert.match(packet.text, /Parallelism reminder:/, `${kind}: static line preserved (zero-regression)`);
+    assert.ok(!/Fan-out directive/.test(packet.text), `${kind}: no directive`);
+  }
+});
+
+test('packet keeps the static line when the kill-switch is set', () => {
+  const prev = process.env.CLEMMY_FANOUT_DIRECTIVE;
+  process.env.CLEMMY_FANOUT_DIRECTIVE = 'off';
+  try {
+    const packet = buildAgentContextPacket(
+      'Research these 10 prospects.',
+      NO_MEMORY,
+      { sessionKind: 'chat', sessionId: 'sess-chat-off' },
+    );
+    assert.equal(packet.multiItem.detected, false, 'detection skipped when off');
+    assert.equal(packet.multiItem.offered, false);
+    assert.match(packet.text, /Parallelism reminder:/, 'static line restored when off');
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_FANOUT_DIRECTIVE;
+    else process.env.CLEMMY_FANOUT_DIRECTIVE = prev;
+  }
+});
+
+test('packet keeps the static line for a single-item / no-count request', () => {
+  const packet = buildAgentContextPacket(
+    'Audit this law firm’s website and summarize the findings.',
+    NO_MEMORY,
+    { sessionKind: 'chat', sessionId: 'sess-chat-single' },
+  );
+  assert.equal(packet.multiItem.detected, false);
+  assert.match(packet.text, /Parallelism reminder:/);
 });
