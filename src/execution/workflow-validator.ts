@@ -349,7 +349,7 @@ const SERIAL_WORK_RE = /\b(?:scrape|crawl|research|enrich|audit|draft|create|wri
 function checkParallelismHint(step: WorkflowStepShape): string | null {
   if (step.forEach) return null;
   if (!MULTI_ITEM_PROMPT_RE.test(step.prompt) || !SERIAL_WORK_RE.test(step.prompt)) return null;
-  return `Step "${step.id}" looks like multi-item work but has no forEach. Consider splitting the upstream list and running this step with forEach so Clementine can parallelize safely.`;
+  return `Step "${step.id}" looks like multi-item work but has no forEach — it will run serially in one context. To parallelize safely, have the upstream step emit an ARRAY and add \`forEach: <upstreamStepId>\` to this step; the runner then fans out per item with bounded concurrency and keeps each item's context lean. (run_worker is not the path — it's unavailable inside a workflow step; forEach is the fan-out primitive.)`;
 }
 
 function checkDeterministicRunner(step: WorkflowStepShape): string | null {

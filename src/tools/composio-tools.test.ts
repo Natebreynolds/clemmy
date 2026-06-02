@@ -260,3 +260,15 @@ test('fan-out advisory does NOT fire for the SAME args repeated (that is a loop,
       'identical args = not distinct items = no fan-out advice');
   }
 });
+
+test('fan-out advisory inside a WORKFLOW step recommends forEach, NOT run_worker (Gap D)', async () => {
+  const { maybeFanoutAdvisory } = await import('./composio-tools.js');
+  // Workflow step sessions are prefixed `workflow:<runId>:<stepId>` and block run_worker.
+  const sid = 'workflow:run-abc:enrich';
+  assert.equal(maybeFanoutAdvisory('DATAFORSEO_SERP', { q: 'p1' }, sid), null);
+  assert.equal(maybeFanoutAdvisory('DATAFORSEO_SERP', { q: 'p2' }, sid), null);
+  const advice = maybeFanoutAdvisory('DATAFORSEO_SERP', { q: 'p3' }, sid);
+  assert.ok(advice, 'advice fires on the 3rd distinct item in a workflow step too');
+  assert.match(advice!, /forEach/, 'workflow-step advice must name forEach as the fan-out primitive');
+  assert.ok(!/run_worker once per item/.test(advice!), 'must NOT tell a workflow step to use the blocklisted run_worker');
+});

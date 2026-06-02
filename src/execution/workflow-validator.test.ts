@@ -230,6 +230,21 @@ test('multi-item step without forEach → parallelism warning', () => {
   );
 });
 
+test('parallelism hint gives the mechanical forEach rewrite + steers away from run_worker (Gap D)', () => {
+  const result = validateWorkflowDefinition({
+    name: 'wf',
+    description: 'Workflow that should fan out',
+    steps: [
+      { id: 'enrich', prompt: 'For each of the 20 sites, scrape and audit the SEO signals.' },
+    ],
+  });
+  const hint = result.warnings.find((w) => w.includes('has no forEach'));
+  assert.ok(hint, 'parallelism hint present');
+  assert.match(hint!, /forEach: <upstreamStepId>/, 'names the concrete forEach rewrite');
+  assert.match(hint!, /array/i, 'tells the author to emit an array upstream');
+  assert.match(hint!, /run_worker is not the path/i, 'clarifies run_worker is not the workflow fan-out primitive');
+});
+
 test('deliverable-producing step without an output contract → advisory warning (Gap C)', () => {
   const result = validateWorkflowDefinition({
     name: 'wf',

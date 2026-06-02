@@ -295,6 +295,19 @@ export function maybeFanoutAdvisory(toolSlug: string, args: Record<string, unkno
     set.add(argHash);
     if (set.size < FANOUT_ADVICE_THRESHOLD) return null;
     t.advised = true;
+    // Inside a workflow STEP (session id is `workflow:<runId>:<stepId>`),
+    // run_worker is blocklisted by construction — recommending it would be
+    // actively misleading. The fan-out primitive for workflows is a `forEach`
+    // step (an authoring decision the runner parallelizes). Surface the
+    // CORRECT mechanism instead of the run_worker advice.
+    if (sessionId.startsWith('workflow:')) {
+      return (
+        `\n\n↗ Fan-out tip: this workflow step has called ${toolSlug} for ${set.size} different items in series. `
+        + `Inside a workflow step the fan-out primitive is a forEach step, not run_worker (which isn't available here): `
+        + `have the upstream step emit an array and add a \`forEach: <upstreamStepId>\` step so the runner processes `
+        + `items concurrently (bounded) and keeps each item's context lean.`
+      );
+    }
     return (
       `\n\n↗ Fan-out tip: you've now called ${toolSlug} for ${set.size} different items in series. `
       + `For 3+ independent same-shape items, call run_worker once per item (in parallel waves of up to 8) `
