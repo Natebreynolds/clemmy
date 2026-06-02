@@ -43,6 +43,7 @@ const {
   reapResolvedParkedRuns,
   executeStep,
   findContractViolationStep,
+  describeStepNonCompletion,
 } = await import('./workflow-runner.js');
 const { readWorkflowEvents } = await import('./workflow-events.js');
 const { HarnessSession } = await import('../runtime/harness/session.js');
@@ -200,6 +201,51 @@ test('applySkillToPrompt: empty usesSkill string is treated as unset', () => {
     'do thing carefully',
   );
   assert.equal(out, 'do thing carefully');
+});
+
+// ---------------------------------------------------------------------------
+// Gap A — a step that ends in any non-`completed` harness status must report
+// back honestly, never be captured as prose-success. The throw in
+// runStepViaHarness uses describeStepNonCompletion for a legible message; the
+// outer processOneRunFile catch then classifies cancel-vs-error. (The
+// behavioral throw is verified live; here we lock the message contract that
+// drives the report-back.)
+// ---------------------------------------------------------------------------
+
+test('describeStepNonCompletion: limit_exceeded explains the guardrail/budget stop', () => {
+  const msg = describeStepNonCompletion('limit_exceeded');
+  assert.match(msg, /guardrail|loop|budget|limit/i);
+  assert.ok(!/unknown/i.test(msg), 'must be specific, not a generic placeholder');
+});
+
+test('describeStepNonCompletion: killed explains the abort', () => {
+  assert.match(describeStepNonCompletion('killed'), /abort/i);
+});
+
+test('describeStepNonCompletion: awaiting_user_input names the background-workflow limitation + the fix', () => {
+  const msg = describeStepNonCompletion('awaiting_user_input');
+  assert.match(msg, /user input/i);
+  assert.match(msg, /requiresApproval|input/i, 'should point at the actionable remedy');
+});
+
+test('describeStepNonCompletion: failed describes an unhandled error', () => {
+  assert.match(describeStepNonCompletion('failed'), /error/i);
+});
+
+test('describeStepNonCompletion: an explicit harness error takes precedence over the canned reason', () => {
+  const msg = describeStepNonCompletion('limit_exceeded', 'tool AIRTABLE_LIST repeated 7x');
+  assert.equal(msg, 'tool AIRTABLE_LIST repeated 7x');
+});
+
+test('describeStepNonCompletion: a blank error falls back to the status reason (no empty report)', () => {
+  const msg = describeStepNonCompletion('killed', '   ');
+  assert.match(msg, /abort/i, 'whitespace-only error must not produce an empty report-back');
+});
+
+test('describeStepNonCompletion: an unknown future status still yields a non-empty reason', () => {
+  const msg = describeStepNonCompletion('some_new_status');
+  assert.ok(msg.length > 0);
+  assert.match(msg, /some_new_status/);
 });
 
 test('planWorkflowExecutionBatches: fans out independent dependsOn branches', () => {

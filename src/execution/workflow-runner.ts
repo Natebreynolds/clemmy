@@ -48,6 +48,8 @@ import { configureHarnessRuntime } from '../runtime/harness/codex-client.js';
 import { closePlanScope, openPlanScope } from '../agents/plan-scope.js';
 import { missingWorkflowRunInputs, normalizeWorkflowRunInputs } from './workflow-inputs.js';
 import { verifyStepOutput } from './step-output-verify.js';
+import { judgeWorkflowTarget, type WorkflowTargetVerdict } from './workflow-objective-judge.js';
+import { judgeStepSkillExecution } from './workflow-step-judge.js';
 
 const logger = pino({ name: 'clementine-next.workflow-runner' });
 
@@ -312,6 +314,7 @@ class ParkRunSignal extends Error {
   }
 }
 
+
 /**
  * P0 flag: event-driven approval parking. Default OFF → the in-place
  * poll loop (today's exact behavior) holds the worker until the approval
@@ -330,6 +333,29 @@ function isWorkflowRunCancelled(runId: string): boolean {
 
 function throwIfWorkflowRunCancelled(runId: string): void {
   if (isWorkflowRunCancelled(runId)) throw new WorkflowRunCancelledError();
+}
+
+/**
+ * Plain-language reason for a step that ended in any harness terminal status
+ * OTHER than `completed`. A workflow step is only "done" when the harness
+ * reports `completed`; every other terminal status means the step did NOT
+ * finish its job and must be reported back honestly (north-star: reports back
+ * without fail), never captured as prose-success. Exported for tests.
+ */
+export function describeStepNonCompletion(status: string, error?: string): string {
+  if (error && error.trim()) return error.trim();
+  switch (status) {
+    case 'limit_exceeded':
+      return 'the step hit a tool-call / loop guardrail or budget limit before finishing';
+    case 'killed':
+      return 'the step run was aborted before finishing';
+    case 'awaiting_user_input':
+      return 'the step is waiting for user input, which a background workflow cannot provide — make it a requiresApproval step or supply the value as an input';
+    case 'failed':
+      return 'the step failed with an unhandled error';
+    default:
+      return `the step ended in a non-completed state (${status})`;
+  }
 }
 
 /**
@@ -667,6 +693,20 @@ interface StepExecutionContext {
   // workflow run can surface "completed with N/M failures" instead of
   // reporting an all-green success when fan-out items quietly errored.
   forEachFailures: Array<{ stepId: string; itemKey: string; error: string }>;
+  // Shared accumulator for NON-FAILING quality advisories (skill-execution
+  // judge misses). These NEVER fail a step or run — they ride along with the
+  // delivered output as a "review this" heads-up so a confident-but-wrong
+  // judge can never break a workflow that actually succeeded.
+  qualityAdvisories: WorkflowQualityAdvisory[];
+}
+
+/** A non-blocking quality heads-up attached to a COMPLETED run. The deliverable
+ *  is still produced + delivered; this only adds a "review this" note. */
+export interface WorkflowQualityAdvisory {
+  stepId: string;
+  itemKey?: string;
+  kind: 'skill_not_executed' | 'target_missed';
+  note: string;
 }
 
 /**
@@ -741,6 +781,9 @@ interface HarnessStepResult {
   /** True when `output` came from an explicit workflow_step_result call
    *  rather than the prose fallback (telemetry / migration signal). */
   usedStructuredResult?: boolean;
+  /** The real harness session id the step ran in — used by the per-step
+   *  skill-execution judge to read this step's tool-call evidence. */
+  sessionId: string;
 }
 
 function workflowHarnessMetadataMatches(
@@ -1000,12 +1043,6 @@ async function runStepViaHarness(
       clearWorkflowRunPausedForApproval(workflowRunId);
     }
 
-    if (result.status === 'failed') {
-      throw new Error(
-        `workflow step "${step.id}" failed via harness: ${result.error ?? 'unknown error'}`,
-      );
-    }
-
     // Pull the user-visible output from the most recent
     // conversation_completed event for this session. The harness writes
     // `summary` (or `reply` when present) as the user-facing text.
@@ -1019,16 +1056,37 @@ async function runStepViaHarness(
       || (lastCompletion?.data?.summary as string | undefined)
       || '';
 
-    // Prefer the explicit structured result the step emitted via
-    // workflow_step_result (captured full, unclipped, keyed by session).
-    // Fall back to the agent's prose when the step didn't emit one — so a
-    // step (or the legacy orchestrator path) that never calls the tool
-    // behaves exactly as before.
+    // The explicit structured result the step emitted via workflow_step_result
+    // (captured full, unclipped, keyed by session). Taken once.
     const captured = takeStepResult(realSessionId);
-    if (captured.found) {
-      return { output: captured.value, hadApprovals, approvalIds, usedStructuredResult: true };
+
+    // A step is "done" only when the harness reports `completed`. The
+    // awaiting_approval while-loop above guarantees a terminal status here.
+    //   - `failed` = a real harness error → always throw (prior behavior).
+    //   - A step that EXPLICITLY emitted its deliverable via
+    //     workflow_step_result delivers it even on a SOFT non-completion
+    //     (limit_exceeded / killed / awaiting_user_input): the step did its
+    //     job and emitted the result before the limit/kill, so discarding that
+    //     real partial would be a regression.
+    //   - Otherwise (no explicit deliverable AND not `completed`) only the
+    //     harness apology prose remains → throw so a guardrail-killed /
+    //     limit-hit run can't masquerade as success. The throw unwinds to
+    //     processOneRunFile, which classifies cancel-vs-error and reports back
+    //     loudly (north-star: reports back without fail).
+    if (result.status === 'failed') {
+      throw new Error(
+        `workflow step "${step.id}" failed via harness: ${result.error ?? describeStepNonCompletion('failed')}`,
+      );
     }
-    return { output: prose, hadApprovals, approvalIds, usedStructuredResult: false };
+    if (captured.found) {
+      return { output: captured.value, hadApprovals, approvalIds, usedStructuredResult: true, sessionId: realSessionId };
+    }
+    if (result.status !== 'completed') {
+      throw new Error(
+        `workflow step "${step.id}" did not complete (status: ${result.status}): ${describeStepNonCompletion(result.status, result.error)}`,
+      );
+    }
+    return { output: prose, hadApprovals, approvalIds, usedStructuredResult: false, sessionId: realSessionId };
   } finally {
     // Belt + suspenders: clear the heartbeat gate in finally so a throw
     // mid-resume doesn't leave the heartbeat permanently suppressed
@@ -1456,24 +1514,38 @@ export async function executeStep(
         // Bind this item's declared inputs + fast-fail on missing (no-op
         // when the step declares no `inputs`). `item` is in scope here.
         const itemContext = bindStepContext(step, ctx, item);
-        const prompt = applySkillToPrompt(step, renderTemplate(step.prompt, ctx.inputs, ctx.stepOutputs, item));
-        const output = workflowHarnessEnabled(step)
-          ? (await runStepViaHarness(
-              step,
-              `${ctx.runId}:${step.id}:${key}`,
-              `Item: ${key}\n\n${prompt}`,
-              ctx.workflow.name,
-              workflowAutoApprovalTools(ctx.workflow, step),
-              ctx.runId,
-              itemContext,
-            )).output
-          : (await ctx.assistant.respond({
-              sessionId: `workflow:${ctx.runId}:${step.id}:${key}`,
-              channel: 'workflow',
-              message: `Workflow: ${ctx.workflow.name}\nStep: ${step.id}\nItem: ${key}\n\n${prompt}`,
-              model: step.model || MODELS.primary,
-              maxWallClockMs: WORKFLOW_STEP_WALL_CLOCK_MS,
-            })).text;
+        const itemIntent = renderTemplate(step.prompt, ctx.inputs, ctx.stepOutputs, item);
+        const prompt = applySkillToPrompt(step, itemIntent);
+        let output: unknown;
+        let itemSessionId = `workflow:${ctx.runId}:${step.id}:${key}`;
+        if (workflowHarnessEnabled(step)) {
+          const r = await runStepViaHarness(
+            step,
+            `${ctx.runId}:${step.id}:${key}`,
+            `Item: ${key}\n\n${prompt}`,
+            ctx.workflow.name,
+            workflowAutoApprovalTools(ctx.workflow, step),
+            ctx.runId,
+            itemContext,
+          );
+          output = r.output;
+          itemSessionId = r.sessionId;
+        } else {
+          output = (await ctx.assistant.respond({
+            sessionId: `workflow:${ctx.runId}:${step.id}:${key}`,
+            channel: 'workflow',
+            message: `Workflow: ${ctx.workflow.name}\nStep: ${step.id}\nItem: ${key}\n\n${prompt}`,
+            model: step.model || MODELS.primary,
+            maxWallClockMs: WORKFLOW_STEP_WALL_CLOCK_MS,
+          })).text;
+        }
+        // Per-item skill-execution check (forEach): advisory, DETECTION-ONLY —
+        // a `usesSkill` item that couldn't be confirmed to produce the skill's
+        // deliverables records a non-failing quality advisory. The item still
+        // completes + contributes its output; it never becomes an item failure
+        // on a judge verdict (a confident-but-wrong judge can't drop a good
+        // item). Fail-open; no-op for items without usesSkill.
+        await noteStepSkillAdvisory(step, itemSessionId, output, itemIntent, ctx, key);
         appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
           kind: 'item_completed',
           stepId: step.id,
@@ -1525,6 +1597,7 @@ export async function executeStep(
   });
   const prompt = applySkillToPrompt(step, renderTemplate(step.prompt, ctx.inputs, ctx.stepOutputs));
   let output: unknown;
+  let stepSessionId = `workflow:${ctx.runId}:${step.id}`;
   if (workflowHarnessEnabled(step)) {
     try {
       const result = await runStepViaHarness(
@@ -1538,6 +1611,7 @@ export async function executeStep(
         true, // canPark: plain step unwinds cleanly to processOneRunFile
       );
       output = result.output;
+      stepSessionId = result.sessionId;
       if (result.hadApprovals) {
         logger.info(
           { stepId: step.id, approvalIds: result.approvalIds, count: result.approvalIds.length },
@@ -1562,7 +1636,52 @@ export async function executeStep(
     });
     output = response.text;
   }
+
+  // Skill-execution check (advisory, DETECTION-ONLY). Engages ONLY for
+  // `usesSkill` steps; fail-open. A confident miss records a non-failing
+  // quality advisory that rides along with the delivered output — it never
+  // fails the step or run, so it can't break a workflow that actually
+  // succeeded.
+  await noteStepSkillAdvisory(step, stepSessionId, output, renderTemplate(step.prompt, ctx.inputs, ctx.stepOutputs), ctx);
+
   return finalizeStepOutput(ctx.workflowSlug, ctx.runId, step, output);
+}
+
+/**
+ * Run the per-step skill-execution judge and, on a confident miss, record a
+ * NON-FAILING quality advisory (the step still completed + delivered its
+ * output). DETECTION-ONLY: it never throws / never fails the step or run — a
+ * confident-but-wrong judge can therefore never break a workflow that actually
+ * succeeded (the owner's #1 bar). No-op for steps without `usesSkill`, and
+ * wholly fail-open (any error is swallowed). `itemKey` set for forEach items.
+ */
+async function noteStepSkillAdvisory(
+  step: WorkflowStepInput,
+  sessionId: string,
+  output: unknown,
+  stepIntent: string,
+  ctx: StepExecutionContext,
+  itemKey?: string,
+): Promise<void> {
+  if (!step.usesSkill?.trim()) return;
+  try {
+    const verdict = await judgeStepSkillExecution({ step, sessionId, output, stepIntent });
+    if (verdict.judged && !verdict.executed) {
+      ctx.qualityAdvisories.push({
+        stepId: step.id,
+        itemKey,
+        kind: 'skill_not_executed',
+        note: `step "${step.id}"${itemKey ? ` · item ${itemKey}` : ''} used skill "${step.usesSkill}" — couldn't confirm it produced the skill's deliverables: ${verdict.reason}`,
+      });
+      appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
+        kind: 'step_advisory',
+        stepId: step.id,
+        meta: { reason: 'skill_not_executed', skill: step.usesSkill, note: verdict.reason, itemKey },
+      });
+    }
+  } catch {
+    /* advisory is best-effort — a judge hiccup must never affect the step */
+  }
 }
 
 export function planWorkflowExecutionBatches(
@@ -1633,10 +1752,11 @@ async function executeWorkflow(
   inputs: Record<string, string>,
   assistant: ClementineAssistant,
   targetStepId?: string,
-): Promise<{ finalOutput: string; forEachFailures: Array<{ stepId: string; itemKey: string; error: string }> }> {
+): Promise<{ finalOutput: string; forEachFailures: Array<{ stepId: string; itemKey: string; error: string }>; qualityAdvisories: WorkflowQualityAdvisory[] }> {
   const resume = computeResumeState(workflowSlug, runId);
   const stepOutputs: Record<string, unknown> = Object.fromEntries(resume.completedSteps);
   const forEachFailures: Array<{ stepId: string; itemKey: string; error: string }> = [];
+  const qualityAdvisories: WorkflowQualityAdvisory[] = [];
 
   // Single-step "TRY" mode: execute only the named step. Upstream
   // references in the prompt resolve to empty strings — the user is
@@ -1662,7 +1782,7 @@ async function executeWorkflow(
       });
       const completedItems = resume.completedItems.get(step.id) ?? new Map();
       const output = await executeStepVerified(step, {
-        workflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems, forEachFailures,
+        workflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems, forEachFailures, qualityAdvisories,
       });
       throwIfWorkflowRunCancelled(runId);
       stepOutputs[step.id] = output;
@@ -1683,7 +1803,7 @@ async function executeWorkflow(
         throwIfWorkflowRunCancelled(runId);
         const completedItems = resume.completedItems.get(step.id) ?? new Map();
         const output = await executeStepVerified(step, {
-          workflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems, forEachFailures,
+          workflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems, forEachFailures, qualityAdvisories,
         });
         return { step, output };
       }));
@@ -1783,7 +1903,7 @@ async function executeWorkflow(
 
   // Record string-coerced step outputs on the run record for the
   // dashboard's recent-runs display (which expects strings).
-  return { finalOutput, forEachFailures };
+  return { finalOutput, forEachFailures, qualityAdvisories };
 }
 
 function stringifyOutputs(stepOutputs: Record<string, unknown>): Record<string, string> {
@@ -2066,7 +2186,7 @@ async function processOneRunFile(
 
     const stopHeartbeat = startWorkflowHeartbeat(workflow.data.name, run.id, Date.now());
     try {
-      const { finalOutput, forEachFailures } = await executeWorkflow(workflow.data, workflow.name, run.id, inputs, assistant, run.targetStepId);
+      const { finalOutput, forEachFailures, qualityAdvisories } = await executeWorkflow(workflow.data, workflow.name, run.id, inputs, assistant, run.targetStepId);
       throwIfWorkflowRunCancelled(run.id);
       const resume = computeResumeState(workflow.name, run.id);
       const stepOutputs = stringifyOutputs(Object.fromEntries(resume.completedSteps));
@@ -2077,6 +2197,47 @@ async function processOneRunFile(
       // dumps raw JSON. Detect it, diagnose the root cause, and offer a
       // fix — instead of silently reporting a misleading success.
       const blockedSteps = detectBlockedSteps(stepOutputs, workflow.data.steps.map((s) => s.id));
+
+      // Workflow-level "did we reach the target?" judge (fail-open,
+      // conservative, DETECTION-ONLY, ADVISORY). A background workflow is only
+      // valuable if its final deliverable is exactly what the user needs — so
+      // audit the deliverable against the workflow's declared target + this
+      // run's inputs. A CONFIDENT miss records a NON-FAILING quality advisory
+      // that rides along with the delivered output: the run still completes and
+      // DELIVERS its result, but honestly flags "couldn't confirm the target."
+      // It NEVER fails the run, NEVER hides the deliverable, and NEVER re-runs
+      // the workflow (a blind re-run could double irreversible side effects) —
+      // so a confident-but-wrong verdict can never break a workflow that
+      // actually succeeded. Skipped for partial single-step re-runs and runs
+      // with no deliverable; fully fail-open.
+      const baseSuccessBody = renderSuccessBody({
+        steps: workflow.data.steps,
+        stepOutputs,
+        finalOutput,
+        hasSynthesis: Boolean(workflow.data.synthesis?.prompt) && !run.targetStepId,
+      });
+      let targetVerdict: WorkflowTargetVerdict | null = null;
+      try {
+        targetVerdict = await judgeWorkflowTarget({
+          workflow: workflow.data,
+          inputs,
+          finalOutput,
+          fallbackBody: baseSuccessBody,
+          isPartialRun: Boolean(run.targetStepId),
+        });
+      } catch { /* fail-open: a target-judge error never affects a completed run */ }
+      if (targetVerdict && targetVerdict.judged && !targetVerdict.reached) {
+        qualityAdvisories.push({
+          stepId: '(workflow target)',
+          kind: 'target_missed',
+          note: `couldn't confirm this run reached the workflow's target: ${targetVerdict.gap}`,
+        });
+        logger.info(
+          { workflow: workflow.data.name, runId: run.id, gap: targetVerdict.gap },
+          'Workflow target check flagged a possible miss — surfacing as a non-failing advisory',
+        );
+      }
+
       // Only GENUINE blocks (explicit {blocked:true} / prose) are routed to the
       // Doctor — its remedies (rewrite the prompt, reconnect a service, fix an
       // input) presume a prompt/connection/input cause. A step that RAN but
@@ -2128,12 +2289,17 @@ async function processOneRunFile(
       // fix offer when self-heal produced one. Otherwise today's body.
       // Success body: human-readable (synthesis prose or humanized step
       // results), never a raw JSON dump of the step bookkeeping.
-      const successBody = `${renderSuccessBody({
-        steps: workflow.data.steps,
-        stepOutputs,
-        finalOutput,
-        hasSynthesis: Boolean(workflow.data.synthesis?.prompt) && !run.targetStepId,
-      })}${failureSummary}`;
+      const successBody = `${baseSuccessBody}${failureSummary}`;
+      // Non-failing quality advisories (skill-execution misses + target-miss):
+      // appended to whichever body we send so the deliverable is ALWAYS shown,
+      // with a clear "review this" heads-up after it. Never replaces the body.
+      const hasAdvisories = qualityAdvisories.length > 0;
+      const advisorySummary = hasAdvisories
+        ? `\n\n⚠️ Quality check (the result above is delivered — please review):\n${qualityAdvisories
+            .slice(0, 5)
+            .map((a) => `- ${a.note}`)
+            .join('\n')}${qualityAdvisories.length > 5 ? `\n(+${qualityAdvisories.length - 5} more)` : ''}`
+        : '';
       const outcome = renderLegibleOutcome({
         workflowName: workflow.data.name,
         blockedSteps,
@@ -2160,17 +2326,20 @@ async function processOneRunFile(
           : outcome.title,
         // Send the full body. Discord delivery splits long content into
         // multiple messages; previous 2000-char slice cut off workflow
-        // results above that length with no continuation.
-        body: needsAttention ? outcome.body : successBody,
+        // results above that length with no continuation. Quality advisories
+        // are appended to whichever body we send (never replace the deliverable).
+        body: `${needsAttention ? outcome.body : successBody}${advisorySummary}`,
         createdAt: new Date().toISOString(),
         read: false,
-        silent: stepAlreadyNotified,
+        // Advisories must reach the user — never silence a run that has one.
+        silent: stepAlreadyNotified && !hasAdvisories,
         metadata: {
           workflow: workflow.data.name,
           runId: run.id,
           forEachFailures: hasFailures ? forEachFailures : undefined,
           needsAttention: needsAttention || undefined,
           proposedFixId: proposedFix?.id,
+          qualityAdvisories: hasAdvisories ? qualityAdvisories : undefined,
         },
       });
       markRunNotified(filePath);
@@ -2179,11 +2348,11 @@ async function processOneRunFile(
           status: 'completed',
           message: needsAttention
             ? `Needs attention — ${blockedSteps.length} step${blockedSteps.length === 1 ? '' : 's'} blocked`
-            : `Completed${hasFailures ? ` with ${forEachFailures.length} item failure${forEachFailures.length === 1 ? '' : 's'}` : ''}`,
-          outputPreview: (needsAttention ? outcome.body : successBody).slice(0, 800),
+            : `Completed${hasFailures ? ` with ${forEachFailures.length} item failure${forEachFailures.length === 1 ? '' : 's'}` : ''}${hasAdvisories ? ` · ${qualityAdvisories.length} quality advisory${qualityAdvisories.length === 1 ? '' : 'ies'}` : ''}`,
+          outputPreview: `${(needsAttention ? outcome.body : successBody)}${advisorySummary}`.slice(0, 800),
         });
       } catch { /* best-effort */ }
-      logger.info({ workflow: workflow.data.name, runId: run.id, partialFailures: forEachFailures.length, blockedSteps: blockedSteps.length, diagnosed: !!diagnosis }, 'Workflow run completed');
+      logger.info({ workflow: workflow.data.name, runId: run.id, partialFailures: forEachFailures.length, blockedSteps: blockedSteps.length, advisories: qualityAdvisories.length, diagnosed: !!diagnosis }, 'Workflow run completed');
     } catch (error) {
       // P0 parking: the run paused on a human approval. Checkpoint the
       // resume coordinates as status='parked' and RETURN — this is NOT a

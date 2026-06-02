@@ -45,6 +45,10 @@ function toFrontmatter(def: WorkflowDefinition): WorkflowFrontmatter {
 export interface WorkflowWriteCheck {
   ok: boolean;
   errors: string[];
+  /** Non-blocking authoring advisories (e.g. "declare an output contract",
+   *  "use forEach for batch work"). Surfaced to the authoring agent in the
+   *  tool result so it can self-correct before/after save — never blocks. */
+  warnings: string[];
 }
 
 /**
@@ -171,5 +175,5 @@ export function checkDependencyBinding(def: WorkflowDefinition): string[] {
 export function checkWorkflowForWrite(def: WorkflowDefinition): WorkflowWriteCheck {
   const result = validateWorkflowDefinition(toFrontmatter(def));
   const errors = [...result.errors, ...checkSendGate(def), ...checkRunnabilityConstraints(def), ...checkDependencyBinding(def)];
-  return { ok: errors.length === 0, errors };
+  return { ok: errors.length === 0, errors, warnings: result.warnings };
 }

@@ -52,6 +52,18 @@ import { addNotification } from '../runtime/notifications.js';
  * model self-corrects instead of looping. Values are coerced toward strings
  * downstream by normalizeWorkflowRunInputs.
  */
+/**
+ * Render non-blocking authoring advisories (output-contract / forEach hints)
+ * into the workflow_create/_update tool result so the AUTHORING agent sees them
+ * and can self-correct before relying on the workflow. Advisory only — the
+ * write already succeeded. Empty string when there is nothing to flag, so a
+ * clean authoring run is byte-identical.
+ */
+export function renderAuthoringAdvisories(warnings: string[] | undefined): string {
+  if (!warnings || warnings.length === 0) return '';
+  return `\n\nHeads up (advisory — the workflow was saved):\n- ${warnings.join('\n- ')}`;
+}
+
 export function parseWorkflowRunInputsJson(raw: string | null | undefined): Record<string, string> {
   if (raw === null || raw === undefined) return {};
   const trimmed = raw.trim();
@@ -443,7 +455,9 @@ export function registerOrchestrationTools(server: McpServer): void {
         );
       }
       writeWorkflow(dirName, def);
-      return textResult(`Created workflow "${name}" at workflows/${dirName}/SKILL.md.`);
+      return textResult(
+        `Created workflow "${name}" at workflows/${dirName}/SKILL.md.${renderAuthoringAdvisories(createCheck.warnings)}`,
+      );
     },
   );
 
@@ -713,7 +727,11 @@ export function registerOrchestrationTools(server: McpServer): void {
           changed,
         },
       });
-      return textResult(`Workflow "${name}" updated.`);
+      // Non-blocking authoring advisories (output-contract / forEach hints).
+      // Update has never gated on validation; keep it that way — surface the
+      // hints so the author can sharpen the workflow without blocking the save.
+      const updateAdvisories = renderAuthoringAdvisories(checkWorkflowForWrite(next).warnings);
+      return textResult(`Workflow "${name}" updated.${updateAdvisories}`);
     },
   );
 

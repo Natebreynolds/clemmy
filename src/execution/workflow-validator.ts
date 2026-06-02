@@ -362,6 +362,25 @@ function checkDeterministicRunner(step: WorkflowStepShape): string | null {
   return null;
 }
 
+// A step that produces a concrete artifact (file / URL / report / record)
+// should declare an `output` contract — that's what engages BOTH the
+// deterministic per-step verifier (verifyStepOutput) AND the end-of-run target
+// judge. Without it, a step that claims success without actually producing the
+// deliverable passes silently. Advisory only (regex can't be certain), and
+// skipped when the step already declares output / is a forEach fan-out wrapper
+// (its items carry the shape) / is purely deterministic config.
+const DELIVERABLE_RE = /\b(report|brief|audit|file|document|url|link|html|sheet|spreadsheet|pdf|csv|deck|slides?|deploy(?:ed|ment)?|publish(?:ed)?|draft(?:ed)?|record|page|website|saved to|written to|upload(?:ed)?)\b/i;
+const PRODUCE_RE = /\b(produce|generate|create|build|write|draft|deploy|publish|save|export|render|compile|assemble|deliver|output)\b/i;
+
+function checkOutputContractHint(step: WorkflowStepShape): string | null {
+  if (step.output && Object.keys(step.output).length > 0) return null;
+  if (step.forEach) return null; // the fan-out wrapper aggregates; per-item shape is what matters
+  if (step.deterministic) return null; // deterministic steps are handled by checkDeterministicRunner
+  const prompt = step.prompt ?? '';
+  if (!DELIVERABLE_RE.test(prompt) || !PRODUCE_RE.test(prompt)) return null;
+  return `Step "${step.id}" looks like it produces a deliverable but declares no output contract. Add an "output" block (e.g. required_keys, or verify.url_present / verify.path_exists for a real URL or file) so the engine can confirm the deliverable actually exists and the end-of-run target check can verify it — otherwise a step that claims success without producing the artifact passes silently.`;
+}
+
 function checkSkillReference(step: WorkflowStepShape, installedSkillNames: Set<string> | undefined): string | null {
   const skill = (step.usesSkill ?? step.uses_skill ?? '').trim();
   if (!skill || !installedSkillNames) return null;
@@ -482,6 +501,9 @@ export function validateWorkflowDefinition(
 
     const parallelismIssue = checkParallelismHint(step);
     if (parallelismIssue) warnings.push(parallelismIssue);
+
+    const outputContractIssue = checkOutputContractHint(step);
+    if (outputContractIssue) warnings.push(outputContractIssue);
   }
 
   return {

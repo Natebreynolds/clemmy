@@ -45,6 +45,7 @@ export type WorkflowEventKind =
   | 'step_completed'      // step finished — output is the final result
   | 'step_failed'         // step errored
   | 'step_retry'          // step failed transiently; retrying after backoff
+  | 'step_advisory'       // step completed but a non-failing quality check flagged it (skill-execution miss)
   | 'step_skipped'        // step was a no-op (forEach over empty list, condition)
   | 'item_started'        // one iteration of a forEach step started
   | 'item_completed'      // one iteration of a forEach step done

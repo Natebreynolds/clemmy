@@ -230,6 +230,72 @@ test('multi-item step without forEach → parallelism warning', () => {
   );
 });
 
+test('deliverable-producing step without an output contract → advisory warning (Gap C)', () => {
+  const result = validateWorkflowDefinition({
+    name: 'wf',
+    description: 'Workflow that builds a report',
+    steps: [
+      { id: 'build', prompt: 'Generate the competitive SEO brief and save it to an HTML file.' },
+    ],
+  });
+  assert.ok(
+    result.warnings.some((w) => /output contract/i.test(w)),
+    `expected output-contract advisory, got: ${JSON.stringify(result.warnings)}`,
+  );
+});
+
+test('deliverable step WITH an output contract → no advisory', () => {
+  const result = validateWorkflowDefinition({
+    name: 'wf',
+    description: 'Workflow that builds a report with a declared contract',
+    steps: [
+      {
+        id: 'build',
+        prompt: 'Generate the competitive SEO brief and save it to an HTML file.',
+        output: { verify: { path_exists: ['path'] } },
+      },
+    ],
+  });
+  assert.ok(
+    !result.warnings.some((w) => /output contract/i.test(w)),
+    `expected NO output-contract advisory once declared, got: ${JSON.stringify(result.warnings)}`,
+  );
+});
+
+test('non-deliverable step → no output-contract advisory (precision guard)', () => {
+  const result = validateWorkflowDefinition({
+    name: 'wf',
+    description: 'Workflow that just reads',
+    steps: [
+      { id: 'check', prompt: 'Summarize how many unread messages are in the inbox.' },
+    ],
+  });
+  assert.ok(
+    !result.warnings.some((w) => /output contract/i.test(w)),
+    `a pure read should not be nudged, got: ${JSON.stringify(result.warnings)}`,
+  );
+});
+
+test('forEach + deterministic steps are exempt from the output-contract advisory', () => {
+  const forEach = validateWorkflowDefinition({
+    name: 'wf',
+    description: 'fan-out',
+    steps: [
+      { id: 'list', prompt: 'List the prospects.' },
+      { id: 'each', prompt: 'Generate and save a brief file.', forEach: 'list' },
+    ],
+  });
+  assert.ok(!forEach.warnings.some((w) => /output contract/i.test(w)), 'forEach wrapper exempt');
+  const det = validateWorkflowDefinition({
+    name: 'wf2',
+    description: 'deterministic',
+    steps: [
+      { id: 'gen', prompt: 'Generate and save the report file.', deterministic: { runner: 'scripts/gen.py' } },
+    ],
+  });
+  assert.ok(!det.warnings.some((w) => /output contract/i.test(w)), 'deterministic step exempt');
+});
+
 test('deterministic config without runner → warning', () => {
   const result = validateWorkflowDefinition({
     name: 'wf',

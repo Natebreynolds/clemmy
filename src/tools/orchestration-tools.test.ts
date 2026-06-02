@@ -11,7 +11,7 @@ const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-orchestration-test-'
 process.env.CLEMENTINE_HOME = TMP_HOME;
 process.env.HOME = TMP_HOME;
 
-const { registerOrchestrationTools } = await import('./orchestration-tools.js');
+const { registerOrchestrationTools, renderAuthoringAdvisories } = await import('./orchestration-tools.js');
 const { writeWorkflow, readWorkflow } = await import('../memory/workflow-store.js');
 const { WORKFLOWS_DIR } = await import('../memory/vault.js');
 const { WORKFLOW_RUNS_DIR } = await import('./shared.js');
@@ -211,4 +211,19 @@ test('workflow_run does not queue duplicate active runs for identical inputs', a
 
   const files = readdirSync(WORKFLOW_RUNS_DIR).filter((entry) => entry.endsWith('.json'));
   assert.equal(files.length, 1);
+});
+
+// ── Gap C: authoring advisories render into the tool result ───────────────
+
+test('renderAuthoringAdvisories: empty when there are no warnings (byte-identical clean authoring)', () => {
+  assert.equal(renderAuthoringAdvisories([]), '');
+  assert.equal(renderAuthoringAdvisories(undefined), '');
+});
+
+test('renderAuthoringAdvisories: surfaces warnings as a non-blocking heads-up', () => {
+  const out = renderAuthoringAdvisories(['declare an output contract', 'use forEach']);
+  assert.match(out, /advisory/i);
+  assert.match(out, /saved/i, 'must make clear the workflow was still saved');
+  assert.match(out, /declare an output contract/);
+  assert.match(out, /use forEach/);
 });
