@@ -240,3 +240,23 @@ test('auto-remember RE-LEARNS after a choice was invalidated (choice cleared →
   maybeAutoRememberComposioChoice('NEW_WORKING_SLUG', {}, { successful: true }, 'sess-relearn');
   assert.equal(peekToolChoice(intent)?.choice?.identifier, 'NEW_WORKING_SLUG', 'auto-commit re-fills an invalidated intent');
 });
+
+test('fan-out advisory fires ONCE on the 3rd distinct-item call of the same slug', async () => {
+  const { maybeFanoutAdvisory } = await import('./composio-tools.js');
+  const sid = 'sess-fanout-1';
+  assert.equal(maybeFanoutAdvisory('DATAFORSEO_SERP', { q: 'item1' }, sid), null, 'item 1: no advice');
+  assert.equal(maybeFanoutAdvisory('DATAFORSEO_SERP', { q: 'item2' }, sid), null, 'item 2: no advice');
+  const advice = maybeFanoutAdvisory('DATAFORSEO_SERP', { q: 'item3' }, sid);
+  assert.ok(advice && /run_worker/.test(advice), 'item 3: fan-out advice fires');
+  // One-time per session.
+  assert.equal(maybeFanoutAdvisory('DATAFORSEO_SERP', { q: 'item4' }, sid), null, 'item 4: advice does not repeat');
+});
+
+test('fan-out advisory does NOT fire for the SAME args repeated (that is a loop, not a batch)', async () => {
+  const { maybeFanoutAdvisory } = await import('./composio-tools.js');
+  const sid = 'sess-fanout-2';
+  for (let i = 0; i < 5; i++) {
+    assert.equal(maybeFanoutAdvisory('AIRTABLE_LIST_RECORDS', { baseId: 'app1', table: 'tbl1' }, sid), null,
+      'identical args = not distinct items = no fan-out advice');
+  }
+});

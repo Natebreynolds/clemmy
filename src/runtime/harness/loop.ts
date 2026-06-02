@@ -34,6 +34,7 @@ import {
 } from './budget.js';
 import { MODELS } from '../../config.js';
 import { judgeObjectiveComplete, shouldRunObjectiveJudge, type ObjectiveJudgeFn } from './objective-judge.js';
+import { gatherSessionSkills, summarizeToolCallsForJudge } from './skill-execution.js';
 import { classifyMessageIntent } from '../../assistant/message-intent.js';
 import { attachEventLogHooks, extractSessionIdFromContext, type RunHooksLike } from './hooks.js';
 import * as approvalRegistry from './approval-registry.js';
@@ -1419,7 +1420,15 @@ async function runConversationCore(
         })
       ) {
         const responseText = decision.reply && decision.reply.trim() ? decision.reply : decision.summary;
-        const verdict = await objectiveJudge(objective, responseText ?? '');
+        // Skill-execution rubric: if any skill was loaded this session, give the
+        // judge the skill's own steps + tool-call evidence so it verifies the
+        // skill was EXECUTED (deliverables produced), not just read. Fail-open:
+        // gather helpers return [] on error, so the judge runs exactly as before.
+        const loadedSkills = gatherSessionSkills(options.sessionId);
+        const skillContext = loadedSkills.length > 0
+          ? { skills: loadedSkills, toolCallSummary: summarizeToolCallsForJudge(options.sessionId) }
+          : undefined;
+        const verdict = await objectiveJudge(objective, responseText ?? '', skillContext);
         if (!verdict.done) {
           objectiveJudgeContinuations += 1;
           safeAppend({

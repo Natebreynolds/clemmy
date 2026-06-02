@@ -59,9 +59,18 @@ export function shouldRunObjectiveJudge(input: ObjectiveJudgeGateInput): boolean
   );
 }
 
+/** Optional skill-execution rubric: the skills loaded this session + compact
+ *  evidence of what tools actually fired. When present, the judge verifies the
+ *  agent EXECUTED the skill (produced its deliverables), not just read it. */
+export interface SkillExecutionContext {
+  skills: { name: string; body: string }[];
+  toolCallSummary: string;
+}
+
 export type ObjectiveJudgeFn = (
   objective: string,
   assistantResponse: string,
+  skillContext?: SkillExecutionContext,
 ) => Promise<ObjectiveJudgeVerdict>;
 
 const VerdictSchema = z.object({
@@ -79,15 +88,28 @@ function buildJudgeAgent(): Agent<RuntimeContextValue, typeof VerdictSchema> {
   });
 }
 
-export function buildObjectiveJudgePrompt(objective: string, assistantResponse: string): string {
-  return [
+export function buildObjectiveJudgePrompt(
+  objective: string,
+  assistantResponse: string,
+  skillContext?: SkillExecutionContext,
+): string {
+  const parts = [
     `Objective: ${objective}`,
     '',
     "Assistant's most recent response (truncated to 4000 chars):",
     assistantResponse.slice(0, 4000),
-    '',
-    'Audit it against the objective and respond with the structured verdict.',
-  ].join('\n');
+  ];
+  if (skillContext && skillContext.skills.length > 0) {
+    parts.push(
+      '',
+      '=== SKILLS LOADED THIS SESSION — verify they were EXECUTED, not just read ===',
+      'A loaded skill is a procedure the assistant committed to run. For EACH skill below, check the assistant actually carried out its prescribed steps and produced its deliverables (a file, image, URL, record, deploy). Use the tool-call evidence: if a skill clearly prescribes a step (e.g. generate imagery, run a bundled script, create a file) and the evidence shows that step was NOT done, the objective is NOT done — set done=false and name the specific skipped step. A pure-advice/persona skill with no concrete deliverables has nothing to enforce.',
+      `Tool calls made this session: ${skillContext.toolCallSummary || '(none recorded)'}`,
+      ...skillContext.skills.map((s) => `\n--- skill: ${s.name} (first 2500 chars) ---\n${s.body.slice(0, 2500)}`),
+    );
+  }
+  parts.push('', 'Audit it against the objective and respond with the structured verdict.');
+  return parts.join('\n');
 }
 
 /**
@@ -98,13 +120,14 @@ export function buildObjectiveJudgePrompt(objective: string, assistantResponse: 
 export async function judgeObjectiveComplete(
   objective: string,
   assistantResponse: string,
+  skillContext?: SkillExecutionContext,
 ): Promise<ObjectiveJudgeVerdict> {
   if (!objective.trim() || !assistantResponse.trim()) {
     return { done: true, reason: 'insufficient text to judge — accepting completion' };
   }
   try {
     const runner = new Runner({ workflowName: 'clementine-objective-judge' });
-    const result = await runner.run(buildJudgeAgent(), buildObjectiveJudgePrompt(objective, assistantResponse), {
+    const result = await runner.run(buildJudgeAgent(), buildObjectiveJudgePrompt(objective, assistantResponse, skillContext), {
       maxTurns: 1,
     });
     const parsed = VerdictSchema.safeParse(result.finalOutput);

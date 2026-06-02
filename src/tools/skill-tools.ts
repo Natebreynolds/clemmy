@@ -116,7 +116,25 @@ export function registerSkillTools(server: McpServer): void {
 
       const crib = renderToolNameCrib(skill);
 
-      return textResult(`${head}\n\n${manifestLines}\n\n${crib}\n\n---\n${skill.body}`);
+      // Execution contract (global, generic — reads no skill-specific code).
+      // An installed skill is an authoritative PROCEDURE to run, not reference
+      // material to skim and cherry-pick. Without this framing the model treats
+      // skill_read as "study material" and skips prescribed steps (observed:
+      // read a redesign skill, then shipped without generating the imagery the
+      // skill calls for). The body below stays authoritative; this only frames
+      // intent. Applies in chat, workers, AND workflow steps because they all
+      // call this one tool.
+      const executionContract = [
+        '=== HOW TO RUN THIS SKILL ===',
+        'This skill is a PROCEDURE to EXECUTE, not reference material to summarize or cherry-pick.',
+        'Carry out every step in the body below, in order, using your tools:',
+        '- Do all steps and phases; do not condense or skip any. If the skill names a step (generate images, run a script, fetch a reference), actually do it.',
+        '- Produce every deliverable the body specifies (the file, image, URL, message, or record) — not a description of it.',
+        '- You are done with this skill only when each deliverable it prescribes actually exists.',
+        '- If you deliberately skip a prescribed step, say so explicitly and why — do not silently drop it.',
+      ].join('\n');
+
+      return textResult(`${head}\n\n${manifestLines}\n\n${crib}\n\n${executionContract}\n\n---\n${skill.body}`);
     },
   );
 }

@@ -222,6 +222,10 @@ test('compactSessionIfNeeded — applies pair collapse during layer 1 preflight'
   const { result, nextItems } = await compactSessionIfNeeded(session, items, {
     disable: 'layer1_only',
     layer1ItemThreshold: 1,
+    // This test exercises pair-collapse, so force the item-count trigger
+    // regardless of token headroom (the new headroom guard would otherwise
+    // hold off Layer-1 at these tiny token counts).
+    layer1ItemTriggerMinFraction: 0,
     layer1RetainToolPairs: 4,
   });
 
@@ -297,4 +301,51 @@ test('tool_outputs — call_id is scoped per session (no cross-session leakage)'
 // Cleanup
 process.on('exit', () => {
   try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* ignore */ }
+});
+
+test('compactSessionIfNeeded — Layer 1 does NOT clip on item-count alone when there is token headroom', async () => {
+  resetEventLog();
+  const session = HarnessSession.create({ kind: 'chat', title: 'headroom test' });
+  const items: AgentInputItem[] = [];
+  // 16 tool pairs, each result ~1KB → many items but tiny total tokens.
+  for (let i = 0; i < 16; i++) {
+    const callId = `call_h${i}`;
+    items.push(userMessage(`turn ${i}`));
+    items.push(toolCall(callId, 'dataforseo.serp', `{"q":"q-${i}"}`));
+    items.push(toolResult(callId, `serp ${i} ${'z'.repeat(1000)}`));
+    writeToolOutput({ sessionId: session.id, callId, tool: 'dataforseo.serp', output: `serp ${i} ${'z'.repeat(1000)}` });
+  }
+  session.updateConversationSnapshot(items);
+
+  // Big budget, low real token usage: item count (48 > 15) would have triggered
+  // the OLD unconditional clip. With the headroom guard it must NOT.
+  const { result } = await compactSessionIfNeeded(session, items, {
+    inputBudgetTokens: 200_000,
+    layer1ItemThreshold: 15,
+  });
+  assert.ok(result.beforeTokens < 200_000 * 0.3, 'precondition: well under the token-pressure trigger');
+  assert.equal(result.layer1.applied, false, 'no Layer-1 clip while there is abundant token headroom');
+  assert.equal(result.modified, false);
+});
+
+test('compactSessionIfNeeded — Layer 1 STILL clips under genuine token pressure', async () => {
+  resetEventLog();
+  const session = HarnessSession.create({ kind: 'chat', title: 'pressure test' });
+  const items: AgentInputItem[] = [];
+  for (let i = 0; i < 16; i++) {
+    const callId = `call_p${i}`;
+    items.push(userMessage(`turn ${i}`));
+    items.push(toolCall(callId, 'dataforseo.serp', `{"q":"q-${i}"}`));
+    items.push(toolResult(callId, `serp ${i} ${'z'.repeat(1000)}`));
+    writeToolOutput({ sessionId: session.id, callId, tool: 'dataforseo.serp', output: `serp ${i} ${'z'.repeat(1000)}` });
+  }
+  session.updateConversationSnapshot(items);
+
+  // Tiny budget → the same content is now PAST the token-pressure trigger.
+  const { result } = await compactSessionIfNeeded(session, items, {
+    inputBudgetTokens: 1_000,
+    layer1ItemThreshold: 15,
+  });
+  assert.ok(result.beforeTokens > 1_000 * 0.3, 'precondition: past the token-pressure trigger');
+  assert.equal(result.layer1.applied, true, 'real token pressure still triggers Layer-1');
 });

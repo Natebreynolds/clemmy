@@ -378,7 +378,10 @@ export function applySkillToPrompt(step: WorkflowStepInput, rendered: string): s
     skillBody,
     '=== END SKILL ===',
     '',
-    'Use the instructions above to complete the step task below.',
+    // Same execution-contract framing skill_read applies in chat/workers, so a
+    // workflow step that uses a skill RUNS it as a procedure rather than
+    // treating it as background reading (global "run skills as designed" fix).
+    'The skill above is a PROCEDURE to EXECUTE for this step — carry out every step it prescribes and produce every deliverable it specifies (the file, image, URL, record), not a description. Do not skip its phases. The step is complete only when the skill\'s deliverables actually exist.',
     '',
     '=== STEP TASK ===',
     rendered,

@@ -50,6 +50,16 @@ const DEFAULT_LAYER2_RETAIN_MESSAGES = 6;
 const DEFAULT_LAYER1_TOKEN_FRACTION = 0.3;
 const DEFAULT_LAYER2_TOKEN_FRACTION = 0.55;
 const DEFAULT_LAYER3_TOKEN_FRACTION = 0.9;
+// The item-count trigger (>N input items) is a chatty-turn backstop, but it
+// must NOT fire while there is abundant token headroom — otherwise a multi-tool
+// run (e.g. researching 10 prospects) clips its freshly-fetched results to
+// stubs even at ~12% of budget, throwing away the very data the model needs and
+// forcing recall round-trips (observed sess-mpvujlni 2026-06-01: 14 outputs
+// clipped at 30K/200K). So the item-count clause only applies once we're at
+// least this fraction of budget; below it, ONLY genuine token pressure
+// (layer1TokenFraction) triggers Layer 1. Token pressure, not item count, is
+// the real signal.
+const DEFAULT_LAYER1_ITEM_TRIGGER_MIN_FRACTION = 0.5;
 const DEFAULT_INPUT_BUDGET_TOKENS = 200_000;
 const COLLAPSED_TOOL_SUMMARY_MAX_CHARS = 12_000;
 
@@ -75,6 +85,8 @@ export interface CompactionOptions {
   layer1RetainToolPairs?: number;
   layer2RetainMessages?: number;
   layer1TokenFraction?: number;
+  /** Min budget fraction before the item-count trigger may fire (headroom guard). */
+  layer1ItemTriggerMinFraction?: number;
   layer2TokenFraction?: number;
   layer3TokenFraction?: number;
   /** Disable specific layers via CLEMMY_AUTO_COMPACT=off|layer1_only. */
@@ -676,6 +688,7 @@ export async function compactSessionIfNeeded(
   const retainToolPairs = opts.layer1RetainToolPairs ?? Math.max(DEFAULT_LAYER1_RETAIN_TOOL_PAIRS, retainTurns * 3);
   const retainMessages = opts.layer2RetainMessages ?? DEFAULT_LAYER2_RETAIN_MESSAGES;
   const l1Frac = opts.layer1TokenFraction ?? DEFAULT_LAYER1_TOKEN_FRACTION;
+  const l1ItemMinFrac = opts.layer1ItemTriggerMinFraction ?? DEFAULT_LAYER1_ITEM_TRIGGER_MIN_FRACTION;
   const l2Frac = opts.layer2TokenFraction ?? DEFAULT_LAYER2_TOKEN_FRACTION;
   const l3Frac = opts.layer3TokenFraction ?? DEFAULT_LAYER3_TOKEN_FRACTION;
 
@@ -696,9 +709,15 @@ export async function compactSessionIfNeeded(
 
   let nextItems = items;
 
-  // Layer 1
+  // Layer 1 — fire on genuine token pressure, OR (chatty-turn backstop) on item
+  // count BUT ONLY once we're partway to budget. The item-count clause used to
+  // be unconditional, which clipped freshly-fetched tool outputs during a
+  // multi-tool run while 85-99% of context was free. Token pressure is the real
+  // signal; item count only matters when those items are actually filling the
+  // window.
   const layer1Trigger =
-    items.length > itemThreshold || beforeTokens > budget * l1Frac;
+    beforeTokens > budget * l1Frac
+    || (items.length > itemThreshold && beforeTokens > budget * l1ItemMinFrac);
   if (layer1Trigger) {
     const clipped = clipOldToolResults(nextItems, retainTurns, opts);
     const collapsed = collapseOldCompletedToolPairs(nextItems, retainToolPairs, session.id);

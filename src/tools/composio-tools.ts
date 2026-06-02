@@ -265,6 +265,47 @@ export function maybeAutoRememberComposioChoice(
   }
 }
 
+// ─── Fan-out nudge: catch serial same-shape work and suggest run_worker ─────
+//
+// Observed live (sess-mpvujlni 2026-06-01): the agent researched 10 prospects
+// SERIALLY in one context (run_worker=0) instead of fanning out — slower, and
+// it piles every item's raw tool output into one context, which then forces the
+// harness to clip the freshly-fetched data mid-run. The orchestrator already
+// instructs fan-out, but a buried rule got ignored. So nudge at the MOMENT it's
+// happening: when the same slug has been executed for N distinct items in one
+// session, append a ONE-TIME advisory to the tool result. Soft + informs (never
+// blocks); fires once per session.
+const FANOUT_ADVICE_THRESHOLD = 3;
+const fanoutTrackerBySession = new Map<string, { distinctBySlug: Map<string, Set<string>>; advised: boolean }>();
+
+export function maybeFanoutAdvisory(toolSlug: string, args: Record<string, unknown>, sessionId: string | undefined): string | null {
+  try {
+    if (!sessionId || !toolSlug) return null;
+    let t = fanoutTrackerBySession.get(sessionId);
+    if (!t) {
+      if (fanoutTrackerBySession.size > 500) fanoutTrackerBySession.clear(); // crude bound for a long-lived daemon
+      t = { distinctBySlug: new Map(), advised: false };
+      fanoutTrackerBySession.set(sessionId, t);
+    }
+    if (t.advised) return null;
+    let set = t.distinctBySlug.get(toolSlug);
+    if (!set) { set = new Set(); t.distinctBySlug.set(toolSlug, set); }
+    let argHash = '';
+    try { argHash = JSON.stringify(args ?? {}); } catch { argHash = String(Math.random()); }
+    set.add(argHash);
+    if (set.size < FANOUT_ADVICE_THRESHOLD) return null;
+    t.advised = true;
+    return (
+      `\n\n↗ Fan-out tip: you've now called ${toolSlug} for ${set.size} different items in series. `
+      + `For 3+ independent same-shape items, call run_worker once per item (in parallel waves of up to 8) `
+      + `instead of looping here — it runs them concurrently AND keeps this context lean so the harness `
+      + `doesn't clip your freshly-fetched data mid-run. Fan out the remaining items.`
+    );
+  } catch {
+    return null; // a nudge must never break the tool call
+  }
+}
+
 async function runComposioExecute(
   toolSlug: string,
   args: Record<string, unknown>,
@@ -274,7 +315,13 @@ async function runComposioExecute(
   try {
     const result = await executeComposioTool(toolSlug, args, connectedAccountId);
     const output = formatComposioExecuteOutput(result, { ...options, toolSlug });
-    maybeAutoRememberComposioChoice(toolSlug, args, result, sessionIdFromRunContext(options.context));
+    const sid = sessionIdFromRunContext(options.context);
+    maybeAutoRememberComposioChoice(toolSlug, args, result, sid);
+    // Only count/advise on SUCCESS — a failed call isn't "an item processed".
+    if (!detectComposioFailure(result).failed) {
+      const advisory = maybeFanoutAdvisory(toolSlug, args, sid);
+      if (advisory) return output + advisory;
+    }
     return output;
   } catch (err) {
     return composioThrownErrorOutput(err, { ...options, toolSlug });
