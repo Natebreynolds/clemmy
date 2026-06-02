@@ -34,6 +34,33 @@ test('does NOT match unrelated request (the incident — must block)', () => {
   );
 });
 
+test('STRONG PARTIAL match: distinctive tokens identify the workflow without the full slug', () => {
+  // The live friction: "fire off the salesforce to airtable workflow" should
+  // resolve salesforce-to-airtable-prospect-enrichment (salesforce + airtable
+  // = 2 distinctive tokens) without typing the exact name.
+  assert.equal(
+    workflowExplicitlyRequested(
+      'salesforce-to-airtable-prospect-enrichment',
+      ['salesforce-to-airtable-prospect-enrichment'],
+      'can you fire off the salesforce to airtable workflow please',
+    ),
+    true,
+  );
+});
+
+test('strong-partial needs >=2 distinctive tokens — a single shared word does NOT match', () => {
+  // "prospect" alone is shared by several workflows → must not trigger.
+  assert.equal(
+    workflowExplicitlyRequested('salesforce-to-airtable-prospect-enrichment', [], 'run my prospect thing'),
+    false,
+  );
+  // The incident text has 0 distinctive-token overlap with this workflow too.
+  assert.equal(
+    workflowExplicitlyRequested('salesforce-to-airtable-prospect-enrichment', [], 'scrape keywords into a google sheet'),
+    false,
+  );
+});
+
 test('empty user text returns false', () => {
   assert.equal(workflowExplicitlyRequested('morning-prospect-prep', [], ''), false);
 });

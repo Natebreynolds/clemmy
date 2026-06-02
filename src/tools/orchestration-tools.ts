@@ -463,7 +463,7 @@ export function registerOrchestrationTools(server: McpServer): void {
 
   server.tool(
     'workflow_run',
-    'Queue a workflow run by writing a run request to local workflow state. Call workflow_get first and pass every required input, for example inputs.url for URL-based audit workflows. Missing required inputs are rejected without queuing.',
+    'Dispatch a workflow to run in the BACKGROUND (fire-and-forget) — it runs in the daemon and reports its outcome back to this chat automatically on completion; you do not wait or poll. Call workflow_get first and pass every required input, for example inputs.url for URL-based audit workflows. Missing required inputs are rejected without queuing.',
     {
       name: z.string().min(1),
       inputs: z.string().optional().describe('JSON object of the workflow\'s inputs, e.g. {"url":"https://example.com"}. Call workflow_get first to see the required input names.'),

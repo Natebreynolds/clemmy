@@ -42,12 +42,17 @@ beforeEach(() => {
 test('queueWorkflowRun: writes a queued run and dedupes identical inputs', () => {
   const first = queueWorkflowRun('audit-brief', { url: 'https://x.com' });
   assert.equal(first.status, 'queued');
-  assert.match(first.message, /Queued workflow "audit-brief"/);
+  // Fire-and-forget hand-off wording (A): names the workflow + says background + report-back.
+  assert.match(first.message, /Queued "audit-brief"/);
+  assert.match(first.message, /BACKGROUND/);
+  assert.match(first.message, /report back/i);
+  assert.match(first.message, /do NOT (wait|poll)/i);
   assert.equal(runFiles().length, 1);
 
   const second = queueWorkflowRun('audit-brief', { url: 'https://x.com' });
   assert.equal(second.status, 'duplicate');
   assert.match(second.message, /No duplicate was queued/);
+  assert.match(second.message, /running in the background/i);
   assert.equal(runFiles().length, 1);
 });
 
@@ -84,7 +89,7 @@ test('resumeWorkflowRun: all inputs supplied → queues the run', () => {
   writeAuditWorkflow();
   const result = resumeWorkflowRun('audit-brief', { url: 'https://revill.co.uk' });
   assert.equal(result.status, 'queued');
-  assert.match(result.message, /Queued workflow "audit-brief"/);
+  assert.match(result.message, /Queued "audit-brief"/);
   assert.equal(runFiles().length, 1);
 });
 

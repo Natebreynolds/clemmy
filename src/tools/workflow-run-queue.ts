@@ -86,7 +86,7 @@ export function queueWorkflowRun(
     return {
       status: 'duplicate',
       id: duplicate.id,
-      message: `Workflow "${name}" is already ${duplicate.status} as run ${duplicate.id} with the same inputs. No duplicate was queued. Use workflow_run_status with run_id="${duplicate.id}" to check progress.`,
+      message: `Workflow "${name}" is already ${duplicate.status} as run ${duplicate.id} with the same inputs — it's running in the background and will report back here when it finishes. No duplicate was queued; just tell the user it's already on it. (Only call workflow_run_status if the user explicitly asks for a progress check.)`,
     };
   }
   const id = `${Date.now()}-${randomBytes(3).toString('hex')}`;
@@ -105,7 +105,15 @@ export function queueWorkflowRun(
     }, null, 2),
     'utf-8',
   );
-  return { status: 'queued', id, message: `Queued workflow "${name}" (run ${id}).` };
+  return {
+    status: 'queued',
+    id,
+    message:
+      `Queued "${name}" (run ${id}) — it is now running in the BACKGROUND. `
+      + `Tell the user it's running and that you'll report back here when it finishes; the outcome is delivered to this chat automatically on completion. `
+      + `Do NOT wait, poll, or call workflow_run_status, and do NOT do the workflow's work yourself — you're free to take the user's next request right now. `
+      + `(Only call workflow_run_status later if the user explicitly asks how it's going.)`,
+  };
 }
 
 export interface ResumeWorkflowRunResult {

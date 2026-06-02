@@ -107,7 +107,7 @@ test('workflow_run queues with normalized URL aliases', async () => {
   });
   const text = resultText(result);
 
-  assert.match(text, /Queued workflow "proposal-audit-brief"/);
+  assert.match(text, /Queued "proposal-audit-brief"/);
   const files = readdirSync(WORKFLOW_RUNS_DIR).filter((entry) => entry.endsWith('.json'));
   assert.equal(files.length, 1);
   const run = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, files[0]), 'utf-8')) as {
@@ -200,7 +200,7 @@ test('workflow_run does not queue duplicate active runs for identical inputs', a
     name: 'proposal-audit-brief',
     inputs: JSON.stringify({ url: 'https://www.aldouslaw.com/' }),
   });
-  assert.match(resultText(first), /Queued workflow/);
+  assert.match(resultText(first), /Queued "/);
 
   const second = await workflowRun()({
     name: 'proposal-audit-brief',

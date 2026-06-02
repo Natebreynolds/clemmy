@@ -20,6 +20,20 @@
 /** Needles shorter than this are ignored to avoid trivial substring hits. */
 const MIN_NEEDLE_LEN = 4;
 
+/** Generic words that aren't distinctive enough to identify a workflow. */
+const NAME_STOPWORDS = new Set([
+  'workflow', 'workflows', 'with', 'from', 'into', 'your', 'this', 'that',
+  'please', 'flow', 'auto', 'daily', 'hourly', 'run', 'the', 'and', 'for',
+]);
+
+/** Distinctive (>=4 char, non-stopword) tokens of a workflow name/slug. */
+function distinctiveNameTokens(name: string): string[] {
+  return name
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((t) => t.length >= MIN_NEEDLE_LEN && !NAME_STOPWORDS.has(t));
+}
+
 /**
  * True when the workflow appears to have been explicitly named by the user
  * in their recent message text.
@@ -53,6 +67,23 @@ export function workflowExplicitlyRequested(
   for (const needle of needles) {
     if (needle.length < MIN_NEEDLE_LEN) continue;
     if (haystack.includes(needle)) return true;
+  }
+
+  // Strong PARTIAL match: the user named enough of the workflow's distinctive
+  // tokens to clearly mean it WITHOUT typing the full slug — e.g. "fire off the
+  // salesforce to airtable workflow" → salesforce-to-airtable-prospect-enrichment.
+  // Require >=2 distinctive tokens present so a single shared word (e.g.
+  // "prospect") never triggers a false match, and an unrelated ad-hoc request
+  // (the original 2026-05-31 incident: "scrape keywords into a sheet" → 0
+  // overlap with morning-prospect-prep) still refuses.
+  const tokens = new Set(
+    [workflowName, ...slugCandidates].flatMap((c) => (typeof c === 'string' ? distinctiveNameTokens(c) : [])),
+  );
+  if (tokens.size >= 2) {
+    const hayTokens = new Set(haystack.split(/[^a-z0-9]+/).filter(Boolean));
+    let overlap = 0;
+    for (const t of tokens) if (hayTokens.has(t)) overlap += 1;
+    if (overlap >= 2) return true;
   }
   return false;
 }

@@ -46,6 +46,9 @@ const {
   describeStepNonCompletion,
   enqueueWorkflowOutcomeTurn,
   shouldNotifyCancelledRun,
+  coerceOutputForContract,
+  applyContractToPrompt,
+  describeOutputShape,
 } = await import('./workflow-runner.js');
 const { SessionStore: RunnerSessionStore } = await import('../memory/session-store.js');
 const { readWorkflowEvents } = await import('./workflow-events.js');
@@ -164,6 +167,84 @@ test('reapResolvedParkedRuns is a no-op when WORKFLOW_APPROVAL_PARKING is off', 
   reapResolvedParkedRuns();
   assert.equal(statusOf(filePath), 'parked'); // scan disabled → untouched
   rmSync(filePath, { force: true });
+});
+
+// ── D: contract binding (parse JSON-text output + inject the shape) ──────────
+
+const objContract = { type: 'object', required_keys: ['proposed_prospects', 'existing_airtable_count', 'dedupe_summary'] } as never;
+
+test('coerceOutputForContract: no contract → output unchanged', () => {
+  assert.equal(coerceOutputForContract('just text', undefined), 'just text');
+});
+
+test('coerceOutputForContract: an already-structured object is returned as-is', () => {
+  const o = { proposed_prospects: [], existing_airtable_count: 0, dedupe_summary: 'x' };
+  assert.equal(coerceOutputForContract(o, objContract), o);
+});
+
+test('coerceOutputForContract: a JSON-TEXT output is parsed into the object (the live failure)', () => {
+  const text = '{"proposed_prospects":[{"account_name":"Acme"}],"existing_airtable_count":3,"dedupe_summary":"ok"}';
+  const out = coerceOutputForContract(text, objContract);
+  assert.equal(typeof out, 'object');
+  assert.equal((out as { existing_airtable_count: number }).existing_airtable_count, 3);
+  assert.equal(((out as { proposed_prospects: unknown[] }).proposed_prospects).length, 1);
+});
+
+test('coerceOutputForContract: a fenced ```json block is parsed', () => {
+  const text = 'Here you go:\n```json\n{"proposed_prospects":[],"existing_airtable_count":0,"dedupe_summary":"none"}\n```';
+  const out = coerceOutputForContract(text, objContract);
+  assert.equal((out as { dedupe_summary: string }).dedupe_summary, 'none');
+});
+
+test('coerceOutputForContract: JSON embedded in surrounding prose is extracted', () => {
+  const text = 'Done. {"proposed_prospects":[],"existing_airtable_count":1,"dedupe_summary":"d"} — that is the batch.';
+  const out = coerceOutputForContract(text, objContract);
+  assert.equal((out as { existing_airtable_count: number }).existing_airtable_count, 1);
+});
+
+test('coerceOutputForContract: non-JSON text is returned unchanged (verifier then fails loudly, as before)', () => {
+  assert.equal(coerceOutputForContract('I could not find any prospects.', objContract), 'I could not find any prospects.');
+});
+
+test('coerceOutputForContract: a type:"string" contract is NEVER coerced — a JSON-looking string stays a string (regression #1)', () => {
+  const strContract = { type: 'string' } as never;
+  assert.equal(coerceOutputForContract('{"a":1}', strContract), '{"a":1}');
+  assert.equal(coerceOutputForContract('[1,2,3]', strContract), '[1,2,3]');
+});
+
+test('coerceOutputForContract: a parse that does NOT satisfy the contract is rejected (no wrong-pass, regression #2)', () => {
+  // objContract requires proposed_prospects/existing_airtable_count/dedupe_summary.
+  // A JSON object WITHOUT those keys must NOT be accepted — return the original
+  // so the verifier fails loudly instead of binding a wrong-shaped object.
+  const wrong = '{"reply":"found some","summary":"3 prospects"}';
+  assert.equal(coerceOutputForContract(wrong, objContract), wrong);
+});
+
+test('describeOutputShape: names the actual produced shape (so a contract failure is diagnosable)', () => {
+  assert.match(describeOutputShape({ reply: 'x', summary: 'y' }), /object with keys: reply, summary/);
+  assert.match(describeOutputShape([1, 2, 3]), /array \(3 items\)/);
+  assert.match(describeOutputShape('hello world'), /string \(11 chars\)/);
+  assert.equal(describeOutputShape(null), 'null');
+});
+
+test('applyContractToPrompt: no contract → prompt unchanged', () => {
+  assert.equal(applyContractToPrompt({ id: 'a', prompt: 'do' }, 'do'), 'do');
+});
+
+test('applyContractToPrompt: injects the EXACT required keys so the agent knows the shape', () => {
+  const out = applyContractToPrompt({ id: 'a', prompt: 'do', output: objContract } as never, 'find prospects');
+  assert.match(out, /REQUIRED OUTPUT/);
+  assert.match(out, /"proposed_prospects"/);
+  assert.match(out, /"existing_airtable_count"/);
+  assert.match(out, /"dedupe_summary"/);
+  assert.ok(out.startsWith('find prospects'), 'the task text is preserved first');
+});
+
+test('applyContractToPrompt: surfaces url_present as a hard requirement', () => {
+  const c = { type: 'object', required_keys: ['airtable_table_url'], verify: { url_present: ['airtable_table_url'] } } as never;
+  const out = applyContractToPrompt({ id: 'w', prompt: 'write', output: c } as never, 'write records');
+  assert.match(out, /https:\/\/ URL/i);
+  assert.match(out, /airtable_table_url/);
 });
 
 test('applySkillToPrompt: no usesSkill returns prompt unchanged', () => {

@@ -259,6 +259,9 @@ export function buildAssistantInstructions(context: MemoryContext, channel?: str
     // Focus — single-task mode when the user signals a topic shift.
     'When the user asks to focus on one task, pause the rest, or stop working on everything except X, call `execution_focus` (id or short title substring). To bring everything back, call `execution_clear_focus`. Use `execution_pause` / `execution_resume` for ad-hoc single-execution control outside of a focus session.',
 
+    // Background outcome report-back — surface a finished background job proactively.
+    'BACKGROUND OUTCOME REPORT-BACK — the recent transcript may contain a synthetic line that starts with `[workflow run <id> …]` or `[background task <id> …]`. That is a job you dispatched to run in the background REPORTING ITS OUTCOME (completed / needs attention / FAILED) — it is NOT a user message and must NEVER be silently absorbed. The user fired it off and moved on to other work; they are relying on you to tell them when it lands. SURFACE it proactively: on a completion, give them the result + any link/IDs it produced; on a FAILED / needs-attention outcome, first finish whatever the user just asked for, then flag it in one non-blocking line ("— heads up: your <name> flow finished but needs attention / failed at <step> — want me to retry?"). Do not re-surface an outcome you have already reported to the user.',
+
     channelDirective,
     actionDirective,
     section('User Preferences', userPreferences),

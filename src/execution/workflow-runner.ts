@@ -14,6 +14,7 @@ import {
   listWorkflows,
   type WorkflowDefinition,
   type WorkflowStepInput,
+  type WorkflowStepOutputContract,
 } from '../memory/workflow-store.js';
 import { loadSkill } from '../memory/skill-store.js';
 import {
@@ -423,6 +424,37 @@ export function applySkillToPrompt(step: WorkflowStepInput, rendered: string): s
     '=== STEP TASK ===',
     rendered,
   ].filter(Boolean).join('\n');
+}
+
+/**
+ * When a step declares an output contract, append an explicit instruction so
+ * the step agent KNOWS the exact structured shape to emit — otherwise it
+ * guesses and the deterministic verifier fails it after the fact (the live
+ * "missing required output key" failure). Pairs with coerceOutputForContract
+ * (parses a JSON-text emission) + verifyStepOutput (enforces it). No contract →
+ * prompt unchanged. Exported for tests.
+ */
+export function applyContractToPrompt(step: WorkflowStepInput, rendered: string): string {
+  const c = step.output;
+  if (!c) return rendered;
+  const keys = c.required_keys ?? [];
+  if (keys.length === 0 && !c.verify && !c.type) return rendered;
+  const lines: string[] = ['', '=== REQUIRED OUTPUT (this step is NOT complete until you return EXACTLY this) ==='];
+  if (keys.length > 0) {
+    lines.push(
+      `Return your result as a JSON object with these EXACT top-level keys: ${keys.map((k) => `"${k}"`).join(', ')}.`,
+      'Emit ONLY that JSON object as the step result (if a workflow_step_result tool is available, call it with this object) — no surrounding prose.',
+    );
+  } else if (c.type) {
+    lines.push(`Return your result as type: ${c.type}.`);
+  }
+  if (c.verify?.url_present?.length) {
+    lines.push(`These keys MUST hold a real, non-empty https:// URL (verified): ${c.verify.url_present.join(', ')}.`);
+  }
+  if (c.verify?.path_exists?.length) {
+    lines.push(`These keys MUST hold a real, existing file path (verified): ${c.verify.path_exists.join(', ')}.`);
+  }
+  return [rendered, ...lines].join('\n');
 }
 
 function renderTemplate(
@@ -1381,6 +1413,79 @@ async function executeStepVerified(
  * straight step_completed emit, byte-identical to before. Every step shape
  * (deterministic / forEach / plain / synthesis) routes through this.
  */
+/**
+ * Contract BINDING: when a step declares an output contract but its agent
+ * returned the result as a STRING (prose, or a fenced ```json block) instead of
+ * a structured object, parse that string into the object so the contract can
+ * bind to it. A step that emits the right JSON as text now satisfies the
+ * contract, and downstream steps + forEach receive the real object (not a
+ * string). Conservative + additive: only touches a STRING output when a
+ * contract is declared; if nothing parses to an object/array the original is
+ * returned and the verifier fails loudly exactly as before. Exported for tests.
+ */
+export function coerceOutputForContract(
+  output: unknown,
+  contract: WorkflowStepOutputContract | undefined,
+): unknown {
+  if (!contract) return output;
+  // Only a STRUCTURED contract can be satisfied by a parsed object/array. A
+  // scalar contract (string/number/boolean with no keys/verify) must NOT be
+  // coerced — a valid string output that happens to be JSON-looking would
+  // otherwise flip into a failing object (review regression #1).
+  const structured =
+    contract.type === 'object' ||
+    contract.type === 'array' ||
+    (contract.required_keys?.length ?? 0) > 0 ||
+    Boolean(contract.verify);
+  if (!structured) return output;
+  if (typeof output !== 'string') return output;
+  const text = output.trim();
+  if (!text) return output;
+  const candidates: string[] = [];
+  const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fence?.[1]) candidates.push(fence[1].trim());
+  candidates.push(text);
+  // Last resort: pull the outermost {...} or [...] block so leading/trailing
+  // prose around the JSON doesn't defeat the parse.
+  const start = text.search(/[[{]/);
+  const end = Math.max(text.lastIndexOf('}'), text.lastIndexOf(']'));
+  if (start >= 0 && end > start) candidates.push(text.slice(start, end + 1));
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate);
+      // ACCEPT a parsed candidate ONLY if it actually SATISFIES the contract.
+      // This makes coercion provably unable to turn a fail into a wrong-pass or
+      // a pass into a fail (review regression #2): a non-conformant parse (e.g.
+      // an incidental [3] from prose, or an object for a string contract) is
+      // rejected, the original is returned, and the verifier fails loudly.
+      if (parsed !== null && typeof parsed === 'object' && verifyStepOutput(contract, parsed).ok) {
+        return parsed;
+      }
+    } catch {
+      /* try the next candidate */
+    }
+  }
+  return output;
+}
+
+/** Compact, safe description of an output's actual shape — for a contract
+ *  failure message so we can see WHAT was produced vs what was required
+ *  (e.g. "object with keys: reply, summary" when the contract wanted
+ *  proposed_prospects). Never throws. */
+export function describeOutputShape(value: unknown): string {
+  if (value === null) return 'null';
+  if (typeof value === 'string') {
+    const t = value.trim();
+    return `string (${t.length} chars)${t ? `: "${t.slice(0, 80)}${t.length > 80 ? '…' : ''}"` : ''}`;
+  }
+  if (Array.isArray(value)) return `array (${value.length} items)`;
+  if (typeof value === 'object') {
+    const keys = Object.keys(value as Record<string, unknown>);
+    return `object with keys: ${keys.length ? keys.slice(0, 12).join(', ') : '(none)'}`;
+  }
+  return typeof value;
+}
+
 export function finalizeStepOutput(
   workflowSlug: string,
   runId: string,
@@ -1388,15 +1493,23 @@ export function finalizeStepOutput(
   output: unknown,
   meta?: Record<string, unknown>,
 ): unknown {
+  // Bind a JSON-text output to the declared contract shape BEFORE verifying, so
+  // a step that emitted the right keys as text (not a structured object) passes
+  // and downstream steps receive the real object. No contract → unchanged.
+  const bound = step.output ? coerceOutputForContract(output, step.output) : output;
   if (step.output) {
-    const result = verifyStepOutput(step.output, output);
+    const result = verifyStepOutput(step.output, bound);
     if (!result.ok) {
-      const message = `Step "${step.id}" output failed its contract: ${result.problems.join('; ')}`;
+      const got = describeOutputShape(bound);
+      // Include the ACTUAL produced shape so the failure is diagnosable (the
+      // step ran but emitted the wrong shape — e.g. its decision object instead
+      // of the contracted keys) instead of only "missing key X".
+      const message = `Step "${step.id}" output failed its contract: ${result.problems.join('; ')} — the step produced ${got}.`;
       appendWorkflowEvent(workflowSlug, runId, {
         kind: 'step_failed',
         stepId: step.id,
         error: message,
-        meta: { reason: 'output_contract', problems: result.problems },
+        meta: { reason: 'output_contract', problems: result.problems, got },
       });
       throw new Error(message);
     }
@@ -1404,10 +1517,10 @@ export function finalizeStepOutput(
   appendWorkflowEvent(workflowSlug, runId, {
     kind: 'step_completed',
     stepId: step.id,
-    output,
+    output: bound,
     ...(meta ? { meta } : {}),
   });
-  return output;
+  return bound;
 }
 
 /**
@@ -1526,7 +1639,7 @@ export async function executeStep(
         // when the step declares no `inputs`). `item` is in scope here.
         const itemContext = bindStepContext(step, ctx, item);
         const itemIntent = renderTemplate(step.prompt, ctx.inputs, ctx.stepOutputs, item);
-        const prompt = applySkillToPrompt(step, itemIntent);
+        const prompt = applyContractToPrompt(step, applySkillToPrompt(step, itemIntent));
         let output: unknown;
         let itemSessionId = `workflow:${ctx.runId}:${step.id}:${key}`;
         if (workflowHarnessEnabled(step)) {
@@ -1606,7 +1719,7 @@ export async function executeStep(
     kind: 'step_started',
     stepId: step.id,
   });
-  const prompt = applySkillToPrompt(step, renderTemplate(step.prompt, ctx.inputs, ctx.stepOutputs));
+  const prompt = applyContractToPrompt(step, applySkillToPrompt(step, renderTemplate(step.prompt, ctx.inputs, ctx.stepOutputs)));
   let output: unknown;
   let stepSessionId = `workflow:${ctx.runId}:${step.id}`;
   if (workflowHarnessEnabled(step)) {
