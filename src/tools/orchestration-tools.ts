@@ -42,6 +42,7 @@ import {
   workflowExplicitlyRequested,
 } from './workflow-run-guard.js';
 import { addNotification } from '../runtime/notifications.js';
+import { matchToolChoicesForStep, type StepToolChoiceMatch, type ToolChoiceRecord } from '../memory/tool-choice-store.js';
 
 /**
  * Parse the workflow_run `inputs` field, which the model passes as a JSON
@@ -62,6 +63,151 @@ import { addNotification } from '../runtime/notifications.js';
 export function renderAuthoringAdvisories(warnings: string[] | undefined): string {
   if (!warnings || warnings.length === 0) return '';
   return `\n\nHeads up (advisory — the workflow was saved):\n- ${warnings.join('\n- ')}`;
+}
+
+export interface StepBindResult {
+  /** Confirmation lines for steps that were AUTO-bound (deterministic). */
+  boundNotes: string[];
+  /** Advisory lines for steps that SHOULD bind but weren't auto-bound. */
+  advisories: string[];
+}
+
+/** Marker delimiting the engine-appended bind directive from the author's
+ *  prompt. A step carrying it is already engine-bound (skip + don't re-match the
+ *  directive's own prose, which would otherwise let a 2nd workflow_update bind a
+ *  different choice off boilerplate words). */
+const BIND_DIRECTIVE_MARKER = '\n\n→ Proven tool (engine-bound):';
+
+/** Convert `{{var}}` placeholders to `<var>` so a baked command is GUIDANCE, not
+ *  a workflow template token — otherwise checkMalformedTokens would reject the
+ *  workflow on its own injected `{{soql}}`, and renderTemplate can't fill it. */
+function neutralizeTemplatePlaceholders(s: string): string {
+  return s.replace(/\{\{\s*([^}]+?)\s*\}\}/g, '<$1>');
+}
+
+/** Lock a step's allowedTools to a bound family: keep any explicitly-allowed
+ *  NON-composio tools the author listed, drop composio_* (the drift gateway),
+ *  and ensure the family is present. A wildcard/empty list becomes the family. */
+function lockAllowedToolsTo(existing: string[] | undefined, family: string[]): string[] {
+  const kept = (existing ?? []).filter((t) => t && t !== '*' && !t.startsWith('composio'));
+  return [...new Set<string>([...kept, ...family])];
+}
+
+/** Auto-bind may NARROW the tool surface but must never WIDEN the auto-approval
+ *  scope: if the author explicitly scoped the step (non-wildcard) and the proven
+ *  family isn't already reachable, locking it in would silently auto-approve a
+ *  tool they deliberately excluded. In that case we ADVISE instead of mutating. */
+function canLockWithoutEscalation(existing: string[] | undefined, family: string[]): boolean {
+  if (!existing || existing.length === 0 || existing.some((t) => t === '*')) return true; // wildcard → narrowing
+  return family.every((f) =>
+    existing.some((e) => e === f || (e.endsWith('*') && f.startsWith(e.slice(0, -1)))));
+}
+
+/**
+ * Hybrid author-time binding (the centerpiece of tight authoring). For each
+ * step, find the user's PROVEN tool-choice for what the step does:
+ *   - HIGH-confidence cli/mcp match → AUTO-BIND: bake the exact command into the
+ *     step prompt AND lock allowedTools to that family (dropping the composio
+ *     drift gateway) so the run uses the path that works and can't re-decide.
+ *   - MEDIUM match, or any composio match (identifier/connection rot-prone) →
+ *     ADVISE only: name the exact command so the author can bind it; never mutate.
+ *   - Already-bound or usesSkill steps are left untouched.
+ * Mutates `steps` in place; returns notes for the tool result. Best-effort — a
+ * matcher error never blocks the write (a clean store yields empty results).
+ */
+export function bindStepsToToolChoices(
+  steps: Array<{ id?: string; prompt: string; allowedTools?: string[]; usesSkill?: string }>,
+  opts: { choices?: ToolChoiceRecord[] } = {},
+): StepBindResult {
+  const boundNotes: string[] = [];
+  const advisories: string[] = [];
+  for (const step of steps) {
+    if (step.usesSkill) continue; // a skill owns its own tool surface
+    if (step.prompt.includes(BIND_DIRECTIVE_MARKER)) continue; // already engine-bound
+    let matches: StepToolChoiceMatch[];
+    try { matches = matchToolChoicesForStep(step.prompt, { choices: opts.choices }); } catch { continue; }
+    const top = matches.find((m) => !m.alreadyBound);
+    if (!top) continue;
+    // AUTO-BIND only when it's a proven cli/mcp choice AND locking it in won't
+    // silently widen the auto-approval scope the author chose; otherwise advise.
+    const safeToLock = canLockWithoutEscalation(step.allowedTools, top.family);
+    if (top.autoBindable && top.tier === 'high' && safeToLock) {
+      const how = top.kind === 'cli' ? ' via run_shell_command' : '';
+      const noun = top.kind === 'cli' ? 'command' : 'tool';
+      const cmd = neutralizeTemplatePlaceholders(top.command);
+      step.prompt =
+        `${step.prompt}${BIND_DIRECTIVE_MARKER} use this exact, proven ${noun} (do not substitute another tool): \`${cmd}\`${how}.`;
+      step.allowedTools = lockAllowedToolsTo(step.allowedTools, top.family);
+      boundNotes.push(
+        `Bound step \`${step.id ?? '?'}\` to your proven ${top.kind} \`${cmd}\` and locked its tools so the run can't drift onto a stale path.`,
+      );
+    } else {
+      const cmd = neutralizeTemplatePlaceholders(top.command);
+      const what = top.kind === 'composio'
+        ? `could use your remembered \`${top.identifier}\``
+        : `should use your proven \`${cmd}\``;
+      advisories.push(
+        `Step \`${step.id ?? '?'}\` ${what} — embed that exact ${top.kind === 'cli' ? 'command (via run_shell_command)' : 'tool'} in the step prompt and set its allowedTools to that family, so the run uses the proven path instead of re-deciding.`,
+      );
+    }
+  }
+  return { boundNotes, advisories };
+}
+
+const ACTIVE_RUN_STATUSES = new Set(['queued', 'running', 'parked']);
+
+function formatRunAge(iso?: string): string {
+  if (!iso) return '';
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return '';
+  const mins = Math.max(0, Math.round((Date.now() - t) / 60_000));
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.round(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  return `${Math.round(hrs / 24)}d ago`;
+}
+
+/**
+ * Render a compact overview of workflow runs for chat recall ("what's running?"):
+ * every in-flight (queued/running/parked) or needs-attention run, plus the few
+ * most-recent finished ones. Reads the run-record files directly — token-cheap.
+ */
+export function renderWorkflowRunsOverview(limit = 15): string {
+  if (!existsSync(WORKFLOW_RUNS_DIR)) return 'No workflow runs yet — nothing is running.';
+  interface RunRow { id: string; workflow: string; status: string; createdAt?: string; needsAttention?: boolean; }
+  const rows: RunRow[] = [];
+  for (const file of readdirSync(WORKFLOW_RUNS_DIR)) {
+    if (!file.endsWith('.json')) continue;
+    try {
+      const r = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, file), 'utf-8')) as Record<string, unknown>;
+      if (typeof r.id !== 'string') continue;
+      rows.push({
+        id: r.id,
+        workflow: typeof r.workflow === 'string' ? r.workflow : '(unknown)',
+        status: typeof r.status === 'string' ? r.status : 'unknown',
+        createdAt: typeof r.createdAt === 'string' ? r.createdAt : undefined,
+        needsAttention: r.needsAttention === true,
+      });
+    } catch { /* skip malformed run file */ }
+  }
+  if (rows.length === 0) return 'No workflow runs yet — nothing is running.';
+  const byCreated = (a: RunRow, b: RunRow) => (b.createdAt ?? '').localeCompare(a.createdAt ?? '');
+  const active = rows.filter((r) => ACTIVE_RUN_STATUSES.has(r.status) || r.needsAttention).sort(byCreated);
+  const recent = rows.filter((r) => !ACTIVE_RUN_STATUSES.has(r.status) && !r.needsAttention).sort(byCreated).slice(0, 5);
+  const fmt = (r: RunRow) =>
+    `- ${r.workflow} · ${r.status}${r.needsAttention ? ' · NEEDS ATTENTION' : ''} · run ${r.id}${r.createdAt ? ` · ${formatRunAge(r.createdAt)}` : ''}`;
+  const parts: string[] = [];
+  if (active.length > 0) {
+    parts.push(`${active.length} active run${active.length === 1 ? '' : 's'} (in-flight / needs attention):`);
+    parts.push(...active.slice(0, limit).map(fmt));
+  } else {
+    parts.push('No workflows are running right now.');
+  }
+  if (recent.length > 0) {
+    parts.push('', 'Recently finished:', ...recent.map(fmt));
+  }
+  return parts.join('\n');
 }
 
 export function parseWorkflowRunInputsJson(raw: string | null | undefined): Record<string, string> {
@@ -445,9 +591,11 @@ export function registerOrchestrationTools(server: McpServer): void {
         inputs: Object.keys(inputsSchema).length > 0 ? inputsSchema : undefined,
         synthesis: synthesis_prompt ? { prompt: synthesis_prompt } : undefined,
       };
+      // Tight authoring: bind steps to the user's proven tool-choices BEFORE
+      // validation (auto-bound steps then pass the binding warning cleanly).
+      const createBind = bindStepsToToolChoices(def.steps);
       // P2: refuse to create a workflow whose data can't flow (unbound
-      // inputs, malformed {{tokens}}, dangling deps). Flag-gated → no-op
-      // when WORKFLOW_TYPED_CONTRACT is off.
+      // inputs, malformed {{tokens}}, dangling deps).
       const createCheck = checkWorkflowForWrite(def);
       if (!createCheck.ok) {
         return textResult(
@@ -455,8 +603,10 @@ export function registerOrchestrationTools(server: McpServer): void {
         );
       }
       writeWorkflow(dirName, def);
+      const createBindReport = createBind.boundNotes.length > 0 ? `\n\n${createBind.boundNotes.join('\n')}` : '';
       return textResult(
-        `Created workflow "${name}" at workflows/${dirName}/SKILL.md.${renderAuthoringAdvisories(createCheck.warnings)}`,
+        `Created workflow "${name}" at workflows/${dirName}/SKILL.md.${createBindReport}`
+          + `${renderAuthoringAdvisories([...createCheck.warnings, ...createBind.advisories])}`,
       );
     },
   );
@@ -698,6 +848,8 @@ export function registerOrchestrationTools(server: McpServer): void {
           output: s.output,
         }));
       }
+      // Tight authoring: bind any newly-provided steps to proven tool-choices.
+      const updateBind = steps ? bindStepsToToolChoices(next.steps) : { boundNotes: [], advisories: [] };
       if (inputsProvided) next.inputs = inputsSchema;
       if (synthesis_prompt !== undefined) next.synthesis = { prompt: synthesis_prompt };
 
@@ -736,8 +888,12 @@ export function registerOrchestrationTools(server: McpServer): void {
       // Non-blocking authoring advisories (output-contract / forEach hints).
       // Update has never gated on validation; keep it that way — surface the
       // hints so the author can sharpen the workflow without blocking the save.
-      const updateAdvisories = renderAuthoringAdvisories(checkWorkflowForWrite(next).warnings);
-      return textResult(`Workflow "${name}" updated.${updateAdvisories}`);
+      const updateBindReport = updateBind.boundNotes.length > 0 ? `\n\n${updateBind.boundNotes.join('\n')}` : '';
+      const updateAdvisories = renderAuthoringAdvisories([
+        ...checkWorkflowForWrite(next).warnings,
+        ...updateBind.advisories,
+      ]);
+      return textResult(`Workflow "${name}" updated.${updateBindReport}${updateAdvisories}`);
     },
   );
 
@@ -817,28 +973,32 @@ export function registerOrchestrationTools(server: McpServer): void {
 
   server.tool(
     'workflow_run_status',
-    'Check the status of a queued or completed workflow run by id. Returns the run record (status, inputs, createdAt, completion info).',
+    'Check workflow runs. Pass run_id for one run\'s detail, OR omit it to LIST what is running right now — use the no-id form to answer "what workflows are running / how is my flow going". Lists in-flight (queued/running/parked) + needs-attention runs and the few most-recent finished ones.',
     {
-      run_id: z.string().min(1),
+      run_id: z.string().optional().describe('A specific run id for its full record. Omit to list active + recent runs.'),
     },
     async ({ run_id }) => {
-      const filePath = path.join(WORKFLOW_RUNS_DIR, `${run_id}.json`);
-      if (!existsSync(filePath)) return textResult(`Workflow run "${run_id}" not found.`);
-      try {
-        const record = JSON.parse(readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
-        const lines = [
-          `Run ${run_id}`,
-          `Workflow: ${record.workflow ?? '(unknown)'}`,
-          `Status: ${record.status ?? '(unknown)'}`,
-          record.createdAt ? `Created: ${record.createdAt}` : '',
-          record.completedAt ? `Completed: ${record.completedAt}` : '',
-          record.inputs && Object.keys(record.inputs).length > 0 ? `Inputs: ${JSON.stringify(record.inputs)}` : '',
-          record.error ? `Error: ${record.error}` : '',
-        ].filter(Boolean);
-        return textResult(lines.join('\n'));
-      } catch (err) {
-        return textResult(`Failed to read run ${run_id}: ${err instanceof Error ? err.message : String(err)}`);
+      if (run_id && run_id.trim()) {
+        const filePath = path.join(WORKFLOW_RUNS_DIR, `${run_id}.json`);
+        if (!existsSync(filePath)) return textResult(`Workflow run "${run_id}" not found.`);
+        try {
+          const record = JSON.parse(readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
+          const lines = [
+            `Run ${run_id}`,
+            `Workflow: ${record.workflow ?? '(unknown)'}`,
+            `Status: ${record.status ?? '(unknown)'}${record.needsAttention ? ' · NEEDS ATTENTION' : ''}`,
+            record.createdAt ? `Created: ${record.createdAt}` : '',
+            record.finishedAt ? `Finished: ${record.finishedAt}` : '',
+            record.inputs && Object.keys(record.inputs).length > 0 ? `Inputs: ${JSON.stringify(record.inputs)}` : '',
+            record.error ? `Error: ${record.error}` : '',
+          ].filter(Boolean);
+          return textResult(lines.join('\n'));
+        } catch (err) {
+          return textResult(`Failed to read run ${run_id}: ${err instanceof Error ? err.message : String(err)}`);
+        }
       }
+      // No id → list active + recent runs so Clem can answer "what's running?".
+      return textResult(renderWorkflowRunsOverview());
     },
   );
 

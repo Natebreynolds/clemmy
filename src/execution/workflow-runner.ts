@@ -37,6 +37,7 @@ import {
   detectBlockedSteps,
   diagnoseWorkflowBlock,
   recordProposedFix,
+  applyProposedFix,
   renderLegibleOutcome,
   renderSuccessBody,
   selfHealEnabled,
@@ -44,6 +45,8 @@ import {
   type ProposedFix,
   type BlockedStep,
 } from './workflow-diagnosis.js';
+import { requeueWorkflowFromRun } from '../tools/workflow-run-queue.js';
+import { stepLooksLikeIrreversibleSend } from './workflow-enforce.js';
 import { takeStepResult } from '../tools/step-result-tool.js';
 import { configureHarnessRuntime } from '../runtime/harness/codex-client.js';
 import { closePlanScope, openPlanScope } from '../agents/plan-scope.js';
@@ -243,6 +246,13 @@ interface QueuedRunRecord {
   needsAttention?: boolean;
   blockedSteps?: Array<{ stepId: string; reason: string }>;
   proposedFixId?: string | null;
+  /**
+   * Bounded autonomous self-heal: how many times this run has already been
+   * auto-healed (a safe edit_step fix applied) + re-queued. Carried run→run via
+   * requeueWorkflowFromRun so the runner can stop after
+   * CLEMENTINE_WORKFLOW_SELF_HEAL_MAX_ATTEMPTS and escalate instead of looping.
+   */
+  selfHealAttempt?: number;
   /**
    * P0 event-driven approval parking (flag WORKFLOW_APPROVAL_PARKING).
    * When a step pauses on a human approval, the runner records the
@@ -901,6 +911,10 @@ export const workflowRunnerInternalsForTest = {
   awaitDeclarativeStepApproval,
   bindStepContext,
   renderStepContextBlock,
+  hasCompletedUpstreamMutation: (steps: WorkflowStepInput[], blockedStepId: string, completedStepIds: Set<string>) =>
+    hasCompletedUpstreamMutation(steps, blockedStepId, completedStepIds),
+  tryAutoHealAndRequeue,
+  selfHealAutoMaxAttempts,
 };
 
 async function runStepViaHarness(
@@ -970,7 +984,7 @@ async function runStepViaHarness(
     // workflows (no recursion). Default off → the full orchestrator +
     // prose capture, byte-identical to prior behavior.
     const agent = useWorkflowStepAgent()
-      ? await buildWorkflowStepAgent({ userInput: message, sessionId: realSessionId })
+      ? await buildWorkflowStepAgent({ userInput: message, sessionId: realSessionId, lockTools: step.allowedTools })
       : await buildOrchestratorAgent({ userInput: message, sessionId: realSessionId });
     let result: RunConversationResult;
     if (session.loadInterruptState() || approvalRegistry.hasPending(realSessionId)) {
@@ -2324,6 +2338,102 @@ async function drainWorkflowRuns(assistant: ClementineAssistant): Promise<void> 
   );
 }
 
+// ── Bounded autonomous self-heal ────────────────────────────────────
+//
+// Owner directive: "on 1 failure workflows can run again until clem self heals
+// them." When a step blocks with a diagnosable, AUTO-APPLICABLE prompt-rewrite
+// fix, apply it and re-run automatically — bounded, side-effect-guarded, and
+// reported every time. Reuses the EXACT path `apply fix` already runs (the
+// user-approved Doctor flow): applyProposedFix → requeueWorkflowFromRun. So this
+// introduces no new execution machinery and no side-effect class beyond what
+// shipping `apply fix` already does — only it's automatic, counted, and capped.
+// Gated by the existing WORKFLOW_SELF_HEAL switch (default on); no new flag.
+
+function selfHealAutoMaxAttempts(): number {
+  const raw = Number.parseInt(getRuntimeEnv('CLEMENTINE_WORKFLOW_SELF_HEAL_MAX_ATTEMPTS', '2') || '2', 10);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 2;
+}
+
+/** Side-effect guard: a FRESH re-run re-executes every step, so it's only safe
+ *  when no OTHER mutating step already completed before the blocked one — else
+ *  the re-run could double an irreversible write. A step counts as mutating if
+ *  it's approval-gated (the author's own "this writes" signal) OR its prompt
+ *  reads as an irreversible send/publish (reusing the send-gate heuristic) — so
+ *  an unmarked "send the emails" step still blocks auto-heal. Conservative: if
+ *  any such step completed, escalate instead of auto-running. */
+function hasCompletedUpstreamMutation(
+  steps: WorkflowStepInput[],
+  blockedStepId: string,
+  completedStepIds: Set<string>,
+): boolean {
+  return steps.some((s) =>
+    s.id !== blockedStepId
+    && completedStepIds.has(s.id)
+    && (s.requiresApproval === true
+      || (s as { requires_approval?: boolean }).requires_approval === true
+      || stepLooksLikeIrreversibleSend(s.prompt ?? '')));
+}
+
+interface AutoHealOutcome { attempt: number; max: number; stepId: string; message: string; }
+
+/**
+ * Decide + perform an automatic heal for a run that just completed with a
+ * diagnosable block. Returns the heal outcome (so the caller reports it +
+ * suppresses the "apply this fix" offer) or null to fall through to today's
+ * escalation (needs-attention + fix offer). Never throws.
+ */
+function tryAutoHealAndRequeue(args: {
+  run: QueuedRunRecord;
+  workflowSlug: string;
+  steps: WorkflowStepInput[];
+  diagnosis: WorkflowDiagnosis | null;
+  proposedFix: ProposedFix | null;
+  completedStepIds: Set<string>;
+}): AutoHealOutcome | null {
+  const { run, workflowSlug, steps, diagnosis, proposedFix, completedStepIds } = args;
+  if (!selfHealEnabled() || !diagnosis || !proposedFix) return null;
+  const fix = diagnosis.fix;
+  if (fix.kind !== 'edit_step' || !fix.autoApplicable || !fix.newStepPrompt) return null; // only safe prompt rewrites
+  const max = selfHealAutoMaxAttempts();
+  const prior = run.selfHealAttempt ?? 0;
+  if (max <= 0 || prior >= max) return null; // at cap → escalate (today's offer)
+  if (hasCompletedUpstreamMutation(steps, fix.stepId, completedStepIds)) {
+    logger.info(
+      { runId: run.id, step: fix.stepId },
+      'self-heal: an upstream mutating step already completed — escalating instead of auto re-running (avoids double side effects)',
+    );
+    return null;
+  }
+  let applied: { ok: boolean; message: string };
+  try {
+    applied = applyProposedFix(proposedFix.id);
+  } catch (err) {
+    logger.warn({ runId: run.id, err: err instanceof Error ? err.message : err }, 'self-heal: applyProposedFix threw; escalating');
+    return null;
+  }
+  if (!applied.ok) {
+    logger.info({ runId: run.id, fixId: proposedFix.id, msg: applied.message }, 'self-heal: fix not auto-applicable; escalating');
+    return null;
+  }
+  const attempt = prior + 1;
+  try {
+    appendWorkflowEvent(workflowSlug, run.id, { kind: 'step_retry', stepId: fix.stepId, meta: { selfHeal: true, attempt } });
+  } catch { /* heal log is best-effort */ }
+  const requeued = requeueWorkflowFromRun(run.id, { originSessionId: run.originSessionId, selfHealAttempt: attempt });
+  if (requeued.status === 'not_found') {
+    // Fix is applied but we couldn't re-queue — report it so it's never silent.
+    logger.warn({ runId: run.id }, 'self-heal: applied fix but could not re-queue; surfacing for manual re-run');
+    return { attempt, max, stepId: fix.stepId, message: `I auto-applied a fix to step "${fix.stepId}" (${fix.description}), but couldn't re-run automatically — please run the workflow again.` };
+  }
+  logger.info({ runId: run.id, newRunId: requeued.id, step: fix.stepId, attempt, max }, 'self-heal: applied fix + re-queued a fresh run');
+  return {
+    attempt,
+    max,
+    stepId: fix.stepId,
+    message: `Step "${fix.stepId}" blocked, so I auto-applied a fix (${fix.description}) and re-ran the workflow — attempt ${attempt} of ${max}. It's running in the background and will report back here when it finishes.`,
+  };
+}
+
 async function processOneRunFile(
   file: string,
   filePath: string,
@@ -2521,6 +2631,48 @@ async function processOneRunFile(
           ? { needsAttention: true, blockedSteps, proposedFixId: proposedFix?.id ?? null }
           : {}),
       });
+
+      // Bounded autonomous self-heal: a step blocked with an auto-applicable
+      // prompt-rewrite fix → apply it and re-run automatically (bounded +
+      // side-effect-guarded). When it fires, report the heal + re-run and STOP
+      // here: the original run is terminal (above), and the FRESH re-run reports
+      // its own outcome (and re-enters the origin chat via carried origin). We
+      // skip the normal needs-attention notification/offer to avoid double-msging.
+      if (needsAttention) {
+        const healed = tryAutoHealAndRequeue({
+          run,
+          workflowSlug: workflow.name,
+          steps: workflow.data.steps,
+          diagnosis,
+          proposedFix,
+          completedStepIds: new Set(resume.completedSteps.keys()),
+        });
+        if (healed) {
+          addNotification({
+            id: `workflow-${run.id}-selfheal`,
+            kind: 'workflow',
+            title: `Auto-healing workflow: ${workflow.data.name}`,
+            body: `🔧 ${healed.message}`,
+            createdAt: new Date().toISOString(),
+            read: false,
+            metadata: { workflow: workflow.data.name, runId: run.id, selfHeal: true, attempt: healed.attempt },
+          });
+          markRunNotified(filePath);
+          try {
+            finishRun(run.id, {
+              status: 'completed',
+              message: `Auto-healing — re-running (attempt ${healed.attempt}/${healed.max})`,
+              outputPreview: healed.message.slice(0, 800),
+            });
+          } catch { /* best-effort */ }
+          // Gap E: also tell the origin chat in-context that we're healing +
+          // re-running (the fresh run carries originSessionId and will report its
+          // own final outcome). No-op for scheduled/cron runs.
+          enqueueWorkflowOutcomeTurn(run, workflow.data.name, 'blocked', healed.message);
+          logger.info({ workflow: workflow.data.name, runId: run.id, attempt: healed.attempt }, 'Workflow run auto-healed and re-queued');
+          return;
+        }
+      }
 
       // Partial-success surfacing: if any forEach items errored, lift
       // them into the user-visible notification so a "completed" run

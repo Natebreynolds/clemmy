@@ -82,6 +82,69 @@ export function filterToolsForStep<T extends { name?: string }>(tools: T[]): T[]
   );
 }
 
+// ── Tool-surface lock (tight authoring A4) ──────────────────────────
+//
+// When a step declares an EXPLICIT, non-wildcard `allowedTools` (the author or
+// the auto-binder locked it to a proven family, e.g. ['run_shell_command']),
+// physically PRUNE the step agent's visible tool list to that family — so a
+// bound step can't see composio and re-decide its way onto a stale path
+// (the live SF→Airtable drift). This is OPT-IN per step (the user's explicit
+// allowedTools, not a global curated list — so it doesn't fight
+// feedback_no_hardcoded_tool_lists) and always preserves the structural output
+// channel so a step can never be starved of its ability to return.
+//
+// Note (scope): this prunes the CORE tool list (which carries the composio
+// gateway — the proven drift vector). MCP servers are attached separately and
+// are NOT scoped here, so an mcp-bound step keeps its MCP tools; tighter MCP
+// scoping is a follow-up. A step with no/`*` allowedTools is unchanged.
+
+/** Structural channels a step always needs, regardless of its bound work family
+ *  — NEVER pruned away. Beyond the output channel (without which a step can't
+ *  return at all), this keeps the REPORT channel (notify_user — a triage/brief
+ *  step's job is to report) and the RECALL channel (recall_tool_result /
+ *  tool_output_query — to read back a large tool output the harness clipped to
+ *  the side-store). These are structural, not "work" tools, so keeping them
+ *  doesn't reopen the composio drift vector the lock exists to close. */
+export const STEP_STRUCTURAL_BASELINE_TOOLS = new Set<string>([
+  'workflow_step_result',
+  'notify_user',
+  'recall_tool_result',
+  'tool_output_query',
+]);
+
+/** A step's allowedTools "locks" its surface only when explicitly set and not a
+ *  wildcard. Empty / undefined / contains '*' → no lock (today's full surface). */
+export function stepAllowedToolsLock(allowed?: string[] | null): boolean {
+  if (!allowed || allowed.length === 0) return false;
+  return !allowed.some((a) => typeof a === 'string' && (a === '*' || a === '**' || a.trim() === ''));
+}
+
+/** Build a name predicate from an explicit allowedTools list: an entry ending
+ *  in '*' is a prefix family (e.g. 'composio_*'); otherwise an exact name. The
+ *  structural baseline is always allowed. */
+export function makeStepToolAllow(allowed: string[]): (name: string) => boolean {
+  const exact = new Set<string>();
+  const prefixes: string[] = [];
+  for (const a of allowed) {
+    const t = typeof a === 'string' ? a.trim() : '';
+    if (!t || t === '*') continue;
+    if (t.endsWith('*')) prefixes.push(t.slice(0, -1));
+    else exact.add(t);
+  }
+  return (name: string) =>
+    STEP_STRUCTURAL_BASELINE_TOOLS.has(name) ||
+    exact.has(name) ||
+    prefixes.some((p) => p.length > 0 && name.startsWith(p));
+}
+
+/** Prune the step's tool list to its explicit allowedTools family (+ baseline).
+ *  No-op when allowedTools doesn't lock the surface. */
+export function lockToolsForStep<T extends { name?: string }>(tools: T[], allowed?: string[] | null): T[] {
+  if (!stepAllowedToolsLock(allowed)) return tools;
+  const allow = makeStepToolAllow(allowed as string[]);
+  return tools.filter((t) => allow(typeof t?.name === 'string' ? t.name : ''));
+}
+
 const STEP_INSTRUCTIONS = [
   'You are executing ONE step of a workflow — a deterministic pipeline, not a chat.',
   'Do exactly the work the step prompt describes, using the smallest set of tool calls. Do not branch into other tasks, do not re-plan, do not ask the user questions.',
@@ -95,13 +158,20 @@ export interface BuildWorkflowStepAgentOptions {
   userInput?: string | null;
   sessionId?: string | null;
   mcpToolScope?: McpToolScope;
+  /** The step's explicit allowedTools. When it locks the surface (non-wildcard),
+   *  the agent's tool list is pruned to that family + the structural baseline,
+   *  so a bound step can't drift onto composio. Omit / `['*']` → full surface. */
+  lockTools?: string[] | null;
 }
 
 export async function buildWorkflowStepAgent(
   options: BuildWorkflowStepAgentOptions = {},
 ): Promise<Agent<RuntimeContextValue, typeof OrchestratorDecisionSchema>> {
   const all = await getCoreToolsAsync({ includeDynamicComposioTools: false });
-  const tools = filterToolsForStep(all) as Tool<RuntimeContextValue>[];
+  const tools = lockToolsForStep(
+    filterToolsForStep(all),
+    options.lockTools,
+  ) as Tool<RuntimeContextValue>[];
   return new Agent<RuntimeContextValue, typeof OrchestratorDecisionSchema>({
     name: 'WorkflowStep',
     instructions: harnessInstructions(STEP_INSTRUCTIONS),

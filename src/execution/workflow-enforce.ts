@@ -1,6 +1,7 @@
 import type { WorkflowDefinition } from '../memory/workflow-store.js';
 import { validateWorkflowDefinition, type WorkflowFrontmatter } from './workflow-validator.js';
 import { collectRequiredWorkflowInputs, COMMON_WORKFLOW_INPUT_KEYS } from './workflow-inputs.js';
+import { listToolChoices } from '../memory/tool-choice-store.js';
 
 /**
  * Author/enable-time enforcement (typed-workflow-contract).
@@ -35,6 +36,7 @@ function toFrontmatter(def: WorkflowDefinition): WorkflowFrontmatter {
       forEach: s.forEach,
       deterministic: s.deterministic,
       usesSkill: s.usesSkill,
+      allowedTools: s.allowedTools,
       requiresApproval: s.requiresApproval,
       inputs: s.inputs as Record<string, unknown> | undefined,
       output: s.output as Record<string, unknown> | undefined,
@@ -75,7 +77,7 @@ const IRREVERSIBLE_SEND_RE =
 const PUBLISH_RE =
   /\b(?:publish|publishes|publishing|post|posts|posting)\b[\s\S]{0,40}\b(?:tweet|tweets|linkedin|slack|twitter|\bx\b|facebook|instagram|blog\s*post)\b/i;
 
-function stepLooksLikeIrreversibleSend(prompt: string): boolean {
+export function stepLooksLikeIrreversibleSend(prompt: string): boolean {
   const p = prompt ?? '';
   return IRREVERSIBLE_SEND_RE.test(p) || PUBLISH_RE.test(p);
 }
@@ -173,7 +175,16 @@ export function checkDependencyBinding(def: WorkflowDefinition): string[] {
  * refuse and surface the fixes. Validation is unconditional (no flag).
  */
 export function checkWorkflowForWrite(def: WorkflowDefinition): WorkflowWriteCheck {
-  const result = validateWorkflowDefinition(toFrontmatter(def));
+  // Surface the user's proven tool-choices so the validator can warn on a step
+  // that should bind one but doesn't. Best-effort — a store read error never
+  // blocks a write (the binding check simply no-ops without choices).
+  let rememberedToolChoices: ReturnType<typeof listToolChoices> | undefined;
+  try {
+    rememberedToolChoices = listToolChoices();
+  } catch {
+    rememberedToolChoices = undefined;
+  }
+  const result = validateWorkflowDefinition(toFrontmatter(def), { rememberedToolChoices });
   const errors = [...result.errors, ...checkSendGate(def), ...checkRunnabilityConstraints(def), ...checkDependencyBinding(def)];
   return { ok: errors.length === 0, errors, warnings: result.warnings };
 }

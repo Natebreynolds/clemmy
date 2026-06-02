@@ -482,3 +482,67 @@ test('literal {{...}} ellipsis in prompt documentation is NOT flagged (no false 
   });
   assert.ok(!result.errors.some((e) => /unrecognized template token/.test(e)), JSON.stringify(result.errors));
 });
+
+// ── Feature A: remembered tool-choice binding WARNING (advisory, never blocks) ──
+
+import type { ToolChoiceRecord } from '../memory/tool-choice-store.js';
+
+function sfCliChoice(): ToolChoiceRecord {
+  return {
+    intent: 'salesforce.cli.query',
+    description: 'Run a SOQL query against Salesforce via the sf CLI',
+    choice: { kind: 'cli', identifier: 'sf', invocationTemplate: 'sf data query --json --query "{{soql}}"', testedAt: '2026-06-01T00:00:00Z' },
+    fallbacks: [],
+    body: '',
+    filePath: '/tmp/sf.md',
+  };
+}
+
+test('binding warning: a generic salesforce step exposed to composio gets a WARNING (never an error)', () => {
+  const wf: WorkflowFrontmatter = {
+    name: 'sf-flow',
+    description: 'Query Salesforce and add prospects to Airtable.',
+    enabled: true,
+    steps: [
+      { id: 'find', prompt: 'Query Salesforce for new prospect accounts via a SOQL query.', allowedTools: ['composio_execute_tool'] },
+    ],
+  };
+  const result = validateWorkflowDefinition(wf, { rememberedToolChoices: [sfCliChoice()] });
+  assert.equal(result.ok, true, 'binding mismatch is advisory — never blocks the write');
+  assert.ok(result.warnings.some((w) => /proven .*sf data query/.test(w)), 'warns to bake the proven command');
+});
+
+test('binding warning: a step already bound (or locked off composio) does NOT warn', () => {
+  const bound: WorkflowFrontmatter = {
+    name: 'sf-flow',
+    description: 'Query Salesforce.',
+    enabled: true,
+    steps: [
+      { id: 'find', prompt: 'Query Salesforce: run `sf data query --json --query "SELECT Id FROM Account"`.', allowedTools: ['run_shell_command'] },
+    ],
+  };
+  const r1 = validateWorkflowDefinition(bound, { rememberedToolChoices: [sfCliChoice()] });
+  assert.ok(!r1.warnings.some((w) => /proven .*sf data query/.test(w)));
+
+  const lockedOff: WorkflowFrontmatter = {
+    name: 'sf-flow',
+    description: 'Query Salesforce.',
+    enabled: true,
+    steps: [
+      { id: 'find', prompt: 'Query Salesforce for new prospect accounts via a SOQL query.', allowedTools: ['run_shell_command'] },
+    ],
+  };
+  const r2 = validateWorkflowDefinition(lockedOff, { rememberedToolChoices: [sfCliChoice()] });
+  assert.ok(!r2.warnings.some((w) => /proven .*sf data query/.test(w)), 'no composio in scope → no drift → no warning');
+});
+
+test('binding warning: no remembered choices → no binding warning (byte-identical)', () => {
+  const wf: WorkflowFrontmatter = {
+    name: 'sf-flow',
+    description: 'Query Salesforce for prospects.',
+    enabled: true,
+    steps: [{ id: 'find', prompt: 'Query Salesforce for new prospect accounts via a SOQL query.', allowedTools: ['composio_execute_tool'] }],
+  };
+  const result = validateWorkflowDefinition(wf);
+  assert.ok(!result.warnings.some((w) => /proven/.test(w)));
+});

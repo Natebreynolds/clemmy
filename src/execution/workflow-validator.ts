@@ -22,6 +22,7 @@
  * surface as soft signals the user can override.
  */
 import { COMMON_WORKFLOW_INPUT_KEYS } from './workflow-inputs.js';
+import { matchToolChoicesForStep, type ToolChoiceRecord } from '../memory/tool-choice-store.js';
 
 /**
  * Shape of a workflow's parsed frontmatter — kept loose because the
@@ -40,6 +41,7 @@ export interface WorkflowStepShape {
   deterministic?: { runner?: string };
   usesSkill?: string;
   uses_skill?: string;
+  allowedTools?: string[];
   requiresApproval?: boolean;
   requires_approval?: boolean;
   /** Typed step contract (P0). Keys = declared input names. */
@@ -341,6 +343,10 @@ export interface ValidateOptions {
   knownToolNames?: Set<string>;
   /** Optional set of installed skill directory names. Missing refs warn. */
   installedSkillNames?: Set<string>;
+  /** The user's active remembered tool-choices. When provided, a step that
+   *  should bind a proven cli/mcp choice but doesn't (and stays exposed to the
+   *  composio drift gateway) gets a WARNING. Caller passes listToolChoices(). */
+  rememberedToolChoices?: ToolChoiceRecord[];
 }
 
 const MULTI_ITEM_PROMPT_RE = /\b(?:for each|each one|each account|each site|each firm|for every|all \d+|top \d+|\d+\s+(?:accounts?|sites?|firms?|leads?|contacts?|emails?|rows?))\b/i;
@@ -379,6 +385,39 @@ function checkOutputContractHint(step: WorkflowStepShape): string | null {
   const prompt = step.prompt ?? '';
   if (!DELIVERABLE_RE.test(prompt) || !PRODUCE_RE.test(prompt)) return null;
   return `Step "${step.id}" looks like it produces a deliverable but declares no output contract. Add an "output" block (e.g. required_keys, or verify.url_present / verify.path_exists for a real URL or file) so the engine can confirm the deliverable actually exists and the end-of-run target check can verify it — otherwise a step that claims success without producing the artifact passes silently.`;
+}
+
+// A step that should run a PROVEN cli/mcp tool-choice but leaves its prompt
+// generic AND keeps the composio gateway in scope will re-decide at runtime and
+// can drift onto a stale/expired path (the live SF→Airtable failure). WARNING
+// only (never blocks) — and only fires when binding is both warranted and
+// missing. Auto-bind (workflow_create) resolves most of these before save; this
+// catches medium-confidence matches and hand-edits via the dashboard editor.
+function checkRememberedToolChoiceBinding(
+  step: WorkflowStepShape,
+  choices: ToolChoiceRecord[] | undefined,
+): string | null {
+  if (!choices || choices.length === 0) return null;
+  if (step.usesSkill || step.uses_skill) return null; // a skill owns its tools
+  let matches: ReturnType<typeof matchToolChoicesForStep>;
+  try {
+    matches = matchToolChoicesForStep(step.prompt ?? '', { choices });
+  } catch {
+    return null;
+  }
+  const m = matches.find((x) => (x.kind === 'cli' || x.kind === 'mcp') && !x.alreadyBound);
+  if (!m) return null;
+  const allowed = step.allowedTools;
+  // Drift is possible when the step can still reach composio: an explicit
+  // composio_* entry, OR no allowedTools at all (default = full surface).
+  const canReachComposio =
+    !allowed || allowed.length === 0 || allowed.some((t) => typeof t === 'string' && t.startsWith('composio'));
+  if (!canReachComposio) return null;
+  return (
+    `Step "${step.id}" looks like it should use your proven ${m.kind} \`${m.command}\`, but its prompt doesn't `
+    + 'embed it and its tools still include composio — at runtime the step may re-decide and drift onto a stale '
+    + `path. Bake \`${m.command}\` into the step prompt and set allowedTools to that family.`
+  );
 }
 
 function checkSkillReference(step: WorkflowStepShape, installedSkillNames: Set<string> | undefined): string | null {
@@ -504,6 +543,9 @@ export function validateWorkflowDefinition(
 
     const outputContractIssue = checkOutputContractHint(step);
     if (outputContractIssue) warnings.push(outputContractIssue);
+
+    const bindingIssue = checkRememberedToolChoiceBinding(step, opts.rememberedToolChoices);
+    if (bindingIssue) warnings.push(bindingIssue);
   }
 
   return {

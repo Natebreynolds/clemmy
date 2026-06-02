@@ -139,6 +139,47 @@ test('requeueWorkflowFromRun: missing original run → not_found (best-effort, n
   assert.equal(requeueWorkflowFromRun('does-not-exist').status, 'not_found');
 });
 
+test('requeueWorkflowFromRun carries originSessionId from the prior run (re-run re-enters the chat)', () => {
+  writeAuditWorkflow();
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  const origId = 'orig-with-origin';
+  writeFileSync(
+    path.join(WORKFLOW_RUNS_DIR, `${origId}.json`),
+    JSON.stringify({ id: origId, workflow: 'audit-brief', inputs: { url: 'https://x.co' }, status: 'completed', originSessionId: 'sess-abc' }),
+    'utf-8',
+  );
+  requeueWorkflowFromRun(origId);
+  const fresh = readdirSync(WORKFLOW_RUNS_DIR)
+    .filter((f) => f.endsWith('.json') && f !== `${origId}.json`)
+    .map((f) => JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, f), 'utf-8')) as { originSessionId?: string });
+  assert.equal(fresh.length, 1);
+  assert.equal(fresh[0].originSessionId, 'sess-abc');
+});
+
+test('self-heal lineage: requeue bumps + persists selfHealAttempt (bound counter survives run→run)', () => {
+  writeAuditWorkflow();
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  const origId = 'orig-heal';
+  writeFileSync(
+    path.join(WORKFLOW_RUNS_DIR, `${origId}.json`),
+    JSON.stringify({ id: origId, workflow: 'audit-brief', inputs: { url: 'https://x.co' }, status: 'completed' }),
+    'utf-8',
+  );
+  requeueWorkflowFromRun(origId, { selfHealAttempt: 1 });
+  const fresh = readdirSync(WORKFLOW_RUNS_DIR)
+    .filter((f) => f.endsWith('.json') && f !== `${origId}.json`)
+    .map((f) => JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, f), 'utf-8')) as { selfHealAttempt?: number });
+  assert.equal(fresh.length, 1);
+  assert.equal(fresh[0].selfHealAttempt, 1);
+});
+
+test('queueWorkflowRun omits selfHealAttempt when 0/absent (byte-identical normal runs)', () => {
+  writeAuditWorkflow();
+  queueWorkflowRun('audit-brief', { url: 'https://x.co' });
+  const rec = runFiles().map((f) => JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, f), 'utf-8')) as Record<string, unknown>)[0];
+  assert.equal('selfHealAttempt' in rec, false);
+});
+
 test.after(() => {
   rmSync(TMP_HOME, { recursive: true, force: true });
 });

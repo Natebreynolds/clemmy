@@ -73,6 +73,9 @@ export interface QueueWorkflowRunOptions {
    *  Written into the run record so the runner re-enters it on a terminal
    *  state. Omit for scheduled/cron/dashboard/webhook runs (notification-only). */
   originSessionId?: string;
+  /** Self-heal lineage: how many times this run has already been auto-healed +
+   *  re-queued. Carried run→run so the runner can bound auto-heal attempts. */
+  selfHealAttempt?: number;
 }
 
 export function queueWorkflowRun(
@@ -91,6 +94,9 @@ export function queueWorkflowRun(
   }
   const id = `${Date.now()}-${randomBytes(3).toString('hex')}`;
   const origin = opts?.originSessionId?.trim();
+  const selfHealAttempt = typeof opts?.selfHealAttempt === 'number' && opts.selfHealAttempt > 0
+    ? opts.selfHealAttempt
+    : undefined;
   writeFileSync(
     path.join(WORKFLOW_RUNS_DIR, `${id}.json`),
     JSON.stringify({
@@ -102,6 +108,7 @@ export function queueWorkflowRun(
       // Only written when present → scheduled/dashboard/webhook records are
       // byte-identical to before (no origin → notification-only).
       ...(origin ? { originSessionId: origin } : {}),
+      ...(selfHealAttempt ? { selfHealAttempt } : {}),
     }, null, 2),
     'utf-8',
   );
@@ -159,15 +166,18 @@ export interface RequeueResult {
  * prior run file by id; returns not_found if it's gone (best-effort, never
  * throws into the caller — the fix is already applied either way).
  */
-export function requeueWorkflowFromRun(originalRunId: string): RequeueResult {
+export function requeueWorkflowFromRun(
+  originalRunId: string,
+  opts: QueueWorkflowRunOptions = {},
+): RequeueResult {
   const safe = originalRunId.replace(/[^a-zA-Z0-9_.:-]/g, '');
   const file = path.join(WORKFLOW_RUNS_DIR, `${safe}.json`);
   if (!existsSync(file)) {
     return { status: 'not_found', message: `Original run "${originalRunId}" not found; nothing to re-queue.` };
   }
-  let rec: { workflow?: unknown; inputs?: unknown };
+  let rec: { workflow?: unknown; inputs?: unknown; originSessionId?: unknown };
   try {
-    rec = JSON.parse(readFileSync(file, 'utf-8')) as { workflow?: unknown; inputs?: unknown };
+    rec = JSON.parse(readFileSync(file, 'utf-8')) as { workflow?: unknown; inputs?: unknown; originSessionId?: unknown };
   } catch {
     return { status: 'not_found', message: 'Original run record unreadable; nothing to re-queue.' };
   }
@@ -178,6 +188,10 @@ export function requeueWorkflowFromRun(originalRunId: string): RequeueResult {
       ? (rec.inputs as Record<string, string>)
       : {},
   );
-  const queued = queueWorkflowRun(workflow, inputs);
+  // Carry the original run's chat-origin so the re-run reports back into the
+  // SAME chat (closes the deferred report-back gap), unless the caller overrides.
+  const originSessionId = opts.originSessionId
+    ?? (typeof rec.originSessionId === 'string' ? rec.originSessionId : undefined);
+  const queued = queueWorkflowRun(workflow, inputs, { originSessionId, selfHealAttempt: opts.selfHealAttempt });
   return { status: queued.status, id: queued.id, message: queued.message };
 }

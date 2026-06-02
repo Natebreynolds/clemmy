@@ -15,6 +15,7 @@ import { ExecutionStore } from '../execution/store.js';
 import { interruptStaleRunningBackgroundTasks, resumeInterruptedBackgroundTasks, processBackgroundTasks } from '../execution/background-tasks.js';
 import { processWorkflowRuns, reconcilePendingWorkflowRuns, reapResolvedParkedRuns } from '../execution/workflow-runner.js';
 import { runWorkflowWatchdog } from '../execution/workflow-watchdog.js';
+import { runBackgroundTaskWatchdog } from '../execution/background-task-watchdog.js';
 import { getBuildInfo, describeBuild } from '../runtime/build-info.js';
 import { processWorkflowSchedules, reapStaleWorkflowRuns } from '../execution/workflow-scheduler.js';
 import { sweepStaleExecutions, sweepCrashedExecutions, sweepStaleBlockedExecutions } from '../execution/store.js';
@@ -897,6 +898,17 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
       logger.warn(
         { err: err instanceof Error ? err.message : String(err) },
         'Workflow watchdog tick failed',
+      );
+    }
+    // Same safety net for background TASKS (a task that died mid-run or whose
+    // terminal notification was lost would otherwise go silent — no watchdog
+    // existed for tasks before). Observe-only + deduped, like the workflow one.
+    try {
+      runBackgroundTaskWatchdog();
+    } catch (err) {
+      logger.warn(
+        { err: err instanceof Error ? err.message : String(err) },
+        'Background-task watchdog tick failed',
       );
     }
   };

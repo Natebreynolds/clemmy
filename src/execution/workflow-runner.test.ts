@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -698,4 +698,141 @@ test('awaitDeclarativeStepApproval creates the gate session so register() does n
   assert.equal(pending.length, 1, 'exactly one pending gate approval registered');
 
   delete process.env.WORKFLOW_APPROVAL_PARKING;
+});
+
+// ---------------------------------------------------------------------------
+// Feature B — bounded autonomous self-heal + re-run
+// ---------------------------------------------------------------------------
+
+const { writeWorkflow: writeWorkflowForHeal } = await import('../memory/workflow-store.js');
+const { recordProposedFix } = await import('./workflow-diagnosis.js');
+
+function editStepDiagnosis(stepId: string, autoApplicable = true, kind: 'edit_step' | 'reconnect_service' = 'edit_step') {
+  return {
+    summary: 'A step blocked.',
+    rootCause: 'The step was too vague about how to reach Salesforce.',
+    fix: {
+      kind,
+      stepId,
+      description: 'Bind the step to the proven sf CLI.',
+      newStepPrompt: kind === 'edit_step' ? `Query Salesforce. Use this exact, proven command: \`sf data query --json --query "SELECT Id FROM Account"\` via run_shell_command.` : null,
+      service: kind === 'reconnect_service' ? 'Salesforce' : null,
+      autoApplicable,
+    },
+    confidence: 'high' as const,
+  };
+}
+
+function writeHealWorkflow(name: string, steps: Array<{ id: string; prompt: string; requiresApproval?: boolean }>): void {
+  writeWorkflowForHeal(name, {
+    name,
+    description: 'Self-heal test workflow.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: steps.map((s) => ({ id: s.id, prompt: s.prompt, requiresApproval: s.requiresApproval })),
+  });
+}
+
+function freshRunsFor(wf: string, origId: string): Array<Record<string, unknown>> {
+  return readdirSync(WORKFLOW_RUNS_DIR)
+    .filter((f) => f.endsWith('.json') && f !== `${origId}.json`)
+    .map((f) => JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, f), 'utf-8')) as Record<string, unknown>)
+    .filter((r) => r.workflow === wf);
+}
+
+test('self-heal: below cap → applies the edit_step fix + re-queues a fresh run carrying attempt+1', () => {
+  const wf = 'heal-below-cap';
+  writeHealWorkflow(wf, [{ id: 'find', prompt: 'Query Salesforce for prospects somehow.' }]);
+  const origId = `${wf}-run`;
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${origId}.json`),
+    JSON.stringify({ id: origId, workflow: wf, inputs: {}, status: 'completed', originSessionId: 'sess-h' }), 'utf-8');
+  const fix = recordProposedFix(wf, origId, editStepDiagnosis('find'));
+
+  const out = workflowRunnerInternalsForTest.tryAutoHealAndRequeue({
+    run: { id: origId, workflow: wf, originSessionId: 'sess-h', selfHealAttempt: 0 },
+    workflowSlug: wf,
+    steps: [{ id: 'find', prompt: 'Query Salesforce for prospects somehow.' }] as never,
+    diagnosis: editStepDiagnosis('find') as never,
+    proposedFix: fix,
+    completedStepIds: new Set(['find']),
+  });
+  assert.ok(out, 'heal fired');
+  assert.equal(out!.attempt, 1);
+  const fresh = freshRunsFor(wf, origId) as Array<{ workflow: string; selfHealAttempt?: number; originSessionId?: string }>;
+  assert.equal(fresh.length, 1, 'one fresh re-run queued');
+  assert.equal(fresh[0].selfHealAttempt, 1, 'carries the bumped attempt counter');
+  assert.equal(fresh[0].originSessionId, 'sess-h', 'carries origin so the re-run re-enters chat');
+});
+
+test('self-heal: at the attempt cap → escalates (no auto re-run)', () => {
+  const wf = 'heal-at-cap';
+  writeHealWorkflow(wf, [{ id: 'find', prompt: 'Query Salesforce for prospects somehow.' }]);
+  const origId = `${wf}-run`;
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${origId}.json`),
+    JSON.stringify({ id: origId, workflow: wf, inputs: {}, status: 'completed' }), 'utf-8');
+  const fix = recordProposedFix(wf, origId, editStepDiagnosis('find'));
+  const max = workflowRunnerInternalsForTest.selfHealAutoMaxAttempts();
+
+  const out = workflowRunnerInternalsForTest.tryAutoHealAndRequeue({
+    run: { id: origId, workflow: wf, selfHealAttempt: max },
+    workflowSlug: wf,
+    steps: [{ id: 'find', prompt: 'x' }] as never,
+    diagnosis: editStepDiagnosis('find') as never,
+    proposedFix: fix,
+    completedStepIds: new Set(['find']),
+  });
+  assert.equal(out, null, 'at cap → does not auto-heal');
+  assert.equal(freshRunsFor(wf, origId).length, 0, 'no fresh run queued at cap');
+});
+
+test('self-heal: a completed UPSTREAM mutating step blocks auto re-run (no double side-effects)', () => {
+  const steps = [{ id: 'send', prompt: 'Send the emails.', requiresApproval: true }, { id: 'find', prompt: 'x' }];
+  // send (mutating) already completed → guard trips.
+  assert.equal(
+    workflowRunnerInternalsForTest.hasCompletedUpstreamMutation(steps as never, 'find', new Set(['send', 'find'])),
+    true,
+  );
+  // the blocked step itself being requiresApproval does NOT trip the guard.
+  assert.equal(
+    workflowRunnerInternalsForTest.hasCompletedUpstreamMutation(
+      [{ id: 'find', prompt: 'x', requiresApproval: true }] as never, 'find', new Set(['find'])),
+    false,
+  );
+});
+
+test('self-heal: a non-edit_step (reconnect) fix is never auto-applied', () => {
+  const wf = 'heal-reconnect';
+  writeHealWorkflow(wf, [{ id: 'find', prompt: 'x' }]);
+  const origId = `${wf}-run`;
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${origId}.json`),
+    JSON.stringify({ id: origId, workflow: wf, inputs: {}, status: 'completed' }), 'utf-8');
+  const fix = recordProposedFix(wf, origId, editStepDiagnosis('find', false, 'reconnect_service'));
+  const out = workflowRunnerInternalsForTest.tryAutoHealAndRequeue({
+    run: { id: origId, workflow: wf, selfHealAttempt: 0 },
+    workflowSlug: wf,
+    steps: [{ id: 'find', prompt: 'x' }] as never,
+    diagnosis: editStepDiagnosis('find', false, 'reconnect_service') as never,
+    proposedFix: fix,
+    completedStepIds: new Set(['find']),
+  });
+  assert.equal(out, null, 'reconnect_service escalates, never auto-applies');
+});
+
+test('self-heal: a completed upstream IRREVERSIBLE-SEND step (unmarked) blocks auto re-run', () => {
+  // Adversarial review B-1: requiresApproval alone is insufficient — an unmarked
+  // "send the emails" step that completed must still block a fresh re-run.
+  const steps = [{ id: 'send', prompt: 'Send the prospect emails to each contact.' }, { id: 'find', prompt: 'x' }];
+  assert.equal(
+    workflowRunnerInternalsForTest.hasCompletedUpstreamMutation(steps as never, 'find', new Set(['send', 'find'])),
+    true,
+  );
+  // A benign read upstream does NOT block.
+  const reads = [{ id: 'read', prompt: 'Read the prospect list from the sheet.' }, { id: 'find', prompt: 'x' }];
+  assert.equal(
+    workflowRunnerInternalsForTest.hasCompletedUpstreamMutation(reads as never, 'find', new Set(['read', 'find'])),
+    false,
+  );
 });

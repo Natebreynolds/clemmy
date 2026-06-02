@@ -405,6 +405,231 @@ export function listToolChoices(): ToolChoiceRecord[] {
 }
 
 // ─────────────────────────────────────────────────────────────────
+// Author-time binding — match a workflow STEP PROMPT to the proven
+// tool-choices the user has already taught Clem, so authoring bakes the
+// concrete command into the step instead of leaving it generic (which lets
+// the runtime agent re-decide and drift onto a stale/expired path).
+//
+// Scoring note: `jaccardOverlap` (used by recallToolChoice) compares two
+// SLUGS of similar size. A step prompt is a long sentence and a choice's
+// distinctive tokens are few — jaccard would score that near zero. So we use
+// CONTAINMENT: of the choice's distinctive tokens, what fraction appear in the
+// prompt. We also require at least one matched token to come from the choice's
+// CORE identity (intent slug / identifier), not just its description, so an
+// incidental description word can't trigger a bind.
+// ─────────────────────────────────────────────────────────────────
+
+/** Generic verbs/nouns that must never, on their own, anchor a step→choice
+ *  match. Service/tool names (salesforce, airtable, firecrawl, sf, …) are NOT
+ *  here — those are exactly the distinctive tokens we want to match on. */
+// Two filter sets, applied differently:
+//  - CORE (intent slug + identifier) keeps OPERATION tokens (query, list, soql,
+//    update, …) because in a slug like `salesforce.cli.query` the operation IS
+//    part of the tool's identity. It drops only true stopwords + tool-TYPE words
+//    (cli/mcp/api) that never appear in a step prompt. A match then needs ≥2 of
+//    these identity tokens (service + operation), so a lone service mention
+//    ("the salesforce dashboard") never binds.
+//  - CONTEXT (the free-text description) drops the broad generic set too, since
+//    in prose those words are noise, not identity.
+const STEP_MATCH_STOPWORDS = new Set<string>([
+  'the', 'for', 'and', 'via', 'using', 'use', 'from', 'into', 'with', 'all', 'then',
+  'this', 'that', 'each', 'about', 'your', 'their', 'a', 'an', 'of', 'to', 'in', 'on',
+  'at', 'by', 'or', 'as', 'is', 'it', 'new', 'step', 'workflow',
+  // tool-TYPE tokens describe HOW, not WHAT.
+  'cli', 'mcp', 'composio', 'api', 'sdk', 'rest', 'graphql', 'tool', 'tools',
+]);
+const STEP_MATCH_GENERIC_TOKENS = new Set<string>([
+  ...STEP_MATCH_STOPWORDS,
+  // generic verbs/objects: noise inside a free-text DESCRIPTION (kept in CORE).
+  'query', 'get', 'list', 'fetch', 'read', 'write', 'create', 'update', 'delete',
+  'run', 'call', 'data', 'records', 'record', 'find', 'search', 'pull', 'fetching',
+]);
+
+/** Word-tokenize free text (a step prompt) into a lowercase set, dropping
+ *  punctuation and very short tokens. (recall's `tokenize` only splits slugs
+ *  on `._-/`, so it can't tokenize a sentence — this is the prose counterpart.) */
+function wordTokens(text: string): Set<string> {
+  return new Set(
+    (text || '')
+      .toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .map((t) => t.trim())
+      .filter((t) => t.length >= 2),
+  );
+}
+
+/** CORE identity tokens of a choice: its intent slug + identifier, keeping
+ *  operation tokens (query/list/soql/…) and dropping only stopwords + tool-type
+ *  words. A match needs ≥2 of these (service + operation), so a lone service
+ *  mention can't bind. */
+function coreChoiceTokens(rec: ToolChoiceRecord): Set<string> {
+  const raw = new Set<string>([
+    ...tokenize(slugifyIntent(rec.intent)),
+    ...wordTokens(rec.choice?.identifier ?? ''),
+  ]);
+  const out = new Set<string>();
+  for (const t of raw) if (t.length >= 3 && !STEP_MATCH_STOPWORDS.has(t)) out.add(t);
+  return out;
+}
+
+/** CONTEXT tokens of a choice: its description words, minus generics. Used to
+ *  raise confidence but never sufficient alone to anchor a match. */
+function contextChoiceTokens(rec: ToolChoiceRecord): Set<string> {
+  const raw = wordTokens(rec.description ?? '');
+  const out = new Set<string>();
+  for (const t of raw) if (t.length >= 3 && !STEP_MATCH_GENERIC_TOKENS.has(t)) out.add(t);
+  return out;
+}
+
+export type StepToolChoiceTier = 'high' | 'medium';
+
+export interface StepToolChoiceMatch {
+  intent: string;
+  kind: ToolChoiceKind;
+  identifier: string;
+  invocationTemplate?: string;
+  /** Containment score in [0,1]: distinctive choice tokens present in the prompt. */
+  score: number;
+  tier: StepToolChoiceTier;
+  /** Distinctive tokens of the choice that were found in the step prompt. */
+  matched: string[];
+  /** The step prompt already embeds this choice's identifier/command — never re-bind. */
+  alreadyBound: boolean;
+  /** Whether this choice may be AUTO-bound (deterministic) vs ADVISE-only.
+   *  Only proven `cli`/`mcp` choices auto-bind; `composio` (identifier/connection
+   *  rot-prone, see stripBakedConnectionId) is always advise-only. */
+  autoBindable: boolean;
+  /** The `allowedTools` family this step should be locked to when bound. */
+  family: string[];
+  /** The concrete command/tool to bake into the bound step prompt. */
+  command: string;
+}
+
+export interface MatchToolChoicesOptions {
+  limit?: number;
+  /** Override the store read (tests). */
+  choices?: ToolChoiceRecord[];
+}
+
+/** Rank: lower = preferred. On a near-tie prefer cli/mcp over composio — routes
+ *  around a poisoned/mislabeled composio choice when a clean cli/mcp one exists. */
+function choiceKindRank(kind: ToolChoiceKind): number {
+  return kind === 'cli' ? 0 : kind === 'mcp' ? 1 : 2;
+}
+
+/** Does the prompt already embed this choice's concrete path? Uses whole-word
+ *  matching for short identifiers so a 2-char command like `sf` is NOT counted
+ *  as bound merely because it's a substring of "sale**sf**orce". */
+function promptAlreadyBinds(promptText: string, choice: ToolChoiceRecordChoice): boolean {
+  const lower = promptText.toLowerCase();
+  const words = wordTokens(promptText);
+  const id = (choice.identifier ?? '').toLowerCase();
+  // A distinctive identifier (≥5 chars, e.g. an mcp tool name) can match as a
+  // substring; a short one (sf, gh) must appear as a STANDALONE word.
+  if (id.length >= 5 && lower.includes(id)) return true;
+  if (id && words.has(id)) return true;
+  const tmpl = choice.invocationTemplate?.trim();
+  if (tmpl) {
+    const head = tmpl.split(/\s+/)[0]?.toLowerCase();
+    if (head && words.has(head)) return true; // command head as a standalone word
+    const slice = tmpl.slice(0, 24).toLowerCase();
+    if (slice.length >= 8 && lower.includes(slice)) return true; // embedded command
+  }
+  return false;
+}
+
+/**
+ * Match a workflow step prompt against the user's active remembered tool-choices.
+ * Returns the strongest matches (capped), each tagged with a confidence tier and
+ * whether it may be auto-bound. Pure apart from reading the tool-choice store.
+ */
+export function matchToolChoicesForStep(
+  promptText: string,
+  opts: MatchToolChoicesOptions = {},
+): StepToolChoiceMatch[] {
+  const limit = opts.limit ?? 3;
+  const prompt = wordTokens(promptText);
+  if (prompt.size === 0) return [];
+
+  let records: ToolChoiceRecord[];
+  try {
+    records = opts.choices ?? listToolChoices();
+  } catch {
+    return [];
+  }
+
+  const out: StepToolChoiceMatch[] = [];
+  for (const rec of records) {
+    if (!rec.choice) continue; // inactive (invalidated, not yet rediscovered)
+    const core = coreChoiceTokens(rec);
+    if (core.size === 0) continue;
+    const matchedCore = [...core].filter((t) => prompt.has(t));
+    const alreadyBound = promptAlreadyBinds(promptText, rec.choice);
+
+    // Precision: an embedded command is the strongest possible signal → always a
+    // match (the consumer skips it as already-bound). Otherwise require at least
+    // TWO CORE identity tokens (typically service + operation, e.g. "salesforce"
+    // AND "query") with a real anchor — so a lone service mention or an
+    // incidental shared description word can never trigger a bind.
+    if (!alreadyBound) {
+      if (matchedCore.length < 2) continue;
+      if (!matchedCore.some((t) => t.length >= 4)) continue;
+    }
+    // Containment score (for ranking only): how much of the choice's identity +
+    // description the prompt names. Description tokens only raise/lower the
+    // score; they never gate a match (that's the core-count rule above).
+    const distinctive = new Set<string>([...core, ...contextChoiceTokens(rec)]);
+    const matchedDistinctive = [...distinctive].filter((t) => prompt.has(t));
+    const score = alreadyBound ? 1 : matchedDistinctive.length / distinctive.size;
+
+    out.push({
+      intent: rec.intent,
+      kind: rec.choice.kind,
+      identifier: rec.choice.identifier,
+      invocationTemplate: rec.choice.invocationTemplate,
+      score,
+      // HIGH (auto-bind candidate) = ≥2 core identity tokens named (or an
+      // already-embedded command). cli/mcp at HIGH auto-bind; composio advises.
+      tier: alreadyBound || matchedCore.length >= 2 ? 'high' : 'medium',
+      matched: matchedDistinctive,
+      alreadyBound,
+      autoBindable: rec.choice.kind === 'cli' || rec.choice.kind === 'mcp',
+      family: toolFamilyForChoice(rec.choice),
+      command: boundCommandForChoice(rec.choice),
+    });
+  }
+
+  out.sort((a, b) => {
+    if (Math.abs(b.score - a.score) > 0.08) return b.score - a.score;
+    return choiceKindRank(a.kind) - choiceKindRank(b.kind);
+  });
+  return out.slice(0, limit);
+}
+
+/** The `allowedTools` family a step should be locked to when bound to a choice.
+ *  cli → run_shell_command; mcp → the mcp tool name; composio → the slug. */
+export function toolFamilyForChoice(choice: ToolChoiceRecordChoice): string[] {
+  switch (choice.kind) {
+    case 'cli':
+      return ['run_shell_command'];
+    case 'mcp':
+      return [choice.identifier];
+    case 'composio':
+      return ['composio_execute_tool'];
+    default:
+      return [];
+  }
+}
+
+/** The concrete, human-readable command/tool to bake into a bound step prompt. */
+export function boundCommandForChoice(choice: ToolChoiceRecordChoice): string {
+  if (choice.invocationTemplate && choice.invocationTemplate.trim().length > 0) {
+    return choice.invocationTemplate.trim();
+  }
+  return choice.identifier;
+}
+
+// ─────────────────────────────────────────────────────────────────
 // P2 — measured learning loop
 // ─────────────────────────────────────────────────────────────────
 
