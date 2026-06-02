@@ -320,7 +320,9 @@ async function routeWorkflowPendingInputs(
   }
 
   const merged = { ...have, ...cls.values };
-  const result = resumeWorkflowRun(workflowName, merged);
+  // Gap E: re-enter THIS chat session on the resumed run's outcome — it's the
+  // session that asked for the missing inputs and is waiting for the result.
+  const result = resumeWorkflowRun(workflowName, merged, { originSessionId: input.sessionId });
 
   if (result.status === 'queued' || result.status === 'duplicate') {
     supersedePlanProposal(openWf.id);

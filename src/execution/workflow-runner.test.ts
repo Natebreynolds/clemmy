@@ -44,7 +44,10 @@ const {
   executeStep,
   findContractViolationStep,
   describeStepNonCompletion,
+  enqueueWorkflowOutcomeTurn,
+  shouldNotifyCancelledRun,
 } = await import('./workflow-runner.js');
+const { SessionStore: RunnerSessionStore } = await import('../memory/session-store.js');
 const { readWorkflowEvents } = await import('./workflow-events.js');
 const { HarnessSession } = await import('../runtime/harness/session.js');
 const { resetEventLog } = await import('../runtime/harness/eventlog.js');
@@ -246,6 +249,65 @@ test('describeStepNonCompletion: an unknown future status still yields a non-emp
   const msg = describeStepNonCompletion('some_new_status');
   assert.ok(msg.length > 0);
   assert.match(msg, /some_new_status/);
+});
+
+// ---------------------------------------------------------------------------
+// Gap E — enqueueWorkflowOutcomeTurn: re-enter the origin chat in-context.
+// ---------------------------------------------------------------------------
+
+test('enqueueWorkflowOutcomeTurn: appends ONE role:user outcome turn to the origin session', () => {
+  enqueueWorkflowOutcomeTurn({ id: 'gapE-1', workflow: 'wf' as never, originSessionId: 'sessE1' }, 'My WF', 'done', 'the deliverable');
+  const turns = new RunnerSessionStore().get('sessE1').turns;
+  const mine = turns.filter((t: { text?: string }) => typeof t.text === 'string' && t.text.startsWith('[workflow run gapE-1 '));
+  assert.equal(mine.length, 1, 'exactly one outcome turn');
+  assert.equal(mine[0].role, 'user');
+  assert.match(mine[0].text, /completed]/);
+  assert.match(mine[0].text, /the deliverable/);
+});
+
+test('enqueueWorkflowOutcomeTurn: idempotent — a second call (drain retry / restart) does not double-post', () => {
+  enqueueWorkflowOutcomeTurn({ id: 'gapE-2', workflow: 'wf' as never, originSessionId: 'sessE2' }, 'My WF', 'done', 'r');
+  enqueueWorkflowOutcomeTurn({ id: 'gapE-2', workflow: 'wf' as never, originSessionId: 'sessE2' }, 'My WF', 'done', 'r');
+  const turns = new RunnerSessionStore().get('sessE2').turns;
+  assert.equal(turns.filter((t: { text?: string }) => typeof t.text === 'string' && t.text.startsWith('[workflow run gapE-2 ')).length, 1);
+});
+
+// shouldNotifyCancelledRun — backlog-spam guard (review must-fix #1)
+const NOW = 1_780_000_000_000;
+const isoAgo = (ms: number) => new Date(NOW - ms).toISOString();
+
+test('shouldNotifyCancelledRun: a RECENT, un-reported cancel → notify', () => {
+  assert.equal(shouldNotifyCancelledRun({ id: 'c1', finishedAt: isoAgo(60_000) }, NOW, new Set()), true);
+});
+
+test('shouldNotifyCancelledRun: a STALE cancel (older than 12h) → do NOT re-notify (the backlog-sweep bug)', () => {
+  assert.equal(shouldNotifyCancelledRun({ id: 'c2', finishedAt: isoAgo(6 * 24 * 60 * 60_000) }, NOW, new Set()), false);
+  // falls back to createdAt when finishedAt is absent
+  assert.equal(shouldNotifyCancelledRun({ id: 'c3', createdAt: isoAgo(13 * 60 * 60_000) }, NOW, new Set()), false);
+});
+
+test('shouldNotifyCancelledRun: an already-reported cancel → do NOT double-notify', () => {
+  assert.equal(shouldNotifyCancelledRun({ id: 'c4', finishedAt: isoAgo(60_000) }, NOW, new Set(['c4'])), false);
+});
+
+test('shouldNotifyCancelledRun: a recent cancel with an unparseable timestamp still notifies (fresh, not stale)', () => {
+  assert.equal(shouldNotifyCancelledRun({ id: 'c5' }, NOW, new Set()), true);
+});
+
+test('enqueueWorkflowOutcomeTurn: NO originSessionId → no-op (scheduled/cron stay notification-only)', () => {
+  // Must not throw and must not create a turn anywhere addressable.
+  assert.doesNotThrow(() => enqueueWorkflowOutcomeTurn({ id: 'gapE-3', workflow: 'wf' as never }, 'My WF', 'done', 'r'));
+});
+
+test('enqueueWorkflowOutcomeTurn: failed/blocked outcomes carry the right in-context guidance', () => {
+  enqueueWorkflowOutcomeTurn({ id: 'gapE-4', workflow: 'wf' as never, originSessionId: 'sessE4' }, 'My WF', 'failed', 'boom');
+  enqueueWorkflowOutcomeTurn({ id: 'gapE-5', workflow: 'wf' as never, originSessionId: 'sessE5' }, 'My WF', 'blocked', 'gap');
+  const f = new RunnerSessionStore().get('sessE4').turns.find((t: { text?: string }) => t.text?.startsWith('[workflow run gapE-4 '));
+  const b = new RunnerSessionStore().get('sessE5').turns.find((t: { text?: string }) => t.text?.startsWith('[workflow run gapE-5 '));
+  assert.match(f!.text, /FAILED]/);
+  assert.match(f!.text, /did NOT complete/i);
+  assert.match(b!.text, /needs attention]/);
+  assert.match(b!.text, /NEEDS ATTENTION/i);
 });
 
 test('planWorkflowExecutionBatches: fans out independent dependsOn branches', () => {

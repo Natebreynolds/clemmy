@@ -51,6 +51,27 @@ test('queueWorkflowRun: writes a queued run and dedupes identical inputs', () =>
   assert.equal(runFiles().length, 1);
 });
 
+test('queueWorkflowRun: writes originSessionId when provided (Gap E)', () => {
+  const r = queueWorkflowRun('audit-brief', { url: 'https://x.com' }, { originSessionId: 'sess-chat-1' });
+  assert.equal(r.status, 'queued');
+  const rec = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, runFiles()[0]), 'utf-8'));
+  assert.equal(rec.originSessionId, 'sess-chat-1');
+});
+
+test('queueWorkflowRun: omits originSessionId when absent → scheduled/dashboard records unchanged (Gap E)', () => {
+  queueWorkflowRun('audit-brief', { url: 'https://y.com' });
+  const rec = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, runFiles()[0]), 'utf-8'));
+  assert.ok(!('originSessionId' in rec), 'no origin → field is not written (notification-only run)');
+});
+
+test('resumeWorkflowRun: carries originSessionId through to the queued run (Gap E ask-then-resume)', () => {
+  writeAuditWorkflow();
+  const result = resumeWorkflowRun('audit-brief', { url: 'https://revill.co.uk' }, { originSessionId: 'sess-chat-2' });
+  assert.equal(result.status, 'queued');
+  const rec = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, runFiles()[0]), 'utf-8'));
+  assert.equal(rec.originSessionId, 'sess-chat-2');
+});
+
 test('resumeWorkflowRun: missing required input → missing_inputs, no queue', () => {
   writeAuditWorkflow();
   const result = resumeWorkflowRun('audit-brief', {});

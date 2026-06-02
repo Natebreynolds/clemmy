@@ -52,7 +52,12 @@ const DEFAULT_TERMINAL_UNNOTIFIED_STALL_MS = 3 * 60_000;
  */
 const DEFAULT_TERMINAL_UNNOTIFIED_MAX_MS = 12 * 60 * 60_000;
 
-const TERMINAL_STATUSES = new Set(['completed', 'error']);
+// 'cancelled' is terminal too: a cancelled run that lost its notification
+// (crash window, or a run cancelled while still queued) would otherwise never
+// be backstopped — the terminal_unnotified check only looks at this set. The
+// 12h MAX window + report-back dedup keep this from alerting on the historical
+// cancel backlog or on cancels that did notify.
+const TERMINAL_STATUSES = new Set(['completed', 'error', 'cancelled']);
 
 export interface WatchdogRunView {
   id: string;
@@ -154,18 +159,48 @@ export function dropReportedBackTerminalRuns(
  * reporting back). Best-effort: a corrupt/missing log yields an empty set, so
  * the watchdog falls back to the marker alone (prior behavior).
  */
-function collectReportedBackRunIds(): Set<string> {
+/** Pure: which runIds have a DELIVERED user notification in this log. Exported
+ *  for tests. A notification counts ONLY if it was actually delivered
+ *  (deliveredAt set or a non-empty deliveredDestinations) — a silent /
+ *  dashboard-only / never-delivered record (e.g. the runner's silenced
+ *  completion echo) must NOT mask a real report-back failure. Accepts BOTH
+ *  metadata.runId (the runner echo) and metadata.workflowRunId (a step's own
+ *  notify_user card), so a self-notifying run whose step delivered is correctly
+ *  counted while a silenced-but-undelivered echo is not. */
+export function reportedBackRunIdsFrom(
+  notifications: Array<{ id?: string; deliveredAt?: string; deliveredDestinations?: string[]; metadata?: Record<string, unknown> }>,
+): Set<string> {
   const out = new Set<string>();
-  try {
-    for (const n of loadNotifications()) {
-      if (typeof n.id === 'string' && n.id.startsWith('workflow-stalled-')) continue;
-      const runId = n.metadata?.runId;
-      if (typeof runId === 'string' && runId) out.add(runId);
+  for (const n of notifications) {
+    // Exclude LIFECYCLE / non-outcome records that reference a runId but are NOT
+    // the run reporting its terminal result: the watchdog's own stalled alert,
+    // the "still running" heartbeat, and the parked approval / recovery card.
+    // Otherwise a delivered heartbeat or approval card would mask a genuinely
+    // lost completion notification (the exact silent loss this backstop exists
+    // to catch).
+    if (typeof n.id === 'string' && (
+      n.id.startsWith('workflow-stalled-') ||
+      n.id.startsWith('workflow-heartbeat-') ||
+      n.id.startsWith('approval-')
+    )) continue;
+    if (n.metadata?.heartbeat === true) continue;
+    const delivered = Boolean(n.deliveredAt) || (Array.isArray(n.deliveredDestinations) && n.deliveredDestinations.length > 0);
+    if (!delivered) continue;
+    for (const key of ['runId', 'workflowRunId'] as const) {
+      const id = n.metadata?.[key];
+      if (typeof id === 'string' && id) out.add(id);
     }
-  } catch {
-    // Best-effort — never let a bad notification log break the watchdog.
   }
   return out;
+}
+
+function collectReportedBackRunIds(): Set<string> {
+  try {
+    return reportedBackRunIdsFrom(loadNotifications());
+  } catch {
+    // Best-effort — never let a bad notification log break the watchdog.
+    return new Set<string>();
+  }
 }
 
 /**

@@ -555,7 +555,13 @@ export function registerOrchestrationTools(server: McpServer): void {
         );
       }
 
-      return textResult(queueWorkflowRun(name, normalizedInputs).message);
+      // Gap E: carry the triggering chat session so the run re-enters it on a
+      // terminal state (in-context report-back, in ADDITION to the global
+      // notification). guardCtx is the agent's tool-output context resolved
+      // above; absent for non-chat callers → notification-only.
+      return textResult(
+        queueWorkflowRun(name, normalizedInputs, { originSessionId: guardCtx?.sessionId }).message,
+      );
     },
   );
 

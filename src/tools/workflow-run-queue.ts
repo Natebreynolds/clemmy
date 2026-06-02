@@ -68,7 +68,18 @@ export interface QueueWorkflowRunResult {
  * raw queue primitive). Returns a duplicate result without queueing when an
  * identical run is already queued/running.
  */
-export function queueWorkflowRun(name: string, normalizedInputs: Record<string, string>): QueueWorkflowRunResult {
+export interface QueueWorkflowRunOptions {
+  /** Gap E: the chat/agent session that should hear the outcome in-context.
+   *  Written into the run record so the runner re-enters it on a terminal
+   *  state. Omit for scheduled/cron/dashboard/webhook runs (notification-only). */
+  originSessionId?: string;
+}
+
+export function queueWorkflowRun(
+  name: string,
+  normalizedInputs: Record<string, string>,
+  opts?: QueueWorkflowRunOptions,
+): QueueWorkflowRunResult {
   ensureDir(WORKFLOW_RUNS_DIR);
   const duplicate = findDuplicateQueuedWorkflowRun(name, normalizedInputs);
   if (duplicate) {
@@ -79,6 +90,7 @@ export function queueWorkflowRun(name: string, normalizedInputs: Record<string, 
     };
   }
   const id = `${Date.now()}-${randomBytes(3).toString('hex')}`;
+  const origin = opts?.originSessionId?.trim();
   writeFileSync(
     path.join(WORKFLOW_RUNS_DIR, `${id}.json`),
     JSON.stringify({
@@ -87,6 +99,9 @@ export function queueWorkflowRun(name: string, normalizedInputs: Record<string, 
       inputs: normalizedInputs,
       status: 'queued',
       createdAt: new Date().toISOString(),
+      // Only written when present → scheduled/dashboard/webhook records are
+      // byte-identical to before (no origin → notification-only).
+      ...(origin ? { originSessionId: origin } : {}),
     }, null, 2),
     'utf-8',
   );
@@ -106,7 +121,11 @@ export interface ResumeWorkflowRunResult {
  * either queues it or reports exactly which inputs are still missing — so the
  * caller can re-ask without ever falling back into a model-driven retry loop.
  */
-export function resumeWorkflowRun(name: string, rawInputs: Record<string, string>): ResumeWorkflowRunResult {
+export function resumeWorkflowRun(
+  name: string,
+  rawInputs: Record<string, string>,
+  opts?: QueueWorkflowRunOptions,
+): ResumeWorkflowRunResult {
   const workflow = listWorkflows().find((entry) => entry.data.name === name);
   if (!workflow) return { status: 'not_found', message: `Workflow "${name}" not found.` };
   if (!workflow.data.enabled) return { status: 'disabled', message: `Workflow "${name}" is disabled.` };
@@ -115,7 +134,7 @@ export function resumeWorkflowRun(name: string, rawInputs: Record<string, string
   if (missing.length > 0) {
     return { status: 'missing_inputs', missing, message: `Still missing: ${missing.join(', ')}.` };
   }
-  const queued = queueWorkflowRun(name, normalized);
+  const queued = queueWorkflowRun(name, normalized, opts);
   return { status: queued.status, id: queued.id, message: queued.message };
 }
 

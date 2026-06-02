@@ -50,6 +50,8 @@ import { missingWorkflowRunInputs, normalizeWorkflowRunInputs } from './workflow
 import { verifyStepOutput } from './step-output-verify.js';
 import { judgeWorkflowTarget, type WorkflowTargetVerdict } from './workflow-objective-judge.js';
 import { judgeStepSkillExecution } from './workflow-step-judge.js';
+import { SessionStore } from '../memory/session-store.js';
+import { reportedBackRunIdsFrom } from './workflow-watchdog.js';
 
 const logger = pino({ name: 'clementine-next.workflow-runner' });
 
@@ -214,6 +216,15 @@ interface QueuedRunRecord {
   startedAt?: string;
   finishedAt?: string;
   source?: string;
+  /**
+   * Gap E — chat re-entry. Set ONLY when a workflow run was triggered from a
+   * chat/agent session that should hear the outcome in-context. On a terminal
+   * state the runner appends a synthetic turn to this session (mirrors
+   * background-task report-back). Absent for scheduled/cron/dashboard/webhook
+   * runs → those stay notification-only (the global notification still fires
+   * for ALL runs regardless).
+   */
+  originSessionId?: string;
   stepOutputs?: Record<string, unknown>;
   output?: string;
   error?: string;
@@ -2044,6 +2055,106 @@ function renderStepContextBlock(ctx: { values: Record<string, unknown>; upstream
   ].join('\n');
 }
 
+/**
+ * A run cancelled while still queued (or a mid-flight cancel whose notification
+ * was lost to a crash) is skipped by the drain status filter and would never
+ * report back. Surface it ONCE — north-star: reports back without fail.
+ * markRunNotified + the !notifiedAt guard make it idempotent; best-effort so a
+ * notify hiccup never breaks the drain (the watchdog backstops an unmarked one).
+ */
+/**
+ * Gap E — re-enter the origin chat on a terminal state. Mirrors
+ * enqueueBackgroundTaskOutcomeTurn: appends ONE synthetic role:'user' turn to
+ * the triggering chat session so Clementine continues in-context (read via
+ * recentTranscript on the session's next turn). This is IN ADDITION to the
+ * global notification — it never replaces it. No-op when the run carries no
+ * originSessionId (scheduled/cron/dashboard/webhook → notification-only).
+ * Idempotent (id-prefix scan survives drain retries / restarts) and fully
+ * best-effort: a session-write hiccup can NEVER fail a completed run or its
+ * notification.
+ */
+export function enqueueWorkflowOutcomeTurn(
+  run: QueuedRunRecord,
+  workflowName: string,
+  outcome: 'done' | 'blocked' | 'failed',
+  detail: string,
+): void {
+  try {
+    const sessionId = run.originSessionId;
+    if (!sessionId) return;
+    const idPrefix = `[workflow run ${run.id} `;
+    const store = new SessionStore();
+    const existing = store.get(sessionId);
+    if (existing.turns.some((t) => typeof t.text === 'string' && t.text.startsWith(idPrefix))) {
+      return; // already reported — idempotent across retries / daemon restarts
+    }
+    const head =
+      outcome === 'done' ? `${idPrefix}completed]`
+        : outcome === 'failed' ? `${idPrefix}FAILED]`
+          : `${idPrefix}needs attention]`;
+    const guidance =
+      outcome === 'done'
+        ? `The workflow you started ran in the background and just finished — continue from here. Full result via workflow_run_status run_id="${run.id}".`
+        : outcome === 'failed'
+          ? `The workflow you started FAILED — it did NOT complete. Decide whether to retry or tell the user; do not assume success. Details via workflow_run_status run_id="${run.id}".`
+          : `The workflow you started completed but NEEDS ATTENTION (a step blocked or the target check flagged a gap). Review and decide next steps. Details via workflow_run_status run_id="${run.id}".`;
+    const preview = detail.length > 1500 ? `${detail.slice(0, 1500)}\n…[truncated]` : detail;
+    const text = `${head} ${workflowName}\n\n${preview}\n\n(${guidance})`;
+    store.appendTurn(sessionId, { role: 'user', text, createdAt: new Date().toISOString() });
+    logger.info({ runId: run.id, sessionId, outcome }, 'Workflow outcome enqueued into origin chat session');
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : err, runId: run.id },
+      'enqueueWorkflowOutcomeTurn failed (best-effort; run + notification unaffected)',
+    );
+  }
+}
+
+// A daemon restart drains EVERY run file, so the cancelled-notify path must not
+// re-ping the backlog: skip a STALE cancel (older than this window) or one that
+// already reported back, mirroring the watchdog's two guards. Matches
+// DEFAULT_TERMINAL_UNNOTIFIED_MAX_MS so the drain path + watchdog agree.
+const CANCEL_NOTIFY_MAX_AGE_MS = 12 * 60 * 60_000;
+
+/** Pure: should the drain path post a cancelled-run notification? NO for a
+ *  STALE cancel (older than the window — e.g. a backlog file swept on restart)
+ *  or one that already reported back. Exported for tests. */
+export function shouldNotifyCancelledRun(
+  run: { id: string; finishedAt?: string; createdAt?: string },
+  nowMs: number,
+  reportedBackRunIds: Set<string>,
+): boolean {
+  const ts = Date.parse(run.finishedAt ?? run.createdAt ?? '');
+  const stale = Number.isFinite(ts) && nowMs - ts > CANCEL_NOTIFY_MAX_AGE_MS;
+  return !stale && !reportedBackRunIds.has(run.id);
+}
+
+function notifyCancelledRunOnce(filePath: string, run: QueuedRunRecord): void {
+  try {
+    let reported = new Set<string>();
+    try {
+      reported = reportedBackRunIdsFrom(loadNotifications());
+    } catch { /* best-effort: a bad notification log must not block the cancel notify */ }
+    if (shouldNotifyCancelledRun(run, Date.now(), reported)) {
+      addNotification({
+        // Stable id → addNotification id-dedup makes this at-most-once even if
+        // the drain re-reads the file or the catch-handler also posts a cancel
+        // card for the same run.
+        id: `workflow-${run.id}-cancelled`,
+        kind: 'workflow',
+        title: `Workflow cancelled: ${run.workflow}`,
+        body: 'This workflow run was cancelled.',
+        createdAt: new Date().toISOString(),
+        read: false,
+        metadata: { workflow: run.workflow, runId: run.id, status: 'cancelled' },
+      });
+    }
+    // Stamp the marker either way so a stale/already-reported file isn't
+    // re-checked every drain tick (and the watchdog skips it too).
+    markRunNotified(filePath);
+  } catch { /* best-effort; the watchdog backstops an unmarked terminal run */ }
+}
+
 async function drainWorkflowRuns(assistant: ClementineAssistant): Promise<void> {
   const workflows = listWorkflows();
   const eligible: Array<{ file: string; filePath: string; run: QueuedRunRecord }> = [];
@@ -2051,6 +2162,12 @@ async function drainWorkflowRuns(assistant: ClementineAssistant): Promise<void> 
     const filePath = path.join(WORKFLOW_RUNS_DIR, file);
     const run = readRunRecord(filePath);
     if (!run) continue;
+    // A cancelled run never enters processOneRunFile (skipped just below), so
+    // notify it here once before dropping it — otherwise a queued-then-cancelled
+    // run (or a mid-flight cancel whose notify was lost) goes silent.
+    if (run.status === 'cancelled' && !run.notifiedAt) {
+      notifyCancelledRunOnce(filePath, run);
+    }
     // Pick up queued runs and runs marked as running but never
     // completed (resume after daemon restart).
     if (run.status && run.status !== 'queued' && run.status !== 'running') continue;
@@ -2352,6 +2469,15 @@ async function processOneRunFile(
           outputPreview: `${(needsAttention ? outcome.body : successBody)}${advisorySummary}`.slice(0, 800),
         });
       } catch { /* best-effort */ }
+      // Gap E: re-enter the origin chat in-context (no-op for scheduled/cron).
+      // needs-attention OR a quality advisory → 'blocked' so Clem knows to
+      // review; a clean run → 'done'.
+      enqueueWorkflowOutcomeTurn(
+        run,
+        workflow.data.name,
+        needsAttention || hasAdvisories ? 'blocked' : 'done',
+        `${needsAttention ? outcome.body : successBody}${advisorySummary}`,
+      );
       logger.info({ workflow: workflow.data.name, runId: run.id, partialFailures: forEachFailures.length, blockedSteps: blockedSteps.length, advisories: qualityAdvisories.length, diagnosed: !!diagnosis }, 'Workflow run completed');
     } catch (error) {
       // P0 parking: the run paused on a human approval. Checkpoint the
@@ -2370,6 +2496,26 @@ async function processOneRunFile(
           startedAt: run.startedAt ?? new Date().toISOString(),
           parked: { parkedSteps: error.parkedSteps, parkedAt },
         });
+        // Belt-and-suspenders: the user-facing approval ask is normally posted
+        // upstream in runStepViaHarness, but that post is gated + best-effort.
+        // Re-emit it here with the SAME stable id `approval-<approvalId>` so
+        // addNotification dedupes to a no-op when the upstream card landed, and
+        // a RECOVERY post when it didn't — so a parked run never goes silent
+        // until the 1h watchdog floor. (Not markRunNotified: parked isn't
+        // terminal; the run resumes and reports back on completion.)
+        for (const approvalId of approvalIds) {
+          try {
+            addNotification({
+              id: `approval-${approvalId}`,
+              kind: 'approval',
+              title: `Workflow ${workflow.data.name} needs approval`,
+              body: `This workflow is parked until you respond. Reply \`approve ${approvalId}\` or \`reject ${approvalId}\`.`,
+              createdAt: new Date().toISOString(),
+              read: false,
+              metadata: { approvalId, runId: run.id, workflowName: workflow.data.name },
+            });
+          } catch { /* best-effort recovery card — never block parking */ }
+        }
         try {
           finishRun(run.id, {
             status: 'awaiting_approval',
@@ -2448,7 +2594,10 @@ async function processOneRunFile(
         }
       }
       addNotification({
-        id: `${Date.now()}-workflow-${run.id}-${cancelled ? 'cancelled' : 'error'}`,
+        // Stable id (terminal state fires once per run): addNotification
+        // id-dedup makes this at-most-once and shares the cancelled id with the
+        // drain-path helper so the two can never double-post the same cancel.
+        id: `workflow-${run.id}-${cancelled ? 'cancelled' : 'error'}`,
         kind: 'workflow',
         title: healTitle ?? (cancelled ? `Workflow cancelled: ${run.workflow}` : `Workflow failed: ${run.workflow}`),
         body: healBody ?? message,
@@ -2462,6 +2611,12 @@ async function processOneRunFile(
         },
       });
       markRunNotified(filePath);
+      // Gap E: re-enter the origin chat on a genuine FAILURE (no-op for
+      // scheduled/cron). Skip a user-initiated CANCEL — the user already knows
+      // (mirrors background-tasks skipping aborted).
+      if (!cancelled) {
+        enqueueWorkflowOutcomeTurn(run, run.workflow, 'failed', healBody ?? message);
+      }
       try {
         finishRun(run.id, {
           status: cancelled ? 'cancelled' : 'failed',

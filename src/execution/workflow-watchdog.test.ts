@@ -9,6 +9,7 @@ import assert from 'node:assert/strict';
 import {
   findStalledRuns,
   dropReportedBackTerminalRuns,
+  reportedBackRunIdsFrom,
   type WatchdogRunView,
   type StalledRun,
 } from './workflow-watchdog.js';
@@ -138,6 +139,22 @@ test('does NOT flag a terminal run that WAS notified', () => {
   assert.equal(findStalledRuns(runs, T0, { queuedStallMs: FIVE_MIN }).length, 0);
 });
 
+test('flags a CANCELLED run that was never notified (was an uncovered terminal state)', () => {
+  const runs: WatchdogRunView[] = [
+    { id: 'tc', workflow: 'wf', status: 'cancelled', finishedAt: iso(10 * 60_000) },
+  ];
+  const stalled = findStalledRuns(runs, T0, { queuedStallMs: FIVE_MIN });
+  assert.equal(stalled.length, 1);
+  assert.equal(stalled[0].reason, 'terminal_unnotified');
+});
+
+test('does NOT flag a cancelled run that WAS notified', () => {
+  const runs: WatchdogRunView[] = [
+    { id: 'tc2', workflow: 'wf', status: 'cancelled', finishedAt: iso(10 * 60_000), notifiedAt: iso(10 * 60_000) },
+  ];
+  assert.equal(findStalledRuns(runs, T0, { queuedStallMs: FIVE_MIN }).length, 0);
+});
+
 test('does NOT flag a just-finished terminal run (notify may still be landing this tick)', () => {
   const runs: WatchdogRunView[] = [
     { id: 't4', workflow: 'wf', status: 'completed', finishedAt: iso(30_000) },
@@ -188,4 +205,62 @@ test('dropReportedBackTerminalRuns: never suppresses queued/parked reasons even 
   ];
   const kept = dropReportedBackTerminalRuns(stalled, new Set(['shared', 'shared2']));
   assert.equal(kept.length, 2);
+});
+
+// ── delivery-aware ground truth: only a DELIVERED notification counts (GAP #1) ──
+
+test('reportedBackRunIdsFrom: a DELIVERED notification counts as reported-back', () => {
+  const ids = reportedBackRunIdsFrom([
+    { id: 'n1', deliveredAt: iso(0), metadata: { runId: 'r1' } },
+    { id: 'n2', deliveredDestinations: ['discord'], metadata: { runId: 'r2' } },
+  ]);
+  assert.ok(ids.has('r1') && ids.has('r2'));
+});
+
+test('reportedBackRunIdsFrom: a SILENT/UNDELIVERED notification does NOT count (no masking the silent loss)', () => {
+  // The runner's silenced completion echo: carries runId but was never delivered.
+  const ids = reportedBackRunIdsFrom([
+    { id: 'echo', metadata: { runId: 'lost' } }, // no deliveredAt, no destinations
+    { id: 'echo2', deliveredDestinations: [], metadata: { runId: 'lost2' } },
+  ]);
+  assert.ok(!ids.has('lost') && !ids.has('lost2'), 'undelivered records must not satisfy ground truth');
+});
+
+test('reportedBackRunIdsFrom: accepts a step notify_user card keyed by workflowRunId', () => {
+  const ids = reportedBackRunIdsFrom([
+    { id: 'step', deliveredAt: iso(0), metadata: { source: 'notify_user_tool', workflowRunId: 'wfr' } },
+  ]);
+  assert.ok(ids.has('wfr'), 'a delivered step card (workflowRunId) proves the run reported back');
+});
+
+test('reportedBackRunIdsFrom: ignores the watchdog\'s own stalled alerts', () => {
+  const ids = reportedBackRunIdsFrom([
+    { id: 'workflow-stalled-xyz', deliveredAt: iso(0), metadata: { runId: 'xyz' } },
+  ]);
+  assert.ok(!ids.has('xyz'), 'the watchdog alert is not the run reporting back');
+});
+
+test('reportedBackRunIdsFrom: a delivered HEARTBEAT does not count as report-back (no masking a lost terminal result)', () => {
+  const ids = reportedBackRunIdsFrom([
+    { id: 'workflow-heartbeat-run9-2', deliveredAt: iso(0), metadata: { runId: 'run9', heartbeat: true } },
+  ]);
+  assert.ok(!ids.has('run9'), 'a "still running" ping is not the run reporting its outcome');
+});
+
+test('reportedBackRunIdsFrom: a delivered APPROVAL/recovery card does not count as report-back', () => {
+  const ids = reportedBackRunIdsFrom([
+    { id: 'approval-apr123', deliveredAt: iso(0), metadata: { runId: 'run10' } },
+  ]);
+  assert.ok(!ids.has('run10'), 'a parked approval card is not a terminal outcome');
+});
+
+test('reportedBackRunIdsFrom + dropReportedBackTerminalRuns: silenced undelivered echo no longer masks a genuine loss', () => {
+  const reported = reportedBackRunIdsFrom([
+    { id: 'silenced-echo', metadata: { runId: 'self-notify-run' } }, // silent + undelivered
+  ]);
+  const stalled: StalledRun[] = [
+    { id: 'self-notify-run', workflow: 'wf', ageMs: 8 * 60_000, reason: 'terminal_unnotified' },
+  ];
+  // Before the fix the undelivered echo would have masked this; now it's KEPT.
+  assert.deepEqual(dropReportedBackTerminalRuns(stalled, reported).map((r) => r.id), ['self-notify-run']);
 });
