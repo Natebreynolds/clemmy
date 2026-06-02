@@ -48,6 +48,18 @@ export interface SkillSourceMeta {
   sha?: string;
   /** ISO-8601 timestamp. */
   installedAt?: string;
+  // ── Update-check state (written by recordSkillUpdateCheck) ──────
+  // These are refreshed by the daily poll / manual "check for updates"
+  // and read by the dashboard to render an "update available" badge.
+  // They are intentionally NOT part of the install payload — a fresh
+  // install/update writes only {repo, pathInRepo, sha, installedAt},
+  // which clears any stale update flag.
+  /** Remote default-branch HEAD SHA observed at the last check. */
+  latestRemoteSha?: string;
+  /** True when latestRemoteSha differs from the installed sha. */
+  updateAvailable?: boolean;
+  /** ISO-8601 timestamp of the last successful remote check. */
+  lastCheckedAt?: string;
 }
 
 export interface Skill {
@@ -268,6 +280,36 @@ export function uninstallSkill(name: string): boolean {
   if (!existsSync(dir)) return false;
   rmSync(dir, { recursive: true, force: true });
   return true;
+}
+
+/**
+ * Persist the result of a remote update check into the skill's
+ * `.clementine-source.json`. Merges into the existing metadata so the
+ * install provenance (repo/pathInRepo/sha/installedAt) is preserved.
+ *
+ * No-op when the skill has no source file (a manually dropped-in skill
+ * with no upstream to check) or the name is unsafe — there's nothing to
+ * update against in those cases.
+ */
+export function recordSkillUpdateCheck(
+  name: string,
+  patch: { latestRemoteSha?: string; updateAvailable?: boolean; lastCheckedAt: string },
+): void {
+  if (!isSafeSkillName(name)) return;
+  const dir = path.join(SKILLS_DIR, name);
+  const existing = readSourceMeta(dir);
+  if (!existing) return;
+  // Always stamp lastCheckedAt. But only overwrite the update verdict
+  // when we actually resolved a remote SHA — an unreachable remote
+  // (offline, rate-limited, private w/o gh auth) is "unknown", NOT "up
+  // to date". Clobbering a previously-detected update to false on a
+  // transient failure would silently drop the user's UPDATE badge.
+  const next: SkillSourceMeta = { ...existing, lastCheckedAt: patch.lastCheckedAt };
+  if (patch.latestRemoteSha !== undefined) {
+    next.latestRemoteSha = patch.latestRemoteSha;
+    next.updateAvailable = patch.updateAvailable ?? false;
+  }
+  writeSourceMeta(dir, next);
 }
 
 /**

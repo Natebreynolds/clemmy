@@ -100,7 +100,7 @@ import { loadPlugins, PLUGINS_DIR } from '../plugins/loader.js';
 import { loadUserProfile, saveUserProfile } from '../runtime/user-profile.js';
 import { getOrRefreshScan, probe, readCachedScan } from '../runtime/cli-discovery.js';
 import { SKILLS_DIR, listSkills, uninstallSkill } from '../memory/skill-store.js';
-import { getSkillInstallJob, startSkillInstall } from '../runtime/skill-installer.js';
+import { checkAllSkillUpdates, getSkillInstallJob, startSkillInstall, startSkillUpdate } from '../runtime/skill-installer.js';
 import { getProactivityPolicySnapshot, loadProactivityPolicy, saveProactivityPolicy } from '../agents/proactivity-policy.js';
 import { getAuthStatus, loginWithNativeOAuth } from '../runtime/auth-store.js';
 import { getSecretStore, listSecretDescriptors, type SecretName } from '../runtime/secrets/index.js';
@@ -2692,6 +2692,34 @@ export function registerConsoleRoutes(
       res.json({ ok: true, name });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // Check every installed skill against its source repo (cheap: one
+  // `git ls-remote` per unique repo, no clone). Persists the result into
+  // each skill's source metadata so GET /skills surfaces the badge.
+  // Registered before the parameterized routes so the literal path wins.
+  app.post('/api/console/skills/check-updates', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const summary = await checkAllSkillUpdates();
+      res.json(summary);
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // Re-pull a single installed skill from its source repo. Returns an
+  // install job; poll via GET /api/console/skills/install/:id (shared
+  // job map). Applying an update is an explicit user action — the daily
+  // poll only detects, it never mutates.
+  app.post('/api/console/skills/:name/update', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const job = startSkillUpdate(req.params.name);
+      res.json({ job });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
     }
   });
 

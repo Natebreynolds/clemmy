@@ -7,7 +7,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { normalizeRepoUrl } from './skill-installer.js';
+import { normalizeRepoUrl, deriveUpdateAvailable } from './skill-installer.js';
 
 test('normalizeRepoUrl: full https URL', () => {
   const r = normalizeRepoUrl('https://github.com/nutlope/hallmark');
@@ -101,4 +101,26 @@ test('normalizeRepoUrl: rejects random URL', () => {
 
 test('normalizeRepoUrl: rejects non-github https URL', () => {
   assert.throws(() => normalizeRepoUrl('https://gitlab.com/owner/repo'), /Unsupported/);
+});
+
+// ── deriveUpdateAvailable — the honest "is there an update" signal ──
+
+test('deriveUpdateAvailable: differing shas → update available', () => {
+  assert.equal(deriveUpdateAvailable('aaa111', 'bbb222'), true);
+});
+
+test('deriveUpdateAvailable: identical shas → no update', () => {
+  assert.equal(deriveUpdateAvailable('aaa111', 'aaa111'), false);
+});
+
+test('deriveUpdateAvailable: missing remote sha → no update (can\'t claim one)', () => {
+  assert.equal(deriveUpdateAvailable('aaa111', undefined), false);
+});
+
+test('deriveUpdateAvailable: missing installed baseline → no update', () => {
+  assert.equal(deriveUpdateAvailable(undefined, 'bbb222'), false);
+});
+
+test('deriveUpdateAvailable: both missing → no update', () => {
+  assert.equal(deriveUpdateAvailable(undefined, undefined), false);
 });

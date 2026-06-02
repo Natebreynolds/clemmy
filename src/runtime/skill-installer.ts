@@ -5,9 +5,12 @@ import path from 'node:path';
 import {
   discoverSkillsInRepo,
   installSkillFromDir,
+  listSkills,
+  loadSkill,
+  recordSkillUpdateCheck,
   type Skill,
 } from '../memory/skill-store.js';
-import { getGitHubCliStatus } from '../integrations/github-cli.js';
+import { getGitHubCliStatus, runGitHubCli } from '../integrations/github-cli.js';
 import { findSafeCliCommand } from './cli-discovery.js';
 
 /**
@@ -34,6 +37,15 @@ export interface SkillInstallJob {
   error?: string;
   sha?: string;
   cloneMethod?: 'git' | 'gh';
+  /**
+   * 'install' (default) installs every skill discovered in the repo;
+   * 'update' re-pulls a single already-installed skill (scoped to its
+   * recorded pathInRepo) so siblings the user uninstalled aren't
+   * resurrected.
+   */
+  mode?: 'install' | 'update';
+  /** For mode==='update': the skill being refreshed. */
+  target?: string;
 }
 
 const jobs = new Map<string, SkillInstallJob>();
@@ -115,6 +127,21 @@ export function normalizeRepoUrl(input: string): { url: string; basename: string
   );
 }
 
+/**
+ * Env for spawning git in automation: never prompt for credentials or
+ * host-key confirmation, and fail fast on SSH so a misconfigured key
+ * can't hang behind our timeout. Applied to every git spawn here — the
+ * installer runs headless under the daemon, where an interactive prompt
+ * would mean a guaranteed (bounded) stall.
+ */
+function nonInteractiveGitEnv(): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    GIT_TERMINAL_PROMPT: '0',
+    GIT_SSH_COMMAND: 'ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new',
+  };
+}
+
 function runGit(args: string[], cwd: string, onChunk: (s: string) => void, timeoutMs: number): Promise<{ code: number }> {
   return new Promise((resolve) => {
     const git = findSafeCliCommand('git');
@@ -125,7 +152,7 @@ function runGit(args: string[], cwd: string, onChunk: (s: string) => void, timeo
       return;
     }
     let settled = false;
-    const child = spawn(git.command, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(git.command, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'], env: nonInteractiveGitEnv() });
     child.stdout.on('data', (b: Buffer) => onChunk(b.toString('utf-8')));
     child.stderr.on('data', (b: Buffer) => onChunk(b.toString('utf-8')));
     const timer = setTimeout(() => {
@@ -159,7 +186,7 @@ async function readGitSha(cwd: string): Promise<string | undefined> {
       return;
     }
     let out = '';
-    const child = spawn(git.command, ['rev-parse', 'HEAD'], { cwd, stdio: ['ignore', 'pipe', 'ignore'] });
+    const child = spawn(git.command, ['rev-parse', 'HEAD'], { cwd, stdio: ['ignore', 'pipe', 'ignore'], env: nonInteractiveGitEnv() });
     child.stdout.on('data', (b: Buffer) => { out += b.toString('utf-8'); });
     child.on('close', (code) => resolve(code === 0 ? out.trim() : undefined));
     child.on('error', () => resolve(undefined));
@@ -193,7 +220,16 @@ export function startSkillInstall(rawUrl: string): SkillInstallJob {
   return job;
 }
 
-async function runInstall(job: SkillInstallJob, url: string, basename: string, ghRepo?: string): Promise<void> {
+async function runInstall(
+  job: SkillInstallJob,
+  url: string,
+  basename: string,
+  ghRepo?: string,
+  // When set (mode==='update'), install ONLY the discovered skill whose
+  // pathInRepo matches — re-pulling one skill from a bundled repo without
+  // touching its siblings.
+  filter?: { pathInRepo: string; installName: string },
+): Promise<void> {
   const tmpRoot = mkdtempSync(path.join(os.tmpdir(), 'clemmy-skill-install-'));
   try {
     job.status = 'cloning';
@@ -227,7 +263,7 @@ async function runInstall(job: SkillInstallJob, url: string, basename: string, g
     appendOutput(job, `\nCloned at SHA ${job.sha ?? '(unknown)'}\n`);
 
     job.status = 'discovering';
-    const discovered = discoverSkillsInRepo(tmpRoot, basename);
+    let discovered = discoverSkillsInRepo(tmpRoot, basename);
     if (discovered.length === 0) {
       job.status = 'failed';
       job.error = 'No SKILL.md found in repo (looked at root, skills/, and .claude/skills/).';
@@ -235,6 +271,28 @@ async function runInstall(job: SkillInstallJob, url: string, basename: string, g
       appendOutput(job, `\nNo skills found. A valid skill repo has SKILL.md at the root or inside a skills/<name>/ folder.\n`);
       return;
     }
+
+    // Update mode: narrow to the single skill we're refreshing. Match on
+    // pathInRepo (the stable identifier across re-clones); fall back to
+    // installName so a root-level skill renamed at install time still
+    // resolves. If the path vanished upstream, fail loudly rather than
+    // silently reinstalling a sibling.
+    if (filter) {
+      const wantPath = filter.pathInRepo || '';
+      const match = discovered.find((d) => (d.pathInRepo || '') === wantPath)
+        ?? discovered.find((d) => d.installName === filter.installName);
+      if (!match) {
+        job.status = 'failed';
+        job.error = `Skill "${filter.installName}" (path "${wantPath || 'root'}") was not found in the repo at HEAD — it may have been moved or removed upstream.`;
+        job.completedAt = new Date().toISOString();
+        appendOutput(job, `\n${job.error}\n`);
+        return;
+      }
+      // Pin the install name to what's already on disk so the update
+      // overwrites the existing skill rather than creating a renamed copy.
+      discovered = [{ ...match, installName: filter.installName }];
+    }
+
     appendOutput(job, `\nDiscovered ${discovered.length} skill${discovered.length === 1 ? '' : 's'}:\n`);
     for (const d of discovered) appendOutput(job, `  - ${d.installName} (${d.pathInRepo || 'root'})\n`);
 
@@ -261,7 +319,8 @@ async function runInstall(job: SkillInstallJob, url: string, basename: string, g
       job.error = 'Discovered skills but none could be installed (see output).';
     } else {
       job.status = 'succeeded';
-      appendOutput(job, `\nDone — ${installed.length} skill${installed.length === 1 ? '' : 's'} now active.\n`);
+      const verb = job.mode === 'update' ? 'updated' : 'now active';
+      appendOutput(job, `\nDone — ${installed.length} skill${installed.length === 1 ? '' : 's'} ${verb}.\n`);
     }
     job.completedAt = new Date().toISOString();
   } finally {
@@ -300,6 +359,236 @@ function runGitHubClone(binary: string, repo: string, cwd: string, onChunk: (s: 
       resolve({ code: code ?? -1 });
     });
   });
+}
+
+/**
+ * Re-pull a single installed skill from its recorded source repo. The
+ * upgrade path is identical to install (clone → discover → overwrite),
+ * scoped to this skill's pathInRepo so siblings the user uninstalled
+ * aren't resurrected. A successful run rewrites .clementine-source.json
+ * with the fresh sha, which clears any "update available" flag.
+ *
+ * Returns the job immediately; poll via getSkillInstallJob(id) — the
+ * same map the install flow uses.
+ */
+export function startSkillUpdate(name: string): SkillInstallJob {
+  const skill = loadSkill(name);
+  if (!skill) throw new Error(`Skill not found: ${name}`);
+  const repo = skill.source?.repo;
+  if (!repo) {
+    throw new Error(`Skill "${name}" has no recorded source repo. Reinstall it from GitHub to enable updates.`);
+  }
+  const { url, basename, owner, repo: repoName } = normalizeRepoUrl(repo);
+  const id = newJobId();
+  const job: SkillInstallJob = {
+    id,
+    source: repo,
+    normalizedUrl: url,
+    status: 'queued',
+    output: '',
+    startedAt: new Date().toISOString(),
+    installed: [],
+    mode: 'update',
+    target: name,
+  };
+  jobs.set(id, job);
+
+  void runInstall(
+    job,
+    url,
+    basename,
+    owner && repoName ? `${owner}/${repoName}` : undefined,
+    { pathInRepo: skill.source?.pathInRepo ?? '', installName: name },
+  ).catch((err) => {
+    job.status = 'failed';
+    job.error = err instanceof Error ? err.message : String(err);
+    job.completedAt = new Date().toISOString();
+    appendOutput(job, `\n[update crashed: ${job.error}]\n`);
+  });
+  return job;
+}
+
+export interface SkillUpdateStatus {
+  name: string;
+  repo?: string;
+  /** SHA recorded at install time (baseline). */
+  installedSha?: string;
+  /** Remote default-branch HEAD SHA, undefined when the check failed. */
+  remoteSha?: string;
+  updateAvailable: boolean;
+  checkedAt: string;
+  /** Populated when the remote SHA couldn't be resolved. */
+  error?: string;
+}
+
+export interface SkillUpdateSummary {
+  checkedAt: string;
+  results: SkillUpdateStatus[];
+  /** Names of skills with a newer upstream commit. */
+  updatesAvailable: string[];
+}
+
+/**
+ * Resolve the remote default-branch HEAD SHA WITHOUT cloning.
+ *
+ * Primary path: `git ls-remote <url> HEAD` — one cheap network round
+ * trip, works for any public repo with no auth. Fallback for private
+ * repos: the authenticated GitHub CLI's commits API. Returns undefined
+ * when neither path yields a SHA (offline, gone, private + no gh auth).
+ */
+export async function getRemoteHeadSha(repoUrl: string): Promise<string | undefined> {
+  let normalized: { url: string; owner?: string; repo?: string };
+  try {
+    const n = normalizeRepoUrl(repoUrl);
+    normalized = { url: n.url, owner: n.owner, repo: n.repo };
+  } catch {
+    return undefined;
+  }
+
+  const lsRemote = await gitLsRemoteHead(normalized.url);
+  if (lsRemote) return lsRemote;
+
+  // Fallback: private repo over the authenticated GitHub CLI.
+  if (normalized.owner && normalized.repo) {
+    const ghStatus = await getGitHubCliStatus().catch(() => null);
+    if (ghStatus?.installed && ghStatus.authenticated) {
+      const res = await runGitHubCli(
+        ['api', `repos/${normalized.owner}/${normalized.repo}/commits?per_page=1`, '--jq', '.[0].sha'],
+        20_000,
+      ).catch(() => null);
+      const sha = res?.ok ? res.stdout.trim() : '';
+      if (/^[0-9a-f]{7,40}$/i.test(sha)) return sha;
+    }
+  }
+  return undefined;
+}
+
+function gitLsRemoteHead(url: string): Promise<string | undefined> {
+  return new Promise((resolve) => {
+    const git = findSafeCliCommand('git');
+    if (!git || git.skipped) {
+      resolve(undefined);
+      return;
+    }
+    let settled = false;
+    let out = '';
+    // -q/--exit-code keeps noise down; HEAD resolves the remote's
+    // default-branch tip without fetching any objects.
+    const child = spawn(git.command, ['ls-remote', '--quiet', '--', url, 'HEAD'], {
+      stdio: ['ignore', 'pipe', 'ignore'],
+      env: nonInteractiveGitEnv(),
+    });
+    child.stdout.on('data', (b: Buffer) => { out += b.toString('utf-8'); });
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try { child.kill('SIGKILL'); } catch { /* noop */ }
+      resolve(undefined);
+    }, 20_000);
+    child.on('error', () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(undefined);
+    });
+    child.on('close', (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (code !== 0) { resolve(undefined); return; }
+      // Output: "<sha>\tHEAD". Take the first whitespace-delimited token.
+      const sha = out.split(/\s+/)[0]?.trim() ?? '';
+      resolve(/^[0-9a-f]{7,40}$/i.test(sha) ? sha : undefined);
+    });
+  });
+}
+
+/** True when both shas are known and differ — the honest signal. */
+export function deriveUpdateAvailable(installedSha?: string, remoteSha?: string): boolean {
+  return Boolean(installedSha && remoteSha && installedSha !== remoteSha);
+}
+
+/**
+ * Check a single installed skill against its upstream and persist the
+ * result into its source metadata. Cheap (one ls-remote). Skills with
+ * no recorded source repo are reported as not-checkable.
+ */
+export async function checkSkillUpdate(name: string): Promise<SkillUpdateStatus> {
+  const checkedAt = new Date().toISOString();
+  const skill = loadSkill(name);
+  if (!skill || !skill.source?.repo) {
+    return { name, updateAvailable: false, checkedAt, error: 'no source repo recorded' };
+  }
+  const remoteSha = await getRemoteHeadSha(skill.source.repo);
+  const updateAvailable = deriveUpdateAvailable(skill.source.sha, remoteSha);
+  recordSkillUpdateCheck(name, { latestRemoteSha: remoteSha, updateAvailable, lastCheckedAt: checkedAt });
+  return {
+    name,
+    repo: skill.source.repo,
+    installedSha: skill.source.sha,
+    remoteSha,
+    updateAvailable,
+    checkedAt,
+    error: remoteSha ? undefined : 'could not resolve remote HEAD',
+  };
+}
+
+/**
+ * Check every installed skill that has a source repo. Dedupes the
+ * network call by repo URL, so a bundled repo (e.g. taste-skill with 12
+ * skills) costs ONE ls-remote, not twelve. Persists each result and
+ * returns a summary the daily poll / dashboard can act on.
+ */
+export async function checkAllSkillUpdates(
+  // Injectable for tests; production passes the real ls-remote resolver.
+  resolveRemoteSha: (repoUrl: string) => Promise<string | undefined> = getRemoteHeadSha,
+): Promise<SkillUpdateSummary> {
+  const checkedAt = new Date().toISOString();
+  const skills = listSkills().filter((s) => s.source?.repo);
+
+  // Group by repo so we hit each remote once.
+  const byRepo = new Map<string, Skill[]>();
+  for (const s of skills) {
+    const key = s.source!.repo!;
+    const group = byRepo.get(key);
+    if (group) group.push(s);
+    else byRepo.set(key, [s]);
+  }
+
+  // Resolve every unique repo's HEAD concurrently so total wall-clock is
+  // one timeout window, not the sum — a handful of unreachable repos
+  // can't serialize into an N×20s stall on the request-synchronous
+  // check-updates route. Unique-repo counts are tiny, so unbounded
+  // fan-out is fine.
+  const repoShas = new Map<string, string | undefined>(
+    await Promise.all(
+      [...byRepo.keys()].map(async (repo) => [repo, await resolveRemoteSha(repo)] as const),
+    ),
+  );
+
+  const results: SkillUpdateStatus[] = [];
+  for (const [repo, group] of byRepo) {
+    const remoteSha = repoShas.get(repo);
+    for (const s of group) {
+      const updateAvailable = deriveUpdateAvailable(s.source?.sha, remoteSha);
+      recordSkillUpdateCheck(s.name, { latestRemoteSha: remoteSha, updateAvailable, lastCheckedAt: checkedAt });
+      results.push({
+        name: s.name,
+        repo,
+        installedSha: s.source?.sha,
+        remoteSha,
+        updateAvailable,
+        checkedAt,
+        error: remoteSha ? undefined : 'could not resolve remote HEAD',
+      });
+    }
+  }
+
+  return {
+    checkedAt,
+    results: results.sort((a, b) => a.name.localeCompare(b.name)),
+    updatesAvailable: results.filter((r) => r.updateAvailable).map((r) => r.name),
+  };
 }
 
 export function getSkillInstallJob(id: string): SkillInstallJob | undefined {

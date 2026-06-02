@@ -1,4 +1,5 @@
 import { statSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import pino from 'pino';
 import { embedMissingChunks, embedMissingFacts, isEmbeddingsEnabled } from './embeddings.js';
 import { reindexVault } from './indexer.js';
@@ -16,6 +17,8 @@ import {
 } from '../integrations/recall/meeting-capture.js';
 import { startCanonicalTranscriptBackfill } from '../integrations/recall/backfill.js';
 import { createBackgroundTask } from '../execution/background-tasks.js';
+import { checkAllSkillUpdates } from '../runtime/skill-installer.js';
+import { addNotification } from '../runtime/notifications.js';
 
 /**
  * Memory maintenance for the daemon tick.
@@ -89,6 +92,64 @@ const MEETING_FILING_EVERY_N_TICKS = 8; // ~2min with a 15s tick
 // inside 3:00–3:00:59 would otherwise all match). Reset per-process —
 // the dedupe inside writeReport handles cross-restart safety.
 let lastNightlyFireDay = '';
+
+// Skill update poll. Installed skills (SKILL.md repos) drift behind
+// their GitHub source; this surfaces "update available" without forcing
+// the user to reinstall by hand. DETECTION ONLY — it never mutates an
+// installed skill (applying an update is approval-gated, via the manual
+// "Update" button). The check is one `git ls-remote` per unique repo,
+// so it's cheap enough to run on a daily cadence + a nightly fire.
+const SKILL_UPDATE_EVERY_N_TICKS = 5760; // ~24h with a 15s tick
+const SKILL_UPDATE_NIGHTLY_HOUR = 4;     // 4:00 AM local (offset from autoresearch's 3:00)
+const SKILL_UPDATE_NIGHTLY_MINUTE = 0;
+let lastSkillUpdateFireDay = '';
+let skillUpdateCheckInFlight = false;
+
+/**
+ * Run the skill update poll out-of-band (the network calls shouldn't
+ * block the daemon tick) and notify when updates land. Single-flighted
+ * so an overlapping cadence + nightly fire can't double-run. The
+ * notification id is keyed on the exact (name@remoteSha) set, so a
+ * still-pending update doesn't re-ping the user every day — only a NEW
+ * upstream commit produces a new id and a fresh notification.
+ */
+function runSkillUpdatePoll(reason: 'cadence' | 'nightly'): void {
+  if (skillUpdateCheckInFlight) return;
+  skillUpdateCheckInFlight = true;
+  void checkAllSkillUpdates()
+    .then((summary) => {
+      const names = summary.updatesAvailable;
+      if (names.length > 0) {
+        const seed = names
+          .map((n) => {
+            const r = summary.results.find((x) => x.name === n);
+            return `${n}@${(r?.remoteSha ?? '').slice(0, 12)}`;
+          })
+          .sort()
+          .join(',');
+        const id = `skill-updates-${createHash('sha1').update(seed).digest('hex').slice(0, 12)}`;
+        addNotification({
+          id,
+          kind: 'system',
+          read: false,
+          createdAt: new Date().toISOString(),
+          title: `${names.length} skill update${names.length === 1 ? '' : 's'} available`,
+          body: `New upstream commits for: ${names.join(', ')}. Open Settings → Skills to review and update.`,
+          metadata: { skills: names, source: 'skill-update-poll' },
+        });
+      }
+      logger.info(
+        { reason, updates: names.length, checked: summary.results.length },
+        'skill update poll tick',
+      );
+    })
+    .catch((err) => {
+      logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'skill update poll tick failed');
+    })
+    .finally(() => {
+      skillUpdateCheckInFlight = false;
+    });
+}
 
 export async function processMemoryMaintenance(tickCount: number): Promise<void> {
   if (tickCount % REINDEX_EVERY_N_TICKS === 0) {
@@ -212,16 +273,33 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
     }
   }
 
+  // Skill update poll — periodic ~24h cadence so a machine that's never
+  // up at the nightly hour still gets checked. Out-of-band + single
+  // flighted; detection only.
+  if (tickCount % SKILL_UPDATE_EVERY_N_TICKS === 0) {
+    runSkillUpdatePoll('cadence');
+  }
+
   // Explicit nightly fire at 3:00 AM local. Independent of the periodic
   // cadence above — users want a guaranteed "fresh report when I wake
   // up." We check hour+minute, dedupe by calendar day so we fire ONCE
   // even though four 15s ticks land inside the matching minute.
   const now = new Date();
+  const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
   if (now.getHours() === AUTORESEARCH_NIGHTLY_HOUR && now.getMinutes() === AUTORESEARCH_NIGHTLY_MINUTE) {
-    const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
     if (lastNightlyFireDay !== today) {
       lastNightlyFireDay = today;
       tickAutoresearchObservatory();
+    }
+  }
+
+  // Guaranteed daily skill update check at 4:00 AM local (same
+  // fire-once-per-day dedupe as autoresearch). Offset an hour so the two
+  // nightly jobs don't pile onto the same tick.
+  if (now.getHours() === SKILL_UPDATE_NIGHTLY_HOUR && now.getMinutes() === SKILL_UPDATE_NIGHTLY_MINUTE) {
+    if (lastSkillUpdateFireDay !== today) {
+      lastSkillUpdateFireDay = today;
+      runSkillUpdatePoll('nightly');
     }
   }
 }

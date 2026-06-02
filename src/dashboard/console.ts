@@ -607,8 +607,11 @@ export function renderConsoleHtml(token: string): string {
             </div>
             <div class="skills-stats">
               <div class="stat-card"><span>SKILLS</span><em data-skills-count>—</em></div>
+              <button class="skills-check-btn" data-skills-check-updates title="Check installed skills for upstream updates on GitHub">CHECK FOR UPDATES</button>
             </div>
           </div>
+
+          <div class="skills-check-status" data-skills-check-status hidden></div>
 
           <div class="skills-install" data-skills-install>
             <input type="text" data-skills-install-url placeholder="github.com/owner/repo, owner/repo, or 'npx skills add owner/repo'" />
@@ -9058,6 +9061,10 @@ body {
   padding: 10px 12px;
   border-bottom: 1px solid var(--line);
   background: var(--bg-1);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
 }
 .skill-card .skill-name {
   color: var(--fg);
@@ -9139,6 +9146,53 @@ body {
 }
 .skills-install button:hover { border-color: var(--accent); color: var(--accent); }
 .skills-install button:disabled { opacity: 0.5; cursor: wait; }
+.skills-check-btn {
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  padding: 8px 12px;
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  cursor: pointer;
+  align-self: center;
+}
+.skills-check-btn:hover { border-color: var(--accent); color: var(--accent); }
+.skills-check-btn:disabled { opacity: 0.5; cursor: wait; }
+.skills-check-status {
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  padding: 8px 10px;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  color: var(--fg-2);
+  margin-bottom: 14px;
+}
+.skill-card .skill-head-actions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.skill-card .skill-update-badge {
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  margin-left: 6px;
+  padding: 1px 5px;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  border-radius: 2px;
+  vertical-align: middle;
+}
+.skill-card .skill-update {
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  background: transparent;
+  border: 1px solid var(--accent);
+  padding: 3px 8px;
+  color: var(--accent);
+  cursor: pointer;
+}
+.skill-card .skill-update:hover { background: var(--accent); color: var(--bg-0); }
+.skill-card .skill-update:disabled { opacity: 0.5; cursor: wait; }
 .skills-install-status {
   flex-basis: 100%;
   background: var(--bg-0);
@@ -17661,6 +17715,11 @@ const CONSOLE_JS = `
   // here. Lives in ~/.clementine-next/skills/.
 
   let skillsInstallPollTimer = null;
+  // Restore handler for the job the single shared timer is currently
+  // watching. If a second job (install during an update, or vice versa)
+  // clobbers the timer, we run this first so the abandoned flow's button
+  // isn't left stuck disabled.
+  let skillsActivePollRestore = null;
 
   async function bootSkillsPanel() {
     const dirEl    = document.querySelector('[data-skills-dir]');
@@ -17688,7 +17747,132 @@ const CONSOLE_JS = `
       });
     }
 
+    const checkBtn = document.querySelector('[data-skills-check-updates]');
+    if (checkBtn && !checkBtn.dataset.bound) {
+      checkBtn.dataset.bound = '1';
+      checkBtn.addEventListener('click', () => checkSkillUpdates(checkBtn));
+    }
+
     await refreshSkillsList(gridEl, cntEl, dirEl);
+  }
+
+  // Ask the backend to re-check every installed skill against its source
+  // repo (one cheap ls-remote per unique repo), then refresh the grid so
+  // "UPDATE" badges appear. The backend persists the result, so the
+  // badges survive a reload until the next check or a successful update.
+  async function checkSkillUpdates(btn) {
+    const statusEl = document.querySelector('[data-skills-check-status]');
+    if (statusEl) { statusEl.hidden = false; statusEl.textContent = 'Checking installed skills for updates…'; }
+    if (btn) { btn.disabled = true; btn.textContent = 'CHECKING…'; }
+    try {
+      const r = await fetch(withToken('/api/console/skills/check-updates'), { method: 'POST' });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        if (statusEl) statusEl.textContent = 'Check failed: ' + (j.error || r.status);
+        return;
+      }
+      const avail = Array.isArray(j.updatesAvailable) ? j.updatesAvailable : [];
+      const checked = Array.isArray(j.results) ? j.results.length : 0;
+      const failed = Array.isArray(j.results) ? j.results.filter((x) => x.error).length : 0;
+      if (statusEl) {
+        if (avail.length > 0) {
+          statusEl.textContent = '✓ ' + avail.length + ' update' + (avail.length === 1 ? '' : 's') + ' available: ' + avail.join(', ') + '. Click UPDATE on a card to pull the latest.';
+        } else if (checked === 0) {
+          statusEl.textContent = 'No skills with a GitHub source to check. Install a skill from a repo to enable update checks.';
+        } else {
+          statusEl.textContent = '✓ All ' + checked + ' skill' + (checked === 1 ? '' : 's') + ' up to date' + (failed > 0 ? ' (' + failed + ' could not be reached).' : '.');
+        }
+      }
+      const gridEl = document.querySelector('[data-skills-grid]');
+      const cntEl = document.querySelector('[data-skills-count]');
+      const dirEl = document.querySelector('[data-skills-dir]');
+      await refreshSkillsList(gridEl, cntEl, dirEl);
+    } catch (err) {
+      if (statusEl) statusEl.textContent = 'Check error: ' + (err.message || err);
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = 'CHECK FOR UPDATES'; }
+    }
+  }
+
+  // Re-pull a single skill from its source repo. Reuses the install job
+  // machinery (shared jobs map → same poll endpoint).
+  async function updateSkill(name, btn) {
+    const statusEl = document.querySelector('[data-skills-install-status]');
+    if (statusEl) { statusEl.hidden = false; statusEl.textContent = 'Updating ' + name + '…'; }
+    if (btn) { btn.disabled = true; btn.textContent = 'UPDATING…'; }
+    try {
+      const r = await fetch(withToken('/api/console/skills/' + encodeURIComponent(name) + '/update'), { method: 'POST' });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        if (statusEl) statusEl.textContent = 'Update failed: ' + (j.error || r.status);
+        if (btn) { btn.disabled = false; btn.textContent = 'UPDATE'; }
+        return;
+      }
+      const jobId = j.job && j.job.id;
+      if (!jobId) {
+        if (statusEl) statusEl.textContent = 'Update kicked off but no job id returned.';
+        if (btn) { btn.disabled = false; btn.textContent = 'UPDATE'; }
+        return;
+      }
+      pollSkillJob(jobId, statusEl, (job) => {
+        const gridEl = document.querySelector('[data-skills-grid]');
+        const cntEl = document.querySelector('[data-skills-count]');
+        const dirEl = document.querySelector('[data-skills-dir]');
+        refreshSkillsList(gridEl, cntEl, dirEl);
+        if (statusEl) {
+          statusEl.textContent = job.status === 'succeeded'
+            ? '✓ Updated ' + name + '.'
+            : 'Update failed: ' + (job.error || 'see log above');
+          if (job.status === 'succeeded') setTimeout(() => { if (statusEl) statusEl.hidden = true; }, 6000);
+        }
+      }, () => { if (btn) { btn.disabled = false; btn.textContent = 'UPDATE'; } });
+    } catch (err) {
+      if (statusEl) statusEl.textContent = 'Update error: ' + (err.message || err);
+      if (btn) { btn.disabled = false; btn.textContent = 'UPDATE'; }
+    }
+  }
+
+  // Shared poller for install + update jobs (same backend job map). Polls
+  // until the job reaches a terminal state, streaming the log into
+  // statusEl, then invokes onTerminal(job). Only one poll runs at a time:
+  // starting a new poll clears the previous timer, so we first run the
+  // abandoned job's restore handler (re-enable its button) — the backend
+  // job still completes, but its onTerminal would never fire client-side.
+  function pollSkillJob(jobId, statusEl, onTerminal, restore) {
+    if (skillsInstallPollTimer) {
+      clearInterval(skillsInstallPollTimer);
+      skillsInstallPollTimer = null;
+      if (typeof skillsActivePollRestore === 'function') {
+        try { skillsActivePollRestore(); } catch (_) { /* noop */ }
+      }
+    }
+    skillsActivePollRestore = typeof restore === 'function' ? restore : null;
+    skillsInstallPollTimer = setInterval(async () => {
+      try {
+        const pollR = await fetch(withToken('/api/console/skills/install/' + encodeURIComponent(jobId)));
+        const pollJ = await pollR.json().catch(() => ({}));
+        if (!pollR.ok) {
+          if (statusEl) statusEl.textContent = 'Status check failed: ' + (pollJ.error || pollR.status);
+          clearInterval(skillsInstallPollTimer);
+          skillsInstallPollTimer = null;
+          if (typeof skillsActivePollRestore === 'function') {
+            try { skillsActivePollRestore(); } catch (_) { /* noop */ }
+          }
+          skillsActivePollRestore = null;
+          return;
+        }
+        const job = pollJ.job || {};
+        if (statusEl) statusEl.textContent = (job.output || '').slice(-1500);
+        if (job.status === 'succeeded' || job.status === 'failed') {
+          clearInterval(skillsInstallPollTimer);
+          skillsInstallPollTimer = null;
+          skillsActivePollRestore = null;
+          if (typeof onTerminal === 'function') onTerminal(job);
+        }
+      } catch (err) {
+        if (statusEl) statusEl.textContent = 'Status check error: ' + (err.message || err);
+      }
+    }, 750);
   }
 
   async function refreshSkillsList(gridEl, cntEl, dirEl) {
@@ -17708,8 +17892,16 @@ const CONSOLE_JS = `
         return;
       }
       gridEl.innerHTML = skills.map((s) => {
-        const sourceLine = s.source && s.source.repo
-          ? '<div class="skill-desc" style="color:var(--fg-3);font-size:10px;">from ' + escMem(s.source.repo) + (s.source.sha ? ' @ ' + escMem(s.source.sha.slice(0, 7)) : '') + '</div>'
+        const src = s.source || {};
+        const updateAvailable = !!src.updateAvailable;
+        const shaBit = src.sha ? ' @ ' + escMem(src.sha.slice(0, 7)) : '';
+        // When an update is pending, show the target SHA so the user
+        // knows there's something newer to pull.
+        const newBit = updateAvailable && src.latestRemoteSha
+          ? ' → new ' + escMem(src.latestRemoteSha.slice(0, 7))
+          : '';
+        const sourceLine = src.repo
+          ? '<div class="skill-desc" style="color:var(--fg-3);font-size:10px;">from ' + escMem(src.repo) + shaBit + newBit + '</div>'
           : '';
         const extras = [
           s.hasScripts ? '<span class="skill-tool-pill">scripts/</span>' : '',
@@ -17717,11 +17909,18 @@ const CONSOLE_JS = `
           s.hasReferences ? '<span class="skill-tool-pill">references/</span>' : '',
         ].filter(Boolean).join('');
         const display = s.displayName && s.displayName !== s.name ? s.displayName : s.name;
+        const badge = updateAvailable ? '<span class="skill-update-badge">UPDATE</span>' : '';
+        const updateBtn = updateAvailable
+          ? '<button class="skill-update" data-skill-update="' + escMem(s.name) + '" title="Pull the latest version from ' + escMem(src.repo || 'source') + '">UPDATE</button>'
+          : '';
         return [
           '<div class="skill-card" data-skill-name="' + escMem(s.name) + '">',
           '  <div class="skill-head">',
-          '    <span class="skill-name">' + escMem(display) + '</span>',
-          '    <button class="skill-uninstall" data-skill-uninstall="' + escMem(s.name) + '" title="Uninstall">UNINSTALL</button>',
+          '    <span class="skill-name">' + escMem(display) + badge + '</span>',
+          '    <span class="skill-head-actions">',
+          '      ' + updateBtn,
+          '      <button class="skill-uninstall" data-skill-uninstall="' + escMem(s.name) + '" title="Uninstall">UNINSTALL</button>',
+          '    </span>',
           '  </div>',
           s.description ? '  <div class="skill-desc">' + escMem(s.description) + '</div>' : '',
           sourceLine,
@@ -17729,6 +17928,13 @@ const CONSOLE_JS = `
           '</div>',
         ].join('');
       }).join('');
+
+      gridEl.querySelectorAll('[data-skill-update]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const name = btn.getAttribute('data-skill-update');
+          updateSkill(name, btn);
+        });
+      });
 
       gridEl.querySelectorAll('[data-skill-uninstall]').forEach((btn) => {
         btn.addEventListener('click', async () => {
@@ -17769,61 +17975,44 @@ const CONSOLE_JS = `
       const j = await r.json().catch(() => ({}));
       if (!r.ok) {
         if (statusEl) statusEl.textContent = 'Error: ' + (j.error || r.status);
+        if (runBtn) { runBtn.disabled = false; runBtn.textContent = 'INSTALL SKILL'; }
         return;
       }
       const jobId = j.job?.id;
       if (!jobId) {
         if (statusEl) statusEl.textContent = 'Install kicked off but no job id returned.';
+        if (runBtn) { runBtn.disabled = false; runBtn.textContent = 'INSTALL SKILL'; }
         return;
       }
-      // Poll until terminal.
-      skillsInstallPollTimer = setInterval(async () => {
-        try {
-          const pollR = await fetch(withToken('/api/console/skills/install/' + encodeURIComponent(jobId)));
-          const pollJ = await pollR.json().catch(() => ({}));
-          if (!pollR.ok) {
-            if (statusEl) statusEl.textContent = 'Status check failed: ' + (pollJ.error || pollR.status);
-            clearInterval(skillsInstallPollTimer);
-            skillsInstallPollTimer = null;
-            return;
+      pollSkillJob(jobId, statusEl, async (job) => {
+        if (runBtn) { runBtn.disabled = false; runBtn.textContent = 'INSTALL SKILL'; }
+        const gridEl = document.querySelector('[data-skills-grid]');
+        const cntEl = document.querySelector('[data-skills-count]');
+        const dirEl = document.querySelector('[data-skills-dir]');
+        await refreshSkillsList(gridEl, cntEl, dirEl);
+        // Reset the install form so the user can paste another URL
+        // without clearing the field by hand. Success briefly shows a
+        // confirmation, then collapses the log; failures keep the log
+        // visible so the user can read why it broke.
+        const urlInput = document.querySelector('[data-skills-install-url]');
+        if (job.status === 'succeeded') {
+          if (urlInput) {
+            urlInput.value = '';
+            try { urlInput.focus(); } catch (_) { /* noop */ }
           }
-          const job = pollJ.job || {};
-          if (statusEl) statusEl.textContent = (job.output || '').slice(-1500);
-          if (job.status === 'succeeded' || job.status === 'failed') {
-            clearInterval(skillsInstallPollTimer);
-            skillsInstallPollTimer = null;
-            if (runBtn) { runBtn.disabled = false; runBtn.textContent = 'INSTALL FROM GITHUB'; }
-            const gridEl = document.querySelector('[data-skills-grid]');
-            const cntEl = document.querySelector('[data-skills-count]');
-            const dirEl = document.querySelector('[data-skills-dir]');
-            await refreshSkillsList(gridEl, cntEl, dirEl);
-            // Reset the install form so the user can paste another URL
-            // without clearing the field by hand. Success briefly shows a
-            // confirmation, then collapses the log; failures keep the log
-            // visible so the user can read why it broke.
-            const urlInput = document.querySelector('[data-skills-install-url]');
-            if (job.status === 'succeeded') {
-              if (urlInput) {
-                urlInput.value = '';
-                try { urlInput.focus(); } catch (_) { /* noop */ }
-              }
-              const installedNames = (job.installed || []).map((x) => x.name);
-              if (statusEl) {
-                const n = installedNames.length;
-                statusEl.textContent = n > 0
-                  ? '✓ Installed ' + n + ' skill' + (n === 1 ? '' : 's') + ': ' + installedNames.slice(0, 6).join(', ') + (n > 6 ? ' + ' + (n - 6) + ' more' : '') + '. Paste another URL to install more.'
-                  : '✓ Done.';
-                setTimeout(() => { if (statusEl) statusEl.hidden = true; }, 6000);
-              }
-            }
+          const installedNames = (job.installed || []).map((x) => x.name);
+          if (statusEl) {
+            const n = installedNames.length;
+            statusEl.textContent = n > 0
+              ? '✓ Installed ' + n + ' skill' + (n === 1 ? '' : 's') + ': ' + installedNames.slice(0, 6).join(', ') + (n > 6 ? ' + ' + (n - 6) + ' more' : '') + '. Paste another URL to install more.'
+              : '✓ Done.';
+            setTimeout(() => { if (statusEl) statusEl.hidden = true; }, 6000);
           }
-        } catch (err) {
-          if (statusEl) statusEl.textContent = 'Status check error: ' + (err.message || err);
         }
-      }, 750);
+      }, () => { if (runBtn) { runBtn.disabled = false; runBtn.textContent = 'INSTALL SKILL'; } });
     } catch (err) {
       if (statusEl) statusEl.textContent = 'Network error: ' + (err.message || err);
-      if (runBtn) { runBtn.disabled = false; runBtn.textContent = 'INSTALL FROM GITHUB'; }
+      if (runBtn) { runBtn.disabled = false; runBtn.textContent = 'INSTALL SKILL'; }
     }
   }
 
