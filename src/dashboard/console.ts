@@ -23620,10 +23620,10 @@ const CONSOLE_JS = `
           if (recLbl) recLbl.textContent = 'STOP RECORDING';
           recBtn.setAttribute('data-state', 'recording');
         } else {
-          // Label tracks what the button will actually do: record the
-          // detected meeting window, or (no meeting open) generic
-          // desktop audio.
-          if (recLbl) recLbl.textContent = recall?.hasActiveMeetingWindow ? 'RECORD MEETING' : 'RECORD AUDIO';
+          // Always the MEETING button now — it no longer silently records
+          // generic desktop audio when no meeting is open. If it can't see a
+          // meeting on click, it guides the user to grant Screen Recording.
+          if (recLbl) recLbl.textContent = 'RECORD MEETING';
           recBtn.setAttribute('data-state', 'idle');
         }
       }
@@ -23682,26 +23682,48 @@ const CONSOLE_JS = `
         }
         return;
       }
-      // Confirm only the start side — stopping mid-meeting should be
-      // one click since the user can always restart. The message
-      // reflects whether we'll record the detected meeting or fall
-      // back to generic desktop audio (no meeting window open).
       let recallNow = null;
       try { recallNow = await window.clemmy.recallStatus(); } catch { /* best-effort */ }
       const hasMeeting = Boolean(recallNow && recallNow.hasActiveMeetingWindow);
-      const confirmMsg = hasMeeting
-        ? 'Start recording this meeting?\\nMake sure participants are aware where required.'
-        : 'No meeting detected — start a generic desktop-audio recording instead?\\nMake sure participants are aware where required.';
-      if (!confirm(confirmMsg)) return;
-      // Optimistic UI flip — show STARTING immediately so the user
-      // knows their click registered. The next refreshDockLive (which
-      // we kick after the IPC resolves) replaces this with the real
-      // state ("STOP RECORDING" + pulsing dot).
+
+      // No silent desktop-audio fallback. If the SDK can't see a meeting,
+      // the cause is almost always a missing Screen Recording permission
+      // (it resets when the app updates) — tell the user the exact fix and
+      // offer to trigger the OS permission request, instead of quietly
+      // recording meeting-less audio that never produces a transcript.
+      if (!hasMeeting) {
+        const perm = (recallNow && recallNow.permissionStatuses) || {};
+        const screen = perm['screen-capture'];
+        const needsPerm = !screen || screen !== 'granted';
+        if (needsPerm) {
+          const go = confirm(
+            'Clementine can’t see your meeting — it needs SCREEN RECORDING permission.\\n\\n'
+            + 'Click OK to trigger the permission request. Then enable Clementine under '
+            + 'System Settings → Privacy & Security → Screen Recording, and QUIT + REOPEN Clementine.'
+          );
+          if (go && window.clemmy.recallRequestPermissions) {
+            try { await window.clemmy.recallRequestPermissions(); } catch (_) { /* best-effort */ }
+          }
+          showError('Recording needs Screen Recording permission. Enable Clementine in System Settings → Privacy & Security → Screen Recording, then quit & reopen.');
+        } else {
+          showError('No meeting detected. Open your Zoom, Meet, or Teams window, then click RECORD MEETING. (For in-person audio, use “Record desktop audio” in Settings → Meetings.)');
+        }
+        return;
+      }
+
+      if (!confirm('Start recording this meeting?\\nMake sure participants are aware where required.')) return;
+      // Optimistic UI flip — show STARTING immediately so the user knows
+      // their click registered; the next refreshDockLive replaces it.
       recLbl.textContent = 'STARTING…';
       recBtn.setAttribute('disabled', '');
       try {
-        await window.clemmy.recallRecordActive();
-        showSuccess(hasMeeting ? 'Recording started.' : 'Desktop-audio recording started.');
+        const res = await window.clemmy.recallRecordActive();
+        if (res && res.blocked) {
+          // The meeting vanished between status + click, or permission is off.
+          showError(res.blocked.message || 'Could not start meeting recording.');
+        } else {
+          showSuccess('Recording started.');
+        }
       } catch (err) {
         showError('Recording failed to start: ' + ((err && err.message) || err));
       } finally {

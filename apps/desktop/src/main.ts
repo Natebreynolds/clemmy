@@ -866,12 +866,13 @@ ipcMain.handle('clemmy:recall-start-manual', async (evt: IpcMainInvokeEvent) => 
   return recallCapture?.startManualRecording() ?? null;
 });
 
-// Primary "RECORD MEETING" path — records the detected meeting window
-// when one is open, else falls back to desktop audio. See
-// RecallDesktopCapture.recordActiveMeetingOrDesktop.
+// Primary "RECORD MEETING" path — records the detected meeting window when
+// one is open. When none is found it does NOT silently record desktop audio;
+// it returns a `blocked` reason (usually "grant Screen Recording") so the
+// dashboard can guide the user. See RecallDesktopCapture.recordActiveMeeting.
 ipcMain.handle('clemmy:recall-record-active', async (evt: IpcMainInvokeEvent) => {
   assertIpcSender(evt, ['dashboard']);
-  return recallCapture?.recordActiveMeetingOrDesktop() ?? null;
+  return recallCapture?.recordActiveMeeting() ?? null;
 });
 
 ipcMain.handle('clemmy:recall-record-detected', async (evt: IpcMainInvokeEvent, payload: { windowId: string }) => {

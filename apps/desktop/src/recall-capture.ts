@@ -26,6 +26,16 @@ export interface RecallCaptureStatus {
     title?: string;
   };
   /**
+   * Set when a RECORD MEETING request could NOT start a real meeting
+   * recording and we refused to silently fall back to desktop audio. The
+   * dashboard surfaces `message` verbatim so the user knows the concrete
+   * fix (almost always: grant Screen Recording, then quit + reopen).
+   */
+  blocked?: {
+    reason: 'screen-recording-permission' | 'no-meeting-detected';
+    message: string;
+  };
+  /**
    * Per-permission status as reported by the SDK's `permission-status`
    * event. Keys are the permission slugs (`accessibility`, `microphone`,
    * `screen-capture`, etc.); values are the SDK's own strings — usually
@@ -289,26 +299,53 @@ export class RecallDesktopCapture {
   }
 
   /**
-   * The "RECORD MEETING" path the dashboard's primary button should use.
+   * The "RECORD MEETING" path the dashboard's primary button uses.
    * If the SDK has an open meeting window (Zoom/Meet/Teams) it records
-   * THAT window — giving per-participant transcripts and a real meeting
-   * title — instead of falling back to a generic desktop-audio capture.
-   * Only when no meeting window is detected do we fall back to mixed
-   * desktop audio.
+   * THAT window — per-participant transcript + real title.
    *
-   * Previously the dock REC button called startManualRecording()
-   * directly, so even with Zoom detected the user got a "Manual desktop
-   * audio recording" tagged platform:'desktop-audio' and the actual
-   * meeting never recorded. This is the single source of truth that
-   * fixes that — both UI buttons route here.
+   * It does NOT fall back to generic desktop audio when no window is
+   * found. That silent fallback was the trap: with Screen Recording
+   * permission missing the SDK can't SEE the meeting window, so the
+   * button quietly recorded meeting-less desktop audio (no transcript,
+   * recall.ai 404s the upload) and never told the user the real fix.
+   * Instead we report a `blocked` reason — almost always "grant Screen
+   * Recording" — so the dashboard can guide the user. Deliberate
+   * in-person audio capture stays available via `startManualRecording()`
+   * (an explicit, separate "Record desktop audio" action).
    */
-  async recordActiveMeetingOrDesktop(): Promise<RecallCaptureStatus> {
+  async recordActiveMeeting(): Promise<RecallCaptureStatus> {
     await this.initialize();
     const windowId = this.pickActiveMeetingWindow();
     if (windowId) {
       return this.recordDetectedWindow(windowId);
     }
-    return this.startManualRecording();
+    // No meeting window — surface WHY instead of silently recording audio.
+    // Screen Recording is what lets the SDK detect/capture meeting windows;
+    // if it's not granted, that's the cause ~every time after an app update.
+    const screen = this.permissionStatuses['screen-capture'];
+    const needsPermission = !screen || screen !== 'granted';
+    const blocked: NonNullable<RecallCaptureStatus['blocked']> = needsPermission
+      ? {
+        reason: 'screen-recording-permission',
+        message:
+          'Clementine needs Screen Recording permission to record meetings. Open System Settings → '
+          + 'Privacy & Security → Screen Recording, turn on Clementine, then QUIT and reopen Clementine. '
+          + '(Microphone and Accessibility should be on too.)',
+      }
+      : {
+        reason: 'no-meeting-detected',
+        message:
+          'No meeting window detected. Open your Zoom, Google Meet, or Teams window, then click RECORD '
+          + 'MEETING. For an in-person meeting with no window, use “Record desktop audio” in Settings → Meetings.',
+      };
+    this.lastError = blocked.message;
+    this.emit('recording-blocked', {
+      reason: blocked.reason,
+      message: blocked.message,
+      permission: 'screen-capture',
+      permissionStatuses: { ...this.permissionStatuses },
+    });
+    return { ...this.status(), blocked };
   }
 
   /**
