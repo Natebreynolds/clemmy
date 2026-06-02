@@ -93,15 +93,48 @@ function fieldMatch(field: string, value: number): boolean {
   return false;
 }
 
-function cronMatches(expr: string, at: Date): boolean {
+interface WallClock { minute: number; hour: number; dayOfMonth: number; month: number; dayOfWeek: number; }
+
+/** The wall-clock fields of `at` in an IANA timezone (default = host local, so
+ *  a schedule with no timezone is byte-identical to before). Never throws — an
+ *  invalid/unknown tz falls back to host local rather than breaking the tick. */
+export function wallClockInZone(at: Date, tz?: string): WallClock {
+  const local = (): WallClock => ({
+    minute: at.getMinutes(), hour: at.getHours(), dayOfMonth: at.getDate(),
+    month: at.getMonth() + 1, dayOfWeek: at.getDay(),
+  });
+  if (!tz) return local();
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: tz, hour12: false,
+      minute: '2-digit', hour: '2-digit', day: '2-digit', month: '2-digit', weekday: 'short',
+    }).formatToParts(at);
+    const get = (t: string): string => parts.find((p) => p.type === t)?.value ?? '';
+    const wd: Record<string, number> = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+    let hour = Number.parseInt(get('hour'), 10);
+    if (hour === 24) hour = 0; // some ICU builds render midnight as "24"
+    return {
+      minute: Number.parseInt(get('minute'), 10),
+      hour,
+      dayOfMonth: Number.parseInt(get('day'), 10),
+      month: Number.parseInt(get('month'), 10),
+      dayOfWeek: wd[get('weekday')] ?? at.getDay(),
+    };
+  } catch {
+    return local();
+  }
+}
+
+export function cronMatches(expr: string, at: Date, tz?: string): boolean {
   if (!validateCronExpression(expr)) return false;
   const [min, hour, dom, mon, dow] = expr.trim().split(/\s+/);
+  const wc = wallClockInZone(at, tz);
   return (
-    fieldMatch(min, at.getMinutes()) &&
-    fieldMatch(hour, at.getHours()) &&
-    fieldMatch(dom, at.getDate()) &&
-    fieldMatch(mon, at.getMonth() + 1) &&
-    fieldMatch(dow, at.getDay())
+    fieldMatch(min, wc.minute) &&
+    fieldMatch(hour, wc.hour) &&
+    fieldMatch(dom, wc.dayOfMonth) &&
+    fieldMatch(mon, wc.month) &&
+    fieldMatch(dow, wc.dayOfWeek)
   );
 }
 
@@ -141,7 +174,7 @@ export async function processWorkflowSchedules(): Promise<ScheduledFireResult> {
     if (!wf.enabled) continue;
     const schedule = wf.trigger?.schedule;
     if (!schedule || typeof schedule !== 'string') continue;
-    if (!cronMatches(schedule, now)) continue;
+    if (!cronMatches(schedule, now, wf.trigger?.timezone)) continue;
 
     const dedupeKey = `wf:${wf.name}`;
     if (state.lastRunByMinute[dedupeKey] === minuteKey) {

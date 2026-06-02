@@ -295,6 +295,14 @@ function readRunRecord(filePath: string): QueuedRunRecord | null {
   catch { return null; }
 }
 
+/** A run fired by the TIME-BASED scheduler (no human present to approve). The
+ *  legacy cron path and the workflow scheduler both stamp these sources. A
+ *  manual/chat/dashboard run is NOT unattended (a person is there to approve). */
+function isUnattendedScheduledRun(runId: string): boolean {
+  const rec = readRunRecord(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`));
+  return rec?.source === 'schedule' || rec?.source === 'cron';
+}
+
 function writeRunRecord(filePath: string, record: QueuedRunRecord): void {
   writeFileSync(filePath, JSON.stringify(record, null, 2), 'utf-8');
 }
@@ -1187,6 +1195,25 @@ async function awaitDeclarativeStepApproval(
     throw new Error(`workflow step "${step.id}" was not approved (${prior})`);
   }
 
+  // Unattended scheduled run: there is no human at 8am to click "approve", so a
+  // declarative gate would PARK FOREVER (deadlock) — the run never completes and
+  // the daily promise silently fails. For a scheduler-fired run of an ENABLED
+  // workflow, the human's consent WAS the enable + the schedule, so auto-approve
+  // the gate (logged for audit) and proceed. Manual/chat/dashboard runs (a person
+  // is present) still register the gate and wait, exactly as before.
+  if (ctx.workflow.enabled !== false && isUnattendedScheduledRun(ctx.runId)) {
+    appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
+      kind: 'step_started',
+      stepId: step.id,
+      meta: { gate: 'auto_approved_unattended', reason: 'enabled scheduled run — consent was enable + schedule' },
+    });
+    logger.info(
+      { workflow: ctx.workflow.name, runId: ctx.runId, step: step.id },
+      'declarative approval gate auto-approved for unattended scheduled run (enable was the consent)',
+    );
+    return;
+  }
+
   // Register the gate once (idempotent across resumes: only if none pending).
   const pending = approvalRegistry.listPending({ sessionId: gateSessionId, status: 'pending' });
   let row = pending[0];
@@ -1335,19 +1362,27 @@ const RETRY_BACKOFF_BASE_MS = parseInt(
 // Bare HTTP status NUMBERS are deliberately NOT matched here — a message that
 // merely contains "500" (e.g. "expected 500 rows") must not be retried. HTTP
 // status is only honored via the structured `err.status` field below.
-const TRANSIENT_RE = /\b(ETIMEDOUT|ECONNRESET|ECONNREFUSED|EAI_AGAIN|ENOTFOUND|EPIPE|socket hang up|network error|timed? ?out|timeout|rate.?limit|too many requests|temporarily unavailable|service unavailable|bad gateway|gateway timeout)\b/i;
+// NB: `fetch failed` is the undici/Node fetch TOP-LEVEL message — the real
+// network code (ECONNRESET/ENOTFOUND) lives on err.cause, which the classifier
+// inspects below. A daily unattended workflow that hit a one-off `fetch failed`
+// (observed live 2026-06-02) must not be treated as a deterministic bug.
+const TRANSIENT_RE = /\b(ETIMEDOUT|ECONNRESET|ECONNREFUSED|EAI_AGAIN|ENOTFOUND|EPIPE|socket hang up|network error|fetch failed|connection (?:error|closed|reset)|timed? ?out|timeout|rate.?limit|too many requests|temporarily unavailable|service unavailable|bad gateway|gateway timeout)\b/i;
 // Deterministic workflow failures that must NEVER be retried even though their
 // message text can contain a transient token (e.g. "timed out waiting for
 // approval" contains "timed out"). This override wins over TRANSIENT_RE.
 const NON_RETRYABLE_RE = /(waiting for approval|exceeded approval wait budget|was not approved|missing required input|failed its contract|deterministic runner)/i;
 const TRANSIENT_STATUS = new Set([408, 429, 500, 502, 503, 504]);
-export function isTransientStepError(err: unknown): boolean {
+export function isTransientStepError(err: unknown, depth = 0): boolean {
   const msg = err instanceof Error ? err.message : String(err ?? '');
   if (NON_RETRYABLE_RE.test(msg)) return false;
-  const code = (err as { code?: string; status?: number } | null);
+  const code = (err as { code?: string; status?: number; cause?: unknown } | null);
   if (code?.code && TRANSIENT_RE.test(code.code)) return true;
   if (typeof code?.status === 'number' && TRANSIENT_STATUS.has(code.status)) return true;
-  return TRANSIENT_RE.test(msg);
+  if (TRANSIENT_RE.test(msg)) return true;
+  // undici fetch / aggregate errors wrap the real transient cause one level down
+  // (a `fetch failed` whose cause is ECONNRESET). Recurse, bounded, on the cause.
+  if (depth < 3 && code?.cause && code.cause !== err) return isTransientStepError(code.cause, depth + 1);
+  return false;
 }
 
 /**
@@ -1384,11 +1419,23 @@ export async function runWithStepRetry<T>(
   }
 }
 
+/** A TRANSIENT-only retry floor: even a step that declared no retryBudget gets
+ *  this many automatic retries on a network/infra blip (the retry harness gates
+ *  on isTransientStepError, so a real deterministic failure still fails on
+ *  attempt 1). Default 1 so a daily unattended run survives a one-off `fetch
+ *  failed`/5xx; set CLEMENTINE_WORKFLOW_TRANSIENT_RETRY_FLOOR=0 to restore the
+ *  old fail-fast-on-transient behavior. */
+function transientRetryFloor(): number {
+  const raw = Number.parseInt(getRuntimeEnv('CLEMENTINE_WORKFLOW_TRANSIENT_RETRY_FLOOR', '1') || '1', 10);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 1;
+}
+
 async function executeStepVerified(
   step: WorkflowStepInput,
   ctx: StepExecutionContext,
 ): Promise<unknown> {
-  const budget = step.retryBudget && step.retryBudget > 0 ? step.retryBudget : 0;
+  const declared = step.retryBudget && step.retryBudget > 0 ? step.retryBudget : 0;
+  const budget = Math.max(declared, transientRetryFloor());
   // Retry loop wraps EXECUTION only. Verification (below) is deterministic
   // and never retried. Park/cancel signals propagate immediately (they are
   // not "retryable").

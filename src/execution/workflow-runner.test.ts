@@ -49,6 +49,7 @@ const {
   coerceOutputForContract,
   applyContractToPrompt,
   describeOutputShape,
+  isTransientStepError,
 } = await import('./workflow-runner.js');
 const { SessionStore: RunnerSessionStore } = await import('../memory/session-store.js');
 const { readWorkflowEvents } = await import('./workflow-events.js');
@@ -835,4 +836,68 @@ test('self-heal: a completed upstream IRREVERSIBLE-SEND step (unmarked) blocks a
     workflowRunnerInternalsForTest.hasCompletedUpstreamMutation(reads as never, 'find', new Set(['read', 'find'])),
     false,
   );
+});
+
+// ── G8: transient classifier covers "fetch failed" + err.cause (no-fail retry) ──
+
+test('G8: a bare "fetch failed" (undici) is now classified transient → retryable', () => {
+  assert.equal(isTransientStepError(new Error('fetch failed')), true);
+  assert.equal(isTransientStepError(new Error('workflow step "x" failed via harness: fetch failed')), true);
+});
+
+test('G8: a transient cause one level down is detected even when the top message is generic', () => {
+  const e = new Error('request to https://api.example.com failed');
+  (e as { cause?: unknown }).cause = Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' });
+  assert.equal(isTransientStepError(e), true);
+});
+
+test('G8: deterministic failures are NOT retried (real bugs fail fast, no loop)', () => {
+  assert.equal(isTransientStepError(new Error('missing required input "url"')), false);
+  assert.equal(isTransientStepError(new Error('TypeError: x is not a function')), false);
+  assert.equal(isTransientStepError(new Error('failed its contract')), false);
+  // a self-referential cause must not loop forever (bounded recursion)
+  const loop = new Error('weird');
+  (loop as { cause?: unknown }).cause = loop;
+  assert.equal(isTransientStepError(loop), false);
+});
+
+// ── G5: scheduled enabled workflow auto-approves its declarative gate ──────────
+
+test('G5: an unattended SCHEDULED run auto-approves the gate (no human at 8am → no deadlock)', async () => {
+  const runId = 'g5-scheduled-gate';
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`),
+    JSON.stringify({ id: runId, workflow: 'Daily Dash', status: 'running', source: 'schedule' }), 'utf-8');
+  const ctx = {
+    workflow: { name: 'Daily Dash', enabled: true, steps: [] }, workflowSlug: 'daily-dash',
+    runId, inputs: {}, stepOutputs: {}, assistant: {} as never, completedItems: new Map(),
+    forEachFailures: [], qualityAdvisories: [],
+  } as never;
+  const step = { id: 'deploy', prompt: 'deploy', requiresApproval: true, approvalPreview: 'Deploy' } as never;
+  // Must NOT throw (no park) and must NOT register a pending human approval.
+  await workflowRunnerInternalsForTest.awaitDeclarativeStepApproval(ctx, step);
+  const pending = approvalRegistry.listPending({ sessionId: `workflow-gate:${runId}:deploy`, status: 'pending' });
+  assert.equal(pending.length, 0, 'auto-approved — no human approval registered for the unattended run');
+  rmSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), { force: true });
+});
+
+test('G5: a MANUAL run still registers the gate (a person is present to approve)', async () => {
+  process.env.WORKFLOW_APPROVAL_PARKING = 'on';
+  const runId = 'g5-manual-gate';
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`),
+    JSON.stringify({ id: runId, workflow: 'Daily Dash', status: 'running', source: 'manual', originSessionId: 'sess-x' }), 'utf-8');
+  const ctx = {
+    workflow: { name: 'Daily Dash', enabled: true, steps: [] }, workflowSlug: 'daily-dash2',
+    runId, inputs: {}, stepOutputs: {}, assistant: {} as never, completedItems: new Map(),
+    forEachFailures: [], qualityAdvisories: [],
+  } as never;
+  const step = { id: 'deploy', prompt: 'deploy', requiresApproval: true, approvalPreview: 'Deploy' } as never;
+  let threw: Error | null = null;
+  try { await workflowRunnerInternalsForTest.awaitDeclarativeStepApproval(ctx, step); } catch (e) { threw = e as Error; }
+  assert.ok(threw, 'manual run parks — registers the gate + throws to release the slot');
+  const pending = approvalRegistry.listPending({ sessionId: `workflow-gate:${runId}:deploy`, status: 'pending' });
+  assert.equal(pending.length, 1, 'manual run registers a human approval (unchanged)');
+  rmSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), { force: true });
+  delete process.env.WORKFLOW_APPROVAL_PARKING;
 });

@@ -162,6 +162,10 @@ export interface WorkflowStepOutputContract {
 export interface WorkflowTrigger {
   schedule?: string;
   manual?: boolean;
+  /** IANA timezone (e.g. "America/Los_Angeles") the cron `schedule` is
+   *  interpreted in. Omitted → the daemon host's local time (byte-identical to
+   *  legacy behavior). Set so "daily 8am" means the OWNER's 8am, not the host's. */
+  timezone?: string;
 }
 
 export interface WorkflowInputDef {

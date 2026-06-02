@@ -6,6 +6,7 @@ import { listWorkflows, writeWorkflow, readWorkflow } from '../memory/workflow-s
 import type { WorkflowDefinition } from '../memory/workflow-store.js';
 import { CRON_FILE } from '../memory/vault.js';
 import { textResult } from './shared.js';
+import { loadUserProfile } from '../runtime/user-profile.js';
 
 /**
  * Schedule authoring tools — the agent's primary surface for "schedule
@@ -91,6 +92,10 @@ const scheduleParams = {
     .boolean()
     .nullable()
     .describe('Whether the schedule should fire. Default true. Pass false to author the workflow but keep it dormant until the user explicitly enables it.'),
+  timezone: z
+    .string()
+    .nullable()
+    .describe('IANA timezone the cron is interpreted in (e.g. "America/Los_Angeles"). Omit to use the user\'s profile timezone; "8am" then means THEIR 8am, not the server host\'s. Only falls back to host-local time if neither is set.'),
 };
 
 export function registerWorkflowScheduleTools(server: McpServer): void {
@@ -105,7 +110,7 @@ export function registerWorkflowScheduleTools(server: McpServer): void {
       'Returns the saved workflow path and the next scheduled run time. Idempotent — passing an existing `name` UPDATES that workflow.',
     ].join('\n'),
     scheduleParams,
-    async ({ name, description, cron, instructions, toolCall, enabled }) => {
+    async ({ name, description, cron, instructions, toolCall, enabled, timezone }) => {
       if (!isValidSlug(name)) {
         return textResult(`Error: workflow name "${name}" is not a valid slug. Use lowercase kebab-case: "instagram-friday-post", "daily-briefing".`);
       }
@@ -132,12 +137,18 @@ export function registerWorkflowScheduleTools(server: McpServer): void {
         stepPrompt = (instructions ?? '').trim();
       }
 
+      // Resolve the timezone "8am" should mean: explicit arg → user profile →
+      // (omit, so the scheduler falls back to host-local, byte-identical legacy).
+      let resolvedTz: string | undefined = (timezone ?? '').trim() || undefined;
+      if (!resolvedTz) {
+        try { resolvedTz = loadUserProfile().timezone?.trim() || undefined; } catch { /* profile optional */ }
+      }
       const existing = readWorkflow(name);
       const def: WorkflowDefinition = {
         name,
         description,
         enabled: enabled !== false,
-        trigger: { schedule: cron },
+        trigger: { schedule: cron, ...(resolvedTz ? { timezone: resolvedTz } : {}) },
         allowedTools,
         steps: [
           {

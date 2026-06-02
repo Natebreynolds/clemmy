@@ -53,7 +53,7 @@ export interface WorkflowFrontmatter {
   name?: string;
   description?: string;
   enabled?: boolean;
-  trigger?: { schedule?: string; manual?: boolean };
+  trigger?: { schedule?: string; manual?: boolean; timezone?: string };
   steps?: WorkflowStepShape[];
   inputs?: Record<string, { type?: string; default?: string; description?: string }>;
   synthesis?: { prompt?: string };

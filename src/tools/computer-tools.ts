@@ -76,7 +76,7 @@ function needsApprovalUnlessInPlanScope(toolName: string) {
  * shutdown, etc.); this gate is the softer "human-in-the-loop please"
  * checkpoint for ops that mutate state outside Clementine.
  */
-function shellCommandNeedsApproval(rawCommand: unknown): boolean {
+export function shellCommandNeedsApproval(rawCommand: unknown): boolean {
   if (typeof rawCommand !== 'string') return true; // unparseable → ask
   const cmd = rawCommand.trim();
   if (!cmd) return true;
@@ -136,6 +136,11 @@ function shellCommandNeedsApproval(rawCommand: unknown): boolean {
     /(^|[\s;&|])gcloud\s+\S+\s+(create|update|delete|enable|disable|set)/,
     /(^|[\s;&|])(terraform|tofu)\s+(apply|destroy|init|import|state\s+(rm|mv|push)|workspace\s+(new|delete))/,
     /(^|[\s;&|])(ansible|ansible-playbook)\b/,
+    // Static-site / serverless deploys — a public, externally-visible write.
+    // A workflow step's plan-scope (['*']) auto-approves the SCHEDULED redeploy;
+    // this only pauses the FIRST ad-hoc chat deploy so a busy owner sees it once.
+    /(^|[\s;&|])(netlify|vercel|wrangler|firebase|gh-pages)\s+(deploy|publish|--prod)/,
+    /(^|[\s;&|])surge\s/,
     // Scary tools
     /(^|[\s;&|])(eval|exec|source|\.)\s/,
     /(^|[\s;&|])history\s+-c/,

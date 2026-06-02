@@ -257,3 +257,33 @@ test('renderToolChoicesForContext returns empty when no choice fits the budget',
 process.on('beforeExit', () => {
   try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ }
 });
+
+// ── G1: baked Composio connection ids are stripped on READ (not just write) ──
+
+test('G1: a legacy tool-choice file with a baked connected_account_id is sanitized on read + in context', async () => {
+  const { mkdirSync: mkd, writeFileSync: wf } = await import('node:fs');
+  const dir = path.join(TMP_HOME, 'memory', 'tool-choices', 'machine-A');
+  mkd(dir, { recursive: true });
+  // Raw file written by hand (bypasses rememberToolChoice's write-time strip),
+  // simulating the 50 legacy files on the owner's disk.
+  wf(path.join(dir, 'googlesheets.values.update.md'),
+    [
+      '---',
+      'intent: googlesheets.values.update',
+      'description: Update a Google Sheet range',
+      'choice:',
+      '  kind: composio',
+      '  identifier: GOOGLESHEETS_VALUES_UPDATE',
+      '  invocationTemplate: composio_execute_tool(tool_slug="GOOGLESHEETS_VALUES_UPDATE", connected_account_id="ca_GJ_hJWV2Hw7P", arguments="{}")',
+      '  testedAt: 2026-05-25T00:00:00Z',
+      '---',
+      'notes',
+    ].join('\n'), 'utf-8');
+
+  const rec = recallToolChoice('googlesheets.values.update');
+  assert.ok(rec?.choice, 'choice recalled');
+  assert.doesNotMatch(rec!.choice!.invocationTemplate ?? '', /connected_account_id|ca_GJ_hJWV2Hw7P/, 'read path strips the baked id');
+
+  const ctx = renderToolChoicesForContext();
+  assert.doesNotMatch(ctx, /connected_account_id|ca_GJ_hJWV2Hw7P/, 'context injection never exposes a baked id to the model');
+});

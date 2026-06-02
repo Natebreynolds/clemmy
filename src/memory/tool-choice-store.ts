@@ -123,7 +123,14 @@ function parseChoice(raw: unknown): ToolChoiceRecordChoice | null {
   return {
     kind,
     identifier,
-    invocationTemplate: typeof r.invocationTemplate === 'string' ? r.invocationTemplate : undefined,
+    // Strip any baked `connected_account_id` on READ too (not just on write):
+    // 50+ legacy choices on disk still carry a hardcoded ca_… that, if the model
+    // copied the template verbatim into composio_execute_tool, would override the
+    // LIVE connection resolution and silently fail when that id rotates/revokes
+    // (the 2026-06-01 Airtable INVALID_PERMISSIONS class). Stripping at the single
+    // read source means every consumer — context injection, recall, the authoring
+    // matcher — sees a connection-less template and always falls to live resolve.
+    invocationTemplate: typeof r.invocationTemplate === 'string' ? stripBakedConnectionId(r.invocationTemplate) : undefined,
     testedAt: typeof r.testedAt === 'string' ? r.testedAt : new Date().toISOString(),
     testEvidence: typeof r.testEvidence === 'string' ? r.testEvidence : undefined,
   };
