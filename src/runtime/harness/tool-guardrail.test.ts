@@ -186,6 +186,53 @@ test('applyMode: warn mode does NOT block an exact-args loop on a READ/poll tool
   assert.equal(applyMode(pollLoop, 'warn').action, 'warn');
 });
 
+test('applyMode: warn mode does NOT hard-block a looping composio READ slug (slug-aware)', () => {
+  // Regression for the 2026-06-02 live incident: a looping AIRTABLE_LIST_RECORDS
+  // read got hard-blocked ("the system stopped repeated Airtable reads") because
+  // applyMode keyed off MUTATING_TOOLS.has('composio_execute_tool') = true. The
+  // decision now carries the SLUG-AWARE mutating flag (false for a read slug),
+  // so the read block demotes to warn and the agent keeps going.
+  const readLoop = {
+    action: 'block' as const,
+    signature: 'sig',
+    toolName: 'composio_execute_tool',
+    reason: 'loop',
+    rule: 'exact_args_repeat' as const,
+    count: 6,
+    mutating: false, // inner slug is a read (AIRTABLE_LIST_RECORDS)
+  };
+  assert.equal(applyMode(readLoop, 'warn').action, 'warn');
+});
+
+test('applyMode: warn mode STILL hard-blocks a looping composio WRITE slug (slug-aware)', () => {
+  // The flip side: a write slug (OUTLOOK_SEND_EMAIL) with identical args is the
+  // dangerous duplicate-send runaway — must stay blocked even in warn mode.
+  const writeLoop = {
+    action: 'block' as const,
+    signature: 'sig',
+    toolName: 'composio_execute_tool',
+    reason: 'loop',
+    rule: 'exact_args_repeat' as const,
+    count: 6,
+    mutating: true, // inner slug is a write (OUTLOOK_SEND_EMAIL)
+  };
+  assert.equal(applyMode(writeLoop, 'warn').action, 'block');
+});
+
+test('evaluateToolCall: a looping composio READ slug decision demotes end-to-end in warn mode', () => {
+  // Full path: a read slug repeated past the block threshold returns
+  // action:'block' WITH mutating:false, which applyMode(warn) demotes to warn.
+  _resetAllTrackersForTests();
+  const readArgs = { tool_slug: 'AIRTABLE_LIST_RECORDS', arguments: '{"baseId":"app1","tableIdOrName":"tbl1"}' };
+  let raw;
+  for (let i = 0; i < 6; i += 1) {
+    raw = evaluateToolCall('sess-read-e2e', 'composio_execute_tool', readArgs);
+  }
+  assert.equal(raw?.action, 'block');
+  assert.equal(raw?.mutating, false);
+  assert.equal(applyMode(raw!, 'warn').action, 'warn');
+});
+
 test('applyMode: warn mode still demotes non-exact-args block/halt to warn', () => {
   // Same tool, DIFFERENT args (possibly legitimate varied/batch work) stays
   // demoted in the default mode; strict mode enforces it.

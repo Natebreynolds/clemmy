@@ -676,8 +676,21 @@ export function wrapToolForHarness<T extends WrappableTool>(
             } catch { /* count is best-effort; fail toward not-a-batch */ }
 
             const { loadProactivityPolicy } = await import('../../agents/proactivity-policy.js');
-            const threshold = loadProactivityPolicy().batchConfirmThreshold;
+            const policy = loadProactivityPolicy();
+            const threshold = policy.batchConfirmThreshold;
             const review = decideInstructionReview({ priorSameShapeCount: prior, threshold });
+
+            // YOLO = the user has granted STANDING approval ("auto-approve
+            // everything except the hard danger denylist"). The confirm-first
+            // batch gate is an APPROVAL gate; in YOLO it is pure friction and
+            // breaks the approve-once-then-run contract (live 2026-06-02: in
+            // YOLO, after 4 sends the 5th tripped this gate and demanded a
+            // plan the user had already approved). Skip the block in YOLO but
+            // still RECORD the write below for batch-count continuity. The
+            // escalate loop-guard + the hard danger denylist remain the floor.
+            // The same yolo short-circuit lives in evaluateAutoApprove
+            // (plan-scope.ts) — this gate had simply forgotten to ask.
+            const yoloStandingApproval = policy.autoApproveScope === 'yolo';
 
             // An instruction-reviewed plan scope satisfies the gate.
             const { getPlanScope } = await import('../../agents/plan-scope.js');
@@ -702,7 +715,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
               (getRuntimeEnv('CLEMMY_CONFIRM_FIRST_ALL_WRITES', 'off') ?? 'off').toLowerCase() === 'on';
             const severityRequiresGate = gateAllMutating || shape.irreversible;
 
-            if (review.required && severityRequiresGate && !hasReviewedScope) {
+            if (!yoloStandingApproval && review.required && severityRequiresGate && !hasReviewedScope) {
               try {
                 appendEvent({
                   sessionId: ctx.sessionId,

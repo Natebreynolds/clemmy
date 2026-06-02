@@ -238,6 +238,13 @@ export interface GuardrailDecision {
   rule: 'exact_args_repeat' | 'same_mut_tool_repeat' | 'allowed';
   /** Current count for the matched signature/tool. */
   count: number;
+  /** Slug-aware mutating verdict for THIS call (composio_execute_tool is
+   *  classified by its inner slug; native tools by set membership). Carried
+   *  on the decision so `applyMode` can demote a looping READ to warn even
+   *  when the wrapper tool name (composio_execute_tool) is itself mutating —
+   *  the args aren't reachable from applyMode. Optional: when absent (a
+   *  hand-built decision) applyMode falls back to MUTATING_TOOLS membership. */
+  mutating?: boolean;
 }
 
 function readMode(): GuardrailMode {
@@ -329,6 +336,7 @@ export function evaluateToolCall(
       reason: 'no session context — guardrail bypassed',
       rule: 'allowed',
       count: 0,
+      mutating: isMutatingCall(toolName, args),
     };
   }
   const tracker = getOrCreateTracker(sessionId);
@@ -386,6 +394,7 @@ export function evaluateToolCall(
       reason: `${toolName} called ${exactCount}× with IDENTICAL arguments — stuck in an unrecoverable loop. Ending the turn.`,
       rule: 'exact_args_repeat',
       count: exactCount,
+      mutating: isMut,
     };
   }
   if (exactCount >= thresholds.exactArgsBlockAt) {
@@ -396,6 +405,7 @@ export function evaluateToolCall(
       reason: `Loop detected: ${toolName} has been called ${exactCount}× with IDENTICAL arguments and keeps failing/returning the same result. Repeating it will not help. STOP — do something different: change the arguments, try another tool/approach, or if you're blocked, report the specific blocker to the user. Do NOT call ${toolName} with these same arguments again.`,
       rule: 'exact_args_repeat',
       count: exactCount,
+      mutating: isMut,
     };
   }
   if (exactCount >= thresholds.exactArgsWarnAt) {
@@ -406,6 +416,7 @@ export function evaluateToolCall(
       reason: `${toolName} called ${exactCount}× with identical args in recent window`,
       rule: 'exact_args_repeat',
       count: exactCount,
+      mutating: isMut,
     };
   }
 
@@ -420,6 +431,7 @@ export function evaluateToolCall(
         reason: `mutating tool ${toolName} called with ${distinctArgsCount} distinct arg sets in recent window — runaway pattern`,
         rule: 'same_mut_tool_repeat',
         count: distinctArgsCount,
+        mutating: isMut,
       };
     }
     if (distinctArgsCount >= thresholds.sameMutToolWarnAt) {
@@ -430,6 +442,7 @@ export function evaluateToolCall(
         reason: `mutating tool ${toolName} called with ${distinctArgsCount} distinct arg sets in recent window`,
         rule: 'same_mut_tool_repeat',
         count: distinctArgsCount,
+        mutating: isMut,
       };
     }
   }
@@ -446,6 +459,7 @@ export function evaluateToolCall(
     reason: 'within thresholds',
     rule: 'allowed',
     count: exactCount,
+    mutating: isMut,
   };
 }
 
@@ -462,18 +476,27 @@ export function applyMode(decision: GuardrailDecision, mode: GuardrailMode = rea
   // warn mode (default).
   //
   // An EXACT-args repeat (same tool, byte-identical args, ≥ block threshold)
-  // is hard-blocked even in the default mode — BUT ONLY for MUTATING tools.
+  // is hard-blocked even in the default mode — BUT ONLY for MUTATING calls.
   // That's the dangerous runaway: 137× workflow_run with the same inputs,
   // repeated sends, etc. — stopped at the source, agent forced to
-  // reconsider. READ/poll tools (workflow_run_status, list/get/search) are
+  // reconsider. READ/poll calls (workflow_run_status, list/get/search) are
   // non-destructive, and repeating the identical call is LEGITIMATE
   // (polling an async result, re-reading) — never block a poll; demote to
   // warn. (A read loop wastes tokens but can't corrupt/spawn/send and is
   // bounded by the turn's limits.)
+  //
+  // Use the decision's SLUG-AWARE `mutating` flag, not set membership on the
+  // tool name: `composio_execute_tool` IS in MUTATING_TOOLS, but it's a
+  // gateway that wraps reads (AIRTABLE_LIST_RECORDS) as often as writes.
+  // Keying off the name hard-blocked a looping Airtable READ ("the system
+  // stopped repeated Airtable reads" — live 2026-06-02) even though it can't
+  // corrupt state. The flag is classified by the inner slug upstream.
+  // (Hand-built decisions without the flag fall back to set membership.)
+  const decisionIsMutating = decision.mutating ?? MUTATING_TOOLS.has(decision.toolName);
   if (
     decision.action === 'block'
     && decision.rule === 'exact_args_repeat'
-    && MUTATING_TOOLS.has(decision.toolName)
+    && decisionIsMutating
   ) {
     return decision;
   }

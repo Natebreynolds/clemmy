@@ -418,6 +418,49 @@ test('confirm-first gate: same-shape writes accrue across calls and the batch tr
   }
 });
 
+test('confirm-first gate: YOLO standing approval lets an irreversible batch run without a plan scope', async () => {
+  // Regression for the 2026-06-02 live incident: in YOLO the user has granted
+  // STANDING approval, but the batch gate (an approval gate) still tripped on
+  // the 5th send and demanded a plan the user had already approved. YOLO must
+  // skip the block while still RECORDING each write for batch-count continuity.
+  const prevBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  const prevConfirm = process.env.CLEMMY_CONFIRM_FIRST;
+  const prevExecGate = process.env.CLEMMY_EXECUTION_GATE;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  process.env.CLEMMY_CONFIRM_FIRST = 'on';
+  process.env.CLEMMY_EXECUTION_GATE = 'off';
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const { saveProactivityPolicy } = await import('../../agents/proactivity-policy.js');
+  const { listEvents } = await import('./eventlog.js');
+  saveProactivityPolicy({ autoApproveScope: 'yolo' });
+  try {
+    const counter = new ToolCallsCounter(100);
+    const wrapped = wrapToolForHarness({
+      name: 'composio_execute_tool',
+      execute: async (_input: unknown) => 'sent',
+    });
+    const sendNo = (n: number) =>
+      withHarnessRunContext({ sessionId: sess.id, counter }, () =>
+        wrapped.execute!({ tool_slug: 'OUTLOOK_SEND_EMAIL', arguments: JSON.stringify({ to: `person${n}@x.com` }) }),
+      );
+    // 8 irreversible sends, well past the threshold of 5 — ALL pass in YOLO,
+    // no plan scope ever opened.
+    for (let n = 1; n <= 8; n += 1) {
+      assert.equal(await sendNo(n), 'sent', `YOLO send #${n} should pass (standing approval)`);
+    }
+    // Continuity preserved: each allowed write was still recorded so the batch
+    // count stays accurate if the user later leaves YOLO mid-session.
+    const writes = listEvents(sess.id, { types: ['external_write'] });
+    assert.equal(writes.length, 8, 'every YOLO write should still be recorded for batch-count continuity');
+  } finally {
+    saveProactivityPolicy({ autoApproveScope: 'balanced' });
+    process.env.HARNESS_TOOL_BRACKETS = prevBrackets;
+    process.env.CLEMMY_CONFIRM_FIRST = prevConfirm;
+    process.env.CLEMMY_EXECUTION_GATE = prevExecGate;
+  }
+});
+
 test('confirm-first gate: explicit off escape hatch lets batches pass', async () => {
   const prevBrackets = process.env.HARNESS_TOOL_BRACKETS;
   const prevConfirm = process.env.CLEMMY_CONFIRM_FIRST;
