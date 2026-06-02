@@ -146,6 +146,28 @@ export class HarnessSession {
   }
 
   /**
+   * Stage a synthetic `role:'user'` turn into the persisted conversation
+   * snapshot so the NEXT `runTurn` replays it (no event emitted, no turn
+   * started — same mechanism as updateConversationSnapshot). This is how a
+   * background workflow/task OUTCOME reaches the ORCHESTRATOR's reasoning: the
+   * orchestrator replays toInputItems() (the harness snapshot), NOT the PWA
+   * SessionStore where enqueue*OutcomeTurn also writes. Idempotent by
+   * `idPrefix` so a terminal-retry / re-drain can't double-inject. Returns true
+   * when it injected, false when a matching turn was already staged.
+   */
+  injectSyntheticUserTurn(idPrefix: string, text: string): boolean {
+    const items = this.toInputItems();
+    const already = items.some((it) => {
+      const role = (it as { role?: unknown }).role;
+      const content = (it as { content?: unknown }).content;
+      return role === 'user' && typeof content === 'string' && content.startsWith(idPrefix);
+    });
+    if (already) return false;
+    this.updateConversationSnapshot([...items, { role: 'user', content: text } as AgentInputItem]);
+    return true;
+  }
+
+  /**
    * Persist the SDK's post-run history snapshot + `lastResponseId`.
    * Also emits a `turn_ended` event so the audit log records the
    * boundary even when no semantic events fired this turn.

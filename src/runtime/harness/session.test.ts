@@ -90,6 +90,26 @@ test('recordTurnResult persists history and lastResponseId across reopen', () =>
   assert.equal(ended[0].data.lastResponseId, 'resp_abc');
 });
 
+test('injectSyntheticUserTurn stages an outcome turn into the snapshot the orchestrator replays + is idempotent', () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  sess.recordTurnResult({ history: [{ role: 'user', content: 'hi' }], lastResponseId: 'r1', turn: 1 });
+  const prefix = '[workflow run abc ';
+  const text = `${prefix}completed] my-wf\n\nresult`;
+  // First injection: appends a user turn the next runTurn will replay.
+  assert.equal(sess.injectSyntheticUserTurn(prefix, text), true);
+  let items = sess.toInputItems();
+  const mine = items.filter((it) => (it as { role?: unknown }).role === 'user' && typeof (it as { content?: unknown }).content === 'string' && ((it as { content?: string }).content ?? '').startsWith(prefix));
+  assert.equal(mine.length, 1, 'one outcome turn staged into the harness snapshot');
+  // Second injection (terminal-retry / re-drain): idempotent — no double.
+  assert.equal(sess.injectSyntheticUserTurn(prefix, text), false);
+  items = sess.toInputItems();
+  assert.equal(items.filter((it) => typeof (it as { content?: unknown }).content === 'string' && ((it as { content?: string }).content ?? '').startsWith(prefix)).length, 1, 'not double-injected');
+  // Survives reload (it's in META_CONVERSATION, the orchestrator's replay source).
+  const reloaded = HarnessSession.load(sess.id);
+  assert.ok(reloaded!.toInputItems().some((it) => typeof (it as { content?: unknown }).content === 'string' && ((it as { content?: string }).content ?? '').startsWith(prefix)));
+});
+
 test('previousResponseId is undefined until first recordTurnResult', () => {
   resetEventLog();
   const sess = HarnessSession.create({ kind: 'chat' });

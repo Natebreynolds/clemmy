@@ -12,6 +12,7 @@ import pino from 'pino';
 import { BASE_DIR, MODELS } from '../config.js';
 import { addNotification } from '../runtime/notifications.js';
 import { SessionStore } from '../memory/session-store.js';
+import { HarnessSession } from '../runtime/harness/session.js';
 import { ExecutionStore } from './store.js';
 import type { RunStoppedReason } from '../types.js';
 import type { ClementineAssistant } from '../assistant/core.js';
@@ -365,6 +366,13 @@ function enqueueBackgroundTaskOutcomeTurn(
       detail.length > RESULT_TRUNCATE_CHARS ? `${detail.slice(0, RESULT_TRUNCATE_CHARS)}\n…[truncated]` : detail;
     const text = `${head} ${task.title}\n\n${preview}\n\n(${guidance})`;
     store.appendTurn(sessionId, { role: 'user', text, createdAt: nowIso() });
+    // ALSO stage into the harness conversation snapshot so the desktop/Discord
+    // orchestrator (which replays the harness snapshot, not this PWA SessionStore)
+    // sees the outcome on its next turn. Best-effort + idempotent.
+    try {
+      const hs = HarnessSession.load(sessionId);
+      if (hs) hs.injectSyntheticUserTurn(idPrefix, text);
+    } catch { /* best-effort: harness-store write must never affect task state */ }
     logger.info({ taskId: task.id, sessionId, outcome }, 'Background task outcome enqueued into origin session');
   } catch (err) {
     logger.warn(

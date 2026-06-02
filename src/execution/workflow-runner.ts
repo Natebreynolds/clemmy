@@ -1497,7 +1497,18 @@ export function finalizeStepOutput(
   // a step that emitted the right keys as text (not a structured object) passes
   // and downstream steps receive the real object. No contract → unchanged.
   const bound = step.output ? coerceOutputForContract(output, step.output) : output;
-  if (step.output) {
+  // A step that legitimately BLOCKED (returns {blocked:true, reason}) is
+  // signaling it couldn't produce its deliverable — surface that block + its
+  // REASON via the success-path self-heal (detectBlockedSteps reports
+  // "needs attention: <reason>") instead of MASKING it as a cryptic contract
+  // failure ("missing required key X"). So skip contract verification for a
+  // blocked output; it flows through as step_completed and the run reports the
+  // real reason. (Live: add_to_airtable blocked "no prospects — Salesforce
+  // expired" but the user saw "missing required output key created_records".)
+  const isBlockedOutput =
+    bound !== null && typeof bound === 'object' && !Array.isArray(bound) &&
+    (bound as { blocked?: unknown }).blocked === true;
+  if (step.output && !isBlockedOutput) {
     const result = verifyStepOutput(step.output, bound);
     if (!result.ok) {
       const got = describeOutputShape(bound);
@@ -2214,6 +2225,14 @@ export function enqueueWorkflowOutcomeTurn(
     const preview = detail.length > 1500 ? `${detail.slice(0, 1500)}\n…[truncated]` : detail;
     const text = `${head} ${workflowName}\n\n${preview}\n\n(${guidance})`;
     store.appendTurn(sessionId, { role: 'user', text, createdAt: new Date().toISOString() });
+    // ALSO stage it into the harness conversation snapshot: the desktop/Discord
+    // orchestrator replays the harness snapshot (toInputItems), NOT the PWA
+    // SessionStore above — without this, Clem's reasoning never sees the outcome
+    // and she reports a finished run as still "running." Best-effort + idempotent.
+    try {
+      const hs = HarnessSession.load(sessionId);
+      if (hs) hs.injectSyntheticUserTurn(idPrefix, text);
+    } catch { /* best-effort: a harness-store write must never fail a completed run */ }
     logger.info({ runId: run.id, sessionId, outcome }, 'Workflow outcome enqueued into origin chat session');
   } catch (err) {
     logger.warn(

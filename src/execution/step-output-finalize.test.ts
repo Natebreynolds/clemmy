@@ -52,6 +52,20 @@ test('contract FAIL → throws, step_failed recorded, step_completed NEVER recor
   assert.ok(!k.includes('step_completed'), 'step_completed must NOT be recorded for a contract-failed step');
 });
 
+test('contracted step that BLOCKS ({blocked:true}) is NOT masked as a contract failure — surfaces as a blocked step with its reason', () => {
+  const run = nextRun();
+  const step = { id: 'sb', prompt: 'p', output: { type: 'object' as const, required_keys: ['created_records', 'airtable_table_url'] } };
+  // The live add_to_airtable case: it blocked (nothing to add) and the contract
+  // verifier masked it as "missing required key". Now it must pass through as a
+  // completed-but-blocked step so the run reports the REASON, not a contract error.
+  const blocked = { blocked: true, reason: 'no prospects to add — Salesforce connection expired' };
+  const out = finalizeStepOutput(WF, run, step, blocked);
+  assert.deepEqual(out, blocked, 'the blocked output flows through (downstream + detectBlockedSteps surface the reason)');
+  const k = kinds(run);
+  assert.ok(k.includes('step_completed'), 'recorded as step_completed (the run-level self-heal then flags needs-attention)');
+  assert.ok(!k.includes('step_failed'), 'a legitimate block must NOT be a contract failure');
+});
+
 test('verification is UNCONDITIONAL — fires even with WORKFLOW_CONTRACT_OUTPUT=off (flag removed)', () => {
   const run = nextRun();
   const step = { id: 's3', prompt: 'p', output: { type: 'number' as const } };
