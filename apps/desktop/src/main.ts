@@ -19,6 +19,7 @@ import { DaemonSupervisor, locateDaemonProjectRoot, type SupervisorEvent } from 
 import { needsSetup, hasCompletedSetup, writeSetupComplete, type SetupConfiguredSummary } from './setup-state.js';
 import { createSetupWindow } from './setup-window.js';
 import { RecallDesktopCapture, type RecallCaptureSettings } from './recall-capture.js';
+import { isBenignPipeError } from './pipe-errors.js';
 import {
   applyUpdate,
   checkForUpdatesNow,
@@ -1195,10 +1196,25 @@ ipcMain.handle('clemmy:setup-skip', async (evt: IpcMainInvokeEvent) => {
 // wedged boot() — the app launched, no window appeared, no user-visible
 // signal. These handlers convert any future silent freeze into a
 // visible dialog the user can act on (or screenshot to file a bug).
+// A broken pipe to an OPTIONAL child helper (most often the Recall.ai meeting
+// recorder's native process) is recoverable and must NEVER crash the whole app.
+// Before v0.5.64 any EPIPE became a fatal boot dialog, crash-looping the app on
+// startup. Log it durably and continue. (See pipe-errors.ts.)
+function logNonFatal(label: string, err: unknown): void {
+  const message = err instanceof Error ? err.stack ?? err.message : String(err);
+  try {
+    mkdirSync(path.dirname(LOG_FILE), { recursive: true });
+    appendFileSync(LOG_FILE, `\n=== Non-fatal (${label}) at ${new Date().toISOString()} ===\n${message}\n`);
+  } catch {
+    /* best-effort — never let logging throw from an error handler */
+  }
+}
 process.on('unhandledRejection', (reason: unknown) => {
+  if (isBenignPipeError(reason)) { logNonFatal('ignored broken pipe (unhandledRejection)', reason); return; }
   reportBootFailure('handle a background error', reason);
 });
 process.on('uncaughtException', (err: Error) => {
+  if (isBenignPipeError(err)) { logNonFatal('ignored broken pipe (uncaughtException)', err); return; }
   reportBootFailure('handle a fatal error', err);
 });
 
