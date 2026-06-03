@@ -112,6 +112,9 @@ export function Memory() {
           <div key={fact.id} class={`memory-fact memory-fact-${fact.kind}`}>
             <div class="memory-fact-head">
               <span class={`fact-kind kind-${fact.kind}`}>{fact.kind}</span>
+              {fact.pinned ? (
+                <span class="fact-pinned" title="pinned standing instruction">📌</span>
+              ) : null}
               {typeof fact.importance === 'number' ? (
                 <span class="fact-importance" title="importance">★ {fact.importance.toFixed(1)}</span>
               ) : null}

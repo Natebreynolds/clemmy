@@ -46,6 +46,7 @@ const PLANNER_TOOL_NAMES = new Set<string>([
   'memory_recall',
   'memory_read',
   'memory_list_facts',
+  'memory_search_facts',
   'memory_review_instructions',
   'workspace_roots',
   'workspace_list',

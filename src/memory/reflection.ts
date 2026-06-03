@@ -9,6 +9,7 @@ import {
   updateFact,
   deleteFact,
   findSimilarFacts,
+  findSimilarFactsScored,
   type RememberInput,
   type ConsolidatedFact,
 } from './facts.js';
@@ -329,6 +330,14 @@ export interface ConsolidateOutcome {
   importanceAdded: number;
 }
 
+export interface ConsolidateOptions {
+  /** Tier A1 novelty fast-path: if the most-similar existing fact's cosine
+   *  similarity is strictly below this value, skip the LLM conflict
+   *  resolver and ADD directly (the candidate is clearly novel). Omit to
+   *  always run the resolver when similar facts exist (legacy behavior). */
+  noveltyFastPathSim?: number;
+}
+
 /**
  * Consolidate a single candidate fact into memory via the Mem0 update
  * phase (Chhikara et al §2.1): retrieve similar existing facts, let the
@@ -342,10 +351,37 @@ export interface ConsolidateOutcome {
 export async function consolidateFact(
   candidate: ConsolidateCandidate,
   ctx: ConsolidateContext = {},
+  opts: ConsolidateOptions = {},
 ): Promise<ConsolidateOutcome> {
   const out: ConsolidateOutcome = { written: 0, updated: 0, deleted: 0, noop: 0, importanceAdded: 0 };
 
-  const similar = await findSimilarFacts(candidate.text, { kind: candidate.kind, topK: 5 });
+  const scored = await findSimilarFactsScored(candidate.text, { kind: candidate.kind, topK: 5 });
+  const similar = scored.map((s) => s.fact);
+
+  // Novelty fast-path (Tier A1): when the most-similar existing fact's
+  // cosine is BELOW the bar, the candidate is clearly novel — there is no
+  // plausible conflict to resolve, so ADD directly and skip the LLM
+  // resolver call. Only applies on the semantic path (sim != null); the
+  // lexical fallback reports sim=null and always runs the resolver.
+  const topSim = scored.length > 0 ? scored[0].sim : null;
+  if (
+    typeof opts.noveltyFastPathSim === 'number' &&
+    topSim !== null &&
+    topSim < opts.noveltyFastPathSim
+  ) {
+    rememberFact({
+      kind: candidate.kind,
+      content: candidate.text,
+      sessionId: ctx.sessionId,
+      derivedFrom: ctx.derivedFrom,
+      importance: candidate.importance,
+      trustLevel: candidate.trustLevel,
+    });
+    out.written = 1;
+    out.importanceAdded += candidate.importance ?? 0;
+    return out;
+  }
+
   const decision = await resolveConflict({ kind: candidate.kind, text: candidate.text }, similar);
 
   if (decision.decision === 'NOOP') {
@@ -832,4 +868,76 @@ export async function runRecursiveReflection(): Promise<RecursiveReflectionResul
 
   if (!producedAnything && result.groupsProcessed === 0) return emit('empty');
   return emit();
+}
+
+export interface DedupResult {
+  examined: number;
+  merged: number;
+  ids: number[];
+}
+
+/**
+ * Retroactive semantic dedup (Tier A3). Folds NEAR-IDENTICAL active facts
+ * (cosine >= `simThreshold`, default 0.95) that accumulated before the
+ * resolver was on the `memory_remember` path. Deliberately MECHANICAL and
+ * high-confidence — no LLM call: at ~0.95 cosine on text-embedding-3-small
+ * the two statements are paraphrases of the same fact, so we keep the
+ * higher-scored (tie → newer) and soft-delete the other. This avoids
+ * misusing the conflict resolver (which is built for NEW candidate vs
+ * existing, not existing vs existing) and bounds blast radius.
+ *
+ * Semantic-only: without embeddings, `findSimilarFactsScored` reports
+ * sim=null and nothing is folded (no-op). Capped by `maxMerges` per run.
+ * Soft delete only (active=0) — fully reversible, embedding + audit kept.
+ */
+export async function consolidateActiveFacts(
+  opts: { perKind?: number; maxMerges?: number; simThreshold?: number } = {},
+): Promise<DedupResult> {
+  const perKind = Math.max(1, opts.perKind ?? 200);
+  const maxMerges = Math.max(0, opts.maxMerges ?? 100);
+  const simThreshold = opts.simThreshold ?? 0.95;
+  const result: DedupResult = { examined: 0, merged: 0, ids: [] };
+  if (maxMerges === 0) return result;
+
+  const db = openMemoryDb();
+  const kinds: ConsolidatedFactKind[] = ['user', 'project', 'feedback', 'reference'];
+  const folded = new Set<number>();
+
+  for (const kind of kinds) {
+    const rows = db.prepare(`
+      SELECT id, content, score FROM consolidated_facts
+      WHERE active = 1 AND kind = ? AND pinned = 0
+      ORDER BY updated_at DESC
+      LIMIT ?
+    `).all(kind, perKind) as { id: number; content: string; score: number }[];
+
+    for (const row of rows) {
+      if (result.merged >= maxMerges) break;
+      if (folded.has(row.id)) continue; // already merged away
+      result.examined += 1;
+
+      const scored = await findSimilarFactsScored(row.content, { kind, topK: 6 });
+      for (const s of scored) {
+        if (result.merged >= maxMerges) break;
+        if (s.fact.id === row.id || folded.has(s.fact.id)) continue;
+        // scored is cosine-desc; once below the bar, no later one qualifies.
+        if (s.sim === null || s.sim < simThreshold) break;
+
+        // Keep the higher-scored fact (tie → larger id = newer); drop the other.
+        const keepId = s.fact.score > row.score
+          || (s.fact.score === row.score && s.fact.id > row.id)
+          ? s.fact.id
+          : row.id;
+        const dropId = keepId === row.id ? s.fact.id : row.id;
+
+        if (deleteFact(dropId)) {
+          folded.add(dropId);
+          result.merged += 1;
+          result.ids.push(dropId);
+        }
+        if (dropId === row.id) break; // the outer fact itself was folded away
+      }
+    }
+  }
+  return result;
 }

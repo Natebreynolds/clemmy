@@ -321,10 +321,25 @@ export function deleteFact(id: number): boolean {
  * actual contradiction-vs-complement judgment; this retrieval just
  * narrows the candidate pool.
  */
-export async function findSimilarFacts(
+/** A fact paired with its similarity to the query. `sim` is the cosine
+ *  similarity (0..1) on the semantic path, or `null` on the lexical
+ *  fallback path (no comparable score is available without embeddings).
+ *  Callers that gate on a similarity threshold (novelty fast-path, dedup)
+ *  MUST treat `null` as "unknown" and not threshold against it. */
+export interface ScoredFact {
+  fact: ConsolidatedFact;
+  sim: number | null;
+}
+
+/**
+ * Like {@link findSimilarFacts} but returns each fact paired with its
+ * cosine similarity to the query (semantic path) or `null` (lexical
+ * fallback). Single source of truth — `findSimilarFacts` strips the score.
+ */
+export async function findSimilarFactsScored(
   content: string,
   options: { kind?: ConsolidatedFactKind; topK?: number } = {},
-): Promise<ConsolidatedFact[]> {
+): Promise<ScoredFact[]> {
   const db = openMemoryDb();
   const topK = Math.max(1, Math.min(20, options.topK ?? 5));
   const normalized = normalizeContent(content);
@@ -354,18 +369,20 @@ export async function findSimilarFacts(
             scored.push({ id, sim: cosine(queryVector, vec) });
           }
           scored.sort((a, b) => b.sim - a.sim);
-          const topIds = scored.slice(0, topK).map((s) => s.id);
+          const top = scored.slice(0, topK);
+          const topIds = top.map((s) => s.id);
           if (topIds.length > 0) {
+            const simById = new Map(top.map((s) => [s.id, s.sim]));
             const placeholders = topIds.map(() => '?').join(',');
             const factRows = db.prepare(
               `SELECT * FROM consolidated_facts WHERE id IN (${placeholders})`
             ).all(...topIds) as ConsolidatedFactRow[];
             const byId = new Map(factRows.map((r) => [r.id, r]));
-            // Preserve cosine order.
+            // Preserve cosine order, carrying the similarity score.
             return topIds
               .map((id) => byId.get(id))
               .filter((r): r is ConsolidatedFactRow => Boolean(r))
-              .map(rowToFact);
+              .map((r) => ({ fact: rowToFact(r), sim: simById.get(r.id) ?? null }));
           }
         }
       }
@@ -396,14 +413,37 @@ export async function findSimilarFacts(
     LIMIT 200
   `).all(...(options.kind ? [options.kind] : []), ...tokens.map((t) => `%${t}%`)) as ConsolidatedFactRow[];
 
-  // Score by token-occurrence count, return top-K.
+  // Score by token-occurrence count, return top-K. No cosine available on
+  // this path, so sim is null (callers must not threshold against it).
   const scored = matches.map((row) => {
     const lc = row.content.toLowerCase();
     const hits = tokens.reduce((sum, t) => sum + (lc.includes(t) ? 1 : 0), 0);
     return { row, hits };
   });
   scored.sort((a, b) => b.hits - a.hits || (b.row.updated_at || '').localeCompare(a.row.updated_at || ''));
-  return scored.slice(0, topK).map((s) => rowToFact(s.row));
+  return scored.slice(0, topK).map((s) => ({ fact: rowToFact(s.row), sim: null }));
+}
+
+export async function findSimilarFacts(
+  content: string,
+  options: { kind?: ConsolidatedFactKind; topK?: number } = {},
+): Promise<ConsolidatedFact[]> {
+  return (await findSimilarFactsScored(content, options)).map((s) => s.fact);
+}
+
+/**
+ * Agent-facing semantic search over the durable fact store (Tier B).
+ * Thin wrapper over {@link findSimilarFacts} — the conflict resolver's
+ * `findSimilarFacts` was previously the ONLY semantic entry into the
+ * 800+ fact long-tail, and it was internal-only, so on-demand fact recall
+ * was limited to the ~40 facts that win a MEMORY.md slot. This exposes the
+ * full embedded pool to `memory_search_facts`.
+ */
+export async function searchFacts(
+  query: string,
+  options: { kind?: ConsolidatedFactKind; topK?: number } = {},
+): Promise<ConsolidatedFact[]> {
+  return findSimilarFacts(query, { kind: options.kind, topK: options.topK ?? 8 });
 }
 
 /**
@@ -823,4 +863,79 @@ export function countActiveFacts(): number {
   } catch {
     return 0;
   }
+}
+
+export interface DecayOptions {
+  /** Max facts to soft-delete in a single pass (blast-radius cap). */
+  maxDeactivate?: number;
+  /** Only consider facts idle (no access/update) for at least this many days. */
+  minIdleDays?: number;
+  /** Only consider facts whose importance is at or below this (1–10).
+   *  Default 4 is strictly BELOW the 5.0 default, so the majority of
+   *  facts (default-importance, never reflection-scored) are NEVER
+   *  evicted by decay — only facts the reflector judged low-salience. */
+  importanceCeil?: number;
+  /** Soft-delete only when the Stanford recall score is below this floor. */
+  scoreFloor?: number;
+  nowMs?: number;
+}
+
+export interface DecayResult {
+  scanned: number;
+  deactivated: number;
+  ids: number[];
+}
+
+/**
+ * Forgetting / staleness eviction (Tier A2). Soft-deletes (active=0)
+ * active, NON-PINNED facts that are simultaneously (a) idle past
+ * `minIdleDays`, (b) low-importance (<= `importanceCeil`, default 4 — below
+ * the 5.0 default so the bulk of the store is protected), and (c) below the
+ * Stanford recall-score floor. Bounded by `maxDeactivate` per run.
+ *
+ * Decay is a STORAGE complement to the existing RANKING-time recency decay
+ * (`stanfordRecallScore`): ranking demotes stale facts in the prompt; this
+ * actually retires the long, low-value tail so the fact store stops growing
+ * unbounded. Conservative by design and flag-gated off — the owner tunes the
+ * thresholds from telemetry, mirroring CLEMMY_REFLECTION_THRESHOLD.
+ *
+ * Soft delete only (active=0): the row, its embedding, and its audit trail
+ * survive for re-activation, exactly like `deleteFact`/Mem0 DELETE.
+ */
+export function decayAndEvictFacts(options: DecayOptions = {}): DecayResult {
+  const maxDeactivate = Math.max(0, options.maxDeactivate ?? 100);
+  const minIdleDays = Math.max(1, options.minIdleDays ?? 60);
+  const importanceCeil = Math.max(1, Math.min(10, options.importanceCeil ?? 4));
+  const scoreFloor = options.scoreFloor ?? 0.4;
+  const nowMs = options.nowMs ?? Date.now();
+  const result: DecayResult = { scanned: 0, deactivated: 0, ids: [] };
+  if (maxDeactivate === 0) return result;
+
+  const db = openMemoryDb();
+  const idleCutoff = new Date(nowMs - minIdleDays * 24 * 60 * 60 * 1000).toISOString();
+  // Candidate set: active, unpinned, idle, low-importance. Over-fetch (×4)
+  // so the score-floor filter below still has room to hit maxDeactivate.
+  const rows = db.prepare(`
+    SELECT * FROM consolidated_facts
+    WHERE active = 1
+      AND pinned = 0
+      AND COALESCE(last_accessed_at, extracted_at, updated_at, created_at) < ?
+      AND COALESCE(importance, 5) <= ?
+    ORDER BY COALESCE(last_accessed_at, updated_at, created_at) ASC
+    LIMIT ?
+  `).all(idleCutoff, importanceCeil, maxDeactivate * 4) as ConsolidatedFactRow[];
+
+  for (const row of rows) {
+    result.scanned += 1;
+    if (result.deactivated >= maxDeactivate) break;
+    const fact = rowToFact(row);
+    // Final gate: even an idle low-importance fact survives if its Stanford
+    // recall score is still above the floor (e.g. importance was bumped).
+    if (stanfordRecallScore(fact, nowMs) > scoreFloor) continue;
+    if (deleteFact(fact.id)) {
+      result.deactivated += 1;
+      result.ids.push(fact.id);
+    }
+  }
+  return result;
 }

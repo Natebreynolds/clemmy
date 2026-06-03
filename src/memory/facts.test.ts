@@ -18,6 +18,8 @@ process.env.CLEMENTINE_HOME = TEST_HOME;
 const { resetMemoryDb, openMemoryDb } = await import('./db.js');
 // eslint-disable-next-line import/first
 const {
+  decayAndEvictFacts,
+  findSimilarFactsScored,
   forgetFact,
   getFact,
   lexicalRelevance,
@@ -27,8 +29,11 @@ const {
   rememberFact,
   renderFactsForInstructions,
   reviewStandingInstructions,
+  searchFacts,
   setFactPinned,
 } = await import('./facts.js');
+
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 before(() => {
   rmSync(TEST_HOME, { recursive: true, force: true });
@@ -274,4 +279,68 @@ test('pinned fact is not double-rendered (excluded from the scored section)', ()
   const rendered = renderFactsForInstructions(10, 4000);
   const occurrences = rendered.split('Quote prices in USD only').length - 1;
   assert.equal(occurrences, 1, 'pinned fact should appear exactly once');
+});
+
+// ─────────────────────────────────────────────────────────────────
+// Tier A2 — decay / eviction (forgetting). No embeddings needed.
+// ─────────────────────────────────────────────────────────────────
+
+test('decayAndEvictFacts soft-deletes idle, low-importance, unpinned facts', () => {
+  const stale = rememberFact({ kind: 'project', content: 'Old throwaway scratch note about a one-off task.', importance: 2 });
+  const future = Date.now() + 90 * DAY_MS; // make `stale` look 90 days idle
+  const result = decayAndEvictFacts({ nowMs: future });
+  assert.ok(result.deactivated >= 1, 'at least the stale low-importance fact is evicted');
+  assert.ok(result.ids.includes(stale.id), 'the stale fact id is in the eviction set');
+  const after = getFact(stale.id);
+  assert.equal(after?.active, false, 'stale fact is soft-deleted (active=0)');
+});
+
+test('decayAndEvictFacts protects pinned, high-importance, and default-importance facts', () => {
+  const pinnedLow = rememberFact({ kind: 'feedback', content: 'Always CC the partner on client emails.', importance: 2 });
+  setFactPinned(pinnedLow.id, true);
+  const important = rememberFact({ kind: 'project', content: 'Flagship Q3 launch is the top priority.', importance: 9 });
+  const defaultImp = rememberFact({ kind: 'user', content: 'Nathan works in the Pacific timezone.' }); // importance defaults to 5.0
+
+  const future = Date.now() + 120 * DAY_MS;
+  decayAndEvictFacts({ nowMs: future });
+
+  assert.equal(getFact(pinnedLow.id)?.active, true, 'pinned fact survives regardless of importance/idle');
+  assert.equal(getFact(important.id)?.active, true, 'high-importance fact survives');
+  assert.equal(getFact(defaultImp.id)?.active, true, 'default-importance (5.0) fact is above the ceil (4) and survives');
+});
+
+test('decayAndEvictFacts does not evict recently-accessed facts', () => {
+  const recent = rememberFact({ kind: 'project', content: 'Note touched just now, low importance.', importance: 2 });
+  // No future nowMs → "now" is the present, so the fact is not idle.
+  const result = decayAndEvictFacts();
+  assert.ok(!result.ids.includes(recent.id), 'a fresh fact is not idle and is not evicted');
+  assert.equal(getFact(recent.id)?.active, true);
+});
+
+test('decayAndEvictFacts honors the maxDeactivate cap', () => {
+  for (let i = 0; i < 5; i++) {
+    rememberFact({ kind: 'project', content: `Stale low-value note number ${i}.`, importance: 1 });
+  }
+  const future = Date.now() + 90 * DAY_MS;
+  const result = decayAndEvictFacts({ nowMs: future, maxDeactivate: 2 });
+  assert.equal(result.deactivated, 2, 'never soft-deletes more than the cap in one pass');
+});
+
+// ─────────────────────────────────────────────────────────────────
+// Tier B1 / scored similarity — lexical fallback (no embeddings here).
+// ─────────────────────────────────────────────────────────────────
+
+test('findSimilarFactsScored reports sim=null on the lexical fallback path', async () => {
+  rememberFact({ kind: 'user', content: 'Nathan prefers concise replies in markdown.' });
+  const scored = await findSimilarFactsScored('concise markdown replies', { kind: 'user', topK: 5 });
+  assert.ok(scored.length >= 1, 'lexical fallback returns a candidate');
+  assert.equal(scored[0].sim, null, 'no cosine score available without embeddings');
+  assert.ok(scored[0].fact.content.length > 0);
+});
+
+test('searchFacts returns relevant facts via lexical fallback', async () => {
+  rememberFact({ kind: 'project', content: 'The deployment runs on a nightly cron at 3am.' });
+  rememberFact({ kind: 'user', content: 'Nathan likes terse status updates.' });
+  const hits = await searchFacts('nightly cron deployment', { topK: 5 });
+  assert.ok(hits.some((f) => /cron/i.test(f.content)), 'token-overlap match surfaces');
 });

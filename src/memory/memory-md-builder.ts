@@ -41,7 +41,7 @@ import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync } from '
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import pino from 'pino';
-import { MEMORY_FILE } from './vault.js';
+import { MEMORY_FILE, MEMORY_PROMPT_READ_CHARS } from './vault.js';
 import { listActiveFacts, countActiveFacts, type ConsolidatedFact } from './facts.js';
 
 const logger = pino({ name: 'clementine-next.memory.md-builder' });
@@ -172,6 +172,15 @@ export interface RegenerateMemoryMdResult {
   factCount: number;
   autoSectionChars: number;
   hadMarker: boolean;
+  /** Tier C1: total assembled file length in chars. */
+  totalChars: number;
+  /** Tier C1: true when the assembled file exceeds the prompt read budget
+   *  (MEMORY_PROMPT_READ_CHARS), so its tail is clipped from the per-turn
+   *  injection. NOT data loss — facts are independently injected via
+   *  renderFactsForInstructions (the SQLite stream) — but the human-readable
+   *  MEMORY.md view in the prompt is truncated. Surfaced so the owner/doctor
+   *  can see it instead of silent clipping. */
+  promptTruncated: boolean;
 }
 
 /**
@@ -207,9 +216,12 @@ export function regenerateMemoryMd(): RegenerateMemoryMdResult {
   // unchanged. Without this, every tick writes — the test suite
   // happened to pass because consecutive calls fired in the same
   // millisecond, but the maintenance loop has 30-min gaps.
+  const totalChars = next.length;
+  const promptTruncated = totalChars > MEMORY_PROMPT_READ_CHARS;
+
   const normalizeForDiff = (s: string) => s.replace(/_Auto-regenerated [^_]+_/g, '_Auto-regenerated <ts>_');
   if (normalizeForDiff(next) === normalizeForDiff(existing)) {
-    return { written: false, reason: 'unchanged', factCount, autoSectionChars: autoBody.length, hadMarker };
+    return { written: false, reason: 'unchanged', factCount, autoSectionChars: autoBody.length, hadMarker, totalChars, promptTruncated };
   }
   atomicWrite(MEMORY_FILE, next);
   return {
@@ -218,6 +230,8 @@ export function regenerateMemoryMd(): RegenerateMemoryMdResult {
     factCount,
     autoSectionChars: autoBody.length,
     hadMarker,
+    totalChars,
+    promptTruncated,
   };
 }
 
@@ -228,6 +242,17 @@ export function tickMemoryMdRefresh(): void {
     const result = regenerateMemoryMd();
     if (result.written) {
       logger.info({ result }, 'MEMORY.md refreshed');
+    }
+    // Tier C1: warn (not silent) when the assembled file is larger than the
+    // per-turn prompt budget so its tail is clipped from the injected view.
+    // Facts are still injected via renderFactsForInstructions, so this is a
+    // visibility signal, not data loss. Fires at most once per ~30-min tick
+    // and only while overflowing.
+    if (result.promptTruncated) {
+      logger.warn(
+        { totalChars: result.totalChars, readBudget: MEMORY_PROMPT_READ_CHARS, factCount: result.factCount },
+        'MEMORY.md exceeds the prompt read budget — its tail is clipped from the injected view (facts still injected via the SQLite stream)',
+      );
     }
   } catch (err) {
     logger.warn({ err }, 'MEMORY.md refresh failed');

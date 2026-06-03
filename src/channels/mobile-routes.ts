@@ -951,6 +951,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
           importance: fact.importance ?? null,
           updatedAt: fact.updatedAt,
           lastAccessedAt: fact.lastAccessedAt ?? null,
+          pinned: fact.pinned === true,
         })),
       });
     } catch (err) {

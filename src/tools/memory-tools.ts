@@ -4,9 +4,19 @@ import { z } from 'zod';
 import { formatSearchHits, searchVaultAsync } from '../memory/search.js';
 import { recallHybrid } from '../memory/recall.js';
 import { embedMissingChunks, isEmbeddingsEnabled, readEmbeddingStats } from '../memory/embeddings.js';
-import { FACT_KINDS, forgetFact, getFact, listActiveFacts, listAllFacts, rememberFact, reviewStandingInstructions, setFactPinned } from '../memory/facts.js';
+import { FACT_KINDS, forgetFact, getFact, listActiveFacts, listAllFacts, rememberFact, reviewStandingInstructions, searchFacts, setFactPinned } from '../memory/facts.js';
+import { consolidateFact } from '../memory/reflection.js';
+import { getRuntimeEnv } from '../config.js';
 import { WORKING_MEMORY_FILE } from '../memory/vault.js';
 import { readText, replaceFile, resolveMemoryTarget, textResult } from './shared.js';
+
+// Tier A1 — when CLEMMY_REMEMBER_RECONCILE=on, the agent's explicit
+// memory_remember writes route through the Mem0 conflict resolver
+// (consolidateFact) instead of blind-appending, so a restated/contradicted
+// preference UPDATEs or supersedes the old fact instead of stacking a
+// duplicate. Below this cosine bar a candidate is treated as clearly novel
+// and ADDed without an LLM resolver call (cost fast-path).
+const REMEMBER_NOVELTY_FAST_PATH_SIM = 0.6;
 
 export function registerMemoryTools(server: McpServer): void {
   server.tool(
@@ -120,6 +130,24 @@ export function registerMemoryTools(server: McpServer): void {
     },
     async ({ kind, content, sessionId, sourcePath }) => {
       try {
+        const reconcile = (getRuntimeEnv('CLEMMY_REMEMBER_RECONCILE', 'off') || 'off').toLowerCase() === 'on';
+        if (reconcile) {
+          // Route through the Mem0 resolver. User-stated facts pass trust
+          // 1.0 so they win conflicts against derived (0.6) facts.
+          const outcome = await consolidateFact(
+            { kind: kind as (typeof FACT_KINDS)[number], text: content, trustLevel: 1.0 },
+            { sessionId },
+            { noveltyFastPathSim: REMEMBER_NOVELTY_FAST_PATH_SIM },
+          );
+          const verb = outcome.updated
+            ? 'Updated an existing fact'
+            : outcome.deleted
+              ? 'Superseded the prior fact and recorded'
+              : outcome.noop
+                ? 'Already known — no change'
+                : 'Remembered';
+          return textResult(`${verb} (${kind}): ${content}`);
+        }
         const fact = rememberFact({
           kind: kind as (typeof FACT_KINDS)[number],
           content,
@@ -155,6 +183,25 @@ export function registerMemoryTools(server: McpServer): void {
         const flag = fact.active ? '' : ' [inactive]';
         return `- #${fact.id} ${fact.kind} (${fact.score.toFixed(2)})${flag}: ${fact.content}`;
       });
+      return textResult(lines.join('\n'));
+    },
+  );
+
+  server.tool(
+    'memory_search_facts',
+    'Semantically search durable FACTS (your long-term memory of the user, projects, standing feedback, references) by meaning. Unlike memory_search/memory_recall (which search the vault notes), this queries the consolidated_facts store directly via embeddings — use it to answer "what do I already know about X?" before asking the user or re-deriving. Returns the most relevant facts even when they share no exact words with the query.',
+    {
+      query: z.string().min(1),
+      kind: z.enum(FACT_KINDS as unknown as [string, ...string[]]).optional(),
+      limit: z.number().int().min(1).max(20).optional(),
+    },
+    async ({ query, kind, limit }) => {
+      const facts = await searchFacts(query, {
+        kind: kind as (typeof FACT_KINDS)[number] | undefined,
+        topK: limit ?? 8,
+      });
+      if (facts.length === 0) return textResult('No relevant facts found.');
+      const lines = facts.map((fact) => `- #${fact.id} ${fact.kind}: ${fact.content}`);
       return textResult(lines.join('\n'));
     },
   );

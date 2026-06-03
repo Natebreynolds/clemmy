@@ -321,6 +321,7 @@ export interface MemoryFact {
   importance: number | null;
   updatedAt: string;
   lastAccessedAt: string | null;
+  pinned?: boolean;
 }
 
 export async function listFacts(kind?: MemoryFact['kind'], limit = 60): Promise<{ facts: MemoryFact[] }> {

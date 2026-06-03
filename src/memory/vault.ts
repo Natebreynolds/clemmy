@@ -18,6 +18,14 @@ export const CRON_FILE = path.join(SYSTEM_DIR, 'CRON.md');
 export const WORKFLOWS_DIR = path.join(SYSTEM_DIR, 'workflows');
 export const WORKING_MEMORY_FILE = path.join(BASE_DIR, 'working-memory.md');
 
+/** Char budget MEMORY.md gets when injected into the prompt every turn.
+ *  The auto-section builder caps its output at 6000 chars, but the
+ *  authoritative fact carrier in the prompt is renderFactsForInstructions
+ *  (the SQLite stream), so MEMORY.md is a secondary human-readable surface
+ *  and stays at a tight budget. Exported so the builder (Tier C1) can warn
+ *  when the assembled file exceeds what the prompt actually reads. */
+export const MEMORY_PROMPT_READ_CHARS = 4000;
+
 function readMaybe(filePath: string, maxChars = 4000): string | undefined {
   if (!existsSync(filePath)) return undefined;
   try {
@@ -44,7 +52,7 @@ export function loadMemoryContext(): MemoryContext {
   ensureVaultScaffold();
   return {
     soul: readMaybe(SOUL_FILE),
-    memory: readMaybe(MEMORY_FILE),
+    memory: readMaybe(MEMORY_FILE, MEMORY_PROMPT_READ_CHARS),
     identity: readMaybe(IDENTITY_FILE),
     workingMemory: readMaybe(WORKING_MEMORY_FILE, 3000),
   };

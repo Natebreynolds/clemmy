@@ -26,7 +26,8 @@ import { DISCORD_BOT_TOKEN, DISCORD_ENABLED, WEBHOOK_ENABLED, WEBHOOK_SECRET } f
 import { fullScan as warmCliScan } from '../runtime/cli-discovery.js';
 import { closePlanScope, openPlanScope } from '../agents/plan-scope.js';
 import { processMemoryMaintenance } from '../memory/maintenance.js';
-import { runRecursiveReflection } from '../memory/reflection.js';
+import { runRecursiveReflection, consolidateActiveFacts } from '../memory/reflection.js';
+import { decayAndEvictFacts } from '../memory/facts.js';
 import {
   CRON_FILE,
 } from '../memory/vault.js';
@@ -80,6 +81,9 @@ interface DaemonState {
   // local). Set after a successful run so we fire exactly once per
   // local day even across daemon restarts.
   lastRecursiveReflectionDay?: string;
+  // Tier A2/A3: nightly memory-hygiene day-stamp (decay + dedup). Same
+  // once-per-local-day-across-restarts contract as recursive reflection.
+  lastMemoryHygieneDay?: string;
 }
 
 const DELIVERY_MAX_ATTEMPTS = 5;
@@ -345,6 +349,52 @@ async function processRecursiveReflectionTick(state: DaemonState): Promise<void>
       { err: err instanceof Error ? err.message : String(err) },
       'Brain recursive reflection failed (will retry tomorrow)',
     );
+  }
+}
+
+// Tier A2/A3 — nightly memory hygiene: forgetting (decay/eviction of the
+// stale, low-value, unpinned tail) + retroactive semantic dedup of
+// near-identical facts. Without this the consolidated_facts store only
+// grows (~100/day with ~zero deactivation). Both halves are flag-gated
+// (default off) and conservative + bounded; the owner flips them on after
+// tuning thresholds from observed counts. Same once-per-local-day,
+// survives-restart contract as recursive reflection (offset one hour so
+// the two brain jobs don't pile onto the same tick).
+const MEMORY_HYGIENE_LOCAL_HOUR = 4;
+
+async function processMemoryHygieneTick(state: DaemonState): Promise<void> {
+  const decayOn = (getRuntimeEnv('CLEMMY_MEMORY_DECAY', 'off') || 'off').toLowerCase() === 'on';
+  const dedupOn = (getRuntimeEnv('CLEMMY_MEMORY_DEDUP', 'off') || 'off').toLowerCase() === 'on';
+  if (!decayOn && !dedupOn) return;
+
+  const now = new Date();
+  if (now.getHours() < MEMORY_HYGIENE_LOCAL_HOUR) return;
+  const day = localDayKey(now);
+  if (state.lastMemoryHygieneDay === day) return;
+  state.lastMemoryHygieneDay = day;
+  saveState(state);
+
+  if (decayOn) {
+    try {
+      const result = decayAndEvictFacts();
+      logger.info({ result }, 'Memory decay/eviction completed');
+    } catch (err) {
+      logger.warn(
+        { err: err instanceof Error ? err.message : String(err) },
+        'Memory decay/eviction failed (will retry tomorrow)',
+      );
+    }
+  }
+  if (dedupOn) {
+    try {
+      const result = await consolidateActiveFacts();
+      logger.info({ result }, 'Memory dedup/consolidation completed');
+    } catch (err) {
+      logger.warn(
+        { err: err instanceof Error ? err.message : String(err) },
+        'Memory dedup/consolidation failed (will retry tomorrow)',
+      );
+    }
   }
 }
 
@@ -1006,6 +1056,7 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
     }
     await processMemoryMaintenance(tickCount);
     await processRecursiveReflectionTick(state);
+    await processMemoryHygieneTick(state);
     // Notification delivery used to run inline here. It now ticks on
     // its own independent setInterval above, so deliveries keep
     // flowing while this loop is parked on a long workflow / cron /

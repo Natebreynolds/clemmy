@@ -1,7 +1,10 @@
-import { statSync } from 'node:fs';
+import { statSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
 import { createHash } from 'node:crypto';
 import pino from 'pino';
+import { getRuntimeEnv } from '../config.js';
 import { embedMissingChunks, embedMissingFacts, isEmbeddingsEnabled } from './embeddings.js';
+import { STATE_DIR, backupMemoryDb, reapStaleEpisodicPointers } from './db.js';
 import { reindexVault } from './indexer.js';
 import { tickMemoryMdRefresh } from './memory-md-builder.js';
 import { tickIdentityMdRefresh } from './identity-md-builder.js';
@@ -87,11 +90,37 @@ const RECALL_REAPER_EVERY_N_TICKS = 20; // ~5min with a 15s tick
 // Cheap: skips any note already newer than its analysis JSON (2 stats),
 // so steady-state work is ~0 once everything is filed.
 const MEETING_FILING_EVERY_N_TICKS = 8; // ~2min with a 15s tick
-// Track the last calendar day on which we fired the nightly run so we
+// Track the last calendar day on which we fired each nightly job so we
 // don't re-fire 240 times across the matching minute window (15s ticks
-// inside 3:00–3:00:59 would otherwise all match). Reset per-process —
-// the dedupe inside writeReport handles cross-restart safety.
-let lastNightlyFireDay = '';
+// inside 3:00–3:00:59 would otherwise all match). PERSISTED to disk (Tier
+// C4) so a daemon restart inside the 3:00–4:30 window can't double-fire:
+// previously these were per-process `let`s that reset to '' on every boot.
+interface MemoryMaintenanceState {
+  lastNightlyFireDay?: string;
+  lastSkillUpdateFireDay?: string;
+  lastBackupDay?: string;
+}
+const MAINTENANCE_STATE_FILE = path.join(STATE_DIR, 'memory-maintenance-state.json');
+
+function readMaintenanceState(): MemoryMaintenanceState {
+  try {
+    return JSON.parse(readFileSync(MAINTENANCE_STATE_FILE, 'utf-8')) as MemoryMaintenanceState;
+  } catch {
+    return {};
+  }
+}
+
+function writeMaintenanceState(state: MemoryMaintenanceState): void {
+  try {
+    if (!existsSync(STATE_DIR)) mkdirSync(STATE_DIR, { recursive: true });
+    writeFileSync(MAINTENANCE_STATE_FILE, JSON.stringify(state), 'utf-8');
+  } catch (err) {
+    logger.warn({ err }, 'failed to persist memory-maintenance state');
+  }
+}
+
+// Loaded once at module init, mutated + persisted on each nightly fire.
+const maintenanceState: MemoryMaintenanceState = readMaintenanceState();
 
 // Skill update poll. Installed skills (SKILL.md repos) drift behind
 // their GitHub source; this surfaces "update available" without forcing
@@ -102,8 +131,18 @@ let lastNightlyFireDay = '';
 const SKILL_UPDATE_EVERY_N_TICKS = 5760; // ~24h with a 15s tick
 const SKILL_UPDATE_NIGHTLY_HOUR = 4;     // 4:00 AM local (offset from autoresearch's 3:00)
 const SKILL_UPDATE_NIGHTLY_MINUTE = 0;
-let lastSkillUpdateFireDay = '';
 let skillUpdateCheckInFlight = false;
+
+// Tier C2 — nightly memory.db backup (default on; CLEMMY_MEMORY_BACKUP=off
+// to disable). Fires once per local day at/after the backup hour, deduped
+// via the persisted lastBackupDay. Retains the newest N snapshots.
+const MEMORY_BACKUP_NIGHTLY_HOUR = 4;
+const MEMORY_BACKUP_NIGHTLY_MINUTE = 30; // offset from skill-update's 4:00
+const MEMORY_BACKUP_RETAIN = 7;
+
+// Tier C3 — episodic_pointers TTL reaper cadence (~1h, same as the
+// tool_outputs reaper it shadows).
+const EPISODIC_REAPER_EVERY_N_TICKS = 240; // ~1h with a 15s tick
 
 /**
  * Run the skill update poll out-of-band (the network calls shouldn't
@@ -221,6 +260,22 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
     }
   }
 
+  // Tier C3 — episodic_pointers TTL reaper. Pointers outlive the tool
+  // outputs they reference (eventlog reaper drops those at ~14d), so a
+  // pointer past its TTL is a dead breadcrumb. Same always-on, indexed-
+  // DELETE class as the tool_outputs reaper above. Tunable TTL.
+  if (tickCount % EPISODIC_REAPER_EVERY_N_TICKS === 0) {
+    try {
+      const ttl = Number.parseInt(getRuntimeEnv('CLEMMY_EPISODIC_TTL_DAYS', '30') || '30', 10);
+      const deleted = reapStaleEpisodicPointers({ maxAgeDays: Number.isFinite(ttl) && ttl > 0 ? ttl : 30 });
+      if (deleted > 0) {
+        logger.info({ deleted }, 'episodic_pointers reaper tick');
+      }
+    } catch (err) {
+      logger.warn({ err }, 'episodic_pointers reaper tick failed');
+    }
+  }
+
   // Recall stuck-recording reaper — finalize abandoned 'recording'
   // records so they stop showing as live and get analyzed. Mirrors the
   // post-processing the /api/console/meetings/recall/complete route does
@@ -287,8 +342,9 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
   const now = new Date();
   const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
   if (now.getHours() === AUTORESEARCH_NIGHTLY_HOUR && now.getMinutes() === AUTORESEARCH_NIGHTLY_MINUTE) {
-    if (lastNightlyFireDay !== today) {
-      lastNightlyFireDay = today;
+    if (maintenanceState.lastNightlyFireDay !== today) {
+      maintenanceState.lastNightlyFireDay = today;
+      writeMaintenanceState(maintenanceState);
       tickAutoresearchObservatory();
     }
   }
@@ -297,9 +353,30 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
   // fire-once-per-day dedupe as autoresearch). Offset an hour so the two
   // nightly jobs don't pile onto the same tick.
   if (now.getHours() === SKILL_UPDATE_NIGHTLY_HOUR && now.getMinutes() === SKILL_UPDATE_NIGHTLY_MINUTE) {
-    if (lastSkillUpdateFireDay !== today) {
-      lastSkillUpdateFireDay = today;
+    if (maintenanceState.lastSkillUpdateFireDay !== today) {
+      maintenanceState.lastSkillUpdateFireDay = today;
+      writeMaintenanceState(maintenanceState);
       runSkillUpdatePoll('nightly');
+    }
+  }
+
+  // Tier C2 — nightly memory.db backup at 4:30 AM local (default on).
+  // Fire-once-per-day, persisted dedupe like the jobs above.
+  if (now.getHours() === MEMORY_BACKUP_NIGHTLY_HOUR && now.getMinutes() === MEMORY_BACKUP_NIGHTLY_MINUTE) {
+    const backupEnabled = (getRuntimeEnv('CLEMMY_MEMORY_BACKUP', 'on') || 'on').toLowerCase() !== 'off';
+    if (backupEnabled && maintenanceState.lastBackupDay !== today) {
+      maintenanceState.lastBackupDay = today;
+      writeMaintenanceState(maintenanceState);
+      try {
+        const result = backupMemoryDb({ retain: MEMORY_BACKUP_RETAIN });
+        if (result) {
+          logger.info({ backupPath: result.backupPath, bytes: result.bytes }, 'memory.db nightly backup written');
+        } else {
+          logger.warn('memory.db nightly backup returned no result');
+        }
+      } catch (err) {
+        logger.warn({ err }, 'memory.db nightly backup failed');
+      }
     }
   }
 }

@@ -168,6 +168,7 @@ const ALWAYS_READ = new Set<string>([
   'background_tasks_recent',
   'background_task_status',
   'memory_list_facts',
+  'memory_search_facts',
   'memory_read',
   'memory_recall',
   'memory_search',

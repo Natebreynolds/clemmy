@@ -5347,19 +5347,33 @@ body {
   letter-spacing: 0.1em;
   color: var(--fg-3);
 }
-.fact-viewer .forget {
+.fact-viewer .fact-actions {
   margin-top: 14px;
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.fact-viewer .forget,
+.fact-viewer .pin,
+.fact-viewer .edit {
   background: transparent;
-  border: 1px solid var(--accent-fail);
-  color: var(--accent-fail);
+  border: 1px solid var(--fg-3);
+  color: var(--fg-2);
   padding: 6px 12px;
   font: inherit;
   font-size: 10px;
   letter-spacing: 0.16em;
   cursor: pointer;
-  transition: background 100ms, color 100ms;
+  transition: background 100ms, color 100ms, border-color 100ms;
+}
+.fact-viewer .forget {
+  border-color: var(--accent-fail);
+  color: var(--accent-fail);
 }
 .fact-viewer .forget:hover { background: var(--accent-fail); color: var(--bg-0); }
+.fact-viewer .pin { border-color: var(--accent); color: var(--accent); }
+.fact-viewer .pin:hover { background: var(--accent); color: var(--bg-0); }
+.fact-viewer .edit:hover { background: var(--fg-3); color: var(--bg-0); }
 
 /* ── Context / Identity panel ─────────────────────────────────── */
 .context-layout {
@@ -14230,19 +14244,25 @@ const CONSOLE_JS = `
   }
 
   function renderFactViewer(fact) {
+    const pinnedTag = fact.pinned ? ' · 📌 PINNED' : '';
     const html = [
       '<div class="fact-viewer">',
-      '  <div class="kind">' + escMem(fact.kind.toUpperCase()) + ' · #' + fact.id + '</div>',
+      '  <div class="kind">' + escMem(fact.kind.toUpperCase()) + ' · #' + fact.id + pinnedTag + '</div>',
       '  <div class="body">' + escMem(fact.content) + '</div>',
       '  <div class="meta">score ' + (fact.score || 1).toFixed(2)
          + ' · created ' + (fact.createdAt ? fact.createdAt.slice(0, 19).replace('T', ' ') : '—')
          + ' · updated ' + (fact.updatedAt ? fact.updatedAt.slice(0, 19).replace('T', ' ') : '—') + '</div>',
-      '  <button class="forget" data-forget-id="' + fact.id + '">FORGET ▣</button>',
+      '  <div class="fact-actions">',
+      '    <button class="edit" data-edit-id="' + fact.id + '">EDIT ✎</button>',
+      '    <button class="pin" data-pin-id="' + fact.id + '">' + (fact.pinned ? 'UNPIN ▤' : 'PIN ▤') + '</button>',
+      '    <button class="forget" data-forget-id="' + fact.id + '">FORGET ▣</button>',
+      '  </div>',
       '</div>',
     ].join('');
     mem.viewer.innerHTML = html;
-    const btn = mem.viewer.querySelector('.forget');
-    btn.addEventListener('click', async () => {
+
+    const forgetBtn = mem.viewer.querySelector('.forget');
+    forgetBtn.addEventListener('click', async () => {
       if (!confirm('Soft-delete fact #' + fact.id + '?')) return;
       try {
         await fetch(withToken('/api/console/memory/facts/' + fact.id + '/forget'), { method: 'POST' });
@@ -14251,6 +14271,49 @@ const CONSOLE_JS = `
         mem.viewer.innerHTML = '<div class="mem-empty"><div class="mem-empty-mark">▢</div><div class="mem-empty-text">FACT FORGOTTEN</div></div>';
       } catch (err) {
         alert('Forget failed: ' + (err.message || err));
+      }
+    });
+
+    // Tier D1 — pin / unpin a fact as a standing instruction.
+    const pinBtn = mem.viewer.querySelector('.pin');
+    pinBtn.addEventListener('click', async () => {
+      const want = !fact.pinned;
+      try {
+        await fetch(withToken('/api/console/memory/facts/' + fact.id + '/pin'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ pinned: want }),
+        });
+        fact.pinned = want;
+        renderFactViewer(fact);
+        await refreshFactList();
+      } catch (err) {
+        alert('Pin failed: ' + (err.message || err));
+      }
+    });
+
+    // Tier D1 — edit/correct a fact in place.
+    const editBtn = mem.viewer.querySelector('.edit');
+    editBtn.addEventListener('click', async () => {
+      const next = prompt('Edit fact #' + fact.id + ':', fact.content);
+      if (next === null) return;
+      const trimmed = next.trim();
+      if (!trimmed || trimmed === fact.content) return;
+      try {
+        const r = await fetch(withToken('/api/console/memory/facts/' + fact.id), {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ content: trimmed }),
+        });
+        const data = await r.json();
+        if (data && data.fact) {
+          renderFactViewer(data.fact);
+          await refreshFactList();
+        } else {
+          alert('Edit failed: ' + (data && data.error ? data.error : 'unknown error'));
+        }
+      } catch (err) {
+        alert('Edit failed: ' + (err.message || err));
       }
     });
   }

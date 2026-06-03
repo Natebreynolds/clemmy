@@ -21,9 +21,9 @@ import {
 } from '../config.js';
 import { getComposioRuntimeStatus } from '../integrations/composio/client.js';
 import { getGitHubCliStatus } from '../integrations/github-cli.js';
-import { recallHybrid } from '../memory/recall.js';
-import { bufferToVector } from '../memory/embeddings.js';
-import { FACT_KINDS, forgetFact, listActiveFacts, listAllFacts, rememberFact } from '../memory/facts.js';
+import { recallHybrid, getRecallStats } from '../memory/recall.js';
+import { bufferToVector, readEmbeddingStats } from '../memory/embeddings.js';
+import { FACT_KINDS, forgetFact, getFact, listActiveFacts, listAllFacts, rememberFact, searchFacts, setFactPinned, updateFact } from '../memory/facts.js';
 import { openMemoryDb } from '../memory/db.js';
 import {
   getFocusSnapshot,
@@ -1184,6 +1184,111 @@ export function registerConsoleRoutes(
     try {
       const ok = forgetFact(id);
       res.json({ ok });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * Tier D1 — edit/correct a fact's content (and optionally importance).
+   * Lets the owner fix a wrong derivation in place instead of only being
+   * able to soft-delete it. content_hash is recomputed by updateFact so
+   * future dedup still works.
+   */
+  app.patch('/api/console/memory/facts/:id', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isFinite(id) || id <= 0) { res.status(400).json({ error: 'invalid id' }); return; }
+    const body = (req.body ?? {}) as { content?: unknown; importance?: unknown };
+    const patch: { content?: string; importance?: number } = {};
+    if (typeof body.content === 'string' && body.content.trim()) patch.content = body.content.trim().slice(0, 800);
+    if (typeof body.importance === 'number' && Number.isFinite(body.importance)) patch.importance = body.importance;
+    if (patch.content === undefined && patch.importance === undefined) {
+      res.status(400).json({ error: 'nothing to update (provide content and/or importance)' });
+      return;
+    }
+    try {
+      const updated = updateFact(id, patch);
+      if (!updated) { res.status(404).json({ error: `no fact #${id}` }); return; }
+      res.json({ ok: true, fact: updated });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * Tier D1 — pin / unpin a fact as a standing instruction (always
+   * injected, exempt from the top-N cap + recency decay). Body: { pinned }.
+   */
+  app.post('/api/console/memory/facts/:id/pin', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isFinite(id) || id <= 0) { res.status(400).json({ error: 'invalid id' }); return; }
+    const pinned = ((req.body ?? {}) as { pinned?: unknown }).pinned !== false;
+    try {
+      const existing = getFact(id);
+      if (!existing) { res.status(404).json({ error: `no fact #${id}` }); return; }
+      const ok = setFactPinned(id, pinned);
+      res.json({ ok, pinned });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * Tier D3 — semantic search over the FACT store (distinct from
+   * /memory/search, which searches vault chunks). Lets the Memory panel
+   * answer "what does Clem know about X?" against consolidated_facts.
+   */
+  app.get('/api/console/memory/facts/search', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const query = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+    const limit = Math.max(1, Math.min(20, parseInt(typeof req.query.limit === 'string' ? req.query.limit : '8', 10) || 8));
+    if (!query) { res.json({ query: '', facts: [] }); return; }
+    try {
+      const facts = await searchFacts(query, { topK: limit });
+      res.json({ query, facts });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * Tier D2 — memory health/observability: fact counts, embedding coverage
+   * + freshness, recall hit-rate, and the hidden layers (pinned / episodic /
+   * focus) that the fact-centric panel doesn't otherwise surface.
+   */
+  app.get('/api/console/memory/health', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const db = openMemoryDb();
+      const one = (sql: string): number => (db.prepare(sql).get() as { c: number } | undefined)?.c ?? 0;
+      const facts = one('SELECT COUNT(*) AS c FROM consolidated_facts WHERE active = 1');
+      const factsInactive = one('SELECT COUNT(*) AS c FROM consolidated_facts WHERE active = 0');
+      const factEmbeds = one('SELECT COUNT(*) AS c FROM fact_embeddings');
+      const factsTotal = one('SELECT COUNT(*) AS c FROM consolidated_facts');
+      const chunks = one('SELECT COUNT(*) AS c FROM vault_chunks');
+      const chunkEmbeds = one('SELECT COUNT(*) AS c FROM embeddings');
+      const pinned = one('SELECT COUNT(*) AS c FROM consolidated_facts WHERE active = 1 AND pinned = 1');
+      const episodic = one('SELECT COUNT(*) AS c FROM episodic_pointers');
+      const entities = one('SELECT COUNT(*) AS c FROM entities');
+      const focusActive = one("SELECT COUNT(*) AS c FROM current_focus WHERE status = 'active'");
+      const embStats = readEmbeddingStats();
+      res.json({
+        facts: { active: facts, inactive: factsInactive, total: factsTotal, pinned },
+        entities,
+        episodicPointers: episodic,
+        focusActive,
+        embeddings: {
+          model: embStats.model,
+          dim: embStats.dim,
+          factCoverage: factsTotal > 0 ? factEmbeds / factsTotal : 0,
+          vaultCoverage: chunks > 0 ? chunkEmbeds / chunks : 0,
+          factEmbeds,
+          chunkEmbeds,
+        },
+        recall: getRecallStats(),
+      });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

@@ -35,6 +35,29 @@ const RRF_K = 60;
 /** Bound pure-vector fallback scans so personal vaults stay snappy. */
 const SEMANTIC_FALLBACK_MAX_SCAN = 5000;
 
+// Tier D2 — lightweight recall hit-rate telemetry. In-memory, process-local
+// (resets on restart) — enough for the dashboard "are recalls finding
+// anything?" health signal without a new table or write amplification.
+const recallStats = { calls: 0, hits: 0, empties: 0 };
+
+function recordRecall(hitCount: number): void {
+  recallStats.calls += 1;
+  if (hitCount > 0) recallStats.hits += 1;
+  else recallStats.empties += 1;
+}
+
+export interface RecallStats {
+  calls: number;
+  hits: number;
+  empties: number;
+  hitRate: number; // 0..1; 0 when no calls yet
+}
+
+export function getRecallStats(): RecallStats {
+  const { calls, hits, empties } = recallStats;
+  return { calls, hits, empties, hitRate: calls > 0 ? hits / calls : 0 };
+}
+
 interface RecallChunkRow {
   id: number;
   path: string;
@@ -217,7 +240,9 @@ async function semanticFallback(query: string, options: RecallOptions, limit: nu
 export function recall(query: string, options: RecallOptions = {}): MemorySearchHit[] {
   const limit = Math.max(1, options.limit ?? 6);
   const rows = fetchFtsCandidates(query, options, limit);
-  return rowsToHits(rows);
+  const hits = rowsToHits(rows);
+  recordRecall(hits.length);
+  return hits;
 }
 
 /**
@@ -227,6 +252,12 @@ export function recall(query: string, options: RecallOptions = {}): MemorySearch
  * no candidates in the pool have stored embeddings.
  */
 export async function recallHybrid(query: string, options: RecallOptions = {}): Promise<MemorySearchHit[]> {
+  const hits = await recallHybridImpl(query, options);
+  recordRecall(hits.length);
+  return hits;
+}
+
+async function recallHybridImpl(query: string, options: RecallOptions = {}): Promise<MemorySearchHit[]> {
   const limit = Math.max(1, options.limit ?? 6);
   const poolSize = Math.max(limit, RERANK_CANDIDATE_POOL);
   const candidates = fetchFtsCandidates(query, options, poolSize);

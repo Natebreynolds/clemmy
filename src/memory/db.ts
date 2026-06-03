@@ -1,5 +1,5 @@
 import Database from 'better-sqlite3';
-import { existsSync, mkdirSync, unlinkSync } from 'node:fs';
+import { existsSync, mkdirSync, unlinkSync, readdirSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { BASE_DIR } from '../config.js';
 
@@ -20,6 +20,7 @@ import { BASE_DIR } from '../config.js';
 
 export const STATE_DIR = path.join(BASE_DIR, 'state');
 export const MEMORY_DB_PATH = path.join(STATE_DIR, 'memory.db');
+export const MEMORY_BACKUP_DIR = path.join(STATE_DIR, 'backups');
 
 export type ConsolidatedFactKind = 'user' | 'project' | 'feedback' | 'reference';
 
@@ -458,5 +459,74 @@ export function resetMemoryDb(): void {
   for (const suffix of ['', '-wal', '-shm']) {
     const file = MEMORY_DB_PATH + suffix;
     if (existsSync(file)) unlinkSync(file);
+  }
+}
+
+export interface BackupResult {
+  backupPath: string;
+  bytes: number;
+}
+
+/**
+ * Tier C2 — disaster-recovery backup of the memory DB. Unlike the vault
+ * (rebuildable from markdown), `consolidated_facts`/`entities`/`embeddings`
+ * are NOT derivable from anything on disk — a corrupt memory.db loses the
+ * agent's whole long-term memory. This writes a consistent, defragmented
+ * snapshot and prunes to the newest `retain` copies.
+ *
+ * `VACUUM INTO` (vs a raw file copy) is atomic and consistent under WAL —
+ * it serializes a clean page image, so the backup is never a torn mid-write
+ * file. We checkpoint the WAL first so the live file is also compacted.
+ */
+export function backupMemoryDb(opts: { retain?: number } = {}): BackupResult | null {
+  const retain = Math.max(1, opts.retain ?? 7);
+  try {
+    const db = openMemoryDb();
+    // Fold the WAL back into the main file (TRUNCATE resets it) so both the
+    // live DB and the snapshot stay compact. Best-effort — a busy checkpoint
+    // is not fatal to the backup itself.
+    try { db.pragma('wal_checkpoint(TRUNCATE)'); } catch { /* best effort */ }
+
+    if (!existsSync(MEMORY_BACKUP_DIR)) mkdirSync(MEMORY_BACKUP_DIR, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const backupPath = path.join(MEMORY_BACKUP_DIR, `memory-${stamp}.db`);
+    // Escape single quotes for the SQL string literal (path is ours, but be safe).
+    db.exec(`VACUUM INTO '${backupPath.replace(/'/g, "''")}'`);
+
+    // Retention: ISO stamps sort lexicographically = chronologically, so the
+    // oldest are at the front. Keep the newest `retain`, drop the rest.
+    const backups = readdirSync(MEMORY_BACKUP_DIR)
+      .filter((f) => f.startsWith('memory-') && f.endsWith('.db'))
+      .sort();
+    for (let i = 0; i < backups.length - retain; i++) {
+      try { unlinkSync(path.join(MEMORY_BACKUP_DIR, backups[i])); } catch { /* ignore */ }
+    }
+
+    let bytes = 0;
+    try { bytes = existsSync(backupPath) ? statSync(backupPath).size : 0; } catch { /* ignore */ }
+    return { backupPath, bytes };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Tier C3 — TTL reaper for `episodic_pointers`. These are breadcrumbs
+ * (session_id, call_id, label) pointing at tool outputs in harness.db, which
+ * the eventlog reaper drops after ~14 days. A pointer older than the tool
+ * output it references is dead weight (the raw output is already gone), so we
+ * retire pointers past `maxAgeDays` (default 30, comfortably beyond the
+ * tool-output TTL). Same class as the always-on tool_outputs reaper: bounded,
+ * indexed DELETE, no curated data lost. Returns the row count removed.
+ */
+export function reapStaleEpisodicPointers(opts: { maxAgeDays?: number } = {}): number {
+  const maxAgeDays = Math.max(1, opts.maxAgeDays ?? 30);
+  try {
+    const db = openMemoryDb();
+    const cutoff = new Date(Date.now() - maxAgeDays * 24 * 60 * 60 * 1000).toISOString();
+    const info = db.prepare('DELETE FROM episodic_pointers WHERE created_at < ?').run(cutoff);
+    return Number(info.changes ?? 0);
+  } catch {
+    return 0;
   }
 }
