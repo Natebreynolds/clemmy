@@ -134,6 +134,69 @@ test('sweepCrashedExecutions: stale heartbeat but recent harness activity is lef
   assert.equal(after[0].status, 'active');
 });
 
+test('sweepCrashedExecutions: stale heartbeat but nextReviewAt in the FUTURE is left alone (v0.5.64 schedule-aware)', () => {
+  seedExecutions([
+    baseExecution({
+      id: 'scheduled-future',
+      sessionId: 'sess-sched-future',
+      status: 'active',
+      lastHeartbeatAt: nowMinusMinutes(10),
+      updatedAt: nowMinusMinutes(10),
+      lastActivityAt: nowMinusMinutes(10),
+      // controller scheduled the next review 25 min out — the stale heartbeat
+      // is BY DESIGN, not a crash. Must NOT be swept.
+      nextReviewAt: new Date(Date.now() + 25 * 60_000).toISOString(),
+    }),
+  ]);
+  const swept = sweepCrashedExecutions();
+  assert.equal(swept, 0, 'execution waiting for a future-scheduled review must not be swept');
+  const after = readExecutions();
+  assert.equal(after[0].status, 'active');
+});
+
+test('sweepCrashedExecutions: stale heartbeat AND nextReviewAt OVERDUE is still swept (real starvation)', () => {
+  seedExecutions([
+    baseExecution({
+      id: 'scheduled-overdue',
+      sessionId: 'sess-sched-overdue',
+      status: 'active',
+      lastHeartbeatAt: nowMinusMinutes(10),
+      updatedAt: nowMinusMinutes(10),
+      lastActivityAt: nowMinusMinutes(10),
+      // review was due 8 min ago but the controller never ticked it — genuine
+      // crash/starvation, still swept.
+      nextReviewAt: nowMinusMinutes(8),
+    }),
+  ]);
+  const swept = sweepCrashedExecutions();
+  assert.equal(swept, 1, 'an overdue-but-stale execution is a real crash signal and is swept');
+  const after = readExecutions();
+  assert.equal(after[0].status, 'completed');
+});
+
+test('sweepCrashedExecutions: CLEMMY_SWEEP_HONOR_NEXT_REVIEW=off reverts to sweeping future-review executions', () => {
+  const prev = process.env.CLEMMY_SWEEP_HONOR_NEXT_REVIEW;
+  process.env.CLEMMY_SWEEP_HONOR_NEXT_REVIEW = 'off';
+  try {
+    seedExecutions([
+      baseExecution({
+        id: 'sched-flag-off',
+        sessionId: 'sess-sched-flagoff',
+        status: 'active',
+        lastHeartbeatAt: nowMinusMinutes(10),
+        updatedAt: nowMinusMinutes(10),
+        lastActivityAt: nowMinusMinutes(10),
+        nextReviewAt: new Date(Date.now() + 25 * 60_000).toISOString(),
+      }),
+    ]);
+    const swept = sweepCrashedExecutions();
+    assert.equal(swept, 1, 'kill-switch off => prior behavior (swept regardless of nextReviewAt)');
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_SWEEP_HONOR_NEXT_REVIEW;
+    else process.env.CLEMMY_SWEEP_HONOR_NEXT_REVIEW = prev;
+  }
+});
+
 test('sweepCrashedExecutions: active with fresh heartbeat is left alone', () => {
   seedExecutions([
     baseExecution({ id: 'fresh', status: 'active', lastHeartbeatAt: nowMinusMinutes(1) }),

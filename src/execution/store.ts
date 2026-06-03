@@ -336,6 +336,22 @@ export function sweepCrashedExecutions(staleAfterMs = 5 * 60 * 1000): number {
     if (isExecutionLegitimatelyIdle(execution)) {
       continue;
     }
+    // v0.5.64 — schedule-aware sweep. The controller schedules the NEXT review
+    // up to 15-60 min out (controller.ts `nextReviewAt: plusMinutes(30/60)`),
+    // and the heartbeat only ticks when an execution actually RUNS a cycle. So
+    // an execution legitimately waiting for a future-scheduled review has a
+    // stale heartbeat BY DESIGN — it is not crashed. Only sweep executions that
+    // are OVERDUE for review (nextReviewAt has passed) AND heartbeat-stale —
+    // that is the real "should have run but the controller didn't tick it"
+    // crash/starvation signal. Without this, every execution that scheduled a
+    // review more than `staleAfterMs` (5m) out was false-swept as "heartbeat
+    // stalled" (observed 2026-06-03: a send-emails execution scheduled
+    // nextReviewAt=+30m, swept at +7m, so the send never ran).
+    // Honors CLEMMY_SWEEP_HONOR_NEXT_REVIEW=off to revert.
+    if ((process.env.CLEMMY_SWEEP_HONOR_NEXT_REVIEW ?? 'on').toLowerCase() !== 'off' && execution.nextReviewAt) {
+      const nextReview = Date.parse(execution.nextReviewAt);
+      if (Number.isFinite(nextReview) && nextReview > Date.now()) continue;
+    }
     const ageMinutes = Math.round((Date.now() - heartbeatTime) / 60000);
     transitionToFailed(
       execution,
