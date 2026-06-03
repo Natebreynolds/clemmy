@@ -743,6 +743,41 @@ function findLatestPreflightVerdict(
 }
 
 /**
+ * Loop reconciliation for the YOLO "never stuck" guarantee. When this turn's
+ * ask_user_question already AUTO-RESOLVED under YOLO standing approval, the tool
+ * emitted a non-halting `autonomy_note` (NOT an `awaiting_user_input` event) and
+ * returned "proceed". But the model may STILL set `decision.nextAction =
+ * 'awaiting_user_input'` out of habit (the orchestrator instructs it to whenever
+ * it calls ask_user_question), which would strand the run at the halt seams
+ * below. That stray nextAction contradicts the already-resolved question, so we
+ * ignore it and continue.
+ *
+ * Conservative by construction: returns true ONLY when this turn produced an
+ * `autonomy_note` (the positive proof YOLO auto-resolved an approval ask) AND no
+ * halting `awaiting_user_input` event (a genuine clarification this turn — which
+ * MUST still halt). The autonomy_note's presence already encodes that YOLO + the
+ * kill-switch were active when it was emitted, so no policy re-check is needed.
+ */
+function yoloAutoResolvedAskThisTurn(sessionId: string, turn: number): boolean {
+  try {
+    const events = listEvents(sessionId, { types: ['autonomy_note', 'awaiting_user_input'] });
+    let hasAutonomyNote = false;
+    let hasHaltingAsk = false;
+    for (const evt of events) {
+      if (evt.turn !== turn) continue;
+      if (evt.type === 'awaiting_user_input') hasHaltingAsk = true;
+      else if (evt.type === 'autonomy_note'
+        && (evt.data as { autoResolved?: unknown } | undefined)?.autoResolved === 'yolo-standing-approval') {
+        hasAutonomyNote = true;
+      }
+    }
+    return hasAutonomyNote && !hasHaltingAsk;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * v0.5.19 F1 — build the preflight-block system message that gets
  * injected when the gate at `runTurn` projects the next turn would
  * exceed budget. The v1 message named `propose_plan` and
@@ -1493,6 +1528,25 @@ async function runConversationCore(
     }
 
     if (decision.nextAction === 'awaiting_user_input') {
+      // Loop reconciliation: if this turn's ask already auto-resolved under YOLO
+      // standing approval (autonomy_note, no halting event), a stray
+      // nextAction:'awaiting_user_input' is a contradiction — don't strand the
+      // run; continue. Conservative: only fires with positive autonomy_note
+      // evidence this turn, so a genuine clarification still halts below.
+      if (yoloAutoResolvedAskThisTurn(options.sessionId, turnResult.turn)) {
+        safeAppend({
+          sessionId: options.sessionId,
+          turn: turnResult.turn,
+          role: 'system',
+          type: 'heartbeat',
+          data: {
+            kind: 'yolo_proceed_reconciled',
+            message: 'Ignored a stray nextAction:awaiting_user_input — the approval question already auto-resolved under YOLO standing approval. Continuing.',
+          },
+        });
+        nextInput = 'You already auto-resolved that approval question under YOLO standing approval — do NOT wait for the user. Proceed with your best default and keep going until the work is done, then report what you did.';
+        continue;
+      }
       return {
         sessionId: options.sessionId,
         status: 'awaiting_user_input',
@@ -2818,15 +2872,31 @@ async function runConversationFromResumeCore(opts: {
       };
     }
     if (decision.nextAction === 'awaiting_user_input') {
-      return {
+      // Loop reconciliation (resume variant): same YOLO "never stuck" guard as
+      // runConversation. If this turn's ask auto-resolved under YOLO standing
+      // approval (autonomy_note, no halting event), fall through to run the next
+      // turn instead of stranding. Conservative: only when the note exists.
+      if (!yoloAutoResolvedAskThisTurn(opts.sessionId, lastTurn)) {
+        return {
+          sessionId: opts.sessionId,
+          status: 'awaiting_user_input',
+          steps: stepIndex,
+          lastDecision: decision,
+          lastTurn,
+        };
+      }
+      safeAppend({
         sessionId: opts.sessionId,
-        status: 'awaiting_user_input',
-        steps: stepIndex,
-        lastDecision: decision,
-        lastTurn,
-      };
-    }
-    if (decision.nextAction === 'awaiting_approval') {
+        turn: lastTurn,
+        role: 'system',
+        type: 'heartbeat',
+        data: {
+          kind: 'yolo_proceed_reconciled',
+          message: 'Ignored a stray nextAction:awaiting_user_input — the approval question already auto-resolved under YOLO standing approval. Continuing.',
+        },
+      });
+      // fall through to the next-turn runTurn below.
+    } else if (decision.nextAction === 'awaiting_approval') {
       return {
         sessionId: opts.sessionId,
         status: 'awaiting_approval',

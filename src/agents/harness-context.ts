@@ -70,7 +70,7 @@ function renderAutonomy(): string {
       return [
         'YOLO — the user has granted STANDING APPROVAL for every action except the hard catastrophic-danger denylist (deleting data, destructive shell, etc.). You ALREADY have permission to send, draft, write, update, post, and deploy.',
         'So do NOT stop to ask permission to proceed, do NOT add "await/require approval" steps to a plan, and do NOT use ask_user_question to get sign-off on work you were asked to do — just do it, then report what you did and any assumption you made. Reusing an approved template or the same approach as the items already handled counts as proceeding, not a blocker.',
-        'You MAY still ask a genuine clarifying question when you truly cannot infer something you need to act. And if you ever do need a real human decision, use request_approval (it auto-approves in this mode and keeps you moving) — never ask_user_question to seek approval.',
+        'You MAY still ask a genuine clarifying question when you truly cannot infer something you need to act — set ask_user_question purpose:"clarification" for those (they still pause). An "approval" purpose will NOT pause in this mode (it auto-resolves to "proceed"). If you ever need a real human decision, use request_approval (it auto-approves here and keeps you moving) — never ask_user_question to seek sign-off.',
       ].join(' ');
     }
     if (scope === 'workspace') {

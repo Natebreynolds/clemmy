@@ -1007,6 +1007,59 @@ test('runConversation: stops on first completed decision', async () => {
   assert.equal(events.filter((e) => e.type === 'conversation_completed').length, 1);
 });
 
+test('runConversation: YOLO auto-resolved ask (autonomy_note + stray nextAction:awaiting_user_input) CONTINUES, never stuck', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  let call = 0;
+  const runRunner: RunRunnerFn = async () => {
+    call += 1;
+    if (call === 1) {
+      // Simulate the ask_user_question tool auto-resolving under YOLO this turn:
+      // it emits a non-halting autonomy_note (NOT awaiting_user_input)…
+      appendEvent({
+        sessionId: sess.id, turn: 1, role: 'Clem', type: 'autonomy_note',
+        data: { autoResolved: 'yolo-standing-approval', question: 'send the rest?' },
+      });
+      // …but the model STILL sets nextAction:awaiting_user_input (the stray).
+      return { history: [], lastResponseId: undefined, finalOutput: {
+        summary: 'asked for sign-off (auto-resolved under YOLO)', reply: null,
+        done: false, nextAction: 'awaiting_user_input', reason: null } };
+    }
+    return { history: [], lastResponseId: undefined, finalOutput: {
+      summary: 'sent the remaining emails', reply: 'Sent the rest of the R&R emails.',
+      done: true, nextAction: 'completed', reason: null } };
+  };
+  const result = await runConversation({
+    agent: makeAgentStub(), sessionId: sess.id, input: 'send the rest',
+    makeRunner: makeRunnerStub, runRunner,
+  });
+  assert.equal(result.status, 'completed', 'must NOT strand on awaiting_user_input after a YOLO auto-proceed');
+  assert.ok(call >= 2, 'the loop ran a second turn instead of halting');
+  const reconciled = listEventsForConv(sess.id, { types: ['heartbeat'] })
+    .some((e) => (e.data as { kind?: string } | undefined)?.kind === 'yolo_proceed_reconciled');
+  assert.equal(reconciled, true, 'emits the yolo_proceed_reconciled telemetry');
+});
+
+test('runConversation: a GENUINE awaiting_user_input (no autonomy_note) still HALTS (no over-suppression)', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const runRunner: RunRunnerFn = async () => {
+    // Genuine clarification: emits the halting event, NO autonomy_note.
+    appendEvent({
+      sessionId: sess.id, turn: 1, role: 'Clem', type: 'awaiting_user_input',
+      data: { question: 'staging or prod?' },
+    });
+    return { history: [], lastResponseId: undefined, finalOutput: {
+      summary: 'need to know which environment', reply: 'Staging or prod?',
+      done: false, nextAction: 'awaiting_user_input', reason: null } };
+  };
+  const result = await runConversation({
+    agent: makeAgentStub(), sessionId: sess.id, input: 'deploy it',
+    makeRunner: makeRunnerStub, runRunner,
+  });
+  assert.equal(result.status, 'awaiting_user_input', 'genuine clarification must still halt');
+});
+
 test('objective judge: gates premature completion and continues (action intent)', async () => {
   const sess = HarnessSession.create({ kind: 'chat' });
   const runner = scriptedRunner([

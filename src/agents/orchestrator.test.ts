@@ -344,7 +344,7 @@ test('ask_user_question emits awaiting_user_input with options', async () => {
   const t = buildAskUserQuestionTool();
   const result = await invokeFunctionTool(
     t,
-    { question: 'which environment?', options: ['staging', 'prod'] },
+    { question: 'which environment?', options: ['staging', 'prod'], purpose: null },
     { sessionId: sess.id, turn: 1 },
   );
   assert.match(result, /Question posted/);
@@ -355,33 +355,80 @@ test('ask_user_question emits awaiting_user_input with options', async () => {
   assert.deepEqual(events[0].data.options, ['staging', 'prod']);
 });
 
-// ─── YOLO: approval-shaped ask_user_question must NOT halt (the v0.5.60 code fix) ───
+// ─── YOLO: approval-purpose ask_user_question must NOT halt; clarification must ───
+// Typed `purpose` is the PRIMARY signal (reliable); the regex is the BACKSTOP
+// when purpose is omitted (so this is strictly ≥ the v0.5.60 regex-only fix).
 
-test('YOLO + approval-shaped ask_user_question does NOT halt — proceeds with standing approval', async () => {
+test('YOLO + purpose:"approval" does NOT halt — proceeds (typed signal)', async () => {
   resetEventLog();
   saveProactivityPolicy({ autoApproveScope: 'yolo' });
   try {
     const sess = createSession({ kind: 'chat' });
     const t = buildAskUserQuestionTool();
-    // The live incident question (sess-mpxdpxv0).
+    const result = await invokeFunctionTool(
+      t,
+      { question: 'Want me to send the rest of the R&R emails now?', options: ['Yes', 'No'], purpose: 'approval' },
+      { sessionId: sess.id, turn: 1 },
+    );
+    assert.match(result, /standing approval|NOT pausing/i);
+    assert.equal(listEvents(sess.id, { types: ['awaiting_user_input'] }).length, 0, 'approval purpose must not halt');
+    const notes = listEvents(sess.id, { types: ['autonomy_note'] });
+    assert.equal(notes.length, 1);
+    assert.equal(notes[0].data.classifier, 'typed', 'declared purpose drives the typed path');
+  } finally {
+    saveProactivityPolicy({ autoApproveScope: 'balanced' });
+  }
+});
+
+test('YOLO + purpose:"clarification" still HALTS even in YOLO (she can still ask)', async () => {
+  resetEventLog();
+  saveProactivityPolicy({ autoApproveScope: 'yolo' });
+  try {
+    const sess = createSession({ kind: 'chat' });
+    const t = buildAskUserQuestionTool();
+    // Note: this text is approval-SHAPED by the regex (has "send" + "should I"),
+    // so this proves the TYPED clarification signal overrides the regex — a real
+    // clarification is never auto-proceeded just because of its wording.
+    const result = await invokeFunctionTool(
+      t,
+      { question: 'Should I send to the staging list or the prod list?', options: ['staging', 'prod'], purpose: 'clarification' },
+      { sessionId: sess.id, turn: 1 },
+    );
+    assert.match(result, /Question posted/);
+    assert.equal(listEvents(sess.id, { types: ['awaiting_user_input'] }).length, 1, 'typed clarification halts even in YOLO');
+    assert.equal(listEvents(sess.id, { types: ['autonomy_note'] }).length, 0);
+  } finally {
+    saveProactivityPolicy({ autoApproveScope: 'balanced' });
+  }
+});
+
+test('YOLO + purpose:null + approval-shaped text → regex BACKSTOP proceeds (>= v0.5.60)', async () => {
+  resetEventLog();
+  saveProactivityPolicy({ autoApproveScope: 'yolo' });
+  try {
+    const sess = createSession({ kind: 'chat' });
+    const t = buildAskUserQuestionTool();
+    // The live incident question, with purpose omitted (null) — the regex catches it.
     const result = await invokeFunctionTool(
       t,
       {
         question: 'I’m blocked on the approved R&R email copy. Do you want me to use a specific prior template, or should I create the Outlook drafts first for review instead of sending live?',
         options: ['Use prior template and send', 'Create drafts for review'],
+        purpose: null,
       },
       { sessionId: sess.id, turn: 1 },
     );
-    assert.match(result, /standing approval|NOT pausing/i, 'returns a proceed instruction, not a wait');
-    // The run must NOT halt: zero awaiting_user_input, and a non-halting audit note instead.
-    assert.equal(listEvents(sess.id, { types: ['awaiting_user_input'] }).length, 0, 'approval-shaped Q must not emit the halting event');
-    assert.equal(listEvents(sess.id, { types: ['autonomy_note'] }).length, 1, 'records a non-halting autonomy_note');
+    assert.match(result, /standing approval|NOT pausing/i);
+    assert.equal(listEvents(sess.id, { types: ['awaiting_user_input'] }).length, 0);
+    const notes = listEvents(sess.id, { types: ['autonomy_note'] });
+    assert.equal(notes.length, 1);
+    assert.equal(notes[0].data.classifier, 'regex-backstop', 'omitted purpose falls back to the regex');
   } finally {
     saveProactivityPolicy({ autoApproveScope: 'balanced' });
   }
 });
 
-test('YOLO + GENUINE info question still halts (she can still ask)', async () => {
+test('YOLO + purpose:null + genuine info text → halts (regex correctly declines)', async () => {
   resetEventLog();
   saveProactivityPolicy({ autoApproveScope: 'yolo' });
   try {
@@ -389,27 +436,56 @@ test('YOLO + GENUINE info question still halts (she can still ask)', async () =>
     const t = buildAskUserQuestionTool();
     const result = await invokeFunctionTool(
       t,
-      { question: 'Which Salesforce environment should I read from, staging or prod?', options: ['staging', 'prod'] },
+      { question: 'Which Salesforce environment should I read from, staging or prod?', options: ['staging', 'prod'], purpose: null },
       { sessionId: sess.id, turn: 1 },
     );
-    assert.match(result, /Question posted/, 'genuine info question still posts + waits');
-    assert.equal(listEvents(sess.id, { types: ['awaiting_user_input'] }).length, 1, 'genuine clarification still halts in YOLO');
+    assert.match(result, /Question posted/);
+    assert.equal(listEvents(sess.id, { types: ['awaiting_user_input'] }).length, 1);
   } finally {
     saveProactivityPolicy({ autoApproveScope: 'balanced' });
   }
 });
 
-test('non-YOLO (balanced) + approval-shaped question still halts (no default-user regression)', async () => {
+test('non-YOLO (balanced) + purpose:"approval" still halts (no default-user regression)', async () => {
   resetEventLog();
   saveProactivityPolicy({ autoApproveScope: 'balanced' });
   const sess = createSession({ kind: 'chat' });
   const t = buildAskUserQuestionTool();
   await invokeFunctionTool(
     t,
-    { question: 'Should I send the rest of the emails now?', options: ['Yes send', 'No'] },
+    { question: 'Should I send the rest of the emails now?', options: ['Yes send', 'No'], purpose: 'approval' },
     { sessionId: sess.id, turn: 1 },
   );
   assert.equal(listEvents(sess.id, { types: ['awaiting_user_input'] }).length, 1, 'balanced is byte-identical: still halts');
+});
+
+test('kill-switch off → YOLO + purpose:"approval" halts (revert path)', async () => {
+  resetEventLog();
+  const prev = process.env.CLEMMY_YOLO_NO_APPROVAL_HALT;
+  process.env.CLEMMY_YOLO_NO_APPROVAL_HALT = 'off';
+  saveProactivityPolicy({ autoApproveScope: 'yolo' });
+  try {
+    const sess = createSession({ kind: 'chat' });
+    const t = buildAskUserQuestionTool();
+    await invokeFunctionTool(
+      t,
+      { question: 'Want me to send them now?', options: null, purpose: 'approval' },
+      { sessionId: sess.id, turn: 1 },
+    );
+    assert.equal(listEvents(sess.id, { types: ['awaiting_user_input'] }).length, 1, 'kill-switch off → halts');
+  } finally {
+    saveProactivityPolicy({ autoApproveScope: 'balanced' });
+    if (prev === undefined) delete process.env.CLEMMY_YOLO_NO_APPROVAL_HALT;
+    else process.env.CLEMMY_YOLO_NO_APPROVAL_HALT = prev;
+  }
+});
+
+test('ask_user_question tool description names the purpose param + both values', () => {
+  const t = buildAskUserQuestionTool();
+  const desc = (t as unknown as { description?: string }).description ?? '';
+  assert.match(desc, /purpose/);
+  assert.match(desc, /clarification/);
+  assert.match(desc, /approval/);
 });
 
 test('deliberation tools no-op silently when no sessionId is on the context', async () => {
@@ -419,7 +495,7 @@ test('deliberation tools no-op silently when no sessionId is on the context', as
   const t = buildAskUserQuestionTool();
   const result = await invokeFunctionTool(
     t,
-    { question: 'is anyone listening?', options: null },
+    { question: 'is anyone listening?', options: null, purpose: null },
     {},
   );
   assert.match(result, /Question posted/);

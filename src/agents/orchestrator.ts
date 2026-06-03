@@ -292,27 +292,47 @@ const askUserQuestionParams = z.object({
     .max(5)
     .nullable()
     .describe('Pre-canned answers; pass null if none.'),
+  purpose: z
+    .enum(['clarification', 'approval'])
+    .nullable()
+    .describe(
+      'Why you are asking. "clarification" = you genuinely cannot proceed without a fact only the user has '
+      + '(which of two real resources, a value you cannot infer). "approval" = you are seeking sign-off / permission '
+      + 'to do work the user already asked for (send/draft/update/post/deploy). In YOLO the user has STANDING '
+      + 'approval, so an "approval" question does NOT pause — it auto-resolves to "proceed with your best default." '
+      + 'Mark "clarification" only when waiting is genuinely the only correct move. Pass null if neither fits.',
+    ),
 });
 
 export function buildAskUserQuestionTool() {
   return tool({
     name: 'ask_user_question',
     description:
-      'Ask the user a clarifying question. The harness records awaiting_user_input; the next turn resumes after the user replies.',
+      'Ask the user a question and (normally) pause for the reply. Set `purpose`: "clarification" if you truly '
+      + 'cannot proceed without a fact only the user has, or "approval" if you are seeking sign-off for work already '
+      + 'requested. In YOLO mode an "approval" question does NOT pause — it auto-resolves to "proceed with your best '
+      + 'default" — so use this for genuine clarifications, not to seek permission for work you were already asked to do.',
     parameters: askUserQuestionParams,
     execute: async (args, runContext) => {
       const sessionId = extractSessionId(runContext);
-      // YOLO + approval-shaped question → do NOT halt. The user has standing
+      // YOLO + approval-purpose question → do NOT halt. The user has standing
       // approval; seeking sign-off for an action they authorized is the exact
-      // re-block we're killing. Record a NON-halting autonomy_note (audit trail
-      // of what she defaulted on) and return "proceed" so the run continues.
-      // A genuine clarification (no mutating action being gated) falls through
-      // to the normal awaiting_user_input halt below — she can still ask.
+      // re-block we're killing. PRIMARY signal is the model's declared
+      // `purpose` (reliable, mirrors request_approval's typed intent); the
+      // regex isApprovalShapedQuestion is the BACKSTOP only when purpose is
+      // omitted. A genuine clarification (purpose:'clarification', or no
+      // mutating action) falls through to the awaiting_user_input halt below —
+      // she can still ask. Record a NON-halting autonomy_note (audit trail).
+      const classifier: 'typed' | 'regex-backstop' | null =
+        args.purpose === 'approval' ? 'typed'
+          : (args.purpose == null && isApprovalShapedQuestion(args.question, args.options)) ? 'regex-backstop'
+            : null;
+      const isApprovalPurpose = classifier !== null;
       if (
         sessionId
         && isYoloAutoApprovalPolicy()
         && yoloNoApprovalHaltEnabled()
-        && isApprovalShapedQuestion(args.question, args.options)
+        && isApprovalPurpose
       ) {
         try {
           appendEvent({
@@ -323,6 +343,8 @@ export function buildAskUserQuestionTool() {
             data: {
               question: args.question,
               options: args.options ?? null,
+              purpose: args.purpose ?? null,
+              classifier,
               autoResolved: 'yolo-standing-approval',
             },
           });
