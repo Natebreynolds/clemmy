@@ -96,6 +96,13 @@ const LIST_ITEM_RE = /^[ \t]*(?:\d+[.)]|[-*•–])\s+\S/gim;
 // Aggregate / single-collection RETRIEVAL verbs — a paginated read of one
 // collection, not N independent same-shape jobs ("show my last 5 emails").
 const AGGREGATE_RETRIEVAL_RE = /\b(?:show|list|display|view|print|read out|pull up|give me|show me|tell me)\b/i;
+// Genuine per-item WORK verbs (multi-step work, not mere retrieval/display).
+// When one of these is present, an INCIDENTAL aggregate verb elsewhere in the
+// prompt ("…then tell me which failed") must NOT suppress fan-out — the live
+// 2026-06-02 batch ("research these 8 sites … tell me which") was wrongly
+// suppressed by "tell me". The aggregate guard only bites when the request is
+// retrieval-only (no deep work), e.g. "show my last 5 emails".
+const DEEP_WORK_RE = /\b(?:research|audit|scrape|crawl|analy[sz]e|enrich|profile|investigate|draft|compose|create|build|generate|write|redesign|compile|produce|assemble|summari[sz]e|deploy|publish)\b/i;
 // Internal cardinality — the N items belong to ONE parent, so there is only one
 // job ("this firm's 10 competitors"): possessive owner, or "N <noun> of the X".
 const INTERNAL_OWNER_RE = /\b(?:this|that|the|a|an|each|every|its|his|her|their|our|my|one|same)\s+[a-z][\w-]*['’]s\s+(?:top\s+|first\s+)?\d{1,3}\b/i;
@@ -156,7 +163,10 @@ export function detectMultiItemIntent(input: string): MultiItemIntent {
     if (!sameShapeWork) return NO_MULTI_ITEM;
 
     // 3. Zero-regression guards — each resolves ambiguity to NOT multi-item.
-    if (AGGREGATE_RETRIEVAL_RE.test(text)) return NO_MULTI_ITEM; // single-collection read
+    // Aggregate-retrieval ("show/list/tell me …") suppresses ONLY when the
+    // request is retrieval-only; a genuine per-item work verb (research/
+    // enrich/draft/…) means an incidental aggregate phrase shouldn't block.
+    if (AGGREGATE_RETRIEVAL_RE.test(text) && !DEEP_WORK_RE.test(text)) return NO_MULTI_ITEM; // single-collection read
     if (INTERNAL_OWNER_RE.test(text) || INTERNAL_OF_RE.test(text)) return NO_MULTI_ITEM; // internal cardinality
     const hasDistinct = enumerated || DISTINCT_MARKER_RE.test(text);
     if (SEQUENCE_RE.test(text) && !hasDistinct) return NO_MULTI_ITEM; // A->B->C chain

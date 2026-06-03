@@ -105,6 +105,18 @@ test('detectMultiItemIntent uses size-aware boundaries (soft < 8, imperative >= 
   assert.equal(large.itemCount, 12);
 });
 
+test('detectMultiItemIntent FIRES despite an incidental aggregate verb when per-item work is present (live 2026-06-02 regression)', () => {
+  // "research … tell me which failed" was wrongly suppressed by "tell me".
+  const r = detectMultiItemIntent(
+    'Research these 8 law-firm websites as 8 independent per-item jobs: a.com, b.com — for each return a one-line SEO snapshot. Then tell me which you could not get data for.',
+  );
+  assert.equal(r.isMultiItem, true, 'a genuine per-item research request must fire even with a trailing "tell me"');
+  assert.equal(r.itemCount, 8);
+  // The retrieval-only case is still suppressed (no deep-work verb).
+  assert.equal(detectMultiItemIntent('Show my last 5 emails.').isMultiItem, false);
+  assert.equal(detectMultiItemIntent('Give me my 5 latest invoices.').isMultiItem, false);
+});
+
 test('detectMultiItemIntent does NOT fire on the no-fire cases', () => {
   const cases: Array<[string, string]> = [
     ['Tell me 3 jokes.', 'conversational, no per-item tool work'],
