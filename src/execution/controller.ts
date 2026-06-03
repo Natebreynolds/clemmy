@@ -11,6 +11,7 @@ import { WORKFLOWS_DIR } from '../memory/vault.js';
 import { refreshWorkingMemory } from '../memory/working-memory.js';
 import { addNotification, getNotification } from '../runtime/notifications.js';
 import { actionBus } from '../runtime/action-bus.js';
+import { classifyCodexAuthError, isCodexAuthDead } from '../runtime/auth-store.js';
 import { PlanStore } from '../planning/plan-store.js';
 import {
   DELEGATIONS_DIR,
@@ -1184,6 +1185,29 @@ export async function processExecutionController(assistant: ClementineAssistant)
       const previousFailures = execution.consecutiveAdvanceFailures ?? 0;
       const nextFailures = previousFailures + 1;
       const errorMessage = error instanceof Error ? clean(error.message, 400) : String(error);
+
+      // Terminal auth (Codex sign-in revoked/expired) is NOT this execution's
+      // fault — the token is down globally. Auto-failing real work because auth
+      // lapsed would discard it; counting it toward the failure budget would
+      // burn through to auto-fail in a few cycles. Instead: park, do NOT
+      // increment the failure counter, and let it resume automatically once a
+      // re-auth lands (which clears the DEAD latch). The runtime already
+      // surfaced the daily-bucketed "re-authenticate" notification.
+      const status = (error as { status?: number } | null)?.status;
+      if (isCodexAuthDead() || classifyCodexAuthError({ message: errorMessage, status }) === 'terminal') {
+        logger.warn(
+          { executionId: execution.id },
+          'Execution controller paused — Codex auth revoked/expired; will resume after re-authentication',
+        );
+        store.update(execution.id, {
+          nextReviewAt: plusMinutes(15),
+          lastControllerRunAt: new Date().toISOString(),
+          lastAssistantSummary: 'Paused — Codex sign-in expired or was revoked. Will resume automatically after re-authentication.',
+          // consecutiveAdvanceFailures intentionally preserved (not incremented).
+        });
+        continue;
+      }
+
       logger.error(
         { err: error, executionId: execution.id, consecutiveAdvanceFailures: nextFailures },
         'Execution controller cycle failed',

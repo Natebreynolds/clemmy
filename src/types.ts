@@ -352,4 +352,9 @@ export interface AuthStatus {
   codexAccountId?: string;
   codexLastRefresh?: string;
   codexImportPath?: string;
+  /** True when Clementine's stored grant shares the Codex CLI's rotating refresh-token
+   *  family (imported from ~/.codex/auth.json, or running directly off it). In this
+   *  state a `codex logout` revokes the family server-side and signs Clementine out
+   *  too — `clementine auth login-native` mints an independent grant that decouples it. */
+  codexSharedWithCli?: boolean;
 }

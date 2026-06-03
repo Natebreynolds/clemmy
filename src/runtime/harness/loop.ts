@@ -40,6 +40,7 @@ import { attachEventLogHooks, extractSessionIdFromContext, type RunHooksLike } f
 import * as approvalRegistry from './approval-registry.js';
 import { actionBus } from '../action-bus.js';
 import { addNotification } from '../notifications.js';
+import { classifyCodexAuthError, markCodexAuthDead } from '../auth-store.js';
 import { BoundaryError } from '../boundary-error.js';
 import { getRuntimeEnv } from '../../config.js';
 import { captureInteractionSignals } from '../../memory/auto-capture.js';
@@ -3016,8 +3017,8 @@ function isKillBeforeStart(
  *  model call. The token can't recover by retrying — the user must re-auth — so
  *  we surface a clear instruction instead of the raw provider JSON. */
 export function isCodexAuthRevoked(err: unknown, message: string): boolean {
-  if ((err as { status?: unknown } | null)?.status === 401) return true;
-  return /token_revoked|invalidated oauth token|401 unauthorized/i.test(message);
+  const status = (err as { status?: number } | null)?.status;
+  return classifyCodexAuthError({ message, status }) === 'terminal';
 }
 
 function handleRunError(
@@ -3239,6 +3240,9 @@ function handleRunError(
   // never recovers. Surface a clear re-auth instruction + one deduped
   // notification (so they know even if they're not watching), then end cleanly.
   if (isCodexAuthRevoked(err, message)) {
+    // Latch auth DEAD so background loops (execution controller, cron, autonomy)
+    // stop replaying the revoked token and park until a re-auth clears it.
+    markCodexAuthDead(message);
     const friendly =
       'Your Codex sign-in expired or was revoked, so I can’t reach the model right now. '
       + 'Re-authenticate in Settings → Credentials → RE-AUTHENTICATE '

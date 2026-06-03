@@ -5,7 +5,7 @@ import { AgentRuntimeCancelledError, ASSISTANT_PAUSED_PLACEHOLDER, type AgentRun
 import { ApprovalStore } from './approval-store.js';
 import { addNotification, getNotification } from './notifications.js';
 import { ASSISTANT_NAME, BASE_DIR } from '../config.js';
-import { getStoredCodexOAuthTokens, refreshStoredNativeOAuth } from './auth-store.js';
+import { getStoredCodexOAuthTokens, refreshStoredNativeOAuth, isCodexAuthDead, getCodexAuthDead } from './auth-store.js';
 import { getCoreToolsAsync } from '../tools/registry.js';
 import { getOrCreateConfiguredMcpServers } from './mcp-servers.js';
 import { classifyTool, decideToolApproval } from '../agents/tool-taxonomy.js';
@@ -804,6 +804,15 @@ export class CodexNativeRuntime implements AgentRuntime {
   ): Promise<CodexResponseResult> {
     let refreshed = false;
     let transientAttempts = 0;
+
+    // DEAD latch: a prior terminal revoke means this request is doomed and a
+    // refresh would just replay the dead token. Skip the round-trip, surface the
+    // re-auth pointer (daily-bucketed), and throw a terminal error so the caller
+    // parks instead of hammering. Cleared automatically when a re-auth lands.
+    if (isCodexAuthDead()) {
+      notifyCodexAuthExpired(getCodexAuthDead()?.reason);
+      throw new CodexRuntimeError('Codex sign-in is revoked or expired — re-authenticate to resume.', 401);
+    }
 
     while (true) {
       try {

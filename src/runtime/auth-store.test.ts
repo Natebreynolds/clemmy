@@ -14,15 +14,41 @@ import os from 'node:os';
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-auth-store-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
 process.env.HOME = TMP_HOME;
+process.env.AUTH_MODE = 'codex_oauth'; // exercise the codex branches of getAuthStatus
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { refreshStoredNativeOAuth, __setRefreshTokenImplForTests } = await import('./auth-store.js');
+const {
+  refreshStoredNativeOAuth,
+  __setRefreshTokenImplForTests,
+  bootstrapCodexAuth,
+  getAuthStatus,
+  classifyCodexAuthError,
+  isCodexAuthDead,
+  clearCodexAuthDead,
+} = await import('./auth-store.js');
 
 const AUTH_FILE = path.join(TMP_HOME, 'state', 'auth.json');
 const LOCK_FILE = path.join(TMP_HOME, 'state', 'codex-refresh.lock');
+const DEAD_FILE = path.join(TMP_HOME, 'state', 'codex-auth-dead.json');
+const CLI_AUTH_FILE = path.join(TMP_HOME, '.codex', 'auth.json');
+
+function writeNativeVault(refreshToken = 'RT_native'): void {
+  writeFileSync(AUTH_FILE, JSON.stringify({
+    source: 'native',
+    codexOauth: { accessToken: 'AT_native', refreshToken, accountId: 'acct', lastRefresh: new Date().toISOString() },
+  }), 'utf-8');
+}
+
+function writeCliAuth(refreshToken = 'RT_cli'): void {
+  mkdirSync(path.join(TMP_HOME, '.codex'), { recursive: true });
+  writeFileSync(CLI_AUTH_FILE, JSON.stringify({
+    tokens: { access_token: 'AT_cli', refresh_token: refreshToken, account_id: 'acct' },
+    last_refresh: new Date().toISOString(),
+  }), 'utf-8');
+}
 
 function writeStoredAuth(lastRefreshIso: string, refreshToken = 'RT1'): void {
   writeFileSync(AUTH_FILE, JSON.stringify({
@@ -39,7 +65,108 @@ const tenMinAgo = () => new Date(Date.now() - 10 * 60 * 1000).toISOString();
 
 beforeEach(() => {
   rmSync(LOCK_FILE, { force: true });
+  rmSync(AUTH_FILE, { force: true });
+  rmSync(CLI_AUTH_FILE, { force: true });
+  rmSync(DEAD_FILE, { force: true });
   __setRefreshTokenImplForTests(null);
+});
+
+// ── Terminal-vs-transient taxonomy + DEAD latch (the "stop hammering a revoked
+// token / don't re-auth on a 429" gap, adopted from the Hermes harness). ──
+
+test('classifyCodexAuthError: revoke/reuse/invalid_grant/401 = terminal; 429/quota/5xx = transient', () => {
+  for (const m of ['token_revoked', 'Encountered invalidated oauth token', 'refresh_token_reused', 'invalid_grant', 'unauthorized_client']) {
+    assert.equal(classifyCodexAuthError({ message: m }), 'terminal', `${m} should be terminal`);
+  }
+  assert.equal(classifyCodexAuthError({ status: 401 }), 'terminal', '401 is terminal');
+  // The critical false-alarm guard: a quota 429 must NOT be a revoke.
+  assert.equal(classifyCodexAuthError({ status: 429, message: 'Rate limit exceeded' }), 'transient', '429 is transient, not a revoke');
+  assert.equal(classifyCodexAuthError({ status: 503 }), 'transient', '5xx is transient');
+  assert.equal(classifyCodexAuthError({ message: 'something unrelated' }), null, 'non-auth error is null');
+});
+
+test('a terminal refresh failure latches DEAD and short-circuits the next refresh (no replay of the dead RT)', async () => {
+  writeStoredAuth(tenMinAgo(), 'RT1');
+  let calls = 0;
+  __setRefreshTokenImplForTests(async () => {
+    calls += 1;
+    throw Object.assign(new Error('Native OAuth refresh failed (401): token_revoked'), { status: 401 });
+  });
+
+  const first = await refreshStoredNativeOAuth();
+  assert.equal(first.ok, false);
+  assert.equal(first.terminal, true, 'terminal failure flagged');
+  assert.equal(isCodexAuthDead(), true, 'auth is latched DEAD');
+  assert.equal(calls, 1, 'the dead RT was POSTed exactly once');
+
+  // Next refresh must NOT POST again — it short-circuits on the latch.
+  const second = await refreshStoredNativeOAuth();
+  assert.equal(second.ok, false);
+  assert.equal(second.terminal, true);
+  assert.equal(calls, 1, 'no second POST of the revoked refresh token');
+});
+
+test('a TRANSIENT refresh failure (429) does NOT latch DEAD — the token is still valid', async () => {
+  writeStoredAuth(tenMinAgo(), 'RT1');
+  __setRefreshTokenImplForTests(async () => {
+    throw Object.assign(new Error('Native OAuth refresh failed (429): Rate limit exceeded'), { status: 429 });
+  });
+
+  const res = await refreshStoredNativeOAuth();
+  assert.equal(res.ok, false);
+  assert.notEqual(res.terminal, true, 'a 429 is not terminal');
+  assert.equal(isCodexAuthDead(), false, 'a quota 429 must never brick auth');
+});
+
+test('a successful refresh after a revoke clears the DEAD latch (recovery signal)', async () => {
+  // Latch dead first.
+  writeStoredAuth(tenMinAgo(), 'RT1');
+  __setRefreshTokenImplForTests(async () => { throw Object.assign(new Error('token_revoked'), { status: 401 }); });
+  await refreshStoredNativeOAuth();
+  assert.equal(isCodexAuthDead(), true);
+
+  // Simulate re-auth: a fresh token is written, then a refresh succeeds.
+  clearCodexAuthDead(); // (login/import would clear it; emulate the re-auth write)
+  writeStoredAuth(tenMinAgo(), 'RT_new');
+  __setRefreshTokenImplForTests(async () => ({ accessToken: 'AT2', refreshToken: 'RT2', idToken: 'ID2', accountId: 'acct', lastRefresh: new Date().toISOString() }));
+  const res = await refreshStoredNativeOAuth();
+  assert.ok(res.ok, 'refresh succeeds after re-auth');
+  assert.equal(isCodexAuthDead(), false, 'a successful token write lifts the latch');
+});
+
+// The codex-logout-revokes-Clem trap: bootstrap used to end on an unconditional
+// importCodexCliAuth, clobbering a freshly-minted native grant with the CLI's shared
+// token family. A `codex logout` then revoked that family and signed Clementine out.
+test('bootstrap keeps Clem’s own native grant — never downgrades to the CLI’s shared family', async () => {
+  writeNativeVault('RT_native');   // Clementine already owns an independent grant
+  writeCliAuth('RT_cli');          // the Codex CLI is signed in with a DIFFERENT family
+
+  const res = await bootstrapCodexAuth();
+
+  assert.ok(res.ok, 'bootstrap succeeds');
+  const vault = JSON.parse(readFileSync(AUTH_FILE, 'utf-8'));
+  assert.equal(vault.source, 'native', 'source stays native — not downgraded to codex_cli');
+  assert.equal(vault.codexOauth.refreshToken, 'RT_native', 'native RT must NOT be clobbered by the CLI import');
+});
+
+test('auth status flags a CLI-shared sign-in (imported grant) with the decouple remedy', () => {
+  writeFileSync(AUTH_FILE, JSON.stringify({
+    source: 'codex_cli',
+    codexOauth: { accessToken: 'AT', refreshToken: 'RT', accountId: 'acct', lastRefresh: new Date().toISOString() },
+  }), 'utf-8');
+
+  const status = getAuthStatus();
+  assert.equal(status.codexOauthPresent, true);
+  assert.equal(status.codexSharedWithCli, true, 'an imported CLI grant is flagged as shared');
+  assert.match(status.message, /login-native/i, 'message points at the decouple remedy');
+});
+
+test('auth status does NOT flag an independent native grant as shared', () => {
+  writeNativeVault('RT_native');
+
+  const status = getAuthStatus();
+  assert.equal(status.codexOauthPresent, true);
+  assert.equal(status.codexSharedWithCli, false, 'a native grant is independent of the CLI');
 });
 
 test('concurrent refreshes coalesce into ONE network rotation (no RT reuse → no token_revoked)', async () => {

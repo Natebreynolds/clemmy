@@ -45,6 +45,86 @@ const AUTH_STATE_FILE = path.join(BASE_DIR, 'state', 'auth.json');
 //     advanced and the consumed RT stays on disk → the next caller replays it →
 //     revoke. No lock can close server-side consumption with a lost ack.
 const REFRESH_LOCK_FILE = path.join(BASE_DIR, 'state', 'codex-refresh.lock');
+
+// ─────────────────────────────────────────────────────────────────
+// Terminal-vs-transient auth-error taxonomy + DEAD latch.
+//
+// OpenAI's auth backend distinguishes PERMANENT failures (the token family is
+// gone — only a re-auth recovers) from TRANSIENT ones (quota/rate-limit/backend
+// blips — the SAME token is still valid, just retry later). Conflating them is a
+// documented foot-gun in sibling harnesses: re-auth-prompting on a mere 429
+// (false alarm), and — worse — RE-POSTING an already-revoked refresh token every
+// cycle, which both spams the user and can trip further family revokes.
+//
+// We persist a small DEAD latch the moment a terminal auth failure is observed.
+// While latched: refresh short-circuits (never replays the dead RT) and runtimes
+// can skip the doomed request and park instead of hammering. ANY successful token
+// write (login / import / refresh) clears it — that's the recovery signal.
+const CODEX_AUTH_DEAD_FILE = path.join(BASE_DIR, 'state', 'codex-auth-dead.json');
+
+const TERMINAL_AUTH_PATTERNS = [
+  'token_revoked',
+  'token_invalidated',
+  'refresh_token_invalidated',
+  'invalidated oauth token',
+  'refresh_token_reused',
+  'refresh token was already used',
+  'invalid_grant',
+  'unauthorized_client',
+  'refresh_token_expired',
+];
+
+export type CodexAuthErrorClass = 'terminal' | 'transient' | null;
+
+/** Classify a Codex auth/model error as terminal (re-auth required), transient
+ *  (retry — token still valid), or null (not an auth signal). Pure; used by the
+ *  refresh path, the runtimes, and the execution controller so they all agree. */
+export function classifyCodexAuthError(input: { message?: string; status?: number; code?: string }): CodexAuthErrorClass {
+  const hay = `${input.code ?? ''} ${input.message ?? ''}`.toLowerCase();
+  if (TERMINAL_AUTH_PATTERNS.some((p) => hay.includes(p))) return 'terminal';
+  // A bare 401 with no transient marker means the credential was rejected → terminal.
+  if (input.status === 401 || /\b401\b/.test(hay)) return 'terminal';
+  // Quota / rate-limit / backend blips: the token is fine, retry later. NEVER
+  // treat these as a revoke (the "re-auth on a 429" false alarm).
+  if (input.status === 429 || input.status === 402 || (typeof input.status === 'number' && input.status >= 500)) return 'transient';
+  if (/rate.?limit|quota|too many requests|temporarily|timeout|503|502|504/.test(hay)) return 'transient';
+  return null;
+}
+
+export interface CodexAuthDeadState { reason: string; since: string; }
+
+export function getCodexAuthDead(): CodexAuthDeadState | null {
+  try {
+    if (!existsSync(CODEX_AUTH_DEAD_FILE)) return null;
+    const parsed = JSON.parse(readFileSync(CODEX_AUTH_DEAD_FILE, 'utf-8')) as Partial<CodexAuthDeadState>;
+    if (parsed?.reason && parsed?.since) return { reason: parsed.reason, since: parsed.since };
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export function isCodexAuthDead(): boolean {
+  return getCodexAuthDead() !== null;
+}
+
+/** Latch auth as dead (terminal revoke/expiry). Idempotent — keeps the FIRST
+ *  reason/since so the latch reflects when auth actually went down. */
+export function markCodexAuthDead(reason: string): void {
+  try {
+    if (existsSync(CODEX_AUTH_DEAD_FILE)) return; // preserve original since/reason
+    mkdirSync(path.dirname(CODEX_AUTH_DEAD_FILE), { recursive: true });
+    writeFileSync(
+      CODEX_AUTH_DEAD_FILE,
+      JSON.stringify({ reason: reason.slice(0, 300), since: new Date().toISOString() }, null, 2),
+      { encoding: 'utf-8', mode: 0o600 },
+    );
+  } catch { /* best-effort; the latch is an optimization, never load-bearing for correctness */ }
+}
+
+export function clearCodexAuthDead(): void {
+  try { rmSync(CODEX_AUTH_DEAD_FILE, { force: true }); } catch { /* ignore */ }
+}
 // STALE must comfortably exceed the 30s refresh HTTP timeout so a slow-but-ALIVE
 // holder's lock is never stolen mid-rotation — stealing a live holder is the ONE
 // path that re-creates the reuse→revoke this fix prevents. The harness starves
@@ -56,7 +136,7 @@ const REFRESH_LOCK_WAIT_MS = 90_000;   // bound the wait, then fail-open
 const REFRESH_LOCK_STALE_MS = 90_000;  // steal only a crashed holder, never a slow live one
 const REFRESH_SKIP_IF_WITHIN_MS = 2 * 60 * 1000; // a sibling just refreshed → reuse it
 
-let inflightRefresh: Promise<{ ok: boolean; message: string }> | null = null;
+let inflightRefresh: Promise<{ ok: boolean; message: string; terminal?: boolean }> | null = null;
 
 // Test seam: substitute the network token rotation with a stub so the
 // single-flight + lock behavior is verifiable without hitting OpenAI.
@@ -195,6 +275,11 @@ function saveLocalAuthState(state: LocalAuthState): void {
   mkdirSync(path.dirname(AUTH_STATE_FILE), { recursive: true });
   writeFileSync(AUTH_STATE_FILE, JSON.stringify(state, null, 2), { encoding: 'utf-8', mode: 0o600 });
   try { chmodSync(AUTH_STATE_FILE, 0o600); } catch { /* best-effort */ }
+  // A fresh, usable token landed (login / import / successful refresh) → auth is
+  // healthy again, so lift any DEAD latch. This is the single recovery signal.
+  if (state.codexOauth?.accessToken && state.codexOauth?.refreshToken) {
+    clearCodexAuthDead();
+  }
 }
 
 function loadCodexCliAuth(sourceFile = getCodexAuthSourceFile()): CodexCliAuthFile | null {
@@ -332,7 +417,14 @@ export async function loginWithNativeOAuth(_sourceFile = getCodexAuthSourceFile(
  *  even when many agents call this at once (single-flight) or another daemon
  *  races it (cross-process lock + skip-if-just-refreshed). See the concurrency
  *  notes near REFRESH_LOCK_FILE for why this matters (reuse → token_revoked). */
-export async function refreshStoredNativeOAuth(sourceFile = getCodexAuthSourceFile()): Promise<{ ok: boolean; message: string }> {
+export async function refreshStoredNativeOAuth(sourceFile = getCodexAuthSourceFile()): Promise<{ ok: boolean; message: string; terminal?: boolean }> {
+  // 0. DEAD latch: a prior terminal revoke means the refresh token is gone.
+  // Re-POSTing it can't recover and risks tripping further family revokes —
+  // short-circuit until a re-auth lands and clears the latch.
+  const dead = getCodexAuthDead();
+  if (dead) {
+    return { ok: false, terminal: true, message: `Codex sign-in is revoked/expired (since ${dead.since}); re-authenticate to resume.` };
+  }
   // 1. In-process single-flight: concurrent callers share ONE refresh.
   if (inflightRefresh) return inflightRefresh;
   inflightRefresh = doRefreshStoredNativeOAuth(sourceFile);
@@ -349,7 +441,11 @@ function refreshedWithinSkipWindow(lastRefreshIso: string | undefined): boolean 
   return Number.isFinite(last) && Date.now() - last < REFRESH_SKIP_IF_WITHIN_MS;
 }
 
-async function doRefreshStoredNativeOAuth(_sourceFile: string): Promise<{ ok: boolean; message: string }> {
+async function doRefreshStoredNativeOAuth(_sourceFile: string): Promise<{ ok: boolean; message: string; terminal?: boolean }> {
+  // Snapshot the RT we INTEND to spend BEFORE we queue on the lock. If a sibling
+  // rotates the token while we wait, the on-disk RT will differ post-lock and we
+  // reuse theirs rather than spending our now-stale one (read-before-spend).
+  const preLockRefreshToken = loadLocalAuthState().codexOauth?.refreshToken;
   // lockFd starts null + the lock is acquired INSIDE the try, so any throw from
   // acquireRefreshLock (e.g. a state-dir mkdir EACCES) still returns ok:false
   // rather than rejecting the caller's model request.
@@ -365,9 +461,13 @@ async function doRefreshStoredNativeOAuth(_sourceFile: string): Promise<{ ok: bo
     if (!refreshToken) {
       return { ok: false, message: 'No locally stored native refresh token is available.' };
     }
-    // 3. Skip if a sibling just refreshed — reuse their token instead of
-    // POSTing the now-rotated RT again (which would trip reuse-detection).
-    if (refreshedWithinSkipWindow(local.codexOauth?.lastRefresh)) {
+    // 3. Skip if a sibling just refreshed — reuse their token instead of POSTing
+    // the now-rotated RT again (which would trip reuse-detection). Two signals:
+    //   (a) value-based — the on-disk RT changed vs the one we meant to spend
+    //       (a sibling rotated it while we queued on the lock), OR
+    //   (b) time-based — it was refreshed within the skip window.
+    const rotatedWhileWaiting = Boolean(preLockRefreshToken) && refreshToken !== preLockRefreshToken;
+    if (rotatedWhileWaiting || refreshedWithinSkipWindow(local.codexOauth?.lastRefresh)) {
       return { ok: true, message: 'Token was just refreshed by another holder; reusing it.' };
     }
     const tokens = await refreshTokenImpl(refreshToken);
@@ -389,7 +489,18 @@ async function doRefreshStoredNativeOAuth(_sourceFile: string): Promise<{ ok: bo
     });
     return { ok: true, message: 'Native ChatGPT/Codex tokens refreshed.' };
   } catch (error) {
-    return { ok: false, message: error instanceof Error ? error.message : String(error) };
+    const message = error instanceof Error ? error.message : String(error);
+    const status = (error as { status?: number } | null)?.status;
+    const kind = classifyCodexAuthError({ message, status });
+    if (kind === 'terminal') {
+      // The token family is gone — re-POSTing it can't recover and risks more
+      // family revokes. Latch DEAD so callers stop hammering until re-auth.
+      markCodexAuthDead(message);
+      return { ok: false, terminal: true, message };
+    }
+    // Transient (rate-limit / backend blip / network): the token is still valid;
+    // do NOT latch — let the caller retry.
+    return { ok: false, message };
   } finally {
     releaseRefreshLock(lockFd);
   }
@@ -411,28 +522,30 @@ export async function runCodexLogin(): Promise<{ ok: boolean; message: string }>
 
 export async function bootstrapCodexAuth(sourceFile = getCodexAuthSourceFile()): Promise<{ ok: boolean; message: string }> {
   let state = getCodexBootstrapState(sourceFile);
-  const hasReusableAuth = Boolean(
-    (state.localCodex?.accessToken && state.localCodex?.refreshToken)
-    || (state.codexCli?.access_token && state.codexCli?.refresh_token),
-  );
 
-  if (!hasReusableAuth) {
-    const nativeLogin = await loginWithNativeOAuth(sourceFile);
-    if (!nativeLogin.ok) {
-      if (!isCodexCliAvailable()) {
-        const installResult = await installCodexCli();
-        if (!installResult.ok) {
-          return nativeLogin;
-        }
-      }
-      const loginResult = await runCodexLogin();
-      if (!loginResult.ok) {
-        return nativeLogin;
-      }
-    }
-    state = getCodexBootstrapState(sourceFile);
+  // 1. Clementine already holds its OWN grant in the vault → keep it. We must NEVER
+  //    downgrade to the CLI's shared token family below: that coupling is exactly what
+  //    lets a `codex logout` (which revokes the CLI's family server-side) revoke
+  //    Clementine too. A present CLI file is no longer a reason to skip / overwrite.
+  if (state.localCodex?.accessToken && state.localCodex?.refreshToken) {
+    return { ok: true, message: 'Codex OAuth credentials are already stored in Clementine’s own vault.' };
   }
 
+  // 2. No vault grant yet. PREFER a fresh native login so Clementine gets an INDEPENDENT
+  //    token family (its own grant of the shared OAuth client), decoupled from the Codex
+  //    CLI's sign-in. Only interactive sessions can complete the browser flow; importing
+  //    the CLI's (shared) grant is a headless / native-failed fallback below.
+  const interactive = Boolean(process.stdout?.isTTY);
+  if (interactive) {
+    const nativeLogin = await loginWithNativeOAuth(sourceFile);
+    if (nativeLogin.ok && getCodexBootstrapState(sourceFile).localCodex?.refreshToken) {
+      return nativeLogin;
+    }
+  }
+
+  // 3. Fallback: bootstrap through the Codex CLI and import its (shared) grant. The
+  //    resulting state is flagged `codexSharedWithCli` in `auth status` so the user
+  //    knows a `codex logout` will sign Clementine out, and how to decouple.
   if (!isCodexCliAvailable()) {
     const installResult = await installCodexCli();
     if (!installResult.ok) {
@@ -440,27 +553,23 @@ export async function bootstrapCodexAuth(sourceFile = getCodexAuthSourceFile()):
     }
   }
 
-  const hasImportedAuth = Boolean(state.localCodex?.accessToken && state.localCodex?.refreshToken);
-  const hasCodexCliAuth = Boolean(state.codexCli?.access_token && state.codexCli?.refresh_token);
+  state = getCodexBootstrapState(sourceFile);
+  if (!(state.codexCli?.access_token && state.codexCli?.refresh_token)) {
+    const loginResult = await runCodexLogin();
+    if (!loginResult.ok) {
+      return loginResult;
+    }
+    state = getCodexBootstrapState(sourceFile);
+  }
 
-  if (!hasImportedAuth && !hasCodexCliAuth) {
+  if (!(state.codexCli?.access_token && state.codexCli?.refresh_token)) {
     return {
       ok: false,
       message: `Codex login finished, but no reusable credentials were found at ${sourceFile}.`,
     };
   }
 
-  const importResult = importCodexCliAuth(sourceFile);
-  if (importResult.ok) {
-    return importResult;
-  }
-
-  return {
-    ok: hasImportedAuth || hasCodexCliAuth,
-    message: hasImportedAuth || hasCodexCliAuth
-      ? 'Codex login completed and reusable credentials are available.'
-      : importResult.message,
-  };
+  return importCodexCliAuth(sourceFile);
 }
 
 export function importCodexCliAuth(sourceFile = getCodexAuthSourceFile()): { ok: boolean; message: string } {
@@ -492,6 +601,7 @@ export function importCodexCliAuth(sourceFile = getCodexAuthSourceFile()): { ok:
 
 export function clearImportedAuth(): void {
   rmSync(AUTH_STATE_FILE, { force: true });
+  clearCodexAuthDead();
 }
 
 export function getAuthStatus(): AuthStatus {
@@ -501,6 +611,15 @@ export function getAuthStatus(): AuthStatus {
   const localCodex = local.codexOauth;
   const openaiApiKeyPresent = Boolean(getOpenAiApiKey());
   const codexOauthPresent = Boolean(localCodex?.accessToken && localCodex?.refreshToken);
+
+  // Shared-family detection: Clementine's grant is coupled to the Codex CLI's rotating
+  // refresh-token family when it was imported from the CLI (source 'codex_cli'), or when
+  // there is no vault grant and we'd run directly off ~/.codex/auth.json. In that state a
+  // `codex logout` revokes the family server-side and signs Clementine out too.
+  const codexSharedWithCli = codexOauthPresent
+    ? local.source === 'codex_cli'
+    : Boolean(codexCli?.tokens?.access_token && codexCli.tokens.refresh_token);
+  const sharedHint = ' ⚠ This sign-in is shared with the Codex CLI — signing out of the CLI (`codex logout`) will sign Clementine out too. Run `clementine auth login-native` (or desktop → Re-authenticate) to give Clementine its own independent sign-in.';
 
   if (AUTH_MODE === 'api_key') {
     return {
@@ -515,6 +634,7 @@ export function getAuthStatus(): AuthStatus {
       codexAccountId: localCodex?.accountId,
       codexLastRefresh: localCodex?.lastRefresh,
       codexImportPath: codexAuthSourceFile,
+      codexSharedWithCli,
     };
   }
 
@@ -523,14 +643,16 @@ export function getAuthStatus(): AuthStatus {
       mode: AUTH_MODE,
       configured: true,
       source: local.source === 'native' ? 'native' : 'local_store',
-      message: local.source === 'native'
+      message: (local.source === 'native'
         ? 'Native ChatGPT/Codex credentials are stored locally. Codex CLI is optional.'
-        : 'Codex OAuth credentials are imported locally. Codex CLI is optional.',
+        : 'Codex OAuth credentials are imported locally. Codex CLI is optional.')
+        + (codexSharedWithCli ? sharedHint : ''),
       openaiApiKeyPresent,
       codexOauthPresent,
       codexAccountId: localCodex?.accountId,
       codexLastRefresh: localCodex?.lastRefresh,
       codexImportPath: codexAuthSourceFile,
+      codexSharedWithCli,
     };
   }
 
@@ -539,14 +661,16 @@ export function getAuthStatus(): AuthStatus {
       mode: AUTH_MODE,
       configured: isCodexCliAvailable(),
       source: 'codex_cli',
-      message: isCodexCliAvailable()
+      message: (isCodexCliAvailable()
         ? 'Codex CLI credentials detected. Import is optional; the Codex-backed runtime can use the existing CLI login.'
-        : `Codex CLI credentials detected, but the Codex executable is not available on PATH. ${getCodexInstallHint()}`,
+        : `Codex CLI credentials detected, but the Codex executable is not available on PATH. ${getCodexInstallHint()}`)
+        + sharedHint,
       openaiApiKeyPresent,
       codexOauthPresent,
       codexAccountId: codexCli.tokens.account_id,
       codexLastRefresh: codexCli.last_refresh,
       codexImportPath: codexAuthSourceFile,
+      codexSharedWithCli,
     };
   }
 
@@ -558,6 +682,7 @@ export function getAuthStatus(): AuthStatus {
     openaiApiKeyPresent,
     codexOauthPresent,
     codexImportPath: codexAuthSourceFile,
+    codexSharedWithCli,
   };
 }
 
@@ -568,6 +693,7 @@ export function formatAuthStatus(status = getAuthStatus()): string {
     `source: ${status.source}`,
     `api_key_present: ${status.openaiApiKeyPresent ? 'yes' : 'no'}`,
     `codex_oauth_present: ${status.codexOauthPresent ? 'yes' : 'no'}`,
+    status.codexSharedWithCli ? `codex_shared_with_cli: yes (a CLI logout will revoke this — run \`clementine auth login-native\` to decouple)` : '',
     status.codexAccountId ? `codex_account_id: ${status.codexAccountId}` : '',
     status.codexLastRefresh ? `codex_last_refresh: ${status.codexLastRefresh}` : '',
     status.codexImportPath ? `codex_import_path: ${status.codexImportPath}` : '',
