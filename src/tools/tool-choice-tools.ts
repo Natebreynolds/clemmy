@@ -4,6 +4,8 @@ import {
   invalidateToolChoice,
   recallToolChoice,
   rememberToolChoice,
+  deleteToolChoice,
+  forgetMatching,
   type ToolChoiceKind,
 } from '../memory/tool-choice-store.js';
 import { textResult } from './shared.js';
@@ -165,6 +167,33 @@ export function registerToolChoiceTools(server: McpServer): void {
       return textResult(
         `Invalidated choice for "${intent}". The next request for this intent will trigger fresh discovery. Total fallbacks recorded: ${rec.fallbacks.length}.`,
       );
+    },
+  );
+
+  server.tool(
+    'tool_choice_forget',
+    [
+      'HARD-clear a remembered tool choice so the next request fully re-discovers it.',
+      'Use this when the user says a remembered tool is WRONG ("that is wrong", "clear the cache", "forget what you learned for X", "search for new tools / re-search"), or when you notice a cached choice maps to the wrong action for the intent (e.g. a "send" intent that actually points at a create-draft slug).',
+      'Unlike `tool_choice_invalidate` (which keeps the record with an empty choice — still fuzzy-matchable and re-fillable), this DELETES the record entirely. Pass `intent` to forget one, or `pattern` to forget a whole poisoned cluster at once (e.g. pattern "outlook send" or "mark read"). After forgetting, re-discover with `composio_search_tools`/`tool_choice_recall`.',
+    ].join('\n'),
+    {
+      intent: z.string().min(1).max(160).optional().describe('Exact intent to forget (one record).'),
+      pattern: z.string().min(1).max(160).optional().describe('Case-insensitive substring; forgets EVERY matching intent (clears a cluster).'),
+    },
+    async ({ intent, pattern }) => {
+      if (pattern) {
+        const forgotten = forgetMatching(pattern);
+        if (forgotten.length === 0) return textResult(`No tool choices matched "${pattern}" — nothing to forget.`);
+        return textResult(`Forgot ${forgotten.length} tool choice(s) matching "${pattern}": ${forgotten.join(', ')}. The next request for these intents will re-discover from scratch.`);
+      }
+      if (intent) {
+        const removed = deleteToolChoice(intent);
+        return textResult(removed
+          ? `Forgot the tool choice for "${intent}" (record deleted). The next request will re-discover it.`
+          : `No recorded choice for intent "${intent}" — nothing to forget.`);
+      }
+      return textResult('Provide either `intent` (one record) or `pattern` (a cluster) to forget.');
     },
   );
 }

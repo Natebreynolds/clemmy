@@ -241,6 +241,22 @@ test('auto-remember RE-LEARNS after a choice was invalidated (choice cleared →
   assert.equal(peekToolChoice(intent)?.choice?.identifier, 'NEW_WORKING_SLUG', 'auto-commit re-fills an invalidated intent');
 });
 
+test('auto-remember (v0.5.64 membership gate): a slug the search did NOT surface is NOT cached', () => {
+  const intent = 'outlook send email message';
+  // Search surfaced only draft/list/forward tools — never a real send slug.
+  noteComposioSearchIntent('sess-gate-1', intent, ['OUTLOOK_CREATE_DRAFT', 'OUTLOOK_FORWARD_MESSAGE', 'OUTLOOK_LIST_MESSAGES']);
+  // The model executed an UNRELATED slug (a stale cache / cross-intent call).
+  maybeAutoRememberComposioChoice('AIRTABLE_LIST_RECORDS', {}, { successful: true }, 'sess-gate-1');
+  assert.equal(recallToolChoice(intent), null, 'a slug not in the search candidates must not poison the intent');
+});
+
+test('auto-remember (v0.5.64 membership gate): a slug the search DID surface is cached normally', () => {
+  const intent = 'get dataforseo ranked keywords for site';
+  noteComposioSearchIntent('sess-gate-2', intent, ['DATAFORSEO_LABS_GOOGLE_RANKED_KEYWORDS', 'DATAFORSEO_SERP']);
+  maybeAutoRememberComposioChoice('DATAFORSEO_LABS_GOOGLE_RANKED_KEYWORDS', {}, { successful: true }, 'sess-gate-2');
+  assert.equal(recallToolChoice(intent)?.choice?.identifier, 'DATAFORSEO_LABS_GOOGLE_RANKED_KEYWORDS', 'a surfaced slug is learned');
+});
+
 test('fan-out advisory fires ONCE on the 3rd distinct-item call of the same slug', async () => {
   const { maybeFanoutAdvisory } = await import('./composio-tools.js');
   const sid = 'sess-fanout-1';

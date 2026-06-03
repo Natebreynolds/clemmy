@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
 import matter from 'gray-matter';
 import { BASE_DIR } from '../config.js';
@@ -398,6 +398,47 @@ export function peekToolChoice(intent: string): ToolChoiceRecord | null {
   return parseRecord(filePathFor(intent));
 }
 
+/**
+ * HARD-delete a tool-choice record (unlink the markdown file) — a TRUE clear.
+ *
+ * Unlike `invalidateToolChoice` (which keeps the file with choice=null, so it
+ * is still fuzzy-matchable by recall and can be silently re-poisoned by
+ * auto-remember filling the null slot), this removes the record entirely so the
+ * next request re-discovers from scratch. Returns true if a file was removed.
+ * (v0.5.64 — gives the agent/user a real "forget what you learned" affordance
+ * so a poisoned choice no longer requires hand-deleting files.)
+ */
+export function deleteToolChoice(intent: string): boolean {
+  try {
+    const fp = filePathFor(intent);
+    if (!existsSync(fp)) return false;
+    unlinkSync(fp);
+    emitToolChoiceEvent('forget', intent);
+    return true;
+  } catch {
+    return false; // best-effort — a forget failure must never throw to a tool call
+  }
+}
+
+/**
+ * Forget every tool-choice whose intent matches `pattern` (case-insensitive
+ * substring on the raw intent OR its slug). Returns the forgotten intents.
+ * Used to clear a poisoned CLUSTER in one call (e.g. every `outlook send` /
+ * `mark read` choice) instead of one intent at a time.
+ */
+export function forgetMatching(pattern: string): string[] {
+  const needle = pattern.trim().toLowerCase();
+  if (!needle) return [];
+  const needleSlug = slugifyIntent(needle);
+  const forgotten: string[] = [];
+  for (const rec of listToolChoices()) {
+    const matches = rec.intent.toLowerCase().includes(needle)
+      || (needleSlug.length > 0 && slugifyIntent(rec.intent).includes(needleSlug));
+    if (matches && deleteToolChoice(rec.intent)) forgotten.push(rec.intent);
+  }
+  return forgotten;
+}
+
 /** List all recorded tool choices on this machine. Test/debug helper. */
 export function listToolChoices(): ToolChoiceRecord[] {
   const dir = machineDir();
@@ -650,7 +691,7 @@ export function boundCommandForChoice(choice: ToolChoiceRecordChoice): string {
  * perturb a recall/remember path. The CONTEXT INJECTION (behavior change)
  * is what's flag-gated, not this measurement.
  */
-type ToolChoiceAction = 'recall_hit' | 'recall_hit_fuzzy' | 'recall_miss' | 'remember' | 'invalidate' | 'auto_invalidate';
+type ToolChoiceAction = 'recall_hit' | 'recall_hit_fuzzy' | 'recall_miss' | 'remember' | 'invalidate' | 'auto_invalidate' | 'forget';
 function emitToolChoiceEvent(action: ToolChoiceAction, intent: string, identifier?: string): void {
   try {
     recordToolEvent({

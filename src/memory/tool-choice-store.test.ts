@@ -34,6 +34,8 @@ const {
   recallToolChoice,
   rememberToolChoice,
   invalidateToolChoice,
+  deleteToolChoice,
+  forgetMatching,
   listToolChoices,
   renderToolChoicesForContext,
   slugifyIntent,
@@ -286,4 +288,30 @@ test('G1: a legacy tool-choice file with a baked connected_account_id is sanitiz
 
   const ctx = renderToolChoicesForContext();
   assert.doesNotMatch(ctx, /connected_account_id|ca_GJ_hJWV2Hw7P/, 'context injection never exposes a baked id to the model');
+});
+
+// ─── v0.5.64: hard-delete + cluster forget (self-heal affordance) ──────────
+test('deleteToolChoice HARD-removes the record (not recallable, not fuzzy-matchable)', () => {
+  rememberToolChoice({ intent: 'outlook send new email message', choice: { kind: 'composio', identifier: 'OUTLOOK_CREATE_DRAFT' } });
+  assert.ok(recallToolChoice('outlook send new email message')?.choice, 'precondition: recorded');
+  assert.equal(deleteToolChoice('outlook send new email message'), true, 'reports deletion');
+  // Unlike invalidate (choice=null, file kept), a delete removes the record
+  // entirely — even fuzzy recall must miss it.
+  assert.equal(recallToolChoice('outlook send new email message'), null, 'exact recall misses after delete');
+  assert.equal(recallToolChoice('outlook send a new email'), null, 'fuzzy recall misses after delete (file gone)');
+});
+
+test('deleteToolChoice on a missing intent returns false (no throw)', () => {
+  assert.equal(deleteToolChoice('never.recorded.intent'), false);
+});
+
+test('forgetMatching clears a whole poisoned cluster and leaves unrelated choices', () => {
+  rememberToolChoice({ intent: 'outlook send email', choice: { kind: 'composio', identifier: 'AIRTABLE_LIST_RECORDS' } });
+  rememberToolChoice({ intent: 'outlook send message draft', choice: { kind: 'composio', identifier: 'OUTLOOK_LIST_MESSAGES' } });
+  rememberToolChoice({ intent: 'salesforce.accounts.count', choice: { kind: 'cli', identifier: 'sf' } });
+  const forgotten = forgetMatching('outlook send');
+  assert.equal(forgotten.length, 2, 'both outlook-send choices forgotten');
+  assert.equal(recallToolChoice('outlook send email'), null);
+  assert.equal(recallToolChoice('outlook send message draft'), null);
+  assert.ok(recallToolChoice('salesforce.accounts.count')?.choice, 'unrelated choice survives the cluster forget');
 });
