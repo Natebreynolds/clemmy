@@ -938,24 +938,74 @@ export async function setupApiKeyToolkit(
   return { ok: true, authConfigId, connectionId };
 }
 
-export async function listComposioToolkitTools(slug: string, limit = 80): Promise<ComposioToolkitTool[]> {
-  const composio = getComposio();
+export async function listComposioToolkitTools(
+  slug: string,
+  limit = 80,
+  composioOverride?: unknown,
+): Promise<ComposioToolkitTool[]> {
+  const composio = (composioOverride ?? getComposio()) as any;
   if (!composio) throw new Error('COMPOSIO_API_KEY is not configured.');
-  const raw = await (composio as any).tools.getRawComposioTools({ toolkits: [slug], limit });
-  const items = Array.isArray(raw) ? raw : (raw?.items ?? []);
+
+  const seen = new Set<string>();
   const tools: ComposioToolkitTool[] = [];
-  for (const item of items as Array<Record<string, unknown>>) {
-    const toolkit = obj(item.toolkit);
-    const toolSlug = str(item.slug) ?? str(item.name);
-    if (!toolSlug) continue;
-    tools.push({
-      slug: toolSlug,
-      name: str(item.name) ?? toolSlug,
-      description: str(item.description),
-      toolkitSlug: str(toolkit.slug) ?? slug,
-      inputParameters: item.inputParameters ?? item.input_parameters ?? item.parameters,
-    });
+  const ingest = (raw: unknown): void => {
+    const items = Array.isArray(raw) ? raw : ((raw as { items?: unknown[] } | null)?.items ?? []);
+    for (const item of items as Array<Record<string, unknown>>) {
+      const toolkit = obj(item.toolkit);
+      const toolSlug = str(item.slug) ?? str(item.name);
+      if (!toolSlug || seen.has(toolSlug)) continue;
+      seen.add(toolSlug);
+      tools.push({
+        slug: toolSlug,
+        name: str(item.name) ?? toolSlug,
+        description: str(item.description),
+        toolkitSlug: str(toolkit.slug) ?? slug,
+        inputParameters: item.inputParameters ?? item.input_parameters ?? item.parameters,
+      });
+    }
+  };
+
+  // CURATED set FIRST via a DIRECT v3 call WITHOUT toolkit_versions. Every SDK
+  // list path (getRawComposioTools AND the lower-level client.tools.list) pins
+  // toolkit_versions="latest", which the Composio API resolves to the RAW
+  // OpenAPI import and EXCLUDES Composio's curated actions — e.g. the
+  // OUTLOOK_OUTLOOK_* family (SEND_EMAIL / REPLY_EMAIL). Only omitting the
+  // version returns the curated/published set, and the SDK can't omit it — so
+  // we hit the endpoint directly. (Diagnosed 2026-06-03: composio_search_tools
+  // surfaced an Outlook send tool 0/81 times because of this pin, so Clem
+  // wrongly reported "send is not exposed.") Curated is ingested first so its
+  // slugs win de-dup and rank ahead in discovery. Best-effort: any failure
+  // falls through to the raw set below.
+  try {
+    const apiKey = readComposioEnv('COMPOSIO_API_KEY');
+    if (apiKey) {
+      const base = String((composio.client?.baseURL as string | undefined) ?? 'https://backend.composio.dev').replace(/\/+$/, '');
+      const root = /\/api\/v\d+$/.test(base) ? base : `${base}/api/v3`;
+      const url = `${root}/tools?toolkit_slug=${encodeURIComponent(slug)}&limit=${limit}`;
+      // 5s timeout (matches validateComposioApiKey above) so a stuck curated
+      // fetch can't stall the per-toolkit search loop in composio_search_tools.
+      // An AbortError is caught here and falls through to the raw set.
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 5_000);
+      try {
+        const res = await fetch(url, { headers: { 'x-api-key': apiKey, accept: 'application/json' }, signal: controller.signal });
+        if (res.ok) ingest(await res.json());
+      } finally {
+        clearTimeout(timeout);
+      }
+    }
+  } catch {
+    // best-effort: if the curated fetch fails (network / timeout / non-JSON), the raw set below still returns.
   }
+
+  // RAW set ("latest") for full OpenAPI coverage + any user custom tools.
+  try {
+    const raw = await composio.tools.getRawComposioTools({ toolkits: [slug], limit });
+    ingest(raw);
+  } catch (err) {
+    if (tools.length === 0) throw err; // only surface if we got nothing at all
+  }
+
   return tools;
 }
 
