@@ -4,7 +4,8 @@ import { decideToolApproval } from '../agents/tool-taxonomy.js';
 import { beginToolEvent } from '../agents/tool-observability.js';
 import { BoundaryError } from './boundary-error.js';
 import { rateLimitedAlert } from './rate-limited-alert.js';
-import { withTimeout } from './harness/brackets.js';
+import { withTimeout, harnessRunContextStorage } from './harness/brackets.js';
+import { appendFanoutAdvisory } from './harness/fanout-advisory.js';
 
 // Bound MCP startup below the SDK's default (~60s), but leave enough
 // room for `npx`/`uvx` based servers on fresh machines. 5s/8s was too
@@ -24,6 +25,36 @@ const MCP_EAGER_CONNECT_BLOCKING =
 
 type MCPTool = Awaited<ReturnType<MCPServer['listTools']>>[number];
 type CallToolResultContent = Awaited<ReturnType<MCPServer['callTool']>>;
+
+// Append the global fan-out advisory to a native MCP result when the model is
+// looping the same tool serially for N>=3 distinct items in one turn. This is
+// the ONLY place native MCP calls (dataforseo__*/firecrawl__* — the read-heavy
+// path in the sess-mpxpl2l9 incident) are observable: they go through this shim,
+// NOT through wrapToolForHarness, so without this hook they get no behavioral
+// fan-out trigger. sessionId comes from the harness run context, which the loop
+// installs around every turn regardless of HARNESS_TOOL_BRACKETS. Best-effort:
+// never alters the result on any error.
+function appendMcpFanoutAdvisory(
+  toolName: string,
+  args: Record<string, unknown> | null,
+  result: CallToolResultContent,
+): CallToolResultContent {
+  try {
+    const sessionId = harnessRunContextStorage.getStore()?.sessionId;
+    if (!sessionId || !Array.isArray(result)) return result;
+    const resultText = result
+      .map((block) => {
+        const text = (block as { text?: unknown } | null)?.text;
+        return typeof text === 'string' ? text : '';
+      })
+      .join('\n');
+    const advisory = appendFanoutAdvisory({ toolName, args: args ?? {}, sessionId, resultText });
+    if (!advisory) return result;
+    return [...result, { type: 'text', text: advisory }];
+  } catch {
+    return result; // a nudge must never break a tool call
+  }
+}
 
 /**
  * MCP namespace shim — flattens N installed MCP servers into a single
@@ -616,7 +647,10 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): MCPSer
         // Forward to the underlying server with the ORIGINAL tool name.
         const result = await server.callTool(parsed.toolName, args);
         finish('success');
-        return result;
+        // Global fan-out trigger: native MCP calls bypass wrapToolForHarness,
+        // so this is where serial same-shape MCP work (N>=3 distinct items) gets
+        // the run_worker advisory appended. Best-effort; no-op when not looping.
+        return appendMcpFanoutAdvisory(toolName, args, result);
       } catch (err) {
         finish('error', err instanceof Error ? err.message : String(err));
         throw err;

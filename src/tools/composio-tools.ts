@@ -14,6 +14,7 @@ import { formatRecallableToolText } from '../runtime/harness/tool-output-format.
 import { callIdFromToolDetails, sessionIdFromRunContext } from '../runtime/harness/tool-output-context.js';
 import { rememberToolChoice, peekToolChoice, stripBakedConnectionId } from '../memory/tool-choice-store.js';
 import { workerThrashGuardEnabled } from '../runtime/harness/brackets.js';
+import { appendFanoutAdvisory } from '../runtime/harness/fanout-advisory.js';
 import { isTransientStepError } from '../execution/transient-error.js';
 
 const DYNAMIC_TOOL_PREFIX = 'cx_';
@@ -285,96 +286,18 @@ export function maybeAutoRememberComposioChoice(
 
 // ─── Fan-out nudge: catch serial same-shape work and suggest run_worker ─────
 //
-// Observed live (sess-mpvujlni 2026-06-01): the agent researched 10 prospects
-// SERIALLY in one context (run_worker=0) instead of fanning out — slower, and
-// it piles every item's raw tool output into one context, which then forces the
-// harness to clip the freshly-fetched data mid-run. The orchestrator already
-// instructs fan-out, but a buried rule got ignored. So nudge at the MOMENT it's
-// happening: when the same slug has been executed for N distinct items in one
-// session, append an advisory to the tool result. Soft + informs (never blocks).
-//
-// P1 re-arm: the original latch fired exactly ONCE per session and then went
-// quiet, so a loop that slipped the turn-start directive (context-packet.ts)
-// only ever got one nudge. We now re-emit — but HARD-CAPPED (the advisory enters
-// session history, so unbounded re-emit would bloat the very context we keep
-// lean) — and we key the tracker by `slug + coarse-arg-shape`, not session-wide,
-// so "10 prospects then 5 accounts" are separate buckets that each get their own
-// nudge. Gated by CLEMMY_FANOUT_DIRECTIVE: when off, behavior reverts EXACTLY to
-// the prior fire-once-per-session-per-slug latch.
-const FANOUT_ADVICE_THRESHOLD = 3;
-const FANOUT_ADVICE_MAX_EMITS = 2; // re-arm cap per bucket (flag on)
-
-interface FanoutBucket { items: Set<string>; emits: number; }
-const fanoutTrackerBySession = new Map<string, { buckets: Map<string, FanoutBucket>; legacyAdvised: boolean }>();
-
-function fanoutDirectiveEnabled(): boolean {
-  return (process.env.CLEMMY_FANOUT_DIRECTIVE ?? 'on').toLowerCase() !== 'off';
-}
-
-// Coarse arg shape = sorted set of top-level arg keys. Distinct enough to keep
-// genuinely different job types in separate buckets, coarse enough that the
-// same job over different items shares one bucket.
-function coarseArgShape(args: Record<string, unknown>): string {
-  try {
-    return Object.keys(args ?? {}).sort().join(',');
-  } catch {
-    return '';
-  }
-}
-
-export function maybeFanoutAdvisory(toolSlug: string, args: Record<string, unknown>, sessionId: string | undefined): string | null {
-  try {
-    if (!sessionId || !toolSlug) return null;
-    const flagOn = fanoutDirectiveEnabled();
-    let t = fanoutTrackerBySession.get(sessionId);
-    if (!t) {
-      if (fanoutTrackerBySession.size > 500) fanoutTrackerBySession.clear(); // crude bound for a long-lived daemon
-      t = { buckets: new Map(), legacyAdvised: false };
-      fanoutTrackerBySession.set(sessionId, t);
-    }
-    // Flag ON: per slug+arg-shape bucket with capped re-emit.
-    // Flag OFF: one bucket per slug + a session-wide fire-once latch (exactly
-    // the prior shipped behavior).
-    if (!flagOn && t.legacyAdvised) return null;
-    const bucketKey = flagOn ? `${toolSlug}::${coarseArgShape(args)}` : toolSlug;
-    let bucket = t.buckets.get(bucketKey);
-    if (!bucket) { bucket = { items: new Set(), emits: 0 }; t.buckets.set(bucketKey, bucket); }
-
-    let argHash = '';
-    try { argHash = JSON.stringify(args ?? {}); } catch { argHash = `#${bucket.items.size + 1}`; }
-    bucket.items.add(argHash);
-    const size = bucket.items.size;
-
-    const cap = flagOn ? FANOUT_ADVICE_MAX_EMITS : 1;
-    // Emit on threshold crossings, spaced by THRESHOLD distinct items (3, 6),
-    // capped. Spacing keeps the re-emit from firing on every call after 3.
-    const shouldEmit = size >= FANOUT_ADVICE_THRESHOLD * (bucket.emits + 1) && bucket.emits < cap;
-    if (!shouldEmit) return null;
-    bucket.emits += 1;
-    if (!flagOn) t.legacyAdvised = true;
-
-    // Inside a workflow STEP (session id is `workflow:<runId>:<stepId>`),
-    // run_worker is blocklisted by construction — recommending it would be
-    // actively misleading. The fan-out primitive for workflows is a `forEach`
-    // step (an authoring decision the runner parallelizes). Surface the
-    // CORRECT mechanism instead of the run_worker advice.
-    if (sessionId.startsWith('workflow:')) {
-      return (
-        `\n\n↗ Fan-out tip: this workflow step has called ${toolSlug} for ${size} different items in series. `
-        + `Inside a workflow step the fan-out primitive is a forEach step, not run_worker (which isn't available here): `
-        + `have the upstream step emit an array and add a \`forEach: <upstreamStepId>\` step so the runner processes `
-        + `items concurrently (bounded) and keeps each item's context lean.`
-      );
-    }
-    return (
-      `\n\n↗ FAN-OUT NOW: you've called ${toolSlug} serially for ${size} different items in this turn. `
-      + `Do NOT make the next serial call. You already resolved the shared slug/connection — reuse it and call `
-      + `run_worker once per REMAINING item in parallel waves of up to 8, then aggregate. Serial here is exactly `
-      + `what piles every item's payload into one context, trips the loop guard, and got the last batch cancelled.`
-    );
-  } catch {
-    return null; // a nudge must never break the tool call
-  }
+// The detector itself now lives in src/runtime/harness/fanout-advisory.ts so it
+// can be shared with the MCP namespace shim (native dataforseo__*/firecrawl__*
+// reads were previously invisible to this composio-only nudge). This wrapper
+// keeps the original 3-arg signature for the composio path + existing tests;
+// passing `resultText` additionally enables the data-flow independence guard.
+export function maybeFanoutAdvisory(
+  toolSlug: string,
+  args: Record<string, unknown>,
+  sessionId: string | undefined,
+  resultText?: string,
+): string | null {
+  return appendFanoutAdvisory({ toolName: toolSlug, args, sessionId, resultText });
 }
 
 async function runComposioExecute(
@@ -390,7 +313,7 @@ async function runComposioExecute(
     maybeAutoRememberComposioChoice(toolSlug, args, result, sid);
     // Only count/advise on SUCCESS — a failed call isn't "an item processed".
     if (!detectComposioFailure(result).failed) {
-      const advisory = maybeFanoutAdvisory(toolSlug, args, sid);
+      const advisory = maybeFanoutAdvisory(toolSlug, args, sid, output);
       if (advisory) return output + advisory;
     }
     return output;
