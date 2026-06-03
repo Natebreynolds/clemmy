@@ -3,6 +3,7 @@ import { isKillRequested, appendEvent, getSession, listEvents } from './eventlog
 import { getHarnessBudgetSettings } from './budget-settings.js';
 import { listPending as listPendingApprovals } from './approval-registry.js';
 import { evaluateToolCall, applyMode } from './tool-guardrail.js';
+import { normalizeWorkerOutput } from '../../agents/worker-output.js';
 import { getRuntimeEnv } from '../../config.js';
 import {
   isMutatingExternalWrite,
@@ -483,6 +484,29 @@ export interface HarnessRunContext {
    *  timeoutForTool(name) when set; otherwise the default per-name
    *  policy applies. */
   defaultTimeoutMs?: number;
+  /** Loop-guard tracker key. When set (only for run_worker sub-agent
+   *  runs, behind CLEMMY_WORKER_THRASH_GUARD), each worker's loop
+   *  detection counts against its OWN window instead of the shared
+   *  parent sessionId — so 44 parallel workers don't poison one tracker
+   *  and trip the guard on the aggregate. sessionId is left UNCHANGED
+   *  so kill/pause/approval/recall reads still resolve to the real
+   *  session. Falls back to sessionId when absent (byte-identical). */
+  guardrailScopeId?: string;
+}
+
+/** CLEMMY_WORKER_THRASH_GUARD: per-worker loop-guard isolation + bounded
+ *  worker turns + structured per-item give-up. Default OFF — flip on after
+ *  the synthetic-batch soak (the maxTurns floor needs empirical calibration
+ *  before it's the default). Fail-open: a parse miss reads as off. */
+export function workerThrashGuardEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_WORKER_THRASH_GUARD', 'off') ?? 'off').toLowerCase() === 'on';
+}
+
+let workerScopeSeq = 0;
+function workerScopeIdFromDetails(sessionId: string, details: unknown): string {
+  const call = (details as { toolCall?: { callId?: string; id?: string } } | undefined)?.toolCall;
+  const callId = call?.callId ?? call?.id;
+  return `${sessionId}::w:${callId ?? `n${(workerScopeSeq = (workerScopeSeq + 1) % 1_000_000)}`}`;
 }
 
 /** Per-turn context store. The loop wraps runner.run() in `run` so
@@ -578,9 +602,10 @@ export function wrapToolForHarness<T extends WrappableTool>(
       throw new ToolCallsLimitExceeded(ctx.counter.limit);
     }
     ctx.counter.increment();
-    // 2b. Tool-call guardrail (loop detection)
+    // 2b. Tool-call guardrail (loop detection). Keyed by guardrailScopeId
+    // when set (a worker run isolates its own window) else sessionId.
     try {
-      const rawDecision = evaluateToolCall(ctx.sessionId, tool.name, parsedInput);
+      const rawDecision = evaluateToolCall(ctx.guardrailScopeId ?? ctx.sessionId, tool.name, parsedInput);
       const decision = applyMode(rawDecision);
       if (decision.action !== 'allow') {
         try {
@@ -831,12 +856,24 @@ export function wrapToolForHarness<T extends WrappableTool>(
         // timeout means the underlying tool is genuinely stuck).
         throw err;
       }
-      const invokePromise = withTimeout(
+      const invokeOnce = () => withTimeout(
         (async () => originalInvoke.call(tt, runContext, input, details))(),
         timeoutMs,
         tool.name,
         { isPaused: isPausedFactory(ctx?.sessionId) },
       );
+      // run_worker: isolate the worker's loop-guard window so 44 parallel
+      // workers don't poison the one shared tracker (the cross-worker
+      // exact_args_repeat/same_mut_tool_repeat aggregate that cancelled the
+      // 44-attorney batch). sessionId is unchanged (kill/pause/recall intact);
+      // the counter stays shared (batch budget). Behind CLEMMY_WORKER_THRASH_GUARD.
+      const invokePromise =
+        tool.name === 'run_worker' && ctx && workerThrashGuardEnabled()
+          ? (harnessRunContextStorage.run(
+              { ...ctx, guardrailScopeId: workerScopeIdFromDetails(ctx.sessionId, details) },
+              invokeOnce,
+            ) as Promise<unknown>)
+          : invokeOnce();
       // run_worker (Agent.asTool fan-out leaf) MUST return something into the
       // orchestrator's context even on timeout. withTimeout sits OUTSIDE the
       // try/catch above, so a ToolTimeout here propagates straight out of
@@ -849,7 +886,14 @@ export function wrapToolForHarness<T extends WrappableTool>(
       // ask-user Retry card for those (loop.ts), which we don't want to change.
       if (tool.name === 'run_worker') {
         try {
-          return await invokePromise;
+          const result = await invokePromise;
+          // FIX 1.3 — normalize the worker's output into a deterministic
+          // ERROR:/PARTIAL:/verbatim envelope so the orchestrator can tell
+          // done from failed in CODE. Covers BOTH the success text AND the
+          // SDK's generic "An error occurred…" string (the soft-converted
+          // MaxTurnsExceeded / internal-error path the customOutputExtractor
+          // never sees, because a throw skips it). Behind the flag.
+          return workerThrashGuardEnabled() ? normalizeWorkerOutput(result) : result;
         } catch (err) {
           if (err instanceof ToolTimeout) {
             return (

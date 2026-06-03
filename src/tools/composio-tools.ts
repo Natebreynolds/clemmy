@@ -13,6 +13,8 @@ import {
 import { formatRecallableToolText } from '../runtime/harness/tool-output-format.js';
 import { callIdFromToolDetails, sessionIdFromRunContext } from '../runtime/harness/tool-output-context.js';
 import { rememberToolChoice, peekToolChoice, stripBakedConnectionId } from '../memory/tool-choice-store.js';
+import { workerThrashGuardEnabled } from '../runtime/harness/brackets.js';
+import { isTransientStepError } from '../execution/transient-error.js';
 
 const DYNAMIC_TOOL_PREFIX = 'cx_';
 const MAX_TOOL_NAME_LENGTH = 64;
@@ -98,10 +100,22 @@ export function detectComposioFailure(value: unknown): { failed: boolean; summar
  *  `cx_<slug>`) and the slug, so the corrective is unambiguous on both paths. */
 function composioFailureCorrective(
   summary: string,
-  opts: { toolName?: string; toolSlug?: string; notFound?: boolean } = {},
+  opts: { toolName?: string; toolSlug?: string; notFound?: boolean; transient?: boolean } = {},
 ): string {
   const label = opts.toolName || 'composio_execute_tool';
   const where = opts.toolSlug ? ` (slug=${opts.toolSlug})` : '';
+  if (opts.transient && !opts.notFound) {
+    // FIX 1.4 — a transient infra error (rate-limit / 5xx / network / timeout)
+    // is the ONE case where repeating the SAME call is productive. Tell the
+    // model to retry ONCE so we preserve legitimate recovery — but cap it so a
+    // persistent outage doesn't become thrash. (Distinct from the deterministic
+    // "do NOT repeat" copy below.)
+    return [
+      `⚠️ ${label} FAILED${where}: ${summary}`,
+      `This looks like a TRANSIENT infrastructure error (rate-limit / 5xx / network / timeout) — NOT a bad request. A SINGLE retry of the SAME call after a brief pause may succeed.`,
+      `Retry this EXACT call ONCE. If it fails again, treat it as a hard blocker: switch approach (different action/tool) or report the specific blocker to the user. Do NOT retry more than once.`,
+    ].join('\n');
+  }
   if (opts.notFound) {
     // The referenced resource (table/object/record/field id) doesn't exist or
     // wasn't matched — DISCOVER the valid ids, don't guess another name. This
@@ -156,7 +170,8 @@ export function formatComposioExecuteOutput(
   const body = formatComposioToolOutput(value, options);
   const { failed, summary, notFound } = detectComposioFailure(value);
   if (!failed) return body; // success: the GLOBAL id-index (formatRecallableToolText) handles resource lists
-  return composioFailureCorrective(summary, { toolName: options.toolName, toolSlug: options.toolSlug, notFound }) + '\n\n' + body;
+  const transient = workerThrashGuardEnabled() && !notFound && isTransientStepError(summary);
+  return composioFailureCorrective(summary, { toolName: options.toolName, toolSlug: options.toolSlug, notFound, transient }) + '\n\n' + body;
 }
 
 /**
@@ -175,7 +190,10 @@ export function composioThrownErrorOutput(
   const summary = message.slice(0, 240) || 'unknown error';
   const notFound = COMPOSIO_NOT_FOUND_RE.test(message);
   const body = formatComposioToolOutput({ error: message, toolSlug: options.toolSlug ?? null }, options);
-  return composioFailureCorrective(summary, { toolName: options.toolName, toolSlug: options.toolSlug, notFound }) + '\n\n' + body;
+  // The thrown path carries the real error object (status/cause) — classify on
+  // it directly so undici `fetch failed`→ECONNRESET is correctly transient.
+  const transient = workerThrashGuardEnabled() && !notFound && isTransientStepError(err);
+  return composioFailureCorrective(summary, { toolName: options.toolName, toolSlug: options.toolSlug, notFound, transient }) + '\n\n' + body;
 }
 
 /** Run a Composio execution and format BOTH outcomes through the corrective
@@ -349,10 +367,10 @@ export function maybeFanoutAdvisory(toolSlug: string, args: Record<string, unkno
       );
     }
     return (
-      `\n\n↗ Fan-out tip: you've now called ${toolSlug} for ${size} different items in series. `
-      + `For 3+ independent same-shape items, call run_worker once per item (in parallel waves of up to 8) `
-      + `instead of looping here — it runs them concurrently AND keeps this context lean so the harness `
-      + `doesn't clip your freshly-fetched data mid-run. Fan out the remaining items.`
+      `\n\n↗ FAN-OUT NOW: you've called ${toolSlug} serially for ${size} different items in this turn. `
+      + `Do NOT make the next serial call. You already resolved the shared slug/connection — reuse it and call `
+      + `run_worker once per REMAINING item in parallel waves of up to 8, then aggregate. Serial here is exactly `
+      + `what piles every item's payload into one context, trips the loop guard, and got the last batch cancelled.`
     );
   } catch {
     return null; // a nudge must never break the tool call

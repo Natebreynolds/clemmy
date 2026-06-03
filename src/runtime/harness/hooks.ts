@@ -2,6 +2,7 @@ import type { Runner } from '@openai/agents';
 import { appendEvent, writeToolOutput, type EventRow } from './eventlog.js';
 import { scheduleReflection } from '../../memory/reflection.js';
 import { autoInvalidateOnFailure } from './auto-invalidate.js';
+import { fanoutLedgerEnabled, recordWorkerResult } from './fanout-ledger.js';
 
 /**
  * RunHooks → event log writer.
@@ -111,6 +112,19 @@ function callIdFromDetails(details: ToolDetails | undefined): string | undefined
   return call?.callId ?? call?.id;
 }
 
+/** Best-effort `item` label from a run_worker call's arguments (the worker
+ *  packet's `item` field) for the fan-out ledger. Pure; never throws. */
+function workerItemFromDetails(details: ToolDetails | undefined): string | null {
+  try {
+    const raw = details?.toolCall?.arguments;
+    if (typeof raw !== 'string' || !raw.trim()) return null;
+    const parsed = JSON.parse(raw) as { item?: unknown };
+    return typeof parsed.item === 'string' ? parsed.item.slice(0, 120) : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Subscribe to the lifecycle events on a Runner (or anything Runner-
  * shaped) and write each one to the event log. Returns a `detach()`
@@ -125,6 +139,9 @@ export function attachEventLogHooks(
   const maxResultChars = options.maxResultChars ?? 8000;
   const maxOutputChars = options.maxOutputChars ?? 4000;
   const callIdToCalledEventId = new Map<string, string>();
+  // run_worker item label captured at tool-start (args live on the START
+  // event) for the fan-out ledger's failure report; read+cleared at tool-end.
+  const callIdToWorkerItem = new Map<string, string | null>();
 
   const onAgentStart = (...args: unknown[]) => {
     const [runContext, agent] = args as [unknown, NamedAgent | undefined];
@@ -204,6 +221,9 @@ export function attachEventLogHooks(
     }
     if (callId) {
       callIdToCalledEventId.set(callId, event.id);
+      if (tool?.name === 'run_worker' && fanoutLedgerEnabled()) {
+        callIdToWorkerItem.set(callId, workerItemFromDetails(details));
+      }
     }
   };
 
@@ -281,6 +301,26 @@ export function attachEventLogHooks(
         });
       }
     }
+    // FIX 7 — per-run fan-out coverage ledger. Record every run_worker outcome
+    // (ok = result does NOT start with ERROR:) so a partial batch can report
+    // honestly instead of a hollow done. Covers chat + background/execution
+    // (both flow through this hook). Best-effort + flag-gated.
+    if (fanoutLedgerEnabled() && tool?.name === 'run_worker' && callId) {
+      try {
+        const ok = !/^\s*ERROR:/i.test(resultStr ?? '');
+        const item = callIdToWorkerItem.get(callId) ?? workerItemFromDetails(details);
+        recordWorkerResult({
+          sessionId,
+          callId,
+          item,
+          ok,
+          reason: ok ? undefined : (resultStr ?? '').split('\n')[0],
+        });
+      } catch {
+        // ledger is best-effort; never block the event-log write
+      }
+    }
+    if (callId) callIdToWorkerItem.delete(callId);
     try {
       appendEvent({
         sessionId,

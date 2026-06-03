@@ -20,6 +20,7 @@ import { addRunEvent, finishRun, startRun } from '../runtime/run-events.js';
 import { AgentRuntimeCancelledError } from '../runtime/provider.js';
 import { getBackgroundCheckInMs, loadProactivityPolicy } from '../agents/proactivity-policy.js';
 import { openPlanScope } from '../agents/plan-scope.js';
+import { fanoutLedgerEnabled, summarizeLedger, clearLedger } from '../runtime/harness/fanout-ledger.js';
 
 const logger = pino({ name: 'clementine-next.background-tasks' });
 
@@ -571,7 +572,37 @@ export function classifyBackgroundTaskOutcome(
     }
   }
 
+  // 4) FIX 7 — fan-out coverage: if this run fanned out workers and any item
+  //    FAILED (worker returned ERROR:), report partial coverage honestly
+  //    instead of a hollow "done". Flag-gated (CLEMMY_FANOUT_LEDGER).
+  const coverageBlock = fanoutCoverageBlock(task.runSessionId);
+  if (coverageBlock) return coverageBlock;
+
   return { outcome: 'done' };
+}
+
+/**
+ * FIX 7 — derive a partial-coverage "blocked" verdict from the per-run fan-out
+ * ledger, or null when coverage is complete / the flag is off / nothing fanned
+ * out. Shared by both the post-approval and main drain completion paths so a
+ * partial batch never reports a hollow "done" on either. Best-effort.
+ */
+function fanoutCoverageBlock(runSessionId: string): { outcome: 'blocked'; reason: string } | null {
+  if (!fanoutLedgerEnabled()) return null;
+  try {
+    const cov = summarizeLedger(runSessionId);
+    if (cov.total > 0 && cov.failed > 0) {
+      const shown = cov.failedItems.slice(0, 8).join(', ');
+      const more = cov.failedItems.length > 8 ? `, +${cov.failedItems.length - 8} more` : '';
+      return {
+        outcome: 'blocked',
+        reason: `Partial coverage: ${cov.done}/${cov.total} items done, ${cov.failed} failed (${shown}${more}).`,
+      };
+    }
+  } catch {
+    // best-effort
+  }
+  return null;
 }
 
 export function cancelBackgroundTask(id: string, reason = 'Cancelled by user.'): BackgroundTaskRecord | null {
@@ -839,6 +870,7 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
             message: `Background task ${task.id} blocked after approval ${resolution.approvalId}: ${postApprovalOutcome.reason ?? 'could not complete'}`,
             outputPreview: result.text,
           });
+          clearLedger(task.runSessionId);
           logger.warn({ taskId: task.id, approvalId: resolution.approvalId, reason: postApprovalOutcome.reason }, 'Background task blocked after approval continuation (not marked done)');
           continue;
         }
@@ -848,6 +880,7 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
           message: `Background task ${task.id} completed after approval ${resolution.approvalId}.`,
           outputPreview: result.text,
         });
+        clearLedger(task.runSessionId);
         logger.info({ taskId: task.id, approvalId: resolution.approvalId }, 'Background task completed after approval continuation');
         continue;
       }
@@ -923,12 +956,28 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
         continue;
       }
 
+      // FIX 7 — partial fan-out coverage reports honestly instead of a hollow
+      // done. Flag-gated; when off this is a no-op and the run marks done
+      // exactly as before (byte-identical).
+      const coverageBlock = fanoutCoverageBlock(task.runSessionId);
+      if (coverageBlock) {
+        markBackgroundTaskBlocked(task.id, coverageBlock.reason, response.text);
+        finishRun(run.id, {
+          status: 'failed',
+          message: `Background task ${task.id} ${coverageBlock.reason}`,
+          outputPreview: response.text,
+        });
+        clearLedger(task.runSessionId);
+        logger.warn({ taskId: task.id, reason: coverageBlock.reason }, 'Background task partial fan-out coverage (blocked, not done)');
+        continue;
+      }
       markBackgroundTaskDone(task.id, response.text);
       finishRun(run.id, {
         status: 'completed',
         message: `Background task ${task.id} completed.`,
         outputPreview: response.text,
       });
+      clearLedger(task.runSessionId);
       logger.info({ taskId: task.id }, 'Background task completed');
 	    } catch (error) {
 	      if (heartbeatTimer) clearInterval(heartbeatTimer);

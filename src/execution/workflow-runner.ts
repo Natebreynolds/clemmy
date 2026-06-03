@@ -1358,32 +1358,12 @@ const RETRY_BACKOFF_BASE_MS = parseInt(
  * real bug. ParkRunSignal / cancellation are handled by the caller before
  * this is consulted.
  */
-// Transient SIGNALS matched against the error message (network/infra hiccups).
-// Bare HTTP status NUMBERS are deliberately NOT matched here — a message that
-// merely contains "500" (e.g. "expected 500 rows") must not be retried. HTTP
-// status is only honored via the structured `err.status` field below.
-// NB: `fetch failed` is the undici/Node fetch TOP-LEVEL message — the real
-// network code (ECONNRESET/ENOTFOUND) lives on err.cause, which the classifier
-// inspects below. A daily unattended workflow that hit a one-off `fetch failed`
-// (observed live 2026-06-02) must not be treated as a deterministic bug.
-const TRANSIENT_RE = /\b(ETIMEDOUT|ECONNRESET|ECONNREFUSED|EAI_AGAIN|ENOTFOUND|EPIPE|socket hang up|network error|fetch failed|connection (?:error|closed|reset)|timed? ?out|timeout|rate.?limit|too many requests|temporarily unavailable|service unavailable|bad gateway|gateway timeout)\b/i;
-// Deterministic workflow failures that must NEVER be retried even though their
-// message text can contain a transient token (e.g. "timed out waiting for
-// approval" contains "timed out"). This override wins over TRANSIENT_RE.
-const NON_RETRYABLE_RE = /(waiting for approval|exceeded approval wait budget|was not approved|missing required input|failed its contract|deterministic runner)/i;
-const TRANSIENT_STATUS = new Set([408, 429, 500, 502, 503, 504]);
-export function isTransientStepError(err: unknown, depth = 0): boolean {
-  const msg = err instanceof Error ? err.message : String(err ?? '');
-  if (NON_RETRYABLE_RE.test(msg)) return false;
-  const code = (err as { code?: string; status?: number; cause?: unknown } | null);
-  if (code?.code && TRANSIENT_RE.test(code.code)) return true;
-  if (typeof code?.status === 'number' && TRANSIENT_STATUS.has(code.status)) return true;
-  if (TRANSIENT_RE.test(msg)) return true;
-  // undici fetch / aggregate errors wrap the real transient cause one level down
-  // (a `fetch failed` whose cause is ECONNRESET). Recurse, bounded, on the cause.
-  if (depth < 3 && code?.cause && code.cause !== err) return isTransientStepError(code.cause, depth + 1);
-  return false;
-}
+// The transient-vs-deterministic classifier now lives in a pure leaf module
+// (transient-error.ts) so low-level tool modules (composio-tools) can share it
+// without importing this high-level runner. Imported for internal step-retry
+// use + re-exported for back-compat with existing importers.
+import { isTransientStepError } from './transient-error.js';
+export { isTransientStepError };
 
 /**
  * Pure retry harness around an execution thunk. Retries on a transient

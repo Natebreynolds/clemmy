@@ -1,7 +1,7 @@
 import { Agent, tool } from '@openai/agents';
 import type { Handoff } from '@openai/agents';
 import { z } from 'zod';
-import { MODELS } from '../config.js';
+import { MODELS, getRuntimeEnv } from '../config.js';
 import type { RuntimeContextValue } from '../types.js';
 import { buildPlannerTool } from './planner.js';
 // Phase 3 (v0.5.16): single-agent mode — Clem completes the user's
@@ -31,7 +31,7 @@ import {
   harnessInputGuardrails,
   harnessOutputGuardrails,
 } from '../runtime/harness/guardrails.js';
-import { DEFAULT_MAX_TURNS, wrapToolForHarness, type WrappableTool } from '../runtime/harness/brackets.js';
+import { DEFAULT_MAX_TURNS, wrapToolForHarness, workerThrashGuardEnabled, type WrappableTool } from '../runtime/harness/brackets.js';
 
 /**
  * Clem (display name) — the top of the 0.3 harness. Internally the
@@ -409,19 +409,29 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   }
 
   const worker = await buildWorkerAgent({ mcpToolScope });
+  // FIX 1.2 — bound each worker to its own turn budget so a thrashing worker
+  // self-terminates cheaply (the SDK soft-converts MaxTurnsExceeded to a string
+  // result, so a capped worker NEVER throws into the parent batch — siblings
+  // keep running). Env-tunable; behind CLEMMY_WORKER_THRASH_GUARD. When the
+  // flag is off we pass no runOptions → SDK default (today's behavior).
+  const workerMaxTurns = (() => {
+    const n = Number.parseInt(getRuntimeEnv('CLEMMY_WORKER_MAX_TURNS', '8') ?? '8', 10);
+    return Number.isFinite(n) && n >= 2 ? n : 8;
+  })();
   const runWorkerTool = worker.asTool({
     toolName: 'run_worker',
     toolDescription: [
       'Spawn a stateless Worker on ONE item using a structured parent-planned job packet. Call this MULTIPLE TIMES IN PARALLEL when you have N independent items to process (scrape, classify, summarize, fetch, transform, create N records, send N messages with different bodies).',
       'Each worker call gets its own isolated context — use this to keep your own context from ballooning over hundreds of items, and to run the work concurrently instead of sequentially.',
       'Input: a structured packet for ONE item. You must include the item identifier, exact resolved tool slugs/commands/schemas, source rows/URLs, instructions, and expected output. Workers are isolated and cannot see your prior tool outputs unless you paste the needed details into the packet.',
-      'When to use: 3+ independent items of the same kind. The Worker returns a tight result you aggregate.',
+      'When to use: 3+ independent items of the same kind. The Worker returns a tight result you aggregate. TRIP-WIRE: if you catch yourself about to call the same research/enrichment/read/write tool a 3rd time for a DIFFERENT item in one turn, STOP and fan the REMAINING items out with run_worker instead of looping serially (serial piles every item\'s payload into your context and is exactly what tripped the loop guard and got the last batch cancelled).',
       'CRITICAL: a worker result beginning with "ERROR:" means that item FAILED — it was NOT done. Never summarize a batch as complete if any worker returned ERROR. Report exactly which items succeeded and which failed, including the worker reason, and treat the run as needs-attention rather than success.',
       'Before fanning out N mutating workers: call `request_approval` ONCE with the batch summary ("Create 50 Salesforce tasks for these leads — review the list?") instead of letting each worker pause individually. Sticky approval then covers the fan-out.',
       'When NOT to use: tasks that need cross-item memory or a single coherent output stream — those stay on you.',
     ].join(' '),
     parameters: WorkerToolInputSchema,
     inputBuilder: buildWorkerJobPrompt,
+    ...(workerThrashGuardEnabled() ? { runOptions: { maxTurns: workerMaxTurns } } : {}),
   }) as Tool<RuntimeContextValue>;
 
   // Read-only Composio discovery tool. Surfaces `composio_search_tools`

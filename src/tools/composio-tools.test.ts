@@ -334,3 +334,83 @@ test('fan-out advisory inside a WORKFLOW step recommends forEach, NOT run_worker
   assert.match(advice!, /forEach/, 'workflow-step advice must name forEach as the fan-out primitive');
   assert.ok(!/run_worker once per item/.test(advice!), 'must NOT tell a workflow step to use the blocklisted run_worker');
 });
+
+// ─── FIX 2.5: the mid-run advisory is IMPERATIVE at the data-derived count ───
+
+test('FIX2.5: chat fan-out advisory is IMPERATIVE on the 3rd serial call', async () => {
+  const { maybeFanoutAdvisory } = await import('./composio-tools.js');
+  const sid = 'sess-fanout-imperative';
+  maybeFanoutAdvisory('DATAFORSEO_SERP', { q: 'a' }, sid);
+  maybeFanoutAdvisory('DATAFORSEO_SERP', { q: 'b' }, sid);
+  const advice = maybeFanoutAdvisory('DATAFORSEO_SERP', { q: 'c' }, sid);
+  assert.ok(advice, '3rd serial same-shape call fires the advisory');
+  assert.match(advice!, /FAN-OUT NOW/);
+  assert.match(advice!, /Do NOT make the next serial call/);
+  assert.match(advice!, /run_worker/);
+});
+
+// ─── FIX 1.4: transient-aware corrective (retry once vs hard-stop) ───────────
+
+test('FIX1.4: a TRANSIENT composio failure says retry ONCE (flag on)', async () => {
+  const { composioThrownErrorOutput } = await import('./composio-tools.js');
+  const prev = process.env.CLEMMY_WORKER_THRASH_GUARD;
+  process.env.CLEMMY_WORKER_THRASH_GUARD = 'on';
+  try {
+    const rateLimited = Object.assign(new Error('Too Many Requests'), { status: 429 });
+    const out1 = composioThrownErrorOutput(rateLimited, { toolSlug: 'OUTLOOK_SEND_EMAIL' });
+    assert.match(out1, /TRANSIENT/);
+    assert.match(out1, /Retry this EXACT call ONCE/);
+    assert.ok(!/do NOT repeat/i.test(out1.split('\n\n')[0]), 'transient must not use the hard do-not-repeat copy');
+
+    const fetchFailed = Object.assign(new Error('fetch failed'), {
+      cause: Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }),
+    });
+    assert.match(composioThrownErrorOutput(fetchFailed, {}), /TRANSIENT/);
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_WORKER_THRASH_GUARD;
+    else process.env.CLEMMY_WORKER_THRASH_GUARD = prev;
+  }
+});
+
+test('FIX1.4: a DETERMINISTIC (4xx/schema) failure keeps the hard do-not-repeat copy', async () => {
+  const { composioThrownErrorOutput } = await import('./composio-tools.js');
+  const prev = process.env.CLEMMY_WORKER_THRASH_GUARD;
+  process.env.CLEMMY_WORKER_THRASH_GUARD = 'on';
+  try {
+    const schemaErr = new Error('Bad request: missing required field "subject"');
+    const out = composioThrownErrorOutput(schemaErr, { toolSlug: 'OUTLOOK_SEND_EMAIL' });
+    assert.match(out, /HARD failure/);
+    assert.match(out, /Do NOT repeat this identical call/);
+    assert.ok(!/TRANSIENT/.test(out));
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_WORKER_THRASH_GUARD;
+    else process.env.CLEMMY_WORKER_THRASH_GUARD = prev;
+  }
+});
+
+test('FIX1.4: a NOT-FOUND failure keeps the discover-ids copy (transient suppressed)', async () => {
+  const { composioThrownErrorOutput } = await import('./composio-tools.js');
+  const prev = process.env.CLEMMY_WORKER_THRASH_GUARD;
+  process.env.CLEMMY_WORKER_THRASH_GUARD = 'on';
+  try {
+    const out = composioThrownErrorOutput(new Error('TABLE_NOT_FOUND: tblXYZ does not exist'), { toolSlug: 'AIRTABLE_LIST_RECORDS' });
+    assert.match(out, /NOT FOUND/);
+    assert.ok(!/TRANSIENT/.test(out), 'a not-found is deterministic, never transient');
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_WORKER_THRASH_GUARD;
+    else process.env.CLEMMY_WORKER_THRASH_GUARD = prev;
+  }
+});
+
+test('FIX1.4: flag OFF → even a transient error gets the legacy hard copy (zero-regression)', async () => {
+  const { composioThrownErrorOutput } = await import('./composio-tools.js');
+  const prev = process.env.CLEMMY_WORKER_THRASH_GUARD;
+  delete process.env.CLEMMY_WORKER_THRASH_GUARD; // default off
+  try {
+    const out = composioThrownErrorOutput(Object.assign(new Error('rate limit'), { status: 429 }), { toolSlug: 'X' });
+    assert.match(out, /HARD failure/);
+    assert.ok(!/TRANSIENT/.test(out), 'flag off must preserve the prior corrective verbatim');
+  } finally {
+    if (prev !== undefined) process.env.CLEMMY_WORKER_THRASH_GUARD = prev;
+  }
+});
