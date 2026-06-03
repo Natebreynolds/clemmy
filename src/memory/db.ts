@@ -1,5 +1,5 @@
 import Database from 'better-sqlite3';
-import { existsSync, mkdirSync, unlinkSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, unlinkSync, readdirSync, statSync, statfsSync } from 'node:fs';
 import path from 'node:path';
 import { BASE_DIR } from '../config.js';
 
@@ -481,6 +481,18 @@ export interface BackupResult {
 export function backupMemoryDb(opts: { retain?: number } = {}): BackupResult | null {
   const retain = Math.max(1, opts.retain ?? 7);
   try {
+    // Disk-full guard (v0.5.64): a VACUUM INTO snapshot needs room for a full
+    // copy of the live DB. On a near-full disk the write fails with ENOSPC
+    // every maintenance cycle (and a backup you can't write is moot anyway), so
+    // skip cleanly when free space is below a safety floor instead of
+    // attempting + erroring nightly. Best-effort: if statfs is unavailable,
+    // proceed (the outer try/catch still soft-fails any write error to null).
+    try {
+      const fsStat = statfsSync(STATE_DIR);
+      const freeBytes = fsStat.bavail * fsStat.bsize;
+      if (freeBytes < 50 * 1024 * 1024) return null; // < ~50MB free — skip this cycle
+    } catch { /* statfs unsupported — fall through and let the write try */ }
+
     const db = openMemoryDb();
     // Fold the WAL back into the main file (TRUNCATE resets it) so both the
     // live DB and the snapshot stay compact. Best-effort — a busy checkpoint

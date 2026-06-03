@@ -1202,7 +1202,7 @@ export function registerConsoleRoutes(
     const body = (req.body ?? {}) as { content?: unknown; importance?: unknown };
     const patch: { content?: string; importance?: number } = {};
     if (typeof body.content === 'string' && body.content.trim()) patch.content = body.content.trim().slice(0, 800);
-    if (typeof body.importance === 'number' && Number.isFinite(body.importance)) patch.importance = body.importance;
+    if (typeof body.importance === 'number' && Number.isFinite(body.importance)) patch.importance = Math.max(0, Math.min(10, body.importance)); // clamp at the route (updateFact also clamps — defense-in-depth)
     if (patch.content === undefined && patch.importance === undefined) {
       res.status(400).json({ error: 'nothing to update (provide content and/or importance)' });
       return;

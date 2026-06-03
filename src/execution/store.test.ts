@@ -197,6 +197,24 @@ test('sweepCrashedExecutions: CLEMMY_SWEEP_HONOR_NEXT_REVIEW=off reverts to swee
   }
 });
 
+test('sweepCrashedExecutions: stale heartbeat with a MALFORMED nextReviewAt is still swept (NaN must not protect)', () => {
+  seedExecutions([
+    baseExecution({
+      id: 'sched-garbage',
+      sessionId: 'sess-sched-garbage',
+      status: 'active',
+      lastHeartbeatAt: nowMinusMinutes(10),
+      updatedAt: nowMinusMinutes(10),
+      lastActivityAt: nowMinusMinutes(10),
+      nextReviewAt: 'not-a-real-date',
+    }),
+  ]);
+  const swept = sweepCrashedExecutions();
+  assert.equal(swept, 1, 'an unparseable nextReviewAt (NaN) falls through to the sweep — the conservative outcome');
+  const after = readExecutions();
+  assert.equal(after[0].status, 'completed');
+});
+
 test('sweepCrashedExecutions: active with fresh heartbeat is left alone', () => {
   seedExecutions([
     baseExecution({ id: 'fresh', status: 'active', lastHeartbeatAt: nowMinusMinutes(1) }),
