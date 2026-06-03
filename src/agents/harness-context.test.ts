@@ -15,6 +15,26 @@ import assert from 'node:assert/strict';
 const { resetMemoryDb } = await import('../memory/db.js');
 const { createFocus } = await import('../memory/focus.js');
 const { renderHarnessMemoryContext } = await import('./harness-context.js');
+const { saveProactivityPolicy } = await import('./proactivity-policy.js');
+
+test('Autonomy section: YOLO tells the model it has STANDING approval and not to seek sign-off', () => {
+  saveProactivityPolicy({ autoApproveScope: 'yolo' });
+  try {
+    const context = renderHarnessMemoryContext();
+    assert.match(context, /## Autonomy/);
+    assert.match(context, /STANDING APPROVAL/);
+    assert.match(context, /do NOT use ask_user_question to get sign-off/i);
+    assert.match(context, /request_approval \(it auto-approves/);
+  } finally {
+    saveProactivityPolicy({ autoApproveScope: 'balanced' });
+  }
+});
+
+test('Autonomy section: balanced (default) renders NO autonomy line (byte-identical common case)', () => {
+  saveProactivityPolicy({ autoApproveScope: 'balanced' });
+  const context = renderHarnessMemoryContext();
+  assert.doesNotMatch(context, /## Autonomy/);
+});
 
 test('persistent context includes compact installed skills index', () => {
   const skillDir = path.join(TMP_HOME, 'skills', 'proposal-style');

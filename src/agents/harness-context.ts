@@ -34,6 +34,7 @@ import { getActiveObjective, getFocusSnapshot } from '../memory/focus.js';
 import { renderSkillsIndex } from '../memory/skill-store.js';
 import { renderToolChoicesForContext } from '../memory/tool-choice-store.js';
 import { loadUserProfile, renderProfileForInstructions } from '../runtime/user-profile.js';
+import { loadProactivityPolicy } from './proactivity-policy.js';
 
 const GOALS_DIR = path.join(BASE_DIR, 'goals');
 
@@ -49,6 +50,39 @@ interface GoalSummary {
 function section(title: string, body: string | undefined | null): string {
   if (!body || !body.trim()) return '';
   return `## ${title}\n${body.trim()}`;
+}
+
+/**
+ * Surface the user's approval posture (autoApproveScope) to the model. This is
+ * the one piece of operational state the orchestrator was flying blind on:
+ * without it, a YOLO user's Clem still defaults to caution — drafting
+ * "require batch approval" steps and stopping to ask permission (via the
+ * always-blocking ask_user_question) for actions she's already been told to do.
+ * Telling her the posture is true state she lacked, not a prompt-hope rule.
+ *
+ * `balanced` (the default the static instructions already assume) renders
+ * nothing, so the common case is byte-identical and the block stays lean.
+ */
+function renderAutonomy(): string {
+  try {
+    const scope = loadProactivityPolicy().autoApproveScope;
+    if (scope === 'yolo') {
+      return [
+        'YOLO — the user has granted STANDING APPROVAL for every action except the hard catastrophic-danger denylist (deleting data, destructive shell, etc.). You ALREADY have permission to send, draft, write, update, post, and deploy.',
+        'So do NOT stop to ask permission to proceed, do NOT add "await/require approval" steps to a plan, and do NOT use ask_user_question to get sign-off on work you were asked to do — just do it, then report what you did and any assumption you made. Reusing an approved template or the same approach as the items already handled counts as proceeding, not a blocker.',
+        'You MAY still ask a genuine clarifying question when you truly cannot infer something you need to act. And if you ever do need a real human decision, use request_approval (it auto-approves in this mode and keeps you moving) — never ask_user_question to seek approval.',
+      ].join(' ');
+    }
+    if (scope === 'workspace') {
+      return 'Workspace — actions on files/paths inside the user\'s workspace are pre-approved. Proceed on those without asking; still confirm before reaching outside the workspace or making irreversible external writes.';
+    }
+    if (scope === 'strict') {
+      return 'Careful — get an explicit plan/approval from the user (request_approval) before any mutating or external-write action.';
+    }
+    return ''; // balanced: the assumed default; no extra line needed
+  } catch {
+    return '';
+  }
 }
 
 /**
@@ -229,6 +263,7 @@ export function renderHarnessMemoryContext(): string {
     // other context. Without this the model defaults to its training
     // cutoff for date math, which is months stale.
     section('Now', nowLine),
+    section('Autonomy', renderAutonomy()),
     section('User Preferences', profile),
     section('Persistent Facts', facts),
     section('Recently Learned (last 24h)', recentlyLearned),
