@@ -26,6 +26,7 @@ import { z } from 'zod';
 
 const { resetEventLog, createSession, listEvents } = await import('../runtime/harness/eventlog.js');
 const { getPlanScope } = await import('./plan-scope.js');
+const { saveProactivityPolicy } = await import('./proactivity-policy.js');
 const {
   buildOrchestratorAgent,
   OrchestratorDecisionSchema,
@@ -352,6 +353,63 @@ test('ask_user_question emits awaiting_user_input with options', async () => {
   assert.equal(events.length, 1);
   assert.equal(events[0].data.question, 'which environment?');
   assert.deepEqual(events[0].data.options, ['staging', 'prod']);
+});
+
+// ─── YOLO: approval-shaped ask_user_question must NOT halt (the v0.5.60 code fix) ───
+
+test('YOLO + approval-shaped ask_user_question does NOT halt — proceeds with standing approval', async () => {
+  resetEventLog();
+  saveProactivityPolicy({ autoApproveScope: 'yolo' });
+  try {
+    const sess = createSession({ kind: 'chat' });
+    const t = buildAskUserQuestionTool();
+    // The live incident question (sess-mpxdpxv0).
+    const result = await invokeFunctionTool(
+      t,
+      {
+        question: 'I’m blocked on the approved R&R email copy. Do you want me to use a specific prior template, or should I create the Outlook drafts first for review instead of sending live?',
+        options: ['Use prior template and send', 'Create drafts for review'],
+      },
+      { sessionId: sess.id, turn: 1 },
+    );
+    assert.match(result, /standing approval|NOT pausing/i, 'returns a proceed instruction, not a wait');
+    // The run must NOT halt: zero awaiting_user_input, and a non-halting audit note instead.
+    assert.equal(listEvents(sess.id, { types: ['awaiting_user_input'] }).length, 0, 'approval-shaped Q must not emit the halting event');
+    assert.equal(listEvents(sess.id, { types: ['autonomy_note'] }).length, 1, 'records a non-halting autonomy_note');
+  } finally {
+    saveProactivityPolicy({ autoApproveScope: 'balanced' });
+  }
+});
+
+test('YOLO + GENUINE info question still halts (she can still ask)', async () => {
+  resetEventLog();
+  saveProactivityPolicy({ autoApproveScope: 'yolo' });
+  try {
+    const sess = createSession({ kind: 'chat' });
+    const t = buildAskUserQuestionTool();
+    const result = await invokeFunctionTool(
+      t,
+      { question: 'Which Salesforce environment should I read from, staging or prod?', options: ['staging', 'prod'] },
+      { sessionId: sess.id, turn: 1 },
+    );
+    assert.match(result, /Question posted/, 'genuine info question still posts + waits');
+    assert.equal(listEvents(sess.id, { types: ['awaiting_user_input'] }).length, 1, 'genuine clarification still halts in YOLO');
+  } finally {
+    saveProactivityPolicy({ autoApproveScope: 'balanced' });
+  }
+});
+
+test('non-YOLO (balanced) + approval-shaped question still halts (no default-user regression)', async () => {
+  resetEventLog();
+  saveProactivityPolicy({ autoApproveScope: 'balanced' });
+  const sess = createSession({ kind: 'chat' });
+  const t = buildAskUserQuestionTool();
+  await invokeFunctionTool(
+    t,
+    { question: 'Should I send the rest of the emails now?', options: ['Yes send', 'No'] },
+    { sessionId: sess.id, turn: 1 },
+  );
+  assert.equal(listEvents(sess.id, { types: ['awaiting_user_input'] }).length, 1, 'balanced is byte-identical: still halts');
 });
 
 test('deliberation tools no-op silently when no sessionId is on the context', async () => {

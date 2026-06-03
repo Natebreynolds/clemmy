@@ -194,6 +194,35 @@ function isYoloAutoApprovalPolicy(): boolean {
   }
 }
 
+// Code-level backstop for the v0.5.59 context fix: in YOLO, ask_user_question is
+// the ONE human-wait path with no autonomy-scope awareness — its siblings
+// (request_approval, confirm-first, per-tool approval) all honor YOLO in code.
+// So when a YOLO Clem reaches for ask_user_question to seek SIGN-OFF for an
+// action the user already authorized, don't let it halt the run (the prompt
+// alone can't guarantee that). A GENUINE clarification still halts and asks —
+// the gate is on the approval SHAPE, not on questions in general (the owner:
+// "she CAN ask questions"). Kill-switch CLEMMY_YOLO_NO_APPROVAL_HALT=off.
+function yoloNoApprovalHaltEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_YOLO_NO_APPROVAL_HALT', 'on') ?? 'on').toLowerCase() !== 'off';
+}
+
+// "Should I <do mutating thing>?" / "go ahead?" / "approve?" + a mutating verb,
+// OR explicit approval/permission/"for review"/"use a template" vocabulary with
+// a mutating action. Mirrors the two-pattern style of isLocalSaveApproval.
+const APPROVAL_ASK_WORDS = /\b(approve|approval|permission|sign[-\s]?off|ok(?:ay)?\s+to|go\s+ahead|proceed|for\s+review|review\s+(?:first|before)|drafts?\s+(?:first\s+)?for\s+review|before\s+(?:sending|posting|publishing|writing)|use\s+(?:a|the|this|that|specific|prior)\b[^.?!]*\b(?:template|copy|draft))\b/i;
+const APPROVAL_ASK_LEADIN = /\b(should\s+i|shall\s+i|do\s+you\s+want\s+me\s+to|would\s+you\s+like\s+me\s+to|can\s+i|may\s+i|ok\s+to|okay\s+to)\b/i;
+const MUTATING_ACTION_WORD = /\b(send|sending|sent|draft|drafts|email|emails|update|post|posting|deploy|publish|write|create|submit)\b/i;
+
+function isApprovalShapedQuestion(question: string, options: string[] | null | undefined): boolean {
+  try {
+    const text = `${question} ${(options ?? []).join(' ')}`;
+    if (!MUTATING_ACTION_WORD.test(text)) return false; // no action being gated → it's a real info question
+    return APPROVAL_ASK_LEADIN.test(text) || APPROVAL_ASK_WORDS.test(text);
+  } catch {
+    return false;
+  }
+}
+
 function inferApprovedComposioSlugs(args: RequestApprovalArgs): string[] {
   const sampleText = args.preview?.samples
     ?.flatMap((sample) => [sample.label, sample.value, sample.secondary ?? ''])
@@ -273,6 +302,37 @@ export function buildAskUserQuestionTool() {
     parameters: askUserQuestionParams,
     execute: async (args, runContext) => {
       const sessionId = extractSessionId(runContext);
+      // YOLO + approval-shaped question → do NOT halt. The user has standing
+      // approval; seeking sign-off for an action they authorized is the exact
+      // re-block we're killing. Record a NON-halting autonomy_note (audit trail
+      // of what she defaulted on) and return "proceed" so the run continues.
+      // A genuine clarification (no mutating action being gated) falls through
+      // to the normal awaiting_user_input halt below — she can still ask.
+      if (
+        sessionId
+        && isYoloAutoApprovalPolicy()
+        && yoloNoApprovalHaltEnabled()
+        && isApprovalShapedQuestion(args.question, args.options)
+      ) {
+        try {
+          appendEvent({
+            sessionId,
+            turn: extractTurn(runContext),
+            role: 'Clem',
+            type: 'autonomy_note',
+            data: {
+              question: args.question,
+              options: args.options ?? null,
+              autoResolved: 'yolo-standing-approval',
+            },
+          });
+        } catch { /* audit note is best-effort; never block the proceed path */ }
+        return (
+          'YOLO standing approval is in effect — NOT pausing for sign-off on an action you were already asked to do. '
+          + 'Proceed now with your best default (reuse the approved copy/template the already-handled items used, or the same approach), '
+          + `then report what you did and the assumption you made. (Noted, not waiting: "${args.question}")`
+        );
+      }
       if (sessionId) {
         appendEvent({
           sessionId,
