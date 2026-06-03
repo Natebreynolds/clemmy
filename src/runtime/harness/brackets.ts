@@ -495,11 +495,11 @@ export interface HarnessRunContext {
 }
 
 /** CLEMMY_WORKER_THRASH_GUARD: per-worker loop-guard isolation + bounded
- *  worker turns + structured per-item give-up. Default OFF — flip on after
- *  the synthetic-batch soak (the maxTurns floor needs empirical calibration
- *  before it's the default). Fail-open: a parse miss reads as off. */
+ *  worker turns + structured per-item give-up. Default ON (validated live
+ *  2026-06-02: 8-worker fan-out, 0 cap-hits at maxTurns=8, 0 thrash, honest
+ *  per-item ERROR reporting). `=off` is the emergency kill-switch. */
 export function workerThrashGuardEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_WORKER_THRASH_GUARD', 'off') ?? 'off').toLowerCase() === 'on';
+  return (getRuntimeEnv('CLEMMY_WORKER_THRASH_GUARD', 'on') ?? 'on').toLowerCase() !== 'off';
 }
 
 let workerScopeSeq = 0;

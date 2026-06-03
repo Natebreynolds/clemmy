@@ -6,9 +6,9 @@
  *
  * Pure + best-effort: a bug here must never break a turn. Scoped to a single
  * live run/turn (in-memory) — durable large-N progress is the forEach-workflow
- * path's job, not this. Behind CLEMMY_FANOUT_LEDGER (default off) because it
- * flips a previously-"done" partial batch to "blocked" — a report-back change
- * that needs its own soak before default-on.
+ * path's job, not this. Default ON (CLEMMY_FANOUT_LEDGER=off to disable): on a
+ * partial batch the background classifier reports "M of N failed" (blocked)
+ * instead of a hollow done.
  */
 import { getRuntimeEnv } from '../../config.js';
 
@@ -29,8 +29,11 @@ export interface LedgerSummary {
 // result for the same worker call updates rather than double-counts.
 const ledgerBySession = new Map<string, Map<string, LedgerEntry>>();
 
+// Default ON (validated 2026-06-02). `=off` is the emergency kill-switch.
+// On a partial fan-out batch the background classifier reports "M of N failed"
+// (blocked) instead of a hollow done — honest report-back for all users.
 export function fanoutLedgerEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_FANOUT_LEDGER', 'off') ?? 'off').toLowerCase() === 'on';
+  return (getRuntimeEnv('CLEMMY_FANOUT_LEDGER', 'on') ?? 'on').toLowerCase() !== 'off';
 }
 
 export function recordWorkerResult(input: {

@@ -402,15 +402,16 @@ test('FIX1.4: a NOT-FOUND failure keeps the discover-ids copy (transient suppres
   }
 });
 
-test('FIX1.4: flag OFF → even a transient error gets the legacy hard copy (zero-regression)', async () => {
+test('FIX1.4: kill-switch off → even a transient error gets the legacy hard copy (revert path)', async () => {
   const { composioThrownErrorOutput } = await import('./composio-tools.js');
   const prev = process.env.CLEMMY_WORKER_THRASH_GUARD;
-  delete process.env.CLEMMY_WORKER_THRASH_GUARD; // default off
+  process.env.CLEMMY_WORKER_THRASH_GUARD = 'off'; // explicit kill-switch (default is now on)
   try {
     const out = composioThrownErrorOutput(Object.assign(new Error('rate limit'), { status: 429 }), { toolSlug: 'X' });
     assert.match(out, /HARD failure/);
-    assert.ok(!/TRANSIENT/.test(out), 'flag off must preserve the prior corrective verbatim');
+    assert.ok(!/TRANSIENT/.test(out), 'kill-switch off must preserve the prior corrective verbatim');
   } finally {
-    if (prev !== undefined) process.env.CLEMMY_WORKER_THRASH_GUARD = prev;
+    if (prev === undefined) delete process.env.CLEMMY_WORKER_THRASH_GUARD;
+    else process.env.CLEMMY_WORKER_THRASH_GUARD = prev;
   }
 });

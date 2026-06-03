@@ -52,11 +52,13 @@ test('never throws on bad input', () => {
   });
 });
 
-test('flag defaults off, honors on', () => {
+test('flag defaults ON, honors the off kill-switch', () => {
   const prev = process.env.CLEMMY_FANOUT_LEDGER;
   try {
     delete process.env.CLEMMY_FANOUT_LEDGER;
-    assert.equal(fanoutLedgerEnabled(), false);
+    assert.equal(fanoutLedgerEnabled(), true, 'default on');
+    process.env.CLEMMY_FANOUT_LEDGER = 'off';
+    assert.equal(fanoutLedgerEnabled(), false, 'off disables');
     process.env.CLEMMY_FANOUT_LEDGER = 'on';
     assert.equal(fanoutLedgerEnabled(), true);
   } finally {

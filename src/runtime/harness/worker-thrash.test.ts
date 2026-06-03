@@ -62,15 +62,15 @@ test('per-worker keys ISOLATE the guard: 4 identical calls per worker never trip
   }
 });
 
-test('flag helper: CLEMMY_WORKER_THRASH_GUARD defaults off, honors on', () => {
+test('flag helper: CLEMMY_WORKER_THRASH_GUARD defaults ON, honors the off kill-switch', () => {
   const prev = process.env.CLEMMY_WORKER_THRASH_GUARD;
   try {
     delete process.env.CLEMMY_WORKER_THRASH_GUARD;
-    assert.equal(workerThrashGuardEnabled(), false, 'default off');
+    assert.equal(workerThrashGuardEnabled(), true, 'default on (validated live)');
+    process.env.CLEMMY_WORKER_THRASH_GUARD = 'off';
+    assert.equal(workerThrashGuardEnabled(), false, 'off is the kill-switch');
     process.env.CLEMMY_WORKER_THRASH_GUARD = 'on';
     assert.equal(workerThrashGuardEnabled(), true);
-    process.env.CLEMMY_WORKER_THRASH_GUARD = 'off';
-    assert.equal(workerThrashGuardEnabled(), false);
   } finally {
     if (prev === undefined) delete process.env.CLEMMY_WORKER_THRASH_GUARD;
     else process.env.CLEMMY_WORKER_THRASH_GUARD = prev;

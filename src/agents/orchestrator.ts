@@ -412,8 +412,8 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   // FIX 1.2 — bound each worker to its own turn budget so a thrashing worker
   // self-terminates cheaply (the SDK soft-converts MaxTurnsExceeded to a string
   // result, so a capped worker NEVER throws into the parent batch — siblings
-  // keep running). Env-tunable; behind CLEMMY_WORKER_THRASH_GUARD. When the
-  // flag is off we pass no runOptions → SDK default (today's behavior).
+  // keep running). Env-tunable; on by default (CLEMMY_WORKER_THRASH_GUARD=off
+  // reverts to the SDK default turn budget and skips the cap).
   //
   // Default 8, calibrated against harness.db (2026-06-02): a focused single-job
   // agent (the WorkflowStep analog — the closest measurable proxy, since worker
