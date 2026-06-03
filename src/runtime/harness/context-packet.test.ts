@@ -115,6 +115,16 @@ test('detectMultiItemIntent FIRES despite an incidental aggregate verb when per-
   // The retrieval-only case is still suppressed (no deep-work verb).
   assert.equal(detectMultiItemIntent('Show my last 5 emails.').isMultiItem, false);
   assert.equal(detectMultiItemIntent('Give me my 5 latest invoices.').isMultiItem, false);
+
+  // Live 2026-06-02 #2: an incidental "<n>-sentence analysis of that firm"
+  // must NOT be misread as internal cardinality and suppress a per-firm fan-out.
+  const heavy = detectMultiItemIntent(
+    'For each of these 8 law firms, do a full per-firm SEO audit: pull ranked keywords, backlinks, and competitors, then write a 2-3 sentence analysis of that firm’s SEO position. Firms: a.com, b.com.',
+  );
+  assert.equal(heavy.isMultiItem, true, '"2-3 sentence analysis of that firm" must not suppress an 8-firm audit');
+  assert.equal(heavy.itemCount, 8);
+  // The tight possessive internal-cardinality case is still suppressed.
+  assert.equal(detectMultiItemIntent("Research this firm's 10 competitors.").isMultiItem, false);
 });
 
 test('detectMultiItemIntent does NOT fire on the no-fire cases', () => {

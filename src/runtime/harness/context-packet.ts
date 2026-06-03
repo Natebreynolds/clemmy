@@ -104,9 +104,13 @@ const AGGREGATE_RETRIEVAL_RE = /\b(?:show|list|display|view|print|read out|pull 
 // retrieval-only (no deep work), e.g. "show my last 5 emails".
 const DEEP_WORK_RE = /\b(?:research|audit|scrape|crawl|analy[sz]e|enrich|profile|investigate|draft|compose|create|build|generate|write|redesign|compile|produce|assemble|summari[sz]e|deploy|publish)\b/i;
 // Internal cardinality — the N items belong to ONE parent, so there is only one
-// job ("this firm's 10 competitors"): possessive owner, or "N <noun> of the X".
+// job ("this firm's 10 competitors"): a possessive owner immediately governing
+// the count. Tight by design: anchored to "<owner>'s <N>". The looser
+// "N <noun> of the X" variant was REMOVED — it false-matched incidental phrases
+// like "write a 2-3 sentence analysis of that firm" (live 2026-06-02), wrongly
+// suppressing a legit per-firm fan-out. Its only unique target ("10 competitors
+// of this firm") is itself fan-out-able, so dropping it favors reliable firing.
 const INTERNAL_OWNER_RE = /\b(?:this|that|the|a|an|each|every|its|his|her|their|our|my|one|same)\s+[a-z][\w-]*['’]s\s+(?:top\s+|first\s+)?\d{1,3}\b/i;
-const INTERNAL_OF_RE = /\b\d{1,3}\s+[a-z][\w'-]+(?:\s+[a-z][\w'-]+)?\s+(?:of|for|within|inside|from|on|in)\s+(?:this|that|the|a|an|each|every|its|one|my|his|her|their|our)\s+[a-z]/i;
 // Distinct-items markers that override the sequence guard ("these 10 ...").
 const DISTINCT_MARKER_RE = /\b(?:these|those|each|every|all (?:of )?(?:the|these|those|my|them)|the following|following|below|listed|respectively)\b/i;
 // Nouns that are units/pagination/chit-chat, never independent fan-out items.
@@ -167,7 +171,7 @@ export function detectMultiItemIntent(input: string): MultiItemIntent {
     // request is retrieval-only; a genuine per-item work verb (research/
     // enrich/draft/…) means an incidental aggregate phrase shouldn't block.
     if (AGGREGATE_RETRIEVAL_RE.test(text) && !DEEP_WORK_RE.test(text)) return NO_MULTI_ITEM; // single-collection read
-    if (INTERNAL_OWNER_RE.test(text) || INTERNAL_OF_RE.test(text)) return NO_MULTI_ITEM; // internal cardinality
+    if (INTERNAL_OWNER_RE.test(text)) return NO_MULTI_ITEM; // internal cardinality
     const hasDistinct = enumerated || DISTINCT_MARKER_RE.test(text);
     if (SEQUENCE_RE.test(text) && !hasDistinct) return NO_MULTI_ITEM; // A->B->C chain
 
