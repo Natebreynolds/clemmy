@@ -27,7 +27,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 const { attachEventLogHooks, extractSessionIdFromContext } = await import('./hooks.js');
-const { resetEventLog, createSession } = await import('./eventlog.js');
+const { resetEventLog, createSession, listEvents } = await import('./eventlog.js');
 const { summarizeLedger, clearLedger } = await import('./fanout-ledger.js');
 const { classifyBackgroundTaskOutcome } = await import('../../execution/background-tasks.js');
 const { normalizeWorkerOutput } = await import('../../agents/worker-output.js');
@@ -98,6 +98,12 @@ test('synthetic fan-out: failing items are counted failed, siblings done, run re
   const outcome = classifyBackgroundTaskOutcome({ runSessionId }, 'Enriched the firms.');
   assert.equal(outcome.outcome, 'blocked', 'a partial batch must not report done');
   assert.match(outcome.reason ?? '', /7\/10 items done, 3 failed/);
+
+  // (d): the turn-capped worker emits always-on worker_capped telemetry (the
+  // only signal of worker turn-ceiling hits — feeds maxTurns recalibration).
+  const capped = listEvents(runSessionId, { types: ['worker_capped'] });
+  assert.equal(capped.length, 1, 'the turn-capped worker logs exactly one worker_capped event');
+  assert.equal((capped[0].data as { item?: string }).item, 'Firm 9');
   clearLedger(runSessionId);
 });
 

@@ -414,6 +414,18 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   // result, so a capped worker NEVER throws into the parent batch — siblings
   // keep running). Env-tunable; behind CLEMMY_WORKER_THRASH_GUARD. When the
   // flag is off we pass no runOptions → SDK default (today's behavior).
+  //
+  // Default 8, calibrated against harness.db (2026-06-02): a focused single-job
+  // agent (the WorkflowStep analog — the closest measurable proxy, since worker
+  // nested runs carry no harness hooks so their turns aren't logged directly)
+  // completes in 1–3 turns (avg 1.1, max 3). The ONLY workers that ever hit the
+  // SDK default of 10 were mis-scoped (one worker crammed with 8 sends each) —
+  // an anti-pattern the structured one-item packet now prevents. 8 sits above
+  // legit single-item work (1–3, complex sequential ≤~7) and below 10, catching
+  // mis-scoped/runaway workers ~2 turns earlier. The precise thrash control is
+  // the per-worker loop-guard (identical-call block@5/escalate@7), not this cap;
+  // the cap is the outer runaway bound. `worker_capped` telemetry (hooks.ts)
+  // records cap-hits so this can be recalibrated from real data.
   const workerMaxTurns = (() => {
     const n = Number.parseInt(getRuntimeEnv('CLEMMY_WORKER_MAX_TURNS', '8') ?? '8', 10);
     return Number.isFinite(n) && n >= 2 ? n : 8;

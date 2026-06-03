@@ -121,6 +121,11 @@ export const EVENT_TYPES = [
   // writes — which share the parent session via AsyncLocalStorage but may
   // not log tool_called under it — are counted reliably.
   'external_write',
+  // Always-on telemetry: a run_worker sub-agent hit its turn ceiling
+  // (MaxTurnsExceeded). Worker nested runs carry no harness hooks, so this is
+  // the only signal of worker turn-cap hits — used to recalibrate
+  // CLEMMY_WORKER_MAX_TURNS from real data.
+  'worker_capped',
 ] as const;
 export type EventType = (typeof EVENT_TYPES)[number];
 const EVENT_TYPE_SET: ReadonlySet<string> = new Set(EVENT_TYPES);

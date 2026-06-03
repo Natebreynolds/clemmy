@@ -320,6 +320,24 @@ export function attachEventLogHooks(
         // ledger is best-effort; never block the event-log write
       }
     }
+    // ALWAYS-ON telemetry (no flag): worker turn-cap hits. Worker nested runs
+    // carry no harness hooks, so their internal turns aren't otherwise logged —
+    // this is the only signal of "a worker hit its turn ceiling", needed to
+    // recalibrate CLEMMY_WORKER_MAX_TURNS from real data. Matches both the raw
+    // SDK MaxTurnsExceeded string and the FIX-1.3 normalized turn-cap envelope.
+    if (tool?.name === 'run_worker' && /MaxTurnsExceeded|hit its turn cap/i.test(resultStr ?? '')) {
+      try {
+        appendEvent({
+          sessionId,
+          turn: getTurn(runContext),
+          role: 'system',
+          type: 'worker_capped',
+          data: { callId: callId ?? null, item: callIdToWorkerItem.get(callId ?? '') ?? workerItemFromDetails(details) },
+        });
+      } catch {
+        // telemetry is best-effort
+      }
+    }
     if (callId) callIdToWorkerItem.delete(callId);
     try {
       appendEvent({
