@@ -15,7 +15,7 @@ import {
   type WorkflowDefinition,
   type WorkflowEntry,
 } from '../memory/workflow-store.js';
-import { checkWorkflowForWrite } from '../execution/workflow-enforce.js';
+import { prepareWorkflowForWrite } from '../execution/workflow-enforce.js';
 import { analyzeWorkflowGaps, renderWorkflowGapQuestions } from '../execution/workflow-gap-test.js';
 import {
   CRON_PROGRESS_DIR,
@@ -602,23 +602,27 @@ export function registerOrchestrationTools(server: McpServer): void {
       // Tight authoring: bind steps to the user's proven tool-choices BEFORE
       // validation (auto-bound steps then pass the binding warning cleanly).
       const createBind = bindStepsToToolChoices(def.steps);
-      // P2: refuse to create a workflow whose data can't flow (unbound
-      // inputs, malformed {{tokens}}, dangling deps).
-      const createCheck = checkWorkflowForWrite(def);
-      if (!createCheck.ok) {
+      // Auto-repair the mechanically-fixable binding gaps (dangling
+      // {{steps.X.output}} / forEach / undeclared {{input.X}}), THEN refuse
+      // only if the repaired workflow still can't flow. This saves a runnable
+      // workflow in one shot instead of bouncing the author into a token-
+      // burning re-author loop over a fix the engine can make itself.
+      const createPrep = prepareWorkflowForWrite(def);
+      if (!createPrep.ok) {
         return textResult(
-          `Workflow "${name}" was NOT created — fix these first:\n- ${createCheck.errors.join('\n- ')}`,
+          `Workflow "${name}" was NOT created — fix these first:\n- ${createPrep.errors.join('\n- ')}`,
         );
       }
-      writeWorkflow(dirName, def);
+      const savedDef = createPrep.def;
+      writeWorkflow(dirName, savedDef);
       const createBindReport = createBind.boundNotes.length > 0 ? `\n\n${createBind.boundNotes.join('\n')}` : '';
       // Super-plan authoring: a saved workflow is run through the gap test so
       // Clem asks the user for clarity BEFORE relying on it, instead of
       // authoring something quietly set up to fail at 2am.
-      const createGaps = analyzeWorkflowGaps(def);
+      const createGaps = analyzeWorkflowGaps(savedDef);
       return textResult(
         `Created workflow "${name}" at workflows/${dirName}/SKILL.md.${createBindReport}`
-          + `${renderAuthoringAdvisories([...createCheck.warnings, ...createBind.advisories])}`
+          + `${renderAuthoringAdvisories([...createPrep.repairs, ...createPrep.warnings, ...createBind.advisories])}`
           + `${renderWorkflowGapQuestions(createGaps)}`,
       );
     },
@@ -838,18 +842,25 @@ export function registerOrchestrationTools(server: McpServer): void {
     async ({ name, enabled }) => {
       const entry = listWorkflowFiles().find((w) => w.data.name === name);
       if (!entry) return textResult(`Workflow "${name}" not found.`);
-      // P2: a workflow whose data can't flow can't be ENABLED (disabling
-      // is always allowed). Flag-gated → no-op when the flag is off.
+      // A workflow whose data can't flow can't be ENABLED (disabling is
+      // always allowed). Auto-repair the fixable binding gaps first, so
+      // enabling an older workflow with a dangling reference fixes it in
+      // place instead of refusing.
       if (enabled) {
-        const check = checkWorkflowForWrite({ ...entry.data, enabled: true });
-        if (!check.ok) {
+        const prep = prepareWorkflowForWrite({ ...entry.data, enabled: true });
+        if (!prep.ok) {
           return textResult(
-            `Workflow "${name}" was NOT enabled — fix these first:\n- ${check.errors.join('\n- ')}`,
+            `Workflow "${name}" was NOT enabled — fix these first:\n- ${prep.errors.join('\n- ')}`,
           );
         }
+        writeWorkflow(entry.name, { ...prep.def, enabled: true });
+        return textResult(
+          `Workflow "${name}" is now approved (enabled).`
+            + (prep.repairs.length ? `\n\nAuto-wired on enable:\n- ${prep.repairs.join('\n- ')}` : ''),
+        );
       }
       writeWorkflow(entry.name, { ...entry.data, enabled });
-      return textResult(`Workflow "${name}" is now ${enabled ? 'approved (enabled)' : 'disabled'}.`);
+      return textResult(`Workflow "${name}" is now disabled.`);
     },
   );
 
@@ -934,7 +945,13 @@ export function registerOrchestrationTools(server: McpServer): void {
         next.trigger = { ...currentTrigger, schedule: trigger_schedule, manual: currentTrigger.manual ?? true };
       }
 
-      writeWorkflow(entry.name, next);
+      // Auto-repair the fixable binding gaps before persisting so an edit
+      // that left a dangling {{steps.X.output}} / forEach / {{input.X}}
+      // saves runnable. Update has never gated on validation; keep it that
+      // way — the repair only ever improves the saved definition.
+      const updatePrep = prepareWorkflowForWrite(next);
+      const savedNext = updatePrep.def;
+      writeWorkflow(entry.name, savedNext);
       const changed = [
         description !== undefined ? 'description' : '',
         steps ? 'steps' : '',
@@ -963,12 +980,13 @@ export function registerOrchestrationTools(server: McpServer): void {
       // hints so the author can sharpen the workflow without blocking the save.
       const updateBindReport = updateBind.boundNotes.length > 0 ? `\n\n${updateBind.boundNotes.join('\n')}` : '';
       const updateAdvisories = renderAuthoringAdvisories([
-        ...checkWorkflowForWrite(next).warnings,
+        ...updatePrep.repairs,
+        ...updatePrep.warnings,
         ...updateBind.advisories,
       ]);
       // Re-run the gap test on the edited workflow so remaining gaps stay
       // visible until the author actually closes them.
-      const updateGaps = renderWorkflowGapQuestions(analyzeWorkflowGaps(next));
+      const updateGaps = renderWorkflowGapQuestions(analyzeWorkflowGaps(savedNext));
       return textResult(`Workflow "${name}" updated.${updateBindReport}${updateAdvisories}${updateGaps}`);
     },
   );

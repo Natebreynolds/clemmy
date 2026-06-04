@@ -7,7 +7,7 @@ import type { WorkflowDefinition } from '../memory/workflow-store.js';
 import { CRON_FILE } from '../memory/vault.js';
 import { textResult } from './shared.js';
 import { loadUserProfile } from '../runtime/user-profile.js';
-import { checkWorkflowForWrite } from '../execution/workflow-enforce.js';
+import { prepareWorkflowForWrite } from '../execution/workflow-enforce.js';
 import { analyzeWorkflowGaps, renderWorkflowGapQuestions } from '../execution/workflow-gap-test.js';
 
 /**
@@ -166,19 +166,19 @@ export function registerWorkflowScheduleTools(server: McpServer): void {
       // authoring surface, so it must not be a back door that ships a workflow
       // set up to fail (ungated send, undeclared input, broken dataflow). An
       // ENABLED workflow that fails validation is refused; disable to draft.
-      const writeCheck = checkWorkflowForWrite(def);
+      const writeCheck = prepareWorkflowForWrite(def);
       if (def.enabled && !writeCheck.ok) {
         return textResult(
           `Workflow "${name}" was NOT scheduled — fix these first (or pass enabled=false to draft it):\n- ${writeCheck.errors.join('\n- ')}`,
         );
       }
 
-      const written = writeWorkflow(name, def);
+      const written = writeWorkflow(name, writeCheck.def);
       const next = nextFireDescription(cron);
       const verb = existing ? 'Updated' : 'Created';
-      const gapQuestions = renderWorkflowGapQuestions(analyzeWorkflowGaps(def));
-      const advisories = writeCheck.warnings.length > 0
-        ? `\n\nHeads up (advisory — the workflow was saved):\n- ${writeCheck.warnings.join('\n- ')}`
+      const gapQuestions = renderWorkflowGapQuestions(analyzeWorkflowGaps(writeCheck.def));
+      const advisories = (writeCheck.repairs.length > 0 || writeCheck.warnings.length > 0)
+        ? `\n\nHeads up (advisory — the workflow was saved):\n- ${[...writeCheck.repairs, ...writeCheck.warnings].join('\n- ')}`
         : '';
       return textResult(
         `${verb} workflow "${name}" with cron "${cron}". ${def.enabled ? `Will fire ${next}.` : 'Currently DISABLED — pass enabled=true to activate.'}\nFile: ${written.filePath}`

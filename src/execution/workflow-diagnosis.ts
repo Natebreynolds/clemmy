@@ -69,6 +69,25 @@ function coerceObject(raw: unknown): Record<string, unknown> | null {
   return v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
 }
 
+/**
+ * A forEach step's aggregate is an ARRAY of per-item results (and reaches
+ * here as a JSON-array STRING — `stringifyOutputs` JSON.stringifies every
+ * non-string output). Parse it so per-item polite blocks/failures don't
+ * vanish. Returns null when the value isn't an array (or array string).
+ */
+function coerceArray(raw: unknown): unknown[] | null {
+  if (Array.isArray(raw)) return raw;
+  if (typeof raw === 'string') {
+    const t = raw.trim();
+    if (!t.startsWith('[')) return null;
+    try {
+      const v = JSON.parse(t);
+      return Array.isArray(v) ? v : null;
+    } catch { return null; }
+  }
+  return null;
+}
+
 // A step agent is told to block via structured `{blocked:true}`, but it
 // sometimes returns a prose block instead ("Blocked the workflow step
 // because …"). Catch that too, or the ROOT block (e.g. an expired
@@ -127,6 +146,59 @@ export function detectSelfReportedFailure(obj: Record<string, unknown>): string 
 }
 
 /**
+ * Inspect a forEach aggregate (array of per-item results) for items that
+ * politely BLOCKED ({blocked:true}) or self-reported a failure (ok:false /
+ * *status in the failure vocab / error string). Without this, a fan-out
+ * where every item quietly blocked still reads as a clean "completed" run
+ * (the array never matched the single-object checks) — breaking
+ * "reports back without fail". Returns one rolled-up BlockedStep for the
+ * step, or null when every item looks healthy. Tagged
+ * 'self_reported_failure' (surface as needs-attention, NOT routed into the
+ * prompt-rewrite Doctor): per-item blocks are usually data/provider
+ * outcomes, not a bad step prompt — same rationale as the single-object
+ * self_reported_failure path.
+ */
+function inspectArrayForFailures(arr: unknown[], stepId: string): BlockedStep | null {
+  let blockedCount = 0;
+  let failedCount = 0;
+  let firstReason: string | null = null;
+  for (const el of arr) {
+    // The runner stores a forEach aggregate as an array of
+    // `{ itemKey, output }` wrappers — the per-item RESULT lives in `.output`
+    // (the wrapper itself never carries blocked/ok). Unwrap it; a raw item
+    // object (other shapes / future callers) is inspected directly.
+    let candidate: unknown = el;
+    if (
+      el && typeof el === 'object' && !Array.isArray(el)
+      && 'itemKey' in (el as Record<string, unknown>)
+      && 'output' in (el as Record<string, unknown>)
+    ) {
+      candidate = (el as { output: unknown }).output;
+    }
+    const obj = coerceObject(candidate);
+    if (!obj) continue;
+    if (obj.blocked === true) {
+      blockedCount += 1;
+      if (!firstReason) firstReason = String(obj.reason ?? 'blocked').slice(0, 200);
+    } else {
+      const r = detectSelfReportedFailure(obj);
+      if (r) {
+        failedCount += 1;
+        if (!firstReason) firstReason = r;
+      }
+    }
+  }
+  const bad = blockedCount + failedCount;
+  if (bad === 0) return null;
+  const label = blockedCount > 0 && failedCount > 0
+    ? 'block/failure'
+    : blockedCount > 0 ? 'block' : 'failure';
+  const reason = `step "${stepId}" had ${bad} of ${arr.length} item${arr.length === 1 ? '' : 's'} report a ${label}`
+    + (firstReason ? ` — e.g. ${firstReason}` : '');
+  return { stepId, reason: reason.slice(0, 600), kind: 'self_reported_failure' };
+}
+
+/**
  * A step is "blocked" when its structured result carries `blocked:true`
  * (the explicit clean-block channel) OR its prose output starts with a
  * block declaration. Synthesis (`__synthesis__`) is excluded.
@@ -156,6 +228,15 @@ export function detectBlockedSteps(
       // prompt-rewrite Doctor (the failure is an outcome, not a bad prompt).
       const reason = detectSelfReportedFailure(obj);
       if (reason) blocked.push({ stepId, reason: `step "${stepId}" ${reason}`.slice(0, 600), kind: 'self_reported_failure' });
+    } else {
+      // Not a blocked object, prose block, or healthy object — it may be a
+      // forEach aggregate (array / JSON-array string). Surface per-item
+      // polite blocks/failures that would otherwise read as a clean success.
+      const arr = coerceArray(raw);
+      if (arr) {
+        const finding = inspectArrayForFailures(arr, stepId);
+        if (finding) blocked.push(finding);
+      }
     }
   }
   if (stepOrder && stepOrder.length > 0) {

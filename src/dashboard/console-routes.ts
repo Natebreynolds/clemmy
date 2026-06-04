@@ -51,7 +51,7 @@ import {
   validateWorkflowDefinition as runValidator,
   type WorkflowValidation,
 } from '../execution/workflow-validator.js';
-import { checkWorkflowForWrite } from '../execution/workflow-enforce.js';
+import { prepareWorkflowForWrite } from '../execution/workflow-enforce.js';
 import { ExecutionStore } from '../execution/store.js';
 import { listOpenCheckIns } from '../agents/check-ins.js';
 import type { ClementineAssistant } from '../assistant/core.js';
@@ -2027,18 +2027,16 @@ export function registerConsoleRoutes(
       inputs: inputs && Object.keys(inputs).length > 0 ? inputs : undefined,
       synthesis,
     };
-    // Same author-time guard as workflow_create: an ENABLED workflow whose data
-    // can't flow (dangling deps, broken forEach, ungated send, undeclared input)
-    // is refused so the dashboard isn't a back door around validation. Save
-    // disabled to draft.
-    if (def.enabled) {
-      const check = checkWorkflowForWrite(def);
-      if (!check.ok) {
-        res.status(400).json({ error: 'workflow failed validation', errors: check.errors }); return;
-      }
+    // Same author-time guard as workflow_create: auto-repair the fixable
+    // binding gaps, then refuse only if an ENABLED workflow still can't flow
+    // (so the dashboard isn't a back door around validation). Save disabled to
+    // draft. A disabled workflow is still repaired so it saves runnable.
+    const createPrep = prepareWorkflowForWrite(def);
+    if (def.enabled && !createPrep.ok) {
+      res.status(400).json({ error: 'workflow failed validation', errors: createPrep.errors }); return;
     }
-    writeWorkflow(slug, def);
-    res.json({ created: true, name, file: `${slug}/SKILL.md` });
+    writeWorkflow(slug, createPrep.def);
+    res.json({ created: true, name, file: `${slug}/SKILL.md`, repairs: createPrep.repairs });
   });
 
   app.patch('/api/console/workflows/:name', (req, res) => {
@@ -2065,18 +2063,17 @@ export function registerConsoleRoutes(
       next.trigger = { manual: true };
     }
 
-    // PATCH can change steps AND flip enabled→true, so re-validate before an
-    // enabled workflow is persisted (the set-enabled route already does; this
-    // closes the parallel hole where PATCH enables without re-validation).
-    if (next.enabled) {
-      const check = checkWorkflowForWrite(next);
-      if (!check.ok) {
-        res.status(400).json({ error: 'workflow failed validation', errors: check.errors }); return;
-      }
+    // PATCH can change steps AND flip enabled→true, so auto-repair + re-validate
+    // before an enabled workflow is persisted (the set-enabled route already
+    // does; this closes the parallel hole where PATCH enables without
+    // re-validation).
+    const patchPrep = prepareWorkflowForWrite(next);
+    if (next.enabled && !patchPrep.ok) {
+      res.status(400).json({ error: 'workflow failed validation', errors: patchPrep.errors }); return;
     }
 
-    writeWorkflow(entry.name, next);
-    res.json({ updated: true, name: next.name });
+    writeWorkflow(entry.name, patchPrep.def);
+    res.json({ updated: true, name: patchPrep.def.name, repairs: patchPrep.repairs });
   });
 
   app.delete('/api/console/workflows/:name', (req, res) => {
@@ -2095,17 +2092,21 @@ export function registerConsoleRoutes(
     if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
     const body = req.body ?? {};
     if (typeof body.enabled !== 'boolean') { res.status(400).json({ error: 'enabled (boolean) required' }); return; }
-    // P2: a workflow whose data can't flow can't be ENABLED (disabling
-    // always allowed). Flag-gated → no-op when WORKFLOW_TYPED_CONTRACT off.
+    // A workflow whose data can't flow can't be ENABLED (disabling always
+    // allowed). Auto-repair the fixable binding gaps so enabling an older
+    // workflow fixes it in place instead of refusing.
     if (body.enabled) {
-      const check = checkWorkflowForWrite({ ...entry.data, enabled: true });
-      if (!check.ok) {
-        res.status(400).json({ error: 'workflow failed validation', errors: check.errors });
+      const prep = prepareWorkflowForWrite({ ...entry.data, enabled: true });
+      if (!prep.ok) {
+        res.status(400).json({ error: 'workflow failed validation', errors: prep.errors });
         return;
       }
+      writeWorkflow(entry.name, { ...prep.def, enabled: true });
+      res.json({ updated: true, enabled: true, repairs: prep.repairs });
+      return;
     }
-    writeWorkflow(entry.name, { ...entry.data, enabled: body.enabled });
-    res.json({ updated: true, enabled: body.enabled });
+    writeWorkflow(entry.name, { ...entry.data, enabled: false });
+    res.json({ updated: true, enabled: false });
   });
 
   app.post('/api/console/workflows/:name/validate', (req, res) => {

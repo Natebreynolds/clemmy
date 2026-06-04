@@ -65,6 +65,46 @@ test('detectBlockedSteps orders by stepOrder so the ROOT (earliest) is first', (
   assert.equal(blocked[1].stepId, 'select_best_contact');
 });
 
+test('detectBlockedSteps: forEach aggregate (real {itemKey,output} string) with polite blocks → needs attention', () => {
+  // The runner stores a forEach aggregate as an array of {itemKey, output}
+  // wrappers (per-item result nested in .output), JSON.stringified. Without
+  // unwrapping + array-awareness, a fan-out where items quietly blocked reads
+  // as a clean "completed" run. (This is the exact shape the live engine
+  // produces — caught by the runtime smoke, not the original unit test.)
+  const blocked = detectBlockedSteps({
+    fanout: JSON.stringify([
+      { itemKey: 'idx-0', output: { ok: true, lead: 'acme' } },
+      { itemKey: 'idx-1', output: '{"blocked":true,"reason":"no contact email found"}' },
+      { itemKey: 'idx-2', output: { ok: false } },
+    ]),
+  });
+  assert.equal(blocked.length, 1);
+  assert.equal(blocked[0].stepId, 'fanout');
+  assert.equal(blocked[0].kind, 'self_reported_failure'); // not routed to the prompt Doctor
+  assert.match(blocked[0].reason, /2 of 3 items/);
+  assert.match(blocked[0].reason, /no contact email found/);
+});
+
+test('detectBlockedSteps: raw item objects (no wrapper) are inspected too', () => {
+  const blocked = detectBlockedSteps({
+    fanout: [{ ok: true }, { someStatus: 'fail' }],
+  });
+  assert.equal(blocked.length, 1);
+  assert.match(blocked[0].reason, /1 of 2 items/);
+});
+
+test('detectBlockedSteps: a healthy forEach aggregate is NOT flagged', () => {
+  const blocked = detectBlockedSteps({
+    fanout: JSON.stringify([
+      { itemKey: 'idx-0', output: { ok: true, lead: 'acme' } },
+      { itemKey: 'idx-1', output: { ok: true, lead: 'globex', error: null } }, // error:null is healthy
+      { itemKey: 'idx-2', output: 'done' },
+    ]),
+    plainArray: JSON.stringify([1, 2, 3]),
+  });
+  assert.deepEqual(blocked, []);
+});
+
 test('humanizeStepOutput surfaces human content, not raw JSON', () => {
   assert.equal(humanizeStepOutput({ notified: true, body: 'Good morning, Nate.' }), 'Good morning, Nate.');
   assert.equal(humanizeStepOutput({ summary: 'Scanned 10 emails.' }), 'Scanned 10 emails.');

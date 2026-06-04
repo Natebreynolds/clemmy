@@ -75,6 +75,21 @@ function validateCronExpression(expr: string): boolean {
   return parts.every((part) => /^(\*|\*\/\d+|\d+|\d+-\d+)(,(\*\/\d+|\d+|\d+-\d+))*$/.test(part));
 }
 
+// An invalid IANA timezone does NOT throw at run time — `wallClockInZone`
+// silently falls back to HOST-local time (workflow-scheduler.ts), so a typo
+// like "America/Los_Angles" makes a scheduled workflow fire at the wrong
+// hour with no error. Catch it at author time. Intl is the authoritative
+// IANA registry, so this never false-positives on a real zone.
+function isValidTimezone(tz: string): boolean {
+  if (!tz.trim()) return false;
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: tz });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // ─── Hand-off language detection ─────────────────────────────────────
 //
 // These phrases tell the agent "this isn't your job to continue" and
@@ -502,6 +517,12 @@ export function validateWorkflowDefinition(
 
   if (data.trigger?.schedule && !validateCronExpression(data.trigger.schedule)) {
     errors.push(`Invalid cron expression: "${data.trigger.schedule}"`);
+  }
+  if (data.trigger?.timezone && !isValidTimezone(data.trigger.timezone)) {
+    errors.push(
+      `Invalid timezone: "${data.trigger.timezone}". Use a valid IANA name (e.g. "America/Los_Angeles", "Europe/London", "UTC") — `
+      + 'an unknown timezone silently falls back to the server host time, so the workflow would fire at the wrong hour.',
+    );
   }
 
   if (!data.description || data.description.trim().length < 8) {

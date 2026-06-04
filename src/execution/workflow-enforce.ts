@@ -1,4 +1,4 @@
-import type { WorkflowDefinition } from '../memory/workflow-store.js';
+import type { WorkflowDefinition, WorkflowInputDef } from '../memory/workflow-store.js';
 import { validateWorkflowDefinition, type WorkflowFrontmatter } from './workflow-validator.js';
 import { collectRequiredWorkflowInputs, COMMON_WORKFLOW_INPUT_KEYS } from './workflow-inputs.js';
 import { listToolChoices } from '../memory/tool-choice-store.js';
@@ -170,6 +170,116 @@ export function checkDependencyBinding(def: WorkflowDefinition): string[] {
 }
 
 /**
+ * Author-time AUTO-REPAIR of the mechanically-fixable data-binding gaps —
+ * "a user can create a workflow no matter the tools, turns or output."
+ *
+ * The validator REFUSES a workflow whose data can't flow, which is correct
+ * (it would fail at run time) but bounces the author into a re-author loop
+ * that burns tokens and can re-fail. Most of those refusals are
+ * DETERMINISTICALLY fixable without changing intent:
+ *
+ *   1. `{{steps.X.output}}` where X is a real step but not a (transitive)
+ *      dependency → add X to this step's dependsOn so the token resolves.
+ *   2. `forEach: X` where X is a real step but not a dependency → same.
+ *   3. `{{input.X}}` referenced but never declared (and not a common key)
+ *      → declare it under the workflow inputs so the engine binds it.
+ *
+ * Each repair is intent-preserving, never introduces a cycle (a dep that
+ * would cycle is left for the validator to surface honestly), and is
+ * re-validated by the caller afterwards — so a repair can only turn a
+ * would-be refusal into a runnable save, never the reverse. Pure: the input
+ * def is never mutated; a repaired clone is returned with a human-readable
+ * list of what changed.
+ */
+export interface WorkflowAutoRepair {
+  def: WorkflowDefinition;
+  repairs: string[];
+}
+
+export function autoRepairWorkflowDefinition(def: WorkflowDefinition): WorkflowAutoRepair {
+  const repairs: string[] = [];
+  const steps = def.steps.map((s) => ({
+    ...s,
+    dependsOn: Array.isArray(s.dependsOn) ? [...s.dependsOn] : s.dependsOn,
+  }));
+  const ids = new Set(steps.map((s) => s.id).filter(Boolean));
+
+  const directDeps = (): Map<string, string[]> => {
+    const m = new Map<string, string[]>();
+    for (const s of steps) if (s.id) m.set(s.id, (s.dependsOn ?? []).filter((d) => ids.has(d)));
+    return m;
+  };
+  const transitiveDeps = (stepId: string, dd: Map<string, string[]>): Set<string> => {
+    const out = new Set<string>();
+    const stack = [...(dd.get(stepId) ?? [])];
+    while (stack.length > 0) {
+      const d = stack.pop() as string;
+      if (out.has(d)) continue;
+      out.add(d);
+      for (const x of dd.get(d) ?? []) stack.push(x);
+    }
+    return out;
+  };
+
+  const addDep = (step: (typeof steps)[number], dep: string, why: string): void => {
+    if (!step.id || !ids.has(dep) || dep === step.id) return;
+    if ((step.dependsOn ?? []).includes(dep)) return;
+    const dd = directDeps();
+    if (transitiveDeps(step.id, dd).has(dep)) return; // already reachable
+    // Refuse to introduce a cycle: if `dep` (transitively) depends on this
+    // step, wiring step→dep would close a loop. Leave it for the validator.
+    if (transitiveDeps(dep, dd).has(step.id)) return;
+    step.dependsOn = [...(step.dependsOn ?? []), dep];
+    repairs.push(`Wired step "${step.id}" to depend on "${dep}" (${why}).`);
+  };
+
+  for (const step of steps) {
+    if (!step.id || !step.prompt) continue;
+    // 1. {{steps.X.output}} (optionally with a subpath) referencing a real step.
+    const stepRefRe = /\{\{\s*steps\.([a-zA-Z0-9_-]+)\.output(?:\.[a-zA-Z0-9_.-]+)?\s*\}\}/g;
+    const seenRefs = new Set<string>();
+    let m: RegExpExecArray | null;
+    while ((m = stepRefRe.exec(step.prompt)) !== null) {
+      const ref = m[1];
+      if (seenRefs.has(ref)) continue;
+      seenRefs.add(ref);
+      if (ids.has(ref)) addDep(step, ref, `so {{steps.${ref}.output}} resolves`);
+    }
+    // 2. forEach over a real step.
+    if (typeof step.forEach === 'string' && step.forEach.trim().length > 0) {
+      const src = step.forEach.trim();
+      if (ids.has(src)) addDep(step, src, `forEach source`);
+    }
+  }
+
+  // 3. {{input.X}} referenced in a step prompt but undeclared (and not a
+  //    common injectable key) → declare it so the engine binds it. Mirrors
+  //    the validator's checkInputTokenBinding error surface exactly.
+  const declared: Record<string, WorkflowInputDef> = { ...(def.inputs ?? {}) };
+  let declaredChanged = false;
+  for (const step of steps) {
+    if (!step.prompt) continue;
+    const inputRe = /\{\{\s*input\.([a-zA-Z0-9_-]+)\s*\}\}/g;
+    let m: RegExpExecArray | null;
+    while ((m = inputRe.exec(step.prompt)) !== null) {
+      const key = m[1];
+      if (key in declared || COMMON_WORKFLOW_INPUT_KEYS.has(key)) continue;
+      declared[key] = { type: 'string' };
+      declaredChanged = true;
+      repairs.push(`Declared workflow input "${key}" (referenced by {{input.${key}}} but never declared).`);
+    }
+  }
+
+  if (repairs.length === 0) return { def, repairs };
+  const repaired: WorkflowDefinition = {
+    ...def,
+    steps,
+    ...(declaredChanged ? { inputs: declared } : {}),
+  };
+  return { def: repaired, repairs };
+}
+
+/**
  * Gate a workflow write (create / enable). Returns {ok:true} when the
  * workflow validates; otherwise {ok:false, errors} so the caller can
  * refuse and surface the fixes. Validation is unconditional (no flag).
@@ -187,4 +297,27 @@ export function checkWorkflowForWrite(def: WorkflowDefinition): WorkflowWriteChe
   const result = validateWorkflowDefinition(toFrontmatter(def), { rememberedToolChoices });
   const errors = [...result.errors, ...checkSendGate(def), ...checkRunnabilityConstraints(def), ...checkDependencyBinding(def)];
   return { ok: errors.length === 0, errors, warnings: result.warnings };
+}
+
+export interface WorkflowWritePrep extends WorkflowWriteCheck {
+  /** The definition to actually persist — the auto-repaired clone (which
+   *  may equal the input when nothing needed fixing). */
+  def: WorkflowDefinition;
+  /** Human-readable list of the binding repairs applied (empty when none). */
+  repairs: string[];
+}
+
+/**
+ * The single entry every write seam should use: auto-repair the
+ * mechanically-fixable binding gaps, THEN validate the repaired definition.
+ * Callers persist `prep.def` (not their original), refuse on `!prep.ok`, and
+ * surface `prep.repairs` + `prep.warnings` as advisories. This makes "save a
+ * runnable workflow in one shot" the default across create / update / enable
+ * / dashboard / schedule instead of bouncing the author into a re-author
+ * loop over a fix the engine could make itself.
+ */
+export function prepareWorkflowForWrite(def: WorkflowDefinition): WorkflowWritePrep {
+  const { def: repaired, repairs } = autoRepairWorkflowDefinition(def);
+  const check = checkWorkflowForWrite(repaired);
+  return { def: repaired, ok: check.ok, errors: check.errors, warnings: check.warnings, repairs };
 }

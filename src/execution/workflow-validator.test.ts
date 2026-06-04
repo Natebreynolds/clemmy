@@ -74,6 +74,26 @@ test('invalid cron → error', () => {
   assert.ok(result.errors.some((e) => e.includes('Invalid cron expression')));
 });
 
+test('invalid timezone → error (would silently misfire at host time)', () => {
+  const result = validateWorkflowDefinition({
+    name: 'badtz',
+    trigger: { schedule: '0 8 * * *', timezone: 'America/Los_Angles' },
+    steps: [{ id: 'a', prompt: 'do thing' }],
+  });
+  assert.ok(result.errors.some((e) => e.includes('Invalid timezone')));
+});
+
+test('valid IANA timezone → no timezone error', () => {
+  for (const tz of ['America/Los_Angeles', 'Europe/London', 'UTC']) {
+    const result = validateWorkflowDefinition({
+      name: 'goodtz',
+      trigger: { schedule: '0 8 * * *', timezone: tz },
+      steps: [{ id: 'a', prompt: 'do thing' }],
+    });
+    assert.ok(!result.errors.some((e) => e.includes('Invalid timezone')), `${tz} should be valid`);
+  }
+});
+
 // ── New semantic checks (2026-05-21) ──────────────────────────────────
 
 test('hand-off language "future turn handles" → error', () => {

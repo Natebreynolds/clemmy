@@ -8,7 +8,12 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { checkWorkflowForWrite, checkRunnabilityConstraints } from './workflow-enforce.js';
+import {
+  checkWorkflowForWrite,
+  checkRunnabilityConstraints,
+  autoRepairWorkflowDefinition,
+  prepareWorkflowForWrite,
+} from './workflow-enforce.js';
 import type { WorkflowDefinition } from '../memory/workflow-store.js';
 
 function wf(overrides: Partial<WorkflowDefinition> = {}): WorkflowDefinition {
@@ -86,4 +91,132 @@ test('checkRunnabilityConstraints: schedule + manual together never blocks (a ca
     steps: [{ id: 'a', prompt: 'audit {{input.segment}}' }],
   });
   assert.deepEqual(checkRunnabilityConstraints(def), []);
+});
+
+// ─── auto-repair (creation reliability: save runnable, don't bounce) ──────
+
+test('autoRepair: {{steps.X.output}} on a non-dependency wires the dependsOn', () => {
+  // 'analyze' references fetch's output but doesn't depend on it → would
+  // render empty at run time and the validator would refuse the save.
+  const def = wf({
+    steps: [
+      { id: 'fetch', prompt: 'fetch the data' },
+      { id: 'analyze', prompt: 'analyze {{steps.fetch.output}}' },
+    ],
+  });
+  // Pre-repair: the raw definition is refused.
+  assert.equal(checkWorkflowForWrite(def).ok, false);
+  const { def: repaired, repairs } = autoRepairWorkflowDefinition(def);
+  assert.deepEqual(repaired.steps[1].dependsOn, ['fetch']);
+  assert.equal(repairs.length, 1);
+  assert.match(repairs[0], /analyze.*fetch/);
+  // Post-repair: it now validates.
+  assert.equal(checkWorkflowForWrite(repaired).ok, true);
+});
+
+test('autoRepair: {{steps.X.output}} with a subpath still wires the dependsOn', () => {
+  const def = wf({
+    steps: [
+      { id: 'fetch', prompt: 'fetch' },
+      { id: 'use', prompt: 'use {{steps.fetch.output.items}}' },
+    ],
+  });
+  const { def: repaired } = autoRepairWorkflowDefinition(def);
+  assert.deepEqual(repaired.steps[1].dependsOn, ['fetch']);
+});
+
+test('autoRepair: forEach over a non-dependency wires the dependsOn', () => {
+  const def = wf({
+    steps: [
+      { id: 'list', prompt: 'produce a list of leads' },
+      { id: 'each', prompt: 'process {{item}}', forEach: 'list' },
+    ],
+  });
+  const { def: repaired, repairs } = autoRepairWorkflowDefinition(def);
+  assert.deepEqual(repaired.steps[1].dependsOn, ['list']);
+  assert.match(repairs.join(' '), /forEach/);
+  assert.equal(checkWorkflowForWrite(repaired).ok, true);
+});
+
+test('autoRepair: undeclared {{input.X}} gets declared so the engine binds it', () => {
+  const def = wf({
+    steps: [{ id: 'a', prompt: 'audit {{input.segment}}' }],
+  });
+  // segment is non-common + undeclared → validator error pre-repair.
+  assert.equal(checkWorkflowForWrite(def).ok, false);
+  const { def: repaired, repairs } = autoRepairWorkflowDefinition(def);
+  assert.ok(repaired.inputs?.segment);
+  assert.match(repairs.join(' '), /segment/);
+  assert.equal(checkWorkflowForWrite(repaired).ok, true);
+});
+
+test('autoRepair: never declares a COMMON input key (url is injectable)', () => {
+  const def = wf({ steps: [{ id: 'a', prompt: 'audit {{input.url}}' }] });
+  const { def: repaired, repairs } = autoRepairWorkflowDefinition(def);
+  assert.equal(repairs.length, 0);
+  assert.equal(repaired.inputs?.url, undefined);
+});
+
+test('autoRepair: refuses to introduce a cycle (leaves the error for the validator)', () => {
+  // a already depends on b; b references a's output. Wiring b→a would cycle.
+  const def = wf({
+    steps: [
+      { id: 'a', prompt: 'start {{steps.b.output}}', dependsOn: ['b'] },
+      { id: 'b', prompt: 'work' },
+    ],
+  });
+  const { def: repaired, repairs } = autoRepairWorkflowDefinition(def);
+  // b is NOT given a dependsOn on a (would cycle); no repair claimed.
+  assert.equal(repaired.steps[0].dependsOn?.includes('b'), true);
+  assert.equal(repairs.length, 0);
+});
+
+test('autoRepair: a clean workflow is returned unchanged (same object, no repairs)', () => {
+  const def = wf({
+    steps: [
+      { id: 'fetch', prompt: 'fetch' },
+      { id: 'analyze', prompt: 'analyze {{steps.fetch.output}}', dependsOn: ['fetch'] },
+    ],
+  });
+  const { def: repaired, repairs } = autoRepairWorkflowDefinition(def);
+  assert.equal(repairs.length, 0);
+  assert.equal(repaired, def); // no clone when nothing changed
+});
+
+test('autoRepair: an already-transitive dependency is not re-added', () => {
+  // c depends on b, b depends on a; c references a's output → a is already
+  // transitively reachable, so no new direct dep is added.
+  const def = wf({
+    steps: [
+      { id: 'a', prompt: 'a' },
+      { id: 'b', prompt: 'b', dependsOn: ['a'] },
+      { id: 'c', prompt: 'use {{steps.a.output}}', dependsOn: ['b'] },
+    ],
+  });
+  const { def: repaired, repairs } = autoRepairWorkflowDefinition(def);
+  assert.deepEqual(repaired.steps[2].dependsOn, ['b']);
+  assert.equal(repairs.length, 0);
+});
+
+test('prepareWorkflowForWrite: repairs then validates, surfacing repairs', () => {
+  const def = wf({
+    steps: [
+      { id: 'fetch', prompt: 'fetch' },
+      { id: 'analyze', prompt: 'analyze {{steps.fetch.output}}' },
+    ],
+  });
+  const prep = prepareWorkflowForWrite(def);
+  assert.equal(prep.ok, true);
+  assert.deepEqual(prep.def.steps[1].dependsOn, ['fetch']);
+  assert.ok(prep.repairs.length >= 1);
+});
+
+test('prepareWorkflowForWrite: a genuinely broken workflow still fails after repair', () => {
+  // Hand-off language is not auto-fixable → still refused.
+  const def = wf({
+    steps: [{ id: 'a', prompt: 'do the work; a future turn will handle the rest' }],
+  });
+  const prep = prepareWorkflowForWrite(def);
+  assert.equal(prep.ok, false);
+  assert.ok(prep.errors.length >= 1);
 });
