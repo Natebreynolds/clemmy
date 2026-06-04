@@ -344,3 +344,33 @@ test('searchFacts returns relevant facts via lexical fallback', async () => {
   const hits = await searchFacts('nightly cron deployment', { topK: 5 });
   assert.ok(hits.some((f) => /cron/i.test(f.content)), 'token-overlap match surfaces');
 });
+
+// ─────────────────────────────────────────────────────────────────
+// Thread 1 / C1 — source provenance + authoritative trust on the row.
+// ─────────────────────────────────────────────────────────────────
+
+test('rememberFact persists sourceApp and an authoritative trust override', () => {
+  const fact = rememberFact({
+    kind: 'project',
+    content: 'Acme renewal closes in Q3.',
+    derivedFrom: { sessionId: 's1', tool: 'SALESFORCE_GET_RECORD' },
+    trustLevel: 0.9,
+    sourceApp: 'Salesforce',
+  });
+  // trust override beats the derived-fact default of 0.6.
+  assert.equal(fact.trustLevel, 0.9, 'authoritative trust persisted');
+  assert.equal(fact.sourceApp, 'Salesforce', 'source app persisted');
+  const reloaded = getFact(fact.id);
+  assert.equal(reloaded?.sourceApp, 'Salesforce');
+  assert.equal(reloaded?.trustLevel, 0.9);
+});
+
+test('derived facts without a source keep the 0.6 default and null sourceApp', () => {
+  const fact = rememberFact({
+    kind: 'project',
+    content: 'Inferred: the prospect prefers email over calls.',
+    derivedFrom: { sessionId: 's1', tool: 'firecrawl' },
+  });
+  assert.equal(fact.trustLevel, 0.6, 'unchanged derived default');
+  assert.equal(fact.sourceApp ?? null, null);
+});

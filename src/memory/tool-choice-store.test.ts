@@ -40,6 +40,10 @@ const {
   renderToolChoicesForContext,
   slugifyIntent,
   stripBakedConnectionId,
+  updateToolChoiceOutcome,
+  updateToolChoiceOutcomeForIdentifier,
+  computeChoiceScore,
+  peekToolChoice,
 } = await import('./tool-choice-store.js');
 
 test('recallToolChoice returns null when there is no record', () => {
@@ -314,4 +318,163 @@ test('forgetMatching clears a whole poisoned cluster and leaves unrelated choice
   assert.equal(recallToolChoice('outlook send email'), null);
   assert.equal(recallToolChoice('outlook send message draft'), null);
   assert.ok(recallToolChoice('salesforce.accounts.count')?.choice, 'unrelated choice survives the cluster forget');
+});
+
+// ─── P1-E: intent-relevant ranking of remembered tool-choices ────────────────
+
+test('P1-E: renderToolChoicesForContext promotes the objective-relevant choice (★) over a newer irrelevant one', () => {
+  // Isolate from choices accumulated by earlier tests so ordering is deterministic.
+  for (const r of listToolChoices()) deleteToolChoice(r.intent);
+
+  rememberToolChoice({
+    intent: 'salesforce.accounts.query_nate_owned_non_market_leader',
+    description: 'Query Nate-owned Salesforce accounts not on the Market Leader list.',
+    choice: { kind: 'cli', identifier: 'sf', invocationTemplate: 'sf data query --json --query "{{q}}"', testedAt: '2026-01-01T00:00:00.000Z' },
+  });
+  rememberToolChoice({
+    intent: 'airtable.create.base',
+    description: 'Create a new Airtable base.',
+    choice: { kind: 'composio', identifier: 'AIRTABLE_CREATE_BASE', testedAt: '2026-06-01T00:00:00.000Z' },
+  });
+
+  const objective = 'salesforce email reply audit query pre-discovery last 90 days';
+  const ranked = renderToolChoicesForContext(12, undefined, objective);
+  assert.ok(ranked.includes('★ salesforce.accounts.query_nate_owned_non_market_leader'), 'the relevant Salesforce choice is starred');
+  assert.ok(!ranked.includes('★ airtable.create.base'), 'the unrelated Airtable choice is NOT starred');
+  assert.ok(
+    ranked.indexOf('salesforce.accounts.query_nate_owned_non_market_leader') < ranked.indexOf('airtable.create.base'),
+    'the relevant (older) choice is promoted above the newer irrelevant one',
+  );
+
+  // No objective → pure recency, byte-identical behavior: no stars, newer first.
+  const recencyOnly = renderToolChoicesForContext(12);
+  assert.ok(!recencyOnly.includes('★'), 'no objective → nothing is starred');
+  assert.ok(
+    recencyOnly.indexOf('airtable.create.base') < recencyOnly.indexOf('salesforce.accounts.query_nate_owned_non_market_leader'),
+    'no objective → the newer Airtable choice sorts above the older Salesforce one',
+  );
+});
+
+// ─────────────────────────────────────────────────────────────────
+// Thread 2 — outcome-driven procedural memory.
+// ─────────────────────────────────────────────────────────────────
+
+test('computeChoiceScore is a smoothed success rate (prior 0.5)', () => {
+  assert.equal(computeChoiceScore(null), 0.5);
+  assert.equal(computeChoiceScore({ kind: 'mcp', identifier: 'x', testedAt: 'now' }), 0.5, 'no outcomes → neutral prior');
+  assert.ok(Math.abs(computeChoiceScore({ kind: 'mcp', identifier: 'x', testedAt: 'now', successCount: 1 }) - 2 / 3) < 1e-9);
+  assert.ok(Math.abs(computeChoiceScore({ kind: 'mcp', identifier: 'x', testedAt: 'now', failureCount: 1 }) - 1 / 3) < 1e-9);
+});
+
+test('updateToolChoiceOutcome is a no-op when the flag is off', () => {
+  delete process.env.CLEMMY_PROCEDURAL_OUTCOMES;
+  rememberToolChoice({ intent: 't2 flag off', choice: { kind: 'mcp', identifier: 'tool_a' } });
+  const r = updateToolChoiceOutcome('t2 flag off', 'success');
+  assert.equal(r, null, 'no-op returns null when flag off');
+  const after = peekToolChoice('t2 flag off');
+  assert.equal(after?.choice?.successCount ?? 0, 0, 'no counter written when flag off');
+});
+
+test('updateToolChoiceOutcome records success/failure and shifts the score', () => {
+  process.env.CLEMMY_PROCEDURAL_OUTCOMES = 'on';
+  try {
+    rememberToolChoice({ intent: 't2 record', choice: { kind: 'mcp', identifier: 'tool_b' } });
+    updateToolChoiceOutcome('t2 record', 'success');
+    let rec = peekToolChoice('t2 record');
+    assert.equal(rec?.choice?.successCount, 1);
+    assert.ok(rec?.choice?.lastSuccessAt, 'lastSuccessAt set');
+    assert.ok(computeChoiceScore(rec?.choice) > 0.5, 'score above prior after a win');
+
+    updateToolChoiceOutcome('t2 record', 'failure');
+    rec = peekToolChoice('t2 record');
+    assert.equal(rec?.choice?.failureCount, 1);
+    assert.ok(Math.abs(computeChoiceScore(rec?.choice) - 0.5) < 1e-9, '1 win + 1 loss → back to 0.5');
+  } finally {
+    delete process.env.CLEMMY_PROCEDURAL_OUTCOMES;
+  }
+});
+
+test('counts carry forward on re-remember of the same identifier, reset on a different one', () => {
+  process.env.CLEMMY_PROCEDURAL_OUTCOMES = 'on';
+  try {
+    rememberToolChoice({ intent: 't2 carry', choice: { kind: 'mcp', identifier: 'same_tool' } });
+    updateToolChoiceOutcome('t2 carry', 'success');
+    updateToolChoiceOutcome('t2 carry', 'success');
+    // Re-remember the SAME tool (a re-validation) — history must survive.
+    rememberToolChoice({ intent: 't2 carry', choice: { kind: 'mcp', identifier: 'same_tool' } });
+    assert.equal(peekToolChoice('t2 carry')?.choice?.successCount, 2, 'same identifier keeps its record');
+    // Swap to a DIFFERENT tool — the new path earns a fresh record.
+    rememberToolChoice({ intent: 't2 carry', choice: { kind: 'mcp', identifier: 'other_tool' } });
+    assert.equal(peekToolChoice('t2 carry')?.choice?.successCount ?? 0, 0, 'identifier change resets counts');
+  } finally {
+    delete process.env.CLEMMY_PROCEDURAL_OUTCOMES;
+  }
+});
+
+test('updateToolChoiceOutcomeForIdentifier credits every active choice on that slug', () => {
+  process.env.CLEMMY_PROCEDURAL_OUTCOMES = 'on';
+  try {
+    rememberToolChoice({ intent: 't2 slug one', choice: { kind: 'composio', identifier: 'SALESFORCE_QUERY' } });
+    rememberToolChoice({ intent: 't2 slug two', choice: { kind: 'composio', identifier: 'SALESFORCE_QUERY' } });
+    const n = updateToolChoiceOutcomeForIdentifier('SALESFORCE_QUERY', 'success');
+    assert.equal(n, 2, 'both intents pointing at the slug are credited');
+    assert.equal(peekToolChoice('t2 slug one')?.choice?.successCount, 1);
+    assert.equal(peekToolChoice('t2 slug two')?.choice?.successCount, 1);
+  } finally {
+    delete process.env.CLEMMY_PROCEDURAL_OUTCOMES;
+  }
+});
+
+test('three failures with no win auto-invalidates the choice (→ rediscovery)', () => {
+  process.env.CLEMMY_PROCEDURAL_OUTCOMES = 'on';
+  try {
+    rememberToolChoice({ intent: 't2 streak', choice: { kind: 'composio', identifier: 'FLAKY_TOOL' } });
+    updateToolChoiceOutcome('t2 streak', 'failure');
+    updateToolChoiceOutcome('t2 streak', 'failure');
+    assert.ok(peekToolChoice('t2 streak')?.choice, 'still active after 2 failures');
+    updateToolChoiceOutcome('t2 streak', 'failure');
+    const rec = peekToolChoice('t2 streak');
+    assert.equal(rec?.choice, null, 'auto-invalidated after the 3rd failure');
+    assert.ok(rec?.fallbacks.some((f) => f.identifier === 'FLAKY_TOOL'), 'failed path recorded in fallbacks');
+  } finally {
+    delete process.env.CLEMMY_PROCEDURAL_OUTCOMES;
+  }
+});
+
+test('P3 render: with outcomes off the block is unchanged (no track annotation)', () => {
+  // Fresh machine so listToolChoices only sees this test's choices.
+  writeFileSync(path.join(TMP_HOME, 'state', 'machine-id'), 'machine-p3-off\n');
+  resetMachineIdCacheForTests();
+  delete process.env.CLEMMY_PROCEDURAL_OUTCOMES;
+  rememberToolChoice({ intent: 'p3 off intent', choice: { kind: 'mcp', identifier: 'render_tool' } });
+  process.env.CLEMMY_PROCEDURAL_OUTCOMES = 'on';
+  updateToolChoiceOutcome('p3 off intent', 'success');
+  delete process.env.CLEMMY_PROCEDURAL_OUTCOMES;
+  const block = renderToolChoicesForContext();
+  assert.match(block, /p3 off intent/);
+  assert.doesNotMatch(block, /✓/, 'no track annotation when flag off');
+});
+
+test('P3 render: with outcomes on, net-negative choices are dropped and strong ones annotated', () => {
+  writeFileSync(path.join(TMP_HOME, 'state', 'machine-id'), 'machine-p3-on\n');
+  resetMachineIdCacheForTests();
+  process.env.CLEMMY_PROCEDURAL_OUTCOMES = 'on';
+  try {
+    rememberToolChoice({ intent: 'p3 strong', choice: { kind: 'mcp', identifier: 'good_tool' } });
+    updateToolChoiceOutcome('p3 strong', 'success');
+    updateToolChoiceOutcome('p3 strong', 'success');
+
+    rememberToolChoice({ intent: 'p3 weak', choice: { kind: 'mcp', identifier: 'bad_tool' } });
+    updateToolChoiceOutcome('p3 weak', 'failure'); // 2 failures, 0 wins → score 0.25 < floor,
+    updateToolChoiceOutcome('p3 weak', 'failure'); // but <3 so not auto-invalidated
+
+    const block = renderToolChoicesForContext();
+    assert.match(block, /p3 strong/, 'proven choice advertised');
+    assert.match(block, /✓2/, 'track record annotated');
+    assert.doesNotMatch(block, /p3 weak/, 'net-negative choice dropped from injection');
+  } finally {
+    delete process.env.CLEMMY_PROCEDURAL_OUTCOMES;
+    writeFileSync(path.join(TMP_HOME, 'state', 'machine-id'), 'machine-A\n');
+    resetMachineIdCacheForTests();
+  }
 });

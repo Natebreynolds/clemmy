@@ -14,11 +14,93 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createCodexToolDefinitions, expandParallelHallucination, type CodexFunctionCall } from './codex-native-runtime.js';
+import { createCodexToolDefinitions, expandParallelHallucination, isWallClockAbort, trimNativeInputForRetry, parseCodexUsage, type CodexFunctionCall } from './codex-native-runtime.js';
 import { invalidateConfiguredMcpServers } from './mcp-servers.js';
+import { AgentRuntimeCancelledError } from './provider.js';
 
 test.after(async () => {
   await invalidateConfiguredMcpServers();
+});
+
+// ─── P0-A wall-clock recovery helpers ────────────────────────────────────────
+
+test('isWallClockAbort: recognizes the per-call wall-clock abort by message, rejects others', () => {
+  assert.equal(
+    isWallClockAbort(new Error("Clementine's model backend exceeded the wall-clock budget of 120000ms and was aborted mid-stream.")),
+    true,
+    'wall-clock message → true',
+  );
+  assert.equal(isWallClockAbort(new AgentRuntimeCancelledError()), false, 'a user cancel is not a wall-clock abort');
+  assert.equal(isWallClockAbort(new Error('Clementine\'s model backend failed with HTTP 503')), false, '5xx is not a wall-clock abort');
+  assert.equal(isWallClockAbort('exceeded the wall-clock budget'), false, 'a non-Error value → false');
+  assert.equal(isWallClockAbort(undefined), false, 'undefined → false');
+});
+
+test('trimNativeInputForRetry: shrinks OLD large tool outputs, preserves pairing + prompt + recent window', () => {
+  const big = 'X'.repeat(5000);
+  const input: Record<string, unknown>[] = [
+    { role: 'user', content: [{ type: 'input_text', text: 'do the thing' }] },
+    { type: 'function_call', call_id: 'c1', name: 't', arguments: '{}' },
+    { type: 'function_call_output', call_id: 'c1', output: big },     // old → trim
+    { type: 'function_call', call_id: 'c2', name: 't', arguments: '{}' },
+    { type: 'function_call_output', call_id: 'c2', output: 'short' }, // old but small → keep
+    { type: 'function_call', call_id: 'c3', name: 't', arguments: '{}' },
+    { type: 'function_call_output', call_id: 'c3', output: big },     // recent → keep
+    { type: 'function_call', call_id: 'c4', name: 't', arguments: '{}' },
+    { type: 'function_call_output', call_id: 'c4', output: big },     // recent → keep
+  ];
+  const out = trimNativeInputForRetry(input, { keepRecent: 3, perOutputCap: 100 });
+
+  assert.equal(out.length, input.length, 'no items removed — every call/output pairing is preserved');
+  assert.equal(out[0], input[0], 'original prompt is untouched');
+  assert.ok((out[2] as Record<string, unknown>).output as string, 'old big output still present');
+  assert.ok(((out[2] as Record<string, unknown>).output as string).length < big.length, 'old big output was trimmed');
+  assert.ok(/trimmed for wall-clock retry/.test((out[2] as Record<string, unknown>).output as string), 'trim marker added');
+  assert.equal((out[4] as Record<string, unknown>).output, 'short', 'small old output kept verbatim');
+  assert.equal((out[6] as Record<string, unknown>).output, big, 'recent output (within keepRecent) kept verbatim');
+  assert.equal((out[8] as Record<string, unknown>).output, big, 'most recent output kept verbatim');
+});
+
+// ─── parseCodexUsage: cached + reasoning tokens were silently read as 0 ──────
+
+test('parseCodexUsage: reads cached tokens from the NESTED Responses-API shape (was always 0)', () => {
+  // The real Codex/Responses usage object nests the cache count — the old flat
+  // `usage['input_tokens_details.cached_tokens']` read never matched it.
+  const u = parseCodexUsage({
+    input_tokens: 60000,
+    output_tokens: 400,
+    total_tokens: 60400,
+    input_tokens_details: { cached_tokens: 48000 },
+    output_tokens_details: { reasoning_tokens: 120 },
+  });
+  assert.equal(u.inputTokens, 60000);
+  assert.equal(u.cachedInputTokens, 48000, 'nested cached_tokens now captured');
+  assert.equal(u.reasoningTokens, 120, 'nested reasoning_tokens now captured');
+  assert.equal(u.outputTokens, 400);
+  assert.equal(u.totalTokens, 60400);
+});
+
+test('parseCodexUsage: handles the chat-completions shape + flat cached_tokens + missing fields', () => {
+  const cc = parseCodexUsage({ prompt_tokens: 1000, completion_tokens: 50, prompt_tokens_details: { cached_tokens: 800 } });
+  assert.equal(cc.inputTokens, 1000);
+  assert.equal(cc.cachedInputTokens, 800, 'chat-completions nested cache path');
+  assert.equal(cc.totalTokens, 1050, 'total derived when absent');
+
+  const flat = parseCodexUsage({ input_tokens: 10, output_tokens: 2, cached_tokens: 5 });
+  assert.equal(flat.cachedInputTokens, 5, 'flat cached_tokens still works');
+
+  const none = parseCodexUsage({ input_tokens: 10, output_tokens: 2 });
+  assert.equal(none.cachedInputTokens, undefined, 'no cache info → undefined (not a false 0)');
+  assert.equal(parseCodexUsage(undefined).inputTokens, 0, 'undefined usage → zeros, never throws');
+});
+
+test('trimNativeInputForRetry: returns the input unchanged when it is at or under keepRecent+1', () => {
+  const input: Record<string, unknown>[] = [
+    { role: 'user', content: [{ type: 'input_text', text: 'p' }] },
+    { type: 'function_call_output', call_id: 'c1', output: 'X'.repeat(9000) },
+  ];
+  const out = trimNativeInputForRetry(input, { keepRecent: 6 });
+  assert.equal(out, input, 'short histories are left alone (nothing to trim safely)');
 });
 
 test('expander: pass-through when no synthetic call is present', () => {

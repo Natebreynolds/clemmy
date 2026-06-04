@@ -26,6 +26,7 @@ const {
   listBackgroundTasks,
   resumeInterruptedBackgroundTasks,
   processBackgroundTasks,
+  classifyBackgroundTaskOutcome,
 } = await import('./background-tasks.js');
 const { isAutoApprovedByScope, getPlanScope } = await import('../agents/plan-scope.js');
 const { SessionStore } = await import('../memory/session-store.js');
@@ -175,4 +176,39 @@ test('markBackgroundTaskFailed with status=interrupted does NOT report back (aut
   const turns = store.get(sessionId).turns;
   const reported = turns.filter((t) => typeof t.text === 'string' && t.text.startsWith(`[background task ${task.id} `));
   assert.equal(reported.length, 0, 'interrupted (auto-resumed) must not spam the session with a failure');
+});
+
+// ─── P0-C: a runtime-error abort must NOT be reported as a completed task ─────
+
+test('classifyBackgroundTaskOutcome: stoppedReason "error" → blocked (not a hollow done)', () => {
+  const outcome = classifyBackgroundTaskOutcome(
+    { runSessionId: 'sess-p0c-error' },
+    "I hit a runtime error and couldn't finish the reply: Clementine's model backend exceeded the wall-clock budget of 120000ms and was aborted mid-stream.",
+    'error',
+  );
+  assert.equal(outcome.outcome, 'blocked', 'a typed error result is a non-completion');
+  assert.ok(outcome.reason && /wall-clock budget/.test(outcome.reason), 'reason carries the error text');
+});
+
+test('classifyBackgroundTaskOutcome: the wall-clock error text alone (no stoppedReason) → blocked', () => {
+  const outcome = classifyBackgroundTaskOutcome(
+    { runSessionId: 'sess-p0c-text' },
+    "I hit a runtime error and couldn't finish the reply: ...exceeded the wall-clock budget of 120000ms...",
+  );
+  assert.equal(outcome.outcome, 'blocked', 'the runtime-error text patterns catch it even without stoppedReason');
+});
+
+test('classifyBackgroundTaskOutcome: a genuinely-complete run still reports done', () => {
+  const done = classifyBackgroundTaskOutcome(
+    { runSessionId: 'sess-p0c-done' },
+    'Done — I created the Google Sheet "90-Day Audit" with 1,393 rows and shared it with you.',
+    'success',
+  );
+  assert.equal(done.outcome, 'done', 'a clean completion is not diverted (regression lock)');
+
+  const doneNoReason = classifyBackgroundTaskOutcome(
+    { runSessionId: 'sess-p0c-done2' },
+    'Finished the export and saved it to your vault.',
+  );
+  assert.equal(doneNoReason.outcome, 'done', 'clean text with no stoppedReason stays done');
 });

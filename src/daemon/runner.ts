@@ -23,7 +23,7 @@ import { sweepStaleRuns } from '../runtime/run-events.js';
 import { sweepStaleApprovals } from '../runtime/approval-store.js';
 import { getAuthStatus } from '../runtime/auth-store.js';
 import { DISCORD_BOT_TOKEN, DISCORD_ENABLED, WEBHOOK_ENABLED, WEBHOOK_SECRET } from '../config.js';
-import { fullScan as warmCliScan } from '../runtime/cli-discovery.js';
+import { getOrRefreshScan as warmCliScan } from '../runtime/cli-discovery.js';
 import { closePlanScope, openPlanScope } from '../agents/plan-scope.js';
 import { processMemoryMaintenance } from '../memory/maintenance.js';
 import { runRecursiveReflection, consolidateActiveFacts } from '../memory/reflection.js';
@@ -887,12 +887,27 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
   // CLIs card don't pay the full $PATH-walk-and-probe cost (5–30s on a
   // typical dev machine). Errors are non-fatal — the cache will rebuild
   // on demand if this fails.
-  void warmCliScan().catch((err) => {
-    logger.warn(
-      { err: err instanceof Error ? err.message : String(err) },
-      'Initial CLI discovery scan failed (will retry on demand)',
-    );
-  });
+  //
+  // DEFERRED + cache-respecting. The scan forks a storm of `--version`
+  // probes (6-way, 2s timeout each) that saturates the single Node event
+  // loop. Fired immediately at boot it starves the FIRST dashboard
+  // render: the first /meetings/recall/recent fetch (a ~5ms file read)
+  // was observed queued behind it for ~31s, so the Meetings panel looked
+  // blank/hung. Pushing it past the initial-render window — and using
+  // getOrRefreshScan, which skips the scan entirely when a recent scan is
+  // still fresh (10-min TTL, so rapid restarts pay nothing) — keeps first
+  // paint responsive while the cache is still warm long before any CLI
+  // feature is used. unref() so the timer never holds the process open.
+  const CLI_WARM_DELAY_MS = 10_000;
+  const cliWarmTimer = setTimeout(() => {
+    void warmCliScan().catch((err) => {
+      logger.warn(
+        { err: err instanceof Error ? err.message : String(err) },
+        'Initial CLI discovery scan failed (will retry on demand)',
+      );
+    });
+  }, CLI_WARM_DELAY_MS);
+  cliWarmTimer.unref?.();
 
   // Notification delivery runs on its OWN cadence, independent of the
   // main loop. The main loop can park for 30+ min on a long cron job

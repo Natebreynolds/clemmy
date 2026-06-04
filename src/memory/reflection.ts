@@ -14,6 +14,8 @@ import {
   type ConsolidatedFact,
 } from './facts.js';
 import { recordToolEvent } from '../agents/tool-observability.js';
+import { classifySource, isSourceTrustEnabled, AUTHORITATIVE_TRUST } from './authoritative-sources.js';
+import { isSourceMapEnabled, upsertResourcePointer } from './source-map.js';
 
 /**
  * Reflection-on-tool-return — Phase 1 of the brain architecture.
@@ -73,12 +75,32 @@ const ExtractedPointerSchema = z.object({
   label: z.string().min(3).max(120),
   source_uri: z.string().max(200).optional(),
 });
+// Source-map / landscape memory (pointer-first): a NAMED LOCATION the output
+// reveals (a Drive folder, an Airtable base, a CRM object) — where data lives,
+// not the data itself.
+const ExtractedResourceSchema = z.object({
+  kind: z.string().min(1).max(40),
+  name: z.string().min(1).max(160),
+  ref: z.string().max(200).optional(),
+  whats_here: z.string().max(200).optional(),
+  when_to_use: z.string().max(160).optional(),
+});
 const ExtractionSchema = z.object({
   facts: z.array(ExtractedFactSchema).max(8),
   entities: z.array(ExtractedEntitySchema).max(12),
   pointers: z.array(ExtractedPointerSchema).max(4),
 });
-export type Extraction = z.infer<typeof ExtractionSchema>;
+// Variant used only when CLEMMY_SOURCE_MAP is on, so the flag-off extractor
+// schema + prompt stay byte-identical to today.
+const ExtractionSchemaWithResources = z.object({
+  facts: z.array(ExtractedFactSchema).max(8),
+  entities: z.array(ExtractedEntitySchema).max(12),
+  pointers: z.array(ExtractedPointerSchema).max(4),
+  resources: z.array(ExtractedResourceSchema).max(6),
+});
+export type Extraction = z.infer<typeof ExtractionSchema> & {
+  resources?: z.infer<typeof ExtractedResourceSchema>[];
+};
 
 export interface ReflectionInput {
   sessionId: string;
@@ -98,32 +120,51 @@ export interface ReflectionResult {
   skipped?: 'too_short' | 'already_reflected' | 'extractor_failed' | 'disabled' | 'low_importance';
 }
 
-const PROMPT_PREAMBLE = [
-  'You are the reflection layer of a long-running personal assistant.',
-  'Read the tool output below and extract DURABLE knowledge the assistant should remember about the USER, their PROJECTS, or REFERENCES they may want to revisit. Be conservative — only extract facts that will plausibly matter weeks from now. If nothing durable is in this output, return empty arrays.',
-  '',
-  'Return strict JSON matching this shape:',
-  '{',
-  '  "facts": [{ "kind": "user|project|feedback|reference", "text": "<short fact>", "importance": <1-10> }],',
-  '  "entities": [{ "type": "person|company|project|place|thing", "name": "<canonical>", "aliases": ["<alt>", ...] }],',
-  '  "pointers": [{ "label": "<short human label>", "source_uri": "<optional uri like outlook:thread:abc>" }]',
-  '}',
-  '',
-  'IMPORTANCE SCALE (per Park et al, Generative Agents §4.1):',
-  '  1 = purely mundane (e.g., user opened their inbox)',
-  '  4 = routine but recurring (e.g., weekly meeting with X)',
-  '  7 = notable / actionable for the user (e.g., new project kickoff)',
-  '  10 = extremely poignant (e.g., job offer, contract signing, life event)',
-  'Score conservatively. A typical derived fact is 3-5. Only push 7+ for things that change how the user works.',
-  '',
-  'Rules:',
-  '- Facts must be ATOMIC (one statement per entry), present-tense, third-person if about the user (e.g. "User\'s preferred meeting time is Tuesday afternoons").',
-  '- Pull entities (people, companies, projects) even if you have no fact about them yet — the registry uses them.',
-  '- "pointers" are short labels the user might use later ("the pricing convo with Marlow"); only include when the output describes a notable thread/event/document.',
-  '- DO NOT extract ephemeral state (current weather, request-ids, timestamps).',
-  '- DO NOT invent facts. If the output is noise/empty/error, return all three arrays empty.',
-  '- Output ONLY the JSON object. No markdown fences. No commentary.',
-].join('\n');
+const PROMPT_PREAMBLE = buildExtractorPreamble(false);
+const PROMPT_PREAMBLE_WITH_RESOURCES = buildExtractorPreamble(true);
+
+function buildExtractorPreamble(includeResources: boolean): string {
+  const shape = [
+    '  "facts": [{ "kind": "user|project|feedback|reference", "text": "<short fact>", "importance": <1-10> }],',
+    '  "entities": [{ "type": "person|company|project|place|thing", "name": "<canonical>", "aliases": ["<alt>", ...] }],',
+    includeResources
+      ? '  "pointers": [{ "label": "<short human label>", "source_uri": "<optional uri like outlook:thread:abc>" }],'
+      : '  "pointers": [{ "label": "<short human label>", "source_uri": "<optional uri like outlook:thread:abc>" }]',
+  ];
+  if (includeResources) {
+    shape.push('  "resources": [{ "kind": "folder|file|doc|sheet|base|table|object|channel|label", "name": "<resource name>", "ref": "<optional stable id/uri>", "whats_here": "<one phrase: what this holds>", "when_to_use": "<optional: when to come back here>" }]');
+  }
+  const lines = [
+    'You are the reflection layer of a long-running personal assistant.',
+    'Read the tool output below and extract DURABLE knowledge the assistant should remember about the USER, their PROJECTS, or REFERENCES they may want to revisit. Be conservative — only extract facts that will plausibly matter weeks from now. If nothing durable is in this output, return empty arrays.',
+    '',
+    'Return strict JSON matching this shape:',
+    '{',
+    ...shape,
+    '}',
+    '',
+    'IMPORTANCE SCALE (per Park et al, Generative Agents §4.1):',
+    '  1 = purely mundane (e.g., user opened their inbox)',
+    '  4 = routine but recurring (e.g., weekly meeting with X)',
+    '  7 = notable / actionable for the user (e.g., new project kickoff)',
+    '  10 = extremely poignant (e.g., job offer, contract signing, life event)',
+    'Score conservatively. A typical derived fact is 3-5. Only push 7+ for things that change how the user works.',
+    '',
+    'Rules:',
+    '- Facts must be ATOMIC (one statement per entry), present-tense, third-person if about the user (e.g. "User\'s preferred meeting time is Tuesday afternoons").',
+    '- Pull entities (people, companies, projects) even if you have no fact about them yet — the registry uses them.',
+    '- "pointers" are short labels the user might use later ("the pricing convo with Marlow"); only include when the output describes a notable thread/event/document.',
+  ];
+  if (includeResources) {
+    lines.push('- "resources" are NAMED LOCATIONS this output reveals — a Drive folder, an Airtable base/table, a CRM object, a mail label, a channel. Capture WHERE data lives + what it holds (NOT the content). Only include real, re-visitable containers; skip one-off records and the data values themselves.');
+  }
+  lines.push(
+    '- DO NOT extract ephemeral state (current weather, request-ids, timestamps).',
+    `- DO NOT invent facts. If the output is noise/empty/error, return all ${includeResources ? 'four' : 'three'} arrays empty.`,
+    '- Output ONLY the JSON object. No markdown fences. No commentary.',
+  );
+  return lines.join('\n');
+}
 
 function getReflectorModel(): string {
   return MODELS.fast || MODELS.primary || 'gpt-5.4-mini';
@@ -216,6 +257,11 @@ function markReflected(key: string): void {
 
 async function runExtractor(serialized: string): Promise<Extraction | null> {
   const model = getReflectorModel();
+  // Source-map: when on, ask the extractor for `resources` too (named
+  // locations). Flag-off keeps the schema + prompt byte-identical to today.
+  const withResources = isSourceMapEnabled();
+  const schema = withResources ? ExtractionSchemaWithResources : ExtractionSchema;
+  const instructions = withResources ? PROMPT_PREAMBLE_WITH_RESOURCES : PROMPT_PREAMBLE;
   try {
     // v0.5.22.1 — outputType binds ExtractionSchema to the SDK's structured-
     // output path, so OpenAI's grammar-constrained sampling guarantees a
@@ -225,8 +271,8 @@ async function runExtractor(serialized: string): Promise<Extraction | null> {
     const agent = new Agent<unknown, typeof ExtractionSchema>({
       name: 'Reflection Extractor',
       model,
-      instructions: PROMPT_PREAMBLE,
-      outputType: normalizeZodForCodexStrict(ExtractionSchema) as typeof ExtractionSchema,
+      instructions,
+      outputType: normalizeZodForCodexStrict(schema) as typeof ExtractionSchema,
     });
     const runner = new Runner({ workflowName: 'clementine-reflection' });
     const result = await runner.run(agent, serialized);
@@ -261,6 +307,8 @@ const CONFLICT_PROMPT = [
   '',
   'Be conservative — when in doubt, ADD. UPDATE/DELETE require clear contradiction, not vague semantic overlap.',
   '',
+  'TRUST / AUTHORITY: each fact has a trust score (0–1). user-stated ≈ 1.0; a system of record (CRM, calendar, mailbox, database) ≈ 0.9 = CANONICAL ground truth; a generic inference ≈ 0.6; a public web/scrape ≈ 0.5. When the candidate is from an authoritative source (trust ≥ 0.85) and an existing LOWER-trust fact disagrees, prefer UPDATE (or DELETE) of the stale one — ground truth beats inference. Never let a low-trust inference overwrite a higher-trust fact; in that direction prefer NOOP.',
+  '',
   'Output strict JSON: { "decision": "ADD|UPDATE|DELETE|NOOP", "target_id": <id or null>, "rewrite": "<optional>", "reason": "<one-line>" }',
   'No markdown fences. No commentary.',
 ].join('\n');
@@ -273,7 +321,7 @@ interface ConflictDecision {
 }
 
 export async function resolveConflict(
-  candidate: { kind: 'user' | 'project' | 'feedback' | 'reference'; text: string },
+  candidate: { kind: 'user' | 'project' | 'feedback' | 'reference'; text: string; trustLevel?: number },
   similar: ConsolidatedFact[],
 ): Promise<ConflictDecision> {
   if (similar.length === 0) return { decision: 'ADD' };
@@ -286,8 +334,11 @@ export async function resolveConflict(
       outputType: normalizeZodForCodexStrict(ConflictDecisionSchema) as typeof ConflictDecisionSchema,
     });
     const runner = new Runner({ workflowName: 'clementine-conflict-resolver' });
+    const candTrust = typeof candidate.trustLevel === 'number' ? candidate.trustLevel.toFixed(2) : '?';
+    const candAuthoritative = typeof candidate.trustLevel === 'number' && candidate.trustLevel >= AUTHORITATIVE_TRUST
+      ? ' [AUTHORITATIVE system-of-record]' : '';
     const prompt = [
-      `Candidate fact (kind=${candidate.kind}): "${candidate.text}"`,
+      `Candidate fact (kind=${candidate.kind}, trust=${candTrust})${candAuthoritative}: "${candidate.text}"`,
       '',
       'Existing similar facts:',
       ...similar.map((f) => `  [id=${f.id}, kind=${f.kind}, trust=${f.trustLevel ?? '?'}, importance=${f.importance ?? '?'}] "${f.content}"`),
@@ -313,8 +364,12 @@ export interface ConsolidateCandidate {
   /** Stanford §4.1 poignancy. Defaults handled by rememberFact (5.0). */
   importance?: number;
   /** 0.0–1.0. User-stated facts pass 1.0 so they win conflicts; tool-
-   *  derived facts leave this undefined → rememberFact defaults to 0.6. */
+   *  derived facts leave this undefined → rememberFact defaults to 0.6.
+   *  Systems of record pass ~0.9 (connectors-as-authoritative-writers). */
   trustLevel?: number;
+  /** v9 — friendly app name when the candidate came from a system of
+   *  record (set by classifySource in the reflection loop). */
+  sourceApp?: string;
 }
 
 export interface ConsolidateContext {
@@ -357,13 +412,56 @@ export async function consolidateFact(
 
   const scored = await findSimilarFactsScored(candidate.text, { kind: candidate.kind, topK: 5 });
   const similar = scored.map((s) => s.fact);
+  const topSim = scored.length > 0 ? scored[0].sim : null;
+
+  // Ground-truth-wins fast-path (Thread 1 / C2): an AUTHORITATIVE candidate
+  // (system of record, trust ≥ 0.85) that clearly conflicts (high cosine)
+  // with a stale, lower-trust (≤ 0.6) existing fact supersedes it
+  // deterministically — no LLM resolver call. This is the "ground truth
+  // beats inference" rule: a fresh Salesforce/Outlook fact overrides an old
+  // guess. Mirrors the novelty fast-path's shape.
+  //
+  // GATED on candidate.sourceApp — the system-of-record marker that ONLY the
+  // flag-on (CLEMMY_SOURCE_TRUST) classifySource path sets. This is the real
+  // enforcement of "only fires when source trust tagged the candidate": the
+  // default-on auto-capture path passes user restatements at trust 1.0 (which
+  // also clears 0.85) but NEVER sets sourceApp, so without this guard a
+  // restatement merely ≥0.8 cosine-similar to a DERIVED fact (≤0.6) would
+  // deterministically overwrite it (content replace, not append), bypassing
+  // the LLM ADD/UPDATE resolver and silently dropping a distinct-but-related
+  // derived fact. User restatements correctly fall through to resolveConflict
+  // below — which UPDATEs a true restatement but ADDs a genuinely new one, so
+  // no fact is lost. Default behavior (no sourceApp) is therefore unchanged.
+  const GROUND_TRUTH_CONFLICT_SIM = 0.8;
+  if (
+    typeof candidate.sourceApp === 'string' &&
+    candidate.sourceApp.length > 0 &&
+    typeof candidate.trustLevel === 'number' &&
+    candidate.trustLevel >= AUTHORITATIVE_TRUST &&
+    scored.length > 0 &&
+    topSim !== null &&
+    topSim >= GROUND_TRUTH_CONFLICT_SIM &&
+    (scored[0].fact.trustLevel ?? 1.0) <= 0.6
+  ) {
+    const updated = updateFact(scored[0].fact.id, {
+      content: candidate.text,
+      trustLevel: candidate.trustLevel,
+      importance: candidate.importance,
+      sessionId: ctx.sessionId,
+      sourceApp: candidate.sourceApp,
+    });
+    if (updated) {
+      out.updated = 1;
+      out.importanceAdded += candidate.importance ?? 0;
+      return out;
+    }
+  }
 
   // Novelty fast-path (Tier A1): when the most-similar existing fact's
   // cosine is BELOW the bar, the candidate is clearly novel — there is no
   // plausible conflict to resolve, so ADD directly and skip the LLM
   // resolver call. Only applies on the semantic path (sim != null); the
   // lexical fallback reports sim=null and always runs the resolver.
-  const topSim = scored.length > 0 ? scored[0].sim : null;
   if (
     typeof opts.noveltyFastPathSim === 'number' &&
     topSim !== null &&
@@ -376,13 +474,17 @@ export async function consolidateFact(
       derivedFrom: ctx.derivedFrom,
       importance: candidate.importance,
       trustLevel: candidate.trustLevel,
+      sourceApp: candidate.sourceApp,
     });
     out.written = 1;
     out.importanceAdded += candidate.importance ?? 0;
     return out;
   }
 
-  const decision = await resolveConflict({ kind: candidate.kind, text: candidate.text }, similar);
+  const decision = await resolveConflict(
+    { kind: candidate.kind, text: candidate.text, trustLevel: candidate.trustLevel },
+    similar,
+  );
 
   if (decision.decision === 'NOOP') {
     out.noop = 1;
@@ -403,6 +505,7 @@ export async function consolidateFact(
       trustLevel: candidate.trustLevel ?? 0.6,
       importance: candidate.importance,
       sessionId: ctx.sessionId,
+      sourceApp: candidate.sourceApp,
     });
     if (updated) {
       out.updated = 1;
@@ -421,6 +524,7 @@ export async function consolidateFact(
     // Leave undefined for tool-derived (rememberFact derives 0.6 from
     // derivedFrom); user path passes 1.0 explicitly.
     trustLevel: candidate.trustLevel,
+    sourceApp: candidate.sourceApp,
   };
   rememberFact(rememberInput);
   out.written = 1;
@@ -571,6 +675,35 @@ export async function reflectOnToolReturn(input: ReflectionInput): Promise<Refle
     return emitObservability({ factsWritten: 0, entitiesUpserted: 0, pointersStored: 0, skipped: 'extractor_failed' });
   }
 
+  // Source-map / landscape memory — mint resource pointers BEFORE the
+  // importance gate below. The landscape is pointer-first + bounded (dedupe by
+  // app+ref), so we map it LIBERALLY even in low-signal sessions, unlike facts
+  // which the importance gate deliberately throttles. Only for systems of
+  // record (the apps the user navigates), tagged with the source app + trust.
+  // Flag-gated (CLEMMY_SOURCE_MAP) + best-effort — never perturbs reflection.
+  if (isSourceMapEnabled() && extraction.resources && extraction.resources.length > 0) {
+    const cls = classifySource(input.tool);
+    if (cls && cls.category === 'system_of_record') {
+      for (const r of extraction.resources) {
+        try {
+          upsertResourcePointer({
+            app: cls.app,
+            kind: r.kind,
+            name: r.name,
+            // Route the extractor's stable id/uri through providerId so a
+            // reactively-learned resource lands on the SAME canonical ref as
+            // the background-ingest crawler (app:kind:id) and they converge.
+            providerId: r.ref,
+            whatsHere: r.whats_here,
+            whenToUse: r.when_to_use,
+            trust: cls.trust,
+            source: 'reactive',
+          });
+        } catch { /* best-effort — a map write must never break reflection */ }
+      }
+    }
+  }
+
   // Stanford §4.2: importance-threshold gating on the COMMIT step. The
   // extractor already ran (cheap fast-tier call); we just decide
   // whether the extracted facts clear the rolling sum-importance bar.
@@ -603,6 +736,13 @@ export async function reflectOnToolReturn(input: ReflectionInput): Promise<Refle
   let pointersStored = 0;
   let sumImportance = 0;
 
+  // Connectors-as-authoritative-writers (Thread 1): classify the producing
+  // tool's source category once for this batch. A system of record lifts the
+  // derived-fact trust from 0.6 → 0.9 (ground truth) and records the source
+  // app; a web/scrape source lowers it to 0.5. Flag-gated; unrecognized
+  // tools → null → unchanged default trust.
+  const source = isSourceTrustEnabled() ? classifySource(input.tool) : null;
+
   for (const fact of extraction.facts) {
     try {
       // Mem0-style conflict resolution (Chhikara et al §2.1) via the
@@ -610,7 +750,13 @@ export async function reflectOnToolReturn(input: ReflectionInput): Promise<Refle
       // the LLM decide ADD / UPDATE / DELETE / NOOP. Falls back to ADD
       // if anything fails — we never lose information silently.
       const outcome = await consolidateFact(
-        { kind: fact.kind, text: fact.text, importance: fact.importance },
+        {
+          kind: fact.kind,
+          text: fact.text,
+          importance: fact.importance,
+          trustLevel: source?.trust,
+          sourceApp: source?.app,
+        },
         {
           sessionId: input.sessionId,
           derivedFrom: {

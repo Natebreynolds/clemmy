@@ -16,6 +16,7 @@ import {
   type WorkflowEntry,
 } from '../memory/workflow-store.js';
 import { checkWorkflowForWrite } from '../execution/workflow-enforce.js';
+import { analyzeWorkflowGaps, renderWorkflowGapQuestions } from '../execution/workflow-gap-test.js';
 import {
   CRON_PROGRESS_DIR,
   CRON_RUNS_DIR,
@@ -41,6 +42,12 @@ import {
   unrequestedWorkflowRunMessage,
   workflowExplicitlyRequested,
 } from './workflow-run-guard.js';
+import {
+  resolveWorkflowName,
+  textRefersToWorkflow,
+  workflowNamesEqual,
+  type ResolverEntry,
+} from './workflow-resolve.js';
 import { addNotification } from '../runtime/notifications.js';
 import { matchToolChoicesForStep, type StepToolChoiceMatch, type ToolChoiceRecord } from '../memory/tool-choice-store.js';
 
@@ -515,7 +522,8 @@ export function registerOrchestrationTools(server: McpServer): void {
 
   server.tool(
     'workflow_create',
-    "Create a recurring or multi-step automated workflow. Use this for ANY scheduled or repeated work (\"daily at 6pm\", \"every Monday morning\", \"when X happens, do Y\") INSTEAD of task_add (which is one-shot). A workflow is the WHAT (the steps); after this call, call workflow_schedule to set the cron — that's the WHEN. "
+    "Create a recurring or multi-step automated workflow. SUPER-PLAN POSTURE: authoring a workflow is a deliberate act — never save one that's set up to fail. Think the data flow through end-to-end, and after saving you'll get a GAP TEST: clarifying questions about anything likely to break (missing destination for a deliverable, unclear send recipient, undeclared input, recurring prose with no schedule, batch work without forEach). Put those questions to the user and refine with workflow_update BEFORE telling them it's ready. "
+      + "Use this for ANY scheduled or repeated work (\"daily at 6pm\", \"every Monday morning\", \"when X happens, do Y\") INSTEAD of task_add (which is one-shot). A workflow is the WHAT (the steps); after this call, call workflow_schedule to set the cron — that's the WHEN. "
       + "AUTHORING MODEL (important): workflows are AUTONOMOUS BY DEFAULT — an enabled workflow runs every step end-to-end on the user's one-time consent (enabling it), WITHOUT pausing for per-step approval. Do NOT put `request_approval` in step prompts. "
       + "Each step does ONE job and its result flows to dependent steps automatically: every `dependsOn` output is injected into the downstream STEP CONTEXT as real structured data. Use `{{steps.<stepId>.output}}` or step inputs only when you need a precise subpath or a named typed value. "
       + "If — and only if — a step does something IRREVERSIBLE the user should sign off on first (e.g. sending emails, publishing), set `requiresApproval: true` on THAT ONE step and a short `approvalPreview`; the runner surfaces a single batch approval and holds the run there, then continues. Prefer ZERO gates for read/research/draft/deploy-for-review workflows. "
@@ -604,24 +612,63 @@ export function registerOrchestrationTools(server: McpServer): void {
       }
       writeWorkflow(dirName, def);
       const createBindReport = createBind.boundNotes.length > 0 ? `\n\n${createBind.boundNotes.join('\n')}` : '';
+      // Super-plan authoring: a saved workflow is run through the gap test so
+      // Clem asks the user for clarity BEFORE relying on it, instead of
+      // authoring something quietly set up to fail at 2am.
+      const createGaps = analyzeWorkflowGaps(def);
       return textResult(
         `Created workflow "${name}" at workflows/${dirName}/SKILL.md.${createBindReport}`
-          + `${renderAuthoringAdvisories([...createCheck.warnings, ...createBind.advisories])}`,
+          + `${renderAuthoringAdvisories([...createCheck.warnings, ...createBind.advisories])}`
+          + `${renderWorkflowGapQuestions(createGaps)}`,
       );
     },
   );
 
   server.tool(
     'workflow_run',
-    'Dispatch a workflow to run in the BACKGROUND (fire-and-forget) — it runs in the daemon and reports its outcome back to this chat automatically on completion; you do not wait or poll. Call workflow_get first and pass every required input, for example inputs.url for URL-based audit workflows. Missing required inputs are rejected without queuing.',
+    'Dispatch a workflow to run in the BACKGROUND (fire-and-forget) — it runs in the daemon and reports its outcome back to this chat automatically on completion; you do not wait or poll. Call workflow_get first and pass every required input, for example inputs.url for URL-based audit workflows. Missing required inputs are rejected without queuing. '
+      + 'You may pass the user\'s loose name (e.g. "prospecting flow"): if it is not an exact match the tool returns the CLOSEST workflow (or asks which of several) so you can confirm with the user — "Just to confirm, did you want me to kick off your <X> workflow? I\'ll report back once it\'s done." — then call again with that exact name. Only an exact name runs straight through.',
     {
       name: z.string().min(1),
       inputs: z.string().optional().describe('JSON object of the workflow\'s inputs, e.g. {"url":"https://example.com"}. Call workflow_get first to see the required input names.'),
     },
     async ({ name, inputs }) => {
-      const workflow = listWorkflowFiles().find((entry) => entry.data.name === name);
+      const all = listWorkflowFiles();
+      const resolverEntries: ResolverEntry[] = all.map((e) => ({
+        name: e.data.name,
+        slug: path.basename(e.dir),
+      }));
+      // Match by NAME, not just the exact direct name: a user who says "kick off
+      // my prospecting flow" should land on "Morning Prospect Prep" — but Clem
+      // CONFIRMS the close match before running, and asks which one when several
+      // fit. Only an exact name runs straight through.
+      const resolution = resolveWorkflowName(name, resolverEntries);
+      if (resolution.kind === 'none') {
+        const names = resolverEntries.map((e) => `"${e.name}"`).join(', ');
+        return textResult(
+          resolverEntries.length === 0
+            ? `No workflow matches "${name}", and there are no saved workflows. Just do the task directly.`
+            : `No workflow closely matches "${name}". Saved workflows: ${names}. If the user meant one of these, confirm which and call workflow_run with its exact name; otherwise just do the task ad-hoc.`,
+        );
+      }
+      if (resolution.kind === 'ambiguous') {
+        const opts = resolution.candidates.map((c) => `"${c}"`).join(', ');
+        return textResult(
+          `"${name}" could mean more than one workflow: ${opts}. Ask the user which one they want — e.g. "Did you mean ${resolution.candidates.map((c) => `your ${c}`).join(' or ')}?" — then call workflow_run with that exact name.`,
+        );
+      }
+      if (resolution.kind === 'fuzzy') {
+        return textResult(
+          `No workflow is named exactly "${name}". The closest match is "${resolution.name}". `
+            + `Confirm with the user before running it — e.g. "Just to confirm, did you want me to kick off your ${resolution.name} workflow? I'll report back once it's done." — `
+            + `then call workflow_run with name "${resolution.name}".`,
+        );
+      }
+      // Exact match → run it.
+      const workflow = all.find((e) => workflowNamesEqual(e.data.name, resolution.name));
       if (!workflow) return textResult(`Workflow "${name}" not found.`);
-      if (!workflow.data.enabled) return textResult(`Workflow "${name}" is disabled.`);
+      const canonicalName = workflow.data.name;
+      if (!workflow.data.enabled) return textResult(`Workflow "${canonicalName}" is disabled.`);
 
       // Soft boundary guard (2026-05-31 incident): do NOT silently auto-run a
       // workflow the user did not explicitly name in their recent request.
@@ -661,11 +708,18 @@ export function registerOrchestrationTools(server: McpServer): void {
         const slugCandidates = [workflow.name, path.basename(workflow.dir)].filter(
           (value): value is string => typeof value === 'string' && value.length > 0,
         );
+        // The user "explicitly requested" this workflow if their recent text
+        // names it directly OR resolves to it by matching name (so a confirmed
+        // fuzzy run — "kick off my prospecting flow" → Morning Prospect Prep —
+        // isn't re-blocked as unrequested). A request that clearly points at a
+        // DIFFERENT workflow (or none) still fails the guard.
+        const thisEntry: ResolverEntry = { name: canonicalName, slug: path.basename(workflow.dir) };
         if (
           recentUserText.trim() !== '' &&
-          !workflowExplicitlyRequested(name, slugCandidates, recentUserText)
+          !workflowExplicitlyRequested(canonicalName, slugCandidates, recentUserText) &&
+          !textRefersToWorkflow(recentUserText, thisEntry, resolverEntries)
         ) {
-          return textResult(unrequestedWorkflowRunMessage(name));
+          return textResult(unrequestedWorkflowRunMessage(canonicalName));
         }
       }
 
@@ -686,20 +740,20 @@ export function registerOrchestrationTools(server: McpServer): void {
         // (tests / internal callers) → keep the deterministic rejection.
         if (guardCtx?.sessionId) {
           surfaceWorkflowPendingInputs({
-            workflowName: name,
+            workflowName: canonicalName,
             requiredInputs: missing,
             providedInputs: normalizedInputs,
             sessionId: guardCtx.sessionId,
-            originatingRequest: `Run the "${name}" workflow`,
+            originatingRequest: `Run the "${canonicalName}" workflow`,
           });
           const inputList = missing.map((key) => `\`${key}\``).join(', ');
           return textResult(
-            `I need ${inputList} to run the "${name}" workflow. Reply with ${missing.length === 1 ? 'it' : 'them'} and I'll run it.`,
+            `I need ${inputList} to run the "${canonicalName}" workflow. Reply with ${missing.length === 1 ? 'it' : 'them'} and I'll run it.`,
           );
         }
         return textResult(
           [
-            `Workflow "${name}" was not queued because required input${missing.length === 1 ? '' : 's'} ${missing.map((key) => `"${key}"`).join(', ')} ${missing.length === 1 ? 'is' : 'are'} missing.`,
+            `Workflow "${canonicalName}" was not queued because required input${missing.length === 1 ? '' : 's'} ${missing.map((key) => `"${key}"`).join(', ')} ${missing.length === 1 ? 'is' : 'are'} missing.`,
             `Call workflow_run again with inputs including ${missing.map((key) => `"${key}": "<value>"`).join(', ')}.`,
           ].join('\n'),
         );
@@ -710,7 +764,7 @@ export function registerOrchestrationTools(server: McpServer): void {
       // notification). guardCtx is the agent's tool-output context resolved
       // above; absent for non-chat callers → notification-only.
       return textResult(
-        queueWorkflowRun(name, normalizedInputs, { originSessionId: guardCtx?.sessionId }).message,
+        queueWorkflowRun(canonicalName, normalizedInputs, { originSessionId: guardCtx?.sessionId }).message,
       );
     },
   );
@@ -722,8 +776,27 @@ export function registerOrchestrationTools(server: McpServer): void {
       name: z.string().min(1),
     },
     async ({ name }) => {
-      const entry = listWorkflowFiles().find((w) => w.data.name === name);
-      if (!entry) return textResult(`Workflow "${name}" not found.`);
+      const allGet = listWorkflowFiles();
+      let entry = allGet.find((w) => w.data.name === name);
+      if (!entry) {
+        // Match by name, not just the exact direct name — same resolver the
+        // run path uses, so workflow_get("prospecting flow") still finds it.
+        const resolution = resolveWorkflowName(
+          name,
+          allGet.map((e) => ({ name: e.data.name, slug: path.basename(e.dir) })),
+        );
+        if (resolution.kind === 'exact' || resolution.kind === 'fuzzy') {
+          entry = allGet.find((w) => workflowNamesEqual(w.data.name, resolution.name));
+        } else if (resolution.kind === 'ambiguous') {
+          return textResult(
+            `"${name}" could mean: ${resolution.candidates.map((c) => `"${c}"`).join(', ')}. Ask the user which one, then call workflow_get with that exact name.`,
+          );
+        }
+      }
+      if (!entry) {
+        const names = allGet.map((w) => `"${w.data.name}"`).join(', ');
+        return textResult(`Workflow "${name}" not found.${names ? ` Saved workflows: ${names}.` : ''}`);
+      }
       const w = entry.data;
       const stepsBlock = w.steps.map((step) => {
         const deps = step.dependsOn && step.dependsOn.length > 0 ? ` (depends on: ${step.dependsOn.join(', ')})` : '';
@@ -893,7 +966,10 @@ export function registerOrchestrationTools(server: McpServer): void {
         ...checkWorkflowForWrite(next).warnings,
         ...updateBind.advisories,
       ]);
-      return textResult(`Workflow "${name}" updated.${updateBindReport}${updateAdvisories}`);
+      // Re-run the gap test on the edited workflow so remaining gaps stay
+      // visible until the author actually closes them.
+      const updateGaps = renderWorkflowGapQuestions(analyzeWorkflowGaps(next));
+      return textResult(`Workflow "${name}" updated.${updateBindReport}${updateAdvisories}${updateGaps}`);
     },
   );
 

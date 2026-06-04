@@ -33,6 +33,7 @@ import { renderFactsForInstructions, renderRecentlyLearnedForInstructions } from
 import { getActiveObjective, getFocusSnapshot } from '../memory/focus.js';
 import { renderSkillsIndex } from '../memory/skill-store.js';
 import { renderToolChoicesForContext } from '../memory/tool-choice-store.js';
+import { renderSourceMapForContext } from '../memory/source-map.js';
 import { loadUserProfile, renderProfileForInstructions } from '../runtime/user-profile.js';
 import { loadProactivityPolicy } from './proactivity-policy.js';
 
@@ -158,6 +159,34 @@ function renderActiveGoals(): string {
  * string each call. Errors in any individual source degrade
  * gracefully — a missing vault doesn't take the agent down.
  */
+
+/**
+ * The LEARNED-context blocks (Recently Learned + Remembered Tool Choices) —
+ * the half of Clem's self that grows from use. Defined ONCE here and shared by
+ * BOTH the harness assembler (below) and the chat assembler
+ * (assistant/instructions.ts), so the surface you talk to and the surface that
+ * runs long work see the SAME learned tools/facts. North-star Move 2 (one self):
+ * before this, only the harness path surfaced these, so chat re-discovered tools
+ * it had already learned. `objective` scopes the tool-choice ranking (chat blends
+ * message+focus, harness uses the active focus). Returns the two SECTION strings
+ * separately so each caller keeps its own block ordering. Best-effort.
+ */
+export function renderLearnedBlocks(objective?: string): { recentlyLearned: string; toolChoices: string } {
+  let recentlyLearned = '';
+  try {
+    recentlyLearned = section('Recently Learned (last 24h)', renderRecentlyLearnedForInstructions(24, 15));
+  } catch {
+    recentlyLearned = '';
+  }
+  let toolChoices = '';
+  try {
+    toolChoices = section('Remembered Tool Choices', renderToolChoicesForContext(12, undefined, objective));
+  } catch {
+    toolChoices = '';
+  }
+  return { recentlyLearned, toolChoices };
+}
+
 export function renderHarnessMemoryContext(): string {
   let memContext;
   try {
@@ -177,29 +206,19 @@ export function renderHarnessMemoryContext(): string {
     facts = '';
   }
 
-  // Phase 1 brain architecture (v0.5.11): "Recently Learned" surfaces
-  // derived facts the reflection layer synthesized from tool returns
-  // in the last 24h. Each line ends with [call_id] when the fact
-  // came from a specific tool call so the agent can recall the
-  // verbatim source via recall_tool_result. See
-  // [[project_brain_architecture]].
-  let recentlyLearned = '';
-  try {
-    recentlyLearned = renderRecentlyLearnedForInstructions(24, 15);
-  } catch {
-    recentlyLearned = '';
-  }
+  // Learned context (Recently Learned + Remembered Tool Choices) — shared with
+  // the chat assembler via renderLearnedBlocks so both surfaces see the same
+  // learned tools/facts. Scoped to the active focus objective. Returns
+  // SECTION-wrapped strings, placed below at their existing positions.
+  const { recentlyLearned, toolChoices } = renderLearnedBlocks(getActiveObjective());
 
-  // P2 (measured learning loop): inject remembered tool choices so the
-  // agent recalls a proven tool by READING the context, not only by
-  // calling tool_choice_recall. Enabled by default with a hard prompt
-  // budget; TOOL_CHOICE_CONTEXT_INJECT=off is the escape hatch.
-  // [[project_measured_learning_loop]].
-  let toolChoices = '';
+  // Source-map / landscape memory — a pointer-first index of WHERE the user's
+  // data lives, scoped to the active objective. Off (flag) → ''.
+  let dataLandscape = '';
   try {
-    toolChoices = renderToolChoicesForContext(12);
+    dataLandscape = renderSourceMapForContext(24, undefined, getActiveObjective());
   } catch {
-    toolChoices = '';
+    dataLandscape = '';
   }
 
   let profile = '';
@@ -266,8 +285,9 @@ export function renderHarnessMemoryContext(): string {
     section('Autonomy', renderAutonomy()),
     section('User Preferences', profile),
     section('Persistent Facts', facts),
-    section('Recently Learned (last 24h)', recentlyLearned),
-    section('Remembered Tool Choices', toolChoices),
+    recentlyLearned,
+    section('Data Landscape', dataLandscape),
+    toolChoices,
     section('Working Memory', memContext.workingMemory),
     section('Identity', memContext.identity),
     section('Core Personality', memContext.soul),

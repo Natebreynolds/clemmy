@@ -114,3 +114,49 @@ export function refreshWorkingMemory(session: SessionRecord): void {
 export function workingMemoryExists(): boolean {
   return existsSync(WORKING_MEMORY_FILE);
 }
+
+/**
+ * P2-F — lightweight between-turn checkpoint. `refreshWorkingMemory` only
+ * runs at the END of a `respond` call, so a run that aborts mid-tool-loop
+ * (e.g. a wall-clock abort) persists nothing. This writes/updates a compact
+ * `## In-flight Checkpoint` section in the per-session working-memory file
+ * after a substantive turn, so a later retry / watchdog re-spawn resumes
+ * from progress instead of zero. Deterministic, no LLM, best-effort — a
+ * write failure must never break a turn. Non-destructive: it only replaces
+ * the checkpoint section, leaving any existing working-memory content intact
+ * (a normal turn-end `refreshWorkingMemory` overwrites the whole file again).
+ */
+export function checkpointWorkingMemory(
+  sessionId: string,
+  progress: { lastText?: string; toolCallsTotal?: number; turn?: number },
+): void {
+  try {
+    const filePath = workingMemoryPathForSession(sessionId);
+    const checkpointSection = [
+      '## In-flight Checkpoint',
+      `Updated: ${new Date().toISOString()}`,
+      progress.turn !== undefined ? `Turn: ${progress.turn}` : null,
+      progress.toolCallsTotal !== undefined ? `Tool calls so far: ${progress.toolCallsTotal}` : null,
+      progress.lastText ? `Latest: ${progress.lastText.replace(/\s+/g, ' ').slice(0, 500)}` : null,
+    ].filter(Boolean).join('\n');
+
+    let existing = '';
+    if (existsSync(filePath)) {
+      try { existing = readFileSync(filePath, 'utf-8'); } catch { existing = ''; }
+    }
+
+    let next: string;
+    if (/## In-flight Checkpoint/.test(existing)) {
+      next = existing.replace(/## In-flight Checkpoint[\s\S]*?(?=\n## |$)/, `${checkpointSection}\n`);
+    } else if (existing.trim()) {
+      next = `${existing.trimEnd()}\n\n${checkpointSection}\n`;
+    } else {
+      next = `# Working Memory\n\n${checkpointSection}\n`;
+    }
+
+    mkdirSync(SESSION_WORKING_MEMORY_DIR, { recursive: true });
+    writeFileSync(filePath, next);
+  } catch {
+    // best-effort; a checkpoint write must never break or fail a turn.
+  }
+}

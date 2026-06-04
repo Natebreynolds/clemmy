@@ -32,6 +32,20 @@
 import { randomBytes } from 'node:crypto';
 import { openEventLog } from './eventlog.js';
 import { markNotificationsReadByApprovalId } from '../notifications.js';
+import { updateToolChoiceOutcomeForIdentifier } from '../../memory/tool-choice-store.js';
+
+/**
+ * The tool-choice identifier an approval maps to (Thread 2 — outcome loop).
+ * For the composio wrapper the proven choice stores the action SLUG (in args),
+ * not the wrapper name; an MCP/CLI tool's name IS the stored identifier.
+ */
+function approvalChoiceIdentifier(tool: string | null, args: Record<string, unknown> | null): string | null {
+  if (!tool) return null;
+  if (tool === 'composio_execute_tool') {
+    return args && typeof args.tool_slug === 'string' && args.tool_slug.trim() ? args.tool_slug.trim() : null;
+  }
+  return tool;
+}
 
 export type PendingApprovalStatus = 'pending' | 'resolved' | 'expired' | 'cancelled';
 export type ApprovalResolution = 'approved' | 'rejected' | 'expired' | 'cancelled_by_user';
@@ -302,6 +316,20 @@ export function resolve(
     // Notification cleanup is best-effort; approval resolution is the
     // source of truth and must not fail because the dashboard queue is
     // temporarily unavailable.
+  }
+  // Thread 2 — feed the human's approve/reject back to procedural memory. A
+  // REJECTION is the strongest distinct signal (the tool never runs, so the
+  // execute-outcome loop never sees it); an approval is a soft positive
+  // (usually followed by an execute success that also credits it). Flag-gated
+  // no-op when off; never let it break resolution.
+  if (resolution === 'approved' || resolution === 'rejected') {
+    try {
+      const pub = rowToPublic(row);
+      const id = approvalChoiceIdentifier(pub.tool, pub.args);
+      if (id) updateToolChoiceOutcomeForIdentifier(id, resolution);
+    } catch {
+      /* best-effort */
+    }
   }
   return { ok: true, row: rowToPublic(row) };
 }

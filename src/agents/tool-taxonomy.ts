@@ -90,6 +90,7 @@ const NEVER_GATE_LOCAL_MEMORY = new Set<string>([
   'tool_choice_invalidate',
   // Durable facts + working memory.
   'memory_remember',
+  'source_map_upsert',
   'memory_forget',
   'memory_embed_backfill',
   'working_memory',

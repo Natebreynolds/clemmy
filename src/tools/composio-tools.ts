@@ -12,9 +12,10 @@ import {
 } from '../integrations/composio/client.js';
 import { formatRecallableToolText } from '../runtime/harness/tool-output-format.js';
 import { callIdFromToolDetails, sessionIdFromRunContext } from '../runtime/harness/tool-output-context.js';
-import { rememberToolChoice, peekToolChoice, invalidateToolChoice, stripBakedConnectionId } from '../memory/tool-choice-store.js';
+import { rememberToolChoice, peekToolChoice, invalidateToolChoice, stripBakedConnectionId, updateToolChoiceOutcomeForIdentifier } from '../memory/tool-choice-store.js';
 import { workerThrashGuardEnabled } from '../runtime/harness/brackets.js';
 import { appendFanoutAdvisory } from '../runtime/harness/fanout-advisory.js';
+import { maybeDiscoveryAdvisory, isDescribeSlug, toolkitOfSlug, describeSignature } from '../runtime/harness/discovery-advisory.js';
 import { isTransientStepError } from '../execution/transient-error.js';
 
 const DYNAMIC_TOOL_PREFIX = 'cx_';
@@ -244,7 +245,12 @@ export function maybeAutoRememberComposioChoice(
   sessionId: string | undefined,
 ): void {
   try {
-    if (detectComposioFailure(result).failed) return; // only learn from successes
+    const failed = detectComposioFailure(result).failed;
+    // Thread 2 — close the outcome loop: credit (success) or blame (failure)
+    // whatever proven choice points at this slug on EVERY execute, not just
+    // discovery-followed ones. Flag-gated no-op when off; best-effort.
+    updateToolChoiceOutcomeForIdentifier(toolSlug, failed ? 'failure' : 'success');
+    if (failed) return; // only LEARN a new choice from successes
     const sid = sessionId;
     if (!sid) return;
     const pending = lastComposioSearchBySession.get(sid);
@@ -326,6 +332,19 @@ async function runComposioExecute(
     maybeAutoRememberComposioChoice(toolSlug, args, result, sid);
     // Only count/advise on SUCCESS — a failed call isn't "an item processed".
     if (!detectComposioFailure(result).failed) {
+      // P1-D — a schema/describe execute is DISCOVERY, not per-item work. Route
+      // it to the discovery advisory (which counts repeated describes of one
+      // toolkit) and skip the fan-out advisory so the two never double-fire on
+      // the same call. All other executes keep the fan-out advisory unchanged.
+      if (isDescribeSlug(toolSlug)) {
+        const advisory = maybeDiscoveryAdvisory({
+          kind: 'describe',
+          toolkit: toolkitOfSlug(toolSlug),
+          signature: describeSignature(toolSlug, args),
+          sessionId: sid,
+        });
+        return advisory ? output + advisory : output;
+      }
       const advisory = maybeFanoutAdvisory(toolSlug, args, sid, output);
       if (advisory) return output + advisory;
     }
@@ -518,7 +537,7 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
     }),
     execute: async ({ toolkit_slug, limit }, context, details) => {
       const tools = await listComposioToolkitTools(toolkit_slug, limit ?? 80);
-      return formatComposioToolOutput({
+      const output = formatComposioToolOutput({
         toolkit: toolkit_slug,
         count: tools.length,
         tools: tools.map((item) => ({
@@ -528,6 +547,14 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
           inputParameters: item.inputParameters,
         })),
       }, { context, details, toolName: 'composio_list_tools' });
+      // P1-D — a list counts toward the toolkit's discovery FIND lane.
+      const advisory = maybeDiscoveryAdvisory({
+        kind: 'list',
+        toolkit: toolkit_slug,
+        signature: `list ${toolkit_slug}`,
+        sessionId: sessionIdFromRunContext(context),
+      });
+      return advisory ? output + advisory : output;
     },
   });
 
@@ -627,7 +654,7 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
         query,
         matches.filter((m) => m.slug && m.slug !== '__toolkit_error__').map((m) => m.slug),
       );
-      return formatComposioToolOutput({
+      const output = formatComposioToolOutput({
         configured: true,
         connectedToolkits: allConnections.map((connection) => ({
           toolkit: connection.slug,
@@ -645,6 +672,15 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
         matches: matches.slice(0, maxResults),
         nextStep: 'Pick the best match, then call `composio_execute_tool` with `tool_slug` set to the exact slug from this result and `arguments` as a JSON object string built from the action\'s `inputParameters` schema.',
       }, { context, details, toolName: 'composio_search_tools' });
+      // P1-D — catch the search-loop: repeated overlapping searches of one
+      // toolkit (the 2026-06-04 Google Sheets ×4 thrash) get nudged to commit.
+      const advisory = maybeDiscoveryAdvisory({
+        kind: 'search',
+        toolkit: toolkit_slug ?? matches.find((m) => m.slug !== '__toolkit_error__')?.toolkit ?? '*',
+        signature: query,
+        sessionId: sessionIdFromRunContext(context),
+      });
+      return advisory ? output + advisory : output;
     },
   });
 

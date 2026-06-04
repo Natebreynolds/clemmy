@@ -47,6 +47,9 @@ export interface ConsolidatedFact {
   // v8 — pinned standing instruction: always injected into the prompt,
   // exempt from the top-N cap and recency decay.
   pinned?: boolean;
+  // v9 — friendly app name when derived from a system of record
+  // (Salesforce/Outlook/Airtable/…). NULL otherwise.
+  sourceApp?: string | null;
 }
 
 export const FACT_KINDS: ConsolidatedFactKind[] = ['user', 'project', 'feedback', 'reference'];
@@ -89,6 +92,7 @@ function rowToFact(row: ConsolidatedFactRow): ConsolidatedFact {
       ? safeParseFactIds(row.derived_from_fact_ids)
       : null,
     pinned: row.pinned === 1,
+    sourceApp: row.source_app ?? null,
   };
 }
 
@@ -127,6 +131,9 @@ export interface RememberInput {
   // higher-order patterns; derivedFromFactIds carries the source ids.
   derivationDepth?: number;
   derivedFromFactIds?: number[];
+  // v9 — friendly source-app name when this fact was derived from a system
+  // of record (set by the reflection loop via classifySource).
+  sourceApp?: string;
 }
 
 /**
@@ -182,10 +189,13 @@ export function rememberFact(input: RememberInput): ConsolidatedFact {
           -- Importance MAX-merges too: a fact that was first derived
           -- as importance=4 but later restated with importance=8
           -- should reflect the higher salience.
-          importance              = MAX(COALESCE(importance, 0), ?)
+          importance              = MAX(COALESCE(importance, 0), ?),
+          -- v9: fill in source provenance if a later authoritative write
+          -- knows it and the row didn't yet (don't clobber an existing one).
+          source_app              = COALESCE(source_app, ?)
       WHERE id = ?
     `).run(now, input.sessionId ?? null, input.path ?? null,
-           dfSession, dfCall, dfTool, trust, extractedAt, importance, existing.id);
+           dfSession, dfCall, dfTool, trust, extractedAt, importance, input.sourceApp ?? null, existing.id);
     const refreshed = db.prepare('SELECT * FROM consolidated_facts WHERE id = ?')
       .get(existing.id) as ConsolidatedFactRow;
     return rowToFact(refreshed);
@@ -202,12 +212,12 @@ export function rememberFact(input: RememberInput): ConsolidatedFact {
        score, active, created_at, updated_at,
        derived_from_session_id, derived_from_call_id, derived_from_tool,
        trust_level, extracted_at, importance,
-       derivation_depth, derived_from_fact_ids)
-    VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       derivation_depth, derived_from_fact_ids, source_app)
+    VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(input.kind, content, hash, input.sessionId ?? null, input.path ?? null,
          initialScore, now, now,
          dfSession, dfCall, dfTool, trust, extractedAt, importance,
-         derivationDepth, derivedFromIdsJson);
+         derivationDepth, derivedFromIdsJson, input.sourceApp ?? null);
 
   const inserted = db.prepare('SELECT * FROM consolidated_facts WHERE id = ?')
     .get(info.lastInsertRowid) as ConsolidatedFactRow;
@@ -251,6 +261,7 @@ export function updateFact(
     trustLevel?: number;
     importance?: number;
     sessionId?: string;
+    sourceApp?: string;
   },
 ): ConsolidatedFact | null {
   const db = openMemoryDb();
@@ -278,9 +289,10 @@ export function updateFact(
         last_accessed_at = ?,
         trust_level   = ?,
         importance    = ?,
-        source_session_id = COALESCE(?, source_session_id)
+        source_session_id = COALESCE(?, source_session_id),
+        source_app    = COALESCE(?, source_app)
     WHERE id = ?
-  `).run(newContent, newHash, now, now, newTrust, newImportance, patch.sessionId ?? null, id);
+  `).run(newContent, newHash, now, now, newTrust, newImportance, patch.sessionId ?? null, patch.sourceApp ?? null, id);
   const refreshed = db.prepare('SELECT * FROM consolidated_facts WHERE id = ?')
     .get(id) as ConsolidatedFactRow;
   return rowToFact(refreshed);
@@ -780,9 +792,19 @@ export function listPinnedFacts(limit = 12): ConsolidatedFact[] {
  * Render the top-N active facts as a compact block for the assistant's
  * instructions. Empty string when no facts exist — keeps the prompt clean.
  */
-export function renderFactsForInstructions(limit = 10, maxChars = 1600, objective?: string): string {
+export function renderFactsForInstructions(
+  limit = 10,
+  maxChars = 1600,
+  objective?: string,
+  // Tiered context: 'pinned' → only the always-apply standing instructions
+  // (Tier-1); 'scored' → only the ranked by-kind facts (Tier-2); 'all'
+  // (default) → both, byte-identical to before.
+  mode: 'all' | 'pinned' | 'scored' = 'all',
+): string {
   let facts: ConsolidatedFact[] = [];
-  try {
+  if (mode === 'pinned') {
+    // pinned-only: skip the (relatively expensive) ranked retrieval entirely.
+  } else try {
     // v4: Stanford-ranked retrieval. Important + recently-accessed
     // facts surface first. Touching last_accessed_at below shifts the
     // recency anchor so a fact the agent just used stays warm in the
@@ -802,6 +824,11 @@ export function renderFactsForInstructions(limit = 10, maxChars = 1600, objectiv
   // the scored top-N, so a durable rule never silently ages out. They get
   // their own section and are removed from the scored set to avoid
   // double-rendering.
+  // ALWAYS fetch pinned ids — even in 'scored' mode — so the scored set can
+  // EXCLUDE them. A pinned fact that also ranks into the Stanford top-N would
+  // otherwise render in BOTH the Tier-1 standing block ('pinned') and the
+  // Tier-2 scored block ('scored'), double-sending the very rule the user
+  // pinned. The pinned SECTION is only RENDERED when mode !== 'scored'.
   let pinned: ConsolidatedFact[] = [];
   try {
     pinned = listPinnedFacts(12);
@@ -809,26 +836,24 @@ export function renderFactsForInstructions(limit = 10, maxChars = 1600, objectiv
     pinned = [];
   }
   const pinnedIds = new Set(pinned.map((f) => f.id));
-  const scored = facts.filter((f) => !pinnedIds.has(f.id));
+  const renderPinned = mode !== 'scored';
+  const scored = mode === 'pinned' ? [] : facts.filter((f) => !pinnedIds.has(f.id));
 
-  if (pinned.length === 0 && scored.length === 0) return '';
+  if ((!renderPinned || pinned.length === 0) && scored.length === 0) return '';
 
-  // Touch last_accessed for every fact we're about to expose to the
-  // model (the act of rendering = an access in Stanford's framework).
+  // Touch last_accessed for every fact we're about to EXPOSE to the model (the
+  // act of rendering = an access in Stanford's framework). Pinned facts we
+  // fetched only to filter (mode 'scored') are NOT exposed, so don't touch them.
   // NON-CRITICAL recency bookkeeping — must NEVER break prompt assembly.
-  // Previously unguarded: a transient SQLite WAL/busy error here threw
-  // straight out of renderFactsForInstructions and could fail the whole
-  // turn. Swallow per-loop so the facts still render even if the touch
-  // can't be written this tick.
   try {
-    for (const fact of [...pinned, ...scored]) touchFactAccess(fact.id);
+    for (const fact of [...(renderPinned ? pinned : []), ...scored]) touchFactAccess(fact.id);
   } catch {
     // recency anchor will just be slightly stale — never a turn-breaker.
   }
 
   const sections: string[] = [];
 
-  if (pinned.length > 0) {
+  if (renderPinned && pinned.length > 0) {
     const lines = pinned.map((fact) => `- ${fact.content}`).join('\n');
     sections.push(`**Standing instructions (always apply)**\n${lines}`);
   }

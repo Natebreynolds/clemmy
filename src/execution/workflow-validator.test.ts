@@ -546,3 +546,95 @@ test('binding warning: no remembered choices → no binding warning (byte-identi
   const result = validateWorkflowDefinition(wf);
   assert.ok(!result.warnings.some((w) => /proven/.test(w)));
 });
+
+// ── forEach target validation (2026-06-03: silent zero-work fan-out) ──
+
+test('forEach pointing at an unknown step → error', () => {
+  const result = validateWorkflowDefinition({
+    name: 'fe-unknown',
+    description: 'Fan out over a missing step.',
+    enabled: true,
+    steps: [{ id: 'enrich', prompt: 'Enrich each item.', forEach: 'nope' }],
+  });
+  assert.ok(result.errors.some((e) => /forEach/.test(e) && /no such step/.test(e)));
+});
+
+test('forEach on a step that does not depend on the source → error', () => {
+  const result = validateWorkflowDefinition({
+    name: 'fe-nodep',
+    description: 'Fan out over a non-dependency.',
+    enabled: true,
+    steps: [
+      { id: 'pull', prompt: 'Pull the list of prospects.' },
+      { id: 'enrich', prompt: 'Enrich each item.', forEach: 'pull' },
+    ],
+  });
+  assert.ok(result.errors.some((e) => /fans out over "pull"/.test(e) && /does not depend/.test(e)));
+});
+
+test('forEach over a declared dependency → ok', () => {
+  const result = validateWorkflowDefinition({
+    name: 'fe-ok',
+    description: 'Fan out over a dependency.',
+    enabled: true,
+    steps: [
+      { id: 'pull', prompt: 'Pull the list of prospects.' },
+      { id: 'enrich', prompt: 'Enrich each item.', dependsOn: ['pull'], forEach: 'pull' },
+    ],
+  });
+  assert.ok(!result.errors.some((e) => /forEach|fans out/.test(e)));
+});
+
+// ── {{steps.X.output}} must reference a dependency ───────────────────
+
+test('steps.X.output referencing a non-dependency step → error', () => {
+  const result = validateWorkflowDefinition({
+    name: 'ref-nodep',
+    description: 'Reference a step that is not a dependency.',
+    enabled: true,
+    steps: [
+      { id: 'a', prompt: 'Produce some data.' },
+      { id: 'b', prompt: 'Use {{steps.a.output}} to do work.' },
+    ],
+  });
+  assert.ok(result.errors.some((e) => /steps\.a\.output/.test(e) && /not one of its dependencies/.test(e)));
+});
+
+test('steps.X.output referencing a declared dependency → ok', () => {
+  const result = validateWorkflowDefinition({
+    name: 'ref-dep',
+    description: 'Reference a declared dependency.',
+    enabled: true,
+    steps: [
+      { id: 'a', prompt: 'Produce some data.' },
+      { id: 'b', prompt: 'Use {{steps.a.output}} to do work.', dependsOn: ['a'] },
+    ],
+  });
+  assert.ok(!result.errors.some((e) => /steps\.a\.output/.test(e)));
+});
+
+test('steps.X.output referencing a nonexistent step → error (distinct message)', () => {
+  const result = validateWorkflowDefinition({
+    name: 'ref-missing',
+    description: 'Reference a step that does not exist.',
+    enabled: true,
+    steps: [
+      { id: 'b', prompt: 'Use {{steps.ghost.output}} to do work.' },
+    ],
+  });
+  assert.ok(result.errors.some((e) => /steps\.ghost\.output/.test(e) && /no step has that id/.test(e)));
+});
+
+test('steps.X.output via transitive dependency → ok', () => {
+  const result = validateWorkflowDefinition({
+    name: 'ref-transitive',
+    description: 'Reference a transitive dependency.',
+    enabled: true,
+    steps: [
+      { id: 'a', prompt: 'Produce some data.' },
+      { id: 'b', prompt: 'Process it.', dependsOn: ['a'] },
+      { id: 'c', prompt: 'Use {{steps.a.output}} again.', dependsOn: ['b'] },
+    ],
+  });
+  assert.ok(!result.errors.some((e) => /steps\.a\.output/.test(e)));
+});

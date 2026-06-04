@@ -84,6 +84,10 @@ export interface ConsolidatedFactRow {
   // v8 — pinned standing instruction. 1 = always injected into the
   // prompt, exempt from the top-N cap and recency decay.
   pinned: number;
+  // v9 — friendly app name when the fact was derived from a system of
+  // record (Salesforce/Outlook/Airtable/…). NULL otherwise. Provenance
+  // only; the trust prior lives in trust_level.
+  source_app: string | null;
 }
 
 export type EntityType = 'person' | 'company' | 'project' | 'place' | 'thing';
@@ -107,6 +111,22 @@ export interface EpisodicPointerRow {
   tool: string | null;
   source_uri: string | null; // e.g. "outlook:thread:abc123"
   created_at: string;
+}
+
+export interface ResourcePointerRow {
+  id: number;
+  app: string;
+  kind: string;
+  ref: string;
+  name: string;
+  whats_here: string | null;
+  when_to_use: string | null;
+  parent_ref: string | null;
+  trust: number | null;
+  source: string;
+  first_seen_at: string;
+  last_seen_at: string;
+  mention_count: number;
 }
 
 export type FocusStatus = 'active' | 'paused' | 'completed' | 'abandoned';
@@ -403,6 +423,50 @@ const MIGRATIONS: { version: number; sql: string }[] = [
 
       CREATE INDEX IF NOT EXISTS idx_facts_pinned
         ON consolidated_facts(pinned, active);
+    `,
+  },
+  {
+    // v9 — Source app provenance (connectors-as-authoritative-writers).
+    // Friendly name of the app a derived fact came from (e.g. "Salesforce",
+    // "Outlook / Microsoft 365") when the fact was derived from a system of
+    // record, so the UI/audit can show WHERE a fact originated and the
+    // resolver can prefer ground truth. NULL for user-stated + generic
+    // derived facts. The trust prior lives in the existing trust_level
+    // column; this column is provenance only.
+    version: 9,
+    sql: `
+      ALTER TABLE consolidated_facts ADD COLUMN source_app TEXT;
+    `,
+  },
+  {
+    // v10 — Source-map / landscape memory. A POINTER-FIRST navigational
+    // index of WHERE the user's data lives (Drive folders, Airtable bases,
+    // CRM objects, …) and WHEN to use it — never the content itself. One row
+    // per distinct resource (UNIQUE(app, ref)); touches bump mention_count +
+    // last_seen so the map stays bounded. See docs/source-map-landscape-memory.md.
+    version: 10,
+    sql: `
+      CREATE TABLE IF NOT EXISTS resource_pointers (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        app           TEXT NOT NULL,
+        kind          TEXT NOT NULL,
+        ref           TEXT NOT NULL,
+        name          TEXT NOT NULL,
+        whats_here    TEXT,
+        when_to_use   TEXT,
+        parent_ref    TEXT,
+        trust         REAL,
+        source        TEXT NOT NULL DEFAULT 'reactive',
+        first_seen_at TEXT NOT NULL,
+        last_seen_at  TEXT NOT NULL,
+        mention_count INTEGER NOT NULL DEFAULT 1,
+        UNIQUE(app, ref)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_resource_last_seen
+        ON resource_pointers(last_seen_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_resource_app
+        ON resource_pointers(app, last_seen_at DESC);
     `,
   },
 ];

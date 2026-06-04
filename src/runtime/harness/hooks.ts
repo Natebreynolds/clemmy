@@ -1,6 +1,7 @@
 import type { Runner } from '@openai/agents';
 import { appendEvent, writeToolOutput, type EventRow } from './eventlog.js';
 import { scheduleReflection } from '../../memory/reflection.js';
+import { cliBinaryFromCommand } from '../../memory/authoritative-sources.js';
 import { autoInvalidateOnFailure } from './auto-invalidate.js';
 import { fanoutLedgerEnabled, recordWorkerResult } from './fanout-ledger.js';
 
@@ -123,6 +124,53 @@ function workerItemFromDetails(details: ToolDetails | undefined): string | null 
   } catch {
     return null;
   }
+}
+
+/**
+ * The tool name reflection should attribute a fact to. For the generic
+ * `composio_execute_tool` wrapper the real action slug (e.g.
+ * SALESFORCE_GET_RECORD) lives in the call's `tool_slug` arg, not the tool
+ * name — so attributing to the wrapper hides which system of record a fact
+ * came from. Unwrap it to the slug so provenance is specific AND the
+ * source-trust classifier can recognize a system of record. Pure; never
+ * throws; falls back to the wrapper name.
+ */
+export function effectiveReflectionTool(toolName: string | null, details: ToolDetails | undefined): string | null {
+  // Composio wrapper → its action slug (SALESFORCE_*, GOOGLEDRIVE_*).
+  if (toolName === 'composio_execute_tool') {
+    try {
+      const raw = details?.toolCall?.arguments;
+      if (typeof raw === 'string' && raw.trim()) {
+        const parsed = JSON.parse(raw) as { tool_slug?: unknown };
+        if (typeof parsed.tool_slug === 'string' && parsed.tool_slug.trim()) {
+          return parsed.tool_slug.trim();
+        }
+      }
+    } catch {
+      // fall through to the wrapper name
+    }
+    return toolName;
+  }
+  // Native-CLI wrapper → the recognized connector binary (sf, gh). The command
+  // lives in the `command` arg, not the tool name — same shape as composio. We
+  // only unwrap KNOWN connector CLIs, so ordinary shell stays attributed to
+  // run_shell_command (no provenance churn for ls/git/npm/etc.).
+  if (toolName === 'run_shell_command') {
+    try {
+      const raw = details?.toolCall?.arguments;
+      if (typeof raw === 'string' && raw.trim()) {
+        const parsed = JSON.parse(raw) as { command?: unknown };
+        if (typeof parsed.command === 'string') {
+          const binary = cliBinaryFromCommand(parsed.command);
+          if (binary) return binary;
+        }
+      }
+    } catch {
+      // fall through to the wrapper name
+    }
+    return toolName;
+  }
+  return toolName;
 }
 
 /**
@@ -296,7 +344,10 @@ export function attachEventLogHooks(
         scheduleReflection({
           sessionId,
           callId,
-          tool: tool?.name ?? null,
+          // Unwrap composio_execute_tool → its action slug so the fact's
+          // provenance is specific and the source-trust classifier can see
+          // the system of record.
+          tool: effectiveReflectionTool(tool?.name ?? null, details),
           output: resultStr,
         });
       }

@@ -6,6 +6,7 @@ import { recallHybrid } from '../memory/recall.js';
 import { embedMissingChunks, isEmbeddingsEnabled, readEmbeddingStats } from '../memory/embeddings.js';
 import { FACT_KINDS, forgetFact, getFact, listActiveFacts, listAllFacts, rememberFact, reviewStandingInstructions, searchFacts, setFactPinned } from '../memory/facts.js';
 import { consolidateFact } from '../memory/reflection.js';
+import { upsertResourcePointer, isSourceMapEnabled } from '../memory/source-map.js';
 import { getRuntimeEnv } from '../config.js';
 import { WORKING_MEMORY_FILE } from '../memory/vault.js';
 import { readText, replaceFile, resolveMemoryTarget, textResult } from './shared.js';
@@ -184,6 +185,34 @@ export function registerMemoryTools(server: McpServer): void {
         return `- #${fact.id} ${fact.kind} (${fact.score.toFixed(2)})${flag}: ${fact.content}`;
       });
       return textResult(lines.join('\n'));
+    },
+  );
+
+  server.tool(
+    'source_map_upsert',
+    'Record WHERE a resource lives in one of the user\'s connected sources — a Drive folder, an Airtable base/table, a CRM object, a mail label/folder — as a navigation POINTER, never its content. Use when you enumerate or discover the STRUCTURE of a connected source (the user asks to "map"/"index" a source, or you list its folders/bases/objects). One call per resource. Pass providerId (the real id from the source, e.g. the Drive folder id) so the pointer dedupes and stays stable; parentRef links it into a tree.',
+    {
+      app: z.string().min(1),                 // friendly app name, e.g. "Google Drive"
+      kind: z.string().min(1),                // folder | file | base | table | object | channel | label
+      name: z.string().min(1),
+      providerId: z.string().optional(),      // the source's stable id (preferred)
+      whatsHere: z.string().optional(),       // one phrase: what this holds
+      whenToUse: z.string().optional(),       // when to navigate here
+      parentRef: z.string().optional(),       // canonicalRef of the parent (tree)
+    },
+    async ({ app, kind, name, providerId, whatsHere, whenToUse, parentRef }) => {
+      // Writes are gated on the same flag as the reader (renderSourceMapForContext)
+      // — otherwise the model could write resource_pointers rows that nothing ever
+      // surfaces when the feature is off (silent, invisible accumulation).
+      if (!isSourceMapEnabled()) {
+        return textResult('source_map_upsert is disabled (CLEMMY_SOURCE_MAP is off) — not recording.');
+      }
+      try {
+        const p = upsertResourcePointer({ app, kind, name, providerId, whatsHere, whenToUse, parentRef, source: 'reactive' });
+        return textResult(`Mapped ${p.app} ${p.kind}: ${p.name}`);
+      } catch (err) {
+        return textResult(`source_map_upsert failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
     },
   );
 

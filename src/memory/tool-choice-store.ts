@@ -42,6 +42,17 @@ export interface ToolChoiceRecordChoice {
   testedAt: string;
   /** Short string describing how validation passed (e.g. "sf --version exit 0"). */
   testEvidence?: string;
+  // ── Thread 2 — outcome-driven procedural memory ──
+  // Track record of how this proven path has FARED since it was learned, so
+  // retrieval can prefer procedures that actually work and retire ones that
+  // don't. Reset when the identifier changes (a different tool earns its own
+  // record). All optional → absent on legacy/never-measured choices.
+  successCount?: number;
+  failureCount?: number;
+  approvalCount?: number;
+  rejectionCount?: number;
+  lastSuccessAt?: string;
+  lastFailureAt?: string;
 }
 
 export interface ToolChoiceRecordFallback {
@@ -133,7 +144,19 @@ function parseChoice(raw: unknown): ToolChoiceRecordChoice | null {
     invocationTemplate: typeof r.invocationTemplate === 'string' ? stripBakedConnectionId(r.invocationTemplate) : undefined,
     testedAt: typeof r.testedAt === 'string' ? r.testedAt : new Date().toISOString(),
     testEvidence: typeof r.testEvidence === 'string' ? r.testEvidence : undefined,
+    // Outcome counters — only present once measured, so legacy files round-trip
+    // byte-identically until an outcome is recorded.
+    successCount: numOrUndef(r.successCount),
+    failureCount: numOrUndef(r.failureCount),
+    approvalCount: numOrUndef(r.approvalCount),
+    rejectionCount: numOrUndef(r.rejectionCount),
+    lastSuccessAt: typeof r.lastSuccessAt === 'string' ? r.lastSuccessAt : undefined,
+    lastFailureAt: typeof r.lastFailureAt === 'string' ? r.lastFailureAt : undefined,
   };
+}
+
+function numOrUndef(v: unknown): number | undefined {
+  return typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : undefined;
 }
 
 function parseFallback(raw: unknown): ToolChoiceRecordFallback | null {
@@ -304,12 +327,25 @@ export function rememberToolChoice(input: RememberToolChoiceInput): ToolChoiceRe
   const existing = parseRecord(filePathFor(input.intent));
   const now = new Date().toISOString();
   const merged = mergeFallbacks(existing?.fallbacks ?? [], input.fallbacks ?? []);
+  // Thread 2: carry the outcome track record forward when re-remembering the
+  // SAME tool (a re-validation shouldn't wipe its history); reset when the
+  // identifier changes (a different tool earns a fresh record).
+  const prev = existing?.choice;
+  const samePath = prev && prev.kind === input.choice.kind && prev.identifier === input.choice.identifier;
   const choice: ToolChoiceRecordChoice = {
     kind: input.choice.kind,
     identifier: input.choice.identifier,
     invocationTemplate: stripBakedConnectionId(input.choice.invocationTemplate),
     testedAt: input.choice.testedAt ?? now,
     testEvidence: input.choice.testEvidence,
+    ...(samePath ? {
+      successCount: prev.successCount,
+      failureCount: prev.failureCount,
+      approvalCount: prev.approvalCount,
+      rejectionCount: prev.rejectionCount,
+      lastSuccessAt: prev.lastSuccessAt,
+      lastFailureAt: prev.lastFailureAt,
+    } : {}),
   };
   const saved = writeRecord({
     intent: input.intent,
@@ -691,7 +727,7 @@ export function boundCommandForChoice(choice: ToolChoiceRecordChoice): string {
  * perturb a recall/remember path. The CONTEXT INJECTION (behavior change)
  * is what's flag-gated, not this measurement.
  */
-type ToolChoiceAction = 'recall_hit' | 'recall_hit_fuzzy' | 'recall_miss' | 'remember' | 'invalidate' | 'auto_invalidate' | 'forget';
+type ToolChoiceAction = 'recall_hit' | 'recall_hit_fuzzy' | 'recall_miss' | 'remember' | 'invalidate' | 'auto_invalidate' | 'forget' | 'outcome_pos' | 'outcome_neg';
 function emitToolChoiceEvent(action: ToolChoiceAction, intent: string, identifier?: string): void {
   try {
     recordToolEvent({
@@ -705,6 +741,111 @@ function emitToolChoiceEvent(action: ToolChoiceAction, intent: string, identifie
   } catch {
     /* telemetry is best-effort — never break a tool-choice operation */
   }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Thread 2 — outcome-driven procedural memory
+// ─────────────────────────────────────────────────────────────────
+
+/** Behavior flag. When off, outcome recording is a no-op and retrieval is
+ *  byte-identical to the pre-outcome recency ordering. */
+export function isProceduralOutcomesEnabled(): boolean {
+  return (process.env.CLEMMY_PROCEDURAL_OUTCOMES ?? 'off').toLowerCase() === 'on';
+}
+
+export type ProceduralOutcome = 'success' | 'failure' | 'approved' | 'rejected';
+
+/** A choice whose injected confidence is at/below this is net-negative — it has
+ *  failed at least as often as it has worked — so it's dropped from injection
+ *  (still on disk + recallable; the model can retry, but we stop advertising a
+ *  broken procedure as "previously worked"). */
+export const TOOL_CHOICE_SCORE_FLOOR = 0.34;
+/** Auto-invalidate (→ rediscovery) after this many failures with no later win. */
+const AUTO_INVALIDATE_FAILURE_STREAK = 3;
+
+/**
+ * Laplace-smoothed success rate in (0,1). positives = success + approval;
+ * negatives = failure + rejection. Prior 0.5 (one phantom win + one loss) so a
+ * single observation can't peg the score to 0 or 1 — a freshly-learned choice
+ * sits at the neutral prior until evidence accrues.
+ */
+export function computeChoiceScore(choice: ToolChoiceRecordChoice | null | undefined): number {
+  if (!choice) return 0.5;
+  const pos = (choice.successCount ?? 0) + (choice.approvalCount ?? 0);
+  const neg = (choice.failureCount ?? 0) + (choice.rejectionCount ?? 0);
+  return (pos + 1) / (pos + neg + 2);
+}
+
+function applyOutcome(choice: ToolChoiceRecordChoice, outcome: ProceduralOutcome, nowIso: string): ToolChoiceRecordChoice {
+  const next = { ...choice };
+  switch (outcome) {
+    case 'success': next.successCount = (next.successCount ?? 0) + 1; next.lastSuccessAt = nowIso; break;
+    case 'failure': next.failureCount = (next.failureCount ?? 0) + 1; next.lastFailureAt = nowIso; break;
+    case 'approved': next.approvalCount = (next.approvalCount ?? 0) + 1; break;
+    case 'rejected': next.rejectionCount = (next.rejectionCount ?? 0) + 1; break;
+  }
+  return next;
+}
+
+function recordOutcomeOn(rec: ToolChoiceRecord, outcome: ProceduralOutcome): ToolChoiceRecord | null {
+  if (!rec.choice) return null;
+  const now = new Date().toISOString();
+  const nextChoice = applyOutcome(rec.choice, outcome, now);
+  const saved = writeRecord({
+    intent: rec.intent,
+    description: rec.description,
+    choice: nextChoice,
+    fallbacks: rec.fallbacks,
+    body: rec.body,
+    filePath: rec.filePath,
+  });
+  emitToolChoiceEvent(outcome === 'failure' || outcome === 'rejected' ? 'outcome_neg' : 'outcome_pos', rec.intent, nextChoice.identifier);
+
+  // Auto-invalidate a path that's failing repeatedly with no later win, so the
+  // next run rediscovers instead of re-treading a broken procedure.
+  if (outcome === 'failure') {
+    const failures = nextChoice.failureCount ?? 0;
+    const winAfterLoss = nextChoice.lastSuccessAt && nextChoice.lastFailureAt
+      ? nextChoice.lastSuccessAt > nextChoice.lastFailureAt
+      : Boolean(nextChoice.lastSuccessAt);
+    if (failures >= AUTO_INVALIDATE_FAILURE_STREAK && !winAfterLoss) {
+      return invalidateToolChoice(
+        rec.intent,
+        `auto-invalidated after ${failures} failures with no later success`,
+        { automatic: true },
+      ) ?? saved;
+    }
+  }
+  return saved;
+}
+
+/**
+ * Record an outcome for the active choice of an intent. No-op (returns null)
+ * when the flag is off, the record is missing, or the choice is inactive.
+ */
+export function updateToolChoiceOutcome(intent: string, outcome: ProceduralOutcome): ToolChoiceRecord | null {
+  if (!isProceduralOutcomesEnabled()) return null;
+  const existing = parseRecord(filePathFor(intent));
+  if (!existing || !existing.choice) return null;
+  return recordOutcomeOn(existing, outcome);
+}
+
+/**
+ * Record an outcome against every active choice whose identifier matches (e.g.
+ * a Composio slug). The composio execute path knows the slug on every call —
+ * regardless of whether a search preceded it — so this is the primary loop-
+ * closing seam. Returns the number of choice records updated.
+ */
+export function updateToolChoiceOutcomeForIdentifier(identifier: string, outcome: ProceduralOutcome): number {
+  if (!isProceduralOutcomesEnabled()) return 0;
+  if (!identifier) return 0;
+  let updated = 0;
+  for (const rec of listToolChoices()) {
+    if (rec.choice && rec.choice.identifier === identifier) {
+      if (recordOutcomeOn(rec, outcome)) updated += 1;
+    }
+  }
+  return updated;
 }
 
 /**
@@ -733,7 +874,7 @@ function contextInjectEnabled(): boolean {
 const TOOL_CHOICE_LINE_MAX = 160;
 const TOOL_CHOICE_BLOCK_MAX = 1400;
 
-export function renderToolChoicesForContext(limit = 12, maxChars = TOOL_CHOICE_BLOCK_MAX): string {
+export function renderToolChoicesForContext(limit = 12, maxChars = TOOL_CHOICE_BLOCK_MAX, objective?: string): string {
   if (!contextInjectEnabled()) return '';
   let records: ToolChoiceRecord[];
   try {
@@ -741,21 +882,75 @@ export function renderToolChoicesForContext(limit = 12, maxChars = TOOL_CHOICE_B
   } catch {
     return '';
   }
-  const active = records
-    .filter((r) => r.choice)
-    .sort((a, b) => (b.choice!.testedAt ?? '').localeCompare(a.choice!.testedAt ?? ''))
-    .slice(0, limit);
-  if (active.length === 0) return '';
-  const header = 'These tools previously worked for these intents on this machine. Prefer them directly — skip rediscovery (composio_search_tools / local_cli_list). If one fails, call tool_choice_invalidate and rediscover.';
+  let activeRecords = records.filter((r) => r.choice);
+  if (activeRecords.length === 0) return '';
+
+  // Thread 2 / P3 — outcome weighting (flag-gated; off = byte-identical below).
+  // Drop net-negative procedures from the ADVERTISED set (they remain on disk
+  // and recallable — we just stop telling the model a broken path "worked").
+  // If filtering would empty the pool, keep the unfiltered set rather than
+  // advertise nothing.
+  const outcomesOn = isProceduralOutcomesEnabled();
+  if (outcomesOn) {
+    const filtered = activeRecords.filter((r) => computeChoiceScore(r.choice) >= TOOL_CHOICE_SCORE_FLOOR);
+    if (filtered.length > 0) activeRecords = filtered;
+  }
+
+  // Default ordering: most-recently-tested first (byte-identical to before).
+  // With outcomes on, higher-confidence choices sort ahead of fresher-but-
+  // unproven ones (recency breaks near-ties).
+  const byRecency = [...activeRecords].sort((a, b) => {
+    if (outcomesOn) {
+      const sd = computeChoiceScore(b.choice) - computeChoiceScore(a.choice);
+      if (Math.abs(sd) > 0.05) return sd;
+    }
+    return (b.choice!.testedAt ?? '').localeCompare(a.choice!.testedAt ?? '');
+  });
+
+  // P1-E — when the active objective is known, promote the choices RELEVANT to
+  // it above pure recency so the model reuses the right remembered tool (e.g.
+  // SALESFORCE_QUERY_RECORDS for a Salesforce-query task) instead of
+  // re-discovering. Relevance uses the same matcher workflows use (≥2 core
+  // identity tokens), so a lone service mention can't promote an unrelated
+  // choice. The no-objective path is unchanged.
+  let ordered = byRecency;
+  const relevantIntents = new Set<string>();
+  const trimmedObjective = objective?.trim();
+  if (trimmedObjective) {
+    try {
+      const matches = matchToolChoicesForStep(trimmedObjective, {
+        choices: byRecency,
+        limit: byRecency.length,
+      });
+      for (const m of matches) relevantIntents.add(m.intent);
+      if (relevantIntents.size > 0) {
+        const relevant = byRecency.filter((r) => relevantIntents.has(r.intent));
+        const rest = byRecency.filter((r) => !relevantIntents.has(r.intent));
+        ordered = [...relevant, ...rest];
+      }
+    } catch {
+      /* relevance ranking is best-effort; fall back to recency */
+    }
+  }
+
+  const active = ordered.slice(0, limit);
+  const header = relevantIntents.size > 0
+    ? 'These tools previously worked for these intents on this machine (★ = relevant to your current task). Prefer them directly — skip rediscovery (composio_search_tools / local_cli_list). If one fails, call tool_choice_invalidate and rediscover.'
+    : 'These tools previously worked for these intents on this machine. Prefer them directly — skip rediscovery (composio_search_tools / local_cli_list). If one fails, call tool_choice_invalidate and rediscover.';
   const clip = (s: string): string => (s.length <= TOOL_CHOICE_LINE_MAX ? s : `${s.slice(0, TOOL_CHOICE_LINE_MAX - 1)}…`);
   // Accumulate lines until the block budget is hit (header counts toward it),
-  // so the most-recently-tested choices win the space.
+  // so the highest-ranked choices win the space.
   const lines: string[] = [];
   let used = header.length;
   for (const r of active) {
     const c = r.choice!;
+    const star = relevantIntents.has(r.intent) ? '★ ' : '';
     const how = c.invocationTemplate ? ` → \`${c.invocationTemplate}\`` : '';
-    const line = clip(`- ${r.intent}: ${c.kind}:${c.identifier}${how}`);
+    // With outcomes on, show the track record so the model can gauge confidence.
+    const neg = (c.failureCount ?? 0) + (c.rejectionCount ?? 0);
+    const pos = (c.successCount ?? 0) + (c.approvalCount ?? 0);
+    const track = outcomesOn && pos + neg > 0 ? ` (✓${pos}${neg ? `/✗${neg}` : ''})` : '';
+    const line = clip(`- ${star}${r.intent}: ${c.kind}:${c.identifier}${how}${track}`);
     if (used + 1 + line.length > maxChars) break;
     lines.push(line);
     used += 1 + line.length;

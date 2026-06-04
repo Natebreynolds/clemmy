@@ -1,0 +1,89 @@
+/**
+ * Run: npx tsx --test src/tools/workflow-schedule-tools.test.ts
+ *
+ * Proves workflow_schedule is no longer a back door around the author-time
+ * guards: an ENABLED workflow that fails validation (ungated send) is refused,
+ * while drafting (enabled=false) is allowed.
+ */
+import { test, beforeEach } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+
+const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-schedule-test-'));
+process.env.CLEMENTINE_HOME = TMP_HOME;
+process.env.HOME = TMP_HOME;
+
+const { registerWorkflowScheduleTools } = await import('./workflow-schedule-tools.js');
+const { readWorkflow } = await import('../memory/workflow-store.js');
+const { WORKFLOWS_DIR } = await import('../memory/vault.js');
+
+type ToolResult = { content: Array<{ type: 'text'; text: string }> };
+type ToolHandler = (args: Record<string, unknown>) => Promise<ToolResult>;
+
+const handlers = new Map<string, ToolHandler>();
+registerWorkflowScheduleTools({
+  tool(name: string, _description: string, _schema: unknown, handler: ToolHandler) {
+    handlers.set(name, handler);
+  },
+} as never);
+
+function scheduleTool(): ToolHandler {
+  const handler = handlers.get('workflow_schedule');
+  assert.ok(handler, 'workflow_schedule registered');
+  return handler;
+}
+
+function resultText(result: ToolResult): string {
+  return result.content.map((item) => item.text).join('\n');
+}
+
+beforeEach(() => {
+  rmSync(WORKFLOWS_DIR, { recursive: true, force: true });
+});
+
+test('enabled ungated-send workflow is REFUSED (not written)', async () => {
+  const result = await scheduleTool()({
+    name: 'midday-sender',
+    description: 'Compose and send the outreach emails at midday.',
+    cron: '0 12 * * *',
+    instructions: 'Compose and send the outreach emails to the prospect list.',
+    enabled: true,
+    toolCall: null,
+    timezone: null,
+  });
+  const text = resultText(result);
+  assert.ok(/NOT scheduled/.test(text), `expected refusal, got: ${text}`);
+  assert.equal(readWorkflow('midday-sender'), null, 'workflow must not be written');
+});
+
+test('same workflow saved DISABLED is allowed (drafting)', async () => {
+  const result = await scheduleTool()({
+    name: 'midday-sender-draft',
+    description: 'Compose and send the outreach emails at midday.',
+    cron: '0 12 * * *',
+    instructions: 'Compose and send the outreach emails to the prospect list.',
+    enabled: false,
+    toolCall: null,
+    timezone: null,
+  });
+  const text = resultText(result);
+  assert.ok(!/NOT scheduled/.test(text), `expected save, got: ${text}`);
+  assert.ok(readWorkflow('midday-sender-draft'), 'disabled draft must be written');
+});
+
+test('a clean research/report schedule is written and may surface gap questions', async () => {
+  const result = await scheduleTool()({
+    name: 'daily-digest',
+    description: 'Summarize overnight signups every morning.',
+    cron: '0 8 * * *',
+    instructions: 'Summarize the overnight signups and notify Nate.',
+    enabled: true,
+    toolCall: null,
+    timezone: null,
+  });
+  const text = resultText(result);
+  assert.ok(/Created workflow "daily-digest"/.test(text), `expected create, got: ${text}`);
+  assert.ok(readWorkflow('daily-digest'), 'workflow must be written');
+});

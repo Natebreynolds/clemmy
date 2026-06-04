@@ -819,6 +819,7 @@ export function renderConsoleHtml(token: string): string {
               <button class="brain-tab" data-brain-tab="meetings">Meetings</button>
               <button class="brain-tab" data-brain-tab="profile">Profile</button>
               <button class="brain-tab" data-brain-tab="evolution">Evolution</button>
+              <button class="brain-tab" data-brain-tab="datamap">Data Map</button>
             </div>
           </div>
 
@@ -1023,7 +1024,7 @@ export function renderConsoleHtml(token: string): string {
                   <button type="button" class="mem-meetings-refresh" data-mem-meetings-refresh>REFRESH</button>
                 </div>
                 <div class="mem-meetings-list" data-mem-meetings-list>
-                  <div class="mem-meetings-empty">— loading recent meetings —</div>
+                  <div class="mem-meetings-empty mem-loading"><span class="pulse"></span>Loading recent meetings…</div>
                 </div>
                 <div class="mem-meetings-detail" data-mem-meetings-detail>
                   <div class="mem-meetings-detail-empty">Pick a meeting on the left to see its summary, action items, and transcript.</div>
@@ -1171,6 +1172,25 @@ export function renderConsoleHtml(token: string): string {
               <div class="evolution-meta" data-evolution-meta>— loading —</div>
               <div class="evolution-report" data-evolution-report>
                 <div class="settings-info">— no report yet · click <strong>Run now</strong> to generate one —</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Data Map: the navigational "where your data lives" layer (source-map). -->
+          <div class="brain-tab-pane" data-brain-pane="datamap" hidden>
+            <div class="evolution-layout">
+              <div class="evolution-header">
+                <div>
+                  <h2 class="evolution-title">Data Map</h2>
+                  <p class="evolution-sub">Where your data lives — a pointer-first index Clementine builds as she navigates your connected sources (Drive, Airtable, Salesforce, Outlook…). It stores <em>locations + when to use them</em>, never content.</p>
+                </div>
+                <div class="evolution-actions">
+                  <button type="button" class="evolution-btn" data-datamap-refresh title="Reload the map">Refresh</button>
+                </div>
+              </div>
+              <div class="evolution-meta" data-datamap-meta>— loading —</div>
+              <div class="datamap-body" data-datamap-body>
+                <div class="settings-info">— loading —</div>
               </div>
             </div>
           </div>
@@ -5033,6 +5053,19 @@ body {
   font-size: 11px;
   color: var(--fg-mute);
 }
+/* Transient "loading" rows: a muted line with the house pulse dot so a
+   slow first paint reads as in-progress, not blank. Reuses the existing
+   .pulse token (no new keyframes). */
+.mem-loading {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.mem-loading .pulse {
+  width: 7px;
+  height: 7px;
+  flex: none;
+}
 .mem-meetings-section {
   position: sticky;
   top: 0;
@@ -8871,6 +8904,21 @@ body {
   background: var(--accent-fail); color: var(--bg-1);
   text-align: center; margin-left: 4px;
 }
+
+/* Data Map (source-map / landscape memory) viewer */
+/* .evolution-layout is height:100%/overflow:hidden, so the scrollable region
+   must be a flex:1 + overflow child (mirrors .evolution-report). */
+.datamap-body { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 14px; padding-right: 4px; }
+.dm-app { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+.dm-app-head { font-size: 12px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--text-1); margin-bottom: 8px; display: flex; align-items: center; gap: 6px; }
+.dm-count { font-size: 10px; font-weight: 600; background: var(--line); color: var(--text-2); border-radius: 8px; padding: 1px 7px; }
+.dm-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.dm-item { border-left: 2px solid var(--accent, #6aa9ff); padding: 4px 0 4px 10px; }
+.dm-kind { font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-2); }
+.dm-name { font-weight: 600; color: var(--text-1); }
+.dm-what { font-size: 12px; color: var(--text-1); margin-top: 2px; }
+.dm-when { font-size: 12px; color: var(--text-2); margin-top: 1px; }
+.dm-foot { font-size: 10px; color: var(--text-2); margin-top: 3px; opacity: 0.8; }
 
 /* v0.5.11 — Brain panel */
 .brain-layout {
@@ -13138,7 +13186,7 @@ const CONSOLE_JS = `
     const list = document.querySelector('[data-mem-meetings-list]');
     const meta = document.querySelector('[data-mem-meetings-meta]');
     if (!list) return;
-    list.innerHTML = '<div class="mem-meetings-empty">searching…</div>';
+    list.innerHTML = '<div class="mem-meetings-empty mem-loading"><span class="pulse"></span>Searching…</div>';
     try {
       const data = await fetchJSON('/api/console/memory/search?q=' + encodeURIComponent(q) + '&limit=25');
       const hits = (data.hits || []).filter((h) => (h.filePath || '').includes('/04-Meetings/'));
@@ -13217,7 +13265,7 @@ const CONSOLE_JS = `
   async function loadMemoryMeetingDetail(meetingId) {
     const detail = document.querySelector('[data-mem-meetings-detail]');
     if (!detail || !meetingId) return;
-    detail.innerHTML = '<div class="mem-meetings-detail-empty">Loading…</div>';
+    detail.innerHTML = '<div class="mem-meetings-detail-empty mem-loading"><span class="pulse"></span>Loading…</div>';
     try {
       const data = await fetchJSON('/api/console/meetings/recall/' + encodeURIComponent(meetingId));
       renderMemoryMeetingDetail(data);
@@ -21695,6 +21743,53 @@ const CONSOLE_JS = `
     else if (brainCurrentTab === 'meetings') refreshBrainMeetings();
     else if (brainCurrentTab === 'profile') refreshBrainProfile();
     else if (brainCurrentTab === 'evolution') refreshBrainEvolution();
+    else if (brainCurrentTab === 'datamap') refreshBrainDataMap();
+  }
+
+  // Data Map (source-map / landscape memory): render WHERE the user's data
+  // lives, grouped by source app. Read-only viewer over /api/console/memory/source-map.
+  async function refreshBrainDataMap() {
+    const body = document.querySelector('[data-datamap-body]');
+    const meta = document.querySelector('[data-datamap-meta]');
+    if (body) body.innerHTML = '<div class="settings-info">— loading —</div>';
+    try {
+      const data = await fetchJSON('/api/console/memory/source-map');
+      const pts = (data && data.pointers) || [];
+      if (meta) {
+        meta.textContent = data && data.enabled
+          ? (data.count + ' pointer' + (data.count === 1 ? '' : 's') + ' across your connected sources')
+          : 'Data-map layer is OFF (CLEMMY_SOURCE_MAP) — turn it on to let Clementine map where your data lives.';
+      }
+      if (!body) return;
+      if (!data || !data.enabled) {
+        body.innerHTML = '<div class="settings-info">This layer is currently disabled. Enable <code>CLEMMY_SOURCE_MAP</code> and Clementine will start mapping where your data lives as she works.</div>';
+        return;
+      }
+      if (!pts.length) {
+        body.innerHTML = '<div class="settings-info">No pointers yet. Clementine seeds these as she navigates your connected sources — a Drive folder, an Airtable base, a Salesforce object, an Outlook label. The map stays tiny and never goes stale: it points at the live source, not a copy.</div>';
+        return;
+      }
+      const byApp = {};
+      pts.forEach(function (p) { (byApp[p.app] = byApp[p.app] || []).push(p); });
+      let html = '';
+      Object.keys(byApp).sort().forEach(function (app) {
+        const items = byApp[app];
+        html += '<div class="dm-app"><div class="dm-app-head">' + esc(app) + ' <span class="dm-count">' + items.length + '</span></div><ul class="dm-list">';
+        items.forEach(function (p) {
+          html += '<li class="dm-item">'
+            + '<span class="dm-kind">' + esc(p.kind || '') + '</span> '
+            + '<span class="dm-name">' + esc(p.name || '') + '</span>'
+            + (p.whatsHere ? '<div class="dm-what">' + esc(p.whatsHere) + '</div>' : '')
+            + (p.whenToUse ? '<div class="dm-when">→ ' + esc(p.whenToUse) + '</div>' : '')
+            + '<div class="dm-foot">trust ' + (p.trust != null ? Number(p.trust).toFixed(2) : '–') + ' · seen ' + (p.mentionCount || 1) + '×' + (p.source ? ' · ' + esc(p.source) : '') + '</div>'
+            + '</li>';
+        });
+        html += '</ul></div>';
+      });
+      body.innerHTML = html;
+    } catch (e) {
+      if (body) body.innerHTML = '<div class="settings-info">Failed to load the data map: ' + esc(String(e)) + '</div>';
+    }
   }
 
   async function refreshBrainKnowledgeCurrentSub() {
@@ -21739,6 +21834,9 @@ const CONSOLE_JS = `
         refreshBrainCurrentTab();
       });
     });
+    // Data Map refresh button.
+    const dmRefresh = document.querySelector('[data-datamap-refresh]');
+    if (dmRefresh) dmRefresh.addEventListener('click', refreshBrainDataMap);
     // Inner Knowledge sub-tabs (Facts / Entities / Graph & Files).
     Array.from(document.querySelectorAll('[data-brain-knowledge-tab]')).forEach(function (btn) {
       btn.addEventListener('click', function () {

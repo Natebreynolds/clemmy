@@ -12,6 +12,7 @@ import { classifyTool, decideToolApproval } from '../agents/tool-taxonomy.js';
 import { beginToolEvent, recordPendingApproval, recordToolEvent } from '../agents/tool-observability.js';
 import { recordUsage, type UsageEvent } from './usage-log.js';
 import { formatRecallableToolText } from './harness/tool-output-format.js';
+import { checkpointWorkingMemory } from '../memory/working-memory.js';
 import { withToolOutputContext } from './harness/tool-output-context.js';
 import type { RuntimeContextValue, ToolActivity } from '../types.js';
 import { codexDispatcher, detectUndiciTimeout, buildTransportTimeoutError } from './codex-dispatcher.js';
@@ -51,6 +52,10 @@ interface CodexInputMessage {
 }
 
 class CodexRuntimeError extends Error {
+  /** P0-A — discriminant for the per-call wall-clock abort so the tool
+   *  loop can recognize it without string-matching and auto-recover.
+   *  Set after construction at the two wall-clock throw sites. */
+  reason?: 'wall_clock';
   constructor(
     message: string,
     readonly status?: number,
@@ -66,6 +71,102 @@ class CodexRuntimeError extends Error {
     super(message);
     this.name = 'CodexRuntimeError';
   }
+}
+
+/**
+ * P0-A — true when an error is a per-call wall-clock abort (the model
+ * backend streamed past `maxWallClockMs` and was aborted mid-stream).
+ * Checks the typed discriminant first and falls back to the message so
+ * a wrapped/re-thrown abort is still recognized. Exported for tests and
+ * for the tool loop's auto-recovery branch.
+ */
+export function isWallClockAbort(err: unknown): boolean {
+  if (err instanceof CodexRuntimeError && err.reason === 'wall_clock') return true;
+  return err instanceof Error && /exceeded the wall-clock budget/i.test(err.message);
+}
+
+/**
+ * P0-A — deterministically shrink the input sent on a wall-clock retry.
+ * A heavy synthesis turn that aborts is usually carrying large historical
+ * tool outputs; trimming them makes the retried call lighter and faster
+ * without an LLM summary (which could itself wall-clock). We only truncate
+ * the `output` string of OLD `function_call_output` items — never remove
+ * any item — so every function_call/output pairing the Codex API requires
+ * stays intact. The original prompt (index 0) and the most recent
+ * `keepRecent` items are preserved verbatim. Pure + exported for tests.
+ */
+export function trimNativeInputForRetry(
+  input: CodexInputMessage[],
+  opts?: { keepRecent?: number; perOutputCap?: number },
+): CodexInputMessage[] {
+  const keepRecent = opts?.keepRecent ?? 6;
+  const perOutputCap = opts?.perOutputCap ?? 2000;
+  if (input.length <= keepRecent + 1) return input;
+  const recentCutoff = input.length - keepRecent;
+  return input.map((item, i) => {
+    if (i === 0 || i >= recentCutoff) return item;
+    const rec = item as Record<string, unknown>;
+    if (rec?.type === 'function_call_output' && typeof rec.output === 'string' && rec.output.length > perOutputCap) {
+      const head = rec.output.slice(0, perOutputCap);
+      return {
+        ...item,
+        output: `${head}\n…[${rec.output.length - perOutputCap} chars trimmed for wall-clock retry — call recall_tool_result for the full output]`,
+      };
+    }
+    return item;
+  });
+}
+
+/** P0-A — ephemeral directive appended to the retried turn only (never to
+ *  the persisted history) telling the model to take a smaller, durable
+ *  step instead of re-attempting the all-at-once synthesis that aborted. */
+function wallClockRecoveryDirective(): CodexInputMessage {
+  return {
+    type: 'message',
+    role: 'developer',
+    content: [
+      {
+        type: 'input_text',
+        text: [
+          '[WALL-CLOCK RECOVERY] Your previous step ran too long and was aborted before it finished.',
+          'Do NOT try to produce or synthesize the entire deliverable in one step.',
+          'Take ONE concrete, smaller action now: either (a) write your intermediate findings / partial draft to a durable artifact (a file or working memory) so nothing is lost, or (b) complete just the next single sub-step.',
+          'Checkpoint as you go. A short, concrete step that persists progress is required — a large all-at-once synthesis will fail again.',
+        ].join('\n'),
+      },
+    ],
+  } as unknown as CodexInputMessage;
+}
+
+/** P0-A — wall-clock auto-recovery kill-switch (default on). */
+function wallClockRecoveryEnabled(): boolean {
+  return process.env.CLEMENTINE_WALL_CLOCK_RECOVERY !== 'off';
+}
+
+/** P0-A — number of wall-clock retries allowed per runToolLoop invocation
+ *  (default 1, clamped 0–2). 0 when recovery is disabled. */
+function wallClockRetryBudget(): number {
+  if (!wallClockRecoveryEnabled()) return 0;
+  const raw = parseInt(process.env.CLEMENTINE_WALL_CLOCK_RETRY_BUDGET || '', 10);
+  if (Number.isNaN(raw)) return 1;
+  return Math.max(0, Math.min(2, raw));
+}
+
+/** P0-A — the wall-clock RETRY is gated to non-interactive channels. On an
+ *  interactive surface the aborted turn's deltas were already forwarded to
+ *  onChunk, so a fresh retried call would re-stream a duplicate/garbled partial
+ *  to the user. Autonomous channels don't surface onChunk deltas as the
+ *  deliverable, so the retry is invisible there — and that's exactly where the
+ *  recovery is needed (the 2026-06-04 background email-audit incident).
+ *  Interactive chat just re-sends if it stalls. */
+const WALL_CLOCK_RETRY_CHANNELS = new Set(['background', 'workflow', 'execution', 'controller', 'cron', 'agent', 'autonomy']);
+function wallClockRetryAllowed(channel?: string): boolean {
+  return !!channel && WALL_CLOCK_RETRY_CHANNELS.has(channel);
+}
+
+/** P2-F — between-turn working-memory checkpoint kill-switch (default on). */
+function turnCheckpointEnabled(): boolean {
+  return process.env.CLEMENTINE_TURN_CHECKPOINT !== 'off';
 }
 
 // One actionable user-facing notification per calendar day when the
@@ -422,6 +523,55 @@ function formatCodexApiError(status: number, bodyText: string): string {
 }
 
 /**
+ * Parse a Codex/Responses `usage` object into token counts. Handles BOTH the
+ * Responses API shape (`input_tokens`/`output_tokens`, cached under
+ * `input_tokens_details.cached_tokens`) and the chat-completions shape
+ * (`prompt_tokens`/`completion_tokens`, cached under
+ * `prompt_tokens_details.cached_tokens`).
+ *
+ * BUG FIX (2026-06-04): the previous inline reader used a FLAT lookup
+ * `usage['input_tokens_details.cached_tokens']` for the nested paths, so cached
+ * + reasoning tokens were ALWAYS read as 0 — making prompt-cache hit-rate and
+ * reasoning cost invisible in the usage log (observed: 0% cache across 27M
+ * input tokens, which was a measurement artifact, not necessarily reality).
+ * Exported for tests.
+ */
+export function parseCodexUsage(usage: Record<string, unknown> | undefined): {
+  inputTokens: number;
+  cachedInputTokens?: number;
+  outputTokens: number;
+  reasoningTokens?: number;
+  totalTokens: number;
+} {
+  const flat = (key: string): number | undefined => {
+    const v = usage?.[key];
+    return typeof v === 'number' ? v : undefined;
+  };
+  const nested = (path: string): number | undefined => {
+    let cur: unknown = usage;
+    for (const part of path.split('.')) {
+      if (cur && typeof cur === 'object' && part in (cur as Record<string, unknown>)) {
+        cur = (cur as Record<string, unknown>)[part];
+      } else {
+        return undefined;
+      }
+    }
+    return typeof cur === 'number' ? cur : undefined;
+  };
+  const inputTokens = flat('input_tokens') ?? flat('prompt_tokens') ?? 0;
+  const outputTokens = flat('output_tokens') ?? flat('completion_tokens') ?? 0;
+  const totalTokens = flat('total_tokens') ?? (inputTokens + outputTokens);
+  const cachedInputTokens =
+    flat('cached_tokens')
+    ?? nested('input_tokens_details.cached_tokens')
+    ?? nested('prompt_tokens_details.cached_tokens');
+  const reasoningTokens =
+    flat('reasoning_tokens')
+    ?? nested('output_tokens_details.reasoning_tokens');
+  return { inputTokens, cachedInputTokens, outputTokens, reasoningTokens, totalTokens };
+}
+
+/**
  * Classify a usage event by sessionId/channel into a UI-friendly kind.
  * Lets the dashboard "Usage" panel group spend by source category
  * (chat vs cron vs autonomy vs workflow) without having to parse the
@@ -519,9 +669,11 @@ async function performCodexRequest(
 	  } catch (error) {
 	    if (abortController?.signal.aborted) {
 	      if (wallClockTimedOut) {
-	        throw new CodexRuntimeError(
+	        const wallClockErr = new CodexRuntimeError(
 	          `Clementine's model backend exceeded the wall-clock budget of ${request.maxWallClockMs}ms and was aborted.`,
 	        );
+	        wallClockErr.reason = 'wall_clock';
+	        throw wallClockErr;
 	      }
 	      throw new AgentRuntimeCancelledError();
 	    }
@@ -609,9 +761,11 @@ async function performCodexRequest(
 	      } catch (error) {
 	        if (abortController?.signal.aborted) {
 	          if (wallClockTimedOut) {
-	            throw new CodexRuntimeError(
+	            const wallClockErr = new CodexRuntimeError(
 	              `Clementine's model backend exceeded the wall-clock budget of ${request.maxWallClockMs}ms and was aborted mid-stream.`,
 	            );
+	            wallClockErr.reason = 'wall_clock';
+	            throw wallClockErr;
 	          }
 	          throw new AgentRuntimeCancelledError();
 	        }
@@ -680,15 +834,7 @@ async function performCodexRequest(
 	            const responseObj = (payload as { response?: Record<string, unknown> }).response;
 	            const usage = responseObj && (responseObj.usage as Record<string, unknown> | undefined);
 	            if (usage && typeof usage === 'object') {
-	              const num = (key: string): number | undefined => {
-	                const v = usage[key];
-	                return typeof v === 'number' ? v : undefined;
-	              };
-	              const inputTokens = num('input_tokens') ?? num('prompt_tokens') ?? 0;
-	              const outputTokens = num('output_tokens') ?? num('completion_tokens') ?? 0;
-	              const totalTokens = num('total_tokens') ?? (inputTokens + outputTokens);
-	              const cachedInputTokens = num('cached_tokens') ?? num('prompt_tokens_details.cached_tokens');
-	              const reasoningTokens = num('reasoning_tokens') ?? num('output_tokens_details.reasoning_tokens');
+	              const { inputTokens, outputTokens, totalTokens, cachedInputTokens, reasoningTokens } = parseCodexUsage(usage);
 	              const sessionId = request.sessionId ?? 'unknown';
 	              recordUsage({
 	                at: new Date().toISOString(),
@@ -1241,13 +1387,50 @@ export class CodexNativeRuntime implements AgentRuntime {
 	      1,
 	      parseInt(process.env.CLEMENTINE_MAX_TOOL_TURNS || '', 10) || 75,
 	    );
+	    let wallClockRetriesUsed = 0;
+	    // Gated to non-interactive channels — see wallClockRetryAllowed. 0 on
+	    // interactive surfaces so a retried turn can't re-stream a partial.
+	    const maxWallClockRetries = wallClockRetryAllowed(request.channel) ? wallClockRetryBudget() : 0;
 	    for (let turn = 0; turn < maxTurns; turn++) {
 	      await throwIfCancelled(callbacks);
-	      latestResult = await this.performWithRefresh(
-        { ...request, sessionId },
-        currentInput,
-        callbacks,
-      );
+	      // P0-A wall-clock recovery (autonomous channels only): a single
+	      // overloaded turn that streamed past the per-call wall-clock used to
+	      // abort the whole run with no retry. Re-run the SAME turn once after
+	      // trimming context + injecting a smaller-step directive. The retried
+	      // call re-sends currentInput (which never carries mid-stream text), so
+	      // the model CONTEXT never double-counts; channel-gating (above) prevents
+	      // a user-visible re-stream of onChunk deltas. A retry does NOT consume a
+	      // tool-turn.
+	      let attemptInput = currentInput;
+	      while (true) {
+	        try {
+	          latestResult = await this.performWithRefresh(
+	            { ...request, sessionId },
+	            attemptInput,
+	            callbacks,
+	          );
+	          break;
+	        } catch (err) {
+	          if (isWallClockAbort(err) && wallClockRetriesUsed < maxWallClockRetries) {
+	            wallClockRetriesUsed += 1;
+	            recordToolEvent({
+	              at: new Date().toISOString(),
+	              sessionId,
+	              toolName: '__runtime__',
+	              kind: 'execute',
+	              phase: 'error',
+	              outcome: 'error',
+	              errorMessage: `wall_clock_recovery: turn ${turn + 1} aborted at the per-call wall-clock; retry ${wallClockRetriesUsed}/${maxWallClockRetries} with trimmed context + smaller-step directive`,
+	            });
+	            try {
+	              await callbacks?.onChunk?.('\n_(That step ran long — restarting it with a smaller plan…)_\n');
+	            } catch { /* onChunk best-effort */ }
+	            attemptInput = [...trimNativeInputForRetry(currentInput), wallClockRecoveryDirective()];
+	            continue;
+	          }
+	          throw err;
+	        }
+	      }
 
       if (latestResult.toolCalls.length === 0) {
         const finalText = latestResult.text || ASSISTANT_PAUSED_PLACEHOLDER;
@@ -1300,6 +1483,18 @@ export class CodexNativeRuntime implements AgentRuntime {
       }
 
       currentInput = nextInput;
+
+      // P2-F — persist a compact in-flight checkpoint between turns (throttled,
+      // best-effort) so a later wall-clock abort or watchdog re-spawn resumes
+      // from progress rather than zero. refreshWorkingMemory only fires at the
+      // end of respond(), which a mid-loop abort never reaches.
+      if (turnCheckpointEnabled() && turn % 3 === 0) {
+        checkpointWorkingMemory(sessionId, {
+          turn: turn + 1,
+          toolCallsTotal,
+          lastText: latestResult?.text,
+        });
+      }
     }
 
     // Hit the tool-turn cap. Instead of returning a static "ran out of

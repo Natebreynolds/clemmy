@@ -186,16 +186,26 @@ function checkApprovalCoherence(
 function checkStepOutputReferences(
   stepId: string,
   prompt: string,
-  upstreamIds: Set<string>,
+  dependencyIds: Set<string>,
+  allIds: Set<string>,
 ): string[] {
   const errors: string[] = [];
   const stepRefPattern = /\{\{\s*steps\.([a-zA-Z0-9_-]+)\.output\s*\}\}/g;
   let match;
   while ((match = stepRefPattern.exec(prompt)) !== null) {
     const referenced = match[1];
-    if (!upstreamIds.has(referenced)) {
+    if (dependencyIds.has(referenced)) continue;
+    if (allIds.has(referenced)) {
+      // The step exists but isn't an upstream DEPENDENCY of this one. Data only
+      // flows from declared dependencies, so unless the runner happens to finish
+      // it first, the token renders empty — a silent, ordering-dependent bug.
       errors.push(
-        `Step "${stepId}" references {{steps.${referenced}.output}} but no upstream step has that id. `
+        `Step "${stepId}" references {{steps.${referenced}.output}} but "${referenced}" is not one of its dependencies. `
+        + `Add "${referenced}" to this step's dependsOn so its output is available; otherwise the reference renders empty whenever "${referenced}" hasn't finished first.`,
+      );
+    } else {
+      errors.push(
+        `Step "${stepId}" references {{steps.${referenced}.output}} but no step has that id. `
         + 'The reference will render as an empty string and the agent will silently get nothing.',
       );
     }
@@ -466,6 +476,30 @@ export function validateWorkflowDefinition(
   const hasCycles = detectCycles(steps);
   if (hasCycles) errors.push('Dependency graph has a cycle.');
 
+  // Transitive dependency resolution. Data only flows into a step from its
+  // declared dependencies (dependsOn), so {{steps.X.output}} and forEach: X are
+  // only safe when X is an upstream dependency. Precompute each step's
+  // transitive dep set (cycle-guarded) for those checks.
+  const directDeps = new Map<string, string[]>();
+  for (const step of steps) {
+    if (step.id) directDeps.set(step.id, (step.dependsOn ?? []).filter((d) => ids.has(d)));
+  }
+  const transitiveDepsCache = new Map<string, Set<string>>();
+  const transitiveDeps = (stepId: string): Set<string> => {
+    const cached = transitiveDepsCache.get(stepId);
+    if (cached) return cached;
+    const out = new Set<string>();
+    const stack = [...(directDeps.get(stepId) ?? [])];
+    while (stack.length > 0) {
+      const d = stack.pop() as string;
+      if (out.has(d)) continue;
+      out.add(d);
+      for (const dd of directDeps.get(d) ?? []) stack.push(dd);
+    }
+    transitiveDepsCache.set(stepId, out);
+    return out;
+  };
+
   if (data.trigger?.schedule && !validateCronExpression(data.trigger.schedule)) {
     errors.push(`Invalid cron expression: "${data.trigger.schedule}"`);
   }
@@ -488,6 +522,25 @@ export function validateWorkflowDefinition(
       warnings.push(
         `Step "${step.id}" uses deprecated orderingOnlyDeps. dependsOn now carries upstream outputs automatically; remove orderingOnlyDeps when you next edit this workflow.`,
       );
+    }
+
+    // forEach must fan out over an upstream DEPENDENCY's list. If it points at a
+    // missing step, itself, or a step it doesn't depend on, the runner reads no
+    // items and SILENTLY skips the step (reason: forEach-empty) — a fan-out that
+    // looks authored but does zero work. Catch it at author time.
+    if (typeof step.forEach === 'string' && step.forEach.trim().length > 0) {
+      const src = step.forEach.trim();
+      if (!ids.has(src)) {
+        errors.push(
+          `Step "${step.id}" has forEach: "${src}" but no such step exists — the fan-out would iterate over nothing and the step is silently skipped at run time.`,
+        );
+      } else if (src === step.id) {
+        errors.push(`Step "${step.id}" has forEach pointing at itself.`);
+      } else if (!transitiveDeps(step.id).has(src)) {
+        errors.push(
+          `Step "${step.id}" fans out over "${src}" but does not depend on it — add "${src}" to this step's dependsOn so its list is produced first; otherwise the runner finds no items and skips the step.`,
+        );
+      }
     }
 
     // Template-token sanity (typed-workflow-contract P1, report-only):
@@ -517,13 +570,12 @@ export function validateWorkflowDefinition(
     for (const issue of approval.errors) errors.push(issue);
     for (const issue of approval.warnings) warnings.push(issue);
 
-    // Step output references → errors (unresolved refs render empty silently)
-    // Reference set: every other step's id (upstream relative to this one
-    // is approximate — we accept any sibling ref; cycle detector above
-    // catches the bad-direction case separately).
-    const refIds = new Set(ids);
-    refIds.delete(step.id);
-    for (const issue of checkStepOutputReferences(step.id, step.prompt, refIds)) {
+    // Step output references → errors. Data flows only from declared
+    // dependencies, so a {{steps.X.output}} where X isn't an upstream
+    // dependency renders empty at run time (ordering-dependent). Restrict the
+    // valid reference set to this step's transitive dependencies; the checker
+    // distinguishes "no such step" from "exists but not a dependency".
+    for (const issue of checkStepOutputReferences(step.id, step.prompt, transitiveDeps(step.id), ids)) {
       errors.push(issue);
     }
 

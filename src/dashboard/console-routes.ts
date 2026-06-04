@@ -24,6 +24,7 @@ import { getGitHubCliStatus } from '../integrations/github-cli.js';
 import { recallHybrid, getRecallStats } from '../memory/recall.js';
 import { bufferToVector, readEmbeddingStats } from '../memory/embeddings.js';
 import { FACT_KINDS, forgetFact, getFact, listActiveFacts, listAllFacts, rememberFact, searchFacts, setFactPinned, updateFact } from '../memory/facts.js';
+import { listResourcePointers, countResourcePointers, isSourceMapEnabled } from '../memory/source-map.js';
 import { openMemoryDb } from '../memory/db.js';
 import {
   getFocusSnapshot,
@@ -1099,6 +1100,24 @@ export function registerConsoleRoutes(
     }
   });
 
+  // Data Map (source-map / landscape memory): the navigational layer —
+  // WHERE the user's data lives. Read-only viewer feed for the Brain → Data Map
+  // tab. `enabled` reflects CLEMMY_SOURCE_MAP so the panel can explain an empty
+  // state ("layer is off" vs "nothing mapped yet").
+  app.get('/api/console/memory/source-map', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const limit = Math.max(1, Math.min(500, parseInt(typeof req.query.limit === 'string' ? req.query.limit : '300', 10) || 300));
+    try {
+      res.json({
+        enabled: isSourceMapEnabled(),
+        count: countResourcePointers(),
+        pointers: listResourcePointers({ limit }),
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   /**
    * Force MEMORY.md auto-regeneration on demand (mostly: a "regenerate
    * now" button in the Memory panel header). The maintenance tick
@@ -2008,6 +2027,16 @@ export function registerConsoleRoutes(
       inputs: inputs && Object.keys(inputs).length > 0 ? inputs : undefined,
       synthesis,
     };
+    // Same author-time guard as workflow_create: an ENABLED workflow whose data
+    // can't flow (dangling deps, broken forEach, ungated send, undeclared input)
+    // is refused so the dashboard isn't a back door around validation. Save
+    // disabled to draft.
+    if (def.enabled) {
+      const check = checkWorkflowForWrite(def);
+      if (!check.ok) {
+        res.status(400).json({ error: 'workflow failed validation', errors: check.errors }); return;
+      }
+    }
     writeWorkflow(slug, def);
     res.json({ created: true, name, file: `${slug}/SKILL.md` });
   });
@@ -2034,6 +2063,16 @@ export function registerConsoleRoutes(
       next.trigger = s ? { schedule: s, manual: true } : { manual: true };
     } else if (body.clearTriggerSchedule === true) {
       next.trigger = { manual: true };
+    }
+
+    // PATCH can change steps AND flip enabled→true, so re-validate before an
+    // enabled workflow is persisted (the set-enabled route already does; this
+    // closes the parallel hole where PATCH enables without re-validation).
+    if (next.enabled) {
+      const check = checkWorkflowForWrite(next);
+      if (!check.ok) {
+        res.status(400).json({ error: 'workflow failed validation', errors: check.errors }); return;
+      }
     }
 
     writeWorkflow(entry.name, next);

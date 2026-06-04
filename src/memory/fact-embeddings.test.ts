@@ -218,6 +218,71 @@ test('consolidateActiveFacts is a no-op without embeddings (sim=null path)', asy
   }
 });
 
+test('ground-truth-wins: an authoritative candidate supersedes a stale low-trust fact (no resolver)', async () => {
+  // Stale, low-trust inference about the same topic (cosine ~1.0 vs the
+  // authoritative candidate). trust 0.6 = generic derived.
+  const stale = rememberFact({
+    kind: 'project',
+    content: 'Standing planning session is loosely sometime midweek.',
+    derivedFrom: { sessionId: 's1', tool: 'firecrawl' }, // → trust 0.6
+  });
+  await embedMissingFacts({ maxChunks: 50 });
+
+  // Authoritative system-of-record candidate (trust 0.9) that conflicts.
+  const outcome = await consolidateFact(
+    {
+      kind: 'project',
+      text: 'Recurring planning meeting is locked to Monday 9am each week.',
+      trustLevel: 0.9,
+      sourceApp: 'Google Calendar',
+    },
+    { sessionId: 's2' },
+  );
+
+  assert.equal(outcome.updated, 1, 'authoritative candidate UPDATEs the stale fact');
+  assert.equal(outcome.written, 0, 'no new duplicate row');
+  const after = getFact(stale.id);
+  assert.match(after?.content ?? '', /Monday 9am/, 'stale content superseded by ground truth');
+  assert.equal(after?.trustLevel, 0.9, 'trust lifted to authoritative');
+  assert.equal(after?.sourceApp, 'Google Calendar', 'source app recorded on supersede');
+});
+
+test('ground-truth-wins does NOT fire for a user restatement (no sourceApp) — distinct derived fact is preserved', async () => {
+  // Regression lock: the deterministic ground-truth overwrite must be gated
+  // on the system-of-record marker (candidate.sourceApp), NOT merely on
+  // trust ≥ 0.85. The default-on auto-capture path passes user statements at
+  // trust 1.0 (which clears 0.85) but never sets sourceApp. Without the gate,
+  // a user restatement ≥0.8 cosine-similar to a DERIVED fact would silently
+  // overwrite it in place; with the gate it falls through to the LLM resolver
+  // (stubbed-absent here → conservative ADD), so the distinct derived fact
+  // survives. Same-topic vectors → cosine ~1.0 (well past the 0.8 bar that
+  // the old, ungated code would have tripped).
+  const derived = rememberFact({
+    kind: 'project',
+    content: 'Standing planning session is loosely sometime midweek.',
+    derivedFrom: { sessionId: 's1', tool: 'firecrawl' }, // → trust 0.6
+  });
+  await embedMissingFacts({ maxChunks: 50 });
+
+  // User restatement: trust 1.0, NO sourceApp. Same topic → high cosine.
+  const outcome = await consolidateFact(
+    {
+      kind: 'project',
+      text: 'Recurring planning meeting happens weekly.',
+      trustLevel: 1.0,
+      // sourceApp intentionally omitted — this is a user statement, not a
+      // system of record.
+    },
+    { sessionId: 's2' },
+  );
+
+  assert.equal(outcome.updated, 0, 'no deterministic ground-truth overwrite for a user restatement');
+  const after = getFact(derived.id);
+  assert.equal(after?.active, true, 'the derived fact is not deleted');
+  assert.match(after?.content ?? '', /midweek/, 'derived content is preserved (not clobbered in place)');
+  assert.ok(after?.sourceApp == null, 'no spurious sourceApp written onto the derived fact');
+});
+
 test('consolidateFact novelty fast-path ADDs a clearly-novel candidate without the resolver', async () => {
   // Existing pool is all "meeting" topic; the candidate is "secret" topic →
   // cosine ≈ 0.05, well below the 0.6 bar → fast-path ADD (no resolver call,

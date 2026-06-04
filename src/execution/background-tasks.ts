@@ -11,8 +11,7 @@ import path from 'node:path';
 import pino from 'pino';
 import { BASE_DIR, MODELS } from '../config.js';
 import { addNotification } from '../runtime/notifications.js';
-import { SessionStore } from '../memory/session-store.js';
-import { HarnessSession } from '../runtime/harness/session.js';
+import { deliverOutcome } from '../runtime/outcome.js';
 import { ExecutionStore } from './store.js';
 import type { RunStoppedReason } from '../types.js';
 import type { ClementineAssistant } from '../assistant/core.js';
@@ -105,6 +104,14 @@ export interface CreateBackgroundTaskInput {
 const BACKGROUND_TASK_DIR = path.join(BASE_DIR, 'state', 'background-tasks');
 const RESULT_TRUNCATE_CHARS = 4000;
 const PROGRESS_CHECKIN_TOOL_INTERVAL = 5;
+
+// P0-B — per-call wall-clock for a background worker turn. Without this the
+// worker inherits the 120s chat default and a legitimate >2-min synthesis turn
+// is guillotined (the 2026-06-04 email-audit abort). Env-tunable, floored 60s.
+const BACKGROUND_STEP_WALL_CLOCK_MS = (() => {
+  const raw = parseInt(process.env.CLEMENTINE_BACKGROUND_STEP_WALL_MS || '', 10);
+  return Number.isNaN(raw) ? 10 * 60_000 : Math.max(60_000, raw);
+})();
 const DAEMON_RESTART_INTERRUPT_REASON = 'Daemon restarted while task was running.';
 let backgroundProcessorInFlight = false;
 
@@ -341,46 +348,20 @@ function enqueueBackgroundTaskOutcomeTurn(
   outcome: BackgroundTaskOutcome,
   detail: string,
 ): void {
-  try {
-    const sessionId = task.originSessionId;
-    if (!sessionId) return;
-    // State-agnostic id prefix: a task reaches exactly ONE terminal state, so
-    // scanning for the id alone makes the report-back idempotent across retries
-    // AND prevents a done+failed double-report for the same id.
-    const idPrefix = `[background task ${task.id} `;
-    const store = new SessionStore();
-    const existing = store.get(sessionId);
-    if (existing.turns.some((t) => typeof t.text === 'string' && t.text.startsWith(idPrefix))) {
-      return; // already reported — idempotent
-    }
-    const head =
-      outcome === 'done' ? `${idPrefix}completed]`
-        : outcome === 'failed' ? `${idPrefix}FAILED]`
-          : `${idPrefix}BLOCKED]`;
-    const guidance =
-      outcome === 'done'
-        ? `This work ran in the background and just finished — continue from here. For the complete result call background_task_status('${task.id}').`
-        : outcome === 'failed'
-          ? `This background task FAILED — it did NOT complete. Decide whether to retry with an adjusted approach or tell the user; do not assume it succeeded. Details via background_task_status('${task.id}').`
-          : `This background task is BLOCKED — it could not finish without a prerequisite. Surface the blocker to the user or resolve it, then re-run. Details via background_task_status('${task.id}').`;
-    const preview =
-      detail.length > RESULT_TRUNCATE_CHARS ? `${detail.slice(0, RESULT_TRUNCATE_CHARS)}\n…[truncated]` : detail;
-    const text = `${head} ${task.title}\n\n${preview}\n\n(${guidance})`;
-    store.appendTurn(sessionId, { role: 'user', text, createdAt: nowIso() });
-    // ALSO stage into the harness conversation snapshot so the desktop/Discord
-    // orchestrator (which replays the harness snapshot, not this PWA SessionStore)
-    // sees the outcome on its next turn. Best-effort + idempotent.
-    try {
-      const hs = HarnessSession.load(sessionId);
-      if (hs) hs.injectSyntheticUserTurn(idPrefix, text);
-    } catch { /* best-effort: harness-store write must never affect task state */ }
-    logger.info({ taskId: task.id, sessionId, outcome }, 'Background task outcome enqueued into origin session');
-  } catch (err) {
-    logger.warn(
-      { err: err instanceof Error ? err.message : err, taskId: task.id },
-      'enqueueBackgroundTaskOutcomeTurn failed (best-effort; task state not blocked)',
-    );
-  }
+  // Unified report-back (Move 4): one mechanism for every lane. Preserves the
+  // `[background task <id> …]` prefix (idempotency + UI detect); the body is the
+  // shared Outcome card. See src/runtime/outcome.ts.
+  deliverOutcome(
+    { status: outcome, detail },
+    {
+      originSessionId: task.originSessionId,
+      sourceLabel: 'background task',
+      sourceId: task.id,
+      title: task.title,
+      statusHint: `background_task_status('${task.id}')`,
+      maxDetailChars: RESULT_TRUNCATE_CHARS,
+    },
+  );
 }
 
 export function markBackgroundTaskDone(id: string, result: string): BackgroundTaskRecord | null {
@@ -534,6 +515,12 @@ const BLOCKED_TEXT_PATTERNS: RegExp[] = [
   /\bwaiting (on|for) (your|user|the user)\b/i,
   /\bblocked (on|by)\b/i,
   /\bmissing (data|access|credentials|the required)\b/i,
+  // P0-C — runtime-error stubs that `respond()` produces when the model
+  // backend throws (e.g. a wall-clock abort that survived the in-loop retries,
+  // a 5xx burst, a transport timeout). These are NOT completed deliverables.
+  /\bhit a runtime error\b/i,
+  /\bwall-clock budget\b/i,
+  /\bcould ?n['’]?t (finish|complete|proceed|continue)\b/i,
 ];
 
 export function classifyBackgroundTaskOutcome(
@@ -560,6 +547,19 @@ export function classifyBackgroundTaskOutcome(
   //    branch normally handles this first).
   if (stoppedReason === 'pending-approval') {
     return { outcome: 'blocked', reason: 'Stopped awaiting an approval that was not surfaced.' };
+  }
+
+  // 2.5) P0-C — the runtime threw mid-turn and `respond()` converted it to a
+  //      typed error result (a wall-clock abort that survived the P0-A in-loop
+  //      retries, a 5xx burst, a transport timeout). That is NOT a finished
+  //      deliverable; surface it as a non-completion so report-back is honest
+  //      and the watchdog re-spawn isn't the only backstop.
+  if (stoppedReason === 'error') {
+    const text = (finalText || '').trim();
+    return {
+      outcome: 'blocked',
+      reason: (text || 'The run hit a runtime error before finishing.').slice(0, 400),
+    };
   }
 
   // 3) Text heuristic: the agent's own final words say it's blocked.
@@ -899,6 +899,13 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	        channel: task.channel ?? 'background',
 	        userId: task.userId,
 	        model: task.model ?? MODELS.deep,
+	        // P0-B — give a heavy worker turn real headroom, but never more than
+	        // half the task's soft cap so one overlong call aborts-and-recovers
+	        // (P0-A) well before the whole-task deadline cancels everything.
+	        maxWallClockMs: Math.min(
+	          BACKGROUND_STEP_WALL_CLOCK_MS,
+	          Math.floor((task.maxMinutes * 60_000) / 2),
+	        ),
 	        message: buildWorkerPrompt(task),
 	        runId: run.id,
 	        shouldCancel: () => {
@@ -971,6 +978,29 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
         logger.warn({ taskId: task.id, reason: coverageBlock.reason }, 'Background task partial fan-out coverage (blocked, not done)');
         continue;
       }
+
+      // P0-C — the main drain previously marked done after only the pending-
+      // approval + fan-out checks, so a wall-clock abort (which respond()
+      // converts to a typed error RESULT, not a throw, so it never reaches the
+      // catch below) slipped through as a hollow "done". Run the full outcome
+      // classifier — it also adds the blocked-execution + blocked-text signals
+      // the main drain otherwise lacked.
+      const outcome = classifyBackgroundTaskOutcome(task, response.text, response.stoppedReason);
+      if (outcome.outcome === 'blocked') {
+        markBackgroundTaskBlocked(task.id, outcome.reason ?? 'Run did not finish cleanly.', response.text);
+        finishRun(run.id, {
+          status: 'failed',
+          message: `Background task ${task.id} did not complete: ${outcome.reason ?? 'run did not finish cleanly'}`,
+          outputPreview: response.text,
+        });
+        clearLedger(task.runSessionId);
+        logger.warn(
+          { taskId: task.id, reason: outcome.reason, stoppedReason: response.stoppedReason },
+          'Background task did not complete cleanly (blocked, not done)',
+        );
+        continue;
+      }
+
       markBackgroundTaskDone(task.id, response.text);
       finishRun(run.id, {
         status: 'completed',

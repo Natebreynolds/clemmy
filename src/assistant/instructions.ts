@@ -4,9 +4,11 @@ import { ASSISTANT_NAME, BASE_DIR, OWNER_NAME, getRuntimeEnv } from '../config.j
 import type { MemoryContext } from '../types.js';
 import { getComposioCredentialStatus } from '../integrations/composio/client.js';
 import { renderFactsForInstructions } from '../memory/facts.js';
+import { renderSourceMapForContext } from '../memory/source-map.js';
 import { getRecallObjective } from '../memory/focus.js';
 import { renderProfileForInstructions } from '../runtime/user-profile.js';
 import { getProposalFeedback, renderProposalFeedback } from '../agents/proposal-feedback.js';
+import { renderLearnedBlocks } from '../agents/harness-context.js';
 import { renderMcpServersForInstructions } from '../runtime/mcp-config.js';
 import { readConnectedClis } from '../integrations/cli-catalog/catalog.js';
 import type { MessageIntent } from './message-intent.js';
@@ -209,72 +211,126 @@ export function renderActionDisciplineDirective(intent?: MessageIntent, message 
   ].join('\n');
 }
 
+/**
+ * Tiered context (north-star: lean, cacheable prompt). When ON, the STABLE
+ * Constitution (voice + reasoning rules + SOUL + identity + profile) stays in
+ * the cached `instructions` prefix, and the DYNAMIC per-turn blocks (facts,
+ * tool-choices, working-memory, …) move to the per-turn input tail via
+ * buildTurnContextBlock — so the prefix caches and the model isn't waded
+ * through ~8K of re-sent, mostly-irrelevant context every turn. Default OFF →
+ * byte-identical legacy prompt until validated. CLEMMY_TIERED_CONTEXT=on enables.
+ */
+export function tieredContextEnabled(): boolean {
+  // getRuntimeEnv (not process.env) so the documented ~/.clementine-next/.env
+  // path flips it too, matching the sibling scopeGateEnabled flag in this file.
+  return (getRuntimeEnv('CLEMMY_TIERED_CONTEXT', 'off') ?? 'off').toLowerCase() === 'on';
+}
+
 export function buildAssistantInstructions(context: MemoryContext, channel?: string, intent?: MessageIntent, message?: string): string {
   const owner = OWNER_NAME || 'the user';
-  const goalsContext = buildGoalsContext();
-  const integrationsContext = buildIntegrationsContext();
-  // Scoped recall: scope persistent facts to the CURRENT MESSAGE blended
-  // with the active focus, so a per-turn query surfaces query-relevant
-  // facts (e.g. "pull MY market-leader accounts" surfaces the
-  // "accounts owned by Nathan Reynolds" fact and the owner filter sticks).
-  // No message+focus / flag off → undefined → unchanged global top-12.
-  const persistentFacts = renderFactsForInstructions(12, 1600, getRecallObjective(message));
-  const userPreferences = renderProfileForInstructions();
   const channelDirective = renderChannelDirective(channel);
   const actionDirective = renderActionDisciplineDirective(intent, message);
-  const proposalFeedback = renderProposalFeedback(getProposalFeedback({ windowDays: 30 }));
+  const userPreferences = section('User Preferences', renderProfileForInstructions());
+  const proposalFeedback = section('Proposal Feedback', renderProposalFeedback(getProposalFeedback({ windowDays: 30 })));
+  const identity = section('Identity', context.identity);
+  const soul = section('Core Personality', context.soul);
+  const longTermMemory = section('Long-Term Memory', context.memory);
+  const connectedTools = section('Connected Tools', buildIntegrationsContext());
 
+  // ── Tier-1: stable Constitution — voice + reasoning rules + SOUL/identity/
+  //    profile. Stable across turns → caches. Always present every turn. ──
+  const identityVoice = `You are ${ASSISTANT_NAME}, a persistent executive assistant for ${owner}. Concise by default; deeper only when the task is complex or the user asks. Speak like a sharp operator — no filler, no preamble, no warmups. Aligned with user intent; reduce friction.`;
+  const contextDiscipline = 'Treat the memory and continuity blocks below as private context, not content to recite. Greetings and lightweight check-ins get a one- or two-line reply, no recap. Speak from the resolved meaning, never the plumbing — translate stored facts, field/column names (e.g. `Market_Leader__c`), and internal labels ("current focus", "boundary", "scope filter") into plain business language ("accounts that aren\'t market leaders yet"), and never narrate your own process or safety steps ("confirming before I write", "for approval, not send"). Field names and slugs belong only inside a concrete data-operation you are describing, never in conversation.';
+  const toolBehavior = 'Tools have real schemas. Just call them when the work fits. The runtime classifies each call (read/write/execute/send/admin) and applies the trust gradient automatically — do not pre-ask "want me to proceed?" for reads or for actions inside the user\'s current scope policy. If a call fails, report the real error and propose a fix.';
+  const clarify = 'Ask ONE clarifying question only when two interpretations lead to materially different work AND guessing wrong means redoing it. Otherwise pick the obvious option, mention it, and proceed. Never re-ask a clarification the user already answered ("yes", "go ahead", "default is fine") — act on the answer.';
+  const capture = 'Persist durable signals as they appear: `memory_remember` for facts/preferences that should carry across sessions; `user_profile_update` for how-to-communicate preferences (tone, timezone, hours, addressing); `propose_check_in_template` for recurring rhythms the user describes ("every Friday I deploy"). Don\'t announce these writes; behave better next turn.';
+  const handoffs = [
+    'You orchestrate sub-agents. Hand off when the work fits a specialist:',
+    '- Researcher: gather information, read-only.',
+    '- Writer: polished artifacts (docs, drafts, reports).',
+    '- Reviewer: read-only audit before risky writes AND after multi-step mutations.',
+    '- Executor: concrete mutations. Gated on active tracked execution.',
+    '- Deployer: release / CI / shipping. Same execution gate.',
+    'Stay in chat for direct answers, quick lookups, and one-or-two-call work you can finish yourself.',
+  ].join('\n');
+  const planner = 'Keep clarify / plan / act conversational inside the main loop. Use `draft_plan` only for explicit planning requests, genuinely large/irreversible work, complex local/multi-artifact work where the user benefits from seeing your approach, or batch external writes that need a reviewed scope. If the returned plan has open `needsUserInput` questions, ask the user the shortest necessary clarification first; do NOT call `surface_plan` and do NOT show approval buttons for an incomplete plan. If the plan is executable and SIGNIFICANT/LARGE, recommends tracked execution, or includes multiple external writes, call `surface_plan` and stop until you see "Plan approved: <objective>". If the plan is executable, moderate, and safe/local/read-only, call `share_plan` to show the working plan without approval buttons, then continue. Skip the Planner for trivial reads and natural conversation.';
+  const focus = 'When the user asks to focus on one task, pause the rest, or stop working on everything except X, call `execution_focus` (id or short title substring). To bring everything back, call `execution_clear_focus`. Use `execution_pause` / `execution_resume` for ad-hoc single-execution control outside of a focus session.';
+  const reportBack = 'BACKGROUND OUTCOME REPORT-BACK — the recent transcript may contain a synthetic line that starts with `[workflow run <id> …]` or `[background task <id> …]`. That is a job you dispatched to run in the background REPORTING ITS OUTCOME (completed / needs attention / FAILED) — it is NOT a user message and must NEVER be silently absorbed. The user fired it off and moved on to other work; they are relying on you to tell them when it lands. SURFACE it proactively: on a completion, give them the result + any link/IDs it produced; on a FAILED / needs-attention outcome, first finish whatever the user just asked for, then flag it in one non-blocking line ("— heads up: your <name> flow finished but needs attention / failed at <step> — want me to retry?"). Do not re-surface an outcome you have already reported to the user.';
+
+  // Pinned/standing facts are Tier-1 — ALWAYS present (even on a casual turn),
+  // so a durable rule the user set never silently drops. Scored facts ride the
+  // Tier-2 tail (intent-gated). objective omitted: standing rules always apply.
+  const standingFacts = renderFactsForInstructions(12, 800, undefined, 'pinned');
+
+  const tier1 = [
+    identityVoice, contextDiscipline, toolBehavior, clarify, capture, handoffs, planner, focus, reportBack,
+    channelDirective, actionDirective, userPreferences, standingFacts, proposalFeedback,
+    identity, soul, longTermMemory, connectedTools,
+  ];
+
+  if (tieredContextEnabled()) {
+    // Tiered: only the stable Constitution lands in the cached system prompt.
+    // The dynamic blocks go to the per-turn input tail (buildTurnContextBlock).
+    return tier1.filter(Boolean).join('\n\n');
+  }
+
+  // Legacy (flag OFF): the original interleaved prompt — byte-identical to the
+  // pre-tiering chat path (reverts the always-on learned-blocks injection too).
+  const persistentFacts = section('Persistent Facts', renderFactsForInstructions(12, 1600, getRecallObjective(message)));
+  const dataLandscape = section('Data Landscape', renderSourceMapForContext(24, undefined, getRecallObjective(message)));
   return [
-    // Identity + voice — one paragraph instead of seven separate lines.
-    `You are ${ASSISTANT_NAME}, a persistent executive assistant for ${owner}. Concise by default; deeper only when the task is complex or the user asks. Speak like a sharp operator — no filler, no preamble, no warmups. Aligned with user intent; reduce friction.`,
-
-    // Context discipline — keep memory blocks private; don't recite.
-    'Treat the memory and continuity blocks below as private context, not content to recite. Greetings and lightweight check-ins get a one- or two-line reply, no recap. Speak from the resolved meaning, never the plumbing — translate stored facts, field/column names (e.g. `Market_Leader__c`), and internal labels ("current focus", "boundary", "scope filter") into plain business language ("accounts that aren\'t market leaders yet"), and never narrate your own process or safety steps ("confirming before I write", "for approval, not send"). Field names and slugs belong only inside a concrete data-operation you are describing, never in conversation.',
-
-    // Tool behavior — code (taxonomy + scope policy) does the gating.
-    'Tools have real schemas. Just call them when the work fits. The runtime classifies each call (read/write/execute/send/admin) and applies the trust gradient automatically — do not pre-ask "want me to proceed?" for reads or for actions inside the user\'s current scope policy. If a call fails, report the real error and propose a fix.',
-
-    // Clarifying questions — when, when not.
-    'Ask ONE clarifying question only when two interpretations lead to materially different work AND guessing wrong means redoing it. Otherwise pick the obvious option, mention it, and proceed. Never re-ask a clarification the user already answered ("yes", "go ahead", "default is fine") — act on the answer.',
-
-    // Memory + profile capture — when to write.
-    'Persist durable signals as they appear: `memory_remember` for facts/preferences that should carry across sessions; `user_profile_update` for how-to-communicate preferences (tone, timezone, hours, addressing); `propose_check_in_template` for recurring rhythms the user describes ("every Friday I deploy"). Don\'t announce these writes; behave better next turn.',
-
-    // Sub-agent handoffs — when to delegate.
-    [
-      'You orchestrate sub-agents. Hand off when the work fits a specialist:',
-      '- Researcher: gather information, read-only.',
-      '- Writer: polished artifacts (docs, drafts, reports).',
-      '- Reviewer: read-only audit before risky writes AND after multi-step mutations.',
-      '- Executor: concrete mutations. Gated on active tracked execution.',
-      '- Deployer: release / CI / shipping. Same execution gate.',
-      'Stay in chat for direct answers, quick lookups, and one-or-two-call work you can finish yourself.',
-    ].join('\n'),
-
-    // Planner — draft before complex work, surface only when it warrants review.
-    [
-      'Keep clarify / plan / act conversational inside the main loop. Use `draft_plan` only for explicit planning requests, genuinely large/irreversible work, complex local/multi-artifact work where the user benefits from seeing your approach, or batch external writes that need a reviewed scope. If the returned plan has open `needsUserInput` questions, ask the user the shortest necessary clarification first; do NOT call `surface_plan` and do NOT show approval buttons for an incomplete plan. If the plan is executable and SIGNIFICANT/LARGE, recommends tracked execution, or includes multiple external writes, call `surface_plan` and stop until you see "Plan approved: <objective>". If the plan is executable, moderate, and safe/local/read-only, call `share_plan` to show the working plan without approval buttons, then continue. Skip the Planner for trivial reads and natural conversation.',
-    ].join('\n'),
-
-    // Focus — single-task mode when the user signals a topic shift.
-    'When the user asks to focus on one task, pause the rest, or stop working on everything except X, call `execution_focus` (id or short title substring). To bring everything back, call `execution_clear_focus`. Use `execution_pause` / `execution_resume` for ad-hoc single-execution control outside of a focus session.',
-
-    // Background outcome report-back — surface a finished background job proactively.
-    'BACKGROUND OUTCOME REPORT-BACK — the recent transcript may contain a synthetic line that starts with `[workflow run <id> …]` or `[background task <id> …]`. That is a job you dispatched to run in the background REPORTING ITS OUTCOME (completed / needs attention / FAILED) — it is NOT a user message and must NEVER be silently absorbed. The user fired it off and moved on to other work; they are relying on you to tell them when it lands. SURFACE it proactively: on a completion, give them the result + any link/IDs it produced; on a FAILED / needs-attention outcome, first finish whatever the user just asked for, then flag it in one non-blocking line ("— heads up: your <name> flow finished but needs attention / failed at <step> — want me to retry?"). Do not re-surface an outcome you have already reported to the user.',
-
-    channelDirective,
-    actionDirective,
-    section('User Preferences', userPreferences),
-    section('Persistent Facts', persistentFacts),
-    section('Proposal Feedback', proposalFeedback),
+    identityVoice, contextDiscipline, toolBehavior, clarify, capture, handoffs, planner, focus, reportBack,
+    channelDirective, actionDirective,
+    userPreferences,
+    persistentFacts,
+    dataLandscape,
+    proposalFeedback,
     section('Session Continuity', context.sessionBrief),
     section('Working Memory', context.workingMemory),
-    section('Identity', context.identity),
-    section('Core Personality', context.soul),
-    section('Long-Term Memory', context.memory),
-    section('Active Goals', goalsContext),
-    section('Connected Tools', integrationsContext),
+    identity,
+    soul,
+    longTermMemory,
+    section('Active Goals', buildGoalsContext()),
+    connectedTools,
   ]
     .filter(Boolean)
     .join('\n\n');
+}
+
+/**
+ * Tier-2: the DYNAMIC, per-turn context that used to bloat the system prompt
+ * (and bust the cache). Returned for the per-turn INPUT tail when tiered context
+ * is ON; '' when OFF (legacy keeps these inside the instructions). This is where
+ * scoped facts, remembered tool-choices, working memory, etc. live now — adjacent
+ * to the user message, not in the cached prefix. (Step 2 will additionally gate
+ * these by intent so casual turns skip them; Step 1 includes them every turn.)
+ */
+export function buildTurnContextBlock(context: MemoryContext, intent?: MessageIntent, message?: string): string {
+  if (!tieredContextEnabled()) return '';
+  // Step 2: casual greetings / meta turns don't need the working context — keep
+  // them lean. The standing/pinned facts live in Tier-1, so nothing durable is
+  // lost here. Every WORKING turn (action/lookup/tool) + all workflow runs get
+  // the full block.
+  //
+  // Insurance (the gate rides on an imperfect intent classifier): rather than
+  // sending NOTHING on a "casual" turn — which would leave a MIS-classified
+  // working request blind to facts + proven tools — send a one-line pointer so
+  // the model knows the context is one call away the moment the turn turns real.
+  if (intent === 'casual' || intent === 'meta_clarify') {
+    return 'Context for this turn (private — use as needed, do not recite): any standing facts are above. If this turns into real work, pull your saved facts and proven tools first (memory_search_facts, tool_choice_recall, working_memory, goal_list) — they exist even though they are not inlined on this lightweight turn.';
+  }
+  const objective = getRecallObjective(message);
+  const { recentlyLearned, toolChoices } = renderLearnedBlocks(objective);
+  const blocks = [
+    // 'scored' — pinned facts are already in Tier-1; avoid double-rendering.
+    section('Persistent Facts', renderFactsForInstructions(12, 1600, objective, 'scored')),
+    recentlyLearned,
+    section('Data Landscape', renderSourceMapForContext(24, undefined, objective)),
+    toolChoices,
+    section('Session Continuity', context.sessionBrief),
+    section('Working Memory', context.workingMemory),
+    section('Active Goals', buildGoalsContext()),
+  ].filter(Boolean);
+  if (blocks.length === 0) return '';
+  return ['Context for this turn (private — use as needed, do not recite):', ...blocks].join('\n\n');
 }

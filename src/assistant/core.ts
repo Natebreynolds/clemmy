@@ -10,7 +10,7 @@ import { PlanStore } from '../planning/plan-store.js';
 import { refreshWorkingMemory } from '../memory/working-memory.js';
 import { captureInteractionSignals } from '../memory/auto-capture.js';
 import { refineActivePlanFromMessage } from '../planning/refinement.js';
-import { buildAssistantInstructions } from './instructions.js';
+import { buildAssistantInstructions, buildTurnContextBlock } from './instructions.js';
 import { AgentRuntimeCancelledError, ASSISTANT_PAUSED_PLACEHOLDER, type AgentRuntime } from '../runtime/provider.js';
 import { addRunEvent } from '../runtime/run-events.js';
 import { isUserFacingSession, looksLikeInternalPrompt } from '../execution/scope.js';
@@ -36,6 +36,38 @@ import { classifyMessageIntent } from './message-intent.js';
  * still aborting indefinite stalls.
  */
 export const CHAT_WALL_CLOCK_MS = 120_000;
+
+/**
+ * P0-B — per-call wall-clock for NON-interactive turns. The 120s chat budget
+ * above is a Discord slow-drip backstop; applied to a background/execution
+ * synthesis turn it guillotines a legitimate >2-min generation (the 2026-06-04
+ * email-audit abort). Non-interactive channels get real headroom, mirroring the
+ * workflow step budget. Env-tunable; floored at 60s. An explicit caller
+ * override (`request.maxWallClockMs`) always wins over this default.
+ */
+const NON_INTERACTIVE_WALL_CLOCK_MS = (() => {
+  const raw = parseInt(process.env.CLEMENTINE_BACKGROUND_STEP_WALL_MS || '', 10);
+  return Number.isNaN(raw) ? 10 * 60_000 : Math.max(60_000, raw);
+})();
+
+// 'agent' is the channel the autonomy loop actually uses (autonomy.ts); the
+// earlier 'autonomy' entry was dead. background/workflow pass an explicit
+// maxWallClockMs that always wins, so they're here only as a defensive default
+// for any caller that forgets one. The load-bearing entries are 'cron' + 'agent'.
+const NON_INTERACTIVE_CHANNELS = new Set([
+  'background', 'workflow', 'execution', 'controller', 'cron', 'agent',
+]);
+
+/** P0-B — pick the per-call wall-clock default by channel: snappy 120s for
+ *  interactive chat/discord/dashboard, real headroom for non-interactive
+ *  autonomous channels. Defense-in-depth for callers that don't pass an
+ *  explicit `maxWallClockMs` (background-tasks does; the execution controller
+ *  / cron / autonomy paths may not). */
+function defaultWallClockForChannel(channel?: string): number {
+  return channel && NON_INTERACTIVE_CHANNELS.has(channel)
+    ? NON_INTERACTIVE_WALL_CLOCK_MS
+    : CHAT_WALL_CLOCK_MS;
+}
 
 function shouldUseExecutionTracking(request: AssistantRequest): boolean {
   return isUserFacingSession(request.sessionId, request.channel) &&
@@ -122,11 +154,16 @@ export class ClementineAssistant {
     const executionPrompt = executionIntent ? buildExecutionPromptBlock(executionIntent, activeExecution) : '';
     const { memoryContext, retrievalText } = await assemblePromptContextAsync(request.sessionId, request.message, transcriptBeforeReply);
     const instructions = buildAssistantInstructions(memoryContext, request.channel, messageIntent.intent, request.message);
+    // Tiered context (flag on): the dynamic per-turn blocks (facts, tool-choices,
+    // working-memory, …) ride the per-turn input tail instead of the cached
+    // system prompt. '' when the flag is off → promptParts byte-identical to legacy.
+    const turnContext = buildTurnContextBlock(memoryContext, messageIntent.intent, request.message);
 
     const promptParts = [
       request.channel ? `Channel: ${request.channel}` : '',
       transcriptBeforeReply ? `Recent transcript:\n${transcriptBeforeReply}` : '',
       retrievalText ? `Relevant vault context:\n${retrievalText}` : '',
+      turnContext,
       executionPrompt,
       `Latest user message:\n${request.message}`,
     ].filter(Boolean);
@@ -146,7 +183,7 @@ export class ClementineAssistant {
         sessionId: request.sessionId,
         userId: request.userId,
         channel: request.channel,
-        maxWallClockMs: request.maxWallClockMs ?? CHAT_WALL_CLOCK_MS,
+        maxWallClockMs: request.maxWallClockMs ?? defaultWallClockForChannel(request.channel),
         excludeToolNames: request.excludeToolNames,
       }, {
         shouldCancel: request.shouldCancel,

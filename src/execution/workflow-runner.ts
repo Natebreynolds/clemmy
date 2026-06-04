@@ -54,7 +54,7 @@ import { missingWorkflowRunInputs, normalizeWorkflowRunInputs } from './workflow
 import { verifyStepOutput } from './step-output-verify.js';
 import { judgeWorkflowTarget, type WorkflowTargetVerdict } from './workflow-objective-judge.js';
 import { judgeStepSkillExecution } from './workflow-step-judge.js';
-import { SessionStore } from '../memory/session-store.js';
+import { deliverOutcome } from '../runtime/outcome.js';
 import { reportedBackRunIdsFrom } from './workflow-watchdog.js';
 
 const logger = pino({ name: 'clementine-next.workflow-runner' });
@@ -2244,43 +2244,22 @@ export function enqueueWorkflowOutcomeTurn(
   outcome: 'done' | 'blocked' | 'failed',
   detail: string,
 ): void {
-  try {
-    const sessionId = run.originSessionId;
-    if (!sessionId) return;
-    const idPrefix = `[workflow run ${run.id} `;
-    const store = new SessionStore();
-    const existing = store.get(sessionId);
-    if (existing.turns.some((t) => typeof t.text === 'string' && t.text.startsWith(idPrefix))) {
-      return; // already reported — idempotent across retries / daemon restarts
-    }
-    const head =
-      outcome === 'done' ? `${idPrefix}completed]`
-        : outcome === 'failed' ? `${idPrefix}FAILED]`
-          : `${idPrefix}needs attention]`;
-    const guidance =
-      outcome === 'done'
-        ? `The workflow you started ran in the background and just finished — continue from here. Full result via workflow_run_status run_id="${run.id}".`
-        : outcome === 'failed'
-          ? `The workflow you started FAILED — it did NOT complete. Decide whether to retry or tell the user; do not assume success. Details via workflow_run_status run_id="${run.id}".`
-          : `The workflow you started completed but NEEDS ATTENTION (a step blocked or the target check flagged a gap). Review and decide next steps. Details via workflow_run_status run_id="${run.id}".`;
-    const preview = detail.length > 1500 ? `${detail.slice(0, 1500)}\n…[truncated]` : detail;
-    const text = `${head} ${workflowName}\n\n${preview}\n\n(${guidance})`;
-    store.appendTurn(sessionId, { role: 'user', text, createdAt: new Date().toISOString() });
-    // ALSO stage it into the harness conversation snapshot: the desktop/Discord
-    // orchestrator replays the harness snapshot (toInputItems), NOT the PWA
-    // SessionStore above — without this, Clem's reasoning never sees the outcome
-    // and she reports a finished run as still "running." Best-effort + idempotent.
-    try {
-      const hs = HarnessSession.load(sessionId);
-      if (hs) hs.injectSyntheticUserTurn(idPrefix, text);
-    } catch { /* best-effort: a harness-store write must never fail a completed run */ }
-    logger.info({ runId: run.id, sessionId, outcome }, 'Workflow outcome enqueued into origin chat session');
-  } catch (err) {
-    logger.warn(
-      { err: err instanceof Error ? err.message : err, runId: run.id },
-      'enqueueWorkflowOutcomeTurn failed (best-effort; run + notification unaffected)',
-    );
-  }
+  // Unified report-back (Move 4): delegate to the shared deliverOutcome so the
+  // desktop/Discord/mobile surfaces render the SAME structure as every other
+  // lane. Preserves the `[workflow run <id> …]` prefix + the "needs attention"
+  // wording for a soft-blocked workflow (idempotency + tests depend on it).
+  deliverOutcome(
+    { status: outcome, detail },
+    {
+      originSessionId: run.originSessionId,
+      sourceLabel: 'workflow run',
+      sourceId: run.id,
+      title: workflowName,
+      statusHint: `workflow_run_status run_id="${run.id}"`,
+      headWord: { blocked: 'needs attention' },
+      maxDetailChars: 1500,
+    },
+  );
 }
 
 // A daemon restart drains EVERY run file, so the cancelled-notify path must not

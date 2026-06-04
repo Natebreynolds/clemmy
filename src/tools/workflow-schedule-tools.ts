@@ -7,6 +7,8 @@ import type { WorkflowDefinition } from '../memory/workflow-store.js';
 import { CRON_FILE } from '../memory/vault.js';
 import { textResult } from './shared.js';
 import { loadUserProfile } from '../runtime/user-profile.js';
+import { checkWorkflowForWrite } from '../execution/workflow-enforce.js';
+import { analyzeWorkflowGaps, renderWorkflowGapQuestions } from '../execution/workflow-gap-test.js';
 
 /**
  * Schedule authoring tools — the agent's primary surface for "schedule
@@ -160,11 +162,27 @@ export function registerWorkflowScheduleTools(server: McpServer): void {
         description_body: existing?.data.description_body,
       };
 
+      // Same author-time guards as workflow_create — this is a first-class
+      // authoring surface, so it must not be a back door that ships a workflow
+      // set up to fail (ungated send, undeclared input, broken dataflow). An
+      // ENABLED workflow that fails validation is refused; disable to draft.
+      const writeCheck = checkWorkflowForWrite(def);
+      if (def.enabled && !writeCheck.ok) {
+        return textResult(
+          `Workflow "${name}" was NOT scheduled — fix these first (or pass enabled=false to draft it):\n- ${writeCheck.errors.join('\n- ')}`,
+        );
+      }
+
       const written = writeWorkflow(name, def);
       const next = nextFireDescription(cron);
       const verb = existing ? 'Updated' : 'Created';
+      const gapQuestions = renderWorkflowGapQuestions(analyzeWorkflowGaps(def));
+      const advisories = writeCheck.warnings.length > 0
+        ? `\n\nHeads up (advisory — the workflow was saved):\n- ${writeCheck.warnings.join('\n- ')}`
+        : '';
       return textResult(
-        `${verb} workflow "${name}" with cron "${cron}". ${def.enabled ? `Will fire ${next}.` : 'Currently DISABLED — pass enabled=true to activate.'}\nFile: ${written.filePath}`,
+        `${verb} workflow "${name}" with cron "${cron}". ${def.enabled ? `Will fire ${next}.` : 'Currently DISABLED — pass enabled=true to activate.'}\nFile: ${written.filePath}`
+          + `${advisories}${gapQuestions}`,
       );
     },
   );

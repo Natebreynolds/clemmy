@@ -26,8 +26,35 @@ import { EventEmitter } from 'node:events';
 
 // Dynamic imports — see eventlog.test.ts for why.
 const { resetEventLog, createSession, listEvents } = await import('./eventlog.js');
-const { attachEventLogHooks, extractSessionIdFromContext } = await import('./hooks.js');
+const { attachEventLogHooks, extractSessionIdFromContext, effectiveReflectionTool } = await import('./hooks.js');
 type RunHooksLike = import('./hooks.js').RunHooksLike;
+
+test('effectiveReflectionTool unwraps composio_execute_tool to its action slug', () => {
+  const details = { toolCall: { arguments: JSON.stringify({ tool_slug: 'SALESFORCE_GET_RECORD_BY_ID', arguments: '{}' }) } };
+  assert.equal(effectiveReflectionTool('composio_execute_tool', details as never), 'SALESFORCE_GET_RECORD_BY_ID');
+});
+
+test('effectiveReflectionTool passes through non-composio tools unchanged', () => {
+  assert.equal(effectiveReflectionTool('read_file', undefined), 'read_file');
+  assert.equal(effectiveReflectionTool(null, undefined), null);
+});
+
+test('effectiveReflectionTool unwraps run_shell_command to a recognized connector CLI', () => {
+  const sf = { toolCall: { arguments: JSON.stringify({ command: 'sf data query --json "SELECT Id FROM Account"', cwd: null }) } };
+  assert.equal(effectiveReflectionTool('run_shell_command', sf as never), 'sf');
+  // Ordinary shell stays attributed to the wrapper (no provenance churn).
+  const ls = { toolCall: { arguments: JSON.stringify({ command: 'ls -la', cwd: null }) } };
+  assert.equal(effectiveReflectionTool('run_shell_command', ls as never), 'run_shell_command');
+  const git = { toolCall: { arguments: JSON.stringify({ command: 'git status' }) } };
+  assert.equal(effectiveReflectionTool('run_shell_command', git as never), 'run_shell_command');
+  assert.equal(effectiveReflectionTool('run_shell_command', undefined), 'run_shell_command');
+});
+
+test('effectiveReflectionTool falls back to the wrapper name when the slug is missing/unparseable', () => {
+  assert.equal(effectiveReflectionTool('composio_execute_tool', { toolCall: { arguments: 'not json' } } as never), 'composio_execute_tool');
+  assert.equal(effectiveReflectionTool('composio_execute_tool', { toolCall: {} } as never), 'composio_execute_tool');
+  assert.equal(effectiveReflectionTool('composio_execute_tool', undefined), 'composio_execute_tool');
+});
 
 test.after(() => {
   try {
