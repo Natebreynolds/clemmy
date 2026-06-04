@@ -1009,6 +1009,41 @@ export async function listComposioToolkitTools(
   return tools;
 }
 
+/**
+ * Resolve a tool's OWN version via a direct version-free v3 retrieve.
+ *
+ * Curated Composio actions (e.g. OUTLOOK_OUTLOOK_SEND_EMAIL) live in the
+ * published namespace with a pinned version (e.g. "00000000_00") and 404 under
+ * the SDK's default toolkit_versions=latest — so listComposioToolkitTools can
+ * SURFACE them (it fetches version-free) but tools.execute() can't RESOLVE them
+ * ("Unable to retrieve tool"). This returns the slug's version so execute can
+ * pin it. Exported for tests. Best-effort: undefined on any failure.
+ */
+export async function resolveComposioToolVersion(slug: string): Promise<string | undefined> {
+  try {
+    const apiKey = readComposioEnv('COMPOSIO_API_KEY');
+    if (!apiKey || !slug) return undefined;
+    const composio = getComposio();
+    const base = String(((composio as unknown as { client?: { baseURL?: unknown } })?.client?.baseURL as string | undefined) ?? 'https://backend.composio.dev').replace(/\/+$/, '');
+    const root = /\/api\/v\d+$/.test(base) ? base : `${base}/api/v3`;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5_000);
+    try {
+      const res = await fetch(`${root}/tools/${encodeURIComponent(slug)}`, {
+        headers: { 'x-api-key': apiKey, accept: 'application/json' },
+        signal: controller.signal,
+      });
+      if (!res.ok) return undefined;
+      const data = (await res.json()) as { version?: unknown };
+      return typeof data.version === 'string' && data.version ? data.version : undefined;
+    } finally {
+      clearTimeout(timeout);
+    }
+  } catch {
+    return undefined;
+  }
+}
+
 export async function executeComposioTool(
   toolSlug: string,
   args: Record<string, unknown>,
@@ -1058,7 +1093,23 @@ export async function executeComposioTool(
     dangerouslySkipVersionCheck: true,
   };
   if (resolvedConnection) body.connectedAccountId = resolvedConnection;
-  return (composio as any).tools.execute(toolSlug, body);
+  try {
+    return await (composio as any).tools.execute(toolSlug, body);
+  } catch (err) {
+    // v0.5.65 — discover/execute version split. The SDK resolves a slug under
+    // toolkit_versions=latest, but CURATED slugs (now discoverable via the
+    // version-free broker fetch) live in the PUBLISHED namespace and 404 under
+    // 'latest' → "Unable to retrieve tool". That failure is at the RESOLVE step,
+    // BEFORE any side effect, so it is safe to retry: resolve the slug's own
+    // version and run once more pinned to it. Guarded to the not-found case only
+    // (never a real execution error) and a single retry (body.version unset).
+    const msg = err instanceof Error ? err.message : String(err);
+    if (body.version === undefined && /unable to retrieve tool|tool not found|ComposioToolNotFound/i.test(msg)) {
+      const version = await resolveComposioToolVersion(toolSlug);
+      if (version) return await (composio as any).tools.execute(toolSlug, { ...body, version });
+    }
+    throw err;
+  }
 }
 
 /**

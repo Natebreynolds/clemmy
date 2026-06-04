@@ -10,7 +10,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { listComposioToolkitTools } from './client.js';
+import { listComposioToolkitTools, resolveComposioToolVersion } from './client.js';
 
 function withMockedFetch(impl: typeof fetch, run: () => Promise<void>): Promise<void> {
   const prevFetch = globalThis.fetch;
@@ -92,5 +92,29 @@ test('returns the curated set even when the raw SDK call fails', async () => {
   await withMockedFetch(mockFetch, async () => {
     const tools = await listComposioToolkitTools('outlook', 50, fakeComposio);
     assert.deepEqual(tools.map((t) => t.slug), ['OUTLOOK_OUTLOOK_SEND_EMAIL'], 'curated returned despite raw failure');
+  });
+});
+
+// ─── v0.5.65: execute-side version resolution for curated slugs ─────────────
+test('resolveComposioToolVersion returns the curated slug pinned version (version-free v3 retrieve)', async () => {
+  let fetchedUrl = '';
+  const mockFetch = (async (url: string | URL | Request) => {
+    fetchedUrl = String(url);
+    return { ok: true, json: async () => ({ slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL', version: '00000000_00' }) } as Response;
+  }) as typeof fetch;
+  await withMockedFetch(mockFetch, async () => {
+    const v = await resolveComposioToolVersion('OUTLOOK_OUTLOOK_SEND_EMAIL');
+    assert.equal(v, '00000000_00', 'returns the tool\'s own version so execute can pin it');
+    assert.match(fetchedUrl, /\/api\/v3\/tools\/OUTLOOK_OUTLOOK_SEND_EMAIL/);
+    assert.doesNotMatch(fetchedUrl, /toolkit_versions|[?]version=/, 'retrieves version-free (so the curated slug resolves)');
+  });
+});
+
+test('resolveComposioToolVersion returns undefined on non-ok or missing version (best-effort)', async () => {
+  await withMockedFetch((async () => ({ ok: false } as Response)) as typeof fetch, async () => {
+    assert.equal(await resolveComposioToolVersion('X_TOOL'), undefined);
+  });
+  await withMockedFetch((async () => ({ ok: true, json: async () => ({ slug: 'X_TOOL' }) } as Response)) as typeof fetch, async () => {
+    assert.equal(await resolveComposioToolVersion('X_TOOL'), undefined, 'no version field → undefined (caller falls through)');
   });
 });
