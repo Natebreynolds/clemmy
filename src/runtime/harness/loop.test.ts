@@ -1448,6 +1448,55 @@ test('runConversation: stuck_detected fires Signal A when zero tools + generic a
   assert.equal((stuckEvents[0].data as { signal: string }).signal, 'A_zero_tools');
 });
 
+test('runConversation: a zero-tool ACKNOWLEDGMENT turn is NOT flagged as a stall', async () => {
+  // Live regression (sess-mpzre9m2, turn 7): the user gave correction feedback;
+  // the model correctly replied "You're right … going forward I'll treat SEO as
+  // raw metrics" with done=true, nextAction=completed, 0 tool calls. The stray
+  // "I'll" tripped STALL_ANNOUNCEMENT_PATTERN and the harness force-injected
+  // "prose, not an action — call a tool now", derailing the alignment turn. The
+  // reflection suppressor must let a genuine conversational reply through.
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const runner = scriptedRunner([
+    { finalOutput: {
+      summary: 'Acknowledged the two corrections and aligned on next steps',
+      reply: "You're right on both. I put them in the wrong table, and going forward I'll treat SEO as raw metrics first.",
+      done: true, nextAction: 'completed', reason: null } },
+  ]);
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'two issues to correct: wrong table, and that seo data is too light',
+    makeRunner: makeRunnerStub,
+    runRunner: runner,
+  });
+  assert.equal(result.status, 'completed');
+  assert.equal(result.steps, 1, 'an acknowledgment reply must complete in one step, not retry');
+  const falseClaims = listEventsForConv(sess.id, { types: ['stuck_detected'] })
+    .filter((e) => (e.data as { kind?: string }).kind === 'structured_zero_tool_claim');
+  assert.equal(falseClaims.length, 0, 'a conversational acknowledgment must not be a zero-tool claim stall');
+});
+
+test('runConversation: a zero-tool FALSE completion claim still fires the stall (no over-suppression)', async () => {
+  // Positive control: a real fake-completion ("Sent the email …") carries none
+  // of the reflection markers, so the suppressor must NOT shield it.
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const runner = scriptedRunner([
+    { finalOutput: {
+      summary: 'claimed the email was sent', reply: 'Sent the email to the team.',
+      done: true, nextAction: 'completed', reason: null } },
+  ]);
+  await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'send the email',
+    makeRunner: makeRunnerStub,
+    runRunner: runner,
+  });
+  const claims = listEventsForConv(sess.id, { types: ['stuck_detected'] })
+    .filter((e) => (e.data as { kind?: string }).kind === 'structured_zero_tool_claim');
+  assert.ok(claims.length >= 1, 'a false completion claim with zero tools must still be flagged');
+});
+
 test('runConversation: Signal D fires when sub-agent emits OrchestratorDecision JSON', async () => {
   // Pattern: model over-conforms to schema and the SDK passes the
   // JSON through as a plain string. Today extractFallbackSummary

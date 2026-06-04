@@ -1481,8 +1481,9 @@ async function runConversationCore(
           });
           nextInput = [
             `You marked this objective complete, but an independent verification check found it is NOT finished: ${verdict.reason}.`,
-            'Do not stop and do not ask the user — keep working and actually produce the missing deliverable.',
-            'Only set done=true with nextAction=completed once the real artifact or verifiable evidence (a URL, file path, emitted result) genuinely exists.',
+            'First try to finish it yourself — produce the real artifact and verifiable evidence (a URL, file path, or emitted result). Prefer doing the work over asking.',
+            'But do NOT loop on a dead end: if a tool keeps failing, a required input is missing, or an external service is genuinely unavailable, STOP and report the SPECIFIC blocker — set nextAction=awaiting_user_input with a concrete question, or nextAction=abandoned if it is truly impossible. A blocked task reported honestly is correct; silently re-declaring "complete" without the artifact is not.',
+            'Only set nextAction=completed once the real artifact or verifiable evidence genuinely exists.',
           ].join(' ');
           continue;
         }
@@ -3354,6 +3355,17 @@ const STALL_OUTPUT_PATTERN = /^(continuing|ok|okay|done|sure|got it|working on i
 // apostrophe class catches curly quotes models love to emit.
 const STALL_ANNOUNCEMENT_PATTERN = /\b(I[\u2018\u2019\u02bc' ]?ll\s|let me\s|executing\s|fetching\s|running\s|pulling\s|querying\s|about to\s|going to\s|on the way|in progress|kicking off|starting now|handed off\s|handing off\s|completed the\s|sent the\s|updated the\s|searched\s|pulled the\s|posted the\s|created the\s|drafted the\s|saved the\s|loaded the\s|fetched\s|queried\s|ran the\s|transferred to\s|transferring to\s|routed to\s|routing to\s|dispatched the\s|dispatching the\s|delegated to\s|delegating to\s|kicked off\s|invoked the\s|invoking the\s|launched the\s|launching the\s|triggered the\s|triggering the\s|forwarded to\s|forwarding to\s)/i;
 const STRUCTURED_TOOL_UNAVAILABLE_PATTERN = /\b(tool[- ]?enabled run|tool runtime|tool access|tool surface.{0,80}not available|tools? (?:were|was|are|is) (?:not )?available|no (?:commentary\/)?tool calls? (?:were|was|are|is) available|no executable tool results|no completed tool results|handoff summary|without tool access|resend ["“]?continue["”]?.*tool|please resend.*tool[- ]?enabled|cannot (?:create|read|write|search|execute|run).{0,80}(?:this turn|without tools?))\b/i;
+// A zero-tool turn that AGREES with a correction, reflects on future behavior,
+// or admits it isn't done is a legitimate CONVERSATIONAL reply — not a false
+// "I did the work" claim. Without this guard, a stray "I'll …" in
+// "you're right — going forward I'll treat SEO as raw metrics" trips
+// STALL_ANNOUNCEMENT_PATTERN and the harness force-injects "prose, not an
+// action — call a tool now", punishing exactly the converse-until-aligned
+// behavior we want. Suppressing on these markers only ever removes FALSE
+// positives: a real fake-completion ("Sent the email.", "Created the records.")
+// contains none of them. Tool-agnostic — keys on the model's own wording.
+const STALL_REFLECTION_SUPPRESS_PATTERN =
+  /(you[‘’ʼ'` ]?re right|you are right|good catch|fair (?:point|enough)|my (?:mistake|bad)|i was wrong|i (?:got|had) (?:that|it) wrong|apolog|i should(?:n[‘’ʼ'`]?t)? have|going forward|for future|next time|in the future|that[‘’ʼ'` ]?s (?:right|fair|a (?:fair|good) point)|not (?:the|what)\b.{0,40}\byou asked\b)/i;
 const TOOL_SURFACE_PROBE_TOOLS = new Set([
   'check_capability',
   'list_capabilities',
@@ -3421,7 +3433,11 @@ function evaluateStructuredDecisionStall(opts: {
     };
   }
   if (toolCalls !== 0) return undefined;
-  if (decision.nextAction === 'completed' && STALL_ANNOUNCEMENT_PATTERN.test(combined)) {
+  if (
+    decision.nextAction === 'completed' &&
+    STALL_ANNOUNCEMENT_PATTERN.test(combined) &&
+    !STALL_REFLECTION_SUPPRESS_PATTERN.test(combined)
+  ) {
     return {
       signal: 'A_zero_tools',
       rawOutput: combined.slice(0, 220),

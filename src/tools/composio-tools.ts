@@ -71,10 +71,18 @@ export function detectComposioFailure(value: unknown): { failed: boolean; summar
   if (!isRecord(value)) return { ...none };
   const data = isRecord(value.data) ? value.data : undefined;
   // Authoritative markers: `successful === false` and `http_error` are
-  // composio's own failure envelope. `status_code >= 400` and a bare top-level
-  // `error` string are best-effort SECONDARY signals — the bare-error branch is
-  // AND-gated on `successful !== true` so a successful action that carries a
-  // non-empty advisory `error` string isn't mislabelled.
+  // composio's own failure envelope. `status_code` (read as an HTTP status) and
+  // a bare top-level `error` string are best-effort SECONDARY signals — BOTH are
+  // AND-gated on `!explicitSuccess` so an authoritative `successful:true`
+  // envelope wins and a successful action carrying an advisory `error`/odd code
+  // isn't mislabelled. The status_code check is ALSO bounded to the real HTTP
+  // error range (400–599): many toolkits nest a non-HTTP numeric `status_code`
+  // in their payload — e.g. DataForSEO returns `status_code: 20000` ("Ok") on
+  // SUCCESS. `20000 >= 400` is true, so an unbounded check flagged every
+  // successful DataForSEO call as a HARD failure and made the model abandon good
+  // data. The `< 600` bound ignores all 5-digit API codes (success AND error)
+  // and defers their interpretation to `successful`/`error`/`http_error`, which
+  // is correct and fully tool-agnostic.
   const httpError = data && typeof data.http_error === 'string' ? data.http_error.trim() : '';
   const statusCode = data && typeof data.status_code === 'number' ? data.status_code : undefined;
   const topError = typeof value.error === 'string' ? value.error.trim() : '';
@@ -82,7 +90,7 @@ export function detectComposioFailure(value: unknown): { failed: boolean; summar
   const failed =
     value.successful === false ||
     httpError.length > 0 ||
-    (statusCode !== undefined && statusCode >= 400) ||
+    (statusCode !== undefined && statusCode >= 400 && statusCode < 600 && !explicitSuccess) ||
     (topError.length > 0 && !explicitSuccess);
   if (!failed) return { ...none };
   const dataMessage = data && typeof data.message === 'string' ? data.message : '';

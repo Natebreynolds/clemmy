@@ -94,6 +94,29 @@ test('detectComposioFailure: flags Composio API error shapes, ignores successes'
   assert.equal(detectComposioFailure('a plain string').failed, false);
 });
 
+test('detectComposioFailure: a 5-digit API "Ok" status code (DataForSEO 20000) is NOT a failure', () => {
+  // Live regression (sess-mpzre9m2, 2026-06-04): a SUCCESSFUL DataForSEO call —
+  // `successful:true, error:null, data.status_code:20000` ("Ok") — was flagged
+  // as a HARD failure because `20000 >= 400`, so the model abandoned a 94KB
+  // payload and looped across other endpoints. Must read as success.
+  assert.equal(
+    detectComposioFailure({
+      successful: true,
+      error: null,
+      data: { status_code: 20000, status_message: 'Ok.', tasks: [{ data: {} }] },
+    }).failed,
+    false,
+  );
+  // Tool-agnostic: even without the explicit `successful:true` envelope, a
+  // non-HTTP 5-digit code must not be misread as an HTTP error.
+  assert.equal(detectComposioFailure({ data: { status_code: 20000, status_message: 'Ok.' } }).failed, false);
+  // …but genuine HTTP 4xx/5xx (in-range) still flags as before (no-regress):
+  assert.equal(detectComposioFailure({ data: { status_code: 404 } }).failed, true);
+  assert.equal(detectComposioFailure({ data: { status_code: 500 } }).failed, true);
+  // An authoritative successful:true envelope wins even over an in-range code.
+  assert.equal(detectComposioFailure({ successful: true, data: { status_code: 404 } }).failed, false);
+});
+
 test('detectComposioFailure: flags the NOT-FOUND (wrong table/record/object) case distinctly', () => {
   // The live Airtable shape — fused permissions/not-found → treat as not-found.
   const air = detectComposioFailure({ successful: false, data: { http_error: '403', message: 'Airtable API error (INVALID_PERMISSIONS_OR_MODEL_NOT_FOUND): …' } });
