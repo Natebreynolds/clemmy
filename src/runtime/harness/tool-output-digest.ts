@@ -29,6 +29,38 @@ function tryParse(text: string): unknown {
   try { return JSON.parse(t); } catch { return undefined; }
 }
 
+// Well-known keys that hold the "rows" of a list/records result, across
+// composio/Airtable/Sheets/Gmail/etc. Used to report the TRUE item count.
+const DOMINANT_LIST_KEYS = ['records', 'items', 'results', 'rows', 'data', 'value', 'entries', 'messages', 'files', 'matches', 'documents'];
+
+/** Find the dominant list inside a parsed tool result — a records/items/results
+ *  array, possibly nested one level under `data` (the composio/Airtable shape
+ *  `{ data: { records: [...] } }`). Returns the key + count so a clip/digest can
+ *  tell the model the TRUE item count ("59 records") and that recall returns ALL
+ *  of them — instead of a char count that reads like "there may be more pages"
+ *  and invites hallucinated pagination. */
+export function countDominantArray(value: unknown): { key: string; count: number } | null {
+  if (Array.isArray(value)) return { key: 'items', count: value.length };
+  if (!value || typeof value !== 'object') return null;
+  const obj = value as Record<string, unknown>;
+  let best: { key: string; count: number } | null = null;
+  const consider = (key: string, v: unknown): void => {
+    if (Array.isArray(v) && (!best || v.length > best.count)) best = { key, count: v.length };
+  };
+  for (const k of DOMINANT_LIST_KEYS) consider(k, obj[k]);
+  const data = obj.data;
+  if (data && typeof data === 'object' && !Array.isArray(data)) {
+    for (const k of DOMINANT_LIST_KEYS) consider(k, (data as Record<string, unknown>)[k]);
+  }
+  return best;
+}
+
+/** Parse text then count the dominant list — for callers that only hold the raw
+ *  string (e.g. the plain clip footer). Returns null when not a list payload. */
+export function dominantListCount(text: string): { key: string; count: number } | null {
+  return countDominantArray(tryParse(text));
+}
+
 /** Union of keys across the first N objects in an array (the "schema"). */
 function collectFields(arr: unknown[], sample = 12): string[] {
   const keys = new Set<string>();
@@ -143,8 +175,15 @@ function digestObject(obj: Record<string, unknown>, totalChars: number, maxChars
     shownKeys++;
   }
   const moreKeys = entries.length - shownKeys;
+  // Surface the TRUE count of a nested records/items array so the model knows
+  // the full set size + that recall returns ALL of it — never reads the clip as
+  // "maybe more pages" and guesses an offset (the scorpion 44→4 / 'itr2' bug).
+  const dom = countDominantArray(obj);
+  const domNote = dom && dom.count > 0
+    ? ` Contains ${dom.count} ${dom.key} — recall_tool_result returns ALL ${dom.count} (no pagination needed).`
+    : '';
   const footer =
-    `\n[digest: ${toolName} returned a JSON object with ${entries.length} top-level key${entries.length === 1 ? '' : 's'} (~${totalChars.toLocaleString()} chars)${moreKeys > 0 ? `; ${moreKeys} key(s) not shown` : ''}. ` +
+    `\n[digest: ${toolName} returned a JSON object with ${entries.length} top-level key${entries.length === 1 ? '' : 's'} (~${totalChars.toLocaleString()} chars)${moreKeys > 0 ? `; ${moreKeys} key(s) not shown` : ''}.${domNote} ` +
     `${recoveryHint(callId)}]`;
   return `{\n${lines.join('\n')}\n}${footer}`;
 }

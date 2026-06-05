@@ -136,6 +136,17 @@ function composioFailureCorrective(
       `Do this, in order: (1) DISCOVER the real options first — call the toolkit's schema/list action (e.g. AIRTABLE_GET_BASE_SCHEMA for a base's tables, GOOGLESHEETS list, SALESFORCE describe, or composio_search_tools) and read the EXACT ids it returns; (2) retry with one of those exact ids. Do NOT guess another table/field name — guessing returns the same not-found error.`,
     ].join('\n');
   }
+  if (/\boffset\b|opaque token|pagination|next[- ]?page/i.test(summary)) {
+    // Pagination/offset error — almost always because the PREVIOUS list result
+    // was clipped for size (full payload is stored) and the model then GUESSED
+    // an offset to "get the rest". The fix is to RECALL, not paginate (the
+    // scorpion 44→4 / 'itr2' bug).
+    return [
+      `⚠️ ${label} FAILED${where}: ${summary}`,
+      `An offset/page token must be the EXACT opaque value returned in a prior response's \`offset\` field — never a guessed one. Most likely your previous list call returned everything but its result was CLIPPED for size: the FULL payload is stored.`,
+      `Do this: call \`recall_tool_result\` on your previous list call to get the COMPLETE set in one shot — do NOT pass a guessed offset. Only paginate if a prior response actually returned a verbatim \`offset\` token.`,
+    ].join('\n');
+  }
   return [
     `⚠️ ${label} FAILED${where}: ${summary}`,
     `This is a HARD failure — calling it again with the SAME arguments will return the SAME error.`,

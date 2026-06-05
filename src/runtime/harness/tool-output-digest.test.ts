@@ -7,7 +7,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { digestToolOutput } from './tool-output-digest.js';
+import { digestToolOutput, countDominantArray, dominantListCount } from './tool-output-digest.js';
 
 const accounts = Array.from({ length: 47 }, (_, i) => ({
   Id: `001${i}`,
@@ -154,4 +154,31 @@ test('Composio list catalog digest keeps slug index instead of only top-level sh
   assert.match(digest, /DATAFORSEO_TOOL_00/);
   assert.match(digest, /DATAFORSEO_TOOL_10/);
   assert.doesNotMatch(digest, /top-level key/);
+});
+
+// ─── dominant-list count (the scorpion 44→4 / 'itr2' fix) ──────────────────
+
+test('countDominantArray: finds a nested records array (Airtable/composio shape)', () => {
+  const payload = { data: { records: Array.from({ length: 59 }, (_, i) => ({ id: i })) }, error: null, successful: true };
+  assert.deepEqual(countDominantArray(payload), { key: 'records', count: 59 });
+});
+
+test('countDominantArray: top-level array + items/results + null for non-lists', () => {
+  assert.deepEqual(countDominantArray([1, 2, 3]), { key: 'items', count: 3 });
+  assert.deepEqual(countDominantArray({ results: [1, 2] }), { key: 'results', count: 2 });
+  assert.equal(countDominantArray({ ok: true, count: 5 }), null); // no list array
+  assert.equal(countDominantArray('not json'), null);
+});
+
+test('dominantListCount: parses text then counts', () => {
+  const text = JSON.stringify({ data: { records: [{ a: 1 }, { a: 2 }, { a: 3 }, { a: 4 }] } });
+  assert.deepEqual(dominantListCount(text), { key: 'records', count: 4 });
+});
+
+test('digestObject: surfaces the nested records count + recall-returns-all (no pagination)', () => {
+  const big = { data: { records: Array.from({ length: 59 }, (_, i) => ({ id: i, name: 'x'.repeat(80) })) }, error: null, successful: true };
+  const out = digestToolOutput(JSON.stringify(big, null, 2), { maxChars: 1500, toolName: 'composio_execute_tool', callId: 'call_X' });
+  assert.match(out, /Contains 59 records/);
+  assert.match(out, /recall_tool_result returns ALL 59/);
+  assert.match(out, /no pagination needed/i);
 });

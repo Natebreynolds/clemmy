@@ -1,7 +1,7 @@
 import { getRuntimeEnv } from '../../config.js';
 import { writeToolOutput } from './eventlog.js';
 import { getToolOutputContext } from './tool-output-context.js';
-import { digestToolOutput } from './tool-output-digest.js';
+import { digestToolOutput, dominantListCount } from './tool-output-digest.js';
 
 // Raised 4000 → 12000 (2026-05-29): 4000 clipped normal "show me N" results
 // (e.g. 10 Salesforce accounts ≈ 5.5KB) into head+tail, which read as
@@ -141,5 +141,13 @@ export function formatRecallableToolText(
     return withIndex(digestToolOutput(text, { maxChars, toolName, callId }));
   }
   const iso = new Date().toISOString();
-  return withIndex(`${text.slice(0, maxChars)}\n[clipped: ${toolName} returned ${text.length} chars at ${iso} — call recall_tool_result("${callId}") for full output]`);
+  // Report the TRUE item count (not just chars) when the payload is a list, so
+  // the model knows the full set size + that recall returns ALL of it — instead
+  // of seeing a few records + a char count and guessing pagination (the scorpion
+  // 44→4 / 'itr2' bug). recall returns the complete payload — no pagination.
+  const dom = dominantListCount(text);
+  const countNote = dom && dom.count > 0
+    ? `contains ${dom.count} ${dom.key} (only a portion shown) — recall_tool_result("${callId}") returns ALL ${dom.count}, no pagination`
+    : `returned ${text.length} chars — call recall_tool_result("${callId}") for full output`;
+  return withIndex(`${text.slice(0, maxChars)}\n[clipped: ${toolName} ${countNote} · ${iso}]`);
 }

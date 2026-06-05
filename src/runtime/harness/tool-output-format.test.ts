@@ -56,6 +56,19 @@ test('formatRecallableToolText stores full output and returns canonical recall s
   assert.equal(row.output, full);
 });
 
+test('clip footer reports the TRUE record count + that recall returns ALL (scorpion 44→4 fix)', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  // The Airtable shape that broke: full result with 59 records, clipped to a few.
+  const full = JSON.stringify({ data: { records: Array.from({ length: 59 }, (_, i) => ({ id: i, fields: { Name: 'Contact ' + i, Email: `c${i}@x.com` } })) }, error: null, successful: true });
+  const visible = formatRecallableToolText(full, { sessionId: sess.id, callId: 'call_air', toolName: 'composio_execute_tool', maxChars: 400 });
+  assert.match(visible, /contains 59 records/);
+  assert.match(visible, /recall_tool_result\("call_air"\) returns ALL 59/);
+  assert.match(visible, /no pagination/);
+  assert.doesNotMatch(visible, /returned \d+ chars/); // count note replaces the bare char note
+  assert.equal(getToolOutput(sess.id, 'call_air')!.output, full); // full payload preserved
+});
+
 test('textResult uses active tool-output context for MCP-style local tools', async () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });

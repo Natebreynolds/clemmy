@@ -55,7 +55,10 @@ test('formatComposioToolOutput stores full oversized JSON before returning a rec
 
   assert.ok(output.length < full.length, 'model-facing output should be clipped');
   assert.match(output, /recall_tool_result\("call_composio_full"\)/);
-  assert.match(output, /composio_execute_tool returned \d+ chars/);
+  // List payload → the footer now reports the TRUE item count + that recall
+  // returns ALL of them (the scorpion 44→4 fix), not a bare char count.
+  assert.match(output, /20 value/);
+  assert.match(output, /ALL 20/);
 
   const row = getToolOutput(sess.id, 'call_composio_full');
   assert.ok(row);
@@ -453,4 +456,14 @@ test('FIX1.4: kill-switch off → even a transient error gets the legacy hard co
     if (prev === undefined) delete process.env.CLEMMY_WORKER_THRASH_GUARD;
     else process.env.CLEMMY_WORKER_THRASH_GUARD = prev;
   }
+});
+
+test('formatComposioExecuteOutput: an invalid-offset error redirects to recall, not guessed pagination (scorpion itr2 fix)', () => {
+  const out = formatComposioExecuteOutput(
+    { error: "Invalid offset value: The offset 'itr2' is not valid. The offset must be an opaque token returned in the 'offset' field of a previous list records response.", successful: false },
+    { toolName: 'composio_execute_tool', toolSlug: 'AIRTABLE_LIST_RECORDS' },
+  );
+  assert.match(out, /FAILED/);
+  assert.match(out, /recall_tool_result/);
+  assert.match(out, /do NOT pass a guessed offset/i);
 });
