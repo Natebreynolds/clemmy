@@ -83,3 +83,47 @@ test('declarative fallback ignores questions and imperative tasks', () => {
 test('a "do you remember ..." question is not treated as a store request', () => {
   assert.deepEqual(extractAutoMemoryCandidates('Do you remember what we decided about pricing?'), []);
 });
+
+// ─── Standing-rule capture (the gap FEEDBACK_CUES + declarative fallback miss) ──
+
+test('standing rule with a named resource is captured as a durable feedback fact', () => {
+  const c = extractAutoMemoryCandidates(
+    'Going forward, send the weekly digest to this sheet: https://docs.google.com/spreadsheets/d/1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789ABCD/edit',
+  );
+  assert.equal(c.length, 1, 'a gap-marker standing rule is captured (dropped entirely today)');
+  assert.equal(c[0].kind, 'feedback');
+  assert.match(c[0].content, /^Standing instruction:/);
+  assert.match(c[0].content, /1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789ABCD/);
+});
+
+test('standing rule with recipient emails is captured', () => {
+  const c = extractAutoMemoryCandidates('Every Monday, send the digest to alice@x.com and bob@y.com');
+  assert.equal(c.length, 1);
+  assert.match(c[0].content, /^Standing instruction:/);
+  assert.match(c[0].content, /alice@x\.com/);
+});
+
+test('standing rule "by default use this list" phrasing is captured', () => {
+  const c = extractAutoMemoryCandidates('By default, send my newsletter to the marketing list.');
+  assert.equal(c.length, 1);
+  assert.equal(c[0].kind, 'feedback');
+});
+
+test('standing MARKER without a concrete target is NOT captured (false-positive guard)', () => {
+  assert.deepEqual(extractAutoMemoryCandidates('Going forward be careful with the data.'), []);
+  assert.deepEqual(extractAutoMemoryCandidates('Every Monday I try to plan the week.'), []);
+});
+
+test('a one-off imperative (no standing marker) is still NOT routed to a fact', () => {
+  assert.deepEqual(extractAutoMemoryCandidates('Just send it to the usual list this once.'), []);
+  // byte-identical regression guard: the pre-existing imperative-task case stays []
+  assert.deepEqual(extractAutoMemoryCandidates('Send the quarterly report to the leadership team today.'), []);
+});
+
+test('"always"/"from now on" still route through FEEDBACK_CUES, not the standing branch (byte-identical)', () => {
+  // These already matched FEEDBACK_CUES before this change; the gap branch is
+  // length-gated so it must NOT add a second "Standing instruction:" candidate.
+  const c = extractAutoMemoryCandidates('From now on, send the report to the board distro.');
+  assert.ok(c.length >= 1);
+  assert.ok(!c.some((cand) => cand.content.startsWith('Standing instruction:')), 'no duplicate standing-branch row');
+});

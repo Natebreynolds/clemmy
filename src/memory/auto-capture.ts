@@ -1,6 +1,7 @@
 import type { ConsolidatedFactKind } from './db.js';
 import type { ConsolidatedFact } from './facts.js';
 import { consolidateFact } from './reflection.js';
+import { extractNamedResource } from './focus.js';
 import { saveUserProfile, type UserProfile } from '../runtime/user-profile.js';
 
 export interface AutoMemoryCandidate {
@@ -27,6 +28,39 @@ const CONNECTED_APP_TERMS = /\b(composio|outlook|gmail|google calendar|calendar|
 const CONNECTED_APP_CUES = /\b(i|we|the agent|users?)\s+(?:use|uses|have|has|need|needs|want|wants|connect|connects|access|auth|authenticate|oauth)\b/i;
 
 const LOW_SIGNAL = /^(approve|approved|reject|rejected|yes|no|ok|okay|cool|perfect|nice|thanks|thank you|lets do it|let'?s do it|keep going|continue|great job|sounds good)[.!?]*$/i;
+
+// Standing-rule capture — a durable "going forward / every Monday / by default"
+// instruction that should PERSIST ACROSS SESSIONS (routed to the facts vault),
+// as opposed to a one-off action (handled by the session-scoped Active Task pin
+// in working-memory.ts). "always" / "never" / "from now on" are DELIBERATELY
+// OMITTED: they already match FEEDBACK_CUES above and are captured today, so the
+// length-gated branch below would never run for them. This marker set fills only
+// the gap those cues miss. A marker alone is not enough — an imperative verb AND
+// a concrete target are also required (see hasConcreteStandingTarget).
+const STANDING_MARKER_RE = /\b(?:from here on(?: out)?|going forward|by default|as a rule|every (?:day|week|month|monday|tuesday|wednesday|thursday|friday|saturday|sunday)|each (?:day|week|month|monday|tuesday|wednesday|thursday|friday|saturday|sunday)|whenever)\b/i;
+// The imperative verbs isDurableDeclarative explicitly rejects — exactly why a
+// standing imperative is uncaptured today.
+const STANDING_VERB_RE = /\b(?:send|e-?mail|message|dm|post|publish|reply|forward|cc|bcc|route|use)\b/i;
+// NON-global on purpose: a /g regex carries lastIndex across .test() calls.
+const STANDING_EMAIL_RE = /[\w.+-]+@[\w-]+\.[\w.-]+/;
+// Determiner-qualified destination, allowing a few adjective words before the
+// noun ("to the MARKETING list", "to my OUTREACH sheet"). Still bounded so it
+// stays a destination phrase, not arbitrary prose.
+const STANDING_LIST_PHRASE_RE = /\b(?:to|use)\s+(?:this|that|these|those|the following|the|my|our)\s+(?:[\w'-]+\s+){0,3}?(?:list|distro|group|team|sheet|doc|document|spreadsheet|folder|channel|inbox)\b/i;
+
+/**
+ * A standing marker only earns a durable fact when it names a CONCRETE target:
+ * a resource locator (sheet/doc id or URL), at least one email, or a determiner-
+ * qualified list/distro/sheet phrase. This is the false-positive guard — a bare
+ * exhortation ("going forward be careful", "I always forget lunch") never
+ * qualifies. Shares extractNamedResource with the Active Task pin so "the user
+ * named their own resource" means the same thing across both layers.
+ */
+function hasConcreteStandingTarget(text: string): boolean {
+  return extractNamedResource(text) !== null
+    || STANDING_EMAIL_RE.test(text)
+    || STANDING_LIST_PHRASE_RE.test(text);
+}
 
 function clean(value: string, maxChars = 260): string {
   return value
@@ -138,6 +172,27 @@ export function extractAutoMemoryCandidates(message: string, maxCandidates = 3):
       kind: 'user',
       content: text,
       reason: 'durable first-person declarative',
+    });
+  }
+
+  // Standing-rule fallback (gap-only). A durable "going forward / every Monday /
+  // by default, send X to Y" instruction with a concrete target. Gated on
+  // candidates.length === 0 (like the declarative fallback above) so it NEVER
+  // alters what the cued/declarative branches already capture — it only fills
+  // the gap those markers miss. Captured as a 'feedback' fact (a standing
+  // instruction to Clem), so it persists + cross-session-injects + dedups via
+  // the same consolidateFact path as every other candidate. The session-scoped
+  // Active Task pin still covers the current turn when the rule is actionable now.
+  if (
+    candidates.length === 0
+    && STANDING_MARKER_RE.test(text)
+    && STANDING_VERB_RE.test(text)
+    && hasConcreteStandingTarget(text)
+  ) {
+    addCandidate(candidates, {
+      kind: 'feedback',
+      content: `Standing instruction: ${text}`,
+      reason: 'standing instruction (marker + concrete target)',
     });
   }
 
