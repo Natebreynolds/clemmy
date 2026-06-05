@@ -7,7 +7,7 @@ import { refreshSessionBrief } from '../memory/session-briefs.js';
 import { SessionStore } from '../memory/session-store.js';
 import type { AssistantRequest, AssistantResponse, RunResult } from '../types.js';
 import { PlanStore } from '../planning/plan-store.js';
-import { refreshWorkingMemory } from '../memory/working-memory.js';
+import { refreshWorkingMemory, reconcileActiveTask } from '../memory/working-memory.js';
 import { captureInteractionSignals } from '../memory/auto-capture.js';
 import { refineActivePlanFromMessage } from '../planning/refinement.js';
 import { buildAssistantInstructions, buildTurnContextBlock } from './instructions.js';
@@ -132,6 +132,14 @@ export class ClementineAssistant {
       }
     }
     refreshSessionBrief(sessionBeforeReply);
+
+    if (executionTrackingEnabled) {
+      // Pin a stated action constraint (recipient list / count / "only these")
+      // synchronously, BEFORE context assembly reads working memory below, so the
+      // binding spec is visible on THIS turn and survives the conversation. No
+      // queueMicrotask — it must be on disk before assemblePromptContextAsync.
+      reconcileActiveTask(request.sessionId, request.message);
+    }
 
     const messageIntent = classifyMessageIntent(request.message);
     const casualCheckIn = messageIntent.intent === 'casual';

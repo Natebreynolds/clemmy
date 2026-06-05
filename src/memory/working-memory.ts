@@ -10,6 +10,233 @@ import { isUserFacingSession } from '../execution/scope.js';
 
 const SESSION_WORKING_MEMORY_DIR = path.join(path.dirname(WORKING_MEMORY_FILE), 'state', 'working-memory');
 
+/**
+ * Heading for the pinned "Active Task" block — the durable, same-turn-visible
+ * home for a hard constraint the user states mid-chat ("send 25 emails to ONLY
+ * this list: …"). It is the single source of truth Clem re-reads when she acts,
+ * so she stops drifting to a different/stale list across many back-and-forth
+ * turns. Distinct from the existing "## Focus" block (which carries the coarse
+ * execution/plan focus, not the verbatim constraint parameters).
+ */
+const ACTIVE_TASK_HEADING = '## Active Task';
+
+/**
+ * How long a pinned Active Task stays binding before it is treated as stale and
+ * dropped on the next turn-end refresh. Bounds the "stale spec poisons the next
+ * task" risk without needing reliable completion detection (deferred). A fresh
+ * full spec on a later turn replaces it sooner (last-writer-wins).
+ */
+const ACTIVE_TASK_TTL_MS = 6 * 60 * 60 * 1000;
+
+export interface ActiveTaskSpec {
+  /** ISO timestamp; drives the staleness window. */
+  capturedAt: string;
+  /** The mutating/outbound verb that triggered the pin (e.g. "send"). */
+  verb?: string;
+  /** Explicit count when stated ("25 emails"). */
+  count?: number;
+  /** The named recipient/target set, stored VERBATIM and untruncated. */
+  recipients: string[];
+  /** "only" | "exactly" | "just" when the user constrained scope. */
+  exclusivity?: string;
+  /** The raw constraint clause (capped), for provenance. */
+  constraintText: string;
+}
+
+// A mutating / outbound verb whose parameters must be pinned so they survive
+// the conversation. Mirrors the intent of plan-first's write-verb set; kept
+// local so the memory layer stays self-contained (no harness import).
+const TASK_VERB_RE =
+  /\b(send|e-?mail|emails?|draft|message|dm|post|publish|reply|forward|create|add|invite|schedule|book|update|delete|remove)\b/i;
+// Determiner that points at a specific list the user is naming.
+const LIST_MARKER_RE = /\b(this|these|those|the following|the list|my list)\b/i;
+// "only/exactly/just these" — an explicit exclusivity constraint.
+const EXCLUSIVITY_RE = /\b(only|exactly|just)\b/i;
+// An explicit count governing a plural-ish noun ("25 emails", "10 contacts").
+const COUNT_RE = /\b(\d{1,4})\s+(?:[a-z][\w-]*\s+){0,2}?(emails?|recipients?|people|contacts?|messages?|names?|addresses|folks|clients?|customers?|leads?|invites?)\b/i;
+const EMAIL_RE = /[\w.+-]+@[\w-]+\.[\w.-]+/g;
+// A plausible person/recipient name: 1–5 letter-tokens. Conservative so a
+// chatty sentence ("send me your thoughts") doesn't read as a recipient.
+const PLAUSIBLE_NAME_RE = /^[A-Za-z][A-Za-z.'’-]*(?:\s+[A-Za-z][A-Za-z.'’-]*){0,4}$/;
+
+function dedupePreserveOrder(items: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const item of items) {
+    const key = item.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(item);
+  }
+  return out;
+}
+
+/**
+ * Pull the explicit recipient set out of a message. Prefers email addresses;
+ * otherwise an enumerated list after a colon / list marker. Returns [] unless
+ * there are at least two concrete recipients (the conservative bar that keeps
+ * ordinary imperatives like "send the report" from being captured).
+ */
+function parseRecipients(text: string): string[] {
+  const emails = text.match(EMAIL_RE);
+  if (emails && emails.length >= 2) return dedupePreserveOrder(emails);
+
+  // Enumerated names — look at the clause after the last colon if present
+  // (that's where "…this list: Alice, Bob, …" puts them), else the whole text.
+  const colon = text.lastIndexOf(':');
+  const tail = colon >= 0 && colon < text.length - 1 ? text.slice(colon + 1) : text;
+  const items = tail
+    .split(/[,\n;]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const names = items.filter((item) => item.length <= 60 && PLAUSIBLE_NAME_RE.test(item));
+  if (names.length >= 2) return dedupePreserveOrder(names);
+
+  return emails && emails.length >= 1 ? dedupePreserveOrder(emails) : [];
+}
+
+/**
+ * Deterministic, no-LLM detector for an "action-with-parameters" turn: a
+ * mutating verb co-occurring with a concrete recipient/target set. Returns a
+ * spec to pin, or null. Conservative by construction — resolves ambiguity to
+ * "no spec" so it never over-constrains a later turn (forward-only).
+ */
+export function detectActiveTask(message: string): ActiveTaskSpec | null {
+  const text = (message ?? '').replace(/\s+/g, ' ').trim();
+  if (text.length < 8) return null;
+  if (!TASK_VERB_RE.test(text)) return null;
+
+  const recipients = parseRecipients(text);
+  if (recipients.length < 2) return null; // require a concrete list
+
+  const verbMatch = text.match(TASK_VERB_RE);
+  const countMatch = COUNT_RE.exec(text);
+  const count = countMatch ? Number.parseInt(countMatch[1], 10) : undefined;
+  const exclusivity = EXCLUSIVITY_RE.test(text) && LIST_MARKER_RE.test(text)
+    ? (text.match(EXCLUSIVITY_RE)?.[0]?.toLowerCase())
+    : undefined;
+
+  return {
+    capturedAt: new Date().toISOString(),
+    verb: verbMatch ? verbMatch[0].toLowerCase() : undefined,
+    count: Number.isFinite(count) ? count : undefined,
+    recipients,
+    exclusivity,
+    constraintText: text.slice(0, 1500),
+  };
+}
+
+function renderActiveTaskSection(spec: ActiveTaskSpec): string {
+  const lines = [
+    `${ACTIVE_TASK_HEADING} (binding — act on THIS list/count below, not on recalled context; the latest stated version wins)`,
+  ];
+  const meta: string[] = [];
+  if (spec.verb) meta.push(`Action: ${spec.verb}`);
+  if (spec.count != null) meta.push(`Count: ${spec.count}`);
+  if (spec.exclusivity) meta.push(`Scope: ${spec.exclusivity} these`);
+  if (meta.length) lines.push(meta.join(' | '));
+  if (spec.recipients.length) {
+    lines.push('Recipients (verbatim — do not substitute or re-derive):');
+    for (const recipient of spec.recipients) lines.push(`- ${recipient}`);
+  }
+  if (spec.constraintText) lines.push(`Stated: ${spec.constraintText}`);
+  lines.push(`Captured: ${spec.capturedAt}`);
+  return lines.join('\n');
+}
+
+const ACTIVE_TASK_SECTION_RE = /## Active Task[\s\S]*?(?=\n## |$)/;
+
+/** Write/replace the Active Task section in the per-session file synchronously
+ *  (last-writer-wins). Placed right after the file header so it stays within
+ *  the 3000-char read window. Best-effort — never throws. */
+export function writeActiveTaskSection(sessionId: string, spec: ActiveTaskSpec): void {
+  try {
+    const filePath = workingMemoryPathForSession(sessionId);
+    const body = renderActiveTaskSection(spec).trimEnd();
+    let existing = '';
+    if (existsSync(filePath)) {
+      try { existing = readFileSync(filePath, 'utf-8'); } catch { existing = ''; }
+    }
+
+    let next: string;
+    if (ACTIVE_TASK_SECTION_RE.test(existing)) {
+      next = existing.replace(ACTIVE_TASK_SECTION_RE, `${body}\n`);
+    } else if (/^# Working Memory/.test(existing)) {
+      next = existing.replace(/^(# Working Memory\n+)/, `$1${body}\n\n`);
+    } else if (existing.trim()) {
+      next = `${body}\n\n${existing}`;
+    } else {
+      next = `# Working Memory\n\n${body}\n`;
+    }
+
+    mkdirSync(SESSION_WORKING_MEMORY_DIR, { recursive: true });
+    writeFileSync(filePath, next);
+  } catch {
+    // best-effort; pinning a constraint must never break a turn.
+  }
+}
+
+function parseCapturedAt(sectionText: string): number | undefined {
+  const match = sectionText.match(/Captured:\s*(\S+)/);
+  if (!match) return undefined;
+  const ts = Date.parse(match[1]);
+  return Number.isNaN(ts) ? undefined : ts;
+}
+
+/** Return the LIVE (non-stale) Active Task section text for a session, or
+ *  undefined if absent or past its TTL. */
+export function readActiveTaskSection(sessionId: string): string | undefined {
+  try {
+    const filePath = workingMemoryPathForSession(sessionId);
+    if (!existsSync(filePath)) return undefined;
+    const content = readFileSync(filePath, 'utf-8');
+    const match = content.match(ACTIVE_TASK_SECTION_RE);
+    if (!match) return undefined;
+    const section = match[0];
+    const capturedAt = parseCapturedAt(section);
+    if (capturedAt !== undefined && Date.now() - capturedAt > ACTIVE_TASK_TTL_MS) {
+      return undefined; // stale — let the next refresh drop it
+    }
+    return section.trimEnd();
+  } catch {
+    return undefined;
+  }
+}
+
+/** Cheap probe for the memory-budget override: does a live Active Task spec
+ *  exist for this session? */
+export function hasActiveTaskSection(sessionId: string): boolean {
+  return readActiveTaskSection(sessionId) !== undefined;
+}
+
+/** Remove the Active Task section (e.g. on completion/pivot). Best-effort. */
+export function dropActiveTaskSection(sessionId: string): void {
+  try {
+    const filePath = workingMemoryPathForSession(sessionId);
+    if (!existsSync(filePath)) return;
+    const content = readFileSync(filePath, 'utf-8');
+    if (!ACTIVE_TASK_SECTION_RE.test(content)) return;
+    writeFileSync(filePath, content.replace(ACTIVE_TASK_SECTION_RE, '').replace(/\n{3,}/g, '\n\n'));
+  } catch {
+    // best-effort.
+  }
+}
+
+/**
+ * Pin a stated action constraint synchronously at turn start. Detects an
+ * action-with-parameters turn and writes/replaces the Active Task section
+ * (last-writer-wins). On a turn with no detectable spec it does nothing, so any
+ * existing spec is carried forward by refreshWorkingMemory. Best-effort.
+ */
+export function reconcileActiveTask(sessionId: string, message: string): void {
+  try {
+    const spec = detectActiveTask(message);
+    if (spec) writeActiveTaskSection(sessionId, spec);
+  } catch {
+    // best-effort; a capture failure must never break a turn.
+  }
+}
+
 function workingMemoryDigest(sessionId: string): string {
   return createHash('sha1').update(sessionId).digest('hex');
 }
@@ -103,11 +330,23 @@ export function refreshWorkingMemory(session: SessionRecord): void {
     '',
   ];
 
-  const content = sections.join('\n');
+  const baseContent = sections.join('\n');
+
+  // Carry forward a LIVE Active Task section written synchronously at turn
+  // start. Without this, the full-file rewrite here clobbers it and the
+  // constraint drift returns (the top regression). It is placed FIRST so it
+  // survives the 3000-char read window, and kept OUT of the GLOBAL file so one
+  // session's verbatim recipient list never leaks into the harness/other
+  // surfaces (which read the global WORKING_MEMORY_FILE).
+  const activeTask = readActiveTaskSection(session.id);
+  const perSessionContent = activeTask
+    ? ['# Working Memory', '', activeTask, '', ...sections.slice(2)].join('\n')
+    : baseContent;
+
   mkdirSync(SESSION_WORKING_MEMORY_DIR, { recursive: true });
-  writeFileSync(workingMemoryPathForSession(session.id), content);
+  writeFileSync(workingMemoryPathForSession(session.id), perSessionContent);
   if (isUserFacingSession(session.id, session.channel)) {
-    writeFileSync(WORKING_MEMORY_FILE, content);
+    writeFileSync(WORKING_MEMORY_FILE, baseContent);
   }
 }
 

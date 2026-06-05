@@ -1,6 +1,6 @@
 import { loadMemoryContext } from './vault.js';
 import { loadSessionBrief, renderSessionContinuity } from './session-briefs.js';
-import { loadWorkingMemoryForSession } from './working-memory.js';
+import { hasActiveTaskSection, loadWorkingMemoryForSession } from './working-memory.js';
 import { formatSearchHits, searchVault, searchVaultAsync } from './search.js';
 import type { AssembledPromptContext } from '../types.js';
 import { classifyMessageIntent, memoryBudgetFor } from '../assistant/message-intent.js';
@@ -26,7 +26,7 @@ function buildSearchQuery(memoryContext: { workingMemory?: string; sessionBrief?
  */
 export async function assemblePromptContextAsync(sessionId: string, message: string, transcript: string): Promise<AssembledPromptContext> {
   const intent = classifyMessageIntent(message);
-  const budget = memoryBudgetFor(intent.intent);
+  const budget = memoryBudgetFor(intent.intent, { hasActiveTaskSpec: hasActiveTaskSection(sessionId) });
   const brief = budget.loadSessionBrief ? loadSessionBrief(sessionId) : undefined;
   const memoryContext = {
     ...loadMemoryContext(),
@@ -48,7 +48,7 @@ export async function assemblePromptContextAsync(sessionId: string, message: str
  */
 export function assemblePromptContext(sessionId: string, message: string, transcript: string): AssembledPromptContext {
   const intent = classifyMessageIntent(message);
-  const budget = memoryBudgetFor(intent.intent);
+  const budget = memoryBudgetFor(intent.intent, { hasActiveTaskSpec: hasActiveTaskSection(sessionId) });
   const brief = budget.loadSessionBrief ? loadSessionBrief(sessionId) : undefined;
   const memoryContext = {
     ...loadMemoryContext(),

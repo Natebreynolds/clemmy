@@ -20,6 +20,15 @@ function section(title: string, body?: string): string {
   return `## ${title}\n${body.trim()}`;
 }
 
+/** Pull the pinned "## Active Task" block out of the working-memory string, if
+ *  present, so it can be surfaced even on a light (casual/meta) turn where the
+ *  rest of working memory is intentionally withheld. */
+function extractActiveTaskBlock(workingMemory?: string): string | undefined {
+  if (!workingMemory) return undefined;
+  const match = workingMemory.match(/## Active Task[\s\S]*?(?=\n## |$)/);
+  return match ? match[0].trim() : undefined;
+}
+
 interface GoalSummary {
   id: string;
   title: string;
@@ -317,7 +326,12 @@ export function buildTurnContextBlock(context: MemoryContext, intent?: MessageIn
   // working request blind to facts + proven tools — send a one-line pointer so
   // the model knows the context is one call away the moment the turn turns real.
   if (intent === 'casual' || intent === 'meta_clarify') {
-    return 'Context for this turn (private — use as needed, do not recite): any standing facts are above. If this turns into real work, pull your saved facts and proven tools first (memory_search_facts, tool_choice_recall, working_memory, goal_list) — they exist even though they are not inlined on this lightweight turn.';
+    const pointer = 'Context for this turn (private — use as needed, do not recite): any standing facts are above. If this turns into real work, pull your saved facts and proven tools first (memory_search_facts, tool_choice_recall, working_memory, goal_list) — they exist even though they are not inlined on this lightweight turn.';
+    // A pinned Active Task is binding even on a casual/approval turn ("ok",
+    // "go ahead") — surface it so the model never acts blind to the list it
+    // was told to use. Other working-memory content stays out on light turns.
+    const activeTask = extractActiveTaskBlock(context.workingMemory);
+    return activeTask ? `${activeTask}\n\n${pointer}` : pointer;
   }
   const objective = getRecallObjective(message);
   const { recentlyLearned, toolChoices } = renderLearnedBlocks(objective);
