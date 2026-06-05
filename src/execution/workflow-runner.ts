@@ -47,6 +47,7 @@ import {
 } from './workflow-diagnosis.js';
 import { requeueWorkflowFromRun } from '../tools/workflow-run-queue.js';
 import { stepLooksLikeIrreversibleSend } from './workflow-enforce.js';
+import { preflightWorkflow, renderPreflightReport } from './workflow-preflight.js';
 import { takeStepResult } from '../tools/step-result-tool.js';
 import { configureHarnessRuntime } from '../runtime/harness/codex-client.js';
 import { closePlanScope, openPlanScope } from '../agents/plan-scope.js';
@@ -2321,8 +2322,13 @@ async function drainWorkflowRuns(assistant: ClementineAssistant): Promise<void> 
       notifyCancelledRunOnce(filePath, run);
     }
     // Pick up queued runs and runs marked as running but never
-    // completed (resume after daemon restart).
-    if (run.status && run.status !== 'queued' && run.status !== 'running') continue;
+    // completed (resume after daemon restart). Also pick up a FRESH dry_run
+    // request (the dashboard DRY-RUN button) — but not one already finished.
+    if (run.status === 'dry_run') {
+      if (run.finishedAt) continue;
+    } else if (run.status && run.status !== 'queued' && run.status !== 'running') {
+      continue;
+    }
     if (inFlightRunIds.has(run.id)) continue; // already draining in another slot
     eligible.push({ file, filePath, run });
   }
@@ -2466,6 +2472,34 @@ async function processOneRunFile(
         createdAt: new Date().toISOString(),
         read: false,
         metadata: { workflow: run.workflow, runId: run.id },
+      });
+      markRunNotified(filePath);
+      return;
+    }
+    // DRY-RUN: a safe, side-effect-free runnability preflight (the dashboard
+    // DRY-RUN button + auto-smoke-test on promotion). Works on a DISABLED
+    // draft (it's exactly what you dry-run), executes NOTHING, and reports a
+    // per-issue "would this run?" verdict, then finalizes the record.
+    if (run.status === 'dry_run') {
+      const inputs = normalizeWorkflowRunInputs({
+        ...Object.fromEntries(Object.entries(workflow.data.inputs ?? {}).map(([k, meta]) => [k, meta.default ?? ''])),
+        ...(run.inputs ?? {}),
+      });
+      const preflight = preflightWorkflow(workflow.data, inputs);
+      writeRunRecord(filePath, {
+        ...run,
+        status: 'dry_run',
+        finishedAt: new Date().toISOString(),
+        output: preflight.summary,
+      });
+      addNotification({
+        id: `workflow-${run.id}-dryrun`,
+        kind: 'workflow',
+        title: preflight.ok ? `Dry-run OK: ${workflow.data.name}` : `Dry-run found issues: ${workflow.data.name}`,
+        body: renderPreflightReport(workflow.data.name, preflight),
+        createdAt: new Date().toISOString(),
+        read: false,
+        metadata: { workflow: workflow.data.name, runId: run.id, dryRun: true, preflightOk: preflight.ok },
       });
       markRunNotified(filePath);
       return;

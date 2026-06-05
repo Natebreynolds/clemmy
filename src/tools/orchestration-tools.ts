@@ -19,6 +19,7 @@ import { prepareWorkflowForWrite } from '../execution/workflow-enforce.js';
 import { describeWorkflowPlainEnglish, describeWorkflowOneLine, describeCron } from '../execution/workflow-describe.js';
 import { validateCronExpression } from '../shared/cron.js';
 import { draftWorkflowFromSession, type WorkflowDraft } from '../execution/trace-to-workflow.js';
+import { preflightWorkflow } from '../execution/workflow-preflight.js';
 import { analyzeWorkflowGaps, renderWorkflowGapQuestions } from '../execution/workflow-gap-test.js';
 import {
   CRON_PROGRESS_DIR,
@@ -707,12 +708,14 @@ export function registerOrchestrationTools(server: McpServer): void {
         return textResult(`I couldn't build "${name}" from this chat — these need fixing first:\n- ${built.errors.join('\n- ')}`);
       }
       const n = draft.toolCallCount;
+      const preflight = preflightWorkflow(built.savedDef);
       return textResult(
         `Built a draft workflow "${name}" from this chat — saved DISABLED so you can review before it runs.\n\n`
           + describeWorkflowPlainEnglish(built.savedDef)
+          + `\n\n${preflight.ok ? '✅' : '⚠️'} ${preflight.summary}`
           + `\n\nReconstructed from ${n} action${n === 1 ? '' : 's'} you took. Before enabling:\n- ${draft.notes.join('\n- ')}`
           + renderWorkflowGapQuestions(built.gaps)
-          + `\n\nRefine any step with workflow_update, then enable it with workflow_set_enabled when it's ready.`,
+          + `\n\nRefine any step with workflow_update, dry-run it to smoke-test, then enable it with workflow_set_enabled when it's ready.`,
       );
     },
   );
