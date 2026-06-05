@@ -375,12 +375,76 @@ export function listProposedFixes(): ProposedFix[] {
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 }
 
+// ─── 3b. Rollback backups (self-improvement hole #7) ─────────────────
+//
+// An auto-applied fix overwrites the step prompt with no way back — a bad
+// heal degrades the workflow permanently. Before any fix is written, snapshot
+// the PRIOR full definition so the change is reversible (`revert heal <id>`).
+
+const FIX_BACKUPS_DIR = path.join(STATE_DIR, 'workflow-fix-backups');
+
+export interface FixBackup {
+  id: string;
+  workflow: string;
+  stepId: string;
+  priorDefinition: WorkflowDefinition;
+  description: string;
+  createdAt: string;
+}
+
+/** Snapshot the prior definition before a fix is written. Best-effort
+ *  (disk-full / FS errors never block the heal) — returns null on failure. */
+function recordFixBackup(
+  workflow: string,
+  stepId: string,
+  priorDefinition: WorkflowDefinition,
+  description: string,
+): FixBackup | null {
+  try {
+    fs.mkdirSync(FIX_BACKUPS_DIR, { recursive: true });
+    const id = `heal-${randomUUID().slice(0, 8)}`;
+    const backup: FixBackup = { id, workflow, stepId, priorDefinition, description, createdAt: new Date().toISOString() };
+    fs.writeFileSync(path.join(FIX_BACKUPS_DIR, `${id}.json`), JSON.stringify(backup, null, 2));
+    return backup;
+  } catch (err) {
+    logger.warn({ err, workflow, stepId }, 'self-heal: could not record fix backup (heal not reversible)');
+    return null;
+  }
+}
+
+export function listFixBackups(): FixBackup[] {
+  if (!fs.existsSync(FIX_BACKUPS_DIR)) return [];
+  return fs.readdirSync(FIX_BACKUPS_DIR)
+    .filter((f) => f.endsWith('.json'))
+    .map((f) => { try { return JSON.parse(fs.readFileSync(path.join(FIX_BACKUPS_DIR, f), 'utf8')) as FixBackup; } catch { return null; } })
+    .filter((x): x is FixBackup => x !== null)
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+}
+
+/** Restore the workflow to its pre-fix definition. Reverses an auto- or
+ *  manually-applied heal that made things worse. */
+export function revertWorkflowFix(id: string): ApplyResult {
+  const safe = id.replace(/[^a-zA-Z0-9_-]/g, '');
+  const file = path.join(FIX_BACKUPS_DIR, `${safe}.json`);
+  if (!fs.existsSync(file)) return { ok: false, message: `No revertable heal found with id "${id}".` };
+  let backup: FixBackup;
+  try { backup = JSON.parse(fs.readFileSync(file, 'utf8')) as FixBackup; }
+  catch { return { ok: false, message: `Heal backup "${id}" is unreadable.` }; }
+  if (!readWorkflow(backup.workflow)) return { ok: false, message: `Workflow "${backup.workflow}" no longer exists.` };
+  writeWorkflow(backup.workflow, backup.priorDefinition);
+  try { fs.unlinkSync(file); } catch { /* best-effort */ }
+  logger.info({ workflow: backup.workflow, step: backup.stepId, healId: id }, 'self-heal: reverted workflow fix');
+  return { ok: true, message: `Reverted "${backup.workflow}" to the version before the auto-fix on step "${backup.stepId}".` };
+}
+
 // ─── 4. Apply (approval-gated only) ──────────────────────────────────
 
 export interface ApplyResult {
   ok: boolean;
   message: string;
   errors?: string[];
+  /** Set when the apply snapshotted a reversible backup (`revert heal <id>`). */
+  backupId?: string;
 }
 
 /**
@@ -414,10 +478,17 @@ export function applyProposedFix(id: string): ApplyResult {
   if (!check.ok) {
     return { ok: false, message: `The proposed fix would fail workflow validation; not applied.`, errors: check.errors };
   }
+  // Snapshot the PRIOR definition first so a bad heal is reversible (#7).
+  const backup = recordFixBackup(fix.workflow, fix.stepId, def, d.fix.description);
   writeWorkflow(fix.workflow, updated);
   dismissProposedFix(id);
-  logger.info({ workflow: fix.workflow, step: fix.stepId, fixId: id }, 'self-heal: applied workflow fix');
-  return { ok: true, message: `Applied the fix to "${fix.workflow}" · step "${fix.stepId}". Re-run the workflow when ready.` };
+  logger.info({ workflow: fix.workflow, step: fix.stepId, fixId: id, backupId: backup?.id }, 'self-heal: applied workflow fix');
+  const revertHint = backup ? ` If it doesn't help, revert with \`revert heal ${backup.id}\`.` : '';
+  return {
+    ok: true,
+    message: `Applied the fix to "${fix.workflow}" · step "${fix.stepId}". Re-run the workflow when ready.${revertHint}`,
+    backupId: backup?.id,
+  };
 }
 
 // ─── Legible rendering (safe to use unconditionally) ─────────────────

@@ -28,7 +28,10 @@ const {
   listProposedFixes,
   dismissProposedFix,
   applyProposedFix,
+  revertWorkflowFix,
+  listFixBackups,
 } = mod;
+const { writeWorkflow, readWorkflow } = await import('../memory/workflow-store.js');
 
 test('detectBlockedSteps finds blocked results (object + JSON string), skips synthesis', () => {
   const blocked = detectBlockedSteps({
@@ -187,4 +190,34 @@ test('applyProposedFix refuses unknown id and non-auto-applicable fixes', () => 
   const res = applyProposedFix(reconnect.id);
   assert.equal(res.ok, false);
   assert.match(res.message, /Reconnect Google Drive/);
+});
+
+// ─── #7: rollback / revert of an applied auto-fix ────────────────────
+
+test('applyProposedFix snapshots a backup, and revertWorkflowFix restores the prior prompt', () => {
+  writeWorkflow('revert-wf', {
+    name: 'revert-wf', description: 'revert test', enabled: true, trigger: { manual: true },
+    steps: [{ id: 'main', prompt: 'ORIGINAL step prompt' }],
+  } as never);
+  const fix = recordProposedFix('revert-wf', 'run-r', {
+    summary: 's', rootCause: 'r',
+    fix: { kind: 'edit_step' as const, stepId: 'main', description: 'rewrite it', newStepPrompt: 'REWRITTEN step prompt', service: null, autoApplicable: true },
+    confidence: 'high' as const,
+  });
+  const applied = applyProposedFix(fix.id);
+  assert.equal(applied.ok, true, applied.message);
+  assert.ok(applied.backupId, 'a backup id was returned');
+  assert.match(applied.message, /revert heal/);
+  assert.equal(readWorkflow('revert-wf')!.data.steps[0].prompt, 'REWRITTEN step prompt'); // fix applied
+  assert.ok(listFixBackups().some((b) => b.id === applied.backupId));
+
+  const reverted = revertWorkflowFix(applied.backupId!);
+  assert.equal(reverted.ok, true, reverted.message);
+  assert.equal(readWorkflow('revert-wf')!.data.steps[0].prompt, 'ORIGINAL step prompt'); // restored
+  // backup consumed → a second revert is a no-op
+  assert.equal(revertWorkflowFix(applied.backupId!).ok, false);
+});
+
+test('revertWorkflowFix on an unknown id fails cleanly', () => {
+  assert.equal(revertWorkflowFix('heal-nope').ok, false);
 });

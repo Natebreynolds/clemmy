@@ -20,6 +20,7 @@ import { describeWorkflowPlainEnglish, describeWorkflowOneLine, describeCron } f
 import { validateCronExpression } from '../shared/cron.js';
 import { draftWorkflowFromSession, type WorkflowDraft } from '../execution/trace-to-workflow.js';
 import { preflightWorkflow } from '../execution/workflow-preflight.js';
+import { clearWorkflowFailures } from '../execution/workflow-failure-ledger.js';
 import { analyzeWorkflowGaps, renderWorkflowGapQuestions } from '../execution/workflow-gap-test.js';
 import {
   CRON_PROGRESS_DIR,
@@ -950,6 +951,9 @@ export function registerOrchestrationTools(server: McpServer): void {
           );
         }
         writeWorkflow(entry.name, { ...prep.def, enabled: true });
+        // Re-enabling is a deliberate fresh start — clear any chronic-failure
+        // streak so auto-heal/escalation resets (#6).
+        clearWorkflowFailures(entry.name);
         return textResult(
           `Workflow "${name}" is now approved (enabled).`
             + (prep.repairs.length ? `\n\nAuto-wired on enable:\n- ${prep.repairs.join('\n- ')}` : ''),

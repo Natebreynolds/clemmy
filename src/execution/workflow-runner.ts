@@ -48,6 +48,7 @@ import {
 import { requeueWorkflowFromRun } from '../tools/workflow-run-queue.js';
 import { stepLooksLikeIrreversibleSend } from './workflow-enforce.js';
 import { preflightWorkflow, renderPreflightReport } from './workflow-preflight.js';
+import { recordWorkflowOutcome, shouldStopAutoHeal, escalateThreshold } from './workflow-failure-ledger.js';
 import { takeStepResult } from '../tools/step-result-tool.js';
 import { configureHarnessRuntime } from '../runtime/harness/codex-client.js';
 import { closePlanScope, openPlanScope } from '../agents/plan-scope.js';
@@ -2404,6 +2405,16 @@ function tryAutoHealAndRequeue(args: {
 }): AutoHealOutcome | null {
   const { run, workflowSlug, steps, diagnosis, proposedFix, completedStepIds } = args;
   if (!selfHealEnabled() || !diagnosis || !proposedFix) return null;
+  // Cross-fire guard (#6): a workflow that has failed N times in a row is
+  // clearly stuck — stop re-running the WHOLE thing to auto-heal (the
+  // expensive multiplier) and let it escalate to the human instead.
+  if (shouldStopAutoHeal(workflowSlug)) {
+    logger.info(
+      { runId: run.id, workflow: workflowSlug, consecutiveFailures: escalateThreshold() },
+      'self-heal: workflow is chronically failing — auto-heal paused, escalating',
+    );
+    return null;
+  }
   const fix = diagnosis.fix;
   if (fix.kind !== 'edit_step' || !fix.autoApplicable || !fix.newStepPrompt) return null; // only safe prompt rewrites
   const max = selfHealAutoMaxAttempts();
@@ -2661,6 +2672,16 @@ async function processOneRunFile(
       }
       const needsAttention = blockedSteps.length > 0;
 
+      // Cross-fire failure ledger (#6): record this run's outcome so a
+      // chronically-failing workflow stops auto-healing + escalates. A clean
+      // run resets the streak. (Heal re-runs count too — a fire whose heals all
+      // fail is genuinely stuck, and escalating then is correct.)
+      const ledger = recordWorkflowOutcome(workflow.name, !needsAttention, needsAttention ? blockedSteps[0]?.reason : undefined);
+      const autoHealPaused = needsAttention && shouldStopAutoHeal(workflow.name);
+      const escalationBanner = autoHealPaused
+        ? `⚠️ "${workflow.data.name}" has failed ${ledger.consecutiveFailures} runs in a row — auto-heal is PAUSED to stop wasting tokens. Review the blocked step(s) below; if a recent auto-fix caused this, revert it with \`revert heal <id>\`. It resumes automatically after one clean run, and (for a scheduled workflow) consider disabling it until fixed.\n\n`
+        : '';
+
       writeRunRecord(filePath, {
         ...run,
         status: 'completed',
@@ -2759,6 +2780,9 @@ async function processOneRunFile(
         runId: run.id,
         notifications: loadNotifications(),
       });
+      // Single report body (escalation banner prepended when auto-heal is
+      // paused), reused for the notification, dashboard preview, and chat re-entry.
+      const reportBody = `${escalationBanner}${needsAttention ? outcome.body : successBody}${advisorySummary}`;
       addNotification({
         id: `${Date.now()}-workflow-${run.id}`,
         kind: 'workflow',
@@ -2769,11 +2793,12 @@ async function processOneRunFile(
         // multiple messages; previous 2000-char slice cut off workflow
         // results above that length with no continuation. Quality advisories
         // are appended to whichever body we send (never replace the deliverable).
-        body: `${needsAttention ? outcome.body : successBody}${advisorySummary}`,
+        body: reportBody,
         createdAt: new Date().toISOString(),
         read: false,
         // Advisories must reach the user — never silence a run that has one.
-        silent: stepAlreadyNotified && !hasAdvisories,
+        // A chronic-failure escalation must also always deliver.
+        silent: stepAlreadyNotified && !hasAdvisories && !autoHealPaused,
         metadata: {
           workflow: workflow.data.name,
           runId: run.id,
@@ -2790,7 +2815,7 @@ async function processOneRunFile(
           message: needsAttention
             ? `Needs attention — ${blockedSteps.length} step${blockedSteps.length === 1 ? '' : 's'} blocked`
             : `Completed${hasFailures ? ` with ${forEachFailures.length} item failure${forEachFailures.length === 1 ? '' : 's'}` : ''}${hasAdvisories ? ` · ${qualityAdvisories.length} quality advisory${qualityAdvisories.length === 1 ? '' : 'ies'}` : ''}`,
-          outputPreview: `${(needsAttention ? outcome.body : successBody)}${advisorySummary}`.slice(0, 800),
+          outputPreview: reportBody.slice(0, 800),
         });
       } catch { /* best-effort */ }
       // Gap E: re-enter the origin chat in-context (no-op for scheduled/cron).
@@ -2800,7 +2825,7 @@ async function processOneRunFile(
         run,
         workflow.data.name,
         needsAttention || hasAdvisories ? 'blocked' : 'done',
-        `${needsAttention ? outcome.body : successBody}${advisorySummary}`,
+        reportBody,
       );
       logger.info({ workflow: workflow.data.name, runId: run.id, partialFailures: forEachFailures.length, blockedSteps: blockedSteps.length, advisories: qualityAdvisories.length, diagnosed: !!diagnosis }, 'Workflow run completed');
     } catch (error) {
@@ -2869,6 +2894,13 @@ async function processOneRunFile(
       }
       const message = error instanceof Error ? error.message : String(error);
       const cancelled = error instanceof WorkflowRunCancelledError || isWorkflowRunCancelled(run.id);
+      // Cross-fire failure ledger (#6): a thrown failure counts too (a user
+      // cancel does not). Surfaces the chronic-failure escalation on the error
+      // path, mirroring the blocked-step path above.
+      const errLedger = !cancelled ? recordWorkflowOutcome(workflow.name, false, message) : null;
+      const errEscalationBanner = errLedger && shouldStopAutoHeal(workflow.name)
+        ? `⚠️ "${workflow.data.name}" has failed ${errLedger.consecutiveFailures} runs in a row — please check it (and, for a scheduled workflow, consider disabling it until fixed). It resumes normal handling after one clean run.\n\n`
+        : '';
       logger[cancelled ? 'info' : 'error']({ err: error, file }, cancelled ? 'Workflow run cancelled' : 'Workflow run failed');
       appendWorkflowEvent(workflow.name, run.id, { kind: cancelled ? 'run_cancelled' : 'run_failed', error: message });
       writeRunRecord(filePath, {
@@ -2924,7 +2956,7 @@ async function processOneRunFile(
         id: `workflow-${run.id}-${cancelled ? 'cancelled' : 'error'}`,
         kind: 'workflow',
         title: healTitle ?? (cancelled ? `Workflow cancelled: ${run.workflow}` : `Workflow failed: ${run.workflow}`),
-        body: healBody ?? message,
+        body: `${errEscalationBanner}${healBody ?? message}`,
         createdAt: new Date().toISOString(),
         read: false,
         metadata: {
@@ -2939,7 +2971,7 @@ async function processOneRunFile(
       // scheduled/cron). Skip a user-initiated CANCEL — the user already knows
       // (mirrors background-tasks skipping aborted).
       if (!cancelled) {
-        enqueueWorkflowOutcomeTurn(run, run.workflow, 'failed', healBody ?? message);
+        enqueueWorkflowOutcomeTurn(run, run.workflow, 'failed', `${errEscalationBanner}${healBody ?? message}`);
       }
       try {
         finishRun(run.id, {

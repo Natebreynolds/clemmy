@@ -13,7 +13,7 @@ import {
 import { MODELS } from '../config.js';
 import { addRunEvent, finishRun, getRun, listRuns, startRun, type RunRecord } from '../runtime/run-events.js';
 import { loadProactivityPolicy } from '../agents/proactivity-policy.js';
-import { applyProposedFix, dismissProposedFix, listProposedFixes, loadProposedFix } from '../execution/workflow-diagnosis.js';
+import { applyProposedFix, dismissProposedFix, listProposedFixes, loadProposedFix, revertWorkflowFix } from '../execution/workflow-diagnosis.js';
 import { requeueWorkflowFromRun } from '../tools/workflow-run-queue.js';
 import type { ToolActivity } from '../types.js';
 
@@ -64,7 +64,8 @@ type GatewayCommand =
   | { type: 'run_status'; id: string }
   | { type: 'list_fixes' }
   | { type: 'apply_fix'; id: string }
-  | { type: 'dismiss_fix'; id: string };
+  | { type: 'dismiss_fix'; id: string }
+  | { type: 'revert_heal'; id: string };
 
 function clean(value: string, maxChars = 200): string {
   return value.replace(/\s+/g, ' ').trim().slice(0, maxChars);
@@ -129,6 +130,11 @@ function parseCommand(message: string): GatewayCommand | null {
   const dismissFixMatch = withoutSlash.match(/^(?:dismiss|skip|reject|decline)\s+fix\s+(fix-[a-z0-9]+)$/i);
   if (dismissFixMatch) {
     return { type: 'dismiss_fix', id: dismissFixMatch[1].toLowerCase() };
+  }
+  // Reverse an applied auto-fix (self-improvement #7): `revert heal heal-xxxx`.
+  const revertHealMatch = withoutSlash.match(/^(?:revert|undo)\s+(?:heal|fix)\s+(heal-[a-z0-9]+)$/i);
+  if (revertHealMatch) {
+    return { type: 'revert_heal', id: revertHealMatch[1].toLowerCase() };
   }
 
   return null;
@@ -402,6 +408,15 @@ export class ClementineGateway {
         sessionId: request.sessionId,
         handledControl: true,
         text: dismissed ? `Dismissed proposed fix ${command.id}.` : `I couldn't find proposed fix ${command.id}.`,
+      };
+    }
+
+    if (command.type === 'revert_heal') {
+      const result = revertWorkflowFix(command.id);
+      return {
+        sessionId: request.sessionId,
+        handledControl: true,
+        text: result.ok ? `↩️ ${result.message}` : `I couldn't revert ${command.id}: ${result.message}`,
       };
     }
 
