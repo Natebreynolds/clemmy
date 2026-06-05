@@ -34,6 +34,12 @@ test('buildWorkerJobPrompt renders resolved tools as authoritative and blocks re
   assert.match(prompt, /final line must start with ERROR:/);
 });
 
+test('buildWorkerJobPrompt forbids substituting a different list for the parent-pinned target', () => {
+  const prompt = buildWorkerJobPrompt(validPacket);
+  assert.match(prompt, /parent-pinned binding target/);
+  assert.match(prompt, /do NOT re-discover, search for, or substitute a different list/i);
+});
+
 test('buildWorkerJobPrompt allows no-tool local workers without forcing discovery', () => {
   const prompt = buildWorkerJobPrompt({
     ...validPacket,
