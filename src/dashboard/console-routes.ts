@@ -52,6 +52,7 @@ import {
   type WorkflowValidation,
 } from '../execution/workflow-validator.js';
 import { prepareWorkflowForWrite } from '../execution/workflow-enforce.js';
+import { describeWorkflowPlainEnglish } from '../execution/workflow-describe.js';
 import { ExecutionStore } from '../execution/store.js';
 import { listOpenCheckIns } from '../agents/check-ins.js';
 import type { ClementineAssistant } from '../assistant/core.js';
@@ -1997,6 +1998,10 @@ export function registerConsoleRoutes(
       synthesis: entry.data.synthesis ?? null,
       allowedTools: entry.data.allowedTools ?? null,
       whenToUse: entry.data.whenToUse ?? null,
+      // Plain-English / printable rendering for the UI — "what this does, when
+      // it runs, what it needs/produces, where it pauses" — so the dashboard
+      // can show a readable summary instead of only raw step fields.
+      summary: describeWorkflowPlainEnglish(entry.data),
     });
   });
 

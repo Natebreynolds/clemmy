@@ -16,6 +16,7 @@ import {
   type WorkflowEntry,
 } from '../memory/workflow-store.js';
 import { prepareWorkflowForWrite } from '../execution/workflow-enforce.js';
+import { describeWorkflowPlainEnglish, describeWorkflowOneLine } from '../execution/workflow-describe.js';
 import { analyzeWorkflowGaps, renderWorkflowGapQuestions } from '../execution/workflow-gap-test.js';
 import {
   CRON_PROGRESS_DIR,
@@ -510,10 +511,13 @@ export function registerOrchestrationTools(server: McpServer): void {
       if (workflows.length === 0) return textResult('No workflows found.');
       return textResult(
         workflows
-          .map(({ name, filePath, layout, data }) => {
-            const trigger = data.trigger.schedule ? `schedule: ${data.trigger.schedule}` : 'manual';
-            const fileLabel = layout === 'directory' ? `${name}/SKILL.md` : path.basename(filePath);
-            return `**${data.name}** [${data.enabled ? 'enabled' : 'disabled'}]\n  File: ${fileLabel}\n  ${data.description || '(no description)'}\n  Trigger: ${trigger}\n  Steps (${data.steps.length}): ${data.steps.map((step) => step.id).join(' -> ')}`;
+          .map(({ data }) => {
+            // Plain-English one-liner (name — when · N steps · pauses for approval),
+            // then the description so the user can pick the right one at a glance.
+            const summary = describeWorkflowOneLine(data);
+            const enabled = data.enabled ? '' : ' [disabled]';
+            const desc = data.description ? `\n  ${data.description}` : '';
+            return `**${summary}**${enabled}${desc}`;
           })
           .join('\n\n'),
       );
@@ -621,7 +625,8 @@ export function registerOrchestrationTools(server: McpServer): void {
       // authoring something quietly set up to fail at 2am.
       const createGaps = analyzeWorkflowGaps(savedDef);
       return textResult(
-        `Created workflow "${name}" at workflows/${dirName}/SKILL.md.${createBindReport}`
+        `Created workflow "${name}". Here's what it will do:\n\n${describeWorkflowPlainEnglish(savedDef)}\n\n`
+          + `Saved to workflows/${dirName}/SKILL.md.${createBindReport}`
           + `${renderAuthoringAdvisories([...createPrep.repairs, ...createPrep.warnings, ...createBind.advisories])}`
           + `${renderWorkflowGapQuestions(createGaps)}`,
       );
@@ -816,10 +821,14 @@ export function registerOrchestrationTools(server: McpServer): void {
       const allowed = w.allowedTools && w.allowedTools.length > 0
         ? w.allowedTools.map((t) => (typeof t === 'string' ? t : `${t.name}${t.approval === 'required' ? ' (approval)' : ''}`)).join(', ')
         : '(any)';
+      // Lead with the plain-English summary — what a human actually wants to
+      // read ("what does this do, when, what it needs/produces, where it
+      // pauses") — then keep the technical block below for precise editing.
       return textResult([
-        `**${w.name}** [${w.enabled ? 'enabled' : 'disabled'}]`,
+        describeWorkflowPlainEnglish(w),
+        '',
+        '— technical detail —',
         `File: ${path.relative(path.dirname(entry.dir), entry.filePath)}`,
-        `${w.description || '(no description)'}`,
         w.whenToUse ? `When to use: ${w.whenToUse}` : '',
         `Trigger: ${trigger}`,
         `Allowed tools: ${allowed}`,
@@ -987,7 +996,10 @@ export function registerOrchestrationTools(server: McpServer): void {
       // Re-run the gap test on the edited workflow so remaining gaps stay
       // visible until the author actually closes them.
       const updateGaps = renderWorkflowGapQuestions(analyzeWorkflowGaps(savedNext));
-      return textResult(`Workflow "${name}" updated.${updateBindReport}${updateAdvisories}${updateGaps}`);
+      return textResult(
+        `Workflow "${name}" updated. Here's what it does now:\n\n${describeWorkflowPlainEnglish(savedNext)}\n\n`
+          + `${updateBindReport}${updateAdvisories}${updateGaps}`.trim(),
+      );
     },
   );
 
