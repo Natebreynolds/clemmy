@@ -8,6 +8,9 @@ export interface AutoMemoryCandidate {
   kind: ConsolidatedFactKind;
   content: string;
   reason: string;
+  /** Pin the resulting fact (always-injected, decay-exempt). Set for a
+   *  safety-critical prohibition so it can never be scoped out at action time. */
+  pin?: boolean;
 }
 
 export interface AutoCaptureResult {
@@ -28,6 +31,22 @@ const CONNECTED_APP_TERMS = /\b(composio|outlook|gmail|google calendar|calendar|
 const CONNECTED_APP_CUES = /\b(i|we|the agent|users?)\s+(?:use|uses|have|has|need|needs|want|wants|connect|connects|access|auth|authenticate|oauth)\b/i;
 
 const LOW_SIGNAL = /^(approve|approved|reject|rejected|yes|no|ok|okay|cool|perfect|nice|thanks|thank you|lets do it|let'?s do it|keep going|continue|great job|sounds good)[.!?]*$/i;
+
+// Safety-critical PROHIBITION: a durable "never / do not <comms-or-mutating
+// action>" rule. These are the highest-stakes facts — they must NEVER be scoped
+// out of the prompt at action time — so when one is detected the fact is
+// captured AND PINNED (always-injected, decay-exempt). Tight by design: a
+// prohibition word AND an action verb, EXCLUDING one-off phrasing and the
+// idiom "never mind" so chit-chat can't trip it.
+const PROHIBITION_RE = /\b(?:never|under no circumstances|do not|don'?t|do n'?t)\b/i;
+const PROHIBITION_ACTION_RE = /\b(?:send|sends|email|emails|e-?mail|cc|bcc|share|shares|post|posts|publish|delete|deletes|remove|removes|touch|modify|change|contact|message|reply|forward|push|deploy|overwrite|disclose|expose|text|dm|ping|notify)\b/i;
+const PROHIBITION_ONE_OFF_RE = /\b(?:this once|just this|right now|today only|for now|this time|that one|never\s*mind)\b/i;
+
+function isSafetyProhibition(text: string): boolean {
+  return PROHIBITION_RE.test(text)
+    && PROHIBITION_ACTION_RE.test(text)
+    && !PROHIBITION_ONE_OFF_RE.test(text);
+}
 
 // Standing-rule capture — a durable "going forward / every Monday / by default"
 // instruction that should PERSIST ACROSS SESSIONS (routed to the facts vault),
@@ -117,6 +136,7 @@ export function extractAutoMemoryCandidates(message: string, maxCandidates = 3):
   if (!text || LOW_SIGNAL.test(text)) return [];
 
   const candidates: AutoMemoryCandidate[] = [];
+  const prohibition = isSafetyProhibition(text);
 
   if (FEEDBACK_CUES.test(text)) {
     const kind: ConsolidatedFactKind = PROJECT_TERMS.test(text) ? 'feedback' : 'user';
@@ -124,6 +144,9 @@ export function extractAutoMemoryCandidates(message: string, maxCandidates = 3):
       kind,
       content: kind === 'feedback' ? `Standing product feedback: ${text}` : `User preference: ${text}`,
       reason: 'explicit user preference or feedback',
+      // A "never/do-not <action>" rule (e.g. "never email the test list") is
+      // safety-critical — pin it so scoped recall can't drop it at action time.
+      pin: prohibition,
     });
   }
 
@@ -140,6 +163,19 @@ export function extractAutoMemoryCandidates(message: string, maxCandidates = 3):
       kind: 'reference',
       content: `Connected-app context: ${text}`,
       reason: 'connected app access or setup signal',
+    });
+  }
+
+  // Safety-critical prohibition the cued branches above didn't catch
+  // (e.g. "do not send to the prod list" — no feedback/project/app cue). Capture
+  // it as a PINNED standing rule so it's always injected. Gated len===0 so it
+  // never duplicates a prohibition the feedback branch already pinned.
+  if (candidates.length === 0 && prohibition) {
+    addCandidate(candidates, {
+      kind: 'feedback',
+      content: `Standing prohibition: ${text}`,
+      reason: 'safety-critical prohibition (auto-pinned)',
+      pin: true,
     });
   }
 
@@ -238,7 +274,7 @@ export function captureInteractionSignals(input: {
     // the chat turn — memory capture must never block the conversation.
     queueMicrotask(() => {
       consolidateFact(
-        { kind: candidate.kind, text: candidate.content, trustLevel: 1.0 },
+        { kind: candidate.kind, text: candidate.content, trustLevel: 1.0, pin: candidate.pin },
         { sessionId: input.sessionId },
       ).catch(() => {
         // Swallow — a capture failure must never surface to the turn.

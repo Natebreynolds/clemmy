@@ -8,6 +8,7 @@ import {
   rememberFact,
   updateFact,
   deleteFact,
+  setFactPinned,
   findSimilarFacts,
   findSimilarFactsScored,
   type RememberInput,
@@ -370,6 +371,11 @@ export interface ConsolidateCandidate {
   /** v9 — friendly app name when the candidate came from a system of
    *  record (set by classifySource in the reflection loop). */
   sourceApp?: string;
+  /** Pin the resulting fact (always-injected, decay-exempt). Set by the
+   *  auto-capture prohibition path so a safety-critical "never …" rule can
+   *  never be scoped out of context at action time. Pinned INSIDE
+   *  consolidateFact where the resulting row id is known. */
+  pin?: boolean;
 }
 
 export interface ConsolidateContext {
@@ -409,6 +415,15 @@ export async function consolidateFact(
   opts: ConsolidateOptions = {},
 ): Promise<ConsolidateOutcome> {
   const out: ConsolidateOutcome = { written: 0, updated: 0, deleted: 0, noop: 0, importanceAdded: 0 };
+
+  // Pin the resulting fact when the candidate asked for it (the safety-critical
+  // prohibition path). Done HERE, where the ADD/UPDATE row id is known, so the
+  // caller doesn't need an id back (consolidateFact returns counts only).
+  // Best-effort: a pin failure must never break consolidation.
+  const maybePin = (id: number | undefined | null): void => {
+    if (!candidate.pin || !id) return;
+    try { setFactPinned(id, true); } catch { /* best-effort */ }
+  };
 
   const scored = await findSimilarFactsScored(candidate.text, { kind: candidate.kind, topK: 5 });
   const similar = scored.map((s) => s.fact);
@@ -452,6 +467,7 @@ export async function consolidateFact(
     });
     if (updated) {
       out.updated = 1;
+      maybePin(scored[0].fact.id);
       out.importanceAdded += candidate.importance ?? 0;
       return out;
     }
@@ -467,7 +483,7 @@ export async function consolidateFact(
     topSim !== null &&
     topSim < opts.noveltyFastPathSim
   ) {
-    rememberFact({
+    const added = rememberFact({
       kind: candidate.kind,
       content: candidate.text,
       sessionId: ctx.sessionId,
@@ -476,6 +492,7 @@ export async function consolidateFact(
       trustLevel: candidate.trustLevel,
       sourceApp: candidate.sourceApp,
     });
+    maybePin(added.id);
     out.written = 1;
     out.importanceAdded += candidate.importance ?? 0;
     return out;
@@ -509,6 +526,7 @@ export async function consolidateFact(
     });
     if (updated) {
       out.updated = 1;
+      maybePin(decision.target_id);
       out.importanceAdded += candidate.importance ?? 0;
       return out; // UPDATE replaces ADD; no additional row
     }
@@ -526,7 +544,8 @@ export async function consolidateFact(
     trustLevel: candidate.trustLevel,
     sourceApp: candidate.sourceApp,
   };
-  rememberFact(rememberInput);
+  const added = rememberFact(rememberInput);
+  maybePin(added.id);
   out.written = 1;
   out.importanceAdded += candidate.importance ?? 0;
   return out;

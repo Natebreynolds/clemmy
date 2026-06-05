@@ -127,3 +127,33 @@ test('"always"/"from now on" still route through FEEDBACK_CUES, not the standing
   assert.ok(c.length >= 1);
   assert.ok(!c.some((cand) => cand.content.startsWith('Standing instruction:')), 'no duplicate standing-branch row');
 });
+
+// ─── safety-critical prohibitions are auto-pinned ─────────────────────────────
+
+test('a "never <action>" prohibition is captured and marked pin=true', () => {
+  const c = extractAutoMemoryCandidates('Never email the test list.');
+  assert.equal(c.length, 1);
+  assert.equal(c[0].pin, true, 'safety-critical prohibition is pinned');
+});
+
+test('a "do not <action>" prohibition the cues miss is captured as a pinned standing rule', () => {
+  const c = extractAutoMemoryCandidates('Do not send anything to the prod distro.');
+  assert.equal(c.length, 1);
+  assert.match(c[0].content, /^Standing prohibition:/);
+  assert.equal(c[0].pin, true);
+});
+
+test('an ordinary preference is captured but NOT pinned', () => {
+  const c = extractAutoMemoryCandidates('I prefer concise, no-preamble replies.');
+  assert.ok(c.length >= 1);
+  assert.ok(!c[0].pin, 'a non-prohibition preference is not auto-pinned');
+});
+
+test('"never mind" and one-off / non-action negatives are NOT pinned prohibitions', () => {
+  // idiom, no action verb
+  assert.ok(!extractAutoMemoryCandidates('never mind, forget it').some((x) => x.pin));
+  // negative but no comms/mutating action verb
+  assert.ok(!extractAutoMemoryCandidates('do not worry about the deadline').some((x) => x.pin));
+  // explicit one-off → not a durable prohibition
+  assert.ok(!extractAutoMemoryCandidates('do not send that one this time').some((x) => x.pin));
+});

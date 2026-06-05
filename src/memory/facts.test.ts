@@ -362,6 +362,23 @@ test('decayAndEvictFacts records a per-eviction reason for the audit log', () =>
   assert.ok(result.reasons.some((r) => r.includes('#' + stale.id) && r.includes('imp:')), 'reason names the fact id + importance');
 });
 
+test('consolidateFact pins the resulting fact when candidate.pin is set (prohibition path)', async () => {
+  const { consolidateFact } = await import('./reflection.js');
+  await consolidateFact({ kind: 'feedback', text: 'never email the test list', trustLevel: 1.0, pin: true }, {});
+  const pinned = listPinnedFacts(12);
+  assert.ok(pinned.some((f) => f.content.includes('never email the test list')), 'a pin:true candidate ends up pinned (always-injected)');
+});
+
+test('consolidateFact does NOT pin when pin is unset (common path unchanged)', async () => {
+  const { consolidateFact } = await import('./reflection.js');
+  await consolidateFact({ kind: 'user', text: 'Nathan prefers concise replies.', trustLevel: 1.0 }, {});
+  assert.equal(
+    listPinnedFacts(12).some((f) => f.content.includes('concise replies')),
+    false,
+    'a candidate without pin stays unpinned',
+  );
+});
+
 test('no-regression: a decay pass that evicts nothing leaves the rendered facts byte-identical', () => {
   rememberFact({ kind: 'project', content: 'High-priority launch note.', importance: 9 });
   rememberFact({ kind: 'user', content: 'Nathan is the owner.' }); // default importance 5 > ceil 4
