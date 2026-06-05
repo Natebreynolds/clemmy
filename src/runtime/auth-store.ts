@@ -78,17 +78,66 @@ export type CodexAuthErrorClass = 'terminal' | 'transient' | null;
 
 /** Classify a Codex auth/model error as terminal (re-auth required), transient
  *  (retry — token still valid), or null (not an auth signal). Pure; used by the
- *  refresh path, the runtimes, and the execution controller so they all agree. */
-export function classifyCodexAuthError(input: { message?: string; status?: number; code?: string }): CodexAuthErrorClass {
+ *  refresh path, the runtimes, and the execution controller so they all agree.
+ *
+ *  `source` matters for a MARKER-LESS 401. On the `refresh` (token) endpoint a
+ *  bare 401 means the refresh token itself was rejected → terminal (re-login).
+ *  On a `model` (inference) call a bare 401 almost always means the short-lived
+ *  access token just expired (or a one-off edge reject) → TRANSIENT: the caller
+ *  must refresh-and-retry first. Conflating the two is exactly what bricked auth
+ *  on a transient blip; Codex CLI and Hermes both refresh-and-retry a model 401
+ *  and only treat a refresh-endpoint failure as a revoke. Default (no source) is
+ *  the conservative legacy behavior (401 → terminal) for the refresh path. */
+export function classifyCodexAuthError(input: { message?: string; status?: number; code?: string; source?: 'model' | 'refresh' }): CodexAuthErrorClass {
   const hay = `${input.code ?? ''} ${input.message ?? ''}`.toLowerCase();
+  // An explicit terminal MARKER (token_revoked / invalid_grant / refresh_token_reused
+  // / …) is terminal wherever it surfaces — the refresh-token family is gone.
   if (TERMINAL_AUTH_PATTERNS.some((p) => hay.includes(p))) return 'terminal';
-  // A bare 401 with no transient marker means the credential was rejected → terminal.
-  if (input.status === 401 || /\b401\b/.test(hay)) return 'terminal';
+  // A bare 401 with no terminal marker: terminal only off the refresh endpoint;
+  // on a model call it's a needs-refresh signal, not a revoke.
+  if (input.status === 401 || /\b401\b/.test(hay)) {
+    return input.source === 'model' ? 'transient' : 'terminal';
+  }
   // Quota / rate-limit / backend blips: the token is fine, retry later. NEVER
   // treat these as a revoke (the "re-auth on a 429" false alarm).
   if (input.status === 429 || input.status === 402 || (typeof input.status === 'number' && input.status >= 500)) return 'transient';
   if (/rate.?limit|quota|too many requests|temporarily|timeout|503|502|504/.test(hay)) return 'transient';
   return null;
+}
+
+/** Decode a JWT payload (base64url, signature NOT verified). Pure. */
+function decodeJwtPayload(token: string | undefined): Record<string, unknown> | null {
+  if (!token) return null;
+  const parts = token.split('.');
+  if (parts.length < 2) return null;
+  try {
+    const normalized = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+    const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, '=');
+    return JSON.parse(Buffer.from(padded, 'base64').toString('utf-8')) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+/** The access token's JWT `exp` in epoch milliseconds, or null when the token
+ *  carries no decodable numeric `exp`. Lets callers distinguish "has a real
+ *  expiry" from "expiring now" (so they know when to trust exp vs fall back to
+ *  the lastRefresh heuristic). */
+export function accessTokenExpMs(accessToken: string | undefined): number | null {
+  const exp = decodeJwtPayload(accessToken)?.exp;
+  if (typeof exp !== 'number' || !Number.isFinite(exp)) return null;
+  return exp * 1000;
+}
+
+/** True when the access token's JWT `exp` is at/within `skewMs` of now. Mirrors
+ *  Codex CLI / Hermes `_codex_access_token_is_expiring`: refresh off the REAL
+ *  token expiry, not a fixed wall-clock guess — fewer rotations (smaller reuse
+ *  surface) AND never late (no mid-run 401). Returns false when the token has no
+ *  decodable numeric `exp` so the caller falls back to the lastRefresh heuristic. */
+export function accessTokenExpiresSoon(accessToken: string | undefined, skewMs = 60_000): boolean {
+  const expMs = accessTokenExpMs(accessToken);
+  if (expMs === null) return false;
+  return expMs <= Date.now() + Math.max(0, skewMs);
 }
 
 export interface CodexAuthDeadState { reason: string; since: string; }
@@ -417,7 +466,8 @@ export async function loginWithNativeOAuth(_sourceFile = getCodexAuthSourceFile(
  *  even when many agents call this at once (single-flight) or another daemon
  *  races it (cross-process lock + skip-if-just-refreshed). See the concurrency
  *  notes near REFRESH_LOCK_FILE for why this matters (reuse → token_revoked). */
-export async function refreshStoredNativeOAuth(sourceFile = getCodexAuthSourceFile()): Promise<{ ok: boolean; message: string; terminal?: boolean }> {
+export async function refreshStoredNativeOAuth(options: { force?: boolean; sourceFile?: string } = {}): Promise<{ ok: boolean; message: string; terminal?: boolean }> {
+  const { force = false, sourceFile = getCodexAuthSourceFile() } = options;
   // 0. DEAD latch: a prior terminal revoke means the refresh token is gone.
   // Re-POSTing it can't recover and risks tripping further family revokes —
   // short-circuit until a re-auth lands and clears the latch.
@@ -425,9 +475,11 @@ export async function refreshStoredNativeOAuth(sourceFile = getCodexAuthSourceFi
   if (dead) {
     return { ok: false, terminal: true, message: `Codex sign-in is revoked/expired (since ${dead.since}); re-authenticate to resume.` };
   }
-  // 1. In-process single-flight: concurrent callers share ONE refresh.
+  // 1. In-process single-flight: concurrent callers share ONE refresh. (A force
+  // refresh still piggybacks on an in-flight one — sharing is what prevents the
+  // double-POST reuse→revoke; the caller retries its request afterward.)
   if (inflightRefresh) return inflightRefresh;
-  inflightRefresh = doRefreshStoredNativeOAuth(sourceFile);
+  inflightRefresh = doRefreshStoredNativeOAuth(sourceFile, force);
   try {
     return await inflightRefresh;
   } finally {
@@ -441,7 +493,7 @@ function refreshedWithinSkipWindow(lastRefreshIso: string | undefined): boolean 
   return Number.isFinite(last) && Date.now() - last < REFRESH_SKIP_IF_WITHIN_MS;
 }
 
-async function doRefreshStoredNativeOAuth(_sourceFile: string): Promise<{ ok: boolean; message: string; terminal?: boolean }> {
+async function doRefreshStoredNativeOAuth(_sourceFile: string, force = false): Promise<{ ok: boolean; message: string; terminal?: boolean }> {
   // Snapshot the RT we INTEND to spend BEFORE we queue on the lock. If a sibling
   // rotates the token while we wait, the on-disk RT will differ post-lock and we
   // reuse theirs rather than spending our now-stale one (read-before-spend).
@@ -467,7 +519,13 @@ async function doRefreshStoredNativeOAuth(_sourceFile: string): Promise<{ ok: bo
     //       (a sibling rotated it while we queued on the lock), OR
     //   (b) time-based — it was refreshed within the skip window.
     const rotatedWhileWaiting = Boolean(preLockRefreshToken) && refreshToken !== preLockRefreshToken;
-    if (rotatedWhileWaiting || refreshedWithinSkipWindow(local.codexOauth?.lastRefresh)) {
+    // `force` (a 401 rejected the current access token) bypasses the TIME-based
+    // skip — a refresh 2 min ago doesn't help if the token is being rejected NOW,
+    // and the on-disk RT is the unused output of that refresh so spending it is a
+    // first use, not a reuse. We still honor `rotatedWhileWaiting`: a sibling that
+    // rotated while we queued already produced a fresh, valid token — reuse it
+    // rather than forcing a second rotation.
+    if (rotatedWhileWaiting || (!force && refreshedWithinSkipWindow(local.codexOauth?.lastRefresh))) {
       return { ok: true, message: 'Token was just refreshed by another holder; reusing it.' };
     }
     const tokens = await refreshTokenImpl(refreshToken);

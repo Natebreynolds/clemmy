@@ -2044,13 +2044,28 @@ test('runConversation: propagates run_failed status when a turn throws', async (
   assert.match(result.error ?? '', /scripted_throw/);
 });
 
-test('isCodexAuthRevoked: detects 401/token_revoked and ignores unrelated errors', () => {
-  // CodexModelError-shaped: carries status 401
-  assert.equal(isCodexAuthRevoked({ status: 401 }, 'Codex /responses returned 401 Unauthorized'), true);
-  // CodexRuntimeError-shaped: message-only signal
+test('isCodexAuthRevoked: a real revoke marker is terminal; a BARE model 401 is NOT (refresh-and-retry, no brick)', async () => {
+  const { markCodexAuthDead, clearCodexAuthDead, isCodexAuthDead } = await import('../auth-store.js');
+  clearCodexAuthDead();
+  assert.equal(isCodexAuthDead(), false, 'precondition: auth not latched dead');
+
+  // Real revoke markers ARE terminal (these genuinely mean re-login).
   assert.equal(isCodexAuthRevoked(new Error('Encountered invalidated oauth token for user, failing request'), 'Encountered invalidated oauth token for user, failing request'), true);
   assert.equal(isCodexAuthRevoked({}, 'token_revoked'), true);
-  // Not auth: a 429 rate limit or a generic failure must NOT be misclassified
+  assert.equal(isCodexAuthRevoked({ status: 401 }, 'Codex /responses returned 401: invalid_grant'), true, 'a 401 carrying a revoke marker is terminal');
+
+  // THE FIX: a marker-less model 401 (access-token expiry / edge reject) must
+  // NOT be classified as a revoke — streamCodex already force-refreshed+retried
+  // it, so latching DEAD here is the bug that bricked users on a transient blip.
+  assert.equal(isCodexAuthRevoked({ status: 401 }, 'Codex /responses returned 401 Unauthorized'), false, 'a bare 401 no longer bricks auth');
+
+  // …unless auth is genuinely DEAD (the refresh token itself was rejected, which
+  // latches DEAD inside refreshStoredNativeOAuth) — then even a bare 401 is terminal.
+  markCodexAuthDead('refresh token revoked');
+  assert.equal(isCodexAuthRevoked({ status: 401 }, 'Codex /responses returned 401 Unauthorized'), true, 'once DEAD-latched, surface re-auth');
+  clearCodexAuthDead();
+
+  // Not auth: a 429 rate limit or a generic failure must NOT be misclassified.
   assert.equal(isCodexAuthRevoked({ status: 429 }, 'Codex /responses returned 429'), false);
   assert.equal(isCodexAuthRevoked(new Error('scripted_throw'), 'scripted_throw'), false);
   assert.equal(isCodexAuthRevoked(null, 'some tool failed'), false);

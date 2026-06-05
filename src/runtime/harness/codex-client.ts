@@ -27,12 +27,15 @@
  * both do the same thing.
  */
 import { setDefaultModelProvider } from '@openai/agents';
-import { getStoredCodexOAuthTokens, refreshStoredNativeOAuth } from '../auth-store.js';
+import { getStoredCodexOAuthTokens, refreshStoredNativeOAuth, accessTokenExpMs } from '../auth-store.js';
 import { CodexModelProvider } from './codex-model.js';
 
-// Codex access tokens last ~1 hour. Refresh proactively a little
-// before that so requests don't 401 mid-run.
+// Codex access tokens last ~1 hour. Prefer the token's REAL JWT `exp` and
+// refresh a skew before it; only fall back to this wall-clock guess off
+// lastRefresh when the token carries no decodable exp. (Hermes/Codex-CLI do the
+// same — refreshing off real expiry is never late and rotates less often.)
 const REFRESH_AFTER_MS = 50 * 60 * 1000;
+const REFRESH_SKEW_MS = 60 * 1000;
 
 const JWT_CLAIM_PATH = 'https://api.openai.com/auth';
 
@@ -70,7 +73,7 @@ export async function loadFreshCodexAccessToken(): Promise<string> {
   if (!tokens?.accessToken) {
     throw new Error('codex OAuth tokens were cleared while the harness was running');
   }
-  if (shouldRefresh(tokens.lastRefresh)) {
+  if (shouldRefresh(tokens.accessToken, tokens.lastRefresh)) {
     const result = await refreshStoredNativeOAuth();
     if (result.ok) {
       const refreshed = getStoredCodexOAuthTokens();
@@ -118,7 +121,14 @@ export async function configureHarnessRuntime(): Promise<ConfigureResult> {
   return { ok: true };
 }
 
-function shouldRefresh(lastRefreshIso: string | undefined | null): boolean {
+function shouldRefresh(accessToken: string | undefined | null, lastRefreshIso: string | undefined | null): boolean {
+  // Exp-aware: when the access token carries a decodable exp, refresh strictly
+  // off it (real expiry minus skew) — never late, and no rotation until needed.
+  const expMs = accessTokenExpMs(accessToken ?? undefined);
+  if (expMs !== null) {
+    return expMs <= Date.now() + REFRESH_SKEW_MS;
+  }
+  // Fallback: no usable exp → wall-clock guess off the last refresh.
   if (!lastRefreshIso) return true;
   const last = Date.parse(lastRefreshIso);
   if (!Number.isFinite(last)) return true;
@@ -131,4 +141,4 @@ export function resetHarnessRuntimeConfig(): void {
 }
 
 /** Test helper — direct access to the staleness check. */
-export const __test__ = { shouldRefresh, REFRESH_AFTER_MS };
+export const __test__ = { shouldRefresh, REFRESH_AFTER_MS, REFRESH_SKEW_MS };

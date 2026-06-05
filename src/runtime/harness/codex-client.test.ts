@@ -101,27 +101,59 @@ test('configureHarnessRuntime is idempotent within a process', async () => {
   assert.equal(second.ok, true);
 });
 
-test('shouldRefresh: missing lastRefresh forces a refresh', () => {
-  assert.equal(__test__.shouldRefresh(undefined), true);
-  assert.equal(__test__.shouldRefresh(null), true);
-  assert.equal(__test__.shouldRefresh(''), true);
+// A token with no decodable JWT exp → shouldRefresh falls back to the
+// lastRefresh wall-clock heuristic. `undefined` accessToken hits that path too.
+const NO_EXP = undefined;
+
+// Build a fake JWT (header.payload.sig) whose payload carries the given exp
+// (epoch SECONDS), so the exp-aware branch of shouldRefresh can be exercised
+// without a live token.
+function jwtWithExp(expSeconds: number): string {
+  const b64url = (o: unknown): string =>
+    Buffer.from(JSON.stringify(o)).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+  return `${b64url({ alg: 'none' })}.${b64url({ exp: expSeconds })}.sig`;
+}
+
+test('shouldRefresh (heuristic fallback): missing lastRefresh forces a refresh', () => {
+  assert.equal(__test__.shouldRefresh(NO_EXP, undefined), true);
+  assert.equal(__test__.shouldRefresh(NO_EXP, null), true);
+  assert.equal(__test__.shouldRefresh(NO_EXP, ''), true);
 });
 
-test('shouldRefresh: malformed lastRefresh forces a refresh', () => {
-  assert.equal(__test__.shouldRefresh('not-a-date'), true);
+test('shouldRefresh (heuristic fallback): malformed lastRefresh forces a refresh', () => {
+  assert.equal(__test__.shouldRefresh(NO_EXP, 'not-a-date'), true);
 });
 
-test('shouldRefresh: a fresh timestamp does not trigger a refresh', () => {
+test('shouldRefresh (heuristic fallback): a fresh timestamp does not trigger a refresh', () => {
   const justNow = new Date().toISOString();
-  assert.equal(__test__.shouldRefresh(justNow), false);
+  assert.equal(__test__.shouldRefresh(NO_EXP, justNow), false);
 });
 
-test('shouldRefresh: a token older than REFRESH_AFTER_MS triggers a refresh', () => {
+test('shouldRefresh (heuristic fallback): a token older than REFRESH_AFTER_MS triggers a refresh', () => {
   const old = new Date(Date.now() - __test__.REFRESH_AFTER_MS - 60_000).toISOString();
-  assert.equal(__test__.shouldRefresh(old), true);
+  assert.equal(__test__.shouldRefresh(NO_EXP, old), true);
 });
 
-test('shouldRefresh: a token just inside the window does not trigger', () => {
+test('shouldRefresh (heuristic fallback): a token just inside the window does not trigger', () => {
   const recent = new Date(Date.now() - __test__.REFRESH_AFTER_MS + 60_000).toISOString();
-  assert.equal(__test__.shouldRefresh(recent), false);
+  assert.equal(__test__.shouldRefresh(NO_EXP, recent), false);
+});
+
+// Exp-aware branch: when the access token carries a real exp, shouldRefresh
+// decides STRICTLY off it (skew before expiry) and ignores lastRefresh — even a
+// brand-new lastRefresh cannot keep an already-expired token alive.
+test('shouldRefresh (exp-aware): an access token past exp triggers a refresh even with a fresh lastRefresh', () => {
+  const expired = jwtWithExp(Math.floor(Date.now() / 1000) - 10);
+  assert.equal(__test__.shouldRefresh(expired, new Date().toISOString()), true);
+});
+
+test('shouldRefresh (exp-aware): a token within the skew window triggers a refresh', () => {
+  const expiringNow = jwtWithExp(Math.floor((Date.now() + __test__.REFRESH_SKEW_MS / 2) / 1000));
+  assert.equal(__test__.shouldRefresh(expiringNow, new Date().toISOString()), true);
+});
+
+test('shouldRefresh (exp-aware): a token comfortably before exp does NOT refresh (even with a stale lastRefresh)', () => {
+  const farFuture = jwtWithExp(Math.floor(Date.now() / 1000) + 30 * 60);
+  const staleRefresh = new Date(Date.now() - __test__.REFRESH_AFTER_MS - 60_000).toISOString();
+  assert.equal(__test__.shouldRefresh(farFuture, staleRefresh), false);
 });

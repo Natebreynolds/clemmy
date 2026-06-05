@@ -50,6 +50,7 @@ import type { AgentInputItem, AgentOutputItem } from '@openai/agents-core';
 import type { StreamEvent } from '@openai/agents-core/types';
 import { MODELS } from '../../config.js';
 import { loadFreshCodexAccessToken, extractAccountIdFromJwt } from './codex-client.js';
+import { refreshStoredNativeOAuth, getStoredCodexOAuthTokens, classifyCodexAuthError } from '../auth-store.js';
 import { BoundaryError } from '../boundary-error.js';
 import { codexDispatcher, detectCodexTransportFailure, buildTransportTimeoutError } from '../codex-dispatcher.js';
 import { estimateInputTokens } from './token-estimator.js';
@@ -694,111 +695,161 @@ export class CodexResponsesModel implements Model {
    * able from every other).
    */
   protected async *streamCodex(request: ModelRequest, diag?: StreamDiagnostics): AsyncGenerator<AnyCodexEvent> {
-    const token = await loadFreshCodexAccessToken();
-    const accountId = extractAccountIdFromJwt(token) ?? '';
-    if (!accountId) {
-      throw new CodexModelError(
-        'Could not extract chatgpt_account_id from the codex OAuth token. ' +
-          'Run `clementine auth login-native` to re-login.',
-      );
-    }
-
+    // Request body is token-independent — build it once and reuse across a
+    // possible refresh-and-retry below.
     const body = buildCodexRequestBody(this.modelId, request);
     const bodyJson = JSON.stringify(body);
     logNativeCompactionRequestTelemetry(request, body);
     if (diag) {
-      diag.startTs = Date.now();
       diag.requestBytes = Buffer.byteLength(bodyJson, 'utf8');
     }
-    let res: Response;
-    try {
-      // v0.5.21 Phase 2 — pass `dispatcher: codexDispatcher` so undici
-      // enforces headersTimeout (15s) and bodyTimeout (30s) on this
-      // request. Default undici timeouts are 5min each, which hung
-      // chat indefinitely on a Cloudflare edge stall (2026-05-25
-      // sess-mplfm14j-f0985a98). Detect UND_ERR_HEADERS_TIMEOUT here
-      // (the body-timeout case is detected inside the streaming
-      // generator below).
-      res = await fetch(CODEX_URL, {
-        method: 'POST',
-        headers: buildCodexHeaders(token, accountId),
-        body: bodyJson,
-        signal: request.signal,
-        dispatcher: codexDispatcher,
-      } as RequestInit & { dispatcher?: unknown });
-    } catch (err) {
-      const undiciCode = detectCodexTransportFailure(err);
-      if (undiciCode) {
-        throw buildTransportTimeoutError(undiciCode, {
-          modelId: this.modelId,
-          requestBytes: diag?.requestBytes ?? null,
-          phase: 'headers',
-        }, err);
-      }
-      throw err;
-    }
-    if (diag) {
-      diag.httpStatus = res.status;
-      diag.responseHeaders = collectDiagnosticHeaders(res.headers);
-      diag.firstByteTs = Date.now();
-    }
 
-    if (!res.ok) {
-      const detail = await safeReadErrorBody(res);
-      // Persist a 4xx trace so operators can inspect the exact request
-      // that Codex rejected. The codex-native-runtime path has the same
-      // logic (T2.4); the harness path was a gap — without this trace
-      // an error like "No tool output found for function call call_X"
-      // has no diagnosable surface because the request body is not
-      // preserved anywhere else (store:false, stream:true).
-      if (res.status >= 400 && res.status < 500) {
-        try {
-          const { atomicJsonMutate } = await import('../atomic-json.js');
-          const path = await import('node:path');
-          const { BASE_DIR } = await import('../../config.js');
-          const inputArr = Array.isArray(body.input) ? body.input : [];
-          const tracePath = path.join(
-            BASE_DIR,
-            'state',
-            'codex-4xx-trace',
-            `harness-${Date.now()}.json`,
-          );
-          await atomicJsonMutate(
-            tracePath,
-            () => ({
-              ts: new Date().toISOString(),
-              source: 'codex-model',
-              status: res.status,
-              modelId: this.modelId,
-              responseBody: detail?.slice(0, 4096) ?? '',
-              inputItemCount: inputArr.length,
-              inputItemSummary: inputArr.map((it) => {
-                const r = it as Record<string, unknown>;
-                return {
-                  type: r.type ?? r.role ?? 'unknown',
-                  call_id: r.call_id ?? undefined,
-                  name: r.name ?? undefined,
-                };
-              }),
-              requestBody: body,
-            }),
-            {} as Record<string, unknown>,
-          );
-        } catch {
-          // best-effort; never block the error path on a trace write
+    let token = await loadFreshCodexAccessToken();
+    // A 401 on a MODEL call almost always means the short-lived access token
+    // just expired (or a one-off edge reject) — NOT a revoked sign-in. Force ONE
+    // refresh + retry before surfacing anything (the daemon CodexNativeRuntime
+    // path and Hermes both do this). Only a TERMINAL refresh result (a real
+    // revoke, which latches auth DEAD inside refreshStoredNativeOAuth) becomes a
+    // re-auth prompt; a transient 401 stays a retryable error and never bricks.
+    let refreshedOn401 = false;
+    for (;;) {
+      const accountId = extractAccountIdFromJwt(token) ?? '';
+      if (!accountId) {
+        throw new CodexModelError(
+          'Could not extract chatgpt_account_id from the codex OAuth token. ' +
+            'Run `clementine auth login-native` to re-login.',
+        );
+      }
+      if (diag) {
+        diag.startTs = Date.now();
+      }
+      let res: Response;
+      try {
+        // v0.5.21 Phase 2 — pass `dispatcher: codexDispatcher` so undici
+        // enforces headersTimeout (15s) and bodyTimeout (30s) on this
+        // request. Default undici timeouts are 5min each, which hung
+        // chat indefinitely on a Cloudflare edge stall (2026-05-25
+        // sess-mplfm14j-f0985a98). Detect UND_ERR_HEADERS_TIMEOUT here
+        // (the body-timeout case is detected inside the streaming
+        // generator below).
+        res = await fetch(CODEX_URL, {
+          method: 'POST',
+          headers: buildCodexHeaders(token, accountId),
+          body: bodyJson,
+          signal: request.signal,
+          dispatcher: codexDispatcher,
+        } as RequestInit & { dispatcher?: unknown });
+      } catch (err) {
+        const undiciCode = detectCodexTransportFailure(err);
+        if (undiciCode) {
+          throw buildTransportTimeoutError(undiciCode, {
+            modelId: this.modelId,
+            requestBytes: diag?.requestBytes ?? null,
+            phase: 'headers',
+          }, err);
         }
+        throw err;
       }
-      throw new CodexModelError(
-        `Codex /responses returned ${res.status} ${res.statusText}${detail ? ': ' + detail : ''}`,
-        res.status,
-      );
-    }
-    if (!res.body) {
-      throw new CodexModelError('Codex /responses returned an empty body.');
-    }
+      if (diag) {
+        diag.httpStatus = res.status;
+        diag.responseHeaders = collectDiagnosticHeaders(res.headers);
+        diag.firstByteTs = Date.now();
+      }
 
+      if (!res.ok) {
+        const detail = await safeReadErrorBody(res);
+        // Refresh-and-retry on a marker-less 401 (access-token expiry), once.
+        // A 401 carrying a real revoke marker (token_revoked / invalid_grant /…)
+        // classifies 'terminal' even with source:'model', so it skips the retry
+        // and surfaces immediately.
+        if (
+          res.status === 401
+          && !refreshedOn401
+          && classifyCodexAuthError({ message: detail ?? '', status: 401, source: 'model' }) !== 'terminal'
+        ) {
+          refreshedOn401 = true;
+          const refreshResult = await refreshStoredNativeOAuth({ force: true });
+          if (refreshResult.ok) {
+            const refreshed = getStoredCodexOAuthTokens();
+            if (refreshed?.accessToken) {
+              token = refreshed.accessToken;
+              continue; // retry the request with the fresh token (no bytes streamed yet)
+            }
+          }
+          if (refreshResult.terminal) {
+            // The refresh token itself is dead — DEAD latch is already set inside
+            // refreshStoredNativeOAuth. Surface a terminal error so loop.ts shows
+            // the re-auth prompt.
+            throw new CodexModelError(
+              `Codex sign-in is revoked or expired — re-authenticate to resume. ${refreshResult.message}`,
+              401,
+            );
+          }
+          // Transient refresh failure (network / 5xx): fall through to throw a
+          // non-terminal 401 the loop can retry, rather than bricking auth.
+        }
+        // Persist a 4xx trace so operators can inspect the exact request
+        // that Codex rejected. The codex-native-runtime path has the same
+        // logic (T2.4); the harness path was a gap — without this trace
+        // an error like "No tool output found for function call call_X"
+        // has no diagnosable surface because the request body is not
+        // preserved anywhere else (store:false, stream:true).
+        if (res.status >= 400 && res.status < 500) {
+          try {
+            const { atomicJsonMutate } = await import('../atomic-json.js');
+            const path = await import('node:path');
+            const { BASE_DIR } = await import('../../config.js');
+            const inputArr = Array.isArray(body.input) ? body.input : [];
+            const tracePath = path.join(
+              BASE_DIR,
+              'state',
+              'codex-4xx-trace',
+              `harness-${Date.now()}.json`,
+            );
+            await atomicJsonMutate(
+              tracePath,
+              () => ({
+                ts: new Date().toISOString(),
+                source: 'codex-model',
+                status: res.status,
+                modelId: this.modelId,
+                responseBody: detail?.slice(0, 4096) ?? '',
+                inputItemCount: inputArr.length,
+                inputItemSummary: inputArr.map((it) => {
+                  const r = it as Record<string, unknown>;
+                  return {
+                    type: r.type ?? r.role ?? 'unknown',
+                    call_id: r.call_id ?? undefined,
+                    name: r.name ?? undefined,
+                  };
+                }),
+                requestBody: body,
+              }),
+              {} as Record<string, unknown>,
+            );
+          } catch {
+            // best-effort; never block the error path on a trace write
+          }
+        }
+        throw new CodexModelError(
+          `Codex /responses returned ${res.status} ${res.statusText}${detail ? ': ' + detail : ''}`,
+          res.status,
+        );
+      }
+      if (!res.body) {
+        throw new CodexModelError('Codex /responses returned an empty body.');
+      }
+
+      yield* this.streamCodexBody(res.body, diag);
+      return;
+    }
+  }
+
+  /** Stream + parse the SSE body. Split out of streamCodex so the
+   *  refresh-and-retry loop above never re-enters streaming once bytes flow. */
+  private async *streamCodexBody(bodyStream: ReadableStream<Uint8Array>, diag?: StreamDiagnostics): AsyncGenerator<AnyCodexEvent> {
     try {
-      yield* parseCodexSse(res.body);
+      yield* parseCodexSse(bodyStream);
     } catch (err) {
       // v0.5.21 Phase 2 — undici body-timeout fires here (no SSE bytes
       // for 30s after headers arrived). Same routing as header-timeout

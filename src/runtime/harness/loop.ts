@@ -40,7 +40,7 @@ import { attachEventLogHooks, extractSessionIdFromContext, type RunHooksLike } f
 import * as approvalRegistry from './approval-registry.js';
 import { actionBus } from '../action-bus.js';
 import { addNotification } from '../notifications.js';
-import { classifyCodexAuthError, markCodexAuthDead } from '../auth-store.js';
+import { classifyCodexAuthError, markCodexAuthDead, isCodexAuthDead } from '../auth-store.js';
 import { BoundaryError } from '../boundary-error.js';
 import { getRuntimeEnv } from '../../config.js';
 import { captureInteractionSignals } from '../../memory/auto-capture.js';
@@ -3018,8 +3018,16 @@ function isKillBeforeStart(
  *  model call. The token can't recover by retrying — the user must re-auth — so
  *  we surface a clear instruction instead of the raw provider JSON. */
 export function isCodexAuthRevoked(err: unknown, message: string): boolean {
+  // Auth is genuinely dead only when the refresh token itself was rejected
+  // (which latches DEAD inside refreshStoredNativeOAuth) or the error carries a
+  // real revoke marker (token_revoked / invalid_grant / refresh_token_reused).
+  // A bare model-call 401 is NOT a revoke: streamCodex already force-refreshed
+  // and retried it, so reaching here with a marker-less 401 means a transient
+  // failure — classify it 'model' so it falls through to normal retryable-error
+  // handling instead of permanently bricking auth on a one-off blip.
+  if (isCodexAuthDead()) return true;
   const status = (err as { status?: number } | null)?.status;
-  return classifyCodexAuthError({ message, status }) === 'terminal';
+  return classifyCodexAuthError({ message, status, source: 'model' }) === 'terminal';
 }
 
 function handleRunError(

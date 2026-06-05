@@ -28,7 +28,17 @@ const {
   classifyCodexAuthError,
   isCodexAuthDead,
   clearCodexAuthDead,
+  accessTokenExpiresSoon,
+  accessTokenExpMs,
 } = await import('./auth-store.js');
+
+// Build a fake JWT (header.payload.sig) whose payload carries the given exp
+// (epoch SECONDS) so the exp helpers can be exercised without a live token.
+function jwtWithExp(expSeconds: number): string {
+  const b64url = (o: unknown): string =>
+    Buffer.from(JSON.stringify(o)).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+  return `${b64url({ alg: 'none' })}.${b64url({ exp: expSeconds })}.sig`;
+}
 
 const AUTH_FILE = path.join(TMP_HOME, 'state', 'auth.json');
 const LOCK_FILE = path.join(TMP_HOME, 'state', 'codex-refresh.lock');
@@ -83,6 +93,32 @@ test('classifyCodexAuthError: revoke/reuse/invalid_grant/401 = terminal; 429/quo
   assert.equal(classifyCodexAuthError({ status: 429, message: 'Rate limit exceeded' }), 'transient', '429 is transient, not a revoke');
   assert.equal(classifyCodexAuthError({ status: 503 }), 'transient', '5xx is transient');
   assert.equal(classifyCodexAuthError({ message: 'something unrelated' }), null, 'non-auth error is null');
+});
+
+test('classifyCodexAuthError: a MARKER-LESS 401 is transient on a model call, terminal on the refresh endpoint', () => {
+  // The bug fix: a bare model-call 401 (access-token expiry / edge reject) must
+  // NOT be treated as a revoke — it is a refresh-and-retry signal.
+  assert.equal(classifyCodexAuthError({ status: 401, source: 'model' }), 'transient', 'bare model 401 = needs-refresh, not a logout');
+  // …but a 401 carrying a real revoke marker is terminal even on the model call.
+  assert.equal(classifyCodexAuthError({ status: 401, source: 'model', message: 'token_revoked' }), 'terminal', 'a real revoke marker is still terminal on a model call');
+  // On the refresh/token endpoint a bare 401 means the refresh token was rejected → terminal.
+  assert.equal(classifyCodexAuthError({ status: 401, source: 'refresh' }), 'terminal', 'a refresh-endpoint 401 is terminal');
+  // Default (no source) stays conservative/terminal — preserves the refresh path.
+  assert.equal(classifyCodexAuthError({ status: 401 }), 'terminal', 'no-source 401 stays terminal (legacy)');
+});
+
+test('accessTokenExpMs / accessTokenExpiresSoon: decode real exp; tolerate non-JWT tokens', () => {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const future = jwtWithExp(nowSec + 30 * 60);
+  const past = jwtWithExp(nowSec - 10);
+
+  assert.equal(typeof accessTokenExpMs(future), 'number');
+  assert.equal(accessTokenExpMs('opaque-not-a-jwt'), null, 'no decodable exp → null');
+  assert.equal(accessTokenExpMs(undefined), null);
+
+  assert.equal(accessTokenExpiresSoon(future, 60_000), false, 'a token 30m out is not expiring');
+  assert.equal(accessTokenExpiresSoon(past, 60_000), true, 'an expired token is expiring');
+  assert.equal(accessTokenExpiresSoon('opaque-not-a-jwt'), false, 'no exp → not expiring (caller falls back to heuristic)');
 });
 
 test('a terminal refresh failure latches DEAD and short-circuits the next refresh (no replay of the dead RT)', async () => {
@@ -200,6 +236,24 @@ test('skip-if-just-refreshed: a refresh right after a successful one does NOT re
   assert.equal(calls, 0, 'must NOT POST again — a sibling just refreshed; reuse their token');
   assert.ok(res.ok);
   assert.equal(storedRefreshToken(), 'RT2', 'the just-rotated RT is left untouched');
+});
+
+test('force refresh bypasses the time-based skip window (a 401 rejected the current token NOW)', async () => {
+  // Token was refreshed 5s ago (inside the 2-min skip window) — a normal refresh
+  // would skip. But a model-call 401 means the current access token is being
+  // rejected right now, so `force` must actually POST a fresh rotation.
+  writeStoredAuth(new Date(Date.now() - 5_000).toISOString(), 'RT2');
+  let calls = 0;
+  __setRefreshTokenImplForTests(async () => { calls += 1; return { accessToken: 'AT3', refreshToken: 'RT3', idToken: 'ID3', accountId: 'acct', lastRefresh: new Date().toISOString() }; });
+
+  const skipped = await refreshStoredNativeOAuth();         // no force → skip
+  assert.equal(calls, 0, 'without force, a recent refresh is reused (skip window)');
+  assert.ok(skipped.ok);
+
+  const forced = await refreshStoredNativeOAuth({ force: true }); // force → real rotation
+  assert.equal(calls, 1, 'force POSTs a fresh rotation despite the recent refresh');
+  assert.ok(forced.ok);
+  assert.equal(storedRefreshToken(), 'RT3', 'the forced rotation is persisted');
 });
 
 test('a genuinely stale token still refreshes (guards do not block legitimate refresh)', async () => {
