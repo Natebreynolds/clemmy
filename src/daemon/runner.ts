@@ -3,6 +3,7 @@ import path from 'node:path';
 import matter from 'gray-matter';
 import pino from 'pino';
 import { ClementineAssistant } from '../assistant/core.js';
+import { validateCronExpression } from '../shared/cron.js';
 import { processAgentAutonomy } from '../agents/autonomy.js';
 import { processAgentAutonomyV2 } from '../agents/autonomy-v2.js';
 import { processMonitors } from '../agents/monitors.js';
@@ -129,12 +130,6 @@ function saveState(state: DaemonState): void {
   // Mutate in place so callers retain a reference to the pruned map —
   // otherwise the next saveState would re-write the dropped entries.
   state.lastCronRunByMinute = pruned.lastCronRunByMinute;
-}
-
-function validateCronExpression(expr: string): boolean {
-  const parts = expr.trim().split(/\s+/);
-  if (parts.length !== 5) return false;
-  return parts.every((part) => /^(\*|\*\/\d+|\d+|\d+-\d+)(,(\*\/\d+|\d+|\d+-\d+))*$/.test(part));
 }
 
 function fieldMatch(field: string, value: number): boolean {

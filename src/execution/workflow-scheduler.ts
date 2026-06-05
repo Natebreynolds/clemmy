@@ -3,6 +3,7 @@ import path from 'node:path';
 import pino from 'pino';
 import { CRON_RUNS_DIR, WORKFLOW_RUNS_DIR, ensureDir } from '../tools/shared.js';
 import { listWorkflows } from '../memory/workflow-store.js';
+import { validateCronExpression } from '../shared/cron.js';
 
 /**
  * Workflow scheduling tick.
@@ -70,11 +71,6 @@ function saveScheduleState(state: ScheduleState): void {
 // cron path so users can move expressions between them without
 // surprises). ─────────────────────────────────────────────────────────
 
-function validateCronExpression(expr: string): boolean {
-  const parts = expr.trim().split(/\s+/);
-  if (parts.length !== 5) return false;
-  return parts.every((part) => /^(\*|\*\/\d+|\d+|\d+-\d+)(,(\*\/\d+|\d+|\d+-\d+))*$/.test(part));
-}
 
 function fieldMatch(field: string, value: number): boolean {
   if (field === '*') return true;

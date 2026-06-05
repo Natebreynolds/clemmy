@@ -9,6 +9,7 @@ import { textResult } from './shared.js';
 import { loadUserProfile } from '../runtime/user-profile.js';
 import { prepareWorkflowForWrite } from '../execution/workflow-enforce.js';
 import { describeCron } from '../execution/workflow-describe.js';
+import { validateCronExpression } from '../shared/cron.js';
 import { analyzeWorkflowGaps, renderWorkflowGapQuestions } from '../execution/workflow-gap-test.js';
 
 /**
@@ -40,11 +41,6 @@ function isValidSlug(name: string): boolean {
   return SLUG_RE.test(name);
 }
 
-function isValidCron(expr: string): boolean {
-  const parts = expr.trim().split(/\s+/);
-  if (parts.length !== 5) return false;
-  return parts.every((p) => /^(\*|\*\/\d+|\d+|\d+-\d+)(,(\*\/\d+|\d+|\d+-\d+))*$/.test(p));
-}
 
 function buildToolCallPrompt(slug: string, args: string): string {
   // Authoring style #1: direct tool invocation. The single workflow
@@ -117,7 +113,7 @@ export function registerWorkflowScheduleTools(server: McpServer): void {
       if (!isValidSlug(name)) {
         return textResult(`Error: workflow name "${name}" is not a valid slug. Use lowercase kebab-case: "instagram-friday-post", "daily-briefing".`);
       }
-      if (!isValidCron(cron)) {
+      if (!validateCronExpression(cron)) {
         return textResult(`Error: "${cron}" is not a valid 5-field cron expression. Use minute hour day-of-month month day-of-week (numeric, 0-based for day-of-week).`);
       }
       if ((!instructions || !instructions.trim()) && !toolCall) {

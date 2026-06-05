@@ -53,6 +53,7 @@ import {
 } from '../execution/workflow-validator.js';
 import { prepareWorkflowForWrite } from '../execution/workflow-enforce.js';
 import { describeWorkflowPlainEnglish } from '../execution/workflow-describe.js';
+import { validateCronExpression } from '../shared/cron.js';
 import { ExecutionStore } from '../execution/store.js';
 import { listOpenCheckIns } from '../agents/check-ins.js';
 import type { ClementineAssistant } from '../assistant/core.js';
@@ -778,12 +779,6 @@ async function handleGoalCommand(opts: {
     goalStatus: result.status,
     goalObjective: result.objective,
   });
-}
-
-function validateCronExpression(expr: string): boolean {
-  const parts = expr.trim().split(/\s+/);
-  if (parts.length !== 5) return false;
-  return parts.every((part) => /^(\*|\*\/\d+|\d+|\d+-\d+)(,(\*\/\d+|\d+|\d+-\d+))*$/.test(part));
 }
 
 function sanitizeWorkflowName(name: string): string {

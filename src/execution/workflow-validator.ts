@@ -23,6 +23,7 @@
  */
 import { COMMON_WORKFLOW_INPUT_KEYS } from './workflow-inputs.js';
 import { matchToolChoicesForStep, type ToolChoiceRecord } from '../memory/tool-choice-store.js';
+import { validateCronExpression } from '../shared/cron.js';
 
 /**
  * Shape of a workflow's parsed frontmatter — kept loose because the
@@ -68,12 +69,6 @@ export interface WorkflowValidation {
 }
 
 // ─── Cron validation (mirrors workflow-scheduler.ts:cronMatches semantics) ──
-
-function validateCronExpression(expr: string): boolean {
-  const parts = expr.trim().split(/\s+/);
-  if (parts.length !== 5) return false;
-  return parts.every((part) => /^(\*|\*\/\d+|\d+|\d+-\d+)(,(\*\/\d+|\d+|\d+-\d+))*$/.test(part));
-}
 
 // An invalid IANA timezone does NOT throw at run time — `wallClockInZone`
 // silently falls back to HOST-local time (workflow-scheduler.ts), so a typo
