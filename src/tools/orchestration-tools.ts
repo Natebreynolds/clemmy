@@ -40,7 +40,7 @@ import {
 import { queueWorkflowRun } from './workflow-run-queue.js';
 import { surfaceWorkflowPendingInputs } from '../agents/plan-proposals.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
-import { listEvents } from '../runtime/harness/eventlog.js';
+import { listEvents, getSession } from '../runtime/harness/eventlog.js';
 import {
   unrequestedWorkflowRunMessage,
   workflowExplicitlyRequested,
@@ -623,7 +623,10 @@ export function registerOrchestrationTools(server: McpServer): void {
         return textResult(`Invalid cron expression: "${trigger_schedule}"`);
       }
 
-      const dirName = name.replace(/[^a-zA-Z0-9_-]/g, '-').toLowerCase();
+      if (!/[a-zA-Z0-9]/.test(name)) {
+        return textResult('Please give the workflow a name with at least one letter or number.');
+      }
+      const dirName = name.replace(/[^a-zA-Z0-9_-]/g, '-').toLowerCase().replace(/^-+|-+$/g, '');
       if (readWorkflow(dirName)) return textResult(`Workflow "${name}" already exists.`);
 
       const def: WorkflowDefinition = {
@@ -684,7 +687,13 @@ export function registerOrchestrationTools(server: McpServer): void {
       if (!sid) {
         return textResult('I can\'t tell which chat to turn into a workflow (no session context). Run this from the chat where you did the work.');
       }
-      const dirName = name.replace(/[^a-zA-Z0-9_-]/g, '-').toLowerCase();
+      if (!getSession(sid)) {
+        return textResult(`I couldn't find a chat session to promote${sessionId ? ` (no session "${sessionId}")` : ''}. Run this from the chat where you did the work.`);
+      }
+      if (!/[a-zA-Z0-9]/.test(name)) {
+        return textResult('Please give the workflow a name with at least one letter or number.');
+      }
+      const dirName = name.replace(/[^a-zA-Z0-9_-]/g, '-').toLowerCase().replace(/^-+|-+$/g, '');
       if (readWorkflow(dirName)) {
         return textResult(`A workflow named "${name}" already exists — pick a different name, or update it with workflow_update.`);
       }

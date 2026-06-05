@@ -66,10 +66,12 @@ export interface WorkflowDraft {
 const PROMOTION_PLUMBING_TOOLS = new Set<string>([
   'composio_search_tools', 'composio_status',
   'skill_list', 'skill_read', 'tool_choice_forget',
-  'workflow_get', 'workflow_list', 'workflow_run_status',
-  'workflow_schedule', 'workflow_unschedule', 'workflow_import_status',
+  'workflow_get', 'workflow_list', 'workflow_run_status', 'workflow_import_status',
   'workflow_from_session',
 ]);
+// Note: workflow_schedule / workflow_unschedule are authoring/mutation tools,
+// not plumbing reads — they live in WORKFLOW_STEP_BLOCKED_TOOL_NAMES (reused
+// above), which already excludes them here.
 
 /** A tool call is promotable to a step unless it's a meta/recursion vector
  *  (reused step-agent blocklist), pure discovery/plumbing/memory, the
@@ -176,6 +178,18 @@ function buildStep(grp: DraftGroup, index: number, usedIds: Set<string>): Workfl
       observed: { tool: head.tool, args: head.args.slice(0, 600), calls },
     };
   }
+  if (head.tool === 'composio_execute_tool') {
+    // Gateway call whose action slug couldn't be parsed from the args — make
+    // the gap explicit so the author names the concrete action when refining.
+    const id = slugifyId('composio-action', index, usedIds);
+    return {
+      id,
+      prompt: `Run a composio_execute_tool action (the specific action slug couldn't be detected from the recorded args${argKeySummary(head.args)} — name it, e.g. GMAIL_SEND_EMAIL, when you refine this step)${repeated}`,
+      allowedTools: ['composio_execute_tool'],
+      ...gate,
+      observed: { tool: head.tool, args: head.args.slice(0, 600), calls },
+    };
+  }
   const id = slugifyId(head.tool, index, usedIds);
   return {
     id,
@@ -211,7 +225,12 @@ export function traceToWorkflowDraft(
     if (!isPromotableTool(c.tool)) continue;
     substantiveCount += 1;
     const last = groups[groups.length - 1];
-    if (!approvalActive && last && last.calls[0].tool === c.tool && last.calls[0].slug === c.slug) {
+    // Coalesce only when the current call has a KNOWN slug that matches the
+    // group's — so repeated same-action composio calls (the forEach case) merge,
+    // but distinct shell commands / unknown-slug calls each stay their own step.
+    const coalesces = !approvalActive && Boolean(c.slug)
+      && last && last.calls[0].tool === c.tool && last.calls[0].slug === c.slug;
+    if (coalesces) {
       last.calls.push(c);
     } else {
       groups.push({ calls: [c], approvalPreview: approvalActive ? (pendingApproval ?? '') : undefined });
@@ -232,6 +251,17 @@ export function traceToWorkflowDraft(
     notes.push('Steps are chained in run order; if a step actually depends on an earlier step\'s OUTPUT, reference it with {{steps.<id>.output}} (the canonical write path will auto-wire the dependency).');
     if (steps.some((s) => s.requiresApproval)) {
       notes.push('An approval gate from the original run was preserved (requiresApproval on the step that followed it) — keep it so the workflow pauses before that action.');
+    }
+    // A request_approval as the LAST call has no following action to gate.
+    // Don't attach it to the prior step (that action already ran ungated) and
+    // don't drop it silently — surface it so the author decides.
+    if (approvalActive) {
+      notes.push('The original run ended with an approval request that had no following action — no gate was added. If a step here should pause for approval, set requiresApproval on it.');
+    }
+    // Shell commands are captured verbatim into the step prompt — flag the
+    // secret-leak risk before this draft is enabled or exported.
+    if (steps.some((s) => s.observed.tool === 'run_shell_command')) {
+      notes.push('A shell command was captured verbatim into a step — review it and remove any secrets/tokens (or move them to inputs) before enabling or exporting this workflow.');
     }
   }
   return {

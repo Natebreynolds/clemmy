@@ -59,6 +59,10 @@ export const WORKFLOW_STEP_BLOCKED_TOOL_NAMES = new Set<string>([
   'workflow_delete',
   'workflow_set_enabled',
   'workflow_import_framework',
+  // scheduling: authoring/mutation of a workflow's schedule — a step runs
+  // work, it doesn't (re)schedule or unschedule workflows
+  'workflow_schedule',
+  'workflow_unschedule',
   // scheduling / cron: a step doesn't schedule or trigger future work
   'add_cron_job',
   'trigger_cron_job',

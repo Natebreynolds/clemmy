@@ -116,6 +116,34 @@ test('traceToWorkflowDraft: scaffolding between actions is filtered (real-trace 
   assert.deepEqual(draft.steps.map((s) => s.id), ['airtable-list-records', 'python']);
 });
 
+test('traceToWorkflowDraft: request_approval as the LAST call is NOT lost — warns, does not gate the prior step', () => {
+  const draft = traceToWorkflowDraft([
+    call('composio_execute_tool', '{"tool":"SALESFORCE_GET_RECORDS","arguments":{}}'),
+    call('request_approval', '{"preview":"Review the pull"}'),
+  ]);
+  assert.equal(draft.steps.length, 1);
+  assert.equal(draft.steps[0].requiresApproval, undefined); // the action already ran ungated — don't fake a gate
+  assert.match(draft.notes.join(' '), /ended with an approval request that had no following action/i);
+});
+
+test('traceToWorkflowDraft: distinct no-slug calls do NOT coalesce (separate shell commands stay separate)', () => {
+  const draft = traceToWorkflowDraft([
+    call('run_shell_command', '{"command":"python a.py"}'),
+    call('run_shell_command', '{"command":"python b.py"}'),
+  ]);
+  assert.equal(draft.steps.length, 2); // not merged
+  assert.match(draft.notes.join(' '), /shell command was captured verbatim/i); // secret-leak heads-up
+});
+
+test('traceToWorkflowDraft: composio call with an unparsable slug gets an explicit refine prompt, tools still locked', () => {
+  const draft = traceToWorkflowDraft([
+    { tool: 'composio_execute_tool', args: '{"garbled":true}', callId: 'x' }, // no slug field
+  ]);
+  assert.equal(draft.steps.length, 1);
+  assert.deepEqual(draft.steps[0].allowedTools, ['composio_execute_tool']);
+  assert.match(draft.steps[0].prompt, /couldn't be detected/i);
+});
+
 test('traceToWorkflowDraft: a session with no actions returns an honest note, no steps', () => {
   const draft = traceToWorkflowDraft([
     call('composio_search_tools', '{}'),
