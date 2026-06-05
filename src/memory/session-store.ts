@@ -83,6 +83,21 @@ export class SessionStore {
       .slice(0, limit);
   }
 
+  /**
+   * Read-only filter of this user's sessions, newest first. Backs the chat
+   * cross-session seed (continuity when a user starts a fresh session, or the
+   * same user moves between surfaces that share a userId). Does NOT merge with
+   * the harness eventlog store or unify session ids — it just queries the
+   * existing chat sessions map by userId.
+   */
+  listByUser(userId: string, limit = 20): SessionRecord[] {
+    if (!userId) return [];
+    return Object.values(loadSessions())
+      .filter((s) => s.userId === userId)
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+      .slice(0, limit);
+  }
+
   get(sessionId: string): SessionRecord {
     const sessions = loadSessions();
     const existing = sessions[sessionId];

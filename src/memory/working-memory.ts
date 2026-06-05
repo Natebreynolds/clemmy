@@ -257,7 +257,17 @@ export function readActiveTaskSection(sessionId: string): string | undefined {
     const section = match[0];
     const capturedAt = parseCapturedAt(section);
     if (capturedAt !== undefined && Date.now() - capturedAt > ACTIVE_TASK_TTL_MS) {
-      return undefined; // stale — let the next refresh drop it
+      // Past the 6h TTL — but keep the pin alive while the session still has a
+      // live tracked execution. A multi-hour in-flight job must not drop its
+      // binding constraint at 6h and re-open drift. Best-effort: any error
+      // falls through to the normal drop.
+      let hasLiveExecution = false;
+      try {
+        hasLiveExecution = Boolean(new ExecutionStore().getActiveForSession(sessionId));
+      } catch {
+        hasLiveExecution = false;
+      }
+      if (!hasLiveExecution) return undefined; // stale — let the next refresh drop it
     }
     return section.trimEnd();
   } catch {
@@ -269,6 +279,22 @@ export function readActiveTaskSection(sessionId: string): string | undefined {
  *  exist for this session? */
 export function hasActiveTaskSection(sessionId: string): boolean {
   return readActiveTaskSection(sessionId) !== undefined;
+}
+
+/**
+ * The pinned Active Task for a SPECIFIC origin session, as plaintext, for
+ * carrying into DELEGATED work (a background task, a fanned-out worker) so the
+ * delegate acts on the EXACT target instead of re-discovering it. Keyed by the
+ * spawning session id and read from THAT session's per-session file — never the
+ * global working-memory file, never a "most-recent any-session" read — so one
+ * session's recipient list can never leak into an unrelated job. Returns
+ * undefined when there's no live (non-stale) pin. Defensively length-capped.
+ */
+export function getActiveTaskForDelegation(originSessionId: string): string | undefined {
+  if (!originSessionId) return undefined;
+  const section = readActiveTaskSection(originSessionId);
+  if (!section) return undefined;
+  return section.length > 2000 ? `${section.slice(0, 2000)}…` : section;
 }
 
 /**

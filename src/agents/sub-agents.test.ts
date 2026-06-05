@@ -65,7 +65,13 @@ test('Worker is a LEAF (has no handoffs of its own)', async () => {
 
 test('Worker instructions honor parent-planned packets and one retry', async () => {
   const worker = await buildWorkerAgent();
-  const instructions = (worker as unknown as { instructions?: string }).instructions ?? '';
+  // instructions is now a FUNCTION (it appends the origin session's pinned
+  // Active Task when present). Invoke it with no session context → base
+  // instructions, which must still carry the packet/retry rules verbatim.
+  const instr = (worker as unknown as { instructions?: unknown }).instructions;
+  const instructions = typeof instr === 'function'
+    ? String(await (instr as (ctx: unknown, agent: unknown) => unknown)({ context: {} }, worker))
+    : String(instr ?? '');
 
   assert.match(instructions, /\[WORKER JOB PACKET\]/);
   assert.match(instructions, /resolvedTools\/context\/instructions as authoritative/);

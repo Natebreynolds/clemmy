@@ -7,6 +7,8 @@ import { getOrCreateExternalMcpServers } from '../runtime/mcp-servers.js';
 import type { McpToolScope } from '../runtime/mcp-tool-scope.js';
 import type { RuntimeContextValue } from '../types.js';
 import { wrapToolForHarness, type WrappableTool } from '../runtime/harness/brackets.js';
+import { getActiveTaskForDelegation } from '../memory/working-memory.js';
+import { sessionIdFromRunContext } from '../runtime/harness/tool-output-context.js';
 
 /**
  * Sub-agents.
@@ -108,10 +110,7 @@ function filterToolsForWorker<T extends { name?: string }>(tools: T[]): T[] {
 export async function buildWorkerAgent(options: { mcpToolScope?: McpToolScope } = {}): Promise<SubAgent> {
   const all = await getCoreToolsAsync({ includeDynamicComposioTools: false });
   const tools = filterToolsForWorker(all) as Tool<RuntimeContextValue>[];
-  return new Agent<RuntimeContextValue>({
-    name: 'Worker',
-    handoffDescription: 'Stateless per-item worker. Use via run_worker tool for parallel fan-out.',
-    instructions: [
+  const baseInstructions = [
       'You are a Worker — a stateless, single-task sub-agent inside Clementine.',
       'Your scope is ONE item. The parent agent fans out across N items by calling you N times in parallel; each call is a fresh, isolated context.',
       'Rules:',
@@ -126,7 +125,26 @@ export async function buildWorkerAgent(options: { mcpToolScope?: McpToolScope } 
       '  - Fill per-item artifacts (email/Outlook draft, record, message) with the REAL identity values from your data. If your item is "draft an email to account X", the draft carries X\'s actual recipient address and a real first-name greeting from the data you were given or fetched — never a blank or "Hi there". If a required identity field (recipient email, contact first name) is genuinely missing for your item and one retry to fetch it fails, do NOT produce a hollow draft — return "ERROR: missing <field> for <item>" so the parent can decide.',
       '  - Do NOT call notify_user, ask_user_question, or write to shared tasks/executions — those mutate state your sibling workers also touch and create race conditions.',
       'You may write per-item artifacts (write_file with a unique path) if the parent\'s prompt asks for them. Otherwise, prefer returning the result inline.',
-    ].join('\n\n'),
+    ].join('\n\n');
+  return new Agent<RuntimeContextValue>({
+    name: 'Worker',
+    handoffDescription: 'Stateless per-item worker. Use via run_worker tool for parallel fan-out.',
+    // Instructions are a FUNCTION so a worker fanned out from a chat session
+    // inherits that session's pinned Active Task (the SDK passes runContext to
+    // the instructions fn). Keyed by the parent run context's sessionId — never
+    // the global file — so no unrelated session's list can leak in. Zero-width
+    // (base instructions) when there's no live pin for the session.
+    instructions: (runContext) => {
+      try {
+        const pin = getActiveTaskForDelegation(sessionIdFromRunContext(runContext) ?? '');
+        if (pin) {
+          return `${baseInstructions}\n\n## Pinned Constraint (from the session that started this work — act on EXACTLY this target; do NOT re-discover or substitute a different list)\n${pin}`;
+        }
+      } catch {
+        // best-effort enrichment; never break worker construction.
+      }
+      return baseInstructions;
+    },
     model: MODELS.primary,
     tools: wrapTools(tools),
     // External MCP servers (DataForSEO, Supabase, browsermcp, etc.)

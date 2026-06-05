@@ -12,6 +12,7 @@ import pino from 'pino';
 import { BASE_DIR, MODELS } from '../config.js';
 import { addNotification } from '../runtime/notifications.js';
 import { deliverOutcome } from '../runtime/outcome.js';
+import { getActiveTaskForDelegation } from '../memory/working-memory.js';
 import { ExecutionStore } from './store.js';
 import type { RunStoppedReason } from '../types.js';
 import type { ClementineAssistant } from '../assistant/core.js';
@@ -214,6 +215,13 @@ function writeFullResultFile(task: BackgroundTaskRecord, result: string): string
 
 function buildWorkerPrompt(task: BackgroundTaskRecord): string {
   const policy = loadProactivityPolicy();
+  // Carry the spawning chat session's pinned Active Task into this delegated
+  // worker so it acts on the EXACT target the user named, instead of
+  // re-discovering it (the drift this whole feature targets re-opens at the
+  // handoff otherwise). Keyed by the ORIGIN session id only — never the global
+  // file — so no other session's list can leak in. Empty (byte-identical
+  // prompt) for cron/autonomous spawns with no origin or no live pin.
+  const pinned = task.originSessionId ? getActiveTaskForDelegation(task.originSessionId) : undefined;
   return [
     'You are running a durable Clementine background task.',
     `Autonomy mode: ${policy.mode}.`,
@@ -231,6 +239,9 @@ function buildWorkerPrompt(task: BackgroundTaskRecord): string {
     task.originSessionId ? `Origin session: ${task.originSessionId}` : '',
     `Soft max runtime: ${task.maxMinutes} minutes`,
     '',
+    pinned
+      ? `## Pinned Constraint (from the session that started this task — act on EXACTLY this target; do NOT re-discover or substitute a different list)\n${pinned}\n`
+      : '',
     'Original request:',
     task.prompt,
   ].filter(Boolean).join('\n');

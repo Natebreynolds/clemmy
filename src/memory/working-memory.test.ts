@@ -27,8 +27,10 @@ const {
   dropActiveTaskSection,
   reconcileActiveTask,
   refreshWorkingMemory,
+  getActiveTaskForDelegation,
 } = await import('./working-memory.js');
 const { WORKING_MEMORY_FILE } = await import('./vault.js');
+const { ExecutionStore } = await import('../execution/store.js');
 
 function fakeSession(id: string, channel = 'dashboard') {
   const now = new Date().toISOString();
@@ -237,4 +239,34 @@ test('refreshWorkingMemory common case (no spec) writes no Active Task section',
   const content = readFileSync(workingMemoryPathForSession(sid), 'utf-8');
   assert.ok(!content.includes('## Active Task'), 'no spec → no Active Task section (common case unchanged)');
   assert.ok(content.includes('## Current Session') && content.includes('## Focus'), 'base sections present');
+});
+
+// ─── delegation bridge: carry the origin pin into delegated work ──────────────
+
+test('getActiveTaskForDelegation returns the origin session pin (undefined when none/empty)', () => {
+  const sid = 'sess-deleg-1';
+  assert.equal(getActiveTaskForDelegation(sid), undefined, 'no pin → undefined');
+  assert.equal(getActiveTaskForDelegation(''), undefined, 'empty session id → undefined');
+  writeActiveTaskSection(sid, {
+    capturedAt: new Date().toISOString(),
+    verb: 'send', resourceRef: 'SHEET-DELEG-1', recipients: [], constraintText: 'send to that sheet',
+  });
+  const pin = getActiveTaskForDelegation(sid);
+  assert.ok(pin && pin.includes('SHEET-DELEG-1'), 'returns the live pinned section for delegation');
+  assert.ok(pin!.includes('Active Task'), 'carries the binding header');
+});
+
+test('execution-conditioned TTL: a stale pin drops without an execution but survives while one is active', () => {
+  const sid = 'sess-ttl-exec';
+  writeActiveTaskSection(sid, {
+    capturedAt: new Date(Date.now() - 7 * 60 * 60 * 1000).toISOString(), // 7h ago > 6h TTL
+    verb: 'send', recipients: ['Alice Anderson', 'Bob Brennan'], constraintText: 'send to A, B',
+  });
+  assert.equal(readActiveTaskSection(sid), undefined, 'past-TTL pin drops when no live execution');
+
+  new ExecutionStore().create({
+    sessionId: sid, title: 'In-flight job', objective: 'do the multi-hour thing',
+    reason: 'tracked', startedFromMessage: 'go', confidence: 0.7, reasons: ['tracked'],
+  });
+  assert.ok(readActiveTaskSection(sid), 'past-TTL pin is KEPT ALIVE while a live execution exists for the session');
 });
