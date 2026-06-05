@@ -57,15 +57,38 @@ export function searchVault(query: string, limit = 5): MemorySearchHit[] {
   return searchVaultLegacy(query, limit);
 }
 
+export interface VaultSearchOptions {
+  limit?: number;
+  /** Scope ranking toward this objective (focus + current message). */
+  objective?: string;
+  /** Gentle recency half-life (days) for the fused score. */
+  recencyHalfLifeDays?: number;
+}
+
 /**
  * Async search. Runs FTS5 then — when OPENAI_API_KEY is configured — does
  * an embedding rerank over the candidate pool with reciprocal rank fusion.
  * Silently falls back to FTS-only when embeddings are off or fail.
+ *
+ * Accepts either a numeric limit (legacy callers, unchanged) or an options
+ * object that additionally scopes ranking by objective + recency. Threading
+ * scope is additive — omit it and ranking is byte-identical to before.
  */
-export async function searchVaultAsync(query: string, limit = 5): Promise<MemorySearchHit[]> {
+export async function searchVaultAsync(
+  query: string,
+  limitOrOptions: number | VaultSearchOptions = 5,
+): Promise<MemorySearchHit[]> {
+  const options: VaultSearchOptions = typeof limitOrOptions === 'number'
+    ? { limit: limitOrOptions }
+    : limitOrOptions;
+  const limit = options.limit ?? 5;
   try {
     ensureIndexLazily();
-    const hits = await recallHybrid(query, { limit });
+    const hits = await recallHybrid(query, {
+      limit,
+      objective: options.objective,
+      recencyHalfLifeDays: options.recencyHalfLifeDays,
+    });
     if (hits.length > 0) return hits;
   } catch (err) {
     logger.warn({ err }, 'hybrid recall failed; using legacy search');

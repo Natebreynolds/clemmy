@@ -65,6 +65,7 @@ interface RecallChunkRow {
   content: string;
   rank: number;
   snip: string;
+  mtime: number;
 }
 
 interface SemanticChunkRow {
@@ -102,7 +103,7 @@ export function buildFtsQuery(query: string): string {
   return clauses.join(' OR ');
 }
 
-function deriveTitle(row: RecallChunkRow): string {
+function deriveTitle(row: Pick<RecallChunkRow, 'title' | 'path'>): string {
   if (row.title && row.title.trim()) return row.title.trim();
   return path.basename(row.path, '.md');
 }
@@ -112,6 +113,77 @@ export interface RecallOptions {
   limit?: number;
   /** Optional path prefix filter (e.g. only /vault/02-People). */
   pathPrefix?: string;
+  /**
+   * Scope ranking toward this objective string (the active focus blended with
+   * the current message). Candidates whose title/content overlaps the objective
+   * get a small ADDITIVE bonus, so a freshly-referenced item outranks a stale
+   * one with a slightly stronger lexical match. Unset → no effect.
+   */
+  objective?: string;
+  /**
+   * Half-life (days) for a gentle recency nudge applied to the fused score.
+   * The multiplier is FLOORED at 0.5 — a very old chunk is at most halved, never
+   * buried — so this breaks near-ties toward recent without dropping a strong
+   * old match. Unset or <= 0 → no recency weighting (ranking byte-identical).
+   */
+  recencyHalfLifeDays?: number;
+}
+
+// Recency multiplier floor: an arbitrarily old chunk is demoted to at most this
+// fraction of its base score, never to zero. Keeps a strong old match in play.
+const RECENCY_FLOOR = 0.5;
+// Weight of the additive objective-overlap bonus. ~comparable to a one-rank jump
+// at the top of the RRF scale (1/(RRF_K+1) ≈ 0.0164), so it nudges, not dominates.
+const OBJECTIVE_BONUS_WEIGHT = 0.012;
+const MS_PER_DAY = 86_400_000;
+
+/** True when any scope signal is set — gates the re-rank so the default path
+ *  (no objective, no recency) is byte-identical to legacy BM25/RRF ordering. */
+function scopeActive(options: RecallOptions): boolean {
+  return Boolean(options.objective)
+    || (typeof options.recencyHalfLifeDays === 'number' && options.recencyHalfLifeDays > 0);
+}
+
+/** Floored exponential recency decay in (RECENCY_FLOOR, 1]. */
+function recencyMultiplier(mtime: number | undefined, halfLifeDays?: number): number {
+  if (!halfLifeDays || halfLifeDays <= 0 || !mtime || mtime <= 0) return 1;
+  const ageDays = Math.max(0, (Date.now() - mtime) / MS_PER_DAY);
+  return RECENCY_FLOOR + (1 - RECENCY_FLOOR) * Math.pow(0.5, ageDays / halfLifeDays);
+}
+
+function scopeTokens(objective?: string): Set<string> {
+  if (!objective) return new Set();
+  return new Set(
+    objective.toLowerCase().split(/[^a-z0-9_]+/).filter((t) => t.length >= 3),
+  );
+}
+
+/** Fraction (0..1) of objective tokens that appear in the candidate. */
+function objectiveOverlap(tokens: Set<string>, row: RecallChunkRow): number {
+  if (tokens.size === 0) return 0;
+  const hay = `${row.title ?? ''} ${row.content}`.toLowerCase();
+  let hits = 0;
+  for (const token of tokens) if (hay.includes(token)) hits += 1;
+  return hits / tokens.size;
+}
+
+/**
+ * Re-rank FTS candidates (already in BM25 order) by a base-position score
+ * nudged by recency + objective overlap. No-op (returns the input order) when
+ * no scope signal is set, so the default recall path is unchanged.
+ */
+function reRankByScope(candidates: RecallChunkRow[], options: RecallOptions): RecallChunkRow[] {
+  if (!scopeActive(options)) return candidates;
+  const tokens = scopeTokens(options.objective);
+  return candidates
+    .map((candidate, idx) => {
+      const base = 1 / (RRF_K + idx + 1);
+      const score = base * recencyMultiplier(candidate.mtime, options.recencyHalfLifeDays)
+        + OBJECTIVE_BONUS_WEIGHT * objectiveOverlap(tokens, candidate);
+      return { candidate, score };
+    })
+    .sort((a, b) => b.score - a.score)
+    .map((entry) => entry.candidate);
 }
 
 /**
@@ -130,6 +202,7 @@ function fetchFtsCandidates(query: string, options: RecallOptions, poolSize: num
       vc.path    AS path,
       vc.title   AS title,
       vc.content AS content,
+      vc.mtime   AS mtime,
       bm25(vault_chunks_fts) AS rank,
       snippet(vault_chunks_fts, 0, '[', ']', ' … ', 12) AS snip
     FROM vault_chunks_fts
@@ -220,14 +293,7 @@ async function semanticFallback(query: string, options: RecallOptions, limit: nu
 
   return scored.map((entry) => ({
     filePath: entry.row.path,
-    title: deriveTitle({
-      id: entry.row.id,
-      path: entry.row.path,
-      title: entry.row.title,
-      content: entry.row.content,
-      rank: 0,
-      snip: '',
-    }),
+    title: deriveTitle({ title: entry.row.title, path: entry.row.path }),
     snippet: entry.row.content.slice(0, 240).replace(/\s+/g, ' '),
     score: Number((Math.max(0, entry.score) * 10).toFixed(3)),
   }));
@@ -267,19 +333,19 @@ async function recallHybridImpl(query: string, options: RecallOptions = {}): Pro
 
   // FTS-only fast path when embeddings aren't available.
   if (!isEmbeddingsEnabled()) {
-    return rowsToHits(candidates.slice(0, limit));
+    return rowsToHits(reRankByScope(candidates, options).slice(0, limit));
   }
 
   const stored = loadEmbeddingsForChunks(candidates.map((c) => c.id));
   if (stored.size === 0) {
     // Pool has no embeddings yet — return FTS order. The backfill task
     // will fill them in over time and the next call benefits.
-    return rowsToHits(candidates.slice(0, limit));
+    return rowsToHits(reRankByScope(candidates, options).slice(0, limit));
   }
 
   const queryVector = await embedQuery(query);
   if (!queryVector) {
-    return rowsToHits(candidates.slice(0, limit));
+    return rowsToHits(reRankByScope(candidates, options).slice(0, limit));
   }
 
   // Rank by FTS (already ordered) and by semantic similarity. Then fuse
@@ -300,12 +366,18 @@ async function recallHybridImpl(query: string, options: RecallOptions = {}): Pro
   const semanticRankByChunk = new Map<number, number>();
   semanticScored.forEach((entry, idx) => semanticRankByChunk.set(entry.id, idx + 1));
 
+  const tokens = scopeTokens(options.objective);
   const fused = candidates.map((candidate) => {
     const ftsRank = ftsRankByChunk.get(candidate.id) ?? candidates.length + 1;
     const semRank = semanticRankByChunk.get(candidate.id);
     const ftsScore = 1 / (RRF_K + ftsRank);
     const semScore = semRank !== undefined ? 1 / (RRF_K + semRank) : 0;
-    return { candidate, score: ftsScore + semScore };
+    // Recency + objective scope. Both are identity no-ops when their options are
+    // unset (multiplier 1, overlap 0), so the default fused order is unchanged.
+    const base = ftsScore + semScore;
+    const score = base * recencyMultiplier(candidate.mtime, options.recencyHalfLifeDays)
+      + OBJECTIVE_BONUS_WEIGHT * objectiveOverlap(tokens, candidate);
+    return { candidate, score };
   });
 
   fused.sort((a, b) => b.score - a.score);

@@ -2,8 +2,16 @@ import { loadMemoryContext } from './vault.js';
 import { loadSessionBrief, renderSessionContinuity } from './session-briefs.js';
 import { hasActiveTaskSection, loadWorkingMemoryForSession } from './working-memory.js';
 import { formatSearchHits, searchVault, searchVaultAsync } from './search.js';
+import { getRecallObjective } from './focus.js';
 import type { AssembledPromptContext } from '../types.js';
 import { classifyMessageIntent, memoryBudgetFor } from '../assistant/message-intent.js';
+
+/**
+ * Gentle recency half-life (days) for chat vault recall. The decay is FLOORED
+ * (see recall.ts RECENCY_FLOOR) so a freshly-referenced item edges out a stale
+ * one without burying strong older notes. 30 days = a soft tiebreaker.
+ */
+const CHAT_RECALL_RECENCY_HALF_LIFE_DAYS = 30;
 
 function buildSearchQuery(memoryContext: { workingMemory?: string; sessionBrief?: string }, message: string, transcript: string): string {
   return [
@@ -34,7 +42,11 @@ export async function assemblePromptContextAsync(sessionId: string, message: str
     sessionBrief: brief ? renderSessionContinuity(brief) : undefined,
   };
   const hits = budget.vaultSearchTopK > 0
-    ? await searchVaultAsync(buildSearchQuery(memoryContext, message, transcript), budget.vaultSearchTopK)
+    ? await searchVaultAsync(buildSearchQuery(memoryContext, message, transcript), {
+        limit: budget.vaultSearchTopK,
+        objective: getRecallObjective(message),
+        recencyHalfLifeDays: CHAT_RECALL_RECENCY_HALF_LIFE_DAYS,
+      })
     : [];
   return {
     memoryContext,
