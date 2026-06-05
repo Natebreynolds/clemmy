@@ -55,3 +55,17 @@ test('normalizeModelId falls back on empty or unsafe values', () => {
   assert.equal(config.normalizeModelId('gpt-5.5', 'gpt-5.4'), 'gpt-5.5');
   assert.equal(config.normalizeModelId('gpt 5.5', 'gpt-5.4'), 'gpt-5.4');
 });
+
+test('resolveDiscordEnabled: a saved token turns Discord on without DISCORD_ENABLED', () => {
+  // The core gap fix: pasting a token anywhere (vault, .env, hub) is enough.
+  assert.equal(config.resolveDiscordEnabled('', true), true);
+  // No token, no explicit enable → stays off (don't start a tokenless bot).
+  assert.equal(config.resolveDiscordEnabled('', false), false);
+  // Explicit true still works even before a token lands.
+  assert.equal(config.resolveDiscordEnabled('true', false), true);
+  // Explicit false is an honored kill-switch even with a token saved.
+  assert.equal(config.resolveDiscordEnabled('false', true), false);
+  // Tolerates whitespace/casing from hand-edited .env files.
+  assert.equal(config.resolveDiscordEnabled('  TRUE ', false), true);
+  assert.equal(config.resolveDiscordEnabled(' False ', true), false);
+});

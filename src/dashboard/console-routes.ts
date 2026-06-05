@@ -3905,7 +3905,39 @@ export function registerConsoleRoutes(
         (acc, d) => { acc[d.name] = { description: d.description, setupHint: d.setupHint, required: d.required, envVarName: d.envVarName }; return acc; },
         {},
       );
-      res.json({ rows, descriptors, auth: getAuthStatus() });
+      // Surface the Discord allow-list alongside the token so the hub can
+      // offer a "Discord User ID" field on the discord_bot_token row. A
+      // saved token alone makes the bot connect (config.ts auto-enables on
+      // token presence) but it stays mute until a user ID is on this list
+      // — see shouldRespond() in channels/discord.ts.
+      const env = readBaseEnv();
+      const discordAllowedUsers = (env.DISCORD_ALLOWED_USERS || env.DISCORD_DM_ALLOWED_USERS || '').trim();
+      res.json({ rows, descriptors, auth: getAuthStatus(), discordAllowedUsers });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // Save the Discord owner / allowed user id(s) without a vault round-trip —
+  // these are env values (the allow-list gate), not secrets. Writes BOTH
+  // DISCORD_ALLOWED_USERS (channel + DM gate) and DISCORD_DM_ALLOWED_USERS
+  // (DM poll loop) so the bot both connects AND replies. Applies on the
+  // next daemon restart, like every other updateEnvKey-backed setting.
+  app.post('/api/console/credentials/discord-owner', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const raw = typeof req.body?.ownerId === 'string' ? req.body.ownerId : '';
+    // Accept a single id or a comma-separated list; keep only plausible
+    // Discord snowflakes (17–20 digit ids, with margin) and drop the rest.
+    const ids = raw.split(',').map((s: string) => s.trim()).filter((s: string) => /^\d{5,25}$/.test(s));
+    if (raw.trim() && ids.length === 0) {
+      res.status(400).json({ error: 'Enter a numeric Discord user ID (Developer Mode → right-click your name → Copy User ID).' });
+      return;
+    }
+    try {
+      const value = ids.join(',');
+      updateEnvKey('DISCORD_ALLOWED_USERS', value);
+      updateEnvKey('DISCORD_DM_ALLOWED_USERS', value);
+      res.json({ ok: true, discordAllowedUsers: value, appliesOnRestart: true });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

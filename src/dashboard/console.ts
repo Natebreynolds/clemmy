@@ -23189,6 +23189,7 @@ const CONSOLE_JS = `
       const rows = data.rows || [];
       const descriptors = data.descriptors || {};
       const auth = data.auth || null;
+      const discordAllowedUsers = data.discordAllowedUsers || '';
       const unreadable = rows.filter((r) => r.status === 'unreadable' || r.status === 'needs_repair').length;
       metaEl.textContent = (auth?.configured ? 'runtime ready via ' + runtimeAuthLabel(auth) : 'runtime auth needs setup')
         + ' · ' + (hasOpenAiApiKey(auth) ? 'OpenAI key ready' : 'OpenAI key optional')
@@ -23222,6 +23223,21 @@ const CONSOLE_JS = `
           '        <button class="save" type="button" data-cred-set-save="' + escMem(r.name) + '">SAVE</button>',
           '      </div>',
           '    </div>',
+          // Discord-only: the user-ID allow-list. A saved token connects the
+          // bot, but it ignores everyone until a user ID lands here (the
+          // shouldRespond() gate). Surfacing it on the token row is the
+          // post-setup home for users who skipped Discord in the wizard.
+          r.name === 'discord_bot_token' ? [
+            '    <div class="cred-discord-owner" style="margin-top:10px;border-top:1px solid var(--border,rgba(255,255,255,0.08));padding-top:10px;">',
+            '      <label style="display:block;font-size:11px;letter-spacing:0.04em;opacity:0.75;margin-bottom:5px;">YOUR DISCORD USER ID — so the bot replies to you</label>',
+            '      <div style="display:flex;gap:6px;align-items:center;">',
+            '        <input type="text" class="cred-set-input" data-discord-owner-input value="' + escMem(discordAllowedUsers) + '" placeholder="e.g. 123456789012345678" autocomplete="off" spellcheck="false" inputmode="numeric" style="flex:1;" />',
+            '        <button class="save" type="button" data-discord-owner-save>SAVE ID</button>',
+            '      </div>',
+            '      <div class="cred-hint" style="margin-top:5px;">Discord → Settings → Advanced → Developer Mode, then right-click your name → Copy User ID. Applies after a daemon restart.</div>',
+            '      <div data-discord-owner-msg style="font-size:11px;margin-top:4px;"></div>',
+            '    </div>',
+          ].join('') : '',
           '  </div>',
           '  <div class="cred-actions">',
           runtimeCredentialReady
@@ -23296,6 +23312,30 @@ const CONSOLE_JS = `
         } catch (err) {
           alert('Save failed: ' + (err.message || err));
           btn.textContent = 'SAVE';
+        }
+      });
+    });
+    root.querySelectorAll('[data-discord-owner-save]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const row = btn.closest('.cred-row');
+        const input = row?.querySelector('[data-discord-owner-input]');
+        const msg = row?.querySelector('[data-discord-owner-msg]');
+        const ownerId = input?.value?.trim() || '';
+        const setMsg = (text, ok) => { if (msg) { msg.textContent = text; msg.style.color = ok ? 'var(--accent-ok,#4ade80)' : 'var(--accent-fail,#f87171)'; } };
+        btn.textContent = 'SAVING…';
+        try {
+          const r = await fetch(withToken('/api/console/credentials/discord-owner'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ownerId }),
+          });
+          const j = await r.json().catch(() => ({}));
+          if (!r.ok) { setMsg(j.error || ('Save failed: ' + r.status), false); btn.textContent = 'SAVE ID'; return; }
+          setMsg('Saved. Restart the daemon (tray → Restart Daemon) so the bot picks it up.', true);
+        } catch (err) {
+          setMsg('Save failed: ' + (err.message || err), false);
+        } finally {
+          btn.textContent = 'SAVE ID';
         }
       });
     });

@@ -583,15 +583,15 @@ const SETUP_JS = `
 
   function renderDiscord() {
     const verifyDisabled = !state.discordToken || state.discordVerifyStatus === 'verifying';
-    let verifiedBlock = '';
+    // Verify is OPTIONAL — it only fetches the app name and builds the
+    // add-to-server install link. The bot connects from the token alone,
+    // so we never gate the user-ID field (the allow-list) behind it. A
+    // user who skips Verify must still be able to enter their ID, or the
+    // bot ends up online-but-mute. See shouldRespond() in discord.ts.
+    let verifyBlock = '';
     if (state.discordVerifyStatus === 'ok') {
-      verifiedBlock = [
+      verifyBlock = [
         '<div class="status-msg ok" style="margin-top:12px;">Verified: ' + esc(state.discordAppName || 'bot') + ' (' + esc(state.discordClientId) + ')</div>',
-        '<div class="field" style="margin-top:14px;">',
-        '  <label>YOUR DISCORD USER ID</label>',
-        '  <input type="text" data-state="discordOwnerId" value="' + esc(state.discordOwnerId) + '" placeholder="e.g. 123456789012345678" autocomplete="off" spellcheck="false" inputmode="numeric" />',
-        '  <span class="hint">Right-click your name in Discord → Copy User ID. Used so only you can DM the bot.</span>',
-        '</div>',
         '<div class="field" style="margin-top:14px;">',
         '  <label>BOT INSTALL LINK</label>',
         '  <div class="hint" style="word-break:break-all;">' + esc(state.discordInstallUrl) + '</div>',
@@ -600,22 +600,29 @@ const SETUP_JS = `
         '</div>',
       ].join('');
     } else if (state.discordVerifyStatus === 'error') {
-      verifiedBlock = '<div class="status-msg warn" style="margin-top:12px;">' + esc(state.discordVerifyMessage || 'Verification failed') + '</div>';
+      verifyBlock = '<div class="status-msg warn" style="margin-top:12px;">' + esc(state.discordVerifyMessage || 'Verification failed') + '</div>';
     } else if (state.discordVerifyStatus === 'verifying') {
-      verifiedBlock = '<div class="status-msg" style="margin-top:12px;">Verifying token with Discord…</div>';
+      verifyBlock = '<div class="status-msg" style="margin-top:12px;">Verifying token with Discord…</div>';
     }
     return [
       '<div class="step">',
       '  <div class="step-tag">INTEGRATION · 04</div>',
       '  <h1>Discord (optional)</h1>',
-      '  <div class="step-desc">Paste the bot token, click Verify, then add the bot to a server. Skip otherwise.</div>',
+      '  <div class="step-desc">Paste the bot token and your Discord user ID — that&rsquo;s all it takes to connect. Verify is optional (it builds the add-to-server link). Skip the whole step otherwise.</div>',
       '  <div class="field">',
       '    <label>DISCORD BOT TOKEN</label>',
       '    <input type="text" class="secret-input" data-state="discordToken" name="setup-discord-token-no-autofill" value="' + esc(state.discordToken) + '" placeholder="paste token or leave blank" autocomplete="off" data-1p-ignore="true" data-lpignore="true" data-form-type="other" spellcheck="false" />',
-      '    <span class="hint">Create one at discord.com/developers/applications. Bot needs the Message Content + Server Members intents.</span>',
-      '    <button class="ws-pick" type="button" data-discord-verify style="margin-top:8px;"' + (verifyDisabled ? ' disabled' : '') + '>VERIFY TOKEN</button>',
+      '    <span class="hint">Create one at discord.com/developers/applications. Enable the Message Content + Server Members intents on the Bot tab.</span>',
       '  </div>',
-           verifiedBlock,
+      '  <div class="field" style="margin-top:14px;">',
+      '    <label>YOUR DISCORD USER ID</label>',
+      '    <input type="text" data-state="discordOwnerId" value="' + esc(state.discordOwnerId) + '" placeholder="e.g. 123456789012345678" autocomplete="off" spellcheck="false" inputmode="numeric" />',
+      '    <span class="hint">Required for the bot to reply — it only answers user IDs on this list. In Discord: Settings → Advanced → turn on Developer Mode, then right-click your name → Copy User ID.</span>',
+      '  </div>',
+      '  <div class="field">',
+      '    <button class="ws-pick" type="button" data-discord-verify' + (verifyDisabled ? ' disabled' : '') + '>VERIFY TOKEN (OPTIONAL · BUILDS INSTALL LINK)</button>',
+      '  </div>',
+           verifyBlock,
       '</div>',
     ].join('');
   }

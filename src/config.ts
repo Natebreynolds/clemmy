@@ -195,7 +195,9 @@ export const WEBHOOK_ALLOW_LAN = getEnv('WEBHOOK_ALLOW_LAN', 'false').toLowerCas
 // applied here for symmetry across all secrets.)
 export const WEBHOOK_SECRET = readSecretFromFileVaultSync('webhook_secret') || getEnv('WEBHOOK_SECRET', '') || '';
 export const WEBHOOK_SECRET_IS_STRONG = isStrongLocalSecret(WEBHOOK_SECRET);
-export const DISCORD_ENABLED = getEnv('DISCORD_ENABLED', 'false').toLowerCase() === 'true';
+// Raw env intent. Empty string = "unset" (auto-decide from token presence
+// below); 'true'/'false' are explicit overrides. See DISCORD_ENABLED.
+const DISCORD_ENABLED_RAW = getEnv('DISCORD_ENABLED', '').toLowerCase();
 // When true, Discord routes incoming messages through the 0.3 harness
 // (Orchestrator + sub-agents + auto-continuation + live progress) instead
 // of the v0.2 gateway. Off by default so the desktop release ships the
@@ -209,6 +211,20 @@ export const DISCORD_HARNESS_ENABLED = getEnv('DISCORD_HARNESS_ENABLED', 'false'
 // status "CONNECTED file", restarted Clementine — bot still showed as
 // offline because DISCORD_BOT_TOKEN was the empty string.
 export const DISCORD_BOT_TOKEN = readSecretFromFileVaultSync('discord_bot_token') || getEnv('DISCORD_BOT_TOKEN', '') || '';
+// Discord turns on automatically when a bot token is present, so "paste a
+// token → bot connects" works across every setup surface (CLI setup,
+// desktop wizard, credentials hub, manual .env) without each one having to
+// also remember to write DISCORD_ENABLED=true. This is the second half of
+// the vault-token fallback above: together they close the "token saved but
+// bot still offline after restart" gap end to end. An explicit
+// DISCORD_ENABLED=false still force-disables while keeping the token saved.
+export function resolveDiscordEnabled(rawEnabled: string, hasToken: boolean): boolean {
+  const raw = rawEnabled.trim().toLowerCase();
+  if (raw === 'true') return true;
+  if (raw === 'false') return false;
+  return hasToken; // unset → decide by token presence
+}
+export const DISCORD_ENABLED = resolveDiscordEnabled(DISCORD_ENABLED_RAW, DISCORD_BOT_TOKEN.length > 0);
 export const DISCORD_CLIENT_ID = getEnv('DISCORD_CLIENT_ID', '');
 export const DISCORD_REQUIRE_MENTION = getEnv('DISCORD_REQUIRE_MENTION', 'true').toLowerCase() === 'true';
 export const DISCORD_DM_ALLOWED_USERS = parseCsvEnv(getEnv('DISCORD_DM_ALLOWED_USERS', ''));
