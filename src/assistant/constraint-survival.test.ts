@@ -105,3 +105,36 @@ test('a stated recipient list survives chit-chat and a bare-ack approval turn', 
     assert.ok(actText.includes(name), `act ('go ahead') turn prompt is missing "${name}"`);
   }
 });
+
+test('the REAL incident: a list REFERENCE survives the email-copy tangent and is used at action time (not re-discovered)', async () => {
+  const runtime = new RecordingRuntime();
+  const assistant = new ClementineAssistant(runtime);
+  const sessionId = assistant.createSessionId();
+  const SHEET = '1AbcD_efGhIjKlMnOpQrStUvWxYz0123456789xyz';
+
+  const messages = [
+    // Turn 1 — point Clem at the list (a concrete resource, like the real user did).
+    `send the Q2 outreach to the list at https://docs.google.com/spreadsheets/d/${SHEET}/edit`,
+    // Long tangent about the email COPY — nothing about the list.
+    "let's work on the email copy",
+    'make the subject punchier',
+    'add a PS about the webinar',
+    'tighten the opening line',
+    'good',
+    'ok',
+    // Action time — the moment Clem previously re-discovered and pulled the WRONG list.
+    'now pull the list and send',
+  ];
+  for (const message of messages) {
+    await assistant.respond({ message, sessionId });
+  }
+
+  const act = runtime.calls[runtime.calls.length - 1];
+  const text = `${act.instructions}\n${act.prompt}`;
+  assert.ok(text.includes(SHEET), 'the exact sheet reference is still pinned at action time');
+  assert.match(
+    text,
+    /do NOT re-discover|pull it from the pinned reference/,
+    'instructed to use the pinned reference, not re-discover via fresh calls',
+  );
+});

@@ -7,6 +7,7 @@ import { loadSessionBrief } from './session-briefs.js';
 import type { SessionRecord } from '../types.js';
 import { PlanStore } from '../planning/plan-store.js';
 import { isUserFacingSession } from '../execution/scope.js';
+import { extractNamedResource } from './focus.js';
 
 const SESSION_WORKING_MEMORY_DIR = path.join(path.dirname(WORKING_MEMORY_FILE), 'state', 'working-memory');
 
@@ -35,13 +36,29 @@ export interface ActiveTaskSpec {
   verb?: string;
   /** Explicit count when stated ("25 emails"). */
   count?: number;
-  /** The named recipient/target set, stored VERBATIM and untruncated. */
+  /** The named recipient/target set, stored VERBATIM. Inline when small;
+   *  large sets render as a bounded preview + count (pointer-first, no bloat). */
   recipients: string[];
+  /**
+   * A concrete resource LOCATOR for the list/target (a Google Sheets/Docs id or
+   * URL). This is the compact "where it lives" pointer — pinned so that at
+   * action time Clem pulls from THIS exact reference instead of re-discovering
+   * (the real failure: she made fresh MCP calls and pulled the wrong list).
+   */
+  resourceRef?: string;
   /** "only" | "exactly" | "just" when the user constrained scope. */
   exclusivity?: string;
   /** The raw constraint clause (capped), for provenance. */
   constraintText: string;
 }
+
+/**
+ * Recipients are inlined verbatim up to this many characters; beyond it the
+ * block renders a bounded preview + "+N more" + a confirm nudge, so a large
+ * pasted list never bloats every turn or overflows the working-memory read cap.
+ * The compact resource pointer (resourceRef) is the preferred home for big sets.
+ */
+const RECIPIENT_INLINE_CHAR_BUDGET = 1500;
 
 // A mutating / outbound verb whose parameters must be pinned so they survive
 // the conversation. Mirrors the intent of plan-first's write-verb set; kept
@@ -107,20 +124,35 @@ export function detectActiveTask(message: string): ActiveTaskSpec | null {
   if (!TASK_VERB_RE.test(text)) return null;
 
   const recipients = parseRecipients(text);
-  if (recipients.length < 2) return null; // require a concrete list
-
-  const verbMatch = text.match(TASK_VERB_RE);
+  const resourceRef = extractNamedResource(text) ?? undefined;
+  const hasMarker = LIST_MARKER_RE.test(text);
   const countMatch = COUNT_RE.exec(text);
-  const count = countMatch ? Number.parseInt(countMatch[1], 10) : undefined;
-  const exclusivity = EXCLUSIVITY_RE.test(text) && LIST_MARKER_RE.test(text)
+  const parsedCount = countMatch ? Number.parseInt(countMatch[1], 10) : NaN;
+  const count = Number.isFinite(parsedCount) ? parsedCount : undefined;
+  const exclusivity = EXCLUSIVITY_RE.test(text) && hasMarker
     ? (text.match(EXCLUSIVITY_RE)?.[0]?.toLowerCase())
     : undefined;
 
+  // Fire only with a CONCRETE target signal alongside the mutating verb:
+  //  - an enumerated recipient set (>=2), OR
+  //  - a concrete resource locator (sheet/doc id or URL), OR
+  //  - a list reference ("this/that list") qualified by a count or exclusivity
+  //    (the "send 25 emails to this list" shape) — pinned even when the exact
+  //    list is UNRESOLVED, so the params persist and Clem is told to confirm
+  //    WHICH list before pulling, rather than re-discovering and guessing.
+  const hasConcreteTarget =
+    recipients.length >= 2
+    || Boolean(resourceRef)
+    || (hasMarker && (count !== undefined || Boolean(exclusivity)));
+  if (!hasConcreteTarget) return null;
+
+  const verbMatch = text.match(TASK_VERB_RE);
   return {
     capturedAt: new Date().toISOString(),
     verb: verbMatch ? verbMatch[0].toLowerCase() : undefined,
-    count: Number.isFinite(count) ? count : undefined,
+    count,
     recipients,
+    resourceRef,
     exclusivity,
     constraintText: text.slice(0, 1500),
   };
@@ -128,17 +160,47 @@ export function detectActiveTask(message: string): ActiveTaskSpec | null {
 
 function renderActiveTaskSection(spec: ActiveTaskSpec): string {
   const lines = [
-    `${ACTIVE_TASK_HEADING} (binding — act on THIS list/count below, not on recalled context; the latest stated version wins)`,
+    `${ACTIVE_TASK_HEADING} (binding — use the EXACT target below; pull it from the pinned reference and do NOT re-discover, search, or substitute another list; the latest stated version wins)`,
   ];
   const meta: string[] = [];
   if (spec.verb) meta.push(`Action: ${spec.verb}`);
   if (spec.count != null) meta.push(`Count: ${spec.count}`);
   if (spec.exclusivity) meta.push(`Scope: ${spec.exclusivity} these`);
   if (meta.length) lines.push(meta.join(' | '));
-  if (spec.recipients.length) {
-    lines.push('Recipients (verbatim — do not substitute or re-derive):');
-    for (const recipient of spec.recipients) lines.push(`- ${recipient}`);
+
+  // Compact "where it lives" pointer — the preferred, no-bloat home for the
+  // list. At action time Clem must pull from THIS exact locator.
+  if (spec.resourceRef) {
+    lines.push(`Resource (pull from THIS exact reference — do not search for a list): ${spec.resourceRef}`);
   }
+
+  if (spec.recipients.length) {
+    const joined = spec.recipients.join(', ');
+    if (joined.length <= RECIPIENT_INLINE_CHAR_BUDGET) {
+      lines.push(`Recipients (verbatim — do not substitute or re-derive): ${joined}`);
+    } else {
+      // Bounded preview so a large pasted list neither bloats every turn nor
+      // overflows the read cap (which would silently drop names = drift).
+      let preview = '';
+      let included = 0;
+      for (const recipient of spec.recipients) {
+        if (preview.length + recipient.length + 2 > RECIPIENT_INLINE_CHAR_BUDGET) break;
+        preview += (preview ? ', ' : '') + recipient;
+        included += 1;
+      }
+      const remaining = spec.recipients.length - included;
+      lines.push(
+        `Recipients: ${preview} … +${remaining} more (large list — confirm the exact full set, or store it as a referenced list/sheet, before sending; do NOT substitute a different list).`,
+      );
+    }
+  }
+
+  // Referenced a list but we could not resolve a concrete locator or set —
+  // clarify, don't guess (the real failure was guessing via re-discovery).
+  if (!spec.resourceRef && spec.recipients.length === 0) {
+    lines.push('List reference: UNRESOLVED — confirm WHICH list with the user before pulling it; do not guess or search.');
+  }
+
   if (spec.constraintText) lines.push(`Stated: ${spec.constraintText}`);
   lines.push(`Captured: ${spec.capturedAt}`);
   return lines.join('\n');

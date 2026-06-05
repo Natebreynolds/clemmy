@@ -108,6 +108,54 @@ test('detectActiveTask returns null for imperatives without a concrete list', ()
   }
 });
 
+test('detectActiveTask captures a resource locator (the where-it-lives pointer)', () => {
+  const url = 'https://docs.google.com/spreadsheets/d/1AbcD_efGhIjKlMnOpQrStUvWxYz0123456789xyz/edit';
+  const spec = detectActiveTask(`send the Q2 outreach to the list at ${url}`);
+  assert.ok(spec, 'mutating verb + a concrete locator fires');
+  assert.equal(spec!.resourceRef, '1AbcD_efGhIjKlMnOpQrStUvWxYz0123456789xyz');
+});
+
+test('detectActiveTask fires on "send 25 to this list" and renders an UNRESOLVED clarify line', () => {
+  const spec = detectActiveTask('send 25 emails to this list');
+  assert.ok(spec, 'list reference + count fires even with no inline names');
+  assert.equal(spec!.count, 25);
+  assert.equal(spec!.recipients.length, 0);
+  assert.equal(spec!.resourceRef, undefined);
+  const sid = 'sess-at-unresolved';
+  writeActiveTaskSection(sid, spec!);
+  const content = readFileSync(workingMemoryPathForSession(sid), 'utf-8');
+  assert.match(content, /UNRESOLVED — confirm WHICH list/);
+});
+
+test('Active Task renders the locator + use-don\'t-rediscover discipline (the real-incident fix)', () => {
+  const sid = 'sess-at-loc';
+  const id = '1AbcD_efGhIjKlMnOpQrStUvWxYz0123456789xyz';
+  writeActiveTaskSection(sid, {
+    capturedAt: new Date().toISOString(),
+    verb: 'send', resourceRef: id, recipients: [],
+    constraintText: 'send the Q2 outreach to that sheet',
+  });
+  const content = readFileSync(workingMemoryPathForSession(sid), 'utf-8');
+  assert.match(content, /pull it from the pinned reference and do NOT re-discover/);
+  assert.ok(content.includes(id), 'the exact locator is pinned');
+  assert.doesNotMatch(content, /UNRESOLVED/, 'a locator resolves the reference');
+});
+
+test('Active Task bounds a large recipient list (no bloat, no truncation drift)', () => {
+  const sid = 'sess-at-large';
+  const big = Array.from({ length: 200 }, (_, i) => `Person Number ${i}`);
+  writeActiveTaskSection(sid, {
+    capturedAt: new Date().toISOString(),
+    verb: 'send', recipients: big, constraintText: 'send to all 200',
+  });
+  const content = readFileSync(workingMemoryPathForSession(sid), 'utf-8');
+  assert.match(content, /\+\d+ more/, 'overflow is summarized, not inlined');
+  assert.match(content, /confirm the exact full set/);
+  assert.ok(content.includes('Person Number 0'), 'preview includes the head of the list');
+  assert.ok(!content.includes('Person Number 199'), 'the tail is not inlined (bounded)');
+  assert.ok(content.length < 3000, 'whole section stays within the 3000-char read window');
+});
+
 // ─── Active Task: write / read / dedupe / non-destructive ────────────────────
 
 test('writeActiveTaskSection is non-destructive, last-writer-wins, lists verbatim', () => {
