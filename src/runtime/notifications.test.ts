@@ -35,6 +35,7 @@ const {
   listNotifications,
   markStaleApprovalNotificationsRead,
   markNotificationsReadByApprovalId,
+  isDeliveryJobStale,
 } = await import('./notifications.js');
 
 const NOTIFICATIONS_FILE = path.join(TMP_HOME, 'state', 'notifications.json');
@@ -53,6 +54,20 @@ function makeNotification(id: string, body = 'hello'): Parameters<typeof addNoti
 
 test.after(() => {
   try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ }
+});
+
+test('isDeliveryJobStale: caps the backlog so a flush cannot dump old notifications', () => {
+  const now = Date.UTC(2026, 5, 5, 3, 0, 0); // 2026-06-05T03:00:00Z
+  const dayMs = 24 * 60 * 60_000;
+  // The incident: a two-week-old job must be treated as stale and dropped.
+  assert.equal(isDeliveryJobStale('2026-05-22T03:00:00.000Z', now, dayMs), true);
+  // Just over the 24h cap → stale.
+  assert.equal(isDeliveryJobStale(new Date(now - dayMs - 60_000).toISOString(), now, dayMs), true);
+  // Fresh / within the window → keep and deliver.
+  assert.equal(isDeliveryJobStale(new Date(now - 60_000).toISOString(), now, dayMs), false);
+  assert.equal(isDeliveryJobStale(new Date(now).toISOString(), now, dayMs), false);
+  // Unparseable timestamp → NOT stale (safer to keep than silently drop).
+  assert.equal(isDeliveryJobStale('not-a-date', now, dayMs), false);
 });
 
 test('addNotification: writes atomically and leaves no .tmp behind', () => {

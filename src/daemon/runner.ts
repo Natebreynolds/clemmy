@@ -47,6 +47,7 @@ import {
   addNotification,
   getNotificationDestinationsForRecord,
   getNotification,
+  isDeliveryJobStale,
   listQueuedNotificationDeliveries,
   markNotificationRead,
   replaceQueuedNotificationDeliveries,
@@ -89,6 +90,21 @@ interface DaemonState {
 }
 
 const DELIVERY_MAX_ATTEMPTS = 5;
+// Drop a delivery job that has been undeliverable longer than this. Without
+// it, jobs deferred for lack of a destination accumulate forever and flush
+// all at once when one is finally added (2026-06-05: 395 two-week-old jobs
+// dumped on first Discord connect). 24h default; env-overridable for ops.
+const DELIVERY_MAX_AGE_MS = (() => {
+  const hours = parseInt(getRuntimeEnv('NOTIFICATION_DELIVERY_MAX_AGE_HOURS') ?? '', 10);
+  return (Number.isFinite(hours) && hours > 0 ? hours : 24) * 60 * 60_000;
+})();
+// Even fresh, legitimate bursts shouldn't fire as one wall of messages. Cap
+// how many notifications actually deliver per 15s tick; the rest defer to
+// the next tick and trickle out. env-overridable.
+const DELIVERY_MAX_PER_TICK = (() => {
+  const n = parseInt(getRuntimeEnv('NOTIFICATION_DELIVERY_MAX_PER_TICK') ?? '', 10);
+  return Number.isFinite(n) && n > 0 ? n : 25;
+})();
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -677,9 +693,25 @@ async function processNotificationDeliveries(assistant: ClementineAssistant): Pr
 
   const nextQueue: typeof queue = [];
   let deferredCount = 0;
+  let droppedStale = 0;
+  let deliveredThisTick = 0;
+  const nowMs = Date.now();
   for (const job of queue) {
     const notification = getNotification(job.notificationId);
     if (!notification) {
+      continue;
+    }
+
+    // Age cap (terminal): a job undeliverable past DELIVERY_MAX_AGE_MS is
+    // dropped rather than delivered. This is what stops a long-deferred
+    // backlog from flooding the moment a destination is finally configured
+    // (2026-06-05 incident). The notification itself stays in Activity.
+    if (isDeliveryJobStale(job.queuedAt, nowMs, DELIVERY_MAX_AGE_MS)) {
+      droppedStale += 1;
+      updateNotificationDeliveryStatus(notification.id, {
+        deliveredAt: notification.deliveredAt,
+        deliveryError: `Dropped: undelivered for over ${Math.round(DELIVERY_MAX_AGE_MS / 3_600_000)}h`,
+      });
       continue;
     }
 
@@ -717,6 +749,16 @@ async function processNotificationDeliveries(assistant: ClementineAssistant): Pr
       nextQueue.push(job);
       continue;
     }
+
+    // Per-tick send cap: once this pass has delivered DELIVERY_MAX_PER_TICK
+    // notifications, defer the rest to the next 15s tick so a large (but
+    // fresh) burst trickles out instead of arriving as one wall. Stale jobs
+    // were already dropped above, so this only paces legitimate volume.
+    if (deliveredThisTick >= DELIVERY_MAX_PER_TICK) {
+      nextQueue.push(job);
+      continue;
+    }
+
     const now = new Date();
     const completed = new Set(job.completedDestinationIds ?? []);
     const failed = new Set(job.failedDestinationIds ?? []);
@@ -766,6 +808,10 @@ async function processNotificationDeliveries(assistant: ClementineAssistant): Pr
     job.nextAttemptAtByDestination = nextAttemptAtByDestination;
     job.lastErrorByDestination = lastErrorByDestination;
 
+    // Count toward the per-tick cap only when this job actually pushed a
+    // message out — deferred/retry-waiting jobs don't burn the budget.
+    if (successfulDestinations.length > 0) deliveredThisTick += 1;
+
     const allDestinationIds = destinations.map((destination) => destination.id);
     const terminal = allDestinationIds.every((id) => completed.has(id) || failed.has(id));
     const totalAttempts = Object.values(attemptCountByDestination).reduce((sum, value) => sum + value, 0);
@@ -809,6 +855,14 @@ async function processNotificationDeliveries(assistant: ClementineAssistant): Pr
 
   replaceQueuedNotificationDeliveries(nextQueue);
   emitNoDestinationsPromptIfNeeded(deferredCount);
+  if (droppedStale > 0) {
+    logger.warn({ droppedStale, maxAgeHours: Math.round(DELIVERY_MAX_AGE_MS / 3_600_000) },
+      'Dropped stale notification deliveries (older than max age) to prevent a backlog flush');
+  }
+  if (deliveredThisTick >= DELIVERY_MAX_PER_TICK && nextQueue.length > 0) {
+    logger.info({ deliveredThisTick, deferred: nextQueue.length },
+      'Hit per-tick delivery cap; remaining notifications will trickle out on the next tick');
+  }
 }
 
 export async function startDaemon(assistant: ClementineAssistant): Promise<void> {

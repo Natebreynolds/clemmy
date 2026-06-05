@@ -145,6 +145,23 @@ function uniqueStrings(items: string[]): string[] {
   return [...new Set(items.filter(Boolean))];
 }
 
+/**
+ * A delivery job is "stale" once it has sat undelivered longer than
+ * maxAgeMs. Jobs defer in the queue while no destination is configured
+ * (intended) — but without an age cap they accumulate forever and then
+ * flush ALL AT ONCE the moment a destination is finally added. That is
+ * exactly the 2026-06-05 incident: connecting Discord for a new user
+ * dumped 395 two-week-old notifications in one burst. The drain drops
+ * stale jobs instead of delivering them; the underlying notification
+ * stays in Activity, it just won't be pushed out. Unparseable timestamps
+ * are treated as NOT stale (keep — safer than silently dropping).
+ */
+export function isDeliveryJobStale(queuedAt: string, nowMs: number, maxAgeMs: number): boolean {
+  const queuedMs = new Date(queuedAt).getTime();
+  if (!Number.isFinite(queuedMs)) return false;
+  return nowMs - queuedMs > maxAgeMs;
+}
+
 export function loadNotifications(): NotificationRecord[] {
   const result = loadJsonResilient<NotificationRecord[]>(NOTIFICATIONS_FILE, []);
   if (result.corrupted) surfaceCorruption(NOTIFICATIONS_FILE);
