@@ -68,6 +68,10 @@ test('context packet ranks relevant skills and workflows for the current request
   assert.match(packet.text, /External MCP scope: dataforseo/);
   assert.match(packet.text, /call skill_read/);
   assert.match(packet.text, /reusable-process candidates/);
+  // Journey-1 discovery cue: a vague run request must route to workflow_run
+  // (the resolver confirms), while still not auto-running unrequested workflows.
+  assert.match(packet.text, /call workflow_run with their exact phrasing/);
+  assert.match(packet.text, /Do NOT auto-run a workflow the user did not ask to run/);
 });
 
 // ─── P0: detectMultiItemIntent unit table ──────────────────────────────────
