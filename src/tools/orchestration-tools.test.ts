@@ -12,7 +12,7 @@ process.env.CLEMENTINE_HOME = TMP_HOME;
 process.env.HOME = TMP_HOME;
 
 import type { ToolChoiceRecord } from '../memory/tool-choice-store.js';
-const { registerOrchestrationTools, renderAuthoringAdvisories, bindStepsToToolChoices, draftToDefinition, commitAuthoredWorkflow } = await import('./orchestration-tools.js');
+const { registerOrchestrationTools, renderAuthoringAdvisories, bindStepsToToolChoices, draftToDefinition, commitAuthoredWorkflow, bindDiscussedToolkitsIntoSteps } = await import('./orchestration-tools.js');
 const { traceToWorkflowDraft } = await import('../execution/trace-to-workflow.js');
 const { writeWorkflow, readWorkflow } = await import('../memory/workflow-store.js');
 const { WORKFLOWS_DIR } = await import('../memory/vault.js');
@@ -414,4 +414,45 @@ test('draftToDefinition + commitAuthoredWorkflow: a promoted draft authors + val
   assert.equal(built.ok, true, built.errors.join('; '));
   assert.equal(built.savedDef.enabled, false);
   assert.equal(readWorkflow('zz-promote-test')!.data.steps.length, 2);
+});
+
+// ─── chat-aware toolkit binding (the scorpion-facebook-trends fix) ──────────
+
+test('bindDiscussedToolkitsIntoSteps: binds the scrape step to the discussed TOOL (Apify), not the TARGET (Facebook)', () => {
+  const steps: any = [
+    { id: 'fetch', prompt: 'Find the official Facebook page for scorpion.co and verify it.', allowedTools: ['composio_*', 'run_shell_command'] },
+    { id: 'scrape', prompt: 'Prefer a reliable Apify public Facebook page/posts scraper if configured; otherwise use public web scraping only.', allowedTools: ['composio_*', 'run_shell_command'] },
+    { id: 'notify', prompt: 'Notify Nate with the summary.', allowedTools: ['notify_user'] },
+  ];
+  const discussed = [{ slug: 'apify', name: 'Apify' }, { slug: 'facebook', name: 'Facebook' }];
+  const r = bindDiscussedToolkitsIntoSteps(steps, discussed);
+  // Only the scrape step binds, and to Apify.
+  assert.equal(r.boundNotes.length, 1);
+  assert.match(r.boundNotes[0], /scrape.*Apify/);
+  assert.match(steps[1].prompt, /use the Apify toolkit via composio/);
+  assert.match(steps[1].prompt, /Do NOT improvise raw HTTP/);
+  assert.ok(steps[1].allowedTools.includes('composio_execute_tool') && !steps[1].allowedTools.includes('composio_*'));
+  // The find-page step (Facebook = TARGET) is untouched; notify is untouched.
+  assert.equal(steps[0].prompt, 'Find the official Facebook page for scorpion.co and verify it.');
+  assert.equal(steps[2].allowedTools.length, 1);
+});
+
+test('bindDiscussedToolkitsIntoSteps: a platform named only as a TARGET is never bound', () => {
+  const steps: any = [{ id: 's', prompt: 'Summarize the latest Facebook posts for the team.', allowedTools: [] }];
+  const r = bindDiscussedToolkitsIntoSteps(steps, [{ slug: 'facebook', name: 'Facebook' }]);
+  assert.equal(r.boundNotes.length, 0); // "Facebook posts" = target, no tool intent
+});
+
+test('bindDiscussedToolkitsIntoSteps: requires tool intent (a bare mention does not bind)', () => {
+  const steps: any = [{ id: 's', prompt: 'Write a friendly note mentioning Apify to the team.', allowedTools: [] }];
+  const r = bindDiscussedToolkitsIntoSteps(steps, [{ slug: 'apify', name: 'Apify' }]);
+  assert.equal(r.boundNotes.length, 0); // no scraper/actor/use-Apify cue
+});
+
+test('bindDiscussedToolkitsIntoSteps: idempotent (a second pass does not double-bind)', () => {
+  const steps: any = [{ id: 's', prompt: 'Use the Apify scraper to pull data.', allowedTools: [] }];
+  const first = bindDiscussedToolkitsIntoSteps(steps, [{ slug: 'apify', name: 'Apify' }]);
+  const second = bindDiscussedToolkitsIntoSteps(steps, [{ slug: 'apify', name: 'Apify' }]);
+  assert.equal(first.boundNotes.length, 1);
+  assert.equal(second.boundNotes.length, 0); // marker present → skipped
 });

@@ -542,6 +542,13 @@ function readCatalogCache(): CatalogToolkit[] {
   }
 }
 
+/** Synchronous, best-effort read of the cached toolkit catalog (slug + name).
+ *  For author-time use (e.g. detecting a toolkit the chat discussed) where an
+ *  async catalog fetch would be too heavy. Returns [] when the cache is cold. */
+export function listCachedToolkits(): CatalogToolkit[] {
+  return readCatalogCache();
+}
+
 function writeCatalogCache(data: CatalogToolkit[]): void {
   mkdirSync(CACHE_DIR, { recursive: true });
   writeFileSync(CATALOG_CACHE_FILE, JSON.stringify({ at: Date.now(), data }, null, 2), { encoding: 'utf-8', mode: 0o600 });

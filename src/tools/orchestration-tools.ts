@@ -20,6 +20,7 @@ import { describeWorkflowPlainEnglish, describeWorkflowOneLine, describeCron } f
 import { validateCronExpression } from '../shared/cron.js';
 import { draftWorkflowFromSession, type WorkflowDraft } from '../execution/trace-to-workflow.js';
 import { preflightWorkflow } from '../execution/workflow-preflight.js';
+import { listCachedToolkits } from '../integrations/composio/client.js';
 import { clearWorkflowFailures } from '../execution/workflow-failure-ledger.js';
 import { analyzeWorkflowGaps, renderWorkflowGapQuestions } from '../execution/workflow-gap-test.js';
 import {
@@ -219,6 +220,102 @@ export function bindStepsToToolChoices(
     }
   }
   return { boundNotes, advisories };
+}
+
+// ── Chat-aware toolkit binding (correct-by-construction authoring) ──────────
+//
+// The failure: a user asked "what's the best Facebook scraper" → Clem
+// recommended Apify (available via Composio) → "build a workflow" → the scrape
+// step was authored vaguely ("Apify if configured, else web scraping") and at
+// run time improvised a raw urllib GET that returned nothing. The decision the
+// chat established (use Apify) wasn't COMMITTED into the workflow.
+//
+// Fix: when a step's prompt NAMES a Composio toolkit that was discussed in this
+// chat (and exists in the catalog), bind it concretely — lock allowedTools to
+// the composio family and inject a firm directive to use that toolkit (and NOT
+// improvise raw HTTP/manual scraping). High-precision (the step already named
+// the toolkit + it was discussed + it's real), so it never over-fires.
+
+const TOOLKIT_BIND_MARKER = '\n\n→ Toolkit (chat-bound):';
+
+/** Catalog toolkits whose NAME appears in the recent chat text. Best-effort +
+ *  sync; returns [] on any read failure. Names <4 chars are skipped (too noisy). */
+function toolkitsDiscussedInChat(sessionId: string | undefined): Array<{ slug: string; name: string }> {
+  if (!sessionId) return [];
+  let toolkits: Array<{ slug: string; name: string }>;
+  let chatText: string;
+  try {
+    toolkits = listCachedToolkits().map((t) => ({ slug: t.slug, name: t.name }));
+    if (toolkits.length === 0) return [];
+    const events = listEvents(sessionId, { types: ['user_input_received', 'conversation_completed'], limit: 60, desc: true });
+    chatText = events
+      .map((e) => {
+        const d = e.data as Record<string, unknown>;
+        return [d.text, d.reply, d.summary].filter((x): x is string => typeof x === 'string').join(' ');
+      })
+      .join(' \n ')
+      .toLowerCase();
+  } catch {
+    return [];
+  }
+  if (!chatText) return [];
+  const seen = new Set<string>();
+  const out: Array<{ slug: string; name: string }> = [];
+  for (const tk of toolkits) {
+    const name = (tk.name ?? '').trim();
+    if (name.length < 4 || seen.has(tk.slug)) continue;
+    // Word-boundary, case-insensitive presence of the toolkit name in the chat.
+    const re = new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+    if (re.test(chatText)) { out.push({ slug: tk.slug, name }); seen.add(tk.slug); }
+  }
+  return out;
+}
+
+// A toolkit NAME followed by a content noun is the scrape TARGET (e.g.
+// "Facebook page/posts"), not the tool to use — never bind those.
+const TOOLKIT_TARGET_NOUN = /(?:page|pages|post|posts|profile|profiles|account|accounts|group|groups|feed|feeds|channel|channels|video|videos|story|stories|reel|reels)\b/i;
+// A step that actually USES an external tool names one of these.
+const TOOLKIT_TOOL_INTENT = /\b(scraper|scrapers|actor|actors|connector|integration|api|crawl|crawler|toolkit)\b/i;
+const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/** Pure step-binder: commit a DISCUSSED toolkit into any step whose prompt NAMES
+ *  it AS A TOOL (not as a scrape target) — lock the tool surface to composio +
+ *  append a use-this-toolkit directive. Mutates the steps. Exported for tests so
+ *  the precision (Apify-the-tool vs Facebook-the-target) is pinned without a DB. */
+export function bindDiscussedToolkitsIntoSteps(
+  steps: WorkflowDefinition['steps'],
+  discussed: Array<{ slug: string; name: string }>,
+): { boundNotes: string[] } {
+  if (discussed.length === 0) return { boundNotes: [] };
+  const boundNotes: string[] = [];
+  for (const step of steps) {
+    const prompt = step.prompt ?? '';
+    if (!prompt || prompt.includes(TOOLKIT_BIND_MARKER)) continue;
+    const named = discussed.find((tk) => {
+      const nm = escapeRe(tk.name);
+      if (!new RegExp(`\\b${nm}\\b`, 'i').test(prompt)) return false;
+      // Skip when the name reads as a TARGET ("<name> page/posts/…").
+      if (new RegExp(`\\b${nm}\\b\\s+(?:\\w+\\s+){0,1}${TOOLKIT_TARGET_NOUN.source}`, 'i').test(prompt)) return false;
+      // Require real tool intent: a tool-noun present, or "use/via/with/prefer <name>".
+      return TOOLKIT_TOOL_INTENT.test(prompt)
+        || new RegExp(`\\b(?:use|using|via|with|prefer)\\b[\\s\\w]{0,20}\\b${nm}\\b`, 'i').test(prompt);
+    });
+    if (!named) continue;
+    step.allowedTools = lockAllowedToolsTo(step.allowedTools, ['composio_execute_tool', 'composio_search_tools']);
+    step.prompt = `${prompt}${TOOLKIT_BIND_MARKER} use the ${named.name} toolkit via composio (run composio_search_tools to find the exact ${named.name} action, then composio_execute_tool). Do NOT improvise raw HTTP / urllib / manual scraping — if ${named.name} can't return the data, stop with a clear blocked status and reason instead of silently falling back.`;
+    boundNotes.push(`🔗 Bound step \`${step.id}\` to the ${named.name} toolkit (you discussed it in this chat) and locked off raw-HTTP improvisation.`);
+  }
+  return { boundNotes };
+}
+
+/** Commit a chat-discussed toolkit into any step that names it. Reads the chat
+ *  (catalog toolkits named in the recent session text), then delegates to the
+ *  pure binder above. */
+export function bindChatDiscussedToolkits(
+  steps: WorkflowDefinition['steps'],
+  sessionId: string | undefined,
+): { boundNotes: string[] } {
+  return bindDiscussedToolkitsIntoSteps(steps, toolkitsDiscussedInChat(sessionId));
 }
 
 const ACTIVE_RUN_STATUSES = new Set(['queued', 'running', 'parked']);
@@ -655,7 +752,11 @@ export function registerOrchestrationTools(server: McpServer): void {
         inputs: Object.keys(inputsSchema).length > 0 ? inputsSchema : undefined,
         synthesis: synthesis_prompt ? { prompt: synthesis_prompt } : undefined,
       };
-      // Tight authoring: bind steps to the user's proven tool-choices BEFORE
+      // Chat-aware binding: commit any toolkit the user discussed in THIS chat
+      // into the step that names it (e.g. "Apify" → lock the scrape step to
+      // composio + a use-Apify directive) BEFORE validation/persist, so the
+      // decision the chat established can't get dropped into a vague step.
+      const chatBind = bindChatDiscussedToolkits(def.steps, getToolOutputContext()?.sessionId);
       // Author through the canonical core (bind → auto-repair + validate →
       // persist → gap-test). Auto-repair saves a runnable workflow in one shot
       // instead of bouncing the author into a token-burning re-author loop;
@@ -667,7 +768,8 @@ export function registerOrchestrationTools(server: McpServer): void {
           `Workflow "${name}" was NOT created — fix these first:\n- ${created.errors.join('\n- ')}`,
         );
       }
-      const createBindReport = created.boundNotes.length > 0 ? `\n\n${created.boundNotes.join('\n')}` : '';
+      const createBindReport = [...chatBind.boundNotes, ...created.boundNotes].length > 0
+        ? `\n\n${[...chatBind.boundNotes, ...created.boundNotes].join('\n')}` : '';
       return textResult(
         `Created workflow "${name}". Here's what it will do:\n\n${describeWorkflowPlainEnglish(created.savedDef)}\n\n`
           + `Saved to workflows/${dirName}/SKILL.md.${createBindReport}`
@@ -704,15 +806,20 @@ export function registerOrchestrationTools(server: McpServer): void {
         return textResult(`There's nothing to turn into a workflow yet: ${draft.notes[0] ?? 'no actions found in this chat.'}`);
       }
       const def = draftToDefinition(name, draft);
+      // Same chat-aware binding as workflow_create: commit a toolkit the chat
+      // discussed (e.g. Apify) into the step that names it before persisting.
+      const promoteBind = bindChatDiscussedToolkits(def.steps, sid);
       const built = commitAuthoredWorkflow(def, dirName);
       if (!built.ok) {
         return textResult(`I couldn't build "${name}" from this chat — these need fixing first:\n- ${built.errors.join('\n- ')}`);
       }
       const n = draft.toolCallCount;
       const preflight = preflightWorkflow(built.savedDef);
+      const promoteBindReport = promoteBind.boundNotes.length > 0 ? `\n\n${promoteBind.boundNotes.join('\n')}` : '';
       return textResult(
         `Built a draft workflow "${name}" from this chat — saved DISABLED so you can review before it runs.\n\n`
           + describeWorkflowPlainEnglish(built.savedDef)
+          + promoteBindReport
           + `\n\n${preflight.ok ? '✅' : '⚠️'} ${preflight.summary}`
           + `\n\nReconstructed from ${n} action${n === 1 ? '' : 's'} you took. Before enabling:\n- ${draft.notes.join('\n- ')}`
           + renderWorkflowGapQuestions(built.gaps)
