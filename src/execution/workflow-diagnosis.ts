@@ -146,6 +146,45 @@ export function detectSelfReportedFailure(obj: Record<string, unknown>): string 
 }
 
 /**
+ * Depth-bounded recursive variant of detectSelfReportedFailure: returns a reason
+ * when a self-reported failure (ok=false / non-empty error string / *status in
+ * the failure vocab) appears ANYWHERE in a nested result, not just at the top
+ * level. The motivating case (caught by the live creation-test smoke): a step
+ * told to return a structured object wrapped its error envelope one level deep —
+ * `{records:{ok:false,error:"Unable to retrieve tool …"}}` — which the top-level
+ * check + the output contract both wave through.
+ *
+ * Deliberately NOT wired into the canonical detectBlockedSteps (the runtime
+ * completion path): a healthy real run can legitimately carry a nested
+ * degraded-but-complete marker (e.g. one sub-source `ok:false` among real data),
+ * and failing those would regress "degraded ≠ failed". It is used ONLY by the
+ * creation-test trust gate, where a false flag merely leaves the draft DISABLED
+ * with an explainable reason + "enable anyway" (informs, never traps).
+ */
+export function deepSelfReportedFailure(value: unknown, depth = 0): string | null {
+  if (value == null || depth > 4) return null;
+  if (Array.isArray(value)) {
+    for (const el of value) {
+      const r = deepSelfReportedFailure(el, depth + 1);
+      if (r) return r;
+    }
+    return null;
+  }
+  if (typeof value === 'object') {
+    const obj = value as Record<string, unknown>;
+    const here = detectSelfReportedFailure(obj);
+    if (here) return here;
+    for (const v of Object.values(obj)) {
+      if (v && typeof v === 'object') {
+        const r = deepSelfReportedFailure(v, depth + 1);
+        if (r) return r;
+      }
+    }
+  }
+  return null;
+}
+
+/**
  * Inspect a forEach aggregate (array of per-item results) for items that
  * politely BLOCKED ({blocked:true}) or self-reported a failure (ok:false /
  * *status in the failure vocab / error string). Without this, a fan-out

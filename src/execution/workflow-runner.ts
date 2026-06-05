@@ -32,11 +32,12 @@ import {
   type RunConversationResult,
 } from '../runtime/harness/loop.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
+import { countDominantArray } from '../runtime/harness/tool-output-digest.js';
 import { buildOrchestratorAgent } from '../agents/orchestrator.js';
 import { buildWorkflowStepAgent } from '../agents/workflow-step-agent.js';
 import {
   detectBlockedSteps,
-  detectSelfReportedFailure,
+  deepSelfReportedFailure,
   diagnoseWorkflowBlock,
   recordProposedFix,
   applyProposedFix,
@@ -2487,18 +2488,33 @@ export interface CreationTestResult {
 
 /** Verdict for a read-only step's output: did it actually return data? */
 export function creationTestVerdict(stepId: string, out: unknown): CreationTestStepResult {
+  // A read-only step that returns NOTHING is a creation-test failure (the
+  // scorpion mode — a scrape/fetch that silently came back empty): null, an
+  // empty/whitespace string, an empty array, or an empty object.
   const empty =
     out == null
     || (typeof out === 'string' && out.trim().length === 0)
-    || (Array.isArray(out) && out.length === 0);
+    || (Array.isArray(out) && out.length === 0)
+    || (typeof out === 'object' && !Array.isArray(out) && Object.keys(out as Record<string, unknown>).length === 0);
   if (empty) return { stepId, status: 'empty', detail: 'returned no data' };
-  if (out && typeof out === 'object' && !Array.isArray(out)) {
-    const o = out as Record<string, unknown>;
-    if (Object.keys(o).length === 0) return { stepId, status: 'empty', detail: 'returned an empty object' };
-    if (o.blocked === true) return { stepId, status: 'failed', detail: String(o.reason ?? 'blocked').slice(0, 160) };
-    const r = detectSelfReportedFailure(o);
-    if (r) return { stepId, status: 'failed', detail: r };
-  }
+  // An EMPTY dominant list is also "no data" even when wrapped in an object —
+  // `{records:[]}`, `{data:{records:[]}}` (reuses the 44→4 dominant-list finder).
+  const dom = countDominantArray(out);
+  if (dom && dom.count === 0) return { stepId, status: 'empty', detail: `returned 0 ${dom.key}` };
+  // Reuse the engine's CANONICAL failure detector — the SAME one the
+  // run-completion path uses (detectBlockedSteps) — so the creation-test
+  // verdict can never drift from how a real run judges a step. It catches
+  // blocked:true, a "blocked …" prose string (the Part A "block with a reason
+  // if it can't return data" directive, however the step phrases it), ok:false
+  // / error / *status failure-vocab, and per-item forEach failures.
+  const blocked = detectBlockedSteps({ [stepId]: out });
+  if (blocked.length > 0) return { stepId, status: 'failed', detail: blocked[0].reason.slice(0, 200) };
+  // Trust-gate strictness (creation test ONLY, not the runtime path): a step
+  // that buried a self-reported failure one level deep — e.g. it wrapped an
+  // error envelope to satisfy a contract key (`{records:{ok:false,error:…}}`,
+  // caught live by the smoke) — never returned real data. Recurse for it.
+  const deep = deepSelfReportedFailure(out);
+  if (deep) return { stepId, status: 'failed', detail: deep.slice(0, 200) };
   return { stepId, status: 'ok' };
 }
 

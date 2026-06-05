@@ -926,3 +926,28 @@ test('creationTestVerdict: a blocked/self-reported failure → failed (with reas
   assert.equal(blocked.status, 'failed');
   assert.match(blocked.detail ?? '', /Apify/);
 });
+
+test('creationTestVerdict: reuses the canonical detector — prose "blocked …" string + ok:false → failed', () => {
+  // The Part A directive ("block with a reason if it can't return data") may
+  // surface as a string OR an object; both must be caught, same as a real run.
+  assert.equal(creationTestVerdict('scrape', 'blocked: the Apify actor returned no posts').status, 'failed');
+  assert.equal(creationTestVerdict('scrape', { ok: false, note: 'no data' }).status, 'failed');
+  // An empty object is "no data", not a healthy result.
+  assert.equal(creationTestVerdict('scrape', {}).status, 'empty');
+});
+
+test('creationTestVerdict: NESTED failure envelope → failed (the live-smoke false-pass)', () => {
+  // Exact shape the smoke caught: the step wrapped an error one level deep to
+  // satisfy a contract key. Top-level looks fine; the failure is buried.
+  const out = { records: { ok: false, error: 'Unable to retrieve tool with slug NONEXISTENT_SMOKE_TOOLKIT_XYZ' } };
+  const v = creationTestVerdict('scrape', out);
+  assert.equal(v.status, 'failed');
+  assert.match(v.detail ?? '', /ok=false|Unable to retrieve/);
+});
+
+test('creationTestVerdict: empty dominant list (wrapped) → empty', () => {
+  assert.equal(creationTestVerdict('scrape', { records: [] }).status, 'empty');
+  assert.equal(creationTestVerdict('scrape', { data: { records: [] } }).status, 'empty');
+  // A NON-empty wrapped list is real data → ok.
+  assert.equal(creationTestVerdict('scrape', { data: { records: [{ id: 1 }] } }).status, 'ok');
+});

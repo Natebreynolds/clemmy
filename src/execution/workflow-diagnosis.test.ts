@@ -30,8 +30,28 @@ const {
   applyProposedFix,
   revertWorkflowFix,
   listFixBackups,
+  detectSelfReportedFailure,
+  deepSelfReportedFailure,
 } = mod;
 const { writeWorkflow, readWorkflow } = await import('../memory/workflow-store.js');
+
+test('deepSelfReportedFailure: finds a failure nested below the top level; null on healthy data', () => {
+  // Top-level check (parity with detectSelfReportedFailure).
+  assert.ok(deepSelfReportedFailure({ ok: false }));
+  // Nested one level (the live-smoke shape): error wrapped under a data key.
+  assert.match(
+    deepSelfReportedFailure({ records: { ok: false, error: 'Unable to retrieve tool' } }) ?? '',
+    /ok=false/,
+  );
+  // Nested error string deeper down.
+  assert.match(deepSelfReportedFailure({ a: { b: { error: 'boom' } } }) ?? '', /error="boom"/);
+  // Healthy data — no false positive (a normal records payload).
+  assert.equal(deepSelfReportedFailure({ records: [{ id: 1, name: 'x' }], count: 1 }), null);
+  assert.equal(deepSelfReportedFailure('just a string'), null);
+  assert.equal(deepSelfReportedFailure(null), null);
+  // Base detector still only sees the top level (unchanged).
+  assert.equal(detectSelfReportedFailure({ records: { ok: false } }), null);
+});
 
 test('detectBlockedSteps finds blocked results (object + JSON string), skips synthesis', () => {
   const blocked = detectBlockedSteps({
