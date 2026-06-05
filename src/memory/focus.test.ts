@@ -29,6 +29,7 @@ const {
   clearFocus,
   getFocusSnapshot,
   checkResourceMatchesFocus,
+  extractNamedResource,
 } = await import('./focus.js');
 
 test('createFocus: inserts an active row', () => {
@@ -42,6 +43,36 @@ test('createFocus: inserts an active row', () => {
   assert.equal(focus.status, 'active');
   assert.equal(focus.title, 'Q2 2026 Market Leader Refresh');
   assert.ok(focus.confirm_after > focus.created_at, 'confirm_after must be in the future');
+});
+
+test('createFocus staleOnCreate is born needsConfirm (auto-pin must be verified)', () => {
+  resetMemoryDb();
+  createFocus({
+    resourceRef: 'res-stale-pin',
+    title: 'Auto-pinned guess',
+    summary: 'Inferred from prior-session tool calls.',
+    staleOnCreate: true,
+  });
+  assert.equal(getFocusSnapshot().needsConfirm, true, 'a born-stale auto-pin must render under verify-before-rely');
+});
+
+test('createFocus without staleOnCreate is authoritative (not needsConfirm) at birth', () => {
+  resetMemoryDb();
+  createFocus({ resourceRef: 'res-fresh-pin', title: 'Confirmed', summary: 'User named this resource.' });
+  assert.equal(getFocusSnapshot().needsConfirm, false);
+});
+
+test('extractNamedResource: URL id, bare long id, and ignores ordinary text', () => {
+  assert.equal(
+    extractNamedResource('use https://docs.google.com/spreadsheets/d/1AbcD_efGhIjKlMnOpQrStUvWxYz0123456789xyz/edit'),
+    '1AbcD_efGhIjKlMnOpQrStUvWxYz0123456789xyz',
+  );
+  assert.equal(
+    extractNamedResource('sheet id 1A2B3C4D5E6F7G8H9I0J1K2L3M4N5O6P7Q8R9S0T'),
+    '1A2B3C4D5E6F7G8H9I0J1K2L3M4N5O6P7Q8R9S0T',
+  );
+  assert.equal(extractNamedResource('send to the usual list'), null);
+  assert.equal(extractNamedResource(undefined), null);
 });
 
 test('single-active invariant: creating a 2nd focus parks the 1st', () => {

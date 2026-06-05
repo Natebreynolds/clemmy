@@ -17,6 +17,33 @@ import type { Plan } from '../../agents/planner.js';
 const VAGUE_DEAL_REQUEST =
   'can you get me a list of the deals we closed recently and put it somewhere i can look at it';
 
+// ─── priorAnswers default-resource guard (cross-session drift) ───────────────
+
+test('buildPlannerPrompt: priorAnswers with NO named resource keeps the NEW-sheet default', () => {
+  const prompt = buildPlannerPrompt('pull the closed deals', 'put them in a sheet');
+  assert.match(prompt, /create a NEW Google Sheet/);
+});
+
+test('buildPlannerPrompt: priorAnswers naming an existing resource suppresses the default', () => {
+  const prompt = buildPlannerPrompt('update the deals tracker', 'use the existing sheet');
+  assert.doesNotMatch(prompt, /create a NEW Google Sheet/);
+  assert.match(prompt, /Use the resource the user named/);
+});
+
+test('buildPlannerPrompt: a sheet URL in the request suppresses the default', () => {
+  const prompt = buildPlannerPrompt(
+    'add rows to https://docs.google.com/spreadsheets/d/1AbcD_efGhIjKlMnOpQrStUvWxYz0123456789xyz/edit',
+    'go ahead',
+  );
+  assert.doesNotMatch(prompt, /create a NEW Google Sheet/);
+});
+
+test('buildPlannerPrompt: no priorAnswers → no default clause at all (unchanged)', () => {
+  const prompt = buildPlannerPrompt('pull the closed deals');
+  assert.doesNotMatch(prompt, /create a NEW Google Sheet/);
+  assert.doesNotMatch(prompt, /Use the resource the user named/);
+});
+
 function makePlan(overrides: Partial<Plan> = {}): Plan {
   return {
     objective: 'Create a short local markdown SEO opportunity brief for review.',

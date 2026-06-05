@@ -3,6 +3,7 @@ import { surfacePlan, surfaceAskingPlan } from '../../agents/plan-proposals.js';
 import { buildPlannerAgent, PlanSchema, type Plan } from '../../agents/planner.js';
 import { captureInteractionSignals } from '../../memory/auto-capture.js';
 import { recallHybrid } from '../../memory/recall.js';
+import { extractNamedResource } from '../../memory/focus.js';
 import type { AutoApproveScope } from '../../agents/proactivity-policy.js';
 import { appendEvent } from './eventlog.js';
 
@@ -171,8 +172,19 @@ export function buildPlannerPrompt(input: string, priorAnswers?: string, memoryC
     'Name the likely tool families or systems in the step text when they are obvious from the request.',
   ];
   if (priorAnswers && priorAnswers.trim().length > 0) {
+    // Only offer the "NEW Google Sheet" default when the user has NOT named a
+    // specific destination. When they named one (a sheet/doc id or URL, "the
+    // existing X", "update the …", or a quoted name), substituting a default
+    // would override their explicit resource — the cross-session drift we guard.
+    const combined = `${input} ${priorAnswers}`;
+    const namesResource = Boolean(extractNamedResource(combined))
+      || /\b(?:existing|the same|that)\s+(?:sheet|spreadsheet|doc|document|file|list|folder)\b/i.test(combined)
+      || /\bupdate\s+(?:the|my|our|that|this)\b/i.test(combined)
+      || /["'][^"']{3,}["']/.test(combined);
     lines.push(
-      `The user has answered the open questions: ${priorAnswers.trim()}. Produce a now-COMPLETE plan with needsUserInput EMPTY; apply safe defaults (e.g. create a NEW Google Sheet unless told to update an existing one) rather than re-asking.`,
+      namesResource
+        ? `The user has answered the open questions: ${priorAnswers.trim()}. Produce a now-COMPLETE plan with needsUserInput EMPTY. Use the resource the user named; do NOT substitute a new default.`
+        : `The user has answered the open questions: ${priorAnswers.trim()}. Produce a now-COMPLETE plan with needsUserInput EMPTY; apply safe defaults (e.g. create a NEW Google Sheet unless told to update an existing one) rather than re-asking.`,
     );
   }
   lines.push('', `User request:\n${input}`);

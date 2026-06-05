@@ -7,6 +7,41 @@ import type { AutoApproveScope } from '../../agents/proactivity-policy.js';
 import type { RuntimeContextValue } from '../../types.js';
 import { normalizeZodForCodexStrict } from '../schema-normalizer.js';
 import { runPlanFirstPreflight } from './plan-first.js';
+import { extractNamedResource } from '../../memory/focus.js';
+
+/**
+ * Deterministic self-contained-request guard (code-level, not a prompt rule).
+ * The classifier biases toward "answers"; a fresh request that names its OWN
+ * concrete resource (a sheet/doc id or URL) absent from the open plan must NOT
+ * be swallowed as an answer to that plan, or it would run against the wrong
+ * target. High precision: only fires on a concrete resource id that does not
+ * appear in the plan's objective/questions — plain answers ("yes, the first
+ * list") carry no resource id and stay "answers". Best-effort; never throws.
+ */
+export function applySelfContainedGuard(
+  plan: PlanProposal,
+  message: string,
+  classification: PlanContinuityClassification,
+): PlanContinuityClassification {
+  try {
+    if (classification.kind !== 'answers') return classification;
+    const named = extractNamedResource(message);
+    if (!named) return classification;
+    const planText = [
+      plan.plan?.objective ?? '',
+      plan.originatingRequest ?? '',
+      ...(plan.plan?.needsUserInput ?? []),
+    ].join(' ');
+    if (planText.includes(named)) return classification; // plan IS about this resource → genuine answer
+    return {
+      kind: 'new_topic',
+      confidence: Math.max(classification.confidence, 0.6),
+      reason: `message names its own resource not in the open plan — treating as a new request, not an answer`,
+    };
+  } catch {
+    return classification;
+  }
+}
 
 /**
  * Plan continuity (always on — the CLEMMY_PLAN_CONTINUITY rollout flag was
@@ -138,27 +173,27 @@ export async function classifyAgainstPlan(
     });
     const parsed = ClassificationSchema.safeParse(result.finalOutput);
     if (!parsed.success) {
-      return {
+      return applySelfContainedGuard(plan, message, {
         kind: 'answers',
         answers: message,
         confidence: 0.3,
         reason: 'classifier output did not parse — defaulting to treat as answer',
-      };
+      });
     }
     const data = parsed.data;
-    return {
+    return applySelfContainedGuard(plan, message, {
       kind: data.kind,
       answers: data.answers ?? undefined,
       confidence: data.confidence,
       reason: data.reason,
-    };
+    });
   } catch {
-    return {
+    return applySelfContainedGuard(plan, message, {
       kind: 'answers',
       answers: message,
       confidence: 0.3,
       reason: 'classifier error — defaulting to treat as answer',
-    };
+    });
   }
 }
 

@@ -38,6 +38,7 @@ import {
   createFocus as createFocusForPrefix,
   checkResourceMatchesFocus,
   extractResourceIdFromApprovalArgs,
+  extractNamedResource,
 } from '../memory/focus.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { previewToolCall } from '../runtime/approval-summary.js';
@@ -268,7 +269,7 @@ function resolveOrCreateSession(opts: {
   // conversation; the new session asked for clarification on something
   // the prior session had already specified — 25/batch via firecrawl.)
   try {
-    seedCrossSessionPrefix(session.id, opts.channelId, now);
+    seedCrossSessionPrefix(session.id, opts.channelId, now, opts.prompt);
   } catch (err) {
     logger.warn({ err: err instanceof Error ? err.message : String(err), channelId: opts.channelId }, 'cross-session prefix seed failed (non-fatal)');
   }
@@ -289,7 +290,7 @@ const PREFIX_MAX_TURNS_PER_SESSION = 6;
 
 interface PriorTurn { who: 'user' | 'assistant'; text: string; at: string }
 
-function seedCrossSessionPrefix(newSessionId: string, channelId: string, now: number): void {
+function seedCrossSessionPrefix(newSessionId: string, channelId: string, now: number, newMessage?: string): void {
   const db = openEventLog();
   // Find the most recent N prior sessions for this channel (exclude
   // the newly-created one). We walk multiple sessions because the
@@ -349,7 +350,7 @@ function seedCrossSessionPrefix(newSessionId: string, channelId: string, now: nu
     // SKILL.md whose sheet_id was different from the one the user
     // had actually been editing across 5 prior sessions.
     if (!active) {
-      const autoPinned = autoPinFocusFromPriorSessions(db, inWindow.map((r) => r.id));
+      const autoPinned = autoPinFocusFromPriorSessions(db, inWindow.map((r) => r.id), newMessage);
       if (autoPinned) {
         active = autoPinned;
       }
@@ -399,6 +400,7 @@ function seedCrossSessionPrefix(newSessionId: string, channelId: string, now: nu
 function autoPinFocusFromPriorSessions(
   db: ReturnType<typeof openEventLog>,
   priorSessionIds: string[],
+  newMessage?: string,
 ): ReturnType<typeof getActiveFocusForPrefix> | null {
   if (priorSessionIds.length === 0) return null;
   const counts = new Map<string, { kind: string; count: number; sessionId: string }>();
@@ -448,6 +450,17 @@ function autoPinFocusFromPriorSessions(
   }
   if (!best) return null;
 
+  // Cross-session guard: don't let a stale prior-session anchor shadow a
+  // resource the user's CURRENT message explicitly names. If they name a
+  // DIFFERENT resource, decline to auto-pin (let the live message win, fact
+  // scope stays global). If they name the SAME one, the pin is confirmed and
+  // authoritative. If they name NOTHING, the pin is a guess from prior tool
+  // calls — born stale (needsConfirm) so the model verifies before relying.
+  const namedId = extractNamedResource(newMessage);
+  const bestId = extractNamedResource(best.ref) ?? best.ref;
+  if (namedId && namedId !== bestId) return null;
+  const bornStale = !namedId;
+
   // Derive a title from the prior session's session title (which is
   // the first ~60 chars of the user's first prompt) and a summary
   // from the prior session's last conversation_completed summary.
@@ -473,6 +486,7 @@ function autoPinFocusFromPriorSessions(
       summary,
       resourceKind: best.kind,
       relatedSessionId: best.sessionId,
+      staleOnCreate: bornStale,
     });
   } catch {
     return null;

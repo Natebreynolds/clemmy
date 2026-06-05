@@ -21,8 +21,42 @@ process.env.CLEMENTINE_HOME = TEST_HOME;
 
 const { surfaceAskingPlan, surfacePlan, listPlanProposals, supersedePlanProposal, rejectPlanProposal, surfaceWorkflowPendingInputs, setWorkflowPendingInputValues, getPlanProposal } =
   await import('../../agents/plan-proposals.js');
-const { findOpenQuestionPlan, findOpenWorkflowPendingInputs, buildClassifierPrompt, buildWorkflowInputClassifierPrompt } =
+const { findOpenQuestionPlan, findOpenWorkflowPendingInputs, buildClassifierPrompt, buildWorkflowInputClassifierPrompt, applySelfContainedGuard } =
   await import('./plan-continuity.js');
+
+const SHEET_ID = '1AbcD_efGhIjKlMnOpQrStUvWxYz0123456789xyz';
+function proposalFor(objective: string, questions: string[] = []) {
+  return {
+    plan: { objective, needsUserInput: questions, steps: [] },
+    originatingRequest: objective,
+  } as unknown as Parameters<typeof applySelfContainedGuard>[0];
+}
+
+test('applySelfContainedGuard: downgrades answers→new_topic when message names a FOREIGN resource', () => {
+  const plan = proposalFor('Pull the closed deals into a sheet', ['Which deals?']);
+  const msg = `actually send to https://docs.google.com/spreadsheets/d/${SHEET_ID}/edit`;
+  const out = applySelfContainedGuard(plan, msg, { kind: 'answers', answers: msg, confidence: 0.3, reason: 'x' });
+  assert.equal(out.kind, 'new_topic');
+});
+
+test('applySelfContainedGuard: keeps a plain answer (no resource) as answers', () => {
+  const plan = proposalFor('Pull the closed deals into a sheet', ['Which deals?']);
+  const out = applySelfContainedGuard(plan, 'the ones from last quarter', { kind: 'answers', answers: '…', confidence: 0.5, reason: 'x' });
+  assert.equal(out.kind, 'answers');
+});
+
+test('applySelfContainedGuard: keeps answers when the named resource IS the plan target', () => {
+  const plan = proposalFor(`Update sheet ${SHEET_ID} with the new rows`, ['Confirm the sheet?']);
+  const msg = `yes, https://docs.google.com/spreadsheets/d/${SHEET_ID}/edit`;
+  const out = applySelfContainedGuard(plan, msg, { kind: 'answers', answers: msg, confidence: 0.3, reason: 'x' });
+  assert.equal(out.kind, 'answers');
+});
+
+test('applySelfContainedGuard: never escalates a non-answers classification', () => {
+  const plan = proposalFor('Pull the closed deals', []);
+  const out = applySelfContainedGuard(plan, 'cancel that', { kind: 'abandon', confidence: 0.9, reason: 'x' });
+  assert.equal(out.kind, 'abandon');
+});
 const { shouldUsePlanFirst } = await import('./plan-first.js');
 
 function aPlan(overrides: Record<string, unknown> = {}) {

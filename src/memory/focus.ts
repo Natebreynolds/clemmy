@@ -72,6 +72,13 @@ export interface CreateFocusInput {
   relatedSessionId?: string;
   relatedGoalId?: string;
   metadata?: Record<string, unknown>;
+  /**
+   * Born-stale: set confirm_after to NOW so getFocusSnapshot reports
+   * needsConfirm immediately and the focus renders under the "verify before
+   * relying" block. Used for auto-pins inferred from prior-session tool calls —
+   * a guess the model should confirm, not treat as authoritative.
+   */
+  staleOnCreate?: boolean;
 }
 
 export interface FocusSnapshot {
@@ -126,7 +133,7 @@ export function createFocus(input: CreateFocusInput): FocusRow {
     input.relatedGoalId ?? null,
     now,
     now,
-    confirmAfterFromNow(),
+    input.staleOnCreate ? now : confirmAfterFromNow(),
     JSON.stringify(input.metadata ?? {}),
   );
   const row = getFocusById(Number(info.lastInsertRowid))!;
@@ -343,6 +350,27 @@ export function checkResourceMatchesFocus(candidateId: string | null | undefined
  * etc.) from an approval's args payload. Args may be a string (JSON)
  * or an object. Returns the first id found, or null.
  */
+/**
+ * Best-effort extraction of a concrete resource id from FREE-TEXT (a user
+ * message or a focus resource_ref), as opposed to JSON approval args. Handles a
+ * Google Sheets/Docs/Drive URL and a bare Google-style id pasted inline.
+ * Returns the bare id (URL ids normalized) or null. Shared by the cross-session
+ * auto-pin guard and the plan-continuity self-contained-request guard so both
+ * detect "the user named their own resource" with the same rule.
+ */
+export function extractNamedResource(text?: string | null): string | null {
+  if (!text) return null;
+  const url = text.match(
+    /(?:docs|drive)\.google\.com\/(?:spreadsheets|document|file|presentation)\/d\/([A-Za-z0-9_-]{20,})/,
+  );
+  if (url?.[1]) return url[1];
+  // A bare Google-style resource id pasted inline (typically ~44 chars). Tight
+  // length bound so ordinary words/slugs don't read as a resource id.
+  const bare = text.match(/\b([A-Za-z0-9_-]{30,})\b/);
+  if (bare?.[1]) return bare[1];
+  return null;
+}
+
 export function extractResourceIdFromApprovalArgs(args: unknown): string | null {
   if (!args) return null;
   let text: string;
