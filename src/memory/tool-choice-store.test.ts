@@ -44,6 +44,7 @@ const {
   updateToolChoiceOutcomeForIdentifier,
   computeChoiceScore,
   peekToolChoice,
+  matchToolChoicesForStep,
 } = await import('./tool-choice-store.js');
 
 test('recallToolChoice returns null when there is no record', () => {
@@ -477,4 +478,36 @@ test('P3 render: with outcomes on, net-negative choices are dropped and strong o
     writeFileSync(path.join(TMP_HOME, 'state', 'machine-id'), 'machine-A\n');
     resetMachineIdCacheForTests();
   }
+});
+
+// ─── matchToolChoicesForStep precision: identity = command HEAD, not args ──
+// Regression for the live "scorpion-facebook-trends" bug: a Facebook-scrape
+// step got told to use a Salesforce SOQL choice because `LAST_N_DAYS:15` in the
+// SOQL collided with "the last 14 days" in the prompt. Core identity must be the
+// command head (sf data query), not argument values.
+
+const sfSoqlChoice = {
+  intent: 'pull market leader accounts needing follow-up',
+  description: 'Query Salesforce for market-leader accounts via the sf CLI',
+  choice: {
+    kind: 'cli' as const,
+    identifier: `sf data query --query "SELECT Id, Name, Website, LastActivityDate, Owner.Name FROM Account WHERE Owner.Name = 'Nathan Reynolds' AND Market_Leader__c = TRUE AND (LastActivityDate = NULL OR LastActivityDate < LAST_N_DAYS:15) ORDER BY LastActivityDate ASC NULLS FIRST LIMIT 50"`,
+    testedAt: '2026-01-01',
+  },
+  fallbacks: [], body: '', filePath: '/x',
+} as never;
+
+test('matchToolChoicesForStep: a Facebook-scrape step does NOT match a Salesforce SOQL choice (argument-value collision)', () => {
+  const fbPrompt = 'Scrape Scorpion\'s public Facebook page: pull recent public posts from the last 14 days and summarize posting trends.';
+  assert.equal(matchToolChoicesForStep(fbPrompt, { choices: [sfSoqlChoice] }).length, 0);
+});
+
+test('matchToolChoicesForStep: a genuine Salesforce step STILL matches the SOQL choice (no regression)', () => {
+  const sfPrompt = 'Query Salesforce for my market-leader accounts that need follow-up and list their names and websites.';
+  assert.ok(matchToolChoicesForStep(sfPrompt, { choices: [sfSoqlChoice] }).length >= 1);
+});
+
+test('matchToolChoicesForStep: an embedded command still binds (already-bound short-circuit unaffected)', () => {
+  const boundPrompt = 'Run `sf data query --query "SELECT Id FROM Account"` to pull the accounts.';
+  assert.ok(matchToolChoicesForStep(boundPrompt, { choices: [sfSoqlChoice] }).length >= 1);
 });

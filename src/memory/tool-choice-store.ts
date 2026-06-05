@@ -542,14 +542,32 @@ function wordTokens(text: string): Set<string> {
   );
 }
 
-/** CORE identity tokens of a choice: its intent slug + identifier, keeping
+/** The IDENTITY portion of a CLI command — the program + subcommands BEFORE
+ *  the first flag (`-x`/`--x`) or quoted/`=` argument. A tool's identity is
+ *  `sf data query`, NOT its query string: ingesting argument VALUES let generic
+ *  words leak into "core identity" (e.g. `LAST_N_DAYS:15` → "last"/"days"),
+ *  which false-matched unrelated step prompts ("scrape posts from the last 14
+ *  days" → the Salesforce SOQL choice). Non-CLI identifiers (composio/mcp) are
+ *  bare identity slugs already, so they're used whole. */
+function cliCommandHead(command: string): string {
+  const flagIdx = command.search(/\s-{1,2}\w/); // first " -x" / " --x"
+  const quoteIdx = command.search(/["'=]/);     // first quoted / `=` argument
+  const cuts = [flagIdx, quoteIdx].filter((i) => i >= 0);
+  const cut = cuts.length ? Math.min(...cuts) : command.length;
+  return command.slice(0, cut);
+}
+
+/** CORE identity tokens of a choice: its intent slug + the command-HEAD of its
+ *  identifier (program + subcommands only — NOT argument values), keeping
  *  operation tokens (query/list/soql/…) and dropping only stopwords + tool-type
  *  words. A match needs ≥2 of these (service + operation), so a lone service
- *  mention can't bind. */
+ *  mention — or an incidental shared argument-value word — can't bind. */
 function coreChoiceTokens(rec: ToolChoiceRecord): Set<string> {
+  const identifier = rec.choice?.identifier ?? '';
+  const identityText = rec.choice?.kind === 'cli' ? cliCommandHead(identifier) : identifier;
   const raw = new Set<string>([
     ...tokenize(slugifyIntent(rec.intent)),
-    ...wordTokens(rec.choice?.identifier ?? ''),
+    ...wordTokens(identityText),
   ]);
   const out = new Set<string>();
   for (const t of raw) if (t.length >= 3 && !STEP_MATCH_STOPWORDS.has(t)) out.add(t);
