@@ -15,7 +15,7 @@ import {
   type WorkflowDefinition,
   type WorkflowEntry,
 } from '../memory/workflow-store.js';
-import { prepareWorkflowForWrite } from '../execution/workflow-enforce.js';
+import { prepareWorkflowForWrite, workflowNeedsCreationTest } from '../execution/workflow-enforce.js';
 import { describeWorkflowPlainEnglish, describeWorkflowOneLine, describeCron } from '../execution/workflow-describe.js';
 import { validateCronExpression } from '../shared/cron.js';
 import { draftWorkflowFromSession, type WorkflowDraft } from '../execution/trace-to-workflow.js';
@@ -40,7 +40,7 @@ import {
   missingWorkflowRunInputs,
   normalizeWorkflowRunInputs,
 } from '../execution/workflow-inputs.js';
-import { queueWorkflowRun } from './workflow-run-queue.js';
+import { queueWorkflowRun, queueWorkflowCreationTest } from './workflow-run-queue.js';
 import { surfaceWorkflowPendingInputs } from '../agents/plan-proposals.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { listEvents, getSession } from '../runtime/harness/eventlog.js';
@@ -757,6 +757,26 @@ export function registerOrchestrationTools(server: McpServer): void {
       // composio + a use-Apify directive) BEFORE validation/persist, so the
       // decision the chat established can't get dropped into a vague step.
       const chatBind = bindChatDiscussedToolkits(def.steps, getToolOutputContext()?.sessionId);
+      // Part B — REAL creation-time test. When the workflow has a read-only step
+      // that actually gathers external data (scrape/fetch/query), save it
+      // DISABLED and run those steps for real against the tools first (mutating
+      // steps are previewed, not executed); it auto-enables on a clean pass, or
+      // stays disabled with a one-line fix if a read step returns nothing. This
+      // is what stops a doomed workflow (scorpion: scrape step bound no tool,
+      // improvised raw HTTP, returned empty, reported success) from being saved
+      // live + untested. Pure-LLM / all-mutating / un-testable-without-inputs
+      // workflows skip the gate and enable directly (nothing real to validate).
+      const testInputs = normalizeWorkflowRunInputs(
+        Object.fromEntries(Object.entries(inputsSchema).map(([k, m]) => [k, m.default ?? ''])),
+      );
+      let runCreationTest = workflowNeedsCreationTest(def);
+      if (runCreationTest && missingWorkflowRunInputs(def, testInputs).length > 0) {
+        // Can't run a meaningful test without required inputs (no defaults) —
+        // don't trap the workflow disabled; enable it and flag that the first
+        // run will be its real test.
+        runCreationTest = false;
+      }
+      if (runCreationTest) def.enabled = false;
       // Author through the canonical core (bind → auto-repair + validate →
       // persist → gap-test). Auto-repair saves a runnable workflow in one shot
       // instead of bouncing the author into a token-burning re-author loop;
@@ -770,11 +790,20 @@ export function registerOrchestrationTools(server: McpServer): void {
       }
       const createBindReport = [...chatBind.boundNotes, ...created.boundNotes].length > 0
         ? `\n\n${[...chatBind.boundNotes, ...created.boundNotes].join('\n')}` : '';
+      const advisoryTail = `${renderAuthoringAdvisories([...created.repairs, ...created.warnings, ...created.advisories])}`
+        + `${renderWorkflowGapQuestions(created.gaps)}`;
+      if (runCreationTest) {
+        const queued = queueWorkflowCreationTest(name, testInputs, { originSessionId: getToolOutputContext()?.sessionId });
+        return textResult(
+          `Created workflow "${name}" (saved DISABLED while I test it). Here's what it will do:\n\n${describeWorkflowPlainEnglish(created.savedDef)}\n\n`
+            + `Saved to workflows/${dirName}/SKILL.md.${createBindReport}\n\n`
+            + `${queued.message}${advisoryTail}`,
+        );
+      }
       return textResult(
         `Created workflow "${name}". Here's what it will do:\n\n${describeWorkflowPlainEnglish(created.savedDef)}\n\n`
           + `Saved to workflows/${dirName}/SKILL.md.${createBindReport}`
-          + `${renderAuthoringAdvisories([...created.repairs, ...created.warnings, ...created.advisories])}`
-          + `${renderWorkflowGapQuestions(created.gaps)}`,
+          + `${advisoryTail}`,
       );
     },
   );

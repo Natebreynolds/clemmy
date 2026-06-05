@@ -82,6 +82,65 @@ export function stepLooksLikeIrreversibleSend(prompt: string): boolean {
   return IRREVERSIBLE_SEND_RE.test(p) || PUBLISH_RE.test(p);
 }
 
+// A step that WRITES to the outside world (creates/updates/deletes a record,
+// sheet, file, event, message) — broader than a pure send. Used by the
+// creation-time test to PREVIEW (not execute) anything mutating, so a test run
+// never sends an email or creates a real artifact while authoring.
+const EXTERNAL_WRITE_RE =
+  /\b(?:create|creates|creating|add|adds|adding|insert|inserts|upsert|upserts|update|updates|updating|write|writes|writing|save|saves|post|posts|delete|deletes|remove|removes|append|appends|draft|drafts)\b[\s\S]{0,40}\b(?:record|records|row|rows|sheet|spreadsheet|table|crm|airtable|salesforce|hubspot|database|file|files|document|docs?|event|calendar|invite|message|ticket|issue|page|notion)\b/i;
+
+/**
+ * True when a step MUTATES external state (send / publish / create / update /
+ * delete) and so must NOT be executed for real during a creation-time test —
+ * it's previewed instead. Conservative: a declared approval gate, an
+ * irreversible send, or a write-verb-near-external-noun all count; a pure
+ * read/fetch/query step does not.
+ */
+export function stepLooksMutating(step: { prompt?: string; requiresApproval?: boolean; requires_approval?: boolean }): boolean {
+  if (step.requiresApproval === true || step.requires_approval === true) return true;
+  const p = step.prompt ?? '';
+  return stepLooksLikeIrreversibleSend(p) || EXTERNAL_WRITE_RE.test(p);
+}
+
+// Read/gather intent in a step's prose — the verbs whose job is to PULL external
+// data (the thing that silently returns empty when the tool isn't bound).
+const READ_INTENT_RE =
+  /\b(?:scrape|scrapes|scraping|fetch|fetches|fetching|search|searches|searching|query|queries|querying|pull|pulls|pulling|list|lists|listing|retrieve|retrieves|retrieving|crawl|crawls|crawling|extract|extracts|extracting|collect|collects|collecting|gather|gathers|gathering|download|downloads|downloading|look ?up|looks ?up|lookup|monitor|monitors|monitoring|read|reads|reading|get|gets|getting)\b/i;
+
+// A step's tool surface reaches OUTSIDE the model (so it can actually return real
+// data — or silently nothing). Used to decide whether a creation test is worth
+// running. A pure-LLM step (no external tools) has nothing real to validate.
+function stepReachesExternalTools(step: { allowedTools?: string[]; usesSkill?: string; forEach?: string }): boolean {
+  if (step.usesSkill) return true;
+  if (step.forEach) return true;
+  const tools = step.allowedTools ?? [];
+  return tools.some((t) =>
+    t === '*'
+    || /^(?:composio|run_shell_command|mcp|firecrawl|apify|fetch|web_|browser|recall_tool_result)/i.test(t));
+}
+
+/**
+ * True when a step is worth REALLY running in the creation test: it's read-only
+ * (not mutating — those get previewed) AND it actually gathers external data
+ * (read-intent prose and/or an external tool surface). This is the eligibility
+ * signal for queueing a creation test at all — a workflow with no such step
+ * (pure-LLM, or all-mutating) has nothing to validate against real data, so it's
+ * enabled directly instead of test-gated.
+ */
+export function stepIsTestableRead(
+  step: { prompt?: string; requiresApproval?: boolean; requires_approval?: boolean; allowedTools?: string[]; usesSkill?: string; forEach?: string },
+): boolean {
+  if (stepLooksMutating(step)) return false;
+  if (!stepReachesExternalTools(step)) return false;
+  return READ_INTENT_RE.test(step.prompt ?? '') || (step.allowedTools ?? []).length > 0 || !!step.usesSkill || !!step.forEach;
+}
+
+/** Does this workflow have at least one read-only step worth a real creation
+ *  test? If not, the create path enables it directly (nothing to validate). */
+export function workflowNeedsCreationTest(def: WorkflowDefinition): boolean {
+  return (def.steps ?? []).some((s) => stepIsTestableRead(s));
+}
+
 function hasEnforcedApprovalGate(def: WorkflowDefinition): boolean {
   return def.steps.some(
     (s) => s.requiresApproval === true || (s as { requires_approval?: boolean }).requires_approval === true,

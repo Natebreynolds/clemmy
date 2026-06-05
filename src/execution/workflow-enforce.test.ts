@@ -13,6 +13,9 @@ import {
   checkRunnabilityConstraints,
   autoRepairWorkflowDefinition,
   prepareWorkflowForWrite,
+  stepLooksMutating,
+  stepIsTestableRead,
+  workflowNeedsCreationTest,
 } from './workflow-enforce.js';
 import type { WorkflowDefinition } from '../memory/workflow-store.js';
 
@@ -219,4 +222,61 @@ test('prepareWorkflowForWrite: a genuinely broken workflow still fails after rep
   const prep = prepareWorkflowForWrite(def);
   assert.equal(prep.ok, false);
   assert.ok(prep.errors.length >= 1);
+});
+
+// ── Part B: creation-test eligibility (which steps run for real / get previewed) ──
+
+test('stepLooksMutating: a send/write step is mutating; a pure read step is not', () => {
+  assert.equal(stepLooksMutating({ prompt: 'send the report email to the owner' }), true);
+  assert.equal(stepLooksMutating({ prompt: 'create a new record in the Airtable table' }), true);
+  assert.equal(stepLooksMutating({ prompt: 'do anything', requiresApproval: true }), true);
+  assert.equal(stepLooksMutating({ prompt: 'scrape the Facebook page posts with Apify' }), false);
+  assert.equal(stepLooksMutating({ prompt: 'fetch the latest SERP rankings' }), false);
+});
+
+test('stepIsTestableRead: read step with an external tool surface is testable', () => {
+  // The scorpion scrape step: read intent + a composio/shell surface → test it for real.
+  assert.equal(
+    stepIsTestableRead({ prompt: 'scrape the Facebook page with Apify', allowedTools: ['composio_*', 'run_shell_command'] }),
+    true,
+  );
+  // forEach over upstream data counts as reaching external data.
+  assert.equal(stepIsTestableRead({ prompt: 'process each item', forEach: '{{steps.a.output}}', allowedTools: ['*'] }), true);
+});
+
+test('stepIsTestableRead: a mutating step is NOT testable (it gets previewed, not run)', () => {
+  assert.equal(
+    stepIsTestableRead({ prompt: 'create records in Airtable for each prospect', allowedTools: ['composio_*'] }),
+    false,
+  );
+});
+
+test('stepIsTestableRead: a pure-LLM read step (no external tools) is NOT worth a creation test', () => {
+  assert.equal(stepIsTestableRead({ prompt: 'summarize the findings into three bullets' }), false);
+  assert.equal(stepIsTestableRead({ prompt: 'read the upstream data and rank it', allowedTools: [] }), false);
+});
+
+test('workflowNeedsCreationTest: true when any step is a testable read, false otherwise', () => {
+  // Scrape-then-email: the scrape step is testable → the workflow gets the gate.
+  assert.equal(
+    workflowNeedsCreationTest(wf({
+      steps: [
+        { id: 'scrape', prompt: 'scrape the page with Apify', allowedTools: ['composio_*'] },
+        { id: 'send', prompt: 'send the summary email', dependsOn: ['scrape'] },
+      ],
+    })),
+    true,
+  );
+  // All-mutating workflow → nothing read-only to validate → no gate.
+  assert.equal(
+    workflowNeedsCreationTest(wf({
+      steps: [{ id: 'a', prompt: 'send the daily reminder email', requiresApproval: true }],
+    })),
+    false,
+  );
+  // Pure-LLM workflow → no external data to validate → no gate.
+  assert.equal(
+    workflowNeedsCreationTest(wf({ steps: [{ id: 'a', prompt: 'draft a motivational quote of the day' }] })),
+    false,
+  );
 });

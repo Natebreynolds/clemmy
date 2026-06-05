@@ -12,6 +12,7 @@ import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
 import { WORKFLOWS_DIR } from '../memory/vault.js';
 import {
   listWorkflows,
+  writeWorkflow,
   type WorkflowDefinition,
   type WorkflowStepInput,
   type WorkflowStepOutputContract,
@@ -35,6 +36,7 @@ import { buildOrchestratorAgent } from '../agents/orchestrator.js';
 import { buildWorkflowStepAgent } from '../agents/workflow-step-agent.js';
 import {
   detectBlockedSteps,
+  detectSelfReportedFailure,
   diagnoseWorkflowBlock,
   recordProposedFix,
   applyProposedFix,
@@ -46,9 +48,9 @@ import {
   type BlockedStep,
 } from './workflow-diagnosis.js';
 import { requeueWorkflowFromRun } from '../tools/workflow-run-queue.js';
-import { stepLooksLikeIrreversibleSend } from './workflow-enforce.js';
+import { stepLooksLikeIrreversibleSend, stepLooksMutating } from './workflow-enforce.js';
 import { preflightWorkflow, renderPreflightReport } from './workflow-preflight.js';
-import { recordWorkflowOutcome, shouldStopAutoHeal, escalateThreshold } from './workflow-failure-ledger.js';
+import { recordWorkflowOutcome, shouldStopAutoHeal, escalateThreshold, clearWorkflowFailures } from './workflow-failure-ledger.js';
 import { takeStepResult } from '../tools/step-result-tool.js';
 import { configureHarnessRuntime } from '../runtime/harness/codex-client.js';
 import { closePlanScope, openPlanScope } from '../agents/plan-scope.js';
@@ -761,6 +763,10 @@ interface StepExecutionContext {
   // delivered output as a "review this" heads-up so a confident-but-wrong
   // judge can never break a workflow that actually succeeded.
   qualityAdvisories: WorkflowQualityAdvisory[];
+  // Creation-time test mode: read-only steps run for real but a forEach fans
+  // out over only the FIRST item (bounded cost — we just need to confirm the
+  // step returns data, not process the whole batch). No-op for normal runs.
+  creationTest?: boolean;
 }
 
 /** A non-blocking quality heads-up attached to a COMPLETED run. The deliverable
@@ -1659,7 +1665,10 @@ export async function executeStep(
   // 2. forEach — iterate an upstream output with bounded concurrency.
   if (step.forEach) {
     const upstream = ctx.stepOutputs[step.forEach];
-    const items = coerceToArray(upstream);
+    let items = coerceToArray(upstream);
+    // Creation-test: fan out over only the first item (just confirm the per-item
+    // work returns data; don't run the whole batch while authoring).
+    if (items && ctx.creationTest && items.length > 1) items = items.slice(0, 1);
     if (!items || items.length === 0) {
       appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
         kind: 'step_skipped',
@@ -2323,9 +2332,9 @@ async function drainWorkflowRuns(assistant: ClementineAssistant): Promise<void> 
       notifyCancelledRunOnce(filePath, run);
     }
     // Pick up queued runs and runs marked as running but never
-    // completed (resume after daemon restart). Also pick up a FRESH dry_run
-    // request (the dashboard DRY-RUN button) — but not one already finished.
-    if (run.status === 'dry_run') {
+    // completed (resume after daemon restart). Also pick up a FRESH dry_run /
+    // creation_test request — but not one already finished.
+    if (run.status === 'dry_run' || run.status === 'creation_test') {
       if (run.finishedAt) continue;
     } else if (run.status && run.status !== 'queued' && run.status !== 'running') {
       continue;
@@ -2457,6 +2466,88 @@ function tryAutoHealAndRequeue(args: {
   };
 }
 
+// ── Creation-time test (Part B) ─────────────────────────────────────
+//
+// A REAL smoke test at creation: execute the workflow's READ-ONLY steps for
+// real (in dependency order, forEach capped to the first item) and confirm they
+// return data; PREVIEW (never execute) anything mutating. Catches the
+// scorpion-class failure — a scrape step that returns nothing — at creation,
+// before the workflow is trusted, instead of at 7:30am. Reuses executeStepVerified
+// (retry + contract verify) per step; leaves the normal run engine untouched.
+
+export interface CreationTestStepResult {
+  stepId: string;
+  status: 'ok' | 'empty' | 'failed' | 'previewed' | 'error';
+  detail?: string;
+}
+export interface CreationTestResult {
+  pass: boolean;
+  steps: CreationTestStepResult[];
+}
+
+/** Verdict for a read-only step's output: did it actually return data? */
+export function creationTestVerdict(stepId: string, out: unknown): CreationTestStepResult {
+  const empty =
+    out == null
+    || (typeof out === 'string' && out.trim().length === 0)
+    || (Array.isArray(out) && out.length === 0);
+  if (empty) return { stepId, status: 'empty', detail: 'returned no data' };
+  if (out && typeof out === 'object' && !Array.isArray(out)) {
+    const o = out as Record<string, unknown>;
+    if (Object.keys(o).length === 0) return { stepId, status: 'empty', detail: 'returned an empty object' };
+    if (o.blocked === true) return { stepId, status: 'failed', detail: String(o.reason ?? 'blocked').slice(0, 160) };
+    const r = detectSelfReportedFailure(o);
+    if (r) return { stepId, status: 'failed', detail: r };
+  }
+  return { stepId, status: 'ok' };
+}
+
+export async function runCreationTest(
+  workflow: WorkflowDefinition,
+  workflowSlug: string,
+  runId: string,
+  inputs: Record<string, string>,
+  assistant: ClementineAssistant,
+): Promise<CreationTestResult> {
+  const stepOutputs: Record<string, unknown> = {};
+  const forEachFailures: Array<{ stepId: string; itemKey: string; error: string }> = [];
+  const qualityAdvisories: WorkflowQualityAdvisory[] = [];
+  const steps = workflow.steps;
+  const results: CreationTestStepResult[] = [];
+  const completed = new Set<string>();
+  let guard = 0;
+  while (completed.size < steps.length && guard++ < steps.length + 2) {
+    const batch = planWorkflowExecutionBatches(steps, completed)[0] ?? [];
+    if (batch.length === 0) break;
+    for (const step of batch) {
+      throwIfWorkflowRunCancelled(runId);
+      if (stepLooksMutating(step)) {
+        // Never execute a send/write while authoring — preview it. Downstream
+        // read-only steps still get a stub so they can run.
+        stepOutputs[step.id] = { previewed: true, reason: 'mutating step — previewed, not executed in the creation test' };
+        results.push({ stepId: step.id, status: 'previewed' });
+      } else {
+        try {
+          const out = await executeStepVerified(step, {
+            workflow, workflowSlug, runId, inputs, stepOutputs,
+            assistant, completedItems: new Map(), forEachFailures, qualityAdvisories,
+            creationTest: true,
+          });
+          stepOutputs[step.id] = out;
+          results.push(creationTestVerdict(step.id, out));
+        } catch (err) {
+          stepOutputs[step.id] = { blocked: true, reason: 'creation-test error' };
+          results.push({ stepId: step.id, status: 'error', detail: (err instanceof Error ? err.message : String(err)).slice(0, 200) });
+        }
+      }
+      completed.add(step.id);
+    }
+  }
+  const pass = forEachFailures.length === 0
+    && results.every((r) => r.status === 'ok' || r.status === 'previewed');
+  return { pass, steps: results };
+}
+
 async function processOneRunFile(
   file: string,
   filePath: string,
@@ -2512,6 +2603,49 @@ async function processOneRunFile(
         read: false,
         metadata: { workflow: workflow.data.name, runId: run.id, dryRun: true, preflightOk: preflight.ok },
       });
+      markRunNotified(filePath);
+      return;
+    }
+    // CREATION TEST (Part B): really run the read-only steps + preview mutating,
+    // confirm they return data, then AUTO-ENABLE on a clean pass (or leave the
+    // draft disabled + report what to fix). Works on a disabled draft, so it
+    // sits before the enabled gate.
+    if (run.status === 'creation_test') {
+      const ctInputs = normalizeWorkflowRunInputs({
+        ...Object.fromEntries(Object.entries(workflow.data.inputs ?? {}).map(([k, meta]) => [k, meta.default ?? ''])),
+        ...(run.inputs ?? {}),
+      });
+      let result: CreationTestResult;
+      try {
+        result = await runCreationTest(workflow.data, workflow.name, run.id, ctInputs, assistant);
+      } catch (err) {
+        result = { pass: false, steps: [{ stepId: '(run)', status: 'error', detail: err instanceof Error ? err.message : String(err) }] };
+      }
+      // On a clean pass, enable the draft so it's live + trusted; otherwise it
+      // stays disabled and the report says what to fix (informs, not a hard gate
+      // — the user can still enable manually).
+      if (result.pass) {
+        try { writeWorkflow(workflow.name, { ...workflow.data, enabled: true }); } catch { /* best-effort */ }
+        try { clearWorkflowFailures(workflow.name); } catch { /* best-effort */ }
+      }
+      writeRunRecord(filePath, { ...run, status: 'creation_test', finishedAt: new Date().toISOString(), output: result.pass ? 'creation test passed' : 'creation test found issues' });
+      const lines = result.steps.map((s) => {
+        const icon = s.status === 'ok' ? '✅' : s.status === 'previewed' ? '⏭️ previewed (mutating — not run)' : '⚠️';
+        return `- ${s.stepId}: ${s.status === 'ok' ? '✅ returned data' : s.status === 'previewed' ? '⏭️ previewed (mutating step — not run)' : `${icon} ${s.status}${s.detail ? ` — ${s.detail}` : ''}`}`;
+      });
+      const body = result.pass
+        ? `✅ Creation test passed for "${workflow.data.name}" — read-only steps returned real data. I've ENABLED it.\n\n${lines.join('\n')}\n\nMutating steps were previewed (not run). It'll run on its schedule / when you trigger it.`
+        : `⚠️ Creation test for "${workflow.data.name}" found issues — left DISABLED so it won't run broken.\n\n${lines.join('\n')}\n\nFix the flagged step(s) with workflow_update (e.g. bind the right tool), then re-test. To run it as-is anyway: workflow_set_enabled.`;
+      addNotification({
+        id: `workflow-${run.id}-creationtest`,
+        kind: 'workflow',
+        title: result.pass ? `Workflow ready: ${workflow.data.name}` : `Workflow needs a fix: ${workflow.data.name}`,
+        body,
+        createdAt: new Date().toISOString(),
+        read: false,
+        metadata: { workflow: workflow.data.name, runId: run.id, creationTest: true, pass: result.pass },
+      });
+      enqueueWorkflowOutcomeTurn(run, workflow.data.name, result.pass ? 'done' : 'blocked', body);
       markRunNotified(filePath);
       return;
     }

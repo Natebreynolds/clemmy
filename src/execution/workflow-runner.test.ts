@@ -50,6 +50,7 @@ const {
   applyContractToPrompt,
   describeOutputShape,
   isTransientStepError,
+  creationTestVerdict,
 } = await import('./workflow-runner.js');
 const { SessionStore: RunnerSessionStore } = await import('../memory/session-store.js');
 const { readWorkflowEvents } = await import('./workflow-events.js');
@@ -900,4 +901,28 @@ test('G5: a MANUAL run still registers the gate (a person is present to approve)
   assert.equal(pending.length, 1, 'manual run registers a human approval (unchanged)');
   rmSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), { force: true });
   delete process.env.WORKFLOW_APPROVAL_PARKING;
+});
+
+// ---------------------------------------------------------------------------
+// Part B — creation-test verdict (did a read-only step actually return data?)
+// ---------------------------------------------------------------------------
+
+test('creationTestVerdict: real data → ok', () => {
+  assert.equal(creationTestVerdict('scrape', { records: [{ id: 1 }] }).status, 'ok');
+  assert.equal(creationTestVerdict('scrape', 'some real scraped text').status, 'ok');
+  assert.equal(creationTestVerdict('scrape', [{ a: 1 }]).status, 'ok');
+});
+
+test('creationTestVerdict: empty results → empty (the scorpion failure — caught at creation)', () => {
+  assert.equal(creationTestVerdict('scrape', null).status, 'empty');
+  assert.equal(creationTestVerdict('scrape', '').status, 'empty');
+  assert.equal(creationTestVerdict('scrape', '   ').status, 'empty');
+  assert.equal(creationTestVerdict('scrape', []).status, 'empty');
+  assert.equal(creationTestVerdict('scrape', {}).status, 'empty');
+});
+
+test('creationTestVerdict: a blocked/self-reported failure → failed (with reason)', () => {
+  const blocked = creationTestVerdict('scrape', { blocked: true, reason: 'Apify actor not bound' });
+  assert.equal(blocked.status, 'failed');
+  assert.match(blocked.detail ?? '', /Apify/);
 });

@@ -14,7 +14,7 @@ const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-wf-queue-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
 process.env.HOME = TMP_HOME;
 
-const { queueWorkflowRun, resumeWorkflowRun, requeueWorkflowFromRun } = await import('./workflow-run-queue.js');
+const { queueWorkflowRun, resumeWorkflowRun, requeueWorkflowFromRun, queueWorkflowCreationTest } = await import('./workflow-run-queue.js');
 const { writeWorkflow } = await import('../memory/workflow-store.js');
 const { WORKFLOWS_DIR } = await import('../memory/vault.js');
 const { WORKFLOW_RUNS_DIR } = await import('./shared.js');
@@ -178,6 +178,25 @@ test('queueWorkflowRun omits selfHealAttempt when 0/absent (byte-identical norma
   queueWorkflowRun('audit-brief', { url: 'https://x.co' });
   const rec = runFiles().map((f) => JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, f), 'utf-8')) as Record<string, unknown>)[0];
   assert.equal('selfHealAttempt' in rec, false);
+});
+
+test('queueWorkflowCreationTest: writes a creation_test run record (Part B authoring test)', () => {
+  const r = queueWorkflowCreationTest('audit-brief', { url: 'https://x.com' }, { originSessionId: 'sess-create' });
+  assert.equal(r.status, 'queued');
+  assert.match(r.message, /creation test/i);
+  assert.match(r.message, /DISABLED/);
+  assert.equal(runFiles().length, 1);
+  const rec = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, runFiles()[0]), 'utf-8'));
+  assert.equal(rec.status, 'creation_test');
+  assert.equal(rec.workflow, 'audit-brief');
+  assert.equal(rec.inputs.url, 'https://x.com');
+  assert.equal(rec.originSessionId, 'sess-create');
+});
+
+test('queueWorkflowCreationTest: does NOT dedupe (each authoring test is fresh)', () => {
+  queueWorkflowCreationTest('audit-brief', { url: 'https://x.com' });
+  queueWorkflowCreationTest('audit-brief', { url: 'https://x.com' });
+  assert.equal(runFiles().length, 2);
 });
 
 test.after(() => {

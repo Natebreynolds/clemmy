@@ -123,6 +123,47 @@ export function queueWorkflowRun(
   };
 }
 
+/**
+ * Queue a CREATION TEST run — the real read-only validation that runs once at
+ * authoring time (Part B). The runner walks the steps in dependency order,
+ * actually EXECUTES the read-only/critical steps (scrape/fetch/query) against
+ * the real tools with the run's inputs, and PREVIEWS (does not execute)
+ * mutating steps. On pass it auto-enables the workflow; on fail the workflow
+ * stays disabled with a one-line reason. Distinct status so the drain loop and
+ * report-back can treat it differently from a normal run or a dry_run.
+ */
+export function queueWorkflowCreationTest(
+  name: string,
+  normalizedInputs: Record<string, string>,
+  opts?: QueueWorkflowRunOptions,
+): QueueWorkflowRunResult {
+  ensureDir(WORKFLOW_RUNS_DIR);
+  const id = `${Date.now()}-${randomBytes(3).toString('hex')}`;
+  const origin = opts?.originSessionId?.trim();
+  writeFileSync(
+    path.join(WORKFLOW_RUNS_DIR, `${id}.json`),
+    JSON.stringify({
+      id,
+      workflow: name,
+      inputs: normalizedInputs,
+      status: 'creation_test',
+      createdAt: new Date().toISOString(),
+      ...(origin ? { originSessionId: origin } : {}),
+    }, null, 2),
+    'utf-8',
+  );
+  return {
+    status: 'queued',
+    id,
+    message:
+      `Saved "${name}" as DISABLED and started a creation test (run ${id}) — `
+      + `it's running the read-only steps now against the real tools to confirm they return data, `
+      + `and previewing (not executing) any send/write steps. `
+      + `Tell the user it's being tested and that it will auto-enable here on pass (or report what to fix on fail). `
+      + `Do NOT wait, poll, or do the work yourself.`,
+  };
+}
+
 export interface ResumeWorkflowRunResult {
   status: 'queued' | 'duplicate' | 'missing_inputs' | 'not_found' | 'disabled';
   id?: string;
