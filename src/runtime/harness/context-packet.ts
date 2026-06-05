@@ -6,6 +6,7 @@ import { listSkills } from '../../memory/skill-store.js';
 import { listWorkflows } from '../../memory/workflow-store.js';
 import { listMcpServerHealth, type MCPServerHealthSnapshot } from '../mcp-namespace-shim.js';
 import { resolveMcpToolScope, type McpToolScope } from '../mcp-tool-scope.js';
+import { tokenize } from '../../shared/workflow-scoring.js';
 
 export interface MemoryPrimerSummary {
   enabled: boolean;
@@ -217,11 +218,8 @@ function clip(text: string, max: number): string {
 }
 
 function tokens(text: string): string[] {
-  return text
-    .toLowerCase()
-    .split(/[^a-z0-9]+/)
-    .map((t) => t.trim())
-    .filter((t) => t.length >= 3 && !STOPWORDS.has(t));
+  // Canonical tokenizer with this matcher's general-English stopword policy.
+  return tokenize(text, { minLen: 3, stopwords: STOPWORDS });
 }
 
 function classifyComplexity(input: string): AgentContextPacket['complexity'] {

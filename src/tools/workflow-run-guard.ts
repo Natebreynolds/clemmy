@@ -17,6 +17,8 @@
  * passes the concatenated text in here.
  */
 
+import { tokenize } from '../shared/workflow-scoring.js';
+
 /** Needles shorter than this are ignored to avoid trivial substring hits. */
 const MIN_NEEDLE_LEN = 4;
 
@@ -26,12 +28,10 @@ const NAME_STOPWORDS = new Set([
   'please', 'flow', 'auto', 'daily', 'hourly', 'run', 'the', 'and', 'for',
 ]);
 
-/** Distinctive (>=4 char, non-stopword) tokens of a workflow name/slug. */
+/** Distinctive (>=4 char, non-stopword) tokens of a workflow name/slug.
+ *  Canonical tokenizer with this guard's name-focused stopword policy. */
 function distinctiveNameTokens(name: string): string[] {
-  return name
-    .toLowerCase()
-    .split(/[^a-z0-9]+/)
-    .filter((t) => t.length >= MIN_NEEDLE_LEN && !NAME_STOPWORDS.has(t));
+  return tokenize(name, { minLen: MIN_NEEDLE_LEN, stopwords: NAME_STOPWORDS });
 }
 
 /**

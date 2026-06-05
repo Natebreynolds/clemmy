@@ -22,6 +22,8 @@
  * "unrequested" (see workflow-run-guard.ts + orchestration-tools.ts).
  */
 
+import { tokenize } from '../shared/workflow-scoring.js';
+
 /** A workflow as the resolver sees it: just its display name + dir slug. */
 export interface ResolverEntry {
   /** Display name, e.g. "Morning Prospect Prep". */
@@ -67,25 +69,10 @@ function compact(value: string): string {
  * one token. Deliberately tiny — enough to bridge the gap between how a user
  * speaks ("prospecting") and how a slug reads ("prospect"), not a real stemmer.
  */
-function stem(token: string): string {
-  let t = token;
-  if (t.length > 4 && t.endsWith('ing')) t = t.slice(0, -3);
-  else if (t.length > 4 && t.endsWith('ed')) t = t.slice(0, -2);
-  else if (t.length > 4 && t.endsWith('es')) t = t.slice(0, -2);
-  else if (t.length > 3 && t.endsWith('s') && !t.endsWith('ss')) t = t.slice(0, -1);
-  return t;
-}
-
-/** Distinctive, stemmed content tokens of a string (no stopwords/filler). */
+/** Distinctive, stemmed content tokens of a string (no stopwords/filler).
+ *  Uses the canonical tokenizer with this matcher's stopword policy + stemming. */
 function contentTokens(value: string): Set<string> {
-  const out = new Set<string>();
-  for (const raw of (value ?? '').toLowerCase().split(/[^a-z0-9]+/)) {
-    if (raw.length < MIN_TOKEN_LEN) continue;
-    if (STOPWORDS.has(raw)) continue;
-    const s = stem(raw);
-    if (s.length >= MIN_TOKEN_LEN && !STOPWORDS.has(s)) out.add(s);
-  }
-  return out;
+  return new Set(tokenize(value, { minLen: MIN_TOKEN_LEN, stopwords: STOPWORDS, stem: true }));
 }
 
 /** Tokens that identify an entry: union of its name + slug content tokens. */
