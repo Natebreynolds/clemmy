@@ -4,6 +4,7 @@ import type { RuntimeContextValue } from '../types.js';
 import { getComputerTools } from './computer-tools.js';
 import { getComposioRuntimeTools, getDynamicComposioRuntimeTools } from './composio-tools.js';
 import { getLocalRuntimeTools } from './local-runtime-tools.js';
+import { getActiveTaskTools } from './active-task-tools.js';
 
 export function getCoreTools(): Tool<RuntimeContextValue>[] {
   const request_destructive_action = tool({
@@ -21,6 +22,7 @@ export function getCoreTools(): Tool<RuntimeContextValue>[] {
 
   return [
     request_destructive_action,
+    ...getActiveTaskTools(),
     ...getLocalRuntimeTools(),
     ...getComputerTools(),
     ...getComposioRuntimeTools(),

@@ -271,6 +271,41 @@ export function hasActiveTaskSection(sessionId: string): boolean {
   return readActiveTaskSection(sessionId) !== undefined;
 }
 
+/**
+ * Parse the live Active Task section back into a structured spec (reverses
+ * renderActiveTaskSection). Single source of truth — the section IS the store;
+ * this lets code read the pinned params (the `active_task` tool's `update`
+ * merge, and the execution-brief hand-off) without a parallel JSON store.
+ * Returns undefined if no live (non-stale) section exists. For a bounded
+ * large-list preview, only the previewed recipients are recoverable (large
+ * sets should carry a resourceRef anyway). Best-effort — never throws.
+ */
+export function parseActiveTaskSection(sessionId: string): ActiveTaskSpec | undefined {
+  try {
+    const section = readActiveTaskSection(sessionId);
+    if (!section) return undefined;
+    const verbMatch = section.match(/Action:\s*([^|\n]+?)(?:\s*\||\n|$)/);
+    const countMatch = section.match(/Count:\s*(\d+)/);
+    const scopeMatch = section.match(/Scope:\s*(\w+)\s+these/);
+    const refMatch = section.match(/Resource \(pull from THIS exact reference[^)]*\):\s*(.+)/);
+    const recipientsMatch = section.match(/Recipients \(verbatim[^)]*\):\s*(.+)/);
+    const capturedMatch = section.match(/Captured:\s*(\S+)/);
+    const statedMatch = section.match(/Stated:\s*(.+)/);
+    const count = countMatch ? Number.parseInt(countMatch[1], 10) : undefined;
+    return {
+      capturedAt: capturedMatch?.[1] ?? new Date().toISOString(),
+      verb: verbMatch?.[1]?.trim() || undefined,
+      count: count !== undefined && Number.isFinite(count) ? count : undefined,
+      recipients: recipientsMatch ? recipientsMatch[1].split(/,\s*/).map((r) => r.trim()).filter(Boolean) : [],
+      resourceRef: refMatch?.[1]?.trim() || undefined,
+      exclusivity: scopeMatch?.[1]?.toLowerCase() || undefined,
+      constraintText: statedMatch?.[1]?.trim() ?? '',
+    };
+  } catch {
+    return undefined;
+  }
+}
+
 /** Remove the Active Task section (e.g. on completion/pivot). Best-effort. */
 export function dropActiveTaskSection(sessionId: string): void {
   try {
