@@ -317,6 +317,26 @@ export function deleteFact(id: number): boolean {
 }
 
 /**
+ * Reactivate a soft-deleted fact — the inverse of deleteFact/forgetFact.
+ *
+ * The load-bearing reversibility primitive: soft-delete (active=0) keeps the
+ * row, embedding, and provenance intact, but until now there was no way back —
+ * a forgotten or auto-decayed fact was stranded. This restores it. It also
+ * refreshes last_accessed_at so the just-restored fact is NOT immediately
+ * idle-eligible for re-decay on the next hygiene pass (the user explicitly
+ * brought it back — that counts as an access). Idempotent: a no-op on an
+ * already-active fact returns false (no rows changed).
+ */
+export function reactivateFact(id: number): boolean {
+  const db = openMemoryDb();
+  const now = new Date().toISOString();
+  const info = db.prepare(
+    'UPDATE consolidated_facts SET active = 1, updated_at = ?, last_accessed_at = ? WHERE id = ? AND active = 0',
+  ).run(now, now, id);
+  return info.changes > 0;
+}
+
+/**
  * Find facts semantically similar to a candidate content string. Used
  * by the reflection conflict resolver: before ADDing a new candidate
  * fact, retrieve the top-K most-similar existing active facts so the
@@ -909,6 +929,9 @@ export interface DecayResult {
   scanned: number;
   deactivated: number;
   ids: number[];
+  /** Per-eviction human-readable reason ("#42 imp:2 score:0.31"), for the
+   *  reviewable hygiene audit log — so the owner can see WHY a fact decayed. */
+  reasons: string[];
 }
 
 /**
@@ -933,7 +956,7 @@ export function decayAndEvictFacts(options: DecayOptions = {}): DecayResult {
   const importanceCeil = Math.max(1, Math.min(10, options.importanceCeil ?? 4));
   const scoreFloor = options.scoreFloor ?? 0.4;
   const nowMs = options.nowMs ?? Date.now();
-  const result: DecayResult = { scanned: 0, deactivated: 0, ids: [] };
+  const result: DecayResult = { scanned: 0, deactivated: 0, ids: [], reasons: [] };
   if (maxDeactivate === 0) return result;
 
   const db = openMemoryDb();
@@ -956,10 +979,12 @@ export function decayAndEvictFacts(options: DecayOptions = {}): DecayResult {
     const fact = rowToFact(row);
     // Final gate: even an idle low-importance fact survives if its Stanford
     // recall score is still above the floor (e.g. importance was bumped).
-    if (stanfordRecallScore(fact, nowMs) > scoreFloor) continue;
+    const score = stanfordRecallScore(fact, nowMs);
+    if (score > scoreFloor) continue;
     if (deleteFact(fact.id)) {
       result.deactivated += 1;
       result.ids.push(fact.id);
+      result.reasons.push(`#${fact.id} imp:${fact.importance ?? 5} score:${score.toFixed(2)}`);
     }
   }
   return result;

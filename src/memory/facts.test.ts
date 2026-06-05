@@ -26,6 +26,7 @@ const {
   listActiveFacts,
   listAllFacts,
   listPinnedFacts,
+  reactivateFact,
   rememberFact,
   renderFactsForInstructions,
   reviewStandingInstructions,
@@ -324,6 +325,50 @@ test('decayAndEvictFacts honors the maxDeactivate cap', () => {
   const future = Date.now() + 90 * DAY_MS;
   const result = decayAndEvictFacts({ nowMs: future, maxDeactivate: 2 });
   assert.equal(result.deactivated, 2, 'never soft-deletes more than the cap in one pass');
+});
+
+// ─── reversibility: the restore/undo path (the load-bearing safety primitive) ──
+
+test('reactivateFact restores a soft-deleted fact', () => {
+  const fact = rememberFact({ kind: 'project', content: 'A fact that gets forgotten then restored.' });
+  assert.equal(forgetFact(fact.id), true);
+  assert.equal(getFact(fact.id)?.active, false);
+  assert.equal(listActiveFacts({ limit: 100 }).some((f) => f.id === fact.id), false, 'gone from active list while forgotten');
+  assert.equal(reactivateFact(fact.id), true);
+  assert.equal(getFact(fact.id)?.active, true);
+  assert.equal(listActiveFacts({ limit: 100 }).some((f) => f.id === fact.id), true, 'back in the active list');
+});
+
+test('reactivateFact is idempotent on an already-active fact', () => {
+  const fact = rememberFact({ kind: 'user', content: 'An already-active fact.' });
+  assert.equal(reactivateFact(fact.id), false, 'no-op on an active fact returns false');
+  assert.equal(getFact(fact.id)?.active, true);
+});
+
+test('reactivateFact refreshes recency so a restored fact is not immediately re-decayed', () => {
+  const fact = rememberFact({ kind: 'project', content: 'Stale low-value note, forgotten then restored.', importance: 2 });
+  forgetFact(fact.id);
+  reactivateFact(fact.id);
+  const result = decayAndEvictFacts(); // "now" → a just-restored fact is not idle
+  assert.equal(result.ids.includes(fact.id), false, 'just-restored fact is not re-evicted');
+  assert.equal(getFact(fact.id)?.active, true);
+});
+
+test('decayAndEvictFacts records a per-eviction reason for the audit log', () => {
+  const stale = rememberFact({ kind: 'project', content: 'Stale note for reason capture.', importance: 2 });
+  const future = Date.now() + 90 * DAY_MS;
+  const result = decayAndEvictFacts({ nowMs: future });
+  assert.equal(result.reasons.length, result.deactivated, 'one reason per eviction');
+  assert.ok(result.reasons.some((r) => r.includes('#' + stale.id) && r.includes('imp:')), 'reason names the fact id + importance');
+});
+
+test('no-regression: a decay pass that evicts nothing leaves the rendered facts byte-identical', () => {
+  rememberFact({ kind: 'project', content: 'High-priority launch note.', importance: 9 });
+  rememberFact({ kind: 'user', content: 'Nathan is the owner.' }); // default importance 5 > ceil 4
+  const before = renderFactsForInstructions(12, 1600);
+  const result = decayAndEvictFacts(); // "now" → nothing idle, nothing low enough
+  assert.equal(result.deactivated, 0, 'nothing evicted');
+  assert.equal(renderFactsForInstructions(12, 1600), before, 'render byte-identical when no fact is retired');
 });
 
 // ─────────────────────────────────────────────────────────────────

@@ -29,6 +29,7 @@ import { closePlanScope, openPlanScope } from '../agents/plan-scope.js';
 import { processMemoryMaintenance } from '../memory/maintenance.js';
 import { runRecursiveReflection, consolidateActiveFacts } from '../memory/reflection.js';
 import { decayAndEvictFacts } from '../memory/facts.js';
+import { appendHygieneAudit } from '../memory/hygiene-audit.js';
 import {
   CRON_FILE,
 } from '../memory/vault.js';
@@ -358,8 +359,15 @@ async function processRecursiveReflectionTick(state: DaemonState): Promise<void>
 const MEMORY_HYGIENE_LOCAL_HOUR = 4;
 
 async function processMemoryHygieneTick(state: DaemonState): Promise<void> {
-  const decayOn = (getRuntimeEnv('CLEMMY_MEMORY_DECAY', 'off') || 'off').toLowerCase() === 'on';
-  const dedupOn = (getRuntimeEnv('CLEMMY_MEMORY_DEDUP', 'off') || 'off').toLowerCase() === 'on';
+  // Default-ON now (per feedback_no_rollout_flags: validated behavior becomes
+  // the default path). Both halves are conservative + SOFT (active=0,
+  // pinned-exempt, importance<=4, idle>=60d, score-floored, capped) and every
+  // retirement is recoverable (reactivateFact / restore route) AND reviewable
+  // (the hygiene audit log below + the inactive-facts view). The env vars
+  // survive ONLY as an operator kill-switch (set to 'off' to disable), not as a
+  // rollout gate.
+  const decayOn = (getRuntimeEnv('CLEMMY_MEMORY_DECAY', 'on') || 'on').toLowerCase() !== 'off';
+  const dedupOn = (getRuntimeEnv('CLEMMY_MEMORY_DEDUP', 'on') || 'on').toLowerCase() !== 'off';
   if (!decayOn && !dedupOn) return;
 
   const now = new Date();
@@ -373,6 +381,14 @@ async function processMemoryHygieneTick(state: DaemonState): Promise<void> {
     try {
       const result = decayAndEvictFacts();
       logger.info({ result }, 'Memory decay/eviction completed');
+      if (result.deactivated > 0) {
+        appendHygieneAudit({
+          at: now.toISOString(),
+          kind: 'decay',
+          ids: result.ids,
+          detail: { scanned: result.scanned, deactivated: result.deactivated, reasons: result.reasons },
+        });
+      }
     } catch (err) {
       logger.warn(
         { err: err instanceof Error ? err.message : String(err) },
@@ -384,6 +400,14 @@ async function processMemoryHygieneTick(state: DaemonState): Promise<void> {
     try {
       const result = await consolidateActiveFacts();
       logger.info({ result }, 'Memory dedup/consolidation completed');
+      if (result.ids.length > 0) {
+        appendHygieneAudit({
+          at: now.toISOString(),
+          kind: 'dedup',
+          ids: result.ids,
+          detail: { examined: result.examined, merged: result.merged },
+        });
+      }
     } catch (err) {
       logger.warn(
         { err: err instanceof Error ? err.message : String(err) },

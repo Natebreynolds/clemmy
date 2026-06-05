@@ -23,8 +23,9 @@ import { getComposioRuntimeStatus } from '../integrations/composio/client.js';
 import { getGitHubCliStatus } from '../integrations/github-cli.js';
 import { recallHybrid, getRecallStats } from '../memory/recall.js';
 import { bufferToVector, readEmbeddingStats } from '../memory/embeddings.js';
-import { FACT_KINDS, forgetFact, getFact, listActiveFacts, listAllFacts, rememberFact, searchFacts, setFactPinned, updateFact } from '../memory/facts.js';
+import { FACT_KINDS, forgetFact, getFact, listActiveFacts, listAllFacts, reactivateFact, rememberFact, searchFacts, setFactPinned, updateFact } from '../memory/facts.js';
 import { listResourcePointers, countResourcePointers, isSourceMapEnabled } from '../memory/source-map.js';
+import { readHygieneAudit } from '../memory/hygiene-audit.js';
 import { openMemoryDb } from '../memory/db.js';
 import {
   getFocusSnapshot,
@@ -1199,6 +1200,40 @@ export function registerConsoleRoutes(
     try {
       const ok = forgetFact(id);
       res.json({ ok });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * Restore a soft-deleted (forgotten / auto-decayed) fact. The reversibility
+   * half of forget — soft-delete keeps the row, this brings it back. Idempotent
+   * (a no-op on an already-active fact returns ok:false). Lets the owner undo
+   * an automatic decay/dedup retirement or a mistaken forget. No hard-delete is
+   * ever exposed in the console; that stays MCP-tool-only.
+   */
+  app.post('/api/console/memory/facts/:id/restore', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isFinite(id) || id <= 0) { res.status(400).json({ error: 'invalid id' }); return; }
+    try {
+      const ok = reactivateFact(id);
+      res.json({ ok });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * Reviewable audit of AUTOMATIC nightly hygiene (decay + dedup): what was
+   * retired, when, and why. Read-only — the facts themselves stay visible via
+   * ?includeInactive=1 and restorable via the route above.
+   */
+  app.get('/api/console/memory/hygiene-log', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const limit = Math.max(1, Math.min(1000, parseInt(String(req.query.limit ?? '200'), 10) || 200));
+    try {
+      res.json({ entries: readHygieneAudit(limit) });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

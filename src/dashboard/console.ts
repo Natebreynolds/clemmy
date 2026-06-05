@@ -979,6 +979,9 @@ export function renderConsoleHtml(token: string): string {
                       <button class="kind-pill" data-kind="feedback">FEEDBACK</button>
                       <button class="kind-pill" data-kind="reference">REFERENCE</button>
                     </div>
+                    <div class="mem-inactive-row">
+                      <button class="kind-pill mem-inactive-toggle" data-mem-show-inactive title="Show facts that were forgotten or auto-decayed — they are restorable">SHOW FORGOTTEN</button>
+                    </div>
                     <ol class="mem-fact-list" data-mem-fact-list>
                       <li class="empty">— loading —</li>
                     </ol>
@@ -5388,7 +5391,8 @@ body {
 }
 .fact-viewer .forget,
 .fact-viewer .pin,
-.fact-viewer .edit {
+.fact-viewer .edit,
+.fact-viewer .restore {
   background: transparent;
   border: 1px solid var(--fg-3);
   color: var(--fg-2);
@@ -5407,6 +5411,12 @@ body {
 .fact-viewer .pin { border-color: var(--accent); color: var(--accent); }
 .fact-viewer .pin:hover { background: var(--accent); color: var(--bg-0); }
 .fact-viewer .edit:hover { background: var(--fg-3); color: var(--bg-0); }
+.fact-viewer .restore { border-color: var(--accent-ok, #3ddc84); color: var(--accent-ok, #3ddc84); }
+.fact-viewer .restore:hover { background: var(--accent-ok, #3ddc84); color: var(--bg-0); }
+.mem-inactive-row { margin: 6px 0 2px; }
+.mem-inactive-toggle.active { border-color: var(--accent-ok, #3ddc84); color: var(--accent-ok, #3ddc84); }
+.mem-fact-list li.fact.inactive { opacity: 0.5; }
+.mem-fact-list li.fact.inactive .body { text-decoration: line-through; }
 
 /* ── Context / Identity panel ─────────────────────────────────── */
 .context-layout {
@@ -12571,6 +12581,7 @@ const CONSOLE_JS = `
     fileCount:  document.querySelector('[data-mem-files-count]'),
     factCount:  document.querySelector('[data-mem-facts-count]'),
     kinds:      document.querySelector('[data-mem-fact-kinds]'),
+    showInactive: document.querySelector('[data-mem-show-inactive]'),
     search:     document.querySelector('[data-mem-search]'),
     searchMeta: document.querySelector('[data-mem-search-meta]'),
     viewer:     document.querySelector('[data-mem-viewer]'),
@@ -12581,6 +12592,7 @@ const CONSOLE_JS = `
   let memSelectedFile = null;
   let memSelectedFact = null;
   let memActiveKind = '';
+  let memShowInactive = false;
   let memSearchSeq = 0;
 
   function escMem(s) {
@@ -14190,7 +14202,10 @@ const CONSOLE_JS = `
 
   async function refreshFactList() {
     try {
-      const url = memActiveKind ? '/api/console/memory/facts?kind=' + encodeURIComponent(memActiveKind) : '/api/console/memory/facts';
+      const params = [];
+      if (memActiveKind) params.push('kind=' + encodeURIComponent(memActiveKind));
+      if (memShowInactive) params.push('includeInactive=1');
+      const url = '/api/console/memory/facts' + (params.length ? '?' + params.join('&') : '');
       const data = await fetchJSON(url);
       const facts = data.facts || [];
       mem.factCount.textContent = facts.length;
@@ -14199,12 +14214,13 @@ const CONSOLE_JS = `
         return;
       }
       mem.factList.innerHTML = facts.map((f) => {
-        const cls = memSelectedFact === f.id ? 'fact selected' : 'fact';
+        const inactive = f.active === false;
+        const cls = (memSelectedFact === f.id ? 'fact selected' : 'fact') + (inactive ? ' inactive' : '');
         return [
           '<li class="' + cls + '" data-fact-id="' + f.id + '">',
           '  <span class="kind">' + escMem(f.kind.toUpperCase()) + '</span>',
           '  <span class="body">' + escMem(f.content) + '</span>',
-          '  <span class="body-extra">score ' + (f.score || 1).toFixed(2) + ' · updated ' + (f.updatedAt ? f.updatedAt.slice(0, 10) : '—') + '</span>',
+          '  <span class="body-extra">score ' + (f.score || 1).toFixed(2) + ' · updated ' + (f.updatedAt ? f.updatedAt.slice(0, 10) : '—') + (inactive ? ' · ⚠ forgotten' : '') + '</span>',
           '</li>',
         ].join('');
       }).join('');
@@ -14230,6 +14246,14 @@ const CONSOLE_JS = `
       refreshFactList();
     });
   });
+
+  if (mem.showInactive) {
+    mem.showInactive.addEventListener('click', () => {
+      memShowInactive = !memShowInactive;
+      mem.showInactive.classList.toggle('active', memShowInactive);
+      refreshFactList();
+    });
+  }
 
   mem.search.addEventListener('keydown', async (e) => {
     if (e.key !== 'Enter') return;
@@ -14293,25 +14317,38 @@ const CONSOLE_JS = `
 
   function renderFactViewer(fact) {
     const pinnedTag = fact.pinned ? ' · 📌 PINNED' : '';
+    const inactive = fact.active === false;
+    const forgottenTag = inactive ? ' · ⚠ FORGOTTEN' : '';
+    // Provenance line (where/when this fact came from) — fields may be absent.
+    const prov = [];
+    if (typeof fact.importance === 'number') prov.push('importance ' + fact.importance);
+    if (typeof fact.trustLevel === 'number') prov.push('trust ' + fact.trustLevel.toFixed(2));
+    if (fact.sourceApp) prov.push('via ' + escMem(fact.sourceApp));
+    else if (fact.derivedFrom && fact.derivedFrom.tool) prov.push('via ' + escMem(fact.derivedFrom.tool));
+    const provLine = prov.length ? '  <div class="meta">' + prov.join(' · ') + '</div>' : '';
+    const lastAction = inactive
+      ? '    <button class="restore" data-restore-id="' + fact.id + '">RESTORE ↺</button>'
+      : '    <button class="forget" data-forget-id="' + fact.id + '">FORGET ▣</button>';
     const html = [
       '<div class="fact-viewer">',
-      '  <div class="kind">' + escMem(fact.kind.toUpperCase()) + ' · #' + fact.id + pinnedTag + '</div>',
+      '  <div class="kind">' + escMem(fact.kind.toUpperCase()) + ' · #' + fact.id + pinnedTag + forgottenTag + '</div>',
       '  <div class="body">' + escMem(fact.content) + '</div>',
       '  <div class="meta">score ' + (fact.score || 1).toFixed(2)
          + ' · created ' + (fact.createdAt ? fact.createdAt.slice(0, 19).replace('T', ' ') : '—')
          + ' · updated ' + (fact.updatedAt ? fact.updatedAt.slice(0, 19).replace('T', ' ') : '—') + '</div>',
+      provLine,
       '  <div class="fact-actions">',
       '    <button class="edit" data-edit-id="' + fact.id + '">EDIT ✎</button>',
       '    <button class="pin" data-pin-id="' + fact.id + '">' + (fact.pinned ? 'UNPIN ▤' : 'PIN ▤') + '</button>',
-      '    <button class="forget" data-forget-id="' + fact.id + '">FORGET ▣</button>',
+      lastAction,
       '  </div>',
       '</div>',
     ].join('');
     mem.viewer.innerHTML = html;
 
     const forgetBtn = mem.viewer.querySelector('.forget');
-    forgetBtn.addEventListener('click', async () => {
-      if (!confirm('Soft-delete fact #' + fact.id + '?')) return;
+    if (forgetBtn) forgetBtn.addEventListener('click', async () => {
+      if (!confirm('Soft-delete fact #' + fact.id + '? You can restore it from SHOW FORGOTTEN.')) return;
       try {
         await fetch(withToken('/api/console/memory/facts/' + fact.id + '/forget'), { method: 'POST' });
         await refreshFactList();
@@ -14319,6 +14356,19 @@ const CONSOLE_JS = `
         mem.viewer.innerHTML = '<div class="mem-empty"><div class="mem-empty-mark">▢</div><div class="mem-empty-text">FACT FORGOTTEN</div></div>';
       } catch (err) {
         alert('Forget failed: ' + (err.message || err));
+      }
+    });
+
+    const restoreBtn = mem.viewer.querySelector('.restore');
+    if (restoreBtn) restoreBtn.addEventListener('click', async () => {
+      try {
+        await fetch(withToken('/api/console/memory/facts/' + fact.id + '/restore'), { method: 'POST' });
+        fact.active = true;
+        renderFactViewer(fact);
+        await refreshFactList();
+        await refreshMemoryStatus();
+      } catch (err) {
+        alert('Restore failed: ' + (err.message || err));
       }
     });
 
