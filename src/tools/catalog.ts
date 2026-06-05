@@ -52,6 +52,7 @@ export const LOCAL_MCP_TOOL_NAMES = [
   'trigger_cron_job',
   'workflow_list',
   'workflow_create',
+  'workflow_from_session',
   'workflow_run',
   'workflow_get',
   'workflow_set_enabled',

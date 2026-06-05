@@ -18,6 +18,7 @@ import {
 import { prepareWorkflowForWrite } from '../execution/workflow-enforce.js';
 import { describeWorkflowPlainEnglish, describeWorkflowOneLine, describeCron } from '../execution/workflow-describe.js';
 import { validateCronExpression } from '../shared/cron.js';
+import { draftWorkflowFromSession, type WorkflowDraft } from '../execution/trace-to-workflow.js';
 import { analyzeWorkflowGaps, renderWorkflowGapQuestions } from '../execution/workflow-gap-test.js';
 import {
   CRON_PROGRESS_DIR,
@@ -69,6 +70,61 @@ import { matchToolChoicesForStep, type StepToolChoiceMatch, type ToolChoiceRecor
  * write already succeeded. Empty string when there is nothing to flag, so a
  * clean authoring run is byte-identical.
  */
+export interface AuthoredWorkflowResult {
+  ok: boolean;
+  errors: string[];
+  savedDef: WorkflowDefinition;
+  repairs: string[];
+  warnings: string[];
+  boundNotes: string[];
+  advisories: string[];
+  gaps: ReturnType<typeof analyzeWorkflowGaps>;
+}
+
+/**
+ * Canonical "author and persist a NEW workflow" core, shared by workflow_create
+ * and workflow_from_session so promotion can never drift from the create path.
+ * Binds proven tool-choices → auto-repairs + validates → persists (only when
+ * valid) → gap-tests. Returns the structured result; each caller composes its
+ * own response text. (This is the F4 consolidation, justified now that a second
+ * real consumer — promotion — needs the exact same author behavior.)
+ */
+export function commitAuthoredWorkflow(def: WorkflowDefinition, dirName: string): AuthoredWorkflowResult {
+  const bind = bindStepsToToolChoices(def.steps);
+  const prep = prepareWorkflowForWrite(def);
+  if (!prep.ok) {
+    return {
+      ok: false, errors: prep.errors, savedDef: prep.def, repairs: prep.repairs,
+      warnings: prep.warnings, boundNotes: bind.boundNotes, advisories: bind.advisories, gaps: [],
+    };
+  }
+  writeWorkflow(dirName, prep.def);
+  return {
+    ok: true, errors: [], savedDef: prep.def, repairs: prep.repairs,
+    warnings: prep.warnings, boundNotes: bind.boundNotes, advisories: bind.advisories,
+    gaps: analyzeWorkflowGaps(prep.def),
+  };
+}
+
+/** Build a WorkflowDefinition from a session-trace draft. Saved DISABLED so a
+ *  reconstructed workflow is reviewed (and smoke-tested) before it can fire.
+ *  Pure + exported for tests. */
+export function draftToDefinition(name: string, draft: WorkflowDraft): WorkflowDefinition {
+  return {
+    name,
+    description: `Reusable workflow built from a chat session (${draft.toolCallCount} action${draft.toolCallCount === 1 ? '' : 's'}).`,
+    enabled: false,
+    trigger: { manual: true },
+    steps: draft.steps.map((s) => ({
+      id: s.id,
+      prompt: s.prompt,
+      dependsOn: s.dependsOn,
+      allowedTools: s.allowedTools,
+      ...(s.requiresApproval ? { requiresApproval: true, approvalPreview: s.approvalPreview } : {}),
+    })),
+  };
+}
+
 export function renderAuthoringAdvisories(warnings: string[] | undefined): string {
   if (!warnings || warnings.length === 0) return '';
   return `\n\nHeads up (advisory — the workflow was saved):\n- ${warnings.join('\n- ')}`;
@@ -595,31 +651,59 @@ export function registerOrchestrationTools(server: McpServer): void {
         synthesis: synthesis_prompt ? { prompt: synthesis_prompt } : undefined,
       };
       // Tight authoring: bind steps to the user's proven tool-choices BEFORE
-      // validation (auto-bound steps then pass the binding warning cleanly).
-      const createBind = bindStepsToToolChoices(def.steps);
-      // Auto-repair the mechanically-fixable binding gaps (dangling
-      // {{steps.X.output}} / forEach / undeclared {{input.X}}), THEN refuse
-      // only if the repaired workflow still can't flow. This saves a runnable
-      // workflow in one shot instead of bouncing the author into a token-
-      // burning re-author loop over a fix the engine can make itself.
-      const createPrep = prepareWorkflowForWrite(def);
-      if (!createPrep.ok) {
+      // Author through the canonical core (bind → auto-repair + validate →
+      // persist → gap-test). Auto-repair saves a runnable workflow in one shot
+      // instead of bouncing the author into a token-burning re-author loop;
+      // refuse only if the repaired workflow still can't flow. Shared with
+      // workflow_from_session so promotion can't drift from this path.
+      const created = commitAuthoredWorkflow(def, dirName);
+      if (!created.ok) {
         return textResult(
-          `Workflow "${name}" was NOT created — fix these first:\n- ${createPrep.errors.join('\n- ')}`,
+          `Workflow "${name}" was NOT created — fix these first:\n- ${created.errors.join('\n- ')}`,
         );
       }
-      const savedDef = createPrep.def;
-      writeWorkflow(dirName, savedDef);
-      const createBindReport = createBind.boundNotes.length > 0 ? `\n\n${createBind.boundNotes.join('\n')}` : '';
-      // Super-plan authoring: a saved workflow is run through the gap test so
-      // Clem asks the user for clarity BEFORE relying on it, instead of
-      // authoring something quietly set up to fail at 2am.
-      const createGaps = analyzeWorkflowGaps(savedDef);
+      const createBindReport = created.boundNotes.length > 0 ? `\n\n${created.boundNotes.join('\n')}` : '';
       return textResult(
-        `Created workflow "${name}". Here's what it will do:\n\n${describeWorkflowPlainEnglish(savedDef)}\n\n`
+        `Created workflow "${name}". Here's what it will do:\n\n${describeWorkflowPlainEnglish(created.savedDef)}\n\n`
           + `Saved to workflows/${dirName}/SKILL.md.${createBindReport}`
-          + `${renderAuthoringAdvisories([...createPrep.repairs, ...createPrep.warnings, ...createBind.advisories])}`
-          + `${renderWorkflowGapQuestions(createGaps)}`,
+          + `${renderAuthoringAdvisories([...created.repairs, ...created.warnings, ...created.advisories])}`
+          + `${renderWorkflowGapQuestions(created.gaps)}`,
+      );
+    },
+  );
+
+  server.tool(
+    'workflow_from_session',
+    'Turn what you JUST did in this chat into a reusable, repeatable workflow. Call this only when the user asks to save/repeat/automate what they just did (confirm with them first). It reads this session\'s tool-call trace, reconstructs the steps — locking each to the exact tool you actually used (so future runs are deterministic) and preserving any approval pause — and saves a DISABLED draft. Returns a plain-English summary to review. After saving, refine any step with workflow_update and enable it with workflow_set_enabled when it\'s ready.',
+    {
+      name: z.string().min(1).describe('A short name for the new workflow, e.g. "Weekly Prospect Outreach".'),
+      sessionId: z.string().optional().describe('Defaults to the CURRENT chat session. Only pass this to promote a different session.'),
+    },
+    async ({ name, sessionId }) => {
+      const sid = sessionId || getToolOutputContext()?.sessionId;
+      if (!sid) {
+        return textResult('I can\'t tell which chat to turn into a workflow (no session context). Run this from the chat where you did the work.');
+      }
+      const dirName = name.replace(/[^a-zA-Z0-9_-]/g, '-').toLowerCase();
+      if (readWorkflow(dirName)) {
+        return textResult(`A workflow named "${name}" already exists — pick a different name, or update it with workflow_update.`);
+      }
+      const draft = draftWorkflowFromSession(sid);
+      if (draft.steps.length === 0) {
+        return textResult(`There's nothing to turn into a workflow yet: ${draft.notes[0] ?? 'no actions found in this chat.'}`);
+      }
+      const def = draftToDefinition(name, draft);
+      const built = commitAuthoredWorkflow(def, dirName);
+      if (!built.ok) {
+        return textResult(`I couldn't build "${name}" from this chat — these need fixing first:\n- ${built.errors.join('\n- ')}`);
+      }
+      const n = draft.toolCallCount;
+      return textResult(
+        `Built a draft workflow "${name}" from this chat — saved DISABLED so you can review before it runs.\n\n`
+          + describeWorkflowPlainEnglish(built.savedDef)
+          + `\n\nReconstructed from ${n} action${n === 1 ? '' : 's'} you took. Before enabling:\n- ${draft.notes.join('\n- ')}`
+          + renderWorkflowGapQuestions(built.gaps)
+          + `\n\nRefine any step with workflow_update, then enable it with workflow_set_enabled when it's ready.`,
       );
     },
   );

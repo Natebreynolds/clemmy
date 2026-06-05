@@ -12,7 +12,8 @@ process.env.CLEMENTINE_HOME = TMP_HOME;
 process.env.HOME = TMP_HOME;
 
 import type { ToolChoiceRecord } from '../memory/tool-choice-store.js';
-const { registerOrchestrationTools, renderAuthoringAdvisories, bindStepsToToolChoices } = await import('./orchestration-tools.js');
+const { registerOrchestrationTools, renderAuthoringAdvisories, bindStepsToToolChoices, draftToDefinition, commitAuthoredWorkflow } = await import('./orchestration-tools.js');
+const { traceToWorkflowDraft } = await import('../execution/trace-to-workflow.js');
 const { writeWorkflow, readWorkflow } = await import('../memory/workflow-store.js');
 const { WORKFLOWS_DIR } = await import('../memory/vault.js');
 const { WORKFLOW_RUNS_DIR } = await import('./shared.js');
@@ -383,4 +384,34 @@ test('workflow_create: a generic salesforce step is auto-bound AND saved (the fl
   assert.match(saved.prompt, /sf data query/, 'command baked into the saved prompt');
   assert.ok(!saved.prompt.includes('{{'), 'no raw template token saved');
   assert.deepEqual(saved.allowedTools, ['run_shell_command'], 'locked off composio');
+});
+
+// ─── J2b: chat → workflow promotion (draftToDefinition + canonical author) ──
+
+test('draftToDefinition: maps a trace draft to a DISABLED, manual-trigger workflow', () => {
+  const draft = traceToWorkflowDraft([
+    { tool: 'composio_execute_tool', slug: 'SALESFORCE_GET_RECORDS', args: '{"tool":"SALESFORCE_GET_RECORDS","arguments":{}}', callId: 'a' },
+    { tool: 'request_approval', args: '{"preview":"Send 5 emails"}', callId: 'b' },
+    { tool: 'composio_execute_tool', slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL', args: '{"tool":"OUTLOOK_OUTLOOK_SEND_EMAIL","arguments":{}}', callId: 'c' },
+  ]);
+  const def = draftToDefinition('My Prospect Flow', draft);
+  assert.equal(def.enabled, false);                 // saved disabled for review
+  assert.equal(def.trigger.manual, true);
+  assert.equal(def.steps.length, 2);                 // approval is a gate, not a step
+  assert.deepEqual(def.steps[0].allowedTools, ['composio_execute_tool']);
+  assert.deepEqual(def.steps[1].dependsOn, [def.steps[0].id]);  // linear chain
+  assert.equal(def.steps[1].requiresApproval, true);            // gate preserved
+  assert.equal(def.steps[1].approvalPreview, 'Send 5 emails');
+});
+
+test('draftToDefinition + commitAuthoredWorkflow: a promoted draft authors + validates cleanly', () => {
+  const draft = traceToWorkflowDraft([
+    { tool: 'composio_execute_tool', slug: 'DATAFORSEO_RANKED_KEYWORDS', args: '{"tool":"DATAFORSEO_RANKED_KEYWORDS","arguments":{"target":"x.com"}}', callId: 'a' },
+    { tool: 'run_shell_command', args: '{"command":"python report.py"}', callId: 'b' },
+  ]);
+  const def = draftToDefinition('zz-promote-test', draft);
+  const built = commitAuthoredWorkflow(def, 'zz-promote-test');
+  assert.equal(built.ok, true, built.errors.join('; '));
+  assert.equal(built.savedDef.enabled, false);
+  assert.equal(readWorkflow('zz-promote-test')!.data.steps.length, 2);
 });
