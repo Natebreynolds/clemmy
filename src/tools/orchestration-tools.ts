@@ -16,7 +16,7 @@ import {
   type WorkflowEntry,
 } from '../memory/workflow-store.js';
 import { prepareWorkflowForWrite } from '../execution/workflow-enforce.js';
-import { describeWorkflowPlainEnglish, describeWorkflowOneLine } from '../execution/workflow-describe.js';
+import { describeWorkflowPlainEnglish, describeWorkflowOneLine, describeCron } from '../execution/workflow-describe.js';
 import { analyzeWorkflowGaps, renderWorkflowGapQuestions } from '../execution/workflow-gap-test.js';
 import {
   CRON_PROGRESS_DIR,
@@ -324,15 +324,10 @@ function fieldMatch(field: string, value: number): boolean {
   return false;
 }
 
-function describeCronSchedule(expr: string): string {
-  const parts = expr.trim().split(/\s+/);
-  if (parts.length !== 5) return expr;
-  const [min, hour, dom, _mon, dow] = parts;
-  if (min.startsWith('*/')) return `every ${min.slice(2)} minutes`;
-  if (hour.startsWith('*/')) return `every ${hour.slice(2)} hours`;
-  if (hour !== '*' && min !== '*') return `${hour.padStart(2, '0')}:${min.padStart(2, '0')}${dow !== '*' ? ` on ${dow}` : dom !== '*' ? ` on day ${dom}` : ' daily'}`;
-  return expr;
-}
+// Cron → human recurrence. Canonical implementation lives in
+// workflow-describe.ts (describeCron); this local alias keeps the cron_list
+// call site readable while removing the duplicate humanizer.
+const describeCronSchedule = describeCron;
 
 function getNextRun(expr: string): string | null {
   if (!validateCronExpression(expr)) return null;

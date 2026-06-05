@@ -8,6 +8,7 @@ import { CRON_FILE } from '../memory/vault.js';
 import { textResult } from './shared.js';
 import { loadUserProfile } from '../runtime/user-profile.js';
 import { prepareWorkflowForWrite } from '../execution/workflow-enforce.js';
+import { describeCron } from '../execution/workflow-describe.js';
 import { analyzeWorkflowGaps, renderWorkflowGapQuestions } from '../execution/workflow-gap-test.js';
 
 /**
@@ -269,21 +270,12 @@ export function registerWorkflowScheduleTools(server: McpServer): void {
 }
 
 /**
- * Crude "next fire" hint for the success message. We don't run a real
- * cron parser here — just describe the schedule in plain English when
- * obvious, otherwise fall back to "per the cron expression."
+ * "Next fire" hint for the success message. Delegates to the canonical
+ * cron humanizer (workflow-describe.ts:describeCron), which covers more
+ * patterns (weekday/daily/weekly/day-of-month/interval) and falls back to
+ * the raw expression when it can't phrase one.
  */
 function nextFireDescription(cron: string): string {
-  const parts = cron.trim().split(/\s+/);
-  if (parts.length !== 5) return 'per the cron expression';
-  const [min, hour, dom, mon, dow] = parts;
-  const everything = (s: string): boolean => s === '*';
-  if (everything(dom) && everything(mon) && dow === '1-5' && /^\d+$/.test(min) && /^\d+$/.test(hour)) {
-    return `weekdays at ${hour.padStart(2, '0')}:${min.padStart(2, '0')}`;
-  }
-  if (everything(dom) && everything(mon) && everything(dow) && /^\d+$/.test(min) && /^\d+$/.test(hour)) {
-    return `every day at ${hour.padStart(2, '0')}:${min.padStart(2, '0')}`;
-  }
-  return 'per the cron expression';
+  return describeCron(cron);
 }
 
