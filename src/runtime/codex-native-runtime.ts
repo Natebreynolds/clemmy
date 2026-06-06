@@ -175,7 +175,7 @@ function turnCheckpointEnabled(): boolean {
 // in the caller (cron, autonomy, controller) and the user never sees
 // the "re-authenticate" prompt — observed 35 silent 401s in a row in
 // production logs. Bucket id by date so we never spam.
-function notifyCodexAuthExpired(refreshError?: string): void {
+export function notifyCodexAuthExpired(refreshError?: string): void {
   const id = `system-codex-auth-expired-${new Date().toISOString().slice(0, 10)}`;
   if (getNotification(id)) return;
   const detail = refreshError ? `Refresh attempt failed: ${refreshError}\n\n` : '';

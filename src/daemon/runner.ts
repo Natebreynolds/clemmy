@@ -23,6 +23,7 @@ import { sweepStaleExecutions, sweepCrashedExecutions, sweepStaleBlockedExecutio
 import { sweepStaleRuns } from '../runtime/run-events.js';
 import { sweepStaleApprovals } from '../runtime/approval-store.js';
 import { getAuthStatus } from '../runtime/auth-store.js';
+import { tickAuthKeepalive, isAuthKeepaliveEnabled } from '../runtime/auth-keepalive.js';
 import { DISCORD_BOT_TOKEN, DISCORD_ENABLED, WEBHOOK_ENABLED, WEBHOOK_SECRET } from '../config.js';
 import { getOrRefreshScan as warmCliScan } from '../runtime/cli-discovery.js';
 import { closePlanScope, openPlanScope } from '../agents/plan-scope.js';
@@ -1052,6 +1053,18 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
   };
   const watchdogTimer = setInterval(tickWatchdog, 60_000);
   watchdogTimer.unref?.();
+
+  // Proactive Codex auth keepalive: refresh a soon-to-expire token while idle and
+  // surface a re-auth prompt EARLY (not mid-task). Routes through the existing
+  // single-flight + lock, so it adds no reuse-revoke risk. Kill switch:
+  // CLEMENTINE_AUTH_KEEPALIVE=off.
+  if (isAuthKeepaliveEnabled()) {
+    // Run once shortly after boot so a daemon that started with a near-expired
+    // token warms it before the first job, then every 5 min.
+    setTimeout(() => { void tickAuthKeepalive(); }, 30_000).unref?.();
+    const authKeepaliveTimer = setInterval(() => { void tickAuthKeepalive(); }, 5 * 60_000);
+    authKeepaliveTimer.unref?.();
+  }
 
   // Workflow-run lane: drain queued runs on an independent timer so one
   // long/parked run can't starve the main loop (cron, schedules,
