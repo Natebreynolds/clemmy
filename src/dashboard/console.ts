@@ -321,6 +321,26 @@ export function renderConsoleHtml(token: string): string {
             </div>
           </header>
 
+          <!-- Active Goal banner — prominent at the top when Clem is
+               pursuing a standing goal. Hidden otherwise. Populated by
+               refreshHomeGoal() from /api/console/home/goal-status. -->
+          <div class="home-goal-banner" data-home-goal-banner hidden role="button" tabindex="0" data-tools-jump="activity" aria-label="Active goal">
+            <div class="home-goal-row">
+              <span class="home-goal-tag">ACTIVE GOAL</span>
+              <span class="home-goal-objective" data-home-goal-objective>—</span>
+              <span class="home-goal-turns" data-home-goal-turns>0/0</span>
+              <span class="home-goal-state" data-home-goal-state>ACTIVE</span>
+            </div>
+            <div class="dock-progress home-goal-progress"><span class="dock-progress-fill" data-home-goal-progress style="width:0%"></span></div>
+          </div>
+
+          <!-- Activity pulse — a compact sparkline of runs over the last
+               24h so you can see how busy Clem has been at a glance. -->
+          <div class="home-pulse" data-home-pulse hidden>
+            <div class="home-pulse-head"><span>ACTIVITY · LAST 24H</span><em data-home-pulse-total>—</em></div>
+            <div class="usage-spark home-pulse-spark" data-home-pulse-spark></div>
+          </div>
+
           <div class="home-main">
 
             <div class="home-main-left">
@@ -3568,6 +3588,38 @@ body {
   flex-direction: column;
   gap: 6px;
 }
+/* Status dot on command-center cards */
+.home-item-dot {
+  width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0;
+  background: var(--fg-mute); align-self: center;
+}
+.home-item-dot.warn { background: var(--accent-warn); box-shadow: 0 0 6px color-mix(in srgb, var(--accent-warn) 50%, transparent); }
+.home-item-dot.running { background: var(--accent-3); box-shadow: 0 0 6px color-mix(in srgb, var(--accent-3) 50%, transparent); animation: pulse 1.4s ease-in-out infinite; }
+.home-item-dot.done { background: var(--accent-2); }
+/* Active Goal banner */
+.home-goal-banner {
+  display: flex; flex-direction: column; gap: 8px;
+  border: 1px solid var(--accent); background: color-mix(in srgb, var(--accent) 8%, var(--bg-2));
+  padding: 10px 14px; margin-bottom: 12px; cursor: pointer;
+  transition: background 120ms;
+}
+.home-goal-banner:hover { background: color-mix(in srgb, var(--accent) 14%, var(--bg-2)); }
+.home-goal-banner.paused { border-color: var(--accent-warn); background: color-mix(in srgb, var(--accent-warn) 8%, var(--bg-2)); }
+.home-goal-row { display: flex; align-items: baseline; gap: 12px; }
+.home-goal-tag { font-size: 9px; letter-spacing: 0.2em; color: var(--accent); flex-shrink: 0; }
+.home-goal-banner.paused .home-goal-tag { color: var(--accent-warn); }
+.home-goal-objective { flex: 1; min-width: 0; color: var(--fg); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.home-goal-turns { font-size: 10px; color: var(--fg-3); letter-spacing: 0.06em; flex-shrink: 0; }
+.home-goal-state { font-size: 9px; letter-spacing: 0.16em; color: var(--accent); flex-shrink: 0; }
+.home-goal-banner.paused .home-goal-state { color: var(--accent-warn); }
+.home-goal-progress { height: 4px; }
+/* Activity pulse sparkline */
+.home-pulse { border: 1px solid var(--line); background: var(--bg-2); padding: 8px 14px 10px; margin-bottom: 12px; }
+.home-pulse-head { display: flex; justify-content: space-between; align-items: baseline; font-size: 9px; letter-spacing: 0.18em; color: var(--fg-3); margin-bottom: 6px; }
+.home-pulse-head em { font-style: normal; color: var(--fg-2); }
+.home-pulse-spark { height: 36px; }
+.home-pulse-spark .spark-bar { background: var(--line-bright); }
+.home-pulse-spark .spark-bar.on { background: var(--accent-3); }
 .home-empty {
   color: var(--fg-mute);
   font-size: 11px;
@@ -11910,10 +11962,11 @@ const CONSOLE_JS = `
     }
   }
 
-  function renderCommandItems(items, emptyText) {
+  function renderCommandItems(items, emptyText, tone) {
     if (!items || items.length === 0) {
       return '<div class="home-empty">' + escMem(emptyText) + '</div>';
     }
+    const dotTone = tone || '';
     return items.map((item) => {
       const hasApproval = item.approvalId && item.approvalKind;
       const hasWorkflowRun = item.actionKind === 'workflow-run' && item.workflowName && item.runId;
@@ -11972,6 +12025,7 @@ const CONSOLE_JS = `
         : '';
       return [
       '<div class="home-item command-item" data-tools-jump="' + escMem(item.panel || 'activity') + '"' + targetSessionAttr + targetRunAttr + targetBackgroundAttr + '>',
+      '  <span class="home-item-dot ' + escMem(dotTone) + '" aria-hidden="true"></span>',
       '  <span class="home-item-kind ' + escMem(item.kind || 'task') + '">' + escMem(String(item.kind || 'item').toUpperCase()) + '</span>',
       '  <div style="flex:1; min-width:0;">',
       '    <div class="home-item-text">' + escMem(item.title || '') + '</div>',
@@ -12388,9 +12442,9 @@ const CONSOLE_JS = `
       if (toolsTile) toolsTile.textContent = (data.integrations?.requiredMissing || 0) > 0 ? '!' : ((data.integrations?.connected ?? 0) + '/' + (data.integrations?.total ?? 0));
       if (els.approvals) els.approvals.textContent = counts.approvals ?? 0;
 
-      if (needsEl) needsEl.innerHTML = renderCommandItems(data.needsYou, '— nothing waiting on you —');
-      if (workingEl) workingEl.innerHTML = renderCommandItems(data.workingNow, '— no active runs or background tasks —');
-      if (recentEl) recentEl.innerHTML = renderCommandItems(data.recentCompleted, '— nothing completed recently —');
+      if (needsEl) needsEl.innerHTML = renderCommandItems(data.needsYou, '— nothing waiting on you —', 'warn');
+      if (workingEl) workingEl.innerHTML = renderCommandItems(data.workingNow, '— no active runs or background tasks —', 'running');
+      if (recentEl) recentEl.innerHTML = renderCommandItems(data.recentCompleted, '— nothing completed recently —', 'done');
       if (memoryEl) memoryEl.innerHTML = renderMemoryPulse(data.memory || {});
       if (toolsEl) toolsEl.innerHTML = renderToolReadiness(data.integrations || {});
 
@@ -12401,11 +12455,70 @@ const CONSOLE_JS = `
       setNavBadge('settings', (counts.approvals || 0) + (counts.planProposals || 0) + (counts.checkInProposals || 0), 'hot');
 
       renderStatusFocus(data.focus || null);
+      refreshHomeGoal();
+      refreshHomePulse(data.recentCompleted || []);
     } catch (err) {
       const needsEl = document.querySelector('[data-home-needs-list]');
       if (needsEl) needsEl.innerHTML = '<div class="home-empty">Command center failed: ' + escMem(err.message || err) + '</div>';
       setPresence('offline');
     }
+  }
+
+  // Active Goal banner at the top of Home — mirrors the dock goal card but
+  // big + prominent. Reads the cheap goal-status endpoint.
+  async function refreshHomeGoal() {
+    const banner = document.querySelector('[data-home-goal-banner]');
+    if (!banner) return;
+    try {
+      const r = await fetch(withToken('/api/console/home/goal-status'));
+      if (!r.ok) { banner.hidden = true; return; }
+      const j = await r.json();
+      const state = j && j.goal;
+      const status = state && state.status;
+      if (state && (status === 'pursuing' || status === 'paused')) {
+        const used = parseInt(state.turnsUsed, 10) || 0;
+        const total = parseInt(state.turnsLimit, 10) || 0;
+        const setText = (sel, txt) => { const el = banner.querySelector(sel); if (el) el.textContent = txt; };
+        setText('[data-home-goal-objective]', String(state.objective || '').slice(0, 140));
+        setText('[data-home-goal-turns]', used + '/' + total);
+        setText('[data-home-goal-state]', status === 'pursuing' ? 'ACTIVE' : 'PAUSED');
+        const fill = banner.querySelector('[data-home-goal-progress]');
+        if (fill) fill.style.width = Math.round((used / Math.max(1, total)) * 100) + '%';
+        banner.classList.toggle('paused', status === 'paused');
+        banner.hidden = false;
+      } else {
+        banner.hidden = true;
+      }
+    } catch (_) { banner.hidden = true; }
+  }
+
+  // Activity pulse sparkline — bucket recent completed items into the last
+  // 24 hourly bins. Uses item.completedAt/ts/meta timestamps when present;
+  // falls back to hiding if we can't derive any times.
+  function refreshHomePulse(recentItems) {
+    const wrap = document.querySelector('[data-home-pulse]');
+    const spark = document.querySelector('[data-home-pulse-spark]');
+    if (!wrap || !spark) return;
+    const now = Date.now();
+    const HOURS = 24;
+    const bins = new Array(HOURS).fill(0);
+    let counted = 0;
+    (recentItems || []).forEach((it) => {
+      const raw = it.completedAt || it.finishedAt || it.ts || it.at || it.createdAt;
+      const t = raw ? Date.parse(raw) : NaN;
+      if (!Number.isFinite(t)) return;
+      const hoursAgo = Math.floor((now - t) / 3600000);
+      if (hoursAgo >= 0 && hoursAgo < HOURS) { bins[HOURS - 1 - hoursAgo]++; counted++; }
+    });
+    if (counted === 0) { wrap.hidden = true; return; }
+    const max = Math.max.apply(null, bins) || 1;
+    const totalEl = document.querySelector('[data-home-pulse-total]');
+    if (totalEl) totalEl.textContent = counted + ' done';
+    spark.innerHTML = bins.map((n) => {
+      const h = Math.max(2, Math.round((n / max) * 100));
+      return '<span class="spark-bar' + (n > 0 ? ' on' : '') + '" style="height:' + h + '%" title="' + n + '"></span>';
+    }).join('');
+    wrap.hidden = false;
   }
 
   function greetingForNow() {
