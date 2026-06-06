@@ -2473,8 +2473,12 @@ body {
  */
 .grid {
   display: grid;
-  grid-template-columns: 220px 1fr;
-  grid-template-rows: 44px 1fr 28px;
+  grid-template-columns: 220px minmax(0, 1fr);
+  /* minmax(0, 1fr) — NOT plain 1fr — so the panel row can shrink below its
+     content's intrinsic size; otherwise the row grows to fit the content,
+     pushing the foot bar (and the panel's own overflow) off-screen on smaller
+     windows instead of letting the panel scroll. */
+  grid-template-rows: 44px minmax(0, 1fr) 28px;
   grid-template-areas:
     "header header"
     "sidebar panel"
@@ -2494,6 +2498,37 @@ body {
 .grid.sidebar-collapsed { grid-template-columns: 0 1fr; }
 .grid.sidebar-collapsed .sidebar { display: none; }
 .sidebar-toggle-icon { font-size: 14px; line-height: 1; }
+
+/* ── Fit + scroll at ANY window size ──────────────────────────────────
+ * Grid/flex items default to min-{height,width}:auto and refuse to shrink
+ * below their content. So on smaller windows the .panel grew past its 1fr
+ * grid cell and the bottom (and foot bar) got CLIPPED with no scroll, while
+ * wide rows spilled past the right edge. .panel already has overflow:auto —
+ * it just couldn't shrink to a scrollable size. Letting the structural
+ * containers shrink + clipping the shell makes the app fit + scroll on any
+ * screen. */
+.panel { min-width: 0; min-height: 0; }
+.grid { overflow: hidden; max-width: 100vw; }
+.status-bar, .status-row { min-width: 0; }
+/* The active view fills + scrolls within the constrained panel instead of
+ * forcing the panel taller than its cell. */
+.panel-frame { min-width: 0; min-height: 0; max-width: 100%; }
+
+/* Header controls never get pushed off the right edge. The two toggle
+ * buttons stay pinned + clickable at any width; the variable-length FOCUS
+ * chip yields first (its title ellipsises); the remaining short stats
+ * truncate only when the window is genuinely cramped. NOTE: never put
+ * overflow:hidden on .stat-focus itself — it would clip its popover. */
+.status-row .stat:not(.stat-focus) { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.status-row .stat-focus { flex-shrink: 100; min-width: 0; }
+.status-row .stat-focus-title { min-width: 0; }
+.status-row .theme-toggle { flex: 0 0 auto; }
+
+/* Home view: grid/flex children must shrink below their content width so the
+ * two-column layout fits its cell instead of overflowing (and being clipped
+ * by the layout's overflow:hidden) on smaller windows. */
+.home-greet-strip, .home-main, .home-main-left, .home-main-right,
+.home-needs, .home-working, .home-completed { min-width: 0; }
 
 /* ── Status bar (top) ─────────────────────────────────────────── */
 .status-bar {
