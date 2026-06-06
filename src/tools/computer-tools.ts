@@ -10,6 +10,8 @@ import { getWorkspaceDirs } from './shared.js';
 import { loadProactivityPolicy } from '../agents/proactivity-policy.js';
 import { needsApprovalFromTaxonomy } from '../agents/tool-taxonomy.js';
 import { findSafeCliCommand } from '../runtime/cli-discovery.js';
+import { isConvertibleExtension } from '../runtime/markitdown.js';
+import { ingestAttachment } from '../runtime/attachments.js';
 import { formatRecallableToolText } from '../runtime/harness/tool-output-format.js';
 import { callIdFromToolDetails, sessionIdFromRunContext } from '../runtime/harness/tool-output-context.js';
 import { isSensitivePath, redactSensitiveText, shellCommandTouchesSensitiveData } from '../runtime/security.js';
@@ -486,7 +488,10 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
 
   const read_file = tool({
     name: 'read_file',
-    description: 'Read a UTF-8 text file from an allowed workspace path.',
+    description: [
+      'Read a file from an allowed workspace path.',
+      'UTF-8 text is returned as-is. Other formats are transparently extracted to Markdown: PDF/Word/Excel/PowerPoint/EPub via the bundled markitdown runtime, images via vision OCR, and audio via transcription. The first markitdown conversion may take ~30-60s while the runtime warms.',
+    ].join('\n'),
     parameters: z.object({
       path: z.string().min(1),
       max_chars: z.number().min(1).max(50000).nullable(),
@@ -496,11 +501,50 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
       const filePath = resolveAllowedPath(input.path);
       if (!existsSync(filePath)) return `File does not exist: ${filePath}`;
       if (!statSync(filePath).isFile()) return `Not a file: ${filePath}`;
+      if (isConvertibleExtension(filePath)) {
+        // Route through the unified ingestion pipeline so audio→Whisper,
+        // image→vision OCR, and docs→markitdown all behave identically here.
+        const ingested = await ingestAttachment({ name: path.basename(filePath), sourcePath: filePath });
+        if (ingested.error) return `Could not read ${path.basename(filePath)}: ${ingested.error}`;
+        return formatToolOutput(
+          'read_file',
+          runContext,
+          details,
+          (ingested.markdown ?? '').slice(0, input.max_chars ?? 20000),
+        );
+      }
       return formatToolOutput(
         'read_file',
         runContext,
         details,
         readFileSync(filePath, 'utf-8').slice(0, input.max_chars ?? 20000),
+      );
+    },
+  });
+
+  const convert_to_markdown = tool({
+    name: 'convert_to_markdown',
+    description: [
+      'Extract a non-text file (PDF, Word/Excel/PowerPoint, EPub, image, audio, …) into Markdown you can read.',
+      'Use for any binary/Office document, image (OCR), or audio (transcript) the user references. (read_file also auto-routes these formats here.)',
+      'Docs use the bundled markitdown runtime (first run ~30-60s to warm); images use vision OCR; audio uses transcription.',
+    ].join('\n'),
+    parameters: z.object({
+      path: z.string().min(1),
+      max_chars: z.number().min(1).max(50000).nullable(),
+    }),
+    needsApproval: needsApprovalForReadFile(),
+    execute: async (input, runContext, details) => {
+      const filePath = resolveAllowedPath(input.path);
+      if (!existsSync(filePath)) return `File does not exist: ${filePath}`;
+      if (!statSync(filePath).isFile()) return `Not a file: ${filePath}`;
+      const ingested = await ingestAttachment({ name: path.basename(filePath), sourcePath: filePath });
+      if (ingested.error) return `Conversion failed: ${ingested.error}`;
+      return formatToolOutput(
+        'convert_to_markdown',
+        runContext,
+        details,
+        (ingested.markdown ?? '').slice(0, input.max_chars ?? 20000),
       );
     },
   });
@@ -591,5 +635,5 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
     },
   });
 
-  return [workspace_roots, list_files, read_file, write_file, run_shell_command, git_status];
+  return [workspace_roots, list_files, read_file, convert_to_markdown, write_file, run_shell_command, git_status];
 }

@@ -26,6 +26,7 @@
   "files": [
     "dist",
     "apps/mobile-web/dist",
+    "vendor/uv",
     "README.md",
     ".env.example"
   ],
@@ -38,9 +39,11 @@
     "test:smoke:gate": "node scripts/smoke-fresh-install.mjs",
     "smoke:codex-native-compaction": "node scripts/smoke-codex-native-compaction.mjs",
     "smoke:report-back": "tsx scripts/smoke-unified-report-back.ts",
+    "vendor:uv": "node scripts/vendor-uv.mjs",
+    "smoke:markitdown": "node scripts/smoke-markitdown.mjs",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
-    "prepack": "npm run build && npm run build:mobile-web",
+    "prepack": "npm run build && npm run build:mobile-web && npm run vendor:uv",
     "pack:local": "npm pack",
     "chat": "tsx src/index.ts chat",
     "daemon": "tsx src/index.ts daemon",

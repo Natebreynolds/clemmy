@@ -9,6 +9,7 @@ import {
 import { CRON_FILE, SOUL_FILE, VAULT_DIR, WORKFLOWS_DIR, WORKING_MEMORY_FILE } from '../memory/vault.js';
 import { readMemoryIndexStatus } from '../memory/indexer.js';
 import { getAuthStatus } from '../runtime/auth-store.js';
+import { resolveUv } from '../runtime/markitdown.js';
 import { getConfiguredDiscordInstallInfo } from '../channels/discord-install.js';
 import { getWorkspaceDirs, listWorkspaceProjects } from '../tools/shared.js';
 import { listGlobalCliStatus } from './capability-status.js';
@@ -175,6 +176,22 @@ export async function runDoctor(): Promise<number> {
     } else {
       passRow('cron jobs', 'Configured');
     }
+  }
+
+  // File conversion runtime (uv + markitdown)
+  const uv = resolveUv();
+  if ('command' in uv) {
+    const warmed = existsSync(path.join(BASE_DIR, 'runtime', 'uv-cache'));
+    passRow('file conversion', warmed ? `uv ready (${uv.command}); markitdown warmed` : `uv ready (${uv.command}); markitdown installs on first convert`);
+  } else {
+    warnRow('file conversion', uv.error);
+  }
+
+  // Media extraction (audio transcription + image OCR) via OpenAI
+  if (getOpenAiApiKey()) {
+    passRow('media extraction', 'audio→Whisper + image→vision OCR ready (OpenAI key set)');
+  } else {
+    warnRow('media extraction', 'Set OPENAI_API_KEY to enable audio transcription + image OCR (docs still work)');
   }
 
   console.log();

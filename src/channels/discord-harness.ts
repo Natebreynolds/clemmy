@@ -2235,8 +2235,29 @@ export async function handleDiscordHarnessMessage(
       await message.reply(content);
     },
   };
+  // Fold any files the user dropped in Discord into the prompt. Discord hosts
+  // the bytes on its CDN, so we just hand the URL + filename to the shared
+  // ingestion pipeline (fetch → convert to markdown). YouTube links pasted in
+  // the message text are picked up too.
+  let effectivePrompt = prompt;
+  try {
+    const { ingestAttachment, foldAttachmentsIntoMessage, extractYouTubeUrls } = await import('../runtime/attachments.js');
+    const ingested = [];
+    for (const att of message.attachments.values()) {
+      ingested.push(await ingestAttachment({ name: att.name ?? 'attachment', url: att.url }));
+    }
+    for (const url of extractYouTubeUrls(prompt).slice(0, 3)) {
+      ingested.push(await ingestAttachment({ name: url, url }));
+    }
+    if (ingested.length > 0) {
+      effectivePrompt = foldAttachmentsIntoMessage(prompt, ingested);
+    }
+  } catch {
+    // Attachment ingestion is best-effort; fall back to the plain prompt.
+  }
+
   await runDiscordHarnessConversation({
-    prompt,
+    prompt: effectivePrompt,
     channelId: message.channelId,
     userId: message.author.id,
     guildId: message.guildId ?? null,
