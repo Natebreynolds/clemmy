@@ -370,7 +370,7 @@ export function renderConsoleHtml(token: string): string {
 
               <div class="home-block home-completed">
                 <div class="home-block-head">
-                  <span>COMPLETED</span>
+                  <span>RECENT</span>
                   <em data-home-recent-count>—</em>
                 </div>
                 <div class="home-block-body command-list compact" data-home-recent-list>
@@ -3145,12 +3145,10 @@ body {
      gap left a huge empty middle on wide windows. */
   justify-content: flex-start;
   gap: 18px;
-  padding: 10px 14px;
-  border: 1px solid var(--line);
-  background:
-    linear-gradient(135deg, color-mix(in srgb, var(--accent) 7%, transparent), transparent 56%),
-    var(--bg-1);
-  min-height: 50px;
+  /* Airy + borderless so the top of Home breathes — premium calm rather
+     than a boxed status strip. */
+  padding: 2px 2px 16px;
+  min-height: 0;
 }
 .home-greet-text {
   display: flex;
@@ -3207,18 +3205,35 @@ body {
    of expanding the page. */
 .home-main {
   display: grid;
-  grid-template-columns: minmax(280px, 0.85fr) minmax(360px, 1.4fr);
-  gap: 12px;
+  /* CHAT is the hero (wide); the INBOX rail is calm + narrow. The columns are
+     visually swapped from source order via grid-column below, so the takeover
+     CSS — which keys off .home-main-left holding the LIVE card — keeps working
+     untouched. */
+  grid-template-columns: minmax(0, 1.85fr) minmax(300px, 0.82fr);
+  gap: 16px;
   min-height: 0; /* critical: lets children's overflow:auto actually scroll */
 }
+.home-main-right { grid-column: 1; grid-row: 1; } /* CHAT hero → left */
+.home-main-left  { grid-column: 2; grid-row: 1; } /* INBOX rail → right */
+
+/* INBOX rail (placed right): one cohesive surface — NEEDS YOU on top, a thin
+   WORKING line, then RECENT filling + scrolling. Inner blocks drop their own
+   border/background so the rail reads as a single calm panel, not a stack of
+   competing boxes. */
 .home-main-left {
   display: grid;
-  grid-template-rows: minmax(0, 1fr) minmax(0, 1fr) minmax(130px, 0.72fr);
-  gap: 12px;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  gap: 0;
   min-height: 0;
+  border: 1px solid var(--line);
+  background: var(--bg-1);
 }
+.home-main-left > .home-block { border: 0; background: transparent; }
+.home-main-left > .home-block + .home-block { border-top: 1px solid var(--line); }
 .home-main-right {
+  /* CHAT hero (placed left). */
   display: grid;
+  grid-template-rows: minmax(0, 1fr);
   min-height: 0;
 }
 .home-needs,
@@ -3235,9 +3250,7 @@ body {
   color: var(--fg);
   font-size: 11px;
   line-height: 1.4;
-  background:
-    repeating-linear-gradient(90deg, color-mix(in srgb, var(--fg) 4%, transparent) 0 1px, transparent 1px 18px),
-    var(--bg-0);
+  background: transparent;
 }
 .home-current-objective[hidden] {
   /* HTML's hidden attribute applies display:none with low
@@ -3350,7 +3363,7 @@ body {
   background:
     linear-gradient(180deg, rgba(255, 170, 80, var(--card-tint, 0.03)) 0%, transparent 30%),
     var(--bg-1);
-  border-left: 2px solid var(--accent);
+  border-top: 2px solid var(--accent);
 }
 .home-chat .home-chat-thread {
   flex: 1 1 auto;
@@ -3378,6 +3391,9 @@ body {
 .home-layout.live-takeover .home-main-left {
   grid-template-rows: 1fr;
   min-height: 0;
+  grid-column: 1;        /* reset the rail's right placement so the orb fills full width */
+  border: 0;
+  background: transparent;
 }
 .home-layout.live-takeover .home-live {
   display: flex;
@@ -3600,7 +3616,7 @@ body {
 }
 .stat-focus-popover-parked-resume:hover { color: var(--accent); border-color: var(--accent); }
 .home-block-head {
-  padding: 8px 14px;
+  padding: 12px 16px;
   border-bottom: 1px solid var(--line);
   display: flex;
   justify-content: space-between;
@@ -3618,7 +3634,7 @@ body {
 .home-block-body {
   flex: 1;
   overflow-y: auto;
-  padding: 8px 14px 12px;
+  padding: 10px 16px 14px;
   display: flex;
   flex-direction: column;
   gap: 6px;
