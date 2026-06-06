@@ -55,6 +55,15 @@ const NEGATED_FRESH_EXTERNAL_RE =
 const NEGATED_EXTERNAL_WINDOW_RE =
   /\b(?:do\s+not|don't|dont|without|no)\s+[^.!?\n]{0,160}\b(?:fresh|new|dataforseo|external\s+mcp|web\s+search|crawl|crawling|scrape|scraping|search|searching|lookup|lookups|look\s+up|audit)\b/i;
 
+// A turn that CONTINUES the active thread rather than opening a new topic — a
+// bare confirmation / go-ahead / anaphoric follow-up ("let's get them ready",
+// "go ahead", "do it", "make that happen", "yes that's perfect", "show me").
+// These carry no tool keyword, so the keyword scoper would strip every external
+// tool mid-task — the "chatbot" failure. When one matches AND no fresh intent is
+// detected, we inherit the most recent concrete scope from a prior turn instead.
+const TOOL_SCOPE_CONTINUATION_RE =
+  /\b(?:go ahead|go for it|let'?s (?:go|do|get|build|run|send|make|try|kick|finish|wrap)|do it|go off|now go|ok(?:ay)? (?:go|do|proceed)|get (?:them|it|those|these|that|started)|make (?:it|that|this|them|those)?[^.!?]{0,30}happen|make (?:it|them|those)\b|run (?:it|them|those|that)|send (?:it|them|those|that)|build (?:it|them|those|that)|create (?:it|them|those|that)|generate (?:it|them|those|that)|prep (?:it|them|those)|finish (?:it|them|those|up)|wrap (?:it|them|those) up|proceed|continue|carry on|keep going|next step|yes(?:\s+please)?|yep|yeah|sure|sounds good|looks good|that'?s perfect|perfect|show me|kick it off)\b/i;
+
 const DATAFORSEO_SEO_PATTERNS = [
   'serp',
   'organic',
@@ -241,4 +250,51 @@ export function resolveMcpToolScope(options: ResolveMcpToolScopeOptions = {}): M
     maxTools: maxTools > 0 ? maxTools : undefined,
     serverMaxTools: Object.keys(serverMaxTools).length > 0 ? serverMaxTools : undefined,
   };
+}
+
+/** A scope that actually exposes tools: the legacy allowAll surface, or a
+ *  concrete server scope with a non-zero cap. (maxTools:0 = nothing exposed.) */
+function scopeIsConcrete(scope: McpToolScope): boolean {
+  return Boolean(scope.allowAll) || (scope.maxTools ?? 0) > 0;
+}
+
+/**
+ * True when the input CONTINUES the active conversation (a bare confirmation /
+ * go-ahead / anaphoric follow-up) rather than opening a fresh topic. Pure.
+ */
+export function isToolScopeContinuation(input?: string | null): boolean {
+  const text = (input ?? '').trim();
+  if (!text) return false;
+  return TOOL_SCOPE_CONTINUATION_RE.test(text);
+}
+
+/**
+ * Continuity-aware scope resolution. Resolves the current turn normally; if that
+ * turn has NO fresh external intent (maxTools:0) but the user is CONTINUING the
+ * thread, inherit the most recent CONCRETE scope from a prior turn's input so the
+ * tools needed to finish the just-agreed task aren't yanked away mid-conversation
+ * (the verified "chatbot feel": every keyword-less turn — "let's get them ready",
+ * "yes that's perfect" — silently dropped the Outlook tools). `priorUserInputs`
+ * are prior turn texts, NEWEST FIRST (this session + continuation lineage). Pure;
+ * the caller supplies the history. Fail-safe: no continuation match or no prior
+ * concrete scope → returns the direct (today's) result unchanged.
+ */
+export function resolveMcpToolScopeWithContinuity(
+  options: { userInput?: string | null; priorUserInputs?: Array<string | null | undefined> } = {},
+): McpToolScope {
+  const direct = resolveMcpToolScope({ userInput: options.userInput });
+  if (scopeIsConcrete(direct)) return direct;
+  if (!isToolScopeContinuation(options.userInput)) return direct;
+  for (const prior of options.priorUserInputs ?? []) {
+    const inherited = resolveMcpToolScope({ userInput: prior });
+    // Only inherit a CONCRETE tool scope (maxTools>0) — never a prior allowAll
+    // (a no-prompt/internal turn) which would silently open the whole surface.
+    if ((inherited.maxTools ?? 0) > 0) {
+      return {
+        ...inherited,
+        reason: `continuity: inherited prior-turn scope for follow-up ("${(options.userInput ?? '').trim().slice(0, 40)}") → ${inherited.reason}`,
+      };
+    }
+  }
+  return direct;
 }

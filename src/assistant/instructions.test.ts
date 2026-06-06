@@ -3,7 +3,22 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { renderChannelDirective, renderActionDisciplineDirective, hasScopedLanguage } from './instructions.js';
+import { renderChannelDirective, renderActionDisciplineDirective, hasScopedLanguage, EXECUTE_DIRECTIVE } from './instructions.js';
+
+test('EXECUTE_DIRECTIVE: tells the model to act in-turn + preview-as-sample, and stays artifact-agnostic', () => {
+  // The two code-backed rules must be present.
+  assert.match(EXECUTE_DIRECTIVE, /ACT IN THE SAME TURN/i);
+  assert.match(EXECUTE_DIRECTIVE, /promises work but produces no artifact is a failure/i);
+  assert.match(EXECUTE_DIRECTIVE, /PREVIEW|representative SAMPLE/i);
+  // Anti-taxonomy guard: the owner explicitly rejected baking a domain/verb
+  // taxonomy (draft-vs-send / email-specific) into the engine — preview/execute
+  // is the SAME machinery for any artifact. Keep this directive taxonomy-free so
+  // the email framing can't creep back in.
+  assert.doesNotMatch(EXECUTE_DIRECTIVE, /\bdraft(s|ing)?\b/i);
+  assert.doesNotMatch(EXECUTE_DIRECTIVE, /\bsend(s|ing)?\b/i);
+  assert.doesNotMatch(EXECUTE_DIRECTIVE, /\b(reversible|irreversible)\b/i);
+  assert.doesNotMatch(EXECUTE_DIRECTIVE, /\bemail/i);
+});
 
 test('discord: requests tight conversational replies under ~500 chars', () => {
   const d = renderChannelDirective('discord');

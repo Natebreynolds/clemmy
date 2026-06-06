@@ -21,9 +21,9 @@ import { harnessInstructions } from './harness-context.js';
 import { normalizeZodForCodexStrict } from '../runtime/schema-normalizer.js';
 import { getCoreToolsAsync } from '../tools/registry.js';
 import { getOrCreateExternalMcpServers } from '../runtime/mcp-servers.js';
-import { resolveMcpToolScope, type McpToolScope } from '../runtime/mcp-tool-scope.js';
+import { resolveMcpToolScope, resolveMcpToolScopeWithContinuity, type McpToolScope } from '../runtime/mcp-tool-scope.js';
 import type { Tool } from '@openai/agents';
-import { appendEvent } from '../runtime/harness/eventlog.js';
+import { appendEvent, listEvents } from '../runtime/harness/eventlog.js';
 import { openPlanScope } from './plan-scope.js';
 import { loadProactivityPolicy } from './proactivity-policy.js';
 import { buildWorkerJobPrompt, WorkerToolInputSchema } from './worker-job-packet.js';
@@ -438,6 +438,55 @@ const ORCHESTRATOR_INSTRUCTIONS = [
   'COMPACTED CONTEXT — recall_tool_result. In long sessions, auto-compact replaces older tool returns with stubs like `[clipped: gmail.list_messages returned 47KB at 2026-05-22T22:30:00Z — call recall_tool_result("call_abc123") for full output]`. If a stub references a detail you need RIGHT NOW (a specific URL, ID, ranking position, recipient address, exact figure that the summary lacks), call `recall_tool_result(call_id="call_abc123")` to retrieve the verbatim original (up to 30KB). Per-turn budget: 3 calls / 60KB total. Use sparingly — usually the summary is enough.',
 ].join('\n\n');
 
+/**
+ * Recent prior user-turn texts for continuity-aware tool scoping, NEWEST FIRST.
+ * Reads this session's `user_input_received` events (excluding the current turn);
+ * if this session has none with intent yet, follows the continuation lineage
+ * (cross_session_prefix.priorSessionIds) so a NEW session resuming an old task
+ * can still inherit the active scope. Best-effort — never throws into agent build.
+ */
+export function recentPriorUserInputsForScope(
+  sessionId: string,
+  currentInput?: string | null,
+  perSessionLimit = 8,
+): string[] {
+  const current = (currentInput ?? '').trim();
+  const seen = new Set<string>();
+  const out: string[] = [];
+  const collect = (sid: string): void => {
+    let rows: ReturnType<typeof listEvents>;
+    try {
+      rows = listEvents(sid, { types: ['user_input_received'], desc: true, limit: perSessionLimit });
+    } catch {
+      return;
+    }
+    // desc:true returns chronological (oldest→newest); reverse → newest-first.
+    for (const ev of [...rows].reverse()) {
+      const text = typeof (ev.data as { text?: unknown })?.text === 'string'
+        ? ((ev.data as { text?: string }).text ?? '').trim()
+        : '';
+      if (!text || text === current || seen.has(text)) continue;
+      seen.add(text);
+      out.push(text);
+    }
+  };
+  collect(sessionId);
+  if (out.length === 0) {
+    try {
+      const prefix = listEvents(sessionId, { types: ['cross_session_prefix'], desc: true, limit: 1 });
+      const prior = (prefix[0]?.data as { priorSessionIds?: unknown })?.priorSessionIds;
+      if (Array.isArray(prior)) {
+        for (const sid of prior) {
+          if (typeof sid === 'string') collect(sid);
+        }
+      }
+    } catch {
+      /* best-effort lineage walk */
+    }
+  }
+  return out;
+}
+
 export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOptions = {}): Promise<
   Agent<RuntimeContextValue, typeof OrchestratorDecisionSchema>
 > {
@@ -470,7 +519,20 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   // when the work is "do the same operation across N independent
   // items" — N composio writes, N scrapes, N file edits, etc.
   // Each call spawns a fresh SDK context bounded to a single result.
-  const mcpToolScope = options.mcpToolScope ?? resolveMcpToolScope({ userInput: options.userInput });
+  // Continuity-aware scope: a keyword-less continuation ("let's get them ready",
+  // "yes that's perfect", "go ahead") must NOT strip the tools the conversation
+  // is mid-using. When a sessionId is present, feed the scoper the prior turns'
+  // inputs (this session + continuation lineage) so a bare follow-up inherits
+  // the active scope instead of collapsing to maxTools:0. No session → exact
+  // legacy behavior. Still gated by CLEMMY_SCOPED_MCP_TOOLS (no new flag).
+  const mcpToolScope = options.mcpToolScope ?? (
+    options.sessionId
+      ? resolveMcpToolScopeWithContinuity({
+          userInput: options.userInput,
+          priorUserInputs: recentPriorUserInputsForScope(options.sessionId, options.userInput),
+        })
+      : resolveMcpToolScope({ userInput: options.userInput })
+  );
   if (options.sessionId) {
     try {
       appendEvent({

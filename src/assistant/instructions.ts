@@ -15,6 +15,15 @@ import type { MessageIntent } from './message-intent.js';
 
 const GOALS_DIR = path.join(BASE_DIR, 'goals');
 
+/**
+ * Align-then-execute guidance (the "intelligence" pillar of the converse →
+ * preview → execute loop). Artifact-AGNOSTIC by design: it must NOT encode a
+ * domain taxonomy (no draft-vs-send / email-specific verbs) — preview and
+ * execute are the same machinery at two altitudes for ANY artifact. Exported so
+ * a guard test can assert it stays present and taxonomy-free.
+ */
+export const EXECUTE_DIRECTIVE = 'ALIGN, THEN ACT IN THE SAME TURN. Once the user greenlights an agreed action ("go ahead", "do it", "let\'s get them ready", "make it happen"), CARRY IT OUT this turn using your tools and report the real result. Do NOT reply with a future-tense plan ("I\'ll prep those next", "going to put that together") and stop — a turn that promises work but produces no artifact is a failure. Either produce the actual result now, or, if something genuinely blocks you, name the SPECIFIC blocker and do the part you can. When the user asks to PREVIEW or "show me what you\'d make", produce a real representative SAMPLE of the actual output (one concrete example, not a description of it), then produce the full thing on their go-ahead. Same shape for ANY artifact — a report, a file, a dataset, a batch of messages.';
+
 function section(title: string, body?: string): string {
   if (!body?.trim()) return '';
   return `## ${title}\n${body.trim()}`;
@@ -252,6 +261,7 @@ export function buildAssistantInstructions(context: MemoryContext, channel?: str
   const contextDiscipline = 'Treat the memory and continuity blocks below as private context, not content to recite. Greetings and lightweight check-ins get a one- or two-line reply, no recap. Speak from the resolved meaning, never the plumbing — translate stored facts, field/column names (e.g. `Market_Leader__c`), and internal labels ("current focus", "boundary", "scope filter") into plain business language ("accounts that aren\'t market leaders yet"), and never narrate your own process or safety steps ("confirming before I write", "for approval, not send"). Field names and slugs belong only inside a concrete data-operation you are describing, never in conversation.';
   const toolBehavior = 'Tools have real schemas. Just call them when the work fits. The runtime classifies each call (read/write/execute/send/admin) and applies the trust gradient automatically — do not pre-ask "want me to proceed?" for reads or for actions inside the user\'s current scope policy. If a call fails, report the real error and propose a fix.';
   const clarify = 'Ask ONE clarifying question only when two interpretations lead to materially different work AND guessing wrong means redoing it. Otherwise pick the obvious option, mention it, and proceed. Never re-ask a clarification the user already answered ("yes", "go ahead", "default is fine") — act on the answer.';
+  const executeDirective = EXECUTE_DIRECTIVE;
   const capture = 'Persist durable signals as they appear: `memory_remember` for facts/preferences that should carry across sessions; `user_profile_update` for how-to-communicate preferences (tone, timezone, hours, addressing); `propose_check_in_template` for recurring rhythms the user describes ("every Friday I deploy"). When the user names a concrete target for a pending action — a list/sheet/doc, a recipient set, a count, an "only these" scope — that you must hold across a long conversation (e.g. while drafting the email copy), pin it with `active_task`; when you execute, act on THAT pinned target — pull from its exact reference, do not re-discover or search for a list — and `active_task` action:"clear" once it is done. Don\'t announce these writes; behave better next turn.';
   const handoffs = [
     'You orchestrate sub-agents. Hand off when the work fits a specialist:',
@@ -272,7 +282,7 @@ export function buildAssistantInstructions(context: MemoryContext, channel?: str
   const standingFacts = renderFactsForInstructions(12, 800, undefined, 'pinned');
 
   const tier1 = [
-    identityVoice, contextDiscipline, toolBehavior, clarify, capture, handoffs, planner, focus, reportBack,
+    identityVoice, contextDiscipline, toolBehavior, clarify, executeDirective, capture, handoffs, planner, focus, reportBack,
     channelDirective, actionDirective, userPreferences, standingFacts, proposalFeedback,
     identity, soul, longTermMemory, connectedTools,
   ];
@@ -288,7 +298,7 @@ export function buildAssistantInstructions(context: MemoryContext, channel?: str
   const persistentFacts = section('Persistent Facts', renderFactsForInstructions(12, 1600, getRecallObjective(message)));
   const dataLandscape = section('Data Landscape', renderSourceMapForContext(24, undefined, getRecallObjective(message)));
   return [
-    identityVoice, contextDiscipline, toolBehavior, clarify, capture, handoffs, planner, focus, reportBack,
+    identityVoice, contextDiscipline, toolBehavior, clarify, executeDirective, capture, handoffs, planner, focus, reportBack,
     channelDirective, actionDirective,
     userPreferences,
     persistentFacts,

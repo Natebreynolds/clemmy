@@ -4,11 +4,62 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { filterMcpToolsForScope } from './mcp-tool-filter.js';
-import { resolveMcpToolScope } from './mcp-tool-scope.js';
+import { resolveMcpToolScope, resolveMcpToolScopeWithContinuity, isToolScopeContinuation } from './mcp-tool-scope.js';
 
 function tool(name: string, description = ''): any {
   return { name, description, inputSchema: { type: 'object', properties: {} } };
 }
+
+// ── Continuity-aware scope (the "chatbot feel" fix) ──────────────────────────
+
+test('isToolScopeContinuation: confirmations/go-aheads are continuations; fresh topics are not', () => {
+  for (const c of ["let's get them ready", 'go ahead', 'do it', "yes that's perfect", 'make that thing happen', 'show me', 'now go off and get all the data and make it happen']) {
+    assert.equal(isToolScopeContinuation(c), true, `should be continuation: ${c}`);
+  }
+  for (const f of ['what is the weather tomorrow', 'summarize our chat', 'who won the game']) {
+    assert.equal(isToolScopeContinuation(f), false, `should NOT be continuation: ${f}`);
+  }
+});
+
+test('resolveMcpToolScopeWithContinuity: a bare confirmation inherits the prior turn\'s tool scope (the incident)', () => {
+  // On main, "let's get them ready" → maxTools:0 (no keyword). With the prior
+  // turn's Outlook-intent input available, it inherits the Outlook scope.
+  const inherited = resolveMcpToolScopeWithContinuity({
+    userInput: "let's get them ready",
+    priorUserInputs: ['draft the outlook emails to the 44 contacts'],
+  });
+  assert.ok((inherited.maxTools ?? 0) > 0, 'inherits a concrete tool scope');
+  assert.ok((inherited.allowedServerSlugs ?? []).some((s) => /outlook|microsoft/.test(s)), 'inherits Outlook servers');
+  assert.match(inherited.reason, /continuity/);
+  // Proof it fails on main: the direct resolve of the same confirmation is empty.
+  assert.equal(resolveMcpToolScope({ userInput: "let's get them ready" }).maxTools, 0);
+});
+
+test('resolveMcpToolScopeWithContinuity: a FRESH-intent turn ignores prior scope (no over-inherit)', () => {
+  const scope = resolveMcpToolScopeWithContinuity({
+    userInput: 'run a fresh SEO audit of acme.com',
+    priorUserInputs: ['draft the outlook emails'],
+  });
+  // Current turn has its own intent → SEO scope, NOT the inherited Outlook one.
+  assert.ok((scope.allowedServerSlugs ?? []).includes('dataforseo'));
+  assert.ok(!(scope.allowedServerSlugs ?? []).some((s) => /outlook/.test(s)));
+});
+
+test('resolveMcpToolScopeWithContinuity: a non-continuation keyword-less turn stays empty (no inherit)', () => {
+  const scope = resolveMcpToolScopeWithContinuity({
+    userInput: 'summarize what we discussed',
+    priorUserInputs: ['draft the outlook emails'],
+  });
+  assert.equal(scope.maxTools, 0);
+});
+
+test('resolveMcpToolScopeWithContinuity: nothing concrete to inherit → unchanged (fail-safe)', () => {
+  const scope = resolveMcpToolScopeWithContinuity({
+    userInput: 'go ahead',
+    priorUserInputs: ['just chatting', 'thanks'],
+  });
+  assert.equal(scope.maxTools, 0);
+});
 
 test('resolveMcpToolScope: local/file prompts do not inject external MCP tools', () => {
   const scope = resolveMcpToolScope({ userInput: 'write a local markdown file with a project checklist' });

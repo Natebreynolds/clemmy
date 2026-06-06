@@ -38,6 +38,14 @@ export interface ObjectiveJudgeGateInput {
   maxContinuations: number;
   /** The orchestrator's self-declared next action. */
   nextAction: string;
+  /**
+   * The reply is a future-tense PROMISE of work ("I'll prep them…", "let me go
+   * build that") with no evidence of an actual artifact/result. These are the
+   * turns that look low-effort (non-action intent, few tool calls) and so used
+   * to skip the judge — exactly the "chatbot" shape where Clem narrates intent
+   * and marks itself done. Computed at the callsite from the reply text.
+   */
+  promiseShaped?: boolean;
 }
 
 /**
@@ -49,14 +57,40 @@ export interface ObjectiveJudgeGateInput {
  * lookup but is multi-step action). The intent branch keeps the cheap path for
  * a clearly-phrased ACTION objective. A trivial lookup ("what's on my
  * calendar") stays below the work threshold and is never judged.
+ *
+ * PLUS: a PROMISE-SHAPED reply (future-tense intent, no artifact) is always
+ * judged even when it looks low-effort — that is the precise turn where the
+ * model says "I'll do that next" and completes without doing it. The judge's
+ * own rubric rejects "a promise or plan", so running it forces a real artifact
+ * or an honest blocker. Fail-open + bounded by maxContinuations, so a false
+ * positive costs one cheap judge call, never a wedge.
  */
 export function shouldRunObjectiveJudge(input: ObjectiveJudgeGateInput): boolean {
   return (
     input.optIn &&
     input.nextAction === 'completed' &&
     input.continuationsUsed < input.maxContinuations &&
-    (input.actionIntent || input.totalToolCalls >= input.workThreshold)
+    (input.actionIntent || input.totalToolCalls >= input.workThreshold || Boolean(input.promiseShaped))
   );
+}
+
+/**
+ * Detect a future-tense PROMISE of work with no evidence of a produced artifact.
+ * Pure + exported for tests. Future/deferral phrasing ("I'll…", "let me…",
+ * "going to…", "let's…") with NO completion/artifact marker ("done", "created",
+ * a URL, a path, "here's…"). The artifact whitelist suppresses false positives
+ * on turns that actually delivered something. English-only (a backstop after the
+ * existing observed-work gate, not the primary signal).
+ */
+const PROMISE_PHRASE_RE =
+  /\b(?:i'?ll|i will|i'?m going to|i am going to|going to|about to|let me|let'?s|i can (?:now )?(?:go|start|begin|prep|put together|pull)|once you|next i'?ll|then i'?ll|i'?ll go (?:ahead|and))\b/i;
+const ARTIFACT_EVIDENCE_RE =
+  /\b(?:done|completed|finished|created|drafted|generated|saved|wrote|written|sent|posted|updated|added|attached|here'?s|here is|i'?ve (?:created|drafted|saved|sent|added|updated|built|put together)|https?:\/\/|\/[\w.-]+\/)/i;
+
+export function isPromiseShapedReply(reply?: string | null): boolean {
+  const text = (reply ?? '').trim();
+  if (!text) return false;
+  return PROMISE_PHRASE_RE.test(text) && !ARTIFACT_EVIDENCE_RE.test(text);
 }
 
 /** Optional skill-execution rubric: the skills loaded this session + compact

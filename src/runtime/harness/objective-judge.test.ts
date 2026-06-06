@@ -7,7 +7,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { buildObjectiveJudgePrompt, judgeObjectiveComplete, shouldRunObjectiveJudge } = await import('./objective-judge.js');
+const { buildObjectiveJudgePrompt, judgeObjectiveComplete, shouldRunObjectiveJudge, isPromiseShapedReply } = await import('./objective-judge.js');
 
 const baseGate = {
   optIn: true,
@@ -43,6 +43,43 @@ test('gate: does NOT fire once the continuation budget is exhausted', () => {
 
 test('gate: does NOT fire when nextAction is not completed (e.g. awaiting approval)', () => {
   assert.equal(shouldRunObjectiveJudge({ ...baseGate, actionIntent: true, nextAction: 'awaiting_approval' }), false);
+});
+
+// ── Promise-shaped completion (the "I'll do that next" chatbot turn) ──────────
+
+test('gate: FIRES for a promise-shaped reply even when it looks low-effort (the incident)', () => {
+  // The exact shape that slipped through: non-action intent, 1 tool call, done.
+  assert.equal(
+    shouldRunObjectiveJudge({ ...baseGate, actionIntent: false, totalToolCalls: 1, promiseShaped: true }),
+    true,
+  );
+  // Without the promise signal, the same low-effort turn is NOT judged (unchanged).
+  assert.equal(
+    shouldRunObjectiveJudge({ ...baseGate, actionIntent: false, totalToolCalls: 1, promiseShaped: false }),
+    false,
+  );
+});
+
+test('isPromiseShapedReply: future-tense promise with no artifact → true', () => {
+  for (const p of [
+    "Got it. I'll prep them as review-ready drafts, not send them yet.",
+    'Going to put that report together for you.',
+    "Let me go pull all the data and build the file.",
+  ]) {
+    assert.equal(isPromiseShapedReply(p), true, `promise: ${p}`);
+  }
+});
+
+test('isPromiseShapedReply: a real artifact/result suppresses the promise signal → false', () => {
+  for (const r of [
+    "Done — created the sheet: https://example.com/s/123",
+    "Here's the summary of all 44 records.",
+    "I've drafted the report and saved it to /tmp/out.html",
+    'Found 5 accounts matching your filter.',
+    '', // empty
+  ]) {
+    assert.equal(isPromiseShapedReply(r), false, `not a bare promise: ${r}`);
+  }
 });
 
 test('buildObjectiveJudgePrompt includes the objective and the assistant response', () => {

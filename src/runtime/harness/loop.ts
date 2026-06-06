@@ -33,7 +33,7 @@ import {
   predictTurnCost,
 } from './budget.js';
 import { MODELS } from '../../config.js';
-import { judgeObjectiveComplete, shouldRunObjectiveJudge, type ObjectiveJudgeFn } from './objective-judge.js';
+import { judgeObjectiveComplete, shouldRunObjectiveJudge, isPromiseShapedReply, type ObjectiveJudgeFn } from './objective-judge.js';
 import { gatherSessionSkills, summarizeToolCallsForJudge } from './skill-execution.js';
 import { classifyMessageIntent } from '../../assistant/message-intent.js';
 import { attachEventLogHooks, extractSessionIdFromContext, type RunHooksLike } from './hooks.js';
@@ -1453,6 +1453,10 @@ async function runConversationCore(
           continuationsUsed: objectiveJudgeContinuations,
           maxContinuations: MAX_OBJECTIVE_JUDGE_CONTINUATIONS,
           nextAction: decision.nextAction,
+          // Catch the "I'll do that next" turn that looks low-effort but promised
+          // work and never produced it — the chatbot shape. The judge then forces
+          // a real artifact or an honest blocker.
+          promiseShaped: isPromiseShapedReply(decision.reply || decision.summary),
         })
       ) {
         const responseText = decision.reply && decision.reply.trim() ? decision.reply : decision.summary;

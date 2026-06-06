@@ -24,7 +24,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { z } from 'zod';
 
-const { resetEventLog, createSession, listEvents } = await import('../runtime/harness/eventlog.js');
+const { resetEventLog, createSession, listEvents, appendEvent } = await import('../runtime/harness/eventlog.js');
 const { getPlanScope } = await import('./plan-scope.js');
 const { saveProactivityPolicy } = await import('./proactivity-policy.js');
 const {
@@ -32,7 +32,9 @@ const {
   OrchestratorDecisionSchema,
   buildRequestApprovalTool,
   buildAskUserQuestionTool,
+  recentPriorUserInputsForScope,
 } = await import('./orchestrator.js');
+const { resolveMcpToolScopeWithContinuity } = await import('../runtime/mcp-tool-scope.js');
 
 test.after(() => {
   try {
@@ -499,6 +501,54 @@ test('deliberation tools no-op silently when no sessionId is on the context', as
     {},
   );
   assert.match(result, /Question posted/);
+});
+
+// ─── Continuity-aware tool scope: the orchestrator reads prior turns from the
+// eventlog so a keyword-less confirmation inherits the active scope (the
+// verified "chatbot feel" incident: every iteration turn dropped the tools). ───
+
+function seedUserInput(sessionId: string, turn: number, text: string): void {
+  appendEvent({ sessionId, turn, role: 'user', type: 'user_input_received', data: { text } });
+}
+
+test('recentPriorUserInputsForScope: returns prior turns newest-first, excluding the current input', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat', channel: 'discord' });
+  seedUserInput(sess.id, 1, 'draft the outlook emails to the 44 contacts');
+  seedUserInput(sess.id, 2, 'make the tone a bit more playful');
+  seedUserInput(sess.id, 3, "let's get them ready"); // the current turn
+  const prior = recentPriorUserInputsForScope(sess.id, "let's get them ready");
+  assert.equal(prior.includes("let's get them ready"), false, 'excludes the current turn');
+  assert.deepEqual(prior, ['make the tone a bit more playful', 'draft the outlook emails to the 44 contacts']);
+});
+
+test('continuity end-to-end: a bare confirmation inherits the active Outlook scope from the eventlog (the incident)', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat', channel: 'discord' });
+  seedUserInput(sess.id, 1, 'draft the outlook emails to the 44 contacts'); // had tool intent
+  seedUserInput(sess.id, 2, "let's get them ready"); // keyword-less confirmation
+  const prior = recentPriorUserInputsForScope(sess.id, "let's get them ready");
+  const scope = resolveMcpToolScopeWithContinuity({ userInput: "let's get them ready", priorUserInputs: prior });
+  assert.ok((scope.maxTools ?? 0) > 0, 'tools are no longer stripped on the confirmation turn');
+  assert.ok((scope.allowedServerSlugs ?? []).some((s) => /outlook|microsoft/.test(s)));
+  assert.match(scope.reason, /continuity/);
+});
+
+test('continuity cross-session: a NEW session inherits scope via the continuation lineage', () => {
+  resetEventLog();
+  const prior = createSession({ kind: 'chat', channel: 'discord' });
+  seedUserInput(prior.id, 1, 'draft the outlook emails to the 44 contacts');
+  const current = createSession({ kind: 'chat', channel: 'discord' });
+  // This session has only a keyword-less turn, but it continues the prior one.
+  appendEvent({
+    sessionId: current.id, turn: 0, role: 'system', type: 'cross_session_prefix',
+    data: { priorSessionIds: [prior.id], sessionsIncluded: 1, totalChars: 0, text: '' },
+  });
+  seedUserInput(current.id, 1, "let's get them ready");
+  const inherited = recentPriorUserInputsForScope(current.id, "let's get them ready");
+  assert.ok(inherited.includes('draft the outlook emails to the 44 contacts'), 'walks the lineage when this session has no prior intent');
+  const scope = resolveMcpToolScopeWithContinuity({ userInput: "let's get them ready", priorUserInputs: inherited });
+  assert.ok((scope.allowedServerSlugs ?? []).some((s) => /outlook|microsoft/.test(s)));
 });
 
 test('OrchestratorDecision: nextAction enum covers the harness states the loop expects', () => {
