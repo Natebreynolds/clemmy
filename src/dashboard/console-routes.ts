@@ -5459,6 +5459,130 @@ export function registerConsoleRoutes(
         })),
       ].slice(0, 6).map((item) => ({ ...item, title: trimConsoleTitle(item.title, 120), meta: trimConsoleTitle(item.meta || '', 100) }));
 
+      // ── Inbox feed from the notifications store ──────────────────────────
+      // The notifications store is the canonical log of everything Clem has
+      // REPORTED BACK: workflow/task completions, notify_user reports, blocked
+      // runs, and system alerts. The task/exec/run sources above MISS scheduled
+      // workflow report-backs (e.g. the hourly Outlook triage), so completed
+      // work was silently absent from Home. Fold the store in here. Drop
+      // lifecycle noise: silent records + "still running" heartbeats. (This is
+      // the first slice of the unified inbox; the full panel + read/unread +
+      // not-delivered backstop builds on this same feed.)
+      const rawNotifs = listNotifications(300);
+      const inboxNotifs = rawNotifs.filter(
+        (notification) => !notification.silent && notification.metadata?.heartbeat !== true,
+      );
+      const notifFirstLine = (body: string): string =>
+        (body || '')
+          .split('\n')
+          .map((line) => line.trim())
+          .find((line) => line && !line.startsWith('#') && !/^[{}\[\]\-=*`>|"',:]+$/.test(line)) || '';
+      const isNeedsAttentionNotif = (notification: { title: string; metadata?: Record<string, unknown> }): boolean =>
+        notification.metadata?.needsAttention === true ||
+        Boolean(notification.metadata?.proposedFixId) ||
+        /\bblocked\b|needs attention|needs input|couldn['’]t finish|action required/i.test(notification.title);
+      // Collapse the generic "Workflow completed/needs attention: <name>"
+      // echo when a richer notify_user report already covers the same run —
+      // otherwise every run double-reports (the clutter the inbox must avoid).
+      const reportedRunIds = new Set(
+        inboxNotifs
+          .filter((notification) => notification.metadata?.source === 'notify_user_tool')
+          .map((notification) => String(notification.metadata?.workflowRunId || notification.metadata?.runId || ''))
+          .filter(Boolean),
+      );
+      const isGenericWorkflowEcho = (notification: { title: string; metadata?: Record<string, unknown> }): boolean =>
+        notification.metadata?.source !== 'notify_user_tool' &&
+        /workflow (completed|needs attention|still running)/i.test(notification.title) &&
+        reportedRunIds.has(String(notification.metadata?.runId || notification.metadata?.workflowRunId || ''));
+      const dedupeByTitle = <T extends { title: string }>(items: T[], cap: number): T[] => {
+        const seen = new Set<string>();
+        const out: T[] = [];
+        for (const item of items) {
+          const key = (item.title || '').toLowerCase().trim();
+          if (!key || seen.has(key)) continue;
+          seen.add(key);
+          out.push(item);
+          if (out.length >= cap) break;
+        }
+        return out;
+      };
+      // Collapse one ITEM PER WORKFLOW (latest state), across both the
+      // generic "Workflow …" echoes and the richer notify_user reports.
+      // Build runId → workflow from notifications that carry both, so a
+      // notify_user report (which lacks a workflow field) can still be keyed
+      // to its workflow and deduped against that workflow's other rows.
+      const runIdToWorkflow = new Map<string, string>();
+      for (const notification of rawNotifs) {
+        const runId = String(notification.metadata?.runId || notification.metadata?.workflowRunId || '');
+        const workflowName = typeof notification.metadata?.workflow === 'string' ? notification.metadata.workflow : '';
+        if (runId && workflowName) runIdToWorkflow.set(runId, workflowName);
+      }
+      const workflowKeyOf = (notification: { metadata?: Record<string, unknown> }): string => {
+        const workflowName = typeof notification.metadata?.workflow === 'string' ? notification.metadata.workflow : '';
+        if (workflowName) return 'wf:' + workflowName.toLowerCase();
+        const runId = String(notification.metadata?.workflowRunId || notification.metadata?.runId || '');
+        const mapped = runId ? runIdToWorkflow.get(runId) : '';
+        return mapped ? 'wf:' + mapped.toLowerCase() : '';
+      };
+      const isReportNotif = (notification: { metadata?: Record<string, unknown> }): boolean =>
+        notification.metadata?.source === 'notify_user_tool';
+      // Keep one per workflow: richest report first, then newest. Items with
+      // no workflow association fall back to title dedup. Restore newest-first
+      // order for display.
+      const dedupeByWorkflow = <T extends { title: string; createdAt: string; metadata?: Record<string, unknown> }>(items: T[], cap: number): T[] => {
+        const ordered = [...items].sort((a, b) => {
+          const ra = isReportNotif(a) ? 1 : 0;
+          const rb = isReportNotif(b) ? 1 : 0;
+          if (ra !== rb) return rb - ra;
+          return b.createdAt.localeCompare(a.createdAt);
+        });
+        const seenWorkflow = new Set<string>();
+        const seenTitle = new Set<string>();
+        const out: T[] = [];
+        for (const notification of ordered) {
+          const workflowKey = workflowKeyOf(notification);
+          const titleKey = notification.title.toLowerCase().trim();
+          // Collapse if EITHER the workflow OR the exact title was already
+          // seen — handles the dual-notification styles (generic echo vs
+          // notify_user report) and repeated same-title runs in one pass.
+          if ((workflowKey && seenWorkflow.has(workflowKey)) || seenTitle.has(titleKey)) continue;
+          if (workflowKey) seenWorkflow.add(workflowKey);
+          seenTitle.add(titleKey);
+          out.push(notification);
+          if (out.length >= cap) break;
+        }
+        return out.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+      };
+      const notifNeedsYou = dedupeByWorkflow(
+        inboxNotifs.filter((notification) => isNeedsAttentionNotif(notification) && !isGenericWorkflowEcho(notification)),
+        6,
+      ).map((notification) => ({
+        kind: 'workflow',
+        title: trimConsoleTitle(stripConsoleIds(notification.title.replace(/^[⚠️️\s]+/, '')), 140),
+        meta: trimConsoleTitle([notification.createdAt.slice(11, 16), notifFirstLine(notification.body)].filter(Boolean).join(' · '), 100),
+        panel: 'activity',
+        urgency: 'high',
+        notifId: notification.id,
+      }));
+      const notifRecent = dedupeByWorkflow(
+        inboxNotifs.filter((notification) => !isNeedsAttentionNotif(notification) && !isGenericWorkflowEcho(notification)),
+        12,
+      ).map((notification) => {
+        const undelivered = !notification.deliveredAt && (Boolean(notification.deliveryError) || (notification.deliveryAttempts || 0) > 0);
+        return {
+          kind: undelivered ? 'exec' : 'done',
+          title: trimConsoleTitle(stripConsoleIds(notification.title.replace(/^[✓✅\s]+/, '')), 120),
+          meta: trimConsoleTitle([notification.createdAt.slice(11, 16), undelivered ? 'NOT DELIVERED' : '', notifFirstLine(notification.body)].filter(Boolean).join(' · '), 120),
+          panel: 'activity',
+          notifId: notification.id,
+          read: notification.read,
+        };
+      });
+      // Notifications LEAD (they hold the real report-backs), then the
+      // task/exec/run completions; deduped by title, capped for the rail.
+      const recentMerged = dedupeByTitle([...notifRecent, ...recentCompleted], 8);
+      const needsYouMerged = [...needsYou, ...notifNeedsYou];
+
       const credentialRows = credentialHealth
         .filter((row) => ['openai_api_key', 'discord_bot_token', 'composio_api_key', 'recall_api_key', 'browser_use_api_key', 'codex_oauth_access_token', 'codex_oauth_refresh_token'].includes(row.name))
         .map((row) => ({
@@ -5491,9 +5615,9 @@ export function registerConsoleRoutes(
       // sessions + workflow runs/executions only. Background tasks and
       // legacy channel runs have their own surfaces.
       const activeCount = workingNow.length;
-      const waitingCount = needsYou.length;
+      const waitingCount = needsYouMerged.length;
       const currentObjective = workingNow[0]?.title
-        ?? needsYou[0]?.title
+        ?? needsYouMerged[0]?.title
         ?? (memoryWarnings.length ? 'Memory needs attention before the graph is fully trustworthy.' : 'Standing by for the next useful task.');
 
       res.json({
@@ -5517,9 +5641,9 @@ export function registerConsoleRoutes(
           backgroundActive: activeBackgroundTasks.length,
           requiredSetupMissing: requiredMissing,
         },
-        needsYou,
+        needsYou: needsYouMerged,
         workingNow,
-        recentCompleted,
+        recentCompleted: recentMerged,
         memory: {
           chunks: memory.chunks,
           indexedFiles: memory.indexedFiles,

@@ -3222,7 +3222,10 @@ body {
    competing boxes. */
 .home-main-left {
   display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr);
+  /* NEEDS YOU and RECENT each get a scrollable half so neither can push the
+     other off-screen (a long NEEDS-YOU list must never hide completed work).
+     WORKING NOW sits compact between them. */
+  grid-template-rows: minmax(0, 1fr) auto minmax(0, 1fr);
   gap: 0;
   min-height: 0;
   border: 1px solid var(--line);
