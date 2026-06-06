@@ -3603,6 +3603,7 @@ body {
   padding: 10px 14px; margin-bottom: 12px; cursor: pointer;
   transition: background 120ms;
 }
+.home-goal-banner[hidden] { display: none; }
 .home-goal-banner:hover { background: color-mix(in srgb, var(--accent) 14%, var(--bg-2)); }
 .home-goal-banner.paused { border-color: var(--accent-warn); background: color-mix(in srgb, var(--accent-warn) 8%, var(--bg-2)); }
 .home-goal-row { display: flex; align-items: baseline; gap: 12px; }

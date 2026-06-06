@@ -470,6 +470,32 @@ function trimConsoleTitle(text: string, max = 120): string {
   return clean.length > max ? clean.slice(0, Math.max(0, max - 1)) + '…' : clean;
 }
 
+/** Strip internal id tokens (bg-…, run-bg-…, recall-…, sess-…, UUIDs) from
+ *  a user-facing string so the Home cards read cleanly instead of dumping
+ *  raw task/run ids. */
+function stripConsoleIds(text: string): string {
+  return (text || '')
+    .replace(/\b(?:run-bg|run|bg|recall|sess|apr|sched|task|exec)[-_][A-Za-z0-9][A-Za-z0-9_-]{3,}/gi, '')
+    .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, '')
+    .replace(/\s*[:·|-]\s*$/g, '')
+    .replace(/^\s*[:·|-]\s*/g, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
+/** Short relative age ("just now", "12m ago", "3h ago") from an ISO time. */
+function relAge(iso?: string | null): string {
+  if (!iso) return '';
+  const ms = Date.now() - Date.parse(iso);
+  if (!Number.isFinite(ms) || ms < 0) return '';
+  const m = Math.floor(ms / 60000);
+  if (m < 1) return 'just now';
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.floor(h / 24)}d ago`;
+}
+
 interface ApprovalPreviewSample {
   label?: string;
   value?: string;
@@ -5215,7 +5241,11 @@ export function registerConsoleRoutes(
         if (task.status === 'awaiting_approval') {
           return task.pendingApprovalId ? pendingApprovalIds.has(task.pendingApprovalId) : true;
         }
-        return task.status === 'pending' || task.status === 'running' || task.status === 'interrupted';
+        // WORKING NOW = genuinely active only. 'interrupted' tasks are
+        // stalled (often zombie tasks from a daemon restart) — they were
+        // cluttering Home as fake active work; they remain visible in
+        // Activity for resume/clear.
+        return task.status === 'pending' || task.status === 'running';
       });
       const backgroundTaskByApprovalId = new Map(
         backgroundTasks
@@ -5331,7 +5361,11 @@ export function registerConsoleRoutes(
           panel: 'approvals',
           urgency: 'high',
         })),
-      ].map((item) => ({ ...item, title: trimConsoleTitle(item.title, 140) }));
+      ].map((item) => ({
+        ...item,
+        title: trimConsoleTitle(stripConsoleIds(item.title), 140),
+        meta: trimConsoleTitle(stripConsoleIds((item as { meta?: string }).meta || ''), 100),
+      }));
 
       // WORKING NOW shows anything the daemon has accepted as active
       // or queued work. A plan-approved background task can sit
@@ -5346,26 +5380,36 @@ export function registerConsoleRoutes(
           const summary = runtimeApproval
             ? approvalSummaryFromArgs(args, summarizeApprovalAction(runtimeApproval))
             : task.title;
+          // Clean meta: a short check-in line (ids stripped) or a relative
+          // age — never the raw bg-… id.
+          const checkin = task.lastCheckInMessage ? stripConsoleIds(task.lastCheckInMessage) : '';
+          const age = relAge(task.lastCheckInAt || task.startedAt || task.updatedAt);
           return {
             kind: task.status === 'pending' ? 'queued' : task.status,
             title: task.status === 'awaiting_approval'
-              ? `Waiting for approval: ${summary}`
-              : task.title,
-            meta: task.lastCheckInMessage
-              ? `${task.id} · ${task.lastCheckInMessage}`
-              : `${task.id} · ${task.status}`,
+              ? `Waiting for approval: ${stripConsoleIds(summary)}`
+              : stripConsoleIds(task.title),
+            meta: checkin || age || (task.status === 'pending' ? 'queued' : 'running'),
             panel: task.status === 'awaiting_approval' ? 'approvals' : 'activity',
             approvalKind: runtimeApproval ? 'runtime' : undefined,
             approvalId: runtimeApproval?.id,
           };
         }),
-        ...pendingWorkflowRuns.map((run) => {
+        ...pendingWorkflowRuns.filter((run) => {
+          // Drop stale "in-flight" runs — the daemon keeps trying to resume
+          // runs that stalled days ago; those are not "working now". Keep a
+          // run only if it has progressed within the last 2 hours (or has
+          // no event yet — freshly queued).
+          if (!run.lastEventAt) return true;
+          const t = Date.parse(run.lastEventAt);
+          return Number.isFinite(t) && (Date.now() - t) < 2 * 60 * 60 * 1000;
+        }).map((run) => {
           const workflow = readWorkflow(run.workflowName);
           const title = workflow?.data?.name ?? run.workflowName;
           return {
             kind: 'workflow',
-            title: run.inFlightStepId ? `${title} · ${run.inFlightStepId}` : title,
-            meta: `run ${run.runId}${run.lastEventAt ? ` · ${run.lastEventAt.slice(11, 16)}` : ''}`,
+            title: run.inFlightStepId ? `${title} · ${run.inFlightStepId.replace(/_/g, ' ')}` : title,
+            meta: run.lastEventAt ? relAge(run.lastEventAt) || 'running' : 'running',
             panel: 'workflows',
             actionKind: 'workflow-run',
             workflowName: run.workflowName,
@@ -5391,18 +5435,18 @@ export function registerConsoleRoutes(
       const recentCompleted = [
         ...backgroundTasks.filter((task) => task.status === 'done').slice(0, 5).map((task) => ({
           kind: 'done',
-          title: task.title,
+          title: stripConsoleIds(task.title),
           meta: task.result
-            ? trimConsoleTitle(task.result.replace(/^#+\s*/gm, '').split('\n').find((line) => line.trim() && !line.includes('/Users/')) || task.result, 120)
-            : task.completedAt ? `done ${task.completedAt.slice(11, 16)}` : task.id,
+            ? stripConsoleIds(trimConsoleTitle(task.result.replace(/^#+\s*/gm, '').split('\n').find((line) => line.trim() && !line.includes('/Users/')) || task.result, 120))
+            : relAge(task.completedAt) || 'done',
           panel: 'activity',
           actionKind: 'background-task',
           taskId: task.id,
         })),
         ...runs.filter((run) => run.status === 'completed').slice(0, 5).map((run) => ({
           kind: 'done',
-          title: run.title || run.input || run.id,
-          meta: run.completedAt ? `done ${run.completedAt.slice(11, 16)}` : run.id,
+          title: stripConsoleIds(run.title || run.input || 'Completed run'),
+          meta: relAge(run.completedAt) || 'done',
           panel: 'activity',
           targetRunId: run.id,
         })),
