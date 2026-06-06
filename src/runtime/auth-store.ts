@@ -2,8 +2,7 @@ import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, rm
 import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { spawn, spawnSync } from 'node:child_process';
-import { AUTH_MODE, BASE_DIR, CODEX_EXECUTABLE, CODEX_INSTALL_PACKAGE, getOpenAiApiKey, getRuntimeEnv } from '../config.js';
+import { AUTH_MODE, BASE_DIR, getOpenAiApiKey, getRuntimeEnv } from '../config.js';
 import type { AuthStatus } from '../types.js';
 import { loginWithNativeCodexOAuth, refreshNativeCodexTokens, startCodexDeviceAuth, pollCodexDeviceAuth } from './codex-native-oauth.js';
 import type { NativeCodexTokenSet } from './codex-native-oauth.js';
@@ -294,6 +293,11 @@ function loadLocalAuthState(): LocalAuthState {
 }
 
 export function getStoredCodexOAuthTokens(): StoredCodexOAuthTokens | null {
+  // VAULT ONLY. Clementine never runs off ~/.codex/auth.json (the Codex CLI's
+  // file). Reading it as a fallback coupled Clem to the CLI's rotating token
+  // family, so a `codex logout` or a concurrent `codex` run revoked Clem too —
+  // the dominant "keeps getting logged out" trap. Clem owns its OWN grant
+  // (native loopback or device-code login); the CLI file is no longer read.
   const local = loadLocalAuthState();
   if (local.codexOauth?.accessToken && local.codexOauth?.refreshToken) {
     return {
@@ -304,18 +308,6 @@ export function getStoredCodexOAuthTokens(): StoredCodexOAuthTokens | null {
       lastRefresh: local.codexOauth.lastRefresh,
     };
   }
-
-  const cli = loadCodexCliAuth();
-  if (cli?.tokens?.access_token && cli.tokens.refresh_token) {
-    return {
-      accessToken: cli.tokens.access_token,
-      refreshToken: cli.tokens.refresh_token,
-      idToken: cli.tokens.id_token,
-      accountId: cli.tokens.account_id,
-      lastRefresh: cli.last_refresh,
-    };
-  }
-
   return null;
 }
 
@@ -354,6 +346,8 @@ function getCodexBootstrapState(sourceFile = getCodexAuthSourceFile()): CodexBoo
 
 export function getCodexBootstrapAvailability(sourceFile = getCodexAuthSourceFile()): CodexBootstrapAvailability {
   const state = getCodexBootstrapState(sourceFile);
+  // VAULT ONLY — a present ~/.codex/auth.json no longer counts as "available".
+  // Clem must hold its own independent grant; an external CLI sign-in is not it.
   if (state.localCodex?.accessToken && state.localCodex?.refreshToken) {
     return {
       available: true,
@@ -362,75 +356,19 @@ export function getCodexBootstrapAvailability(sourceFile = getCodexAuthSourceFil
       lastRefresh: state.localCodex.lastRefresh,
     };
   }
-  if (state.codexCli?.access_token && state.codexCli?.refresh_token) {
-    return {
-      available: true,
-      source: 'codex_cli',
-      accountId: state.codexCli.account_id,
-      lastRefresh: state.codexCliLastRefresh,
-    };
-  }
   return {
     available: false,
     source: 'none',
   };
 }
 
-export function isCodexCliAvailable(): boolean {
-  const result = spawnSync(CODEX_EXECUTABLE, ['--version'], {
-    stdio: 'ignore',
-    env: process.env,
-  });
-  return result.status === 0;
-}
-
-export function getCodexInstallHint(): string {
-  return `Install Codex first: npm install -g ${CODEX_INSTALL_PACKAGE}`;
-}
-
-// (writeCodexAuthFile removed) Clementine no longer mirrors its rotating token
-// into ~/.codex/auth.json — login + refresh persist to its OWN vault only, so a
-// separate `codex` CLI invocation can't consume/rotate the shared family and
-// trip reuse-detection (token_revoked). The CLI file is still READ as a one-time
-// import bootstrap (loadCodexCliAuth), never written.
-
-function runInteractiveCommand(command: string, args: string[]): Promise<boolean> {
-  return new Promise((resolve) => {
-    const child = spawn(command, args, {
-      stdio: 'inherit',
-      env: process.env,
-      shell: process.platform === 'win32',
-    });
-    child.on('error', () => resolve(false));
-    child.on('close', (code) => resolve(code === 0));
-  });
-}
-
-export async function installCodexCli(): Promise<{ ok: boolean; message: string }> {
-  // Fail fast and honestly when npm itself is missing. Without this the
-  // error surfaced to the user is "Failed to install Codex globally"
-  // with no hint that Node is the actual missing piece — observed on
-  // fresh Macs where Clementine was the user's first attempt at any
-  // Node-based tool.
-  const npmProbe = spawnSync('npm', ['--version'], { stdio: 'ignore', env: process.env });
-  if (npmProbe.status !== 0) {
-    return {
-      ok: false,
-      message: 'Cannot install Codex: npm is not on PATH. Install Node.js from https://nodejs.org (LTS is fine), reopen your terminal, then retry.',
-    };
-  }
-  const installed = await runInteractiveCommand('npm', ['install', '-g', CODEX_INSTALL_PACKAGE]);
-  if (!installed) {
-    return {
-      ok: false,
-      message: `Failed to install Codex globally. Try: npm install -g ${CODEX_INSTALL_PACKAGE}`,
-    };
-  }
-  return {
-    ok: true,
-    message: `Installed Codex globally from ${CODEX_INSTALL_PACKAGE}.`,
-  };
-}
+// Clementine no longer installs, runs, or reads-as-runtime the external `codex`
+// CLI. It never mirrors its rotating token into ~/.codex/auth.json, never auto-
+// installs the CLI, and never runs `codex login` — all of which coupled Clem to
+// the CLI's shared token family (a `codex logout` then signed Clem out). Clem
+// signs in independently via the loopback (login-native) or device-code
+// (login-device) flows. The CLI file is still READ once, on demand, ONLY by the
+// explicit `auth import-codex` migration command (importCodexCliAuth).
 
 export async function loginWithNativeOAuth(_sourceFile = getCodexAuthSourceFile()): Promise<{ ok: boolean; message: string }> {
   try {
@@ -680,35 +618,16 @@ async function doRefreshStoredNativeOAuth(_sourceFile: string, force = false): P
   }
 }
 
-export async function runCodexLogin(): Promise<{ ok: boolean; message: string }> {
-  if (!isCodexCliAvailable()) {
-    return {
-      ok: false,
-      message: `Codex CLI is not available on PATH. ${getCodexInstallHint()}`,
-    };
-  }
-  const loggedIn = await runInteractiveCommand(CODEX_EXECUTABLE, ['login']);
-  return {
-    ok: loggedIn,
-    message: loggedIn ? 'Codex login completed.' : 'Codex login did not complete successfully.',
-  };
-}
-
 export async function bootstrapCodexAuth(sourceFile = getCodexAuthSourceFile()): Promise<{ ok: boolean; message: string }> {
-  let state = getCodexBootstrapState(sourceFile);
+  const state = getCodexBootstrapState(sourceFile);
 
-  // 1. Clementine already holds its OWN grant in the vault → keep it. We must NEVER
-  //    downgrade to the CLI's shared token family below: that coupling is exactly what
-  //    lets a `codex logout` (which revokes the CLI's family server-side) revoke
-  //    Clementine too. A present CLI file is no longer a reason to skip / overwrite.
+  // 1. Clementine already holds its OWN grant in the vault → keep it.
   if (state.localCodex?.accessToken && state.localCodex?.refreshToken) {
     return { ok: true, message: 'Codex OAuth credentials are already stored in Clementine’s own vault.' };
   }
 
-  // 2. No vault grant yet. PREFER a fresh native login so Clementine gets an INDEPENDENT
-  //    token family (its own grant of the shared OAuth client), decoupled from the Codex
-  //    CLI's sign-in. Only interactive sessions can complete the browser flow; importing
-  //    the CLI's (shared) grant is a headless / native-failed fallback below.
+  // 2. No vault grant yet. An interactive TTY can complete the loopback browser
+  //    flow — Clem's own INDEPENDENT grant of the shared OAuth client.
   const interactive = Boolean(process.stdout?.isTTY);
   if (interactive) {
     const nativeLogin = await loginWithNativeOAuth(sourceFile);
@@ -717,33 +636,17 @@ export async function bootstrapCodexAuth(sourceFile = getCodexAuthSourceFile()):
     }
   }
 
-  // 3. Fallback: bootstrap through the Codex CLI and import its (shared) grant. The
-  //    resulting state is flagged `codexSharedWithCli` in `auth status` so the user
-  //    knows a `codex logout` will sign Clementine out, and how to decouple.
-  if (!isCodexCliAvailable()) {
-    const installResult = await installCodexCli();
-    if (!installResult.ok) {
-      return installResult;
-    }
-  }
-
-  state = getCodexBootstrapState(sourceFile);
-  if (!(state.codexCli?.access_token && state.codexCli?.refresh_token)) {
-    const loginResult = await runCodexLogin();
-    if (!loginResult.ok) {
-      return loginResult;
-    }
-    state = getCodexBootstrapState(sourceFile);
-  }
-
-  if (!(state.codexCli?.access_token && state.codexCli?.refresh_token)) {
-    return {
-      ok: false,
-      message: `Codex login finished, but no reusable credentials were found at ${sourceFile}.`,
-    };
-  }
-
-  return importCodexCliAuth(sourceFile);
+  // 3. Headless (or native-login failed) → DEVICE-CODE login. No browser, no
+  //    loopback, and crucially NO Codex CLI: Clem deliberately does NOT install,
+  //    run, or import from the `codex` CLI. That coupling (running off / importing
+  //    ~/.codex/auth.json) is exactly what let a `codex logout` or a concurrent
+  //    `codex` run sign Clementine out. Clem owns its own grant, full stop.
+  return loginWithCodexDeviceCode(({ userCode, verificationUri }) => {
+    console.log('\nTo sign in to ChatGPT/Codex from any device:');
+    console.log(`  1. Open: ${verificationUri}`);
+    console.log(`  2. Enter the code: ${userCode}\n`);
+    console.log('Waiting for sign-in… (Ctrl+C to cancel)');
+  });
 }
 
 export function importCodexCliAuth(sourceFile = getCodexAuthSourceFile()): { ok: boolean; message: string } {
@@ -786,14 +689,16 @@ export function getAuthStatus(): AuthStatus {
   const openaiApiKeyPresent = Boolean(getOpenAiApiKey());
   const codexOauthPresent = Boolean(localCodex?.accessToken && localCodex?.refreshToken);
 
-  // Shared-family detection: Clementine's grant is coupled to the Codex CLI's rotating
-  // refresh-token family when it was imported from the CLI (source 'codex_cli'), or when
-  // there is no vault grant and we'd run directly off ~/.codex/auth.json. In that state a
-  // `codex logout` revokes the family server-side and signs Clementine out too.
-  const codexSharedWithCli = codexOauthPresent
-    ? local.source === 'codex_cli'
-    : Boolean(codexCli?.tokens?.access_token && codexCli.tokens.refresh_token);
-  const sharedHint = ' ⚠ This sign-in is shared with the Codex CLI — signing out of the CLI (`codex logout`) will sign Clementine out too. Run `clementine auth login-native` (or desktop → Re-authenticate) to give Clementine its own independent sign-in.';
+  // Shared-family detection: Clem's grant is coupled to the Codex CLI's rotating
+  // refresh-token family ONLY when it was explicitly imported from the CLI
+  // (legacy `auth import-codex`, source 'codex_cli'). Clem no longer runs off
+  // ~/.codex/auth.json, so a mere present CLI file is NOT coupling. In the
+  // coupled state a `codex logout` revokes the family server-side and signs Clem
+  // out — the user should re-login to mint an independent grant.
+  const codexSharedWithCli = codexOauthPresent && local.source === 'codex_cli';
+  const sharedHint = ' ⚠ This sign-in was imported from the Codex CLI — signing out of the CLI (`codex logout`) will sign Clementine out too. Run `clementine auth login-device` (or desktop → Re-authenticate) to give Clementine its own independent sign-in.';
+  // Tailored hint for someone who used to run off the CLI file before the decouple.
+  const legacyCliFilePresent = Boolean(codexCli?.tokens?.access_token && codexCli.tokens.refresh_token);
 
   if (AUTH_MODE === 'api_key') {
     return {
@@ -830,29 +735,15 @@ export function getAuthStatus(): AuthStatus {
     };
   }
 
-  if (codexCli?.tokens?.access_token && codexCli.tokens.refresh_token) {
-    return {
-      mode: AUTH_MODE,
-      configured: isCodexCliAvailable(),
-      source: 'codex_cli',
-      message: (isCodexCliAvailable()
-        ? 'Codex CLI credentials detected. Import is optional; the Codex-backed runtime can use the existing CLI login.'
-        : `Codex CLI credentials detected, but the Codex executable is not available on PATH. ${getCodexInstallHint()}`)
-        + sharedHint,
-      openaiApiKeyPresent,
-      codexOauthPresent,
-      codexAccountId: codexCli.tokens.account_id,
-      codexLastRefresh: codexCli.last_refresh,
-      codexImportPath: codexAuthSourceFile,
-      codexSharedWithCli,
-    };
-  }
-
+  // No vault grant. A present ~/.codex/auth.json is NO LONGER usable by Clem —
+  // it must hold its own grant. Point the user at the (remote-capable) login.
   return {
     mode: AUTH_MODE,
     configured: false,
     source: 'none',
-    message: `No Codex OAuth credentials found. Sign in with ChatGPT from the desktop setup flow, or import an existing Codex CLI auth file from ${codexAuthSourceFile}.`,
+    message: legacyCliFilePresent
+      ? 'No Clementine Codex sign-in. A Codex CLI sign-in exists but Clementine no longer uses it (so a `codex logout` can’t sign you out). Run `clementine auth login-device` (or desktop → Re-authenticate) to give Clementine its own independent sign-in.'
+      : 'No Codex OAuth credentials found. Run `clementine auth login-device` (remote/headless), `clementine auth login-native` (local browser), or use the desktop setup flow to sign in with ChatGPT.',
     openaiApiKeyPresent,
     codexOauthPresent,
     codexImportPath: codexAuthSourceFile,
@@ -867,7 +758,7 @@ export function formatAuthStatus(status = getAuthStatus()): string {
     `source: ${status.source}`,
     `api_key_present: ${status.openaiApiKeyPresent ? 'yes' : 'no'}`,
     `codex_oauth_present: ${status.codexOauthPresent ? 'yes' : 'no'}`,
-    status.codexSharedWithCli ? `codex_shared_with_cli: yes (a CLI logout will revoke this — run \`clementine auth login-native\` to decouple)` : '',
+    status.codexSharedWithCli ? `codex_shared_with_cli: yes (a CLI logout will revoke this — run \`clementine auth login-device\` to decouple)` : '',
     status.codexAccountId ? `codex_account_id: ${status.codexAccountId}` : '',
     status.codexLastRefresh ? `codex_last_refresh: ${status.codexLastRefresh}` : '',
     status.codexImportPath ? `codex_import_path: ${status.codexImportPath}` : '',

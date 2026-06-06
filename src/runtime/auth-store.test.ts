@@ -194,7 +194,7 @@ test('auth status flags a CLI-shared sign-in (imported grant) with the decouple 
   const status = getAuthStatus();
   assert.equal(status.codexOauthPresent, true);
   assert.equal(status.codexSharedWithCli, true, 'an imported CLI grant is flagged as shared');
-  assert.match(status.message, /login-native/i, 'message points at the decouple remedy');
+  assert.match(status.message, /login-device/i, 'message points at the decouple remedy (device-code login)');
 });
 
 test('auth status does NOT flag an independent native grant as shared', () => {

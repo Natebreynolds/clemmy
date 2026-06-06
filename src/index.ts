@@ -55,10 +55,11 @@ Daemon (background agent)
 
 Auth
   auth status         Show auth configuration
-  auth login          Bootstrap Codex CLI auth
-  auth login-native   OAuth browser sign-in
+  auth login          Sign in with ChatGPT/Codex (browser if a TTY, else device code)
+  auth login-native   OAuth browser sign-in (local machine)
+  auth login-device   OAuth device-code sign-in (remote / headless — any device)
   auth refresh        Refresh stored OAuth token
-  auth import-codex   Import token from Codex CLI
+  auth import-codex   Import a token from the Codex CLI (legacy; couples to a CLI logout)
   auth logout         Clear stored auth
 
 Plugins
@@ -414,7 +415,7 @@ async function main(): Promise<void> {
       console.log('Cleared stored auth.');
       return;
     }
-    console.log('Usage: clementine auth <status|login|login-native|refresh|import-codex|logout>');
+    console.log('Usage: clementine auth <status|login|login-native|login-device|refresh|import-codex|logout>');
     process.exitCode = 1;
     return;
   }
