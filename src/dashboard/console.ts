@@ -12557,11 +12557,14 @@ const CONSOLE_JS = `
       const j = await r.json();
       const state = j && j.goal;
       const status = state && state.status;
-      if (state && (status === 'pursuing' || status === 'paused')) {
+      const objective = state ? String(state.objective || '').trim() : '';
+      // Only show the banner for a real, pursued goal WITH an objective.
+      // An empty objective (stale/blank goal state) just looks broken.
+      if (state && (status === 'pursuing' || status === 'paused') && objective) {
         const used = parseInt(state.turnsUsed, 10) || 0;
         const total = parseInt(state.turnsLimit, 10) || 0;
         const setText = (sel, txt) => { const el = banner.querySelector(sel); if (el) el.textContent = txt; };
-        setText('[data-home-goal-objective]', String(state.objective || '').slice(0, 140));
+        setText('[data-home-goal-objective]', objective.slice(0, 140));
         setText('[data-home-goal-turns]', used + '/' + total);
         setText('[data-home-goal-state]', status === 'pursuing' ? 'ACTIVE' : 'PAUSED');
         const fill = banner.querySelector('[data-home-goal-progress]');
@@ -16363,18 +16366,28 @@ const CONSOLE_JS = `
     const elements = [];
     graph.nodes.forEach((n) => elements.push({ data: { id: n.id, label: wfNodeBadges(n.flags) + n.label, stepId: n.id } }));
     graph.edges.forEach((e) => elements.push({ data: { id: e.id, source: e.source, target: e.target } }));
+    // Explicit roots = steps with no upstream dependency. Without this,
+    // breadthfirst's auto root-detection throws ("reading 'x1'") on some
+    // DAGs even though the graph is valid.
+    const targetIds = {};
+    graph.edges.forEach((e) => { targetIds[e.target] = true; });
+    const rootSel = graph.nodes.filter((n) => !targetIds[n.id]).map((n) => '#' + n.id).join(', ');
     if (wfGraphCy) { try { wfGraphCy.destroy(); } catch (_) { /* ignore */ } wfGraphCy = null; }
+    // breadthfirst (directed) reliably paints branching DAGs and fits
+    // them to the canvas. A 'grid'-style layered look without the paint
+    // glitches we hit trying a custom preset. maxZoom keeps small graphs
+    // from blowing up; fit handles the wide ones (pan/zoom to read).
     wfGraphCy = window.cytoscape({
       container: container,
       elements: elements,
+      maxZoom: 1.5,
       style: [
         { selector: 'node', style: {
           'background-color': bg2, 'border-color': line, 'border-width': 1,
           'shape': 'round-rectangle', 'label': 'data(label)', 'color': fg,
           'font-size': 11, 'font-family': 'ui-monospace, Menlo, monospace',
           'text-valign': 'center', 'text-halign': 'center', 'text-wrap': 'wrap',
-          'text-max-width': 130, 'width': 'label', 'height': 'label',
-          'padding': 12,
+          'text-max-width': 150, 'width': 172, 'height': 'label', 'padding': 12,
         } },
         { selector: 'edge', style: {
           'width': 1.5, 'line-color': line, 'target-arrow-color': line,
@@ -16386,17 +16399,20 @@ const CONSOLE_JS = `
         { selector: 'node.skipped', style: { 'color': fg3, 'border-color': line } },
         { selector: 'node:selected', style: { 'border-color': accent, 'border-width': 2 } },
       ],
-      // Left-to-right flow: breadthfirst lays out top-down, so swap x/y in
-      // the position transform to rotate it horizontal — uses the wide
-      // canvas far better for the typical linear chain.
-      layout: {
-        name: 'breadthfirst', directed: true, spacingFactor: 1.3, padding: 24, fit: true, grid: false,
-        transform: function (node, pos) { return { x: pos.y, y: pos.x }; },
-      },
+      // Construct without an auto-layout; we run breadthfirst explicitly
+      // below so we can swallow a non-fatal cytoscape internal throw
+      // (positions still apply) and keep the console clean.
+      layout: { name: 'preset' },
       wheelSensitivity: 0.2, boxSelectionEnabled: false,
       userPanningEnabled: true, userZoomingEnabled: true,
     });
     wfGraphCy.on('tap', 'node', (evt) => openWfStepDrawer(evt.target.data('stepId')));
+    try {
+      wfGraphCy.layout({ name: 'breadthfirst', directed: true, roots: rootSel || undefined, spacingFactor: 1.2, padding: 26, fit: true, grid: true }).run();
+    } catch (_) {
+      try { wfGraphCy.layout({ name: 'grid', fit: true, padding: 26 }).run(); } catch (__) { /* ignore */ }
+    }
+    wfGraphCy.ready(() => { try { wfGraphCy.resize(); wfGraphCy.fit(undefined, 26); } catch (_) { /* ignore */ } });
   }
 
   // Paint live run status onto a node (called from applyStepEvent).
