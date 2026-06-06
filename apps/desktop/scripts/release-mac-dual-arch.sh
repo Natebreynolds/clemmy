@@ -29,6 +29,35 @@ verify_native_arch() {
   fi
 }
 
+# Prove the vendored uv binary actually shipped INSIDE the built .app and is
+# validly signed (hardened-runtime + Developer ID via electron-builder's
+# osx-sign). This is the only honest check — smoke-markitdown.mjs resolves uv
+# against the dev tree, so it passes green while the bundle is broken. A missing
+# or unsigned uv = the file/image-conversion feature is dead on a fresh install,
+# so fail the build loudly instead of shipping it.
+verify_uv_packaged() {
+  local arch="$1"
+  local uvtarget="$2"
+  local found=""
+  while IFS= read -r app; do
+    local uvbin="$app/Contents/Resources/daemon/vendor/uv/$uvtarget/uv"
+    if [[ -f "$uvbin" ]]; then
+      echo "   uv present: $uvbin"
+      if codesign -v --strict "$uvbin" 2>/dev/null; then
+        echo "   uv codesign: OK"
+        found="$uvbin"
+      else
+        echo "::error::vendored uv for $arch ($uvtarget) is present but NOT validly signed: $uvbin"
+        exit 1
+      fi
+    fi
+  done < <(find "$DESKTOP_DIR/release" -maxdepth 2 -name "Clementine.app" -type d 2>/dev/null)
+  if [[ -z "$found" ]]; then
+    echo "::error::vendored uv ($uvtarget) is MISSING from the $arch .app — file/image conversion would be dead on fresh install"
+    exit 1
+  fi
+}
+
 build_arch() {
   local arch="$1"
   local expected="$2"
@@ -44,6 +73,15 @@ build_arch() {
 
   echo "-> Building macOS artifacts ($arch)"
   (cd "$DESKTOP_DIR" && "$BUILDER_BIN" --mac dmg zip "--$arch" --publish never)
+
+  local uvtarget
+  case "$arch" in
+    arm64) uvtarget="aarch64-apple-darwin" ;;
+    x64)   uvtarget="x86_64-apple-darwin" ;;
+    *) echo "::error::unknown arch $arch for uv verification"; exit 1 ;;
+  esac
+  echo "-> Verifying vendored uv shipped + signed ($arch)"
+  verify_uv_packaged "$arch" "$uvtarget"
 }
 
 echo "-> Building desktop shell"
@@ -54,6 +92,13 @@ echo "-> Building daemon"
 
 echo "-> Building mobile web app"
 (cd "$ROOT_DIR" && npm run build:mobile-web)
+
+# Vendor the uv runtime binaries BEFORE packaging — file/image conversion
+# (markitdown) needs them inside the .app, and they're gitignored so they are
+# NOT present in a fresh CI checkout. Without this, extraResources copies an
+# empty dir and the shipped feature is dead on every machine.
+echo "-> Vendoring uv runtime binaries (required for file/image conversion)"
+(cd "$ROOT_DIR" && npm run vendor:uv)
 
 build_arch arm64 arm64
 build_arch x64 x86_64

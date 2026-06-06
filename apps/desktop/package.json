@@ -79,6 +79,20 @@
           "!**/tests/**",
           "!**/.bin/**"
         ]
+      },
+      {
+        "from": "../../vendor/uv/aarch64-apple-darwin",
+        "to": "daemon/vendor/uv/aarch64-apple-darwin",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "../../vendor/uv/x86_64-apple-darwin",
+        "to": "daemon/vendor/uv/x86_64-apple-darwin",
+        "filter": [
+          "**/*"
+        ]
       }
     ],
     "afterSign": "build/notarize.cjs",

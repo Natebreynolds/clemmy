@@ -179,15 +179,31 @@ export async function ingestAttachment(input: IngestInput): Promise<IngestedAtta
       return res.ok ? { name, markdown: clip(`# Transcript — ${name}\n\n${res.text}`) } : { name, error: res.error };
     }
     // Images → vision OCR + description when a key is set (real text
-    // extraction); otherwise fall back to markitdown's metadata-only path.
+    // extraction); otherwise fall back to markitdown's metadata-only path —
+    // and SAY SO, so a no-key user (e.g. codex_oauth, which carries no OpenAI
+    // key) isn't silently given metadata-only or a misleading "reinstall" error.
     if (isImageExtension(target)) {
-      if (hasOpenAiKey()) {
+      const keyed = hasOpenAiKey();
+      if (keyed) {
         const res = await describeImage(target);
         if (res.ok) return { name, markdown: clip(res.text) };
         // vision failed — fall through to markitdown metadata rather than error
       }
       const res = await convertToMarkdown(target);
-      return res.ok ? { name, markdown: clip(res.markdown) } : { name, error: res.error };
+      if (res.ok) {
+        const note = keyed
+          ? ''
+          : '\n\n> ⚠️ Image metadata only. Full image analysis (text/OCR + description) needs an OpenAI API key — set OPENAI_API_KEY to enable vision.';
+        return { name, markdown: clip(res.markdown + note) };
+      }
+      // Metadata path also failed. If there's no key, the honest primary fix is
+      // the key (not "reinstall Clementine", which is what res.error would say).
+      return {
+        name,
+        error: keyed
+          ? res.error
+          : `Image analysis needs an OpenAI API key — set OPENAI_API_KEY for text/OCR + description. (Metadata-only fallback also unavailable: ${res.error})`,
+      };
     }
     if (isConvertibleExtension(target)) {
       const res = await convertToMarkdown(target);
