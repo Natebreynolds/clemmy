@@ -7967,6 +7967,35 @@ body {
 .pe-ov-desc { color: var(--fg-2); margin-bottom: 8px; }
 .pe-ov-sub { font-size: 10px; letter-spacing: 0.14em; color: var(--fg-3); margin: 8px 0 4px; }
 .pe-ov-deps { font-size: 10px; color: var(--fg-2); line-height: 1.6; }
+/* Overview quick stats */
+.pe-stats { display: flex; gap: 8px; flex-wrap: wrap; }
+.pe-stat {
+  flex: 1; min-width: 64px; border: 1px solid var(--line); background: var(--bg-2);
+  padding: 8px 10px; display: flex; flex-direction: column; gap: 2px;
+}
+.pe-stat-val { font-size: 18px; color: var(--fg); font-weight: 600; line-height: 1; }
+.pe-stat-label { font-size: 9px; letter-spacing: 0.16em; color: var(--fg-mute); text-transform: uppercase; }
+/* Top-level structure card grid */
+.pe-struct-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 6px; }
+.pe-struct {
+  display: flex; align-items: center; gap: 7px; text-align: left;
+  border: 1px solid var(--line); background: var(--bg-2); color: var(--fg-2);
+  font: 11px var(--mono); padding: 7px 9px; cursor: pointer; overflow: hidden;
+  transition: border-color 100ms, color 100ms;
+}
+.pe-struct:hover { border-color: var(--accent); color: var(--fg); }
+.pe-struct-ico { color: var(--fg-3); flex-shrink: 0; }
+.pe-struct.dir .pe-struct-ico { color: var(--accent-3); }
+.pe-struct.dir .pe-struct-name { color: var(--accent-3); }
+.pe-struct-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Script chips */
+.pe-script-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.pe-script-chip {
+  display: inline-flex; align-items: center; gap: 5px;
+  border: 1px solid var(--line); background: var(--bg-2); color: var(--fg-2);
+  font: 10px var(--mono); letter-spacing: 0.04em; padding: 3px 8px; cursor: default;
+}
+.pe-script-run { color: var(--accent-2); font-size: 8px; }
 .proj-block {
   border: 1px solid var(--line);
   background: var(--bg-1);
@@ -18588,17 +18617,41 @@ const CONSOLE_JS = `
 
   function projOverviewHtml(meta) {
     if (!meta) return '<div class="pe-prev-empty">— select a file to preview —</div>';
+    const pkg = meta.package;
+    const entries = Array.isArray(meta.entries) ? meta.entries : [];
+    const folders = entries.filter((e) => e.isDir).length;
+    const files = entries.length - folders;
+    const depCount = pkg ? ((pkg.dependencies || []).length + (pkg.devDependencies || []).length) : 0;
+    const scriptKeys = pkg ? Object.keys(pkg.scripts || {}) : [];
     const parts = ['<div class="pe-overview">'];
     parts.push('<div class="pe-ov-head"><span class="pe-ov-name">' + escMem((meta.path || '').split('/').pop()) + '</span><span class="pe-ov-path">' + escMem(meta.path || '') + '</span></div>');
-    if (meta.package) {
-      const pkg = meta.package;
-      const scripts = Object.entries(pkg.scripts || {}).slice(0, 12)
-        .map(([k, v]) => '<dt>' + escMem(k) + '</dt><dd>' + escMem(String(v)) + '</dd>').join('');
+
+    // Quick stats — at-a-glance shape of the project.
+    const statCard = (val, label) => '<div class="pe-stat"><span class="pe-stat-val">' + val + '</span><span class="pe-stat-label">' + label + '</span></div>';
+    const stats = [statCard(folders, 'folders'), statCard(files, 'files')];
+    if (pkg) { stats.push(statCard(scriptKeys.length, 'scripts')); stats.push(statCard(depCount, 'deps')); }
+    parts.push('<div class="pe-stats">' + stats.join('') + '</div>');
+
+    // Top-level structure as a clickable card grid (the project "map").
+    if (entries.length > 0) {
+      const cards = entries.slice(0, 48).map((e) =>
+        '<button type="button" class="pe-struct ' + (e.isDir ? 'dir' : 'file') + '" data-ov-entry="' + escMem(e.name) + '" data-ov-dir="' + (e.isDir ? '1' : '0') + '">'
+        + '<span class="pe-struct-ico">' + (e.isDir ? '▸' : '·') + '</span>'
+        + '<span class="pe-struct-name">' + escMem(e.name) + (e.isDir ? '/' : '') + '</span>'
+        + '</button>'
+      ).join('');
+      parts.push('<div class="pe-ov-block"><div class="pe-ov-block-head">STRUCTURE · ' + entries.length + '</div><div class="pe-ov-block-body"><div class="pe-struct-grid">' + cards + '</div></div></div>');
+    }
+
+    if (pkg) {
+      const scriptChips = scriptKeys.slice(0, 16).map((k) =>
+        '<span class="pe-script-chip" title="' + escMem(String(pkg.scripts[k])) + '"><span class="pe-script-run">▶</span>' + escMem(k) + '</span>'
+      ).join('');
       parts.push([
         '<div class="pe-ov-block"><div class="pe-ov-block-head">PACKAGE · ' + escMem(pkg.name || '') + ' ' + escMem(pkg.version || '') + '</div>',
         '<div class="pe-ov-block-body">',
         pkg.description ? '<div class="pe-ov-desc">' + escMem(pkg.description) + '</div>' : '',
-        scripts ? '<div class="pe-ov-sub">SCRIPTS</div><dl class="proj-pkg-grid">' + scripts + '</dl>' : '',
+        scriptChips ? '<div class="pe-ov-sub">SCRIPTS</div><div class="pe-script-chips">' + scriptChips + '</div>' : '',
         (pkg.dependencies || []).length > 0
           ? '<div class="pe-ov-sub">DEPENDENCIES (' + pkg.dependencies.length + ')</div><div class="pe-ov-deps">' + escMem(pkg.dependencies.slice(0, 30).join(', ')) + (pkg.dependencies.length > 30 ? ' …' : '') + '</div>'
           : '',
@@ -18611,11 +18664,28 @@ const CONSOLE_JS = `
     if (meta.claudeMd) {
       parts.push('<div class="pe-ov-block"><div class="pe-ov-block-head">AGENT NOTES</div><div class="pe-ov-block-body pe-md">' + renderTinyMarkdown(meta.claudeMd) + '</div></div>');
     }
-    if (!meta.package && !meta.readme && !meta.claudeMd) {
-      parts.push('<div class="pe-prev-empty">— select a file from the tree to preview it —</div>');
-    }
     parts.push('</div>');
     return parts.join('');
+  }
+
+  // Wire the structure cards in the overview: a file opens in the preview,
+  // a folder expands its node in the tree.
+  function projWireOverview(prev) {
+    if (!prev) return;
+    Array.from(prev.querySelectorAll('[data-ov-entry]')).forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const name = btn.getAttribute('data-ov-entry');
+        const isDir = btn.getAttribute('data-ov-dir') === '1';
+        if (!name) return;
+        if (isDir) {
+          const treeEl = proj.detail.querySelector('[data-proj-tree]');
+          const row = treeEl && Array.from(treeEl.querySelectorAll('.pe-dir')).find((r) => r.getAttribute('data-rel') === name);
+          if (row) { if (!row.classList.contains('open')) row.click(); row.scrollIntoView({ block: 'nearest' }); }
+        } else {
+          projLoadFile(name, name);
+        }
+      });
+    });
   }
 
   async function projLoadFile(rel, name, gotoLine) {
@@ -18798,10 +18868,12 @@ const CONSOLE_JS = `
       projWireTree(treeEl);
       const prev = proj.detail.querySelector('[data-proj-preview]');
       prev.innerHTML = projOverviewHtml(meta);
+      projWireOverview(prev);
       const ovBtn = proj.detail.querySelector('[data-proj-overview]');
       if (ovBtn) ovBtn.addEventListener('click', () => {
         Array.from(treeEl.querySelectorAll('.pe-file.active')).forEach((el) => el.classList.remove('active'));
         prev.innerHTML = projOverviewHtml(projMeta);
+        projWireOverview(prev);
         prev.scrollTop = 0;
       });
       projWireSearch();
