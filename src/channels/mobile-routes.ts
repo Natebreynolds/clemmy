@@ -25,6 +25,7 @@ import { fileURLToPath } from 'node:url';
 import { PKG_DIR } from '../config.js';
 import { hasPin, readPinMeta, setPin, verifyPin } from '../runtime/mobile-pin.js';
 import { consumeMobilePairingCode } from '../runtime/mobile-pairing.js';
+import { beginCodexDeviceLogin, pollCodexDeviceLogin } from '../runtime/auth-store.js';
 import {
   createSession,
   listSessions,
@@ -617,6 +618,34 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       expiresAt: ctx.record.expiresAt,
       lastSeenAt: ctx.record.lastSeenAt,
     });
+  });
+
+  // ─── Remote Codex re-authentication (device code) ───────────────
+  //
+  // The whole point of the mobile companion is doing things when you are NOT at
+  // the daemon. A Codex sign-in that lapses would otherwise strand the user
+  // until they got back to the machine (the desktop "Re-authenticate" button
+  // runs the browser/loopback flow ON THE DAEMON). The device-code flow lets the
+  // user re-auth right from the phone: begin() returns a code + URL to show, they
+  // sign in, and the PWA polls until the daemon has the tokens.
+
+  router.post('/api/auth/codex-device/begin', requireMobileSession, async (_req, res) => {
+    try {
+      const start = await beginCodexDeviceLogin();
+      res.json(start);
+    } catch (err) {
+      res.status(502).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.post('/api/auth/codex-device/poll', requireMobileSession, async (req, res) => {
+    const loginId = typeof req.body?.loginId === 'string' ? req.body.loginId : '';
+    if (!loginId) { res.status(400).json({ error: 'loginId required' }); return; }
+    try {
+      res.json(await pollCodexDeviceLogin(loginId));
+    } catch (err) {
+      res.status(500).json({ status: 'error', message: err instanceof Error ? err.message : String(err) });
+    }
   });
 
   // ─── Plan approvals ─────────────────────────────────────────────

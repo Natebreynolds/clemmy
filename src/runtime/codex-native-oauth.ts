@@ -17,6 +17,19 @@ const CALLBACK_PATH = '/auth/callback';
 const LEGACY_CALLBACK_PATH = '/callback';
 const LOGIN_TIMEOUT_MS = 15 * 60_000;
 
+// ─────────────────────────────────────────────────────────────────
+// Device-code login (remote / headless). The loopback browser flow above only
+// works for someone sitting at the daemon's machine — it opens a LOCAL browser
+// and binds a localhost callback on the daemon host. The device-code flow has no
+// such requirement: the daemon shows a short URL + code, the user authorizes on
+// ANY device (phone, another laptop), and the daemon POLLS for the token. This
+// is the SAME endpoints the Codex CLI's `--device-auth` and the Hermes agent use
+// against this same public client. No loopback server, no tunnel redirect.
+const DEVICE_USERCODE_URL = `${AUTH_BASE_URL}/api/accounts/deviceauth/usercode`;
+const DEVICE_POLL_URL = `${AUTH_BASE_URL}/api/accounts/deviceauth/token`;
+const DEVICE_VERIFICATION_URL = `${AUTH_BASE_URL}/codex/device`;
+const DEVICE_REDIRECT_URI = `${AUTH_BASE_URL}/deviceauth/callback`;
+
 export interface NativeCodexTokenSet {
   accessToken: string;
   refreshToken: string;
@@ -302,6 +315,97 @@ export async function refreshNativeCodexTokens(refreshToken: string): Promise<Na
     accountId: extractAccountId(nextIdToken, nextAccessToken),
     lastRefresh: new Date().toISOString(),
   };
+}
+
+export interface CodexDeviceAuthStart {
+  /** Short human-typed code the user enters at the verification URL. */
+  userCode: string;
+  /** Opaque server handle used to poll for completion. Keep this server-side. */
+  deviceAuthId: string;
+  /** Where the user goes to enter the code (e.g. https://auth.openai.com/codex/device). */
+  verificationUri: string;
+  /** Minimum seconds the server asks us to wait between polls. */
+  intervalSeconds: number;
+}
+
+export type CodexDevicePollResult =
+  | { status: 'pending' }
+  | { status: 'complete'; tokens: NativeCodexTokenSet };
+
+/** Step 1 of device-code login: request a user_code + device_auth_id. The caller
+ *  shows `userCode` + `verificationUri` to the (possibly remote) user, then polls
+ *  with {@link pollCodexDeviceAuth}. */
+export async function startCodexDeviceAuth(): Promise<CodexDeviceAuthStart> {
+  const response = await fetch(DEVICE_USERCODE_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ client_id: CLIENT_ID }),
+    signal: AbortSignal.timeout(15_000),
+  }).catch((err: Error & { name?: string }) => {
+    if (err?.name === 'TimeoutError' || err?.name === 'AbortError') {
+      throw new Error('Codex device-code request timed out after 15s. Check your network connection and try again.');
+    }
+    throw err;
+  });
+
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`Codex device-code request failed (${response.status}): ${text.slice(0, 300)}`);
+  }
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(text) as Record<string, unknown>;
+  } catch {
+    throw new Error(`Codex device-code request returned invalid JSON: ${text.slice(0, 300)}`);
+  }
+  const userCode = typeof parsed.user_code === 'string' ? parsed.user_code : '';
+  const deviceAuthId = typeof parsed.device_auth_id === 'string' ? parsed.device_auth_id : '';
+  if (!userCode || !deviceAuthId) {
+    throw new Error('Codex device-code response was missing user_code or device_auth_id.');
+  }
+  const interval = Number(parsed.interval);
+  const intervalSeconds = Number.isFinite(interval) && interval > 0 ? Math.max(3, Math.floor(interval)) : 5;
+  return { userCode, deviceAuthId, verificationUri: DEVICE_VERIFICATION_URL, intervalSeconds };
+}
+
+/** Step 2 of device-code login: poll once. Returns `pending` until the user has
+ *  authorized, then `complete` with a usable token set (the authorization code +
+ *  PKCE verifier come back from the poll and are exchanged at the token URL). */
+export async function pollCodexDeviceAuth(deviceAuthId: string, userCode: string): Promise<CodexDevicePollResult> {
+  const response = await fetch(DEVICE_POLL_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ device_auth_id: deviceAuthId, user_code: userCode }),
+    signal: AbortSignal.timeout(15_000),
+  }).catch((err: Error & { name?: string }) => {
+    if (err?.name === 'TimeoutError' || err?.name === 'AbortError') {
+      throw new Error('Codex device-code poll timed out after 15s. Check your network connection and try again.');
+    }
+    throw err;
+  });
+
+  // 403/404 = the user has not finished authorizing yet (matches the Codex CLI /
+  // Hermes contract). Anything else non-2xx is a real error.
+  if (response.status === 403 || response.status === 404) {
+    return { status: 'pending' };
+  }
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`Codex device-code poll failed (${response.status}): ${text.slice(0, 300)}`);
+  }
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(text) as Record<string, unknown>;
+  } catch {
+    throw new Error(`Codex device-code poll returned invalid JSON: ${text.slice(0, 300)}`);
+  }
+  const authorizationCode = typeof parsed.authorization_code === 'string' ? parsed.authorization_code : '';
+  const codeVerifier = typeof parsed.code_verifier === 'string' ? parsed.code_verifier : '';
+  if (!authorizationCode || !codeVerifier) {
+    throw new Error('Codex device-code poll succeeded but did not return an authorization_code/code_verifier.');
+  }
+  const tokens = await exchangeAuthorizationCode(authorizationCode, DEVICE_REDIRECT_URI, codeVerifier);
+  return { status: 'complete', tokens };
 }
 
 export async function loginWithNativeCodexOAuth(opener?: BrowserOpener): Promise<NativeCodexTokenSet> {

@@ -23,7 +23,7 @@ import {
   stopDaemon,
   writeDaemonPid,
 } from './daemon/process.js';
-import { bootstrapCodexAuth, clearImportedAuth, formatAuthStatus, importCodexCliAuth, loginWithNativeOAuth, refreshStoredNativeOAuth } from './runtime/auth-store.js';
+import { bootstrapCodexAuth, clearImportedAuth, formatAuthStatus, importCodexCliAuth, loginWithNativeOAuth, loginWithCodexDeviceCode, refreshStoredNativeOAuth } from './runtime/auth-store.js';
 import { createRuntimeFromConfig } from './runtime/factory.js';
 import { runDoctor } from './setup/doctor.js';
 import { initHome } from './setup/init-home.js';
@@ -381,6 +381,18 @@ async function main(): Promise<void> {
     }
     if (subcommand === 'login-native') {
       const result = await loginWithNativeOAuth();
+      console.log(result.message);
+      process.exitCode = result.ok ? 0 : 1;
+      return;
+    }
+    if (subcommand === 'login-device') {
+      // Remote / headless sign-in: no local browser or loopback callback needed.
+      const result = await loginWithCodexDeviceCode(({ userCode, verificationUri }) => {
+        console.log('\nTo sign in to ChatGPT/Codex from any device:');
+        console.log(`  1. Open: ${verificationUri}`);
+        console.log(`  2. Enter the code: ${userCode}\n`);
+        console.log('Waiting for sign-in… (Ctrl+C to cancel)');
+      });
       console.log(result.message);
       process.exitCode = result.ok ? 0 : 1;
       return;

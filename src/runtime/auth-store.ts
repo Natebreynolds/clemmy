@@ -1,10 +1,12 @@
 import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
 import { AUTH_MODE, BASE_DIR, CODEX_EXECUTABLE, CODEX_INSTALL_PACKAGE, getOpenAiApiKey, getRuntimeEnv } from '../config.js';
 import type { AuthStatus } from '../types.js';
-import { loginWithNativeCodexOAuth, refreshNativeCodexTokens } from './codex-native-oauth.js';
+import { loginWithNativeCodexOAuth, refreshNativeCodexTokens, startCodexDeviceAuth, pollCodexDeviceAuth } from './codex-native-oauth.js';
+import type { NativeCodexTokenSet } from './codex-native-oauth.js';
 
 const AUTH_STATE_FILE = path.join(BASE_DIR, 'state', 'auth.json');
 
@@ -458,6 +460,120 @@ export async function loginWithNativeOAuth(_sourceFile = getCodexAuthSourceFile(
       ok: false,
       message: error instanceof Error ? error.message : String(error),
     };
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Device-code login (remote / headless). Persists into Clementine's OWN vault,
+// exactly like the loopback native login — no ~/.codex/auth.json coupling. The
+// pending map holds the per-login PKCE/poll handles server-side, keyed by an
+// opaque loginId; only the loginId + the user_code + verification URL ever cross
+// the wire to the (possibly remote) client.
+const DEVICE_LOGIN_TTL_MS = 15 * 60 * 1000;
+interface PendingDeviceLogin { deviceAuthId: string; userCode: string; intervalSeconds: number; createdAt: number; }
+const pendingDeviceLogins = new Map<string, PendingDeviceLogin>();
+
+function sweepPendingDeviceLogins(): void {
+  const cutoff = Date.now() - DEVICE_LOGIN_TTL_MS;
+  for (const [id, p] of pendingDeviceLogins) {
+    if (p.createdAt < cutoff) pendingDeviceLogins.delete(id);
+  }
+}
+
+function persistDeviceTokens(tokens: NativeCodexTokenSet): void {
+  // OWN vault only (source 'native') — clears the DEAD latch via saveLocalAuthState.
+  saveLocalAuthState({
+    importedAt: new Date().toISOString(),
+    source: 'native',
+    codexOauth: {
+      accessToken: tokens.accessToken,
+      refreshToken: tokens.refreshToken,
+      idToken: tokens.idToken,
+      accountId: tokens.accountId,
+      lastRefresh: tokens.lastRefresh,
+    },
+  });
+}
+
+export interface CodexDeviceLoginStart {
+  loginId: string;
+  userCode: string;
+  verificationUri: string;
+  intervalSeconds: number;
+  expiresAt: string;
+}
+
+export type CodexDeviceLoginPoll =
+  | { status: 'pending' }
+  | { status: 'complete'; accountId?: string }
+  | { status: 'expired' }
+  | { status: 'error'; message: string };
+
+/** Begin a remote/headless device-code sign-in. Returns the user_code +
+ *  verification URL to display (URL/QR) and a loginId to poll with. */
+export async function beginCodexDeviceLogin(): Promise<CodexDeviceLoginStart> {
+  sweepPendingDeviceLogins();
+  const start = await startCodexDeviceAuth();
+  const loginId = randomUUID();
+  pendingDeviceLogins.set(loginId, {
+    deviceAuthId: start.deviceAuthId,
+    userCode: start.userCode,
+    intervalSeconds: start.intervalSeconds,
+    createdAt: Date.now(),
+  });
+  return {
+    loginId,
+    userCode: start.userCode,
+    verificationUri: start.verificationUri,
+    intervalSeconds: start.intervalSeconds,
+    expiresAt: new Date(Date.now() + DEVICE_LOGIN_TTL_MS).toISOString(),
+  };
+}
+
+/** Poll a device-code sign-in once. On `complete`, the tokens are persisted to
+ *  Clementine's vault (and the DEAD latch is cleared). Safe to call repeatedly
+ *  from the client every `intervalSeconds`. */
+export async function pollCodexDeviceLogin(loginId: string): Promise<CodexDeviceLoginPoll> {
+  const pending = pendingDeviceLogins.get(loginId);
+  if (!pending) return { status: 'expired' };
+  if (Date.now() - pending.createdAt > DEVICE_LOGIN_TTL_MS) {
+    pendingDeviceLogins.delete(loginId);
+    return { status: 'expired' };
+  }
+  try {
+    const result = await pollCodexDeviceAuth(pending.deviceAuthId, pending.userCode);
+    if (result.status === 'pending') return { status: 'pending' };
+    pendingDeviceLogins.delete(loginId);
+    persistDeviceTokens(result.tokens);
+    return { status: 'complete', accountId: result.tokens.accountId };
+  } catch (error) {
+    return { status: 'error', message: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+/** Blocking device-code login for the CLI / headless servers: prints the code,
+ *  polls until the user authorizes (or it times out), persists on success. */
+export async function loginWithCodexDeviceCode(
+  onPrompt: (info: { userCode: string; verificationUri: string }) => void,
+  opts: { signal?: AbortSignal } = {},
+): Promise<{ ok: boolean; message: string }> {
+  try {
+    const start = await startCodexDeviceAuth();
+    onPrompt({ userCode: start.userCode, verificationUri: start.verificationUri });
+    const deadline = Date.now() + DEVICE_LOGIN_TTL_MS;
+    const intervalMs = Math.max(3, start.intervalSeconds) * 1000;
+    for (;;) {
+      if (opts.signal?.aborted) return { ok: false, message: 'Device login cancelled.' };
+      await delay(intervalMs);
+      if (Date.now() > deadline) return { ok: false, message: 'Device login timed out after 15 minutes.' };
+      const result = await pollCodexDeviceAuth(start.deviceAuthId, start.userCode);
+      if (result.status === 'complete') {
+        persistDeviceTokens(result.tokens);
+        return { ok: true, message: 'Signed in to ChatGPT/Codex via device code. Clementine stored its own credentials.' };
+      }
+    }
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : String(error) };
   }
 }
 

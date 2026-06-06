@@ -106,7 +106,7 @@ import { getOrRefreshScan, probe, readCachedScan } from '../runtime/cli-discover
 import { SKILLS_DIR, listSkills, uninstallSkill } from '../memory/skill-store.js';
 import { checkAllSkillUpdates, getSkillInstallJob, startSkillInstall, startSkillUpdate } from '../runtime/skill-installer.js';
 import { getProactivityPolicySnapshot, loadProactivityPolicy, saveProactivityPolicy } from '../agents/proactivity-policy.js';
-import { getAuthStatus, loginWithNativeOAuth } from '../runtime/auth-store.js';
+import { getAuthStatus, loginWithNativeOAuth, beginCodexDeviceLogin, pollCodexDeviceLogin } from '../runtime/auth-store.js';
 import { getSecretStore, listSecretDescriptors, type SecretName } from '../runtime/secrets/index.js';
 import {
   createCheckInTemplate,
@@ -5717,6 +5717,51 @@ export function registerConsoleRoutes(
       res.status(result.ok ? 200 : 400).json(result);
     } catch (err) {
       res.status(500).json({ ok: false, message: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * REMOTE re-authentication via the OpenAI device-code flow. Unlike
+   * /api/console/auth/codex-login (which opens a browser + binds a loopback
+   * callback ON THE DAEMON, so it only works for someone physically at the
+   * machine), this works from any device: begin() returns a short code + a URL
+   * to display (link/QR); the user signs in on their phone/laptop; the client
+   * polls until the daemon has the tokens. No loopback, no tunnel redirect — the
+   * same flow the Codex CLI's `--device-auth` and Hermes use. PKCE/poll handles
+   * stay server-side keyed by loginId.
+   */
+  app.post('/api/console/auth/codex-device/begin', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const start = await beginCodexDeviceLogin();
+      res.json(start);
+    } catch (err) {
+      res.status(502).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/auth/codex-device/poll', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const loginId = typeof req.body?.loginId === 'string' ? req.body.loginId : '';
+    if (!loginId) { res.status(400).json({ error: 'loginId required' }); return; }
+    try {
+      const result = await pollCodexDeviceLogin(loginId);
+      if (result.status === 'complete') {
+        try {
+          addNotification({
+            id: `codex-reauth-success-${new Date().toISOString()}`,
+            kind: 'system',
+            title: 'Codex sign-in refreshed',
+            body: 'Clementine re-authenticated with ChatGPT/Codex (device code). You can resume where you left off.',
+            createdAt: new Date().toISOString(),
+            read: false,
+            metadata: { reason: 'codex_reauth_success' },
+          });
+        } catch { /* notification is best-effort */ }
+      }
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ status: 'error', message: err instanceof Error ? err.message : String(err) });
     }
   });
 

@@ -23252,6 +23252,7 @@ const CONSOLE_JS = `
           // ~/.codex/auth.json or run a CLI command. v0.5.9 fix.
           (r.name === 'codex_oauth_access_token')
             ? '    <button class="cred-reauth" type="button" data-cred-codex-reauth>RE-AUTHENTICATE ↻</button>'
+              + '    <button class="cred-reauth" type="button" data-cred-codex-reauth-remote title="Sign in from your phone or another device — no browser needed on this machine">RE-AUTH REMOTELY ⤢</button>'
             : '',
           (!runtimeCredentialReady && r.status === 'env_only')
             ? '    <button class="cred-migrate" type="button" data-cred-migrate="' + escMem(r.name) + '">MOVE TO VAULT ⇢</button>'
@@ -23408,6 +23409,70 @@ const CONSOLE_JS = `
           btn.disabled = false;
           btn.textContent = originalLabel;
         }
+      });
+    });
+
+    // REMOTE re-auth via the device-code flow. Works from any device (incl. a
+    // browser pointed at the daemon over the tunnel): no local browser or
+    // loopback callback on the daemon. Shows a code + URL, then polls until the
+    // daemon has the tokens. The PWA has the same flow under /m.
+    root.querySelectorAll('[data-cred-codex-reauth-remote]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const originalLabel = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = 'STARTING…';
+        let panel = btn.parentElement.querySelector('.codex-device-panel');
+        if (!panel) {
+          panel = document.createElement('div');
+          panel.className = 'codex-device-panel';
+          panel.style.marginTop = '8px';
+          panel.style.fontSize = '12px';
+          panel.style.lineHeight = '1.5';
+          btn.parentElement.appendChild(panel);
+        }
+        panel.textContent = 'Requesting a sign-in code…';
+        const fail = (msg) => { panel.textContent = msg; btn.disabled = false; btn.textContent = originalLabel; };
+        try {
+          const r = await fetchWithToken('/api/console/auth/codex-device/begin', { method: 'POST', headers: { Accept: 'application/json' } });
+          const start = await r.json().catch(() => ({}));
+          if (!r.ok || !start.loginId) { fail('Could not start device login: ' + ((start && (start.error || start.message)) || ('HTTP ' + r.status))); return; }
+          const intervalMs = Math.max(3, start.intervalSeconds || 5) * 1000;
+          const expiresAt = Date.parse(start.expiresAt) || (Date.now() + 900000);
+          panel.textContent = '';
+          const line = document.createElement('div');
+          line.appendChild(document.createTextNode('Open '));
+          const a = document.createElement('a');
+          a.href = start.verificationUri; a.target = '_blank'; a.rel = 'noopener'; a.textContent = start.verificationUri;
+          line.appendChild(a);
+          line.appendChild(document.createTextNode(' and enter code: '));
+          const codeEl = document.createElement('b');
+          codeEl.textContent = start.userCode; codeEl.style.letterSpacing = '1px';
+          line.appendChild(codeEl);
+          panel.appendChild(line);
+          const statusEl = document.createElement('div');
+          statusEl.style.opacity = '0.8';
+          statusEl.textContent = 'Waiting for sign-in…';
+          panel.appendChild(statusEl);
+          btn.textContent = 'WAITING…';
+          const poll = async () => {
+            if (Date.now() > expiresAt) { fail('Code expired — click RE-AUTH REMOTELY to try again.'); return; }
+            try {
+              const pr = await fetchWithToken('/api/console/auth/codex-device/poll', { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify({ loginId: start.loginId }) });
+              const result = await pr.json().catch(() => ({}));
+              if (result.status === 'complete') {
+                statusEl.textContent = 'Signed in ✓';
+                btn.textContent = 'RE-AUTHENTICATED ✓';
+                await refreshCredentialsHealth();
+                setTimeout(() => { try { panel.remove(); } catch (e) {} btn.disabled = false; btn.textContent = originalLabel; }, 2500);
+                return;
+              }
+              if (result.status === 'pending') { statusEl.textContent = 'Waiting for sign-in…'; setTimeout(poll, intervalMs); return; }
+              if (result.status === 'expired') { fail('Code expired — try again.'); return; }
+              fail('Error: ' + ((result && result.message) || 'unknown'));
+            } catch (e) { statusEl.textContent = 'Network hiccup — retrying…'; setTimeout(poll, intervalMs); }
+          };
+          setTimeout(poll, intervalMs);
+        } catch (err) { fail('Device login failed: ' + ((err && err.message) || err)); }
       });
     });
   }
