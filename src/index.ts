@@ -25,6 +25,7 @@ import {
 } from './daemon/process.js';
 import { bootstrapCodexAuth, clearImportedAuth, formatAuthStatus, importCodexCliAuth, loginWithNativeOAuth, loginWithCodexDeviceCode, refreshStoredNativeOAuth } from './runtime/auth-store.js';
 import { createRuntimeFromConfig } from './runtime/factory.js';
+import { warmMarkitdownInBackground } from './runtime/markitdown.js';
 import { runDoctor } from './setup/doctor.js';
 import { initHome } from './setup/init-home.js';
 import { runSetupWizard } from './setup/setup.js';
@@ -535,6 +536,10 @@ async function main(): Promise<void> {
     }
     writeDaemonPid(process.pid);
     registerShutdownHandlers(async () => { clearDaemonPid(); });
+    // Warm the markitdown runtime in the background so a user's FIRST file
+    // conversion doesn't eat a ~½GB download under the per-conversion timeout.
+    // Fire-and-forget, idempotent, never blocks the daemon loop.
+    warmMarkitdownInBackground();
     await startDaemon(assistant);
     return;
   }

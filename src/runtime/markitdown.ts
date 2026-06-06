@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { BASE_DIR, PKG_DIR } from '../config.js';
 import { findSafeCliCommand } from './cli-discovery.js';
@@ -214,6 +214,86 @@ export function resolveUv(): UvResolved | UvUnavailable {
 /** Reset memoized uv resolution — test seam. */
 export function resetUvCache(): void {
   cachedUvCommand = null;
+}
+
+/** Path to the one-time "runtime is warmed" marker. Exported for tests. */
+export function markitdownWarmMarkerPath(): string {
+  return path.join(BASE_DIR, 'runtime', '.markitdown-warmed');
+}
+
+/** Whether background warming is enabled (kill-switch: MARKITDOWN_WARM=off). */
+export function isMarkitdownWarmEnabled(): boolean {
+  return (process.env.MARKITDOWN_WARM ?? 'on').toLowerCase() !== 'off';
+}
+
+let warmKicked = false;
+
+/**
+ * Fire-and-forget background warm of the markitdown runtime at daemon startup.
+ *
+ * The FIRST real conversion otherwise downloads ~½GB (a managed Python +
+ * markitdown + the format libraries) UNDER the per-conversion timeout — so on a
+ * slow link a user's very first file conversion can TIME OUT and fail (it works
+ * on retry once cached). Pulling it in the background at boot — no timeout, no
+ * user waiting — means by the time anyone drops a file it's already cached and
+ * the first conversion is instant.
+ *
+ * Idempotent (marker-gated + uv's own content cache), never blocks startup,
+ * never throws into the caller. No-op when already warmed, when uv is
+ * unavailable (the on-demand path then reports the clear error), or when
+ * disabled via MARKITDOWN_WARM=off.
+ */
+export function warmMarkitdownInBackground(): void {
+  if (warmKicked || !isMarkitdownWarmEnabled()) return;
+  warmKicked = true;
+  setImmediate(() => {
+    try {
+      if (existsSync(markitdownWarmMarkerPath())) return; // already warmed once
+      const uv = resolveUv();
+      if ('error' in uv) return; // no uv → nothing to warm; convert path reports it
+
+      const cacheDir = path.join(BASE_DIR, 'runtime', 'uv-cache');
+      const pythonDir = path.join(BASE_DIR, 'runtime', 'uv-python');
+      try {
+        mkdirSync(cacheDir, { recursive: true });
+        mkdirSync(pythonDir, { recursive: true });
+      } catch {
+        return; // can't create the cache → give up quietly
+      }
+
+      // Same spec as a real conversion (so it caches exactly what convert needs);
+      // `--version` triggers the full resolve+install without needing a file.
+      let child: ReturnType<typeof spawn>;
+      try {
+        child = spawn(uv.command, ['tool', 'run', '--from', markitdownSpec(), 'markitdown', '--version'], {
+          cwd: BASE_DIR,
+          stdio: 'ignore',
+          env: {
+            ...process.env,
+            UV_CACHE_DIR: cacheDir,
+            UV_PYTHON_INSTALL_DIR: pythonDir,
+            UV_PYTHON_PREFERENCE: 'managed',
+            NO_COLOR: '1',
+          },
+        });
+      } catch {
+        return; // sync spawn failure (e.g. EACCES) — best-effort, give up
+      }
+
+      child.on('error', () => { /* swallow — warming must never break the daemon */ });
+      child.on('exit', (code) => {
+        if (code === 0) {
+          try { writeFileSync(markitdownWarmMarkerPath(), new Date().toISOString()); } catch { /* best-effort */ }
+        }
+        // Non-zero → leave no marker so the next launch retries.
+      });
+      // No timeout — this is a detached background pull. unref so it never holds
+      // the daemon's event loop open or delays shutdown.
+      child.unref();
+    } catch {
+      /* best-effort — warming must never affect startup */
+    }
+  });
 }
 
 export interface ConvertOk {

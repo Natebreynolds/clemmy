@@ -7,9 +7,42 @@ import {
   UV_TARGETS,
   convertToMarkdown,
   isConvertibleExtension,
+  isMarkitdownWarmEnabled,
+  markitdownWarmMarkerPath,
   uvTargetForHost,
   vendoredUvPath,
+  warmMarkitdownInBackground,
 } from './markitdown.js';
+
+test('isMarkitdownWarmEnabled: default on, kill-switch off', () => {
+  const prev = process.env.MARKITDOWN_WARM;
+  try {
+    delete process.env.MARKITDOWN_WARM;
+    assert.equal(isMarkitdownWarmEnabled(), true, 'default on');
+    process.env.MARKITDOWN_WARM = 'off';
+    assert.equal(isMarkitdownWarmEnabled(), false, 'off disables');
+    process.env.MARKITDOWN_WARM = 'on';
+    assert.equal(isMarkitdownWarmEnabled(), true);
+  } finally {
+    if (prev === undefined) delete process.env.MARKITDOWN_WARM;
+    else process.env.MARKITDOWN_WARM = prev;
+  }
+});
+
+test('markitdownWarmMarkerPath lives under the runtime dir', () => {
+  assert.match(markitdownWarmMarkerPath(), /runtime\/\.markitdown-warmed$/);
+});
+
+test('warmMarkitdownInBackground never throws and is a no-op when disabled', () => {
+  const prev = process.env.MARKITDOWN_WARM;
+  try {
+    process.env.MARKITDOWN_WARM = 'off';
+    assert.doesNotThrow(() => warmMarkitdownInBackground());
+  } finally {
+    if (prev === undefined) delete process.env.MARKITDOWN_WARM;
+    else process.env.MARKITDOWN_WARM = prev;
+  }
+});
 
 test('uvTargetForHost maps every supported platform/arch', () => {
   assert.equal(uvTargetForHost('darwin', 'arm64'), 'aarch64-apple-darwin');
