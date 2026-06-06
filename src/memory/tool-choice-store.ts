@@ -765,10 +765,16 @@ function emitToolChoiceEvent(action: ToolChoiceAction, intent: string, identifie
 // Thread 2 — outcome-driven procedural memory
 // ─────────────────────────────────────────────────────────────────
 
-/** Behavior flag. When off, outcome recording is a no-op and retrieval is
- *  byte-identical to the pre-outcome recency ordering. */
+/** Outcome-driven procedural memory: record how a remembered tool path FARES
+ *  (success/failure/approve/reject) and prefer proven paths over merely-recent
+ *  ones, auto-retiring repeat failures. DEFAULT-ON (validated behavior → default,
+ *  per the no-rollout-flags rule); set CLEMMY_PROCEDURAL_OUTCOMES=off to disable
+ *  (kill-switch retained → byte-identical pre-outcome recency ordering + no-op
+ *  recording). This is the learning loop's teeth: "route by learned success."
+ *  Composio + approval outcomes already feed it (composio-tools.ts,
+ *  approval-registry.ts); turning it on lights up both recording and ranking. */
 export function isProceduralOutcomesEnabled(): boolean {
-  return (process.env.CLEMMY_PROCEDURAL_OUTCOMES ?? 'off').toLowerCase() === 'on';
+  return (process.env.CLEMMY_PROCEDURAL_OUTCOMES ?? 'on').toLowerCase() !== 'off';
 }
 
 export type ProceduralOutcome = 'success' | 'failure' | 'approved' | 'rejected';

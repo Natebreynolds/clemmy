@@ -367,13 +367,29 @@ test('computeChoiceScore is a smoothed success rate (prior 0.5)', () => {
   assert.ok(Math.abs(computeChoiceScore({ kind: 'mcp', identifier: 'x', testedAt: 'now', failureCount: 1 }) - 1 / 3) < 1e-9);
 });
 
-test('updateToolChoiceOutcome is a no-op when the flag is off', () => {
-  delete process.env.CLEMMY_PROCEDURAL_OUTCOMES;
-  rememberToolChoice({ intent: 't2 flag off', choice: { kind: 'mcp', identifier: 'tool_a' } });
-  const r = updateToolChoiceOutcome('t2 flag off', 'success');
-  assert.equal(r, null, 'no-op returns null when flag off');
-  const after = peekToolChoice('t2 flag off');
-  assert.equal(after?.choice?.successCount ?? 0, 0, 'no counter written when flag off');
+test('procedural outcomes is DEFAULT-ON (unset env) — records + shifts score', () => {
+  delete process.env.CLEMMY_PROCEDURAL_OUTCOMES; // unset → default on
+  try {
+    rememberToolChoice({ intent: 't2 default on', choice: { kind: 'mcp', identifier: 'tool_default' } });
+    const r = updateToolChoiceOutcome('t2 default on', 'success');
+    assert.ok(r, 'records by default (no flag set)');
+    assert.equal(peekToolChoice('t2 default on')?.choice?.successCount, 1);
+  } finally {
+    delete process.env.CLEMMY_PROCEDURAL_OUTCOMES;
+  }
+});
+
+test('updateToolChoiceOutcome is a no-op when the kill-switch is off', () => {
+  process.env.CLEMMY_PROCEDURAL_OUTCOMES = 'off';
+  try {
+    rememberToolChoice({ intent: 't2 flag off', choice: { kind: 'mcp', identifier: 'tool_a' } });
+    const r = updateToolChoiceOutcome('t2 flag off', 'success');
+    assert.equal(r, null, 'no-op returns null when kill-switch off');
+    const after = peekToolChoice('t2 flag off');
+    assert.equal(after?.choice?.successCount ?? 0, 0, 'no counter written when off');
+  } finally {
+    delete process.env.CLEMMY_PROCEDURAL_OUTCOMES;
+  }
 });
 
 test('updateToolChoiceOutcome records success/failure and shifts the score', () => {
@@ -442,18 +458,24 @@ test('three failures with no win auto-invalidates the choice (→ rediscovery)',
   }
 });
 
-test('P3 render: with outcomes off the block is unchanged (no track annotation)', () => {
+test('P3 render: with the kill-switch off the block is unchanged (no track annotation)', () => {
   // Fresh machine so listToolChoices only sees this test's choices.
   writeFileSync(path.join(TMP_HOME, 'state', 'machine-id'), 'machine-p3-off\n');
   resetMachineIdCacheForTests();
-  delete process.env.CLEMMY_PROCEDURAL_OUTCOMES;
-  rememberToolChoice({ intent: 'p3 off intent', choice: { kind: 'mcp', identifier: 'render_tool' } });
-  process.env.CLEMMY_PROCEDURAL_OUTCOMES = 'on';
-  updateToolChoiceOutcome('p3 off intent', 'success');
-  delete process.env.CLEMMY_PROCEDURAL_OUTCOMES;
-  const block = renderToolChoicesForContext();
-  assert.match(block, /p3 off intent/);
-  assert.doesNotMatch(block, /✓/, 'no track annotation when flag off');
+  process.env.CLEMMY_PROCEDURAL_OUTCOMES = 'off';
+  try {
+    rememberToolChoice({ intent: 'p3 off intent', choice: { kind: 'mcp', identifier: 'render_tool' } });
+    process.env.CLEMMY_PROCEDURAL_OUTCOMES = 'on';
+    updateToolChoiceOutcome('p3 off intent', 'success');
+    process.env.CLEMMY_PROCEDURAL_OUTCOMES = 'off';
+    const block = renderToolChoicesForContext();
+    assert.match(block, /p3 off intent/);
+    assert.doesNotMatch(block, /✓/, 'no track annotation when off');
+  } finally {
+    delete process.env.CLEMMY_PROCEDURAL_OUTCOMES;
+    writeFileSync(path.join(TMP_HOME, 'state', 'machine-id'), 'machine-A\n');
+    resetMachineIdCacheForTests();
+  }
 });
 
 test('P3 render: with outcomes on, net-negative choices are dropped and strong ones annotated', () => {
