@@ -4563,6 +4563,42 @@ body {
 .timeline .tl-msg { color: var(--fg); font-size: 12px; line-height: 1.45; }
 .timeline-empty { color: var(--fg-mute); font-size: 12px; }
 
+/* Visual status timeline (run detail) — connector rail + colored dots */
+.timeline-viz { list-style: none; margin: 0; padding: 0; }
+.timeline-viz .tl-item {
+  display: grid; grid-template-columns: 16px 1fr; gap: 10px;
+  padding: 0; border: 0; align-items: stretch;
+}
+.timeline-viz .tl-rail {
+  position: relative; display: flex; justify-content: center;
+}
+.timeline-viz .tl-rail::before {
+  content: ''; position: absolute; top: 0; bottom: 0; left: 50%;
+  width: 1px; background: var(--line); transform: translateX(-50%);
+}
+.timeline-viz .tl-item:first-child .tl-rail::before { top: 9px; }
+.timeline-viz .tl-item:last-child .tl-rail::before { bottom: calc(100% - 9px); }
+.timeline-viz .tl-dot {
+  position: relative; z-index: 1; margin-top: 5px;
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--fg-mute); border: 2px solid var(--bg-1); box-sizing: content-box;
+}
+.timeline-viz .tl-body {
+  display: flex; justify-content: space-between; align-items: baseline; gap: 10px;
+  padding: 2px 0 12px; min-width: 0;
+}
+.timeline-viz .tl-msg { color: var(--fg-2); }
+.timeline-viz .tl-time { flex-shrink: 0; }
+.timeline-viz .tone-done .tl-dot { background: var(--accent-2); }
+.timeline-viz .tone-fail .tl-dot { background: var(--accent-fail); }
+.timeline-viz .tone-fail .tl-msg { color: var(--accent-fail); }
+.timeline-viz .tone-warn .tl-dot { background: var(--accent-warn); }
+.timeline-viz .tone-run .tl-dot  { background: var(--accent-3); }
+.timeline-viz .tl-live .tl-dot {
+  background: var(--accent-3); animation: pulse 1.4s ease-in-out infinite;
+}
+.timeline-viz .tl-live .tl-msg { color: var(--fg); }
+
 .read-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 18px; }
 .read-btn {
   padding: 7px 14px;
@@ -11516,6 +11552,17 @@ const CONSOLE_JS = `
     return (run.category || 'chat') === activeFilter;
   }
 
+  // Classify a timeline event into a colour tone from its type/message so
+  // the visual timeline can dot it green/red/cyan/amber at a glance.
+  function timelineTone(text) {
+    const s = String(text || '').toLowerCase();
+    if (/fail|error|denied|cancel|abort|blocked/.test(s)) return 'fail';
+    if (/complete|completed|done|finished|success|saved|sent|delivered|approved/.test(s)) return 'done';
+    if (/wait|await|approval|paused|needs you|check-in|checkin/.test(s)) return 'warn';
+    if (/start|started|running|begin|working|executing|thinking|planning|enrich/.test(s)) return 'run';
+    return 'idle';
+  }
+
   function buildInboxItem(run) {
     const status = run.runState || run.status || 'unknown';
     const cls = selectedRunId === run.id ? 'inbox-item selected' : 'inbox-item';
@@ -11661,9 +11708,15 @@ const CONSOLE_JS = `
 
     html += '<div class="read-block"><div class="read-block-head">What happened</div>';
     if (timeline.length) {
-      html += '<ol class="timeline">' + timeline.map((ev) =>
-        '<li><span class="tl-time">' + esc(fmtTime(ev.createdAt)) + '</span><span class="tl-msg">' + esc(ev.message) + '</span></li>',
-      ).join('') + '</ol>';
+      html += '<ol class="timeline timeline-viz">' + timeline.map((ev, i) => {
+        const tone = timelineTone(ev.type || ev.kind || ev.message || '');
+        const isLast = i === timeline.length - 1;
+        return '<li class="tl-item tone-' + tone + (isLast && run.live ? ' tl-live' : '') + '">'
+          + '<span class="tl-rail"><span class="tl-dot"></span></span>'
+          + '<span class="tl-body"><span class="tl-msg">' + esc(ev.message) + '</span>'
+          + '<span class="tl-time">' + esc(fmtTime(ev.createdAt)) + '</span></span>'
+          + '</li>';
+      }).join('') + '</ol>';
     } else if (run.live) {
       html += '<p class="timeline-empty">' + esc(run.liveLine || 'Working…') + '</p>';
     } else {
