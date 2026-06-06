@@ -56,6 +56,7 @@ import {
 import { prepareWorkflowForWrite } from '../execution/workflow-enforce.js';
 import { extractYouTubeUrls, foldAttachmentsIntoMessage, ingestAttachment, loadInboxAttachment, saveIngestedToInbox, type IngestedAttachment } from '../runtime/attachments.js';
 import { describeWorkflowPlainEnglish } from '../execution/workflow-describe.js';
+import { buildWorkflowGraph } from './workflow-graph.js';
 import { validateCronExpression } from '../shared/cron.js';
 import { ExecutionStore } from '../execution/store.js';
 import { listOpenCheckIns } from '../agents/check-ins.js';
@@ -1936,9 +1937,18 @@ export function registerConsoleRoutes(
   app.get('/api/console/workflows', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
+      // Latest run per workflow (records are newest-first) → a status dot
+      // in the list so you can scan health at a glance.
+      const runRecords = readWorkflowRunRecords();
+      const latestRunByWorkflow = new Map<string, WorkflowRunRecordSummary>();
+      for (const run of runRecords) {
+        if (!latestRunByWorkflow.has(run.workflow)) latestRunByWorkflow.set(run.workflow, run);
+      }
       const items = listWorkflows()
         .sort((a, b) => a.data.name.localeCompare(b.data.name))
-        .map((entry) => ({
+        .map((entry) => {
+          const lastRun = latestRunByWorkflow.get(entry.data.name) ?? latestRunByWorkflow.get(entry.name) ?? null;
+          return {
           name: entry.data.name,
           file: entry.layout === 'directory' ? `${entry.name}/SKILL.md` : `${entry.name}.md`,
           description: entry.data.description,
@@ -1951,7 +1961,10 @@ export function registerConsoleRoutes(
           synthesis: entry.data.synthesis ?? null,
           allowedTools: entry.data.allowedTools ?? null,
           whenToUse: entry.data.whenToUse ?? null,
-        }));
+          lastRunStatus: lastRun ? lastRun.status : null,
+          lastRunAt: lastRun ? (lastRun.finishedAt ?? lastRun.startedAt ?? lastRun.createdAt) : null,
+          };
+        });
       res.json({ workflows: items });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
@@ -2132,6 +2145,10 @@ export function registerConsoleRoutes(
       // it runs, what it needs/produces, where it pauses" — so the dashboard
       // can show a readable summary instead of only raw step fields.
       summary: describeWorkflowPlainEnglish(entry.data),
+      // Ready-to-draw flow graph (nodes = steps, edges = dependsOn) for the
+      // visual workflow view. Built server-side from the pure, unit-tested
+      // buildWorkflowGraph so the browser just hands it to Cytoscape.
+      graph: buildWorkflowGraph(entry.data.steps),
     });
   });
 

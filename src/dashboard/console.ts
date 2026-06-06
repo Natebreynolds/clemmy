@@ -519,6 +519,7 @@ export function renderConsoleHtml(token: string): string {
               <span>WORKFLOWS</span>
               <span class="wf-list-actions">
                 <button type="button" class="wf-home-btn" data-wf-home title="Workflow home">HOME</button>
+                <button type="button" class="wf-home-btn" data-wf-import-open title="Import a workflow from a folder or Git repo">IMPORT</button>
                 <span class="wf-new-btn" data-wf-new role="button" tabindex="0" title="Create new workflow" onclick="window.__clementineStartNewWorkflow && window.__clementineStartNewWorkflow();">＋ NEW</span>
               </span>
             </div>
@@ -532,51 +533,16 @@ export function renderConsoleHtml(token: string): string {
                  parallel systems and trained users to expect both. -->
           </aside>
 
-          <!-- Editor (middle) -->
+          <!-- Detail (right) — visual workflow view + simple edit.
+               The old "Architect" chat pane was removed: Clem authors
+               workflows from the main chat, so this panel is now about
+               understanding, importing, and lightly editing them. -->
           <div class="wf-editor" data-wf-editor>
             <div class="wf-empty">
               <div class="wf-empty-mark">↻</div>
               <div class="wf-empty-text">Loading workflow home…</div>
             </div>
           </div>
-
-          <!-- Architect chat (right) -->
-          <aside class="wf-chat-pane">
-            <div class="wf-chat-head">
-              <span class="wf-chat-title">ARCHITECT</span>
-              <span class="wf-chat-meta" data-wf-chat-meta>idle</span>
-              <button type="button" class="wf-chat-collapse" data-wf-chat-toggle title="Collapse architect">⇥</button>
-            </div>
-            <div class="wf-chat-log" data-wf-chat-log>
-              <div class="wf-chat-intro">
-                <strong>Describe what you want and the Architect builds it.</strong><br>
-                The Architect drafts, refines, or critiques the workflow on the left. Click a starter below or type your own.
-              </div>
-            </div>
-            <!-- v0.5.11 UX: starter prompt chips. Context-aware via
-                 [data-wf-chat-chip data-wf-chat-chip-mode="new|edit"];
-                 the JS swaps which set is visible based on whether a
-                 workflow is open. Clicking a chip pre-fills the textarea
-                 and focuses it so the user can edit before sending. -->
-            <div class="wf-chat-chips" data-wf-chat-chips>
-              <!-- "new workflow" chips — visible when no draft is loaded -->
-              <button type="button" class="wf-chat-chip" data-wf-chat-chip-mode="new" data-wf-chat-chip="Draft a workflow that triages my inbox every hour and surfaces anything important.">📥 Hourly inbox triage</button>
-              <button type="button" class="wf-chat-chip" data-wf-chat-chip-mode="new" data-wf-chat-chip="Draft a morning briefing workflow that runs Mon-Fri at 8am and summarizes my calendar, overdue tasks, and any new emails I should know about.">☀ Morning briefing</button>
-              <button type="button" class="wf-chat-chip" data-wf-chat-chip-mode="new" data-wf-chat-chip="Draft a weekly review workflow that runs Mondays at 9am, pulls completed tasks from last week, and asks me what I want to focus on this week.">📅 Weekly review</button>
-              <button type="button" class="wf-chat-chip" data-wf-chat-chip-mode="new" data-wf-chat-chip="Draft a daily prospect outreach workflow that pulls cadence-eligible accounts from Salesforce, enriches them with SEO data via DataForSEO, drafts emails (no send), and surfaces drafts for my approval.">🎯 Prospect outreach</button>
-              <!-- "edit current workflow" chips — visible when a draft is loaded -->
-              <button type="button" class="wf-chat-chip" data-wf-chat-chip-mode="edit" data-wf-chat-chip="Add a step at the end that summarizes what just happened and sends me a notify_user." hidden>＋ Add a summary step</button>
-              <button type="button" class="wf-chat-chip" data-wf-chat-chip-mode="edit" data-wf-chat-chip="Change the schedule to weekdays at 9am Pacific." hidden>⏱ Change schedule</button>
-              <button type="button" class="wf-chat-chip" data-wf-chat-chip-mode="edit" data-wf-chat-chip="Validate this workflow for cycles, missing tools, and broken step dependencies. Tell me what you find." hidden>✓ Validate this workflow</button>
-              <button type="button" class="wf-chat-chip" data-wf-chat-chip-mode="edit" data-wf-chat-chip="Explain what this workflow does in plain English — assume I'm a non-developer." hidden>❔ Explain in plain English</button>
-            </div>
-            <form class="wf-chat-form" data-wf-chat-form>
-              <textarea class="wf-chat-input" data-wf-chat-input
-                placeholder="message the architect · ⏎ to send · shift+⏎ for newline"
-                rows="2" autocomplete="off"></textarea>
-              <button type="submit" class="wf-chat-send" data-wf-chat-send>SEND ▸</button>
-            </form>
-          </aside>
 
         </div>
       </section>
@@ -5765,18 +5731,74 @@ body {
 /* ── Workflow Studio ─────────────────────────────────────────── */
 .wf-layout {
   display: grid;
-  /* List stays slim, editor takes 1.5x of the remaining space so the
-     per-step action row (▶ TRY · ✎ REFINE · ⛭) doesn't clip, and the
-     architect chat keeps a usable column on standard desktops. fr
-     units (not min-width) so we degrade gracefully on narrow windows
-     instead of overflowing horizontally. */
-  grid-template-columns: 200px 1.5fr 1fr;
+  /* Two panes now: a slim workflow list + a wide detail/visualization
+     pane (the Architect chat column was removed — Clem authors workflows
+     from the main chat). */
+  grid-template-columns: 240px minmax(0, 1fr);
   gap: 12px;
   height: 100%;
   overflow: hidden;
 }
-.wf-layout.architect-collapsed {
-  grid-template-columns: 200px minmax(0, 1fr) 44px;
+/* ── Workflow visual view (flow diagram + summary) ── */
+.wf-visual { display: flex; flex-direction: column; gap: 12px; margin-bottom: 14px; }
+.wf-visual-summary { font-size: 12px; line-height: 1.55; color: var(--fg-2); }
+.wf-visual-summary h1, .wf-visual-summary h2 { font-size: 14px; color: var(--fg); margin: 6px 0 4px; }
+.wf-visual-head {
+  display: flex; align-items: baseline; justify-content: space-between;
+  font-size: 10px; letter-spacing: 0.18em; color: var(--fg-3);
+}
+.wf-visual-legend { font-size: 10px; letter-spacing: 0.04em; color: var(--fg-mute); }
+.wf-graph {
+  position: relative; height: 360px; border: 1px solid var(--line);
+  background:
+    radial-gradient(circle at 1px 1px, var(--line) 1px, transparent 0) 0 0 / 22px 22px,
+    var(--bg-1);
+  overflow: hidden;
+}
+.wf-graph-empty {
+  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  color: var(--fg-mute); font-size: 11px; letter-spacing: 0.06em; text-align: center; padding: 20px;
+}
+.wf-graph-fallback { margin: 0; padding: 12px 12px 12px 30px; font-size: 12px; color: var(--fg-2); }
+.wf-graph-fallback li { padding: 4px 0; cursor: pointer; }
+.wf-graph-fallback li:hover { color: var(--accent); }
+.wf-edit-toggle {
+  align-self: flex-start; background: transparent; border: 1px solid var(--line);
+  color: var(--fg-2); font: 10px var(--mono); letter-spacing: 0.14em; padding: 5px 12px; cursor: pointer;
+  transition: color 120ms, border-color 120ms;
+}
+.wf-edit-toggle:hover { color: var(--accent); border-color: var(--accent); }
+/* Last-run status dot in the workflow list */
+.wf-run-dot {
+  display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+  margin-right: 7px; vertical-align: middle; flex-shrink: 0;
+  background: var(--fg-mute); box-shadow: none;
+}
+.wf-run-dot.done { background: var(--accent-2); box-shadow: 0 0 6px color-mix(in srgb, var(--accent-2) 50%, transparent); }
+.wf-run-dot.running { background: var(--accent-warn); box-shadow: 0 0 6px color-mix(in srgb, var(--accent-warn) 50%, transparent); animation: pulse 1.4s ease-in-out infinite; }
+.wf-run-dot.failed { background: var(--accent-fail); box-shadow: 0 0 6px color-mix(in srgb, var(--accent-fail) 50%, transparent); }
+.wf-run-dot.idle { background: var(--fg-mute); }
+/* Step drawer (click a node) */
+.wf-step-drawer {
+  position: fixed; top: 0; right: 0; width: 380px; max-width: 88vw; height: 100%;
+  background: var(--bg-1); border-left: 1px solid var(--line); z-index: 9998;
+  transform: translateX(100%); transition: transform 160ms ease; overflow-y: auto;
+  box-shadow: -8px 0 24px rgba(0,0,0,0.3);
+}
+.wf-step-drawer.open { transform: translateX(0); }
+.wf-drawer-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 14px; border-bottom: 1px solid var(--line);
+  font-size: 11px; letter-spacing: 0.12em; color: var(--fg);
+  position: sticky; top: 0; background: var(--bg-2);
+}
+.wf-drawer-close { background: transparent; border: 0; color: var(--fg-3); font-size: 14px; cursor: pointer; }
+.wf-drawer-close:hover { color: var(--accent); }
+.wf-drawer-flags { padding: 10px 14px; font-size: 10px; color: var(--fg-3); border-bottom: 1px solid var(--line); }
+.wf-drawer-sub { padding: 12px 14px 4px; font-size: 9px; letter-spacing: 0.18em; color: var(--fg-mute); }
+.wf-drawer-pre {
+  margin: 0; padding: 0 14px 12px; font: 11px/1.5 var(--mono); color: var(--fg);
+  white-space: pre-wrap; word-break: break-word;
 }
 .wf-list-pane,
 .wf-editor,
@@ -15003,6 +15025,7 @@ const CONSOLE_JS = `
   let wfDraft = null;
   let wfSelectedName = null;
   let wfIsNew = false;
+  let wfGraphCy = null;   // Cytoscape instance for the workflow flow diagram
   let wfItems = [];
   let wfHomeData = null;
   let wfMode = 'home';
@@ -15137,18 +15160,29 @@ const CONSOLE_JS = `
           startStarterWorkflow();
           return;
         }
-        if (action === 'architect') {
-          expandWorkflowArchitect();
-          if (wf.chatInput) {
-            wf.chatInput.value = 'Draft me a workflow for ';
-            wf.chatInput.focus();
-          }
+        if (action === 'chat') {
+          // Authoring lives in the main chat now — jump there.
+          switchPanel('home');
+          const homeInput = document.querySelector('[data-home-harness-input]') || document.querySelector('[data-home-chat-input]');
+          if (homeInput && typeof homeInput.focus === 'function') setTimeout(() => homeInput.focus(), 60);
           return;
         }
         if (action === 'import') {
           startWorkflowImportFromCreate();
           return;
         }
+      }
+      // IMPORT shortcut from the list header → open the create view and
+      // focus the import field.
+      if (target.closest('[data-wf-import-open]')) {
+        event.preventDefault();
+        showWorkflowCreate();
+        setTimeout(() => {
+          const src = document.querySelector('[data-wf-import-source]');
+          if (src && typeof src.scrollIntoView === 'function') src.scrollIntoView({ block: 'center' });
+          if (src && typeof src.focus === 'function') src.focus();
+        }, 40);
+        return;
       }
       const homeAction = target.closest('[data-wf-home-action]');
       if (homeAction) {
@@ -15186,10 +15220,9 @@ const CONSOLE_JS = `
       }
       if (target.closest('[data-wf-empty-architect]')) {
         event.preventDefault();
-        if (wf.chatInput) {
-          wf.chatInput.value = 'Draft me a workflow for ';
-          wf.chatInput.focus();
-        }
+        switchPanel('home');
+        const homeInput = document.querySelector('[data-home-harness-input]') || document.querySelector('[data-home-chat-input]');
+        if (homeInput && typeof homeInput.focus === 'function') setTimeout(() => homeInput.focus(), 60);
       }
     });
     // Direct binding on the sidebar button so even if delegation is
@@ -15640,14 +15673,14 @@ const CONSOLE_JS = `
       '<div class="wf-create">',
       '  <div class="wf-create-head">',
       '    <h2>Create workflow</h2>',
-      '    <p>Start from a safe starter template, ask the Architect to draft the workflow, or import a framework from a local folder or Git repo.</p>',
+      '    <p>Ask Clem to build one in chat, start from a template, or import a framework from a local folder or Git repo.</p>',
       '  </div>',
       '  <div class="wf-create-grid">',
       '    <article class="wf-create-card">',
-      '      <h3>ARCHITECT</h3>',
-      '      <p>Describe the process in plain language. Clementine proposes diff cards; nothing mutates until you apply and save.</p>',
+      '      <h3>ASK CLEM</h3>',
+      '      <p>Describe the process in plain language in the main chat — Clem drafts the workflow and it shows up here to review, run, and refine.</p>',
       '      <div class="wf-create-actions">',
-      '        <button type="button" class="primary" data-wf-create-action="architect">ASK ARCHITECT</button>',
+      '        <button type="button" class="primary" data-wf-create-action="chat">OPEN CHAT →</button>',
       '      </div>',
       '    </article>',
       '    <article class="wf-create-card">',
@@ -15939,10 +15972,19 @@ const CONSOLE_JS = `
           ? '<span class="pill cron" title="' + escMem(w.triggerSchedule) + '">⏱ ' + escMem(humanCron || w.triggerSchedule) + '</span>'
           : '';
         const href = '#workflows/' + encodeURIComponent(w.name);
+        // Last-run status dot — scan health at a glance.
+        const rs = (w.lastRunStatus || '').toLowerCase();
+        let dotCls = 'idle', dotLabel = 'no runs yet';
+        if (rs === 'running' || rs === 'queued') { dotCls = 'running'; dotLabel = rs; }
+        else if (rs === 'done' || rs === 'completed' || rs === 'succeeded' || rs === 'ok' || rs === 'success') { dotCls = 'done'; dotLabel = 'last run: done'; }
+        else if (rs === 'error' || rs === 'failed' || rs === 'blocked') { dotCls = 'failed'; dotLabel = 'last run: ' + rs; }
+        else if (rs) { dotLabel = 'last run: ' + rs; }
+        if (w.lastRunAt) dotLabel += ' · ' + fmtAgoShort(w.lastRunAt);
+        const runDot = '<span class="wf-run-dot ' + dotCls + '" title="' + escMem(dotLabel) + '"></span>';
         return [
           '<li class="' + cls + '" data-wf-name="' + escMem(w.name) + '">',
           '  <a class="wf-select" data-wf-select="' + escMem(w.name) + '" href="' + href + '" onclick="window.__clementineSelectWorkflow && window.__clementineSelectWorkflow(this.getAttribute(&quot;data-wf-select&quot;));">',
-          '    <span class="name">' + escMem(w.name) + '</span>',
+          '    <span class="name">' + runDot + escMem(w.name) + '</span>',
           '    <span class="meta">' + enabledPill + cronPill + '<span class="pill">' + w.stepCount + ' steps</span></span>',
           '  </a>',
           '</li>',
@@ -16003,6 +16045,7 @@ const CONSOLE_JS = `
       synthesisPrompt: data.synthesis && data.synthesis.prompt ? data.synthesis.prompt : '',
       allowedTools: data.allowedTools || null,
       whenToUse: data.whenToUse || null,
+      summary: data.summary || '',
     };
     wfChatHistory = [];
     // Reset per-step edit state when loading a different workflow —
@@ -16054,6 +16097,153 @@ const CONSOLE_JS = `
   // The sidebar + empty-state both bind via event delegation in
   // bootWorkflowsPanel(); no per-element listener needed here.
 
+  // ─── Workflow flow diagram ────────────────────────────────────
+  // Client-side mirror of the pure backend buildWorkflowGraph (kept tiny
+  // + tested server-side via workflow-graph.test.ts). Building it from the
+  // live wfDraft.steps means the diagram reflects edits immediately.
+  function wfBuildGraph(steps) {
+    const list = Array.isArray(steps) ? steps : [];
+    const ids = new Set(list.map((s) => s.id));
+    const nodes = list.map((s) => ({
+      id: s.id,
+      label: (s.prompt || s.id).replace(/\\s+/g, ' ').trim().split(/(?<=[.!?])\\s/)[0].slice(0, 80) || s.id,
+      flags: {
+        forEach: !!s.forEach,
+        approval: !!(s.requiresApproval || (s.deterministic && s.requiresApproval)),
+        skill: s.usesSkill || null,
+        deterministic: !!s.deterministic,
+      },
+    }));
+    const edges = [];
+    const seen = {};
+    for (const s of list) {
+      for (const d of (Array.isArray(s.dependsOn) ? s.dependsOn : [])) {
+        if (!ids.has(d)) continue;
+        const id = d + '->' + s.id;
+        if (seen[id]) continue;
+        seen[id] = 1;
+        edges.push({ id: id, source: d, target: s.id });
+      }
+    }
+    return { nodes: nodes, edges: edges };
+  }
+
+  function wfNodeBadges(flags) {
+    const b = [];
+    if (flags.forEach) b.push('🔁');
+    if (flags.approval) b.push('🔒');
+    if (flags.skill) b.push('🧩');
+    if (flags.deterministic) b.push('⚙');
+    return b.length ? b.join(' ') + '  ' : '';
+  }
+
+  async function renderWorkflowGraph(container, steps) {
+    if (!container) return;
+    const graph = wfBuildGraph(steps);
+    if (graph.nodes.length === 0) {
+      container.innerHTML = '<div class="wf-graph-empty">No steps yet — add steps or ask Clem in chat to build this workflow.</div>';
+      return;
+    }
+    const ok = await ensureCytoscapeLoaded();
+    if (!ok || typeof window.cytoscape !== 'function') {
+      // Graceful fallback: a simple ordered list of steps.
+      container.innerHTML = '<ol class="wf-graph-fallback">' + graph.nodes.map((n) =>
+        '<li data-wf-graph-step="' + escMem(n.id) + '">' + escMem(wfNodeBadges(n.flags) + n.label) + '</li>'
+      ).join('') + '</ol>';
+      Array.from(container.querySelectorAll('[data-wf-graph-step]')).forEach((li) =>
+        li.addEventListener('click', () => openWfStepDrawer(li.getAttribute('data-wf-graph-step'))));
+      return;
+    }
+    container.innerHTML = '';
+    const css = getComputedStyle(document.documentElement);
+    const cv = (name, fallback) => (css.getPropertyValue(name).trim() || fallback);
+    const accent = cv('--accent', '#ff5a35');
+    const accent2 = cv('--accent-2', '#b9ff36');
+    const accentWarn = cv('--accent-warn', '#ffcc33');
+    const accentFail = cv('--accent-fail', '#ff3b5a');
+    const line = cv('--line', '#2a2a36');
+    const fg = cv('--fg', '#e5e5ea');
+    const fg3 = cv('--fg-3', '#6b6b78');
+    const bg2 = cv('--bg-2', '#14141c');
+    const elements = [];
+    graph.nodes.forEach((n) => elements.push({ data: { id: n.id, label: wfNodeBadges(n.flags) + n.label, stepId: n.id } }));
+    graph.edges.forEach((e) => elements.push({ data: { id: e.id, source: e.source, target: e.target } }));
+    if (wfGraphCy) { try { wfGraphCy.destroy(); } catch (_) { /* ignore */ } wfGraphCy = null; }
+    wfGraphCy = window.cytoscape({
+      container: container,
+      elements: elements,
+      style: [
+        { selector: 'node', style: {
+          'background-color': bg2, 'border-color': line, 'border-width': 1,
+          'shape': 'round-rectangle', 'label': 'data(label)', 'color': fg,
+          'font-size': 11, 'font-family': 'ui-monospace, Menlo, monospace',
+          'text-valign': 'center', 'text-halign': 'center', 'text-wrap': 'wrap',
+          'text-max-width': 130, 'width': 'label', 'height': 'label',
+          'padding': 12,
+        } },
+        { selector: 'edge', style: {
+          'width': 1.5, 'line-color': line, 'target-arrow-color': line,
+          'target-arrow-shape': 'triangle', 'curve-style': 'bezier', 'arrow-scale': 0.9,
+        } },
+        { selector: 'node.running', style: { 'border-color': accentWarn, 'border-width': 2, 'color': fg } },
+        { selector: 'node.done', style: { 'border-color': accent2, 'border-width': 2 } },
+        { selector: 'node.failed', style: { 'border-color': accentFail, 'border-width': 2 } },
+        { selector: 'node.skipped', style: { 'color': fg3, 'border-color': line } },
+        { selector: 'node:selected', style: { 'border-color': accent, 'border-width': 2 } },
+      ],
+      // Left-to-right flow: breadthfirst lays out top-down, so swap x/y in
+      // the position transform to rotate it horizontal — uses the wide
+      // canvas far better for the typical linear chain.
+      layout: {
+        name: 'breadthfirst', directed: true, spacingFactor: 1.3, padding: 24, fit: true, grid: false,
+        transform: function (node, pos) { return { x: pos.y, y: pos.x }; },
+      },
+      wheelSensitivity: 0.2, boxSelectionEnabled: false,
+      userPanningEnabled: true, userZoomingEnabled: true,
+    });
+    wfGraphCy.on('tap', 'node', (evt) => openWfStepDrawer(evt.target.data('stepId')));
+  }
+
+  // Paint live run status onto a node (called from applyStepEvent).
+  function wfSetNodeStatus(stepId, status) {
+    if (!wfGraphCy || !stepId) return;
+    try {
+      const node = wfGraphCy.$('#' + (window.CSS && CSS.escape ? CSS.escape(stepId) : stepId));
+      if (!node || node.length === 0) return;
+      node.removeClass('running done failed skipped');
+      if (status) node.addClass(status);
+    } catch (_) { /* ignore */ }
+  }
+
+  // Side drawer showing one step's prompt + most recent output.
+  function openWfStepDrawer(stepId) {
+    if (!wfDraft || !stepId) return;
+    const step = (wfDraft.steps || []).find((s) => s.id === stepId);
+    if (!step) return;
+    let drawer = document.querySelector('[data-wf-step-drawer]');
+    if (!drawer) {
+      drawer = document.createElement('div');
+      drawer.className = 'wf-step-drawer';
+      drawer.setAttribute('data-wf-step-drawer', '');
+      document.body.appendChild(drawer);
+    }
+    const flags = [];
+    if (step.forEach) flags.push('🔁 for each ' + escMem(String(step.forEach)));
+    if (step.usesSkill) flags.push('🧩 skill: ' + escMem(step.usesSkill));
+    if (step.deterministic) flags.push('⚙ deterministic');
+    if (Array.isArray(step.dependsOn) && step.dependsOn.length) flags.push('depends on ' + step.dependsOn.map(escMem).join(', '));
+    const lastOut = document.querySelector('[data-wf-step-output="' + (window.CSS && CSS.escape ? CSS.escape(stepId) : stepId) + '"]');
+    drawer.innerHTML = [
+      '<div class="wf-drawer-head"><span>STEP · ' + escMem(stepId) + '</span><button class="wf-drawer-close" data-wf-drawer-close>✕</button></div>',
+      flags.length ? '<div class="wf-drawer-flags">' + flags.join(' · ') + '</div>' : '',
+      '<div class="wf-drawer-sub">PROMPT</div><pre class="wf-drawer-pre">' + escMem(step.prompt || '') + '</pre>',
+      lastOut && lastOut.textContent ? '<div class="wf-drawer-sub">LATEST OUTPUT</div><pre class="wf-drawer-pre">' + escMem(lastOut.textContent) + '</pre>' : '',
+    ].join('');
+    drawer.classList.add('open');
+    const close = drawer.querySelector('[data-wf-drawer-close]');
+    if (close) close.addEventListener('click', () => drawer.classList.remove('open'));
+  }
+
   function renderEditor() {
     if (!wfDraft) {
       wf.editor.innerHTML = [
@@ -16063,7 +16253,7 @@ const CONSOLE_JS = `
         '  <p class="wf-empty-sub">A workflow is a multi-step task you can run on demand or on a schedule.</p>',
         '  <div class="wf-empty-actions">',
         '    <button class="wf-empty-btn primary" data-wf-new onclick="window.__clementineStartNewWorkflow && window.__clementineStartNewWorkflow();">＋ NEW WORKFLOW</button>',
-        '    <button class="wf-empty-btn" data-wf-empty-architect>ASK ARCHITECT TO DRAFT ONE →</button>',
+        '    <button class="wf-empty-btn" data-wf-empty-architect>ASK CLEM IN CHAT →</button>',
         '  </div>',
         '  <div class="wf-framework-guide">',
         '    <div class="wf-framework-guide-head">BUILD OUTSIDE CLEMENTINE</div>',
@@ -16102,8 +16292,19 @@ const CONSOLE_JS = `
     ].join('');
     const runSummary = wfIsNew ? '' : renderWorkflowRunSummary([]);
 
+    // Visual-first: a plain-English summary + the flow diagram are shown
+    // by default; the editable form is revealed by the EDIT toggle.
+    const visual = [
+      '<div class="wf-visual">',
+      d.summary ? '<div class="wf-visual-summary pe-md">' + renderTinyMarkdown(d.summary) + '</div>' : '',
+      '  <div class="wf-visual-head"><span>FLOW</span><span class="wf-visual-legend">🔁 loop · 🔒 approval · 🧩 skill · ⚙ deterministic</span></div>',
+      '  <div class="wf-graph" data-wf-graph><div class="wf-graph-empty">— rendering flow —</div></div>',
+      '  <button type="button" class="wf-edit-toggle" data-wf-edit-toggle>✎ EDIT WORKFLOW</button>',
+      '</div>',
+    ].join('');
+
     const body = [
-      '<div class="wf-edit-body">',
+      '<div class="wf-edit-body" data-wf-edit-body hidden>',
 
       '  <div class="wf-field">',
       '    <label>DESCRIPTION</label>',
@@ -16147,10 +16348,29 @@ const CONSOLE_JS = `
       '</div>',
     ].join('');
 
-    wf.editor.innerHTML = head + controls + runSummary + body;
+    wf.editor.innerHTML = head + controls + (wfIsNew ? '' : visual) + runSummary + body;
     bindEditorEvents();
     bindSchedulePicker(wf.editor);
     refreshWorkflowRuns();
+    // Render the flow diagram (skip for brand-new drafts — nothing to show
+    // until steps exist; the EDIT form is open by default for new ones).
+    if (wfIsNew) {
+      const bodyEl = wf.editor.querySelector('[data-wf-edit-body]');
+      if (bodyEl) bodyEl.hidden = false;
+    } else {
+      const graphEl = wf.editor.querySelector('[data-wf-graph]');
+      if (graphEl) renderWorkflowGraph(graphEl, d.steps);
+      const toggle = wf.editor.querySelector('[data-wf-edit-toggle]');
+      const bodyEl = wf.editor.querySelector('[data-wf-edit-body]');
+      if (toggle && bodyEl) {
+        toggle.addEventListener('click', () => {
+          const show = bodyEl.hidden;
+          bodyEl.hidden = !show;
+          toggle.textContent = show ? '▲ HIDE EDITOR' : '✎ EDIT WORKFLOW';
+          if (show) bodyEl.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+        });
+      }
+    }
   }
 
   function workflowRunInputsLabel(run) {
@@ -16799,6 +17019,11 @@ const CONSOLE_JS = `
     if (!ev || !ev.stepId) return;
     const pill = document.querySelector('[data-wf-step-status="' + ev.stepId + '"]');
     const output = document.querySelector('[data-wf-step-output="' + ev.stepId + '"]');
+    // Paint the live status onto the flow-diagram node too.
+    if (ev.kind === 'step_started') wfSetNodeStatus(ev.stepId, 'running');
+    else if (ev.kind === 'step_completed') wfSetNodeStatus(ev.stepId, 'done');
+    else if (ev.kind === 'step_failed') wfSetNodeStatus(ev.stepId, 'failed');
+    else if (ev.kind === 'step_skipped') wfSetNodeStatus(ev.stepId, 'skipped');
     if (ev.kind === 'step_started') {
       if (pill) { pill.textContent = 'running'; pill.className = 'step-status status-running'; pill.title = ''; }
       if (output) { output.hidden = true; output.textContent = ''; }
@@ -17358,7 +17583,18 @@ const CONSOLE_JS = `
   // ─── Architect chat ───────────────────────────────────────────
 
   function appendChatMessage(role, text) {
-    if (!wf.chatLog) return;
+    // The architect chat log is gone, but this is still the panel's
+    // feedback channel (run queued, update saved, errors). Route those to
+    // toasts so the messages still reach the user. The user's own echoed
+    // messages ('user') and the transient 'thinking' placeholder are
+    // dropped (no log to hold them).
+    if (!wf.chatLog) {
+      if (!text) return null;
+      if (role === 'error') showError(String(text));
+      else if (role === 'user' || role === 'thinking') { /* no surface — skip */ }
+      else if (typeof showInfo === 'function') showInfo(String(text));
+      return null;
+    }
     const intro = wf.chatLog.querySelector('.wf-chat-intro');
     if (intro) intro.remove();
     const div = document.createElement('div');
@@ -17608,6 +17844,11 @@ const CONSOLE_JS = `
     });
   }
 
+  // The Architect chat pane was removed (Clem authors workflows from the
+  // main chat now). This whole block only wires up if the pane exists, so
+  // it's an inert no-op in the new layout while staying available if the
+  // pane is ever reintroduced.
+  if (wf.chatForm) {
   wf.chatForm.addEventListener('submit', async (e) => {
     e.preventDefault();
     if (wfChatBusy) return;
@@ -17665,6 +17906,7 @@ const CONSOLE_JS = `
       wf.chatForm.dispatchEvent(new Event('submit', { cancelable: true }));
     }
   });
+  } // end if (wf.chatForm) — architect pane wiring (no-op without the pane)
 
   // v0.5.11 UX — wire architect chat starter chips. Clicking a chip
   // pre-fills the textarea and focuses it so the user can edit before

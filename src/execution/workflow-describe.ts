@@ -123,7 +123,7 @@ function detokenize(prompt: string): string {
 
 /** A short, human one-liner for a step: first sentence of its (detokenized)
  *  prompt, clipped. */
-function shortStepLabel(prompt: string): string {
+export function shortStepLabel(prompt: string): string {
   const clean = detokenize((prompt ?? '').replace(/\s+/g, ' ').trim());
   if (!clean) return '(no description)';
   // First sentence (up to a period/newline) or the whole thing if short.
