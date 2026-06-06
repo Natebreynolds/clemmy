@@ -1,4 +1,5 @@
 import type { Express, Request } from 'express';
+import express from 'express';
 import * as fs from 'node:fs';
 import { existsSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
@@ -53,6 +54,7 @@ import {
   type WorkflowValidation,
 } from '../execution/workflow-validator.js';
 import { prepareWorkflowForWrite } from '../execution/workflow-enforce.js';
+import { extractYouTubeUrls, foldAttachmentsIntoMessage, ingestAttachment, loadInboxAttachment, saveIngestedToInbox, type IngestedAttachment } from '../runtime/attachments.js';
 import { describeWorkflowPlainEnglish } from '../execution/workflow-describe.js';
 import { validateCronExpression } from '../shared/cron.js';
 import { ExecutionStore } from '../execution/store.js';
@@ -971,6 +973,104 @@ export function upcomingWorkflowOccurrences(
   return out.slice(0, 100);
 }
 
+
+/**
+ * Resolve a user-requested file path inside a linked project, with hard
+ * containment. Pure + dependency-free so it can be unit-tested directly:
+ * the Express routes pass in the live workspace dirs + homedir.
+ *
+ * Guarantees:
+ *   - `root` must be a configured workspace dir or a directory under one
+ *     (no reading arbitrary disk locations).
+ *   - the resolved target can never escape `root` via `..` or symlink-y
+ *     relative paths — only `root` itself or paths strictly beneath it.
+ */
+export type ProjectPathGuard =
+  | { ok: true; root: string; target: string }
+  | { ok: false; status: number; error: string };
+
+export function resolveProjectFilePath(
+  workspaceDirs: string[],
+  homedir: string,
+  rawRoot: string,
+  rel: string,
+): ProjectPathGuard {
+  if (!rawRoot) return { ok: false, status: 400, error: 'root query param required' };
+  const expanded = rawRoot.startsWith('~') ? path.join(homedir, rawRoot.slice(1)) : rawRoot;
+  const absRoot = path.resolve(expanded);
+  const allowed = workspaceDirs
+    .map((d) => path.resolve(d))
+    .some((d) => absRoot === d || absRoot.startsWith(d + path.sep));
+  if (!allowed) return { ok: false, status: 403, error: 'root is not a linked workspace' };
+  const target = path.resolve(absRoot, rel || '.');
+  if (target !== absRoot && !target.startsWith(absRoot + path.sep)) {
+    return { ok: false, status: 400, error: 'path escapes project root' };
+  }
+  return { ok: true, root: absRoot, target };
+}
+
+/**
+ * Bounded content search inside a project root. Pure + synchronous so it
+ * can be unit-tested. Skips heavy/irrelevant dirs, caps depth, files
+ * scanned, file size, and total matches so a `grep` over a huge repo can
+ * never hang the daemon event loop or return an unbounded payload.
+ */
+export interface GrepMatch { rel: string; line: number; text: string }
+export interface GrepResult { matches: GrepMatch[]; filesScanned: number; truncated: boolean }
+
+const GREP_SKIP_DIRS = new Set([
+  'node_modules', '.git', '.next', '.turbo', 'dist', 'build', '.venv', '.cache',
+  '__pycache__', 'venv', 'env', 'coverage', '.idea', '.vscode', 'release',
+]);
+
+export function grepProjectFiles(
+  root: string,
+  query: string,
+  opts: { maxDepth?: number; maxFiles?: number; maxMatches?: number; maxFileBytes?: number } = {},
+): GrepResult {
+  const needle = query.toLowerCase();
+  const maxDepth = opts.maxDepth ?? 8;
+  const maxFiles = opts.maxFiles ?? 2000;
+  const maxMatches = opts.maxMatches ?? 200;
+  const maxFileBytes = opts.maxFileBytes ?? 512 * 1024;
+  const matches: GrepMatch[] = [];
+  let filesScanned = 0;
+  let truncated = false;
+
+  const walk = (dir: string, depth: number): void => {
+    if (truncated || depth > maxDepth) return;
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (truncated) return;
+      if (e.name.startsWith('.') && e.isDirectory()) continue;
+      if (e.isDirectory()) {
+        if (GREP_SKIP_DIRS.has(e.name)) continue;
+        walk(path.join(dir, e.name), depth + 1);
+        continue;
+      }
+      if (!e.isFile()) continue;
+      if (filesScanned >= maxFiles) { truncated = true; return; }
+      const full = path.join(dir, e.name);
+      let stat: fs.Stats;
+      try { stat = fs.statSync(full); } catch { continue; }
+      if (stat.size > maxFileBytes) continue;
+      let buf: Buffer;
+      try { buf = fs.readFileSync(full); } catch { continue; }
+      if (buf.subarray(0, 8192).includes(0)) continue; // binary
+      filesScanned++;
+      const lines = buf.toString('utf-8').split('\n');
+      for (let i = 0; i < lines.length; i++) {
+        if (lines[i].toLowerCase().includes(needle)) {
+          matches.push({ rel: path.relative(root, full), line: i + 1, text: lines[i].slice(0, 240) });
+          if (matches.length >= maxMatches) { truncated = true; return; }
+        }
+      }
+    }
+  };
+  walk(root, 0);
+  return { matches, filesScanned, truncated };
+}
 
 export function registerConsoleRoutes(
   app: Express,
@@ -2813,6 +2913,151 @@ export function registerConsoleRoutes(
     res.json({ query, results: hits });
   });
 
+  // ─── In-project file explorer (read-only, scoped) ─────────────
+  //
+  // Lets the Projects panel browse a linked project's tree and preview
+  // individual files without leaving the app. Read-only and strictly
+  // contained: `root` must be a configured workspace dir (or under one),
+  // and the resolved target can never escape that root via `../`. This
+  // is the same surface the agent already reads — we just give the user
+  // a window into it.
+
+  function resolveWithinProject(rawRoot: string, rel: string): ProjectPathGuard {
+    const guard = resolveProjectFilePath(getWorkspaceDirs(), os.homedir(), rawRoot, rel);
+    if (!guard.ok) return guard;
+    if (!existsSync(guard.root)) return { ok: false, status: 404, error: 'root not found' };
+    if (!existsSync(guard.target)) return { ok: false, status: 404, error: 'path not found' };
+    return guard;
+  }
+
+  /** List one directory level inside a project. Dirs first, then files. */
+  app.get('/api/console/projects/files', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const guard = resolveWithinProject(
+      typeof req.query.root === 'string' ? req.query.root : '',
+      typeof req.query.path === 'string' ? req.query.path : '',
+    );
+    if (!guard.ok) { res.status(guard.status).json({ error: guard.error }); return; }
+    try {
+      const stat = fs.statSync(guard.target);
+      if (!stat.isDirectory()) { res.status(400).json({ error: 'not a directory' }); return; }
+      const entries = fs
+        .readdirSync(guard.target, { withFileTypes: true })
+        .filter((e) => e.name !== '.DS_Store')
+        .map((e) => {
+          let size = 0;
+          if (!e.isDirectory()) {
+            try { size = fs.statSync(path.join(guard.target, e.name)).size; } catch { /* ignore */ }
+          }
+          return {
+            name: e.name,
+            isDir: e.isDirectory(),
+            size,
+            rel: path.relative(guard.root, path.join(guard.target, e.name)),
+          };
+        })
+        .sort((a, b) => (a.isDir === b.isDir ? a.name.localeCompare(b.name) : a.isDir ? -1 : 1))
+        .slice(0, 1000);
+      res.json({ root: guard.root, path: path.relative(guard.root, guard.target), entries });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /** Read + preview a single file. Returns text, image data URL, or a
+   *  binary/too-large marker — never streams an unbounded blob. */
+  app.get('/api/console/projects/file', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const guard = resolveWithinProject(
+      typeof req.query.root === 'string' ? req.query.root : '',
+      typeof req.query.path === 'string' ? req.query.path : '',
+    );
+    if (!guard.ok) { res.status(guard.status).json({ error: guard.error }); return; }
+    try {
+      const stat = fs.statSync(guard.target);
+      if (stat.isDirectory()) { res.status(400).json({ error: 'is a directory' }); return; }
+      const name = path.basename(guard.target);
+      const ext = path.extname(guard.target).toLowerCase();
+      const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.bmp', '.ico', '.avif']);
+      const MAX_TEXT = 512 * 1024;       // 512KB inline text cap
+      const MAX_IMAGE = 4 * 1024 * 1024; // 4MB image cap
+
+      if (IMAGE_EXTS.has(ext)) {
+        if (stat.size > MAX_IMAGE) {
+          res.json({ kind: 'too-large', name, size: stat.size, ext }); return;
+        }
+        const buf = fs.readFileSync(guard.target);
+        const mime = ext === '.svg' ? 'image/svg+xml'
+          : ext === '.ico' ? 'image/x-icon'
+          : ext === '.jpg' ? 'image/jpeg'
+          : 'image/' + ext.slice(1);
+        res.json({ kind: 'image', name, size: stat.size, ext, dataUrl: `data:${mime};base64,${buf.toString('base64')}` });
+        return;
+      }
+
+      if (stat.size > MAX_TEXT) {
+        const fd = fs.openSync(guard.target, 'r');
+        const buf = Buffer.alloc(MAX_TEXT);
+        const read = fs.readSync(fd, buf, 0, MAX_TEXT, 0);
+        fs.closeSync(fd);
+        res.json({ kind: 'text', name, size: stat.size, ext, truncated: true, content: buf.subarray(0, read).toString('utf-8') });
+        return;
+      }
+
+      const buf = fs.readFileSync(guard.target);
+      if (buf.subarray(0, 8192).includes(0)) {
+        res.json({ kind: 'binary', name, size: stat.size, ext });
+        return;
+      }
+      res.json({ kind: 'text', name, size: stat.size, ext, content: buf.toString('utf-8') });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /** Content search within a project. Bounded walk (depth + skip-list +
+   *  caps) so it never scans node_modules or hangs on a huge tree. Pure
+   *  walker extracted to `grepProjectFiles` for unit testing. */
+  app.get('/api/console/projects/grep', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const guard = resolveWithinProject(
+      typeof req.query.root === 'string' ? req.query.root : '',
+      '',
+    );
+    if (!guard.ok) { res.status(guard.status).json({ error: guard.error }); return; }
+    const query = typeof req.query.q === 'string' ? req.query.q : '';
+    if (query.trim().length < 2) { res.status(400).json({ error: 'q must be at least 2 characters' }); return; }
+    try {
+      const result = grepProjectFiles(guard.root, query);
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /** Open a project file in the OS default app / editor (macOS `open`).
+   *  Workspace-scoped via the same traversal-safe guard. */
+  app.post('/api/console/projects/open', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const body = req.body ?? {};
+    const guard = resolveWithinProject(
+      typeof body.root === 'string' ? body.root : '',
+      typeof body.path === 'string' ? body.path : '',
+    );
+    if (!guard.ok) { res.status(guard.status).json({ error: guard.error }); return; }
+    if (process.platform !== 'darwin') {
+      res.status(501).json({ error: 'open-in-editor is only supported on macOS' });
+      return;
+    }
+    try {
+      const child = childProcess.spawn('open', [guard.target], { detached: true, stdio: 'ignore' });
+      child.unref();
+      res.json({ ok: true, opened: guard.target });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   // ─── Skills (SKILL.md format) ──────────────────────────────────
   //
   // Skills are reusable prompt modules in the Anthropic Skills format
@@ -4403,21 +4648,35 @@ export function registerConsoleRoutes(
   app.get('/api/console/brain/facts', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
-      const { listActiveFacts, countActiveFacts } = await import('../memory/facts.js');
+      const { listActiveFacts, countActiveFacts, listAllFacts, searchFacts } = await import('../memory/facts.js');
       const kindParam = typeof req.query.kind === 'string' ? req.query.kind : '';
       const sort = typeof req.query.sort === 'string' ? req.query.sort : 'stanford';
+      const query = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+      const includeForgotten = req.query.includeForgotten === '1' || req.query.includeForgotten === 'true';
       const allowedKinds = new Set(['user', 'project', 'feedback', 'reference']);
       const kind = allowedKinds.has(kindParam) ? (kindParam as 'user' | 'project' | 'feedback' | 'reference') : undefined;
       const limit = 100;
-      let facts = listActiveFacts({ limit, kind, ranking: sort === 'stanford' ? 'stanford' : 'score' });
-      if (sort === 'recent') {
-        facts = [...facts].sort((a, b) =>
-          (b.lastAccessedAt || b.updatedAt || '').localeCompare(a.lastAccessedAt || a.updatedAt || ''),
-        );
-      } else if (sort === 'important') {
-        facts = [...facts].sort((a, b) => (b.importance ?? 0) - (a.importance ?? 0));
-      } else if (sort === 'trust') {
-        facts = [...facts].sort((a, b) => (b.trustLevel ?? 0) - (a.trustLevel ?? 0));
+      let facts;
+      if (query) {
+        // Free-text / semantic search across the fact pool. Same shape as
+        // listActiveFacts so the row template renders unchanged.
+        facts = await searchFacts(query, { kind, topK: 60 });
+        if (!includeForgotten) facts = facts.filter((f) => f.active !== false);
+      } else if (includeForgotten) {
+        facts = listAllFacts(200).filter((f) => !kind || f.kind === kind);
+      } else {
+        facts = listActiveFacts({ limit, kind, ranking: sort === 'stanford' ? 'stanford' : 'score' });
+      }
+      if (!query) {
+        if (sort === 'recent') {
+          facts = [...facts].sort((a, b) =>
+            (b.lastAccessedAt || b.updatedAt || '').localeCompare(a.lastAccessedAt || a.updatedAt || ''),
+          );
+        } else if (sort === 'important') {
+          facts = [...facts].sort((a, b) => (b.importance ?? 0) - (a.importance ?? 0));
+        } else if (sort === 'trust') {
+          facts = [...facts].sort((a, b) => (b.trustLevel ?? 0) - (a.trustLevel ?? 0));
+        }
       }
       res.json({ facts, total: countActiveFacts() });
     } catch (err) {
@@ -5766,6 +6025,34 @@ export function registerConsoleRoutes(
   });
 
   /**
+   * File attachment upload + convert. The composer POSTs the raw file bytes
+   * (application/octet-stream) with ?name=… so the global 1mb JSON parser is
+   * bypassed; we use a route-scoped raw parser at 30mb. The file is ingested
+   * (saved + converted to Markdown via the markitdown runtime) and stored in
+   * the inbox; the returned id is included in the next /api/harness/chat send.
+   */
+  app.post('/api/attach', express.raw({ type: '*/*', limit: '30mb' }), async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const name = typeof req.query.name === 'string' ? req.query.name : 'attachment';
+    const url = typeof req.query.url === 'string' ? req.query.url : '';
+    const bytes = Buffer.isBuffer(req.body) && req.body.length > 0 ? (req.body as Buffer) : undefined;
+    if (!bytes && !url) { res.status(400).json({ error: 'file bytes or url required' }); return; }
+    try {
+      const ingested = await ingestAttachment(bytes ? { name, bytes } : { name, url });
+      const id = saveIngestedToInbox(ingested);
+      res.json({
+        id,
+        name: ingested.name,
+        ok: !ingested.error,
+        error: ingested.error ?? null,
+        chars: ingested.markdown?.length ?? 0,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
    * Background-mode harness chat handler.
    *
    * The desktop UI and Discord bot POST here to start (or continue)
@@ -5788,16 +6075,20 @@ export function registerConsoleRoutes(
 
     const body = req.body ?? {};
     const input = typeof body.input === 'string' ? body.input.trim() : '';
-    if (!input) { res.status(400).json({ error: 'input required' }); return; }
+    const attachmentIds: string[] = Array.isArray(body.attachments)
+      ? body.attachments.filter((a: unknown): a is string => typeof a === 'string').slice(0, 10)
+      : [];
+    if (!input && attachmentIds.length === 0) { res.status(400).json({ error: 'input required' }); return; }
 
     const existingId = typeof body.sessionId === 'string' ? body.sessionId : '';
     let session = existingId ? getHarnessSession(existingId) : null;
     const freshSession = !session;
     if (existingId && !session) { res.status(404).json({ error: 'session not found' }); return; }
     if (!session) {
+      const titleSeed = input || (attachmentIds.length ? 'Attached file' : '');
       session = createHarnessSession({
         kind: 'chat',
-        title: input.length > 80 ? `${input.slice(0, 77)}...` : input,
+        title: titleSeed.length > 80 ? `${titleSeed.slice(0, 77)}...` : titleSeed,
         metadata: { source: 'desktop' },
       });
     }
@@ -5891,6 +6182,22 @@ export function registerConsoleRoutes(
           summaryHint,
           'Continue with the next step of your plan. If you have nothing left to do, set done=true and nextAction=completed.',
         ].join('\n\n');
+      }
+    }
+
+    // Fold any attachments (uploaded files, resolved from the inbox by id) and
+    // pasted YouTube links into the agent-facing turn. `input` stays raw for
+    // command/title/intent parsing; only `turnInput` carries the converted
+    // content so the agent sees the file/video contents inline.
+    {
+      const ingested: IngestedAttachment[] = attachmentIds
+        .map((id) => loadInboxAttachment(id))
+        .filter((a): a is IngestedAttachment => a !== null);
+      for (const url of extractYouTubeUrls(input).slice(0, 3)) {
+        ingested.push(await ingestAttachment({ name: url, url }));
+      }
+      if (ingested.length > 0) {
+        turnInput = foldAttachmentsIntoMessage(turnInput, ingested);
       }
     }
 

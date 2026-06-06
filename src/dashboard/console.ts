@@ -117,6 +117,13 @@ export function renderConsoleHtml(token: string): string {
     </header>
 
     <nav class="sidebar" aria-label="Console sections">
+      <!-- Nav is grouped into labelled sections so every panel has an
+           obvious home. Group headers are inert (.nav-group); the
+           buttons keep their data-panel keys, so switchPanel(),
+           navButtons (descendant query), badge wiring, and
+           syncMeetingsPlacement() are all unaffected by the grouping. -->
+
+      <div class="nav-group">Overview</div>
       <button class="nav active" data-panel="home">
         <span class="nav-key">01</span>
         <span class="nav-label">Home</span>
@@ -126,25 +133,16 @@ export function renderConsoleHtml(token: string): string {
         <span class="nav-label">Activity</span>
         <span class="nav-badge" data-activity-badge hidden>0</span>
       </button>
-      <!-- v0.5.11: Brain panel — single home for everything Clementine
-           knows + how it learns + how it's evolving. Consolidates the
-           legacy Memory / Context / Evolution top-level slots into one
-           panel with 5 sub-tabs (Overview / Knowledge / Events /
-           Profile / Evolution). See [[project_brain_architecture]]. -->
-      <button class="nav" data-panel="brain">
+      <!-- v0.5.11: dedicated Approvals panel. Surfaces pending approvals
+           with full context (subject, args, workflow source, age) and
+           per-row + bulk actions. Sits in Overview because it's a daily
+           "needs me" surface, not a system setting. -->
+      <button class="nav" data-panel="approvals">
         <span class="nav-key">03</span>
-        <span class="nav-label">Brain</span>
+        <span class="nav-label">Approvals <span class="approvals-badge" data-approvals-badge hidden></span></span>
       </button>
-      <!-- Meetings — promoted to a top-level slot only when Recall.ai
-           meeting capture is enabled. Hidden by default; revealed by
-           syncMeetingsPlacement() once recallStatus().enabled is true.
-           When not configured, meetings stay under Brain's "meetings"
-           sub-tab (status quo). Letter key "M" mirrors Approvals' "A"
-           so the 01–10 numbering never shifts. -->
-      <button class="nav" data-panel="meetings" data-meetings-nav hidden>
-        <span class="nav-key">M</span>
-        <span class="nav-label">Meetings</span>
-      </button>
+
+      <div class="nav-group">Workspace</div>
       <button class="nav" data-panel="workflows">
         <span class="nav-key">04</span>
         <span class="nav-label">Workflows</span>
@@ -161,24 +159,38 @@ export function renderConsoleHtml(token: string): string {
         <span class="nav-key">07</span>
         <span class="nav-label">Integrations</span>
       </button>
-      <button class="nav" data-panel="usage">
+
+      <div class="nav-group">Intelligence</div>
+      <!-- v0.5.11: Brain panel — single home for everything Clementine
+           knows + how it learns + how it's evolving. Consolidates the
+           legacy Memory / Context / Evolution top-level slots into one
+           panel with 5 sub-tabs (Overview / Knowledge / Events /
+           Profile / Evolution). See [[project_brain_architecture]]. -->
+      <button class="nav" data-panel="brain">
         <span class="nav-key">08</span>
+        <span class="nav-label">Brain</span>
+      </button>
+      <!-- Meetings — promoted to a top-level slot only when Recall.ai
+           meeting capture is enabled. Hidden by default; revealed by
+           syncMeetingsPlacement() once recallStatus().enabled is true.
+           When not configured, meetings stay under Brain's "meetings"
+           sub-tab (status quo). -->
+      <button class="nav" data-panel="meetings" data-meetings-nav hidden>
+        <span class="nav-key">M</span>
+        <span class="nav-label">Meetings</span>
+      </button>
+
+      <div class="nav-group">System</div>
+      <button class="nav" data-panel="usage">
+        <span class="nav-key">09</span>
         <span class="nav-label">Usage</span>
       </button>
       <button class="nav" data-panel="settings">
-        <span class="nav-key">09</span>
+        <span class="nav-key">10</span>
         <span class="nav-label">Settings</span>
       </button>
-      <!-- v0.5.11: dedicated Approvals panel. Surfaces pending approvals
-           with full context (subject, args, workflow source, age) and
-           per-row + bulk actions. Replaces the noise loop where briefs
-           pinged the user without enough context to act on. -->
-      <button class="nav" data-panel="approvals">
-        <span class="nav-key">A</span>
-        <span class="nav-label">Approvals <span class="approvals-badge" data-approvals-badge hidden></span></span>
-      </button>
       <button class="nav" data-panel="mobile-access">
-        <span class="nav-key">M</span>
+        <span class="nav-key">11</span>
         <span class="nav-label">Mobile</span>
       </button>
 
@@ -412,7 +424,11 @@ export function renderConsoleHtml(token: string): string {
                     </div>
                   </div>
                 </div>
+                <div class="home-chat-attachments" data-home-chat-attachments hidden></div>
                 <form class="home-chat-form" data-home-chat-form>
+                  <input type="file" data-home-chat-file multiple hidden
+                    accept=".pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.csv,.txt,.md,.epub,.rtf,.msg,.png,.jpg,.jpeg,.gif,.bmp,.tiff,.webp,.wav,.mp3,.m4a,.flac,.zip" />
+                  <button type="button" class="home-chat-attach" data-home-chat-attach title="Attach a file (PDF, Word, Excel, image, audio…) or paste a YouTube link">📎</button>
                   <input type="text" class="home-chat-input" data-home-chat-input
                     placeholder="message Clementine…" autocomplete="off" />
                   <button type="submit" class="home-chat-send">SEND ↵</button>
@@ -707,10 +723,10 @@ export function renderConsoleHtml(token: string): string {
 
           <div class="hub-block">
             <div class="hub-block-head">
-              <span class="hub-block-title">Skill / CLI Installer</span>
+              <span class="hub-block-title">Manual Install Command</span>
               <span class="hub-block-meta" data-hub-installer-meta>approved commands only</span>
             </div>
-            <p class="hub-block-intro">Advanced and optional. Install trusted CLI tools (gh, sf, etc.) without opening Terminal. Accepts single install commands such as <code>npm install -g package</code>, <code>brew install formula</code>, <code>uv tool install package</code>, <code>pipx install package</code>, or <code>git clone https://github.com/org/repo</code>. <strong>For SKILL installs (Hallmark, etc.) use Skills → Install Skill — that path drops the skill into <code>~/.clementine-next/skills/</code> properly.</strong></p>
+            <p class="hub-block-intro">Advanced and optional — an escape hatch for installing a CLI when the guided "Connect a CLI" search above doesn't have it. Runs a single trusted install command without opening Terminal: <code>npm install -g package</code>, <code>brew install formula</code>, <code>uv tool install package</code>, <code>pipx install package</code>, or <code>git clone https://github.com/org/repo</code>. <strong>Not for skills</strong> — install those from the <strong>Skills</strong> panel, which places them in <code>~/.clementine-next/skills/</code> correctly.</p>
             <div class="hub-apps-controls" data-hub-installer-controls>
               <input type="text" data-hub-install-command placeholder="npm install -g some-cli" />
               <button data-hub-install-run>RUN INSTALL</button>
@@ -846,6 +862,7 @@ export function renderConsoleHtml(token: string): string {
             </div>
             <div class="brain-knowledge-pane" data-brain-knowledge-pane="facts">
               <div class="brain-controls">
+                <input type="search" class="brain-fact-search" data-brain-fact-search placeholder="Search facts…" />
                 <select data-brain-fact-kind>
                   <option value="">all kinds</option>
                   <option value="user">user</option>
@@ -859,6 +876,7 @@ export function renderConsoleHtml(token: string): string {
                   <option value="important">most important first</option>
                   <option value="trust">most trusted first</option>
                 </select>
+                <button type="button" class="brain-forgotten-toggle" data-brain-fact-forgotten title="Show facts that were forgotten or auto-decayed — they are restorable">SHOW FORGOTTEN</button>
                 <span class="brain-count" data-brain-fact-count></span>
               </div>
               <div class="brain-list" data-brain-fact-list>
@@ -1282,10 +1300,14 @@ export function renderConsoleHtml(token: string): string {
 
       <section class="panel-frame" data-section="settings" hidden>
         <div class="panel-tag">PANEL · 09 · SETTINGS</div>
-        <div class="panel-toolbar" style="display:flex; justify-content:flex-end; padding:8px 16px; border-bottom:1px solid var(--line);">
-          <label class="check-pill" style="cursor:pointer;">
+        <div class="panel-toolbar settings-toolbar">
+          <label class="dev-toggle" title="Reveal diagnostics, the tool catalog, and runtime tuning controls">
             <input type="checkbox" data-settings-advanced-toggle />
-            <span>Show advanced</span>
+            <span class="dev-toggle-switch" aria-hidden="true"></span>
+            <span class="dev-toggle-text">
+              <span class="dev-toggle-label">Developer mode</span>
+              <span class="dev-toggle-hint">Diagnostics, tool catalog &amp; tuning</span>
+            </span>
           </label>
         </div>
         <div class="settings-tabs" data-settings-tabs>
@@ -1294,8 +1316,8 @@ export function renderConsoleHtml(token: string): string {
           <button type="button" class="settings-tab" data-settings-tab-target="autonomy">AUTONOMY</button>
           <button type="button" class="settings-tab" data-settings-tab-target="memory">MEMORY</button>
           <button type="button" class="settings-tab" data-settings-tab-target="credentials">CREDENTIALS</button>
-          <button type="button" class="settings-tab" data-settings-tab-target="tools">TOOLS</button>
-          <button type="button" class="settings-tab" data-settings-tab-target="diagnostics">DIAGNOSTICS</button>
+          <button type="button" class="settings-tab" data-settings-tab-target="tools" data-advanced-block hidden>TOOLS</button>
+          <button type="button" class="settings-tab" data-settings-tab-target="diagnostics" data-advanced-block hidden>DIAGNOSTICS</button>
         </div>
         <div class="panel-body settings-layout">
 
@@ -1411,7 +1433,7 @@ export function renderConsoleHtml(token: string): string {
               <div class="settings-info" data-settings-models-status>—</div>
             </div>
 
-            <div class="settings-block" data-settings-tab-panel="runtime">
+            <div class="settings-block" data-settings-tab-panel="runtime" data-advanced-block hidden>
               <div class="settings-block-head">RUNTIME BUDGETS</div>
               <form class="settings-form" data-settings-runtime-form>
                 <div class="settings-field">
@@ -2688,6 +2710,15 @@ body {
   flex-direction: column;
   padding: 12px 0;
 }
+.nav-group {
+  padding: 14px 18px 5px 16px;
+  font-size: 9px;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--fg-mute);
+  user-select: none;
+}
+.nav-group:first-of-type { padding-top: 2px; }
 .nav {
   background: transparent;
   border: 0;
@@ -3832,6 +3863,41 @@ body {
   border-top: 1px solid var(--line);
   background: var(--bg-2);
 }
+.home-chat-attach {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-dim, var(--fg));
+  font-size: 14px;
+  line-height: 1;
+  padding: 4px 9px;
+  cursor: pointer;
+}
+.home-chat-attach:hover { border-color: var(--accent); color: var(--accent); }
+.home-chat-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 14px 0;
+}
+.home-chat-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 240px;
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  color: var(--fg);
+  font-size: 11px;
+  padding: 3px 8px;
+}
+.home-chat-chip.is-error { border-color: var(--danger, #c0392b); color: var(--danger, #c0392b); }
+.home-chat-chip.is-pending { opacity: 0.7; }
+.home-chat-chip-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.home-chat-chip-x {
+  background: transparent; border: 0; color: inherit; cursor: pointer;
+  font-size: 13px; line-height: 1; padding: 0;
+}
+.home-chat-thread.is-dragover { outline: 2px dashed var(--accent); outline-offset: -6px; }
 .home-chat-input {
   flex: 1;
   background: var(--bg-0);
@@ -7662,13 +7728,135 @@ body {
 .proj-detail {
   border: 1px solid var(--line);
   background: var(--bg-2);
-  overflow-y: auto;
-  padding: 14px;
+  overflow: hidden;
+  padding: 0;
   display: flex;
   flex-direction: column;
-  gap: 10px;
   font-size: 11px;
 }
+.proj-detail > .wf-empty { margin: auto; }
+
+/* ── In-project file explorer ── */
+.proj-explorer { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.proj-exp-bar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 8px 12px; background: var(--bg-1); border-bottom: 1px solid var(--line);
+}
+.pe-bar-name { color: var(--fg); font-size: 11px; letter-spacing: 0.06em; font-weight: 600; }
+.pe-bar-overview {
+  background: transparent; border: 1px solid var(--line); color: var(--fg-3);
+  font: 10px var(--mono); letter-spacing: 0.14em; padding: 3px 9px; cursor: pointer;
+  transition: color 100ms, border-color 100ms;
+}
+.pe-bar-overview:hover { color: var(--accent); border-color: var(--accent); }
+.proj-exp-panes { display: grid; grid-template-columns: 248px 1fr; flex: 1; min-height: 0; }
+.proj-tree-col {
+  display: flex; flex-direction: column; min-height: 0;
+  border-right: 1px solid var(--line); background: var(--bg-2);
+}
+.pe-search {
+  margin: 6px; padding: 5px 8px; font: 11px var(--mono);
+  background: var(--bg-1); border: 1px solid var(--line); color: var(--fg);
+}
+.pe-search::placeholder { color: var(--fg-mute); }
+.pe-recent { border-bottom: 1px solid var(--line); padding: 4px 0 6px; flex-shrink: 0; }
+.pe-recent-head {
+  font-size: 9px; letter-spacing: 0.18em; color: var(--fg-mute); padding: 2px 12px 4px;
+}
+.pe-recent-row {
+  font: 11px var(--mono); color: var(--fg-2); padding: 2px 12px; cursor: pointer;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.pe-recent-row:hover { background: var(--bg-3); color: var(--fg); }
+.proj-tree {
+  overflow: auto; padding: 4px 0; user-select: none; flex: 1; min-height: 0;
+}
+.proj-grep { overflow: auto; flex: 1; min-height: 0; font: 11px/1.5 var(--mono); }
+.pe-grep-status { padding: 8px 12px; color: var(--fg-mute); font-size: 10px; letter-spacing: 0.06em; }
+.pe-grep-file { border-bottom: 1px solid var(--line); padding-bottom: 4px; }
+.pe-grep-file-name {
+  padding: 5px 12px 3px; color: var(--accent-3); font-size: 10px; word-break: break-all;
+}
+.pe-grep-line { display: flex; gap: 8px; padding: 1px 12px 1px 18px; cursor: pointer; color: var(--fg-2); }
+.pe-grep-line:hover { background: var(--bg-3); color: var(--fg); }
+.pe-grep-ln { color: var(--fg-mute); min-width: 28px; text-align: right; flex-shrink: 0; font-size: 10px; }
+.pe-grep-tx { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* Preview header open button + numbered code view */
+.pe-prev-spacer { flex: 1; }
+.pe-prev-open {
+  background: transparent; border: 1px solid var(--line); color: var(--fg-3);
+  font: 10px var(--mono); letter-spacing: 0.12em; padding: 2px 8px; cursor: pointer; flex-shrink: 0;
+  transition: color 100ms, border-color 100ms;
+}
+.pe-prev-open:hover { color: var(--accent); border-color: var(--accent); }
+.pe-prev-code-wrap { padding: 8px 0; font: 11px/1.55 var(--mono); }
+.pe-code-line { display: flex; gap: 0; padding: 0 12px; }
+.pe-code-line.hit { background: color-mix(in srgb, var(--accent) 16%, transparent); }
+.pe-code-ln {
+  color: var(--fg-mute); min-width: 42px; text-align: right; padding-right: 14px;
+  flex-shrink: 0; user-select: none;
+}
+.pe-code-tx { color: var(--fg); white-space: pre; }
+.pe-row {
+  display: flex; align-items: center; gap: 6px; padding: 3px 10px 3px 0;
+  font: 11px/1.4 var(--mono); color: var(--fg-2); cursor: pointer; white-space: nowrap;
+}
+.pe-row:hover { background: var(--bg-3); }
+.pe-file.active { background: var(--bg-3); color: var(--fg); box-shadow: inset 2px 0 0 var(--accent); }
+.pe-twist { width: 12px; flex-shrink: 0; color: var(--fg-3); font-size: 9px; text-align: center; }
+.pe-dot { color: var(--fg-mute); }
+.pe-dir > .pe-label { color: var(--accent-3); }
+.pe-label { overflow: hidden; text-overflow: ellipsis; }
+.pe-size { margin-left: auto; padding-left: 10px; color: var(--fg-mute); font-size: 9px; flex-shrink: 0; }
+.pe-empty { color: var(--fg-mute); font-size: 10px; letter-spacing: 0.08em; cursor: default; }
+.pe-empty:hover { background: transparent; }
+.proj-preview { overflow: auto; background: var(--bg-1); display: flex; flex-direction: column; }
+.pe-prev-empty {
+  margin: auto; color: var(--fg-mute); letter-spacing: 0.12em; font-size: 11px; padding: 40px;
+}
+.pe-prev-head {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 12px;
+  padding: 8px 14px; border-bottom: 1px solid var(--line); background: var(--bg-2);
+  position: sticky; top: 0; z-index: 1;
+}
+.pe-prev-name { color: var(--fg); font-size: 11px; }
+.pe-prev-meta { color: var(--fg-mute); font-size: 10px; letter-spacing: 0.08em; flex-shrink: 0; }
+.pe-prev-code {
+  margin: 0; padding: 12px 14px; font: 11px/1.55 var(--mono); color: var(--fg);
+  white-space: pre; overflow-x: auto;
+}
+.pe-prev-body { padding: 14px 18px; }
+.pe-prev-img { padding: 18px; display: flex; align-items: flex-start; justify-content: center; }
+.pe-prev-img img {
+  max-width: 100%; height: auto; border: 1px solid var(--line);
+  background: repeating-conic-gradient(var(--bg-2) 0% 25%, var(--bg-3) 0% 50%) 50% / 16px 16px;
+}
+.pe-md { font-size: 12px; line-height: 1.6; color: var(--fg); }
+.pe-md h1 { font-size: 17px; margin: 14px 0 8px; color: var(--fg); }
+.pe-md h2 { font-size: 14px; margin: 14px 0 6px; color: var(--fg); }
+.pe-md p { margin: 6px 0; color: var(--fg-2); }
+.pe-md ul { margin: 6px 0; padding-left: 20px; color: var(--fg-2); }
+.pe-md li { margin: 2px 0; }
+.pe-md code { background: var(--bg-3); padding: 1px 5px; border-radius: 2px; font-size: 11px; }
+.pe-md hr { border: none; border-top: 1px solid var(--line); margin: 12px 0; }
+.pe-md table { border-collapse: collapse; margin: 8px 0; font-size: 11px; }
+.pe-md th, .pe-md td { border: 1px solid var(--line); padding: 4px 8px; text-align: left; }
+.pe-md th { background: var(--bg-2); color: var(--fg-3); }
+.pe-md a { color: var(--accent); }
+/* Overview (default preview) */
+.pe-overview { padding: 14px 16px; display: flex; flex-direction: column; gap: 12px; }
+.pe-ov-head { display: flex; flex-direction: column; gap: 2px; }
+.pe-ov-name { color: var(--fg); font-size: 13px; font-weight: 600; }
+.pe-ov-path { color: var(--fg-mute); font-size: 10px; word-break: break-all; }
+.pe-ov-block { border: 1px solid var(--line); background: var(--bg-2); }
+.pe-ov-block-head {
+  padding: 6px 12px; background: var(--bg-1); border-bottom: 1px solid var(--line);
+  font-size: 10px; letter-spacing: 0.16em; color: var(--fg-3);
+}
+.pe-ov-block-body { padding: 10px 12px; }
+.pe-ov-desc { color: var(--fg-2); margin-bottom: 8px; }
+.pe-ov-sub { font-size: 10px; letter-spacing: 0.14em; color: var(--fg-3); margin: 8px 0 4px; }
+.pe-ov-deps { font-size: 10px; color: var(--fg-2); line-height: 1.6; }
 .proj-block {
   border: 1px solid var(--line);
   background: var(--bg-1);
@@ -8981,6 +9169,35 @@ body {
 .brain-fact-meta .pill.derived { color: var(--accent-warn); border-color: var(--accent-warn); }
 .brain-fact-meta .pill.direct { color: var(--accent-ok, #4ade80); border-color: var(--accent-ok, #4ade80); }
 .brain-fact-meta .pill.important { color: var(--accent); border-color: var(--accent); }
+/* Fact search box + forgotten toggle */
+.brain-fact-search {
+  font-size: 11px; padding: 4px 8px; background: var(--bg-2);
+  border: 1px solid var(--line); color: var(--fg-1); min-width: 200px; flex: 1;
+}
+.brain-fact-search::placeholder { color: var(--fg-mute); }
+.brain-forgotten-toggle {
+  font: 10px var(--mono); letter-spacing: 0.1em; padding: 4px 9px;
+  background: transparent; border: 1px solid var(--line); color: var(--fg-3); cursor: pointer;
+  white-space: nowrap; transition: color 120ms, border-color 120ms;
+}
+.brain-forgotten-toggle:hover { color: var(--fg); border-color: var(--fg-3); }
+.brain-forgotten-toggle.on { color: var(--accent); border-color: var(--accent); }
+/* Inline per-fact row actions — revealed on hover to keep the list calm */
+.brain-fact-row { position: relative; }
+.brain-fact-row.inactive { opacity: 0.6; }
+.brain-fact-actions {
+  display: flex; gap: 6px; margin-top: 2px;
+  opacity: 0; max-height: 0; overflow: hidden; transition: opacity 120ms;
+}
+.brain-fact-row:hover .brain-fact-actions,
+.brain-fact-row:focus-within .brain-fact-actions { opacity: 1; max-height: 40px; }
+.brain-fact-act {
+  font: 9px var(--mono); letter-spacing: 0.1em; padding: 3px 8px;
+  background: var(--bg-2); border: 1px solid var(--line); color: var(--fg-2); cursor: pointer;
+  transition: color 120ms, border-color 120ms;
+}
+.brain-fact-act:hover { color: var(--accent); border-color: var(--accent); }
+.brain-fact-act.danger:hover { color: #d04848; border-color: #d04848; }
 .brain-entity-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
 .brain-entity-name { font-size: 12px; font-weight: 500; }
 .brain-entity-type {
@@ -9284,6 +9501,57 @@ body {
 }
 
 /* ── Settings panel ──────────────────────────────────────────── */
+.settings-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--line);
+}
+/* Developer-mode toggle — a clear pill switch that reveals advanced surfaces */
+.dev-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+  padding: 5px 12px 5px 10px;
+  border: 1px solid var(--line);
+  background: var(--bg-1);
+  transition: border-color 120ms;
+}
+.dev-toggle:hover { border-color: var(--accent); }
+.dev-toggle input { position: absolute; opacity: 0; width: 0; height: 0; }
+.dev-toggle-switch {
+  position: relative;
+  width: 30px; height: 16px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--bg-3);
+  flex-shrink: 0;
+  transition: background 120ms, border-color 120ms;
+}
+.dev-toggle-switch::after {
+  content: '';
+  position: absolute;
+  top: 1px; left: 1px;
+  width: 12px; height: 12px;
+  border-radius: 50%;
+  background: var(--fg-3);
+  transition: transform 140ms, background 140ms;
+}
+.dev-toggle input:checked + .dev-toggle-switch {
+  background: color-mix(in srgb, var(--accent) 30%, var(--bg-3));
+  border-color: var(--accent);
+}
+.dev-toggle input:checked + .dev-toggle-switch::after {
+  transform: translateX(14px);
+  background: var(--accent);
+}
+.dev-toggle input:focus-visible + .dev-toggle-switch { outline: 1px solid var(--accent); outline-offset: 2px; }
+.dev-toggle-text { display: flex; flex-direction: column; line-height: 1.25; text-align: left; }
+.dev-toggle-label { font-size: 11px; letter-spacing: 0.04em; color: var(--fg); }
+.dev-toggle-hint { font-size: 9px; letter-spacing: 0.04em; color: var(--fg-mute); }
+
 .settings-tabs {
   display: flex;
   flex-wrap: wrap;
@@ -12173,11 +12441,14 @@ const CONSOLE_JS = `
   document.querySelectorAll('[data-home-tile]').forEach((tile) => {
     tile.addEventListener('click', () => {
       const kind = tile.getAttribute('data-home-tile');
-      if (kind === 'approvals' || kind === 'plans' || kind === 'proposals' || kind === 'checkins') {
+      if (kind === 'approvals') {
+        // Approvals have one home now: the dedicated Approvals panel
+        // (full context + per-row/bulk actions), not buried in Settings.
+        switchPanel('approvals');
+      } else if (kind === 'plans' || kind === 'proposals' || kind === 'checkins') {
+        // Agent-drafted plans / proposals / check-ins are still authored
+        // in Settings → Autonomy.
         switchPanel('settings');
-        // Settings panel hosts proposal/plan/check-in editors. Approvals
-        // surface in run-inspector / Discord buttons; for v1 just open
-        // Settings so users find the related controls.
       } else if (kind === 'activity') {
         switchPanel('activity');
       } else if (kind === 'memory') {
@@ -17824,45 +18095,309 @@ const CONSOLE_JS = `
     });
   }
 
+  // ─── In-project file explorer ─────────────────────────────────
+  // Two panes inside the detail area: a lazy-loaded file tree on the
+  // left, a live preview (markdown / code / image) on the right. The
+  // project overview (README, package.json, agent notes) is the default
+  // preview until the user opens a file.
+  let projMeta = null;
+
+  function projFmtBytes(n) {
+    if (!n && n !== 0) return '';
+    if (n < 1024) return n + ' B';
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+    return (n / (1024 * 1024)).toFixed(1) + ' MB';
+  }
+
+  function projTreeRow(e, depth) {
+    const pad = 'style="padding-left:' + (depth * 13 + 10) + 'px"';
+    if (e.isDir) {
+      return [
+        '<div class="pe-row pe-dir" data-rel="' + escMem(e.rel) + '" data-loaded="0" ' + pad + '>',
+        '  <span class="pe-twist">▸</span>',
+        '  <span class="pe-label">' + escMem(e.name) + '</span>',
+        '</div>',
+        '<div class="pe-children" data-children="' + escMem(e.rel) + '" hidden></div>',
+      ].join('');
+    }
+    return [
+      '<div class="pe-row pe-file" data-rel="' + escMem(e.rel) + '" data-name="' + escMem(e.name) + '" ' + pad + '>',
+      '  <span class="pe-twist pe-dot">·</span>',
+      '  <span class="pe-label">' + escMem(e.name) + '</span>',
+      '  <span class="pe-size">' + escMem(projFmtBytes(e.size)) + '</span>',
+      '</div>',
+    ].join('');
+  }
+
+  function projRenderLevel(entries, depth) {
+    if (!entries || entries.length === 0) {
+      return '<div class="pe-row pe-empty" style="padding-left:' + (depth * 13 + 22) + 'px">— empty —</div>';
+    }
+    return entries.map((e) => projTreeRow(e, depth)).join('');
+  }
+
+  function projDepthOf(rel) {
+    return rel ? rel.split('/').length : 0;
+  }
+
+  function projWireTree(treeEl) {
+    treeEl.addEventListener('click', async (ev) => {
+      const row = ev.target.closest('.pe-row');
+      if (!row || !treeEl.contains(row)) return;
+      if (row.classList.contains('pe-dir')) {
+        const rel = row.getAttribute('data-rel');
+        const kids = treeEl.querySelector('[data-children="' + (window.CSS && CSS.escape ? CSS.escape(rel) : rel) + '"]');
+        const fallback = !kids ? Array.from(treeEl.querySelectorAll('.pe-children')).find((c) => c.getAttribute('data-children') === rel) : null;
+        const box = kids || fallback;
+        if (!box) return;
+        const twist = row.querySelector('.pe-twist');
+        if (row.getAttribute('data-loaded') === '0') {
+          box.innerHTML = '<div class="pe-row pe-empty" style="padding-left:' + ((projDepthOf(rel) + 1) * 13 + 22) + 'px">…</div>';
+          box.hidden = false;
+          row.setAttribute('data-loaded', '1');
+          if (twist) twist.textContent = '▾';
+          row.classList.add('open');
+          try {
+            const data = await fetchJSON('/api/console/projects/files?root=' + encodeURIComponent(projSelectedPath) + '&path=' + encodeURIComponent(rel));
+            box.innerHTML = projRenderLevel(data.entries || [], projDepthOf(rel) + 1);
+          } catch (err) {
+            box.innerHTML = '<div class="pe-row pe-empty" style="padding-left:' + ((projDepthOf(rel) + 1) * 13 + 22) + 'px">— ' + escMem(err.message || err) + ' —</div>';
+          }
+        } else {
+          box.hidden = !box.hidden;
+          row.classList.toggle('open', !box.hidden);
+          if (twist) twist.textContent = box.hidden ? '▸' : '▾';
+        }
+        return;
+      }
+      if (row.classList.contains('pe-file')) {
+        Array.from(treeEl.querySelectorAll('.pe-file.active')).forEach((el) => el.classList.remove('active'));
+        row.classList.add('active');
+        projLoadFile(row.getAttribute('data-rel'), row.getAttribute('data-name'));
+      }
+    });
+  }
+
+  function projOverviewHtml(meta) {
+    if (!meta) return '<div class="pe-prev-empty">— select a file to preview —</div>';
+    const parts = ['<div class="pe-overview">'];
+    parts.push('<div class="pe-ov-head"><span class="pe-ov-name">' + escMem((meta.path || '').split('/').pop()) + '</span><span class="pe-ov-path">' + escMem(meta.path || '') + '</span></div>');
+    if (meta.package) {
+      const pkg = meta.package;
+      const scripts = Object.entries(pkg.scripts || {}).slice(0, 12)
+        .map(([k, v]) => '<dt>' + escMem(k) + '</dt><dd>' + escMem(String(v)) + '</dd>').join('');
+      parts.push([
+        '<div class="pe-ov-block"><div class="pe-ov-block-head">PACKAGE · ' + escMem(pkg.name || '') + ' ' + escMem(pkg.version || '') + '</div>',
+        '<div class="pe-ov-block-body">',
+        pkg.description ? '<div class="pe-ov-desc">' + escMem(pkg.description) + '</div>' : '',
+        scripts ? '<div class="pe-ov-sub">SCRIPTS</div><dl class="proj-pkg-grid">' + scripts + '</dl>' : '',
+        (pkg.dependencies || []).length > 0
+          ? '<div class="pe-ov-sub">DEPENDENCIES (' + pkg.dependencies.length + ')</div><div class="pe-ov-deps">' + escMem(pkg.dependencies.slice(0, 30).join(', ')) + (pkg.dependencies.length > 30 ? ' …' : '') + '</div>'
+          : '',
+        '</div></div>',
+      ].join(''));
+    }
+    if (meta.readme) {
+      parts.push('<div class="pe-ov-block"><div class="pe-ov-block-head">README</div><div class="pe-ov-block-body pe-md">' + renderTinyMarkdown(meta.readme) + '</div></div>');
+    }
+    if (meta.claudeMd) {
+      parts.push('<div class="pe-ov-block"><div class="pe-ov-block-head">AGENT NOTES</div><div class="pe-ov-block-body pe-md">' + renderTinyMarkdown(meta.claudeMd) + '</div></div>');
+    }
+    if (!meta.package && !meta.readme && !meta.claudeMd) {
+      parts.push('<div class="pe-prev-empty">— select a file from the tree to preview it —</div>');
+    }
+    parts.push('</div>');
+    return parts.join('');
+  }
+
+  async function projLoadFile(rel, name, gotoLine) {
+    const prev = proj.detail.querySelector('[data-proj-preview]');
+    if (!prev) return;
+    prev.innerHTML = '<div class="pe-prev-empty">— loading ' + escMem(name) + ' —</div>';
+    try {
+      const data = await fetchJSON('/api/console/projects/file?root=' + encodeURIComponent(projSelectedPath) + '&path=' + encodeURIComponent(rel));
+      const ext = (data.ext || '').toLowerCase();
+      const head = [
+        '<div class="pe-prev-head">',
+        '  <span class="pe-prev-name">' + escMem(data.name || name) + '</span>',
+        '  <span class="pe-prev-spacer"></span>',
+        '  <span class="pe-prev-meta">' + escMem(projFmtBytes(data.size)) + (data.truncated ? ' · truncated' : '') + '</span>',
+        '  <button class="pe-prev-open" data-proj-open type="button" title="Open in your default editor / app">OPEN ↗</button>',
+        '</div>',
+      ].join('');
+      let bodyHtml;
+      if (data.kind === 'image') {
+        bodyHtml = '<div class="pe-prev-img"><img src="' + escMem(data.dataUrl) + '" alt="' + escMem(data.name || '') + '" /></div>';
+      } else if (data.kind === 'binary') {
+        bodyHtml = '<div class="pe-prev-empty">— binary file · ' + escMem(projFmtBytes(data.size)) + ' · no preview —</div>';
+      } else if (data.kind === 'too-large') {
+        bodyHtml = '<div class="pe-prev-empty">— file too large to preview · ' + escMem(projFmtBytes(data.size)) + ' —</div>';
+      } else if (ext === '.md' || ext === '.markdown') {
+        bodyHtml = '<div class="pe-prev-body pe-md">' + renderTinyMarkdown(data.content || '') + '</div>';
+      } else {
+        // Numbered code view so grep "go to line" can land somewhere visible.
+        // Cap the row count — very large files fall back to a plain <pre> so
+        // we never build tens of thousands of DOM nodes.
+        const lines = (data.content || '').split('\\n');
+        if (lines.length > 4000) {
+          bodyHtml = '<pre class="pe-prev-code">' + escMem(data.content || '') + '</pre>';
+        } else {
+          bodyHtml = '<div class="pe-prev-code-wrap">' + lines.map((ln, i) =>
+            '<div class="pe-code-line" data-line="' + (i + 1) + '"><span class="pe-code-ln">' + (i + 1) + '</span><span class="pe-code-tx">' + escMem(ln) + '</span></div>'
+          ).join('') + '</div>';
+        }
+      }
+      prev.innerHTML = head + bodyHtml;
+      prev.scrollTop = 0;
+      const openBtn = prev.querySelector('[data-proj-open]');
+      if (openBtn) openBtn.addEventListener('click', () => projOpenFile(rel));
+      if (gotoLine) {
+        const target = prev.querySelector('.pe-code-line[data-line="' + gotoLine + '"]');
+        if (target) { target.classList.add('hit'); target.scrollIntoView({ block: 'center' }); }
+      }
+      projPushRecent(rel, name);
+    } catch (err) {
+      prev.innerHTML = '<div class="pe-prev-empty">— ' + escMem(err.message || err) + ' —</div>';
+    }
+  }
+
+  async function projOpenFile(rel) {
+    try {
+      const r = await fetch(withToken('/api/console/projects/open'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ root: projSelectedPath, path: rel }),
+      });
+      if (!r.ok) { const j = await r.json().catch(() => ({})); alert('Could not open: ' + (j.error || ('HTTP ' + r.status))); }
+    } catch (err) {
+      alert('Open failed: ' + ((err && err.message) || err));
+    }
+  }
+
+  // ─── In-project content search (grep) ─────────────────────────
+  function projWireSearch() {
+    const input = proj.detail.querySelector('[data-proj-search]');
+    const treeEl = proj.detail.querySelector('[data-proj-tree]');
+    const grepEl = proj.detail.querySelector('[data-proj-grep]');
+    if (!input || !treeEl || !grepEl) return;
+    let timer = null;
+    input.addEventListener('input', () => {
+      if (timer) clearTimeout(timer);
+      const q = input.value.trim();
+      if (q.length < 2) {
+        grepEl.hidden = true; grepEl.innerHTML = '';
+        treeEl.hidden = false;
+        return;
+      }
+      timer = setTimeout(() => projRunGrep(q, treeEl, grepEl), 280);
+    });
+  }
+
+  async function projRunGrep(q, treeEl, grepEl) {
+    treeEl.hidden = true;
+    grepEl.hidden = false;
+    grepEl.innerHTML = '<div class="pe-grep-status">— searching —</div>';
+    try {
+      const data = await fetchJSON('/api/console/projects/grep?root=' + encodeURIComponent(projSelectedPath) + '&q=' + encodeURIComponent(q));
+      const matches = data.matches || [];
+      if (matches.length === 0) {
+        grepEl.innerHTML = '<div class="pe-grep-status">— no matches in ' + (data.filesScanned || 0) + ' files —</div>';
+        return;
+      }
+      // Group matches by file.
+      const byFile = {};
+      matches.forEach((m) => { (byFile[m.rel] = byFile[m.rel] || []).push(m); });
+      const status = '<div class="pe-grep-status">' + matches.length + ' match' + (matches.length === 1 ? '' : 'es') + ' in ' + Object.keys(byFile).length + ' file' + (Object.keys(byFile).length === 1 ? '' : 's') + (data.truncated ? ' (truncated)' : '') + '</div>';
+      grepEl.innerHTML = status + Object.keys(byFile).map((rel) => {
+        const rows = byFile[rel].map((m) =>
+          '<div class="pe-grep-line" data-grep-rel="' + escMem(rel) + '" data-grep-line="' + m.line + '"><span class="pe-grep-ln">' + m.line + '</span><span class="pe-grep-tx">' + escMem(m.text.trim()) + '</span></div>'
+        ).join('');
+        return '<div class="pe-grep-file"><div class="pe-grep-file-name">' + escMem(rel) + '</div>' + rows + '</div>';
+      }).join('');
+      Array.from(grepEl.querySelectorAll('[data-grep-rel]')).forEach((row) => {
+        row.addEventListener('click', () => {
+          const rel = row.getAttribute('data-grep-rel');
+          const line = parseInt(row.getAttribute('data-grep-line'), 10) || 0;
+          projLoadFile(rel, rel.split('/').pop(), line);
+        });
+      });
+    } catch (err) {
+      grepEl.innerHTML = '<div class="pe-grep-status">— ' + escMem(err.message || err) + ' —</div>';
+    }
+  }
+
+  // ─── Per-project recent files (localStorage) ──────────────────
+  function projRecentKey() { return 'clementine.proj.recent.' + (projSelectedPath || ''); }
+  function projReadRecents() {
+    try { return JSON.parse(localStorage.getItem(projRecentKey()) || '[]'); } catch (_) { return []; }
+  }
+  function projPushRecent(rel, name) {
+    try {
+      let list = projReadRecents().filter((r) => r.rel !== rel);
+      list.unshift({ rel: rel, name: name || rel.split('/').pop() });
+      list = list.slice(0, 6);
+      localStorage.setItem(projRecentKey(), JSON.stringify(list));
+      projRenderRecents();
+    } catch (_) { /* private mode */ }
+  }
+  function projRenderRecents() {
+    const wrap = proj.detail.querySelector('[data-proj-recent]');
+    if (!wrap) return;
+    const list = projReadRecents();
+    if (list.length === 0) { wrap.hidden = true; wrap.innerHTML = ''; return; }
+    wrap.hidden = false;
+    wrap.innerHTML = '<div class="pe-recent-head">RECENT</div>' + list.map((r) =>
+      '<div class="pe-recent-row" data-recent-rel="' + escMem(r.rel) + '" title="' + escMem(r.rel) + '">' + escMem(r.name) + '</div>'
+    ).join('');
+    Array.from(wrap.querySelectorAll('[data-recent-rel]')).forEach((row) => {
+      row.addEventListener('click', () => {
+        const rel = row.getAttribute('data-recent-rel');
+        projLoadFile(rel, rel.split('/').pop());
+      });
+    });
+  }
+
   async function loadProjectDetail(p) {
     if (!p) return;
+    projSelectedPath = p;
     proj.detail.innerHTML = '<div class="wf-empty"><div class="wf-empty-mark">⌛</div><div class="wf-empty-text">LOADING…</div></div>';
     try {
-      const data = await fetchJSON('/api/console/projects/inspect?path=' + encodeURIComponent(p));
-      const parts = [];
-      parts.push('<div class="proj-block"><div class="proj-block-head"><span>PATH</span></div><div class="proj-block-body"><pre>' + escMem(data.path) + '</pre></div></div>');
-
-      if (data.package) {
-        const pkg = data.package;
-        const scripts = Object.entries(pkg.scripts || {}).slice(0, 12)
-          .map(([k, v]) => '<dt>' + escMem(k) + '</dt><dd>' + escMem(String(v)) + '</dd>').join('');
-        parts.push([
-          '<div class="proj-block"><div class="proj-block-head"><span>PACKAGE.JSON</span><em>' + escMem(pkg.name || '') + ' ' + escMem(pkg.version || '') + '</em></div>',
-          '<div class="proj-block-body">',
-          pkg.description ? '<div style="color:var(--fg-2);margin-bottom:8px;">' + escMem(pkg.description) + '</div>' : '',
-          scripts ? '<div style="font-size:10px;letter-spacing:0.14em;color:var(--fg-3);margin-bottom:4px;">SCRIPTS</div><dl class="proj-pkg-grid">' + scripts + '</dl>' : '',
-          (pkg.dependencies || []).length > 0
-            ? '<div style="margin-top:8px;font-size:10px;letter-spacing:0.14em;color:var(--fg-3);">DEPS (' + pkg.dependencies.length + ')</div><div style="font-size:10px;color:var(--fg-2);">' + escMem(pkg.dependencies.slice(0, 24).join(", ")) + (pkg.dependencies.length > 24 ? " …" : "") + '</div>'
-            : '',
-          '</div></div>',
-        ].join(''));
-      }
-
-      if (data.claudeMd) {
-        parts.push('<div class="proj-block"><div class="proj-block-head"><span>IMPORTED AGENT NOTES</span></div><div class="proj-block-body"><pre>' + escMem(data.claudeMd) + '</pre></div></div>');
-      }
-      if (data.readme) {
-        parts.push('<div class="proj-block"><div class="proj-block-head"><span>README</span></div><div class="proj-block-body"><pre>' + escMem(data.readme) + '</pre></div></div>');
-      }
-      if (Array.isArray(data.entries) && data.entries.length > 0) {
-        parts.push([
-          '<div class="proj-block"><div class="proj-block-head"><span>TOP-LEVEL · ' + data.entries.length + '</span></div>',
-          '<div class="proj-block-body"><div class="proj-entries">',
-          data.entries.map((e) => '<span class="entry ' + (e.isDir ? 'dir' : '') + '">' + escMem(e.name) + (e.isDir ? '/' : '') + '</span>').join(''),
-          '</div></div></div>',
-        ].join(''));
-      }
-      proj.detail.innerHTML = parts.join('');
+      const [meta, root] = await Promise.all([
+        fetchJSON('/api/console/projects/inspect?path=' + encodeURIComponent(p)).catch(() => ({ path: p })),
+        fetchJSON('/api/console/projects/files?root=' + encodeURIComponent(p)).catch(() => ({ entries: [] })),
+      ]);
+      projMeta = meta;
+      const projName = escMem((meta.path || p).split('/').pop());
+      proj.detail.innerHTML = [
+        '<div class="proj-explorer">',
+        '  <div class="proj-exp-bar">',
+        '    <span class="pe-bar-name">' + projName + '</span>',
+        '    <button class="pe-bar-overview" data-proj-overview type="button">OVERVIEW</button>',
+        '  </div>',
+        '  <div class="proj-exp-panes">',
+        '    <div class="proj-tree-col">',
+        '      <input type="search" class="pe-search" data-proj-search placeholder="Search in project…" />',
+        '      <div class="pe-recent" data-proj-recent hidden></div>',
+        '      <div class="proj-tree" data-proj-tree></div>',
+        '      <div class="proj-grep" data-proj-grep hidden></div>',
+        '    </div>',
+        '    <div class="proj-preview" data-proj-preview></div>',
+        '  </div>',
+        '</div>',
+      ].join('');
+      const treeEl = proj.detail.querySelector('[data-proj-tree]');
+      treeEl.innerHTML = projRenderLevel(root.entries || [], 0);
+      projWireTree(treeEl);
+      const prev = proj.detail.querySelector('[data-proj-preview]');
+      prev.innerHTML = projOverviewHtml(meta);
+      const ovBtn = proj.detail.querySelector('[data-proj-overview]');
+      if (ovBtn) ovBtn.addEventListener('click', () => {
+        Array.from(treeEl.querySelectorAll('.pe-file.active')).forEach((el) => el.classList.remove('active'));
+        prev.innerHTML = projOverviewHtml(projMeta);
+        prev.scrollTop = 0;
+      });
+      projWireSearch();
+      projRenderRecents();
     } catch (err) {
       proj.detail.innerHTML = '<div class="wf-empty"><div class="wf-empty-mark">!</div><div class="wf-empty-text">' + escMem(err.message || err) + '</div></div>';
     }
@@ -18207,6 +18742,15 @@ const CONSOLE_JS = `
         if (visible) el.removeAttribute('hidden');
         else el.setAttribute('hidden', '');
       });
+      // If a developer-only tab is currently active and we're turning dev
+      // mode off, fall back to Profile so the user isn't left on a blank
+      // (now-hidden) tab.
+      if (!visible) {
+        const activeTab = document.querySelector('.settings-tab.active');
+        if (activeTab && activeTab.hasAttribute('hidden') && typeof window.__clementineSetSettingsTab === 'function') {
+          window.__clementineSetSettingsTab('profile');
+        }
+      }
       if (typeof window.__clementineRefreshSettingsTabColumns === 'function') {
         window.__clementineRefreshSettingsTabColumns();
       }
@@ -18236,7 +18780,7 @@ const CONSOLE_JS = `
       });
     };
     const apply = (tab) => {
-      const valid = buttons.some((button) => button.getAttribute('data-settings-tab-target') === tab);
+      const valid = buttons.some((button) => button.getAttribute('data-settings-tab-target') === tab && !button.hasAttribute('hidden'));
       const next = valid ? tab : 'profile';
       buttons.forEach((button) => {
         button.classList.toggle('active', button.getAttribute('data-settings-tab-target') === next);
@@ -18300,6 +18844,66 @@ const CONSOLE_JS = `
 
   // ─── Home panel ────────────────────────────────────────────────
 
+  // ── Chat attachments (file upload → markitdown convert → fold into turn) ──
+  let homePendingAttachments = []; // { id, name, ok, error, pending, _p }
+  function escAttachText(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+  function renderHomeAttachments() {
+    const box = document.querySelector('[data-home-chat-attachments]');
+    if (!box) return;
+    if (homePendingAttachments.length === 0) { box.setAttribute('hidden', ''); box.innerHTML = ''; return; }
+    box.removeAttribute('hidden');
+    box.innerHTML = homePendingAttachments.map((a, i) => {
+      const cls = a.pending ? 'is-pending' : (a.ok ? '' : 'is-error');
+      const suffix = a.pending ? ' …' : (a.ok ? '' : ' ✕');
+      return '<span class="home-chat-chip ' + cls + '" title="' + escAttachText(a.error || a.name) + '">'
+        + '<span class="home-chat-chip-name">' + escAttachText(a.name) + suffix + '</span>'
+        + '<button type="button" class="home-chat-chip-x" data-home-chat-chip-x="' + i + '">×</button>'
+        + '</span>';
+    }).join('');
+    box.querySelectorAll('[data-home-chat-chip-x]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const idx = parseInt(btn.getAttribute('data-home-chat-chip-x'), 10);
+        if (!Number.isNaN(idx)) { homePendingAttachments.splice(idx, 1); renderHomeAttachments(); }
+      });
+    });
+  }
+  function uploadHomeAttachment(file) {
+    const entry = { id: null, name: file.name || 'attachment', ok: false, error: null, pending: true };
+    entry._p = (async () => {
+      try {
+        const r = await fetchWithToken('/api/attach?name=' + encodeURIComponent(entry.name), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/octet-stream' },
+          body: file,
+        });
+        const j = await r.json().catch(() => ({}));
+        entry.pending = false;
+        if (r.ok && j.id) { entry.id = j.id; entry.ok = !!j.ok; entry.error = j.error || null; entry.name = j.name || entry.name; }
+        else { entry.ok = false; entry.error = j.error || ('HTTP ' + r.status); }
+      } catch (err) {
+        entry.pending = false; entry.ok = false; entry.error = (err && err.message) || String(err);
+      }
+      renderHomeAttachments();
+    })();
+    homePendingAttachments.push(entry);
+    renderHomeAttachments();
+    return entry._p;
+  }
+  async function awaitHomeAttachments() {
+    await Promise.allSettled(homePendingAttachments.map((a) => a._p).filter(Boolean));
+  }
+  function homeAttachmentIds() {
+    return homePendingAttachments.filter((a) => a.id && a.ok).map((a) => a.id);
+  }
+  function clearHomeAttachments() {
+    homePendingAttachments = [];
+    renderHomeAttachments();
+  }
+
   async function bootHomePanel() {
     const form = document.querySelector('[data-home-chat-form]');
     const input = document.querySelector('[data-home-chat-input]');
@@ -18308,9 +18912,30 @@ const CONSOLE_JS = `
       form.addEventListener('submit', async (event) => {
         event.preventDefault();
         const text = (input.value || '').trim();
-        if (!text) return;
+        if (!text && homePendingAttachments.length === 0) return;
         input.value = '';
         await sendHomeChat(text);
+      });
+    }
+    // Attach button → hidden file picker; picked/dropped files upload + convert.
+    const attachBtn = document.querySelector('[data-home-chat-attach]');
+    const fileInput = document.querySelector('[data-home-chat-file]');
+    if (attachBtn && fileInput) {
+      attachBtn.addEventListener('click', () => fileInput.click());
+      fileInput.addEventListener('change', () => {
+        for (const f of Array.from(fileInput.files || [])) uploadHomeAttachment(f);
+        fileInput.value = '';
+      });
+    }
+    // Drag-and-drop a file onto the chat thread.
+    const thread = document.querySelector('[data-home-chat-thread]');
+    if (thread) {
+      const stop = (e) => { e.preventDefault(); e.stopPropagation(); };
+      ['dragenter', 'dragover'].forEach((ev) => thread.addEventListener(ev, (e) => { stop(e); thread.classList.add('is-dragover'); }));
+      ['dragleave', 'dragend'].forEach((ev) => thread.addEventListener(ev, (e) => { stop(e); thread.classList.remove('is-dragover'); }));
+      thread.addEventListener('drop', (e) => {
+        stop(e); thread.classList.remove('is-dragover');
+        for (const f of Array.from((e.dataTransfer && e.dataTransfer.files) || [])) uploadHomeAttachment(f);
       });
     }
     // STOP — abort the in-flight turn from the composer. The SEND button is
@@ -18535,8 +19160,14 @@ const CONSOLE_JS = `
     const hint = thread.querySelector('.home-chat-hint');
     if (hint) hint.remove();
 
-    appendChatTurn('user', text);
-    homeChatHistory.push({ role: 'user', text });
+    // Wait for any in-flight uploads/conversions, then collect their ids.
+    await awaitHomeAttachments();
+    const attachIds = homeAttachmentIds();
+    const attachNames = homePendingAttachments.map((a) => a.name);
+    const displayText = attachNames.length ? (text + (text ? '\\n' : '') + '📎 ' + attachNames.join(', ')) : text;
+
+    appendChatTurn('user', displayText);
+    homeChatHistory.push({ role: 'user', text: displayText });
     const assistantTurn = appendChatTurn('assistant', '');
     assistantTurn && assistantTurn.classList.add('pending');
     setChatTurnStatus(assistantTurn, 'Clem is starting up...');
@@ -18548,8 +19179,9 @@ const CONSOLE_JS = `
       const r = await fetchWithToken('/api/harness/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ input: text, sessionId: activeSessionId }),
+        body: JSON.stringify({ input: text, sessionId: activeSessionId, attachments: attachIds }),
       });
+      if (r.ok) clearHomeAttachments();
       if (!r.ok) {
         const j = await r.json().catch(() => ({}));
         if (r.status === 404 && activeSessionId) {
@@ -21785,6 +22417,7 @@ const CONSOLE_JS = `
   // ────────────────────────────────────────────────────────────────
 
   let brainKnowledgeSubtab = 'facts';
+  let brainFactsShowForgotten = false;
 
   function refreshBrainCurrentTab() {
     if (brainCurrentTab === 'overview') refreshBrainOverview();
@@ -21903,9 +22536,26 @@ const CONSOLE_JS = `
     const kindSel = document.querySelector('[data-brain-fact-kind]');
     const sortSel = document.querySelector('[data-brain-fact-sort]');
     const entityTypeSel = document.querySelector('[data-brain-entity-type]');
+    const factSearch = document.querySelector('[data-brain-fact-search]');
+    const forgottenBtn = document.querySelector('[data-brain-fact-forgotten]');
     if (kindSel) kindSel.addEventListener('change', refreshBrainFacts);
     if (sortSel) sortSel.addEventListener('change', refreshBrainFacts);
     if (entityTypeSel) entityTypeSel.addEventListener('change', refreshBrainEntities);
+    if (factSearch) {
+      let factSearchTimer = null;
+      factSearch.addEventListener('input', function () {
+        if (factSearchTimer) clearTimeout(factSearchTimer);
+        factSearchTimer = setTimeout(refreshBrainFacts, 220);
+      });
+    }
+    if (forgottenBtn) {
+      forgottenBtn.addEventListener('click', function () {
+        brainFactsShowForgotten = !brainFactsShowForgotten;
+        forgottenBtn.classList.toggle('on', brainFactsShowForgotten);
+        forgottenBtn.textContent = brainFactsShowForgotten ? 'HIDE FORGOTTEN' : 'SHOW FORGOTTEN';
+        refreshBrainFacts();
+      });
+    }
     // Default tab is Overview — load it on boot.
     await refreshBrainOverview();
   }
@@ -21928,19 +22578,29 @@ const CONSOLE_JS = `
     if (!list) return;
     const kind = (document.querySelector('[data-brain-fact-kind]') || {}).value || '';
     const sort = (document.querySelector('[data-brain-fact-sort]') || {}).value || 'stanford';
+    const query = ((document.querySelector('[data-brain-fact-search]') || {}).value || '').trim();
     try {
       const q = new URLSearchParams();
       if (kind) q.set('kind', kind);
       q.set('sort', sort);
+      if (query) q.set('q', query);
+      if (brainFactsShowForgotten) q.set('includeForgotten', '1');
       const data = await fetchJSON('/api/console/brain/facts?' + q.toString());
       const facts = Array.isArray(data.facts) ? data.facts : [];
-      if (cnt) cnt.textContent = facts.length + ' / ' + (data.total || 0) + ' active';
+      if (cnt) {
+        cnt.textContent = query
+          ? facts.length + ' match' + (facts.length === 1 ? '' : 'es')
+          : facts.length + ' / ' + (data.total || 0) + ' active';
+      }
       if (facts.length === 0) {
-        list.innerHTML = '<div class="settings-info">No facts in this filter. Try a different kind or sort.</div>';
+        list.innerHTML = query
+          ? '<div class="settings-info">No facts match "' + escMem(query) + '".</div>'
+          : '<div class="settings-info">No facts in this filter. Try a different kind or sort.</div>';
         return;
       }
       list.innerHTML = facts.map(function (f) {
         const isDerived = f.derivedFrom && (f.derivedFrom.callId || f.derivedFrom.sessionId);
+        const inactive = f.active === false;
         const trustPill = isDerived
           ? '<span class="pill derived">derived · trust ' + (f.trustLevel != null ? f.trustLevel.toFixed(1) : '?') + '</span>'
           : '<span class="pill direct">direct · trust 1.0</span>';
@@ -21951,28 +22611,98 @@ const CONSOLE_JS = `
         const impPill = typeof f.importance === 'number' && f.importance > 0
           ? '<span class="pill ' + (f.importance >= 7 ? 'important' : '') + '">imp ' + f.importance.toFixed(1) + '</span>'
           : '';
+        const pinPill = f.pinned ? '<span class="pill important">📌 pinned</span>' : '';
+        const forgottenPill = inactive ? '<span class="pill">⚠ forgotten</span>' : '';
         const callIdRef = isDerived && f.derivedFrom.callId
           ? ' · <code>' + escMem(f.derivedFrom.callId) + '</code>'
           : '';
         const toolRef = isDerived && f.derivedFrom.tool
           ? ' · from <code>' + escMem(f.derivedFrom.tool) + '</code>'
           : '';
+        // Inline row actions — wired to the existing fact-mutation routes.
+        const actions = inactive
+          ? '<button class="brain-fact-act" data-fact-restore="' + f.id + '">RESTORE ↺</button>'
+          : [
+              '<button class="brain-fact-act" data-fact-pin="' + f.id + '">' + (f.pinned ? 'UNPIN' : 'PIN') + '</button>',
+              '<button class="brain-fact-act" data-fact-edit="' + f.id + '">EDIT ✎</button>',
+              '<button class="brain-fact-act danger" data-fact-forget="' + f.id + '">FORGET ▣</button>',
+            ].join('');
         return [
-          '<div class="brain-fact-row">',
+          '<div class="brain-fact-row' + (inactive ? ' inactive' : '') + '" data-fact-id="' + f.id + '">',
           '  <div class="brain-fact-content">' + escMem(f.content || '') + '</div>',
           '  <div class="brain-fact-meta">',
-          '    ' + trustPill + ' ' + impPill,
+          '    ' + trustPill + ' ' + impPill + ' ' + pinPill + ' ' + forgottenPill,
           '    <span class="pill">' + escMem(f.kind || '') + '</span>',
           '    · last accessed ' + escMem(fmtAgoShort(f.lastAccessedAt || f.updatedAt)),
           callIdRef, toolRef,
           '  </div>',
+          '  <div class="brain-fact-actions">' + actions + '</div>',
           '</div>',
         ].join('');
       }).join('');
+      wireBrainFactActions(list, facts);
     } catch (err) {
       console.error('brain facts refresh failed:', err);
       list.innerHTML = '<div class="settings-info">— failed to load —</div>';
     }
+  }
+
+  // Wire the inline fact-row buttons (pin/edit/forget/restore) to the
+  // existing /api/console/memory/facts/* mutation routes. Same contract
+  // the legacy memory panel's renderFactViewer uses (console.ts ~14512).
+  function wireBrainFactActions(list, facts) {
+    const byId = {};
+    facts.forEach(function (f) { byId[String(f.id)] = f; });
+    async function post(url, body) {
+      const opts = { method: 'POST' };
+      if (body) { opts.headers = { 'Content-Type': 'application/json' }; opts.body = JSON.stringify(body); }
+      const r = await fetch(withToken(url), opts);
+      if (!r.ok) { const j = await r.json().catch(function () { return {}; }); throw new Error(j.error || ('HTTP ' + r.status)); }
+      return r.json().catch(function () { return {}; });
+    }
+    Array.from(list.querySelectorAll('[data-fact-pin]')).forEach(function (btn) {
+      btn.addEventListener('click', async function () {
+        const id = btn.getAttribute('data-fact-pin');
+        const f = byId[id] || {};
+        try { await post('/api/console/memory/facts/' + id + '/pin', { pinned: !f.pinned }); await refreshBrainFacts(); }
+        catch (err) { alert('Pin failed: ' + (err.message || err)); }
+      });
+    });
+    Array.from(list.querySelectorAll('[data-fact-forget]')).forEach(function (btn) {
+      btn.addEventListener('click', async function () {
+        const id = btn.getAttribute('data-fact-forget');
+        if (!confirm('Forget fact #' + id + '? You can restore it from SHOW FORGOTTEN.')) return;
+        try { await post('/api/console/memory/facts/' + id + '/forget'); await refreshBrainFacts(); }
+        catch (err) { alert('Forget failed: ' + (err.message || err)); }
+      });
+    });
+    Array.from(list.querySelectorAll('[data-fact-restore]')).forEach(function (btn) {
+      btn.addEventListener('click', async function () {
+        const id = btn.getAttribute('data-fact-restore');
+        try { await post('/api/console/memory/facts/' + id + '/restore'); await refreshBrainFacts(); }
+        catch (err) { alert('Restore failed: ' + (err.message || err)); }
+      });
+    });
+    Array.from(list.querySelectorAll('[data-fact-edit]')).forEach(function (btn) {
+      btn.addEventListener('click', async function () {
+        const id = btn.getAttribute('data-fact-edit');
+        const f = byId[id] || {};
+        const next = prompt('Edit fact #' + id + ':', f.content || '');
+        if (next === null) return;
+        const trimmed = next.trim();
+        if (!trimmed || trimmed === f.content) return;
+        try {
+          const r = await fetch(withToken('/api/console/memory/facts/' + id), {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ content: trimmed }),
+          });
+          const data = await r.json().catch(function () { return {}; });
+          if (data && data.fact) { await refreshBrainFacts(); }
+          else { alert('Edit failed: ' + (data && data.error ? data.error : 'unknown error')); }
+        } catch (err) { alert('Edit failed: ' + (err.message || err)); }
+      });
+    });
   }
 
   async function refreshBrainEntities() {
