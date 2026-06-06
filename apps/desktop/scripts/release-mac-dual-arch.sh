@@ -39,16 +39,26 @@ verify_uv_packaged() {
   local arch="$1"
   local uvtarget="$2"
   local found=""
+  # Presence is ALWAYS required. A valid Developer-ID signature is only required
+  # on a real signed release; an unsigned local build (package:mac:unsigned sets
+  # CSC_IDENTITY_AUTO_DISCOVERY=false / APPLE_NOTARIZE_SKIP) just confirms the
+  # binary shipped.
+  local require_signed="true"
+  if [[ "${CSC_IDENTITY_AUTO_DISCOVERY:-}" == "false" || -n "${APPLE_NOTARIZE_SKIP:-}" ]]; then
+    require_signed="false"
+  fi
   while IFS= read -r app; do
     local uvbin="$app/Contents/Resources/daemon/vendor/uv/$uvtarget/uv"
     if [[ -f "$uvbin" ]]; then
       echo "   uv present: $uvbin"
+      found="$uvbin"
       if codesign -v --strict "$uvbin" 2>/dev/null; then
         echo "   uv codesign: OK"
-        found="$uvbin"
-      else
+      elif [[ "$require_signed" == "true" ]]; then
         echo "::error::vendored uv for $arch ($uvtarget) is present but NOT validly signed: $uvbin"
         exit 1
+      else
+        echo "   uv codesign: skipped (unsigned build)"
       fi
     fi
   done < <(find "$DESKTOP_DIR/release" -maxdepth 2 -name "Clementine.app" -type d 2>/dev/null)
