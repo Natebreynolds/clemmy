@@ -9,7 +9,7 @@ import { reindexVault } from './indexer.js';
 import { tickMemoryMdRefresh } from './memory-md-builder.js';
 import { tickIdentityMdRefresh } from './identity-md-builder.js';
 import { tickAutoresearchObservatory } from '../autoresearch/observatory.js';
-import { reapStaleToolOutputs } from '../runtime/harness/eventlog.js';
+import { reapStaleToolOutputs, reapStaleSessions } from '../runtime/harness/eventlog.js';
 import {
   reapStuckRecallRecordings,
   loadRecallMeetingSettings,
@@ -257,6 +257,16 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
       }
     } catch (err) {
       logger.warn({ err }, 'tool_outputs reaper tick failed');
+    }
+    // Reap terminal sessions (+ cascade their events) so harness.db doesn't
+    // grow unbounded. Active/paused sessions are kept so the user can resume.
+    try {
+      const deletedSessions = reapStaleSessions();
+      if (deletedSessions > 0) {
+        logger.info({ deletedSessions }, 'sessions reaper tick');
+      }
+    } catch (err) {
+      logger.warn({ err }, 'sessions reaper tick failed');
     }
   }
 

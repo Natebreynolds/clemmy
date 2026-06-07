@@ -20,7 +20,7 @@
 // Writes a JSON summary to ~/.clementine-next/state/verify-long-running-<ts>.json
 // for cross-release diff.
 
-import { mkdtempSync, mkdirSync, existsSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, existsSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { pathToFileURL } from 'node:url';
@@ -1529,6 +1529,18 @@ try {
   const summaryPath = path.join(summaryDir, `verify-long-running-${Date.now()}.json`);
   writeFileSync(summaryPath, JSON.stringify(summary, null, 2));
   console.log(`\n${palette.dim}summary → ${summaryPath}${palette.reset}`);
+  // Retention: keep only the newest 10 summaries. Each run wrote one forever,
+  // leaking 100+ files into state/. Filenames are ...-<epochMs>.json so a
+  // lexical sort is chronological.
+  try {
+    const KEEP = 10;
+    const stale = readdirSync(summaryDir)
+      .filter((f) => /^verify-long-running-\d+\.json$/.test(f))
+      .sort()
+      .reverse()
+      .slice(KEEP);
+    for (const f of stale) rmSync(path.join(summaryDir, f), { force: true });
+  } catch { /* best-effort cleanup */ }
 } catch (err) {
   console.log(`\n${palette.dim}(skipped summary write: ${err instanceof Error ? err.message : err})${palette.reset}`);
 }

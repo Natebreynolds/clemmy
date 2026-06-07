@@ -809,6 +809,44 @@ export function reapStaleToolOutputs(maxAgeDays?: number): number {
   return result.changes;
 }
 
+/**
+ * Drop terminal (completed/failed/cancelled) sessions older than `maxAgeDays`
+ * (default 14) and — via the `ON DELETE CASCADE` on every child table
+ * (events, tool_outputs, kill switches, …) with `PRAGMA foreign_keys = ON`
+ * set on the connection — all of their child rows. Active/paused sessions are
+ * NEVER touched, so the user can always resume in-flight work.
+ *
+ * Without this the `sessions` + `events` tables append forever and harness.db
+ * balloons over weeks (observed 159 MB). `reapStaleToolOutputs` already caps
+ * one child table; this caps the parent (and everything under it). After the
+ * delete we checkpoint the WAL (TRUNCATE) so reclaimed pages actually return
+ * to the main file instead of accumulating in the -wal sidecar.
+ *
+ * Returns the number of sessions deleted. Operator-overridable via
+ * `CLEMMY_SESSION_TTL_DAYS` env (clamped to [1, 365]).
+ */
+export function reapStaleSessions(maxAgeDays?: number): number {
+  const env = process.env.CLEMMY_SESSION_TTL_DAYS;
+  const ttl = maxAgeDays ?? (env ? Math.max(1, Math.min(365, Number(env))) : 14);
+  if (!Number.isFinite(ttl) || ttl <= 0) return 0;
+  const db = openEventLog();
+  const result = db
+    .prepare(
+      `DELETE FROM sessions
+       WHERE status IN ('completed','failed','cancelled')
+         AND updated_at < datetime('now', ?)`,
+    )
+    .run(`-${Math.floor(ttl)} days`);
+  // Best-effort WAL merge so the on-disk file actually shrinks after a reap.
+  // A busy db just retries on the next tick — never let this throw.
+  try {
+    db.pragma('wal_checkpoint(TRUNCATE)');
+  } catch {
+    // opportunistic; ignore
+  }
+  return result.changes;
+}
+
 export function getToolOutput(sessionId: string, callId: string): ToolOutputRecord | null {
   const db = openEventLog();
   const row = db

@@ -38,6 +38,8 @@ const {
   requestKill,
   isKillRequested,
   clearKill,
+  reapStaleSessions,
+  openEventLog,
 } = await import('./eventlog.js');
 type EventType = import('./eventlog.js').EventType;
 
@@ -69,6 +71,41 @@ test('creates a session and appends events with monotonic seq', () => {
   for (let i = 1; i < events.length; i++) {
     assert.ok(events[i].seq > events[i - 1].seq, 'seq is monotonic');
   }
+});
+
+test('reapStaleSessions deletes old terminal sessions (+cascade), keeps active + recent', () => {
+  resetEventLog();
+  const db = openEventLog();
+  const backdate = (id: string) =>
+    db.prepare('UPDATE sessions SET updated_at = ? WHERE id = ?').run('2020-01-01T00:00:00.000Z', id);
+
+  // A: old + completed → should be reaped (and cascade-delete its events).
+  const a = createSession({ kind: 'workflow', channel: 'cli', title: 'old-done' });
+  appendEvent({ sessionId: a.id, turn: 0, role: 'orchestrator', type: 'heartbeat', data: {} });
+  updateSession(a.id, { status: 'completed' });
+  backdate(a.id);
+
+  // B: old but ACTIVE → must be kept (user can still resume in-flight work).
+  const b = createSession({ kind: 'chat', channel: 'cli', title: 'old-active' });
+  backdate(b.id);
+
+  // C: completed but RECENT → must be kept (within TTL).
+  const c = createSession({ kind: 'execution', channel: 'cli', title: 'recent-done' });
+  updateSession(c.id, { status: 'completed' });
+
+  const deleted = reapStaleSessions(14);
+  assert.equal(deleted, 1, 'only the old terminal session is reaped');
+  assert.equal(getSession(a.id), null, 'old completed session gone');
+  assert.equal(listEvents(a.id).length, 0, 'cascade removed its events');
+  assert.ok(getSession(b.id), 'old ACTIVE session kept (resumable)');
+  assert.ok(getSession(c.id), 'recent completed session kept (within TTL)');
+
+  // TTL <= 0 is a no-op guard (never reap everything by accident).
+  const d = createSession({ kind: 'chat', channel: 'cli', title: 'guard' });
+  updateSession(d.id, { status: 'completed' });
+  backdate(d.id);
+  assert.equal(reapStaleSessions(0), 0, 'ttl<=0 reaps nothing');
+  assert.ok(getSession(d.id), 'guarded session survives ttl<=0');
 });
 
 test('rejects unknown event type', () => {

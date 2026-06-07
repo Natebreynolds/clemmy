@@ -1,4 +1,4 @@
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync, writeSync } from 'node:fs';
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync, writeSync } from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { BASE_DIR, DISCORD_BOT_TOKEN, DISCORD_DM_ALLOWED_USERS, DISCORD_ENABLED } from '../config.js';
@@ -20,14 +20,24 @@ function atomicWriteJson(filePath: string, value: unknown): void {
   mkdirSync(path.dirname(filePath), { recursive: true });
   const tmp = `${filePath}.tmp.${process.pid}.${randomUUID().slice(0, 8)}`;
   const payload = JSON.stringify(value, null, 2);
-  const fd = openSync(tmp, 'w');
   try {
-    writeSync(fd, payload);
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
+    const fd = openSync(tmp, 'w');
+    try {
+      writeSync(fd, payload);
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(tmp, filePath);
+  } catch (err) {
+    // A write/rename failure (disk full, perms, race) must not leave the
+    // half-written tmp behind — those accumulated as orphaned `.tmp.*`
+    // files. Clean it up, then rethrow so the caller still sees the error.
+    // (A hard SIGKILL between create and rename can still orphan a tmp;
+    // that residue is swept separately, not here.)
+    try { unlinkSync(tmp); } catch { /* tmp may not exist — ignore */ }
+    throw err;
   }
-  renameSync(tmp, filePath);
 }
 
 /**

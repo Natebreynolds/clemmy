@@ -26,6 +26,27 @@ function emitIfResolved(previous: PendingApproval | undefined, next: PendingAppr
 const STATE_DIR = path.join(BASE_DIR, 'state');
 const APPROVAL_FILE = path.join(STATE_DIR, 'approvals.json');
 
+// Cap the stored approvals so resolved records don't accumulate forever.
+// sweepStaleApprovals only flips pending→rejected; nothing ever deleted, so
+// approvals.json grew unbounded (observed 2.4MB). Mirrors runs.json's
+// MAX_RUNS / notifications' MAX_STORED. Pending (in-flight) approvals are
+// NEVER dropped — only the oldest resolved beyond the cap.
+const MAX_APPROVALS = 500;
+
+function pruneApprovals(items: PendingApproval[]): PendingApproval[] {
+  if (items.length <= MAX_APPROVALS) return items;
+  const pending = items.filter((item) => item.status === 'pending');
+  const resolved = items
+    .filter((item) => item.status !== 'pending')
+    .sort((a, b) => (Date.parse(b.createdAt) || 0) - (Date.parse(a.createdAt) || 0));
+  const keep = new Set<PendingApproval>([
+    ...pending,
+    ...resolved.slice(0, Math.max(0, MAX_APPROVALS - pending.length)),
+  ]);
+  // Preserve the input order for the kept set.
+  return items.filter((item) => keep.has(item));
+}
+
 function ensureDir(): void {
   if (!existsSync(STATE_DIR)) {
     mkdirSync(STATE_DIR, { recursive: true });
@@ -44,7 +65,7 @@ function loadApprovals(): PendingApproval[] {
 
 function saveApprovals(items: PendingApproval[]): void {
   ensureDir();
-  writeFileSync(APPROVAL_FILE, JSON.stringify(items, null, 2));
+  writeFileSync(APPROVAL_FILE, JSON.stringify(pruneApprovals(items), null, 2));
 }
 
 export class ApprovalStore {
