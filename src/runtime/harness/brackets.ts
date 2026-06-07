@@ -540,34 +540,36 @@ export interface WrapToolOptions {
   now?: () => number;
 }
 
+// Tool reliability brackets — per-tool wall-clock timeout + identical-args
+// loop-guard (block@5/escalate@7) + counter cap. DEFAULT-ON (2026-06-07): the
+// 24/7 audit proved these are the live wedge — a hung external tool had no
+// timeout and a runaway reached 77-81x identical calls because this block was
+// off by default. Timeouts are generous (mcp/shell 10min, externalApi 5min;
+// timeoutForTool) so a legitimate long tool isn't killed, and reads/polls are
+// demoted to warn so only identical-args MUTATING loops hard-stop. Kill-switch:
+// HARNESS_TOOL_BRACKETS=off. Read via getRuntimeEnv so the .env value applies
+// under launchd too (where process.env isn't merged).
+export function harnessToolBracketsEnabled(): boolean {
+  return (getRuntimeEnv('HARNESS_TOOL_BRACKETS', 'on') ?? 'on').toLowerCase() !== 'off';
+}
+
 /**
  * Wrap a tool so its execute fires the three reliability checks at the
- * entry edge. The wrap is gated behind `HARNESS_TOOL_BRACKETS=on` env
- * flag so we can ship + dogfood without flipping behavior until we're
- * sure nothing legitimate gets killed by a too-tight timeout.
+ * entry edge. Gated by HARNESS_TOOL_BRACKETS (default ON; =off kill-switch).
  *
- * When the flag is off, returns the tool unchanged. When on, returns
- * a new object with a wrapped `execute`. The original tool is not
- * mutated — both can coexist if needed.
+ * When disabled, returns the tool unchanged. When on, returns a new object
+ * with a wrapped `execute`/`invoke`. The original tool is not mutated.
  *
- * Reading the run context via AsyncLocalStorage means tools called
- * OUTSIDE the harness (e.g. direct MCP invocations, test fixtures)
- * see ctx === undefined; in that case the wrapper degrades to "apply
- * timeout only, no kill check, no counter check" — safer than
- * crashing on a missing counter.
+ * Reading the run context via AsyncLocalStorage means tools called OUTSIDE the
+ * harness (direct MCP invocations, test fixtures) see ctx === undefined; in
+ * that case the wrapper degrades to "apply timeout only, no kill/counter
+ * check" — safer than crashing on a missing counter.
  */
 export function wrapToolForHarness<T extends WrappableTool>(
   tool: T,
   options: WrapToolOptions = {},
 ): T {
-  // Opt-in via HARNESS_TOOL_BRACKETS=on. As of v0.5.18 the flag
-  // ACTUALLY WORKS in production (F1 supervisor injection + F8
-  // wrap-via-invoke fix). Default stays OFF for this release because
-  // a default-on flip surfaced test fallout (loop.test.ts:839) that
-  // needs its own focused investigation. Tracked for v0.5.19.
-  // Users who want the reliability brackets active set the env via
-  // Settings → Runtime or directly in ~/.clementine-next/.env.
-  if (process.env.HARNESS_TOOL_BRACKETS !== 'on') return tool;
+  if (!harnessToolBracketsEnabled()) return tool;
   // CRITICAL: The OpenAI Agents SDK's `tool()` factory captures the
   // original `execute` in a CLOSURE inside the returned `invoke`
   // function (node_modules/@openai/agents-core/dist/tool.js:175).

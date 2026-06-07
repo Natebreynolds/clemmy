@@ -38,6 +38,11 @@ const SCHEDULE_RETENTION_DAYS = 7;
 
 interface ScheduleState {
   lastRunByMinute: Record<string, string>; // key = "wf:<name>", value = "YYYY-MM-DDTHH:MM"
+  // Wall-clock minute (epoch ms, minute-floored) of the last scheduler tick.
+  // Drives misfire CATCH-UP: a daemon asleep at a schedule's fire-minute (the
+  // canonical laptop case) used to silently drop that run because cron was only
+  // matched against `now`. We now backfill the missed window on the next tick.
+  lastEvaluatedAtMs?: number;
 }
 
 function loadScheduleState(): ScheduleState {
@@ -57,7 +62,7 @@ function pruneScheduleState(state: ScheduleState): ScheduleState {
   for (const [k, v] of Object.entries(state.lastRunByMinute)) {
     if (v >= cutoff) next[k] = v;
   }
-  return { lastRunByMinute: next };
+  return { lastRunByMinute: next, lastEvaluatedAtMs: state.lastEvaluatedAtMs };
 }
 
 function saveScheduleState(state: ScheduleState): void {
@@ -65,6 +70,32 @@ function saveScheduleState(state: ScheduleState): void {
   const pruned = pruneScheduleState(state);
   writeFileSync(SCHEDULE_STATE_FILE, JSON.stringify(pruned, null, 2), 'utf-8');
   state.lastRunByMinute = pruned.lastRunByMinute;
+}
+
+/** Cap on how far back catch-up will scan (a daemon off for a week shouldn't
+ *  replay 10k minutes — fire each missed schedule once within the last day). */
+const MAX_CATCHUP_MINUTES = 24 * 60;
+
+function minuteFloor(ms: number): number {
+  return Math.floor(ms / 60_000) * 60_000;
+}
+
+/**
+ * The wall-clock minutes to evaluate this tick: just `now` on a normal tick, or
+ * the backfilled window [lastEval+1 … now] (capped) after the daemon was asleep.
+ * Pure + exported for tests. First-ever tick (no lastEvaluatedAtMs) returns only
+ * `now` — never a spurious backfill on first boot.
+ */
+export function scheduleCatchupWindow(lastEvaluatedAtMs: number | undefined, nowMs: number): Date[] {
+  const nowMin = minuteFloor(nowMs);
+  if (lastEvaluatedAtMs === undefined) return [new Date(nowMin)];
+  let startMin = minuteFloor(lastEvaluatedAtMs) + 60_000; // minute AFTER the last evaluated one
+  const earliest = nowMin - MAX_CATCHUP_MINUTES * 60_000;
+  if (startMin < earliest) startMin = earliest;
+  if (startMin > nowMin) return [new Date(nowMin)]; // same minute as last tick → just now
+  const out: Date[] = [];
+  for (let t = startMin; t <= nowMin; t += 60_000) out.push(new Date(t));
+  return out;
 }
 
 // ── Cron matching (intentionally identical semantics to the daemon's
@@ -163,20 +194,37 @@ export async function processWorkflowSchedules(): Promise<ScheduledFireResult> {
   }
 
   const state = loadScheduleState();
-  let stateDirty = false;
+
+  // Minutes to evaluate this tick: [now] normally, or the backfilled window
+  // after a sleep (misfire catch-up). On a normal 15s tick this is exactly
+  // [now] → byte-identical to the prior behavior.
+  const window = scheduleCatchupWindow(state.lastEvaluatedAtMs, now.getTime());
 
   for (const entry of workflows) {
     const wf = entry.data;
     if (!wf.enabled) continue;
     const schedule = wf.trigger?.schedule;
     if (!schedule || typeof schedule !== 'string') continue;
-    if (!cronMatches(schedule, now, wf.trigger?.timezone)) continue;
 
     const dedupeKey = `wf:${wf.name}`;
-    if (state.lastRunByMinute[dedupeKey] === minuteKey) {
-      result.deduped.push(wf.name);
+    // Cron matches in the window that we haven't already fired (dedupe by minute
+    // key, in chronological order). Empty on most ticks.
+    const matchedKeys: string[] = [];
+    for (const m of window) {
+      if (!cronMatches(schedule, m, wf.trigger?.timezone)) continue;
+      const k = currentMinuteKey(m);
+      if (state.lastRunByMinute[dedupeKey] !== k) matchedKeys.push(k);
+    }
+    if (matchedKeys.length === 0) {
+      // Telemetry parity: if NOW matched but we already fired it this minute,
+      // record the dedupe exactly as before.
+      if (cronMatches(schedule, now, wf.trigger?.timezone) && state.lastRunByMinute[dedupeKey] === minuteKey) {
+        result.deduped.push(wf.name);
+      }
       continue;
     }
+    const latestKey = matchedKeys[matchedKeys.length - 1];
+    const missed = matchedKeys.length - 1; // earlier fires collapsed into one
 
     // Pending-queue cap. If the previous run hasn't finished yet and a
     // few more are already stacked, refuse to enqueue more — otherwise a
@@ -188,19 +236,21 @@ export async function processWorkflowSchedules(): Promise<ScheduledFireResult> {
     if (pending >= MAX_PENDING_PER_WORKFLOW) {
       result.deduped.push(wf.name);
       emitQueueBackpressureNotice(wf.name, pending);
-      // Mark this minute "seen" so we don't recheck the same minute
-      // on the next 15s tick.
-      state.lastRunByMinute[dedupeKey] = minuteKey;
-      stateDirty = true;
+      // Mark the latest matched minute "seen" so we don't recheck it.
+      state.lastRunByMinute[dedupeKey] = latestKey;
       continue;
     }
 
     try {
+      // A long-missed window collapses to ONE catch-up run (not N), so a
+      // daily 8am report fires once after a closed-overnight laptop reopens.
       enqueueScheduledRun(wf.name);
-      state.lastRunByMinute[dedupeKey] = minuteKey;
-      stateDirty = true;
+      state.lastRunByMinute[dedupeKey] = latestKey;
       result.fired.push(wf.name);
-      logger.info({ workflow: wf.name, schedule, minuteKey }, 'Scheduled workflow run enqueued');
+      logger.info({ workflow: wf.name, schedule, minuteKey: latestKey, missed }, 'Scheduled workflow run enqueued');
+      if (missed > 0) {
+        emitCatchupNotice(wf.name, missed, latestKey);
+      }
     } catch (err) {
       logger.warn(
         { err: err instanceof Error ? err.message : String(err), workflow: wf.name },
@@ -209,7 +259,9 @@ export async function processWorkflowSchedules(): Promise<ScheduledFireResult> {
     }
   }
 
-  if (stateDirty) saveScheduleState(state);
+  // Always advance the evaluation pointer so the next tick's window is correct.
+  state.lastEvaluatedAtMs = minuteFloor(now.getTime());
+  saveScheduleState(state);
   return result;
 }
 
@@ -274,6 +326,36 @@ function emitQueueBackpressureNotice(workflowName: string, pending: number): voi
     logger.warn(
       { err: err instanceof Error ? err.message : String(err), workflow: workflowName },
       'Failed to emit backpressure notice (best-effort, ignored)',
+    );
+  }
+}
+
+/** Tell the user when a scheduled run fired LATE (daemon was asleep at the
+ *  scheduled minute) and how many earlier fires were collapsed — so a missed
+ *  schedule is never silent (reports-back). Daily-bucketed per workflow. */
+function emitCatchupNotice(workflowName: string, missed: number, firedMinuteKey: string): void {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { addNotification, getNotification } = require('../runtime/notifications.js') as {
+      addNotification: (n: Record<string, unknown>) => void;
+      getNotification: (id: string) => unknown;
+    };
+    const dayKey = new Date().toISOString().slice(0, 10);
+    const id = `system-workflow-catchup-${workflowName}-${dayKey}`;
+    if (getNotification(id)) return;
+    addNotification({
+      id,
+      kind: 'system',
+      title: `Caught up workflow "${workflowName}" after a missed schedule`,
+      body: `The daemon was asleep when "${workflowName}" was scheduled to run. It ran once now (caught up)${missed > 0 ? `, skipping ${missed} earlier missed fire${missed === 1 ? '' : 's'}` : ''}. If this matters, keep the daemon running at the scheduled time.`,
+      createdAt: new Date().toISOString(),
+      read: false,
+      metadata: { errorCategory: 'workflow_schedule_catchup', workflow: workflowName, missed, firedMinuteKey },
+    });
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err), workflow: workflowName },
+      'Failed to emit schedule catch-up notice (best-effort, ignored)',
     );
   }
 }

@@ -2825,13 +2825,25 @@ async function processOneRunFile(
           proposedFix = recordProposedFix(workflow.name, run.id, diagnosis);
         }
       }
-      const needsAttention = blockedSteps.length > 0;
+      // A CONFIDENT target-miss is promoted from a silent advisory to a
+      // NON-BLOCKING needs-attention: the run still completed and DELIVERS its
+      // output, but it is flagged for review instead of reported as a clean
+      // success. It has no diagnosable block, so it never routes to the Doctor;
+      // and tryAutoHealAndRequeue requires a proposedFix — so a target-miss can
+      // NEVER trigger a blind re-run that doubles irreversible side effects.
+      const targetMissed = Boolean(targetVerdict && targetVerdict.judged && !targetVerdict.reached);
+      const needsAttention = blockedSteps.length > 0 || targetMissed;
+      const attentionReason =
+        blockedSteps[0]?.reason ??
+        (targetMissed
+          ? `target not confirmed: ${targetVerdict?.gap ?? 'deliverable may not reach the workflow target'}`
+          : undefined);
 
       // Cross-fire failure ledger (#6): record this run's outcome so a
       // chronically-failing workflow stops auto-healing + escalates. A clean
       // run resets the streak. (Heal re-runs count too — a fire whose heals all
       // fail is genuinely stuck, and escalating then is correct.)
-      const ledger = recordWorkflowOutcome(workflow.name, !needsAttention, needsAttention ? blockedSteps[0]?.reason : undefined);
+      const ledger = recordWorkflowOutcome(workflow.name, !needsAttention, needsAttention ? attentionReason : undefined);
       const autoHealPaused = needsAttention && shouldStopAutoHeal(workflow.name);
       const escalationBanner = autoHealPaused
         ? `⚠️ "${workflow.data.name}" has failed ${ledger.consecutiveFailures} runs in a row — auto-heal is PAUSED to stop wasting tokens. Review the blocked step(s) below; if a recent auto-fix caused this, revert it with \`revert heal <id>\`. It resumes automatically after one clean run, and (for a scheduled workflow) consider disabling it until fixed.\n\n`
@@ -2943,7 +2955,11 @@ async function processOneRunFile(
         kind: 'workflow',
         title: hasFailures && !needsAttention
           ? `Workflow completed with ${forEachFailures.length} failure${forEachFailures.length === 1 ? '' : 's'}: ${workflow.data.name}`
-          : outcome.title,
+          // renderLegibleOutcome titles a no-blocked-step run "completed"; a
+          // target-miss is needs-attention with no blocked step, so title it honestly.
+          : targetMissed && blockedSteps.length === 0
+            ? `⚠️ Workflow needs attention: ${workflow.data.name}`
+            : outcome.title,
         // Send the full body. Discord delivery splits long content into
         // multiple messages; previous 2000-char slice cut off workflow
         // results above that length with no continuation. Quality advisories
@@ -2968,7 +2984,9 @@ async function processOneRunFile(
         finishRun(run.id, {
           status: 'completed',
           message: needsAttention
-            ? `Needs attention — ${blockedSteps.length} step${blockedSteps.length === 1 ? '' : 's'} blocked`
+            ? (blockedSteps.length > 0
+                ? `Needs attention — ${blockedSteps.length} step${blockedSteps.length === 1 ? '' : 's'} blocked`
+                : `Needs attention — ${attentionReason ?? 'target not confirmed'}`)
             : `Completed${hasFailures ? ` with ${forEachFailures.length} item failure${forEachFailures.length === 1 ? '' : 's'}` : ''}${hasAdvisories ? ` · ${qualityAdvisories.length} quality advisory${qualityAdvisories.length === 1 ? '' : 'ies'}` : ''}`,
           outputPreview: reportBody.slice(0, 800),
         });

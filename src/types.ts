@@ -93,6 +93,49 @@ export interface SessionRecord {
   createdAt: string;
   updatedAt: string;
   turns: ConversationTurn[];
+  // Organize metadata for the desktop "Conversations" UI. All optional
+  // and additive — older sessions.json records simply lack them.
+  title?: string;
+  pinned?: boolean;
+  tags?: string[];
+  archived?: boolean;
+}
+
+/**
+ * Origin of a conversation in the unified desktop sessions list. Desktop
+ * chats live in the SessionStore (sessions.json); the rest are harness
+ * eventlog sessions (harness.db).
+ */
+export type SessionOrigin = 'desktop' | 'cli' | 'discord' | 'workflow' | 'agent';
+
+/**
+ * One row in the unified sessions list (`GET /api/console/sessions`).
+ * Normalizes the two underlying stores so the desktop is a single client
+ * over both engines. `id` is namespaced (`desktop:<id>` / `harness:<id>`).
+ */
+export interface UnifiedSessionSummary {
+  id: string;
+  origin: SessionOrigin;
+  store: 'desktop' | 'harness';
+  kind: string;
+  title: string;
+  preview: string;
+  createdAt: string;
+  updatedAt: string;
+  status: string;
+  pinned: boolean;
+  tags: string[];
+  archived: boolean;
+  /** True when the desktop can send a new turn into this session. */
+  continuable: boolean;
+  turnCount: number;
+}
+
+/** A single normalized turn for rendering a conversation's history. */
+export interface UnifiedSessionTurn {
+  role: 'user' | 'assistant';
+  text: string;
+  createdAt: string;
 }
 
 export interface SessionAutoBrief {

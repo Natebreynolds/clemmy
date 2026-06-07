@@ -21,6 +21,7 @@ import { AgentRuntimeCancelledError } from '../runtime/provider.js';
 import { getBackgroundCheckInMs, loadProactivityPolicy } from '../agents/proactivity-policy.js';
 import { openPlanScope } from '../agents/plan-scope.js';
 import { fanoutLedgerEnabled, summarizeLedger, clearLedger } from '../runtime/harness/fanout-ledger.js';
+import { BLOCKED_TEXT_PATTERNS } from '../runtime/harness/verify-delivered.js';
 
 const logger = pino({ name: 'clementine-next.background-tasks' });
 
@@ -515,24 +516,9 @@ export function markBackgroundTaskFailed(id: string, error: string, status: Extr
  * Deliberately conservative: we only divert to `blocked` on a positive
  * signal. A genuinely-complete run with no blocked markers stays 'done'.
  */
-const BLOCKED_TEXT_PATTERNS: RegExp[] = [
-  /\bapproval required\b/i,
-  /\bpending approval id\b/i,
-  /\bi('?m| am)\s+blocked\b/i,
-  /\bi can('?t|not)\s+(complete|finish|proceed|continue)\b/i,
-  /\bunable to (complete|finish|proceed|continue|access|retrieve|pull)\b/i,
-  /\bcannot (complete|finish|proceed|continue) (this|the) (task|work|objective)\b/i,
-  /\bneed (more|additional|your) (input|information|access|approval|credentials)\b/i,
-  /\bwaiting (on|for) (your|user|the user)\b/i,
-  /\bblocked (on|by)\b/i,
-  /\bmissing (data|access|credentials|the required)\b/i,
-  // P0-C — runtime-error stubs that `respond()` produces when the model
-  // backend throws (e.g. a wall-clock abort that survived the in-loop retries,
-  // a 5xx burst, a transport timeout). These are NOT completed deliverables.
-  /\bhit a runtime error\b/i,
-  /\bwall-clock budget\b/i,
-  /\bcould ?n['’]?t (finish|complete|proceed|continue)\b/i,
-];
+// BLOCKED_TEXT_PATTERNS now lives in runtime/harness/verify-delivered.ts so
+// the cron/gateway/autonomy honesty chokepoint and this richer background-task
+// classifier share one blocked-text vocabulary.
 
 export function classifyBackgroundTaskOutcome(
   task: Pick<BackgroundTaskRecord, 'runSessionId'>,

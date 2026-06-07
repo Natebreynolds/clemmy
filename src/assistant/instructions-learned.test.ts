@@ -95,6 +95,36 @@ test('renderFactsForInstructions mode split: pinned vs scored vs all', () => {
   assert.match(all, /Standing instructions/, 'all mode keeps both (byte-identical legacy)');
 });
 
+test('CANON-SELFASM: chat instructions carry the Now/date block (legacy mode)', () => {
+  delete process.env.CLEMMY_TIERED_CONTEXT;
+  const out = buildAssistantInstructions(ctx, 'dashboard', 'action', 'what should I do today');
+  assert.match(out, /## Now/, 'chat now carries the Now block (was harness-only — chat did date math against the training cutoff)');
+  assert.match(out, /Today is \d{4}-\d{2}-\d{2}/, 'the real current date is injected');
+});
+
+test('CANON-SELFASM: the kill-switch removes the parity blocks', () => {
+  const prev = process.env.CLEMMY_CHAT_CONTEXT_PARITY;
+  delete process.env.CLEMMY_TIERED_CONTEXT;
+  try {
+    process.env.CLEMMY_CHAT_CONTEXT_PARITY = 'off';
+    const out = buildAssistantInstructions(ctx, 'dashboard', 'action', 'what should I do today');
+    assert.doesNotMatch(out, /## Now/, 'flag off → no Now block (exact prior behavior)');
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_CHAT_CONTEXT_PARITY;
+    else process.env.CLEMMY_CHAT_CONTEXT_PARITY = prev;
+  }
+});
+
+test('CANON-SELFASM: in tiered mode the dynamic Now block rides the per-turn tail', () => {
+  process.env.CLEMMY_TIERED_CONTEXT = 'on';
+  try {
+    const tail = buildTurnContextBlock(ctx, 'action', 'pull my accounts');
+    assert.match(tail, /## Now/, 'Now rides the per-turn tail in tiered mode (it changes daily — must not be cached)');
+  } finally {
+    delete process.env.CLEMMY_TIERED_CONTEXT;
+  }
+});
+
 test('Step 2: casual turn skips the tail BUT standing/pinned facts stay in Tier-1', () => {
   process.env.CLEMMY_TIERED_CONTEXT = 'on';
   try {

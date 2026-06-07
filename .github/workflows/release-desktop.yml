@@ -57,6 +57,14 @@ jobs:
         working-directory: apps/mobile-web
         run: npm ci
 
+      - name: Install console-web deps
+        # The release build (release-mac-dual-arch.sh) runs build:console-web
+        # (tsc + vite) for the new desktop UI, which needs this nested
+        # workspace's own deps. Without this the bundle is never built and
+        # the packaged app silently falls back to the legacy console.
+        working-directory: apps/console-web
+        run: npm ci
+
       - name: Verify release secrets
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}

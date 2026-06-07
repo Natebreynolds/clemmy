@@ -29,6 +29,7 @@ import {
   type SessionRow as HarnessSessionRow,
 } from '../runtime/harness/eventlog.js';
 import { registerConsoleRoutes } from '../dashboard/console-routes.js';
+import { isConsoleNextEnabled, registerConsoleSpaRoutes } from '../dashboard/console-spa.js';
 import { createMobileRouter } from './mobile-routes.js';
 import { readMobileAccess } from '../runtime/mobile-access-state.js';
 import {
@@ -815,6 +816,24 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
     }
   });
 
+  // JSON enable/disable + delete (the new console SPA consumes these instead
+  // of the /dashboard/actions/* redirect endpoints, which return HTML and
+  // ignore the request body). PATCH SETS enabled from the body (idempotent).
+  app.patch('/api/notifications/destinations/:id', requireAuth, (req, res) => {
+    const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+    const destination = listNotificationDestinations().find((entry) => entry.id === id);
+    if (!destination) { res.status(404).json({ error: 'Destination not found' }); return; }
+    const enabled = (req.body as { enabled?: unknown })?.enabled;
+    upsertNotificationDestination({ ...destination, enabled: enabled === true });
+    res.json({ ok: true, enabled: enabled === true });
+  });
+
+  app.delete('/api/notifications/destinations/:id', requireAuth, (req, res) => {
+    const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+    removeNotificationDestination(id);
+    res.json({ ok: true });
+  });
+
   // /console is the primary UI surface. /dashboard remains only as a
   // compatibility redirect for stale bookmarks and older local installs.
   app.get('/console', (req, res, next) => {
@@ -832,7 +851,14 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
     const query = url.searchParams.toString();
     res.redirect(302, query ? `${url.pathname}?${query}` : url.pathname);
   });
-  registerConsoleRoutes(app, isAuthorized, assistant);
+  // New React/Vite console (apps/console-web), behind a flag. When on
+  // and built, it answers GET /console; the legacy string console stays
+  // reachable at /console-legacy. Registered *before* the legacy routes
+  // so its /console handler wins. If the flag is off — or the bundle
+  // isn't built — /console falls through to the legacy renderer.
+  const consoleNext = isConsoleNextEnabled();
+  const consoleSpaServed = consoleNext && registerConsoleSpaRoutes(app, isAuthorized);
+  registerConsoleRoutes(app, isAuthorized, assistant, { serveLegacyAtRoot: !consoleSpaServed });
   app.use('/m', createMobileRouter({ isAdminAuthorized: isAuthorized, assistant }));
 
   app.get('/dashboard', (req, res) => {

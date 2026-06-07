@@ -10,6 +10,7 @@ import { getWorkspaceDirs } from './shared.js';
 import { loadProactivityPolicy } from '../agents/proactivity-policy.js';
 import { needsApprovalFromTaxonomy } from '../agents/tool-taxonomy.js';
 import { findSafeCliCommand } from '../runtime/cli-discovery.js';
+import { mergedSpawnEnv } from '../runtime/spawn-env.js';
 import { isConvertibleExtension } from '../runtime/markitdown.js';
 import { ingestAttachment } from '../runtime/attachments.js';
 import { formatRecallableToolText } from '../runtime/harness/tool-output-format.js';
@@ -367,7 +368,9 @@ function runCommand(command: string, cwd: string, timeoutMs: number): Promise<st
       cwd,
       shell: true,
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: process.env,
+      // Augmented PATH so CLI-backed skills resolve on a packaged .app
+      // launch instead of "command not found". See spawn-env.ts.
+      env: mergedSpawnEnv(),
     });
 
     let stdout = '';
@@ -406,7 +409,9 @@ function runProcess(command: string, args: string[], cwd: string, timeoutMs: num
       cwd,
       shell: false,
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: process.env,
+      // Augmented PATH so CLI-backed skills resolve on a packaged .app
+      // launch instead of "command not found". See spawn-env.ts.
+      env: mergedSpawnEnv(),
     });
 
     let stdout = '';

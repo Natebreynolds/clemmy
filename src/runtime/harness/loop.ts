@@ -21,6 +21,7 @@ import {
   maxTurnsForRole,
   defaultToolCallsPerTurn,
   withHarnessRunContext,
+  harnessToolBracketsEnabled,
 } from './brackets.js';
 import { compactSessionIfNeeded } from './compaction.js';
 import { buildAgentContextPacket } from './context-packet.js';
@@ -1087,12 +1088,68 @@ function emitRuntimeTerminalEvent(sessionId: string, result: RunConversationResu
   }
 }
 
+// Kill-switch (default ON). When a PROGRESSING run is about to hit the step
+// cap, auto-elevate the budget instead of pausing for a manual `continue`, so a
+// genuinely long task ("work through all of these") finishes within its time
+// budget. No-op on an instance already configured for long runs (autoContinue
+// on → maxSteps is already 1,000,000, so the cap is never approached).
+function stepProgressElevateEnabled(): boolean {
+  return (process.env.CLEMMY_STEP_PROGRESS_ELEVATE ?? 'on').toLowerCase() !== 'off';
+}
+
+/**
+ * Pure: should a forward-progressing run auto-elevate its budget because it is
+ * about to exhaust the STEP cap? Only fires on the capped `standard` preset with
+ * no caller-pinned maxSteps and autoContinue OFF — i.e. exactly the default
+ * install that would otherwise pause at 40 steps. Exported for tests.
+ */
+export function shouldElevateOnStepProgress(opts: {
+  enabled: boolean;
+  alreadyElevated: boolean;
+  preset: string;
+  autoContinueOnLimit: boolean;
+  explicitMaxSteps: boolean;
+  stepIndex: number;
+  maxSteps: number;
+}): boolean {
+  if (!opts.enabled) return false;
+  if (opts.alreadyElevated) return false;
+  if (opts.explicitMaxSteps) return false; // caller pinned the cap — respect it
+  if (opts.autoContinueOnLimit) return false; // already long-run capable (no-op for long/unlimited)
+  if (opts.preset !== 'standard') return false; // only the capped default preset
+  return opts.stepIndex >= opts.maxSteps; // about to exit on the step cap
+}
+
+// Restart-recovery: set/clear the in-flight marker on CHAT sessions only.
+// Best-effort — a marker write must never affect the run. Flag-gated so it can
+// be fully disabled. See restart-recovery.ts for the boot-time scan.
+function markRunInFlight(sessionId: string, on: boolean): void {
+  if ((process.env.CLEMMY_CHAT_RESTART_RECOVERY ?? 'on').toLowerCase() === 'off') return;
+  try {
+    const sess = HarnessSession.load(sessionId);
+    if (!sess || sess.kind !== 'chat') return;
+    if (on) sess.setRunInFlight();
+    else sess.clearRunInFlight();
+  } catch {
+    /* best-effort — the recovery marker must never break a run */
+  }
+}
+
 export async function runConversation(
   options: RunConversationOptions,
 ): Promise<RunConversationResult> {
-  const result = await runConversationCore(options);
-  emitRuntimeTerminalEvent(options.sessionId, result);
-  return result;
+  // In-flight marker set BEFORE the run and cleared in the finally on ANY exit
+  // (return or throw). Only a hard process death between here and the finally
+  // leaves it set — which is exactly the "killed mid-run" case the boot scan
+  // surfaces so a long chat run never dies silently.
+  markRunInFlight(options.sessionId, true);
+  try {
+    const result = await runConversationCore(options);
+    emitRuntimeTerminalEvent(options.sessionId, result);
+    return result;
+  } finally {
+    markRunInFlight(options.sessionId, false);
+  }
 }
 
 async function runConversationCore(
@@ -1148,6 +1205,33 @@ async function runConversationCore(
   let objectiveJudgeContinuations = 0;
   let totalToolCalls = 0;
 
+  // One-way budget elevation (standard → long). Shared by the token-fraction
+  // trigger (preflight warn/block) and the step-progress trigger below. Rebinds
+  // the cached ceilings so the next loop iteration picks them up. No-op when
+  // getElevatedBudget declines (knob off / not standard).
+  const applyElevation = (eventData: Record<string, unknown>): void => {
+    const next = getElevatedBudget(budget);
+    if (next === budget) return;
+    const prev = { maxSteps, maxTurns, toolCallsPerTurn, maxWallMs };
+    budget = next;
+    maxSteps = options.maxSteps ?? Math.max(maxSteps, budget.maxConversationSteps);
+    if (options.maxSteps === undefined && budget.autoContinueOnLimit) {
+      maxSteps = Math.max(maxSteps, 1_000_000);
+    }
+    maxWallMs = options.maxWallClockMs ?? Math.max(maxWallMs, budget.maxConversationWallMs);
+    maxTurns = options.maxTurns ?? Math.max(maxTurns, budget.maxTurns);
+    toolCallsPerTurn = options.toolCallsPerTurn ?? Math.max(toolCallsPerTurn, budget.toolCallsPerTurn);
+    checkInMs = Math.min(checkInMs, Math.max(60_000, budget.checkInMinutes * 60 * 1000));
+    elevated = true;
+    safeAppend({
+      sessionId: options.sessionId,
+      turn: lastTurn,
+      role: 'system',
+      type: 'budget_elevated',
+      data: { ...eventData, from: prev, to: { maxSteps, maxTurns, toolCallsPerTurn, maxWallMs } },
+    });
+  };
+
   while (stepIndex < maxSteps) {
     stepIndex += 1;
 
@@ -1172,35 +1256,11 @@ async function runConversationCore(
       const recentPreflight = findLatestPreflightVerdict(options.sessionId, lastTurn);
       if (recentPreflight && (recentPreflight.status === 'warn' || recentPreflight.status === 'block')
           && recentPreflight.fractionUsed > 0.5) {
-        const next = getElevatedBudget(budget);
-        // getElevatedBudget returns the same object when knob=off or
-        // preset !== standard; equality check avoids spurious events.
-        if (next !== budget) {
-          const prev = { maxSteps, maxTurns, toolCallsPerTurn, maxWallMs };
-          budget = next;
-          maxSteps = options.maxSteps ?? Math.max(maxSteps, budget.maxConversationSteps);
-          if (options.maxSteps === undefined && budget.autoContinueOnLimit) {
-            maxSteps = Math.max(maxSteps, 1_000_000);
-          }
-          maxWallMs = options.maxWallClockMs ?? Math.max(maxWallMs, budget.maxConversationWallMs);
-          maxTurns = options.maxTurns ?? Math.max(maxTurns, budget.maxTurns);
-          toolCallsPerTurn = options.toolCallsPerTurn ?? Math.max(toolCallsPerTurn, budget.toolCallsPerTurn);
-          checkInMs = Math.min(checkInMs, Math.max(60_000, budget.checkInMinutes * 60 * 1000));
-          elevated = true;
-          safeAppend({
-            sessionId: options.sessionId,
-            turn: lastTurn,
-            role: 'system',
-            type: 'budget_elevated',
-            data: {
-              reason: 'preflight_warn',
-              preflightStatus: recentPreflight.status,
-              fractionUsed: recentPreflight.fractionUsed,
-              from: prev,
-              to: { maxSteps, maxTurns, toolCallsPerTurn, maxWallMs },
-            },
-          });
-        }
+        applyElevation({
+          reason: 'preflight_warn',
+          preflightStatus: recentPreflight.status,
+          fractionUsed: recentPreflight.fractionUsed,
+        });
       }
     }
 
@@ -1634,6 +1694,25 @@ async function runConversationCore(
       };
     }
 
+    // Surgical long-run: a forward-progressing run about to hit the STEP cap
+    // auto-elevates ONCE (standard → long) instead of pausing for a manual
+    // `continue`, so a genuinely long task finishes within its time budget.
+    // Reaching here means the turn completed and the conversation is NOT done /
+    // abandoned / stalled (those returned earlier) — i.e. real forward progress.
+    // No-op when autoContinue is already on (maxSteps is 1,000,000, so the cap
+    // is never approached) → cannot regress a long/unlimited instance.
+    if (shouldElevateOnStepProgress({
+      enabled: stepProgressElevateEnabled(),
+      alreadyElevated: elevated,
+      preset: budget.preset,
+      autoContinueOnLimit: budget.autoContinueOnLimit,
+      explicitMaxSteps: options.maxSteps !== undefined,
+      stepIndex,
+      maxSteps,
+    })) {
+      applyElevation({ reason: 'step_progress', steps: stepIndex });
+    }
+
     // 'awaiting_handoff_result' or any other non-terminal state → loop.
     nextInput = CONTINUATION_INPUT;
   }
@@ -1856,7 +1935,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   // When the flag is off, fall back to the legacy post-hoc hook so
   // counting still works for any agent that didn't go through the
   // wrap factory yet.
-  const useToolWrapper = process.env.HARNESS_TOOL_BRACKETS === 'on';
+  const useToolWrapper = harnessToolBracketsEnabled();
   if (!useToolWrapper) {
     (runner as unknown as RunHooksLike).on(
       'agent_tool_start',
@@ -2584,7 +2663,7 @@ export async function resumePendingApproval(
     toolCounter.increment();
   };
   // T2.1 — see equivalent block in runTurn at the top of this file.
-  const useToolWrapper = process.env.HARNESS_TOOL_BRACKETS === 'on';
+  const useToolWrapper = harnessToolBracketsEnabled();
   if (!useToolWrapper) {
     (runner as unknown as RunHooksLike).on(
       'agent_tool_start',
@@ -3565,8 +3644,16 @@ function evaluateProgress(opts: {
     // 2026-05-19 sf data query session (Executor said "Executing the
     // Salesforce pull now — I'll fetch 15 contacts ..." with 0 tool
     // calls). Any time the output is future-tense and zero tools fired,
-    // treat it the same as the bare "Continuing." stall.
-    if (trimmed && STALL_ANNOUNCEMENT_PATTERN.test(trimmed)) {
+    // treat it the same as the bare "Continuing." stall — EXCEPT when the
+    // reply is a reflective/alignment turn ("you're right — going forward
+    // I'll …"), which legitimately has zero tools. Same suppression the
+    // structured-decision path already applies (evaluateStructuredDecisionStall);
+    // without it, converse-until-aligned replies false-fire a stall retry.
+    if (
+      trimmed &&
+      STALL_ANNOUNCEMENT_PATTERN.test(trimmed) &&
+      !STALL_REFLECTION_SUPPRESS_PATTERN.test(trimmed)
+    ) {
       return {
         signal: 'A_zero_tools',
         rawOutput: trimmed.slice(0, 220),

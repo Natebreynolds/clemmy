@@ -39,6 +39,11 @@ import {
 
 const META_CONVERSATION = '__conversation';
 const META_INTERRUPT = '__interrupt_state';
+// Restart-recovery marker: set while a runConversation is in flight, cleared in
+// a finally when it returns/throws — so ONLY a hard process death (daemon crash
+// /restart mid-run) leaves it set. The boot scan uses it to surface an
+// interrupted chat run instead of dying silently. Internal bookkeeping → no event.
+const META_RUNNING = '__run_in_flight';
 
 export interface PersistedConversation {
   items: AgentInputItem[];
@@ -80,6 +85,10 @@ export class HarnessSession {
 
   get id(): string {
     return this.row.id;
+  }
+
+  get kind(): SessionRow['kind'] {
+    return this.row.kind;
   }
 
   get sessionRow(): SessionRow {
@@ -242,5 +251,29 @@ export class HarnessSession {
    */
   markStatus(status: SessionStatus): void {
     this.row = updateSession(this.row.id, { status });
+  }
+
+  // ── Restart-recovery in-flight marker ──────────────────────────────
+  // Mirror of saveInterruptState's read-modify-write, but emits NO event
+  // (it's internal bookkeeping, not an audit signal). Set on runConversation
+  // entry, cleared in its finally — so a value surviving across a daemon
+  // restart means that run was killed mid-flight.
+  setRunInFlight(at: string = new Date().toISOString()): void {
+    const meta = { ...this.row.metadata };
+    meta[META_RUNNING] = at;
+    this.row = updateSession(this.row.id, { metadata: meta });
+  }
+
+  clearRunInFlight(): void {
+    if (!(META_RUNNING in this.row.metadata)) return;
+    const meta = { ...this.row.metadata };
+    delete meta[META_RUNNING];
+    this.row = updateSession(this.row.id, { metadata: meta });
+  }
+
+  /** ISO timestamp a still-in-flight run started at, or null. */
+  runInFlightSince(): string | null {
+    const raw = this.row.metadata[META_RUNNING];
+    return typeof raw === 'string' ? raw : null;
   }
 }

@@ -1,0 +1,141 @@
+/* Self-hosted brand font (no network dependency in the desktop app). */
+@import '@fontsource-variable/plus-jakarta-sans';
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * Design tokens — warm, friendly-premium. Light is the DEFAULT
+ * (`:root`); `.dark` on <html> swaps to a warm charcoal. The orange
+ * brand stays the hero. Contrast targets: text 12.8:1, muted 5.9:1,
+ * subtle/placeholder 4.6:1 (all >= WCAG AA on the cream canvas).
+ */
+:root {
+  color-scheme: light;
+
+  /* Brand orange (hero) */
+  --primary: #f26419;       /* orange-500 */
+  --primary-hover: #ff8442; /* orange-400 */
+  --primary-press: #d9520f; /* orange-600 */
+  --primary-fg: #ffffff;    /* text on primary fill */
+  --primary-tint: #fff4ed;  /* orange-50 — selected/hover wash */
+
+  /* Surfaces (warm paper) */
+  --bg-canvas: #faf7f2;
+  --bg-surface: #ffffff;
+  --bg-subtle: #f4f0e9;
+  --bg-hover: #efeae1;
+
+  /* Lines */
+  --border: #e7e1d6;
+  --border-strong: #d6cfc0;
+  --ring: #f26419;
+
+  /* Text */
+  --text: #1f1b16;
+  --text-muted: #5c564b;
+  --text-subtle: #857e70;
+
+  /* Semantic */
+  --success: #2e7d46; --success-tint: #e8f5ec;
+  --info: #1e6fb8;    --info-tint: #e6f1fa;
+  --warning: #b26c00; --warning-tint: #fcf1de;
+  --danger: #c0392b;  --danger-tint: #fbe9e7;
+}
+
+.dark {
+  color-scheme: dark;
+
+  --primary: #ff7a45;       /* brighter on charcoal */
+  --primary-hover: #ff9466;
+  --primary-press: #f26419;
+  --primary-fg: #1f1b16;
+  --primary-tint: #2e2017;
+
+  --bg-canvas: #16140f;
+  --bg-surface: #1f1c16;
+  --bg-subtle: #2a271f;
+  --bg-hover: #332f26;
+
+  --border: #3a352b;
+  --border-strong: #4e4839;
+  --ring: #ff7a45;
+
+  --text: #f5f1e8;
+  --text-muted: #b8b1a1;
+  --text-subtle: #8c8475;
+
+  --success: #5bc97e; --success-tint: #15301f;
+  --info: #5ba8e0;    --info-tint: #122838;
+  --warning: #e0a030; --warning-tint: #2f2410;
+  --danger: #f0685a;  --danger-tint: #331715;
+}
+
+@layer base {
+  * {
+    border-color: var(--border);
+  }
+  html, body, #root {
+    height: 100%;
+  }
+  body {
+    margin: 0;
+    background: var(--bg-canvas);
+    color: var(--text);
+    font-family: theme('fontFamily.sans');
+    font-size: 0.875rem;
+    line-height: 1.375rem;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+  /* Visible focus ring everywhere — replaces the legacy outline:none. */
+  :focus-visible {
+    outline: none;
+    box-shadow:
+      0 0 0 2px var(--bg-surface),
+      0 0 0 4px color-mix(in srgb, var(--ring) 55%, transparent);
+    border-radius: 6px;
+  }
+  ::placeholder { color: var(--text-subtle); }
+}
+
+@layer utilities {
+  /* macOS hiddenInset titlebar: the top bar is the drag region; every
+     interactive child must opt back out or it becomes unclickable. */
+  .app-drag { -webkit-app-region: drag; }
+  .app-no-drag { -webkit-app-region: no-drag; }
+
+  /* macOS hiddenInset: push the brand below the window traffic lights. */
+  .is-mac .sidebar-brand { padding-top: 30px; }
+
+  /* Skeleton shimmer (disabled under reduced-motion below). */
+  .skeleton {
+    position: relative;
+    overflow: hidden;
+    background: var(--bg-subtle);
+  }
+  .skeleton::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    transform: translateX(-100%);
+    background: linear-gradient(
+      90deg,
+      transparent,
+      color-mix(in srgb, var(--bg-hover) 80%, transparent),
+      transparent
+    );
+    animation: shimmer 1.5s infinite;
+  }
+}
+
+/* Respect the user's reduced-motion preference globally. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+  .skeleton::after { animation: none; }
+}

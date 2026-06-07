@@ -21,7 +21,7 @@ import { harnessInstructions } from './harness-context.js';
 import { normalizeZodForCodexStrict } from '../runtime/schema-normalizer.js';
 import { getCoreToolsAsync } from '../tools/registry.js';
 import { getOrCreateExternalMcpServers } from '../runtime/mcp-servers.js';
-import { resolveMcpToolScope, resolveMcpToolScopeWithContinuity, type McpToolScope } from '../runtime/mcp-tool-scope.js';
+import { resolveMcpToolScope, resolveMcpToolScopeWithRecall, type McpToolScope } from '../runtime/mcp-tool-scope.js';
 import type { Tool } from '@openai/agents';
 import { appendEvent, listEvents } from '../runtime/harness/eventlog.js';
 import { openPlanScope } from './plan-scope.js';
@@ -527,7 +527,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   // legacy behavior. Still gated by CLEMMY_SCOPED_MCP_TOOLS (no new flag).
   const mcpToolScope = options.mcpToolScope ?? (
     options.sessionId
-      ? resolveMcpToolScopeWithContinuity({
+      ? resolveMcpToolScopeWithRecall({
           userInput: options.userInput,
           priorUserInputs: recentPriorUserInputsForScope(options.sessionId, options.userInput),
         })

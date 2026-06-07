@@ -108,6 +108,34 @@ test('reapStaleSessions deletes old terminal sessions (+cascade), keeps active +
   assert.ok(getSession(d.id), 'guarded session survives ttl<=0');
 });
 
+test('reapStaleSessions never reaps a pinned or archived terminal session', () => {
+  resetEventLog();
+  const db = openEventLog();
+  const backdate = (id: string) =>
+    db.prepare('UPDATE sessions SET updated_at = ? WHERE id = ?').run('2020-01-01T00:00:00.000Z', id);
+
+  // Pinned + old + completed → must be kept (explicit "hold onto this").
+  const pinned = createSession({ kind: 'chat', channel: 'discord', title: 'pinned-done' });
+  updateSession(pinned.id, { status: 'completed', metadata: { source: 'discord', pinned: true } });
+  backdate(pinned.id);
+
+  // Archived + old + completed → must be kept.
+  const archived = createSession({ kind: 'workflow', channel: 'cli', title: 'archived-done' });
+  updateSession(archived.id, { status: 'completed', metadata: { archived: true } });
+  backdate(archived.id);
+
+  // Plain old completed → reaped.
+  const plain = createSession({ kind: 'chat', channel: 'cli', title: 'plain-done' });
+  updateSession(plain.id, { status: 'completed' });
+  backdate(plain.id);
+
+  const deleted = reapStaleSessions(14);
+  assert.equal(deleted, 1, 'only the un-pinned, un-archived terminal session is reaped');
+  assert.ok(getSession(pinned.id), 'pinned terminal session kept');
+  assert.ok(getSession(archived.id), 'archived terminal session kept');
+  assert.equal(getSession(plain.id), null, 'plain old terminal session reaped');
+});
+
 test('rejects unknown event type', () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });

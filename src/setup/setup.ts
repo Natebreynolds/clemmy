@@ -5,7 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { input, password, select, confirm } from '@inquirer/prompts';
-import { BASE_DIR, CODEX_AUTH_SOURCE_FILE, WEBHOOK_PORT } from '../config.js';
+import { BASE_DIR, CODEX_AUTH_SOURCE_FILE, DEFAULT_MODELS, WEBHOOK_PORT } from '../config.js';
 import {
   bootstrapCodexAuth,
   getAuthStatus,
@@ -82,9 +82,12 @@ export async function runSetupWizard(): Promise<number> {
     OPENAI_API_KEY: existing.OPENAI_API_KEY ?? '',
     AUTH_MODE: authMode,
     CODEX_AUTH_SOURCE_FILE: existing.CODEX_AUTH_SOURCE_FILE || CODEX_AUTH_SOURCE_FILE,
-    OPENAI_MODEL_PRIMARY: existing.OPENAI_MODEL_PRIMARY || 'gpt-4.1',
-    OPENAI_MODEL_FAST: existing.OPENAI_MODEL_FAST || 'gpt-4.1-mini',
-    OPENAI_MODEL_DEEP: existing.OPENAI_MODEL_DEEP || 'gpt-4.1',
+    // Seed from DEFAULT_MODELS (the single source of truth) so the wizard
+    // never silently pins a new user to a stale model the rest of the app
+    // has moved past.
+    OPENAI_MODEL_PRIMARY: existing.OPENAI_MODEL_PRIMARY || DEFAULT_MODELS.primary,
+    OPENAI_MODEL_FAST: existing.OPENAI_MODEL_FAST || DEFAULT_MODELS.fast,
+    OPENAI_MODEL_DEEP: existing.OPENAI_MODEL_DEEP || DEFAULT_MODELS.deep,
     CLEMENTINE_HOME: existing.CLEMENTINE_HOME || BASE_DIR,
     ASSISTANT_NAME: existing.ASSISTANT_NAME || 'Clementine',
     OWNER_NAME: existing.OWNER_NAME || os.userInfo().username,
@@ -104,7 +107,14 @@ export async function runSetupWizard(): Promise<number> {
     AUTONOMY_V2_AGENTS: existing.AUTONOMY_V2_AGENTS || 'clementine',
     AUTONOMY_ORCHESTRATOR_SLUGS: existing.AUTONOMY_ORCHESTRATOR_SLUGS || '',
     COMPOSIO_API_KEY: existing.COMPOSIO_API_KEY || '',
-    COMPOSIO_USER_ID: existing.COMPOSIO_USER_ID || 'default',
+    // Leave blank by default. Persisting the literal "default" defeats
+    // getPreferredUserId's auto-detection (Composio's real ids look like
+    // pg-test-…), stranding every dashboard-connected toolkit on
+    // NoActiveConnection. Migrate an already-persisted "default" to blank.
+    COMPOSIO_USER_ID:
+      existing.COMPOSIO_USER_ID && existing.COMPOSIO_USER_ID !== 'default'
+        ? existing.COMPOSIO_USER_ID
+        : '',
     WORKSPACE_DIRS: existing.WORKSPACE_DIRS || '',
   };
 
@@ -350,10 +360,12 @@ export async function runSetupWizard(): Promise<number> {
     });
     if (composioKey) values.COMPOSIO_API_KEY = composioKey;
     const composioUserId = await input({
-      message: 'Composio user ID',
-      default: values.COMPOSIO_USER_ID || 'default',
+      message: 'Composio user ID (leave blank to auto-detect from your connections)',
+      default: values.COMPOSIO_USER_ID,
     });
-    values.COMPOSIO_USER_ID = composioUserId || 'default';
+    // Blank → auto-detect at runtime. Never re-persist the "default" sentinel.
+    const trimmedUserId = composioUserId.trim();
+    values.COMPOSIO_USER_ID = trimmedUserId && trimmedUserId !== 'default' ? trimmedUserId : '';
     if (values.COMPOSIO_API_KEY) {
       ok('Composio configured', 'connect app toolkits from the dashboard');
     } else {

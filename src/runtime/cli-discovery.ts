@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync,
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { BASE_DIR } from '../config.js';
+import { augmentPath } from './spawn-env.js';
 
 /**
  * Local CLI discovery. Two operations, both global:
@@ -113,7 +114,9 @@ function writeCachedScan(result: CliScanResult): void {
  * PATH wins, matching shell resolution order).
  */
 export function scanPath(): { command: string; path: string }[] {
-  const PATH = process.env.PATH ?? '';
+  // Augment PATH so a packaged .app sees Homebrew/nvm/user-CLI dirs, not
+  // just the minimal launch PATH. Same seam as the shell-exec env.
+  const PATH = augmentPath(process.env.PATH);
   const dirs = PATH.split(path.delimiter).filter(Boolean);
   const seen = new Map<string, string>();
 
@@ -462,7 +465,9 @@ export async function probe(command: string, candidatePath?: string): Promise<Cl
 }
 
 function whichOnPath(command: string): string | undefined {
-  const PATH = process.env.PATH ?? '';
+  // Augmented PATH (see spawn-env.ts) so resolution matches what the
+  // shell-exec seam can actually run on a packaged .app.
+  const PATH = augmentPath(process.env.PATH);
   for (const dir of PATH.split(path.delimiter).filter(Boolean)) {
     const candidate = path.join(dir, command);
     try {

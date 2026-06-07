@@ -1,3 +1,5 @@
+import { matchToolChoicesForStep, type StepToolChoiceMatch } from '../memory/tool-choice-store.js';
+
 export interface McpToolScope {
   /**
    * Human-readable reason for telemetry/debug logs.
@@ -30,6 +32,17 @@ export interface McpToolScope {
    * DataForSEO from consuming the entire multi-system budget.
    */
   serverMaxTools?: Record<string, number>;
+  /**
+   * Fail-OPEN marker: set ONLY on the unrecognized-intent fallthrough (no
+   * keyword family matched and it is NOT a deliberate no-tool turn). The
+   * consumer (getOrCreateExternalMcpServers) interprets this as "expose the
+   * user's OWN connected external servers, bounded by maxTools" — derived
+   * dynamically, with NO allowlist and NO keyword branch. This is what makes a
+   * connected app outside the 6 keyword families reachable on the first try
+   * instead of silently invisible (maxTools:0). The filter treats it as
+   * match-all-servers but STILL applies the cap.
+   */
+  failOpenCandidate?: boolean;
 }
 
 export interface ResolveMcpToolScopeOptions {
@@ -107,6 +120,22 @@ const DATAFORSEO_SEO_PRIORITIES = [
 function scopingDisabled(): boolean {
   const raw = process.env.CLEMMY_SCOPED_MCP_TOOLS;
   return typeof raw === 'string' && /^(0|false|off|no)$/i.test(raw.trim());
+}
+
+// Bounded global cap for the unrecognized-intent fail-open surface. Small enough
+// to stay token-cheap on keyword-less turns, large enough to surface a connected
+// server's core tools. Tunable via CLEMMY_MCP_SCOPE_FAILOPEN_MAX.
+const DEFAULT_FAILOPEN_MAX_TOOLS = 12;
+
+// Kill-switch (default ON). CLEMMY_MCP_SCOPE_FAILOPEN=off restores the prior
+// behavior (an unrecognized-intent turn exposes NO external tools).
+function failOpenScopeEnabled(): boolean {
+  return (process.env.CLEMMY_MCP_SCOPE_FAILOPEN ?? 'on').toLowerCase() !== 'off';
+}
+
+function failOpenMaxTools(): number {
+  const raw = Number.parseInt(process.env.CLEMMY_MCP_SCOPE_FAILOPEN_MAX ?? '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_FAILOPEN_MAX_TOOLS;
 }
 
 /**
@@ -222,11 +251,27 @@ export function resolveMcpToolScope(options: ResolveMcpToolScopeOptions = {}): M
   }
 
   if (scopes.length === 0) {
+    // No keyword family matched. The old behavior returned maxTools:0 — which
+    // made ANY connected app outside the 6 hardcoded families (Airtable, Slack,
+    // Notion, Stripe, …) silently invisible, so Clem falsely reported "not
+    // connected" on the first relevant turn. FAIL OPEN per class instead:
+    // expose the user's OWN connected servers, bounded. No allowlist, no new
+    // keyword branch — the consumer enumerates the configured servers
+    // dynamically. (The DELIBERATE local-context no-tool turn above keeps
+    // maxTools:0, so token discipline is preserved where it was intended.)
+    if (!failOpenScopeEnabled()) {
+      return {
+        reason: `no external MCP intent detected; fail-open disabled: ${lower.slice(0, 120)}`,
+        allowedServerSlugs: [],
+        toolPatterns: [],
+        maxTools: 0,
+      };
+    }
     return {
-      reason: `no external MCP intent detected from prompt: ${lower.slice(0, 120)}`,
-      allowedServerSlugs: [],
+      reason: `no keyword-family intent matched — failing OPEN to the user's own connected servers (bounded): ${lower.slice(0, 120)}`,
+      failOpenCandidate: true,
       toolPatterns: [],
-      maxTools: 0,
+      maxTools: failOpenMaxTools(),
     };
   }
 
@@ -252,9 +297,14 @@ export function resolveMcpToolScope(options: ResolveMcpToolScopeOptions = {}): M
   };
 }
 
-/** A scope that actually exposes tools: the legacy allowAll surface, or a
- *  concrete server scope with a non-zero cap. (maxTools:0 = nothing exposed.) */
+/** A scope that actually exposes tools FROM A RECOGNIZED INTENT: the legacy
+ *  allowAll surface, or a concrete keyword scope with a non-zero cap. A
+ *  fail-open scope is deliberately NOT concrete — it's the last-resort fallback,
+ *  so continuity must still get a chance to inherit a PRECISE prior-turn scope
+ *  before we settle for the broad bounded fail-open surface. (maxTools:0 =
+ *  nothing exposed.) */
 function scopeIsConcrete(scope: McpToolScope): boolean {
+  if (scope.failOpenCandidate) return false;
   return Boolean(scope.allowAll) || (scope.maxTools ?? 0) > 0;
 }
 
@@ -287,9 +337,11 @@ export function resolveMcpToolScopeWithContinuity(
   if (!isToolScopeContinuation(options.userInput)) return direct;
   for (const prior of options.priorUserInputs ?? []) {
     const inherited = resolveMcpToolScope({ userInput: prior });
-    // Only inherit a CONCRETE tool scope (maxTools>0) — never a prior allowAll
-    // (a no-prompt/internal turn) which would silently open the whole surface.
-    if ((inherited.maxTools ?? 0) > 0) {
+    // Only inherit a CONCRETE keyword scope (maxTools>0) — never a prior allowAll
+    // (a no-prompt/internal turn) which would silently open the whole surface,
+    // and never a prior FAIL-OPEN scope (that's a fallback, not a precise
+    // intent to inherit — the direct fail-open below already covers it).
+    if (!inherited.failOpenCandidate && (inherited.maxTools ?? 0) > 0) {
       return {
         ...inherited,
         reason: `continuity: inherited prior-turn scope for follow-up ("${(options.userInput ?? '').trim().slice(0, 40)}") → ${inherited.reason}`,
@@ -297,4 +349,83 @@ export function resolveMcpToolScopeWithContinuity(
     }
   }
   return direct;
+}
+
+// Kill-switch (default ON). CLEMMY_SCOPE_FROM_RECALL=off disables both the
+// recall-aware widening here AND the remember-native-MCP-on-success half
+// (auto-remember.ts) — they are one feature and must move together.
+function recallScopeEnabled(): boolean {
+  return (process.env.CLEMMY_SCOPE_FROM_RECALL ?? 'on').toLowerCase() !== 'off';
+}
+
+/** Server slugs from HIGH-tier remembered MCP choices whose identity the current
+ *  prompt strongly names — derived from each mcp tool name's `<slug>__<tool>`
+ *  prefix. This is the user's OWN proven evidence, so it can only WIDEN reach. */
+function learnedMcpServerSlugs(matches: StepToolChoiceMatch[]): string[] {
+  const slugs: string[] = [];
+  for (const m of matches) {
+    if (m.kind !== 'mcp' || m.tier !== 'high') continue;
+    const slug = (m.identifier.split('__')[0] ?? '').trim().toLowerCase();
+    if (slug) slugs.push(slug);
+  }
+  return Array.from(new Set(slugs));
+}
+
+/**
+ * Recall-aware scope: resolve continuity-aware normally, then WIDEN with the
+ * user's own proven MCP servers when the current prompt strongly names a
+ * remembered tool. This closes the native-MCP compounding loop — a server proven
+ * once for an intent becomes reachable for it again WITHOUT needing a keyword
+ * branch (pairs with the remember-on-success half in auto-remember.ts).
+ *
+ * Strictly additive: it only ever adds the user's own learned servers, never
+ * removes; a deliberate no-tool turn is left untouched; precise recall replaces
+ * the broad fail-open surface (drops failOpenCandidate so the consumer targets
+ * the proven servers). No-op when nothing is learned or the flag is off. Reading
+ * the tool-choice store is the only impurity; `learnedMatches` overrides it for
+ * tests / callers that already have the matches.
+ */
+export function resolveMcpToolScopeWithRecall(
+  options: {
+    userInput?: string | null;
+    priorUserInputs?: Array<string | null | undefined>;
+    learnedMatches?: StepToolChoiceMatch[];
+  } = {},
+): McpToolScope {
+  const base = resolveMcpToolScopeWithContinuity(options);
+  if (!recallScopeEnabled()) return base;
+  if (base.allowAll) return base; // already the full surface
+  // A DELIBERATE no-tool turn (maxTools:0, not fail-open) explicitly wants no
+  // tools — recall must not override it.
+  if ((base.maxTools ?? 0) === 0 && !base.failOpenCandidate) return base;
+
+  const input = (options.userInput ?? '').trim();
+  let matches: StepToolChoiceMatch[];
+  if (options.learnedMatches) {
+    matches = options.learnedMatches;
+  } else if (input) {
+    try {
+      matches = matchToolChoicesForStep(input);
+    } catch {
+      matches = [];
+    }
+  } else {
+    matches = [];
+  }
+
+  const learned = learnedMcpServerSlugs(matches);
+  if (learned.length === 0) return base;
+
+  // Precise recall beats broad fail-open: drop failOpenCandidate and target the
+  // learned servers (merged with any keyword-matched ones).
+  const existing = base.failOpenCandidate ? [] : (base.allowedServerSlugs ?? []);
+  const merged = Array.from(new Set([...existing, ...learned]));
+  const baseCap = base.failOpenCandidate ? 0 : (base.maxTools ?? 0);
+  return {
+    ...base,
+    failOpenCandidate: undefined,
+    allowedServerSlugs: merged,
+    maxTools: baseCap + learned.length * 8,
+    reason: `${base.reason} + recall: proven server(s) ${learned.join(', ')}`,
+  };
 }

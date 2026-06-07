@@ -3,6 +3,7 @@ import { appendEvent, writeToolOutput, type EventRow } from './eventlog.js';
 import { scheduleReflection } from '../../memory/reflection.js';
 import { cliBinaryFromCommand } from '../../memory/authoritative-sources.js';
 import { autoInvalidateOnFailure } from './auto-invalidate.js';
+import { autoRememberOnSuccess } from './auto-remember.js';
 import { fanoutLedgerEnabled, recordWorkerResult } from './fanout-ledger.js';
 
 /**
@@ -417,6 +418,13 @@ export function attachEventLogHooks(
     autoInvalidateOnFailure({
       toolName: tool?.name ?? null,
       args: (details as { toolCall?: { arguments?: unknown } } | undefined)?.toolCall?.arguments,
+      resultStr,
+    });
+    // Commit half: a CLEAN native-MCP success memorizes itself against the
+    // active objective so recall can compound for the native-MCP family (the
+    // Composio half already does this via the search query). Best-effort.
+    autoRememberOnSuccess({
+      toolName: tool?.name ?? null,
       resultStr,
     });
   };

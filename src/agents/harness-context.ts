@@ -64,7 +64,7 @@ function section(title: string, body: string | undefined | null): string {
  * `balanced` (the default the static instructions already assume) renders
  * nothing, so the common case is byte-identical and the block stays lean.
  */
-function renderAutonomy(): string {
+export function renderAutonomy(): string {
   try {
     const scope = loadProactivityPolicy().autoApproveScope;
     if (scope === 'yolo') {
@@ -102,7 +102,7 @@ function renderAutonomy(): string {
  * to the system's resolved timezone; if even that fails, the line is
  * just omitted from the persistent context.
  */
-function renderCurrentTimeForInstructions(): string {
+export function renderCurrentTimeForInstructions(): string {
   try {
     const profile = loadUserProfile();
     const tz = profile.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
@@ -119,6 +119,51 @@ function renderCurrentTimeForInstructions(): string {
   } catch {
     return '';
   }
+}
+
+/**
+ * Render the Current Focus block (active / stale / parked). Extracted so BOTH
+ * the harness self-assembler and the chat assembler emit the SAME focus surface
+ * (CANON-SELFASM) — chat previously had none, forcing a focus_get every turn.
+ * Returns the inner content (wrap with section('Current Focus', …)); '' on no
+ * focus or error.
+ */
+export function renderFocusForInstructions(): string {
+  let focus = '';
+  try {
+    const snap = getFocusSnapshot();
+    if (snap.active && !snap.needsConfirm) {
+      focus = [
+        `ACTIVE focus #${snap.active.id}: ${snap.active.title}`,
+        `Summary: ${snap.active.summary}`,
+        `Resource: ${snap.active.resource_ref}${snap.active.resource_kind ? ` (${snap.active.resource_kind})` : ''}`,
+        `Last touched: ${snap.active.last_touched_at}`,
+      ].join('\n');
+      if (snap.parked.length > 0) {
+        focus += `\n\nParked (resumable via focus_activate):\n`
+          + snap.parked.slice(0, 5).map((p) => `  - #${p.id} ${p.title}`).join('\n');
+      }
+    } else if (snap.active && snap.needsConfirm) {
+      focus = [
+        'No confirmed active focus.',
+        `STALE focus #${snap.active.id}: ${snap.active.title}`,
+        `Summary: ${snap.active.summary}`,
+        `Resource: ${snap.active.resource_ref}${snap.active.resource_kind ? ` (${snap.active.resource_kind})` : ''}`,
+        `Last touched: ${snap.active.last_touched_at}`,
+        'Do not treat the stale focus as authoritative. If the user is clearly continuing it, call focus_touch(id). If the user moved on or asks for unrelated work, call focus_clear(id, resolution:"abandoned") or focus_park(id, reason) before proceeding.',
+      ].join('\n');
+      if (snap.parked.length > 0) {
+        focus += `\n\nParked (resumable via focus_activate):\n`
+          + snap.parked.slice(0, 5).map((p) => `  - #${p.id} ${p.title}`).join('\n');
+      }
+    } else if (snap.parked.length > 0) {
+      focus = 'No active focus. Parked threads (resumable):\n'
+        + snap.parked.slice(0, 5).map((p) => `  - #${p.id} ${p.title} — ${p.summary}`).join('\n');
+    }
+  } catch {
+    focus = '';
+  }
+  return focus;
 }
 
 function renderActiveGoals(): string {
@@ -242,40 +287,7 @@ export function renderHarnessMemoryContext(): string {
   // has at-a-glance awareness without a focus_get tool call. The
   // instructions still require focus_get at turn start for the most
   // current state (the persistent block is rendered once per turn).
-  let focus = '';
-  try {
-    const snap = getFocusSnapshot();
-    if (snap.active && !snap.needsConfirm) {
-      focus = [
-        `ACTIVE focus #${snap.active.id}: ${snap.active.title}`,
-        `Summary: ${snap.active.summary}`,
-        `Resource: ${snap.active.resource_ref}${snap.active.resource_kind ? ` (${snap.active.resource_kind})` : ''}`,
-        `Last touched: ${snap.active.last_touched_at}`,
-      ].join('\n');
-      if (snap.parked.length > 0) {
-        focus += `\n\nParked (resumable via focus_activate):\n`
-          + snap.parked.slice(0, 5).map((p) => `  - #${p.id} ${p.title}`).join('\n');
-      }
-    } else if (snap.active && snap.needsConfirm) {
-      focus = [
-        'No confirmed active focus.',
-        `STALE focus #${snap.active.id}: ${snap.active.title}`,
-        `Summary: ${snap.active.summary}`,
-        `Resource: ${snap.active.resource_ref}${snap.active.resource_kind ? ` (${snap.active.resource_kind})` : ''}`,
-        `Last touched: ${snap.active.last_touched_at}`,
-        'Do not treat the stale focus as authoritative. If the user is clearly continuing it, call focus_touch(id). If the user moved on or asks for unrelated work, call focus_clear(id, resolution:"abandoned") or focus_park(id, reason) before proceeding.',
-      ].join('\n');
-      if (snap.parked.length > 0) {
-        focus += `\n\nParked (resumable via focus_activate):\n`
-          + snap.parked.slice(0, 5).map((p) => `  - #${p.id} ${p.title}`).join('\n');
-      }
-    } else if (snap.parked.length > 0) {
-      focus = 'No active focus. Parked threads (resumable):\n'
-        + snap.parked.slice(0, 5).map((p) => `  - #${p.id} ${p.title} — ${p.summary}`).join('\n');
-    }
-  } catch {
-    focus = '';
-  }
+  const focus = renderFocusForInstructions();
 
   const blocks = [
     // Current date/time goes FIRST so the model reads it before any

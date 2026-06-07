@@ -18,9 +18,11 @@ import { processWorkflowRuns, reconcilePendingWorkflowRuns, reapResolvedParkedRu
 import { runWorkflowWatchdog } from '../execution/workflow-watchdog.js';
 import { runBackgroundTaskWatchdog } from '../execution/background-task-watchdog.js';
 import { getBuildInfo, describeBuild } from '../runtime/build-info.js';
+import { verifyDelivered } from '../runtime/harness/verify-delivered.js';
 import { processWorkflowSchedules, reapStaleWorkflowRuns } from '../execution/workflow-scheduler.js';
 import { sweepStaleExecutions, sweepCrashedExecutions, sweepStaleBlockedExecutions } from '../execution/store.js';
 import { sweepStaleRuns } from '../runtime/run-events.js';
+import { reportInterruptedChatRuns } from '../runtime/harness/restart-recovery.js';
 import { sweepStaleApprovals } from '../runtime/approval-store.js';
 import { getAuthStatus } from '../runtime/auth-store.js';
 import { tickAuthKeepalive, isAuthKeepaliveEnabled } from '../runtime/auth-keepalive.js';
@@ -284,28 +286,36 @@ async function runCronJob(assistant: ClementineAssistant, job: CronJobRecord, so
       maxWallClockMs: cronBudgetMs,
     });
 
+    // Report-back honesty: a non-throwing respond() can still be a blocked /
+    // promised / errored run. Fail-open + suspicious-only, so this only ever
+    // converts a false "ok" into an honest "needs attention".
+    const verdict = await verifyDelivered(prompt, response.text, { stoppedReason: response.stoppedReason });
+
     appendRunLog(job.name, {
-      status: 'ok',
+      status: verdict.delivered ? 'ok' : 'blocked',
       startedAt,
       finishedAt: new Date().toISOString(),
       durationMs: Date.now() - startMs,
       source,
       response: response.text,
+      ...(verdict.delivered ? {} : { blockedReason: verdict.reason }),
     });
     addNotification({
       id: `${Date.now()}-cron-${job.name}`,
       kind: 'cron',
-      title: `Cron job completed: ${job.name}`,
+      title: verdict.delivered ? `Cron job completed: ${job.name}` : `Cron job needs attention: ${job.name}`,
       // Send the full body. Discord delivery (notification-delivery.ts)
       // splits long content into multiple messages with paragraph-
       // preserving chunks. Previously this was hard-sliced to 2000 chars
       // and a morning briefing > 2000 arrived cut off with no continuation.
-      body: response.text,
+      body: verdict.delivered
+        ? response.text
+        : `⚠️ This run did not finish cleanly: ${verdict.reason ?? 'no verifiable result'}\n\n${response.text}`,
       createdAt: new Date().toISOString(),
       read: false,
-      metadata: { job: job.name, source },
+      metadata: { job: job.name, source, ...(verdict.delivered ? {} : { status: 'blocked' }) },
     });
-    logger.info({ job: job.name, source }, 'Cron job completed');
+    logger.info({ job: job.name, source, delivered: verdict.delivered }, verdict.delivered ? 'Cron job completed' : 'Cron job blocked (not done)');
   } catch (error) {
     appendRunLog(job.name, {
       status: 'error',
@@ -889,6 +899,13 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
   const autoResumed = resumeInterruptedBackgroundTasks({ cap: 2 });
   if (autoResumed > 0) {
     logger.warn({ autoResumed }, 'Auto-resumed interrupted background tasks on boot');
+  }
+  // Chat runs execute in-process with no resumer; a restart mid-run would
+  // otherwise die SILENTLY. Surface each interrupted chat run (non-silent
+  // notice + notification + "reply continue") so report-back never fails.
+  const recoveredChats = reportInterruptedChatRuns();
+  if (recoveredChats > 0) {
+    logger.warn({ recoveredChats }, 'Surfaced chat runs interrupted by a previous restart');
   }
   // Sweep records that got stuck active across a previous crash/restart.
   // Without this, the dashboard "NOW" panel still reports phantom in-flight
