@@ -809,6 +809,13 @@ async function runAgentCycle(assistant: ClementineAssistant, agent: TeamAgentRec
       model: agent.model ?? MODELS.fast,
       message: prompt,
     });
+    // Report-back honesty: if the runtime didn't finish cleanly, treat the cycle
+    // as failed rather than parsing a half-baked / error-stub body as a decision.
+    // (This lane's "completion" is its JSON decision, so the promise/judge path
+    // doesn't apply — a stoppedReason guard is the right-sized check here.)
+    if (response.stoppedReason === 'error' || response.stoppedReason === 'cancelled' || response.stoppedReason === 'pending-approval') {
+      throw new Error(`Agent run did not finish cleanly (${response.stoppedReason}): ${response.text.slice(0, 240)}`);
+    }
     const decision = parseJsonObject(response.text);
     if (!decision) {
       throw new Error(`Agent response was not valid JSON: ${response.text.slice(0, 240)}`);

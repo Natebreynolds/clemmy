@@ -8,7 +8,8 @@ import { renderSourceMapForContext } from '../memory/source-map.js';
 import { getRecallObjective } from '../memory/focus.js';
 import { renderProfileForInstructions } from '../runtime/user-profile.js';
 import { getProposalFeedback, renderProposalFeedback } from '../agents/proposal-feedback.js';
-import { renderLearnedBlocks } from '../agents/harness-context.js';
+import { renderLearnedBlocks, renderAutonomy, renderCurrentTimeForInstructions, renderFocusForInstructions } from '../agents/harness-context.js';
+import { renderSkillsIndex } from '../memory/skill-store.js';
 import { renderMcpServersForInstructions } from '../runtime/mcp-config.js';
 import { readConnectedClis } from '../integrations/cli-catalog/catalog.js';
 import type { MessageIntent } from './message-intent.js';
@@ -244,6 +245,15 @@ export function tieredContextEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_TIERED_CONTEXT', 'off') ?? 'off').toLowerCase() === 'on';
 }
 
+// CANON-SELFASM kill-switch (default ON). The chat assembler historically
+// omitted four blocks the harness always injects — Now/date, Autonomy, Current
+// Focus, Available Skills — so chat/Discord-default/mobile/bg turns did date
+// math against the training cutoff and never saw the active focus or installed
+// skills. We port them byte-faithfully from the harness (same render functions).
+export function chatContextParityEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_CHAT_CONTEXT_PARITY', 'on') ?? 'on').toLowerCase() !== 'off';
+}
+
 export function buildAssistantInstructions(context: MemoryContext, channel?: string, intent?: MessageIntent, message?: string): string {
   const owner = OWNER_NAME || 'the user';
   const channelDirective = renderChannelDirective(channel);
@@ -254,6 +264,18 @@ export function buildAssistantInstructions(context: MemoryContext, channel?: str
   const soul = section('Core Personality', context.soul);
   const longTermMemory = section('Long-Term Memory', context.memory);
   const connectedTools = section('Connected Tools', buildIntegrationsContext());
+
+  // CANON-SELFASM parity blocks (chat was missing all four vs the harness).
+  // Now/date + Current Focus are DYNAMIC (per-turn); Autonomy + Available Skills
+  // are stable enough to ride the cached Tier-1 prefix.
+  const parityOn = chatContextParityEnabled();
+  const nowBlock = parityOn ? section('Now', renderCurrentTimeForInstructions()) : '';
+  const autonomyBlock = parityOn ? section('Autonomy', renderAutonomy()) : '';
+  const focusBlock = parityOn ? section('Current Focus', renderFocusForInstructions()) : '';
+  let skillsBlock = '';
+  if (parityOn) {
+    try { skillsBlock = section('Available Skills', renderSkillsIndex()); } catch { skillsBlock = ''; }
+  }
 
   // ── Tier-1: stable Constitution — voice + reasoning rules + SOUL/identity/
   //    profile. Stable across turns → caches. Always present every turn. ──
@@ -284,6 +306,8 @@ export function buildAssistantInstructions(context: MemoryContext, channel?: str
   const tier1 = [
     identityVoice, contextDiscipline, toolBehavior, clarify, executeDirective, capture, handoffs, planner, focus, reportBack,
     channelDirective, actionDirective, userPreferences, standingFacts, proposalFeedback,
+    // Stable parity blocks (Now/Focus are dynamic → per-turn tail, not here).
+    autonomyBlock, skillsBlock,
     identity, soul, longTermMemory, connectedTools,
   ];
 
@@ -298,8 +322,11 @@ export function buildAssistantInstructions(context: MemoryContext, channel?: str
   const persistentFacts = section('Persistent Facts', renderFactsForInstructions(12, 1600, getRecallObjective(message)));
   const dataLandscape = section('Data Landscape', renderSourceMapForContext(24, undefined, getRecallObjective(message)));
   return [
+    // Date FIRST so the model reads it before any other context (matches harness).
+    nowBlock,
     identityVoice, contextDiscipline, toolBehavior, clarify, executeDirective, capture, handoffs, planner, focus, reportBack,
     channelDirective, actionDirective,
+    autonomyBlock,
     userPreferences,
     persistentFacts,
     dataLandscape,
@@ -310,6 +337,8 @@ export function buildAssistantInstructions(context: MemoryContext, channel?: str
     soul,
     longTermMemory,
     section('Active Goals', buildGoalsContext()),
+    focusBlock,
+    skillsBlock,
     connectedTools,
   ]
     .filter(Boolean)
@@ -345,7 +374,11 @@ export function buildTurnContextBlock(context: MemoryContext, intent?: MessageIn
   }
   const objective = getRecallObjective(message);
   const { recentlyLearned, toolChoices } = renderLearnedBlocks(objective);
+  // CANON-SELFASM: Now/date + Current Focus are DYNAMIC, so in tiered mode they
+  // ride the per-turn tail (Autonomy + Available Skills are stable → Tier-1).
+  const parityOn = chatContextParityEnabled();
   const blocks = [
+    parityOn ? section('Now', renderCurrentTimeForInstructions()) : '',
     // 'scored' — pinned facts are already in Tier-1; avoid double-rendering.
     section('Persistent Facts', renderFactsForInstructions(12, 1600, objective, 'scored')),
     recentlyLearned,
@@ -354,6 +387,7 @@ export function buildTurnContextBlock(context: MemoryContext, intent?: MessageIn
     section('Session Continuity', context.sessionBrief),
     section('Working Memory', context.workingMemory),
     section('Active Goals', buildGoalsContext()),
+    parityOn ? section('Current Focus', renderFocusForInstructions()) : '',
   ].filter(Boolean);
   if (blocks.length === 0) return '';
   return ['Context for this turn (private — use as needed, do not recite):', ...blocks].join('\n\n');

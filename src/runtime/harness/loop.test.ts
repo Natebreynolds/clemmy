@@ -47,6 +47,14 @@ writeFileSync(
 // in scripts/verify-long-running.mjs → stall-converts-to-question.
 process.env.HARNESS_STALL_ASK_USER = 'off';
 process.env.HARNESS_MAX_STALL_RETRIES = '1';
+// This suite drives the loop with SCRIPTED runners that simulate tool calls by
+// emitting agent_tool_start events (no real wrapped-tool invoke). Tool-call
+// counting for those simulated calls comes from the loop's event-based fallback
+// counter, which only registers when tool-brackets are OFF (when ON, the wrapped
+// tool owns the counter — see loop.ts:1938). Brackets are now default-ON in
+// production (24/7 keystone); pin them OFF here so the simulated-tool stall/judge
+// tests keep counting. Brackets-ON behavior is covered by brackets.test.ts.
+process.env.HARNESS_TOOL_BRACKETS = 'off';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -1495,6 +1503,49 @@ test('runConversation: a zero-tool FALSE completion claim still fires the stall 
   const claims = listEventsForConv(sess.id, { types: ['stuck_detected'] })
     .filter((e) => (e.data as { kind?: string }).kind === 'structured_zero_tool_claim');
   assert.ok(claims.length >= 1, 'a false completion claim with zero tools must still be flagged');
+});
+
+test("runConversation: a zero-tool reflective TEXT reply is NOT flagged as a Signal A' stall", async () => {
+  // Parity fix: when the model returns a PLAIN STRING (not an
+  // OrchestratorDecision object) that is a reflective/alignment turn carrying
+  // a stray future-tense "I'll", the TEXT-path detector (evaluateProgress
+  // Signal A') must apply the same reflection suppression the structured path
+  // already did. Before the fix this false-fired "announced work but didn't
+  // call the tool" and forced a needless retry on a legitimate reply.
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const runner = scriptedRunner([
+    { finalOutput: "You're right — going forward I'll treat SEO data as raw metrics first." },
+  ]);
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'correction: that seo data was too light',
+    makeRunner: makeRunnerStub,
+    runRunner: runner,
+  });
+  assert.equal(result.steps, 1, 'a reflective text reply must complete in one step, not retry');
+  const stuckEvents = listEventsForConv(sess.id, { types: ['stuck_detected'] });
+  assert.equal(stuckEvents.length, 0, "a reflective text reply must not trip Signal A'");
+});
+
+test("runConversation: a zero-tool false-claim TEXT reply still fires Signal A' (no over-suppression)", async () => {
+  // Positive control for the text path: a real fake-completion string ("Sent
+  // the email …") carries no reflection markers, so the suppressor must NOT
+  // shield it — the announcement stall must still fire.
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const runner = scriptedRunner([
+    { finalOutput: 'Sent the email to the team.' },
+  ]);
+  await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'send the email',
+    makeRunner: makeRunnerStub,
+    runRunner: runner,
+  });
+  const stuckEvents = listEventsForConv(sess.id, { types: ['stuck_detected'] });
+  assert.ok(stuckEvents.length >= 1, 'a false completion claim in plain text must still be flagged');
+  assert.equal((stuckEvents[0].data as { signal: string }).signal, 'A_zero_tools');
 });
 
 test('runConversation: Signal D fires when sub-agent emits OrchestratorDecision JSON', async () => {

@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { renderToolChoicesForContext } from '../memory/tool-choice-store.js';
 
 export const WorkerToolInputSchema = z.object({
   objective: z
@@ -40,6 +41,19 @@ function resolveWorkerToolInput(inputOrOptions: WorkerToolInput | WorkerToolInpu
 
 export function buildWorkerJobPrompt(inputOrOptions: WorkerToolInput | WorkerToolInputBuilderOptions): string {
   const input = resolveWorkerToolInput(inputOrOptions);
+  // Recall, for workers: a worker runs the same nested-agent loop but never saw
+  // the parent's "Remembered Tool Choices" block, so it re-discovered tools the
+  // user has already proven. Inject the learned choices RELEVANT to this
+  // worker's objective so a worker that must do its own smallest-discovery
+  // reaches for a proven tool instead of searching from scratch. Best-effort +
+  // bounded + scoped; rides the existing context-inject flag (renders '' when
+  // empty/disabled). resolvedTools stays authoritative — this only supplements.
+  let remembered = '';
+  try {
+    remembered = renderToolChoicesForContext(8, undefined, input.objective);
+  } catch {
+    remembered = '';
+  }
   return [
     '[WORKER JOB PACKET]',
     'You are executing ONE item from a parent-planned fan-out. Treat this packet as authoritative.',
@@ -51,6 +65,13 @@ export function buildWorkerJobPrompt(inputOrOptions: WorkerToolInput | WorkerToo
     '- If a listed tool call fails or returns missing data, fix and retry that call once. After one genuine retry fails, return ERROR with the specific reason.',
     '- Do not ask the user, notify the user, mutate shared task/execution state, or perform work outside this single item.',
     '- Return only the requested expectedOutput. If the item failed, the final line must start with ERROR:',
+    ...(remembered
+      ? [
+          '',
+          'Proven tool choices for this objective (only if resolvedTools does not already cover a needed capability — prefer these over fresh discovery):',
+          remembered,
+        ]
+      : []),
     '',
     'Packet JSON:',
     JSON.stringify(input, null, 2),

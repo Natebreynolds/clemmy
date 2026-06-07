@@ -15,6 +15,8 @@ import { addRunEvent, finishRun, getRun, listRuns, startRun, type RunRecord } fr
 import { loadProactivityPolicy } from '../agents/proactivity-policy.js';
 import { applyProposedFix, dismissProposedFix, listProposedFixes, loadProposedFix, revertWorkflowFix } from '../execution/workflow-diagnosis.js';
 import { requeueWorkflowFromRun } from '../tools/workflow-run-queue.js';
+import { verifyDelivered } from '../runtime/harness/verify-delivered.js';
+import { deriveTitle } from '../memory/derive-title.js';
 import type { ToolActivity } from '../types.js';
 
 const logger = pino({ name: 'clementine-next.gateway' });
@@ -66,17 +68,6 @@ type GatewayCommand =
   | { type: 'apply_fix'; id: string }
   | { type: 'dismiss_fix'; id: string }
   | { type: 'revert_heal'; id: string };
-
-function clean(value: string, maxChars = 200): string {
-  return value.replace(/\s+/g, ' ').trim().slice(0, maxChars);
-}
-
-function deriveTitle(message: string): string {
-  return clean(message
-    .replace(/^\/?(background|bg|run|start|queue|plan)\b/i, '')
-    .replace(/^(please|can you|could you|let'?s|i need you to|help me)\s+/i, '')
-    .trim(), 120) || 'Background task';
-}
 
 function parseCommand(message: string): GatewayCommand | null {
   const normalized = message.trim();
@@ -500,13 +491,28 @@ export class ClementineGateway {
         onReasoning: request.onReasoning,
         onToolActivity: request.onToolActivity,
       });
+      // Report-back honesty: a non-pending, non-throwing respond() can still be
+      // a blocked / promised / errored run. Fail-open + suspicious-only; the run
+      // status enum has no 'blocked', so a not-delivered verdict maps to 'failed'
+      // with the reason. The returned text is left as the agent wrote it.
+      const verdict = response.pendingApprovalId
+        ? null
+        : await verifyDelivered(request.message, response.text, { stoppedReason: response.stoppedReason });
+      const runFailedNotDelivered = verdict ? !verdict.delivered : false;
       finishRun(run.id, {
-        status: response.pendingApprovalId ? 'awaiting_approval' : 'completed',
+        status: response.pendingApprovalId
+          ? 'awaiting_approval'
+          : runFailedNotDelivered
+            ? 'failed'
+            : 'completed',
         message: response.pendingApprovalId
           ? `Approval required: ${response.pendingApprovalId}.`
-          : 'Assistant run completed.',
+          : runFailedNotDelivered
+            ? `Assistant run did not finish cleanly: ${verdict?.reason ?? 'no verifiable result'}`
+            : 'Assistant run completed.',
         outputPreview: response.text,
         pendingApprovalId: response.pendingApprovalId,
+        ...(runFailedNotDelivered ? { error: verdict?.reason ?? 'Run did not finish cleanly.' } : {}),
       });
       return {
         text: response.text,

@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs';
 import { MCPServerSSE, MCPServerStdio, MCPServerStreamableHttp, type MCPServer } from '@openai/agents';
 import { BASE_DIR, LOCAL_MCP_ENABLED, PKG_DIR } from '../config.js';
 import { discoverMcpServers } from './mcp-config.js';
+import { mergedSpawnEnv } from './spawn-env.js';
 import { createMcpNamespaceShim } from './mcp-namespace-shim.js';
 import { filterMcpToolsForScope } from './mcp-tool-filter.js';
 import type { McpToolScope } from './mcp-tool-scope.js';
@@ -22,62 +23,10 @@ function positiveIntEnv(key: string, fallback: number): number {
 const MCP_CLIENT_SESSION_TIMEOUT_SECONDS = positiveIntEnv('MCP_CLIENT_SESSION_TIMEOUT_SECONDS', 30);
 const MCP_REQUEST_TIMEOUT_MS = positiveIntEnv('MCP_REQUEST_TIMEOUT_MS', 10 * 60 * 1000);
 
-function mergedEnv(extra: Record<string, string> = {}): Record<string, string> {
-  const env: Record<string, string> = {};
-  for (const [key, value] of Object.entries(process.env)) {
-    if (typeof value === 'string') {
-      env[key] = value;
-    }
-  }
-  env.PATH = augmentPathForMcpSpawn(env.PATH);
-  return { ...env, ...extra };
-}
-
-/**
- * macOS Electron apps launched from /Applications inherit a minimal PATH
- * (`/usr/bin:/bin:/usr/sbin:/sbin`) — none of the dirs where Homebrew or
- * nvm install `npx`/`uvx`/`node` are on it. The result: every stdio MCP
- * server fails with `spawn npx ENOENT` on first call, so DataForSEO,
- * Bright Data, Apify, ElevenLabs, the local clementine MCP, etc. are
- * silently unusable when launched from the .app bundle.
- *
- * Prepend (a) the directory of the node binary that's running us, plus
- * (b) the well-known Homebrew + system tool dirs. Idempotent — duplicate
- * entries already on PATH are skipped.
- */
-function augmentPathForMcpSpawn(existing: string | undefined): string {
-  const sep = ':';
-  const candidates: string[] = [];
-  try {
-    const dir = pathDirname(process.execPath);
-    if (dir) candidates.push(dir);
-  } catch { /* execPath unset is fine */ }
-  candidates.push(
-    '/opt/homebrew/bin',
-    '/opt/homebrew/sbin',
-    '/usr/local/bin',
-    '/usr/local/sbin',
-    '/usr/bin',
-    '/bin',
-    '/usr/sbin',
-    '/sbin',
-  );
-  const existingParts = (existing ?? '').split(sep).filter(Boolean);
-  const seen = new Set(existingParts);
-  const prepend: string[] = [];
-  for (const dir of candidates) {
-    if (seen.has(dir)) continue;
-    seen.add(dir);
-    prepend.push(dir);
-  }
-  return [...prepend, ...existingParts].join(sep);
-}
-
-function pathDirname(filePath: string): string {
-  // Local import alias to avoid shadowing the `path` module name in this
-  // small helper while keeping the public surface tidy.
-  return path.dirname(filePath);
-}
+// PATH-augmented spawn env (Homebrew/nvm/user-CLI dirs) — shared with the
+// shell-exec and CLI-discovery seams so a packaged .app resolves binaries
+// identically everywhere. See src/runtime/spawn-env.ts.
+const mergedEnv = mergedSpawnEnv;
 
 function localNodeCommand(): string {
   // In packaged Electron, the daemon itself is already running under
@@ -230,6 +179,10 @@ let cachedShim: MCPServer | null = null;
 let cachedExternalShim: MCPServer | null = null;
 let cachedScopedExternalBaseShims: Map<string, MCPServer> = new Map();
 let cachedScopedExternalShims: Map<string, MCPServer> = new Map();
+// Fail-open shim is a cheap cap-only view over cachedExternalShim (the all-
+// external base), so it owns no child processes — clearing the base is enough.
+let cachedFailOpenExternalShim: MCPServer | null = null;
+let cachedFailOpenKey = '';
 
 const emptyExternalShim: MCPServer = {
   cacheToolsList: false,
@@ -299,14 +252,41 @@ function createScopedExternalShim(base: MCPServer, scope: McpToolScope): MCPServ
   };
 }
 
+function ensureAllExternalBaseShim(): MCPServer {
+  if (!cachedExternalShim) {
+    cachedExternalShim = createMcpNamespaceShim({
+      servers: buildRawMcpServers({ excludeLocal: true }),
+    });
+  }
+  return cachedExternalShim;
+}
+
+/**
+ * Fail-open per class: an unrecognized-intent turn exposes the user's OWN
+ * connected external servers (all of them), bounded by scope.maxTools, instead
+ * of the empty shim. Reuses the daemon-lifetime all-external base shim and wraps
+ * it with the cap via the standard filter (scope.failOpenCandidate makes the
+ * filter match every server but still apply the cap). No allowlist, no keyword
+ * branch — candidates are whatever the user has connected.
+ */
+function getOrCreateFailOpenExternalShim(scope: McpToolScope): MCPServer {
+  const base = ensureAllExternalBaseShim();
+  const key = `failopen:${scope.maxTools ?? ''}`;
+  if (cachedFailOpenExternalShim && cachedFailOpenKey === key) return cachedFailOpenExternalShim;
+  cachedFailOpenExternalShim = createScopedExternalShim(base, scope);
+  cachedFailOpenKey = key;
+  return cachedFailOpenExternalShim;
+}
+
 export function getOrCreateExternalMcpServers(scope?: McpToolScope): MCPServer {
   if (!scope || scope.allowAll) {
-    if (!cachedExternalShim) {
-      cachedExternalShim = createMcpNamespaceShim({
-        servers: buildRawMcpServers({ excludeLocal: true }),
-      });
-    }
-    return cachedExternalShim;
+    return ensureAllExternalBaseShim();
+  }
+
+  // Fail-open BEFORE the empty-shim guard: a failOpenCandidate scope has no
+  // allowedServerSlugs (by design) but must still reach the user's servers.
+  if (scope.failOpenCandidate) {
+    return getOrCreateFailOpenExternalShim(scope);
   }
 
   if ((scope.maxTools ?? 0) === 0 || (scope.allowedServerSlugs ?? []).length === 0) {
@@ -347,6 +327,8 @@ export async function invalidateConfiguredMcpServers(): Promise<void> {
   ].filter((s): s is MCPServer => s !== null);
   cachedShim = null;
   cachedExternalShim = null;
+  cachedFailOpenExternalShim = null;
+  cachedFailOpenKey = '';
   cachedScopedExternalBaseShims = new Map();
   cachedScopedExternalShims = new Map();
   await Promise.all(

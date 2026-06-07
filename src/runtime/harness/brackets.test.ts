@@ -38,6 +38,7 @@ const {
   DEFAULT_TOOL_CALLS_PER_TURN,
   wrapToolForHarness,
   withHarnessRunContext,
+  harnessToolBracketsEnabled,
 } = await import('./brackets.js');
 
 test.after(() => {
@@ -45,6 +46,37 @@ test.after(() => {
     rmSync(TMP_HOME, { recursive: true, force: true });
   } catch {
     /* best effort */
+  }
+});
+
+test('harnessToolBracketsEnabled: DEFAULT-ON (keystone flip) with =off kill-switch', () => {
+  const prev = process.env.HARNESS_TOOL_BRACKETS;
+  try {
+    delete process.env.HARNESS_TOOL_BRACKETS;
+    assert.equal(harnessToolBracketsEnabled(), true, 'unset → ON (the 24/7 keystone default)');
+    process.env.HARNESS_TOOL_BRACKETS = 'on';
+    assert.equal(harnessToolBracketsEnabled(), true);
+    process.env.HARNESS_TOOL_BRACKETS = 'off';
+    assert.equal(harnessToolBracketsEnabled(), false, 'kill-switch honored');
+    process.env.HARNESS_TOOL_BRACKETS = 'OFF';
+    assert.equal(harnessToolBracketsEnabled(), false, 'case-insensitive kill-switch');
+  } finally {
+    if (prev === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = prev;
+  }
+});
+
+test('wrapToolForHarness: default-ON wraps the tool; =off returns it unchanged', () => {
+  const prev = process.env.HARNESS_TOOL_BRACKETS;
+  const raw = { name: 'demo', execute: async () => 'ok' };
+  try {
+    delete process.env.HARNESS_TOOL_BRACKETS;
+    assert.notEqual(wrapToolForHarness(raw), raw, 'default-on → wrapped (new object)');
+    process.env.HARNESS_TOOL_BRACKETS = 'off';
+    assert.equal(wrapToolForHarness(raw), raw, 'kill-switch → unchanged');
+  } finally {
+    if (prev === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = prev;
   }
 });
 

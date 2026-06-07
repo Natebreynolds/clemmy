@@ -6,7 +6,38 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { cronMatches, wallClockInZone } from './workflow-scheduler.js';
+import { cronMatches, wallClockInZone, scheduleCatchupWindow } from './workflow-scheduler.js';
+
+const MIN = 60_000;
+
+test('scheduleCatchupWindow: first tick (no prior eval) → only now, no backfill', () => {
+  const now = Date.UTC(2026, 5, 7, 10, 30) + 12_345; // mid-minute
+  const w = scheduleCatchupWindow(undefined, now);
+  assert.equal(w.length, 1);
+  assert.equal(w[0].getTime(), Date.UTC(2026, 5, 7, 10, 30)); // minute-floored
+});
+
+test('scheduleCatchupWindow: normal 15s tick (same minute) → just now (no double-eval)', () => {
+  const baseMin = Date.UTC(2026, 5, 7, 10, 30);
+  const w = scheduleCatchupWindow(baseMin, baseMin + 15_000);
+  assert.equal(w.length, 1);
+  assert.equal(w[0].getTime(), baseMin);
+});
+
+test('scheduleCatchupWindow: after a sleep, backfills every missed minute (after last, through now)', () => {
+  const last = Date.UTC(2026, 5, 7, 8, 0);
+  const now = Date.UTC(2026, 5, 7, 8, 5);
+  const w = scheduleCatchupWindow(last, now).map((d) => d.getTime());
+  assert.deepEqual(w, [last + MIN, last + 2 * MIN, last + 3 * MIN, last + 4 * MIN, last + 5 * MIN]);
+});
+
+test('scheduleCatchupWindow: a long outage is capped at 24h of backfill', () => {
+  const now = Date.UTC(2026, 5, 7, 12, 0);
+  const last = now - 5 * 24 * 60 * MIN; // 5 days ago
+  const w = scheduleCatchupWindow(last, now);
+  assert.equal(w.length, 24 * 60 + 1, 'capped to last 24h (1440 min) + the now minute');
+  assert.equal(w[w.length - 1].getTime(), now);
+});
 
 // A fixed UTC instant: 2026-06-02T15:00:00Z = 08:00 America/Los_Angeles (PDT, -7).
 const INSTANT = new Date('2026-06-02T15:00:00Z');

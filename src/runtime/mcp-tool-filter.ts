@@ -26,22 +26,28 @@ function normalizedHaystack(tool: MCPTool): string {
 }
 
 function scoreTool(tool: MCPTool, priorityKeywords: string[] | undefined): number {
-  if (!priorityKeywords || priorityKeywords.length === 0) return 0;
-  const haystack = normalizedHaystack(tool);
   let score = 0;
+  // Prefer concrete tools over the synthetic unavailable stubs when a cap
+  // applies, but keep stubs visible when no real tools match. Applied BEFORE the
+  // no-keyword early return so it also de-prioritizes stubs on the fail-open
+  // surface (which supplies no priority keywords).
+  if (tool.name.endsWith('__unavailable')) score -= 50;
+  if (!priorityKeywords || priorityKeywords.length === 0) return score;
+  const haystack = normalizedHaystack(tool);
   for (const keyword of priorityKeywords) {
     const normalized = keyword.toLowerCase();
     if (!normalized) continue;
     if (haystack.includes(normalized)) score += 5;
   }
-  // Prefer concrete tools over the synthetic unavailable stubs when a cap
-  // applies, but keep stubs visible when no real tools match.
-  if (tool.name.endsWith('__unavailable')) score -= 50;
   return score;
 }
 
 function toolMatchesScope(tool: MCPTool, scope: McpToolScope, patterns: RegExp[]): boolean {
   if (scope.allowAll) return true;
+  // Fail-open: match every connected server's tools (no slug/pattern gate); the
+  // maxTools cap below still bounds the surface, and __unavailable stubs are
+  // de-prioritized by scoreTool so real tools win the cap.
+  if (scope.failOpenCandidate) return true;
   const parsed = parseNamespacedTool(tool.name);
   const allowedSlugs = new Set(scope.allowedServerSlugs ?? []);
   if (allowedSlugs.size > 0 && (!parsed || !allowedSlugs.has(parsed.serverSlug))) {

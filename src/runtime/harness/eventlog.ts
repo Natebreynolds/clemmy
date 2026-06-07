@@ -830,11 +830,17 @@ export function reapStaleSessions(maxAgeDays?: number): number {
   const ttl = maxAgeDays ?? (env ? Math.max(1, Math.min(365, Number(env))) : 14);
   if (!Number.isFinite(ttl) || ttl <= 0) return 0;
   const db = openEventLog();
+  // Never reap a conversation the user has pinned or archived for keeping
+  // — those are explicit "hold onto this" signals from the Conversations
+  // UI, stored additively in metadata_json. Without this guard a pinned
+  // Discord/workflow conversation would silently vanish after the TTL.
   const result = db
     .prepare(
       `DELETE FROM sessions
        WHERE status IN ('completed','failed','cancelled')
-         AND updated_at < datetime('now', ?)`,
+         AND updated_at < datetime('now', ?)
+         AND metadata_json NOT LIKE '%"pinned":true%'
+         AND metadata_json NOT LIKE '%"archived":true%'`,
     )
     .run(`-${Math.floor(ttl)} days`);
   // Best-effort WAL merge so the on-disk file actually shrinks after a reap.
