@@ -1,4 +1,4 @@
-import type { Express, Request } from 'express';
+import type { Express, Request, Response } from 'express';
 import express from 'express';
 import * as fs from 'node:fs';
 import { existsSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs';
@@ -202,6 +202,13 @@ import {
   recordConnectedCli,
   statusForSearchResults,
 } from '../integrations/cli-catalog/catalog.js';
+import { isInternalSessionId } from '../execution/scope.js';
+import {
+  buildUnifiedSessionList,
+  getUnifiedSessionDetail,
+  patchUnifiedSession,
+  deleteUnifiedSession,
+} from './sessions-api.js';
 
 /**
  * Mounts the Clementine Console dashboard at /console.
@@ -1103,8 +1110,14 @@ export function registerConsoleRoutes(
   app: Express,
   isAuthorized: (req: Request) => boolean,
   assistant: ClementineAssistant,
+  opts?: { serveLegacyAtRoot?: boolean },
 ): void {
-  app.get('/console', (req, res) => {
+  // Renders the legacy inlined-HTML console. Bound to /console-legacy
+  // always, and to /console unless the new React SPA (console-spa.ts) is
+  // serving there (controlled by the CLEMENTINE_CONSOLE_NEXT flag in
+  // webhook.ts). This keeps the old console one URL away during the
+  // staged migration.
+  const serveLegacyConsole = (req: Request, res: Response): void => {
     if (!isAuthorized(req)) {
       res.status(401).send('Unauthorized');
       return;
@@ -1114,7 +1127,11 @@ export function registerConsoleRoutes(
     res.setHeader('Pragma', 'no-cache');
     res.setHeader('Expires', '0');
     res.type('html').send(renderConsoleHtml(queryToken));
-  });
+  };
+  app.get('/console-legacy', serveLegacyConsole);
+  if (opts?.serveLegacyAtRoot ?? true) {
+    app.get('/console', serveLegacyConsole);
+  }
 
   /**
    * Serve the Clementine icon for use in the dashboard / favicons.
@@ -2233,12 +2250,21 @@ export function registerConsoleRoutes(
         ? { prompt: body.synthesisPrompt.trim() } : undefined;
     }
     if (body.inputs && typeof body.inputs === 'object') next.inputs = body.inputs;
+    // Carry the timezone over when rebuilding the trigger so a schedule's
+    // "8am" stays the OWNER's 8am (was silently dropped on every PATCH).
+    // A `timezone` in the body overrides; otherwise preserve the existing one.
+    const existingTz = (entry.data.trigger as { timezone?: string } | undefined)?.timezone;
+    const tz = typeof body.timezone === 'string' && body.timezone.trim() ? body.timezone.trim() : existingTz;
+    const withTz = <T extends Record<string, unknown>>(t: T): T => (tz ? { ...t, timezone: tz } : t);
     if (typeof body.triggerSchedule === 'string') {
       const s = body.triggerSchedule.trim();
       if (s && !validateCronExpression(s)) { res.status(400).json({ error: `invalid cron: ${s}` }); return; }
-      next.trigger = s ? { schedule: s, manual: true } : { manual: true };
+      next.trigger = withTz(s ? { schedule: s, manual: true } : { manual: true });
     } else if (body.clearTriggerSchedule === true) {
-      next.trigger = { manual: true };
+      next.trigger = withTz({ manual: true });
+    } else if (tz !== existingTz) {
+      // timezone-only change (keep whatever schedule/manual flag exists)
+      next.trigger = withTz({ ...(entry.data.trigger ?? { manual: true }) });
     }
 
     // PATCH can change steps AND flip enabled→true, so auto-repair + re-validate
@@ -6487,6 +6513,17 @@ export function registerConsoleRoutes(
     const message = typeof body.message === 'string' ? body.message.trim() : '';
     if (!message) { res.status(400).json({ error: 'message required' }); return; }
 
+    // Resolve the conversation id. Back-compat: a missing sessionId keeps
+    // the single rolling 'console:home' (legacy console + voice). The new
+    // React console always supplies a per-conversation id. Reject internal
+    // ids so the desktop can't hijack cron:/agent:/execution: sessions.
+    const requestedId = typeof body.sessionId === 'string' ? body.sessionId.trim().slice(0, 120) : '';
+    if (requestedId && isInternalSessionId(requestedId)) {
+      res.status(400).json({ error: 'invalid sessionId' });
+      return;
+    }
+    const sessionId = requestedId || 'console:home';
+
     res.status(200);
     res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
@@ -6507,7 +6544,7 @@ export function registerConsoleRoutes(
       if (goalCmd) {
         await handleGoalCommand({
           command: goalCmd,
-          sessionId: 'console:home',
+          sessionId,
           assistant,
           writeEvent,
           shouldCancel: () => closed,
@@ -6519,7 +6556,7 @@ export function registerConsoleRoutes(
       writeEvent({ type: 'status', text: 'Clementine run started.' });
       const response = await assistant.respond({
         message,
-        sessionId: 'console:home',
+        sessionId,
         channel: 'cli',
         userId: 'console',
         onChunk: (delta) => {
@@ -6539,6 +6576,7 @@ export function registerConsoleRoutes(
       });
       writeEvent({
         type: 'done',
+        sessionId,
         text: response.text,
         pendingApprovalId: response.pendingApprovalId ?? null,
         // Surface why the run stopped so the dashboard can render the
@@ -6763,14 +6801,79 @@ export function registerConsoleRoutes(
     const body = req.body ?? {};
     const message = typeof body.message === 'string' ? body.message.trim() : '';
     if (!message) { res.status(400).json({ error: 'message required' }); return; }
+    const requestedId = typeof body.sessionId === 'string' ? body.sessionId.trim().slice(0, 120) : '';
+    if (requestedId && isInternalSessionId(requestedId)) {
+      res.status(400).json({ error: 'invalid sessionId' });
+      return;
+    }
+    const sessionId = requestedId || 'console:home';
     try {
       const response = await assistant.respond({
         message,
-        sessionId: 'console:home',
+        sessionId,
         channel: 'cli',
         userId: 'console',
       });
-      res.json({ text: response.text, pendingApprovalId: response.pendingApprovalId });
+      res.json({ sessionId, text: response.text, pendingApprovalId: response.pendingApprovalId });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // ─── Unified Conversations API ─────────────────────────────────────────
+  // One list over both session engines (desktop chats + harness/Discord/
+  // workflow), with reopen/continue routing decided per-session by origin.
+
+  app.get('/api/console/sessions', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const q = typeof req.query.q === 'string' ? req.query.q : undefined;
+      const tag = typeof req.query.tag === 'string' ? req.query.tag : undefined;
+      const source = typeof req.query.source === 'string' ? req.query.source : undefined;
+      const includeArchived = req.query.includeArchived === '1' || req.query.includeArchived === 'true';
+      const limit = typeof req.query.limit === 'string' ? Number(req.query.limit) : undefined;
+      const sessions = buildUnifiedSessionList({ q, tag, source, includeArchived, limit });
+      res.json({ sessions, total: sessions.length });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.get('/api/console/sessions/:id', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const detail = getUnifiedSessionDetail(req.params.id);
+      if (!detail) { res.status(404).json({ error: 'session not found' }); return; }
+      res.json(detail);
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.patch('/api/console/sessions/:id', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const body = req.body ?? {};
+      const patch: { title?: string; pinned?: boolean; tags?: string[]; archived?: boolean } = {};
+      if (typeof body.title === 'string') patch.title = body.title;
+      if (typeof body.pinned === 'boolean') patch.pinned = body.pinned;
+      if (typeof body.archived === 'boolean') patch.archived = body.archived;
+      if (Array.isArray(body.tags)) patch.tags = body.tags.filter((t: unknown): t is string => typeof t === 'string');
+      const updated = patchUnifiedSession(req.params.id, patch);
+      if (!updated) { res.status(404).json({ error: 'session not found' }); return; }
+      res.json({ session: updated });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.delete('/api/console/sessions/:id', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const hard = req.query.hard === '1' || req.query.hard === 'true';
+      const result = deleteUnifiedSession(req.params.id, hard);
+      if (!result) { res.status(404).json({ error: 'session not found' }); return; }
+      res.json(result);
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

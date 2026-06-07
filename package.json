@@ -26,6 +26,7 @@
   "files": [
     "dist",
     "apps/mobile-web/dist",
+    "apps/console-web/dist",
     "vendor/uv",
     "README.md",
     ".env.example"
@@ -33,6 +34,7 @@
   "scripts": {
     "build": "tsc --outDir dist",
     "build:mobile-web": "npm --prefix apps/mobile-web run build",
+    "build:console-web": "npm --prefix apps/console-web run build",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test 'src/**/*.test.ts'",
     "test:smoke": "node scripts/smoke-fresh-install.mjs && node scripts/smoke-fresh-install-e2e.mjs",
@@ -43,7 +45,7 @@
     "smoke:markitdown": "node scripts/smoke-markitdown.mjs",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
-    "prepack": "npm run build && npm run build:mobile-web && npm run vendor:uv",
+    "prepack": "npm run build && npm run build:mobile-web && npm run build:console-web && npm run vendor:uv",
     "pack:local": "npm pack",
     "chat": "tsx src/index.ts chat",
     "daemon": "tsx src/index.ts daemon",

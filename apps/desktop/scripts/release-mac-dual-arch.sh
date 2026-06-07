@@ -68,6 +68,22 @@ verify_uv_packaged() {
   fi
 }
 
+verify_console_web_packaged() {
+  local arch="$1"
+  local found=""
+  while IFS= read -r app; do
+    local idx="$app/Contents/Resources/daemon/apps/console-web/dist/index.html"
+    if [[ -f "$idx" ]]; then
+      echo "   console-web present: $idx"
+      found="$idx"
+    fi
+  done < <(find "$DESKTOP_DIR/release" -maxdepth 2 -name "Clementine.app" -type d 2>/dev/null)
+  if [[ -z "$found" ]]; then
+    echo "::error::console-web dist is MISSING from the $arch .app — the new desktop console would silently fall back to legacy on fresh install"
+    exit 1
+  fi
+}
+
 build_arch() {
   local arch="$1"
   local expected="$2"
@@ -92,6 +108,9 @@ build_arch() {
   esac
   echo "-> Verifying vendored uv shipped + signed ($arch)"
   verify_uv_packaged "$arch" "$uvtarget"
+
+  echo "-> Verifying console-web bundle shipped ($arch)"
+  verify_console_web_packaged "$arch"
 }
 
 echo "-> Building desktop shell"
@@ -102,6 +121,9 @@ echo "-> Building daemon"
 
 echo "-> Building mobile web app"
 (cd "$ROOT_DIR" && npm run build:mobile-web)
+
+echo "-> Building console web app (new desktop UI)"
+(cd "$ROOT_DIR" && npm run build:console-web)
 
 # Vendor the uv runtime binaries BEFORE packaging — file/image conversion
 # (markitdown) needs them inside the .app, and they're gitignored so they are

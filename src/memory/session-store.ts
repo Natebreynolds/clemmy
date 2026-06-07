@@ -3,6 +3,7 @@ import path from 'node:path';
 import { BASE_DIR } from '../config.js';
 import type { ConversationTurn, SessionRecord } from '../types.js';
 import { ASSISTANT_PAUSED_PLACEHOLDER } from '../runtime/provider.js';
+import { deriveTitle } from './derive-title.js';
 
 const SESSION_DIR = path.join(BASE_DIR, 'state');
 const SESSION_FILE = path.join(SESSION_DIR, 'sessions.json');
@@ -131,6 +132,12 @@ export class SessionStore {
       return session;
     }
     session.turns.push(turn);
+    // Auto-title from the first user message so the Conversations list
+    // shows something meaningful instead of a raw id. Only set once; a
+    // user-supplied title (via setMeta) is never overwritten.
+    if (!session.title && turn.role === 'user' && turn.text.trim()) {
+      session.title = deriveTitle(turn.text, 'New chat');
+    }
     if (session.turns.length > MAX_TURNS_PER_SESSION) {
       // Archive the rotated turns to the vault before dropping so the
       // conversation remains FTS-recallable. Previously these were
@@ -155,4 +162,83 @@ export class SessionStore {
       .map((turn) => `${turn.role === 'user' ? 'User' : 'Assistant'}: ${turn.text}`)
       .join('\n');
   }
+
+  /** True when a session with this id is actually persisted (not a synthesized empty). */
+  exists(sessionId: string): boolean {
+    return Boolean(loadSessions()[sessionId]);
+  }
+
+  /**
+   * Full set of persisted sessions, newest first. Unlike `list()` this is
+   * unbounded — the unified Conversations list merges across stores and
+   * needs everything, then paginates/clamps at the API layer.
+   */
+  listAll(): SessionRecord[] {
+    return Object.values(loadSessions()).sort((left, right) =>
+      right.updatedAt.localeCompare(left.updatedAt),
+    );
+  }
+
+  /**
+   * Update organize metadata (title/pinned/tags/archived) on an existing
+   * session. Returns the updated record, or `null` if the id isn't
+   * persisted — we never create a phantom record from a metadata edit
+   * (e.g. a stale id from the UI). Bumps `updatedAt` only when a field
+   * actually changed.
+   */
+  setMeta(
+    sessionId: string,
+    patch: { title?: string; pinned?: boolean; tags?: string[]; archived?: boolean },
+  ): SessionRecord | null {
+    const sessions = loadSessions();
+    const session = sessions[sessionId];
+    if (!session) return null;
+    let changed = false;
+    if (patch.title !== undefined) {
+      const next = patch.title.trim().slice(0, 120);
+      if (next !== session.title) { session.title = next; changed = true; }
+    }
+    if (patch.pinned !== undefined && patch.pinned !== Boolean(session.pinned)) {
+      session.pinned = patch.pinned; changed = true;
+    }
+    if (patch.archived !== undefined && patch.archived !== Boolean(session.archived)) {
+      session.archived = patch.archived; changed = true;
+    }
+    if (patch.tags !== undefined) {
+      const next = normalizeTags(patch.tags);
+      if (JSON.stringify(next) !== JSON.stringify(session.tags ?? [])) {
+        session.tags = next; changed = true;
+      }
+    }
+    if (changed) {
+      session.updatedAt = new Date().toISOString();
+      sessions[sessionId] = session;
+      saveSessions(sessions);
+    }
+    return session;
+  }
+
+  /** Permanently remove a session. Returns true if one was deleted. */
+  delete(sessionId: string): boolean {
+    const sessions = loadSessions();
+    if (!sessions[sessionId]) return false;
+    delete sessions[sessionId];
+    saveSessions(sessions);
+    return true;
+  }
+}
+
+/** De-dupe, trim, clip, and cap tags so the store can't grow unbounded. */
+function normalizeTags(tags: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const raw of tags) {
+    if (typeof raw !== 'string') continue;
+    const tag = raw.trim().slice(0, 40);
+    if (!tag || seen.has(tag.toLowerCase())) continue;
+    seen.add(tag.toLowerCase());
+    out.push(tag);
+    if (out.length >= 20) break;
+  }
+  return out;
 }

@@ -1,0 +1,338 @@
+import { useEffect, useState } from 'react';
+import { Link } from 'react-router-dom';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import {
+  Search, Trash2, Pin, Target, User, Network, FileText, BookOpen, Plus, X, Database,
+  FileSearch, Users, MapPin,
+} from 'lucide-react';
+import { Page } from '@/components/Page';
+import { Card } from '@/components/ui/Card';
+import { Button } from '@/components/ui/Button';
+import { Input, Select } from '@/components/ui/Field';
+import { StatusPill } from '@/components/ui/StatusPill';
+import { Skeleton } from '@/components/ui/Skeleton';
+import { EmptyState } from '@/components/ui/EmptyState';
+import { MemoryGraph } from '@/components/MemoryGraph';
+import { usePoll } from '@/lib/poll';
+import { cn } from '@/lib/cn';
+import {
+  listFacts, forgetFact, pinFact, getContext, addFact, addGoal, searchMemory, getMemoryFiles,
+  getBrainHealth, listEntities, getSourceMap, fileBasename, FACT_KINDS,
+  type Fact, type ContextFile, type Entity,
+} from '@/lib/memory';
+
+type Tab = 'overview' | 'facts' | 'entities' | 'sources' | 'you';
+const KIND_LABEL: Record<Fact['kind'], string> = { user: 'About you', project: 'Project', feedback: 'Preference', reference: 'Reference' };
+
+export function Memory() {
+  const qc = useQueryClient();
+  const [tab, setTab] = useState<Tab>('overview');
+  const [q, setQ] = useState('');
+  const [debouncedQ, setDebouncedQ] = useState('');
+  useEffect(() => { const t = setTimeout(() => setDebouncedQ(q.trim()), 350); return () => clearTimeout(t); }, [q]);
+  const search = useQuery({ queryKey: ['mem-search', debouncedQ], queryFn: () => searchMemory(debouncedQ), enabled: debouncedQ.length >= 2, staleTime: 30_000 });
+  const searching = debouncedQ.length >= 2;
+
+  const tabs: { key: Tab; label: string; icon: typeof Search }[] = [
+    { key: 'overview', label: 'Overview', icon: Network },
+    { key: 'facts', label: 'Facts', icon: BookOpen },
+    { key: 'entities', label: 'People & things', icon: Users },
+    { key: 'sources', label: 'Sources', icon: FileText },
+    { key: 'you', label: 'You & goals', icon: User },
+  ];
+
+  return (
+    <Page title="Memory" subtitle="Everything Clementine knows — and where it comes from">
+      <div className="mb-5 flex items-center gap-2 rounded-lg border border-border bg-surface px-3 shadow-xs">
+        <Search className="h-4 w-4 text-faint" aria-hidden />
+        <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search everything Clementine knows…" aria-label="Search memory"
+          className="h-12 flex-1 bg-transparent text-body-lg text-fg outline-none placeholder:text-faint" />
+        {q && <button type="button" onClick={() => setQ('')} aria-label="Clear search" className="cursor-pointer text-faint hover:text-fg"><X className="h-4 w-4" aria-hidden /></button>}
+      </div>
+
+      {searching ? (
+        <SearchResults loading={search.isLoading} hits={search.data?.hits ?? []} query={debouncedQ} />
+      ) : (
+        <>
+          <div className="mb-5 flex flex-wrap gap-1 border-b border-border">
+            {tabs.map((t) => {
+              const Icon = t.icon; const active = tab === t.key;
+              return (
+                <button key={t.key} type="button" onClick={() => setTab(t.key)}
+                  className={cn('inline-flex items-center gap-2 border-b-2 px-3 py-2.5 text-body font-medium transition-colors cursor-pointer -mb-px',
+                    active ? 'border-primary text-fg' : 'border-transparent text-muted hover:text-fg')}>
+                  <Icon className="h-4 w-4" aria-hidden /> {t.label}
+                </button>
+              );
+            })}
+          </div>
+          {tab === 'overview' && <OverviewTab />}
+          {tab === 'facts' && <FactsTab qc={qc} />}
+          {tab === 'entities' && <EntitiesTab />}
+          {tab === 'sources' && <SourcesTab />}
+          {tab === 'you' && <YouTab qc={qc} />}
+        </>
+      )}
+    </Page>
+  );
+}
+
+// ─────────── Overview: the knowledge graph as the focal point + stats ───────────
+function OverviewTab() {
+  const health = usePoll(['brain-health'], getBrainHealth, 30000);
+  const files = usePoll(['memory-files'], getMemoryFiles, 60000);
+  const sources = usePoll(['source-map'], getSourceMap, 60000);
+  const h = health.data ?? {};
+  const stats = [
+    { label: 'Facts', value: h.activeFacts, sub: `${h.directFacts ?? 0} told · ${h.derivedFacts ?? 0} learned` },
+    { label: 'People & things', value: h.entitiesTotal, sub: `${h.entitiesPerson ?? 0} people · ${h.entitiesCompany ?? 0} orgs` },
+    { label: 'Knowledge files', value: files.data?.files?.length, sub: 'indexed & searchable' },
+    { label: 'Events', value: h.pointersTotal, sub: `${h.pointersRecent ?? 0} recent` },
+    { label: 'Data sources', value: sources.data?.count, sub: 'places data lives' },
+  ];
+  return (
+    <div className="space-y-5">
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
+        {stats.map((s) => (
+          <Card key={s.label} className="p-4">
+            <div className="text-h2 text-fg">{typeof s.value === 'number' ? s.value.toLocaleString() : '—'}</div>
+            <div className="text-small font-medium text-fg">{s.label}</div>
+            <div className="mt-0.5 text-caption text-faint">{s.sub}</div>
+          </Card>
+        ))}
+      </div>
+      <div>
+        <p className="mb-2 text-small text-muted">How everything connects — tap a topic to fold it, drag to explore, tap a node for detail.</p>
+        <MemoryGraph height={540} />
+      </div>
+    </div>
+  );
+}
+
+// ─────────── Search ───────────
+function SearchResults({ loading, hits, query }: { loading: boolean; hits: { filePath: string; title: string; snippet: string; score: number }[]; query: string }) {
+  if (loading) return <div className="space-y-2">{[0, 1, 2].map((i) => <Skeleton key={i} className="h-20 w-full" />)}</div>;
+  if (hits.length === 0) return <EmptyState title="No matches" description={`Nothing in memory matches “${query}” yet.`} />;
+  return (
+    <div className="space-y-2">
+      <p className="mb-1 text-small text-muted">{hits.length} result{hits.length === 1 ? '' : 's'} — this is what Clementine finds when she looks something up.</p>
+      {hits.map((hit, i) => (
+        <Card key={i} className="p-4">
+          <div className="mb-1 flex items-center gap-2">
+            <FileSearch className="h-4 w-4 shrink-0 text-primary" aria-hidden />
+            <span className="min-w-0 flex-1 truncate text-body font-medium text-fg">{hit.title || fileBasename(hit.filePath)}</span>
+            <span className="shrink-0 font-mono text-caption text-faint">{fileBasename(hit.filePath)}</span>
+          </div>
+          <p className="text-small text-muted">{hit.snippet}</p>
+        </Card>
+      ))}
+    </div>
+  );
+}
+
+// ─────────── Facts ───────────
+function FactsTab({ qc }: { qc: ReturnType<typeof useQueryClient> }) {
+  const [kind, setKind] = useState<Fact['kind'] | 'all'>('all');
+  const facts = usePoll(['facts', kind], () => listFacts(kind === 'all' ? undefined : kind), 15000);
+  const rows = facts.data?.facts ?? [];
+  const [draft, setDraft] = useState('');
+  const [draftKind, setDraftKind] = useState<Fact['kind']>('user');
+  const add = async () => { if (!draft.trim()) return; try { await addFact(draft.trim(), draftKind); setDraft(''); } finally { void qc.invalidateQueries({ queryKey: ['facts'] }); } };
+  const onForget = async (id: Fact['id']) => { try { await forgetFact(id); } finally { void qc.invalidateQueries({ queryKey: ['facts'] }); } };
+  const onPin = async (id: Fact['id'], pinned: boolean) => { try { await pinFact(id, pinned); } finally { void qc.invalidateQueries({ queryKey: ['facts'] }); } };
+  return (
+    <>
+      <div className="mb-3 flex flex-wrap items-center gap-2">
+        {([{ key: 'all', label: 'All' }, ...FACT_KINDS] as { key: Fact['kind'] | 'all'; label: string }[]).map((k) => (
+          <button key={k.key} type="button" onClick={() => setKind(k.key)}
+            className={cn('rounded-full border px-3 py-1 text-small transition-colors cursor-pointer', kind === k.key ? 'border-primary bg-primary-tint text-primary' : 'border-border text-muted hover:text-fg')}>{k.label}</button>
+        ))}
+      </div>
+      <div className="mb-4 flex flex-wrap gap-2">
+        <Input value={draft} onChange={(e) => setDraft(e.target.value)} placeholder="Tell Clementine something to remember…" aria-label="New fact" className="min-w-48 flex-1" onKeyDown={(e) => { if (e.key === 'Enter') void add(); }} />
+        <Select value={draftKind} onChange={(e) => setDraftKind(e.target.value as Fact['kind'])} aria-label="Fact type" className="w-40">{FACT_KINDS.map((k) => <option key={k.key} value={k.key}>{k.label}</option>)}</Select>
+        <Button onClick={add} disabled={!draft.trim()}><Plus className="h-4 w-4" aria-hidden /> Remember</Button>
+      </div>
+      {facts.isLoading ? <div className="space-y-2">{[0, 1, 2].map((i) => <Skeleton key={i} className="h-12 w-full" />)}</div>
+        : rows.length === 0 ? <Card><EmptyState title="Still getting to know you" description="As we work together, the important things land here — and you can edit or forget anything." /></Card>
+          : <div className="space-y-2">{rows.map((f) => <FactCard key={f.id} fact={f} onPin={() => onPin(f.id, !f.pinned)} onForget={() => onForget(f.id)} />)}</div>}
+    </>
+  );
+}
+
+function FactCard({ fact, onPin, onForget }: { fact: Fact; onPin: () => void; onForget: () => void }) {
+  const [expanded, setExpanded] = useState(false);
+  const long = (fact.content?.length ?? 0) > 180;
+  return (
+    <Card className="flex items-start gap-3 p-3.5">
+      {fact.pinned && <Pin className="mt-1 h-4 w-4 shrink-0 text-primary" aria-hidden />}
+      <div className="min-w-0 flex-1">
+        <div className="mb-1"><StatusPill tone="neutral">{KIND_LABEL[fact.kind] ?? fact.kind}</StatusPill></div>
+        <p className={cn('text-body text-fg', !expanded && long && 'line-clamp-3')}>{fact.content}</p>
+        {long && <button type="button" onClick={() => setExpanded((v) => !v)} className="mt-1 text-caption font-semibold text-primary hover:underline cursor-pointer">{expanded ? 'Show less' : 'Show more'}</button>}
+      </div>
+      <div className="flex shrink-0 gap-1">
+        <Button variant="ghost" size="icon" aria-label={fact.pinned ? 'Unpin' : 'Pin'} title={fact.pinned ? 'Unpin' : 'Pin'} onClick={onPin}><Pin className={cn('h-4 w-4', fact.pinned && 'fill-primary text-primary')} aria-hidden /></Button>
+        <Button variant="ghost" size="icon" aria-label="Forget this" title="Forget this" onClick={onForget}><Trash2 className="h-4 w-4" aria-hidden /></Button>
+      </div>
+    </Card>
+  );
+}
+
+// ─────────── Entities (people & things) ───────────
+const ENTITY_TYPES = ['all', 'person', 'company', 'project', 'place', 'thing'];
+const ENTITY_PLURAL: Record<string, string> = { all: 'All', person: 'People', company: 'Companies', project: 'Projects', place: 'Places', thing: 'Things' };
+function EntitiesTab() {
+  const entities = usePoll(['entities'], () => listEntities(400), 60000);
+  const [type, setType] = useState('all');
+  const [q, setQ] = useState('');
+  const all = entities.data?.entities ?? [];
+  const rows = all.filter((e) =>
+    (type === 'all' || e.entityType === type) &&
+    (!q.trim() || `${e.canonicalName} ${(e.aliases ?? []).join(' ')}`.toLowerCase().includes(q.toLowerCase())),
+  );
+  return (
+    <>
+      <div className="mb-3 flex flex-wrap items-center gap-2">
+        {ENTITY_TYPES.map((t) => (
+          <button key={t} type="button" onClick={() => setType(t)}
+            className={cn('rounded-full border px-3 py-1 text-small transition-colors cursor-pointer', type === t ? 'border-primary bg-primary-tint text-primary' : 'border-border text-muted hover:text-fg')}>{ENTITY_PLURAL[t] ?? t}</button>
+        ))}
+        <Input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Filter…" aria-label="Filter entities" className="ml-auto w-48" />
+      </div>
+      {entities.isLoading ? <div className="grid gap-2 sm:grid-cols-2">{[0, 1, 2, 3].map((i) => <Skeleton key={i} className="h-14 w-full" />)}</div>
+        : rows.length === 0 ? <Card><EmptyState title="Nothing here yet" description="People, companies, and projects Clementine learns about will appear here." /></Card>
+          : <>
+              <p className="mb-2 text-small text-muted">{rows.length} of {entities.data?.total ?? rows.length} — everyone and everything Clementine has noticed.</p>
+              <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+                {rows.slice(0, 150).map((e) => <EntityCard key={e.id} entity={e} />)}
+              </div>
+            </>}
+    </>
+  );
+}
+
+function EntityCard({ entity }: { entity: Entity }) {
+  return (
+    <Card className="p-3.5">
+      <div className="flex items-center gap-2">
+        <span className="min-w-0 flex-1 truncate text-body font-medium text-fg">{entity.canonicalName}</span>
+        <StatusPill tone="neutral">{entity.entityType}</StatusPill>
+      </div>
+      {entity.aliases && entity.aliases.length > 0 && <p className="mt-1 line-clamp-1 text-caption text-faint">aka {entity.aliases.join(', ')}</p>}
+    </Card>
+  );
+}
+
+// ─────────── Sources (what Clementine reads + where data lives) ───────────
+function SourcesTab() {
+  const ctx = usePoll(['context'], getContext, 30000);
+  const files = usePoll(['memory-files'], getMemoryFiles, 30000);
+  const sources = usePoll(['source-map'], getSourceMap, 30000);
+  const coreFiles = ctx.data?.files ?? [];
+  const vault = files.data?.files ?? [];
+  const pointers = sources.data?.pointers ?? [];
+  return (
+    <div className="space-y-6">
+      <section>
+        <h3 className="mb-1 flex items-center gap-2 text-h3 text-fg"><BookOpen className="h-5 w-5 text-primary" aria-hidden /> Core context</h3>
+        <p className="mb-3 text-small text-muted">The notes Clementine reads on every turn — her personality, who you are, and what to keep in mind. This is the seeded memory you can shape.</p>
+        {ctx.isLoading ? <Skeleton className="h-32 w-full" /> : <div className="space-y-2">{coreFiles.map((f) => <ContextFileCard key={f.key} file={f} />)}</div>}
+      </section>
+
+      {pointers.length > 0 && (
+        <section>
+          <h3 className="mb-1 flex items-center gap-2 text-h3 text-fg"><MapPin className="h-5 w-5 text-primary" aria-hidden /> Where your data lives</h3>
+          <p className="mb-3 text-small text-muted">The apps and places Clementine knows to look — Outlook folders, Airtable bases, Drive, and more.</p>
+          <div className="grid gap-2 sm:grid-cols-2">
+            {pointers.slice(0, 40).map((p) => (
+              <Card key={p.id} className="p-3.5">
+                <div className="flex items-center gap-2">
+                  <Database className="h-4 w-4 shrink-0 text-faint" aria-hidden />
+                  <span className="min-w-0 flex-1 truncate text-body font-medium text-fg">{p.name || p.ref}</span>
+                  <StatusPill tone="neutral">{p.app}</StatusPill>
+                </div>
+                {p.whatsHere && <p className="mt-1 line-clamp-1 text-caption text-muted">{p.whatsHere}</p>}
+              </Card>
+            ))}
+          </div>
+        </section>
+      )}
+
+      <section>
+        <h3 className="mb-1 flex items-center gap-2 text-h3 text-fg"><Database className="h-5 w-5 text-primary" aria-hidden /> Indexed knowledge</h3>
+        <p className="mb-3 text-small text-muted">Files Clementine has read and broken into searchable chunks — this is where she looks things up. ({vault.length} files)</p>
+        {files.isLoading ? <Skeleton className="h-32 w-full" /> : vault.length === 0 ? <Card className="p-4 text-body text-muted">No files indexed yet.</Card>
+          : <div className="space-y-1.5">
+              {vault.slice(0, 80).map((v) => (
+                <div key={v.path} className="flex items-center gap-3 rounded-md border border-border bg-surface px-3.5 py-2.5">
+                  <FileText className="h-4 w-4 shrink-0 text-faint" aria-hidden />
+                  <span className="min-w-0 flex-1 truncate font-mono text-small text-fg">{fileBasename(v.path)}</span>
+                  <span className="shrink-0 text-caption text-faint">{v.chunks} chunk{v.chunks === 1 ? '' : 's'}</span>
+                </div>
+              ))}
+            </div>}
+      </section>
+    </div>
+  );
+}
+
+function ContextFileCard({ file }: { file: ContextFile }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <Card className="p-4">
+      <button type="button" onClick={() => setOpen((v) => !v)} className="flex w-full items-center gap-3 text-left cursor-pointer">
+        <div className="min-w-0 flex-1">
+          <div className="text-body font-semibold text-fg">{file.title}</div>
+          {file.description && <div className="text-caption text-muted">{file.description}</div>}
+        </div>
+        <StatusPill tone={file.empty ? 'neutral' : 'success'}>{file.empty ? 'Empty' : `${file.bytes ?? 0} bytes`}</StatusPill>
+      </button>
+      {open && <pre className="mt-3 max-h-72 overflow-auto whitespace-pre-wrap rounded-md bg-subtle p-3 text-small text-muted">{file.content?.trim() || '(empty)'}</pre>}
+    </Card>
+  );
+}
+
+// ─────────── You & goals ───────────
+function YouTab({ qc }: { qc: ReturnType<typeof useQueryClient> }) {
+  const ctx = usePoll(['context'], getContext, 20000);
+  const profile = ctx.data?.profile ?? {};
+  const goals = ctx.data?.goals ?? [];
+  const [goalTitle, setGoalTitle] = useState('');
+  const [goalDesc, setGoalDesc] = useState('');
+  const add = async () => { if (!goalTitle.trim() || !goalDesc.trim()) return; try { await addGoal(goalTitle.trim(), goalDesc.trim()); setGoalTitle(''); setGoalDesc(''); } finally { void qc.invalidateQueries({ queryKey: ['context'] }); } };
+  return (
+    <div className="grid gap-4 lg:grid-cols-2">
+      <Card className="p-5">
+        <div className="mb-3 flex items-center gap-2"><User className="h-5 w-5 text-primary" aria-hidden /><h3 className="text-h3 text-fg">Profile</h3></div>
+        {ctx.isLoading ? <Skeleton className="h-24 w-full" /> : (
+          <dl className="grid grid-cols-2 gap-x-4 gap-y-2.5">
+            <ProfileItem label="Name" value={profile.preferredName || profile.displayName} />
+            <ProfileItem label="Role" value={profile.role} />
+            <ProfileItem label="Timezone" value={profile.timezone} />
+            <ProfileItem label="Tone" value={profile.communicationTone} />
+          </dl>
+        )}
+        <p className="mt-3 text-small text-muted">Wrong name or details? Fix them in <Link to="/settings" className="text-primary hover:underline">Settings → Profile</Link>.</p>
+      </Card>
+      <Card className="p-5">
+        <div className="mb-3 flex items-center gap-2"><Target className="h-5 w-5 text-primary" aria-hidden /><h3 className="text-h3 text-fg">Your goals</h3></div>
+        {ctx.isLoading ? <Skeleton className="h-24 w-full" /> : goals.length === 0 ? <p className="text-body text-muted">No goals yet. Tell Clementine what you're working toward.</p>
+          : <ul className="space-y-2.5">{goals.map((g, i) => (
+              <li key={g.id || i} className="flex items-start gap-2.5"><span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-primary" aria-hidden /><div><div className="text-body font-medium text-fg">{g.title || g.objective || 'Goal'}</div>{g.description && <div className="text-small text-muted">{g.description}</div>}</div></li>
+            ))}</ul>}
+        <div className="mt-4 space-y-2 border-t border-border pt-4">
+          <Input value={goalTitle} onChange={(e) => setGoalTitle(e.target.value)} placeholder="New goal (e.g. Grow SEO pipeline)" aria-label="Goal title" />
+          <div className="flex gap-2">
+            <Input value={goalDesc} onChange={(e) => setGoalDesc(e.target.value)} placeholder="What does success look like?" aria-label="Goal description" className="flex-1" />
+            <Button size="sm" onClick={add} disabled={!goalTitle.trim() || !goalDesc.trim()}><Plus className="h-4 w-4" aria-hidden /> Add</Button>
+          </div>
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+function ProfileItem({ label, value }: { label: string; value?: string }) {
+  return <div><dt className="text-label text-faint">{label}</dt><dd className="text-body text-fg">{value || '—'}</dd></div>;
+}
