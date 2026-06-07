@@ -5878,6 +5878,11 @@ body {
      pane (the Architect chat column was removed — Clem authors workflows
      from the main chat). */
   grid-template-columns: 240px minmax(0, 1fr);
+  /* Explicit row track that fills the panel height and can shrink — without
+     this the single implicit row sizes to content, so a long workflow list
+     grew past the panel and got clipped (no scroll) instead of letting the
+     list pane scroll internally. */
+  grid-template-rows: minmax(0, 1fr);
   gap: 12px;
   height: 100%;
   overflow: hidden;
@@ -5951,6 +5956,11 @@ body {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  /* Let the panes shrink within the grid row so their inner overflow:auto
+     (the wf-list / editor body) actually scrolls instead of the pane growing
+     past its cell and being clipped. */
+  min-height: 0;
+  min-width: 0;
 }
 .wf-list-head,
 .wf-chat-head {
