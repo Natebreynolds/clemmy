@@ -364,7 +364,12 @@ export function clearConnectedToolkitsCache(): void {
 
 export async function getPreferredUserId(): Promise<string> {
   const explicit = readComposioEnv('COMPOSIO_USER_ID');
-  if (explicit) return explicit;
+  // Treat the literal "default" sentinel as "not set" so already-installed
+  // users whose .env still carries COMPOSIO_USER_ID=default also fall through
+  // to auto-detection. Safe: if detection finds nothing we return
+  // DEFAULT_USER_ID ('default') anyway, and a user with real connections under
+  // the literal "default" id is still surfaced as the top connected user.
+  if (explicit && explicit !== DEFAULT_USER_ID) return explicit;
 
   const now = Date.now();
   if (detectedPreferredUserId && now - detectedPreferredUserId.at < USER_ID_TTL_MS) {

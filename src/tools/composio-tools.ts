@@ -9,6 +9,7 @@ import {
   getComposioRuntimeStatus,
   listComposioToolkitTools,
   listConnectedToolkits,
+  listAllToolkits,
 } from '../integrations/composio/client.js';
 import { formatRecallableToolText } from '../runtime/harness/tool-output-format.js';
 import { callIdFromToolDetails, sessionIdFromRunContext } from '../runtime/harness/tool-output-context.js';
@@ -620,6 +621,26 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
       // gives the agent (and the user) accurate, actionable feedback
       // instead of "tool not available" when the tool IS available.
       const allConnections = await listConnectedToolkits();
+      // Cold-start nudge: a configured key with ZERO connected apps returns a
+      // guidance-free empty result that the model reads as "no such tool".
+      // Say what's actually wrong and how to fix it. (Skipped when an explicit
+      // toolkit_slug was given — that's a deliberate targeted lookup.)
+      if (allConnections.length === 0 && !toolkit_slug) {
+        return formatComposioToolOutput({
+          configured: true,
+          connectedToolkits: [],
+          query,
+          count: 0,
+          matches: [],
+          message:
+            'Composio is configured, but NO apps are connected yet — so there are no toolkits to search. ' +
+            'A tool only becomes searchable after its app is connected. Connect the app you need from the ' +
+            'dashboard (Integrations → connect), then retry. Do not conclude the capability is unavailable.',
+          nextStep:
+            'Tell the user which app to connect (or point them to the dashboard Integrations page), then retry ' +
+            'composio_search_tools once it is connected.',
+        }, { context, details, toolName: 'composio_search_tools' });
+      }
       const targetToolkits = toolkit_slug
         ? [toolkit_slug]
         : [...new Set(allConnections.map((connection) => connection.slug))];
@@ -673,6 +694,32 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
         query,
         matches.filter((m) => m.slug && m.slug !== '__toolkit_error__').map((m) => m.slug),
       );
+      // Empty-with-connections: the query matched nothing in the CONNECTED
+      // toolkits. One bounded catalog check tells the user whether the app they
+      // want is supported-but-unconnected (the common cold-start confusion)
+      // instead of letting an empty result read as "no such capability".
+      const realMatchCount = matches.filter(
+        (m) => m.slug && m.slug !== '__toolkit_error__' && m.score > 0,
+      ).length;
+      let unconnectedHint: string | undefined;
+      if (realMatchCount === 0 && !toolkit_slug) {
+        try {
+          const connectedSlugs = new Set(allConnections.map((c) => c.slug));
+          const supported = (await listAllToolkits())
+            .filter((tk) => !connectedSlugs.has(tk.slug))
+            .filter((tk) => {
+              const hay = `${tk.slug} ${tk.name ?? ''}`.toLowerCase();
+              return queryTerms.some((term) => term.length >= 3 && hay.includes(term));
+            })
+            .slice(0, 5)
+            .map((tk) => tk.name ?? tk.slug);
+          if (supported.length > 0) {
+            unconnectedHint =
+              `No CONNECTED toolkit matched "${query}". These supported apps look relevant but are NOT connected yet: ` +
+              `${supported.join(', ')}. Connect one from the dashboard (Integrations) and retry — don't conclude it's unavailable.`;
+          }
+        } catch { /* best-effort hint — a catalog hiccup must never break search */ }
+      }
       const output = formatComposioToolOutput({
         configured: true,
         connectedToolkits: allConnections.map((connection) => ({
@@ -689,6 +736,7 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
         query,
         count: Math.min(matches.length, maxResults),
         matches: matches.slice(0, maxResults),
+        ...(unconnectedHint ? { message: unconnectedHint } : {}),
         nextStep: 'Pick the best match, then call `composio_execute_tool` with `tool_slug` set to the exact slug from this result and `arguments` as a JSON object string built from the action\'s `inputParameters` schema.',
       }, { context, details, toolName: 'composio_search_tools' });
       // P1-D — catch the search-loop: repeated overlapping searches of one

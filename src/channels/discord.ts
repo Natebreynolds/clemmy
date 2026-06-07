@@ -2322,11 +2322,26 @@ async function handleButtonInteraction(interaction: ButtonInteraction, assistant
     }
 
     if (action === 'continue') {
+      const sessionId = targetId;
+      // Engine-correctness guard: when the harness is the live engine (default),
+      // this session lives in the harness event log, NOT the chat-core
+      // SessionStore that assistant.respond() reads — so routing the button
+      // through respond() would run the WRONG engine on empty context. The
+      // harness resumes correctly from a typed `continue` (handled in
+      // discord-harness), so steer there instead. (Legacy chat-core path below
+      // is unchanged for non-harness installs.) The harness path does not attach
+      // these buttons, so this only catches a stale button from before the flip.
+      if (DISCORD_HARNESS_ENABLED) {
+        await interaction.reply({
+          content: 'Reply `continue` here to resume — your chats run on the durable harness, so it picks up with full history.',
+          ephemeral: true,
+        });
+        return;
+      }
       // The button targets the original sessionId; we re-issue a
       // "continue" prompt against it so the model resumes with full
       // history. Defer first so Discord doesn't time out on the 3s
       // window while the model thinks.
-      const sessionId = targetId;
       await interaction.deferReply();
       try {
         const response = await assistant.respond({

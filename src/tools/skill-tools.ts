@@ -2,6 +2,7 @@ import { readdirSync } from 'node:fs';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { listSkills, loadSkill, type Skill } from '../memory/skill-store.js';
+import { checkSkillPreconditions } from '../runtime/capability-preconditions.js';
 import { textResult } from './shared.js';
 
 /**
@@ -90,7 +91,22 @@ export function registerSkillTools(server: McpServer): void {
       if (!skill) {
         return textResult(`Skill "${name}" is not installed. Call skill_list() to see what is available.`);
       }
+      // Capability preconditions: if the skill declares `requires:` (mcp:/cli:/
+      // secret:) and something is missing, surface a NON-BLOCKING heads-up so the
+      // agent diagnoses the gap up front instead of dead-ending mid-task. Skills
+      // without `requires` are unaffected; the check is fail-open.
+      const pre = checkSkillPreconditions((skill.frontmatter as Record<string, unknown>).requires);
+      const notReadyBanner = pre.ready
+        ? ''
+        : [
+            '⚠️ NOT READY — this skill declares prerequisites that are not detected:',
+            ...pre.unmet.map((u) => `  • ${u}`),
+            'Set these up first (connect the app/MCP in the dashboard, install the CLI, or add the secret), then run the skill. This is a heads-up, not a hard block — if you know they are configured, proceed.',
+            '',
+          ].join('\n');
+
       const head = [
+        notReadyBanner,
         `# ${skill.frontmatter.name || skill.name}`,
         skill.frontmatter.description ? `\n${skill.frontmatter.description}\n` : '',
       ].filter(Boolean).join('\n');

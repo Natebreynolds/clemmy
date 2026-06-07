@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { COMPOSIO_AUTH_CONFIGS_URL, __test__, pickToolkitConnection } from './client.js';
+import { COMPOSIO_AUTH_CONFIGS_URL, __test__, getPreferredUserId, pickToolkitConnection } from './client.js';
 
 test('selectAuthConfigIdForToolkit handles current auth config response shapes', () => {
   const items = [
@@ -19,6 +19,23 @@ test('selectAuthConfigIdForToolkit handles current auth config response shapes',
 
 test('Composio auth-config fallback URL uses the current dashboard path', () => {
   assert.equal(COMPOSIO_AUTH_CONFIGS_URL, 'https://dashboard.composio.dev/~/project/auth-configs');
+});
+
+test('getPreferredUserId honors a real explicit COMPOSIO_USER_ID (short-circuits before any network)', async () => {
+  // Regression guard for the sentinel fix: a real id like pg-test-… must
+  // still short-circuit and be returned verbatim — we only stopped the
+  // literal "default" sentinel from masking auto-detection. (Hermetic: the
+  // real-id branch returns before getComposio()/connected-accounts ever run;
+  // we deliberately do NOT assert the "default" fallthrough here because that
+  // path can reach the live SDK on a machine with a configured key.)
+  const prev = process.env.COMPOSIO_USER_ID;
+  try {
+    process.env.COMPOSIO_USER_ID = 'pg-test-04a26016-regression';
+    assert.equal(await getPreferredUserId(), 'pg-test-04a26016-regression');
+  } finally {
+    if (prev === undefined) delete process.env.COMPOSIO_USER_ID;
+    else process.env.COMPOSIO_USER_ID = prev;
+  }
 });
 
 test('pickToolkitConnection: resolves the live connection only when unambiguous (no stale-id guessing)', () => {
