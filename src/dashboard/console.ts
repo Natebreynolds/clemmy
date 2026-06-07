@@ -5975,12 +5975,21 @@ body {
   letter-spacing: 0.18em;
   color: var(--fg-3);
 }
+/* The list pane is only 240px wide — WORKFLOWS + HOME + IMPORT + ＋ NEW don't
+   fit on one row (the ＋ NEW button was clipping). Stack the title above the
+   action buttons so everything stays fully visible at any width. */
+.wf-list-head {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+}
 .wf-chat-title { color: var(--fg); }
 .wf-chat-meta { color: var(--accent); font-size: 10px; }
 .wf-list-actions {
   display: flex;
   align-items: center;
   gap: 6px;
+  flex-wrap: wrap; /* never clip an action button on a narrow pane */
 }
 .wf-home-btn {
   display: inline-block;
