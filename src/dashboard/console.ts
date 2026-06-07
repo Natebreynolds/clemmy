@@ -3808,6 +3808,11 @@ body {
 }
 .inbox-drawer-btn:hover { color: var(--accent); border-color: var(--accent); }
 .home-item.notif-item { cursor: pointer; }
+/* Read/unread: unread reports get an accent dot; once opened (read) the row
+   mutes. The first UI to drive NotificationRecord.read, so the backlog clears
+   as reports are read rather than showing a noisy all-unread badge. */
+.home-item.notif-item.unread .home-item-dot { background: var(--accent); box-shadow: 0 0 6px color-mix(in srgb, var(--accent) 55%, transparent); }
+.home-item.notif-item.read-seen .home-item-text { color: var(--fg-3); }
 .home-memory-line {
   display: flex;
   justify-content: space-between;
@@ -12202,6 +12207,15 @@ const CONSOLE_JS = `
       '</div>',
     ].join('');
     requestAnimationFrame(() => { backdrop.classList.add('open'); drawer.classList.add('open'); });
+    // Mark read on open (the first UI to actually drive NotificationRecord.read)
+    // — naturally clears the unread backlog as reports are read.
+    if (item.read === false) {
+      item.read = true;
+      fetch(withToken('/dashboard/actions/notifications/' + encodeURIComponent(id) + '/read'), { method: 'POST' }).catch(() => {});
+      document.querySelectorAll('[data-home-notif]').forEach((row) => {
+        if (row.getAttribute('data-home-notif') === id) { row.classList.remove('unread'); row.classList.add('read-seen'); }
+      });
+    }
   }
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape' && document.querySelector('[data-inbox-drawer].open')) closeInboxDrawer();
@@ -12275,7 +12289,7 @@ const CONSOLE_JS = `
         ? ' data-home-notif="' + escMem(item.notifId) + '"'
         : (' data-tools-jump="' + escMem(item.panel || 'activity') + '"' + targetSessionAttr + targetRunAttr + targetBackgroundAttr);
       return [
-      '<div class="home-item command-item' + (isNotif ? ' notif-item' : '') + '"' + rowAttrs + '>',
+      '<div class="home-item command-item' + (isNotif ? ' notif-item' : '') + (isNotif && item.read === false ? ' unread' : '') + (isNotif && item.read === true ? ' read-seen' : '') + '"' + rowAttrs + '>',
       '  <span class="home-item-dot ' + escMem(dotTone) + '" aria-hidden="true"></span>',
       '  <span class="home-item-kind ' + escMem(item.kind || 'task') + '">' + escMem(String(item.kind || 'item').toUpperCase()) + '</span>',
       '  <div style="flex:1; min-width:0;">',
