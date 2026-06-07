@@ -12769,9 +12769,14 @@ const CONSOLE_JS = `
   // 24 hourly bins. Uses item.completedAt/ts/meta timestamps when present;
   // falls back to hiding if we can't derive any times.
   function refreshHomePulse(recentItems) {
+    // Home stays focused on chat + inbox (the main job). The 24h activity
+    // timeline lives in the dedicated Activity panel, so the home pulse chart
+    // is intentionally kept hidden here to avoid pushing chat/inbox down.
+    const HOME_PULSE_ENABLED = false;
     const wrap = document.querySelector('[data-home-pulse]');
     const spark = document.querySelector('[data-home-pulse-spark]');
     if (!wrap || !spark) return;
+    if (!HOME_PULSE_ENABLED) { wrap.hidden = true; return; }
     const now = Date.now();
     const HOURS = 24;
     const bins = new Array(HOURS).fill(0);
@@ -12986,15 +12991,17 @@ const CONSOLE_JS = `
       else s.setAttribute('hidden', '');
     });
     navButtons.forEach((b) => b.classList.toggle('active', b.getAttribute('data-panel') === name));
-    // The Home panel has its own prominent LIVE card with the orb;
-    // the sidebar dock-live duplicates the same controls. Hide the
-    // dock copy when Home is active so the at-a-glance dock stays
-    // useful from every other panel without doubling up on Home.
-    const dockLive = document.querySelector('[data-dock-live]');
-    if (dockLive) {
-      if (name === 'home') dockLive.setAttribute('hidden', '');
-      else dockLive.removeAttribute('hidden');
-    }
+    // On Home the inbox rail already shows NOW (needs you) + RECENT and the
+    // chat hero carries LIVE, so the dock copies of those just duplicate the
+    // rail and clutter the sidebar. Hide them on Home; keep them on every
+    // other panel as the at-a-glance cross-panel monitor. HEALTH stays (the
+    // rail doesn't show it).
+    ['[data-dock-live]', '[data-dock-now]', '[data-dock-recent]'].forEach((sel) => {
+      const el = document.querySelector(sel);
+      if (!el) return;
+      if (name === 'home') el.setAttribute('hidden', '');
+      else el.removeAttribute('hidden');
+    });
     // v0.5.11 brain-consolidation: 'memory' / 'context' / 'evolution'
     // are no longer top-level panels — they live as sub-tabs inside
     // Brain. The boot/refresh functions for those modules are now
