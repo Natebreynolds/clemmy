@@ -200,6 +200,11 @@ function startWorkflowHeartbeat(
       body: `${stepBody}Run ${runId} has been working for ${elapsedMin} min. Will notify on completion or failure. Open Console → Activity for live status.`,
       createdAt: new Date().toISOString(),
       read: false,
+      // Dashboard-only: "still running" heartbeats are live-status reassurance,
+      // not report-backs. Delivering them spammed Discord every ~10 min during
+      // long runs. The terminal completion/failure notification (and any
+      // notify_user report) still delivers — this only stops the noise.
+      silent: true,
       metadata: { workflow: workflowName, runId, heartbeat: true, elapsedMin },
     });
   };
