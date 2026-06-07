@@ -5563,6 +5563,9 @@ export function registerConsoleRoutes(
         panel: 'activity',
         urgency: 'high',
         notifId: notification.id,
+        body: (notification.body || '').slice(0, 4000),
+        createdAt: notification.createdAt,
+        runId: String(notification.metadata?.workflowRunId || notification.metadata?.runId || ''),
       }));
       const notifRecent = dedupeByWorkflow(
         inboxNotifs.filter((notification) => !isNeedsAttentionNotif(notification) && !isGenericWorkflowEcho(notification)),
@@ -5576,6 +5579,10 @@ export function registerConsoleRoutes(
           panel: 'activity',
           notifId: notification.id,
           read: notification.read,
+          body: (notification.body || '').slice(0, 4000),
+          createdAt: notification.createdAt,
+          runId: String(notification.metadata?.workflowRunId || notification.metadata?.runId || ''),
+          notDelivered: undelivered,
         };
       });
       // Notifications LEAD (they hold the real report-backs), then the

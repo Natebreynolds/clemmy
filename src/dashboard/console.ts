@@ -3767,6 +3767,47 @@ body {
 .home-item-actions button[data-home-approval-action="approve"] { border-color: var(--accent-2); color: var(--accent-2); }
 .home-item-actions button[data-home-approval-action="reject"] { border-color: var(--accent-fail); color: var(--accent-fail); }
 .home-item-actions button[disabled] { opacity: 0.45; cursor: wait; }
+
+/* ── Inbox detail drawer ──────────────────────────────────────────────
+ * Clicking an inbox row (a notification report-back) slides in a reading
+ * drawer with the full body — so a completion like the Outlook triage is
+ * actually readable, not just a one-line preview. */
+.inbox-drawer-backdrop {
+  position: fixed; inset: 0; z-index: 9997;
+  background: rgba(0, 0, 0, 0.32);
+  opacity: 0; transition: opacity 180ms ease; pointer-events: none;
+}
+.inbox-drawer-backdrop.open { opacity: 1; pointer-events: auto; }
+.inbox-drawer {
+  position: fixed; top: 0; right: 0; width: 440px; max-width: 92vw; height: 100%;
+  background: var(--bg-1); border-left: 1px solid var(--line); z-index: 9998;
+  transform: translateX(100%); transition: transform 200ms ease; overflow-y: auto;
+  box-shadow: -10px 0 30px rgba(0, 0, 0, 0.35);
+  display: flex; flex-direction: column; min-height: 0;
+}
+.inbox-drawer.open { transform: translateX(0); }
+.inbox-drawer-head {
+  display: flex; align-items: flex-start; justify-content: space-between; gap: 12px;
+  padding: 16px 18px; border-bottom: 1px solid var(--line);
+  position: sticky; top: 0; background: var(--bg-2);
+}
+.inbox-drawer-title { font-size: 14px; color: var(--fg); letter-spacing: 0.01em; line-height: 1.35; }
+.inbox-drawer-close { background: transparent; border: 0; color: var(--fg-3); font-size: 16px; line-height: 1; cursor: pointer; flex-shrink: 0; }
+.inbox-drawer-close:hover { color: var(--accent); }
+.inbox-drawer-meta { padding: 12px 18px 0; font-size: 10px; letter-spacing: 0.1em; color: var(--fg-3); text-transform: uppercase; }
+.inbox-drawer-warn { color: var(--accent-warn); }
+.inbox-drawer-body {
+  padding: 12px 18px 18px; font-size: 12.5px; line-height: 1.6; color: var(--fg-1);
+  white-space: pre-wrap; word-break: break-word; flex: 1;
+}
+.inbox-drawer-actions { padding: 0 18px 18px; display: flex; gap: 8px; flex-wrap: wrap; }
+.inbox-drawer-btn {
+  background: transparent; border: 1px solid var(--line); color: var(--fg-2);
+  font-family: inherit; font-size: 10px; letter-spacing: 0.14em; padding: 7px 13px; cursor: pointer;
+  transition: color 120ms, border-color 120ms;
+}
+.inbox-drawer-btn:hover { color: var(--accent); border-color: var(--accent); }
+.home-item.notif-item { cursor: pointer; }
 .home-memory-line {
   display: flex;
   justify-content: space-between;
@@ -12118,6 +12159,54 @@ const CONSOLE_JS = `
     }
   }
 
+  // Inbox detail drawer — full report-back body on click. Items are keyed by
+  // notifId; the map is refreshed each command-center poll.
+  const inboxItemsById = {};
+  function closeInboxDrawer() {
+    const drawer = document.querySelector('[data-inbox-drawer]');
+    const backdrop = document.querySelector('[data-inbox-backdrop]');
+    if (drawer) drawer.classList.remove('open');
+    if (backdrop) backdrop.classList.remove('open');
+  }
+  function openInboxDetail(id) {
+    const item = inboxItemsById[id];
+    if (!item) return;
+    let backdrop = document.querySelector('[data-inbox-backdrop]');
+    if (!backdrop) {
+      backdrop = document.createElement('div');
+      backdrop.className = 'inbox-drawer-backdrop';
+      backdrop.setAttribute('data-inbox-backdrop', '');
+      backdrop.addEventListener('click', closeInboxDrawer);
+      document.body.appendChild(backdrop);
+    }
+    let drawer = document.querySelector('[data-inbox-drawer]');
+    if (!drawer) {
+      drawer = document.createElement('div');
+      drawer.className = 'inbox-drawer';
+      drawer.setAttribute('data-inbox-drawer', '');
+      document.body.appendChild(drawer);
+    }
+    let when = item.meta || '';
+    try { if (item.createdAt) when = new Date(item.createdAt).toLocaleString(); } catch (_) {}
+    drawer.innerHTML = [
+      '<div class="inbox-drawer-head">',
+      '  <span class="inbox-drawer-title">' + escMem(item.title || 'Notification') + '</span>',
+      '  <button type="button" class="inbox-drawer-close" data-inbox-close aria-label="Close">✕</button>',
+      '</div>',
+      '<div class="inbox-drawer-meta">' + escMem(when) + (item.notDelivered ? ' · <span class="inbox-drawer-warn">NOT DELIVERED</span>' : '') + '</div>',
+      '<div class="inbox-drawer-body">' + escMem(item.body || item.meta || '(no detail)') + '</div>',
+      '<div class="inbox-drawer-actions">',
+      (item.notDelivered ? '  <button type="button" class="inbox-drawer-btn" data-inbox-retry="' + escMem(id) + '">RETRY DELIVERY</button>' : ''),
+      (item.runId ? '  <button type="button" class="inbox-drawer-btn" data-inbox-run="' + escMem(item.runId) + '">OPEN RUN</button>' : ''),
+      '  <button type="button" class="inbox-drawer-btn" data-inbox-close>CLOSE</button>',
+      '</div>',
+    ].join('');
+    requestAnimationFrame(() => { backdrop.classList.add('open'); drawer.classList.add('open'); });
+  }
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && document.querySelector('[data-inbox-drawer].open')) closeInboxDrawer();
+  });
+
   function renderCommandItems(items, emptyText, tone) {
     if (!items || items.length === 0) {
       return '<div class="home-empty">' + escMem(emptyText) + '</div>';
@@ -12179,8 +12268,14 @@ const CONSOLE_JS = `
       const targetBackgroundAttr = hasBackgroundTask
         ? ' data-home-background-task-id="' + escMem(item.taskId) + '"'
         : '';
+      // Pure notification rows (report-backs) open the inbox detail drawer to
+      // read the full body, instead of jumping to a panel that can't show them.
+      const isNotif = item.notifId && !hasApproval && !hasWorkflowRun && !hasHarnessSession && !hasBackgroundTask;
+      const rowAttrs = isNotif
+        ? ' data-home-notif="' + escMem(item.notifId) + '"'
+        : (' data-tools-jump="' + escMem(item.panel || 'activity') + '"' + targetSessionAttr + targetRunAttr + targetBackgroundAttr);
       return [
-      '<div class="home-item command-item" data-tools-jump="' + escMem(item.panel || 'activity') + '"' + targetSessionAttr + targetRunAttr + targetBackgroundAttr + '>',
+      '<div class="home-item command-item' + (isNotif ? ' notif-item' : '') + '"' + rowAttrs + '>',
       '  <span class="home-item-dot ' + escMem(dotTone) + '" aria-hidden="true"></span>',
       '  <span class="home-item-kind ' + escMem(item.kind || 'task') + '">' + escMem(String(item.kind || 'item').toUpperCase()) + '</span>',
       '  <div style="flex:1; min-width:0;">',
@@ -12539,6 +12634,11 @@ const CONSOLE_JS = `
       const data = await fetchJSON('/api/console/home/command-center');
       const counts = data.counts || {};
       const presence = data.presence || {};
+      // Index notification-backed inbox rows by id so a click can open the
+      // full report in the detail drawer.
+      [...(data.needsYou || []), ...(data.recentCompleted || [])].forEach((it) => {
+        if (it && it.notifId) inboxItemsById[it.notifId] = it;
+      });
       const needsEl = document.querySelector('[data-home-needs-list]');
       const workingEl = document.querySelector('[data-home-working-list]');
       const recentEl = document.querySelector('[data-home-recent-list]');
@@ -13064,6 +13164,42 @@ const CONSOLE_JS = `
         switchPanel('activity');
         setTimeout(() => openBackgroundTaskDetail(taskId), 0);
       }
+      return;
+    }
+    // Inbox detail drawer: close / retry / open-run, then open-on-row.
+    if (target.closest('[data-inbox-close]')) {
+      event.preventDefault();
+      event.stopPropagation();
+      closeInboxDrawer();
+      return;
+    }
+    const retryBtn = target.closest('[data-inbox-retry]');
+    if (retryBtn) {
+      event.preventDefault();
+      event.stopPropagation();
+      const id = retryBtn.getAttribute('data-inbox-retry');
+      retryBtn.textContent = 'RETRYING…';
+      retryBtn.setAttribute('disabled', '');
+      fetch(withToken('/dashboard/actions/notifications/' + encodeURIComponent(id) + '/retry'), { method: 'POST' })
+        .then(() => { retryBtn.textContent = 'RETRY QUEUED'; })
+        .catch(() => { retryBtn.textContent = 'RETRY FAILED'; });
+      return;
+    }
+    const runBtn = target.closest('[data-inbox-run]');
+    if (runBtn) {
+      event.preventDefault();
+      event.stopPropagation();
+      const runId = runBtn.getAttribute('data-inbox-run');
+      closeInboxDrawer();
+      switchPanel('activity');
+      setTimeout(() => { try { selectedRunId = runId; if (typeof loadDetail === 'function') loadDetail(runId); } catch (_) {} }, 80);
+      return;
+    }
+    const notifRow = target.closest('[data-home-notif]');
+    if (notifRow) {
+      event.preventDefault();
+      event.stopPropagation();
+      openInboxDetail(notifRow.getAttribute('data-home-notif'));
       return;
     }
     const jump = target.closest('[data-tools-jump]');
