@@ -1,7 +1,7 @@
 import { useState } from 'react';
-import { useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigate } from 'react-router-dom';
-import { Zap, Clock, Puzzle, Play, Plus, RefreshCw, Loader2 } from 'lucide-react';
+import { Zap, Clock, Puzzle, Play, Plus, RefreshCw, Loader2, Trash2, ChevronDown, ExternalLink } from 'lucide-react';
 import { Page } from '@/components/Page';
 import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
@@ -16,7 +16,8 @@ import { WorkflowDrawer } from '@/components/automate/WorkflowDrawer';
 import { cn } from '@/lib/cn';
 import {
   listWorkflows, runWorkflow, setWorkflowEnabled,
-  listSkills, installSkill, checkSkillUpdates,
+  listSkills, installSkill, checkSkillUpdates, getSkill, deleteSkill, updateSkill,
+  type SkillRow,
 } from '@/lib/automate';
 
 type Tab = 'workflows' | 'schedules' | 'skills';
@@ -192,13 +193,8 @@ export function Automate() {
             ? <CardGridSkeleton />
             : sk.length === 0
               ? <EmptyState title="No skills installed" description="Skills give Clementine new abilities. Add one above to get started." />
-              : <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-                  {sk.map((s) => (
-                    <Card key={s.name} className="p-5">
-                      <h3 className="mb-1 text-h3 text-fg">{s.name}</h3>
-                      <p className="line-clamp-3 text-body text-muted">{s.description || 'No description.'}</p>
-                    </Card>
-                  ))}
+              : <div className="space-y-3">
+                  {sk.map((s) => <SkillCard key={s.name} skill={s} onChanged={() => void qc.invalidateQueries({ queryKey: ['skills'] })} />)}
                 </div>}
         </div>
       )}
@@ -213,5 +209,67 @@ function CardGridSkeleton() {
     <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
       {[0, 1, 2].map((i) => <Skeleton key={i} className="h-40 w-full" />)}
     </div>
+  );
+}
+
+function SkillCard({ skill, onChanged }: { skill: SkillRow; onChanged: () => void }) {
+  const [open, setOpen] = useState(false);
+  const [busy, setBusy] = useState<string | null>(null);
+  const detail = useQuery({ queryKey: ['skill', skill.name], queryFn: () => getSkill(skill.name), enabled: open });
+
+  const remove = async () => { setBusy('remove'); try { await deleteSkill(skill.name); onChanged(); } finally { setBusy(null); } };
+  const update = async () => { setBusy('update'); try { await updateSkill(skill.name); setTimeout(onChanged, 1500); } finally { setBusy(null); } };
+
+  const badge = (label: string) => <span className="rounded-full bg-subtle px-2 py-0.5 text-caption text-muted">{label}</span>;
+
+  return (
+    <Card className="p-5">
+      <div className="flex items-start gap-3">
+        <Puzzle className="mt-0.5 h-5 w-5 shrink-0 text-primary" aria-hidden />
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <h3 className="text-h3 text-fg">{skill.displayName || skill.name}</h3>
+            {skill.source?.updateAvailable && <StatusPill tone="warning">Update available</StatusPill>}
+            {skill.hasScripts && badge('scripts')}
+            {skill.hasReferences && badge('references')}
+            {skill.hasSrc && badge('src')}
+          </div>
+          <p className={cn('mt-1 text-body text-muted', !open && 'line-clamp-2')}>{skill.description || 'No description.'}</p>
+        </div>
+        <div className="flex shrink-0 items-center gap-1">
+          {skill.source?.updateAvailable && (
+            <Button size="sm" variant="secondary" disabled={busy === 'update'} onClick={update}>
+              {busy === 'update' ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <RefreshCw className="h-4 w-4" aria-hidden />} Update
+            </Button>
+          )}
+          <Button size="sm" variant="ghost" aria-label={`Remove ${skill.name}`} title="Remove skill" disabled={busy === 'remove'} onClick={remove} className="text-danger">
+            {busy === 'remove' ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <Trash2 className="h-4 w-4" aria-hidden />}
+          </Button>
+        </div>
+      </div>
+
+      <button type="button" onClick={() => setOpen((v) => !v)}
+        className="mt-2 inline-flex items-center gap-1 text-caption font-semibold text-primary hover:underline cursor-pointer">
+        <ChevronDown className={cn('h-3.5 w-3.5 transition-transform', open && 'rotate-180')} aria-hidden />
+        {open ? 'Hide skill' : 'Read full skill'}
+      </button>
+
+      {open && (
+        <div className="mt-2">
+          {detail.isLoading ? <Skeleton className="h-48 w-full" />
+            : detail.isError ? <p className="text-small text-danger">Couldn't load this skill.</p>
+            : (
+              <>
+                {detail.data?.source?.repo && (
+                  <a href={detail.data.source.repo} target="_blank" rel="noopener noreferrer" className="mb-2 inline-flex items-center gap-1 text-caption text-primary hover:underline">
+                    <ExternalLink className="h-3.5 w-3.5" aria-hidden /> {detail.data.source.repo}
+                  </a>
+                )}
+                <pre className="max-h-[28rem] overflow-auto whitespace-pre-wrap rounded-md border border-border bg-subtle p-3 font-mono text-caption text-fg">{detail.data?.body || '(empty)'}</pre>
+              </>
+            )}
+        </div>
+      )}
+    </Card>
   );
 }

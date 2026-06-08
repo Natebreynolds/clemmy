@@ -432,7 +432,9 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
         "base-uri 'none'",
         "frame-ancestors 'none'",
         "object-src 'none'",
-        "img-src 'self' data:",
+        // Allow remote app/toolkit logos (Composio CDN, etc.) to load. Loopback
+        // Electron surface — images are inert; this just stops broken-logo icons.
+        "img-src 'self' data: https:",
         "script-src 'self' 'unsafe-inline'",
         "style-src 'self' 'unsafe-inline'",
         "connect-src 'self' https://api.openai.com wss://api.openai.com",

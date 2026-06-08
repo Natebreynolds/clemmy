@@ -4,6 +4,7 @@ import { Sidebar } from './Sidebar';
 import { TopBar } from './TopBar';
 import { CommandPalette } from './CommandPalette';
 import { VoiceOverlay } from './VoiceOverlay';
+import { ErrorBoundary } from './ErrorBoundary';
 import { ALL_NAV } from '@/lib/nav';
 
 function titleForPath(pathname: string): string {
@@ -37,7 +38,9 @@ export function AppShell() {
           onToggleSidebar={() => setCollapsed((v) => !v)}
         />
         <main id="main" className="min-h-0 flex-1 overflow-y-auto">
-          <Outlet />
+          <ErrorBoundary resetKey={location.pathname}>
+            <Outlet />
+          </ErrorBoundary>
         </main>
       </div>
 

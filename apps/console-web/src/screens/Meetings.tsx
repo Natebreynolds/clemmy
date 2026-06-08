@@ -219,45 +219,70 @@ function MeetingRow({ m, selected, onSelect }: { m: MeetingSummary; selected: bo
   );
 }
 
+// Analysis fields vary across meetings — actionItems can be an array of
+// OBJECTS (e.g. {task, owner}) on some, strings on others, or null. Coerce
+// everything to a readable string so a render never throws ("Objects are not
+// valid as a React child"), which was blanking the whole app.
+function asText(v: unknown): string {
+  if (v == null) return '';
+  if (typeof v === 'string') return v;
+  if (typeof v === 'number' || typeof v === 'boolean') return String(v);
+  if (typeof v === 'object') {
+    const o = v as Record<string, unknown>;
+    const main = o.task ?? o.action ?? o.item ?? o.text ?? o.title ?? o.description ?? o.name;
+    const who = o.owner ?? o.assignee ?? o.who;
+    if (typeof main === 'string') return typeof who === 'string' && who ? `${main} — ${who}` : main;
+    try { return JSON.stringify(v); } catch { return String(v); }
+  }
+  return String(v);
+}
+function toList(v: unknown): unknown[] { return Array.isArray(v) ? v : v == null ? [] : [v]; }
+
 function MeetingDetailView({ data }: { data?: import('@/lib/meetings').MeetingDetail }) {
-  const a = data?.analysis ?? {};
-  const r = data?.record ?? {};
-  const segments = (r.segments ?? []).filter((s) => s.text);
+  const a = (data?.analysis ?? {}) as Record<string, unknown>;
+  const r = (data?.record ?? {}) as Record<string, unknown>;
+  const summary = asText(a.summary);
+  const actionItems = toList(a.actionItems).map(asText).filter(Boolean);
+  const decisions = toList(a.decisions).map(asText).filter(Boolean);
+  const topics = toList(a.topics).map(asText).filter(Boolean);
+  const participants = toList(a.participants).map(asText).filter(Boolean);
+  const segments = toList(r.segments).filter((s) => asText((s as Record<string, unknown>)?.text));
   return (
     <div>
       <div className="mb-2 flex items-center gap-2 text-caption text-faint">
-        <span className="uppercase tracking-wide">{r.platform}</span>
-        {r.startedAt && <span>· {relativeTime(r.startedAt)}</span>}
+        <span className="uppercase tracking-wide">{asText(r.platform)}</span>
+        {r.startedAt ? <span>· {relativeTime(asText(r.startedAt))}</span> : null}
       </div>
-      <h3 className="mb-3 text-h2 text-fg">{a.title || 'Meeting'}</h3>
-      {a.summary && <p className="mb-4 whitespace-pre-wrap text-body text-fg">{a.summary}</p>}
+      <h3 className="mb-3 text-h2 text-fg">{asText(a.title) || 'Meeting'}</h3>
+      {summary && <p className="mb-4 whitespace-pre-wrap text-body text-fg">{summary}</p>}
 
-      {a.actionItems && a.actionItems.length > 0 && (
+      {actionItems.length > 0 && (
         <Section icon={ListChecks} title="Action items">
-          <ul className="space-y-1.5">{a.actionItems.map((it, i) => <li key={i} className="flex gap-2 text-body text-fg"><span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-primary" aria-hidden />{it}</li>)}</ul>
+          <ul className="space-y-1.5">{actionItems.map((it, i) => <li key={i} className="flex gap-2 text-body text-fg"><span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-primary" aria-hidden />{it}</li>)}</ul>
         </Section>
       )}
-      {a.decisions && a.decisions.length > 0 && (
+      {decisions.length > 0 && (
         <Section icon={ListChecks} title="Decisions">
-          <ul className="space-y-1.5">{a.decisions.map((it, i) => <li key={i} className="text-body text-fg">{it}</li>)}</ul>
+          <ul className="space-y-1.5">{decisions.map((it, i) => <li key={i} className="text-body text-fg">{it}</li>)}</ul>
         </Section>
       )}
-      {a.topics && a.topics.length > 0 && (
+      {topics.length > 0 && (
         <Section icon={Hash} title="Topics">
-          <div className="flex flex-wrap gap-1.5">{a.topics.map((t, i) => <span key={i} className="rounded-full bg-subtle px-2.5 py-1 text-caption text-muted">{t}</span>)}</div>
+          <div className="flex flex-wrap gap-1.5">{topics.map((t, i) => <span key={i} className="rounded-full bg-subtle px-2.5 py-1 text-caption text-muted">{t}</span>)}</div>
         </Section>
       )}
-      {a.participants && a.participants.length > 0 && (
+      {participants.length > 0 && (
         <Section icon={Users} title="Participants">
-          <div className="text-body text-muted">{a.participants.join(', ')}</div>
+          <div className="text-body text-muted">{participants.join(', ')}</div>
         </Section>
       )}
       {segments.length > 0 && (
         <Section icon={Mic} title="Transcript">
           <div className="max-h-72 space-y-2 overflow-auto">
-            {segments.slice(0, 200).map((s, i) => (
-              <p key={i} className="text-small text-muted"><span className="font-semibold text-fg">{s.speaker || 'Speaker'}:</span> {s.text}</p>
-            ))}
+            {segments.slice(0, 200).map((s, i) => {
+              const seg = s as Record<string, unknown>;
+              return <p key={i} className="text-small text-muted"><span className="font-semibold text-fg">{asText(seg.speaker) || 'Speaker'}:</span> {asText(seg.text)}</p>;
+            })}
           </div>
         </Section>
       )}
