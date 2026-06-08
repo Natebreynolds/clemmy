@@ -47,10 +47,29 @@ function releaseUrl(file) {
   return `https://github.com/astral-sh/uv/releases/download/${VERSION}/${file}`;
 }
 
-async function download(url) {
-  const res = await fetch(url, { redirect: 'follow' });
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText} for ${url}`);
-  return Buffer.from(await res.arrayBuffer());
+async function download(url, attempts = 5) {
+  let lastErr;
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      const res = await fetch(url, { redirect: 'follow' });
+      // 5xx / 429 are transient (GitHub release-CDN 504s have blocked releases);
+      // retry with backoff. 4xx (except 429) are real → fail fast.
+      if (!res.ok) {
+        if (res.status >= 500 || res.status === 429) throw new Error(`${res.status} ${res.statusText} for ${url}`);
+        throw Object.assign(new Error(`${res.status} ${res.statusText} for ${url}`), { fatal: true });
+      }
+      return Buffer.from(await res.arrayBuffer());
+    } catch (err) {
+      lastErr = err;
+      if (err && err.fatal) throw err;
+      if (i < attempts) {
+        const waitMs = Math.min(15000, 1000 * 2 ** (i - 1)); // 1s,2s,4s,8s,15s
+        console.log(`  ↻ retry ${i}/${attempts - 1} after ${waitMs}ms — ${String(err.message || err).slice(0, 80)}`);
+        await new Promise((r) => setTimeout(r, waitMs));
+      }
+    }
+  }
+  throw lastErr;
 }
 
 function sha256(buf) {
