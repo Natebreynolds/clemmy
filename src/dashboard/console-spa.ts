@@ -31,6 +31,16 @@ export function isConsoleNextEnabled(): boolean {
   return !(raw === '0' || raw === 'false' || raw === 'off' || raw === 'no');
 }
 
+/** The 3D "Memory Constellation" view on the Memory tab. Default ON, with a
+ *  kill-switch (set CLEMENTINE_MEMORY_3D=off/0/false/no to disable) — same
+ *  convention as CLEMENTINE_CONSOLE_NEXT / CLEMENTINE_SPACES. The flag is
+ *  surfaced to the SPA via the bootstrap (below); the client still falls back
+ *  to the 2D graph on no-WebGL / reduced-motion / large graphs / errors. */
+export function isMemory3dEnabled(): boolean {
+  const raw = getRuntimeEnv('CLEMENTINE_MEMORY_3D', '').trim().toLowerCase();
+  return !(raw === '0' || raw === 'false' || raw === 'off' || raw === 'no');
+}
+
 /** Locate the built console-web bundle. Returns null if not built yet. */
 export function resolveConsoleDistDir(override?: string | null): string | null {
   if (override === null) return null;
@@ -56,7 +66,7 @@ export function resolveConsoleDistDir(override?: string | null): string | null {
 /** Build the inline bootstrap <script> the SPA reads on boot. */
 function bootstrapScript(token: string): string {
   // Escape `<` so the JSON can't break out of the surrounding <script>.
-  const json = JSON.stringify({ token }).replace(/</g, '\\u003c');
+  const json = JSON.stringify({ token, flags: { memory3d: isMemory3dEnabled() } }).replace(/</g, '\\u003c');
   return `<script>window.__CLEM_BOOTSTRAP__=${json};</script>`;
 }
 

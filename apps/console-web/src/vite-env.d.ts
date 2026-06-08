@@ -13,6 +13,8 @@ interface ImportMeta {
 interface ClemBootstrap {
   token?: string;
   version?: string;
+  /** Server feature flags injected by the daemon (src/dashboard/console-spa.ts). */
+  flags?: { memory3d?: boolean };
 }
 
 interface Window {

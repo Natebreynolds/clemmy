@@ -12,7 +12,7 @@ import { Input, Select } from '@/components/ui/Field';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { EmptyState } from '@/components/ui/EmptyState';
-import { MemoryGraph } from '@/components/MemoryGraph';
+import { MemoryGraphContainer } from '@/components/MemoryGraphContainer';
 import { usePoll } from '@/lib/poll';
 import { cn } from '@/lib/cn';
 import {
@@ -103,7 +103,7 @@ function OverviewTab() {
       </div>
       <div>
         <p className="mb-2 text-small text-muted">How everything connects — tap a topic to fold it, drag to explore, tap a node for detail.</p>
-        <MemoryGraph height={540} />
+        <MemoryGraphContainer height={540} />
       </div>
     </div>
   );

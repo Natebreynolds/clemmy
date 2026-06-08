@@ -6,6 +6,7 @@
 export interface Bootstrap {
   token: string;
   version: string;
+  flags: { memory3d: boolean };
 }
 
 let cached: Bootstrap | null = null;
@@ -16,8 +17,14 @@ export function getBootstrap(): Bootstrap {
   cached = {
     token: typeof raw.token === 'string' ? raw.token : '',
     version: typeof raw.version === 'string' ? raw.version : '',
+    flags: { memory3d: raw.flags?.memory3d === true },
   };
   return cached;
+}
+
+/** Opt-in 3D Memory Constellation (server flag CLEMENTINE_MEMORY_3D, default off). */
+export function isMemory3dEnabled(): boolean {
+  return getBootstrap().flags.memory3d;
 }
 
 /**

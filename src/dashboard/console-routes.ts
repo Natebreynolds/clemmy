@@ -23,11 +23,12 @@ import {
 import { getComposioRuntimeStatus } from '../integrations/composio/client.js';
 import { getGitHubCliStatus } from '../integrations/github-cli.js';
 import { recallHybrid, getRecallStats } from '../memory/recall.js';
-import { bufferToVector, readEmbeddingStats } from '../memory/embeddings.js';
+import { readEmbeddingStats } from '../memory/embeddings.js';
 import { FACT_KINDS, forgetFact, getFact, listActiveFacts, listAllFacts, reactivateFact, rememberFact, searchFacts, setFactPinned, updateFact } from '../memory/facts.js';
 import { listResourcePointers, countResourcePointers, isSourceMapEnabled } from '../memory/source-map.js';
 import { readHygieneAudit } from '../memory/hygiene-audit.js';
 import { openMemoryDb } from '../memory/db.js';
+import { buildMemoryGraph } from './memory-graph.js';
 import {
   getFocusSnapshot,
   activateFocus as activateFocusRow,
@@ -358,117 +359,9 @@ const CONTEXT_FILES: ContextFileDefinition[] = [
   },
 ];
 
-// ── Semantic 3D layout for the knowledge graph ──────────────────────
-// Project fact embeddings (1536-dim) → 3D via PCA so semantically similar
-// facts cluster in space. Uses the Gram-matrix trick (features ≫ samples):
-// the top-3 eigenvectors of the N×N Gram matrix give the PCA scores
-// directly as score_k(i) = √λ_k · u_k[i]. Dependency-free power iteration;
-// N ≤ 300 so this is cheap. Result cached by fact-set signature.
-let semanticPosCache: { key: string; positions: Map<number, [number, number, number]> } | null = null;
-
-function computeSemanticFactPositions(
-  db: ReturnType<typeof openMemoryDb>,
-  factIds: number[],
-): Map<number, [number, number, number]> | null {
-  if (factIds.length < 4) return null;
-  const key = factIds.slice().sort((a, b) => a - b).join(',');
-  if (semanticPosCache && semanticPosCache.key === key) return semanticPosCache.positions;
-
-  const placeholders = factIds.map(() => '?').join(',');
-  const rows = db.prepare(
-    `SELECT fact_id, vector FROM fact_embeddings WHERE fact_id IN (${placeholders})`,
-  ).all(...factIds) as Array<{ fact_id: number; vector: Buffer }>;
-  if (rows.length < 4) return null;
-
-  const ids: number[] = [];
-  const vecs: Float32Array[] = [];
-  for (const r of rows) {
-    const v = bufferToVector(r.vector);
-    if (v && v.length > 0) { ids.push(r.fact_id); vecs.push(v); }
-  }
-  const n = vecs.length;
-  if (n < 4) return null;
-  const dim = vecs[0].length;
-
-  // Center the vectors (subtract the mean) — PCA operates on centered data.
-  const mean = new Float64Array(dim);
-  for (const v of vecs) for (let d = 0; d < dim; d++) mean[d] += v[d];
-  for (let d = 0; d < dim; d++) mean[d] /= n;
-  const centered: Float64Array[] = vecs.map((v) => {
-    const c = new Float64Array(dim);
-    for (let d = 0; d < dim; d++) c[d] = v[d] - mean[d];
-    return c;
-  });
-
-  // Gram matrix G = Xc · Xcᵀ  (n × n, symmetric).
-  const G: Float64Array[] = [];
-  for (let i = 0; i < n; i++) {
-    const gi = new Float64Array(n);
-    for (let j = 0; j <= i; j++) {
-      let dot = 0;
-      const a = centered[i], b = centered[j];
-      for (let d = 0; d < dim; d++) dot += a[d] * b[d];
-      gi[j] = dot;
-      if (j < i) G[j][i] = dot; // symmetric fill
-    }
-    G.push(gi);
-  }
-  for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) G[i][j] = G[j][i];
-
-  // Deterministic non-degenerate seed (no Math.random → stable + cacheable).
-  const seed = (i: number) => Math.sin((i + 1) * 12.9898) * 43758.5453 % 1;
-  const matVec = (M: Float64Array[], x: Float64Array) => {
-    const y = new Float64Array(n);
-    for (let i = 0; i < n; i++) { let s = 0; const row = M[i]; for (let j = 0; j < n; j++) s += row[j] * x[j]; y[i] = s; }
-    return y;
-  };
-  const norm = (x: Float64Array) => { let s = 0; for (let i = 0; i < n; i++) s += x[i] * x[i]; return Math.sqrt(s); };
-
-  // Power iteration + deflation for the top 3 eigenpairs.
-  const comps: Array<{ vec: Float64Array; val: number }> = [];
-  const work = G.map((r) => Float64Array.from(r)); // deflated copy
-  for (let k = 0; k < 3; k++) {
-    let x = new Float64Array(n);
-    for (let i = 0; i < n; i++) x[i] = seed(i + k * 7) || 0.01;
-    let nrm = norm(x) || 1;
-    for (let i = 0; i < n; i++) x[i] /= nrm;
-    let lambda = 0;
-    for (let iter = 0; iter < 100; iter++) {
-      const y = matVec(work, x);
-      nrm = norm(y);
-      if (nrm < 1e-9) break;
-      for (let i = 0; i < n; i++) y[i] /= nrm;
-      let diff = 0; for (let i = 0; i < n; i++) diff += Math.abs(y[i] - x[i]);
-      x = y;
-      lambda = nrm;
-      if (diff < 1e-6) break;
-    }
-    comps.push({ vec: x, val: lambda });
-    // Deflate: work -= lambda · x xᵀ
-    for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) work[i][j] -= lambda * x[i] * x[j];
-  }
-
-  // Scores: coord_k(i) = √λ_k · u_k[i]. Then scale to a pleasant range.
-  const coords: Array<[number, number, number]> = [];
-  let maxAbs = 1e-6;
-  for (let i = 0; i < n; i++) {
-    const c: [number, number, number] = [
-      Math.sqrt(Math.max(0, comps[0].val)) * comps[0].vec[i],
-      Math.sqrt(Math.max(0, comps[1].val)) * comps[1].vec[i],
-      Math.sqrt(Math.max(0, comps[2].val)) * comps[2].vec[i],
-    ];
-    coords.push(c);
-    maxAbs = Math.max(maxAbs, Math.abs(c[0]), Math.abs(c[1]), Math.abs(c[2]));
-  }
-  const scale = 160 / maxAbs;
-  const positions = new Map<number, [number, number, number]>();
-  for (let i = 0; i < n; i++) {
-    positions.set(ids[i], [coords[i][0] * scale, coords[i][1] * scale, coords[i][2] * scale]);
-  }
-
-  semanticPosCache = { key, positions };
-  return positions;
-}
+// Knowledge-graph construction (fact/kind/file/entity nodes, semantic edges,
+// PCA 3D positions) lives in ./memory-graph.ts so the route, the offline
+// snapshot dumper, and tests all share one tested builder.
 
 function contextFileForKey(key: string): ContextFileDefinition | undefined {
   return CONTEXT_FILES.find((file) => file.key === key);
@@ -1495,178 +1388,41 @@ export function registerConsoleRoutes(
    * panel renders this as a browsable file tree on the left side.
    */
   /**
-   * Build a {nodes, edges} graph payload for the Memory tab visualizer.
+   * Build a {nodes, edges, meta} graph payload for the Memory tab visualizer.
+   * Thin wrapper over buildMemoryGraph (./memory-graph.ts).
    *
-   * Nodes:
-   *   - fact     — durable knowledge entries
-   *   - file     — indexed vault files (path-based)
-   *   - kind     — fact kind clusters (user/project/feedback/reference)
+   * Nodes: fact · kind · file · entity.
+   * Edges: kind (fact→kind) · mentions (fact→file) · entity (fact→entity) ·
+   *        similar (fact↔fact semantic, opt-in via ?simEdges).
    *
-   * Edges:
-   *   - fact → kind   (every fact connects to its kind cluster)
-   *   - fact → file   (when the fact text mentions the file's name)
+   * Query params (all optional, clamped):
+   *   facts (10–300, def 100) · files (10–200, def 60) · entities (0–150, def 80)
+   *   layout=semantic            → attach PCA fx/fy/fz seed positions to facts
+   *   simEdges=<K> (0–8, def 0)  → top-K semantic neighbours per fact; 0 = off
+   *   simThreshold (0.40–0.95, def 0.70) · simCap (0–1500, def 300)
+   *   cluster=kind|auto (def kind)
    *
-   * Caps: 100 facts + 60 files by default to keep the layout snappy.
+   * The bare URL (no new params) is byte-compatible with the prior route.
    */
   app.get('/api/console/memory/graph', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
-      const factsLimit = Math.max(10, Math.min(300, parseInt(typeof req.query.facts === 'string' ? req.query.facts : '100', 10) || 100));
-      const filesLimit = Math.max(10, Math.min(200, parseInt(typeof req.query.files === 'string' ? req.query.files : '60', 10) || 60));
-
-      const facts = listActiveFacts({ limit: factsLimit });
+      const intParam = (v: unknown, def: number) =>
+        typeof v === 'string' && v.trim() !== '' ? (parseInt(v, 10) || def) : def;
+      const floatParam = (v: unknown, def: number) =>
+        typeof v === 'string' && v.trim() !== '' ? (Number.parseFloat(v) || def) : def;
       const db = openMemoryDb();
-      const files = db.prepare(`
-        SELECT path, MAX(mtime) AS mtime, COUNT(*) AS chunks
-        FROM vault_chunks
-        GROUP BY path
-        ORDER BY MAX(mtime) DESC
-        LIMIT ?
-      `).all(filesLimit) as Array<{ path: string; mtime: number; chunks: number }>;
-
-      const KIND_SET = new Set<string>();
-      for (const f of facts) if (f.kind) KIND_SET.add(f.kind);
-      const kinds = Array.from(KIND_SET);
-
-      const nodes: Array<{ id: string; label: string; type: string; data?: Record<string, unknown> }> = [];
-      const edges: Array<{ id: string; source: string; target: string; type: string }> = [];
-
-      // Kind cluster nodes.
-      for (const kind of kinds) {
-        nodes.push({ id: `kind:${kind}`, label: kind.toUpperCase(), type: 'kind' });
-      }
-
-      // Fact nodes + fact→kind edges.
-      const fileBasenames = files.map((f) => {
-        const base = path.basename(f.path, path.extname(f.path));
-        return { path: f.path, base, baseLower: base.toLowerCase() };
+      const result = buildMemoryGraph(db, {
+        factsLimit: intParam(req.query.facts, 100),
+        filesLimit: intParam(req.query.files, 60),
+        entitiesLimit: intParam(req.query.entities, 80),
+        semanticLayout: req.query.layout === 'semantic',
+        simEdges: intParam(req.query.simEdges, 0),
+        simThreshold: floatParam(req.query.simThreshold, 0.70),
+        simCap: intParam(req.query.simCap, 300),
+        clusterMode: req.query.cluster === 'auto' ? 'auto' : 'kind',
       });
-
-      for (const fact of facts) {
-        const id = `fact:${fact.id}`;
-        const summary = (fact.content || '(fact)').trim().split('\n')[0].slice(0, 60);
-        nodes.push({
-          id,
-          label: summary,
-          type: 'fact',
-          data: { kind: fact.kind, content: fact.content?.slice(0, 600), source: fact.source },
-        });
-        if (fact.kind) {
-          edges.push({ id: `${id}->kind:${fact.kind}`, source: id, target: `kind:${fact.kind}`, type: 'kind' });
-        }
-        // Fact → file edges when the fact text mentions a file basename.
-        const lower = (fact.content || '').toLowerCase();
-        if (lower.length > 0) {
-          for (const f of fileBasenames) {
-            if (f.baseLower.length < 4) continue; // skip tiny names
-            if (lower.includes(f.baseLower)) {
-              edges.push({ id: `${id}->file:${f.path}`, source: id, target: `file:${f.path}`, type: 'mentions' });
-            }
-          }
-        }
-      }
-
-      // File nodes — only include files that either have an inbound edge
-      // OR are recently-active (top 30 by mtime).
-      const referencedFilePaths = new Set(edges.filter((e) => e.target.startsWith('file:')).map((e) => e.target.slice(5)));
-      const recentTop = files.slice(0, 30).map((f) => f.path);
-      for (const path of recentTop) referencedFilePaths.add(path);
-
-      for (const f of files) {
-        if (!referencedFilePaths.has(f.path)) continue;
-        nodes.push({
-          id: `file:${f.path}`,
-          label: f.path.split('/').slice(-2).join('/'),
-          type: 'file',
-          data: { chunks: f.chunks, mtime: f.mtime },
-        });
-      }
-
-      // Entity nodes — the `entities` registry (people/companies/projects/
-      // places/things). There is NO stored fact↔entity link, so edges are
-      // DERIVED by matching an entity's canonical name / aliases (≥4 chars)
-      // inside fact content — the same substring technique used for files.
-      const entitiesLimit = Math.max(0, Math.min(150, parseInt(typeof req.query.entities === 'string' ? req.query.entities : '80', 10) || 80));
-      if (entitiesLimit > 0) {
-        const entityRows = db.prepare(`
-          SELECT id, entity_type, canonical_name, canonical_name_lc, aliases_json, mention_count
-          FROM entities
-          ORDER BY mention_count DESC, last_seen_at DESC
-          LIMIT ?
-        `).all(entitiesLimit) as Array<{ id: number; entity_type: string; canonical_name: string; canonical_name_lc: string; aliases_json: string | null; mention_count: number }>;
-
-        const entityMatchers = entityRows.map((e) => {
-          const names = new Set<string>();
-          if (e.canonical_name_lc && e.canonical_name_lc.length >= 4) names.add(e.canonical_name_lc);
-          try {
-            const aliases = e.aliases_json ? JSON.parse(e.aliases_json) : [];
-            if (Array.isArray(aliases)) {
-              for (const a of aliases) {
-                const al = String(a || '').trim().toLowerCase();
-                if (al.length >= 4) names.add(al);
-              }
-            }
-          } catch { /* malformed aliases — skip */ }
-          return { row: e, names: Array.from(names) };
-        });
-
-        const referencedEntityIds = new Set<number>();
-        for (const fact of facts) {
-          const lower = (fact.content || '').toLowerCase();
-          if (!lower) continue;
-          for (const m of entityMatchers) {
-            if (m.names.some((n) => lower.includes(n))) {
-              referencedEntityIds.add(m.row.id);
-              edges.push({ id: `fact:${fact.id}->entity:${m.row.id}`, source: `fact:${fact.id}`, target: `entity:${m.row.id}`, type: 'entity' });
-            }
-          }
-        }
-
-        // Include an entity node if it linked to a fact OR is among the
-        // top ~30 most-mentioned (so prominent entities still show).
-        const topEntityIds = new Set(entityRows.slice(0, 30).map((e) => e.id));
-        for (const e of entityRows) {
-          if (!referencedEntityIds.has(e.id) && !topEntityIds.has(e.id)) continue;
-          nodes.push({
-            id: `entity:${e.id}`,
-            label: e.canonical_name,
-            type: 'entity',
-            data: { entity_type: e.entity_type, mention_count: e.mention_count },
-          });
-        }
-      }
-
-      // Phase 4 — optional semantic 3D layout. ?layout=semantic projects
-      // fact embeddings (1536-dim) → 3D via PCA and attaches fixed fx/fy/fz
-      // to fact nodes so semantically-similar facts cluster in space.
-      if (req.query.layout === 'semantic') {
-        try {
-          const positions = computeSemanticFactPositions(db, facts.map((f) => f.id));
-          if (positions) {
-            for (const node of nodes) {
-              if (node.type !== 'fact') continue;
-              const fid = Number(String(node.id).slice('fact:'.length));
-              const p = positions.get(fid);
-              if (p) {
-                node.data = { ...(node.data || {}), fx: p[0], fy: p[1], fz: p[2] };
-              }
-            }
-          }
-        } catch { /* embeddings unavailable — fall back to force layout */ }
-      }
-
-      res.json({
-        nodes,
-        edges,
-        meta: {
-          factCount: facts.length,
-          fileCount: nodes.filter((n) => n.type === 'file').length,
-          kindCount: kinds.length,
-          entityCount: nodes.filter((n) => n.type === 'entity').length,
-          edgeCount: edges.length,
-          semantic: req.query.layout === 'semantic',
-        },
-      });
+      res.json(result);
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

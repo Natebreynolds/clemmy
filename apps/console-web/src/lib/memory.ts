@@ -94,5 +94,33 @@ export interface SourcePointer { id: number | string; app: string; kind?: string
 export const getSourceMap = () => apiGet<{ enabled?: boolean; count?: number; pointers?: SourcePointer[] }>('/api/console/memory/source-map');
 
 export interface GraphNode { id: string; label: string; type: string; data?: Record<string, unknown> }
-export interface GraphEdge { id: string; source: string; target: string; type: string }
-export const getGraph = () => apiGet<{ nodes: GraphNode[]; edges: GraphEdge[] }>('/api/console/memory/graph');
+export interface GraphEdge { id: string; source: string; target: string; type: string; weight?: number }
+export interface GraphMeta {
+  factCount?: number; fileCount?: number; kindCount?: number; entityCount?: number; edgeCount?: number;
+  semantic?: boolean;
+  semanticEdges?: { enabled: boolean; requested: number; threshold: number; cap: number; count: number; embeddedFacts: number; skippedNoEmbedding: number };
+  clustering?: { mode: string; clusters: number };
+}
+export interface GraphResponse { nodes: GraphNode[]; edges: GraphEdge[]; meta?: GraphMeta }
+export interface GraphParams {
+  layout?: 'semantic';
+  simEdges?: number; simThreshold?: number; simCap?: number;
+  facts?: number; files?: number; entities?: number;
+}
+/**
+ * Fetch the memory graph. Called with no args → the bare URL (byte-compatible
+ * with the legacy 2D view). Pass params to request 3D semantic layout +
+ * fact↔fact similarity edges, e.g. getGraph({ layout: 'semantic', simEdges: 3 }).
+ */
+export const getGraph = (params?: GraphParams) => {
+  const qs = new URLSearchParams();
+  if (params?.layout) qs.set('layout', params.layout);
+  if (params?.simEdges != null) qs.set('simEdges', String(params.simEdges));
+  if (params?.simThreshold != null) qs.set('simThreshold', String(params.simThreshold));
+  if (params?.simCap != null) qs.set('simCap', String(params.simCap));
+  if (params?.facts != null) qs.set('facts', String(params.facts));
+  if (params?.files != null) qs.set('files', String(params.files));
+  if (params?.entities != null) qs.set('entities', String(params.entities));
+  const q = qs.toString();
+  return apiGet<GraphResponse>(`/api/console/memory/graph${q ? `?${q}` : ''}`);
+};

@@ -22,6 +22,19 @@ export default defineConfig({
     // Keeping every font/asset as a real file under /console/assets/
     // keeps everything CSP-clean.
     assetsInlineLimit: 0,
+    rollupOptions: {
+      output: {
+        // Coalesce the (lazy-loaded) 3D graph stack into one cacheable chunk
+        // so three.js never lands in the main bundle — it's only fetched when
+        // the Memory tab's 3D view is opened.
+        manualChunks(id: string) {
+          if (/node_modules\/(three|react-force-graph-3d|3d-force-graph|three-forcegraph|three-render-objects)\//.test(id)) {
+            return 'graph3d';
+          }
+          return undefined;
+        },
+      },
+    },
   },
   // Dev: `npm run dev` serves at http://127.0.0.1:5174/console/ and
   // proxies API + shared asset paths straight to the local daemon so the

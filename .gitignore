@@ -13,6 +13,11 @@ dist/
 *.log
 logs/
 
+# Local 3D memory-graph artifacts — contain REAL memory data, never commit.
+# Regenerate the snapshot/prototype any time with: npx tsx scripts/dump-memory-graph.ts
+/scripts/memory-graph-snapshot.json
+/clementine-memory-constellation.html
+
 # Build / packaging artifacts
 *.tgz
 release/
