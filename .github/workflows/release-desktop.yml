@@ -86,6 +86,17 @@ jobs:
             exit 1
           fi
 
+      - name: Sync app version from the pushed tag
+        working-directory: apps/desktop
+        # electron-builder versions the app (and its latest-mac.yml update feed)
+        # from apps/desktop/package.json. The release-bump commit only updates the
+        # ROOT package.json, so the desktop app stayed frozen at whatever version
+        # apps/desktop/package.json last held — every release since republished
+        # that stale version and the auto-updater never advanced (users stuck on
+        # an old build seeing "up to date"). Make the pushed tag authoritative so
+        # the two can never desync again.
+        run: npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version --allow-same-version
+
       - name: Build + sign + notarize (no publish)
         working-directory: apps/desktop
         env:
