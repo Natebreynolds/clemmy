@@ -60,8 +60,13 @@ test('MCP shim appends the run_worker advisory on the 3rd serial same-shape nati
 });
 
 test('MCP shim emits the forEach variant (not run_worker) when the session is a workflow step', async () => {
-  const slug = 'firecrawl';
-  const tool = 'scrape';
+  // A READ tool (like the other tests): the forEach-vs-run_worker choice keys on
+  // the session being a workflow step, NOT on the tool. Using a write-classified
+  // tool here would hit the approval gate under the default (strict/balanced)
+  // policy in CI and throw before the advisory runs — the gate is orthogonal to
+  // what this test checks.
+  const slug = 'dataforseo';
+  const tool = 'serp_organic_live_advanced';
   const shim = createMcpNamespaceShim({ servers: [makeFakeServer(slug, tool)] });
   const namespaced = namespaceToolName(slugifyServerName(slug), tool);
 
