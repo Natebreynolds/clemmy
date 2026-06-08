@@ -24,8 +24,10 @@ import { cn } from '@/lib/cn';
 const reduceMotion = () =>
   typeof window !== 'undefined' && !!window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
 
-// Above this node count we bail to the 2D view (keeps the WebGL path snappy).
-const MAX_3D_NODES = 1400;
+function hasWebGL(): boolean {
+  try { const c = document.createElement('canvas'); return !!(c.getContext('webgl2') || c.getContext('webgl')); }
+  catch { return false; }
+}
 
 const KIND_COLOR: Record<string, string> = { project: '#FF8A3D', user: '#8FA2FF', feedback: '#FF73B9', reference: '#4FD8C4' };
 const COLOR = { kind: '#FF7A1A', entity: '#FFC24B', file: '#6FE0FF', similar: '#B58CFF' };
@@ -69,14 +71,14 @@ const TYPES = [
 
 interface Sel { label: string; type: string; content?: string; data?: Record<string, unknown>; connected: number }
 
-export default function KnowledgeGraph3D({ height = 540, onFallback }: { height?: number; onFallback?: (reason: string) => void }) {
+export default function KnowledgeGraph3D({ height = 540 }: { height?: number }) {
   const wrap = useRef<HTMLDivElement>(null);
   const fgRef = useRef<ForceGraphMethods<GNode, GLink> | undefined>(undefined);
   const orbitRaf = useRef<number | null>(null);
   const orbitAngle = useRef(0);
   const bloomPassRef = useRef<UnrealBloomPass | null>(null);
 
-  const [status, setStatus] = useState<'loading' | 'ready' | 'empty' | 'error'>('loading');
+  const [status, setStatus] = useState<'loading' | 'ready' | 'empty' | 'error' | 'nowebgl'>('loading');
   const [data, setData] = useState<{ nodes: GNode[]; links: GLink[] } | null>(null);
   const [counts, setCounts] = useState({ facts: 0, links: 0 });
   const [dims, setDims] = useState({ w: 0, h: height });
@@ -106,13 +108,13 @@ export default function KnowledgeGraph3D({ height = 540, onFallback }: { height?
   // ── fetch graph ────────────────────────────────────────────────────
   useEffect(() => {
     let cancelled = false;
+    if (!hasWebGL()) { setStatus('nowebgl'); return; }
     (async () => {
       try {
         const res = await getGraph({ layout: 'semantic', simEdges: 3, facts: 300, files: 80, entities: 100 });
         if (cancelled) return;
         const rawNodes = res.nodes ?? [];
         if (rawNodes.length === 0) { setStatus('empty'); return; }
-        if (rawNodes.length > MAX_3D_NODES) { onFallback?.('too-many-nodes'); return; }
         // clone + seed positions from PCA so the graph lands pre-clustered
         const nodes: GNode[] = rawNodes.map((n) => {
           const m: GNode = { ...n };
@@ -125,11 +127,11 @@ export default function KnowledgeGraph3D({ height = 540, onFallback }: { height?
         setCounts({ facts: nodes.filter((n) => n.type === 'fact').length, links: links.filter((l) => l.type === 'similar').length });
         setStatus('ready');
       } catch {
-        if (!cancelled) { setStatus('error'); onFallback?.('fetch-error'); }
+        if (!cancelled) setStatus('error');
       }
     })();
     return () => { cancelled = true; };
-  }, [onFallback]);
+  }, []);
 
   const nodeById = useMemo(() => {
     const m = new Map<string, GNode>();
@@ -350,6 +352,7 @@ export default function KnowledgeGraph3D({ height = 540, onFallback }: { height?
       {status === 'loading' && <Overlay>Igniting the constellation…</Overlay>}
       {status === 'empty' && <Overlay>Nothing to map yet — Clementine will fill this in as it learns.</Overlay>}
       {status === 'error' && <Overlay>Couldn’t load the graph.</Overlay>}
+      {status === 'nowebgl' && <Overlay>This view needs WebGL / hardware acceleration — enable it to see the constellation.</Overlay>}
 
       {sel && (
         <div className="absolute bottom-3 right-3 w-72 rounded-lg border border-white/15 bg-black/70 p-3 text-white shadow-lg backdrop-blur">

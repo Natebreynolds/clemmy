@@ -1,74 +1,42 @@
-import { Component, lazy, Suspense, useState, type ReactNode } from 'react';
+import { Component, lazy, Suspense, type ReactNode } from 'react';
 import { MemoryGraph } from './MemoryGraph';
 import { isMemory3dEnabled } from '@/lib/bootstrap';
-import { cn } from '@/lib/cn';
 
 /**
- * Hosts the Memory tab graph and the 2D⇄3D toggle.
+ * Hosts the Memory tab graph.
  *
- * - Flag CLEMENTINE_MEMORY_3D OFF (default) → renders the existing 2D
- *   Cytoscape MemoryGraph unchanged (byte-identical to before this feature).
- * - Flag ON → offers a 2D⇄3D toggle. 3D (KnowledgeGraph3D) is lazy-loaded so
- *   three.js ships as its own chunk, fetched only when 3D is shown. The 2D
- *   MemoryGraph stays the universal fallback for: no WebGL, the user's choice,
- *   oversized graphs, fetch/runtime errors (via the error boundary), and
- *   reduced-motion defaults.
+ * The 3D "Memory Constellation" (KnowledgeGraph3D) is THE view — lazy-loaded so
+ * three.js ships as its own chunk, fetched only when the Memory tab opens. There
+ * is intentionally no 2D toggle: the 3D component shows a graceful message if
+ * WebGL is unavailable or the data can't load (never blank), and the error
+ * boundary below shows a message if it ever throws. The legacy 2D Cytoscape
+ * MemoryGraph is kept ONLY as the kill-switch (CLEMENTINE_MEMORY_3D=off).
  */
 
 const KnowledgeGraph3D = lazy(() => import('./KnowledgeGraph3D'));
 
-const MODE_KEY = 'mem.graphMode';
-function hasWebGL(): boolean {
-  try { const c = document.createElement('canvas'); return !!(c.getContext('webgl2') || c.getContext('webgl')); }
-  catch { return false; }
-}
-const reduceMotion = () => typeof window !== 'undefined' && !!window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+const Box = ({ height, children }: { height: number; children: ReactNode }) => (
+  <div className="flex items-center justify-center rounded-xl border border-border bg-subtle px-6 text-center text-body text-muted" style={{ height }}>{children}</div>
+);
 
-/** If the 3D view throws at render time, silently fall back to 2D. */
-class GraphErrorBoundary extends Component<{ onError: () => void; children: ReactNode }, { failed: boolean }> {
+/** Shows a message (not a 2D fallback) if the 3D view ever throws at runtime. */
+class GraphErrorBoundary extends Component<{ children: ReactNode; height: number }, { failed: boolean }> {
   state = { failed: false };
   static getDerivedStateFromError() { return { failed: true }; }
-  componentDidCatch() { this.props.onError(); }
-  render() { return this.state.failed ? null : this.props.children; }
+  render() {
+    if (this.state.failed) return <Box height={this.props.height}>Couldn’t load the constellation. Reload the page to try again.</Box>;
+    return this.props.children;
+  }
 }
 
 export function MemoryGraphContainer({ height = 540 }: { height?: number }) {
-  const enabled = isMemory3dEnabled();
-  const webgl = enabled && hasWebGL();
-  const [mode, setMode] = useState<'2d' | '3d'>(() => {
-    if (!webgl) return '2d';
-    const saved = (typeof window !== 'undefined' && window.localStorage.getItem(MODE_KEY)) || '';
-    if (saved === '2d' || saved === '3d') return saved;
-    return reduceMotion() ? '2d' : '3d';
-  });
-  const choose = (m: '2d' | '3d') => { setMode(m); try { window.localStorage.setItem(MODE_KEY, m); } catch { /* ignore */ } };
-
-  // Flag off → unchanged behaviour.
-  if (!enabled) return <MemoryGraph height={height} />;
-
+  // Kill-switch only: CLEMENTINE_MEMORY_3D=off renders the legacy 2D graph.
+  if (!isMemory3dEnabled()) return <MemoryGraph height={height} />;
   return (
-    <div className="relative">
-      {webgl && (
-        <div className="absolute left-1/2 top-3 z-10 -translate-x-1/2">
-          <div className="flex rounded-full border border-border bg-surface/90 p-0.5 shadow-xs backdrop-blur">
-            {(['3d', '2d'] as const).map((m) => (
-              <button key={m} type="button" onClick={() => choose(m)}
-                className={cn('rounded-full px-3 py-1 text-caption font-semibold uppercase transition-colors cursor-pointer',
-                  mode === m ? 'bg-primary text-white' : 'text-muted hover:text-fg')}>{m}</button>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {mode === '3d' && webgl ? (
-        <GraphErrorBoundary onError={() => choose('2d')}>
-          <Suspense fallback={<div className="flex items-center justify-center rounded-xl border border-border bg-subtle text-body text-muted" style={{ height }}>Loading the constellation…</div>}>
-            <KnowledgeGraph3D height={height} onFallback={() => choose('2d')} />
-          </Suspense>
-        </GraphErrorBoundary>
-      ) : (
-        <MemoryGraph height={height} />
-      )}
-    </div>
+    <GraphErrorBoundary height={height}>
+      <Suspense fallback={<Box height={height}>Loading the constellation…</Box>}>
+        <KnowledgeGraph3D height={height} />
+      </Suspense>
+    </GraphErrorBoundary>
   );
 }
