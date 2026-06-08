@@ -10,7 +10,7 @@
  * surface) and mcp-server.ts (the standalone MCP server), gated by the
  * CLEMENTINE_SPACES flag — mirrors registerWorkflowScheduleTools.
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, statSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -97,6 +97,21 @@ function toDataSource(raw: z.infer<typeof dataSourceShape>): SpaceDataSource {
   return ds;
 }
 
+/** Best-effort row count for a refreshed source's data — an array's length, or
+ *  the first array one level down (e.g. {contacts:[...]} → contacts.length).
+ *  null when there's no obvious row collection (a scalar/object payload). */
+function countRows(val: unknown): number | null {
+  if (Array.isArray(val)) return val.length;
+  if (val && typeof val === 'object') {
+    for (const k of Object.keys(val as Record<string, unknown>)) {
+      if (k === '_meta') continue;
+      const v = (val as Record<string, unknown>)[k];
+      if (Array.isArray(v)) return v.length;
+    }
+  }
+  return null;
+}
+
 export function registerSpaceTools(server: McpServer): void {
   server.tool(
     'space_save',
@@ -105,6 +120,8 @@ export function registerSpaceTools(server: McpServer): void {
       'FIRST write the self-contained view with write_file (inline CSS/JS only — external CDNs are blocked by CSP). Save it under ~/.clementine-next/spaces/<slug>/view/index.html (or any path inside ~/.clementine-next), then call this with view_path pointing at it.',
       'The view calls same-origin data routes the user opens in the desktop: GET /api/console/spaces/<slug>/data, POST /api/console/spaces/<slug>/notes. It can call any /api endpoint (it inherits the session).',
       'Optionally declare data_sources (a deterministic script that prints JSON, or a Composio op) so the workspace can refresh its data server-side without spending tokens.',
+      'RUNNER CONTRACT (when a data source is a script — .mjs/.js/.ts/.py/.sh): it runs SERVER-SIDE with NO LLM and a SCRUBBED env (PATH/HOME/locale only — NO API keys or daemon secrets). It receives a JSON payload on stdin and MUST print the dataset as JSON to stdout and NOTHING else (a stray console.log/print corrupts the parse). Exit non-zero on failure. Use only language built-ins + (node) global fetch — there is NO node_modules, so no npm imports. It MAY shell out to CLIs on PATH (e.g. `sf`, `gh`), which read their own auth from $HOME. For anything that needs a secret/OAuth, declare a Composio op (composio_slug) instead of a runner. The view reads each source at data["<sourceId>"] from GET /api/console/spaces/<slug>/data.',
+      'Changing a data source (or editing its runner file) auto-refreshes on save and reports the row count, so you can confirm the new data before telling the user it is done.',
       'Returns the workspace URL and a summary. The prior view is snapshotted for one-click revert.',
     ].join('\n'),
     {
@@ -176,7 +193,17 @@ export function registerSpaceTools(server: McpServer): void {
       // question. Only run when sources were declared/changed (keeps view-only
       // edits fast).
       let smoke: Awaited<ReturnType<typeof runSpaceCreationSmoke>> | null = null;
-      const shouldSmoke = record.dataSources.length > 0 && (!existing || data_sources != null || actions != null);
+      // Also refresh when a runner FILE changed since the last pull, even if
+      // data_sources wasn't re-passed — so editing the data-pull script and
+      // re-saving actually re-runs it (the "I edited the filter but the data
+      // didn't change" gap). View-only metadata re-saves stay fast.
+      const lastRefreshMs = existing?.lastRefreshedAt ? Date.parse(existing.lastRefreshedAt) : 0;
+      const runnerChanged = !!existing && record.dataSources.some((s) => {
+        if (!s.runner) return false;
+        try { return statSync(resolveInSpace(slug, path.join('data', s.runner))).mtimeMs > (Number.isFinite(lastRefreshMs) ? lastRefreshMs : 0); }
+        catch { return false; }
+      });
+      const shouldSmoke = record.dataSources.length > 0 && (!existing || data_sources != null || actions != null || runnerChanged);
       if (shouldSmoke) {
         smoke = await runSpaceCreationSmoke(slug);
         if (smoke.failed.length > 0) {
@@ -194,13 +221,18 @@ export function registerSpaceTools(server: McpServer): void {
       let smokeNote = '';
       if (smoke) {
         const parts: string[] = [];
+        // Per-source refresh outcome (row counts) so a data edit is never reported
+        // "done" while the surface still shows stale rows.
+        const failedIds = new Set(smoke.failed.map((f) => f.id));
+        const dataNow = (() => { try { return readData(slug) as Record<string, unknown>; } catch { return {}; } })();
+        const refreshed = record.dataSources
+          .filter((s) => !failedIds.has(s.id))
+          .map((s) => { const n = countRows(dataNow?.[s.id]); return `${s.id} (${n == null ? 'ok' : `${n} row${n === 1 ? '' : 's'}`})`; });
+        if (refreshed.length > 0) parts.push(`Data refreshed: ${refreshed.join(', ')}.`);
         if (smoke.failed.length > 0) {
           parts.push(`Creation smoke PARKED this Workspace as PAUSED — fix and re-save:\n- ${smoke.failed.map((f) => `source "${f.id}": ${f.error}`).join('\n- ')}`);
         }
         if (smoke.actionWarnings.length > 0) parts.push(smoke.actionWarnings.map((w) => `- ${w}`).join('\n'));
-        if (smoke.failed.length === 0 && smoke.empty.length === 0 && smoke.actionWarnings.length === 0) {
-          parts.push('Creation smoke passed — data sources returned real data.');
-        }
         if (parts.length > 0) smokeNote = `\n\n${parts.join('\n\n')}`;
       }
       // Soft gap test (mirror of renderWorkflowGapQuestions) — clarifying
