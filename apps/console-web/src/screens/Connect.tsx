@@ -16,6 +16,7 @@ import { usePoll } from '@/lib/poll';
 import {
   getComposioStatus, getComposioToolkits, authorizeComposio, refreshComposio, disconnectComposio, activeConnectionId,
   getCredentials, setCredential, setDiscordOwner,
+  codexReauthLocal, codexDeviceBegin, codexDevicePoll,
   normalizeCredentialRows, isConnected, CODEX_MANAGED_SECRETS,
   connectedToolkits, searchToolkits, toolkitStatus,
   type CredentialRow, type CredentialDescriptor, type ComposioToolkit,
@@ -277,8 +278,89 @@ function CredentialCard({ row, descriptor, discordAllowedUsers, codexSignedIn = 
         </div>
       )}
       {error && <p className="mt-2 text-caption text-danger">{error}</p>}
+      {name === 'codex_oauth_access_token' && <CodexReauth signedIn={connected} onDone={onSaved} />}
       {showDiscordOwner && <DiscordOwnerField initial={discordAllowedUsers ?? ''} onSaved={onSaved} />}
     </Card>
+  );
+}
+
+// Codex re-auth — a faithful port of the legacy console's proven flow
+// (src/dashboard/console.ts:24832-24934). Same daemon endpoints, same states.
+// LOCAL: opens a browser + loopback callback on the daemon (desktop only →
+// gated on window.clemmy). REMOTE: device-code flow that works from any device.
+const isDesktop = () => typeof window !== 'undefined' && !!window.clemmy;
+
+function CodexReauth({ signedIn, onDone }: { signedIn: boolean; onDone: () => void }) {
+  const [localState, setLocalState] = useState<'idle' | 'opening' | 'done'>('idle');
+  const [localErr, setLocalErr] = useState('');
+  const [device, setDevice] = useState<{ uri: string; code: string } | null>(null);
+  const [deviceStatus, setDeviceStatus] = useState('');
+  const [deviceBusy, setDeviceBusy] = useState(false);
+
+  const runLocal = async () => {
+    setLocalErr(''); setLocalState('opening');
+    try {
+      const r = await codexReauthLocal();
+      if (r && r.ok) {
+        setLocalState('done'); onDone();
+        setTimeout(() => setLocalState('idle'), 2500);
+      } else {
+        setLocalState('idle'); setLocalErr((r && (r.message || r.error)) || 'Re-auth failed.');
+      }
+    } catch (e) { setLocalState('idle'); setLocalErr((e as Error).message || 'Re-auth failed.'); }
+  };
+
+  const runRemote = async () => {
+    setLocalErr(''); setDeviceBusy(true); setDeviceStatus('Requesting a sign-in code…'); setDevice(null);
+    try {
+      const start = await codexDeviceBegin();
+      if (!start.loginId || !start.verificationUri || !start.userCode) {
+        setDeviceStatus(`Couldn't start device login: ${start.error || start.message || 'unknown error'}`); setDeviceBusy(false); return;
+      }
+      setDevice({ uri: start.verificationUri, code: start.userCode });
+      setDeviceStatus('Waiting for sign-in…');
+      const intervalMs = Math.max(3, start.intervalSeconds || 5) * 1000;
+      const expiresAt = start.expiresAt ? Date.parse(start.expiresAt) : Date.now() + 900_000;
+      const loginId = start.loginId;
+      const poll = async () => {
+        if (Date.now() > expiresAt) { setDeviceStatus('Code expired — click “Sign in on another device” to retry.'); setDeviceBusy(false); return; }
+        try {
+          const res = await codexDevicePoll(loginId);
+          if (res.status === 'complete') {
+            setDeviceStatus('Signed in ✓'); onDone();
+            setTimeout(() => { setDevice(null); setDeviceStatus(''); setDeviceBusy(false); }, 2500);
+            return;
+          }
+          if (res.status === 'expired') { setDeviceStatus('Code expired — try again.'); setDeviceBusy(false); return; }
+          setDeviceStatus('Waiting for sign-in…'); setTimeout(poll, intervalMs); // pending
+        } catch { setDeviceStatus('Network hiccup — retrying…'); setTimeout(poll, intervalMs); }
+      };
+      setTimeout(poll, intervalMs);
+    } catch (e) { setDeviceStatus(`Device login failed: ${(e as Error).message}`); setDeviceBusy(false); }
+  };
+
+  return (
+    <div className="mt-3 border-t border-border pt-3">
+      <div className="flex flex-wrap items-center gap-2">
+        {isDesktop() && (
+          <Button size="sm" onClick={runLocal} disabled={localState !== 'idle'}>
+            {localState === 'opening' ? <><Loader2 className="h-4 w-4 animate-spin" aria-hidden /> Opening browser…</>
+              : localState === 'done' ? <><Check className="h-4 w-4" aria-hidden /> Re-authenticated</>
+              : <><KeyRound className="h-4 w-4" aria-hidden /> {signedIn ? 'Re-authenticate' : 'Sign in'}</>}
+          </Button>
+        )}
+        <Button variant={isDesktop() ? 'ghost' : 'primary'} size="sm" onClick={runRemote} disabled={deviceBusy}>
+          <RotateCw className="h-4 w-4" aria-hidden /> Sign in on another device
+        </Button>
+      </div>
+      {localErr && <p className="mt-2 text-caption text-danger">{localErr}</p>}
+      {device && (
+        <div className="mt-2 rounded-md border border-border bg-subtle p-2.5 text-small text-muted">
+          Open <a href={device.uri} target="_blank" rel="noopener noreferrer" className="text-primary hover:underline">{device.uri}</a> and enter code: <b className="tracking-wide text-fg">{device.code}</b>
+        </div>
+      )}
+      {deviceStatus && <p className="mt-1 text-caption text-faint">{deviceStatus}</p>}
+    </div>
   );
 }
 
