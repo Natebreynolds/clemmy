@@ -60,6 +60,7 @@ import { verifyStepOutput } from './step-output-verify.js';
 import { judgeWorkflowTarget, type WorkflowTargetVerdict } from './workflow-objective-judge.js';
 import { judgeStepSkillExecution } from './workflow-step-judge.js';
 import { deliverOutcome } from '../runtime/outcome.js';
+import { rewriteInClementineVoice } from './voice-rewrite.js';
 import { reportedBackRunIdsFrom } from './workflow-watchdog.js';
 
 const logger = pino({ name: 'clementine-next.workflow-runner' });
@@ -2949,17 +2950,32 @@ async function processOneRunFile(
       });
       // Single report body (escalation banner prepended when auto-heal is
       // paused), reused for the notification, dashboard preview, and chat re-entry.
-      const reportBody = `${escalationBanner}${needsAttention ? outcome.body : successBody}${advisorySummary}`;
+      let reportBody = `${escalationBanner}${needsAttention ? outcome.body : successBody}${advisorySummary}`;
+      // Warm the tone into Clementine's voice + let her flag a routine no-op.
+      // Best-effort/fail-open: any hiccup returns the original text. We skip the
+      // already-silenced echo (token-free). A no-op silences ONLY a clean,
+      // scheduled (non-interactive) run — every guard below must be false.
+      const interactive = Boolean(run.originSessionId);
+      let runIsNoOp = false;
+      if (!stepAlreadyNotified) {
+        const lane: 'done' | 'blocked' = (needsAttention || hasAdvisories) ? 'blocked' : 'done';
+        const voiced = await rewriteInClementineVoice(reportBody, { workflowName: workflow.data.name, lane });
+        reportBody = voiced.message;
+        runIsNoOp = voiced.nothingHappened
+          && !needsAttention && !hasFailures && !hasAdvisories && !autoHealPaused && !interactive;
+      }
       addNotification({
         id: `${Date.now()}-workflow-${run.id}`,
         kind: 'workflow',
-        title: hasFailures && !needsAttention
-          ? `Workflow completed with ${forEachFailures.length} failure${forEachFailures.length === 1 ? '' : 's'}: ${workflow.data.name}`
-          // renderLegibleOutcome titles a no-blocked-step run "completed"; a
-          // target-miss is needs-attention with no blocked step, so title it honestly.
-          : targetMissed && blockedSteps.length === 0
-            ? `⚠️ Workflow needs attention: ${workflow.data.name}`
-            : outcome.title,
+        title: runIsNoOp
+          ? `Nothing new — ${workflow.data.name}`
+          : hasFailures && !needsAttention
+            ? `Workflow completed with ${forEachFailures.length} failure${forEachFailures.length === 1 ? '' : 's'}: ${workflow.data.name}`
+            // renderLegibleOutcome titles a no-blocked-step run "completed"; a
+            // target-miss is needs-attention with no blocked step, so title it honestly.
+            : targetMissed && blockedSteps.length === 0
+              ? `⚠️ Workflow needs attention: ${workflow.data.name}`
+              : outcome.title,
         // Send the full body. Discord delivery splits long content into
         // multiple messages; previous 2000-char slice cut off workflow
         // results above that length with no continuation. Quality advisories
@@ -2968,8 +2984,9 @@ async function processOneRunFile(
         createdAt: new Date().toISOString(),
         read: false,
         // Advisories must reach the user — never silence a run that has one.
-        // A chronic-failure escalation must also always deliver.
-        silent: stepAlreadyNotified && !hasAdvisories && !autoHealPaused,
+        // A chronic-failure escalation must also always deliver. A routine
+        // no-op goes dashboard-only (recorded + auditable, no Discord/push).
+        silent: (stepAlreadyNotified || runIsNoOp) && !hasAdvisories && !autoHealPaused,
         metadata: {
           workflow: workflow.data.name,
           runId: run.id,
@@ -2977,6 +2994,7 @@ async function processOneRunFile(
           needsAttention: needsAttention || undefined,
           proposedFixId: proposedFix?.id,
           qualityAdvisories: hasAdvisories ? qualityAdvisories : undefined,
+          ...(runIsNoOp ? { noOp: true, noOpReason: 'no new items' } : {}),
         },
       });
       markRunNotified(filePath);
@@ -2993,13 +3011,15 @@ async function processOneRunFile(
       } catch { /* best-effort */ }
       // Gap E: re-enter the origin chat in-context (no-op for scheduled/cron).
       // needs-attention OR a quality advisory → 'blocked' so Clem knows to
-      // review; a clean run → 'done'.
-      enqueueWorkflowOutcomeTurn(
-        run,
-        workflow.data.name,
-        needsAttention || hasAdvisories ? 'blocked' : 'done',
-        reportBody,
-      );
+      // review; a clean run → 'done'. A routine no-op never wakes the chat.
+      if (!runIsNoOp) {
+        enqueueWorkflowOutcomeTurn(
+          run,
+          workflow.data.name,
+          needsAttention || hasAdvisories ? 'blocked' : 'done',
+          reportBody,
+        );
+      }
       logger.info({ workflow: workflow.data.name, runId: run.id, partialFailures: forEachFailures.length, blockedSteps: blockedSteps.length, advisories: qualityAdvisories.length, diagnosed: !!diagnosis }, 'Workflow run completed');
     } catch (error) {
       // P0 parking: the run paused on a human approval. Checkpoint the
@@ -3122,6 +3142,13 @@ async function processOneRunFile(
           logger.warn({ err: healErr, runId: run.id }, 'contract-violation self-heal failed (best-effort)');
         }
       }
+      // Warm the failure tone too (fail-open, lane:'failed' so the rewrite can
+      // never claim success or drop the `apply fix <id>` action). A user CANCEL
+      // keeps the original text + is never rewritten. Failures are NEVER silenced.
+      let failureBody = `${errEscalationBanner}${healBody ?? message}`;
+      if (!cancelled) {
+        failureBody = (await rewriteInClementineVoice(failureBody, { workflowName: run.workflow, lane: 'failed' })).message;
+      }
       addNotification({
         // Stable id (terminal state fires once per run): addNotification
         // id-dedup makes this at-most-once and shares the cancelled id with the
@@ -3129,7 +3156,7 @@ async function processOneRunFile(
         id: `workflow-${run.id}-${cancelled ? 'cancelled' : 'error'}`,
         kind: 'workflow',
         title: healTitle ?? (cancelled ? `Workflow cancelled: ${run.workflow}` : `Workflow failed: ${run.workflow}`),
-        body: `${errEscalationBanner}${healBody ?? message}`,
+        body: failureBody,
         createdAt: new Date().toISOString(),
         read: false,
         metadata: {
@@ -3144,7 +3171,7 @@ async function processOneRunFile(
       // scheduled/cron). Skip a user-initiated CANCEL — the user already knows
       // (mirrors background-tasks skipping aborted).
       if (!cancelled) {
-        enqueueWorkflowOutcomeTurn(run, run.workflow, 'failed', `${errEscalationBanner}${healBody ?? message}`);
+        enqueueWorkflowOutcomeTurn(run, run.workflow, 'failed', failureBody);
       }
       try {
         finishRun(run.id, {

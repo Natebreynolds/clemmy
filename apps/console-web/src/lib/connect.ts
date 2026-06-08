@@ -62,6 +62,18 @@ export const getComposioStatus = () => apiGet<ComposioStatus>('/api/composio/sta
 export const getComposioToolkits = () => apiGet<ComposioSnapshot>('/api/composio/toolkits');
 export const authorizeComposio = (slug: string) =>
   apiPost<{ url?: string; redirectUrl?: string }>(`/api/composio/toolkits/${encodeURIComponent(slug)}/authorize`);
+// Reset the daemon's cached Composio client so the next status/toolkits read is fresh.
+export const refreshComposio = () => apiPost<{ ok: boolean }>('/api/composio/refresh');
+// Disconnect a connected app (deletes the connected account). Needs the connection id.
+export const disconnectComposio = (slug: string, connectionId: string) =>
+  apiPost<{ ok: boolean }>(`/api/composio/toolkits/${encodeURIComponent(slug)}/disconnect`, { connectionId });
+
+/** The connection id to act on — the ACTIVE one if present, else the first. */
+export function activeConnectionId(t: ComposioToolkit): string | undefined {
+  const conns = t.connections ?? [];
+  const active = conns.find((c) => (c.status ?? '').toUpperCase() === 'ACTIVE');
+  return (active ?? conns[0])?.id;
+}
 
 export const getCredentials = () =>
   apiGet<{ rows?: unknown; descriptors?: Record<string, CredentialDescriptor>; discordAllowedUsers?: string }>('/api/console/credentials');
@@ -80,7 +92,60 @@ export interface McpServerInput {
 export const addMcpServer = (body: McpServerInput) => apiPost('/api/console/mcp-servers', body);
 export const deleteMcpServer = (name: string) =>
   api(`/api/console/mcp-servers/${encodeURIComponent(name)}`, { method: 'DELETE' });
-export const getClis = () => apiGet<{ clis?: CliRow[]; cliCount?: number }>('/api/console/clis');
+export const getClis = () => apiGet<{ clis?: CliRow[]; cliCount?: number; detectedCount?: number }>('/api/console/clis');
+// User-saved CLIs the user explicitly told Clementine they use.
+export const getSavedClis = () => apiGet<{ saved: string[] }>('/api/console/clis/saved');
+export const saveCli = (command: string) => apiPost<{ saved: string[] }>('/api/console/clis/saved', { command });
+export const removeSavedCli = (command: string) =>
+  api<{ saved: string[] }>(`/api/console/clis/saved?command=${encodeURIComponent(command)}`, { method: 'DELETE' });
+// Live probe a single bare name (resolves even probe-skipped CLIs like sf).
+export const probeCli = (command: string) => apiGet<CliRow>(`/api/console/clis/probe?command=${encodeURIComponent(command)}`);
+
+// ─── Managed CLIs (auto-discovered: GitHub + Composio, with install/auth) ──
+export interface ManagedCliStatus {
+  installed: boolean;
+  path: string | null;
+  version: string | null;
+  authenticated: boolean;
+  authStatus: string;          // 'ok' | 'missing' | 'invalid' | 'error' | 'unknown'
+  authMessage: string | null;
+  username?: string | null;    // GitHub only
+}
+export interface ManagedClisResp {
+  github: ManagedCliStatus;
+  composio: { cli: ManagedCliStatus; enabled?: boolean; apiKeyPresent?: boolean; userId?: string };
+}
+export type ManagedCliKind = 'github' | 'composio';
+export type ManagedCliAction = 'install' | 'auth' | 'repair';
+export interface ManagedCliJob {
+  id: string; kind: string; action: string; title: string; command: string;
+  status: 'running' | 'succeeded' | 'failed'; output: string; exitCode?: number | null;
+}
+export const getManagedClis = () => apiGet<ManagedClisResp>('/api/console/managed-clis');
+export const startManagedCliJob = (kind: ManagedCliKind, action: ManagedCliAction) =>
+  apiPost<{ job: ManagedCliJob }>(`/api/console/managed-clis/${kind}/${action}`);
+export const getManagedCliJob = (id: string) =>
+  apiGet<{ job: ManagedCliJob }>(`/api/console/managed-cli-jobs/${encodeURIComponent(id)}`);
+
+// ─── CLI catalog (curated installable tools w/ install + auth metadata) ──
+export interface CatalogEntry {
+  id: string; name: string; command: string; vendor: string; description: string; tags: string[];
+  installCommand: string; installSource: string; authDocsUrl: string; authCommand?: string; homepage?: string;
+  installed?: boolean; resolvedPath?: string; score?: number;
+}
+export interface ConnectedCli {
+  id: string; command: string; vendor: string; name: string; installedAt: string; authDocsUrl: string; authCommand?: string;
+}
+export interface CatalogResp { query: string; results: CatalogEntry[]; connected: Record<string, ConnectedCli>; autoPromoted: string[] }
+export interface InstallJob { id: string; title: string; status: 'running' | 'succeeded' | 'failed'; output: string; exitCode?: number | null }
+
+export const getCliCatalog = (q?: string) =>
+  apiGet<CatalogResp>(`/api/console/cli-catalog${q ? `?q=${encodeURIComponent(q)}` : ''}`);
+export const installCatalogCli = (id: string) =>
+  apiPost<{ job: InstallJob; entry: CatalogEntry }>('/api/console/cli-catalog/install', { id });
+export const forgetCatalogCli = (id: string) => apiPost<{ ok: boolean }>('/api/console/cli-catalog/forget', { id });
+export const reconnectCatalogCli = (id: string) => apiPost('/api/console/cli-catalog/reconnect', { id });
+export const getInstallJob = (id: string) => apiGet<{ job: InstallJob }>(`/api/console/install-jobs/${encodeURIComponent(id)}`);
 
 export interface ProjectInfo { name: string; path: string; type?: string; description?: string; hasClaude?: boolean }
 export const getProjects = () => apiGet<{ workspaceDirs?: string[]; projects?: ProjectInfo[] }>('/api/console/projects');

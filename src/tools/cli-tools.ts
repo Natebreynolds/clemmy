@@ -1,6 +1,7 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { filterClis, getOrRefreshScan, probe, readCachedScan } from '../runtime/cli-discovery.js';
+import { getSavedClis } from '../runtime/saved-clis.js';
 import { textResult } from './shared.js';
 
 /**
@@ -43,6 +44,9 @@ export function registerCliTools(server: McpServer): void {
       if (exactFilter && /^[A-Za-z0-9._+-]+$/.test(exactFilter) && !refresh) {
         const entry = await probe(exactFilter);
         if (!entry) {
+          if (getSavedClis().includes(exactFilter)) {
+            return textResult(`"${exactFilter}" isn't auto-detected on $PATH, but the user SAVED it as a tool they use — call it directly via run_shell_command (it should resolve at runtime).`);
+          }
           return textResult(`"${exactFilter}" is not installed on $PATH.`);
         }
         if (!entry.isLikelyCli && entry.helpHead?.startsWith('Skipped macOS')) {
@@ -61,11 +65,16 @@ export function registerCliTools(server: McpServer): void {
         ? await getOrRefreshScan({ force: true })
         : (readCachedScan() ?? await getOrRefreshScan());
       const entries = filterClis(scan, filter);
+      const saved = getSavedClis();
+      const savedMatch = filter ? saved.filter((s) => s.includes(filter.toLowerCase())) : saved;
+      const savedNote = savedMatch.length
+        ? `\n\nUser-saved tools (the user confirmed they use these — prefer calling them directly via run_shell_command, even if not in the scan above): ${savedMatch.join(', ')}`
+        : '';
       if (entries.length === 0) {
         const hint = filter
           ? `No installed CLI matches "${filter}". Scanned ${scan.clis.length} CLIs at ${scan.scannedAt}.`
           : `No CLIs detected on $PATH at ${scan.scannedAt}.`;
-        return textResult(hint);
+        return textResult(hint + savedNote);
       }
       const lines = entries.slice(0, 60).map((c) => {
         const v = c.version ? ` — ${c.version}` : '';
@@ -73,7 +82,7 @@ export function registerCliTools(server: McpServer): void {
       });
       const trailer = entries.length > 60 ? `\n…and ${entries.length - 60} more. Pass a filter to narrow.` : '';
       return textResult(
-        `${entries.length} CLI${entries.length === 1 ? '' : 's'} on $PATH (scanned ${scan.scannedAt}):\n${lines.join('\n')}${trailer}`,
+        `${entries.length} CLI${entries.length === 1 ? '' : 's'} on $PATH (scanned ${scan.scannedAt}):\n${lines.join('\n')}${trailer}${savedNote}`,
       );
     },
   );

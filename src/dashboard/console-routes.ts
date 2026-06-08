@@ -106,7 +106,8 @@ import { classifyTool } from '../agents/tool-taxonomy.js';
 import { loadPlugins, PLUGINS_DIR } from '../plugins/loader.js';
 import { loadUserProfile, saveUserProfile } from '../runtime/user-profile.js';
 import { getOrRefreshScan, probe, readCachedScan } from '../runtime/cli-discovery.js';
-import { SKILLS_DIR, listSkills, uninstallSkill } from '../memory/skill-store.js';
+import { getSavedClis, addSavedCli, removeSavedCli } from '../runtime/saved-clis.js';
+import { SKILLS_DIR, listSkills, loadSkill, uninstallSkill } from '../memory/skill-store.js';
 import { checkAllSkillUpdates, getSkillInstallJob, startSkillInstall, startSkillUpdate } from '../runtime/skill-installer.js';
 import { getProactivityPolicySnapshot, loadProactivityPolicy, saveProactivityPolicy } from '../agents/proactivity-policy.js';
 import { getAuthStatus, loginWithNativeOAuth, beginCodexDeviceLogin, pollCodexDeviceLogin } from '../runtime/auth-store.js';
@@ -2711,6 +2712,24 @@ export function registerConsoleRoutes(
     }
   });
 
+  // User-saved CLIs — the tools the user has explicitly told Clementine they
+  // use (works even when the PATH scan can't see/probe them, e.g. sf).
+  app.get('/api/console/clis/saved', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    res.json({ saved: getSavedClis() });
+  });
+  app.post('/api/console/clis/saved', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const command = typeof req.body?.command === 'string' ? req.body.command : '';
+    try { res.json({ saved: addSavedCli(command) }); }
+    catch (err) { res.status(400).json({ error: err instanceof Error ? err.message : String(err) }); }
+  });
+  app.delete('/api/console/clis/saved', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const command = typeof req.query.command === 'string' ? req.query.command : '';
+    res.json({ saved: removeSavedCli(command) });
+  });
+
   // ─── Projects (workspace) ─────────────────────────────────────
 
   app.get('/api/console/projects', (req, res) => {
@@ -3175,6 +3194,24 @@ export function registerConsoleRoutes(
     const job = getSkillInstallJob(req.params.id);
     if (!job) { res.status(404).json({ error: 'install job not found' }); return; }
     res.json({ job });
+  });
+
+  // Full skill detail — the entire SKILL.md body, so the dashboard can
+  // expand a card to read the whole skill (not just the preview).
+  app.get('/api/console/skills/:name', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const skill = loadSkill(req.params.name);
+    if (!skill) { res.status(404).json({ error: 'skill not found' }); return; }
+    res.json({
+      name: skill.name,
+      displayName: skill.frontmatter.name,
+      description: skill.frontmatter.description,
+      body: skill.body,
+      source: skill.source ?? null,
+      hasScripts: skill.hasScripts,
+      hasReferences: skill.hasReferences,
+      hasSrc: skill.hasSrc,
+    });
   });
 
   app.delete('/api/console/skills/:name', (req, res) => {

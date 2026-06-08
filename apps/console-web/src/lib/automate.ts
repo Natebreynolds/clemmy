@@ -42,8 +42,29 @@ export interface CronRow {
 
 export interface SkillRow {
   name: string;
+  displayName?: string;
   description?: string;
+  bodyPreview?: string;
+  hasScripts?: boolean;
+  hasReferences?: boolean;
+  hasSrc?: boolean;
+  source?: { repo?: string; updateAvailable?: boolean; installedAt?: string; lastCheckedAt?: string } | null;
 }
+
+export interface SkillDetail {
+  name: string;
+  displayName?: string;
+  description?: string;
+  body: string;
+  source?: { repo?: string; updateAvailable?: boolean } | null;
+  hasScripts?: boolean;
+  hasReferences?: boolean;
+  hasSrc?: boolean;
+}
+
+export const getSkill = (name: string) => apiGet<SkillDetail>(`/api/console/skills/${encodeURIComponent(name)}`);
+export const deleteSkill = (name: string) => api(`/api/console/skills/${encodeURIComponent(name)}`, { method: 'DELETE' });
+export const updateSkill = (name: string) => apiPost(`/api/console/skills/${encodeURIComponent(name)}/update`, {});
 
 export const listWorkflows = () => apiGet<{ workflows: WorkflowRow[] }>('/api/console/workflows');
 export const runWorkflow = (name: string) => apiPost(`/api/console/workflows/${encodeURIComponent(name)}/run`, {});
