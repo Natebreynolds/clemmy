@@ -30,6 +30,8 @@ import {
 } from '../runtime/harness/eventlog.js';
 import { registerConsoleRoutes } from '../dashboard/console-routes.js';
 import { isConsoleNextEnabled, registerConsoleSpaRoutes } from '../dashboard/console-spa.js';
+import { registerSpaceRoutes } from '../dashboard/space-routes.js';
+import { isSpacesEnabled } from '../spaces/store.js';
 import { createMobileRouter } from './mobile-routes.js';
 import { readMobileAccess } from '../runtime/mobile-access-state.js';
 import {
@@ -430,7 +432,10 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
       [
         "default-src 'self'",
         "base-uri 'none'",
-        "frame-ancestors 'none'",
+        // 'self' (not 'none') so the console can embed an agent-authored
+        // Workspace view in a same-origin iframe (gallery previews + the
+        // full-bleed surface). Still blocks ALL cross-origin framing.
+        "frame-ancestors 'self'",
         "object-src 'none'",
         // Allow remote app/toolkit logos (Composio CDN, etc.) to load. Loopback
         // Electron surface — images are inert; this just stops broken-logo icons.
@@ -859,6 +864,12 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
   // so its /console handler wins. If the flag is off — or the bundle
   // isn't built — /console falls through to the legacy renderer.
   const consoleNext = isConsoleNextEnabled();
+  // Workspaces ("Spaces") — agent-authored interactive surfaces. Additive,
+  // flag-gated (CLEMENTINE_SPACES, default off). MUST register BEFORE the
+  // console SPA: its /console/* deep-link fallback would otherwise intercept
+  // GET /console/spaces/:id/view and serve the React index instead of the
+  // agent-authored view.
+  if (isSpacesEnabled()) registerSpaceRoutes(app, isAuthorized);
   const consoleSpaServed = consoleNext && registerConsoleSpaRoutes(app, isAuthorized);
   registerConsoleRoutes(app, isAuthorized, assistant, { serveLegacyAtRoot: !consoleSpaServed });
   app.use('/m', createMobileRouter({ isAdminAuthorized: isAuthorized, assistant }));

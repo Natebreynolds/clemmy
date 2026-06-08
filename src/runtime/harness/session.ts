@@ -177,6 +177,27 @@ export class HarnessSession {
   }
 
   /**
+   * Set a self-updating CONTEXT PRIMER turn keyed by a stable prefix (e.g. a
+   * Workspace dock's "[workspace-context]" block). Unlike injectSyntheticUserTurn
+   * (inject-once), this REPLACES any prior primer with the same prefix when the
+   * text changes, so guidance edits reach existing sessions on their next turn.
+   * No-op when the current primer already matches. Returns true if it changed.
+   */
+  setContextPrimer(prefix: string, text: string): boolean {
+    const items = this.toInputItems();
+    const isPrimer = (it: AgentInputItem): boolean => {
+      const role = (it as { role?: unknown }).role;
+      const content = (it as { content?: unknown }).content;
+      return role === 'user' && typeof content === 'string' && content.startsWith(prefix);
+    };
+    const current = items.find(isPrimer) as { content?: string } | undefined;
+    if (current && current.content === text) return false; // already current
+    const without = items.filter((it) => !isPrimer(it));
+    this.updateConversationSnapshot([...without, { role: 'user', content: text } as AgentInputItem]);
+    return true;
+  }
+
+  /**
    * Persist the SDK's post-run history snapshot + `lastResponseId`.
    * Also emits a `turn_ended` event so the audit log records the
    * boundary even when no semantic events fired this turn.

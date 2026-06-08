@@ -154,6 +154,7 @@ import { getBackgroundTaskStatus } from '../execution/background-task-status.js'
 import { listRuns } from '../runtime/run-events.js';
 import { addNotification, listNotifications, markStaleApprovalNotificationsRead } from '../runtime/notifications.js';
 import { actionBus, type ActionEvent } from '../runtime/action-bus.js';
+import { spaceStore } from '../spaces/store.js';
 import {
   appendEvent as appendHarnessEvent,
   createSession as createHarnessSession,
@@ -6338,6 +6339,20 @@ export function registerConsoleRoutes(
     const existingId = typeof body.sessionId === 'string' ? body.sessionId : '';
     let session = existingId ? getHarnessSession(existingId) : null;
     const freshSession = !session;
+    // A Workspace's floating dock binds a STABLE per-workspace session id
+    // (space-<slug>) so the dock + re-engage share one continuous thread — but
+    // that session may not exist until the first message. Create it with the
+    // given id instead of 404ing. Other unknown ids are still rejected (don't
+    // resurrect arbitrary sessions).
+    if (existingId && !session && /^space-[a-z0-9][a-z0-9-]*$/.test(existingId)) {
+      const seed = input || (attachmentIds.length ? 'Attached file' : 'Workspace');
+      session = createHarnessSession({
+        id: existingId,
+        kind: 'chat',
+        title: seed.length > 80 ? `${seed.slice(0, 77)}...` : seed,
+        metadata: { source: 'workspace', spaceSlug: existingId.slice('space-'.length) },
+      });
+    }
     if (existingId && !session) { res.status(404).json({ error: 'session not found' }); return; }
     if (!session) {
       const titleSeed = input || (attachmentIds.length ? 'Attached file' : '');
@@ -6463,6 +6478,26 @@ export function registerConsoleRoutes(
     // dock had no way to resume a paused session, the SEND button sat
     // in THINKING forever, and the user couldn't continue the workflow.
     const harnessSession = HarnessSession.load(sessionId);
+    // Workspace dock: seed a one-time context primer (idempotent by prefix) so
+    // Clem knows WHICH Workspace this thread is about and how to edit it.
+    // Without it the dock is a contextless generic assistant (it asked "which
+    // app? send me the file path" instead of knowing it's this Workspace).
+    if (harnessSession && /^space-[a-z0-9][a-z0-9-]*$/.test(sessionId)) {
+      try {
+        const slug = sessionId.slice('space-'.length);
+        const rec = spaceStore.get(slug);
+        if (rec) {
+          const ds = rec.dataSources.map((d) => d.id).join(', ') || 'none';
+          const acts = rec.actions.map((a) => a.label ?? a.id).join(', ') || 'none';
+          harnessSession.setContextPrimer('[workspace-context]', [
+            `[workspace-context] You are working inside the user's "${rec.title}" Workspace (slug: ${slug}) — a live interactive surface you built and maintain. Everything the user says in THIS thread is about this Workspace.`,
+            `It has: a view at ~/.clementine-next/spaces/${slug}/view/index.html (served at /console/spaces/${slug}/view); data source(s): ${ds}; action(s): ${acts}.`,
+            `To edit the view, ALWAYS use space_edit_view('${slug}', [{find, replace}]): first space_get('${slug}') to get the exact current text, then pass ONLY the snippet that changes. Do NOT use write_file to edit an existing view — regenerating the whole file is slow and wasteful. Reserve write_file + space_save for a brand-new view, a from-scratch rewrite, or changing data sources/actions. The open Workspace AUTO-REFRESHES on any edit, so never tell the user to refresh.`,
+            `Reply CONCISELY — one short sentence on what you changed. Don't narrate your steps or paste code. Don't ask for the file path or which app; you already know it's this Workspace.`,
+          ].join('\n\n'));
+        }
+      } catch { /* best-effort primer */ }
+    }
     const isPausedOnApproval = !!harnessSession && !!harnessSession.loadInterruptState();
     const intent = isPausedOnApproval ? parseApprovalIntent(input) : null;
     const sinceSeq = getLatestHarnessEventSeq(sessionId);

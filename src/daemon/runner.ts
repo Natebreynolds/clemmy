@@ -20,6 +20,8 @@ import { runBackgroundTaskWatchdog } from '../execution/background-task-watchdog
 import { getBuildInfo, describeBuild } from '../runtime/build-info.js';
 import { verifyDelivered } from '../runtime/harness/verify-delivered.js';
 import { processWorkflowSchedules, reapStaleWorkflowRuns } from '../execution/workflow-scheduler.js';
+import { processSpaceSchedules } from '../spaces/scheduler.js';
+import { isSpacesEnabled } from '../spaces/store.js';
 import { sweepStaleExecutions, sweepCrashedExecutions, sweepStaleBlockedExecutions } from '../execution/store.js';
 import { sweepStaleRuns } from '../runtime/run-events.js';
 import { reportInterruptedChatRuns } from '../runtime/harness/restart-recovery.js';
@@ -1121,6 +1123,13 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
     // Match workflows with trigger.schedule against the wall clock and
     // enqueue runs. processWorkflowRuns (below) then drains the queue.
     await processWorkflowSchedules();
+    // Workspaces: silently refresh any scheduled data sources (no LLM).
+    // Flag-gated (CLEMENTINE_SPACES, default off) — no-op when disabled.
+    if (isSpacesEnabled()) {
+      await processSpaceSchedules().catch((err) => {
+        logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'processSpaceSchedules tick failed');
+      });
+    }
     // When the run lane is active, draining happens on its own timer
     // (above) so a long run can't block this loop. Only drain inline
     // when the lane is disabled.

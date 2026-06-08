@@ -13,6 +13,8 @@ import { registerCliTools } from './cli-tools.js';
 import { registerSkillTools } from './skill-tools.js';
 import { registerToolChoiceTools } from './tool-choice-tools.js';
 import { registerWorkflowScheduleTools } from './workflow-schedule-tools.js';
+import { registerSpaceTools } from './space-tools.js';
+import { isSpacesEnabled } from '../spaces/store.js';
 import { registerDynamicTools } from './dynamic-tools.js';
 import { registerExecutionTools } from './execution-tools.js';
 import { registerGoalTools } from './goal-tools.js';
@@ -129,6 +131,7 @@ function captureLocalTools(): CapturedLocalTool[] {
   registerSkillTools(server);
   registerToolChoiceTools(server);
   registerWorkflowScheduleTools(server);
+  if (isSpacesEnabled()) registerSpaceTools(server);
   registerBrowserHarnessTools(server);
   registerMcpStatusTools(server);
   const dynamicToolStart = captured.length;

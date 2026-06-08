@@ -16,7 +16,7 @@ interface ClemmyBridge {
   restartDaemon?: () => Promise<unknown>;
   openLogs?: () => Promise<unknown>;
   updaterStatus?: () => Promise<unknown>;
-  checkForUpdates?: () => Promise<unknown>;
+  updaterCheck?: () => Promise<unknown>;
   onUpdaterEvent?: (cb: (event: UpdaterEvent) => void) => void;
   // Recall.ai meeting capture (Electron-only; absent in a browser).
   recallStatus?: () => Promise<Record<string, unknown> | null>;

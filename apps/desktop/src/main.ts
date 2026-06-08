@@ -198,27 +198,35 @@ function assertIpcSender(event: IpcMainInvokeEvent, allowed: RendererSurface[]):
   }
 }
 
+/** Non-web protocols that should be handed to the OS (the dialer, mail client,
+ *  etc.) rather than navigated to — clicking a `tel:` link inside a Workspace
+ *  view would otherwise blank the iframe (Electron has no tel: handler). */
+function isExternalProtocol(rawUrl: string): boolean {
+  return /^(tel:|callto:|sms:|mailto:|facetime:|facetime-audio:|maps:|webcal:|zoommtg:|msteams:)/i.test(rawUrl || '');
+}
+
 function guardWindow(win: BrowserWindow, allowed: RendererSurface[]): void {
   function allowedUrl(rawUrl: string): boolean {
     const surface = senderSurface(rawUrl);
     return Boolean(surface && allowed.includes(surface));
   }
+  // Shared nav guard for the top frame AND sub-frames (Workspace views render in
+  // an iframe, so tel:/mailto: clicks arrive via will-frame-navigate).
+  const guardNav = (event: { preventDefault: () => void }, url: string): void => {
+    if (isExternalProtocol(url)) { event.preventDefault(); void shell.openExternal(url); return; }
+    if (allowedUrl(url)) return; // in-app navigation (incl. /console/spaces/:id/view) is fine
+    event.preventDefault();
+    if (isExternalHttpUrl(url)) void shell.openExternal(url);
+  };
   win.webContents.setWindowOpenHandler(({ url }) => {
-    // A clicked link (target=_blank / window.open) → open in the user's
-    // browser. Any http(s) URL, not a curated allowlist.
-    if (isExternalHttpUrl(url)) {
-      void shell.openExternal(url);
-    }
+    // A clicked link (target=_blank / window.open) → hand off to the OS.
+    if (isExternalProtocol(url) || isExternalHttpUrl(url)) void shell.openExternal(url);
     return { action: 'deny' };
   });
-  win.webContents.on('will-navigate', (event, url) => {
-    if (allowedUrl(url)) return;
-    event.preventDefault();
-    // A same-window link to somewhere outside the dashboard → open externally.
-    if (isExternalHttpUrl(url)) {
-      void shell.openExternal(url);
-    }
-  });
+  win.webContents.on('will-navigate', (event, url) => guardNav(event, url));
+  // Sub-frame navigations (the Workspace iframe). Without this a tel: click in a
+  // Workspace view navigates the iframe to tel: and blanks it.
+  win.webContents.on('will-frame-navigate', (event) => guardNav(event, event.url));
 }
 
 function getWebhookSecret(): string {

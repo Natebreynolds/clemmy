@@ -4,6 +4,7 @@ import { Sidebar } from './Sidebar';
 import { TopBar } from './TopBar';
 import { CommandPalette } from './CommandPalette';
 import { VoiceOverlay } from './VoiceOverlay';
+import { UpdaterBanner } from './UpdaterBanner';
 import { ErrorBoundary } from './ErrorBoundary';
 import { ALL_NAV } from '@/lib/nav';
 
@@ -46,6 +47,7 @@ export function AppShell() {
 
       <CommandPalette />
       <VoiceOverlay />
+      <UpdaterBanner />
     </div>
   );
 }

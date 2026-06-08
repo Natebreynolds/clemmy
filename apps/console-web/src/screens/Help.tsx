@@ -23,9 +23,9 @@ export function Help() {
 
   const checkUpdates = async () => {
     const bridge = clemmy();
-    if (!bridge?.checkForUpdates) return;
+    if (!bridge?.updaterCheck) return;
     setChecking(true);
-    try { await bridge.checkForUpdates(); } finally { setChecking(false); }
+    try { await bridge.updaterCheck(); } finally { setChecking(false); }
   };
 
   return (
