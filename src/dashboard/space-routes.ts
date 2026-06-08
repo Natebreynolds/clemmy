@@ -337,6 +337,7 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
             message ? `User: ${message}` : `Trigger: ${trigger}`,
             guidance ? `What you set up to do here: ${guidance}` : '',
             `Inspect the current state with space_get('${slug}').`,
+            `If the user wants to change the DATA (better/different rows, a tighter filter, fewer/more fields, one row per entity), edit the data runner then call space_refresh('${slug}') and report the new row count — do NOT say it's done while the surface still shows the old data. For layout/copy tweaks use space_edit_view.`,
           ].filter(Boolean).join('\n\n'),
         },
         {

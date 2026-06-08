@@ -24,6 +24,7 @@ import {
 import { prepareSpaceForWrite } from '../spaces/space-enforce.js';
 import { analyzeSpaceGaps, renderSpaceGapQuestions } from '../spaces/space-gap-test.js';
 import { runSpaceCreationSmoke } from '../spaces/space-smoke.js';
+import { refreshSpaceData } from '../spaces/runner.js';
 import { readData, listNotes, listAudit } from '../spaces/data-store.js';
 
 function expandHome(p: string): string {
@@ -298,6 +299,34 @@ export function registerSpaceTools(server: McpServer): void {
         `- ${s.id} · "${s.title}" · ${s.status} · ${s.dataSources.length} source${s.dataSources.length === 1 ? '' : 's'} · updated ${s.updatedAt}`,
       );
       return textResult(`${spaces.length} workspace${spaces.length === 1 ? '' : 's'}:\n${lines.join('\n')}`);
+    },
+  );
+
+  server.tool(
+    'space_refresh',
+    [
+      'Re-run a Workspace\'s data source(s) NOW (server-side, no LLM) and persist the fresh dataset. Use this RIGHT AFTER you edit a data runner (e.g. you changed the query/filter/fields for better data) so the open surface shows the new rows — and so you can report the new row count to the user instead of saying "done" while it still shows old data.',
+      'Returns per-source ok + row count + any error. For layout/copy changes use space_edit_view; for adding/replacing a data source use space_save.',
+    ].join('\n'),
+    {
+      slug: z.string().min(2).max(63).describe('The workspace slug.'),
+      source_id: z.string().max(120).nullable().describe('Optional: refresh just this data source id; omit to refresh all sources.'),
+    },
+    async ({ slug, source_id }) => {
+      if (!isValidSpaceSlug(slug)) return textResult(`Error: invalid workspace slug "${slug}".`);
+      const rec = spaceStore.get(slug);
+      if (!rec) return textResult(`No workspace named "${slug}".`);
+      if (rec.dataSources.length === 0) return textResult(`Workspace "${slug}" has no data sources to refresh.`);
+      const results = await refreshSpaceData(slug, source_id?.trim() || undefined);
+      const dataNow = (() => { try { return readData(slug) as Record<string, unknown>; } catch { return {}; } })();
+      const lines = results.map((r) => {
+        if (!r.ok) return `- ${r.sourceId}: FAILED — ${r.error}`;
+        const n = countRows(dataNow?.[r.sourceId]);
+        return `- ${r.sourceId}: ok${n == null ? '' : ` (${n} row${n === 1 ? '' : 's'})`}`;
+      });
+      const anyOk = results.some((r) => r.ok);
+      const allOk = results.every((r) => r.ok);
+      return textResult(`${allOk ? 'Refreshed' : anyOk ? 'Partially refreshed' : 'Refresh failed for'} "${slug}":\n${lines.join('\n')}`);
     },
   );
 
