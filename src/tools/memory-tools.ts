@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { formatSearchHits, searchVaultAsync } from '../memory/search.js';
 import { recallHybrid } from '../memory/recall.js';
 import { embedMissingChunks, isEmbeddingsEnabled, readEmbeddingStats } from '../memory/embeddings.js';
-import { FACT_KINDS, forgetFact, getFact, listActiveFacts, listAllFacts, rememberFact, reviewStandingInstructions, searchFacts, setFactPinned } from '../memory/facts.js';
+import { FACT_KINDS, forgetFact, getFact, listActiveFacts, listAllFacts, rememberFact, reviewStandingInstructions, searchFacts, setFactPinned, touchFactAccess } from '../memory/facts.js';
 import { consolidateFact } from '../memory/reflection.js';
 import { upsertResourcePointer, isSourceMapEnabled } from '../memory/source-map.js';
 import { getRuntimeEnv } from '../config.js';
@@ -229,6 +229,10 @@ export function registerMemoryTools(server: McpServer): void {
         kind: kind as (typeof FACT_KINDS)[number] | undefined,
         topK: limit ?? 8,
       });
+      // Refresh the recency anchor for surfaced facts: an on-demand recall is an
+      // ACCESS, so bumping last_accessed_at keeps frequently-recalled facts warm
+      // for the Stanford recall score (best-effort, never throws).
+      for (const fact of facts) touchFactAccess(fact.id);
       if (facts.length === 0) return textResult('No relevant facts found.');
       const lines = facts.map((fact) => `- #${fact.id} ${fact.kind}: ${fact.content}`);
       return textResult(lines.join('\n'));

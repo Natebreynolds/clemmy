@@ -1,5 +1,5 @@
 import pino from 'pino';
-import { getOpenAiApiKey } from '../config.js';
+import { getOpenAiApiKey, getRuntimeEnv } from '../config.js';
 import { openMemoryDb } from './db.js';
 
 /**
@@ -75,6 +75,11 @@ function recordFailure(): void {
 }
 
 export function isEmbeddingsEnabled(): boolean {
+  // Explicit, key-decoupled opt-out. Previously EMBEDDINGS_DISABLED was read
+  // nowhere (a dead flag); honoring it makes the user's off-switch real. Default
+  // (unset) is byte-identical to the old key-presence behavior. When disabled,
+  // every consumer degrades gracefully to the FTS/LIKE fallback.
+  if ((getRuntimeEnv('EMBEDDINGS_DISABLED', '') || '').trim().toLowerCase() === 'true') return false;
   return Boolean(getOpenAiApiKey());
 }
 

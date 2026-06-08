@@ -1,6 +1,23 @@
 import { createHash } from 'node:crypto';
+import { getRuntimeEnv } from '../config.js';
 import { openMemoryDb, type ConsolidatedFactKind, type ConsolidatedFactRow } from './db.js';
 import { cosine, embedQuery, isEmbeddingsEnabled, loadFactEmbeddings } from './embeddings.js';
+
+/**
+ * Floor for the Stanford recall candidate pool. The pool is pre-filtered by
+ * `updated_at DESC` but SCORED by the Stanford axis (last_accessed_at +
+ * importance + relevance). A small floor (the old 100) silently drops warm,
+ * high-importance facts whose CONTENT wasn't recently edited before they can
+ * be scored — at audit time 63 of 73 active importance>=7 facts sat past
+ * rank 100 by updated_at. 500 matches findSimilarFactsScored's cap and covers
+ * the full active set at our scale (~1k facts); a JS sort of 500 stays sub-ms.
+ * Widening only — it never reorders the pool, so any fact surfaced today still
+ * surfaces. Override via CLEMMY_RECALL_POOL (invalid/empty → 500).
+ */
+function recallCandidatePoolFloor(): number {
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_RECALL_POOL', '500') || '500', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 500;
+}
 
 /**
  * Read/write API for durable, agent-curated facts.
@@ -702,9 +719,11 @@ export function listActiveFacts(options: {
   if (ranking === 'stanford') {
     // Over-fetch then sort in JS by Stanford recall score. Keeps the
     // SQL simple — at our vault size (low thousands of facts) this is
-    // negligible. The over-fetch factor (5×) caps the candidate pool
-    // so we never sort the whole table.
-    const candidatePool = Math.max(limit * 5, 100);
+    // negligible. The pool is pre-filtered by updated_at but scored on a
+    // DIFFERENT axis (last_accessed_at + importance), so the floor must be
+    // wide enough that warm high-importance facts aren't dropped before
+    // scoring — see recallCandidatePoolFloor().
+    const candidatePool = Math.max(limit * 5, recallCandidatePoolFloor());
     const rows = options.kind
       ? db.prepare(`
           SELECT * FROM consolidated_facts

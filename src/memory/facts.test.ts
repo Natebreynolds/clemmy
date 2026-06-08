@@ -436,3 +436,63 @@ test('derived facts without a source keep the 0.6 default and null sourceApp', (
   assert.equal(fact.trustLevel, 0.6, 'unchanged derived default');
   assert.equal(fact.sourceApp ?? null, null);
 });
+
+test('listActiveFacts(stanford): a warm high-importance fact past the updated_at rank-100 cutoff is still recalled (pool widening)', () => {
+  // Regression characterization for the recall candidate-pool bug: the pool is
+  // pre-filtered by `updated_at DESC` but SCORED by the Stanford axis
+  // (last_accessed_at + importance). With the old 100-row floor, a warm
+  // high-importance fact whose CONTENT wasn't recently edited fell out of the
+  // pool before it could be scored. We characterize BOTH states via the
+  // CLEMMY_RECALL_POOL knob: floor 100 drops it (the bug), floor 500 keeps it.
+  const db = openMemoryDb();
+  const now = Date.now();
+  const nowIso = new Date(now).toISOString();
+  const insert = db.prepare(`
+    INSERT INTO consolidated_facts
+      (kind, content, content_hash, score, active, created_at, updated_at, importance, last_accessed_at)
+    VALUES (@kind, @content, @hash, 1.0, 1, @created, @updated, @importance, @accessed)
+  `);
+  // 120 recently-edited, low-importance fillers — push the target past rank 100
+  // by updated_at while keeping their own Stanford score low (importance 1).
+  for (let i = 0; i < 120; i++) {
+    insert.run({
+      kind: 'project',
+      content: `filler fact ${i} routine status`,
+      hash: `recall-pool-filler-${i}`,
+      created: nowIso,
+      updated: new Date(now - i * 1000).toISOString(),
+      importance: 1,
+      accessed: nowIso,
+    });
+  }
+  // The target: edited 30 days ago (~rank 121 by updated_at) but ACCESSED today
+  // and high-importance — exactly what the Stanford score wants to surface.
+  insert.run({
+    kind: 'user',
+    content: 'Nathan default sending identity is nathan.reynolds@scorpion.com.',
+    hash: 'recall-pool-target-high-importance',
+    created: new Date(now - 30 * DAY_MS).toISOString(),
+    updated: new Date(now - 30 * DAY_MS).toISOString(),
+    importance: 8,
+    accessed: nowIso,
+  });
+
+  const hasTarget = (facts: { content: string }[]) =>
+    facts.some((f) => f.content.includes('default sending identity'));
+
+  process.env.CLEMMY_RECALL_POOL = '100';
+  assert.equal(
+    hasTarget(listActiveFacts({ ranking: 'stanford', limit: 10 })),
+    false,
+    'with a 100-row pool the warm high-importance fact is dropped before scoring (the bug)',
+  );
+
+  process.env.CLEMMY_RECALL_POOL = '500';
+  assert.equal(
+    hasTarget(listActiveFacts({ ranking: 'stanford', limit: 10 })),
+    true,
+    'widening the pool to 500 recalls the warm high-importance fact',
+  );
+
+  delete process.env.CLEMMY_RECALL_POOL;
+});

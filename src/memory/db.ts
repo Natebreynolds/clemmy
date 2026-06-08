@@ -501,6 +501,11 @@ export function openMemoryDb(): Database.Database {
   db.pragma('synchronous = NORMAL');
   db.pragma('foreign_keys = ON');
   db.pragma('busy_timeout = 5000');
+  // Checkpoint the WAL ~4x more often than the 4MB default (256 pages ≈ 1MB) so
+  // the WAL stays small between the nightly TRUNCATE backup-checkpoint, even for
+  // a transient process that holds the connection a while. PASSIVE under the
+  // hood — never blocks writers, no-op when it can't proceed.
+  db.pragma('wal_autocheckpoint = 256');
 
   runMigrations(db);
   cached = db;

@@ -12,6 +12,7 @@ import {
   bufferToVector,
   cosine,
   EMBEDDING_DIM,
+  isEmbeddingsEnabled,
   vectorToBuffer,
 } from './embeddings.js';
 
@@ -69,4 +70,25 @@ test('cosine handles mismatched lengths by clipping to shorter', () => {
   const b = new Float32Array([1, 0, 0]); // length 3
   // Should clip a to first 3 dims, both become [1,0,0] → cosine = 1.
   assert.ok(Math.abs(cosine(a, b) - 1) < 1e-6);
+});
+
+test('isEmbeddingsEnabled honors EMBEDDINGS_DISABLED (key-decoupled opt-out)', () => {
+  // process.env takes precedence over any .env file, so this is hermetic
+  // regardless of the live install's EMBEDDINGS_DISABLED setting.
+  const prevDisabled = process.env.EMBEDDINGS_DISABLED;
+  const prevKey = process.env.OPENAI_API_KEY;
+  try {
+    process.env.OPENAI_API_KEY = 'sk-test-key-present';
+
+    // Explicit opt-out wins even with a key present → FTS-only.
+    process.env.EMBEDDINGS_DISABLED = 'true';
+    assert.equal(isEmbeddingsEnabled(), false, 'EMBEDDINGS_DISABLED=true must disable embeddings');
+
+    // Explicit false (overrides any inherited true) → key presence governs.
+    process.env.EMBEDDINGS_DISABLED = 'false';
+    assert.equal(isEmbeddingsEnabled(), true, 'EMBEDDINGS_DISABLED=false leaves key-presence behavior');
+  } finally {
+    if (prevDisabled === undefined) delete process.env.EMBEDDINGS_DISABLED; else process.env.EMBEDDINGS_DISABLED = prevDisabled;
+    if (prevKey === undefined) delete process.env.OPENAI_API_KEY; else process.env.OPENAI_API_KEY = prevKey;
+  }
 });

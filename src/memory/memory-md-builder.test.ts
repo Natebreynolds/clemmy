@@ -112,3 +112,44 @@ test('regenerateMemoryMd: marker placement keeps user content separate after re-
   assert.match(userSlice, /I work at Scorpion/);
   assert.match(userSlice, /I lead the sales team/);
 });
+
+test('regenerateMemoryMd: header reports the TRUE active-fact count, not the 160-row fetch cap', () => {
+  // Push the active count well above the render fetch cap (MAX_FACTS_PER_KIND *
+  // SECTIONS * 4 = 160). The old code printed facts.length (clamped to 160);
+  // the fix prints the true factCount.
+  for (let i = 0; i < 175; i++) {
+    rememberFact({ kind: 'project', content: `Distinct project fact number ${i} for header-count test.` });
+  }
+  const result = regenerateMemoryMd();
+  assert.ok(result.factCount > 160, `precondition: active facts (${result.factCount}) must exceed the 160 fetch cap`);
+  const body = readFileSync(MEMORY_FILE, 'utf-8');
+  const m = body.match(/·\s*(\d+)\s*active facts/);
+  assert.ok(m, 'header must contain an "N active facts" count');
+  assert.equal(Number(m![1]), result.factCount, 'header count must equal the true active count, not 160');
+  assert.notEqual(Number(m![1]), 160, 'header must not show the fetch cap');
+});
+
+test('regenerateMemoryMd: AUTO-section overflow does NOT set userOverflow (no false-alarm warning)', () => {
+  // Seed long facts across all kinds so the RENDERED auto section (10/kind)
+  // overflows the 4000-char read budget — the real-world condition (long
+  // "Clementine requirement: …" facts). With a small user block, that overflow
+  // must NOT flag userOverflow (the warning gate) — it is by-design.
+  for (const kind of ['user', 'project', 'feedback', 'reference'] as const) {
+    for (let i = 0; i < 12; i++) {
+      rememberFact({ kind, content: `Long ${kind} standing detail entry ${i} — ${'context phrase '.repeat(10)}` });
+    }
+  }
+  writeFileSync(MEMORY_FILE, '# Memory\n\n## Notes\n- short user note\n', 'utf-8');
+  const result = regenerateMemoryMd();
+  assert.equal(result.promptTruncated, true, 'precondition: the assembled file exceeds the 4000-char budget');
+  assert.equal(result.userOverflow, false, 'AUTO-section overflow must not trip the actionable warning');
+});
+
+test('regenerateMemoryMd: userOverflow is true only when the USER block alone exceeds the budget', () => {
+  // A user-curated section larger than the 4000-char read budget IS actionable
+  // (their own content will clip from the injected view) — userOverflow=true.
+  const hugeUserBlock = '# Memory\n\n## My notes\n' + '- a long curated standing note line\n'.repeat(160);
+  writeFileSync(MEMORY_FILE, hugeUserBlock, 'utf-8');
+  const result = regenerateMemoryMd();
+  assert.equal(result.userOverflow, true, 'a >4000-char user section must trip userOverflow');
+});

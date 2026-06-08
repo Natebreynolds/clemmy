@@ -110,11 +110,11 @@ function formatFact(fact: ConsolidatedFact): string {
  * Render the auto-generated section body. Returns the section text
  * WITHOUT the marker comment itself — the caller adds the marker.
  */
-function renderAutoSection(facts: ConsolidatedFact[], now: Date): string {
+function renderAutoSection(facts: ConsolidatedFact[], now: Date, totalActiveFacts: number = facts.length): string {
   if (facts.length === 0) {
     return [
       '',
-      `_Auto-regenerated ${now.toISOString()} · 0 active facts. The agent will populate this as it learns durable signals (preferences, project context, standing feedback)._`,
+      `_Auto-regenerated ${now.toISOString()} · ${totalActiveFacts} active facts. The agent will populate this as it learns durable signals (preferences, project context, standing feedback)._`,
       '',
     ].join('\n');
   }
@@ -132,7 +132,7 @@ function renderAutoSection(facts: ConsolidatedFact[], now: Date): string {
 
   const lines: string[] = [
     '',
-    `_Auto-regenerated ${now.toISOString()} from \`consolidated_facts\` · ${facts.length} active facts._`,
+    `_Auto-regenerated ${now.toISOString()} from \`consolidated_facts\` · ${totalActiveFacts} active facts._`,
     '_Edit the user section above; this section is overwritten on every refresh tick._',
     '',
   ];
@@ -181,6 +181,12 @@ export interface RegenerateMemoryMdResult {
    *  MEMORY.md view in the prompt is truncated. Surfaced so the owner/doctor
    *  can see it instead of silent clipping. */
   promptTruncated: boolean;
+  /** True only when the USER-curated section (above the AUTO marker) alone
+   *  exceeds the prompt read budget — the one ACTIONABLE clip (the user wrote
+   *  >budget chars of their own content that won't fully inject). The AUTO
+   *  section overflowing is by-design and non-destructive (facts inject via the
+   *  SQLite stream), so we no longer warn on that. Gates the log warning. */
+  userOverflow: boolean;
 }
 
 /**
@@ -202,7 +208,10 @@ export function regenerateMemoryMd(): RegenerateMemoryMdResult {
   const existing = existsSync(MEMORY_FILE) ? readFileSync(MEMORY_FILE, 'utf-8') : '# Memory\n\n';
   const { userPart, hadMarker } = splitAtMarker(existing);
 
-  const autoBody = renderAutoSection(facts, new Date());
+  // Header reports the TRUE active-fact count (factCount), not facts.length —
+  // facts is the capped fetch pool (MAX_FACTS_PER_KIND*SECTIONS*4), so
+  // facts.length would mislabel e.g. 933 active facts as "160".
+  const autoBody = renderAutoSection(facts, new Date(), factCount);
   // Assemble final file: user-section + marker + auto-body.
   // If the user section is just "# Memory" (the init seed), keep it as
   // the title; otherwise preserve verbatim.
@@ -218,10 +227,15 @@ export function regenerateMemoryMd(): RegenerateMemoryMdResult {
   // millisecond, but the maintenance loop has 30-min gaps.
   const totalChars = next.length;
   const promptTruncated = totalChars > MEMORY_PROMPT_READ_CHARS;
+  // Only the USER block clipping is actionable; the AUTO section overflowing is
+  // by-design (facts inject via the SQLite stream). The injected view is the
+  // whole file sliced to the budget, so user content is lost ONLY when the user
+  // block alone exceeds it.
+  const userOverflow = userBlock.length > MEMORY_PROMPT_READ_CHARS;
 
   const normalizeForDiff = (s: string) => s.replace(/_Auto-regenerated [^_]+_/g, '_Auto-regenerated <ts>_');
   if (normalizeForDiff(next) === normalizeForDiff(existing)) {
-    return { written: false, reason: 'unchanged', factCount, autoSectionChars: autoBody.length, hadMarker, totalChars, promptTruncated };
+    return { written: false, reason: 'unchanged', factCount, autoSectionChars: autoBody.length, hadMarker, totalChars, promptTruncated, userOverflow };
   }
   atomicWrite(MEMORY_FILE, next);
   return {
@@ -232,6 +246,7 @@ export function regenerateMemoryMd(): RegenerateMemoryMdResult {
     hadMarker,
     totalChars,
     promptTruncated,
+    userOverflow,
   };
 }
 
@@ -243,15 +258,15 @@ export function tickMemoryMdRefresh(): void {
     if (result.written) {
       logger.info({ result }, 'MEMORY.md refreshed');
     }
-    // Tier C1: warn (not silent) when the assembled file is larger than the
-    // per-turn prompt budget so its tail is clipped from the injected view.
-    // Facts are still injected via renderFactsForInstructions, so this is a
-    // visibility signal, not data loss. Fires at most once per ~30-min tick
-    // and only while overflowing.
-    if (result.promptTruncated) {
+    // Tier C1: warn ONLY when the user-curated section alone exceeds the prompt
+    // read budget — the one actionable clip (the user's own content won't fully
+    // inject). The AUTO section overflowing is by-design and non-destructive
+    // (facts inject via renderFactsForInstructions / the SQLite stream), so we
+    // no longer warn on that — it fired every tick and could never clear.
+    if (result.userOverflow) {
       logger.warn(
         { totalChars: result.totalChars, readBudget: MEMORY_PROMPT_READ_CHARS, factCount: result.factCount },
-        'MEMORY.md exceeds the prompt read budget — its tail is clipped from the injected view (facts still injected via the SQLite stream)',
+        'MEMORY.md user-curated section exceeds the prompt read budget — move detail into linked notes so it injects in full',
       );
     }
   } catch (err) {

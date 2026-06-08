@@ -157,3 +157,25 @@ test('"never mind" and one-off / non-action negatives are NOT pinned prohibition
   // explicit one-off → not a durable prohibition
   assert.ok(!extractAutoMemoryCandidates('do not send that one this time').some((x) => x.pin));
 });
+
+test('extractAutoMemoryCandidates does NOT fold a pasted workflow definition into a fact', () => {
+  // The exact shape that polluted the store: a pasted "Workflow: … Step: …"
+  // definition. PROJECT_TERMS matches "workflow" + the cue "must", so without
+  // the guard this became a "Clementine requirement: Workflow: …" fact.
+  const dump = [
+    'Workflow: outlook-triage-hourly',
+    'Step: triage',
+    "Triage today's unread Outlook inbox. You must complete the work in this run; do not defer.",
+  ].join('\n');
+  assert.deepEqual(extractAutoMemoryCandidates(dump), [], 'a workflow/step dump must not be captured');
+});
+
+test('extractAutoMemoryCandidates still captures a genuine requirement that merely mentions workflows', () => {
+  // Precision guard: casual prose mentioning "workflows" (no "Workflow:"+"Step:"
+  // structured markers) is NOT a dump and must still be captured.
+  const candidates = extractAutoMemoryCandidates(
+    'I want Clementine to run my Discord workflows autonomously and make sure they are persistent.',
+  );
+  assert.equal(candidates[0]?.kind, 'project');
+  assert.match(candidates[0]?.content ?? '', /Clementine requirement/i);
+});

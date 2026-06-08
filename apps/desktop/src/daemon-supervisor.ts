@@ -1,6 +1,6 @@
 import { spawn, type ChildProcessByStdio } from 'node:child_process';
 import { createServer } from 'node:net';
-import { createWriteStream, existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { createWriteStream, existsSync, mkdirSync, readFileSync, statSync, renameSync, openSync, readSync, closeSync, fstatSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import os from 'node:os';
@@ -58,6 +58,32 @@ const READINESS_POLL_MS = 250;
 const SHUTDOWN_GRACE_MS = 5_000;
 const RESTART_BASE_MS = 1_000;
 const RESTART_MAX_MS = 30_000;
+
+// supervisor.log is append-only and was never rotated — it grew unbounded
+// (30MB+ observed). Roll it at log-open when it exceeds this size, keeping one
+// previous generation (.1). Override via CLEMENTINE_SUPERVISOR_LOG_MAX_BYTES.
+const DEFAULT_SUPERVISOR_LOG_MAX_BYTES = 20 * 1024 * 1024; // 20MB
+function supervisorLogMaxBytes(): number {
+  const raw = Number.parseInt(process.env.CLEMENTINE_SUPERVISOR_LOG_MAX_BYTES ?? '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_SUPERVISOR_LOG_MAX_BYTES;
+}
+
+/**
+ * Roll the supervisor log when it exceeds maxBytes: rename current → `.1`
+ * (replacing any prior generation), so the live file restarts empty on the next
+ * open. rename-then-create is crash-safe. Best-effort — a rotation failure must
+ * never block daemon start. Returns true when a rotation happened.
+ */
+export function rotateSupervisorLogIfNeeded(logFile: string, maxBytes: number): boolean {
+  try {
+    if (!existsSync(logFile)) return false;
+    if (statSync(logFile).size <= maxBytes) return false;
+    renameSync(logFile, `${logFile}.1`);
+    return true;
+  } catch {
+    return false;
+  }
+}
 // After this much continuous stable uptime, treat any future crash as
 // "fresh" (i.e. reset the restart counter to 0 before incrementing).
 // Without this, 8 transient crashes spread over a month would
@@ -284,6 +310,8 @@ export class DaemonSupervisor {
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
+    // Roll the log if it's grown past the cap BEFORE re-opening it for append.
+    rotateSupervisorLogIfNeeded(this.opts.logFile, supervisorLogMaxBytes());
     this.logStream = createWriteStream(this.opts.logFile, { flags: 'a' });
     this.logStream.write(`\n=== Daemon started ${new Date().toISOString()} on port ${this.chosenPort} ===\n`);
 
@@ -365,15 +393,25 @@ export class DaemonSupervisor {
     return token ? `${base}?token=${encodeURIComponent(token)}` : base;
   }
 
-  /** Read the most recent log lines for the dashboard to display. */
+  /** Read the most recent log lines for the dashboard to display. Reads only
+   *  the last ~256KB rather than slurping the whole (possibly 20MB) file. */
   tailLog(maxLines = 200): string[] {
     if (!existsSync(this.opts.logFile)) return [];
+    const TAIL_BYTES = 256 * 1024;
+    let fd: number | undefined;
     try {
-      const text = readFileSync(this.opts.logFile, 'utf-8');
-      const lines = text.split('\n');
-      return lines.slice(-maxLines);
+      fd = openSync(this.opts.logFile, 'r');
+      const size = fstatSync(fd).size;
+      const start = Math.max(0, size - TAIL_BYTES);
+      const length = size - start;
+      if (length <= 0) return [];
+      const buf = Buffer.allocUnsafe(length);
+      readSync(fd, buf, 0, length, start);
+      return buf.toString('utf-8').split('\n').slice(-maxLines);
     } catch {
       return [];
+    } finally {
+      if (fd !== undefined) { try { closeSync(fd); } catch { /* ignore */ } }
     }
   }
 

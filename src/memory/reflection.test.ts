@@ -33,6 +33,7 @@ const {
   storeEpisodicPointer,
   listRecentEpisodicPointers,
   reflectOnToolReturn,
+  isSelfReferentialTool,
   REFLECTION_MIN_CONTENT_CHARS,
   getReflectionThreshold,
   runRecursiveReflection,
@@ -277,6 +278,54 @@ test('depth/provenance: rememberFact persists derivationDepth + derivedFromFactI
   assert.equal(pattern.derivationDepth, 1);
   assert.deepEqual(pattern.derivedFromFactIds, [source.id]);
   assert.equal(pattern.importance, 7);
+});
+
+test('isSelfReferentialTool: denies Clementine introspective tools, keeps real-data tools', () => {
+  // Self/introspective → denied (no reflection).
+  for (const t of [
+    'memory_read', 'memory_recall', 'memory_search', 'memory_search_facts',
+    'memory_list_facts', 'memory_remember', 'memory_forget',
+    'recall_tool_result', 'tool_output_query', 'draft_plan',
+    'task_list', 'task_get', 'task_create', 'task_update', 'active_task',
+    'workflow_get', 'workflow_list', 'workflow_schedule',
+    'background_task_status', 'execution_get', 'execution_list',
+    'MEMORY_READ', // case-insensitive
+  ]) {
+    assert.equal(isSelfReferentialTool(t), true, `${t} should be denied`);
+  }
+  // Real user/external data → kept reflectable.
+  for (const t of [
+    'read_file', 'run_shell_command', 'skill_read', 'workflow_run',
+    'firecrawl_search', 'OUTLOOK_SEND_EMAIL', 'SALESFORCE_GET_RECORD',
+    'composio_execute_tool', null, undefined, '',
+  ]) {
+    assert.equal(isSelfReferentialTool(t as string | null | undefined), false, `${t} should be reflectable`);
+  }
+});
+
+test('reflectOnToolReturn: a self-tool return is skipped before the extractor (no fact written)', async () => {
+  resetMemoryDb();
+  const prevReflect = process.env.CLEMMY_REFLECTION;
+  const prevSelf = process.env.CLEMMY_REFLECT_SELF_TOOLS;
+  delete process.env.CLEMMY_REFLECTION;        // reflection ENABLED
+  delete process.env.CLEMMY_REFLECT_SELF_TOOLS; // filter at default (ON)
+  try {
+    // Output is well over REFLECTION_MIN_CONTENT_CHARS so only the self-tool
+    // gate (not the too_short gate) can produce the skip — and it returns
+    // BEFORE runExtractor, so no model call happens.
+    const longOutput = 'recalled fact: '.repeat(40);
+    const res = await reflectOnToolReturn({
+      sessionId: 'sess-self-tool',
+      callId: 'call-1',
+      tool: 'memory_read',
+      output: longOutput,
+    });
+    assert.equal(res.skipped, 'self_tool', 'memory_read return must short-circuit as self_tool');
+    assert.equal(res.factsWritten, 0, 'no fact written from a self-tool reflection');
+  } finally {
+    if (prevReflect === undefined) delete process.env.CLEMMY_REFLECTION; else process.env.CLEMMY_REFLECTION = prevReflect;
+    if (prevSelf === undefined) delete process.env.CLEMMY_REFLECT_SELF_TOOLS; else process.env.CLEMMY_REFLECT_SELF_TOOLS = prevSelf;
+  }
 });
 
 // Cleanup

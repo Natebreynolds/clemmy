@@ -1,7 +1,7 @@
 import { Agent, Runner } from '@openai/agents';
 import { z } from 'zod';
 import pino from 'pino';
-import { MODELS } from '../config.js';
+import { MODELS, getRuntimeEnv } from '../config.js';
 import { normalizeZodForCodexStrict } from '../runtime/schema-normalizer.js';
 import { openMemoryDb, type ConsolidatedFactKind, type ConsolidatedFactRow, type EntityType, type EntityRow, type EpisodicPointerRow } from './db.js';
 import {
@@ -118,7 +118,7 @@ export interface ReflectionResult {
   entitiesUpserted: number;
   pointersStored: number;
   sumImportance?: number;
-  skipped?: 'too_short' | 'already_reflected' | 'extractor_failed' | 'disabled' | 'low_importance';
+  skipped?: 'too_short' | 'already_reflected' | 'extractor_failed' | 'disabled' | 'low_importance' | 'self_tool';
 }
 
 const PROMPT_PREAMBLE = buildExtractorPreamble(false);
@@ -174,6 +174,37 @@ function getReflectorModel(): string {
 function readDisableFlag(): boolean {
   const raw = (process.env.CLEMMY_REFLECTION ?? '').trim().toLowerCase();
   return raw === 'off' || raw === 'false' || raw === '0';
+}
+
+// Self/introspective tools whose returns are Clementine's OWN internal state
+// (memory, tasks, plans, execution status), NOT external/user data. Reflecting
+// on them manufactures self-referential facts and a memory_read→fact recursion
+// at derivation_depth 0 (so the nightly recursive-depth cap does NOT guard it).
+// The 2026-06-08 memory audit found >50% of the fact store was self-referential
+// this way (59 facts derived from memory_read alone). We skip reflection on
+// these. KEEP read_file / run_shell_command / skill_read / workflow_run
+// reflectable — they surface real user/external content.
+const SELF_TOOL_DENY_EXACT = new Set<string>([
+  'recall_tool_result', 'tool_output_query',
+  'draft_plan', 'task_list', 'task_get', 'task_create', 'task_update', 'active_task',
+  'workflow_get', 'workflow_list', 'workflow_schedule',
+]);
+const SELF_TOOL_DENY_PREFIXES = ['memory_', 'background_task', 'execution_'];
+
+export function isSelfReferentialTool(toolName: string | null | undefined): boolean {
+  if (!toolName) return false;
+  const name = toolName.trim().toLowerCase();
+  if (!name) return false;
+  if (SELF_TOOL_DENY_EXACT.has(name)) return true;
+  return SELF_TOOL_DENY_PREFIXES.some((p) => name.startsWith(p));
+}
+
+// Filter defaults ON (do NOT reflect on self/introspective tools). The
+// kill-switch CLEMMY_REFLECT_SELF_TOOLS=on restores the old reflect-everything
+// behavior. Read via getRuntimeEnv so a live ~/.clementine-next/.env override
+// applies under launchd too.
+function selfToolReflectionFilterEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_REFLECT_SELF_TOOLS', 'off') || 'off').toLowerCase() !== 'on';
 }
 
 // Stanford §4.2: reflection fires when sum(importance) of recent
@@ -674,6 +705,11 @@ export async function reflectOnToolReturn(input: ReflectionInput): Promise<Refle
 
   if (readDisableFlag()) {
     return emitObservability({ factsWritten: 0, entitiesUpserted: 0, pointersStored: 0, skipped: 'disabled' });
+  }
+  if (selfToolReflectionFilterEnabled() && isSelfReferentialTool(input.tool)) {
+    // Skip Clementine's own introspective tools — reflecting on them only
+    // mints self-referential facts (memory_read→fact recursion).
+    return emitObservability({ factsWritten: 0, entitiesUpserted: 0, pointersStored: 0, skipped: 'self_tool' });
   }
   if (!input.output || input.output.length < REFLECTION_MIN_CONTENT_CHARS) {
     return emitObservability({ factsWritten: 0, entitiesUpserted: 0, pointersStored: 0, skipped: 'too_short' });

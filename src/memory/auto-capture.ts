@@ -3,6 +3,24 @@ import type { ConsolidatedFact } from './facts.js';
 import { consolidateFact } from './reflection.js';
 import { extractNamedResource } from './focus.js';
 import { saveUserProfile, type UserProfile } from '../runtime/user-profile.js';
+import { getRuntimeEnv } from '../config.js';
+
+/**
+ * A pasted workflow/step DEFINITION (the "Workflow: <name> … Step: <name> …"
+ * shape) is a structured artifact, not a user statement. PROJECT_TERMS matches
+ * the literal word "workflow", so without this guard such a paste is folded
+ * into a `Clementine requirement: …` fact — the 2026-06-08 audit found many such
+ * polluting rows. The real definition already lives in the workflow store, so
+ * dropping the fragmentary capture loses no knowledge. Requires BOTH markers so
+ * casual prose mentioning a single "workflow:" or "step:" is never dropped.
+ * Flag-gated (CLEMMY_AUTOCAP_SKIP_WORKFLOW_TEXT, default ON).
+ */
+function looksLikeWorkflowDefinitionDump(text: string): boolean {
+  return /\bworkflow:\s/i.test(text) && /\bstep:\s/i.test(text);
+}
+function autocapSkipWorkflowTextEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_AUTOCAP_SKIP_WORKFLOW_TEXT', 'on') || 'on').toLowerCase() !== 'off';
+}
 
 export interface AutoMemoryCandidate {
   kind: ConsolidatedFactKind;
@@ -134,6 +152,9 @@ export function extractProfilePatchFromMessage(message: string): Record<string, 
 export function extractAutoMemoryCandidates(message: string, maxCandidates = 3): AutoMemoryCandidate[] {
   const text = clean(message, 900);
   if (!text || LOW_SIGNAL.test(text)) return [];
+  // Don't fold a pasted workflow definition into facts (it pollutes the store
+  // and duplicates the workflow store).
+  if (autocapSkipWorkflowTextEnabled() && looksLikeWorkflowDefinitionDump(text)) return [];
 
   const candidates: AutoMemoryCandidate[] = [];
   const prohibition = isSafetyProhibition(text);

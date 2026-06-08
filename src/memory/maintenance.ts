@@ -190,6 +190,18 @@ function runSkillUpdatePoll(reason: 'cadence' | 'nightly'): void {
     });
 }
 
+/**
+ * True at or after `hour`:`minute` local time. Used WITH a per-day fire-once
+ * stamp so a nightly job still runs (catches up) on the first tick after the
+ * machine wakes, instead of silently skipping the day when it was asleep across
+ * the exact gate minute. Replaces the old `getHours()===H && getMinutes()===M`
+ * exact-minute gate that lost the whole day on an intermittent laptop.
+ */
+export function isAtOrAfterDailyTime(now: Date, hour: number, minute: number): boolean {
+  const h = now.getHours();
+  return h > hour || (h === hour && now.getMinutes() >= minute);
+}
+
 export async function processMemoryMaintenance(tickCount: number): Promise<void> {
   if (tickCount % REINDEX_EVERY_N_TICKS === 0) {
     try {
@@ -351,7 +363,7 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
   // even though four 15s ticks land inside the matching minute.
   const now = new Date();
   const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
-  if (now.getHours() === AUTORESEARCH_NIGHTLY_HOUR && now.getMinutes() === AUTORESEARCH_NIGHTLY_MINUTE) {
+  if (isAtOrAfterDailyTime(now, AUTORESEARCH_NIGHTLY_HOUR, AUTORESEARCH_NIGHTLY_MINUTE)) {
     if (maintenanceState.lastNightlyFireDay !== today) {
       maintenanceState.lastNightlyFireDay = today;
       writeMaintenanceState(maintenanceState);
@@ -362,7 +374,7 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
   // Guaranteed daily skill update check at 4:00 AM local (same
   // fire-once-per-day dedupe as autoresearch). Offset an hour so the two
   // nightly jobs don't pile onto the same tick.
-  if (now.getHours() === SKILL_UPDATE_NIGHTLY_HOUR && now.getMinutes() === SKILL_UPDATE_NIGHTLY_MINUTE) {
+  if (isAtOrAfterDailyTime(now, SKILL_UPDATE_NIGHTLY_HOUR, SKILL_UPDATE_NIGHTLY_MINUTE)) {
     if (maintenanceState.lastSkillUpdateFireDay !== today) {
       maintenanceState.lastSkillUpdateFireDay = today;
       writeMaintenanceState(maintenanceState);
@@ -372,7 +384,7 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
 
   // Tier C2 — nightly memory.db backup at 4:30 AM local (default on).
   // Fire-once-per-day, persisted dedupe like the jobs above.
-  if (now.getHours() === MEMORY_BACKUP_NIGHTLY_HOUR && now.getMinutes() === MEMORY_BACKUP_NIGHTLY_MINUTE) {
+  if (isAtOrAfterDailyTime(now, MEMORY_BACKUP_NIGHTLY_HOUR, MEMORY_BACKUP_NIGHTLY_MINUTE)) {
     const backupEnabled = (getRuntimeEnv('CLEMMY_MEMORY_BACKUP', 'on') || 'on').toLowerCase() !== 'off';
     if (backupEnabled && maintenanceState.lastBackupDay !== today) {
       maintenanceState.lastBackupDay = today;
