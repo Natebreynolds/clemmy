@@ -2222,7 +2222,13 @@ function clipForContext(value: unknown): unknown {
   let json: string;
   try { json = JSON.stringify(value); } catch { return '[unserializable]'; }
   if (json.length <= STEP_CONTEXT_VALUE_CLIP) return value;
-  return `[clipped ${json.length} chars — use explicit inputs.from binding for precise large subfields]`;
+  // Head+tail preview of the SERIALIZED value (not a bare placeholder): a
+  // downstream step keyed on a big upstream output (50 enriched records, a
+  // scraped page) used to see only "[clipped …]" and FALSELY self-block as if
+  // the value were empty. The preview shows the SHAPE + sample rows; for the
+  // precise full value the step declares an explicit inputs.from binding.
+  const head = 6000, tail = 1500;
+  return `[clipped to a head+tail preview of ${json.length} chars — declare an explicit inputs.from binding for the precise full value]\n${json.slice(0, head)}\n…[${json.length - head - tail} chars omitted from the middle]…\n${json.slice(json.length - tail)}`;
 }
 function renderStepContextBlock(ctx: { values: Record<string, unknown>; upstream: Record<string, unknown>; item?: unknown }): string {
   const payload: Record<string, unknown> = {
@@ -2275,7 +2281,11 @@ export function enqueueWorkflowOutcomeTurn(
       title: workflowName,
       statusHint: `workflow_run_status run_id="${run.id}"`,
       headWord: { blocked: 'needs attention' },
-      maxDetailChars: 1500,
+      // Was 1500 — the most aggressive cut of any report-back lane, and it
+      // carries the actual user-facing report on a CHAT-fired workflow. Aligned
+      // to the outcome default (4000) so this lane is no more starved than the
+      // background-task lane; the marker + statusHint still recover the rest.
+      maxDetailChars: 4000,
     },
   );
 }

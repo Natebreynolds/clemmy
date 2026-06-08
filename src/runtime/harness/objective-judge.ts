@@ -122,16 +122,41 @@ function buildJudgeAgent(): Agent<RuntimeContextValue, typeof VerdictSchema> {
   });
 }
 
+/** Binding cap on the response text shown to the completion judge. Above this
+ *  we window the head AND tail (artifact evidence — a sheet URL, a file path, a
+ *  send confirmation — clusters at the TAIL of a long multi-deliverable reply)
+ *  and TELL the judge the middle was elided for length, so a self-inflicted cut
+ *  is never misread as a genuinely incomplete deliverable → false done:false.
+ *  Also the binding cap for the workflow target judge, which calls through here
+ *  (workflow-objective-judge.ts pre-renders to MAX_DELIVERABLE_CHARS first). */
+export const JUDGE_RESPONSE_MAX_CHARS = 8000;
+
+/** Window a long body for a judge so the cut is self-describing. Returns the
+ *  text unchanged when it fits. Head 65% / tail 35% — keep the bulk of the work
+ *  while preserving the trailing artifact evidence the rubric looks for. */
+export function clipForJudge(text: string, max = JUDGE_RESPONSE_MAX_CHARS): { text: string; truncated: boolean } {
+  const t = text ?? '';
+  if (t.length <= max) return { text: t, truncated: false };
+  const head = Math.floor(max * 0.65);
+  const tail = max - head;
+  const omitted = t.length - max;
+  const windowed = `${t.slice(0, head)}\n\n…[${omitted} chars elided from the MIDDLE for length — the response is longer and may be COMPLETE]…\n\n${t.slice(t.length - tail)}`;
+  return { text: windowed, truncated: true };
+}
+
 export function buildObjectiveJudgePrompt(
   objective: string,
   assistantResponse: string,
   skillContext?: SkillExecutionContext,
 ): string {
+  const shown = clipForJudge(assistantResponse, JUDGE_RESPONSE_MAX_CHARS);
   const parts = [
     `Objective: ${objective}`,
     '',
-    "Assistant's most recent response (truncated to 4000 chars):",
-    assistantResponse.slice(0, 4000),
+    shown.truncated
+      ? "Assistant's most recent response (LONG — windowed to its head and tail with the middle elided for length; judge ONLY what is visible and do NOT mark the objective incomplete merely because an expected deliverable might fall in the omitted middle):"
+      : "Assistant's most recent response:",
+    shown.text,
   ];
   if (skillContext && skillContext.skills.length > 0) {
     parts.push(
@@ -139,7 +164,7 @@ export function buildObjectiveJudgePrompt(
       '=== SKILLS LOADED THIS SESSION — verify they were EXECUTED, not just read ===',
       'A loaded skill is a procedure the assistant committed to run. For EACH skill below, check the assistant actually carried out its prescribed steps and produced its deliverables (a file, image, URL, record, deploy). Use the tool-call evidence: if a skill clearly prescribes a step (e.g. generate imagery, run a bundled script, create a file) and the evidence shows that step was NOT done, the objective is NOT done — set done=false and name the specific skipped step. A pure-advice/persona skill with no concrete deliverables has nothing to enforce.',
       `Tool calls made this session: ${skillContext.toolCallSummary || '(none recorded)'}`,
-      ...skillContext.skills.map((s) => `\n--- skill: ${s.name} (first 2500 chars) ---\n${s.body.slice(0, 2500)}`),
+      ...skillContext.skills.map((s) => `\n--- skill: ${s.name} (first 5000 chars) ---\n${s.body.slice(0, 5000)}`),
     );
   }
   parts.push('', 'Audit it against the objective and respond with the structured verdict.');

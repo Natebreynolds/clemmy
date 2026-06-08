@@ -735,6 +735,10 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
         searchedToolkits: targetToolkits,
         query,
         count: Math.min(matches.length, maxResults),
+        totalMatches: matches.length,
+        ...(matches.length > maxResults
+          ? { truncatedNote: `Showing the top ${maxResults} of ${matches.length} ranked matches — if the tool you need isn't listed, narrow the query or pass toolkit_slug.` }
+          : {}),
         matches: matches.slice(0, maxResults),
         ...(unconnectedHint ? { message: unconnectedHint } : {}),
         nextStep: 'Pick the best match, then call `composio_execute_tool` with `tool_slug` set to the exact slug from this result and `arguments` as a JSON object string built from the action\'s `inputParameters` schema.',

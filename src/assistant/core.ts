@@ -144,11 +144,21 @@ export class ClementineAssistant {
     const messageIntent = classifyMessageIntent(request.message);
     const casualCheckIn = messageIntent.intent === 'casual';
     const lightContext = casualCheckIn || messageIntent.intent === 'meta_clarify';
-    const transcriptDepth = casualCheckIn ? 1 : messageIntent.intent === 'meta_clarify' ? 3 : 12;
-    const transcriptBeforeReply = this.sessions.recentTranscript(request.sessionId, transcriptDepth);
+    // Hoisted above transcriptDepth: a mid-task "ok"/"perfect"/"got it"
+    // classifies casual, but collapsing the transcript to 1 turn drops the
+    // thread it's confirming. Floor the depth when there's in-flight tracked
+    // work so a confirmation keeps continuity; a true standalone greeting (no
+    // active execution) stays at the cheap depth — byte-identical to before.
     const activeExecution = executionTrackingEnabled
       ? this.executions.getActiveForSession(request.sessionId)
       : undefined;
+    const hasInflight = Boolean(activeExecution);
+    const transcriptDepth = casualCheckIn
+      ? (hasInflight ? 6 : 1)
+      : messageIntent.intent === 'meta_clarify'
+        ? (hasInflight ? 6 : 3)
+        : 12;
+    const transcriptBeforeReply = this.sessions.recentTranscript(request.sessionId, transcriptDepth);
     // ExecutionIntent only matters when the user is asking for action
     // or continuing tracked work. Skip the keyword scoring entirely
     // for casual / lookup / meta turns — saves a scan and avoids

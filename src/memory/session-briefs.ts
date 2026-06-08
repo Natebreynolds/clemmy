@@ -201,21 +201,26 @@ function renderListSection(title: string, items: string[], prefix = '- '): strin
   return [`## ${title}`, ...items.map((item) => `${prefix}${item}`)].join('\n');
 }
 
-export function renderSessionContinuity(brief: SessionBriefRecord | null, maxChars = 2000): string {
+export function renderSessionContinuity(brief: SessionBriefRecord | null, maxChars = 2600): string {
   if (!brief) return '';
 
+  // Decision-relevant blocks FIRST — the explicit resume pointer (Next Best
+  // Step) and the user-authored handoff (Manual Context) — so they survive the
+  // tail cut; the long auto-lists ride the tail where truncation costs least.
+  // (They used to render LAST and vanished first on a busy session.)
   const sections = [
     `## Summary\n${brief.auto.summary}`,
+    brief.auto.nextStep ? `## Next Best Step\n${brief.auto.nextStep}` : '',
+    brief.manual?.context ? `## Manual Context\n${brief.manual.context}` : '',
     renderListSection('Recent User Requests', brief.auto.recentUserRequests),
     renderListSection('Open Questions', brief.auto.openQuestions),
     brief.auto.activePlan ? `## Active Plan\n${brief.auto.activePlan}` : '',
     brief.manual?.remaining?.length ? renderListSection('Open Loops From Last Handoff', brief.manual.remaining, '- [ ] ') : '',
     brief.manual?.blockers?.length ? renderListSection('Blockers', brief.manual.blockers) : '',
-    brief.manual?.context ? `## Manual Context\n${brief.manual.context}` : '',
-    brief.auto.nextStep ? `## Next Best Step\n${brief.auto.nextStep}` : '',
   ].filter(Boolean);
 
-  return sections.join('\n\n').slice(0, maxChars).trim();
+  const joined = sections.join('\n\n').trim();
+  return joined.length > maxChars ? `${joined.slice(0, maxChars).trim()}\n…(continuity truncated)` : joined;
 }
 
 export function renderSessionResume(session: SessionRecord, brief: SessionBriefRecord | null): string {

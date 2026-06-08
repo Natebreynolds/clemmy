@@ -61,6 +61,15 @@ test('renderDeliverableForJudge: serializes an object deliverable', () => {
   assert.match(out, /"url": "https:\/\/x\.com"/);
 });
 
+test('renderDeliverableForJudge: appends a self-describing marker only when it truncates', () => {
+  const big = 'x'.repeat(20000);
+  const out = renderDeliverableForJudge(big);
+  assert.match(out, /deliverable truncated to 12000 chars for judging — the run's full output is longer and complete/);
+  assert.ok(out.startsWith('x'.repeat(12000)), 'keeps the first 12000 chars verbatim');
+  // a sub-cap deliverable is untouched (no marker)
+  assert.equal(renderDeliverableForJudge('short and complete'), 'short and complete');
+});
+
 test('renderDeliverableForJudge: uses the fallback body when finalOutput is empty', () => {
   assert.equal(renderDeliverableForJudge('', 'humanized summary'), 'humanized summary');
   assert.equal(renderDeliverableForJudge(null, 'humanized summary'), 'humanized summary');
@@ -143,4 +152,36 @@ test('judgeWorkflowTarget: FAILS OPEN when the judge throws (never breaks a good
   });
   assert.equal(v.reached, true);
   assert.equal(v.judged, false, 'fail-open path is recorded as not-judged for telemetry');
+});
+
+// ── truncation-artifact guard (the Outlook-brief false-flag) ──────────────
+
+test('judgeWorkflowTarget: SUPPRESSES a truncation-shaped gap when the deliverable was windowed for length', async () => {
+  // > JUDGE_RESPONSE_MAX_CHARS (8000) so the judge sees only a head+tail window.
+  const bigBrief = JSON.stringify({ items: Array.from({ length: 60 }, (_, i) => ({ i, subject: 'email subject '.repeat(8) })) });
+  assert.ok(bigBrief.length > 8000, 'fixture must exceed the binding judge cap');
+  const j = judgeReturning({ done: false, reason: 'The response is truncated, so there is no complete verifiable evidence of all items.' });
+  const v = await judgeWorkflowTarget({
+    workflow: wf(),
+    inputs: {},
+    finalOutput: bigBrief,
+    judgeFn: j.fn,
+  });
+  assert.equal(v.reached, true, 'a self-inflicted truncation gap must not flip the run to needs-attention');
+  assert.equal(v.judged, false);
+  assert.match(v.gap, /truncation-shaped gap suppressed/);
+});
+
+test('judgeWorkflowTarget: a real (non-truncation) miss on a long deliverable still flags', async () => {
+  const bigBrief = 'y'.repeat(9000);
+  const j = judgeReturning({ done: false, reason: 'the brief is missing the required backlinks section entirely' });
+  const v = await judgeWorkflowTarget({ workflow: wf(), inputs: {}, finalOutput: bigBrief, judgeFn: j.fn });
+  assert.equal(v.reached, false, 'a genuine target miss must still surface even on a windowed deliverable');
+  assert.match(v.gap, /backlinks/);
+});
+
+test('judgeWorkflowTarget: a truncation-shaped reason on a SHORT (un-windowed) deliverable is NOT suppressed', async () => {
+  const j = judgeReturning({ done: false, reason: 'the output appears to be cut off / incomplete' });
+  const v = await judgeWorkflowTarget({ workflow: wf(), inputs: {}, finalOutput: 'short deliverable', judgeFn: j.fn });
+  assert.equal(v.reached, false, 'guard only applies when WE windowed the deliverable, not to genuinely short output');
 });

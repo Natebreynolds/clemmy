@@ -314,12 +314,14 @@ function seedCrossSessionPrefix(newSessionId: string, channelId: string, now: nu
   });
   if (inWindow.length === 0) return;
 
-  // Pull recent turns from each in-window session, oldest sessions
-  // first so the resulting text reads chronologically.
+  // Spend the char budget NEWEST-first (inWindow is updated_at DESC) so a
+  // back-reference keeps the most-relevant recent sessions; the old code
+  // iterated oldest-first and so dropped the NEWEST sessions on overflow. We
+  // reverse the KEPT blocks afterward so the text still reads chronologically.
   const sectionBlocks: string[] = [];
   let totalChars = 0;
   const MAX_TOTAL_CHARS = 8_000; // generous, but bounded
-  for (const session of inWindow.slice().reverse()) {
+  for (const session of inWindow) {
     const turns = pullRecentTurnsForSession(db, session.id, PREFIX_MAX_TURNS_PER_SESSION);
     if (turns.length === 0) continue;
     const elapsedMin = Math.round((now - Date.parse(session.updated_at)) / 60_000);
@@ -335,6 +337,7 @@ function seedCrossSessionPrefix(newSessionId: string, channelId: string, now: nu
     totalChars += block.length;
   }
   if (sectionBlocks.length === 0) return;
+  sectionBlocks.reverse(); // chronological (oldest → newest) for reading
 
   // Surface active focus state too — if a focus is pinned, the new
   // session should treat it as authoritative context.

@@ -403,9 +403,16 @@ export async function findSimilarFactsScored(
       // query; fresh installs often have facts but no fact_embeddings yet,
       // and making a network call just to discover an empty comparison
       // pool adds latency without improving recall.
+      // Same env-driven pool floor as listActiveFacts (CLEMMY_RECALL_POOL,
+      // default 500) so this semantic-recall path — which backs both
+      // memory_search_facts and the dedup/conflict resolver — widens together
+      // and stops pre-filtering high-importance facts out by updated_at before
+      // they're ever cosine-scored. Widening only; updated_at stays the
+      // tiebreaker so today's top-K never reorders.
+      const pool = recallCandidatePoolFloor();
       const poolRows = (options.kind
-        ? db.prepare('SELECT id FROM consolidated_facts WHERE active = 1 AND kind = ? ORDER BY updated_at DESC LIMIT 500').all(options.kind)
-        : db.prepare('SELECT id FROM consolidated_facts WHERE active = 1 ORDER BY updated_at DESC LIMIT 500').all()) as { id: number }[];
+        ? db.prepare(`SELECT id FROM consolidated_facts WHERE active = 1 AND kind = ? ORDER BY updated_at DESC LIMIT ${pool}`).all(options.kind)
+        : db.prepare(`SELECT id FROM consolidated_facts WHERE active = 1 ORDER BY updated_at DESC LIMIT ${pool}`).all()) as { id: number }[];
       const ids = poolRows.map((r) => r.id);
       const vectors = loadFactEmbeddings(ids);
       if (vectors.size > 0) {
@@ -505,19 +512,24 @@ export async function searchFacts(
 export function renderRecentlyLearnedForInstructions(
   sinceHours = 24,
   limit = 15,
-  maxChars = 1200,
+  maxChars = 2000,
 ): string {
   const facts = listRecentlyLearnedFacts({ sinceHours, limit });
   if (facts.length === 0) return '';
   const lines: string[] = [];
   let used = 0;
-  for (const fact of facts) {
+  let elided = 0;
+  for (let i = 0; i < facts.length; i++) {
+    const fact = facts[i];
     const callRef = fact.derivedFrom?.callId ? ` [${fact.derivedFrom.callId}]` : '';
     const toolRef = fact.derivedFrom?.tool ? ` (from ${fact.derivedFrom.tool})` : '';
     const line = `- ${fact.content}${callRef}${toolRef}`;
-    if (used + line.length > maxChars) break;
+    if (used + line.length > maxChars) { elided = facts.length - i; break; }
     lines.push(line);
     used += line.length;
+  }
+  if (elided > 0) {
+    lines.push(`- _… and ${elided} more recent fact${elided === 1 ? '' : 's'} (recall via memory_search_facts)._`);
   }
   return lines.join('\n');
 }
@@ -536,7 +548,7 @@ export function listRecentlyLearnedFacts(options: { sinceHours?: number; limit?:
     WHERE active = 1
       AND extracted_at IS NOT NULL
       AND extracted_at >= ?
-    ORDER BY extracted_at DESC, id DESC
+    ORDER BY importance DESC, extracted_at DESC, id DESC
     LIMIT ?
   `).all(since, limit) as ConsolidatedFactRow[];
   return rows.map(rowToFact);
@@ -890,12 +902,15 @@ export function renderFactsForInstructions(
     // recency anchor will just be slightly stale — never a turn-breaker.
   }
 
-  const sections: string[] = [];
-
-  if (renderPinned && pinned.length > 0) {
-    const lines = pinned.map((fact) => `- ${fact.content}`).join('\n');
-    sections.push(`**Standing instructions (always apply)**\n${lines}`);
-  }
+  // Pinned standing instructions are EXEMPT from the char cap — they're the
+  // user's durable rules and must NEVER be silently cut (they're already
+  // hard-bounded by listPinnedFacts(12)). The maxChars cap below applies ONLY
+  // to the ranked scored tail; rendering pinned first AND slicing the whole
+  // join (the old behavior) cut into the standing block whenever it alone
+  // exceeded maxChars, reading a half-rule as a complete one.
+  const pinnedSection = renderPinned && pinned.length > 0
+    ? `**Standing instructions (always apply)**\n${pinned.map((fact) => `- ${fact.content}`).join('\n')}`
+    : '';
 
   const byKind: Record<ConsolidatedFactKind, ConsolidatedFact[]> = {
     user: [], project: [], feedback: [], reference: [],
@@ -909,14 +924,33 @@ export function renderFactsForInstructions(
     reference: 'References',
   };
 
+  const scoredSections: string[] = [];
   for (const kind of FACT_KINDS) {
     const group = byKind[kind];
     if (group.length === 0) continue;
     const lines = group.map((fact) => `- ${fact.content}`).join('\n');
-    sections.push(`**${titles[kind]}**\n${lines}`);
+    scoredSections.push(`**${titles[kind]}**\n${lines}`);
+  }
+  let scoredBlock = scoredSections.join('\n\n');
+
+  // Cap the scored tail only, on a fact/section boundary (never mid-fact), and
+  // flag the elision so the model knows recall can widen.
+  const scoredBudget = Math.max(0, maxChars - (pinnedSection ? pinnedSection.length + 2 : 0));
+  if (scoredBlock.length > scoredBudget) {
+    scoredBlock = clipToLineBoundary(scoredBlock, scoredBudget);
+    if (scoredBlock) scoredBlock += '\n_… more facts elided to fit; call memory_search_facts to widen._';
   }
 
-  return sections.join('\n\n').slice(0, maxChars);
+  return [pinnedSection, scoredBlock].filter(Boolean).join('\n\n');
+}
+
+/** Trim `text` to at most `max` chars on a newline boundary (never mid-line),
+ *  so a fact is never cut mid-sentence. */
+function clipToLineBoundary(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const cut = text.slice(0, max);
+  const nl = cut.lastIndexOf('\n');
+  return (nl > 0 ? cut.slice(0, nl) : cut).trimEnd();
 }
 
 export function countActiveFacts(): number {

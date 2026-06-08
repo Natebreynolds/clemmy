@@ -262,6 +262,32 @@ test('resolveMcpToolScope: fresh SEO follow-ups can still request DataForSEO', (
   assert.ok((scope.maxTools ?? 0) > 0);
 });
 
+// A local follow-up that asks for FRESH data from an app OUTSIDE the named
+// keyword families used to fall through to maxTools:0 → "not connected on the
+// first try". It must now reach tools (bounded fail-open or a matched scope).
+test('resolveMcpToolScope: "update the report with the latest Airtable records" is NOT starved to maxTools:0', () => {
+  const scope = resolveMcpToolScope({ userInput: 'update the report with the latest Airtable records' });
+  assert.ok((scope.maxTools ?? 0) > 0, 'app-data follow-up must reach external tools');
+  assert.doesNotMatch(scope.reason, /local context/i);
+});
+
+test('resolveMcpToolScope: "the report needs the newest backlinks" reaches the SEO scope', () => {
+  const scope = resolveMcpToolScope({ userInput: 'The report needs the newest backlinks added.' });
+  assert.ok(scope.allowedServerSlugs?.includes('dataforseo'));
+  assert.ok((scope.maxTools ?? 0) > 0);
+});
+
+test('resolveMcpToolScope: "pull the current deals into the report" falls open to bounded tools', () => {
+  const scope = resolveMcpToolScope({ userInput: 'Pull the current deals into the report.' });
+  assert.ok((scope.maxTools ?? 0) > 0);
+});
+
+test('resolveMcpToolScope: an EXPLICIT negation still suppresses tools even with the new freshness cues', () => {
+  const scope = resolveMcpToolScope({ userInput: 'Append to the local report; do not pull any fresh Airtable records.' });
+  assert.equal(scope.maxTools, 0);
+  assert.match(scope.reason, /local context/i);
+});
+
 test('resolveMcpToolScope: named external systems override local-context wording', () => {
   const scope = resolveMcpToolScope({
     userInput:

@@ -63,6 +63,15 @@ const LOCAL_CONTEXT_FOLLOWUP_RE =
   /\b(existing context|use the existing context|from context|remember|remembered|we just ran|previous|already found|append|local file update|local markdown|markdown report|the report|the audit we just ran)\b/i;
 const FRESH_EXTERNAL_RE =
   /\b(fresh|new audit|rerun|re-run|run .*audit|use dataforseo|crawl|lighthouse|current rankings?|latest rankings?|check the site|fetch|scrape|search the web|look up online|new data)\b/i;
+// A local-context follow-up that nonetheless asks for FRESH data from an
+// external system ("update the report with the latest Airtable records", "the
+// report needs the newest backlinks", "pull the current deals") still needs
+// external tools. Without this, those phrases fall through to maxTools:0 (the
+// app sits outside the 6 named keyword families) and read as "not connected".
+// Monotonic: matching here only ever turns a no-tools turn into the bounded
+// fail-open surface — it can never strip tools from a turn that had them.
+const FRESH_EXTERNAL_DATA_RE =
+  /\b(?:latest|newest|current|up[-\s]?to[-\s]?date|updated|recent|most recent)\s+(?:\w+\s+){0,3}(?:record|records|data|results?|rows?|entries|metric|metrics|lead|leads|backlinks?|listings?|deal|deals|contact|contacts|ranking|rankings|numbers|figures|stats|statistics)\b|\b(?:pull|grab|import|sync|retrieve|refresh|re-?pull|re-?fetch)\s+(?:the\s+|in\s+|down\s+)?(?:\w+\s+){0,3}(?:record|records|data|results?|rows?|entries|leads?|deals?|contacts?|backlinks?|rankings?|from\b)|\bairtable\b/i;
 const NEGATED_FRESH_EXTERNAL_RE =
   /\b(?:do\s+not|don't|dont|without|no)\s+(?:run|running|rerun|re-running|re-run|perform|performing|do|doing|use|using|call|calling|invoke|invoking|start|starting|trigger|triggering)?\s*(?:any\s+)?(?:a\s+)?(?:fresh|new)?\s*(?:web\s+)?(?:seo\s+)?(?:audit|dataforseo|lookup|lookups|look\s+up|crawl|crawling|scrape|scraping|search|searching|external|external\s+mcp|web\s+search|site\s+check)\b/i;
 const NEGATED_EXTERNAL_WINDOW_RE =
@@ -159,7 +168,7 @@ export function resolveMcpToolScope(options: ResolveMcpToolScopeOptions = {}): M
   const scopes: McpToolScope[] = [];
 
   const isLocalContextFollowup = LOCAL_CONTEXT_FOLLOWUP_RE.test(input);
-  const hasFreshExternalIntent = FRESH_EXTERNAL_RE.test(input);
+  const hasFreshExternalIntent = FRESH_EXTERNAL_RE.test(input) || FRESH_EXTERNAL_DATA_RE.test(input);
   const hasNegatedFreshExternalIntent = NEGATED_FRESH_EXTERNAL_RE.test(input) || NEGATED_EXTERNAL_WINDOW_RE.test(input);
   const wantsSeo = SEO_RE.test(input) || (URL_RE.test(input) && /\baudit\b/i.test(input));
   const wantsWeb = WEB_RE.test(input);

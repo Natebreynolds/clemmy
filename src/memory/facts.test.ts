@@ -247,6 +247,24 @@ test('a pinned instruction is always rendered even when out-ranked by many newer
   assert.match(rendered, /Never email clients on Fridays/);
 });
 
+test('pinned standing instructions render IN FULL even when they alone exceed maxChars (exempt from the cap)', () => {
+  const pins = [
+    'Only ever add events to the Breakthrough Coaching calendar, never a personal calendar.',
+    'Default sending identity is nathan.reynolds@breakthroughcoaching.ai for all outbound email.',
+    'Never email clients on Fridays or over the weekend without explicit approval.',
+    'Always quote prices in USD and state the engagement scope before any number.',
+  ];
+  for (const content of pins) setFactPinned(rememberFact({ kind: 'feedback', content }).id, true);
+  for (let i = 0; i < 6; i += 1) rememberFact({ kind: 'project', content: `Scored project note ${i} about scraping pipelines.` });
+
+  // A cap far SMALLER than the pinned block alone. Old behavior sliced the
+  // whole join and cut a standing rule mid-word; the fix renders pinned in full.
+  const rendered = renderFactsForInstructions(10, 200);
+  for (const content of pins) {
+    assert.ok(rendered.includes(content), `pinned standing instruction must survive in full: ${content}`);
+  }
+});
+
 test('message-scoped recall surfaces a query-relevant fact that global recall buries (the "MY accounts" fix)', () => {
   // The fact that should govern "pull MY market-leader accounts".
   rememberFact({ kind: 'project', content: 'My market-leader accounts are Salesforce accounts owned by Nathan Reynolds where Market_Leader__c is true.' });

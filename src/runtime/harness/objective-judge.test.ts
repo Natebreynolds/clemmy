@@ -7,7 +7,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { buildObjectiveJudgePrompt, judgeObjectiveComplete, shouldRunObjectiveJudge, isPromiseShapedReply } = await import('./objective-judge.js');
+const { buildObjectiveJudgePrompt, judgeObjectiveComplete, shouldRunObjectiveJudge, isPromiseShapedReply, clipForJudge, JUDGE_RESPONSE_MAX_CHARS } = await import('./objective-judge.js');
 
 const baseGate = {
   optIn: true,
@@ -86,6 +86,30 @@ test('buildObjectiveJudgePrompt includes the objective and the assistant respons
   const prompt = buildObjectiveJudgePrompt('build a report on X', 'Done — saved to /tmp/report.md');
   assert.match(prompt, /build a report on X/);
   assert.match(prompt, /\/tmp\/report\.md/);
+});
+
+test('clipForJudge passes a sub-cap body through untouched', () => {
+  const r = clipForJudge('a short response');
+  assert.equal(r.truncated, false);
+  assert.equal(r.text, 'a short response');
+});
+
+test('clipForJudge windows head+tail and self-describes the elision', () => {
+  const head = 'HEAD_MARKER ' + 'a'.repeat(JUDGE_RESPONSE_MAX_CHARS);
+  const tailEvidence = ' saved to https://example.com/sheet TAIL_MARKER';
+  const full = head + 'z'.repeat(2000) + tailEvidence;
+  const r = clipForJudge(full);
+  assert.equal(r.truncated, true);
+  assert.ok(r.text.length < full.length, 'output is shorter than the full input');
+  assert.ok(r.text.length <= JUDGE_RESPONSE_MAX_CHARS + 200, 'output stays near the cap (plus the small marker)');
+  assert.match(r.text, /HEAD_MARKER/, 'keeps the head');
+  assert.match(r.text, /TAIL_MARKER/, 'keeps the tail where artifact evidence clusters');
+  assert.match(r.text, /elided from the MIDDLE for length/, 'tells the judge the middle was cut for length');
+});
+
+test('buildObjectiveJudgePrompt directs the judge not to penalize a windowed reply', () => {
+  const prompt = buildObjectiveJudgePrompt('build a big report', 'B'.repeat(JUDGE_RESPONSE_MAX_CHARS + 5000));
+  assert.match(prompt, /do not mark the objective incomplete merely because/i);
 });
 
 test('judgeObjectiveComplete fails OPEN (done:true) when there is no response text to judge', async () => {

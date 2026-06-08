@@ -301,7 +301,11 @@ export function buildAssistantInstructions(context: MemoryContext, channel?: str
   // Pinned/standing facts are Tier-1 — ALWAYS present (even on a casual turn),
   // so a durable rule the user set never silently drops. Scored facts ride the
   // Tier-2 tail (intent-gated). objective omitted: standing rules always apply.
-  const standingFacts = renderFactsForInstructions(12, 800, undefined, 'pinned');
+  // Pinned facts are now rendered in full (exempt from the cap) inside
+  // renderFactsForInstructions; this budget only bounds the (empty here) scored
+  // tail. Kept generous as defense-in-depth so a large standing block survives
+  // even if the exempt-pinned logic ever changes.
+  const standingFacts = renderFactsForInstructions(12, 2000, undefined, 'pinned');
 
   const tier1 = [
     identityVoice, contextDiscipline, toolBehavior, clarify, executeDirective, capture, handoffs, planner, focus, reportBack,

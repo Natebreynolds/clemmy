@@ -448,12 +448,17 @@ function listDirectory(dir: string, limit: number): string {
   const resolved = resolveAllowedPath(dir);
   if (!existsSync(resolved)) return `Directory does not exist: ${resolved}`;
   if (!statSync(resolved).isDirectory()) return `Not a directory: ${resolved}`;
-  return readdirSync(resolved, { withFileTypes: true })
+  const cap = Math.max(1, Math.min(500, limit));
+  const entries = readdirSync(resolved, { withFileTypes: true })
     .filter((entry) => entry.name !== 'node_modules' && entry.name !== '.git')
-    .sort((left, right) => left.name.localeCompare(right.name))
-    .slice(0, Math.max(1, Math.min(500, limit)))
-    .map((entry) => `${entry.name}${entry.isDirectory() ? '/' : ''}`)
-    .join('\n') || '(empty)';
+    .sort((left, right) => left.name.localeCompare(right.name));
+  const shown = entries.slice(0, cap).map((entry) => `${entry.name}${entry.isDirectory() ? '/' : ''}`);
+  // Without this, an alphabetical slice silently drops the tail — a file that
+  // sorts late reads as "not present". Tell the model how to widen.
+  if (entries.length > cap) {
+    shown.push(`…[${entries.length - cap} more entr${entries.length - cap === 1 ? 'y' : 'ies'} not shown; pass a higher limit (max 500) or a more specific directory]`);
+  }
+  return shown.join('\n') || '(empty)';
 }
 
 export function getComputerTools(): Tool<RuntimeContextValue>[] {
@@ -491,6 +496,17 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
     ),
   });
 
+  // Clip read output to the char cap, but when the FULL content exceeds the
+  // cap append a self-describing note with the true length + how to widen. The
+  // slice happens BEFORE the result is parked, so without this note a clipped
+  // large file (multi-page brief, extracted PDF, audit log) reads as complete
+  // with no recovery path — confident wrong/incomplete answers. (~30-60 tokens,
+  // only on oversized reads; net token-negative, it prevents blind re-reads.)
+  const clipReadWithWidenNote = (content: string, cap: number, label: string): string =>
+    content.length <= cap
+      ? content
+      : `${content.slice(0, cap)}\n\n…[${label} is ${content.length} chars; showing the first ${cap}. Re-call with a larger max_chars (up to 50000) to read more.]`;
+
   const read_file = tool({
     name: 'read_file',
     description: [
@@ -515,14 +531,14 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
           'read_file',
           runContext,
           details,
-          (ingested.markdown ?? '').slice(0, input.max_chars ?? 20000),
+          clipReadWithWidenNote(ingested.markdown ?? '', input.max_chars ?? 20000, path.basename(filePath)),
         );
       }
       return formatToolOutput(
         'read_file',
         runContext,
         details,
-        readFileSync(filePath, 'utf-8').slice(0, input.max_chars ?? 20000),
+        clipReadWithWidenNote(readFileSync(filePath, 'utf-8'), input.max_chars ?? 20000, path.basename(filePath)),
       );
     },
   });
@@ -549,7 +565,7 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
         'convert_to_markdown',
         runContext,
         details,
-        (ingested.markdown ?? '').slice(0, input.max_chars ?? 20000),
+        clipReadWithWidenNote(ingested.markdown ?? '', input.max_chars ?? 20000, path.basename(filePath)),
       );
     },
   });

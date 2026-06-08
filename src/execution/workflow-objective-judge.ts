@@ -1,4 +1,4 @@
-import { judgeObjectiveComplete, type ObjectiveJudgeFn } from '../runtime/harness/objective-judge.js';
+import { judgeObjectiveComplete, JUDGE_RESPONSE_MAX_CHARS, type ObjectiveJudgeFn } from '../runtime/harness/objective-judge.js';
 import type { WorkflowDefinition } from '../memory/workflow-store.js';
 
 /**
@@ -35,7 +35,15 @@ export interface WorkflowTargetVerdict {
 }
 
 const MAX_OBJECTIVE_CHARS = 2000;
-const MAX_DELIVERABLE_CHARS = 6000;
+// >= the binding judge cap (JUDGE_RESPONSE_MAX_CHARS) so this layer never
+// pre-starves the deliverable below what the judge can actually see; matches
+// DEFAULT_TOOL_RESULT_MAX_CHARS so a deliverable the model already saw in full
+// can be judged in full. Overflow is windowed head+tail downstream, not lost.
+const MAX_DELIVERABLE_CHARS = 12000;
+// A "gap" that is really about the deliverable being cut off / not fully
+// visible is an artifact of OUR length window, never a real target miss — a
+// genuine miss names a missing TARGET element. Suppressed when we windowed.
+const TRUNCATION_SHAPED_GAP = /truncat|cut ?off|incomplete (response|text|json|output|deliverable|data)|no complete verifiable|not fully (visible|shown|present)|appears? (to be )?(cut|incomplete)|omitted/i;
 const MAX_INPUT_SCALAR_CHARS = 200;
 const JUDGE_TIMEOUT_MS = 25_000;
 
@@ -101,8 +109,11 @@ export function renderDeliverableForJudge(finalOutput: unknown, fallbackBody?: s
       : finalOutput == null
         ? ''
         : safeJson(finalOutput);
-  const text = fromOutput && fromOutput.trim() ? fromOutput : (fallbackBody ?? '');
-  return text.slice(0, MAX_DELIVERABLE_CHARS).trim();
+  const text = (fromOutput && fromOutput.trim() ? fromOutput : (fallbackBody ?? '')).trim();
+  if (text.length <= MAX_DELIVERABLE_CHARS) return text;
+  // Self-describing cut: tell the judge the tail exists and is complete, so a
+  // mid-content slice is never read as a genuinely incomplete deliverable.
+  return `${text.slice(0, MAX_DELIVERABLE_CHARS)}\n\n…[deliverable truncated to ${MAX_DELIVERABLE_CHARS} chars for judging — the run's full output is longer and complete]…`;
 }
 
 export interface JudgeWorkflowTargetInput {
@@ -141,16 +152,30 @@ export async function judgeWorkflowTarget(
     };
   }
   const judge = opts.judgeFn ?? judgeObjectiveComplete;
+  // True when the deliverable is long enough that the judge sees only a
+  // head+tail window of it (the slice happens inside buildObjectiveJudgePrompt
+  // at JUDGE_RESPONSE_MAX_CHARS). Used to suppress truncation-shaped "gaps".
+  const wasWindowedForJudge = deliverable.length > JUDGE_RESPONSE_MAX_CHARS;
   const objectivePrompt = [
     "This is a BACKGROUND WORKFLOW's target — the complete deliverable the user needs while they are away:",
     objective,
     '',
     'The run is successful ONLY if the deliverable below fully reaches that target. Be CONSERVATIVE: report NOT done only when a SPECIFIC required part of the target is clearly missing or unfulfilled in the deliverable. If the deliverable plausibly satisfies the target, accept it (done=true).',
+    ...(wasWindowedForJudge
+      ? ['', 'NOTE: the deliverable is shown to you windowed to its head and tail for length. Judge ONLY the visible content; NEVER report NOT done merely because the deliverable looks cut off or an expected item might sit in the omitted middle.']
+      : []),
   ].join('\n');
   try {
     const verdict = await withJudgeTimeout(judge(objectivePrompt, deliverable));
     if (!verdict) {
       return { reached: true, judged: false, gap: 'target judge timed out — accepting completion' };
+    }
+    // A truncation-shaped gap on a deliverable WE windowed for length is a
+    // self-inflicted artifact, never a real target miss — fall open so it can
+    // never flip a good run to needs-attention. (Detection-only: the report
+    // still delivers in full regardless of this verdict.)
+    if (!verdict.done && wasWindowedForJudge && TRUNCATION_SHAPED_GAP.test(verdict.reason)) {
+      return { reached: true, judged: false, gap: `truncation-shaped gap suppressed (judge saw a length-windowed view): ${verdict.reason.slice(0, 160)}` };
     }
     return { reached: verdict.done, judged: true, gap: verdict.reason };
   } catch {
