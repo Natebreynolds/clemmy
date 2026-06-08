@@ -676,6 +676,20 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       'read_file',
       'write_file',
       'git_status',
+      // Workspaces (Spaces) — agent-authored interactive surfaces. These ARE
+      // registered in allCoreTools (local-runtime-tools.ts, gated by
+      // isSpacesEnabled, default-ON) but were never in this allowlist, so the
+      // workspace dock / re-engage turn ran on the orchestrator and self-
+      // reported "space_save is not exposed in this run" — then wrote the
+      // dataset to /tmp and reported a blocker instead of refreshing the
+      // surface. Same omission class as the workflow_* block below. byName
+      // no-ops to undefined (→ filtered out) when spaces are disabled, so this
+      // is safe with the flag off.
+      'space_get',
+      'space_list',
+      'space_save',
+      'space_edit_view',
+      'space_refresh',
       // Shell (approval-gated by taxonomy for mutating commands)
       'run_shell_command',
       // Tasks (writes)

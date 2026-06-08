@@ -166,6 +166,11 @@ async function runScript(slug: string, runner: string, extra?: Record<string, un
         resolve({ ok: false, error: `runner stdout was not valid JSON: ${out.slice(0, 200)}` });
       }
     });
+    // A fast runner (e.g. a shell echo) can exit before we finish writing the
+    // payload, closing its stdin — that surfaces as an ASYNC 'error' (EPIPE) on
+    // the stream, which the try/catch below can't catch and would otherwise
+    // become an uncaughtException. Swallow it: stdin is optional input.
+    child.stdin.on('error', () => { /* child closed stdin early — fine */ });
     try { child.stdin.end(payload); } catch { /* stdin optional */ }
   });
 }

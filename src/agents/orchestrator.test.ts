@@ -132,6 +132,11 @@ test('Orchestrator is now the single agent — carries the union of all action t
     'run_shell_command', 'write_file', 'read_file', 'list_files',
     // Workspace
     'workspace_config', 'workspace_info', 'workspace_list', 'workspace_roots',
+    // Workspaces (Spaces) authoring — must be on the orchestrator surface so the
+    // workspace dock / re-engage turn can actually edit + refresh a space
+    // (regression guard: these were registered but omitted from discoveryTools,
+    // so the dock self-reported "space_save is not exposed in this run").
+    'space_save', 'space_refresh', 'space_get', 'space_edit_view', 'space_list',
     // Tasks + goals + executions
     'task_list', 'task_add', 'task_update',
     'goal_get', 'goal_update',
