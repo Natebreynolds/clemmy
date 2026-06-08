@@ -16,7 +16,7 @@ import { usePoll } from '@/lib/poll';
 import {
   getComposioStatus, getComposioToolkits, authorizeComposio, refreshComposio, disconnectComposio, activeConnectionId,
   getCredentials, setCredential, setDiscordOwner,
-  normalizeCredentialRows, isConnected,
+  normalizeCredentialRows, isConnected, CODEX_MANAGED_SECRETS,
   connectedToolkits, searchToolkits, toolkitStatus,
   type CredentialRow, type CredentialDescriptor, type ComposioToolkit,
 } from '@/lib/connect';
@@ -56,6 +56,7 @@ export function Connect() {
   const credentialRows = normalizeCredentialRows(creds.data?.rows);
   const descriptors = creds.data?.descriptors ?? {};
   const discordAllowedUsers = creds.data?.discordAllowedUsers ?? '';
+  const codexSignedIn = Boolean(creds.data?.auth?.codexOauthPresent);
 
   const [refreshing, setRefreshing] = useState(false);
   const [appNotice, setAppNotice] = useState<{ tone: 'info' | 'error'; text: string } | null>(null);
@@ -164,6 +165,7 @@ export function Connect() {
             {credentialRows.map((row, i) => (
               <CredentialCard key={row.name || i} row={row} descriptor={descriptors[row.name ?? '']}
                 discordAllowedUsers={row.name === 'discord_bot_token' ? discordAllowedUsers : undefined}
+                codexSignedIn={codexSignedIn}
                 onSaved={() => qc.invalidateQueries({ queryKey: ['credentials'] })} />
             ))}
           </div>
@@ -228,16 +230,20 @@ function AppCard({ t, onConnect, onDisconnect }: { t: ComposioToolkit; onConnect
   );
 }
 
-function CredentialCard({ row, descriptor, discordAllowedUsers, onSaved }: {
-  row: CredentialRow; descriptor?: CredentialDescriptor; discordAllowedUsers?: string; onSaved: () => void;
+function CredentialCard({ row, descriptor, discordAllowedUsers, codexSignedIn = false, onSaved }: {
+  row: CredentialRow; descriptor?: CredentialDescriptor; discordAllowedUsers?: string; codexSignedIn?: boolean; onSaved: () => void;
 }) {
-  const connected = isConnected(row);
+  const name = row.name ?? '';
+  // Codex OAuth tokens are stored + refreshed automatically by the sign-in
+  // flow — never user-pasted. Show them green when signed in and hide the
+  // Set/Update editor so no one can clobber the auto-managed refresh token.
+  const managed = CODEX_MANAGED_SECRETS.has(name);
+  const connected = managed ? codexSignedIn : isConnected(row);
   const required = descriptor?.required ?? false;
   const [editing, setEditing] = useState(false);
   const [value, setValue] = useState('');
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
-  const name = row.name ?? '';
   const label = prettyName(name);
   const showDiscordOwner = discordAllowedUsers !== undefined;
 
@@ -257,9 +263,9 @@ function CredentialCard({ row, descriptor, discordAllowedUsers, onSaved }: {
           {descriptor?.description && <div className="truncate text-caption text-faint" title={descriptor.description}>{descriptor.description}</div>}
         </div>
         <StatusPill tone={connected ? 'success' : required ? 'warning' : 'neutral'}>
-          {connected ? 'Connected' : required ? 'Action needed' : 'Optional'}
+          {connected ? 'Connected' : managed ? 'Sign in needed' : required ? 'Action needed' : 'Optional'}
         </StatusPill>
-        {!editing && (
+        {!editing && !managed && (
           <Button variant="ghost" size="sm" onClick={() => setEditing(true)}>{connected ? 'Update' : 'Set'}</Button>
         )}
       </div>

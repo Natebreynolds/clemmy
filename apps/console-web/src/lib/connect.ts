@@ -75,8 +75,14 @@ export function activeConnectionId(t: ComposioToolkit): string | undefined {
   return (active ?? conns[0])?.id;
 }
 
+/** Codex/OpenAI auth snapshot (getAuthStatus on the daemon). codexOauthPresent
+ *  is true when the managed OAuth sign-in (access + refresh) is in place. */
+export interface AuthStatusLite { mode?: string; configured?: boolean; codexOauthPresent?: boolean; openaiApiKeyPresent?: boolean; [k: string]: unknown }
+/** Secrets that are MANAGED by the Codex sign-in flow — never user-pasted. */
+export const CODEX_MANAGED_SECRETS = new Set(['codex_oauth_access_token', 'codex_oauth_refresh_token']);
+
 export const getCredentials = () =>
-  apiGet<{ rows?: unknown; descriptors?: Record<string, CredentialDescriptor>; discordAllowedUsers?: string }>('/api/console/credentials');
+  apiGet<{ rows?: unknown; descriptors?: Record<string, CredentialDescriptor>; discordAllowedUsers?: string; auth?: AuthStatusLite }>('/api/console/credentials');
 export const setDiscordOwner = (ownerId: string) =>
   apiPost<{ ok: boolean; discordAllowedUsers?: string; appliesOnRestart?: boolean }>('/api/console/credentials/discord-owner', { ownerId });
 export const getMcpServers = () => apiGet<{ servers?: McpServer[] }>('/api/console/mcp-servers');
