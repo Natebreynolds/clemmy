@@ -38,6 +38,9 @@ const {
   getReflectionThreshold,
   runRecursiveReflection,
   consolidateActiveFacts,
+  consolidateFact,
+  getResolverStats,
+  _resetResolverStatsForTest,
   _testOnly_peekSessionImportance,
   _testOnly_resetAllSessionImportance,
 } = await import('./reflection.js');
@@ -386,6 +389,24 @@ test('runRecursiveReflection: an EMPTY extractor is a low-signal week (processed
     const res = await runRecursiveReflection({ extractor: async () => ({ patterns: [] }) });
     assert.equal(res.groupsFailed, 0, 'an empty-but-successful extractor is NOT a failure');
     assert.ok(res.groupsProcessed >= 1, 'the group was processed (ran fine, nothing to synthesize)');
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_REFLECTION; else process.env.CLEMMY_REFLECTION = prev;
+  }
+});
+
+
+test('getResolverStats: a novel fact tallies as an ADD (resolver observability)', async () => {
+  resetMemoryDb();
+  _resetResolverStatsForTest();
+  const prev = process.env.CLEMMY_REFLECTION; delete process.env.CLEMMY_REFLECTION;
+  try {
+    // A novel fact (no similar existing facts) takes the novelty fast-path → ADD,
+    // no LLM resolver call — deterministic in the test env.
+    const out = await consolidateFact({ kind: 'user', text: 'Nathan keeps a standing 9am Monday review.' });
+    assert.equal(out.written, 1, 'novel fact is added');
+    const stats = getResolverStats();
+    assert.ok(stats.add >= 1, 'the ADD decision is tallied');
+    assert.equal(stats.update + stats.delete + stats.noop, 0, 'no update/delete/noop for a novel add');
   } finally {
     if (prev === undefined) delete process.env.CLEMMY_REFLECTION; else process.env.CLEMMY_REFLECTION = prev;
   }

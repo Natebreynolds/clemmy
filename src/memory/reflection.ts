@@ -441,7 +441,34 @@ export interface ConsolidateOptions {
  *
  * Falls back to ADD on any resolver failure — we never lose a fact.
  */
+
+// Cumulative resolver-decision tallies since process start. Surfaces whether
+// refinement is actually happening (UPDATE/DELETE/NOOP supersede or merge) or
+// the store is just growing by ADD — the deep-dive's open question. Read by the
+// diagnostics panel; reset only on restart.
+const resolverStats = { add: 0, update: 0, delete: 0, noop: 0 };
+export function getResolverStats(): { add: number; update: number; delete: number; noop: number } {
+  return { ...resolverStats };
+}
+export function _resetResolverStatsForTest(): void {
+  resolverStats.add = 0; resolverStats.update = 0; resolverStats.delete = 0; resolverStats.noop = 0;
+}
+
 export async function consolidateFact(
+  candidate: ConsolidateCandidate,
+  ctx: ConsolidateContext = {},
+  opts: ConsolidateOptions = {},
+): Promise<ConsolidateOutcome> {
+  const out = await consolidateFactInner(candidate, ctx, opts);
+  // Tally the resolver decision (a fact is exactly one of these per call).
+  if (out.updated) resolverStats.update += 1;
+  else if (out.deleted) resolverStats.delete += 1;
+  else if (out.noop) resolverStats.noop += 1;
+  else if (out.written) resolverStats.add += 1;
+  return out;
+}
+
+async function consolidateFactInner(
   candidate: ConsolidateCandidate,
   ctx: ConsolidateContext = {},
   opts: ConsolidateOptions = {},
