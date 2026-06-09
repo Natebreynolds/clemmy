@@ -17,6 +17,7 @@ import {
 import { recordToolEvent } from '../agents/tool-observability.js';
 import { classifySource, isSourceTrustEnabled, AUTHORITATIVE_TRUST } from './authoritative-sources.js';
 import { isSourceMapEnabled, upsertResourcePointer } from './source-map.js';
+import { cosine, loadFactEmbeddings } from './embeddings.js';
 
 /**
  * Reflection-on-tool-return — Phase 1 of the brain architecture.
@@ -1091,12 +1092,21 @@ export interface DedupResult {
  * sim=null and nothing is folded (no-op). Capped by `maxMerges` per run.
  * Soft delete only (active=0) — fully reversible, embedding + audit kept.
  */
+function dedupStoredEmbeddingsEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_DEDUP_STORED_EMBEDDINGS', 'on') || 'on').toLowerCase() !== 'off';
+}
+
 export async function consolidateActiveFacts(
-  opts: { perKind?: number; maxMerges?: number; simThreshold?: number } = {},
+  opts: { perKind?: number; maxMerges?: number; simThreshold?: number; useStoredEmbeddings?: boolean } = {},
 ): Promise<DedupResult> {
-  const perKind = Math.max(1, opts.perKind ?? 200);
   const maxMerges = Math.max(0, opts.maxMerges ?? 100);
   const simThreshold = opts.simThreshold ?? 0.95;
+  const useStored = opts.useStoredEmbeddings ?? dedupStoredEmbeddingsEnabled();
+  // The stored-embedding path scans the FULL active set per kind (in-memory
+  // pairwise cosine over vectors we ALREADY computed — ZERO new API calls), so
+  // the old 200-row window that left ~59% of project facts un-deduped is gone.
+  // The legacy re-embedding path keeps the conservative window to bound cost.
+  const perKind = Math.max(1, opts.perKind ?? (useStored ? 5000 : 200));
   const result: DedupResult = { examined: 0, merged: 0, ids: [] };
   if (maxMerges === 0) return result;
 
@@ -1104,6 +1114,48 @@ export async function consolidateActiveFacts(
   const kinds: ConsolidatedFactKind[] = ['user', 'project', 'feedback', 'reference'];
   const folded = new Set<number>();
 
+  if (useStored) {
+    for (const kind of kinds) {
+      if (result.merged >= maxMerges) break;
+      const rows = db.prepare(`
+        SELECT id, content, score FROM consolidated_facts
+        WHERE active = 1 AND kind = ? AND pinned = 0
+        ORDER BY updated_at DESC
+        LIMIT ?
+      `).all(kind, perKind) as { id: number; content: string; score: number }[];
+      const vecs = loadFactEmbeddings(rows.map((r) => r.id));
+      // Only facts with a stored embedding participate; the handful not yet
+      // embedded are folded on a later run once the backfill catches them.
+      const embedded = rows.filter((r) => vecs.has(r.id));
+      for (let i = 0; i < embedded.length; i += 1) {
+        if (result.merged >= maxMerges) break;
+        const a = embedded[i];
+        if (folded.has(a.id)) continue;
+        result.examined += 1;
+        const va = vecs.get(a.id);
+        if (!va) continue;
+        for (let j = i + 1; j < embedded.length; j += 1) {
+          if (result.merged >= maxMerges) break;
+          const b = embedded[j];
+          if (folded.has(b.id)) continue;
+          const vb = vecs.get(b.id);
+          if (!vb || cosine(va, vb) < simThreshold) continue;
+          // Keep the higher-scored fact (tie → larger id = newer); drop the other.
+          const keepId = a.score > b.score || (a.score === b.score && a.id > b.id) ? a.id : b.id;
+          const dropId = keepId === a.id ? b.id : a.id;
+          if (deleteFact(dropId)) {
+            folded.add(dropId);
+            result.merged += 1;
+            result.ids.push(dropId);
+          }
+          if (dropId === a.id) break; // a was folded away — advance to next i
+        }
+      }
+    }
+    return result;
+  }
+
+  // Legacy per-row re-embedding path (kill-switch: CLEMMY_DEDUP_STORED_EMBEDDINGS=off).
   for (const kind of kinds) {
     const rows = db.prepare(`
       SELECT id, content, score FROM consolidated_facts
