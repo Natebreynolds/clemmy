@@ -88,6 +88,10 @@ export interface ConsolidatedFactRow {
   // record (Salesforce/Outlook/Airtable/…). NULL otherwise. Provenance
   // only; the trust prior lives in trust_level.
   source_app: string | null;
+  // v11 — number of times this fact has been surfaced into a prompt.
+  // Folded as log(1+access_count) into the recall score (reinforcement)
+  // and used as a decay-resistance signal. Defaults to 0.
+  access_count: number;
 }
 
 export type EntityType = 'person' | 'company' | 'project' | 'place' | 'thing';
@@ -467,6 +471,18 @@ const MIGRATIONS: { version: number; sql: string }[] = [
         ON resource_pointers(last_seen_at DESC);
       CREATE INDEX IF NOT EXISTS idx_resource_app
         ON resource_pointers(app, last_seen_at DESC);
+    `,
+  },
+  {
+    // v11 — access-frequency reinforcement (Stanford "Generative Agents" §4:
+    // retrieval frequency feeds the importance/recency loop). access_count
+    // increments every time a fact is surfaced (touchFactAccess); the recall
+    // score folds in log(1+access_count) so a repeatedly-useful fact ranks
+    // higher AND resists decay — memory compounds and sharpens with use instead
+    // of treating a fact recalled 50x the same as one never recalled.
+    version: 11,
+    sql: `
+      ALTER TABLE consolidated_facts ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0;
     `,
   },
 ];

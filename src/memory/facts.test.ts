@@ -34,6 +34,7 @@ const {
   setFactPinned,
   setTurnQueryVector,
   clearTurnQueryVector,
+  touchFactAccess,
 } = await import('./facts.js');
 const { vectorToBuffer } = await import('./embeddings.js');
 
@@ -577,4 +578,29 @@ test('lexicalRelevance: a detailed on-point fact is not demoted by its length (s
   assert.ok(dScore >= 0.6, `detailed on-point fact should score by coverage, got ${dScore}`);
   // A short exact match still scores 1.0 (precision path preserved).
   assert.equal(lexicalRelevance('legal contract', 'legal contract'), 1);
+});
+
+test('access reinforcement: a frequently-recalled fact outranks an equal-base never-recalled one', () => {
+  process.env.CLEMMY_RECALL_REINFORCEMENT_WEIGHT = '0.1';
+  clearTurnQueryVector();
+  const db = openMemoryDb();
+  const a = rememberFact({ kind: 'user', content: 'Reinforced fact A.', importance: 5 });
+  const b = rememberFact({ kind: 'user', content: 'Never-recalled fact B.', importance: 5 });
+  // Identical recency anchor + importance for both; A has 50 prior recalls.
+  const sameTime = new Date().toISOString();
+  db.prepare('UPDATE consolidated_facts SET last_accessed_at = ?, access_count = ? WHERE id = ?').run(sameTime, 50, a.id);
+  db.prepare('UPDATE consolidated_facts SET last_accessed_at = ?, access_count = ? WHERE id = ?').run(sameTime, 0, b.id);
+  const ranked = listActiveFacts({ ranking: 'stanford', limit: 5 });
+  const ai = ranked.findIndex((f) => f.id === a.id);
+  const bi = ranked.findIndex((f) => f.id === b.id);
+  assert.ok(ai >= 0 && ai < bi, 'the reinforced fact (50 recalls) ranks above the never-recalled equal');
+  delete process.env.CLEMMY_RECALL_REINFORCEMENT_WEIGHT;
+});
+
+test('touchFactAccess increments access_count', () => {
+  const a = rememberFact({ kind: 'user', content: 'Touch me for reinforcement.' });
+  assert.equal(getFact(a.id)?.accessCount ?? 0, 0, 'new fact starts at 0 accesses');
+  touchFactAccess(a.id);
+  touchFactAccess(a.id);
+  assert.equal(getFact(a.id)?.accessCount, 2, 'two touches → access_count 2');
 });
