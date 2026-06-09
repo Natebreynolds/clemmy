@@ -23,6 +23,7 @@ import { listMcpServerHealth, type MCPServerHealthSnapshot } from '../runtime/mc
 import { readCachedScan } from '../runtime/cli-discovery.js';
 import { redactSensitiveText, redactSensitiveValue } from '../runtime/security.js';
 import { getEmbeddingHealth, readEmbeddingStats, countUnembeddedActiveFacts } from '../memory/embeddings.js';
+import { getResolverStats } from '../memory/reflection.js';
 
 const SUPERVISOR_LOG_PATH = path.join(BASE_DIR, 'logs', 'desktop', 'supervisor.log');
 const TOOL_EVENTS_DIR = path.join(BASE_DIR, 'state', 'tool-events');
@@ -58,6 +59,9 @@ export interface SemanticMemoryHealth {
   lastSuccessAt: string | null;
   lastErrorClass: string | null;
   lastErrorAt: string | null;
+  /** Mem0 resolver decision tallies since process start — shows whether
+   *  refinement (update/delete/noop) is happening or the store just ADDs. */
+  resolver: { add: number; update: number; delete: number; noop: number };
 }
 
 export interface ToolEventsSummary {
@@ -294,6 +298,7 @@ function readSemanticMemoryHealth(): SemanticMemoryHealth {
     lastSuccessAt: h.lastSuccessAt,
     lastErrorClass: h.lastErrorClass,
     lastErrorAt: h.lastErrorAt,
+    resolver: getResolverStats(),
   };
 }
 

@@ -24032,6 +24032,7 @@ const CONSOLE_JS = `
         '<div class="diag-error-row"><span class="diag-level ' + lvl + '">' + statusLabel + '</span><span>' + escMem(sm.detail || '') + '</span></div>' +
         '<div class="diag-row"><span>model</span><em>' + escMem(sm.model || '—') + (sm.dim ? ' · ' + sm.dim + 'd' : '') + '</em></div>' +
         '<div class="diag-row"><span>embedded / awaiting</span><em>' + sm.embeddedCount + ' / ' + sm.unembeddedActiveCount + '</em></div>' +
+        (sm.resolver ? '<div class="diag-row"><span>refinement (add/upd/del/noop)</span><em>' + sm.resolver.add + '/' + sm.resolver.update + '/' + sm.resolver.delete + '/' + sm.resolver.noop + '</em></div>' : '') +
         '<div class="diag-row"><span>last success</span><em>' + (sm.lastSuccessAt ? escMem(String(sm.lastSuccessAt).slice(0, 19).replace('T', ' ')) : '—') + '</em></div>' +
         (sm.lastErrorClass ? '<div class="diag-row"><span>last error</span><em>' + escMem(sm.lastErrorClass) + (sm.lastErrorAt ? ' · ' + escMem(String(sm.lastErrorAt).slice(11, 19)) : '') + '</em></div>' : '');
     }
