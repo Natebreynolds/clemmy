@@ -926,6 +926,10 @@ interface RecursiveReflectionResult {
   groupsProcessed: number;
   groupsSkipped: number;
   factsConsidered: number;
+  /** Groups whose extractor LLM call FAILED (returned null) — distinct from a
+   *  low-signal night (groups processed, 0 patterns). >0 means the synthesizer
+   *  is broken (auth/quota/model), not that the week was quiet. */
+  groupsFailed: number;
 }
 
 async function runRecursivePatternExtractor(
@@ -963,7 +967,10 @@ async function runRecursivePatternExtractor(
  * Returns counts for observability. Safe to call from a cron tick or
  * manually for testing. Honors CLEMMY_REFLECTION=off.
  */
-export async function runRecursiveReflection(): Promise<RecursiveReflectionResult> {
+export async function runRecursiveReflection(
+  opts: { extractor?: typeof runRecursivePatternExtractor } = {},
+): Promise<RecursiveReflectionResult> {
+  const extractFn = opts.extractor ?? runRecursivePatternExtractor;
   const startedAt = Date.now();
   const result: RecursiveReflectionResult = {
     patternsWritten: 0,
@@ -972,6 +979,7 @@ export async function runRecursiveReflection(): Promise<RecursiveReflectionResul
     groupsProcessed: 0,
     groupsSkipped: 0,
     factsConsidered: 0,
+    groupsFailed: 0,
   };
 
   const emit = (skipped?: 'disabled' | 'empty'): RecursiveReflectionResult => {
@@ -982,11 +990,12 @@ export async function runRecursiveReflection(): Promise<RecursiveReflectionResul
       kind: 'read',
       phase: 'end',
       durationMs: Date.now() - startedAt,
-      // Same semantics as reflection.ts: extractor returning empty is
-      // still success (groups <5 facts get groupsSkipped++; runs that
-      // produced no patterns reflect a low-signal week, not a failure).
-      outcome: skipped ? 'cancelled' : 'success',
-      argsSummary: `groups=${result.groupsProcessed}/${result.groupsProcessed + result.groupsSkipped} facts=${result.factsConsidered} written=${result.patternsWritten} updated=${result.patternsUpdated} noop=${result.patternsNoop}${skipped ? ` skipped=${skipped}` : ''}`,
+      // A group that ran but produced no patterns is a low-signal week (success).
+      // A group whose extractor FAILED (groupsFailed>0) means the synthesizer is
+      // broken (auth/quota/model) — surface that as 'error' so a dark compounding
+      // layer can't hide behind written=0 like it did before.
+      outcome: skipped ? 'cancelled' : (result.groupsFailed > 0 && result.patternsWritten === 0 && result.patternsUpdated === 0 ? 'error' : 'success'),
+      argsSummary: `groups=${result.groupsProcessed}/${result.groupsProcessed + result.groupsSkipped + result.groupsFailed} failed=${result.groupsFailed} facts=${result.factsConsidered} written=${result.patternsWritten} updated=${result.patternsUpdated} noop=${result.patternsNoop}${skipped ? ` skipped=${skipped}` : ''}`,
     });
     return result;
   };
@@ -1015,8 +1024,16 @@ export async function runRecursiveReflection(): Promise<RecursiveReflectionResul
     }
     result.factsConsidered += rows.length;
 
-    const extraction = await runRecursivePatternExtractor(kind, rows);
-    if (!extraction || extraction.patterns.length === 0) {
+    const extraction = await extractFn(kind, rows);
+    if (!extraction) {
+      // The extractor LLM call FAILED (auth/quota/model) — not a quiet week.
+      // Counted separately so the emit can flag a broken synthesizer instead of
+      // masquerading as success/written=0.
+      result.groupsFailed += 1;
+      continue;
+    }
+    if (extraction.patterns.length === 0) {
+      // Ran fine; genuinely nothing higher-order to synthesize this week.
       result.groupsProcessed += 1;
       continue;
     }
@@ -1068,7 +1085,10 @@ export async function runRecursiveReflection(): Promise<RecursiveReflectionResul
     }
   }
 
-  if (!producedAnything && result.groupsProcessed === 0) return emit('empty');
+  // 'empty' (a quiet, low-signal week) ONLY when nothing was produced AND no
+  // group failed. If groups failed, fall through to emit() so the outcome is
+  // flagged 'error' rather than masquerading as a cancelled/empty run.
+  if (!producedAnything && result.groupsProcessed === 0 && result.groupsFailed === 0) return emit('empty');
   return emit();
 }
 
