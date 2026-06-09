@@ -1,9 +1,8 @@
 import { useState } from 'react';
 import { useLocation } from 'react-router-dom';
-import { ExternalLink, Search } from 'lucide-react';
+import { Search } from 'lucide-react';
 import { Page } from '@/components/Page';
 import { Card } from '@/components/ui/Card';
-import { Button } from '@/components/ui/Button';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { EmptyState } from '@/components/ui/EmptyState';
@@ -12,14 +11,7 @@ import { getUsage, getTools, fmtNum } from '@/lib/advanced';
 import { BudgetsForm } from './advanced/BudgetsForm';
 import { AutonomyForm } from './advanced/AutonomyForm';
 import { DiagnosticsView } from './advanced/DiagnosticsView';
-
-function ClassicLink({ label }: { label: string }) {
-  return (
-    <a href="/console-legacy" target="_self">
-      <Button variant="secondary" size="sm"><ExternalLink className="h-4 w-4" aria-hidden /> {label}</Button>
-    </a>
-  );
-}
+import { EvolutionView } from './advanced/EvolutionView';
 
 function Usage() {
   const usage = usePoll(['usage'], getUsage, 15000);
@@ -110,17 +102,6 @@ function Tools() {
   );
 }
 
-function InfoScreen({ title, subtitle, body }: { title: string; subtitle: string; body: string }) {
-  return (
-    <Page title={title} subtitle={subtitle}>
-      <Card className="p-6">
-        <p className="mb-4 max-w-xl text-body text-muted">{body}</p>
-        <ClassicLink label="Open in classic view" />
-      </Card>
-    </Page>
-  );
-}
-
 export function Advanced() {
   const { pathname } = useLocation();
   const seg = pathname.split('/').filter(Boolean)[1] ?? 'usage';
@@ -130,9 +111,7 @@ export function Advanced() {
     case 'diagnostics': return <DiagnosticsView />;
     case 'budgets': return <BudgetsForm />;
     case 'autonomy': return <AutonomyForm />;
-    case 'evolution':
-      return <InfoScreen title="Evolution" subtitle="Nightly self-research"
-        body="Observations Clementine gathers about how to work better for you. Read the latest reports in the classic view for now." />;
+    case 'evolution': return <EvolutionView />;
     default: return <Usage />;
   }
 }
