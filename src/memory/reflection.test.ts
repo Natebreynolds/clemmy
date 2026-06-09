@@ -364,6 +364,33 @@ test('consolidateActiveFacts (stored embeddings): makes ZERO new embed API calls
   assert.equal(res.merged, 0, 'un-embedded facts are skipped, not re-embedded');
 });
 
+
+test('runRecursiveReflection: a FAILING extractor is counted as groupsFailed (not a silent quiet week)', async () => {
+  resetMemoryDb();
+  const prev = process.env.CLEMMY_REFLECTION; delete process.env.CLEMMY_REFLECTION;
+  try {
+    for (let i = 0; i < 6; i += 1) rememberFact({ kind: 'project', content: `Distinct roadmap signal number ${i} for synthesis.` });
+    const res = await runRecursiveReflection({ extractor: async () => null }); // simulate broken synthesizer
+    assert.ok(res.groupsFailed >= 1, 'a null extractor return is a FAILED group, not low-signal');
+    assert.equal(res.patternsWritten, 0);
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_REFLECTION; else process.env.CLEMMY_REFLECTION = prev;
+  }
+});
+
+test('runRecursiveReflection: an EMPTY extractor is a low-signal week (processed, 0 failed)', async () => {
+  resetMemoryDb();
+  const prev = process.env.CLEMMY_REFLECTION; delete process.env.CLEMMY_REFLECTION;
+  try {
+    for (let i = 0; i < 6; i += 1) rememberFact({ kind: 'project', content: `Distinct low-signal fact number ${i}.` });
+    const res = await runRecursiveReflection({ extractor: async () => ({ patterns: [] }) });
+    assert.equal(res.groupsFailed, 0, 'an empty-but-successful extractor is NOT a failure');
+    assert.ok(res.groupsProcessed >= 1, 'the group was processed (ran fine, nothing to synthesize)');
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_REFLECTION; else process.env.CLEMMY_REFLECTION = prev;
+  }
+});
+
 // Cleanup
 process.on('exit', () => {
   try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* ignore */ }
