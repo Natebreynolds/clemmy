@@ -664,7 +664,16 @@ export function lexicalRelevance(objective: string, content: string): number {
   if (factTokens.size === 0) return 0;
   let hits = 0;
   for (const tok of factTokens) if (objTokens.has(tok)) hits += 1;
-  return hits / factTokens.size;
+  // Blend precision (hits ÷ fact tokens) with objective COVERAGE (hits ÷
+  // objective tokens). Precision alone has a short-fact bias: a detailed,
+  // on-point fact with many tokens is divided by its own length and loses to a
+  // short generic one (the verified "travis" failure mode). Coverage credits a
+  // fact for addressing the objective's key terms regardless of its length;
+  // max() keeps the [0,1] range and removes the bias without penalizing short
+  // exact matches (which still score 1.0 via precision).
+  const precision = hits / factTokens.size;
+  const coverage = hits / objTokens.size;
+  return Math.max(precision, coverage);
 }
 
 // Weights for the objective-scoped blend (Move 1 — scoped recall).

@@ -567,3 +567,14 @@ test('listActiveFacts(stanford): semantic recall is a no-op when the flag is off
   clearTurnQueryVector();
   delete process.env.CLEMMY_SEMANTIC_RECALL;
 });
+
+test('lexicalRelevance: a detailed on-point fact is not demoted by its length (short-fact bias fix)', () => {
+  const objective = 'travis county permit contact email';
+  const detailed = 'The Travis County permit office contact is Jane Doe handling residential building permits';
+  const dScore = lexicalRelevance(objective, detailed);
+  // Covers 4/5 objective terms → strong relevance via coverage, even though
+  // precision (4/11) is low. Old behavior scored this ~0.36 and lost to noise.
+  assert.ok(dScore >= 0.6, `detailed on-point fact should score by coverage, got ${dScore}`);
+  // A short exact match still scores 1.0 (precision path preserved).
+  assert.equal(lexicalRelevance('legal contract', 'legal contract'), 1);
+});

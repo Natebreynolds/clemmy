@@ -323,7 +323,7 @@ export function buildAssistantInstructions(context: MemoryContext, channel?: str
 
   // Legacy (flag OFF): the original interleaved prompt — byte-identical to the
   // pre-tiering chat path (reverts the always-on learned-blocks injection too).
-  const persistentFacts = section('Persistent Facts', renderFactsForInstructions(12, 1600, getRecallObjective(message)));
+  const persistentFacts = section('Persistent Facts', renderFactsForInstructions(12, 2600, getRecallObjective(message)));
   const dataLandscape = section('Data Landscape', renderSourceMapForContext(24, undefined, getRecallObjective(message)));
   return [
     // Date FIRST so the model reads it before any other context (matches harness).
@@ -384,7 +384,7 @@ export function buildTurnContextBlock(context: MemoryContext, intent?: MessageIn
   const blocks = [
     parityOn ? section('Now', renderCurrentTimeForInstructions()) : '',
     // 'scored' — pinned facts are already in Tier-1; avoid double-rendering.
-    section('Persistent Facts', renderFactsForInstructions(12, 1600, objective, 'scored')),
+    section('Persistent Facts', renderFactsForInstructions(12, 2600, objective, 'scored')),
     recentlyLearned,
     section('Data Landscape', renderSourceMapForContext(24, undefined, objective)),
     toolChoices,

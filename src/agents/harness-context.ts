@@ -246,7 +246,7 @@ export function renderHarnessMemoryContext(): string {
     // objective so an off-topic fact can't leak into a focused session.
     // getActiveObjective() returns undefined when there's no focus or the
     // flag is off → identical to the global ranking (no regression).
-    facts = renderFactsForInstructions(10, 1600, getActiveObjective());
+    facts = renderFactsForInstructions(10, 2600, getActiveObjective());
   } catch {
     facts = '';
   }
