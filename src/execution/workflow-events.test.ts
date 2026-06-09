@@ -28,7 +28,7 @@ import os from 'node:os';
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-events-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
 
-const { appendWorkflowEvent, readWorkflowEvents, computeResumeState, listPendingRuns } =
+const { appendWorkflowEvent, readWorkflowEvents, computeResumeState, listPendingRuns, reapRunEventDir } =
   await import('./workflow-events.js');
 const { WORKFLOWS_DIR } = await import('../memory/vault.js');
 const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
@@ -140,16 +140,38 @@ test('readWorkflowEvents skips corrupt trailing lines without throwing', () => {
 
 test('listPendingRuns excludes terminal runs and includes in-flight', () => {
   // Done run
-  appendWorkflowEvent('done', 'r1', { kind: 'run_started' });
-  appendWorkflowEvent('done', 'r1', { kind: 'run_completed' });
+  appendWorkflowEvent('done', 'rdone', { kind: 'run_started' });
+  appendWorkflowEvent('done', 'rdone', { kind: 'run_completed' });
   // Still running
-  appendWorkflowEvent('in-flight', 'r1', { kind: 'run_started' });
-  appendWorkflowEvent('in-flight', 'r1', { kind: 'step_started', stepId: 'one' });
+  appendWorkflowEvent('in-flight', 'rflight', { kind: 'run_started' });
+  appendWorkflowEvent('in-flight', 'rflight', { kind: 'step_started', stepId: 'one' });
+  // A real in-flight run ALWAYS has a (non-terminal) queue record — written at
+  // enqueue, before any event. (P0-2: a run with events but NO record is a
+  // reaped orphan, not in-flight — see the next test.)
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, 'rflight.json'), JSON.stringify({ id: 'rflight', workflow: 'in-flight', status: 'running' }), 'utf-8');
 
   const pending = listPendingRuns();
   const flights = pending.map((p) => `${p.workflowName}/${p.runId}`);
-  assert.ok(flights.includes('in-flight/r1'), 'still-running run is pending');
-  assert.ok(!flights.includes('done/r1'), 'completed run is not pending');
+  assert.ok(flights.includes('in-flight/rflight'), 'still-running run with a running record is pending');
+  assert.ok(!flights.includes('done/rdone'), 'completed run is not pending');
+});
+
+test('listPendingRuns excludes a run whose queue record is MISSING (reaped orphan) — P0-2', () => {
+  appendWorkflowEvent('reaped', 'orphan-1', { kind: 'run_started' });
+  appendWorkflowEvent('reaped', 'orphan-1', { kind: 'step_started', stepId: 'one' });
+  // No record file → reaped (or never persisted). It must NOT resume as a
+  // phantom on boot (the May-29 "Resuming N in-flight runs" symptom).
+  const flights = listPendingRuns().map((p) => `${p.workflowName}/${p.runId}`);
+  assert.ok(!flights.includes('reaped/orphan-1'), 'a run with a missing record is terminal-by-deletion, not pending');
+});
+
+test('reapRunEventDir removes the run event-log directory — P0-2', () => {
+  appendWorkflowEvent('reapme', 'rid', { kind: 'run_started' });
+  const dir = path.join(WORKFLOWS_DIR, 'reapme', 'runs', 'rid');
+  assert.ok(existsSync(dir), 'event dir exists after an event');
+  reapRunEventDir('reapme', 'rid');
+  assert.ok(!existsSync(dir), 'event dir removed after reap');
 });
 
 test('listPendingRuns excludes runs with terminal queue-record status', () => {

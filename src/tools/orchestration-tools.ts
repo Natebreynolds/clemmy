@@ -1183,10 +1183,20 @@ export function registerOrchestrationTools(server: McpServer): void {
 
       // Auto-repair the fixable binding gaps before persisting so an edit
       // that left a dangling {{steps.X.output}} / forEach / {{input.X}}
-      // saves runnable. Update has never gated on validation; keep it that
-      // way — the repair only ever improves the saved definition.
+      // saves runnable.
       const updatePrep = prepareWorkflowForWrite(next);
       const savedNext = updatePrep.def;
+      // P0-4: an ENABLED workflow must be valid — it runs on schedule. Auto-repair
+      // fixes mechanical gaps, but non-repairable defects (cycles, ungated sends,
+      // unknown deps) must NOT go live silently. This was the ONLY write seam that
+      // computed validation then discarded it; gate it like every other seam
+      // (create / dashboard PATCH / set_enabled / schedule). A DISABLED draft may
+      // still save invalid so the user can keep iterating.
+      if (savedNext.enabled && !updatePrep.ok) {
+        return textResult(
+          `Workflow "${entry.name}" was NOT updated — it's enabled and these must be fixed first (or disable it to keep iterating):\n- ${updatePrep.errors.join('\n- ')}`,
+        );
+      }
       writeWorkflow(entry.name, savedNext);
       const changed = [
         description !== undefined ? 'description' : '',

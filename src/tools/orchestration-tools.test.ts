@@ -170,6 +170,30 @@ test('workflow_update can add an output contract to an existing step', async () 
   assert.deepEqual(readWorkflow('upc-wf')!.data.steps[0].output, contract);
 });
 
+test('workflow_update refuses to save an ENABLED workflow that becomes invalid — P0-4 gate', async () => {
+  // Seed an enabled, valid single-step workflow.
+  writeWorkflow('p04-wf', {
+    name: 'p04-wf',
+    description: 'x',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{ id: 'only', prompt: 'Do the thing.' }],
+  });
+  // Update it into a dependency CYCLE (not auto-repairable) — would fail at the
+  // next fire. The gate must refuse and leave the live definition untouched.
+  const result = await workflowUpdate()({
+    name: 'p04-wf',
+    steps: [
+      { id: 'a', prompt: 'A', dependsOn: ['b'] },
+      { id: 'b', prompt: 'B', dependsOn: ['a'] },
+    ],
+  });
+  assert.match(resultText(result), /NOT updated/i);
+  const after = readWorkflow('p04-wf')!.data;
+  assert.equal(after.steps.length, 1, 'invalid update did not persist');
+  assert.equal(after.steps[0].id, 'only');
+});
+
 test('workflow_create rejects malformed inputs schema JSON without creating', async () => {
   const result = await workflowCreate()({
     name: 'bad-wf',
