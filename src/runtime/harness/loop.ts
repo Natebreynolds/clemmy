@@ -45,6 +45,7 @@ import { classifyCodexAuthError, markCodexAuthDead, isCodexAuthDead } from '../a
 import { BoundaryError } from '../boundary-error.js';
 import { getRuntimeEnv } from '../../config.js';
 import { captureInteractionSignals } from '../../memory/auto-capture.js';
+import { primeTurnRecallVector } from '../../memory/facts.js';
 import { formatSearchHits, searchVault, searchVaultAsync } from '../../memory/search.js';
 import { maybeAutoFocusSession } from './auto-focus.js';
 import { getPlanScope, openPlanScope } from '../../agents/plan-scope.js';
@@ -2184,7 +2185,14 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     }
   }
 
-  const turnMemoryPrimer = await buildTurnMemoryPrimer(options.input);
+  // Run the memory primer and the semantic-recall query embed concurrently —
+  // the embed stashes the turn's query vector so the (sync) per-turn fact recall
+  // can add a relevance term, at ~no added latency (both are network-bound and
+  // overlap). primeTurnRecallVector never throws.
+  const [turnMemoryPrimer] = await Promise.all([
+    buildTurnMemoryPrimer(options.input),
+    primeTurnRecallVector(options.input),
+  ]);
   const contextPacket = buildAgentContextPacket(options.input, {
     enabled: turnMemoryPrimer.enabled,
     hitCount: turnMemoryPrimer.hitCount,

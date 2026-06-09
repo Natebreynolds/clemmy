@@ -32,7 +32,10 @@ const {
   reviewStandingInstructions,
   searchFacts,
   setFactPinned,
+  setTurnQueryVector,
+  clearTurnQueryVector,
 } = await import('./facts.js');
+const { vectorToBuffer } = await import('./embeddings.js');
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -513,4 +516,54 @@ test('listActiveFacts(stanford): a warm high-importance fact past the updated_at
   );
 
   delete process.env.CLEMMY_RECALL_POOL;
+});
+
+test('listActiveFacts(stanford): a semantically-relevant fact is promoted by the turn query vector (bonus-only)', () => {
+  process.env.CLEMMY_SEMANTIC_RECALL = 'on';
+  const db = openMemoryDb();
+  const embed = db.prepare(`INSERT INTO fact_embeddings (fact_id, model, dim, vector, content_hash, created_at)
+                            VALUES (?, 'test', 4, ?, ?, datetime('now'))`);
+  const setVec = (id: number, arr: number[], hash: string) => embed.run(id, vectorToBuffer(Float32Array.from(arr)), hash);
+
+  // Relevant but LOW importance → loses on base Stanford score.
+  const relevant = rememberFact({ kind: 'user', content: 'Nathan default sending identity is scorpion email.', importance: 3 });
+  setVec(relevant.id, [1, 0, 0, 0], 'h-rel');
+  // Off-topic but HIGH importance → wins the slot on base score alone.
+  const offtopic = rememberFact({ kind: 'project', content: 'Home services plumbing emergency funnel.', importance: 8 });
+  setVec(offtopic.id, [0, 1, 0, 0], 'h-off');
+
+  const rankOf = (id: number, facts: { id: number }[]) => facts.findIndex((f) => f.id === id);
+
+  // No turn vector → base ranking: high-importance off-topic fact wins.
+  clearTurnQueryVector();
+  const base = listActiveFacts({ ranking: 'stanford', limit: 5 });
+  assert.ok(rankOf(offtopic.id, base) < rankOf(relevant.id, base), 'baseline: high-importance off-topic fact outranks the relevant one');
+
+  // Turn vector aligned with the relevant fact → its cosine bonus promotes it.
+  setTurnQueryVector('what email do I send from', Float32Array.from([1, 0, 0, 0]));
+  const withSem = listActiveFacts({ ranking: 'stanford', limit: 5 });
+  assert.ok(rankOf(relevant.id, withSem) < rankOf(offtopic.id, withSem), 'semantic bonus promotes the on-topic fact above the merely-recent/important one');
+
+  clearTurnQueryVector();
+  delete process.env.CLEMMY_SEMANTIC_RECALL;
+});
+
+test('listActiveFacts(stanford): semantic recall is a no-op when the flag is off', () => {
+  process.env.CLEMMY_SEMANTIC_RECALL = 'off';
+  const db = openMemoryDb();
+  const embed = db.prepare(`INSERT INTO fact_embeddings (fact_id, model, dim, vector, content_hash, created_at)
+                            VALUES (?, 'test', 4, ?, ?, datetime('now'))`);
+  const rel = rememberFact({ kind: 'user', content: 'Low importance but on-topic.', importance: 3 });
+  embed.run(rel.id, vectorToBuffer(Float32Array.from([1, 0, 0, 0])), 'h2-rel');
+  const off = rememberFact({ kind: 'project', content: 'High importance off-topic.', importance: 8 });
+  embed.run(off.id, vectorToBuffer(Float32Array.from([0, 1, 0, 0])), 'h2-off');
+
+  setTurnQueryVector('on-topic query', Float32Array.from([1, 0, 0, 0]));
+  const facts = listActiveFacts({ ranking: 'stanford', limit: 5 });
+  const ri = facts.findIndex((f) => f.id === rel.id);
+  const oi = facts.findIndex((f) => f.id === off.id);
+  assert.ok(oi < ri, 'with the flag OFF the vector is ignored — base ranking stands');
+
+  clearTurnQueryVector();
+  delete process.env.CLEMMY_SEMANTIC_RECALL;
 });
