@@ -35,6 +35,7 @@ import { processMemoryMaintenance } from '../memory/maintenance.js';
 import { runRecursiveReflection, consolidateActiveFacts } from '../memory/reflection.js';
 import { decayAndEvictFacts } from '../memory/facts.js';
 import { appendHygieneAudit } from '../memory/hygiene-audit.js';
+import { autoCleanSafeMemory } from '../autoresearch/memory-apply.js';
 import {
   CRON_FILE,
 } from '../memory/vault.js';
@@ -443,6 +444,22 @@ async function processMemoryHygieneTick(state: DaemonState): Promise<void> {
         'Memory dedup/consolidation failed (will retry tomorrow)',
       );
     }
+  }
+  // Tier A4: auto-clean the provably-safe class (synthetic smoke-test pollution
+  // matched by EXACT signature). The first auto-APPLY of the memory-refinement
+  // loop. Soft, capped, pinned-exempt, audited (kind:'autoclean'), reversible —
+  // and it only ever touches non-user-knowledge. CLEMMY_MEMORY_AUTOCLEAN=off is
+  // the kill-switch; autoCleanSafeMemory() honours it internally.
+  try {
+    const result = autoCleanSafeMemory({ nowIso: now.toISOString() });
+    if (result.pruned > 0) {
+      logger.info({ pruned: result.pruned, ids: result.ids }, 'Memory auto-clean (synthetic junk) completed');
+    }
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'Memory auto-clean failed (will retry tomorrow)',
+    );
   }
 }
 

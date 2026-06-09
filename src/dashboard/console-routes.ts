@@ -1236,6 +1236,25 @@ export function registerConsoleRoutes(
   });
 
   /**
+   * Auto-research P1 — apply the provably-safe memory cleanup NOW (the
+   * "Clean up safe junk" button on the Evolution page's Memory-refinements
+   * card). Soft-deletes ONLY the synthetic smoke-test pollution class (exact
+   * signature match), capped + audited + reversible. Pass ?dry=1 to preview
+   * without mutating. Never touches user knowledge — that stays behind P2/P3.
+   */
+  app.post('/api/console/autoresearch/memory-cleanup', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { autoCleanSafeMemory } = await import('../autoresearch/memory-apply.js');
+      const dryRun = req.query.dry === '1' || req.query.dry === 'true';
+      const result = autoCleanSafeMemory({ dryRun });
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
    * Soft-delete a fact (sets active=0). Used by the panel's forget button.
    * Hard delete intentionally not exposed here — that lives in MCP tools
    * for the agent itself.

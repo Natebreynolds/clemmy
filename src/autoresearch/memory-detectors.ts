@@ -37,12 +37,42 @@ export interface MemoryRefinements {
   /** Facts derived from Clementine's own introspective tools (memory_read,
    *  task_list, execution_*, …) — low-value self-referential noise. */
   internalNoise: { count: number; byTool: Array<{ tool: string; count: number }>; examples: RefinementCandidate[] };
+  /** Provably-synthetic test pollution (smoke-test workflow facts) — the
+   *  PROVABLY-SAFE class that P1 auto-prunes. */
+  syntheticJunk: { count: number; examples: RefinementCandidate[] };
   /** Old, low-importance, never-recalled facts. */
   stale: { count: number; examples: RefinementCandidate[] };
   /** High-importance / high-trust facts that have NEVER been recalled. */
   recallGaps: { count: number; examples: RefinementCandidate[] };
   totalCandidates: number;
   generatedAt: string;
+}
+
+/**
+ * EXACT substring signatures for provably-synthetic test pollution — facts that
+ * leaked into the store from running the smoke-test workflows. The `zz-` prefix
+ * is the repo's test-naming convention (sorts tests to the bottom of any list),
+ * so these strings CANNOT appear in genuine user knowledge. This is the single
+ * source of truth shared by the read-only detector (here) and the P1 apply path
+ * (memory-apply.ts) so the "what we'd clean" preview and the "what we cleaned"
+ * action can never drift apart. Conservative by design — broad engineering terms
+ * like a bare "smoke test" are deliberately excluded.
+ */
+export const SYNTHETIC_JUNK_SIGNATURES = [
+  'zz-smoke',
+  'native-compaction-proof',
+  'step-handoff-test',
+  'packaged-smoke-test',
+] as const;
+
+/** True iff `content` matches a provably-synthetic test-workflow signature. */
+export function matchSyntheticJunk(content: string | null | undefined): string | null {
+  if (!content) return null;
+  const c = content.toLowerCase();
+  for (const sig of SYNTHETIC_JUNK_SIGNATURES) {
+    if (c.includes(sig)) return sig;
+  }
+  return null;
 }
 
 const KINDS = ['user', 'project', 'feedback', 'reference'] as const;
@@ -133,6 +163,19 @@ export function detectStale(maxExamples = 6): MemoryRefinements['stale'] {
   return { count: rows.length, examples };
 }
 
+/** Provably-synthetic test pollution — the class P1 auto-prunes. Read-only count. */
+export function detectSyntheticJunk(maxExamples = 6): MemoryRefinements['syntheticJunk'] {
+  const db = openMemoryDb();
+  const like = SYNTHETIC_JUNK_SIGNATURES.map(() => 'LOWER(content) LIKE ?').join(' OR ');
+  const rows = db.prepare(
+    `SELECT id, kind, content, importance FROM consolidated_facts
+     WHERE active = 1 AND pinned = 0 AND (${like})
+     ORDER BY id ASC`,
+  ).all(...SYNTHETIC_JUNK_SIGNATURES.map((s) => `%${s}%`)) as FactRow[];
+  const examples = rows.slice(0, maxExamples).map((r) => ({ id: r.id, kind: r.kind, content: trunc(r.content), importance: r.importance }));
+  return { count: rows.length, examples };
+}
+
 /** High-importance / high-trust facts that have never been recalled. */
 export function detectRecallGaps(maxExamples = 6): MemoryRefinements['recallGaps'] {
   const db = openMemoryDb();
@@ -152,14 +195,16 @@ export function detectRecallGaps(maxExamples = 6): MemoryRefinements['recallGaps
 export function computeMemoryRefinements(nowIso: string = new Date().toISOString()): MemoryRefinements {
   const duplicates = detectDuplicates();
   const internalNoise = detectInternalNoise();
+  const syntheticJunk = detectSyntheticJunk();
   const stale = detectStale();
   const recallGaps = detectRecallGaps();
   return {
     duplicates,
     internalNoise,
+    syntheticJunk,
     stale,
     recallGaps,
-    totalCandidates: duplicates.count + internalNoise.count + stale.count + recallGaps.count,
+    totalCandidates: duplicates.count + internalNoise.count + syntheticJunk.count + stale.count + recallGaps.count,
     generatedAt: nowIso,
   };
 }
