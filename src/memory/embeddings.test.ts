@@ -10,10 +10,15 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   bufferToVector,
+  classifyEmbedError,
   cosine,
   EMBEDDING_DIM,
+  getEmbeddingHealth,
   isEmbeddingsEnabled,
   vectorToBuffer,
+  _resetEmbeddingHealthForTest,
+  _driveEmbedFailureForTest,
+  _driveEmbedSuccessForTest,
 } from './embeddings.js';
 
 test('vectorToBuffer + bufferToVector roundtrip preserves vectors', () => {
@@ -91,4 +96,44 @@ test('isEmbeddingsEnabled honors EMBEDDINGS_DISABLED (key-decoupled opt-out)', (
     if (prevDisabled === undefined) delete process.env.EMBEDDINGS_DISABLED; else process.env.EMBEDDINGS_DISABLED = prevDisabled;
     if (prevKey === undefined) delete process.env.OPENAI_API_KEY; else process.env.OPENAI_API_KEY = prevKey;
   }
+});
+
+test('classifyEmbedError: maps API errors to terminal/transient classes', () => {
+  assert.equal(classifyEmbedError(new Error('Embeddings API 429: {"error":{"message":"You exceeded your current quota, please check your plan and billing details","type":"insufficient_quota"}}')), 'quota');
+  assert.equal(classifyEmbedError(new Error('Embeddings API 401: {"error":{"message":"Incorrect API key provided","code":"invalid_api_key"}}')), 'auth');
+  assert.equal(classifyEmbedError(new Error('OPENAI_API_KEY is not set')), 'auth');
+  assert.equal(classifyEmbedError(new Error('Embeddings API 429: {"error":{"type":"rate_limit_exceeded"}}')), 'rate_limit');
+  assert.equal(classifyEmbedError(new Error('The operation was aborted due to timeout')), 'transient');
+  assert.equal(classifyEmbedError(new Error('Embeddings API 503: upstream error')), 'transient');
+});
+
+test('breaker: a quota error opens the breaker IMMEDIATELY with a long cooldown', () => {
+  _resetEmbeddingHealthForTest();
+  _driveEmbedFailureForTest(new Error('Embeddings API 429: insufficient_quota — exceeded your current quota'));
+  const h = getEmbeddingHealth();
+  assert.equal(h.breakerOpen, true, 'one quota failure must open the breaker');
+  assert.equal(h.lastErrorClass, 'quota');
+  // ~1h cooldown, not the 5-min transient one.
+  assert.ok(h.cooldownUntilMs - Date.now() > 30 * 60_000, 'terminal cooldown should be far longer than transient');
+});
+
+test('breaker: a single transient error does NOT open the breaker (needs 3)', () => {
+  _resetEmbeddingHealthForTest();
+  _driveEmbedFailureForTest(new Error('connect ETIMEDOUT'));
+  assert.equal(getEmbeddingHealth().breakerOpen, false, 'one transient blip must not drop recall to FTS');
+  _driveEmbedFailureForTest(new Error('connect ETIMEDOUT'));
+  _driveEmbedFailureForTest(new Error('connect ETIMEDOUT'));
+  assert.equal(getEmbeddingHealth().breakerOpen, true, 'three transient failures open the breaker');
+});
+
+test('breaker: success resets state and records lastSuccessAt', () => {
+  _resetEmbeddingHealthForTest();
+  _driveEmbedFailureForTest(new Error('Embeddings API 401: invalid_api_key'));
+  assert.equal(getEmbeddingHealth().breakerOpen, true);
+  _driveEmbedSuccessForTest();
+  const h = getEmbeddingHealth();
+  assert.equal(h.breakerOpen, false, 'success closes the breaker');
+  assert.equal(h.consecutiveFailures, 0);
+  assert.equal(h.lastErrorClass, null);
+  assert.ok(h.lastSuccessAt, 'lastSuccessAt is recorded');
 });

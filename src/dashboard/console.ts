@@ -1728,6 +1728,10 @@ export function renderConsoleHtml(token: string): string {
                 <div class="diag-section-head">MCP SERVERS</div>
                 <div class="diag-mcp-body" data-diag-mcp-body></div>
               </div>
+              <div class="diag-section" data-diag-semantic hidden>
+                <div class="diag-section-head">SEMANTIC MEMORY</div>
+                <div class="diag-semantic-body" data-diag-semantic-body></div>
+              </div>
               <div class="diag-section" data-diag-errors hidden>
                 <div class="diag-section-head">RECENT WARN/ERROR (filtered)</div>
                 <div class="diag-errors-body" data-diag-errors-body></div>
@@ -23957,6 +23961,7 @@ const CONSOLE_JS = `
     const mcpEl = document.querySelector('[data-diag-mcp-body]');
     const errorsEl = document.querySelector('[data-diag-errors-body]');
     const storageEl = document.querySelector('[data-diag-storage-body]');
+    const semanticEl = document.querySelector('[data-diag-semantic-body]');
     const fmtBytes = (n) => n > 1024 * 1024 ? (n / 1024 / 1024).toFixed(1) + 'MB' : n > 1024 ? (n / 1024).toFixed(1) + 'KB' : n + 'B';
 
     if (summaryEl) {
@@ -23980,6 +23985,7 @@ const CONSOLE_JS = `
       ['data-diag-tool-events', toolsEl, (t = data.toolEvents) => t && t.byTool && t.byTool.length > 0],
       ['data-diag-sessions',    sessionsEl, () => data.toolEvents && data.toolEvents.bySession && data.toolEvents.bySession.length > 0],
       ['data-diag-mcp',         mcpEl, () => data.mcp && data.mcp.servers && data.mcp.servers.length > 0],
+      ['data-diag-semantic',    semanticEl, () => !!data.semanticMemory],
       ['data-diag-errors',      errorsEl, () => (data.recentErrors || []).length > 0],
       ['data-diag-storage',     storageEl, () => true],
     ];
@@ -24015,6 +24021,19 @@ const CONSOLE_JS = `
       errorsEl.innerHTML = (data.recentErrors || []).slice(-20).map((e) =>
         '<div class="diag-error-row"><span class="diag-level ' + e.level + '">' + e.level.toUpperCase() + '</span><span>' + escMem(e.source) + ' · ' + escMem(e.message) + '</span></div>'
       ).join('') || '<div class="settings-info">— no warnings or errors recorded —</div>';
+    }
+
+    if (semanticEl && data.semanticMemory) {
+      const sm = data.semanticMemory;
+      const lvl = (sm.status === 'quota_exhausted' || sm.status === 'auth_failed') ? 'error'
+                : (sm.status === 'degraded') ? 'warn' : 'ok';
+      const statusLabel = String(sm.status || '').replace(/_/g, ' ').toUpperCase();
+      semanticEl.innerHTML =
+        '<div class="diag-error-row"><span class="diag-level ' + lvl + '">' + statusLabel + '</span><span>' + escMem(sm.detail || '') + '</span></div>' +
+        '<div class="diag-row"><span>model</span><em>' + escMem(sm.model || '—') + (sm.dim ? ' · ' + sm.dim + 'd' : '') + '</em></div>' +
+        '<div class="diag-row"><span>embedded / awaiting</span><em>' + sm.embeddedCount + ' / ' + sm.unembeddedActiveCount + '</em></div>' +
+        '<div class="diag-row"><span>last success</span><em>' + (sm.lastSuccessAt ? escMem(String(sm.lastSuccessAt).slice(0, 19).replace('T', ' ')) : '—') + '</em></div>' +
+        (sm.lastErrorClass ? '<div class="diag-row"><span>last error</span><em>' + escMem(sm.lastErrorClass) + (sm.lastErrorAt ? ' · ' + escMem(String(sm.lastErrorAt).slice(11, 19)) : '') + '</em></div>' : '');
     }
 
     if (storageEl && data.storage) {
