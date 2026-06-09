@@ -1,5 +1,5 @@
-import { useState } from 'react';
-import { ExternalLink, RefreshCw, Brain, Wrench, Lightbulb, TrendingUp, Sparkles, ShieldCheck, Check } from 'lucide-react';
+import { useState, type ReactNode } from 'react';
+import { ExternalLink, RefreshCw, Brain, Wrench, Lightbulb, TrendingUp, Sparkles, ShieldCheck } from 'lucide-react';
 import { Page } from '@/components/Page';
 import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
@@ -8,8 +8,10 @@ import { Skeleton } from '@/components/ui/Skeleton';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { usePoll } from '@/lib/poll';
 import {
-  getAutoresearchReport, runAutoresearch, runMemoryCleanup, fmtNum, fmtPct, fmtWhen,
-  type ObservatoryReport, type ToolHealth, type MemoryRefinements, type AutoCleanResult,
+  getAutoresearchReport, runAutoresearch, runMemoryCleanup,
+  approveDuplicates, liftRecallGaps, retireInternalNoise,
+  fmtNum, fmtPct, fmtWhen,
+  type ObservatoryReport, type ToolHealth, type MemoryRefinements, type AutoCleanResult, type ApproveResult,
 } from '@/lib/advanced';
 
 const pct = (n: number, d: number) => (d > 0 ? Math.round((n / d) * 100) : 0);
@@ -158,6 +160,49 @@ function RefineStat({ label, value }: { label: string; value: string }) {
   );
 }
 
+/** A batch "Approve" control: button → in-flight → success pill with "N left". */
+function BatchApprove({
+  count, idle, busyLabel, doneVerb, run, onDone,
+}: {
+  count: number;
+  idle: ReactNode;
+  busyLabel: string;
+  doneVerb: string;
+  run: () => Promise<ApproveResult>;
+  onDone: () => Promise<unknown> | void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [res, setRes] = useState<ApproveResult | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const onClick = async () => {
+    setBusy(true); setErr(null);
+    try {
+      const r = await run();
+      setRes(r);
+      await onDone();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : 'Action failed');
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="mt-2 flex flex-wrap items-center gap-2">
+      <Button variant="secondary" size="sm" onClick={onClick} disabled={busy || count === 0}>
+        {busy ? busyLabel : count === 0 ? 'None left' : idle}
+      </Button>
+      {res && res.applied > 0 && (
+        <StatusPill tone="success">{doneVerb} {fmtNum(res.applied)}</StatusPill>
+      )}
+      {res && res.applied === 0 && !err && (
+        <span className="text-caption text-faint">Nothing eligible right now</span>
+      )}
+      {res && res.remaining > 0 && <span className="text-caption text-faint">{fmtNum(res.remaining)} left — run again</span>}
+      {err && <span className="text-caption text-danger">{err}</span>}
+    </div>
+  );
+}
+
 function MemoryRefinementsCard({ data, onCleaned }: { data: MemoryRefinements; onCleaned: () => Promise<unknown> | void }) {
   const dups = data.duplicates;
   const noise = data.internalNoise;
@@ -165,13 +210,25 @@ function MemoryRefinementsCard({ data, onCleaned }: { data: MemoryRefinements; o
   const gaps = data.recallGaps;
   const stale = data.stale;
   const dupPairs = Array.isArray(dups?.pairs) ? dups.pairs : [];
+  const shownDups = dupPairs.slice(0, 8);
+  // "More" reflects the true remainder (the detector counts every drop candidate
+  // but only ships up to ~20 pairs), so the 7–20 range isn't silently hidden.
+  const dupMore = Math.max(0, (dups?.count ?? 0) - shownDups.length);
   const byTool = Array.isArray(noise?.byTool) ? noise.byTool : [];
   const gapEx = Array.isArray(gaps?.examples) ? gaps.examples : [];
   const junkCount = junk?.count ?? 0;
+  const noiseCount = noise?.count ?? 0;
+  const gapCount = gaps?.count ?? 0;
 
   const [cleaning, setCleaning] = useState(false);
   const [cleaned, setCleaned] = useState<AutoCleanResult | null>(null);
   const [cleanError, setCleanError] = useState<string | null>(null);
+
+  // Per-pair dedup approval state, keyed by dropId (so distinct rows don't share
+  // one in-flight flag and a rapid double-click can't act twice).
+  const [merging, setMerging] = useState<Set<number>>(new Set());
+  const [merged, setMerged] = useState<Set<number>>(new Set());
+  const [mergeError, setMergeError] = useState<string | null>(null);
 
   const onClean = async () => {
     setCleaning(true);
@@ -187,6 +244,21 @@ function MemoryRefinementsCard({ data, onCleaned }: { data: MemoryRefinements; o
     }
   };
 
+  const onMerge = async (keepId: number, dropId: number) => {
+    setMerging((s) => new Set(s).add(dropId));
+    setMergeError(null);
+    try {
+      const r = await approveDuplicates([{ keepId, dropId }]);
+      if (r.applied > 0) setMerged((s) => new Set(s).add(dropId));
+      else if (r.skipped?.[0]) setMergeError(`#${dropId} skipped (${r.skipped[0].reason})`);
+      await onCleaned();
+    } catch (err) {
+      setMergeError(err instanceof Error ? err.message : 'Merge failed');
+    } finally {
+      setMerging((s) => { const n = new Set(s); n.delete(dropId); return n; });
+    }
+  };
+
   return (
     <Card className="p-5">
       <div className="mb-2 flex items-center gap-2">
@@ -195,7 +267,7 @@ function MemoryRefinementsCard({ data, onCleaned }: { data: MemoryRefinements; o
         <span className="ml-auto text-caption text-faint">{fmtNum(data.totalCandidates)} candidates</span>
       </div>
       <p className="mb-3 max-w-2xl text-small text-muted">
-        How Clementine keeps memory sharp. The <span className="text-fg">provably-safe</span> class (smoke-test pollution) is cleaned automatically every night — everything that could touch your real knowledge waits for your one-click approval (coming next).
+        How Clementine keeps memory sharp. The <span className="text-fg">provably-safe</span> class is cleaned automatically; everything that touches your real knowledge waits for your one-click approval below. Every action is soft and reversible.
       </p>
 
       {/* Provably-safe auto-clean — the one class we apply without asking. */}
@@ -208,7 +280,7 @@ function MemoryRefinementsCard({ data, onCleaned }: { data: MemoryRefinements; o
           </div>
         </div>
         {cleaned ? (
-          <StatusPill tone="success"><Check className="h-3.5 w-3.5" aria-hidden /> Cleaned {fmtNum(cleaned.pruned)}</StatusPill>
+          <StatusPill tone="success">Cleaned {fmtNum(cleaned.pruned)}</StatusPill>
         ) : (
           <Button variant="secondary" size="sm" onClick={onClean} disabled={cleaning || junkCount === 0}>
             {cleaning ? 'Cleaning…' : junkCount === 0 ? 'Nothing to clean' : `Clean up ${fmtNum(junkCount)} now`}
@@ -219,49 +291,101 @@ function MemoryRefinementsCard({ data, onCleaned }: { data: MemoryRefinements; o
 
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
         <RefineStat label="Near-duplicates" value={`${fmtNum(dups?.count ?? 0)}${dups?.capped ? '+' : ''}`} />
-        <RefineStat label="Internal-tool noise" value={fmtNum(noise?.count ?? 0)} />
-        <RefineStat label="High-value, never recalled" value={fmtNum(gaps?.count ?? 0)} />
+        <RefineStat label="Internal-tool noise" value={fmtNum(noiseCount)} />
+        <RefineStat label="High-value, never recalled" value={fmtNum(gapCount)} />
         <RefineStat label="Stale clutter" value={fmtNum(stale?.count ?? 0)} />
       </div>
 
+      {/* (a) Near-duplicates — PER-PAIR approval. You see both sides + similarity
+          and approve one at a time; we never bulk-merge the 0.90–0.95 band. */}
       {dupPairs.length > 0 && (
-        <div className="mt-4">
-          <div className="mb-1.5 text-label text-faint">Near-duplicates — keep the higher-scored, drop the other</div>
-          <ul className="space-y-1.5">
-            {dupPairs.slice(0, 5).map((p, i) => (
-              <li key={i} className="flex items-center gap-2 text-small">
-                <StatusPill tone="neutral">{p.similarity.toFixed(2)}</StatusPill>
-                <span className="min-w-0 flex-1 truncate text-muted" title={p.drop}>#{p.dropId} {p.drop}</span>
-              </li>
-            ))}
+        <div className="mt-5">
+          <div className="mb-1.5 text-label text-faint">Near-duplicates — approve to keep the higher-scored fact, soft-delete the other</div>
+          <ul className="space-y-2">
+            {shownDups.map((p) => {
+              const isMerging = merging.has(p.dropId);
+              const isMerged = merged.has(p.dropId);
+              return (
+                <li key={p.dropId} className="flex items-start gap-3 rounded-md border border-border bg-surface p-2.5">
+                  <StatusPill tone="neutral">{p.similarity.toFixed(2)}</StatusPill>
+                  <div className="min-w-0 flex-1 space-y-0.5">
+                    <div className="truncate text-small text-fg" title={p.keep}><span className="text-caption text-success">KEEP #{p.keepId}</span> {p.keep}</div>
+                    <div className="truncate text-small text-muted" title={p.drop}><span className="text-caption text-danger">DROP #{p.dropId}</span> {p.drop}</div>
+                  </div>
+                  {isMerged ? (
+                    <StatusPill tone="success">Merged</StatusPill>
+                  ) : (
+                    <Button variant="secondary" size="sm" onClick={() => onMerge(p.keepId, p.dropId)} disabled={isMerging}>
+                      {isMerging ? 'Merging…' : 'Approve'}
+                    </Button>
+                  )}
+                </li>
+              );
+            })}
           </ul>
+          {dupMore > 0 && <p className="mt-1.5 text-caption text-faint">{fmtNum(dupMore)} more near-duplicate pair(s) — approve these, then they refresh.</p>}
+          {mergeError && <p className="mt-1.5 text-caption text-danger">{mergeError}</p>}
         </div>
       )}
 
-      {byTool.length > 0 && (
-        <div className="mt-4">
+      {/* (b) High-value, never recalled — BATCH boost importance (NOT pin: pinning
+          dozens would evict your real standing instructions). */}
+      {gapCount > 0 && (
+        <div className="mt-5">
+          <div className="mb-1 text-label text-faint">High-value facts that never surface</div>
+          <p className="mb-1 max-w-2xl text-caption text-faint">
+            Raises these facts’ importance so they rank higher in recall — reversible, and it doesn’t crowd your pinned rules.
+          </p>
+          {gapEx.length > 0 && (
+            <ul className="mb-1 space-y-1">
+              {gapEx.slice(0, 3).map((e) => (
+                <li key={e.id} className="flex items-center gap-2 text-small">
+                  <span className="shrink-0 text-caption text-faint">imp {e.importance ?? '—'}</span>
+                  <span className="min-w-0 flex-1 truncate text-muted" title={e.content}>{e.content}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+          <BatchApprove
+            count={gapCount}
+            idle={`Boost ${fmtNum(Math.min(gapCount, 25))} now`}
+            busyLabel="Boosting…"
+            doneVerb="Boosted"
+            run={liftRecallGaps}
+            onDone={onCleaned}
+          />
+        </div>
+      )}
+
+      {/* (c) Internal-tool noise — BATCH retire (soft, capped at 25/click). */}
+      {noiseCount > 0 && (
+        <div className="mt-5">
           <div className="mb-1.5 text-label text-faint">Internal-tool noise by source</div>
-          <div className="flex flex-wrap gap-1.5">
-            {byTool.slice(0, 8).map((t) => (
-              <span key={t.tool} className="rounded-md bg-surface px-2 py-0.5 font-mono text-caption text-muted">{t.tool} · {t.count}</span>
-            ))}
-          </div>
+          {byTool.length > 0 && (
+            <div className="mb-1.5 flex flex-wrap gap-1.5">
+              {byTool.slice(0, 8).map((t) => (
+                <span key={t.tool} className="rounded-md bg-surface px-2 py-0.5 font-mono text-caption text-muted">{t.tool} · {t.count}</span>
+              ))}
+            </div>
+          )}
+          <p className="mb-1 max-w-2xl text-caption text-faint">
+            Soft-deletes self-referential tool clutter (memory_*, task_*, execution_*). Undoable for 30 days.
+          </p>
+          <BatchApprove
+            count={noiseCount}
+            idle={`Retire ${fmtNum(Math.min(noiseCount, 25))} now`}
+            busyLabel="Retiring…"
+            doneVerb="Retired"
+            run={retireInternalNoise}
+            onDone={onCleaned}
+          />
         </div>
       )}
 
-      {gapEx.length > 0 && (
-        <div className="mt-4">
-          <div className="mb-1.5 text-label text-faint">High-value facts that never surface</div>
-          <ul className="space-y-1">
-            {gapEx.slice(0, 3).map((e) => (
-              <li key={e.id} className="flex items-center gap-2 text-small">
-                <span className="shrink-0 text-caption text-faint">imp {e.importance ?? '—'}</span>
-                <span className="min-w-0 flex-1 truncate text-muted" title={e.content}>{e.content}</span>
-              </li>
-            ))}
-          </ul>
-        </div>
-      )}
+      <p className="mt-5 border-t border-border/60 pt-3 text-caption text-faint">
+        Every approval is soft and reversible — undo anytime in{' '}
+        <a className="text-accent underline-offset-2 hover:underline" href="/console-legacy" target="_self">Classic › Memory › Show forgotten</a>.
+      </p>
     </Card>
   );
 }

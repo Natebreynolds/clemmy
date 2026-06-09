@@ -176,13 +176,23 @@ export function detectSyntheticJunk(maxExamples = 6): MemoryRefinements['synthet
   return { count: rows.length, examples };
 }
 
-/** High-importance / high-trust facts that have never been recalled. */
+/**
+ * High-importance facts that have never been recalled.
+ *
+ * NOTE: this predicate is kept in lock-step with the P2 action that drains it
+ * (memory-apply sibling memory-approve.ts `liftRecallGaps`) so the headline
+ * count and the "Boost N" button's reach can't diverge. We deliberately do NOT
+ * include the old `OR trust_level = 1.0` clause: it swept in every mundane
+ * directly-stated fact, inflating the count with rows the boost action would
+ * never touch (it only lifts importance >= 7). If you change one predicate,
+ * change the other.
+ */
 export function detectRecallGaps(maxExamples = 6): MemoryRefinements['recallGaps'] {
   const db = openMemoryDb();
   const rows = db.prepare(
     `SELECT id, kind, content, importance FROM consolidated_facts
      WHERE active = 1 AND pinned = 0
-       AND (COALESCE(importance, 5) >= 7 OR trust_level = 1.0)
+       AND COALESCE(importance, 5) >= 7
        AND (last_accessed_at IS NULL OR last_accessed_at <= datetime(created_at, '+2 seconds'))
        AND julianday('now') - julianday(created_at) > 7
      ORDER BY COALESCE(importance, 5) DESC LIMIT 500`,
