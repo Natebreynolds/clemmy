@@ -51,6 +51,9 @@ const {
   describeOutputShape,
   isTransientStepError,
   creationTestVerdict,
+  shouldHaltResumeForSideEffect,
+  stepSideEffectClass,
+  finalizeStepOutput,
 } = await import('./workflow-runner.js');
 const { SessionStore: RunnerSessionStore } = await import('../memory/session-store.js');
 const { readWorkflowEvents } = await import('./workflow-events.js');
@@ -163,12 +166,15 @@ test('reapResolvedParkedRuns re-admits on a rejected approval too (run fails lou
   delete process.env.WORKFLOW_APPROVAL_PARKING;
 });
 
-test('reapResolvedParkedRuns is a no-op when WORKFLOW_APPROVAL_PARKING is off', () => {
-  delete process.env.WORKFLOW_APPROVAL_PARKING;
+test('reapResolvedParkedRuns is a no-op when WORKFLOW_APPROVAL_PARKING is off (kill-switch)', () => {
+  // Parking now defaults ON (P1-7), so the kill-switch must be set EXPLICITLY to
+  // get the legacy no-scan behavior (was: rely on the default).
+  process.env.WORKFLOW_APPROVAL_PARKING = 'off';
   const filePath = writeParkedRun('park-test-off', ['apr-irrelevant']);
   reapResolvedParkedRuns();
   assert.equal(statusOf(filePath), 'parked'); // scan disabled → untouched
   rmSync(filePath, { force: true });
+  delete process.env.WORKFLOW_APPROVAL_PARKING;
 });
 
 // ── D: contract binding (parse JSON-text output + inject the shape) ──────────
@@ -620,6 +626,39 @@ test('findContractViolationStep: null when the failure is not a contract violati
   assert.equal(findContractViolationStep([] as never), null);
 });
 
+test('P1-9 finalizeStepOutput: empty-only violation → "produced no usable data" + empty_output reason (skips the Doctor)', () => {
+  // The SF→Airtable shape: required_keys are present, but the list is empty.
+  const step = {
+    id: 'pull',
+    prompt: 'x',
+    output: { required_keys: ['prospects'], non_empty: ['prospects'] },
+  } as never;
+  assert.throws(
+    () => finalizeStepOutput('empty-route-test', 'er-1', step, { prospects: [], note: 'Blocked: SF expired' }),
+    /produced no usable data/,
+  );
+  const failed = readWorkflowEvents('empty-route-test', 'er-1').find((e) => e.kind === 'step_failed');
+  assert.equal((failed as { meta?: { reason?: string } })?.meta?.reason, 'empty_output');
+  // empty_output is a DATA problem → NOT routed to the Doctor.
+  assert.equal(findContractViolationStep(readWorkflowEvents('empty-route-test', 'er-1')), null);
+});
+
+test('P1-9 finalizeStepOutput: a shape violation alongside an empty one stays output_contract (routes to Doctor)', () => {
+  const step = {
+    id: 'pull',
+    prompt: 'x',
+    output: { required_keys: ['prospects', 'summary'], non_empty: ['prospects'] },
+  } as never;
+  // Missing `summary` (shape) + empty `prospects` (emptiness) → mixed → contract.
+  assert.throws(
+    () => finalizeStepOutput('empty-route-test', 'er-2', step, { prospects: [] }),
+    /failed its contract/,
+  );
+  const failed = readWorkflowEvents('empty-route-test', 'er-2').find((e) => e.kind === 'step_failed');
+  assert.equal((failed as { meta?: { reason?: string } })?.meta?.reason, 'output_contract');
+  assert.equal(findContractViolationStep(readWorkflowEvents('empty-route-test', 'er-2'))?.stepId, 'pull');
+});
+
 // Cleanup the temp BASE_DIR.
 test.after(() => {
   try { rmSync(tmp, { recursive: true, force: true }); } catch { /* ignore */ }
@@ -950,4 +989,78 @@ test('creationTestVerdict: empty dominant list (wrapped) → empty', () => {
   assert.equal(creationTestVerdict('scrape', { data: { records: [] } }).status, 'empty');
   // A NON-empty wrapped list is real data → ok.
   assert.equal(creationTestVerdict('scrape', { data: { records: [{ id: 1 }] } }).status, 'ok');
+});
+
+// ---------------------------------------------------------------------------
+// Wave 3 P0-3 — crash-resume side-effect guard
+// ---------------------------------------------------------------------------
+
+function resumeState(inFlightStepId: string | undefined, completed: string[] = [], failed: string[] = []) {
+  return {
+    inFlightStepId,
+    completedSteps: new Map<string, unknown>(completed.map((id) => [id, 'out'] as [string, unknown])),
+    failedSteps: new Set<string>(failed),
+  };
+}
+function wfWith(steps: unknown[]): Parameters<typeof shouldHaltResumeForSideEffect>[0] {
+  return { name: 'rt', description: '', enabled: true, trigger: { manual: true }, steps } as never;
+}
+
+test('stepSideEffectClass: declared field wins, else heuristic', () => {
+  assert.equal(stepSideEffectClass({ id: 'a', prompt: 'anything', sideEffect: 'send' }), 'send');
+  assert.equal(stepSideEffectClass({ id: 'a', prompt: 'Send the outreach emails to the list.' }), 'send');
+  assert.equal(stepSideEffectClass({ id: 'a', prompt: 'Read the leads from the sheet.' }), 'read');
+});
+
+test('P0-3 halts crash-resume of an autonomous write/send step', () => {
+  const wf = wfWith([
+    { id: 'pull', prompt: 'Read leads.', sideEffect: 'read' },
+    { id: 'save', prompt: 'Write to the sheet.', sideEffect: 'write', dependsOn: ['pull'] },
+    { id: 'send', prompt: 'Email the batch.', sideEffect: 'send', dependsOn: ['save'] },
+  ]);
+  assert.deepEqual(shouldHaltResumeForSideEffect(wf, resumeState('save', ['pull'])), { stepId: 'save', cls: 'write' });
+  assert.deepEqual(shouldHaltResumeForSideEffect(wf, resumeState('send', ['pull', 'save'])), { stepId: 'send', cls: 'send' });
+});
+
+test('P0-3 does NOT halt a read step, a completed step, or the targeted re-run path', () => {
+  const wf = wfWith([
+    { id: 'pull', prompt: 'Read leads.', sideEffect: 'read' },
+    { id: 'send', prompt: 'Email the batch.', sideEffect: 'send', dependsOn: ['pull'] },
+  ]);
+  // read step in flight → no halt
+  assert.equal(shouldHaltResumeForSideEffect(wf, resumeState('pull')), null);
+  // in-flight step already completed → no halt
+  assert.equal(shouldHaltResumeForSideEffect(wf, resumeState('send', ['pull', 'send'])), null);
+  // explicit single-step re-run → exempt
+  assert.equal(shouldHaltResumeForSideEffect(wf, resumeState('send', ['pull']), 'send'), null);
+  // nothing in flight → no halt
+  assert.equal(shouldHaltResumeForSideEffect(wf, resumeState(undefined)), null);
+});
+
+test('P0-3 approval-gated step is exempt (parking emits step_started before the gate)', () => {
+  const wf = wfWith([
+    { id: 'send', prompt: 'Email the batch.', sideEffect: 'send', requiresApproval: true },
+  ]);
+  assert.equal(shouldHaltResumeForSideEffect(wf, resumeState('send')), null);
+});
+
+test('P0-3 runtime-request_approval park is exempt (in-flight step has a step_failed event)', () => {
+  // The regression case: a PLAIN send step (requiresApproval=false) that called
+  // request_approval mid-run parks via ParkRunSignal → caught + logged as
+  // step_failed → reaper re-admits. On resume it must RESUME (not halt), or the
+  // now-default-ON parking flow would break for every send step.
+  const wf = wfWith([
+    { id: 'send', prompt: 'Email the batch.', sideEffect: 'send' },
+  ]);
+  // Without the park marker it WOULD halt (plain crashed send) …
+  assert.deepEqual(shouldHaltResumeForSideEffect(wf, resumeState('send')), { stepId: 'send', cls: 'send' });
+  // … with a logged step_failed (the park signature) it is exempt.
+  assert.equal(shouldHaltResumeForSideEffect(wf, resumeState('send', [], ['send'])), null);
+});
+
+test('P0-3 forEach step is exempt (resume is item-level idempotent)', () => {
+  const wf = wfWith([
+    { id: 'blast', prompt: 'Email each prospect.', sideEffect: 'send', forEach: 'pull' },
+  ]);
+  assert.equal(shouldHaltResumeForSideEffect(wf, resumeState('blast')), null);
 });

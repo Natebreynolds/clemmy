@@ -46,6 +46,17 @@ function matchesType(value: unknown, type: WorkflowContractType): boolean {
   }
 }
 
+/** Wave 3 P1-9: a value is "empty" when it carries no data — null/undefined,
+ *  a blank/whitespace string, a zero-length array, or an object with no own
+ *  keys. Numbers and booleans are never empty (0 / false are real values). */
+function isEmptyValue(value: unknown): boolean {
+  if (value === null || value === undefined) return true;
+  if (typeof value === 'string') return value.trim().length === 0;
+  if (Array.isArray(value)) return value.length === 0;
+  if (typeof value === 'object') return Object.keys(value as Record<string, unknown>).length === 0;
+  return false;
+}
+
 function isNonEmptyHttpUrl(value: unknown): boolean {
   if (typeof value !== 'string' || value.trim().length === 0) return false;
   try {
@@ -86,6 +97,30 @@ export function verifyStepOutput(
         if (obj[key] === undefined || obj[key] === null) {
           problems.push(`missing required output key "${key}"`);
         }
+      }
+    }
+  }
+
+  // Wave 3 P1-9: emptiness checks. A "" / "." path targets the root value.
+  // Problem strings are prefixed `non_empty:` / `min_items:` so the runner can
+  // recognize an empty-data violation and route it to needs-attention with a
+  // remediation message instead of a cryptic contract error.
+  if (contract.non_empty && contract.non_empty.length > 0) {
+    for (const p of contract.non_empty) {
+      const resolved = p === '' || p === '.' ? value : resolvePath(value, p);
+      if (isEmptyValue(resolved)) {
+        problems.push(`non_empty: output "${p || '(root)'}" is empty (no data produced)`);
+      }
+    }
+  }
+
+  if (contract.min_items) {
+    for (const [p, min] of Object.entries(contract.min_items)) {
+      const resolved = p === '' || p === '.' ? value : resolvePath(value, p);
+      if (!Array.isArray(resolved)) {
+        problems.push(`min_items: output "${p || '(root)'}" is not an array (cannot count items)`);
+      } else if (resolved.length < min) {
+        problems.push(`min_items: output "${p || '(root)'}" has ${resolved.length} item(s), needs at least ${min}`);
       }
     }
   }

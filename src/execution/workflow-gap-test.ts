@@ -47,14 +47,33 @@ const CADENCE_RE =
 const FOREACH_HINT_RE =
   /\b(?:for each|each of|one per|per\s+(?:prospect|lead|item|row|client|account|company|firm|record|contact)|every\s+[a-z]+s\b|all\s+(?:the\s+)?[a-z]+s\b)\b/i;
 
+// Wave 3 P1-9: a step that PULLS a list of items from a source. When something
+// downstream depends on that list, an empty pull silently feeds nothing forward
+// (the SF→Airtable "{prospects: []}" class) — so ask whether zero is valid.
+const DATA_SOURCE_RE =
+  /\b(?:fetch\w*|pull\w*|quer\w+|search\w*|retriev\w*|list\w*|gather\w*|collect\w*|find\w*|load\w*|scrape\w*|extract\w*|enumerate\w*|look\s*up)\b[\s\S]{0,40}\b(?:prospects?|leads?|rows?|records?|contacts?|results?|items?|entries|companies|firms|accounts?|emails?|messages?|tickets?|deals?|opportunities|customers?|users?|candidates?|listings?|posts?|articles?|threads?)\b/i;
+
 function looksLikeDeliverableProducer(prompt: string): boolean {
   const p = prompt ?? '';
   return DELIVERABLE_PRODUCER_RE.test(p) || DELIVERABLE_PRODUCER_REV_RE.test(p);
 }
 
+function looksLikeDataSource(prompt: string): boolean {
+  return DATA_SOURCE_RE.test(prompt ?? '');
+}
+
 function hasOutputContract(step: WorkflowDefinition['steps'][number]): boolean {
   const o = step.output as { type?: unknown; required_keys?: unknown; verify?: unknown } | undefined;
   return Boolean(o && (o.type || o.required_keys || o.verify));
+}
+
+/** Wave 3 P1-9: does the step declare an emptiness contract (non_empty / min_items)? */
+function hasEmptinessContract(step: WorkflowDefinition['steps'][number]): boolean {
+  const o = step.output as { non_empty?: unknown; min_items?: unknown } | undefined;
+  if (!o) return false;
+  const ne = Array.isArray(o.non_empty) && o.non_empty.length > 0;
+  const mi = o.min_items != null && typeof o.min_items === 'object' && Object.keys(o.min_items as object).length > 0;
+  return ne || mi;
 }
 
 /** Declared input names (lowercased) for membership checks. */
@@ -136,6 +155,24 @@ export function analyzeWorkflowGaps(def: WorkflowDefinition): WorkflowGap[] {
       severity: 'clarify',
       question: 'This reads like recurring work, but no schedule is set — should I schedule it (what time + timezone), or keep it manual-only?',
       why: 'A workflow meant to run "every morning" that has no schedule will simply never fire on its own.',
+    });
+  }
+
+  // 8 (Wave 3 P1-9): a step pulls a LIST that downstream depends on but declares
+  //    no emptiness contract — ask whether zero items is a valid outcome. If not,
+  //    a non_empty / min_items contract makes the run HALT + report on an empty
+  //    pull instead of feeding nothing forward (the SF→Airtable shape, where an
+  //    expired credential returned [] and the run reported "done").
+  for (const step of steps) {
+    if (step.usesSkill) continue; // a skill owns its own output shape
+    if (!dependedOn.has(step.id)) continue; // only producers something consumes
+    if (!looksLikeDataSource(step.prompt ?? '')) continue;
+    if (hasEmptinessContract(step)) continue;
+    gaps.push({
+      severity: 'clarify',
+      stepId: step.id,
+      question: `Step "${step.id}" pulls a list that later steps depend on — is ZERO items a valid result, or should the run stop and flag you if it comes back empty? If empty isn't OK, I'll add a non_empty (or min_items) output contract so it halts and reports instead of running downstream on no data.`,
+      why: 'An empty upstream — no rows, an expired credential, an over-strict filter — otherwise flows downstream silently and the run reports "done" having done nothing.',
     });
   }
 

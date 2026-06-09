@@ -428,6 +428,10 @@ const WorkflowStepOutputContractSchema = z.object({
     .describe('The shape the step must produce.'),
   required_keys: z.array(z.string()).optional()
     .describe('For an object output: top-level keys that must be present and non-null.'),
+  non_empty: z.array(z.string()).optional()
+    .describe('Dot-paths whose value must be NON-EMPTY (a non-blank string, an array with ≥1 item, or an object with ≥1 key); "" / "." means the whole output. Declare on a data-producing step so a zero-row / blocked-but-shaped result ({prospects: []}) HALTS and reports back instead of feeding empty data downstream.'),
+  min_items: z.record(z.string(), z.number().int().nonnegative()).optional()
+    .describe('Map of dot-path → minimum array length (e.g. {"prospects": 1}). Stricter form of non_empty for "this source must yield at least N rows".'),
   verify: z.object({
     path_exists: z.array(z.string()).optional()
       .describe('Dot-paths in the output whose value must be an existing file path.'),

@@ -263,6 +263,26 @@ export function autoRepairWorkflowDefinition(def: WorkflowDefinition): WorkflowA
   }));
   const ids = new Set(steps.map((s) => s.id).filter(Boolean));
 
+  // Wave 3 P0-3: persist a derived side-effect class when the author omitted it,
+  // so it's visible + overridable in the SKILL.md and the crash-resume guard has
+  // a durable signal (it still falls back to this same heuristic when absent).
+  // 'read' is the default and is not serialized, so read-only workflows are
+  // byte-identical on disk.
+  let sideEffectChanged = false;
+  for (const step of steps) {
+    if (!step.sideEffect && step.prompt) {
+      const cls = stepLooksLikeIrreversibleSend(step.prompt)
+        ? 'send'
+        : stepLooksMutating(step) ? 'write' : 'read';
+      step.sideEffect = cls;
+      // Only a write/send default is a MEANINGFUL change — it serializes (read
+      // is dropped on write) and arms the crash-resume guard's durable signal.
+      // A 'read' default must NOT force a clone, or the byte-identical /
+      // same-object contract for clean read-only workflows would break.
+      if (cls !== 'read') sideEffectChanged = true;
+    }
+  }
+
   const directDeps = (): Map<string, string[]> => {
     const m = new Map<string, string[]>();
     for (const s of steps) if (s.id) m.set(s.id, (s.dependsOn ?? []).filter((d) => ids.has(d)));
@@ -329,7 +349,7 @@ export function autoRepairWorkflowDefinition(def: WorkflowDefinition): WorkflowA
     }
   }
 
-  if (repairs.length === 0) return { def, repairs };
+  if (repairs.length === 0 && !sideEffectChanged) return { def, repairs };
   const repaired: WorkflowDefinition = {
     ...def,
     steps,

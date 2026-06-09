@@ -357,13 +357,17 @@ class ParkRunSignal extends Error {
 
 
 /**
- * P0 flag: event-driven approval parking. Default OFF → the in-place
- * poll loop (today's exact behavior) holds the worker until the approval
- * resolves. ON → a parked step releases its slot and is resumed by the
- * reaper scan once the approval clears.
+ * Event-driven approval parking (flag WORKFLOW_APPROVAL_PARKING). Default ON
+ * (Wave 3 P1-7): a parked step RELEASES its drain slot and is resumed by the
+ * reaper scan once the approval clears — so one unattended approval (e.g. a 7am
+ * scheduled run with no human) can't hold the only drain slot and wedge the
+ * whole workflow queue for up to 24h. The reaper + watchdog already expect this.
+ * Kill-switch: WORKFLOW_APPROVAL_PARKING=off restores the in-place poll loop
+ * (holds the worker until the approval resolves).
  */
 function parkingEnabled(): boolean {
-  return (getRuntimeEnv('WORKFLOW_APPROVAL_PARKING', 'off') ?? 'off').toLowerCase() === 'on';
+  const raw = (getRuntimeEnv('WORKFLOW_APPROVAL_PARKING', 'on') ?? 'on').toLowerCase();
+  return !(raw === 'off' || raw === '0' || raw === 'false' || raw === 'no');
 }
 
 function isWorkflowRunCancelled(runId: string): boolean {
@@ -1576,15 +1580,28 @@ export function finalizeStepOutput(
     const result = verifyStepOutput(step.output, bound);
     if (!result.ok) {
       const got = describeOutputShape(bound);
+      // Wave 3 P1-9: an emptiness-only violation (non_empty / min_items) is a
+      // DATA problem, not a definition bug — the upstream source returned
+      // nothing. Give it a remediation-oriented message + a distinct meta
+      // reason ('empty_output') so it surfaces as "produced no data" with a
+      // likely cause, and is NOT routed to the Doctor (findContractViolationStep
+      // matches only 'output_contract' — the Doctor can't fix "SF expired").
+      // Both paths land on the error route, which sets needsAttention (Wave 1).
+      const emptyProblems = result.problems.filter(
+        (p) => p.startsWith('non_empty:') || p.startsWith('min_items:'),
+      );
+      const isEmptyOnly = emptyProblems.length > 0 && emptyProblems.length === result.problems.length;
       // Include the ACTUAL produced shape so the failure is diagnosable (the
       // step ran but emitted the wrong shape — e.g. its decision object instead
       // of the contracted keys) instead of only "missing key X".
-      const message = `Step "${step.id}" output failed its contract: ${result.problems.join('; ')} — the step produced ${got}.`;
+      const message = isEmptyOnly
+        ? `Step "${step.id}" produced no usable data: ${emptyProblems.join('; ')}. This usually means the upstream source returned nothing — an empty result, an expired credential, or an over-strict filter. The run was halted instead of continuing with empty data; check the source, then re-run.`
+        : `Step "${step.id}" output failed its contract: ${result.problems.join('; ')} — the step produced ${got}.`;
       appendWorkflowEvent(workflowSlug, runId, {
         kind: 'step_failed',
         stepId: step.id,
         error: message,
-        meta: { reason: 'output_contract', problems: result.problems, got },
+        meta: { reason: isEmptyOnly ? 'empty_output' : 'output_contract', problems: result.problems, got },
       });
       throw new Error(message);
     }
@@ -1947,6 +1964,57 @@ function parallelStepLabel(steps: WorkflowStepInput[]): string {
  * frameworks fast: normalize once, fan out independent research
  * branches, then aggregate when all parents complete.
  */
+/** Wave 3 P0-3: a step's external side-effect class — the declared `sideEffect`
+ *  field if set, else derived from the prose heuristic. Drives the crash-resume
+ *  guard (don't blind-re-run a step that may have partially sent/written). */
+export function stepSideEffectClass(step: WorkflowStepInput): 'read' | 'write' | 'send' {
+  if (step.sideEffect === 'read' || step.sideEffect === 'write' || step.sideEffect === 'send') return step.sideEffect;
+  if (stepLooksLikeIrreversibleSend(step.prompt ?? '')) return 'send';
+  if (stepLooksMutating(step)) return 'write';
+  return 'read';
+}
+
+/**
+ * Wave 3 P0-3: should crash-resume HALT instead of blind-re-running the
+ * in-flight step? Returns the offending step + its class when YES, else null.
+ *
+ * HALT only on a genuine SILENT crash: a step that emitted step_started, never
+ * completed, and left no other trace — the process vanished mid-execution and a
+ * side-effecting (write/send) step may have partially sent/written. Everything
+ * that isn't a silent side-effect crash is exempt:
+ *
+ *  - targetStepId set            → explicit operator re-run, not auto-resume.
+ *  - completed already           → nothing to re-run.
+ *  - in-flight step has a        → it PARKED on a runtime request_approval
+ *    step_failed event             (ParkRunSignal is caught + logged as
+ *                                   step_failed, then the reaper re-admits it).
+ *                                   A truly errored step is terminal and never
+ *                                   resumed, so within a resumable run a logged
+ *                                   failure means "parked", not "crashed".
+ *                                   Re-running just resumes from the approval.
+ *  - requiresApproval (declar.)  → the gate emits step_started before the wait,
+ *                                   so a parked gate legitimately shows in-flight.
+ *  - forEach                     → resume is idempotent at the ITEM level
+ *                                   (completed items are skipped), so a crashed
+ *                                   forEach re-runs only the unfinished items.
+ *  - read class                  → no external side effect to duplicate.
+ *
+ * Pure + exported so the predicate is unit-tested.
+ */
+export function shouldHaltResumeForSideEffect(
+  workflow: WorkflowDefinition,
+  resume: { inFlightStepId?: string; completedSteps: Map<string, unknown>; failedSteps?: Set<string> },
+  targetStepId?: string,
+): { stepId: string; cls: 'write' | 'send' } | null {
+  if (targetStepId) return null;
+  const id = resume.inFlightStepId;
+  if (!id || resume.completedSteps.has(id) || resume.failedSteps?.has(id)) return null;
+  const crashed = workflow.steps.find((s) => s.id === id);
+  if (!crashed || crashed.requiresApproval === true || crashed.forEach) return null;
+  const cls = stepSideEffectClass(crashed);
+  return cls === 'read' ? null : { stepId: id, cls };
+}
+
 async function executeWorkflow(
   workflow: WorkflowDefinition,
   workflowSlug: string,
@@ -1959,6 +2027,22 @@ async function executeWorkflow(
   const stepOutputs: Record<string, unknown> = Object.fromEntries(resume.completedSteps);
   const forEachFailures: Array<{ stepId: string; itemKey: string; error: string }> = [];
   const qualityAdvisories: WorkflowQualityAdvisory[] = [];
+
+  // Wave 3 P0-3: crash-resume idempotency guard. A step that started but never
+  // completed (crash / daemon restart) and performs an external side effect
+  // must NOT be blind-re-run — it may have already sent or written some items.
+  // Halt + throw, which routes to the error path → needsAttention (Wave 1), so
+  // a human confirms before any re-run. (See shouldHaltResumeForSideEffect for
+  // the exemptions: approval-gated steps and the targeted single-step re-run.)
+  const resumeHalt = shouldHaltResumeForSideEffect(workflow, resume, targetStepId);
+  if (resumeHalt) {
+    throw new Error(
+      `Step "${resumeHalt.stepId}" was interrupted mid-run on a prior attempt and may have already ` +
+      `${resumeHalt.cls === 'send' ? 'sent or published' : 'written'} some items. It was NOT automatically ` +
+      `re-run, to avoid duplicates. Review what it did, then re-run the workflow (or just that ` +
+      `step) manually once you've confirmed it's safe.`,
+    );
+  }
 
   // Single-step "TRY" mode: execute only the named step. Upstream
   // references in the prompt resolve to empty strings — the user is

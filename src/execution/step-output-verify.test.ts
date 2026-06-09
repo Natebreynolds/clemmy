@@ -57,6 +57,41 @@ test('the revill regression: claims success but returns no real URL → caught',
   assert.match(r.problems[0], /url_present/);
 });
 
+test('P1-9 non_empty: empty array/string/object fails, populated passes', () => {
+  // The SF→Airtable shape: required_keys passes but the list is empty.
+  const empty = verifyStepOutput(
+    { required_keys: ['proposed_prospects'], non_empty: ['proposed_prospects'] },
+    { proposed_prospects: [], dedupe_summary: 'Blocked: Salesforce expired' },
+  );
+  assert.equal(empty.ok, false);
+  assert.match(empty.problems[0], /non_empty: output "proposed_prospects" is empty/);
+
+  assert.ok(verifyStepOutput({ non_empty: ['rows'] }, { rows: [1, 2] }).ok);
+  assert.equal(verifyStepOutput({ non_empty: ['note'] }, { note: '   ' }).ok, false);
+  assert.equal(verifyStepOutput({ non_empty: ['obj'] }, { obj: {} }).ok, false);
+  assert.ok(verifyStepOutput({ non_empty: ['obj'] }, { obj: { a: 1 } }).ok);
+});
+
+test('P1-9 non_empty: numbers/false are NOT empty', () => {
+  assert.ok(verifyStepOutput({ non_empty: ['count'] }, { count: 0 }).ok);
+  assert.ok(verifyStepOutput({ non_empty: ['flag'] }, { flag: false }).ok);
+});
+
+test('P1-9 non_empty: empty path "" targets the root value', () => {
+  assert.equal(verifyStepOutput({ non_empty: [''] }, []).ok, false);
+  assert.ok(verifyStepOutput({ non_empty: ['.'] }, [1]).ok);
+});
+
+test('P1-9 min_items: enforces minimum array length and rejects non-arrays', () => {
+  assert.ok(verifyStepOutput({ min_items: { prospects: 1 } }, { prospects: [1] }).ok);
+  const tooFew = verifyStepOutput({ min_items: { prospects: 3 } }, { prospects: [1, 2] });
+  assert.equal(tooFew.ok, false);
+  assert.match(tooFew.problems[0], /has 2 item\(s\), needs at least 3/);
+  const notArr = verifyStepOutput({ min_items: { prospects: 1 } }, { prospects: 'nope' });
+  assert.equal(notArr.ok, false);
+  assert.match(notArr.problems[0], /is not an array/);
+});
+
 test('multiple problems accumulate', () => {
   const r = verifyStepOutput(
     { type: 'object', required_keys: ['id'], verify: { url_present: ['url'] } },

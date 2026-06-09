@@ -112,6 +112,50 @@ test('output.verify (verifiable handles) round-trips', () => {
   assert.deepEqual(s?.output?.verify?.url_present, ['netlifyUrl']);
 });
 
+test('P0-3 sideEffect round-trips as side_effect (read is implicit, not serialized)', () => {
+  writeWorkflow('side-rt', {
+    name: 'side-rt', description: 'side-effect round-trip', enabled: true, trigger: { manual: true },
+    steps: [
+      { id: 'pull', prompt: 'Read the leads.', sideEffect: 'read' },
+      { id: 'save', prompt: 'Write them to the sheet.', sideEffect: 'write', dependsOn: ['pull'] },
+      { id: 'send', prompt: 'Email the batch.', sideEffect: 'send', dependsOn: ['save'] },
+    ],
+  });
+  const steps = readWorkflow('side-rt')!.data.steps;
+  // 'read' is the default → not serialized, so it reads back undefined (heuristic fallback at runtime).
+  assert.equal(steps.find((x) => x.id === 'pull')?.sideEffect, undefined);
+  assert.equal(steps.find((x) => x.id === 'save')?.sideEffect, 'write');
+  assert.equal(steps.find((x) => x.id === 'send')?.sideEffect, 'send');
+});
+
+test('P0-3 hand-authored snake_case side_effect is parsed', () => {
+  const dir = path.join(WORKFLOWS_DIR, 'side-snake');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    path.join(dir, 'SKILL.md'),
+    [
+      '---', 'name: side-snake', 'description: snake side-effect', 'enabled: true',
+      'steps:', '  - id: send', '    side_effect: send', '---', '', '## step: send', '', 'Send it.', '',
+    ].join('\n'),
+    'utf-8',
+  );
+  const send = readWorkflow('side-snake')!.data.steps.find((s) => s.id === 'send');
+  assert.equal(send?.sideEffect, 'send');
+});
+
+test('P1-9 non_empty / min_items output contract round-trips', () => {
+  writeWorkflow('empty-rt', {
+    name: 'empty-rt', description: 'emptiness round-trip', enabled: true, trigger: { manual: true },
+    steps: [{
+      id: 'pull', prompt: 'Pull prospects.',
+      output: { type: 'object', non_empty: ['prospects'], min_items: { prospects: 1 } },
+    }],
+  });
+  const s = readWorkflow('empty-rt')!.data.steps.find((x) => x.id === 'pull');
+  assert.deepEqual(s?.output?.non_empty, ['prospects']);
+  assert.deepEqual(s?.output?.min_items, { prospects: 1 });
+});
+
 test('retryBudget round-trips as retry_budget and clamps malformed values', () => {
   writeWorkflow('retry-rt', {
     name: 'retry-rt', description: 'retry round-trip', enabled: true, trigger: { manual: true },

@@ -123,6 +123,54 @@ test('does NOT flag per-item prose when forEach is already set', () => {
   assert.ok(!analyzeWorkflowGaps(def).some((g) => g.stepId === 'enrich'));
 });
 
+test('P1-9 flags a list-pulling step with a consumer and no emptiness contract', () => {
+  const def = wf({
+    steps: [
+      { id: 'pull', prompt: 'Query Salesforce for new prospects since yesterday.' },
+      { id: 'write', prompt: 'Add them to Airtable.', dependsOn: ['pull'] },
+    ],
+  });
+  const gaps = analyzeWorkflowGaps(def);
+  assert.ok(gaps.some((g) => g.stepId === 'pull' && /ZERO items|empty/i.test(g.question)));
+});
+
+test('P1-9 does NOT flag empty when the step declares a non_empty contract', () => {
+  const def = wf({
+    steps: [
+      {
+        id: 'pull',
+        prompt: 'Query Salesforce for new prospects since yesterday.',
+        output: { non_empty: ['prospects'] },
+      },
+      { id: 'write', prompt: 'Add them to Airtable.', dependsOn: ['pull'] },
+    ],
+  });
+  assert.ok(!analyzeWorkflowGaps(def).some((g) => g.stepId === 'pull' && /ZERO items/i.test(g.question)));
+});
+
+test('P1-9 does NOT flag empty when min_items is declared', () => {
+  const def = wf({
+    steps: [
+      {
+        id: 'pull',
+        prompt: 'Fetch the list of leads from the CRM.',
+        output: { min_items: { leads: 1 } },
+      },
+      { id: 'write', prompt: 'Process them.', dependsOn: ['pull'] },
+    ],
+  });
+  assert.ok(!analyzeWorkflowGaps(def).some((g) => g.stepId === 'pull' && /ZERO items/i.test(g.question)));
+});
+
+test('P1-9 does NOT flag a list-pull with no downstream consumer', () => {
+  const def = wf({
+    steps: [
+      { id: 'pull', prompt: 'Query Salesforce for new prospects since yesterday.' },
+    ],
+  });
+  assert.ok(!analyzeWorkflowGaps(def).some((g) => g.stepId === 'pull' && /ZERO items/i.test(g.question)));
+});
+
 test('caps the number of gaps', () => {
   const def = wf({
     description: 'Every morning do this.',

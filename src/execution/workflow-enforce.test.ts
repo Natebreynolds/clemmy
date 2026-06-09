@@ -153,6 +153,28 @@ test('autoRepair: undeclared {{input.X}} gets declared so the engine binds it', 
   assert.equal(checkWorkflowForWrite(repaired).ok, true);
 });
 
+test('autoRepair P0-3: derives sideEffect from the prompt when the author omitted it', () => {
+  const def = wf({
+    steps: [
+      { id: 'pull', prompt: 'Read the leads from the CRM.' },
+      { id: 'save', prompt: 'Update the Airtable records with the enriched data.', dependsOn: ['pull'] },
+      { id: 'send', prompt: 'Send the outreach emails to the list.', dependsOn: ['save'], requiresApproval: true },
+    ],
+  });
+  const { def: repaired } = autoRepairWorkflowDefinition(def);
+  assert.equal(repaired.steps[0].sideEffect, 'read');
+  assert.equal(repaired.steps[1].sideEffect, 'write');
+  assert.equal(repaired.steps[2].sideEffect, 'send');
+});
+
+test('autoRepair P0-3: never overrides an author-declared sideEffect', () => {
+  const def = wf({
+    steps: [{ id: 'a', prompt: 'Send the emails.', sideEffect: 'read', requiresApproval: true } as never],
+  });
+  const { def: repaired } = autoRepairWorkflowDefinition(def);
+  assert.equal(repaired.steps[0].sideEffect, 'read'); // declared value preserved
+});
+
 test('autoRepair: never declares a COMMON input key (url is injectable)', () => {
   const def = wf({ steps: [{ id: 'a', prompt: 'audit {{input.url}}' }] });
   const { def: repaired, repairs } = autoRepairWorkflowDefinition(def);

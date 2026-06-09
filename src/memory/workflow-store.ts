@@ -74,6 +74,16 @@ export interface WorkflowStepInput {
    */
   allowedTools?: string[];
   /**
+   * External side-effect class (Wave 3 P0-3). 'read' = idempotent pull/query;
+   * 'write' = creates/updates external state; 'send' = irreversible send/publish.
+   * Keeps crash-RESUME from blind-re-running a step that may have partially
+   * executed (duplicate-send guard). When omitted, the runner falls back to the
+   * prose heuristic (stepLooksLikeIrreversibleSend / stepLooksMutating);
+   * authoring persists a derived default so it's visible + overridable.
+   * Serialized to YAML as `side_effect`.
+   */
+  sideEffect?: 'read' | 'write' | 'send';
+  /**
    * Reference to an installed skill — directory name under
    * ~/.clementine-next/skills/<usesSkill>/. When set, the runner loads
    * the skill's SKILL.md body and injects it ahead of this step's
@@ -142,6 +152,21 @@ export interface WorkflowStepOutputContract {
   type?: WorkflowContractType;
   /** Top-level keys that must be present on an object result (shallow). */
   required_keys?: string[];
+  /**
+   * Wave 3 P1-9: emptiness contract. Dot-paths into the output whose value
+   * must be NON-EMPTY — a string with non-whitespace content, an array with
+   * ≥1 item, or an object with ≥1 key. The empty path "" (or ".") means the
+   * output value itself. Catches the "self-reported block in a contract-shaped
+   * object" class: `{proposed_prospects: [], summary: "Blocked: SF expired"}`
+   * satisfies required_keys but is functionally a failure — non_empty makes the
+   * run halt + report (needs-attention) instead of feeding empty data
+   * downstream. Authoring asks "is empty a valid result?" when a step looks
+   * like a data producer.
+   */
+  non_empty?: string[];
+  /** Wave 3 P1-9: dot-path → minimum array length. A stricter form of
+   *  non_empty for "this source must yield at least N rows". */
+  min_items?: Record<string, number>;
   /**
    * Verifiable concrete handles (Hermes-style artifact verification):
    * after the step returns, the engine confirms the named output values
@@ -349,6 +374,11 @@ export function readWorkflowDefinitionFile(filePath: string): WorkflowDefinition
           ? step.approvalPreview.trim()
           : '';
       if (preview) result.approvalPreview = preview;
+      // Side-effect class (Wave 3 P0-3). Accept snake_case or camelCase.
+      const se = typeof step.side_effect === 'string'
+        ? step.side_effect
+        : typeof step.sideEffect === 'string' ? step.sideEffect : '';
+      if (se === 'read' || se === 'write' || se === 'send') result.sideEffect = se;
       // Typed step contract (P0). Pure passthrough — structure is
       // validated/consumed by the binder + validator, not here.
       if (step.inputs && typeof step.inputs === 'object' && !Array.isArray(step.inputs)) {
@@ -470,6 +500,7 @@ function writeWorkflowToDir(dirPath: string, def: WorkflowDefinition): void {
       if (s.inputs && Object.keys(s.inputs).length > 0) out.inputs = s.inputs;
       if (s.output && Object.keys(s.output).length > 0) out.output = s.output;
       if (s.retryBudget && s.retryBudget > 0) out.retry_budget = s.retryBudget;
+      if (s.sideEffect && s.sideEffect !== 'read') out.side_effect = s.sideEffect;
       return out;
     });
   }

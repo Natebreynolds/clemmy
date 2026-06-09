@@ -191,6 +191,12 @@ export interface ResumeState {
   completedItems: Map<string, Map<string, unknown>>;
   /** Step that was in flight at last event (may have crashed). */
   inFlightStepId?: string;
+  /** Step IDs that logged a step_failed event. In a run that is still resumable
+   *  (a genuinely errored run is terminal and never resumed), a step_failed on
+   *  the in-flight step means it PARKED on a runtime approval (request_approval
+   *  → ParkRunSignal → step_failed → re-admitted by the reaper), NOT a silent
+   *  crash — the crash-resume side-effect guard uses this to tell them apart. */
+  failedSteps: Set<string>;
   /** ISO timestamp of the most recent event. */
   lastEventAt?: string;
   /** True when the log contains a terminal run_completed/run_failed. */
@@ -201,6 +207,7 @@ export function computeResumeState(workflowName: string, runId: string): ResumeS
   const events = readWorkflowEvents(workflowName, runId);
   const completedSteps = new Map<string, unknown>();
   const completedItems = new Map<string, Map<string, unknown>>();
+  const failedSteps = new Set<string>();
   let inFlightStepId: string | undefined;
   let lastEventAt: string | undefined;
   let terminal = false;
@@ -213,6 +220,9 @@ export function computeResumeState(workflowName: string, runId: string): ResumeS
     if (ev.kind === 'step_started' && ev.stepId) {
       inFlightStepId = ev.stepId;
     }
+    if (ev.kind === 'step_failed' && ev.stepId) {
+      failedSteps.add(ev.stepId);
+    }
     if (ev.kind === 'step_completed' && ev.stepId) {
       completedSteps.set(ev.stepId, ev.output);
       if (inFlightStepId === ev.stepId) inFlightStepId = undefined;
@@ -224,7 +234,7 @@ export function computeResumeState(workflowName: string, runId: string): ResumeS
     }
   }
 
-  return { completedSteps, completedItems, inFlightStepId, lastEventAt, terminal };
+  return { completedSteps, completedItems, failedSteps, inFlightStepId, lastEventAt, terminal };
 }
 
 /**
