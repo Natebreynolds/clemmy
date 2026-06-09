@@ -114,6 +114,9 @@ export interface ConsolidatedFact {
   // v9 — friendly app name when derived from a system of record
   // (Salesforce/Outlook/Airtable/…). NULL otherwise.
   sourceApp?: string | null;
+  // v11 — how many times this fact has been surfaced into a prompt.
+  // Reinforces recall ranking + decay resistance via log(1+accessCount).
+  accessCount?: number;
 }
 
 export const FACT_KINDS: ConsolidatedFactKind[] = ['user', 'project', 'feedback', 'reference'];
@@ -157,6 +160,7 @@ function rowToFact(row: ConsolidatedFactRow): ConsolidatedFact {
       : null,
     pinned: row.pinned === 1,
     sourceApp: row.source_app ?? null,
+    accessCount: row.access_count ?? 0,
   };
 }
 
@@ -300,7 +304,7 @@ export function rememberFact(input: RememberInput): ConsolidatedFact {
 export function touchFactAccess(id: number): void {
   try {
     const db = openMemoryDb();
-    db.prepare('UPDATE consolidated_facts SET last_accessed_at = ? WHERE id = ?')
+    db.prepare('UPDATE consolidated_facts SET last_accessed_at = ?, access_count = access_count + 1 WHERE id = ?')
       .run(new Date().toISOString(), id);
   } catch {
     // ignore
@@ -621,6 +625,16 @@ export function listRecentlyLearnedFacts(options: { sinceHours?: number; limit?:
  */
 const STANFORD_RECENCY_DECAY_RATE = -Math.log(0.995); // ≈ 0.00501
 
+// Access-frequency reinforcement weight. log1p(access_count) is bounded and
+// gentle (0 accesses → 0, 1 → 0.69, 10 → 0.24·w, 50 → 0.39·w at w=0.1), so a
+// repeatedly-useful fact rises in recall AND clears the decay score-floor more
+// easily, while a never-recalled fact is unchanged. Tunable via
+// CLEMMY_RECALL_REINFORCEMENT_WEIGHT (0 disables — byte-identical to before).
+function recallReinforcementWeight(): number {
+  const raw = Number.parseFloat(getRuntimeEnv('CLEMMY_RECALL_REINFORCEMENT_WEIGHT', '0.1') || '0.1');
+  return Number.isFinite(raw) && raw >= 0 ? raw : 0.1;
+}
+
 export function stanfordRecallScore(fact: ConsolidatedFact, nowMs: number = Date.now()): number {
   const accessIso = fact.lastAccessedAt || fact.extractedAt || fact.updatedAt || fact.createdAt;
   const accessedAtMs = Date.parse(accessIso);
@@ -629,8 +643,10 @@ export function stanfordRecallScore(fact: ConsolidatedFact, nowMs: number = Date
     : 0;
   const recency = Math.exp(-STANFORD_RECENCY_DECAY_RATE * hoursSince);
   const importance = (typeof fact.importance === 'number' ? fact.importance : 5.0) / 10;
-  // recency + importance (no relevance component for non-query reads)
-  return recency + importance;
+  // Reinforcement: a fact recalled many times is proven useful — promote it and
+  // help it resist decay. log1p keeps it bounded so it never dominates recency.
+  const reinforcement = recallReinforcementWeight() * Math.log1p(Math.max(0, fact.accessCount ?? 0));
+  return recency + importance + reinforcement;
 }
 
 // Tiny stopword set so common words don't manufacture false relevance.
