@@ -27,7 +27,7 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { resetMemoryDb } = await import('./db.js');
+const { resetMemoryDb, openMemoryDb } = await import('./db.js');
 const {
   upsertEntity,
   storeEpisodicPointer,
@@ -37,10 +37,12 @@ const {
   REFLECTION_MIN_CONTENT_CHARS,
   getReflectionThreshold,
   runRecursiveReflection,
+  consolidateActiveFacts,
   _testOnly_peekSessionImportance,
   _testOnly_resetAllSessionImportance,
 } = await import('./reflection.js');
-const { rememberFact, listRecentlyLearnedFacts, renderRecentlyLearnedForInstructions } = await import('./facts.js');
+const { rememberFact, getFact, listRecentlyLearnedFacts, renderRecentlyLearnedForInstructions } = await import('./facts.js');
+const { vectorToBuffer } = await import('./embeddings.js');
 
 test('entities: upsert is idempotent + merges aliases', () => {
   resetMemoryDb();
@@ -326,6 +328,40 @@ test('reflectOnToolReturn: a self-tool return is skipped before the extractor (n
     if (prevReflect === undefined) delete process.env.CLEMMY_REFLECTION; else process.env.CLEMMY_REFLECTION = prevReflect;
     if (prevSelf === undefined) delete process.env.CLEMMY_REFLECT_SELF_TOOLS; else process.env.CLEMMY_REFLECT_SELF_TOOLS = prevSelf;
   }
+});
+
+
+test('consolidateActiveFacts (stored embeddings): full-coverage pairwise dedup keeps the higher-scored fact', async () => {
+  resetMemoryDb();
+  const db = openMemoryDb();
+  const embed = db.prepare(`INSERT INTO fact_embeddings (fact_id, model, dim, vector, content_hash, created_at)
+                            VALUES (?, 'test', 4, ?, ?, datetime('now'))`);
+  const setVec = (id: number, arr: number[], hash: string) => embed.run(id, vectorToBuffer(Float32Array.from(arr)), hash);
+
+  // A and B are near-duplicates (identical vector); B has the higher score → A is dropped.
+  const a = rememberFact({ kind: 'project', content: 'Quarterly revenue target is 2M.', score: 1.0 });
+  const b = rememberFact({ kind: 'project', content: 'The quarterly revenue goal is two million.', score: 1.5 });
+  const c = rememberFact({ kind: 'project', content: 'Office relocation planned for spring.', score: 1.0 });
+  setVec(a.id, [1, 0, 0, 0], 'dup-a');
+  setVec(b.id, [1, 0, 0, 0], 'dup-b');
+  setVec(c.id, [0, 1, 0, 0], 'distinct-c');
+
+  const res = await consolidateActiveFacts({ useStoredEmbeddings: true, simThreshold: 0.95 });
+  assert.ok(res.merged >= 1, 'at least one near-duplicate is folded');
+  assert.ok(res.ids.includes(a.id), 'the lower-scored duplicate (A) is dropped');
+  assert.equal(getFact(a.id)?.active, false, 'A is soft-deleted');
+  assert.equal(getFact(b.id)?.active, true, 'the higher-scored B is kept');
+  assert.equal(getFact(c.id)?.active, true, 'the distinct fact C is untouched');
+});
+
+test('consolidateActiveFacts (stored embeddings): makes ZERO new embed API calls (uses stored vectors)', async () => {
+  resetMemoryDb();
+  const db = openMemoryDb();
+  // No OPENAI key in this test env + no stored vectors for these facts → the
+  // stored path simply finds nothing to compare and never calls the API.
+  rememberFact({ kind: 'user', content: 'A fact with no embedding yet.' });
+  const res = await consolidateActiveFacts({ useStoredEmbeddings: true });
+  assert.equal(res.merged, 0, 'un-embedded facts are skipped, not re-embedded');
 });
 
 // Cleanup
