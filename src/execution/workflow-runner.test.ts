@@ -56,7 +56,7 @@ const {
   finalizeStepOutput,
 } = await import('./workflow-runner.js');
 const { SessionStore: RunnerSessionStore } = await import('../memory/session-store.js');
-const { readWorkflowEvents } = await import('./workflow-events.js');
+const { readWorkflowEvents, appendWorkflowEvent, computeResumeState } = await import('./workflow-events.js');
 const { HarnessSession } = await import('../runtime/harness/session.js');
 const { resetEventLog } = await import('../runtime/harness/eventlog.js');
 const approvalRegistry = await import('../runtime/harness/approval-registry.js');
@@ -1063,4 +1063,25 @@ test('P0-3 forEach step is exempt (resume is item-level idempotent)', () => {
     { id: 'blast', prompt: 'Email each prospect.', sideEffect: 'send', forEach: 'pull' },
   ]);
   assert.equal(shouldHaltResumeForSideEffect(wf, resumeState('blast')), null);
+});
+
+test('P0-3 end-to-end: park → approve → crash mid-send HALTS (closes the double-send hole)', () => {
+  // Build the real event sequence through the durability layer and feed the
+  // resulting ResumeState to the guard — the post-approval re-start must clear
+  // the park marker so a mid-send crash is caught, not blind-re-run.
+  const slug = 'p03-e2e';
+  const wf = wfWith([{ id: 'send', prompt: 'Email the batch.', sideEffect: 'send' }]);
+
+  // 1. parked on a runtime approval → exempt (resumes from the gate).
+  appendWorkflowEvent(slug, 'r1', { kind: 'step_started', stepId: 'send' });
+  appendWorkflowEvent(slug, 'r1', { kind: 'step_failed', stepId: 'send', error: 'Workflow run parked on approval.' });
+  assert.equal(shouldHaltResumeForSideEffect(wf, computeResumeState(slug, 'r1')), null, 'still-parked send resumes');
+
+  // 2. approved → re-started → crashed mid-send → HALT (no double send).
+  appendWorkflowEvent(slug, 'r1', { kind: 'step_started', stepId: 'send' });
+  assert.deepEqual(
+    shouldHaltResumeForSideEffect(wf, computeResumeState(slug, 'r1')),
+    { stepId: 'send', cls: 'send' },
+    'post-approval mid-send crash halts',
+  );
 });

@@ -191,11 +191,16 @@ export interface ResumeState {
   completedItems: Map<string, Map<string, unknown>>;
   /** Step that was in flight at last event (may have crashed). */
   inFlightStepId?: string;
-  /** Step IDs that logged a step_failed event. In a run that is still resumable
-   *  (a genuinely errored run is terminal and never resumed), a step_failed on
-   *  the in-flight step means it PARKED on a runtime approval (request_approval
-   *  → ParkRunSignal → step_failed → re-admitted by the reaper), NOT a silent
-   *  crash — the crash-resume side-effect guard uses this to tell them apart. */
+  /** Step IDs whose MOST-RECENT lifecycle event is step_failed — i.e. currently
+   *  sitting in a parked/failed state, NOT subsequently re-started. A later
+   *  step_started or step_completed REMOVES the id. In a run that is still
+   *  resumable (a genuinely errored run is terminal and never resumed), a step in
+   *  this set means it PARKED on a runtime approval (request_approval →
+   *  ParkRunSignal → step_failed → re-admitted by the reaper), NOT a silent
+   *  crash — the crash-resume side-effect guard uses it to tell them apart.
+   *  Critically, because a re-start clears it, a step that parked, got approved,
+   *  re-started, and THEN crashed mid-send is NOT exempt (its post-approval
+   *  step_started removed it) → the guard halts it instead of double-sending. */
   failedSteps: Set<string>;
   /** ISO timestamp of the most recent event. */
   lastEventAt?: string;
@@ -219,12 +224,17 @@ export function computeResumeState(workflowName: string, runId: string): ResumeS
     }
     if (ev.kind === 'step_started' && ev.stepId) {
       inFlightStepId = ev.stepId;
+      // A re-start clears any prior parked/failed state: a crash AFTER this
+      // step_started is a REAL crash (e.g. a post-approval send that died
+      // mid-flight), not a park — so it must NOT be exempted from the guard.
+      failedSteps.delete(ev.stepId);
     }
     if (ev.kind === 'step_failed' && ev.stepId) {
       failedSteps.add(ev.stepId);
     }
     if (ev.kind === 'step_completed' && ev.stepId) {
       completedSteps.set(ev.stepId, ev.output);
+      failedSteps.delete(ev.stepId);
       if (inFlightStepId === ev.stepId) inFlightStepId = undefined;
     }
     if (ev.kind === 'item_completed' && ev.stepId && ev.itemKey) {

@@ -104,6 +104,19 @@ test('computeResumeState tracks failedSteps (the runtime-approval park signature
   assert.equal(state.terminal, false, 'step_failed is not a terminal RUN status');
 });
 
+test('computeResumeState: a re-started step is REMOVED from failedSteps (post-approval crash is not a park)', () => {
+  // park → approve → re-run (2nd step_started) → crash mid-send. The stale
+  // park marker must NOT linger, or the guard would exempt a real mid-send
+  // crash and double-send.
+  appendWorkflowEvent('resume-restart', 'r1', { kind: 'run_started' });
+  appendWorkflowEvent('resume-restart', 'r1', { kind: 'step_started', stepId: 'send' });
+  appendWorkflowEvent('resume-restart', 'r1', { kind: 'step_failed', stepId: 'send', error: 'Workflow run parked on approval.' });
+  appendWorkflowEvent('resume-restart', 'r1', { kind: 'step_started', stepId: 'send' }); // post-approval re-run
+  const state = computeResumeState('resume-restart', 'r1');
+  assert.ok(!state.failedSteps.has('send'), 're-start clears the parked marker');
+  assert.equal(state.inFlightStepId, 'send', 'still in-flight (no completion)');
+});
+
 test('computeResumeState round-trips STRUCTURED step output (no schema change needed)', () => {
   // The step_result refactor stores structured objects as step output.
   // This proves resume restores the object intact across a restart —
