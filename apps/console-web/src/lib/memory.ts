@@ -49,6 +49,11 @@ export const forgetFact = (id: Fact['id']) =>
 export const pinFact = (id: Fact['id'], pinned = true) =>
   apiPost(`/api/console/memory/facts/${encodeURIComponent(String(id))}/pin`, { pinned });
 
+/** Reverse a soft-delete (forget / auto-clean / approved retire/merge). The
+ *  undo half of every reversible memory action — 30-day window. */
+export const restoreFact = (id: Fact['id']) =>
+  apiPost(`/api/console/memory/facts/${encodeURIComponent(String(id))}/restore`);
+
 /** A core context file Clementine reads every turn (SOUL/IDENTITY/MEMORY/working). */
 export interface ContextFile {
   key: string;

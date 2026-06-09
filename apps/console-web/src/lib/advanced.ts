@@ -81,6 +81,26 @@ export const getAutoresearchReport = () => apiGet<AutoresearchReportResponse>('/
 export const runAutoresearch = () => apiPost<AutoresearchRunResponse>('/api/console/autoresearch/run');
 export const runMemoryCleanup = () => apiPost<AutoCleanResult>('/api/console/autoresearch/memory-cleanup');
 
+// ─── P2 — one-click approvals for knowledge-touching refinements ────────────
+export interface ApproveResult {
+  ran: boolean;
+  applied: number;
+  ids: number[];
+  skipped: Array<{ id: number; reason: string }>;
+  examples: Array<{ id: number; content: string; note?: string }>;
+  cap: number;
+  remaining: number;
+  dryRun: boolean;
+  class: string;
+  reason?: string;
+}
+export const approveDuplicates = (pairs: Array<{ keepId: number; dropId: number }>) =>
+  apiPost<ApproveResult>('/api/console/autoresearch/memory-approve/duplicates', { pairs });
+export const liftRecallGaps = () =>
+  apiPost<ApproveResult>('/api/console/autoresearch/memory-approve/recall-gaps');
+export const retireInternalNoise = () =>
+  apiPost<ApproveResult>('/api/console/autoresearch/memory-approve/internal-noise');
+
 export const fmtNum = (n?: number) => (typeof n === 'number' ? n.toLocaleString() : '—');
 export const fmtPct = (n?: number) => (typeof n === 'number' ? `${Math.round(n)}%` : '—');
 export const fmtWhen = (iso?: string) => {

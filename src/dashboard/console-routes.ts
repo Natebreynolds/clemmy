@@ -1255,6 +1255,56 @@ export function registerConsoleRoutes(
   });
 
   /**
+   * Auto-research P2 — one-click human APPROVAL for the knowledge-touching
+   * refinement classes. Unlike P1 (auto), NOTHING here runs unattended: each is
+   * gated on an explicit Approve click on the Evolution page. All soft + capped
+   * + audited + reversible; the batch routes re-derive their full target set
+   * server-side, and the per-pair dedup route re-validates every pair at the
+   * seam (never trusts client ids). ?dry=1 previews without mutating.
+   */
+  app.post('/api/console/autoresearch/memory-approve/duplicates', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { approveDuplicateMerges } = await import('../autoresearch/memory-approve.js');
+      const body = (req.body ?? {}) as { pairs?: unknown };
+      const rawPairs = Array.isArray(body.pairs) ? body.pairs : [];
+      const pairs = rawPairs
+        .filter((p): p is { keepId: number; dropId: number } => {
+          const o = p as { keepId?: unknown; dropId?: unknown } | null;
+          return !!o && typeof o.keepId === 'number' && typeof o.dropId === 'number'
+            && Number.isFinite(o.keepId) && Number.isFinite(o.dropId)
+            && o.keepId > 0 && o.dropId > 0 && o.keepId !== o.dropId;
+        });
+      const dryRun = req.query.dry === '1' || req.query.dry === 'true';
+      res.json(approveDuplicateMerges({ pairs, dryRun }));
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/autoresearch/memory-approve/recall-gaps', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { liftRecallGaps } = await import('../autoresearch/memory-approve.js');
+      const dryRun = req.query.dry === '1' || req.query.dry === 'true';
+      res.json(liftRecallGaps({ dryRun }));
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/autoresearch/memory-approve/internal-noise', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { retireInternalNoise } = await import('../autoresearch/memory-approve.js');
+      const dryRun = req.query.dry === '1' || req.query.dry === 'true';
+      res.json(retireInternalNoise({ dryRun }));
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
    * Soft-delete a fact (sets active=0). Used by the panel's forget button.
    * Hard delete intentionally not exposed here — that lives in MCP tools
    * for the agent itself.
