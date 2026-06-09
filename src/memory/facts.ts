@@ -1060,6 +1060,12 @@ export interface DecayOptions {
   importanceCeil?: number;
   /** Soft-delete only when the Stanford recall score is below this floor. */
   scoreFloor?: number;
+  /** v11 — importance-AWARE decay: instead of the binary importance≤ceil gate
+   *  (which makes the importance≥5 tail structurally immortal), scale the idle
+   *  threshold by importance × access-frequency so even a high-importance fact
+   *  can fade after MONTHS of total disuse, while proven-useful ones are
+   *  protected longer. Default from CLEMMY_DECAY_IMPORTANCE_AWARE (off). */
+  importanceAware?: boolean;
   nowMs?: number;
 }
 
@@ -1088,16 +1094,64 @@ export interface DecayResult {
  * Soft delete only (active=0): the row, its embedding, and its audit trail
  * survive for re-activation, exactly like `deleteFact`/Mem0 DELETE.
  */
+/** Idle days before a fact is eligible to decay in importance-aware mode,
+ *  scaled by importance (more important → protected longer) and access
+ *  frequency (proven-useful → protected longer). With base 60d:
+ *  imp1/0-access ≈ 36d, imp5/0 ≈ 60d, imp8/0 ≈ 78d, imp10/50-access ≈ 270d. */
+export function importanceAwareIdleThresholdDays(fact: ConsolidatedFact, baseIdleDays: number): number {
+  const importance = typeof fact.importance === 'number' ? fact.importance : 5;
+  const importanceFactor = 0.5 + importance / 10;
+  const accessFactor = 1 + 0.5 * Math.log1p(Math.max(0, fact.accessCount ?? 0));
+  return baseIdleDays * importanceFactor * accessFactor;
+}
+
+function decayImportanceAwareEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_DECAY_IMPORTANCE_AWARE', 'off') || 'off').toLowerCase() === 'on';
+}
+
 export function decayAndEvictFacts(options: DecayOptions = {}): DecayResult {
   const maxDeactivate = Math.max(0, options.maxDeactivate ?? 100);
   const minIdleDays = Math.max(1, options.minIdleDays ?? 60);
   const importanceCeil = Math.max(1, Math.min(10, options.importanceCeil ?? 4));
   const scoreFloor = options.scoreFloor ?? 0.4;
+  const importanceAware = options.importanceAware ?? decayImportanceAwareEnabled();
   const nowMs = options.nowMs ?? Date.now();
   const result: DecayResult = { scanned: 0, deactivated: 0, ids: [], reasons: [] };
   if (maxDeactivate === 0) return result;
 
   const db = openMemoryDb();
+
+  if (importanceAware) {
+    // Fetch broadly-idle, unpinned candidates (idle ≥ the smallest possible
+    // threshold = base × 0.6 for imp1/0-access) then apply the per-fact
+    // importance×access threshold in JS. Most-idle first.
+    const minThresholdDays = minIdleDays * 0.6;
+    const minCutoff = new Date(nowMs - minThresholdDays * 24 * 60 * 60 * 1000).toISOString();
+    const rows = db.prepare(`
+      SELECT * FROM consolidated_facts
+      WHERE active = 1
+        AND pinned = 0
+        AND COALESCE(last_accessed_at, extracted_at, updated_at, created_at) < ?
+      ORDER BY COALESCE(last_accessed_at, updated_at, created_at) ASC
+      LIMIT ?
+    `).all(minCutoff, maxDeactivate * 8) as ConsolidatedFactRow[];
+    for (const row of rows) {
+      result.scanned += 1;
+      if (result.deactivated >= maxDeactivate) break;
+      const fact = rowToFact(row);
+      const anchorIso = fact.lastAccessedAt || fact.extractedAt || fact.updatedAt || fact.createdAt;
+      const idleDays = (nowMs - Date.parse(anchorIso)) / (24 * 60 * 60 * 1000);
+      const threshold = importanceAwareIdleThresholdDays(fact, minIdleDays);
+      if (!(idleDays >= threshold)) continue;
+      if (deleteFact(fact.id)) {
+        result.deactivated += 1;
+        result.ids.push(fact.id);
+        result.reasons.push(`#${fact.id} imp:${fact.importance ?? 5} idle:${idleDays.toFixed(0)}d/${threshold.toFixed(0)}d acc:${fact.accessCount ?? 0}`);
+      }
+    }
+    return result;
+  }
+
   const idleCutoff = new Date(nowMs - minIdleDays * 24 * 60 * 60 * 1000).toISOString();
   // Candidate set: active, unpinned, idle, low-importance. Over-fetch (×4)
   // so the score-floor filter below still has room to hit maxDeactivate.

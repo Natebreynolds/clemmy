@@ -604,3 +604,42 @@ test('touchFactAccess increments access_count', () => {
   touchFactAccess(a.id);
   assert.equal(getFact(a.id)?.accessCount, 2, 'two touches → access_count 2');
 });
+
+test('importance-aware decay: low-importance idle fades; high-importance moderately-idle survives; ancient high-importance eventually fades', () => {
+  const db = openMemoryDb();
+  const daysAgo = (d: number) => new Date(Date.now() - d * DAY_MS).toISOString();
+  const setAge = (id: number, days: number, importance: number, access: number) => db.prepare(
+    'UPDATE consolidated_facts SET updated_at=?, created_at=?, last_accessed_at=NULL, importance=?, access_count=? WHERE id=?'
+  ).run(daysAgo(days), daysAgo(days), importance, access, id);
+
+  const lowIdle = rememberFact({ kind: 'project', content: 'Low importance idle fact.' });
+  setAge(lowIdle.id, 50, 2, 0);        // threshold ~42d, idle 50 → decays
+  const highMod = rememberFact({ kind: 'project', content: 'High importance moderately idle.' });
+  setAge(highMod.id, 70, 9, 0);        // threshold ~84d, idle 70 → survives
+  const highAncient = rememberFact({ kind: 'project', content: 'High importance unused for months.' });
+  setAge(highAncient.id, 200, 9, 0);   // threshold ~84d, idle 200 → fades (tail not immortal)
+  const usedOften = rememberFact({ kind: 'project', content: 'Frequently recalled fact.' });
+  setAge(usedOften.id, 100, 5, 50);   // threshold ~178d, idle 100 → protected by reinforcement
+
+  const decayed = new Set(decayAndEvictFacts({ importanceAware: true }).ids);
+  assert.ok(decayed.has(lowIdle.id), 'low-importance very-idle fact decays');
+  assert.ok(!decayed.has(highMod.id), 'high-importance moderately-idle fact survives');
+  assert.ok(decayed.has(highAncient.id), 'high-importance fact unused for months eventually fades');
+  assert.ok(!decayed.has(usedOften.id), 'a frequently-recalled fact is protected by access reinforcement');
+});
+
+test('importance-aware decay: pinned facts are exempt even when ancient', () => {
+  const db = openMemoryDb();
+  const f = rememberFact({ kind: 'feedback', content: 'Pinned standing rule.' });
+  db.prepare('UPDATE consolidated_facts SET updated_at=?, created_at=?, importance=?, pinned=1 WHERE id=?')
+    .run(new Date(Date.now() - 300 * DAY_MS).toISOString(), new Date(Date.now() - 300 * DAY_MS).toISOString(), 2, f.id);
+  assert.ok(!decayAndEvictFacts({ importanceAware: true }).ids.includes(f.id), 'pinned fact exempt even at 300 days idle');
+});
+
+test('importance-aware decay is OFF by default — binary behavior unchanged (high-importance never evicted)', () => {
+  const db = openMemoryDb();
+  const f = rememberFact({ kind: 'project', content: 'High importance ancient.' });
+  db.prepare('UPDATE consolidated_facts SET updated_at=?, created_at=?, importance=9 WHERE id=?')
+    .run(new Date(Date.now() - 300 * DAY_MS).toISOString(), new Date(Date.now() - 300 * DAY_MS).toISOString(), f.id);
+  assert.ok(!decayAndEvictFacts({}).ids.includes(f.id), 'binary (default) mode never evicts a high-importance fact');
+});
