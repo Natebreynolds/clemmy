@@ -45,10 +45,39 @@ const FETCH_TIMEOUT_MS = 6_000;
 // silently fall through to the FTS path, avoiding the 6s × N tax per
 // chat. A single success closes the breaker.
 const CONSECUTIVE_FAIL_THRESHOLD = 3;
-const COOLDOWN_MS = 5 * 60_000;
+// Class-aware cooldowns. A transient pool/network blip clears in minutes and a
+// rate-limit clears fast, but a TERMINAL error (quota exhausted / bad key) will
+// NOT fix itself for hours — retrying it every 5 min just drip-spends and floods
+// the log (the 2026-06-08 incident: 149 retries in a day against an empty
+// account). So terminal errors back off hard and surface loudly.
+const COOLDOWN_TRANSIENT_MS = 5 * 60_000;   // pooled-IP / network / 5xx / timeout
+const COOLDOWN_RATE_LIMIT_MS = 60_000;      // 429 throttle (not quota)
+const COOLDOWN_TERMINAL_MS = 60 * 60_000;   // quota / auth — probe at most hourly
+
+export type EmbedErrorClass = 'quota' | 'auth' | 'rate_limit' | 'transient';
+
+export function classifyEmbedError(err: unknown): EmbedErrorClass {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (/insufficient_quota|exceeded your current quota|check your plan and billing/i.test(msg)) return 'quota';
+  if (/\b401\b|invalid_api_key|incorrect api key|OPENAI_API_KEY is not set/i.test(msg)) return 'auth';
+  if (/\b429\b|rate.?limit/i.test(msg)) return 'rate_limit';
+  return 'transient';
+}
+
+function cooldownForClass(cls: EmbedErrorClass): number {
+  switch (cls) {
+    case 'quota':
+    case 'auth': return COOLDOWN_TERMINAL_MS;
+    case 'rate_limit': return COOLDOWN_RATE_LIMIT_MS;
+    default: return COOLDOWN_TRANSIENT_MS;
+  }
+}
 
 let consecutiveFailures = 0;
 let cooldownUntilMs = 0;
+let lastSuccessAtMs = 0;
+let lastErrorClass: EmbedErrorClass | null = null;
+let lastErrorAtMs = 0;
 
 function inCooldown(): boolean {
   if (cooldownUntilMs === 0) return false;
@@ -61,18 +90,77 @@ function inCooldown(): boolean {
   return true;
 }
 
+/** Non-mutating view of breaker state for the health getter (never half-opens). */
+function breakerOpenPeek(): boolean {
+  return cooldownUntilMs !== 0 && Date.now() < cooldownUntilMs;
+}
+
 function recordSuccess(): void {
   consecutiveFailures = 0;
   cooldownUntilMs = 0;
+  lastSuccessAtMs = Date.now();
+  lastErrorClass = null;
 }
 
-function recordFailure(): void {
+function recordFailure(err: unknown): void {
   consecutiveFailures++;
-  if (consecutiveFailures >= CONSECUTIVE_FAIL_THRESHOLD && cooldownUntilMs === 0) {
-    cooldownUntilMs = Date.now() + COOLDOWN_MS;
-    logger.warn({ failures: consecutiveFailures, cooldownMs: COOLDOWN_MS }, 'embeddings circuit breaker open — falling back to FTS-only for the next 5 minutes');
+  const cls = classifyEmbedError(err);
+  lastErrorClass = cls;
+  lastErrorAtMs = Date.now();
+  const terminal = cls === 'quota' || cls === 'auth';
+  // Terminal errors are definitive — open immediately (don't burn 2 more calls
+  // confirming the quota is still empty). Transient/rate-limit wait for the
+  // threshold so a single blip doesn't drop recall to FTS.
+  const shouldOpen = cooldownUntilMs === 0 && (terminal || consecutiveFailures >= CONSECUTIVE_FAIL_THRESHOLD);
+  if (shouldOpen) {
+    const ms = cooldownForClass(cls);
+    cooldownUntilMs = Date.now() + ms;
+    const line = `embeddings circuit breaker open (${cls}) — recall on FTS-only for ~${Math.round(ms / 60_000)}m`;
+    if (terminal) {
+      logger.error(
+        { cls, failures: consecutiveFailures, cooldownMs: ms },
+        `${line}. ${cls === 'quota' ? 'OpenAI quota exhausted — add credit/billing to restore semantic memory.' : 'OpenAI key rejected — check credentials.'}`,
+      );
+    } else {
+      logger.warn({ cls, failures: consecutiveFailures, cooldownMs: ms }, line);
+    }
   }
 }
+
+export interface EmbeddingHealth {
+  enabled: boolean;
+  breakerOpen: boolean;
+  cooldownUntilMs: number;
+  lastSuccessAt: string | null;
+  consecutiveFailures: number;
+  lastErrorClass: EmbedErrorClass | null;
+  lastErrorAt: string | null;
+}
+
+/** Snapshot of embedding health for the diagnostics panel — non-mutating. */
+export function getEmbeddingHealth(): EmbeddingHealth {
+  return {
+    enabled: isEmbeddingsEnabled(),
+    breakerOpen: breakerOpenPeek(),
+    cooldownUntilMs,
+    lastSuccessAt: lastSuccessAtMs ? new Date(lastSuccessAtMs).toISOString() : null,
+    consecutiveFailures,
+    lastErrorClass,
+    lastErrorAt: lastErrorAtMs ? new Date(lastErrorAtMs).toISOString() : null,
+  };
+}
+
+/** Test-only: reset the in-process breaker/health state between cases. */
+export function _resetEmbeddingHealthForTest(): void {
+  consecutiveFailures = 0;
+  cooldownUntilMs = 0;
+  lastSuccessAtMs = 0;
+  lastErrorClass = null;
+  lastErrorAtMs = 0;
+}
+/** Test-only: drive the breaker without a real API call. */
+export function _driveEmbedFailureForTest(err: unknown): void { recordFailure(err); }
+export function _driveEmbedSuccessForTest(): void { recordSuccess(); }
 
 export function isEmbeddingsEnabled(): boolean {
   // Explicit, key-decoupled opt-out. Previously EMBEDDINGS_DISABLED was read
@@ -177,7 +265,7 @@ export async function embedQuery(query: string): Promise<Float32Array | null> {
     recordSuccess();
     return vector ?? null;
   } catch (err) {
-    recordFailure();
+    recordFailure(err);
     logger.warn({ err }, 'embedQuery failed; falling back to FTS-only');
     return null;
   }
@@ -256,7 +344,7 @@ export async function embedMissingChunks(options: { maxChunks?: number } = {}): 
       vectors = await embedBatch(batch.map((r) => r.content));
       recordSuccess();
     } catch (err) {
-      recordFailure();
+      recordFailure(err);
       stats.failed += batch.length;
       logger.warn({ err, batchStart: i, batchSize: batch.length }, 'embed batch failed');
       // If the breaker tripped on this batch, bail the whole tick —
@@ -370,7 +458,7 @@ export async function embedMissingFacts(options: { maxChunks?: number } = {}): P
       vectors = await embedBatch(batch.map((r) => r.content));
       recordSuccess();
     } catch (err) {
-      recordFailure();
+      recordFailure(err);
       stats.failed += batch.length;
       logger.warn({ err, batchStart: i, batchSize: batch.length }, 'embed fact batch failed');
       if (inCooldown()) {
@@ -444,4 +532,20 @@ export function readEmbeddingStats(): EmbeddingStats {
     // Table may not exist or DB may not be openable in some edge tests.
   }
   return stats;
+}
+
+/** Active facts that don't yet have an embedding — the backfill backlog. A
+ *  growing value while the breaker is open means semantic recall is degrading. */
+export function countUnembeddedActiveFacts(): number {
+  try {
+    const db = openMemoryDb();
+    const row = db.prepare(`
+      SELECT COUNT(*) AS c FROM consolidated_facts f
+      WHERE f.active = 1
+        AND NOT EXISTS (SELECT 1 FROM fact_embeddings e WHERE e.fact_id = f.id)
+    `).get() as { c: number };
+    return row.c;
+  } catch {
+    return 0;
+  }
 }

@@ -22,6 +22,7 @@ import { BASE_DIR } from '../config.js';
 import { listMcpServerHealth, type MCPServerHealthSnapshot } from '../runtime/mcp-namespace-shim.js';
 import { readCachedScan } from '../runtime/cli-discovery.js';
 import { redactSensitiveText, redactSensitiveValue } from '../runtime/security.js';
+import { getEmbeddingHealth, readEmbeddingStats, countUnembeddedActiveFacts } from '../memory/embeddings.js';
 
 const SUPERVISOR_LOG_PATH = path.join(BASE_DIR, 'logs', 'desktop', 'supervisor.log');
 const TOOL_EVENTS_DIR = path.join(BASE_DIR, 'state', 'tool-events');
@@ -38,6 +39,25 @@ export interface DiagnosticsSummary {
    *  timestamp from the cli-discovery cache. */
   cli: { count: number | null; lastScannedAt: string | null };
   storage: StorageStats;
+  /** Semantic-memory (embeddings) health — surfaces a quota/auth outage that
+   *  was previously silent (recall degrades to FTS with no signal). */
+  semanticMemory: SemanticMemoryHealth;
+}
+
+export interface SemanticMemoryHealth {
+  /** Derived rollup: 'ok' | 'disabled' | 'quota_exhausted' | 'auth_failed' | 'degraded'. */
+  status: 'ok' | 'disabled' | 'quota_exhausted' | 'auth_failed' | 'degraded';
+  /** Human-readable one-liner for the panel. */
+  detail: string;
+  enabled: boolean;
+  breakerOpen: boolean;
+  model: string | null;
+  dim: number | null;
+  embeddedCount: number;
+  unembeddedActiveCount: number;
+  lastSuccessAt: string | null;
+  lastErrorClass: string | null;
+  lastErrorAt: string | null;
 }
 
 export interface ToolEventsSummary {
@@ -238,6 +258,45 @@ function readStorageStats(): StorageStats {
   return { baseDir: BASE_DIR, supervisorLogSizeBytes: supervisorBytes, toolEventsTodayBytes: toolEventsBytes, stateJsonCount };
 }
 
+function readSemanticMemoryHealth(): SemanticMemoryHealth {
+  const h = getEmbeddingHealth();
+  const stats = readEmbeddingStats();
+  const unembedded = countUnembeddedActiveFacts();
+  let status: SemanticMemoryHealth['status'];
+  let detail: string;
+  if (!h.enabled) {
+    status = 'disabled';
+    detail = 'Embeddings off — recall is keyword (FTS) only.';
+  } else if (h.breakerOpen && h.lastErrorClass === 'quota') {
+    status = 'quota_exhausted';
+    detail = 'OpenAI quota exhausted — semantic recall is down (FTS fallback). Add credit/billing.';
+  } else if (h.breakerOpen && h.lastErrorClass === 'auth') {
+    status = 'auth_failed';
+    detail = 'OpenAI key rejected — semantic recall is down (FTS fallback). Check credentials.';
+  } else if (h.breakerOpen) {
+    status = 'degraded';
+    detail = 'Embeddings temporarily degraded (transient errors) — recall on FTS until it recovers.';
+  } else {
+    status = 'ok';
+    detail = unembedded > 0
+      ? `Semantic recall active; ${unembedded} fact(s) awaiting backfill.`
+      : 'Semantic recall active; all active facts embedded.';
+  }
+  return {
+    status,
+    detail,
+    enabled: h.enabled,
+    breakerOpen: h.breakerOpen,
+    model: stats.model,
+    dim: stats.dim,
+    embeddedCount: stats.count,
+    unembeddedActiveCount: unembedded,
+    lastSuccessAt: h.lastSuccessAt,
+    lastErrorClass: h.lastErrorClass,
+    lastErrorAt: h.lastErrorAt,
+  };
+}
+
 export function collectDiagnostics(): DiagnosticsSummary {
   const servers = redactSensitiveValue(listMcpServerHealth());
   const mcpSummary: McpHealthSummary = {
@@ -258,5 +317,6 @@ export function collectDiagnostics(): DiagnosticsSummary {
       lastScannedAt: cliScan ? cliScan.scannedAt : null,
     },
     storage: readStorageStats(),
+    semanticMemory: readSemanticMemoryHealth(),
   };
 }
