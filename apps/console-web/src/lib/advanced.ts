@@ -52,10 +52,20 @@ export interface DuplicatePair { kind: string; keepId: number; dropId: number; s
 export interface MemoryRefinements {
   duplicates: { count: number; capped: boolean; pairs: DuplicatePair[] };
   internalNoise: { count: number; byTool: Array<{ tool: string; count: number }>; examples: RefinementCandidate[] };
+  syntheticJunk: { count: number; examples: RefinementCandidate[] };
   stale: { count: number; examples: RefinementCandidate[] };
   recallGaps: { count: number; examples: RefinementCandidate[] };
   totalCandidates: number;
   generatedAt: string;
+}
+export interface AutoCleanResult {
+  ran: boolean;
+  pruned: number;
+  ids: number[];
+  examples: Array<{ id: number; content: string; signature: string }>;
+  cap: number;
+  dryRun: boolean;
+  reason?: string;
 }
 export interface AutoresearchReportResponse {
   report: ObservatoryReport | null;
@@ -69,6 +79,7 @@ export interface AutoresearchRunResponse {
 
 export const getAutoresearchReport = () => apiGet<AutoresearchReportResponse>('/api/console/autoresearch/report');
 export const runAutoresearch = () => apiPost<AutoresearchRunResponse>('/api/console/autoresearch/run');
+export const runMemoryCleanup = () => apiPost<AutoCleanResult>('/api/console/autoresearch/memory-cleanup');
 
 export const fmtNum = (n?: number) => (typeof n === 'number' ? n.toLocaleString() : '—');
 export const fmtPct = (n?: number) => (typeof n === 'number' ? `${Math.round(n)}%` : '—');

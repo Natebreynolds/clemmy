@@ -16,7 +16,7 @@ const MAX_LINES = 2000;
 
 export interface HygieneAuditEntry {
   at: string;
-  kind: 'decay' | 'dedup';
+  kind: 'decay' | 'dedup' | 'autoclean';
   ids: number[];
   detail?: Record<string, unknown>;
 }

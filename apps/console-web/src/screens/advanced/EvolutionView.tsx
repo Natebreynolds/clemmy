@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { ExternalLink, RefreshCw, Brain, Wrench, Lightbulb, TrendingUp, Sparkles } from 'lucide-react';
+import { ExternalLink, RefreshCw, Brain, Wrench, Lightbulb, TrendingUp, Sparkles, ShieldCheck, Check } from 'lucide-react';
 import { Page } from '@/components/Page';
 import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
@@ -8,8 +8,8 @@ import { Skeleton } from '@/components/ui/Skeleton';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { usePoll } from '@/lib/poll';
 import {
-  getAutoresearchReport, runAutoresearch, fmtNum, fmtPct, fmtWhen,
-  type ObservatoryReport, type ToolHealth, type MemoryRefinements,
+  getAutoresearchReport, runAutoresearch, runMemoryCleanup, fmtNum, fmtPct, fmtWhen,
+  type ObservatoryReport, type ToolHealth, type MemoryRefinements, type AutoCleanResult,
 } from '@/lib/advanced';
 
 const pct = (n: number, d: number) => (d > 0 ? Math.round((n / d) * 100) : 0);
@@ -158,24 +158,65 @@ function RefineStat({ label, value }: { label: string; value: string }) {
   );
 }
 
-function MemoryRefinementsCard({ data }: { data: MemoryRefinements }) {
+function MemoryRefinementsCard({ data, onCleaned }: { data: MemoryRefinements; onCleaned: () => Promise<unknown> | void }) {
   const dups = data.duplicates;
   const noise = data.internalNoise;
+  const junk = data.syntheticJunk;
   const gaps = data.recallGaps;
   const stale = data.stale;
   const dupPairs = Array.isArray(dups?.pairs) ? dups.pairs : [];
   const byTool = Array.isArray(noise?.byTool) ? noise.byTool : [];
   const gapEx = Array.isArray(gaps?.examples) ? gaps.examples : [];
+  const junkCount = junk?.count ?? 0;
+
+  const [cleaning, setCleaning] = useState(false);
+  const [cleaned, setCleaned] = useState<AutoCleanResult | null>(null);
+  const [cleanError, setCleanError] = useState<string | null>(null);
+
+  const onClean = async () => {
+    setCleaning(true);
+    setCleanError(null);
+    try {
+      const res = await runMemoryCleanup();
+      setCleaned(res);
+      await onCleaned();
+    } catch (err) {
+      setCleanError(err instanceof Error ? err.message : 'Cleanup failed');
+    } finally {
+      setCleaning(false);
+    }
+  };
+
   return (
     <Card className="p-5">
       <div className="mb-2 flex items-center gap-2">
         <Sparkles className="h-4 w-4 text-faint" aria-hidden />
         <h3 className="text-h3 text-fg">Memory refinements</h3>
-        <span className="ml-auto text-caption text-faint">{fmtNum(data.totalCandidates)} candidates · read-only preview</span>
+        <span className="ml-auto text-caption text-faint">{fmtNum(data.totalCandidates)} candidates</span>
       </div>
       <p className="mb-3 max-w-2xl text-small text-muted">
-        What Clementine would tidy to keep memory sharp. Nothing is changed yet — auto-applying the safe cleanups and one-click approvals for the rest are coming next.
+        How Clementine keeps memory sharp. The <span className="text-fg">provably-safe</span> class (smoke-test pollution) is cleaned automatically every night — everything that could touch your real knowledge waits for your one-click approval (coming next).
       </p>
+
+      {/* Provably-safe auto-clean — the one class we apply without asking. */}
+      <div className="mb-4 flex flex-wrap items-center gap-3 rounded-md border border-border bg-surface p-3">
+        <ShieldCheck className="h-4 w-4 shrink-0 text-success" aria-hidden />
+        <div className="min-w-0 flex-1">
+          <div className="text-small font-medium text-fg">Safe to auto-clean: {fmtNum(junkCount)} synthetic test fact(s)</div>
+          <div className="text-caption text-faint">
+            Smoke-test pollution (exact-signature match). Soft-deleted &amp; undoable for 30 days. Runs nightly; clean on demand here.
+          </div>
+        </div>
+        {cleaned ? (
+          <StatusPill tone="success"><Check className="h-3.5 w-3.5" aria-hidden /> Cleaned {fmtNum(cleaned.pruned)}</StatusPill>
+        ) : (
+          <Button variant="secondary" size="sm" onClick={onClean} disabled={cleaning || junkCount === 0}>
+            {cleaning ? 'Cleaning…' : junkCount === 0 ? 'Nothing to clean' : `Clean up ${fmtNum(junkCount)} now`}
+          </Button>
+        )}
+      </div>
+      {cleanError && <p className="mb-3 text-small text-danger">Couldn’t clean: {cleanError}</p>}
+
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
         <RefineStat label="Near-duplicates" value={`${fmtNum(dups?.count ?? 0)}${dups?.capped ? '+' : ''}`} />
         <RefineStat label="Internal-tool noise" value={fmtNum(noise?.count ?? 0)} />
@@ -277,7 +318,7 @@ export function EvolutionView() {
         />
       ) : (
         <div className="space-y-4">
-          {refinements && <MemoryRefinementsCard data={refinements} />}
+          {refinements && <MemoryRefinementsCard data={refinements} onCleaned={q.refetch} />}
           {report && <EvolutionReport report={report} />}
         </div>
       )}
