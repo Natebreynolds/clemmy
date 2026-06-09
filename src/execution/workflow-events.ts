@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { WORKFLOWS_DIR } from '../memory/vault.js';
 import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
@@ -74,6 +74,14 @@ const MAX_PAYLOAD_BYTES = 32 * 1024;
 
 function runDir(workflowName: string, runId: string): string {
   return path.join(WORKFLOWS_DIR, workflowName, 'runs', runId);
+}
+
+/** Delete a run's event-log directory (best-effort). Called by the run-record
+ *  reaper so the per-workflow events.jsonl dirs are removed TOGETHER with the
+ *  flat record — otherwise they accumulate orphaned (P0-2: 334 dirs vs 122
+ *  records) and a reaped run's lingering log used to read as phantom-pending. */
+export function reapRunEventDir(workflowName: string, runId: string): void {
+  try { rmSync(runDir(workflowName, runId), { recursive: true, force: true }); } catch { /* best-effort */ }
 }
 
 function eventsPath(workflowName: string, runId: string): string {
@@ -239,7 +247,12 @@ const TERMINAL_RUN_RECORD_STATUSES = new Set(['completed', 'error', 'cancelled',
 
 function terminalRunRecordStatus(runId: string): boolean {
   const file = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
-  if (!existsSync(file)) return false;
+  // P0-2: a MISSING record means it was reaped (7-day terminal cleanup) or never
+  // persisted — either way this is NOT a live in-flight run to resume. Treat
+  // missing as terminal so a reaped run with a lingering events.jsonl doesn't
+  // get "resumed" as a phantom on every boot (the May-29 trio symptom). Was
+  // `return false`, which made every reaped run look permanently pending.
+  if (!existsSync(file)) return true;
   try {
     const raw = JSON.parse(readFileSync(file, 'utf-8')) as { status?: unknown };
     return typeof raw.status === 'string' && TERMINAL_RUN_RECORD_STATUSES.has(raw.status);

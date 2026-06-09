@@ -3,6 +3,7 @@ import path from 'node:path';
 import pino from 'pino';
 import { CRON_RUNS_DIR, WORKFLOW_RUNS_DIR, ensureDir } from '../tools/shared.js';
 import { listWorkflows } from '../memory/workflow-store.js';
+import { reapRunEventDir } from './workflow-events.js';
 import { validateCronExpression } from '../shared/cron.js';
 
 /**
@@ -401,13 +402,17 @@ export function reapStaleWorkflowRuns(): { scanned: number; deleted: number } {
   for (const file of files) {
     const full = path.join(WORKFLOW_RUNS_DIR, file);
     try {
-      const raw = JSON.parse(readFileSync(full, 'utf-8')) as { status?: string; finishedAt?: string };
+      const raw = JSON.parse(readFileSync(full, 'utf-8')) as { status?: string; finishedAt?: string; workflow?: string };
       if (!raw.status || !TERMINAL_STATUSES.has(raw.status)) continue;
       // Prefer finishedAt; fall back to file mtime if absent (older records).
       const finishedMs = raw.finishedAt ? Date.parse(raw.finishedAt) : NaN;
       const ageRef = Number.isFinite(finishedMs) ? finishedMs : statSync(full).mtimeMs;
       if (ageRef >= cutoffMs) continue;
       unlinkSync(full);
+      // P0-2: reap the run's events.jsonl dir together with the record so the
+      // two sources of truth can't diverge (orphaned event logs that read as
+      // phantom-pending / accumulate unbounded). Best-effort.
+      if (raw.workflow) reapRunEventDir(raw.workflow, file.replace(/\.json$/, ''));
       deleted += 1;
     } catch {
       // Unreadable / disappeared — skip.

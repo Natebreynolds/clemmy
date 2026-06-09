@@ -3111,6 +3111,12 @@ async function processOneRunFile(
         status: cancelled ? 'cancelled' : 'error',
         finishedAt: new Date().toISOString(),
         error: message,
+        // P0-1: a genuine FAILURE must surface in the "Needs you" UI, which reads
+        // needsAttention OFF THE RECORD (the success/blocked path sets it; the
+        // error path never did, so failed runs were invisible). A user CANCEL
+        // never needs attention. proposedFixId is merged in below once the
+        // self-heal diagnosis (if any) computes a fix.
+        ...(cancelled ? {} : { needsAttention: true, blockedSteps: [{ stepId: '(run)', reason: message }] }),
       });
       // Contract-aware self-heal: a step that FAILED its declared output
       // contract throws to here (contract failures throw, so they bypass the
@@ -3151,6 +3157,12 @@ async function processOneRunFile(
         } catch (healErr) {
           logger.warn({ err: healErr, runId: run.id }, 'contract-violation self-heal failed (best-effort)');
         }
+      }
+      // P0-1: persist the proposed fix id onto the RECORD too (the self-heal
+      // block above only put it in the notification), so the "Needs you" surface
+      // can offer "apply fix <id>" for a failed run.
+      if (healFixId) {
+        try { const rec = readRunRecord(filePath); if (rec) writeRunRecord(filePath, { ...rec, proposedFixId: healFixId }); } catch { /* best-effort */ }
       }
       // Warm the failure tone too (fail-open, lane:'failed' so the rewrite can
       // never claim success or drop the `apply fix <id>` action). A user CANCEL
