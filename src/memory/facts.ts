@@ -19,6 +19,53 @@ function recallCandidatePoolFloor(): number {
   return Number.isFinite(raw) && raw > 0 ? raw : 500;
 }
 
+// ─── Per-turn semantic recall (reuse the turn's query embedding) ───────────
+// The per-turn fact ranking is SYNCHRONOUS, but embedding the query is async.
+// The harness loop computes the query vector once at turn start (concurrent
+// with the memory primer, so ~no added latency) and stashes it here;
+// listActiveFacts(stanford) then adds a BONUS semantic-relevance term
+// (weight · max(0, cosine)) so recall becomes recency + importance + RELEVANCE
+// instead of recency + lexical-only — the 968 fact embeddings finally feed the
+// per-turn path. Bonus-only: it can only PROMOTE an on-topic fact, never demote
+// one below where recency+importance already placed it. TTL-guarded so a stale
+// vector can never leak into an unrelated later call. Flag CLEMMY_SEMANTIC_RECALL
+// (default on); off → byte-identical to the prior lexical ranking.
+const TURN_QUERY_TTL_MS = 60_000;
+let turnQuery: { text: string; vector: Float32Array; atMs: number } | null = null;
+
+export function setTurnQueryVector(text: string, vector: Float32Array | null, nowMs: number = Date.now()): void {
+  turnQuery = vector && vector.length > 0 ? { text, vector, atMs: nowMs } : null;
+}
+export function clearTurnQueryVector(): void { turnQuery = null; }
+
+/** Compute + stash the turn's query embedding so the (sync) per-turn fact
+ *  recall can add a semantic-relevance term. Fire concurrently with the memory
+ *  primer — it never throws and never blocks recall (embedQuery is breaker- and
+ *  timeout-guarded). No-op when the flag is off or embeddings are unavailable,
+ *  leaving recall on the prior lexical ranking. */
+export async function primeTurnRecallVector(input: string): Promise<void> {
+  if (!semanticRecallEnabled() || !input || !input.trim()) { clearTurnQueryVector(); return; }
+  try {
+    setTurnQueryVector(input, await embedQuery(input));
+  } catch {
+    setTurnQueryVector(input, null);
+  }
+}
+
+function getActiveTurnQueryVector(nowMs: number): Float32Array | null {
+  if (!turnQuery) return null;
+  if (nowMs - turnQuery.atMs > TURN_QUERY_TTL_MS) return null;
+  return turnQuery.vector;
+}
+
+function semanticRecallEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_SEMANTIC_RECALL', 'on') || 'on').toLowerCase() !== 'off';
+}
+function semanticRecallWeight(): number {
+  const raw = Number.parseFloat(getRuntimeEnv('CLEMMY_SEMANTIC_RECALL_WEIGHT', '1.0') || '1.0');
+  return Number.isFinite(raw) && raw >= 0 ? raw : 1.0;
+}
+
 /**
  * Read/write API for durable, agent-curated facts.
  *
@@ -753,9 +800,22 @@ export function listActiveFacts(options: {
     const scoreOf = objective
       ? (fact: ConsolidatedFact) => scopedRecallScore(fact, objective, now)
       : (fact: ConsolidatedFact) => stanfordRecallScore(fact, now);
+    // Bonus-only semantic-relevance term: blend cosine(queryVector, factVector)
+    // when the harness stashed a turn query embedding. Loaded once for the whole
+    // candidate pool (sync DB read). No vector / flag off → s is unchanged.
+    const queryVec = semanticRecallEnabled() ? getActiveTurnQueryVector(now) : null;
+    const factVectors = queryVec ? loadFactEmbeddings(rows.map((r) => r.id)) : null;
+    const wSem = semanticRecallWeight();
     return rows
       .map(rowToFact)
-      .map((fact) => ({ fact, s: scoreOf(fact) }))
+      .map((fact) => {
+        let s = scoreOf(fact);
+        if (queryVec && factVectors) {
+          const v = factVectors.get(fact.id);
+          if (v) s += wSem * Math.max(0, cosine(queryVec, v));
+        }
+        return { fact, s };
+      })
       .sort((a, b) => b.s - a.s)
       .slice(0, limit)
       .map((x) => x.fact);
