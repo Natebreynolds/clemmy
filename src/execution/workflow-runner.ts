@@ -1022,6 +1022,11 @@ async function runStepViaHarness(
         agent,
         sessionId: realSessionId,
         input: message,
+        // P2-10: bound the step on the harness path too. The legacy path passes
+        // this (see below); without it a harness step fell back to the 120-min
+        // chat budget, so a hung/runaway step wasn't bounded at the intended
+        // 15 min. Env-tunable via CLEMENTINE_WORKFLOW_STEP_WALL_MS.
+        maxWallClockMs: WORKFLOW_STEP_WALL_CLOCK_MS,
       });
     }
 
@@ -1417,12 +1422,15 @@ export async function runWithStepRetry<T>(
 /** A TRANSIENT-only retry floor: even a step that declared no retryBudget gets
  *  this many automatic retries on a network/infra blip (the retry harness gates
  *  on isTransientStepError, so a real deterministic failure still fails on
- *  attempt 1). Default 1 so a daily unattended run survives a one-off `fetch
- *  failed`/5xx; set CLEMENTINE_WORKFLOW_TRANSIENT_RETRY_FLOOR=0 to restore the
+ *  attempt 1). Default 2 (P1-6: was 1) so an unattended run survives a brief
+ *  Codex/network 5xx window, not just a single blip — a live scheduled run died
+ *  after one retry against a ~46s 503 outage. With exp backoff (2s, 4s) two
+ *  retries span ~6s; a SUSTAINED outage still needs the run-level re-queue
+ *  (follow-up). Set CLEMENTINE_WORKFLOW_TRANSIENT_RETRY_FLOOR=0 to restore the
  *  old fail-fast-on-transient behavior. */
 function transientRetryFloor(): number {
-  const raw = Number.parseInt(getRuntimeEnv('CLEMENTINE_WORKFLOW_TRANSIENT_RETRY_FLOOR', '1') || '1', 10);
-  return Number.isFinite(raw) && raw >= 0 ? raw : 1;
+  const raw = Number.parseInt(getRuntimeEnv('CLEMENTINE_WORKFLOW_TRANSIENT_RETRY_FLOOR', '2') || '2', 10);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 2;
 }
 
 async function executeStepVerified(

@@ -143,6 +143,17 @@ export function registerWorkflowScheduleTools(server: McpServer): void {
         try { resolvedTz = loadUserProfile().timezone?.trim() || undefined; } catch { /* profile optional */ }
       }
       const existing = readWorkflow(name);
+      // P1-8: workflow_schedule authors a SINGLE-step workflow + sets the WHEN.
+      // On an existing MULTI-step pipeline it used to rebuild steps:[{id:'main'}]
+      // and silently DISCARD the rest. Refuse that — redirect to workflow_update,
+      // which sets trigger_schedule without touching steps.
+      const prevSteps = existing?.data.steps ?? [];
+      if (existing && prevSteps.length > 1) {
+        return textResult(
+          `Workflow "${name}" already has ${prevSteps.length} steps — workflow_schedule would rebuild it as a single step and discard the rest. `
+            + `To set ONLY its schedule, use workflow_update("${name}", trigger_schedule: "${cron}"). To redefine what it does, edit it with workflow_update.`,
+        );
+      }
       const def: WorkflowDefinition = {
         name,
         description,
@@ -151,12 +162,17 @@ export function registerWorkflowScheduleTools(server: McpServer): void {
         allowedTools,
         steps: [
           {
-            id: 'main',
+            // Preserve the single step's id + output contract on a reschedule;
+            // only the prompt is (re)set from the caller's instructions/toolCall.
+            id: prevSteps[0]?.id ?? 'main',
             prompt: stepPrompt,
+            ...(prevSteps[0]?.output ? { output: prevSteps[0].output } : {}),
           },
         ],
-        // Preserve user-edited free-form body when updating an existing workflow.
+        // Preserve user-edited free-form body + declared inputs on an existing
+        // single-step workflow (don't drop them on a reschedule).
         description_body: existing?.data.description_body,
+        ...(existing?.data.inputs ? { inputs: existing.data.inputs } : {}),
       };
 
       // Same author-time guards as workflow_create — this is a first-class

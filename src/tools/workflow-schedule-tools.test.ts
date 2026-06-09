@@ -16,7 +16,7 @@ process.env.CLEMENTINE_HOME = TMP_HOME;
 process.env.HOME = TMP_HOME;
 
 const { registerWorkflowScheduleTools } = await import('./workflow-schedule-tools.js');
-const { readWorkflow } = await import('../memory/workflow-store.js');
+const { readWorkflow, writeWorkflow } = await import('../memory/workflow-store.js');
 const { WORKFLOWS_DIR } = await import('../memory/vault.js');
 
 type ToolResult = { content: Array<{ type: 'text'; text: string }> };
@@ -56,6 +56,34 @@ test('enabled ungated-send workflow is REFUSED (not written)', async () => {
   const text = resultText(result);
   assert.ok(/NOT scheduled/.test(text), `expected refusal, got: ${text}`);
   assert.equal(readWorkflow('midday-sender'), null, 'workflow must not be written');
+});
+
+test('workflow_schedule does NOT clobber an existing MULTI-step workflow — P1-8', async () => {
+  // Seed a real 2-step pipeline.
+  writeWorkflow('multi-pipe', {
+    name: 'multi-pipe',
+    description: 'two steps',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [
+      { id: 'pull', prompt: 'Pull the data.' },
+      { id: 'summarize', prompt: 'Summarize {{steps.pull.output}}.', dependsOn: ['pull'] },
+    ],
+  });
+  const result = await scheduleTool()({
+    name: 'multi-pipe',
+    description: 'two steps',
+    cron: '0 9 * * *',
+    instructions: 'Do the whole thing.',
+    enabled: true,
+    toolCall: null,
+    timezone: null,
+  });
+  // Must refuse + redirect to workflow_update, and the pipeline must be intact.
+  assert.match(resultText(result), /steps|workflow_update/i);
+  const after = readWorkflow('multi-pipe')!.data;
+  assert.equal(after.steps.length, 2, 'multi-step pipeline preserved, not clobbered to one step');
+  assert.equal(after.steps[1].id, 'summarize');
 });
 
 test('same workflow saved DISABLED is allowed (drafting)', async () => {
