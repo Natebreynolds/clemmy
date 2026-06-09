@@ -1197,10 +1197,18 @@ export function registerConsoleRoutes(
   app.get('/api/console/autoresearch/report', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
-      const { findLatestReport, listReports } = await import('../autoresearch/observatory.js');
+      const { buildReport, findLatestReport, listReports } = await import('../autoresearch/observatory.js');
+      const { computeMemoryRefinements } = await import('../autoresearch/memory-detectors.js');
+      // `report` is a FRESH structured report (read-only compute over tool-events
+      // + the memory DB) for the new console's live cards. `memoryRefinements`
+      // are the read-only cleanup candidates (dups/noise/stale/recall-gaps).
+      // `latest` is the nightly-written markdown the legacy console still renders.
+      const report = buildReport();
+      let memoryRefinements = null;
+      try { memoryRefinements = computeMemoryRefinements(); } catch { /* detectors are best-effort */ }
       const latest = findLatestReport();
       const history = listReports().slice(0, 30);
-      res.json({ latest, history });
+      res.json({ report, memoryRefinements, latest, history });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
