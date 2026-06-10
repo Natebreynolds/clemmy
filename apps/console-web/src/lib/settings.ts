@@ -75,6 +75,7 @@ export interface SettingsSnapshot {
   };
   models?: ModelsSnapshot;
   modelBackend?: ModelBackend;
+  claudeAuth?: ClaudeAuth;
 }
 
 export const getSettings = () => apiGet<SettingsSnapshot>('/api/console/settings');
@@ -92,3 +93,10 @@ export const patchModels = (p: Partial<ModelTriple>) =>
   patch<{ models: ModelsSnapshot }>('/api/console/settings/models', p);
 export const patchModelBackend = (p: ModelBackendPatch) =>
   patch<{ modelBackend: ModelBackend; models: ModelsSnapshot }>('/api/console/settings/model-backend', p);
+
+// Claude (Anthropic) subscription OAuth login.
+export interface ClaudeAuth { configured: boolean; reason?: string; plan?: string; expiresAt?: string }
+export const beginClaudeLogin = () =>
+  api<{ flowId: string; authorizeUrl: string }>('/api/console/auth/claude/begin', { method: 'POST', body: '{}' });
+export const completeClaudeLogin = (flowId: string, code: string) =>
+  api<{ ok: boolean; snapshot?: ClaudeAuth }>('/api/console/auth/claude/complete', { method: 'POST', body: JSON.stringify({ flowId, code }) });

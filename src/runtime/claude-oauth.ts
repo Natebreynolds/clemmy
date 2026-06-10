@@ -16,10 +16,12 @@
  * silently API-billed.
  */
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import pino from 'pino';
+import { BASE_DIR } from '../config.js';
+import { refreshClaudeTokens, type ClaudeTokenSet } from './claude-native-oauth.js';
 
 const logger = pino({ name: 'clementine.claude-oauth' });
 
@@ -27,12 +29,40 @@ const KEYCHAIN_SERVICE = 'Claude Code-credentials';
 const OAT_PREFIX = 'sk-ant-oat01';
 const API_KEY_PREFIX = 'sk-ant-api03';
 
+// Clementine's OWN Claude grant (from the in-app login), decoupled from the
+// Claude Code CLI keychain so we can rotate the refresh token freely. Preferred
+// over the keychain when present.
+const CLAUDE_VAULT_FILE = path.join(BASE_DIR, 'state', 'claude-auth.json');
+
+/** Persist our own Claude tokens (from the in-app login or a refresh). 0600. */
+export function saveClaudeTokens(tokens: ClaudeTokenSet): void {
+  mkdirSync(path.dirname(CLAUDE_VAULT_FILE), { recursive: true });
+  writeFileSync(CLAUDE_VAULT_FILE, JSON.stringify(tokens, null, 2), { encoding: 'utf-8', mode: 0o600 });
+  try { chmodSync(CLAUDE_VAULT_FILE, 0o600); } catch { /* best-effort */ }
+}
+
+function getVaultClaudeTokens(): ClaudeOAuthTokens | null {
+  if (!existsSync(CLAUDE_VAULT_FILE)) return null;
+  try {
+    const j = JSON.parse(readFileSync(CLAUDE_VAULT_FILE, 'utf-8')) as Record<string, unknown>;
+    if (!j.accessToken) return null;
+    return {
+      accessToken: j.accessToken as string,
+      refreshToken: j.refreshToken as string | undefined,
+      expiresAt: typeof j.expiresAt === 'number' ? j.expiresAt : undefined,
+      scopes: Array.isArray(j.scopes) ? (j.scopes as string[]) : undefined,
+      source: 'vault',
+    };
+  } catch { return null; }
+}
+
 export interface ClaudeOAuthTokens {
   accessToken: string;
   refreshToken?: string;
   expiresAt?: number; // epoch ms
   scopes?: string[];
   subscriptionType?: string;
+  source?: 'vault' | 'claude-code';
 }
 
 export class ClaudeAuthError extends Error {
@@ -82,11 +112,14 @@ export function parseClaudeCredential(raw: string): ClaudeOAuthTokens {
   };
 }
 
-/** Read the stored Claude OAuth tokens, or null if none are present. */
+/** Read the stored Claude OAuth tokens, preferring Clementine's OWN vault grant
+ *  (from the in-app login) over the Claude Code CLI keychain. */
 export function getStoredClaudeTokens(): ClaudeOAuthTokens | null {
+  const vault = getVaultClaudeTokens();
+  if (vault) return vault;
   const raw = readRawCredentialJson();
   if (!raw) return null;
-  try { return parseClaudeCredential(raw); }
+  try { return { ...parseClaudeCredential(raw), source: 'claude-code' }; }
   catch { return null; }
 }
 
@@ -130,6 +163,36 @@ export function assertSubscriptionToken(tokens: ClaudeOAuthTokens | null, nowMs:
 
 export function loadClaudeAccessToken(): string {
   return assertSubscriptionToken(getStoredClaudeTokens());
+}
+
+const REFRESH_BEFORE_MS = 5 * 60_000;
+
+/** Async loader that refreshes OUR vault token before expiry (rotating the
+ *  refresh token). Never refreshes a Claude Code CLI keychain token — that
+ *  would desync the user's CLI login. Use this in the request path. */
+export async function loadFreshClaudeAccessToken(): Promise<string> {
+  let tokens = getStoredClaudeTokens();
+  if (
+    tokens?.source === 'vault' &&
+    tokens.refreshToken &&
+    tokens.accessToken?.startsWith(OAT_PREFIX) &&
+    tokens.expiresAt && tokens.expiresAt <= Date.now() + REFRESH_BEFORE_MS
+  ) {
+    try {
+      const refreshed = await refreshClaudeTokens(tokens.refreshToken);
+      saveClaudeTokens({
+        accessToken: refreshed.accessToken,
+        refreshToken: refreshed.refreshToken ?? tokens.refreshToken, // persist the ROTATED token
+        expiresAt: refreshed.expiresAt,
+        scopes: refreshed.scopes ?? tokens.scopes,
+      });
+      tokens = getStoredClaudeTokens();
+      logger.info('Claude subscription token refreshed');
+    } catch (err) {
+      logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Claude token refresh failed; falling back to current token');
+    }
+  }
+  return assertSubscriptionToken(tokens);
 }
 
 /** True when a usable Claude subscription token is present (for auth-status UI). */

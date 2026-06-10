@@ -27,6 +27,14 @@ test('envelope: the Claude-Code identity is injected into the request body syste
   assert.equal(parsed.system[0].text, IDENTITY);
 });
 
+test('envelope: a missing max_tokens is filled (Anthropic requires it); a present one is left alone', () => {
+  const filled = JSON.parse(applyClaudeEnvelope({ body: JSON.stringify({ model: 'x', messages: [] }) }, 'sk-ant-oat01-x').body as string);
+  assert.equal(typeof filled.max_tokens, 'number');
+  assert.ok(filled.max_tokens > 0);
+  const kept = JSON.parse(applyClaudeEnvelope({ body: JSON.stringify({ model: 'x', messages: [], max_tokens: 512 }) }, 'sk-ant-oat01-x').body as string);
+  assert.equal(kept.max_tokens, 512, 'harness-set max_tokens is not overridden');
+});
+
 test('withIdentityPrefix: string / empty / array / already-prefixed', () => {
   assert.deepEqual(withIdentityPrefix(''), [{ type: 'text', text: IDENTITY }]);
   assert.deepEqual(withIdentityPrefix('hi'), [{ type: 'text', text: IDENTITY }, { type: 'text', text: 'hi' }]);

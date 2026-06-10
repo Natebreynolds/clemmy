@@ -24,7 +24,7 @@
 import { aisdk } from '@openai/agents-extensions/ai-sdk';
 import { createAnthropic } from '@ai-sdk/anthropic';
 import type { Model, ModelProvider } from '@openai/agents-core';
-import { loadClaudeAccessToken } from '../claude-oauth.js';
+import { loadFreshClaudeAccessToken } from '../claude-oauth.js';
 import { getClaudeBrainModel } from '../../config.js';
 import pino from 'pino';
 
@@ -36,16 +36,20 @@ const logger = pino({ name: 'clementine.claude-model' });
 const CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude.";
 const ENVELOPE_BETA = 'oauth-2025-04-20,claude-code-20250219';
 const CLAUDE_USER_AGENT = 'claude-cli/1.0.0 (external, clementine)';
+// Anthropic Messages REQUIRES max_tokens. The AI SDK passes the harness's
+// maxTokens through, but we defensively fill a generous default if a turn ever
+// omits it, so a Claude call can never 400 on a missing max_tokens.
+const CLAUDE_DEFAULT_MAX_TOKENS = 16384;
 
 // Cache the validated subscription token briefly so we don't shell out to the
 // keychain on every request. The billing guard (oat01-only) runs on each
 // (re)read; the token itself is long-lived (~10h).
-const TOKEN_TTL_MS = 5 * 60_000;
+const TOKEN_TTL_MS = 60_000;
 let cachedToken: { value: string; readAt: number } | null = null;
-function freshClaudeToken(): string {
+async function freshClaudeToken(): Promise<string> {
   const now = Date.now();
   if (cachedToken && now - cachedToken.readAt < TOKEN_TTL_MS) return cachedToken.value;
-  const value = loadClaudeAccessToken(); // throws (fail-closed) unless oat01 + valid
+  const value = await loadFreshClaudeAccessToken(); // refreshes-if-needed; throws (fail-closed) unless oat01 + valid
   cachedToken = { value, readAt: now };
   return value;
 }
@@ -86,6 +90,7 @@ export function applyClaudeEnvelope(
     try {
       const parsed = JSON.parse(body) as Record<string, unknown>;
       parsed.system = withIdentityPrefix(parsed.system);
+      if (parsed.max_tokens == null) parsed.max_tokens = CLAUDE_DEFAULT_MAX_TOKENS;
       body = JSON.stringify(parsed);
     } catch {
       // non-JSON body (shouldn't happen for Messages) — leave as-is
@@ -97,7 +102,7 @@ export function applyClaudeEnvelope(
 /** Custom fetch enforcing the OAuth billing guarantee + identity envelope. */
 export function makeClaudeFetch(): typeof fetch {
   return (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
-    const token = freshClaudeToken();
+    const token = await freshClaudeToken();
     const { headers, body } = applyClaudeEnvelope(init, token);
     return fetch(input, { ...init, headers, body });
   }) as typeof fetch;

@@ -115,6 +115,9 @@ import { SKILLS_DIR, listSkills, loadSkill, uninstallSkill } from '../memory/ski
 import { checkAllSkillUpdates, getSkillInstallJob, startSkillInstall, startSkillUpdate } from '../runtime/skill-installer.js';
 import { getProactivityPolicySnapshot, loadProactivityPolicy, saveProactivityPolicy } from '../agents/proactivity-policy.js';
 import { getAuthStatus, loginWithNativeOAuth, beginCodexDeviceLogin, pollCodexDeviceLogin } from '../runtime/auth-store.js';
+import { beginClaudeLogin, completeClaudeLogin } from '../runtime/claude-native-oauth.js';
+import { saveClaudeTokens, getClaudeAuthSnapshot } from '../runtime/claude-oauth.js';
+import { resetClaudeModelCache } from '../runtime/harness/claude-model.js';
 import { getSecretStore, listSecretDescriptors, type SecretName } from '../runtime/secrets/index.js';
 import {
   createCheckInTemplate,
@@ -3560,7 +3563,7 @@ export function registerConsoleRoutes(
         hasKey: Boolean(byo.apiKey),
         configured: byo.configured,
       };
-      res.json({ profile, proactivity, auth, memory, models, runtimeBudget, modelBackend });
+      res.json({ profile, proactivity, auth, memory, models, runtimeBudget, modelBackend, claudeAuth: getClaudeAuthSnapshot() });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -6205,6 +6208,42 @@ export function registerConsoleRoutes(
       res.json(result);
     } catch (err) {
       res.status(500).json({ status: 'error', message: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // Claude (Anthropic) subscription OAuth login — PKCE paste-the-code, peer to
+  // the Codex device flow. Flow state (verifier+state) held in-memory, 15-min
+  // TTL. The pasted code exchanges to an oat01 subscription token stored in our
+  // own vault (decoupled from the Claude Code CLI login).
+  const claudeLoginFlows = new Map<string, { verifier: string; state: string; createdAt: number }>();
+  app.post('/api/console/auth/claude/begin', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { authorizeUrl, verifier, state } = beginClaudeLogin();
+      const flowId = randomBytes(16).toString('hex');
+      for (const [k, v] of claudeLoginFlows) if (Date.now() - v.createdAt > 15 * 60_000) claudeLoginFlows.delete(k);
+      claudeLoginFlows.set(flowId, { verifier, state, createdAt: Date.now() });
+      res.json({ flowId, authorizeUrl });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+  app.post('/api/console/auth/claude/complete', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const flowId = typeof req.body?.flowId === 'string' ? req.body.flowId : '';
+    const code = typeof req.body?.code === 'string' ? req.body.code : '';
+    const flow = claudeLoginFlows.get(flowId);
+    if (!flow) { res.status(400).json({ error: 'Login flow expired or not found — start the Claude sign-in again.' }); return; }
+    if (!code.trim()) { res.status(400).json({ error: 'Paste the code from the Claude authorize page.' }); return; }
+    try {
+      const tokens = await completeClaudeLogin(code, flow.verifier, flow.state);
+      saveClaudeTokens(tokens);
+      claudeLoginFlows.delete(flowId);
+      resetHarnessRuntimeConfig(); // re-register the Claude provider on the next run
+      resetClaudeModelCache(); // drop the cached (pre-login) token so the new grant takes effect immediately
+      res.json({ ok: true, snapshot: getClaudeAuthSnapshot() });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
     }
   });
 

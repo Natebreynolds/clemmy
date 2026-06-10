@@ -7,6 +7,7 @@ import { ProfileForm } from './settings/ProfileForm';
 import { NotificationsEditor } from './settings/NotificationsEditor';
 import { ModelsForm } from './settings/ModelsForm';
 import { ModelBackendForm } from './settings/ModelBackendForm';
+import { ClaudeLoginForm } from './settings/ClaudeLoginForm';
 import { cn } from '@/lib/cn';
 
 const THEMES: { key: ThemeChoice; label: string; icon: typeof Sun }[] = [
@@ -60,6 +61,8 @@ export function Settings() {
         <ModelsForm />
 
         <ModelBackendForm />
+
+        <ClaudeLoginForm />
 
         <ClassicRow title="Sign-in & credentials" desc="Codex/OpenAI sign-in and stored keys (in Connect → Keys)." />
       </div>
