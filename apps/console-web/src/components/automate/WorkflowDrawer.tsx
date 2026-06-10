@@ -55,7 +55,10 @@ export function WorkflowDrawer({ name, onClose }: { name: string; onClose: () =>
     catch (e) { setError((e as Error).message); }
     finally { setRunning(false); }
   };
-  const remove = async () => { await deleteWorkflow(name); invalidate(); onClose(); };
+  const remove = async () => {
+    if (!window.confirm(`Delete "${name}"? This can't be undone.`)) return;
+    await deleteWorkflow(name); invalidate(); onClose();
+  };
 
   return (
     <div className="fixed inset-0 z-[110] flex justify-end bg-black/30 animate-fade-in" onMouseDown={onClose}>

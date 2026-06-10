@@ -1,5 +1,6 @@
-import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync, writeFileSync, openSync, writeSync, fsyncSync, closeSync, renameSync } from 'node:fs';
 import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import pino from 'pino';
 import type { ClementineAssistant } from '../assistant/core.js';
@@ -315,7 +316,15 @@ function isUnattendedScheduledRun(runId: string): boolean {
 }
 
 function writeRunRecord(filePath: string, record: QueuedRunRecord): void {
-  writeFileSync(filePath, JSON.stringify(record, null, 2), 'utf-8');
+  const tmp = `${filePath}.tmp.${process.pid}.${randomUUID().slice(0, 8)}`;
+  const fd = openSync(tmp, 'w');
+  try {
+    writeSync(fd, JSON.stringify(record, null, 2));
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  renameSync(tmp, filePath);
 }
 
 /**
@@ -2941,10 +2950,13 @@ async function processOneRunFile(
       // and tryAutoHealAndRequeue requires a proposedFix — so a target-miss can
       // NEVER trigger a blind re-run that doubles irreversible side effects.
       const targetMissed = Boolean(targetVerdict && targetVerdict.judged && !targetVerdict.reached);
-      const needsAttention = blockedSteps.length > 0 || targetMissed;
+      const hasForEachFailures = forEachFailures.length > 0;
+      const needsAttention = blockedSteps.length > 0 || targetMissed || hasForEachFailures;
       const attentionReason =
         blockedSteps[0]?.reason ??
-        (targetMissed
+        (hasForEachFailures
+          ? `${forEachFailures.length} forEach item${forEachFailures.length === 1 ? '' : 's'} failed`
+          : targetMissed
           ? `target not confirmed: ${targetVerdict?.gap ?? 'deliverable may not reach the workflow target'}`
           : undefined);
 
@@ -2960,7 +2972,7 @@ async function processOneRunFile(
 
       writeRunRecord(filePath, {
         ...run,
-        status: 'completed',
+        status: hasForEachFailures ? 'completed_with_errors' : 'completed',
         finishedAt: new Date().toISOString(),
         stepOutputs,
         output: finalOutput,
