@@ -2120,25 +2120,30 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
         : 0.92;
       const verdict = checkBudget({ predictedTokens: predicted, modelId, blockFraction });
       const sessionKind = session.sessionRow.kind;
-      // Telemetry: always record — even on 'ok' for ANY kind.
-      safeAppend({
-        sessionId: options.sessionId,
-        turn,
-        role: 'system',
-        type: 'guardrail_tripped',
-        data: {
-          kind: 'preflight_budget_check',
-          sessionKind,
-          status: verdict.status,
-          predictedTokens: verdict.predictedTokens,
-          effectiveLimit: verdict.effectiveLimit,
-          fractionUsed: Number(verdict.fractionUsed.toFixed(3)),
-          plannedToolCallCount,
-          avgToolReturnTokens,
-          adaptive: plannedToolCallCount !== STATIC_PLANNED_TOOL_CALLS || avgToolReturnTokens !== STATIC_AVG_TOOL_RETURN,
-          reason: verdict.reason,
-        },
-      });
+      // Only emit guardrail_tripped when the budget check actually detects a problem.
+      // 'ok' status checks (6-7% usage, well under limits) are not worth logging; they
+      // create noise (91 events/day) without actionable information. Only 'warn' and 'block'
+      // statuses indicate something worth tracking.
+      if (verdict.status !== 'ok') {
+        safeAppend({
+          sessionId: options.sessionId,
+          turn,
+          role: 'system',
+          type: 'guardrail_tripped',
+          data: {
+            kind: 'preflight_budget_check',
+            sessionKind,
+            status: verdict.status,
+            predictedTokens: verdict.predictedTokens,
+            effectiveLimit: verdict.effectiveLimit,
+            fractionUsed: Number(verdict.fractionUsed.toFixed(3)),
+            plannedToolCallCount,
+            avgToolReturnTokens,
+            adaptive: plannedToolCallCount !== STATIC_PLANNED_TOOL_CALLS || avgToolReturnTokens !== STATIC_AVG_TOOL_RETURN,
+            reason: verdict.reason,
+          },
+        });
+      }
       if (verdict.status === 'block') {
         if (sessionKind === 'chat') {
           // Inject the F1-rewritten block message pointing at real tools.

@@ -22,7 +22,7 @@ export const STATE_DIR = path.join(BASE_DIR, 'state');
 export const MEMORY_DB_PATH = path.join(STATE_DIR, 'memory.db');
 export const MEMORY_BACKUP_DIR = path.join(STATE_DIR, 'backups');
 
-export type ConsolidatedFactKind = 'user' | 'project' | 'feedback' | 'reference';
+export type ConsolidatedFactKind = 'user' | 'project' | 'feedback' | 'reference' | 'constraint';
 
 export interface VaultChunkRow {
   id: number;

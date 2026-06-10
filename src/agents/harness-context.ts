@@ -29,7 +29,7 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import { BASE_DIR } from '../config.js';
 import { loadMemoryContext } from '../memory/vault.js';
-import { renderFactsForInstructions, renderRecentlyLearnedForInstructions } from '../memory/facts.js';
+import { renderFactsForInstructions, renderRecentlyLearnedForInstructions, listConstraints } from '../memory/facts.js';
 import { getActiveObjective, getFocusSnapshot } from '../memory/focus.js';
 import { renderSkillsIndex } from '../memory/skill-store.js';
 import { renderToolChoicesForContext } from '../memory/tool-choice-store.js';
@@ -166,6 +166,18 @@ export function renderFocusForInstructions(): string {
   return focus;
 }
 
+function renderActiveConstraints(): string {
+  try {
+    const constraints = listConstraints(20);
+    if (constraints.length === 0) return '';
+    return constraints
+      .map((c) => `- ${c.content}`)
+      .join('\n');
+  } catch {
+    return '';
+  }
+}
+
 function renderActiveGoals(): string {
   if (!existsSync(GOALS_DIR)) return '';
   try {
@@ -289,12 +301,15 @@ export function renderHarnessMemoryContext(): string {
   // current state (the persistent block is rendered once per turn).
   const focus = renderFocusForInstructions();
 
+  const constraints = renderActiveConstraints();
+
   const blocks = [
     // Current date/time goes FIRST so the model reads it before any
     // other context. Without this the model defaults to its training
     // cutoff for date math, which is months stale.
     section('Now', nowLine),
     section('Autonomy', renderAutonomy()),
+    section('Standing Constraints', constraints),
     section('User Preferences', profile),
     section('Persistent Facts', facts),
     recentlyLearned,
