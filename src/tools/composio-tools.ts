@@ -21,6 +21,9 @@ import { isTransientStepError } from '../execution/transient-error.js';
 import { checkConstraintViolation, formatConstraintEscalation } from '../runtime/harness/constraint-guard.js';
 import { validateComposioBatchOperation, formatBatchValidationError } from './composio-batch-validator.js';
 import { shouldRetryToolCall, delayMs } from '../runtime/harness/retry-handler.js';
+import { suggestNextSteps, type FailureType as FallbackFailureType } from '../runtime/fallback-chain-store.js';
+import { getCapabilitiesForIntent } from '../runtime/capability-registry.js';
+import { recordExecution } from '../runtime/graceful-degradation-engine.js';
 
 const DYNAMIC_TOOL_PREFIX = 'cx_';
 const MAX_TOOL_NAME_LENGTH = 64;
@@ -108,16 +111,77 @@ export function detectComposioFailure(value: unknown): { failed: boolean; summar
   return { failed: true, summary, notFound };
 }
 
+/**
+ * Classify failure type for fallback chain lookup.
+ */
+function classifyFailureType(summary: string): 'permission_denied' | 'not_found' | 'rate_limit' | 'timeout' | 'unknown' {
+  const lower = summary.toLowerCase();
+  if (/403|permission|forbidden|unauthorized|deny|access\s+denied/i.test(lower)) return 'permission_denied';
+  if (/404|not\s+found|does\s+not\s+exist|no\s+such|unknown|invalid.*(?:id|table|record|field)/i.test(lower))
+    return 'not_found';
+  if (/429|rate\s+limit|quota|too\s+many\s+requests/i.test(lower)) return 'rate_limit';
+  if (/timeout|timed\s+out|deadline|took\s+too\s+long/i.test(lower)) return 'timeout';
+  return 'unknown';
+}
+
+/**
+ * Format fallback suggestions from capability registry and learned chains.
+ */
+function formatFallbackSuggestions(intent: string, failedTool: string, failureType: ReturnType<typeof classifyFailureType>): string {
+  try {
+    // Get learned fallback chains (from prior failures)
+    const suggestion = suggestNextSteps(intent, failedTool, failureType);
+
+    if (suggestion.fallback.length === 0) {
+      // Fall back to capability registry for alternatives
+      const caps = getCapabilitiesForIntent(intent);
+      const alternatives = caps
+        .filter((c) => c.toolName !== failedTool && c.score > 0.3) // Only viable alternatives
+        .slice(0, 3); // Top 3 options
+
+      if (alternatives.length === 0) {
+        return '';
+      }
+
+      const lines = [`Your alternatives for "${intent}":`];
+      for (const alt of alternatives) {
+        lines.push(`  • ${alt.toolName} (${(alt.score * 100).toFixed(0)}% fit): ${alt.reason}`);
+        if (alt.requirement) lines.push(`    Requires: ${alt.requirement}`);
+      }
+      return lines.join('\n');
+    }
+
+    // Use learned fallback chain
+    const lines = [
+      `Based on prior attempts, when ${intent} fails with ${failureType}, try these in order:`,
+    ];
+    for (const tool of suggestion.fallback.slice(0, 3)) {
+      lines.push(`  • ${tool}`);
+    }
+    return lines.join('\n');
+  } catch (err) {
+    // Silently ignore fallback suggestion errors; never break error reporting
+    return '';
+  }
+}
+
 /** Loud, self-correcting header prepended to a failed Composio execution so
  *  the model adapts on failure #1 instead of retrying identically. Names the
  *  tool the model actually called (`composio_execute_tool` or the dynamic
  *  `cx_<slug>`) and the slug, so the corrective is unambiguous on both paths. */
 function composioFailureCorrective(
   summary: string,
-  opts: { toolName?: string; toolSlug?: string; notFound?: boolean; transient?: boolean } = {},
+  opts: { toolName?: string; toolSlug?: string; notFound?: boolean; transient?: boolean; intent?: string } = {},
 ): string {
   const label = opts.toolName || 'composio_execute_tool';
   const where = opts.toolSlug ? ` (slug=${opts.toolSlug})` : '';
+
+  // Classify failure for fallback chain lookup
+  const failureType = classifyFailureType(summary);
+  const failedTool = opts.toolSlug || 'unknown_tool';
+  const intent = opts.intent || 'accomplish this task';
+  const fallbackSuggestions = formatFallbackSuggestions(intent, failedTool, failureType);
+
   if (opts.transient && !opts.notFound) {
     // FIX 1.4 — a transient infra error (rate-limit / 5xx / network / timeout)
     // is the ONE case where repeating the SAME call is productive. Tell the
@@ -128,7 +192,10 @@ function composioFailureCorrective(
       `⚠️ ${label} FAILED${where}: ${summary}`,
       `This looks like a TRANSIENT infrastructure error (rate-limit / 5xx / network / timeout) — NOT a bad request. A SINGLE retry of the SAME call after a brief pause may succeed.`,
       `Retry this EXACT call ONCE. If it fails again, treat it as a hard blocker: switch approach (different action/tool) or report the specific blocker to the user. Do NOT retry more than once.`,
-    ].join('\n');
+      fallbackSuggestions && `If retry fails, here are your alternatives:\n${fallbackSuggestions}`,
+    ]
+      .filter(Boolean)
+      .join('\n\n');
   }
   if (opts.notFound) {
     // The referenced resource (table/object/record/field id) doesn't exist or
@@ -155,7 +222,10 @@ function composioFailureCorrective(
     `⚠️ ${label} FAILED${where}: ${summary}`,
     `This is a HARD failure — calling it again with the SAME arguments will return the SAME error.`,
     `Do ONE of these instead: (1) fix the arguments — re-check the action's exact required field names/shape (a 4xx almost always means a wrong, missing, or misnamed field); (2) use a different action or tool for this (e.g. composio_search_tools to find the right slug); (3) if you can't resolve it, STOP and tell the user the specific blocker. Do NOT repeat this identical call.`,
-  ].join('\n');
+    fallbackSuggestions && `If you need alternatives for "${intent}", here are your options:\n${fallbackSuggestions}`,
+  ]
+    .filter(Boolean)
+    .join('\n\n');
 }
 
 /**
@@ -358,8 +428,23 @@ async function runComposioExecute(
       const output = formatComposioExecuteOutput(result, { ...options, toolSlug });
       const sid = sessionIdFromRunContext(options.context);
       maybeAutoRememberComposioChoice(toolSlug, args, result, sid);
+
+      // PHASE 5: Record outcome for adaptive tool selection & learning
+      const failure = detectComposioFailure(result);
+      try {
+        recordExecution({
+          toolName: options.toolName || toolSlug,
+          intent: 'composio_execute', // TODO: extract from context
+          succeeded: !failure.failed,
+          errorType: failure.failed ? (failure.notFound ? 'not_found' : 'unknown') : undefined,
+          timestamp: new Date().toISOString(),
+        });
+      } catch {
+        // Outcome recording failure must never break tool execution
+      }
+
       // Only count/advise on SUCCESS — a failed call isn't "an item processed".
-      if (!detectComposioFailure(result).failed) {
+      if (!failure.failed) {
         // P1-D — a schema/describe execute is DISCOVERY, not per-item work. Route
         // it to the discovery advisory (which counts repeated describes of one
         // toolkit) and skip the fan-out advisory so the two never double-fire on
