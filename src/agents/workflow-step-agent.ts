@@ -179,6 +179,9 @@ export async function buildWorkflowStepAgent(
   return new Agent<RuntimeContextValue, typeof OrchestratorDecisionSchema>({
     name: 'WorkflowStep',
     instructions: harnessInstructions(STEP_INSTRUCTIONS),
+    // Step orchestration (OrchestratorDecisionSchema, multi-tool) stays on the
+    // brain/primary tier — Codex in worker mode. Only forEach per-item fan-out
+    // labor routes to the cheap worker model (see workflow-runner forEach path).
     model: MODELS.primary,
     outputType: normalizeZodForCodexStrict(OrchestratorDecisionSchema) as typeof OrchestratorDecisionSchema,
     tools: tools.map((t) => wrapToolForHarness(t as unknown as WrappableTool) as unknown as Tool<RuntimeContextValue>),

@@ -4,7 +4,7 @@ export interface Models {
   deep: string;
 }
 
-export type AuthMode = 'api_key' | 'codex_oauth';
+export type AuthMode = 'api_key' | 'codex_oauth' | 'claude_oauth';
 
 export interface RunRequest {
   instructions?: string;

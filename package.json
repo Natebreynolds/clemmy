@@ -64,14 +64,17 @@
     "plugin": "tsx src/index.ts plugin"
   },
   "dependencies": {
+    "@ai-sdk/anthropic": "^3.0.82",
     "@composio/core": "^0.10.0",
     "@inquirer/prompts": "^8.4.1",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@openai/agents": "^0.11.5",
     "@openai/agents-core": "^0.11.5",
+    "@openai/agents-extensions": "^0.11.6",
     "@openai/agents-openai": "^0.11.5",
     "@openai/agents-realtime": "^0.11.5",
     "3d-force-graph": "^1.80.0",
+    "ai": "^6.0.199",
     "better-sqlite3": "^11.7.0",
     "cytoscape": "^3.33.3",
     "discord.js": "^14.26.4",

@@ -143,6 +143,12 @@ const MODEL_CONTEXT_LIMITS: ReadonlyMap<string, number> = new Map([
   ['gpt-4.1-mini', 128_000],
   ['gpt-4o', 128_000],
   ['gpt-4o-mini', 128_000],
+  // BYO OpenAI-compatible backends (worker / all-in routing). Providers'
+  // published context windows; override per-id via CLEMMY_MODEL_CONTEXT_LIMIT_<id>.
+  // Longest-prefix match resolves "MiniMax-M3" before the generic "MiniMax".
+  ['MiniMax-M3', 1_000_000],
+  ['MiniMax', 200_000],
+  ['deepseek', 128_000],
 ]);
 
 /** Hard floor for the budget threshold. Smaller models with tiny

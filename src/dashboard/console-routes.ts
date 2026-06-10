@@ -18,7 +18,10 @@ import {
   getOpenAiApiKey,
   getRuntimeEnv,
   normalizeModelId,
+  getByoBackendConfig,
+  getModelRoutingMode,
   type ModelTier,
+  type ModelRoutingMode,
 } from '../config.js';
 import { getComposioRuntimeStatus } from '../integrations/composio/client.js';
 import { getGitHubCliStatus } from '../integrations/github-cli.js';
@@ -176,7 +179,8 @@ import { getHarnessBudgetSnapshot, saveHarnessBudgetSettings } from '../runtime/
 import { HarnessSession } from '../runtime/harness/session.js';
 import { parseApprovalIntent, parseHarnessCommand } from '../channels/discord-harness.js';
 import { buildOrchestratorAgent } from '../agents/orchestrator.js';
-import { configureHarnessRuntime } from '../runtime/harness/codex-client.js';
+import { configureHarnessRuntime, resetHarnessRuntimeConfig } from '../runtime/harness/codex-client.js';
+import { resetByoModelCache } from '../runtime/harness/byo-model.js';
 import { summarizeApprovalAction } from '../runtime/approval-summary.js';
 import {
   appendRecallTranscriptSegment,
@@ -3545,7 +3549,18 @@ export function registerConsoleRoutes(
       const memory = readMemoryIndexStatus();
       const models = getModelSettingsSnapshot();
       const runtimeBudget = getHarnessBudgetSnapshot();
-      res.json({ profile, proactivity, auth, memory, models, runtimeBudget });
+      const byo = getByoBackendConfig();
+      const modelBackend = {
+        mode: getModelRoutingMode(),
+        baseURL: byo.baseURL,
+        modelId: byo.primaryId,
+        judgeId: byo.judgeId,
+        workerModel: getRuntimeEnv('OPENAI_MODEL_WORKER', '') || '',
+        providerLabel: byo.providerLabel,
+        hasKey: Boolean(byo.apiKey),
+        configured: byo.configured,
+      };
+      res.json({ profile, proactivity, auth, memory, models, runtimeBudget, modelBackend });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -3801,6 +3816,86 @@ export function registerConsoleRoutes(
       }
       clearAutonomyAgentCache();
       res.json({ models: getModelSettingsSnapshot() });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.patch('/api/console/settings/model-backend', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const body = (req.body ?? {}) as {
+        mode?: string; baseURL?: string; apiKey?: string; modelId?: string;
+        judgeId?: string; workerModel?: string; providerLabel?: string;
+      };
+      const mode: ModelRoutingMode = body.mode === 'worker' || body.mode === 'all_in' ? body.mode : 'off';
+      const cleanId = (v: unknown): string => {
+        const s = typeof v === 'string' ? v.trim() : '';
+        return /^[A-Za-z0-9._:/-]*$/.test(s) ? s : '';
+      };
+      const baseURL = typeof body.baseURL === 'string' ? body.baseURL.trim() : '';
+      const modelId = cleanId(body.modelId);
+      const judgeId = cleanId(body.judgeId);
+      const explicitWorker = cleanId(body.workerModel);
+      const providerLabel = typeof body.providerLabel === 'string' ? body.providerLabel.trim().slice(0, 40) : '';
+
+      updateEnvKey('MODEL_ROUTING_MODE', mode);
+      updateEnvKey('BYO_MODEL_BASE_URL', baseURL);
+      updateEnvKey('BYO_MODEL_ID', modelId);
+      updateEnvKey('BYO_MODEL_JUDGE_ID', judgeId);
+      updateEnvKey('BYO_MODEL_PROVIDER', providerLabel);
+      // Only overwrite the key when a non-empty value is supplied — the UI
+      // sends blank to keep the existing key untouched.
+      if (typeof body.apiKey === 'string' && body.apiKey.trim()) {
+        updateEnvKey('BYO_MODEL_API_KEY', body.apiKey.trim());
+      }
+
+      // Wire role → tier env vars so the router routes the right roles to
+      // the BYO backend. Codex (gpt-5*) tier customizations are preserved
+      // on worker/off; all_in points every tier at the BYO ids (fast tier
+      // = the cross-model judge).
+      const keepCodexOrDefault = (tier: ModelTier): string => {
+        const cur = getRuntimeEnv(MODEL_ENV_KEYS[tier], DEFAULT_MODELS[tier]) || DEFAULT_MODELS[tier];
+        return cur.startsWith('gpt-5') ? cur : DEFAULT_MODELS[tier];
+      };
+      if (mode === 'all_in') {
+        updateEnvKey(MODEL_ENV_KEYS.primary, modelId || DEFAULT_MODELS.primary);
+        updateEnvKey(MODEL_ENV_KEYS.deep, modelId || DEFAULT_MODELS.deep);
+        updateEnvKey(MODEL_ENV_KEYS.fast, judgeId || modelId || DEFAULT_MODELS.fast);
+        updateEnvKey('OPENAI_MODEL_WORKER', modelId);
+      } else if (mode === 'worker') {
+        updateEnvKey(MODEL_ENV_KEYS.primary, keepCodexOrDefault('primary'));
+        updateEnvKey(MODEL_ENV_KEYS.deep, keepCodexOrDefault('deep'));
+        updateEnvKey(MODEL_ENV_KEYS.fast, keepCodexOrDefault('fast'));
+        updateEnvKey('OPENAI_MODEL_WORKER', explicitWorker || modelId);
+      } else {
+        updateEnvKey(MODEL_ENV_KEYS.primary, keepCodexOrDefault('primary'));
+        updateEnvKey(MODEL_ENV_KEYS.deep, keepCodexOrDefault('deep'));
+        updateEnvKey(MODEL_ENV_KEYS.fast, keepCodexOrDefault('fast'));
+        updateEnvKey('OPENAI_MODEL_WORKER', '');
+      }
+
+      // Force the harness to re-register its model provider on the next
+      // run so the mode switch takes effect without a full daemon restart.
+      // Also clear the BYO model client cache if the key changed.
+      resetHarnessRuntimeConfig();
+      resetByoModelCache();
+      clearAutonomyAgentCache();
+
+      const byo = getByoBackendConfig();
+      res.json({
+        modelBackend: {
+          mode: getModelRoutingMode(),
+          baseURL: byo.baseURL,
+          modelId: byo.primaryId,
+          judgeId: byo.judgeId,
+          workerModel: getRuntimeEnv('OPENAI_MODEL_WORKER', '') || '',
+          providerLabel: byo.providerLabel,
+          hasKey: Boolean(byo.apiKey),
+          configured: byo.configured,
+        },
+        models: getModelSettingsSnapshot(),
+      });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
