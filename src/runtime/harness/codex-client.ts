@@ -32,7 +32,7 @@ import { CodexModelProvider } from './codex-model.js';
 import { RouterModelProvider } from './router-model.js';
 import { ClaudeModelProvider } from './claude-model.js';
 import { loadClaudeAccessToken } from '../claude-oauth.js';
-import { getModelRoutingMode, getByoBackendConfig, AUTH_MODE } from '../../config.js';
+import { getModelRoutingMode, getByoBackendConfig, getActiveAuthMode } from '../../config.js';
 
 // Codex access tokens last ~1 hour. Prefer the token's REAL JWT `exp` and
 // refresh a skew before it; only fall back to this wall-clock guess off
@@ -111,7 +111,7 @@ export async function configureHarnessRuntime(): Promise<ConfigureResult> {
   // closed unless a valid `oat01` SUBSCRIPTION token is present: the preflight
   // throws on a missing/expired token OR an `api03` API key, so a subscription
   // user can never be silently pay-per-token billed.
-  if (AUTH_MODE === 'claude_oauth') {
+  if (getActiveAuthMode() === 'claude_oauth') {
     try {
       loadClaudeAccessToken();
     } catch (err) {

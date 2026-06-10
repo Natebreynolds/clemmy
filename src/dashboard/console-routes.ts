@@ -20,6 +20,7 @@ import {
   normalizeModelId,
   getByoBackendConfig,
   getModelRoutingMode,
+  getActiveAuthMode,
   type ModelTier,
   type ModelRoutingMode,
 } from '../config.js';
@@ -116,7 +117,7 @@ import { checkAllSkillUpdates, getSkillInstallJob, startSkillInstall, startSkill
 import { getProactivityPolicySnapshot, loadProactivityPolicy, saveProactivityPolicy } from '../agents/proactivity-policy.js';
 import { getAuthStatus, loginWithNativeOAuth, beginCodexDeviceLogin, pollCodexDeviceLogin } from '../runtime/auth-store.js';
 import { beginClaudeLogin, completeClaudeLogin } from '../runtime/claude-native-oauth.js';
-import { saveClaudeTokens, getClaudeAuthSnapshot } from '../runtime/claude-oauth.js';
+import { saveClaudeTokens, getClaudeAuthSnapshot, loadFreshClaudeAccessToken, ClaudeAuthError } from '../runtime/claude-oauth.js';
 import { resetClaudeModelCache } from '../runtime/harness/claude-model.js';
 import { getSecretStore, listSecretDescriptors, type SecretName } from '../runtime/secrets/index.js';
 import {
@@ -3563,7 +3564,7 @@ export function registerConsoleRoutes(
         hasKey: Boolean(byo.apiKey),
         configured: byo.configured,
       };
-      res.json({ profile, proactivity, auth, memory, models, runtimeBudget, modelBackend, claudeAuth: getClaudeAuthSnapshot() });
+      res.json({ profile, proactivity, auth, memory, models, runtimeBudget, modelBackend, claudeAuth: getClaudeAuthSnapshot(), activeBrain: getActiveAuthMode() });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -6244,6 +6245,53 @@ export function registerConsoleRoutes(
       res.json({ ok: true, snapshot: getClaudeAuthSnapshot() });
     } catch (err) {
       res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // Switch the active brain (Codex ↔ Claude) LIVE — no daemon restart. Persists
+  // AUTH_MODE to .env (survives restart) AND mutates process.env so the harness'
+  // fresh-reading getActiveAuthMode() picks it up on the very next turn (chat,
+  // workflow, and Discord all call configureHarnessRuntime() per-run). Switching
+  // TO Claude fail-closes exactly as the harness does — a missing/expired token
+  // or an api03 API key is refused BEFORE we persist, so a user is never
+  // stranded on an unusable brain nor silently pay-per-token billed.
+  app.patch('/api/console/settings/active-brain', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const raw = typeof req.body?.brain === 'string' ? req.body.brain : '';
+      const brain = raw === 'claude_oauth' ? 'claude_oauth' : raw === 'codex_oauth' ? 'codex_oauth' : '';
+      if (!brain) { res.status(400).json({ error: 'brain must be "codex_oauth" or "claude_oauth".' }); return; }
+
+      if (brain === 'claude_oauth') {
+        // Preflight BEFORE persisting; refresh a near-expiry vault token so the
+        // harness' own sync check at configure-time also passes next turn.
+        try {
+          await loadFreshClaudeAccessToken();
+        } catch (err) {
+          const kind = err instanceof ClaudeAuthError ? err.kind : 'missing';
+          res.status(409).json({
+            error: err instanceof Error ? err.message : 'Claude subscription auth is not ready.',
+            kind,
+            needsLogin: true,
+          });
+          return;
+        }
+      }
+
+      updateEnvKey('AUTH_MODE', brain);
+      process.env.AUTH_MODE = brain; // so getActiveAuthMode() reflects it THIS session
+
+      // Force the next harness turn to re-register the chosen provider, and drop
+      // brain-specific caches so a Codex→Claude→Codex round-trip leaves no stale
+      // provider/client behind.
+      resetHarnessRuntimeConfig();
+      resetClaudeModelCache();
+      resetByoModelCache();
+      clearAutonomyAgentCache();
+
+      res.json({ activeBrain: getActiveAuthMode(), claudeAuth: getClaudeAuthSnapshot() });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
   });
 

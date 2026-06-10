@@ -50,6 +50,25 @@ test('model settings snapshot reports process env overrides', () => {
   }
 });
 
+test('getActiveAuthMode reads the brain selector fresh (the live Codex↔Claude switch)', () => {
+  // The active-brain route mutates process.env.AUTH_MODE; getActiveAuthMode must
+  // reflect it the SAME session (no module re-import / daemon restart). This is
+  // what makes the "Run on Claude" button apply on the next harness turn.
+  const original = process.env.AUTH_MODE;
+  try {
+    process.env.AUTH_MODE = 'claude_oauth';
+    assert.equal(config.getActiveAuthMode(), 'claude_oauth');
+    process.env.AUTH_MODE = 'codex_oauth';
+    assert.equal(config.getActiveAuthMode(), 'codex_oauth');
+    // An unrecognized value fails safe to api_key rather than registering a brain.
+    process.env.AUTH_MODE = 'totally-bogus';
+    assert.equal(config.getActiveAuthMode(), 'api_key');
+  } finally {
+    if (original === undefined) delete process.env.AUTH_MODE;
+    else process.env.AUTH_MODE = original;
+  }
+});
+
 test('normalizeModelId falls back on empty or unsafe values', () => {
   assert.equal(config.normalizeModelId('', 'gpt-5.4'), 'gpt-5.4');
   assert.equal(config.normalizeModelId('gpt-5.5', 'gpt-5.4'), 'gpt-5.5');

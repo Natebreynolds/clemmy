@@ -76,6 +76,7 @@ export interface SettingsSnapshot {
   models?: ModelsSnapshot;
   modelBackend?: ModelBackend;
   claudeAuth?: ClaudeAuth;
+  activeBrain?: ActiveBrain;
 }
 
 export const getSettings = () => apiGet<SettingsSnapshot>('/api/console/settings');
@@ -100,3 +101,10 @@ export const beginClaudeLogin = () =>
   api<{ flowId: string; authorizeUrl: string }>('/api/console/auth/claude/begin', { method: 'POST', body: '{}' });
 export const completeClaudeLogin = (flowId: string, code: string) =>
   api<{ ok: boolean; snapshot?: ClaudeAuth }>('/api/console/auth/claude/complete', { method: 'POST', body: JSON.stringify({ flowId, code }) });
+
+// Active brain (which model orchestrates everything). 'codex_oauth' is the
+// default; 'claude_oauth' runs Clementine on the Claude subscription. Switching
+// applies live on the next message — no daemon restart.
+export type ActiveBrain = 'codex_oauth' | 'claude_oauth' | 'api_key';
+export const setActiveBrain = (brain: ActiveBrain) =>
+  patch<{ activeBrain: ActiveBrain; claudeAuth: ClaudeAuth }>('/api/console/settings/active-brain', { brain });

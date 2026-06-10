@@ -123,6 +123,23 @@ export const AUTH_MODE = ((): AuthMode => {
   return 'api_key';
 })();
 
+/**
+ * Live-readable brain selector. Unlike the boot-time `AUTH_MODE` const above
+ * (frozen at module load), this re-reads `AUTH_MODE` from the runtime env on
+ * every call — so the active brain (Codex ↔ Claude) can be switched from
+ * Settings WITHOUT a daemon restart. The harness reads this at the start of
+ * each run (codex-client.ts), and the active-brain route both persists to
+ * `.env` (survives restart) and mutates `process.env.AUTH_MODE` (so this getter
+ * reflects the change the same session). Falls back to the boot const when
+ * unset, so byte-identical for users who never touch the switch.
+ */
+export function getActiveAuthMode(): AuthMode {
+  const raw = getRuntimeEnv('AUTH_MODE', AUTH_MODE);
+  if (raw === 'codex_oauth') return 'codex_oauth';
+  if (raw === 'claude_oauth') return 'claude_oauth';
+  return 'api_key';
+}
+
 /** Claude (Anthropic) flagship-brain support — peer to Codex. Gated default-OFF;
  *  flip with AUTH_MODE=claude_oauth (and the kill-switch below). Mirrors the
  *  Codex OAuth subscription path: reads the user's Claude Code OAuth token and
@@ -130,8 +147,9 @@ export const AUTH_MODE = ((): AuthMode => {
 export function getClaudeBrainEnabled(): boolean {
   const raw = (getRuntimeEnv('CLEMENTINE_CLAUDE_BRAIN', '') || '').trim().toLowerCase();
   if (raw === 'on' || raw === '1' || raw === 'true') return true;
-  // Implicitly enabled when AUTH_MODE selects it.
-  return AUTH_MODE === 'claude_oauth';
+  // Implicitly enabled when AUTH_MODE selects it — read LIVE so this tracks the
+  // in-app brain switch the same session (the boot const would go stale).
+  return getActiveAuthMode() === 'claude_oauth';
 }
 
 /** Default Claude brain model (current flagship, verified live 2026-06-09). */
