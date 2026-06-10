@@ -9,6 +9,7 @@ import { reindexVault } from './indexer.js';
 import { tickMemoryMdRefresh } from './memory-md-builder.js';
 import { tickIdentityMdRefresh } from './identity-md-builder.js';
 import { tickAutoresearchObservatory } from '../autoresearch/observatory.js';
+import { mergeParaphrases } from './memory-merge.js';
 import { reapStaleToolOutputs, reapStaleSessions } from '../runtime/harness/eventlog.js';
 import {
   reapStuckRecallRecordings,
@@ -99,6 +100,7 @@ interface MemoryMaintenanceState {
   lastNightlyFireDay?: string;
   lastSkillUpdateFireDay?: string;
   lastBackupDay?: string;
+  lastMergeDay?: string;
 }
 const MAINTENANCE_STATE_FILE = path.join(STATE_DIR, 'memory-maintenance-state.json');
 
@@ -139,6 +141,13 @@ let skillUpdateCheckInFlight = false;
 const MEMORY_BACKUP_NIGHTLY_HOUR = 4;
 const MEMORY_BACKUP_NIGHTLY_MINUTE = 30; // offset from skill-update's 4:00
 const MEMORY_BACKUP_RETAIN = 7;
+
+// Tier C2b — nightly paraphrase merge (default on; CLEMMY_MERGE_ENABLED=false
+// to disable). Consolidates semantically identical facts with entity-aware
+// guards to prevent merging facts about different tables/clients/accounts.
+// Runs once per local day at 4:45, after backup. Fully reversible via audit log.
+const MEMORY_MERGE_NIGHTLY_HOUR = 4;
+const MEMORY_MERGE_NIGHTLY_MINUTE = 45; // offset from backup's 4:30
 
 // Tier C3 — episodic_pointers TTL reaper cadence (~1h, same as the
 // tool_outputs reaper it shadows).
@@ -398,6 +407,24 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
         }
       } catch (err) {
         logger.warn({ err }, 'memory.db nightly backup failed');
+      }
+    }
+  }
+
+  // Tier C2b — nightly paraphrase merge at 4:45 AM local (default on).
+  // Entity-aware consolidation of semantic duplicates. Fully reversible via
+  // audit log + soft-delete. Fire-once-per-day, persisted dedupe.
+  if (isAtOrAfterDailyTime(now, MEMORY_MERGE_NIGHTLY_HOUR, MEMORY_MERGE_NIGHTLY_MINUTE)) {
+    if (maintenanceState.lastMergeDay !== today) {
+      maintenanceState.lastMergeDay = today;
+      writeMaintenanceState(maintenanceState);
+      try {
+        const stats = await mergeParaphrases();
+        if (stats.clustersFound > 0 || stats.errors > 0) {
+          logger.info({ stats }, 'paraphrase merge nightly job completed');
+        }
+      } catch (err) {
+        logger.warn({ err }, 'paraphrase merge nightly job failed');
       }
     }
   }
