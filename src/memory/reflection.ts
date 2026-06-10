@@ -354,7 +354,7 @@ interface ConflictDecision {
 }
 
 export async function resolveConflict(
-  candidate: { kind: 'user' | 'project' | 'feedback' | 'reference'; text: string; trustLevel?: number },
+  candidate: { kind: 'user' | 'project' | 'feedback' | 'reference' | 'constraint'; text: string; trustLevel?: number },
   similar: ConsolidatedFact[],
 ): Promise<ConflictDecision> {
   if (similar.length === 0) return { decision: 'ADD' };
@@ -1031,7 +1031,8 @@ export async function runRecursiveReflection(
 
   const db = openMemoryDb();
   const sinceIso = new Date(Date.now() - RECURSIVE_REFLECTION_LOOKBACK_DAYS * 24 * 60 * 60 * 1000).toISOString();
-  const kinds: ConsolidatedFactKind[] = ['user', 'project', 'feedback', 'reference'];
+  // Constraints are standing rules, not derived patterns — exclude from recursive reflection
+  const kinds: Array<'user' | 'project' | 'feedback' | 'reference'> = ['user', 'project', 'feedback', 'reference'];
 
   let producedAnything = false;
   for (const kind of kinds) {

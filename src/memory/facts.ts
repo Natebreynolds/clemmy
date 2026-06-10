@@ -119,7 +119,7 @@ export interface ConsolidatedFact {
   accessCount?: number;
 }
 
-export const FACT_KINDS: ConsolidatedFactKind[] = ['user', 'project', 'feedback', 'reference'];
+export const FACT_KINDS: ConsolidatedFactKind[] = ['user', 'project', 'feedback', 'reference', 'constraint'];
 
 function normalizeContent(content: string): string {
   return content.replace(/\s+/g, ' ').trim();
@@ -924,6 +924,18 @@ export function listPinnedFacts(limit = 12): ConsolidatedFact[] {
   return rows.map(rowToFact);
 }
 
+/** List all active constraint facts. Constraints are hard rules that guard tool dispatch. */
+export function listConstraints(limit = 20): ConsolidatedFact[] {
+  const db = openMemoryDb();
+  const rows = db.prepare(`
+    SELECT * FROM consolidated_facts
+    WHERE active = 1 AND kind = 'constraint'
+    ORDER BY updated_at DESC
+    LIMIT ?
+  `).all(Math.max(1, limit)) as ConsolidatedFactRow[];
+  return rows.map(rowToFact);
+}
+
 /**
  * Render the top-N active facts as a compact block for the assistant's
  * instructions. Empty string when no facts exist — keeps the prompt clean.
@@ -998,7 +1010,7 @@ export function renderFactsForInstructions(
     : '';
 
   const byKind: Record<ConsolidatedFactKind, ConsolidatedFact[]> = {
-    user: [], project: [], feedback: [], reference: [],
+    user: [], project: [], feedback: [], reference: [], constraint: [],
   };
   for (const fact of scored) byKind[fact.kind].push(fact);
 
@@ -1007,6 +1019,7 @@ export function renderFactsForInstructions(
     project: 'Project context',
     feedback: 'Standing feedback',
     reference: 'References',
+    constraint: 'Active Constraints',
   };
 
   const scoredSections: string[] = [];

@@ -18,6 +18,9 @@ import { workerThrashGuardEnabled } from '../runtime/harness/brackets.js';
 import { appendFanoutAdvisory } from '../runtime/harness/fanout-advisory.js';
 import { maybeDiscoveryAdvisory, isDescribeSlug, toolkitOfSlug, describeSignature } from '../runtime/harness/discovery-advisory.js';
 import { isTransientStepError } from '../execution/transient-error.js';
+import { checkConstraintViolation, formatConstraintEscalation } from '../runtime/harness/constraint-guard.js';
+import { validateComposioBatchOperation, formatBatchValidationError } from './composio-batch-validator.js';
+import { shouldRetryToolCall, delayMs } from '../runtime/harness/retry-handler.js';
 
 const DYNAMIC_TOOL_PREFIX = 'cx_';
 const MAX_TOOL_NAME_LENGTH = 64;
@@ -345,33 +348,56 @@ async function runComposioExecute(
   connectedAccountId: string | undefined,
   options: FormatComposioToolOutputOptions,
 ): Promise<string> {
-  try {
-    const result = await executeComposioTool(toolSlug, args, connectedAccountId);
-    const output = formatComposioExecuteOutput(result, { ...options, toolSlug });
-    const sid = sessionIdFromRunContext(options.context);
-    maybeAutoRememberComposioChoice(toolSlug, args, result, sid);
-    // Only count/advise on SUCCESS — a failed call isn't "an item processed".
-    if (!detectComposioFailure(result).failed) {
-      // P1-D — a schema/describe execute is DISCOVERY, not per-item work. Route
-      // it to the discovery advisory (which counts repeated describes of one
-      // toolkit) and skip the fan-out advisory so the two never double-fire on
-      // the same call. All other executes keep the fan-out advisory unchanged.
-      if (isDescribeSlug(toolSlug)) {
-        const advisory = maybeDiscoveryAdvisory({
-          kind: 'describe',
-          toolkit: toolkitOfSlug(toolSlug),
-          signature: describeSignature(toolSlug, args),
-          sessionId: sid,
-        });
-        return advisory ? output + advisory : output;
+  const recentErrors: string[] = [];
+  let lastError: unknown;
+
+  // Retry loop with exponential backoff for transient errors
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const result = await executeComposioTool(toolSlug, args, connectedAccountId);
+      const output = formatComposioExecuteOutput(result, { ...options, toolSlug });
+      const sid = sessionIdFromRunContext(options.context);
+      maybeAutoRememberComposioChoice(toolSlug, args, result, sid);
+      // Only count/advise on SUCCESS — a failed call isn't "an item processed".
+      if (!detectComposioFailure(result).failed) {
+        // P1-D — a schema/describe execute is DISCOVERY, not per-item work. Route
+        // it to the discovery advisory (which counts repeated describes of one
+        // toolkit) and skip the fan-out advisory so the two never double-fire on
+        // the same call. All other executes keep the fan-out advisory unchanged.
+        if (isDescribeSlug(toolSlug)) {
+          const advisory = maybeDiscoveryAdvisory({
+            kind: 'describe',
+            toolkit: toolkitOfSlug(toolSlug),
+            signature: describeSignature(toolSlug, args),
+            sessionId: sid,
+          });
+          return advisory ? output + advisory : output;
+        }
+        const advisory = maybeFanoutAdvisory(toolSlug, args, sid, output);
+        if (advisory) return output + advisory;
       }
-      const advisory = maybeFanoutAdvisory(toolSlug, args, sid, output);
-      if (advisory) return output + advisory;
+      return output;
+    } catch (err) {
+      lastError = err;
+      const errorMsg = err instanceof Error ? err.message : String(err ?? '');
+      recentErrors.push(errorMsg);
+
+      // Check if we should retry
+      const decision = shouldRetryToolCall(err, attempt, recentErrors);
+      if (!decision.shouldRetry) {
+        // Terminal error or circuit-breaker triggered: return error immediately
+        return composioThrownErrorOutput(err, { ...options, toolSlug });
+      }
+
+      // Transient error: wait and retry
+      if (attempt < 3) {
+        await delayMs(decision.delayMs);
+      }
     }
-    return output;
-  } catch (err) {
-    return composioThrownErrorOutput(err, { ...options, toolSlug });
   }
+
+  // Max retries exhausted: return last error
+  return composioThrownErrorOutput(lastError, { ...options, toolSlug });
 }
 
 function parseArgumentsJson(value: string | null | undefined): Record<string, unknown> {
@@ -776,6 +802,32 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
         // corrective so the model fixes the JSON instead of resending it.
         return composioThrownErrorOutput(err, { context, details, toolName: 'composio_execute_tool', toolSlug: tool_slug });
       }
+
+      // Check if this tool call violates any standing constraints
+      const violation = checkConstraintViolation('composio_execute_tool', {
+        ...parsedArgs,
+        action: tool_slug,
+      });
+      if (violation) {
+        return {
+          data: null,
+          successful: false,
+          error: 'constraint_violation',
+          message: formatConstraintEscalation(violation),
+        };
+      }
+
+      // Validate batch operations before dispatch (prevent "missing fields" errors)
+      const batchValidationError = validateComposioBatchOperation(tool_slug, parsedArgs);
+      if (batchValidationError) {
+        return {
+          data: null,
+          successful: false,
+          error: 'batch_validation_error',
+          message: formatBatchValidationError(batchValidationError, tool_slug),
+        };
+      }
+
       return runComposioExecute(tool_slug, parsedArgs, connected_account_id ?? undefined, {
         context,
         details,
