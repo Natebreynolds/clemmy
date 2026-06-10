@@ -29,6 +29,10 @@
 import { setDefaultModelProvider } from '@openai/agents';
 import { getStoredCodexOAuthTokens, refreshStoredNativeOAuth, accessTokenExpMs } from '../auth-store.js';
 import { CodexModelProvider } from './codex-model.js';
+import { RouterModelProvider } from './router-model.js';
+import { ClaudeModelProvider } from './claude-model.js';
+import { loadClaudeAccessToken } from '../claude-oauth.js';
+import { getModelRoutingMode, getByoBackendConfig, AUTH_MODE } from '../../config.js';
 
 // Codex access tokens last ~1 hour. Prefer the token's REAL JWT `exp` and
 // refresh a skew before it; only fall back to this wall-clock guess off
@@ -102,6 +106,42 @@ export interface ConfigureResult {
 export async function configureHarnessRuntime(): Promise<ConfigureResult> {
   if (configured) return { ok: true };
 
+  // Claude brain (subscription OAuth) — when AUTH_MODE=claude_oauth, every role
+  // runs on Claude via the user's Max/Pro subscription, peer to Codex. Fail
+  // closed unless a valid `oat01` SUBSCRIPTION token is present: the preflight
+  // throws on a missing/expired token OR an `api03` API key, so a subscription
+  // user can never be silently pay-per-token billed.
+  if (AUTH_MODE === 'claude_oauth') {
+    try {
+      loadClaudeAccessToken();
+    } catch (err) {
+      return { ok: false, reason: err instanceof Error ? err.message : 'Claude subscription auth is not ready.' };
+    }
+    setDefaultModelProvider(new ClaudeModelProvider());
+    configured = true;
+    return { ok: true };
+  }
+
+  const mode = getModelRoutingMode();
+  const byo = getByoBackendConfig();
+
+  // All-in (no Codex): route every role to the user's BYO backend. No
+  // Codex OAuth token is required — this is the path for users who don't
+  // have (or don't want) a ChatGPT/Codex subscription.
+  if (mode === 'all_in') {
+    if (!byo.configured) {
+      return {
+        ok: false,
+        reason:
+          'all_in mode is enabled but no BYO backend is configured. ' +
+          'Set a backend (e.g., DeepSeek, MiniMax) in Settings → Model backend.',
+      };
+    }
+    setDefaultModelProvider(new RouterModelProvider());
+    configured = true;
+    return { ok: true };
+  }
+
   const tokens = getStoredCodexOAuthTokens();
   if (!tokens?.accessToken) {
     return {
@@ -112,11 +152,17 @@ export async function configureHarnessRuntime(): Promise<ConfigureResult> {
     };
   }
 
-  // Register the codex-native model provider. Every agent in the
-  // harness that names a model string (e.g. `gpt-5.4`) gets a
-  // CodexResponsesModel back, which hand-rolls the codex protocol
-  // instead of leaning on the OpenAI SDK.
-  setDefaultModelProvider(new CodexModelProvider());
+  // Worker mode: the brain + judge stay on Codex (gpt-5*), and the
+  // delegated worker labor routes to the BYO backend. Otherwise register
+  // the codex-native provider exactly as before — byte-identical default.
+  if (mode === 'worker' && byo.configured) {
+    setDefaultModelProvider(new RouterModelProvider());
+  } else {
+    // Every agent that names a model string (e.g. `gpt-5.4`) gets a
+    // CodexResponsesModel back, which hand-rolls the codex protocol
+    // instead of leaning on the OpenAI SDK.
+    setDefaultModelProvider(new CodexModelProvider());
+  }
   configured = true;
   return { ok: true };
 }

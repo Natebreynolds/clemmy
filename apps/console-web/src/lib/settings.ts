@@ -42,6 +42,27 @@ export interface ModelsSnapshot {
   presets: { id: string; label: string }[];
 }
 
+export type ModelRoutingMode = 'off' | 'worker' | 'all_in';
+export interface ModelBackend {
+  mode: ModelRoutingMode;
+  baseURL: string;
+  modelId: string;
+  judgeId: string;
+  workerModel: string;
+  providerLabel: string;
+  hasKey: boolean;
+  configured: boolean;
+}
+export interface ModelBackendPatch {
+  mode: ModelRoutingMode;
+  baseURL: string;
+  apiKey?: string;
+  modelId: string;
+  judgeId?: string;
+  workerModel?: string;
+  providerLabel?: string;
+}
+
 export interface SettingsSnapshot {
   profile?: UserProfile;
   proactivity?: { policy?: Policy };
@@ -53,6 +74,7 @@ export interface SettingsSnapshot {
     envKeys?: Record<string, string>;
   };
   models?: ModelsSnapshot;
+  modelBackend?: ModelBackend;
 }
 
 export const getSettings = () => apiGet<SettingsSnapshot>('/api/console/settings');
@@ -68,3 +90,5 @@ export const patchBudget = (p: Partial<BudgetSettings>) =>
   patch<{ runtimeBudget: BudgetSettings }>('/api/console/settings/runtime-budget', p);
 export const patchModels = (p: Partial<ModelTriple>) =>
   patch<{ models: ModelsSnapshot }>('/api/console/settings/models', p);
+export const patchModelBackend = (p: ModelBackendPatch) =>
+  patch<{ modelBackend: ModelBackend; models: ModelsSnapshot }>('/api/console/settings/model-backend', p);

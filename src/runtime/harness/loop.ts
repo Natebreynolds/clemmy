@@ -3886,6 +3886,55 @@ function extractFallbackSummary(out: unknown): string | undefined {
 // expose identical `history` / `lastResponseId` / `finalOutput` /
 // `interruptions` / `state` getters via RunResultBase, so streaming
 // is a pure superset: drain the stream, then read the same fields.
+/** True when an error is an `outputType` parse/validation failure — a JSON
+ *  `SyntaxError` (the model returned non-JSON) or a `ZodError` (JSON parsed
+ *  but the shape is wrong) — rather than a transport/auth/SSE error. A BYO
+ *  OpenAI-compatible backend (MiniMax/DeepSeek) can emit either. Only these
+ *  are recoverable; everything else must propagate. */
+export function isStructuredOutputError(err: unknown): boolean {
+  if (err instanceof SyntaxError) return true;
+  if (err && typeof err === 'object') {
+    const e = err as { name?: unknown; issues?: unknown; message?: unknown };
+    if (e.name === 'ZodError') return true;
+    if (Array.isArray(e.issues)) return true;
+    // The Agents SDK wraps an output JSON.parse / Zod failure in a
+    // ModelBehaviorError whose message starts "Invalid output type: …"
+    // (agents-core runner/turnResolution.js). Heavy reasoning models
+    // (MiniMax M3) trip this by emitting <think> text or truncated JSON.
+    // Match the message so the run recovers cleanly — without swallowing
+    // other ModelBehaviorErrors (e.g. invalid tool input).
+    if (typeof e.message === 'string'
+        && /invalid output type|failed schema validation|is not valid json/i.test(e.message)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Best-effort plain text from an assistant history item (string content or
+ *  an array of text parts). Never throws. */
+export function assistantItemText(item: AgentInputItem | null): string | null {
+  try {
+    if (!item) return null;
+    const content = (item as { content?: unknown }).content;
+    if (typeof content === 'string') return content.trim() || null;
+    if (Array.isArray(content)) {
+      const text = content
+        .map((p) => (typeof p === 'string' ? p : (p as { text?: unknown } | null)?.text))
+        .filter((t): t is string => typeof t === 'string')
+        .join('')
+        .trim();
+      return text || null;
+    }
+  } catch {
+    // best effort — recovery must never throw
+  }
+  return null;
+}
+
+const STRUCTURED_OUTPUT_RECOVERY_FALLBACK =
+  "Clementine produced a response that couldn't be structured. Please ask again.";
+
 const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
   type StreamedResultLike = {
     history: AgentInputItem[];
@@ -3907,18 +3956,57 @@ const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
   // once the SSE stream has been fully drained and the state machine
   // is settled. Without awaiting it, finalOutput/interruptions read
   // stale (undefined) values and the SDK logs a warning.
-  await result.completed;
-  const hasInterruptions = Array.isArray(result.interruptions) && result.interruptions.length > 0;
+  //
+  // A structured-output (agent.outputType) parse/validation failure surfaces
+  // here (or on the finalOutput read) as a JSON SyntaxError or ZodError —
+  // seen when a BYO compatible backend returns off-shape JSON. Rather than
+  // crash the whole run, recover the model's raw text and end the turn
+  // cleanly: a non-decision finalOutput is treated as "done" by the caller,
+  // which renders it via extractFallbackSummary (it even unwraps a
+  // JSON-shaped reply/summary). Transport/auth/SSE errors are NOT swallowed.
+  let structuredOutputFailed = false;
+  try {
+    await result.completed;
+  } catch (err) {
+    if (!isStructuredOutputError(err)) throw err;
+    structuredOutputFailed = true;
+    console.warn('[harness] structured output failed to parse/validate — ending turn with raw text',
+      err instanceof Error ? err.message : err);
+  }
+
+  let history: AgentInputItem[] = [];
+  try { history = result.history; } catch { history = []; }
+
+  let finalOutput: unknown;
+  if (structuredOutputFailed) {
+    finalOutput = assistantItemText(findLatestAssistantMessage(history)) ?? STRUCTURED_OUTPUT_RECOVERY_FALLBACK;
+  } else {
+    try {
+      finalOutput = result.finalOutput;
+    } catch (err) {
+      if (!isStructuredOutputError(err)) throw err;
+      structuredOutputFailed = true;
+      console.warn('[harness] finalOutput failed to parse/validate — ending turn with raw text',
+        err instanceof Error ? err.message : err);
+      finalOutput = assistantItemText(findLatestAssistantMessage(history)) ?? STRUCTURED_OUTPUT_RECOVERY_FALLBACK;
+    }
+  }
+
+  // A failed-parse turn has no valid interruption state to resume from.
+  const hasInterruptions = !structuredOutputFailed
+    && Array.isArray(result.interruptions) && result.interruptions.length > 0;
   return {
-    history: result.history,
+    history,
     lastResponseId: result.lastResponseId,
-    finalOutput: result.finalOutput,
+    finalOutput,
     rawResponses: result.rawResponses,
     hasInterruptions,
     interruptions: hasInterruptions ? extractInterruptionInfo(result.interruptions ?? []) : undefined,
     serializedState: hasInterruptions ? result.state?.toString() : undefined,
   };
 };
+
+export { defaultRunRunner as __defaultRunRunner };
 
 /**
  * Walk RunResult.interruptions and extract each tool call's name and

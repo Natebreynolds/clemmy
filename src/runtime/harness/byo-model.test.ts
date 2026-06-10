@@ -1,0 +1,225 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { relaxRequestForCompatBackend, wrapCompletionsCreate, liftReasoning } from './byo-model.js';
+
+// --- test helpers for the wrapped-create repair layer ---------------------
+type AnyObj = Record<string, unknown>;
+function completionWith(content: string | null, tool_calls?: AnyObj[]): AnyObj {
+  return {
+    id: 'c1', created: 1, model: 'm',
+    usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    choices: [{ index: 0, finish_reason: tool_calls ? 'tool_calls' : 'stop', message: { role: 'assistant', content, tool_calls } }],
+  };
+}
+function makeFake(responders: Array<(p: AnyObj) => unknown>) {
+  const calls: AnyObj[] = [];
+  let i = 0;
+  const fn = async (params: AnyObj) => {
+    calls.push(params);
+    const r = responders[Math.min(i, responders.length - 1)];
+    i += 1;
+    return r(params);
+  };
+  return { fn: fn as unknown as (p: AnyObj, o?: unknown) => Promise<unknown>, calls };
+}
+const structuredParams = (overrides: AnyObj = {}): AnyObj => ({
+  model: 'm',
+  messages: [{ role: 'system', content: 'sys' }, { role: 'user', content: 'go' }],
+  response_format: { type: 'json_schema', json_schema: { name: 'V', strict: true, schema: { type: 'object', properties: { done: { type: 'boolean' } } } } },
+  ...overrides,
+});
+async function collect(stream: unknown): Promise<AnyObj[]> {
+  const out: AnyObj[] = [];
+  for await (const chunk of stream as AsyncIterable<AnyObj>) out.push(chunk);
+  return out;
+}
+
+test('relax: strict json_schema is downgraded to json_object', () => {
+  const out = relaxRequestForCompatBackend({
+    messages: [{ role: 'system', content: 'sys' }],
+    response_format: { type: 'json_schema', json_schema: { name: 'V', strict: true, schema: { type: 'object' } } },
+  }) as { response_format?: { type?: string } };
+  assert.equal(out.response_format?.type, 'json_object');
+});
+
+test('relax: schema is folded into the system message so the model still returns conforming JSON', () => {
+  const out = relaxRequestForCompatBackend({
+    messages: [{ role: 'system', content: 'You are Clem.' }, { role: 'user', content: 'hi' }],
+    response_format: { type: 'json_schema', json_schema: { name: 'V', strict: true, schema: { type: 'object', properties: { done: { type: 'boolean' } } } } },
+  }) as { messages: Array<{ role: string; content: string }> };
+  const sys = out.messages.find((m) => m.role === 'system');
+  assert.ok(sys);
+  assert.match(sys!.content, /JSON Schema/);
+  assert.match(sys!.content, /"done"/);
+});
+
+test('relax: a system message is created when none exists', () => {
+  const out = relaxRequestForCompatBackend({
+    messages: [{ role: 'user', content: 'hi' }],
+    response_format: { type: 'json_schema', json_schema: { name: 'V', strict: true, schema: { type: 'object' } } },
+  }) as { messages: Array<{ role: string }> };
+  assert.equal(out.messages[0].role, 'system');
+});
+
+test('relax: OpenAI-only fields rejected by compatible backends are stripped', () => {
+  const out = relaxRequestForCompatBackend({
+    messages: [],
+    store: false,
+    prompt_cache_retention: 'in-memory',
+    reasoning_effort: 'high',
+    verbosity: 'low',
+    temperature: 0.5,
+  }) as Record<string, unknown>;
+  assert.equal('store' in out, false);
+  assert.equal('prompt_cache_retention' in out, false);
+  assert.equal('reasoning_effort' in out, false);
+  assert.equal('verbosity' in out, false);
+  // non-OpenAI-only fields are preserved
+  assert.equal(out.temperature, 0.5);
+});
+
+test('relax: strict is stripped from function tool definitions', () => {
+  const out = relaxRequestForCompatBackend({
+    messages: [],
+    tools: [
+      { type: 'function', function: { name: 'f', parameters: { type: 'object' }, strict: true } },
+      { type: 'function', function: { name: 'g', parameters: { type: 'object' } } },
+    ],
+  }) as { tools: Array<{ function: Record<string, unknown> }> };
+  assert.equal('strict' in out.tools[0].function, false);
+  assert.equal(out.tools[0].function.name, 'f');
+  assert.equal(out.tools[1].function.name, 'g');
+});
+
+test('relax: plain text requests (no response_format) pass through untouched', () => {
+  const body = { messages: [{ role: 'user', content: 'hi' }], temperature: 0.2 };
+  const out = relaxRequestForCompatBackend(body) as Record<string, unknown>;
+  assert.equal(out.response_format, undefined);
+  assert.equal(out.temperature, 0.2);
+});
+
+test('relax: input is not mutated (returns a new object)', () => {
+  const body = { messages: [{ role: 'system', content: 'sys' }], store: true };
+  const out = relaxRequestForCompatBackend(body);
+  assert.notEqual(out, body);
+  assert.equal((body as Record<string, unknown>).store, true, 'original keeps its fields');
+});
+
+// --- wrapped-create repair layer ------------------------------------------
+
+test('wrap(i): tool-call turn (non-stream) is returned untouched', async () => {
+  const fake = makeFake([() => completionWith('', [{ id: 't1', type: 'function', function: { name: 'f', arguments: '{}' } }])]);
+  const create = wrapCompletionsCreate(fake.fn);
+  const res = (await create(structuredParams())) as AnyObj;
+  const msg = (res.choices as AnyObj[])[0].message as AnyObj;
+  assert.equal(msg.content, '');
+  assert.equal((msg.tool_calls as AnyObj[]).length, 1);
+});
+
+test('wrap(j): empty content (non-stream) is returned untouched', async () => {
+  const fake = makeFake([() => completionWith('')]);
+  const res = (await wrapCompletionsCreate(fake.fn)(structuredParams())) as AnyObj;
+  assert.equal(((res.choices as AnyObj[])[0].message as AnyObj).content, '');
+});
+
+test('wrap(k): no marker (free-text + pre-existing json_object) is never repaired', async () => {
+  // free-text: no response_format → no marker → passthrough
+  const f1 = makeFake([() => completionWith('plain answer, not json')]);
+  const r1 = (await wrapCompletionsCreate(f1.fn)({ model: 'm', messages: [{ role: 'user', content: 'hi' }] })) as AnyObj;
+  assert.equal(((r1.choices as AnyObj[])[0].message as AnyObj).content, 'plain answer, not json');
+  // pre-existing json_object (NOT our json_schema downgrade) → no marker → fenced content left as-is
+  const f2 = makeFake([() => completionWith('```json\n{"a":1}\n```')]);
+  const r2 = (await wrapCompletionsCreate(f2.fn)({ model: 'm', messages: [], response_format: { type: 'json_object' } })) as AnyObj;
+  assert.equal(((r2.choices as AnyObj[])[0].message as AnyObj).content, '```json\n{"a":1}\n```');
+});
+
+test('wrap(l): marker + fenced content (non-stream) is rewritten to parseable JSON', async () => {
+  const fake = makeFake([() => completionWith('```json\n{"done": true}\n```')]);
+  const res = (await wrapCompletionsCreate(fake.fn)(structuredParams())) as AnyObj;
+  const content = ((res.choices as AnyObj[])[0].message as AnyObj).content as string;
+  assert.deepEqual(JSON.parse(content), { done: true });
+});
+
+test('wrap(m): marker + fenced content (stream) emits one converter-legal repaired chunk', async () => {
+  const fake = makeFake([() => completionWith('```json\n{"done": false}\n```')]);
+  const stream = await wrapCompletionsCreate(fake.fn)(structuredParams({ stream: true }));
+  const chunks = await collect(stream);
+  assert.equal(chunks.length, 1);
+  const choice = (chunks[0].choices as AnyObj[])[0];
+  assert.equal((choice as AnyObj).index, 0);
+  assert.equal((choice as AnyObj).finish_reason, 'stop');
+  assert.ok(chunks[0].usage, 'usage preserved so token budget is not zeroed');
+  assert.deepEqual(JSON.parse(((choice as AnyObj).delta as AnyObj).content as string), { done: false });
+});
+
+test('wrap(n): stream + internal stream:false rejection falls back to a real stream (no throw)', async () => {
+  async function* realStream() { yield completionWith('streamed'); }
+  const fake = makeFake([(p) => { if (p.stream === false) throw new Error('backend rejects non-stream'); return realStream(); }]);
+  const stream = await wrapCompletionsCreate(fake.fn)(structuredParams({ stream: true }));
+  const chunks = await collect(stream);
+  assert.equal(chunks.length, 1);
+  assert.equal(((chunks[0].choices as AnyObj[])[0].message as AnyObj).content, 'streamed');
+});
+
+test('wrap(o): re-ask fires exactly once — junk then clean JSON succeeds', async () => {
+  const fake = makeFake([() => completionWith('garbage, no json'), () => completionWith('{"ok": 1}')]);
+  const create = wrapCompletionsCreate(fake.fn);
+  const res = (await create(structuredParams())) as AnyObj;
+  assert.equal(fake.calls.length, 2, 'one initial call + one re-ask');
+  assert.deepEqual(JSON.parse(((res.choices as AnyObj[])[0].message as AnyObj).content as string), { ok: 1 });
+});
+
+test('wrap(o): junk then junk re-asks once (never 3x), leaves content best-effort', async () => {
+  const fake = makeFake([() => completionWith('garbage one'), () => completionWith('garbage two')]);
+  const res = (await wrapCompletionsCreate(fake.fn)(structuredParams())) as AnyObj;
+  assert.equal(fake.calls.length, 2, 'initial + one re-ask only');
+  assert.equal(((res.choices as AnyObj[])[0].message as AnyObj).content, 'garbage one');
+});
+
+// --- reasoning preservation (the M3 interleaved-thinking fix) --------------
+
+function compl(message: AnyObj): AnyObj {
+  return { id: 'c1', created: 1, model: 'm', usage: {}, choices: [{ index: 0, finish_reason: 'stop', message }] };
+}
+
+test('liftReasoning: reasoning_content is lifted into message.reasoning (SDK carry-forward field)', () => {
+  const c = compl({ role: 'assistant', content: '{"ok":true}', reasoning_content: 'I considered X then Y.' });
+  liftReasoning(c);
+  assert.equal(((c.choices as AnyObj[])[0].message as AnyObj).reasoning, 'I considered X then Y.');
+});
+
+test('liftReasoning: a leading <think> block becomes reasoning and is stripped from content', () => {
+  const c = compl({ role: 'assistant', content: '<think>\nplan: call tool A next\n</think>\n{"ok":true}' });
+  liftReasoning(c);
+  const msg = (c.choices as AnyObj[])[0].message as AnyObj;
+  assert.match(msg.reasoning as string, /plan: call tool A/);
+  assert.equal(msg.content, '{"ok":true}');
+});
+
+test('liftReasoning: no-op when reasoning already present (no double-lift)', () => {
+  const c = compl({ role: 'assistant', content: 'hi', reasoning: 'already here', reasoning_content: 'ignored' });
+  liftReasoning(c);
+  assert.equal(((c.choices as AnyObj[])[0].message as AnyObj).reasoning, 'already here');
+});
+
+test('wrap: a TOOL-CALL streaming turn carries reasoning forward (the critical long-loop case)', async () => {
+  // Tool turn: content empty, tool_calls present, reasoning in reasoning_content.
+  const fake = makeFake([() => compl({
+    role: 'assistant', content: '', reasoning_content: 'I should search the inbox first.',
+    tool_calls: [{ id: 't1', type: 'function', function: { name: 'search', arguments: '{}' } }],
+  })]);
+  const stream = await wrapCompletionsCreate(fake.fn)(structuredParams({ stream: true }));
+  const chunks = await collect(stream);
+  const delta = (chunks[0].choices as AnyObj[])[0].delta as AnyObj;
+  assert.equal(delta.reasoning, 'I should search the inbox first.', 'reasoning preserved on the tool turn');
+  assert.equal((delta.tool_calls as AnyObj[])[0].function && ((delta.tool_calls as AnyObj[])[0].function as AnyObj).name, 'search', 'tool call preserved');
+});
+
+test('wrap: a structured streaming turn carries reasoning + repaired JSON', async () => {
+  const fake = makeFake([() => compl({ role: 'assistant', content: '<think>let me answer</think>\n```json\n{"done":true}\n```' })]);
+  const stream = await wrapCompletionsCreate(fake.fn)(structuredParams({ stream: true }));
+  const chunks = await collect(stream);
+  const delta = (chunks[0].choices as AnyObj[])[0].delta as AnyObj;
+  assert.match(delta.reasoning as string, /let me answer/);
+  assert.deepEqual(JSON.parse(delta.content as string), { done: true });
+});

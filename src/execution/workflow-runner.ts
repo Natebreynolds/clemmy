@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process';
 import path from 'node:path';
 import pino from 'pino';
 import type { ClementineAssistant } from '../assistant/core.js';
-import { MODELS, getRuntimeEnv } from '../config.js';
+import { MODELS, getRuntimeEnv, getWorkerModel } from '../config.js';
 import { runBoundedPool } from './bounded-pool.js';
 import { bindStepInputs } from './step-binding.js';
 import { addNotification, loadNotifications } from '../runtime/notifications.js';
@@ -1729,7 +1729,8 @@ export async function executeStep(
             sessionId: `workflow:${ctx.runId}:${step.id}:${key}`,
             channel: 'workflow',
             message: `Workflow: ${ctx.workflow.name}\nStep: ${step.id}\nItem: ${key}\n\n${prompt}`,
-            model: step.model || MODELS.primary,
+            // forEach fan-out item = delegated grunt-work labor → BYO worker model when routed.
+            model: step.model || getWorkerModel(),
             maxWallClockMs: WORKFLOW_STEP_WALL_CLOCK_MS,
           })).text;
         }
@@ -1825,6 +1826,11 @@ export async function executeStep(
       sessionId: `workflow:${ctx.runId}:${step.id}`,
       channel: 'workflow',
       message: `Workflow: ${ctx.workflow.name}\nStep: ${step.id}\n\n${prompt}`,
+      // A plain (non-forEach) step is ORCHESTRATION work (multi-tool, strict
+      // structured output, e.g. Outlook triage) — it stays on the brain/primary
+      // tier (Codex in worker mode), NOT the cheap worker tier. Only forEach
+      // per-item labor (above) routes to the worker model. An author can still
+      // pin a specific step via step.model.
       model: step.model || MODELS.primary,
       maxWallClockMs: WORKFLOW_STEP_WALL_CLOCK_MS,
     });

@@ -116,7 +116,34 @@ export function getOpenAiApiKey(): string {
 export const ASSISTANT_NAME = getEnv('ASSISTANT_NAME', 'Clementine');
 export const OWNER_NAME = getEnv('OWNER_NAME', '');
 export const OPENAI_API_KEY = getEnv('OPENAI_API_KEY', '');
-export const AUTH_MODE = (getEnv('AUTH_MODE', 'api_key') === 'codex_oauth' ? 'codex_oauth' : 'api_key') satisfies AuthMode;
+export const AUTH_MODE = ((): AuthMode => {
+  const raw = getEnv('AUTH_MODE', 'api_key');
+  if (raw === 'codex_oauth') return 'codex_oauth';
+  if (raw === 'claude_oauth') return 'claude_oauth';
+  return 'api_key';
+})();
+
+/** Claude (Anthropic) flagship-brain support — peer to Codex. Gated default-OFF;
+ *  flip with AUTH_MODE=claude_oauth (and the kill-switch below). Mirrors the
+ *  Codex OAuth subscription path: reads the user's Claude Code OAuth token and
+ *  bills the subscription (Agent-SDK credit), never an API key. */
+export function getClaudeBrainEnabled(): boolean {
+  const raw = (getRuntimeEnv('CLEMENTINE_CLAUDE_BRAIN', '') || '').trim().toLowerCase();
+  if (raw === 'on' || raw === '1' || raw === 'true') return true;
+  // Implicitly enabled when AUTH_MODE selects it.
+  return AUTH_MODE === 'claude_oauth';
+}
+
+/** Default Claude brain model (current flagship, verified live 2026-06-09). */
+export function getClaudeBrainModel(): string {
+  return (getRuntimeEnv('CLAUDE_MODEL', '') || '').trim() || 'claude-opus-4-8';
+}
+
+export const CLAUDE_MODEL_PRESETS = [
+  { id: 'claude-opus-4-8', label: 'Claude Opus 4.8 (flagship)' },
+  { id: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6' },
+  { id: 'claude-haiku-4-5', label: 'Claude Haiku 4.5' },
+];
 export const CODEX_AUTH_SOURCE_FILE = getEnv('CODEX_AUTH_SOURCE_FILE', path.join(os.homedir(), '.codex', 'auth.json'));
 export const CODEX_EXECUTABLE = getEnv('CODEX_EXECUTABLE', 'codex');
 export const CODEX_INSTALL_PACKAGE = getEnv('CODEX_INSTALL_PACKAGE', '@openai/codex');
@@ -181,6 +208,65 @@ export function getModelSettingsSnapshot(): {
       primary: process.env[MODEL_ENV_KEYS.primary] !== undefined,
       deep: process.env[MODEL_ENV_KEYS.deep] !== undefined,
     },
+  };
+}
+
+// ----------------------------------------------------------------------
+// BYO model backend — worker offload & all-in (non-Codex) routing.
+//
+// Additive and default-OFF: when MODEL_ROUTING_MODE is unset/'off' OR no
+// BYO backend is configured, the harness registers CodexModelProvider
+// exactly as before (byte-identical). These knobs only take effect when a
+// user opts in via Settings → Models.
+//
+//   off    → everything on Codex (today's behavior)
+//   worker → worker/grunt-work agents on the BYO model; brain + judge on Codex
+//   all_in → every role on the BYO model (judge on a 2nd BYO model if set)
+// ----------------------------------------------------------------------
+export type ModelRoutingMode = 'off' | 'worker' | 'all_in';
+
+export function getModelRoutingMode(): ModelRoutingMode {
+  const v = (getRuntimeEnv('MODEL_ROUTING_MODE', 'off') || 'off').toLowerCase();
+  return v === 'worker' || v === 'all_in' ? v : 'off';
+}
+
+/** The model the delegated worker/grunt-work agents run on. Defaults to
+ *  the primary (Codex) model so an unset knob is byte-identical to today. */
+export function getWorkerModel(): string {
+  const raw = getRuntimeEnv('OPENAI_MODEL_WORKER', '') || '';
+  return raw ? normalizeModelId(raw, MODELS.primary) : MODELS.primary;
+}
+
+export interface ByoBackendConfig {
+  configured: boolean;
+  baseURL: string;
+  apiKey: string;
+  primaryId: string;
+  judgeId: string;
+  providerLabel: string;
+}
+
+/** Resolve the user-supplied (bring-your-own) OpenAI-compatible backend
+ *  used for worker/all-in routing (e.g. MiniMax, DeepSeek, or any
+ *  Chat-Completions endpoint). Key is vault-first, then env. */
+export function getByoBackendConfig(): ByoBackendConfig {
+  // BYO ids may include '/' (OpenRouter-style) so we use a looser sanity
+  // filter than normalizeModelId (which is tuned for OpenAI gpt-* ids).
+  const cleanId = (raw: unknown): string => {
+    const s = typeof raw === 'string' ? raw.trim() : '';
+    return /^[A-Za-z0-9._:/-]+$/.test(s) ? s : '';
+  };
+  const baseURL = (getRuntimeEnv('BYO_MODEL_BASE_URL', '') || '').trim();
+  const apiKey = (readSecretFromFileVaultSync('byo_model_api_key') || getRuntimeEnv('BYO_MODEL_API_KEY', '') || '').trim();
+  const primaryId = cleanId(getRuntimeEnv('BYO_MODEL_ID', ''));
+  const judgeRaw = cleanId(getRuntimeEnv('BYO_MODEL_JUDGE_ID', ''));
+  return {
+    configured: Boolean(baseURL && apiKey),
+    baseURL,
+    apiKey,
+    primaryId,
+    judgeId: judgeRaw || primaryId,
+    providerLabel: (getRuntimeEnv('BYO_MODEL_PROVIDER', '') || '').trim(),
   };
 }
 
