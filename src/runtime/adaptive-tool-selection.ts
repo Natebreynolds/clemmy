@@ -114,7 +114,7 @@ export function recordToolOutcome(outcome: ToolOutcome): void {
 
   // Persist to tool-choice-store for per-tool learning
   try {
-    updateToolChoiceOutcomeForIdentifier(outcome.toolName, outcome.succeeded);
+    updateToolChoiceOutcomeForIdentifier(outcome.toolName, outcome.succeeded ? 'success' : 'failure');
   } catch (err) {
     // Silently ignore if tool-choice-store not available
   }
