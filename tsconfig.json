@@ -13,5 +13,10 @@
   },
   "include": [
     "src/**/*.ts"
+  ],
+  "exclude": [
+    "src/**/*.vitest.ts",
+    "src/**/*.test.ts",
+    "node_modules"
   ]
 }
