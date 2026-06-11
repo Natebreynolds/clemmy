@@ -18,7 +18,8 @@ import { workerThrashGuardEnabled } from '../runtime/harness/brackets.js';
 import { appendFanoutAdvisory } from '../runtime/harness/fanout-advisory.js';
 import { maybeDiscoveryAdvisory, isDescribeSlug, toolkitOfSlug, describeSignature } from '../runtime/harness/discovery-advisory.js';
 import { isTransientStepError } from '../execution/transient-error.js';
-import { checkConstraintViolation, formatConstraintEscalation } from '../runtime/harness/constraint-guard.js';
+import { checkConstraintViolation, formatConstraintEscalation, findEmailSendConstraint } from '../runtime/harness/constraint-guard.js';
+import { verifyOutlookSender } from '../runtime/harness/sender-verify.js';
 import { validateComposioBatchOperation, formatBatchValidationError } from './composio-batch-validator.js';
 import { shouldRetryToolCall, delayMs } from '../runtime/harness/retry-handler.js';
 import { suggestNextSteps, type FailureType as FallbackFailureType } from '../runtime/fallback-chain-store.js';
@@ -412,12 +413,59 @@ export function maybeFanoutAdvisory(
   return appendFanoutAdvisory({ toolName: toolSlug, args, sessionId, resultText });
 }
 
+/**
+ * Standing-constraint gate for EVERY composio dispatch path (both
+ * `composio_execute_tool` and the dynamic first-class `cx_*` tools route
+ * through runComposioExecute). Returns a model-facing block message when the
+ * call must not execute, null when clear to proceed.
+ *
+ * The email-sender rule is enforced with a REAL mailbox lookup
+ * (OUTLOOK_GET_PROFILE), not arg pattern-matching — `user_id: 'me'` is
+ * resolved to the actual connected mailbox before any send leaves
+ * (2026-06-11 wrong-mailbox incident). Fail-closed.
+ */
+async function enforceStandingConstraints(
+  toolSlug: string,
+  args: Record<string, unknown>,
+  connectedAccountId: string | undefined,
+): Promise<string | null> {
+  const senderOverride = args.sender_override_confirmed === true;
+  delete args.sender_override_confirmed; // meta-arg — never reaches the provider API
+
+  const emailRule = findEmailSendConstraint(toolSlug, args);
+  if (emailRule) {
+    if (senderOverride) {
+      console.error(`[sender-verify] OVERRIDE used for ${toolSlug} — user-directed alternate sender (constraint #${emailRule.constraint.id})`);
+    } else {
+      const verification = await verifyOutlookSender({
+        rule: emailRule,
+        toolSlug,
+        userId: String(args.user_id ?? 'me'),
+        connectedAccountId,
+        fetchProfile: (slug, profileArgs) => executeComposioTool(slug, profileArgs, connectedAccountId),
+      });
+      if (!verification.ok) return verification.message ?? 'Blocked by standing sender constraint.';
+    }
+  }
+
+  const violation = checkConstraintViolation('composio_execute_tool', {
+    ...args,
+    action: toolSlug,
+  }, { emailHandledExternally: true });
+  if (violation) return formatConstraintEscalation(violation);
+
+  return null;
+}
+
 async function runComposioExecute(
   toolSlug: string,
   args: Record<string, unknown>,
   connectedAccountId: string | undefined,
   options: FormatComposioToolOutputOptions,
 ): Promise<string> {
+  const gateMessage = await enforceStandingConstraints(toolSlug, args, connectedAccountId);
+  if (gateMessage) return gateMessage;
+
   const recentErrors: string[] = [];
   let lastError: unknown;
 
@@ -888,19 +936,8 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
         return composioThrownErrorOutput(err, { context, details, toolName: 'composio_execute_tool', toolSlug: tool_slug });
       }
 
-      // Check if this tool call violates any standing constraints
-      const violation = checkConstraintViolation('composio_execute_tool', {
-        ...parsedArgs,
-        action: tool_slug,
-      });
-      if (violation) {
-        return {
-          data: null,
-          successful: false,
-          error: 'constraint_violation',
-          message: formatConstraintEscalation(violation),
-        };
-      }
+      // Standing-constraint enforcement (incl. the hard sender gate) lives in
+      // runComposioExecute so the dynamic cx_* tool path is covered too.
 
       // Validate batch operations before dispatch (prevent "missing fields" errors)
       const batchValidationError = validateComposioBatchOperation(tool_slug, parsedArgs);

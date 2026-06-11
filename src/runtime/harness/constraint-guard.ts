@@ -18,20 +18,60 @@ export interface ConstraintViolation {
   violatingField: string;
 }
 
+export interface EmailSendConstraint {
+  constraint: ConsolidatedFact;
+  /** The only mailbox this send is allowed to leave from (lowercased). */
+  allowedAccount: string;
+}
+
+const EMAIL_IN_TEXT = /[\w\-.+]+@[\w\-.]+\.[a-z]{2,}/i;
+
+/**
+ * Find the active email-account constraint that applies to this composio
+ * call, if any. A constraint applies when it names email + outlook and the
+ * slug is a send/draft action. The dispatch layer (composio-tools) uses this
+ * to VERIFY the actual connected mailbox before the send leaves — pattern
+ * matching alone cannot know which account `user_id: 'me'` resolves to.
+ */
+export function findEmailSendConstraint(
+  toolSlug: string,
+  _args: Record<string, unknown>,
+): EmailSendConstraint | null {
+  try {
+    const slug = toolSlug.toLowerCase();
+    if (!slug.includes('send') && !slug.includes('draft')) return null;
+    for (const constraint of listConstraints()) {
+      const content = constraint.content.toLowerCase();
+      if (!content.includes('email') && !content.includes('mail')) continue;
+      const match = constraint.content.match(EMAIL_IN_TEXT);
+      if (!match) continue;
+      return { constraint, allowedAccount: match[0].toLowerCase() };
+    }
+  } catch (err) {
+    console.error('[constraint-guard] error finding email constraint:', err);
+  }
+  return null;
+}
+
 /**
  * Check if a tool call violates any active constraints.
  * Returns a violation object if found, null if OK to proceed.
+ *
+ * `emailHandledExternally` — the composio dispatch path verifies the real
+ * sending mailbox (profile lookup) via findEmailSendConstraint and must not
+ * ALSO trip the pattern-only email check here.
  */
 export function checkConstraintViolation(
   toolName: string,
   args: Record<string, unknown>,
+  opts: { emailHandledExternally?: boolean } = {},
 ): ConstraintViolation | null {
   try {
     const constraints = listConstraints();
     if (constraints.length === 0) return null;
 
     for (const constraint of constraints) {
-      const violation = checkSingleConstraint(toolName, args, constraint);
+      const violation = checkSingleConstraint(toolName, args, constraint, opts);
       if (violation) return violation;
     }
   } catch (err) {
@@ -50,11 +90,13 @@ function checkSingleConstraint(
   toolName: string,
   args: Record<string, unknown>,
   constraint: ConsolidatedFact,
+  opts: { emailHandledExternally?: boolean } = {},
 ): ConstraintViolation | null {
   const content = constraint.content.toLowerCase();
 
   // Email account constraint: "use [account] for Outlook"
-  if (content.includes('email') && content.includes('outlook') && toolName === 'composio_execute_tool') {
+  if (!opts.emailHandledExternally
+      && content.includes('email') && content.includes('outlook') && toolName === 'composio_execute_tool') {
     const violation = checkEmailAccountConstraint(args, constraint.content);
     if (violation) {
       return { constraint, reason: violation, toolName, violatingField: 'from/account' };

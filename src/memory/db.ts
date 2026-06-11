@@ -160,7 +160,7 @@ function ensureStateDir(): void {
   }
 }
 
-const MIGRATIONS: { version: number; sql: string }[] = [
+const MIGRATIONS: ({ version: number; sql: string } | { version: number; run: (db: Database.Database) => void })[] = [
   {
     version: 1,
     sql: `
@@ -218,7 +218,7 @@ const MIGRATIONS: { version: number; sql: string }[] = [
 
       CREATE TABLE IF NOT EXISTS consolidated_facts (
         id                INTEGER PRIMARY KEY AUTOINCREMENT,
-        kind              TEXT NOT NULL CHECK (kind IN ('user','project','feedback','reference')),
+        kind              TEXT NOT NULL CHECK (kind IN ('user','project','feedback','reference','constraint')),
         content           TEXT NOT NULL,
         content_hash      TEXT NOT NULL UNIQUE,
         source_session_id TEXT,
@@ -485,6 +485,93 @@ const MIGRATIONS: { version: number; sql: string }[] = [
       ALTER TABLE consolidated_facts ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0;
     `,
   },
+  {
+    // v12 — widen the kind CHECK to admit 'constraint'. The 'constraint' kind
+    // was added to the TS types (2026-06-10) but the CHECK was never migrated,
+    // so every INSERT of a constraint fact threw and listConstraints() stayed
+    // empty — which is why the dispatch-time constraint gate never enforced
+    // anything (2026-06-11 wrong-mailbox incident). SQLite can't ALTER a
+    // CHECK, so this is the documented full-rebuild procedure. It must run
+    // with foreign_keys OFF: fact_embeddings references this table with
+    // ON DELETE CASCADE, and a plain DROP would cascade-wipe every embedding.
+    version: 12,
+    run: (db: Database.Database) => {
+      const ddl = (db.prepare(
+        `SELECT sql FROM sqlite_master WHERE type='table' AND name='consolidated_facts'`,
+      ).get() as { sql: string } | undefined)?.sql ?? '';
+      if (ddl.includes("'constraint'")) return; // fresh install — v1 already created the widened CHECK
+
+      db.pragma('foreign_keys = OFF');
+      try {
+        db.transaction(() => {
+          db.exec(`
+            CREATE TABLE consolidated_facts_new (
+              id                INTEGER PRIMARY KEY AUTOINCREMENT,
+              kind              TEXT NOT NULL CHECK (kind IN ('user','project','feedback','reference','constraint')),
+              content           TEXT NOT NULL,
+              content_hash      TEXT NOT NULL UNIQUE,
+              source_session_id TEXT,
+              source_path       TEXT,
+              score             REAL NOT NULL DEFAULT 1.0,
+              active            INTEGER NOT NULL DEFAULT 1,
+              created_at        TEXT NOT NULL,
+              updated_at        TEXT NOT NULL,
+              derived_from_session_id TEXT,
+              derived_from_call_id    TEXT,
+              derived_from_tool       TEXT,
+              trust_level             REAL,
+              extracted_at            TEXT,
+              importance              REAL,
+              last_accessed_at        TEXT,
+              derivation_depth        INTEGER NOT NULL DEFAULT 0,
+              derived_from_fact_ids   TEXT,
+              pinned                  INTEGER NOT NULL DEFAULT 0,
+              source_app              TEXT,
+              access_count            INTEGER NOT NULL DEFAULT 0
+            );
+
+            INSERT INTO consolidated_facts_new (
+              id, kind, content, content_hash, source_session_id, source_path,
+              score, active, created_at, updated_at, derived_from_session_id,
+              derived_from_call_id, derived_from_tool, trust_level, extracted_at,
+              importance, last_accessed_at, derivation_depth, derived_from_fact_ids,
+              pinned, source_app, access_count
+            )
+            SELECT
+              id, kind, content, content_hash, source_session_id, source_path,
+              score, active, created_at, updated_at, derived_from_session_id,
+              derived_from_call_id, derived_from_tool, trust_level, extracted_at,
+              importance, last_accessed_at, derivation_depth, derived_from_fact_ids,
+              pinned, source_app, access_count
+            FROM consolidated_facts;
+
+            DROP TABLE consolidated_facts;
+            ALTER TABLE consolidated_facts_new RENAME TO consolidated_facts;
+
+            CREATE INDEX idx_facts_active ON consolidated_facts(active, kind, score DESC);
+            CREATE INDEX idx_facts_extracted_at
+              ON consolidated_facts(extracted_at DESC) WHERE extracted_at IS NOT NULL;
+            CREATE INDEX idx_facts_importance
+              ON consolidated_facts(importance DESC) WHERE importance IS NOT NULL;
+            CREATE INDEX idx_facts_last_accessed
+              ON consolidated_facts(last_accessed_at DESC) WHERE last_accessed_at IS NOT NULL;
+            CREATE INDEX idx_facts_derivation_depth
+              ON consolidated_facts(derivation_depth, created_at DESC);
+            CREATE INDEX idx_facts_pinned
+              ON consolidated_facts(pinned, active);
+          `);
+          // Inside the transaction so an orphan (id drift between copy and the
+          // FK in fact_embeddings) rolls the whole rebuild back.
+          const orphans = db.pragma('foreign_key_check(fact_embeddings)') as unknown[];
+          if (orphans.length > 0) {
+            throw new Error(`consolidated_facts rebuild would orphan ${orphans.length} fact_embeddings rows`);
+          }
+        })();
+      } finally {
+        db.pragma('foreign_keys = ON');
+      }
+    },
+  },
 ];
 
 function runMigrations(db: Database.Database): void {
@@ -500,6 +587,15 @@ function runMigrations(db: Database.Database): void {
 
   for (const migration of MIGRATIONS) {
     if (migration.version <= current) continue;
+    if ('run' in migration) {
+      // Callback migrations manage their own transaction (e.g. the v12 table
+      // rebuild needs PRAGMA foreign_keys toggled, which is a silent no-op
+      // inside an open transaction). Version is recorded only on success, so
+      // a failed run retries on the next open.
+      migration.run(db);
+      apply.run(migration.version, new Date().toISOString());
+      continue;
+    }
     const tx = db.transaction(() => {
       db.exec(migration.sql);
       apply.run(migration.version, new Date().toISOString());
