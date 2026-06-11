@@ -44,6 +44,7 @@ import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { previewToolCall } from '../runtime/approval-summary.js';
 import { buildOrchestratorAgent } from '../agents/orchestrator.js';
 import { runPlanFirstPreflight, shouldUsePlanFirst } from '../runtime/harness/plan-first.js';
+import { parseGoalCommand, handleGoalContractCommand } from '../agents/goal-commands.js';
 import { routeOpenQuestionPlan } from '../runtime/harness/plan-continuity.js';
 import { loadProactivityPolicy } from '../agents/proactivity-policy.js';
 
@@ -1909,6 +1910,30 @@ export async function runDiscordHarnessConversation(opts: {
       // It runs inside this IIFE so re-entering runPlanFirstPreflight emits
       // its events into the same live-edit loop and `return` short-circuits
       // the orchestrator exactly like the existing planFirst block below.
+      // /goal slash command (goal-contract P3): pin/inspect/cancel the
+      // session's parked goal. Reply-only commands complete via the event
+      // bus (the live-edit subscriber renders the reply and settles);
+      // start/resume swap the run input so work begins immediately.
+      const goalCmd = parseGoalCommand(prompt);
+      let goalRunInput: string | null = null;
+      if (goalCmd) {
+        const outcome = handleGoalContractCommand({
+          command: goalCmd,
+          sessionId: session.id,
+          channel: `discord:${channelId}`,
+        });
+        if (!outcome.runInput) {
+          appendHarnessEvent({
+            sessionId: session.id,
+            turn: 0,
+            role: 'Clem',
+            type: 'conversation_completed',
+            data: { reason: 'goal_command', summary: outcome.reply, reply: outcome.reply, steps: 0 },
+          });
+          return;
+        }
+        goalRunInput = outcome.runInput;
+      }
       {
         const channelKey = `discord:${channelId}`;
         const continuity = await routeOpenQuestionPlan({
@@ -1924,7 +1949,7 @@ export async function runDiscordHarnessConversation(opts: {
         });
         if (continuity.handled) return;
       }
-      if (planFirst) {
+      if (planFirst && !goalRunInput) {
         const preflight = await runPlanFirstPreflight({
           input: prompt,
           sessionId: session.id,
@@ -1935,8 +1960,9 @@ export async function runDiscordHarnessConversation(opts: {
         });
         if (preflight.surfaced) return;
       }
-      const agent = await buildOrchestratorAgent({ userInput: prompt, sessionId: session.id });
-      await runConversation({ agent, sessionId: session.id, input: prompt, judgeCompletion: true, onChunk });
+      const effectiveInput = goalRunInput ?? prompt;
+      const agent = await buildOrchestratorAgent({ userInput: effectiveInput, sessionId: session.id });
+      await runConversation({ agent, sessionId: session.id, input: effectiveInput, judgeCompletion: true, onChunk });
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
       try {

@@ -10,10 +10,9 @@ import { normalizeZodForCodexStrict } from '../schema-normalizer.js';
  * completion by themselves. Build an audit checklist mapping requirements →
  * verifiable evidence before marking done."
  *
- * Canonical home (goal-contract Phase 1): this prompt used to live in the
- * legacy /goal loop (agents/goal-loop.ts, scheduled for deletion in Phase 3),
- * which now imports it from here — the dependency was flipped so deleting the
- * legacy loop doesn't orphan the judge.
+ * Canonical home (goal-contract): the legacy /goal loop that originally
+ * owned this prompt was deleted in Phase 3 — the goal-contract store +
+ * harness validation (goal-validate.ts) replaced it.
  */
 export const JUDGE_SYSTEM_PROMPT = [
   'You are a goal-completion judge. You receive (1) a user objective and (2) the most recent assistant response.',

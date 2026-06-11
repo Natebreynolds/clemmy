@@ -147,13 +147,9 @@ import {
 } from '../agents/plan-proposals.js';
 import { approvePlanAndQueueBackgroundTask } from '../execution/approved-plan-tasks.js';
 import {
-  clearGoalState,
-  describeGoalState,
-  loadGoalState,
   parseGoalCommand,
-  runGoalLoop,
-  type GoalCommand,
-} from '../agents/goal-loop.js';
+  handleGoalContractCommand,
+} from '../agents/goal-commands.js';
 import { PlanSchema } from '../agents/planner.js';
 import { closePlanScope, listActiveScopes, listAllScopes } from '../agents/plan-scope.js';
 import type { CheckInUrgency } from '../agents/check-ins.js';
@@ -585,141 +581,6 @@ function realtimeNumberEnv(name: string, fallback: number, min: number, max: num
   return Math.max(min, Math.min(max, parsed));
 }
 
-/**
- * Handle a `/goal <...>` slash command coming in through the streaming
- * chat endpoint. Streams progress events so the dashboard can render a
- * "Goal turn N/M" indicator and final summary inline.
- *
- * `status` / `clear` / `resume` are short-circuit responses. `start`
- * drives the Ralph loop in `goal-loop.ts`.
- */
-async function handleGoalCommand(opts: {
-  command: GoalCommand;
-  sessionId: string;
-  assistant: ClementineAssistant;
-  writeEvent: (event: Record<string, unknown>) => void;
-  shouldCancel: () => boolean;
-}): Promise<void> {
-  const { command, sessionId, assistant, writeEvent, shouldCancel } = opts;
-
-  if (command.kind === 'status') {
-    const state = loadGoalState(sessionId);
-    writeEvent({
-      type: 'done',
-      text: describeGoalState(state),
-      stoppedReason: 'success',
-    });
-    return;
-  }
-
-  if (command.kind === 'clear') {
-    const before = loadGoalState(sessionId);
-    clearGoalState(sessionId);
-    writeEvent({
-      type: 'done',
-      text: before
-        ? `Goal cleared: "${before.objective}" (was ${before.status} at ${before.turnsUsed}/${before.turnsLimit}).`
-        : 'No goal was active. Nothing to clear.',
-      stoppedReason: 'success',
-    });
-    return;
-  }
-
-  const existing = loadGoalState(sessionId);
-  const objective = command.kind === 'resume'
-    ? existing?.objective
-    : command.kind === 'start'
-      ? command.objective
-      : undefined;
-
-  if (!objective) {
-    writeEvent({
-      type: 'done',
-      text: 'No goal to resume in this session. Use `/goal <objective>` to start one.',
-      stoppedReason: 'success',
-    });
-    return;
-  }
-
-  if (command.kind === 'resume' && existing) {
-    writeEvent({
-      type: 'status',
-      text: `Resuming goal: "${objective}" (was at ${existing.turnsUsed}/${existing.turnsLimit}).`,
-    });
-  } else {
-    writeEvent({ type: 'status', text: `Starting goal: "${objective}"` });
-  }
-
-  const result = await runGoalLoop({
-    sessionId,
-    objective,
-    runtime: assistant.getRuntime(),
-    shouldCancel: () => shouldCancel(),
-    onTurnStart: ({ turn, total }) => {
-      writeEvent({
-        type: 'status',
-        text: `Goal turn ${turn}/${total}: thinking…`,
-        goalTurn: turn,
-        goalTotal: total,
-      });
-    },
-    onTurnEnd: ({ turn, done, reason }) => {
-      writeEvent({
-        type: 'status',
-        text: done
-          ? `Judge: complete after turn ${turn} (${reason}).`
-          : `Judge: not yet done after turn ${turn} (${reason}). Continuing…`,
-        goalTurn: turn,
-        goalJudgeDone: done,
-      });
-    },
-    driveAssistant: async (message) => {
-      // Each goal turn is a normal assistant.respond() call. The text
-      // we get back is what we'll surface as a chat turn.
-      const turnResponse = await assistant.respond({
-        message,
-        sessionId,
-        channel: 'cli',
-        userId: 'console',
-        onChunk: (delta) => {
-          writeEvent({ type: 'chunk', delta });
-        },
-        onToolActivity: (activity) => {
-          writeEvent({
-            type: 'tool',
-            toolName: activity.toolName,
-            input: activity.input,
-          });
-        },
-        shouldCancel: () => shouldCancel(),
-      });
-      // Emit a turn-boundary marker so the dashboard can visually
-      // separate goal turns in the same conversation thread.
-      writeEvent({
-        type: 'goal-turn-complete',
-        text: turnResponse.text,
-        pendingApprovalId: turnResponse.pendingApprovalId ?? null,
-        stoppedReason: turnResponse.stoppedReason ?? 'success',
-      });
-      return { text: turnResponse.text };
-    },
-  });
-
-  // Terminal event. The dashboard reads this to render the final
-  // affordance — "achieved" / "paused → resume?" / "budget-limited" /
-  // "unmet". Vocabulary mirrors OpenAI Codex CLI 0.128.0's /goal.
-  const finalText = describeGoalState(result);
-  writeEvent({
-    type: 'done',
-    text: finalText,
-    stoppedReason: result.status === 'achieved' ? 'success'
-      : result.status === 'paused' || result.status === 'budget-limited' ? 'max-turns-with-grace'
-      : 'cancelled',
-    turnsUsed: result.turnsUsed,
-    goalStatus: result.status,
-    goalObjective: result.objective,
-  });
-}
 
 function sanitizeWorkflowName(name: string): string {
   return name.replace(/[^a-zA-Z0-9_-]/g, '-').toLowerCase();
@@ -6531,6 +6392,25 @@ export function registerConsoleRoutes(
 
     setImmediate(async () => {
       try {
+        // /goal slash command (goal-contract P3): pin/inspect/cancel the
+        // session's parked goal. status/cancel are reply-only; start/resume
+        // swap the run input so work begins immediately on the normal loop.
+        const goalCmd = !intent ? parseGoalCommand(turnInput) : null;
+        let goalRunInput: string | null = null;
+        if (goalCmd) {
+          const outcome = handleGoalContractCommand({ command: goalCmd, sessionId, channel: 'desktop' });
+          if (!outcome.runInput) {
+            appendHarnessEvent({
+              sessionId,
+              turn: 0,
+              role: 'Clem',
+              type: 'conversation_completed',
+              data: { reason: 'goal_command', summary: outcome.reply, reply: outcome.reply, steps: 0 },
+            });
+            return;
+          }
+          goalRunInput = outcome.runInput;
+        }
         if (!intent) {
           const continuity = await routeOpenQuestionPlan({
             channel: 'desktop',
@@ -6568,7 +6448,9 @@ export function registerConsoleRoutes(
             } as any,
           });
         };
-        if (planFirst) {
+        // A /goal start already pinned its goal — skip plan-first and run
+        // the objective directly on the normal loop.
+        if (planFirst && !goalRunInput) {
           const preflight = await runPlanFirstPreflight({
             input: turnInput,
             sessionId,
@@ -6579,7 +6461,8 @@ export function registerConsoleRoutes(
           });
           if (preflight.surfaced) return;
         }
-        const agent = await buildOrchestratorAgent({ userInput: turnInput, sessionId });
+        const effectiveInput = goalRunInput ?? turnInput;
+        const agent = await buildOrchestratorAgent({ userInput: effectiveInput, sessionId });
         if (intent && harnessSession) {
           await runConversationFromResume({
             agent,
@@ -6590,7 +6473,7 @@ export function registerConsoleRoutes(
           });
           return;
         }
-        await runConversation({ agent, sessionId, input: turnInput, judgeCompletion: true, onChunk });
+        await runConversation({ agent, sessionId, input: effectiveInput, judgeCompletion: true, onChunk });
       } catch (err) {
         // The loop emits its own run_failed when a turn throws. If we
         // got here, the throw happened BEFORE any turn started
@@ -6643,20 +6526,6 @@ export function registerConsoleRoutes(
     };
 
     try {
-      // /goal slash-command interception. We do this BEFORE the normal
-      // respond() so the loop driver controls turn pacing + judging.
-      const goalCmd = parseGoalCommand(message);
-      if (goalCmd) {
-        await handleGoalCommand({
-          command: goalCmd,
-          sessionId,
-          assistant,
-          writeEvent,
-          shouldCancel: () => closed,
-        });
-        res.end();
-        return;
-      }
 
       writeEvent({ type: 'status', text: 'Clementine run started.' });
       const response = await assistant.respond({
@@ -6888,14 +6757,27 @@ export function registerConsoleRoutes(
   app.get('/api/console/home/goal-status', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
-      // Lazy-import to avoid pulling goal-loop into the top of this
-      // file just for one route; keeps the existing import graph stable.
-      const { loadGoalState } = await import('../agents/goal-loop.js');
+      // Goal-contract store read (goal-loop.ts deleted in goal-contract P3).
+      // Shape kept legacy-compatible for the home dock card.
+      const { getActiveGoalForSession } = await import('../agents/plan-proposals.js');
       const sessionId = typeof req.query.sessionId === 'string' && req.query.sessionId.trim()
         ? req.query.sessionId.trim().slice(0, 120)
         : 'console:home';
-      const state = loadGoalState(sessionId);
-      res.json({ goal: state });
+      const goal = getActiveGoalForSession(sessionId);
+      const plan = goal ? (goal.approvedPlan ?? goal.plan) : null;
+      res.json({
+        goal: goal && plan
+          ? {
+              sessionId,
+              objective: plan.objective,
+              status: 'pursuing',
+              turnsUsed: goal.attempt ?? 0,
+              turnsLimit: goal.maxAttempts ?? 3,
+              startedAt: goal.proposedAt,
+              updatedAt: goal.lastActivityAt ?? goal.proposedAt,
+            }
+          : null,
+      });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
