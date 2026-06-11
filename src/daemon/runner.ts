@@ -32,6 +32,7 @@ import { DISCORD_BOT_TOKEN, DISCORD_ENABLED, WEBHOOK_ENABLED, WEBHOOK_SECRET } f
 import { getOrRefreshScan as warmCliScan } from '../runtime/cli-discovery.js';
 import { closePlanScope, openPlanScope } from '../agents/plan-scope.js';
 import { processMemoryMaintenance } from '../memory/maintenance.js';
+import { reapStaleCheckIns } from '../agents/check-ins.js';
 import { embedQuery, isEmbeddingsEnabled } from '../memory/embeddings.js';
 import { runRecursiveReflection, consolidateActiveFacts } from '../memory/reflection.js';
 import { decayAndEvictFacts } from '../memory/facts.js';
@@ -957,6 +958,16 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
     }
   } catch (err) {
     logger.warn({ err }, 'Notification reap on boot failed');
+  }
+  // Same hygiene for open check-ins: an unanswered agent question whose
+  // work died weeks ago must not pin "Needs you" to Home forever.
+  try {
+    const closedCheckIns = reapStaleCheckIns();
+    if (closedCheckIns > 0) {
+      logger.info({ closedCheckIns }, 'Auto-closed stale open check-ins on boot');
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Check-in reap on boot failed');
   }
   // First-tick init: ensure built-in proactive check-in templates
   // exist on disk (disabled). Re-runs are no-ops because the seeder

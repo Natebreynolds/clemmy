@@ -24,6 +24,7 @@ import { createBackgroundTask } from '../execution/background-tasks.js';
 import { checkAllSkillUpdates } from '../runtime/skill-installer.js';
 import { addNotification, reapStaleNotifications } from '../runtime/notifications.js';
 import { reapExpiredGoals } from '../agents/plan-proposals.js';
+import { reapStaleCheckIns } from '../agents/check-ins.js';
 
 /**
  * Memory maintenance for the daemon tick.
@@ -474,6 +475,14 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
         }
       } catch (err) {
         logger.warn({ err }, 'notification reaper nightly job failed');
+      }
+      try {
+        const closedCheckIns = reapStaleCheckIns();
+        if (closedCheckIns > 0) {
+          logger.info({ closedCheckIns }, 'check-in reaper nightly job completed');
+        }
+      } catch (err) {
+        logger.warn({ err }, 'check-in reaper nightly job failed');
       }
     }
   }

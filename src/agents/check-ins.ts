@@ -304,6 +304,26 @@ export function answerCheckIn(id: string, answer: string): CheckInRecord | null 
   return updated;
 }
 
+/** Open check-ins older than this are dead — their executions are long gone
+ *  and the "Needs you" card goes nowhere (observed live: open questions from
+ *  May 14–28 pinned to Home for weeks with no dismiss path). */
+const STALE_CHECK_IN_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * Check-in hygiene (boot + nightly): closes open check-ins past the stale
+ * TTL with an audit closeReason. An answered/closed record is never touched.
+ */
+export function reapStaleCheckIns(nowMs: number = Date.now()): number {
+  let closed = 0;
+  for (const record of listCheckIns({ status: 'open' })) {
+    const at = Date.parse(record.askedAt);
+    if (!Number.isFinite(at) || nowMs - at <= STALE_CHECK_IN_MS) continue;
+    closeCheckIn(record.id, 'Auto-closed: question went unanswered past the 7-day TTL and its originating work is no longer active.');
+    closed += 1;
+  }
+  return closed;
+}
+
 export function closeCheckIn(id: string, reason = 'Dismissed by user.'): CheckInRecord | null {
   const existing = getCheckIn(id);
   if (!existing) return null;
