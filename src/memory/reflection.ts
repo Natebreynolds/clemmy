@@ -187,7 +187,7 @@ function readDisableFlag(): boolean {
 // reflectable — they surface real user/external content.
 const SELF_TOOL_DENY_EXACT = new Set<string>([
   'recall_tool_result', 'tool_output_query',
-  'draft_plan', 'task_list', 'task_get', 'task_create', 'task_update', 'active_task',
+  'draft_plan', 'task_list', 'task_get', 'task_create', 'task_update',
   'workflow_get', 'workflow_list', 'workflow_schedule',
 ]);
 const SELF_TOOL_DENY_PREFIXES = ['memory_', 'background_task', 'execution_'];

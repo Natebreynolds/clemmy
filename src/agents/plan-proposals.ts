@@ -673,6 +673,24 @@ export function createDirectGoal(input: {
   return activateGoal(proposal.id, { origin: { kind: 'chat' }, maxAttempts: input.maxAttempts });
 }
 
+/**
+ * Render the origin session's parked goal for DELEGATED work (sub-agents,
+ * background tasks) — the replacement for the deleted Active Task pin.
+ * Origin-keyed only; returns undefined when the session has no active goal,
+ * so delegated prompts stay byte-identical for goal-less sessions.
+ */
+export function getGoalPinForDelegation(originSessionId: string): string | undefined {
+  if (!originSessionId) return undefined;
+  const goal = getActiveGoalForSession(originSessionId);
+  if (!goal) return undefined;
+  const plan = goal.approvedPlan ?? goal.plan;
+  const criteria = (plan.successCriteria ?? []).map((c) => c.trim()).filter(Boolean);
+  return [
+    `Pinned goal (origin conversation): ${plan.objective}`,
+    criteria.length > 0 ? `Success criteria:\n${criteria.map((c, i) => `${i + 1}. ${c}`).join('\n')}` : '',
+  ].filter(Boolean).join('\n');
+}
+
 /** Restart-resume seam: every active goal across all sessions. */
 export function listActiveGoalContracts(): PlanProposal[] {
   return listPlanProposals({ status: 'all' }).filter((p) => p.status === 'active');

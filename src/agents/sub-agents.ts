@@ -7,7 +7,7 @@ import { getOrCreateExternalMcpServers } from '../runtime/mcp-servers.js';
 import type { McpToolScope } from '../runtime/mcp-tool-scope.js';
 import type { RuntimeContextValue } from '../types.js';
 import { wrapToolForHarness, type WrappableTool } from '../runtime/harness/brackets.js';
-import { getActiveTaskForDelegation } from '../memory/working-memory.js';
+import { getGoalPinForDelegation } from './plan-proposals.js';
 import { sessionIdFromRunContext } from '../runtime/harness/tool-output-context.js';
 
 /**
@@ -130,15 +130,15 @@ export async function buildWorkerAgent(options: { mcpToolScope?: McpToolScope } 
     name: 'Worker',
     handoffDescription: 'Stateless per-item worker. Use via run_worker tool for parallel fan-out.',
     // Instructions are a FUNCTION so a worker fanned out from a chat session
-    // inherits that session's pinned Active Task (the SDK passes runContext to
-    // the instructions fn). Keyed by the parent run context's sessionId — never
-    // the global file — so no unrelated session's list can leak in. Zero-width
-    // (base instructions) when there's no live pin for the session.
+    // inherits that session's parked GOAL (goal-contract P3 — replaced the
+    // Active Task pin). Keyed by the parent run context's sessionId — never
+    // a global — so no unrelated session's goal can leak in. Zero-width
+    // (base instructions) when the session has no active goal.
     instructions: (runContext) => {
       try {
-        const pin = getActiveTaskForDelegation(sessionIdFromRunContext(runContext) ?? '');
+        const pin = getGoalPinForDelegation(sessionIdFromRunContext(runContext) ?? '');
         if (pin) {
-          return `${baseInstructions}\n\n## Pinned Constraint (from the session that started this work — act on EXACTLY this target; do NOT re-discover or substitute a different list)\n${pin}`;
+          return `${baseInstructions}\n\n## Pinned Goal (from the session that started this work — work toward EXACTLY this; do NOT re-discover or substitute a different target)\n${pin}`;
         }
       } catch {
         // best-effort enrichment; never break worker construction.

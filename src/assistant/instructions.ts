@@ -33,11 +33,6 @@ function section(title: string, body?: string): string {
 /** Pull the pinned "## Active Task" block out of the working-memory string, if
  *  present, so it can be surfaced even on a light (casual/meta) turn where the
  *  rest of working memory is intentionally withheld. */
-function extractActiveTaskBlock(workingMemory?: string): string | undefined {
-  if (!workingMemory) return undefined;
-  const match = workingMemory.match(/## Active Task[\s\S]*?(?=\n## |$)/);
-  return match ? match[0].trim() : undefined;
-}
 
 interface GoalSummary {
   id: string;
@@ -284,7 +279,7 @@ export function buildAssistantInstructions(context: MemoryContext, channel?: str
   const toolBehavior = 'Tools have real schemas. Just call them when the work fits. The runtime classifies each call (read/write/execute/send/admin) and applies the trust gradient automatically — do not pre-ask "want me to proceed?" for reads or for actions inside the user\'s current scope policy. If a call fails, report the real error and propose a fix.';
   const clarify = 'Ask ONE clarifying question only when two interpretations lead to materially different work AND guessing wrong means redoing it. Otherwise pick the obvious option, mention it, and proceed. Never re-ask a clarification the user already answered ("yes", "go ahead", "default is fine") — act on the answer.';
   const executeDirective = EXECUTE_DIRECTIVE;
-  const capture = 'Persist durable signals as they appear: `memory_remember` for facts/preferences that should carry across sessions; `user_profile_update` for how-to-communicate preferences (tone, timezone, hours, addressing); `propose_check_in_template` for recurring rhythms the user describes ("every Friday I deploy"). When the user names a concrete target for a pending action — a list/sheet/doc, a recipient set, a count, an "only these" scope — that you must hold across a long conversation (e.g. while drafting the email copy), pin it with `active_task`; when you execute, act on THAT pinned target — pull from its exact reference, do not re-discover or search for a list — and `active_task` action:"clear" once it is done. Don\'t announce these writes; behave better next turn.';
+  const capture = 'Persist durable signals as they appear: `memory_remember` for facts/preferences that should carry across sessions; `user_profile_update` for how-to-communicate preferences (tone, timezone, hours, addressing); `propose_check_in_template` for recurring rhythms the user describes ("every Friday I deploy"). Don\'t announce these writes; behave better next turn.';
   const handoffs = [
     'You orchestrate sub-agents. Hand off when the work fits a specialist:',
     '- Researcher: gather information, read-only.',
@@ -373,8 +368,7 @@ export function buildTurnContextBlock(context: MemoryContext, intent?: MessageIn
     // A pinned Active Task is binding even on a casual/approval turn ("ok",
     // "go ahead") — surface it so the model never acts blind to the list it
     // was told to use. Other working-memory content stays out on light turns.
-    const activeTask = extractActiveTaskBlock(context.workingMemory);
-    return activeTask ? `${activeTask}\n\n${pointer}` : pointer;
+    return pointer;
   }
   const objective = getRecallObjective(message);
   const { recentlyLearned, toolChoices } = renderLearnedBlocks(objective);

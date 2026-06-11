@@ -188,16 +188,7 @@ export interface MemoryBudget {
 
 export function memoryBudgetFor(
   intent: MessageIntent,
-  ctx?: { hasActiveTaskSpec?: boolean },
 ): MemoryBudget {
-  // A binding task spec exists for this session — never drop working memory on
-  // a bare acknowledgement / approval turn ("ok", "perfect"), or the model acts
-  // blind to the list it was just told to use. Load working memory only; vault
-  // search + session brief stay off so this is NOT the firehose. Gated on
-  // spec-existence so the common casual/meta turn stays byte-identical.
-  if (ctx?.hasActiveTaskSpec && (intent === 'casual' || intent === 'meta_clarify')) {
-    return { loadWorkingMemory: true, loadSessionBrief: false, vaultSearchTopK: 0, vaultFormatBytes: 0 };
-  }
   switch (intent) {
     case 'casual':
       return { loadWorkingMemory: false, loadSessionBrief: false, vaultSearchTopK: 0, vaultFormatBytes: 0 };

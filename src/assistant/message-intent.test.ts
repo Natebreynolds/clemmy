@@ -145,29 +145,6 @@ test('memoryBudgetFor: tool_intent loads moderate context', () => {
   assert.ok(b.vaultSearchTopK < memoryBudgetFor('action').vaultSearchTopK + 1);
 });
 
-// ─── Active Task spec override ─────────────────────────────────
-
-test('memoryBudgetFor: casual with no ctx is byte-identical (common case unchanged)', () => {
-  assert.deepEqual(memoryBudgetFor('casual'), {
-    loadWorkingMemory: false, loadSessionBrief: false, vaultSearchTopK: 0, vaultFormatBytes: 0,
-  });
-  assert.deepEqual(memoryBudgetFor('casual', {}), memoryBudgetFor('casual'));
-  assert.deepEqual(memoryBudgetFor('casual', { hasActiveTaskSpec: false }), memoryBudgetFor('casual'));
-});
-
-test('memoryBudgetFor: casual WITH an active task spec loads working memory (not the firehose)', () => {
-  const b = memoryBudgetFor('casual', { hasActiveTaskSpec: true });
-  assert.equal(b.loadWorkingMemory, true, 'binding spec stays visible on the approval turn');
-  assert.equal(b.vaultSearchTopK, 0, 'vault search stays off — not the firehose');
-  assert.equal(b.loadSessionBrief, false);
-});
-
-test('memoryBudgetFor: meta_clarify WITH a spec loads working memory; action unaffected', () => {
-  assert.equal(memoryBudgetFor('meta_clarify', { hasActiveTaskSpec: true }).loadWorkingMemory, true);
-  // The override only touches casual/meta turns; action already loads WM.
-  assert.deepEqual(memoryBudgetFor('action', { hasActiveTaskSpec: true }), memoryBudgetFor('action'));
-});
-
 // ─── reasons ───────────────────────────────────────────────────
 
 test('classifier returns human-readable reasons', () => {

@@ -291,7 +291,7 @@ test('isSelfReferentialTool: denies Clementine introspective tools, keeps real-d
     'memory_read', 'memory_recall', 'memory_search', 'memory_search_facts',
     'memory_list_facts', 'memory_remember', 'memory_forget',
     'recall_tool_result', 'tool_output_query', 'draft_plan',
-    'task_list', 'task_get', 'task_create', 'task_update', 'active_task',
+    'task_list', 'task_get', 'task_create', 'task_update',
     'workflow_get', 'workflow_list', 'workflow_schedule',
     'background_task_status', 'execution_get', 'execution_list',
     'MEMORY_READ', // case-insensitive

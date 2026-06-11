@@ -86,7 +86,7 @@ export function isPromotableTool(name: string): boolean {
   // Stable scaffolding/plumbing families: memory, recall, active-task,
   // execution-tracking (execution_create/update_step/complete/list/get), and
   // tool-choice memory. None are workflow ACTIONS.
-  if (/^(memory_|recall|active_task|execution_|tool_choice)/.test(name)) return false;
+  if (/^(memory_|recall|execution_|tool_choice)/.test(name)) return false;
   return true;
 }
 
