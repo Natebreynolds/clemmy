@@ -1,9 +1,40 @@
 import { Agent, Runner } from '@openai/agents';
 import { z } from 'zod';
 import { MODELS } from '../../config.js';
-import { JUDGE_SYSTEM_PROMPT } from '../../agents/goal-loop.js';
 import type { RuntimeContextValue } from '../../types.js';
 import { normalizeZodForCodexStrict } from '../schema-normalizer.js';
+
+/**
+ * Judge system prompt — modeled on OpenAI Codex's continuation.md auditor
+ * pattern (Codex CLI 0.128.0, April 2026): "Do not accept proxy signals as
+ * completion by themselves. Build an audit checklist mapping requirements →
+ * verifiable evidence before marking done."
+ *
+ * Canonical home (goal-contract Phase 1): this prompt used to live in the
+ * legacy /goal loop (agents/goal-loop.ts, scheduled for deletion in Phase 3),
+ * which now imports it from here — the dependency was flipped so deleting the
+ * legacy loop doesn't orphan the judge.
+ */
+export const JUDGE_SYSTEM_PROMPT = [
+  'You are a goal-completion judge. You receive (1) a user objective and (2) the most recent assistant response.',
+  '',
+  'Use an AUDIT CHECKLIST: enumerate the concrete, verifiable deliverables the objective implies, then check each one against the assistant\'s response.',
+  '',
+  'Rules:',
+  '- A deliverable counts as complete only when the response contains VERIFIABLE EVIDENCE (a URL, a file path, a quoted result, an emitted artifact) — not a promise or summary of what was done.',
+  '- Do NOT accept proxy signals (e.g. "I have updated the records", "task complete", "✓") as completion by themselves. Require the artifact or its output.',
+  '- A plan, intention, or "I will work on this next" is NOT complete.',
+  '- Partial completion of multiple deliverables is NOT complete unless the objective only asked for one.',
+  '- HONEST BLOCKER: if the response delivers the results it COULD produce AND explicitly names the specific part it could not, with a concrete reason that part is genuinely blocked (a named tool/endpoint unavailable, a record/field that does not exist, access denied), treat that as DONE — do NOT demand it retry a capability that is genuinely unavailable. Mark not-done ONLY when the assistant could plausibly still finish with the tools it has (it punted, guessed, promised, or stopped without actually trying).',
+  '- If the objective is ambiguous, lean toward not-done so the user can clarify rather than the loop terminating prematurely.',
+  '',
+  'Output ONLY a JSON object on one line with no prose: {"done": <boolean>, "reason": "<one short sentence naming the missing evidence or the artifact that satisfied the objective>"}.',
+  '',
+  'Examples:',
+  '  {"done": true, "reason": "Spreadsheet created at /Users/me/Q3.xlsx with URL returned"}',
+  '  {"done": false, "reason": "Assistant proposed steps but no artifact or URL was produced"}',
+  '  {"done": false, "reason": "Two of three deliverables remain — emails drafted but no send confirmation evidence"}',
+].join('\n');
 
 /**
  * Independent objective-completion judge for the chat continuation loop.
@@ -169,6 +200,30 @@ export function buildObjectiveJudgePrompt(
   }
   parts.push('', 'Audit it against the objective and respond with the structured verdict.');
   return parts.join('\n');
+}
+
+/**
+ * STRICT judge variant (goal-contract Phase 1): same audit-checklist judge,
+ * but infra failures THROW instead of resolving to done. Goal validation
+ * fails open in the OPPOSITE direction from the chat gate — a dead judge
+ * must never auto-satisfy a parked goal — so the caller (goal-validate.ts)
+ * catches the throw and resolves to not-passed + judgeFailedOpen.
+ */
+export async function judgeObjectiveCompleteStrict(
+  objective: string,
+  assistantResponse: string,
+  skillContext?: SkillExecutionContext,
+): Promise<ObjectiveJudgeVerdict> {
+  if (!objective.trim() || !assistantResponse.trim()) {
+    throw new Error('insufficient text to judge');
+  }
+  const runner = new Runner({ workflowName: 'clementine-objective-judge' });
+  const result = await runner.run(buildJudgeAgent(), buildObjectiveJudgePrompt(objective, assistantResponse, skillContext), {
+    maxTurns: 1,
+  });
+  const parsed = VerdictSchema.safeParse(result.finalOutput);
+  if (!parsed.success) throw new Error('judge output did not parse');
+  return { done: parsed.data.done, reason: parsed.data.reason };
 }
 
 /**

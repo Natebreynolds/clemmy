@@ -23,6 +23,7 @@ import { startCanonicalTranscriptBackfill } from '../integrations/recall/backfil
 import { createBackgroundTask } from '../execution/background-tasks.js';
 import { checkAllSkillUpdates } from '../runtime/skill-installer.js';
 import { addNotification } from '../runtime/notifications.js';
+import { reapExpiredGoals } from '../agents/plan-proposals.js';
 
 /**
  * Memory maintenance for the daemon tick.
@@ -101,6 +102,7 @@ interface MemoryMaintenanceState {
   lastSkillUpdateFireDay?: string;
   lastBackupDay?: string;
   lastMergeDay?: string;
+  lastGoalReapDay?: string;
 }
 const MAINTENANCE_STATE_FILE = path.join(STATE_DIR, 'memory-maintenance-state.json');
 
@@ -148,6 +150,13 @@ const MEMORY_BACKUP_RETAIN = 7;
 // Runs once per local day at 4:45, after backup. Fully reversible via audit log.
 const MEMORY_MERGE_NIGHTLY_HOUR = 4;
 const MEMORY_MERGE_NIGHTLY_MINUTE = 45; // offset from backup's 4:30
+
+// Goal-contract reaper (GOAL-CONTRACT-PLAN.md Phase 1) — daily goal hygiene:
+// chat-origin active goals idle >24h expire (one inbox note when mid-flight),
+// workflow-origin goals are exempt, terminal records >7d purge. Runs at 5:00,
+// offset from the merge's 4:45.
+const GOAL_REAP_NIGHTLY_HOUR = 5;
+const GOAL_REAP_NIGHTLY_MINUTE = 0;
 
 // Tier C3 — episodic_pointers TTL reaper cadence (~1h, same as the
 // tool_outputs reaper it shadows).
@@ -425,6 +434,23 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
         }
       } catch (err) {
         logger.warn({ err }, 'paraphrase merge nightly job failed');
+      }
+    }
+  }
+
+  // Goal-contract reaper at 5:00 AM local (GOAL-CONTRACT-PLAN.md Phase 1).
+  // Same fire-once-per-day persisted dedupe as the jobs above.
+  if (isAtOrAfterDailyTime(now, GOAL_REAP_NIGHTLY_HOUR, GOAL_REAP_NIGHTLY_MINUTE)) {
+    if (maintenanceState.lastGoalReapDay !== today) {
+      maintenanceState.lastGoalReapDay = today;
+      writeMaintenanceState(maintenanceState);
+      try {
+        const stats = reapExpiredGoals(now);
+        if (stats.expired > 0 || stats.purged > 0) {
+          logger.info({ stats }, 'goal reaper nightly job completed');
+        }
+      } catch (err) {
+        logger.warn({ err }, 'goal reaper nightly job failed');
       }
     }
   }

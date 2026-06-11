@@ -39,7 +39,33 @@ const logger = pino({ name: 'clementine-next.plan-proposals' });
 
 const PROPOSALS_DIR = path.join(BASE_DIR, 'state', 'plan-proposals');
 
-export type PlanProposalStatus = 'pending' | 'approved' | 'rejected' | 'superseded';
+export type PlanProposalStatus =
+  | 'pending' | 'approved' | 'rejected' | 'superseded'
+  // Goal-contract lifecycle (GOAL-CONTRACT-PLAN.md): an approved plan that has
+  // been ACTIVATED becomes the session's parked goal — the harness re-injects
+  // it each turn and validates completion against it externally. Vocabulary
+  // ported from the legacy /goal loop: pursuing→active, achieved→satisfied,
+  // budget-limited→expired(reason).
+  | 'active' | 'satisfied' | 'expired';
+
+/** One validation finding, per criterion, per attempt. */
+export interface GoalEvidence {
+  at: string;
+  attempt: number;
+  criterion: string;
+  pass: boolean;
+  /** How the criterion was checked (deterministic check vs LLM judge). */
+  method?: 'deterministic' | 'judge' | 'skipped';
+  detail?: string;
+}
+
+/** Where a goal contract came from. Chat goals are session-pinned and subject
+ *  to the daily idle reaper; workflow goals live and die with their run. */
+export interface GoalOrigin {
+  kind: 'chat' | 'workflow';
+  runId?: string;
+  stepId?: string;
+}
 
 export interface PlanProposal {
   id: string;
@@ -80,6 +106,21 @@ export interface PlanProposal {
   requiredInputs?: string[];
   /** workflow_pending_inputs: inputs accumulated so far across replies. */
   pendingInputValues?: Record<string, string>;
+  // ── Goal-contract fields (present only once a proposal is ACTIVATED) ──
+  /** Where the goal came from; absent ⇒ treated as chat-origin. */
+  origin?: GoalOrigin;
+  /** Validation attempts consumed so far. */
+  attempt?: number;
+  /** Attempt ceiling before the loop escalates instead of retrying. */
+  maxAttempts?: number;
+  /** Validation findings, per criterion, per attempt (append-only). */
+  evidence?: GoalEvidence[];
+  /** Compact harness-curated "done so far" lines re-injected each turn. */
+  progressLedger?: string[];
+  /** Bumped on every goal touch; drives the idle reaper TTL. */
+  lastActivityAt?: string;
+  /** Why the goal reached `satisfied` / `expired`. */
+  doneReason?: string;
   version: 'v1';
 }
 
@@ -495,4 +536,211 @@ export function supersedePlanProposal(id: string, replacedBy?: string): PlanProp
   };
   writeProposal(resolved);
   return resolved;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Goal contracts (GOAL-CONTRACT-PLAN.md, Phase 1)
+//
+// The parked-goal substrate: an approved plan (or a /goal objective) becomes
+// the session's ACTIVE goal contract. The harness re-injects it fresh every
+// iteration (the model rents the goal, never owns it) and completion is
+// validated externally against the PARKED successCriteria — the model saying
+// "done" is a trigger to validate, never the verdict.
+//
+// This is the SAME store as plan proposals — statuses on one record, one
+// lifecycle: proposed → active → satisfied | expired | superseded. It absorbs
+// the legacy /goal GoalState (status vocabulary ported; the JSON-file store in
+// state/goals/ is deleted in Phase 3) and replaces the Active Task delegation
+// pin (Phase 3). Do not add a parallel mechanism.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Idle TTL for chat-origin goals: no activity for this long → expired. */
+const GOAL_IDLE_TTL_MS = 24 * 60 * 60 * 1000; // 24h
+/** Terminal goal records (satisfied/expired) older than this are purged. */
+const GOAL_TERMINAL_PURGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+/** Default validation-attempt ceiling before the loop escalates. */
+export const GOAL_DEFAULT_MAX_ATTEMPTS = 3;
+
+export interface ActivateGoalOptions {
+  origin?: GoalOrigin;
+  maxAttempts?: number;
+}
+
+/**
+ * Transition an `approved` (or, for /goal-created contracts, `pending`)
+ * proposal into the session's ACTIVE goal. Enforces ONE active goal per
+ * session: any other active goal on the same session is marked superseded —
+ * never silently stacked. Returns null when the proposal is missing or not
+ * in an activatable state.
+ */
+export function activateGoal(id: string, options: ActivateGoalOptions = {}): PlanProposal | null {
+  const proposal = readProposal(id);
+  if (!proposal) return null;
+  if (proposal.status !== 'approved' && proposal.status !== 'pending') return null;
+  if (planProposalNeedsUserInput(proposal)) return null;
+
+  // One active goal per session — supersede the rest explicitly.
+  if (proposal.sessionId) {
+    for (const other of listPlanProposals({ status: 'active', sessionId: proposal.sessionId })) {
+      if (other.id === id) continue;
+      writeProposal({
+        ...other,
+        status: 'superseded',
+        resolvedAt: new Date().toISOString(),
+        resolvedBy: 'system',
+        rejectionReason: `Superseded by goal ${id}`,
+      });
+      logger.info({ superseded: other.id, by: id, sessionId: proposal.sessionId }, 'active goal superseded by new goal');
+    }
+  }
+
+  const now = new Date().toISOString();
+  const active: PlanProposal = {
+    ...proposal,
+    status: 'active',
+    origin: options.origin ?? proposal.origin ?? { kind: 'chat' },
+    attempt: proposal.attempt ?? 0,
+    maxAttempts: options.maxAttempts ?? proposal.maxAttempts ?? GOAL_DEFAULT_MAX_ATTEMPTS,
+    evidence: proposal.evidence ?? [],
+    progressLedger: proposal.progressLedger ?? [],
+    lastActivityAt: now,
+  };
+  writeProposal(active);
+  logger.info({ goalId: id, sessionId: proposal.sessionId, origin: active.origin?.kind }, 'goal contract activated');
+  return active;
+}
+
+/** The session's current parked goal, if any. Newest wins if several exist
+ *  (shouldn't happen — activateGoal supersedes — but be deterministic). */
+export function getActiveGoalForSession(sessionId: string): PlanProposal | null {
+  if (!sessionId) return null;
+  const active = listPlanProposals({ status: 'active', sessionId, limit: 1 });
+  return active[0] ?? null;
+}
+
+/** Restart-resume seam: every active goal across all sessions. */
+export function listActiveGoalContracts(): PlanProposal[] {
+  return listPlanProposals({ status: 'all' }).filter((p) => p.status === 'active');
+}
+
+/**
+ * Bump a goal's activity stamp and optionally append a progress-ledger line.
+ * The ledger is the compact "done so far" digest the harness re-injects each
+ * iteration instead of letting the transcript accumulate.
+ */
+export function touchGoalActivity(id: string, ledgerLine?: string): PlanProposal | null {
+  const proposal = readProposal(id);
+  if (!proposal || proposal.status !== 'active') return null;
+  const updated: PlanProposal = {
+    ...proposal,
+    lastActivityAt: new Date().toISOString(),
+    ...(ledgerLine && ledgerLine.trim().length > 0
+      ? { progressLedger: [...(proposal.progressLedger ?? []), ledgerLine.trim()].slice(-20) }
+      : {}),
+  };
+  writeProposal(updated);
+  return updated;
+}
+
+/**
+ * Append a validation attempt's evidence and bump the attempt counter.
+ * Returns the updated record; the caller decides continue / escalate from
+ * `attempt >= maxAttempts`.
+ */
+export function recordGoalValidation(id: string, evidence: GoalEvidence[]): PlanProposal | null {
+  const proposal = readProposal(id);
+  if (!proposal || proposal.status !== 'active') return null;
+  const updated: PlanProposal = {
+    ...proposal,
+    attempt: (proposal.attempt ?? 0) + 1,
+    evidence: [...(proposal.evidence ?? []), ...evidence].slice(-100),
+    lastActivityAt: new Date().toISOString(),
+  };
+  writeProposal(updated);
+  return updated;
+}
+
+/** External validation passed — the goal is done. */
+export function satisfyGoal(id: string, reason?: string): PlanProposal | null {
+  const proposal = readProposal(id);
+  if (!proposal || proposal.status !== 'active') return null;
+  const resolved: PlanProposal = {
+    ...proposal,
+    status: 'satisfied',
+    resolvedAt: new Date().toISOString(),
+    resolvedBy: 'system',
+    doneReason: reason?.trim() || undefined,
+  };
+  writeProposal(resolved);
+  logger.info({ goalId: id, sessionId: proposal.sessionId }, 'goal contract satisfied');
+  return resolved;
+}
+
+/** Terminal stop without completion (idle TTL, budget exhaustion, user cancel). */
+export function expireGoal(id: string, reason?: string): PlanProposal | null {
+  const proposal = readProposal(id);
+  if (!proposal || proposal.status !== 'active') return null;
+  const resolved: PlanProposal = {
+    ...proposal,
+    status: 'expired',
+    resolvedAt: new Date().toISOString(),
+    resolvedBy: 'system',
+    doneReason: reason?.trim() || undefined,
+  };
+  writeProposal(resolved);
+  logger.info({ goalId: id, sessionId: proposal.sessionId, reason }, 'goal contract expired');
+  return resolved;
+}
+
+export interface GoalReapStats {
+  expired: number;
+  purged: number;
+  notified: number;
+}
+
+/**
+ * Daily goal hygiene (wired to the nightly maintenance tick):
+ *  - chat-origin ACTIVE goals idle past the 24h TTL → expired. A goal that
+ *    was mid-flight (validation attempts or ledger progress) gets ONE inbox
+ *    note so unfinished work never vanishes silently; an untouched goal
+ *    sweeps silently.
+ *  - workflow-origin goals are EXEMPT — they live and die with their run.
+ *  - terminal goal records (satisfied/expired) older than 7 days are purged.
+ *    Only goal-lifecycle statuses are touched; pending/approved/rejected/
+ *    superseded proposals keep their existing behavior untouched.
+ */
+export function reapExpiredGoals(now: Date = new Date()): GoalReapStats {
+  const stats: GoalReapStats = { expired: 0, purged: 0, notified: 0 };
+  for (const p of listPlanProposals({ status: 'all' })) {
+    if (p.status === 'active') {
+      if ((p.origin?.kind ?? 'chat') === 'workflow') continue; // run-owned
+      const last = Date.parse(p.lastActivityAt ?? p.proposedAt);
+      if (!Number.isFinite(last) || now.getTime() - last < GOAL_IDLE_TTL_MS) continue;
+      const wasMidFlight = (p.attempt ?? 0) > 0 || (p.progressLedger?.length ?? 0) > 0;
+      expireGoal(p.id, 'idle past 24h TTL');
+      stats.expired += 1;
+      if (wasMidFlight) {
+        addNotification({
+          id: `${Date.now()}-goal-expired-${p.id}`,
+          kind: 'system',
+          title: `Goal expired incomplete: ${truncateForNotification(p.plan.objective, 80)}`,
+          body: `This goal went idle for over a day and was set aside with work still in progress. Say "continue" in that conversation to revive it, or let it go.`,
+          createdAt: now.toISOString(),
+          read: false,
+          metadata: { planProposalId: p.id, sessionId: p.sessionId, kind: 'goal_expired' },
+        });
+        stats.notified += 1;
+      }
+    } else if (p.status === 'satisfied' || p.status === 'expired') {
+      const resolved = Date.parse(p.resolvedAt ?? p.proposedAt);
+      if (Number.isFinite(resolved) && now.getTime() - resolved > GOAL_TERMINAL_PURGE_MS) {
+        deletePlanProposal(p.id);
+        stats.purged += 1;
+      }
+    }
+  }
+  if (stats.expired > 0 || stats.purged > 0) {
+    logger.info({ stats }, 'goal reaper pass completed');
+  }
+  return stats;
 }

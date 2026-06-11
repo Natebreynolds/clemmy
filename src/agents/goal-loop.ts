@@ -28,6 +28,11 @@ import path from 'node:path';
 import pino from 'pino';
 import { BASE_DIR, MODELS } from '../config.js';
 import type { AgentRuntime } from '../runtime/provider.js';
+// Goal-contract Phase 1 dependency flip: the judge prompt's canonical home is
+// the harness objective-judge (this legacy loop is deleted in Phase 3, so it
+// imports the prompt rather than owning it). Re-exported for back-compat.
+import { JUDGE_SYSTEM_PROMPT } from '../runtime/harness/objective-judge.js';
+export { JUDGE_SYSTEM_PROMPT } from '../runtime/harness/objective-judge.js';
 
 const logger = pino({ name: 'clementine-next.goal-loop' });
 
@@ -166,39 +171,6 @@ interface JudgeResult {
   parseFailed: boolean;
 }
 
-/**
- * Judge system prompt — modeled on OpenAI Codex's continuation.md
- * auditor pattern (Codex CLI 0.128.0, April 2026). The Codex prompt
- * explicitly tells the agent: "Do not accept proxy signals as
- * completion by themselves. Build an audit checklist mapping
- * requirements → verifiable evidence before marking done."
- *
- * The audit-checklist framing is meaningfully stronger than a generic
- * "is this done?" because it forces the judge to enumerate concrete
- * deliverables and check evidence for each — which is the dimension
- * a confident-sounding but incomplete assistant response usually
- * fails on.
- */
-export const JUDGE_SYSTEM_PROMPT = [
-  'You are a goal-completion judge. You receive (1) a user objective and (2) the most recent assistant response.',
-  '',
-  'Use an AUDIT CHECKLIST: enumerate the concrete, verifiable deliverables the objective implies, then check each one against the assistant\'s response.',
-  '',
-  'Rules:',
-  '- A deliverable counts as complete only when the response contains VERIFIABLE EVIDENCE (a URL, a file path, a quoted result, an emitted artifact) — not a promise or summary of what was done.',
-  '- Do NOT accept proxy signals (e.g. "I have updated the records", "task complete", "✓") as completion by themselves. Require the artifact or its output.',
-  '- A plan, intention, or "I will work on this next" is NOT complete.',
-  '- Partial completion of multiple deliverables is NOT complete unless the objective only asked for one.',
-  '- HONEST BLOCKER: if the response delivers the results it COULD produce AND explicitly names the specific part it could not, with a concrete reason that part is genuinely blocked (a named tool/endpoint unavailable, a record/field that does not exist, access denied), treat that as DONE — do NOT demand it retry a capability that is genuinely unavailable. Mark not-done ONLY when the assistant could plausibly still finish with the tools it has (it punted, guessed, promised, or stopped without actually trying).',
-  '- If the objective is ambiguous, lean toward not-done so the user can clarify rather than the loop terminating prematurely.',
-  '',
-  'Output ONLY a JSON object on one line with no prose: {"done": <boolean>, "reason": "<one short sentence naming the missing evidence or the artifact that satisfied the objective>"}.',
-  '',
-  'Examples:',
-  '  {"done": true, "reason": "Spreadsheet created at /Users/me/Q3.xlsx with URL returned"}',
-  '  {"done": false, "reason": "Assistant proposed steps but no artifact or URL was produced"}',
-  '  {"done": false, "reason": "Two of three deliverables remain — emails drafted but no send confirmation evidence"}',
-].join('\n');
 
 async function callJudge(
   runtime: AgentRuntime,
