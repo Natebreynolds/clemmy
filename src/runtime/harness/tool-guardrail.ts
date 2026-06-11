@@ -68,6 +68,7 @@ function rehydrateFromSqlite(sessionId: string): SessionTrackerState | null {
   // identical to a session that's been running in-process.
   const countBySignature = new Map<string, number>();
   const distinctArgsByMutTool = new Map<string, Set<string>>();
+  const distinctArgsByFanoutKey = new Map<string, Set<string>>();
   for (const call of recent) {
     countBySignature.set(call.signature, (countBySignature.get(call.signature) ?? 0) + 1);
     if (MUTATING_TOOLS.has(call.toolName)) {
@@ -78,8 +79,16 @@ function rehydrateFromSqlite(sessionId: string): SessionTrackerState | null {
       }
       set.add(call.signature);
     }
+    if (call.fanoutKey) {
+      let set = distinctArgsByFanoutKey.get(call.fanoutKey);
+      if (!set) {
+        set = new Set();
+        distinctArgsByFanoutKey.set(call.fanoutKey, set);
+      }
+      set.add(call.signature);
+    }
   }
-  return { recent, countBySignature, distinctArgsByMutTool };
+  return { recent, countBySignature, distinctArgsByMutTool, distinctArgsByFanoutKey };
 }
 
 function persistTracker(sessionId: string, tracker: SessionTrackerState): void {
@@ -171,6 +180,30 @@ function isMutatingCall(toolName: string, args: unknown): boolean {
   return MUTATING_TOOLS.has(toolName);
 }
 
+/** Slug-specific batch-API hints for the fan-out nudge. When the serialized
+ *  slug has a REAL batch shape, naming it beats the generic advice — the live
+ *  2026-06-11 run posted 25 DataForSEO tasks one TASK_POST at a time even
+ *  though the endpoint accepts a `tasks` array. Checked in order; first match
+ *  wins. Keep entries few and certain — a wrong hint is worse than none. */
+const BATCH_API_HINTS: Array<{ test: (slug: string) => boolean; hint: string }> = [
+  {
+    test: (s) => s.startsWith('DATAFORSEO_') && s.includes('TASK_POST'),
+    hint: 'NOTE: this DataForSEO endpoint accepts a `tasks` ARRAY — post ALL remaining items in ONE call.',
+  },
+  {
+    test: (s) => s.startsWith('DATAFORSEO_') && (s.includes('TASK_GET') || s.includes('_BY_ID')),
+    hint: 'NOTE: DataForSEO has a TASKS_READY endpoint — poll it ONCE to list all completed task ids instead of polling each id separately.',
+  },
+  {
+    test: (s) => /^AIRTABLE_(CREATE|UPDATE|DELETE)_RECORDS$/.test(s),
+    hint: 'NOTE: this Airtable endpoint accepts a `records` ARRAY (up to 10 per call) — batch the remaining rows.',
+  },
+];
+
+function batchApiHintFor(slug: string): string | undefined {
+  return BATCH_API_HINTS.find((h) => h.test(slug))?.hint;
+}
+
 /** Slug-aware: a composio read slug is idempotent (looping is legitimate). */
 function isIdempotentCall(toolName: string, args: unknown): boolean {
   if (toolName === 'composio_execute_tool') {
@@ -195,6 +228,9 @@ interface Thresholds {
   /** Bounded recent-window for signature tracking — older entries
    *  drop off so a long session doesn't accumulate unbounded state. */
   recentWindowSize: number;
+  /** Same external tool/slug with this many DISTINCT arg sets in the
+   *  window → attach a fan-out nudge to the decision (advisory). */
+  fanoutNudgeAt: number;
 }
 
 function readThresholds(): Thresholds {
@@ -210,6 +246,7 @@ function readThresholds(): Thresholds {
     sameMutToolWarnAt: num('CLEMMY_GUARDRAIL_MUT_WARN', 3),
     sameMutToolHaltAt: num('CLEMMY_GUARDRAIL_MUT_HALT', 8),
     recentWindowSize: num('CLEMMY_GUARDRAIL_WINDOW', 100),
+    fanoutNudgeAt: num('CLEMMY_GUARDRAIL_FANOUT_NUDGE', 3),
   };
 }
 
@@ -245,6 +282,14 @@ export interface GuardrailDecision {
    *  the args aren't reachable from applyMode. Optional: when absent (a
    *  hand-built decision) applyMode falls back to MUTATING_TOOLS membership. */
   mutating?: boolean;
+  /** Advisory fan-out steering message. Set when the same EXTERNAL tool
+   *  (composio_execute_tool, keyed by inner slug) has been called with N+
+   *  distinct arg sets in the recent window — the serial-batch trap observed
+   *  live 2026-06-11 (74 sequential DataForSEO/Airtable calls, 25 minutes,
+   *  zero run_worker). Unlike warn (telemetry-only), the harness APPENDS this
+   *  to the tool's RESULT so the model actually reads it mid-stride and can
+   *  switch to run_worker / the service's batch API. Never blocks. */
+  fanoutNudge?: string;
 }
 
 function readMode(): GuardrailMode {
@@ -263,6 +308,9 @@ interface TrackedCall {
   toolName: string;
   /** Wall-clock ms when this signature first appeared in the window. */
   firstSeenMs: number;
+  /** Fan-out grouping key (composio_execute_tool keyed by inner slug).
+   *  Optional — absent on rows persisted before this field existed. */
+  fanoutKey?: string;
 }
 
 interface SessionTrackerState {
@@ -272,6 +320,9 @@ interface SessionTrackerState {
   countBySignature: Map<string, number>;
   /** Mutating tool name → count of distinct args seen recently. */
   distinctArgsByMutTool: Map<string, Set<string>>;
+  /** Fan-out key (e.g. composio::DATAFORSEO_…_TASK_POST) → distinct arg
+   *  signatures seen recently. Drives the serial-batch fan-out nudge. */
+  distinctArgsByFanoutKey: Map<string, Set<string>>;
 }
 
 const trackers = new Map<string, SessionTrackerState>();
@@ -284,7 +335,7 @@ function getOrCreateTracker(sessionId: string): SessionTrackerState {
     // get their loop-detection state back. New sessions just see null
     // and start fresh.
     t = rehydrateFromSqlite(sessionId)
-      ?? { recent: [], countBySignature: new Map(), distinctArgsByMutTool: new Map() };
+      ?? { recent: [], countBySignature: new Map(), distinctArgsByMutTool: new Map(), distinctArgsByFanoutKey: new Map() };
     trackers.set(sessionId, t);
   }
   return t;
@@ -341,8 +392,16 @@ export function evaluateToolCall(
   }
   const tracker = getOrCreateTracker(sessionId);
 
+  // Fan-out grouping key: composio_execute_tool is the external-API gateway
+  // where serial batch work actually bites (DataForSEO, Airtable, Salesforce,
+  // Outlook). Key by the INNER slug so 25 different-keyword TASK_POSTs group
+  // together while unrelated slugs don't. Local tools (read_file, execution_*)
+  // legitimately serialize and get no key.
+  const slug = toolName === 'composio_execute_tool' ? composioSlugOf(args) : undefined;
+  const fanoutKey = slug ? `composio::${slug}` : undefined;
+
   // Push + bound the window
-  tracker.recent.push({ signature, toolName, firstSeenMs: Date.now() });
+  tracker.recent.push({ signature, toolName, firstSeenMs: Date.now(), ...(fanoutKey ? { fanoutKey } : {}) });
   if (tracker.recent.length > thresholds.recentWindowSize) {
     const dropped = tracker.recent.shift();
     if (dropped) {
@@ -364,6 +423,36 @@ export function evaluateToolCall(
       tracker.distinctArgsByMutTool.set(toolName, set);
     }
     set.add(signature);
+  }
+
+  // Fan-out nudge: same slug, N distinct arg sets → the model is serializing
+  // per-item batch work in its own context (re-polls of ONE id hash identical,
+  // so legitimate polling never trips this). Fires at the threshold, then
+  // every 5 further distinct items, so a long serial run is re-nudged without
+  // spamming every call. Advisory only — delivered by appending to the tool
+  // RESULT in brackets.ts (warn events are telemetry the model never sees;
+  // that gap is exactly how the live 2026-06-11 serial run slipped through).
+  let fanoutNudge: string | undefined;
+  if (fanoutKey) {
+    let set = tracker.distinctArgsByFanoutKey.get(fanoutKey);
+    if (!set) {
+      set = new Set();
+      tracker.distinctArgsByFanoutKey.set(fanoutKey, set);
+    }
+    set.add(signature);
+    const distinct = set.size;
+    const at = thresholds.fanoutNudgeAt;
+    if (distinct >= at && (distinct - at) % 5 === 0) {
+      const batchHint = slug ? batchApiHintFor(slug) : undefined;
+      fanoutNudge =
+        `[harness fan-out check] You have now made ${distinct} DISTINCT ${slug} calls in this conversation's recent window — `
+        + `you are serializing per-item batch work through your own context. STOP looping serially: `
+        + `fan the REMAINING items out with run_worker (one item per worker, waves of up to 8), `
+        + `or use the service's real batch API if it accepts an array of items in one call. `
+        + `For very large batches (>50), author a workflow with forEach instead. `
+        + `Serial looping piles every item's payload into your context and is dramatically slower.`
+        + (batchHint ? ` ${batchHint}` : '');
+    }
   }
 
   // v0.5.19 F6 — write-through to sqlite on every call. Bounded by
@@ -417,6 +506,7 @@ export function evaluateToolCall(
       rule: 'exact_args_repeat',
       count: exactCount,
       mutating: isMut,
+      ...(fanoutNudge ? { fanoutNudge } : {}),
     };
   }
 
@@ -443,6 +533,7 @@ export function evaluateToolCall(
         rule: 'same_mut_tool_repeat',
         count: distinctArgsCount,
         mutating: isMut,
+        ...(fanoutNudge ? { fanoutNudge } : {}),
       };
     }
   }
@@ -460,13 +551,14 @@ export function evaluateToolCall(
     rule: 'allowed',
     count: exactCount,
     mutating: isMut,
+    ...(fanoutNudge ? { fanoutNudge } : {}),
   };
 }
 
 /** Strict-mode promotion: in warn mode, block→warn and halt→warn.
  *  In strict mode, decisions enforce as-is. Off mode always allows. */
 export function applyMode(decision: GuardrailDecision, mode: GuardrailMode = readMode()): GuardrailDecision {
-  if (mode === 'off') return { ...decision, action: 'allow' };
+  if (mode === 'off') return { ...decision, action: 'allow', fanoutNudge: undefined };
   // 'escalate' is a terminal-stuck signal — it is NEVER downgraded (even in
   // warn mode) because the model cannot recover by retrying. The ONLY way to
   // suppress it is mode 'off' (handled above). This is what actually stops the

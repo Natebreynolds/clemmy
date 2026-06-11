@@ -33,6 +33,7 @@ const {
   buildRequestApprovalTool,
   buildAskUserQuestionTool,
   recentPriorUserInputsForScope,
+  ORCHESTRATOR_INSTRUCTIONS,
 } = await import('./orchestrator.js');
 const { resolveMcpToolScopeWithContinuity } = await import('../runtime/mcp-tool-scope.js');
 
@@ -163,6 +164,34 @@ test('Orchestrator is now the single agent — carries the union of all action t
   for (const name of ['run_researcher', 'run_writer', 'run_reviewer', 'run_executor', 'run_deployer']) {
     assert.equal(toolNames.includes(name), false, `${name} should be removed in Phase 3`);
   }
+});
+
+test('every tool the instructions tell the model to call is ON the surface (allowlist-omission guard)', async () => {
+  // THIRD-occurrence bug class (spaces 2026-05-?, workflows 2026-05-21,
+  // recall/focus 2026-06-11): the instructions name a tool, the allowlist
+  // omits it, the model truthfully reports "isn't exposed in this run" and
+  // stalls. Live: every clipped tool result says `call recall_tool_result(…)`
+  // but ALL 286 historical calls came from workflow steps — chat could never
+  // make one. This test extracts every backticked snake_case name from the
+  // instructions and asserts it resolves on the BUILT agent's tool surface.
+  // Adding a new instructed tool without allowlisting it fails HERE, not in
+  // a live session.
+  const agent = await buildOrchestratorAgent();
+  const surface = new Set((agent.tools ?? []).map((t) => (t as { name?: string }).name));
+  // Backticked names that are NOT tools: decision-enum values + event types
+  // the instructions legitimately reference. Keep this list as small as the
+  // instructions allow — every entry is a name the model might try to call.
+  const NON_TOOL_MENTIONS = new Set(['awaiting_approval', 'awaiting_user_input', 'tool_called']);
+  const mentioned = new Set<string>();
+  for (const m of String(ORCHESTRATOR_INSTRUCTIONS).matchAll(/`([a-z][a-z0-9_]+)(?:\([^`]*)?`/g)) {
+    const n = m[1];
+    // require a '_' (tool-shaped) and exclude server-namespaced MCP names
+    // (dataforseo__…) which are scope-dependent, not allowlist entries.
+    if (n.includes('_') && !n.includes('__')) mentioned.add(n);
+  }
+  assert.ok(mentioned.size >= 30, `extraction sanity: expected 30+ instructed tool mentions, got ${mentioned.size}`);
+  const missing = [...mentioned].filter((n) => !surface.has(n) && !NON_TOOL_MENTIONS.has(n)).sort();
+  assert.deepEqual(missing, [], `instructions promise tools the surface does not expose: ${missing.join(', ')}`);
 });
 
 test('run_worker requires a structured parent-planned job packet', async () => {

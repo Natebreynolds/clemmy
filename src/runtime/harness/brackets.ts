@@ -591,10 +591,15 @@ export function wrapToolForHarness<T extends WrappableTool>(
   const hasExecute = typeof tool.execute === 'function';
   if (!hasInvoke && !hasExecute) return tool; // pure declaration; nothing to wrap
 
+  // Returns an advisory fan-out nudge string when the guardrail detects
+  // serial per-item batch work (same composio slug, N distinct args). The
+  // caller APPENDS it to the tool's result so the model reads it mid-stride —
+  // a warn-mode telemetry event alone is invisible to the model (live
+  // 2026-06-11: 74 serial composio calls, 8 warn events, zero course-change).
   const runBrackets = async (
     sessionId: string,
     parsedInput: unknown,
-  ): Promise<void> => {
+  ): Promise<string | undefined> => {
     const ctx = harnessRunContextStorage.getStore();
     if (!ctx) return; // no context = test fixture or out-of-band call; brackets degrade
     // 1. Kill check
@@ -606,9 +611,30 @@ export function wrapToolForHarness<T extends WrappableTool>(
     ctx.counter.increment();
     // 2b. Tool-call guardrail (loop detection). Keyed by guardrailScopeId
     // when set (a worker run isolates its own window) else sessionId.
+    let fanoutNudge: string | undefined;
     try {
       const rawDecision = evaluateToolCall(ctx.guardrailScopeId ?? ctx.sessionId, tool.name, parsedInput);
       const decision = applyMode(rawDecision);
+      // Fan-out nudge: only steer the ORCHESTRATOR's own context toward
+      // run_worker — inside a worker scope (guardrailScopeId set) the nudge
+      // is wrong advice (workers can't spawn workers), so suppress it.
+      if (decision.fanoutNudge && !ctx.guardrailScopeId) {
+        fanoutNudge = decision.fanoutNudge;
+        try {
+          appendEvent({
+            sessionId: ctx.sessionId,
+            turn: 0,
+            role: 'system',
+            type: 'guardrail_tripped',
+            data: {
+              kind: 'fanout_nudge',
+              toolName: decision.toolName,
+              count: decision.count,
+              reason: decision.fanoutNudge,
+            },
+          });
+        } catch { /* telemetry write must never block */ }
+      }
       if (decision.action !== 'allow') {
         try {
           appendEvent({
@@ -796,6 +822,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
     // (sessionId arg is unused — included for future per-session
     // behavior without forcing callers to refactor.)
     void sessionId;
+    return fanoutNudge;
   };
 
   // Resolve the per-tool timeout once at wrap time.
@@ -831,8 +858,9 @@ export function wrapToolForHarness<T extends WrappableTool>(
         }
       }
       const ctx = harnessRunContextStorage.getStore();
+      let fanoutNudge: string | undefined;
       try {
-        await runBrackets(ctx?.sessionId ?? '', parsedInput);
+        fanoutNudge = await runBrackets(ctx?.sessionId ?? '', parsedInput);
       } catch (err) {
         // MissingExecutionWrapError should land as a SOFT tool error
         // — return the message string so the model sees it as the
@@ -906,6 +934,13 @@ export function wrapToolForHarness<T extends WrappableTool>(
           throw err;
         }
       }
+      // Deliver the fan-out nudge INTO the model's view: append it to a
+      // string result. (Non-string results skip the nudge rather than risk
+      // corrupting a structured payload — the next serial call will re-fire.)
+      if (fanoutNudge) {
+        const result = await invokePromise;
+        return typeof result === 'string' ? `${result}\n\n${fanoutNudge}` : result;
+      }
       return invokePromise;
     };
     return { ...tool, invoke: wrappedInvoke } as T;
@@ -915,13 +950,15 @@ export function wrapToolForHarness<T extends WrappableTool>(
   const originalExecute = tool.execute!;
   const wrappedExecute = async (input: unknown, runContext?: unknown): Promise<unknown> => {
     const ctx = harnessRunContextStorage.getStore();
-    await runBrackets(ctx?.sessionId ?? '', input);
-    return withTimeout(
+    const fanoutNudge = await runBrackets(ctx?.sessionId ?? '', input);
+    const result = await withTimeout(
       (async () => originalExecute(input, runContext))(),
       timeoutMs,
       tool.name,
       { isPaused: isPausedFactory(ctx?.sessionId) },
     );
+    if (fanoutNudge && typeof result === 'string') return `${result}\n\n${fanoutNudge}`;
+    return result;
     // NOTE: A tool-return truncator used to live here as part of
     // Primitive 6 (v0.5.18 plan). Removed 2026-05-24 because hooks.ts
     // `clipToolResult` + `writeToolOutput` + `clipOldToolResults`

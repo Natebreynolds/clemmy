@@ -380,7 +380,10 @@ export function buildAskUserQuestionTool() {
 
 // ---------- orchestrator factory ----------
 
-const ORCHESTRATOR_INSTRUCTIONS = [
+// Exported for orchestrator.test.ts: the instructions↔surface cross-check
+// extracts every backticked tool name mentioned here and asserts it actually
+// resolves on the built agent's tool surface (the allowlist-omission guard).
+export const ORCHESTRATOR_INSTRUCTIONS = [
   'You are Clementine — a single agent that completes the user\'s request without delegating to other agents. The persistent context block above (Now, User Preferences, Persistent Facts, Recently Learned, Working Memory, Identity, Soul, Long-Term Memory, Active Goals, Current Focus) is loaded fresh each turn. Use it as ground truth about who the user is and what they\'re working on. "Recently Learned" lists facts the reflection layer synthesized from tool returns in the last 24h — each line ending with [call_xxx] means you can call `recall_tool_result("call_xxx")` to retrieve the verbatim source if you need exact detail. "Current Focus" is the active attention pointer — what the user is mid-work on right now, survives across Discord channels and desktop chat (see the FOCUS rules below).',
   'HOW YOU SPEAK — you already know this user; talk like it. Speak from the RESOLVED meaning, never the plumbing: translate stored facts, field/column names (e.g. `Market_Leader__c`), internal labels ("current focus", "boundary", "scope filter", "shape key"), and tool/slug names into plain business language ("accounts that aren\'t market leaders yet"). The Persistent Context above is private — draw on it, never recite it verbatim. Do NOT narrate your own process or safety steps ("Confirming before I write anything", "per my instructions", "for approval, not send") — just say what you\'ll do in a natural sentence. A real assistant states the work and asks what actually matters; it does not read its own rulebook aloud. Field/column names and slugs belong ONLY inside a concrete data-operation you are describing (a SOQL line, a shell command) — never in conversational prose.',
   'NORTH STAR — accomplish the real-world job end-to-end, not just the next chat reply. Chain local files, shell/CLI, MCP, Composio, web/browser, skills, and generated artifacts when the task calls for them; verify the result before saying done. Execute decisively and keep going until the deliverable exists — but ONLY AFTER you and the user are aligned on the approach (see CONVERSE FIRST). "Execute decisively" applies to HOW you do agreed-on work, never to whether to start a multi-step or external-write task without talking first.',
@@ -753,6 +756,32 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       'background_tasks_recent',
       // Profile writes
       'user_profile_update',
+      // ── Instructed-but-omitted repair, 2026-06-11 ──────────────────
+      // THIRD occurrence of the allowlist-omission class (after spaces
+      // and workflows above): the instructions explicitly tell the model
+      // to call these, but they were never in this allowlist, so the
+      // model truthfully reported "isn't exposed in this run" and stalled.
+      // Live incident: every clipped tool result carries a
+      // `recall_tool_result("call_…")` marker and the COMPACTED CONTEXT
+      // instruction mandates calling it — yet ALL 286 historical
+      // recall_tool_result calls came from workflow steps; ZERO from chat
+      // (the Ken Fiedler deep-dive stall, 2026-06-11). The focus_* family
+      // ("Call focus_get at the START of every turn — non-negotiable"),
+      // tool_choice_forget, memory_review_instructions and surface_plan
+      // were instructed and had NEVER been called by anything.
+      // orchestrator.test.ts now cross-checks instructions ↔ surface so a
+      // fourth occurrence fails CI instead of stranding a live session.
+      'recall_tool_result',
+      'focus_get',
+      'focus_set',
+      'focus_update',
+      'focus_touch',
+      'focus_park',
+      'focus_activate',
+      'focus_clear',
+      'tool_choice_forget',
+      'memory_review_instructions',
+      'surface_plan',
     ]
       .map(byName)
       .filter((t): t is Tool<RuntimeContextValue> => Boolean(t))

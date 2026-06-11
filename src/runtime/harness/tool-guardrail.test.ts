@@ -155,6 +155,99 @@ test('evaluateToolCall: idempotent tool with many distinct args is NOT flagged b
   }
 });
 
+// ─── evaluateToolCall — serial-batch fan-out nudge ────────────────
+
+test('fanoutNudge: 3rd DISTINCT same-slug composio call attaches the nudge (and cadence re-fires at 8)', () => {
+  _resetAllTrackersForTests();
+  const call = (i: number) =>
+    evaluateToolCall('sess-fan', 'composio_execute_tool', {
+      tool_slug: 'DATAFORSEO_GET_SERP_GOOGLE_ORGANIC_TASK_ADVANCED_BY_ID',
+      arguments: `{"id":"task-${i}"}`,
+    });
+  assert.equal(call(1).fanoutNudge, undefined);
+  assert.equal(call(2).fanoutNudge, undefined);
+  const d3 = call(3);
+  assert.ok(d3.fanoutNudge, '3rd distinct same-slug call must carry the nudge');
+  assert.match(d3.fanoutNudge!, /run_worker/);
+  // Cadence: 4th–7th distinct stay quiet, 8th re-fires.
+  for (let i = 4; i <= 7; i += 1) assert.equal(call(i).fanoutNudge, undefined, `distinct #${i} must not re-nudge`);
+  assert.ok(call(8).fanoutNudge, '8th distinct re-fires the nudge');
+});
+
+test('fanoutNudge: re-polling the SAME id never nudges (identical args = one distinct entry)', () => {
+  _resetAllTrackersForTests();
+  const args = { tool_slug: 'DATAFORSEO_GET_SERP_GOOGLE_ORGANIC_TASK_ADVANCED_BY_ID', arguments: '{"id":"task-1"}' };
+  for (let i = 0; i < 6; i += 1) {
+    const d = evaluateToolCall('sess-poll', 'composio_execute_tool', args);
+    assert.equal(d.fanoutNudge, undefined, 'legitimate polling must not be told to fan out');
+  }
+});
+
+test('fanoutNudge: different slugs do NOT group together', () => {
+  _resetAllTrackersForTests();
+  const slugs = ['AIRTABLE_LIST_RECORDS', 'SALESFORCE_QUERY', 'OUTLOOK_LIST_MESSAGES'];
+  for (const [i, slug] of slugs.entries()) {
+    const d = evaluateToolCall('sess-mix', 'composio_execute_tool', { tool_slug: slug, arguments: `{"n":${i}}` });
+    assert.equal(d.fanoutNudge, undefined);
+  }
+});
+
+test('fanoutNudge: non-composio tools never nudge (local serialization is legitimate)', () => {
+  _resetAllTrackersForTests();
+  for (let i = 0; i < 6; i += 1) {
+    const d = evaluateToolCall('sess-local', 'read_file', { path: `/tmp/f-${i}` });
+    assert.equal(d.fanoutNudge, undefined);
+  }
+});
+
+test('fanoutNudge: rides on a warn decision too (same-mut-tool warn keeps the nudge)', () => {
+  _resetAllTrackersForTests();
+  // 3 distinct WRITE-slug calls: hits same_mut_tool_repeat warn AND the
+  // fan-out threshold simultaneously — the nudge must survive on the warn.
+  evaluateToolCall('sess-warn', 'composio_execute_tool', { tool_slug: 'AIRTABLE_CREATE_RECORDS', arguments: '{"n":1}' });
+  evaluateToolCall('sess-warn', 'composio_execute_tool', { tool_slug: 'AIRTABLE_CREATE_RECORDS', arguments: '{"n":2}' });
+  const d3 = evaluateToolCall('sess-warn', 'composio_execute_tool', { tool_slug: 'AIRTABLE_CREATE_RECORDS', arguments: '{"n":3}' });
+  assert.equal(d3.action, 'warn');
+  assert.equal(d3.rule, 'same_mut_tool_repeat');
+  assert.ok(d3.fanoutNudge);
+});
+
+test('fanoutNudge: slug-specific batch-API hints (DataForSEO tasks array, TASKS_READY, Airtable records array)', () => {
+  const cases: Array<[slug: string, expect: RegExp]> = [
+    ['DATAFORSEO_CREATE_SERP_GOOGLE_ORGANIC_TASK_POST', /`tasks` ARRAY/],
+    ['DATAFORSEO_GET_SERP_GOOGLE_ORGANIC_TASK_ADVANCED_BY_ID', /TASKS_READY/],
+    ['AIRTABLE_UPDATE_RECORDS', /`records` ARRAY/],
+  ];
+  for (const [slug, re] of cases) {
+    _resetAllTrackersForTests();
+    let d;
+    for (let i = 1; i <= 3; i += 1) {
+      d = evaluateToolCall(`sess-hint-${slug}`, 'composio_execute_tool', { tool_slug: slug, arguments: `{"n":${i}}` });
+    }
+    assert.ok(d?.fanoutNudge, `${slug}: 3rd distinct call must nudge`);
+    assert.match(d!.fanoutNudge!, re, `${slug}: nudge must carry its batch-API hint`);
+  }
+  // A slug with no known batch shape gets the generic nudge, no NOTE.
+  _resetAllTrackersForTests();
+  let d;
+  for (let i = 1; i <= 3; i += 1) {
+    d = evaluateToolCall('sess-hint-none', 'composio_execute_tool', { tool_slug: 'SALESFORCE_QUERY', arguments: `{"n":${i}}` });
+  }
+  assert.ok(d?.fanoutNudge);
+  assert.doesNotMatch(d!.fanoutNudge!, /NOTE:/);
+});
+
+test('fanoutNudge: applyMode off strips the nudge', () => {
+  _resetAllTrackersForTests();
+  for (let i = 1; i <= 2; i += 1) {
+    evaluateToolCall('sess-off', 'composio_execute_tool', { tool_slug: 'SALESFORCE_QUERY', arguments: `{"q":${i}}` });
+  }
+  const d3 = evaluateToolCall('sess-off', 'composio_execute_tool', { tool_slug: 'SALESFORCE_QUERY', arguments: '{"q":3}' });
+  assert.ok(d3.fanoutNudge);
+  assert.equal(applyMode(d3, 'off').fanoutNudge, undefined);
+  assert.equal(applyMode(d3, 'warn').fanoutNudge, d3.fanoutNudge);
+});
+
 // ─── applyMode — mode-based action demotion ──────────────────────
 
 test('applyMode: warn mode HARD-BLOCKS an exact-args loop on a MUTATING tool (runaway stop)', () => {

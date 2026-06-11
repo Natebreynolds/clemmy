@@ -25,7 +25,8 @@ export const JUDGE_SYSTEM_PROMPT = [
   '- A plan, intention, or "I will work on this next" is NOT complete.',
   '- Partial completion of multiple deliverables is NOT complete unless the objective only asked for one.',
   '- HONEST BLOCKER: if the response delivers the results it COULD produce AND explicitly names the specific part it could not, with a concrete reason that part is genuinely blocked (a named tool/endpoint unavailable, a record/field that does not exist, access denied), treat that as DONE — do NOT demand it retry a capability that is genuinely unavailable. Mark not-done ONLY when the assistant could plausibly still finish with the tools it has (it punted, guessed, promised, or stopped without actually trying).',
-  '- If the objective is ambiguous, lean toward not-done so the user can clarify rather than the loop terminating prematurely.',
+  '- Audit ONLY the deliverables the objective actually names. Do NOT invent extra deliverables (an "audit artifact", a "decision document", a saved file) that the user never asked for — demanding unnamed artifacts trains the assistant to write filler evidence files instead of doing work.',
+  '- If the objective is ambiguous or is a bare conversational follow-up, judge it against the conversation context included with it. When the response reports concrete completed work with evidence for everything the objective ACTUALLY names, that is done — in an interactive chat the user will steer the next step; do not keep the loop running to chase deliverables nobody requested.',
   '',
   'Output ONLY a JSON object on one line with no prose: {"done": <boolean>, "reason": "<one short sentence naming the missing evidence or the artifact that satisfied the objective>"}.',
   '',
@@ -121,6 +122,50 @@ export function isPromiseShapedReply(reply?: string | null): boolean {
   const text = (reply ?? '').trim();
   if (!text) return false;
   return PROMISE_PHRASE_RE.test(text) && !ARTIFACT_EVIDENCE_RE.test(text);
+}
+
+/** Harness-injected inputs recorded as user_input_received that are NOT real
+ *  user messages — continuation drips, judge retries, prose-corrections. Used
+ *  to filter conversation history when composing the judged objective. */
+export const HARNESS_INJECTED_INPUT_PREFIXES = [
+  'Continue with the next step of your plan.',
+  'You marked this objective complete,',
+  'Your previous response was prose, not an action.',
+] as const;
+
+export function isHarnessInjectedInput(text: string): boolean {
+  return HARNESS_INJECTED_INPUT_PREFIXES.some((p) => text.startsWith(p));
+}
+
+/** Below this length, a user message is likely a bare follow-up ("just mine
+ *  please", "lets do it") that is meaningless as a standalone objective. */
+const BARE_FOLLOWUP_MAX_CHARS = 120;
+
+/**
+ * Compose the objective text the judge audits. A bare follow-up judged in
+ * isolation is inherently "ambiguous" → the judge demands artifacts the
+ * message never named → up to maxContinuations wasted full model turns per
+ * message (live 2026-06-11: "just mine please" and "lets do it" each judged
+ * as standalone objectives, 5 false NOT-finished retries in one session).
+ * When the current input is short and real prior user messages exist, include
+ * the recent priors so the judge audits what the USER actually asked for.
+ * Pure — the caller gathers (and pre-filters) the prior messages.
+ */
+export function composeJudgedObjective(input: string, priorUserMessages: string[]): string {
+  const current = (input ?? '').trim();
+  if (current.length >= BARE_FOLLOWUP_MAX_CHARS) return current;
+  const priors = priorUserMessages
+    .map((m) => (m ?? '').trim())
+    .filter((m) => m.length > 0 && !isHarnessInjectedInput(m))
+    .slice(-2)
+    .map((m) => (m.length > 600 ? `${m.slice(0, 600)}…` : m));
+  if (priors.length === 0) return current;
+  return [
+    'Earlier user messages in this conversation (the follow-up below continues them):',
+    ...priors.map((m, i) => `${i + 1}. ${m}`),
+    '',
+    `Current user message (the follow-up being judged): ${current}`,
+  ].join('\n');
 }
 
 /** Optional skill-execution rubric: the skills loaded this session + compact

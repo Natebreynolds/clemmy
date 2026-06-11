@@ -140,3 +140,49 @@ test('buildObjectiveJudgePrompt without skill context is unchanged (no rubric in
   assert.doesNotMatch(p, /SKILLS LOADED THIS SESSION/);
   assert.match(p, /respond with the structured verdict/);
 });
+
+// ─── composeJudgedObjective — continuity-aware judged objective ────
+
+test('composeJudgedObjective: bare follow-up gets prior REAL user messages as context', async () => {
+  const { composeJudgedObjective } = await import('./objective-judge.js');
+  const composed = composeJudgedObjective('just mine please', [
+    'I need to pull 25 market leader accounts new from Salesforce that have not had contact in 15 days, de-dupe against Airtable, then SEO enrichment.',
+    'Continue with the next step of your plan. If you have nothing left to do, set done=true and nextAction=completed.',
+  ]);
+  assert.match(composed, /25 market leader accounts/);
+  assert.match(composed, /Current user message .*: just mine please/);
+  assert.doesNotMatch(composed, /Continue with the next step/, 'harness drip injections must be filtered');
+});
+
+test('composeJudgedObjective: long objective passes through unchanged', async () => {
+  const { composeJudgedObjective } = await import('./objective-judge.js');
+  const long = 'Research the top 25 personal injury firms in New York by SERP visibility, then write each one an outreach note referencing their weakest keyword cluster.';
+  assert.equal(composeJudgedObjective(long, ['earlier message']), long);
+});
+
+test('composeJudgedObjective: no real priors → raw input unchanged', async () => {
+  const { composeJudgedObjective } = await import('./objective-judge.js');
+  assert.equal(composeJudgedObjective('lets do it', []), 'lets do it');
+  assert.equal(
+    composeJudgedObjective('lets do it', [
+      'You marked this objective complete, but an independent verification check found it is NOT finished: x.',
+    ]),
+    'lets do it',
+    'injected-only history must not be treated as context',
+  );
+});
+
+test('composeJudgedObjective: keeps only the last 2 priors and truncates very long ones', async () => {
+  const { composeJudgedObjective } = await import('./objective-judge.js');
+  const composed = composeJudgedObjective('go', ['first', 'second', `third ${'x'.repeat(700)}`]);
+  assert.doesNotMatch(composed, /\bfirst\b/, 'only the last 2 priors are kept');
+  assert.match(composed, /second/);
+  assert.match(composed, /…/, 'long prior is truncated');
+});
+
+test('JUDGE_SYSTEM_PROMPT: rubric audits only NAMED deliverables and yields on ambiguity', async () => {
+  const { JUDGE_SYSTEM_PROMPT } = await import('./objective-judge.js');
+  assert.match(JUDGE_SYSTEM_PROMPT, /Do NOT invent extra deliverables/);
+  assert.match(JUDGE_SYSTEM_PROMPT, /bare conversational follow-up/);
+  assert.doesNotMatch(JUDGE_SYSTEM_PROMPT, /lean toward not-done/, 'the loop-forever-on-ambiguity rule is gone');
+});

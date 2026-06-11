@@ -424,9 +424,10 @@ test('confirm-first gate: same-shape writes accrue across calls and the batch tr
         wrapped.execute!({ tool_slug: 'GMAIL_SEND_EMAIL', arguments: JSON.stringify({ to: `person${n}@x.com` }) }),
       );
 
-    // Writes 1..4 succeed.
+    // Writes 1..4 succeed. (The fan-out nudge may be appended from the 3rd
+    // distinct call on — the gate's concern is only that the write PASSES.)
     for (let n = 1; n <= 4; n += 1) {
-      assert.equal(await sendNo(n), 'sent', `write #${n} should pass below threshold`);
+      assert.ok(String(await sendNo(n)).startsWith('sent'), `write #${n} should pass below threshold`);
     }
     // Write #5 trips the batch gate — no instruction-reviewed plan scope.
     await assert.rejects(async () => { await sendNo(5); }, (err: Error) => err instanceof ConfirmFirstRequiredError);
@@ -438,7 +439,7 @@ test('confirm-first gate: same-shape writes accrue across calls and the batch tr
       approvedPlanObjective: 'Send the reviewed batch of emails',
       allowedTools: ['composio_execute_tool'],
     });
-    assert.equal(await sendNo(5), 'sent', 'write passes once a plan scope exists');
+    assert.ok(String(await sendNo(5)).startsWith('sent'), 'write passes once a plan scope exists');
 
     // Closing the scope re-arms the gate.
     closePlanScope(sess.id, 'test');
@@ -479,7 +480,7 @@ test('confirm-first gate: YOLO standing approval lets an irreversible batch run 
     // 8 irreversible sends, well past the threshold of 5 — ALL pass in YOLO,
     // no plan scope ever opened.
     for (let n = 1; n <= 8; n += 1) {
-      assert.equal(await sendNo(n), 'sent', `YOLO send #${n} should pass (standing approval)`);
+      assert.ok(String(await sendNo(n)).startsWith('sent'), `YOLO send #${n} should pass (standing approval)`);
     }
     // Continuity preserved: each allowed write was still recorded so the batch
     // count stays accurate if the user later leaves YOLO mid-session.
@@ -513,7 +514,59 @@ test('confirm-first gate: explicit off escape hatch lets batches pass', async ()
       const r = await withHarnessRunContext({ sessionId: sess.id, counter }, () =>
         wrapped.execute!({ tool_slug: 'GMAIL_SEND_EMAIL', arguments: JSON.stringify({ to: `p${n}@x.com` }) }),
       );
-      assert.equal(r, 'sent', `write #${n} should pass when confirm-first is off`);
+      assert.ok(String(r).startsWith('sent'), `write #${n} should pass when confirm-first is off`);
+    }
+  } finally {
+    process.env.HARNESS_TOOL_BRACKETS = prevBrackets;
+    process.env.CLEMMY_CONFIRM_FIRST = prevConfirm;
+    process.env.CLEMMY_EXECUTION_GATE = prevExecGate;
+  }
+});
+
+test('fan-out nudge: appended to the tool RESULT on serial same-slug calls; suppressed in worker scope', async () => {
+  // The live 2026-06-11 serial run: 74 sequential composio calls, 8 warn-only
+  // guardrail events the model never saw. The nudge must land IN the result
+  // the model reads — and must NOT fire inside a run_worker scope (workers
+  // can't fan out further).
+  const prevBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  const prevConfirm = process.env.CLEMMY_CONFIRM_FIRST;
+  const prevExecGate = process.env.CLEMMY_EXECUTION_GATE;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  process.env.CLEMMY_CONFIRM_FIRST = 'off';
+  process.env.CLEMMY_EXECUTION_GATE = 'off';
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  try {
+    const counter = new ToolCallsCounter(100);
+    const wrapped = wrapToolForHarness({
+      name: 'composio_execute_tool',
+      execute: async (_input: unknown) => 'rows',
+    });
+    const call = (n: number, scopeId?: string) =>
+      withHarnessRunContext(
+        { sessionId: sess.id, counter, ...(scopeId ? { guardrailScopeId: scopeId } : {}) },
+        () => wrapped.execute!({ tool_slug: 'AIRTABLE_LIST_RECORDS', arguments: JSON.stringify({ view: `v${n}` }) }),
+      );
+    assert.equal(await call(1), 'rows');
+    assert.equal(await call(2), 'rows');
+    const r3 = String(await call(3));
+    assert.ok(r3.includes('[harness fan-out check]'), '3rd distinct same-slug call carries the nudge in the RESULT');
+    assert.ok(r3.includes('run_worker'), 'nudge steers toward run_worker');
+
+    // Worker scope: same serial pattern, nudge suppressed.
+    resetEventLog();
+    const sess2 = createSession({ kind: 'chat' });
+    const counter2 = new ToolCallsCounter(100);
+    const wrapped2 = wrapToolForHarness({
+      name: 'composio_execute_tool',
+      execute: async (_input: unknown) => 'rows',
+    });
+    for (let n = 1; n <= 4; n += 1) {
+      const r = await withHarnessRunContext(
+        { sessionId: sess2.id, counter: counter2, guardrailScopeId: `${sess2.id}::w:test` },
+        () => wrapped2.execute!({ tool_slug: 'AIRTABLE_LIST_RECORDS', arguments: JSON.stringify({ view: `v${n}` }) }),
+      );
+      assert.equal(r, 'rows', `worker-scope call #${n} must NOT carry the fan-out nudge`);
     }
   } finally {
     process.env.HARNESS_TOOL_BRACKETS = prevBrackets;

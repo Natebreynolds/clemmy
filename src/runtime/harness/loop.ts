@@ -34,7 +34,7 @@ import {
   predictTurnCost,
 } from './budget.js';
 import { MODELS } from '../../config.js';
-import { judgeObjectiveComplete, shouldRunObjectiveJudge, isPromiseShapedReply, type ObjectiveJudgeFn } from './objective-judge.js';
+import { judgeObjectiveComplete, shouldRunObjectiveJudge, isPromiseShapedReply, composeJudgedObjective, type ObjectiveJudgeFn } from './objective-judge.js';
 import {
   getActiveGoalForSession,
   recordGoalValidation,
@@ -1600,7 +1600,21 @@ async function runConversationCore(
         const skillContext = loadedSkills.length > 0
           ? { skills: loadedSkills, toolCallSummary: summarizeToolCallsForJudge(options.sessionId) }
           : undefined;
-        const verdict = await objectiveJudge(objective, responseText ?? '', skillContext);
+        // A bare follow-up ("just mine please") judged in isolation is
+        // inherently ambiguous → false NOT-finished retries (5 in the live
+        // 2026-06-11 session). Compose the judged objective with the recent
+        // REAL user messages (harness drips filtered) so the judge audits
+        // what the user actually asked for. Fail-open to the raw input.
+        let judgedObjective = objective;
+        try {
+          const priorInputs = listEvents(options.sessionId, { types: ['user_input_received'] })
+            .map((ev) => String((ev.data as { text?: string } | undefined)?.text ?? ''))
+            .filter((t) => t.trim().length > 0);
+          // The current conversation's own input is the most recent entry — drop it.
+          if (priorInputs.length > 0 && priorInputs[priorInputs.length - 1] === objective) priorInputs.pop();
+          judgedObjective = composeJudgedObjective(objective, priorInputs);
+        } catch { /* fail-open: judge the raw input */ }
+        const verdict = await objectiveJudge(judgedObjective, responseText ?? '', skillContext);
         if (!verdict.done) {
           objectiveJudgeContinuations += 1;
           safeAppend({
