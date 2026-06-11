@@ -35,6 +35,14 @@ import {
 } from './budget.js';
 import { MODELS } from '../../config.js';
 import { judgeObjectiveComplete, shouldRunObjectiveJudge, isPromiseShapedReply, type ObjectiveJudgeFn } from './objective-judge.js';
+import {
+  getActiveGoalForSession,
+  recordGoalValidation,
+  satisfyGoal,
+  GOAL_DEFAULT_MAX_ATTEMPTS,
+  type PlanProposal,
+} from '../../agents/plan-proposals.js';
+import { validateGoal, toGoalEvidence, type GoalValidationResult, type ValidateGoalInput } from '../../execution/goal-validate.js';
 import { gatherSessionSkills, summarizeToolCallsForJudge } from './skill-execution.js';
 import { classifyMessageIntent } from '../../assistant/message-intent.js';
 import { attachEventLogHooks, extractSessionIdFromContext, type RunHooksLike } from './hooks.js';
@@ -687,6 +695,8 @@ export interface RunConversationOptions {
   judgeCompletion?: boolean;
   /** Test injection for the objective judge (defaults to judgeObjectiveComplete). */
   judgeFn?: ObjectiveJudgeFn;
+  /** Test injection for goal-contract validation (defaults to validateGoal). */
+  goalValidator?: (input: ValidateGoalInput) => Promise<GoalValidationResult>;
   /** Test injection. */
   makeRunner?: () => Runner;
   /** Test injection. */
@@ -1503,6 +1513,63 @@ async function runConversationCore(
     }
 
     if (decision.done) {
+      // Goal contract (Phase 3): a session with an ACTIVE parked goal
+      // validates self-declared completion against the PARKED criteria — the
+      // model saying "done" is a trigger to validate, never the verdict.
+      // Gated on observed work (tool calls or a promise-shaped reply) so a
+      // casual Q&A turn inside a goal session never spins the loop. Replaces
+      // the generic transcript judge for these sessions (never both). Bounded
+      // by the goal's persistent attempt budget; a dead judge resolves
+      // not-satisfied + escalates (it can never auto-satisfy a goal).
+      let goalUnmetNote = '';
+      const activeGoal = safeActiveGoal(options.sessionId);
+      const goalGate = Boolean(activeGoal)
+        && (totalToolCalls >= 1 || isPromiseShapedReply(decision.reply || decision.summary));
+      if (activeGoal && goalGate) {
+        const goalPlan = activeGoal.approvedPlan ?? activeGoal.plan;
+        const evidenceText = (decision.reply?.trim() ? decision.reply : decision.summary) ?? '';
+        const goalValidator = options.goalValidator ?? validateGoal;
+        const validation = await goalValidator({
+          objective: goalPlan.objective,
+          successCriteria: goalPlan.successCriteria ?? [],
+          evidenceText,
+        });
+        const updated = recordGoalValidation(
+          activeGoal.id,
+          toGoalEvidence(validation, (activeGoal.attempt ?? 0) + 1, new Date().toISOString()),
+        );
+        const attempt = updated?.attempt ?? (activeGoal.attempt ?? 0) + 1;
+        const maxAttempts = activeGoal.maxAttempts ?? GOAL_DEFAULT_MAX_ATTEMPTS;
+        const failures = validation.perCriterion.filter((c) => !c.pass);
+        safeAppend({
+          sessionId: options.sessionId,
+          turn: turnResult.turn,
+          role: 'system',
+          type: 'goal_validation',
+          data: {
+            goalId: activeGoal.id,
+            pass: validation.pass,
+            attempt,
+            maxAttempts,
+            judgeFailedOpen: validation.judgeFailedOpen ?? false,
+            failures: failures.slice(0, 4).map((f) => ({ criterion: f.criterion.slice(0, 200), detail: f.detail?.slice(0, 200) })),
+          },
+        });
+        if (validation.pass) {
+          satisfyGoal(activeGoal.id, 'external validation passed');
+        } else if (!validation.judgeFailedOpen && attempt < maxAttempts) {
+          nextInput = [
+            `You marked this done, but external validation of the session's pinned goal found unmet criteria (attempt ${attempt}/${maxAttempts}):`,
+            ...failures.slice(0, 4).map((f) => `- ${f.criterion}${f.detail ? ` (${f.detail})` : ''}`),
+            'Close these specific gaps and produce verifiable evidence (a URL, file path, or emitted result). If a criterion is genuinely impossible, say so explicitly with the concrete blocker instead of declaring done without it.',
+          ].join('\n');
+          continue;
+        } else {
+          goalUnmetNote = validation.judgeFailedOpen
+            ? 'Note: the pinned goal could not be validated (completion judge unavailable). The goal stays pinned — say "continue" to retry, or /goal cancel to drop it.'
+            : `Note: the pinned goal still has unmet criteria after ${attempt}/${maxAttempts} validation attempts: ${failures.slice(0, 3).map((f) => f.criterion).join('; ')}. The goal stays pinned — say "continue" to keep working, or /goal cancel to drop it.`;
+        }
+      } else if (
       // Independent completion gate (Hermes-style): the model just declared
       // itself done. For a multi-step action objective, verify with an
       // INDEPENDENT judge before yielding — LLMs over-declare completion
@@ -1510,7 +1577,6 @@ async function runConversationCore(
       // what turns the agent back into a chatbot you have to re-prompt. If the
       // judge sees no real evidence, inject a continuation and keep working.
       // Bounded + fail-open (judge defaults to done) so it can never wedge.
-      if (
         shouldRunObjectiveJudge({
           optIn: objectiveJudgeOptIn,
           actionIntent: objectiveJudgeActionIntent,
@@ -1572,11 +1638,14 @@ async function runConversationCore(
       // diagnosable instead of masked by plausible-looking META text.
       const hasReply = decision.reply && decision.reply.trim();
       const isCompletedAction = decision.nextAction === 'completed';
-      const userVisibleSummary = hasReply
+      const baseSummary = hasReply
         ? decision.reply!
         : isCompletedAction
           ? `(The model marked the turn complete without producing a user-facing reply. This is a bug. Internal log: ${decision.summary})`
           : decision.summary;
+      // Goal contract: criteria still unmet after the attempt budget — the
+      // user must SEE that, never a silent clean-looking completion.
+      const userVisibleSummary = goalUnmetNote ? `${baseSummary}\n\n${goalUnmetNote}` : baseSummary;
       safeAppend({
         sessionId: options.sessionId,
         turn: turnResult.turn,
@@ -1854,6 +1923,40 @@ function toOrchestratorDecision(value: unknown): OrchestratorDecisionShape | nul
 }
 
 // ---------- public API ----------
+
+// ─── Goal contract (GOAL-CONTRACT-PLAN.md Phase 3) ──────────────────────────
+// A session with an ACTIVE parked goal gets the goal re-injected fresh every
+// turn (the model rents the goal; the store owns it), and self-declared
+// completion triggers EXTERNAL validation against the parked criteria.
+// Kill-switch: CLEMMY_GOAL_CONTRACT=off disables both injection + validation.
+
+function goalContractEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_GOAL_CONTRACT', 'on') ?? 'on').toLowerCase() !== 'off';
+}
+
+/** Store read must never break a turn. */
+function safeActiveGoal(sessionId: string): PlanProposal | null {
+  if (!goalContractEnabled()) return null;
+  try {
+    return getActiveGoalForSession(sessionId);
+  } catch {
+    return null;
+  }
+}
+
+function renderGoalContextBlock(goal: PlanProposal): string {
+  const plan = goal.approvedPlan ?? goal.plan;
+  const criteria = (plan.successCriteria ?? []).map((c) => c.trim()).filter(Boolean);
+  const ledger = (goal.progressLedger ?? []).slice(-8);
+  return [
+    '[ACTIVE GOAL — parked outside this conversation. Completion is validated EXTERNALLY against the criteria below; declaring done triggers that validation, it does not decide it.]',
+    `Objective: ${plan.objective}`,
+    criteria.length > 0 ? `Success criteria:\n${criteria.map((c, i) => `${i + 1}. ${c}`).join('\n')}` : '',
+    ledger.length > 0 ? `Progress so far:\n${ledger.map((l) => `- ${l}`).join('\n')}` : '',
+    `Validation attempts used: ${goal.attempt ?? 0}/${goal.maxAttempts ?? GOAL_DEFAULT_MAX_ATTEMPTS}.`,
+    'If a criterion is genuinely impossible, say so explicitly with the concrete reason instead of declaring done without it.',
+  ].filter(Boolean).join('\n');
+}
 
 export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   const row = getSession(options.sessionId);
@@ -2203,6 +2306,10 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     buildTurnMemoryPrimer(options.input),
     primeTurnRecallVector(options.input),
   ]);
+  // Goal contract: re-fetch the session's parked goal EVERY turn from the
+  // store (never trusted to transcript memory) so the model always works
+  // against the authoritative objective + criteria + progress ledger.
+  const activeGoalForTurn = safeActiveGoal(options.sessionId);
   const contextPacket = buildAgentContextPacket(options.input, {
     enabled: turnMemoryPrimer.enabled,
     hitCount: turnMemoryPrimer.hitCount,
@@ -2270,6 +2377,19 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
           input: [
             ...modelData.input,
             { role: 'system', content: turnMemoryPrimer.text } as AgentInputItem,
+          ],
+          instructions: modelData.instructions,
+        };
+      }
+
+      // Goal contract: the parked goal block rides with the model-only
+      // transient context (like the memory primer — never persisted into
+      // session history, re-rendered fresh from the store each turn).
+      if (activeGoalForTurn) {
+        modelData = {
+          input: [
+            ...modelData.input,
+            { role: 'system', content: renderGoalContextBlock(activeGoalForTurn) } as AgentInputItem,
           ],
           instructions: modelData.instructions,
         };

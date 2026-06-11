@@ -54,6 +54,9 @@ export const EVENT_TYPES = [
   // Loop intent proposal: surfaced before tools fire on multi-step requests.
   // Contains the planned objective, steps, and risks.
   'loop_intent_proposed',
+  // Goal-contract validation (goal-contract Phase 3): emitted when a session's
+  // parked goal is validated on self-declared completion — pass/fail, attempt.
+  'goal_validation',
   'guardrail_tripped',
   'stuck_detected',
   // Emitted from the conversation loop when stuck_detected fires AND

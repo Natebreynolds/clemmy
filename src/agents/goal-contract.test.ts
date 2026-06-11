@@ -63,6 +63,7 @@ function aPlan(overrides = {}) {
   };
 }
 
+/** Approval now AUTO-ACTIVATES chat plans (Phase 3) — returns the ACTIVE goal. */
 function surfaceApproved(sessionId: string) {
   const p = surfacePlan({ plan: aPlan(), originatingRequest: 'do the outreach prep', sessionId });
   return approvePlanProposal(p.id, { allowedTools: [] })!;
@@ -70,9 +71,8 @@ function surfaceApproved(sessionId: string) {
 
 // ─── activate ────────────────────────────────────────────────────────────────
 
-test('activateGoal: approved → active with goal fields initialized', () => {
-  const approved = surfaceApproved('sess-g1');
-  const active = activateGoal(approved.id);
+test('approval auto-activates: approved chat plan becomes the ACTIVE goal with fields initialized', () => {
+  const active = surfaceApproved('sess-g1');
   assert.ok(active);
   assert.equal(active!.status, 'active');
   assert.equal(active!.origin?.kind, 'chat');
@@ -103,17 +103,13 @@ test('activateGoal: refuses terminal proposals and unresolved questions', () => 
 
 test('activateGoal: ONE active goal per session — prior active is superseded, other sessions untouched', () => {
   const a = surfaceApproved('sess-g4');
-  const b = surfaceApproved('sess-g4');
   const other = surfaceApproved('sess-g4-other');
+  const activatedB = surfaceApproved('sess-g4'); // approval auto-activates + supersedes
 
-  activateGoal(a.id);
-  activateGoal(other.id);
-  const activatedB = activateGoal(b.id);
-
-  assert.equal(activatedB!.status, 'active');
+  assert.equal(activatedB.status, 'active');
   assert.equal(getPlanProposal(a.id)!.status, 'superseded', 'prior active goal superseded');
   assert.equal(getPlanProposal(other.id)!.status, 'active', 'other session goal untouched');
-  assert.equal(getActiveGoalForSession('sess-g4')!.id, b.id);
+  assert.equal(getActiveGoalForSession('sess-g4')!.id, activatedB.id);
 });
 
 // ─── reads ───────────────────────────────────────────────────────────────────
@@ -124,8 +120,8 @@ test('getActiveGoalForSession: null without a session or active goal', () => {
 });
 
 test('listActiveGoalContracts lists active goals across sessions', () => {
-  activateGoal(surfaceApproved('sess-g5a').id);
-  activateGoal(surfaceApproved('sess-g5b').id);
+  surfaceApproved('sess-g5a');
+  surfaceApproved('sess-g5b');
   const all = listActiveGoalContracts();
   assert.equal(all.length, 2);
   assert.ok(all.every((g) => g.status === 'active'));
@@ -134,7 +130,7 @@ test('listActiveGoalContracts lists active goals across sessions', () => {
 // ─── progress + validation bookkeeping ───────────────────────────────────────
 
 test('touchGoalActivity bumps lastActivityAt and bounds the ledger at 20 lines', () => {
-  const g = activateGoal(surfaceApproved('sess-g6').id)!;
+  const g = surfaceApproved('sess-g6');
   for (let i = 0; i < 25; i++) touchGoalActivity(g.id, `step ${i} done`);
   const after = getPlanProposal(g.id)!;
   assert.equal(after.progressLedger!.length, 20, 'ledger bounded');
@@ -143,7 +139,7 @@ test('touchGoalActivity bumps lastActivityAt and bounds the ledger at 20 lines',
 });
 
 test('recordGoalValidation appends evidence and bumps attempt', () => {
-  const g = activateGoal(surfaceApproved('sess-g7').id)!;
+  const g = surfaceApproved('sess-g7');
   recordGoalValidation(g.id, [
     { at: new Date().toISOString(), attempt: 1, criterion: 'A local markdown brief exists.', pass: false, method: 'deterministic', detail: 'file missing' },
   ]);
@@ -154,7 +150,7 @@ test('recordGoalValidation appends evidence and bumps attempt', () => {
 });
 
 test('satisfy/expire transition only from active', () => {
-  const g = activateGoal(surfaceApproved('sess-g8').id)!;
+  const g = surfaceApproved('sess-g8');
   const satisfied = satisfyGoal(g.id, 'all criteria met');
   assert.equal(satisfied!.status, 'satisfied');
   assert.equal(satisfied!.doneReason, 'all criteria met');
@@ -174,9 +170,9 @@ function backdateGoal(id: string, hoursAgo: number) {
 }
 
 test('reapExpiredGoals: idle chat goal expires; fresh and workflow-origin goals survive', () => {
-  const idle = activateGoal(surfaceApproved('sess-r1').id)!;
-  const fresh = activateGoal(surfaceApproved('sess-r2').id)!;
-  const wf = activateGoal(surfaceApproved('sess-r3').id, { origin: { kind: 'workflow', runId: 'run-1' } })!;
+  const idle = surfaceApproved('sess-r1');
+  const fresh = surfaceApproved('sess-r2');
+  const wf = activateGoal(surfacePlan({ plan: aPlan(), originatingRequest: 'wf goal', sessionId: 'sess-r3' }).id, { origin: { kind: 'workflow', runId: 'run-1' } })!;
   backdateGoal(idle.id, 30);
   backdateGoal(wf.id, 30);
 
@@ -188,9 +184,9 @@ test('reapExpiredGoals: idle chat goal expires; fresh and workflow-origin goals 
 });
 
 test('reapExpiredGoals: mid-flight expiry notifies once; untouched expiry is silent', () => {
-  const midFlight = activateGoal(surfaceApproved('sess-r4').id)!;
+  const midFlight = surfaceApproved('sess-r4');
   touchGoalActivity(midFlight.id, 'pulled the accounts');
-  const untouched = activateGoal(surfaceApproved('sess-r5').id)!;
+  const untouched = surfaceApproved('sess-r5');
   backdateGoal(midFlight.id, 30);
   backdateGoal(untouched.id, 30);
 
@@ -204,25 +200,25 @@ test('reapExpiredGoals: mid-flight expiry notifies once; untouched expiry is sil
 });
 
 test('reapExpiredGoals: terminal records older than 7 days purge; pending/approved proposals untouched', () => {
-  const old = activateGoal(surfaceApproved('sess-r6').id)!;
+  const old = surfaceApproved('sess-r6');
   satisfyGoal(old.id);
   backdateGoal(old.id, 8 * 24);
 
   const pendingP = surfacePlan({ plan: aPlan(), originatingRequest: 'still pending', sessionId: 'sess-r7' });
-  const approvedP = surfaceApproved('sess-r8');
+  const freshActive = surfaceApproved('sess-r8');
 
   const stats = reapExpiredGoals();
   assert.equal(stats.purged, 1);
   assert.equal(getPlanProposal(old.id), null, 'purged from disk');
   assert.equal(getPlanProposal(pendingP.id)!.status, 'pending', 'pending proposal untouched');
-  assert.equal(getPlanProposal(approvedP.id)!.status, 'approved', 'approved proposal untouched');
+  assert.equal(getPlanProposal(freshActive.id)!.status, 'active', 'fresh active goal untouched');
 });
 
 // ─── back-compat ────────────────────────────────────────────────────────────
 
 test('existing proposal flow is unchanged: default list filter still pending-only', () => {
   const p = surfacePlan({ plan: aPlan(), originatingRequest: 'plain proposal', sessionId: 'sess-bc1' });
-  activateGoal(surfaceApproved('sess-bc1').id);
+  surfaceApproved('sess-bc1');
   const pendingOnly = listPlanProposals({ sessionId: 'sess-bc1' });
   assert.equal(pendingOnly.length, 1);
   assert.equal(pendingOnly[0].id, p.id);

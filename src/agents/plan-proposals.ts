@@ -491,6 +491,21 @@ export function approvePlanProposal(id: string, options: ApprovePlanProposalOpti
   });
 
   logger.info({ proposalId: proposal.id, edited: Boolean(options.editedPlan), scopeOpened }, 'plan proposal approved');
+
+  // Goal-contract Phase 3: an approved CHAT plan becomes the session's parked
+  // goal — the harness re-injects it each turn and validates completion
+  // against its successCriteria externally. One chokepoint, all approval
+  // surfaces. workflow_pending_inputs records are a resume mechanism, not a
+  // goal; sessionless proposals have no conversation to pin to. Best-effort:
+  // activation failure must never break the approval itself.
+  if (proposal.sessionId && (proposal.kind ?? 'plan') === 'plan') {
+    try {
+      const activated = activateGoal(proposal.id, { origin: { kind: 'chat' } });
+      if (activated) return activated;
+    } catch (err) {
+      logger.warn({ proposalId: proposal.id, err: err instanceof Error ? err.message : String(err) }, 'goal activation after approval failed');
+    }
+  }
   return resolved;
 }
 
@@ -616,6 +631,46 @@ export function getActiveGoalForSession(sessionId: string): PlanProposal | null 
   if (!sessionId) return null;
   const active = listPlanProposals({ status: 'active', sessionId, limit: 1 });
   return active[0] ?? null;
+}
+
+/**
+ * /goal front door: create + activate a goal directly from a bare objective
+ * (no plan-first round-trip). The synthetic plan carries the objective with
+ * NO success criteria — validation falls back to judging the objective itself
+ * via the audit-checklist judge, which is exactly the legacy /goal semantics.
+ * Criteria-rich goals come from the plan-first approval path instead.
+ */
+export function createDirectGoal(input: {
+  objective: string;
+  sessionId: string;
+  channel?: string;
+  maxAttempts?: number;
+}): PlanProposal | null {
+  const objective = input.objective.trim();
+  if (objective.length < 4 || !input.sessionId) return null;
+  const now = new Date().toISOString();
+  const proposal: PlanProposal = {
+    id: `goal-${randomUUID().slice(0, 8)}`,
+    proposedAt: now,
+    proposedByAgent: 'clementine',
+    status: 'pending',
+    originatingRequest: objective,
+    sessionId: input.sessionId,
+    channel: input.channel,
+    plan: {
+      objective,
+      steps: [{ n: 1, action: `Pursue the objective: ${objective}`, rationale: 'Direct /goal objective.', verification: null }],
+      successCriteria: [],
+      risks: [],
+      estimatedComplexity: 'moderate',
+      recommendsTrackedExecution: false,
+      needsUserInput: [],
+      appliedInstructions: [],
+    },
+    version: 'v1',
+  };
+  writeProposal(proposal);
+  return activateGoal(proposal.id, { origin: { kind: 'chat' }, maxAttempts: input.maxAttempts });
 }
 
 /** Restart-resume seam: every active goal across all sessions. */
