@@ -7,6 +7,7 @@ const APPS = [
   "Discord", "Asana", "HubSpot", "Salesforce", "Zendesk", "Intercom",
   "Vercel", "Cloudflare", "Twilio", "Sendgrid", "Webflow", "Figma",
   "Jira", "ClickUp", "Trello", "Dropbox", "Box", "OneDrive",
+  "Outlook", "Firecrawl", "Google Docs", "LinkedIn", "YouTube", "Vapi",
 ];
 
 export function ConnectedMarquee() {

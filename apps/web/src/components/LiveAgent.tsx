@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { motion, AnimatePresence } from "framer-motion";
+import { motion, AnimatePresence, useReducedMotion } from "framer-motion";
 import {
   Search,
   Mail,
@@ -19,20 +19,26 @@ type Beat =
   | { kind: "think"; text: string }
   | { kind: "tool"; icon: typeof Mail; label: string; args: string; result?: string }
   | { kind: "memory"; text: string }
+  | { kind: "goal"; text: string }
+  | { kind: "heal"; text: string }
   | { kind: "approval"; label: string }
+  | { kind: "outcome"; text: string }
   | { kind: "reply"; text: string };
 
 const SCRIPT: Beat[] = [
   { kind: "memory", text: "Q4 Planning meeting · 47 min · auto-captured · 14 action items extracted" },
   { kind: "user", text: "Summarize today's planning meeting and email action items to the team." },
+  { kind: "goal", text: "goal contract · summary doc exists + mail delivered to every owner" },
   { kind: "think", text: "Pulling transcript and structured notes…" },
   { kind: "tool", icon: Video, label: "meeting.get", args: "today · Q4 Planning", result: "47 min · 3 speakers · 14 actions" },
   { kind: "tool", icon: Search, label: "vault.search", args: '"Q4 plan, Acme partnership"', result: "8 matches" },
   { kind: "tool", icon: FileSpreadsheet, label: "google_drive.create", args: "Q4 Planning · /Team Docs", result: "doc_e9f1a8" },
   { kind: "approval", label: "Send email to 7 recipients?" },
+  { kind: "heal", text: "gmail.send · 429 rate-limited → diagnosed → backoff 2s → retry" },
   { kind: "tool", icon: Mail, label: "gmail.send", args: "team@clem.ai · Q4 Planning · 14 actions", result: "sent · msg_3c1d" },
   { kind: "memory", text: "Wrote: 'Q4 planning shipped 2026-05-20 · 14 actions' → vault/notes" },
-  { kind: "reply", text: "Done. Doc in Team Docs, mail sent to 7. 14 actions assigned and logged." },
+  { kind: "outcome", text: "done · goal validated — doc created, 7/7 delivered · spoken into chat" },
+  { kind: "reply", text: "Done. Doc in Team Docs, mail sent to all 7. 14 actions assigned and logged." },
 ];
 
 const TYPE_SPEED = 14; // ms per char for typed strings
@@ -57,6 +63,7 @@ function useTypewriter(text: string, active: boolean) {
 }
 
 export function LiveAgent() {
+  const reducedMotion = useReducedMotion();
   const [step, setStep] = useState(0);
   const [tick, setTick] = useState(0); // forces re-run on loop
   const [hasVideo, setHasVideo] = useState<boolean | null>(null);
@@ -75,13 +82,17 @@ export function LiveAgent() {
   }, []);
 
   useEffect(() => {
+    if (reducedMotion) { setStep(SCRIPT.length - 1); return; }
     const delays = SCRIPT.map((b) => {
       switch (b.kind) {
         case "user": return 1800;
         case "think": return 900;
         case "memory": return 900;
+        case "goal": return 1100;
+        case "heal": return 1500;
         case "tool": return 1500;
         case "approval": return 1800;
+        case "outcome": return 2000;
         case "reply": return 2200;
       }
     });
@@ -100,7 +111,7 @@ export function LiveAgent() {
     };
     advance();
     return () => { canceled = true; };
-  }, [tick]);
+  }, [tick, reducedMotion]);
 
   // Show all beats up to current step, but typewriter the latest one
   const visible = useMemo(() => SCRIPT.slice(0, step + 1), [step]);
@@ -195,7 +206,7 @@ export function LiveAgent() {
           <Pillar
             icon={Sparkles}
             title="No silent failures"
-            body="Every scheduled run completes with success or a clear, addressable failure. Nothing dies quietly."
+            body="Failed steps get diagnosed and retried with backoff. Every run ends in an Outcome — done, partial, or failed — delivered back to where you asked. Nothing dies quietly."
           />
         </div>
       </div>
@@ -262,6 +273,34 @@ function BeatRow({ beat, active }: { beat: Beat; active: boolean }) {
       <Row label="mem" labelClass="text-violet-300">
         <span className="text-violet-200/90">{beat.text}</span>
       </Row>
+    );
+  }
+  if (beat.kind === "goal") {
+    return (
+      <Row label="goal" labelClass="text-sky-300">
+        <span className="text-sky-200/90">{beat.text}</span>
+      </Row>
+    );
+  }
+  if (beat.kind === "heal") {
+    return (
+      <Row label="!" labelClass="text-amber-300">
+        <span className="text-amber-200/90">{beat.text}</span>
+      </Row>
+    );
+  }
+  if (beat.kind === "outcome") {
+    return (
+      <motion.div
+        initial={{ opacity: 0, y: 6 }}
+        animate={{ opacity: 1, y: 0 }}
+        className="my-1 rounded-lg border border-emerald-300/30 bg-emerald-300/[0.06] px-3 py-2"
+      >
+        <div className="text-[11px] font-mono uppercase tracking-wider text-emerald-300">
+          Outcome
+        </div>
+        <div className="mt-1 text-white/90">{beat.text}</div>
+      </motion.div>
     );
   }
   if (beat.kind === "approval") {

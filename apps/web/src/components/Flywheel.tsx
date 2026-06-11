@@ -36,8 +36,8 @@ const STEPS = [
   {
     icon: Workflow,
     eyebrow: "05 · Compounds",
-    title: "Becomes a workflow.",
-    body: "Do something twice — she suggests automating it. Define a recurring workflow once and she runs it on schedule: morning briefing, weekly reviews, post-meeting follow-ups. The flywheel turns.",
+    title: "Becomes a workflow. And reports back.",
+    body: "Do something twice — she suggests automating it. Every run carries a goal contract: she validates the work actually met it before calling it done, retries what fails, and delivers the Outcome back to the channel you asked from. The flywheel turns.",
     accent: "bg-clem-600",
   },
 ];

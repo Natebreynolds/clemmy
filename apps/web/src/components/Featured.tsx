@@ -1,7 +1,7 @@
 "use client";
 
 import { ReactNode, useEffect, useState } from "react";
-import { motion, AnimatePresence } from "framer-motion";
+import { motion, AnimatePresence, useReducedMotion } from "framer-motion";
 import {
   Plug,
   Mic,
@@ -16,6 +16,11 @@ import {
   Sparkles,
   Puzzle,
   Workflow,
+  LayoutDashboard,
+  Megaphone,
+  Wrench,
+  FileText,
+  Smartphone,
 } from "lucide-react";
 import { Section } from "./ui/Section";
 import { fadeUp, stagger } from "@/lib/motion";
@@ -32,7 +37,7 @@ export function Featured() {
           <span className="text-[var(--ink-dim)]">Now she does it for you.</span>
         </>
       }
-      intro="Six headline capabilities. Six more underneath. Every one runs through the same memory, the same tools, and the same approval policy."
+      intro="The headline capabilities — and the long tail underneath. Every one runs through the same memory, the same tools, and the same approval policy."
     >
       <div className="space-y-6">
         <FeatureRow
@@ -61,10 +66,10 @@ export function Featured() {
           <FeatureRow
             eyebrow="Memory spine"
             title="Learns what works. Remembers it."
-            body="Markdown vault + SQLite FTS + embeddings. Decisions, wins, tool choices, and project context flow in automatically. Tomorrow's session starts knowing yesterday."
+            body="Markdown vault + SQLite FTS + semantic embeddings. Decisions, wins, tool choices, and project context flow in automatically — then get consolidated: near-duplicate memories merge (with guards so facts about different clients never blur together), and what you use most stays sharpest. Explore all of it as a 3D constellation in the console."
             icon={Brain}
             compact
-            preview={<MemoryStack />}
+            preview={<ConstellationPreview />}
           />
         </div>
         <FeatureRow
@@ -74,6 +79,31 @@ export function Featured() {
           icon={Workflow}
           preview={<WorkflowsPreview />}
         />
+        <FeatureRow
+          eyebrow="Workspaces · self-running surfaces"
+          title="She doesn't just answer. She builds you software."
+          body="Ask for a tracker, a live report, a planning board — and Clementine writes you a real interactive page that keeps itself up to date on a schedule, with no model in the loop while it runs. A CRM fed by your pipeline workflow. A campaign dashboard that refreshes every morning. Open it, click around, edit rows — it's yours."
+          icon={LayoutDashboard}
+          preview={<SpacesPreview />}
+        />
+        <div className="grid gap-6 md:grid-cols-2">
+          <FeatureRow
+            eyebrow="Outcomes · goal contracts"
+            title="Every run reports back."
+            body="Each run carries a goal contract — she validates the result actually met it before calling it done. The Outcome lands back in the channel you asked from: done, partial, or failed, with artifacts and the next step. In chat, she says it out loud."
+            icon={Megaphone}
+            compact
+            preview={<OutcomePreview />}
+          />
+          <FeatureRow
+            eyebrow="Reliability · self-healing"
+            title="Fails loudly. Fixes quietly."
+            body="A failing step gets diagnosed, not buried: transient errors retry with backoff, broken workflows propose their own fixes, and a circuit breaker stops runaway loops. You see one clear outcome instead of a silent stall."
+            icon={Wrench}
+            compact
+            preview={<SelfHealPreview />}
+          />
+        </div>
         <FeatureRow
           eyebrow="Skills · drop-in extensibility"
           title="Teach her in plain markdown."
@@ -109,10 +139,10 @@ export function Featured() {
             { icon: Terminal, title: "Computer-use", body: "Write files, run shell commands, edit code. Gated by your scope policy, hard denylist absolute." },
             { icon: Clock, title: "Scheduled tasks", body: "Pre-configured morning briefing, end-of-day, weekly review. Add your own cron from the dashboard." },
             { icon: Webhook, title: "Webhook & API", body: "POST a task and walk away. NDJSON streaming on /chat/stream. Wire her into Raycast or Shortcuts." },
-            { icon: Sparkles, title: "Goals & autonomy", body: "Active goals get injected into every cycle. She brings them up — you don't have to remember." },
-            { icon: Plug, title: "Plugin system", body: "Drop a package into ~/.clementine-next/plugins/. Adds tools, monitors, channels — no rebuild." },
+            { icon: FileText, title: "File ingestion", body: "Drop in a PDF, DOCX, XLSX — or paste a YouTube link. She reads it straight into memory." },
+            { icon: Smartphone, title: "Mobile web", body: "Open the console from your phone — secure tunnel, rotating PIN. Approvals on the go." },
             { icon: ShieldCheck, title: "Audit log", body: "Append-only NDJSON record of every tool call. The substrate for the always-learning loop." },
-            { icon: Brain, title: "Codex OAuth", body: "Sign in once with ChatGPT. Or bring your own OpenAI key. Or both. Your wallet, your model." },
+            { icon: Brain, title: "Bring your model", body: "Sign in with ChatGPT or Claude, or bring your own API key. Switch backends from Settings." },
           ].map(({ icon: Icon, title, body }) => (
             <motion.div
               key={title}
@@ -187,7 +217,7 @@ function FeatureRow({
             {body}
           </p>
         </div>
-        <div className={"relative " + (compact ? "h-[180px]" : "h-[280px] md:h-[320px]")}>
+        <div aria-hidden className={"relative " + (compact ? "h-[180px]" : "h-[280px] md:h-[320px]")}>
           {preview}
         </div>
       </div>
@@ -213,6 +243,7 @@ const TOOLS = [
 ];
 
 function ToolOrbit() {
+  const reducedMotion = useReducedMotion();
   const rings = [
     { count: 4, r: 92, dur: 32, dir: 1 },
     { count: 5, r: 152, dur: 48, dir: -1 },
@@ -245,7 +276,7 @@ function ToolOrbit() {
         ))}
 
         <motion.div
-          animate={{ scale: [1, 1.06, 1] }}
+          animate={reducedMotion ? undefined : { scale: [1, 1.06, 1] }}
           transition={{ duration: 3.5, repeat: Infinity, ease: "easeInOut" }}
           className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 size-16 rounded-full bg-gradient-to-br from-clem-300 to-clem-600 shadow-[0_0_70px_rgba(249,115,22,0.6)] ring-2 ring-clem-200"
         >
@@ -256,15 +287,16 @@ function ToolOrbit() {
           <motion.div
             key={ri}
             className="absolute inset-0"
-            animate={{ rotate: ring.dir * 360 }}
+            animate={reducedMotion ? undefined : { rotate: ring.dir * 360 }}
             transition={{ duration: ring.dur, repeat: Infinity, ease: "linear" }}
           >
             {layout
               .filter((c) => c.ring === ri)
               .map(({ tool, angle, r, dur, dir }) => {
                 const rad = (angle * Math.PI) / 180;
-                const x = Math.cos(rad) * r;
-                const y = Math.sin(rad) * r;
+                // Round so SSR markup and client hydration serialize identically.
+                const x = Math.round(Math.cos(rad) * r * 100) / 100;
+                const y = Math.round(Math.sin(rad) * r * 100) / 100;
                 return (
                   <motion.div
                     key={tool.name}
@@ -272,7 +304,7 @@ function ToolOrbit() {
                     style={{ x, y }}
                   >
                     <motion.div
-                      animate={{ rotate: -dir * 360 }}
+                      animate={reducedMotion ? undefined : { rotate: -dir * 360 }}
                       transition={{ duration: dur, repeat: Infinity, ease: "linear" }}
                       className="-translate-x-1/2 -translate-y-1/2 rounded-full bg-white ring-1 ring-black/10 px-2.5 py-1 flex items-center gap-1.5 shadow-[0_4px_14px_-4px_rgba(80,40,10,0.18)]"
                     >
@@ -297,6 +329,7 @@ function ToolOrbit() {
 /* ───── Preview: voice waveform ───── */
 
 function VoiceWave() {
+  const reducedMotion = useReducedMotion();
   return (
     <div className="absolute inset-0 flex items-center justify-center">
       <div className="flex items-center gap-1.5 h-24">
@@ -307,7 +340,8 @@ function VoiceWave() {
             <motion.span
               key={i}
               className="w-1 rounded-full bg-gradient-to-t from-clem-700 to-clem-400"
-              animate={{
+              style={reducedMotion ? { height: `${baseH}px` } : undefined}
+              animate={reducedMotion ? undefined : {
                 height: [
                   `${baseH * 0.4}px`,
                   `${baseH * 1.2 + 10}px`,
@@ -329,41 +363,278 @@ function VoiceWave() {
   );
 }
 
-/* ───── Preview: memory cards ───── */
+/* ───── Preview: memory constellation ───── */
 
-const NOTES = [
-  { tag: "decision", text: "Picked Railway over Vercel — preview env per branch" },
-  { tag: "fact", text: "Nathan @ Breakthrough Coaching · macOS · Codex OAuth" },
-  { tag: "win", text: "Q4 retro shipped 2026-05-20 · 7 recipients" },
-  { tag: "tool", text: "vault.search + gmail.send cluster — preload" },
+// Fixed node layout — a small slice of the console's 3D memory constellation,
+// drawn as SVG so the marketing site never imports three.js.
+const C_NODES: Array<{ x: number; y: number; r: number; c: string; pulse?: boolean }> = [
+  { x: 95,  y: 70,  r: 7,   c: "#fb923c", pulse: true },
+  { x: 170, y: 45,  r: 4.5, c: "#38bdf8" },
+  { x: 230, y: 95,  r: 5.5, c: "#a78bfa" },
+  { x: 150, y: 120, r: 4,   c: "#fbbf24" },
+  { x: 60,  y: 130, r: 5,   c: "#34d399" },
+  { x: 280, y: 55,  r: 4,   c: "#f472b6" },
+  { x: 305, y: 130, r: 6,   c: "#fb923c" },
+  { x: 215, y: 160, r: 4.5, c: "#38bdf8" },
+  { x: 110, y: 175, r: 4,   c: "#a78bfa" },
+  { x: 30,  y: 60,  r: 3.5, c: "#fbbf24" },
+  { x: 340, y: 90,  r: 3.5, c: "#34d399" },
+  { x: 265, y: 185, r: 5,   c: "#f472b6" },
 ];
 
-function MemoryStack() {
+const C_EDGES: Array<[number, number]> = [
+  [0, 1], [0, 3], [0, 4], [0, 9], [1, 2], [1, 5], [2, 3], [2, 6],
+  [2, 7], [3, 8], [5, 10], [6, 10], [6, 11], [7, 11], [4, 8],
+];
+
+function ConstellationPreview() {
+  const reducedMotion = useReducedMotion();
   return (
     <div className="absolute inset-0 flex items-center justify-center">
-      <div className="relative w-full max-w-sm">
-        {NOTES.map((n, i) => (
+      <div className="relative w-full max-w-sm overflow-hidden rounded-xl bg-[#0d0907] ring-1 ring-black/20 shadow-[0_20px_50px_-20px_rgba(0,0,0,0.5)]">
+        <div className="flex items-center gap-2 border-b border-white/5 px-3 py-2 font-mono text-[9px] uppercase tracking-wider text-white/45">
+          <Brain className="h-3 w-3 text-clem-300" />
+          memory · 1,046 facts · 120k links
+          <span className="ml-auto inline-flex items-center gap-1 text-emerald-300/80 normal-case">
+            <span className="size-1 rounded-full bg-emerald-400 animate-pulse" />
+            recall
+          </span>
+        </div>
+        <motion.svg
+          viewBox="0 0 370 215"
+          className="block w-full"
+          animate={reducedMotion ? undefined : { scale: [1, 1.04, 1] }}
+          transition={{ duration: 14, repeat: Infinity, ease: "easeInOut" }}
+        >
+          {C_EDGES.map(([a, b], i) => (
+            <motion.line
+              key={i}
+              x1={C_NODES[a].x}
+              y1={C_NODES[a].y}
+              x2={C_NODES[b].x}
+              y2={C_NODES[b].y}
+              stroke="rgba(251,146,60,0.25)"
+              strokeWidth={0.75}
+              initial={{ pathLength: 0, opacity: 0 }}
+              whileInView={{ pathLength: 1, opacity: 1 }}
+              viewport={{ once: true }}
+              transition={{ duration: 0.9, delay: 0.3 + i * 0.05 }}
+            />
+          ))}
+          {C_NODES.map((n, i) => (
+            <motion.circle
+              key={i}
+              cx={n.x}
+              cy={n.y}
+              r={n.r}
+              fill={n.c}
+              initial={{ opacity: 0, scale: 0 }}
+              whileInView={{ opacity: 0.9, scale: 1 }}
+              viewport={{ once: true }}
+              transition={{ duration: 0.5, delay: i * 0.06 }}
+              style={{ filter: `drop-shadow(0 0 ${n.r}px ${n.c})` }}
+            />
+          ))}
+          {/* recall pulse on the hot node */}
+          {!reducedMotion && (
+            <motion.circle
+              cx={C_NODES[0].x}
+              cy={C_NODES[0].y}
+              r={8}
+              fill="none"
+              stroke="#fb923c"
+              strokeWidth={1}
+              initial={{ r: 8, opacity: 0.8 }}
+              animate={{ r: [8, 22], opacity: [0.8, 0] }}
+              transition={{ duration: 2.2, repeat: Infinity, ease: "easeOut" }}
+            />
+          )}
+        </motion.svg>
+      </div>
+    </div>
+  );
+}
+
+/* ───── Preview: workspaces / spaces ───── */
+
+const SPACE_ROWS = [
+  { name: "Spring Pt Push", stage: "Proposal", value: "$18k", tone: "text-amber-700 bg-amber-50 ring-amber-400/40" },
+  { name: "Harbor & Co", stage: "Won", value: "$32k", tone: "text-emerald-700 bg-emerald-50 ring-emerald-400/40" },
+  { name: "Northside reno", stage: "Call set", value: "$9k", tone: "text-sky-700 bg-sky-50 ring-sky-400/40" },
+  { name: "Q3 retainer", stage: "Drafting", value: "$24k", tone: "text-violet-700 bg-violet-50 ring-violet-400/40" },
+];
+
+function SpacesPreview() {
+  return (
+    <div className="absolute inset-0 flex items-center justify-center p-2">
+      <div className="w-full max-w-md overflow-hidden rounded-xl bg-white ring-1 ring-black/10 shadow-[0_20px_50px_-20px_rgba(80,40,10,0.3)]">
+        {/* browser chrome */}
+        <div className="flex items-center gap-1.5 border-b border-black/5 bg-[var(--bg-dim)] px-3 py-2">
+          <span className="size-2 rounded-full bg-red-400" />
+          <span className="size-2 rounded-full bg-yellow-400" />
+          <span className="size-2 rounded-full bg-green-400" />
+          <span className="ml-2 flex-1 truncate rounded bg-white/70 px-2 py-0.5 font-mono text-[9px] text-[var(--ink-dim)]">
+            workspaces / pipeline-tracker
+          </span>
+          <span className="font-mono text-[8px] uppercase tracking-wider text-emerald-700 bg-emerald-50 ring-1 ring-emerald-400/40 rounded px-1.5 py-0.5 whitespace-nowrap">
+            auto · 7:00 AM · no LLM
+          </span>
+        </div>
+        <div className="px-3 py-2.5">
+          <div className="grid grid-cols-[1.4fr_1fr_0.6fr] gap-2 pb-1.5 font-mono text-[9px] uppercase tracking-wider text-[var(--ink-faint)]">
+            <span>Deal</span><span>Stage</span><span className="text-right">Value</span>
+          </div>
+          {SPACE_ROWS.map((r, i) => (
+            <motion.div
+              key={r.name}
+              initial={{ opacity: 0, x: -10 }}
+              whileInView={{ opacity: 1, x: 0 }}
+              viewport={{ once: true }}
+              transition={{ duration: 0.45, delay: 0.2 + i * 0.12 }}
+              className="grid grid-cols-[1.4fr_1fr_0.6fr] items-center gap-2 border-t border-black/[0.05] py-2"
+            >
+              <span className="truncate text-[12px] font-medium text-[var(--ink-strong)]">{r.name}</span>
+              <span className={"inline-flex w-fit rounded-full px-2 py-0.5 text-[10px] ring-1 " + r.tone}>{r.stage}</span>
+              <span className="text-right font-mono text-[11px] text-[var(--ink-dim)]">{r.value}</span>
+            </motion.div>
+          ))}
           <motion.div
-            key={i}
-            initial={{ y: 20, opacity: 0 }}
-            whileInView={{ y: 0, opacity: 1 }}
+            initial={{ opacity: 0 }}
+            whileInView={{ opacity: 1 }}
             viewport={{ once: true }}
-            transition={{ duration: 0.6, delay: i * 0.15 }}
-            className="absolute left-0 right-0 rounded-lg bg-white ring-1 ring-black/10 px-3 py-2.5 shadow-[0_6px_18px_-6px_rgba(80,40,10,0.18)]"
-            style={{
-              top: `${i * 28}px`,
-              transform: `rotate(${(i - 1.5) * 1.5}deg)`,
-              zIndex: NOTES.length - i,
-            }}
+            transition={{ delay: 0.9 }}
+            className="mt-2 flex items-center gap-1.5 font-mono text-[9px] text-[var(--ink-faint)]"
           >
-            <div className="flex items-center gap-2 mb-1">
-              <span className="font-mono text-[9px] uppercase tracking-wider text-clem-700 rounded bg-clem-500/12 px-1.5 py-0.5 ring-1 ring-clem-500/30">
-                {n.tag}
-              </span>
-            </div>
-            <div className="text-[12px] text-[var(--ink-strong)] leading-snug">{n.text}</div>
+            <span className="size-1 rounded-full bg-emerald-500" />
+            built by Clementine · refreshed 4 min ago
           </motion.div>
-        ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ───── Preview: outcome report-back ───── */
+
+function OutcomePreview() {
+  return (
+    <div className="absolute inset-0 flex items-center justify-center p-2">
+      <motion.div
+        initial={{ opacity: 0, y: 16, scale: 0.97 }}
+        whileInView={{ opacity: 1, y: 0, scale: 1 }}
+        viewport={{ once: true }}
+        transition={{ duration: 0.6, ease: [0.16, 1, 0.3, 1] }}
+        className="w-full max-w-sm rounded-xl bg-white ring-1 ring-black/10 p-4 shadow-[0_16px_40px_-16px_rgba(80,40,10,0.25)]"
+      >
+        <div className="flex items-center gap-2">
+          <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-50 ring-1 ring-emerald-400/40 px-2.5 py-0.5 text-[11px] font-medium text-emerald-700">
+            <CheckCircle2 className="h-3.5 w-3.5" />
+            done
+          </span>
+          <span className="font-mono text-[10px] uppercase tracking-wider text-[var(--ink-faint)]">
+            outcome · weekly-pipeline-report
+          </span>
+        </div>
+        <div className="mt-3 space-y-1.5">
+          {[
+            "Report generated — 4 deals moved stage",
+            "Delivered to chat + Discord",
+            "Goal contract validated",
+          ].map((t, i) => (
+            <motion.div
+              key={t}
+              initial={{ opacity: 0, x: -8 }}
+              whileInView={{ opacity: 1, x: 0 }}
+              viewport={{ once: true }}
+              transition={{ delay: 0.35 + i * 0.18, duration: 0.4 }}
+              className="flex items-center gap-2 text-[12.5px] text-[var(--ink)]"
+            >
+              <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-emerald-500" />
+              {t}
+            </motion.div>
+          ))}
+        </div>
+        <motion.div
+          initial={{ opacity: 0 }}
+          whileInView={{ opacity: 1 }}
+          viewport={{ once: true }}
+          transition={{ delay: 1 }}
+          className="mt-3 flex items-center gap-2 rounded-lg bg-clem-50/80 ring-1 ring-clem-400/30 px-2.5 py-1.5 text-[11.5px] text-clem-800"
+        >
+          <Megaphone className="h-3.5 w-3.5 shrink-0" />
+          &ldquo;Pipeline report's done — four deals moved. One needs you.&rdquo;
+        </motion.div>
+      </motion.div>
+    </div>
+  );
+}
+
+/* ───── Preview: self-healing steps ───── */
+
+function SelfHealPreview() {
+  const reducedMotion = useReducedMotion();
+  return (
+    <div className="absolute inset-0 flex items-center justify-center p-2">
+      <div className="w-full max-w-sm space-y-1.5 font-mono text-[11.5px]">
+        <motion.div
+          initial={{ opacity: 0, x: -8 }}
+          whileInView={{ opacity: 1, x: 0 }}
+          viewport={{ once: true }}
+          transition={{ delay: 0.1 }}
+          className="flex items-center gap-2 rounded-lg bg-white ring-1 ring-black/10 px-3 py-2 text-[var(--ink)]"
+        >
+          <CheckCircle2 className="h-3.5 w-3.5 text-emerald-500" />
+          step 1 · pull pipeline
+          <span className="ml-auto text-[10px] text-[var(--ink-faint)]">1.2s</span>
+        </motion.div>
+        <motion.div
+          initial={{ opacity: 0, x: -8 }}
+          whileInView={{ opacity: 1, x: 0 }}
+          viewport={{ once: true }}
+          transition={{ delay: 0.3 }}
+          className="rounded-lg bg-white ring-1 ring-amber-400/40 px-3 py-2 text-[var(--ink)]"
+        >
+          <div className="flex items-center gap-2">
+            <span className="inline-grid size-3.5 place-items-center rounded-full bg-red-100 text-[9px] text-red-600 ring-1 ring-red-400/50">✗</span>
+            step 2 · update sheet
+            <span className="ml-auto text-[10px] text-red-500">429</span>
+          </div>
+          <motion.div
+            initial={{ opacity: 0 }}
+            whileInView={{ opacity: 1 }}
+            viewport={{ once: true }}
+            transition={{ delay: 0.7 }}
+            className="mt-1.5 flex items-center gap-1.5 pl-5 text-[10px] text-amber-700"
+          >
+            <motion.span
+              animate={reducedMotion ? undefined : { opacity: [1, 0.4, 1] }}
+              transition={{ duration: 1.4, repeat: Infinity }}
+              className="size-1.5 rounded-full bg-amber-500"
+            />
+            diagnosed: rate limit → backoff 2s → retry
+          </motion.div>
+          <motion.div
+            initial={{ opacity: 0 }}
+            whileInView={{ opacity: 1 }}
+            viewport={{ once: true }}
+            transition={{ delay: 1.3 }}
+            className="mt-1 flex items-center gap-1.5 pl-5 text-[10px] text-emerald-700"
+          >
+            <CheckCircle2 className="h-3 w-3" />
+            retry succeeded
+          </motion.div>
+        </motion.div>
+        <motion.div
+          initial={{ opacity: 0, x: -8 }}
+          whileInView={{ opacity: 1, x: 0 }}
+          viewport={{ once: true }}
+          transition={{ delay: 1.6 }}
+          className="flex items-center gap-2 rounded-lg bg-white ring-1 ring-black/10 px-3 py-2 text-[var(--ink)]"
+        >
+          <CheckCircle2 className="h-3.5 w-3.5 text-emerald-500" />
+          step 3 · deliver outcome
+          <span className="ml-auto text-[10px] text-[var(--ink-faint)]">0.8s</span>
+        </motion.div>
       </div>
     </div>
   );
@@ -542,12 +813,14 @@ function useElapsed(active: boolean) {
 }
 
 function MeetingRecording() {
+  const reducedMotion = useReducedMotion();
   const [step, setStep] = useState(0);
   const [actionStep, setActionStep] = useState(0);
   const [tick, setTick] = useState(0);
-  const timer = useElapsed(true);
+  const timer = useElapsed(!reducedMotion);
 
   useEffect(() => {
+    if (reducedMotion) { setStep(UTTERANCES.length); setActionStep(ACTIONS.length); return; }
     if (step >= UTTERANCES.length) {
       const t = window.setTimeout(() => {
         setStep(0);
@@ -558,14 +831,15 @@ function MeetingRecording() {
     }
     const t = window.setTimeout(() => setStep((s) => s + 1), 1900);
     return () => window.clearTimeout(t);
-  }, [step]);
+  }, [step, reducedMotion]);
 
   useEffect(() => {
+    if (reducedMotion) return;
     if (actionStep >= ACTIONS.length) return;
     if (step < actionStep + 2) return;
     const t = window.setTimeout(() => setActionStep((s) => s + 1), 400);
     return () => window.clearTimeout(t);
-  }, [step, actionStep]);
+  }, [step, actionStep, reducedMotion]);
 
   const visible = UTTERANCES.slice(0, step);
   const visibleActions = ACTIONS.slice(0, actionStep);

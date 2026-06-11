@@ -74,7 +74,7 @@ export function Architecture() {
         />
         <Tile
           eyebrow="Reports back"
-          body="Every scheduled run completes with success or a clear failure. Silent halts are bugs."
+          body="Every run ends in an Outcome card — done, partial, or failed, validated against its goal contract — delivered back to where you asked. Silent halts are bugs."
         />
       </div>
     </Section>
@@ -151,16 +151,18 @@ function Connector({ path, delay = 0 }: { path: string; delay?: number }) {
 }
 
 function DataFlow({ path, delay = 0 }: { path: string; delay?: number }) {
+  // Animate a CSS variable rather than offsetDistance directly — framer
+  // forwards unknown SVG props to the DOM, which trips React's prop warning.
   return (
     <g>
       <motion.circle
         r={4}
         fill="#ea580c"
-        initial={{ offsetDistance: "0%", opacity: 0 }}
+        initial={{ "--offset": "0%", opacity: 0 } as never}
         whileInView={{
-          offsetDistance: ["0%", "100%"],
+          "--offset": ["0%", "100%"],
           opacity: [0, 1, 1, 0],
-        }}
+        } as never}
         viewport={{ once: false }}
         transition={{
           delay,
@@ -169,7 +171,10 @@ function DataFlow({ path, delay = 0 }: { path: string; delay?: number }) {
           repeatDelay: 0.8,
           ease: "easeInOut",
         }}
-        style={{ offsetPath: `path("${path}")` }}
+        style={{
+          offsetPath: `path("${path}")`,
+          offsetDistance: "var(--offset)" as never,
+        }}
       />
     </g>
   );

@@ -12,7 +12,7 @@ const STATS: Array<{
   { value: 0,   suffix: "",  label: "Bots in your meetings", sub: "Native Zoom · Meet · Teams capture · no participant-list noise" },
   { value: 200, suffix: "+", label: "Connected apps",        sub: "via Composio · Gmail · Slack · Notion · Sheets · …" },
   { value: 40,  suffix: "+", label: "MCP servers",           sub: "DataForSEO · Supabase · Apify · Bright Data · …" },
-  { value: 100, suffix: "%", label: "Local-first",           sub: "Data lives in ~/.clementine-next/ · nothing else" },
+  { value: 100, suffix: "%", label: "Runs report back",      sub: "Every run ends in an Outcome — done, partial, or failed · local-first, data lives in ~/.clementine-next/" },
 ];
 
 export function Stats() {
@@ -73,11 +73,14 @@ function StatCell({
       transition={{ duration: 0.7, delay: index * 0.08, ease: [0.16, 1, 0.3, 1] }}
       className="group relative bg-[var(--bg-elev)] p-6 sm:p-7 transition-colors hover:bg-clem-50/50"
     >
-      <div className="flex items-baseline gap-1 font-semibold tracking-tight">
-        <span className="text-5xl sm:text-6xl text-[var(--ink-strong)]">
+      <div
+        className="flex items-baseline gap-1 font-semibold tracking-tight"
+        aria-label={`${value}${suffix} ${label}`}
+      >
+        <span aria-hidden className="text-5xl sm:text-6xl text-[var(--ink-strong)]">
           {count}
         </span>
-        <span className="text-3xl sm:text-4xl text-clem-600">{suffix}</span>
+        <span aria-hidden className="text-3xl sm:text-4xl text-clem-600">{suffix}</span>
       </div>
       <div className="mt-2 text-sm font-medium text-[var(--ink-strong)]">{label}</div>
       <div className="mt-1.5 text-[12px] leading-relaxed text-[var(--ink-dim)]">{sub}</div>

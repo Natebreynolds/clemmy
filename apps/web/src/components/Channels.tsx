@@ -1,11 +1,12 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { motion, AnimatePresence } from "framer-motion";
-import { Monitor, Mic, MessageSquare, Webhook } from "lucide-react";
+import Image from "next/image";
+import { motion, AnimatePresence, useReducedMotion } from "framer-motion";
+import { Monitor, Mic, MessageSquare, Webhook, Smartphone } from "lucide-react";
 import { Section } from "./ui/Section";
 
-type ChannelId = "dashboard" | "voice" | "discord" | "api";
+type ChannelId = "dashboard" | "voice" | "discord" | "mobile" | "api";
 
 const TABS: Array<{
   id: ChannelId;
@@ -16,11 +17,11 @@ const TABS: Array<{
 }> = [
   {
     id: "dashboard",
-    label: "Dashboard",
+    label: "Console",
     icon: Monitor,
-    title: "The Electron dashboard is the home page.",
+    title: "The console is mission control.",
     body:
-      "Chat with Clementine, watch tool calls stream in real time, approve actions, manage MCP servers, set your scope policy. Closing the window leaves the daemon running — find her in the menu bar to quit.",
+      "Chat is the command center — a Needs-you strip for approvals, a Working-now strip for live runs. Inbox collects outcomes, Memory shows everything she knows as a living constellation, Automate holds your workflows and schedules. Closing the window leaves the daemon running.",
   },
   {
     id: "voice",
@@ -28,15 +29,23 @@ const TABS: Array<{
     icon: Mic,
     title: "Talk to her like you'd talk to a coworker.",
     body:
-      "OpenAI Realtime, push-to-talk in the dashboard. Spoken commands route into the same local agent — same memory, same tools, same approvals. Great for hands-free starts on a long task.",
+      "OpenAI Realtime, push-to-talk in the console. Spoken commands route into the same local agent — same memory, same tools, same approvals. Great for hands-free starts on a long task.",
   },
   {
     id: "discord",
     label: "Discord",
     icon: MessageSquare,
-    title: "Run her from your phone.",
+    title: "She's in your server too.",
     body:
-      "Paste a Discord bot token in the dashboard. DM Clementine or post in a bot channel. Approvals arrive as inline buttons so you can authorize an action without unlocking your laptop.",
+      "Paste a Discord bot token in the console. DM Clementine or post in a bot channel. Approvals arrive as inline buttons so you can authorize an action without unlocking your laptop.",
+  },
+  {
+    id: "mobile",
+    label: "Mobile",
+    icon: Smartphone,
+    title: "In your pocket, behind a PIN.",
+    body:
+      "Open the console from your phone through a secure tunnel — QR setup, rotating PIN, per-device sessions. Check on a run from the coffee line, approve a send from the couch. Same daemon, nothing leaves your Mac except the tunnel you opened.",
   },
   {
     id: "api",
@@ -56,9 +65,9 @@ export function Channels() {
     <Section
       eyebrow="Channels"
       title="Talk to her any way you want."
-      intro="Same agent, same memory, four ways in. Pick whichever fits the moment."
+      intro="Same agent, same memory, five ways in. Pick whichever fits the moment."
     >
-      <div className="flex flex-wrap gap-2 mb-8">
+      <div className="flex flex-wrap gap-2 mb-8" role="tablist" aria-label="Channels">
         {TABS.map((t) => {
           const Icon = t.icon;
           const isActive = t.id === active;
@@ -66,6 +75,8 @@ export function Channels() {
             <button
               key={t.id}
               onClick={() => setActive(t.id)}
+              role="tab"
+              aria-selected={isActive}
               className={
                 "inline-flex items-center gap-2 rounded-full px-4 py-2 text-sm transition-all " +
                 (isActive
@@ -94,6 +105,7 @@ export function Channels() {
               {active === "dashboard" && <DashboardMockup />}
               {active === "voice" && <VoiceMockup />}
               {active === "discord" && <DiscordMockup />}
+              {active === "mobile" && <MobileMockup />}
               {active === "api" && <WebhookMockup />}
             </motion.div>
           </AnimatePresence>
@@ -118,18 +130,93 @@ export function Channels() {
 
 function DashboardMockup() {
   return (
-    <div
-      className="absolute inset-0 bg-cover bg-top"
-      style={{ backgroundImage: 'url("/screenshots/dashboard.png")' }}
-    />
+    <div className="absolute inset-0">
+      <Image
+        src="/screenshots/dashboard.png"
+        alt="The Clementine console with a chat thread, conversation list, and navigation for Inbox, Automate, Workspaces, Connect, Memory, and Meetings"
+        fill
+        sizes="(max-width: 1024px) 100vw, 60vw"
+        className="object-cover object-top"
+      />
+    </div>
+  );
+}
+
+function MobileMockup() {
+  const reducedMotion = useReducedMotion();
+  return (
+    <div className="absolute inset-0 flex items-center justify-center bg-[#0d0907]">
+      <div className="absolute inset-0 opacity-25">
+        <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 h-[70%] w-[55%] rounded-full bg-clem-500/30 blur-[70px]" />
+      </div>
+
+      {/* phone frame */}
+      <div className="relative h-[86%] aspect-[9/19] rounded-[2rem] bg-[var(--bg)] ring-[6px] ring-black/80 shadow-[0_30px_80px_-20px_rgba(0,0,0,0.8)] overflow-hidden">
+        <div className="absolute left-1/2 top-1.5 -translate-x-1/2 h-4 w-20 rounded-full bg-black/85 z-10" />
+
+        <div className="flex h-full flex-col px-3 pt-8 pb-3 text-[10px]">
+          <div className="flex items-center justify-between pb-2">
+            <div className="flex items-center gap-1.5">
+              <img src="/logo.png" alt="" className="h-4 w-4" style={{ imageRendering: "pixelated" }} />
+              <span className="font-semibold text-[11px] text-[var(--ink-strong)]">Clementine</span>
+            </div>
+            <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/15 px-1.5 py-0.5 text-[8px] font-mono text-emerald-700">
+              <span className="size-1 rounded-full bg-emerald-500" />
+              tunnel · PIN
+            </span>
+          </div>
+
+          <div className="flex-1 space-y-2 overflow-hidden">
+            <motion.div
+              initial={reducedMotion ? false : { opacity: 0, y: 8 }}
+              whileInView={{ opacity: 1, y: 0 }}
+              viewport={{ once: true }}
+              transition={{ duration: 0.4, delay: 0.15 }}
+              className="ml-auto max-w-[85%] rounded-xl rounded-tr-sm bg-clem-500/15 px-2.5 py-1.5 text-[var(--ink-strong)]"
+            >
+              status on the pipeline report?
+            </motion.div>
+            <motion.div
+              initial={reducedMotion ? false : { opacity: 0, y: 8 }}
+              whileInView={{ opacity: 1, y: 0 }}
+              viewport={{ once: true }}
+              transition={{ duration: 0.4, delay: 0.35 }}
+              className="max-w-[88%] rounded-xl rounded-tl-sm bg-white ring-1 ring-black/5 px-2.5 py-1.5 text-[var(--ink)] shadow-sm"
+            >
+              Done 20 minutes ago — 4 deals moved stage. One thing needs you:
+            </motion.div>
+            <motion.div
+              initial={reducedMotion ? false : { opacity: 0, y: 8 }}
+              whileInView={{ opacity: 1, y: 0 }}
+              viewport={{ once: true }}
+              transition={{ duration: 0.4, delay: 0.55 }}
+              className="max-w-[88%] rounded-xl border-l-2 border-clem-500 bg-white ring-1 ring-black/5 px-2.5 py-2 shadow-sm"
+            >
+              <div className="font-mono text-[8px] uppercase tracking-wider text-clem-700">Approval</div>
+              <div className="mt-0.5 text-[var(--ink-strong)]">Send the report to the team channel?</div>
+              <div className="mt-1.5 flex gap-1.5">
+                <span className="rounded bg-clem-500 px-2 py-0.5 text-[9px] font-medium text-white">Approve</span>
+                <span className="rounded bg-black/5 px-2 py-0.5 text-[9px] text-[var(--ink-dim)]">Not now</span>
+              </div>
+            </motion.div>
+          </div>
+
+          <div className="rounded-full bg-white ring-1 ring-black/10 px-3 py-1.5 text-[var(--ink-faint)]">
+            Message Clementine…
+          </div>
+        </div>
+      </div>
+    </div>
   );
 }
 
 function VoiceMockup() {
+  const reducedMotion = useReducedMotion();
   const [transcript, setTranscript] = useState("");
   const FULL = "Pull yesterday's meeting notes and draft a follow-up to Maya about the Q4 plan.";
 
   useEffect(() => {
+    if (reducedMotion) { setTranscript(FULL); return; }
     let i = 0;
     setTranscript("");
     const id = window.setInterval(() => {
@@ -138,7 +225,7 @@ function VoiceMockup() {
       if (i >= FULL.length) window.clearInterval(id);
     }, 28);
     return () => window.clearInterval(id);
-  }, []);
+  }, [reducedMotion]);
 
   return (
     <div className="absolute inset-0 flex flex-col items-center justify-center bg-[#0d0907] px-8 text-center">
@@ -155,7 +242,7 @@ function VoiceMockup() {
       </div>
 
       <motion.div
-        animate={{ scale: [1, 1.06, 1] }}
+        animate={reducedMotion ? undefined : { scale: [1, 1.06, 1] }}
         transition={{ duration: 2, repeat: Infinity, ease: "easeInOut" }}
         className="relative z-10 mb-6"
       >
@@ -173,7 +260,8 @@ function VoiceMockup() {
             <motion.span
               key={i}
               className="w-[3px] rounded-full bg-gradient-to-t from-clem-600 to-clem-300"
-              animate={{
+              style={reducedMotion ? { height: `${baseH}px` } : undefined}
+              animate={reducedMotion ? undefined : {
                 height: [
                   `${baseH * 0.4}px`,
                   `${baseH * 1.4}px`,
@@ -375,17 +463,19 @@ const STREAM: StreamLine[] = [
 ];
 
 function WebhookMockup() {
+  const reducedMotion = useReducedMotion();
   const [step, setStep] = useState(0);
   const [tick, setTick] = useState(0);
 
   useEffect(() => {
+    if (reducedMotion) { setStep(STREAM.length); return; }
     if (step >= STREAM.length) {
       const t = window.setTimeout(() => { setStep(0); setTick((x) => x + 1); }, 2200);
       return () => window.clearTimeout(t);
     }
     const t = window.setTimeout(() => setStep(step + 1), 320);
     return () => window.clearTimeout(t);
-  }, [step]);
+  }, [step, reducedMotion]);
 
   const visible = STREAM.slice(0, step);
   const color = (k: StreamLine["kind"]) =>

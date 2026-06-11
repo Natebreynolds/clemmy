@@ -10,7 +10,14 @@ export const metadata: Metadata = {
     title: "Clementine — your always-on local AI",
     description:
       "Persistent memory. Every tool you use. Runs in the background on your Mac.",
-    images: ["/og.png"],
+    images: [
+      {
+        url: "/og.png",
+        width: 1200,
+        height: 630,
+        alt: "The Clementine console — chat with your always-on local AI",
+      },
+    ],
     type: "website",
   },
   twitter: {

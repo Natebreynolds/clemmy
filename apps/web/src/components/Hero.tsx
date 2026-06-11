@@ -1,17 +1,32 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
+import Image from "next/image";
 import {
   motion,
+  AnimatePresence,
   useSpring,
   useTransform,
   useMotionValue,
+  useScroll,
+  useReducedMotion,
 } from "framer-motion";
-import { Apple } from "lucide-react";
+import { Apple, Menu, X } from "lucide-react";
 import { PrimaryButton, GhostButton } from "./ui/Button";
+
+const NAV_LINKS = [
+  { href: "#flywheel", label: "How it works" },
+  { href: "#capabilities", label: "Capabilities" },
+  { href: "#console", label: "The console" },
+  { href: "#trust", label: "Trust" },
+  { href: "https://github.com/Natebreynolds/clemmy", label: "GitHub", external: true },
+];
 
 export function Hero() {
   const deviceRef = useRef<HTMLDivElement>(null);
+  const sectionRef = useRef<HTMLElement>(null);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const reducedMotion = useReducedMotion();
 
   const mouseX = useMotionValue(0);
   const mouseY = useMotionValue(0);
@@ -21,7 +36,16 @@ export function Hero() {
   const auraX = useSpring(useTransform(mouseX, [-1, 1], [-14, 14]), springConfig);
   const auraY = useSpring(useTransform(mouseY, [-1, 1], [-8, 8]), springConfig);
 
+  // Subtle parallax as the hero scrolls away, layered on the mouse tilt.
+  const { scrollYProgress } = useScroll({
+    target: sectionRef,
+    offset: ["start start", "end start"],
+  });
+  const parallaxY = useTransform(scrollYProgress, [0, 1], [0, 48]);
+  const parallaxScale = useTransform(scrollYProgress, [0, 1], [1, 0.975]);
+
   useEffect(() => {
+    if (reducedMotion) return;
     const el = deviceRef.current;
     if (!el) return;
     const onMove = (e: MouseEvent) => {
@@ -38,14 +62,14 @@ export function Hero() {
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseleave", onLeave);
     };
-  }, [mouseX, mouseY]);
+  }, [mouseX, mouseY, reducedMotion]);
 
   return (
-    <section className="relative min-h-screen overflow-hidden bg-[var(--bg)]">
+    <section ref={sectionRef} className="relative min-h-screen overflow-hidden bg-[var(--bg)]">
       <div className="absolute inset-0 radial-glow" />
       <div className="absolute inset-0 dot-grid opacity-70" />
       <motion.div
-        style={{ x: auraX, y: auraY }}
+        style={reducedMotion ? undefined : { x: auraX, y: auraY }}
         className="pointer-events-none absolute inset-0"
       >
         <div className="absolute left-1/2 top-[58%] -translate-x-1/2 -translate-y-1/2 h-[55vh] w-[70vw] rounded-[50%] bg-clem-400/25 blur-[160px]" />
@@ -58,19 +82,61 @@ export function Hero() {
             <span className="font-semibold text-[15px] tracking-tight text-[var(--ink-strong)]">Clementine</span>
           </a>
           <nav className="hidden sm:flex items-center gap-8 text-sm text-[var(--ink-dim)]">
-            <a href="#flywheel" className="hover:text-[var(--ink-strong)] transition-colors">How it works</a>
-            <a href="#capabilities" className="hover:text-[var(--ink-strong)] transition-colors">Capabilities</a>
-            <a href="#trust" className="hover:text-[var(--ink-strong)] transition-colors">Trust</a>
-            <a
-              href="https://github.com/Natebreynolds/clemmy"
-              target="_blank"
-              rel="noreferrer"
-              className="hover:text-[var(--ink-strong)] transition-colors"
-            >
-              GitHub
-            </a>
+            {NAV_LINKS.map((l) => (
+              <a
+                key={l.href}
+                href={l.href}
+                target={l.external ? "_blank" : undefined}
+                rel={l.external ? "noreferrer" : undefined}
+                className="hover:text-[var(--ink-strong)] transition-colors"
+              >
+                {l.label}
+              </a>
+            ))}
           </nav>
+          <button
+            type="button"
+            onClick={() => setMenuOpen((v) => !v)}
+            aria-label={menuOpen ? "Close menu" : "Open menu"}
+            aria-expanded={menuOpen}
+            className="sm:hidden rounded-lg p-2 text-[var(--ink-dim)] ring-1 ring-black/10 bg-white/70 backdrop-blur"
+          >
+            {menuOpen ? <X className="h-5 w-5" /> : <Menu className="h-5 w-5" />}
+          </button>
         </header>
+
+        <AnimatePresence>
+          {menuOpen && (
+            <motion.nav
+              initial={{ opacity: 0, y: -8 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -8 }}
+              transition={{ duration: 0.25, ease: [0.16, 1, 0.3, 1] }}
+              className="sm:hidden absolute left-4 right-4 top-[68px] z-40 rounded-2xl bg-white/95 backdrop-blur ring-1 ring-black/10 shadow-[0_30px_80px_-30px_rgba(80,40,10,0.30)] p-4"
+            >
+              <div className="flex flex-col">
+                {NAV_LINKS.map((l) => (
+                  <a
+                    key={l.href}
+                    href={l.href}
+                    target={l.external ? "_blank" : undefined}
+                    rel={l.external ? "noreferrer" : undefined}
+                    onClick={() => setMenuOpen(false)}
+                    className="rounded-lg px-3 py-2.5 text-[15px] text-[var(--ink-strong)] hover:bg-black/[0.04] transition-colors"
+                  >
+                    {l.label}
+                  </a>
+                ))}
+                <div className="mt-2 border-t border-black/10 pt-3">
+                  <PrimaryButton href="/api/download?arch=arm64">
+                    <Apple className="h-4 w-4" />
+                    Download for Mac
+                  </PrimaryButton>
+                </div>
+              </div>
+            </motion.nav>
+          )}
+        </AnimatePresence>
 
         <div className="px-6 pt-4 sm:pt-6 text-center">
           <motion.div
@@ -97,7 +163,7 @@ export function Hero() {
             Persistent memory. Every tool you use.{" "}
             <span className="text-clem-700 font-medium">Sits in your meetings —</span>{" "}
             <span className="text-[var(--ink-strong)] font-medium">no bot joins the call.</span>{" "}
-            Runs in the background on your Mac.
+            And every run reports back: done, verified, spoken into chat.
           </motion.p>
           <motion.div
             initial={{ opacity: 0, y: 12 }}
@@ -122,11 +188,17 @@ export function Hero() {
             initial={{ opacity: 0, y: 24, scale: 0.97 }}
             animate={{ opacity: 1, y: 0, scale: 1 }}
             transition={{ duration: 1.0, delay: 0.4, ease: [0.16, 1, 0.3, 1] }}
-            style={{
-              rotateX: tiltX,
-              rotateY: tiltY,
-              transformStyle: "preserve-3d",
-            }}
+            style={
+              reducedMotion
+                ? { transformStyle: "preserve-3d" }
+                : {
+                    rotateX: tiltX,
+                    rotateY: tiltY,
+                    y: parallaxY,
+                    scale: parallaxScale,
+                    transformStyle: "preserve-3d",
+                  }
+            }
             className="relative w-full max-w-[1180px] aspect-[16/10] max-h-[62vh]"
           >
             <div className="pointer-events-none absolute -inset-px rounded-xl ring-1 ring-black/15 shadow-[0_50px_120px_-30px_rgba(80,40,10,0.35)] z-30" />
@@ -140,14 +212,16 @@ export function Hero() {
             <div className="pointer-events-none absolute inset-0 rounded-xl overflow-hidden z-10">
               <div className="absolute -inset-y-2 -left-1/3 w-1/3 rotate-12 bg-gradient-to-r from-transparent via-white/40 to-transparent animate-sheen" />
             </div>
-            <div
-              className="absolute inset-0 rounded-xl overflow-hidden"
-              style={{
-                backgroundImage: 'url("/screenshots/dashboard.png")',
-                backgroundSize: "cover",
-                backgroundPosition: "top center",
-              }}
-            />
+            <div className="absolute inset-0 rounded-xl overflow-hidden">
+              <Image
+                src="/screenshots/dashboard.png"
+                alt="The Clementine console — a chat conversation where Clementine lists the meetings, follow-ups, memory, and automations she is handling this week"
+                fill
+                priority
+                sizes="(max-width: 1180px) 100vw, 1180px"
+                className="object-cover object-top"
+              />
+            </div>
           </motion.div>
         </div>
       </div>

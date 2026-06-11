@@ -16,7 +16,7 @@ const items = [
       "Every meeting, decision, and tool result writes here",
     ],
     body:
-      "Tomorrow morning she opens already knowing what you shipped, what slipped, what's due, and what tools worked for what task. Nothing to re-explain.",
+      "Tomorrow morning she opens already knowing what you shipped, what slipped, what's due, and what tools worked for what task. Memories consolidate as they grow — duplicates merge, the useful stays sharp. Nothing to re-explain.",
   },
   {
     icon: Wrench,
