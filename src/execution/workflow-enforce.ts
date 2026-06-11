@@ -189,6 +189,45 @@ export function checkSendGate(def: WorkflowDefinition): string[] {
 }
 
 /**
+ * Re-smoke-on-edit (2026-06-11): does an edit change what the workflow
+ * actually EXECUTES? Projects the execution-relevant surface (steps' prompts,
+ * tools, skills, contracts, fan-out, loop config; workflow-level tools,
+ * inputs, synthesis, send policy) and compares. Description / schedule /
+ * enabled changes are NOT execution changes — a reschedule must never
+ * trigger a re-test. Pure + exported for tests.
+ */
+function executionSurfaceProjection(def: WorkflowDefinition): string {
+  return JSON.stringify({
+    steps: (def.steps ?? []).map((s) => ({
+      id: s.id,
+      prompt: s.prompt,
+      dependsOn: s.dependsOn ?? [],
+      forEach: s.forEach ?? null,
+      deterministic: s.deterministic ?? null,
+      allowedTools: s.allowedTools ?? [],
+      usesSkill: s.usesSkill ?? null,
+      inputs: s.inputs ?? null,
+      output: s.output ?? null,
+      requiresApproval: s.requiresApproval ?? false,
+      model: s.model ?? null,
+      useHarness: s.useHarness ?? null,
+      maxTurns: s.maxTurns ?? null,
+      loopUntil: s.loopUntil ?? null,
+      loopSafe: s.loopSafe ?? false,
+      sideEffect: s.sideEffect ?? null,
+    })),
+    allowedTools: def.allowedTools ?? null,
+    inputs: def.inputs ?? null,
+    synthesis: def.synthesis ?? null,
+    allowSends: (def as { allowSends?: boolean }).allowSends !== false,
+  });
+}
+
+export function workflowExecutionSurfaceChanged(before: WorkflowDefinition, after: WorkflowDefinition): boolean {
+  return executionSurfaceProjection(before) !== executionSurfaceProjection(after);
+}
+
+/**
  * Author/enable-time loopUntil law (goal-contract Phase 2). Mirrors the
  * runtime guard (stepLoopUntilEnabled in workflow-runner.ts) so a
  * misconfigured loop is REFUSED at save time with guidance, instead of

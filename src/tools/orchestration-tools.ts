@@ -15,7 +15,7 @@ import {
   type WorkflowDefinition,
   type WorkflowEntry,
 } from '../memory/workflow-store.js';
-import { prepareWorkflowForWrite, workflowNeedsCreationTest } from '../execution/workflow-enforce.js';
+import { workflowExecutionSurfaceChanged, prepareWorkflowForWrite, workflowNeedsCreationTest } from '../execution/workflow-enforce.js';
 import { describeWorkflowPlainEnglish, describeWorkflowOneLine, describeCron } from '../execution/workflow-describe.js';
 import { validateCronExpression } from '../shared/cron.js';
 import { draftWorkflowFromSession, type WorkflowDraft } from '../execution/trace-to-workflow.js';
@@ -1124,6 +1124,24 @@ export function registerOrchestrationTools(server: McpServer): void {
             `Workflow "${name}" was NOT enabled — fix these first:\n- ${prep.errors.join('\n- ')}`,
           );
         }
+        // Verify-by-running (2026-06-11): enabling means "set to run" — when
+        // the workflow has testable read steps, run the creation test now and
+        // let the PASS enable it, instead of trusting the config. Same input
+        // policy as create: no test without bindable inputs (enable directly).
+        const enableTestInputs = normalizeWorkflowRunInputs(
+          Object.fromEntries(Object.entries(prep.def.inputs ?? {}).map(([k, m]) => [k, m.default ?? ''])),
+        );
+        let enableViaTest = workflowNeedsCreationTest(prep.def);
+        if (enableViaTest && missingWorkflowRunInputs(prep.def, enableTestInputs).length > 0) enableViaTest = false;
+        if (enableViaTest) {
+          writeWorkflow(entry.name, { ...prep.def, enabled: false });
+          clearWorkflowFailures(entry.name);
+          const queued = queueWorkflowCreationTest(entry.name, enableTestInputs, { originSessionId: getToolOutputContext()?.sessionId });
+          return textResult(
+            `Verifying "${name}" before it goes live — ${queued.message}`
+              + (prep.repairs.length ? `\n\nAuto-wired on enable:\n- ${prep.repairs.join('\n- ')}` : ''),
+          );
+        }
         writeWorkflow(entry.name, { ...prep.def, enabled: true });
         // Re-enabling is a deliberate fresh start — clear any chronic-failure
         // streak so auto-heal/escalation resets (#6).
@@ -1239,7 +1257,30 @@ export function registerOrchestrationTools(server: McpServer): void {
           `Workflow "${entry.name}" was NOT updated — it's enabled and these must be fixed first (or disable it to keep iterating):\n- ${updatePrep.errors.join('\n- ')}`,
         );
       }
-      writeWorkflow(entry.name, savedNext);
+      // Re-smoke on edit (2026-06-11): an edit that changes what an ENABLED
+      // workflow EXECUTES is re-verified the same way a new workflow is —
+      // saved disabled, creation test runs the read-only steps against the
+      // REAL tools, auto-enables on pass / stays disabled with the reason on
+      // fail. "It's set and working" must mean "I watched it run", never
+      // "I read the config". Schedule/description-only edits never re-test.
+      let reSmoke: { message: string } | null = null;
+      if (entry.data.enabled && workflowExecutionSurfaceChanged(entry.data, savedNext)) {
+        const testInputs = normalizeWorkflowRunInputs(
+          Object.fromEntries(Object.entries(savedNext.inputs ?? {}).map(([k, m]) => [k, m.default ?? ''])),
+        );
+        let runTest = workflowNeedsCreationTest(savedNext);
+        if (runTest && missingWorkflowRunInputs(savedNext, testInputs).length > 0) {
+          // Required inputs with no defaults — a test can't bind them. Keep it
+          // enabled; the next real run is its test (same policy as create).
+          runTest = false;
+        }
+        if (runTest) {
+          savedNext.enabled = false;
+          writeWorkflow(entry.name, savedNext);
+          reSmoke = queueWorkflowCreationTest(entry.name, testInputs, { originSessionId: getToolOutputContext()?.sessionId });
+        }
+      }
+      if (!reSmoke) writeWorkflow(entry.name, savedNext);
       const changed = [
         description !== undefined ? 'description' : '',
         steps ? 'steps' : '',
@@ -1277,6 +1318,7 @@ export function registerOrchestrationTools(server: McpServer): void {
       const updateGaps = renderWorkflowGapQuestions(analyzeWorkflowGaps(savedNext));
       return textResult(
         `Workflow "${name}" updated. Here's what it does now:\n\n${describeWorkflowPlainEnglish(savedNext)}\n\n`
+          + `${reSmoke ? `${reSmoke.message}\n\n` : ''}`
           + `${updateBindReport}${updateAdvisories}${updateGaps}`.trim(),
       );
     },
