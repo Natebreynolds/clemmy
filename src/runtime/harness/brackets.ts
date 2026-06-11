@@ -16,6 +16,15 @@ import {
   isConfirmFirstEnabled,
   ConfirmFirstRequiredError,
 } from './confirm-first-gate.js';
+import {
+  isGroundingGateEnabled,
+  extractDuplicateIdentityKeys,
+  evaluateGrounding,
+  detectDuplicateTarget,
+  markDuplicateWarned,
+  GroundingCheckFailedError,
+  DuplicateExternalWriteError,
+} from './grounding-gate.js';
 
 /**
  * Reliability brackets — the safety primitives the harness loop weaves
@@ -707,6 +716,76 @@ export function wrapToolForHarness<T extends WrappableTool>(
       // eslint-disable-next-line no-console
       console.warn('[harness] execution-wrap gate threw (fail-open)', err instanceof Error ? err.message : err);
     }
+    // 2c2. Grounding + duplicate-target gates (integrity at the
+    // irreversible-write boundary — the 2026-06-11 Eley incident class).
+    // Runs for IRREVERSIBLE shapes only (SEND/PUBLISH). Both fail open on
+    // any evaluation error; both surface as SOFT tool errors the model
+    // recovers from. Ordered BEFORE confirm-first so a corrupted or
+    // duplicate payload is fixed before approval machinery engages, and
+    // so the external_write event for THIS call (emitted by confirm-first
+    // on allow) can never count against itself.
+    try {
+      if (isGroundingGateEnabled()) {
+        const shape = classifyExternalWrite(tool.name, parsedInput);
+        if (shape.mutating && shape.irreversible) {
+          const dupTargets = extractDuplicateIdentityKeys(parsedInput);
+          // Duplicate-target speed bump: one same-shape write per target
+          // per session unless consciously confirmed (second attempt
+          // passes). Approval of a batch is not idempotency.
+          let priorWrites: Array<{ shapeKey?: string; targets?: string[] }> = [];
+          try {
+            priorWrites = listEvents(ctx.sessionId, { types: ['external_write'] })
+              .map((ev) => ev.data as { shapeKey?: string; targets?: string[] });
+          } catch { /* fail toward not-a-duplicate */ }
+          const dup = detectDuplicateTarget({ sessionId: ctx.sessionId, shapeKey: shape.shapeKey, targets: dupTargets, priorWrites });
+          if (dup.duplicate && dup.warnedKey) {
+            markDuplicateWarned(dup.warnedKey);
+            try {
+              appendEvent({
+                sessionId: ctx.sessionId,
+                turn: 0,
+                role: 'system',
+                type: 'guardrail_tripped',
+                data: { kind: 'duplicate_external_write', toolName: tool.name, shapeKey: shape.shapeKey ?? null, target: dup.target ?? null },
+              });
+            } catch { /* telemetry write must never block */ }
+            throw new DuplicateExternalWriteError({ toolName: tool.name, shapeKey: shape.shapeKey, target: dup.target ?? 'unknown' });
+          }
+          // Grounding: verify the payload against this target's own
+          // session artifacts via an independent fast judge.
+          const verdictResult = await evaluateGrounding(ctx.sessionId, tool.name, parsedInput);
+          if (verdictResult.action === 'block') {
+            try {
+              appendEvent({
+                sessionId: ctx.sessionId,
+                turn: 0,
+                role: 'system',
+                type: 'guardrail_tripped',
+                data: {
+                  kind: 'grounding_blocked',
+                  toolName: tool.name,
+                  targets: verdictResult.targets.slice(0, 5),
+                  sources: verdictResult.sourceCallIds.slice(0, 5),
+                  reason: verdictResult.reason,
+                  failureCount: verdictResult.failureCount ?? 1,
+                },
+              });
+            } catch { /* telemetry write must never block */ }
+            throw new GroundingCheckFailedError({
+              toolName: tool.name,
+              reason: verdictResult.reason,
+              targets: verdictResult.targets,
+              sourceCallIds: verdictResult.sourceCallIds,
+              failureCount: verdictResult.failureCount ?? 1,
+            });
+          }
+        }
+      }
+    } catch (err) {
+      if (err instanceof GroundingCheckFailedError || err instanceof DuplicateExternalWriteError) throw err;
+      // eslint-disable-next-line no-console
+      console.warn('[harness] grounding gate threw (fail-open)', err instanceof Error ? err.message : err);
+    }
     // 2d. Confirm-first gate — a BATCH of same-shape external writes
     // needs an instruction-reviewed plan scope before it proceeds. Runs
     // for chat sessions only and aggregates across workers (they share
@@ -808,6 +887,10 @@ export function wrapToolForHarness<T extends WrappableTool>(
                   irreversible: shape.irreversible,
                   count: review.count,
                   underScope: hasReviewedScope,
+                  // Target identity (recipient email/domain/ids) — read by
+                  // the duplicate-target gate so a later same-shape write
+                  // to the same target gets a conscious-confirmation bump.
+                  targets: extractDuplicateIdentityKeys(parsedInput).slice(0, 8),
                 },
               });
             } catch { /* telemetry write must never block */ }
@@ -875,7 +958,9 @@ export function wrapToolForHarness<T extends WrappableTool>(
           err instanceof MissingExecutionWrapError ||
           err instanceof ConfirmFirstRequiredError ||
           err instanceof ToolGuardrailBlocked ||
-          err instanceof ToolCallsLimitExceeded
+          err instanceof ToolCallsLimitExceeded ||
+          err instanceof GroundingCheckFailedError ||
+          err instanceof DuplicateExternalWriteError
         ) {
           return `Tool call refused by harness: ${err instanceof Error ? err.message : String(err)}`;
         }

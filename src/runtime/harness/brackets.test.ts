@@ -574,3 +574,71 @@ test('fan-out nudge: appended to the tool RESULT on serial same-slug calls; supp
     process.env.CLEMMY_EXECUTION_GATE = prevExecGate;
   }
 });
+
+test('grounding gate: an irreversible send contradicting the target\'s own artifacts is soft-blocked; corrected payload passes; duplicate re-send bumps once (Eley incident replay)', async () => {
+  const prevBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  const prevConfirm = process.env.CLEMMY_CONFIRM_FIRST;
+  const prevExecGate = process.env.CLEMMY_EXECUTION_GATE;
+  const prevGrounding = process.env.CLEMMY_GROUNDING_GATE;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  process.env.CLEMMY_CONFIRM_FIRST = 'off';
+  process.env.CLEMMY_EXECUTION_GATE = 'off';
+  process.env.CLEMMY_GROUNDING_GATE = 'on';
+  resetEventLog();
+  const { writeToolOutput, appendEvent } = await import('./eventlog.js');
+  const grounding = await import('./grounding-gate.js');
+  grounding._resetGroundingStateForTests();
+  grounding._resetDuplicateStateForTests();
+  const sess = createSession({ kind: 'chat' });
+  // The extraction worker's CORRECT artifact for this target (Denver).
+  writeToolOutput({
+    sessionId: sess.id,
+    callId: 'call_extract_eley',
+    tool: 'run_worker',
+    output: 'Eley Law Firm; verified search term: "workers compensation lawyer Denver"; contact cliff@eleylawfirm.com; subject: Denver comp search gap',
+  });
+  grounding._setGroundingJudgeForTests(async (payload) => payload.includes('Houston')
+    ? { grounded: false, reason: 'Payload claims Houston; the extraction artifact for this target says Denver.' }
+    : { grounded: true, reason: 'Matches the Denver extraction.' });
+  try {
+    const counter = new ToolCallsCounter(100);
+    const wrapped = wrapToolForHarness({
+      name: 'composio_execute_tool',
+      execute: async (_input: unknown) => 'sent',
+    });
+    const send = (subject: string) =>
+      withHarnessRunContext({ sessionId: sess.id, counter }, () =>
+        wrapped.execute!({
+          tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL',
+          arguments: JSON.stringify({ to_email: 'cliff@eleylawfirm.com', subject, body: `${subject} body` }),
+        }),
+      );
+    // 1. Corrupted payload (Houston) → soft-blocked with the discrepancy.
+    await assert.rejects(() => Promise.resolve(send('Houston workers comp search')), (err: Error) => {
+      assert.match(err.message, /GROUNDING_CHECK_FAILED/);
+      assert.match(err.message, /Denver/);
+      return true;
+    });
+    // 2. Corrected payload (Denver) → allowed.
+    assert.equal(await send('Denver comp search gap'), 'sent');
+    // 3. Re-send to the SAME target after a recorded external_write →
+    //    duplicate bump fires once…
+    appendEvent({
+      sessionId: sess.id, turn: 0, role: 'system', type: 'external_write',
+      data: { shapeKey: 'OUTLOOK_OUTLOOK_SEND_EMAIL', toolName: 'composio_execute_tool', irreversible: true, count: 1, underScope: false, targets: ['cliff@eleylawfirm.com', 'eleylawfirm.com'] },
+    });
+    await assert.rejects(() => Promise.resolve(send('Denver comp search gap')), (err: Error) => {
+      assert.match(err.message, /DUPLICATE_EXTERNAL_WRITE/);
+      assert.match(err.message, /cliff@eleylawfirm\.com/);
+      return true;
+    });
+    // …and the conscious retry passes (speed bump, not a wall).
+    assert.equal(await send('Denver comp search gap'), 'sent');
+  } finally {
+    grounding._setGroundingJudgeForTests(null);
+    process.env.HARNESS_TOOL_BRACKETS = prevBrackets;
+    process.env.CLEMMY_CONFIRM_FIRST = prevConfirm;
+    process.env.CLEMMY_EXECUTION_GATE = prevExecGate;
+    if (prevGrounding === undefined) delete process.env.CLEMMY_GROUNDING_GATE; else process.env.CLEMMY_GROUNDING_GATE = prevGrounding;
+  }
+});

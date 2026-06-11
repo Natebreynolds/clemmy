@@ -812,6 +812,35 @@ export function writeToolOutput(input: WriteToolOutputInput): void {
 }
 
 /**
+ * Search a session's stored tool outputs for rows containing ANY of the
+ * given terms. Powers the grounding gate's source retrieval: before an
+ * irreversible external write, the gate pulls the artifacts that mention
+ * the write's TARGET (recipient email/name/domain) so an independent
+ * judge can verify the outgoing payload against what was actually
+ * researched for that target. Newest first; caller clips content.
+ */
+export function searchToolOutputs(
+  sessionId: string,
+  terms: string[],
+  opts: { limit?: number } = {},
+): Array<{ callId: string; tool: string | null; output: string; createdAt: string }> {
+  const cleaned = terms.map((t) => t.trim()).filter((t) => t.length >= 3);
+  if (cleaned.length === 0) return [];
+  const db = openEventLog();
+  const likes = cleaned.map(() => 'output_full LIKE ?').join(' OR ');
+  const rows = db.prepare(
+    `SELECT call_id, tool, output_full, created_at
+       FROM tool_outputs
+      WHERE session_id = ? AND (${likes})
+      ORDER BY created_at DESC
+      LIMIT ?`,
+  ).all(sessionId, ...cleaned.map((t) => `%${t}%`), Math.max(1, Math.min(opts.limit ?? 6, 20))) as Array<{
+    call_id: string; tool: string | null; output_full: string; created_at: string;
+  }>;
+  return rows.map((r) => ({ callId: r.call_id, tool: r.tool, output: r.output_full, createdAt: r.created_at }));
+}
+
+/**
  * Drop `tool_outputs` rows older than `maxAgeDays` (default 14). Called
  * from the daemon's hourly maintenance tick — without this, the table
  * grows unbounded (~10 MB/day at observed write rates) and the harness
