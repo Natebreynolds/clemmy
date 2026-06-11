@@ -45,6 +45,7 @@ import { previewToolCall } from '../runtime/approval-summary.js';
 import { buildOrchestratorAgent } from '../agents/orchestrator.js';
 import { runPlanFirstPreflight, shouldUsePlanFirst } from '../runtime/harness/plan-first.js';
 import { parseGoalCommand, handleGoalContractCommand } from '../agents/goal-commands.js';
+import { createJsonFieldStreamer } from '../runtime/harness/stream-reply.js';
 import { routeOpenQuestionPlan } from '../runtime/harness/plan-continuity.js';
 import { loadProactivityPolicy } from '../agents/proactivity-policy.js';
 
@@ -1652,7 +1653,9 @@ export async function runDiscordHarnessConversation(opts: {
   let streamBuffer = '';
   let pendingStreamFlush: NodeJS.Timeout | null = null;
 
-  const onChunk = (delta: string): void => {
+  // Extract clean reply/plan text from the structured-output JSON stream
+  // (raw deltas are JSON — see stream-reply.ts).
+  const onChunk = createJsonFieldStreamer(['reply', 'objective', 'action'], (delta: string): void => {
     streamBuffer += delta;
     // Schedule a flush if not already pending. Use a faster debounce (1200ms)
     // than the event-based debounce (2000ms) so tokens appear sooner.
@@ -1667,7 +1670,7 @@ export async function runDiscordHarnessConversation(opts: {
         scheduleEdit();
       }
     }, 1200);
-  };
+  });
 
   const flush = async (): Promise<void> => {
     pendingEdit = null;
@@ -2137,7 +2140,7 @@ async function runDiscordHarnessResume(opts: {
   let streamBuffer = '';
   let pendingStreamFlush: NodeJS.Timeout | null = null;
 
-  const onChunk = (delta: string): void => {
+  const onChunk = createJsonFieldStreamer(['reply', 'objective', 'action'], (delta: string): void => {
     streamBuffer += delta;
     if (pendingStreamFlush) return;
     pendingStreamFlush = setTimeout(() => {
@@ -2147,7 +2150,7 @@ async function runDiscordHarnessResume(opts: {
         scheduleEdit();
       }
     }, 1200);
-  };
+  });
 
   const flush = async (): Promise<void> => {
     pendingEdit = null;

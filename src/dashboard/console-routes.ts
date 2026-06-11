@@ -150,6 +150,7 @@ import {
   parseGoalCommand,
   handleGoalContractCommand,
 } from '../agents/goal-commands.js';
+import { createJsonFieldStreamer } from '../runtime/harness/stream-reply.js';
 import { PlanSchema } from '../agents/planner.js';
 import { closePlanScope, listActiveScopes, listAllScopes } from '../agents/plan-scope.js';
 import type { CheckInUrgency } from '../agents/check-ins.js';
@@ -6434,7 +6435,11 @@ export function registerConsoleRoutes(
           });
           if (continuity.handled) return;
         }
-        const onChunk = (delta: string) => {
+        // Stream CLEAN text, not raw structured-output JSON: extract the
+        // reply (chat decisions) / objective+actions (streamed plans) as
+        // they form. Non-JSON model output emits nothing — the final reply
+        // always lands via conversation_completed.
+        const emitToken = (delta: string) => {
           actionBus.emit({
             kind: 'harness.event',
             sessionId,
@@ -6448,6 +6453,7 @@ export function registerConsoleRoutes(
             } as any,
           });
         };
+        const onChunk = createJsonFieldStreamer(['reply', 'objective', 'action'], emitToken);
         // A /goal start already pinned its goal — skip plan-first and run
         // the objective directly on the normal loop.
         if (planFirst && !goalRunInput) {

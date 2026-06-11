@@ -55,13 +55,20 @@ export function ChatBubble({
               <span>{message.progress ?? 'Thinking…'}</span>
             </div>
           ) : (
-            <p className={cn('whitespace-pre-wrap text-body-lg', message.status === 'failed' ? 'text-danger' : 'text-fg')}>
+            <p className={cn('whitespace-pre-wrap text-body-lg leading-relaxed', message.status === 'failed' ? 'text-danger' : 'text-fg')}>
               {message.text}
+              {thinking && message.text && (
+                <span
+                  aria-hidden
+                  className="ml-0.5 inline-block h-[1.1em] w-[2px] translate-y-[0.2em] rounded-full bg-primary/80"
+                  style={{ animation: 'breathe 1s ease-in-out infinite' }}
+                />
+              )}
             </p>
           )}
 
           {thinking && message.text && message.progress && (
-            <div className="mt-2 flex items-center gap-2 text-caption text-faint">
+            <div className="mt-2.5 flex items-center gap-2 border-t border-border/60 pt-2 text-caption text-faint">
               <ThinkingDots />
               <span>{message.progress}</span>
             </div>
