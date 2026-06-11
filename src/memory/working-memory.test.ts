@@ -20,12 +20,10 @@ import assert from 'node:assert/strict';
 const {
   checkpointWorkingMemory,
   workingMemoryPathForSession,
-  detectActiveTask,
   writeActiveTaskSection,
   readActiveTaskSection,
   hasActiveTaskSection,
   dropActiveTaskSection,
-  reconcileActiveTask,
   refreshWorkingMemory,
   getActiveTaskForDelegation,
 } = await import('./working-memory.js');
@@ -80,51 +78,17 @@ test('checkpointWorkingMemory is best-effort and never throws', () => {
   assert.doesNotThrow(() => checkpointWorkingMemory('sess-wm-3', { lastText: undefined, toolCallsTotal: undefined, turn: undefined }));
 });
 
-// ─── Active Task: detector ──────────────────────────────────────────────────
+// ─── Active Task: render (store backing the `active_task` tool; the legacy
+//      auto-detector was deleted in goal-contract Phase 0a — the tool and this
+//      store are removed in Phase 3 when the goal contract replaces them) ─────
 
-test('detectActiveTask captures verb + count + exclusivity + verbatim recipients', () => {
-  const spec = detectActiveTask('Send 25 emails to ONLY this list: Alice Anderson, Bob Brennan, Carol Chen');
-  assert.ok(spec, 'a constraint with a named list is detected');
-  assert.equal(spec!.verb, 'send');
-  assert.equal(spec!.count, 25);
-  assert.equal(spec!.exclusivity, 'only');
-  assert.deepEqual(spec!.recipients, ['Alice Anderson', 'Bob Brennan', 'Carol Chen']);
-});
-
-test('detectActiveTask captures an explicit email list', () => {
-  const spec = detectActiveTask('email a@x.com, b@y.com and c@z.com about the launch');
-  assert.ok(spec);
-  assert.deepEqual(spec!.recipients, ['a@x.com', 'b@y.com', 'c@z.com']);
-});
-
-test('detectActiveTask returns null for imperatives without a concrete list', () => {
-  for (const msg of [
-    'send the report',
-    'send me your thoughts',
-    'how many emails did we send?',
-    'what is on my calendar today',
-    'thanks',
-    'go ahead',
-  ]) {
-    assert.equal(detectActiveTask(msg), null, `"${msg}" should not be captured`);
-  }
-});
-
-test('detectActiveTask captures a resource locator (the where-it-lives pointer)', () => {
-  const url = 'https://docs.google.com/spreadsheets/d/1AbcD_efGhIjKlMnOpQrStUvWxYz0123456789xyz/edit';
-  const spec = detectActiveTask(`send the Q2 outreach to the list at ${url}`);
-  assert.ok(spec, 'mutating verb + a concrete locator fires');
-  assert.equal(spec!.resourceRef, '1AbcD_efGhIjKlMnOpQrStUvWxYz0123456789xyz');
-});
-
-test('detectActiveTask fires on "send 25 to this list" and renders an UNRESOLVED clarify line', () => {
-  const spec = detectActiveTask('send 25 emails to this list');
-  assert.ok(spec, 'list reference + count fires even with no inline names');
-  assert.equal(spec!.count, 25);
-  assert.equal(spec!.recipients.length, 0);
-  assert.equal(spec!.resourceRef, undefined);
+test('Active Task renders an UNRESOLVED clarify line when no concrete list/locator is pinned', () => {
   const sid = 'sess-at-unresolved';
-  writeActiveTaskSection(sid, spec!);
+  writeActiveTaskSection(sid, {
+    capturedAt: new Date().toISOString(),
+    verb: 'send', count: 25, recipients: [],
+    constraintText: 'send 25 emails to this list',
+  });
   const content = readFileSync(workingMemoryPathForSession(sid), 'utf-8');
   assert.match(content, /UNRESOLVED — confirm WHICH list/);
 });
@@ -196,9 +160,7 @@ test('readActiveTaskSection drops a stale (past-TTL) spec', () => {
   assert.equal(hasActiveTaskSection(sid), false);
 });
 
-test('writeActiveTaskSection / reconcileActiveTask are best-effort (never throw)', () => {
-  assert.doesNotThrow(() => reconcileActiveTask('', ''));
-  assert.doesNotThrow(() => reconcileActiveTask('sess-at-empty', 'just chatting'));
+test('dropActiveTaskSection is best-effort (never throws)', () => {
   assert.doesNotThrow(() => dropActiveTaskSection('does-not-exist'));
 });
 

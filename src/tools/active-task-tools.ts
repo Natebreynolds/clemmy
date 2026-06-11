@@ -59,15 +59,17 @@ export function applyActiveTaskAction(sessionId: string, input: ActiveTaskToolIn
 }
 
 /**
- * The `active_task` tool — the model-driven layer over the deterministic
- * Active Task scratchpad. The harness ALWAYS pins a stated constraint
- * deterministically at turn start (detectActiveTask), so this tool is the
- * additive hybrid: it lets the model capture or correct task parameters the
- * regex detector missed (novel phrasings, a target named across several turns,
- * a mid-conversation change), and clear the pin when the task is done. It
- * writes to the SAME per-session store, so the pin is injected verbatim every
+ * The `active_task` tool — the model-driven writer for the Active Task
+ * scratchpad: the model pins task parameters (a target list/sheet, a recipient
+ * set, a count, an "only these" scope), corrects them mid-conversation, and
+ * clears the pin when the task is done. The pin is injected verbatim every
  * turn and read at action time — Clem uses the pinned reference instead of
  * re-discovering and pulling the wrong list.
+ *
+ * NOTE (goal-contract plan): the legacy deterministic detector
+ * (detectActiveTask/reconcileActiveTask) was deleted in Phase 0a. This tool +
+ * the section store are scheduled for deletion in Phase 3, when the goal
+ * contract replaces the delegation pin seam. Do not add to this mechanism.
  */
 export function getActiveTaskTools(): Tool<RuntimeContextValue>[] {
   const active_task = tool({

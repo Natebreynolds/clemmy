@@ -7,7 +7,6 @@ import { loadSessionBrief } from './session-briefs.js';
 import type { SessionRecord } from '../types.js';
 import { PlanStore } from '../planning/plan-store.js';
 import { isUserFacingSession } from '../execution/scope.js';
-import { extractNamedResource } from './focus.js';
 
 const SESSION_WORKING_MEMORY_DIR = path.join(path.dirname(WORKING_MEMORY_FILE), 'state', 'working-memory');
 
@@ -59,104 +58,6 @@ export interface ActiveTaskSpec {
  * The compact resource pointer (resourceRef) is the preferred home for big sets.
  */
 const RECIPIENT_INLINE_CHAR_BUDGET = 1500;
-
-// A mutating / outbound verb whose parameters must be pinned so they survive
-// the conversation. Mirrors the intent of plan-first's write-verb set; kept
-// local so the memory layer stays self-contained (no harness import).
-const TASK_VERB_RE =
-  /\b(send|e-?mail|emails?|draft|message|dm|post|publish|reply|forward|create|add|invite|schedule|book|update|delete|remove)\b/i;
-// Determiner that points at a specific list the user is naming.
-const LIST_MARKER_RE = /\b(this|these|those|the following|the list|my list)\b/i;
-// "only/exactly/just these" — an explicit exclusivity constraint.
-const EXCLUSIVITY_RE = /\b(only|exactly|just)\b/i;
-// An explicit count governing a plural-ish noun ("25 emails", "10 contacts").
-const COUNT_RE = /\b(\d{1,4})\s+(?:[a-z][\w-]*\s+){0,2}?(emails?|recipients?|people|contacts?|messages?|names?|addresses|folks|clients?|customers?|leads?|invites?)\b/i;
-const EMAIL_RE = /[\w.+-]+@[\w-]+\.[\w.-]+/g;
-// A plausible person/recipient name: 1–5 letter-tokens. Conservative so a
-// chatty sentence ("send me your thoughts") doesn't read as a recipient.
-const PLAUSIBLE_NAME_RE = /^[A-Za-z][A-Za-z.'’-]*(?:\s+[A-Za-z][A-Za-z.'’-]*){0,4}$/;
-
-function dedupePreserveOrder(items: string[]): string[] {
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const item of items) {
-    const key = item.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(item);
-  }
-  return out;
-}
-
-/**
- * Pull the explicit recipient set out of a message. Prefers email addresses;
- * otherwise an enumerated list after a colon / list marker. Returns [] unless
- * there are at least two concrete recipients (the conservative bar that keeps
- * ordinary imperatives like "send the report" from being captured).
- */
-function parseRecipients(text: string): string[] {
-  const emails = text.match(EMAIL_RE);
-  if (emails && emails.length >= 2) return dedupePreserveOrder(emails);
-
-  // Enumerated names — look at the clause after the last colon if present
-  // (that's where "…this list: Alice, Bob, …" puts them), else the whole text.
-  const colon = text.lastIndexOf(':');
-  const tail = colon >= 0 && colon < text.length - 1 ? text.slice(colon + 1) : text;
-  const items = tail
-    .split(/[,\n;]+/)
-    .map((s) => s.trim())
-    .filter(Boolean);
-  const names = items.filter((item) => item.length <= 60 && PLAUSIBLE_NAME_RE.test(item));
-  if (names.length >= 2) return dedupePreserveOrder(names);
-
-  return emails && emails.length >= 1 ? dedupePreserveOrder(emails) : [];
-}
-
-/**
- * Deterministic, no-LLM detector for an "action-with-parameters" turn: a
- * mutating verb co-occurring with a concrete recipient/target set. Returns a
- * spec to pin, or null. Conservative by construction — resolves ambiguity to
- * "no spec" so it never over-constrains a later turn (forward-only).
- */
-export function detectActiveTask(message: string): ActiveTaskSpec | null {
-  const text = (message ?? '').replace(/\s+/g, ' ').trim();
-  if (text.length < 8) return null;
-  if (!TASK_VERB_RE.test(text)) return null;
-
-  const recipients = parseRecipients(text);
-  const resourceRef = extractNamedResource(text) ?? undefined;
-  const hasMarker = LIST_MARKER_RE.test(text);
-  const countMatch = COUNT_RE.exec(text);
-  const parsedCount = countMatch ? Number.parseInt(countMatch[1], 10) : NaN;
-  const count = Number.isFinite(parsedCount) ? parsedCount : undefined;
-  const exclusivity = EXCLUSIVITY_RE.test(text) && hasMarker
-    ? (text.match(EXCLUSIVITY_RE)?.[0]?.toLowerCase())
-    : undefined;
-
-  // Fire only with a CONCRETE target signal alongside the mutating verb:
-  //  - an enumerated recipient set (>=2), OR
-  //  - a concrete resource locator (sheet/doc id or URL), OR
-  //  - a list reference ("this/that list") qualified by a count or exclusivity
-  //    (the "send 25 emails to this list" shape) — pinned even when the exact
-  //    list is UNRESOLVED, so the params persist and Clem is told to confirm
-  //    WHICH list before pulling, rather than re-discovering and guessing.
-  const hasConcreteTarget =
-    recipients.length >= 2
-    || Boolean(resourceRef)
-    || (hasMarker && (count !== undefined || Boolean(exclusivity)));
-  if (!hasConcreteTarget) return null;
-
-  const verbMatch = text.match(TASK_VERB_RE);
-  return {
-    capturedAt: new Date().toISOString(),
-    verb: verbMatch ? verbMatch[0].toLowerCase() : undefined,
-    count,
-    recipients,
-    resourceRef,
-    exclusivity,
-    constraintText: text.slice(0, 1500),
-  };
-}
 
 function renderActiveTaskSection(spec: ActiveTaskSpec): string {
   const lines = [
@@ -342,21 +243,6 @@ export function dropActiveTaskSection(sessionId: string): void {
     writeFileSync(filePath, content.replace(ACTIVE_TASK_SECTION_RE, '').replace(/\n{3,}/g, '\n\n'));
   } catch {
     // best-effort.
-  }
-}
-
-/**
- * Pin a stated action constraint synchronously at turn start. Detects an
- * action-with-parameters turn and writes/replaces the Active Task section
- * (last-writer-wins). On a turn with no detectable spec it does nothing, so any
- * existing spec is carried forward by refreshWorkingMemory. Best-effort.
- */
-export function reconcileActiveTask(sessionId: string, message: string): void {
-  try {
-    const spec = detectActiveTask(message);
-    if (spec) writeActiveTaskSection(sessionId, spec);
-  } catch {
-    // best-effort; a capture failure must never break a turn.
   }
 }
 

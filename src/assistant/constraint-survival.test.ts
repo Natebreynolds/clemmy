@@ -9,16 +9,15 @@
  * "ok" and later "go ahead". The assembled prompt the model actually
  * receives on those ACT turns must still contain the verbatim list.
  *
- * FAILS on main: the turn-1 imperative is never captured (auto-capture
- * rejects imperatives at auto-capture.ts:165), the working-memory summary
- * truncates each turn to 180 chars and keeps only the last 6 turns
- * (working-memory.ts:32,38), and a bare "ok" classifies as 'casual' whose
- * budget skips working memory entirely (message-intent.ts:192). So by the
- * approval turn the list is gone from every window the model sees.
+ * What this protects: the working-memory summary truncates each turn to 180
+ * chars and keeps only the last 6 turns, and a bare "ok" classifies as
+ * 'casual' whose budget would skip working memory — so without a durable pin,
+ * the list is gone from every window the model sees by the approval turn.
  *
- * PASSES after the durable Active Task fix: the constraint is pinned
- * synchronously to the per-session working-memory file at turn start,
- * carried forward across turn-end rewrites, and re-injected (untruncated)
+ * The pin is written via the Active Task section store (the same write the
+ * model-facing `active_task` tool performs — the legacy auto-detector was
+ * deleted in goal-contract Phase 0a). What must hold: the pinned constraint
+ * is carried forward across turn-end rewrites and re-injected (untruncated)
  * on every subsequent turn — including the casual approval turn.
  */
 import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
@@ -35,6 +34,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 const { ClementineAssistant } = await import('./core.js');
+const { writeActiveTaskSection } = await import('../memory/working-memory.js');
 import type { AgentRuntime, AgentRuntimeCallbacks } from '../runtime/provider.js';
 import type { ApprovalResolutionResult, PendingApproval, RunRequest, RunResult } from '../types.js';
 
@@ -71,6 +71,17 @@ test('a stated recipient list survives chit-chat and a bare-ack approval turn', 
   const runtime = new RecordingRuntime();
   const assistant = new ClementineAssistant(runtime);
   const sessionId = assistant.createSessionId();
+
+  // The legacy auto-detector (reconcileActiveTask) was deleted in goal-contract
+  // Phase 0a — the pin is now written explicitly (as the model-facing
+  // `active_task` tool does). What this test still proves is the SURVIVING
+  // chain: a written pin carries across turn-end rewrites and is re-injected
+  // verbatim into the assembled prompt on casual/bare-ack turns.
+  writeActiveTaskSection(sessionId, {
+    capturedAt: new Date().toISOString(),
+    verb: 'send', count: 25, exclusivity: 'only', recipients: NAMES,
+    constraintText: `Send 25 emails to ONLY this list: ${LIST}`,
+  });
 
   const messages = [
     `Send 25 emails to ONLY this list: ${LIST}`, // turn 1 — the constraint
@@ -111,6 +122,15 @@ test('the REAL incident: a list REFERENCE survives the email-copy tangent and is
   const assistant = new ClementineAssistant(runtime);
   const sessionId = assistant.createSessionId();
   const SHEET = '1AbcD_efGhIjKlMnOpQrStUvWxYz0123456789xyz';
+
+  // Pin the resource explicitly (the `active_task` tool path) — the legacy
+  // auto-detector is deleted; this test now covers pin → carry-forward →
+  // verbatim injection + use-don't-rediscover discipline at action time.
+  writeActiveTaskSection(sessionId, {
+    capturedAt: new Date().toISOString(),
+    verb: 'send', resourceRef: SHEET, recipients: [],
+    constraintText: 'send the Q2 outreach to the list at that sheet',
+  });
 
   const messages = [
     // Turn 1 — point Clem at the list (a concrete resource, like the real user did).
