@@ -1868,6 +1868,13 @@ export async function runDiscordHarnessConversation(opts: {
         clearTimeout(pendingEdit);
         pendingEdit = null;
       }
+      // Cancel any pending stream flush — without this, a token-stream
+      // flush scheduled up to 1200ms ago can fire AFTER finalFlush and
+      // overwrite the final reply with stale partial stream text.
+      if (pendingStreamFlush) {
+        clearTimeout(pendingStreamFlush);
+        pendingStreamFlush = null;
+      }
       if (progressPulse) {
         clearInterval(progressPulse);
         progressPulse = null;
@@ -2181,6 +2188,12 @@ async function runDiscordHarnessResume(opts: {
       if (pendingEdit) {
         clearTimeout(pendingEdit);
         pendingEdit = null;
+      }
+      // Cancel any pending stream flush so it can't overwrite the final
+      // reply with stale partial stream text after finalFlush.
+      if (pendingStreamFlush) {
+        clearTimeout(pendingStreamFlush);
+        pendingStreamFlush = null;
       }
       await finalFlush();
       resolve();

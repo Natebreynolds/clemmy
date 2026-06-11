@@ -3973,17 +3973,21 @@ const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
   ) => Promise<StreamedResultLike>;
   const run = runner.run.bind(runner) as unknown as RunMethod;
   const onChunk = (opts as unknown as { onChunk?: (delta: string) => void | Promise<void> })?.onChunk;
-  // Only enable streaming if onChunk callback is provided (no point otherwise)
-  const runOpts = { ...opts, ...(onChunk ? { stream: true } : {}) };
-  const result = await run(agent, items, runOpts);
+  // ALWAYS stream (matches the pre-streaming production behavior): with
+  // stream: true, a structured-output (agent.outputType) parse/validation
+  // failure surfaces at `result.completed` / the finalOutput read INSIDE the
+  // recovery try/catch below. A non-streamed run would reject `run()` itself,
+  // bypassing the recovery path — so do not make `stream` conditional.
+  const result = await run(agent, items, { ...opts, stream: true });
 
-  // Iterate the StreamedRunResult to drain the event stream and call onChunk
-  // for each token delta. This allows callers to get real-time token streaming
-  // instead of buffering until the response is complete.
+  // When a consumer wants token deltas, iterate the StreamedRunResult and
+  // forward each output_text_delta. Without onChunk, skip iteration and just
+  // await `completed` exactly like the original code (the SDK drains the
+  // stream internally). The asyncIterator guard keeps test mocks (plain
+  // objects with only a `completed` promise) working.
   let structuredOutputFailed = false;
   try {
-    // Only iterate if streaming was enabled and result is async iterable
-    if (onChunk && Symbol.asyncIterator in (result as Record<symbol, unknown>)) {
+    if (onChunk && Symbol.asyncIterator in (result as unknown as Record<symbol, unknown>)) {
       for await (const event of result as unknown as AsyncIterable<unknown>) {
         // raw_model_stream_event with output_text_delta
         const ev = event as { type?: string; data?: { type?: string; delta?: string } };
