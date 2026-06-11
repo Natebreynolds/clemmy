@@ -4,6 +4,7 @@ import pino from 'pino';
 import { getRuntimeEnv } from '../config.js';
 import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
 import { addNotification, loadNotifications } from '../runtime/notifications.js';
+import { latestEventAtForSessionPrefix } from '../runtime/harness/eventlog.js';
 
 /**
  * Workflow watchdog (north star: REPORTS BACK WITHOUT FAIL).
@@ -70,13 +71,16 @@ export interface WatchdogRunView {
   finishedAt?: string;
   /** ISO time the terminal user notification was delivered (report-back marker). */
   notifiedAt?: string;
+  /** Newest harness event across the run's step sessions (caller-populated
+   *  for status='running' runs). Drives silent-running detection. */
+  lastActivityAt?: string;
 }
 
 export interface StalledRun {
   id: string;
   workflow: string;
   ageMs: number;
-  reason: 'queued_not_draining' | 'parked_awaiting_approval' | 'terminal_unnotified';
+  reason: 'queued_not_draining' | 'parked_awaiting_approval' | 'terminal_unnotified' | 'running_silent';
 }
 
 /**
@@ -84,10 +88,12 @@ export interface StalledRun {
  * threshold. Exported for tests — no I/O, no clock dependency (caller
  * passes `now`).
  */
+const DEFAULT_RUNNING_SILENT_STALL_MS = 10 * 60_000; // 10 min with zero step events
+
 export function findStalledRuns(
   runs: WatchdogRunView[],
   now: number,
-  opts: { queuedStallMs: number; parkedStallMs?: number; terminalUnnotifiedStallMs?: number; terminalUnnotifiedMaxMs?: number },
+  opts: { queuedStallMs: number; parkedStallMs?: number; terminalUnnotifiedStallMs?: number; terminalUnnotifiedMaxMs?: number; runningSilentStallMs?: number },
 ): StalledRun[] {
   const parkedStallMs = opts.parkedStallMs ?? DEFAULT_PARKED_STALL_MS;
   const terminalStallMs = opts.terminalUnnotifiedStallMs ?? DEFAULT_TERMINAL_UNNOTIFIED_STALL_MS;
@@ -101,6 +107,20 @@ export function findStalledRuns(
       const ageMs = now - created;
       if (ageMs >= opts.queuedStallMs) {
         out.push({ id: run.id, workflow: run.workflow, ageMs, reason: 'queued_not_draining' });
+      }
+    } else if (status === 'running') {
+      // Silent-running detection (turn-stall fix layer 3, 2026-06-11): a
+      // 'running' run whose step sessions have emitted NOTHING for a long
+      // window is wedged, not working — two live incidents sat invisible
+      // for hours. The stream-stall watchdog (loop.ts) should abort these
+      // first; this is the user-facing net if anything else ever wedges.
+      const silentMs = opts.runningSilentStallMs ?? DEFAULT_RUNNING_SILENT_STALL_MS;
+      const ref = run.lastActivityAt ?? run.createdAt;
+      const last = ref ? Date.parse(ref) : Number.NaN;
+      if (!Number.isFinite(last)) continue;
+      const ageMs = now - last;
+      if (ageMs >= silentMs) {
+        out.push({ id: run.id, workflow: run.workflow, ageMs, reason: 'running_silent' });
       }
     } else if (status === 'parked') {
       // Age from parkedAt (when it actually parked), not createdAt — a run that
@@ -239,6 +259,12 @@ function parkedStallMs(): number {
 
 /** Reason-specific alert copy for a stalled run. */
 function watchdogAlert(run: StalledRun, minutes: number): { title: string; body: string } {
+  if (run.reason === 'running_silent') {
+    return {
+      title: `Workflow looks wedged: ${run.workflow}`,
+      body: `Run ${run.id} has been "running" with zero activity for ${minutes}m — no model output, no tool calls. It is almost certainly stuck, not working. Cancel and re-run it (completed steps resume from cache), or ask me to investigate.`,
+    };
+  }
   switch (run.reason) {
     case 'parked_awaiting_approval':
       return {
@@ -284,6 +310,15 @@ export function runWorkflowWatchdog(now: number = Date.now()): { stalled: number
     } catch {
       // A malformed run file is its own (separate) problem; skip it.
     }
+  }
+
+  // Populate lastActivityAt for running runs from the harness event log —
+  // a run's step sessions are 'workflow:<runId>:<stepId>'.
+  for (const run of runs) {
+    if ((run.status ?? 'queued') !== 'running') continue;
+    try {
+      run.lastActivityAt = latestEventAtForSessionPrefix(`workflow:${run.id}:`) ?? run.lastActivityAt;
+    } catch { /* watchdog must never throw on a read */ }
   }
 
   const candidates = findStalledRuns(runs, now, { queuedStallMs: queuedStallMs(), parkedStallMs: parkedStallMs() });

@@ -36,15 +36,30 @@ test('does NOT flag a freshly-queued run (will be picked up next tick)', () => {
   assert.equal(findStalledRuns(runs, T0, { queuedStallMs: FIVE_MIN }).length, 0);
 });
 
-test('ignores non-queued statuses (running/completed/error/awaiting_approval)', () => {
+test('ignores terminal/other statuses; ACTIVE running runs are exempt only while alive', () => {
   const old = iso(60 * 60_000);
   const runs: WatchdogRunView[] = [
-    { id: 'a', workflow: 'wf', status: 'running', createdAt: old },
+    // running + RECENT activity → alive, not stalled
+    { id: 'a', workflow: 'wf', status: 'running', createdAt: old, lastActivityAt: iso(60_000) },
     { id: 'b', workflow: 'wf', status: 'completed', createdAt: old },
     { id: 'c', workflow: 'wf', status: 'error', createdAt: old },
     { id: 'd', workflow: 'wf', status: 'awaiting_approval', createdAt: old },
   ];
   assert.equal(findStalledRuns(runs, T0, { queuedStallMs: FIVE_MIN }).length, 0);
+});
+
+test('running_silent: a running run with NO step activity past the window is flagged (turn-stall layer 3)', () => {
+  const runs: WatchdogRunView[] = [
+    // wedged: running for an hour, last event 30 min ago
+    { id: 'wedged', workflow: 'wf', status: 'running', createdAt: iso(60 * 60_000), lastActivityAt: iso(30 * 60_000) },
+    // alive: event 1 min ago
+    { id: 'alive', workflow: 'wf', status: 'running', createdAt: iso(60 * 60_000), lastActivityAt: iso(60_000) },
+    // no events at all (lastActivityAt absent) → age from createdAt
+    { id: 'never-started', workflow: 'wf', status: 'running', createdAt: iso(20 * 60_000) },
+  ];
+  const stalled = findStalledRuns(runs, T0, { queuedStallMs: FIVE_MIN, runningSilentStallMs: 10 * 60_000 });
+  assert.deepEqual(stalled.map((r) => r.id).sort(), ['never-started', 'wedged']);
+  assert.ok(stalled.every((r) => r.reason === 'running_silent'));
 });
 
 test('treats a missing status as queued (the bare run stub from the dashboard)', () => {

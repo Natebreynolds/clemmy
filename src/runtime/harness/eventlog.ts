@@ -665,6 +665,22 @@ export function appendEvent(input: AppendEventInput): EventRow {
   return event;
 }
 
+/**
+ * Newest event timestamp across every session whose id starts with `prefix`
+ * (e.g. 'workflow:<runId>:' spans all of a run's step sessions). Used by the
+ * workflow watchdog's silent-running detection — a 'running' run whose step
+ * sessions have emitted nothing for many minutes is wedged, not working.
+ * Returns null when no events match.
+ */
+export function latestEventAtForSessionPrefix(prefix: string): string | null {
+  if (!prefix) return null;
+  const db = openEventLog();
+  const row = db
+    .prepare("SELECT MAX(created_at) AS at FROM events WHERE session_id LIKE ? ESCAPE '\\'")
+    .get(`${prefix.replace(/[%_\\]/g, (m) => `\\${m}`)}%`) as { at: string | null };
+  return row?.at ?? null;
+}
+
 export function listEvents(sessionId: string, options: ListEventsOptions = {}): EventRow[] {
   const db = openEventLog();
   const clauses: string[] = ['session_id = ?'];

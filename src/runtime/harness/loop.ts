@@ -1934,6 +1934,16 @@ function goalContractEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_GOAL_CONTRACT', 'on') ?? 'on').toLowerCase() !== 'off';
 }
 
+/** Stream-inactivity threshold for the turn-stall watchdog. Default 5 min —
+ *  observed first-byte on big prompts is ~35s, so 8x margin; every stream
+ *  event (token, tool call) resets the timer, so long multi-tool turns are
+ *  never cut while ANYTHING is happening. 0 disables. */
+function modelStreamStallMs(): number {
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_MODEL_STREAM_STALL_MS', '300000') ?? '300000', 10);
+  if (!Number.isFinite(raw)) return 300_000;
+  return raw <= 0 ? 0 : raw;
+}
+
 /** Store read must never break a turn. */
 function safeActiveGoal(sessionId: string): PlanProposal | null {
   if (!goalContractEnabled()) return null;
@@ -2302,10 +2312,31 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   // the embed stashes the turn's query vector so the (sync) per-turn fact recall
   // can add a relevance term, at ~no added latency (both are network-bound and
   // overlap). primeTurnRecallVector never throws.
-  const [turnMemoryPrimer] = await Promise.all([
-    buildTurnMemoryPrimer(options.input),
-    primeTurnRecallVector(options.input),
+  // Turn-stall fix layer 2: the assembly stage gets a HARD outer timeout.
+  // Both arms have internal bounds, but a live incident froze a turn at
+  // exactly this stage with zero events — belt and braces: if assembly
+  // doesn't settle in 15s, proceed with a degraded (no-primer) turn instead
+  // of hanging the user. The race leaves the slow promise to settle in the
+  // background; it never blocks the turn again.
+  const assemblySettled = await Promise.race([
+    Promise.all([
+      buildTurnMemoryPrimer(options.input),
+      primeTurnRecallVector(options.input),
+    ]).then((r) => r as [TurnMemoryPrimer, void]),
+    new Promise<null>((resolve) => {
+      const t = setTimeout(() => resolve(null), 15_000);
+      (t as unknown as { unref?: () => void }).unref?.();
+    }),
   ]);
+  const turnMemoryPrimer: TurnMemoryPrimer = assemblySettled
+    ? assemblySettled[0]
+    : {
+        enabled: true,
+        query: options.input.replace(/\s+/g, ' ').trim().slice(0, 160),
+        hitCount: 0,
+        injectedBytes: 0,
+        skippedReason: 'assembly_timeout',
+      };
   // Goal contract: re-fetch the session's parked goal EVERY turn from the
   // store (never trusted to transcript memory) so the model always works
   // against the authoritative objective + criteria + progress ledger.
@@ -4107,20 +4138,55 @@ const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
   // objects with only a `completed` promise) working.
   let structuredOutputFailed = false;
   try {
-    if (onChunk && Symbol.asyncIterator in (result as unknown as Record<symbol, unknown>)) {
-      for await (const event of result as unknown as AsyncIterable<unknown>) {
-        // raw_model_stream_event with output_text_delta
-        const ev = event as { type?: string; data?: { type?: string; delta?: string } };
-        if (ev.type === 'raw_model_stream_event' && ev.data?.type === 'output_text_delta' && typeof ev.data.delta === 'string') {
-          try {
-            await onChunk(ev.data.delta);
-          } catch {
-            // never let consumer errors abort the stream
+    // Stream-inactivity watchdog (turn-stall fix, 2026-06-11): two live
+    // incidents wedged a turn forever with ZERO events — once pre-first-byte
+    // on the model call, once after a hung tool — because nothing bounds a
+    // silent model stream. Drain the stream with a stall timer that resets on
+    // EVERY stream event (tool activity keeps long turns alive); if the
+    // stream goes silent past the threshold, abort the turn with a
+    // timeout-flavored error (workflow steps auto-retry it as transient;
+    // chat surfaces an honest run_failed instead of hanging the user).
+    const stallMs = modelStreamStallMs();
+    const iterable = Symbol.asyncIterator in (result as unknown as Record<symbol, unknown>);
+    let lastEventAt = Date.now();
+    const drain = (async () => {
+      if (iterable) {
+        for await (const event of result as unknown as AsyncIterable<unknown>) {
+          lastEventAt = Date.now();
+          // raw_model_stream_event with output_text_delta
+          const ev = event as { type?: string; data?: { type?: string; delta?: string } };
+          if (onChunk && ev.type === 'raw_model_stream_event' && ev.data?.type === 'output_text_delta' && typeof ev.data.delta === 'string') {
+            try {
+              await onChunk(ev.data.delta);
+            } catch {
+              // never let consumer errors abort the stream
+            }
           }
         }
       }
-    }
-    await result.completed;
+      await result.completed;
+    })();
+    let stallTimer: ReturnType<typeof setInterval> | undefined;
+    const watchdog = new Promise<never>((_, reject) => {
+      if (!iterable || stallMs <= 0) return; // mocks / kill-switch: no watchdog
+      const tickMs = Math.min(15_000, Math.max(250, Math.floor(stallMs / 4)));
+      stallTimer = setInterval(() => {
+        if (Date.now() - lastEventAt > stallMs) {
+          if (stallTimer) clearInterval(stallTimer);
+          // Best-effort: release the underlying stream so the dangling
+          // request doesn't pin sockets after we abandon the turn.
+          try { (result as unknown as { cancel?: () => void }).cancel?.(); } catch { /* best-effort */ }
+          reject(new Error(
+            `model stream stalled — no stream events for ${Math.round(stallMs / 1000)}s; the model call timed out (CLEMMY_MODEL_STREAM_STALL_MS to tune)`,
+          ));
+        }
+      }, tickMs);
+      // Deliberately NOT unref'd: while a turn is in flight the watchdog IS
+      // pending work — an unref'd timer could let a bare process exit before
+      // the stall fires. It self-clears on drain completion or stall.
+    });
+    void drain.finally(() => { if (stallTimer) clearInterval(stallTimer); }).catch(() => { /* surfaced via race */ });
+    await Promise.race([drain, watchdog]);
   } catch (err) {
     if (!isStructuredOutputError(err)) throw err;
     structuredOutputFailed = true;
