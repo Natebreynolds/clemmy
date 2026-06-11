@@ -3972,19 +3972,22 @@ const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
     o: typeof opts,
   ) => Promise<StreamedResultLike>;
   const run = runner.run.bind(runner) as unknown as RunMethod;
-  const result = await run(agent, items, { ...opts, stream: true });
+  const onChunk = (opts as unknown as { onChunk?: (delta: string) => void | Promise<void> })?.onChunk;
+  // Only enable streaming if onChunk callback is provided (no point otherwise)
+  const runOpts = { ...opts, ...(onChunk ? { stream: true } : {}) };
+  const result = await run(agent, items, runOpts);
 
   // Iterate the StreamedRunResult to drain the event stream and call onChunk
   // for each token delta. This allows callers to get real-time token streaming
   // instead of buffering until the response is complete.
   let structuredOutputFailed = false;
-  const onChunk = (opts as unknown as { onChunk?: (delta: string) => void | Promise<void> })?.onChunk;
   try {
-    for await (const event of result as unknown as AsyncIterable<unknown>) {
-      // raw_model_stream_event with output_text_delta
-      const ev = event as { type?: string; data?: { type?: string; delta?: string } };
-      if (ev.type === 'raw_model_stream_event' && ev.data?.type === 'output_text_delta' && typeof ev.data.delta === 'string') {
-        if (onChunk) {
+    // Only iterate if streaming was enabled and result is async iterable
+    if (onChunk && Symbol.asyncIterator in (result as Record<symbol, unknown>)) {
+      for await (const event of result as unknown as AsyncIterable<unknown>) {
+        // raw_model_stream_event with output_text_delta
+        const ev = event as { type?: string; data?: { type?: string; delta?: string } };
+        if (ev.type === 'raw_model_stream_event' && ev.data?.type === 'output_text_delta' && typeof ev.data.delta === 'string') {
           try {
             await onChunk(ev.data.delta);
           } catch {

@@ -1,0 +1,108 @@
+{
+  "generated_at": "2026-06-01T10:02:00-07:00",
+  "source": "Salesforce query: Nate-owned Market Leader accounts with no activity in the last 15+ days, website present, limit 10, oldest/no activity first",
+  "total_accounts": 10,
+  "accounts": [
+    {
+      "salesforce_account_id": "0015f00000Sy3C1AAJ",
+      "account_name": "Franklin D. Azar & Associates, P.C.-Pueblo",
+      "website": "https://www.fdazar.com/contact/pueblo/?utm_source=google&utm_medium=organic&utm_campaign=GMBPueblo",
+      "last_activity_date": null,
+      "contact": null,
+      "contact_status": "No email contact returned from Salesforce"
+    },
+    {
+      "salesforce_account_id": "0015f00000SyF9oAAF",
+      "account_name": "Rubenstein Law-Fort Myers",
+      "website": "https://www.rubensteinlaw.com/locations/fort-myers-accident-lawyers?utm_source=google&utm_medium=maps&utm_campaign=fort-myers&st",
+      "last_activity_date": null,
+      "contact": null,
+      "contact_status": "No email contact returned from Salesforce"
+    },
+    {
+      "salesforce_account_id": "0015f00000SxxLUAAZ",
+      "account_name": "Scott P. Card",
+      "website": "http://www.fslaw.com/attorneys/scott-card/",
+      "last_activity_date": null,
+      "contact": null,
+      "contact_status": "No email contact returned from Salesforce"
+    },
+    {
+      "salesforce_account_id": "0015f00000Sy3CaAAJ",
+      "account_name": "Franklin D. Azar & Associates, P.C.-Thornton",
+      "website": "https://www.fdazar.com/contact/thornton/?utm_source=google&utm_medium=organic&utm_campaign=GMBThornton",
+      "last_activity_date": null,
+      "contact": null,
+      "contact_status": "No email contact returned from Salesforce"
+    },
+    {
+      "salesforce_account_id": "001Rj0000021X2RIAU",
+      "account_name": "Cook, Bradford & Levy, Llc",
+      "website": "cookinjurylaw.com",
+      "last_activity_date": "2025-10-10",
+      "contact": {
+        "salesforce_contact_id": "003Rj000001yRzxIAE",
+        "first_name": "Brian",
+        "last_name": "Bradford",
+        "name": "Brian M. Bradford",
+        "email": "brian@colegalteam.com",
+        "title": "Managing Partner"
+      },
+      "contact_status": "Email contact available from Salesforce"
+    },
+    {
+      "salesforce_account_id": "0015f00000SyVbtAAF",
+      "account_name": "Roden Law | Personal Injury Lawyer-Atlanta",
+      "website": "https://www.rodenlaw.com/?utm_source=google&utm_medium=gmb&utm_campaign=gmb-listing-atlanta",
+      "last_activity_date": "2026-01-21",
+      "contact": null,
+      "contact_status": "No email contact returned from Salesforce"
+    },
+    {
+      "salesforce_account_id": "0015f00000SyF9SAAV",
+      "account_name": "The Doan Law Firm",
+      "website": "thedoanlawfirm.com",
+      "last_activity_date": "2026-01-21",
+      "contact": null,
+      "contact_status": "No email contact returned from Salesforce"
+    },
+    {
+      "salesforce_account_id": "001Rj0000011ferIAA",
+      "account_name": "Huntsman Injury Law - Utah",
+      "website": "https://www.huntsmanlaw.com/",
+      "last_activity_date": "2026-02-05",
+      "contact": null,
+      "contact_status": "No email contact returned from Salesforce"
+    },
+    {
+      "salesforce_account_id": "0015f00000SwPuBAAV",
+      "account_name": "Passalacqua & Associates",
+      "website": "https://cnytriallaw.com/",
+      "last_activity_date": "2026-03-09",
+      "contact": {
+        "salesforce_contact_id": "0035f00000RMkDpAAL",
+        "first_name": "Nicholas",
+        "last_name": "Passalacqua",
+        "name": "Nicholas Passalacqua",
+        "email": "nick@cnytriallaw.com",
+        "title": "Owner"
+      },
+      "contact_status": "Email contact available from Salesforce"
+    },
+    {
+      "salesforce_account_id": "0015f00000Sx1KKAAZ",
+      "account_name": "Nelson Defense Group",
+      "website": "https://nelsondefensegroup.com/",
+      "last_activity_date": "2026-03-09",
+      "contact": {
+        "salesforce_contact_id": "0035f00000RMULxAAP",
+        "first_name": "Aaron",
+        "last_name": "Nelson",
+        "name": "Aaron Nelson",
+        "email": "aaron@nelsondefensegroup.com",
+        "title": null
+      },
+      "contact_status": "Email contact available from Salesforce"
+    }
+  ]
+}

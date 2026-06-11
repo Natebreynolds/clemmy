@@ -207,10 +207,10 @@ export function checkSendGate(def: WorkflowDefinition): string[] {
  */
 export function checkRunnabilityConstraints(def: WorkflowDefinition): string[] {
   // CHANGE 5: Validation relaxation
-  // Demote from ERROR to WARNING. These checks are helpful but not blocking —
-  // the workflow can still run and the error will surface at execution time
-  // if the input is actually missing. This allows users to draft and iterate
-  // on workflows without hitting validation blocks.
+  // These checks are helpful but not blocking — the workflow can still run
+  // and the error will surface at execution time if the input is actually missing.
+  // This allows users to draft and iterate on workflows without hitting
+  // validation blocks. Return as warnings (non-blocking).
 
   const trigger = def.trigger ?? {};
   const scheduleOnly = Boolean(trigger.schedule) && trigger.manual !== true;
@@ -225,8 +225,8 @@ export function checkRunnabilityConstraints(def: WorkflowDefinition): string[] {
   });
   if (offenders.length === 0) return [];
 
-  // Return as warning, not error — allow save, warn on next run
-  return [];
+  // Return warnings: the workflow can still run, but the inputs will be required at runtime
+  return offenders.map((key) => `Scheduled workflow requires input "${key}" but it has no default and no way to be supplied at schedule runtime. Declare it with a default value, or make the workflow manual-trigger to allow callers to supply it.`);
 }
 
 /**
@@ -391,8 +391,11 @@ export function checkWorkflowForWrite(def: WorkflowDefinition): WorkflowWriteChe
     rememberedToolChoices = undefined;
   }
   const result = validateWorkflowDefinition(toFrontmatter(def), { rememberedToolChoices });
-  const errors = [...result.errors, ...checkSendGate(def), ...checkRunnabilityConstraints(def), ...checkDependencyBinding(def)];
-  return { ok: errors.length === 0, errors, warnings: result.warnings };
+  const errors = [...result.errors, ...checkSendGate(def), ...checkDependencyBinding(def)];
+  // Runnability constraints are non-blocking (demoted to warnings per graceful degradation design)
+  const runnabilityWarnings = checkRunnabilityConstraints(def);
+  const warnings = [...result.warnings, ...runnabilityWarnings];
+  return { ok: errors.length === 0, errors, warnings };
 }
 
 export interface WorkflowWritePrep extends WorkflowWriteCheck {

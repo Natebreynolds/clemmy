@@ -1,0 +1,126 @@
+{
+  "name": "Prospecting CRM - Market Leader, Non-Market-Leader & USI",
+  "workspace": "My First Workspace",
+  "status": "Ready to create once Airtable workspaceId is available; attempted workspaceId wspMyFirstWorkspace returned 404.",
+  "tables": [
+    {
+      "name": "Accounts",
+      "description": "Source-of-truth prospect accounts across Market Leader, non-Market-Leader, and USI lanes.",
+      "fields": [
+        "Account Name",
+        "Prospecting Lane",
+        "Salesforce Account ID",
+        "Owner",
+        "Account Status",
+        "Website",
+        "Vertical",
+        "Market",
+        "State",
+        "Market Leader?",
+        "USI Source",
+        "No Active Opportunities?",
+        "ICP Score",
+        "Priority",
+        "Research Summary",
+        "Best Hook",
+        "SEO Opportunity",
+        "AI Visibility Hook",
+        "Competitor Notes",
+        "Page 2 Keywords",
+        "Top Keywords + Positions",
+        "Backlink / Authority Notes",
+        "On-Page / Lighthouse Notes",
+        "Outreach Status",
+        "Last Touch Date",
+        "Next Touch Date",
+        "Next Action",
+        "Email Draft Status",
+        "Chili Piper Link Included?",
+        "Source Sheet / URL",
+        "Notes"
+      ]
+    },
+    {
+      "name": "Contacts",
+      "description": "Decision makers and best contacts tied to prospect accounts.",
+      "fields": [
+        "Contact Name",
+        "Account Name",
+        "Salesforce Contact ID",
+        "Title",
+        "Email",
+        "Phone",
+        "LinkedIn URL",
+        "Role Type",
+        "Best Contact?",
+        "Email Confidence",
+        "Last Activity Date",
+        "Notes"
+      ]
+    },
+    {
+      "name": "Outreach",
+      "description": "Drafts, sent emails, follow-ups, and approvals.",
+      "fields": [
+        "Outreach Name",
+        "Account Name",
+        "Contact Name",
+        "Channel",
+        "Sequence Step",
+        "Subject",
+        "Draft Body",
+        "Personalization Hook",
+        "Status",
+        "Outlook Draft ID",
+        "Sent At",
+        "Reply Status",
+        "Next Follow-Up Date",
+        "Chili Piper Link"
+      ]
+    },
+    {
+      "name": "Research Runs",
+      "description": "Reusable research artifacts and source-backed hooks from DataForSEO, Firecrawl, Salesforce, and manual review.",
+      "fields": [
+        "Run Name",
+        "Account Name",
+        "Run Type",
+        "Source URL",
+        "Research Date",
+        "Raw Findings",
+        "Best Sales Hook",
+        "Evidence / Citation",
+        "Unavailable Data"
+      ]
+    },
+    {
+      "name": "Campaigns",
+      "description": "Prospecting campaigns and segment definitions.",
+      "fields": [
+        "Campaign Name",
+        "Lane",
+        "Goal",
+        "Audience Criteria",
+        "Default CTA",
+        "Status",
+        "Start Date",
+        "End Date"
+      ]
+    },
+    {
+      "name": "Tasks",
+      "description": "Next actions and follow-up work for prospecting.",
+      "fields": [
+        "Task",
+        "Account Name",
+        "Contact Name",
+        "Task Type",
+        "Owner",
+        "Due Date",
+        "Priority",
+        "Status",
+        "Notes"
+      ]
+    }
+  ]
+}

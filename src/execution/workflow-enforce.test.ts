@@ -70,18 +70,18 @@ test('checkWorkflowForWrite: user-only notification workflow is allowed without 
 
 // ─── runnability (the "can't author an unrunnable workflow" guarantee) ───
 
-test('checkRunnabilityConstraints: schedule-only + required non-common input with no default → error', () => {
+test('checkRunnabilityConstraints: schedule-only + required non-common input with no default → warning', () => {
   // 'segment' is NOT in COMMON_WORKFLOW_INPUT_KEYS, so it has no auto-supply
-  // path on a scheduled run — must be flagged.
+  // path on a scheduled run — flagged as a warning (non-blocking per graceful degradation).
   const def = wf({
     trigger: { schedule: '0 9 * * *' }, // schedule, no manual
     inputs: { segment: { type: 'string' } } as WorkflowDefinition['inputs'],
     steps: [{ id: 'a', prompt: 'audit {{input.segment}}' }],
   });
-  const errors = checkRunnabilityConstraints(def);
-  assert.equal(errors.length, 1);
-  assert.match(errors[0], /no default and no way to be supplied/i);
-  assert.match(errors[0], /segment/);
+  const warnings = checkRunnabilityConstraints(def);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /no default and no way to be supplied/i);
+  assert.match(warnings[0], /segment/);
 });
 
 test('checkRunnabilityConstraints: schedule-only + required COMMON input (url) is allowed (injectable)', () => {
