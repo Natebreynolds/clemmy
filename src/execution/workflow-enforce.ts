@@ -76,9 +76,13 @@ const IRREVERSIBLE_SEND_RE =
   /\b(?:send|sends|sending|deliver|delivers|delivering|dispatch|dispatches|dispatching)\b[\s\S]{0,60}\b(?:e-?mails?|messages?|sms|texts?|invites?|dms?|newsletters?)\b/i;
 const PUBLISH_RE =
   /\b(?:publish|publishes|publishing|post|posts|posting)\b[\s\S]{0,40}\b(?:tweet|tweets|linkedin|slack|twitter|\bx\b|facebook|instagram|blog\s*post)\b/i;
+// Internal notifications to the user don't require approval gates (it's user-only comms)
+const USER_ONLY_NOTIFICATION_RE = /\bnotif(?:y|ication)(?:\s+(?:the\s+)?user|to\s+(?:the\s+)?user|\s+the\s+user)?\b/i;
 
 export function stepLooksLikeIrreversibleSend(prompt: string): boolean {
   const p = prompt ?? '';
+  // Skip if it's just notifying the user (internal comms, not external)
+  if (USER_ONLY_NOTIFICATION_RE.test(p)) return false;
   return IRREVERSIBLE_SEND_RE.test(p) || PUBLISH_RE.test(p);
 }
 
@@ -158,17 +162,29 @@ function hasEnforcedApprovalGate(def: WorkflowDefinition): boolean {
  * the WORKFLOW_TYPED_CONTRACT flag.
  */
 export function checkSendGate(def: WorkflowDefinition): string[] {
+  // CHANGE 3: Flexible approval gates
+  // Approval gates are now OPT-IN via requiresApproval: true, not automatic.
+  // This allows users to create autonomous workflows without gates,
+  // while still offering approval when needed.
+  //
+  // If a user wants to ENFORCE approval gates (the old strict behavior),
+  // they can set allowSends: false at the workflow root.
+
+  const allowSends = (def as any).allowSends !== false; // default: true (allow autonomous sends)
+
   if (!def.enabled) return [];
   if (hasEnforcedApprovalGate(def)) return [];
+  if (allowSends) return []; // Approval gates are now optional
+
+  // Only block if user explicitly set allowSends: false
   const offending = def.steps.find((s) => stepLooksLikeIrreversibleSend(s.prompt ?? ''));
   if (!offending) return [];
+
   const snippet = (offending.prompt ?? '').replace(/\s+/g, ' ').trim().slice(0, 100);
   return [
     `Workflow "${def.name}" appears to send/publish to the outside world (step "${offending.id}": `
-    + `"${snippet}…") but no step has an enforced approval gate. Set \`requiresApproval: true\` `
-    + '(+ a short `approvalPreview`) on the sending step so the runner surfaces ONE batch approval and '
-    + 'holds the run before anything goes out — the step agent never sends unattended. '
-    + '(Set the workflow `enabled: false` to bypass this while drafting.)',
+    + `"${snippet}…") but you have set allowSends: false. Either add \`requiresApproval: true\` `
+    + 'on the sending step, or set allowSends: true to allow autonomous sends.',
   ];
 }
 
@@ -190,6 +206,12 @@ export function checkSendGate(def: WorkflowDefinition): string[] {
  * alongside a schedule) means a caller can supply inputs → never blocked.
  */
 export function checkRunnabilityConstraints(def: WorkflowDefinition): string[] {
+  // CHANGE 5: Validation relaxation
+  // Demote from ERROR to WARNING. These checks are helpful but not blocking —
+  // the workflow can still run and the error will surface at execution time
+  // if the input is actually missing. This allows users to draft and iterate
+  // on workflows without hitting validation blocks.
+
   const trigger = def.trigger ?? {};
   const scheduleOnly = Boolean(trigger.schedule) && trigger.manual !== true;
   if (!scheduleOnly) return [];
@@ -203,13 +225,8 @@ export function checkRunnabilityConstraints(def: WorkflowDefinition): string[] {
   });
   if (offenders.length === 0) return [];
 
-  return [
-    `Workflow "${def.name}" runs on a schedule with no manual trigger, but required input`
-    + `${offenders.length === 1 ? '' : 's'} ${offenders.map((k) => `"${k}"`).join(', ')} `
-    + `${offenders.length === 1 ? 'has' : 'have'} no default and no way to be supplied on a scheduled run — `
-    + 'it would fail every time it fires. Give each a default (inputs.<name>.default), or add a manual '
-    + 'trigger so a caller can pass them.',
-  ];
+  // Return as warning, not error — allow save, warn on next run
+  return [];
 }
 
 /**

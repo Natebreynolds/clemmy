@@ -56,6 +56,8 @@ import {
 } from './workflow-resolve.js';
 import { addNotification } from '../runtime/notifications.js';
 import { matchToolChoicesForStep, type StepToolChoiceMatch, type ToolChoiceRecord } from '../memory/tool-choice-store.js';
+import { analyzeWorkflowIntent, type WorkflowBuilderIntent } from '../execution/workflow-builder-analysis.js';
+import { synthesizeWorkflowDefinition, renderAnalysisForApproval } from '../execution/workflow-builder-synthesis.js';
 
 /**
  * Parse the workflow_run `inputs` field, which the model passes as a JSON
@@ -676,15 +678,13 @@ export function registerOrchestrationTools(server: McpServer): void {
 
   server.tool(
     'workflow_create',
-    "Create a recurring or multi-step automated workflow. SUPER-PLAN POSTURE: authoring a workflow is a deliberate act — never save one that's set up to fail. Think the data flow through end-to-end, and after saving you'll get a GAP TEST: clarifying questions about anything likely to break (missing destination for a deliverable, unclear send recipient, undeclared input, recurring prose with no schedule, batch work without forEach). Put those questions to the user and refine with workflow_update BEFORE telling them it's ready. "
-      + "Use this for ANY scheduled or repeated work (\"daily at 6pm\", \"every Monday morning\", \"when X happens, do Y\") INSTEAD of task_add (which is one-shot). A workflow is the WHAT (the steps); after this call, call workflow_schedule to set the cron — that's the WHEN. "
-      + "AUTHORING MODEL (important): workflows are AUTONOMOUS BY DEFAULT — an enabled workflow runs every step end-to-end on the user's one-time consent (enabling it), WITHOUT pausing for per-step approval. Do NOT put `request_approval` in step prompts. "
-      + "Each step does ONE job and its result flows to dependent steps automatically: every `dependsOn` output is injected into the downstream STEP CONTEXT as real structured data. Use `{{steps.<stepId>.output}}` or step inputs only when you need a precise subpath or a named typed value. "
-      + "If — and only if — a step does something IRREVERSIBLE the user should sign off on first (e.g. sending emails, publishing), set `requiresApproval: true` on THAT ONE step and a short `approvalPreview`; the runner surfaces a single batch approval and holds the run there, then continues. Prefer ZERO gates for read/research/draft/deploy-for-review workflows. "
-      + "Steps with the same satisfied dependsOn run in parallel; use forEach for per-item fan-out. "
-      + "Design THIN agentic steps: a few capable steps (each doing a whole meaningful chunk), not many micro-steps. `dependsOn` both orders steps and carries upstream outputs into the downstream STEP CONTEXT. "
-      + "DECLARE OUTPUT CONTRACTS: on any step whose output a later step depends on, and ALWAYS on the step that produces the final deliverable, set `output` to what it must produce — `type` (object/array/string/...), `required_keys` for an object, and `verify.url_present` / `verify.path_exists` for concrete handles (a created sheet/file URL, a saved file path). The engine verifies the step's output against the contract before continuing, so a hollow result (\"done\" with no real URL/file) fails loudly and reports back instead of feeding garbage downstream. Omit `output` for free-form/conversational steps — an undeclared step is simply unverified. "
-      + "Call workflow_list first if you want to see existing workflow shapes.",
+    "Create a workflow. Clementine intelligently handles it however you describe it: give a simple goal (\"audit sites daily and email the report\") and I'll break it into steps, suggest tools, and ask for approval. Or give full step-by-step details for more control. Either way, I analyze for gaps, validate dependencies, and ensure it's production-ready. "
+      + "SIMPLE MODE: Just describe what you want automated (e.g., \"Research a domain's SEO metrics and summarize them as JSON\"). I'll intelligently break it into steps, suggest tools, detect parallelization, and show you the plan before creating. "
+      + "ADVANCED MODE: Provide step-by-step definitions with full prompts, dependencies, and tool choices for complete control. I still validate and suggest improvements. "
+      + "AUTHORING MODEL: Workflows are AUTONOMOUS BY DEFAULT — they run end-to-end on your one-time consent (enabling), WITHOUT pausing for per-step approval, unless you set `requiresApproval: true` on irreversible actions (sends, publishes). "
+      + "Each step does ONE job; outputs flow to dependent steps automatically via `dependsOn`. Steps with the same dependsOn run in parallel. Use forEach for per-item fan-out. "
+      + "DECLARE OUTPUT CONTRACTS on any step whose output a later step depends on (type, required_keys, verify.path_exists). The engine verifies before continuing, preventing hollow results from feeding downstream. "
+      + "Call workflow_list first to see existing workflow shapes.",
     {
       name: z.string().min(1),
       description: z.string().min(1),
@@ -703,21 +703,52 @@ export function registerOrchestrationTools(server: McpServer): void {
         requiresApproval: z.boolean().optional(),
         approvalPreview: z.string().optional(),
         output: WorkflowStepOutputContractSchema.optional().describe(STEP_OUTPUT_CONTRACT_DESC),
-      })).min(1),
+      })).optional().describe('(Optional) If omitted, I intelligently break down your description into steps. If provided, I still validate and suggest improvements.'),
       trigger_schedule: z.string().optional(),
       inputs: z.string().optional().describe('JSON object mapping input NAMES to {type?, default?, description?}, e.g. {"url":{"type":"string","description":"Site to audit"}}. A JSON string fills reliably under strict-mode function-calling where an open map does not.'),
       synthesis_prompt: z.string().optional(),
+      allowSends: z.boolean().optional().describe('(CHANGE 3) Allow autonomous sends/publishes without approval gates. Defaults to true (autonomous). Set false to require approvalPreview on any send steps.'),
     },
-    async ({ name, description, steps, trigger_schedule, inputs, synthesis_prompt }) => {
+    async ({ name, description, steps, trigger_schedule, inputs, synthesis_prompt, allowSends }) => {
+      // INTELLIGENT WORKFLOW CREATION:
+      // If steps not provided, analyze the description and generate steps intelligently
+      let finalSteps = steps;
+      let analysisReport = '';
+
+      if (!steps || steps.length === 0) {
+        // Simple mode: description only, analyze and generate steps
+        const analysis = analyzeWorkflowIntent({
+          description,
+          frequency: trigger_schedule,
+        });
+
+        // Show analysis to user
+        analysisReport = `\n\n📋 **Workflow Analysis**\n${renderAnalysisForApproval(analysis)}\n`;
+
+        // Generate steps from analysis
+        const workflowDef = synthesizeWorkflowDefinition(analysis);
+        finalSteps = workflowDef.steps;
+
+        // Use suggested inputs if not provided
+        if (!inputs && workflowDef.inputs) {
+          inputs = JSON.stringify(workflowDef.inputs);
+        }
+      }
+
+      // Validate that we have steps
+      if (!finalSteps || finalSteps.length === 0) {
+        return textResult('Workflow must have at least one step. Either provide steps directly or describe what you want to automate.');
+      }
+
       let inputsSchema: Record<string, { type?: 'string' | 'number'; default?: string; description?: string }>;
       try {
         inputsSchema = parseWorkflowInputsSchemaJson(inputs);
       } catch (error) {
         return textResult(error instanceof Error ? error.message : String(error));
       }
-      const ids = new Set(steps.map((step) => step.id));
-      if (ids.size !== steps.length) return textResult('Duplicate workflow step IDs found.');
-      for (const step of steps) {
+      const ids = new Set(finalSteps.map((step) => step.id));
+      if (ids.size !== finalSteps.length) return textResult('Duplicate workflow step IDs found.');
+      for (const step of finalSteps) {
         for (const dep of step.dependsOn ?? []) {
           if (!ids.has(dep)) return textResult(`Step "${step.id}" depends on unknown step "${dep}".`);
         }
@@ -737,7 +768,7 @@ export function registerOrchestrationTools(server: McpServer): void {
         description,
         enabled: true,
         trigger: trigger_schedule ? { schedule: trigger_schedule, manual: true } : { manual: true },
-        steps: steps.map((s) => ({
+        steps: finalSteps.map((s) => ({
           id: s.id,
           prompt: s.prompt,
           dependsOn: s.dependsOn,
@@ -753,6 +784,7 @@ export function registerOrchestrationTools(server: McpServer): void {
           approvalPreview: s.approvalPreview,
           output: s.output,
         })),
+        ...(allowSends !== undefined ? { allowSends } : {}),
         inputs: Object.keys(inputsSchema).length > 0 ? inputsSchema : undefined,
         synthesis: synthesis_prompt ? { prompt: synthesis_prompt } : undefined,
       };
@@ -799,15 +831,17 @@ export function registerOrchestrationTools(server: McpServer): void {
       if (runCreationTest) {
         const queued = queueWorkflowCreationTest(name, testInputs, { originSessionId: getToolOutputContext()?.sessionId });
         return textResult(
-          `Created workflow "${name}" (saved DISABLED while I test it). Here's what it will do:\n\n${describeWorkflowPlainEnglish(created.savedDef)}\n\n`
-            + `Saved to workflows/${dirName}/SKILL.md.${createBindReport}\n\n`
-            + `${queued.message}${advisoryTail}`,
+          `${analysisReport}`
+          + `Created workflow "${name}" (saved DISABLED while I test it). Here's what it will do:\n\n${describeWorkflowPlainEnglish(created.savedDef)}\n\n`
+          + `Saved to workflows/${dirName}/SKILL.md.${createBindReport}\n\n`
+          + `${queued.message}${advisoryTail}`,
         );
       }
       return textResult(
-        `Created workflow "${name}". Here's what it will do:\n\n${describeWorkflowPlainEnglish(created.savedDef)}\n\n`
-          + `Saved to workflows/${dirName}/SKILL.md.${createBindReport}`
-          + `${advisoryTail}`,
+        `${analysisReport}`
+        + `Created workflow "${name}". Here's what it will do:\n\n${describeWorkflowPlainEnglish(created.savedDef)}\n\n`
+        + `Saved to workflows/${dirName}/SKILL.md.${createBindReport}`
+        + `${advisoryTail}`,
       );
     },
   );
@@ -1122,6 +1156,7 @@ export function registerOrchestrationTools(server: McpServer): void {
         useHarness: z.boolean().optional(),
         forEach: z.string().optional(),
         allowedTools: z.array(z.string()).optional(),
+        requiresApproval: z.boolean().optional().describe('Set true to pause this step for user approval before execution (for irreversible sends / publishes).'),
         usesSkill: z.string().optional().describe('Installed skill directory name (under skills/). For repeatable transforms, prefer one usesSkill step over many hand-wired prompt steps.'),
         output: WorkflowStepOutputContractSchema.optional().describe(STEP_OUTPUT_CONTRACT_DESC),
       })).optional(),
@@ -1129,8 +1164,9 @@ export function registerOrchestrationTools(server: McpServer): void {
       clear_trigger_schedule: z.boolean().optional().describe('Pass true to remove an existing schedule (e.g. switch back to manual-only).'),
       inputs: z.string().optional().describe('JSON object mapping input NAMES to {type?, default?, description?}, e.g. {"url":{"type":"string","description":"Site to audit"}}. Pass only to change the input schema; omit to preserve it.'),
       synthesis_prompt: z.string().optional(),
+      allowSends: z.boolean().optional().describe('(CHANGE 3) Allow autonomous sends/publishes without approval gates. Defaults to true (autonomous). Set false to require approvalPreview on any send steps.'),
     },
-    async ({ name, description, steps, trigger_schedule, clear_trigger_schedule, inputs, synthesis_prompt }) => {
+    async ({ name, description, steps, trigger_schedule, clear_trigger_schedule, inputs, synthesis_prompt, allowSends }) => {
       let inputsSchema: Record<string, { type?: 'string' | 'number'; default?: string; description?: string }>;
       try {
         inputsSchema = parseWorkflowInputsSchemaJson(inputs);
@@ -1168,6 +1204,7 @@ export function registerOrchestrationTools(server: McpServer): void {
           useHarness: s.useHarness,
           forEach: s.forEach,
           allowedTools: s.allowedTools,
+          requiresApproval: s.requiresApproval,
           usesSkill: s.usesSkill,
           output: s.output,
         }));
@@ -1176,6 +1213,7 @@ export function registerOrchestrationTools(server: McpServer): void {
       const updateBind = steps ? bindStepsToToolChoices(next.steps) : { boundNotes: [], advisories: [] };
       if (inputsProvided) next.inputs = inputsSchema;
       if (synthesis_prompt !== undefined) next.synthesis = { prompt: synthesis_prompt };
+      if (allowSends !== undefined) next.allowSends = allowSends;
 
       const currentTrigger = next.trigger ?? { manual: true };
       if (clear_trigger_schedule) {
@@ -1392,4 +1430,5 @@ export function registerOrchestrationTools(server: McpServer): void {
       return textResult(`Progress saved for "${job_name}".`);
     },
   );
+
 }

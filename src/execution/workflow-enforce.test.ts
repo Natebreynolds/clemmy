@@ -45,6 +45,15 @@ test('checkWorkflowForWrite: enabled send workflow without approval gate is reje
   assert.match(result.errors.join(' '), /approval gate/i);
 });
 
+test('checkWorkflowForWrite: user-only notification workflow is allowed without approval gate', () => {
+  const notification = wf({
+    steps: [{ id: 'notify', prompt: 'notify the user with a structured summary of the outlook triage' }],
+  });
+  const result = checkWorkflowForWrite(notification);
+  assert.equal(result.ok, true);
+  assert.equal(result.errors.length, 0);
+});
+
 // ─── runnability (the "can't author an unrunnable workflow" guarantee) ───
 
 test('checkRunnabilityConstraints: schedule-only + required non-common input with no default → error', () => {

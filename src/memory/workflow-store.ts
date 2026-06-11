@@ -233,6 +233,10 @@ export interface WorkflowDefinition {
   synthesis?: WorkflowSynthesis;
   /** Free-form prose body — everything not under a ## step: anchor. */
   description_body?: string;
+  /** CHANGE 3: Approval gate flexibility. When true (default), sends/publishes run autonomously
+   *  without requiring approval gates. Users can opt-in to approval per-step via requiresApproval.
+   *  Set to false to re-enable strict validation (old behavior: send gates required). */
+  allowSends?: boolean;
 }
 
 /** What the on-disk loader returns. */
