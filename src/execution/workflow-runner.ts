@@ -2503,6 +2503,10 @@ export function enqueueWorkflowOutcomeTurn(
       // to the outcome default (4000) so this lane is no more starved than the
       // background-task lane; the marker + statusHint still recover the rest.
       maxDetailChars: 4000,
+      // Report-back v2: a chat-fired run's outcome is SPOKEN into the idle
+      // origin conversation (creation tests included — "verified, set to
+      // run: fire now or wait?"), not just staged for the user's next turn.
+      proactiveTurn: true,
     },
   );
 }

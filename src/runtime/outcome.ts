@@ -54,6 +54,28 @@ export interface DeliverContext {
   headWord?: Partial<Record<OutcomeStatus, string>>;
   /** Detail truncation cap. */
   maxDetailChars?: number;
+  /**
+   * Report-back v2 (2026-06-11): when true and the origin is an IDLE chat
+   * session, fire ONE proactive conversation turn so Clementine SPEAKS the
+   * outcome into the conversation immediately ("test passed — fire it now or
+   * wait for the schedule?") instead of waiting for the user's next message.
+   * Falls back to the passive synthetic-turn staging whenever the session is
+   * busy, non-chat, or anything errors. Best-effort by construction.
+   */
+  proactiveTurn?: boolean;
+}
+
+/** Pure gate for the proactive report-back turn: only an idle CHAT session
+ *  qualifies — a session mid-turn (recent event) must not get a colliding
+ *  turn, and workflow/agent sessions have no human watching them. */
+export function shouldProactivelyReport(
+  sessionKind: string | null,
+  lastEventAgeMs: number | null,
+  idleThresholdMs = 60_000,
+): boolean {
+  if (sessionKind !== 'chat') return false;
+  if (lastEventAgeMs !== null && lastEventAgeMs < idleThresholdMs) return false;
+  return true;
 }
 
 const DEFAULT_HEAD_WORDS: Record<OutcomeStatus, string> = {
@@ -132,6 +154,36 @@ export function deliverOutcome(outcome: Outcome, ctx: DeliverContext): boolean {
       if (hs) hs.injectSyntheticUserTurn(idPrefix, text);
     } catch { /* a harness-store write must never affect run state */ }
     logger.info({ sourceId: ctx.sourceId, sessionId, status: outcome.status }, 'Outcome delivered to origin session');
+    if (ctx.proactiveTurn) {
+      // Fire-and-forget: a proactive relay failure must never affect the run
+      // or the passive staging above (which remains the guaranteed baseline).
+      void (async () => {
+        try {
+          const hs = HarnessSession.load(sessionId);
+          if (!hs) return;
+          const { listEvents } = await import('./harness/eventlog.js');
+          const last = listEvents(sessionId, { limit: 1, desc: true })[0];
+          const ageMs = last ? Date.now() - Date.parse(last.createdAt) : null;
+          if (!shouldProactivelyReport(hs.sessionRow.kind, ageMs)) return;
+          const [{ runConversation }, { buildOrchestratorAgent }] = await Promise.all([
+            import('./harness/loop.js'),
+            import('../agents/orchestrator.js'),
+          ]);
+          const directive =
+            `A ${ctx.sourceLabel} you started from this conversation just finished (see the latest [${ctx.sourceLabel} ${ctx.sourceId}] note in context). `
+            + 'Relay the outcome to the user NOW in one short message: lead with pass/fail and the key evidence. '
+            + 'If it passed and the workflow is enabled, end by asking: fire it off now, or wait for the next scheduled run? '
+            + 'If it failed, say exactly what you will fix. Do not re-run anything in this turn.';
+          const agent = await buildOrchestratorAgent({ userInput: directive, sessionId });
+          await runConversation({ agent, sessionId, input: directive, judgeCompletion: false });
+        } catch (err) {
+          logger.warn(
+            { err: err instanceof Error ? err.message : err, sourceId: ctx.sourceId },
+            'proactive report-back turn failed (passive staging + notification remain)',
+          );
+        }
+      })();
+    }
     return true;
   } catch (err) {
     logger.warn(
