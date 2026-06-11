@@ -43,7 +43,9 @@ beforeEach(() => {
   rmSync(WORKFLOWS_DIR, { recursive: true, force: true });
 });
 
-test('enabled ungated-send workflow is REFUSED (not written)', async () => {
+test('enabled ungated-send workflow is ALLOWED (default allowSends=true)', async () => {
+  // Approval gates are now opt-in (allowSends: true by default).
+  // Ungated sends are allowed without explicit approval gates.
   const result = await scheduleTool()({
     name: 'midday-sender',
     description: 'Compose and send the outreach emails at midday.',
@@ -54,8 +56,8 @@ test('enabled ungated-send workflow is REFUSED (not written)', async () => {
     timezone: null,
   });
   const text = resultText(result);
-  assert.ok(/NOT scheduled/.test(text), `expected refusal, got: ${text}`);
-  assert.equal(readWorkflow('midday-sender'), null, 'workflow must not be written');
+  assert.ok(/Created workflow/.test(text), `expected creation, got: ${text}`);
+  assert.ok(readWorkflow('midday-sender'), 'workflow must be written');
 });
 
 test('workflow_schedule does NOT clobber an existing MULTI-step workflow — P1-8', async () => {

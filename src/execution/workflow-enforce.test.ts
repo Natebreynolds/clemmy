@@ -36,13 +36,27 @@ test('checkWorkflowForWrite: a clean manual workflow validates ok', () => {
   assert.equal(result.errors.length, 0);
 });
 
-test('checkWorkflowForWrite: enabled send workflow without approval gate is rejected', () => {
+test('checkWorkflowForWrite: enabled send workflow is allowed (default allowSends=true)', () => {
+  // Approval gates are now opt-in. Ungated sends are allowed by default unless
+  // the user explicitly sets allowSends: false (strict mode).
   const offending = wf({
     steps: [{ id: 'send', prompt: 'send the emails to the leads' }],
   });
   const result = checkWorkflowForWrite(offending);
-  assert.equal(result.ok, false);
-  assert.match(result.errors.join(' '), /approval gate/i);
+  assert.equal(result.ok, true, 'ungated send is allowed with default allowSends=true');
+  assert.equal(result.errors.length, 0, 'no errors for autonomous sends');
+});
+
+test('checkWorkflowForWrite: enabled send workflow with allowSends=false is rejected', () => {
+  // Strict mode: require approval gates for any send when allowSends: false
+  const offending = wf({
+    enabled: true,
+    allowSends: false,
+    steps: [{ id: 'send', prompt: 'send the emails to the leads' }],
+  });
+  const result = checkWorkflowForWrite(offending);
+  assert.equal(result.ok, false, 'ungated send is rejected with allowSends=false');
+  assert.match(result.errors.join(' '), /requiresApproval|approval/i);
 });
 
 test('checkWorkflowForWrite: user-only notification workflow is allowed without approval gate', () => {
