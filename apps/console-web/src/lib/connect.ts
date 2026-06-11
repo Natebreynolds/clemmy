@@ -164,6 +164,23 @@ export const forgetCatalogCli = (id: string) => apiPost<{ ok: boolean }>('/api/c
 export const reconnectCatalogCli = (id: string) => apiPost('/api/console/cli-catalog/reconnect', { id });
 export const getInstallJob = (id: string) => apiGet<{ job: InstallJob }>(`/api/console/install-jobs/${encodeURIComponent(id)}`);
 
+// ─── Browser harness (browser-use) — drive the user's real Chrome ────────
+export interface BrowserHarnessPrereq { name: string; available: boolean; path?: string; version?: string }
+export interface BrowserHarnessStatus {
+  installed: boolean; commandPath?: string; version?: string; installDir: string;
+  repoPresent: boolean; codexSkillLinked: boolean;
+  prerequisites: BrowserHarnessPrereq[];
+  browserUseCloudKeyPresent: boolean; chromeSetupUrl: string; docsUrl: string; installCommand: string;
+}
+export interface BrowserHarnessCommandResult { ok: boolean; command: string; code: number | null; output: string }
+export const getBrowserHarness = () => apiGet<BrowserHarnessStatus>('/api/console/browser-harness');
+export const installBrowserHarness = () => apiPost<{ job: InstallJob }>('/api/console/browser-harness/install', {});
+export const getBrowserHarnessInstallJob = (id: string) =>
+  apiGet<{ job: InstallJob }>(`/api/console/browser-harness/install/${encodeURIComponent(id)}`);
+export const browserHarnessDoctor = () => apiPost<BrowserHarnessCommandResult>('/api/console/browser-harness/doctor', {});
+export const browserHarnessTest = () => apiPost<BrowserHarnessCommandResult>('/api/console/browser-harness/test', {});
+export const browserHarnessChromeSetup = () => apiPost<BrowserHarnessCommandResult>('/api/console/browser-harness/open-chrome-setup', {});
+
 export interface ProjectInfo { name: string; path: string; type?: string; description?: string; hasClaude?: boolean }
 export const getProjects = () => apiGet<{ workspaceDirs?: string[]; projects?: ProjectInfo[] }>('/api/console/projects');
 

@@ -12,6 +12,7 @@ import { MobilePanel } from '@/components/connect/MobilePanel';
 import { McpManager } from '@/components/connect/McpManager';
 import { ProjectsPanel } from '@/components/connect/ProjectsPanel';
 import { CliTools } from '@/components/connect/CliTools';
+import { BrowserHarness } from '@/components/connect/BrowserHarness';
 import { usePoll } from '@/lib/poll';
 import {
   getComposioStatus, getComposioToolkits, authorizeComposio, refreshComposio, disconnectComposio, activeConnectionId,
@@ -178,6 +179,9 @@ export function Connect() {
 
       {/* CLIs — save-to-confirm, not a PATH dump */}
       <CliTools />
+
+      {/* Browser harness — drive the user's real Chrome */}
+      <BrowserHarness />
 
       {/* Projects & folders */}
       <ProjectsPanel />
