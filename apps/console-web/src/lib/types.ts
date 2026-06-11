@@ -28,6 +28,10 @@ export interface CommandCenterItem {
   approvalKind?: 'runtime' | 'harness';
   approvalId?: string;
   targetSessionId?: string;
+  /** When present the card shows a dismiss (X) button routed to
+   *  POST /api/console/inbox/dismiss. */
+  dismissKind?: 'checkin' | 'plan' | 'proposal';
+  dismissId?: string;
 }
 
 export interface CommandCenter {

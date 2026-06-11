@@ -64,6 +64,10 @@ export const listRuns = (limit = 40) => apiGet<{ runs: RunRow[] }>(`/api/runs?li
 export const listNotifications = () =>
   apiGet<{ notifications: NotificationRow[] }>('/api/notifications');
 
+/** Dismiss a "Needs you" card (check-in / plan / proposal). */
+export const dismissInboxItem = (kind: string, id: string) =>
+  apiPost(`/api/console/inbox/dismiss`, { kind, id });
+
 export const markNotificationRead = (id: string) =>
   apiPost(`/dashboard/actions/notifications/${encodeURIComponent(id)}/read`);
 

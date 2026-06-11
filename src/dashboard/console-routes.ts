@@ -64,7 +64,7 @@ import { describeWorkflowPlainEnglish } from '../execution/workflow-describe.js'
 import { buildWorkflowGraph } from './workflow-graph.js';
 import { validateCronExpression } from '../shared/cron.js';
 import { ExecutionStore } from '../execution/store.js';
-import { listOpenCheckIns } from '../agents/check-ins.js';
+import { listOpenCheckIns, closeCheckIn } from '../agents/check-ins.js';
 import type { ClementineAssistant } from '../assistant/core.js';
 import type { PendingApproval } from '../types.js';
 import { buildRealtimeVoiceInstructions } from '../assistant/voice-context.js';
@@ -144,6 +144,7 @@ import {
   listPlanProposals,
   planProposalNeedsUserInput,
   rejectPlanProposal,
+  supersedePlanProposal,
 } from '../agents/plan-proposals.js';
 import { approvePlanAndQueueBackgroundTask } from '../execution/approved-plan-tasks.js';
 import {
@@ -5067,6 +5068,39 @@ export function registerConsoleRoutes(
 
   // ─── Home panel ────────────────────────────────────────────────
 
+  /**
+   * Dismiss a "Needs you" card the user doesn't want to act on. Routes to
+   * the owning store: check-ins close (audit reason), plan proposals
+   * supersede (no negative-feedback signal), check-in template proposals
+   * reject. Approvals are deliberately NOT dismissable — decide those.
+   */
+  app.post('/api/console/inbox/dismiss', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const kind = typeof req.body?.kind === 'string' ? req.body.kind : '';
+    const id = typeof req.body?.id === 'string' ? req.body.id.slice(0, 120) : '';
+    if (!id) { res.status(400).json({ error: 'id required' }); return; }
+    try {
+      if (kind === 'checkin') {
+        const closed = closeCheckIn(id, 'Dismissed by user from the inbox.');
+        res.json({ ok: Boolean(closed), kind, id });
+        return;
+      }
+      if (kind === 'plan') {
+        const superseded = supersedePlanProposal(id, 'dismissed from inbox');
+        res.json({ ok: Boolean(superseded), kind, id });
+        return;
+      }
+      if (kind === 'proposal') {
+        const rejected = rejectProposal(id, 'Dismissed from inbox.');
+        res.json({ ok: Boolean(rejected), kind, id });
+        return;
+      }
+      res.status(400).json({ error: `kind "${kind}" is not dismissable` });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   app.get('/api/console/home/command-center', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
@@ -5197,6 +5231,8 @@ export function registerConsoleRoutes(
           meta: `plan ${proposal.id}`,
           panel: 'settings',
           urgency: 'high',
+          dismissKind: 'plan',
+          dismissId: proposal.id,
         })),
         ...checkInProposals.map((proposal) => ({
           kind: 'proposal',
@@ -5204,6 +5240,8 @@ export function registerConsoleRoutes(
           meta: 'check-in proposal',
           panel: 'settings',
           urgency: 'normal',
+          dismissKind: 'proposal',
+          dismissId: proposal.id,
         })),
         ...openCheckIns.map((checkIn) => ({
           kind: 'checkin',
@@ -5211,6 +5249,8 @@ export function registerConsoleRoutes(
           meta: checkIn.urgency !== 'normal' ? `${checkIn.urgency} · ${checkIn.askedAt.slice(11, 16)}` : `asked ${checkIn.askedAt.slice(11, 16)}`,
           panel: 'settings',
           urgency: checkIn.urgency === 'high' ? 'high' : 'normal',
+          dismissKind: 'checkin',
+          dismissId: checkIn.id,
         })),
         ...activeBackgroundTasks.filter((task) => task.status === 'awaiting_approval' && !task.pendingApprovalId).map((task) => ({
           kind: 'background',
