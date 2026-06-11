@@ -22,7 +22,7 @@ import {
 import { startCanonicalTranscriptBackfill } from '../integrations/recall/backfill.js';
 import { createBackgroundTask } from '../execution/background-tasks.js';
 import { checkAllSkillUpdates } from '../runtime/skill-installer.js';
-import { addNotification } from '../runtime/notifications.js';
+import { addNotification, reapStaleNotifications } from '../runtime/notifications.js';
 import { reapExpiredGoals } from '../agents/plan-proposals.js';
 
 /**
@@ -103,6 +103,7 @@ interface MemoryMaintenanceState {
   lastBackupDay?: string;
   lastMergeDay?: string;
   lastGoalReapDay?: string;
+  lastNotificationReapDay?: string;
 }
 const MAINTENANCE_STATE_FILE = path.join(STATE_DIR, 'memory-maintenance-state.json');
 
@@ -157,6 +158,12 @@ const MEMORY_MERGE_NIGHTLY_MINUTE = 45; // offset from backup's 4:30
 // offset from the merge's 4:45.
 const GOAL_REAP_NIGHTLY_HOUR = 5;
 const GOAL_REAP_NIGHTLY_MINUTE = 0;
+
+// Notification hygiene — stale unread approval/execution cards flip to read,
+// >30d records purge. Also runs at daemon boot (daemon/runner.ts). 5:15,
+// offset from the goal reaper's 5:00.
+const NOTIFICATION_REAP_NIGHTLY_HOUR = 5;
+const NOTIFICATION_REAP_NIGHTLY_MINUTE = 15;
 
 // Tier C3 — episodic_pointers TTL reaper cadence (~1h, same as the
 // tool_outputs reaper it shadows).
@@ -451,6 +458,22 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
         }
       } catch (err) {
         logger.warn({ err }, 'goal reaper nightly job failed');
+      }
+    }
+  }
+
+  // Notification reaper at 5:15 AM local. Same fire-once-per-day dedupe.
+  if (isAtOrAfterDailyTime(now, NOTIFICATION_REAP_NIGHTLY_HOUR, NOTIFICATION_REAP_NIGHTLY_MINUTE)) {
+    if (maintenanceState.lastNotificationReapDay !== today) {
+      maintenanceState.lastNotificationReapDay = today;
+      writeMaintenanceState(maintenanceState);
+      try {
+        const stats = reapStaleNotifications();
+        if (stats.markedRead > 0 || stats.purged > 0) {
+          logger.info({ stats }, 'notification reaper nightly job completed');
+        }
+      } catch (err) {
+        logger.warn({ err }, 'notification reaper nightly job failed');
       }
     }
   }

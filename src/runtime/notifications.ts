@@ -369,6 +369,51 @@ export function markStaleApprovalNotificationsRead(
   return changed;
 }
 
+/** Unread approval/execution notifications older than this are dead — their
+ *  runs/approvals are long gone and the "Needs you" card goes nowhere. */
+const STALE_ACTION_NOTIFICATION_MS = 7 * 24 * 60 * 60 * 1000;
+/** Hard age cap: anything older than this is purged outright (the count cap
+ *  in pruneNotifications never fires when volume is low but age is high). */
+const NOTIFICATION_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+
+/**
+ * Notification hygiene (run at daemon boot + nightly): marks stale unread
+ * approval/execution notifications read (their underlying runs are dead, so
+ * the inbox card is unactionable — observed live: 873 unread dating back
+ * weeks, burying anything real) and purges records past the hard age cap.
+ * Audit trail: reaped items get metadata.reapedAt/reapReason.
+ */
+export function reapStaleNotifications(nowMs: number = Date.now()): { markedRead: number; purged: number } {
+  const items = loadNotifications();
+  const kept: NotificationRecord[] = [];
+  let markedRead = 0;
+  let purged = 0;
+  for (const item of items) {
+    const at = Date.parse(item.createdAt);
+    const age = Number.isFinite(at) ? nowMs - at : 0;
+    if (age > NOTIFICATION_MAX_AGE_MS) {
+      purged += 1;
+      continue;
+    }
+    if (
+      !item.read &&
+      age > STALE_ACTION_NOTIFICATION_MS &&
+      (item.kind === 'approval' || item.kind === 'execution')
+    ) {
+      item.read = true;
+      item.metadata = {
+        ...(item.metadata ?? {}),
+        reapedAt: new Date(nowMs).toISOString(),
+        reapReason: 'stale_action_notification',
+      };
+      markedRead += 1;
+    }
+    kept.push(item);
+  }
+  if (markedRead > 0 || purged > 0) saveNotifications(kept);
+  return { markedRead, purged };
+}
+
 export function getNotification(id: string): NotificationRecord | undefined {
   return loadNotifications().find((entry) => entry.id === id);
 }

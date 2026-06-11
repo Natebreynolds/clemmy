@@ -32,6 +32,7 @@ import { DISCORD_BOT_TOKEN, DISCORD_ENABLED, WEBHOOK_ENABLED, WEBHOOK_SECRET } f
 import { getOrRefreshScan as warmCliScan } from '../runtime/cli-discovery.js';
 import { closePlanScope, openPlanScope } from '../agents/plan-scope.js';
 import { processMemoryMaintenance } from '../memory/maintenance.js';
+import { embedQuery, isEmbeddingsEnabled } from '../memory/embeddings.js';
 import { runRecursiveReflection, consolidateActiveFacts } from '../memory/reflection.js';
 import { decayAndEvictFacts } from '../memory/facts.js';
 import { appendHygieneAudit } from '../memory/hygiene-audit.js';
@@ -57,6 +58,7 @@ import {
   listQueuedNotificationDeliveries,
   markNotificationRead,
   replaceQueuedNotificationDeliveries,
+  reapStaleNotifications,
   updateNotificationDeliveryStatus,
   type NotificationRecord,
 } from '../runtime/notifications.js';
@@ -945,6 +947,17 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
       'Auto-closed stale runs / executions / approvals on daemon start',
     );
   }
+  // Notification hygiene on boot: stale unread approval/execution cards
+  // (dead runs) flip to read; >30d records purge. Clears the "Needs you"
+  // ghosts that bury real items (observed live: 873 unread from weeks back).
+  try {
+    const reaped = reapStaleNotifications();
+    if (reaped.markedRead > 0 || reaped.purged > 0) {
+      logger.info(reaped, 'Reaped stale notifications on boot');
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Notification reap on boot failed');
+  }
   // First-tick init: ensure built-in proactive check-in templates
   // exist on disk (disabled). Re-runs are no-ops because the seeder
   // skips seededIds it already created.
@@ -1100,6 +1113,37 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
     setTimeout(() => { void tickAuthKeepalive(); }, 30_000).unref?.();
     const authKeepaliveTimer = setInterval(() => { void tickAuthKeepalive(); }, 5 * 60_000);
     authKeepaliveTimer.unref?.();
+  }
+
+  // Boot warmup: one tiny model call + one embed ping shortly after boot so
+  // the FIRST real user turn doesn't pay the cold-start tax (observed live
+  // on the 0.9.1 update: a 35s model call + hybrid-recall timeout on the
+  // first post-restart greeting). Best-effort and non-blocking — failures
+  // only log. Disable with CLEMMY_BOOT_WARMUP=off.
+  if ((getRuntimeEnv('CLEMMY_BOOT_WARMUP', 'on') ?? 'on').toLowerCase() !== 'off') {
+    setTimeout(() => {
+      void (async () => {
+        try {
+          await assistant.getRuntime().run({
+            instructions: 'Reply with the single word: ok',
+            model: MODELS.fast,
+            prompt: 'ok',
+            sessionId: `warmup-${Date.now()}`,
+          });
+          logger.info('boot warmup: model path warmed');
+        } catch (err) {
+          logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'boot warmup: model ping failed');
+        }
+        try {
+          if (isEmbeddingsEnabled()) {
+            await embedQuery('warmup');
+            logger.info('boot warmup: embedding path warmed');
+          }
+        } catch {
+          /* embedQuery already fails safe */
+        }
+      })();
+    }, 5_000).unref?.();
   }
 
   // Workflow-run lane: drain queued runs on an independent timer so one

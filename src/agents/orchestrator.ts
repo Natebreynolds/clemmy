@@ -60,15 +60,21 @@ import { DEFAULT_MAX_TURNS, wrapToolForHarness, workerThrashGuardEnabled, type W
  * tokens are spent, and secret_leak after the final output.
  */
 
+// Field ORDER is deliberate: `reply` is FIRST so the model generates the
+// user-visible text before the internal log line — token streaming surfaces
+// `reply` as it forms (stream-reply.ts), so reply-first means visible text
+// starts streaming the moment the model starts answering instead of after
+// the summary. Schema key order drives generation order under structured
+// output. (Streaming-latency fix, 2026-06-11.)
 export const OrchestratorDecisionSchema = z.object({
+  reply: z
+    .string()
+    .nullish()
+    .describe('The natural-language message to show the user IN THIS TURN. Write this FIRST. REQUIRED whenever you answer directly without handing off (e.g. greetings, simple questions, confirmations). Pass null ONLY when you are handing off, asking for approval, or otherwise not the one producing the user-visible text. Without a reply here, the chat surface renders nothing and the user sees an empty bubble.'),
   summary: z
     .string()
     .min(8)
     .describe('One-sentence INTERNAL description of what you decided and/or did this turn. This is a log entry, NOT what the user sees. e.g. "Replied to greeting directly", "Handed off to Researcher for slug discovery".'),
-  reply: z
-    .string()
-    .nullish()
-    .describe('The natural-language message to show the user IN THIS TURN. REQUIRED whenever you answer directly without handing off (e.g. greetings, simple questions, confirmations). Pass null ONLY when you are handing off, asking for approval, or otherwise not the one producing the user-visible text. Without a reply here, the chat surface renders nothing and the user sees an empty bubble.'),
   done: z
     .boolean()
     .describe(
