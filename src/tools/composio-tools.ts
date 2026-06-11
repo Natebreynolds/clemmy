@@ -18,8 +18,8 @@ import { workerThrashGuardEnabled } from '../runtime/harness/brackets.js';
 import { appendFanoutAdvisory } from '../runtime/harness/fanout-advisory.js';
 import { maybeDiscoveryAdvisory, isDescribeSlug, toolkitOfSlug, describeSignature } from '../runtime/harness/discovery-advisory.js';
 import { isTransientStepError } from '../execution/transient-error.js';
-import { checkConstraintViolation, formatConstraintEscalation, findEmailSendConstraint } from '../runtime/harness/constraint-guard.js';
-import { verifyOutlookSender } from '../runtime/harness/sender-verify.js';
+import { checkConstraintViolation, formatConstraintEscalation, findEmailSendConstraint, renderToolkitConstraintBanner } from '../runtime/harness/constraint-guard.js';
+import { resolveCompliantSenderConnection } from '../runtime/harness/sender-verify.js';
 import { validateComposioBatchOperation, formatBatchValidationError } from './composio-batch-validator.js';
 import { shouldRetryToolCall, delayMs } from '../runtime/harness/retry-handler.js';
 import { suggestNextSteps, type FailureType as FallbackFailureType } from '../runtime/fallback-chain-store.js';
@@ -424,27 +424,47 @@ export function maybeFanoutAdvisory(
  * resolved to the actual connected mailbox before any send leaves
  * (2026-06-11 wrong-mailbox incident). Fail-closed.
  */
+interface ConstraintGateResult {
+  block: string | null;
+  /** When set, dispatch through THIS connection instead of the caller's
+   *  (constraint-directed routing across multiple connected accounts). */
+  routeConnectedAccountId?: string;
+}
+
 async function enforceStandingConstraints(
   toolSlug: string,
   args: Record<string, unknown>,
   connectedAccountId: string | undefined,
-): Promise<string | null> {
+): Promise<ConstraintGateResult> {
   const senderOverride = args.sender_override_confirmed === true;
   delete args.sender_override_confirmed; // meta-arg — never reaches the provider API
 
+  let routeConnectedAccountId: string | undefined;
   const emailRule = findEmailSendConstraint(toolSlug, args);
   if (emailRule) {
     if (senderOverride) {
       console.error(`[sender-verify] OVERRIDE used for ${toolSlug} — user-directed alternate sender (constraint #${emailRule.constraint.id})`);
     } else {
-      const verification = await verifyOutlookSender({
+      // Multiple accounts of one toolkit can be connected on purpose (read
+      // from all, send from one). Resolve the send to the connection whose
+      // VERIFIED mailbox matches the rule; block only when none complies.
+      let connections: { connectionId: string; accountEmail?: string; status?: string }[] = [];
+      try {
+        const toolkit = toolkitOfSlug(toolSlug);
+        connections = (await listConnectedToolkits())
+          .filter((c) => c.slug.toLowerCase() === toolkit)
+          .map((c) => ({ connectionId: c.connectionId, accountEmail: c.accountEmail, status: c.status }));
+      } catch { /* connection listing failure → resolution probes nothing and fails closed */ }
+      const resolution = await resolveCompliantSenderConnection({
         rule: emailRule,
         toolSlug,
         userId: String(args.user_id ?? 'me'),
-        connectedAccountId,
-        fetchProfile: (slug, profileArgs) => executeComposioTool(slug, profileArgs, connectedAccountId),
+        explicitConnectionId: connectedAccountId,
+        connections,
+        fetchProfile: (slug, profileArgs, connectionId) => executeComposioTool(slug, profileArgs, connectionId),
       });
-      if (!verification.ok) return verification.message ?? 'Blocked by standing sender constraint.';
+      if (!resolution.ok) return { block: resolution.message ?? 'Blocked by standing sender constraint.' };
+      routeConnectedAccountId = resolution.routeConnectionId;
     }
   }
 
@@ -452,9 +472,9 @@ async function enforceStandingConstraints(
     ...args,
     action: toolSlug,
   }, { emailHandledExternally: true });
-  if (violation) return formatConstraintEscalation(violation);
+  if (violation) return { block: formatConstraintEscalation(violation) };
 
-  return null;
+  return { block: null, routeConnectedAccountId };
 }
 
 async function runComposioExecute(
@@ -463,8 +483,14 @@ async function runComposioExecute(
   connectedAccountId: string | undefined,
   options: FormatComposioToolOutputOptions,
 ): Promise<string> {
-  const gateMessage = await enforceStandingConstraints(toolSlug, args, connectedAccountId);
-  if (gateMessage) return gateMessage;
+  const gate = await enforceStandingConstraints(toolSlug, args, connectedAccountId);
+  if (gate.block) return gate.block;
+  const effectiveConnectionId = gate.routeConnectedAccountId ?? connectedAccountId;
+
+  // Tool-bound standing rules ride with EVERY call's output — the model
+  // re-reads them at the moment it acts on this toolkit, independent of
+  // whether memory recall surfaced them this turn.
+  const constraintBanner = renderToolkitConstraintBanner(toolkitOfSlug(toolSlug));
 
   const recentErrors: string[] = [];
   let lastError: unknown;
@@ -472,8 +498,12 @@ async function runComposioExecute(
   // Retry loop with exponential backoff for transient errors
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const result = await executeComposioTool(toolSlug, args, connectedAccountId);
-      const output = formatComposioExecuteOutput(result, { ...options, toolSlug });
+      const result = await executeComposioTool(toolSlug, args, effectiveConnectionId);
+      let output = formatComposioExecuteOutput(result, { ...options, toolSlug });
+      if (gate.routeConnectedAccountId) {
+        output += `\n\n[sender-verify] Routed to connection ${gate.routeConnectedAccountId} — its mailbox verified against the standing sender rule.`;
+      }
+      if (constraintBanner) output += `\n${constraintBanner}`;
       const sid = sessionIdFromRunContext(options.context);
       maybeAutoRememberComposioChoice(toolSlug, args, result, sid);
 
@@ -615,8 +645,13 @@ function describeDynamicTool(toolkitSlug: string, toolSlug: string, description?
   // the model can disambiguate same-named actions across toolkits.
   const real = description?.trim();
   const tag = `[${toolkitSlug}]`;
-  if (real) return `${tag} ${real} (Composio action: ${toolSlug})`;
-  return `${tag} Composio action ${toolSlug}. Call this directly when the fields are clear; use composio_list_tools first if you need to inspect the schema.`;
+  const base = real
+    ? `${tag} ${real} (Composio action: ${toolSlug})`
+    : `${tag} Composio action ${toolSlug}. Call this directly when the fields are clear; use composio_list_tools first if you need to inspect the schema.`;
+  // Tool-bound standing rules live IN the tool description: the model cannot
+  // form a call to this tool without the rule in view, every single turn.
+  const banner = renderToolkitConstraintBanner(toolkitSlug);
+  return banner ? `${base}\n${banner}` : base;
 }
 
 export async function getDynamicComposioRuntimeTools(options: {
@@ -879,7 +914,7 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
           }
         } catch { /* best-effort hint — a catalog hiccup must never break search */ }
       }
-      const output = formatComposioToolOutput({
+      let output = formatComposioToolOutput({
         configured: true,
         connectedToolkits: allConnections.map((connection) => ({
           toolkit: connection.slug,
@@ -902,6 +937,20 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
         ...(unconnectedHint ? { message: unconnectedHint } : {}),
         nextStep: 'Pick the best match, then call `composio_execute_tool` with `tool_slug` set to the exact slug from this result and `arguments` as a JSON object string built from the action\'s `inputParameters` schema.',
       }, { context, details, toolName: 'composio_search_tools' });
+      // Tool-bound standing rules surface at DISCOVERY time — the moment the
+      // model picks a slug, right before it forms the execute call.
+      const matchedToolkits = new Set(
+        matches
+          .filter((m) => m.slug !== '__toolkit_error__')
+          .map((m) => (m.toolkit ?? '').toLowerCase())
+          .filter(Boolean),
+      );
+      let constraintBanners = '';
+      for (const toolkit of matchedToolkits) {
+        const banner = renderToolkitConstraintBanner(toolkit);
+        if (banner) constraintBanners += `\n${banner}`;
+      }
+      if (constraintBanners) output += constraintBanners;
       // P1-D — catch the search-loop: repeated overlapping searches of one
       // toolkit (the 2026-06-04 Google Sheets ×4 thrash) get nudged to commit.
       const advisory = maybeDiscoveryAdvisory({

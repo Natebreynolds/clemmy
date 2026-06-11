@@ -54,6 +54,38 @@ export function findEmailSendConstraint(
 }
 
 /**
+ * GLOBAL tool↔rule binding: a constraint is bound to a toolkit when its
+ * content names that toolkit ("outlook", "salesforce", "airtable", …).
+ * Bound rules ride with the tool on EVERY call — injected into the tool's
+ * description, into search results at discovery time, and into each call's
+ * output — so following them never depends on memory recall surfacing the
+ * rule for that particular turn.
+ */
+export function constraintsForToolkit(toolkitSlug: string): ConsolidatedFact[] {
+  const slug = toolkitSlug.trim().toLowerCase();
+  if (!slug || slug === 'unknown' || slug === '*') return [];
+  try {
+    const wordMatch = new RegExp(`\\b${slug.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+    return listConstraints().filter((c) => wordMatch.test(c.content));
+  } catch (err) {
+    console.error('[constraint-guard] error binding constraints to toolkit:', err);
+    return [];
+  }
+}
+
+/** Render the bound rules as a block to attach to tool surfaces/outputs.
+ *  Null when the toolkit has no bound rules (the common case — zero cost). */
+export function renderToolkitConstraintBanner(toolkitSlug: string): string | null {
+  const rules = constraintsForToolkit(toolkitSlug);
+  if (rules.length === 0) return null;
+  return [
+    '',
+    `⚖️ STANDING RULES bound to the ${toolkitSlug} toolkit — they apply to EVERY call, no exceptions:`,
+    ...rules.map((c) => `- ${c.content}`),
+  ].join('\n');
+}
+
+/**
  * Check if a tool call violates any active constraints.
  * Returns a violation object if found, null if OK to proceed.
  *

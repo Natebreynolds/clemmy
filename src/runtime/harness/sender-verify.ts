@@ -166,3 +166,152 @@ export async function verifyOutlookSender(opts: {
     ),
   };
 }
+
+// ─── Multi-account resolution ────────────────────────────────────────────────
+//
+// When SEVERAL accounts of one toolkit are connected on purpose (read from
+// both, send from one), `user_id: 'me'` with no connection id is ambiguous —
+// composio resolves it to whichever default, which is exactly how the
+// 2026-06-11 incident happened. The fix is not merely to block the wrong
+// account but to RESOLVE the send to the constraint-compliant connection:
+// probe each connected account's real mailbox (cached) and route the send to
+// the one the standing rule requires. Block only when none complies.
+
+export interface ConnectionCandidate {
+  connectionId: string;
+  accountEmail?: string;
+  status?: string;
+}
+
+export interface SenderResolution {
+  ok: boolean;
+  /** When set, dispatch the send through THIS connection id. */
+  routeConnectionId?: string;
+  /** Model-facing block message when !ok. */
+  message?: string;
+}
+
+type ConnectionProfileFetcher = (
+  slug: string,
+  args: Record<string, unknown>,
+  connectionId?: string,
+) => Promise<unknown>;
+
+const MAX_CONNECTION_PROBES = 6;
+
+/** Probe one connection's real mailbox identities (cached). Null = unverifiable. */
+async function mailboxesForConnection(
+  connectionId: string | undefined,
+  userId: string,
+  fetchProfile: ConnectionProfileFetcher,
+): Promise<string[] | null> {
+  const cacheKey = `${connectionId ?? 'default'}:${userId}`;
+  const cached = verifiedMailboxCache.get(cacheKey);
+  if (cached && Date.now() - cached.at < CACHE_TTL_MS) return cached.emails;
+  let result: unknown;
+  try {
+    result = await fetchProfile(PROFILE_SLUG, { user_id: userId, include_proxy_addresses: true }, connectionId);
+  } catch {
+    return null;
+  }
+  if ((result as { successful?: boolean } | null)?.successful === false) return null;
+  const emails = extractMailboxEmails(result);
+  if (emails.length === 0) return null;
+  verifiedMailboxCache.set(cacheKey, { emails, at: Date.now() });
+  return emails;
+}
+
+/**
+ * Resolve which connected account a constrained send must use.
+ *
+ * - Explicit connection id: verify THAT mailbox. On mismatch, block — but
+ *   name the compliant connection id (when one exists) so recovery is
+ *   one-shot. An explicit choice is never silently overridden.
+ * - No connection id: probe the connected accounts (metadata-suggested match
+ *   first) and ROUTE to the one whose verified mailbox matches the rule.
+ * - Nothing complies / nothing verifiable: block, listing what each
+ *   connection actually is. Fail-closed.
+ */
+export async function resolveCompliantSenderConnection(opts: {
+  rule: EmailSendConstraint;
+  toolSlug: string;
+  userId: string;
+  explicitConnectionId?: string;
+  connections: ConnectionCandidate[];
+  fetchProfile: ConnectionProfileFetcher;
+}): Promise<SenderResolution> {
+  const { rule, toolSlug, userId, explicitConnectionId, connections, fetchProfile } = opts;
+
+  if (!toolSlug.toUpperCase().startsWith('OUTLOOK')) {
+    return {
+      ok: false,
+      message: blockMessage(
+        rule,
+        `This ${toolSlug} call sends through a non-Outlook toolkit, so its sending ` +
+          `identity cannot be verified against the required mailbox.`,
+      ),
+    };
+  }
+
+  // Probe order: metadata says it's the required account → first; healthy
+  // (ACTIVE) connections before broken ones. Metadata is a hint, never proof —
+  // every routing decision is confirmed by a real profile lookup.
+  const ordered = [...connections].sort((a, b) => {
+    const aMeta = normalizeEmail(a.accountEmail) === rule.allowedAccount ? 0 : 1;
+    const bMeta = normalizeEmail(b.accountEmail) === rule.allowedAccount ? 0 : 1;
+    if (aMeta !== bMeta) return aMeta - bMeta;
+    const aActive = (a.status ?? '').toUpperCase() === 'ACTIVE' ? 0 : 1;
+    const bActive = (b.status ?? '').toUpperCase() === 'ACTIVE' ? 0 : 1;
+    return aActive - bActive;
+  });
+
+  const findCompliant = async (excludeId?: string): Promise<string | null> => {
+    let probes = 0;
+    for (const conn of ordered) {
+      if (!conn.connectionId || conn.connectionId === excludeId) continue;
+      if (probes >= MAX_CONNECTION_PROBES) break;
+      probes++;
+      const emails = await mailboxesForConnection(conn.connectionId, userId, fetchProfile);
+      if (emails?.includes(rule.allowedAccount)) return conn.connectionId;
+    }
+    return null;
+  };
+
+  if (explicitConnectionId) {
+    const emails = await mailboxesForConnection(explicitConnectionId, userId, fetchProfile);
+    if (emails?.includes(rule.allowedAccount)) return { ok: true };
+    const compliant = await findCompliant(explicitConnectionId);
+    const actual = emails ? emails[0] : 'UNVERIFIABLE (profile lookup failed)';
+    return {
+      ok: false,
+      message: blockMessage(
+        rule,
+        `The explicitly chosen connection ${explicitConnectionId} resolves to: ${actual}.` +
+          (compliant
+            ? `\nA compliant connection EXISTS — retry with "connected_account_id": "${compliant}" (verified as ${rule.allowedAccount}).`
+            : ''),
+      ),
+    };
+  }
+
+  const compliant = await findCompliant();
+  if (compliant) {
+    console.error(`[sender-verify] routed ${toolSlug} to connection ${compliant} (verified ${rule.allowedAccount})`);
+    return { ok: true, routeConnectionId: compliant };
+  }
+
+  const inventory = await Promise.all(
+    ordered.slice(0, MAX_CONNECTION_PROBES).map(async (conn) => {
+      const emails = await mailboxesForConnection(conn.connectionId, userId, fetchProfile);
+      return `  - ${conn.connectionId}: ${emails ? emails[0] : 'unverifiable'}`;
+    }),
+  );
+  return {
+    ok: false,
+    message: blockMessage(
+      rule,
+      `NO connected account verifies as the required mailbox. Connected accounts checked:\n` +
+        (inventory.length ? inventory.join('\n') : '  (none connected for this toolkit)'),
+    ),
+  };
+}

@@ -24,9 +24,9 @@ const { openMemoryDb, closeMemoryDb, resetMemoryDb, MEMORY_DB_PATH, STATE_DIR } 
 // eslint-disable-next-line import/first
 const { rememberFact, listConstraints } = await import('../../memory/facts.js');
 // eslint-disable-next-line import/first
-const { findEmailSendConstraint, checkConstraintViolation } = await import('./constraint-guard.js');
+const { findEmailSendConstraint, checkConstraintViolation, constraintsForToolkit, renderToolkitConstraintBanner } = await import('./constraint-guard.js');
 // eslint-disable-next-line import/first
-const { verifyOutlookSender, extractMailboxEmails, clearSenderVerificationCache } = await import('./sender-verify.js');
+const { verifyOutlookSender, extractMailboxEmails, clearSenderVerificationCache, resolveCompliantSenderConnection } = await import('./sender-verify.js');
 
 const SENDER_RULE =
   'Email sending constraint: always send email via nathan.reynolds@scorpion.com (Scorpion Outlook mailbox) unless Nate explicitly directs otherwise.';
@@ -253,6 +253,122 @@ test('extractMailboxEmails tolerates wrapper drift', () => {
   );
   assert.deepEqual(extractMailboxEmails({ data: { text: 'profile: someone@x.co' } }), ['someone@x.co']);
   assert.deepEqual(extractMailboxEmails(null), []);
+});
+
+test('tool-bound rules: constraints ride with the toolkit they name, globally', () => {
+  // The seeded rule names "Outlook" → bound to the outlook toolkit.
+  const bound = constraintsForToolkit('outlook');
+  assert.equal(bound.length >= 1, true, 'rule naming a toolkit must bind to it');
+
+  const banner = renderToolkitConstraintBanner('outlook');
+  assert.ok(banner?.includes('STANDING RULES'), 'banner must render for a bound toolkit');
+  assert.ok(banner?.includes('nathan.reynolds@scorpion.com'));
+
+  // Unrelated toolkits carry NO banner — zero noise where no rule binds.
+  assert.equal(renderToolkitConstraintBanner('airtable'), null);
+  assert.equal(renderToolkitConstraintBanner('salesforce'), null);
+  assert.equal(constraintsForToolkit('unknown').length, 0);
+  assert.equal(constraintsForToolkit('*').length, 0);
+});
+
+test('multi-account resolution: routes the send to the constraint-compliant connection', async () => {
+  const rule = findEmailSendConstraint('OUTLOOK_OUTLOOK_SEND_EMAIL', { user_id: 'me' });
+  assert.ok(rule);
+
+  // Two mailboxes connected ON PURPOSE (scrape both, send from one) — the
+  // user's real topology. No explicit connection id on the send.
+  const profileByConnection: Record<string, unknown> = {
+    ca_breakthrough: { successful: true, data: { mail: 'nathan@breakthroughcoaching.ai' } },
+    ca_scorpion: { successful: true, data: { mail: 'nathan.reynolds@scorpion.com' } },
+    ca_stale: { successful: false, error: 'token expired' },
+  };
+  const fetchProfile = async (_slug: string, _args: Record<string, unknown>, connectionId?: string) => {
+    const profile = profileByConnection[connectionId ?? ''];
+    if (!profile) throw new Error(`no such connection: ${connectionId}`);
+    return profile;
+  };
+
+  clearSenderVerificationCache();
+  const routed = await resolveCompliantSenderConnection({
+    rule: rule!,
+    toolSlug: 'OUTLOOK_OUTLOOK_SEND_EMAIL',
+    userId: 'me',
+    connections: [
+      { connectionId: 'ca_breakthrough', status: 'ACTIVE' },
+      { connectionId: 'ca_stale', status: 'EXPIRED' },
+      { connectionId: 'ca_scorpion', status: 'ACTIVE' },
+    ],
+    fetchProfile,
+  });
+  assert.equal(routed.ok, true, 'a compliant connection must let the send proceed');
+  assert.equal(routed.routeConnectionId, 'ca_scorpion', 'send must ROUTE to the verified compliant connection');
+
+  // Metadata hint (accountEmail) probes the likely match first — but the
+  // route is still confirmed by a real profile lookup.
+  clearSenderVerificationCache();
+  let probes: string[] = [];
+  const counted = async (slug: string, args: Record<string, unknown>, connectionId?: string) => {
+    probes.push(connectionId ?? '');
+    return fetchProfile(slug, args, connectionId);
+  };
+  const metaRouted = await resolveCompliantSenderConnection({
+    rule: rule!,
+    toolSlug: 'OUTLOOK_OUTLOOK_SEND_EMAIL',
+    userId: 'me',
+    connections: [
+      { connectionId: 'ca_breakthrough', status: 'ACTIVE', accountEmail: 'nathan@breakthroughcoaching.ai' },
+      { connectionId: 'ca_scorpion', status: 'ACTIVE', accountEmail: 'Nathan.Reynolds@scorpion.com' },
+    ],
+    fetchProfile: counted,
+  });
+  assert.equal(metaRouted.routeConnectionId, 'ca_scorpion');
+  assert.equal(probes[0], 'ca_scorpion', 'metadata-suggested match must be probed first');
+});
+
+test('multi-account resolution: explicit wrong connection blocks and names the compliant one', async () => {
+  const rule = findEmailSendConstraint('OUTLOOK_OUTLOOK_SEND_EMAIL', { user_id: 'me' });
+  assert.ok(rule);
+  const fetchProfile = async (_slug: string, _args: Record<string, unknown>, connectionId?: string) =>
+    connectionId === 'ca_scorpion'
+      ? { successful: true, data: { mail: 'nathan.reynolds@scorpion.com' } }
+      : { successful: true, data: { mail: 'nathan@breakthroughcoaching.ai' } };
+
+  clearSenderVerificationCache();
+  const blocked = await resolveCompliantSenderConnection({
+    rule: rule!,
+    toolSlug: 'OUTLOOK_OUTLOOK_SEND_EMAIL',
+    userId: 'me',
+    explicitConnectionId: 'ca_breakthrough',
+    connections: [
+      { connectionId: 'ca_breakthrough', status: 'ACTIVE' },
+      { connectionId: 'ca_scorpion', status: 'ACTIVE' },
+    ],
+    fetchProfile,
+  });
+  assert.equal(blocked.ok, false, 'an explicit non-compliant choice is never silently rerouted');
+  assert.match(blocked.message ?? '', /ca_scorpion/, 'block message must name the compliant connection for one-shot recovery');
+
+  // No compliant connection anywhere → block listing the inventory.
+  clearSenderVerificationCache();
+  const none = await resolveCompliantSenderConnection({
+    rule: rule!,
+    toolSlug: 'OUTLOOK_OUTLOOK_SEND_EMAIL',
+    userId: 'me',
+    connections: [{ connectionId: 'ca_breakthrough', status: 'ACTIVE' }],
+    fetchProfile,
+  });
+  assert.equal(none.ok, false);
+  assert.match(none.message ?? '', /nathan@breakthroughcoaching\.ai/);
+
+  // Zero connections → fail closed.
+  const empty = await resolveCompliantSenderConnection({
+    rule: rule!,
+    toolSlug: 'OUTLOOK_OUTLOOK_SEND_EMAIL',
+    userId: 'me',
+    connections: [],
+    fetchProfile,
+  });
+  assert.equal(empty.ok, false);
 });
 
 test('checkConstraintViolation email branch defers to the external verifier', () => {
