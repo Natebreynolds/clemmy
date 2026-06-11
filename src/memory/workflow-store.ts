@@ -132,6 +132,26 @@ export interface WorkflowStepInput {
    * Serialized to YAML as `retry_budget`.
    */
   retryBudget?: number;
+  /**
+   * Goal-contract Phase 2: re-run this step until its declared `output`
+   * contract PASSES, up to `maxAttempts` (default 3, clamped 1–5). Each
+   * retry's prompt carries the prior attempt's contract-failure evidence so
+   * the step can fix the specific gap ("rows=2, need min_items=10").
+   *
+   * Side-effect law: only `sideEffect: 'read'` steps loop; a `write` step
+   * additionally requires `loopSafe: true` (author asserts idempotency); a
+   * `send` step NEVER loops — re-running a send is re-sending. v1 applies to
+   * plain LLM steps only (not forEach / deterministic). Requires an `output`
+   * contract — that contract IS the loop's exit condition.
+   * Serialized to YAML as `loop_until: { max_attempts }`.
+   */
+  loopUntil?: { maxAttempts?: number };
+  /**
+   * Author's explicit assertion that re-running this WRITE step is safe
+   * (idempotent — e.g. an upsert keyed on a stable id). Required for
+   * `loopUntil` on a write-class step. Serialized to YAML as `loop_safe`.
+   */
+  loopSafe?: boolean;
 }
 
 export type WorkflowContractType = 'string' | 'number' | 'boolean' | 'object' | 'array';
@@ -399,6 +419,22 @@ export function readWorkflowDefinitionFile(filePath: string): WorkflowDefinition
       if (typeof rawRetry === 'number' && Number.isFinite(rawRetry) && rawRetry > 0) {
         result.retryBudget = Math.min(10, Math.floor(rawRetry));
       }
+      // loopUntil / loop_until (goal-contract Phase 2). Accept snake_case or
+      // camelCase; clamp maxAttempts to 1..5 so a malformed value can't spin.
+      const rawLoop = (step as Record<string, unknown>).loop_until ?? step.loopUntil;
+      if (rawLoop && typeof rawLoop === 'object' && !Array.isArray(rawLoop)) {
+        const lu = rawLoop as Record<string, unknown>;
+        const rawMax = typeof lu.max_attempts === 'number' ? lu.max_attempts
+          : typeof lu.maxAttempts === 'number' ? lu.maxAttempts : undefined;
+        result.loopUntil = rawMax !== undefined && Number.isFinite(rawMax)
+          ? { maxAttempts: Math.max(1, Math.min(5, Math.floor(rawMax))) }
+          : {};
+      } else if (rawLoop === true) {
+        result.loopUntil = {};
+      }
+      if ((step as Record<string, unknown>).loop_safe === true || step.loopSafe === true) {
+        result.loopSafe = true;
+      }
       return result;
     });
     return {
@@ -505,6 +541,12 @@ function writeWorkflowToDir(dirPath: string, def: WorkflowDefinition): void {
       if (s.output && Object.keys(s.output).length > 0) out.output = s.output;
       if (s.retryBudget && s.retryBudget > 0) out.retry_budget = s.retryBudget;
       if (s.sideEffect && s.sideEffect !== 'read') out.side_effect = s.sideEffect;
+      if (s.loopUntil) {
+        out.loop_until = s.loopUntil.maxAttempts !== undefined
+          ? { max_attempts: s.loopUntil.maxAttempts }
+          : {};
+      }
+      if (s.loopSafe) out.loop_safe = true;
       return out;
     });
   }

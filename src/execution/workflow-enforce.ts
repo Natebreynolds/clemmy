@@ -189,6 +189,51 @@ export function checkSendGate(def: WorkflowDefinition): string[] {
 }
 
 /**
+ * Author/enable-time loopUntil law (goal-contract Phase 2). Mirrors the
+ * runtime guard (stepLoopUntilEnabled in workflow-runner.ts) so a
+ * misconfigured loop is REFUSED at save time with guidance, instead of
+ * silently degrading to run-once at runtime:
+ *  - loop_until requires an output contract — the contract IS the exit cond
+ *  - v1: plain LLM steps only (not forEach / deterministic)
+ *  - send steps NEVER loop (re-running a send is re-sending)
+ *  - write steps need the author's explicit loop_safe idempotency assertion
+ * Disabled drafts are never blocked (same house pattern as the send gate).
+ */
+export function checkLoopUntilAuthoring(def: WorkflowDefinition): string[] {
+  if (!def.enabled) return [];
+  const errors: string[] = [];
+  for (const step of def.steps ?? []) {
+    if (!step.loopUntil) continue;
+    if (!step.output || Object.keys(step.output).length === 0) {
+      errors.push(
+        `Step "${step.id}" declares loop_until but no output contract — the contract is the loop's exit condition. Declare an "output" block (non_empty / min_items / required_keys / verify) or remove loop_until.`,
+      );
+      continue;
+    }
+    if (step.forEach || step.deterministic) {
+      errors.push(
+        `Step "${step.id}" declares loop_until on a ${step.forEach ? 'forEach' : 'deterministic'} step — loop_until applies to plain LLM steps only. Remove loop_until or restructure the step.`,
+      );
+      continue;
+    }
+    const cls = step.sideEffect === 'read' || step.sideEffect === 'write' || step.sideEffect === 'send'
+      ? step.sideEffect
+      : stepLooksLikeIrreversibleSend(step.prompt ?? '') ? 'send'
+        : stepLooksMutating(step) ? 'write' : 'read';
+    if (cls === 'send') {
+      errors.push(
+        `Step "${step.id}" declares loop_until on a SEND step — re-running a send is re-sending, so send steps never loop. Remove loop_until; on contract failure the run parks for your attention instead.`,
+      );
+    } else if (cls === 'write' && step.loopSafe !== true) {
+      errors.push(
+        `Step "${step.id}" declares loop_until on a WRITE step without loop_safe: true. Re-running a write is only safe when it is idempotent (e.g. an upsert keyed on a stable id) — assert that with loop_safe: true, or set sideEffect: read if the step doesn't actually mutate.`,
+      );
+    }
+  }
+  return errors;
+}
+
+/**
  * Author/enable-time RUNNABILITY check — "Clem can never author/enable a
  * workflow she can't actually run."
  *
@@ -391,7 +436,7 @@ export function checkWorkflowForWrite(def: WorkflowDefinition): WorkflowWriteChe
     rememberedToolChoices = undefined;
   }
   const result = validateWorkflowDefinition(toFrontmatter(def), { rememberedToolChoices });
-  const errors = [...result.errors, ...checkSendGate(def), ...checkDependencyBinding(def)];
+  const errors = [...result.errors, ...checkSendGate(def), ...checkLoopUntilAuthoring(def), ...checkDependencyBinding(def)];
   // Runnability constraints are non-blocking (demoted to warnings per graceful degradation design)
   const runnabilityWarnings = checkRunnabilityConstraints(def);
   const warnings = [...result.warnings, ...runnabilityWarnings];

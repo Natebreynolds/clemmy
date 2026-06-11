@@ -1446,37 +1446,124 @@ function transientRetryFloor(): number {
   return Number.isFinite(raw) && raw >= 0 ? raw : 2;
 }
 
+/**
+ * Goal-contract Phase 2: is this step eligible to loopUntil its contract?
+ * The SIDE-EFFECT LAW, enforced at runtime (belt) on top of the authoring
+ * validator (braces):
+ *  - declares loopUntil + an output contract (the contract IS the exit cond)
+ *  - plain LLM step only (v1): not forEach, not deterministic
+ *  - 'read' steps loop freely; 'write' requires the author's explicit
+ *    loopSafe idempotency assertion; 'send' NEVER loops — re-running a send
+ *    is re-sending (the park→approve→crash double-send lesson).
+ * Pure + exported for tests.
+ */
+export function stepLoopUntilEnabled(step: WorkflowStepInput): boolean {
+  if (!step.loopUntil || !step.output) return false;
+  if (step.forEach || step.deterministic) return false;
+  const cls = stepSideEffectClass(step);
+  if (cls === 'send') return false;
+  if (cls === 'write' && step.loopSafe !== true) return false;
+  return true;
+}
+
+/** Clamped loopUntil attempt ceiling (default 3, range 1–5). */
+export function loopUntilMaxAttempts(step: WorkflowStepInput): number {
+  const raw = step.loopUntil?.maxAttempts ?? 3;
+  return Math.max(1, Math.min(5, Math.floor(raw)));
+}
+
+/** Evidence note appended to a loopUntil retry's prompt so the next attempt
+ *  fixes the SPECIFIC contract gap instead of re-rolling blind. */
+export function renderLoopRetryEvidence(attempt: number, problems: string[]): string {
+  return [
+    '',
+    `⚠ CONTRACT RETRY (attempt ${attempt + 1}): your previous attempt's output FAILED its declared contract:`,
+    ...problems.slice(0, 6).map((p) => `- ${p}`),
+    'Fix these specific gaps this attempt. Produce output that satisfies the declared contract — if the data genuinely is not available, return {"blocked": true, "reason": "<why>"} instead of an empty or malformed result.',
+  ].join('\n');
+}
+
+/**
+ * Pure contract-loop harness (goal-contract Phase 2), shaped like
+ * runWithStepRetry so the loop logic is testable without the step machinery.
+ * Re-runs the thunk while it throws WorkflowContractViolationError, feeding
+ * each retry an amended step whose prompt carries the failure evidence.
+ * Anything that is NOT a contract violation propagates immediately.
+ */
+export async function runWithContractLoop<T>(
+  run: (attemptStep: WorkflowStepInput) => Promise<T>,
+  step: WorkflowStepInput,
+  opts: {
+    maxAttempts: number;
+    onLoopRetry?: (info: { attempt: number; maxAttempts: number; problems: string[] }) => void;
+    beforeRetry?: () => void;
+  },
+): Promise<T> {
+  let attemptStep = step;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await run(attemptStep);
+    } catch (err) {
+      if (!(err instanceof WorkflowContractViolationError) || attempt >= opts.maxAttempts) throw err;
+      opts.onLoopRetry?.({ attempt, maxAttempts: opts.maxAttempts, problems: err.problems });
+      opts.beforeRetry?.();
+      attemptStep = { ...step, prompt: `${step.prompt}\n${renderLoopRetryEvidence(attempt, err.problems)}` };
+    }
+  }
+}
+
 async function executeStepVerified(
   step: WorkflowStepInput,
   ctx: StepExecutionContext,
 ): Promise<unknown> {
   const declared = step.retryBudget && step.retryBudget > 0 ? step.retryBudget : 0;
   const budget = Math.max(declared, transientRetryFloor());
-  // Retry loop wraps EXECUTION only. Verification (below) is deterministic
-  // and never retried. Park/cancel signals propagate immediately (they are
-  // not "retryable").
-  const output = await runWithStepRetry(() => executeStep(step, ctx), {
-    budget,
-    backoffBaseMs: RETRY_BACKOFF_BASE_MS,
-    isRetryable: (err) =>
-      !(err instanceof ParkRunSignal) &&
-      !(err instanceof WorkflowRunCancelledError) &&
-      isTransientStepError(err),
-    onRetry: ({ attempt, budget: b, delayMs, err }) => {
+  // Transient-retry wraps EXECUTION only. Verification is deterministic and
+  // never transient-retried. Park/cancel signals propagate immediately (they
+  // are not "retryable").
+  const runOnce = (attemptStep: WorkflowStepInput): Promise<unknown> =>
+    runWithStepRetry(() => executeStep(attemptStep, ctx), {
+      budget,
+      backoffBaseMs: RETRY_BACKOFF_BASE_MS,
+      isRetryable: (err) =>
+        !(err instanceof ParkRunSignal) &&
+        !(err instanceof WorkflowRunCancelledError) &&
+        isTransientStepError(err),
+      onRetry: ({ attempt, budget: b, delayMs, err }) => {
+        appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
+          kind: 'step_retry',
+          stepId: step.id,
+          error: err instanceof Error ? err.message : String(err),
+          meta: { attempt, budget: b, delayMs, reason: 'transient' },
+        });
+        logger.warn(
+          { stepId: step.id, attempt, budget: b, delayMs, err: err instanceof Error ? err.message : String(err) },
+          'workflow step failed transiently — retrying after backoff',
+        );
+      },
+      afterBackoff: () => throwIfWorkflowRunCancelled(ctx.runId),
+    });
+
+  // Goal-contract Phase 2: contract loop wraps the transient-retry wrapper —
+  // each contract attempt gets its own transient budget. Ineligible steps
+  // (no loopUntil, no contract, forEach/deterministic, send, unsafe write)
+  // run exactly once: byte-identical to the pre-loopUntil behavior.
+  if (!stepLoopUntilEnabled(step)) return runOnce(step);
+  return runWithContractLoop(runOnce, step, {
+    maxAttempts: loopUntilMaxAttempts(step),
+    onLoopRetry: ({ attempt, maxAttempts, problems }) => {
       appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
-        kind: 'step_retry',
+        kind: 'step_loop_retry',
         stepId: step.id,
-        error: err instanceof Error ? err.message : String(err),
-        meta: { attempt, budget: b, delayMs, reason: 'transient' },
+        meta: { attempt, maxAttempts, problems: problems.slice(0, 6) },
       });
-      logger.warn(
-        { stepId: step.id, attempt, budget: b, delayMs, err: err instanceof Error ? err.message : String(err) },
-        'workflow step failed transiently — retrying after backoff',
+      logger.info(
+        { stepId: step.id, attempt, maxAttempts, problems: problems.slice(0, 3) },
+        'workflow step output failed its contract — loopUntil re-running with evidence',
       );
     },
-    afterBackoff: () => throwIfWorkflowRunCancelled(ctx.runId),
+    beforeRetry: () => throwIfWorkflowRunCancelled(ctx.runId),
   });
-  return output;
 }
 
 /**
@@ -1563,6 +1650,24 @@ export function describeOutputShape(value: unknown): string {
   return typeof value;
 }
 
+/**
+ * Typed contract-violation error (goal-contract Phase 2) so the loopUntil
+ * wrapper can recognize "the step ran but its output failed the contract"
+ * without message-sniffing. Same message text as before — existing handling
+ * (run error routing, findContractViolationStep via events) is unchanged.
+ */
+export class WorkflowContractViolationError extends Error {
+  constructor(
+    message: string,
+    public readonly stepId: string,
+    public readonly problems: string[],
+    public readonly reason: 'output_contract' | 'empty_output',
+  ) {
+    super(message);
+    this.name = 'WorkflowContractViolationError';
+  }
+}
+
 export function finalizeStepOutput(
   workflowSlug: string,
   runId: string,
@@ -1612,7 +1717,12 @@ export function finalizeStepOutput(
         error: message,
         meta: { reason: isEmptyOnly ? 'empty_output' : 'output_contract', problems: result.problems, got },
       });
-      throw new Error(message);
+      throw new WorkflowContractViolationError(
+        message,
+        step.id,
+        result.problems,
+        isEmptyOnly ? 'empty_output' : 'output_contract',
+      );
     }
   }
   appendWorkflowEvent(workflowSlug, runId, {
