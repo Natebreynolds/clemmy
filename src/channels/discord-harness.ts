@@ -1647,6 +1647,26 @@ export async function runDiscordHarnessConversation(opts: {
   // v0.5.19 F8 — track the last post-expiry "still working" follow-up
   // so we can throttle to one per POST_EXPIRY_CHECKIN_MS window.
   let lastExpiryCheckInAt = 0;
+  // Token streaming: accumulate deltas here, flush periodically
+  let streamBuffer = '';
+  let pendingStreamFlush: NodeJS.Timeout | null = null;
+
+  const onChunk = (delta: string): void => {
+    streamBuffer += delta;
+    // Schedule a flush if not already pending. Use a faster debounce (1200ms)
+    // than the event-based debounce (2000ms) so tokens appear sooner.
+    if (pendingStreamFlush) return;
+    pendingStreamFlush = setTimeout(() => {
+      pendingStreamFlush = null;
+      // If there's buffered text, update state.summary with accumulated text
+      // and trigger a flush. This way streaming text appears in the message
+      // as tokens arrive, without waiting for tool_called events.
+      if (streamBuffer) {
+        state.summary = streamBuffer;
+        scheduleEdit();
+      }
+    }, 1200);
+  };
 
   const flush = async (): Promise<void> => {
     pendingEdit = null;
@@ -1904,11 +1924,12 @@ export async function runDiscordHarnessConversation(opts: {
           channel: `discord:${channelId}`,
           freshSession: !session.isContinuation,
           autonomy,
+          onChunk,
         });
         if (preflight.surfaced) return;
       }
       const agent = await buildOrchestratorAgent({ userInput: prompt, sessionId: session.id });
-      await runConversation({ agent, sessionId: session.id, input: prompt, judgeCompletion: true });
+      await runConversation({ agent, sessionId: session.id, input: prompt, judgeCompletion: true, onChunk });
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
       try {
@@ -2079,6 +2100,21 @@ async function runDiscordHarnessResume(opts: {
   let lastEditAt = 0;
   let pendingEdit: NodeJS.Timeout | null = null;
   let lastAttachedApprovalId: string | undefined;
+  // Token streaming: accumulate deltas here, flush periodically
+  let streamBuffer = '';
+  let pendingStreamFlush: NodeJS.Timeout | null = null;
+
+  const onChunk = (delta: string): void => {
+    streamBuffer += delta;
+    if (pendingStreamFlush) return;
+    pendingStreamFlush = setTimeout(() => {
+      pendingStreamFlush = null;
+      if (streamBuffer) {
+        state.summary = streamBuffer;
+        scheduleEdit();
+      }
+    }, 1200);
+  };
 
   const flush = async (): Promise<void> => {
     pendingEdit = null;
@@ -2176,6 +2212,7 @@ async function runDiscordHarnessResume(opts: {
         sessionId,
         decision,
         resolver: 'discord-user',
+        onChunk,
       });
       // If reject — the run pivoted to "no work to do" and the
       // conversation is effectively done. Force the UI into the

@@ -48,6 +48,12 @@ export const EVENT_TYPES = [
   'user_input_received',
   'approval_requested',
   'approval_resolved',
+  // Token-level streaming: emitted for each output_text_delta from the model.
+  // Not persisted to SQLite — only broadcast via actionBus for real-time UI.
+  'stream_token',
+  // Loop intent proposal: surfaced before tools fire on multi-step requests.
+  // Contains the planned objective, steps, and risks.
+  'loop_intent_proposed',
   'guardrail_tripped',
   'stuck_detected',
   // Emitted from the conversation loop when stuck_detected fires AND

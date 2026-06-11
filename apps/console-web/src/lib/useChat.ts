@@ -58,7 +58,13 @@ export function useChat(options?: UseChatOptions) {
 
   const applyEvent = useCallback((assistantId: string, ev: HarnessEvent) => {
     const d = (ev.data ?? {}) as Record<string, unknown>;
-    if (ev.type === 'conversation_completed') {
+    if (ev.type === 'stream_token') {
+      // Token-level streaming: append delta to current assistant text
+      const delta = typeof d.delta === 'string' ? d.delta : '';
+      if (delta) {
+        setMessages((prev) => prev.map((m) => (m.id === assistantId ? { ...m, text: m.text + delta } : m)));
+      }
+    } else if (ev.type === 'conversation_completed') {
       const text = humanHarnessText((d.reply ?? d.summary), '');
       const reason = typeof d.reason === 'string' ? d.reason : '';
       const planProposalId = typeof d.planProposalId === 'string' ? d.planProposalId : '';

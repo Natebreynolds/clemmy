@@ -597,6 +597,8 @@ export interface RunTurnOptions {
   makeRunner?: () => Runner;
   /** Test injection: run the Runner. Defaults to a real runner.run(). */
   runRunner?: RunRunnerFn;
+  /** Opt-in: callback fired for each token delta (output_text_delta) emitted by the model. */
+  onChunk?: (delta: string) => void | Promise<void>;
 }
 
 export type RunTurnStatus = 'completed' | 'awaiting_approval' | 'awaiting_user_input' | 'killed' | 'limit_exceeded' | 'failed';
@@ -689,6 +691,8 @@ export interface RunConversationOptions {
   makeRunner?: () => Runner;
   /** Test injection. */
   runRunner?: RunRunnerFn;
+  /** Opt-in: callback fired for each token delta (output_text_delta) emitted by the model. Forwarded to each runTurn. */
+  onChunk?: (delta: string) => void | Promise<void>;
 }
 
 export interface RunConversationResult {
@@ -1244,6 +1248,7 @@ async function runConversationCore(
       toolCallsPerTurn,
       makeRunner: options.makeRunner,
       runRunner: options.runRunner,
+      onChunk: options.onChunk,
     });
     lastTurn = turnResult.turn;
     totalToolCalls += turnResult.toolCalls ?? 0;
@@ -2322,6 +2327,9 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     // provider-side parallelToolCalls (model still decides to parallelize).
     toolExecution: { maxFunctionToolConcurrency: 8 },
   };
+  if (options.onChunk) {
+    (opts as unknown as { onChunk?: typeof options.onChunk }).onChunk = options.onChunk;
+  }
   // DO NOT pass previousResponseId to the SDK when using the codex
   // backend. The SDK uses this flag to opt into a ServerConversationTracker
   // that only sends DELTAS to the model on each subsequent call —
@@ -2488,6 +2496,8 @@ export interface ResumePendingApprovalOptions {
   makeRunner?: () => Runner;
   /** Test injection: drive the resume with a pre-built outcome. */
   runRunner?: RunRunnerFn;
+  /** Opt-in: callback fired for each token delta (output_text_delta) emitted by the model. */
+  onChunk?: (delta: string) => void | Promise<void>;
 }
 
 /**
@@ -2842,6 +2852,8 @@ export async function runConversationFromResume(opts: {
   toolCallsPerTurn?: number;
   makeRunner?: () => Runner;
   runRunner?: RunRunnerFn;
+  /** Opt-in: callback fired for each token delta emitted by the model. */
+  onChunk?: (delta: string) => void | Promise<void>;
 }): Promise<RunConversationResult> {
   const result = await runConversationFromResumeCore(opts);
   emitRuntimeTerminalEvent(opts.sessionId, result);
@@ -2860,6 +2872,7 @@ async function runConversationFromResumeCore(opts: {
   toolCallsPerTurn?: number;
   makeRunner?: () => Runner;
   runRunner?: RunRunnerFn;
+  onChunk?: (delta: string) => void | Promise<void>;
 }): Promise<RunConversationResult> {
   const budget = getHarnessBudgetSettings();
   let maxSteps = opts.maxSteps ?? budget.maxConversationSteps;
@@ -2887,6 +2900,7 @@ async function runConversationFromResumeCore(opts: {
     toolCallsPerTurn,
     makeRunner: opts.makeRunner,
     runRunner: opts.runRunner,
+    onChunk: opts.onChunk,
   });
   lastTurn = firstResult.turn;
 
@@ -3047,6 +3061,7 @@ async function runConversationFromResumeCore(opts: {
       toolCallsPerTurn,
       makeRunner: opts.makeRunner,
       runRunner: opts.runRunner,
+      onChunk: opts.onChunk,
     });
     lastTurn = turnResult.turn;
     if (turnResult.status !== 'completed') {
@@ -3949,6 +3964,7 @@ const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
     rawResponses?: unknown[];
     state?: { toString(): string };
     completed: Promise<void>;
+    [Symbol.asyncIterator](): AsyncIterator<unknown>;
   };
   type RunMethod = (
     a: typeof agent,
@@ -3957,20 +3973,26 @@ const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
   ) => Promise<StreamedResultLike>;
   const run = runner.run.bind(runner) as unknown as RunMethod;
   const result = await run(agent, items, { ...opts, stream: true });
-  // StreamedRunResult exposes a `completed` promise that resolves
-  // once the SSE stream has been fully drained and the state machine
-  // is settled. Without awaiting it, finalOutput/interruptions read
-  // stale (undefined) values and the SDK logs a warning.
-  //
-  // A structured-output (agent.outputType) parse/validation failure surfaces
-  // here (or on the finalOutput read) as a JSON SyntaxError or ZodError —
-  // seen when a BYO compatible backend returns off-shape JSON. Rather than
-  // crash the whole run, recover the model's raw text and end the turn
-  // cleanly: a non-decision finalOutput is treated as "done" by the caller,
-  // which renders it via extractFallbackSummary (it even unwraps a
-  // JSON-shaped reply/summary). Transport/auth/SSE errors are NOT swallowed.
+
+  // Iterate the StreamedRunResult to drain the event stream and call onChunk
+  // for each token delta. This allows callers to get real-time token streaming
+  // instead of buffering until the response is complete.
   let structuredOutputFailed = false;
+  const onChunk = (opts as unknown as { onChunk?: (delta: string) => void | Promise<void> })?.onChunk;
   try {
+    for await (const event of result as unknown as AsyncIterable<unknown>) {
+      // raw_model_stream_event with output_text_delta
+      const ev = event as { type?: string; data?: { type?: string; delta?: string } };
+      if (ev.type === 'raw_model_stream_event' && ev.data?.type === 'output_text_delta' && typeof ev.data.delta === 'string') {
+        if (onChunk) {
+          try {
+            await onChunk(ev.data.delta);
+          } catch {
+            // never let consumer errors abort the stream
+          }
+        }
+      }
+    }
     await result.completed;
   } catch (err) {
     if (!isStructuredOutputError(err)) throw err;

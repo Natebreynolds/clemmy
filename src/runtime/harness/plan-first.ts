@@ -35,6 +35,11 @@ export interface PlanFirstRunInput extends PlanFirstInput {
    * rather than re-asking. Flag-gated upstream (CLEMMY_PLAN_CONTINUITY).
    */
   priorAnswers?: string;
+  /**
+   * Opt-in: callback fired for each token delta from the planner so
+   * the plan appears character-by-character to the user, not as a block.
+   */
+  onChunk?: (delta: string) => void | Promise<void>;
 }
 
 export interface PlanFirstResult {
@@ -384,11 +389,37 @@ export async function runPlanFirstPreflight(input: PlanFirstRunInput): Promise<P
       workflowName: 'clementine-plan-first',
       groupId: input.sessionId,
     });
-    const result = await runner.run(buildPlannerAgent(), buildPlannerPrompt(input.input, input.priorAnswers, memoryContext), {
+    const result = runner.run(buildPlannerAgent(), buildPlannerPrompt(input.input, input.priorAnswers, memoryContext), {
       context: { sessionId: input.sessionId, turn: 0 },
       maxTurns: 8,
       toolExecution: { maxFunctionToolConcurrency: 4 },
-    });
+      stream: true,
+    }) as unknown as { completed: Promise<void>; finalOutput: unknown };
+
+    // Iterate StreamedRunResult to capture and emit token deltas character-by-character,
+    // so the plan appears to the user in real-time rather than as a static block.
+    // stream_token events are ephemeral (not persisted to SQLite) and flow only via onChunk callback.
+    try {
+      for await (const event of result as unknown as AsyncIterable<unknown>) {
+        const ev = event as { type?: string; data?: { type?: string; delta?: string } };
+        if (ev.type === 'raw_model_stream_event' && ev.data?.type === 'output_text_delta' && typeof ev.data.delta === 'string') {
+          // Call the onChunk callback if provided; caller routes it to actionBus for UI streaming.
+          if (input.onChunk) {
+            try {
+              await input.onChunk(ev.data.delta);
+            } catch {
+              // Never let consumer errors abort the stream.
+            }
+          }
+        }
+      }
+    } catch {
+      // Stream iteration errors should not block plan completion;
+      // the completed promise will still resolve and we'll get the final output.
+    }
+
+    // Wait for the runner to finish and get the final structured output.
+    await result.completed;
     const parsed = PlanSchema.safeParse(result.finalOutput);
     if (!parsed.success) {
       const message = parsed.error.message;

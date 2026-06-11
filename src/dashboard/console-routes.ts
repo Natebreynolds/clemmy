@@ -6554,6 +6554,20 @@ export function registerConsoleRoutes(
           });
           if (continuity.handled) return;
         }
+        const onChunk = (delta: string) => {
+          actionBus.emit({
+            kind: 'harness.event',
+            sessionId,
+            event: {
+              seq: 0,
+              sessionId,
+              turn: 0,
+              role: 'assistant',
+              type: 'stream_token',
+              data: { delta },
+            } as any,
+          });
+        };
         if (planFirst) {
           const preflight = await runPlanFirstPreflight({
             input: turnInput,
@@ -6561,6 +6575,7 @@ export function registerConsoleRoutes(
             channel: 'desktop',
             freshSession,
             autonomy,
+            onChunk,
           });
           if (preflight.surfaced) return;
         }
@@ -6571,10 +6586,11 @@ export function registerConsoleRoutes(
             sessionId,
             decision: intent.decision,
             resolver: 'chat-dock-user',
+            onChunk,
           });
           return;
         }
-        await runConversation({ agent, sessionId, input: turnInput, judgeCompletion: true });
+        await runConversation({ agent, sessionId, input: turnInput, judgeCompletion: true, onChunk });
       } catch (err) {
         // The loop emits its own run_failed when a turn throws. If we
         // got here, the throw happened BEFORE any turn started
