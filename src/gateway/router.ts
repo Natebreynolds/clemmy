@@ -16,6 +16,7 @@ import { loadProactivityPolicy } from '../agents/proactivity-policy.js';
 import { applyProposedFix, dismissProposedFix, listProposedFixes, loadProposedFix, revertWorkflowFix } from '../execution/workflow-diagnosis.js';
 import { requeueWorkflowFromRun } from '../tools/workflow-run-queue.js';
 import { verifyDelivered } from '../runtime/harness/verify-delivered.js';
+import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
 import { deriveTitle } from '../memory/derive-title.js';
 import type { ToolActivity } from '../types.js';
 
@@ -480,7 +481,10 @@ export class ClementineGateway {
         type: 'model_started',
         message: 'Assistant run started.',
       });
-      const response = await this.assistant.respond({
+      // CANON-ONE-LOOP: webhook chat runs the gated harness loop (grounding /
+      // confirm-first / guardrail / approvals) with the legacy synchronous
+      // contract preserved; kill-switch CLEMMY_HARNESS_WEBHOOK=off.
+      const response = await respondPreferHarness('webhook', {
         message: request.message,
         sessionId: request.sessionId,
         userId: request.userId,
@@ -490,7 +494,7 @@ export class ClementineGateway {
         onChunk: request.onChunk,
         onReasoning: request.onReasoning,
         onToolActivity: request.onToolActivity,
-      });
+      }, (req) => this.assistant.respond(req));
       // Report-back honesty: a non-pending, non-throwing respond() can still be
       // a blocked / promised / errored run. Fail-open + suspicious-only; the run
       // status enum has no 'blocked', so a not-delivered verdict maps to 'failed'

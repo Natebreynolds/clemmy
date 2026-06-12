@@ -19,6 +19,7 @@ import { runWorkflowWatchdog } from '../execution/workflow-watchdog.js';
 import { runBackgroundTaskWatchdog } from '../execution/background-task-watchdog.js';
 import { getBuildInfo, describeBuild } from '../runtime/build-info.js';
 import { verifyDelivered } from '../runtime/harness/verify-delivered.js';
+import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
 import { processWorkflowSchedules, reapStaleWorkflowRuns } from '../execution/workflow-scheduler.js';
 import { processSpaceSchedules } from '../spaces/scheduler.js';
 import { isSpacesEnabled } from '../spaces/store.js';
@@ -284,13 +285,15 @@ async function runCronJob(assistant: ClementineAssistant, job: CronJobRecord, so
       allowedTools: ['*'],
     });
 
-    const response = await assistant.respond({
+    // CANON-ONE-LOOP: cron jobs run unattended — exactly where the harness
+    // write gates matter most. Kill-switch CLEMMY_HARNESS_CRON=off.
+    const response = await respondPreferHarness('cron', {
       sessionId: cronSessionId,
       channel: 'cron',
       message: prompt,
       model: job.mode === 'unleashed' ? MODELS.deep : MODELS.primary,
       maxWallClockMs: cronBudgetMs,
-    });
+    }, (req) => assistant.respond(req));
 
     // Report-back honesty: a non-throwing respond() can still be a blocked /
     // promised / errored run. Fail-open + suspicious-only, so this only ever

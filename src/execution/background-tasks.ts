@@ -22,6 +22,7 @@ import { getBackgroundCheckInMs, loadProactivityPolicy } from '../agents/proacti
 import { openPlanScope } from '../agents/plan-scope.js';
 import { fanoutLedgerEnabled, summarizeLedger, clearLedger } from '../runtime/harness/fanout-ledger.js';
 import { BLOCKED_TEXT_PATTERNS } from '../runtime/harness/verify-delivered.js';
+import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
 
 const logger = pino({ name: 'clementine-next.background-tasks' });
 
@@ -890,7 +891,12 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	      // reads cancellationReason and marks the task aborted with a
 	      // user-readable message.
 	      const wallClockDeadlineMs = Date.now() + task.maxMinutes * 60_000;
-	      const response = await assistant.respond({
+	      // CANON-ONE-LOOP: background tasks (incl. the mobile chat lane) run the
+	      // gated harness loop; legacy fallback only pre-run. The shouldCancel
+	      // deadline contract is preserved — the bridge maps it onto the harness
+	      // kill switch and re-throws AgentRuntimeCancelledError on caller-driven
+	      // aborts. Kill-switch CLEMMY_HARNESS_BACKGROUND=off.
+	      const response = await respondPreferHarness('background', {
 	        sessionId: task.runSessionId,
 	        channel: task.channel ?? 'background',
 	        userId: task.userId,
@@ -944,7 +950,7 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	            },
 	          });
 	        },
-	      });
+	      }, (req) => assistant.respond(req));
 	      if (heartbeatTimer) clearInterval(heartbeatTimer);
 
       if (response.pendingApprovalId) {

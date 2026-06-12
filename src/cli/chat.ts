@@ -6,6 +6,7 @@ import { PlanStore } from '../planning/plan-store.js';
 import { buildDeepTaskPrompt, extractSteps, saveDeepTaskPlan } from '../planning/deep-task.js';
 import { discoverMcpServers } from '../runtime/mcp-config.js';
 import { LOCAL_MCP_ENABLED, ASSISTANT_NAME } from '../config.js';
+import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
 import { LOCAL_MCP_TOOL_NAMES } from '../tools/catalog.js';
 import { formatAuthStatus } from '../runtime/auth-store.js';
 import { createRuntimeFromConfig } from '../runtime/factory.js';
@@ -204,12 +205,12 @@ export async function startChatCli(): Promise<void> {
         continue;
       }
       const done = thinking();
-      const response = await assistant.respond({
+      const response = await respondPreferHarness('cli', {
         sessionId,
         channel: 'cli',
         message: buildDeepTaskPrompt(task),
         model: 'gpt-4.1',
-      });
+      }, (req) => assistant.respond(req));
       done();
       const steps = extractSteps(response.text);
       if (steps.length > 0) {
@@ -222,7 +223,8 @@ export async function startChatCli(): Promise<void> {
 
     // --- Normal message ---
     const done = thinking();
-    const response = await assistant.respond({ sessionId, channel: 'cli', message: line });
+    // CANON-ONE-LOOP: legacy CLI rides the gated harness loop; kill-switch CLEMMY_HARNESS_CLI=off.
+    const response = await respondPreferHarness('cli', { sessionId, channel: 'cli', message: line }, (req) => assistant.respond(req));
     done();
     printResponse(ASSISTANT_NAME, response.text);
   }
