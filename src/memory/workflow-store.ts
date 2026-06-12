@@ -225,6 +225,24 @@ export interface WorkflowSynthesis {
 }
 
 /**
+ * Run-level PINNED GOAL (goal-contract, run scope). When declared, every
+ * completed run is validated EXTERNALLY against these parked criteria (the
+ * goal lives outside the model — the run finishing is a trigger to validate,
+ * never the verdict). An unmet goal re-pursues the run with the validation
+ * evidence folded into the next attempt (bounded by maxAttempts), or parks
+ * loudly when re-running would be unsafe (a send-class step already executed)
+ * or attempts are exhausted.
+ */
+export interface WorkflowGoal {
+  /** What this workflow run must achieve — judged externally at completion. */
+  objective: string;
+  /** Concrete pass/fail criteria. Empty → the objective itself is judged. */
+  successCriteria?: string[];
+  /** Total run attempts allowed (original + re-pursuits). Clamped 1..3, default 2. */
+  maxAttempts?: number;
+}
+
+/**
  * Tool reference in `allowed-tools`. Can be a bare tool name (auto
  * approval) or an object with explicit approval policy:
  *
@@ -257,6 +275,8 @@ export interface WorkflowDefinition {
    *  without requiring approval gates. Users can opt-in to approval per-step via requiresApproval.
    *  Set to false to re-enable strict validation (old behavior: send gates required). */
   allowSends?: boolean;
+  /** Run-level pinned goal — external validation + bounded re-pursuit. */
+  goal?: WorkflowGoal;
 }
 
 /** What the on-disk loader returns. */
@@ -343,6 +363,31 @@ function parseBody(body: string): ParsedBody {
     stepPrompts[matches[i].id] = body.slice(start, end).trim();
   }
   return { description_body, stepPrompts };
+}
+
+/** Clamp a run-goal's attempt ceiling: 1..3 total runs, default 2. */
+export function clampGoalMaxAttempts(raw: unknown): number {
+  const n = typeof raw === 'number' && Number.isFinite(raw) ? Math.floor(raw) : 2;
+  return Math.max(1, Math.min(3, n));
+}
+
+/** Parse a frontmatter `goal:` block (snake_case or camelCase keys). The
+ *  objective floor (≥4 chars) matches the runtime normalizer, so a goal that
+ *  parses is a goal that RUNS — never a silent runtime no-op. */
+function parseWorkflowGoal(raw: unknown): WorkflowGoal | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const g = raw as Record<string, unknown>;
+  const objective = typeof g.objective === 'string' ? g.objective.trim() : '';
+  if (objective.length < 4) return undefined;
+  const rawCriteria = g.success_criteria ?? g.successCriteria;
+  const successCriteria = Array.isArray(rawCriteria)
+    ? rawCriteria.map((c) => String(c).trim()).filter((c) => c.length > 0)
+    : undefined;
+  const rawMax = g.max_attempts ?? g.maxAttempts;
+  const out: WorkflowGoal = { objective };
+  if (successCriteria && successCriteria.length > 0) out.successCriteria = successCriteria;
+  if (typeof rawMax === 'number' && Number.isFinite(rawMax)) out.maxAttempts = clampGoalMaxAttempts(rawMax);
+  return out;
 }
 
 export function readWorkflowDefinitionFile(filePath: string): WorkflowDefinition | null {
@@ -437,6 +482,7 @@ export function readWorkflowDefinitionFile(filePath: string): WorkflowDefinition
       }
       return result;
     });
+    const goal = parseWorkflowGoal(data.goal);
     return {
       name: String(data.name ?? inferredName),
       description: String(data.description ?? ''),
@@ -448,6 +494,10 @@ export function readWorkflowDefinitionFile(filePath: string): WorkflowDefinition
       inputs: typeof data.inputs === 'object' && data.inputs ? data.inputs as WorkflowDefinition['inputs'] : undefined,
       synthesis: typeof data.synthesis === 'object' && data.synthesis ? data.synthesis as WorkflowSynthesis : undefined,
       description_body: body.description_body || undefined,
+      // allowSends round-trip: only `false` is meaningful (strict send gating);
+      // the default-true case stays unwritten so legacy files are byte-identical.
+      ...(data.allow_sends === false || data.allowSends === false ? { allowSends: false } : {}),
+      ...(goal ? { goal } : {}),
     };
   } catch {
     return null;
@@ -552,6 +602,14 @@ function writeWorkflowToDir(dirPath: string, def: WorkflowDefinition): void {
   }
   if (def.inputs && Object.keys(def.inputs).length > 0) frontmatter.inputs = def.inputs;
   if (def.synthesis?.prompt) frontmatter.synthesis = def.synthesis;
+  // Only the strict (non-default) setting is persisted — see the parse side.
+  if (def.allowSends === false) frontmatter.allow_sends = false;
+  if (def.goal?.objective) {
+    const goal: Record<string, unknown> = { objective: def.goal.objective };
+    if (def.goal.successCriteria && def.goal.successCriteria.length > 0) goal.success_criteria = def.goal.successCriteria;
+    if (def.goal.maxAttempts !== undefined) goal.max_attempts = clampGoalMaxAttempts(def.goal.maxAttempts);
+    frontmatter.goal = goal;
+  }
 
   // Body: optional description paragraph, then one ## step: <id> per
   // step with its prompt content. Always end with a trailing newline.

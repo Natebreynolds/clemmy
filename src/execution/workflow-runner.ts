@@ -14,10 +14,18 @@ import { WORKFLOWS_DIR } from '../memory/vault.js';
 import {
   listWorkflows,
   writeWorkflow,
+  clampGoalMaxAttempts,
   type WorkflowDefinition,
   type WorkflowStepInput,
   type WorkflowStepOutputContract,
 } from '../memory/workflow-store.js';
+import { validateGoal, toGoalEvidence, type GoalValidationResult } from './goal-validate.js';
+import {
+  ensureWorkflowRunGoal,
+  recordGoalValidation,
+  satisfyGoal,
+  expireGoal,
+} from '../agents/plan-proposals.js';
 import { loadSkill } from '../memory/skill-store.js';
 import {
   appendWorkflowEvent,
@@ -167,6 +175,58 @@ export function clearWorkflowRunCurrentStep(runId: string): void {
   runCurrentStep.delete(runId);
 }
 
+/**
+ * forEach item-progress tracker, keyed by run AND step — two forEach steps in
+ * the same dependsOn batch run concurrently (Promise.all), so a run-only key
+ * would let them clobber each other's counters and the first to finish would
+ * delete its sibling's progress. The fan-out loop updates it as items finish
+ * so the heartbeat can say "12/50 items (2 failed)" instead of going silent
+ * for the whole 30-minute fan-out; the heartbeat AGGREGATES across the run's
+ * live fan-outs. Cleared per step when its fan-out finishes, and run-wide at
+ * the end of the step loop.
+ */
+const runItemProgress = new Map<string, { completed: number; failed: number; total: number }>();
+
+const itemProgressKey = (runId: string, stepId: string): string => `${runId}::${stepId}`;
+
+export function setWorkflowRunItemProgress(
+  runId: string,
+  stepId: string,
+  progress: { completed: number; failed: number; total: number },
+): void {
+  runItemProgress.set(itemProgressKey(runId, stepId), progress);
+}
+
+export function bumpWorkflowRunItemProgress(runId: string, stepId: string, outcome: 'completed' | 'failed'): void {
+  const key = itemProgressKey(runId, stepId);
+  const cur = runItemProgress.get(key);
+  if (!cur) return;
+  runItemProgress.set(key, { ...cur, [outcome]: cur[outcome] + 1 });
+}
+
+export function clearWorkflowRunItemProgress(runId: string, stepId?: string): void {
+  if (stepId !== undefined) {
+    runItemProgress.delete(itemProgressKey(runId, stepId));
+    return;
+  }
+  const prefix = `${runId}::`;
+  for (const key of runItemProgress.keys()) {
+    if (key.startsWith(prefix)) runItemProgress.delete(key);
+  }
+}
+
+/** Aggregate item progress across a run's live fan-outs (exported for tests). */
+export function getWorkflowRunItemProgress(runId: string): { completed: number; failed: number; total: number } | null {
+  const prefix = `${runId}::`;
+  let completed = 0, failed = 0, total = 0, found = false;
+  for (const [key, p] of runItemProgress) {
+    if (!key.startsWith(prefix)) continue;
+    found = true;
+    completed += p.completed; failed += p.failed; total += p.total;
+  }
+  return found ? { completed, failed, total } : null;
+}
+
 export function markWorkflowRunPausedForApproval(runId: string): void {
   runsParkedOnApproval.add(runId);
 }
@@ -193,8 +253,16 @@ function startWorkflowHeartbeat(
     // back to the old generic message when the step tracker is empty
     // (e.g. during the synthesis pass or post-step cleanup).
     const cur = runCurrentStep.get(runId);
-    const stepLabel = cur ? ` · step ${cur.index} of ${cur.total} · ${cur.stepId}` : '';
-    const stepBody = cur ? `Currently: \`${cur.stepId}\` (step ${cur.index}/${cur.total}). ` : '';
+    // forEach fan-out progress: "12/50 items (2 failed)" — a long fan-out
+    // must never read as silent/stuck when it's actually chewing through
+    // items. Aggregated across concurrent fan-outs in the same batch.
+    const items = getWorkflowRunItemProgress(runId);
+    const itemsDone = items ? items.completed + items.failed : 0;
+    const itemLabel = items && items.total > 0
+      ? ` · ${itemsDone}/${items.total} items${items.failed > 0 ? ` (${items.failed} failed)` : ''}`
+      : '';
+    const stepLabel = cur ? ` · step ${cur.index} of ${cur.total} · ${cur.stepId}${itemLabel}` : '';
+    const stepBody = cur ? `Currently: \`${cur.stepId}\` (step ${cur.index}/${cur.total}${itemLabel}). ` : '';
     addNotification({
       id: `workflow-heartbeat-${runId}-${count}`,
       kind: 'workflow',
@@ -265,6 +333,19 @@ interface QueuedRunRecord {
    * CLEMENTINE_WORKFLOW_SELF_HEAL_MAX_ATTEMPTS and escalate instead of looping.
    */
   selfHealAttempt?: number;
+  /**
+   * Run-goal lineage (pinned workflow goals): how many goal re-pursuits
+   * already happened (absent/0 = the original run), and the prior attempt's
+   * validation evidence — folded into every LLM step prompt of a re-pursuit
+   * so attempt N+1 is targeted, not blind. Carried run→run via
+   * requeueWorkflowFromRun, exactly like selfHealAttempt.
+   */
+  goalAttempt?: number;
+  goalFeedback?: string;
+  /** Terminal pinned-goal verdict for this run (satisfied | repursue |
+   *  escalate | advisory) + the one-line reason — rendered by run_status. */
+  goalOutcome?: string;
+  goalReason?: string;
   /**
    * P0 event-driven approval parking (flag WORKFLOW_APPROVAL_PARKING).
    * When a step pauses on a human approval, the runner records the
@@ -497,6 +578,28 @@ export function applyContractToPrompt(step: WorkflowStepInput, rendered: string)
     lines.push(`These keys MUST hold a real, existing file path (verified): ${c.verify.path_exists.join(', ')}.`);
   }
   return [rendered, ...lines].join('\n');
+}
+
+/**
+ * Run-goal re-pursuit: fold the prior attempt's external-validation evidence
+ * into the step prompt so the re-run addresses the unmet criteria instead of
+ * blindly repeating itself. No active feedback → prompt unchanged (the normal
+ * first-attempt case stays byte-identical). Exported for tests.
+ */
+export function applyGoalFeedbackToPrompt(
+  ctx: Pick<StepExecutionContext, 'goalFeedback'>,
+  rendered: string,
+): string {
+  const feedback = ctx.goalFeedback?.trim();
+  if (!feedback) return rendered;
+  return [
+    rendered,
+    '',
+    '=== PRIOR ATTEMPT FEEDBACK (this is a goal re-pursuit run) ===',
+    'The previous run of this workflow completed but FAILED external goal validation:',
+    feedback,
+    'Address these gaps in this attempt — do not repeat the prior output unchanged.',
+  ].join('\n');
 }
 
 function renderTemplate(
@@ -787,6 +890,10 @@ interface StepExecutionContext {
   // out over only the FIRST item (bounded cost — we just need to confirm the
   // step returns data, not process the whole batch). No-op for normal runs.
   creationTest?: boolean;
+  // Run-goal re-pursuit: the prior attempt's validation evidence. When set,
+  // every LLM step prompt gets a PRIOR ATTEMPT FEEDBACK block so the re-run
+  // addresses the unmet criteria instead of repeating the same output.
+  goalFeedback?: string;
 }
 
 /** A non-blocking quality heads-up attached to a COMPLETED run. The deliverable
@@ -794,7 +901,7 @@ interface StepExecutionContext {
 export interface WorkflowQualityAdvisory {
   stepId: string;
   itemKey?: string;
-  kind: 'skill_not_executed' | 'target_missed';
+  kind: 'skill_not_executed' | 'target_missed' | 'goal_validation_unavailable';
   note: string;
 }
 
@@ -1228,21 +1335,45 @@ async function awaitDeclarativeStepApproval(
     throw new Error(`workflow step "${step.id}" was not approved (${prior})`);
   }
 
-  // Unattended scheduled run: there is no human at 8am to click "approve", so a
-  // declarative gate would PARK FOREVER (deadlock) — the run never completes and
-  // the daily promise silently fails. For a scheduler-fired run of an ENABLED
-  // workflow, the human's consent WAS the enable + the schedule, so auto-approve
-  // the gate (logged for audit) and proceed. Manual/chat/dashboard runs (a person
-  // is present) still register the gate and wait, exactly as before.
-  if (ctx.workflow.enabled !== false && isUnattendedScheduledRun(ctx.runId)) {
+  // Unattended scheduled run: there is no human at 8am to click "approve".
+  // For a scheduler-fired run of an ENABLED workflow, the human's consent WAS
+  // the enable + the schedule, so a NON-SEND gate auto-approves (visibly —
+  // the user is told the gate was bypassed and why). A SEND-class gate NEVER
+  // auto-approves: the author put a human in front of an irreversible
+  // outbound action, and "scheduled" doesn't revoke that — the run parks on
+  // the durable approval and resumes whenever the user answers (the approval
+  // card + watchdog make the wait loud, so this is a pause, not a deadlock).
+  // Send-class includes the PROSE heuristic for undeclared steps — a
+  // deliberate bias: the bad outcome of a false positive is "asked
+  // permission unnecessarily"; the bad outcome of a false negative is an
+  // unreviewed irreversible send (the wrong-mailbox incident class).
+  // Manual/chat/dashboard runs (a person is present) always register the
+  // gate and wait, exactly as before.
+  if (
+    ctx.workflow.enabled !== false
+    && isUnattendedScheduledRun(ctx.runId)
+    && stepSideEffectClass(step) !== 'send'
+  ) {
     appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
       kind: 'step_started',
       stepId: step.id,
       meta: { gate: 'auto_approved_unattended', reason: 'enabled scheduled run — consent was enable + schedule' },
     });
+    try {
+      addNotification({
+        id: `gate-autoapproved-${ctx.runId}-${step.id}`,
+        kind: 'workflow',
+        title: `Approval gate auto-approved: ${ctx.workflow.name} · ${step.id}`,
+        body: `Scheduled run ${ctx.runId} reached the approval gate on step "${step.id}" with no one present, and the step is not a send — so it was auto-approved (your consent was enabling + scheduling the workflow). If this step should ALWAYS wait for you, declare \`sideEffect: send\` on it or remove the schedule.`,
+        createdAt: new Date().toISOString(),
+        read: false,
+        silent: true,
+        metadata: { workflow: ctx.workflow.name, runId: ctx.runId, stepId: step.id, gate: 'auto_approved_unattended' },
+      });
+    } catch { /* audit notification is best-effort */ }
     logger.info(
       { workflow: ctx.workflow.name, runId: ctx.runId, step: step.id },
-      'declarative approval gate auto-approved for unattended scheduled run (enable was the consent)',
+      'declarative approval gate auto-approved for unattended scheduled run (enable was the consent; non-send step)',
     );
     return;
   }
@@ -1835,6 +1966,13 @@ export async function executeStep(
       stepId: step.id,
       meta: { mode: 'forEach', source: step.forEach, count: items.length, concurrency },
     });
+    // Heartbeat item progress: pre-completed (resumed) items count as done
+    // from the start, then each finishing item bumps the live counter.
+    setWorkflowRunItemProgress(ctx.runId, step.id, {
+      completed: items.filter((it, idx) => ctx.completedItems.has(itemKey(it, idx))).length,
+      failed: 0,
+      total: items.length,
+    });
 
     interface ItemResult { itemKey: string; output: unknown }
     const itemResults = await runWithConcurrency<unknown, ItemResult>(items, concurrency, async (item, idx) => {
@@ -1853,7 +1991,7 @@ export async function executeStep(
         // when the step declares no `inputs`). `item` is in scope here.
         const itemContext = bindStepContext(step, ctx, item);
         const itemIntent = renderTemplate(step.prompt, ctx.inputs, ctx.stepOutputs, item);
-        const prompt = applyContractToPrompt(step, applySkillToPrompt(step, itemIntent));
+        const prompt = applyGoalFeedbackToPrompt(ctx, applyContractToPrompt(step, applySkillToPrompt(step, itemIntent)));
         let output: unknown;
         let itemSessionId = `workflow:${ctx.runId}:${step.id}:${key}`;
         if (workflowHarnessEnabled(step)) {
@@ -1891,6 +2029,7 @@ export async function executeStep(
           itemKey: key,
           output,
         });
+        bumpWorkflowRunItemProgress(ctx.runId, step.id, 'completed');
         return { itemKey: key, output };
       } catch (err) {
         const error = err instanceof Error ? err.message : String(err);
@@ -1900,6 +2039,7 @@ export async function executeStep(
           itemKey: key,
           error,
         });
+        bumpWorkflowRunItemProgress(ctx.runId, step.id, 'failed');
         throw err;
       }
     });
@@ -1916,6 +2056,7 @@ export async function executeStep(
       const key = itemKey(items[i], i);
       ctx.forEachFailures.push({ stepId: step.id, itemKey: key, error: r.error });
     }
+    clearWorkflowRunItemProgress(ctx.runId, step.id);
     return finalizeStepOutput(ctx.workflowSlug, ctx.runId, step, aggregate, {
       mode: 'forEach', completed: successes.length, failed,
     });
@@ -1934,7 +2075,10 @@ export async function executeStep(
     kind: 'step_started',
     stepId: step.id,
   });
-  const prompt = applyContractToPrompt(step, applySkillToPrompt(step, renderTemplate(step.prompt, ctx.inputs, ctx.stepOutputs)));
+  const prompt = applyGoalFeedbackToPrompt(
+    ctx,
+    applyContractToPrompt(step, applySkillToPrompt(step, renderTemplate(step.prompt, ctx.inputs, ctx.stepOutputs))),
+  );
   let output: unknown;
   let stepSessionId = `workflow:${ctx.runId}:${step.id}`;
   if (workflowHarnessEnabled(step)) {
@@ -2147,6 +2291,7 @@ async function executeWorkflow(
   inputs: Record<string, string>,
   assistant: ClementineAssistant,
   targetStepId?: string,
+  goalFeedback?: string,
 ): Promise<{ finalOutput: string; forEachFailures: Array<{ stepId: string; itemKey: string; error: string }>; qualityAdvisories: WorkflowQualityAdvisory[] }> {
   const resume = computeResumeState(workflowSlug, runId);
   const stepOutputs: Record<string, unknown> = Object.fromEntries(resume.completedSteps);
@@ -2193,7 +2338,7 @@ async function executeWorkflow(
       });
       const completedItems = resume.completedItems.get(step.id) ?? new Map();
       const output = await executeStepVerified(step, {
-        workflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems, forEachFailures, qualityAdvisories,
+        workflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems, forEachFailures, qualityAdvisories, goalFeedback,
       });
       throwIfWorkflowRunCancelled(runId);
       stepOutputs[step.id] = output;
@@ -2214,7 +2359,7 @@ async function executeWorkflow(
         throwIfWorkflowRunCancelled(runId);
         const completedItems = resume.completedItems.get(step.id) ?? new Map();
         const output = await executeStepVerified(step, {
-          workflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems, forEachFailures, qualityAdvisories,
+          workflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems, forEachFailures, qualityAdvisories, goalFeedback,
         });
         return { step, output };
       }));
@@ -2259,6 +2404,7 @@ async function executeWorkflow(
   // so the heartbeat doesn't keep showing the LAST step name after
   // the per-step loop is done.
   clearWorkflowRunCurrentStep(runId);
+  clearWorkflowRunItemProgress(runId);
 
   // Synthesis step (optional final pass over all step outputs). Skipped
   // when TRY is running a single step in isolation — the step's own
@@ -2549,6 +2695,11 @@ function notifyCancelledRunOnce(filePath: string, run: QueuedRunRecord): void {
         read: false,
         metadata: { workflow: run.workflow, runId: run.id, status: 'cancelled' },
       });
+      // A chat-fired run's cancellation re-enters the origin chat too —
+      // the user who asked for it in conversation shouldn't have to find a
+      // notification card to learn it stopped. No-op without originSessionId;
+      // deliverOutcome's idempotency makes drain retries safe.
+      enqueueWorkflowOutcomeTurn(run, run.workflow, 'failed', 'This run was cancelled before it finished. Queue it again with workflow_run if it should still happen.');
     }
     // Stamp the marker either way so a stale/already-reported file isn't
     // re-checked every drain tick (and the watchdog skips it too).
@@ -2702,6 +2853,121 @@ function tryAutoHealAndRequeue(args: {
     stepId: fix.stepId,
     message: `Step "${fix.stepId}" blocked, so I auto-applied a fix (${fix.description}) and re-ran the workflow — attempt ${attempt} of ${max}. It's running in the background and will report back here when it finishes.`,
   };
+}
+
+// ── Run-level pinned goals (goal-contract, run scope) ────────────────
+//
+// A workflow can declare `goal:` — an objective + success criteria parked
+// OUTSIDE the model. Every completed run is validated externally against the
+// parked criteria (validateGoal: deterministic checks + strict judge that can
+// NEVER auto-satisfy on infra failure). Unmet + safe + attempts left → the
+// run re-queues itself with the validation evidence folded into every LLM
+// step prompt, so attempt N+1 is targeted. Unmet + unsafe (an irreversible
+// step already executed) or attempts exhausted → loud needs-attention with
+// per-criterion evidence. This is the run-scope sibling of step `loopUntil`,
+// reusing the SAME requeue machinery as bounded self-heal — no new loop
+// drivers, no new stores (the contract row lives in plan-proposals with
+// origin kind 'workflow').
+
+/** Normalize the def's pinned goal; null when none declared. */
+function workflowRunGoal(def: WorkflowDefinition): { objective: string; successCriteria: string[]; maxAttempts: number } | null {
+  const g = def.goal;
+  const objective = g?.objective?.trim() ?? '';
+  if (objective.length < 4) return null;
+  return {
+    objective,
+    successCriteria: (g?.successCriteria ?? []).map((c) => c.trim()).filter(Boolean),
+    maxAttempts: clampGoalMaxAttempts(g?.maxAttempts),
+  };
+}
+
+/**
+ * Side-effect law at RUN scope: a goal re-pursuit re-executes EVERY step, so
+ * it is only safe when no completed step could double an irreversible
+ * external effect. Stricter than the self-heal guard: declared side-effect
+ * classes count (send is always unsafe; write is unsafe unless the author
+ * asserted `loopSafe: true`), approval-gated steps count (the author's own
+ * "this mutates" signal), and the prose heuristic still backstops undeclared
+ * steps. Returns the first offending step id, or null when safe. Exported
+ * for tests.
+ */
+export function runUnsafeToRepursue(
+  steps: WorkflowStepInput[],
+  completedStepIds: Set<string>,
+): string | null {
+  for (const s of steps) {
+    if (!completedStepIds.has(s.id)) continue;
+    const cls = stepSideEffectClass(s);
+    if (cls === 'send') return s.id;
+    if (cls === 'write' && s.loopSafe !== true) return s.id;
+    if (s.requiresApproval === true) return s.id;
+  }
+  return null;
+}
+
+export interface GoalRunDecision {
+  action: 'satisfied' | 'repursue' | 'escalate' | 'advisory';
+  reason: string;
+}
+
+/**
+ * Pure decision: what happens to a completed run whose pinned goal was just
+ * validated. Exported for tests — every branch is deterministic.
+ */
+export function decideGoalRunOutcome(args: {
+  verdict: GoalValidationResult;
+  /** Total run attempts allowed (original + re-pursuits), already clamped. */
+  maxAttempts: number;
+  /** run.goalAttempt ?? 0 — re-pursuits that already happened. */
+  priorRepursuits: number;
+  /** First completed step unsafe to re-run, from runUnsafeToRepursue. */
+  unsafeStepId: string | null;
+  chronicallyFailing: boolean;
+}): GoalRunDecision {
+  const attemptsUsed = args.priorRepursuits + 1;
+  if (args.verdict.pass) return { action: 'satisfied', reason: 'all success criteria met' };
+  // A dead judge makes the FUZZY criteria unverifiable — but a deterministic
+  // criterion (a named artifact) that PROVABLY failed in the same verdict is
+  // a real miss, not an unverifiable one. Only downgrade to advisory when
+  // nothing provable failed; a proven miss proceeds to repursue/escalate.
+  const provenMiss = args.verdict.perCriterion.some((c) => !c.pass && c.method === 'deterministic');
+  if (args.verdict.judgeFailedOpen && !provenMiss) {
+    return { action: 'advisory', reason: 'goal validation unavailable (judge error) — not re-running on an unverifiable verdict' };
+  }
+  if (attemptsUsed >= args.maxAttempts) {
+    return { action: 'escalate', reason: `goal unmet after ${attemptsUsed}/${args.maxAttempts} attempts` };
+  }
+  if (args.unsafeStepId) {
+    return { action: 'escalate', reason: `goal unmet, but step "${args.unsafeStepId}" performed an irreversible action this run — re-running could double it` };
+  }
+  if (args.chronicallyFailing) {
+    return { action: 'escalate', reason: 'goal unmet and this workflow is chronically failing — escalating instead of burning more attempts' };
+  }
+  return { action: 'repursue', reason: `goal unmet (attempt ${attemptsUsed}/${args.maxAttempts})` };
+}
+
+/** Evidence the validator judges: the final deliverable + a truncated
+ *  per-step ledger (so a criterion about an intermediate step is checkable). */
+function buildGoalEvidenceText(finalOutput: string, stepOutputs: Record<string, unknown>): string {
+  const stepLines = Object.entries(stepOutputs)
+    .slice(0, 20)
+    .map(([id, out]) => `- ${id}: ${String(out).slice(0, 400)}`);
+  return [
+    'FINAL OUTPUT:',
+    (finalOutput || '(empty)').slice(0, 6000),
+    '',
+    'STEP RESULTS (truncated):',
+    ...stepLines,
+  ].join('\n');
+}
+
+/** Render the unmet criteria as feedback for the next attempt / the human. */
+export function renderGoalFeedback(verdict: GoalValidationResult): string {
+  const failed = verdict.perCriterion.filter((c) => !c.pass);
+  return [
+    ...failed.map((c) => `- UNMET: ${c.criterion}${c.detail ? ` (${c.detail})` : ''}`),
+    verdict.advice ? `Guidance: ${verdict.advice}` : '',
+  ].filter(Boolean).join('\n');
 }
 
 // ── Creation-time test (Part B) ─────────────────────────────────────
@@ -2983,7 +3249,7 @@ async function processOneRunFile(
 
     const stopHeartbeat = startWorkflowHeartbeat(workflow.data.name, run.id, Date.now());
     try {
-      const { finalOutput, forEachFailures, qualityAdvisories } = await executeWorkflow(workflow.data, workflow.name, run.id, inputs, assistant, run.targetStepId);
+      const { finalOutput, forEachFailures, qualityAdvisories } = await executeWorkflow(workflow.data, workflow.name, run.id, inputs, assistant, run.targetStepId, run.goalFeedback);
       throwIfWorkflowRunCancelled(run.id);
       const resume = computeResumeState(workflow.name, run.id);
       const stepOutputs = stringifyOutputs(Object.fromEntries(resume.completedSteps));
@@ -3013,27 +3279,123 @@ async function processOneRunFile(
         finalOutput,
         hasSynthesis: Boolean(workflow.data.synthesis?.prompt) && !run.targetStepId,
       });
+      // A declared pinned goal REPLACES the fuzzy target judge for this run:
+      // the parked criteria are stricter and produce per-criterion evidence,
+      // so double-judging would only burn a second model call.
+      const declaredRunGoal = workflowRunGoal(workflow.data);
       let targetVerdict: WorkflowTargetVerdict | null = null;
-      try {
-        targetVerdict = await judgeWorkflowTarget({
-          workflow: workflow.data,
-          inputs,
-          finalOutput,
-          fallbackBody: baseSuccessBody,
-          isPartialRun: Boolean(run.targetStepId),
+      if (!declaredRunGoal) {
+        try {
+          targetVerdict = await judgeWorkflowTarget({
+            workflow: workflow.data,
+            inputs,
+            finalOutput,
+            fallbackBody: baseSuccessBody,
+            isPartialRun: Boolean(run.targetStepId),
+          });
+        } catch { /* fail-open: a target-judge error never affects a completed run */ }
+        if (targetVerdict && targetVerdict.judged && !targetVerdict.reached) {
+          qualityAdvisories.push({
+            stepId: '(workflow target)',
+            kind: 'target_missed',
+            note: `couldn't confirm this run reached the workflow's target: ${targetVerdict.gap}`,
+          });
+          logger.info(
+            { workflow: workflow.data.name, runId: run.id, gap: targetVerdict.gap },
+            'Workflow target check flagged a possible miss — surfacing as a non-failing advisory',
+          );
+        }
+      }
+
+      // ── Pinned run goal: validate EXTERNALLY, then decide. Skipped for
+      // partial TRY runs (no full deliverable) and runs with blocked steps
+      // (those route to diagnosis/self-heal first — validating a half-run
+      // would always fail and burn a re-pursuit attempt for nothing).
+      const runGoal = declaredRunGoal && !run.targetStepId && blockedSteps.length === 0 ? declaredRunGoal : null;
+      let goalVerdict: GoalValidationResult | null = null;
+      let goalDecision: GoalRunDecision | null = null;
+      let goalFeedbackNext = '';
+      let goalRequeueId: string | undefined;
+      if (runGoal) {
+        goalVerdict = await validateGoal({
+          objective: runGoal.objective,
+          successCriteria: runGoal.successCriteria,
+          evidenceText: buildGoalEvidenceText(finalOutput, stepOutputs),
         });
-      } catch { /* fail-open: a target-judge error never affects a completed run */ }
-      if (targetVerdict && targetVerdict.judged && !targetVerdict.reached) {
-        qualityAdvisories.push({
-          stepId: '(workflow target)',
-          kind: 'target_missed',
-          note: `couldn't confirm this run reached the workflow's target: ${targetVerdict.gap}`,
+        goalFeedbackNext = renderGoalFeedback(goalVerdict);
+        // Contract row (plan-proposals, origin kind 'workflow'): the pinned
+        // goal's external home — attempt lineage + per-criterion evidence
+        // accumulate across re-pursuit runs, visible to /goal status. Pure
+        // bookkeeping: a store hiccup never affects the run.
+        let goalContractId: string | null = null;
+        try {
+          const contract = ensureWorkflowRunGoal({
+            workflowName: workflow.data.name,
+            runId: run.id,
+            objective: runGoal.objective,
+            successCriteria: runGoal.successCriteria,
+            maxAttempts: runGoal.maxAttempts,
+          });
+          if (contract) {
+            goalContractId = contract.id;
+            recordGoalValidation(contract.id, toGoalEvidence(goalVerdict, (run.goalAttempt ?? 0) + 1, new Date().toISOString()));
+          }
+        } catch { /* contract bookkeeping is best-effort */ }
+        goalDecision = decideGoalRunOutcome({
+          verdict: goalVerdict,
+          maxAttempts: runGoal.maxAttempts,
+          priorRepursuits: run.goalAttempt ?? 0,
+          unsafeStepId: runUnsafeToRepursue(workflow.data.steps, new Set(resume.completedSteps.keys())),
+          chronicallyFailing: shouldStopAutoHeal(workflow.name),
         });
+        if (goalDecision.action === 'repursue') {
+          // ONLY a fresh 'queued' run counts as a re-pursuit. A 'duplicate'
+          // (an identical run already queued — e.g. the next scheduled fire)
+          // carries NO goalAttempt lineage and NO feedback, so treating it as
+          // success would reset the attempt ceiling every cycle and lie to
+          // the user about "re-running with feedback". Exception-safe: a
+          // queue-write error must never turn this COMPLETED run into an
+          // error-path run.
+          let requeued: ReturnType<typeof requeueWorkflowFromRun> | null = null;
+          try {
+            requeued = requeueWorkflowFromRun(run.id, {
+              originSessionId: run.originSessionId,
+              goalAttempt: (run.goalAttempt ?? 0) + 1,
+              goalFeedback: goalFeedbackNext,
+            });
+          } catch { requeued = null; }
+          if (requeued?.status === 'queued') {
+            goalRequeueId = requeued.id;
+          } else {
+            goalDecision = {
+              action: 'escalate',
+              reason: requeued?.status === 'duplicate'
+                ? 'goal unmet, and an identical run is already queued — could not queue a feedback-carrying re-pursuit (the queued run will validate the goal again on its own)'
+                : 'goal unmet and the automatic re-run could not be queued — re-run manually',
+            };
+          }
+        }
+        if (goalDecision.action === 'advisory') {
+          qualityAdvisories.push({ stepId: '(run goal)', kind: 'goal_validation_unavailable', note: goalDecision.reason });
+        }
+        try {
+          if (goalContractId && goalDecision.action === 'satisfied') satisfyGoal(goalContractId, 'external validation passed');
+          if (goalContractId && goalDecision.action === 'escalate') expireGoal(goalContractId, goalDecision.reason);
+        } catch { /* best-effort */ }
+        try {
+          appendWorkflowEvent(workflow.name, run.id, {
+            kind: 'step_advisory',
+            stepId: '(run goal)',
+            meta: { goal: goalDecision.action, reason: goalDecision.reason, attempt: (run.goalAttempt ?? 0) + 1, max: runGoal.maxAttempts },
+          });
+        } catch { /* journal note is best-effort — a re-pursuit may already be queued, so this run must reach its terminal record write */ }
         logger.info(
-          { workflow: workflow.data.name, runId: run.id, gap: targetVerdict.gap },
-          'Workflow target check flagged a possible miss — surfacing as a non-failing advisory',
+          { workflow: workflow.data.name, runId: run.id, goal: goalDecision.action, reason: goalDecision.reason },
+          'pinned run goal validated',
         );
       }
+      const goalMissed = goalDecision?.action === 'escalate';
+      const goalRepursuing = goalDecision?.action === 'repursue';
 
       // Only GENUINE blocks (explicit {blocked:true} / prose) are routed to the
       // Doctor — its remedies (rewrite the prompt, reconnect a service, fix an
@@ -3065,11 +3427,13 @@ async function processOneRunFile(
       // NEVER trigger a blind re-run that doubles irreversible side effects.
       const targetMissed = Boolean(targetVerdict && targetVerdict.judged && !targetVerdict.reached);
       const hasForEachFailures = forEachFailures.length > 0;
-      const needsAttention = blockedSteps.length > 0 || targetMissed || hasForEachFailures;
+      const needsAttention = blockedSteps.length > 0 || targetMissed || hasForEachFailures || goalMissed;
       const attentionReason =
         blockedSteps[0]?.reason ??
         (hasForEachFailures
           ? `${forEachFailures.length} forEach item${forEachFailures.length === 1 ? '' : 's'} failed`
+          : goalMissed
+          ? `pinned goal not met — ${goalDecision?.reason ?? 'criteria unmet'}`
           : targetMissed
           ? `target not confirmed: ${targetVerdict?.gap ?? 'deliverable may not reach the workflow target'}`
           : undefined);
@@ -3077,8 +3441,14 @@ async function processOneRunFile(
       // Cross-fire failure ledger (#6): record this run's outcome so a
       // chronically-failing workflow stops auto-healing + escalates. A clean
       // run resets the streak. (Heal re-runs count too — a fire whose heals all
-      // fail is genuinely stuck, and escalating then is correct.)
-      const ledger = recordWorkflowOutcome(workflow.name, !needsAttention, needsAttention ? attentionReason : undefined);
+      // fail is genuinely stuck, and escalating then is correct. A goal-unmet
+      // re-pursuit counts as a FAILURE so a workflow whose goal never passes
+      // trips the chronic-failure breaker instead of burning attempts forever.)
+      const ledger = recordWorkflowOutcome(
+        workflow.name,
+        !needsAttention && !goalRepursuing,
+        needsAttention ? attentionReason : goalRepursuing ? 'pinned goal unmet — re-pursuing' : undefined,
+      );
       const autoHealPaused = needsAttention && shouldStopAutoHeal(workflow.name);
       const escalationBanner = autoHealPaused
         ? `⚠️ "${workflow.data.name}" has failed ${ledger.consecutiveFailures} runs in a row — auto-heal is PAUSED to stop wasting tokens. Review the blocked step(s) below; if a recent auto-fix caused this, revert it with \`revert heal <id>\`. It resumes automatically after one clean run, and (for a scheduled workflow) consider disabling it until fixed.\n\n`
@@ -3093,7 +3463,44 @@ async function processOneRunFile(
         ...(needsAttention
           ? { needsAttention: true, blockedSteps, proposedFixId: proposedFix?.id ?? null }
           : {}),
+        ...(goalDecision ? { goalOutcome: goalDecision.action, goalReason: goalDecision.reason } : {}),
       });
+
+      // Pinned-goal re-pursuit: the run completed mechanically but its goal is
+      // unmet and a FRESH attempt is already queued (with the validation
+      // evidence folded into its step prompts). Mirror self-heal's
+      // report-and-stop: this run is terminal; the fresh run reports its own
+      // outcome and re-enters the origin chat via the carried originSessionId.
+      if (goalRepursuing) {
+        const attemptNowRunning = (run.goalAttempt ?? 0) + 2;
+        const goalRetryMsg =
+          `🎯 "${workflow.data.name}" finished but its pinned goal isn't met yet:\n${goalFeedbackNext}\n\n`
+          + `Re-running with this feedback — attempt ${attemptNowRunning} of ${runGoal?.maxAttempts ?? attemptNowRunning}`
+          + `${goalRequeueId ? ` (run ${goalRequeueId})` : ''}. It will report back when it finishes.`;
+        addNotification({
+          id: `workflow-${run.id}-goalretry`,
+          kind: 'workflow',
+          title: `Goal re-pursuit: ${workflow.data.name}`,
+          body: goalRetryMsg,
+          createdAt: new Date().toISOString(),
+          read: false,
+          metadata: { workflow: workflow.data.name, runId: run.id, goalRepursuit: true, attempt: attemptNowRunning },
+        });
+        markRunNotified(filePath);
+        try {
+          finishRun(run.id, {
+            status: 'completed',
+            message: `Pinned goal unmet — re-pursuing (attempt ${attemptNowRunning}/${runGoal?.maxAttempts ?? attemptNowRunning})`,
+            outputPreview: goalRetryMsg.slice(0, 800),
+          });
+        } catch { /* best-effort */ }
+        enqueueWorkflowOutcomeTurn(run, workflow.data.name, 'blocked', goalRetryMsg);
+        logger.info(
+          { workflow: workflow.data.name, runId: run.id, newRunId: goalRequeueId, attempt: attemptNowRunning },
+          'pinned goal unmet — re-pursuit queued',
+        );
+        return;
+      }
 
       // Bounded autonomous self-heal: a step blocked with an auto-applicable
       // prompt-rewrite fix → apply it and re-run automatically (bounded +
@@ -3153,7 +3560,15 @@ async function processOneRunFile(
       // fix offer when self-heal produced one. Otherwise today's body.
       // Success body: human-readable (synthesis prose or humanized step
       // results), never a raw JSON dump of the step bookkeeping.
-      const successBody = `${baseSuccessBody}${failureSummary}`;
+      // Pinned-goal verdict rides the body in both lanes: a satisfied goal is
+      // a one-line confirmation; an escalated miss shows the per-criterion
+      // evidence + what to do (the deliverable itself is never hidden).
+      const goalSummary = goalDecision?.action === 'satisfied' && runGoal
+        ? `\n\n🎯 Pinned goal validated — ${runGoal.successCriteria.length > 0 ? `all ${runGoal.successCriteria.length} criteria met` : 'objective met'}.`
+        : goalMissed
+          ? `\n\n🎯 PINNED GOAL NOT MET (${goalDecision?.reason ?? 'criteria unmet'}):\n${goalFeedbackNext || '(no per-criterion detail)'}\n\nThe run's output is above. Re-run the workflow once the gaps are addressed, or adjust the goal.`
+          : '';
+      const successBody = `${baseSuccessBody}${failureSummary}${goalSummary}`;
       // Non-failing quality advisories (skill-execution misses + target-miss):
       // appended to whichever body we send so the deliverable is ALWAYS shown,
       // with a clear "review this" heads-up after it. Never replaces the body.
@@ -3206,8 +3621,9 @@ async function processOneRunFile(
           : hasFailures && !needsAttention
             ? `Workflow completed with ${forEachFailures.length} failure${forEachFailures.length === 1 ? '' : 's'}: ${workflow.data.name}`
             // renderLegibleOutcome titles a no-blocked-step run "completed"; a
-            // target-miss is needs-attention with no blocked step, so title it honestly.
-            : targetMissed && blockedSteps.length === 0
+            // target-miss or goal-miss is needs-attention with no blocked step,
+            // so title it honestly.
+            : (targetMissed || goalMissed) && blockedSteps.length === 0
               ? `⚠️ Workflow needs attention: ${workflow.data.name}`
               : outcome.title,
         // Send the full body. Discord delivery splits long content into
@@ -3312,6 +3728,33 @@ async function processOneRunFile(
               },
             });
           } catch { /* run-events is best-effort; never block parking */ }
+        }
+        // A chat-fired run that just parked tells its origin chat IMMEDIATELY
+        // ("waiting on your approval apr-x"), instead of the user discovering
+        // it hours later from a notification card or the 1h watchdog.
+        // deliverOutcome directly (not enqueueWorkflowOutcomeTurn): the
+        // idempotency prefix is `[workflow run <sourceId> ` and the run's
+        // eventual COMPLETION turn must still land, so the park turn gets its
+        // own sourceId (run id + gate) instead of sharing the run's. A run
+        // that parks on several gates over its life gets one turn per gate.
+        if (run.originSessionId) {
+          const gateKey = approvalIds[0] ?? error.parkedSteps[0]?.stepId ?? 'gate';
+          deliverOutcome(
+            {
+              status: 'needs_input',
+              detail:
+                `The run is PARKED waiting on your approval (step ${error.parkedSteps.map((step) => step.stepId).join(', ') || 'approval gate'}). `
+                + `Reply \`approve ${approvalIds[0] ?? ''}\` or \`reject ${approvalIds[0] ?? ''}\` — it resumes automatically after you decide.`,
+            },
+            {
+              originSessionId: run.originSessionId,
+              sourceLabel: 'workflow run',
+              sourceId: `${run.id}#parked-${gateKey}`,
+              title: workflow.data.name,
+              statusHint: `workflow_run_status run_id="${run.id}"`,
+              proactiveTurn: true,
+            },
+          );
         }
         logger.info(
           { workflow: workflow.data.name, runId: run.id, parkedSteps: error.parkedSteps.map((p) => p.stepId) },

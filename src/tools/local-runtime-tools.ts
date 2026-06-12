@@ -23,7 +23,6 @@ import { registerFocusTools } from './focus-tools.js';
 import { registerMcpStatusTools } from './mcp-status-tools.js';
 import { registerOrchestrationTools } from './orchestration-tools.js';
 import { registerStepResultTool } from './step-result-tool.js';
-import { handlePauseForUserApproval } from '../execution/workflow-pause-gate.js';
 import { registerPlanTools } from './plan-tools.js';
 import { registerProfileTools } from './profile-tools.js';
 import { registerRecallTools } from './recall-tools.js';
@@ -122,43 +121,14 @@ function captureLocalTools(): CapturedLocalTool[] {
   registerOrchestrationTools(server);
   registerStepResultTool(server);
 
-  // Add pause_for_user_approval tool for workflow mid-execution pauses
-  captured.push({
-    name: 'pause_for_user_approval',
-    description:
-      'Pause a workflow step and ask the user for approval before continuing. '
-      + 'The workflow will emit a notification and wait up to 60 minutes for the user to respond with YES/NO. '
-      + 'If approved, execution continues to the next step; if rejected or timeout, the workflow is blocked and reported back.',
-    parameters: {
-      message: z.string().describe('The question or message to show the user, e.g. "Review findings above. Ready to deploy?"'),
-      context_json: z.string().optional().describe('Optional JSON string of context data to include in the notification'),
-    },
-    handler: async (input: Record<string, unknown>) => {
-      const { getToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
-      const ctx = getToolOutputContext();
-      const sessionId = ctx?.sessionId;
-
-      if (!sessionId) {
-        return textResult('Error: pause_for_user_approval works only inside a workflow step (no session context found)');
-      }
-
-      // Parse session ID to extract workflow and step info
-      // Format: workflow:<workflowName>:<runId>:<stepId>
-      const parts = sessionId.split(':');
-      if (parts[0] !== 'workflow' || parts.length < 4) {
-        return textResult(`Error: Invalid workflow session context: ${sessionId}`);
-      }
-
-      const [, workflowName, runId, stepId] = parts;
-      const message = typeof input.message === 'string' ? input.message : '';
-      const context_json = typeof input.context_json === 'string' ? input.context_json : undefined;
-      const result = handlePauseForUserApproval(workflowName, runId, stepId, message, context_json);
-
-      return textResult(
-        `Pause gate created (ID: ${result.gateId}). Workflow paused — user notification sent. Awaiting approval/rejection.`,
-      );
-    },
-  });
+  // NOTE (2026-06-11 audit): the former `pause_for_user_approval` tool was
+  // DELETED here. It was a broken duplicate of the real HITL path — it created
+  // an in-memory gate with no response route, no UI, no durability, and told
+  // the model "awaiting approval" while nothing ever waited. Mid-workflow
+  // human sign-off is the declarative gate: split the step and put
+  // `requiresApproval: true` (+ `approvalPreview`) on the gated step — the
+  // runner registers a durable approval (console + Discord + notifications),
+  // parks the run, and resumes on the user's decision.
 
   registerAgentRunsTools(server);
   registerBackgroundTaskTools(server);

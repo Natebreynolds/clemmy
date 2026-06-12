@@ -25,6 +25,7 @@ function stableJson(value: unknown): string {
 export function findDuplicateQueuedWorkflowRun(
   workflowName: string,
   inputs: Record<string, string>,
+  excludeRunId?: string,
 ): { id: string; status: string } | null {
   if (!existsSync(WORKFLOW_RUNS_DIR)) return null;
   // Normalize BOTH sides so dedupe is correct regardless of whether the
@@ -41,6 +42,10 @@ export function findDuplicateQueuedWorkflowRun(
       const status = typeof parsed.status === 'string' ? parsed.status : 'queued';
       if (status !== 'queued' && status !== 'running') continue;
       if (parsed.workflow !== workflowName) continue;
+      // A requeue-from-run must never see its own SOURCE run as the duplicate
+      // (the source is still status:'running' on disk when a goal re-pursuit
+      // queues the next attempt mid-completion).
+      if (excludeRunId && parsed.id === excludeRunId) continue;
       const existingInputs = normalizeWorkflowRunInputs(
         parsed.inputs && typeof parsed.inputs === 'object' && !Array.isArray(parsed.inputs)
           ? parsed.inputs as Record<string, string>
@@ -76,6 +81,16 @@ export interface QueueWorkflowRunOptions {
   /** Self-heal lineage: how many times this run has already been auto-healed +
    *  re-queued. Carried run→run so the runner can bound auto-heal attempts. */
   selfHealAttempt?: number;
+  /** Run-goal lineage: how many goal re-pursuits already happened (0 = the
+   *  original run). Carried run→run so the runner can bound re-pursuits. */
+  goalAttempt?: number;
+  /** Validation evidence from the prior unmet attempt — folded into every LLM
+   *  step prompt of the re-pursuit so attempt N+1 is targeted, not blind. */
+  goalFeedback?: string;
+  /** Requeue-from-run: the source run's id, excluded from same-inputs dedupe
+   *  (the source is still status:'running' on disk during a mid-completion
+   *  re-pursuit queue, and must not count as "already queued"). */
+  excludeRunId?: string;
 }
 
 export function queueWorkflowRun(
@@ -84,7 +99,7 @@ export function queueWorkflowRun(
   opts?: QueueWorkflowRunOptions,
 ): QueueWorkflowRunResult {
   ensureDir(WORKFLOW_RUNS_DIR);
-  const duplicate = findDuplicateQueuedWorkflowRun(name, normalizedInputs);
+  const duplicate = findDuplicateQueuedWorkflowRun(name, normalizedInputs, opts?.excludeRunId);
   if (duplicate) {
     return {
       status: 'duplicate',
@@ -97,6 +112,10 @@ export function queueWorkflowRun(
   const selfHealAttempt = typeof opts?.selfHealAttempt === 'number' && opts.selfHealAttempt > 0
     ? opts.selfHealAttempt
     : undefined;
+  const goalAttempt = typeof opts?.goalAttempt === 'number' && opts.goalAttempt > 0
+    ? opts.goalAttempt
+    : undefined;
+  const goalFeedback = opts?.goalFeedback?.trim() || undefined;
   writeFileSync(
     path.join(WORKFLOW_RUNS_DIR, `${id}.json`),
     JSON.stringify({
@@ -109,6 +128,8 @@ export function queueWorkflowRun(
       // byte-identical to before (no origin → notification-only).
       ...(origin ? { originSessionId: origin } : {}),
       ...(selfHealAttempt ? { selfHealAttempt } : {}),
+      ...(goalAttempt ? { goalAttempt } : {}),
+      ...(goalFeedback ? { goalFeedback } : {}),
     }, null, 2),
     'utf-8',
   );
@@ -233,6 +254,12 @@ export function requeueWorkflowFromRun(
   // SAME chat (closes the deferred report-back gap), unless the caller overrides.
   const originSessionId = opts.originSessionId
     ?? (typeof rec.originSessionId === 'string' ? rec.originSessionId : undefined);
-  const queued = queueWorkflowRun(workflow, inputs, { originSessionId, selfHealAttempt: opts.selfHealAttempt });
+  const queued = queueWorkflowRun(workflow, inputs, {
+    originSessionId,
+    selfHealAttempt: opts.selfHealAttempt,
+    goalAttempt: opts.goalAttempt,
+    goalFeedback: opts.goalFeedback,
+    excludeRunId: originalRunId,
+  });
   return { status: queued.status, id: queued.id, message: queued.message };
 }

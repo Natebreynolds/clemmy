@@ -684,6 +684,8 @@ export function registerOrchestrationTools(server: McpServer): void {
       + "AUTHORING MODEL: Workflows are AUTONOMOUS BY DEFAULT — they run end-to-end on your one-time consent (enabling), WITHOUT pausing for per-step approval, unless you set `requiresApproval: true` on irreversible actions (sends, publishes). "
       + "Each step does ONE job; outputs flow to dependent steps automatically via `dependsOn`. Steps with the same dependsOn run in parallel. Use forEach for per-item fan-out. "
       + "DECLARE OUTPUT CONTRACTS on any step whose output a later step depends on (type, required_keys, verify.path_exists). The engine verifies before continuing, preventing hollow results from feeding downstream. "
+      + "DECLARE sideEffect on every step ('read' | 'write' | 'send') — it drives the safety law: send steps never auto-retry, crash-resume halts on interrupted writes/sends. "
+      + "PINNED GOAL: declare `goal` to make the workflow run-to-completion — every completed run is validated EXTERNALLY against the goal's success criteria; an unmet goal automatically re-runs the workflow with the validation feedback (bounded by max_attempts, never after an irreversible step executed), and an exhausted goal parks loudly for the user. "
       + "Call workflow_list first to see existing workflow shapes.",
     {
       name: z.string().min(1),
@@ -703,13 +705,21 @@ export function registerOrchestrationTools(server: McpServer): void {
         requiresApproval: z.boolean().optional(),
         approvalPreview: z.string().optional(),
         output: WorkflowStepOutputContractSchema.optional().describe(STEP_OUTPUT_CONTRACT_DESC),
+        sideEffect: z.enum(['read', 'write', 'send']).optional().describe("External side-effect class. 'read' = gathers data only; 'write' = mutates local/remote state reversibly; 'send' = irreversible outbound (email/publish/post). Drives the safety law: send never auto-retries, crash-resume halts on interrupted writes/sends. Declare it — undeclared steps fall back to prose heuristics."),
+        loopUntil: z.object({ maxAttempts: z.number().min(1).max(5).optional() }).optional().describe('Step-level retry-until-contract-passes (plain LLM read steps; write needs loopSafe). Requires an output contract — the contract is the exit condition.'),
+        loopSafe: z.boolean().optional().describe('Author assertion that re-running this WRITE step is idempotent (e.g. an upsert keyed on a stable id). Required for loopUntil on write steps; also allows goal re-pursuit past this step.'),
       })).optional().describe('(Optional) If omitted, I intelligently break down your description into steps. If provided, I still validate and suggest improvements.'),
       trigger_schedule: z.string().optional(),
       inputs: z.string().optional().describe('JSON object mapping input NAMES to {type?, default?, description?}, e.g. {"url":{"type":"string","description":"Site to audit"}}. A JSON string fills reliably under strict-mode function-calling where an open map does not.'),
       synthesis_prompt: z.string().optional(),
-      allowSends: z.boolean().optional().describe('(CHANGE 3) Allow autonomous sends/publishes without approval gates. Defaults to true (autonomous). Set false to require approvalPreview on any send steps.'),
+      allowSends: z.boolean().optional().describe('Allow autonomous sends/publishes without approval gates. Defaults to true (autonomous). Set false for strict mode: any send-looking step must then carry requiresApproval: true or the save is refused.'),
+      goal: z.object({
+        objective: z.string().min(4).describe('What a completed run must achieve — judged externally at run completion.'),
+        success_criteria: z.array(z.string()).optional().describe('Concrete pass/fail criteria (file paths are checked deterministically; the rest go to one strict judge call). Empty → the objective itself is judged.'),
+        max_attempts: z.number().min(1).max(3).optional().describe('Total run attempts (original + automatic re-pursuits). Default 2, ceiling 3 — re-pursuit re-runs the whole workflow.'),
+      }).optional().describe('PINNED RUN GOAL (run-to-completion): the run is validated externally against these criteria at completion; unmet → automatic re-run with the validation feedback folded into every step prompt (never after an irreversible step executed); exhausted → parks loudly with per-criterion evidence.'),
     },
-    async ({ name, description, steps, trigger_schedule, inputs, synthesis_prompt, allowSends }) => {
+    async ({ name, description, steps, trigger_schedule, inputs, synthesis_prompt, allowSends, goal }) => {
       // INTELLIGENT WORKFLOW CREATION:
       // If steps not provided, analyze the description and generate steps intelligently
       let finalSteps = steps;
@@ -783,8 +793,12 @@ export function registerOrchestrationTools(server: McpServer): void {
           requiresApproval: s.requiresApproval,
           approvalPreview: s.approvalPreview,
           output: s.output,
+          sideEffect: s.sideEffect,
+          loopUntil: s.loopUntil,
+          loopSafe: s.loopSafe,
         })),
         ...(allowSends !== undefined ? { allowSends } : {}),
+        ...(goal ? { goal: { objective: goal.objective, successCriteria: goal.success_criteria, maxAttempts: goal.max_attempts } } : {}),
         inputs: Object.keys(inputsSchema).length > 0 ? inputsSchema : undefined,
         synthesis: synthesis_prompt ? { prompt: synthesis_prompt } : undefined,
       };
@@ -1175,16 +1189,26 @@ export function registerOrchestrationTools(server: McpServer): void {
         forEach: z.string().optional(),
         allowedTools: z.array(z.string()).optional(),
         requiresApproval: z.boolean().optional().describe('Set true to pause this step for user approval before execution (for irreversible sends / publishes).'),
+        approvalPreview: z.string().optional().describe('One-line preview shown on the approval card when requiresApproval is set.'),
         usesSkill: z.string().optional().describe('Installed skill directory name (under skills/). For repeatable transforms, prefer one usesSkill step over many hand-wired prompt steps.'),
         output: WorkflowStepOutputContractSchema.optional().describe(STEP_OUTPUT_CONTRACT_DESC),
+        sideEffect: z.enum(['read', 'write', 'send']).optional().describe("External side-effect class ('read' | 'write' | 'send'). Drives the safety law: send never auto-retries, crash-resume halts on interrupted writes/sends."),
+        loopUntil: z.object({ maxAttempts: z.number().min(1).max(5).optional() }).optional().describe('Step-level retry-until-contract-passes (plain LLM read steps; write needs loopSafe). Requires an output contract.'),
+        loopSafe: z.boolean().optional().describe('Author assertion that re-running this WRITE step is idempotent. Required for loopUntil on write steps; also allows goal re-pursuit past this step.'),
       })).optional(),
       trigger_schedule: z.string().optional(),
       clear_trigger_schedule: z.boolean().optional().describe('Pass true to remove an existing schedule (e.g. switch back to manual-only).'),
       inputs: z.string().optional().describe('JSON object mapping input NAMES to {type?, default?, description?}, e.g. {"url":{"type":"string","description":"Site to audit"}}. Pass only to change the input schema; omit to preserve it.'),
       synthesis_prompt: z.string().optional(),
-      allowSends: z.boolean().optional().describe('(CHANGE 3) Allow autonomous sends/publishes without approval gates. Defaults to true (autonomous). Set false to require approvalPreview on any send steps.'),
+      allowSends: z.boolean().optional().describe('Allow autonomous sends/publishes without approval gates. Defaults to true (autonomous). Set false for strict mode: any send-looking step must then carry requiresApproval: true or the save is refused.'),
+      goal: z.object({
+        objective: z.string().min(4).describe('What a completed run must achieve — judged externally at run completion.'),
+        success_criteria: z.array(z.string()).optional().describe('Concrete pass/fail criteria. Empty → the objective itself is judged.'),
+        max_attempts: z.number().min(1).max(3).optional().describe('Total run attempts (original + automatic re-pursuits). Default 2, ceiling 3.'),
+      }).optional().describe('PINNED RUN GOAL (run-to-completion) — see workflow_create. Pass to set/replace; use clear_goal to remove.'),
+      clear_goal: z.boolean().optional().describe('Pass true to remove an existing pinned goal.'),
     },
-    async ({ name, description, steps, trigger_schedule, clear_trigger_schedule, inputs, synthesis_prompt, allowSends }) => {
+    async ({ name, description, steps, trigger_schedule, clear_trigger_schedule, inputs, synthesis_prompt, allowSends, goal, clear_goal }) => {
       let inputsSchema: Record<string, { type?: 'string' | 'number'; default?: string; description?: string }>;
       try {
         inputsSchema = parseWorkflowInputsSchemaJson(inputs);
@@ -1223,8 +1247,12 @@ export function registerOrchestrationTools(server: McpServer): void {
           forEach: s.forEach,
           allowedTools: s.allowedTools,
           requiresApproval: s.requiresApproval,
+          approvalPreview: s.approvalPreview,
           usesSkill: s.usesSkill,
           output: s.output,
+          sideEffect: s.sideEffect,
+          loopUntil: s.loopUntil,
+          loopSafe: s.loopSafe,
         }));
       }
       // Tight authoring: bind any newly-provided steps to proven tool-choices.
@@ -1232,6 +1260,11 @@ export function registerOrchestrationTools(server: McpServer): void {
       if (inputsProvided) next.inputs = inputsSchema;
       if (synthesis_prompt !== undefined) next.synthesis = { prompt: synthesis_prompt };
       if (allowSends !== undefined) next.allowSends = allowSends;
+      if (clear_goal) {
+        delete next.goal;
+      } else if (goal) {
+        next.goal = { objective: goal.objective, successCriteria: goal.success_criteria, maxAttempts: goal.max_attempts };
+      }
 
       const currentTrigger = next.trigger ?? { manual: true };
       if (clear_trigger_schedule) {
@@ -1410,6 +1443,24 @@ export function registerOrchestrationTools(server: McpServer): void {
         if (!existsSync(filePath)) return textResult(`Workflow run "${run_id}" not found.`);
         try {
           const record = JSON.parse(readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
+          // Per-step ledger: which steps produced what / which blocked — the
+          // detail a user actually needs to diagnose "step 3 of 7 failed"
+          // without opening the console. Values truncated; the run record on
+          // disk keeps the full outputs.
+          const stepOutputs = record.stepOutputs && typeof record.stepOutputs === 'object' && !Array.isArray(record.stepOutputs)
+            ? Object.entries(record.stepOutputs as Record<string, unknown>)
+            : [];
+          const blockedSteps = Array.isArray(record.blockedSteps)
+            ? (record.blockedSteps as Array<{ stepId?: unknown; reason?: unknown }>)
+            : [];
+          const blockedIds = new Set(blockedSteps.map((b) => String(b.stepId ?? '')));
+          const stepLines = stepOutputs.map(([id, out]) => {
+            const text = typeof out === 'string' ? out : JSON.stringify(out);
+            const clipped = text && text.length > 300 ? `${text.slice(0, 300)}…` : (text || '(empty)');
+            return `  - ${id}${blockedIds.has(id) ? ' [BLOCKED]' : ''}: ${clipped}`;
+          });
+          const blockedLines = blockedSteps.map((b) => `  - ${String(b.stepId ?? '?')}: ${String(b.reason ?? '(no reason recorded)')}`);
+          const output = typeof record.output === 'string' ? record.output : '';
           const lines = [
             `Run ${run_id}`,
             `Workflow: ${record.workflow ?? '(unknown)'}`,
@@ -1417,7 +1468,11 @@ export function registerOrchestrationTools(server: McpServer): void {
             record.createdAt ? `Created: ${record.createdAt}` : '',
             record.finishedAt ? `Finished: ${record.finishedAt}` : '',
             record.inputs && Object.keys(record.inputs).length > 0 ? `Inputs: ${JSON.stringify(record.inputs)}` : '',
+            record.goalOutcome ? `Pinned goal: ${record.goalOutcome}${record.goalReason ? ` — ${record.goalReason}` : ''}` : '',
             record.error ? `Error: ${record.error}` : '',
+            blockedLines.length > 0 ? `Blocked steps:\n${blockedLines.join('\n')}` : '',
+            stepLines.length > 0 ? `Step results:\n${stepLines.join('\n')}` : '',
+            output ? `Final output (truncated):\n${output.length > 1500 ? `${output.slice(0, 1500)}…` : output}` : '',
           ].filter(Boolean);
           return textResult(lines.join('\n'));
         } catch (err) {

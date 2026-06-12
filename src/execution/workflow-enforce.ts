@@ -152,25 +152,20 @@ function hasEnforcedApprovalGate(def: WorkflowDefinition): boolean {
 }
 
 /**
- * Author/enable-time send-gate check: an ENABLED workflow that performs an
- * irreversible send/publish must carry an enforced approval gate
- * (`requiresApproval: true` on a step), so the runner holds the run for
- * ONE batch approval before anything leaves the building. A disabled
- * workflow can't fire, so it's never blocked here — disable to draft.
+ * Author/enable-time send-gate check. AUTONOMOUS-BY-DEFAULT (CHANGE 3,
+ * 2026-06): approval gates are OPT-IN via `requiresApproval: true` on a step;
+ * an enabled workflow with send steps and no gate saves cleanly. Strict mode
+ * is `allowSends: false` at the workflow root — then any send-looking step
+ * without a gate REFUSES the save. (Runtime safety is independent of this
+ * authoring check: the verified-sender constraint gate and the grounding gate
+ * still run on every actual send, and a declarative gate on a send-class step
+ * is never auto-approved on unattended scheduled runs.)
  *
- * Returns the error strings (empty when clean). Caller already gates on
- * the WORKFLOW_TYPED_CONTRACT flag.
+ * Returns the error strings (empty when clean). Validation is unconditional
+ * (the old WORKFLOW_TYPED_CONTRACT rollout flag was removed 2026-05-31).
  */
 export function checkSendGate(def: WorkflowDefinition): string[] {
-  // CHANGE 3: Flexible approval gates
-  // Approval gates are now OPT-IN via requiresApproval: true, not automatic.
-  // This allows users to create autonomous workflows without gates,
-  // while still offering approval when needed.
-  //
-  // If a user wants to ENFORCE approval gates (the old strict behavior),
-  // they can set allowSends: false at the workflow root.
-
-  const allowSends = (def as any).allowSends !== false; // default: true (allow autonomous sends)
+  const allowSends = def.allowSends !== false; // default: true (allow autonomous sends)
 
   if (!def.enabled) return [];
   if (hasEnforcedApprovalGate(def)) return [];
@@ -220,6 +215,9 @@ function executionSurfaceProjection(def: WorkflowDefinition): string {
     inputs: def.inputs ?? null,
     synthesis: def.synthesis ?? null,
     allowSends: (def as { allowSends?: boolean }).allowSends !== false,
+    // The pinned run goal changes what a run must PROVE (validation +
+    // re-pursuit), so editing it is an execution-surface change → re-smoke.
+    goal: def.goal ?? null,
   });
 }
 
@@ -268,6 +266,33 @@ export function checkLoopUntilAuthoring(def: WorkflowDefinition): string[] {
         `Step "${step.id}" declares loop_until on a WRITE step without loop_safe: true. Re-running a write is only safe when it is idempotent (e.g. an upsert keyed on a stable id) — assert that with loop_safe: true, or set sideEffect: read if the step doesn't actually mutate.`,
       );
     }
+  }
+  return errors;
+}
+
+/**
+ * Author/enable-time pinned-goal law (run-scope goal contract). Mirrors the
+ * runtime normalizer (workflowRunGoal in workflow-runner.ts) so a goal that
+ * would silently no-op at runtime is refused at save time:
+ *  - a declared goal needs a real objective (≥4 chars after trim)
+ *  - maxAttempts outside 1..3 is refused (runtime clamps, but authoring
+ *    should say so instead of silently changing the number)
+ * A goal with no success criteria is allowed — validation falls back to
+ * judging the objective itself (same semantics as a criteria-less /goal).
+ */
+export function checkGoalAuthoring(def: WorkflowDefinition): string[] {
+  const g = def.goal;
+  if (!g) return [];
+  const errors: string[] = [];
+  if (!g.objective || g.objective.trim().length < 4) {
+    errors.push(
+      'Workflow declares a goal with no usable objective. Give it a concrete objective (what a completed run must achieve), or remove the goal block.',
+    );
+  }
+  if (g.maxAttempts !== undefined && (!Number.isFinite(g.maxAttempts) || g.maxAttempts < 1 || g.maxAttempts > 3)) {
+    errors.push(
+      `Goal max_attempts must be 1..3 total run attempts (got ${g.maxAttempts}). Re-pursuit re-runs the WHOLE workflow, so the ceiling is deliberately small.`,
+    );
   }
   return errors;
 }
@@ -475,7 +500,7 @@ export function checkWorkflowForWrite(def: WorkflowDefinition): WorkflowWriteChe
     rememberedToolChoices = undefined;
   }
   const result = validateWorkflowDefinition(toFrontmatter(def), { rememberedToolChoices });
-  const errors = [...result.errors, ...checkSendGate(def), ...checkLoopUntilAuthoring(def), ...checkDependencyBinding(def)];
+  const errors = [...result.errors, ...checkSendGate(def), ...checkLoopUntilAuthoring(def), ...checkGoalAuthoring(def), ...checkDependencyBinding(def)];
   // Runnability constraints are non-blocking (demoted to warnings per graceful degradation design)
   const runnabilityWarnings = checkRunnabilityConstraints(def);
   const warnings = [...result.warnings, ...runnabilityWarnings];

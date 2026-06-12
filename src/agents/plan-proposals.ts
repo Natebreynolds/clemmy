@@ -673,6 +673,69 @@ export function createDirectGoal(input: {
   return activateGoal(proposal.id, { origin: { kind: 'chat' }, maxAttempts: input.maxAttempts });
 }
 
+/** Synthetic session key for a workflow's run-level goal contract — one
+ *  active goal per workflow, shared across re-pursuit runs. */
+export function workflowGoalSessionId(workflowName: string): string {
+  return `workflow-goal:${workflowName}`;
+}
+
+/**
+ * Workflow run-goal front door: find-or-create the ACTIVE goal contract for a
+ * workflow's pinned run goal. Re-pursuit runs of the same workflow reuse the
+ * existing active contract (evidence + attempt lineage accumulate across
+ * runs); a fresh fire after the prior contract resolved creates a new one.
+ * Workflow-origin goals are exempt from the daily idle reaper — they live and
+ * die with their runs (satisfied on pass, expired on exhaustion).
+ */
+export function ensureWorkflowRunGoal(input: {
+  workflowName: string;
+  runId: string;
+  objective: string;
+  successCriteria?: string[];
+  maxAttempts?: number;
+}): PlanProposal | null {
+  const objective = input.objective.trim();
+  if (objective.length < 4 || !input.workflowName) return null;
+  const sessionId = workflowGoalSessionId(input.workflowName);
+  const existing = getActiveGoalForSession(sessionId);
+  if (existing) {
+    // Same objective → same contract (re-pursuit lineage accumulates).
+    // CHANGED objective (the workflow's goal: block was edited between
+    // fires) → the old contract is stale; supersede it so its evidence
+    // doesn't pollute the new goal's lineage. activateGoal below enforces
+    // one-active-per-session, which performs the supersede.
+    const existingObjective = (existing.approvedPlan ?? existing.plan).objective?.trim();
+    if (existingObjective === objective) return existing;
+  }
+  const now = new Date().toISOString();
+  const criteria = (input.successCriteria ?? []).map((c) => c.trim()).filter(Boolean);
+  const proposal: PlanProposal = {
+    id: `goal-${randomUUID().slice(0, 8)}`,
+    proposedAt: now,
+    proposedByAgent: 'clementine',
+    status: 'pending',
+    originatingRequest: `Workflow "${input.workflowName}" pinned run goal: ${objective}`,
+    sessionId,
+    channel: 'workflow',
+    plan: {
+      objective,
+      steps: [{ n: 1, action: `Run workflow "${input.workflowName}" until the goal is met.`, rationale: 'Pinned workflow run goal.', verification: null }],
+      successCriteria: criteria,
+      risks: [],
+      estimatedComplexity: 'moderate',
+      recommendsTrackedExecution: false,
+      needsUserInput: [],
+      appliedInstructions: [],
+    },
+    version: 'v1',
+  };
+  writeProposal(proposal);
+  return activateGoal(proposal.id, {
+    origin: { kind: 'workflow', runId: input.runId },
+    maxAttempts: input.maxAttempts,
+  });
+}
+
 /**
  * Render the origin session's parked goal for DELEGATED work (sub-agents,
  * background tasks) — the replacement for the deleted Active Task pin.
