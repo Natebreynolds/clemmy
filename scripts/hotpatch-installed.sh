@@ -118,6 +118,25 @@ FILES=(
   "runtime/harness/guardrails.js"
   "runtime/harness/loop.js"
   "runtime/harness/codex-model.js"
+  # 29eefe8 — schema-grounded composio validation + self-healing
+  "tools/composio-batch-validator.js"
+  "tools/composio-schema-cache.js"
+  # 99ff437 — pinned run goals + HITL repair (workflow lifecycle)
+  "execution/workflow-enforce.js"
+  "execution/workflow-runner.js"
+  "memory/workflow-store.js"
+  "tools/orchestration-tools.js"
+  "tools/workflow-run-queue.js"
+)
+
+# Modules DELETED from the codebase whose orphaned .js must be removed
+# from the installed dist, or patched files that no longer import them
+# leave a stale mixed-state bundle.
+DELETED_FILES=(
+  # 99ff437 — deletion-first workflow lifecycle (pause-gate trap removed)
+  "execution/workflow-pause-gate.js"
+  "runtime/harness/graceful-tool-execution.js"
+  "runtime/harness/tool-composition-detector.js"
 )
 
 # Sanity-check every source file exists in the local dist BEFORE we
@@ -142,6 +161,18 @@ for f in "${FILES[@]}"; do
   if [[ -f "$INSTALLED_DIST/$f" ]]; then
     mkdir -p "$BACKUP/$(dirname "$f")"
     cp "$INSTALLED_DIST/$f" "$BACKUP/$f"
+  fi
+done
+
+echo "→ Removing deleted modules from installed dist:"
+for f in "${DELETED_FILES[@]}"; do
+  if [[ -f "$INSTALLED_DIST/$f" ]]; then
+    mkdir -p "$BACKUP/$(dirname "$f")"
+    cp "$INSTALLED_DIST/$f" "$BACKUP/$f"
+    rm "$INSTALLED_DIST/$f"
+    echo "  ✓ removed $f (backed up)"
+  else
+    echo "  · $f already absent"
   fi
 done
 

@@ -27,7 +27,10 @@ import { EventEmitter } from 'node:events';
 
 const require = createRequire(import.meta.url);
 const REPO_ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
-const DAEMON_DIST = path.join(REPO_ROOT, 'dist');
+// CLEMMY_VERIFY_DIST lets the suite run against an alternate compiled
+// dist — e.g. the installed Clementine.app daemon after hotpatch:
+//   CLEMMY_VERIFY_DIST="/Applications/Clementine.app/Contents/Resources/daemon/dist" node scripts/verify-tool-recall-fidelity.mjs --all
+const DAEMON_DIST = process.env.CLEMMY_VERIFY_DIST || path.join(REPO_ROOT, 'dist');
 
 if (!existsSync(path.join(DAEMON_DIST, 'runtime/harness/loop.js'))) {
   console.error('✗ dist/ not built. Run: npm run build');
