@@ -112,7 +112,7 @@ test('output.verify (verifiable handles) round-trips', () => {
   assert.deepEqual(s?.output?.verify?.url_present, ['netlifyUrl']);
 });
 
-test('P0-3 sideEffect round-trips as side_effect (read is implicit, not serialized)', () => {
+test('P0-3 sideEffect round-trips as side_effect — INCLUDING read', () => {
   writeWorkflow('side-rt', {
     name: 'side-rt', description: 'side-effect round-trip', enabled: true, trigger: { manual: true },
     steps: [
@@ -122,8 +122,11 @@ test('P0-3 sideEffect round-trips as side_effect (read is implicit, not serializ
     ],
   });
   const steps = readWorkflow('side-rt')!.data.steps;
-  // 'read' is the default → not serialized, so it reads back undefined (heuristic fallback at runtime).
-  assert.equal(steps.find((x) => x.id === 'pull')?.sideEffect, undefined);
+  // A declared 'read' MUST survive rewrite. Undeclared ≠ read: undeclared
+  // falls back to the prose heuristic, which has misclassified read-only
+  // steps as write and parked them on crash-resume (scorpion-facebook-trends
+  // 2026-06-11). Dropping 'read' on rewrite silently resurrected that trap.
+  assert.equal(steps.find((x) => x.id === 'pull')?.sideEffect, 'read');
   assert.equal(steps.find((x) => x.id === 'save')?.sideEffect, 'write');
   assert.equal(steps.find((x) => x.id === 'send')?.sideEffect, 'send');
 });

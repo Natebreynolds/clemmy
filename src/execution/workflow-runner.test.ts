@@ -1018,8 +1018,20 @@ test('P0-3 halts crash-resume of an autonomous write/send step', () => {
     { id: 'save', prompt: 'Write to the sheet.', sideEffect: 'write', dependsOn: ['pull'] },
     { id: 'send', prompt: 'Email the batch.', sideEffect: 'send', dependsOn: ['save'] },
   ]);
-  assert.deepEqual(shouldHaltResumeForSideEffect(wf, resumeState('save', ['pull'])), { stepId: 'save', cls: 'write' });
-  assert.deepEqual(shouldHaltResumeForSideEffect(wf, resumeState('send', ['pull', 'save'])), { stepId: 'send', cls: 'send' });
+  assert.deepEqual(shouldHaltResumeForSideEffect(wf, resumeState('save', ['pull'])), { stepId: 'save', cls: 'write', declared: true });
+  assert.deepEqual(shouldHaltResumeForSideEffect(wf, resumeState('send', ['pull', 'save'])), { stepId: 'send', cls: 'send', declared: true });
+});
+
+test('P0-3 halt reports declared=false when the class was only inferred from prose', () => {
+  // The scorpion-facebook-trends failure mode: no declared sideEffect, prose
+  // heuristic guesses write → halt. The message uses declared=false to teach
+  // the one-line `sideEffect: read` fix.
+  const wf = wfWith([
+    { id: 'scrape', prompt: 'Normalize the scraped page data and write rows into the result.' },
+  ]);
+  const halt = shouldHaltResumeForSideEffect(wf, resumeState('scrape'));
+  assert.ok(halt, 'inferred write step should halt');
+  assert.equal(halt?.declared, false);
 });
 
 test('P0-3 does NOT halt a read step, a completed step, or the targeted re-run path', () => {
@@ -1053,7 +1065,7 @@ test('P0-3 runtime-request_approval park is exempt (in-flight step has a step_fa
     { id: 'send', prompt: 'Email the batch.', sideEffect: 'send' },
   ]);
   // Without the park marker it WOULD halt (plain crashed send) …
-  assert.deepEqual(shouldHaltResumeForSideEffect(wf, resumeState('send')), { stepId: 'send', cls: 'send' });
+  assert.deepEqual(shouldHaltResumeForSideEffect(wf, resumeState('send')), { stepId: 'send', cls: 'send', declared: true });
   // … with a logged step_failed (the park signature) it is exempt.
   assert.equal(shouldHaltResumeForSideEffect(wf, resumeState('send', [], ['send'])), null);
 });
@@ -1081,7 +1093,7 @@ test('P0-3 end-to-end: park → approve → crash mid-send HALTS (closes the dou
   appendWorkflowEvent(slug, 'r1', { kind: 'step_started', stepId: 'send' });
   assert.deepEqual(
     shouldHaltResumeForSideEffect(wf, computeResumeState(slug, 'r1')),
-    { stepId: 'send', cls: 'send' },
+    { stepId: 'send', cls: 'send', declared: true },
     'post-approval mid-send crash halts',
   );
 });

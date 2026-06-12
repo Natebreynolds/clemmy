@@ -2274,14 +2274,18 @@ export function shouldHaltResumeForSideEffect(
   workflow: WorkflowDefinition,
   resume: { inFlightStepId?: string; completedSteps: Map<string, unknown>; failedSteps?: Set<string> },
   targetStepId?: string,
-): { stepId: string; cls: 'write' | 'send' } | null {
+): { stepId: string; cls: 'write' | 'send'; declared: boolean } | null {
   if (targetStepId) return null;
   const id = resume.inFlightStepId;
   if (!id || resume.completedSteps.has(id) || resume.failedSteps?.has(id)) return null;
   const crashed = workflow.steps.find((s) => s.id === id);
   if (!crashed || crashed.requiresApproval === true || crashed.forEach) return null;
   const cls = stepSideEffectClass(crashed);
-  return cls === 'read' ? null : { stepId: id, cls };
+  // `declared` distinguishes an explicit sideEffect from a prose-heuristic
+  // guess — the halt message uses it to teach the one-line fix when the
+  // class was only inferred (inferred read-only steps parking on crash was
+  // the scorpion-facebook-trends failure mode, 2026-06-11).
+  return cls === 'read' ? null : { stepId: id, cls, declared: crashed.sideEffect === cls };
 }
 
 async function executeWorkflow(
@@ -2310,7 +2314,10 @@ async function executeWorkflow(
       `Step "${resumeHalt.stepId}" was interrupted mid-run on a prior attempt and may have already ` +
       `${resumeHalt.cls === 'send' ? 'sent or published' : 'written'} some items. It was NOT automatically ` +
       `re-run, to avoid duplicates. Review what it did, then re-run the workflow (or just that ` +
-      `step) manually once you've confirmed it's safe.`,
+      `step) manually once you've confirmed it's safe. ` +
+      `NOTE: this step's class was ${resumeHalt.declared ? `declared sideEffect: ${resumeHalt.cls}` : `INFERRED as "${resumeHalt.cls}" from its prose (no sideEffect declared)`}. ` +
+      `If the step is actually read-only (scrape/fetch/query — safe to repeat), declare \`sideEffect: read\` on it ` +
+      `in the workflow definition and it will auto-resume after interruptions instead of parking here.`,
     );
   }
 
