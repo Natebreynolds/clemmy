@@ -125,8 +125,13 @@ test('Orchestrator is now the single agent — carries the union of all action t
   // requires for the north-star workflow ("get request → search
   // memory → call tools → done").
   const required = [
-    // Memory (read + write)
+    // Memory (read + write + standing-instruction lifecycle). pin/forget/
+    // restore must ALL be present: memory_forget refuses a pinned fact and
+    // routes recovery through memory_pin pinned=false → memory_forget →
+    // memory_restore; a missing link dead-ends that path and pushes the model
+    // to raw SQL (2026-06-12 regression guard).
     'memory_recall', 'memory_search', 'memory_read', 'memory_remember', 'memory_list_facts',
+    'memory_forget', 'memory_pin', 'memory_restore',
     // Composio (discover + execute)
     'composio_search_tools', 'composio_execute_tool', 'composio_status',
     // Shell + filesystem

@@ -676,6 +676,18 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       // the "ever-learning" loop — Clementine has to be able to correct
       // her own memory, not just write to it.
       'memory_forget',
+      // memory_pin / memory_restore added 2026-06-12: memory_forget refuses a
+      // PINNED standing instruction and tells the model to memory_pin
+      // pinned=false FIRST — but memory_pin was registered (memory-tools.ts)
+      // and NOT on this surface, so that recovery path dead-ended and the
+      // model fell back to raw `sqlite3` against memory.db (bypassing every
+      // guard). memory_restore (reactivate a soft-deleted fact) closes the
+      // inverse gap. Same omission class as the workspace/browser-harness
+      // blocks above. The catalog.ts LOCAL_MCP_TOOL_NAMES list is a DIFFERENT
+      // surface (CLI / workflow-architect) — THIS curated list is what the
+      // harness orchestrator actually gets.
+      'memory_pin',
+      'memory_restore',
       // Workspace + files
       'workspace_config',
       'workspace_roots',
