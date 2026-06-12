@@ -1,4 +1,9 @@
-import { validateComposioBatchOperation, formatBatchValidationError } from './composio-batch-validator.js';
+import {
+  validateComposioBatchOperation,
+  validateComposioArgs,
+  validateArgsAgainstSchema,
+  formatBatchValidationError,
+} from './composio-batch-validator.js';
 
 // Test batch validation detects empty items
 {
@@ -40,6 +45,62 @@ import { validateComposioBatchOperation, formatBatchValidationError } from './co
   }
 }
 
+// Test Airtable-style batch update ({ id, fields }) is NOT falsely blocked
+{
+  const error = validateComposioBatchOperation('AIRTABLE_BATCH_UPDATE_RECORDS', {
+    records: [
+      { id: 'rec1', fields: { Name: 'ok' } },
+      { id: 'rec2', fields: { Name: 'also ok' } },
+    ],
+  });
+  if (error !== null) {
+    throw new Error('Should accept Airtable-style { id, fields } batch items');
+  }
+}
+
+// Test Airtable-style item missing update content is still blocked
+{
+  const error = validateComposioBatchOperation('AIRTABLE_BATCH_UPDATE_RECORDS', {
+    records: [{ id: 'rec1', fields: { Name: 'ok' } }, { id: 'rec2' }],
+  });
+  if (!error || !error.reason.includes('update content')) {
+    throw new Error('Should block Airtable batch item with no update content');
+  }
+}
+
+// Test Google Sheets-style batch update ({ range, values }) is NOT falsely blocked
+// (exact live arg shape from harness.db: GOOGLESHEETS_BATCH_UPDATE_VALUES)
+{
+  const error = validateComposioBatchOperation('GOOGLESHEETS_BATCH_UPDATE_VALUES', {
+    spreadsheet_id: 'sheet1',
+    value_input_option: 'RAW',
+    data: [{ range: 'Sheet1!A1:B2', values: [['a', 'b']] }],
+  });
+  if (error !== null) {
+    throw new Error('Should accept Sheets-style { range, values } batch items');
+  }
+}
+
+// Test Sheets-style item with a range but no values is still blocked
+{
+  const error = validateComposioBatchOperation('GOOGLESHEETS_BATCH_UPDATE_VALUES', {
+    data: [{ range: 'Sheet1!A1:B2' }],
+  });
+  if (!error || !error.reason.includes('update content')) {
+    throw new Error('Should block Sheets batch item with no update content');
+  }
+}
+
+// Test Sheets-style item with values but no write target is still blocked
+{
+  const error = validateComposioBatchOperation('GOOGLESHEETS_BATCH_UPDATE_VALUES', {
+    data: [{ values: [['a', 'b']] }],
+  });
+  if (!error || !error.reason.includes('missing ID')) {
+    throw new Error('Should block Sheets batch item with no range/id target');
+  }
+}
+
 // Test batch validation ignores non-batch operations
 {
   const error = validateComposioBatchOperation('OUTLOOK_OUTLOOK_SEND_EMAIL', {
@@ -66,3 +127,111 @@ import { validateComposioBatchOperation, formatBatchValidationError } from './co
     }
   }
 }
+
+// ─── Schema-grounded validation ──────────────────────────────────────
+
+// THE FUTURE-PROOF PROOF: a brand-new toolkit whose items are keyed by a
+// non-`*id` identity ('sku') — the one shape class the structural
+// heuristic still cannot recognize. The heuristic blocks it; the real
+// schema passes it. No code change needed for new toolkits.
+{
+  const args = { items: [{ sku: 'ABC-123', qty: 5 }] };
+  const heuristic = validateComposioArgs('INVENTORY_BATCH_UPDATE_STOCK', args, null);
+  if (heuristic.mode !== 'heuristic' || heuristic.error === null) {
+    throw new Error('Heuristic should block the sku-keyed shape (proves the schema is what saves it)');
+  }
+  const schema = {
+    type: 'object',
+    required: ['items'],
+    properties: { items: { type: 'array', items: { type: 'object', required: ['sku', 'qty'] } } },
+  };
+  const grounded = validateComposioArgs('INVENTORY_BATCH_UPDATE_STOCK', args, schema);
+  if (grounded.mode !== 'schema' || grounded.error !== null) {
+    throw new Error('Real schema must override the heuristic and pass the valid shape');
+  }
+}
+
+// Structural heuristic accepts ANY identity+content pairing without
+// vocabulary: message_id+patch, message_id+is_read, row_ids+cells —
+// shapes never enumerated anywhere in this file.
+{
+  for (const item of [
+    { message_id: 'm1', patch: { isRead: true } },
+    { message_id: 'm1', is_read: true },
+    { row_ids: ['r1', 'r2'], cells: { A: 1 } },
+  ]) {
+    const error = validateComposioBatchOperation('ANYTOOL_BATCH_UPDATE_THINGS', { updates: [item] });
+    if (error !== null) {
+      throw new Error(`Structural heuristic should accept identity+content item: ${JSON.stringify(item)}`);
+    }
+  }
+}
+
+// Schema catches a missing required top-level field, naming the real fields
+{
+  const schema = { type: 'object', required: ['spreadsheet_id', 'data'], properties: {} };
+  const error = validateArgsAgainstSchema('GOOGLESHEETS_BATCH_UPDATE_VALUES', { data: [] }, schema);
+  if (!error || !error.reason.includes('spreadsheet_id')) {
+    throw new Error('Schema validation should name the real missing required field');
+  }
+}
+
+// Schema catches a batch item missing a required item field
+{
+  const schema = {
+    type: 'object',
+    required: ['data'],
+    properties: { data: { type: 'array', items: { type: 'object', required: ['range', 'values'] } } },
+  };
+  const error = validateArgsAgainstSchema('GOOGLESHEETS_BATCH_UPDATE_VALUES', { data: [{ range: 'A1' }] }, schema);
+  if (!error || !error.reason.includes('values')) {
+    throw new Error('Schema validation should catch missing required item field');
+  }
+}
+
+// Extra keys and type mismatches are NOT blocked (presence-only contract;
+// types are Composio's job)
+{
+  const schema = { type: 'object', required: ['id'], properties: { id: { type: 'string' } } };
+  const error = validateArgsAgainstSchema('ANY_TOOL', { id: 12345, bonus_key: true }, schema);
+  if (error !== null) {
+    throw new Error('Presence-only: extra keys and type mismatches must pass');
+  }
+}
+
+// Fail-open on malformed schemas — junk must never block a dispatch
+{
+  for (const junk of [
+    { required: 'not-an-array' },
+    { required: [42, null] },
+    { properties: 'nope', required: [] },
+    {},
+  ]) {
+    const error = validateArgsAgainstSchema('ANY_TOOL', { whatever: 1 }, junk as Record<string, unknown>);
+    if (error !== null) {
+      throw new Error(`Malformed schema must fail open, got block for: ${JSON.stringify(junk)}`);
+    }
+  }
+}
+
+// Mode selection: schema present → 'schema', absent → 'heuristic'
+{
+  if (validateComposioArgs('X', {}, { type: 'object' }).mode !== 'schema') {
+    throw new Error('Should select schema mode when a schema is supplied');
+  }
+  if (validateComposioArgs('X', {}, null).mode !== 'heuristic') {
+    throw new Error('Should select heuristic mode when no schema is supplied');
+  }
+}
+
+// Heuristic-mode block message teaches the self-fix path
+{
+  const error = validateComposioBatchOperation('OUTLOOK_BATCH_UPDATE_MESSAGES', { updates: [{ id: 'm1' }] });
+  if (!error) throw new Error('precondition: should block');
+  const msg = formatBatchValidationError(error, 'OUTLOOK_BATCH_UPDATE_MESSAGES', 'heuristic');
+  if (!msg.includes('composio_search_tools') || !msg.includes('do NOT guess or rename keys')) {
+    throw new Error('Heuristic block must teach the schema-fetch recovery path');
+  }
+}
+
+console.log('composio-batch-validator tests passed');

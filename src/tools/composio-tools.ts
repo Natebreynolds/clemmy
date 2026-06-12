@@ -20,7 +20,9 @@ import { maybeDiscoveryAdvisory, isDescribeSlug, toolkitOfSlug, describeSignatur
 import { isTransientStepError } from '../execution/transient-error.js';
 import { checkConstraintViolation, formatConstraintEscalation, findEmailSendConstraint, renderToolkitConstraintBanner } from '../runtime/harness/constraint-guard.js';
 import { resolveCompliantSenderConnection } from '../runtime/harness/sender-verify.js';
-import { validateComposioBatchOperation, formatBatchValidationError } from './composio-batch-validator.js';
+import { validateComposioArgs, formatBatchValidationError } from './composio-batch-validator.js';
+import { rememberToolSchema, getCachedToolSchema } from './composio-schema-cache.js';
+import { appendEvent } from '../runtime/harness/eventlog.js';
 import { shouldRetryToolCall, delayMs } from '../runtime/harness/retry-handler.js';
 import { suggestNextSteps, type FailureType as FallbackFailureType } from '../runtime/fallback-chain-store.js';
 import { getCapabilitiesForIntent } from '../runtime/capability-registry.js';
@@ -487,6 +489,40 @@ async function runComposioExecute(
   if (gate.block) return gate.block;
   const effectiveConnectionId = gate.routeConnectedAccountId ?? connectedAccountId;
 
+  // Pre-dispatch arg validation — schema-grounded when the action's real
+  // inputParameters schema has been seen this session (search/list/
+  // dynamic-build populate the cache), slug-name heuristics otherwise.
+  // Lives HERE (not in the composio_execute_tool handler) so the dynamic
+  // cx_* path is covered too. Capability gate: fails open on uncertainty;
+  // blocks only provably-incomplete args. See composio-batch-validator.ts.
+  const validation = validateComposioArgs(toolSlug, args, getCachedToolSchema(toolSlug));
+  if (validation.error) {
+    const blockMessage = formatBatchValidationError(validation.error, toolSlug, validation.mode);
+    // Telemetry: a validation block must be visible in audits. Reuses
+    // guardrail_tripped so existing audit tooling surfaces it for free.
+    try {
+      const sid = sessionIdFromRunContext(options.context);
+      if (sid) {
+        appendEvent({
+          sessionId: sid,
+          turn: 0,
+          role: 'tool',
+          type: 'guardrail_tripped',
+          data: {
+            guardrail: 'composio_validation',
+            mode: validation.mode,
+            toolSlug,
+            field: validation.error.field,
+            reason: validation.error.reason,
+          },
+        });
+      }
+    } catch {
+      // Telemetry must never break the block message path.
+    }
+    return blockMessage;
+  }
+
   // Tool-bound standing rules ride with EVERY call's output — the model
   // re-reads them at the moment it acts on this toolkit, independent of
   // whether memory recall surfaced them this turn.
@@ -700,6 +736,8 @@ export async function getDynamicComposioRuntimeTools(options: {
       seenNames.add(name);
 
       const toolSlug = toolkitTool.slug;
+      // Deposit the real schema for schema-grounded pre-dispatch validation.
+      rememberToolSchema(toolSlug, toolkitTool.inputParameters);
       out.push(tool({
         name,
         description: describeDynamicTool(toolkitSlug, toolSlug, toolkitTool.description),
@@ -751,6 +789,9 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
     }),
     execute: async ({ toolkit_slug, limit }, context, details) => {
       const tools = await listComposioToolkitTools(toolkit_slug, limit ?? 80);
+      // Deposit real schemas — upgrades pre-dispatch validation to
+      // schema-grounded for every listed action (self-healing loop).
+      for (const item of tools) rememberToolSchema(item.slug, item.inputParameters);
       const output = formatComposioToolOutput({
         toolkit: toolkit_slug,
         count: tools.length,
@@ -865,6 +906,9 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
         }
 
         for (const item of tools) {
+          // Deposit real schemas — upgrades pre-dispatch validation to
+          // schema-grounded for every searched action (self-healing loop).
+          rememberToolSchema(item.slug, item.inputParameters);
           const score = scoreComposioTool(slug, item.slug, item.name, item.description, queryTerms);
           if (score <= 0 && queryTerms.length > 0) continue;
           matches.push({
@@ -988,17 +1032,9 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
       // Standing-constraint enforcement (incl. the hard sender gate) lives in
       // runComposioExecute so the dynamic cx_* tool path is covered too.
 
-      // Validate batch operations before dispatch (prevent "missing fields" errors)
-      const batchValidationError = validateComposioBatchOperation(tool_slug, parsedArgs);
-      if (batchValidationError) {
-        return {
-          data: null,
-          successful: false,
-          error: 'batch_validation_error',
-          message: formatBatchValidationError(batchValidationError, tool_slug),
-        };
-      }
-
+      // Pre-dispatch arg validation lives in runComposioExecute (schema-
+      // grounded when cached, heuristic fallback) so the dynamic cx_*
+      // path gets identical coverage.
       return runComposioExecute(tool_slug, parsedArgs, connected_account_id ?? undefined, {
         context,
         details,

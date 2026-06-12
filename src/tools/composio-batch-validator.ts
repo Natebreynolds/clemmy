@@ -1,12 +1,30 @@
 /**
- * Pre-execution validation for Composio batch operations.
+ * Pre-execution validation for Composio operations.
  *
- * Composio batch operations (BATCH_UPDATE_MESSAGES, BULK_CREATE_RECORDS, etc.)
- * frequently fail with "Missing fields" errors when the agent constructs an
- * incomplete item in the batch array.
+ * Two modes, tried in order by validateComposioArgs():
  *
- * This validator catches incomplete batches BEFORE dispatch and returns clear
- * guidance instead of a Composio error.
+ *   1. SCHEMA-GROUNDED (preferred) — when the action's real
+ *      `inputParameters` JSON Schema is cached (composio-schema-cache.ts,
+ *      populated by every search/list/dynamic-build), validate against
+ *      THAT: required top-level fields + required batch-item fields. No
+ *      guessing; new toolkits are automatically right.
+ *
+ *   2. HEURISTIC (fallback) — when no schema is known, slug-name
+ *      heuristics catch only provably-incomplete batches (empty item,
+ *      non-object item, no update content, no write target).
+ *
+ * CONTRACT — capability gates fail OPEN, safety gates fail CLOSED.
+ * This is a capability gate: it exists to save a doomed network call and
+ * give better guidance than Composio's raw error. It must therefore only
+ * block on PROVABLY wrong input. When uncertain (unknown slug, unknown
+ * shape, malformed schema, any internal error) it must pass and let
+ * Composio's server-side validation be the judge. A false block here is
+ * worse than a wasted round-trip: it nudges the model to mutate its args
+ * into shapes the target API never asked for (2026-06-11 incident class:
+ * Airtable `{id, fields}` and Sheets `{range, values}` were falsely
+ * blocked by heuristics that guessed Outlook's `patch` shape was
+ * universal). Do not add new key guesses to the heuristics — teach the
+ * schema cache instead.
  *
  * Example error prevented:
  *   OUTLOOK_BATCH_UPDATE_MESSAGES: Missing fields: {'updates.0.patch', 'updates.1.patch', ...}
@@ -17,6 +35,99 @@ export interface BatchValidationError {
   field: string;
   reason: string;
   examples: string[];
+}
+
+export type ValidationMode = 'schema' | 'heuristic';
+
+export interface ComposioArgsValidation {
+  error: BatchValidationError | null;
+  mode: ValidationMode;
+}
+
+function isRecordValue(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/**
+ * Unified pre-dispatch entry point. Prefers the real schema when one is
+ * supplied; falls back to slug-name heuristics otherwise.
+ */
+export function validateComposioArgs(
+  toolSlug: string,
+  args: Record<string, unknown>,
+  schema?: Record<string, unknown> | null,
+): ComposioArgsValidation {
+  if (isRecordValue(schema)) {
+    return { error: validateArgsAgainstSchema(toolSlug, args, schema), mode: 'schema' };
+  }
+  return { error: validateComposioBatchOperation(toolSlug, args), mode: 'heuristic' };
+}
+
+/**
+ * Schema-grounded validation: block ONLY on fields the action's real
+ * JSON Schema declares `required` and that are absent from the args.
+ * Presence-only — types, formats, and extra keys are Composio's job.
+ * Fail-open on any malformed/unexpected schema shape.
+ */
+export function validateArgsAgainstSchema(
+  toolSlug: string,
+  args: Record<string, unknown>,
+  schema: Record<string, unknown>,
+): BatchValidationError | null {
+  try {
+    // Top-level required fields.
+    const required = Array.isArray(schema.required)
+      ? schema.required.filter((k): k is string => typeof k === 'string')
+      : [];
+    const missing = required.filter((key) => !(key in args));
+    if (missing.length > 0) {
+      return {
+        field: missing.join(', '),
+        reason: `Missing required field(s) per the action's schema: ${missing.join(', ')}. Required fields for ${toolSlug}: ${required.join(', ')}`,
+        examples: [
+          `This comes from ${toolSlug}'s real inputParameters schema — supply every required field.`,
+        ],
+      };
+    }
+
+    // Batch-item required fields: any args array whose schema property
+    // declares required keys on its items.
+    const properties = isRecordValue(schema.properties) ? schema.properties : null;
+    if (!properties) return null;
+    for (const [key, value] of Object.entries(args)) {
+      if (!Array.isArray(value)) continue;
+      const propSchema = properties[key];
+      if (!isRecordValue(propSchema)) continue;
+      const items = isRecordValue(propSchema.items) ? propSchema.items : null;
+      if (!items) continue;
+      const itemRequired = Array.isArray(items.required)
+        ? items.required.filter((k): k is string => typeof k === 'string')
+        : [];
+      if (itemRequired.length === 0) continue;
+      for (let i = 0; i < value.length; i++) {
+        const item = value[i];
+        if (!isRecordValue(item)) {
+          return {
+            field: `${key}[${i}]`,
+            reason: `Item ${i} in '${key}' is not an object — the schema requires objects with: ${itemRequired.join(', ')}`,
+            examples: [`Each '${key}' item needs: ${itemRequired.join(', ')}`],
+          };
+        }
+        const itemMissing = itemRequired.filter((k) => !(k in item));
+        if (itemMissing.length > 0) {
+          return {
+            field: `${key}[${i}].${itemMissing[0]}`,
+            reason: `Item ${i} in '${key}' is missing required field(s) per the action's schema: ${itemMissing.join(', ')}`,
+            examples: [`Each '${key}' item needs: ${itemRequired.join(', ')}`],
+          };
+        }
+      }
+    }
+    return null;
+  } catch {
+    // Fail-open: a malformed schema must never block a dispatch.
+    return null;
+  }
 }
 
 /**
@@ -121,43 +232,59 @@ function validateItemFields(
 ): BatchValidationError | null {
   const slug = toolSlug.toUpperCase();
 
-  // BATCH_UPDATE operations need 'patch' or 'data' field
-  if (slug.includes('BATCH_UPDATE') || slug.includes('BULK_UPDATE')) {
-    if (!('patch' in item) && !('data' in item) && !('value' in item)) {
-      return {
-        field: `${fieldName}[${index}].patch`,
-        reason: `Item ${index} is missing required field — BATCH_UPDATE needs 'patch', 'data', or 'value' field with update content`,
-        examples: [
-          'Correct: { id: "msg123", patch: { subject: "New subject" } }',
-          'Wrong: { id: "msg123" } (missing patch)',
-        ],
-      };
-    }
-  }
+  // STRUCTURAL rules only — never enumerate toolkit vocabulary. Every
+  // key-name list this validator ever carried produced false positives
+  // on real production shapes (Outlook `message_id`+`patch`, Outlook
+  // `message_id`+`is_read`, Airtable `id`+`fields`, Sheets
+  // `range`+`values`), and a false block nudges the model to rename its
+  // args into shapes the target API never asked for. The structural
+  // invariant that holds across all of them:
+  //   identity = any key ending in id/ids (id, message_id, record_id,
+  //              row_ids, …) or 'range' (Sheets' write target)
+  //   content  = any key that is not an identity key
+  const keys = Object.keys(item);
+  const isIdentityKey = (k: string): boolean => /(?:^|_)ids?$/i.test(k) || k.toLowerCase() === 'range';
+  const hasIdentity = keys.some(isIdentityKey);
+  const hasContent = keys.some((k) => !isIdentityKey(k));
 
   // CREATE/INSERT operations need data but not id (usually generated)
   if (slug.includes('CREATE') || slug.includes('INSERT')) {
-    if (isEmptyObject(item)) {
+    if (!hasContent) {
       return {
         field: `${fieldName}[${index}]`,
-        reason: `Item ${index} is empty — CREATE needs field values (e.g., name, email, content)`,
+        reason: `Item ${index} has no field values — CREATE needs content (e.g., name, email, fields)`,
         examples: [
           'Correct: { name: "New Record", email: "test@example.com" }',
           'Wrong: {} or { id: "123" } (no fields)',
         ],
       };
     }
+    return null;
   }
 
-  // UPDATE/UPSERT operations need an ID
+  // UPDATE/UPSERT operations need a write-target identity AND some
+  // update content. An item with identity but nothing else (the
+  // original incident shape: { id: "msg123" }) is provably incomplete.
   if (slug.includes('UPDATE') || slug.includes('UPSERT')) {
-    if (!('id' in item) && !('ID' in item) && !('record_id' in item) && !('recordId' in item)) {
+    if (!hasIdentity) {
       return {
         field: `${fieldName}[${index}].id`,
-        reason: `Item ${index} is missing ID — UPDATE needs 'id' or 'record_id' to identify what to update`,
+        reason: `Item ${index} is missing ID — UPDATE needs an identity key ('id', 'message_id', 'record_id', a '…_id' field, or 'range') to identify what to update`,
         examples: [
-          'Correct: { id: "rec123", name: "Updated" }',
+          'Correct: { id: "rec123", fields: { Name: "Updated" } }',
+          'Correct (Sheets): { range: "Sheet1!A1:B2", values: [["a","b"]] }',
           'Wrong: { name: "Updated" } (missing id)',
+        ],
+      };
+    }
+    if (!hasContent) {
+      return {
+        field: `${fieldName}[${index}].patch`,
+        reason: `Item ${index} has an identity but no update content — UPDATE needs at least one content field (e.g., 'patch', 'fields', 'values', or the property to change)`,
+        examples: [
+          'Correct: { message_id: "msg123", patch: { isRead: true } }',
+          'Correct: { message_id: "msg123", is_read: true }',
+          'Wrong: { id: "msg123" } (identity only, no update content)',
         ],
       };
     }
@@ -170,16 +297,31 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
-function isEmptyObject(obj: Record<string, unknown>): boolean {
-  return Object.keys(obj).length === 0;
-}
-
 /**
- * Format a batch validation error for user escalation.
+ * Format a validation error for the model. The recovery instructions are
+ * the self-healing half of the design: fetching the real schema (via
+ * composio_search_tools / composio_list_tools) both gives the model the
+ * correct shape AND populates the schema cache, so the next validation
+ * of this slug is schema-grounded instead of guessed — a heuristic false
+ * positive cannot block the same action twice in a session.
  */
-export function formatBatchValidationError(error: BatchValidationError, toolSlug: string): string {
+export function formatBatchValidationError(
+  error: BatchValidationError,
+  toolSlug: string,
+  mode: ValidationMode = 'heuristic',
+): string {
+  const recovery = mode === 'schema'
+    ? [
+        `Recovery: the missing field(s) come from ${toolSlug}'s real schema — add them and retry.`,
+        `Do NOT rename or drop other keys; they were not the problem.`,
+      ]
+    : [
+        `Recovery: do NOT guess or rename keys. Call composio_search_tools (or composio_list_tools) for this toolkit to fetch ${toolSlug}'s real inputParameters schema, rebuild the arguments to match it exactly, and retry.`,
+        `Fetching the schema also upgrades this pre-dispatch check from heuristic to schema-grounded for the rest of the session.`,
+        `If you believe the arguments were already correct, the schema fetch will prove it and the retry will pass.`,
+      ];
   return [
-    `⚠️  Batch operation validation failed before dispatch:`,
+    `⚠️  Operation validation failed before dispatch (${mode} check):`,
     ``,
     `Tool: ${toolSlug}`,
     `Field: ${error.field}`,
@@ -188,6 +330,6 @@ export function formatBatchValidationError(error: BatchValidationError, toolSlug
     `Examples:`,
     ...error.examples.map((ex) => `  • ${ex}`),
     ``,
-    `Fix this and retry.`,
+    ...recovery,
   ].join('\n');
 }
