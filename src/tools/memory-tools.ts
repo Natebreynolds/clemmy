@@ -4,12 +4,71 @@ import { z } from 'zod';
 import { formatSearchHits, searchVaultAsync } from '../memory/search.js';
 import { recallHybrid } from '../memory/recall.js';
 import { embedMissingChunks, isEmbeddingsEnabled, readEmbeddingStats } from '../memory/embeddings.js';
-import { FACT_KINDS, forgetFact, getFact, listActiveFacts, listAllFacts, rememberFact, reviewStandingInstructions, searchFacts, setFactPinned, touchFactAccess } from '../memory/facts.js';
+import { FACT_KINDS, forgetFact, getFact, listActiveFacts, listAllFacts, reactivateFact, rememberFact, reviewStandingInstructions, searchFacts, setFactPinned, touchFactAccess } from '../memory/facts.js';
 import { consolidateFact } from '../memory/reflection.js';
 import { upsertResourcePointer, isSourceMapEnabled } from '../memory/source-map.js';
 import { getRuntimeEnv } from '../config.js';
 import { WORKING_MEMORY_FILE } from '../memory/vault.js';
+import { addNotification } from '../runtime/notifications.js';
 import { readText, replaceFile, resolveMemoryTarget, textResult } from './shared.js';
+import type { ConsolidatedFact } from '../memory/facts.js';
+
+/**
+ * Standing-instruction protection for the DIRECT memory tools.
+ *
+ * The autonomous paths (conflict resolver, nightly reflection) already refuse
+ * to touch pinned facts — but memory_forget/memory_pin are model-callable
+ * with no guard, so one misguided tool call could silently remove a standing
+ * rule (the same class as the 2026-06-09 wrong-mailbox incident: protection
+ * existed, the removal path didn't surface). Policy, enforced here:
+ *   - forgetting a PINNED fact is refused — unpin first (a deliberate,
+ *     separately-surfaced step), then forget;
+ *   - hard-deleting a constraint-kind fact is refused outright (soft-delete
+ *     keeps it recoverable via reactivateFact);
+ *   - every pin/unpin/forget that touches a constraint or pinned fact emits
+ *     a user-visible notification, so a standing-rule change can never
+ *     happen silently.
+ * Pure decision function, exported for tests.
+ */
+export function reviewForgetRequest(
+  fact: Pick<ConsolidatedFact, 'id' | 'kind' | 'pinned' | 'content'>,
+  hard: boolean,
+): { allow: boolean; reason?: string } {
+  if (fact.pinned) {
+    return {
+      allow: false,
+      reason: `Fact #${fact.id} is a PINNED standing instruction — refusing to forget it directly. `
+        + `If the user wants this rule gone: (1) call memory_pin with pinned=false (this is surfaced to the user), then (2) call memory_forget. `
+        + 'Do NOT do this unless the user explicitly asked to drop the rule.',
+    };
+  }
+  if (hard && fact.kind === 'constraint') {
+    return {
+      allow: false,
+      reason: `Fact #${fact.id} is a constraint — hard delete is refused so the rule stays recoverable. `
+        + 'Call memory_forget without hard to soft-delete it instead.',
+    };
+  }
+  return { allow: true };
+}
+
+/** One visible card per standing-rule change — never silent. Best-effort. */
+function notifyStandingRuleChange(
+  action: 'unpinned' | 'pinned' | 'forgotten',
+  fact: Pick<ConsolidatedFact, 'id' | 'kind' | 'content'>,
+): void {
+  try {
+    addNotification({
+      id: `${Date.now()}-standing-rule-${action}-${fact.id}`,
+      kind: 'system',
+      title: `Standing rule ${action}: fact #${fact.id}`,
+      body: `Clem ${action} ${fact.kind === 'constraint' ? 'a CONSTRAINT' : 'a pinned fact'} via a memory tool call:\n\n"${fact.content.slice(0, 280)}"\n\nIf you didn't ask for this, say "re-pin fact #${fact.id}" (or "restore fact #${fact.id}" if it was forgotten).`,
+      createdAt: new Date().toISOString(),
+      read: false,
+      metadata: { factId: fact.id, kind: fact.kind, action, source: 'memory-tools-guard' },
+    });
+  } catch { /* notification must never block the tool */ }
+}
 
 // Tier A1 — when CLEMMY_REMEMBER_RECONCILE=on, the agent's explicit
 // memory_remember writes route through the Mem0 conflict resolver
@@ -247,8 +306,30 @@ export function registerMemoryTools(server: McpServer): void {
       hard: z.boolean().optional(),
     },
     async ({ id, hard }) => {
+      const fact = getFact(id);
+      if (!fact) return textResult(`No fact found with id ${id}.`);
+      const review = reviewForgetRequest(fact, hard === true);
+      if (!review.allow) return textResult(`Refused: ${review.reason}`);
       const ok = forgetFact(id, { hard });
+      if (ok && fact.kind === 'constraint') notifyStandingRuleChange('forgotten', fact);
       return textResult(ok ? `Forgot fact #${id}${hard ? ' (hard delete)' : ''}.` : `No fact found with id ${id}.`);
+    },
+  );
+
+  server.tool(
+    'memory_restore',
+    'Restore (reactivate) a soft-deleted fact by id — the inverse of memory_forget. Use when the user says "restore fact #N" / "bring back that rule". No-op if the fact is already active or was hard-deleted.',
+    {
+      id: z.number().int().positive(),
+    },
+    async ({ id }) => {
+      const ok = reactivateFact(id);
+      const fact = ok ? getFact(id) : null;
+      return textResult(
+        ok
+          ? `Restored fact #${id}${fact ? `: ${fact.content.slice(0, 200)}` : ''}. If it was a pinned standing instruction before, re-pin it with memory_pin.`
+          : `Could not restore fact #${id} — it is either already active or was hard-deleted.`,
+      );
     },
   );
 
@@ -264,6 +345,11 @@ export function registerMemoryTools(server: McpServer): void {
       const fact = getFact(id);
       if (!fact) return textResult(`No fact found with id ${id}.`);
       const ok = setFactPinned(id, want);
+      // Unpinning removes a standing instruction's always-applied protection —
+      // surface every such change to the user (pinning a constraint too, so
+      // rule lifecycle is fully visible).
+      if (ok && !want && fact.pinned) notifyStandingRuleChange('unpinned', fact);
+      else if (ok && want && fact.kind === 'constraint' && !fact.pinned) notifyStandingRuleChange('pinned', fact);
       return textResult(
         ok
           ? `${want ? 'Pinned' : 'Unpinned'} fact #${id}${want ? ' — it will always be applied' : ''}: ${fact.content}`

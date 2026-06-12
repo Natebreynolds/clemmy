@@ -8,6 +8,13 @@ export const LOCAL_MCP_TOOL_NAMES = [
   'memory_search_facts',
   'source_map_upsert',
   'memory_forget',
+  // Registered in memory-tools.ts but never allowlisted — the model literally
+  // could not unpin/restore/review, which broke memory_forget's documented
+  // "unpin first" recovery path (found live 2026-06-12; same omission class
+  // as the browser-harness allowlist incident).
+  'memory_pin',
+  'memory_restore',
+  'memory_review_instructions',
   'memory_embed_backfill',
   'working_memory',
   'note_create',

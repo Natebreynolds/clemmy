@@ -314,6 +314,35 @@ function assertCommandAllowed(command: string): void {
   }
 }
 
+/**
+ * Standing-instruction integrity: the memory store (memory.db /
+ * consolidated_facts) is the system of record for pinned standing
+ * instructions and constraint rows. The memory_* tools enforce
+ * pin/constraint protection + audit notifications; raw `sqlite3` / SQL
+ * against the store walks around ALL of that (found live 2026-06-12: the
+ * model flipped a pinned constraint's `active`/`pinned` columns via shell
+ * when memory_pin wasn't in its surface). So: refuse a shell command that
+ * BOTH references the memory store AND carries a mutating SQL verb against
+ * the facts tables. Read-only inspection (SELECT/.schema/.tables/.dump) is
+ * untouched — only mutation is blocked, with a pointer to the right tools.
+ * Pure + exported for tests.
+ */
+const MEMORY_STORE_REF = /\b(memory\.db|consolidated_facts|fact_embeddings)\b/i;
+const MUTATING_SQL = /\b(update|delete\s+from|insert\s+into|drop\s+table|alter\s+table|replace\s+into|truncate)\b/i;
+const FACTS_TABLE_REF = /\b(consolidated_facts|fact_embeddings)\b/i;
+
+export function shellMutatesMemoryStore(rawCommand: unknown): boolean {
+  if (typeof rawCommand !== 'string') return false;
+  const cmd = rawCommand;
+  if (!MEMORY_STORE_REF.test(cmd)) return false;
+  if (!MUTATING_SQL.test(cmd)) return false;
+  // Require the mutation to actually target the facts tables (not, say, an
+  // UPDATE against an unrelated table in a command that merely mentions the
+  // path in a comment). Conservative: if a facts table is named anywhere
+  // alongside a mutating verb, block.
+  return FACTS_TABLE_REF.test(cmd) || /memory\.db/i.test(cmd);
+}
+
 function developerToolStubBlockMessage(command: string): string | null {
   const matches = command.matchAll(/(?:^|[;&|]\s*)([A-Za-z0-9_.+-]+)\b/g);
   for (const match of matches) {
@@ -625,6 +654,16 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
     }),
     needsApproval: needsApprovalForShellSmart(),
     execute: async (input, runContext, details) => {
+      if (shellMutatesMemoryStore(input.command)) {
+        return formatToolOutput(
+          'run_shell_command',
+          runContext,
+          details,
+          'Refused: direct SQL mutation of the memory store (memory.db / consolidated_facts) bypasses the standing-instruction guards and audit trail. '
+            + 'Use the memory tools instead: memory_pin (pin/unpin), memory_forget (soft/hard delete, refuses pinned), memory_restore (reactivate), memory_remember (add/update). '
+            + 'Read-only inspection of the DB is fine; mutation must go through the tools.',
+        );
+      }
       const cwd = resolveAllowedCwd(input.cwd ?? undefined);
       return formatToolOutput(
         'run_shell_command',

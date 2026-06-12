@@ -66,3 +66,20 @@ test('write_file append creates a missing file', async () => {
   assert.equal(await invokeWrite({ path: file, content: 'created by append', mode: 'append' }), `Appended ${file} (17 chars).`);
   assert.equal(readFileSync(file, 'utf-8'), 'created by append\n');
 });
+
+test('shellMutatesMemoryStore: blocks SQL mutation of the facts store, allows read-only + unrelated', async () => {
+  const { shellMutatesMemoryStore } = await import('./computer-tools.js');
+  // Blocked — mutation against the store.
+  assert.equal(shellMutatesMemoryStore("sqlite3 ~/.clementine-next/state/memory.db \"UPDATE consolidated_facts SET pinned=0 WHERE id=1161\""), true);
+  assert.equal(shellMutatesMemoryStore("sqlite3 memory.db 'DELETE FROM consolidated_facts WHERE id=5'"), true);
+  assert.equal(shellMutatesMemoryStore("sqlite3 state/memory.db 'INSERT INTO fact_embeddings VALUES (1)'"), true);
+  assert.equal(shellMutatesMemoryStore("sqlite3 memory.db 'DROP TABLE consolidated_facts'"), true);
+  // Allowed — read-only inspection.
+  assert.equal(shellMutatesMemoryStore("sqlite3 -readonly memory.db 'SELECT * FROM consolidated_facts LIMIT 5'"), false);
+  assert.equal(shellMutatesMemoryStore("sqlite3 memory.db '.schema consolidated_facts'"), false);
+  assert.equal(shellMutatesMemoryStore("sqlite3 memory.db '.tables'"), false);
+  // Allowed — unrelated commands (no memory-store reference).
+  assert.equal(shellMutatesMemoryStore("sqlite3 other.db 'UPDATE foo SET x=1'"), false);
+  assert.equal(shellMutatesMemoryStore("echo hello && ls -la"), false);
+  assert.equal(shellMutatesMemoryStore(undefined), false);
+});
