@@ -574,6 +574,39 @@ export function harnessToolBracketsEnabled(): boolean {
  * that case the wrapper degrades to "apply timeout only, no kill/counter
  * check" — safer than crashing on a missing counter.
  */
+
+/** Duplicate-ledger compensation: the external_write event is recorded
+ *  PRE-dispatch (conservative — a crash mid-send must still count), but a
+ *  dispatch that demonstrably FAILED never wrote anything. Without this, a
+ *  schema-rejected send counts as a prior write and the model's corrected
+ *  retry trips DUPLICATE_EXTERNAL_WRITE (live false positive, audit
+ *  2026-06-12: `to` vs `to_email`). Only the explicit hard-failure shape
+ *  compensates; anything ambiguous stays counted (the safe direction). */
+function compensateFailedExternalWrite(
+  sessionId: string | undefined,
+  toolName: string,
+  parsedInput: unknown,
+  result: unknown,
+): void {
+  if (!sessionId) return;
+  try {
+    if (typeof result !== 'string' || !result.startsWith('⚠️ composio_execute_tool FAILED')) return;
+    const shape = classifyExternalWrite(toolName, parsedInput);
+    if (!shape.mutating) return;
+    appendEvent({
+      sessionId,
+      turn: 0,
+      role: 'system',
+      type: 'external_write_failed',
+      data: {
+        shapeKey: shape.shapeKey,
+        toolName,
+        targets: extractDuplicateIdentityKeys(parsedInput).slice(0, 8),
+      },
+    });
+  } catch { /* compensation must never break the tool result */ }
+}
+
 export function wrapToolForHarness<T extends WrappableTool>(
   tool: T,
   options: WrapToolOptions = {},
@@ -736,6 +769,19 @@ export function wrapToolForHarness<T extends WrappableTool>(
           try {
             priorWrites = listEvents(ctx.sessionId, { types: ['external_write'] })
               .map((ev) => ev.data as { shapeKey?: string; targets?: string[] });
+            // Net out demonstrably-failed dispatches (external_write_failed
+            // compensation events, emitted post-invoke): each failure cancels
+            // ONE matching prior, so a corrected retry after a schema
+            // rejection is not a "duplicate" of a send that never happened.
+            const failures = listEvents(ctx.sessionId, { types: ['external_write_failed'] })
+              .map((ev) => ev.data as { shapeKey?: string; targets?: string[] });
+            for (const failure of failures) {
+              const failTargets = new Set((failure.targets ?? []).map((t) => String(t).toLowerCase()));
+              const idx = priorWrites.findIndex((w) =>
+                w.shapeKey === failure.shapeKey &&
+                (w.targets ?? []).some((t) => failTargets.has(String(t).toLowerCase())));
+              if (idx >= 0) priorWrites.splice(idx, 1);
+            }
           } catch { /* fail toward not-a-duplicate */ }
           const dup = detectDuplicateTarget({ sessionId: ctx.sessionId, shapeKey: shape.shapeKey, targets: dupTargets, priorWrites });
           if (dup.duplicate && dup.warnedKey) {
@@ -982,13 +1028,17 @@ export function wrapToolForHarness<T extends WrappableTool>(
       // exact_args_repeat/same_mut_tool_repeat aggregate that cancelled the
       // 44-attorney batch). sessionId is unchanged (kill/pause/recall intact);
       // the counter stays shared (batch budget). Behind CLEMMY_WORKER_THRASH_GUARD.
-      const invokePromise =
+      let invokePromise =
         tool.name === 'run_worker' && ctx && workerThrashGuardEnabled()
           ? (harnessRunContextStorage.run(
               { ...ctx, guardrailScopeId: workerScopeIdFromDetails(ctx.sessionId, details) },
               invokeOnce,
             ) as Promise<unknown>)
           : invokeOnce();
+      invokePromise = invokePromise.then((result) => {
+        compensateFailedExternalWrite(ctx?.sessionId, tool.name, parsedInput, result);
+        return result;
+      });
       // run_worker (Agent.asTool fan-out leaf) MUST return something into the
       // orchestrator's context even on timeout. withTimeout sits OUTSIDE the
       // try/catch above, so a ToolTimeout here propagates straight out of
@@ -1042,6 +1092,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
       tool.name,
       { isPaused: isPausedFactory(ctx?.sessionId) },
     );
+    compensateFailedExternalWrite(ctx?.sessionId, tool.name, input, result);
     if (fanoutNudge && typeof result === 'string') return `${result}\n\n${fanoutNudge}`;
     return result;
     // NOTE: A tool-return truncator used to live here as part of

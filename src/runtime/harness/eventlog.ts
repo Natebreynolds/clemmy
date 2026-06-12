@@ -130,6 +130,10 @@ export const EVENT_TYPES = [
   // writes — which share the parent session via AsyncLocalStorage but may
   // not log tool_called under it — are counted reliably.
   'external_write',
+  // Compensation record: the dispatch behind an external_write demonstrably
+  // FAILED (e.g. composio schema rejection) — the duplicate-target gate nets
+  // one matching prior per failure so corrected retries aren't "duplicates".
+  'external_write_failed',
   // Always-on telemetry: a run_worker sub-agent hit its turn ceiling
   // (MaxTurnsExceeded). Worker nested runs carry no harness hooks, so this is
   // the only signal of worker turn-cap hits — used to recalibrate

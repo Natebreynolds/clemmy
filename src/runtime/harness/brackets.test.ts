@@ -642,3 +642,69 @@ test('grounding gate: an irreversible send contradicting the target\'s own artif
     if (prevGrounding === undefined) delete process.env.CLEMMY_GROUNDING_GATE; else process.env.CLEMMY_GROUNDING_GATE = prevGrounding;
   }
 });
+
+test('duplicate-target gate: a FAILED dispatch is netted out — the corrected retry is not a "duplicate" (2026-06-12 live replay)', async () => {
+  const prevBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  const prevConfirm = process.env.CLEMMY_CONFIRM_FIRST;
+  const prevExecGate = process.env.CLEMMY_EXECUTION_GATE;
+  const prevGrounding = process.env.CLEMMY_GROUNDING_GATE;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  process.env.CLEMMY_CONFIRM_FIRST = 'off';
+  process.env.CLEMMY_EXECUTION_GATE = 'off';
+  process.env.CLEMMY_GROUNDING_GATE = 'on';
+  resetEventLog();
+  const { appendEvent, listEvents } = await import('./eventlog.js');
+  const grounding = await import('./grounding-gate.js');
+  grounding._resetGroundingStateForTests();
+  grounding._resetDuplicateStateForTests();
+  grounding._setGroundingJudgeForTests(async () => ({ grounded: true, reason: 'ok' }));
+  const sess = createSession({ kind: 'chat' });
+  try {
+    const counter = new ToolCallsCounter(100);
+    let nextResult = '';
+    const wrapped = wrapToolForHarness({
+      name: 'composio_execute_tool',
+      execute: async (_input: unknown) => nextResult,
+    });
+    const send = () =>
+      withHarnessRunContext({ sessionId: sess.id, counter }, () =>
+        wrapped.execute!({
+          tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL',
+          arguments: JSON.stringify({ to_email: 'nathan@example.com', subject: 'Gate test', body: 'b' }),
+        }),
+      );
+    const recordWrite = () => appendEvent({
+      sessionId: sess.id, turn: 0, role: 'system', type: 'external_write',
+      data: { shapeKey: 'OUTLOOK_OUTLOOK_SEND_EMAIL', toolName: 'composio_execute_tool', irreversible: true, count: 1, underScope: false, targets: ['nathan@example.com', 'example.com'] },
+    });
+
+    // 1. The dispatch FAILS HARD at composio validation. The external_write
+    //    record still lands (confirm-first emits it pre-dispatch, after the
+    //    dup gate passed for that same call — so record it post-call here).
+    nextResult = "⚠️ composio_execute_tool FAILED (slug=OUTLOOK_OUTLOOK_SEND_EMAIL): Invalid request data provided - Following fields are missing: {'to_email'}";
+    const r1 = String(await send());
+    recordWrite();
+    assert.match(r1, /FAILED/);
+    const failures = listEvents(sess.id, { types: ['external_write_failed'] });
+    assert.equal(failures.length, 1, 'hard failure emits the compensation event');
+
+    // 2. The corrected retry must NOT be duplicate-blocked — the only prior
+    //    write demonstrably never happened.
+    nextResult = 'sent';
+    assert.equal(await send(), 'sent', 'corrected retry sails through');
+
+    // 3. A real prior (successful send) STILL trips the bump — netting only
+    //    cancels failures, one-for-one.
+    recordWrite();
+    await assert.rejects(() => Promise.resolve(send()), (err: Error) => {
+      assert.match(err.message, /DUPLICATE_EXTERNAL_WRITE/);
+      return true;
+    });
+  } finally {
+    grounding._setGroundingJudgeForTests(null);
+    process.env.HARNESS_TOOL_BRACKETS = prevBrackets;
+    process.env.CLEMMY_CONFIRM_FIRST = prevConfirm;
+    process.env.CLEMMY_EXECUTION_GATE = prevExecGate;
+    if (prevGrounding === undefined) delete process.env.CLEMMY_GROUNDING_GATE; else process.env.CLEMMY_GROUNDING_GATE = prevGrounding;
+  }
+});
