@@ -304,6 +304,34 @@ export function markNotificationRead(id: string): NotificationRecord | undefined
   return item;
 }
 
+/**
+ * Mark a notification read together with its dedupe twins: every other
+ * unread notification with the same title (case-insensitive) or the same
+ * workflow. The command-center "Needs you" feed collapses duplicates by
+ * title/workflow, so dismissing only the surfaced one just resurrects the
+ * next-oldest twin behind it (whack-a-mole; observed 2026-06-11 with
+ * repeated "Clementine needs attention" proactive briefs).
+ */
+export function markNotificationGroupRead(id: string): NotificationRecord[] {
+  const items = loadNotifications();
+  const anchor = items.find((entry) => entry.id === id);
+  if (!anchor) return [];
+  const titleKey = anchor.title.toLowerCase().trim();
+  const workflowKey = typeof anchor.metadata?.workflow === 'string' ? anchor.metadata.workflow.toLowerCase() : '';
+  const changed: NotificationRecord[] = [];
+  for (const item of items) {
+    if (item.read) continue;
+    const itemWorkflow = typeof item.metadata?.workflow === 'string' ? item.metadata.workflow.toLowerCase() : '';
+    const sameTitle = item.title.toLowerCase().trim() === titleKey;
+    const sameWorkflow = Boolean(workflowKey) && itemWorkflow === workflowKey;
+    if (item.id !== id && !sameTitle && !sameWorkflow) continue;
+    item.read = true;
+    changed.push(item);
+  }
+  if (changed.length > 0) saveNotifications(items);
+  return changed;
+}
+
 export function markNotificationsReadByApprovalId(
   approvalId: string,
   metadataPatch: Record<string, unknown> = {},

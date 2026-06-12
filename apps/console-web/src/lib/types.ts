@@ -28,9 +28,12 @@ export interface CommandCenterItem {
   approvalKind?: 'runtime' | 'harness';
   approvalId?: string;
   targetSessionId?: string;
+  /** Backing notification id for needs-attention cards — deep-links to the
+   *  Inbox Notifications tab. */
+  notifId?: string;
   /** When present the card shows a dismiss (X) button routed to
    *  POST /api/console/inbox/dismiss. */
-  dismissKind?: 'checkin' | 'plan' | 'proposal';
+  dismissKind?: 'checkin' | 'plan' | 'proposal' | 'notif';
   dismissId?: string;
 }
 

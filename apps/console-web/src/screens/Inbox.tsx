@@ -1,4 +1,5 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
 import { Check, X, RefreshCw, Mail, Activity as ActivityIcon, BellRing } from 'lucide-react';
 import { Page } from '@/components/Page';
@@ -19,8 +20,22 @@ type Tab = 'needs' | 'activity' | 'notifications';
 
 export function Inbox() {
   const qc = useQueryClient();
-  const [tab, setTab] = useState<Tab>('needs');
-  const [selected, setSelected] = useState<string | null>(null);
+  // Deep-link support: /inbox?tab=notifications&select=<id> (used by the
+  // Home "Needs you" cards, which are notification-backed — landing them on
+  // the default approvals tab showed an empty "all caught up" page).
+  const [searchParams] = useSearchParams();
+  const tabParam = searchParams.get('tab');
+  const initialTab: Tab = tabParam === 'notifications' || tabParam === 'activity' || tabParam === 'needs' ? tabParam : 'needs';
+  const [tab, setTab] = useState<Tab>(initialTab);
+  const [selected, setSelected] = useState<string | null>(searchParams.get('select'));
+  // Re-apply when the deep link changes while the screen stays mounted
+  // (e.g. Home card → Inbox already open in the router tree).
+  useEffect(() => {
+    if (tabParam === 'notifications' || tabParam === 'activity' || tabParam === 'needs') setTab(tabParam);
+    const select = searchParams.get('select');
+    if (select) setSelected(select);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams]);
 
   const approvals = usePoll(['approvals'], listApprovals, 6000);
   const runs = usePoll(['runs'], () => listRuns(40), 4000);

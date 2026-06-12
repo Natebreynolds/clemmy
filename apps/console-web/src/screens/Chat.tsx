@@ -26,6 +26,15 @@ const SUGGESTIONS = [
   'Draft a follow-up email',
 ];
 
+/** Where a "Needs you" card should land. Notification-backed cards open the
+ *  notification itself; approval-backed cards open the approvals tab. A bare
+ *  '/inbox' landed notification cards on an empty "Needs approval" tab. */
+function inboxTarget(item: CommandCenterItem): string {
+  if (item.notifId) return `/inbox?tab=notifications&select=${encodeURIComponent(item.notifId)}`;
+  if (item.approvalId) return `/inbox?tab=needs&select=${encodeURIComponent(item.approvalId)}`;
+  return '/inbox';
+}
+
 function AttentionStrip({ needsYou, workingNow, onDismiss }: { needsYou: CommandCenterItem[]; workingNow: CommandCenterItem[]; onDismiss?: (item: CommandCenterItem) => void }) {
   const navigate = useNavigate();
   if (needsYou.length === 0 && workingNow.length === 0) return null;
@@ -36,8 +45,8 @@ function AttentionStrip({ needsYou, workingNow, onDismiss }: { needsYou: Command
           key={`n${i}`}
           role="button"
           tabIndex={0}
-          onClick={() => navigate('/inbox')}
-          onKeyDown={(e) => { if (e.key === 'Enter') navigate('/inbox'); }}
+          onClick={() => navigate(inboxTarget(item))}
+          onKeyDown={(e) => { if (e.key === 'Enter') navigate(inboxTarget(item)); }}
           className="flex w-full items-center gap-3 rounded-md border border-warning/40 bg-warning-tint px-3 py-2.5 text-left transition-colors hover:brightness-[0.99] cursor-pointer"
         >
           <StatusPill tone="warning">Needs you</StatusPill>
@@ -57,7 +66,11 @@ function AttentionStrip({ needsYou, workingNow, onDismiss }: { needsYou: Command
         </div>
       ))}
       {needsYou.length > 3 && (
-        <button type="button" onClick={() => navigate('/inbox')} className="text-small text-primary hover:underline cursor-pointer">
+        <button
+          type="button"
+          onClick={() => navigate(needsYou.some((item) => item.approvalId) ? '/inbox' : '/inbox?tab=notifications')}
+          className="text-small text-primary hover:underline cursor-pointer"
+        >
           See all {needsYou.length} in Inbox
         </button>
       )}

@@ -158,7 +158,7 @@ import type { CheckInUrgency } from '../agents/check-ins.js';
 import { createBackgroundTask, getBackgroundTask, listBackgroundTasks, processBackgroundTasks } from '../execution/background-tasks.js';
 import { getBackgroundTaskStatus } from '../execution/background-task-status.js';
 import { listRuns } from '../runtime/run-events.js';
-import { addNotification, listNotifications, markStaleApprovalNotificationsRead } from '../runtime/notifications.js';
+import { addNotification, listNotifications, markNotificationGroupRead, markStaleApprovalNotificationsRead } from '../runtime/notifications.js';
 import { actionBus, type ActionEvent } from '../runtime/action-bus.js';
 import { spaceStore } from '../spaces/store.js';
 import {
@@ -5095,6 +5095,16 @@ export function registerConsoleRoutes(
         res.json({ ok: Boolean(rejected), kind, id });
         return;
       }
+      if (kind === 'notif') {
+        // "Needs you" cards backed by a needs-attention notification dismiss
+        // by marking the notification read — the command-center feed only
+        // surfaces unread ones, so the card disappears everywhere at once.
+        // Group-read: the feed dedupes by title/workflow, so the twins
+        // behind the surfaced card must clear too or they pop right back.
+        const marked = markNotificationGroupRead(id);
+        res.json({ ok: marked.length > 0, kind, id, cleared: marked.length });
+        return;
+      }
       res.status(400).json({ error: `kind "${kind}" is not dismissable` });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
@@ -5452,7 +5462,11 @@ export function registerConsoleRoutes(
         return out.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
       };
       const notifNeedsYou = dedupeByWorkflow(
-        inboxNotifs.filter((notification) => isNeedsAttentionNotif(notification) && !isGenericWorkflowEcho(notification)),
+        // Unread only: a read needs-attention notification is one the user
+        // has already seen/dismissed — leaving it here made stale "Workflow
+        // needs attention" cards immortal on Home (clicking led to an empty
+        // approvals tab; observed 2026-06-11).
+        inboxNotifs.filter((notification) => !notification.read && isNeedsAttentionNotif(notification) && !isGenericWorkflowEcho(notification)),
         6,
       ).map((notification) => ({
         kind: 'workflow',
@@ -5464,6 +5478,9 @@ export function registerConsoleRoutes(
         body: (notification.body || '').slice(0, 4000),
         createdAt: notification.createdAt,
         runId: String(notification.metadata?.workflowRunId || notification.metadata?.runId || ''),
+        // Dismiss (X) marks the notification read via /api/console/inbox/dismiss.
+        dismissKind: 'notif',
+        dismissId: notification.id,
       }));
       const notifRecent = dedupeByWorkflow(
         inboxNotifs.filter((notification) => !isNeedsAttentionNotif(notification) && !isGenericWorkflowEcho(notification)),
