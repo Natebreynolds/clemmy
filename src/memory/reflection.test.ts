@@ -44,7 +44,7 @@ const {
   _testOnly_peekSessionImportance,
   _testOnly_resetAllSessionImportance,
 } = await import('./reflection.js');
-const { rememberFact, getFact, listRecentlyLearnedFacts, renderRecentlyLearnedForInstructions } = await import('./facts.js');
+const { rememberFact, getFact, setFactPinned, listRecentlyLearnedFacts, renderRecentlyLearnedForInstructions } = await import('./facts.js');
 const { vectorToBuffer } = await import('./embeddings.js');
 
 test('entities: upsert is idempotent + merges aliases', () => {
@@ -410,6 +410,49 @@ test('getResolverStats: a novel fact tallies as an ADD (resolver observability)'
   } finally {
     if (prev === undefined) delete process.env.CLEMMY_REFLECTION; else process.env.CLEMMY_REFLECTION = prev;
   }
+});
+
+test('consolidateFact: resolver DELETE on a pinned fact is blocked — fact stays active, candidate ADDed', async () => {
+  resetMemoryDb();
+  const prot = rememberFact({ kind: 'feedback', content: 'Never send Scorpion mail from breakthrough.co.' });
+  setFactPinned(prot.id, true);
+  const out = await consolidateFact(
+    { kind: 'feedback', text: 'Sending Scorpion mail from breakthrough.co is fine now.' },
+    {},
+    { resolver: async () => ({ decision: 'DELETE', target_id: prot.id }) },
+  );
+  const reloaded = getFact(prot.id);
+  assert.equal(reloaded?.active, true, 'pinned fact survives a resolver DELETE');
+  assert.equal(reloaded?.pinned, true, 'still pinned');
+  assert.equal(out.deleted, 0, 'no delete tallied');
+  assert.equal(out.written, 1, 'candidate falls through to the conservative ADD');
+});
+
+test('consolidateFact: resolver UPDATE on a pinned fact is blocked — content unchanged, candidate ADDed', async () => {
+  resetMemoryDb();
+  const content = 'Always route Scorpion sends through scorpion.co.';
+  const prot = rememberFact({ kind: 'feedback', content });
+  setFactPinned(prot.id, true);
+  const out = await consolidateFact(
+    { kind: 'feedback', text: 'Scorpion sends can route through any connection.' },
+    {},
+    { resolver: async () => ({ decision: 'UPDATE', target_id: prot.id, rewrite: 'Scorpion sends can route through any connection.' }) },
+  );
+  assert.equal(getFact(prot.id)?.content, content, 'pinned content is untouched');
+  assert.equal(out.updated, 0, 'no update tallied');
+  assert.equal(out.written, 1, 'candidate falls through to the conservative ADD');
+});
+
+test('consolidateFact: oversized resolver rewrite falls back to candidate text', async () => {
+  resetMemoryDb();
+  const target = rememberFact({ kind: 'project', content: 'Quarterly revenue target is 1M.' });
+  const out = await consolidateFact(
+    { kind: 'project', text: 'Quarterly revenue target is 2M.' },
+    {},
+    { resolver: async () => ({ decision: 'UPDATE', target_id: target.id, rewrite: 'x'.repeat(501) }) },
+  );
+  assert.equal(out.updated, 1, 'unpinned target is updated');
+  assert.equal(getFact(target.id)?.content, 'Quarterly revenue target is 2M.', 'cap rejects the 501-char rewrite in favor of candidate text');
 });
 
 // Cleanup

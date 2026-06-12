@@ -808,6 +808,21 @@ async function runAgentCycle(assistant: ClementineAssistant, agent: TeamAgentRec
       userId: agent.slug,
       model: agent.model ?? MODELS.fast,
       message: prompt,
+      // Autonomy cycles run unattended on the legacy loop, which carries
+      // none of the harness write gates (grounding / confirm-first /
+      // duplicate-bump). The cycle's contract is its JSON decision —
+      // applied by executeAgentActions — so external app actions and
+      // workflow mutation are out of scope BY DESIGN; until now that was
+      // prompt-steered only. Enforce it: no composio execution (the single
+      // chokepoint for every external send/write) and no workflow mutation.
+      excludeToolNames: [
+        'composio_execute_tool',
+        'workflow_create',
+        'workflow_update',
+        'workflow_set_enabled',
+        'workflow_delete',
+        'workflow_run',
+      ],
     });
     // Report-back honesty: if the runtime didn't finish cleanly, treat the cycle
     // as failed rather than parsing a half-baked / error-stub body as a decision.

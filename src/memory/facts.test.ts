@@ -296,6 +296,20 @@ test('listPinnedFacts returns only active pinned facts; unpin removes it', () =>
   assert.ok(!listPinnedFacts().some((p) => p.id === f.id));
 });
 
+test('rememberFact auto-pins constraint facts; other kinds stay unpinned', () => {
+  const constraint = rememberFact({ kind: 'constraint', content: 'Scorpion sends must use the scorpion.co connection.' });
+  assert.equal(constraint.pinned, true, 'a constraint is born pinned (always-rendered)');
+  const plain = rememberFact({ kind: 'user', content: 'Nathan reviews pipeline on Mondays.' });
+  assert.equal(plain.pinned, false, 'non-constraint kinds are unaffected');
+});
+
+test('constraint dedup-update keeps pinned', () => {
+  const first = rememberFact({ kind: 'constraint', content: 'Never email the staging list.' });
+  const again = rememberFact({ kind: 'constraint', content: 'Never email the staging list.' });
+  assert.equal(again.id, first.id, 'dedup hits the same row');
+  assert.equal(again.pinned, true, 'dedup-update path preserves the pin');
+});
+
 test('pinned fact is not double-rendered (excluded from the scored section)', () => {
   const f = rememberFact({ kind: 'feedback', content: 'Quote prices in USD only.' });
   setFactPinned(f.id, true);
@@ -642,4 +656,26 @@ test('importance-aware decay is OFF by default — binary behavior unchanged (hi
   db.prepare('UPDATE consolidated_facts SET updated_at=?, created_at=?, importance=9 WHERE id=?')
     .run(new Date(Date.now() - 300 * DAY_MS).toISOString(), new Date(Date.now() - 300 * DAY_MS).toISOString(), f.id);
   assert.ok(!decayAndEvictFacts({}).ids.includes(f.id), 'binary (default) mode never evicts a high-importance fact');
+});
+
+// ─── 2026-06-12 audit: singleton must survive rogue close + nightly merge ───
+
+test('openMemoryDb self-heals after a direct close of the cached handle', () => {
+  const db = openMemoryDb();
+  db.close(); // simulate a caller closing the singleton without closeMemoryDb
+  const reopened = openMemoryDb();
+  assert.equal(reopened.open, true, 'stale closed handle is dropped and reopened');
+  // And it actually works:
+  const f = rememberFact({ kind: 'project', content: 'Self-heal probe fact.' });
+  assert.ok(getFact(f.id), 'reopened handle serves reads/writes');
+});
+
+test('mergeParaphrases leaves the shared db connection usable', async () => {
+  const { mergeParaphrases } = await import('./memory-merge.js');
+  process.env.CLEMMY_MERGE_ENABLED = 'true';
+  await mergeParaphrases();
+  const db = openMemoryDb();
+  assert.equal(db.open, true, 'nightly merge must not close the singleton');
+  const f = rememberFact({ kind: 'project', content: 'Post-merge write probe.' });
+  assert.ok(getFact(f.id), 'memory writes still work after the merge job');
 });

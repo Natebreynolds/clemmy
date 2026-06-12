@@ -4,6 +4,7 @@ import { HarnessSession } from './session.js';
 import {
   appendEvent,
   getSession,
+  getToolOutput,
   listEvents,
   openEventLog,
   type AppendEventInput,
@@ -727,6 +728,32 @@ export const DEFAULT_MAX_CONVERSATION_WALL_MS = positiveIntEnv(
 
 const CONTINUATION_INPUT =
   'Continue with the next step of your plan. If you have nothing left to do, set done=true and nextAction=completed.';
+
+/**
+ * Async-dispatch completion shape: a successful `workflow_run` dispatch this
+ * turn IS the deliverable. The run executes in the daemon and re-enters this
+ * chat with its outcome on completion (workflow_run's originSessionId
+ * report-back), so judging the reply against the workflow's EVENTUAL artifact
+ * can only produce a false NOT-finished — which forces pointless
+ * workflow_run_status polling between dispatch and report-back (2026-06-12:
+ * 6 junk "still running" turns on a 3-minute run). Detection is exact: the
+ * queue tool's own success message, fetched from the tool-output store for a
+ * workflow_run call made in THIS turn. Fail-closed to judging as before.
+ */
+export function dispatchedBackgroundWorkflowRun(sessionId: string, turn: number): boolean {
+  try {
+    const calls = listEvents(sessionId, { types: ['tool_called'] })
+      .filter((ev) => ev.turn === turn
+        && (ev.data as { tool?: unknown } | undefined)?.tool === 'workflow_run');
+    for (const call of calls) {
+      const callId = (call.data as { callId?: unknown } | undefined)?.callId;
+      if (typeof callId !== 'string' || !callId) continue;
+      const output = getToolOutput(sessionId, callId)?.output ?? '';
+      if (/running in the BACKGROUND/i.test(output)) return true;
+    }
+  } catch { /* fail toward running the judge */ }
+  return false;
+}
 
 /**
  * v0.5.19 F2 — find the most recent preflight_budget_check event for
@@ -1590,6 +1617,10 @@ async function runConversationCore(
           // a real artifact or an honest blocker.
           promiseShaped: isPromiseShapedReply(decision.reply || decision.summary),
         })
+        // "I'll report back when it finishes" after a real workflow_run
+        // dispatch is NOT promise-shaped over-declaration — the report-back is
+        // wired. See dispatchedBackgroundWorkflowRun.
+        && !dispatchedBackgroundWorkflowRun(options.sessionId, turnResult.turn)
       ) {
         const responseText = decision.reply && decision.reply.trim() ? decision.reply : decision.summary;
         // Skill-execution rubric: if any skill was loaded this session, give the

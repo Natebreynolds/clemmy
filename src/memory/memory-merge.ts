@@ -263,12 +263,17 @@ export async function mergeParaphrases(): Promise<MergeStats> {
   };
 
   try {
+    // openMemoryDb returns the process-wide cached singleton — NEVER close it
+    // here. The nightly merge used to db.close() this handle on every exit
+    // path, leaving every later caller (recall, fact writes, listConstraints →
+    // the sender-constraint gate) a dead connection until daemon restart
+    // (audit 2026-06-12: "The database connection is not open" all day after
+    // the 4:45 AM merge).
     const db = openMemoryDb();
 
     const threshold = parseFloat(getRuntimeEnv('CLEMMY_MERGE_THRESHOLD', String(DEFAULT_MERGE_THRESHOLD)));
     if (threshold < 0 || threshold > 1) {
       logger.warn({ threshold }, 'invalid merge threshold, skipping merge job');
-      db.close();
       return stats;
     }
 
@@ -297,7 +302,6 @@ export async function mergeParaphrases(): Promise<MergeStats> {
       })) as Fact[];
 
     if (factsWithEmbedding.length < 2) {
-      db.close();
       return stats;
     }
 
@@ -393,7 +397,6 @@ export async function mergeParaphrases(): Promise<MergeStats> {
     }
 
     logger.info(stats, 'paraphrase merge job completed');
-    db.close();
   } catch (err) {
     stats.errors++;
     logger.error({ err: err instanceof Error ? err.message : String(err) }, 'paraphrase merge job failed');
@@ -419,7 +422,6 @@ export function unmergeCluster(canonicalId: number): boolean {
     const fs = require('fs');
     if (!fs.existsSync(auditPath)) {
       logger.warn({ auditPath }, 'audit log not found, cannot unmerge');
-      db.close();
       return false;
     }
 
@@ -439,7 +441,6 @@ export function unmergeCluster(canonicalId: number): boolean {
 
     if (!mergeEntry) {
       logger.warn({ canonicalId }, 'no merge entry found for canonical fact');
-      db.close();
       return false;
     }
 
@@ -460,7 +461,6 @@ export function unmergeCluster(canonicalId: number): boolean {
     });
 
     logger.info({ canonicalId, mergedIds }, 'unmerge cluster completed');
-    db.close();
     return true;
   } catch (err) {
     logger.error({ err: err instanceof Error ? err.message : String(err), canonicalId }, 'unmerge failed');

@@ -161,8 +161,11 @@ function checkApprovalCoherence(
     + 'and the workflow stays autonomous everywhere else.',
   );
 
-  // Must have explicit post-approval instructions.
-  const hasPostApprovalAction = /\b(?:after\s+approval|once\s+approved|when\s+approved|if\s+approved|on\s+approval)\b[\s\S]*?(?:call|invoke|run|execute|use|fire)\s+[`a-z_]/i
+  // Must have explicit post-approval instructions. Accept the common honest
+  // phrasings: action verbs beyond "call" (write/send/create/...) and the
+  // "request_approval returns Approved" form the error message itself
+  // suggests — the old verb list rejected coherent prompts (audit 2026-06-12).
+  const hasPostApprovalAction = /\b(?:after\s+approval|once\s+approved|when\s+approved|if\s+approved|on\s+approval|request_approval\s+returns\s+approved)\b[\s\S]*?(?:call|invoke|run|execute|use|fire|write|send|create|update|save|append|post|upload)\s+[`a-z_/]/i
     .test(prompt);
   if (!hasPostApprovalAction) {
     errors.push(

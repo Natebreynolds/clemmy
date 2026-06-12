@@ -2121,3 +2121,38 @@ test('isCodexAuthRevoked: a real revoke marker is terminal; a BARE model 401 is 
   assert.equal(isCodexAuthRevoked(new Error('scripted_throw'), 'scripted_throw'), false);
   assert.equal(isCodexAuthRevoked(null, 'some tool failed'), false);
 });
+
+// ─── 2026-06-12: async workflow dispatch is a complete deliverable ───────────
+
+test('dispatchedBackgroundWorkflowRun: detects a queued workflow_run this turn, not other turns/tools', async () => {
+  const { dispatchedBackgroundWorkflowRun } = await import('./loop.js');
+  const { writeToolOutput } = await import('./eventlog.js');
+  const sess = createSession({ kind: 'chat' });
+
+  // No calls at all → false.
+  assert.equal(dispatchedBackgroundWorkflowRun(sess.id, 1), false);
+
+  // A queued dispatch on turn 1.
+  appendEvent({
+    sessionId: sess.id, turn: 1, role: 'system', type: 'tool_called',
+    data: { tool: 'workflow_run', callId: 'call_wfrun_1', arguments: '{"name":"x"}' },
+  });
+  writeToolOutput({
+    sessionId: sess.id, callId: 'call_wfrun_1', tool: 'workflow_run',
+    output: 'Queued "x" (run 123-abc) — it is now running in the BACKGROUND. Tell the user…',
+  });
+  assert.equal(dispatchedBackgroundWorkflowRun(sess.id, 1), true, 'queued dispatch this turn is detected');
+  assert.equal(dispatchedBackgroundWorkflowRun(sess.id, 2), false, 'a different turn does not inherit the dispatch');
+
+  // A workflow_run whose output is NOT a queue success (e.g. validation refusal) → false.
+  const sess2 = createSession({ kind: 'chat' });
+  appendEvent({
+    sessionId: sess2.id, turn: 1, role: 'system', type: 'tool_called',
+    data: { tool: 'workflow_run', callId: 'call_wfrun_2', arguments: '{"name":"y"}' },
+  });
+  writeToolOutput({
+    sessionId: sess2.id, callId: 'call_wfrun_2', tool: 'workflow_run',
+    output: 'Workflow "y" is disabled.',
+  });
+  assert.equal(dispatchedBackgroundWorkflowRun(sess2.id, 1), false, 'a refused dispatch still gets judged');
+});

@@ -8,6 +8,7 @@ import {
   rememberFact,
   updateFact,
   deleteFact,
+  getFact,
   setFactPinned,
   findSimilarFacts,
   findSimilarFactsScored,
@@ -322,10 +323,15 @@ async function runExtractor(serialized: string): Promise<Extraction | null> {
 // Mem0-style conflict resolution (Chhikara et al §2.1)
 // ─────────────────────────────────────────────────────────────────
 
+// Same ceiling as the extraction schema's fact text. The resolver's
+// finalOutput is CAST, not zod-parsed, so the cap is re-enforced at the
+// updateFact call site — an oversized rewrite falls back to candidate.text.
+const CONFLICT_REWRITE_MAX_CHARS = 500;
+
 const ConflictDecisionSchema = z.object({
   decision: z.enum(['ADD', 'UPDATE', 'DELETE', 'NOOP']),
   target_id: z.number().int().nullable().optional(),
-  rewrite: z.string().min(3).max(500).optional(),
+  rewrite: z.string().min(3).max(CONFLICT_REWRITE_MAX_CHARS).optional(),
   reason: z.string().max(300).optional(),
 });
 
@@ -429,6 +435,9 @@ export interface ConsolidateOptions {
    *  resolver and ADD directly (the candidate is clearly novel). Omit to
    *  always run the resolver when similar facts exist (legacy behavior). */
   noveltyFastPathSim?: number;
+  /** Test seam: deterministic conflict resolver (defaults to the LLM
+   *  resolveConflict). Mirrors runRecursiveReflection's extractor option. */
+  resolver?: typeof resolveConflict;
 }
 
 /**
@@ -557,7 +566,7 @@ async function consolidateFactInner(
     return out;
   }
 
-  const decision = await resolveConflict(
+  const decision = await (opts.resolver ?? resolveConflict)(
     { kind: candidate.kind, text: candidate.text, trustLevel: candidate.trustLevel },
     similar,
   );
@@ -567,15 +576,34 @@ async function consolidateFactInner(
     return out;
   }
 
-  if (decision.decision === 'DELETE' && typeof decision.target_id === 'number') {
+  // Pinned facts are the always-rendered standing instructions — losing one
+  // silently removes live protection. A resolver decision is LLM output and
+  // must NEVER delete or rewrite a pinned fact; downgrade DELETE/UPDATE on a
+  // pinned target to the conservative ADD below (the candidate still lands).
+  const pinnedTargetId =
+    (decision.decision === 'DELETE' || decision.decision === 'UPDATE') &&
+    typeof decision.target_id === 'number' &&
+    getFact(decision.target_id)?.pinned
+      ? decision.target_id
+      : null;
+  if (pinnedTargetId !== null) {
+    console.warn(`[reflection] conflict resolver ${decision.decision} blocked: fact ${pinnedTargetId} is pinned — adding candidate instead`);
+  }
+
+  if (pinnedTargetId === null && decision.decision === 'DELETE' && typeof decision.target_id === 'number') {
     if (deleteFact(decision.target_id)) out.deleted = 1;
     // After delete we still ADD the new fact below — the deleted row
     // was the OLD state; the candidate captures the current state.
   }
 
-  if (decision.decision === 'UPDATE' && typeof decision.target_id === 'number') {
+  if (pinnedTargetId === null && decision.decision === 'UPDATE' && typeof decision.target_id === 'number') {
+    // Re-enforce the schema's rewrite cap (finalOutput is cast, not parsed).
+    const rewrite =
+      decision.rewrite && decision.rewrite.length <= CONFLICT_REWRITE_MAX_CHARS
+        ? decision.rewrite
+        : undefined;
     const updated = updateFact(decision.target_id, {
-      content: decision.rewrite || candidate.text,
+      content: rewrite || candidate.text,
       // Tool-derived candidates keep the historical 0.6; user candidates
       // pass 1.0. updateFact MAX-merges trust, so user always wins.
       trustLevel: candidate.trustLevel ?? 0.6,
@@ -1081,12 +1109,28 @@ export async function runRecursiveReflection(
           result.patternsNoop += 1;
           continue;
         }
-        if (decision.decision === 'DELETE' && typeof decision.target_id === 'number') {
+        // Same pinned guard as consolidateFact: this path runs NIGHTLY and
+        // unattended, on depth-2 inferences (trust 0.5) — the LAST place an
+        // LLM decision may delete/rewrite a pinned standing instruction.
+        const pinnedTarget =
+          (decision.decision === 'DELETE' || decision.decision === 'UPDATE') &&
+          typeof decision.target_id === 'number' &&
+          getFact(decision.target_id)?.pinned
+            ? decision.target_id
+            : null;
+        if (pinnedTarget !== null) {
+          console.warn(`[reflection] recursive resolver ${decision.decision} blocked: fact ${pinnedTarget} is pinned — adding pattern instead`);
+        }
+        if (pinnedTarget === null && decision.decision === 'DELETE' && typeof decision.target_id === 'number') {
           deleteFact(decision.target_id);
         }
-        if (decision.decision === 'UPDATE' && typeof decision.target_id === 'number') {
+        if (pinnedTarget === null && decision.decision === 'UPDATE' && typeof decision.target_id === 'number') {
+          const rewrite =
+            decision.rewrite && decision.rewrite.length <= CONFLICT_REWRITE_MAX_CHARS
+              ? decision.rewrite
+              : pattern.text;
           const updated = updateFact(decision.target_id, {
-            content: decision.rewrite || pattern.text,
+            content: rewrite,
             // Recursive patterns are inferences over inferences — keep
             // trust strictly below direct-derived (0.6) so user-stated
             // facts always win on conflict.

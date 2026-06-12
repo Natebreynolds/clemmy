@@ -238,6 +238,12 @@ export function rememberFact(input: RememberInput): ConsolidatedFact {
   const importance = typeof input.importance === 'number'
     ? Math.max(1, Math.min(10, input.importance))
     : 5.0;
+  // Constraints are hard rules that guard tool dispatch — they must be in the
+  // always-rendered pinned tier from birth, not only after a manual pin (an
+  // unpinned constraint can be scoped out of context exactly when it matters).
+  // Auto-pin on insert AND on the dedup-update path; setFactPinned still
+  // allows a manual unpin of a constraint the user no longer wants standing.
+  const autoPin = input.kind === 'constraint' ? 1 : 0;
 
   if (existing) {
     db.prepare(`
@@ -260,10 +266,13 @@ export function rememberFact(input: RememberInput): ConsolidatedFact {
           importance              = MAX(COALESCE(importance, 0), ?),
           -- v9: fill in source provenance if a later authoritative write
           -- knows it and the row didn't yet (don't clobber an existing one).
-          source_app              = COALESCE(source_app, ?)
+          source_app              = COALESCE(source_app, ?),
+          -- Constraint auto-pin: MAX so a re-write never UNpins a fact a
+          -- user or the safety path pinned.
+          pinned                   = MAX(pinned, ?)
       WHERE id = ?
     `).run(now, input.sessionId ?? null, input.path ?? null,
-           dfSession, dfCall, dfTool, trust, extractedAt, importance, input.sourceApp ?? null, existing.id);
+           dfSession, dfCall, dfTool, trust, extractedAt, importance, input.sourceApp ?? null, autoPin, existing.id);
     const refreshed = db.prepare('SELECT * FROM consolidated_facts WHERE id = ?')
       .get(existing.id) as ConsolidatedFactRow;
     return rowToFact(refreshed);
@@ -280,12 +289,12 @@ export function rememberFact(input: RememberInput): ConsolidatedFact {
        score, active, created_at, updated_at,
        derived_from_session_id, derived_from_call_id, derived_from_tool,
        trust_level, extracted_at, importance,
-       derivation_depth, derived_from_fact_ids, source_app)
-    VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       derivation_depth, derived_from_fact_ids, source_app, pinned)
+    VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(input.kind, content, hash, input.sessionId ?? null, input.path ?? null,
          initialScore, now, now,
          dfSession, dfCall, dfTool, trust, extractedAt, importance,
-         derivationDepth, derivedFromIdsJson, input.sourceApp ?? null);
+         derivationDepth, derivedFromIdsJson, input.sourceApp ?? null, autoPin);
 
   const inserted = db.prepare('SELECT * FROM consolidated_facts WHERE id = ?')
     .get(info.lastInsertRowid) as ConsolidatedFactRow;

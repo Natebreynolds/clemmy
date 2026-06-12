@@ -605,6 +605,11 @@ function runMigrations(db: Database.Database): void {
 }
 
 export function openMemoryDb(): Database.Database {
+  // Self-heal a dead cache: if some caller closed the handle directly
+  // (instead of closeMemoryDb, which resets the cache), every subsequent
+  // caller would get "The database connection is not open" until daemon
+  // restart. Drop the stale handle and reopen instead.
+  if (cached && !cached.open) cached = null;
   if (cached) return cached;
   ensureStateDir();
 

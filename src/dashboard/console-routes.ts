@@ -1910,7 +1910,18 @@ export function registerConsoleRoutes(
     if (readWorkflow(slug)) { res.status(409).json({ error: 'workflow already exists' }); return; }
     const description = typeof body.description === 'string' ? body.description : '';
     const steps = Array.isArray(body.steps) ? body.steps : [];
-    const triggerSchedule = typeof body.triggerSchedule === 'string' ? body.triggerSchedule.trim() : '';
+    // Accept the nested `trigger.schedule` shape as an alias, and REJECT any
+    // other non-empty `trigger` object instead of silently dropping it — a
+    // silently-unscheduled "overnight" workflow looks armed but never fires
+    // (audit 2026-06-12: a {trigger:{schedule}} create saved as manual-only).
+    const nestedSchedule = body.trigger && typeof body.trigger === 'object' && typeof (body.trigger as { schedule?: unknown }).schedule === 'string'
+      ? ((body.trigger as { schedule: string }).schedule).trim()
+      : '';
+    if (body.trigger && typeof body.trigger === 'object' && !nestedSchedule
+        && Object.keys(body.trigger as object).some((k) => k !== 'manual')) {
+      res.status(400).json({ error: 'unrecognized trigger shape — use top-level "triggerSchedule" (cron string) or {"trigger":{"schedule":"<cron>"}}' }); return;
+    }
+    const triggerSchedule = typeof body.triggerSchedule === 'string' ? body.triggerSchedule.trim() : nestedSchedule;
     const trigger = triggerSchedule ? { schedule: triggerSchedule, manual: true } : { manual: true };
     if (triggerSchedule && !validateCronExpression(triggerSchedule)) {
       res.status(400).json({ error: `invalid cron expression: "${triggerSchedule}"` }); return;
@@ -4950,7 +4961,16 @@ export function registerConsoleRoutes(
     const auditResolution = decision === 'reject' ? 'rejected' : 'approved';
 
     const harnessSession = HarnessSession.load(existing.sessionId);
-    const shouldResume = !!harnessSession?.loadInterruptState();
+    // Workflow sessions must NOT be resumed from here: their RunState was
+    // serialized under the WorkflowStep agent (+ step tool locks), which
+    // buildOrchestratorAgent cannot deserialize — RunState.fromString throws
+    // "Agent WorkflowStep not found", marks the session failed, and CLEARS the
+    // interrupt state the workflow runner needed. The runner owns workflow
+    // resumes (reapResolvedParkedRuns / its in-place approval poll rebuilds
+    // the correct agent); resolving the approval row here is sufficient.
+    const sessionRowForKind = getHarnessSession(existing.sessionId);
+    const shouldResume = sessionRowForKind?.kind !== 'workflow'
+      && !!harnessSession?.loadInterruptState();
     if (!shouldResume) {
       const result = approvalRegistry.resolve(
         id,
@@ -4965,7 +4985,7 @@ export function registerConsoleRoutes(
         ok: true,
         approval: result.row,
         message: `Approval ${decision === 'reject' ? 'rejected' : (decision === 'approve_with_edits' ? 'approved with edits' : 'approved')}: ${id}`,
-        status: 'resolved-stale',
+        status: sessionRowForKind?.kind === 'workflow' ? 'resolved-workflow-runner-resumes' : 'resolved-stale',
       });
       return;
     }
@@ -6524,6 +6544,33 @@ export function registerConsoleRoutes(
           if (preflight.surfaced) return;
         }
         const effectiveInput = goalRunInput ?? turnInput;
+        if (intent && harnessSession && session?.kind === 'workflow') {
+          // A workflow session's RunState deserializes only under the
+          // WorkflowStep agent — driving the resume here with the chat
+          // orchestrator fails AND clears the interrupt state the workflow
+          // runner needs (approval treadmill). Resolve the approvals and let
+          // the runner resume with the right agent (same rule as Discord's
+          // tryHandleHarnessApprovalReply and the /harness-approvals route).
+          const resolution = intent.decision === 'approve' ? 'approved' : 'rejected';
+          const resolvedIds: string[] = [];
+          for (const row of approvalRegistry.listPending({ sessionId, status: 'pending' })) {
+            const r = approvalRegistry.resolve(row.approvalId, resolution, 'chat-dock-user');
+            if (r.ok) resolvedIds.push(row.approvalId);
+          }
+          appendHarnessEvent({
+            sessionId,
+            turn: 0,
+            role: 'Clem',
+            type: 'conversation_completed',
+            data: {
+              reason: 'workflow_approval_resolved',
+              summary: `${resolution} ${resolvedIds.join(', ') || '(no pending approvals)'} — the workflow resumes on its own`,
+              reply: `${resolution === 'approved' ? 'Approved' : 'Rejected'} — the workflow picks this up and resumes by itself.`,
+              steps: 0,
+            },
+          });
+          return;
+        }
         const agent = await buildOrchestratorAgent({ userInput: effectiveInput, sessionId });
         if (intent && harnessSession) {
           await runConversationFromResume({
