@@ -757,8 +757,14 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
     res.json({ ok: true, preferences });
   });
 
-  app.get('/api/notifications', requireAuth, (_req, res) => {
-    res.json({ notifications: listNotifications(50) });
+  app.get('/api/notifications', requireAuth, (req, res) => {
+    // limit is capped to the command-center's 300-notification window so a
+    // Home-card deep link (/inbox?select=<id>) can always find its target —
+    // the feed reads 300 but this route returned only 50, stranding older
+    // anchors with an empty detail pane.
+    const rawLimit = Number(req.query.limit);
+    const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(Math.trunc(rawLimit), 1), 300) : 50;
+    res.json({ notifications: listNotifications(limit) });
   });
 
   app.get('/api/notifications/destinations', requireAuth, (_req, res) => {

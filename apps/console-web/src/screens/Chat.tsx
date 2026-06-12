@@ -68,7 +68,11 @@ function AttentionStrip({ needsYou, workingNow, onDismiss }: { needsYou: Command
       {needsYou.length > 3 && (
         <button
           type="button"
-          onClick={() => navigate(needsYou.some((item) => item.approvalId) ? '/inbox' : '/inbox?tab=notifications')}
+          onClick={() => navigate(
+            needsYou.some((item) => item.approvalId) ? '/inbox'
+              : needsYou.some((item) => item.notifId) ? '/inbox?tab=notifications'
+                : '/inbox',
+          )}
           className="text-small text-primary hover:underline cursor-pointer"
         >
           See all {needsYou.length} in Inbox
@@ -91,6 +95,7 @@ export function Chat() {
     if (!item.dismissKind || !item.dismissId) return;
     try { await dismissInboxItem(item.dismissKind, item.dismissId); } finally {
       void qc.invalidateQueries({ queryKey: ['command-center'] });
+      void qc.invalidateQueries({ queryKey: ['notifications'] });
     }
   };
   const chat = useChat();

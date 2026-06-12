@@ -227,20 +227,23 @@ test('markNotificationGroupRead clears the anchor plus title/workflow twins, lea
     { id: 'g1', kind: 'workflow', title: 'Clementine needs attention', body: '', createdAt: '2026-06-10T10:00:00Z', read: false },
     { id: 'g2', kind: 'workflow', title: 'clementine needs attention', body: '', createdAt: '2026-06-09T10:00:00Z', read: false },
     { id: 'g3', kind: 'workflow', title: 'Workflow needs attention: audit', body: '', createdAt: '2026-06-09T11:00:00Z', read: false, metadata: { workflow: 'audit' } },
-    { id: 'g4', kind: 'workflow', title: 'Workflow failed: audit', body: '', createdAt: '2026-06-08T11:00:00Z', read: false, metadata: { workflow: 'Audit' } },
+    { id: 'g4', kind: 'workflow', title: 'audit blocked on credentials', body: '', createdAt: '2026-06-08T11:00:00Z', read: false, metadata: { workflow: 'Audit' } },
     { id: 'g5', kind: 'workflow', title: 'Something else', body: '', createdAt: '2026-06-10T12:00:00Z', read: false },
+    { id: 'g6', kind: 'workflow', title: 'Workflow completed: audit', body: 'success report', createdAt: '2026-06-09T12:00:00Z', read: false, metadata: { workflow: 'audit', source: 'notify_user_tool' } },
   ]));
 
   // Title twins (case-insensitive), no workflow metadata.
   const clearedByTitle = markNotificationGroupRead('g1');
   assert.deepEqual(clearedByTitle.map((item) => item.id).sort(), ['g1', 'g2']);
 
-  // Workflow twins: same workflow key clears a differently-titled sibling.
+  // Workflow twins: same workflow key clears a differently-titled
+  // needs-attention sibling — but NOT the workflow's unread success report.
   const clearedByWorkflow = markNotificationGroupRead('g3');
   assert.deepEqual(clearedByWorkflow.map((item) => item.id).sort(), ['g3', 'g4']);
 
   const after = JSON.parse(readFileSync(NOTIFICATIONS_FILE, 'utf-8')) as { id: string; read: boolean }[];
   assert.equal(after.find((item) => item.id === 'g5')?.read, false);
+  assert.equal(after.find((item) => item.id === 'g6')?.read, false);
 
   // Unknown id is a no-op.
   assert.deepEqual(markNotificationGroupRead('missing'), []);

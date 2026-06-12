@@ -305,25 +305,44 @@ export function markNotificationRead(id: string): NotificationRecord | undefined
 }
 
 /**
+ * A notification that asks for the user's intervention (vs. a report of
+ * completed work). Shared by the command-center "Needs you" feed and the
+ * group-dismiss below so both sides agree on what a "needs attention"
+ * notification is.
+ */
+export function isNeedsAttentionNotification(
+  notification: Pick<NotificationRecord, 'title' | 'metadata'>,
+): boolean {
+  return notification.metadata?.needsAttention === true ||
+    Boolean(notification.metadata?.proposedFixId) ||
+    /\bblocked\b|needs attention|needs input|couldn['’]t finish|action required/i.test(notification.title || '');
+}
+
+/**
  * Mark a notification read together with its dedupe twins: every other
- * unread notification with the same title (case-insensitive) or the same
- * workflow. The command-center "Needs you" feed collapses duplicates by
- * title/workflow, so dismissing only the surfaced one just resurrects the
- * next-oldest twin behind it (whack-a-mole; observed 2026-06-11 with
- * repeated "Clementine needs attention" proactive briefs).
+ * unread notification with the same title (case-insensitive), plus
+ * same-workflow notifications that are themselves needs-attention. The
+ * command-center "Needs you" feed collapses duplicates by title/workflow,
+ * so dismissing only the surfaced one just resurrects the next-oldest twin
+ * behind it (whack-a-mole; observed 2026-06-11 with 179 unread
+ * outlook-triage-hourly duplicates behind one card).
+ *
+ * The workflow branch deliberately requires the twin to be needs-attention:
+ * a workflow's unrelated unread SUCCESS report must not be silently marked
+ * read by dismissing that workflow's failure card.
  */
 export function markNotificationGroupRead(id: string): NotificationRecord[] {
   const items = loadNotifications();
   const anchor = items.find((entry) => entry.id === id);
   if (!anchor) return [];
-  const titleKey = anchor.title.toLowerCase().trim();
+  const titleKey = (anchor.title || '').toLowerCase().trim();
   const workflowKey = typeof anchor.metadata?.workflow === 'string' ? anchor.metadata.workflow.toLowerCase() : '';
   const changed: NotificationRecord[] = [];
   for (const item of items) {
     if (item.read) continue;
     const itemWorkflow = typeof item.metadata?.workflow === 'string' ? item.metadata.workflow.toLowerCase() : '';
-    const sameTitle = item.title.toLowerCase().trim() === titleKey;
-    const sameWorkflow = Boolean(workflowKey) && itemWorkflow === workflowKey;
+    const sameTitle = Boolean(titleKey) && (item.title || '').toLowerCase().trim() === titleKey;
+    const sameWorkflow = Boolean(workflowKey) && itemWorkflow === workflowKey && isNeedsAttentionNotification(item);
     if (item.id !== id && !sameTitle && !sameWorkflow) continue;
     item.read = true;
     changed.push(item);

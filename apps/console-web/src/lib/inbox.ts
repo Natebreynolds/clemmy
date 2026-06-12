@@ -61,8 +61,11 @@ export const cancelStaleApprovals = () => apiPost('/api/console/approvals/cancel
 
 export const listRuns = (limit = 40) => apiGet<{ runs: RunRow[] }>(`/api/runs?limit=${limit}`);
 
+// 300 matches the command-center feed window — Home "Needs you" cards can
+// deep-link to any notification the feed surfaced, so the Inbox must be able
+// to find it (50 left older anchors unselectable).
 export const listNotifications = () =>
-  apiGet<{ notifications: NotificationRow[] }>('/api/notifications');
+  apiGet<{ notifications: NotificationRow[] }>('/api/notifications?limit=300');
 
 /** Dismiss a "Needs you" card (check-in / plan / proposal). */
 export const dismissInboxItem = (kind: string, id: string) =>

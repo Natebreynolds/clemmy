@@ -158,7 +158,7 @@ import type { CheckInUrgency } from '../agents/check-ins.js';
 import { createBackgroundTask, getBackgroundTask, listBackgroundTasks, processBackgroundTasks } from '../execution/background-tasks.js';
 import { getBackgroundTaskStatus } from '../execution/background-task-status.js';
 import { listRuns } from '../runtime/run-events.js';
-import { addNotification, listNotifications, markNotificationGroupRead, markStaleApprovalNotificationsRead } from '../runtime/notifications.js';
+import { addNotification, isNeedsAttentionNotification, listNotifications, markNotificationGroupRead, markStaleApprovalNotificationsRead } from '../runtime/notifications.js';
 import { actionBus, type ActionEvent } from '../runtime/action-bus.js';
 import { spaceStore } from '../spaces/store.js';
 import {
@@ -5385,10 +5385,9 @@ export function registerConsoleRoutes(
           .split('\n')
           .map((line) => line.trim())
           .find((line) => line && !line.startsWith('#') && !/^[{}\[\]\-=*`>|"',:]+$/.test(line)) || '';
-      const isNeedsAttentionNotif = (notification: { title: string; metadata?: Record<string, unknown> }): boolean =>
-        notification.metadata?.needsAttention === true ||
-        Boolean(notification.metadata?.proposedFixId) ||
-        /\bblocked\b|needs attention|needs input|couldn['’]t finish|action required/i.test(notification.title);
+      // Shared with markNotificationGroupRead so dismiss clears exactly the
+      // set of notifications this feed would surface.
+      const isNeedsAttentionNotif = isNeedsAttentionNotification;
       // Collapse the generic "Workflow completed/needs attention: <name>"
       // echo when a richer notify_user report already covers the same run —
       // otherwise every run double-reports (the clutter the inbox must avoid).
