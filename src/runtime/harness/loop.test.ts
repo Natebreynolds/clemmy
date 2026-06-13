@@ -63,7 +63,7 @@ import { Agent, RunContext, RunState, type AgentInputItem, type Runner } from '@
 
 const { resetEventLog, requestKill, listEvents, createSession, appendEvent } = await import('./eventlog.js');
 const { HarnessSession } = await import('./session.js');
-const { runTurn, runConversation, resumePendingApproval, isCodexAuthRevoked } = await import('./loop.js');
+const { runTurn, runConversation, resumePendingApproval, runConversationFromResume, isCodexAuthRevoked } = await import('./loop.js');
 type RunRunnerFn = import('./loop.js').RunRunnerFn;
 const { ToolCallsLimitExceeded } = await import('./brackets.js');
 const { listEvents: listEventsForConv } = await import('./eventlog.js');
@@ -1281,6 +1281,26 @@ test('honest-completion: a normal delivered reply still completes (delivered:tru
   });
   assert.equal(result.status, 'completed');
   assert.equal(listEvents(sess.id, { types: ['conversation_completed'] }).at(-1)!.data.delivered, true);
+});
+
+test('honest-completion: the live RESUME path (runConversationFromResume) also guards blocked replies', async () => {
+  resetEventLog();
+  const agent = new Agent({ name: 'ResumeBlockedTest', instructions: 'test' });
+  const sess = HarnessSession.create({ kind: 'chat', title: 'resume-blocked' });
+  sess.saveInterruptState(makeApprovalRunStateWithInterruptions(agent, [{
+    toolName: 'composio_execute_tool', callId: 'c1', argumentsJson: JSON.stringify({ tool_slug: 'X', arguments: '{}' }),
+  }]));
+  approvalRegistry.register({ sessionId: sess.id, subject: 'one draft', tool: 'composio_execute_tool', args: {} });
+  const runRunner: RunRunnerFn = async () => ({
+    history: [], lastResponseId: undefined,
+    finalOutput: { done: true, nextAction: 'completed', reply: 'I am blocked — I need your approval to proceed.', summary: 'blocked', reason: null },
+  });
+  const result = await runConversationFromResume({
+    agent, sessionId: sess.id, decision: 'approve', resolver: 'unit-test',
+    makeRunner: makeRunnerStub, runRunner,
+  });
+  assert.equal(result.status, 'awaiting_user_input', 'resume blocked reply must not bank completed');
+  assert.equal(listEvents(sess.id, { types: ['conversation_completed'] }).at(-1)!.data.delivered, false);
 });
 
 test('honest-completion: kill-switch off leaves blocked text completing (byte-identical)', async () => {

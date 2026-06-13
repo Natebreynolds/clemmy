@@ -3421,7 +3421,28 @@ async function runConversationFromResumeCore(opts: {
   // from step 2 since the resume covered step 1.
   let stepIndex = 1;
   while (stepIndex < maxSteps) {
-    if (!decision || decision.done) {
+    // Done-invariant (resume variant): mirror runConversation — a done:true with
+    // a contradictory awaiting_* nextAction must honor the conservative awaiting
+    // state, not bank completed. A null decision (unparseable output) still
+    // gracefully resolves done.
+    const doneStands = !decision || (decision.done
+      && decision.nextAction !== 'awaiting_user_input'
+      && decision.nextAction !== 'awaiting_approval'
+      && decision.nextAction !== 'awaiting_handoff_result');
+    if (decision && decision.done && !doneStands) {
+      safeAppend({
+        sessionId: opts.sessionId,
+        turn: lastTurn,
+        role: 'system',
+        type: 'guardrail_tripped',
+        data: {
+          kind: 'done_invariant',
+          message: `Model emitted done:true with nextAction:${decision.nextAction} — honoring the awaiting state, not banking completed.`,
+          nextAction: decision.nextAction,
+        },
+      });
+    }
+    if (doneStands) {
       // Render priority on the chat surface: prefer `reply` (user-facing)
       // over `summary` (internal META log). Mirrors the equivalent path
       // in runConversation at line ~286 — without this the resume path
@@ -3435,6 +3456,36 @@ async function runConversationFromResumeCore(opts: {
         : isCompletedAction
           ? `(The model marked the turn complete without producing a user-facing reply. This is a bug. Internal log: ${decision?.summary ?? '(none)'})`
           : decision?.summary;
+
+      // Honest-completion backstop (resume variant): a blocked/error-stub final
+      // reply converts to the honest awaiting_user_input. Ungated, deterministic,
+      // fail-open + monotonic, kill-switched (CLEMMY_VERIFY_DELIVERED).
+      if (verifyDeliveredEnabled() && matchesBlockedText(userVisibleSummary)) {
+        safeAppend({
+          sessionId: opts.sessionId,
+          turn: lastTurn,
+          role: 'system',
+          type: 'conversation_completed',
+          data: {
+            steps: stepIndex,
+            summary: userVisibleSummary,
+            internalSummary: decision?.summary,
+            reply: decision?.reply ?? null,
+            delivered: false,
+            blockedReason: (userVisibleSummary ?? '').slice(0, 400),
+          },
+        });
+        const goalForBlocked = safeActiveGoal(opts.sessionId);
+        if (goalForBlocked) safeAppendGoalLedger(goalForBlocked.id, 'blocked', userVisibleSummary ?? '');
+        return {
+          sessionId: opts.sessionId,
+          status: 'awaiting_user_input',
+          steps: stepIndex,
+          lastDecision: decision ?? undefined,
+          lastTurn,
+        };
+      }
+
       safeAppend({
         sessionId: opts.sessionId,
         turn: lastTurn,
@@ -3446,6 +3497,7 @@ async function runConversationFromResumeCore(opts: {
           internalSummary: decision?.summary,
           reply: decision?.reply ?? null,
           missingReply: isCompletedAction && !hasReply ? true : undefined,
+          delivered: true,
         },
       });
       return {
@@ -3456,6 +3508,9 @@ async function runConversationFromResumeCore(opts: {
         lastTurn,
       };
     }
+    // Unreachable in practice: a null decision makes doneStands true and returns
+    // above. The guard restores TS's non-null narrowing for the handlers below.
+    if (!decision) break;
     if (decision.nextAction === 'awaiting_user_input') {
       // Loop reconciliation (resume variant): same YOLO "never stuck" guard as
       // runConversation. If this turn's ask auto-resolved under YOLO standing
