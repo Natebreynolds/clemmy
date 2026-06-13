@@ -91,6 +91,13 @@ export interface CompactionOptions {
   layer3TokenFraction?: number;
   /** Disable specific layers via CLEMMY_AUTO_COMPACT=off|layer1_only. */
   disable?: 'off' | 'layer1_only' | undefined;
+  /**
+   * Stage-checkpoint (D2): force Layer 1 + Layer 2 unconditionally, regardless
+   * of token pressure. Used at a goal stage boundary to reset the context for
+   * the next milestone while the goal's ledger + criteria carry forward. Layer 3
+   * (fork) is suppressed — the checkpoint IS the reset.
+   */
+  forceLayer2?: boolean;
   /** Test injection. */
   now?: () => string;
 }
@@ -719,7 +726,8 @@ export async function compactSessionIfNeeded(
   // signal; item count only matters when those items are actually filling the
   // window.
   const layer1Trigger =
-    beforeTokens > budget * l1Frac
+    opts.forceLayer2
+    || beforeTokens > budget * l1Frac
     || (items.length > itemThreshold && beforeTokens > budget * l1ItemMinFrac);
   if (layer1Trigger) {
     const clipped = clipOldToolResults(nextItems, retainTurns, opts);
@@ -743,7 +751,7 @@ export async function compactSessionIfNeeded(
   }
 
   // Layer 2
-  if (postL1Tokens > budget * l2Frac) {
+  if (opts.forceLayer2 || postL1Tokens > budget * l2Frac) {
     const l2 = await summarizeOlderMessages(nextItems, session.id, retainMessages);
     result.layer2 = {
       applied: l2.applied,
@@ -762,9 +770,10 @@ export async function compactSessionIfNeeded(
     postL1Tokens = result.afterTokens;
   }
 
-  // Layer 3 — fork
+  // Layer 3 — fork. Suppressed during a forced stage checkpoint: that pass IS
+  // the reset, so we never also recommend a session fork on the same boundary.
   let forkRequest: ForkRequest | undefined;
-  if (postL1Tokens > budget * l3Frac) {
+  if (!opts.forceLayer2 && postL1Tokens > budget * l3Frac) {
     forkRequest = buildForkRequest(nextItems, session.id);
     result.layer3 = { applied: true, forkRequested: true };
   }
@@ -774,6 +783,35 @@ export async function compactSessionIfNeeded(
   }
 
   return { result, nextItems, forkRequest };
+}
+
+/**
+ * Stage-checkpoint compaction (D2): at a goal stage boundary, force a Layer 1 +
+ * Layer 2 pass so the next milestone starts with a lean context instead of
+ * dragging the whole prior-stage transcript. The goal's objective + criteria +
+ * ledger are re-injected fresh every turn from the store, so the summary
+ * carries everything needed. Persists the compacted snapshot. Best-effort:
+ * returns the compaction result (or null if disabled / nothing to do / error).
+ * Kill-switch CLEMMY_STAGE_CHECKPOINT=off.
+ */
+export async function checkpointGoalStage(session: HarnessSession): Promise<CompactionResult | null> {
+  if ((process.env.CLEMMY_STAGE_CHECKPOINT || 'on').toLowerCase() === 'off') return null;
+  try {
+    const items = session.toInputItems();
+    if (items.length <= 2) return null; // nothing worth checkpointing
+    const { result, nextItems } = await compactSessionIfNeeded(session, items, {
+      forceLayer2: true,
+      // Keep only the last couple of messages live; the rest distills to the
+      // summary + the goal ledger.
+      layer2RetainMessages: 2,
+    });
+    if (result.modified) session.updateConversationSnapshot(nextItems);
+    return result;
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn('[harness] checkpointGoalStage failed', err instanceof Error ? err.message : err);
+    return null;
+  }
 }
 
 function appendCondenserEvent(sessionId: string, result: CompactionResult): void {

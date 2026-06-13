@@ -26,7 +26,7 @@ import assert from 'node:assert/strict';
 import type { AgentInputItem } from '@openai/agents';
 
 const { resetEventLog, createSession, writeToolOutput, getToolOutput } = await import('./eventlog.js');
-const { clipOldToolResults, collapseOldCompletedToolPairs, compactSessionIfNeeded, validateCallIdReferences } = await import('./compaction.js');
+const { clipOldToolResults, collapseOldCompletedToolPairs, compactSessionIfNeeded, validateCallIdReferences, checkpointGoalStage } = await import('./compaction.js');
 const { estimateInputTokens } = await import('./token-estimator.js');
 const { HarnessSession } = await import('./session.js');
 
@@ -301,6 +301,48 @@ test('tool_outputs — call_id is scoped per session (no cross-session leakage)'
 // Cleanup
 process.on('exit', () => {
   try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* ignore */ }
+});
+
+// ─── D2: stage checkpoint ────────────────────────────────────────────────────
+
+test('forceLayer2 triggers Layer 1 even with abundant token headroom (the stage-checkpoint lever)', async () => {
+  resetEventLog();
+  const session = HarnessSession.create({ kind: 'chat', title: 'force test' });
+  const items: AgentInputItem[] = [];
+  for (let i = 0; i < 16; i++) {
+    const callId = `call_f${i}`;
+    items.push(userMessage(`turn ${i}`));
+    items.push(toolCall(callId, 'dataforseo.serp', `{"q":"q-${i}"}`));
+    items.push(toolResult(callId, `serp ${i} ${'z'.repeat(1000)}`));
+    writeToolOutput({ sessionId: session.id, callId, tool: 'dataforseo.serp', output: `serp ${i} ${'z'.repeat(1000)}` });
+  }
+  session.updateConversationSnapshot(items);
+  // Big budget (no token pressure) — without force this is a no-op (proven by
+  // the headroom test above). With force, Layer 1 runs and collapses old pairs.
+  const { result } = await compactSessionIfNeeded(session, items, {
+    inputBudgetTokens: 200_000, layer1ItemThreshold: 15, forceLayer2: true,
+  });
+  assert.ok(result.beforeTokens < 200_000 * 0.3, 'precondition: no token pressure');
+  assert.equal(result.layer1.applied, true, 'force runs Layer 1 regardless of headroom');
+  assert.equal(result.layer3.applied, false, 'Layer 3 fork is suppressed during a forced checkpoint');
+});
+
+test('checkpointGoalStage no-ops on a tiny session and when the kill-switch is off', async () => {
+  resetEventLog();
+  const tiny = HarnessSession.create({ kind: 'chat', title: 'tiny' });
+  tiny.updateConversationSnapshot([userMessage('hi')]);
+  assert.equal(await checkpointGoalStage(tiny), null, 'nothing worth checkpointing');
+
+  const session = HarnessSession.create({ kind: 'chat', title: 'kill-switch' });
+  const items: AgentInputItem[] = [];
+  for (let i = 0; i < 4; i++) { items.push(userMessage(`m${i}`)); items.push(userMessage(`a${i}`)); }
+  session.updateConversationSnapshot(items);
+  process.env.CLEMMY_STAGE_CHECKPOINT = 'off';
+  try {
+    assert.equal(await checkpointGoalStage(session), null, 'kill-switch makes it inert');
+  } finally {
+    delete process.env.CLEMMY_STAGE_CHECKPOINT;
+  }
 });
 
 test('compactSessionIfNeeded — Layer 1 does NOT clip on item-count alone when there is token headroom', async () => {

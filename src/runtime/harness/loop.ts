@@ -25,7 +25,7 @@ import {
   withHarnessRunContext,
   harnessToolBracketsEnabled,
 } from './brackets.js';
-import { compactSessionIfNeeded } from './compaction.js';
+import { compactSessionIfNeeded, checkpointGoalStage } from './compaction.js';
 import { buildAgentContextPacket } from './context-packet.js';
 import { getHarnessBudgetSettings, getElevatedBudget } from './budget-settings.js';
 import type { HarnessBudgetRuntime } from './budget-settings.js';
@@ -1628,6 +1628,13 @@ async function runConversationCore(
               evidence: evidenceText,
               nextTitle: nextStage?.title,
             });
+            // D2 checkpoint: reset the context at the stage boundary so the next
+            // milestone doesn't drag the whole prior-stage transcript. The goal's
+            // objective + criteria + ledger re-inject fresh, so nothing is lost.
+            try {
+              const cpSession = HarnessSession.load(options.sessionId);
+              if (cpSession) await checkpointGoalStage(cpSession);
+            } catch { /* checkpoint is best-effort */ }
           }
           if (nextStage) {
             nextInput = [
