@@ -1236,6 +1236,56 @@ test('objective judge: does NOT fire for a non-action (lookup) intent', async ()
   assert.equal(judgeInvoked, false, 'lookup intent must not invoke the objective judge');
 });
 
+test('honest-completion: a blocked/error-stub final reply does NOT bank as completed', async () => {
+  // The Done? trust-killer: a turn that ends "I can't proceed without your
+  // approval" previously returned status=completed (false green). The ungated
+  // blocked-text backstop converts it to the honest awaiting_user_input.
+  const sess = HarnessSession.create({ kind: 'workflow' }); // non-opted-in lane (judge never runs)
+  const runner = scriptedRunner([
+    { finalOutput: { summary: 'blocked', reply: 'I cannot complete this task — I need your approval to send.', done: true, nextAction: 'completed', reason: null } },
+  ]);
+  const result = await runConversation({
+    agent: makeAgentStub(), sessionId: sess.id, input: 'send the campaign',
+    makeRunner: makeRunnerStub, runRunner: runner,
+  });
+  assert.equal(result.status, 'awaiting_user_input', 'blocked reply must not report completed');
+  const completed = listEvents(sess.id, { types: ['conversation_completed'] });
+  assert.equal(completed.at(-1)!.data.delivered, false, 'event marked not-delivered');
+  assert.ok(completed.at(-1)!.data.blockedReason, 'blockedReason recorded');
+});
+
+test('honest-completion: a normal delivered reply still completes (delivered:true)', async () => {
+  const sess = HarnessSession.create({ kind: 'workflow' });
+  const runner = scriptedRunner([
+    { finalOutput: { summary: 'done', reply: 'Done — report saved to /tmp/report.md', done: true, nextAction: 'completed', reason: null } },
+  ]);
+  const result = await runConversation({
+    agent: makeAgentStub(), sessionId: sess.id, input: 'build the report',
+    makeRunner: makeRunnerStub, runRunner: runner,
+  });
+  assert.equal(result.status, 'completed');
+  assert.equal(listEvents(sess.id, { types: ['conversation_completed'] }).at(-1)!.data.delivered, true);
+});
+
+test('honest-completion: kill-switch off leaves blocked text completing (byte-identical)', async () => {
+  const prev = process.env.CLEMMY_VERIFY_DELIVERED;
+  process.env.CLEMMY_VERIFY_DELIVERED = 'off';
+  try {
+    const sess = HarnessSession.create({ kind: 'workflow' });
+    const runner = scriptedRunner([
+      { finalOutput: { summary: 'blocked', reply: 'I cannot complete this task without approval.', done: true, nextAction: 'completed', reason: null } },
+    ]);
+    const result = await runConversation({
+      agent: makeAgentStub(), sessionId: sess.id, input: 'send it',
+      makeRunner: makeRunnerStub, runRunner: runner,
+    });
+    assert.equal(result.status, 'completed', 'disabled → prior behavior');
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_VERIFY_DELIVERED;
+    else process.env.CLEMMY_VERIFY_DELIVERED = prev;
+  }
+});
+
 test('objective judge: off by default (no judgeCompletion opt-in)', async () => {
   const sess = HarnessSession.create({ kind: 'chat' });
   const runner = scriptedRunner([

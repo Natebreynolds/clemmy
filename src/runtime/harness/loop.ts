@@ -38,6 +38,7 @@ import {
 } from './budget.js';
 import { MODELS } from '../../config.js';
 import { judgeObjectiveComplete, shouldRunObjectiveJudge, isPromiseShapedReply, composeJudgedObjective, type ObjectiveJudgeFn } from './objective-judge.js';
+import { verifyDeliveredEnabled, matchesBlockedText } from './verify-delivered.js';
 import {
   getActiveGoalForSession,
   recordGoalValidation,
@@ -1775,6 +1776,47 @@ async function runConversationCore(
       // Goal contract: criteria still unmet after the attempt budget — the
       // user must SEE that, never a silent clean-looking completion.
       const userVisibleSummary = goalUnmetNote ? `${baseSummary}\n\n${goalUnmetNote}` : baseSummary;
+
+      // Honest-completion backstop (Done? node). The objective judge above only
+      // runs for opted-in ACTION objectives, so a turn that ends with an
+      // explicit blocked / "I can't proceed" / runtime-error stub — on a
+      // workflow step, a casual session, or any non-opted-in lane — currently
+      // banks as a clean "completed". That false green is the #1 trust-killer
+      // on long runs. This guard is deterministic (no model call — the judge
+      // already spent any call above), fail-open + monotonic (it can only
+      // convert a FALSE completed into an honest awaiting_user_input, never
+      // wedge a real completion), and kill-switched (CLEMMY_VERIFY_DELIVERED).
+      // awaiting_user_input is the honest terminal: a blocked reply IS waiting
+      // on the user/approval/credentials, and every downstream consumer already
+      // treats it as a non-completion that needs attention.
+      if (verifyDeliveredEnabled() && matchesBlockedText(userVisibleSummary)) {
+        safeAppend({
+          sessionId: options.sessionId,
+          turn: turnResult.turn,
+          role: 'system',
+          type: 'conversation_completed',
+          data: {
+            steps: stepIndex,
+            summary: userVisibleSummary,
+            internalSummary: decision.summary,
+            reply: decision.reply ?? null,
+            delivered: false,
+            blockedReason: userVisibleSummary.slice(0, 400),
+          },
+        });
+        const goalForBlocked = safeActiveGoal(options.sessionId);
+        if (goalForBlocked) {
+          safeAppendGoalLedger(goalForBlocked.id, 'blocked', userVisibleSummary);
+        }
+        return {
+          sessionId: options.sessionId,
+          status: 'awaiting_user_input',
+          steps: stepIndex,
+          lastDecision: decision,
+          lastTurn,
+        };
+      }
+
       safeAppend({
         sessionId: options.sessionId,
         turn: turnResult.turn,
@@ -1786,6 +1828,7 @@ async function runConversationCore(
           internalSummary: decision.summary,
           reply: decision.reply ?? null,
           missingReply: isCompletedAction && !hasReply ? true : undefined,
+          delivered: true,
         },
       });
       return {
