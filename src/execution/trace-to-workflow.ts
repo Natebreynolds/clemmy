@@ -276,9 +276,15 @@ export function traceToWorkflowDraft(
  * I/O wrapper: read a session's trace from harness.db and draft a workflow.
  * Thin — all logic is in the pure `traceToWorkflowDraft`.
  */
-export function draftWorkflowFromSession(sessionId: string): WorkflowDraft {
+/**
+ * Reconstruct a session's substantive tool sequence from the event log. The
+ * ONE reader shared by workflow promotion AND the skill distiller (C2) — a chat
+ * run and a successful task are the same thing, an executed tool sequence, so
+ * both read from this single substrate seam.
+ */
+export function readSessionTrace(sessionId: string): TraceToolCall[] {
   const events = listEvents(sessionId, { types: ['tool_called'] });
-  const calls: TraceToolCall[] = events
+  return events
     .map((e) => {
       const tool = typeof e.data.tool === 'string' ? e.data.tool : '';
       const args = typeof e.data.arguments === 'string'
@@ -288,6 +294,10 @@ export function draftWorkflowFromSession(sessionId: string): WorkflowDraft {
       return { tool, args, callId, slug: composioSlug(tool, args) };
     })
     .filter((c) => c.tool);
+}
+
+export function draftWorkflowFromSession(sessionId: string): WorkflowDraft {
+  const calls = readSessionTrace(sessionId);
   // getToolOutput is available for a future data-flow pass (match an upstream
   // output to a downstream arg); v1 keeps the linear chain.
   void getToolOutput;

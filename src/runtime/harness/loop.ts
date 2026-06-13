@@ -1645,6 +1645,10 @@ async function runConversationCore(
           continue;
         } else if (validation.pass) {
           satisfyGoal(activeGoal.id, 'external validation passed');
+          // Capability compounding (C2): a satisfied goal that did real
+          // discovery distills into a reusable draft skill. Fire-and-forget —
+          // it gates on novelty internally and never blocks completion.
+          void maybeDistillSkill(options.sessionId, goalPlan.objective, evidenceText, activeGoal.id);
         } else if (!validation.judgeFailedOpen && attempt < maxAttempts) {
           nextInput = [
             `You marked this done, but external validation of the session's pinned goal found unmet criteria (attempt ${attempt}/${maxAttempts}):`,
@@ -1708,6 +1712,17 @@ async function runConversationCore(
         } catch { /* fail-open: judge the raw input */ }
         const verdict = await objectiveJudge(judgedObjective, responseText ?? '', skillContext);
         if (!verdict.done) {
+          // Self-improvement (C4): a judged not-done where a DRAFT skill was
+          // loaded counts against that draft (pitfall + failureCount; quarantine
+          // at the threshold). Approved skills are never demoted. Best-effort.
+          if (loadedSkills.length > 0) {
+            void (async () => {
+              try {
+                const { reinforceDraftSkills } = await import('../../memory/skill-distiller.js');
+                reinforceDraftSkills(loadedSkills.map((s) => s.name), 'failure', verdict.reason);
+              } catch { /* best-effort */ }
+            })();
+          }
           objectiveJudgeContinuations += 1;
           safeAppend({
             sessionId: options.sessionId,
@@ -2078,6 +2093,28 @@ function safeActiveGoal(sessionId: string): PlanProposal | null {
  * `kind` distinguishes a completed turn from a check-in/blocker so the ledger
  * reads as a real timeline.
  */
+/** Fire-and-forget skill distillation on a satisfied goal. Dynamic import keeps
+ *  the distiller (and its model client) off the hot completion path; all gating
+ *  + error handling lives inside distillSkillFromSession. */
+function maybeDistillSkill(sessionId: string, objective: string, evidence: string, goalId: string): void {
+  void (async () => {
+    try {
+      const { distillSkillFromSession, reinforceDraftSkills } = await import('../../memory/skill-distiller.js');
+      // A satisfied goal is a validated success — reinforce any draft skills the
+      // session leaned on (promotes a proven draft toward approved).
+      try {
+        const usedDrafts = gatherSessionSkills(sessionId).map((s) => s.name);
+        if (usedDrafts.length > 0) reinforceDraftSkills(usedDrafts, 'success');
+      } catch { /* reinforcement is best-effort */ }
+      await distillSkillFromSession(sessionId, {
+        objective,
+        evidence,
+        origin: { kind: 'chat', sourceId: goalId },
+      });
+    } catch { /* distillation never affects the run */ }
+  })();
+}
+
 function safeAppendGoalLedger(goalId: string, kind: 'turn' | 'blocked', text: string): void {
   const body = (text ?? '').trim();
   if (!body) return;

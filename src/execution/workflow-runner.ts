@@ -3456,6 +3456,22 @@ async function processOneRunFile(
         !needsAttention && !goalRepursuing,
         needsAttention ? attentionReason : goalRepursuing ? 'pinned goal unmet — re-pursuing' : undefined,
       );
+      // Capability compounding (C3): a CLEAN run that did real discovery
+      // distills into a reusable draft skill. Fire-and-forget; the novelty gate
+      // skips routine cron runs internally, so this is a no-op for them.
+      if (!needsAttention && !goalRepursuing) {
+        void (async () => {
+          try {
+            const { distillSkillFromSessions } = await import('../memory/skill-distiller.js');
+            const stepSessionIds = (workflow.data.steps ?? []).map((s) => `workflow:${run.id}:${s.id}`);
+            await distillSkillFromSessions(stepSessionIds, {
+              objective: workflow.data.description || workflow.data.name,
+              evidence: typeof finalOutput === 'string' ? finalOutput : undefined,
+              sourceId: run.id,
+            });
+          } catch { /* distillation never affects the run */ }
+        })();
+      }
       const autoHealPaused = needsAttention && shouldStopAutoHeal(workflow.name);
       const escalationBanner = autoHealPaused
         ? `⚠️ "${workflow.data.name}" has failed ${ledger.consecutiveFailures} runs in a row — auto-heal is PAUSED to stop wasting tokens. Review the blocked step(s) below; if a recent auto-fix caused this, revert it with \`revert heal <id>\`. It resumes automatically after one clean run, and (for a scheduled workflow) consider disabling it until fixed.\n\n`

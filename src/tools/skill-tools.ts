@@ -105,8 +105,21 @@ export function registerSkillTools(server: McpServer): void {
             '',
           ].join('\n');
 
+      // A self-distilled DRAFT carries a trust banner: its proven tool slugs +
+      // arg shapes are reliable (they ran successfully once), but the procedure
+      // prose is unreviewed — so use it, but verify outputs.
+      const draftBanner = skill.frontmatter.tier === 'draft'
+        ? [
+            '🧪 DRAFT SKILL — self-distilled from a prior successful run'
+              + (skill.frontmatter.origin?.distilledAt ? ` on ${String(skill.frontmatter.origin.distilledAt).slice(0, 10)}` : '')
+              + '. The tool slugs and argument shapes below were PROVEN in that run; the procedure text is UNREVIEWED. Follow it, but verify the outputs.',
+            '',
+          ].join('\n')
+        : '';
+
       const head = [
         notReadyBanner,
+        draftBanner,
         `# ${skill.frontmatter.name || skill.name}`,
         skill.frontmatter.description ? `\n${skill.frontmatter.description}\n` : '',
       ].filter(Boolean).join('\n');
@@ -151,6 +164,44 @@ export function registerSkillTools(server: McpServer): void {
       ].join('\n');
 
       return textResult(`${head}\n\n${manifestLines}\n\n${crib}\n\n${executionContract}\n\n---\n${skill.body}`);
+    },
+  );
+
+  // Manual distillation front door ("remember how to do this"). Skips the
+  // novelty gate — the user explicitly asked — and distills the CURRENT
+  // session's tool trace into a reusable draft skill.
+  server.tool(
+    'skill_distill',
+    [
+      'Distill the work you just did in THIS conversation into a reusable DRAFT skill, so the capability compounds and you do not have to re-figure it out next time.',
+      'Use when the user says "remember how to do this", "save this as a skill/playbook", or after you worked out a non-obvious multi-step procedure worth keeping.',
+      'Captures the proven tool sequence + argument shapes; writes a draft skill the user can approve from the Skills panel.',
+    ].join('\n'),
+    {
+      objective: z.string().min(4).max(300).describe('One line: what capability this skill captures (e.g. "audit a law firm site and write the SEO brief").'),
+    },
+    async ({ objective }) => {
+      const { harnessRunContextStorage } = await import('../runtime/harness/brackets.js');
+      const sessionId = harnessRunContextStorage.getStore()?.sessionId;
+      if (!sessionId) {
+        return textResult('I can only distill a skill from inside an active conversation with a recorded tool trace.');
+      }
+      const { distillSkillFromSession } = await import('../memory/skill-distiller.js');
+      const result = await distillSkillFromSession(sessionId, {
+        objective,
+        origin: { kind: 'manual', sourceId: sessionId },
+        force: true,
+      });
+      switch (result.status) {
+        case 'written':
+          return textResult(`Distilled a draft skill: \`${result.name}\`. It's usable now (marked draft) — the user can approve or discard it from the Skills panel.`);
+        case 'skipped_duplicate':
+          return textResult(`This already matches an existing skill (\`${result.name}\`), so I didn't create a duplicate.`);
+        case 'skipped_disabled':
+          return textResult('Skill distillation is turned off (CLEMMY_SKILL_DISTILLER=off).');
+        default:
+          return textResult(`I couldn't distill a skill from this session (${result.detail ?? result.status}).`);
+      }
     },
   );
 }

@@ -35,6 +35,21 @@ const SOURCE_FILE = '.clementine-source.json';
 export interface SkillFrontmatter {
   name: string;
   description: string;
+  /**
+   * Capability compounding (C1): a self-distilled skill starts in the `draft`
+   * tier (usable, but unproven) and is promoted to `approved` by user blessing
+   * or repeated validated success. Absent ⇒ `approved` (every installed skill
+   * is untouched).
+   */
+  tier?: 'draft' | 'approved';
+  /** Where a distilled draft came from + when. */
+  origin?: { kind: 'chat' | 'workflow' | 'manual'; sourceId?: string; distilledAt?: string };
+  /** Times this draft was read into a session that then validated success. */
+  useCount?: number;
+  /** Times this draft was implicated in a judged failure. */
+  failureCount?: number;
+  /** A draft that failed too often — hidden from the index, kept on disk. */
+  quarantined?: boolean;
   /** Optional — free-form metadata. */
   [key: string]: unknown;
 }
@@ -323,13 +338,84 @@ export function recordSkillUpdateCheck(
 export function renderSkillsIndex(): string {
   const skills = listSkills();
   if (skills.length === 0) return '';
-  const lines = skills.map((s) => {
-    const desc = s.frontmatter.description || '(no description)';
-    return `- \`${s.name}\`: ${desc}`;
-  });
-  return [
-    'Installed skills (call `skill_read("<name>")` to load the full instructions when relevant):',
-    ...lines,
-    `Skills live on disk under ${SKILLS_DIR}/<name>/. Skills that bundle scripts/, src/, or references/ can be executed via run_shell_command with cwd set to the skill directory.`,
-  ].join('\n');
+  // Quarantined drafts vanish from the index (kept on disk for the dashboard).
+  const visible = skills.filter((s) => !s.frontmatter.quarantined);
+  const approved = visible.filter((s) => (s.frontmatter.tier ?? 'approved') !== 'draft');
+  const drafts = visible.filter((s) => s.frontmatter.tier === 'draft');
+  const line = (s: Skill) => `- \`${s.name}\`: ${s.frontmatter.description || '(no description)'}`;
+  const out: string[] = [];
+  if (approved.length > 0) {
+    out.push('Installed skills (call `skill_read("<name>")` to load the full instructions when relevant):');
+    out.push(...approved.map(line));
+  }
+  if (drafts.length > 0) {
+    out.push('');
+    out.push('Draft skills (self-distilled from past successful runs — usable, but verify outputs; their tool slugs/args were PROVEN, the procedure text is unreviewed):');
+    out.push(...drafts.map(line));
+  }
+  out.push(`Skills live on disk under ${SKILLS_DIR}/<name>/. Skills that bundle scripts/, src/, or references/ can be executed via run_shell_command with cwd set to the skill directory.`);
+  return out.join('\n');
+}
+
+// ─── Capability compounding: distilled draft skills (C1) ─────────────────────
+
+export interface DistilledSkillInput {
+  name: string;
+  description: string;
+  body: string;
+  origin: { kind: 'chat' | 'workflow' | 'manual'; sourceId?: string };
+}
+
+/**
+ * Write (or overwrite) a self-distilled DRAFT skill into the same skills dir as
+ * installed skills (a second directory was rejected — it would fork listSkills,
+ * the dashboard, and skill_read for no benefit). Returns the on-disk name, or
+ * null if the name is unsafe.
+ */
+export function writeDistilledSkill(input: DistilledSkillInput): string | null {
+  if (!isSafeSkillName(input.name)) return null;
+  ensureSkillsDir();
+  const dir = path.join(SKILLS_DIR, input.name);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  const frontmatter: SkillFrontmatter = {
+    name: input.name,
+    description: input.description,
+    tier: 'draft',
+    origin: { ...input.origin, distilledAt: new Date().toISOString() },
+    useCount: 0,
+    failureCount: 0,
+  };
+  const file = matter.stringify(`\n${input.body.trim()}\n`, frontmatter);
+  writeFileSync(path.join(dir, 'SKILL.md'), file, 'utf-8');
+  return input.name;
+}
+
+/** Patch a draft skill's frontmatter in place (counters, tier, quarantine).
+ *  No-op on a missing skill or one with no parseable file. Returns the updated
+ *  Skill or null. */
+export function updateSkillFrontmatter(
+  name: string,
+  patch: Partial<Pick<SkillFrontmatter, 'tier' | 'useCount' | 'failureCount' | 'quarantined'>>,
+): Skill | null {
+  const skill = loadSkill(name);
+  if (!skill) return null;
+  const merged: SkillFrontmatter = { ...skill.frontmatter, ...patch };
+  const file = matter.stringify(`\n${skill.body.trim()}\n`, merged);
+  writeFileSync(skill.skillPath, file, 'utf-8');
+  return loadSkill(name);
+}
+
+/** Append a dated pitfall line to a draft's body (self-improvement, C4),
+ *  reusing the Pitfalls section if it already exists. */
+export function appendSkillPitfall(name: string, line: string): Skill | null {
+  const skill = loadSkill(name);
+  if (!skill) return null;
+  const header = '## Pitfalls (observed)';
+  const trimmed = skill.body.trim();
+  const body = trimmed.includes(header)
+    ? `${trimmed}\n- ${line.trim()}`
+    : `${trimmed}\n\n${header}\n- ${line.trim()}`;
+  const file = matter.stringify(`\n${body}\n`, skill.frontmatter);
+  writeFileSync(skill.skillPath, file, 'utf-8');
+  return loadSkill(name);
 }
