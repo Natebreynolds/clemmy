@@ -1254,6 +1254,22 @@ test('honest-completion: a blocked/error-stub final reply does NOT bank as compl
   assert.ok(completed.at(-1)!.data.blockedReason, 'blockedReason recorded');
 });
 
+test('done-invariant: done:true + nextAction:awaiting_user_input does NOT bank completed', async () => {
+  // `done` and `nextAction` are independent schema fields; a contradictory
+  // done:true + awaiting_user_input must honor the conservative awaiting state.
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const runner = scriptedRunner([
+    { finalOutput: { summary: 'contradiction', reply: 'All set!', done: true, nextAction: 'awaiting_user_input', reason: null } },
+  ]);
+  const result = await runConversation({
+    agent: makeAgentStub(), sessionId: sess.id, input: 'do the thing',
+    makeRunner: makeRunnerStub, runRunner: runner,
+  });
+  assert.equal(result.status, 'awaiting_user_input', 'contradiction → honor awaiting, not completed');
+  const trips = listEvents(sess.id, { types: ['guardrail_tripped'] }).filter((e) => e.data.kind === 'done_invariant');
+  assert.equal(trips.length, 1, 'done_invariant guardrail recorded');
+});
+
 test('honest-completion: a normal delivered reply still completes (delivered:true)', async () => {
   const sess = HarnessSession.create({ kind: 'workflow' });
   const runner = scriptedRunner([

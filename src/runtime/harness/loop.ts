@@ -1555,7 +1555,32 @@ async function runConversationCore(
       };
     }
 
-    if (decision.done) {
+    // Done-invariant guardrail (Done? node). `done` and `nextAction` are
+    // INDEPENDENT schema fields, so the model can emit the contradiction
+    // `done:true` + `nextAction:awaiting_*` — declaring finished while also
+    // asking to wait. Banking that as completed masks a genuine needs-user
+    // turn (a false-done). Honor the MORE CONSERVATIVE awaiting signal: a
+    // done:true only STANDS when nextAction agrees (completed/abandoned).
+    // Falls through to the awaiting_user_input / awaiting_approval handlers
+    // below. Monotonic (only ever downgrades a contradictory completion).
+    const doneStands = decision.done
+      && decision.nextAction !== 'awaiting_user_input'
+      && decision.nextAction !== 'awaiting_approval'
+      && decision.nextAction !== 'awaiting_handoff_result';
+    if (decision.done && !doneStands) {
+      safeAppend({
+        sessionId: options.sessionId,
+        turn: turnResult.turn,
+        role: 'system',
+        type: 'guardrail_tripped',
+        data: {
+          kind: 'done_invariant',
+          message: `Model emitted done:true with nextAction:${decision.nextAction} — honoring the awaiting state, not banking completed.`,
+          nextAction: decision.nextAction,
+        },
+      });
+    }
+    if (doneStands) {
       // Goal contract (Phase 3): a session with an ACTIVE parked goal
       // validates self-declared completion against the PARKED criteria — the
       // model saying "done" is a trigger to validate, never the verdict.
