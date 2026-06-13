@@ -1,22 +1,10 @@
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
-import path from 'node:path';
-import { ASSISTANT_NAME, BASE_DIR, OWNER_NAME } from '../config.js';
+import { ASSISTANT_NAME, OWNER_NAME } from '../config.js';
 import { renderFactsForInstructions } from '../memory/facts.js';
+import { listActiveGoalSummaries } from '../memory/goals-list.js';
 import { loadSessionBrief, renderSessionContinuity } from '../memory/session-briefs.js';
 import { loadMemoryContext } from '../memory/vault.js';
 import { loadWorkingMemoryForSession } from '../memory/working-memory.js';
 import { renderProfileForInstructions } from '../runtime/user-profile.js';
-
-const GOALS_DIR = path.join(BASE_DIR, 'goals');
-
-interface GoalSummary {
-  id: string;
-  title: string;
-  status: string;
-  priority?: string;
-  nextActions?: string[];
-  targetDate?: string;
-}
 
 function section(title: string, body?: string, maxChars = 1800): string {
   const trimmed = body?.trim();
@@ -26,29 +14,12 @@ function section(title: string, body?: string, maxChars = 1800): string {
 }
 
 function buildVoiceGoalsContext(): string {
-  if (!existsSync(GOALS_DIR)) return '';
-  try {
-    const goals = readdirSync(GOALS_DIR)
-      .filter((file) => file.endsWith('.json'))
-      .map((file) => {
-        try {
-          return JSON.parse(readFileSync(path.join(GOALS_DIR, file), 'utf-8')) as GoalSummary;
-        } catch {
-          return null;
-        }
-      })
-      .filter((goal): goal is GoalSummary => Boolean(goal && (goal.status === 'active' || goal.status === 'blocked')))
-      .slice(0, 6);
-
-    return goals.map((goal) => {
-      const next = goal.nextActions?.[0] ? ` | next: ${goal.nextActions[0]}` : '';
-      const due = goal.targetDate ? ` | due: ${goal.targetDate}` : '';
-      const blocked = goal.status === 'blocked' ? ' | blocked' : '';
-      return `- [${goal.id}] ${goal.title}${blocked}${due}${next}`;
-    }).join('\n');
-  } catch {
-    return '';
-  }
+  return listActiveGoalSummaries({ limit: 6 }).map((goal) => {
+    const next = goal.nextActions?.[0] ? ` | next: ${goal.nextActions[0]}` : '';
+    const due = goal.targetDate ? ` | due: ${goal.targetDate}` : '';
+    const blocked = goal.status === 'blocked' ? ' | blocked' : '';
+    return `- [${goal.id}] ${goal.title}${blocked}${due}${next}`;
+  }).join('\n');
 }
 
 export function buildRealtimeVoiceInstructions(sessionId = 'console:home'): string {

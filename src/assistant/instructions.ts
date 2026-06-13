@@ -1,6 +1,5 @@
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
-import path from 'node:path';
-import { ASSISTANT_NAME, BASE_DIR, OWNER_NAME, getRuntimeEnv } from '../config.js';
+import { ASSISTANT_NAME, OWNER_NAME, getRuntimeEnv } from '../config.js';
+import { listActiveGoalSummaries } from '../memory/goals-list.js';
 import type { MemoryContext } from '../types.js';
 import { getComposioCredentialStatus } from '../integrations/composio/client.js';
 import { renderFactsForInstructions } from '../memory/facts.js';
@@ -14,7 +13,6 @@ import { renderMcpServersForInstructions } from '../runtime/mcp-config.js';
 import { readConnectedClis } from '../integrations/cli-catalog/catalog.js';
 import type { MessageIntent } from './message-intent.js';
 
-const GOALS_DIR = path.join(BASE_DIR, 'goals');
 
 /**
  * Align-then-execute guidance (the "intelligence" pillar of the converse →
@@ -34,45 +32,15 @@ function section(title: string, body?: string): string {
  *  present, so it can be surfaced even on a light (casual/meta) turn where the
  *  rest of working memory is intentionally withheld. */
 
-interface GoalSummary {
-  id: string;
-  title: string;
-  status: string;
-  priority: string;
-  nextActions: string[];
-  targetDate?: string;
-}
-
 function buildGoalsContext(): string {
-  if (!existsSync(GOALS_DIR)) return '';
-  try {
-    const goals = readdirSync(GOALS_DIR)
-      .filter((f) => f.endsWith('.json'))
-      .map((f) => {
-        try {
-          return JSON.parse(readFileSync(path.join(GOALS_DIR, f), 'utf-8')) as GoalSummary;
-        } catch {
-          return null;
-        }
-      })
-      .filter((g): g is GoalSummary => g !== null && (g.status === 'active' || g.status === 'blocked'))
-      .sort((a, b) => {
-        const order = { high: 0, medium: 1, low: 2 };
-        return (order[a.priority as keyof typeof order] ?? 1) - (order[b.priority as keyof typeof order] ?? 1);
-      })
-      .slice(0, 8);
-
-    if (goals.length === 0) return '';
-
-    return goals.map((g) => {
-      const next = g.nextActions?.[0] ? ` → ${g.nextActions[0]}` : '';
-      const due = g.targetDate ? ` (due ${g.targetDate})` : '';
-      const status = g.status === 'blocked' ? ' [BLOCKED]' : '';
-      return `- [${g.id}] ${g.title}${status}${due}${next}`;
-    }).join('\n');
-  } catch {
-    return '';
-  }
+  const goals = listActiveGoalSummaries({ limit: 8, sortByPriority: true });
+  if (goals.length === 0) return '';
+  return goals.map((g) => {
+    const next = g.nextActions?.[0] ? ` → ${g.nextActions[0]}` : '';
+    const due = g.targetDate ? ` (due ${g.targetDate})` : '';
+    const status = g.status === 'blocked' ? ' [BLOCKED]' : '';
+    return `- [${g.id}] ${g.title}${status}${due}${next}`;
+  }).join('\n');
 }
 
 function buildIntegrationsContext(): string {

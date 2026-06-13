@@ -25,28 +25,15 @@
  * immediately on the next turn — no daemon restart, no cached
  * snapshot.
  */
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
-import path from 'node:path';
-import { BASE_DIR } from '../config.js';
 import { loadMemoryContext } from '../memory/vault.js';
 import { renderFactsForInstructions, renderRecentlyLearnedForInstructions, listConstraints } from '../memory/facts.js';
 import { getActiveObjective, getFocusSnapshot } from '../memory/focus.js';
 import { renderSkillsIndex } from '../memory/skill-store.js';
 import { renderToolChoicesForContext } from '../memory/tool-choice-store.js';
 import { renderSourceMapForContext } from '../memory/source-map.js';
+import { listActiveGoalSummaries } from '../memory/goals-list.js';
 import { loadUserProfile, renderProfileForInstructions } from '../runtime/user-profile.js';
 import { loadProactivityPolicy } from './proactivity-policy.js';
-
-const GOALS_DIR = path.join(BASE_DIR, 'goals');
-
-interface GoalSummary {
-  id: string;
-  title: string;
-  status: string;
-  priority: string;
-  nextActions?: string[];
-  targetDate?: string;
-}
 
 function section(title: string, body: string | undefined | null): string {
   if (!body || !body.trim()) return '';
@@ -179,35 +166,16 @@ function renderActiveConstraints(): string {
 }
 
 function renderActiveGoals(): string {
-  if (!existsSync(GOALS_DIR)) return '';
-  try {
-    const goals = readdirSync(GOALS_DIR)
-      .filter((f) => f.endsWith('.json'))
-      .map((f) => {
-        try {
-          return JSON.parse(readFileSync(path.join(GOALS_DIR, f), 'utf-8')) as GoalSummary;
-        } catch {
-          return null;
-        }
-      })
-      .filter((g): g is GoalSummary => g !== null && (g.status === 'active' || g.status === 'blocked'))
-      .sort((a, b) => {
-        const order: Record<string, number> = { high: 0, medium: 1, low: 2 };
-        return (order[a.priority] ?? 1) - (order[b.priority] ?? 1);
-      })
-      .slice(0, 8);
-    if (goals.length === 0) return '';
-    return goals
-      .map((g) => {
-        const next = g.nextActions?.[0] ? ` → ${g.nextActions[0]}` : '';
-        const due = g.targetDate ? ` (due ${g.targetDate})` : '';
-        const status = g.status === 'blocked' ? ' [BLOCKED]' : '';
-        return `- [${g.id}] ${g.title}${status}${due}${next}`;
-      })
-      .join('\n');
-  } catch {
-    return '';
-  }
+  const goals = listActiveGoalSummaries({ limit: 8, sortByPriority: true });
+  if (goals.length === 0) return '';
+  return goals
+    .map((g) => {
+      const next = g.nextActions?.[0] ? ` → ${g.nextActions[0]}` : '';
+      const due = g.targetDate ? ` (due ${g.targetDate})` : '';
+      const status = g.status === 'blocked' ? ' [BLOCKED]' : '';
+      return `- [${g.id}] ${g.title}${status}${due}${next}`;
+    })
+    .join('\n');
 }
 
 /**
