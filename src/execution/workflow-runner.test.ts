@@ -610,6 +610,47 @@ test('deterministic step ENFORCES its output contract (regression guard: routes 
   assert.ok(readWorkflowEvents('det-contract-test', 'det-ok').map((e) => e.kind).includes('step_completed'));
 });
 
+test('workflow conversion: a plain step routes through the GATED harness loop when CLEMMY_HARNESS_WORKFLOW=on (not the legacy core)', async () => {
+  // Proves the staged workflow-step conversion (respondPreferHarness on the
+  // default-off `workflow` surface) actually rides the harness when flipped on,
+  // and the legacy core is NOT used. Combined with the architect/home behavioral
+  // smoke (respondPreferHarness returns valid step text) + the unchanged chaining
+  // (renderTemplate/stepOutputs), this closes the workflow-conversion validation.
+  const prev = process.env.CLEMMY_HARNESS_WORKFLOW;
+  const prevWUH = process.env.WORKFLOW_USE_HARNESS;
+  process.env.CLEMMY_HARNESS_WORKFLOW = 'on';
+  // Force the legacy/fallback branch (where this conversion lives): the PRIMARY
+  // path already rides the harness via runStepViaHarness when WORKFLOW_USE_HARNESS
+  // is on. This conversion gates the fallback through the bridge instead.
+  process.env.WORKFLOW_USE_HARNESS = 'off';
+  const { _setBridgeImplsForTests } = await import('../runtime/harness/respond-bridge.js');
+  _setBridgeImplsForTests({
+    configure: (async () => ({ ok: true })) as never,
+    buildAgent: (async () => ({})) as never,
+    runConversation: (async (opts: { sessionId: string }) => ({
+      sessionId: opts.sessionId, steps: 1, lastTurn: 1, status: 'completed',
+      lastDecision: { reply: 'HARNESS-STEP-OUTPUT', nextAction: 'completed' },
+    })) as never,
+  });
+  try {
+    let legacyCalled = false;
+    const ctx = {
+      workflow: { name: 'WF Harness Route', steps: [] },
+      workflowSlug: 'wf-harness-route', runId: 'wf-hr-1', inputs: {}, stepOutputs: {},
+      assistant: { respond: async () => { legacyCalled = true; return { text: 'LEGACY-OUTPUT', sessionId: 'x' }; } },
+      completedItems: new Map(), forEachFailures: [],
+    } as unknown as Parameters<typeof executeStep>[1];
+    const step = { id: 'route', prompt: 'produce output' } as unknown as Parameters<typeof executeStep>[0];
+    const out = await executeStep(step, ctx);
+    assert.equal(out, 'HARNESS-STEP-OUTPUT', 'step output came from the gated harness loop');
+    assert.equal(legacyCalled, false, 'legacy ungated core NOT used when the flag is on');
+  } finally {
+    _setBridgeImplsForTests({});
+    if (prev === undefined) delete process.env.CLEMMY_HARNESS_WORKFLOW; else process.env.CLEMMY_HARNESS_WORKFLOW = prev;
+    if (prevWUH === undefined) delete process.env.WORKFLOW_USE_HARNESS; else process.env.WORKFLOW_USE_HARNESS = prevWUH;
+  }
+});
+
 test('findContractViolationStep: finds the most-recent output_contract failure with its problems', () => {
   const events = [
     { t: '1', kind: 'step_started', stepId: 'a' },
