@@ -105,6 +105,17 @@ export interface BuildOrchestratorAgentOptions {
   sessionId?: string | null;
   /** Test/advanced override. */
   mcpToolScope?: McpToolScope;
+  /**
+   * Per-call tool-exclusion. Names listed here are filtered OUT of the agent's
+   * harness tool surface before construction (matched against the wrapped
+   * tool's name). This lets callers that need a NARROWED surface — the workflow
+   * architect (hides workflow_* mutators) and the autonomy lane (no external
+   * writes) — ride the gated harness loop instead of the legacy ungated core.
+   * Absent/empty ⇒ full surface (byte-identical to before). Does not affect
+   * external MCP-server tools, which are resolved dynamically; the real callers
+   * only ever exclude harness tools (workflow_*, composio_execute_tool).
+   */
+  excludeToolNames?: string[];
 }
 
 // ---------- internal helpers ----------
@@ -831,6 +842,14 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     // HARNESS_TOOL_BRACKETS is off, so this is safe to leave in even
     // before the flag flips default-on.
     tools: [plannerTool, buildRequestApprovalTool(), buildAskUserQuestionTool(), runWorkerTool, ...dedupedDiscoveryTools]
+      // Per-call tool-exclusion (narrowed surface for architect / autonomy lanes
+      // riding the harness loop). No-op when excludeToolNames is absent/empty.
+      .filter((t) => {
+        const names = options.excludeToolNames;
+        if (!names || names.length === 0) return true;
+        const name = (t as unknown as { name?: string }).name;
+        return !name || !names.includes(name);
+      })
       .map((t) => wrapToolForHarness(t as unknown as WrappableTool) as unknown as Tool<RuntimeContextValue>),
     // External MCP servers (DataForSEO, Supabase, browsermcp, etc.) the
     // user has configured. Tools surface as `<server>__<tool>` (e.g.

@@ -123,6 +123,24 @@ test('Orchestrator carries the harness guardrails', async () => {
   assert.ok(outputNames.includes('secret_leak'));
 });
 
+test('Orchestrator: excludeToolNames narrows the harness surface (unblocks architect/autonomy on the one loop)', async () => {
+  // The capability that lets narrowed-surface callers (workflow architect hides
+  // workflow_* mutators; autonomy excludes external writes) ride the GATED
+  // harness loop instead of the legacy ungated core. Additive: absent ⇒ full.
+  const full = await buildOrchestratorAgent();
+  const fullNames = new Set((full.tools ?? []).map((t) => (t as { name?: string }).name));
+  assert.ok(fullNames.has('composio_execute_tool') && fullNames.has('workflow_run'), 'baseline has the tools');
+
+  const exclude = ['composio_execute_tool', 'workflow_create', 'workflow_update', 'workflow_set_enabled', 'workflow_delete', 'workflow_run'];
+  const narrowed = await buildOrchestratorAgent({ excludeToolNames: exclude });
+  const narrowedNames = (narrowed.tools ?? []).map((t) => (t as { name?: string }).name);
+  for (const ex of exclude) assert.ok(!narrowedNames.includes(ex), `${ex} excluded`);
+  // Non-excluded tools survive (e.g. memory + planner still present).
+  assert.ok(narrowedNames.includes('memory_recall'), 'unrelated tools untouched');
+  // And the full surface is genuinely unchanged when nothing is excluded.
+  assert.equal((await buildOrchestratorAgent({ excludeToolNames: [] })).tools?.length, full.tools?.length);
+});
+
 test('Orchestrator is now the single agent — carries the union of all action tools (Phase 3)', async () => {
   // Phase 3 architecture (2026-05-20): no more sub-agent split. The
   // Orchestrator IS the agent — it has discovery + memory + workspace
