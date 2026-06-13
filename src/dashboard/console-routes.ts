@@ -6950,12 +6950,15 @@ export function registerConsoleRoutes(
     }
     const sessionId = requestedId || 'console:home';
     try {
-      const response = await assistant.respond({
-        message,
-        sessionId,
-        channel: 'cli',
-        userId: 'console',
-      });
+      // FORK collapse (staged): interactive console home chat through the gated
+      // harness loop (judgeCompletion ON for desktop/Discord parity). Default-OFF
+      // `home` staging surface → byte-identical to legacy until
+      // CLEMMY_HARNESS_HOME=on, then live-verified + baked in.
+      const response = await respondPreferHarness(
+        'home',
+        { message, sessionId, channel: 'cli', userId: 'console' },
+        (req) => assistant.respond(req),
+      );
       res.json({ sessionId, text: response.text, pendingApprovalId: response.pendingApprovalId });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });

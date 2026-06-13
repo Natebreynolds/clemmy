@@ -43,13 +43,15 @@ import { getRuntimeEnv } from '../../config.js';
 import { LOCAL_MCP_TOOL_NAMES } from '../../tools/catalog.js';
 import type { AssistantRequest, AssistantResponse } from '../../types.js';
 
-export type HarnessSurface = 'webhook' | 'cron' | 'background' | 'cli' | 'dashboard';
+export type HarnessSurface = 'webhook' | 'cron' | 'background' | 'cli' | 'dashboard' | 'home';
 
 /** Surfaces that are STAGED, not yet validated live: default OFF (legacy stays
  *  byte-identical) so a new conversion lands reversibly and Nathan flips the
  *  switch to live-verify, after which it bakes in and leaves this set. The
- *  already-validated surfaces (webhook/cron/background/cli) default ON. */
-const STAGING_SURFACES: ReadonlySet<HarnessSurface> = new Set<HarnessSurface>(['dashboard']);
+ *  already-validated surfaces (webhook/cron/background/cli) default ON. These
+ *  flags are TEMPORARY — they collapse to zero (legacy core deleted, conversions
+ *  baked in) once validated, so the net is a flag REDUCTION, not sprawl. */
+const STAGING_SURFACES: ReadonlySet<HarnessSurface> = new Set<HarnessSurface>(['dashboard', 'home']);
 
 /** The harness can only ENFORCE an exclusion for tools on its own local surface
  *  (buildOrchestratorAgent filters those by name). External MCP-server tools are
@@ -73,10 +75,13 @@ const SURFACE_CONFIG: Record<HarnessSurface, { kind: 'chat' | 'execution'; judge
   cli: { kind: 'chat', judgeCompletion: true },
   cron: { kind: 'execution', judgeCompletion: false },
   background: { kind: 'execution', judgeCompletion: false },
-  // One-shot console drafting endpoints (workflow architect, home chat): chat
-  // kind, but NO objective judge — a single drafting reply is not a multi-step
-  // action to validate, and the judge would only add latency/loops.
+  // One-shot console drafting endpoint (workflow architect): chat kind, but NO
+  // objective judge — a single drafting reply is not a multi-step action to
+  // validate, and the judge would only add latency/loops.
   dashboard: { kind: 'chat', judgeCompletion: false },
+  // Interactive console home chat: full chat parity with desktop/Discord, so
+  // the objective-completion judge is ON (same as the cli/webhook lanes).
+  home: { kind: 'chat', judgeCompletion: true },
 };
 
 export function harnessSurfaceEnabled(surface: HarnessSurface): boolean {

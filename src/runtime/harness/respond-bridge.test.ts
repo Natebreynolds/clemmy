@@ -44,6 +44,7 @@ beforeEach(() => {
   delete process.env.CLEMMY_HARNESS_WEBHOOK;
   delete process.env.CLEMMY_HARNESS_CRON;
   delete process.env.CLEMMY_HARNESS_DASHBOARD;
+  delete process.env.CLEMMY_HARNESS_HOME;
 });
 
 after(() => {
@@ -78,6 +79,16 @@ test('respondPreferHarness: dashboard (staged) routes to legacy by default — a
     async (req) => { legacyCalled += 1; return { text: 'legacy', sessionId: req.sessionId }; },
   );
   assert.equal(legacyCalled, 1, 'default-off staging surface → legacy (no behavior change)');
+});
+
+test('staged surfaces (dashboard, home) both default OFF; home is judge-ON for chat parity', async () => {
+  assert.equal(harnessSurfaceEnabled('dashboard'), false, 'architect drafting surface OFF');
+  assert.equal(harnessSurfaceEnabled('home'), false, 'home chat surface OFF');
+  // home routes legacy by default (byte-identical) — conversion is dormant until flipped.
+  _setBridgeImplsForTests({ configure: okConfigure, buildAgent: fakeAgentBuilder, runConversation: fakeRun({ status: 'completed' }) });
+  let legacyCalled = 0;
+  await respondPreferHarness('home', { message: 'hi', sessionId: 'home-staged' }, async (req) => { legacyCalled += 1; return { text: 'legacy', sessionId: req.sessionId }; });
+  assert.equal(legacyCalled, 1, 'home default-off → legacy');
 });
 
 test('respondPreferHarness: kill-switch routes to legacy', async () => {
