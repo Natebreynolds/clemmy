@@ -43,7 +43,13 @@ import { getRuntimeEnv } from '../../config.js';
 import { LOCAL_MCP_TOOL_NAMES } from '../../tools/catalog.js';
 import type { AssistantRequest, AssistantResponse } from '../../types.js';
 
-export type HarnessSurface = 'webhook' | 'cron' | 'background' | 'cli';
+export type HarnessSurface = 'webhook' | 'cron' | 'background' | 'cli' | 'dashboard';
+
+/** Surfaces that are STAGED, not yet validated live: default OFF (legacy stays
+ *  byte-identical) so a new conversion lands reversibly and Nathan flips the
+ *  switch to live-verify, after which it bakes in and leaves this set. The
+ *  already-validated surfaces (webhook/cron/background/cli) default ON. */
+const STAGING_SURFACES: ReadonlySet<HarnessSurface> = new Set<HarnessSurface>(['dashboard']);
 
 /** The harness can only ENFORCE an exclusion for tools on its own local surface
  *  (buildOrchestratorAgent filters those by name). External MCP-server tools are
@@ -67,10 +73,15 @@ const SURFACE_CONFIG: Record<HarnessSurface, { kind: 'chat' | 'execution'; judge
   cli: { kind: 'chat', judgeCompletion: true },
   cron: { kind: 'execution', judgeCompletion: false },
   background: { kind: 'execution', judgeCompletion: false },
+  // One-shot console drafting endpoints (workflow architect, home chat): chat
+  // kind, but NO objective judge — a single drafting reply is not a multi-step
+  // action to validate, and the judge would only add latency/loops.
+  dashboard: { kind: 'chat', judgeCompletion: false },
 };
 
 export function harnessSurfaceEnabled(surface: HarnessSurface): boolean {
-  const raw = (getRuntimeEnv(`CLEMMY_HARNESS_${surface.toUpperCase()}`, 'on') ?? 'on').trim().toLowerCase();
+  const dflt = STAGING_SURFACES.has(surface) ? 'off' : 'on';
+  const raw = (getRuntimeEnv(`CLEMMY_HARNESS_${surface.toUpperCase()}`, dflt) ?? dflt).trim().toLowerCase();
   return !(raw === 'off' || raw === '0' || raw === 'false' || raw === 'no');
 }
 

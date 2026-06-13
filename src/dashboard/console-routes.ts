@@ -178,6 +178,7 @@ import {
 } from '../runtime/harness/eventlog.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { runConversation, runConversationFromResume } from '../runtime/harness/loop.js';
+import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
 import { runPlanFirstPreflight, shouldUsePlanFirst } from '../runtime/harness/plan-first.js';
 import { routeOpenQuestionPlan } from '../runtime/harness/plan-continuity.js';
 import { getHarnessBudgetSnapshot, saveHarnessBudgetSettings } from '../runtime/harness/budget-settings.js';
@@ -2265,7 +2266,12 @@ export function registerConsoleRoutes(
     ].filter(Boolean).join('\n\n');
 
     try {
-      const response = await assistant.respond({
+      // FORK collapse (staged): route through the GATED harness loop, which now
+      // enforces the workflow_* exclusion (the architect's diff-card backstop).
+      // Gated by the default-OFF `dashboard` staging surface → byte-identical to
+      // the legacy path until CLEMMY_HARNESS_DASHBOARD=on, then live-verified +
+      // baked in. The 5 gates the legacy core lacks come for free on the loop.
+      const architectReq = {
         message: prompt,
         sessionId: `console:workflow-architect:${body.draftName ?? 'new'}`,
         channel: 'cli',
@@ -2276,7 +2282,8 @@ export function registerConsoleRoutes(
         // model cannot bypass the diff-card flow even if the prompt is
         // ignored. See RunRequest.excludeToolNames.
         excludeToolNames: ARCHITECT_HIDDEN_TOOLS,
-      });
+      };
+      const response = await respondPreferHarness('dashboard', architectReq, (req) => assistant.respond(req));
       const { text, diff } = extractArchitectDiff(response.text ?? '');
       res.json({ text, diff });
     } catch (err) {

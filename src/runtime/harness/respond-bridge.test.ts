@@ -43,6 +43,7 @@ beforeEach(() => {
   _setBridgeImplsForTests({});
   delete process.env.CLEMMY_HARNESS_WEBHOOK;
   delete process.env.CLEMMY_HARNESS_CRON;
+  delete process.env.CLEMMY_HARNESS_DASHBOARD;
 });
 
 after(() => {
@@ -57,6 +58,26 @@ test('harnessSurfaceEnabled: default on, kill-switch values off', () => {
   assert.equal(harnessSurfaceEnabled('webhook'), false);
   process.env.CLEMMY_HARNESS_WEBHOOK = 'on';
   assert.equal(harnessSurfaceEnabled('webhook'), true);
+});
+
+test('harnessSurfaceEnabled: STAGED surface (dashboard) defaults OFF; validated surfaces default ON', () => {
+  // A new conversion lands behind a default-OFF staging surface → byte-identical
+  // to legacy until Nathan flips it on to live-verify, then it bakes in.
+  assert.equal(harnessSurfaceEnabled('dashboard'), false, 'staged surface OFF by default');
+  assert.equal(harnessSurfaceEnabled('cli'), true, 'validated surface ON by default');
+  process.env.CLEMMY_HARNESS_DASHBOARD = 'on';
+  assert.equal(harnessSurfaceEnabled('dashboard'), true, 'flips on when set');
+});
+
+test('respondPreferHarness: dashboard (staged) routes to legacy by default — architect conversion is byte-identical until flipped', async () => {
+  _setBridgeImplsForTests({ configure: okConfigure, buildAgent: fakeAgentBuilder, runConversation: fakeRun({ status: 'completed' }) });
+  let legacyCalled = 0;
+  await respondPreferHarness(
+    'dashboard',
+    { message: 'draft a workflow', sessionId: 'arch-staged', excludeToolNames: ['workflow_create', 'workflow_run'] },
+    async (req) => { legacyCalled += 1; return { text: 'legacy', sessionId: req.sessionId }; },
+  );
+  assert.equal(legacyCalled, 1, 'default-off staging surface → legacy (no behavior change)');
 });
 
 test('respondPreferHarness: kill-switch routes to legacy', async () => {
