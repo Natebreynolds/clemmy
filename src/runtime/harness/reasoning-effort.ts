@@ -1,37 +1,37 @@
 /**
  * Dynamic reasoning effort (per-turn). gpt-5.x reasoning models "think" before
- * emitting any token, and that think-time is the dominant latency on simple
- * turns (a calendar lookup paid ~3s of deliberation it didn't need). Instead of
- * a single fixed effort, pick it per turn from the input: trivial lookups go
- * FAST (low), genuinely complex/multi-step work keeps FULL depth (high), and the
- * ambiguous middle stays balanced (medium).
+ * emitting any token, and reasoning depth is the dominant per-turn latency knob.
  *
- * Conservative by design — the cost of a misclassification is bounded: a `low`
- * on a medium task loses a little deliberation; a `medium` on a hard task is
- * roughly today's behavior. Only CLEARLY-trivial turns drop to `low`, and the
- * default for anything uncertain (incl. continuations like "go ahead", which
- * can kick off real work) is `medium`.
+ * GROUND TRUTH (verified against @openai/agents-core + the user's gpt-5.5 setup):
+ * the orchestrator carries NO explicit modelSettings, so the SDK injects its
+ * per-model default — for gpt-5.5 that is `reasoning.effort: 'none'`. So simple
+ * turns are ALREADY at minimum effort; there is no over-reasoning to cut on a
+ * calendar lookup. The real lever is the other direction: let genuinely complex,
+ * multi-step agentic turns think HARDER (where depth changes whether a hard task
+ * completes) while leaving simple turns exactly as fast as today.
  *
- * Kill-switch: CLEMMY_DYNAMIC_REASONING=off → return null (no reasoning field
- * is sent, i.e. the model's own default — byte-identical to before this).
+ * Mapping (monotonic ladder; only RAISES effort above the 'none' baseline, and
+ * only for non-simple work — so the common fast path is byte-identical to today):
+ *   simple   → 'none'    (= today's gpt-5.5 default; fastest; zero regression)
+ *   moderate → 'medium'  (real routing/decision depth)
+ *   complex  → 'high'    (full depth for multi-domain / read+write / batched work)
+ *   active goal (any complexity) → 'high'  (autonomous work, latency tolerable)
+ *
+ * Complexity is NOT re-derived here — we reuse the harness's existing
+ * `classifyComplexity` (context-packet.ts), already computed every turn, so this
+ * is one source of truth, not a duplicate classifier.
+ *
+ * Kill-switch: CLEMMY_DYNAMIC_REASONING=off → caller skips injection entirely
+ * (SDK per-model default rides; byte-identical to before this feature).
  */
 import { getRuntimeEnv } from '../../config.js';
+import type { AgentContextPacket } from './context-packet.js';
 
-export type ReasoningEffort = 'minimal' | 'low' | 'medium' | 'high';
+export type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high';
 
 export function dynamicReasoningEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_DYNAMIC_REASONING', 'on') ?? 'on').toLowerCase() !== 'off';
 }
-
-/** A bare ack/continuation — but a continuation can trigger real work, so these
- *  resolve to `medium`, never `low`. */
-const CONTINUATION = /^(yes|yep|yeah|ya|ok|okay|kk|k|go ahead|do it|go for it|continue|proceed|keep going|sounds good|looks good|perfect|great|sure|please do|👍|👍🏻|👍🏼)\b[\s.!]*$/i;
-
-/** Multi-step / heavy-reasoning signals → full depth. */
-const COMPLEX = /\b(research|analy[sz]e|analysis|audit|build|design|draft|compose|write\s*up|outline|plan\b|planning|strateg(y|ize)|roadmap|compare|evaluate|assess|migrate|refactor|debug|diagnose|investigate|troubleshoot|break\s*down|step[\s-]?by[\s-]?step|all\s+(my|the|of)|every\b|each\b|batch|fan\s*out|workflow|pipeline|enrich|prospect|outreach|campaign|proposal|brief)\b/i;
-
-/** Short read-only lookups / questions → fast. */
-const LOOKUP = /^(what|what's|whats|when|where|who|which|why|how\s+many|how\s+much|do\s+i|does|did|is\s+there|are\s+there|show\s+me|show|list|find|check|get|count|tell\s+me|any\b|remind\s+me)\b/i;
 
 export interface EffortSignals {
   /** True when the session has an active goal/plan — bias toward depth. */
@@ -39,24 +39,21 @@ export interface EffortSignals {
 }
 
 /**
- * Pick the reasoning effort for a turn from its input. Pure + cheap (no LLM).
- * Returns null when the feature is disabled (caller sends no reasoning field).
+ * Map the turn's complexity (+ signals) to a reasoning effort. Pure + cheap.
+ * `complexity` comes from the harness context packet (`classifyComplexity`).
  */
 export function selectReasoningEffort(
-  input: string,
+  complexity: AgentContextPacket['complexity'],
   signals: EffortSignals = {},
 ): { effort: ReasoningEffort; reason: string } {
-  const text = (input ?? '').trim();
-  const words = text ? text.split(/\s+/).length : 0;
-
   if (signals.hasActiveGoal) return { effort: 'high', reason: 'active-goal' };
-  if (COMPLEX.test(text)) return { effort: 'high', reason: 'complex-keyword' };
-  if (words > 40) return { effort: 'high', reason: 'long-input' };
-  if (/\band\b/i.test(text) && words > 22) return { effort: 'high', reason: 'multi-clause' };
-
-  if (!CONTINUATION.test(text) && words <= 12 && (LOOKUP.test(text) || text.endsWith('?'))) {
-    return { effort: 'low', reason: 'short-lookup' };
+  switch (complexity) {
+    case 'complex':
+      return { effort: 'high', reason: 'complexity:complex' };
+    case 'moderate':
+      return { effort: 'medium', reason: 'complexity:moderate' };
+    case 'simple':
+    default:
+      return { effort: 'none', reason: 'complexity:simple' };
   }
-
-  return { effort: 'medium', reason: 'default' };
 }

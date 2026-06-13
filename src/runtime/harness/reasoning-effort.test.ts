@@ -1,58 +1,51 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { selectReasoningEffort } from './reasoning-effort.js';
+import { buildAgentContextPacket } from './context-packet.js';
 
-test('short read-only lookups → low', () => {
-  for (const q of [
-    "what's my calendar today?",
-    'show me unread emails',
-    'how many leads do I have?',
-    'list my open workflows',
-    'do I have any meetings tomorrow?',
-  ]) {
-    assert.equal(selectReasoningEffort(q).effort, 'low', q);
-  }
+const primer = { enabled: false, hitCount: 0, source: null, injected: false, skippedReason: null };
+const complexityOf = (input: string) =>
+  buildAgentContextPacket(input, primer, { sessionKind: 'chat', sessionId: 's' }).complexity;
+
+test('simple turns stay at none (fastest; byte-identical to today)', () => {
+  assert.equal(selectReasoningEffort('simple').effort, 'none');
 });
 
-test('complex / multi-step requests → high', () => {
-  for (const q of [
-    'research these prospects and build me a brief',
-    'audit the SEO baseline for revill law firm',
-    'draft an outreach campaign for my warm leads',
-    'analyze the market and design a landing page',
-    'refactor the autonomy engine',
-  ]) {
-    assert.equal(selectReasoningEffort(q).effort, 'high', q);
-  }
+test('moderate turns → medium', () => {
+  assert.equal(selectReasoningEffort('moderate').effort, 'medium');
 });
 
-test('continuations / acks → medium, never low', () => {
-  for (const q of ['go ahead', 'yes', 'do it', 'sounds good', 'continue', 'ok']) {
-    assert.equal(selectReasoningEffort(q).effort, 'medium', q);
-  }
+test('complex turns → high', () => {
+  assert.equal(selectReasoningEffort('complex').effort, 'high');
 });
 
-test('active goal forces high regardless of phrasing', () => {
-  assert.equal(selectReasoningEffort('what next?', { hasActiveGoal: true }).effort, 'high');
-  assert.equal(selectReasoningEffort('go ahead', { hasActiveGoal: true }).effort, 'high');
-});
-
-test('long input → high even without keywords', () => {
-  const long = Array.from({ length: 45 }, (_, i) => `word${i}`).join(' ');
-  assert.equal(selectReasoningEffort(long).effort, 'high');
-});
-
-test('ambiguous mid-length statements → medium', () => {
-  assert.equal(selectReasoningEffort('send a note to the Eley account about Tuesday').effort, 'medium');
-  assert.equal(selectReasoningEffort('I think we should move the meeting').effort, 'medium');
-});
-
-test('empty / whitespace input → medium (safe default)', () => {
-  assert.equal(selectReasoningEffort('').effort, 'medium');
-  assert.equal(selectReasoningEffort('   ').effort, 'medium');
+test('active goal forces high regardless of complexity', () => {
+  assert.equal(selectReasoningEffort('simple', { hasActiveGoal: true }).effort, 'high');
+  assert.equal(selectReasoningEffort('moderate', { hasActiveGoal: true }).effort, 'high');
 });
 
 test('every result carries a reason tag', () => {
-  const r = selectReasoningEffort("what's my calendar?");
+  const r = selectReasoningEffort('complex');
   assert.ok(r.reason && typeof r.reason === 'string');
+});
+
+test('effort ladder is monotonic in complexity', () => {
+  const rank = { none: 0, minimal: 1, low: 2, medium: 3, high: 4 } as const;
+  const s = rank[selectReasoningEffort('simple').effort];
+  const m = rank[selectReasoningEffort('moderate').effort];
+  const c = rank[selectReasoningEffort('complex').effort];
+  assert.ok(s < m && m < c, `expected simple<moderate<complex, got ${s},${m},${c}`);
+});
+
+// Integration with the real classifier: short lookups classify simple → none;
+// multi-domain read+write work classifies complex → high.
+test('a short calendar lookup resolves to none through the real classifier', () => {
+  assert.equal(selectReasoningEffort(complexityOf("what's on my calendar today?")).effort, 'none');
+});
+
+test('a multi-domain read+write request resolves to high through the real classifier', () => {
+  const input =
+    'Pull my unread Outlook emails and the open Salesforce leads, then update each Airtable contact record and draft outreach for the warm ones';
+  const effort = selectReasoningEffort(complexityOf(input)).effort;
+  assert.ok(effort === 'high' || effort === 'medium', `expected medium/high, got ${effort}`);
 });

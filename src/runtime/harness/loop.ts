@@ -2710,27 +2710,45 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   // (session.toInputItems() returns everything), so codex sees the
   // complete conversation on every call without needing server state.
 
-  // Dynamic reasoning effort (per-turn): trivial lookups think LOW (fast),
-  // complex/multi-step turns think HIGH (full depth), the middle stays MEDIUM.
-  // gpt-5.x reasons before emitting any token, so this is the main lever on
-  // per-turn latency. Set on the agent's modelSettings (the runner reads it at
-  // run time). Kill-switch CLEMMY_DYNAMIC_REASONING=off → unchanged (no field).
+  // Dynamic reasoning effort (per-turn). gpt-5.x reasons before emitting any
+  // token, so reasoning depth is the dominant per-turn latency knob. gpt-5.5's
+  // SDK default is effort:'none', so simple turns are already minimal — the
+  // lever is to let COMPLEX/multi-step/active-goal turns think harder (a
+  // capability win on hard tasks) while keeping simple turns byte-identical.
+  // Reuses the context packet's complexity (one classifier, no duplicate).
+  //
+  // We must set this on agent.modelSettings AND mark it explicit: the SDK reads
+  // `_modelSettingsExplicitlyConfigured` (a constructor-time flag) to decide
+  // whether to honor agent.modelSettings vs its own implicit per-model defaults.
+  // The orchestrator is built without modelSettings, so without flipping that
+  // flag the mutation is silently ignored. We fully specify modelSettings every
+  // turn (effort + the gpt-5 verbosity:'low' default the implicit path provides)
+  // so there is no staleness across turns that reuse this agent instance.
+  // Kill-switch CLEMMY_DYNAMIC_REASONING=off → skip entirely (implicit SDK
+  // default rides; byte-identical to before this feature).
   if (dynamicReasoningEnabled()) {
     try {
-      const { effort, reason } = selectReasoningEffort(options.input, {
+      const { effort, reason } = selectReasoningEffort(contextPacket.complexity, {
         hasActiveGoal: Boolean(safeActiveGoal(options.sessionId)),
       });
-      const agentSettings = (options.agent as { modelSettings?: Record<string, unknown> }).modelSettings ?? {};
-      (options.agent as { modelSettings?: Record<string, unknown> }).modelSettings = {
-        ...agentSettings,
-        reasoning: { ...(agentSettings.reasoning as object ?? {}), effort },
+      const agentRef = options.agent as unknown as {
+        modelSettings?: Record<string, unknown>;
+        _modelSettingsExplicitlyConfigured?: boolean;
       };
+      const prev = agentRef.modelSettings ?? {};
+      agentRef.modelSettings = {
+        ...prev,
+        reasoning: { ...(prev.reasoning as object ?? {}), effort },
+        text: { verbosity: 'low', ...(prev.text as object ?? {}) },
+      };
+      // Make the runner honor agent.modelSettings (see comment above).
+      agentRef._modelSettingsExplicitlyConfigured = true;
       safeAppend({
         sessionId: options.sessionId,
         turn,
         role: 'system',
         type: 'reasoning_effort',
-        data: { effort, reason },
+        data: { effort, reason, complexity: contextPacket.complexity },
       });
     } catch { /* effort selection must never break a turn */ }
   }
