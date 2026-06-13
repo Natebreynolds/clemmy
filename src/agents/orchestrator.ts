@@ -116,6 +116,15 @@ export interface BuildOrchestratorAgentOptions {
    * only ever exclude harness tools (workflow_*, composio_execute_tool).
    */
   excludeToolNames?: string[];
+  /**
+   * Per-call model override. When provided, the agent runs on this model instead
+   * of MODELS.primary — needed so workflow-step lanes that route grunt-work to a
+   * cheaper worker model (forEach fan-out) can ride the gated harness loop
+   * without losing that routing. Absent ⇒ MODELS.primary (byte-identical). No
+   * current caller passes it, so this is a dormant capability until the
+   * workflow-step conversion wires it through.
+   */
+  model?: string;
 }
 
 // ---------- internal helpers ----------
@@ -820,7 +829,9 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     // turn — vault edits and new facts surface immediately without
     // restarting the daemon.
     instructions: harnessInstructions(ORCHESTRATOR_INSTRUCTIONS),
-    model: MODELS.primary,
+    // Per-call override (dormant — no caller passes it yet) so worker-model
+    // routing survives a workflow-step conversion onto the harness loop.
+    model: options.model ?? MODELS.primary,
     // Dynamic per-turn reasoning effort needs the SDK to honor agent.modelSettings,
     // which it only does when modelSettings was passed at CONSTRUCTION (it sets a
     // private `_modelSettingsExplicitlyConfigured` flag then). So we seed the

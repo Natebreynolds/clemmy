@@ -123,6 +123,16 @@ test('Orchestrator carries the harness guardrails', async () => {
   assert.ok(outputNames.includes('secret_leak'));
 });
 
+test('Orchestrator: model override rides through (workflow-step worker-model routing on the gated loop)', async () => {
+  // Dormant capability: absent ⇒ MODELS.primary (byte-identical); present ⇒ the
+  // agent runs on the requested model so a converted forEach step keeps its
+  // cheaper worker model instead of being forced to primary.
+  const dflt = await buildOrchestratorAgent();
+  const overridden = await buildOrchestratorAgent({ model: 'gpt-5.4-mini' });
+  assert.notEqual(dflt.model, 'gpt-5.4-mini', 'default is not the override');
+  assert.equal(overridden.model, 'gpt-5.4-mini', 'override is honored');
+});
+
 test('Orchestrator: excludeToolNames narrows the harness surface (unblocks architect/autonomy on the one loop)', async () => {
   // The capability that lets narrowed-surface callers (workflow architect hides
   // workflow_* mutators; autonomy excludes external writes) ride the GATED
