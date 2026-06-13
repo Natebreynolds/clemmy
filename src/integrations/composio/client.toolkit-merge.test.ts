@@ -10,7 +10,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { listComposioToolkitTools, resolveComposioToolVersion } from './client.js';
+import { listComposioToolkitTools, resolveComposioToolVersion, bustToolkitToolsCache } from './client.js';
 
 function withMockedFetch(impl: typeof fetch, run: () => Promise<void>): Promise<void> {
   const prevFetch = globalThis.fetch;
@@ -93,6 +93,29 @@ test('returns the curated set even when the raw SDK call fails', async () => {
     const tools = await listComposioToolkitTools('outlook', 50, fakeComposio);
     assert.deepEqual(tools.map((t) => t.slug), ['OUTLOOK_OUTLOOK_SEND_EMAIL'], 'curated returned despite raw failure');
   });
+});
+
+// ─── D3: toolkit tool-list cache ────────────────────────────────────────────
+test('the toolkit tool-list cache NEVER caches the override path (tests + special callers stay live)', async () => {
+  bustToolkitToolsCache();
+  const mockFetch = (async () => ({ ok: true, json: async () => ({ items: [] }) } as Response)) as typeof fetch;
+  await withMockedFetch(mockFetch, async () => {
+    // Two calls with DIFFERENT override data must return DIFFERENT results —
+    // proving the override path bypasses the cache entirely (the safety
+    // invariant that keeps every fakeComposio-based test above correct).
+    const first = await listComposioToolkitTools('outlook', 50, {
+      client: { baseURL: 'https://x' },
+      tools: { getRawComposioTools: async () => ([{ slug: 'A_ONE', name: 'one' }]) },
+    });
+    const second = await listComposioToolkitTools('outlook', 50, {
+      client: { baseURL: 'https://x' },
+      tools: { getRawComposioTools: async () => ([{ slug: 'B_TWO', name: 'two' }]) },
+    });
+    assert.deepEqual(first.map((t) => t.slug), ['A_ONE']);
+    assert.deepEqual(second.map((t) => t.slug), ['B_TWO'], 'override path is never served from cache');
+  });
+  // bust is a no-throw clear.
+  assert.doesNotThrow(() => bustToolkitToolsCache());
 });
 
 // ─── v0.5.65: execute-side version resolution for curated slugs ─────────────

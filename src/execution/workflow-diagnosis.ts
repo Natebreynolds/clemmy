@@ -334,8 +334,11 @@ export async function diagnoseWorkflowBlock(input: DiagnoseInput): Promise<Workf
   const step = input.workflow.steps.find((s) => s.id === primary.stepId);
   const agent = new Agent({
     name: 'WorkflowDoctor',
+    // A structured blocked-step classifier — the fast tier handles it well and
+    // keeps post-failure diagnosis cheap (it runs on every blocked run).
     instructions: DOCTOR_INSTRUCTIONS,
-    model: MODELS.primary,
+    model: MODELS.fast,
+    modelSettings: { reasoning: { effort: 'low' } },
     outputType: normalizeZodForCodexStrict(WorkflowDiagnosisSchema) as typeof WorkflowDiagnosisSchema,
     tools: [],
   });

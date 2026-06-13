@@ -13,8 +13,10 @@
  * fact. The false positive cannot strike twice in a session.
  *
  * Design constraints:
- *   - TTL-bounded (10 min, matching the sender-verify cache) so a schema
- *     change upstream is picked up within minutes.
+ *   - TTL-bounded (30 min) so a schema change upstream is picked up within
+ *     minutes. Safe to keep generous: the cache is validation-only and
+ *     fail-open, so a slightly-stale schema can only make a check less precise,
+ *     never wrongly block (D3 — fewer re-fetches across a session).
  *   - Size-capped (LRU-ish: oldest insertion evicted) so a long-running
  *     daemon cannot grow unbounded.
  *   - Never authoritative for BLOCKING on its own: consumers must
@@ -22,7 +24,7 @@
  *     can only make validation more precise, never more aggressive.
  */
 
-const SCHEMA_TTL_MS = 10 * 60_000;
+const SCHEMA_TTL_MS = 30 * 60_000;
 const MAX_ENTRIES = 500;
 
 interface CachedSchema {

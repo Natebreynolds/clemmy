@@ -460,6 +460,9 @@ async function runSummarizerTurn(serializedOlder: string): Promise<{ summary: st
     const agent = new Agent({
       name: 'Compaction Summarizer',
       model,
+      // Bullet-summary compression is a mechanical transform, not a reasoning
+      // task — low effort keeps the (often large) compaction call fast.
+      modelSettings: { reasoning: { effort: 'low' } },
       instructions: 'You compress agent conversation history into bullet summaries that preserve actionable detail.',
     });
     const runner = new Runner({ workflowName: 'clementine-compaction' });

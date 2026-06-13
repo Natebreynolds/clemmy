@@ -138,6 +138,20 @@ let connectionsCache: { at: number; data: ConnectedToolkit[] } | null = null;
 let catalogCache: { at: number; data: CatalogToolkit[] } | null = null;
 let detectedPreferredUserId: { at: number; value: string } | null = null;
 
+// Per-toolkit tool-list cache (D3): composio_search_tools fans out to
+// listComposioToolkitTools once PER connected toolkit PER search, each a
+// network round-trip (curated v3 fetch + raw SDK list). A toolkit's tool set is
+// stable within a session, so a short TTL turns the second+ search of a session
+// from multi-second into in-memory. Keyed by (slug, limit). Kill-switch
+// CLEMMY_TOOLKIT_CACHE=off. Busted whenever connections change (a new
+// connection can expose a toolkit's tools for the first time).
+const TOOLKIT_TOOLS_TTL_MS = 15 * 60 * 1000;
+const toolkitToolsCache = new Map<string, { at: number; data: ComposioToolkitTool[] }>();
+/** Clear the per-toolkit tool-list cache. Exported for tests + connection busts. */
+export function bustToolkitToolsCache(): void {
+  toolkitToolsCache.clear();
+}
+
 function readLocalEnv(): Record<string, string> {
   const now = Date.now();
   if (localEnvCache && now - localEnvCache.at < 2_000) return localEnvCache.env;
@@ -356,10 +370,13 @@ export function resetComposioClient(): void {
   connectionsCache = null;
   catalogCache = null;
   detectedPreferredUserId = null;
+  toolkitToolsCache.clear();
 }
 
 export function clearConnectedToolkitsCache(): void {
   connectionsCache = null;
+  // A new/changed connection can expose a toolkit's tools for the first time.
+  toolkitToolsCache.clear();
 }
 
 export async function getPreferredUserId(): Promise<string> {
@@ -958,6 +975,16 @@ export async function listComposioToolkitTools(
   const composio = (composioOverride ?? getComposio()) as any;
   if (!composio) throw new Error('COMPOSIO_API_KEY is not configured.');
 
+  // Only cache the default path: an explicit composioOverride (tests, special
+  // callers) must hit the live SDK. Kill-switch CLEMMY_TOOLKIT_CACHE=off.
+  const cacheable = composioOverride === undefined
+    && (process.env.CLEMMY_TOOLKIT_CACHE || 'on').toLowerCase() !== 'off';
+  const cacheKey = `${slug}::${limit}`;
+  if (cacheable) {
+    const hit = toolkitToolsCache.get(cacheKey);
+    if (hit && Date.now() - hit.at < TOOLKIT_TOOLS_TTL_MS) return hit.data;
+  }
+
   const seen = new Set<string>();
   const tools: ComposioToolkitTool[] = [];
   const ingest = (raw: unknown): void => {
@@ -1018,6 +1045,11 @@ export async function listComposioToolkitTools(
     if (tools.length === 0) throw err; // only surface if we got nothing at all
   }
 
+  // Cache only a non-empty result (a throw above on a fully-empty fetch never
+  // reaches here, so we never cache a transient failure).
+  if (cacheable && tools.length > 0) {
+    toolkitToolsCache.set(cacheKey, { at: Date.now(), data: tools });
+  }
   return tools;
 }
 

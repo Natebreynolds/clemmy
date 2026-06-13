@@ -192,6 +192,10 @@ function buildJudgeAgent(): Agent<RuntimeContextValue, typeof VerdictSchema> {
     name: 'ObjectiveCompletionJudge',
     instructions: JUDGE_SYSTEM_PROMPT,
     model: MODELS.fast,
+    // A binary done/not-done verdict against an explicit rubric does not need
+    // deep chain-of-thought — low reasoning effort cuts the largest chunk of
+    // per-call latency on this hot path (the judge runs on most action turns).
+    modelSettings: { reasoning: { effort: 'low' } },
     outputType: normalizeZodForCodexStrict(VerdictSchema) as typeof VerdictSchema,
     tools: [],
   });

@@ -149,6 +149,18 @@ test('native Codex compaction flag sends SDK context_management with backend-saf
   });
 });
 
+test('reasoning.effort from modelSettings reaches the wire body (D1 latency lever)', () => {
+  const low = buildCodexRequestBody('gpt-5', buildRequest(
+    [{ role: 'user', content: 'hi' }],
+    { modelSettings: { reasoning: { effort: 'low' } } },
+  ));
+  assert.equal(low.reasoning?.effort, 'low', 'low effort flows to the request');
+
+  // Default (no reasoning setting) omits the field entirely — unchanged behavior.
+  const none = buildCodexRequestBody('gpt-5', buildRequest([{ role: 'user', content: 'hi' }]));
+  assert.equal(none.reasoning, undefined, 'absent reasoning stays absent');
+});
+
 test('compaction input items round-trip only when native Codex compaction flag is enabled', async () => {
   const input = [
     { role: 'user', content: 'hello' },
