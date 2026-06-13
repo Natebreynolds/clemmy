@@ -30,6 +30,9 @@ const {
   getActiveGoalForSession,
   listActiveGoalContracts,
   touchGoalActivity,
+  appendGoalLedgerForSession,
+  getCurrentGoalStage,
+  advanceGoalStage,
   recordGoalValidation,
   satisfyGoal,
   expireGoal,
@@ -54,6 +57,7 @@ function aPlan(overrides = {}) {
       { n: 2, action: 'Draft the outreach emails', rationale: 'The deliverable.', verification: null },
     ],
     successCriteria: ['A local markdown brief exists.', 'Drafts exist for the top 3 accounts.'],
+    stages: null,
     risks: [],
     estimatedComplexity: 'moderate' as const,
     recommendsTrackedExecution: false,
@@ -136,6 +140,68 @@ test('touchGoalActivity bumps lastActivityAt and bounds the ledger at 20 lines',
   assert.equal(after.progressLedger!.length, 20, 'ledger bounded');
   assert.equal(after.progressLedger![19], 'step 24 done', 'newest kept');
   assert.ok(after.lastActivityAt! >= g.lastActivityAt!);
+});
+
+test('appendGoalLedgerForSession targets the session active goal; no-op without one', () => {
+  const g = surfaceApproved('sess-led1');
+  const updated = appendGoalLedgerForSession('sess-led1', 'pulled 12 accounts');
+  assert.ok(updated, 'returns the updated record');
+  assert.equal(getPlanProposal(g.id)!.progressLedger!.at(-1), 'pulled 12 accounts');
+  // A session with no active goal is a clean no-op (never throws).
+  assert.equal(appendGoalLedgerForSession('sess-no-goal', 'orphan line'), null);
+  // Empty lines are ignored.
+  assert.equal(appendGoalLedgerForSession('sess-led1', '   '), null);
+});
+
+// ─── stages ──────────────────────────────────────────────────────────────────
+
+const stagedPlan = () => aPlan({
+  stages: [
+    { title: 'Research', criteria: ['A local markdown brief exists.'] },
+    { title: 'Draft', criteria: ['Drafts exist for the top 3 accounts.'] },
+  ],
+});
+
+test('activation materializes authored stages into pending GoalStage records', () => {
+  const p = surfacePlan({ plan: stagedPlan(), originatingRequest: 'staged work', sessionId: 'sess-st1' });
+  const active = approvePlanProposal(p.id, { allowedTools: [] })!;
+  assert.equal(active.stages!.length, 2);
+  assert.equal(active.stages![0].id, 's1');
+  assert.equal(active.stages![0].status, 'pending');
+  assert.equal(active.stages![0].title, 'Research');
+  assert.equal(getCurrentGoalStage(active)!.id, 's1', 'current = first pending');
+});
+
+test('a goal with no authored stages stays unstaged', () => {
+  const p = surfacePlan({ plan: aPlan(), originatingRequest: 'unstaged', sessionId: 'sess-st2' });
+  const active = approvePlanProposal(p.id, { allowedTools: [] })!;
+  assert.equal(active.stages, undefined);
+  assert.equal(getCurrentGoalStage(active), null);
+});
+
+test('advanceGoalStage is single-fire, resets attempt, and walks to the next stage', () => {
+  const p = surfacePlan({ plan: stagedPlan(), originatingRequest: 'staged', sessionId: 'sess-st3' });
+  const active = approvePlanProposal(p.id, { allowedTools: [] })!;
+  // burn an attempt so we can prove the reset
+  recordGoalValidation(active.id, [{ at: new Date().toISOString(), attempt: 1, criterion: 'A local markdown brief exists.', pass: false }]);
+  assert.equal(getPlanProposal(active.id)!.attempt, 1);
+
+  const advanced = advanceGoalStage(active.id, 's1')!;
+  assert.equal(advanced.stages![0].status, 'done');
+  assert.ok(advanced.stages![0].completedAt && advanced.stages![0].checkinAt, 'completion + checkin stamped');
+  assert.equal(advanced.attempt, 0, 'attempt budget reset for the next stage');
+  assert.equal(getCurrentGoalStage(advanced)!.id, 's2', 'current advanced to s2');
+
+  // second call on the same stage is a no-op (the latch)
+  assert.equal(advanceGoalStage(active.id, 's1'), null, 'already-done stage does not re-fire');
+});
+
+test('advanceGoalStage refuses unknown stage and non-active goals', () => {
+  const p = surfacePlan({ plan: stagedPlan(), originatingRequest: 'staged', sessionId: 'sess-st4' });
+  const active = approvePlanProposal(p.id, { allowedTools: [] })!;
+  assert.equal(advanceGoalStage(active.id, 'nope'), null, 'unknown stage id');
+  satisfyGoal(active.id, 'done');
+  assert.equal(advanceGoalStage(active.id, 's1'), null, 'terminal goal cannot advance');
 });
 
 test('recordGoalValidation appends evidence and bumps attempt', () => {

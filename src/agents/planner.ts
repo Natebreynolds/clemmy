@@ -97,6 +97,16 @@ export const PlanSchema = z.object({
   successCriteria: z.array(z.string()).min(1).max(6).describe(
     'How we will know the whole objective is complete. Should be checkable, not aspirational.',
   ),
+  stages: z.array(
+    z.object({
+      title: z.string().min(3).describe('Short milestone name, e.g. "Pull the accounts".'),
+      criteria: z.array(z.string()).min(1).describe(
+        'The subset of successCriteria above (VERBATIM text) this milestone satisfies.',
+      ),
+    }),
+  ).max(6).nullable().describe(
+    'OPTIONAL ordered milestones for a LONG, multi-session goal: partition the successCriteria above into 2–4 stages so the work validates and checks in one milestone at a time instead of all-or-nothing at the end. Every criterion should appear in exactly one stage, quoted verbatim. Use null for short goals that finish in a single pass.',
+  ),
   risks: z.array(z.string()).max(6).describe(
     'Real risks worth flagging: unknown inputs, irreversible steps, external dependencies.',
   ),
@@ -130,6 +140,7 @@ export function buildPlannerAgent(): Agent<RuntimeContextValue, typeof PlanSchem
       'Group trivial steps. Don\'t list "open the file" as a step. The reader is another LLM — they know.',
       'Each step needs a rationale: why this step, in this order, right now. If you can\'t state the rationale, the step is filler — drop it.',
       'Success criteria must be checkable from outside the agent — tests pass, a file contains X, a command exits 0. Not "the user is happy."',
+      'For a LONG goal that spans multiple sessions or has natural milestones, populate `stages`: group the success criteria into 2–4 ordered milestones (each criterion quoted verbatim in exactly one stage). This lets the work validate and check in one milestone at a time. Leave `stages` null for anything that finishes in a single pass — do not over-stage small work.',
       'If the request is underspecified, populate `needsUserInput` with the SHORTEST questions that resolve the ambiguity. The orchestrator may ask them.',
       'Set `recommendsTrackedExecution: true` when the work is multi-system, spans multiple sessions, or has irreversible steps. The orchestrator decides whether to honor this.',
       'Be honest about risk. "Irreversible delete" is a real risk to call out. "Could break stuff" is not — get specific.',

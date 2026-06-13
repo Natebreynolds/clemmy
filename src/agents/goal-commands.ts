@@ -12,6 +12,7 @@ import {
   createDirectGoal,
   expireGoal,
   getActiveGoalForSession,
+  getCurrentGoalStage,
   GOAL_DEFAULT_MAX_ATTEMPTS,
   type PlanProposal,
 } from './plan-proposals.js';
@@ -41,8 +42,14 @@ export function describeGoalContract(goal: PlanProposal | null): string {
   const plan = goal.approvedPlan ?? goal.plan;
   const attempts = `${goal.attempt ?? 0}/${goal.maxAttempts ?? GOAL_DEFAULT_MAX_ATTEMPTS} validation attempts used`;
   const ledger = (goal.progressLedger ?? []).slice(-3);
+  const stages = goal.stages ?? [];
+  const currentStage = getCurrentGoalStage(goal);
+  const stageLine = stages.length > 0
+    ? `Stage ${stages.filter((s) => s.status === 'done').length + (currentStage ? 1 : 0)}/${stages.length}${currentStage ? `: ${currentStage.title}` : ' (final review)'}.`
+    : '';
   return [
     `Goal pinned: ${plan.objective} (${attempts}).`,
+    stageLine,
     ledger.length > 0 ? `Recent progress:\n${ledger.map((l) => `- ${l}`).join('\n')}` : '',
     'I keep working against it until external validation passes. `/goal cancel` drops it.',
   ].filter(Boolean).join('\n');

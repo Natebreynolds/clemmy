@@ -17,6 +17,7 @@
  */
 import { SessionStore } from '../memory/session-store.js';
 import { HarnessSession } from './harness/session.js';
+import { appendGoalLedgerForSession } from '../agents/plan-proposals.js';
 import pino from 'pino';
 
 const logger = pino({ name: 'clementine-next.outcome' });
@@ -154,6 +155,18 @@ export function deliverOutcome(outcome: Outcome, ctx: DeliverContext): boolean {
       if (hs) hs.injectSyntheticUserTurn(idPrefix, text);
     } catch { /* a harness-store write must never affect run state */ }
     logger.info({ sourceId: ctx.sourceId, sessionId, status: outcome.status }, 'Outcome delivered to origin session');
+    // Async-lane work (workflow run, background task) that reports back into a
+    // session with an active goal becomes goal evidence — one ledger line so
+    // the goal's progress timeline reflects sub-work it dispatched. Best-effort.
+    try {
+      const head = (outcome.summary ?? outcome.detail ?? '').trim();
+      if (head) {
+        appendGoalLedgerForSession(
+          sessionId,
+          `${ctx.sourceLabel} "${ctx.title ?? ctx.sourceId}" ${outcome.status}: ${head.slice(0, 120)}`,
+        );
+      }
+    } catch { /* goal ledger is best-effort */ }
     if (ctx.proactiveTurn) {
       // Fire-and-forget: a proactive relay failure must never affect the run
       // or the passive staging above (which remains the guaranteed baseline).
@@ -169,11 +182,28 @@ export function deliverOutcome(outcome: Outcome, ctx: DeliverContext): boolean {
             import('./harness/loop.js'),
             import('../agents/orchestrator.js'),
           ]);
+          // If the origin session has an active goal, this finished sub-work may
+          // unblock it — tell the model to continue the goal rather than just
+          // narrate. This is the EVENT-DRIVEN half of self-resumption (the
+          // heartbeat in goal-resume.ts is the fallback for stalls/sleep).
+          let goalTail = '';
+          try {
+            const { getActiveGoalForSession } = await import('../agents/plan-proposals.js');
+            const goal = getActiveGoalForSession(sessionId);
+            if (goal) {
+              const plan = goal.approvedPlan ?? goal.plan;
+              goalTail =
+                ` This conversation has a pinned goal ("${(plan.objective ?? '').slice(0, 120)}"). `
+                + 'If this outcome unblocks the next step of that goal, CONTINUE the goal work now (do not just narrate); '
+                + 'if it does not, relay briefly and stop.';
+            }
+          } catch { /* goal read is best-effort */ }
           const directive =
             `A ${ctx.sourceLabel} you started from this conversation just finished (see the latest [${ctx.sourceLabel} ${ctx.sourceId}] note in context). `
             + 'Relay the outcome to the user NOW in one short message: lead with pass/fail and the key evidence. '
             + 'If it passed and the workflow is enabled, end by asking: fire it off now, or wait for the next scheduled run? '
-            + 'If it failed, say exactly what you will fix. Do not re-run anything in this turn.';
+            + 'If it failed, say exactly what you will fix. Do not re-run anything in this turn.'
+            + goalTail;
           const agent = await buildOrchestratorAgent({ userInput: directive, sessionId });
           await runConversation({ agent, sessionId, input: directive, judgeCompletion: false });
         } catch (err) {

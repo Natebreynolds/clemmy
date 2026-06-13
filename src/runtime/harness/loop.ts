@@ -41,6 +41,9 @@ import {
   getActiveGoalForSession,
   recordGoalValidation,
   satisfyGoal,
+  touchGoalActivity,
+  getCurrentGoalStage,
+  advanceGoalStage,
   GOAL_DEFAULT_MAX_ATTEMPTS,
   type PlanProposal,
 } from '../../agents/plan-proposals.js';
@@ -1556,15 +1559,28 @@ async function runConversationCore(
       if (activeGoal && goalGate) {
         const goalPlan = activeGoal.approvedPlan ?? activeGoal.plan;
         const evidenceText = (decision.reply?.trim() ? decision.reply : decision.summary) ?? '';
+        // Staged goals validate ONE milestone at a time against that stage's
+        // criteria; unstaged goals validate the full criteria exactly as
+        // before. The current stage is the first pending one (null ⇒ unstaged
+        // or every stage already done → fall through to full validation).
+        const currentStage = getCurrentGoalStage(activeGoal);
+        const fullCriteria = goalPlan.successCriteria ?? [];
+        const validateCriteria = currentStage ? currentStage.criteria : fullCriteria;
+        // Record this turn's work in the goal's progress ledger BEFORE
+        // validation runs (validation may flip the goal to satisfied, after
+        // which touchGoalActivity no-ops). This is the signal the A2
+        // no-progress breaker and the D2 stage checkpoint read.
+        safeAppendGoalLedger(activeGoal.id, 'turn', evidenceText);
         const goalValidator = options.goalValidator ?? validateGoal;
         const validation = await goalValidator({
           objective: goalPlan.objective,
-          successCriteria: goalPlan.successCriteria ?? [],
+          successCriteria: validateCriteria,
           evidenceText,
         });
         const updated = recordGoalValidation(
           activeGoal.id,
-          toGoalEvidence(validation, (activeGoal.attempt ?? 0) + 1, new Date().toISOString()),
+          toGoalEvidence(validation, (activeGoal.attempt ?? 0) + 1, new Date().toISOString())
+            .map((e) => (currentStage ? { ...e, stageId: currentStage.id } : e)),
         );
         const attempt = updated?.attempt ?? (activeGoal.attempt ?? 0) + 1;
         const maxAttempts = activeGoal.maxAttempts ?? GOAL_DEFAULT_MAX_ATTEMPTS;
@@ -1576,6 +1592,7 @@ async function runConversationCore(
           type: 'goal_validation',
           data: {
             goalId: activeGoal.id,
+            stageId: currentStage?.id,
             pass: validation.pass,
             attempt,
             maxAttempts,
@@ -1583,7 +1600,40 @@ async function runConversationCore(
             failures: failures.slice(0, 4).map((f) => ({ criterion: f.criterion.slice(0, 200), detail: f.detail?.slice(0, 200) })),
           },
         });
-        if (validation.pass) {
+        if (validation.pass && currentStage) {
+          // A milestone cleared. Mark it done (resets the attempt budget),
+          // surface ONE check-in, and keep working — either on the next stage
+          // or a final full-criteria pass. advanceGoalStage returns non-null
+          // only on the pending→done transition, so the check-in fires once.
+          const advanced = advanceGoalStage(activeGoal.id, currentStage.id);
+          const stages = advanced?.stages ?? activeGoal.stages ?? [];
+          const doneCount = stages.filter((s) => s.status === 'done').length;
+          const total = stages.length;
+          const nextStage = stages.find((s) => s.status === 'pending');
+          if (advanced) {
+            safeStageCheckin(options.sessionId, activeGoal.id, {
+              title: currentStage.title,
+              doneCount,
+              total,
+              evidence: evidenceText,
+              nextTitle: nextStage?.title,
+            });
+          }
+          if (nextStage) {
+            nextInput = [
+              `Stage ${doneCount}/${total} ("${currentStage.title}") validated. Now do stage ${doneCount + 1}/${total}: ${nextStage.title}.`,
+              'Success criteria for this stage:',
+              ...nextStage.criteria.map((c, i) => `${i + 1}. ${c}`),
+              'Do the real work and produce verifiable evidence, then mark this stage done. Do NOT redo earlier stages.',
+            ].join('\n');
+          } else {
+            nextInput = [
+              `All ${total} stages are validated. Do a final pass: verify EVERY overall success criterion still holds, produce any missing evidence, then mark the goal done.`,
+              ...fullCriteria.map((c, i) => `${i + 1}. ${c}`),
+            ].join('\n');
+          }
+          continue;
+        } else if (validation.pass) {
           satisfyGoal(activeGoal.id, 'external validation passed');
         } else if (!validation.judgeFailedOpen && attempt < maxAttempts) {
           nextInput = [
@@ -1733,6 +1783,16 @@ async function runConversationCore(
         });
         nextInput = 'You already auto-resolved that approval question under YOLO standing approval — do NOT wait for the user. Proceed with your best default and keep going until the work is done, then report what you did.';
         continue;
+      }
+      // A goal session yielding for input is a check-in/blocker — record it so
+      // the ledger reads as a real timeline and the breaker sees the state.
+      const goalForAsk = safeActiveGoal(options.sessionId);
+      if (goalForAsk) {
+        safeAppendGoalLedger(
+          goalForAsk.id,
+          'blocked',
+          (decision.reply?.trim() ? decision.reply : decision.summary) ?? 'awaiting user input',
+        );
       }
       return {
         sessionId: options.sessionId,
@@ -2000,14 +2060,70 @@ function safeActiveGoal(sessionId: string): PlanProposal | null {
   }
 }
 
+/**
+ * Append one compact "done so far" line to a goal's progress ledger and bump
+ * its activity stamp. The ledger was previously dead (touchGoalActivity had no
+ * production callers), so the no-progress breaker and stage checkpointing had
+ * no real signal to read. Best-effort: a write failure never breaks the turn.
+ * `kind` distinguishes a completed turn from a check-in/blocker so the ledger
+ * reads as a real timeline.
+ */
+function safeAppendGoalLedger(goalId: string, kind: 'turn' | 'blocked', text: string): void {
+  const body = (text ?? '').trim();
+  if (!body) return;
+  const prefix = kind === 'blocked' ? 'blocked: ' : '';
+  try {
+    touchGoalActivity(goalId, clip(`${prefix}${body}`, 140));
+  } catch { /* ledger is best-effort */ }
+}
+
+/**
+ * Surface ONE natural check-in when a goal stage clears: an inbox card the user
+ * can glance at without re-reading the conversation. Called only on the
+ * pending→done transition (advanceGoalStage's single-fire return), so it never
+ * spams. Best-effort — a notification failure never affects the run. The
+ * model's own reply on the next surfaced turn is the conversational half.
+ */
+function safeStageCheckin(
+  sessionId: string,
+  goalId: string,
+  info: { title: string; doneCount: number; total: number; evidence: string; nextTitle?: string },
+): void {
+  try {
+    const tail = info.nextTitle ? ` Continuing: ${info.nextTitle}.` : ' Final review next.';
+    addNotification({
+      id: `goal-stage-${goalId}-${info.doneCount}`,
+      kind: 'system',
+      title: `Goal progress: stage ${info.doneCount}/${info.total} done`,
+      body: `${clip(info.title, 80)} ✓ — ${clip(info.evidence, 160)}.${tail}`,
+      createdAt: new Date().toISOString(),
+      read: false,
+      metadata: { sessionId, goalId, stageDone: info.doneCount, stageTotal: info.total },
+    });
+  } catch { /* check-in is best-effort */ }
+}
+
 function renderGoalContextBlock(goal: PlanProposal): string {
   const plan = goal.approvedPlan ?? goal.plan;
-  const criteria = (plan.successCriteria ?? []).map((c) => c.trim()).filter(Boolean);
   const ledger = (goal.progressLedger ?? []).slice(-8);
+  // Staged goals show ONLY the current milestone's criteria (the model works
+  // one stage at a time) plus a "stage X/N" header; unstaged goals show the
+  // full criteria exactly as before.
+  const stages = goal.stages ?? [];
+  const currentStage = getCurrentGoalStage(goal);
+  const doneCount = stages.filter((s) => s.status === 'done').length;
+  const shownCriteria = (
+    currentStage ? currentStage.criteria : (plan.successCriteria ?? [])
+  ).map((c) => c.trim()).filter(Boolean);
+  const stageHeader = currentStage
+    ? `Current stage ${doneCount + 1}/${stages.length}: ${currentStage.title}`
+    : '';
+  const criteriaLabel = currentStage ? 'Success criteria for THIS stage' : 'Success criteria';
   return [
     '[ACTIVE GOAL — parked outside this conversation. Completion is validated EXTERNALLY against the criteria below; declaring done triggers that validation, it does not decide it.]',
     `Objective: ${plan.objective}`,
-    criteria.length > 0 ? `Success criteria:\n${criteria.map((c, i) => `${i + 1}. ${c}`).join('\n')}` : '',
+    stageHeader,
+    shownCriteria.length > 0 ? `${criteriaLabel}:\n${shownCriteria.map((c, i) => `${i + 1}. ${c}`).join('\n')}` : '',
     ledger.length > 0 ? `Progress so far:\n${ledger.map((l) => `- ${l}`).join('\n')}` : '',
     `Validation attempts used: ${goal.attempt ?? 0}/${goal.maxAttempts ?? GOAL_DEFAULT_MAX_ATTEMPTS}.`,
     'If a criterion is genuinely impossible, say so explicitly with the concrete reason instead of declaring done without it.',

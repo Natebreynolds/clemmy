@@ -31,6 +31,7 @@ test('PlanSchema: accepts a minimal valid plan', () => {
       { n: 1, action: 'Read src/integrations/composio/client.ts', rationale: 'Confirm current auth path.', verification: null },
     ],
     successCriteria: ['The refresh handler retries on 401 once with a fresh token.'],
+    stages: null,
     risks: [],
     estimatedComplexity: 'moderate',
     recommendsTrackedExecution: false,
@@ -39,6 +40,25 @@ test('PlanSchema: accepts a minimal valid plan', () => {
   });
   assert.equal(plan.objective.startsWith('Add a refresh'), true);
   assert.equal(plan.steps[0].n, 1);
+});
+
+test('PlanSchema: accepts authored stages partitioning the criteria', () => {
+  const plan = PlanSchema.parse({
+    objective: 'Build the Q2 outreach list and draft the emails.',
+    steps: [{ n: 1, action: 'Pull accounts', rationale: 'Source of truth.', verification: null }],
+    successCriteria: ['A brief exists.', 'Drafts exist for the top 3 accounts.'],
+    stages: [
+      { title: 'Research', criteria: ['A brief exists.'] },
+      { title: 'Draft', criteria: ['Drafts exist for the top 3 accounts.'] },
+    ],
+    risks: [],
+    estimatedComplexity: 'large',
+    recommendsTrackedExecution: true,
+    needsUserInput: [],
+    appliedInstructions: [],
+  });
+  assert.equal(plan.stages!.length, 2);
+  assert.equal(plan.stages![0].title, 'Research');
 });
 
 test('PlanSchema: rejects empty objective', () => {

@@ -87,3 +87,34 @@ test('deliverOutcome: idempotent — a second call does not double-post', () => 
 test('deliverOutcome: no origin session → false, no throw', () => {
   assert.equal(deliverOutcome({ status: 'done', detail: 'x' }, ctx({ originSessionId: undefined })), false);
 });
+
+test('deliverOutcome: an active goal on the origin session gets a ledger line', async () => {
+  const {
+    surfacePlan, approvePlanProposal, getPlanProposal, getActiveGoalForSession,
+  } = await import('../agents/plan-proposals.js');
+  const sessionId = 'sess-oc-goal';
+  const p = surfacePlan({
+    plan: {
+      objective: 'Ship the brief',
+      steps: [{ n: 1, action: 'do it', rationale: 'r', verification: null }],
+      successCriteria: ['A brief exists.'],
+      risks: [], estimatedComplexity: 'moderate', recommendsTrackedExecution: false,
+      needsUserInput: [], appliedInstructions: [],
+    },
+    originatingRequest: 'ship it',
+    sessionId,
+  });
+  approvePlanProposal(p.id, { allowedTools: [] });
+  const goalId = getActiveGoalForSession(sessionId)!.id;
+
+  const ok = deliverOutcome(
+    { status: 'done', summary: 'scraped 14 rows' },
+    ctx({ originSessionId: sessionId, sourceLabel: 'workflow run', sourceId: 'wf-7', title: 'Scrape' }),
+  );
+  assert.equal(ok, true);
+  const ledger = getPlanProposal(goalId)!.progressLedger ?? [];
+  assert.ok(
+    ledger.some((l) => l.includes('workflow run "Scrape" done') && l.includes('scraped 14 rows')),
+    `expected a workflow-outcome ledger line, got ${JSON.stringify(ledger)}`,
+  );
+});

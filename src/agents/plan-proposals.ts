@@ -57,6 +57,27 @@ export interface GoalEvidence {
   /** How the criterion was checked (deterministic check vs LLM judge). */
   method?: 'deterministic' | 'judge' | 'skipped';
   detail?: string;
+  /** Which stage this finding belongs to (absent on unstaged goals). */
+  stageId?: string;
+}
+
+/**
+ * An ordered milestone within a goal. Stages group the goal's existing
+ * successCriteria (verbatim — the user blessed exactly that text) so a long
+ * goal validates and checks in one milestone at a time instead of all-or-
+ * nothing at the end. A goal with no `stages` validates against the full
+ * criteria exactly as before — staging is purely additive.
+ */
+export interface GoalStage {
+  id: string;
+  title: string;
+  /** Subset of the plan's successCriteria, verbatim. */
+  criteria: string[];
+  status: 'pending' | 'done';
+  /** Set when the stage's criteria validated. */
+  completedAt?: string;
+  /** Single-fire latch: the stage-completion check-in has been surfaced. */
+  checkinAt?: string;
 }
 
 /** Where a goal contract came from. Chat goals are session-pinned and subject
@@ -117,6 +138,8 @@ export interface PlanProposal {
   evidence?: GoalEvidence[];
   /** Compact harness-curated "done so far" lines re-injected each turn. */
   progressLedger?: string[];
+  /** Ordered milestones grouping successCriteria; absent ⇒ unstaged goal. */
+  stages?: GoalStage[];
   /** Bumped on every goal touch; drives the idle reaper TTL. */
   lastActivityAt?: string;
   /** Why the goal reached `satisfied` / `expired`. */
@@ -344,6 +367,7 @@ export function surfaceWorkflowPendingInputs(input: SurfaceWorkflowPendingInputs
       },
     ],
     successCriteria: [`The "${input.workflowName}" workflow is queued with all required inputs.`],
+    stages: null,
     risks: [],
     estimatedComplexity: 'trivial',
     recommendsTrackedExecution: false,
@@ -610,6 +634,7 @@ export function activateGoal(id: string, options: ActivateGoalOptions = {}): Pla
   }
 
   const now = new Date().toISOString();
+  const stages = materializeStages(proposal.approvedPlan ?? proposal.plan);
   const active: PlanProposal = {
     ...proposal,
     status: 'active',
@@ -618,6 +643,7 @@ export function activateGoal(id: string, options: ActivateGoalOptions = {}): Pla
     maxAttempts: options.maxAttempts ?? proposal.maxAttempts ?? GOAL_DEFAULT_MAX_ATTEMPTS,
     evidence: proposal.evidence ?? [],
     progressLedger: proposal.progressLedger ?? [],
+    ...(stages ? { stages } : {}),
     lastActivityAt: now,
   };
   writeProposal(active);
@@ -661,6 +687,7 @@ export function createDirectGoal(input: {
       objective,
       steps: [{ n: 1, action: `Pursue the objective: ${objective}`, rationale: 'Direct /goal objective.', verification: null }],
       successCriteria: [],
+      stages: null,
       risks: [],
       estimatedComplexity: 'moderate',
       recommendsTrackedExecution: false,
@@ -721,6 +748,7 @@ export function ensureWorkflowRunGoal(input: {
       objective,
       steps: [{ n: 1, action: `Run workflow "${input.workflowName}" until the goal is met.`, rationale: 'Pinned workflow run goal.', verification: null }],
       successCriteria: criteria,
+      stages: null,
       risks: [],
       estimatedComplexity: 'moderate',
       recommendsTrackedExecution: false,
@@ -775,6 +803,75 @@ export function touchGoalActivity(id: string, ledgerLine?: string): PlanProposal
       : {}),
   };
   writeProposal(updated);
+  return updated;
+}
+
+/**
+ * Session-keyed convenience over {@link touchGoalActivity}: append one ledger
+ * line to whatever goal is active on `sessionId` (no-op if none). The async
+ * lanes — workflow runs, background tasks — deliver their outcome back to the
+ * origin session, and this turns that outcome into goal evidence with a single
+ * call site (see deliverOutcome). Returns the updated record, or null when the
+ * session has no active goal.
+ */
+export function appendGoalLedgerForSession(sessionId: string, ledgerLine: string): PlanProposal | null {
+  if (!sessionId || !ledgerLine || !ledgerLine.trim()) return null;
+  const goal = getActiveGoalForSession(sessionId);
+  if (!goal) return null;
+  return touchGoalActivity(goal.id, ledgerLine);
+}
+
+/**
+ * Turn a plan's optional authored `stages` into runtime GoalStage records
+ * (stable ids + pending status). Returns undefined when the plan has no usable
+ * stages — the goal then runs unstaged (today's behavior). Defensive: drops
+ * empty stages and never throws on a malformed plan.
+ */
+function materializeStages(plan: Plan): GoalStage[] | undefined {
+  const authored = (plan as { stages?: unknown }).stages;
+  if (!Array.isArray(authored) || authored.length === 0) return undefined;
+  const stages: GoalStage[] = [];
+  for (let i = 0; i < authored.length; i++) {
+    const raw = authored[i] as { title?: unknown; criteria?: unknown };
+    const title = typeof raw?.title === 'string' ? raw.title.trim() : '';
+    const criteria = Array.isArray(raw?.criteria)
+      ? raw.criteria.map((c) => String(c).trim()).filter(Boolean)
+      : [];
+    if (!title || criteria.length === 0) continue;
+    stages.push({ id: `s${i + 1}`, title, criteria, status: 'pending' });
+  }
+  return stages.length > 0 ? stages : undefined;
+}
+
+/** The goal's current (first pending) stage, or null if unstaged / all done. */
+export function getCurrentGoalStage(goal: PlanProposal): GoalStage | null {
+  return goal.stages?.find((s) => s.status === 'pending') ?? null;
+}
+
+/**
+ * Mark a stage complete: status→done + completedAt + checkinAt latch, and reset
+ * the validation attempt budget so the NEXT stage starts fresh. Returns the
+ * updated record ONLY on the pending→done transition (null if the stage is
+ * missing or already done) — so the caller can treat a non-null return as the
+ * single-fire signal to surface the stage check-in. Never advances a
+ * non-active goal.
+ */
+export function advanceGoalStage(goalId: string, stageId: string): PlanProposal | null {
+  const proposal = readProposal(goalId);
+  if (!proposal || proposal.status !== 'active' || !proposal.stages) return null;
+  const stage = proposal.stages.find((s) => s.id === stageId);
+  if (!stage || stage.status === 'done') return null; // not found / already latched
+  const now = new Date().toISOString();
+  const updated: PlanProposal = {
+    ...proposal,
+    stages: proposal.stages.map((s) =>
+      s.id === stageId ? { ...s, status: 'done' as const, completedAt: now, checkinAt: now } : s,
+    ),
+    attempt: 0,
+    lastActivityAt: now,
+  };
+  writeProposal(updated);
+  logger.info({ goalId, stageId, title: stage.title }, 'goal stage advanced');
   return updated;
 }
 

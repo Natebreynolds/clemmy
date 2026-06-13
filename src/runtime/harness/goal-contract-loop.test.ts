@@ -28,8 +28,31 @@ const { resetEventLog, listEvents } = await import('./eventlog.js');
 const { HarnessSession } = await import('./session.js');
 const { runConversation } = await import('./loop.js');
 type RunRunnerFn = import('./loop.js').RunRunnerFn;
-const { createDirectGoal, getPlanProposal, getActiveGoalForSession } = await import('../../agents/plan-proposals.js');
+const {
+  createDirectGoal, getPlanProposal, getActiveGoalForSession,
+  surfacePlan, approvePlanProposal,
+} = await import('../../agents/plan-proposals.js');
 import type { GoalValidationResult } from '../../execution/goal-validate.js';
+
+/** Surface + approve a 2-stage goal for the staged-loop tests. */
+function makeStagedGoal(sessionId: string) {
+  const p = surfacePlan({
+    plan: {
+      objective: 'build the Q2 brief and draft the emails',
+      steps: [{ n: 1, action: 'work', rationale: 'r', verification: null }],
+      successCriteria: ['A brief exists.', 'Drafts exist.'],
+      stages: [
+        { title: 'Research', criteria: ['A brief exists.'] },
+        { title: 'Draft', criteria: ['Drafts exist.'] },
+      ],
+      risks: [], estimatedComplexity: 'large', recommendsTrackedExecution: true,
+      needsUserInput: [], appliedInstructions: [],
+    },
+    originatingRequest: 'do the staged work',
+    sessionId,
+  });
+  return approvePlanProposal(p.id, { allowedTools: [] })!;
+}
 
 test.after(() => {
   try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ }
@@ -116,6 +139,69 @@ test('goal validation: fail → evidence continuation → pass → goal satisfie
   assert.equal(validations.length, 2);
   assert.equal(validations[0].data.pass, false);
   assert.equal(validations[1].data.pass, true);
+});
+
+test('staged goal: validates one stage at a time, advances, then satisfies on the final pass', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat', title: 'staged goal' });
+  const goal = makeStagedGoal(sess.id);
+  assert.equal(goal.stages!.length, 2);
+
+  const validatedCriteria: string[][] = [];
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'go',
+    makeRunner: makeRunnerStub,
+    runRunner: doneRunner('Stage work done'),
+    goalValidator: async (input) => {
+      validatedCriteria.push(input.successCriteria);
+      return PASS_RESULT;
+    },
+  });
+
+  assert.equal(result.status, 'completed');
+  // Stage 1 criteria, then stage 2 criteria, then the full-criteria final pass.
+  assert.equal(validatedCriteria.length, 3, 'two stages + one final full validation');
+  assert.deepEqual(validatedCriteria[0], ['A brief exists.'], 'stage 1 criteria only');
+  assert.deepEqual(validatedCriteria[1], ['Drafts exist.'], 'stage 2 criteria only');
+  assert.deepEqual(validatedCriteria[2], ['A brief exists.', 'Drafts exist.'], 'final = full criteria');
+
+  const after = getPlanProposal(goal.id)!;
+  assert.equal(after.status, 'satisfied');
+  assert.ok(after.stages!.every((s) => s.status === 'done'), 'every stage marked done');
+
+  const validations = listEvents(sess.id, { types: ['goal_validation'] });
+  assert.equal(validations[0].data.stageId, 's1');
+  assert.equal(validations[1].data.stageId, 's2');
+  assert.equal(validations[2].data.stageId, undefined, 'final pass is unstaged');
+});
+
+test('staged goal: a stage that fails retries WITHIN the stage and does not advance', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat', title: 'staged retry' });
+  const goal = makeStagedGoal(sess.id);
+
+  let calls = 0;
+  await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'go',
+    makeRunner: makeRunnerStub,
+    runRunner: doneRunner('working stage 1'),
+    goalValidator: async () => {
+      calls += 1;
+      // Fail stage 1 once, then pass everything (stage1, stage2, final).
+      return calls === 1
+        ? { pass: false, perCriterion: [{ criterion: 'A brief exists.', pass: false, method: 'judge', detail: 'no brief yet' }], advice: 'x' }
+        : PASS_RESULT;
+    },
+  });
+
+  const after = getPlanProposal(goal.id)!;
+  assert.equal(after.status, 'satisfied');
+  // The first stage took 2 validations (fail, pass) before advancing.
+  assert.ok(calls >= 4, `expected ≥4 validations (stage1 fail+pass, stage2, final), got ${calls}`);
 });
 
 test('goal validation: attempt budget exhausted → honest unmet note, goal stays ACTIVE', async () => {
