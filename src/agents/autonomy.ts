@@ -6,6 +6,7 @@ import { ClementineAssistant } from '../assistant/core.js';
 import { MODELS, getRuntimeEnv } from '../config.js';
 import { ExecutionStore } from '../execution/store.js';
 import { addNotification } from '../runtime/notifications.js';
+import { listGoalRecords, type GoalRecord } from '../memory/goals-list.js';
 import {
   AGENT_INBOX_DIR,
   AGENT_STATE_DIR,
@@ -51,40 +52,13 @@ interface AgentStateRecord {
   lastError?: string;
 }
 
-interface GoalRecord {
-  id: string;
-  title: string;
-  status: 'active' | 'paused' | 'completed' | 'blocked';
-  priority: 'high' | 'medium' | 'low';
-  owner: string;
-  targetDate?: string;
-  nextActions: string[];
-  progressNotes: string[];
-  blockers: string[];
-  description: string;
-  updatedAt: string;
-}
-
 function loadActiveGoals(): GoalRecord[] {
-  if (!existsSync(GOALS_DIR)) return [];
-  try {
-    return readdirSync(GOALS_DIR)
-      .filter((f) => f.endsWith('.json'))
-      .map((f) => {
-        try {
-          return JSON.parse(readFileSync(path.join(GOALS_DIR, f), 'utf-8')) as GoalRecord;
-        } catch {
-          return null;
-        }
-      })
-      .filter((g): g is GoalRecord => g !== null && (g.status === 'active' || g.status === 'blocked'))
-      .sort((a, b) => {
-        const pri = { high: 0, medium: 1, low: 2 };
-        return (pri[a.priority] ?? 1) - (pri[b.priority] ?? 1);
-      });
-  } catch {
-    return [];
-  }
+  return listGoalRecords()
+    .filter((g) => g.status === 'active' || g.status === 'blocked')
+    .sort((a, b) => {
+      const pri = { high: 0, medium: 1, low: 2 };
+      return (pri[a.priority] ?? 1) - (pri[b.priority] ?? 1);
+    });
 }
 
 function updateGoal(goalId: string, update: {

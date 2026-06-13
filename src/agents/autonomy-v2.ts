@@ -19,7 +19,6 @@ import type { RuntimeContextValue } from '../types.js';
 import {
   AGENT_INBOX_DIR,
   AGENT_STATE_DIR,
-  GOALS_DIR,
   TASKS_FILE,
   ensureDir,
   ensureTasksFile,
@@ -27,6 +26,7 @@ import {
   parseTasks,
   type TeamAgentRecord,
 } from '../tools/shared.js';
+import { listGoalRecords, type GoalRecord } from '../memory/goals-list.js';
 import { addRunEvent, finishRun } from '../runtime/run-events.js';
 import {
   finishAutonomyRun,
@@ -156,16 +156,6 @@ interface AgentStateRecord {
   engine?: 'v1' | 'v2';
 }
 
-interface GoalRecord {
-  id: string;
-  title: string;
-  status: 'active' | 'paused' | 'completed' | 'blocked';
-  priority: 'high' | 'medium' | 'low';
-  nextActions: string[];
-  blockers: string[];
-  targetDate?: string;
-}
-
 function inboxFilePath(slug: string): string {
   return path.join(AGENT_INBOX_DIR, `${slug}.json`);
 }
@@ -215,25 +205,12 @@ function saveAgentState(state: AgentStateRecord): void {
 }
 
 function loadActiveGoals(): GoalRecord[] {
-  if (!existsSync(GOALS_DIR)) return [];
-  try {
-    return readdirSync(GOALS_DIR)
-      .filter((f) => f.endsWith('.json'))
-      .map((f) => {
-        try {
-          return JSON.parse(readFileSync(path.join(GOALS_DIR, f), 'utf-8')) as GoalRecord;
-        } catch {
-          return null;
-        }
-      })
-      .filter((g): g is GoalRecord => g !== null && (g.status === 'active' || g.status === 'blocked'))
-      .sort((a, b) => {
-        const pri = { high: 0, medium: 1, low: 2 };
-        return (pri[a.priority] ?? 1) - (pri[b.priority] ?? 1);
-      });
-  } catch {
-    return [];
-  }
+  return listGoalRecords()
+    .filter((g) => g.status === 'active' || g.status === 'blocked')
+    .sort((a, b) => {
+      const pri = { high: 0, medium: 1, low: 2 };
+      return (pri[a.priority] ?? 1) - (pri[b.priority] ?? 1);
+    });
 }
 
 function isCadenceDue(agent: TeamAgentRecord, state: AgentStateRecord): boolean {

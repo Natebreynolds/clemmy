@@ -8,7 +8,7 @@ import { listBackgroundTasks } from '../execution/background-tasks.js';
 import { ExecutionStore } from '../execution/store.js';
 import { isUserFacingExecution } from '../execution/scope.js';
 import { addNotification } from '../runtime/notifications.js';
-import { GOALS_DIR } from '../tools/shared.js';
+import { listGoalRecords, type GoalRecord } from '../memory/goals-list.js';
 import { getProactivityPolicySnapshot } from './proactivity-policy.js';
 import { isActionable as isActionableApproval, listPending as listApprovalRegistry, type PendingApprovalRow } from '../runtime/harness/approval-registry.js';
 
@@ -24,16 +24,6 @@ interface ProactiveBriefState {
   lastAttentionSignature?: string;
   lastTitle?: string;
   lastSummary?: string;
-}
-
-interface GoalRecord {
-  id: string;
-  title: string;
-  status: 'active' | 'paused' | 'completed' | 'blocked';
-  priority?: 'high' | 'medium' | 'low';
-  nextActions?: string[];
-  blockers?: string[];
-  updatedAt?: string;
 }
 
 export interface BriefBackgroundTaskLike {
@@ -122,17 +112,7 @@ function humanLabel(primary: string | undefined, fallback: string | undefined, e
 }
 
 function readGoals(): GoalRecord[] {
-  if (!existsSync(GOALS_DIR)) return [];
-  return readdirSync(GOALS_DIR)
-    .filter((file) => file.endsWith('.json'))
-    .map((file) => {
-      try {
-        return JSON.parse(readFileSync(path.join(GOALS_DIR, file), 'utf-8')) as GoalRecord;
-      } catch {
-        return null;
-      }
-    })
-    .filter((goal): goal is GoalRecord => Boolean(goal));
+  return listGoalRecords();
 }
 
 function signatureFor(input: Record<string, unknown>): string {

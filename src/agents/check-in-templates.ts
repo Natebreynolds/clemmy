@@ -3,7 +3,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import pino from 'pino';
 import { BASE_DIR } from '../config.js';
-import { GOALS_DIR } from '../tools/shared.js';
+import { listGoalRecords, type GoalRecord } from '../memory/goals-list.js';
 import { ExecutionStore } from '../execution/store.js';
 import { createCheckIn, listOpenCheckIns, type CheckInUrgency } from './check-ins.js';
 
@@ -269,23 +269,8 @@ export function cronMatches(expr: string, at: Date = new Date()): boolean {
   );
 }
 
-interface GoalRecord {
-  id: string;
-  title: string;
-  status: 'active' | 'paused' | 'completed' | 'blocked';
-  updatedAt?: string;
-  blockers?: string[];
-}
-
 function readGoalsForCheck(): GoalRecord[] {
-  if (!existsSync(GOALS_DIR)) return [];
-  const goals: GoalRecord[] = [];
-  for (const file of readdirSync(GOALS_DIR)) {
-    if (!file.endsWith('.json')) continue;
-    try { goals.push(JSON.parse(readFileSync(path.join(GOALS_DIR, file), 'utf-8')) as GoalRecord); }
-    catch { continue; }
-  }
-  return goals;
+  return listGoalRecords();
 }
 
 interface TriggerContext {

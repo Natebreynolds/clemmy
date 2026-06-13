@@ -4,24 +4,7 @@ import path from 'node:path';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { GOALS_DIR, ensureDir, textResult } from './shared.js';
-
-interface GoalRecord {
-  id: string;
-  title: string;
-  description: string;
-  owner: string;
-  priority: 'high' | 'medium' | 'low';
-  status: 'active' | 'paused' | 'completed' | 'blocked';
-  createdAt: string;
-  updatedAt: string;
-  targetDate?: string;
-  reviewFrequency: 'daily' | 'weekly' | 'on-demand';
-  progressNotes: string[];
-  nextActions: string[];
-  blockers: string[];
-  linkedCronJobs: string[];
-  autoSchedule?: boolean;
-}
+import type { GoalRecord } from '../memory/goals-list.js';
 
 function readGoal(id: string): GoalRecord | null {
   const filePath = path.join(GOALS_DIR, `${id}.json`);

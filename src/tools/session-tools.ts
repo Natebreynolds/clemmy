@@ -5,20 +5,9 @@ import { z } from 'zod';
 import { ExecutionStore } from '../execution/store.js';
 import { loadSessionBrief, listSessionBriefs, refreshSessionBrief, renderSessionResume, saveSessionManualHandoff } from '../memory/session-briefs.js';
 import { PlanStore } from '../planning/plan-store.js';
-import { GOALS_DIR, INBOX_DIR, TASKS_FILE, ensureDir, parseTasks, sessions, textResult } from './shared.js';
+import { INBOX_DIR, TASKS_FILE, parseTasks, sessions, textResult } from './shared.js';
+import { listGoalRecords, type GoalRecord } from '../memory/goals-list.js';
 import { listEvents as listHarnessEvents } from '../runtime/harness/eventlog.js';
-
-interface GoalRecord {
-  id: string;
-  title: string;
-  owner: string;
-  priority: 'high' | 'medium' | 'low';
-  status: 'active' | 'paused' | 'completed' | 'blocked';
-  updatedAt: string;
-  reviewFrequency: 'daily' | 'weekly' | 'on-demand';
-  nextActions: string[];
-  blockers: string[];
-}
 
 interface DiscoveredWorkItem {
   type: string;
@@ -33,17 +22,7 @@ function daysSince(timestamp: string): number {
 }
 
 function readGoals(): GoalRecord[] {
-  ensureDir(GOALS_DIR);
-  return readdirSync(GOALS_DIR)
-    .filter((file) => file.endsWith('.json'))
-    .map((file) => {
-      try {
-        return JSON.parse(readFileSync(path.join(GOALS_DIR, file), 'utf-8')) as GoalRecord;
-      } catch {
-        return null;
-      }
-    })
-    .filter((goal): goal is GoalRecord => goal !== null);
+  return listGoalRecords();
 }
 
 function collectGoalWork(items: DiscoveredWorkItem[]): void {
