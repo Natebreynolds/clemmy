@@ -15,10 +15,11 @@
  *
  *   1. Per-surface kill-switch (`CLEMMY_HARNESS_<SURFACE>`, default ON) —
  *      flips a surface back to legacy instantly.
- *   2. `excludeToolNames` present → legacy. The harness agent builder has no
- *      per-call tool excludes; silently WIDENING a caller's requested tool
- *      surface (autonomy's no-external-writes gate) would be a security
- *      regression, so those callers stay legacy until excludes exist here.
+ *   2. `excludeToolNames` the harness CANNOT enforce (a non-local/external MCP
+ *      tool) → legacy. buildOrchestratorAgent now filters HARNESS-surface tools,
+ *      so callers excluding only local tools (architect: workflow_*; autonomy:
+ *      composio_execute_tool + workflow_*) ride the gated loop. A non-filterable
+ *      exclude still routes legacy — never silently WIDEN a caller's surface.
  *   3. Harness runtime auth unavailable → legacy. This check happens BEFORE
  *      any model call or tool dispatch, so falling back can never
  *      double-execute side effects.
@@ -39,9 +40,23 @@ import { clearKill, createSession, getSession, requestKill } from './eventlog.js
 import { listPending } from './approval-registry.js';
 import { AgentRuntimeCancelledError } from '../provider.js';
 import { getRuntimeEnv } from '../../config.js';
+import { LOCAL_MCP_TOOL_NAMES } from '../../tools/catalog.js';
 import type { AssistantRequest, AssistantResponse } from '../../types.js';
 
 export type HarnessSurface = 'webhook' | 'cron' | 'background' | 'cli';
+
+/** The harness can only ENFORCE an exclusion for tools on its own local surface
+ *  (buildOrchestratorAgent filters those by name). External MCP-server tools are
+ *  resolved dynamically and can't be filtered here, so if a caller excludes one
+ *  we must stay on the legacy core — routing through the harness would silently
+ *  WIDEN the caller's requested tool surface (the autonomy no-external-writes
+ *  gate is the case that matters). The real callers only ever exclude harness
+ *  tools (workflow_*, composio_execute_tool), so they convert cleanly. */
+const HARNESS_FILTERABLE_TOOLS: ReadonlySet<string> = new Set(LOCAL_MCP_TOOL_NAMES as readonly string[]);
+function harnessCanEnforceExcludes(names: string[] | undefined): boolean {
+  if (!names || names.length === 0) return true;
+  return names.every((n) => HARNESS_FILTERABLE_TOOLS.has(n));
+}
 
 /** Interactive chat lanes get the objective-completion judge (parity with
  *  desktop/Discord). Unattended lanes leave it off: their callers already own
@@ -121,7 +136,11 @@ export async function respondViaHarness(
   }
 
   try {
-    const agent = await buildAgentImpl({ userInput: request.message, sessionId });
+    const agent = await buildAgentImpl({
+      userInput: request.message,
+      sessionId,
+      excludeToolNames: request.excludeToolNames,
+    });
     const result = await runConversationImpl({
       agent,
       sessionId,
@@ -197,7 +216,11 @@ export async function respondPreferHarness(
   legacyRespond: (req: AssistantRequest) => Promise<AssistantResponse>,
 ): Promise<AssistantResponse> {
   if (!harnessSurfaceEnabled(surface)) return legacyRespond(request);
-  if (request.excludeToolNames && request.excludeToolNames.length > 0) return legacyRespond(request);
+  // Per-call tool-exclusion: route through the harness ONLY when it can ENFORCE
+  // every excluded name (harness-surface tool). A non-filterable exclude (an
+  // external MCP tool) falls back to legacy so we never silently widen the
+  // caller's tool surface. buildOrchestratorAgent does the actual filtering.
+  if (!harnessCanEnforceExcludes(request.excludeToolNames)) return legacyRespond(request);
   let auth: { ok: boolean };
   try {
     auth = await configureImpl();

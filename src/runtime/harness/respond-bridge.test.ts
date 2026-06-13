@@ -70,15 +70,32 @@ test('respondPreferHarness: kill-switch routes to legacy', async () => {
   assert.equal(res.text, 'legacy');
 });
 
-test('respondPreferHarness: excludeToolNames routes to legacy (never widen a caller tool surface)', async () => {
+test('respondPreferHarness: harness-FILTERABLE excludeToolNames ride the gated loop (exclusion passed to the builder)', async () => {
+  // The FORK-collapse capability: callers excluding only harness tools (architect
+  // workflow_*, autonomy composio_execute_tool+workflow_*) now run on the gated
+  // harness loop instead of the legacy ungated core, with the exclusion enforced.
+  let captured: string[] | undefined;
+  const recordingBuilder = (async (opts: { excludeToolNames?: string[] }) => { captured = opts.excludeToolNames; return FAKE_AGENT; }) as never;
+  _setBridgeImplsForTests({ configure: okConfigure, buildAgent: recordingBuilder, runConversation: fakeRun({ status: 'completed' }) });
+  let legacyCalled = 0;
+  await respondPreferHarness(
+    'cron',
+    { message: 'hi', sessionId: 'bridge-excl-ok', excludeToolNames: ['composio_execute_tool', 'workflow_run'] },
+    async (req) => { legacyCalled += 1; return { text: 'legacy', sessionId: req.sessionId }; },
+  );
+  assert.equal(legacyCalled, 0, 'harness-filterable excludes ride the loop, not legacy');
+  assert.deepEqual(captured, ['composio_execute_tool', 'workflow_run'], 'exclusion forwarded to the agent builder');
+});
+
+test('respondPreferHarness: a NON-filterable exclude (external MCP tool) stays legacy — no silent surface widening', async () => {
   _setBridgeImplsForTests({ configure: okConfigure, buildAgent: fakeAgentBuilder, runConversation: fakeRun({ status: 'completed' }) });
   let legacyCalled = 0;
   const res = await respondPreferHarness(
     'cron',
-    { message: 'hi', sessionId: 'bridge-t2', excludeToolNames: ['composio_execute_tool'] },
+    { message: 'hi', sessionId: 'bridge-excl-ext', excludeToolNames: ['dataforseo__serp_organic_live_advanced'] },
     async (req) => { legacyCalled += 1; return { text: 'legacy', sessionId: req.sessionId }; },
   );
-  assert.equal(legacyCalled, 1);
+  assert.equal(legacyCalled, 1, 'the harness cannot enforce an external-MCP exclude → legacy (invariant preserved)');
   assert.equal(res.text, 'legacy');
 });
 
