@@ -40,6 +40,7 @@ import {
   runConversationFromResume,
   type RunConversationResult,
 } from '../runtime/harness/loop.js';
+import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { countDominantArray } from '../runtime/harness/tool-output-digest.js';
 import { buildOrchestratorAgent } from '../agents/orchestrator.js';
@@ -2007,14 +2008,18 @@ export async function executeStep(
           output = r.output;
           itemSessionId = r.sessionId;
         } else {
-          output = (await ctx.assistant.respond({
+          // FORK collapse (staged): forEach item through the gated harness loop
+          // (default-OFF `workflow` surface → byte-identical to legacy until
+          // CLEMMY_HARNESS_WORKFLOW=on + a real workflow run validates chaining).
+          // honorModel preserves the worker-model routing.
+          output = (await respondPreferHarness('workflow', {
             sessionId: `workflow:${ctx.runId}:${step.id}:${key}`,
             channel: 'workflow',
             message: `Workflow: ${ctx.workflow.name}\nStep: ${step.id}\nItem: ${key}\n\n${prompt}`,
             // forEach fan-out item = delegated grunt-work labor → BYO worker model when routed.
             model: step.model || getWorkerModel(),
             maxWallClockMs: WORKFLOW_STEP_WALL_CLOCK_MS,
-          })).text;
+          }, (r) => ctx.assistant.respond(r))).text;
         }
         // Per-item skill-execution check (forEach): advisory, DETECTION-ONLY —
         // a `usesSkill` item that couldn't be confirmed to produce the skill's
@@ -2110,7 +2115,10 @@ export async function executeStep(
       throw err;
     }
   } else {
-    const response = await ctx.assistant.respond({
+    // FORK collapse (staged): plain step through the gated harness loop
+    // (default-OFF `workflow` surface → byte-identical to legacy until
+    // CLEMMY_HARNESS_WORKFLOW=on + a real workflow run validates chaining).
+    const response = await respondPreferHarness('workflow', {
       sessionId: `workflow:${ctx.runId}:${step.id}`,
       channel: 'workflow',
       message: `Workflow: ${ctx.workflow.name}\nStep: ${step.id}\n\n${prompt}`,
@@ -2121,7 +2129,7 @@ export async function executeStep(
       // pin a specific step via step.model.
       model: step.model || MODELS.primary,
       maxWallClockMs: WORKFLOW_STEP_WALL_CLOCK_MS,
-    });
+    }, (r) => ctx.assistant.respond(r));
     output = response.text;
   }
 

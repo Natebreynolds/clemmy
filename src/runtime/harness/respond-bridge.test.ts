@@ -45,6 +45,7 @@ beforeEach(() => {
   delete process.env.CLEMMY_HARNESS_CRON;
   delete process.env.CLEMMY_HARNESS_DASHBOARD;
   delete process.env.CLEMMY_HARNESS_HOME;
+  delete process.env.CLEMMY_HARNESS_WORKFLOW;
 });
 
 after(() => {
@@ -89,6 +90,26 @@ test('staged surfaces (dashboard, home) both default OFF; home is judge-ON for c
   let legacyCalled = 0;
   await respondPreferHarness('home', { message: 'hi', sessionId: 'home-staged' }, async (req) => { legacyCalled += 1; return { text: 'legacy', sessionId: req.sessionId }; });
   assert.equal(legacyCalled, 1, 'home default-off → legacy');
+});
+
+test('workflow surface: staged (default OFF) + honorModel forwards step.model on the gated loop', async () => {
+  assert.equal(harnessSurfaceEnabled('workflow'), false, 'workflow surface staged OFF by default');
+  // When flipped on, the worker model is forwarded to the agent builder (so a
+  // converted forEach step keeps its cheaper model). Other surfaces ignore model.
+  process.env.CLEMMY_HARNESS_WORKFLOW = 'on';
+  let capturedModel: string | undefined;
+  const recordingBuilder = (async (opts: { model?: string }) => { capturedModel = opts.model; return FAKE_AGENT; }) as never;
+  _setBridgeImplsForTests({ configure: okConfigure, buildAgent: recordingBuilder, runConversation: fakeRun({ status: 'completed' }) });
+  await respondPreferHarness('workflow', { message: 'step', sessionId: 'wf-1', model: 'gpt-5.4-mini' }, async (req) => ({ text: 'legacy', sessionId: req.sessionId }));
+  assert.equal(capturedModel, 'gpt-5.4-mini', 'honorModel surface forwards step.model');
+});
+
+test('non-honorModel surface ignores request.model (cron/gateway byte-identical)', async () => {
+  let capturedModel: string | undefined = 'unset';
+  const recordingBuilder = (async (opts: { model?: string }) => { capturedModel = opts.model; return FAKE_AGENT; }) as never;
+  _setBridgeImplsForTests({ configure: okConfigure, buildAgent: recordingBuilder, runConversation: fakeRun({ status: 'completed' }) });
+  await respondPreferHarness('cron', { message: 'job', sessionId: 'cron-1', model: 'gpt-5.4-deep' }, async (req) => ({ text: 'legacy', sessionId: req.sessionId }));
+  assert.equal(capturedModel, undefined, 'cron does NOT forward model — harness keeps its configured model');
 });
 
 test('respondPreferHarness: kill-switch routes to legacy', async () => {

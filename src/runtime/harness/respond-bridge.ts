@@ -43,7 +43,7 @@ import { getRuntimeEnv } from '../../config.js';
 import { LOCAL_MCP_TOOL_NAMES } from '../../tools/catalog.js';
 import type { AssistantRequest, AssistantResponse } from '../../types.js';
 
-export type HarnessSurface = 'webhook' | 'cron' | 'background' | 'cli' | 'dashboard' | 'home';
+export type HarnessSurface = 'webhook' | 'cron' | 'background' | 'cli' | 'dashboard' | 'home' | 'workflow';
 
 /** Surfaces that are STAGED, not yet validated live: default OFF (legacy stays
  *  byte-identical) so a new conversion lands reversibly and Nathan flips the
@@ -51,7 +51,7 @@ export type HarnessSurface = 'webhook' | 'cron' | 'background' | 'cli' | 'dashbo
  *  already-validated surfaces (webhook/cron/background/cli) default ON. These
  *  flags are TEMPORARY — they collapse to zero (legacy core deleted, conversions
  *  baked in) once validated, so the net is a flag REDUCTION, not sprawl. */
-const STAGING_SURFACES: ReadonlySet<HarnessSurface> = new Set<HarnessSurface>(['dashboard', 'home']);
+const STAGING_SURFACES: ReadonlySet<HarnessSurface> = new Set<HarnessSurface>(['dashboard', 'home', 'workflow']);
 
 /** The harness can only ENFORCE an exclusion for tools on its own local surface
  *  (buildOrchestratorAgent filters those by name). External MCP-server tools are
@@ -70,11 +70,16 @@ function harnessCanEnforceExcludes(names: string[] | undefined): boolean {
  *  desktop/Discord). Unattended lanes leave it off: their callers already own
  *  report-back honesty via verifyDelivered, and an in-loop judge with no
  *  human present only burns budget arguing with itself. */
-const SURFACE_CONFIG: Record<HarnessSurface, { kind: 'chat' | 'execution'; judgeCompletion: boolean }> = {
+const SURFACE_CONFIG: Record<HarnessSurface, { kind: 'chat' | 'execution'; judgeCompletion: boolean; honorModel?: boolean }> = {
   webhook: { kind: 'chat', judgeCompletion: true },
   cli: { kind: 'chat', judgeCompletion: true },
   cron: { kind: 'execution', judgeCompletion: false },
   background: { kind: 'execution', judgeCompletion: false },
+  // Workflow steps: execution lane (no judge — the step contract owns
+  // completion). honorModel passes step.model through so forEach fan-out keeps
+  // its cheaper worker model. Contained: only THIS surface honors request.model
+  // (cron/gateway/etc. keep ignoring it — byte-identical).
+  workflow: { kind: 'execution', judgeCompletion: false, honorModel: true },
   // One-shot console drafting endpoint (workflow architect): chat kind, but NO
   // objective judge — a single drafting reply is not a multi-step action to
   // validate, and the judge would only add latency/loops.
@@ -156,6 +161,9 @@ export async function respondViaHarness(
       userInput: request.message,
       sessionId,
       excludeToolNames: request.excludeToolNames,
+      // Only surfaces flagged honorModel forward request.model (workflow steps);
+      // every other surface keeps the harness's configured model (byte-identical).
+      ...(config.honorModel && request.model ? { model: request.model } : {}),
     });
     const result = await runConversationImpl({
       agent,
