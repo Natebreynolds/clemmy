@@ -153,7 +153,10 @@ import {
 } from '../agents/goal-commands.js';
 import { createJsonFieldStreamer } from '../runtime/harness/stream-reply.js';
 import { PlanSchema } from '../agents/planner.js';
-import { closePlanScope, listActiveScopes, listAllScopes } from '../agents/plan-scope.js';
+import {
+  closePlanScope, listActiveScopes, listAllScopes,
+  grantStandingApproval, revokeStandingApproval, listStandingGrants,
+} from '../agents/plan-scope.js';
 import type { CheckInUrgency } from '../agents/check-ins.js';
 import { createBackgroundTask, getBackgroundTask, listBackgroundTasks, processBackgroundTasks } from '../execution/background-tasks.js';
 import { getBackgroundTaskStatus } from '../execution/background-task-status.js';
@@ -4365,7 +4368,14 @@ export function registerConsoleRoutes(
     }
     const scopeTtlMs = typeof body.scopeTtlMs === 'number' && body.scopeTtlMs >= 0 ? body.scopeTtlMs : undefined;
     const allowedTools = Array.isArray(body.allowedTools) ? body.allowedTools.filter((t: unknown) => typeof t === 'string') : undefined;
-    const result = approvePlanAndQueueBackgroundTask(req.params.id, { editedPlan, scopeTtlMs, allowedTools });
+    // Goal-scoped autonomy (B1): "run autonomously" opens a goal-lifetime
+    // approval scope + self-drives the goal. Sends still gate unless the user
+    // enumerated them in allowedSends; the 5 safety gates never bypass.
+    const autonomous = body.autonomous === true;
+    const allowedSends = Array.isArray(body.allowedSends)
+      ? body.allowedSends.filter((t: unknown) => typeof t === 'string')
+      : undefined;
+    const result = approvePlanAndQueueBackgroundTask(req.params.id, { editedPlan, scopeTtlMs, allowedTools, autonomous, allowedSends });
     if (!result) { res.status(404).json({ error: 'plan proposal not found or already resolved' }); return; }
     setImmediate(() => {
       processBackgroundTasks(assistant, 1).catch((err) => {
@@ -4405,6 +4415,35 @@ export function registerConsoleRoutes(
     const scope = closePlanScope(req.params.sessionId, reason);
     if (!scope) { res.status(404).json({ error: 'no scope for that session' }); return; }
     res.json({ scope });
+  });
+
+  // ─── Standing grants (B2: durable per-tool auto-approval) ──────
+
+  app.get('/api/console/standing-grants', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    res.json({ grants: listStandingGrants() });
+  });
+
+  app.post('/api/console/standing-grants', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const toolName = typeof req.body?.toolName === 'string' ? req.body.toolName.trim() : '';
+    if (!toolName) { res.status(400).json({ error: 'toolName required' }); return; }
+    const note = typeof req.body?.note === 'string' ? req.body.note : undefined;
+    // Classify so send/admin are refused at write — the side-effect law.
+    const kind = classifyTool(toolName);
+    const grant = grantStandingApproval(toolName, { kind, note });
+    if (!grant) {
+      res.status(400).json({ error: `cannot grant a ${kind} tool — sends and admin actions always require an in-the-moment decision` });
+      return;
+    }
+    res.json({ grant });
+  });
+
+  app.delete('/api/console/standing-grants/:toolName', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const ok = revokeStandingApproval(req.params.toolName);
+    if (!ok) { res.status(404).json({ error: 'no live grant for that tool' }); return; }
+    res.json({ revoked: true });
   });
 
   // ─── MCP servers (manageable from the Integrations Hub) ────────

@@ -63,6 +63,21 @@ export interface PlanScope {
    * exact Composio slugs.
    */
   allowedComposioSlugs?: string[];
+  /**
+   * Goal-scoped autonomy (B1): when set, this scope's lifetime is DERIVED from
+   * the goal record — it stays open while the goal is `active` and is closed by
+   * the goal's terminal transition (satisfy/expire/supersede call
+   * closePlanScope), NOT by a TTL. No timer, no new mechanism.
+   */
+  goalScoped?: { goalId: string };
+  /**
+   * Under a goal-scoped scope, send-kind tools (irreversible network mutations)
+   * auto-approve ONLY when named here — a tool name, or a composio slug for the
+   * broker. Populated solely from sends the blessed plan explicitly enumerated.
+   * Anything not listed falls through to the approval registry (the side-effect
+   * law: a send the user didn't pre-bless always waits).
+   */
+  allowedSends?: string[];
   openedAt: string;
   expiresAt: string;
   /** Audit trail of auto-approved calls inside this scope. */
@@ -73,8 +88,23 @@ export interface PlanScope {
   version: 'v1';
 }
 
+/**
+ * A standing grant (B2): a durable, user-level "always auto-approve this tool"
+ * permission, independent of any session or plan. Sends, admin, and destructive
+ * tools can NEVER be granted (refused at write); a per-call destructive hint
+ * still gates upstream in decideToolApproval even for a granted tool.
+ */
+export interface StandingGrant {
+  toolName: string;
+  grantedAt: string;
+  note?: string;
+  revokedAt?: string;
+}
+
 interface ScopesFile {
   scopes: Record<string, PlanScope>; // keyed by sessionId
+  /** Standing grants, keyed by toolName (B2). */
+  grants?: Record<string, StandingGrant>;
   version: 'v1';
 }
 
@@ -107,14 +137,23 @@ export interface OpenPlanScopeInput {
   ttlMs?: number;
   allowedTools?: string[];
   allowedComposioSlugs?: string[];
+  /** Open a goal-lifetime scope (no TTL) keyed to this goal id. */
+  goalScoped?: { goalId: string };
+  /** Sends the plan enumerated + the user blessed (goal-scoped only). */
+  allowedSends?: string[];
 }
 
 export const DEFAULT_SCOPE_ALLOWED_TOOLS = ['run_shell_command', 'write_file'];
 
 export function openPlanScope(input: OpenPlanScopeInput): PlanScope {
   if (!input.sessionId) throw new Error('sessionId required to open a plan scope');
-  const ttl = Math.min(ABSOLUTE_MAX_TTL_MS, Math.max(60_000, input.ttlMs ?? DEFAULT_SCOPE_TTL_MS));
   const now = Date.now();
+  // A goal-scoped scope has no TTL — its lifetime is the goal's. We still stamp
+  // a far-future expiresAt for back-compat with consumers that read the field,
+  // but getPlanScope never expires a goal-scoped scope on time.
+  const ttl = input.goalScoped
+    ? 365 * 24 * 60 * 60 * 1000
+    : Math.min(ABSOLUTE_MAX_TTL_MS, Math.max(60_000, input.ttlMs ?? DEFAULT_SCOPE_TTL_MS));
   const scope: PlanScope = {
     sessionId: input.sessionId,
     planProposalId: input.planProposalId,
@@ -123,6 +162,8 @@ export function openPlanScope(input: OpenPlanScopeInput): PlanScope {
     allowedComposioSlugs: input.allowedComposioSlugs && input.allowedComposioSlugs.length > 0
       ? input.allowedComposioSlugs
       : undefined,
+    goalScoped: input.goalScoped,
+    allowedSends: input.allowedSends && input.allowedSends.length > 0 ? input.allowedSends : undefined,
     openedAt: new Date(now).toISOString(),
     expiresAt: new Date(now + ttl).toISOString(),
     autoApprovals: [],
@@ -150,6 +191,9 @@ export function getPlanScope(sessionId: string): PlanScope | null {
   const scope = file.scopes[sessionId];
   if (!scope) return null;
   if (scope.closedAt) return scope; // return closed scope for inspection but isAutoApproved will refuse
+  // A goal-scoped scope has NO time limit — it is closed only by the goal's
+  // terminal transition (which calls closePlanScope). Never time-expire it.
+  if (scope.goalScoped) return scope;
   // Expire lazily if we're past the window.
   if (Date.parse(scope.expiresAt) <= Date.now()) {
     return { ...scope, closedAt: new Date().toISOString(), closedReason: 'expired' };
@@ -174,11 +218,34 @@ export function closePlanScope(sessionId: string, reason: string = 'closed'): Pl
  * Pure check — does the session have an active, unexpired plan scope
  * that covers `toolName`? Does not mutate.
  */
-export function isAutoApprovedByScope(sessionId: string | undefined, toolName: string, args?: unknown): boolean {
+export function isAutoApprovedByScope(
+  sessionId: string | undefined,
+  toolName: string,
+  args?: unknown,
+  kindHint?: 'send' | 'other',
+): boolean {
+  // Standing grants (B2): durable, user-level, session-independent. A send is
+  // never grantable (refused at write), so a grant only ever covers a safe
+  // write/execute tool — but guard kindHint defensively anyway.
+  if (kindHint !== 'send' && isStandingGranted(toolName)) return true;
   if (!sessionId) return false;
   const scope = getPlanScope(sessionId);
   if (!scope) return false;
   if (scope.closedAt) return false;
+  // Goal-scoped autonomy, the send chokepoint: an irreversible SEND under a
+  // goal-lifetime scope auto-approves ONLY if the plan enumerated it and the
+  // user blessed it (allowedSends). Everything else about a send — an
+  // un-enumerated DM, a publish the plan never mentioned — falls through to the
+  // approval registry. This holds even if allowedTools/`*` would otherwise
+  // cover it: the side-effect law is stricter than the tool allowlist. (The 5
+  // safety gates already ran before this module; this is the extra send lock a
+  // no-TTL scope needs that the 15-min time-boxed scope didn't.)
+  if (scope.goalScoped && kindHint === 'send') {
+    const sends = scope.allowedSends ?? [];
+    if (sends.length === 0) return false;
+    const slug = extractComposioSlug(args);
+    return sends.includes(toolName) || (!!slug && sends.includes(slug));
+  }
   if (scope.allowedTools.includes('*')) return true;
   if (scope.allowedTools.includes(toolName)) {
     if (
@@ -236,8 +303,10 @@ export function evaluateAutoApprove(input: {
   args?: unknown;
   scope: 'strict' | 'balanced' | 'workspace' | 'yolo';
   insideWorkspace: boolean;
+  /** 'send' applies the goal-scoped send lock; anything else is 'other'. */
+  kindHint?: 'send' | 'other';
 }): AutoApproveDecision {
-  if (isAutoApprovedByScope(input.sessionId, input.toolName, input.args)) {
+  if (isAutoApprovedByScope(input.sessionId, input.toolName, input.args, input.kindHint)) {
     return { autoApproved: true, reason: 'plan-scope' };
   }
   if (input.scope === 'yolo') {
@@ -293,6 +362,59 @@ export function summarizeToolArgs(toolName: string, input: unknown): string {
     default:
       return redactSensitiveText(Object.entries(obj).slice(0, 4).map(([k, v]) => `${k}=${String(v).slice(0, 60)}`).join(' · '));
   }
+}
+
+// ─── Standing grants (B2) ────────────────────────────────────────────────────
+
+function standingGrantsEnabled(): boolean {
+  return (process.env.CLEMMY_STANDING_GRANTS || 'on').toLowerCase() !== 'off';
+}
+
+/**
+ * Grant a durable auto-approval for a tool. Refuses send/admin kinds (the
+ * caller classifies and passes `kind`) — those must always be a deliberate,
+ * in-the-moment decision (side-effect law). Returns the grant, or null if
+ * refused. Re-granting clears any prior revocation.
+ */
+export function grantStandingApproval(
+  toolName: string,
+  opts: { kind?: 'read' | 'write' | 'execute' | 'send' | 'admin'; note?: string } = {},
+): StandingGrant | null {
+  const name = toolName.trim();
+  if (!name) return null;
+  if (opts.kind === 'send' || opts.kind === 'admin') return null; // never grantable
+  const file = readAll();
+  file.grants = file.grants ?? {};
+  const grant: StandingGrant = { toolName: name, grantedAt: new Date().toISOString(), note: opts.note?.trim() || undefined };
+  file.grants[name] = grant;
+  writeAll(file);
+  logger.info({ toolName: name }, 'standing grant added');
+  return grant;
+}
+
+/** Revoke a standing grant (soft — keeps the row with revokedAt for audit). */
+export function revokeStandingApproval(toolName: string): boolean {
+  const file = readAll();
+  const grant = file.grants?.[toolName];
+  if (!grant || grant.revokedAt) return false;
+  grant.revokedAt = new Date().toISOString();
+  file.grants![toolName] = grant;
+  writeAll(file);
+  logger.info({ toolName }, 'standing grant revoked');
+  return true;
+}
+
+/** Is there a live (non-revoked) standing grant for this tool? */
+export function isStandingGranted(toolName: string): boolean {
+  if (!standingGrantsEnabled()) return false;
+  const file = readAll();
+  const grant = file.grants?.[toolName];
+  return !!grant && !grant.revokedAt;
+}
+
+export function listStandingGrants(): StandingGrant[] {
+  const file = readAll();
+  return Object.values(file.grants ?? {}).filter((g) => !g.revokedAt);
 }
 
 export function listActiveScopes(): PlanScope[] {

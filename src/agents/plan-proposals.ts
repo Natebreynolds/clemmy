@@ -2,10 +2,32 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSyn
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import pino from 'pino';
-import { BASE_DIR } from '../config.js';
+import { BASE_DIR, getRuntimeEnv } from '../config.js';
 import { addNotification } from '../runtime/notifications.js';
 import type { Plan } from './planner.js';
-import { openPlanScope } from './plan-scope.js';
+import { openPlanScope, closePlanScope, getPlanScope } from './plan-scope.js';
+
+/** Kill-switch for goal-scoped autonomy (B1). Off ⇒ autonomous approval falls
+ *  back to today's time-boxed plan scope. */
+function goalScopeEnabled(): boolean {
+  if ((getRuntimeEnv('CLEMMY_GOAL_CONTRACT', 'on') ?? 'on').toLowerCase() === 'off') return false;
+  return (getRuntimeEnv('CLEMMY_GOAL_SCOPE', 'on') ?? 'on').toLowerCase() !== 'off';
+}
+
+/** Close the goal-scoped plan scope tied to a goal that just resolved. Only
+ *  closes a scope that IS goal-scoped FOR THIS goal — an unrelated time-boxed
+ *  scope on the session is left alone. The scope's lifetime is derived from the
+ *  goal, so its terminal transition is the only thing that closes it.
+ *  Best-effort. */
+function closeGoalScopeFor(goal: PlanProposal): void {
+  if (!goal.sessionId) return;
+  try {
+    const scope = getPlanScope(goal.sessionId);
+    if (scope?.goalScoped?.goalId === goal.id) {
+      closePlanScope(goal.sessionId, `goal ${goal.status}`);
+    }
+  } catch { /* best-effort */ }
+}
 
 /**
  * Plan proposals — agent-drafted plans surfaced for user review.
@@ -483,6 +505,15 @@ export interface ApprovePlanProposalOptions {
    * Pass an empty array to skip opening a scope.
    */
   allowedTools?: string[];
+  /**
+   * Goal-scoped autonomy (B1): open a GOAL-LIFETIME scope (no TTL, closed by
+   * the goal's terminal transition) and flag the goal self-driving, so the
+   * goal runs unattended. Send-kind tools still gate unless enumerated in
+   * `allowedSends`; the 5 safety gates never bypass.
+   */
+  autonomous?: boolean;
+  /** Sends the plan enumerated + the user blessed (autonomous only). */
+  allowedSends?: string[];
 }
 
 export function approvePlanProposal(id: string, options: ApprovePlanProposalOptions = {}): PlanProposal | null {
@@ -503,9 +534,15 @@ export function approvePlanProposal(id: string, options: ApprovePlanProposalOpti
   // Open a plan-scope so the next batch of tool calls (run_shell_command,
   // write_file) doesn't have to interrupt for per-call approval. The
   // scope expires after the TTL even if the agent keeps running.
+  //
+  // Autonomous approval opens a GOAL-SCOPED scope instead (no TTL, lifetime =
+  // the goal) AFTER activation below — so here we skip the time-boxed open for
+  // the autonomous path. Falls back to the time-boxed scope when the goal-scope
+  // kill-switch is off.
+  const autonomous = Boolean(options.autonomous) && goalScopeEnabled();
   let scopeOpened = false;
   let scopeExpiresAt: string | undefined;
-  if (proposal.sessionId && options.allowedTools?.length !== 0) {
+  if (!autonomous && proposal.sessionId && options.allowedTools?.length !== 0) {
     const scope = openPlanScope({
       sessionId: proposal.sessionId,
       planProposalId: proposal.id,
@@ -544,7 +581,29 @@ export function approvePlanProposal(id: string, options: ApprovePlanProposalOpti
   if (proposal.sessionId && (proposal.kind ?? 'plan') === 'plan') {
     try {
       const activated = activateGoal(proposal.id, { origin: { kind: 'chat' } });
-      if (activated) return activated;
+      if (activated) {
+        if (autonomous) {
+          // Goal-lifetime auto-approval scope + self-driving. The scope is keyed
+          // to the goal and closed by satisfy/expire/supersede — no timer.
+          try {
+            openPlanScope({
+              sessionId: proposal.sessionId,
+              planProposalId: proposal.id,
+              approvedPlanObjective: approvedPlan.objective,
+              allowedTools: options.allowedTools,
+              goalScoped: { goalId: proposal.id },
+              allowedSends: options.allowedSends,
+            });
+            // enableGoalSelfDrive rewrites the record — return ITS result so the
+            // caller sees selfDriving:true (not the pre-self-drive snapshot).
+            const driving = enableGoalSelfDrive(proposal.id);
+            if (driving) return driving;
+          } catch (err) {
+            logger.warn({ proposalId: proposal.id, err: err instanceof Error ? err.message : String(err) }, 'autonomous scope/self-drive setup failed');
+          }
+        }
+        return activated;
+      }
     } catch (err) {
       logger.warn({ proposalId: proposal.id, err: err instanceof Error ? err.message : String(err) }, 'goal activation after approval failed');
     }
@@ -647,13 +706,15 @@ export function activateGoal(id: string, options: ActivateGoalOptions = {}): Pla
   if (proposal.sessionId) {
     for (const other of listPlanProposals({ status: 'active', sessionId: proposal.sessionId })) {
       if (other.id === id) continue;
-      writeProposal({
+      const supersededGoal: PlanProposal = {
         ...other,
         status: 'superseded',
         resolvedAt: new Date().toISOString(),
         resolvedBy: 'system',
         rejectionReason: `Superseded by goal ${id}`,
-      });
+      };
+      writeProposal(supersededGoal);
+      closeGoalScopeFor(supersededGoal);
       logger.info({ superseded: other.id, by: id, sessionId: proposal.sessionId }, 'active goal superseded by new goal');
     }
   }
@@ -1031,6 +1092,7 @@ export function satisfyGoal(id: string, reason?: string): PlanProposal | null {
     doneReason: reason?.trim() || undefined,
   };
   writeProposal(resolved);
+  closeGoalScopeFor(resolved);
   logger.info({ goalId: id, sessionId: proposal.sessionId }, 'goal contract satisfied');
   return resolved;
 }
@@ -1047,6 +1109,7 @@ export function expireGoal(id: string, reason?: string): PlanProposal | null {
     doneReason: reason?.trim() || undefined,
   };
   writeProposal(resolved);
+  closeGoalScopeFor(resolved);
   logger.info({ goalId: id, sessionId: proposal.sessionId, reason }, 'goal contract expired');
   return resolved;
 }

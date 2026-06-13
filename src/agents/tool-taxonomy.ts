@@ -498,6 +498,8 @@ export function decideToolApproval(input: ApprovalDecisionInput): ApprovalDecisi
     args: input.args,
     scope: policy.autoApproveScope satisfies AutoApproveScope,
     insideWorkspace: kind === 'send' ? false : Boolean(input.insideWorkspaceHint),
+    // The goal-scoped send lock keys on whether this is an irreversible send.
+    kindHint: kind === 'send' ? 'send' : 'other',
   });
 
   if (decision.autoApproved) {

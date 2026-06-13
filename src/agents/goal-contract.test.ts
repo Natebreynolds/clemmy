@@ -196,6 +196,24 @@ test('advanceGoalStage is single-fire, resets attempt, and walks to the next sta
   assert.equal(advanceGoalStage(active.id, 's1'), null, 'already-done stage does not re-fire');
 });
 
+test('autonomous approval opens a goal-scoped scope + self-driving, and the scope dies with the goal', async () => {
+  const { getPlanScope } = await import('./plan-scope.js');
+  const p = surfacePlan({ plan: aPlan(), originatingRequest: 'auto run', sessionId: 'sess-auto1' });
+  const active = approvePlanProposal(p.id, {
+    allowedTools: ['*'], autonomous: true, allowedSends: ['GMAIL_SEND_EMAIL'],
+  })!;
+  assert.equal(active.selfDriving, true, 'autonomous approval flags the goal self-driving');
+  const scope = getPlanScope('sess-auto1');
+  assert.ok(scope?.goalScoped, 'a goal-scoped scope opened');
+  assert.equal(scope!.goalScoped!.goalId, active.id);
+  assert.deepEqual(scope!.allowedSends, ['GMAIL_SEND_EMAIL']);
+
+  // Satisfying the goal closes the scope (no orphaned auto-approval window).
+  satisfyGoal(active.id, 'done');
+  const after = getPlanScope('sess-auto1');
+  assert.ok(after?.closedAt, 'goal-scoped scope closed when the goal resolved');
+});
+
 test('advanceGoalStage refuses unknown stage and non-active goals', () => {
   const p = surfacePlan({ plan: stagedPlan(), originatingRequest: 'staged', sessionId: 'sess-st4' });
   const active = approvePlanProposal(p.id, { allowedTools: [] })!;

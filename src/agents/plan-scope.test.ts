@@ -29,6 +29,10 @@ const {
   openPlanScope,
   recordAutoApproval,
   summarizeToolArgs,
+  grantStandingApproval,
+  revokeStandingApproval,
+  isStandingGranted,
+  listStandingGrants,
 } = await import('./plan-scope.js');
 
 const SCOPES_FILE = path.join(TEST_HOME, 'state', 'plan-scopes.json');
@@ -283,4 +287,93 @@ test('evaluateAutoApprove: plan-scope wins over policy reason when both fire', (
   // plan-scope takes precedence so the audit log reflects the user's
   // explicit approval rather than the catch-all yolo policy.
   assert.equal(d.reason, 'plan-scope');
+});
+
+// ─── B1: goal-scoped autonomy ────────────────────────────────────────────────
+
+test('a goal-scoped scope never time-expires (only its goal closes it)', () => {
+  openPlanScope({
+    sessionId: 'sess-gs1', planProposalId: 'goal-1', approvedPlanObjective: 'auto',
+    allowedTools: ['*'], goalScoped: { goalId: 'goal-1' },
+  });
+  // Backdate the expiry far into the past — a TIME-boxed scope would be dead.
+  backdate('sess-gs1', -2 * 60 * 60 * 1000, -60 * 60 * 1000);
+  const scope = getPlanScope('sess-gs1');
+  assert.ok(scope && !scope.closedAt, 'goal scope ignores the elapsed TTL');
+  assert.equal(isAutoApprovedByScope('sess-gs1', 'run_shell_command'), true);
+  // Closing it (the goal-terminal hook does this) refuses further approvals.
+  closePlanScope('sess-gs1', 'goal satisfied');
+  assert.equal(isAutoApprovedByScope('sess-gs1', 'run_shell_command'), false);
+});
+
+test('goal-scoped send lock: a send auto-approves ONLY if enumerated in allowedSends', () => {
+  openPlanScope({
+    sessionId: 'sess-gs2', planProposalId: 'goal-2', approvedPlanObjective: 'auto',
+    allowedTools: ['*'], goalScoped: { goalId: 'goal-2' },
+    allowedSends: ['composio_execute_tool', 'GMAIL_SEND_EMAIL'],
+  });
+  // A non-send tool flows under '*'.
+  assert.equal(isAutoApprovedByScope('sess-gs2', 'write_file', undefined, 'other'), true);
+  // An enumerated send tool name auto-approves.
+  assert.equal(isAutoApprovedByScope('sess-gs2', 'composio_execute_tool', '{"tool_slug":"GMAIL_SEND_EMAIL"}', 'send'), true);
+  // An enumerated composio slug (via the broker) auto-approves.
+  assert.equal(isAutoApprovedByScope('sess-gs2', 'GMAIL_SEND_EMAIL', undefined, 'send'), true);
+  // A send NOT enumerated falls through to approval even though '*' covers tools.
+  assert.equal(isAutoApprovedByScope('sess-gs2', 'SLACK_POST_MESSAGE', undefined, 'send'), false);
+});
+
+test('goal-scoped scope with NO allowedSends gates every send', () => {
+  openPlanScope({
+    sessionId: 'sess-gs3', planProposalId: 'goal-3', approvedPlanObjective: 'auto',
+    allowedTools: ['*'], goalScoped: { goalId: 'goal-3' },
+  });
+  assert.equal(isAutoApprovedByScope('sess-gs3', 'GMAIL_SEND_EMAIL', undefined, 'send'), false, 'no blessed sends ⇒ all sends gate');
+  assert.equal(isAutoApprovedByScope('sess-gs3', 'write_file', undefined, 'other'), true, 'non-sends still flow');
+});
+
+test('a TIME-boxed scope keeps its prior send behavior (send lock is goal-scoped only)', () => {
+  // Without goalScoped, a send listed in allowedTools auto-approves as before —
+  // the 15-min TTL is what bounds it. The send lock must not regress this.
+  openPlanScope({
+    sessionId: 'sess-tb', planProposalId: 'plan-tb', approvedPlanObjective: 'time-boxed',
+    allowedTools: ['GMAIL_SEND_EMAIL'],
+  });
+  assert.equal(isAutoApprovedByScope('sess-tb', 'GMAIL_SEND_EMAIL', undefined, 'send'), true);
+});
+
+// ─── B2: standing grants ─────────────────────────────────────────────────────
+
+test('a standing grant auto-approves a write tool with no session scope, and revoke ends it', () => {
+  assert.equal(isAutoApprovedByScope(undefined, 'run_shell_command'), false, 'no grant yet');
+  const grant = grantStandingApproval('run_shell_command', { kind: 'execute', note: 'trusted' });
+  assert.ok(grant);
+  assert.equal(isStandingGranted('run_shell_command'), true);
+  // Session-independent: auto-approves even with no plan scope on the session.
+  assert.equal(isAutoApprovedByScope('sess-none', 'run_shell_command'), true);
+  assert.equal(listStandingGrants().length, 1);
+
+  assert.equal(revokeStandingApproval('run_shell_command'), true);
+  assert.equal(isStandingGranted('run_shell_command'), false);
+  assert.equal(isAutoApprovedByScope('sess-none', 'run_shell_command'), false, 'revoked grant no longer auto-approves');
+  assert.equal(listStandingGrants().length, 0);
+});
+
+test('send and admin kinds can NEVER be granted (side-effect law at write time)', () => {
+  assert.equal(grantStandingApproval('GMAIL_SEND_EMAIL', { kind: 'send' }), null, 'send refused');
+  assert.equal(grantStandingApproval('delete_account', { kind: 'admin' }), null, 'admin refused');
+  assert.equal(isStandingGranted('GMAIL_SEND_EMAIL'), false);
+  // Even if a send tool were somehow granted, the kindHint guard blocks it.
+  grantStandingApproval('write_file', { kind: 'write' });
+  assert.equal(isAutoApprovedByScope('s', 'write_file', undefined, 'send'), false, 'a send call never rides a grant');
+});
+
+test('CLEMMY_STANDING_GRANTS=off makes grants inert', () => {
+  grantStandingApproval('run_shell_command', { kind: 'execute' });
+  process.env.CLEMMY_STANDING_GRANTS = 'off';
+  try {
+    assert.equal(isStandingGranted('run_shell_command'), false);
+    assert.equal(isAutoApprovedByScope('s', 'run_shell_command'), false);
+  } finally {
+    delete process.env.CLEMMY_STANDING_GRANTS;
+  }
 });
