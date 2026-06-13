@@ -120,6 +120,67 @@ function makeApprovalRunStateWithInterruptions(
   return JSON.stringify(json);
 }
 
+test('dynamic reasoning effort: real runTurn injects effort onto the agent per turn complexity (none for simple, high for complex)', async () => {
+  // Exercises the ACTUAL loop.ts injection (not a hand-port): a simple lookup
+  // keeps gpt-5.5's 'none' default (byte-identical, fastest), a complex
+  // multi-domain read+write request bumps to 'high'. Also asserts the runner
+  // honors it — `_modelSettingsExplicitlyConfigured` must be flipped true, else
+  // the SDK ignores agent.modelSettings entirely.
+  resetEventLog();
+  const runRunner: RunRunnerFn = async (_runner, _agent, items) => ({
+    history: [...items, { role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'ok' }] }],
+    lastResponseId: 'resp',
+    finalOutput: { ok: true },
+  });
+
+  // Simple turn → none
+  const simpleAgent = makeAgentStub() as any;
+  const s1 = HarnessSession.create({ kind: 'chat', title: 'effort-simple' });
+  await runTurn({ agent: simpleAgent, sessionId: s1.id, input: "what's on my calendar today?", makeRunner: makeRunnerStub, runRunner });
+  assert.equal(simpleAgent.modelSettings?.reasoning?.effort, 'none', 'simple → none');
+  assert.equal(simpleAgent._modelSettingsExplicitlyConfigured, true, 'flag flipped so SDK honors it');
+  assert.equal(simpleAgent.modelSettings?.text?.verbosity, 'low', 'gpt-5 verbosity default preserved');
+  const e1 = listEvents(s1.id, { types: ['reasoning_effort'] });
+  assert.equal(e1.length, 1);
+  assert.equal(e1[0].data.effort, 'none');
+
+  // Complex turn → high (multi-domain read + write + draft)
+  const complexAgent = makeAgentStub() as any;
+  const s2 = HarnessSession.create({ kind: 'chat', title: 'effort-complex' });
+  await runTurn({
+    agent: complexAgent,
+    sessionId: s2.id,
+    input: 'Pull my unread Outlook emails and the open Salesforce leads, then update each Airtable contact record and draft outreach for the warm ones',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+  assert.equal(complexAgent.modelSettings?.reasoning?.effort, 'high', 'complex → high');
+  const e2 = listEvents(s2.id, { types: ['reasoning_effort'] });
+  assert.equal(e2[0].data.effort, 'high');
+});
+
+test('dynamic reasoning effort: kill-switch off leaves the agent untouched (SDK default rides)', async () => {
+  resetEventLog();
+  const prev = process.env.CLEMMY_DYNAMIC_REASONING;
+  process.env.CLEMMY_DYNAMIC_REASONING = 'off';
+  try {
+    const agent = makeAgentStub() as any;
+    const sess = HarnessSession.create({ kind: 'chat', title: 'effort-off' });
+    const runRunner: RunRunnerFn = async (_runner, _agent, items) => ({
+      history: [...items, { role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'ok' }] }],
+      lastResponseId: 'resp',
+      finalOutput: { ok: true },
+    });
+    await runTurn({ agent, sessionId: sess.id, input: 'research and build a full audit of everything', makeRunner: makeRunnerStub, runRunner });
+    assert.equal(agent.modelSettings, undefined, 'no modelSettings set when disabled');
+    assert.equal(agent._modelSettingsExplicitlyConfigured, undefined, 'flag untouched when disabled');
+    assert.equal(listEvents(sess.id, { types: ['reasoning_effort'] }).length, 0);
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_DYNAMIC_REASONING;
+    else process.env.CLEMMY_DYNAMIC_REASONING = prev;
+  }
+});
+
 test('completed chat run snapshots conversation, emits run_completed, leaves session active', async () => {
   // Chat sessions are inherently multi-turn — the user types again. The
   // loop emits run_completed + conversation_completed (the chat dock
