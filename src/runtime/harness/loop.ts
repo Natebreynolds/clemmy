@@ -61,7 +61,7 @@ import { classifyCodexAuthError, markCodexAuthDead, isCodexAuthDead } from '../a
 import { BoundaryError } from '../boundary-error.js';
 import { getRuntimeEnv } from '../../config.js';
 import { captureInteractionSignals } from '../../memory/auto-capture.js';
-import { primeTurnRecallVector } from '../../memory/facts.js';
+import { primeTurnRecallVector, searchFactsByText } from '../../memory/facts.js';
 import { formatSearchHits, searchVault, searchVaultAsync } from '../../memory/search.js';
 import { maybeAutoFocusSession } from './auto-focus.js';
 import { getPlanScope, openPlanScope } from '../../agents/plan-scope.js';
@@ -907,6 +907,22 @@ const MAX_STALL_RETRIES = positiveIntEnv('HARNESS_MAX_STALL_RETRIES', 2);
 const STALL_RETRY_BACKOFF_MS = [250, 1000];
 const TURN_MEMORY_PRIMER_TOP_K = positiveIntEnv('CLEMMY_TURN_MEMORY_PRIMER_TOP_K', 6);
 const TURN_MEMORY_PRIMER_MAX_CHARS = positiveIntEnv('CLEMMY_TURN_MEMORY_PRIMER_MAX_CHARS', 2600);
+const TURN_MEMORY_PRIMER_FACT_TOP_K = positiveIntEnv('CLEMMY_TURN_MEMORY_PRIMER_FACT_TOP_K', 5);
+
+/** Query-relevant durable facts for the per-turn primer (lexical → finds even
+ *  a fact remembered seconds ago, before its embedding indexes). The primer's
+ *  vault search never touched consolidated_facts, so a freshly-stated "remember
+ *  X" was invisible to auto-context and the model would confabulate. */
+function factsBlockForPrimer(query: string): string {
+  try {
+    const facts = searchFactsByText(query, TURN_MEMORY_PRIMER_FACT_TOP_K);
+    if (facts.length === 0) return '';
+    const lines = facts.map((f) => `- ${f.content}`);
+    return ['[REMEMBERED FACTS — durable, user-stated or curated; treat as known]', ...lines].join('\n');
+  } catch {
+    return '';
+  }
+}
 const TURN_MEMORY_PRIMER_HYBRID_TIMEOUT_MS = positiveIntEnv('CLEMMY_TURN_MEMORY_PRIMER_HYBRID_TIMEOUT_MS', 800);
 
 function isSyntheticStallRetryInput(text: string): boolean {
@@ -967,7 +983,10 @@ interface TurnMemoryPrimer {
 
 function formatTurnMemoryPrimer(query: string, hits: ReturnType<typeof searchVault>, source: TurnMemoryPrimer['source']): TurnMemoryPrimer {
   const formatted = formatSearchHits(hits, TURN_MEMORY_PRIMER_MAX_CHARS);
-  if (!formatted) {
+  // Durable facts relevant to THIS message — the primer's vault search alone
+  // never surfaced consolidated_facts, so a just-remembered fact was invisible.
+  const factsBlock = factsBlockForPrimer(query);
+  if (!formatted && !factsBlock) {
     return { enabled: true, query, hitCount: hits.length, injectedBytes: 0, source, skippedReason: 'no_hits' };
   }
   const sourceLabel = source === 'hybrid'
@@ -977,8 +996,8 @@ function formatTurnMemoryPrimer(query: string, hits: ReturnType<typeof searchVau
     '[MEMORY PRIMER]',
     `A ${sourceLabel} memory search ran for the latest user message before this model call.`,
     'Use these hits to steer the first response and tool choice. Treat snippets as candidate memory, not proof; before mutating external resources or creating source-backed artifacts, load the source with memory_read/read_file/recall_tool_result or call memory_recall for more context.',
-    '',
-    formatted,
+    ...(factsBlock ? ['', factsBlock] : []),
+    ...(formatted ? ['', formatted] : []),
   ].join('\n');
   return { enabled: true, query, hitCount: hits.length, injectedBytes: text.length, source, text };
 }

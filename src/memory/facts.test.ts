@@ -31,6 +31,7 @@ const {
   renderFactsForInstructions,
   reviewStandingInstructions,
   searchFacts,
+  searchFactsByText,
   setFactPinned,
   setTurnQueryVector,
   clearTurnQueryVector,
@@ -49,6 +50,25 @@ beforeEach(() => {
   resetMemoryDb();
   // Touch DB so subsequent ops succeed.
   openMemoryDb();
+});
+
+test('searchFactsByText: a freshly-remembered fact is the top hit despite a stop-word-heavy query', () => {
+  // The fresh-fact recall fix: the per-turn primer searches consolidated_facts
+  // lexically. A query full of stop-words ("what is my ... just the ...") must
+  // not drown the relevant fact (the bug: common words matched thousands of
+  // facts and evicted it before ranking). Stop-word filtering + recency order.
+  for (let i = 0; i < 30; i++) {
+    rememberFact({ kind: 'user', content: `Just the noise: Nathan did thing number ${i} for the project.` });
+  }
+  rememberFact({ kind: 'user', content: 'Nate\'s ship marker is VECTOR-1241.' });
+  const hits = searchFactsByText('What is my ship marker? Just the marker.', 5);
+  assert.ok(hits.length > 0, 'returns hits');
+  assert.match(hits[0].content, /VECTOR-1241/, 'the relevant fresh fact ranks first');
+});
+
+test('searchFactsByText: a query with only stop-words returns nothing (no false matches)', () => {
+  rememberFact({ kind: 'user', content: 'Nathan prefers concise replies.' });
+  assert.deepEqual(searchFactsByText('what is the just', 5), []);
 });
 
 test('rememberFact inserts a new row', () => {

@@ -548,6 +548,60 @@ export async function findSimilarFacts(
 }
 
 /**
+ * Lexical (LIKE-token) search over the durable fact store. SYNCHRONOUS and
+ * embedding-free by design: unlike findSimilarFacts (semantic-first, which
+ * skips its LIKE fallback whenever the embedded pool returns a full top-K), a
+ * FRESHLY-remembered fact — whose embedding may not be indexed yet — is found
+ * here immediately by text. This backs the per-turn memory primer so
+ * "remember my X is TOKEN" is recallable in the very next turn, closing the
+ * fresh-fact recall gap. Token-occurrence ranked, recency as tiebreaker.
+ */
+/** Common words that match too many facts to be useful as a lexical key. */
+const FACT_QUERY_STOPWORDS = new Set<string>([
+  'the', 'and', 'but', 'not', 'are', 'was', 'were', 'for', 'with', 'from', 'this',
+  'that', 'these', 'those', 'what', 'when', 'where', 'who', 'whom', 'which', 'why',
+  'how', 'your', 'you', 'mine', 'our', 'their', 'just', 'please', 'can', 'will',
+  'would', 'should', 'could', 'have', 'has', 'had', 'did', 'does', 'about', 'into',
+  'only', 'also', 'exactly', 'confirm', 'tell', 'give', 'show', 'list', 'find',
+  'get', 'got', 'need', 'want', 'here', 'there', 'now', 'then', 'any', 'all',
+  'some', 'more', 'most', 'than', 'them', 'they', 'its', 'his', 'her', 'out',
+]);
+
+export function searchFactsByText(query: string, limit = 5): ConsolidatedFact[] {
+  const normalized = normalizeContent(query);
+  if (!normalized) return [];
+  // Drop high-frequency stop-words: the LIKE match has no ORDER BY before its
+  // LIMIT, so a common word (the/what/just/your) matches thousands of facts and
+  // evicts the relevant one before token-ranking. Keeping only content-bearing
+  // tokens ("staging","token") makes the relevant fact the one that matches.
+  const tokens = normalized
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((t) => t.length >= 3 && !FACT_QUERY_STOPWORDS.has(t))
+    .slice(0, 12);
+  if (tokens.length === 0) return [];
+  try {
+    const db = openMemoryDb();
+    const matches = db.prepare(`
+      SELECT * FROM consolidated_facts
+      WHERE active = 1
+        AND (${tokens.map(() => 'LOWER(content) LIKE ?').join(' OR ')})
+      ORDER BY updated_at DESC
+      LIMIT 200
+    `).all(...tokens.map((t) => `%${t}%`)) as ConsolidatedFactRow[];
+    const scored = matches.map((row) => {
+      const lc = row.content.toLowerCase();
+      const hits = tokens.reduce((sum, t) => sum + (lc.includes(t) ? 1 : 0), 0);
+      return { row, hits };
+    });
+    scored.sort((a, b) => b.hits - a.hits || (b.row.updated_at || '').localeCompare(a.row.updated_at || ''));
+    return scored.slice(0, Math.max(1, limit)).map((s) => rowToFact(s.row));
+  } catch {
+    return [];
+  }
+}
+
+/**
  * Agent-facing semantic search over the durable fact store (Tier B).
  * Thin wrapper over {@link findSimilarFacts} — the conflict resolver's
  * `findSimilarFacts` was previously the ONLY semantic entry into the
