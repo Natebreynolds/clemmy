@@ -143,6 +143,10 @@ export const EVENT_TYPES = [
   // auto-resolved (standing approval) and the run proceeded instead of pausing.
   // Distinct from awaiting_user_input precisely so it does NOT halt the loop.
   'autonomy_note',
+  // Per-turn dynamic reasoning effort: which effort tier (low/medium/high) was
+  // selected for this turn's model call and why. gpt-5.x reasons before emitting
+  // tokens, so this is the main per-turn latency lever — recorded for observability.
+  'reasoning_effort',
 ] as const;
 export type EventType = (typeof EVENT_TYPES)[number];
 const EVENT_TYPE_SET: ReadonlySet<string> = new Set(EVENT_TYPES);

@@ -26,6 +26,7 @@ import {
   harnessToolBracketsEnabled,
 } from './brackets.js';
 import { compactSessionIfNeeded, checkpointGoalStage } from './compaction.js';
+import { selectReasoningEffort, dynamicReasoningEnabled } from './reasoning-effort.js';
 import { buildAgentContextPacket } from './context-packet.js';
 import { getHarnessBudgetSettings, getElevatedBudget } from './budget-settings.js';
 import type { HarnessBudgetRuntime } from './budget-settings.js';
@@ -2708,6 +2709,31 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   // The full history is already inlined into `items` above
   // (session.toInputItems() returns everything), so codex sees the
   // complete conversation on every call without needing server state.
+
+  // Dynamic reasoning effort (per-turn): trivial lookups think LOW (fast),
+  // complex/multi-step turns think HIGH (full depth), the middle stays MEDIUM.
+  // gpt-5.x reasons before emitting any token, so this is the main lever on
+  // per-turn latency. Set on the agent's modelSettings (the runner reads it at
+  // run time). Kill-switch CLEMMY_DYNAMIC_REASONING=off → unchanged (no field).
+  if (dynamicReasoningEnabled()) {
+    try {
+      const { effort, reason } = selectReasoningEffort(options.input, {
+        hasActiveGoal: Boolean(safeActiveGoal(options.sessionId)),
+      });
+      const agentSettings = (options.agent as { modelSettings?: Record<string, unknown> }).modelSettings ?? {};
+      (options.agent as { modelSettings?: Record<string, unknown> }).modelSettings = {
+        ...agentSettings,
+        reasoning: { ...(agentSettings.reasoning as object ?? {}), effort },
+      };
+      safeAppend({
+        sessionId: options.sessionId,
+        turn,
+        role: 'system',
+        type: 'reasoning_effort',
+        data: { effort, reason },
+      });
+    } catch { /* effort selection must never break a turn */ }
+  }
 
   try {
     const run = options.runRunner ?? defaultRunRunner;
