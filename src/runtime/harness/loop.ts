@@ -2712,43 +2712,37 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
 
   // Dynamic reasoning effort (per-turn). gpt-5.x reasons before emitting any
   // token, so reasoning depth is the dominant per-turn latency knob. gpt-5.5's
-  // SDK default is effort:'none', so simple turns are already minimal — the
-  // lever is to let COMPLEX/multi-step/active-goal turns think harder (a
-  // capability win on hard tasks) while keeping simple turns byte-identical.
-  // Reuses the context packet's complexity (one classifier, no duplicate).
+  // SDK default is effort:'none', so simple turns are already minimal — this
+  // only RAISES effort, and only by the "is a human waiting?" axis: interactive
+  // chat turns cap at 'medium' (never make a person wait on 'high'), background
+  // turns (workflow/execution/goal-resume) may go 'high' where depth aids hard
+  // multi-step work and latency is invisible. Reuses the context packet's
+  // complexity (one classifier, no duplicate).
   //
-  // We must set this on agent.modelSettings AND mark it explicit: the SDK reads
-  // `_modelSettingsExplicitlyConfigured` (a constructor-time flag) to decide
-  // whether to honor agent.modelSettings vs its own implicit per-model defaults.
-  // The orchestrator is built without modelSettings, so without flipping that
-  // flag the mutation is silently ignored. We fully specify modelSettings every
-  // turn (effort + the gpt-5 verbosity:'low' default the implicit path provides)
-  // so there is no staleness across turns that reuse this agent instance.
-  // Kill-switch CLEMMY_DYNAMIC_REASONING=off → skip entirely (implicit SDK
-  // default rides; byte-identical to before this feature).
+  // The SDK only honors agent.modelSettings when it was set at CONSTRUCTION
+  // (buildOrchestratorAgent seeds it when the feature is on — that's what flips
+  // the SDK's explicit flag legitimately, no internal poking here). We just
+  // mutate reasoning.effort on the public field. Kill-switch
+  // CLEMMY_DYNAMIC_REASONING=off → orchestrator has no explicit modelSettings,
+  // so this mutation is a no-op the SDK ignores and its default rides.
   if (dynamicReasoningEnabled()) {
     try {
       const { effort, reason } = selectReasoningEffort(contextPacket.complexity, {
-        hasActiveGoal: Boolean(safeActiveGoal(options.sessionId)),
+        interactive: session.sessionRow.kind === 'chat',
       });
-      const agentRef = options.agent as unknown as {
-        modelSettings?: Record<string, unknown>;
-        _modelSettingsExplicitlyConfigured?: boolean;
-      };
+      const agentRef = options.agent as unknown as { modelSettings?: Record<string, unknown> };
       const prev = agentRef.modelSettings ?? {};
       agentRef.modelSettings = {
         ...prev,
         reasoning: { ...(prev.reasoning as object ?? {}), effort },
         text: { verbosity: 'low', ...(prev.text as object ?? {}) },
       };
-      // Make the runner honor agent.modelSettings (see comment above).
-      agentRef._modelSettingsExplicitlyConfigured = true;
       safeAppend({
         sessionId: options.sessionId,
         turn,
         role: 'system',
         type: 'reasoning_effort',
-        data: { effort, reason, complexity: contextPacket.complexity },
+        data: { effort, reason, complexity: contextPacket.complexity, kind: session.sessionRow.kind },
       });
     } catch { /* effort selection must never break a turn */ }
   }

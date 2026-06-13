@@ -92,6 +92,22 @@ test('Orchestrator builds the Clem single-agent with structured outputType', asy
   assert.equal(parsed.success, true);
 });
 
+test('Orchestrator is built with explicit modelSettings so the SDK honors per-turn reasoning effort', async () => {
+  // The dynamic-reasoning feature mutates agent.modelSettings.reasoning.effort
+  // each turn, but the SDK only honors agent.modelSettings when it was set at
+  // CONSTRUCTION (it flips a private explicit flag then). If this contract
+  // breaks — construction stops seeding modelSettings, or the SDK renames the
+  // flag — the whole feature silently goes inert. This is the guard.
+  const agent = await buildOrchestratorAgent();
+  assert.equal(
+    (agent as unknown as { hasExplicitModelSettings(): boolean }).hasExplicitModelSettings(),
+    true,
+    'SDK must report explicit modelSettings, else per-turn effort is ignored',
+  );
+  assert.ok(agent.modelSettings?.reasoning, 'reasoning settings seeded at construction');
+  assert.equal((agent.modelSettings as { text?: { verbosity?: string } }).text?.verbosity, 'low');
+});
+
 test('Orchestrator carries the harness guardrails', async () => {
   const agent = await buildOrchestratorAgent();
   // SDK normalises into <kind>GuardrailDefinitions; we just confirm

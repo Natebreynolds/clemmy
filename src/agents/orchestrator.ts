@@ -24,6 +24,7 @@ import { getOrCreateExternalMcpServers } from '../runtime/mcp-servers.js';
 import { resolveMcpToolScope, resolveMcpToolScopeWithRecall, type McpToolScope } from '../runtime/mcp-tool-scope.js';
 import type { Tool } from '@openai/agents';
 import { appendEvent, listEvents } from '../runtime/harness/eventlog.js';
+import { dynamicReasoningEnabled } from '../runtime/harness/reasoning-effort.js';
 import { openPlanScope } from './plan-scope.js';
 import { loadProactivityPolicy } from './proactivity-policy.js';
 import { buildWorkerJobPrompt, WorkerToolInputSchema } from './worker-job-packet.js';
@@ -809,6 +810,16 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     // restarting the daemon.
     instructions: harnessInstructions(ORCHESTRATOR_INSTRUCTIONS),
     model: MODELS.primary,
+    // Dynamic per-turn reasoning effort needs the SDK to honor agent.modelSettings,
+    // which it only does when modelSettings was passed at CONSTRUCTION (it sets a
+    // private `_modelSettingsExplicitlyConfigured` flag then). So we seed the
+    // gpt-5.5 default here (effort:'none' + verbosity:'low') and runTurn mutates
+    // only reasoning.effort per turn — no reaching into SDK internals. When the
+    // feature is off we pass nothing, so the SDK's own per-model default rides
+    // (byte-identical to before). See runtime/harness/reasoning-effort.ts.
+    ...(dynamicReasoningEnabled()
+      ? { modelSettings: { reasoning: { effort: 'none' as const }, text: { verbosity: 'low' as const } } }
+      : {}),
     // v0.5.22 — normalize via the centralized helper so the schema
     // serializes Codex-strict compatible (every property in `required`,
     // optional fields as nullable). Without this, .nullish() reply

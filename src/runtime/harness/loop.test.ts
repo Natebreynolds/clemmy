@@ -120,12 +120,13 @@ function makeApprovalRunStateWithInterruptions(
   return JSON.stringify(json);
 }
 
-test('dynamic reasoning effort: real runTurn injects effort onto the agent per turn complexity (none for simple, high for complex)', async () => {
-  // Exercises the ACTUAL loop.ts injection (not a hand-port): a simple lookup
-  // keeps gpt-5.5's 'none' default (byte-identical, fastest), a complex
-  // multi-domain read+write request bumps to 'high'. Also asserts the runner
-  // honors it — `_modelSettingsExplicitlyConfigured` must be flipped true, else
-  // the SDK ignores agent.modelSettings entirely.
+const COMPLEX_INPUT =
+  'Pull my unread Outlook emails and the open Salesforce leads, then update each Airtable contact record and draft outreach for the warm ones';
+
+test('dynamic reasoning effort: real runTurn injects effort per turn (simple→none; interactive chat caps complex at medium)', async () => {
+  // Exercises the ACTUAL loop.ts injection (not a hand-port). The explicit-flag
+  // contract is owned by buildOrchestratorAgent (asserted in orchestrator.test);
+  // here we verify the per-turn effort + the human-waiting cap.
   resetEventLog();
   const runRunner: RunRunnerFn = async (_runner, _agent, items) => ({
     history: [...items, { role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'ok' }] }],
@@ -133,30 +134,34 @@ test('dynamic reasoning effort: real runTurn injects effort onto the agent per t
     finalOutput: { ok: true },
   });
 
-  // Simple turn → none
+  // Simple chat turn → none (byte-identical fastest path)
   const simpleAgent = makeAgentStub() as any;
   const s1 = HarnessSession.create({ kind: 'chat', title: 'effort-simple' });
   await runTurn({ agent: simpleAgent, sessionId: s1.id, input: "what's on my calendar today?", makeRunner: makeRunnerStub, runRunner });
   assert.equal(simpleAgent.modelSettings?.reasoning?.effort, 'none', 'simple → none');
-  assert.equal(simpleAgent._modelSettingsExplicitlyConfigured, true, 'flag flipped so SDK honors it');
   assert.equal(simpleAgent.modelSettings?.text?.verbosity, 'low', 'gpt-5 verbosity default preserved');
-  const e1 = listEvents(s1.id, { types: ['reasoning_effort'] });
-  assert.equal(e1.length, 1);
-  assert.equal(e1[0].data.effort, 'none');
+  assert.equal(listEvents(s1.id, { types: ['reasoning_effort'] })[0].data.effort, 'none');
 
-  // Complex turn → high (multi-domain read + write + draft)
-  const complexAgent = makeAgentStub() as any;
-  const s2 = HarnessSession.create({ kind: 'chat', title: 'effort-complex' });
-  await runTurn({
-    agent: complexAgent,
-    sessionId: s2.id,
-    input: 'Pull my unread Outlook emails and the open Salesforce leads, then update each Airtable contact record and draft outreach for the warm ones',
-    makeRunner: makeRunnerStub,
-    runRunner,
+  // Complex INTERACTIVE chat turn → capped at medium (a human is waiting)
+  const chatAgent = makeAgentStub() as any;
+  const s2 = HarnessSession.create({ kind: 'chat', title: 'effort-chat-complex' });
+  await runTurn({ agent: chatAgent, sessionId: s2.id, input: COMPLEX_INPUT, makeRunner: makeRunnerStub, runRunner });
+  assert.equal(chatAgent.modelSettings?.reasoning?.effort, 'medium', 'complex chat → medium (capped)');
+  assert.equal(listEvents(s2.id, { types: ['reasoning_effort'] })[0].data.kind, 'chat');
+});
+
+test('dynamic reasoning effort: background (workflow) complex turn → high (no human waiting)', async () => {
+  resetEventLog();
+  const runRunner: RunRunnerFn = async (_runner, _agent, items) => ({
+    history: [...items, { role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'ok' }] }],
+    lastResponseId: 'resp',
+    finalOutput: { ok: true },
   });
-  assert.equal(complexAgent.modelSettings?.reasoning?.effort, 'high', 'complex → high');
-  const e2 = listEvents(s2.id, { types: ['reasoning_effort'] });
-  assert.equal(e2[0].data.effort, 'high');
+  const wfAgent = makeAgentStub() as any;
+  const sess = HarnessSession.create({ kind: 'workflow', title: 'effort-wf-complex' });
+  await runTurn({ agent: wfAgent, sessionId: sess.id, input: COMPLEX_INPUT, makeRunner: makeRunnerStub, runRunner });
+  assert.equal(wfAgent.modelSettings?.reasoning?.effort, 'high', 'complex workflow → high');
+  assert.equal(listEvents(sess.id, { types: ['reasoning_effort'] })[0].data.effort, 'high');
 });
 
 test('dynamic reasoning effort: kill-switch off leaves the agent untouched (SDK default rides)', async () => {
