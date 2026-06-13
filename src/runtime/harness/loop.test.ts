@@ -473,6 +473,64 @@ test('kill switch set before the call short-circuits with kill_requested', async
   assert.equal(killEvents.length, 1);
   const reloaded = HarnessSession.load(sess.id);
   assert.equal(reloaded!.sessionRow.status, 'cancelled');
+
+  // The honored kill is one-shot: the latch is consumed, so the user's
+  // next message on the same session runs normally instead of being
+  // assassinated by the stale row (live 2026-06-12 sess-mqbgayx6: a
+  // post-Stop follow-up died on the leftover kill).
+  const { isKillRequested, updateSession } = await import('./eventlog.js');
+  assert.equal(isKillRequested(sess.id), false);
+  updateSession(sess.id, { status: 'active' });
+  let secondRunRan = false;
+  const okRunner: RunRunnerFn = async (_r, _a, items) => {
+    secondRunRan = true;
+    return { history: items, lastResponseId: undefined, finalOutput: 'done' };
+  };
+  const second = await runTurn({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'follow-up after stop',
+    makeRunner: makeRunnerStub,
+    runRunner: okRunner,
+  });
+  assert.equal(secondRunRan, true);
+  assert.notEqual(second.status, 'killed');
+});
+
+test('SDK-wrapped KillRequested during the run ends as a clean killed turn', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+
+  // A kill that lands while a function tool is executing is thrown by the
+  // tool bracket INSIDE the SDK, which re-wraps it as a plain Error — the
+  // same envelope that hid ToolTimeout and ToolGuardrailEscalated. The
+  // instanceof check alone misses it and the raw string reached the user.
+  // Latch the kill INSIDE the run (after pre-flight) like a real Stop press.
+  const runRunner: RunRunnerFn = async () => {
+    requestKill(sess.id, 'stop pressed mid-tool');
+    throw new Error(
+      `Failed to run function tools: KillRequested: session ${sess.id} has a pending kill request`,
+    );
+  };
+
+  const result = await runTurn({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'scan everything',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(result.status, 'killed');
+  const killEvents = listEvents(sess.id, { types: ['kill_requested'] });
+  assert.ok(killEvents.some((ev) => (ev.data as { reason?: unknown }).reason === 'during run'));
+  // No run_failed — the user sees Stopped, not the raw wrapped error.
+  assert.equal(listEvents(sess.id, { types: ['run_failed'] }).length, 0);
+  const reloaded = HarnessSession.load(sess.id);
+  assert.equal(reloaded!.sessionRow.status, 'cancelled');
+  // The latch is consumed here too.
+  const { isKillRequested } = await import('./eventlog.js');
+  assert.equal(isKillRequested(sess.id), false);
 });
 
 test('ToolCallsLimitExceeded thrown by run surfaces as guardrail_tripped', async () => {

@@ -3,6 +3,7 @@ import { Runner } from '@openai/agents';
 import { HarnessSession } from './session.js';
 import {
   appendEvent,
+  clearKill,
   getSession,
   getToolOutput,
   listEvents,
@@ -3317,6 +3318,12 @@ function isKillBeforeStart(
       data: { reason: 'pre-flight check' },
     });
     session.markStatus('cancelled');
+    // The kill has been honored — a kill_switches row is a one-shot "stop
+    // what's running", not a permanent session curse. Only respond-bridge
+    // surfaces cleared it before (line 104 there); on direct-runConversation
+    // surfaces (desktop console, Discord harness) the stale row killed every
+    // subsequent message on the session (observed live 2026-06-12).
+    try { clearKill(sessionId); } catch { /* best effort */ }
     return true;
   }
 }
@@ -3343,7 +3350,19 @@ function handleRunError(
   session: HarnessSession,
   err: unknown,
 ): RunTurnResult {
-  if (err instanceof KillRequested) {
+  // A kill that lands while a tool call is in flight throws KillRequested
+  // INSIDE the SDK's tool execution, and the SDK re-wraps it as a plain
+  // Error: "Failed to run function tools: KillRequested: session X has a
+  // pending kill request" — the same wrapping that hid ToolTimeout
+  // (v0.5.21.1) and ToolGuardrailEscalated (2026-06-01). A bare instanceof
+  // misses it and the raw string got dumped at the user with "Didn't
+  // finish" instead of a clean Stopped (observed live 2026-06-12,
+  // sess-mqbgayx6). Match the wrapped form too.
+  const wrappedKill =
+    !(err instanceof KillRequested)
+    && err instanceof Error
+    && /KillRequested: session \S+ has a pending kill request/.test(err.message);
+  if (err instanceof KillRequested || wrappedKill) {
     safeAppend({
       sessionId,
       turn,
@@ -3352,6 +3371,9 @@ function handleRunError(
       data: { reason: 'during run' },
     });
     session.markStatus('cancelled');
+    // One-shot: the kill stopped this run; clear the latch so the user's
+    // next message on the session isn't assassinated by the stale row.
+    try { clearKill(sessionId); } catch { /* best effort */ }
     bumpTurnNumber(sessionId, turn);
     return { sessionId, turn, status: 'killed' };
   }
