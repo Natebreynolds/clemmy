@@ -25,6 +25,13 @@ import {
   GroundingCheckFailedError,
   DuplicateExternalWriteError,
 } from './grounding-gate.js';
+import {
+  isDestinationGateEnabled,
+  evaluateShellDestination,
+  wasDestinationNudged,
+  markDestinationNudged,
+  ImplicitDestinationError,
+} from './destination-gate.js';
 
 /**
  * Reliability brackets — the safety primitives the harness loop weaves
@@ -832,6 +839,42 @@ export function wrapToolForHarness<T extends WrappableTool>(
       // eslint-disable-next-line no-console
       console.warn('[harness] grounding gate threw (fail-open)', err instanceof Error ? err.message : err);
     }
+    // 2c3. Destination gate — AMBIENT-TARGET writes (the 2026-06-13
+    // wrong-site incident class). `run_shell_command` bypasses every gate
+    // above (isMutatingExternalWrite only classifies composio writes), so
+    // an irreversible publish (deploy/publish/release) whose destination
+    // lives in cwd state — not its args — can clobber an unrelated live
+    // target. This is the FIRST gate to classify shell writes. One-shot +
+    // recoverable: the first ambient-target publish of a given shape
+    // soft-blocks (model makes the target explicit OR confirms the link);
+    // a conscious retry passes. Fail-open on any error.
+    try {
+      if (isDestinationGateEnabled() && tool.name === 'run_shell_command') {
+        const command = typeof (parsedInput as { command?: unknown })?.command === 'string'
+          ? (parsedInput as { command: string }).command
+          : '';
+        if (command) {
+          const verdict = evaluateShellDestination(command);
+          if (verdict.action === 'flag' && verdict.shapeKey && !wasDestinationNudged(ctx.sessionId, verdict.shapeKey)) {
+            markDestinationNudged(ctx.sessionId, verdict.shapeKey);
+            try {
+              appendEvent({
+                sessionId: ctx.sessionId,
+                turn: 0,
+                role: 'system',
+                type: 'guardrail_tripped',
+                data: { kind: 'implicit_destination', toolName: tool.name, verb: verdict.verb ?? null, shapeKey: verdict.shapeKey },
+              });
+            } catch { /* telemetry write must never block */ }
+            throw new ImplicitDestinationError({ command, verb: verdict.verb ?? 'publish', shapeKey: verdict.shapeKey });
+          }
+        }
+      }
+    } catch (err) {
+      if (err instanceof ImplicitDestinationError) throw err;
+      // eslint-disable-next-line no-console
+      console.warn('[harness] destination gate threw (fail-open)', err instanceof Error ? err.message : err);
+    }
     // 2d. Confirm-first gate — a BATCH of same-shape external writes
     // needs an instruction-reviewed plan scope before it proceeds. Runs
     // for chat sessions only and aggregates across workers (they share
@@ -1006,7 +1049,8 @@ export function wrapToolForHarness<T extends WrappableTool>(
           err instanceof ToolGuardrailBlocked ||
           err instanceof ToolCallsLimitExceeded ||
           err instanceof GroundingCheckFailedError ||
-          err instanceof DuplicateExternalWriteError
+          err instanceof DuplicateExternalWriteError ||
+          err instanceof ImplicitDestinationError
         ) {
           return `Tool call refused by harness: ${err instanceof Error ? err.message : String(err)}`;
         }

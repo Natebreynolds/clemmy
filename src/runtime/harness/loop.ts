@@ -12,6 +12,7 @@ import {
   type EventRow,
   type SessionRow,
 } from './eventlog.js';
+import { destinationCardSuffix } from './destination-gate.js';
 import {
   assertNotKilled,
   KillRequested,
@@ -4746,10 +4747,13 @@ function extractApprovalSubject(info: InterruptionInfo): string {
     return verb || info.toolName;
   }
 
-  // run_shell_command: show the command itself, truncated.
+  // run_shell_command: show the command itself, truncated. Append a
+  // "⚠ implicit target" suffix when it's an irreversible publish whose
+  // destination is ambient (deploy/publish with no --site/--project/…) so
+  // the human approves with eyes open — the 2026-06-13 wrong-site class.
   if (info.toolName === 'run_shell_command') {
     const cmd = typeof args.command === 'string' ? args.command : '';
-    if (cmd) return `Shell: ${truncate(cmd, 100)}`;
+    if (cmd) return `Shell: ${truncate(cmd, 100)}${destinationCardSuffix(cmd)}`;
     return 'Shell command';
   }
 

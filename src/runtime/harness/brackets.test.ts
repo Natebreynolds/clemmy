@@ -643,6 +643,61 @@ test('grounding gate: an irreversible send contradicting the target\'s own artif
   }
 });
 
+test('destination gate: an ambient-target shell publish soft-blocks ONCE, then a conscious retry passes; an explicit-target publish passes immediately (2026-06-13 wrong-site replay)', async () => {
+  const prevBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  const prevConfirm = process.env.CLEMMY_CONFIRM_FIRST;
+  const prevExecGate = process.env.CLEMMY_EXECUTION_GATE;
+  const prevGrounding = process.env.CLEMMY_GROUNDING_GATE;
+  const prevDest = process.env.CLEMMY_DESTINATION_GATE;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  process.env.CLEMMY_CONFIRM_FIRST = 'off';
+  process.env.CLEMMY_EXECUTION_GATE = 'off';
+  process.env.CLEMMY_GROUNDING_GATE = 'off';
+  process.env.CLEMMY_DESTINATION_GATE = 'on';
+  resetEventLog();
+  const { listEvents } = await import('./eventlog.js');
+  const destination = await import('./destination-gate.js');
+  destination._resetDestinationStateForTests();
+  const sess = createSession({ kind: 'chat' });
+  try {
+    const counter = new ToolCallsCounter(100);
+    const wrapped = wrapToolForHarness({
+      name: 'run_shell_command',
+      execute: async (_input: unknown) => 'deployed',
+    });
+    const shell = (command: string) =>
+      withHarnessRunContext({ sessionId: sess.id, counter }, () =>
+        wrapped.execute!({ command }),
+      );
+    // 1. The incident command: deploy --prod with NO explicit site → the
+    //    target is ambient (a stale .netlify link) → soft-block ONCE.
+    await assert.rejects(
+      () => Promise.resolve(shell('netlify deploy --dir "/x/site" --prod --json')),
+      (err: Error) => {
+        assert.match(err.message, /IMPLICIT_DESTINATION/);
+        assert.match(err.message, /--site/);
+        return true;
+      },
+    );
+    // telemetry event recorded
+    const tripped = listEvents(sess.id, { types: ['guardrail_tripped'] })
+      .filter((e) => (e.data as { kind?: string }).kind === 'implicit_destination');
+    assert.equal(tripped.length, 1, 'one implicit_destination guardrail event');
+    // 2. Conscious retry of the SAME shape → passes (speed bump, not a wall).
+    assert.equal(await shell('netlify deploy --dir "/x/site" --prod --json'), 'deployed');
+    // 3. An EXPLICIT-target publish never trips at all.
+    assert.equal(await shell('netlify deploy --dir "/x/site" --prod --site abc123 --json'), 'deployed');
+    // 4. A non-publish shell command is untouched.
+    assert.equal(await shell('ls -la /x/site'), 'deployed');
+  } finally {
+    process.env.HARNESS_TOOL_BRACKETS = prevBrackets;
+    process.env.CLEMMY_CONFIRM_FIRST = prevConfirm;
+    process.env.CLEMMY_EXECUTION_GATE = prevExecGate;
+    if (prevGrounding === undefined) delete process.env.CLEMMY_GROUNDING_GATE; else process.env.CLEMMY_GROUNDING_GATE = prevGrounding;
+    if (prevDest === undefined) delete process.env.CLEMMY_DESTINATION_GATE; else process.env.CLEMMY_DESTINATION_GATE = prevDest;
+  }
+});
+
 test('duplicate-target gate: a FAILED dispatch is netted out — the corrected retry is not a "duplicate" (2026-06-12 live replay)', async () => {
   const prevBrackets = process.env.HARNESS_TOOL_BRACKETS;
   const prevConfirm = process.env.CLEMMY_CONFIRM_FIRST;
