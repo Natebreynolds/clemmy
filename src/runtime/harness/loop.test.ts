@@ -1523,7 +1523,7 @@ test('runConversation: abandoned nextAction marks the conversation completed', a
   assert.equal(completedEvents[0].data.reason, 'abandoned_by_orchestrator');
 });
 
-test('runConversation: a malformed finalOutput counts as completed without recursion', async () => {
+test('runConversation: a malformed finalOutput with ZERO tool work counts as completed without recursion', async () => {
   const sess = HarnessSession.create({ kind: 'chat' });
   const runner = scriptedRunner([{ finalOutput: 'a plain string, not a Decision' }]);
   const result = await runConversation({
@@ -1537,6 +1537,89 @@ test('runConversation: a malformed finalOutput counts as completed without recur
   assert.equal(result.steps, 1);
   const completedEvents = listEventsForConv(sess.id, { types: ['conversation_completed'] });
   assert.equal(completedEvents[0].data.reason, 'no_structured_output');
+  // No-regression: a zero-tool malformed null must NOT engage the
+  // did-work-then-malformed retry (that recovery is gated on toolCalls>0).
+  const retries = listEventsForConv(sess.id, { types: ['stall_retry_attempted'] });
+  assert.equal(
+    retries.filter((e) => (e.data as { signal?: string }).signal === 'D_decision_unparsed').length,
+    0,
+    'zero-tool malformed null should not fire the D_decision_unparsed retry',
+  );
+});
+
+test('runConversation: malformed decision AFTER real tool work RETRIES instead of dying (D_decision_unparsed)', async () => {
+  // Repro from a live website build+deploy: the Orchestrator did real
+  // tool work (loaded skills, wrote files) and then emitted the
+  // deliverable (HTML) inline, breaking the structured-decision shape.
+  // Before the fix the run died with reason 'no_structured_output' and
+  // the user saw "produced a response that couldn't be structured" with
+  // no recourse — even though work was in flight. The did-work-then-
+  // malformed case must RETRY (re-prompt for the decision + next action)
+  // so the task actually finishes. (Zero-tool malformed nulls still go
+  // straight to no_structured_output — covered by the test above.)
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  let call = 0;
+  const runRunner: RunRunnerFn = async (runner, _agent, items, opts) => {
+    call += 1;
+    const ee = runner as unknown as EventEmitter;
+    const runContext = { context: opts.context };
+    if (call === 1) {
+      // Real tool work, then a malformed (non-Decision) finalOutput.
+      ee.emit('agent_start', runContext, { name: 'Orchestrator' });
+      ee.emit(
+        'agent_tool_start',
+        runContext,
+        { name: 'Orchestrator' },
+        { name: 'skill_read' },
+        { toolCall: { callId: 'call_1', arguments: '{"name":"taste-skill"}' } },
+      );
+      ee.emit(
+        'agent_tool_start',
+        runContext,
+        { name: 'Orchestrator' },
+        { name: 'write_file' },
+        { toolCall: { callId: 'call_2', arguments: '{"path":"/tmp/site/index.html"}' } },
+      );
+      const output = '<!doctype html><html><body>the whole site inlined instead of a decision</body></html>';
+      ee.emit('agent_end', runContext, { name: 'Orchestrator' }, output);
+      return { history: items, lastResponseId: undefined, finalOutput: output };
+    }
+    // Retry turn: now it issues the proper structured decision and finishes.
+    const decision = {
+      summary: 'Built and deployed the site',
+      reply: 'Done — deployed to https://example.netlify.app',
+      done: true,
+      nextAction: 'completed',
+      reason: null,
+    };
+    ee.emit('agent_start', runContext, { name: 'Orchestrator' });
+    ee.emit('agent_end', runContext, { name: 'Orchestrator' }, decision);
+    return { history: items, lastResponseId: undefined, finalOutput: decision };
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'build and deploy a website',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  // The unparseable-decision retry fired exactly once, with our signal.
+  const retries = listEventsForConv(sess.id, { types: ['stall_retry_attempted'] });
+  const unparsed = retries.filter((e) => (e.data as { signal?: string }).signal === 'D_decision_unparsed');
+  assert.equal(unparsed.length, 1, 'expected exactly one D_decision_unparsed retry');
+
+  // And the conversation RECOVERED — finished on the retry turn, not died.
+  assert.equal(result.status, 'completed');
+  assert.equal(result.lastDecision?.done, true);
+  const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] });
+  assert.notEqual(
+    completed[0].data.reason,
+    'no_structured_output',
+    'did-work-then-malformed must recover, not die with no_structured_output',
+  );
 });
 
 test('runConversation: sub-agent stall ("Continuing." with zero tool calls) is flagged as sub_agent_stalled', async () => {

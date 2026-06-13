@@ -1442,12 +1442,39 @@ async function runConversationCore(
     }
 
     if (!decision) {
-      // No structured decision = nothing to recurse on. End cleanly.
-      // This usually means a handoff target (Executor/Researcher/etc.)
-      // became the final agent on the run, so the Orchestrator's
-      // outputType never applied. The sub-agent's raw final output IS
-      // the user-facing answer — surface it as the summary so the UI
-      // has something to render instead of just "complete".
+      // Malformed/unparseable-decision RECOVERY. Sub-agents are TOOLS here (no
+      // SDK handoffs — see orchestrator.ts), so a null decision means the
+      // Orchestrator itself produced output that didn't fit the decision schema.
+      // This is common on a COMPLEX task after real tool work — the model starts
+      // emitting the deliverable (HTML, a long plan) inline and breaks the JSON
+      // shape. The stall detectors below only catch the ZERO-tool / generic-ack
+      // PUNT case (and own its specialized retry + awaiting_user_input ask), so
+      // we scope THIS recovery to the did-work-then-malformed case (toolCalls>0)
+      // to stay no-regression: a turn that took real action but emitted an
+      // unparseable decision would otherwise die with "couldn't be structured"
+      // and no recourse (observed live: a website build+deploy stopped after
+      // loading skills + checking the env). Re-prompt for the structured
+      // decision AND the next concrete action so the task actually finishes.
+      // Zero-tool nulls fall through to evaluateProgress below, unchanged.
+      // Reuses the bounded stall-retry budget.
+      if ((turnResult.toolCalls ?? 0) > 0 && stallRetriesUsed < MAX_STALL_RETRIES) {
+        stallRetriesUsed += 1;
+        safeAppend({
+          sessionId: options.sessionId,
+          turn: turnResult.turn,
+          role: 'system',
+          type: 'stall_retry_attempted',
+          data: { signal: 'D_decision_unparsed', attempt: stallRetriesUsed, maxRetries: MAX_STALL_RETRIES },
+        });
+        const backoffMs = STALL_RETRY_BACKOFF_MS[stallRetriesUsed - 1] ?? 1000;
+        if (backoffMs > 0) await new Promise((resolve) => setTimeout(resolve, backoffMs));
+        nextInput = 'Your previous response could not be parsed into the required structured decision. Re-issue it now as the exact decision object (summary, reply, done, nextAction, reason) — keep the reply concise and put any large deliverable in FILES via the file tools, never inline in the reply. If the task is NOT finished, set done:false and take the next concrete action now (write the files, run the shell/CLI command, deploy) — do not stop at a plan; keep going until the actual deliverable exists.';
+        continue;
+      }
+      // Retry budget exhausted, or genuinely nothing to recurse on. End cleanly.
+      // (Historically this also covered a handoff target becoming the final
+      // agent; sub-agents are tools now, but the fallback summary still gives
+      // the UI something to render instead of just "complete".)
       const fallbackSummary = extractFallbackSummary(turnResult.finalOutput);
 
       // Stall detection: the sub-agent took zero tool calls AND emitted
