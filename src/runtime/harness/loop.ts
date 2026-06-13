@@ -44,6 +44,7 @@ import {
   touchGoalActivity,
   getCurrentGoalStage,
   advanceGoalStage,
+  unparkGoal,
   GOAL_DEFAULT_MAX_ATTEMPTS,
   type PlanProposal,
 } from '../../agents/plan-proposals.js';
@@ -1216,6 +1217,15 @@ async function runConversationCore(
   let checkInMs = Math.max(60_000, budget.checkInMinutes * 60 * 1000);
   const startedAt = Date.now();
   let lastCheckInAt = startedAt;
+
+  // A parked self-driving goal stops self-resumption; any turn that reaches
+  // here is external re-engagement (a user reply or an outcome relay), which
+  // unparks it so the goal heartbeats again. Self-resume turns never park a
+  // goal first, so this is a no-op for them. Best-effort.
+  try {
+    const parkedGoal = safeActiveGoal(options.sessionId);
+    if (parkedGoal?.parked && parkedGoal.selfDriving) unparkGoal(parkedGoal.id);
+  } catch { /* unpark is best-effort */ }
 
   let stepIndex = 0;
   let nextInput = options.input;

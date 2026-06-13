@@ -144,6 +144,25 @@ export interface PlanProposal {
   lastActivityAt?: string;
   /** Why the goal reached `satisfied` / `expired`. */
   doneReason?: string;
+  // ── Self-driving fields (A2): the daemon re-enters the goal on a cadence ──
+  /** When true, the daemon resumes this goal itself (no human prompt needed). */
+  selfDriving?: boolean;
+  /** Heartbeat cadence: resume at most once per this many ms. */
+  resumeEveryMs?: number;
+  /** Due-timestamp for the next self-resume (wall-clock compare ⇒ sleep-safe). */
+  nextResumeAt?: string;
+  /** Self-resumes fired so far. */
+  resumeCount?: number;
+  /** Resume ceiling before the goal parks for review. */
+  maxResumes?: number;
+  /** Consecutive zero-progress resumes — the anti-spin breaker counter. */
+  noProgressStreak?: number;
+  /** Hard stop: a goal past this is parked regardless of progress. */
+  deadlineAt?: string;
+  /** Progress fingerprint captured at the last resume; the breaker compares it. */
+  lastResumeSnapshot?: { ledger: number; evidence: number; stagesDone: number };
+  /** Set when the goal is parked: resumption stops until a human unparks it. */
+  parked?: { at: string; reason: 'no_progress' | 'approval_timeout' | 'blocker'; note?: string };
   version: 'v1';
 }
 
@@ -599,6 +618,12 @@ const GOAL_IDLE_TTL_MS = 24 * 60 * 60 * 1000; // 24h
 const GOAL_TERMINAL_PURGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 /** Default validation-attempt ceiling before the loop escalates. */
 export const GOAL_DEFAULT_MAX_ATTEMPTS = 3;
+/** Default self-resume cadence: a goal heartbeats at most once per 30 min. */
+export const GOAL_DEFAULT_RESUME_EVERY_MS = 30 * 60 * 1000;
+/** Default self-resume ceiling before the goal parks for human review. */
+export const GOAL_DEFAULT_MAX_RESUMES = 12;
+/** Consecutive zero-progress resumes that trip the anti-spin breaker. */
+export const GOAL_NO_PROGRESS_LIMIT = 2;
 
 export interface ActivateGoalOptions {
   origin?: GoalOrigin;
@@ -873,6 +898,107 @@ export function advanceGoalStage(goalId: string, stageId: string): PlanProposal 
   writeProposal(updated);
   logger.info({ goalId, stageId, title: stage.title }, 'goal stage advanced');
   return updated;
+}
+
+export interface EnableSelfDriveOptions {
+  resumeEveryMs?: number;
+  maxResumes?: number;
+  deadlineAt?: string;
+}
+
+/**
+ * Flag an active goal as self-driving: the daemon will re-enter it on a
+ * cadence (see goal-resume.ts) until it satisfies, parks, or exhausts its
+ * resume budget. First resume is one interval out (the goal already ran once
+ * interactively). No-op on a non-active goal.
+ */
+export function enableGoalSelfDrive(id: string, options: EnableSelfDriveOptions = {}): PlanProposal | null {
+  const proposal = readProposal(id);
+  if (!proposal || proposal.status !== 'active') return null;
+  const resumeEveryMs = options.resumeEveryMs ?? GOAL_DEFAULT_RESUME_EVERY_MS;
+  const updated: PlanProposal = {
+    ...proposal,
+    selfDriving: true,
+    resumeEveryMs,
+    maxResumes: options.maxResumes ?? GOAL_DEFAULT_MAX_RESUMES,
+    resumeCount: proposal.resumeCount ?? 0,
+    noProgressStreak: 0,
+    nextResumeAt: new Date(Date.now() + resumeEveryMs).toISOString(),
+    deadlineAt: options.deadlineAt ?? proposal.deadlineAt,
+    parked: undefined,
+  };
+  writeProposal(updated);
+  logger.info({ goalId: id, resumeEveryMs, maxResumes: updated.maxResumes }, 'goal self-drive enabled');
+  return updated;
+}
+
+/**
+ * Record that a self-resume is being scheduled+fired: bump resumeCount, set the
+ * next due-timestamp, snapshot progress for the breaker, and carry the streak.
+ * Called BEFORE the resume turn fires so a crash costs one slot, never a double
+ * fire. No-op on a non-active goal.
+ */
+export function recordGoalResumeScheduled(
+  id: string,
+  next: { nextResumeAt: string; snapshot: { ledger: number; evidence: number; stagesDone: number }; noProgressStreak: number },
+): PlanProposal | null {
+  const proposal = readProposal(id);
+  if (!proposal || proposal.status !== 'active') return null;
+  const updated: PlanProposal = {
+    ...proposal,
+    resumeCount: (proposal.resumeCount ?? 0) + 1,
+    nextResumeAt: next.nextResumeAt,
+    lastResumeSnapshot: next.snapshot,
+    noProgressStreak: next.noProgressStreak,
+    lastActivityAt: new Date().toISOString(),
+  };
+  writeProposal(updated);
+  return updated;
+}
+
+/** Park a goal: self-resumption stops until a human unparks it. Idempotent. */
+export function parkGoal(
+  id: string,
+  reason: 'no_progress' | 'approval_timeout' | 'blocker',
+  note?: string,
+): PlanProposal | null {
+  const proposal = readProposal(id);
+  if (!proposal || proposal.status !== 'active') return null;
+  if (proposal.parked) return proposal; // already parked — single-fire
+  const updated: PlanProposal = {
+    ...proposal,
+    parked: { at: new Date().toISOString(), reason, note: note?.trim() || undefined },
+  };
+  writeProposal(updated);
+  logger.info({ goalId: id, reason }, 'goal parked');
+  return updated;
+}
+
+/** Clear a goal's parked state + reset the no-progress streak, and (if
+ *  self-driving) re-arm the next resume. The /goal resume + user-reply path. */
+export function unparkGoal(id: string): PlanProposal | null {
+  const proposal = readProposal(id);
+  if (!proposal || proposal.status !== 'active') return null;
+  const resumeEveryMs = proposal.resumeEveryMs ?? GOAL_DEFAULT_RESUME_EVERY_MS;
+  const updated: PlanProposal = {
+    ...proposal,
+    parked: undefined,
+    noProgressStreak: 0,
+    lastActivityAt: new Date().toISOString(),
+    ...(proposal.selfDriving ? { nextResumeAt: new Date(Date.now() + resumeEveryMs).toISOString() } : {}),
+  };
+  writeProposal(updated);
+  logger.info({ goalId: id }, 'goal unparked');
+  return updated;
+}
+
+/** Pure progress fingerprint the breaker compares across resumes. */
+export function goalProgressSnapshot(goal: PlanProposal): { ledger: number; evidence: number; stagesDone: number } {
+  return {
+    ledger: goal.progressLedger?.length ?? 0,
+    evidence: goal.evidence?.length ?? 0,
+    stagesDone: goal.stages?.filter((s) => s.status === 'done').length ?? 0,
+  };
 }
 
 /**

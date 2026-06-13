@@ -21,6 +21,7 @@ import { getBuildInfo, describeBuild } from '../runtime/build-info.js';
 import { verifyDelivered } from '../runtime/harness/verify-delivered.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
 import { processWorkflowSchedules, reapStaleWorkflowRuns } from '../execution/workflow-scheduler.js';
+import { processGoalResumptions } from '../execution/goal-resume.js';
 import { processSpaceSchedules } from '../spaces/scheduler.js';
 import { isSpacesEnabled } from '../spaces/store.js';
 import { sweepStaleExecutions, sweepCrashedExecutions, sweepStaleBlockedExecutions } from '../execution/store.js';
@@ -1232,6 +1233,15 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
       // v1 handles the rest. After a v2 cycle marks lastRunAt, v1 sees
       // the cadence as not-yet-due and skips that agent.
       await processAgentAutonomyV2();
+      // Self-driving goals (A2): re-enter active goals due for a heartbeat.
+      // Inside proactiveWorkAllowed ⇒ quiet hours pause resumption for free
+      // (the autonomous-hours window, reusing proactivity-policy). ~60s scan
+      // cadence; per-goal nextResumeAt governs the real interval. This is the
+      // principled replacement for processAgentAutonomy{,V2} — do NOT add new
+      // standing-work features to those two engines; land them as goals here.
+      if (tickCount % 4 === 0) {
+        await processGoalResumptions();
+      }
       await processProactiveBriefs(assistant);
       // Evaluate user-defined check-in templates — fires open
       // questions through the existing check-in path when their

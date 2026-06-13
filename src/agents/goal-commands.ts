@@ -13,13 +13,18 @@ import {
   expireGoal,
   getActiveGoalForSession,
   getCurrentGoalStage,
+  parkGoal,
+  unparkGoal,
+  enableGoalSelfDrive,
   GOAL_DEFAULT_MAX_ATTEMPTS,
   type PlanProposal,
 } from './plan-proposals.js';
 
 export type GoalCommand =
-  | { kind: 'start'; objective: string }
+  | { kind: 'start'; objective: string; autonomous?: boolean }
+  | { kind: 'auto-existing' }
   | { kind: 'resume' }
+  | { kind: 'pause' }
   | { kind: 'clear' }
   | { kind: 'status' }
   | { kind: 'unknown'; text: string };
@@ -32,8 +37,13 @@ export function parseGoalCommand(message: string): GoalCommand | null {
   if (!rest) return { kind: 'status' };
   const lower = rest.toLowerCase();
   if (lower === 'resume') return { kind: 'resume' };
+  if (lower === 'pause' || lower === 'hold') return { kind: 'pause' };
   if (lower === 'clear' || lower === 'stop' || lower === 'abort' || lower === 'cancel') return { kind: 'clear' };
   if (lower === 'status' || lower === 'state') return { kind: 'status' };
+  // `/goal auto <objective>` pins a self-driving goal; bare `/goal auto`
+  // promotes the existing goal to self-driving.
+  if (lower === 'auto') return { kind: 'auto-existing' };
+  if (lower.startsWith('auto ')) return { kind: 'start', objective: rest.slice(4).trim(), autonomous: true };
   return { kind: 'start', objective: rest };
 }
 
@@ -88,22 +98,43 @@ export function handleGoalContractCommand(input: {
     const plan = existing.approvedPlan ?? existing.plan;
     return { reply: `Goal cancelled: "${plan.objective}".` };
   }
+  if (command.kind === 'pause') {
+    if (!existing) return { reply: 'No goal to pause here.' };
+    parkGoal(existing.id, 'blocker', 'user paused');
+    const plan = existing.approvedPlan ?? existing.plan;
+    return { reply: `Paused the pinned goal: ${plan.objective}. \`/goal resume\` to pick it back up.` };
+  }
   if (command.kind === 'resume') {
     if (!existing) return { reply: 'No goal to resume here. Use `/goal <objective>` to pin one.' };
+    // Clear any parked/no-progress state so self-resumption re-arms.
+    unparkGoal(existing.id);
     const plan = existing.approvedPlan ?? existing.plan;
     return {
       reply: `Resuming the pinned goal: ${plan.objective}`,
       runInput: `Continue working toward the pinned goal: ${plan.objective}`,
     };
   }
+  if (command.kind === 'auto-existing') {
+    if (!existing) return { reply: 'No goal to run autonomously here. Use `/goal auto <objective>` to pin one.' };
+    enableGoalSelfDrive(existing.id);
+    const plan = existing.approvedPlan ?? existing.plan;
+    return {
+      reply: `Running the pinned goal autonomously: ${plan.objective}. I'll keep working it on my own and check in at each milestone (or if I get blocked). \`/goal pause\` to hold.`,
+      runInput: `Continue working toward the pinned goal: ${plan.objective}`,
+    };
+  }
   if (command.kind === 'start') {
     const goal = createDirectGoal({ objective: command.objective, sessionId, channel });
     if (!goal) return { reply: 'I could not pin that goal — give me a short objective, e.g. `/goal audit example.com and write the brief`.' };
+    if (command.autonomous) enableGoalSelfDrive(goal.id);
     const supersededNote = existing ? ` (replaced the previous goal: "${(existing.approvedPlan ?? existing.plan).objective}")` : '';
+    const autoNote = command.autonomous
+      ? " I'll run this autonomously — working it on my own and checking in at each milestone or if I get blocked."
+      : " I'll keep working until external validation passes";
     return {
-      reply: `Goal pinned${supersededNote}: ${command.objective}. I'll keep working until external validation passes — \`/goal status\` to check, \`/goal cancel\` to drop it.`,
+      reply: `Goal pinned${supersededNote}: ${command.objective}.${autoNote} — \`/goal status\` to check, \`/goal cancel\` to drop it.`,
       runInput: command.objective,
     };
   }
-  return { reply: 'Unrecognized /goal command. Use `/goal <objective>`, `/goal status`, or `/goal cancel`.' };
+  return { reply: 'Unrecognized /goal command. Use `/goal <objective>`, `/goal auto <objective>`, `/goal status`, `/goal pause`, or `/goal cancel`.' };
 }
