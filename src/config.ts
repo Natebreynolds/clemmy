@@ -304,9 +304,14 @@ export const WEBHOOK_SECRET_IS_STRONG = isStrongLocalSecret(WEBHOOK_SECRET);
 const DISCORD_ENABLED_RAW = getEnv('DISCORD_ENABLED', '').toLowerCase();
 // When true, Discord routes incoming messages through the 0.3 harness
 // (Orchestrator + sub-agents + auto-continuation + live progress) instead
-// of the v0.2 gateway. Off by default so the desktop release ships the
-// stable path and we can flip per-deployment.
-export const DISCORD_HARNESS_ENABLED = getEnv('DISCORD_HARNESS_ENABLED', 'false').toLowerCase() === 'true';
+// of the legacy v0.2 gateway path. DEFAULT-ON (2026-06-14 FORK-collapse):
+// Discord was the last surface still defaulting to the ungated legacy
+// engine — every other surface defaults to the gated harness, so Discord
+// now matches. The legacy gateway path stays as a kill-switch
+// (DISCORD_HARNESS_ENABLED=false) for reversibility until it's deleted
+// post-soak. handleDiscordHarnessMessage (discord-harness.ts, tested) is
+// the path Nathan has run in production.
+export const DISCORD_HARNESS_ENABLED = getEnv('DISCORD_HARNESS_ENABLED', 'true').toLowerCase() !== 'false';
 // Vault fallback matches WEBHOOK_SECRET / OPENAI_API_KEY pattern — when
 // the user saves their bot token via the credentials UI it lands in
 // secrets-vault.json, NOT in .env. Without this fallback the daemon
