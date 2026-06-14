@@ -40,6 +40,12 @@ test('hardBlock distinguishes PROD from non-prod ambient publishes (Test-5 fix)'
   // --create-site is NOT treated as an explicit destination (netlify ignores it
   // when the cwd is already linked — exactly what clobbered aldous in Test 5).
   assert.equal(evaluateShellDestination('netlify deploy --prod --create-site meridian').hardBlock, true);
+  // Hardening (review 2026-06-14): a QUOTED --prod must still hard-block (the
+  // verb-scan is quote-stripped, so this used to downgrade to a draft).
+  assert.equal(evaluateShellDestination('netlify deploy "--prod" --dir ./site').hardBlock, true);
+  // …but --prod inside an unrelated quoted string on a NON-publish command does
+  // not trip the gate (no publish verb → not flagged).
+  assert.equal(evaluateShellDestination('git commit -m "ship the --prod build"').action, 'allow');
 });
 
 test('an EXPLICIT --site makes it allow (the recovery the model eventually did)', () => {

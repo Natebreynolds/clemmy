@@ -598,20 +598,52 @@ function compensateFailedExternalWrite(
 ): void {
   if (!sessionId) return;
   try {
-    if (typeof result !== 'string' || !result.startsWith('⚠️ composio_execute_tool FAILED')) return;
-    const shape = classifyExternalWrite(toolName, parsedInput);
-    if (!shape.mutating) return;
-    appendEvent({
-      sessionId,
-      turn: 0,
-      role: 'system',
-      type: 'external_write_failed',
-      data: {
-        shapeKey: shape.shapeKey,
-        toolName,
-        targets: extractDuplicateIdentityKeys(parsedInput).slice(0, 8),
-      },
-    });
+    const resultStr = typeof result === 'string' ? result : '';
+    // Composio hard-failure (the 2026-06-12 to/to_email case).
+    if (resultStr.startsWith('⚠️ composio_execute_tool FAILED')) {
+      const shape = classifyExternalWrite(toolName, parsedInput);
+      if (!shape.mutating) return;
+      appendEvent({
+        sessionId,
+        turn: 0,
+        role: 'system',
+        type: 'external_write_failed',
+        data: {
+          shapeKey: shape.shapeKey,
+          toolName,
+          targets: extractDuplicateIdentityKeys(parsedInput).slice(0, 8),
+        },
+      });
+      return;
+    }
+    // Shell network-mutation failure (review 2026-06-14): the 2c4 gate records a
+    // shell send's external_write PRE-dispatch (shapeKey shell:<bin>); if the
+    // command then FAILS (non-zero exit / ERROR stub), compensate so the model's
+    // retry isn't a false DUPLICATE_EXTERNAL_WRITE. Mirrors the composio path,
+    // using the same shell classifier + shapeKey the 2c4 gate emitted.
+    if (toolName === 'run_shell_command') {
+      const command = typeof (parsedInput as { command?: unknown })?.command === 'string'
+        ? (parsedInput as { command: string }).command
+        : '';
+      if (!command) return;
+      const mutation = classifyShellNetworkMutation(command);
+      // computer-tools renders `exit_code: <code>`; non-zero = failure. Also
+      // catch the run_worker-style ERROR: stub. exit_code: 0 → success, no comp.
+      const failed = /(?:^|\s)exit_code:\s*[1-9]/.test(resultStr) || /^ERROR:/.test(resultStr);
+      if (mutation.isNetworkMutation && mutation.shapeKey && failed) {
+        appendEvent({
+          sessionId,
+          turn: 0,
+          role: 'system',
+          type: 'external_write_failed',
+          data: {
+            shapeKey: mutation.shapeKey,
+            toolName,
+            targets: extractDuplicateIdentityKeys(command).slice(0, 8),
+          },
+        });
+      }
+    }
   } catch { /* compensation must never break the tool result */ }
 }
 

@@ -752,6 +752,48 @@ test('shell-send grounding: a curl POST with a contradicting payload soft-blocks
   }
 });
 
+test('shell-send compensation: a FAILED shell network-mutation is netted out — the retry is NOT a false duplicate (review 2026-06-14)', async () => {
+  const prevBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  const prevConfirm = process.env.CLEMMY_CONFIRM_FIRST;
+  const prevExecGate = process.env.CLEMMY_EXECUTION_GATE;
+  const prevGrounding = process.env.CLEMMY_GROUNDING_GATE;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  process.env.CLEMMY_CONFIRM_FIRST = 'off';
+  process.env.CLEMMY_EXECUTION_GATE = 'off';
+  process.env.CLEMMY_GROUNDING_GATE = 'on';
+  resetEventLog();
+  const grounding = await import('./grounding-gate.js');
+  grounding._resetGroundingStateForTests();
+  grounding._resetDuplicateStateForTests();
+  grounding._setGroundingJudgeForTests(async () => ({ grounded: true, reason: 'ok' }));
+  const sess = createSession({ kind: 'chat' });
+  const cmd = `curl -X POST https://api.example.com/send -d '{"to_email":"cliff@eleylawfirm.com"}'`;
+  try {
+    const counter = new ToolCallsCounter(100);
+    // First invocation fails (non-zero exit); second succeeds.
+    let attempt = 0;
+    const wrapped = wrapToolForHarness({
+      name: 'run_shell_command',
+      execute: async () => { attempt += 1; return attempt === 1 ? 'exit_code: 28  stderr: curl: (28) timed out' : 'exit_code: 0  stdout: sent'; },
+    });
+    const post = () => withHarnessRunContext({ sessionId: sess.id, counter }, () => wrapped.execute!({ command: cmd }));
+    // 1. First send: grounding passes, the gate records an external_write, the
+    //    command FAILS → compensateFailedExternalWrite emits external_write_failed.
+    assert.match(String(await post()), /exit_code: 28/);
+    const { listEvents } = await import('./eventlog.js');
+    assert.ok(listEvents(sess.id, { types: ['external_write_failed'] }).length >= 1, 'failed shell send was compensated');
+    // 2. Retry of the SAME target → the failure nets out the prior write, so it is
+    //    NOT a DUPLICATE_EXTERNAL_WRITE. Before the fix this threw.
+    assert.match(String(await post()), /exit_code: 0/);
+  } finally {
+    grounding._setGroundingJudgeForTests(null);
+    process.env.HARNESS_TOOL_BRACKETS = prevBrackets;
+    process.env.CLEMMY_CONFIRM_FIRST = prevConfirm;
+    process.env.CLEMMY_EXECUTION_GATE = prevExecGate;
+    if (prevGrounding === undefined) delete process.env.CLEMMY_GROUNDING_GATE; else process.env.CLEMMY_GROUNDING_GATE = prevGrounding;
+  }
+});
+
 test('duplicate-target gate: a FAILED dispatch is netted out — the corrected retry is not a "duplicate" (2026-06-12 live replay)', async () => {
   const prevBrackets = process.env.HARNESS_TOOL_BRACKETS;
   const prevConfirm = process.env.CLEMMY_CONFIRM_FIRST;

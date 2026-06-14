@@ -163,7 +163,13 @@ export function classifyShellCommand(command: string): ShellWriteShape {
     return { isPublish: false, verb: undefined, binary: undefined, hasExplicitDestination: false, isProd: false };
   }
   const hasExplicitDestination = EXPLICIT_DEST_FLAG_RE.test(command) || EXPLICIT_DEST_URI_RE.test(command);
-  return { isPublish: true, verb, binary, hasExplicitDestination, isProd };
+  // Harden the prod hard-block (review 2026-06-14): the verb-scan runs on the
+  // quote-STRIPPED command, so `deploy "--prod"` would miss the prod flag and
+  // downgrade to a one-shot draft block. Re-check the RAW command for --prod. We
+  // only reach here when a publish verb was already found, so a stray --prod in
+  // an unrelated quoted string can't trip this (isPublish would be false).
+  const isProdRaw = isProd || /(?:^|[\s"'=])--(prod|production)\b/i.test(command);
+  return { isPublish: true, verb, binary, hasExplicitDestination, isProd: isProdRaw };
 }
 
 export interface DestinationGateResult {

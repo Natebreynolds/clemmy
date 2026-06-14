@@ -311,7 +311,9 @@ const DISCORD_ENABLED_RAW = getEnv('DISCORD_ENABLED', '').toLowerCase();
 // (DISCORD_HARNESS_ENABLED=false) for reversibility until it's deleted
 // post-soak. handleDiscordHarnessMessage (discord-harness.ts, tested) is
 // the path Nathan has run in production.
-export const DISCORD_HARNESS_ENABLED = getEnv('DISCORD_HARNESS_ENABLED', 'true').toLowerCase() !== 'false';
+export const DISCORD_HARNESS_ENABLED = !['false', '0', 'no', 'off'].includes(
+  getEnv('DISCORD_HARNESS_ENABLED', 'true').toLowerCase(),
+);
 // Vault fallback matches WEBHOOK_SECRET / OPENAI_API_KEY pattern — when
 // the user saves their bot token via the credentials UI it lands in
 // secrets-vault.json, NOT in .env. Without this fallback the daemon
