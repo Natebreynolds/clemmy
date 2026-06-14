@@ -8,7 +8,7 @@ import { getWorkspaceDirs, listWorkspaceProjects, loadTeamAgents } from '../tool
 import { countDiscordSessions, listDiscordSessions } from '../channels/discord-store.js';
 import { getDiscordRuntimeStatus } from '../channels/discord.js';
 import { getAuthStatus } from '../runtime/auth-store.js';
-import { listAgentInboxCounts, listAgentStates } from '../agents/autonomy.js';
+import { listAgentInboxCounts, listAgentStates } from '../agents/agent-state.js';
 import { getConfiguredDiscordInstallInfo } from '../channels/discord-install.js';
 import { ExecutionStore } from '../execution/store.js';
 import { isUserFacingExecution } from '../execution/scope.js';

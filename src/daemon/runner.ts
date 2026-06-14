@@ -4,7 +4,6 @@ import matter from 'gray-matter';
 import pino from 'pino';
 import { ClementineAssistant } from '../assistant/core.js';
 import { validateCronExpression } from '../shared/cron.js';
-import { processAgentAutonomy } from '../agents/autonomy.js';
 import { processAgentAutonomyV2 } from '../agents/autonomy-v2.js';
 import { processMonitors } from '../agents/monitors.js';
 import { getProactivityPolicySnapshot } from '../agents/proactivity-policy.js';
@@ -1227,11 +1226,9 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
 
     if (proactivity.proactiveWorkAllowed) {
       await processExecutionController(assistant);
-      await processAgentAutonomy(assistant);
-      // v2 runs in parallel with v1 - each agent is owned by exactly one
-      // engine. v2 processes agents listed in AUTONOMY_V2_AGENTS env var;
-      // v1 handles the rest. After a v2 cycle marks lastRunAt, v1 sees
-      // the cadence as not-yet-due and skips that agent.
+      // Autonomy v1 (processAgentAutonomy) was deleted in Phase-2 Wave 2 — v2
+      // owns every standing agent (AUTONOMY_V2_AGENTS) and self-driving goals
+      // own the rest. Only v2 + goals run the standing-work cadence now.
       await processAgentAutonomyV2();
       // Self-driving goals (A2): re-enter active goals due for a heartbeat.
       // Inside proactiveWorkAllowed ⇒ quiet hours pause resumption for free
