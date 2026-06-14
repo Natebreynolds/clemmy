@@ -6,6 +6,16 @@ import { BoundaryError } from './boundary-error.js';
 import { rateLimitedAlert } from './rate-limited-alert.js';
 import { withTimeout, harnessRunContextStorage } from './harness/brackets.js';
 import { appendFanoutAdvisory } from './harness/fanout-advisory.js';
+import {
+  isGroundingGateEnabled,
+  evaluateGrounding,
+  detectDuplicateTarget,
+  extractDuplicateIdentityKeys,
+  markDuplicateWarned,
+  GroundingCheckFailedError,
+  DuplicateExternalWriteError,
+} from './harness/grounding-gate.js';
+import { appendEvent, listEvents } from './harness/eventlog.js';
 
 // Bound MCP startup below the SDK's default (~60s), but leave enough
 // room for `npx`/`uvx` based servers on fresh machines. 5s/8s was too
@@ -636,6 +646,56 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): MCPSer
         });
       }
 
+      // Integrity gates for irreversible MCP SENDS (blind-spot audit #1).
+      // Native MCP tools bypass wrapToolForHarness, so a Gmail/Slack/etc. send
+      // never got the grounding + duplicate-target protection that composio
+      // sends get — a corrupted/wrong-target send (the Eley/mailbox incident
+      // class) or a silent double-send sailed straight through. Run the SAME
+      // gates here for send-kind tools, reusing the same fail-open functions.
+      // Blocks surface as soft tool errors the model recovers from. The
+      // external_write ledger (emitted on success below) is SHARED with the
+      // composio path so duplicate detection spans both surfaces.
+      const integritySessionId = harnessRunContextStorage.getStore()?.sessionId;
+      if (decision.kind === 'send' && isGroundingGateEnabled() && integritySessionId) {
+        try {
+          // Duplicate-target speed bump: a same-shape send to a target already
+          // written this session bumps ONCE (approval is not idempotency).
+          const dupTargets = extractDuplicateIdentityKeys(args ?? {});
+          if (dupTargets.length > 0) {
+            const priorWrites = listEvents(integritySessionId, { types: ['external_write'] })
+              .map((ev) => ev.data as { shapeKey?: string; targets?: string[] });
+            const failures = listEvents(integritySessionId, { types: ['external_write_failed'] })
+              .map((ev) => ev.data as { shapeKey?: string; targets?: string[] });
+            for (const failure of failures) {
+              const failTargets = new Set((failure.targets ?? []).map((t) => String(t).toLowerCase()));
+              const idx = priorWrites.findIndex((w) => w.shapeKey === failure.shapeKey
+                && (w.targets ?? []).some((t) => failTargets.has(String(t).toLowerCase())));
+              if (idx >= 0) priorWrites.splice(idx, 1);
+            }
+            const dup = detectDuplicateTarget({ sessionId: integritySessionId, shapeKey: toolName, targets: dupTargets, priorWrites });
+            if (dup.duplicate && dup.warnedKey) {
+              markDuplicateWarned(dup.warnedKey);
+              throw new DuplicateExternalWriteError({ toolName, shapeKey: toolName, target: dup.target ?? 'unknown' });
+            }
+          }
+          // Grounding: verify the outgoing payload against this target's own
+          // session artifacts (fail-open on no-target / no-sources / judge error).
+          const verdict = await evaluateGrounding(integritySessionId, toolName, args ?? {});
+          if (verdict.action === 'block') {
+            throw new GroundingCheckFailedError({
+              toolName,
+              reason: verdict.reason,
+              targets: verdict.targets,
+              sourceCallIds: verdict.sourceCallIds,
+              failureCount: verdict.failureCount ?? 1,
+            });
+          }
+        } catch (err) {
+          if (err instanceof GroundingCheckFailedError || err instanceof DuplicateExternalWriteError) throw err;
+          // Any other evaluation error is fail-open — never block a legit send.
+        }
+      }
+
       const finish = beginToolEvent({
         toolName,
         kind: decision.kind,
@@ -647,6 +707,26 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): MCPSer
         // Forward to the underlying server with the ORIGINAL tool name.
         const result = await server.callTool(parsed.toolName, args);
         finish('success');
+        // Record the irreversible send in the SHARED external_write ledger so a
+        // later same-shape send (composio OR MCP) to the same target gets the
+        // duplicate bump. Best-effort; telemetry must never affect the result.
+        if (decision.kind === 'send' && integritySessionId) {
+          try {
+            appendEvent({
+              sessionId: integritySessionId,
+              turn: 0,
+              role: 'system',
+              type: 'external_write',
+              data: {
+                shapeKey: toolName,
+                toolName,
+                irreversible: true,
+                mcp: true,
+                targets: extractDuplicateIdentityKeys(args ?? {}).slice(0, 8),
+              },
+            });
+          } catch { /* telemetry write must never block */ }
+        }
         // Global fan-out trigger: native MCP calls bypass wrapToolForHarness,
         // so this is where serial same-shape MCP work (N>=3 distinct items) gets
         // the run_worker advisory appended. Best-effort; no-op when not looping.
