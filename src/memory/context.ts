@@ -94,28 +94,3 @@ export async function assemblePromptContextAsync(sessionId: string, message: str
     retrievalText: formatSearchHits(hits, budget.vaultFormatBytes || 0),
   };
 }
-
-/**
- * Sync variant for code paths that cannot await. Skips the embedding
- * rerank step. Same intent-driven memory budget as the async path.
- */
-export function assemblePromptContext(sessionId: string, message: string, transcript: string): AssembledPromptContext {
-  const intent = classifyMessageIntent(message);
-  const budget = memoryBudgetFor(intent.intent);
-  const brief = budget.loadSessionBrief ? loadSessionBrief(sessionId) : undefined;
-  const memoryContext = {
-    ...loadMemoryContext(),
-    workingMemory: budget.loadWorkingMemory ? loadWorkingMemoryForSession(sessionId) : undefined,
-    sessionBrief: mergeContinuity(
-      brief ? renderSessionContinuity(brief) : undefined,
-      budget.loadSessionBrief ? buildPriorSessionSeed(sessionId) : undefined,
-    ),
-  };
-  const hits = budget.vaultSearchTopK > 0
-    ? searchVault(buildSearchQuery(memoryContext, message, transcript), budget.vaultSearchTopK)
-    : [];
-  return {
-    memoryContext,
-    retrievalText: formatSearchHits(hits, budget.vaultFormatBytes || 0),
-  };
-}

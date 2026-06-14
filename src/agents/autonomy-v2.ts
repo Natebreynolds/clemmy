@@ -851,8 +851,3 @@ export async function processAgentAutonomyV2(): Promise<AutonomyV2RunSummary> {
   summary.durationMs = Date.now() - start;
   return summary;
 }
-
-/** Exported for tests and CLI smoke runs. */
-export async function runAgentCycleV2ForTest(record: TeamAgentRecord): Promise<{ runId: string; success: boolean; outcomes: string[]; error?: string }> {
-  return runAgentCycleV2(record);
-}
