@@ -237,12 +237,24 @@ export function buildObjectiveJudgePrompt(
       : "Assistant's most recent response:",
     shown.text,
   ];
+  // Tool-call evidence — surface it whenever we have it, EVEN with no skill
+  // loaded. The judge audits an ACTION objective ("build/deploy X"); without the
+  // list of tools that actually fired it sees only the prose reply and can
+  // hallucinate a missing deliverable on a genuinely-finished run. Suppressed
+  // for zero-tool turns so a bare promise still shows no evidence (the judge
+  // correctly demands the artifact).
+  const toolSummary = skillContext?.toolCallSummary?.trim();
+  if (toolSummary && toolSummary !== '(no tool calls made)') {
+    parts.push(
+      '',
+      `Tool calls made this session (evidence the work actually ran — corroborates the reply, but the response must still contain the artifact/URL the objective named): ${toolSummary}`,
+    );
+  }
   if (skillContext && skillContext.skills.length > 0) {
     parts.push(
       '',
       '=== SKILLS LOADED THIS SESSION — verify they were EXECUTED, not just read ===',
-      'A loaded skill is a procedure the assistant committed to run. For EACH skill below, check the assistant actually carried out its prescribed steps and produced its deliverables (a file, image, URL, record, deploy). Use the tool-call evidence: if a skill clearly prescribes a step (e.g. generate imagery, run a bundled script, create a file) and the evidence shows that step was NOT done, the objective is NOT done — set done=false and name the specific skipped step. A pure-advice/persona skill with no concrete deliverables has nothing to enforce.',
-      `Tool calls made this session: ${skillContext.toolCallSummary || '(none recorded)'}`,
+      'A loaded skill is a procedure the assistant committed to run. For EACH skill below, check the assistant actually carried out its prescribed steps and produced its deliverables (a file, image, URL, record, deploy). Use the tool-call evidence above: if a skill clearly prescribes a step (e.g. generate imagery, run a bundled script, create a file) and the evidence shows that step was NOT done, the objective is NOT done — set done=false and name the specific skipped step. A pure-advice/persona skill with no concrete deliverables has nothing to enforce.',
       ...skillContext.skills.map((s) => `\n--- skill: ${s.name} (first 5000 chars) ---\n${s.body.slice(0, 5000)}`),
     );
   }

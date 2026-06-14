@@ -1774,9 +1774,18 @@ async function runConversationCore(
         // skill was EXECUTED (deliverables produced), not just read. Fail-open:
         // gather helpers return [] on error, so the judge runs exactly as before.
         const loadedSkills = gatherSessionSkills(options.sessionId);
-        const skillContext = loadedSkills.length > 0
-          ? { skills: loadedSkills, toolCallSummary: summarizeToolCallsForJudge(options.sessionId) }
-          : undefined;
+        // Always hand the judge the tool-call evidence — NOT only when a skill
+        // loaded. A plain build/deploy/CLI run that loads no skill still did
+        // real, verifiable work; judging ONLY decision.reply starved the judge
+        // of that evidence, so it hallucinated a missing deliverable and
+        // false-rejected genuinely-finished action turns ("Done — site live at
+        // <url>"), stranding real completions into a false stuck loop (25 such
+        // sessions in one week of eventlog). Fail-open: summarizeToolCallsForJudge
+        // returns '' on error and the prompt builder only renders a real summary.
+        const skillContext = {
+          skills: loadedSkills,
+          toolCallSummary: summarizeToolCallsForJudge(options.sessionId),
+        };
         // A bare follow-up ("just mine please") judged in isolation is
         // inherently ambiguous → false NOT-finished retries (5 in the live
         // 2026-06-11 session). Compose the judged objective with the recent

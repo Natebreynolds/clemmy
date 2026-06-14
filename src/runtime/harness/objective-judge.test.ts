@@ -141,6 +141,32 @@ test('buildObjectiveJudgePrompt without skill context is unchanged (no rubric in
   assert.match(p, /respond with the structured verdict/);
 });
 
+// Regression (2026-06-14): a build/deploy run that loads NO skill still did real
+// work; the judge was previously starved of the tool-call evidence (it only
+// rendered inside the skills block), so it false-rejected genuinely-finished
+// action turns and stranded ~10% of completions into a false stuck loop.
+test('buildObjectiveJudgePrompt surfaces tool-call evidence even with NO skill loaded', () => {
+  const p = buildObjectiveJudgePrompt(
+    'build and deploy the Test Bakehouse site',
+    'Done — Test Bakehouse is live: https://test-bakehouse.netlify.app',
+    { skills: [], toolCallSummary: 'run_shell_command×5, write_file×1' },
+  );
+  assert.match(p, /Tool calls made this session/);
+  assert.match(p, /run_shell_command×5/);
+  // No skill rubric should be injected for an empty skills list.
+  assert.doesNotMatch(p, /SKILLS LOADED THIS SESSION/);
+});
+
+test('buildObjectiveJudgePrompt suppresses the evidence line for a zero-tool turn', () => {
+  // A bare promise with no tools must NOT get a corroborating evidence line —
+  // the judge should still see only prose and demand the artifact.
+  const p = buildObjectiveJudgePrompt('build a thing', "I'll get right on that.", {
+    skills: [],
+    toolCallSummary: '(no tool calls made)',
+  });
+  assert.doesNotMatch(p, /Tool calls made this session/);
+});
+
 // ─── composeJudgedObjective — continuity-aware judged objective ────
 
 test('composeJudgedObjective: bare follow-up gets prior REAL user messages as context', async () => {
