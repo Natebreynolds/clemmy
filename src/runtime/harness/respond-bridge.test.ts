@@ -62,41 +62,51 @@ test('harnessSurfaceEnabled: default on, kill-switch values off', () => {
   assert.equal(harnessSurfaceEnabled('webhook'), true);
 });
 
-test('harnessSurfaceEnabled: STAGED surface (dashboard) defaults OFF; validated surfaces default ON', () => {
-  // A new conversion lands behind a default-OFF staging surface → byte-identical
-  // to legacy until Nathan flips it on to live-verify, then it bakes in.
-  assert.equal(harnessSurfaceEnabled('dashboard'), false, 'staged surface OFF by default');
+test('harnessSurfaceEnabled: ALL surfaces default ON (FORK-collapse complete); kill-switch reverts', () => {
+  // 2026-06-13 audit #7: dashboard/home/workflow validated live → default ON
+  // like every other surface (the gated loop is the ONE path). The per-surface
+  // kill-switch still reverts to legacy for instant rollback.
+  assert.equal(harnessSurfaceEnabled('dashboard'), true, 'dashboard default ON');
+  assert.equal(harnessSurfaceEnabled('home'), true, 'home default ON');
+  assert.equal(harnessSurfaceEnabled('workflow'), true, 'workflow default ON');
   assert.equal(harnessSurfaceEnabled('cli'), true, 'validated surface ON by default');
-  process.env.CLEMMY_HARNESS_DASHBOARD = 'on';
-  assert.equal(harnessSurfaceEnabled('dashboard'), true, 'flips on when set');
+  process.env.CLEMMY_HARNESS_DASHBOARD = 'off';
+  assert.equal(harnessSurfaceEnabled('dashboard'), false, 'kill-switch reverts to legacy');
+  delete process.env.CLEMMY_HARNESS_DASHBOARD;
 });
 
-test('respondPreferHarness: dashboard (staged) routes to legacy by default — architect conversion is byte-identical until flipped', async () => {
+test('respondPreferHarness: dashboard rides the gated harness loop by DEFAULT (architect conversion baked in)', async () => {
   _setBridgeImplsForTests({ configure: okConfigure, buildAgent: fakeAgentBuilder, runConversation: fakeRun({ status: 'completed' }) });
   let legacyCalled = 0;
   await respondPreferHarness(
     'dashboard',
-    { message: 'draft a workflow', sessionId: 'arch-staged', excludeToolNames: ['workflow_create', 'workflow_run'] },
+    { message: 'draft a workflow', sessionId: 'arch-baked', excludeToolNames: ['workflow_create', 'workflow_run'] },
     async (req) => { legacyCalled += 1; return { text: 'legacy', sessionId: req.sessionId }; },
   );
-  assert.equal(legacyCalled, 1, 'default-off staging surface → legacy (no behavior change)');
+  assert.equal(legacyCalled, 0, 'default-ON → gated harness loop, not legacy');
 });
 
-test('staged surfaces (dashboard, home) both default OFF; home is judge-ON for chat parity', async () => {
-  assert.equal(harnessSurfaceEnabled('dashboard'), false, 'architect drafting surface OFF');
-  assert.equal(harnessSurfaceEnabled('home'), false, 'home chat surface OFF');
-  // home routes legacy by default (byte-identical) — conversion is dormant until flipped.
+test('home + dashboard ride the gated loop by default; the kill-switch still routes to legacy', async () => {
+  assert.equal(harnessSurfaceEnabled('dashboard'), true, 'architect drafting surface ON');
+  assert.equal(harnessSurfaceEnabled('home'), true, 'home chat surface ON');
   _setBridgeImplsForTests({ configure: okConfigure, buildAgent: fakeAgentBuilder, runConversation: fakeRun({ status: 'completed' }) });
   let legacyCalled = 0;
-  await respondPreferHarness('home', { message: 'hi', sessionId: 'home-staged' }, async (req) => { legacyCalled += 1; return { text: 'legacy', sessionId: req.sessionId }; });
-  assert.equal(legacyCalled, 1, 'home default-off → legacy');
+  await respondPreferHarness('home', { message: 'hi', sessionId: 'home-baked' }, async (req) => { legacyCalled += 1; return { text: 'legacy', sessionId: req.sessionId }; });
+  assert.equal(legacyCalled, 0, 'home default-ON → gated harness loop');
+  // kill-switch still reverts
+  process.env.CLEMMY_HARNESS_HOME = 'off';
+  try {
+    await respondPreferHarness('home', { message: 'hi', sessionId: 'home-killed' }, async (req) => { legacyCalled += 1; return { text: 'legacy', sessionId: req.sessionId }; });
+    assert.equal(legacyCalled, 1, 'kill-switch → legacy');
+  } finally {
+    delete process.env.CLEMMY_HARNESS_HOME;
+  }
 });
 
-test('workflow surface: staged (default OFF) + honorModel forwards step.model on the gated loop', async () => {
-  assert.equal(harnessSurfaceEnabled('workflow'), false, 'workflow surface staged OFF by default');
-  // When flipped on, the worker model is forwarded to the agent builder (so a
-  // converted forEach step keeps its cheaper model). Other surfaces ignore model.
-  process.env.CLEMMY_HARNESS_WORKFLOW = 'on';
+test('workflow surface: default ON + honorModel forwards step.model on the gated loop', async () => {
+  assert.equal(harnessSurfaceEnabled('workflow'), true, 'workflow surface default ON');
+  // The worker model is forwarded to the agent builder (so a converted forEach
+  // step keeps its cheaper model). Other surfaces ignore model.
   let capturedModel: string | undefined;
   const recordingBuilder = (async (opts: { model?: string }) => { capturedModel = opts.model; return FAKE_AGENT; }) as never;
   _setBridgeImplsForTests({ configure: okConfigure, buildAgent: recordingBuilder, runConversation: fakeRun({ status: 'completed' }) });

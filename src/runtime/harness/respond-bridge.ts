@@ -50,8 +50,17 @@ export type HarnessSurface = 'webhook' | 'cron' | 'background' | 'cli' | 'dashbo
  *  switch to live-verify, after which it bakes in and leaves this set. The
  *  already-validated surfaces (webhook/cron/background/cli) default ON. These
  *  flags are TEMPORARY — they collapse to zero (legacy core deleted, conversions
- *  baked in) once validated, so the net is a flag REDUCTION, not sprawl. */
-const STAGING_SURFACES: ReadonlySet<HarnessSurface> = new Set<HarnessSurface>(['dashboard', 'home', 'workflow']);
+ *  baked in) once validated, so the net is a flag REDUCTION, not sprawl.
+ *
+ *  2026-06-13 (audit #7 / FORK-collapse): dashboard, home, and workflow have
+ *  been validated live (the dev daemon ran all three on the gated loop all
+ *  session — architect draft, home chat, and workflow step-chaining smokes
+ *  green every run). They now default ON like the other surfaces — the gated
+ *  harness loop is the ONE path for every surface. Per-surface kill-switches
+ *  (CLEMMY_HARNESS_DASHBOARD/HOME/WORKFLOW=off) remain for instant reversibility
+ *  until the legacy core is deleted (Phase 2). Set is now empty (flag REDUCTION
+ *  realized). */
+const STAGING_SURFACES: ReadonlySet<HarnessSurface> = new Set<HarnessSurface>();
 
 /** The harness can only ENFORCE an exclusion for tools on its own local surface
  *  (buildOrchestratorAgent filters those by name). External MCP-server tools are
