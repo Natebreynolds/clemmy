@@ -698,6 +698,67 @@ test('destination gate: an ambient-target shell publish soft-blocks ONCE, then a
   }
 });
 
+test('shell-send grounding: a curl POST with a contradicting payload soft-blocks; the corrected payload passes (audit #2)', async () => {
+  const prevBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  const prevConfirm = process.env.CLEMMY_CONFIRM_FIRST;
+  const prevExecGate = process.env.CLEMMY_EXECUTION_GATE;
+  const prevGrounding = process.env.CLEMMY_GROUNDING_GATE;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  process.env.CLEMMY_CONFIRM_FIRST = 'off';
+  process.env.CLEMMY_EXECUTION_GATE = 'off';
+  process.env.CLEMMY_GROUNDING_GATE = 'on';
+  resetEventLog();
+  const { writeToolOutput } = await import('./eventlog.js');
+  const grounding = await import('./grounding-gate.js');
+  grounding._resetGroundingStateForTests();
+  grounding._resetDuplicateStateForTests();
+  const sess = createSession({ kind: 'chat' });
+  writeToolOutput({
+    sessionId: sess.id, callId: 'c_extract', tool: 'run_worker',
+    output: 'Eley Law Firm; verified "workers compensation lawyer Denver"; contact cliff@eleylawfirm.com',
+  });
+  grounding._setGroundingJudgeForTests(async (payload) => payload.includes('Houston')
+    ? { grounded: false, reason: 'Payload claims Houston; the extraction artifact says Denver.' }
+    : { grounded: true, reason: 'Matches the Denver extraction.' });
+  try {
+    const counter = new ToolCallsCounter(100);
+    const wrapped = wrapToolForHarness({
+      name: 'run_shell_command',
+      execute: async (_input: unknown) => 'posted',
+    });
+    const post = (city: string) =>
+      withHarnessRunContext({ sessionId: sess.id, counter }, () =>
+        wrapped.execute!({
+          command: `curl -X POST https://api.example.com/send -d '{"to_email":"cliff@eleylawfirm.com","body":"${city} comp search gap"}'`,
+        }));
+    // Corrupted payload (Houston) → grounding soft-blocks the shell send.
+    await assert.rejects(() => Promise.resolve(post('Houston')), (err: Error) => {
+      assert.match(err.message, /GROUNDING_CHECK_FAILED/);
+      assert.match(err.message, /Denver/);
+      return true;
+    });
+    // Corrected payload (Denver) → allowed; the shared external_write is recorded.
+    assert.equal(await post('Denver'), 'posted');
+    const { listEvents } = await import('./eventlog.js');
+    assert.ok(
+      listEvents(sess.id, { types: ['external_write'] }).some((e) => (e.data as { shell?: boolean }).shell === true),
+      'a shell external_write was recorded',
+    );
+    // A plain read curl (GET) is NOT gated.
+    const readCurl = wrapToolForHarness({ name: 'run_shell_command', execute: async () => 'ok' });
+    assert.equal(
+      await withHarnessRunContext({ sessionId: sess.id, counter }, () => readCurl.execute!({ command: 'curl -s https://api.example.com/status' })),
+      'ok',
+    );
+  } finally {
+    grounding._setGroundingJudgeForTests(null);
+    process.env.HARNESS_TOOL_BRACKETS = prevBrackets;
+    process.env.CLEMMY_CONFIRM_FIRST = prevConfirm;
+    process.env.CLEMMY_EXECUTION_GATE = prevExecGate;
+    if (prevGrounding === undefined) delete process.env.CLEMMY_GROUNDING_GATE; else process.env.CLEMMY_GROUNDING_GATE = prevGrounding;
+  }
+});
+
 test('duplicate-target gate: a FAILED dispatch is netted out — the corrected retry is not a "duplicate" (2026-06-12 live replay)', async () => {
   const prevBrackets = process.env.HARNESS_TOOL_BRACKETS;
   const prevConfirm = process.env.CLEMMY_CONFIRM_FIRST;

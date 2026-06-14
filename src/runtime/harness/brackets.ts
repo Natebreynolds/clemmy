@@ -31,6 +31,7 @@ import {
   wasDestinationNudged,
   markDestinationNudged,
   ImplicitDestinationError,
+  classifyShellNetworkMutation,
 } from './destination-gate.js';
 
 /**
@@ -874,6 +875,71 @@ export function wrapToolForHarness<T extends WrappableTool>(
       if (err instanceof ImplicitDestinationError) throw err;
       // eslint-disable-next-line no-console
       console.warn('[harness] destination gate threw (fail-open)', err instanceof Error ? err.message : err);
+    }
+    // 2c4. Shell SEND grounding (audit #2). run_shell_command is the universal
+    // external-write vector (curl -X POST / gh api --method POST / sf data
+    // update / sendmail), but isMutatingExternalWrite is composio-only, so
+    // these sends never got the grounding (payload-integrity) + duplicate gates
+    // that composio/MCP sends get — the Eley/mailbox incident class, reachable
+    // through shell. Classify only the CLEAR network-mutation shapes
+    // (conservative; misses = status quo) and route them through the SAME
+    // fail-open gates, reading the target from the command string. The
+    // external_write ledger is SHARED so a shell re-send to the same target
+    // bumps. Fail-open on any evaluation error.
+    try {
+      if (isGroundingGateEnabled() && tool.name === 'run_shell_command') {
+        const command = typeof (parsedInput as { command?: unknown })?.command === 'string'
+          ? (parsedInput as { command: string }).command
+          : '';
+        const mutation = command ? classifyShellNetworkMutation(command) : { isNetworkMutation: false as const };
+        if (mutation.isNetworkMutation && mutation.shapeKey) {
+          const dupTargets = extractDuplicateIdentityKeys(command);
+          if (dupTargets.length > 0) {
+            let priorWrites: Array<{ shapeKey?: string; targets?: string[] }> = [];
+            try {
+              priorWrites = listEvents(ctx.sessionId, { types: ['external_write'] })
+                .map((ev) => ev.data as { shapeKey?: string; targets?: string[] });
+              const failures = listEvents(ctx.sessionId, { types: ['external_write_failed'] })
+                .map((ev) => ev.data as { shapeKey?: string; targets?: string[] });
+              for (const failure of failures) {
+                const ft = new Set((failure.targets ?? []).map((t) => String(t).toLowerCase()));
+                const idx = priorWrites.findIndex((w) => w.shapeKey === failure.shapeKey
+                  && (w.targets ?? []).some((t) => ft.has(String(t).toLowerCase())));
+                if (idx >= 0) priorWrites.splice(idx, 1);
+              }
+            } catch { /* fail toward not-a-duplicate */ }
+            const dup = detectDuplicateTarget({ sessionId: ctx.sessionId, shapeKey: mutation.shapeKey, targets: dupTargets, priorWrites });
+            if (dup.duplicate && dup.warnedKey) {
+              markDuplicateWarned(dup.warnedKey);
+              throw new DuplicateExternalWriteError({ toolName: tool.name, shapeKey: mutation.shapeKey, target: dup.target ?? 'unknown' });
+            }
+          }
+          const verdict = await evaluateGrounding(ctx.sessionId, tool.name, command);
+          if (verdict.action === 'block') {
+            try {
+              appendEvent({
+                sessionId: ctx.sessionId, turn: 0, role: 'system', type: 'guardrail_tripped',
+                data: { kind: 'grounding_blocked', toolName: tool.name, source: 'shell_send', targets: verdict.targets.slice(0, 5), reason: verdict.reason },
+              });
+            } catch { /* telemetry must never block */ }
+            throw new GroundingCheckFailedError({
+              toolName: tool.name, reason: verdict.reason, targets: verdict.targets,
+              sourceCallIds: verdict.sourceCallIds, failureCount: verdict.failureCount ?? 1,
+            });
+          }
+          // Record the shell send in the SHARED external_write ledger.
+          try {
+            appendEvent({
+              sessionId: ctx.sessionId, turn: 0, role: 'system', type: 'external_write',
+              data: { shapeKey: mutation.shapeKey, toolName: tool.name, irreversible: true, shell: true, targets: dupTargets.slice(0, 8) },
+            });
+          } catch { /* telemetry must never block */ }
+        }
+      }
+    } catch (err) {
+      if (err instanceof GroundingCheckFailedError || err instanceof DuplicateExternalWriteError) throw err;
+      // eslint-disable-next-line no-console
+      console.warn('[harness] shell-send grounding threw (fail-open)', err instanceof Error ? err.message : err);
     }
     // 2d. Confirm-first gate — a BATCH of same-shape external writes
     // needs an instruction-reviewed plan scope before it proceeds. Runs

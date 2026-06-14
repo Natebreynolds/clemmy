@@ -190,6 +190,100 @@ export function evaluateShellDestination(command: string): DestinationGateResult
   };
 }
 
+// ─────────────────────────────────────────────────────────────────
+// Shell NETWORK-MUTATION classifier (blind-spot audit #2)
+// ─────────────────────────────────────────────────────────────────
+
+/**
+ * `run_shell_command` is the universal external-write vector — `curl -X POST`,
+ * `gh api --method POST`, `sf data update`, `sendmail` — but
+ * `isMutatingExternalWrite` only classifies `composio_execute_tool`, so these
+ * sends bypass the grounding (payload-integrity) gate that composio/MCP sends
+ * get. This recognizes the CLEAR network-mutation shapes so the brackets gate
+ * can route them through grounding (the Eley/mailbox incident class via shell).
+ *
+ * CONSERVATIVE by construction (the codebase deferred shell classification as
+ * "unreliable", execution-gate.ts) — we match only high-signal mutation shapes
+ * and prefer false-NEGATIVES over false-positives. A miss just means grounding
+ * doesn't run (status quo); a false-positive only triggers a FAIL-OPEN grounding
+ * check that no-ops when there's no target → harmless. A plain `curl https://x`
+ * (a GET / read) is NOT matched — only an explicit mutating method or a request
+ * body / upload / known send-CLI verb.
+ */
+export interface ShellNetworkMutation {
+  isNetworkMutation: boolean;
+  /** Stable per-binary shape key for the duplicate ledger (e.g. "shell:curl"). */
+  shapeKey?: string;
+}
+
+/**
+ * Does `binary` (the command verb) + `rest` (its arg string, quote-stripped)
+ * constitute a clear network mutation? Binary-anchored so a send-CLI name inside
+ * a FILENAME or quoted string (`cat notes-about-sendmail.txt`) never trips it.
+ */
+function binaryIsNetworkMutation(binary: string, rest: string): boolean {
+  switch (binary) {
+    case 'curl':
+    case 'xh':
+      return /\s(-x|--request|--method[ =])\s*(post|put|patch|delete)\b/i.test(rest)
+        || /\s(-d|--data|--data-raw|--data-binary|--data-urlencode|--json|-f|--form|-t|--upload-file)\b/i.test(rest);
+    case 'wget':
+      return /\s(--post-data|--post-file|--body-data|--body-file|--method[ =](post|put|patch|delete))\b/i.test(rest);
+    case 'http': // httpie
+    case 'https':
+      return /\s(post|put|patch|delete)\b/i.test(rest);
+    case 'gh':
+      return /^\s*api\b[\s\S]*\s(-x|--method)\s*(post|put|patch|delete)\b/i.test(rest)
+        || /^\s*(pr|issue|release|gist|repo|secret|workflow)\s+(create|edit|delete|merge|close|comment|upload|set|run|dispatch)\b/i.test(rest);
+    case 'sf':
+      return /^\s*data\s+(update|insert|delete|upsert|import|tree)\b/i.test(rest);
+    case 'sfdx':
+      return /force:data:/i.test(rest);
+    case 'sendmail':
+    case 'mailx':
+    case 'mutt':
+    case 'swaks':
+      return true; // the binary IS a send command
+    case 'mail':
+      return rest.trim().length > 0; // `mail -s … addr` (a bare interactive `mail` has no args)
+    case 'aws':
+      return /^\s*s3\s+(cp|sync|mv)\b[\s\S]*\ss3:\/\//i.test(rest)
+        || /^\s*s3api\s+(put|delete|copy)-/i.test(rest);
+    case 'stripe':
+      return /\b(create|charge|payments?|refund)\b/i.test(rest);
+    case 'twilio':
+      return /\bmessages?:create\b/i.test(rest);
+    case 'scp':
+    case 'rsync':
+      return /\s[\w.-]+@[\w.-]+:/.test(rest) || /\s[\w.-]+:\S/.test(rest);
+    default:
+      return false;
+  }
+}
+
+/**
+ * Classify a shell command as a clear network mutation (send). Pure, binary-
+ * anchored, quote-stripped: scans each `&&`/`||`/`;`/`|` segment, finds the
+ * command binary (skipping env-assigns / sudo), and tests it + its args.
+ */
+export function classifyShellNetworkMutation(command: string): ShellNetworkMutation {
+  if (!command || typeof command !== 'string') return { isNetworkMutation: false };
+  const unquoted = command.replace(/"[^"]*"/g, ' ').replace(/'[^']*'/g, ' ');
+  for (const segment of unquoted.split(/&&|\|\||;|\|/)) {
+    const tokens = tokenize(segment);
+    if (tokens.length === 0) continue;
+    let i = 0;
+    while (i < tokens.length && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[i]) || tokens[i] === 'sudo')) i += 1;
+    const binary = tokens[i]?.split('/').pop()?.toLowerCase();
+    if (!binary) continue;
+    const rest = ` ${tokens.slice(i + 1).join(' ')} `;
+    if (binaryIsNetworkMutation(binary, rest)) {
+      return { isNetworkMutation: true, shapeKey: `shell:${binary}` };
+    }
+  }
+  return { isNetworkMutation: false };
+}
+
 /**
  * Build the "⚠ implicit target" suffix for the approval card. Returns ''
  * when the command names an explicit destination or isn't a publish, so

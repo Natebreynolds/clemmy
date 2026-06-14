@@ -17,6 +17,7 @@ import {
   wasDestinationNudged,
   markDestinationNudged,
   ImplicitDestinationError,
+  classifyShellNetworkMutation,
   _resetDestinationStateForTests,
 } from './destination-gate.js';
 
@@ -107,6 +108,49 @@ test('one-shot ledger: nudged once per (session, shape), then remembered', () =>
   // distinct shape / session is independent
   assert.equal(wasDestinationNudged(sid, 'npm:publish'), false);
   assert.equal(wasDestinationNudged('sess-y', 'netlify:deploy'), false);
+});
+
+// ---- shell NETWORK-MUTATION classifier (audit #2) ----
+
+test('classifyShellNetworkMutation: catches the clear send shapes', () => {
+  const sends = [
+    'curl -X POST https://api.x.com/send -d \'{"to":"a@b.com"}\'',
+    'curl --json \'{"to":"a@b.com"}\' https://api.x.com/send',
+    'curl -F file=@x.json https://api.x.com/upload',
+    'gh api --method POST /repos/o/r/dispatches',
+    'gh api -X DELETE /repos/o/r/issues/1',
+    'gh pr create --title x --body y',
+    'gh release create v1 ./dist',
+    'sf data update --sobject Account --record-id 001 --values "Name=X"',
+    'sendmail a@b.com < msg.txt',
+    'echo body | mail -s subj a@b.com',
+    'aws s3 cp ./out.html s3://my-bucket/index.html',
+    'twilio api:core:messages:create --to +15555550100 --body hi',
+    'scp ./secret.txt user@host:/tmp/',
+  ];
+  for (const cmd of sends) {
+    assert.equal(classifyShellNetworkMutation(cmd).isNetworkMutation, true, `should flag: ${cmd}`);
+  }
+  // shape key is per-binary (stable for the duplicate ledger)
+  assert.equal(classifyShellNetworkMutation('curl -X POST https://x -d @b').shapeKey, 'shell:curl');
+});
+
+test('classifyShellNetworkMutation: NO false positives on reads / benign commands', () => {
+  const benign = [
+    'curl https://api.x.com/status',          // GET = read, no method/body
+    'curl -s https://example.com',            // plain fetch
+    'gh pr list',                             // read
+    'gh api /repos/o/r',                      // GET
+    'sf data query --query "SELECT Id FROM Account"', // read
+    'ls -la /tmp',
+    'git status',
+    'echo "deploy the curl post to mail later"', // words inside a quoted string
+    'cat notes-about-sendmail.txt',           // sendmail as part of a filename
+    'netlify deploy --prod',                  // a publish (different gate), not a network-mutation send
+  ];
+  for (const cmd of benign) {
+    assert.equal(classifyShellNetworkMutation(cmd).isNetworkMutation, false, `should NOT flag: ${cmd}`);
+  }
 });
 
 test('ImplicitDestinationError carries a recoverable, explicit message', () => {
