@@ -1192,6 +1192,44 @@ test('runConversation: a GENUINE awaiting_user_input (no autonomy_note) still HA
   assert.equal(result.status, 'awaiting_user_input', 'genuine clarification must still halt');
 });
 
+test('runConversation: a DECISION-level awaiting (done:true + awaiting, NO ask_user_question) SYNTHESIZES the question event so surfaces deliver it (2026-06-14 Discord stranded-user fix)', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const runRunner: RunRunnerFn = async () => {
+    // The model asks via its DECISION (reply carries the question) and sets
+    // done:true + awaiting — but does NOT call ask_user_question, so it emits
+    // NO awaiting_user_input event. Before the fix, Discord/SSE got nothing.
+    return { history: [], lastResponseId: undefined, finalOutput: {
+      summary: 'confirming which site', reply: 'Still on Stonemill Bakehouse, or another design?',
+      done: true, nextAction: 'awaiting_user_input', reason: null } };
+  };
+  const result = await runConversation({
+    agent: makeAgentStub(), sessionId: sess.id, input: 'finalize the website',
+    makeRunner: makeRunnerStub, runRunner,
+  });
+  assert.equal(result.status, 'awaiting_user_input', 'still halts for the user');
+  // The loop must have SYNTHESIZED an awaiting_user_input event carrying the
+  // question so event-stream surfaces (Discord, desktop SSE) can render it.
+  const askEvents = listEventsForConv(sess.id, { types: ['awaiting_user_input'] });
+  assert.equal(askEvents.length, 1, 'exactly one synthesized awaiting_user_input event');
+  assert.match((askEvents[0].data as { question: string }).question, /Stonemill Bakehouse/);
+  assert.equal((askEvents[0].data as { source?: string }).source, 'decision_awaiting');
+});
+
+test('runConversation: a tool-driven ask (ask_user_question already emitted the event) is NOT double-emitted', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const runRunner: RunRunnerFn = async () => {
+    // ask_user_question tool already emitted the halting event this turn.
+    appendEvent({ sessionId: sess.id, turn: 1, role: 'Clem', type: 'awaiting_user_input', data: { question: 'staging or prod?' } });
+    return { history: [], lastResponseId: undefined, finalOutput: {
+      summary: 'asked', reply: 'Staging or prod?', done: false, nextAction: 'awaiting_user_input', reason: null } };
+  };
+  await runConversation({ agent: makeAgentStub(), sessionId: sess.id, input: 'deploy it', makeRunner: makeRunnerStub, runRunner });
+  const askEvents = listEventsForConv(sess.id, { types: ['awaiting_user_input'] });
+  assert.equal(askEvents.length, 1, 'no double-emit — the tool-emitted event is the only one');
+});
+
 test('objective judge: gates premature completion and continues (action intent)', async () => {
   const sess = HarnessSession.create({ kind: 'chat' });
   const runner = scriptedRunner([

@@ -1932,6 +1932,33 @@ async function runConversationCore(
         nextInput = 'You already auto-resolved that approval question under YOLO standing approval — do NOT wait for the user. Proceed with your best default and keep going until the work is done, then report what you did.';
         continue;
       }
+      // DELIVER the question (review/live fix 2026-06-14). The model can ask a
+      // clarifying question two ways: (a) call the ask_user_question TOOL — which
+      // emits an awaiting_user_input EVENT every surface renders; or (b) just set
+      // done:true + nextAction:awaiting_user_input in its DECISION with the
+      // question in `reply` (no tool call). Path (b) emitted NO awaiting_user_input
+      // event, so event-stream surfaces (Discord, desktop SSE) delivered nothing
+      // and the user was STRANDED staring at a "thinking" state with no question
+      // (observed live: a Discord "finalize the website" turn sat 20min). If no
+      // awaiting_user_input event exists for this turn, synthesize one carrying
+      // the decision's reply so every surface delivers the question.
+      const askedThisTurn = (() => {
+        try {
+          return listEvents(options.sessionId, { types: ['awaiting_user_input'] })
+            .some((e) => e.turn === turnResult.turn);
+        } catch { return false; }
+      })();
+      if (!askedThisTurn) {
+        const question = (decision.reply?.trim() ? decision.reply : decision.summary)
+          ?? 'Could you clarify how you\'d like me to proceed?';
+        safeAppend({
+          sessionId: options.sessionId,
+          turn: turnResult.turn,
+          role: 'Clem',
+          type: 'awaiting_user_input',
+          data: { question, source: 'decision_awaiting' },
+        });
+      }
       // A goal session yielding for input is a check-in/blocker — record it so
       // the ledger reads as a real timeline and the breaker sees the state.
       const goalForAsk = safeActiveGoal(options.sessionId);
@@ -3564,6 +3591,27 @@ async function runConversationFromResumeCore(opts: {
       // approval (autonomy_note, no halting event), fall through to run the next
       // turn instead of stranding. Conservative: only when the note exists.
       if (!yoloAutoResolvedAskThisTurn(opts.sessionId, lastTurn)) {
+        // Deliver the question on the resume path too (see the runConversation
+        // handler): a decision-level awaiting (done:true + awaiting, no
+        // ask_user_question tool) emits no awaiting_user_input event, so surfaces
+        // can't render the question. Synthesize one if none exists this turn.
+        const askedThisTurn = (() => {
+          try {
+            return listEvents(opts.sessionId, { types: ['awaiting_user_input'] })
+              .some((e) => e.turn === lastTurn);
+          } catch { return false; }
+        })();
+        if (!askedThisTurn) {
+          const question = (decision.reply?.trim() ? decision.reply : decision.summary)
+            ?? 'Could you clarify how you\'d like me to proceed?';
+          safeAppend({
+            sessionId: opts.sessionId,
+            turn: lastTurn,
+            role: 'Clem',
+            type: 'awaiting_user_input',
+            data: { question, source: 'decision_awaiting' },
+          });
+        }
         return {
           sessionId: opts.sessionId,
           status: 'awaiting_user_input',
