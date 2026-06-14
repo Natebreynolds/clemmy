@@ -789,8 +789,13 @@ async function runAgentCycle(assistant: ClementineAssistant, agent: TeamAgentRec
       // workflow mutation are out of scope BY DESIGN; until now that was
       // prompt-steered only. Enforce it: no composio execution (the single
       // chokepoint for every external send/write) and no workflow mutation.
+      // Blind-spot audit #8: also exclude the SHELL exec vector — a cycle
+      // could otherwise `run_shell_command("curl -X POST …")` / `sf data
+      // update` its way to an ungated external write, since the exclusion
+      // (not the gates) is autonomy's only enforcement on the legacy loop.
       excludeToolNames: [
         'composio_execute_tool',
+        'run_shell_command',
         'workflow_create',
         'workflow_update',
         'workflow_set_enabled',

@@ -114,6 +114,45 @@ test('MCP send gets grounding + duplicate gates under a `*` scope (the only guar
   }
 });
 
+test('MCP EXEC tool with a network-mutation command gets grounding too (audit #6)', async () => {
+  // kernel exec_command classifies `execute`, not `send`, so the send path
+  // misses it — but `{command:'curl', args:['-X','POST',…body…]}` IS a network
+  // mutation. The arg-shape detector routes it through the same grounding.
+  resetEventLog();
+  grounding._resetGroundingStateForTests();
+  grounding._resetDuplicateStateForTests();
+  const sess = createSession({ kind: 'chat' });
+  writeToolOutput({
+    sessionId: sess.id, callId: 'c_extract', tool: 'mcp__research__lookup',
+    output: 'Eley Law Firm; verified term "workers compensation lawyer Denver"; contact cliff@eleylawfirm.com',
+  });
+  grounding._setGroundingJudgeForTests(async (payload) => payload.includes('Houston')
+    ? { grounded: false, reason: 'Payload claims Houston; artifact says Denver.' }
+    : { grounded: true, reason: 'matches' });
+  const server = makeSendServer('kernel'); // reuse the fake; we override the tool name below
+  (server as any).listTools = async () => [{ name: 'exec_command' }];
+  const shim = createMcpNamespaceShim({ servers: [server], cacheToolsList: false });
+  await shim.listTools();
+  const counter = new ToolCallsCounter(100);
+  const exec = (city: string) =>
+    withHarnessRunContext({ sessionId: sess.id, counter }, () =>
+      shim.callTool('kernel__exec_command', {
+        session_id: 's1',
+        command: 'curl',
+        args: ['-X', 'POST', 'https://api.example.com/send', '-d', `{"to_email":"cliff@eleylawfirm.com","body":"${city} gap"}`],
+      }));
+  try {
+    // exec_command classifies as `execute` → would normally NOT be approval-blocked
+    // in strict either (execute asks)… so set YOLO at file top already covers it.
+    await assert.rejects(() => Promise.resolve(exec('Houston')), /GROUNDING_CHECK_FAILED/);
+    assert.equal((server as any)._calls.length, 0, 'blocked exec never reached the server');
+    await exec('Denver');
+    assert.equal((server as any)._calls.length, 1, 'faithful exec dispatched');
+  } finally {
+    grounding._setGroundingJudgeForTests(null);
+  }
+});
+
 test('MCP READ tool is untouched by the integrity gate (no false gating)', async () => {
   resetEventLog();
   grounding._resetGroundingStateForTests();

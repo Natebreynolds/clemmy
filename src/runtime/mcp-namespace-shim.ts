@@ -16,6 +16,7 @@ import {
   DuplicateExternalWriteError,
 } from './harness/grounding-gate.js';
 import { appendEvent, listEvents } from './harness/eventlog.js';
+import { classifyShellNetworkMutation } from './harness/destination-gate.js';
 
 // Bound MCP startup below the SDK's default (~60s), but leave enough
 // room for `npx`/`uvx` based servers on fresh machines. 5s/8s was too
@@ -35,6 +36,30 @@ const MCP_EAGER_CONNECT_BLOCKING =
 
 type MCPTool = Awaited<ReturnType<MCPServer['listTools']>>[number];
 type CallToolResultContent = Awaited<ReturnType<MCPServer['callTool']>>;
+
+// Audit #6: an MCP EXECUTE/write tool can perform a network mutation through its
+// args — kernel `exec_command({command:'curl', args:['-X','POST',…]})` or
+// `browser_curl({method:'POST', url, body})`. These classify as execute/write,
+// NOT send, so the send-grounding path misses them. Detect the arg shape so they
+// get the same grounding as a send. Reuses the shell network-mutation classifier.
+function detectMcpArgsNetworkMutation(
+  args: Record<string, unknown> | null,
+): { isNetworkMutation: boolean; shapeKey?: string } {
+  if (!args || typeof args !== 'object') return { isNetworkMutation: false };
+  // `command` + `args[]` shape (kernel exec_command and generic command runners).
+  const command = typeof args.command === 'string' ? args.command : '';
+  if (command) {
+    const argv = Array.isArray(args.args) ? (args.args as unknown[]).filter((a): a is string => typeof a === 'string') : [];
+    const m = classifyShellNetworkMutation(`${command} ${argv.join(' ')}`);
+    if (m.isNetworkMutation) return { isNetworkMutation: true, shapeKey: m.shapeKey };
+  }
+  // Structured HTTP-request shape (browser_curl and HTTP-client MCP tools).
+  const method = typeof args.method === 'string' ? args.method.toUpperCase() : '';
+  if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method) && (typeof args.url === 'string' || 'body' in args)) {
+    return { isNetworkMutation: true, shapeKey: 'mcp:http_mutation' };
+  }
+  return { isNetworkMutation: false };
+}
 
 // Append the global fan-out advisory to a native MCP result when the model is
 // looping the same tool serially for N>=3 distinct items in one turn. This is
@@ -656,7 +681,12 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): MCPSer
       // external_write ledger (emitted on success below) is SHARED with the
       // composio path so duplicate detection spans both surfaces.
       const integritySessionId = harnessRunContextStorage.getStore()?.sessionId;
-      if (decision.kind === 'send' && isGroundingGateEnabled() && integritySessionId) {
+      // Gate as a send when the tool is send-kind (audit #1) OR its args describe
+      // a network mutation (audit #6 — kernel exec_command/browser_curl etc.).
+      const argMutation = detectMcpArgsNetworkMutation(args);
+      const gateAsSend = decision.kind === 'send' || argMutation.isNetworkMutation;
+      const integrityShapeKey = decision.kind === 'send' ? toolName : (argMutation.shapeKey ?? toolName);
+      if (gateAsSend && isGroundingGateEnabled() && integritySessionId) {
         try {
           // Duplicate-target speed bump: a same-shape send to a target already
           // written this session bumps ONCE (approval is not idempotency).
@@ -672,10 +702,10 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): MCPSer
                 && (w.targets ?? []).some((t) => failTargets.has(String(t).toLowerCase())));
               if (idx >= 0) priorWrites.splice(idx, 1);
             }
-            const dup = detectDuplicateTarget({ sessionId: integritySessionId, shapeKey: toolName, targets: dupTargets, priorWrites });
+            const dup = detectDuplicateTarget({ sessionId: integritySessionId, shapeKey: integrityShapeKey, targets: dupTargets, priorWrites });
             if (dup.duplicate && dup.warnedKey) {
               markDuplicateWarned(dup.warnedKey);
-              throw new DuplicateExternalWriteError({ toolName, shapeKey: toolName, target: dup.target ?? 'unknown' });
+              throw new DuplicateExternalWriteError({ toolName, shapeKey: integrityShapeKey, target: dup.target ?? 'unknown' });
             }
           }
           // Grounding: verify the outgoing payload against this target's own
@@ -710,7 +740,7 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): MCPSer
         // Record the irreversible send in the SHARED external_write ledger so a
         // later same-shape send (composio OR MCP) to the same target gets the
         // duplicate bump. Best-effort; telemetry must never affect the result.
-        if (decision.kind === 'send' && integritySessionId) {
+        if (gateAsSend && integritySessionId) {
           try {
             appendEvent({
               sessionId: integritySessionId,
@@ -718,7 +748,7 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): MCPSer
               role: 'system',
               type: 'external_write',
               data: {
-                shapeKey: toolName,
+                shapeKey: integrityShapeKey,
                 toolName,
                 irreversible: true,
                 mcp: true,
