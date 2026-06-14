@@ -3,6 +3,7 @@ import { DogMark } from '@/components/DogMark';
 import { Button } from '@/components/ui/Button';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { cn } from '@/lib/cn';
+import { linkify } from '@/lib/linkify';
 import type { ChatMessage } from '@/lib/useChat';
 
 function ThinkingDots() {
@@ -56,7 +57,7 @@ export function ChatBubble({
             </div>
           ) : (
             <p className={cn('whitespace-pre-wrap text-body-lg leading-relaxed', message.status === 'failed' ? 'text-danger' : 'text-fg')}>
-              {message.text}
+              {linkify(message.text)}
               {thinking && message.text && (
                 <span
                   aria-hidden
