@@ -238,6 +238,13 @@ const NAME_PATTERNS: Array<{ kind: ToolKind; verbs: string[] }> = [
     verbs: [
       'admin', 'install', 'uninstall', 'migrate',
       'repair_keychain', 'reset_credentials',
+      // Credential / secret / auth-connection management (e.g. native MCP
+      // `manage_credentials`, `manage_api_keys`, `manage_auth_connections`).
+      // Writing secrets is account-level and must ALWAYS ask, even in YOLO /
+      // under a plan-scope — the in-process `credentials_*` tools are already
+      // in ALWAYS_ADMIN; this extends the same floor to MCP-hosted ones.
+      // (Over-gating a credential LIST to "ask" is acceptably conservative.)
+      'credentials', 'api_keys', 'apikeys', 'auth_connections', 'secret', 'secrets',
     ],
   },
   {
@@ -249,6 +256,13 @@ const NAME_PATTERNS: Array<{ kind: ToolKind; verbs: string[] }> = [
       'send', 'post', 'publish', 'deliver', 'dispatch', 'notify',
       'dm', 'email', 'sms', 'reply', 'forward', 'invite', 'upload',
       'webhook', 'announce', 'broadcast',
+      // Telephony: placing a real phone call is an irreversible external
+      // action. These were falling through to `write` (vapi `create_call`,
+      // ElevenLabs `make_outbound_call`), which defeated the goal-scope
+      // send-lock and let YOLO/scope auto-approve a phone call. Specific
+      // compounds (not bare `call`) so reads like `get_call`/`list_calls`
+      // are untouched.
+      'dial', 'outbound_call', 'create_call', 'place_call', 'start_call',
     ],
   },
   {

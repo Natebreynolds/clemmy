@@ -371,10 +371,35 @@ function standingGrantsEnabled(): boolean {
 }
 
 /**
+ * Arbitrary-capability MULTIPLEXER tools: a single tool name that can reach
+ * any external capability (run any shell command, any composio slug, any CLI,
+ * any code). Granting one of these is granting standing auto-approval to
+ * EVERYTHING it can reach — including sends/destructive ops the grant refusal
+ * is meant to block. They classify as `execute` (not send/admin) so the kind
+ * refusal alone lets them through; refuse them by name/shape too. (Verified:
+ * `classifyTool('run_shell_command')` and `'composio_execute_tool'` both return
+ * `execute`, so a standing grant for either was being accepted.)
+ */
+const UNGRANTABLE_MULTIPLEXERS = new Set<string>([
+  'run_shell_command',
+  'composio_execute_tool',
+  'local_cli_run',
+  'local_cli_exec',
+]);
+function isUngrantableMultiplexer(name: string): boolean {
+  if (UNGRANTABLE_MULTIPLEXERS.has(name)) return true;
+  // Arbitrary code/command execution hosted via MCP (kernel exec_command,
+  // playwright run_code_unsafe / execute_playwright_code, ide executeCode).
+  return /(^|_)(exec_command|run_code_unsafe|execute_playwright_code|executecode|eval)(_|$)/i.test(
+    name.toLowerCase(),
+  );
+}
+
+/**
  * Grant a durable auto-approval for a tool. Refuses send/admin kinds (the
- * caller classifies and passes `kind`) — those must always be a deliberate,
- * in-the-moment decision (side-effect law). Returns the grant, or null if
- * refused. Re-granting clears any prior revocation.
+ * caller classifies and passes `kind`) AND arbitrary-capability multiplexers —
+ * those must always be a deliberate, in-the-moment decision (side-effect law).
+ * Returns the grant, or null if refused. Re-granting clears any prior revocation.
  */
 export function grantStandingApproval(
   toolName: string,
@@ -383,6 +408,7 @@ export function grantStandingApproval(
   const name = toolName.trim();
   if (!name) return null;
   if (opts.kind === 'send' || opts.kind === 'admin') return null; // never grantable
+  if (isUngrantableMultiplexer(name)) return null; // granting the multiplexer grants all it can reach
   const file = readAll();
   file.grants = file.grants ?? {};
   const grant: StandingGrant = { toolName: name, grantedAt: new Date().toISOString(), note: opts.note?.trim() || undefined };

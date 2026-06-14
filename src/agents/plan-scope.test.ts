@@ -344,17 +344,17 @@ test('a TIME-boxed scope keeps its prior send behavior (send lock is goal-scoped
 // ─── B2: standing grants ─────────────────────────────────────────────────────
 
 test('a standing grant auto-approves a write tool with no session scope, and revoke ends it', () => {
-  assert.equal(isAutoApprovedByScope(undefined, 'run_shell_command'), false, 'no grant yet');
-  const grant = grantStandingApproval('run_shell_command', { kind: 'execute', note: 'trusted' });
+  assert.equal(isAutoApprovedByScope(undefined, 'write_file'), false, 'no grant yet');
+  const grant = grantStandingApproval('write_file', { kind: 'write', note: 'trusted' });
   assert.ok(grant);
-  assert.equal(isStandingGranted('run_shell_command'), true);
+  assert.equal(isStandingGranted('write_file'), true);
   // Session-independent: auto-approves even with no plan scope on the session.
-  assert.equal(isAutoApprovedByScope('sess-none', 'run_shell_command'), true);
+  assert.equal(isAutoApprovedByScope('sess-none', 'write_file'), true);
   assert.equal(listStandingGrants().length, 1);
 
-  assert.equal(revokeStandingApproval('run_shell_command'), true);
-  assert.equal(isStandingGranted('run_shell_command'), false);
-  assert.equal(isAutoApprovedByScope('sess-none', 'run_shell_command'), false, 'revoked grant no longer auto-approves');
+  assert.equal(revokeStandingApproval('write_file'), true);
+  assert.equal(isStandingGranted('write_file'), false);
+  assert.equal(isAutoApprovedByScope('sess-none', 'write_file'), false, 'revoked grant no longer auto-approves');
   assert.equal(listStandingGrants().length, 0);
 });
 
@@ -365,15 +365,33 @@ test('send and admin kinds can NEVER be granted (side-effect law at write time)'
   // Even if a send tool were somehow granted, the kindHint guard blocks it.
   grantStandingApproval('write_file', { kind: 'write' });
   assert.equal(isAutoApprovedByScope('s', 'write_file', undefined, 'send'), false, 'a send call never rides a grant');
+  revokeStandingApproval('write_file');
+});
+
+test('arbitrary-capability MULTIPLEXERS can NEVER be granted (granting them grants all they reach)', () => {
+  // These classify as `execute`/`write` (not send/admin) so the kind refusal
+  // alone let them through — granting `run_shell_command` once would standing-
+  // auto-approve EVERY shell command (curl POST, sendmail, rm) forever.
+  for (const tool of [
+    'run_shell_command', 'composio_execute_tool', 'local_cli_run',
+    'mcp__kernel__exec_command', 'mcp__plugin_playwright_playwright__browser_run_code_unsafe',
+  ]) {
+    assert.equal(grantStandingApproval(tool, { kind: 'execute' }), null, `${tool} must be refused`);
+    assert.equal(isStandingGranted(tool), false, `${tool} not granted`);
+  }
+  // A specific, non-multiplexer write tool is STILL grantable (the legit case).
+  assert.ok(grantStandingApproval('write_file', { kind: 'write' }), 'write_file still grantable');
+  revokeStandingApproval('write_file');
 });
 
 test('CLEMMY_STANDING_GRANTS=off makes grants inert', () => {
-  grantStandingApproval('run_shell_command', { kind: 'execute' });
+  grantStandingApproval('write_file', { kind: 'write' });
   process.env.CLEMMY_STANDING_GRANTS = 'off';
   try {
-    assert.equal(isStandingGranted('run_shell_command'), false);
-    assert.equal(isAutoApprovedByScope('s', 'run_shell_command'), false);
+    assert.equal(isStandingGranted('write_file'), false);
+    assert.equal(isAutoApprovedByScope('s', 'write_file'), false);
   } finally {
     delete process.env.CLEMMY_STANDING_GRANTS;
+    revokeStandingApproval('write_file');
   }
 });

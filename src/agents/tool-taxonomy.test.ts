@@ -105,6 +105,26 @@ test('classifyTool: execute names', () => {
   assert.equal(classifyTool('run_workflow'), 'execute');
 });
 
+test('classifyTool: outbound phone calls are SEND, not write (irreversible external action)', () => {
+  // Regression: vapi `create_call` / ElevenLabs `make_outbound_call` were
+  // classified `write` → defeated the goal-scope send-lock + auto-approved a
+  // real phone call under YOLO/scope. They must be `send`.
+  assert.equal(classifyTool('mcp__vapi__create_call'), 'send');
+  assert.equal(classifyTool('mcp__ElevenLabs__make_outbound_call'), 'send');
+  // No false positives: reading call data stays `read`.
+  assert.equal(classifyTool('mcp__vapi__list_calls'), 'read');
+  assert.equal(classifyTool('mcp__vapi__get_call'), 'read');
+});
+
+test('classifyTool: credential/secret/auth management is ADMIN (always asks)', () => {
+  // Regression: MCP-hosted credential tools (n8n / kernel) were `write` → YOLO/
+  // scope auto-approved a secret write. The in-process credentials_* tools are
+  // ALWAYS_ADMIN; extend the same floor to MCP-hosted ones.
+  assert.equal(classifyTool('mcp__n8n__n8n_manage_credentials'), 'admin');
+  assert.equal(classifyTool('mcp__kernel__manage_api_keys'), 'admin');
+  assert.equal(classifyTool('mcp__kernel__manage_auth_connections'), 'admin');
+});
+
 test('classifyTool: send (network mutation) prefixes', () => {
   assert.equal(classifyTool('send_message'), 'send');
   assert.equal(classifyTool('post_status'), 'send');
