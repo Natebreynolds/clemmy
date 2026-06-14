@@ -94,6 +94,10 @@ export interface ShellWriteShape {
   binary: string | undefined;
   /** Whether the command names an explicit destination. */
   hasExplicitDestination: boolean;
+  /** A PRODUCTION publish (`--prod`/`--production`) — the irreversible,
+   *  high-stakes flavor that warrants a HARD block (not a one-shot nudge)
+   *  when the destination is ambient. */
+  isProd: boolean;
 }
 
 /** Tokenize a command segment on whitespace, stripping surrounding quotes. */
@@ -124,7 +128,7 @@ function tokenize(segment: string): string[] {
  */
 export function classifyShellCommand(command: string): ShellWriteShape {
   if (!command || typeof command !== 'string') {
-    return { isPublish: false, verb: undefined, binary: undefined, hasExplicitDestination: false };
+    return { isPublish: false, verb: undefined, binary: undefined, hasExplicitDestination: false, isProd: false };
   }
   // Strip quoted regions so verbs inside messages/strings don't match.
   const unquoted = command.replace(/"[^"]*"/g, ' ').replace(/'[^']*'/g, ' ');
@@ -132,6 +136,7 @@ export function classifyShellCommand(command: string): ShellWriteShape {
 
   let verb: string | undefined;
   let binary: string | undefined;
+  let isProd = false;
   for (const segment of segments) {
     const tokens = tokenize(segment);
     if (tokens.length === 0) continue;
@@ -150,14 +155,15 @@ export function classifyShellCommand(command: string): ShellWriteShape {
     if (verbInSegment || prodFlag) {
       verb = verbInSegment ?? prodFlag!.toLowerCase();
       binary = segBinary;
+      isProd = !!prodFlag;
       break;
     }
   }
   if (!verb) {
-    return { isPublish: false, verb: undefined, binary: undefined, hasExplicitDestination: false };
+    return { isPublish: false, verb: undefined, binary: undefined, hasExplicitDestination: false, isProd: false };
   }
   const hasExplicitDestination = EXPLICIT_DEST_FLAG_RE.test(command) || EXPLICIT_DEST_URI_RE.test(command);
-  return { isPublish: true, verb, binary, hasExplicitDestination };
+  return { isPublish: true, verb, binary, hasExplicitDestination, isProd };
 }
 
 export interface DestinationGateResult {
@@ -167,6 +173,11 @@ export interface DestinationGateResult {
   verb?: string;
   /** Stable per-(binary,verb) key for the one-shot ledger. */
   shapeKey?: string;
+  /** HARD block (every attempt, not one-shot): a PRODUCTION (`--prod`) publish
+   *  to an ambient target — irreversible-write-without-confirmed-target, the
+   *  case that must not be clobberable by simply retrying the same command.
+   *  Non-prod ambient publishes stay a one-shot nudge. */
+  hardBlock?: boolean;
 }
 
 /**
@@ -184,9 +195,10 @@ export function evaluateShellDestination(command: string): DestinationGateResult
   }
   return {
     action: 'flag',
-    reason: `irreversible publish (${shape.verb}) with no explicit destination — target is ambient (read from the current directory/account link)`,
+    reason: `irreversible ${shape.isProd ? 'PRODUCTION ' : ''}publish (${shape.verb}) with no explicit destination — target is ambient (read from the current directory/account link)`,
     verb: shape.verb,
     shapeKey: `${shape.binary ?? 'shell'}:${shape.verb}`,
+    hardBlock: shape.isProd,
   };
 }
 
@@ -314,24 +326,32 @@ export function markDestinationNudged(sessionId: string, shapeKey: string): void
 }
 
 /**
- * Thrown for an ambient-target irreversible publish on its FIRST
- * occurrence. Surfaced to the model as a SOFT tool error (same path as
- * GroundingCheckFailedError) so it recovers — make the target explicit or
- * confirm the current link — instead of the run aborting. One-shot: the
- * gate marks the shape nudged, so a conscious retry goes through.
+ * Thrown for an ambient-target irreversible publish. A non-prod (draft)
+ * publish is a SOFT one-shot nudge — the gate marks the shape nudged so a
+ * conscious retry goes through. A PRODUCTION (`--prod`) publish is a HARD
+ * block that repeats on every attempt until the command carries an EXPLICIT
+ * destination — retrying the same ambient command can NEVER clobber the
+ * linked site (the 2026-06-14 Test-5 finding: an ambient `--prod` retry
+ * deployed onto a stale-linked site before the model self-corrected).
+ * Surfaced to the model as a SOFT tool error (same path as
+ * GroundingCheckFailedError) so it recovers instead of aborting the run.
  */
 export class ImplicitDestinationError extends Error {
   public readonly verb: string;
   public readonly shapeKey: string;
-  constructor(opts: { command: string; verb: string; shapeKey: string }) {
+  public readonly hardBlock: boolean;
+  constructor(opts: { command: string; verb: string; shapeKey: string; hardBlock?: boolean }) {
     const binary = opts.shapeKey.split(':')[0];
+    const hard = !!opts.hardBlock;
     super(
       `IMPLICIT_DESTINATION: this \`${opts.verb}\` command names no explicit destination, so it will publish to whatever site/account/registry THIS directory is currently linked to — which may be an UNRELATED live target (a stale \`.netlify\`/remote/profile link clobbers the wrong place silently). ` +
-        `Before re-issuing: either (a) make the target EXPLICIT in the command (e.g. \`${binary} … --site <id>\`/\`--project\`/\`--account\`/an explicit remote), or (b) confirm the current link is the intended one (e.g. \`${binary} status\` / \`git remote -v\`) and that it matches THIS task's target — if you were asked for a NEW target, create/select it first. ` +
-        `Then retry: a conscious second attempt of the same command will pass.`,
+        (hard
+          ? `This is a PRODUCTION publish, so it is REFUSED until the target is explicit — retrying the SAME command will keep being refused (it could clobber the linked site). You MUST add an explicit destination: run \`${binary} status\` (or \`git remote -v\`) to read the currently-linked target, decide if it is the one THIS task wants, then re-issue WITH \`--site <id>\` (or \`--project\`/\`--account\`/explicit remote). If you were asked for a NEW target, create it first (e.g. \`${binary} sites:create\`) and deploy with its explicit id.`
+          : `Before re-issuing: either (a) make the target EXPLICIT in the command (e.g. \`${binary} … --site <id>\`/\`--project\`/\`--account\`/an explicit remote), or (b) confirm the current link is the intended one (e.g. \`${binary} status\` / \`git remote -v\`) and that it matches THIS task's target — if you were asked for a NEW target, create/select it first. Then retry: a conscious second attempt of the same command will pass.`),
     );
     this.name = 'ImplicitDestinationError';
     this.verb = opts.verb;
     this.shapeKey = opts.shapeKey;
+    this.hardBlock = hard;
   }
 }

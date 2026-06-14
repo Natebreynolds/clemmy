@@ -856,18 +856,22 @@ export function wrapToolForHarness<T extends WrappableTool>(
           : '';
         if (command) {
           const verdict = evaluateShellDestination(command);
-          if (verdict.action === 'flag' && verdict.shapeKey && !wasDestinationNudged(ctx.sessionId, verdict.shapeKey)) {
-            markDestinationNudged(ctx.sessionId, verdict.shapeKey);
+          // PRODUCTION ambient publish → HARD block on EVERY attempt (retrying
+          // the same ambient command must never clobber the linked site — the
+          // 2026-06-14 Test-5 finding). Non-prod ambient publish → one-shot nudge.
+          if (verdict.action === 'flag' && verdict.shapeKey
+            && (verdict.hardBlock || !wasDestinationNudged(ctx.sessionId, verdict.shapeKey))) {
+            if (!verdict.hardBlock) markDestinationNudged(ctx.sessionId, verdict.shapeKey);
             try {
               appendEvent({
                 sessionId: ctx.sessionId,
                 turn: 0,
                 role: 'system',
                 type: 'guardrail_tripped',
-                data: { kind: 'implicit_destination', toolName: tool.name, verb: verdict.verb ?? null, shapeKey: verdict.shapeKey },
+                data: { kind: 'implicit_destination', toolName: tool.name, verb: verdict.verb ?? null, shapeKey: verdict.shapeKey, hardBlock: !!verdict.hardBlock },
               });
             } catch { /* telemetry write must never block */ }
-            throw new ImplicitDestinationError({ command, verb: verdict.verb ?? 'publish', shapeKey: verdict.shapeKey });
+            throw new ImplicitDestinationError({ command, verb: verdict.verb ?? 'publish', shapeKey: verdict.shapeKey, hardBlock: verdict.hardBlock });
           }
         }
       }

@@ -21,11 +21,25 @@ import {
   _resetDestinationStateForTests,
 } from './destination-gate.js';
 
-test('the INCIDENT command flags: netlify deploy --prod (no explicit site)', () => {
+test('the INCIDENT command flags + HARD-blocks: netlify deploy --prod (no explicit site)', () => {
   const r = evaluateShellDestination('netlify deploy --dir "/x/site" --prod --json --message "Deploy"');
   assert.equal(r.action, 'flag');
   assert.equal(r.verb, 'deploy');
   assert.equal(r.shapeKey, 'netlify:deploy');
+  assert.equal(r.hardBlock, true, 'a --prod ambient publish is a HARD block (every attempt, not one-shot)');
+});
+
+test('hardBlock distinguishes PROD from non-prod ambient publishes (Test-5 fix)', () => {
+  // PROD ambient → hard block (a retry must not clobber the linked site).
+  assert.equal(evaluateShellDestination('netlify deploy --prod').hardBlock, true);
+  assert.equal(evaluateShellDestination('vercel --production').hardBlock, true);
+  // A non-prod (draft) ambient publish → soft one-shot nudge.
+  const draft = evaluateShellDestination('netlify deploy --dir ./site');
+  assert.equal(draft.action, 'flag');
+  assert.notEqual(draft.hardBlock, true, 'a draft ambient publish stays a one-shot nudge');
+  // --create-site is NOT treated as an explicit destination (netlify ignores it
+  // when the cwd is already linked — exactly what clobbered aldous in Test 5).
+  assert.equal(evaluateShellDestination('netlify deploy --prod --create-site meridian').hardBlock, true);
 });
 
 test('an EXPLICIT --site makes it allow (the recovery the model eventually did)', () => {
