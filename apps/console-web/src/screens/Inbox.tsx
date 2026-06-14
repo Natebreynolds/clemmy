@@ -9,6 +9,7 @@ import { EmptyState } from '@/components/ui/EmptyState';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { usePoll } from '@/lib/poll';
 import { cn } from '@/lib/cn';
+import { linkify } from '@/lib/linkify';
 import {
   listApprovals, decideApproval, cancelStaleApprovals,
   listRuns, listNotifications, markNotificationRead, retryNotification,
@@ -228,8 +229,8 @@ function RunDetail({ row }: { row: RunRow }) {
         <span className="text-caption text-faint">{relativeTime(row.updatedAt || row.createdAt)}</span>
       </div>
       <h3 className="mb-3 text-h3 text-fg">{row.title || 'Run'}</h3>
-      {row.input && <Field label="Asked"><span className="whitespace-pre-wrap">{row.input}</span></Field>}
-      {row.outputPreview && <Field label="Result"><span className="whitespace-pre-wrap">{row.outputPreview}</span></Field>}
+      {row.input && <Field label="Asked"><span className="whitespace-pre-wrap">{linkify(row.input)}</span></Field>}
+      {row.outputPreview && <Field label="Result"><span className="whitespace-pre-wrap">{linkify(row.outputPreview)}</span></Field>}
       {row.error && <Field label="Error"><span className="text-danger">{row.error}</span></Field>}
       {row.kind && <Field label="Kind">{row.kind}</Field>}
     </div>
@@ -242,7 +243,7 @@ function NotifDetail({ row, onRead, onRetry }: { row: NotificationRow; onRead: (
     <div>
       <h3 className="mb-3 text-h3 text-fg">{row.title || 'Notification'}</h3>
       <Field label="When">{relativeTime(row.createdAt) || '—'}</Field>
-      <Field label="Message"><span className="whitespace-pre-wrap">{row.body || '—'}</span></Field>
+      <Field label="Message"><span className="whitespace-pre-wrap">{row.body ? linkify(row.body) : '—'}</span></Field>
       {row.deliveryError && <Field label="Delivery error"><span className="text-danger">{row.deliveryError}</span></Field>}
       <div className="mt-4 flex gap-2">
         {!row.read && <Button variant="secondary" size="sm" onClick={onRead}>Mark as read</Button>}

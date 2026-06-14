@@ -15,6 +15,7 @@ import { statusTone, relativeTime } from '@/lib/inbox';
 import { clemmy, isDesktop } from '@/lib/clemmy';
 import { getRecallStatus, patchRecallSettings, listMeetings, getMeeting, getMeetingChatPrompt, type MeetingSummary, type RecallSettings } from '@/lib/meetings';
 import { cn } from '@/lib/cn';
+import { linkify } from '@/lib/linkify';
 
 const DEFAULT_REGIONS: Record<string, string> = { 'us-west-2': 'US West', 'us-east-1': 'US East', 'eu-central-1': 'EU Central', 'ap-northeast-1': 'Asia Pacific' };
 const PERMS: { key: string; label: string }[] = [
@@ -254,7 +255,7 @@ function MeetingDetailView({ data }: { data?: import('@/lib/meetings').MeetingDe
         {r.startedAt ? <span>· {relativeTime(asText(r.startedAt))}</span> : null}
       </div>
       <h3 className="mb-3 text-h2 text-fg">{asText(a.title) || 'Meeting'}</h3>
-      {summary && <p className="mb-4 whitespace-pre-wrap text-body text-fg">{summary}</p>}
+      {summary && <p className="mb-4 whitespace-pre-wrap text-body text-fg">{linkify(summary)}</p>}
 
       {actionItems.length > 0 && (
         <Section icon={ListChecks} title="Action items">
