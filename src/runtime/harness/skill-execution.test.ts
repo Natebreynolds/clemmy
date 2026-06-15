@@ -73,6 +73,15 @@ test('skillExecutionShortfall: require()-ing the renderer clears the gate (libra
   assert.equal(skillExecutionShortfall(sess.id), null, 'require-ing + using the renderer counts as executed');
 });
 
+test('skillExecutionShortfall: require(path.join(base,"src/generate-html.js")) clears the gate (no false-positive)', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  loadScriptSkill(sess.id, 'c1', 'lunar-audit', ['aggregate.js', 'generate-html.js', 'validate-html.js']);
+  // The real lunar-audit form: build the path with path.join, not a string literal.
+  shellRun(sess.id, "node - <<'NODE'\nconst path=require('path'); const base='/x/skills/lunar';\nconst generateHtml=require(path.join(base,'src/generate-html.js'));\nrequire('fs').writeFileSync('o.html', generateHtml(d).html);\nNODE");
+  assert.equal(skillExecutionShortfall(sess.id), null, 'path.join-constructed require of the renderer must NOT false-bounce');
+});
+
 test('skillExecutionShortfall: a pure-reference skill (no bundled scripts) is never gated', () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });

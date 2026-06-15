@@ -125,16 +125,27 @@ function rendererScripts(prescribed: string[]): string[] {
 }
 
 /** Script basenames a command REQUIREs / IMPORTs — library-style skills are USED
- *  via `require('./src/generate-html')`, not `node generate-html.js`. Normalized
- *  to a `.js` basename to match extractPrescribedScripts. */
+ *  via `require('./src/generate-html')` OR `require(path.join(base,'src/generate-
+ *  html.js'))`, not `node generate-html.js`. Two passes so BOTH forms count:
+ *  (a) any quoted path that ENDS in a script extension — catches the path.join /
+ *      string-literal forms (the false-positive that hard-failed a real run); and
+ *  (b) extension-less `require('./src/x')` / `import … 'x'` — normalized to `.js`.
+ *  Matching script-file literals (not every quoted string) keeps 'undefined'/'NaN'
+ *  out. Normalized to a `.js` basename to match extractPrescribedScripts. */
 function extractRequiredScripts(command: string): string[] {
   if (!command || typeof command !== 'string') return [];
   const out = new Set<string>();
-  for (const m of command.matchAll(/(?:require\(\s*|from\s+|import\s+)['"`](?:[\w.@/-]+\/)?([\w.-]+?)(?:\.(?:m?[jt]s|cjs))?['"`]/gi)) {
-    const base = m[1].toLowerCase();
-    if (base) out.add(base.endsWith('.js') ? base : `${base}.js`);
+  // (a) ANY quoted path ending in a script extension — `'src/generate-html.js'`,
+  //     `'./src/x.js'`, including inside path.join(...).
+  for (const m of command.matchAll(/['"`](?:[\w.@/-]*\/)?([\w.-]+\.(?:m?[jt]s|cjs|py|sh|rb))['"`]/gi)) {
+    out.add(m[1].toLowerCase());
   }
-  return [...out].slice(0, 24);
+  // (b) extension-less require/import of a path segment → normalize to `.js`.
+  for (const m of command.matchAll(/(?:require\(\s*|from\s+|import\s+)['"`](?:[\w.@/-]+\/)?([\w.-]+?)['"`]/gi)) {
+    const base = m[1].toLowerCase();
+    if (base && !/\.[a-z0-9]+$/i.test(base)) out.add(`${base}.js`);
+  }
+  return [...out].slice(0, 32);
 }
 
 /** Script basenames actually INVOKED this session — run as `node x.js` OR pulled
