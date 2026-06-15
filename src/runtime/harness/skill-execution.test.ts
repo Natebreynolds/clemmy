@@ -17,7 +17,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 const { resetEventLog, createSession, appendEvent, writeToolOutput } = await import('./eventlog.js');
-const { gatherSessionSkills, sessionReadAnySkill, summarizeToolCallsForJudge } = await import('./skill-execution.js');
+const { gatherSessionSkills, sessionReadAnySkill, summarizeToolCallsForJudge, extractInvokedScripts } = await import('./skill-execution.js');
 
 function skillRead(sessionId: string, callId: string, name: string): void {
   appendEvent({ sessionId, turn: 0, role: 'agent', type: 'tool_called', data: { tool: 'skill_read', callId, arguments: JSON.stringify({ name }) } });
@@ -83,6 +83,30 @@ test('summarizeToolCallsForJudge surfaces composio slugs + counts (so the judge 
   const sum = summarizeToolCallsForJudge(s.id);
   assert.match(sum, /run_shell_command×1/);
   assert.match(sum, /composio:AIRTABLE_LIST_RECORDS×1/);
+});
+
+// 2026-06-15: make a skill's prescribed scripts VISIBLE to the judge, so "the
+// skill says run generate-html.js and it never ran" becomes checkable. General
+// to any script-backed skill (.js/.py/.sh, npm run …), not HTML-specific.
+test('extractInvokedScripts pulls executed script basenames across interpreters', () => {
+  assert.deepEqual(extractInvokedScripts('node src/generate-html.js --out index.html'), ['generate-html.js']);
+  assert.deepEqual(extractInvokedScripts('cd /x && python3 scripts/ingest.py'), ['ingest.py']);
+  assert.deepEqual(extractInvokedScripts('./build.sh && node validate-html.js'), ['build.sh', 'validate-html.js']);
+  assert.deepEqual(extractInvokedScripts('npm run audit'), ['npm:audit']);
+  assert.deepEqual(extractInvokedScripts('ls -la && cat foo.txt'), []);   // nothing executed
+  assert.deepEqual(extractInvokedScripts('echo "node fake.js"'), []);     // a quoted echo is not a run — correctly ignored
+});
+
+test('summarizeToolCallsForJudge names the script a shell call ran (so the judge sees generate-html.js fired or did NOT)', () => {
+  resetEventLog();
+  const s = createSession({ kind: 'chat' });
+  appendEvent({ sessionId: s.id, turn: 0, role: 'agent', type: 'tool_called', data: { tool: 'run_shell_command', callId: 'g1', arguments: JSON.stringify({ command: 'node src/generate-html.js' }) } });
+  appendEvent({ sessionId: s.id, turn: 0, role: 'agent', type: 'tool_called', data: { tool: 'run_shell_command', callId: 'v1', arguments: JSON.stringify({ command: 'node src/validate-html.js index.html' }) } });
+  appendEvent({ sessionId: s.id, turn: 0, role: 'agent', type: 'tool_called', data: { tool: 'run_shell_command', callId: 'x1', arguments: JSON.stringify({ command: 'ls -la' }) } });
+  const sum = summarizeToolCallsForJudge(s.id);
+  assert.match(sum, /run_shell_command\(generate-html\.js\)×1/);
+  assert.match(sum, /run_shell_command\(validate-html\.js\)×1/);
+  assert.match(sum, /run_shell_command×1/);   // the bare `ls` keeps the generic key
 });
 
 test('all helpers FAIL-OPEN on an unknown/bad session', () => {

@@ -80,9 +80,30 @@ export function gatherSessionSkills(sessionId: string): SessionSkill[] {
   }
 }
 
-/** Compact tool-call evidence (tool/slug → count) so the judge can see what was
- *  actually done — e.g. that no image-generation tool fired against a skill that
- *  prescribes generating imagery. Fail-open → ''. */
+/** The basenames of scripts/commands a shell command actually INVOKES
+ *  (`node x.js`, `python y.py`, `./z.sh`, `npm run build`). Surfacing these lets
+ *  the skill-execution judge tell `generate-html.js` from `ls` — so a skill that
+ *  prescribes running a bundled script can be checked against whether it ran.
+ *  Heuristic, bounded, fail-open. General to any script-backed skill. */
+export function extractInvokedScripts(command: string): string[] {
+  if (!command || typeof command !== 'string') return [];
+  const out = new Set<string>();
+  // A script file passed to an interpreter, or executed directly (`./x.sh`).
+  for (const m of command.matchAll(/(?:(?:^|[\s|&;(])(?:node|nodejs|python3?|py|bash|sh|zsh|ruby|deno|bun|tsx|ts-node|php|perl)\s+(?:[\w.-]+\/)*|\.\/(?:[\w.-]+\/)*)([\w.-]+\.(?:m?[jt]s|cjs|py|sh|rb|php|pl))\b/gi)) {
+    const base = m[1].split('/').pop();
+    if (base) out.add(base.toLowerCase());
+  }
+  // `npm|pnpm|yarn run <script>` — the script name is the meaningful token.
+  for (const m of command.matchAll(/\b(?:npm|pnpm|yarn)\s+run\s+([\w:.-]+)\b/gi)) {
+    out.add(`npm:${m[1].toLowerCase()}`);
+  }
+  return [...out].slice(0, 8);
+}
+
+/** Compact tool-call evidence (tool/slug/script → count) so the judge can see what
+ *  was actually done — e.g. that no image-generation tool fired against a skill
+ *  that prescribes generating imagery, or that a skill's mandatory bundled script
+ *  (e.g. `generate-html.js`) never ran. Fail-open → ''. */
 export function summarizeToolCallsForJudge(sessionId: string): string {
   try {
     const counts = new Map<string, number>();
@@ -93,6 +114,18 @@ export function summarizeToolCallsForJudge(sessionId: string): string {
         try {
           const slug = (JSON.parse(String(e.data?.arguments ?? '{}')) as { tool_slug?: unknown }).tool_slug;
           if (typeof slug === 'string' && slug) key = `composio:${slug}`;
+        } catch {
+          /* keep generic key */
+        }
+      } else if (tool === 'run_shell_command') {
+        // Surface the script(s) the shell call actually invoked, so the judge can
+        // verify a skill's prescribed scripts RAN (not just "a shell command ran
+        // N times"). 2026-06-15: the lunar-audit's mandatory generate-html.js
+        // never ran in ANY session and the judge was blind to it.
+        try {
+          const cmd = String((JSON.parse(String(e.data?.arguments ?? '{}')) as { command?: unknown }).command ?? '');
+          const scripts = extractInvokedScripts(cmd);
+          if (scripts.length) key = `run_shell_command(${scripts.join(',')})`;
         } catch {
           /* keep generic key */
         }
