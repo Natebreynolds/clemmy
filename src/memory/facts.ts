@@ -978,24 +978,41 @@ export function setFactPinned(id: number, pinned: boolean): boolean {
  *  a runaway pin count can't blow the prompt budget. */
 export function listPinnedFacts(limit = 12): ConsolidatedFact[] {
   const db = openMemoryDb();
+  // Importance-first (recency breaks ties): a pinned rule is a durable "always
+  // apply" instruction, so when more than the budget cap are pinned the LEAST
+  // important should drop — not the OLDEST. Pure recency silently aged out a
+  // high-importance old safety pin in favour of a trivial recent one.
   const rows = db.prepare(`
     SELECT * FROM consolidated_facts
     WHERE active = 1 AND pinned = 1
-    ORDER BY updated_at DESC
+    ORDER BY COALESCE(importance, 5) DESC, updated_at DESC
     LIMIT ?
   `).all(Math.max(1, limit)) as ConsolidatedFactRow[];
   return rows.map(rowToFact);
 }
 
-/** List all active constraint facts. Constraints are hard rules that guard tool dispatch. */
-export function listConstraints(limit = 20): ConsolidatedFact[] {
+/**
+ * List active constraint facts. Constraints are hard rules that guard tool
+ * dispatch, so ENFORCEMENT must see ALL of them — a recency LIMIT silently
+ * stopped enforcing an old-but-critical safety rule once a user accumulated
+ * more than the cap (e.g. >20 standing rules → the oldest mailbox/org rule
+ * fell out and stopped gating dispatch). `limit` undefined ⇒ unbounded (the
+ * enforcement callers in constraint-guard.ts pass nothing). A caller that
+ * only DISPLAYS a subset (harness-context) passes an explicit cap; that
+ * subset is ranked by importance first so the most critical rules show.
+ */
+export function listConstraints(limit?: number): ConsolidatedFact[] {
   const db = openMemoryDb();
-  const rows = db.prepare(`
-    SELECT * FROM consolidated_facts
+  // Importance-first ordering so an explicit display cap keeps the most
+  // critical rules; recency breaks ties. Enforcement (no limit) gets all rows,
+  // so order is immaterial there — but consistent ordering keeps findEmail/
+  // toolkit "first match wins" deterministic (highest-importance rule wins).
+  const base = `SELECT * FROM consolidated_facts
     WHERE active = 1 AND kind = 'constraint'
-    ORDER BY updated_at DESC
-    LIMIT ?
-  `).all(Math.max(1, limit)) as ConsolidatedFactRow[];
+    ORDER BY COALESCE(importance, 5) DESC, updated_at DESC`;
+  const rows = (typeof limit === 'number'
+    ? db.prepare(`${base} LIMIT ?`).all(Math.max(1, limit))
+    : db.prepare(base).all()) as ConsolidatedFactRow[];
   return rows.map(rowToFact);
 }
 

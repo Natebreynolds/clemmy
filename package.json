@@ -38,6 +38,7 @@
     "typecheck": "tsc --noEmit",
     "test": "tsx --test 'src/**/*.test.ts'",
     "bench:gates": "tsx scripts/harness-gate-benchmark.ts",
+    "stress:memory": "tsx scripts/memory-roundtrip-stress.ts",
     "test:smoke": "node scripts/smoke-fresh-install.mjs && node scripts/smoke-fresh-install-e2e.mjs",
     "test:smoke:gate": "node scripts/smoke-fresh-install.mjs",
     "smoke:codex-native-compaction": "node scripts/smoke-codex-native-compaction.mjs",

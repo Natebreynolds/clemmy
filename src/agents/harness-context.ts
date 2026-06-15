@@ -153,13 +153,22 @@ export function renderFocusForInstructions(): string {
   return focus;
 }
 
+const CONSTRAINTS_SHOWN = 20;
 function renderActiveConstraints(): string {
   try {
-    const constraints = listConstraints(20);
-    if (constraints.length === 0) return '';
-    return constraints
-      .map((c) => `- ${c.content}`)
-      .join('\n');
+    // listConstraints() (no arg) returns ALL active constraints — the same set
+    // the dispatch gate enforces. We DISPLAY the most important CONSTRAINTS_SHOWN
+    // (importance-ranked), but never silently hide the rest: a count note makes
+    // clear they're still ACTIVE and ENFORCED, so the model never assumes a
+    // constraint it doesn't see has lapsed.
+    const all = listConstraints();
+    if (all.length === 0) return '';
+    const shown = all.slice(0, CONSTRAINTS_SHOWN);
+    let out = shown.map((c) => `- ${c.content}`).join('\n');
+    if (all.length > shown.length) {
+      out += `\n_(+${all.length - shown.length} more standing constraints are ACTIVE and ENFORCED on tool dispatch, not all shown here.)_`;
+    }
+    return out;
   } catch {
     return '';
   }
