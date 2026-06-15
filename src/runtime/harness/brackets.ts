@@ -26,6 +26,11 @@ import {
   DuplicateExternalWriteError,
 } from './grounding-gate.js';
 import {
+  isGoalFidelityGateEnabled,
+  evaluateGoalFidelity,
+  GoalFidelityCheckFailedError,
+} from './goal-fidelity-gate.js';
+import {
   isDestinationGateEnabled,
   evaluateShellDestination,
   evaluateDestinationProvenance,
@@ -931,6 +936,51 @@ export function wrapToolForHarness<T extends WrappableTool>(
       // eslint-disable-next-line no-console
       console.warn('[harness] grounding gate threw (fail-open)', err instanceof Error ? err.message : err);
     }
+    // 2c2.5. Goal-fidelity gate — does this irreversible write advance the
+    // run's stated GOAL and honor the loaded SKILL's defining requirement?
+    // Sibling to grounding (payload-vs-source); this is payload-vs-GOAL+SKILL.
+    // Deterministic pre-filter first (skill renderer ran? batch uniform?),
+    // then one fast fail-open judge ONLY when there's a goal AND a loaded
+    // skill. Soft-blocks + reroutes BEFORE the write. Same irreversible-only
+    // scope as grounding. Fail-open on any evaluation error.
+    try {
+      if (isGoalFidelityGateEnabled()) {
+        const shape = classifyExternalWrite(tool.name, parsedInput);
+        if (shape.mutating && shape.irreversible) {
+          const verdict = await evaluateGoalFidelity(ctx.sessionId, tool.name, parsedInput);
+          if (verdict.action === 'block') {
+            try {
+              appendEvent({
+                sessionId: ctx.sessionId,
+                turn: 0,
+                role: 'system',
+                type: 'guardrail_tripped',
+                data: {
+                  kind: 'goal_fidelity_blocked',
+                  toolName: tool.name,
+                  mode: verdict.mode,
+                  skill: verdict.skill ?? null,
+                  targets: verdict.targets.slice(0, 5),
+                  reason: verdict.reason,
+                  failureCount: verdict.failureCount ?? 1,
+                },
+              });
+            } catch { /* telemetry write must never block */ }
+            throw new GoalFidelityCheckFailedError({
+              toolName: tool.name,
+              reason: verdict.reason,
+              gap: verdict.gap,
+              targets: verdict.targets,
+              failureCount: verdict.failureCount ?? 1,
+            });
+          }
+        }
+      }
+    } catch (err) {
+      if (err instanceof GoalFidelityCheckFailedError) throw err;
+      // eslint-disable-next-line no-console
+      console.warn('[harness] goal-fidelity gate threw (fail-open)', err instanceof Error ? err.message : err);
+    }
     // 2c3. Destination gate — AMBIENT-TARGET writes (the 2026-06-13
     // wrong-site incident class). `run_shell_command` bypasses every gate
     // above (isMutatingExternalWrite only classifies composio writes), so
@@ -1057,6 +1107,36 @@ export function wrapToolForHarness<T extends WrappableTool>(
       if (err instanceof GroundingCheckFailedError || err instanceof DuplicateExternalWriteError) throw err;
       // eslint-disable-next-line no-console
       console.warn('[harness] shell-send grounding threw (fail-open)', err instanceof Error ? err.message : err);
+    }
+    // 2c4.5. Shell SEND goal-fidelity — mirror of 2c2.5 for the shell
+    // external-write vector (curl POST / gh api / sf data / sendmail), so a
+    // shell publish/send gets the same goal+skill verification composio sends
+    // get. Same fail-open contract; reads the target from the command string.
+    try {
+      if (isGoalFidelityGateEnabled() && tool.name === 'run_shell_command') {
+        const command = typeof (parsedInput as { command?: unknown })?.command === 'string'
+          ? (parsedInput as { command: string }).command
+          : '';
+        const mutation = command ? classifyShellNetworkMutation(command) : { isNetworkMutation: false as const };
+        if (mutation.isNetworkMutation && mutation.shapeKey) {
+          const verdict = await evaluateGoalFidelity(ctx.sessionId, tool.name, command);
+          if (verdict.action === 'block') {
+            try {
+              appendEvent({
+                sessionId: ctx.sessionId, turn: 0, role: 'system', type: 'guardrail_tripped',
+                data: { kind: 'goal_fidelity_blocked', toolName: tool.name, source: 'shell_send', mode: verdict.mode, skill: verdict.skill ?? null, targets: verdict.targets.slice(0, 5), reason: verdict.reason, failureCount: verdict.failureCount ?? 1 },
+              });
+            } catch { /* telemetry must never block */ }
+            throw new GoalFidelityCheckFailedError({
+              toolName: tool.name, reason: verdict.reason, gap: verdict.gap, targets: verdict.targets, failureCount: verdict.failureCount ?? 1,
+            });
+          }
+        }
+      }
+    } catch (err) {
+      if (err instanceof GoalFidelityCheckFailedError) throw err;
+      // eslint-disable-next-line no-console
+      console.warn('[harness] shell-send goal-fidelity threw (fail-open)', err instanceof Error ? err.message : err);
     }
     // 2d. Confirm-first gate — a BATCH of same-shape external writes
     // needs an instruction-reviewed plan scope before it proceeds. Runs
@@ -1232,6 +1312,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
           err instanceof ToolGuardrailBlocked ||
           err instanceof ToolCallsLimitExceeded ||
           err instanceof GroundingCheckFailedError ||
+          err instanceof GoalFidelityCheckFailedError ||
           err instanceof DuplicateExternalWriteError ||
           err instanceof ImplicitDestinationError ||
           err instanceof UnverifiedDestinationError

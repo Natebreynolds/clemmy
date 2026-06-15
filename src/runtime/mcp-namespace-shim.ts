@@ -15,6 +15,11 @@ import {
   GroundingCheckFailedError,
   DuplicateExternalWriteError,
 } from './harness/grounding-gate.js';
+import {
+  isGoalFidelityGateEnabled,
+  evaluateGoalFidelity,
+  GoalFidelityCheckFailedError,
+} from './harness/goal-fidelity-gate.js';
 import { appendEvent, listEvents } from './harness/eventlog.js';
 import { classifyShellNetworkMutation } from './harness/destination-gate.js';
 import { formatRecallableToolText } from './harness/tool-output-format.js';
@@ -754,6 +759,30 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): MCPSer
           }
         } catch (err) {
           if (err instanceof GroundingCheckFailedError || err instanceof DuplicateExternalWriteError) throw err;
+          // Any other evaluation error is fail-open — never block a legit send.
+        }
+      }
+
+      // Goal-fidelity for irreversible MCP SENDS — sibling to the grounding
+      // block above (payload-vs-GOAL+SKILL, not payload-vs-source). Without
+      // this, a native Gmail/Slack send under a loaded skill bypasses the
+      // goal+skill verification composio/shell sends get — the same FORK the
+      // grounding mirror above was added to close. Throws surface as soft tool
+      // errors via the SDK's invoke catch (the shim runs inside _invoke).
+      if (gateAsSend && isGoalFidelityGateEnabled() && integritySessionId) {
+        try {
+          const verdict = await evaluateGoalFidelity(integritySessionId, toolName, args ?? {});
+          if (verdict.action === 'block') {
+            throw new GoalFidelityCheckFailedError({
+              toolName,
+              reason: verdict.reason,
+              gap: verdict.gap,
+              targets: verdict.targets,
+              failureCount: verdict.failureCount ?? 1,
+            });
+          }
+        } catch (err) {
+          if (err instanceof GoalFidelityCheckFailedError) throw err;
           // Any other evaluation error is fail-open — never block a legit send.
         }
       }
