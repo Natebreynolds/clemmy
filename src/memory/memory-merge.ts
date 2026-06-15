@@ -14,7 +14,7 @@ interface Fact extends ConsolidatedFactRow {
   embedding?: Float32Array;
 }
 
-interface EntityAnchors {
+export interface EntityAnchors {
   tableIds: Set<string>;
   accountIds: Set<string>;
   domains: Set<string>;
@@ -42,8 +42,11 @@ interface MergeStats {
 /**
  * Extract entity anchors from a fact's content.
  * These are used to prevent merging facts about logically distinct entities.
+ * Exported so the nightly stored-embedding dedup (reflection.ts
+ * consolidateActiveFacts) gates its drops with the SAME guard the paraphrase
+ * merge uses — one entity-safety primitive, never a second copy.
  */
-function extractAnchors(fact: Fact): EntityAnchors {
+export function extractAnchors(fact: { content: string }): EntityAnchors {
   const content = fact.content;
 
   // Airtable table IDs: tbl[a-zA-Z0-9]{12,}
@@ -81,8 +84,9 @@ function extractAnchors(fact: Fact): EntityAnchors {
  * Check if two facts' entity anchors are compatible for merging.
  * Returns true if they can safely be merged (anchors match or are absent).
  * Returns false if they reference different entities (would corrupt data).
+ * Exported for reuse by the stored-embedding dedup (see extractAnchors).
  */
-function canMergeEntitySafe(anchors1: EntityAnchors, anchors2: EntityAnchors): boolean {
+export function canMergeEntitySafe(anchors1: EntityAnchors, anchors2: EntityAnchors): boolean {
   // Helper: set intersection
   const intersect = <T>(a: Set<T>, b: Set<T>): Set<T> => {
     const result = new Set<T>();
@@ -174,8 +178,13 @@ function findClustersInKind(
 
       const candidateAnchors = anchorsMap.get(candidate.id)!;
 
-      // Entity gate: skip if entities don't match
-      if (!canMergeEntitySafe(seedAnchors, candidateAnchors)) {
+      // Entity gate: the candidate must be entity-compatible with EVERY current
+      // cluster member, not just the seed. Seed-only gating let a no-anchor fact
+      // bridge two entity-distinct facts into one cluster — and if that bridge
+      // then won canonical selection, Guard-2's member-vs-canonical check
+      // (anchors-vs-empty = always true) could not catch it, soft-deleting two
+      // distinct-client facts. Pairwise coherence closes the bridge.
+      if (!cluster.every((m) => canMergeEntitySafe(anchorsMap.get(m.id)!, candidateAnchors))) {
         continue;
       }
 
@@ -335,12 +344,14 @@ export async function mergeParaphrases(): Promise<MergeStats> {
           continue;
         }
 
-        // Guard 2: entity safety (should have been caught above, but double-check)
-        const allAnchorsSafe = [canonical, ...merged].every(f => {
-          const fa = anchorsMap.get(f.id)!;
-          const ca = anchorsMap.get(canonical.id)!;
-          return canMergeEntitySafe(fa, ca);
-        });
+        // Guard 2: entity safety — check ALL PAIRS, not just member-vs-canonical.
+        // A member-vs-canonical loop is blind when the canonical itself has empty
+        // anchors (the bridging case): empty-vs-X is always "safe". All-pairs makes
+        // the whole cluster entity-coherent before any soft-delete.
+        const members = [canonical, ...merged];
+        const allAnchorsSafe = members.every((f1, i) =>
+          members.slice(i + 1).every((f2) =>
+            canMergeEntitySafe(anchorsMap.get(f1.id)!, anchorsMap.get(f2.id)!)));
         if (!allAnchorsSafe) {
           stats.blockedByEntity++;
           logger.warn(

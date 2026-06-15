@@ -357,6 +357,29 @@ test('consolidateActiveFacts (stored embeddings): full-coverage pairwise dedup k
   assert.equal(getFact(c.id)?.active, true, 'the distinct fact C is untouched');
 });
 
+test('consolidateActiveFacts (entity guard): never folds two facts about DISTINCT entities even at cosine 1.0', async () => {
+  resetMemoryDb();
+  const db = openMemoryDb();
+  const embed = db.prepare(`INSERT INTO fact_embeddings (fact_id, model, dim, vector, content_hash, created_at)
+                            VALUES (?, 'test', 4, ?, ?, datetime('now'))`);
+  const setVec = (id: number, arr: number[], hash: string) => embed.run(id, vectorToBuffer(Float32Array.from(arr)), hash);
+
+  // The Revill-vs-Aldous data-loss case: two DISTINCT-client facts with identical
+  // phrasing (identical vector → cosine 1.0). Without the entity guard the older
+  // ties on score and is soft-deleted, corrupting recall for one client. The
+  // guard (extractAnchors/canMergeEntitySafe, shared with the paraphrase merge)
+  // must keep BOTH.
+  const revill = rememberFact({ kind: 'project', content: 'Revill Law Firm ranks #3 for PI Birmingham.', score: 1.0 });
+  const aldous = rememberFact({ kind: 'project', content: 'Aldous Law ranks #3 for PI Birmingham.', score: 1.0 });
+  setVec(revill.id, [1, 0, 0, 0], 'rank-revill');
+  setVec(aldous.id, [1, 0, 0, 0], 'rank-aldous');
+
+  const res = await consolidateActiveFacts({ useStoredEmbeddings: true, simThreshold: 0.95 });
+  assert.equal(res.merged, 0, 'distinct-entity facts are NOT folded despite cosine 1.0');
+  assert.equal(getFact(revill.id)?.active, true, 'Revill survives');
+  assert.equal(getFact(aldous.id)?.active, true, 'Aldous survives');
+});
+
 test('consolidateActiveFacts (stored embeddings): makes ZERO new embed API calls (uses stored vectors)', async () => {
   resetMemoryDb();
   const db = openMemoryDb();

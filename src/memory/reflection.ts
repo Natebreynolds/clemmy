@@ -19,6 +19,7 @@ import { recordToolEvent } from '../agents/tool-observability.js';
 import { classifySource, isSourceTrustEnabled, AUTHORITATIVE_TRUST } from './authoritative-sources.js';
 import { isSourceMapEnabled, upsertResourcePointer } from './source-map.js';
 import { cosine, loadFactEmbeddings } from './embeddings.js';
+import { extractAnchors, canMergeEntitySafe, type EntityAnchors } from './memory-merge.js';
 
 /**
  * Reflection-on-tool-return — Phase 1 of the brain architecture.
@@ -1219,6 +1220,14 @@ export async function consolidateActiveFacts(
       // Only facts with a stored embedding participate; the handful not yet
       // embedded are folded on a later run once the backfill catches them.
       const embedded = rows.filter((r) => vecs.has(r.id));
+      // Entity anchors per candidate so dedup NEVER folds two facts about
+      // logically distinct entities (different client/account/table/domain/
+      // email) even at high cosine — the SAME guard the paraphrase merge uses
+      // (extractAnchors/canMergeEntitySafe from memory-merge.ts). Without it, two
+      // facts differing only by a proper noun ("Revill ranks #3" vs "Aldous ranks
+      // #3", cosine ~0.96) tie on score and the older is erased → wrong-client recall.
+      const anchorsById = new Map<number, EntityAnchors>();
+      for (const r of embedded) anchorsById.set(r.id, extractAnchors(r));
       for (let i = 0; i < embedded.length; i += 1) {
         if (result.merged >= maxMerges) break;
         const a = embedded[i];
@@ -1232,6 +1241,8 @@ export async function consolidateActiveFacts(
           if (folded.has(b.id)) continue;
           const vb = vecs.get(b.id);
           if (!vb || cosine(va, vb) < simThreshold) continue;
+          // Entity guard — subtractive (only ever PREVENTS a fold), no recall regression.
+          if (!canMergeEntitySafe(anchorsById.get(a.id)!, anchorsById.get(b.id)!)) continue;
           // Keep the higher-scored fact (tie → larger id = newer); drop the other.
           const keepId = a.score > b.score || (a.score === b.score && a.id > b.id) ? a.id : b.id;
           const dropId = keepId === a.id ? b.id : a.id;
@@ -1267,6 +1278,8 @@ export async function consolidateActiveFacts(
         if (s.fact.id === row.id || folded.has(s.fact.id)) continue;
         // scored is cosine-desc; once below the bar, no later one qualifies.
         if (s.sim === null || s.sim < simThreshold) break;
+        // Entity guard — never fold across distinct entities even at high cosine.
+        if (!canMergeEntitySafe(extractAnchors(row), extractAnchors(s.fact))) continue;
 
         // Keep the higher-scored fact (tie → larger id = newer); drop the other.
         const keepId = s.fact.score > row.score
