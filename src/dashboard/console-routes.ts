@@ -158,9 +158,9 @@ import {
   grantStandingApproval, revokeStandingApproval, listStandingGrants,
 } from '../agents/plan-scope.js';
 import type { CheckInUrgency } from '../agents/check-ins.js';
-import { createBackgroundTask, getBackgroundTask, listBackgroundTasks, processBackgroundTasks } from '../execution/background-tasks.js';
+import { cancelBackgroundTask, createBackgroundTask, getBackgroundTask, listBackgroundTasks, processBackgroundTasks, resumeBackgroundTask } from '../execution/background-tasks.js';
 import { getBackgroundTaskStatus } from '../execution/background-task-status.js';
-import { listRuns } from '../runtime/run-events.js';
+import { finishRun, getRun, listRuns } from '../runtime/run-events.js';
 import { addNotification, isNeedsAttentionNotification, listNotifications, markNotificationGroupRead, markStaleApprovalNotificationsRead } from '../runtime/notifications.js';
 import { actionBus, type ActionEvent } from '../runtime/action-bus.js';
 import { spaceStore } from '../spaces/store.js';
@@ -874,6 +874,28 @@ export function grepProjectFiles(
   };
   walk(root, 0);
   return { matches, filesScanned, truncated };
+}
+
+/** The four columns of the unified background-work board. */
+type BoardColumnId = 'queued' | 'running' | 'needs_you' | 'done';
+
+/** One normalized card on the Tasks board (see GET /api/console/board). */
+interface BoardCard {
+  id: string;
+  sourceKind: 'background' | 'run' | 'execution' | 'workflow';
+  title: string;
+  column: BoardColumnId;
+  /** Raw source status, for the pill label / tooltip. */
+  status: string;
+  /** Short human progress line (last check-in, current step, blocker). */
+  progressHint: string;
+  /** Harness session id for the live-trace SSE; null for workflow cards. */
+  sessionId: string | null;
+  ageMs: number;
+  updatedAt: string;
+  /** Drag/button actions the card allows: 'cancel' | 'resume' | 'promote'. */
+  actions: string[];
+  raw: Record<string, unknown>;
 }
 
 export function registerConsoleRoutes(
@@ -4927,6 +4949,246 @@ export function registerConsoleRoutes(
       res.json({ task: { ...task, resultFull }, detail });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * Unified background-work board (the desktop "Tasks" Kanban). Aggregates
+   * every kind of background work into one flat, UN-filtered, normalized card
+   * array — the opposite of /api/command-center, which deliberately filters
+   * each source down to "working now / needs you / recent". The board needs
+   * everything, including terminal / interrupted / blocked cards, so it owns
+   * a dedicated endpoint to keep the command-center contract stable.
+   *
+   * Sources: background tasks · run records · executions · in-flight workflow
+   * runs. Each card carries an `actions` allowlist the frontend uses to gate
+   * drag-and-drop (a drop is a REQUEST for an action, never a status write).
+   */
+  app.get('/api/console/board', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const now = Date.now();
+      const ageMs = (iso?: string): number => {
+        const t = iso ? Date.parse(iso) : NaN;
+        return Number.isFinite(t) ? Math.max(0, now - t) : 0;
+      };
+      const cards: BoardCard[] = [];
+
+      // 1) Background tasks — the autonomous "go do this while I'm away" work.
+      for (const task of listBackgroundTasks()) {
+        const terminal = task.status === 'done' || task.status === 'failed'
+          || task.status === 'aborted' || task.status === 'interrupted';
+        const column: BoardColumnId =
+          task.status === 'pending' ? 'queued'
+            : task.status === 'running' || task.status === 'cancelling' ? 'running'
+              : task.status === 'awaiting_approval' || task.status === 'blocked' ? 'needs_you'
+                : 'done';
+        const actions: string[] = [];
+        if (task.status === 'pending') actions.push('promote', 'cancel');
+        else if (task.status === 'running' || task.status === 'cancelling'
+          || task.status === 'awaiting_approval' || task.status === 'blocked') actions.push('cancel');
+        else if (task.status === 'interrupted' || task.status === 'failed' || task.status === 'aborted') {
+          if (!task.resumedIntoTaskId) actions.push('resume');
+        }
+        cards.push({
+          id: task.id,
+          sourceKind: 'background',
+          title: task.title,
+          column,
+          status: task.status,
+          progressHint: task.lastCheckInMessage || (terminal && task.error ? task.error : '') || '',
+          sessionId: task.runSessionId,
+          ageMs: ageMs(task.updatedAt),
+          updatedAt: task.updatedAt,
+          actions,
+          raw: {
+            pendingApprovalId: task.pendingApprovalId,
+            error: task.error,
+            resultPreview: task.result?.slice(0, 600),
+            source: task.source,
+          },
+        });
+      }
+
+      // 2) Run records — chat/Discord/CLI/gateway runs. Drop background-backed
+      //    runs (id === `run-<taskId>`) so the same work isn't double-emitted.
+      for (const run of listRuns(80)) {
+        if (run.id.startsWith('run-bg-')) continue; // background task's own run record
+        const column: BoardColumnId =
+          run.status === 'queued' || run.status === 'received' ? 'queued'
+            : run.status === 'running' ? 'running'
+              : run.status === 'awaiting_approval' ? 'needs_you'
+                : 'done';
+        const live = column === 'queued' || column === 'running' || column === 'needs_you';
+        cards.push({
+          id: run.id,
+          sourceKind: 'run',
+          title: run.title,
+          column,
+          status: run.status,
+          progressHint: run.outputPreview?.slice(0, 600)
+            || run.events[run.events.length - 1]?.message || '',
+          sessionId: run.sessionId,
+          ageMs: ageMs(run.updatedAt),
+          updatedAt: run.updatedAt,
+          actions: live ? ['cancel'] : [],
+          raw: { error: run.error, source: run.source, pendingApprovalId: run.pendingApprovalId },
+        });
+      }
+
+      // 3) Executions — long-running, controller-driven work.
+      for (const exec of new ExecutionStore().list(80)) {
+        const column: BoardColumnId =
+          exec.status === 'active' ? 'running'
+            : exec.status === 'paused' || exec.status === 'blocked' ? 'needs_you'
+              : 'done';
+        const actions: string[] = [];
+        if (exec.status === 'active' || exec.status === 'blocked') actions.push('cancel');
+        else if (exec.status === 'paused') actions.push('resume', 'cancel');
+        cards.push({
+          id: exec.id,
+          sourceKind: 'execution',
+          title: exec.title,
+          column,
+          status: exec.status,
+          progressHint: exec.nextStep || exec.lastAssistantSummary || exec.blocker || '',
+          sessionId: exec.sessionId,
+          ageMs: ageMs(exec.updatedAt),
+          updatedAt: exec.updatedAt,
+          actions,
+          raw: { blocker: exec.blocker, pausedBy: exec.pausedBy, objective: exec.objective },
+        });
+      }
+
+      // 4) In-flight workflow runs. Terminal workflow runs surface via their
+      //    run record (source: 'workflow') in section 2 → Done. Live trace for
+      //    these uses the run-events poll, not the session SSE (workflow steps
+      //    run under per-step `workflow:<suffix>` sessions we can't address).
+      for (const pending of listPendingRuns()) {
+        const column: BoardColumnId = pending.inFlightStepId ? 'running' : 'queued';
+        cards.push({
+          id: `wf:${pending.workflowName}:${pending.runId}`,
+          sourceKind: 'workflow',
+          title: pending.workflowName,
+          column,
+          status: pending.inFlightStepId ? `step: ${pending.inFlightStepId}` : 'queued',
+          progressHint: pending.inFlightStepId ? `Running step ${pending.inFlightStepId}` : 'Queued',
+          sessionId: null,
+          ageMs: ageMs(pending.lastEventAt),
+          updatedAt: pending.lastEventAt ?? new Date(now).toISOString(),
+          actions: ['cancel'],
+          raw: { workflowName: pending.workflowName, runId: pending.runId },
+        });
+      }
+
+      cards.sort((a, b) => a.ageMs - b.ageMs);
+      // Live columns are naturally bounded; Done is not (every task ever is
+      // terminal eventually). Cap it to the most-recent 40 so the payload and
+      // the board stay lean. `cards` is sorted by ageMs asc, so the kept Done
+      // cards are the freshest.
+      const DONE_CAP = 40;
+      let doneShown = 0;
+      const trimmed = cards.filter((c) => c.column !== 'done' || (doneShown += 1) <= DONE_CAP);
+      res.json({ cards: trimmed, generatedAt: new Date(now).toISOString() });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * Board drag actions. A drop onto a column is a REQUEST for an action; the
+   * server validates it against the card's real state and returns
+   * { ok:false, reason } for a snap-back. Status is never written directly —
+   * each action calls the canonical store fn and the board re-polls.
+   */
+  app.post('/api/console/board/background/:id/:action', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const { id, action } = req.params;
+    const task = getBackgroundTask(id);
+    if (!task) { res.status(404).json({ ok: false, reason: 'background task not found' }); return; }
+    try {
+      if (action === 'cancel') {
+        const updated = cancelBackgroundTask(id, 'Cancelled from the Tasks board.');
+        res.json({ ok: true, task: updated });
+        return;
+      }
+      if (action === 'resume') {
+        if (task.status !== 'interrupted' && task.status !== 'failed' && task.status !== 'aborted') {
+          res.status(409).json({ ok: false, reason: `Cannot resume a ${task.status} task.` });
+          return;
+        }
+        const resumed = resumeBackgroundTask(id);
+        if (!resumed) { res.status(409).json({ ok: false, reason: 'Task could not be resumed.' }); return; }
+        res.json({ ok: true, task: resumed });
+        return;
+      }
+      if (action === 'promote') {
+        if (task.status !== 'pending') {
+          res.status(409).json({ ok: false, reason: `Only queued tasks can be started now (this one is ${task.status}).` });
+          return;
+        }
+        // The single-task drain is the "run now" entry point: it pulls the
+        // oldest pending task immediately instead of waiting for the next tick.
+        setImmediate(() => {
+          processBackgroundTasks(assistant, 1).catch((err) => {
+            console.warn('Board promote: immediate background processor failed:', err);
+          });
+        });
+        res.json({ ok: true, task });
+        return;
+      }
+      res.status(400).json({ ok: false, reason: `Unknown action: ${action}` });
+    } catch (err) {
+      res.status(500).json({ ok: false, reason: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/board/execution/:id/transition', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const to = req.body?.to;
+    if (to !== 'active' && to !== 'cancelled') {
+      res.status(400).json({ ok: false, reason: 'transition `to` must be "active" or "cancelled"' });
+      return;
+    }
+    const store = new ExecutionStore();
+    const exec = store.get(req.params.id);
+    if (!exec) { res.status(404).json({ ok: false, reason: 'execution not found' }); return; }
+    try {
+      if (to === 'active') {
+        if (exec.status !== 'paused') {
+          res.status(409).json({ ok: false, reason: `Only paused work can be resumed (this is ${exec.status}).` });
+          return;
+        }
+        const updated = store.update(exec.id, { status: 'active', pausedBy: undefined });
+        res.json({ ok: true, execution: updated });
+        return;
+      }
+      // to === 'cancelled' — ExecutionRecord has no 'cancelled'/'failed' state;
+      // 'completed' + a blocker reason is the canonical terminal close (mirrors
+      // failExecution / sweepStaleExecutions).
+      if (exec.status === 'completed') { res.json({ ok: true, execution: exec }); return; }
+      const updated = store.update(exec.id, { status: 'completed', blocker: 'Cancelled from the Tasks board.' });
+      res.json({ ok: true, execution: updated });
+    } catch (err) {
+      res.status(500).json({ ok: false, reason: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/board/run/:id/cancel', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const run = getRun(req.params.id);
+    if (!run) { res.status(404).json({ ok: false, reason: 'run not found' }); return; }
+    if (run.status === 'completed' || run.status === 'failed' || run.status === 'cancelled') {
+      res.json({ ok: true, run });
+      return;
+    }
+    try {
+      // Best-effort: also signal the underlying harness session to stop.
+      if (run.sessionId) { try { requestHarnessKill(run.sessionId, 'Cancelled from the Tasks board.'); } catch { /* best effort */ } }
+      const updated = finishRun(run.id, { status: 'cancelled', message: 'Cancelled from the Tasks board.' });
+      res.json({ ok: true, run: updated });
+    } catch (err) {
+      res.status(500).json({ ok: false, reason: err instanceof Error ? err.message : String(err) });
     }
   });
 
