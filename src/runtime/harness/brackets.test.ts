@@ -687,6 +687,18 @@ test('destination gate: a PROD ambient publish HARD-blocks every attempt until e
     assert.equal(await shell('netlify deploy --dir "/x/site"'), 'deployed');
     // 5. A non-publish command is untouched.
     assert.equal(await shell('ls -la /x/site'), 'deployed');
+    // 6. PROVENANCE via the API create path (2026-06-15 Fernwood false-positive):
+    //    she self-recovered into `netlify api createSite` (not `sites:create`);
+    //    the gate must recognize it and ALLOW the deploy to her own new site.
+    appendEvent({
+      sessionId: sess.id, turn: 0, role: 'Clem', type: 'tool_called',
+      data: { tool: 'run_shell_command', callId: 'cs1', arguments: JSON.stringify({ command: 'netlify api createSite --data \'{"name":"fernwood","account_slug":"natebreynolds"}\'' }) },
+    });
+    appendEvent({
+      sessionId: sess.id, turn: 0, role: 'Clem', type: 'tool_returned',
+      data: { tool: 'run_shell_command', callId: 'cs1', result: 'exit_code: 0\n\n{"id":"244fc7d2-newsite","name":"fernwood","ssl_url":"https://fernwood.netlify.app"}' },
+    });
+    assert.equal(await shell('netlify deploy --dir "/x/site" --prod --site 244fc7d2-newsite --json'), 'deployed');
   } finally {
     process.env.HARNESS_TOOL_BRACKETS = prevBrackets;
     process.env.CLEMMY_CONFIRM_FIRST = prevConfirm;

@@ -610,10 +610,16 @@ function buildPublishProvenance(sessionId: string): (target: string) => boolean 
         userParts.push(String(d?.text ?? '').toLowerCase());
       } else if (e.type === 'tool_called') {
         const args = String(d?.arguments ?? '');
-        if (/sites?:create|projects?:create/i.test(args)) {
+        // Recognize ANY site-creation path, not just one command:
+        // `netlify sites:create`, the API `netlify api createSite`,
+        // `create-site`. (2026-06-15 Fernwood false-positive: she self-recovered
+        // into `api createSite` and the gate then blocked the deploy to her OWN
+        // freshly-created site because it only matched `sites:create`.) Name is
+        // captured from `--name X` OR a `--data '{"name":"X"}'` JSON body.
+        if (/sites?:create|projects?:create|create-?sites?\b/i.test(args)) {
           const callId = String(d?.callId ?? '');
           if (callId) createCallIds.add(callId);
-          const nm = args.match(/--name(?:=|\s+)["']?([\w.-]+)/i);
+          const nm = args.match(/--name(?:=|\s+)["']?([\w.-]+)/i) ?? args.match(/"name"\s*:\s*"([\w.-]+)"/i);
           if (nm) created.add(nm[1].toLowerCase());
         }
       } else if (e.type === 'tool_returned') {
