@@ -10,7 +10,7 @@ Stress harnesses guarding the fixes: `npm run bench:gates` (safety gates), `npm 
 | 1 | HIGH | memory/dedup | Nightly stored-embedding dedup (`consolidateActiveFacts`, cos≥0.95) has NO entity guard → can erase a distinct client/account/table fact | ✅ FIXED |
 | 2 | HIGH | memory/merge | `mergeParaphrases` entity guard is seed/canonical-relative, not pairwise → a no-anchor fact bridges two entity-distinct facts into one cluster | ✅ FIXED |
 | 3 | HIGH | memory/write | Standing rules captured as user/feedback facts never become `kind:'constraint'` → dispatch gate never enforces them | ⬜ |
-| 4 | HIGH | chat/context | Native MCP tool outputs bypass the per-write recall-clip → land RAW in chat history (context blowup in long chats) | ⬜ |
+| 4 | HIGH | chat/context | Native MCP tool outputs bypass the per-write recall-clip → land RAW in chat history (context blowup in long chats) | ✅ FIXED |
 | 5 | HIGH | workflows/choke | Single-slot run drain (concurrency 1) + unbounded `forEach` items = head-of-line blocking that wedges the workflow queue | ⬜ |
 | 6 | HIGH | agentic/deliver | Decision-level `awaiting_approval` strands the run silently — no card/reply delivered (the symmetric `awaiting_user_input` hole was patched; this one wasn't) | ⬜ |
 | 7 | HIGH | background | A background task paused on `awaiting_approval` has no terminal-state recovery and is invisible to the watchdog | ⬜ |

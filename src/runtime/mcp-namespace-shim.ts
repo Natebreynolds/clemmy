@@ -17,6 +17,7 @@ import {
 } from './harness/grounding-gate.js';
 import { appendEvent, listEvents } from './harness/eventlog.js';
 import { classifyShellNetworkMutation } from './harness/destination-gate.js';
+import { formatRecallableToolText } from './harness/tool-output-format.js';
 
 // Bound MCP startup below the SDK's default (~60s), but leave enough
 // room for `npx`/`uvx` based servers on fresh machines. 5s/8s was too
@@ -69,6 +70,37 @@ function detectMcpArgsNetworkMutation(
 // fan-out trigger. sessionId comes from the harness run context, which the loop
 // installs around every turn regardless of HARNESS_TOOL_BRACKETS. Best-effort:
 // never alters the result on any error.
+// Native MCP calls bypass wrapToolForHarness, so their RAW results landed
+// uncapped in chat history (context blowup in long, tool-heavy sessions). Route
+// them through the SAME formatRecallableToolText primitive every other tool uses:
+// large outputs are parked in tool_outputs (recoverable via recall_tool_result)
+// and replaced with a structure-aware digest; small ones pass through unchanged.
+// Native MCP calls have no SDK callId at this layer, so synthesize a stable one.
+let mcpRecallSeq = 0;
+function clipMcpResultForRecall(toolName: string, result: CallToolResultContent): CallToolResultContent {
+  try {
+    const sessionId = harnessRunContextStorage.getStore()?.sessionId;
+    if (!sessionId || !Array.isArray(result)) return result;
+    const combined = result
+      .map((block) => {
+        const text = (block as { text?: unknown } | null)?.text;
+        return typeof text === 'string' ? text : '';
+      })
+      .join('\n');
+    if (!combined) return result;
+    mcpRecallSeq += 1;
+    const callId = `mcp_${toolName}_${mcpRecallSeq}`;
+    const clipped = formatRecallableToolText(combined, { sessionId, callId, toolName });
+    if (clipped === combined) return result; // under the cap → byte-identical, no-op
+    // Replace the (possibly multi-block) text with one clipped block; preserve any
+    // non-text blocks (images, resource refs) untouched.
+    const nonText = result.filter((block) => (block as { type?: string } | null)?.type !== 'text');
+    return [{ type: 'text', text: clipped }, ...nonText] as CallToolResultContent;
+  } catch {
+    return result; // clipping must NEVER break a tool call
+  }
+}
+
 function appendMcpFanoutAdvisory(
   toolName: string,
   args: Record<string, unknown> | null,
@@ -735,8 +767,11 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): MCPSer
       });
       try {
         // Forward to the underlying server with the ORIGINAL tool name.
-        const result = await server.callTool(parsed.toolName, args);
+        const rawResult = await server.callTool(parsed.toolName, args);
         finish('success');
+        // Cap + park a large raw result for recall BEFORE the fan-out nudge, so a
+        // 200KB MCP dump can't flood the chat context window unrecoverably.
+        const result = clipMcpResultForRecall(toolName, rawResult);
         // Record the irreversible send in the SHARED external_write ledger so a
         // later same-shape send (composio OR MCP) to the same target gets the
         // duplicate bump. Best-effort; telemetry must never affect the result.
