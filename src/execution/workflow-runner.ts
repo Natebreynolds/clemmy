@@ -126,6 +126,16 @@ export function shouldSilenceCompletionEcho(opts: {
 
 const RUNNER_CONCURRENCY = parseInt(process.env.CLEMENTINE_WORKFLOW_CONCURRENCY ?? '5', 10);
 
+// Anti-choke bound on a single forEach fan-out. The run drain is single-slot by
+// default (runDrainConcurrency = 1), so one forEach over an unbounded upstream
+// array (e.g. 10k scraped rows) serializes thousands of sub-agent runs and
+// head-of-line-blocks the entire workflow queue for hours. Cap the batch and
+// REPORT the overflow (never silently drop) so the run surfaces "N deferred".
+function forEachMaxItems(): number {
+  const raw = parseInt(process.env.CLEMENTINE_WORKFLOW_FOREACH_MAX_ITEMS ?? '200', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 200;
+}
+
 // Per-step wall-clock budget. forEach items use the same per-call cap
 // (each item is its own assistant call) and the surrounding step gets
 // the cap multiplied by item count, capped by RUNNER_CONCURRENCY — but
@@ -902,7 +912,7 @@ interface StepExecutionContext {
 export interface WorkflowQualityAdvisory {
   stepId: string;
   itemKey?: string;
-  kind: 'skill_not_executed' | 'target_missed' | 'goal_validation_unavailable';
+  kind: 'skill_not_executed' | 'target_missed' | 'goal_validation_unavailable' | 'foreach_overflow';
   note: string;
 }
 
@@ -1959,6 +1969,26 @@ export async function executeStep(
         meta: { reason: 'forEach-empty', source: step.forEach },
       });
       return [];
+    }
+
+    // Anti-choke: bound an unbounded fan-out so it can't wedge the single-slot
+    // run drain. Process the first N, DEFER the rest, and report it through the
+    // existing qualityAdvisory→needsAttention path (no silent drop). Creation-test
+    // already sliced to 1 above, so this only bites real runs over a huge upstream.
+    const maxItems = forEachMaxItems();
+    if (items.length > maxItems) {
+      const deferred = items.length - maxItems;
+      ctx.qualityAdvisories.push({
+        stepId: step.id,
+        kind: 'foreach_overflow',
+        note: `forEach over "${step.forEach}" had ${items.length} items; processed the first ${maxItems} and DEFERRED ${deferred} to keep the workflow queue from wedging. Re-run to continue, or raise CLEMENTINE_WORKFLOW_FOREACH_MAX_ITEMS.`,
+      });
+      appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
+        kind: 'step_advisory',
+        stepId: step.id,
+        meta: { reason: 'foreach_overflow', total: items.length, processed: maxItems, deferred, source: step.forEach },
+      });
+      items = items.slice(0, maxItems);
     }
 
     const concurrency = Math.max(1, Math.min(RUNNER_CONCURRENCY, items.length));
@@ -3442,11 +3472,14 @@ async function processOneRunFile(
       // NEVER trigger a blind re-run that doubles irreversible side effects.
       const targetMissed = Boolean(targetVerdict && targetVerdict.judged && !targetVerdict.reached);
       const hasForEachFailures = forEachFailures.length > 0;
-      const needsAttention = blockedSteps.length > 0 || targetMissed || hasForEachFailures || goalMissed;
+      const foreachOverflow = qualityAdvisories.find((a) => a.kind === 'foreach_overflow');
+      const needsAttention = blockedSteps.length > 0 || targetMissed || hasForEachFailures || goalMissed || Boolean(foreachOverflow);
       const attentionReason =
         blockedSteps[0]?.reason ??
         (hasForEachFailures
           ? `${forEachFailures.length} forEach item${forEachFailures.length === 1 ? '' : 's'} failed`
+          : foreachOverflow
+          ? foreachOverflow.note
           : goalMissed
           ? `pinned goal not met — ${goalDecision?.reason ?? 'criteria unmet'}`
           : targetMissed

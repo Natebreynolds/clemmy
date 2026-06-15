@@ -610,6 +610,39 @@ test('deterministic step ENFORCES its output contract (regression guard: routes 
   assert.ok(readWorkflowEvents('det-contract-test', 'det-ok').map((e) => e.kind).includes('step_completed'));
 });
 
+test('forEach caps an oversized fan-out and REPORTS the overflow (anti-choke, no silent drop)', async () => {
+  const prev = process.env.CLEMENTINE_WORKFLOW_FOREACH_MAX_ITEMS;
+  process.env.CLEMENTINE_WORKFLOW_FOREACH_MAX_ITEMS = '2';
+  try {
+    const qualityAdvisories: Array<{ kind: string; note: string }> = [];
+    const ctx = {
+      workflow: { name: 'Choke Test', steps: [] },
+      workflowSlug: 'foreach-cap-test',
+      runId: 'fc-1',
+      inputs: {},
+      stepOutputs: { pull: ['a', 'b', 'c', 'd', 'e'] },
+      assistant: { respond: async () => ({ text: 'done' }) },
+      completedItems: new Map(),
+      forEachFailures: [],
+      qualityAdvisories,
+    } as unknown as Parameters<typeof executeStep>[1];
+    const step = { id: 'blast', prompt: 'Process the item.', forEach: 'pull' } as unknown as Parameters<typeof executeStep>[0];
+
+    await executeStep(step, ctx);
+    // The cap took effect BEFORE fan-out: exactly maxItems items were attempted
+    // and the overflow is reported (no silent drop) — independent of per-item
+    // execution outcome (the stub's per-item result shape is irrelevant here).
+    const overflow = qualityAdvisories.find((a) => a.kind === 'foreach_overflow');
+    assert.ok(overflow, 'an overflow quality advisory is recorded — never a silent drop');
+    assert.match(overflow!.note, /DEFERRED 3/);
+    const started = readWorkflowEvents('foreach-cap-test', 'fc-1').filter((e) => e.kind === 'item_started');
+    assert.equal(started.length, 2, 'only maxItems items fanned out (no head-of-line blocking)');
+  } finally {
+    if (prev === undefined) delete process.env.CLEMENTINE_WORKFLOW_FOREACH_MAX_ITEMS;
+    else process.env.CLEMENTINE_WORKFLOW_FOREACH_MAX_ITEMS = prev;
+  }
+});
+
 test('workflow conversion: a plain step routes through the GATED harness loop when CLEMMY_HARNESS_WORKFLOW=on (not the legacy core)', async () => {
   // Proves the staged workflow-step conversion (respondPreferHarness on the
   // default-off `workflow` surface) actually rides the harness when flipped on,
