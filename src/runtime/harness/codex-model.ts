@@ -221,6 +221,25 @@ export function shouldForceSseTruncation(): boolean {
   return false;
 }
 
+/**
+ * Harness invariant — "there is always an output." The model boundary must
+ * never hand back an EMPTY COMPLETION: a `response.completed` that carried
+ * zero output items and surfaced no content to the SDK. That is a backend
+ * blip, not an answer — and passing it through as a clean (empty)
+ * ModelResponse dead-ends downstream as the "couldn't be structured"
+ * sentinel (observed once live: the "find email from Brooke" turn came back
+ * empty and gave up on turn 1). An empty completion and a truncated stream
+ * are the SAME class ("the model yielded no content"), so we fold the
+ * former into the latter's existing retry-or-honest-error path instead of
+ * special-casing it downstream. Provably safe to retry (nothing was yielded
+ * to the user, so no tokens can duplicate). Kill-switch
+ * CLEMMY_CODEX_RETRY_EMPTY_COMPLETION=off restores the legacy pass-through.
+ */
+export function retryEmptyCompletionEnabled(): boolean {
+  const v = (process.env.CLEMMY_CODEX_RETRY_EMPTY_COMPLETION ?? 'on').trim().toLowerCase();
+  return v !== 'off' && v !== '0' && v !== 'false';
+}
+
 function sizeRequestComponents(body: CodexRequestBody): RequestBodyBreakdown {
   const utf8 = (v: unknown): number => Buffer.byteLength(JSON.stringify(v) ?? '', 'utf8');
   const instructionsBytes = Buffer.byteLength(body.instructions ?? '', 'utf8');
@@ -557,7 +576,15 @@ export class CodexResponsesModel implements Model {
         throw err;
       }
 
-      if (completedEvent) {
+      // "Empty completion" — response.completed arrived but the model
+      // yielded NO content (zero output items, no text delta). Not a valid
+      // answer in this harness; fold it into the same no-content retry path
+      // a truncated stream uses below (see retryEmptyCompletionEnabled).
+      const emptyCompletion = !!completedEvent
+        && seenOutputItems.length === 0
+        && !yieldedRealContent
+        && retryEmptyCompletionEnabled();
+      if (completedEvent && !emptyCompletion) {
         // Success path — flush any deferred events (response_started +
         // metadata frames) in arrival order before the response_done.
         // For a "completed cleanly with no real content" trace (rare),
@@ -591,11 +618,17 @@ export class CodexResponsesModel implements Model {
         return;
       }
 
-      // Truncated. Retry IF nothing was yielded to the SDK yet AND we
-      // have retry budget. Otherwise throw the same BoundaryError as
-      // before so the harness logs it + surfaces a real message.
+      // No content from the model — either a truncated stream (no
+      // response.completed) OR an empty completion (response.completed with
+      // zero output). Same class: retry IF nothing was yielded to the SDK
+      // yet AND we have retry budget; otherwise throw the retryable
+      // BoundaryError so the harness logs it + surfaces a real message.
+      // "Always an output": never silently pass an empty answer downstream.
       lastResponseId = responseId;
       lastItemCount = seenOutputItems.length;
+      const noContentReason = completedEvent
+        ? 'empty completion (response.completed carried no output)'
+        : 'SSE ended without response.completed before real content';
       if (!yieldedRealContent && attempt < CODEX_TRANSPARENT_MAX_RETRIES) {
         // v0.5.21.1 — exponential backoff with jitter: 750ms, 1.5s, 3s.
         // Single fixed delay re-hammered the backend on the same frame
@@ -611,8 +644,8 @@ export class CodexResponsesModel implements Model {
             kind: 'codex.sse_truncated',
             retryable: true,
             userMessage: "Clementine's model backend dropped the connection before finishing this turn. Retry — if it persists, the Codex backend may be having an incident.",
-            operatorMessage: 'Codex SSE ended without response.completed before real content.',
-            context: { responseId: lastResponseId ?? null, itemCount: lastItemCount },
+            operatorMessage: `Codex produced no content: ${noContentReason}.`,
+            context: { responseId: lastResponseId ?? null, itemCount: lastItemCount, emptyCompletion: completedEvent != null },
           }),
           attempt,
           'getStreamedResponse',
@@ -656,6 +689,7 @@ export class CodexResponsesModel implements Model {
         durationMs,
         ttfbMs,
         bodyBreakdown: breakdown,
+        emptyCompletion: completedEvent != null,
       };
       // Persist the full request body + breakdown to disk so we can
       // post-mortem WHICH tools dominate the request. Extracted into
@@ -677,7 +711,7 @@ export class CodexResponsesModel implements Model {
         kind: 'codex.sse_truncated',
         retryable: true,
         userMessage: "Clementine's model backend dropped the connection before finishing this turn. Retry — if it persists, the Codex backend may be having an incident.",
-        operatorMessage: `getStreamedResponse: SSE ended without response.completed (items=${lastItemCount}, responseId=${lastResponseId ?? 'none'}, attempts=${attempt + 1}, httpStatus=${lastDiag?.httpStatus ?? 'unknown'}, durationMs=${durationMs ?? 'unknown'})`,
+        operatorMessage: `getStreamedResponse: ${noContentReason} (items=${lastItemCount}, responseId=${lastResponseId ?? 'none'}, attempts=${attempt + 1}, httpStatus=${lastDiag?.httpStatus ?? 'unknown'}, durationMs=${durationMs ?? 'unknown'})`,
         context: diagContext,
       });
     }
@@ -1380,17 +1414,25 @@ function assembleModelResponse(events: AnyCodexEvent[]): ModelResponse {
   // with no diagnostic surface. Now we throw a structured error the
   // top-level handler can retry on (`retryable: true`) and surface
   // to the user as "Model response was cut short."
-  if (!completed) {
+  // Same "always an output" invariant as the streamed path: a completion
+  // that carried no output items is an empty completion — treat it as the
+  // retryable no-content failure, not a clean (empty) ModelResponse. The
+  // getResponse retry loop re-attempts it transparently (nothing yielded).
+  const emptyCompletion = !!completed && items.length === 0 && retryEmptyCompletionEnabled();
+  if (!completed || emptyCompletion) {
     throw new BoundaryError({
       kind: 'codex.sse_truncated',
       retryable: true,
       userMessage: "Clementine's model backend dropped the connection before finishing this turn. Retry — if it persists, the Codex backend may be having an incident.",
-      operatorMessage: `assembleModelResponse: SSE ended without response.completed (events=${events.length}, items=${items.length}, responseId=${responseId ?? 'none'})`,
+      operatorMessage: completed
+        ? `assembleModelResponse: empty completion — response.completed carried no output items (events=${events.length}, responseId=${responseId ?? 'none'})`
+        : `assembleModelResponse: SSE ended without response.completed (events=${events.length}, items=${items.length}, responseId=${responseId ?? 'none'})`,
       context: {
         eventCount: events.length,
         itemCount: items.length,
         responseId: responseId ?? null,
         lastEventType: events[events.length - 1]?.type ?? null,
+        emptyCompletion,
       },
     });
   }

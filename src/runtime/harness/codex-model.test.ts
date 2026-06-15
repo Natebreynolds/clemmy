@@ -110,6 +110,156 @@ async function* functionCallThenTruncation(responseId = 'resp_tool'): AsyncGener
   };
 }
 
+/** response.completed arrives but the model yielded NO output (zero items,
+ *  no text delta). The "empty completion" backend blip that dead-ended as
+ *  the "couldn't be structured" sentinel before the boundary invariant. */
+async function* emptyCompletion(responseId = 'resp_empty'): AsyncGenerator<any> {
+  yield { type: 'response.created', response: { id: responseId } };
+  yield {
+    type: 'response.completed',
+    response: {
+      id: responseId,
+      usage: {
+        input_tokens: 1,
+        output_tokens: 0,
+        total_tokens: 1,
+        input_tokens_details: {},
+        output_tokens_details: {},
+      },
+    },
+  };
+}
+
+/** A completion whose only output item is a reasoning item (no message).
+ *  This is NOT an empty completion — content escaped — so the model boundary
+ *  must pass it through cleanly and leave the "not a parseable decision"
+ *  concern to the loop layer. Guards the boundary between the two fixes. */
+async function* reasoningOnlyCompletion(responseId = 'resp_reasoning'): AsyncGenerator<any> {
+  yield { type: 'response.created', response: { id: responseId } };
+  yield {
+    type: 'response.output_item.done',
+    item: {
+      id: 'rsn_1',
+      type: 'reasoning',
+      summary: [{ type: 'summary_text', text: 'thinking' }],
+      encrypted_content: 'enc',
+    },
+  };
+  yield {
+    type: 'response.completed',
+    response: {
+      id: responseId,
+      usage: {
+        input_tokens: 1,
+        output_tokens: 1,
+        total_tokens: 2,
+        input_tokens_details: {},
+        output_tokens_details: {},
+      },
+    },
+  };
+}
+
+test('CodexResponsesModel retries an empty completion, then recovers (streamed)', async () => {
+  const model = new ScriptedCodexModel(async function* (attempt) {
+    if (attempt === 1) {
+      yield* emptyCompletion();
+      return;
+    }
+    yield* successfulTurn('resp_after_empty_retry');
+  });
+
+  const events: StreamEvent[] = [];
+  for await (const event of model.getStreamedResponse(modelRequest())) {
+    events.push(event);
+  }
+
+  assert.equal(model.attempts, 2);
+  assert.deepEqual(events.map((event) => event.type), [
+    'response_started',
+    'output_text_delta',
+    'response_done',
+  ]);
+  const done = events.at(-1) as Extract<StreamEvent, { type: 'response_done' }>;
+  assert.equal(done.response.id, 'resp_after_empty_retry');
+});
+
+test('CodexResponsesModel throws a retryable boundary error when every completion is empty (streamed)', async () => {
+  const model = new ScriptedCodexModel(async function* () {
+    yield* emptyCompletion();
+  });
+
+  const events: StreamEvent[] = [];
+  let caught: unknown;
+  try {
+    for await (const event of model.getStreamedResponse(modelRequest())) {
+      events.push(event);
+    }
+  } catch (err) {
+    caught = err;
+  }
+
+  assert.equal(model.attempts, 4); // 1 + CODEX_TRANSPARENT_MAX_RETRIES(3)
+  assert.ok(caught instanceof BoundaryError);
+  assert.equal(caught.kind, 'codex.sse_truncated');
+  assert.equal(caught.context.emptyCompletion, true);
+  // No fabricated clean response_done escaped to the SDK.
+  assert.ok(!events.some((event) => event.type === 'response_done'));
+});
+
+test('CodexResponsesModel passes an empty completion through unchanged when the kill-switch is off', async () => {
+  process.env.CLEMMY_CODEX_RETRY_EMPTY_COMPLETION = 'off';
+  try {
+    const model = new ScriptedCodexModel(async function* () {
+      yield* emptyCompletion('resp_legacy_empty');
+    });
+    const events: StreamEvent[] = [];
+    for await (const event of model.getStreamedResponse(modelRequest())) {
+      events.push(event);
+    }
+    assert.equal(model.attempts, 1); // legacy: no retry
+    const done = events.at(-1) as Extract<StreamEvent, { type: 'response_done' }>;
+    assert.equal(done.type, 'response_done');
+    assert.deepEqual(done.response.output, []); // empty, as before
+  } finally {
+    delete process.env.CLEMMY_CODEX_RETRY_EMPTY_COMPLETION;
+  }
+});
+
+test('CodexResponsesModel does NOT treat a reasoning-only completion as empty (boundary with the loop layer)', async () => {
+  const model = new ScriptedCodexModel(async function* () {
+    yield* reasoningOnlyCompletion('resp_reasoning_clean');
+  });
+
+  const events: StreamEvent[] = [];
+  for await (const event of model.getStreamedResponse(modelRequest())) {
+    events.push(event);
+  }
+
+  // Content escaped (a reasoning item) → clean pass-through, single attempt,
+  // no retry. Parsing it into a decision is the loop's job, not the model's.
+  assert.equal(model.attempts, 1);
+  const done = events.at(-1) as Extract<StreamEvent, { type: 'response_done' }>;
+  assert.equal(done.type, 'response_done');
+  assert.equal(done.response.id, 'resp_reasoning_clean');
+});
+
+test('CodexResponsesModel retries an empty completion, then recovers (non-streamed getResponse)', async () => {
+  const model = new ScriptedCodexModel(async function* (attempt) {
+    if (attempt === 1) {
+      yield* emptyCompletion();
+      return;
+    }
+    yield* successfulTurn('resp_nonstream_after_empty');
+  });
+
+  const response = await model.getResponse(modelRequest());
+
+  assert.equal(model.attempts, 2);
+  assert.equal(response.responseId, 'resp_nonstream_after_empty');
+  assert.equal(response.output.length, 1);
+});
+
 test('CodexResponsesModel retries first-call headers timeout before streaming content', async () => {
   const model = new ScriptedCodexModel(async function* (attempt) {
     if (attempt === 1) {
