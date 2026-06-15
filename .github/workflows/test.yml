@@ -30,6 +30,30 @@ jobs:
       - name: Run tests
         run: npx tsx --test src/**/*.test.ts
 
+  gate-benchmark:
+    name: Harness gate benchmark (violations prevented)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Gates ON vs OFF: every safety gate must still PREVENT its trap (a
+      # scenario that WOULD commit an irreversible rule violation). Fully
+      # offline/deterministic — no model, no network, no auth. Exits non-zero
+      # if any gate stops blocking, so a gate regression fails the build.
+      # BLOCKING by design (the eval IS the harness). Run locally: npm run bench:gates
+      - name: Run gate benchmark
+        run: npm run bench:gates
+
   typecheck:
     name: TypeScript check (non-blocking on WIP files)
     runs-on: ubuntu-latest
