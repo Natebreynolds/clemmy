@@ -22,7 +22,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 // Dynamic imports — see eventlog.test.ts for why.
-const { resetEventLog, createSession, requestKill } = await import('./eventlog.js');
+const { resetEventLog, createSession, requestKill, appendEvent } = await import('./eventlog.js');
 const {
   assertNotKilled,
   KillRequested,
@@ -674,7 +674,12 @@ test('destination gate: a PROD ambient publish HARD-blocks every attempt until e
     //    clobber-by-retry). This is the core regression.
     await assert.rejects(() => Promise.resolve(shell(prodCmd)), /IMPLICIT_DESTINATION/);
     await assert.rejects(() => Promise.resolve(shell(prodCmd)), /IMPLICIT_DESTINATION/);
-    // 3. With an EXPLICIT --site, the prod deploy passes immediately.
+    // 3. PROVENANCE (2026-06-15 clobber): an EXPLICIT --site to a target that was
+    //    NEVER created or named this session is REFUSED — explicit ≠ correct
+    //    (the coffee-shop-onto-a-law-firm-site case).
+    await assert.rejects(() => Promise.resolve(shell('netlify deploy --dir "/x/site" --prod --site stranger-999 --json')), /UNVERIFIED_DESTINATION/);
+    //    …but once the user has named the target (or it was created), it passes.
+    appendEvent({ sessionId: sess.id, turn: 0, role: 'user', type: 'user_input_received', data: { text: 'deploy it to abc123 please' } });
     assert.equal(await shell('netlify deploy --dir "/x/site" --prod --site abc123 --json'), 'deployed');
     // 4. A DRAFT (non-prod) ambient publish is the gentle one-shot: blocks once…
     await assert.rejects(() => Promise.resolve(shell('netlify deploy --dir "/x/site"')), /IMPLICIT_DESTINATION/);

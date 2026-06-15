@@ -18,6 +18,9 @@ import {
   markDestinationNudged,
   ImplicitDestinationError,
   classifyShellNetworkMutation,
+  evaluateDestinationProvenance,
+  extractExplicitPublishTargets,
+  UnverifiedDestinationError,
   _resetDestinationStateForTests,
 } from './destination-gate.js';
 
@@ -180,4 +183,57 @@ test('ImplicitDestinationError carries a recoverable, explicit message', () => {
   assert.match(e.message, /netlify status/);  // or how to confirm the current link
   assert.match(e.message, /conscious second attempt/i); // one-shot: a retry passes
   assert.equal(e.verb, 'deploy');
+});
+
+// ─── Destination PROVENANCE (2026-06-15 clobber: coffee shop onto a law firm) ───
+
+test('extractExplicitPublishTargets pulls --site/--project values, ignores vars', () => {
+  assert.deepEqual(extractExplicitPublishTargets('netlify deploy --prod --dir . --site 6c97fed4-abc'), ['6c97fed4-abc']);
+  assert.deepEqual(extractExplicitPublishTargets('netlify deploy --site=harbor-coffee'), ['harbor-coffee']);
+  assert.deepEqual(extractExplicitPublishTargets('vercel --prod --project my-app'), ['my-app']);
+  assert.deepEqual(extractExplicitPublishTargets('netlify deploy --site "$SITE_ID"'), []); // shell var → implicit gate owns it
+  assert.deepEqual(extractExplicitPublishTargets('netlify deploy --prod'), []);            // no explicit target
+});
+
+test('provenance gate HARD-BLOCKS a deploy to an explicit target never created/named this session (the clobber)', () => {
+  // Session created/named only "harbor-coffee-cafe"; the deploy targets an
+  // UNRELATED existing site id grabbed from `netlify status` → must refuse.
+  const provenance = (t: string) => new Set(['harbor-coffee-cafe']).has(t);
+  const v = evaluateDestinationProvenance('cd /x && netlify deploy --prod --dir . --site 6c97fed4-6043-4841-975c-b8f99b2e274c', provenance);
+  assert.equal(v.action, 'flag');
+  assert.equal(v.hardBlock, true);
+  assert.match(v.reason, /no session provenance/i);
+});
+
+test('provenance gate ALLOWS a deploy to a site created this session', () => {
+  // create produced both the slug and the resolved id; deploy targets the id.
+  const provenance = (t: string) => new Set(['harbor-coffee-cafe', 'abc-123-id']).has(t);
+  const v = evaluateDestinationProvenance('netlify deploy --prod --dir . --site abc-123-id', provenance);
+  assert.equal(v.action, 'allow');
+});
+
+test('provenance gate ALLOWS a deploy to a site the user explicitly named', () => {
+  const userNamed = (t: string) => 'deploy harbor coffee to my existing site harbor-coffee'.includes(t);
+  const v = evaluateDestinationProvenance('netlify deploy --prod --site harbor-coffee', userNamed);
+  assert.equal(v.action, 'allow');
+});
+
+test('provenance gate DEFERS (allow) when there is no explicit target — implicit gate owns it', () => {
+  const v = evaluateDestinationProvenance('netlify deploy --prod', () => false);
+  assert.equal(v.action, 'allow');
+  assert.match(v.reason, /implicit-destination gate/i);
+});
+
+test('provenance gate ignores non-publish commands', () => {
+  const v = evaluateDestinationProvenance('netlify sites:list --json', () => false);
+  assert.equal(v.action, 'allow');
+});
+
+test('UnverifiedDestinationError is recoverable and tells the model to create a dedicated site', () => {
+  const e = new UnverifiedDestinationError({ command: 'netlify deploy --site x', verb: 'deploy', shapeKey: 'netlify:deploy:unverified', targets: ['6c97fed4'] });
+  assert.match(e.message, /UNVERIFIED_DESTINATION/);
+  assert.match(e.message, /sites:create/);        // how to make a real dedicated target
+  assert.match(e.message, /--account-slug/);      // non-interactively (the root trigger)
+  assert.match(e.message, /STOP and tell the user/i); // never publish onto an unverified target
+  assert.equal(e.hardBlock, true);
 });

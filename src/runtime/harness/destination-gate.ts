@@ -361,3 +361,91 @@ export class ImplicitDestinationError extends Error {
     this.hardBlock = hard;
   }
 }
+
+// ─────────────────────────────────────────────────────────────────
+// Destination PROVENANCE (2026-06-15 second wrong-site incident)
+// ─────────────────────────────────────────────────────────────────
+//
+// The implicit-destination gate above forces a target into the open. But an
+// EXPLICIT target can still be the WRONG one: the 2026-06-15 incident had a
+// `netlify sites:create` fail on an interactive team prompt, after which the
+// model grabbed an UNRELATED existing site id from `netlify status` and ran
+// `deploy --site <id>` onto it — clobbering a live law-firm site with a
+// coffee-shop build. `hasExplicitDestination` said "explicit → allow", because
+// the gate verified explicitness, never PROVENANCE. This adds the missing
+// check: a publish to an explicit target is only safe if that target was
+// CREATED or NAMED in this task/session. Pure — the caller supplies the
+// provenance predicate (built from the eventlog) + scopes it to chat sessions
+// so recurring workflows that legitimately reuse a stable site id aren't blocked.
+
+const PUBLISH_TARGET_FLAG_RE =
+  /(?:--site|--site-id|--site-name|--project|--project-id|--app|--app-name|--target)(?:=|\s+)["']?([A-Za-z0-9][\w.-]*)["']?/gi;
+
+/** Extract the explicit publish target value(s) (site/project/app id or name),
+ *  lowercased + de-duped. Empty when the command names no explicit target.
+ *  Shell-var placeholders and the literal "current" are ignored (they route
+ *  through the implicit gate, not provenance). Pure. */
+export function extractExplicitPublishTargets(command: string): string[] {
+  if (!command || typeof command !== 'string') return [];
+  const out = new Set<string>();
+  PUBLISH_TARGET_FLAG_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = PUBLISH_TARGET_FLAG_RE.exec(command)) !== null) {
+    const v = m[1].toLowerCase();
+    if (v && v !== 'current' && !v.startsWith('$')) out.add(v);
+  }
+  return [...out];
+}
+
+/**
+ * Evaluate whether an explicit-target publish has session PROVENANCE. Pure: the
+ * caller supplies `hasProvenance(target)` (sites created this session + targets
+ * the user named). Returns allow when it's not a publish, names no explicit
+ * target (the implicit gate owns that), or every explicit target is
+ * provenanced; flag (hardBlock) when a publish names an explicit target with NO
+ * provenance — the clobber-an-unrelated-site shape. Hard so a retry of the same
+ * command can't slip it through.
+ */
+export function evaluateDestinationProvenance(
+  command: string,
+  hasProvenance: (target: string) => boolean,
+): DestinationGateResult {
+  const shape = classifyShellCommand(command);
+  if (!shape.isPublish) return { action: 'allow', reason: 'not an irreversible publish command' };
+  const targets = extractExplicitPublishTargets(command);
+  if (targets.length === 0) {
+    return { action: 'allow', reason: 'no explicit target — implicit-destination gate owns this' };
+  }
+  const unproven = targets.filter((t) => !hasProvenance(t));
+  if (unproven.length === 0) {
+    return { action: 'allow', reason: 'explicit target has session provenance', verb: shape.verb };
+  }
+  return {
+    action: 'flag',
+    reason: `publish (${shape.verb}) to explicit target "${unproven[0]}" with NO session provenance — not created or named in this conversation (clobber risk)`,
+    verb: shape.verb,
+    shapeKey: `${shape.binary ?? 'shell'}:${shape.verb}:unverified`,
+    hardBlock: true,
+  };
+}
+
+/**
+ * Thrown for a publish to an EXPLICIT but UNPROVENANCED target — the 2026-06-15
+ * clobber class (a coffee-shop build deployed onto a law-firm site via an
+ * existing site id reused from `netlify status` after `sites:create` failed).
+ * Always a HARD block. Surfaced as a SOFT tool error (recoverable) like
+ * ImplicitDestinationError so the model self-corrects instead of aborting.
+ */
+export class UnverifiedDestinationError extends Error {
+  public readonly verb: string;
+  public readonly shapeKey: string;
+  public readonly hardBlock = true;
+  constructor(opts: { command: string; verb: string; shapeKey: string; targets: string[] }) {
+    super(
+      `UNVERIFIED_DESTINATION: this \`${opts.verb}\` publishes to "${opts.targets.join(', ')}", a target that was NOT created or named in THIS conversation — it may be an UNRELATED live site. REFUSED. (This is how a build once clobbered an unrelated site: a new-site create failed, and an existing site id from \`status\` was reused.) Do NOT deploy onto a pre-existing site you did not create for THIS task. Instead: create a DEDICATED new site NON-INTERACTIVELY — pass the team/account so it cannot hang on a prompt (e.g. \`netlify sites:create --name <slug> --account-slug <team>\`) — and deploy to ITS id. If the user EXPLICITLY named this exact site earlier, restate that and proceed. If site creation keeps failing, STOP and tell the user the blocker — never publish onto an unverified target.`,
+    );
+    this.name = 'UnverifiedDestinationError';
+    this.verb = opts.verb;
+    this.shapeKey = opts.shapeKey;
+  }
+}

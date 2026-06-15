@@ -28,9 +28,12 @@ import {
 import {
   isDestinationGateEnabled,
   evaluateShellDestination,
+  evaluateDestinationProvenance,
+  extractExplicitPublishTargets,
   wasDestinationNudged,
   markDestinationNudged,
   ImplicitDestinationError,
+  UnverifiedDestinationError,
   classifyShellNetworkMutation,
 } from './destination-gate.js';
 
@@ -583,6 +586,56 @@ export function harnessToolBracketsEnabled(): boolean {
  * check" — safer than crashing on a missing counter.
  */
 
+/**
+ * Build the publish-PROVENANCE predicate for the destination gate (2026-06-15
+ * clobber). A target is "provenanced" if it was CREATED in this session (a
+ * `sites:create`/`projects:create` — the intended --name slug, plus the new
+ * site's id/name/url from that call's SUCCESS result, correlated by callId) OR
+ * the user NAMED it in a message this session. Deliberately does NOT mine
+ * arbitrary tool results (e.g. `netlify status`) for ids — that output is the
+ * stale-link LEAK that caused the clobber, so it must not confer provenance.
+ * Fail-open: any error yields an empty predicate, which only makes the gate
+ * stricter (never crashes a tool call).
+ */
+function buildPublishProvenance(sessionId: string): (target: string) => boolean {
+  const created = new Set<string>();
+  let userBlob = '';
+  try {
+    const events = listEvents(sessionId, { types: ['user_input_received', 'tool_called', 'tool_returned'] });
+    const createCallIds = new Set<string>();
+    const userParts: string[] = [];
+    for (const e of events) {
+      const d = e.data as Record<string, unknown> | undefined;
+      if (e.type === 'user_input_received') {
+        userParts.push(String(d?.text ?? '').toLowerCase());
+      } else if (e.type === 'tool_called') {
+        const args = String(d?.arguments ?? '');
+        if (/sites?:create|projects?:create/i.test(args)) {
+          const callId = String(d?.callId ?? '');
+          if (callId) createCallIds.add(callId);
+          const nm = args.match(/--name(?:=|\s+)["']?([\w.-]+)/i);
+          if (nm) created.add(nm[1].toLowerCase());
+        }
+      } else if (e.type === 'tool_returned') {
+        const callId = String(d?.callId ?? '');
+        if (createCallIds.has(callId)) {
+          const res = String(d?.result ?? '');
+          for (const m of res.matchAll(/"(?:id|site_id|name|site_name)"\s*:\s*"([\w.-]+)"/gi)) created.add(m[1].toLowerCase());
+          for (const m of res.matchAll(/([\w-]+)\.netlify\.app/gi)) created.add(m[1].toLowerCase());
+        }
+      }
+    }
+    userBlob = userParts.join(' \n ');
+  } catch { /* fail-open: empty provenance = stricter gate, never a crash */ }
+  return (target: string) => {
+    const t = target.toLowerCase();
+    if (created.has(t)) return true;
+    // The user explicitly named this site (id/slug) in a message this session.
+    if (t.length >= 4 && userBlob.includes(t)) return true;
+    return false;
+  };
+}
+
 /** Duplicate-ledger compensation: the external_write event is recorded
  *  PRE-dispatch (conservative — a crash mid-send must still count), but a
  *  dispatch that demonstrably FAILED never wrote anything. Without this, a
@@ -887,6 +940,27 @@ export function wrapToolForHarness<T extends WrappableTool>(
           ? (parsedInput as { command: string }).command
           : '';
         if (command) {
+          // PROVENANCE (2026-06-15 clobber): a publish to an EXPLICIT target that
+          // was NOT created or named THIS session may be an unrelated live site
+          // (a coffee-shop build deployed onto a law-firm site via a site id
+          // reused from `netlify status` after `sites:create` failed). Hard-block.
+          // Chat only, so recurring workflows reusing a stable site id are exempt.
+          const sessionRow = getSession(ctx.sessionId);
+          if (sessionRow?.kind === 'chat') {
+            const prov = evaluateDestinationProvenance(command, buildPublishProvenance(ctx.sessionId));
+            if (prov.action === 'flag' && prov.shapeKey) {
+              try {
+                appendEvent({
+                  sessionId: ctx.sessionId,
+                  turn: 0,
+                  role: 'system',
+                  type: 'guardrail_tripped',
+                  data: { kind: 'unverified_destination', toolName: tool.name, verb: prov.verb ?? null, shapeKey: prov.shapeKey, hardBlock: true },
+                });
+              } catch { /* telemetry write must never block */ }
+              throw new UnverifiedDestinationError({ command, verb: prov.verb ?? 'publish', shapeKey: prov.shapeKey, targets: extractExplicitPublishTargets(command) });
+            }
+          }
           const verdict = evaluateShellDestination(command);
           // PRODUCTION ambient publish → HARD block on EVERY attempt (retrying
           // the same ambient command must never clobber the linked site — the
@@ -909,6 +983,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
       }
     } catch (err) {
       if (err instanceof ImplicitDestinationError) throw err;
+      if (err instanceof UnverifiedDestinationError) throw err;
       // eslint-disable-next-line no-console
       console.warn('[harness] destination gate threw (fail-open)', err instanceof Error ? err.message : err);
     }
@@ -1152,7 +1227,8 @@ export function wrapToolForHarness<T extends WrappableTool>(
           err instanceof ToolCallsLimitExceeded ||
           err instanceof GroundingCheckFailedError ||
           err instanceof DuplicateExternalWriteError ||
-          err instanceof ImplicitDestinationError
+          err instanceof ImplicitDestinationError ||
+          err instanceof UnverifiedDestinationError
         ) {
           return `Tool call refused by harness: ${err instanceof Error ? err.message : String(err)}`;
         }
