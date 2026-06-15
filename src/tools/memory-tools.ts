@@ -181,7 +181,7 @@ export function registerMemoryTools(server: McpServer): void {
 
   server.tool(
     'memory_remember',
-    'Record a durable fact in long-term memory. Use for user preferences (kind=user), project context (project), standing feedback (feedback), or external references (reference). Idempotent — re-recording the same fact bumps its score.',
+    'Record a durable fact in long-term memory. Use for user preferences (kind=user), project context (project), standing feedback (feedback), or external references (reference). Use kind=constraint for an ENFORCEABLE standing rule that must HARD-GATE tool dispatch — a sender/account/destination routing rule ("always send Outlook mail from billing@acme.co", "only write Salesforce in the sandbox org") or a never-do guardrail ("never post to the prod channel"). A constraint is auto-pinned and is checked by the dispatch gate on every matching tool call, so reserve it for rules that should BLOCK a wrong action, not general preferences. Idempotent — re-recording the same fact bumps its score.',
     {
       kind: z.enum(FACT_KINDS as unknown as [string, ...string[]]),
       content: z.string().min(3).max(800),

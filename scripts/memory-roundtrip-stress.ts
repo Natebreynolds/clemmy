@@ -28,6 +28,7 @@ const { rememberFact, setFactPinned, listConstraints, listPinnedFacts, searchFac
 const { openMemoryDb } = await import('../src/memory/db.js');
 const { renderHarnessMemoryContext } = await import('../src/agents/harness-context.js');
 const { findEmailSendConstraint, constraintsForToolkit } = await import('../src/runtime/harness/constraint-guard.js');
+const { extractAutoMemoryCandidates } = await import('../src/memory/auto-capture.js');
 
 function clearFacts(): void {
   openMemoryDb().prepare('DELETE FROM consolidated_facts').run();
@@ -154,6 +155,19 @@ const SCENARIOS: Scenario[] = [
       const ctx = renderHarnessMemoryContext();
       const present = ctx.includes('GENUINE RULE: send invoices');
       return { ok: present, detail: present ? 'genuine old pin still injected ✓' : 'DROPPED — newer synthetic pins crowded it out of the 12-cap' };
+    },
+  },
+  {
+    id: 'constraint-autocapture-roundtrip',
+    desc: 'an auto-captured sender rule round-trips all the way to dispatch-gate enforcement',
+    run: async () => {
+      clearFacts();
+      const cands = extractAutoMemoryCandidates('From now on always send Outlook email from nathan.reynolds@scorpion.co — never the default account.');
+      const c = cands.find((x) => x.kind === 'constraint');
+      if (!c) return { ok: false, detail: 'auto-capture did NOT classify the sender rule as a constraint' };
+      rememberFact({ kind: 'constraint', content: c.content, importance: 9 });
+      const hit = findEmailSendConstraint('OUTLOOK_SEND_EMAIL', {});
+      return { ok: !!hit && hit.allowedAccount.includes('scorpion.co'), detail: hit ? 'auto-capture → enforced ✓' : 'captured but NOT enforced at dispatch' };
     },
   },
 ];

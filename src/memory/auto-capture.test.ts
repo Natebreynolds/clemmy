@@ -21,6 +21,34 @@ test('extractAutoMemoryCandidates captures standing chat feedback', () => {
   assert.match(candidates[0]?.content ?? '', /tool streaming/i);
 });
 
+test('extractAutoMemoryCandidates classifies a from-account email-routing rule as a constraint (enforceable)', () => {
+  const candidates = extractAutoMemoryCandidates('Always send Outlook mail from billing@acme.co — never the default account.');
+  const constraint = candidates.find((c) => c.kind === 'constraint');
+  assert.ok(constraint, 'an enforceable sender rule becomes a constraint the dispatch gate can enforce');
+  assert.match(constraint!.content, /billing@acme\.co/);
+  assert.equal(constraint!.pin, true, 'constraint is pinned');
+  // The same rule must NOT also be stored as a plain (un-enforced) preference.
+  assert.ok(!candidates.some((c) => c.kind === 'user' || c.kind === 'feedback'), 'no duplicate preference candidate');
+});
+
+test('extractAutoMemoryCandidates does NOT mis-classify a RECIPIENT mention as a constraint (no over-block)', () => {
+  // "email reports@acme.com" is a recipient, not a from-account — classifying it
+  // would make findEmailSendConstraint wrongly restrict every send to that address.
+  const candidates = extractAutoMemoryCandidates('Always email the weekly report to reports@acme.com every Monday.');
+  assert.ok(!candidates.some((c) => c.kind === 'constraint'), 'a recipient rule is never an enforced sender constraint');
+});
+
+test('extractAutoMemoryCandidates constraint classification respects the kill-switch', () => {
+  const prev = process.env.CLEMMY_AUTOCAP_CONSTRAINTS;
+  process.env.CLEMMY_AUTOCAP_CONSTRAINTS = 'off';
+  try {
+    const candidates = extractAutoMemoryCandidates('Always send Outlook mail from billing@acme.co.');
+    assert.ok(!candidates.some((c) => c.kind === 'constraint'), 'kill-switch off → legacy behavior, no constraint');
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_AUTOCAP_CONSTRAINTS; else process.env.CLEMMY_AUTOCAP_CONSTRAINTS = prev;
+  }
+});
+
 test('extractAutoMemoryCandidates ignores low signal approvals', () => {
   assert.deepEqual(extractAutoMemoryCandidates('approve'), []);
   assert.deepEqual(extractAutoMemoryCandidates("let's do it"), []);

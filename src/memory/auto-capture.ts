@@ -85,6 +85,25 @@ const STANDING_EMAIL_RE = /[\w.+-]+@[\w-]+\.[\w.-]+/;
 // stays a destination phrase, not arbitrary prose.
 const STANDING_LIST_PHRASE_RE = /\b(?:to|use)\s+(?:this|that|these|those|the following|the|my|our)\s+(?:[\w'-]+\s+){0,3}?(?:list|distro|group|team|sheet|doc|document|spreadsheet|folder|channel|inbox)\b/i;
 
+// Enforceable SENDER/account routing rule → kind:'constraint' (the dispatch gate
+// enforces it; rememberFact auto-pins constraints). HIGH PRECISION on purpose:
+// findEmailSendConstraint reads the FIRST email in the rule as the allowed FROM
+// account, so a recipient mention ("email reports@acme.com weekly") must NEVER
+// classify as a constraint — only an explicit from/use/as/via sender marker on
+// the email qualifies. Default-on; kill-switch CLEMMY_AUTOCAP_CONSTRAINTS=off.
+const SENDER_ACCOUNT_RE = /\b(?:from|as|using|use|via|through)\s+(?:the\s+)?(?:account\s+)?[\w.+-]+@[\w-]+\.[\w.-]+/i;
+const EMAIL_APP_RE = /\b(?:outlook|gmail|e-?mail|mailbox|inbox)\b/i;
+const STANDING_DIRECTIVE_RE = /\b(?:always|only|never|from now on|by default|going forward|each time|every time|whenever)\b/i;
+function autocapConstraintsEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_AUTOCAP_CONSTRAINTS', 'on') || 'on').toLowerCase() !== 'off';
+}
+function isEnforceableSenderConstraint(text: string): boolean {
+  return autocapConstraintsEnabled()
+    && STANDING_DIRECTIVE_RE.test(text)
+    && EMAIL_APP_RE.test(text)
+    && SENDER_ACCOUNT_RE.test(text);
+}
+
 /**
  * A standing marker only earns a durable fact when it names a CONCRETE target:
  * a resource locator (sheet/doc id or URL), at least one email, or a determiner-
@@ -159,7 +178,22 @@ export function extractAutoMemoryCandidates(message: string, maxCandidates = 3):
   const candidates: AutoMemoryCandidate[] = [];
   const prohibition = isSafetyProhibition(text);
 
-  if (FEEDBACK_CUES.test(text)) {
+  // Enforceable sender/account routing rule → kind:'constraint' so the dispatch
+  // gate (constraint-guard via listConstraints) actually ENFORCES it, closing the
+  // round-trip a kind:'user'/'feedback' fact could never reach. Emitted FIRST; the
+  // feedback branch below is gated on this so the same rule isn't also stored as a
+  // plain (un-enforced) preference.
+  if (isEnforceableSenderConstraint(text)) {
+    addCandidate(candidates, {
+      kind: 'constraint',
+      content: `Standing rule (enforced): ${text}`,
+      reason: 'enforceable sender/account routing rule',
+      pin: true,
+    });
+  }
+  const capturedConstraint = candidates.some((c) => c.kind === 'constraint');
+
+  if (FEEDBACK_CUES.test(text) && !capturedConstraint) {
     const kind: ConsolidatedFactKind = PROJECT_TERMS.test(text) ? 'feedback' : 'user';
     addCandidate(candidates, {
       kind,
