@@ -77,6 +77,24 @@ test('aborted / interrupted / awaiting_approval are never flagged (known/handled
   assert.equal(findStalledBackgroundTasks(tasks, NOW, new Set()).length, 0);
 });
 
+test('awaiting_approval whose approval is already RESOLVED → approval_orphaned', () => {
+  const tasks: BackgroundTaskWatchdogView[] = [
+    { id: 'orph', title: 'Send batch', status: 'awaiting_approval', updatedAt: ago(60 * MIN), pendingApprovalId: 'apr-123' },
+  ];
+  const stalled = findStalledBackgroundTasks(tasks, NOW, new Set(), {}, new Set(['apr-123']));
+  assert.equal(stalled.length, 1);
+  assert.equal(stalled[0].reason, 'approval_orphaned');
+});
+
+test('awaiting_approval whose approval is still pending / from another store is NOT flagged (no false positive)', () => {
+  const tasks: BackgroundTaskWatchdogView[] = [
+    { id: 'live', title: 'Still waiting', status: 'awaiting_approval', updatedAt: ago(60 * MIN), pendingApprovalId: 'apr-live' },
+    { id: 'other', title: 'Other store', status: 'awaiting_approval', updatedAt: ago(60 * MIN), pendingApprovalId: 'uuid-elsewhere' },
+  ];
+  // resolvedApprovalIds contains only an UNRELATED resolved id → neither task flagged.
+  assert.equal(findStalledBackgroundTasks(tasks, NOW, new Set(), {}, new Set(['apr-999'])).length, 0);
+});
+
 test('reportedBackTaskIdsFrom: only DELIVERED, non-watchdog notifications count', () => {
   const ids = reportedBackTaskIdsFrom([
     { id: 'n1', deliveredAt: ago(MIN), metadata: { backgroundTaskId: 'delivered' } },

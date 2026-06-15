@@ -2,6 +2,7 @@ import pino from 'pino';
 import { getRuntimeEnv } from '../config.js';
 import { addNotification, loadNotifications } from '../runtime/notifications.js';
 import { listBackgroundTasks, type BackgroundTaskRecord } from './background-tasks.js';
+import { ApprovalStore } from '../runtime/approval-store.js';
 
 /**
  * Background-task watchdog (north star: REPORTS BACK WITHOUT FAIL).
@@ -47,7 +48,7 @@ export interface StalledBackgroundTask {
   id: string;
   title: string;
   ageMs: number;
-  reason: 'running_stalled' | 'terminal_undelivered';
+  reason: 'running_stalled' | 'terminal_undelivered' | 'approval_orphaned';
 }
 
 export interface BackgroundTaskWatchdogView {
@@ -59,6 +60,7 @@ export interface BackgroundTaskWatchdogView {
   updatedAt?: string;
   completedAt?: string;
   maxMinutes?: number;
+  pendingApprovalId?: string;
 }
 
 /**
@@ -80,6 +82,13 @@ export function findStalledBackgroundTasks(
     terminalUndeliveredStallMs?: number;
     terminalUndeliveredMaxMs?: number;
   } = {},
+  // Approval ids the approval store has RESOLVED (any non-pending status). When
+  // provided, a task stuck in awaiting_approval whose pendingApprovalId is in this
+  // set is ORPHANED — the approval was decided but no path advanced the task (its
+  // only exit, queueBackgroundTaskApprovalResolution, is interactive-only). An id
+  // NOT in this set is left alone (still pending, or belongs to another store) so
+  // a legitimately-waiting task is never false-flagged.
+  resolvedApprovalIds?: Set<string>,
 ): StalledBackgroundTask[] {
   const floor = opts.runningStallFloorMs ?? DEFAULT_RUNNING_STALL_MS;
   const terminalStall = opts.terminalUndeliveredStallMs ?? DEFAULT_TERMINAL_UNDELIVERED_STALL_MS;
@@ -110,6 +119,18 @@ export function findStalledBackgroundTasks(
       const ageMs = now - refMs;
       if (ageMs >= terminalStall && ageMs <= terminalMax) {
         out.push({ id: task.id, title: task.title ?? task.id, ageMs, reason: 'terminal_undelivered' });
+      }
+    } else if (status === 'awaiting_approval' && resolvedApprovalIds && task.pendingApprovalId
+      && resolvedApprovalIds.has(task.pendingApprovalId)) {
+      // Orphaned: the approval was RESOLVED in the store but the task never left
+      // awaiting_approval (the resolution→advance path didn't fire, or the approval
+      // was swept). A small grace avoids racing an in-flight resolution.
+      const ref = task.updatedAt ?? task.startedAt ?? task.createdAt;
+      const refMs = ref ? Date.parse(ref) : Number.NaN;
+      if (!Number.isFinite(refMs)) continue;
+      const ageMs = now - refMs;
+      if (ageMs >= terminalStall) {
+        out.push({ id: task.id, title: task.title ?? task.id, ageMs, reason: 'approval_orphaned' });
       }
     }
   }
@@ -142,6 +163,14 @@ function isEnabled(): boolean {
 }
 
 function alertFor(task: StalledBackgroundTask, minutes: number): { title: string; body: string } {
+  if (task.reason === 'approval_orphaned') {
+    return {
+      title: `Background task stuck awaiting an approval that's already resolved: ${task.title}`,
+      body:
+        `Task \`${task.id}\` ("${task.title}") has been paused on approval for ${minutes} min, but that approval is no longer pending `
+        + `(it was decided or expired without advancing the task). Re-run it, or re-issue the approval from Console → Activity.`,
+    };
+  }
   if (task.reason === 'terminal_undelivered') {
     return {
       title: `Background task finished but its result wasn't delivered: ${task.title}`,
@@ -177,8 +206,19 @@ export function runBackgroundTaskWatchdog(now: number = Date.now()): { stalled: 
   } catch {
     reportedBack = new Set<string>();
   }
+  // Approval ids the store has RESOLVED (any non-pending status) — lets the
+  // watchdog spot a background task orphaned on an already-decided approval.
+  // Best-effort: a store read failure just disables the orphan check this tick.
+  let resolvedApprovalIds: Set<string> | undefined;
+  try {
+    resolvedApprovalIds = new Set(
+      new ApprovalStore().listAll().filter((a) => a.status !== 'pending').map((a) => a.id),
+    );
+  } catch {
+    resolvedApprovalIds = undefined;
+  }
 
-  const stalled = findStalledBackgroundTasks(tasks, now, reportedBack);
+  const stalled = findStalledBackgroundTasks(tasks, now, reportedBack, {}, resolvedApprovalIds);
   for (const task of stalled) {
     const minutes = Math.max(1, Math.round(task.ageMs / 60_000));
     const alert = alertFor(task, minutes);

@@ -73,6 +73,14 @@ export class ApprovalStore {
     return loadApprovals().filter((item) => item.status === 'pending');
   }
 
+  /** Every approval this store knows about (any status). Lets a sweeper tell
+   *  "resolved here but the dependent task never advanced" (orphaned) apart from
+   *  "an id this store has never heard of" (belongs to another store) — so it
+   *  never false-flags a still-legitimately-pending approval. */
+  listAll(): PendingApproval[] {
+    return loadApprovals();
+  }
+
   get(id: string): PendingApproval | undefined {
     return loadApprovals().find((item) => item.id === id);
   }
