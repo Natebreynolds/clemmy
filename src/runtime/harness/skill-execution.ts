@@ -114,7 +114,31 @@ function extractPrescribedScripts(skillBody: string): string[] {
   return [...out].slice(0, 24);
 }
 
-/** Script basenames actually INVOKED via run_shell_command this session. */
+/** RENDERER/producer scripts among the prescribed set — the ones that EMIT the
+ *  deliverable (name contains generate/render/compose/emit). Running a cheap
+ *  helper (a validator, an aggregator) must NOT satisfy the gate; the renderer
+ *  must — that's the validate-but-don't-generate gaming the lunar audit used.
+ *  Empty → the skill has no obvious producer (the caller falls back to "any
+ *  prescribed script"). */
+function rendererScripts(prescribed: string[]): string[] {
+  return prescribed.filter((s) => /(?:generate|render|compose|emit)/i.test(s));
+}
+
+/** Script basenames a command REQUIREs / IMPORTs — library-style skills are USED
+ *  via `require('./src/generate-html')`, not `node generate-html.js`. Normalized
+ *  to a `.js` basename to match extractPrescribedScripts. */
+function extractRequiredScripts(command: string): string[] {
+  if (!command || typeof command !== 'string') return [];
+  const out = new Set<string>();
+  for (const m of command.matchAll(/(?:require\(\s*|from\s+|import\s+)['"`](?:[\w.@/-]+\/)?([\w.-]+?)(?:\.(?:m?[jt]s|cjs))?['"`]/gi)) {
+    const base = m[1].toLowerCase();
+    if (base) out.add(base.endsWith('.js') ? base : `${base}.js`);
+  }
+  return [...out].slice(0, 24);
+}
+
+/** Script basenames actually INVOKED this session — run as `node x.js` OR pulled
+ *  in via `require('…x')`/`import`. */
 function sessionInvokedScripts(sessionId: string): Set<string> {
   const invoked = new Set<string>();
   for (const e of listEvents(sessionId, { types: ['tool_called'] })) {
@@ -122,6 +146,7 @@ function sessionInvokedScripts(sessionId: string): Set<string> {
     try {
       const cmd = String((JSON.parse(String(e.data?.arguments ?? '{}')) as { command?: unknown }).command ?? '');
       for (const s of extractInvokedScripts(cmd)) invoked.add(s);
+      for (const s of extractRequiredScripts(cmd)) invoked.add(s);
     } catch { /* skip a malformed command */ }
   }
   return invoked;
@@ -133,26 +158,54 @@ export interface SkillExecutionShortfall {
 }
 
 /**
- * DETERMINISTIC skill-execution floor for the completion gate. A loaded skill
- * that PRESCRIBES bundled scripts but ran NONE of them was not executed — the
- * deliverable was hand-rolled (the 2026-06-15 lunar-audit shipped a deployed URL
- * + file that passed the LLM judge while running 0 of the skill's 7 scripts). The
- * LLM judge can't be trusted for this binary fact, so the gate enforces it in
- * code. Returns the first offending skill, or null when every script-backed
- * loaded skill ran ≥1 of its scripts (or none was script-backed). Conservative
- * zero-ran threshold so a partial-but-real run is never false-bounced. Fail-open
- * → null. General to any script-backed skill (no per-skill logic).
+ * The shared deterministic core. A skill's deliverable must come from its own
+ * RENDERER (the generate/render script), not be hand-rolled. `required` = the
+ * renderer(s) when the skill ships one, else any prescribed script (skills with
+ * no obvious producer keep the looser any-script floor). Returns the offending
+ * skill if NONE of `required` ran, else null. Catches the validate-but-don't-
+ * generate gaming: running the cheap validator no longer satisfies the gate.
+ */
+function bodyShortfall(skill: string, body: string, invoked: Set<string>): SkillExecutionShortfall | null {
+  const prescribed = extractPrescribedScripts(body);
+  if (prescribed.length === 0) return null; // pure-reference skill — nothing to enforce
+  const producers = rendererScripts(prescribed);
+  const required = producers.length > 0 ? producers : prescribed;
+  if (required.some((s) => invoked.has(s))) return null; // the renderer (or fallback) ran
+  return { skill, prescribed: required };
+}
+
+/**
+ * DETERMINISTIC skill-execution floor for the CHAT completion gate (skills loaded
+ * via skill_read). A loaded skill whose RENDERER never ran was not executed — the
+ * deliverable was hand-rolled (the 2026-06-15 lunar-audit passed the LLM judge
+ * while running 0 of the skill's scripts, then on re-run only ran the VALIDATOR
+ * on a hand-rolled file). The LLM judge can't be trusted for this binary fact, so
+ * the gate enforces it in code. Fail-open → null. General to any script-backed skill.
  */
 export function skillExecutionShortfall(sessionId: string): SkillExecutionShortfall | null {
   try {
     const invoked = sessionInvokedScripts(sessionId);
     for (const skill of gatherSessionSkills(sessionId)) {
-      const prescribed = extractPrescribedScripts(skill.body);
-      if (prescribed.length === 0) continue; // pure-reference skill — nothing to enforce
-      if (prescribed.some((s) => invoked.has(s))) continue; // ran ≥1 prescribed script → followed
-      return { skill: skill.name, prescribed };
+      const gap = bodyShortfall(skill.name, skill.body, invoked);
+      if (gap) return gap;
     }
     return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * DETERMINISTIC skill-execution floor for the WORKFLOW-STEP path. A workflow step
+ * injects its skill via `usesSkill` (prompt-prepend), NOT skill_read — so the
+ * caller passes the skill body directly (loadSkill(step.usesSkill)). Same
+ * renderer-must-run rule as the chat gate. Fail-open → null. This is what closes
+ * the escape hatch: a chat-gate bounce pushed the model to dispatch a background
+ * workflow, which had no skill enforcement.
+ */
+export function skillBodyExecutionShortfall(skillName: string, skillBody: string, sessionId: string): SkillExecutionShortfall | null {
+  try {
+    return bodyShortfall(skillName, skillBody, sessionInvokedScripts(sessionId));
   } catch {
     return null;
   }

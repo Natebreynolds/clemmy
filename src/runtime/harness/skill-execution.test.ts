@@ -42,15 +42,35 @@ test('skillExecutionShortfall: a script-backed skill with ZERO prescribed script
   const gap = skillExecutionShortfall(sess.id);
   assert.ok(gap, 'a skill whose bundled scripts never ran is flagged');
   assert.equal(gap!.skill, 'lunar-audit');
-  assert.deepEqual(gap!.prescribed.sort(), ['aggregate.js', 'generate-html.js', 'validate-html.js']);
+  // The required set is the RENDERER (generate-html.js), not every prescribed script.
+  assert.ok(gap!.prescribed.includes('generate-html.js'), 'the renderer is named as required');
 });
 
-test('skillExecutionShortfall: running ≥1 prescribed script clears the gate (followed)', () => {
+test('skillExecutionShortfall: running the RENDERER clears the gate (followed)', () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
   loadScriptSkill(sess.id, 'c1', 'lunar-audit', ['aggregate.js', 'generate-html.js', 'validate-html.js']);
   shellRun(sess.id, 'node src/generate-html.js > out.html');
-  assert.equal(skillExecutionShortfall(sess.id), null, 'ran a prescribed script → not a shortfall');
+  assert.equal(skillExecutionShortfall(sess.id), null, 'ran the renderer → not a shortfall');
+});
+
+test('skillExecutionShortfall: running ONLY the validator (require) does NOT clear — the renderer must run (the lunar gaming)', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  loadScriptSkill(sess.id, 'c1', 'lunar-audit', ['aggregate.js', 'generate-html.js', 'validate-html.js']);
+  // Hand-rolled HTML, then validated it via require — but never ran the renderer.
+  shellRun(sess.id, "node - <<'NODE'\nconst v=require('./src/validate-html'); console.log(v('<html>'));\nNODE");
+  const gap = skillExecutionShortfall(sess.id);
+  assert.ok(gap, 'validating a hand-roll is NOT executing the skill — still a shortfall');
+  assert.ok(gap!.prescribed.includes('generate-html.js'), 'the renderer is still required');
+});
+
+test('skillExecutionShortfall: require()-ing the renderer clears the gate (library-style use)', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  loadScriptSkill(sess.id, 'c1', 'lunar-audit', ['aggregate.js', 'generate-html.js', 'validate-html.js']);
+  shellRun(sess.id, "node -e \"const {generateHtml}=require('./src/generate-html'); require('fs').writeFileSync('o.html', generateHtml(d).html)\"");
+  assert.equal(skillExecutionShortfall(sess.id), null, 'require-ing + using the renderer counts as executed');
 });
 
 test('skillExecutionShortfall: a pure-reference skill (no bundled scripts) is never gated', () => {

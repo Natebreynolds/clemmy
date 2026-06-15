@@ -69,6 +69,7 @@ import { missingWorkflowRunInputs, normalizeWorkflowRunInputs } from './workflow
 import { verifyStepOutput } from './step-output-verify.js';
 import { judgeWorkflowTarget, type WorkflowTargetVerdict } from './workflow-objective-judge.js';
 import { judgeStepSkillExecution } from './workflow-step-judge.js';
+import { skillBodyExecutionShortfall } from '../runtime/harness/skill-execution.js';
 import { deliverOutcome } from '../runtime/outcome.js';
 import { rewriteInClementineVoice } from './voice-rewrite.js';
 import { reportedBackRunIdsFrom } from './workflow-watchdog.js';
@@ -2169,6 +2170,26 @@ export async function executeStep(
   // fails the step or run, so it can't break a workflow that actually
   // succeeded.
   await noteStepSkillAdvisory(step, stepSessionId, output, renderTemplate(step.prompt, ctx.inputs, ctx.stepOutputs), ctx);
+
+  // DETERMINISTIC skill-execution FLOOR (hard). The advisory above is detection-
+  // only; this HARD-fails a `usesSkill` step whose skill ships a RENDERER that
+  // never ran — the deliverable was hand-rolled (the 2026-06-15 lunar workflow ran
+  // the VALIDATOR on a hand-rolled file but never generate-html.js, and the
+  // advisory judge waved it through). Closes the escape hatch where a chat-gate
+  // bounce pushed the model to dispatch a background workflow with no enforcement.
+  // Kill-switch HARNESS_SKILL_EXEC_GATE=off; fail-open (loader/detection error → no gate).
+  if ((process.env.HARNESS_SKILL_EXEC_GATE ?? 'on').toLowerCase() !== 'off' && step.usesSkill?.trim()) {
+    let skillGap: { skill: string; prescribed: string[] } | null = null;
+    try {
+      const body = loadSkill(step.usesSkill.trim())?.body ?? '';
+      skillGap = body ? skillBodyExecutionShortfall(step.usesSkill.trim(), body, stepSessionId) : null;
+    } catch { skillGap = null; }
+    if (skillGap) {
+      throw new Error(
+        `Step "${step.id}" did not execute the "${skillGap.skill}" skill: its renderer (${skillGap.prescribed.join(', ')}) never ran — the deliverable was hand-rolled, not produced by the skill's own pipeline. Run the skill's render + validate scripts, then finish.`,
+      );
+    }
+  }
 
   return finalizeStepOutput(ctx.workflowSlug, ctx.runId, step, output);
 }
