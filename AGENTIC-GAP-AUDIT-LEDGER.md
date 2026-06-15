@@ -16,7 +16,11 @@ Stress harnesses guarding the fixes: `npm run bench:gates` (safety gates), `npm 
 | 7 | HIGH | background | A background task paused on `awaiting_approval` has no terminal-state recovery and is invisible to the watchdog | ✅ FIXED |
 | 8 | MED | workflows/resume | `forEach` crash-resume can double-fire a send/write (forEach exemption skips the crash-resume HALT) | ⬜ |
 | 9 | MED | workspaces | Concurrent `refreshSpaceData` for the same slug clobber each other's `data.json` (lost update) | ⬜ |
-| 10 | LOW | memory/pin | A standing rule lands non-pinned without a literal email/list token → objective-scoped recall can evict it at action time | ⬜ |
-| 11 | LOW | memory/observ | Auto-capture fact write is fire-and-forget with a swallowed catch → eventlog reports 'learned' even when the fact never persisted | ⬜ |
+| 10 | LOW | memory/pin | A standing rule lands non-pinned without a literal email/list token → objective-scoped recall can evict it at action time | ✅ FIXED |
+| 11 | LOW | memory/observ | Auto-capture fact write is fire-and-forget with a swallowed catch → eventlog reports 'learned' even when the fact never persisted | ✅ FIXED |
 
 Order of attack: memory data-loss (1,2) → memory constraint round-trip (3,10,11) → workflow choke/double-send (5,8) → chat context (4) → delivery/background (6,7) → workspaces (9). Each fix: extend the named primitive, add a regression test, keep the suite green.
+
+## Deliberate follow-up (MED — not rushed)
+
+**#8 forEach crash-resume double-send** and **#9 workspaces concurrent-refresh clobber** are real but touch hot/stateful paths (the forEach resume gate; the spaces runner's read-modify-write). Both warrant a focused pass with their own characterization tests rather than a tail-of-session change, per no-regressions. Precise fixes are captured in the audit (extend `shouldHaltResumeForSideEffect` to branch on side-effect class + durable duplicate-ledger for #8; per-slug serialization queue around `refreshSpaceData` for #9).

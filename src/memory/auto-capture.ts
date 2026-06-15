@@ -4,6 +4,9 @@ import { consolidateFact } from './reflection.js';
 import { extractNamedResource } from './focus.js';
 import { saveUserProfile, type UserProfile } from '../runtime/user-profile.js';
 import { getRuntimeEnv } from '../config.js';
+import pino from 'pino';
+
+const logger = pino({ name: 'clementine.auto-capture' });
 
 /**
  * A pasted workflow/step DEFINITION (the "Workflow: <name> … Step: <name> …"
@@ -83,7 +86,7 @@ const STANDING_EMAIL_RE = /[\w.+-]+@[\w-]+\.[\w.-]+/;
 // Determiner-qualified destination, allowing a few adjective words before the
 // noun ("to the MARKETING list", "to my OUTREACH sheet"). Still bounded so it
 // stays a destination phrase, not arbitrary prose.
-const STANDING_LIST_PHRASE_RE = /\b(?:to|use)\s+(?:this|that|these|those|the following|the|my|our)\s+(?:[\w'-]+\s+){0,3}?(?:list|distro|group|team|sheet|doc|document|spreadsheet|folder|channel|inbox)\b/i;
+const STANDING_LIST_PHRASE_RE = /\b(?:to|use)\s+(?:this|that|these|those|the following|the|my|our)\s+(?:[\w'-]+\s+){0,3}?(?:list|distro|group|team|sheet|doc|document|spreadsheet|folder|channel|inbox|account|mailbox|address)\b/i;
 
 // Enforceable SENDER/account routing rule → kind:'constraint' (the dispatch gate
 // enforces it; rememberFact auto-pins constraints). HIGH PRECISION on purpose:
@@ -284,6 +287,10 @@ export function extractAutoMemoryCandidates(message: string, maxCandidates = 3):
       kind: 'feedback',
       content: `Standing instruction: ${text}`,
       reason: 'standing instruction (marker + concrete target)',
+      // Pin when it names a connected app: a routing rule like "by default route
+      // outreach through my marketing list" must survive objective-scoped recall
+      // so it's injected at action time, not evicted as an off-topic fact.
+      pin: CONNECTED_APP_TERMS.test(text),
     });
   }
 
@@ -331,8 +338,18 @@ export function captureInteractionSignals(input: {
       consolidateFact(
         { kind: candidate.kind, text: candidate.content, trustLevel: 1.0, pin: candidate.pin },
         { sessionId: input.sessionId },
-      ).catch(() => {
-        // Swallow — a capture failure must never surface to the turn.
+      ).then((outcome) => {
+        // The turn optimistically reports 'learned', but this write is async and
+        // can no-op or fail. Make a non-persist VISIBLE (was a silent swallow) so
+        // a dropped capture is diagnosable — never surfaced to the turn.
+        if (outcome && !outcome.written && !outcome.updated && !outcome.deleted && !outcome.noop) {
+          logger.warn({ kind: candidate.kind, reason: candidate.reason }, 'auto-capture persisted nothing (fact dropped)');
+        }
+      }).catch((err) => {
+        logger.warn(
+          { err: err instanceof Error ? err.message : String(err), kind: candidate.kind },
+          'auto-capture consolidateFact FAILED — fact not persisted despite optimistic "learned"',
+        );
       });
     });
   }
