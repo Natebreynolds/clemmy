@@ -2058,10 +2058,34 @@ async function runConversationCore(
       };
     }
     if (decision.nextAction === 'awaiting_approval') {
-      // The SDK-level interrupt path normally handles this via
-      // turnResult.status. If we end up here it means the Orchestrator
-      // self-reported the state without triggering needsApproval. Honor
-      // its declaration and stop.
+      // The SDK-level interrupt path normally handles this via turnResult.status
+      // (it emits approval_requested, which every surface renders). If we end up
+      // here, the Orchestrator self-reported awaiting_approval WITHOUT an SDK
+      // interrupt — so no approval_requested event fired this turn and event-stream
+      // surfaces (Discord, desktop SSE) would render NOTHING, stranding the user
+      // (the symmetric awaiting_user_input hole fixed just above). Synthesize a
+      // delivery event carrying the decision's reply so every surface shows the ask.
+      const approvalEmittedThisTurn = (() => {
+        try {
+          return listEvents(options.sessionId, { types: ['approval_requested'] })
+            .some((e) => e.turn === turnResult.turn);
+        } catch { return false; }
+      })();
+      if (!approvalEmittedThisTurn) {
+        const ask = (decision.reply?.trim() ? decision.reply : decision.summary)
+          ?? 'I need your approval before the next step — approve to continue or tell me to stop.';
+        safeAppend({
+          sessionId: options.sessionId,
+          turn: turnResult.turn,
+          role: 'Clem',
+          type: 'awaiting_user_input',
+          data: { question: ask, source: 'decision_awaiting_approval' },
+        });
+        const goalForApproval = safeActiveGoal(options.sessionId);
+        if (goalForApproval) {
+          safeAppendGoalLedger(goalForApproval.id, 'blocked', ask);
+        }
+      }
       return {
         sessionId: options.sessionId,
         status: 'awaiting_approval',
@@ -3712,6 +3736,26 @@ async function runConversationFromResumeCore(opts: {
       });
       // fall through to the next-turn runTurn below.
     } else if (decision.nextAction === 'awaiting_approval') {
+      // Resume-path twin of the runConversationCore fix: a self-reported
+      // awaiting_approval with no SDK interrupt emits no approval_requested event,
+      // so surfaces render nothing. Synthesize a delivery event if none fired.
+      const approvalEmittedThisTurn = (() => {
+        try {
+          return listEvents(opts.sessionId, { types: ['approval_requested'] })
+            .some((e) => e.turn === lastTurn);
+        } catch { return false; }
+      })();
+      if (!approvalEmittedThisTurn) {
+        const ask = (decision.reply?.trim() ? decision.reply : decision.summary)
+          ?? 'I need your approval before the next step — approve to continue or tell me to stop.';
+        safeAppend({
+          sessionId: opts.sessionId,
+          turn: lastTurn,
+          role: 'Clem',
+          type: 'awaiting_user_input',
+          data: { question: ask, source: 'decision_awaiting_approval' },
+        });
+      }
       return {
         sessionId: opts.sessionId,
         status: 'awaiting_approval',

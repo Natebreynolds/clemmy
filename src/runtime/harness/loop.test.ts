@@ -1216,6 +1216,28 @@ test('runConversation: a DECISION-level awaiting (done:true + awaiting, NO ask_u
   assert.equal((askEvents[0].data as { source?: string }).source, 'decision_awaiting');
 });
 
+test('runConversation: a DECISION-level awaiting_approval (no SDK interrupt) SYNTHESIZES a delivery event so surfaces are not stranded', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const runRunner: RunRunnerFn = async () => {
+    // The model self-reports awaiting_approval in its DECISION without an SDK
+    // interrupt, so NO approval_requested event fires. Before the fix, every
+    // event-stream surface rendered nothing (the symmetric awaiting hole).
+    return { history: [], lastResponseId: undefined, finalOutput: {
+      summary: 'need sign-off to send the batch', reply: 'Ready to send 12 emails — approve to proceed or tell me to stop?',
+      done: true, nextAction: 'awaiting_approval', reason: null } };
+  };
+  const result = await runConversation({
+    agent: makeAgentStub(), sessionId: sess.id, input: 'send the outreach batch',
+    makeRunner: makeRunnerStub, runRunner,
+  });
+  assert.equal(result.status, 'awaiting_approval', 'still halts for approval');
+  const askEvents = listEventsForConv(sess.id, { types: ['awaiting_user_input'] });
+  assert.equal(askEvents.length, 1, 'exactly one synthesized delivery event');
+  assert.match((askEvents[0].data as { question: string }).question, /approve to proceed/);
+  assert.equal((askEvents[0].data as { source?: string }).source, 'decision_awaiting_approval');
+});
+
 test('runConversation: a tool-driven ask (ask_user_question already emitted the event) is NOT double-emitted', async () => {
   resetEventLog();
   const sess = HarnessSession.create({ kind: 'chat' });
