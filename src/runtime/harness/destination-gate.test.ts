@@ -229,11 +229,16 @@ test('provenance gate ignores non-publish commands', () => {
   assert.equal(v.action, 'allow');
 });
 
-test('UnverifiedDestinationError is recoverable and tells the model to create a dedicated site', () => {
+test('UnverifiedDestinationError is recoverable and directs discover-then-retry, not surrender', () => {
   const e = new UnverifiedDestinationError({ command: 'netlify deploy --site x', verb: 'deploy', shapeKey: 'netlify:deploy:unverified', targets: ['6c97fed4'] });
   assert.match(e.message, /UNVERIFIED_DESTINATION/);
-  assert.match(e.message, /sites:create/);        // how to make a real dedicated target
-  assert.match(e.message, /--account-slug/);      // non-interactively (the root trigger)
-  assert.match(e.message, /STOP and tell the user/i); // never publish onto an unverified target
+  assert.match(e.message, /sites:create/);            // how to make a real dedicated target
+  assert.match(e.message, /--account-slug/);          // non-interactively (the root trigger)
+  // Self-recovery (2026-06-15): on a create failure it must DISCOVER the right
+  // value and retry — only stop AFTER a genuine attempt, never surrender first.
+  assert.match(e.message, /DISCOVERABLE/i);
+  assert.match(e.message, /listAccountsForUser/);     // names the discovery command
+  assert.match(e.message, /only STOP and report the blocker AFTER/i);
+  assert.match(e.message, /do not give up before you have actually tried/i);
   assert.equal(e.hardBlock, true);
 });

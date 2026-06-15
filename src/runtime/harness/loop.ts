@@ -1829,7 +1829,8 @@ async function runConversationCore(
           nextInput = [
             `You marked this objective complete, but an independent verification check found it is NOT finished: ${verdict.reason}.`,
             'First try to finish it yourself — produce the real artifact and verifiable evidence (a URL, file path, or emitted result). Prefer doing the work over asking.',
-            'But do NOT loop on a dead end: if a tool keeps failing, a required input is missing, or an external service is genuinely unavailable, STOP and report the SPECIFIC blocker — set nextAction=awaiting_user_input with a concrete question, or nextAction=abandoned if it is truly impossible. A blocked task reported honestly is correct; silently re-declaring "complete" without the artifact is not.',
+            'But FIRST, if the failure names a DISCOVERABLE value — a 404 / "not found", a wrong or missing slug/team/account/id, a missing arg — find the right value with the tool\'s OWN discovery command (e.g. `netlify api listAccountsForUser`, `<cli> whoami`/`status`/`list`) or by recalling your saved tool-choice, then retry ONCE with it. That is recoverable, NOT a dead end: giving up on it — or asking the user for a value the tool can report itself — is a loop failure, not honesty.',
+            'Only do NOT loop on a GENUINE dead end: a tool truly unavailable, an external service down, or an input the system genuinely cannot provide — after a real discover-and-retry has actually failed. Then STOP and report the SPECIFIC blocker — set nextAction=awaiting_user_input with a concrete question, or nextAction=abandoned if it is truly impossible. A blocked task reported honestly is correct; silently re-declaring "complete" without the artifact is not.',
             'Only set nextAction=completed once the real artifact or verifiable evidence genuinely exists.',
           ].join(' ');
           continue;

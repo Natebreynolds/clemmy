@@ -362,7 +362,7 @@ function developerToolStubBlockMessage(command: string): string | null {
  * original stderr, optionally with one extra line appended explaining
  * what to do — visible to the model and to the dashboard reader.
  */
-function annotateShellStderr(stderr: string, command: string): string {
+export function annotateShellStderr(stderr: string, command: string): string {
   if (!stderr) return stderr;
   const hints: string[] = [];
   if (/EPERM:\s*operation not permitted,?\s*uv_cwd/i.test(stderr)) {
@@ -377,7 +377,25 @@ function annotateShellStderr(stderr: string, command: string): string {
       'CLEMENTINE HINT: bash could not resolve the current working directory. ' +
       'This typically means the cwd was deleted or is inside a TCC-protected folder; pass `cwd: null` or a path under WORKSPACE_DIRS.',
     );
-  } else if (/(command not found|: not found)/i.test(stderr)) {
+  } else if (/\b404\b|\bno such (?:team|account|site|project)\b|account[-\s]?slug|\bunauthoriz|\bnot authoriz|\bforbidden\b|invalid (?:team|account|slug|site|project)/i.test(stderr)) {
+    // RECOVERABLE config error (2026-06-15: a netlify `404: Not Found` from a
+    // wrong --account-slug). The value is DISCOVERABLE — nudge diagnose-then-
+    // retry, NOT surrender. Checked BEFORE the not-on-PATH branch so a "404:
+    // Not Found" stops getting mislabeled "binary missing" (the false hint that
+    // sent the model chasing an install instead of the right team slug).
+    hints.push(
+      'CLEMENTINE HINT (recoverable): this is a WRONG or MISSING config value (team/account/slug/id), not a dead end — it is DISCOVERABLE. Do NOT give up, call it impossible, or ask the user for it. Find the right value with the tool\'s own discovery command (e.g. `netlify api listAccountsForUser` for the real --account-slug, or `<cli> whoami`/`status`/`list`), OR recall your saved choice for this action with `tool_choice_recall(intent)`, then RETRY with the correct value. Do NOT re-issue the identical failing command.',
+    );
+  } else if (/unsettled top-level await|\?\s*Team:|Use arrow keys/i.test(stderr)) {
+    // The CLI tried to open an INTERACTIVE prompt (no TTY here → it hangs/exits
+    // 13). Re-run non-interactively (2026-06-15: `netlify sites:create` hung on
+    // the team picker; `npx netlify-cli … --json` + an explicit value clears it).
+    hints.push(
+      'CLEMENTINE HINT (recoverable): the CLI tried to open an INTERACTIVE prompt (e.g. a team picker) but there is no terminal here, so it hung/failed. Re-run NON-INTERACTIVELY: add `--json` and pass the needed value explicitly — discover it first if unknown (e.g. `netlify api listAccountsForUser` for the team). Do NOT repeat the interactive command unchanged.',
+    );
+  } else if (/command not found|(?:^|\s)[a-zA-Z][\w./-]*: not found\b/i.test(stderr)) {
+    // Tightened (2026-06-15): require a real command-not-found shape so an HTTP
+    // "404: Not Found" no longer matches and falsely claims the binary is absent.
     const firstWord = command.trim().split(/\s+/)[0];
     hints.push(
       `CLEMENTINE HINT: "${firstWord}" is not on PATH. ` +

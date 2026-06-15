@@ -12,9 +12,40 @@ process.env.HOME = tmpHome;
 process.env.CLEMENTINE_HOME = path.join(tmpHome, '.clementine-next');
 
 let getComputerTools: typeof import('./computer-tools.js').getComputerTools;
+let annotateShellStderr: typeof import('./computer-tools.js').annotateShellStderr;
 
 before(async () => {
-  ({ getComputerTools } = await import('./computer-tools.js'));
+  ({ getComputerTools, annotateShellStderr } = await import('./computer-tools.js'));
+});
+
+// ─── Recoverable-failure self-recovery hints (2026-06-15) ───
+// The loop must self-recover from a failed CLI call (discover the right value
+// and retry), not give up. The error annotation is the GENERAL signal that
+// shapes how the loop reasons after ANY failed shell call.
+
+test('annotateShellStderr: an HTTP 404 is NOT mislabeled "binary not on PATH" (the false hint that misdirected self-recovery)', () => {
+  const out = annotateShellStderr('createSiteInTeam error: 404: Not Found', 'netlify sites:create --name x --account-slug wrong');
+  assert.doesNotMatch(out, /is not on PATH/i);                 // the lie is gone
+  assert.match(out, /recoverable/i);                            // now a recoverable hint
+  assert.match(out, /discover/i);                               // …that says discover-and-retry
+  assert.match(out, /do not re-issue the identical failing command/i); // …without thrashing
+});
+
+test('annotateShellStderr: a GENUINE command-not-found still gets the install hint (no regression)', () => {
+  const out = annotateShellStderr('bash: foo: command not found', 'foo --bar');
+  assert.match(out, /not on PATH/i);
+  assert.match(out, /brew install foo|npm install -g foo/);
+});
+
+test('annotateShellStderr: an interactive-prompt hang nudges a non-interactive re-run', () => {
+  const out = annotateShellStderr('? Team: (Use arrow keys)\nWarning: Detected unsettled top-level await', 'netlify sites:create --name x');
+  assert.match(out, /recoverable/i);
+  assert.match(out, /non-?interactive/i);
+});
+
+test('annotateShellStderr: generic no-such-team / 403 is treated as discoverable, not terminal', () => {
+  assert.match(annotateShellStderr('Error: no such team: acme', 'somecli deploy --team acme'), /discover/i);
+  assert.match(annotateShellStderr('403 Forbidden', 'gh api /orgs/x'), /recoverable/i);
 });
 
 after(() => {
