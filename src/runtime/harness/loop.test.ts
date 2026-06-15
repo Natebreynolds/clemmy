@@ -2412,6 +2412,105 @@ test('runConversation: structured zero-tool completion claim is retried', async 
   assert.equal(retryEvents.length, 1);
 });
 
+// BUG 1 (2026-06-15 Brooke email-find): a done:true completion that REPORTS the
+// result of work done in PRIOR turns must NOT be flagged a zero-tool prose claim.
+test('runConversation: done:true completion reporting PRIOR tool work is NOT a zero-tool stall (Brooke fix)', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  // Prior-turn substantive (non-probe) tool work — the real Outlook searches.
+  appendEvent({
+    sessionId: sess.id, turn: 0, role: 'Clem', type: 'tool_called',
+    data: { tool: 'outlook_email_search', callId: 'c_prior', arguments: '{"query":"Brooke"}' },
+  });
+  const runRunner: RunRunnerFn = async (_r, _a, items) => ({
+    history: items, lastResponseId: undefined,
+    finalOutput: {
+      summary: 'Searched Outlook inbox and mailbox for Brooke this afternoon; no results.',
+      reply: "I searched this afternoon and didn't find any email from Brooke — the only afternoon hit was Stripe at 12:18.",
+      done: true, nextAction: 'completed', reason: null,
+    },
+  });
+  const result = await runConversation({
+    agent: makeAgentStub(), sessionId: sess.id, input: 'find the email from Brooke',
+    makeRunner: makeRunnerStub, runRunner,
+  });
+  assert.equal(result.status, 'completed');
+  // The false zero-tool stall must NOT fire (prior real work exists).
+  assert.equal(listEventsForConv(sess.id, { types: ['stuck_detected'] }).length, 0);
+  assert.equal(listEventsForConv(sess.id, { types: ['awaiting_user_input'] }).length, 0);
+  // And the model's answer is delivered.
+  const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] });
+  assert.ok(completed.length >= 1);
+  assert.match(String((completed.at(-1)!.data as { summary?: string }).summary ?? ''), /Brooke/);
+});
+
+test('runConversation: HARNESS_STALL_PRIOR_WORK=off restores the legacy zero-tool stall (kill-switch)', async () => {
+  const prev = process.env.HARNESS_STALL_PRIOR_WORK;
+  process.env.HARNESS_STALL_PRIOR_WORK = 'off';
+  try {
+    resetEventLog();
+    const sess = HarnessSession.create({ kind: 'chat' });
+    appendEvent({
+      sessionId: sess.id, turn: 0, role: 'Clem', type: 'tool_called',
+      data: { tool: 'outlook_email_search', callId: 'c0', arguments: '{}' },
+    });
+    const runRunner: RunRunnerFn = async (_r, _a, items) => ({
+      history: items, lastResponseId: undefined,
+      finalOutput: { summary: 'Searched Outlook for Brooke; no results.', reply: 'I searched and found nothing.', done: true, nextAction: 'completed', reason: null },
+    });
+    await runConversation({ agent: makeAgentStub(), sessionId: sess.id, input: 'find Brooke email', makeRunner: makeRunnerStub, runRunner });
+    const stuck = listEventsForConv(sess.id, { types: ['stuck_detected'] });
+    assert.ok(stuck.length >= 1, 'with the kill-switch off, the legacy stall fires again');
+    assert.equal((stuck[0].data as { kind: string }).kind, 'structured_zero_tool_claim');
+  } finally {
+    if (prev === undefined) delete process.env.HARNESS_STALL_PRIOR_WORK; else process.env.HARNESS_STALL_PRIOR_WORK = prev;
+  }
+});
+
+// BUG 2: a coherent answer that failed the STRICT decision parse is DELIVERED,
+// not turned into the confusing "unable to make progress" prompt.
+test('runConversation: a coherent reply that failed strict parse is salvaged + delivered (not a stuck prompt)', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  // A valid answer emitted as a JSON STRING — the strict parser rejects it
+  // (typeof !== 'object') → D_decision_json carries the model's own reply.
+  // Wording deliberately avoids past-tense action verbs so Signal A' (the
+  // announcement-stall, checked first) does not pre-empt Signal D.
+  const jsonString = JSON.stringify({
+    summary: 'No email from Brooke is present in the inbox for this afternoon.',
+    reply: "There's no email from Brooke this afternoon — the only afternoon item is a Stripe notification.",
+    done: true, nextAction: 'completed', reason: null,
+  });
+  const runRunner: RunRunnerFn = async (_r, _a, items) => ({ history: items, lastResponseId: undefined, finalOutput: jsonString });
+  const result = await runConversation({
+    agent: makeAgentStub(), sessionId: sess.id, input: 'find the email from Brooke',
+    makeRunner: makeRunnerStub, runRunner,
+  });
+  assert.equal(result.status, 'completed');
+  const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] });
+  const salvaged = completed.find((e) => (e.data as { reason?: string }).reason === 'decision_json_salvaged');
+  assert.ok(salvaged, 'the answer was salvaged and delivered');
+  assert.match(String((salvaged!.data as { summary?: string }).summary ?? ''), /Brooke/);
+  // Must NOT have surfaced the confusing "unable to make progress" prompt.
+  assert.equal(listEventsForConv(sess.id, { types: ['awaiting_user_input'] }).length, 0);
+});
+
+test('runConversation: a GENUINE punt (announcement, zero tools, no answer) is NEVER salvaged', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  // An announcement with zero tools → A_zero_tools, NOT D_decision_json → the
+  // salvage (gated on D_decision_json with a real reply) must never deliver it.
+  const runRunner: RunRunnerFn = async (_r, _a, items) => ({ history: items, lastResponseId: undefined, finalOutput: "I'll run the Outlook search now." });
+  await runConversation({
+    agent: makeAgentStub(), sessionId: sess.id, input: 'do the thing',
+    makeRunner: makeRunnerStub, runRunner,
+  });
+  const stuck = listEventsForConv(sess.id, { types: ['stuck_detected'] });
+  assert.ok(stuck.some((e) => (e.data as { signal?: string }).signal === 'A_zero_tools'), 'a genuine punt is detected as a stall');
+  const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] });
+  assert.ok(!completed.some((e) => (e.data as { reason?: string }).reason === 'decision_json_salvaged'), 'an announcement punt is never salvaged');
+});
+
 test('runConversation: propagates run_failed status when a turn throws', async () => {
   const sess = HarnessSession.create({ kind: 'chat' });
   const runner = scriptedRunner([{ status: 'throw' }]);

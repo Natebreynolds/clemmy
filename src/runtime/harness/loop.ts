@@ -1548,6 +1548,46 @@ async function runConversationCore(
         // this event and renders the question, so the user can
         // course-correct (retry / change approach / stop). Honors the
         // north-star "reports back without fail" property.
+        //
+        // SALVAGE FIRST (2026-06-15): the task may NOT be stuck — the model
+        // produced a coherent answer that just failed the STRICT decision parse
+        // (D_decision_json carries the model's own `reply` in userVisibleMessage,
+        // with detail.hasReply). Deliver that answer rather than the confusing
+        // "unable to make progress" prompt (the Brooke email-find lost a real
+        // "I didn't find any email from Brooke" answer this way). Only the real
+        // reply is delivered — a generic ack / announcement / empty-reply
+        // sentinel (hasReply:false) is excluded and still asks the user.
+        // Kill-switch HARNESS_STALL_SALVAGE_REPLY=off.
+        const salvageEnabled =
+          (getRuntimeEnv('HARNESS_STALL_SALVAGE_REPLY', 'on') ?? 'on').toLowerCase() !== 'off';
+        if (
+          salvageEnabled &&
+          stallInfo.signal === 'D_decision_json' &&
+          (stallInfo.detail as { hasReply?: boolean }).hasReply === true &&
+          stallInfo.userVisibleMessage.trim()
+        ) {
+          safeAppend({
+            sessionId: options.sessionId,
+            turn: turnResult.turn,
+            role: 'system',
+            type: 'conversation_completed',
+            data: {
+              steps: stepIndex,
+              reason: 'decision_json_salvaged',
+              summary: stallInfo.userVisibleMessage,
+              reply: stallInfo.userVisibleMessage,
+              delivered: true,
+              stallDetail: { signal: stallInfo.signal, ...stallInfo.detail },
+            },
+          });
+          return {
+            sessionId: options.sessionId,
+            status: 'completed',
+            steps: stepIndex,
+            lastDecision,
+            lastTurn,
+          };
+        }
         const askUserEnabled =
           (getRuntimeEnv('HARNESS_STALL_ASK_USER', 'on') ?? 'on').toLowerCase() !== 'off';
         if (askUserEnabled) {
@@ -4209,7 +4249,14 @@ function evaluateStructuredDecisionStall(opts: {
   if (
     decision.nextAction === 'completed' &&
     STALL_ANNOUNCEMENT_PATTERN.test(combined) &&
-    !STALL_REFLECTION_SUPPRESS_PATTERN.test(combined)
+    !STALL_REFLECTION_SUPPRESS_PATTERN.test(combined) &&
+    // Not a false "zero-tool claim" when the model is REPORTING a genuine
+    // completion (done:true) whose work was done in PRIOR turns — a
+    // "searched, found nothing" answer makes no NEW tool call but isn't a lie.
+    // The genuine target (claims done, did NO work this session) has no prior
+    // substantive tool call, so it is NOT suppressed and still fires.
+    !(decision.done === true && opts.sessionId && opts.turn !== undefined &&
+      sessionDidSubstantiveToolWork(opts.sessionId, opts.turn))
   ) {
     return {
       signal: 'A_zero_tools',
@@ -4242,6 +4289,31 @@ function turnOnlyUsedToolSurfaceProbeTools(sessionId: string, turn: number): boo
       .filter((tool): tool is string => Boolean(tool));
     if (toolNames.length === 0) return false;
     return toolNames.every((tool) => TOOL_SURFACE_PROBE_TOOLS.has(tool));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * True when the SESSION already did substantive (non-probe) tool work in a
+ * STRICTLY-PRIOR turn (`event.turn < turn`). Used to suppress the
+ * `structured_zero_tool_claim` stall on a genuine completion that reports the
+ * result of earlier work (2026-06-15 Brooke email-find: real Outlook searches
+ * in prior turns, then a `done:true` "found nothing" turn was falsely flagged a
+ * zero-tool prose claim → 2.5-min thrash → false "unable to make progress").
+ * Probe tools (memory/workspace/capability lookups) are EXCLUDED, so "only
+ * looked at memory then claimed an external action" is not granted suppression.
+ * Fail-OPEN to false — a degraded eventlog must never hide a real "claimed done,
+ * did no work" lie. Kill-switch: HARNESS_STALL_PRIOR_WORK=off.
+ */
+function sessionDidSubstantiveToolWork(sessionId: string, turn: number): boolean {
+  if ((getRuntimeEnv('HARNESS_STALL_PRIOR_WORK', 'on') ?? 'on').toLowerCase() === 'off') return false;
+  try {
+    return listEvents(sessionId, { types: ['tool_called'] }).some((event) => {
+      if (typeof event.turn !== 'number' || event.turn >= turn) return false;
+      const tool = event.data.tool;
+      return typeof tool === 'string' && tool.length > 0 && !TOOL_SURFACE_PROBE_TOOLS.has(tool);
+    });
   } catch {
     return false;
   }
