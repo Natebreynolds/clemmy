@@ -2511,6 +2511,62 @@ test('runConversation: a GENUINE punt (announcement, zero tools, no answer) is N
   assert.ok(!completed.some((e) => (e.data as { reason?: string }).reason === 'decision_json_salvaged'), 'an announcement punt is never salvaged');
 });
 
+// 2026-06-15 (scorpion-mailbox Brooke): an EMPTY/unstructured turn (items:1,
+// lastResponseId:null, zero tools) dropped straight to "couldn't be structured.
+// Please ask again." with no retry. It must be re-prompted instead.
+test('runConversation: an EMPTY zero-tool turn is RETRIED, then recovers (not dropped as "couldn\'t be structured")', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  // The empty-response sentinel runTurn synthesizes for an items:1/lastResponseId:null model turn.
+  const EMPTY_SENTINEL = "Clementine produced a response that couldn't be structured. Please ask again.";
+  let i = 0;
+  const scripted: unknown[] = [
+    EMPTY_SENTINEL, // turn 1: empty model response
+    { summary: 'Located the message.', reply: 'Found it — the email from Brooke arrived at 9:14am.', done: true, nextAction: 'completed', reason: null },
+  ];
+  const runRunner: RunRunnerFn = async (_r, _a, items) => {
+    const output = scripted[i] ?? scripted[scripted.length - 1];
+    i += 1;
+    return { history: items, lastResponseId: undefined, finalOutput: output };
+  };
+  const result = await runConversation({ agent: makeAgentStub(), sessionId: sess.id, input: 'find the email from Brooke', makeRunner: makeRunnerStub, runRunner });
+  assert.equal(result.status, 'completed');
+  const retries = listEventsForConv(sess.id, { types: ['stall_retry_attempted'] });
+  assert.ok(retries.some((e) => (e.data as { emptyOutput?: boolean }).emptyOutput === true), 'the empty turn was retried');
+  const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] });
+  assert.match(String((completed.at(-1)!.data as { summary?: string }).summary ?? ''), /Brooke/);
+  assert.ok(!completed.some((e) => (e.data as { reason?: string }).reason === 'no_structured_output'), 'did not give up with "couldn\'t be structured"');
+});
+
+test('runConversation: a PERSISTENTLY empty response exhausts retries then completes (bounded — no infinite loop)', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const EMPTY_SENTINEL = "Clementine produced a response that couldn't be structured. Please ask again.";
+  const runRunner: RunRunnerFn = async (_r, _a, items) => ({ history: items, lastResponseId: undefined, finalOutput: EMPTY_SENTINEL });
+  const result = await runConversation({ agent: makeAgentStub(), sessionId: sess.id, input: 'do the thing', makeRunner: makeRunnerStub, runRunner });
+  assert.equal(result.status, 'completed');
+  assert.ok(listEventsForConv(sess.id, { types: ['stall_retry_attempted'] }).length >= 1, 'it retried before giving up');
+  const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] });
+  assert.ok(completed.some((e) => (e.data as { reason?: string }).reason === 'no_structured_output'), 'the fallback stands after retries exhaust');
+});
+
+test('runConversation: HARNESS_STALL_RETRY_EMPTY=off restores the immediate "couldn\'t be structured" (kill-switch)', async () => {
+  const prev = process.env.HARNESS_STALL_RETRY_EMPTY;
+  process.env.HARNESS_STALL_RETRY_EMPTY = 'off';
+  try {
+    resetEventLog();
+    const sess = HarnessSession.create({ kind: 'chat' });
+    const EMPTY_SENTINEL = "Clementine produced a response that couldn't be structured. Please ask again.";
+    const runRunner: RunRunnerFn = async (_r, _a, items) => ({ history: items, lastResponseId: undefined, finalOutput: EMPTY_SENTINEL });
+    await runConversation({ agent: makeAgentStub(), sessionId: sess.id, input: 'do the thing', makeRunner: makeRunnerStub, runRunner });
+    // Kill-switch off → no empty-output retry → immediate no_structured_output.
+    const retries = listEventsForConv(sess.id, { types: ['stall_retry_attempted'] }).filter((e) => (e.data as { emptyOutput?: boolean }).emptyOutput === true);
+    assert.equal(retries.length, 0);
+  } finally {
+    if (prev === undefined) delete process.env.HARNESS_STALL_RETRY_EMPTY; else process.env.HARNESS_STALL_RETRY_EMPTY = prev;
+  }
+});
+
 test('runConversation: propagates run_failed status when a turn throws', async () => {
   const sess = HarnessSession.create({ kind: 'chat' });
   const runner = scriptedRunner([{ status: 'throw' }]);

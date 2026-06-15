@@ -1615,6 +1615,36 @@ async function runConversationCore(
         // Knob=off — fall through to legacy terminate-on-stall.
       }
 
+      // EMPTY/UNSTRUCTURED-OUTPUT RETRY (2026-06-15): a null decision with zero
+      // tools that is NOT a recognized stall is typically a TRANSIENT empty or
+      // malformed model response (turn_ended items:1, lastResponseId:null — a
+      // "find email from Brooke" turn came back empty and gave up on turn 1).
+      // Surfacing "couldn't be structured. Please ask again." as the answer is a
+      // dead-end non-answer; re-prompt for a structured decision (and the next
+      // concrete action) while we have budget. The toolCalls>0 case is already
+      // retried above; this is the symmetric zero-tool case. Bounded by
+      // MAX_STALL_RETRIES → after exhaustion the fallback below stands.
+      // Kill-switch HARNESS_STALL_RETRY_EMPTY=off.
+      if (
+        !stallInfo &&
+        turnResult.finalOutput === STRUCTURED_OUTPUT_RECOVERY_FALLBACK &&
+        stallRetriesUsed < MAX_STALL_RETRIES &&
+        (getRuntimeEnv('HARNESS_STALL_RETRY_EMPTY', 'on') ?? 'on').toLowerCase() !== 'off'
+      ) {
+        stallRetriesUsed += 1;
+        safeAppend({
+          sessionId: options.sessionId,
+          turn: turnResult.turn,
+          role: 'system',
+          type: 'stall_retry_attempted',
+          data: { signal: 'D_decision_unparsed', attempt: stallRetriesUsed, maxRetries: MAX_STALL_RETRIES, emptyOutput: true },
+        });
+        const backoffMs = STALL_RETRY_BACKOFF_MS[stallRetriesUsed - 1] ?? 1000;
+        if (backoffMs > 0) await new Promise((resolve) => setTimeout(resolve, backoffMs));
+        nextInput = 'Your previous response could not be parsed into the required structured decision — it came back empty or malformed. Re-issue it now as the exact decision object (summary, reply, done, nextAction, reason). If the task is NOT finished, set done:false and take the next concrete action — call the tool you need now.';
+        continue;
+      }
+
       safeAppend({
         sessionId: options.sessionId,
         turn: turnResult.turn,
