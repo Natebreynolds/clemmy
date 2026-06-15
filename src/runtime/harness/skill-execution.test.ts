@@ -17,11 +17,49 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 const { resetEventLog, createSession, appendEvent, writeToolOutput } = await import('./eventlog.js');
-const { gatherSessionSkills, sessionReadAnySkill, summarizeToolCallsForJudge, extractInvokedScripts } = await import('./skill-execution.js');
+const { gatherSessionSkills, sessionReadAnySkill, summarizeToolCallsForJudge, extractInvokedScripts, skillExecutionShortfall } = await import('./skill-execution.js');
 
 function skillRead(sessionId: string, callId: string, name: string): void {
   appendEvent({ sessionId, turn: 0, role: 'agent', type: 'tool_called', data: { tool: 'skill_read', callId, arguments: JSON.stringify({ name }) } });
 }
+function shellRun(sessionId: string, command: string): void {
+  appendEvent({ sessionId, turn: 0, role: 'agent', type: 'tool_called', data: { tool: 'run_shell_command', callId: `c-${Math.abs(command.length)}-${command.slice(0, 4)}`, arguments: JSON.stringify({ command }) } });
+}
+/** Seed a loaded skill whose body prescribes the given src/ scripts. */
+function loadScriptSkill(sessionId: string, callId: string, name: string, scripts: string[]): void {
+  skillRead(sessionId, callId, name);
+  const body = `Act 2 — build:\n${scripts.map((s, i) => `${i + 1}. Run \`src/${s}\` to produce the artifact.`).join('\n')}\nValidation is **Mandatory**.`;
+  writeToolOutput({ sessionId, callId, tool: 'skill_read', output: `# ${name}\n\nmanifest\n\ncrib\n\n=== HOW TO RUN THIS SKILL ===\nx\n\n---\n${body}` });
+}
+
+test('skillExecutionShortfall: a script-backed skill with ZERO prescribed scripts run → shortfall (hand-rolled deliverable)', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  loadScriptSkill(sess.id, 'c1', 'lunar-audit', ['aggregate.js', 'generate-html.js', 'validate-html.js']);
+  // She hand-rolled via an inline node heredoc + plain shell — no prescribed script ran.
+  shellRun(sess.id, "node - <<'NODE'\nconst fs=require('fs'); fs.writeFileSync('out.html','<html>');\nNODE");
+  shellRun(sess.id, 'netlify deploy --dir=out --prod');
+  const gap = skillExecutionShortfall(sess.id);
+  assert.ok(gap, 'a skill whose bundled scripts never ran is flagged');
+  assert.equal(gap!.skill, 'lunar-audit');
+  assert.deepEqual(gap!.prescribed.sort(), ['aggregate.js', 'generate-html.js', 'validate-html.js']);
+});
+
+test('skillExecutionShortfall: running ≥1 prescribed script clears the gate (followed)', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  loadScriptSkill(sess.id, 'c1', 'lunar-audit', ['aggregate.js', 'generate-html.js', 'validate-html.js']);
+  shellRun(sess.id, 'node src/generate-html.js > out.html');
+  assert.equal(skillExecutionShortfall(sess.id), null, 'ran a prescribed script → not a shortfall');
+});
+
+test('skillExecutionShortfall: a pure-reference skill (no bundled scripts) is never gated', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  skillRead(sess.id, 'c1', 'voice-guide');
+  writeToolOutput({ sessionId: sess.id, callId: 'c1', tool: 'skill_read', output: '# voice-guide\n\nm\n\nc\n\n=== HOW TO RUN THIS SKILL ===\nx\n\n---\nWrite in a warm, concise voice. No em dashes.' });
+  assert.equal(skillExecutionShortfall(sess.id), null, 'no prescribed scripts → nothing to enforce');
+});
 
 test('gatherSessionSkills returns un-clipped bodies with the skill_read envelope stripped', () => {
   resetEventLog();

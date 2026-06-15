@@ -52,7 +52,7 @@ import {
   type PlanProposal,
 } from '../../agents/plan-proposals.js';
 import { validateGoal, toGoalEvidence, type GoalValidationResult, type ValidateGoalInput } from '../../execution/goal-validate.js';
-import { gatherSessionSkills, summarizeToolCallsForJudge } from './skill-execution.js';
+import { gatherSessionSkills, summarizeToolCallsForJudge, skillExecutionShortfall } from './skill-execution.js';
 import { classifyMessageIntent } from '../../assistant/message-intent.js';
 import { attachEventLogHooks, extractSessionIdFromContext, type RunHooksLike } from './hooks.js';
 import * as approvalRegistry from './approval-registry.js';
@@ -1871,7 +1871,23 @@ async function runConversationCore(
           judgedObjective = composeJudgedObjective(objective, priorInputs);
         } catch { /* fail-open: judge the raw input */ }
         const verdict = await objectiveJudge(judgedObjective, responseText ?? '', skillContext);
-        if (!verdict.done) {
+        // DETERMINISTIC skill-execution FLOOR. The LLM judge above can't be
+        // trusted for the binary "did the skill's bundled script run" — on the
+        // 2026-06-15 lunar-audit it HAD the evidence (no generate-html.js in the
+        // tool-call summary) and still passed a hand-rolled HTML. So enforce it in
+        // code: a loaded skill that prescribes bundled scripts but ran NONE of them
+        // was not executed → NOT done, regardless of the judge. Kill-switch
+        // HARNESS_SKILL_EXEC_GATE=off; fail-open (null → no gate). Conservative
+        // zero-ran threshold never false-bounces a partial-but-real run.
+        const skillGap = (getRuntimeEnv('HARNESS_SKILL_EXEC_GATE', 'on') ?? 'on').toLowerCase() !== 'off'
+          ? skillExecutionShortfall(options.sessionId)
+          : null;
+        if (!verdict.done || skillGap) {
+          // A deterministic skill-execution shortfall overrides the LLM verdict
+          // with a script-specific reason; otherwise use the judge's reason.
+          const judgeReason = skillGap
+            ? `the "${skillGap.skill}" skill was loaded but NONE of its prescribed scripts ran (${skillGap.prescribed.join(', ')}) — the deliverable was hand-rolled instead of built by the skill's own pipeline`
+            : verdict.reason;
           // Self-improvement (C4): a judged not-done where a DRAFT skill was
           // loaded counts against that draft (pitfall + failureCount; quarantine
           // at the threshold). Approved skills are never demoted. Best-effort.
@@ -1879,7 +1895,7 @@ async function runConversationCore(
             void (async () => {
               try {
                 const { reinforceDraftSkills } = await import('../../memory/skill-distiller.js');
-                reinforceDraftSkills(loadedSkills.map((s) => s.name), 'failure', verdict.reason);
+                reinforceDraftSkills(loadedSkills.map((s) => s.name), 'failure', judgeReason);
               } catch { /* best-effort */ }
             })();
           }
@@ -1893,11 +1909,17 @@ async function runConversationCore(
               kind: 'progress_check_in',
               steps: stepIndex,
               message: 'Checked the objective — not done yet, continuing.',
-              objectiveJudge: { attempt: objectiveJudgeContinuations, reason: verdict.reason },
+              objectiveJudge: { attempt: objectiveJudgeContinuations, reason: judgeReason, skillGap: skillGap ? skillGap.skill : undefined },
             },
           });
-          nextInput = [
-            `You marked this objective complete, but an independent verification check found it is NOT finished: ${verdict.reason}.`,
+          nextInput = skillGap
+            ? [
+                `You marked this objective complete, but the "${skillGap.skill}" skill was NOT executed: you ran none of its prescribed scripts (${skillGap.prescribed.join(', ')}).`,
+                'Do NOT hand-roll the deliverable. Run the skill\'s actual pipeline — its bundled render script and any mandatory validate script (re-read it with skill_read if needed) — so the output matches the skill\'s template exactly, then re-verify and finish.',
+                'Only set nextAction=completed once the skill\'s own scripts have produced and validated the artifact.',
+              ].join(' ')
+            : [
+            `You marked this objective complete, but an independent verification check found it is NOT finished: ${judgeReason}.`,
             'First try to finish it yourself — produce the real artifact and verifiable evidence (a URL, file path, or emitted result). Prefer doing the work over asking.',
             'But FIRST, if the failure names a DISCOVERABLE value — a 404 / "not found", a wrong or missing slug/team/account/id, a missing arg — find the right value with the tool\'s OWN discovery command (e.g. `netlify api listAccountsForUser`, `<cli> whoami`/`status`/`list`) or by recalling your saved tool-choice, then retry ONCE with it. That is recoverable, NOT a dead end: giving up on it — or asking the user for a value the tool can report itself — is a loop failure, not honesty.',
             'Only do NOT loop on a GENUINE dead end: a tool truly unavailable, an external service down, or an input the system genuinely cannot provide — after a real discover-and-retry has actually failed. Then STOP and report the SPECIFIC blocker — set nextAction=awaiting_user_input with a concrete question, or nextAction=abandoned if it is truly impossible. A blocked task reported honestly is correct; silently re-declaring "complete" without the artifact is not.',

@@ -100,6 +100,64 @@ export function extractInvokedScripts(command: string): string[] {
   return [...out].slice(0, 8);
 }
 
+/** Scripts a SKILL.md PRESCRIBES as runnable bundled files — PATH-qualified
+ *  basenames (`src/generate-html.js`, `scripts/build.py`). Path-qualified on
+ *  purpose so an incidental ".js" mention in prose is never mistaken for a
+ *  prescribed pipeline script. Reads the skill's own text — no per-skill code,
+ *  general to any script-backed skill. Fail-open → []. */
+function extractPrescribedScripts(skillBody: string): string[] {
+  if (!skillBody || typeof skillBody !== 'string') return [];
+  const out = new Set<string>();
+  for (const m of skillBody.matchAll(/\b(?:src|scripts|bin|tools|lib)\/(?:[\w.-]+\/)*([\w.-]+\.(?:m?[jt]s|cjs|py|sh|rb|php|pl))\b/gi)) {
+    out.add(m[1].toLowerCase());
+  }
+  return [...out].slice(0, 24);
+}
+
+/** Script basenames actually INVOKED via run_shell_command this session. */
+function sessionInvokedScripts(sessionId: string): Set<string> {
+  const invoked = new Set<string>();
+  for (const e of listEvents(sessionId, { types: ['tool_called'] })) {
+    if (e.data?.tool !== 'run_shell_command') continue;
+    try {
+      const cmd = String((JSON.parse(String(e.data?.arguments ?? '{}')) as { command?: unknown }).command ?? '');
+      for (const s of extractInvokedScripts(cmd)) invoked.add(s);
+    } catch { /* skip a malformed command */ }
+  }
+  return invoked;
+}
+
+export interface SkillExecutionShortfall {
+  skill: string;
+  prescribed: string[];
+}
+
+/**
+ * DETERMINISTIC skill-execution floor for the completion gate. A loaded skill
+ * that PRESCRIBES bundled scripts but ran NONE of them was not executed — the
+ * deliverable was hand-rolled (the 2026-06-15 lunar-audit shipped a deployed URL
+ * + file that passed the LLM judge while running 0 of the skill's 7 scripts). The
+ * LLM judge can't be trusted for this binary fact, so the gate enforces it in
+ * code. Returns the first offending skill, or null when every script-backed
+ * loaded skill ran ≥1 of its scripts (or none was script-backed). Conservative
+ * zero-ran threshold so a partial-but-real run is never false-bounced. Fail-open
+ * → null. General to any script-backed skill (no per-skill logic).
+ */
+export function skillExecutionShortfall(sessionId: string): SkillExecutionShortfall | null {
+  try {
+    const invoked = sessionInvokedScripts(sessionId);
+    for (const skill of gatherSessionSkills(sessionId)) {
+      const prescribed = extractPrescribedScripts(skill.body);
+      if (prescribed.length === 0) continue; // pure-reference skill — nothing to enforce
+      if (prescribed.some((s) => invoked.has(s))) continue; // ran ≥1 prescribed script → followed
+      return { skill: skill.name, prescribed };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 /** Compact tool-call evidence (tool/slug/script → count) so the judge can see what
  *  was actually done — e.g. that no image-generation tool fired against a skill
  *  that prescribes generating imagery, or that a skill's mandatory bundled script

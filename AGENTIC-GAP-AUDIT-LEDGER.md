@@ -18,6 +18,7 @@ Stress harnesses guarding the fixes: `npm run bench:gates` (safety gates), `npm 
 | 9 | MED | workspaces | Concurrent `refreshSpaceData` for the same slug clobber each other's `data.json` (lost update) | ⬜ |
 | 10 | LOW | memory/pin | A standing rule lands non-pinned without a literal email/list token → objective-scoped recall can evict it at action time | ✅ FIXED |
 | 11 | LOW | memory/observ | Auto-capture fact write is fire-and-forget with a swallowed catch → eventlog reports 'learned' even when the fact never persisted | ✅ FIXED |
+| 12 | HIGH | skills | A chat session loads a skill but runs NONE of its prescribed scripts (hand-rolls the deliverable) — the LLM completion judge had the evidence and waved it through (live: lunar audit ran 0/6 scripts) | ✅ FIXED |
 
 Order of attack: memory data-loss (1,2) → memory constraint round-trip (3,10,11) → workflow choke/double-send (5,8) → chat context (4) → delivery/background (6,7) → workspaces (9). Each fix: extend the named primitive, add a regression test, keep the suite green.
 
