@@ -136,6 +136,26 @@ const SCENARIOS: Scenario[] = [
       return { ok: stillPinned, detail: stillPinned ? 'still injected ✓' : `DROPPED from the pinned-12 (newest-first) though it is the highest-importance of ${listPinnedFacts(9999).length}` };
     },
   },
+  {
+    id: 'HOLE-pinned-injection-coverage',
+    desc: 'a genuine OLD pinned rule still INJECTS when 19 newer EQUAL-importance pins exist (MEM-INJ-1)',
+    run: async () => {
+      clearFacts();
+      // The live case: synthetic harness auto-pins and a genuine user rule all at
+      // the default importance; the genuine one is older, so a hard newest-12 cap
+      // evicted it from the "always apply" block. The char-budgeted render keeps all.
+      const crit = rememberFact({ kind: 'feedback', content: 'GENUINE RULE: send invoices only from billing@acme.co.', importance: 5 });
+      setFactPinned(crit.id, true);
+      await sleep(15);
+      for (let i = 0; i < 19; i += 1) {
+        const f = rememberFact({ kind: 'feedback', content: `Synthetic auto-pin ${i}: you marked an objective complete and continued.`, importance: 5 });
+        setFactPinned(f.id, true);
+      }
+      const ctx = renderHarnessMemoryContext();
+      const present = ctx.includes('GENUINE RULE: send invoices');
+      return { ok: present, detail: present ? 'genuine old pin still injected ✓' : 'DROPPED — newer synthetic pins crowded it out of the 12-cap' };
+    },
+  },
 ];
 
 function pad(s: string, n: number): string { return s.length >= n ? s : s + ' '.repeat(n - s.length); }

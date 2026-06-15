@@ -1020,6 +1020,14 @@ export function listConstraints(limit?: number): ConsolidatedFact[] {
  * Render the top-N active facts as a compact block for the assistant's
  * instructions. Empty string when no facts exist — keeps the prompt clean.
  */
+// Pinned standing instructions: a runaway-safety row bound (well above any real
+// pin count — the live DB has reached 40) and a generous char budget for the
+// rendered block. Together they replace the old hard count of 12 that silently
+// evicted genuine user rules; importance-first ordering means overflow sheds the
+// least-important, and the render signals any elision.
+const PINNED_RUNAWAY_CAP = 64;
+const PINNED_SECTION_BUDGET = 2400;
+
 export function renderFactsForInstructions(
   limit = 10,
   maxChars = 1600,
@@ -1057,9 +1065,15 @@ export function renderFactsForInstructions(
   // otherwise render in BOTH the Tier-1 standing block ('pinned') and the
   // Tier-2 scored block ('scored'), double-sending the very rule the user
   // pinned. The pinned SECTION is only RENDERED when mode !== 'scored'.
+  // Fetch well above any sane pin count (the live DB has had 40) so genuine
+  // standing rules aren't cut at a hard 12 — listPinnedFacts is importance-first
+  // so the runaway bound only ever sheds the LEAST important. The visible set is
+  // then bounded by a CHAR budget with an explicit elision signal below (never a
+  // silent count cap). Closes MEM-INJ-1: real user safety rules were evicted from
+  // the "always apply" block by harness-synthetic auto-pins under the old 12-cap.
   let pinned: ConsolidatedFact[] = [];
   try {
-    pinned = listPinnedFacts(12);
+    pinned = listPinnedFacts(PINNED_RUNAWAY_CAP);
   } catch {
     pinned = [];
   }
@@ -1085,9 +1099,21 @@ export function renderFactsForInstructions(
   // to the ranked scored tail; rendering pinned first AND slicing the whole
   // join (the old behavior) cut into the standing block whenever it alone
   // exceeded maxChars, reading a half-rule as a complete one.
-  const pinnedSection = renderPinned && pinned.length > 0
-    ? `**Standing instructions (always apply)**\n${pinned.map((fact) => `- ${fact.content}`).join('\n')}`
-    : '';
+  // Render ALL pinned rules (importance-first) bounded by a generous CHAR budget
+  // — not a hard count. On overflow, clip on a line boundary and SIGNAL the
+  // elision (same primitive as the scored tail) so a dropped rule is never
+  // silent and the least-important is what's shed.
+  let pinnedSection = '';
+  if (renderPinned && pinned.length > 0) {
+    const header = '**Standing instructions (always apply)**';
+    const body = pinned.map((fact) => `- ${fact.content}`).join('\n');
+    if (body.length <= PINNED_SECTION_BUDGET) {
+      pinnedSection = `${header}\n${body}`;
+    } else {
+      pinnedSection = `${header}\n${clipToLineBoundary(body, PINNED_SECTION_BUDGET)}`
+        + '\n_… more standing instructions elided to fit (importance-ranked); call memory_search_facts to widen._';
+    }
+  }
 
   const byKind: Record<ConsolidatedFactKind, ConsolidatedFact[]> = {
     user: [], project: [], feedback: [], reference: [], constraint: [],
