@@ -6,6 +6,7 @@ import { ClementineAssistant } from '../assistant/core.js';
 import { validateCronExpression } from '../shared/cron.js';
 import { processAgentAutonomyV2 } from '../agents/autonomy-v2.js';
 import { processMonitors } from '../agents/monitors.js';
+import { processInboxMonitor } from '../agents/inbox-monitor.js';
 import { getProactivityPolicySnapshot } from '../agents/proactivity-policy.js';
 import { processProactiveBriefs } from '../agents/proactive-briefs.js';
 import { ensureSeedTemplates, processProactiveCheckIns } from '../agents/check-in-templates.js';
@@ -1244,6 +1245,10 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
     // Run monitors every 4 ticks (~60s) - they have their own internal rate limiting.
     if (proactivity.proactiveWorkAllowed && tickCount % 4 === 0) {
       processMonitors();
+      // C2 ambient inbox watch (general, read-only, default ON; kill-switch
+      // CLEMMY_INBOX_MONITOR=off). Self-rate-limited (own cadence) + surface-only;
+      // fire-and-forget so its mailbox reads never block the tick. Best-effort.
+      void processInboxMonitor().catch((err) => logger.warn({ err }, 'inbox monitor tick failed'));
     }
 
     if (proactivity.proactiveWorkAllowed) {
