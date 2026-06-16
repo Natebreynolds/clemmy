@@ -7,6 +7,7 @@ import { validateCronExpression } from '../shared/cron.js';
 import { processAgentAutonomyV2 } from '../agents/autonomy-v2.js';
 import { processMonitors } from '../agents/monitors.js';
 import { processInboxMonitor } from '../agents/inbox-monitor.js';
+import { processCalendarMonitor } from '../agents/calendar-monitor.js';
 import { getProactivityPolicySnapshot } from '../agents/proactivity-policy.js';
 import { processProactiveBriefs } from '../agents/proactive-briefs.js';
 import { ensureSeedTemplates, processProactiveCheckIns } from '../agents/check-in-templates.js';
@@ -1249,6 +1250,9 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
       // CLEMMY_INBOX_MONITOR=off). Self-rate-limited (own cadence) + surface-only;
       // fire-and-forget so its mailbox reads never block the tick. Best-effort.
       void processInboxMonitor().catch((err) => logger.warn({ err }, 'inbox monitor tick failed'));
+      // C2 ambient calendar watch — same pattern (general, read-only, default ON;
+      // kill-switch CLEMMY_CALENDAR_MONITOR=off). Self-rate-limited; fire-and-forget.
+      void processCalendarMonitor().catch((err) => logger.warn({ err }, 'calendar monitor tick failed'));
     }
 
     if (proactivity.proactiveWorkAllowed) {

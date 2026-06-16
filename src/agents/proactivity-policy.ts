@@ -52,6 +52,11 @@ export interface ProactivityPolicy {
   inboxWatchEnabled: boolean;
   inboxWatchMinutes: number; // how often to check, 5–240
   inboxWatchMax: number;     // max needs-you cards surfaced per check, 1–20
+  /** C2 ambient calendar watch: surface upcoming events that need you
+   *  (double-bookings, unanswered invites, imminent meetings). Read-only. */
+  calendarWatchEnabled: boolean;
+  calendarWatchMinutes: number; // how often to check, 5–240
+  calendarWatchMax: number;     // max needs-you cards per check, 1–20
   quietHoursEnabled: boolean;
   quietHoursStart: string;
   quietHoursEnd: string;
@@ -84,6 +89,9 @@ export const DEFAULT_PROACTIVITY_POLICY: ProactivityPolicy = {
   inboxWatchEnabled: true,
   inboxWatchMinutes: 15,
   inboxWatchMax: 5,
+  calendarWatchEnabled: true,
+  calendarWatchMinutes: 30,
+  calendarWatchMax: 5,
   quietHoursEnabled: false,
   quietHoursStart: '22:00',
   quietHoursEnd: '07:00',
@@ -137,6 +145,9 @@ function normalizePolicy(input: RawProactivityPolicy = {}): ProactivityPolicy {
     inboxWatchEnabled: input.inboxWatchEnabled !== false,
     inboxWatchMinutes: clampInteger(input.inboxWatchMinutes, DEFAULT_PROACTIVITY_POLICY.inboxWatchMinutes, 5, 240),
     inboxWatchMax: clampInteger(input.inboxWatchMax, DEFAULT_PROACTIVITY_POLICY.inboxWatchMax, 1, 20),
+    calendarWatchEnabled: input.calendarWatchEnabled !== false,
+    calendarWatchMinutes: clampInteger(input.calendarWatchMinutes, DEFAULT_PROACTIVITY_POLICY.calendarWatchMinutes, 5, 240),
+    calendarWatchMax: clampInteger(input.calendarWatchMax, DEFAULT_PROACTIVITY_POLICY.calendarWatchMax, 1, 20),
     quietHoursEnabled: input.quietHoursEnabled === true,
     quietHoursStart: normalizeTime(input.quietHoursStart, DEFAULT_PROACTIVITY_POLICY.quietHoursStart),
     quietHoursEnd: normalizeTime(input.quietHoursEnd, DEFAULT_PROACTIVITY_POLICY.quietHoursEnd),

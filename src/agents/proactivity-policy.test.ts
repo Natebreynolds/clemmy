@@ -45,6 +45,16 @@ test('inbox-watch values are clamped to sane ranges', () => {
   assert.equal(tooHigh.inboxWatchMax, 20, 'max capped at 20');
 });
 
+test('calendar-watch defaults + clamp', () => {
+  const d = saveProactivityPolicy({});
+  assert.equal(d.calendarWatchEnabled, true);
+  assert.equal(d.calendarWatchMinutes, 30);
+  assert.equal(d.calendarWatchMax, 5);
+  const clamped = saveProactivityPolicy({ calendarWatchMinutes: 9999, calendarWatchMax: 0 });
+  assert.equal(clamped.calendarWatchMinutes, 240, 'minutes capped at 240');
+  assert.equal(clamped.calendarWatchMax, 1, 'max floored at 1');
+});
+
 test('a partial save MERGES — a later patch that omits inboxWatchEnabled keeps the prior value', () => {
   saveProactivityPolicy({ inboxWatchEnabled: false });
   const merged = saveProactivityPolicy({ inboxWatchMinutes: 20 }); // omit enabled → keeps false
