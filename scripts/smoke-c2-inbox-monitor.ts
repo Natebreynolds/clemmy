@@ -41,6 +41,7 @@ const deps = {
     return r;
   }),
   notify: (n: any) => surfaced.push(n),          // collect, do NOT write to the store
+  config: () => ({ enabled: true, intervalMs: 0, maxPerScan: 10, fetchTop: 25 }),
   proactiveWorkAllowed: () => true,
   now: () => Date.now(),
   loadState: () => ({ surfacedIds: [] as string[] }),

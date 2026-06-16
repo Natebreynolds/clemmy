@@ -31,7 +31,7 @@ import pino from 'pino';
 import { BASE_DIR, getRuntimeEnv } from '../config.js';
 import { executeComposioTool, listConnectedToolkits } from '../integrations/composio/client.js';
 import { addNotification, type NotificationRecord } from '../runtime/notifications.js';
-import { getProactivityPolicySnapshot } from './proactivity-policy.js';
+import { getProactivityPolicySnapshot, loadProactivityPolicy } from './proactivity-policy.js';
 
 const logger = pino({ name: 'clementine-next.inbox-monitor' });
 
@@ -66,32 +66,37 @@ export interface InboxMonitorDeps {
   listConnections: typeof listConnectedToolkits;
   executeTool: typeof executeComposioTool;
   notify: (n: NotificationRecord) => void;
+  config: () => InboxMonitorConfig;
   proactiveWorkAllowed: () => boolean;
   now: () => number;
   loadState: () => InboxMonitorState;
   saveState: (s: InboxMonitorState) => void;
 }
 
-// ── config ──────────────────────────────────────────────────────────────────
-function enabled(): boolean {
-  // Default ON (validated behavior is the default — feedback_no_rollout_flags).
-  // Safe to default on: surface-only, dashboard-only (quiet), capped, conservative
-  // scoring, and already gated by the proactivity policy + quiet hours. The whole
-  // point of an ambient feature is to help without the user discovering a flag.
-  // Kill-switch: CLEMMY_INBOX_MONITOR=off.
-  return (getRuntimeEnv('CLEMMY_INBOX_MONITOR', 'on') || 'on').toLowerCase() !== 'off';
+// ── config (user-editable via the proactivity policy) ────────────────────────
+export interface InboxMonitorConfig {
+  enabled: boolean;
+  intervalMs: number;
+  maxPerScan: number;
+  fetchTop: number;
 }
-function cadenceMs(): number {
-  const n = Number.parseInt(getRuntimeEnv('CLEMMY_INBOX_MONITOR_MINUTES', '15') || '15', 10);
-  return (Number.isFinite(n) && n >= 1 ? n : 15) * 60_000;
-}
-function perScanCap(): number {
-  const n = Number.parseInt(getRuntimeEnv('CLEMMY_INBOX_MONITOR_MAX', '5') || '5', 10);
-  return Number.isFinite(n) && n >= 1 ? n : 5;
-}
-function fetchTop(): number {
-  const n = Number.parseInt(getRuntimeEnv('CLEMMY_INBOX_MONITOR_FETCH', '25') || '25', 10);
-  return Number.isFinite(n) && n >= 1 ? n : 25;
+/**
+ * Read the live settings from the proactivity policy (what the user edits in the
+ * dashboard: on/off, how often, how many per check). Active hours come from the
+ * policy's quiet-hours window via proactiveWorkAllowed. CLEMMY_INBOX_MONITOR=off
+ * is a hard kill-switch over the user's toggle. Default ON
+ * (feedback_no_rollout_flags) — safe because surface-only + dashboard-only.
+ */
+function realConfig(): InboxMonitorConfig {
+  const policy = loadProactivityPolicy();
+  const killed = (getRuntimeEnv('CLEMMY_INBOX_MONITOR', 'on') || 'on').toLowerCase() === 'off';
+  const fetchOverride = Number.parseInt(getRuntimeEnv('CLEMMY_INBOX_MONITOR_FETCH', '25') || '25', 10);
+  return {
+    enabled: policy.inboxWatchEnabled !== false && !killed,
+    intervalMs: Math.max(1, policy.inboxWatchMinutes) * 60_000,
+    maxPerScan: Math.max(1, policy.inboxWatchMax),
+    fetchTop: Number.isFinite(fetchOverride) && fetchOverride >= 1 ? fetchOverride : 25,
+  };
 }
 
 // ── provider catalog (general, per-provider — NOT per-user) ──────────────────
@@ -210,6 +215,7 @@ const REAL_DEPS: InboxMonitorDeps = {
   listConnections: listConnectedToolkits,
   executeTool: executeComposioTool,
   notify: addNotification,
+  config: realConfig,
   proactiveWorkAllowed: () => getProactivityPolicySnapshot().proactiveWorkAllowed,
   now: () => Date.now(),
   loadState: loadStateReal,
@@ -226,12 +232,13 @@ function accountLabel(conn: { accountEmail?: string; accountName?: string; slug:
  * number of items surfaced. Best-effort: never throws.
  */
 export async function processInboxMonitor(deps: InboxMonitorDeps = REAL_DEPS): Promise<number> {
-  if (!enabled()) return 0;
-  if (!deps.proactiveWorkAllowed()) return 0; // disabled / quiet hours
+  const cfg = deps.config();
+  if (!cfg.enabled) return 0; // inbox-watch toggled off (or kill-switch)
+  if (!deps.proactiveWorkAllowed()) return 0; // proactivity disabled / quiet hours
 
   const nowMs = deps.now();
   const state = deps.loadState();
-  if (state.lastScanAt && nowMs - Date.parse(state.lastScanAt) < cadenceMs()) return 0;
+  if (state.lastScanAt && nowMs - Date.parse(state.lastScanAt) < cfg.intervalMs) return 0;
 
   let connections: Awaited<ReturnType<typeof listConnectedToolkits>>;
   try {
@@ -257,7 +264,7 @@ export async function processInboxMonitor(deps: InboxMonitorDeps = REAL_DEPS): P
     const provider = PROVIDERS[box.slug];
     let resp: unknown;
     try {
-      resp = await deps.executeTool(provider.slug, provider.args(fetchTop()), box.connectionId || undefined);
+      resp = await deps.executeTool(provider.slug, provider.args(cfg.fetchTop), box.connectionId || undefined);
     } catch (err) {
       logger.warn({ err, slug: box.slug }, 'inbox-monitor: read failed for a mailbox');
       continue;
@@ -274,7 +281,7 @@ export async function processInboxMonitor(deps: InboxMonitorDeps = REAL_DEPS): P
 
   // Surface the highest-signal first; newest breaks ties (under the cap).
   candidates.sort((a, b) => (b.score.score - a.score.score) || (Date.parse(b.msg.receivedAt || '') || 0) - (Date.parse(a.msg.receivedAt || '') || 0));
-  const toSurface = candidates.slice(0, perScanCap());
+  const toSurface = candidates.slice(0, cfg.maxPerScan);
   for (const c of toSurface) {
     const key = `${c.connectionId}:${c.msg.id}`;
     deps.notify(buildNeedsYouNotification(c.msg, c.score, c.label, c.connectionId, c.slug, nowMs));

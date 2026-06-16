@@ -1523,6 +1523,21 @@ export function renderConsoleHtml(token: string): string {
                   </div>
                 </div>
                 <div class="settings-field">
+                  <label>WATCH MY INBOX</label>
+                  <div class="settings-row">
+                    <label class="check-pill">
+                      <input type="checkbox" name="inboxWatchEnabled" data-policy-field />
+                      <span>Enabled</span>
+                    </label>
+                    <span style="color:var(--fg-3); font-size:11px;">every</span>
+                    <input type="number" name="inboxWatchMinutes" data-policy-field min="5" max="240" style="width:72px;" />
+                    <span style="color:var(--fg-3); font-size:11px;">min · up to</span>
+                    <input type="number" name="inboxWatchMax" data-policy-field min="1" max="20" style="width:60px;" />
+                    <span style="color:var(--fg-3); font-size:11px;">cards/check</span>
+                  </div>
+                  <em style="color:var(--fg-3); font-size:10.5px;">Quietly checks connected mailboxes and surfaces only unread mail that needs you (read-only). Active hours follow Quiet Hours below.</em>
+                </div>
+                <div class="settings-field">
                   <label>QUIET HOURS</label>
                   <div class="settings-row">
                     <label class="check-pill">
@@ -23883,12 +23898,12 @@ const CONSOLE_JS = `
       ['displayName','preferredName','role','timezone','urgencyTolerance','communicationTone','formality','workingHoursStart','workingHoursEnd','notes'].forEach((k) => setFormValue(sett.profileForm, k, profile[k]));
 
       const policy = (s.proactivity && s.proactivity.policy) || {};
-      ['enabled','quietHoursEnabled','allowComputerActions','allowComposioActions','allowDiscordCheckIns'].forEach((k) => setFormValue(sett.policyForm, k, policy[k]));
+      ['enabled','quietHoursEnabled','inboxWatchEnabled','allowComputerActions','allowComposioActions','allowDiscordCheckIns'].forEach((k) => setFormValue(sett.policyForm, k, policy[k]));
       // autoApproveScope was historically omitted from this list — saved
       // correctly to disk but never rendered back into the dropdown on
       // load, so the value silently reverted to the HTML default
       // ("strict") on every page refresh. Reported 2026-05-22.
-      ['mode','autoApproveScope','checkInMinutes','defaultLongTaskMinutes','briefCadenceMinutes','quietHoursStart','quietHoursEnd'].forEach((k) => setFormValue(sett.policyForm, k, policy[k]));
+      ['mode','autoApproveScope','checkInMinutes','defaultLongTaskMinutes','briefCadenceMinutes','inboxWatchMinutes','inboxWatchMax','quietHoursStart','quietHoursEnd'].forEach((k) => setFormValue(sett.policyForm, k, policy[k]));
 
       renderAuthInfo(s.auth);
       renderModelPicker(s.models);

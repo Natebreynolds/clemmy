@@ -47,6 +47,11 @@ export interface ProactivityPolicy {
    *  external writes in a session requires an instruction-reviewed plan
    *  scope before it proceeds. Floored at 2 by the gate. */
   batchConfirmThreshold: number;
+  /** C2 ambient inbox watch: surface unread mail that needs you (read-only).
+   *  Active hours = NOT quiet hours (reuses the window below). */
+  inboxWatchEnabled: boolean;
+  inboxWatchMinutes: number; // how often to check, 5–240
+  inboxWatchMax: number;     // max needs-you cards surfaced per check, 1–20
   quietHoursEnabled: boolean;
   quietHoursStart: string;
   quietHoursEnd: string;
@@ -76,6 +81,9 @@ export const DEFAULT_PROACTIVITY_POLICY: ProactivityPolicy = {
   defaultLongTaskMinutes: 90,
   maxConcurrentBackgroundTasks: 1,
   batchConfirmThreshold: 5,
+  inboxWatchEnabled: true,
+  inboxWatchMinutes: 15,
+  inboxWatchMax: 5,
   quietHoursEnabled: false,
   quietHoursStart: '22:00',
   quietHoursEnd: '07:00',
@@ -126,6 +134,9 @@ function normalizePolicy(input: RawProactivityPolicy = {}): ProactivityPolicy {
     defaultLongTaskMinutes: clampInteger(input.defaultLongTaskMinutes, DEFAULT_PROACTIVITY_POLICY.defaultLongTaskMinutes, 5, 240),
     maxConcurrentBackgroundTasks: clampInteger(input.maxConcurrentBackgroundTasks, DEFAULT_PROACTIVITY_POLICY.maxConcurrentBackgroundTasks, 1, 5),
     batchConfirmThreshold: clampInteger(input.batchConfirmThreshold, DEFAULT_PROACTIVITY_POLICY.batchConfirmThreshold, 2, 100),
+    inboxWatchEnabled: input.inboxWatchEnabled !== false,
+    inboxWatchMinutes: clampInteger(input.inboxWatchMinutes, DEFAULT_PROACTIVITY_POLICY.inboxWatchMinutes, 5, 240),
+    inboxWatchMax: clampInteger(input.inboxWatchMax, DEFAULT_PROACTIVITY_POLICY.inboxWatchMax, 1, 20),
     quietHoursEnabled: input.quietHoursEnabled === true,
     quietHoursStart: normalizeTime(input.quietHoursStart, DEFAULT_PROACTIVITY_POLICY.quietHoursStart),
     quietHoursEnd: normalizeTime(input.quietHoursEnd, DEFAULT_PROACTIVITY_POLICY.quietHoursEnd),
