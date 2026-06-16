@@ -15,7 +15,12 @@ function compilePatterns(patterns: string[] | undefined): RegExp[] {
   });
 }
 
-function normalizedHaystack(tool: MCPTool): string {
+/**
+ * The text used both to keyword-match a tool and to embed it for semantic
+ * ranking — name + server slug + tool name + description. Exported so the
+ * semantic ranker (mcp-tool-rank) embeds the SAME text the filter keyword-scores.
+ */
+export function toolHaystack(tool: MCPTool): string {
   const parsed = parseNamespacedTool(tool.name);
   return [
     tool.name,
@@ -25,15 +30,31 @@ function normalizedHaystack(tool: MCPTool): string {
   ].join(' ').toLowerCase();
 }
 
-function scoreTool(tool: MCPTool, priorityKeywords: string[] | undefined): number {
+// Weight for the semantic component. A cosine of 1.0 contributes +100 — well
+// above the keyword bumps (+5 each), so on the keyword-less fail-open surface
+// semantic relevance is the dominant signal, while __unavailable stubs (−50)
+// still lose to any real tool with non-trivial relevance.
+const SEMANTIC_WEIGHT = 100;
+
+function scoreTool(
+  tool: MCPTool,
+  priorityKeywords: string[] | undefined,
+  semanticScores?: Map<string, number>,
+): number {
+  // Synthetic "unavailable" stubs must rank below EVERY real tool — return the
+  // penalty immediately so neither semantic relevance nor keyword matches can
+  // rescue a stub above a usable tool (real tools always score >= 0).
+  if (tool.name.endsWith('__unavailable')) return -50;
   let score = 0;
-  // Prefer concrete tools over the synthetic unavailable stubs when a cap
-  // applies, but keep stubs visible when no real tools match. Applied BEFORE the
-  // no-keyword early return so it also de-prioritizes stubs on the fail-open
-  // surface (which supplies no priority keywords).
-  if (tool.name.endsWith('__unavailable')) score -= 50;
+  // T1 semantic component (precomputed cosine in [0,1]). On the fail-open
+  // surface this is the ONLY relevance signal; for keyword scopes it rides
+  // alongside the keyword bumps.
+  if (semanticScores) {
+    const s = semanticScores.get(tool.name);
+    if (typeof s === 'number') score += s * SEMANTIC_WEIGHT;
+  }
   if (!priorityKeywords || priorityKeywords.length === 0) return score;
-  const haystack = normalizedHaystack(tool);
+  const haystack = toolHaystack(tool);
   for (const keyword of priorityKeywords) {
     const normalized = keyword.toLowerCase();
     if (!normalized) continue;
@@ -63,11 +84,21 @@ function toolMatchesScope(tool: MCPTool, scope: McpToolScope, patterns: RegExp[]
 
   if (parsed?.toolName === 'unavailable') return true;
 
-  const haystack = normalizedHaystack(tool);
+  const haystack = toolHaystack(tool);
   return patterns.some((pattern) => pattern.test(haystack));
 }
 
-export function filterMcpToolsForScope(tools: MCPTool[], scope: McpToolScope): MCPTool[] {
+/**
+ * Filter the full MCP tool universe to the per-run surface.
+ * @param semanticScores Optional precomputed cosine relevance (toolName → [0,1])
+ *   from the T1 semantic ranker. When present it dominates ranking on the
+ *   keyword-less fail-open surface; absent, behavior is identical to before.
+ */
+export function filterMcpToolsForScope(
+  tools: MCPTool[],
+  scope: McpToolScope,
+  semanticScores?: Map<string, number>,
+): MCPTool[] {
   if (scope.allowAll) return tools;
   if ((scope.maxTools ?? 0) <= 0 && (scope.allowedServerSlugs?.length ?? 0) === 0) return [];
 
@@ -80,7 +111,7 @@ export function filterMcpToolsForScope(tools: MCPTool[], scope: McpToolScope): M
     .map((tool, index): RankedTool => ({
       tool,
       index,
-      score: scoreTool(tool, scope.priorityKeywords),
+      score: scoreTool(tool, scope.priorityKeywords, semanticScores),
       serverSlug: parseNamespacedTool(tool.name)?.serverSlug ?? null,
     }))
     .sort((a, b) => (b.score - a.score) || (a.index - b.index));

@@ -548,6 +548,12 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         })
       : resolveMcpToolScope({ userInput: options.userInput })
   );
+  // T1: thread the current input so the fail-open MCP surface can rank the
+  // user's connected tools by semantic relevance (run-start only; ignored by
+  // keyword family scopes). Respects a caller-provided queryText.
+  if (typeof options.userInput === 'string' && options.userInput.trim() && !mcpToolScope.queryText) {
+    mcpToolScope.queryText = options.userInput;
+  }
   if (options.sessionId) {
     try {
       appendEvent({

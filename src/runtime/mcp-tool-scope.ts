@@ -43,6 +43,15 @@ export interface McpToolScope {
    * match-all-servers but STILL applies the cap.
    */
   failOpenCandidate?: boolean;
+  /**
+   * The current user input, threaded through for T1 semantic tool retrieval.
+   * When set (and embeddings are healthy), the fail-open surface ranks the
+   * user's connected tools by semantic relevance to this text — turning the
+   * arbitrary "first N tools" cap into the N MOST RELEVANT. Ignored on keyword
+   * family scopes (their cached shim can't hold a per-query embedding). Set by
+   * the orchestrator at run start; not part of the scope cache key.
+   */
+  queryText?: string;
 }
 
 export interface ResolveMcpToolScopeOptions {

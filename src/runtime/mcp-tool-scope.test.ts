@@ -201,6 +201,50 @@ test('filterMcpToolsForScope: a fail-open scope spans ALL servers, capped, de-pr
   assert.ok(filtered.includes('airtable__list_records'));
 });
 
+test('filterMcpToolsForScope: semantic scores rank the fail-open surface (T1)', () => {
+  const scope: McpToolScope = { reason: 'failopen semantic', failOpenCandidate: true, maxTools: 2 };
+  const tools = [
+    tool('github__create_issue', 'Open a GitHub issue'),
+    tool('slack__post_message', 'Post a Slack message'),
+    tool('airtable__list_records', 'List Airtable records'),
+  ];
+  // Query "add a row to my airtable + ping the team" → airtable + slack most
+  // relevant; github least. By index alone the cap of 2 would keep github+slack.
+  const semantic = new Map<string, number>([
+    ['airtable__list_records', 0.81],
+    ['slack__post_message', 0.55],
+    ['github__create_issue', 0.05],
+  ]);
+  const filtered = filterMcpToolsForScope(tools, scope, semantic).map((t) => t.name);
+  assert.deepEqual(filtered, ['airtable__list_records', 'slack__post_message'], 'kept the 2 most semantically relevant, in relevance order');
+  assert.ok(!filtered.includes('github__create_issue'), 'least-relevant tool dropped under the cap');
+});
+
+test('filterMcpToolsForScope: omitting semantic scores is byte-identical to before (no regression)', () => {
+  const scope: McpToolScope = { reason: 'failopen', failOpenCandidate: true, maxTools: 2 };
+  const tools = [
+    tool('a__one', 'first'),
+    tool('b__two', 'second'),
+    tool('c__three', 'third'),
+  ];
+  const withoutArg = filterMcpToolsForScope(tools, scope).map((t) => t.name);
+  const withUndefined = filterMcpToolsForScope(tools, scope, undefined).map((t) => t.name);
+  assert.deepEqual(withoutArg, ['a__one', 'b__two'], 'index order preserved when no semantic signal');
+  assert.deepEqual(withUndefined, withoutArg, 'explicit undefined === omitted');
+});
+
+test('filterMcpToolsForScope: semantic ranking still loses to the __unavailable penalty', () => {
+  const scope: McpToolScope = { reason: 'failopen', failOpenCandidate: true, maxTools: 1 };
+  const tools = [
+    tool('x__unavailable', 'server unavailable stub'),
+    tool('y__do_thing', 'does the thing'),
+  ];
+  // Even if the stub somehow scored highly, the −50 penalty keeps the real tool first.
+  const semantic = new Map<string, number>([['x__unavailable', 0.99], ['y__do_thing', 0.10]]);
+  const filtered = filterMcpToolsForScope(tools, scope, semantic).map((t) => t.name);
+  assert.deepEqual(filtered, ['y__do_thing'], 'real tool wins the cap over the unavailable stub');
+});
+
 test('resolveMcpToolScope: SEO audit prompts select a capped DataForSEO subset', () => {
   const scope = resolveMcpToolScope({
     userInput: 'hey can you do an SEO audit on https://example.com and suggest changes',

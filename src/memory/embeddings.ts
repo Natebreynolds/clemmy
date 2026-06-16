@@ -271,6 +271,27 @@ export async function embedQuery(query: string): Promise<Float32Array | null> {
   }
 }
 
+/**
+ * Public API: embed a batch of texts in one call. Convenience for rankers that
+ * need many vectors at once (e.g. semantic tool retrieval). Returns vectors in
+ * input order, or null if embeddings are disabled / in cooldown / the call
+ * fails — callers fall back to a non-semantic path. Never throws.
+ */
+export async function embedTexts(texts: string[]): Promise<Float32Array[] | null> {
+  if (texts.length === 0) return [];
+  if (!isEmbeddingsEnabled()) return null;
+  if (inCooldown()) return null;
+  try {
+    const vectors = await embedBatch(texts);
+    recordSuccess();
+    return vectors;
+  } catch (err) {
+    recordFailure(err);
+    logger.warn({ err, count: texts.length }, 'embedTexts failed; caller falls back to non-semantic path');
+    return null;
+  }
+}
+
 export interface EmbedBackfillStats {
   enabled: boolean;
   candidateChunks: number;

@@ -6,6 +6,8 @@ import { discoverMcpServers } from './mcp-config.js';
 import { mergedSpawnEnv } from './spawn-env.js';
 import { createMcpNamespaceShim } from './mcp-namespace-shim.js';
 import { filterMcpToolsForScope } from './mcp-tool-filter.js';
+import { rankToolsBySemantic, semanticToolRankEnabled } from './mcp-tool-rank.js';
+import { isEmbeddingsEnabled } from '../memory/embeddings.js';
 import type { McpToolScope } from './mcp-tool-scope.js';
 import type { ManagedMcpServer } from '../types.js';
 
@@ -225,7 +227,11 @@ function scopeCacheKey(scope: McpToolScope): string {
   });
 }
 
-function createScopedExternalShim(base: MCPServer, scope: McpToolScope): MCPServer {
+function createScopedExternalShim(
+  base: MCPServer,
+  scope: McpToolScope,
+  opts: { semantic?: boolean } = {},
+): MCPServer {
   return {
     cacheToolsList: base.cacheToolsList,
     toolFilter: base.toolFilter,
@@ -241,7 +247,15 @@ function createScopedExternalShim(base: MCPServer, scope: McpToolScope): MCPServ
     },
     async listTools() {
       const tools = await base.listTools();
-      return filterMcpToolsForScope(tools, scope);
+      // T1: on the fail-open surface, rank the user's connected tools by
+      // semantic relevance to the query (returns undefined → keyword/index
+      // order, zero behavior change). Only the fresh per-query fail-open shim
+      // sets semantic:true — cached keyword shims hold a stale query and must
+      // not.
+      const semanticScores = opts.semantic
+        ? await rankToolsBySemantic(scope.queryText, tools)
+        : undefined;
+      return filterMcpToolsForScope(tools, scope, semanticScores);
     },
     async callTool(toolName, args) {
       return base.callTool(toolName, args);
@@ -271,6 +285,14 @@ function ensureAllExternalBaseShim(): MCPServer {
  */
 function getOrCreateFailOpenExternalShim(scope: McpToolScope): MCPServer {
   const base = ensureAllExternalBaseShim();
+  // T1 semantic fail-open: rank the user's connected tools by relevance to THIS
+  // query, so the cap keeps the N most relevant instead of the first N. A fresh
+  // per-query wrapper over the SHARED base — no child re-spawn, deliberately not
+  // cached (the ranking is query-specific). Falls back to the cached keyword
+  // path when the flag is off or embeddings are unavailable.
+  if (semanticToolRankEnabled() && scope.queryText && isEmbeddingsEnabled()) {
+    return createScopedExternalShim(base, scope, { semantic: true });
+  }
   const key = `failopen:${scope.maxTools ?? ''}`;
   if (cachedFailOpenExternalShim && cachedFailOpenKey === key) return cachedFailOpenExternalShim;
   cachedFailOpenExternalShim = createScopedExternalShim(base, scope);
@@ -307,6 +329,54 @@ export function getOrCreateExternalMcpServers(scope?: McpToolScope): MCPServer {
   cachedScopedExternalBaseShims.set(key, base);
   cachedScopedExternalShims.set(key, scoped);
   return scoped;
+}
+
+/**
+ * Run one pre-warm and retry a few times if not every server connected.
+ * Pure + injectable sleep so the retry/backoff is unit-testable without
+ * spawning real MCP children. Each retry gap (default 6s) clears the shim's
+ * early connect-failure backoff (1s/5s ladder), so a server whose COLD handshake
+ * was starved on the first attempt reconnects on a later one.
+ */
+export async function prewarmWithRetry(
+  prewarmOnce: () => Promise<boolean>,
+  opts: { attempts?: number; gapMs?: number; sleep?: (ms: number) => Promise<void> } = {},
+): Promise<{ attempts: number; allConnected: boolean }> {
+  const maxAttempts = Math.max(1, opts.attempts ?? 3);
+  const gapMs = opts.gapMs ?? 6_000;
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  let attempt = 0;
+  let allConnected = false;
+  while (attempt < maxAttempts) {
+    attempt += 1;
+    try {
+      allConnected = await prewarmOnce();
+    } catch {
+      allConnected = false;
+    }
+    if (allConnected) break;
+    if (attempt < maxAttempts) await sleep(gapMs);
+  }
+  return { attempts: attempt, allConnected };
+}
+
+/**
+ * Warm the daemon-lifetime external MCP base shim at startup, OFF the hot path.
+ * Connecting while the boot loop is idle avoids the synchronous-better-sqlite3
+ * event-loop starvation that times out a COLD connect mid-turn and degrades the
+ * server (sess-mqg8wdw1: dataforseo "connecting" stalled a Salesforce-CLI turn
+ * that never needed it). Connections persist, so every later turn — and every
+ * cheap scoped/fail-open VIEW that delegates to this base — reuses them without
+ * a per-turn handshake. Best-effort + retried; a still-dead server just stays a
+ * stub and the per-turn skip-path (MCP_ATTACH_CONNECTED_ONLY) keeps it from ever
+ * blocking a turn. Kill-switch (CLEMMY_MCP_PREWARM) is checked by the caller.
+ */
+export async function prewarmMcpServers(
+  opts: { attempts?: number; gapMs?: number } = {},
+): Promise<{ attempts: number; allConnected: boolean }> {
+  const base = ensureAllExternalBaseShim() as { prewarm?: () => Promise<boolean> };
+  if (typeof base.prewarm !== 'function') return { attempts: 0, allConnected: true };
+  return prewarmWithRetry(() => base.prewarm!(), opts);
 }
 
 /**
