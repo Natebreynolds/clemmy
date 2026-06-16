@@ -65,6 +65,7 @@ import { captureInteractionSignals } from '../../memory/auto-capture.js';
 import { primeTurnRecallVector, searchFactsByText } from '../../memory/facts.js';
 import { formatSearchHits, searchVault, searchVaultAsync } from '../../memory/search.js';
 import { maybeAutoFocusSession } from './auto-focus.js';
+import { scrubInternalNarration } from './scrub-internal-narration.js';
 import { getPlanScope, openPlanScope } from '../../agents/plan-scope.js';
 import { classifyTool } from '../../agents/tool-taxonomy.js';
 
@@ -2320,9 +2321,13 @@ function toOrchestratorDecision(value: unknown): OrchestratorDecisionShape | nul
     'abandoned',
   ]);
   if (!validActions.has(v.nextAction)) return null;
+  const rawReply = typeof v.reply === 'string' && v.reply.trim() ? v.reply : null;
   return {
     summary: v.summary,
-    reply: typeof v.reply === 'string' && v.reply.trim() ? v.reply : null,
+    // Strip internal context/memory/focus bookkeeping the model sometimes
+    // narrates INTO the user-facing reply (e.g. "I checked the active context…
+    // not the stale Revill audit thread"). reply is the answer, not plumbing.
+    reply: rawReply ? scrubInternalNarration(rawReply) : null,
     done: v.done,
     nextAction: v.nextAction as OrchestratorDecisionShape['nextAction'],
     reason: typeof v.reason === 'string' ? v.reason : null,
