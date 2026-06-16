@@ -85,6 +85,18 @@ function titleForKind(kind: BoundaryErrorKind): string {
       return 'Model backend stopped responding';
     case 'codex.grace_turn_failed':
       return "Couldn't write a recap after hitting the budget";
+    case 'model.rate_limited':
+      return 'Model backend is rate-limiting';
+    case 'model.overloaded':
+      return 'Model backend is overloaded';
+    case 'model.transport_timeout':
+      return 'Model backend stopped responding';
+    case 'model.empty_completion':
+      return 'Model returned an empty response';
+    case 'model.auth_expired':
+      return 'Model auth expired';
+    case 'model.http_5xx':
+      return 'Model backend is having trouble';
     case 'mcp.server_unavailable':
       return 'Tool server is unavailable';
     case 'mcp.tool_call_failed':
@@ -124,7 +136,15 @@ function actionHintForKind(
     case 'codex.wall_clock':
     case 'codex.transport_timeout':
       return 'Try again in a minute. If it persists, check status.openai.com.';
+    case 'model.rate_limited':
+    case 'model.overloaded':
+    case 'model.transport_timeout':
+    case 'model.http_5xx':
+      return 'Try again in a minute. If it persists, check the provider status page.';
+    case 'model.empty_completion':
+      return undefined;
     case 'codex.auth_expired':
+    case 'model.auth_expired':
       return surface === 'cli'
         ? 'Run: clementine auth login'
         : 'Re-authenticate in Settings → Auth.';
@@ -160,6 +180,11 @@ function severityForKind(kind: BoundaryErrorKind): 'warn' | 'error' | 'critical'
     case 'codex.sse_truncated':
     case 'codex.wall_clock':
     case 'codex.transport_timeout':
+    case 'model.rate_limited':
+    case 'model.overloaded':
+    case 'model.transport_timeout':
+    case 'model.empty_completion':
+    case 'model.http_5xx':
     case 'mcp.server_unavailable':
     case 'notification.delivery_failed':
     case 'notification.partial_chunk':
@@ -175,6 +200,7 @@ function severityForKind(kind: BoundaryErrorKind): 'warn' | 'error' | 'critical'
       return 'error';
     // Hard-blocks the agent until human intervention.
     case 'codex.auth_expired':
+    case 'model.auth_expired':
     case 'state.write_failed':
     case 'state.read_corrupted':
       return 'critical';

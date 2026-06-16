@@ -35,6 +35,13 @@ export type BoundaryErrorKind =
   | 'codex.wall_clock'
   | 'codex.transport_timeout'
   | 'codex.grace_turn_failed'
+  // Provider-agnostic model boundary (resilient-model.ts — Claude / BYO)
+  | 'model.rate_limited'
+  | 'model.overloaded'
+  | 'model.transport_timeout'
+  | 'model.empty_completion'
+  | 'model.auth_expired'
+  | 'model.http_5xx'
   // MCP fleet
   | 'mcp.server_unavailable'
   | 'mcp.tool_call_failed'
@@ -142,6 +149,11 @@ export class BoundaryError extends Error {
       case 'codex.sse_truncated':
       case 'codex.wall_clock':
       case 'codex.transport_timeout':
+      case 'model.rate_limited':
+      case 'model.overloaded':
+      case 'model.transport_timeout':
+      case 'model.empty_completion':
+      case 'model.http_5xx':
       case 'mcp.server_unavailable':
       case 'notification.delivery_failed':
         return true;

@@ -54,6 +54,7 @@ import { refreshStoredNativeOAuth, getStoredCodexOAuthTokens, classifyCodexAuthE
 import { BoundaryError } from '../boundary-error.js';
 import { codexDispatcher, detectCodexTransportFailure, buildTransportTimeoutError } from '../codex-dispatcher.js';
 import { estimateInputTokens } from './token-estimator.js';
+import { restoreLegacyInstructionOrder } from './model-wire-registry.js';
 import pino from 'pino';
 
 const logger = pino({ name: 'clementine.codex-model' });
@@ -955,7 +956,10 @@ export function buildCodexRequestBody(modelId: string, request: ModelRequest): C
   const tools = serializeTools(request.tools, request.handoffs);
   const body: CodexRequestBody = {
     model: resolveCodexModel(modelId),
-    instructions: request.systemInstructions || 'You are a helpful assistant.',
+    // Restore the legacy (dynamic-first) instruction order — Codex's wire is
+    // BYTE-IDENTICAL to pre-parity regardless of the flag (caching is automatic
+    // server-side here, so the stable-first reorder is a Claude-only concern).
+    instructions: restoreLegacyInstructionOrder(request.systemInstructions) || 'You are a helpful assistant.',
     store: false,
     stream: true,
     input: serializeInput(request.input),

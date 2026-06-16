@@ -34,6 +34,7 @@ import { renderSourceMapForContext } from '../memory/source-map.js';
 import { listActiveGoalSummaries } from '../memory/goals-list.js';
 import { loadUserProfile, renderProfileForInstructions } from '../runtime/user-profile.js';
 import { loadProactivityPolicy } from './proactivity-policy.js';
+import { modelParityEnabled, CACHE_BREAK_SENTINEL } from '../runtime/harness/model-wire-registry.js';
 
 function section(title: string, body: string | undefined | null): string {
   if (!body || !body.trim()) return '';
@@ -319,6 +320,15 @@ export function renderHarnessMemoryContext(): string {
 export function harnessInstructions(roleInstructions: string): () => string {
   return () => {
     const ctx = renderHarnessMemoryContext();
-    return ctx ? `${ctx}\n\n---\n\n${roleInstructions}` : roleInstructions;
+    if (!ctx) return roleInstructions;
+    // Parity (default): STABLE role instructions FIRST so the whole prefix
+    // (identity + role + tools) can be prompt-cached; the per-turn DYNAMIC
+    // memory context goes AFTER the cache-break sentinel. Brains that don't
+    // cache (Codex/BYO) strip the sentinel back to a `---` separator at their
+    // wire. Legacy order (dynamic-first) restored when parity is off.
+    if (modelParityEnabled()) {
+      return `${roleInstructions}\n\n${CACHE_BREAK_SENTINEL}\n\n${ctx}`;
+    }
+    return `${ctx}\n\n---\n\n${roleInstructions}`;
   };
 }

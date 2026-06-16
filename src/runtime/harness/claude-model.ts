@@ -23,12 +23,28 @@
  */
 import { aisdk } from '@openai/agents-extensions/ai-sdk';
 import { createAnthropic } from '@ai-sdk/anthropic';
+import { Agent } from 'undici';
 import type { Model, ModelProvider } from '@openai/agents-core';
 import { loadFreshClaudeAccessToken } from '../claude-oauth.js';
-import { getClaudeBrainModel } from '../../config.js';
+import { getClaudeBrainModel, getRuntimeEnv } from '../../config.js';
+import { withResilience } from './resilient-model.js';
+import { resolveModelCapability, estimateTokens, modelParityEnabled, restoreLegacyInstructionOrder, CACHE_BREAK_SENTINEL, type ModelCapability } from './model-wire-registry.js';
 import pino from 'pino';
 
 const logger = pino({ name: 'clementine.claude-model' });
+
+// Bounded socket timeouts for the Claude fetch (G6) — mirrors codexDispatcher.
+// Headers 30s (generous: effort/thinking happens AFTER headers, during the SSE
+// ping stream); body 120s (max gap between SSE events, not total turn time).
+const CLAUDE_HEADERS_TIMEOUT_MS = 30_000;
+const CLAUDE_BODY_TIMEOUT_MS = 120_000;
+let claudeDispatcher: Agent | null = null;
+function getClaudeDispatcher(): Agent {
+  if (!claudeDispatcher) {
+    claudeDispatcher = new Agent({ headersTimeout: CLAUDE_HEADERS_TIMEOUT_MS, bodyTimeout: CLAUDE_BODY_TIMEOUT_MS });
+  }
+  return claudeDispatcher;
+}
 
 // The first system block must establish the Claude-Code identity for the
 // subscription OAuth token to be honored (verified live: the identity prefix is
@@ -89,7 +105,19 @@ export function applyClaudeEnvelope(
   if (typeof body === 'string') {
     try {
       const parsed = JSON.parse(body) as Record<string, unknown>;
-      parsed.system = withIdentityPrefix(parsed.system);
+      if (modelParityEnabled()) {
+        // Parity path: identity-first system blocks + a cache_control breakpoint
+        // on the stable prefix (G3), gated by the model's cacheMinTokens.
+        const cap = resolveModelCapability(typeof parsed.model === 'string' ? parsed.model : '');
+        applyClaudeCaching(parsed, cap);
+      } else {
+        // Legacy path. Defensively restore legacy order / strip any stray
+        // sentinel first — handling BOTH a string system AND the real
+        // array-of-text-blocks shape the AI SDK actually emits — so a flag-flip
+        // between assembly and wire can never leak the marker to the Anthropic
+        // API (which would 400 / pollute the prompt).
+        parsed.system = withIdentityPrefix(restoreLegacySystem(parsed.system));
+      }
       if (parsed.max_tokens == null) parsed.max_tokens = CLAUDE_DEFAULT_MAX_TOKENS;
       body = JSON.stringify(parsed);
     } catch {
@@ -99,13 +127,223 @@ export function applyClaudeEnvelope(
   return { headers, body };
 }
 
-/** Custom fetch enforcing the OAuth billing guarantee + identity envelope. */
+/** Restore legacy instruction order / strip the cache-break sentinel from a
+ *  `system` value of EITHER shape the AI SDK can hand us — a plain string or the
+ *  array-of-text-blocks shape `@ai-sdk/anthropic` actually emits. Used on the
+ *  parity-off path so a stray sentinel never reaches the Anthropic wire. */
+export function restoreLegacySystem(system: unknown): unknown {
+  if (typeof system === 'string') return restoreLegacyInstructionOrder(system);
+  if (Array.isArray(system)) {
+    return system.map((b) => {
+      const t = (b as { text?: unknown })?.text;
+      return typeof t === 'string' ? { ...(b as object), text: restoreLegacyInstructionOrder(t) } : b;
+    });
+  }
+  return system;
+}
+
+/** Normalize the AI SDK's `system` (string or text-block array) to a single
+ *  string we can split at the stable/dynamic boundary. NOTE: the harness emits
+ *  exactly ONE system message, so the production array has a single block; the
+ *  '\n' join is only a defensive fallback for a hypothetical multi-block input. */
+function normalizeSystemText(system: unknown): string {
+  if (typeof system === 'string') return system;
+  if (Array.isArray(system)) {
+    return system
+      .map((b) => {
+        const t = (b as { text?: unknown })?.text;
+        return typeof t === 'string' ? t : '';
+      })
+      .join('\n');
+  }
+  return '';
+}
+
+/**
+ * Build the Anthropic `system` as text blocks: [identity, stable(+cache_control?),
+ * dynamic]. The identity block MUST stay index 0 (the subscription OAuth token is
+ * only honored when the Claude-Code identity leads). When the harness emitted the
+ * CACHE_BREAK_SENTINEL (parity reorder on), everything before it is the STABLE
+ * prefix and gets the cache breakpoint; everything after is per-turn dynamic and
+ * stays uncached. No sentinel → the whole prompt is treated as dynamic (no system
+ * cache) and the caller caches tools instead.
+ */
+export function buildClaudeSystemBlocks(
+  system: unknown,
+  cap: ModelCapability,
+  cachingOn: boolean,
+  toolsTokens = 0,
+): { blocks: Array<Record<string, unknown>>; systemCached: boolean } {
+  let raw = normalizeSystemText(system);
+  if (raw.startsWith(CLAUDE_CODE_IDENTITY)) {
+    raw = raw.slice(CLAUDE_CODE_IDENTITY.length).replace(/^\s+/, '');
+  }
+  const sentIdx = raw.indexOf(CACHE_BREAK_SENTINEL);
+  const stripAll = (s: string): string => s.split(CACHE_BREAK_SENTINEL).join('').trim();
+  const stable = stripAll(sentIdx >= 0 ? raw.slice(0, sentIdx) : raw);
+  const dynamic = stripAll(sentIdx >= 0 ? raw.slice(sentIdx + CACHE_BREAK_SENTINEL.length) : '');
+
+  const blocks: Array<Record<string, unknown>> = [{ type: 'text', text: CLAUDE_CODE_IDENTITY }];
+  let systemCached = false;
+  // Anthropic 400s on an EMPTY text content block, so only emit the stable block
+  // when it has content (identity-only is a valid system, matching legacy
+  // withIdentityPrefix('')). Reachable with an empty/whitespace system or a
+  // sentinel-led prompt whose stable prefix is empty.
+  if (stable) {
+    const stableBlock: Record<string, unknown> = { type: 'text', text: stable };
+    // A breakpoint on the stable system block caches the WHOLE prefix up to it
+    // (tools + identity + stable, per Anthropic's tools->system->messages
+    // hierarchy), so the min-size gate counts the tools tokens that share the
+    // cached prefix — not just identity+stable.
+    if (
+      cachingOn && cap.supportsPromptCache && sentIdx >= 0
+      && estimateTokens(CLAUDE_CODE_IDENTITY + stable) + toolsTokens >= cap.cacheMinTokens
+    ) {
+      stableBlock.cache_control = { type: 'ephemeral' };
+      systemCached = true;
+    }
+    blocks.push(stableBlock);
+  }
+  if (dynamic) blocks.push({ type: 'text', text: dynamic });
+  return { blocks, systemCached };
+}
+
+/** Mutate the request body in place: identity-first cached system blocks, and —
+ *  when the system prefix wasn't cached (no sentinel / empty stable, e.g. a
+ *  sub-agent prompt) — a cache breakpoint on the (stable) tools array instead. */
+function applyClaudeCaching(parsed: Record<string, unknown>, cap: ModelCapability): void {
+  const tools = Array.isArray(parsed.tools) ? (parsed.tools as Array<Record<string, unknown>>) : [];
+  const toolsTokens = tools.length > 0 ? estimateTokens(JSON.stringify(tools)) : 0;
+  const { blocks, systemCached } = buildClaudeSystemBlocks(parsed.system, cap, true, toolsTokens);
+  parsed.system = blocks;
+  if (!systemCached && cap.supportsPromptCache && tools.length > 0 && toolsTokens >= cap.cacheMinTokens) {
+    const last = tools[tools.length - 1];
+    if (last && typeof last === 'object') last.cache_control = { type: 'ephemeral' };
+  }
+}
+
+/** Opt-in wire diagnostics (off by default). `CLEMMY_CLAUDE_WIRE_DEBUG=1` logs
+ *  the outbound request shape + the response's cache-usage to supervisor.log so a
+ *  live smoke can confirm: effort on the wire, cache breakpoints present, the
+ *  sentinel never leaks, and `cacheReadInputTokens > 0` on a repeat turn. */
+export function claudeWireDebugEnabled(): boolean {
+  const v = (getRuntimeEnv('CLEMMY_CLAUDE_WIRE_DEBUG', '') || '').trim().toLowerCase();
+  return v === '1' || v === 'on' || v === 'true';
+}
+
+/** Log the cache/effort/sentinel shape of the outbound Claude request. Best-effort. */
+export function logClaudeRequestShape(body: BodyInit | null | undefined): void {
+  try {
+    if (typeof body !== 'string') return;
+    const parsed = JSON.parse(body) as Record<string, unknown>;
+    const sys = Array.isArray(parsed.system) ? (parsed.system as Array<Record<string, unknown>>) : [];
+    const tools = Array.isArray(parsed.tools) ? (parsed.tools as Array<Record<string, unknown>>) : [];
+    const sysBreakpoints = sys.filter((b) => b?.cache_control).length;
+    const toolBreakpoints = tools.filter((t) => t?.cache_control).length;
+    const outputConfig = parsed.output_config as { effort?: unknown } | undefined;
+    logger.info(
+      {
+        kind: 'claude_wire_request',
+        model: parsed.model,
+        systemBlocks: sys.length,
+        cacheBreakpoints: sysBreakpoints + toolBreakpoints,
+        systemCached: sysBreakpoints > 0,
+        toolsCached: toolBreakpoints > 0,
+        effort: outputConfig?.effort ?? null,
+        sentinelLeaked: body.includes(CACHE_BREAK_SENTINEL),
+      },
+      '[claude-wire] outbound request shape',
+    );
+  } catch {
+    // best-effort diagnostics — never affect the request
+  }
+}
+
+/** Scan the SSE response for the message_start usage (which carries Anthropic's
+ *  cache token counts) and log it. Reads a TEE'd copy — never touches the stream
+ *  the SDK consumes. Best-effort, bounded, never throws. */
+export async function logClaudeResponseUsage(stream: ReadableStream<Uint8Array>): Promise<void> {
+  try {
+    const reader = stream.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const marker = buf.indexOf('"type":"message_start"');
+      if (marker >= 0) {
+        const lineStart = buf.lastIndexOf('data:', marker);
+        const lineEnd = buf.indexOf('\n', marker);
+        if (lineStart >= 0 && lineEnd > lineStart) {
+          try {
+            const evt = JSON.parse(buf.slice(lineStart + 5, lineEnd).trim()) as { message?: { usage?: Record<string, unknown> } };
+            const u = evt.message?.usage ?? {};
+            logger.info(
+              {
+                kind: 'claude_wire_usage',
+                inputTokens: u.input_tokens ?? null,
+                cacheCreationInputTokens: u.cache_creation_input_tokens ?? null,
+                cacheReadInputTokens: u.cache_read_input_tokens ?? null,
+                outputTokens: u.output_tokens ?? null,
+              },
+              '[claude-wire] response usage — cache HIT when cacheReadInputTokens > 0',
+            );
+          } catch { /* keep reading until a parseable message_start */ }
+          break;
+        }
+      }
+      if (buf.length > 65_536) buf = buf.slice(-8_192); // bound memory
+    }
+    try { await reader.cancel(); } catch { /* ignore */ }
+  } catch {
+    // best-effort — a diagnostics failure must never affect the turn
+  }
+}
+
+/** Custom fetch enforcing the OAuth billing guarantee + identity envelope, plus
+ *  (parity-on) a bounded undici dispatcher so a stalled edge can't hang a turn. */
 export function makeClaudeFetch(): typeof fetch {
   return (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
     const token = await freshClaudeToken();
     const { headers, body } = applyClaudeEnvelope(init, token);
-    return fetch(input, { ...init, headers, body });
+    const dispatcher = modelParityEnabled() ? getClaudeDispatcher() : undefined;
+    const debug = claudeWireDebugEnabled();
+    if (debug) logClaudeRequestShape(body);
+    const res = await fetch(input, {
+      ...init,
+      headers,
+      body,
+      ...(dispatcher ? { dispatcher } : {}),
+    } as RequestInit & { dispatcher?: unknown });
+    // Diagnostics only: tee the body so we can read usage without disturbing the
+    // stream the SDK consumes. Entirely skipped when the debug flag is off.
+    if (debug && res.ok && res.body) {
+      try {
+        const [forSdk, forLog] = res.body.tee();
+        void logClaudeResponseUsage(forLog);
+        return new Response(forSdk, { status: res.status, statusText: res.statusText, headers: res.headers });
+      } catch {
+        return res; // tee failed before locking → return the original untouched
+      }
+    }
+    return res;
   }) as typeof fetch;
+}
+
+/** Drop the cached subscription token so the next request re-reads (and
+ *  refreshes) it — the 401 refresh-and-retry hook for the resilience wrapper. */
+export function invalidateClaudeToken(): void {
+  cachedToken = null;
+}
+
+async function refreshClaudeAuth(): Promise<void> {
+  invalidateClaudeToken();
+  try {
+    await loadFreshClaudeAccessToken();
+  } catch {
+    // best-effort — a refresh failure surfaces on the retried request itself
+  }
 }
 
 // One provider instance for the process; the custom fetch resolves a fresh
@@ -124,7 +362,17 @@ const modelCache = new Map<string, Model>();
 export function getClaudeModel(modelId: string): Model {
   const cached = modelCache.get(modelId);
   if (cached) return cached;
-  const model = aisdk(getProvider()(modelId));
+  let model: Model = aisdk(getProvider()(modelId));
+  // Parity layer: provider-agnostic resilience (retry/empty/401) + reasoning
+  // translation (effort -> output_config.effort). Wrap BEFORE caching so the
+  // cache hands back the resilient model, not the bare passthrough.
+  if (modelParityEnabled()) {
+    model = withResilience(model, {
+      label: 'claude',
+      capability: resolveModelCapability(modelId),
+      refreshAuth: refreshClaudeAuth,
+    });
+  }
   modelCache.set(modelId, model);
   return model;
 }

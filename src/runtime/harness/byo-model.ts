@@ -32,6 +32,8 @@ import type { Model } from '@openai/agents-core';
 import type { ByoBackendConfig } from '../../config.js';
 import { getRuntimeEnv } from '../../config.js';
 import { repairToParseableJson, isParseableJson } from './json-repair.js';
+import { withResilience } from './resilient-model.js';
+import { resolveModelCapability, modelParityEnabled, restoreLegacyInstructionOrder } from './model-wire-registry.js';
 import pino from 'pino';
 
 const logger = pino({ name: 'clementine.byo-model' });
@@ -55,6 +57,16 @@ export function relaxRequestForCompatBackend(body: unknown): unknown {
 
   for (const field of OPENAI_ONLY_FIELDS) {
     if (field in next) delete next[field];
+  }
+
+  // Restore legacy (dynamic-first) order in system message(s) — a BYO backend
+  // never caches via breakpoints, so its wire stays BYTE-IDENTICAL to pre-parity.
+  if (Array.isArray(next.messages)) {
+    next.messages = (next.messages as Array<Record<string, unknown>>).map((m) =>
+      m?.role === 'system' && typeof m.content === 'string'
+        ? { ...m, content: restoreLegacyInstructionOrder(m.content) }
+        : m,
+    );
   }
 
   // Some compatible backends reject `strict` on function tool definitions
@@ -300,7 +312,15 @@ function clientKey(byo: ByoBackendConfig): string {
 }
 
 function makeWrappedClient(byo: ByoBackendConfig): OpenAI {
-  const client = new OpenAI({ baseURL: byo.baseURL, apiKey: byo.apiKey });
+  // When the parity resilience wrapper owns retry/backoff, disable the OpenAI
+  // client's own 2 retries so they don't STACK (otherwise a persistently-down
+  // backend makes ~(1+3)×(1+2) attempts with two backoff schedules). Parity off
+  // keeps the SDK default (2) — byte-identical legacy behavior.
+  const client = new OpenAI({
+    baseURL: byo.baseURL,
+    apiKey: byo.apiKey,
+    ...(modelParityEnabled() ? { maxRetries: 0 } : {}),
+  });
   const completions = client.chat.completions;
   const original = completions.create.bind(completions) as unknown as CreateFn;
   // Shadow the prototype method on this instance: relax the request + repair
@@ -323,7 +343,14 @@ export function getByoModel(modelId: string, byo: ByoBackendConfig): Model {
     logger.info({ baseURL: byo.baseURL, provider: byo.providerLabel || 'custom' }, 'BYO model backend initialized');
   }
 
-  const model = new OpenAIChatCompletionsModel(client as unknown as ConstructorParameters<typeof OpenAIChatCompletionsModel>[0], modelId);
+  let model: Model = new OpenAIChatCompletionsModel(client as unknown as ConstructorParameters<typeof OpenAIChatCompletionsModel>[0], modelId);
+  // Parity layer: the same provider-agnostic resilience the Claude path gets —
+  // transparent retry on transient 429/5xx/transport blips + empty-completion
+  // invariant. (BYO already lifts reasoning + repairs JSON at the client layer;
+  // the wrapper adds only the model-boundary resilience.)
+  if (modelParityEnabled()) {
+    model = withResilience(model, { label: 'byo', capability: resolveModelCapability(modelId) });
+  }
   modelCache.set(mkey, model);
   return model;
 }
