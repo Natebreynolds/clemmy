@@ -35,10 +35,45 @@ function positiveIntEnv(key: string, fallback: number): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
-const MCP_LIST_TOOLS_TIMEOUT_MS = positiveIntEnv('MCP_LIST_TOOLS_TIMEOUT_MS', 20_000);
-const MCP_CONNECT_TIMEOUT_MS = positiveIntEnv('MCP_CONNECT_TIMEOUT_MS', 30_000);
+// Read per call (not load-time consts) so they can be tuned at runtime and in tests.
+function mcpListToolsTimeoutMs(): number { return positiveIntEnv('MCP_LIST_TOOLS_TIMEOUT_MS', 20_000); }
+function mcpConnectTimeoutMs(): number { return positiveIntEnv('MCP_CONNECT_TIMEOUT_MS', 30_000); }
 const MCP_EAGER_CONNECT_BLOCKING =
   /^(1|true|on|yes)$/i.test(process.env.MCP_EAGER_CONNECT_BLOCKING ?? '');
+
+// Skip-unconnected attach (default ON). The Agents SDK (and the Codex tool-defs
+// build) await listTools() BEFORE the first model request, and buildFlattenedTools
+// historically `await ensureConnected(server)` INLINE per server — so a single
+// server still mid-connect (or whose cold handshake is starved by the daemon's
+// synchronous better-sqlite3 work) blocks the ENTIRE turn pre-content until the
+// 30s connect timeout, and the model-stream watchdog then fires (sess-mqg8wdw1:
+// dataforseo "connecting" stalled a Salesforce-CLI turn that never needed it).
+// With this ON, a turn attaches ONLY already-connected servers; not-yet-connected
+// ones are warmed in the BACKGROUND for the next turn and surfaced as the existing
+// `<slug>__unavailable` stub so the model still sees them. Pair with startup
+// pre-warm (mcp-servers.prewarmMcpServers) so servers are connected before any turn.
+// Kill-switch: MCP_ATTACH_CONNECTED_ONLY=off restores the legacy inline-blocking path.
+// Read per call (not a load-time const) so it can be toggled in tests and at runtime.
+function attachConnectedOnly(): boolean {
+  return !/^(0|false|off|no)$/i.test(process.env.MCP_ATTACH_CONNECTED_ONLY ?? 'on');
+}
+// Per-turn budget for a not-yet-connected server's handshake before we stop
+// waiting and surface a stub (the connect keeps warming in the background). Short
+// enough that a cold/starved server can't stall the turn, long enough that a
+// fast/idle server attaches its real tools on the same turn. Default 2.5s.
+function attachConnectBudgetMs(): number {
+  return positiveIntEnv('MCP_ATTACH_CONNECT_BUDGET_MS', 2_500);
+}
+
+/** Sentinel: a not-yet-connected server whose handshake didn't finish within the
+ *  attach budget (or is in backoff). NOT a failure — surfaced as a stub and
+ *  retried next turn, so a slow server is never marked degraded. */
+class ServerWarmingError extends Error {
+  constructor() {
+    super('mcp server still warming');
+    this.name = 'ServerWarmingError';
+  }
+}
 
 type MCPTool = Awaited<ReturnType<MCPServer['listTools']>>[number];
 type CallToolResultContent = Awaited<ReturnType<MCPServer['callTool']>>;
@@ -242,7 +277,12 @@ export function parseNamespacedTool(namespaced: string): { serverSlug: string; t
  * Construct a single `MCPServer`-shaped object that fronts all given
  * servers. Pass this to `new Agent({ mcpServers: [shim] })`.
  */
-export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): MCPServer {
+/** The base namespace shim plus a blocking `prewarm()` for startup warming.
+ *  Scoped/fail-open VIEWS (createScopedExternalShim) are plain MCPServer and
+ *  delegate to this base, so warming the base warms every view. */
+export type McpNamespaceShim = MCPServer & { prewarm: () => Promise<boolean> };
+
+export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNamespaceShim {
   const { servers, name = 'clemmy-mcp', cacheToolsList = true } = options;
 
   // Index servers by their slugified name. Detect collisions on slug
@@ -452,7 +492,7 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): MCPSer
     }
     const promise = (async () => {
       try {
-        await withTimeout(server.connect!(), MCP_CONNECT_TIMEOUT_MS, `mcp.connect[${server.name}]`);
+        await withTimeout(server.connect!(), mcpConnectTimeoutMs(), `mcp.connect[${server.name}]`);
         markServerConnected(server);
       } catch (err) {
         // Clear so a future call can retry instead of resolving instantly.
@@ -466,44 +506,97 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): MCPSer
   }
 
   /**
-   * T2.3 — synthetic stub tool for a server that's currently
-   * unavailable. The model sees it, so a request that would have gone
-   * to that server now gets a clear "server down" tool output it can
-   * verbalize to the user, instead of the previous behavior where the
-   * tool simply disappeared from the catalog.
-   *
-   * The stub's name is intentionally invalid as a real tool call —
-   * starts with `<slug>__` so the routing map can match it to the
-   * downed server and emit the BoundaryError.
+   * T2.3 — synthetic stub tool for a server that isn't contributing tools this
+   * turn. The model SEES it (instead of the tool silently vanishing) and gets a
+   * clear status it can verbalize. Two flavors:
+   *   - CONNECTING (no health yet, or failureCount 0): the server is still
+   *     warming up (bounded-connect budget elapsed) — tools arrive shortly. This
+   *     is NOT a failure, so we never mark such a server degraded.
+   *   - UNAVAILABLE (a real connect/list failure): the server is offline.
+   * Either way the stub name is `<slug>__unavailable` so callTool's routing
+   * matches it and emits the BoundaryError (the model never dispatches to it).
    */
-  function buildUnavailableStubTool(server: MCPServer, slug: string, health: ServerHealth): MCPTool {
-    const lastErr = health.lastError?.message ?? 'unknown error';
-    return {
-      name: namespaceToolName(slug, 'unavailable'),
-      description:
-        `[${slug}] UNAVAILABLE — ${server.name} failed to connect ` +
-        `(${health.failureCount} consecutive failures: ${lastErr.slice(0, 160)}). ` +
+  function buildUnavailableStubTool(server: MCPServer, slug: string, health?: ServerHealth): MCPTool {
+    const warming = !health || health.failureCount === 0;
+    const description = warming
+      ? `[${slug}] CONNECTING — ${server.name} is still establishing its connection; its tools ` +
+        `will be available within a turn or two. If you need it right now, tell the user it's warming up.`
+      : `[${slug}] UNAVAILABLE — ${server.name} failed to connect ` +
+        `(${health!.failureCount} consecutive failures: ${(health!.lastError?.message ?? 'unknown error').slice(0, 160)}). ` +
         `Tools from this server are temporarily unavailable. ` +
         `If you need a capability from this server, tell the user the data source is offline ` +
-        `and propose an alternative or ask them to reconnect via Settings → MCP Servers.`,
+        `and propose an alternative or ask them to reconnect via Settings → MCP Servers.`;
+    return {
+      name: namespaceToolName(slug, 'unavailable'),
+      description,
       inputSchema: { type: 'object', properties: {}, additionalProperties: false },
     } as unknown as MCPTool;
   }
 
-  /** Flatten + rename every underlying server's tools. */
-  async function buildFlattenedTools(): Promise<{ tools: MCPTool[]; routing: Map<string, MCPServer> }> {
+  /** Flatten + rename every underlying server's tools.
+   *  `allConnected` is false when ANY server was skipped (pending) or failed —
+   *  the caller (listTools) uses it to AVOID caching a partial surface, so a
+   *  background-warmed server is picked up on the next turn's rebuild (no stale
+   *  cache, no explicit invalidation needed). */
+  async function buildFlattenedTools(): Promise<{ tools: MCPTool[]; routing: Map<string, MCPServer>; allConnected: boolean }> {
     const tools: MCPTool[] = [];
     const routing = new Map<string, MCPServer>(); // namespaced name -> underlying server
+    const skipUnconnected = attachConnectedOnly();
 
     // Connect + list per server in parallel. If one fails, log and continue.
     const results = await Promise.allSettled(
       servers.map(async (server) => {
         const slug = serverSlugs.get(server)!;
+        const isConnected = serverHealth.get(server)?.state === 'connected';
+        // Bounded-connect (skip-unconnected, default ON): a server that is NOT
+        // already connected gets only a SHORT budget to finish its handshake on
+        // this turn. A fast/idle server connects within the budget and attaches
+        // its real tools immediately (preserves the listTools-connects contract);
+        // a COLD or event-loop-STARVED handshake (the sess-mqg8wdw1 stall) does
+        // NOT block the turn — the connect continues in the BACKGROUND (ready
+        // next turn) and we emit the unavailable stub now. Legacy (flag off) and
+        // already-connected servers use the full connect path unchanged.
+        const bounded = skipUnconnected && !isConnected;
+
+        // Phase 1 — connect. ensureConnected records its OWN failure (markServer
+        // failed + frees connectPromise for retry), so a connect error here is
+        // ALREADY accounted for; we just surface a stub (no double-mark). A
+        // bounded attempt that doesn't finish within the budget is "still
+        // warming" — NOT a failure — so we leave health untouched and retry next
+        // turn (the connect keeps running in the background, deduped by the
+        // connectPromise so we don't respawn the child).
+        if (bounded && isServerInBackoffWindow(server)) {
+          // Recently failed — don't spend the budget; stub and let backoff pace.
+          return { server, slug, list: [] as MCPTool[], status: 'pending' as const };
+        }
         try {
-          await ensureConnected(server);
+          const connectAttempt = ensureConnected(server);
+          if (bounded) {
+            connectAttempt.catch(() => { /* keeps warming; ensureConnected records any failure */ });
+            let budgetTimer: ReturnType<typeof setTimeout> | undefined;
+            const budget = new Promise<never>((_, reject) => {
+              budgetTimer = setTimeout(() => reject(new ServerWarmingError()), attachConnectBudgetMs());
+            });
+            try {
+              await Promise.race([connectAttempt, budget]);
+            } finally {
+              if (budgetTimer) clearTimeout(budgetTimer);
+            }
+          } else {
+            await connectAttempt;
+          }
+        } catch (err) {
+          // Budget elapsed → still warming (pending). A real connect failure was
+          // already marked by ensureConnected → surface a stub WITHOUT re-marking.
+          return { server, slug, list: [] as MCPTool[], status: err instanceof ServerWarmingError ? 'pending' as const : 'failed' as const };
+        }
+
+        // Phase 2 — connected; list its tools. A listTools failure is FIRST seen
+        // here (connect succeeded), so this is the right place to mark it failed.
+        try {
           const list = await withTimeout(
             server.listTools(),
-            MCP_LIST_TOOLS_TIMEOUT_MS,
+            mcpListToolsTimeoutMs(),
             `mcp.listTools[${server.name}]`,
           );
           markServerConnected(server);
@@ -516,19 +609,20 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): MCPSer
       }),
     );
 
+    let allConnected = true;
     for (const result of results) {
-      if (result.status !== 'fulfilled') continue;
+      if (result.status !== 'fulfilled') { allConnected = false; continue; }
       const { server, slug, list, status } = result.value;
-      if (status === 'failed') {
-        // T2.3 — emit the unavailable stub instead of silently dropping
-        // the server's tools. The model can read its description and
-        // SEE that this server is offline.
-        const health = serverHealth.get(server);
-        if (health) {
-          const stub = buildUnavailableStubTool(server, slug, health);
-          tools.push(stub);
-          routing.set(stub.name, server);
-        }
+      if (status === 'failed' || status === 'pending') {
+        // Partial surface — don't let listTools cache it (so a warmed server
+        // surfaces next turn). T2.3 — emit the stub (connecting OR unavailable,
+        // per health) instead of silently dropping the server; the model SEES
+        // it. A still-warming server may have NO health entry yet — the stub
+        // builder renders a "connecting" flavor for that, so it's never dropped.
+        allConnected = false;
+        const stub = buildUnavailableStubTool(server, slug, serverHealth.get(server));
+        tools.push(stub);
+        routing.set(stub.name, server);
         continue;
       }
       for (const tool of list) {
@@ -552,16 +646,29 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): MCPSer
       }
     }
 
-    return { tools, routing };
+    return { tools, routing, allConnected };
   }
 
-  const shim: MCPServer = {
+  const shim: McpNamespaceShim = {
     cacheToolsList,
     // `toolFilter` is intentionally unset — filtering is the right
     // place for `isEnabled`-style per-turn pruning, but that's Move 3.
     toolFilter: undefined,
     get name() {
       return name;
+    },
+
+    // Blocking warm for daemon startup (mcp-servers.prewarmMcpServers): unlike
+    // connect() (non-blocking by default), this AWAITS every server's connect so
+    // the caller can run it during the idle boot window and retry. Connections
+    // persist in connectPromises for the daemon lifetime, so every later turn —
+    // including the cheap scoped/fail-open VIEWS that delegate to this base —
+    // short-circuits without a per-turn handshake.
+    async prewarm() {
+      const results = await Promise.allSettled(servers.map((server) => ensureConnected(server)));
+      // true when every server connected — lets the startup retry loop stop
+      // early; a still-failing (cold/degraded) server keeps it retrying.
+      return results.every((r) => r.status === 'fulfilled');
     },
 
     async connect() {
@@ -607,8 +714,17 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): MCPSer
       if (cacheToolsList && cachedTools && cachedToolToServer) {
         return cachedTools;
       }
-      const { tools, routing } = await buildFlattenedTools();
-      if (cacheToolsList) {
+      const { tools, routing, allConnected } = await buildFlattenedTools();
+      // Cache the flattened surface ONLY when stable. In skip-unconnected mode
+      // a partial surface (some servers still warming) must NOT be cached, or a
+      // background-warmed server would stay hidden behind the stub until an
+      // unrelated invalidate — so rebuild next turn and pick it up then. The
+      // rebuild is cheap (connected servers list fast; pending ones return
+      // immediately). Legacy mode (flag off) caches exactly as before.
+      // shouldCache: legacy (attachConnectedOnly=off) caches whenever cacheToolsList;
+      // new mode additionally requires allConnected (no partial surface cached).
+      const shouldCache = cacheToolsList && (!attachConnectedOnly() || allConnected);
+      if (shouldCache) {
         cachedTools = tools;
         cachedToolToServer = routing;
       } else {

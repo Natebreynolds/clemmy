@@ -73,6 +73,31 @@ test('steady events keep the turn alive even when each gap is near the threshold
   assert.deepEqual(out.finalOutput, { ok: true });
 });
 
+test('a PRE-CONTENT stall is retried and self-heals when the retry streams (Claude tool-turn hang)', async () => {
+  // sess-mqg45an3: the first model call produced ZERO events for the window
+  // (a silent/wedged Claude stream). With pre-content retry, the SECOND call
+  // streams normally and the turn recovers instead of hard-failing the user.
+  const first = makeStreamResult({ events: 0, hang: true }); // wedges pre-content
+  const second = makeStreamResult({ events: 2, gapMs: 30 }); // healthy retry
+  let call = 0;
+  const flakyRunner = { run: async () => (call++ === 0 ? first : second) } as unknown as Runner;
+  const started = Date.now();
+  const out = await __defaultRunRunner(flakyRunner, {} as never, [], {} as never);
+  assert.deepEqual(out.finalOutput, { ok: true }, 'recovered via the retry');
+  assert.equal(call, 2, 'made exactly one retry');
+  assert.ok(Date.now() - started < 5_000, 'recovered promptly');
+});
+
+test('a pre-content stall that NEVER recovers still fails after exhausting retries', async () => {
+  // Both attempts wedge → after the one retry, surface the transient stall.
+  const wedged = () => makeStreamResult({ events: 0, hang: true });
+  const wedgedRunner = { run: async () => wedged() } as unknown as Runner;
+  await assert.rejects(
+    __defaultRunRunner(wedgedRunner, {} as never, [], {} as never),
+    (err: unknown) => err instanceof Error && /stalled/.test(err.message) && isTransientStepError(err),
+  );
+});
+
 test('kill-switch: CLEMMY_MODEL_STREAM_STALL_MS=0 disables the watchdog', async () => {
   process.env.CLEMMY_MODEL_STREAM_STALL_MS = '0';
   try {

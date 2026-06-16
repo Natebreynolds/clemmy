@@ -2356,6 +2356,42 @@ function modelStreamStallMs(): number {
   return raw <= 0 ? 0 : raw;
 }
 
+/** Pre-content (first-byte) stall window. A model call that produces ZERO
+ *  stream events for this long has not started — distinct from a long, ACTIVE
+ *  tool turn (which keeps resetting the timer and is governed by the longer
+ *  modelStreamStallMs ceiling). Shorter so a wedged/silent stream (the Claude
+ *  tool-turn hang, sess-mqg45an3) fails fast and RETRIES instead of pinning the
+ *  user for the full 5 min. 0 falls back to the stream-stall ceiling. */
+function modelFirstByteStallMs(): number {
+  const ceiling = modelStreamStallMs();
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_MODEL_FIRST_BYTE_STALL_MS', '75000') ?? '75000', 10);
+  if (!Number.isFinite(raw) || raw <= 0) return ceiling;
+  // Never exceed the stream-stall ceiling (so a tiny configured ceiling — e.g.
+  // in tests — keeps the pre-content window tiny too).
+  return ceiling > 0 ? Math.min(raw, ceiling) : raw;
+}
+
+/** How many times to retry a model call that stalled BEFORE producing any
+ *  content (pre-content stall only — safe because zero events means zero tool
+ *  side effects, so the run can be replayed cleanly). Default 1. 0 disables. */
+function modelStreamStallRetries(): number {
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_MODEL_STREAM_STALL_RETRIES', '1') ?? '1', 10);
+  if (!Number.isFinite(raw) || raw < 0) return 1;
+  return raw;
+}
+
+/** Typed marker for a stalled model stream so the runner can distinguish a
+ *  retryable pre-content stall from a real failure. */
+class ModelStreamStalledError extends Error {
+  constructor(public readonly seconds: number, public readonly preContent: boolean) {
+    super(
+      `model stream stalled — no stream events for ${seconds}s; the model call timed out ` +
+        `(CLEMMY_MODEL_STREAM_STALL_MS / CLEMMY_MODEL_FIRST_BYTE_STALL_MS to tune)`,
+    );
+    this.name = 'ModelStreamStalledError';
+  }
+}
+
 /** Store read must never break a turn. */
 function safeActiveGoal(sessionId: string): PlanProposal | null {
   if (!goalContractEnabled()) return null;
@@ -4805,32 +4841,37 @@ const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
   // failure surfaces at `result.completed` / the finalOutput read INSIDE the
   // recovery try/catch below. A non-streamed run would reject `run()` itself,
   // bypassing the recovery path — so do not make `stream` conditional.
-  const result = await run(agent, items, { ...opts, stream: true });
-
-  // When a consumer wants token deltas, iterate the StreamedRunResult and
-  // forward each output_text_delta. Without onChunk, skip iteration and just
-  // await `completed` exactly like the original code (the SDK drains the
-  // stream internally). The asyncIterator guard keeps test mocks (plain
-  // objects with only a `completed` promise) working.
+  // Stream-inactivity watchdog (turn-stall fix, 2026-06-11; pre-content
+  // retry, 2026-06-15): two live incidents wedged a turn forever with ZERO
+  // events because nothing bounds a silent model stream. Drain the stream with
+  // a stall timer that resets on EVERY stream event (tool activity keeps long
+  // turns alive). The window is TWO-tiered: until the model produces content,
+  // a SHORTER pre-content window applies (modelFirstByteStallMs) and a stall
+  // there is RETRYABLE — a wedged/silent stream (the Claude tool-turn hang,
+  // sess-mqg45an3) re-runs cleanly because zero events means zero tool side
+  // effects, so the user self-heals in seconds instead of hanging 5 min. Once
+  // content has flowed, the longer modelStreamStallMs ceiling governs and a
+  // stall is a hard failure (no replay — content was already emitted).
+  const streamMs = modelStreamStallMs();
+  const firstByteMs = modelFirstByteStallMs();
+  const maxStallRetries = modelStreamStallRetries();
+  // result is reassigned per attempt; the post-drain code reads the winner.
+  let result!: Awaited<ReturnType<typeof run>>;
   let structuredOutputFailed = false;
-  try {
-    // Stream-inactivity watchdog (turn-stall fix, 2026-06-11): two live
-    // incidents wedged a turn forever with ZERO events — once pre-first-byte
-    // on the model call, once after a hung tool — because nothing bounds a
-    // silent model stream. Drain the stream with a stall timer that resets on
-    // EVERY stream event (tool activity keeps long turns alive); if the
-    // stream goes silent past the threshold, abort the turn with a
-    // timeout-flavored error (workflow steps auto-retry it as transient;
-    // chat surfaces an honest run_failed instead of hanging the user).
-    const stallMs = modelStreamStallMs();
+  for (let attempt = 0; ; attempt += 1) {
+    result = await run(agent, items, { ...opts, stream: true });
     const iterable = Symbol.asyncIterator in (result as unknown as Record<symbol, unknown>);
     let lastEventAt = Date.now();
+    let yieldedContent = false;
     const drain = (async () => {
       if (iterable) {
         for await (const event of result as unknown as AsyncIterable<unknown>) {
           lastEventAt = Date.now();
-          // raw_model_stream_event with output_text_delta
           const ev = event as { type?: string; data?: { type?: string; delta?: string } };
+          // Content or tool activity flips us past the pre-content window.
+          if (ev.type === 'run_item_stream_event' || (ev.type === 'raw_model_stream_event' && ev.data?.type === 'output_text_delta')) {
+            yieldedContent = true;
+          }
           if (onChunk && ev.type === 'raw_model_stream_event' && ev.data?.type === 'output_text_delta' && typeof ev.data.delta === 'string') {
             try {
               await onChunk(ev.data.delta);
@@ -4844,17 +4885,16 @@ const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
     })();
     let stallTimer: ReturnType<typeof setInterval> | undefined;
     const watchdog = new Promise<never>((_, reject) => {
-      if (!iterable || stallMs <= 0) return; // mocks / kill-switch: no watchdog
-      const tickMs = Math.min(15_000, Math.max(250, Math.floor(stallMs / 4)));
+      if (!iterable || streamMs <= 0) return; // mocks / kill-switch: no watchdog
+      const tickMs = Math.min(15_000, Math.max(250, Math.floor(Math.min(firstByteMs, streamMs) / 4)));
       stallTimer = setInterval(() => {
-        if (Date.now() - lastEventAt > stallMs) {
+        const win = yieldedContent ? streamMs : firstByteMs;
+        if (Date.now() - lastEventAt > win) {
           if (stallTimer) clearInterval(stallTimer);
           // Best-effort: release the underlying stream so the dangling
           // request doesn't pin sockets after we abandon the turn.
           try { (result as unknown as { cancel?: () => void }).cancel?.(); } catch { /* best-effort */ }
-          reject(new Error(
-            `model stream stalled — no stream events for ${Math.round(stallMs / 1000)}s; the model call timed out (CLEMMY_MODEL_STREAM_STALL_MS to tune)`,
-          ));
+          reject(new ModelStreamStalledError(Math.round(win / 1000), !yieldedContent));
         }
       }, tickMs);
       // Deliberately NOT unref'd: while a turn is in flight the watchdog IS
@@ -4862,12 +4902,22 @@ const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
       // the stall fires. It self-clears on drain completion or stall.
     });
     void drain.finally(() => { if (stallTimer) clearInterval(stallTimer); }).catch(() => { /* surfaced via race */ });
-    await Promise.race([drain, watchdog]);
-  } catch (err) {
-    if (!isStructuredOutputError(err)) throw err;
-    structuredOutputFailed = true;
-    console.warn('[harness] structured output failed to parse/validate — ending turn with raw text',
-      err instanceof Error ? err.message : err);
+    try {
+      await Promise.race([drain, watchdog]);
+      break; // turn drained successfully
+    } catch (err) {
+      // A pre-content stall is retryable: nothing streamed, so no tool ran and
+      // no partial reply reached the user — re-run cleanly before giving up.
+      if (err instanceof ModelStreamStalledError && err.preContent && attempt < maxStallRetries) {
+        console.warn(`[harness] model stream stalled pre-content after ${err.seconds}s — retrying (attempt ${attempt + 1}/${maxStallRetries})`);
+        continue;
+      }
+      if (!isStructuredOutputError(err)) throw err;
+      structuredOutputFailed = true;
+      console.warn('[harness] structured output failed to parse/validate — ending turn with raw text',
+        err instanceof Error ? err.message : err);
+      break;
+    }
   }
 
   let history: AgentInputItem[] = [];

@@ -1160,6 +1160,28 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
     }, 5_000).unref?.();
   }
 
+  // MCP pre-warm (sess-mqg8wdw1): connect the user's external MCP servers while
+  // the boot loop is IDLE, so a cold connect handshake never races a turn's
+  // synchronous better-sqlite3 work, times out at 30s, and degrades the server
+  // — which (because the SDK awaits listTools() before the first model request)
+  // stalled whole turns pre-content. Fired after the 5s boot-warmup window, off
+  // the hot path (unref'd), retried internally so a single starved attempt
+  // recovers. Connections persist for the daemon lifetime. Disable with
+  // CLEMMY_MCP_PREWARM=off (falls back to lazy connect-on-first-use).
+  if ((getRuntimeEnv('CLEMMY_MCP_PREWARM', 'on') ?? 'on').toLowerCase() !== 'off') {
+    setTimeout(() => {
+      void (async () => {
+        try {
+          const { prewarmMcpServers } = await import('../runtime/mcp-servers.js');
+          const { attempts, allConnected } = await prewarmMcpServers();
+          logger.info({ attempts, allConnected }, 'MCP pre-warm complete');
+        } catch (err) {
+          logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'MCP pre-warm failed (servers connect on first use)');
+        }
+      })();
+    }, 8_000).unref?.();
+  }
+
   // Workflow-run lane: drain queued runs on an independent timer so one
   // long/parked run can't starve the main loop (cron, schedules,
   // autonomy, watchdog) — the exact failure that left audit runs queued
