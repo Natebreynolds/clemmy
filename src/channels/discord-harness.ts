@@ -31,6 +31,7 @@ import {
   type SessionRow,
 } from '../runtime/harness/eventlog.js';
 import { runConversation, runConversationFromResume } from '../runtime/harness/loop.js';
+import { enqueueDurableChatTask, renderDurableTaskQueued, shouldPromoteToDurable } from '../execution/background-promote.js';
 import { HarnessSession } from '../runtime/harness/session.js';
 import { openEventLog } from '../runtime/harness/eventlog.js';
 import {
@@ -1530,6 +1531,13 @@ export async function runDiscordHarnessConversation(opts: {
   userId: string;
   guildId: string | null;
   transport: DiscordHarnessTransport;
+  /**
+   * The user's RAW typed text, before attachment folding. Used only for the
+   * durable-promotion intent decision so dropped-file contents can't trip it
+   * (desktop↔Discord parity: desktop decides on raw `input` too). Falls back to
+   * `prompt` when a caller doesn't fold attachments.
+   */
+  rawPrompt?: string;
 }): Promise<void> {
   const { channelId, userId, guildId, transport } = opts;
   // `prompt` is `let` (not destructured const) because the /continue
@@ -1538,6 +1546,9 @@ export async function runDiscordHarnessConversation(opts: {
   // act on. The rest of the function treats it as the user's input
   // verbatim.
   let prompt = opts.prompt;
+  // Raw, pre-fold user text for the durable-intent decision only (parity with
+  // the desktop dock, which decides on raw `input`).
+  const rawPromptForIntent = opts.rawPrompt ?? opts.prompt;
 
   const auth = await configureHarnessRuntime();
   if (!auth.ok) {
@@ -1952,6 +1963,37 @@ export async function runDiscordHarnessConversation(opts: {
         });
         if (continuity.handled) return;
       }
+      // Durable background promotion (gap C1) — desktop↔Discord parity. An
+      // explicit "run this to completion / overnight / keep working" hands the
+      // turn to the daemon's durable lane (board-visible, restart-recoverable,
+      // reports back into THIS channel's session) instead of an ephemeral
+      // in-process run. Plain asks fall through to the normal foreground run.
+      // Decide on the RAW text (not folded attachments); enqueue the FULL
+      // `prompt`. Skip when the session is paused on an approval so a stray
+      // durable phrase can't orphan an in-flight gated workflow.
+      if (!goalRunInput && !isChannelSessionAwaitingApproval(channelId) && shouldPromoteToDurable(rawPromptForIntent)) {
+        const task = enqueueDurableChatTask({
+          message: prompt,
+          sessionId: session.id,
+          channel: `discord:${channelId}`,
+          source: 'discord',
+        });
+        const queuedReply = renderDurableTaskQueued(task);
+        appendHarnessEvent({
+          sessionId: session.id,
+          turn: 0,
+          role: 'Clem',
+          type: 'conversation_completed',
+          data: {
+            reason: 'queued_background',
+            summary: queuedReply,
+            reply: queuedReply,
+            steps: 0,
+            queuedTaskId: task.id,
+          },
+        });
+        return;
+      }
       if (planFirst && !goalRunInput) {
         const preflight = await runPlanFirstPreflight({
           input: prompt,
@@ -2340,6 +2382,7 @@ export async function handleDiscordHarnessMessage(
 
   await runDiscordHarnessConversation({
     prompt: effectivePrompt,
+    rawPrompt: prompt,
     channelId: message.channelId,
     userId: message.author.id,
     guildId: message.guildId ?? null,

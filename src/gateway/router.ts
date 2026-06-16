@@ -3,16 +3,14 @@ import type { ClementineAssistant } from '../assistant/core.js';
 import { ExecutionStore, renderExecutionSummary } from '../execution/store.js';
 import {
   cancelBackgroundTask,
-  createBackgroundTask,
   getBackgroundTask,
   listBackgroundTasks,
   renderBackgroundTask,
   renderBackgroundTaskList,
   resumeBackgroundTask,
 } from '../execution/background-tasks.js';
-import { MODELS } from '../config.js';
+import { enqueueDurableChatTask, shouldPromoteToDurable } from '../execution/background-promote.js';
 import { addRunEvent, finishRun, getRun, listRuns, startRun, type RunRecord } from '../runtime/run-events.js';
-import { loadProactivityPolicy } from '../agents/proactivity-policy.js';
 import { applyProposedFix, dismissProposedFix, listProposedFixes, loadProposedFix, revertWorkflowFix } from '../execution/workflow-diagnosis.js';
 import { requeueWorkflowFromRun } from '../tools/workflow-run-queue.js';
 import { verifyDelivered } from '../runtime/harness/verify-delivered.js';
@@ -130,23 +128,6 @@ function parseCommand(message: string): GatewayCommand | null {
   }
 
   return null;
-}
-
-function hasDurableExecutionIntent(message: string): boolean {
-  const lower = message.toLowerCase();
-  if (/^\/?(background|bg)\b/.test(lower)) return true;
-  if (/\b(run|queue|start).{0,40}\b(background|overnight|as a job)\b/.test(lower)) return true;
-  if (/\b(keep working|don't stop|do not stop|long-running|longer running|overnight|take your time)\b/.test(lower)) return true;
-  if (/\b(from start to finish|end to end|get it done|finish this|finish it all)\b/.test(lower)) {
-    return /\b(build|implement|migrate|refactor|wire|ship|deploy|fix|create|set up|setup|finish)\b/.test(lower);
-  }
-  return false;
-}
-
-function stripBackgroundPrefix(message: string): string {
-  return message.trim()
-    .replace(/^\/?(background|bg)\s*[:\-]?\s*/i, '')
-    .trim();
 }
 
 function renderExecutionList(sessionId: string): string {
@@ -444,21 +425,18 @@ export class ClementineGateway {
       return { ...response, runId: run.id };
     }
 
-    if (hasDurableExecutionIntent(request.message)) {
-      const prompt = stripBackgroundPrefix(request.message) || request.message;
+    if (shouldPromoteToDurable(request.message)) {
       addRunEvent(run.id, {
         type: 'queued_background',
         status: 'queued',
         message: 'Request promoted to a durable background task.',
       });
-      const task = createBackgroundTask({
-        title: deriveTitle(prompt),
-        prompt,
-        originSessionId: request.sessionId,
+      const task = enqueueDurableChatTask({
+        message: request.message,
+        sessionId: request.sessionId,
         userId: request.userId,
         channel: request.channel,
-        model: request.model ?? MODELS.deep,
-        maxMinutes: loadProactivityPolicy().defaultLongTaskMinutes,
+        model: request.model,
         source: request.source ?? 'gateway',
       });
       logger.info({ taskId: task.id, sessionId: request.sessionId, channel: request.channel }, 'Gateway queued background task');

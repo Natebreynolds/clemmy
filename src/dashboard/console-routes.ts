@@ -159,6 +159,7 @@ import {
 } from '../agents/plan-scope.js';
 import type { CheckInUrgency } from '../agents/check-ins.js';
 import { cancelBackgroundTask, createBackgroundTask, getBackgroundTask, listBackgroundTasks, processBackgroundTasks, resumeBackgroundTask } from '../execution/background-tasks.js';
+import { enqueueDurableChatTask, renderDurableTaskQueued, shouldPromoteToDurable } from '../execution/background-promote.js';
 import { getBackgroundTaskStatus } from '../execution/background-task-status.js';
 import { finishRun, getRun, listRuns } from '../runtime/run-events.js';
 import { addNotification, isNeedsAttentionNotification, listNotifications, markNotificationGroupRead, markStaleApprovalNotificationsRead } from '../runtime/notifications.js';
@@ -6818,6 +6819,39 @@ export function registerConsoleRoutes(
             },
           });
           if (continuity.handled) return;
+        }
+        // Durable background promotion (gap C1): when the user EXPLICITLY asks
+        // to run this to completion ("…overnight", "keep working", "/background
+        // …"), hand it to the daemon's durable lane instead of an ephemeral
+        // in-process run. The task then survives a window close / daemon
+        // restart, surfaces on the Tasks board, and reports back into THIS
+        // session on completion (originSessionId). Plain asks fall through to
+        // the normal foreground run below. The intent decision runs on the RAW
+        // `input` (not attachment-folded `turnInput`) so dropped-file contents
+        // can't trip it; the FULL `turnInput` is what the worker receives.
+        // Skips approval-resume, a session paused on approval, and /goal runs.
+        if (!intent && !isPausedOnApproval && !goalRunInput && shouldPromoteToDurable(input)) {
+          const task = enqueueDurableChatTask({
+            message: turnInput,
+            sessionId,
+            channel: 'desktop',
+            source: 'desktop',
+          });
+          const queuedReply = renderDurableTaskQueued(task);
+          appendHarnessEvent({
+            sessionId,
+            turn: 0,
+            role: 'Clem',
+            type: 'conversation_completed',
+            data: {
+              reason: 'queued_background',
+              summary: queuedReply,
+              reply: queuedReply,
+              steps: 0,
+              queuedTaskId: task.id,
+            },
+          });
+          return;
         }
         // Stream CLEAN text, not raw structured-output JSON: extract the
         // reply (chat decisions) / objective+actions (streamed plans) as
