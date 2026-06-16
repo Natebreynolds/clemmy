@@ -26,7 +26,7 @@ const { rememberFact, updateFact, findSimilarFacts, findSimilarFactsScored, getF
 // eslint-disable-next-line import/first
 const { embedMissingFacts, loadFactEmbeddings, isEmbeddingsEnabled } = await import('./embeddings.js');
 // eslint-disable-next-line import/first
-const { consolidateActiveFacts, consolidateFact } = await import('./reflection.js');
+const { consolidateActiveFacts, consolidateFact, triggerEmbedAtWrite, _resetEmbedAtWriteForTest } = await import('./reflection.js');
 
 /**
  * Deterministic 4-dim "topic" embedding. Semantically-related text maps
@@ -281,6 +281,89 @@ test('ground-truth-wins does NOT fire for a user restatement (no sourceApp) — 
   assert.equal(after?.active, true, 'the derived fact is not deleted');
   assert.match(after?.content ?? '', /midweek/, 'derived content is preserved (not clobbered in place)');
   assert.ok(after?.sourceApp == null, 'no spurious sourceApp written onto the derived fact');
+});
+
+// ─────────────────────────────────────────────────────────────────
+// M1 — embed-at-write: a just-written fact gets its vector promptly
+// (newest-first), instead of waiting for the ~2-min nightly backfill, so
+// same-session semantic recall sees what you just told it.
+// ─────────────────────────────────────────────────────────────────
+
+test('embedMissingFacts newestFirst embeds the most-recent facts first', async () => {
+  const oldest = rememberFact({ kind: 'user', content: 'Oldest planning note about the week.' });
+  rememberFact({ kind: 'user', content: 'Middle note about the keychain credential.' });
+  const newest = rememberFact({ kind: 'user', content: 'Newest note about the recurring sync.' });
+
+  // Cap of 1 with newestFirst → only the highest-id (newest) fact is embedded.
+  const stats = await embedMissingFacts({ maxChunks: 1, newestFirst: true });
+  assert.equal(stats.embedded, 1, 'one fact embedded under the cap');
+  assert.equal(loadFactEmbeddings([newest.id]).size, 1, 'newest fact got its vector');
+  assert.equal(loadFactEmbeddings([oldest.id]).size, 0, 'oldest fact NOT embedded yet (lost the cap to newest)');
+
+  // Default (oldest-first) order embeds the oldest of the remaining.
+  const stats2 = await embedMissingFacts({ maxChunks: 1, newestFirst: false });
+  assert.equal(stats2.embedded, 1);
+  assert.equal(loadFactEmbeddings([oldest.id]).size, 1, 'oldest fact embedded on the default-order pass');
+});
+
+test('triggerEmbedAtWrite embeds a just-written fact promptly', async () => {
+  _resetEmbedAtWriteForTest();
+  const f = rememberFact({ kind: 'user', content: 'Nathan prefers oat milk in his coffee.' });
+  assert.equal(loadFactEmbeddings([f.id]).size, 0, 'no vector immediately after write');
+
+  await triggerEmbedAtWrite();
+  assert.equal(loadFactEmbeddings([f.id]).size, 1, 'embed-at-write gave the new fact a vector right away');
+});
+
+test('triggerEmbedAtWrite is a no-op when the kill-switch is off', async () => {
+  _resetEmbedAtWriteForTest();
+  process.env.CLEMMY_EMBED_AT_WRITE = 'off';
+  try {
+    const f = rememberFact({ kind: 'user', content: 'A fact written with embed-at-write disabled.' });
+    await triggerEmbedAtWrite();
+    assert.equal(loadFactEmbeddings([f.id]).size, 0, 'no embedding when CLEMMY_EMBED_AT_WRITE=off');
+  } finally {
+    delete process.env.CLEMMY_EMBED_AT_WRITE;
+  }
+});
+
+test('triggerEmbedAtWrite is a no-op when embeddings are disabled', async () => {
+  _resetEmbedAtWriteForTest();
+  delete process.env.OPENAI_API_KEY;
+  try {
+    const f = rememberFact({ kind: 'user', content: 'A fact written with embeddings disabled.' });
+    await triggerEmbedAtWrite();
+    assert.equal(loadFactEmbeddings([f.id]).size, 0, 'no embedding when embeddings are disabled');
+    assert.equal(fetchCalls, 0, 'no network call');
+  } finally {
+    process.env.OPENAI_API_KEY = 'sk-test-fact-embeddings';
+  }
+});
+
+test('consolidateFact (novelty fast-path) auto-embeds the new fact via embed-at-write', async () => {
+  _resetEmbedAtWriteForTest();
+  // Seed a "meeting"-topic pool + embed it so the candidate's cosine is low.
+  rememberFact({ kind: 'reference', content: 'Standing planning session midweek.' });
+  await embedMissingFacts({ maxChunks: 50 });
+
+  // A clearly-novel ("secret" topic) candidate → novelty fast-path ADD (no resolver).
+  const outcome = await consolidateFact(
+    { kind: 'reference', text: 'The deploy webhook secret is rotated monthly.', trustLevel: 1.0 },
+    {},
+    { noveltyFastPathSim: 0.6 },
+  );
+  assert.equal(outcome.written, 1, 'novel candidate ADDed');
+
+  // consolidateFact fires embed-at-write fire-and-forget (which takes the
+  // running guard). Reset the guard, then await a clean pass so the assertion
+  // is deterministic instead of racing the background trigger. embedMissingFacts
+  // is idempotent, so a concurrent background pass is harmless.
+  _resetEmbedAtWriteForTest();
+  await triggerEmbedAtWrite();
+  const newest = listActiveFacts({ kind: 'reference', limit: 100 })
+    .sort((a, b) => b.id - a.id)[0];
+  assert.match(newest.content, /webhook secret/, 'the new fact is the most recent');
+  assert.equal(loadFactEmbeddings([newest.id]).size, 1, 'the just-consolidated fact has a vector same-session');
 });
 
 test('consolidateFact novelty fast-path ADDs a clearly-novel candidate without the resolver', async () => {

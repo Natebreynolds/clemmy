@@ -424,7 +424,7 @@ export function loadEmbeddingsForChunks(chunkIds: number[]): Map<number, Float32
  * content_hash`. updateFact recomputes the fact's content_hash, so a
  * Mem0 UPDATE naturally re-embeds on the next backfill tick.
  */
-export async function embedMissingFacts(options: { maxChunks?: number } = {}): Promise<EmbedBackfillStats> {
+export async function embedMissingFacts(options: { maxChunks?: number; newestFirst?: boolean } = {}): Promise<EmbedBackfillStats> {
   const start = Date.now();
   const stats: EmbedBackfillStats = {
     enabled: isEmbeddingsEnabled(),
@@ -448,6 +448,10 @@ export async function embedMissingFacts(options: { maxChunks?: number } = {}): P
 
   const db = openMemoryDb();
   const limit = Math.max(1, options.maxChunks ?? 200);
+  // newestFirst (M1 embed-at-write): prioritize the just-written facts (highest
+  // id) so same-session semantic recall sees them within ~1s, instead of the
+  // oldest-first order the nightly backfill uses for eventual full coverage.
+  const order = options.newestFirst ? 'DESC' : 'ASC';
 
   const rows = db.prepare(`
     SELECT cf.id AS id, cf.content AS content, cf.content_hash AS hash
@@ -455,7 +459,7 @@ export async function embedMissingFacts(options: { maxChunks?: number } = {}): P
     LEFT JOIN fact_embeddings fe ON fe.fact_id = cf.id
     WHERE cf.active = 1
       AND (fe.fact_id IS NULL OR fe.content_hash != cf.content_hash)
-    ORDER BY cf.id ASC
+    ORDER BY cf.id ${order}
     LIMIT ?
   `).all(limit) as { id: number; content: string; hash: string }[];
 

@@ -18,7 +18,7 @@ import {
 import { recordToolEvent } from '../agents/tool-observability.js';
 import { classifySource, isSourceTrustEnabled, AUTHORITATIVE_TRUST } from './authoritative-sources.js';
 import { isSourceMapEnabled, upsertResourcePointer } from './source-map.js';
-import { cosine, loadFactEmbeddings } from './embeddings.js';
+import { cosine, embedMissingFacts, isEmbeddingsEnabled, loadFactEmbeddings } from './embeddings.js';
 import { extractAnchors, canMergeEntitySafe, type EntityAnchors } from './memory-merge.js';
 
 /**
@@ -464,6 +464,44 @@ export function _resetResolverStatsForTest(): void {
   resolverStats.add = 0; resolverStats.update = 0; resolverStats.delete = 0; resolverStats.noop = 0;
 }
 
+// M1 embed-at-write: a newly written/updated fact has NO vector until the
+// ~2-min nightly backfill tick, so same-session semantic recall can't see what
+// you just told it (it silently falls back to token overlap). This closes that
+// window to ~1s by embedding the newest unwritten facts right after a write.
+// Off the user turn (consolidateFact already runs in background). The
+// leading+trailing guard coalesces a burst of writes into one batched pass and
+// guarantees a final pass after the last write. The nightly backfill remains the
+// backstop. Kill-switch CLEMMY_EMBED_AT_WRITE=off.
+const EMBED_AT_WRITE_BATCH = 8;
+let embedAtWriteRunning = false;
+let embedAtWriteRerun = false;
+
+function embedAtWriteEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_EMBED_AT_WRITE', 'on') || 'on').toLowerCase() !== 'off';
+}
+
+export async function triggerEmbedAtWrite(): Promise<void> {
+  if (!embedAtWriteEnabled() || !isEmbeddingsEnabled()) return;
+  if (embedAtWriteRunning) { embedAtWriteRerun = true; return; }
+  embedAtWriteRunning = true;
+  try {
+    do {
+      embedAtWriteRerun = false;
+      await embedMissingFacts({ maxChunks: EMBED_AT_WRITE_BATCH, newestFirst: true });
+    } while (embedAtWriteRerun);
+  } catch {
+    // Best-effort: the nightly backfill is the backstop.
+  } finally {
+    embedAtWriteRunning = false;
+  }
+}
+
+/** Test-only: reset the embed-at-write coalescing guard. */
+export function _resetEmbedAtWriteForTest(): void {
+  embedAtWriteRunning = false;
+  embedAtWriteRerun = false;
+}
+
 export async function consolidateFact(
   candidate: ConsolidateCandidate,
   ctx: ConsolidateContext = {},
@@ -475,6 +513,9 @@ export async function consolidateFact(
   else if (out.deleted) resolverStats.delete += 1;
   else if (out.noop) resolverStats.noop += 1;
   else if (out.written) resolverStats.add += 1;
+  // M1: embed a just-written/updated fact promptly so this session's later
+  // turns can semantically recall it. Fire-and-forget — never blocks the caller.
+  if (out.written || out.updated) void triggerEmbedAtWrite();
   return out;
 }
 
