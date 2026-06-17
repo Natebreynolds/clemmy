@@ -7,6 +7,7 @@ import { ProfileForm } from './settings/ProfileForm';
 import { NotificationsEditor } from './settings/NotificationsEditor';
 import { ModelsForm } from './settings/ModelsForm';
 import { ModelBackendForm } from './settings/ModelBackendForm';
+import { FusionForm } from './settings/FusionForm';
 import { ClaudeLoginForm } from './settings/ClaudeLoginForm';
 import { cn } from '@/lib/cn';
 
@@ -59,6 +60,8 @@ export function Settings() {
         <NotificationsEditor />
 
         <ModelsForm />
+
+        <FusionForm />
 
         <ModelBackendForm />
 

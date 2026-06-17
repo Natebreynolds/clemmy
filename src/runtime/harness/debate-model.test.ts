@@ -128,6 +128,23 @@ test('getResponse: one draft fails → fail open to the survivor (no judge)', as
   });
 });
 
+test('getResponse: a HUNG draft does not hold the turn hostage — grace elapses, survivor answers', async () => {
+  await withEnv({ CLEMMY_DEBATE_MODE: 'all' }, async () => {
+    let judged = 0;
+    const b = brains({
+      draftA: model({ getResponse: () => new Promise<ModelResponse>(() => {}) }), // never resolves
+      draftB: model({ getResponse: async () => msg('CODEX-FAST') }),
+      judge: model({ getResponse: async () => { judged++; return msg('FINAL'); } }),
+    });
+    const t0 = Date.now();
+    const res = await new DebateModel(b, { draftGraceMs: 30 }).getResponse(req());
+    const elapsed = Date.now() - t0;
+    assert.equal((res.output[0] as any).content, 'CODEX-FAST', 'fell open to the fast survivor');
+    assert.equal(judged, 0, 'no judge — only one draft made the grace window');
+    assert.ok(elapsed < 2000, `returned promptly (~grace), not hostage to the hung draft (took ${elapsed}ms)`);
+  });
+});
+
 test('getResponse: BOTH drafts fail → passthrough last resort', async () => {
   await withEnv({ CLEMMY_DEBATE_MODE: 'all' }, async () => {
     const b = brains({
@@ -230,6 +247,101 @@ test('streamResponseAsEvents: text delta then a response_done carrying the outpu
   const done = evs.find((e) => e.type === 'response_done');
   assert.ok(done, 'response_done present');
   assert.equal((done.response.output[0] as any).content, 'SOLO');
+});
+
+// --- P0 regression: SDK-conformant response_done on the fail-open paths -------
+// (audit found a CRITICAL crash: a survivor/judge-fallback response_done with no
+//  id + empty usage throws a ZodError in the SDK and crashes the turn — the exact
+//  path the grace/fail-open feature exists for.)
+
+test('streamResponseAsEvents: response_done is SDK-conformant (non-empty id + numeric usage)', async () => {
+  const evs = await collect((async function* () { yield* streamResponseAsEvents(msg('SOLO')); })());
+  const done: any = evs.find((e) => e.type === 'response_done');
+  assert.equal(typeof done.response.id, 'string');
+  assert.ok(done.response.id.length > 0, 'non-empty id (else the SDK Zod parse crashes the turn)');
+  assert.equal(typeof done.response.usage.inputTokens, 'number');
+  assert.equal(typeof done.response.usage.outputTokens, 'number');
+  assert.equal(typeof done.response.usage.totalTokens, 'number');
+});
+
+test('streamResponseAsEvents: preserves a real responseId + sums usage when present', async () => {
+  const resp = { output: [{ type: 'message', content: 'X' }], responseId: 'resp_123', usage: { inputTokens: 10, outputTokens: 5 } } as any;
+  const evs = await collect((async function* () { yield* streamResponseAsEvents(resp); })());
+  const done: any = evs.find((e) => e.type === 'response_done');
+  assert.equal(done.response.id, 'resp_123');
+  assert.equal(done.response.usage.inputTokens, 10);
+  assert.equal(done.response.usage.totalTokens, 15);
+});
+
+test('getStreamedResponse survivor (fail-open) path emits a conformant response_done', async () => {
+  await withEnv({ CLEMMY_DEBATE_MODE: 'all' }, async () => {
+    const b = brains({
+      draftA: model({ getResponse: async () => { throw new Error('down'); } }),
+      draftB: model({ getResponse: async () => ({ output: [{ type: 'message', content: 'SURV' }], responseId: 'r1', usage: { inputTokens: 3, outputTokens: 2 } } as any) }),
+    });
+    const evs = await collect(new DebateModel(b, { heartbeatMs: 0 }).getStreamedResponse(req()));
+    const done: any = evs.find((e) => e.type === 'response_done');
+    assert.ok(done && typeof done.response.id === 'string' && done.response.id.length > 0);
+    assert.equal(typeof done.response.usage.totalTokens, 'number');
+    assert.equal(evs.filter((e) => e.type === 'response_started').length, 1, 'one response_started total');
+  });
+});
+
+// --- P0: judge failure must NOT fail the turn when two drafts exist -----------
+
+test('getResponse: judge failure falls back to the longer surviving draft', async () => {
+  await withEnv({ CLEMMY_DEBATE_MODE: 'all' }, async () => {
+    const b = brains({
+      draftA: model({ getResponse: async () => msg('SHORT') }),
+      draftB: model({ getResponse: async () => msg('A MUCH LONGER DRAFT ANSWER') }),
+      judge: model({ getResponse: async () => { throw new Error('judge down'); } }),
+    });
+    const res = await new DebateModel(b).getResponse(req());
+    assert.equal((res.output[0] as any).content, 'A MUCH LONGER DRAFT ANSWER', 'fell back to the longer draft');
+  });
+});
+
+test('getStreamedResponse: judge failure PRE-content replays a surviving draft (conformant, no crash)', async () => {
+  await withEnv({ CLEMMY_DEBATE_MODE: 'all' }, async () => {
+    const b = brains({
+      draftA: model({ getResponse: async () => msg('DRAFT-A-LONGER-ANSWER') }),
+      draftB: model({ getResponse: async () => msg('B') }),
+      judge: model({ getStreamedResponse: async function* () { throw new Error('judge stream down'); } }),
+    });
+    const evs = await collect(new DebateModel(b, { heartbeatMs: 0 }).getStreamedResponse(req()));
+    assert.ok(evs.some((e) => e.type === 'output_text_delta' && e.delta === 'DRAFT-A-LONGER-ANSWER'));
+    const done: any = evs.find((e) => e.type === 'response_done');
+    assert.ok(done && done.response.id && typeof done.response.usage.totalTokens === 'number');
+    assert.equal(evs.filter((e) => e.type === 'response_started').length, 1);
+  });
+});
+
+test('getStreamedResponse: judge failure AFTER content rethrows (cannot duplicate a partial stream)', async () => {
+  await withEnv({ CLEMMY_DEBATE_MODE: 'all' }, async () => {
+    const b = brains({
+      judge: model({ getStreamedResponse: async function* () {
+        yield { type: 'output_text_delta', delta: 'partial' } as any;
+        throw new Error('judge died mid-stream');
+      } }),
+    });
+    const got: any[] = [];
+    await assert.rejects(async () => { for await (const e of new DebateModel(b, { heartbeatMs: 0 }).getStreamedResponse(req())) got.push(e); });
+    assert.ok(got.some((e) => e.type === 'output_text_delta' && e.delta === 'partial'));
+  });
+});
+
+test('draftBoth: the grace-losing (hung) draft is ABORTED, not left billing', async () => {
+  await withEnv({ CLEMMY_DEBATE_MODE: 'all' }, async () => {
+    let hungSignal: AbortSignal | undefined;
+    const b = brains({
+      draftA: model({ getResponse: (r: any) => { hungSignal = r.signal; return new Promise<ModelResponse>(() => {}); } }),
+      draftB: model({ getResponse: async () => msg('FAST') }),
+    });
+    const res = await new DebateModel(b, { draftGraceMs: 20 }).getResponse(req());
+    assert.equal((res.output[0] as any).content, 'FAST', 'answered from the fast survivor');
+    assert.ok(hungSignal, 'the hung draft received an abort signal');
+    assert.equal(hungSignal!.aborted, true, 'the hung loser draft was aborted on grace timeout');
+  });
 });
 
 test('heartbeatsUntil: yields nothing once the promise has already settled', async () => {

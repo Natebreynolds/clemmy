@@ -77,6 +77,7 @@ export interface SettingsSnapshot {
   modelBackend?: ModelBackend;
   claudeAuth?: ClaudeAuth;
   activeBrain?: ActiveBrain;
+  fusion?: FusionSettings;
 }
 
 export const getSettings = () => apiGet<SettingsSnapshot>('/api/console/settings');
@@ -108,3 +109,16 @@ export const completeClaudeLogin = (flowId: string, code: string) =>
 export type ActiveBrain = 'codex_oauth' | 'claude_oauth' | 'api_key';
 export const setActiveBrain = (brain: ActiveBrain) =>
   patch<{ activeBrain: ActiveBrain; claudeAuth: ClaudeAuth }>('/api/console/settings/active-brain', { brain });
+
+// Fusion (multi-model) — both flagships draft a turn, a judge reconciles. A live
+// toggle: mode/judge apply on the next message, no restart. Needs BOTH a Claude
+// and a Codex login; otherwise Clementine runs single-brain on the primary.
+export type FusionMode = 'off' | 'high' | 'all';
+export interface FusionSettings {
+  mode: FusionMode;
+  judge: 'claude' | 'codex';
+  brainsAvailable: { claude: boolean; codex: boolean };
+  active: boolean;
+}
+export const patchFusion = (p: { mode: FusionMode; judge: 'claude' | 'codex' }) =>
+  patch<{ fusion: FusionSettings }>('/api/console/settings/fusion', p);

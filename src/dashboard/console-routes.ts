@@ -188,6 +188,7 @@ import { parseApprovalIntent, parseHarnessCommand } from '../channels/discord-ha
 import { buildOrchestratorAgent } from '../agents/orchestrator.js';
 import { configureHarnessRuntime, resetHarnessRuntimeConfig } from '../runtime/harness/codex-client.js';
 import { resetByoModelCache } from '../runtime/harness/byo-model.js';
+import { debateMode, judgeChoice, debateBrainsAvailable, readRecentDebateTraces } from '../runtime/harness/debate-model.js';
 import { summarizeApprovalAction } from '../runtime/approval-summary.js';
 import {
   appendRecallTranscriptSegment,
@@ -3471,7 +3472,14 @@ export function registerConsoleRoutes(
         hasKey: Boolean(byo.apiKey),
         configured: byo.configured,
       };
-      res.json({ profile, proactivity, auth, memory, models, runtimeBudget, modelBackend, claudeAuth: getClaudeAuthSnapshot(), activeBrain: getActiveAuthMode() });
+      const fusionBrains = debateBrainsAvailable();
+      const fusion = {
+        mode: debateMode(),
+        judge: judgeChoice(),
+        brainsAvailable: fusionBrains,
+        active: debateMode() !== 'off' && fusionBrains.claude && fusionBrains.codex,
+      };
+      res.json({ profile, proactivity, auth, memory, models, runtimeBudget, modelBackend, claudeAuth: getClaudeAuthSnapshot(), activeBrain: getActiveAuthMode(), fusion });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -6537,6 +6545,68 @@ export function registerConsoleRoutes(
       clearAutonomyAgentCache();
 
       res.json({ activeBrain: getActiveAuthMode(), claudeAuth: getClaudeAuthSnapshot() });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * Fusion (multi-model) settings — a LIVE toggle (no daemon restart).
+   * CLEMMY_DEBATE_MODE picks how often the two flagships debate a turn
+   * (off | high-stakes | all); CLEMMY_DEBATE_JUDGE picks who reconciles.
+   * updateEnvKey persists it, process.env makes it live this session, and
+   * resetHarnessRuntimeConfig forces the next turn's configureHarnessRuntime to
+   * re-register so maybeWrapDebate re-evaluates debate on/off.
+   */
+  app.patch('/api/console/settings/fusion', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const body = (req.body ?? {}) as { mode?: unknown; judge?: unknown };
+      const rawMode = typeof body.mode === 'string' ? body.mode.trim().toLowerCase() : '';
+      const mode = rawMode === 'all' ? 'all' : rawMode === 'high' ? 'high' : 'off';
+      const judge = typeof body.judge === 'string' && body.judge.trim().toLowerCase() === 'codex' ? 'codex' : 'claude';
+
+      updateEnvKey('CLEMMY_DEBATE_MODE', mode);
+      process.env.CLEMMY_DEBATE_MODE = mode;
+      updateEnvKey('CLEMMY_DEBATE_JUDGE', judge);
+      process.env.CLEMMY_DEBATE_JUDGE = judge;
+
+      // Re-register the provider next turn so debate wrapping flips on/off live.
+      resetHarnessRuntimeConfig();
+
+      const brains = debateBrainsAvailable();
+      res.json({
+        fusion: {
+          mode: debateMode(),
+          judge: judgeChoice(),
+          brainsAvailable: brains,
+          active: mode !== 'off' && brains.claude && brains.codex,
+        },
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * Fusion observability — recent debate traces (both drafts + divergence + the
+   * judge's final) plus live fusion status, for a "Fusion" view in the console.
+   * Read-only and best-effort: tolerates an absent/partial trace file.
+   */
+  app.get('/api/console/debate-traces', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const limit = Math.min(200, Math.max(1, Number.parseInt(String(req.query.limit ?? '40'), 10) || 40));
+      const brains = debateBrainsAvailable();
+      res.json({
+        fusion: {
+          mode: debateMode(),
+          judge: judgeChoice(),
+          brainsAvailable: brains,
+          active: debateMode() !== 'off' && brains.claude && brains.codex,
+        },
+        traces: readRecentDebateTraces(limit),
+      });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

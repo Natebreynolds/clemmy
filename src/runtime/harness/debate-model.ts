@@ -40,7 +40,10 @@ import { getRuntimeEnv, getActiveAuthMode, getClaudeBrainModel } from '../../con
 import { getClaudeModel } from './claude-model.js';
 import { CodexModelProvider } from './codex-model.js';
 import { getStoredCodexOAuthTokens } from '../auth-store.js';
-import { loadClaudeAccessToken } from '../claude-oauth.js';
+import { getStoredClaudeTokens } from '../claude-oauth.js';
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import path from 'node:path';
 import pino from 'pino';
 
 const logger = pino({ name: 'clementine.debate-model' });
@@ -71,6 +74,15 @@ export function judgeChoice(): 'claude' | 'codex' {
 function heartbeatMs(): number {
   const raw = Number.parseInt(getRuntimeEnv('CLEMMY_DEBATE_HEARTBEAT_MS', '10000') ?? '10000', 10);
   return Number.isFinite(raw) && raw >= 0 ? raw : 10000;
+}
+
+/** Once the FIRST draft lands, how long to wait for the second before proceeding
+ *  with what we have. Stops a slow/flaky brain (exhausting its own retry budget)
+ *  from holding the whole turn hostage — observed live: Claude transport-timeout
+ *  retried ~90s while Codex was ready in seconds. 0 disables (single draft). */
+function draftGraceMs(): number {
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_DEBATE_DRAFT_GRACE_MS', '25000') ?? '25000', 10);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 25000;
 }
 
 /** High-stakes heuristic for mode=high. A v1 proxy (replaceable by a proper
@@ -137,6 +149,8 @@ export interface DebateBrains {
 
 export interface DebateOptions {
   heartbeatMs?: number;
+  /** Grace window (ms) for the second draft after the first lands. */
+  draftGraceMs?: number;
   /** Injected for deterministic tests. */
   sleep?: (ms: number) => Promise<void>;
 }
@@ -156,11 +170,29 @@ export class DebateModel implements Model {
     const { a, b } = await this.draftBoth(request);
     if (!a || !b) {
       const survivor = a ?? b;
-      if (survivor) return survivor;
+      if (survivor) {
+        recordDebateTrace({ path: 'getResponse', outcome: 'fail-open-survivor', survivor: a ? 'claude' : 'codex' });
+        return survivor;
+      }
       logger.warn('both debate drafts failed — falling back to a single passthrough answer');
+      recordDebateTrace({ path: 'getResponse', outcome: 'both-failed-passthrough' });
       return this.brains.passthrough.getResponse(request);
     }
-    return this.brains.judge.getResponse(buildJudgeRequest(request, a, b));
+    const da = summarizeOutput(a.output);
+    const db = summarizeOutput(b.output);
+    const div = divergence(da, db);
+    try {
+      const final = await this.brains.judge.getResponse(buildJudgeRequest(request, a, b));
+      logger.info({ path: 'getResponse', divergence: div, draftAlen: da.length, draftBlen: db.length, judge: judgeChoice() }, 'debate turn reconciled');
+      recordDebateTrace({ path: 'getResponse', divergence: div, judge: judgeChoice(), draftA: capText(da), draftB: capText(db), final: capText(extractAssistantText(final.output)) });
+      return final;
+    } catch (err) {
+      // The judge failed AFTER two valid drafts — don't lose the turn; answer
+      // from the stronger surviving draft instead of failing closed.
+      logger.warn({ err: errText(err) }, 'debate judge failed — falling back to the longer surviving draft');
+      recordDebateTrace({ path: 'getResponse', outcome: 'judge-failed-draft-fallback', divergence: div });
+      return pickLongerDraft(a, b);
+    }
   }
 
   async *getStreamedResponse(request: ModelRequest): AsyncIterable<StreamEvent> {
@@ -183,29 +215,114 @@ export class DebateModel implements Model {
     if (!a || !b) {
       const survivor = a ?? b;
       if (survivor) {
+        recordDebateTrace({ path: 'stream', outcome: 'fail-open-survivor', survivor: a ? 'claude' : 'codex' });
         yield* streamResponseAsEvents(survivor);
         return;
       }
       logger.warn('both debate drafts failed — streaming a single passthrough answer');
+      recordDebateTrace({ path: 'stream', outcome: 'both-failed-passthrough' });
       yield* dropResponseStarted(this.brains.passthrough.getStreamedResponse(request));
       return;
     }
 
     // Two drafts in hand: the judge reconciles, streamed live as the final answer.
-    yield* dropResponseStarted(this.brains.judge.getStreamedResponse(buildJudgeRequest(request, a, b)));
+    // Tee the judge's text (drop its response_started — we emitted ours) so we can
+    // record what reconciliation actually produced, without altering the stream.
+    const da = summarizeOutput(a.output);
+    const db = summarizeOutput(b.output);
+    const div = divergence(da, db);
+    let finalText = '';
+    let judgeFinalOutput: unknown;
+    let judgeYieldedContent = false;
+    try {
+      for await (const ev of this.brains.judge.getStreamedResponse(buildJudgeRequest(request, a, b))) {
+        const e = ev as { type?: string; delta?: string; response?: { output?: unknown } };
+        if (e.type === 'response_started') continue;
+        if (e.type === 'output_text_delta' && typeof e.delta === 'string') { finalText += e.delta; judgeYieldedContent = true; }
+        if (e.type === 'response_done' && e.response) judgeFinalOutput = e.response.output;
+        yield ev;
+      }
+    } catch (err) {
+      // Judge failed. If nothing user-visible was committed yet, recover by
+      // replaying the stronger surviving draft (the response_started we already
+      // emitted is reused). If content already streamed, we can't cleanly recover.
+      if (judgeYieldedContent) throw err;
+      logger.warn({ err: errText(err) }, 'debate judge stream failed pre-content — replaying the longer surviving draft');
+      recordDebateTrace({ path: 'stream', outcome: 'judge-failed-draft-fallback', divergence: div });
+      yield* streamResponseAsEvents(pickLongerDraft(a, b));
+      return;
+    }
+    // FIX6: structured-output turns carry the answer in response_done.output, not
+    // text deltas — fall back to that so the trace isn't under-reported.
+    const finalForTrace = finalText || extractAssistantText(judgeFinalOutput);
+    logger.info({ path: 'stream', divergence: div, draftAlen: da.length, draftBlen: db.length, finalLen: finalForTrace.length, judge: judgeChoice() }, 'debate turn reconciled');
+    recordDebateTrace({ path: 'stream', divergence: div, judge: judgeChoice(), draftA: capText(da), draftB: capText(db), final: capText(finalForTrace) });
   }
 
-  /** Draft on both brains in parallel. A non-overload rejection (already post the
-   *  brain's own retry budget) drops that draft to null — fail open to the other. */
+  /** Draft on both brains in parallel, but DON'T let a slow/flaky brain hold the
+   *  turn hostage: once the first draft lands, the second gets a bounded grace
+   *  window, then we proceed with what we have. A rejection (already post the
+   *  brain's own retry budget) drops that draft to null — fail open to the other.
+   *  A draft that overruns the grace is treated the same (still runs in bg). */
   private async draftBoth(request: ModelRequest): Promise<{ a: ModelResponse | null; b: ModelResponse | null }> {
-    const [ra, rb] = await Promise.allSettled([
-      this.brains.draftA.getResponse(request),
-      this.brains.draftB.getResponse(request),
-    ]);
-    const a = ra.status === 'fulfilled' ? ra.value : null;
-    const b = rb.status === 'fulfilled' ? rb.value : null;
-    if (!a) logger.warn({ err: errText((ra as PromiseRejectedResult).reason) }, 'debate draft A failed (fail-open)');
-    if (!b) logger.warn({ err: errText((rb as PromiseRejectedResult).reason) }, 'debate draft B failed (fail-open)');
+    let a: ModelResponse | null = null;
+    let b: ModelResponse | null = null;
+    let aDone = false;
+    let bDone = false;
+
+    // Each draft gets its own AbortController so the grace-LOSING draft is
+    // cancelled (not left running fully-billed with its result discarded), and we
+    // chain the turn's own signal so a turn abort cancels BOTH drafts. (The judge
+    // inherits request.signal via buildJudgeRequest's spread.)
+    const turnSignal = (request as { signal?: AbortSignal }).signal;
+    const acA = new AbortController();
+    const acB = new AbortController();
+    const onTurnAbort = () => { acA.abort(); acB.abort(); };
+    if (turnSignal) {
+      if (turnSignal.aborted) onTurnAbort();
+      else turnSignal.addEventListener('abort', onTurnAbort, { once: true });
+    }
+    const reqA = { ...request, signal: acA.signal } as ModelRequest;
+    const reqB = { ...request, signal: acB.signal } as ModelRequest;
+
+    const pa = this.brains.draftA
+      .getResponse(reqA)
+      .then((v) => { a = v; })
+      .catch((e) => { logger.warn({ err: errText(e) }, 'debate draft A failed (fail-open)'); })
+      .finally(() => { aDone = true; });
+    const pb = this.brains.draftB
+      .getResponse(reqB)
+      .then((v) => { b = v; })
+      .catch((e) => { logger.warn({ err: errText(e) }, 'debate draft B failed (fail-open)'); })
+      .finally(() => { bDone = true; });
+
+    const grace = this.opts.draftGraceMs ?? draftGraceMs();
+    await new Promise<void>((resolve) => {
+      let resolved = false;
+      let graceTimer: ReturnType<typeof setTimeout> | undefined;
+      const finish = () => {
+        if (resolved) return;
+        resolved = true;
+        if (graceTimer) clearTimeout(graceTimer);
+        // Proceeding without whichever draft is still running — abort it so it
+        // stops billing tokens for a result we'll discard.
+        if (!aDone) acA.abort();
+        if (!bDone) acB.abort();
+        resolve();
+      };
+      const onSettle = () => {
+        if (aDone && bDone) { finish(); return; }       // both in → go now
+        if (graceTimer === undefined && grace >= 0) {     // first one in → start the clock
+          graceTimer = setTimeout(finish, grace);
+        }
+      };
+      void pa.then(onSettle);
+      void pb.then(onSettle);
+    });
+    if (turnSignal) turnSignal.removeEventListener('abort', onTurnAbort);
+
+    if (!aDone) logger.warn({ graceMs: grace }, 'debate draft A overran the grace window — aborted, proceeding without it');
+    if (!bDone) logger.warn({ graceMs: grace }, 'debate draft B overran the grace window — aborted, proceeding without it');
     return { a, b };
   }
 }
@@ -219,16 +336,28 @@ export class DebateModelProvider implements ModelProvider {
 
   getModel(modelName?: string): Model | Promise<Model> {
     const brains = resolveDebateBrains(this.passthrough, modelName);
+    logDebateAvailabilityTransition(brains !== null);
     // No two distinct flagships available → behave exactly like the normal provider.
     if (!brains) return this.passthrough.getModel(modelName);
     return new DebateModel(brains, this.opts);
   }
 }
 
+const CLAUDE_OAT_PREFIX = 'sk-ant-oat01';
+/** Claude is "available" for debate if a SUBSCRIPTION (oat01) token is stored
+ *  that is currently valid OR refreshable. The access token has an ~8h TTL and
+ *  the real Claude request path AUTO-REFRESHES a vault token, so we must NOT
+ *  disable debate just because the access token momentarily needs a refresh —
+ *  doing so was a false-negative that silently dropped debate to single-brain
+ *  (and self-perpetuated: no Claude call → no refresh → stays off). If a refresh
+ *  ultimately fails, draftBoth fails open to the other brain. The oat01-only
+ *  check preserves the billing guard (an api03 API key is never "available"). */
 function claudeAvailable(): boolean {
   try {
-    loadClaudeAccessToken();
-    return true;
+    const t = getStoredClaudeTokens();
+    if (!t?.accessToken?.startsWith(CLAUDE_OAT_PREFIX)) return false;
+    if (t.refreshToken) return true; // refreshable → the request path will renew it
+    return !t.expiresAt || t.expiresAt > Date.now() + 60_000; // non-refreshable → must be unexpired
   } catch {
     return false;
   }
@@ -245,6 +374,22 @@ function codexAvailable(): boolean {
 /** Diagnostic: which flagships are logged in. Debate needs BOTH. */
 export function debateBrainsAvailable(): { claude: boolean; codex: boolean } {
   return { claude: claudeAvailable(), codex: codexAvailable() };
+}
+
+let lastDebateActive: boolean | null = null;
+/** Log ONCE when debate flips active<->inactive. A flagship login lapsing (e.g.
+ *  Claude's OAuth token expiring) makes debate fall back to single-brain — which
+ *  was previously SILENT (no trace, no log), so it looked like debate "stopped
+ *  working" for no reason. Now the transition is always announced. */
+function logDebateAvailabilityTransition(active: boolean): void {
+  if (active === lastDebateActive) return;
+  lastDebateActive = active;
+  if (active) {
+    logger.info('fusion debate ACTIVE — both flagships available, debating turns');
+  } else {
+    const { claude, codex } = debateBrainsAvailable();
+    logger.warn({ claude, codex }, 'fusion debate INACTIVE — a flagship login is missing; running SINGLE-BRAIN passthrough until it returns');
+  }
 }
 
 /**
@@ -282,12 +427,23 @@ const JUDGE_PREAMBLE = [
   'If the drafts agree, confirm and tighten. If they conflict, decide on the',
   'merits and say nothing about the disagreement. Do NOT mention this debate, the',
   'other model, or that drafts existed — speak directly to the user as one voice.',
+  'IMPORTANT: if EITHER draft proposes a local-state or side-effecting tool call',
+  '(focus_get / focus_set / focus_update / focus_clear, memory_remember, or any',
+  'execution_* call), PRESERVE that call in your response unless you have a',
+  "concrete reason to drop it — only the deciding brain's tool calls actually",
+  'execute, so dropping one silently loses focus hygiene or a learned fact.',
 ].join(' ');
 
 /** Build the judge's request: the original request UNCHANGED (tools, modelSettings,
  *  outputType/handoffs all preserved so structured output + tool use still work),
  *  with the two drafts appended to the system instructions as text. Augmenting the
- *  instruction string (not the input items) keeps it shape-safe across providers. */
+ *  instruction string (not the input items) keeps it shape-safe across providers.
+ *
+ *  INVARIANT: request.input MUST be preserved verbatim — it carries the harness's
+ *  per-turn `role:system` items injected by callModelInputFilter (the
+ *  [AGENT CONTEXT PACKET] with the focus line, the memory primer, and the goal
+ *  block). The `...request` spread preserves them; do NOT rebuild the judge's
+ *  input or the judge loses its focus / memory / goal context. */
 export function buildJudgeRequest(request: ModelRequest, a: ModelResponse, b: ModelResponse): ModelRequest {
   const base = ((request as { systemInstructions?: string }).systemInstructions ?? '').toString();
   const draftA = summarizeOutput(a.output);
@@ -387,9 +543,31 @@ export async function* heartbeatsUntil(
   }
 }
 
-/** Replay a buffered ModelResponse as a stream (text delta + a final
- *  response_done carrying the full output). Used for the single-survivor
- *  fail-open path. No response_started — the caller already emitted one. */
+/** The SDK's StreamEventResponseCompleted schema REQUIRES response.id (non-empty
+ *  string) and a usage object with numeric inputTokens/outputTokens/totalTokens —
+ *  a response_done missing them throws a ZodError in run.js with no try/catch,
+ *  crashing the whole turn. The original survivor-replay emitted `{output, usage:{}}`
+ *  with no id, so the grace/fail-open path (the very reason this feature exists)
+ *  could crash. These helpers make any replayed response_done conformant. */
+function responseIdOf(resp: ModelResponse): string {
+  const r = resp as { responseId?: unknown; response?: { id?: unknown } };
+  if (typeof r.responseId === 'string' && r.responseId) return r.responseId;
+  if (r.response && typeof r.response.id === 'string' && r.response.id) return r.response.id;
+  return '';
+}
+function conformantUsage(u: unknown): { inputTokens: number; outputTokens: number; totalTokens: number } {
+  const o = (u ?? {}) as Record<string, unknown>;
+  const n = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
+  const inputTokens = n(o.inputTokens ?? o.input_tokens ?? o.promptTokens);
+  const outputTokens = n(o.outputTokens ?? o.output_tokens ?? o.completionTokens);
+  const totalTokens = n(o.totalTokens ?? o.total_tokens) || inputTokens + outputTokens;
+  return { inputTokens, outputTokens, totalTokens };
+}
+
+/** Replay a buffered ModelResponse as a stream (text delta + a SDK-CONFORMANT
+ *  response_done carrying the full output, a non-empty id, and numeric usage).
+ *  Used for the single-survivor / judge-failed fallback. No response_started —
+ *  the caller already emitted one. */
 export function* streamResponseAsEvents(resp: ModelResponse): Generator<StreamEvent> {
   const text = extractAssistantText(resp.output);
   if (text) {
@@ -397,8 +575,19 @@ export function* streamResponseAsEvents(resp: ModelResponse): Generator<StreamEv
   }
   yield {
     type: 'response_done',
-    response: { output: resp.output, usage: (resp as { usage?: unknown }).usage ?? {} },
+    response: {
+      id: responseIdOf(resp) || 'debate-fallback',
+      output: resp.output,
+      usage: conformantUsage((resp as { usage?: unknown }).usage),
+    },
   } as unknown as StreamEvent;
+}
+
+/** The surviving draft to fall back to when the judge fails — the longer one
+ *  (more reconciled-answer text) per the audit's "replay the longer surviving
+ *  draft" guidance. */
+function pickLongerDraft(a: ModelResponse, b: ModelResponse): ModelResponse {
+  return extractAssistantText(a.output).length >= extractAssistantText(b.output).length ? a : b;
 }
 
 /** Forward a stream but drop its response_started (we emit our own single one). */
@@ -406,6 +595,68 @@ async function* dropResponseStarted(stream: AsyncIterable<StreamEvent>): AsyncGe
   for await (const ev of stream) {
     if ((ev as { type?: string }).type === 'response_started') continue;
     yield ev;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Observability — capture both drafts + divergence + the judge's final per turn
+// so we can MEASURE whether debate actually helped (vs. just costing 2-3x).
+// ---------------------------------------------------------------------------
+
+const TRACE_CAP = 1600;
+function capText(s: string): string {
+  return s.length > TRACE_CAP ? `${s.slice(0, TRACE_CAP)}…(+${s.length - TRACE_CAP} chars)` : s;
+}
+
+/** Lexical divergence between the two drafts: 0 = identical wording, 1 = disjoint.
+ *  A cheap proxy for "did the brains actually disagree?" — high divergence is
+ *  where reconciliation earns its cost. (Word-set Jaccard, words >2 chars.) */
+export function divergence(a: string, b: string): number {
+  const norm = (s: string) =>
+    new Set(s.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter((w) => w.length > 2));
+  const A = norm(a);
+  const B = norm(b);
+  if (A.size === 0 && B.size === 0) return 0;
+  let inter = 0;
+  for (const w of A) if (B.has(w)) inter += 1;
+  const union = A.size + B.size - inter;
+  const jaccard = union === 0 ? 1 : inter / union;
+  return Math.round((1 - jaccard) * 100) / 100;
+}
+
+function debateTracePath(): string {
+  const home = getRuntimeEnv('CLEMENTINE_HOME', '') || path.join(homedir(), '.clementine-next');
+  return path.join(home, 'state', 'debate-traces.jsonl');
+}
+
+/** Append one debate record as JSONL. Best-effort — tracing must NEVER affect a
+ *  turn. Disabled under tests so the suite doesn't write to the real home. */
+function recordDebateTrace(rec: Record<string, unknown>): void {
+  if (process.env.NODE_ENV === 'test') return;
+  try {
+    const p = debateTracePath();
+    mkdirSync(path.dirname(p), { recursive: true });
+    appendFileSync(p, `${JSON.stringify({ ts: new Date().toISOString(), ...rec })}\n`);
+  } catch {
+    /* best-effort */
+  }
+}
+
+/** Read the most recent debate trace rows (newest first) for the console UI.
+ *  Best-effort: tolerates a missing file and partial/corrupt lines, never throws. */
+export function readRecentDebateTraces(limit = 40): Array<Record<string, unknown>> {
+  try {
+    const p = debateTracePath();
+    if (!existsSync(p)) return [];
+    const lines = readFileSync(p, 'utf-8').split('\n').filter(Boolean);
+    const n = Math.min(Math.max(1, Math.floor(limit)), 500);
+    const out: Array<Record<string, unknown>> = [];
+    for (const l of lines.slice(-n)) {
+      try { out.push(JSON.parse(l)); } catch { /* skip a partial/corrupt line */ }
+    }
+    return out.reverse();
+  } catch {
+    return [];
   }
 }
 

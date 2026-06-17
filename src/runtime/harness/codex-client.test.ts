@@ -101,6 +101,50 @@ test('configureHarnessRuntime is idempotent within a process', async () => {
   assert.equal(second.ok, true);
 });
 
+// --- claude_oauth brain registration (either-flagship coverage) --------------
+// The Claude wallet prefers the vault (BASE_DIR/state/claude-auth.json) over the
+// Claude Code keychain, so writing a fake vault token makes the configure-time
+// fail-closed behavior deterministic regardless of the host's real Claude login.
+const CLAUDE_VAULT_FILE = path.join(AUTH_STATE_DIR, 'claude-auth.json');
+function writeClaudeVault(payload: Record<string, unknown>): void {
+  writeFileSync(CLAUDE_VAULT_FILE, JSON.stringify(payload, null, 2), 'utf-8');
+}
+function clearClaudeVault(): void { try { rmSync(CLAUDE_VAULT_FILE); } catch { /* not present */ } }
+
+test('configureHarnessRuntime: claude_oauth registers the Claude brain on a valid oat01 token', async () => {
+  const prevMode = process.env.AUTH_MODE;
+  const prevDebate = process.env.CLEMMY_DEBATE_MODE;
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_DEBATE_MODE = 'off';
+  writeClaudeVault({ accessToken: 'sk-ant-oat01-faketoken', refreshToken: 'r', expiresAt: Date.now() + 3_600_000 });
+  try {
+    resetHarnessRuntimeConfig();
+    const result = await configureHarnessRuntime();
+    assert.equal(result.ok, true, result.reason);
+  } finally {
+    clearClaudeVault();
+    if (prevMode === undefined) delete process.env.AUTH_MODE; else process.env.AUTH_MODE = prevMode;
+    if (prevDebate === undefined) delete process.env.CLEMMY_DEBATE_MODE; else process.env.CLEMMY_DEBATE_MODE = prevDebate;
+    resetHarnessRuntimeConfig();
+  }
+});
+
+test('configureHarnessRuntime: claude_oauth FAILS CLOSED on an api03 API key (billing guard)', async () => {
+  const prevMode = process.env.AUTH_MODE;
+  process.env.AUTH_MODE = 'claude_oauth';
+  writeClaudeVault({ accessToken: 'sk-ant-api03-fakeapikey' });
+  try {
+    resetHarnessRuntimeConfig();
+    const result = await configureHarnessRuntime();
+    assert.equal(result.ok, false);
+    assert.match(result.reason ?? '', /subscription|api03|Max\/Pro/i);
+  } finally {
+    clearClaudeVault();
+    if (prevMode === undefined) delete process.env.AUTH_MODE; else process.env.AUTH_MODE = prevMode;
+    resetHarnessRuntimeConfig();
+  }
+});
+
 // A token with no decodable JWT exp → shouldRefresh falls back to the
 // lastRefresh wall-clock heuristic. `undefined` accessToken hits that path too.
 const NO_EXP = undefined;
