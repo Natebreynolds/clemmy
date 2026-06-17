@@ -1309,6 +1309,41 @@ test('runConversation: a DECISION-level awaiting_approval (no SDK interrupt) SYN
   assert.equal((askEvents[0].data as { source?: string }).source, 'decision_awaiting_approval');
 });
 
+test('runConversation: done:true + awaiting_handoff_result WITH prior tool work surfaces an ask, NOT a silent re-loop (Step 2 dead-end fix)', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const runRunner: RunRunnerFn = async (runner, _agent, items, opts) => {
+    const ee = runner as unknown as EventEmitter;
+    const runContext = { context: opts.context };
+    // Real (non-probe) tool work this turn → toolCalls > 0, so the stall
+    // detectors do NOT fire (they only catch the ZERO-meaningful-tools case).
+    // This is EXACTLY the dead-end they miss — without the Step 2 handler it
+    // would fall through to CONTINUATION_INPUT and re-loop until a budget cap.
+    ee.emit('agent_start', runContext, { name: 'Orchestrator' });
+    ee.emit('agent_tool_start', runContext, { name: 'Orchestrator' }, { name: 'write_file' },
+      { toolCall: { callId: 'call_1', arguments: '{"path":"/tmp/x"}' } });
+    const decision = {
+      summary: 'wrote the file, now waiting on the executor',
+      reply: 'I prepared the changes — should I apply them or adjust first?',
+      done: true,
+      nextAction: 'awaiting_handoff_result',
+      reason: null,
+    };
+    ee.emit('agent_end', runContext, { name: 'Orchestrator' }, decision);
+    return { history: items, lastResponseId: undefined, finalOutput: decision };
+  };
+  const result = await runConversation({
+    agent: makeAgentStub(), sessionId: sess.id, input: 'apply the change', makeRunner: makeRunnerStub, runRunner,
+  });
+  assert.equal(result.status, 'awaiting_user_input', 'surfaces an ask instead of silently re-looping');
+  const asks = listEventsForConv(sess.id, { types: ['awaiting_user_input'] });
+  assert.equal(asks.length, 1, 'exactly one synthesized ask');
+  assert.equal((asks[0].data as { source?: string }).source, 'decision_awaiting_handoff_terminal');
+  assert.match((asks[0].data as { question: string }).question, /prepared the changes/);
+  // And it was NOT treated as a stall (no retry into the tool-only nudge).
+  assert.equal(listEventsForConv(sess.id, { types: ['stall_retry_attempted'] }).length, 0);
+});
+
 test('runConversation: a tool-driven ask (ask_user_question already emitted the event) is NOT double-emitted', async () => {
   resetEventLog();
   const sess = HarnessSession.create({ kind: 'chat' });

@@ -1186,6 +1186,15 @@ function stepProgressElevateEnabled(): boolean {
   return (process.env.CLEMMY_STEP_PROGRESS_ELEVATE ?? 'on').toLowerCase() !== 'off';
 }
 
+/** Gate-unification Step 2: a `done:true + awaiting_handoff_result` decision is
+ *  waiting on a retired hand-off and used to fall through to a silent re-loop
+ *  until a budget cap killed it (the one live dead-end the stall detectors miss).
+ *  Default-on: surface the result and ask the user instead. =off reverts to the
+ *  prior continue-loop behavior. */
+function handoffDeadEndFixEnabled(): boolean {
+  return (process.env.HARNESS_HANDOFF_DEADEND_FIX ?? 'on').toLowerCase() !== 'off';
+}
+
 /**
  * Pure: should a forward-progressing run auto-elevate its budget because it is
  * about to exhaust the STEP cap? Only fires on the capped `standard` preset with
@@ -2153,6 +2162,55 @@ async function runConversationCore(
       return {
         sessionId: options.sessionId,
         status: 'completed',
+        steps: stepIndex,
+        lastDecision: decision,
+        lastTurn,
+      };
+    }
+
+    // NEVER DEAD-END (gate-unification Step 2): a `done:true` turn whose
+    // nextAction is `awaiting_handoff_result` is waiting on the retired
+    // Orchestrator->Executor hand-off. The done-invariant downgrades it
+    // (doneStands=false) but it matches NO terminal handler above, so it used to
+    // fall through to the silent CONTINUATION_INPUT re-loop and hang until a
+    // budget cap killed it — and the stall detectors MISS it (they only fire on
+    // ZERO meaningful tools; the dangerous case has prior tool work). Give this
+    // enum value the one reading it should have: surface the result and ask the
+    // user, exactly like awaiting_user_input — so the run always has a forward
+    // path instead of a silent hang. (done:false keeps looping as before.)
+    if (
+      decision.done &&
+      decision.nextAction === 'awaiting_handoff_result' &&
+      handoffDeadEndFixEnabled()
+    ) {
+      const askedThisTurn = (() => {
+        try {
+          return listEvents(options.sessionId, { types: ['awaiting_user_input'] })
+            .some((e) => e.turn === turnResult.turn);
+        } catch { return false; }
+      })();
+      if (!askedThisTurn) {
+        const question = (decision.reply?.trim() ? decision.reply : decision.summary)
+          ?? 'I reached a point where I need your input to continue — how would you like me to proceed?';
+        safeAppend({
+          sessionId: options.sessionId,
+          turn: turnResult.turn,
+          role: 'Clem',
+          type: 'awaiting_user_input',
+          data: { question, source: 'decision_awaiting_handoff_terminal' },
+        });
+      }
+      const goalForHandoff = safeActiveGoal(options.sessionId);
+      if (goalForHandoff) {
+        safeAppendGoalLedger(
+          goalForHandoff.id,
+          'blocked',
+          (decision.reply?.trim() ? decision.reply : decision.summary) ?? 'awaiting a hand-off that no longer exists',
+        );
+      }
+      return {
+        sessionId: options.sessionId,
+        status: 'awaiting_user_input',
         steps: stepIndex,
         lastDecision: decision,
         lastTurn,
