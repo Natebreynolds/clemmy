@@ -32,7 +32,26 @@ test('G6: read-only / harmless commands still do NOT require approval (no over-g
     'firecrawl --version',
     'echo hello',
     'ls -la',
+    // Salesforce READS — `sf org display` prints org/token info, `sf data
+    // query` is a SOQL SELECT. Neither mutates. Regression for a read-only
+    // prospect pull (sf org display && sf data query) parking for approval
+    // because `sf org display` was lumped with the org mutations (2026-06-17).
+    'sf org display --json',
+    'sf org display --json && sf data query --json --query "SELECT Id, Name FROM Account WHERE Market_Leader__c = TRUE LIMIT 60"',
+    'sf data query --query "SELECT Id FROM Contact"',
   ]) {
     assert.equal(shellCommandNeedsApproval(cmd), false, `should NOT gate: ${cmd}`);
+  }
+});
+
+test('G6: Salesforce data/org MUTATIONS still require approval (no under-gating)', () => {
+  for (const cmd of [
+    'sf data update record --sobject Account --record-id 001 --values "Name=X"',
+    'sf data delete record --sobject Account --record-id 001',
+    'sf data import tree --files data.json',
+    'sf org login web',
+    'sf org delete scratch --target-org my-org',
+  ]) {
+    assert.equal(shellCommandNeedsApproval(cmd), true, `should gate: ${cmd}`);
   }
 });

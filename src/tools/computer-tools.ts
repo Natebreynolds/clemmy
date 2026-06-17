@@ -125,8 +125,12 @@ export function shellCommandNeedsApproval(rawCommand: unknown): boolean {
     // Docker / k8s mutations
     /(^|[\s;&|])docker\s+(run|rm|rmi|stop|start|kill|build|push|exec|cp|tag|commit|prune|system\s+prune)/,
     /(^|[\s;&|])kubectl\s+(apply|create|delete|edit|patch|replace|rollout|scale|cordon|drain|exec|cp|attach|debug|run)/,
-    // Salesforce CLI writes
-    /(^|[\s;&|])sf\s+(data\s+(update|insert|delete|upsert|import|tree)|org\s+(login|logout|create|delete|open|display|switch)|project\s+(deploy|retrieve|delete|generate)|deploy\b|alias\s+(set|unset))/,
+    // Salesforce CLI writes. NOTE: `sf org display` is a READ (it prints the
+    // connected-org details / access token) and `sf data query` is a READ
+    // (SOQL SELECT) — neither mutates, so they are deliberately NOT listed.
+    // Over-gating them parked read-only prospect pulls for approval (the
+    // `sf org display && sf data query` shape, observed 2026-06-17).
+    /(^|[\s;&|])sf\s+(data\s+(update|insert|delete|upsert|import|tree)|org\s+(login|logout|create|delete|switch)|project\s+(deploy|retrieve|delete|generate)|deploy\b|alias\s+(set|unset))/,
     // GitHub CLI mutations
     /(^|[\s;&|])gh\s+(repo\s+(create|delete|fork|clone|sync|edit|archive|rename|set-default)|pr\s+(create|close|merge|edit|review|comment|ready|reopen)|issue\s+(create|close|edit|comment|reopen|transfer|delete|pin|unpin)|release\s+(create|delete|edit|upload|download)|workflow\s+(run|disable|enable)|secret\s+(set|delete)|auth\s+(login|logout|refresh|token)|api\s+(post|put|patch|delete))/,
     // HTTP mutations
