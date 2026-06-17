@@ -44,7 +44,14 @@ export function FusionForm() {
   const brains = fusion.brainsAvailable;
   const bothPresent = brains.claude && brains.codex;
   const willDebateButCant = form.mode !== 'off' && !bothPresent;
-  const activeMode = MODES.find((m) => m.id === form.mode)!;
+  // Strategy-aware description (the mode sets WHEN; the strategy sets HOW).
+  const howItWorks = form.mode === 'off'
+    ? 'Single brain — no second model is consulted.'
+    : `${form.mode === 'high' ? 'On high-stakes turns, ' : 'On every turn, '}${
+        form.strategy === 'verify'
+          ? 'the executor (primary brain) drafts and the checker verifies/refines the answer (2 calls).'
+          : 'both flagships draft independently and a judge reconciles them (3 calls).'
+      }`;
 
   const save = async () => {
     setSaving(true); setError(null);
@@ -123,7 +130,7 @@ export function FusionForm() {
       </div>
 
       <div className="mb-4 rounded-lg border border-border bg-canvas p-3">
-        <p className="text-small text-muted"><span className="text-fg">How this works:</span> {activeMode.blurb}</p>
+        <p className="text-small text-muted"><span className="text-fg">How this works:</span> {howItWorks}</p>
         <ul className="mt-2 space-y-0.5 text-caption text-muted">
           <li>{brains.claude ? '🟢' : '⚪️'} Claude (Max/Pro) login → {brains.claude ? 'connected' : 'not connected'}</li>
           <li>{brains.codex ? '🟢' : '⚪️'} Codex login → {brains.codex ? 'connected' : 'not connected'}</li>
