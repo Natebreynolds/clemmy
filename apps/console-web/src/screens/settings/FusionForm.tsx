@@ -44,6 +44,10 @@ export function FusionForm() {
   const brains = fusion.brainsAvailable;
   const bothPresent = brains.claude && brains.codex;
   const willDebateButCant = form.mode !== 'off' && !bothPresent;
+  // In verify, the executor IS the primary brain; a judge == primary means the
+  // brain checks itself (no second opinion) — warn so it isn't set by accident.
+  const primaryBrainKind = form.brain === 'claude_oauth' ? 'claude' : 'codex';
+  const verifySelfCheck = form.mode !== 'off' && form.strategy === 'verify' && form.judge === primaryBrainKind;
   // Strategy-aware description (the mode sets WHEN; the strategy sets HOW).
   const howItWorks = form.mode === 'off'
     ? 'Single brain — no second model is consulted.'
@@ -55,15 +59,32 @@ export function FusionForm() {
 
   const save = async () => {
     setSaving(true); setError(null);
+    // Primary brain first (it preflights the Claude token and can 409 with a
+    // sign-in prompt). Keep the two calls' failures distinct so we never leave
+    // the brain switched while fusion silently didn't save.
     try {
-      // Primary brain first (it preflights the Claude token and may error with a
-      // sign-in prompt), then the live fusion mode/judge.
       await setActiveBrain(form.brain);
-      await patchFusion({ mode: form.mode, judge: form.judge, strategy: form.strategy });
+    } catch (err) {
+      const e = err as { status?: number; body?: { needsLogin?: boolean }; message?: string };
+      setError(
+        e?.body?.needsLogin || e?.status === 409
+          ? 'Switching to Claude needs a Claude Code (Max/Pro) login first — sign in under “Claude login” below, then Save again.'
+          : `Brain switch failed: ${e?.message ?? String(err)}`,
+      );
+      setSaving(false);
+      return;
+    }
+    try {
+      const res = await patchFusion({ mode: form.mode, judge: form.judge, strategy: form.strategy });
       setSaved(true);
+      // Resync from the authoritative server snapshot (it coerces values).
+      if (res?.fusion) {
+        setForm((f) => (f ? { ...f, mode: res.fusion.mode, judge: res.fusion.judge, strategy: res.fusion.strategy } : f));
+      }
       void qc.invalidateQueries({ queryKey: ['settings'] });
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      // Brain already switched — be explicit that fusion did NOT save.
+      setError(`Brain switched, but fusion mode/judge did NOT save: ${(err as Error)?.message ?? String(err)}. Click Save again.`);
     } finally {
       setSaving(false);
     }
@@ -143,6 +164,15 @@ export function FusionForm() {
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-warning" aria-hidden />
           <p className="text-caption text-muted">
             Fusion needs BOTH a Claude (Max/Pro) and a Codex login. Until the missing one is connected, Clementine runs single-brain on your primary — no error, just no debate.
+          </p>
+        </div>
+      )}
+
+      {verifySelfCheck && (
+        <div className="mb-4 flex items-start gap-2 rounded-lg border border-warning bg-warning-tint p-3">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-warning" aria-hidden />
+          <p className="text-caption text-muted">
+            In <span className="text-fg">verify</span>, the checker should be the <em>other</em> brain — right now the {primaryBrainKind === 'claude' ? 'Claude' : 'Codex'} primary would be checking its own work (no second opinion). Set Judge/checker to the other model.
           </p>
         </div>
       )}

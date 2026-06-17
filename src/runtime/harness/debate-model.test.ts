@@ -330,6 +330,55 @@ test('getStreamedResponse: judge failure PRE-content replays a surviving draft (
   });
 });
 
+test('fan-out worker scope is NOT fused — runs single-brain (no checker/judge, no budget burn)', async () => {
+  await withEnv({ CLEMMY_DEBATE_MODE: 'all', CLEMMY_FUSION_STRATEGY: 'verify' }, async () => {
+    let judged = 0;
+    const b = brains({
+      passthrough: model({ getResponse: async () => msg('WORKER-OUTPUT'), getStreamedResponse: async function* () {
+        yield { type: 'output_text_delta', delta: 'WORKER-OUTPUT' } as any;
+        yield { type: 'response_done', response: { output: [{ type: 'message', content: 'WORKER-OUTPUT' }] } } as any;
+      } }),
+      judge: model({ getResponse: async () => { judged++; return msg('X'); }, getStreamedResponse: async function* () { judged++; yield { type: 'response_done', response: { output: [] } } as any; } }),
+    });
+    const { harnessRunContextStorage } = await import('./brackets.js');
+    const evs = await harnessRunContextStorage.run(
+      { sessionId: 's', counter: {} as any, guardrailScopeId: 'worker-1' } as any,
+      () => collect(dm(b, { heartbeatMs: 0 }).getStreamedResponse(req())),
+    );
+    assert.equal(judged, 0, 'no checker/judge inside a worker scope');
+    assert.ok(evs.some((e) => e.type === 'output_text_delta' && e.delta === 'WORKER-OUTPUT'), 'worker ran single-brain');
+  });
+});
+
+test('debate: judge streams text but NO terminal response_done → one is synthesized (no SDK crash)', async () => {
+  await withEnv({ CLEMMY_DEBATE_MODE: 'all' }, async () => {
+    const b = brains({
+      judge: model({ getStreamedResponse: async function* () {
+        yield { type: 'output_text_delta', delta: 'ANSWER' } as any; // no response_done!
+      } }),
+    });
+    const evs = await collect(dm(b, { heartbeatMs: 0 }).getStreamedResponse(req()));
+    const dones: any[] = evs.filter((e) => e.type === 'response_done');
+    assert.equal(dones.length, 1, 'exactly one synthesized terminal response_done');
+    assert.ok(dones[0].response.id && typeof dones[0].response.usage.totalTokens === 'number', 'conformant');
+  });
+});
+
+test('verify: checker commits response_done (structured) then throws → NO duplicate response_done', async () => {
+  await withEnv({ CLEMMY_DEBATE_MODE: 'all', CLEMMY_FUSION_STRATEGY: 'verify' }, async () => {
+    const b = brains({
+      passthrough: model({ getResponse: async () => msg('DRAFT-PROSE') }),
+      judge: model({ getStreamedResponse: async function* () {
+        yield { type: 'response_done', response: { output: [{ type: 'message', content: 'FINAL' }] } } as any;
+        throw new Error('trailing error after committing the answer');
+      } }),
+    });
+    const got: any[] = [];
+    await assert.rejects(async () => { for await (const e of dm(b, { heartbeatMs: 0 }).getStreamedResponse(req())) got.push(e); });
+    assert.equal(got.filter((e) => e.type === 'response_done').length, 1, 'only the committed response_done — no draft-replay duplicate');
+  });
+});
+
 test('getStreamedResponse: judge failure AFTER content rethrows (cannot duplicate a partial stream)', async () => {
   await withEnv({ CLEMMY_DEBATE_MODE: 'all' }, async () => {
     const b = brains({

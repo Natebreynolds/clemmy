@@ -42,7 +42,7 @@ import { CodexModelProvider } from './codex-model.js';
 import { getStoredCodexOAuthTokens } from '../auth-store.js';
 import { getStoredClaudeTokens } from '../claude-oauth.js';
 import { harnessRunContextStorage } from './brackets.js';
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import pino from 'pino';
@@ -86,9 +86,11 @@ function draftGraceMs(): number {
   return Number.isFinite(raw) && raw >= 0 ? raw : 25000;
 }
 
-/** Max debated iterations per user MESSAGE. The model is resolved once per run
- *  (SDK #resolveModelForAgent), so the DebateModel instance persists across a
- *  message's loop iterations and this counter is a true per-message cap.
+/** Max debated iterations per user MESSAGE. The AUTHORITY is the per-turn WeakMap
+ *  keyed by the active ToolCallsCounter (see spendFusionSlot) — that survives
+ *  regardless of model-instance lifetime (the SDK may resolve the model per step,
+ *  not once per run, so a per-instance counter would under-count). The
+ *  per-instance counter is only a fallback when no harness ALS is present (tests).
  *
  *  WHY: debating EVERY loop iteration is the core cost blowup — a 10-iteration
  *  agentic turn = 10×(2 drafts + judge) ≈ 30 calls. The research is one-sided
@@ -128,6 +130,19 @@ function activeTurnKey(): object | undefined {
     return harnessRunContextStorage.getStore()?.counter as unknown as object | undefined;
   } catch {
     return undefined;
+  }
+}
+
+/** True inside a run_worker / fan-out sub-agent (the harness sets guardrailScopeId
+ *  ONLY for those). Fusion must skip workers: they ARE the delegated execution
+ *  (run on the executor brain), they don't produce the user-facing answer, and —
+ *  since they share the orchestrator's ToolCallsCounter — fusing them would burn
+ *  the per-message verify budget. So a worker turn always runs single-brain. */
+function isWorkerScope(): boolean {
+  try {
+    return harnessRunContextStorage.getStore()?.guardrailScopeId != null;
+  } catch {
+    return false;
   }
 }
 
@@ -243,7 +258,12 @@ export class DebateModel implements Model {
     return this.opts.heartbeatMs ?? heartbeatMs();
   }
   private get sleep(): (ms: number) => Promise<void> {
-    return this.opts.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+    // unref the keep-alive tick so the one timer that may dangle after a turn
+    // settles can never hold the process open (it resolves an ignored promise).
+    return this.opts.sleep ?? ((ms) => new Promise<void>((r) => {
+      const t = setTimeout(r, ms);
+      (t as { unref?: () => void }).unref?.();
+    }));
   }
 
   async getResponse(request: ModelRequest): Promise<ModelResponse> {
@@ -284,8 +304,9 @@ export class DebateModel implements Model {
   }
 
   async *getStreamedResponse(request: ModelRequest): AsyncIterable<StreamEvent> {
-    if (!shouldDebate(request)) {
-      // Not a debate turn (mode/stakes gate): forward the normal brain verbatim.
+    if (!shouldDebate(request) || isWorkerScope()) {
+      // Not a fused turn (mode/stakes gate, or a fan-out worker = delegated
+      // execution): forward the normal brain verbatim.
       yield* this.brains.passthrough.getStreamedResponse(request);
       return;
     }
@@ -320,7 +341,7 @@ export class DebateModel implements Model {
       }
       logger.warn('both debate drafts failed — streaming a single passthrough answer');
       recordDebateTrace({ path: 'stream', outcome: 'both-failed-passthrough' });
-      yield* dropResponseStarted(this.brains.passthrough.getStreamedResponse(request));
+      yield* forwardWithDoneBackstop(this.brains.passthrough.getStreamedResponse(request));
       return;
     }
 
@@ -333,24 +354,28 @@ export class DebateModel implements Model {
     let finalText = '';
     let judgeFinalOutput: unknown;
     let judgeYieldedContent = false;
+    let sawDone = false;
     try {
       for await (const ev of this.brains.judge.getStreamedResponse(buildJudgeRequest(request, a, b))) {
         const e = ev as { type?: string; delta?: string; response?: { output?: unknown } };
         if (e.type === 'response_started') continue;
         if (e.type === 'output_text_delta' && typeof e.delta === 'string') { finalText += e.delta; judgeYieldedContent = true; }
-        if (e.type === 'response_done' && e.response) judgeFinalOutput = e.response.output;
+        if (e.type === 'response_done') { sawDone = true; if (e.response) judgeFinalOutput = e.response.output; }
         yield ev;
       }
     } catch (err) {
-      // Judge failed. If nothing user-visible was committed yet, recover by
-      // replaying the stronger surviving draft (the response_started we already
-      // emitted is reused). If content already streamed, we can't cleanly recover.
-      if (judgeYieldedContent) throw err;
+      // Recover ONLY if nothing was committed — neither a text delta NOR a
+      // terminal response_done (a structured judge commits via response_done with
+      // no text, so gating on text alone would replay a duplicate response_done).
+      if (judgeYieldedContent || sawDone) throw err;
       logger.warn({ err: errText(err) }, 'debate judge stream failed pre-content — replaying the longer surviving draft');
       recordDebateTrace({ path: 'stream', outcome: 'judge-failed-draft-fallback', divergence: div });
       yield* streamResponseAsEvents(pickLongerDraft(a, b));
       return;
     }
+    // Guarantee a terminal response_done — a judge that streamed text but no done
+    // would otherwise crash the turn ("did not produce a final response").
+    if (!sawDone) yield* synthesizeTerminalDone(judgeFinalOutput, finalText);
     // FIX6: structured-output turns carry the answer in response_done.output, not
     // text deltas — fall back to that so the trace isn't under-reported.
     const finalForTrace = finalText || extractAssistantText(judgeFinalOutput);
@@ -466,7 +491,7 @@ export class DebateModel implements Model {
     if (!draft) {
       logger.warn('fusion verify: executor draft failed — checker streams the answer directly');
       recordDebateTrace({ path: 'verify', outcome: 'executor-failed' });
-      yield* dropResponseStarted(this.brains.judge.getStreamedResponse(request));
+      yield* forwardWithDoneBackstop(this.brains.judge.getStreamedResponse(request));
       return;
     }
 
@@ -482,22 +507,26 @@ export class DebateModel implements Model {
     let finalText = '';
     let checkerOutput: unknown;
     let checkerYieldedContent = false;
+    let sawDone = false;
     try {
       for await (const ev of this.brains.judge.getStreamedResponse(buildVerifyRequest(request, draft))) {
         const e = ev as { type?: string; delta?: string; response?: { output?: unknown } };
         if (e.type === 'response_started') continue;
         if (e.type === 'output_text_delta' && typeof e.delta === 'string') { finalText += e.delta; checkerYieldedContent = true; }
-        if (e.type === 'response_done' && e.response) checkerOutput = e.response.output;
+        if (e.type === 'response_done') { sawDone = true; if (e.response) checkerOutput = e.response.output; }
         yield ev;
       }
     } catch (err) {
-      // Checker failed pre-content → ship the executor's draft (SDK-conformant).
-      if (checkerYieldedContent) throw err;
+      // Recover (ship the executor draft) ONLY if nothing committed — no text AND
+      // no terminal response_done — else we'd emit a duplicate response_done.
+      if (checkerYieldedContent || sawDone) throw err;
       logger.warn({ err: errText(err) }, 'fusion verify: checker failed pre-content — shipping the executor draft');
       recordDebateTrace({ path: 'verify', n: this.debatesThisTurn, outcome: 'checker-failed-ship-draft' });
       yield* streamResponseAsEvents(draft);
       return;
     }
+    // Backstop a checker that streamed text but no terminal done.
+    if (!sawDone) yield* synthesizeTerminalDone(checkerOutput, finalText);
     const finalForTrace = finalText || extractAssistantText(checkerOutput);
     logger.info({ path: 'verify', n: this.debatesThisTurn, executorLen: da.length, finalLen: finalForTrace.length, judge: judgeChoice() }, 'fusion verify reconciled');
     recordDebateTrace({ path: 'verify', n: this.debatesThisTurn, judge: judgeChoice(), executor: capText(da), final: capText(finalForTrace) });
@@ -817,12 +846,41 @@ function pickLongerDraft(a: ModelResponse, b: ModelResponse): ModelResponse {
   return extractAssistantText(a.output).length >= extractAssistantText(b.output).length ? a : b;
 }
 
-/** Forward a stream but drop its response_started (we emit our own single one). */
-async function* dropResponseStarted(stream: AsyncIterable<StreamEvent>): AsyncGenerator<StreamEvent> {
+/** Emit ONE SDK-conformant terminal response_done — backstops a judge/checker
+ *  stream that ended WITHOUT one (else the SDK throws "Model did not produce a
+ *  final response" AFTER the user already saw streamed text). */
+export function* synthesizeTerminalDone(output: unknown, text: string): Generator<StreamEvent> {
+  const hasOutput = Array.isArray(output) && output.length > 0;
+  yield {
+    type: 'response_done',
+    response: {
+      id: 'debate-synth',
+      output: hasOutput
+        ? output
+        : text
+        ? [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text }] }]
+        : [],
+      usage: conformantUsage(undefined),
+    },
+  } as unknown as StreamEvent;
+}
+
+/** Forward a stream, dropping its response_started (we emit our own single one)
+ *  and GUARANTEEING a terminal response_done — synthesizes a conformant one if
+ *  the upstream ends without it. For the direct-forward paths (no draft to
+ *  recover): both-drafts-failed passthrough, and verify executor-failed. */
+async function* forwardWithDoneBackstop(stream: AsyncIterable<StreamEvent>): AsyncGenerator<StreamEvent> {
+  let sawDone = false;
+  let finalText = '';
+  let finalOutput: unknown;
   for await (const ev of stream) {
-    if ((ev as { type?: string }).type === 'response_started') continue;
+    const e = ev as { type?: string; delta?: string; response?: { output?: unknown } };
+    if (e.type === 'response_started') continue;
+    if (e.type === 'output_text_delta' && typeof e.delta === 'string') finalText += e.delta;
+    if (e.type === 'response_done') { sawDone = true; if (e.response) finalOutput = e.response.output; }
     yield ev;
   }
+  if (!sawDone) yield* synthesizeTerminalDone(finalOutput, finalText);
 }
 
 // ---------------------------------------------------------------------------
@@ -858,12 +916,24 @@ function debateTracePath(): string {
 
 /** Append one debate record as JSONL. Best-effort — tracing must NEVER affect a
  *  turn. Disabled under tests so the suite doesn't write to the real home. */
+const TRACE_MAX_BYTES = 2_000_000;
+const TRACE_KEEP_LINES = 400;
 function recordDebateTrace(rec: Record<string, unknown>): void {
   if (process.env.NODE_ENV === 'test') return;
   try {
     const p = debateTracePath();
     mkdirSync(path.dirname(p), { recursive: true });
     appendFileSync(p, `${JSON.stringify({ ts: new Date().toISOString(), ...rec })}\n`);
+    // Bound the file: when it crosses the cap, keep the last N rows. Stops
+    // unbounded growth and keeps readRecentDebateTraces' whole-file read cheap.
+    try {
+      if (statSync(p).size > TRACE_MAX_BYTES) {
+        const kept = readFileSync(p, 'utf-8').split('\n').filter(Boolean).slice(-TRACE_KEEP_LINES);
+        writeFileSync(p, `${kept.join('\n')}\n`);
+      }
+    } catch {
+      /* best-effort trim */
+    }
   } catch {
     /* best-effort */
   }
