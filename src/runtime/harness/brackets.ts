@@ -1299,33 +1299,16 @@ export function wrapToolForHarness<T extends WrappableTool>(
       try {
         fanoutNudge = await runBrackets(ctx?.sessionId ?? '', parsedInput);
       } catch (err) {
-        // MissingExecutionWrapError should land as a SOFT tool error
-        // — return the message string so the model sees it as the
-        // tool's output and can self-correct (call execution_create,
-        // then retry). Throwing here would terminate the run because
-        // our wrap is OUTSIDE the SDK's _invoke catch (which would
-        // have converted the throw via defaultToolErrorFunction).
-        // Same treatment for ToolGuardrailBlocked + the counter
-        // ToolCallsLimitExceeded so the model can recover instead of
-        // the harness exploding on a guardrail decision.
-        if (
-          err instanceof MissingExecutionWrapError ||
-          err instanceof ConfirmFirstRequiredError ||
-          err instanceof ToolGuardrailBlocked ||
-          err instanceof ToolCallsLimitExceeded ||
-          err instanceof GroundingCheckFailedError ||
-          err instanceof GoalFidelityCheckFailedError ||
-          err instanceof DuplicateExternalWriteError ||
-          err instanceof ImplicitDestinationError ||
-          err instanceof UnverifiedDestinationError
-        ) {
-          return `Tool call refused by harness: ${err instanceof Error ? err.message : String(err)}`;
-        }
-        // ToolGuardrailEscalated is NOT a soft error — it propagates so the
-        // turn ends (the model is stuck and can't recover by retrying).
-        // KillRequested + ToolTimeout + unknown errors propagate —
-        // these SHOULD abort the run (kill is user-requested abort;
-        // timeout means the underlying tool is genuinely stuck).
+        // A recoverable gate throw lands as a SOFT tool error — the model sees
+        // it as the tool's output and self-corrects. Throwing here would abort
+        // the run because our wrap is OUTSIDE the SDK's _invoke catch. The exact
+        // same disposition is applied on the legacy execute path below, via the
+        // shared softToolError() — so a gate's recoverability is the GATE's, not
+        // a function of which wrapper the tool happened to use (the crash class).
+        const soft = softToolError(err);
+        if (soft !== null) return soft;
+        // ToolGuardrailEscalated / KillRequested / ToolTimeout / unknown errors
+        // propagate — these SHOULD abort the run.
         throw err;
       }
       const invokeOnce = () => withTimeout(
@@ -1396,7 +1379,17 @@ export function wrapToolForHarness<T extends WrappableTool>(
   const originalExecute = tool.execute!;
   const wrappedExecute = async (input: unknown, runContext?: unknown): Promise<unknown> => {
     const ctx = harnessRunContextStorage.getStore();
-    const fanoutNudge = await runBrackets(ctx?.sessionId ?? '', input);
+    let fanoutNudge: string | undefined;
+    try {
+      fanoutNudge = await runBrackets(ctx?.sessionId ?? '', input);
+    } catch (err) {
+      // SAME disposition as wrappedInvoke above: a recoverable gate throw becomes
+      // a soft tool error here too (this path had NO try/catch, so a typed gate
+      // throw aborted the run purely because the tool used `execute` not `invoke`).
+      const soft = softToolError(err);
+      if (soft !== null) return soft;
+      throw err;
+    }
     const result = await withTimeout(
       (async () => originalExecute(input, runContext))(),
       timeoutMs,
@@ -1416,6 +1409,28 @@ export function wrapToolForHarness<T extends WrappableTool>(
     // stays — it's novel, not duplicative.
   };
   return { ...tool, execute: wrappedExecute };
+}
+
+/** A recoverable gate throw → the recovery string surfaced to the model as the
+ *  tool's own output (a SOFT tool error), or null when the error MUST propagate
+ *  and abort the run (escalation, kill, timeout, or an unknown bug). Shared by
+ *  BOTH wrapper paths (invoke + legacy execute) so a gate's recoverability is a
+ *  property of the gate, never of which wrapper a tool happens to use. */
+export function softToolError(err: unknown): string | null {
+  if (
+    err instanceof MissingExecutionWrapError ||
+    err instanceof ConfirmFirstRequiredError ||
+    err instanceof ToolGuardrailBlocked ||
+    err instanceof ToolCallsLimitExceeded ||
+    err instanceof GroundingCheckFailedError ||
+    err instanceof GoalFidelityCheckFailedError ||
+    err instanceof DuplicateExternalWriteError ||
+    err instanceof ImplicitDestinationError ||
+    err instanceof UnverifiedDestinationError
+  ) {
+    return `Tool call refused by harness: ${err instanceof Error ? err.message : String(err)}`;
+  }
+  return null;
 }
 
 /** Minimal shape for the SDK-built Tool with an invoke method.

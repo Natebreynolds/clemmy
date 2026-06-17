@@ -26,7 +26,6 @@ const {
   withHarnessRunContext,
   workerThrashGuardEnabled,
   ToolCallsCounter,
-  ToolGuardrailBlocked,
 } = await import('./brackets.js');
 
 test.after(() => {
@@ -84,7 +83,8 @@ test('runBrackets keys the guard by guardrailScopeId when set (plumbing)', async
   try {
     const counter = new ToolCallsCounter(1000);
     // write_file is mutating → its exact-args block is NOT demoted by applyMode,
-    // so the legacy execute path throws ToolGuardrailBlocked on the trip.
+    // so on the trip the wrapper surfaces a SOFT tool-error string (both wrapper
+    // paths share that disposition now — see softToolError).
     const wrapped = wrapToolForHarness({
       name: 'write_file',
       execute: async (_input: unknown) => 'ok',
@@ -109,11 +109,9 @@ test('runBrackets keys the guard by guardrailScopeId when set (plumbing)', async
       { sessionId: 'p2', counter },
       async () => {
         for (let i = 0; i < 4; i++) await wrapped.execute!({ path: 'a', content: 'same' });
-        await assert.rejects(
-          () => Promise.resolve(wrapped.execute!({ path: 'a', content: 'same' })),
-          (err: Error) => err instanceof ToolGuardrailBlocked,
-          'shared-key 5th identical mutating call must block',
-        );
+        const blocked = await wrapped.execute!({ path: 'a', content: 'same' });
+        assert.match(String(blocked), /Tool call refused by harness: tool-call guardrail/,
+          'shared-key 5th identical mutating call must block (soft tool error)');
       },
     );
   } finally {

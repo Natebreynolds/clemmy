@@ -39,6 +39,7 @@ const {
   wrapToolForHarness,
   withHarnessRunContext,
   harnessToolBracketsEnabled,
+  softToolError,
 } = await import('./brackets.js');
 
 test.after(() => {
@@ -48,6 +49,20 @@ test.after(() => {
     /* best effort */
   }
 });
+
+// Step 1 of the gate-unification: BOTH wrapper paths (invoke + legacy execute)
+// now surface a recoverable gate block as a soft tool-error STRING, not a throw.
+// These gate tests assert the block via the marker the message carries; re-raise
+// the soft string so their existing assert.rejects + /MARKER/ checks keep reading
+// the block. (The string-vs-throw disposition itself is the softToolError unit
+// test above; this just lets the gate-behavior tests stay focused on the gate.)
+async function raiseSoftRefusal<T>(p: T | Promise<T>): Promise<T> {
+  const v = await p;
+  if (typeof v === 'string' && v.startsWith('Tool call refused by harness:')) {
+    throw new Error(v);
+  }
+  return v;
+}
 
 test('harnessToolBracketsEnabled: DEFAULT-ON (keystone flip) with =off kill-switch', () => {
   const prev = process.env.HARNESS_TOOL_BRACKETS;
@@ -64,6 +79,18 @@ test('harnessToolBracketsEnabled: DEFAULT-ON (keystone flip) with =off kill-swit
     if (prev === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
     else process.env.HARNESS_TOOL_BRACKETS = prev;
   }
+});
+
+test('softToolError: a recoverable gate throw → soft string; escalation/unknown → null (propagate)', () => {
+  // Step 1 of the gate-unification: this shared helper is the SINGLE disposition
+  // for both the invoke and the legacy execute wrappers, so a gate throw can no
+  // longer crash the run purely because a tool used `execute` instead of `invoke`.
+  const soft = softToolError(new ToolCallsLimitExceeded(5));
+  assert.equal(typeof soft, 'string');
+  assert.match(soft as string, /Tool call refused by harness/);
+  // A plain Error (an unknown bug) and a generic non-Error MUST propagate.
+  assert.equal(softToolError(new Error('boom')), null);
+  assert.equal(softToolError({ statusCode: 500 }), null);
 });
 
 test('wrapToolForHarness: default-ON wraps the tool; =off returns it unchanged', () => {
@@ -317,13 +344,13 @@ test('wrapToolForHarness: pre-increment throws BEFORE execute when at limit', as
       { sessionId: 'test-session', counter },
       async () => {
         await assert.rejects(
-          () => wrapped.execute!({}),
-          (err: Error) => err instanceof ToolCallsLimitExceeded,
+          () => raiseSoftRefusal(wrapped.execute!({})),
+          (err: Error) => /exceeded the limit/.test(err.message),
         );
       },
     );
     // The crucial assertion — execute MUST NOT have run when the
-    // pre-increment check throws.
+    // pre-increment check blocks.
     assert.equal(executedTimes, 0);
   } finally {
     process.env.HARNESS_TOOL_BRACKETS = prev;
@@ -420,9 +447,9 @@ test('confirm-first gate: same-shape writes accrue across calls and the batch tr
     });
 
     const sendNo = (n: number) =>
-      withHarnessRunContext({ sessionId: sess.id, counter }, () =>
+      raiseSoftRefusal(withHarnessRunContext({ sessionId: sess.id, counter }, () =>
         wrapped.execute!({ tool_slug: 'GMAIL_SEND_EMAIL', arguments: JSON.stringify({ to: `person${n}@x.com` }) }),
-      );
+      ));
 
     // Writes 1..4 succeed. (The fan-out nudge may be appended from the 3rd
     // distinct call on — the gate's concern is only that the write PASSES.)
@@ -430,7 +457,7 @@ test('confirm-first gate: same-shape writes accrue across calls and the batch tr
       assert.ok(String(await sendNo(n)).startsWith('sent'), `write #${n} should pass below threshold`);
     }
     // Write #5 trips the batch gate — no instruction-reviewed plan scope.
-    await assert.rejects(async () => { await sendNo(5); }, (err: Error) => err instanceof ConfirmFirstRequiredError);
+    await assert.rejects(async () => { await sendNo(5); }, (err: Error) => /CONFIRM_FIRST_REQUIRED/.test(err.message));
 
     // Approving a plan opens a scope that covers the rest of the batch.
     openPlanScope({
@@ -443,7 +470,7 @@ test('confirm-first gate: same-shape writes accrue across calls and the batch tr
 
     // Closing the scope re-arms the gate.
     closePlanScope(sess.id, 'test');
-    await assert.rejects(async () => { await sendNo(6); }, (err: Error) => err instanceof ConfirmFirstRequiredError);
+    await assert.rejects(async () => { await sendNo(6); }, (err: Error) => /CONFIRM_FIRST_REQUIRED/.test(err.message));
   } finally {
     process.env.HARNESS_TOOL_BRACKETS = prevBrackets;
     process.env.CLEMMY_CONFIRM_FIRST = prevConfirm;
@@ -607,12 +634,12 @@ test('grounding gate: an irreversible send contradicting the target\'s own artif
       execute: async (_input: unknown) => 'sent',
     });
     const send = (subject: string) =>
-      withHarnessRunContext({ sessionId: sess.id, counter }, () =>
+      raiseSoftRefusal(withHarnessRunContext({ sessionId: sess.id, counter }, () =>
         wrapped.execute!({
           tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL',
           arguments: JSON.stringify({ to_email: 'cliff@eleylawfirm.com', subject, body: `${subject} body` }),
         }),
-      );
+      ));
     // 1. Corrupted payload (Houston) → soft-blocked with the discrepancy.
     await assert.rejects(() => Promise.resolve(send('Houston workers comp search')), (err: Error) => {
       assert.match(err.message, /GROUNDING_CHECK_FAILED/);
@@ -662,7 +689,7 @@ test('destination gate: a PROD ambient publish HARD-blocks every attempt until e
     const counter = new ToolCallsCounter(100);
     const wrapped = wrapToolForHarness({ name: 'run_shell_command', execute: async () => 'deployed' });
     const shell = (command: string) =>
-      withHarnessRunContext({ sessionId: sess.id, counter }, () => wrapped.execute!({ command }));
+      raiseSoftRefusal(withHarnessRunContext({ sessionId: sess.id, counter }, () => wrapped.execute!({ command })));
     const prodCmd = 'netlify deploy --dir "/x/site" --prod --json';
     // 1. PROD ambient publish → hard-blocked.
     await assert.rejects(() => Promise.resolve(shell(prodCmd)), (err: Error) => {
@@ -737,10 +764,10 @@ test('shell-send grounding: a curl POST with a contradicting payload soft-blocks
       execute: async (_input: unknown) => 'posted',
     });
     const post = (city: string) =>
-      withHarnessRunContext({ sessionId: sess.id, counter }, () =>
+      raiseSoftRefusal(withHarnessRunContext({ sessionId: sess.id, counter }, () =>
         wrapped.execute!({
           command: `curl -X POST https://api.example.com/send -d '{"to_email":"cliff@eleylawfirm.com","body":"${city} comp search gap"}'`,
-        }));
+        })));
     // Corrupted payload (Houston) → grounding soft-blocks the shell send.
     await assert.rejects(() => Promise.resolve(post('Houston')), (err: Error) => {
       assert.match(err.message, /GROUNDING_CHECK_FAILED/);
@@ -835,12 +862,12 @@ test('duplicate-target gate: a FAILED dispatch is netted out — the corrected r
       execute: async (_input: unknown) => nextResult,
     });
     const send = () =>
-      withHarnessRunContext({ sessionId: sess.id, counter }, () =>
+      raiseSoftRefusal(withHarnessRunContext({ sessionId: sess.id, counter }, () =>
         wrapped.execute!({
           tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL',
           arguments: JSON.stringify({ to_email: 'nathan@example.com', subject: 'Gate test', body: 'b' }),
         }),
-      );
+      ));
     const recordWrite = () => appendEvent({
       sessionId: sess.id, turn: 0, role: 'system', type: 'external_write',
       data: { shapeKey: 'OUTLOOK_OUTLOOK_SEND_EMAIL', toolName: 'composio_execute_tool', irreversible: true, count: 1, underScope: false, targets: ['nathan@example.com', 'example.com'] },
