@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { applyClaudeEnvelope, buildClaudeSystemBlocks, claudeWireDebugEnabled, logClaudeRequestShape, logClaudeResponseUsage } from './claude-model.js';
+import { applyClaudeEnvelope, buildClaudeSystemBlocks, claudeWireDebugEnabled, logClaudeRequestShape, logClaudeResponseUsage, hoistSystemMessagesIntoSystem } from './claude-model.js';
 import { resolveModelCapability, CACHE_BREAK_SENTINEL } from './model-wire-registry.js';
 
 const IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude.";
@@ -127,6 +127,65 @@ test('envelope (parity on): no sentinel -> cache the (large, stable) tools array
     assert.equal(parsed.system[0].text, IDENTITY);
     assert.equal(parsed.system[1].cache_control, undefined, 'short system not cached');
     assert.deepEqual(parsed.tools[parsed.tools.length - 1].cache_control, { type: 'ephemeral' });
+  });
+});
+
+// --- role:'system' message hoisting (valid on EVERY Claude model) ----------
+
+test('hoist: a trailing role:system message moves into system blocks and out of messages', () => {
+  const parsed: Record<string, unknown> = {
+    model: 'claude-sonnet-4-6',
+    system: [{ type: 'text', text: IDENTITY }],
+    messages: [
+      { role: 'user', content: 'capital of japan?' },
+      { role: 'system', content: 'Re-issue your decision as JSON.' },
+    ],
+  };
+  hoistSystemMessagesIntoSystem(parsed);
+  const msgs = parsed.messages as Array<Record<string, unknown>>;
+  assert.equal(msgs.length, 1, 'system message removed from messages');
+  assert.equal(msgs[0].role, 'user');
+  const sys = parsed.system as Array<Record<string, unknown>>;
+  assert.equal(sys[sys.length - 1].text, 'Re-issue your decision as JSON.', 'directive hoisted to system');
+  // no role:'system' anywhere in messages
+  assert.equal(JSON.stringify(msgs).includes('"system"'), false);
+});
+
+test('hoist: mid-conversation + array-content system messages are hoisted; no-op when none', () => {
+  const parsed: Record<string, unknown> = {
+    system: [{ type: 'text', text: IDENTITY }],
+    messages: [
+      { role: 'user', content: 'a' },
+      { role: 'system', content: [{ type: 'text', text: 'directive one' }] },
+      { role: 'assistant', content: 'b' },
+    ],
+  };
+  hoistSystemMessagesIntoSystem(parsed);
+  assert.deepEqual((parsed.messages as any[]).map((m) => m.role), ['user', 'assistant']);
+  assert.equal((parsed.system as any[]).pop().text, 'directive one');
+  // no-op
+  const clean: Record<string, unknown> = { system: [{ type: 'text', text: IDENTITY }], messages: [{ role: 'user', content: 'x' }] };
+  const before = JSON.stringify(clean);
+  hoistSystemMessagesIntoSystem(clean);
+  assert.equal(JSON.stringify(clean), before, 'no system messages -> unchanged');
+});
+
+test('envelope (parity on): a role:system message in the body is hoisted, never reaches messages', () => {
+  withParity('on', () => {
+    const { body } = applyClaudeEnvelope(
+      { body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        system: 'Be helpful.',
+        tools: [],
+        messages: [{ role: 'user', content: 'hi' }, { role: 'system', content: 'JSON only.' }],
+      }) },
+      TOKEN,
+    );
+    const parsed = JSON.parse(body as string);
+    assert.equal(parsed.messages.length, 1);
+    assert.equal(parsed.messages[0].role, 'user');
+    assert.equal(JSON.stringify(parsed.messages).includes('"role":"system"'), false, 'no system role on the wire');
+    assert.ok(JSON.stringify(parsed.system).includes('JSON only.'), 'directive lives in system');
   });
 });
 

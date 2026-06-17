@@ -118,6 +118,14 @@ export function applyClaudeEnvelope(
         // API (which would 400 / pollute the prompt).
         parsed.system = withIdentityPrefix(restoreLegacySystem(parsed.system));
       }
+      // Correctness (all models, independent of parity): Anthropic accepts a
+      // system prompt ONLY via the top-level `system` field — a role:'system'
+      // message inside `messages` is rejected by every Claude model EXCEPT Opus
+      // (verified: Opus 4.8 -> 200, Sonnet 4.6 -> 400 "role 'system' is not
+      // supported on this model"). The harness appends role:'system' directives
+      // to the turn input (valid for Codex/OpenAI), so hoist them into the system
+      // blocks here so the request is valid on EVERY Claude model, not just Opus.
+      hoistSystemMessagesIntoSystem(parsed);
       if (parsed.max_tokens == null) parsed.max_tokens = CLAUDE_DEFAULT_MAX_TOKENS;
       body = JSON.stringify(parsed);
     } catch {
@@ -125,6 +133,54 @@ export function applyClaudeEnvelope(
     }
   }
   return { headers, body };
+}
+
+/** Best-effort plain text from an Anthropic message `content` (string or an
+ *  array of text/content blocks). */
+function extractMessageText(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((c) => {
+        const p = c as { text?: unknown };
+        return typeof p?.text === 'string' ? p.text : '';
+      })
+      .join('\n')
+      .trim();
+  }
+  return '';
+}
+
+/**
+ * Move any `role:'system'` message out of `messages` and into the top-level
+ * `system` blocks (Anthropic's only valid place for a system prompt). The
+ * harness appends role:'system' directives to the turn input for the next model
+ * turn (a Codex/OpenAI-valid pattern); on the Anthropic wire those are invalid
+ * on every model but Opus. Mutates `parsed` in place; a no-op when there are no
+ * system messages.
+ */
+export function hoistSystemMessagesIntoSystem(parsed: Record<string, unknown>): void {
+  const messages = Array.isArray(parsed.messages) ? (parsed.messages as Array<Record<string, unknown>>) : null;
+  if (!messages || messages.length === 0) return;
+  const hoisted: string[] = [];
+  const kept: Array<Record<string, unknown>> = [];
+  for (const m of messages) {
+    if (m && m.role === 'system') {
+      const text = extractMessageText(m.content);
+      if (text) hoisted.push(text);
+    } else {
+      kept.push(m);
+    }
+  }
+  if (hoisted.length === 0) return;
+  const sys: Array<Record<string, unknown>> = Array.isArray(parsed.system)
+    ? (parsed.system as Array<Record<string, unknown>>)
+    : typeof parsed.system === 'string' && parsed.system
+      ? [{ type: 'text', text: parsed.system }]
+      : [];
+  for (const text of hoisted) sys.push({ type: 'text', text });
+  parsed.system = sys;
+  parsed.messages = kept;
 }
 
 /** Restore legacy instruction order / strip the cache-break sentinel from a
@@ -241,6 +297,9 @@ export function logClaudeRequestShape(body: BodyInit | null | undefined): void {
     const sysBreakpoints = sys.filter((b) => b?.cache_control).length;
     const toolBreakpoints = tools.filter((t) => t?.cache_control).length;
     const outputConfig = parsed.output_config as { effort?: unknown } | undefined;
+    const msgs = Array.isArray(parsed.messages) ? (parsed.messages as Array<Record<string, unknown>>) : [];
+    const roles = msgs.map((m) => String(m?.role ?? '?'));
+    const systemRoleIdxs = roles.map((r, i) => (r === 'system' ? i : -1)).filter((i) => i >= 0);
     logger.info(
       {
         kind: 'claude_wire_request',
@@ -251,6 +310,9 @@ export function logClaudeRequestShape(body: BodyInit | null | undefined): void {
         toolsCached: toolBreakpoints > 0,
         effort: outputConfig?.effort ?? null,
         sentinelLeaked: body.includes(CACHE_BREAK_SENTINEL),
+        messageCount: msgs.length,
+        roles: roles.join(','),
+        systemRoleInMessages: systemRoleIdxs,
       },
       '[claude-wire] outbound request shape',
     );
