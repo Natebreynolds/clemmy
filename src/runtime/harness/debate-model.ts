@@ -199,6 +199,12 @@ export interface DebateOptions {
   draftGraceMs?: number;
   /** Max debated iterations per message (0 = unlimited). */
   maxPerTurn?: number;
+  /** Fuse the NON-streamed getResponse path too. Default false: in the harness,
+   *  the user-facing orchestrator always STREAMS (getStreamedResponse), while
+   *  getResponse is internal sub-calls (memory consolidation, gates, judges) that
+   *  must NOT consume the fusion budget. Tests set this to exercise the logic
+   *  through getResponse. */
+  fuseNonStreamed?: boolean;
   /** Injected for deterministic tests. */
   sleep?: (ms: number) => Promise<void>;
 }
@@ -241,6 +247,11 @@ export class DebateModel implements Model {
   }
 
   async getResponse(request: ModelRequest): Promise<ModelResponse> {
+    // The user-facing orchestrator always streams; getResponse is internal
+    // sub-calls (memory consolidation, gates, judges) — never fuse them, or they
+    // burn the per-message budget before the real answer (observed live: the
+    // verify budget was spent on consolidation while the answer ran single-brain).
+    if (!this.opts.fuseNonStreamed) return this.brains.passthrough.getResponse(request);
     if (!shouldDebate(request)) return this.brains.passthrough.getResponse(request);
     if (fusionStrategy() === 'verify') return this.verifyResponse(request);
     if (!this.spendFusionSlot()) return this.brains.passthrough.getResponse(request);

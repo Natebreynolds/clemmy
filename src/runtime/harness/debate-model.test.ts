@@ -53,6 +53,11 @@ async function collect(it: AsyncIterable<unknown>): Promise<any[]> {
   for await (const e of it) o.push(e);
   return o;
 }
+// Tests exercise the fusion logic through getResponse, which in production is
+// reserved for internal sub-calls (no fusion). fuseNonStreamed enables it here.
+function dm(b: DebateBrains, opts: Record<string, unknown> = {}) {
+  return new DebateModel(b, { fuseNonStreamed: true, ...opts } as any);
+}
 const noSleep = () => Promise.resolve();
 
 function withEnv(env: Record<string, string | undefined>, fn: () => void | Promise<void>) {
@@ -101,7 +106,7 @@ test('getResponse: NOT a debate turn → passthrough only; drafts/judge untouche
       draftA: model({ getResponse: async () => { drafted++; return msg('A'); } }),
       draftB: model({ getResponse: async () => { drafted++; return msg('B'); } }),
     });
-    const res = await new DebateModel(b).getResponse(req());
+    const res = await dm(b).getResponse(req());
     assert.equal((res.output[0] as any).content, 'PASS');
     assert.equal(drafted, 0, 'no drafting on a non-debate turn');
   });
@@ -115,7 +120,7 @@ test('getResponse: debate turn → both brains draft, judge sees both drafts and
       draftB: model({ getResponse: async () => msg('CODEX-DRAFT') }),
       judge: model({ getResponse: async (r: any) => { judgeSystem = r.systemInstructions; return msg('FINAL'); } }),
     });
-    const res = await new DebateModel(b).getResponse(req());
+    const res = await dm(b).getResponse(req());
     assert.equal((res.output[0] as any).content, 'FINAL');
     assert.match(judgeSystem, /CLAUDE-DRAFT/);
     assert.match(judgeSystem, /CODEX-DRAFT/);
@@ -131,7 +136,7 @@ test('getResponse: one draft fails → fail open to the survivor (no judge)', as
       draftB: model({ getResponse: async () => msg('CODEX-SURVIVES') }),
       judge: model({ getResponse: async () => { judged++; return msg('FINAL'); } }),
     });
-    const res = await new DebateModel(b).getResponse(req());
+    const res = await dm(b).getResponse(req());
     assert.equal((res.output[0] as any).content, 'CODEX-SURVIVES');
     assert.equal(judged, 0, 'judge skipped — only one draft survived');
   });
@@ -146,7 +151,7 @@ test('getResponse: a HUNG draft does not hold the turn hostage — grace elapses
       judge: model({ getResponse: async () => { judged++; return msg('FINAL'); } }),
     });
     const t0 = Date.now();
-    const res = await new DebateModel(b, { draftGraceMs: 30 }).getResponse(req());
+    const res = await dm(b, { draftGraceMs: 30 }).getResponse(req());
     const elapsed = Date.now() - t0;
     assert.equal((res.output[0] as any).content, 'CODEX-FAST', 'fell open to the fast survivor');
     assert.equal(judged, 0, 'no judge — only one draft made the grace window');
@@ -161,7 +166,7 @@ test('getResponse: BOTH drafts fail → passthrough last resort', async () => {
       draftB: model({ getResponse: async () => { throw new Error('down'); } }),
       passthrough: model({ getResponse: async () => msg('LASTRESORT') }),
     });
-    const res = await new DebateModel(b).getResponse(req());
+    const res = await dm(b).getResponse(req());
     assert.equal((res.output[0] as any).content, 'LASTRESORT');
   });
 });
@@ -177,7 +182,7 @@ test('getStreamedResponse: non-debate turn forwards passthrough verbatim', async
         yield { type: 'response_done', response: { output: [{ type: 'message' }] } } as any;
       } }),
     });
-    const evs = await collect(new DebateModel(b).getStreamedResponse(req()));
+    const evs = await collect(dm(b).getStreamedResponse(req()));
     assert.ok(evs.some((e) => e.type === 'output_text_delta' && e.delta === 'PASSTHRU'));
     assert.equal(evs.filter((e) => e.type === 'response_started').length, 1);
   });
@@ -192,7 +197,7 @@ test('getStreamedResponse: debate streams the JUDGE; exactly one response_starte
         yield { type: 'response_done', response: { output: [{ type: 'message', content: 'RECONCILED' }] } } as any;
       } }),
     });
-    const evs = await collect(new DebateModel(b, { heartbeatMs: 0 }).getStreamedResponse(req()));
+    const evs = await collect(dm(b, { heartbeatMs: 0 }).getStreamedResponse(req()));
     assert.equal(evs.filter((e) => e.type === 'response_started').length, 1, 'one response_started total');
     const firstContentIdx = evs.findIndex((e) => e.type === 'output_text_delta');
     const startIdx = evs.findIndex((e) => e.type === 'response_started');
@@ -218,7 +223,7 @@ test('getStreamedResponse: slow drafting emits keep-alive frames (no committed c
     // Heartbeat every tick; sleep is immediate so ticks fire until the draft resolves.
     let ticks = 0;
     const sleep = async () => { ticks++; if (ticks === 3) resolveA(msg('A')); };
-    const evs = await collect(new DebateModel(b, { heartbeatMs: 1, sleep }).getStreamedResponse(req()));
+    const evs = await collect(dm(b, { heartbeatMs: 1, sleep }).getStreamedResponse(req()));
     const keepalives = evs.filter((e) => e.type === 'model' && e.event?.type === 'debate.keepalive');
     assert.ok(keepalives.length >= 1, 'at least one keep-alive while drafting');
     // Keep-alives never carry committed content.
@@ -288,7 +293,7 @@ test('getStreamedResponse survivor (fail-open) path emits a conformant response_
       draftA: model({ getResponse: async () => { throw new Error('down'); } }),
       draftB: model({ getResponse: async () => ({ output: [{ type: 'message', content: 'SURV' }], responseId: 'r1', usage: { inputTokens: 3, outputTokens: 2 } } as any) }),
     });
-    const evs = await collect(new DebateModel(b, { heartbeatMs: 0 }).getStreamedResponse(req()));
+    const evs = await collect(dm(b, { heartbeatMs: 0 }).getStreamedResponse(req()));
     const done: any = evs.find((e) => e.type === 'response_done');
     assert.ok(done && typeof done.response.id === 'string' && done.response.id.length > 0);
     assert.equal(typeof done.response.usage.totalTokens, 'number');
@@ -305,7 +310,7 @@ test('getResponse: judge failure falls back to the longer surviving draft', asyn
       draftB: model({ getResponse: async () => msg('A MUCH LONGER DRAFT ANSWER') }),
       judge: model({ getResponse: async () => { throw new Error('judge down'); } }),
     });
-    const res = await new DebateModel(b).getResponse(req());
+    const res = await dm(b).getResponse(req());
     assert.equal((res.output[0] as any).content, 'A MUCH LONGER DRAFT ANSWER', 'fell back to the longer draft');
   });
 });
@@ -317,7 +322,7 @@ test('getStreamedResponse: judge failure PRE-content replays a surviving draft (
       draftB: model({ getResponse: async () => msg('B') }),
       judge: model({ getStreamedResponse: async function* () { throw new Error('judge stream down'); } }),
     });
-    const evs = await collect(new DebateModel(b, { heartbeatMs: 0 }).getStreamedResponse(req()));
+    const evs = await collect(dm(b, { heartbeatMs: 0 }).getStreamedResponse(req()));
     assert.ok(evs.some((e) => e.type === 'output_text_delta' && e.delta === 'DRAFT-A-LONGER-ANSWER'));
     const done: any = evs.find((e) => e.type === 'response_done');
     assert.ok(done && done.response.id && typeof done.response.usage.totalTokens === 'number');
@@ -334,7 +339,7 @@ test('getStreamedResponse: judge failure AFTER content rethrows (cannot duplicat
       } }),
     });
     const got: any[] = [];
-    await assert.rejects(async () => { for await (const e of new DebateModel(b, { heartbeatMs: 0 }).getStreamedResponse(req())) got.push(e); });
+    await assert.rejects(async () => { for await (const e of dm(b, { heartbeatMs: 0 }).getStreamedResponse(req())) got.push(e); });
     assert.ok(got.some((e) => e.type === 'output_text_delta' && e.delta === 'partial'));
   });
 });
@@ -349,7 +354,7 @@ test('verify strategy: executor drafts, checker verifies → returns the checker
       passthrough: model({ getResponse: async () => { executorCalls += 1; return msg('CODEX-DRAFT'); } }),
       judge: model({ getResponse: async (r: any) => { checkerSawDraft = r.systemInstructions; return msg('CLAUDE-REFINED'); } }),
     });
-    const res = await new DebateModel(b).getResponse(req());
+    const res = await dm(b).getResponse(req());
     assert.equal((res.output[0] as any).content, 'CLAUDE-REFINED');
     assert.equal(executorCalls, 1, 'executor drafted exactly once (2 calls total, not 3)');
     assert.match(checkerSawDraft, /CODEX-DRAFT/, 'checker received the executor draft');
@@ -367,7 +372,7 @@ test('verify strategy (streamed): executor draft → checker streams refined; on
         yield { type: 'response_done', response: { output: [{ type: 'message', content: 'REFINED' }] } } as any;
       } }),
     });
-    const evs = await collect(new DebateModel(b, { heartbeatMs: 0 }).getStreamedResponse(req()));
+    const evs = await collect(dm(b, { heartbeatMs: 0 }).getStreamedResponse(req()));
     assert.equal(evs.filter((e) => e.type === 'response_started').length, 1);
     assert.ok(evs.some((e) => e.type === 'output_text_delta' && e.delta === 'REFINED'));
   });
@@ -385,7 +390,7 @@ test('verify strategy: tool-routing drafts ship as-is (no slot spent); the answe
       passthrough: model({ getResponse: async () => drafts[executorCall++] }),
       judge: model({ getResponse: async () => { checkerCalls += 1; return msg('CHECKED'); } }),
     });
-    const m = new DebateModel(b, { maxPerTurn: 1 }); // cap of ONE
+    const m = dm(b, { maxPerTurn: 1 }); // cap of ONE
     const r1 = await m.getResponse(req()); // tool-routing → ship as-is, no checker, no slot
     const r2 = await m.getResponse(req()); // answer → checked (the slot was preserved)
     assert.equal((r1.output[0] as any).type, 'function_call', 'tool-routing draft shipped as-is');
@@ -400,7 +405,7 @@ test('verify strategy: checker failure pre-content ships the executor draft (con
       passthrough: model({ getResponse: async () => ({ output: [{ type: 'message', content: 'CODEX-SOLO' }], responseId: 'r9', usage: { inputTokens: 1, outputTokens: 1 } } as any) }),
       judge: model({ getStreamedResponse: async function* () { throw new Error('checker down'); } }),
     });
-    const evs = await collect(new DebateModel(b, { heartbeatMs: 0 }).getStreamedResponse(req()));
+    const evs = await collect(dm(b, { heartbeatMs: 0 }).getStreamedResponse(req()));
     assert.ok(evs.some((e) => e.type === 'output_text_delta' && e.delta === 'CODEX-SOLO'), 'shipped the executor draft');
     const done: any = evs.find((e) => e.type === 'response_done');
     assert.ok(done && done.response.id && typeof done.response.usage.totalTokens === 'number');
@@ -418,7 +423,7 @@ test('per-message cap: debate runs at most maxPerTurn times across iterations, t
       passthrough: model({ getResponse: async () => { passthrough += 1; return msg('PASS'); } }),
     });
     // One DebateModel instance = one message (model resolved once per run).
-    const m = new DebateModel(b, { maxPerTurn: 2 });
+    const m = dm(b, { maxPerTurn: 2 });
     const r1 = await m.getResponse(req()); // debate 1
     const r2 = await m.getResponse(req()); // debate 2
     const r3 = await m.getResponse(req()); // cap hit → passthrough
@@ -436,7 +441,7 @@ test('per-message cap: maxPerTurn=0 means unlimited (legacy)', async () => {
   await withEnv({ CLEMMY_DEBATE_MODE: 'all' }, async () => {
     let drafts = 0;
     const b = brains({ draftA: model({ getResponse: async () => { drafts += 1; return msg('A'); } }) });
-    const m = new DebateModel(b, { maxPerTurn: 0 });
+    const m = dm(b, { maxPerTurn: 0 });
     await m.getResponse(req()); await m.getResponse(req()); await m.getResponse(req());
     assert.equal(drafts, 3, 'no cap → every iteration debates');
   });
@@ -449,7 +454,7 @@ test('draftBoth: the grace-losing (hung) draft is ABORTED, not left billing', as
       draftA: model({ getResponse: (r: any) => { hungSignal = r.signal; return new Promise<ModelResponse>(() => {}); } }),
       draftB: model({ getResponse: async () => msg('FAST') }),
     });
-    const res = await new DebateModel(b, { draftGraceMs: 20 }).getResponse(req());
+    const res = await dm(b, { draftGraceMs: 20 }).getResponse(req());
     assert.equal((res.output[0] as any).content, 'FAST', 'answered from the fast survivor');
     assert.ok(hungSignal, 'the hung draft received an abort signal');
     assert.equal(hungSignal!.aborted, true, 'the hung loser draft was aborted on grace timeout');
