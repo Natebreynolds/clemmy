@@ -88,6 +88,41 @@ test('a PRE-CONTENT stall is retried and self-heals when the retry streams (Clau
   assert.ok(Date.now() - started < 5_000, 'recovered promptly');
 });
 
+test('a superseded (stalled) attempt does NOT stream its late tokens into the live retry (no garble)', async () => {
+  // The race that produced garbled output ("importportance") on a recovered
+  // heavy Claude turn: the stalled attempt's stream delivers a late token RIGHT
+  // as the retry begins, and both fed the same onChunk → interleaved SSE.
+  let signalRetry!: () => void;
+  const retryStarted = new Promise<void>((r) => { signalRetry = r; });
+  const stale = {
+    history: [], lastResponseId: 'r0', finalOutput: { ok: false }, rawResponses: [],
+    completed: new Promise<void>(() => { /* abandoned — never completes */ }),
+    async *[Symbol.asyncIterator]() {
+      await retryStarted; // stay silent → pre-content stall → retry
+      yield { type: 'raw_model_stream_event', data: { type: 'output_text_delta', delta: 'STALE' } };
+      await new Promise(() => { /* hang: the abandoned stream */ });
+    },
+  };
+  const live = {
+    history: [], lastResponseId: 'r1', finalOutput: { ok: true }, rawResponses: [],
+    completed: Promise.resolve(),
+    async *[Symbol.asyncIterator]() {
+      signalRetry(); // release the stale stream's late token now, mid-retry
+      await new Promise((r) => setTimeout(r, 40)); // give STALE a chance to interleave
+      yield { type: 'raw_model_stream_event', data: { type: 'output_text_delta', delta: 'GOOD' } };
+    },
+  };
+  let call = 0;
+  const runner = { run: async () => (call++ === 0 ? stale : live) } as unknown as Runner;
+  const chunks: string[] = [];
+  const out = await __defaultRunRunner(
+    runner, {} as never, [],
+    { onChunk: (d: string) => { chunks.push(d); } } as never,
+  );
+  assert.deepEqual(out.finalOutput, { ok: true }, 'the live retry won');
+  assert.deepEqual(chunks, ['GOOD'], "the superseded attempt's late STALE token must be suppressed");
+});
+
 test('a pre-content stall that NEVER recovers still fails after exhausting retries', async () => {
   // Both attempts wedge → after the one retry, surface the transient stall.
   const wedged = () => makeStreamResult({ events: 0, hang: true });

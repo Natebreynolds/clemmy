@@ -4864,21 +4864,31 @@ const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
   // result is reassigned per attempt; the post-drain code reads the winner.
   let result!: Awaited<ReturnType<typeof run>>;
   let structuredOutputFailed = false;
+  // The id of the ACTIVE attempt. After a pre-content stall + retry, the
+  // abandoned stream keeps draining for a beat (its cancel isn't instant); if
+  // its late tokens reach the shared onChunk they INTERLEAVE with the live
+  // attempt's tokens in the user's SSE (observed as garbled output like
+  // "importportance" on a recovered heavy turn). Gating onChunk on this id —
+  // and capturing `result` per attempt — keeps a superseded stream silent.
+  let activeAttempt = 0;
   for (let attempt = 0; ; attempt += 1) {
+    activeAttempt = attempt;
     result = await run(agent, items, { ...opts, stream: true });
-    const iterable = Symbol.asyncIterator in (result as unknown as Record<symbol, unknown>);
+    const myResult = result;
+    const myAttempt = attempt;
+    const iterable = Symbol.asyncIterator in (myResult as unknown as Record<symbol, unknown>);
     let lastEventAt = Date.now();
     let yieldedContent = false;
     const drain = (async () => {
       if (iterable) {
-        for await (const event of result as unknown as AsyncIterable<unknown>) {
+        for await (const event of myResult as unknown as AsyncIterable<unknown>) {
           lastEventAt = Date.now();
           const ev = event as { type?: string; data?: { type?: string; delta?: string } };
           // Content or tool activity flips us past the pre-content window.
           if (ev.type === 'run_item_stream_event' || (ev.type === 'raw_model_stream_event' && ev.data?.type === 'output_text_delta')) {
             yieldedContent = true;
           }
-          if (onChunk && ev.type === 'raw_model_stream_event' && ev.data?.type === 'output_text_delta' && typeof ev.data.delta === 'string') {
+          if (onChunk && myAttempt === activeAttempt && ev.type === 'raw_model_stream_event' && ev.data?.type === 'output_text_delta' && typeof ev.data.delta === 'string') {
             try {
               await onChunk(ev.data.delta);
             } catch {
@@ -4887,7 +4897,7 @@ const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
           }
         }
       }
-      await result.completed;
+      await myResult.completed;
     })();
     let stallTimer: ReturnType<typeof setInterval> | undefined;
     const watchdog = new Promise<never>((_, reject) => {
@@ -4899,7 +4909,7 @@ const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
           if (stallTimer) clearInterval(stallTimer);
           // Best-effort: release the underlying stream so the dangling
           // request doesn't pin sockets after we abandon the turn.
-          try { (result as unknown as { cancel?: () => void }).cancel?.(); } catch { /* best-effort */ }
+          try { (myResult as unknown as { cancel?: () => void }).cancel?.(); } catch { /* best-effort */ }
           reject(new ModelStreamStalledError(Math.round(win / 1000), !yieldedContent));
         }
       }, tickMs);
