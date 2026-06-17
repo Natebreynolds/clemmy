@@ -16,6 +16,7 @@ const {
   debateMode,
   shouldDebate,
   buildJudgeRequest,
+  buildVerifyRequest,
   summarizeOutput,
   heartbeatsUntil,
   streamResponseAsEvents,
@@ -268,6 +269,24 @@ test('buildJudgeRequest: preserves tools/modelSettings, appends both drafts to s
   assert.match(jr.systemInstructions, /BASE/, 'original system kept');
   assert.match(jr.systemInstructions, /DRAFT-A/);
   assert.match(jr.systemInstructions, /DRAFT-B/);
+});
+
+test('buildVerifyRequest / buildJudgeRequest DISABLE extended thinking (effort=none + strips a pre-set anthropic.effort)', () => {
+  // The checker inheriting the turn effort turned on Claude extended thinking,
+  // which corrupted its structured output (thinking bled into the reply). Both
+  // builders must force no-thinking.
+  const r = req({
+    modelSettings: {
+      temperature: 0.3,
+      reasoning: { effort: 'high' },
+      providerData: { providerOptions: { anthropic: { effort: 'high' } } },
+    },
+  });
+  for (const built of [buildVerifyRequest(r, msg('D')) as any, buildJudgeRequest(r, msg('A'), msg('B')) as any]) {
+    assert.equal(built.modelSettings.reasoning.effort, 'none', 'reasoning effort forced to none');
+    assert.equal(built.modelSettings.providerData.providerOptions.anthropic.effort, undefined, 'pre-translated anthropic effort stripped');
+    assert.equal(built.modelSettings.temperature, 0.3, 'other modelSettings preserved');
+  }
 });
 
 test('summarizeOutput: renders message text and proposed tool calls', () => {

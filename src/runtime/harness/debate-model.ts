@@ -777,6 +777,32 @@ const JUDGE_PREAMBLE = [
   'execute, so dropping one silently loses focus hygiene or a learned fact.',
 ].join(' ');
 
+/** Disable extended thinking on a checker/judge request. The fusion checker
+ *  inherits the TURN's reasoning effort, which on a thinking-capable Claude (Opus,
+ *  thinkingMode:'effort') turns ON extended thinking. LIVE FAILURE 2026-06-17:
+ *  Claude's extended thinking + STRUCTURED output corrupt each other through the
+ *  aisdk adapter — the thinking bleeds into the decision's `reply` field, producing
+ *  garbled, reasoning-leaking text (the executor's Codex draft was clean; the
+ *  Claude refinement mangled it: "et I The AI search-angdata … #ocus … rfirst").
+ *  A verify/reconcile pass does not need extended thinking, so force effort='none'
+ *  (ANTHROPIC_EFFORT_MAP maps 'none' -> null -> no anthropic effort) AND strip any
+ *  already-translated providerOptions.anthropic.effort. */
+function withThinkingDisabled(request: ModelRequest): ModelRequest {
+  const ms = ((request as { modelSettings?: Record<string, unknown> }).modelSettings ?? {}) as Record<string, unknown>;
+  const pd = (ms.providerData ?? {}) as Record<string, unknown>;
+  const po = (pd.providerOptions ?? {}) as Record<string, unknown>;
+  const anthropic = { ...((po.anthropic ?? {}) as Record<string, unknown>) };
+  delete anthropic.effort;
+  return {
+    ...request,
+    modelSettings: {
+      ...ms,
+      reasoning: { ...((ms.reasoning ?? {}) as Record<string, unknown>), effort: 'none' },
+      providerData: { ...pd, providerOptions: { ...po, anthropic } },
+    },
+  } as ModelRequest;
+}
+
 /** Build the judge's request: the original request UNCHANGED (tools, modelSettings,
  *  outputType/handoffs all preserved so structured output + tool use still work),
  *  with the two drafts appended to the system instructions as text. Augmenting the
@@ -804,7 +830,7 @@ export function buildJudgeRequest(request: ModelRequest, a: ModelResponse, b: Mo
     draftB || '(empty)',
     '=== END DEBATE DRAFTS ===',
   ].join('\n');
-  return { ...request, systemInstructions: block } as ModelRequest;
+  return withThinkingDisabled({ ...request, systemInstructions: block } as ModelRequest);
 }
 
 const VERIFY_PREAMBLE = [
@@ -833,7 +859,7 @@ export function buildVerifyRequest(request: ModelRequest, draft: ModelResponse):
     summarizeOutput(draft.output) || '(empty)',
     '=== END DRAFT ===',
   ].join('\n');
-  return { ...request, systemInstructions: block } as ModelRequest;
+  return withThinkingDisabled({ ...request, systemInstructions: block } as ModelRequest);
 }
 
 /** Render a draft's output items into compact text for the judge to weigh. */
