@@ -162,6 +162,25 @@ test('getStreamedResponse: a streamed empty completion is retried (no content co
   assert.ok(events.some((e: any) => e.type === 'output_text_delta'));
 });
 
+test('getStreamedResponse: reasoning + tool-call frames stream THROUGH immediately (no starvation before text)', async () => {
+  // A tool-only / thinking-heavy turn produces NO text delta — these events must
+  // reach the Runner as they arrive so the loop's stall watchdog sees activity.
+  const inner = makeModel({
+    getStreamedResponse: async function* () {
+      yield { type: 'response_started' } as any;
+      yield { type: 'model', event: { type: 'reasoning-delta', delta: 'thinking…' } } as any;
+      yield { type: 'model', event: { type: 'tool-call', toolName: 'sf_query' } } as any;
+      yield { type: 'response_done', response: { output: [{ type: 'function_call' }] } } as any;
+    },
+  });
+  const events = await collect(withResilience(inner, policy()).getStreamedResponse(req()));
+  assert.deepEqual(
+    (events as any[]).map((e) => e.type),
+    ['response_started', 'model', 'model', 'response_done'],
+    'start frame flushed before the first real part; reasoning + tool events not withheld',
+  );
+});
+
 test('getStreamedResponse: a PERSISTENT streamed empty completion throws (never yields a clean empty done)', async () => {
   let calls = 0;
   let yieldedDone = false;

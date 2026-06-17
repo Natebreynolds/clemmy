@@ -24,12 +24,13 @@
  * surface. We wrap exactly the brains that LACK these concerns, so the next brain
  * (DeepSeek/MiniMax) inherits parity for free — fixing the general CLASS.
  *
- * Streaming retry-safety (the proven Codex rule): the ONLY event that commits us
- * (makes a retry unsafe) is `output_text_delta` — user-visible streamed text.
- * Everything else (response_started, reasoning/metadata passthrough, and even
- * tool-call frames, which don't execute until the turn finishes) is buffered and
- * discarded-on-retry. So any transient failure BEFORE the first text delta — the
- * dominant Anthropic case (429/529 thrown at stream open) — retries cleanly.
+ * Streaming retry-safety: events are streamed to the Runner AS THEY ARRIVE so the
+ * loop's stream-stall watchdog and the user see the model working (buffering them
+ * until the first text delta starved the watchdog into a false stall on long
+ * thinking / tool-only turns). We may retry only while NOTHING real has been
+ * yielded yet — the dominant Anthropic failure (429/529 thrown at stream open,
+ * before any event) retries cleanly; a failure after the first real part is
+ * surfaced, not retried (it can't be replayed without duplicating Runner state).
  */
 import type { Model, ModelRequest, ModelResponse } from '@openai/agents-core';
 import type { StreamEvent } from '@openai/agents-core/types';
@@ -257,39 +258,44 @@ export class ResilientModel implements Model {
     const authRefreshed = { value: false };
 
     for (let attempt = 0; ; attempt++) {
-      // Buffer non-committing events; the ONLY committing event is a
-      // user-visible text delta. Everything else (start, reasoning/metadata,
-      // tool-call frames that haven't executed) is safe to discard on retry.
-      const buffer: StreamEvent[] = [];
-      let committed = false;
-      let sawTextDelta = false;
+      // Stream events to the Runner AS THEY ARRIVE so the loop's stream-stall
+      // watchdog — and the user — sees the model working. Reasoning + tool-call
+      // frames on a long operational turn can span well past the stall window,
+      // so withholding every non-text event until the first TEXT delta (the old
+      // behavior) STARVED the watchdog into a false "stream stalled" and hid the
+      // model's progress (a tool-only turn yielded nothing at all until the end).
+      // Retry-safety instead rests on ONE rule: we may retry only while NOTHING
+      // real has been yielded yet. The single buffered frame is response_started,
+      // held just long enough to discard cleanly on a pre-content blip / empty
+      // completion.
+      let startEvent: StreamEvent | undefined;
+      let committed = false; // a REAL part (reasoning / tool-call / text) was yielded
       let sawDone = false;
       let doneEmpty = false;
 
       try {
         for await (const ev of this.inner.getStreamedResponse(req)) {
           const e = ev as { type?: string; response?: { output?: unknown[] } };
-          if (e.type === 'output_text_delta') {
-            // First user-visible content: flush buffer in order, then commit.
-            if (!committed) { yield* drain(buffer); committed = true; }
-            sawTextDelta = true;
-            yield ev;
+          if (e.type === 'response_started') {
+            if (committed) yield ev; else startEvent = ev; // hold the lone start frame
             continue;
           }
           if (e.type === 'response_done') {
             sawDone = true;
-            doneEmpty = !sawTextDelta && (!Array.isArray(e.response?.output) || e.response!.output!.length === 0);
-            // An empty completion before any commit is a retryable blip — bail
-            // out of the loop WITHOUT yielding (regardless of remaining budget)
-            // so the post-loop handler retries OR throws, never fabricating a
-            // clean empty turn (the always-an-output invariant).
-            if (doneEmpty && !committed) break;
-            if (!committed) { yield* drain(buffer); committed = true; }
+            const emptyOutput = !Array.isArray(e.response?.output) || e.response!.output!.length === 0;
+            doneEmpty = !committed && emptyOutput;
+            // Empty completion before any real content — bail WITHOUT yielding so
+            // the post-loop handler retries OR throws (never a clean empty turn).
+            if (doneEmpty) break;
+            if (!committed) { if (startEvent) { yield startEvent; startEvent = undefined; } committed = true; }
             yield ev;
             continue;
           }
-          // Non-committing: forward if we've already committed, else buffer.
-          if (committed) yield ev; else buffer.push(ev);
+          // The first REAL part commits us (the Runner now holds live output, so a
+          // retry would duplicate it). Flush the buffered start frame in order,
+          // then stream this and every later event straight through.
+          if (!committed) { if (startEvent) { yield startEvent; startEvent = undefined; } committed = true; }
+          yield ev;
         }
       } catch (err) {
         if (committed) throw err; // user already saw text — cannot safely retry
@@ -334,11 +340,6 @@ export class ResilientModel implements Model {
       return; // committed + drained, or done emitted
     }
   }
-}
-
-function* drain(buffer: StreamEvent[]): Generator<StreamEvent> {
-  for (const ev of buffer) yield ev;
-  buffer.length = 0;
 }
 
 /** Wrap any SDK Model with the provider-agnostic resilience + translation layer. */
