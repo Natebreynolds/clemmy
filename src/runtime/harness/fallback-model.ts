@@ -23,9 +23,25 @@ import type { Model, ModelRequest, ModelResponse } from '@openai/agents-core';
 import type { StreamEvent } from '@openai/agents-core/types';
 import { BoundaryError } from '../boundary-error.js';
 import { classifyModelError } from './resilient-model.js';
+import { getRuntimeEnv } from '../../config.js';
 import pino from 'pino';
 
 const logger = pino({ name: 'clementine.fallback-model' });
+
+/**
+ * TEST KNOB: pretend the first N brains in the chain are OVERLOADED so the
+ * fallback fires deterministically (a real 529 can't be forced). DOUBLE-GATED —
+ * only honored under NODE_ENV=test OR CLEMMY_DEV_OVERRIDES=1, so production can
+ * never trip it. `CLEMMY_FORCE_CLAUDE_OVERLOAD=1` skips Opus -> Sonnet answers;
+ * `=2` skips Opus+Sonnet -> Codex answers.
+ */
+export function forcedOverloadDepth(): number {
+  const raw = (getRuntimeEnv('CLEMMY_FORCE_CLAUDE_OVERLOAD', '') || '').trim().toLowerCase();
+  if (!raw || raw === 'off' || raw === '0') return 0;
+  if (process.env.NODE_ENV !== 'test' && (getRuntimeEnv('CLEMMY_DEV_OVERRIDES', '') || '') !== '1') return 0;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 1; // '1'/'on'/'true' => depth 1
+}
 
 export interface FallbackTarget {
   label: string;
@@ -45,7 +61,12 @@ export class FallbackModel implements Model {
   constructor(private readonly chain: FallbackTarget[]) {}
 
   async getResponse(request: ModelRequest): Promise<ModelResponse> {
+    const forced = forcedOverloadDepth();
     for (let i = 0; i < this.chain.length; i++) {
+      if (i < forced && i < this.chain.length - 1) {
+        logger.warn({ forced: true, from: this.chain[i].label, to: this.chain[i + 1].label }, 'FORCED overload (test knob) — falling back to the next brain');
+        continue;
+      }
       try {
         return await this.chain[i].getModel().getResponse(request);
       } catch (err) {
@@ -61,7 +82,12 @@ export class FallbackModel implements Model {
   }
 
   async *getStreamedResponse(request: ModelRequest): AsyncIterable<StreamEvent> {
+    const forced = forcedOverloadDepth();
     for (let i = 0; i < this.chain.length; i++) {
+      if (i < forced && i < this.chain.length - 1) {
+        logger.warn({ forced: true, from: this.chain[i].label, to: this.chain[i + 1].label }, 'FORCED overload (test knob) — falling back to the next brain');
+        continue;
+      }
       let yieldedAny = false;
       try {
         for await (const ev of this.chain[i].getModel().getStreamedResponse(request)) {

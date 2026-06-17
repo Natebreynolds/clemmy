@@ -67,6 +67,25 @@ test('getStreamedResponse: overload before any yield falls back and streams the 
   assert.ok((events as any[]).some((e) => e.type === 'output_text_delta' && e.delta === 'sonnet says hi'));
 });
 
+test('force-overload knob (dev-gated) skips the primary so the next brain answers', async () => {
+  const prevDev = process.env.CLEMMY_DEV_OVERRIDES;
+  const prevForce = process.env.CLEMMY_FORCE_CLAUDE_OVERLOAD;
+  process.env.CLEMMY_DEV_OVERRIDES = '1';
+  process.env.CLEMMY_FORCE_CLAUDE_OVERLOAD = '1';
+  try {
+    let opusCalls = 0, sonnetCalls = 0;
+    const opus = model({ getResponse: async () => { opusCalls++; return resp('opus'); } });
+    const sonnet = model({ getResponse: async () => { sonnetCalls++; return resp('sonnet'); } });
+    const res = await withModelFallback([target('opus', opus), target('sonnet', sonnet)]).getResponse(req());
+    assert.equal(opusCalls, 0, 'force knob skipped the primary');
+    assert.equal(sonnetCalls, 1);
+    assert.equal((res.output[0] as any).content, 'sonnet');
+  } finally {
+    if (prevDev === undefined) delete process.env.CLEMMY_DEV_OVERRIDES; else process.env.CLEMMY_DEV_OVERRIDES = prevDev;
+    if (prevForce === undefined) delete process.env.CLEMMY_FORCE_CLAUDE_OVERLOAD; else process.env.CLEMMY_FORCE_CLAUDE_OVERLOAD = prevForce;
+  }
+});
+
 test('getStreamedResponse: overload AFTER content yielded does NOT fall back (would duplicate)', async () => {
   let sonnetCalls = 0;
   const opus = model({ getStreamedResponse: async function* () {
