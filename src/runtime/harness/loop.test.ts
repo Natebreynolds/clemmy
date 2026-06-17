@@ -63,7 +63,7 @@ import { Agent, RunContext, RunState, type AgentInputItem, type Runner } from '@
 
 const { resetEventLog, requestKill, listEvents, createSession, appendEvent } = await import('./eventlog.js');
 const { HarnessSession } = await import('./session.js');
-const { runTurn, runConversation, resumePendingApproval, runConversationFromResume, isCodexAuthRevoked } = await import('./loop.js');
+const { runTurn, runConversation, resumePendingApproval, runConversationFromResume, isCodexAuthRevoked, normalizeError } = await import('./loop.js');
 type RunRunnerFn = import('./loop.js').RunRunnerFn;
 const { ToolCallsLimitExceeded } = await import('./brackets.js');
 const { listEvents: listEventsForConv } = await import('./eventlog.js');
@@ -122,6 +122,24 @@ function makeApprovalRunStateWithInterruptions(
 
 const COMPLEX_INPUT =
   'Pull my unread Outlook emails and the open Salesforce leads, then update each Airtable contact record and draft outreach for the warm ones';
+
+test('normalizeError: a non-Error object never renders as "[object Object]" (the run_failed crash)', () => {
+  // The exact class that produced "Something went wrong: [object Object]": a raw
+  // provider error envelope thrown late in a model stream.
+  assert.equal(normalizeError({ statusCode: 529 }), 'error (status 529)');
+  assert.equal(normalizeError({ message: 'overloaded' }), 'overloaded');
+  assert.equal(normalizeError({ error: 'rate limited' }), 'rate limited');
+  assert.equal(normalizeError({ reason: 'upstream blip' }), 'upstream blip');
+  // A bare object with no known field → JSON, never "[object Object]".
+  assert.equal(normalizeError({ foo: 'bar' }), '{"foo":"bar"}');
+  // Real Errors keep their message; primitives stringify normally.
+  assert.equal(normalizeError(new Error('boom')), 'boom');
+  assert.equal(normalizeError('plain string'), 'plain string');
+  // The headline invariant: nothing the helper returns is the literal garbage.
+  for (const v of [{ statusCode: 529 }, { a: 1 }, {}, null, undefined]) {
+    assert.notEqual(normalizeError(v), '[object Object]');
+  }
+});
 
 test('dynamic reasoning effort: real runTurn injects effort per turn (simple→none; interactive chat caps complex at medium)', async () => {
   // Exercises the ACTUAL loop.ts injection (not a hand-port). The explicit-flag
@@ -968,7 +986,9 @@ test('generic run error emits run_failed and marks the session failed', async ()
   const sess = HarnessSession.create({ kind: 'chat' });
 
   const runRunner: RunRunnerFn = async () => {
-    throw new Error('network exploded');
+    // A genuinely non-transient error (no transport/HTTP-status signal) — must
+    // still terminate as 'failed', NOT get routed to the retry prompt.
+    throw new Error('unexpected null in planner output');
   };
 
   const result = await runTurn({
@@ -980,12 +1000,41 @@ test('generic run error emits run_failed and marks the session failed', async ()
   });
 
   assert.equal(result.status, 'failed');
-  assert.match(result.error ?? '', /network exploded/);
+  assert.match(result.error ?? '', /unexpected null/);
   const failed = listEvents(sess.id, { types: ['run_failed'] });
   assert.equal(failed.length, 1);
-  assert.match(String(failed[0].data.error), /network exploded/);
+  assert.match(String(failed[0].data.error), /unexpected null/);
   const reloaded = HarnessSession.load(sess.id);
   assert.equal(reloaded!.sessionRow.status, 'failed');
+});
+
+test('a NON-Error transient throw (the [object Object] class) becomes a retry prompt, not a crash', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+
+  const runRunner: RunRunnerFn = async () => {
+    // Exactly the failure that produced "Something went wrong: [object Object]":
+    // a raw provider envelope (NOT an Error) thrown late in the stream.
+    throw { statusCode: 529, message: 'Overloaded' };
+  };
+
+  const result = await runTurn({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'do thing',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  // Fix 2: a transient infra error offers retry/switch/stop instead of dying.
+  assert.equal(result.status, 'awaiting_user_input');
+  // Fix 1: whatever is surfaced is READABLE — never the literal "[object Object]".
+  assert.ok(!/\[object Object\]/.test(result.error ?? ''), 'error must be readable, not [object Object]');
+  const failed = listEvents(sess.id, { types: ['run_failed'] });
+  assert.equal(failed.length, 0, 'a recoverable transient error does NOT emit a terminal run_failed');
+  const awaiting = listEvents(sess.id, { types: ['awaiting_user_input'] });
+  assert.equal(awaiting.length, 1);
+  assert.match(String((awaiting[0].data as { question?: string }).question ?? ''), /retry/i);
 });
 
 test('throws when sessionId does not exist', async () => {
@@ -1361,6 +1410,45 @@ test('honest-completion: the live RESUME path (runConversationFromResume) also g
   });
   assert.equal(result.status, 'awaiting_user_input', 'resume blocked reply must not bank completed');
   assert.equal(listEvents(sess.id, { types: ['conversation_completed'] }).at(-1)!.data.delivered, false);
+});
+
+test('resume path: narration-deferral in a continuation turn is force-corrected (was an UNGUARDED path)', async () => {
+  // Audit 2026-06-16, headline gap: runConversationFromResumeCore never called
+  // evaluateStructuredDecisionStall, so EVERY stall detector (narration-deferral,
+  // zero-tool false-completion) was bypassed the moment a user approved an action.
+  // A post-approval continuation turn that narration-defers (awaiting_handoff_result,
+  // zero tools) must now be force-corrected in the resume path too.
+  resetEventLog();
+  const agent = new Agent({ name: 'ResumeDeferralTest', instructions: 'test' });
+  const sess = HarnessSession.create({ kind: 'chat', title: 'resume-deferral' });
+  sess.saveInterruptState(makeApprovalRunStateWithInterruptions(agent, [{
+    toolName: 'composio_execute_tool', callId: 'c1', argumentsJson: JSON.stringify({ tool_slug: 'X', arguments: '{}' }),
+  }]));
+  approvalRegistry.register({ sessionId: sess.id, subject: 'the pull', tool: 'composio_execute_tool', args: {} });
+  let i = 0;
+  const scripted: unknown[] = [
+    // #1 the approved turn resumes; not done yet → drives the continuation loop.
+    { done: false, nextAction: 'awaiting_handoff_result', reply: 'Approved — continuing.', summary: 'resumed after approval', reason: null },
+    // #2 CONTINUATION narration-deferral with zero tools — must be caught in the resume path.
+    { done: false, nextAction: 'awaiting_handoff_result', reply: 'On it — running the pull now. One sec.', summary: 'about to pull', reason: null },
+    // #3 forced retry → clean completion (neutral reply that trips no detector).
+    { done: true, nextAction: 'completed', reply: 'Here are the 12 records.', summary: 'Returned the records.', reason: null },
+  ];
+  const runRunner: RunRunnerFn = async (_r, _a, items) => {
+    const o = scripted[i] ?? scripted[scripted.length - 1]; i += 1;
+    return { history: items, lastResponseId: undefined, finalOutput: o };
+  };
+  const result = await runConversationFromResume({
+    agent, sessionId: sess.id, decision: 'approve', resolver: 'unit-test',
+    makeRunner: makeRunnerStub, runRunner,
+  });
+  const stuck = listEvents(sess.id, { types: ['stuck_detected'] });
+  assert.ok(stuck.length >= 1, 'resume continuation narration-deferral must be caught');
+  assert.equal((stuck[0].data as { kind: string }).kind, 'structured_narration_deferral');
+  const resumeRetry = listEvents(sess.id, { types: ['stall_retry_attempted'] })
+    .filter((e) => (e.data as { path?: string }).path === 'resume');
+  assert.ok(resumeRetry.length >= 1, 'a resume-path stall retry fired');
+  assert.equal(result.status, 'completed');
 });
 
 test('honest-completion: kill-switch off leaves blocked text completing (byte-identical)', async () => {
@@ -2340,6 +2428,169 @@ test('runConversation: structured awaiting_handoff_result tool-runtime stall is 
   assert.equal((stuckEvents[0].data as { nextAction: string }).nextAction, 'awaiting_handoff_result');
   const retryEvents = listEventsForConv(sess.id, { types: ['stall_retry_attempted'] });
   assert.equal(retryEvents.length, 1);
+});
+
+test('runConversation: narration-deferral (awaiting_handoff_result + 0 tools, no "unavailable" text) is force-corrected', async () => {
+  // Live repro sess-mqhj058j (2026-06-16): user asked to pull 25 Salesforce
+  // accounts (one `sf data query`). Claude replied "On it. Running the Market
+  // Leader pull now — I'll pull 25." with done:false, nextAction:
+  // awaiting_handoff_result, and ZERO tool calls — promising imminent action and
+  // deferring to a phantom executor. The text does NOT claim tools are
+  // unavailable, so the old detectors missed it and the loop auto-continued into
+  // another narration turn. The narration-deferral guard must catch it and force
+  // the actual tool action on the retry.
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  let scriptIndex = 0;
+  const scripted: unknown[] = [
+    {
+      summary: 'User confirmed criteria; proceeding to query Salesforce for 25 stale accounts',
+      reply: 'On it. Running the Market Leader pull now — your owned accounts, no activity >15 days. I\'ll pull 25.',
+      done: false,
+      nextAction: 'awaiting_handoff_result',
+      reason: 'Next step is querying Salesforce via the sf CLI.',
+    },
+    {
+      summary: 'Ran sf data query and returned the 25 accounts.',
+      reply: 'Pulled 25 accounts. Here they are: …',
+      done: true,
+      nextAction: 'completed',
+      reason: null,
+    },
+  ];
+  const runRunner: RunRunnerFn = async (_r, _a, items) => {
+    const output = scripted[scriptIndex] ?? scripted[scripted.length - 1];
+    scriptIndex += 1;
+    return { history: items, lastResponseId: undefined, finalOutput: output };
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'pull me 25 accounts from salesforce I have not contacted in 15 days',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(result.status, 'completed');
+  const stuckEvents = listEventsForConv(sess.id, { types: ['stuck_detected'] });
+  assert.equal(stuckEvents.length, 1);
+  assert.equal((stuckEvents[0].data as { kind: string }).kind, 'structured_narration_deferral');
+  assert.equal((stuckEvents[0].data as { nextAction: string }).nextAction, 'awaiting_handoff_result');
+  const retryEvents = listEventsForConv(sess.id, { types: ['stall_retry_attempted'] });
+  assert.equal(retryEvents.length, 1);
+});
+
+test('runConversation: discover-then-defer (only tool_choice_recall/local_cli_list, no execution) is force-corrected', async () => {
+  // Companion to the narration-deferral repro: turn 4 of sess-mqhj058j did ONLY
+  // discovery (tool_choice_recall ×2 + local_cli_list) and then deferred again
+  // with awaiting_handoff_result. Discovery-ritual tools are probes, so a
+  // probe-only turn that defers is still the deferral anti-pattern and must be
+  // force-corrected, not rewarded with a bland auto-continue.
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  let scriptIndex = 0;
+  const scripted: unknown[] = [
+    {
+      summary: 'Querying Salesforce via sf CLI for 25 owned market-leader accounts',
+      reply: 'Pulling them now.',
+      done: false,
+      nextAction: 'awaiting_handoff_result',
+      reason: 'Running the confirmed pull.',
+    },
+    {
+      summary: 'Returned the account list after retry.',
+      reply: 'Here are the 25 accounts: Acme, Globex, Initech, and 22 more.',
+      done: true,
+      nextAction: 'completed',
+      reason: null,
+    },
+  ];
+  const runRunner: RunRunnerFn = async (runner, _a, items) => {
+    const output = scripted[scriptIndex] ?? scripted[scripted.length - 1];
+    scriptIndex += 1;
+    if (scriptIndex === 1) {
+      // Discovery-only turn: two probe-classified discovery calls, no execution.
+      for (const tool of ['tool_choice_recall', 'local_cli_list']) {
+        (runner as unknown as EventEmitter).emit('agent_tool_start');
+        appendEvent({
+          sessionId: sess.id,
+          turn: 1,
+          role: 'Clem',
+          type: 'tool_called',
+          data: { tool, callId: `call_${tool}`, arguments: '{}' },
+        });
+      }
+    }
+    return { history: items, lastResponseId: undefined, finalOutput: output };
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'continue the pull',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(result.status, 'completed');
+  const stuckEvents = listEventsForConv(sess.id, { types: ['stuck_detected'] });
+  assert.equal(stuckEvents.length, 1);
+  assert.equal((stuckEvents[0].data as { kind: string }).kind, 'structured_narration_deferral');
+  assert.equal((stuckEvents[0].data as { onlyProbeTools: boolean }).onlyProbeTools, true);
+});
+
+test('runConversation: SILENT narration-deferral (awaiting_handoff_result, all text empty, 0 tools) is caught', async () => {
+  // Audit 2026-06-16: the empty-`combined` early return in evaluateStructuredDecisionStall
+  // fired BEFORE the narration-deferral check, so a wordless hold turn
+  // ({nextAction:awaiting_handoff_result, reply:null, summary:'   '}) escaped into a
+  // bland auto-continue. The silent-defer guard now catches it before the early return.
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  let i = 0;
+  const scripted: unknown[] = [
+    { summary: '   ', reply: null, reason: null, done: false, nextAction: 'awaiting_handoff_result' },
+    { summary: 'Returned the records.', reply: 'Here are the 12 records.', done: true, nextAction: 'completed', reason: null },
+  ];
+  const runRunner: RunRunnerFn = async (_r, _a, items) => {
+    const o = scripted[i] ?? scripted[scripted.length - 1]; i += 1;
+    return { history: items, lastResponseId: undefined, finalOutput: o };
+  };
+  const result = await runConversation({
+    agent: makeAgentStub(), sessionId: sess.id, input: 'pull it',
+    makeRunner: makeRunnerStub, runRunner,
+  });
+  assert.equal(result.status, 'completed');
+  const stuck = listEventsForConv(sess.id, { types: ['stuck_detected'] });
+  assert.equal(stuck.length, 1);
+  assert.equal((stuck[0].data as { kind: string }).kind, 'structured_narration_deferral');
+  assert.equal((stuck[0].data as { silent?: boolean }).silent, true);
+});
+
+test('runConversation: zero-tool ABANDONED claim with announcement is force-corrected (was bypassing the judge)', async () => {
+  // Audit 2026-06-16: a bare "searched everywhere, abandoning" + zero tools banked as a
+  // clean terminal WITHOUT the objective judge (which only runs on nextAction:completed)
+  // or any blocked-text check. The zero-tool-claim branch now also fires on `abandoned`.
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  let i = 0;
+  const scripted: unknown[] = [
+    { summary: 'Could not find it; abandoning.', reply: 'I searched everywhere and am abandoning this — it is impossible to find.', done: true, nextAction: 'abandoned', reason: null },
+    { summary: 'Returned the records.', reply: 'Here are the 12 records.', done: true, nextAction: 'completed', reason: null },
+  ];
+  const runRunner: RunRunnerFn = async (_r, _a, items) => {
+    const o = scripted[i] ?? scripted[scripted.length - 1]; i += 1;
+    return { history: items, lastResponseId: undefined, finalOutput: o };
+  };
+  const result = await runConversation({
+    agent: makeAgentStub(), sessionId: sess.id, input: 'find the record',
+    makeRunner: makeRunnerStub, runRunner,
+  });
+  assert.equal(result.status, 'completed');
+  const stuck = listEventsForConv(sess.id, { types: ['stuck_detected'] });
+  assert.equal(stuck.length, 1);
+  assert.equal((stuck[0].data as { kind: string }).kind, 'structured_zero_tool_claim');
+  assert.equal((stuck[0].data as { nextAction: string }).nextAction, 'abandoned');
 });
 
 test('runConversation: structured abandoned tool-unavailable decision is retried', async () => {

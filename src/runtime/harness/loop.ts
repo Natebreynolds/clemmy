@@ -60,6 +60,7 @@ import { actionBus } from '../action-bus.js';
 import { addNotification } from '../notifications.js';
 import { classifyCodexAuthError, markCodexAuthDead, isCodexAuthDead } from '../auth-store.js';
 import { BoundaryError } from '../boundary-error.js';
+import { classifyModelError } from './resilient-model.js';
 import { getRuntimeEnv } from '../../config.js';
 import { captureInteractionSignals } from '../../memory/auto-capture.js';
 import { primeTurnRecallVector, searchFactsByText } from '../../memory/facts.js';
@@ -85,7 +86,7 @@ function safeAppend(input: AppendEventInput): void {
       type: input.type,
       sessionId: input.sessionId,
       turn: input.turn,
-      err: err instanceof Error ? err.message : String(err),
+      err: normalizeError(err),
     });
   }
 }
@@ -274,7 +275,7 @@ function registerAndEmitApprovals(
       // want to fail the whole approval pause on a registry write.
       console.error('[harness] approval-registry.register failed (continuing without ID)', {
         sessionId: options.sessionId,
-        error: err instanceof Error ? err.message : String(err),
+        error: normalizeError(err),
       });
     }
     if (approvalId) approvalIds.push(approvalId);
@@ -387,7 +388,7 @@ function openScopedApprovalForApprovedBatch(
       sessionId,
       allowedTools: [...allowedTools],
       allowedComposioSlugs: [...allowedComposioSlugs],
-      error: err instanceof Error ? err.message : String(err),
+      error: normalizeError(err),
     });
   }
 }
@@ -406,7 +407,7 @@ function resolveSnapshotApprovalsForResume(
       console.error('[harness] approval-registry.resolve failed during resume', {
         approvalId: row.approvalId,
         sessionId: row.sessionId,
-        error: err instanceof Error ? err.message : String(err),
+        error: normalizeError(err),
       });
     }
   }
@@ -3265,7 +3266,7 @@ export async function resumePendingApproval(
   try {
     state = await RunState.fromString(options.agent, blob);
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
+    const message = normalizeError(err);
     safeAppend({
       sessionId: options.sessionId,
       turn,
@@ -3608,6 +3609,15 @@ async function runConversationFromResumeCore(opts: {
 
   let lastDecision: OrchestratorDecisionShape | undefined;
   let lastTurn = 0;
+  // Stall protection for the continuation loop. The main runConversation loop
+  // runs evaluateStructuredDecisionStall after every turn (line ~1379); this
+  // resume continuation loop is a SEPARATE execution path that historically had
+  // NONE — so after an approval, a narration-deferral / zero-tool false-completion
+  // turn was rewarded with a bland CONTINUATION_INPUT nudge instead of being
+  // force-corrected (audit 2026-06-16). `resumeContinuationInput` is normally the
+  // bland nudge but gets overridden with the stall-forcing message on a hit.
+  let stallRetriesUsed = 0;
+  let resumeContinuationInput = CONTINUATION_INPUT;
 
   // Step 1: resume the paused approval.
   const firstResult = await resumePendingApproval({
@@ -3872,7 +3882,7 @@ async function runConversationFromResumeCore(opts: {
     const turnResult = await runTurn({
       agent: opts.agent,
       sessionId: opts.sessionId,
-      input: CONTINUATION_INPUT,
+      input: resumeContinuationInput,
       maxTurns,
       toolCallsPerTurn,
       makeRunner: opts.makeRunner,
@@ -3899,6 +3909,49 @@ async function runConversationFromResumeCore(opts: {
       type: 'conversation_step',
       data: { step: stepIndex, decision: decision ?? null },
     });
+    // Stall detection for the resume continuation (parity with the main loop at
+    // ~1379). A narration-deferral / zero-tool false-completion turn must be
+    // force-corrected, not rewarded with the bland nudge. The detected decision
+    // is non-terminal (a terminal done/awaiting decision is handled at the top of
+    // the next iteration and returns before reaching runTurn), so overriding the
+    // NEXT continuation input is what reaches the model.
+    const resumeStall = decision
+      ? evaluateStructuredDecisionStall({
+          decision,
+          toolCalls: turnResult.toolCalls ?? 0,
+          sessionId: opts.sessionId,
+          turn: turnResult.turn,
+        })
+      : undefined;
+    if (resumeStall && stallRetriesUsed < MAX_STALL_RETRIES) {
+      stallRetriesUsed += 1;
+      safeAppend({
+        sessionId: opts.sessionId,
+        turn: turnResult.turn,
+        role: 'system',
+        type: 'stuck_detected',
+        data: { signal: resumeStall.signal, ...resumeStall.detail },
+      });
+      safeAppend({
+        sessionId: opts.sessionId,
+        turn: turnResult.turn,
+        role: 'system',
+        type: 'stall_retry_attempted',
+        data: {
+          signal: resumeStall.signal,
+          attempt: stallRetriesUsed,
+          maxRetries: MAX_STALL_RETRIES,
+          rawOutput: resumeStall.rawOutput,
+          path: 'resume',
+        },
+      });
+      const backoffMs = STALL_RETRY_BACKOFF_MS[stallRetriesUsed - 1] ?? 1000;
+      if (backoffMs > 0) await new Promise((resolve) => setTimeout(resolve, backoffMs));
+      resumeContinuationInput =
+        `${buildStallRetryMessage(opts.sessionId, resumeStall)} The tool surface is available in this run; do not ask the user to resend a tool-enabled message. Pick the needed local, shell, web, memory, or external-service tool and call it now.`;
+    } else {
+      resumeContinuationInput = CONTINUATION_INPUT;
+    }
   }
 
   safeAppend({
@@ -4109,16 +4162,38 @@ function handleRunError(
           options: ['Retry', 'Switch approach', 'Stop'],
           source: 'infra_error_recovery',
           boundaryKind: 'tool.timeout',
-          operatorMessage: clip(err instanceof Error ? err.message : String(err), 400),
+          operatorMessage: clip(normalizeError(err), 400),
           retry_context: retryContext,
         },
       });
       bumpTurnNumber(sessionId, turn);
-      return { sessionId, turn, status: 'awaiting_user_input', error: err instanceof Error ? err.message : String(err) };
+      return { sessionId, turn, status: 'awaiting_user_input', error: normalizeError(err) };
     }
   }
 
-  const message = err instanceof Error ? err.message : String(err);
+  const message = normalizeError(err);
+
+  // A raw provider error thrown LATE in a model stream (after content was
+  // committed, so resilient-model re-throws it raw) arrives here as a plain
+  // object — NOT a BoundaryError — and used to dead-end at the terminal
+  // run_failed below ("Something went wrong: [object Object]"). If it classifies
+  // as a transient infra failure (429/529/5xx/timeout), wrap it as a BoundaryError
+  // so the SAME ask-user "retry / switch / stop" recovery fires — turning a
+  // crash into a recoverable prompt. Best-effort; a non-transient/unknown error
+  // falls through to the normalized (now readable) terminal run_failed.
+  if (!(err instanceof BoundaryError)) {
+    try {
+      const cls = classifyModelError(err);
+      const transientModelKinds = new Set(['model.overloaded', 'model.rate_limited', 'model.http_5xx', 'model.transport_timeout']);
+      if (cls.retryable && transientModelKinds.has(cls.kind)) {
+        err = BoundaryError.from(err, {
+          kind: cls.kind,
+          retryable: true,
+          userMessage: `The model backend hit a transient error (${cls.kind.replace('model.', '')}).`,
+        });
+      }
+    } catch { /* classification is best-effort — fall through to normal handling */ }
+  }
 
   // v0.5.19 Bug C fix — Codex 5xx / SSE truncation / MCP unavailable
   // surfaced as silent `run_failed`. The session died and the user
@@ -4134,6 +4209,12 @@ function handleRunError(
       'codex.wall_clock',
       'codex.transport_timeout',
       'mcp.server_unavailable',
+      // Provider-agnostic model boundary (Claude / BYO) transient failures —
+      // the late-stream-throw class that produced the [object Object] dead-end.
+      'model.overloaded',
+      'model.rate_limited',
+      'model.http_5xx',
+      'model.transport_timeout',
     ]);
     const askUserEnabled =
       (getRuntimeEnv('HARNESS_INFRA_ASK_USER', 'on') ?? 'on').toLowerCase() !== 'off';
@@ -4259,6 +4340,33 @@ function nextTurnNumber(row: SessionRow): number {
   return (typeof t === 'number' ? t : 0) + 1;
 }
 
+/** Turn ANY thrown value into a readable message. The codebase historically did
+ *  `normalizeError(err)` at every error→string
+ *  boundary, which renders a NON-Error object — e.g. a raw provider error
+ *  envelope ({statusCode:529}) thrown late in a model stream — as the useless
+ *  literal "[object Object]". That string got persisted into the run_failed event
+ *  and shown to the user verbatim ("Something went wrong: [object Object]").
+ *  Extract a message from a plain object before falling back to String(). Single
+ *  helper so every boundary (and the workflow-runner twin) shares one fix. */
+export function normalizeError(err: unknown): string {
+  if (err instanceof Error) return err.message || err.name || 'Error';
+  if (err && typeof err === 'object') {
+    const o = err as Record<string, unknown>;
+    const m = o.message ?? o.error ?? o.reason ?? o.detail ?? o.statusText;
+    if (typeof m === 'string' && m.trim()) return m;
+    const status = o.statusCode ?? o.status ?? o.code;
+    if (status != null) return `error (status ${String(status)})`;
+    try {
+      const j = JSON.stringify(err);
+      if (j && j !== '{}' && j !== 'null') return j;
+    } catch { /* circular → fall through */ }
+    // An object with nothing readable — return a safe fallback, NEVER String(err)
+    // (which is the "[object Object]" we're here to eliminate).
+    return 'unknown error';
+  }
+  return String(err);
+}
+
 function clip(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, max)}…[+${text.length - max} chars]`;
 }
@@ -4309,7 +4417,7 @@ const STALL_OUTPUT_PATTERN = /^(continuing|ok|okay|done|sure|got it|working on i
 //
 // Boundary anchors (\b) prevent substring matches; the Unicode-
 // apostrophe class catches curly quotes models love to emit.
-const STALL_ANNOUNCEMENT_PATTERN = /\b(I[\u2018\u2019\u02bc' ]?ll\s|let me\s|executing\s|fetching\s|running\s|pulling\s|querying\s|about to\s|going to\s|on the way|in progress|kicking off|starting now|handed off\s|handing off\s|completed the\s|sent the\s|updated the\s|searched\s|pulled the\s|posted the\s|created the\s|drafted the\s|saved the\s|loaded the\s|fetched\s|queried\s|ran the\s|transferred to\s|transferring to\s|routed to\s|routing to\s|dispatched the\s|dispatching the\s|delegated to\s|delegating to\s|kicked off\s|invoked the\s|invoking the\s|launched the\s|launching the\s|triggered the\s|triggering the\s|forwarded to\s|forwarding to\s)/i;
+const STALL_ANNOUNCEMENT_PATTERN = /\b(I[\u2018\u2019\u02bc' ]?ll\s|let me\s|executing\s|fetching\s|running\s|pulling\s|querying\s|checking\s|retrieving\s|processing\s|attempting\s|trying\s|configuring\s|preparing\s|setting up\s|about to\s|going to\s|on the way|in progress|kicking off|starting now|handed off\s|handing off\s|completed the\s|sent the\s|updated the\s|searched\s|pulled the\s|posted the\s|created the\s|drafted the\s|saved the\s|loaded the\s|fetched\s|queried\s|ran the\s|transferred to\s|transferring to\s|routed to\s|routing to\s|dispatched the\s|dispatching the\s|delegated to\s|delegating to\s|kicked off\s|invoked the\s|invoking the\s|launched the\s|launching the\s|triggered the\s|triggering the\s|forwarded to\s|forwarding to\s)/i;
 const STRUCTURED_TOOL_UNAVAILABLE_PATTERN = /\b(tool[- ]?enabled run|tool runtime|tool access|tool surface.{0,80}not available|tools? (?:were|was|are|is) (?:not )?available|no (?:commentary\/)?tool calls? (?:were|was|are|is) available|no executable tool results|no completed tool results|handoff summary|without tool access|resend ["“]?continue["”]?.*tool|please resend.*tool[- ]?enabled|cannot (?:create|read|write|search|execute|run).{0,80}(?:this turn|without tools?))\b/i;
 // A zero-tool turn that AGREES with a correction, reflects on future behavior,
 // or admits it isn't done is a legitimate CONVERSATIONAL reply — not a false
@@ -4333,6 +4441,15 @@ const TOOL_SURFACE_PROBE_TOOLS = new Set([
   'memory_search',
   'memory_list_facts',
   'skill_list',
+  // Discovery-ritual tools: "which tool/command should I use" lookups — never the
+  // deliverable itself. A turn that does ONLY these and then DEFERS (sets
+  // nextAction:awaiting_handoff_result) has discovered-then-punted instead of
+  // executing inline; the narration-deferral guard in evaluateStructuredDecisionStall
+  // force-corrects it. A turn that does discovery AND a real tool call in the same
+  // turn is NOT probe-only (it called a non-probe tool), so this never false-fires.
+  'tool_choice_recall',
+  'composio_search_tools',
+  'local_cli_list',
 ]);
 
 export type StallSignal = 'A_zero_tools' | 'B_repeated_tool' | 'C_handoff_pingpong' | 'D_decision_json';
@@ -4356,12 +4473,39 @@ function evaluateStructuredDecisionStall(opts: {
     .filter((part): part is string => typeof part === 'string' && part.trim().length > 0)
     .join('\n')
     .trim();
-  if (!combined) return undefined;
   const onlyProbeTools =
     toolCalls > 0 && opts.sessionId && opts.turn
       ? turnOnlyUsedToolSurfaceProbeTools(opts.sessionId, opts.turn)
       : false;
   const noMeaningfulTools = toolCalls === 0 || onlyProbeTools;
+  // SILENT narration-deferral — caught BEFORE the empty-text early return below.
+  // A turn with nextAction:awaiting_handoff_result, zero meaningful tools, and
+  // reply/summary/reason ALL null-or-whitespace is still a defer to a hand-off
+  // that no longer exists — just a wordless one. Without this, the empty-`combined`
+  // guard lets it escape into a bland auto-continue (audit 2026-06-16). The
+  // non-empty case is handled by the narration-deferral branch further down, which
+  // stays AFTER the tool-unavailable branch so an explicit "tools unavailable"
+  // claim keeps its own kind.
+  if (!combined && noMeaningfulTools && decision.nextAction === 'awaiting_handoff_result') {
+    return {
+      signal: 'A_zero_tools',
+      rawOutput: '',
+      userVisibleMessage:
+        `_(Clementine produced an empty turn that deferred to a hand-off that no longer ` +
+        `exists, with zero tool calls. The harness will retry and force the actual tool action.)_`,
+      detail: {
+        kind: 'structured_narration_deferral',
+        rawOutput: '',
+        toolCalls,
+        onlyProbeTools,
+        nextAction: decision.nextAction,
+        done: decision.done,
+        summary: decision.summary,
+        silent: true,
+      },
+    };
+  }
+  if (!combined) return undefined;
   if (
     noMeaningfulTools &&
     (
@@ -4388,9 +4532,45 @@ function evaluateStructuredDecisionStall(opts: {
       },
     };
   }
+  // NARRATION-DEFERRAL stall — the Claude-vs-Codex execution gap.
+  // `awaiting_handoff_result` is a vestige of the retired Orchestrator→Executor
+  // handoff: in today's single-agent model there is NO executor to hand off to.
+  // So a turn that sets it while making ZERO meaningful tool calls (none, or only
+  // discovery-ritual probes) has PROMISED imminent action ("On it — running the
+  // pull now", "I'll pull 25") and deferred it to a phantom next agent. Left
+  // alone, the loop REWARDS that by auto-continuing with a bland nudge, inviting
+  // another narration turn — turning one CLI call into N slow model round-trips
+  // (observed sess-mqhj058j: a 25-account Salesforce pull that is a single
+  // `sf data query` burned a narration turn + a discover-then-defer turn before
+  // executing). Codex acts inline; Claude reaches for the defer enum. Force the
+  // real tool action THIS turn instead — reuses the zero-tool retry machinery.
+  if (noMeaningfulTools && decision.nextAction === 'awaiting_handoff_result') {
+    return {
+      signal: 'A_zero_tools',
+      rawOutput: combined.slice(0, 220),
+      userVisibleMessage:
+        `_(Clementine said it was acting but made zero tool calls and deferred to a ` +
+        `hand-off that no longer exists. The harness will retry and force the actual tool action.)_`,
+      detail: {
+        kind: 'structured_narration_deferral',
+        rawOutput: combined.slice(0, 220),
+        toolCalls,
+        onlyProbeTools,
+        nextAction: decision.nextAction,
+        done: decision.done,
+        summary: decision.summary,
+      },
+    };
+  }
   if (toolCalls !== 0) return undefined;
   if (
-    decision.nextAction === 'completed' &&
+    // `abandoned` is included because a bare "Impossible — abandoning" + zero tools
+    // otherwise banks as a clean terminal WITHOUT the objective judge (which only
+    // runs on nextAction:'completed') or any blocked-text check — strictly worse
+    // than a false `completed` claim (audit 2026-06-16). The same prior-work
+    // suppression below still protects a genuine "searched, found nothing,
+    // abandoning after real work" answer.
+    (decision.nextAction === 'completed' || decision.nextAction === 'abandoned') &&
     STALL_ANNOUNCEMENT_PATTERN.test(combined) &&
     !STALL_REFLECTION_SUPPRESS_PATTERN.test(combined) &&
     // Not a false "zero-tool claim" when the model is REPORTING a genuine
