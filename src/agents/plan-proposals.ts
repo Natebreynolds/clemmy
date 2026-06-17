@@ -14,6 +14,31 @@ function goalScopeEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_GOAL_SCOPE', 'on') ?? 'on').toLowerCase() !== 'off';
 }
 
+/** Kill-switch for goal-BOUNDED send autonomy (2026-06-17): when an approved
+ *  plan ENUMERATED its irreversible sends (Plan.externalSends), approval opens a
+ *  goal-scoped scope that auto-approves ONLY those send shapes — off-shape sends
+ *  still pause. Distinct from the explicit `autonomous` opt-in: it does NOT
+ *  self-drive the goal, it just lets the sends the user blessed on the surfaced
+ *  plan run hands-off. Off ⇒ a plan's enumerated sends pre-bless nothing. */
+function goalSendAutonomyEnabled(): boolean {
+  if (!goalScopeEnabled()) return false;
+  return (getRuntimeEnv('CLEMMY_GOAL_SEND_AUTONOMY', 'on') ?? 'on').toLowerCase() !== 'off';
+}
+
+/** The unique send slugs / tool-names a plan enumerated in `externalSends`,
+ *  deduped — exactly what the user blesses by approving the surfaced plan.
+ *  Empty when the plan declares no external sends (read-only / local-only). */
+export function deriveEnumeratedSends(plan: Plan): string[] {
+  const sends = (plan as { externalSends?: Array<{ slug?: unknown }> | null }).externalSends;
+  if (!Array.isArray(sends)) return [];
+  const slugs = new Set<string>();
+  for (const s of sends) {
+    const slug = (s as { slug?: unknown })?.slug;
+    if (typeof slug === 'string' && slug.trim()) slugs.add(slug.trim());
+  }
+  return [...slugs];
+}
+
 /** Close the goal-scoped plan scope tied to a goal that just resolved. Only
  *  closes a scope that IS goal-scoped FOR THIS goal — an unrelated time-boxed
  *  scope on the session is left alone. The scope's lifetime is derived from the
@@ -414,6 +439,7 @@ export function surfaceWorkflowPendingInputs(input: SurfaceWorkflowPendingInputs
     recommendsTrackedExecution: false,
     needsUserInput: missing.slice(0, 5).map((key) => `What is the value for "${key}"?`),
     appliedInstructions: [],
+    externalSends: null,
   };
   const now = new Date().toISOString();
   const proposal: PlanProposal = {
@@ -540,9 +566,22 @@ export function approvePlanProposal(id: string, options: ApprovePlanProposalOpti
   // the autonomous path. Falls back to the time-boxed scope when the goal-scope
   // kill-switch is off.
   const autonomous = Boolean(options.autonomous) && goalScopeEnabled();
+  // Goal-BOUNDED send autonomy: a plan that ENUMERATED its sends (and the user
+  // approved that surfaced list) pre-blesses exactly those send shapes. Opens a
+  // goal-scoped scope below (after activation) WITHOUT self-driving the goal;
+  // off-shape sends still pause. Explicit `autonomous` takes precedence (it adds
+  // self-drive). Caller-supplied allowedSends (the dashboard's "edit + bless")
+  // win; otherwise we derive from the plan the user saw.
+  const enumeratedSends = (options.allowedSends && options.allowedSends.length > 0)
+    ? options.allowedSends
+    : deriveEnumeratedSends(approvedPlan);
+  const sendBounded = !autonomous
+    && !!proposal.sessionId
+    && enumeratedSends.length > 0
+    && goalSendAutonomyEnabled();
   let scopeOpened = false;
   let scopeExpiresAt: string | undefined;
-  if (!autonomous && proposal.sessionId && options.allowedTools?.length !== 0) {
+  if (!autonomous && !sendBounded && proposal.sessionId && options.allowedTools?.length !== 0) {
     const scope = openPlanScope({
       sessionId: proposal.sessionId,
       planProposalId: proposal.id,
@@ -600,6 +639,27 @@ export function approvePlanProposal(id: string, options: ApprovePlanProposalOpti
             if (driving) return driving;
           } catch (err) {
             logger.warn({ proposalId: proposal.id, err: err instanceof Error ? err.message : String(err) }, 'autonomous scope/self-drive setup failed');
+          }
+        } else if (sendBounded) {
+          // Goal-bounded send autonomy: open a goal-scoped scope that auto-runs
+          // ONLY the sends the user blessed on the surfaced plan. No self-drive —
+          // the goal is parked + judged, but it does not run unattended. Off-shape
+          // sends (a slug not in this list) still pause. Lifetime = the goal.
+          try {
+            openPlanScope({
+              sessionId: proposal.sessionId,
+              planProposalId: proposal.id,
+              approvedPlanObjective: approvedPlan.objective,
+              allowedTools: options.allowedTools,
+              goalScoped: { goalId: proposal.id },
+              allowedSends: enumeratedSends,
+            });
+            logger.info(
+              { proposalId: proposal.id, sends: enumeratedSends.length },
+              'goal-bounded send autonomy: opened goal-scoped scope for enumerated sends (no self-drive)',
+            );
+          } catch (err) {
+            logger.warn({ proposalId: proposal.id, err: err instanceof Error ? err.message : String(err) }, 'goal-bounded send scope setup failed');
           }
         }
         return activated;
@@ -779,6 +839,7 @@ export function createDirectGoal(input: {
       recommendsTrackedExecution: false,
       needsUserInput: [],
       appliedInstructions: [],
+      externalSends: null,
     },
     version: 'v1',
   };
@@ -840,6 +901,7 @@ export function ensureWorkflowRunGoal(input: {
       recommendsTrackedExecution: false,
       needsUserInput: [],
       appliedInstructions: [],
+      externalSends: null,
     },
     version: 'v1',
   };

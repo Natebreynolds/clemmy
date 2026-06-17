@@ -122,6 +122,19 @@ export const PlanSchema = z.object({
   appliedInstructions: z.array(z.string()).max(8).describe(
     'Standing instructions / durable preferences from memory that THIS plan is consciously following, each as a short line (quote the instruction, add a "(source: …)" hint when known). Populate by recalling memory scoped to the objective BEFORE planning. Empty array only if a genuine memory check surfaced nothing relevant — never skip the check for mutating or batch work.',
   ),
+  externalSends: z.array(
+    z.object({
+      slug: z.string().min(2).describe(
+        'The EXACT send tool name or Composio slug that will execute this send, e.g. "OUTLOOK_SEND_EMAIL" or "GMAIL_SEND_EMAIL". This string is what gets auto-approved within the goal scope, so it must match what you will actually call.',
+      ),
+      summary: z.string().min(3).describe(
+        'Plain-language description of what/who this send targets, for the user to see and bless — e.g. "personalized outreach to the 8 market-leader firms".',
+      ),
+      count: z.number().int().min(1).nullable().describe('How many sends of this shape (e.g. 8). Use null for a single send.'),
+    }),
+  ).max(10).nullable().describe(
+    'The IRREVERSIBLE external sends (emails sent, posts/messages published) this plan will execute, enumerated by exact tool/slug + a human summary. Populate for ANY plan that sends or publishes externally. When the user approves the plan, sends matching these slugs auto-run within the goal scope while anything OFF this list still pauses for approval. Use null for read-only or local-only plans — never list a send you will not actually make.',
+  ),
 });
 
 export type Plan = z.infer<typeof PlanSchema>;
@@ -143,6 +156,7 @@ export function buildPlannerAgent(): Agent<RuntimeContextValue, typeof PlanSchem
       'For a LONG goal that spans multiple sessions or has natural milestones, populate `stages`: group the success criteria into 2–4 ordered milestones (each criterion quoted verbatim in exactly one stage). This lets the work validate and check in one milestone at a time. Leave `stages` null for anything that finishes in a single pass — do not over-stage small work.',
       'If the request is underspecified, populate `needsUserInput` with the SHORTEST questions that resolve the ambiguity. The orchestrator may ask them.',
       'Set `recommendsTrackedExecution: true` when the work is multi-system, spans multiple sessions, or has irreversible steps. The orchestrator decides whether to honor this.',
+      'ENUMERATE EXTERNAL SENDS: if the plan sends or publishes anything irreversible (emails, posts, DMs, messages), populate `externalSends` — one entry per distinct send SHAPE, with the exact tool/slug you will call (e.g. "OUTLOOK_SEND_EMAIL"), a plain-language summary of who/what it targets, and the count. This is the list the user blesses on approval: matching sends then run hands-off within the goal scope while anything off the list still pauses. List ONLY sends you will actually make; leave null for read-only or local-only plans.',
       'Be honest about risk. "Irreversible delete" is a real risk to call out. "Could break stuff" is not — get specific.',
       'Return one plan. The orchestrator decides what happens next.',
     ].join('\n\n'),
@@ -167,7 +181,7 @@ export function buildPlannerTool(): Tool<RuntimeContextValue> {
       'Use when the user\'s request is multi-step OR the path is not obvious from the message alone.',
       'Do NOT use for trivial single-tool actions or read-only lookups.',
       'The planner is read-only — calling it does not mutate anything.',
-      'Returns a JSON plan with objective, steps, successCriteria, risks, estimatedComplexity, recommendsTrackedExecution, needsUserInput, and appliedInstructions (the standing instructions from memory this plan follows — surfaced to the user for review).',
+      'Returns a JSON plan with objective, steps, successCriteria, risks, estimatedComplexity, recommendsTrackedExecution, needsUserInput, appliedInstructions (the standing instructions from memory this plan follows — surfaced to the user for review), and externalSends (the irreversible sends the plan will make, enumerated for the user to bless on approval).',
       'After receiving the plan, decide: (a) execute it yourself, using share_plan first when the user should see a safe working plan, (b) ask the user the needsUserInput questions first, (c) refine by calling draft_plan again with more context, or (d) surface_plan when it needs review/approval.',
     ].join(' '),
     customOutputExtractor: async (output) => {

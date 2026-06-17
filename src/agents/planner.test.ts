@@ -37,6 +37,7 @@ test('PlanSchema: accepts a minimal valid plan', () => {
     recommendsTrackedExecution: false,
     needsUserInput: [],
     appliedInstructions: [],
+    externalSends: null,
   });
   assert.equal(plan.objective.startsWith('Add a refresh'), true);
   assert.equal(plan.steps[0].n, 1);
@@ -56,9 +57,30 @@ test('PlanSchema: accepts authored stages partitioning the criteria', () => {
     recommendsTrackedExecution: true,
     needsUserInput: [],
     appliedInstructions: [],
+    externalSends: null,
   });
   assert.equal(plan.stages!.length, 2);
   assert.equal(plan.stages![0].title, 'Research');
+});
+
+test('PlanSchema: accepts enumerated externalSends (what the user blesses on approval)', () => {
+  const plan = PlanSchema.parse({
+    objective: 'Send personalized outreach to the 8 market-leader firms.',
+    steps: [{ n: 1, action: 'Send the emails', rationale: 'The ask.', verification: null }],
+    successCriteria: ['8 emails sent from the Scorpion mailbox.'],
+    stages: null,
+    risks: ['Irreversible: emails cannot be unsent.'],
+    estimatedComplexity: 'moderate',
+    recommendsTrackedExecution: false,
+    needsUserInput: [],
+    appliedInstructions: [],
+    externalSends: [
+      { slug: 'OUTLOOK_SEND_EMAIL', summary: 'personalized outreach to 8 firms', count: 8 },
+    ],
+  });
+  assert.equal(plan.externalSends!.length, 1);
+  assert.equal(plan.externalSends![0].slug, 'OUTLOOK_SEND_EMAIL');
+  assert.equal(plan.externalSends![0].count, 8);
 });
 
 test('PlanSchema: rejects empty objective', () => {

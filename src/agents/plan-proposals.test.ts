@@ -25,8 +25,10 @@ const {
   deletePlanProposal,
   supersedePlanProposal,
   planNeedsUserInput,
+  deriveEnumeratedSends,
 } = await import('./plan-proposals.js');
 const { listNotifications } = await import('../runtime/notifications.js');
+const { getPlanScope, isAutoApprovedByScope, closePlanScope } = await import('./plan-scope.js');
 
 before(() => {
   rmSync(TEST_HOME, { recursive: true, force: true });
@@ -262,4 +264,89 @@ test('supersedePlanProposal: marks pending → superseded only', () => {
   const noop = supersedePlanProposal(b.id);
   assert.ok(noop);
   assert.equal(noop.status, 'approved', 'already-approved proposal stays approved');
+});
+
+// ─── goal-bounded send autonomy (2026-06-17) ──────────────────────
+
+test('deriveEnumeratedSends: dedupes slugs; empty for null/no-sends', () => {
+  assert.deepEqual(deriveEnumeratedSends(aPlan({ externalSends: null }) as never), []);
+  assert.deepEqual(deriveEnumeratedSends(aPlan() as never), []); // field absent
+  assert.deepEqual(
+    deriveEnumeratedSends(aPlan({
+      externalSends: [
+        { slug: 'OUTLOOK_SEND_EMAIL', summary: '8 firms', count: 8 },
+        { slug: 'OUTLOOK_SEND_EMAIL', summary: 'a follow-up', count: 1 }, // same shape
+        { slug: '  ', summary: 'blank slug ignored', count: null },
+      ],
+    }) as never),
+    ['OUTLOOK_SEND_EMAIL'],
+  );
+});
+
+test('approve with enumerated sends → opens a GOAL-SCOPED scope blessing exactly those sends (no self-drive)', () => {
+  const sessionId = 'sess-sendbound-1';
+  const p = surfacePlan({
+    plan: aPlan({
+      objective: 'Send personalized outreach to the 8 market-leader firms.',
+      externalSends: [{ slug: 'OUTLOOK_SEND_EMAIL', summary: 'outreach to 8 firms', count: 8 }],
+    }),
+    originatingRequest: 'Send the 8 Scorpion outreach emails.',
+    sessionId,
+  });
+  const approved = approvePlanProposal(p.id);
+  assert.ok(approved);
+  // Approval activates the plan as the session goal, so the returned record is the
+  // GOAL (status 'active'), not the raw 'approved' proposal — that's the pin.
+  assert.equal(approved.status, 'active', 'approved plan becomes the active (pinned) goal');
+
+  const scope = getPlanScope(sessionId);
+  assert.ok(scope, 'a scope opened on approval');
+  assert.equal(scope.goalScoped?.goalId, p.id, 'scope is GOAL-scoped to the approved goal');
+  assert.deepEqual(scope.allowedSends, ['OUTLOOK_SEND_EMAIL'], 'blesses exactly the enumerated send');
+  assert.ok(!scope.closedAt, 'scope is open');
+
+  // The blessed send auto-approves; an off-shape send still pauses.
+  assert.equal(
+    isAutoApprovedByScope(sessionId, 'composio_execute_tool', { tool_slug: 'OUTLOOK_SEND_EMAIL' }, 'send'),
+    true,
+    'enumerated send auto-approves within the goal scope',
+  );
+  assert.equal(
+    isAutoApprovedByScope(sessionId, 'composio_execute_tool', { tool_slug: 'TWITTER_CREATE_TWEET' }, 'send'),
+    false,
+    'an off-shape send (not enumerated) still pauses',
+  );
+  closePlanScope(sessionId, 'test cleanup');
+});
+
+test('kill-switch CLEMMY_GOAL_SEND_AUTONOMY=off → enumerated sends do NOT open a goal scope', () => {
+  const prev = process.env.CLEMMY_GOAL_SEND_AUTONOMY;
+  process.env.CLEMMY_GOAL_SEND_AUTONOMY = 'off';
+  try {
+    const sessionId = 'sess-sendbound-killswitch';
+    const p = surfacePlan({
+      plan: aPlan({ externalSends: [{ slug: 'OUTLOOK_SEND_EMAIL', summary: 'x', count: 2 }] }),
+      originatingRequest: 'Send two emails.',
+      sessionId,
+    });
+    approvePlanProposal(p.id);
+    const scope = getPlanScope(sessionId);
+    // Falls back to the time-boxed scope (NOT goal-scoped) — sends are not pre-blessed.
+    assert.ok(!scope?.goalScoped, 'no goal-scoped scope when the kill-switch is off');
+    if (scope) closePlanScope(sessionId, 'test cleanup');
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_GOAL_SEND_AUTONOMY;
+    else process.env.CLEMMY_GOAL_SEND_AUTONOMY = prev;
+  }
+});
+
+test('no enumerated sends → today\'s time-boxed scope (no goal scope, no send blessing)', () => {
+  const sessionId = 'sess-no-sends';
+  const p = surfacePlan({ plan: aPlan(), originatingRequest: 'Local read-only work.', sessionId });
+  approvePlanProposal(p.id);
+  const scope = getPlanScope(sessionId);
+  assert.ok(scope, 'a time-boxed scope still opens for the execution steps');
+  assert.ok(!scope.goalScoped, 'but it is NOT goal-scoped');
+  assert.ok(!scope.allowedSends || scope.allowedSends.length === 0, 'and blesses no sends');
+  closePlanScope(sessionId, 'test cleanup');
 });

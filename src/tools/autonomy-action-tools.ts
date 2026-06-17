@@ -292,12 +292,22 @@ export function registerAutonomyActionTools(server: McpServer): void {
           channel,
           context,
         });
+        // Enumerated irreversible sends — the user MUST see these before approving,
+        // because approving this plan auto-blesses exactly these send shapes (they
+        // then run hands-off within the goal scope; off-shape sends still pause).
+        const sends = Array.isArray(proposal.plan.externalSends) ? proposal.plan.externalSends : [];
+        const sendsLine = sends.length > 0
+          ? `Irreversible sends the user is blessing by approving: ${sends.map((s) => `${s.count ? `${s.count}× ` : ''}${s.summary} [${s.slug}]`).join('; ')}.`
+          : 'No irreversible external sends in this plan.';
         return textResult([
           `Plan surfaced: ${proposal.id}.`,
           `Objective: ${proposal.plan.objective}`,
           `Complexity: ${proposal.plan.estimatedComplexity}; ${proposal.plan.steps.length} step(s); recommends tracked execution: ${proposal.plan.recommendsTrackedExecution}.`,
-          `The user has been notified — they can review and approve in the dashboard.`,
-          `Tell the user: "I drafted a plan — review it when you have a moment, and reply to approve when you\'re ready."`,
+          sendsLine,
+          `The user has been notified — they can review and approve in the dashboard or by replying.`,
+          sends.length > 0
+            ? `Tell the user, in plain language: what you'll do, and EXACTLY what will be sent (${sends.map((s) => `${s.count ? `${s.count} ` : ''}${s.summary}`).join('; ')}) — then ask them to approve. On approval those sends run without further prompts; anything else still pauses.`
+            : `Tell the user: "I drafted a plan — review it when you have a moment, and reply to approve when you're ready."`,
         ].join('\n'));
       } catch (err) {
         return textResult(`surface_plan failed: ${err instanceof Error ? err.message : String(err)}`);
