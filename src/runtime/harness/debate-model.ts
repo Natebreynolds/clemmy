@@ -146,15 +146,89 @@ function isWorkerScope(): boolean {
   }
 }
 
-/** High-stakes heuristic for mode=high. A v1 proxy (replaceable by a proper
- *  classifier / the Seam-B write-boundary signal): a long/complex request, or a
- *  tool-enabled (agentic, consequential) turn. Deliberately conservative. */
+/** Consequential / irreversible-action verbs — the signal that a turn is
+ *  high-stakes enough to spend the Claude checker on. Word-boundary,
+ *  case-insensitive. (Bare nouns like "proposal"/"invoice" are deliberately NOT
+ *  triggers — they fire on pure drafting/research; only the action verbs do.) */
+const STAKES_ACTION_RE = /\b(send|sends|sending|publish|publishes|deploy|launch|delete|migrate|wire|charge|refund|production|irreversible)\b/i;
+/** The CONTINUATION_INPUT sentinel (loop.ts) — a mid-execution re-loop nudge, not
+ *  a fresh ask; a continuation falls to the goal signal, not the nudge text. */
+const CONTINUATION_PREFIX_RE = /^Continue with the next step of your plan/;
+
+/** v2 selective high-stakes heuristic (default-on). Off ⇒ the legacy byte-length
+ *  proxy (which over-fired on the injected context packet → mode=high≈mode=all). */
+function stakesV2Enabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_DEBATE_STAKES_V2', 'on') ?? 'on').toLowerCase() !== 'off';
+}
+
+/** Extract one input item's text (content string / array-of-{text} / .text). */
+function extractItemText(item: unknown): string {
+  const it = item as { content?: unknown; text?: unknown };
+  if (typeof it.content === 'string') return it.content;
+  if (Array.isArray(it.content)) {
+    const parts: string[] = [];
+    for (const c of it.content) {
+      const cc = c as { text?: unknown };
+      if (typeof cc.text === 'string') parts.push(cc.text);
+    }
+    return parts.join(' ');
+  }
+  if (typeof it.text === 'string') return it.text;
+  return '';
+}
+
+/** The LATEST role:'user' message — the actual ask for THIS turn. The user item
+ *  sits in the MIDDLE of request.input: the harness appends role:'system' items
+ *  (the [AGENT CONTEXT PACKET], memory primer, goal block) AFTER it (loop.ts), so
+ *  we take the last user item BY INDEX (scanning from the tail), NOT a trailing
+ *  run — else the appended system items would mask the user text and under-fire. */
+function renderLatestUserText(request: ModelRequest): string {
+  const input = (request as { input?: unknown }).input;
+  if (typeof input === 'string') return input;
+  if (!Array.isArray(input)) return '';
+  for (let i = input.length - 1; i >= 0; i -= 1) {
+    if ((input[i] as { role?: unknown })?.role === 'user') return extractItemText(input[i]);
+  }
+  return '';
+}
+
+/** ONLY the "Objective:" line of the injected [ACTIVE GOAL …] block — so a
+ *  continuation turn can be judged on whether the run is ABOUT to do an
+ *  irreversible action, WITHOUT re-scanning the context-packet boilerplate (its
+ *  prose contains "sends"/"run") or the goal's past-tense "Progress so far" ledger. */
+function renderActiveGoalObjective(request: ModelRequest): string {
+  const input = (request as { input?: unknown }).input;
+  if (!Array.isArray(input)) return '';
+  for (const item of input) {
+    if ((item as { role?: unknown })?.role !== 'system') continue;
+    const text = extractItemText(item);
+    if (!text.startsWith('[ACTIVE GOAL')) continue;
+    return text.split('\n').find((l) => l.startsWith('Objective:')) ?? '';
+  }
+  return '';
+}
+
+/** High-stakes heuristic for mode=high — "minimal Claude, only the consequential
+ *  turns." Reads ROLES, not bytes: the v1 proxy over-fired because it measured the
+ *  injected system context packet (which alone exceeds 800 chars), not the
+ *  request. Fires when the user's latest message names a consequential action, is
+ *  genuinely long/complex, or — on a mid-execution continuation — the active
+ *  goal's Objective involves an irreversible action. NOTE: the raw send TOOL-CALL
+ *  turn (no assistant text) is NOT checked here — verify gates on a user-facing
+ *  answer (hasUserFacingAnswer), and that write boundary is owned by the grounding
+ *  / goal-fidelity gates. Fusion checks the planning/approval ANSWER turn. */
 function isHighStakes(request: ModelRequest): boolean {
-  const text = renderRequestText(request);
-  if (text.length >= 800) return true;
-  const tools = (request as { tools?: unknown[] }).tools;
-  if (Array.isArray(tools) && tools.length > 0 && text.length >= 200) return true;
-  return /\b(send|publish|deploy|delete|migrate|launch|production|irreversible|invoice|contract|proposal)\b/i.test(text);
+  if (!stakesV2Enabled()) return legacyIsHighStakes(request);
+  const userText = renderLatestUserText(request);
+  const isContinuation = CONTINUATION_PREFIX_RE.test(userText.trim());
+  if (!isContinuation) {
+    if (STAKES_ACTION_RE.test(userText)) return true;
+    if (userText.length >= 800) return true;
+    const tools = (request as { tools?: unknown[] }).tools;
+    if (Array.isArray(tools) && tools.length > 0 && userText.length >= 200) return true;
+  }
+  // continuation OR no user-text hit → judge by the pending goal's Objective.
+  return STAKES_ACTION_RE.test(renderActiveGoalObjective(request));
 }
 
 export function shouldDebate(request: ModelRequest): boolean {
@@ -164,24 +238,23 @@ export function shouldDebate(request: ModelRequest): boolean {
   return isHighStakes(request);
 }
 
-/** Flatten a request's input (string or items) + nothing else into plain text for
- *  the high-stakes heuristic. Defensive across the string/array input shapes. */
+/** LEGACY high-stakes proxy (CLEMMY_DEBATE_STAKES_V2=off only): flatten ALL input
+ *  text and trip on length/keywords. Over-fires — the role:system context packet
+ *  alone routinely exceeds 800 chars, so mode=high collapses to mode=all. Kept
+ *  solely as the kill-switch fallback. */
+function legacyIsHighStakes(request: ModelRequest): boolean {
+  const text = renderRequestText(request);
+  if (text.length >= 800) return true;
+  const tools = (request as { tools?: unknown[] }).tools;
+  if (Array.isArray(tools) && tools.length > 0 && text.length >= 200) return true;
+  return /\b(send|publish|deploy|delete|migrate|launch|production|irreversible|invoice|contract|proposal)\b/i.test(text);
+}
+
 function renderRequestText(request: ModelRequest): string {
   const input = (request as { input?: unknown }).input;
   if (typeof input === 'string') return input;
   if (!Array.isArray(input)) return '';
-  const parts: string[] = [];
-  for (const item of input) {
-    const it = item as { content?: unknown; text?: unknown };
-    if (typeof it.content === 'string') parts.push(it.content);
-    else if (Array.isArray(it.content)) {
-      for (const c of it.content) {
-        const cc = c as { text?: unknown };
-        if (typeof cc.text === 'string') parts.push(cc.text);
-      }
-    } else if (typeof it.text === 'string') parts.push(it.text);
-  }
-  return parts.join(' ');
+  return input.map(extractItemText).join(' ');
 }
 
 /** Some ModelProviders may return Model | Promise<Model>; every in-repo provider
@@ -528,8 +601,13 @@ export class DebateModel implements Model {
     // Backstop a checker that streamed text but no terminal done.
     if (!sawDone) yield* synthesizeTerminalDone(checkerOutput, finalText);
     const finalForTrace = finalText || extractAssistantText(checkerOutput);
-    logger.info({ path: 'verify', n: this.debatesThisTurn, executorLen: da.length, finalLen: finalForTrace.length, judge: judgeChoice() }, 'fusion verify reconciled');
-    recordDebateTrace({ path: 'verify', n: this.debatesThisTurn, judge: judgeChoice(), executor: capText(da), final: capText(finalForTrace) });
+    // Observability: distinguish a real refinement from an empty checker so a
+    // 0-length trace can't be misread as a failure. 'checker-refined' = the
+    // checker produced usable content; 'checker-empty' = it returned without
+    // throwing but with nothing usable (an overloaded/empty completion).
+    const outcome = finalForTrace ? 'checker-refined' : 'checker-empty';
+    logger.info({ path: 'verify', n: this.debatesThisTurn, outcome, executorLen: da.length, finalLen: finalForTrace.length, judge: judgeChoice() }, 'fusion verify reconciled');
+    recordDebateTrace({ path: 'verify', n: this.debatesThisTurn, outcome, judge: judgeChoice(), executor: capText(da), final: capText(finalForTrace) });
   }
 }
 

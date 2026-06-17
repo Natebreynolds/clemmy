@@ -86,13 +86,38 @@ test('debateMode: defaults OFF; on/all/high parse', () => {
   withEnv({ CLEMMY_DEBATE_MODE: 'off' }, () => assert.equal(debateMode(), 'off'));
 });
 
-test('shouldDebate: off never, all always, high on a long/keyword/agentic turn', () => {
+// Production request shape: the role:'user' item sits BEFORE the harness's
+// appended role:'system' items (context packet, goal block) — the layout that
+// made the v1 byte-length proxy fire on the packet, not the request.
+const PACKET = { role: 'system', content: '[AGENT CONTEXT PACKET] ' + 'x'.repeat(1200) };
+function goalItem(objective: string) {
+  return { role: 'system', content: `[ACTIVE GOAL — parked outside this conversation.]\nObjective: ${objective}\nProgress so far:\n- earlier we already sent a draft to review` };
+}
+function userTurn(userText: string, ...sys: unknown[]) {
+  return req({ input: [{ role: 'user', content: userText }, PACKET, ...sys], tools: [{}] });
+}
+
+test('shouldDebate: off never, all always; high (v2) reads the USER message + goal, not the context packet', () => {
   withEnv({ CLEMMY_DEBATE_MODE: 'off' }, () => assert.equal(shouldDebate(req()), false));
   withEnv({ CLEMMY_DEBATE_MODE: 'all' }, () => assert.equal(shouldDebate(req()), true));
-  withEnv({ CLEMMY_DEBATE_MODE: 'high' }, () => {
-    assert.equal(shouldDebate(req({ input: 'short' })), false);
-    assert.equal(shouldDebate(req({ input: 'please send the proposal to the client' })), true, 'keyword');
-    assert.equal(shouldDebate(req({ input: 'x'.repeat(900) })), true, 'long input');
+  withEnv({ CLEMMY_DEBATE_MODE: 'high', CLEMMY_DEBATE_STAKES_V2: 'on' }, () => {
+    // REGRESSION for the over-fire bug: a packet-sized role:system context ALONE
+    // (terse user, no action verb, no goal) must NOT fire — even though the
+    // packet is 1200 chars and the user item is buried before it.
+    assert.equal(shouldDebate(userTurn('what did we do yesterday?')), false, 'packet length alone no longer fires');
+    // A terse user send-ask fires on the keyword (the FATAL case: the user item
+    // is NOT last — system packet is appended after it — so a tail-walk would miss it).
+    assert.equal(shouldDebate(userTurn('send the proposal to the client')), true, 'user keyword (user item is mid-array)');
+    // A genuinely long USER message fires on length (now user-only, not the packet).
+    assert.equal(shouldDebate(userTurn('x'.repeat(850))), true, 'long user message');
+    // A continuation fires ONLY when the active goal Objective involves an
+    // irreversible action — and the ledger's past-tense "sent" must NOT trigger it.
+    assert.equal(shouldDebate(userTurn('Continue with the next step of your plan.', goalItem('Send the 8 market-leader outreach emails'))), true, 'continuation + send goal');
+    assert.equal(shouldDebate(userTurn('Continue with the next step of your plan.', goalItem('Research and summarize the market'))), false, 'continuation + non-send goal (ledger "sent" excluded)');
+  });
+  // Kill-switch reverts to the legacy proxy, which over-fires on packet length.
+  withEnv({ CLEMMY_DEBATE_MODE: 'high', CLEMMY_DEBATE_STAKES_V2: 'off' }, () => {
+    assert.equal(shouldDebate(userTurn('what did we do yesterday?')), true, 'legacy: packet length over-fires (reverted)');
   });
 });
 
