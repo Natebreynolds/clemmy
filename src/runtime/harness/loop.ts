@@ -2373,10 +2373,16 @@ function modelFirstByteStallMs(): number {
 
 /** How many times to retry a model call that stalled BEFORE producing any
  *  content (pre-content stall only — safe because zero events means zero tool
- *  side effects, so the run can be replayed cleanly). Default 1. 0 disables. */
+ *  side effects, so the run can be replayed cleanly). Default 3: Anthropic
+ *  intermittently sends HTTP 200 then no body for >75s on a heavy first call
+ *  (the retry hits the now-warm prompt cache and starts in ~12s), and a single
+ *  retry isn't enough when the hang recurs within a turn. Replays are clean and
+ *  cheap (cache reads), and Codex rarely reaches this backstop (its own
+ *  dispatcher fails fast first), so a higher budget is safe for every brain.
+ *  0 disables. */
 function modelStreamStallRetries(): number {
-  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_MODEL_STREAM_STALL_RETRIES', '1') ?? '1', 10);
-  if (!Number.isFinite(raw) || raw < 0) return 1;
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_MODEL_STREAM_STALL_RETRIES', '3') ?? '3', 10);
+  if (!Number.isFinite(raw) || raw < 0) return 3;
   return raw;
 }
 
