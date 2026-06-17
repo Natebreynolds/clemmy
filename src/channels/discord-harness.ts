@@ -42,6 +42,7 @@ import {
   extractNamedResource,
 } from '../memory/focus.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
+import { listPlanProposals, approvePlanProposal, rejectPlanProposal } from '../agents/plan-proposals.js';
 import { previewToolCall } from '../runtime/approval-summary.js';
 import { buildOrchestratorAgent } from '../agents/orchestrator.js';
 import { runPlanFirstPreflight, shouldUsePlanFirst } from '../runtime/harness/plan-first.js';
@@ -974,6 +975,51 @@ function isDiscordApproval(row: approvalRegistry.PendingApprovalRow): boolean {
   return row.channel === 'discord' || row.channel === 'discord-dm';
 }
 
+/** Gate-unification Step 5 kill-switch. Off ⇒ a typed "yes/approve" no longer
+ *  resolves a surfaced PlanProposal (reverts to the button-only behavior). */
+function typedPlanApprovalEnabled(): boolean {
+  return (process.env.CLEMMY_TYPED_PLAN_APPROVAL ?? 'on').toLowerCase() !== 'off';
+}
+
+/**
+ * Typed consent into the goal contract (gate-unification Step 5). A surfaced
+ * PlanProposal could be approved ONLY via the button / dashboard — typing
+ * "yes, go" after Clem surfaced a plan matched NOTHING (the approval router
+ * resolves only apr- registry rows) and became a fresh chat turn. That was a
+ * dead-end the user hit. If the user typed an approve/reject AND a plan is
+ * pending for this channel's session, resolve it here.
+ *
+ * Registry (apr-) approvals are handled BEFORE this and a specific `apr-` id
+ * never reaches here (we ignore an intent that carries an approvalId), so this
+ * can never shadow a registry row. Returns 'approved' | 'rejected' | null
+ * (no pending plan / not an approval phrase / disabled).
+ */
+export function maybeResolvePendingPlanProposal(channelId: string, prompt: string): 'approved' | 'rejected' | null {
+  if (!typedPlanApprovalEnabled()) return null;
+  const intent = parseApprovalIntent(prompt);
+  // An intent carrying an apr- id is a registry approval, not a plan approval.
+  if (!intent || intent.approvalId) return null;
+  const entry = getOrHydrateChannelSession(channelId);
+  if (!entry) return null;
+  let pending: ReturnType<typeof listPlanProposals>;
+  try {
+    pending = listPlanProposals({ sessionId: entry.sessionId, status: 'pending' })
+      .filter((p) => (p.kind ?? 'plan') === 'plan');
+  } catch {
+    return null;
+  }
+  if (pending.length === 0) return null;
+  const target = pending[0]; // newest-first
+  try {
+    if (intent.decision === 'approve') {
+      return approvePlanProposal(target.id) ? 'approved' : null;
+    }
+    return rejectPlanProposal(target.id, 'rejected via chat') ? 'rejected' : null;
+  } catch {
+    return null;
+  }
+}
+
 function approvalBelongsToDiscordChannel(
   row: approvalRegistry.PendingApprovalRow,
   channelId: string,
@@ -1047,6 +1093,10 @@ export const __test__ = {
   isDiscordTokenExpired,
   renderSessionPickerText,
   sessionPickerComponents,
+  /** Inject a fresh channel→session mapping (Step 5 typed-plan-approval tests). */
+  setChannelSessionForTest(channelId: string, sessionId: string): void {
+    channelSessions.set(channelId, { sessionId, lastUsedAt: Date.now() });
+  },
 };
 
 /**
@@ -1613,6 +1663,19 @@ export async function runDiscordHarnessConversation(opts: {
       });
       return;
     }
+  }
+
+  // Typed consent into a surfaced plan (gate-unification Step 5). A PlanProposal
+  // sets no interrupt state, so it doesn't hit the registry-resume path above —
+  // typing "yes, go" used to fall through to a fresh turn that ignored the
+  // pending plan. Resolve it, then re-engage the SAME turn with a clear
+  // directive so Clem proceeds with the now-active goal (approvePlanProposal
+  // activated it + opened its scope).
+  const planConsent = maybeResolvePendingPlanProposal(channelId, prompt);
+  if (planConsent === 'approved') {
+    prompt = 'Plan approved — proceed with the plan now, and report back when done.';
+  } else if (planConsent === 'rejected') {
+    prompt = 'I rejected that plan. Do NOT proceed with it — ask me what to change.';
   }
 
   const session = resolveOrCreateSession({ channelId, userId, guildId, prompt });
