@@ -37,7 +37,7 @@
 import type { Model, ModelProvider, ModelRequest, ModelResponse } from '@openai/agents-core';
 import type { StreamEvent } from '@openai/agents-core/types';
 import { getRuntimeEnv, getActiveAuthMode, getClaudeBrainModel } from '../../config.js';
-import { getClaudeModel } from './claude-model.js';
+import { ClaudeModelProvider } from './claude-model.js';
 import { CodexModelProvider } from './codex-model.js';
 import { getStoredCodexOAuthTokens } from '../auth-store.js';
 import { getStoredClaudeTokens } from '../claude-oauth.js';
@@ -687,7 +687,13 @@ export function resolveDebateBrains(passthrough: ModelProvider, modelName?: stri
   const haveCodex = codexAvailable();
   if (!haveClaude || !haveCodex) return null;
 
-  const claude: Model = getClaudeModel(getClaudeBrainModel());
+  // Build the Claude brain through the PROVIDER (not bare getClaudeModel) so it
+  // carries the overload fallback chain Opus -> Sonnet -> Codex. Without it, an
+  // Anthropic 529 on the checker exhausts retries and THROWS — failing the whole
+  // fusion run with "Overloaded" instead of falling back. The checker (and the
+  // Claude drafter) now degrade gracefully under Anthropic capacity pressure
+  // rather than taking the turn down. (CLEMMY_CLAUDE_OVERLOAD_FALLBACK=off opts out.)
+  const claude: Model = new ClaudeModelProvider().getModel();
   const codex: Model = new CodexModelProvider().getModel();
   const judge: Model = judgeChoice() === 'codex' ? codex : claude;
 
