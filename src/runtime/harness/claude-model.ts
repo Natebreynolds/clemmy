@@ -378,14 +378,15 @@ export function makeClaudeFetch(): typeof fetch {
       body,
       ...(dispatcher ? { dispatcher } : {}),
     } as RequestInit & { dispatcher?: unknown });
-    // ALWAYS persist a 4xx trace (request body + error) to disk — the Codex path
-    // does this, the Claude path didn't, and Anthropic has MORE wire-shape rules
-    // (system placement, effort, cache_control, empty blocks). Opus silently
-    // tolerates malformations other models 400 on, so without a durable trace
-    // each model-compat failure is a blind debugging session. Best-effort; reads
-    // a clone so the SDK still gets the original error body.
-    if (res.status >= 400 && res.status < 500) {
-      void persistClaude4xxTrace(res.clone(), body, res.status);
+    // ALWAYS persist an error trace (request body + response) to disk on ANY
+    // non-2xx — 4xx (malformed: system placement / effort / cache_control), 429
+    // (YOUR usage quota: rate_limit_error), 529 (ANTHROPIC capacity:
+    // overloaded_error — "not your usage limit"), and 5xx. The Codex path traces;
+    // the Claude path didn't. This makes "was it us or Anthropic?" answerable
+    // from disk (the body names the error type). Best-effort; reads a clone so
+    // the SDK still gets the original error body.
+    if (res.status >= 400) {
+      void persistClaudeErrorTrace(res.clone(), body, res.status);
     }
     // Diagnostics only: tee the body so we can read usage without disturbing the
     // stream the SDK consumes. Entirely skipped when the debug flag is off.
@@ -402,13 +403,27 @@ export function makeClaudeFetch(): typeof fetch {
   }) as typeof fetch;
 }
 
-/** Persist a Claude 4xx (request body + response detail) to
- *  BASE_DIR/state/claude-4xx-trace so a model-compat rejection is diagnosable.
- *  Mirrors the Codex 4xx-trace pattern. Best-effort — never throws, never blocks
- *  the error path. */
-async function persistClaude4xxTrace(res: Response, requestBody: BodyInit | null | undefined, status: number): Promise<void> {
+/** Classify an Anthropic non-2xx so "was it us or Anthropic?" is one glance:
+ *  429 rate_limit_error = YOUR quota; 529 overloaded_error = ANTHROPIC capacity
+ *  (not your usage limit); 4xx = malformed request (our bug); 5xx = backend. */
+function classifyClaudeHttpCause(status: number, body: string): string {
+  if (status === 429) return 'rate_limited (YOUR usage/rate quota)';
+  if (status === 529) return 'overloaded (ANTHROPIC capacity — not your usage limit)';
+  if (/overloaded_error/.test(body)) return 'overloaded (ANTHROPIC capacity)';
+  if (/rate_limit_error/.test(body)) return 'rate_limited (YOUR usage/rate quota)';
+  if (status >= 500) return 'backend 5xx (ANTHROPIC server)';
+  if (status >= 400) return 'invalid_request (malformed by us)';
+  return 'unknown';
+}
+
+/** Persist a Claude error (request body + response) to BASE_DIR/state/
+ *  claude-error-trace on ANY non-2xx, with the cause classified, so a rejection
+ *  (malformed), a 429 (your quota) or a 529 (Anthropic overload) is diagnosable
+ *  from disk. Mirrors the Codex trace pattern. Best-effort — never throws. */
+async function persistClaudeErrorTrace(res: Response, requestBody: BodyInit | null | undefined, status: number): Promise<void> {
   try {
     const detail = await res.text().catch(() => '');
+    const cause = classifyClaudeHttpCause(status, detail);
     const { atomicJsonMutate } = await import('../atomic-json.js');
     const path = await import('node:path');
     const { BASE_DIR } = await import('../../config.js');
@@ -417,20 +432,24 @@ async function persistClaude4xxTrace(res: Response, requestBody: BodyInit | null
     if (typeof requestBody === 'string') {
       try { reqParsed = JSON.parse(requestBody); model = (reqParsed as { model?: unknown } | null)?.model; } catch { /* keep raw */ }
     }
-    const tracePath = path.join(BASE_DIR, 'state', 'claude-4xx-trace', `claude-${Date.now()}.json`);
+    const tracePath = path.join(BASE_DIR, 'state', 'claude-error-trace', `claude-${status}-${Date.now()}.json`);
     await atomicJsonMutate(
       tracePath,
       () => ({
         ts: new Date().toISOString(),
         source: 'claude-model',
         status,
+        cause,
+        retryAfter: res.headers.get('retry-after'),
         model: model ?? null,
         responseBody: detail.slice(0, 4096),
-        requestBody: reqParsed ?? requestBody ?? null,
+        // request body only kept for a 4xx (malformed-by-us) — a 429/529 isn't
+        // about our request, so don't bloat the trace with it.
+        requestBody: status >= 400 && status < 500 ? (reqParsed ?? requestBody ?? null) : undefined,
       }),
       {} as Record<string, unknown>,
     );
-    logger.warn({ status, model: model ?? null, tracePath, responsePreview: detail.slice(0, 240) }, '[claude-wire] 4xx — request trace persisted');
+    logger.warn({ status, cause, model: model ?? null, retryAfter: res.headers.get('retry-after'), tracePath, responsePreview: detail.slice(0, 240) }, '[claude-wire] error — trace persisted');
   } catch {
     // best-effort: a trace-write failure must never affect the request path
   }
