@@ -404,6 +404,26 @@ test('verify: checker commits response_done (structured) then throws → NO dupl
   });
 });
 
+test('verify: a HUNG checker (Anthropic capacity hang) ships the executor draft past the deadline — no failure, no hang', async () => {
+  await withEnv({ CLEMMY_DEBATE_MODE: 'all', CLEMMY_FUSION_STRATEGY: 'verify' }, async () => {
+    const b = brains({
+      passthrough: model({ getResponse: async () => msg('DRAFT-PROSE') }),
+      // The checker takes far longer than the deadline to produce its first event
+      // — exactly the Anthropic transport-timeout hang. Without the deadline it
+      // would block the turn (then fail); with it, the executor's draft (the
+      // safety net) ships at the deadline. (Finite delay so the test loop drains.)
+      judge: model({ getStreamedResponse: async function* () {
+        await new Promise((r) => setTimeout(r, 200));
+        yield { type: 'response_done', response: { output: [{ type: 'message', content: 'LATE-CHECKER' }] } } as any;
+      } }),
+    });
+    const evs = await collect(dm(b, { heartbeatMs: 0, checkerDeadlineMs: 10 }).getStreamedResponse(req()));
+    const dones: any[] = evs.filter((e) => e.type === 'response_done');
+    assert.equal(dones.length, 1, 'exactly one response_done — the shipped draft (no crash, no duplicate)');
+    assert.match(JSON.stringify(evs), /DRAFT-PROSE/, 'shipped the executor draft instead of failing on the hung checker');
+  });
+});
+
 test('getStreamedResponse: judge failure AFTER content rethrows (cannot duplicate a partial stream)', async () => {
   await withEnv({ CLEMMY_DEBATE_MODE: 'all' }, async () => {
     const b = brains({

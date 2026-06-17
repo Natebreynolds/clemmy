@@ -86,6 +86,15 @@ function draftGraceMs(): number {
   return Number.isFinite(raw) && raw >= 0 ? raw : 25000;
 }
 
+/** Deadline (ms) for the verify CHECKER's first event. The executor's draft is
+ *  already in hand (the safety net), so a hung/slow checker — Anthropic at
+ *  capacity HANGS rather than returning a clean 529 — must not block the turn
+ *  waiting out the retry budget. Past this, ship the executor draft. */
+function checkerDeadlineMs(): number {
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_DEBATE_CHECKER_DEADLINE_MS', '25000') ?? '25000', 10);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 25000;
+}
+
 /** Max debated iterations per user MESSAGE. The AUTHORITY is the per-turn WeakMap
  *  keyed by the active ToolCallsCounter (see spendFusionSlot) — that survives
  *  regardless of model-instance lifetime (the SDK may resolve the model per step,
@@ -285,6 +294,8 @@ export interface DebateOptions {
   heartbeatMs?: number;
   /** Grace window (ms) for the second draft after the first lands. */
   draftGraceMs?: number;
+  /** Deadline (ms) for the verify checker's first event before shipping the draft. */
+  checkerDeadlineMs?: number;
   /** Max debated iterations per message (0 = unlimited). */
   maxPerTurn?: number;
   /** Fuse the NON-streamed getResponse path too. Default false: in the harness,
@@ -329,6 +340,9 @@ export class DebateModel implements Model {
 
   private get hb(): number {
     return this.opts.heartbeatMs ?? heartbeatMs();
+  }
+  private get checkerDeadline(): number {
+    return this.opts.checkerDeadlineMs ?? checkerDeadlineMs();
   }
   private get sleep(): (ms: number) => Promise<void> {
     // unref the keep-alive tick so the one timer that may dangle after a turn
@@ -581,13 +595,52 @@ export class DebateModel implements Model {
     let checkerOutput: unknown;
     let checkerYieldedContent = false;
     let sawDone = false;
+    const it = this.brains.judge.getStreamedResponse(buildVerifyRequest(request, draft))[Symbol.asyncIterator]();
     try {
-      for await (const ev of this.brains.judge.getStreamedResponse(buildVerifyRequest(request, draft))) {
+      // DEADLINE on the checker's FIRST event: the executor's Codex draft is
+      // already the answer, so a hung/slow checker (Anthropic at capacity HANGS
+      // rather than 529s — the run-killer) must not block the turn waiting out the
+      // retry budget. If the checker doesn't deliver within the deadline, ship the
+      // draft. (Falling the checker over to Codex would be pointless here — the
+      // executor IS Codex; shipping the draft we already have is the right move.)
+      const firstP = it.next();
+      let firstErr: unknown;
+      let firstRejected = false;
+      firstP.catch((e) => { firstErr = e; firstRejected = true; }); // observe (and swallow) a rejection without consuming firstP
+      const deadline = this.checkerDeadline;
+      const first = await new Promise<IteratorResult<StreamEvent> | 'deadline'>((resolve) => {
+        const timer = setTimeout(() => resolve('deadline'), deadline);
+        if (typeof (timer as { unref?: () => void }).unref === 'function') (timer as { unref: () => void }).unref();
+        firstP.then(
+          (r) => { clearTimeout(timer); resolve(r); },
+          () => { clearTimeout(timer); resolve('deadline'); }, // a pre-first-event throw → nothing committed → ship the draft (below)
+        );
+      });
+      if (first === 'deadline') {
+        // Nothing committed (no event). Either the checker THREW before any event,
+        // or it HUNG past the deadline — both → ship the draft. firstRejected
+        // distinguishes them for the trace; the run never blocks either way.
+        void it.return?.().catch(() => {});
+        if (firstRejected) {
+          logger.warn({ err: errText(firstErr) }, 'fusion verify: checker failed pre-content — shipping the executor draft');
+          recordDebateTrace({ path: 'verify', n: this.debatesThisTurn, outcome: 'checker-failed-ship-draft' });
+        } else {
+          logger.warn({ deadlineMs: deadline }, 'fusion verify: checker exceeded deadline — shipping the executor draft');
+          recordDebateTrace({ path: 'verify', n: this.debatesThisTurn, outcome: 'checker-timeout-ship-draft' });
+        }
+        yield* streamResponseAsEvents(draft);
+        return;
+      }
+      let res = first;
+      while (!res.done) {
+        const ev = res.value;
         const e = ev as { type?: string; delta?: string; response?: { output?: unknown } };
-        if (e.type === 'response_started') continue;
-        if (e.type === 'output_text_delta' && typeof e.delta === 'string') { finalText += e.delta; checkerYieldedContent = true; }
-        if (e.type === 'response_done') { sawDone = true; if (e.response) checkerOutput = e.response.output; }
-        yield ev;
+        if (e.type !== 'response_started') {
+          if (e.type === 'output_text_delta' && typeof e.delta === 'string') { finalText += e.delta; checkerYieldedContent = true; }
+          if (e.type === 'response_done') { sawDone = true; if (e.response) checkerOutput = e.response.output; }
+          yield ev;
+        }
+        res = await it.next();
       }
     } catch (err) {
       // Recover (ship the executor draft) ONLY if nothing committed — no text AND

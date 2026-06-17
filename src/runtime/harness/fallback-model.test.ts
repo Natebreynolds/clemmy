@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { Model, ModelRequest, ModelResponse } from '@openai/agents-core';
-import { withModelFallback, isOverloadError, type FallbackTarget } from './fallback-model.js';
+import { withModelFallback, isOverloadError, isFalloverError, type FallbackTarget } from './fallback-model.js';
 import { BoundaryError } from '../boundary-error.js';
 
 function req(): ModelRequest { return { input: 'hi', modelSettings: {}, tools: [], handoffs: [] } as unknown as ModelRequest; }
@@ -23,6 +23,28 @@ test('isOverloadError: 529 yes, 429 no, BoundaryError(model.overloaded) yes', ()
   assert.equal(isOverloadError({ statusCode: 400 }), false);
   assert.equal(isOverloadError(new BoundaryError({ kind: 'model.overloaded', retryable: true, userMessage: '', operatorMessage: '' })), true);
   assert.equal(isOverloadError(new BoundaryError({ kind: 'model.rate_limited', retryable: true, userMessage: '', operatorMessage: '' })), false);
+});
+
+test('isFalloverError: overload/5xx/TRANSPORT-TIMEOUT yes; 429 + 4xx no (the timeout is the real-world capacity case)', () => {
+  assert.equal(isFalloverError({ statusCode: 529 }), true, 'overloaded');
+  assert.equal(isFalloverError({ statusCode: 503 }), true, '5xx');
+  // The load-bearing case: Anthropic at capacity HANGS → transport_timeout.
+  assert.equal(isFalloverError(new BoundaryError({ kind: 'model.transport_timeout', retryable: true, userMessage: '', operatorMessage: '' })), true);
+  assert.equal(isFalloverError({ message: 'fetch failed' }), true, 'a transport error classifies as transport_timeout');
+  // Excluded: a 429 is account-wide quota — switching Claude tiers won't help.
+  assert.equal(isFalloverError({ statusCode: 429 }), false, '429 not a fallover');
+  assert.equal(isFalloverError({ statusCode: 400 }), false, '4xx not a fallover');
+});
+
+test('getStreamedResponse: a TRANSPORT TIMEOUT (the Anthropic-hang case) falls over — not just a clean 529', async () => {
+  // This is the exact failure the user hit: Claude hangs (transport_timeout), the
+  // resilient wrapper throws it, and the chain MUST advance instead of failing.
+  let codexCalls = 0;
+  const opus = model({ getStreamedResponse: async function* () { throw new BoundaryError({ kind: 'model.transport_timeout', retryable: true, userMessage: '', operatorMessage: 'hung' }); } });
+  const codex = model({ getStreamedResponse: async function* () { codexCalls++; yield { type: 'response_done', response: { output: [{ type: 'message', content: 'from codex' }] } } as any; } });
+  const out = await collect(withModelFallback([target('opus', opus), target('codex', codex)]).getStreamedResponse(req()));
+  assert.equal(codexCalls, 1, 'a transport timeout fell over to Codex');
+  assert.ok(out.length > 0);
 });
 
 test('single-element chain returns the model as-is (no wrapper)', () => {

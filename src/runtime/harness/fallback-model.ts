@@ -1,16 +1,20 @@
 /**
- * fallback-model — try an ordered chain of brains, advancing ONLY when a model
- * is OVERLOADED (Anthropic 529 "the model is temporarily limiting requests — not
- * your usage limit"), after that model has already burned its own transparent
+ * fallback-model — try an ordered chain of brains, advancing when a brain is
+ * UNAVAILABLE (overloaded 529, a 5xx, OR a transport TIMEOUT — the request hung
+ * with no response), after that brain has already burned its own transparent
  * retry budget. The chain for the Claude brain is:
  *
  *     Opus 4.8  ->  Sonnet 4.6  ->  Codex (gpt-5.x, only if a Codex login exists)
  *
- * Why overload-only: a 529 is per-MODEL capacity (Opus is the most contended on
- * Max/Pro; Sonnet/Codex are far less so), so switching models genuinely helps. A
- * 429 is your ACCOUNT-wide quota — switching Claude models won't help — so we do
- * NOT fall back on it (the resilient wrapper just backs off + surfaces). Codex is
- * a different provider entirely, so it survives an Anthropic-wide incident.
+ * Why these classes: a 529 is per-MODEL capacity (Opus is the most contended on
+ * Max/Pro; Sonnet/Codex are far less so) so switching genuinely helps; and when
+ * Anthropic is at capacity it frequently HANGS rather than returning a clean 529
+ * (model.transport_timeout) — gating on overload-only meant the chain never
+ * advanced on that, the dominant real-world failure, so a hung Claude took the
+ * turn down instead of falling over. A 429 is your ACCOUNT-wide quota — switching
+ * Claude models won't help — so we do NOT fall back on it (the resilient wrapper
+ * backs off + surfaces). Codex is a different provider, so it survives an
+ * Anthropic-wide incident.
  *
  * Retry-safety: for a streamed turn we may only switch BEFORE any event has been
  * yielded to the Runner. The resilient wrapper buffers metadata and yields
@@ -57,6 +61,23 @@ export function isOverloadError(err: unknown): boolean {
   return classifyModelError(err).kind === 'model.overloaded';
 }
 
+/** True when an error means the brain is UNAVAILABLE and a DIFFERENT brain is
+ *  worth trying: overloaded (529), a 5xx, OR a transport TIMEOUT (the request
+ *  hung with no response). The timeout is the load-bearing case — when Anthropic
+ *  is at capacity it often does NOT return a clean 529, it HANGS
+ *  (model.transport_timeout, after the resilient wrapper burns its retries).
+ *  Gating fallback on overload-only meant the chain never advanced on the failure
+ *  that actually happens in the wild, so a hung Claude took the whole turn down
+ *  ("Overloaded") instead of falling over. 429 (rate_limited) is deliberately
+ *  EXCLUDED — that's account-wide quota; switching Claude tiers won't help (the
+ *  resilient wrapper backs off + surfaces it). */
+export function isFalloverError(err: unknown): boolean {
+  const kind = err instanceof BoundaryError ? err.kind : classifyModelError(err).kind;
+  return kind === 'model.overloaded'
+    || kind === 'model.http_5xx'
+    || kind === 'model.transport_timeout';
+}
+
 export class FallbackModel implements Model {
   constructor(private readonly chain: FallbackTarget[]) {}
 
@@ -70,8 +91,8 @@ export class FallbackModel implements Model {
       try {
         return await this.chain[i].getModel().getResponse(request);
       } catch (err) {
-        if (isOverloadError(err) && i < this.chain.length - 1) {
-          logger.warn({ from: this.chain[i].label, to: this.chain[i + 1].label }, 'model overloaded — falling back to the next brain');
+        if (isFalloverError(err) && i < this.chain.length - 1) {
+          logger.warn({ from: this.chain[i].label, to: this.chain[i + 1].label, kind: err instanceof BoundaryError ? err.kind : undefined }, 'brain unavailable — falling back to the next brain');
           continue;
         }
         throw err;
@@ -98,8 +119,8 @@ export class FallbackModel implements Model {
       } catch (err) {
         // Can only switch if NOTHING reached the Runner yet (else we'd duplicate
         // a partially-streamed reply), it's an overload, and a next brain exists.
-        if (!yieldedAny && isOverloadError(err) && i < this.chain.length - 1) {
-          logger.warn({ from: this.chain[i].label, to: this.chain[i + 1].label }, 'model overloaded mid-request — falling back to the next brain');
+        if (!yieldedAny && isFalloverError(err) && i < this.chain.length - 1) {
+          logger.warn({ from: this.chain[i].label, to: this.chain[i + 1].label, kind: err instanceof BoundaryError ? err.kind : undefined }, 'brain unavailable mid-request — falling back to the next brain');
           continue;
         }
         throw err;
