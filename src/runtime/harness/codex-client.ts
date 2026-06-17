@@ -31,6 +31,7 @@ import { getStoredCodexOAuthTokens, refreshStoredNativeOAuth, accessTokenExpMs }
 import { CodexModelProvider } from './codex-model.js';
 import { RouterModelProvider } from './router-model.js';
 import { ClaudeModelProvider } from './claude-model.js';
+import { maybeWrapDebate } from './debate-model.js';
 import { loadClaudeAccessToken } from '../claude-oauth.js';
 import { getModelRoutingMode, getByoBackendConfig, getActiveAuthMode } from '../../config.js';
 
@@ -117,7 +118,7 @@ export async function configureHarnessRuntime(): Promise<ConfigureResult> {
     } catch (err) {
       return { ok: false, reason: err instanceof Error ? err.message : 'Claude subscription auth is not ready.' };
     }
-    setDefaultModelProvider(new ClaudeModelProvider());
+    setDefaultModelProvider(maybeWrapDebate(new ClaudeModelProvider()));
     configured = true;
     return { ok: true };
   }
@@ -137,7 +138,7 @@ export async function configureHarnessRuntime(): Promise<ConfigureResult> {
           'Set a backend (e.g., DeepSeek, MiniMax) in Settings → Model backend.',
       };
     }
-    setDefaultModelProvider(new RouterModelProvider());
+    setDefaultModelProvider(maybeWrapDebate(new RouterModelProvider()));
     configured = true;
     return { ok: true };
   }
@@ -156,12 +157,12 @@ export async function configureHarnessRuntime(): Promise<ConfigureResult> {
   // delegated worker labor routes to the BYO backend. Otherwise register
   // the codex-native provider exactly as before — byte-identical default.
   if (mode === 'worker' && byo.configured) {
-    setDefaultModelProvider(new RouterModelProvider());
+    setDefaultModelProvider(maybeWrapDebate(new RouterModelProvider()));
   } else {
     // Every agent that names a model string (e.g. `gpt-5.4`) gets a
     // CodexResponsesModel back, which hand-rolls the codex protocol
     // instead of leaning on the OpenAI SDK.
-    setDefaultModelProvider(new CodexModelProvider());
+    setDefaultModelProvider(maybeWrapDebate(new CodexModelProvider()));
   }
   configured = true;
   return { ok: true };
