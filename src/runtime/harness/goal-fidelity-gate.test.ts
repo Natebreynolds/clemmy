@@ -172,6 +172,48 @@ test('evaluateGoalFidelity: byte-identical opening across distinct firms (skill 
   }
 });
 
+test('evaluateGoalFidelity: a draft-only-skill block is present_for_approval — blocks WITHOUT counting a failure (no escalation)', async () => {
+  resetEventLog();
+  _resetGoalFidelityStateForTests();
+  const sess = createSession({ kind: 'chat' });
+  seedGoal(sess.id, 'Send the 8 prospect emails from the Scorpion mailbox.');
+  seedSkill(sess.id, 'scorpion-outbound', 'This skill does not send email. Present for approval: show To, Subject, Body and ask "Approve, or want changes?". Never claim the email was sent.');
+  _setGoalFidelityJudgeForTests(async () => ({
+    fulfills: false,
+    gap: 'the skill drafts and presents; show the draft for approval before sending',
+    blockKind: 'present_for_approval' as const,
+  }));
+  try {
+    const r1 = await evaluateGoalFidelity(sess.id, 'composio_execute_tool', sendArgs(SEND, 'caroline@tobininjurylaw.com', 'Caroline, ...'));
+    assert.equal(r1.action, 'block', 'still blocks the silent send');
+    assert.equal(r1.blockKind, 'present_for_approval');
+    assert.equal(r1.failureCount, undefined, 'a present-for-approval block is NOT counted as a fidelity failure');
+    // A second identical block must STILL not escalate (no bumpFailure).
+    const r2 = await evaluateGoalFidelity(sess.id, 'composio_execute_tool', sendArgs(SEND, 'caroline@tobininjurylaw.com', 'Caroline, ...'));
+    assert.equal(r2.failureCount, undefined, 'still no escalation on repeat — it is an inform, not a failure');
+  } finally {
+    _setGoalFidelityJudgeForTests(null);
+  }
+});
+
+test('GoalFidelityCheckFailedError: present_for_approval message says present-and-ask, NOT rebuild-and-retry', () => {
+  const present = new GoalFidelityCheckFailedError({
+    toolName: 'composio_execute_tool', reason: 'draft-only skill', targets: ['x@y.com'], failureCount: 0, blockKind: 'present_for_approval',
+  });
+  assert.match(present.message, /PRESENT the drafted/i);
+  assert.match(present.message, /Good to send\?/i);
+  assert.doesNotMatch(present.message, /rebuild the payload/i);
+  assert.doesNotMatch(present.message, /producer script/i);
+  assert.equal(present.blockKind, 'present_for_approval');
+
+  // 'other' (or absent) keeps the existing rebuild/retry recovery.
+  const other = new GoalFidelityCheckFailedError({
+    toolName: 'composio_execute_tool', reason: 'per-firm research skipped', targets: ['x@y.com'], failureCount: 1, blockKind: 'other',
+  });
+  assert.match(other.message, /rebuild the payload|producer script/i);
+  assert.doesNotMatch(other.message, /Good to send\?/i);
+});
+
 // ─── §7.2 renderer class: deterministic block, judge never called ──────────
 
 test('evaluateGoalFidelity: a loaded skill whose producer script never ran blocks deterministically (judge not consulted)', async () => {

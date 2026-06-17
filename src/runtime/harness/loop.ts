@@ -1076,7 +1076,25 @@ async function buildTurnMemoryPrimer(input: string): Promise<TurnMemoryPrimer> {
  * Reads from the eventlog only; never imports the model or SDK, so
  * unit tests can exercise this with a stubbed runner.
  */
-function buildStallRetryMessage(sessionId: string, stall: StallInfo): string {
+export function buildStallRetryMessage(sessionId: string, stall: StallInfo): string {
+  // If the most recent tool result was a draft-only-skill block asking the model
+  // to PRESENT the draft for approval, the stall nudge must NOT forbid text — a
+  // user-facing reply IS the correct move. Steer to present-and-ask instead of
+  // "call a tool, no text" (which is what sent the model hunting for tools and
+  // thrashing on the scorpion email batch, 2026-06-17).
+  try {
+    const recent = listEvents(sessionId, { types: ['tool_returned'], limit: 3, desc: true });
+    for (const ev of recent) {
+      const result = (ev.data as { result?: unknown })?.result;
+      if (typeof result === 'string' && result.includes('GOAL_FIDELITY_CHECK_FAILED') && /PRESENT the drafted/i.test(result)) {
+        return [
+          'Your previous send was held because the loaded skill drafts and presents — it does not itself send.',
+          ' Do NOT call another tool. Reply to the user NOW with the drafted item(s) — per item show the To, Subject, and Body — then ask plainly "Good to send?" and end your turn.',
+        ].join('');
+      }
+    }
+  } catch { /* fall through to the generic nudge */ }
+
   let toolCallHint = '';
   try {
     const events = listEvents(sessionId);

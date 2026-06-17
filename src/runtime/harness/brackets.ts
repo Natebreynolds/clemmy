@@ -963,6 +963,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
                   targets: verdict.targets.slice(0, 5),
                   reason: verdict.reason,
                   failureCount: verdict.failureCount ?? 1,
+                  blockKind: verdict.blockKind ?? 'other',
                 },
               });
             } catch { /* telemetry write must never block */ }
@@ -972,6 +973,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
               gap: verdict.gap,
               targets: verdict.targets,
               failureCount: verdict.failureCount ?? 1,
+              blockKind: verdict.blockKind,
             });
           }
         }

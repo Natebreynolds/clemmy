@@ -63,7 +63,7 @@ import { Agent, RunContext, RunState, type AgentInputItem, type Runner } from '@
 
 const { resetEventLog, requestKill, listEvents, createSession, appendEvent } = await import('./eventlog.js');
 const { HarnessSession } = await import('./session.js');
-const { runTurn, runConversation, resumePendingApproval, runConversationFromResume, isCodexAuthRevoked, normalizeError } = await import('./loop.js');
+const { runTurn, runConversation, resumePendingApproval, runConversationFromResume, isCodexAuthRevoked, normalizeError, buildStallRetryMessage } = await import('./loop.js');
 type RunRunnerFn = import('./loop.js').RunRunnerFn;
 const { ToolCallsLimitExceeded } = await import('./brackets.js');
 const { listEvents: listEventsForConv } = await import('./eventlog.js');
@@ -122,6 +122,28 @@ function makeApprovalRunStateWithInterruptions(
 
 const COMPLEX_INPUT =
   'Pull my unread Outlook emails and the open Salesforce leads, then update each Airtable contact record and draft outreach for the warm ones';
+
+test('buildStallRetryMessage: after a draft-only-skill block, steers to PRESENT the drafts — NOT "call a tool, no text"', () => {
+  // Fix 4(b): the false stall-nudge gagged the model exactly when it should
+  // present the drafts. After a present-for-approval refusal, the nudge must
+  // tell it to reply with the drafts, not forbid text.
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  appendEvent({
+    sessionId: sess.id, turn: 1, role: 'Clem', type: 'tool_returned',
+    data: { tool: 'composio_execute_tool', result: 'Tool call refused by harness: GOAL_FIDELITY_CHECK_FAILED: ... PRESENT the drafted item(s) to the user as your reply now ... then ask "Good to send?"' },
+  });
+  const msg = buildStallRetryMessage(sess.id, { signal: 'A_zero_tools', userVisibleMessage: '', detail: {} } as never);
+  assert.match(msg, /Reply to the user NOW with the drafted/i);
+  assert.doesNotMatch(msg, /do not emit any text/i);
+});
+
+test('buildStallRetryMessage: a normal stall (no draft-only block) still demands a tool call', () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const msg = buildStallRetryMessage(sess.id, { signal: 'A_zero_tools', userVisibleMessage: '', detail: {} } as never);
+  assert.match(msg, /call a tool/i);
+});
 
 test('normalizeError: a non-Error object never renders as "[object Object]" (the run_failed crash)', () => {
   // The exact class that produced "Something went wrong: [object Object]": a raw

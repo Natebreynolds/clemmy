@@ -61,6 +61,17 @@ export function isGoalFidelityGateEnabled(): boolean {
   return raw !== 'off' && raw !== 'false' && raw !== '0';
 }
 
+/** Draft-only-skill INFORM behavior (2026-06-17). When a send is blocked because
+ *  the loaded skill is draft-only / present-for-approval (a SCOPE statement, not a
+ *  prohibition), tell the model to PRESENT the drafts and ASK "good to send?"
+ *  rather than the generic "rebuild the payload and retry the write" recovery —
+ *  and don't count it as a fidelity FAILURE (no escalate). Still BLOCKS the send
+ *  (it does not auto-send). =off reverts to the old generic block for that kind. */
+export function isGoalFidelityDraftInformEnabled(): boolean {
+  if (!isGoalFidelityGateEnabled()) return false;
+  return (getRuntimeEnv('CLEMMY_GOAL_FIDELITY_DRAFT_INFORM', 'on') ?? 'on').toLowerCase() !== 'off';
+}
+
 // ─────────────────────────────────────────────────────────────────
 // Goal assembly (mirrors loop.ts feeding the completion judge)
 // ─────────────────────────────────────────────────────────────────
@@ -209,6 +220,13 @@ export interface GoalFidelityVerdict {
   fulfills: boolean;
   /** One sentence: the single specific gap (when fulfills=false), or why it passed. */
   gap: string;
+  /** When fulfills=false: 'present_for_approval' if the ONLY gap is that the
+   *  loaded skill is draft-only / requires presenting the draft for approval (a
+   *  SCOPE statement, not a ban on the user-approved send) → recovery is
+   *  present-and-ask, not retry-the-write, and it's not a fidelity FAILURE.
+   *  'other' for a genuine violation (wrong target, off-goal, un-rendered,
+   *  per-item research skipped). Absent ⇒ treated as 'other'. */
+  blockKind?: 'present_for_approval' | 'other';
 }
 
 export interface GoalFidelityJudgeInput {
@@ -238,6 +256,8 @@ export function buildGoalFidelityPrompt(input: GoalFidelityJudgeInput): string {
     '- the goal says do ONLY X and this action also does Y;',
     '- the skill requires a produced/rendered artifact and this action ships raw or unprocessed data.',
     'Vague dissatisfaction, style, "could be better", or anything you cannot put a name to → fulfills=true (FAIL OPEN). When in doubt, fulfills=true. A pure-advice/persona skill with no concrete per-item requirement has nothing to enforce → fulfills=true.',
+    '',
+    'SCOPE vs PROHIBITION: a skill that says "this skill does not send", "present for approval", or "never claim the email was sent" is describing its OWN SCOPE (it drafts; it does not itself send). That is NOT a prohibition on the user sending the approved draft. If the ONLY gap is that this present-for-approval step has not happened yet, set fulfills=false AND blockKind="present_for_approval" — the recovery is to present the draft to the user and ask "good to send?", NOT to rebuild the payload. Reserve blockKind="other" for a genuine violation (wrong target, off-goal, un-rendered artifact, per-item research skipped).',
     '',
     'Name the single specific gap and the concrete recovery.',
     '',
@@ -272,6 +292,7 @@ async function runGoalFidelityJudge(input: GoalFidelityJudgeInput): Promise<Goal
   const VerdictSchema = z.object({
     fulfills: z.boolean().describe('False ONLY on a concrete, nameable gap between this action and the goal\'s intent or the skill\'s defining requirement. Vague/style/uncertain → true (fail open).'),
     gap: z.string().describe('One short sentence: the single specific gap and the concrete recovery, or why the action is faithful.'),
+    blockKind: z.enum(['present_for_approval', 'other']).describe('When fulfills=false: "present_for_approval" if the ONLY gap is that the loaded skill is draft-only — it says "does not send" / "present for approval" / "never claim the email was sent" (that is the skill\'s SCOPE, NOT a ban on the user sending the approved draft). Use "other" for a genuine violation (wrong/byte-identical target, off-goal, un-rendered artifact, per-item research skipped). When fulfills=true, use "other".'),
   });
   const agent = new Agent({
     name: 'GoalFidelityJudge',
@@ -315,6 +336,9 @@ export interface GoalFidelityGateResult {
   targets: string[];
   /** Consecutive failures for this target including this one (block only). */
   failureCount?: number;
+  /** Why the block fired: 'present_for_approval' (draft-only skill — present the
+   *  draft + ask, do NOT count as a failure) vs 'other' (genuine violation). */
+  blockKind?: 'present_for_approval' | 'other';
 }
 
 /**
@@ -390,6 +414,24 @@ export async function evaluateGoalFidelity(
     failureCounts.delete(`${sessionId}::${targetKey}`);
     return { action: 'allow', mode: 'judge', reason: verdict.gap, targets };
   }
+
+  // Draft-only-skill block: the skill scoped itself out of sending (it drafts +
+  // presents). This is NOT a fidelity FAILURE to escalate — it's an inform:
+  // present the drafts and ask "good to send?". Don't bump the failure count
+  // (so it never escalates to STOP) and tag the kind so the error message tells
+  // the model to present-and-ask, not rebuild-and-retry. Still BLOCKS the send.
+  const presentForApproval = verdict.blockKind === 'present_for_approval' && isGoalFidelityDraftInformEnabled();
+  if (presentForApproval) {
+    return {
+      action: 'block',
+      mode: 'judge',
+      reason: verdict.gap,
+      gap: verdict.gap,
+      targets,
+      blockKind: 'present_for_approval',
+    };
+  }
+
   const failures = bumpFailure(sessionId, targetKey);
   return {
     action: 'block',
@@ -398,6 +440,7 @@ export async function evaluateGoalFidelity(
     gap: verdict.gap,
     targets,
     failureCount: failures,
+    blockKind: 'other',
   };
 }
 
@@ -420,18 +463,30 @@ export class GoalFidelityCheckFailedError extends Error {
   public readonly toolName: string;
   public readonly targets: string[];
   public readonly failureCount: number;
-  constructor(opts: { toolName: string; reason: string; gap?: string; targets: string[]; failureCount: number }) {
-    const escalate = opts.failureCount >= 2;
+  public readonly blockKind: 'present_for_approval' | 'other';
+  constructor(opts: { toolName: string; reason: string; gap?: string; targets: string[]; failureCount: number; blockKind?: 'present_for_approval' | 'other' }) {
+    const blockKind = opts.blockKind ?? 'other';
+    // Draft-only-skill block: the skill drafts + presents but does not itself
+    // send. The recovery is NOT "rebuild and retry the write" (the old generic
+    // suffix, which is meaningless here — there is no fixed payload to retry and
+    // sending it is what the skill scoped out). It is: present the drafts to the
+    // user and ASK. End the turn — don't hunt for another tool. This is the
+    // inform-not-block path the user asked for: a draft-only block should hand
+    // the drafts back, not crash or loop.
+    const recovery = blockKind === 'present_for_approval'
+      ? 'This is NOT a failure — the skill drafts and presents; it does not send. Do NOT retry this write and do NOT call another tool. PRESENT the drafted item(s) to the user as your reply now — show, per item, the To, Subject, Body and the research/insight used — then ask plainly "Good to send?" and END YOUR TURN. When the user confirms, send.'
+      : (opts.failureCount >= 2
+        ? 'This target has now failed goal-fidelity repeatedly — STOP. Do NOT retry the write. Use ask_user_question to show the user the gap and let them decide.'
+        : 'Recover: honor the missed requirement before this write — recall the per-item research (recall_tool_result / re-read the source) and rebuild the payload from the VERBATIM source, or run the skill\'s producer script to generate the deliverable — then retry. Do not re-fire the same payload.');
     super(
       `GOAL_FIDELITY_CHECK_FAILED: this irreversible ${opts.toolName} does not yet honor the run's stated goal and the loaded skill's defining requirement. ` +
         `Gap: ${opts.gap ?? opts.reason} ` +
-        (escalate
-          ? 'This target has now failed goal-fidelity repeatedly — STOP. Do NOT retry the write. Use ask_user_question to show the user the gap and let them decide.'
-          : 'Recover: honor the missed requirement before this write — recall the per-item research (recall_tool_result / re-read the source) and rebuild the payload from the VERBATIM source, or run the skill\'s producer script to generate the deliverable — then retry. Do not re-fire the same payload.'),
+        recovery,
     );
     this.name = 'GoalFidelityCheckFailedError';
     this.toolName = opts.toolName;
     this.targets = opts.targets;
     this.failureCount = opts.failureCount;
+    this.blockKind = blockKind;
   }
 }
