@@ -41,6 +41,7 @@ import { getClaudeModel } from './claude-model.js';
 import { CodexModelProvider } from './codex-model.js';
 import { getStoredCodexOAuthTokens } from '../auth-store.js';
 import { getStoredClaudeTokens } from '../claude-oauth.js';
+import { harnessRunContextStorage } from './brackets.js';
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
@@ -83,6 +84,38 @@ function heartbeatMs(): number {
 function draftGraceMs(): number {
   const raw = Number.parseInt(getRuntimeEnv('CLEMMY_DEBATE_DRAFT_GRACE_MS', '25000') ?? '25000', 10);
   return Number.isFinite(raw) && raw >= 0 ? raw : 25000;
+}
+
+/** Max debated iterations per user MESSAGE. The model is resolved once per run
+ *  (SDK #resolveModelForAgent), so the DebateModel instance persists across a
+ *  message's loop iterations and this counter is a true per-message cap.
+ *
+ *  WHY: debating EVERY loop iteration is the core cost blowup — a 10-iteration
+ *  agentic turn = 10×(2 drafts + judge) ≈ 30 calls. The research is one-sided
+ *  that debating intermediate tool-routing steps is net-negative (3-5× cost,
+ *  often WORSE accuracy from correct→wrong flips). Cap it so the multi-model
+ *  budget is spent on the first few high-value decisions, then run single-brain;
+ *  irreversible writes are still verified by the grounding/goal-fidelity gates.
+ *  0 = unlimited (legacy behavior). */
+function maxDebatesPerTurn(): number {
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_DEBATE_MAX_PER_TURN', '2') ?? '2', 10);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 2;
+}
+
+// Per-message debate counts keyed by the ACTIVE TURN's counter object (a fresh
+// ToolCallsCounter per runTurn, installed in AsyncLocalStorage around the SDK's
+// run() and shared across all of that message's internal loop iterations). This
+// is the reliable per-message key — the DebateModel instance does NOT always
+// persist across iterations, so a per-instance counter under-counts. WeakMap →
+// entries auto-GC when the turn ends (no leak). Falls back to per-instance when
+// there's no harness ALS (unit tests / non-harness callers).
+const debateCountByTurn = new WeakMap<object, number>();
+function activeTurnKey(): object | undefined {
+  try {
+    return harnessRunContextStorage.getStore()?.counter as unknown as object | undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** High-stakes heuristic for mode=high. A v1 proxy (replaceable by a proper
@@ -151,12 +184,40 @@ export interface DebateOptions {
   heartbeatMs?: number;
   /** Grace window (ms) for the second draft after the first lands. */
   draftGraceMs?: number;
+  /** Max debated iterations per message (0 = unlimited). */
+  maxPerTurn?: number;
   /** Injected for deterministic tests. */
   sleep?: (ms: number) => Promise<void>;
 }
 
 export class DebateModel implements Model {
   constructor(private readonly brains: DebateBrains, private readonly opts: DebateOptions = {}) {}
+
+  /** Debates already spent this message (instance is resolved once per run). */
+  private debatesThisTurn = 0;
+
+  /** Debate THIS iteration? The mode/stakes gate AND the per-message cap.
+   *  Commits a debate slot (increments) only when it returns true, so the cap
+   *  bounds the multi-model spend per user message. */
+  private wantsDebate(request: ModelRequest): boolean {
+    if (!shouldDebate(request)) return false;
+    const cap = this.opts.maxPerTurn ?? maxDebatesPerTurn();
+    if (cap <= 0) { this.debatesThisTurn += 1; return true; } // unlimited (legacy)
+
+    // Prefer the per-message key (survives across loop iterations regardless of
+    // model-instance lifetime); fall back to the per-instance counter in tests.
+    const key = activeTurnKey();
+    if (key) {
+      const n = debateCountByTurn.get(key) ?? 0;
+      if (n >= cap) return false;
+      debateCountByTurn.set(key, n + 1);
+      this.debatesThisTurn = n + 1; // surfaced in the trace as `n`
+      return true;
+    }
+    if (this.debatesThisTurn >= cap) return false;
+    this.debatesThisTurn += 1;
+    return true;
+  }
 
   private get hb(): number {
     return this.opts.heartbeatMs ?? heartbeatMs();
@@ -166,7 +227,7 @@ export class DebateModel implements Model {
   }
 
   async getResponse(request: ModelRequest): Promise<ModelResponse> {
-    if (!shouldDebate(request)) return this.brains.passthrough.getResponse(request);
+    if (!this.wantsDebate(request)) return this.brains.passthrough.getResponse(request);
     const { a, b } = await this.draftBoth(request);
     if (!a || !b) {
       const survivor = a ?? b;
@@ -184,7 +245,7 @@ export class DebateModel implements Model {
     try {
       const final = await this.brains.judge.getResponse(buildJudgeRequest(request, a, b));
       logger.info({ path: 'getResponse', divergence: div, draftAlen: da.length, draftBlen: db.length, judge: judgeChoice() }, 'debate turn reconciled');
-      recordDebateTrace({ path: 'getResponse', divergence: div, judge: judgeChoice(), draftA: capText(da), draftB: capText(db), final: capText(extractAssistantText(final.output)) });
+      recordDebateTrace({ path: 'getResponse', n: this.debatesThisTurn, divergence: div, judge: judgeChoice(), draftA: capText(da), draftB: capText(db), final: capText(extractAssistantText(final.output)) });
       return final;
     } catch (err) {
       // The judge failed AFTER two valid drafts — don't lose the turn; answer
@@ -196,9 +257,9 @@ export class DebateModel implements Model {
   }
 
   async *getStreamedResponse(request: ModelRequest): AsyncIterable<StreamEvent> {
-    if (!shouldDebate(request)) {
-      // Not a debate turn: forward the normal brain verbatim (response_started,
-      // deltas, response_done all pass through unchanged).
+    if (!this.wantsDebate(request)) {
+      // Not a debate turn (mode/stakes gate or per-message cap reached): forward
+      // the normal brain verbatim (response_started, deltas, response_done).
       yield* this.brains.passthrough.getStreamedResponse(request);
       return;
     }
@@ -256,7 +317,7 @@ export class DebateModel implements Model {
     // text deltas — fall back to that so the trace isn't under-reported.
     const finalForTrace = finalText || extractAssistantText(judgeFinalOutput);
     logger.info({ path: 'stream', divergence: div, draftAlen: da.length, draftBlen: db.length, finalLen: finalForTrace.length, judge: judgeChoice() }, 'debate turn reconciled');
-    recordDebateTrace({ path: 'stream', divergence: div, judge: judgeChoice(), draftA: capText(da), draftB: capText(db), final: capText(finalForTrace) });
+    recordDebateTrace({ path: 'stream', n: this.debatesThisTurn, divergence: div, judge: judgeChoice(), draftA: capText(da), draftB: capText(db), final: capText(finalForTrace) });
   }
 
   /** Draft on both brains in parallel, but DON'T let a slow/flaky brain hold the

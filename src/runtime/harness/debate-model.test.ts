@@ -1,7 +1,17 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import type { Model, ModelRequest, ModelResponse } from '@openai/agents-core';
-import {
+import type { DebateBrains } from './debate-model.js';
+
+// Isolate from the host's ~/.clementine-next/.env: getRuntimeEnv() falls back to
+// BASE_DIR/.env, so debateMode()/shouldDebate() default assertions must not see a
+// CLEMMY_DEBATE_MODE the operator set live. Point BASE_DIR at an empty temp dir
+// BEFORE the module (and config.ts) load — hence the dynamic import.
+process.env.CLEMENTINE_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-debate-test-'));
+const {
   DebateModel,
   debateMode,
   shouldDebate,
@@ -9,8 +19,7 @@ import {
   summarizeOutput,
   heartbeatsUntil,
   streamResponseAsEvents,
-  type DebateBrains,
-} from './debate-model.js';
+} = await import('./debate-model.js');
 
 // --- fixtures ---------------------------------------------------------------
 
@@ -327,6 +336,41 @@ test('getStreamedResponse: judge failure AFTER content rethrows (cannot duplicat
     const got: any[] = [];
     await assert.rejects(async () => { for await (const e of new DebateModel(b, { heartbeatMs: 0 }).getStreamedResponse(req())) got.push(e); });
     assert.ok(got.some((e) => e.type === 'output_text_delta' && e.delta === 'partial'));
+  });
+});
+
+test('per-message cap: debate runs at most maxPerTurn times across iterations, then passes through', async () => {
+  await withEnv({ CLEMMY_DEBATE_MODE: 'all' }, async () => {
+    let drafts = 0;
+    let passthrough = 0;
+    const b = brains({
+      draftA: model({ getResponse: async () => { drafts += 1; return msg('A'); } }),
+      draftB: model({ getResponse: async () => msg('B') }),
+      judge: model({ getResponse: async () => msg('JUDGED') }),
+      passthrough: model({ getResponse: async () => { passthrough += 1; return msg('PASS'); } }),
+    });
+    // One DebateModel instance = one message (model resolved once per run).
+    const m = new DebateModel(b, { maxPerTurn: 2 });
+    const r1 = await m.getResponse(req()); // debate 1
+    const r2 = await m.getResponse(req()); // debate 2
+    const r3 = await m.getResponse(req()); // cap hit → passthrough
+    const r4 = await m.getResponse(req()); // passthrough
+    assert.equal((r1.output[0] as any).content, 'JUDGED');
+    assert.equal((r2.output[0] as any).content, 'JUDGED');
+    assert.equal((r3.output[0] as any).content, 'PASS', 'cap reached → single-brain');
+    assert.equal((r4.output[0] as any).content, 'PASS');
+    assert.equal(drafts, 2, 'drafted only for the 2 capped debates');
+    assert.equal(passthrough, 2, 'remaining iterations ran single-brain');
+  });
+});
+
+test('per-message cap: maxPerTurn=0 means unlimited (legacy)', async () => {
+  await withEnv({ CLEMMY_DEBATE_MODE: 'all' }, async () => {
+    let drafts = 0;
+    const b = brains({ draftA: model({ getResponse: async () => { drafts += 1; return msg('A'); } }) });
+    const m = new DebateModel(b, { maxPerTurn: 0 });
+    await m.getResponse(req()); await m.getResponse(req()); await m.getResponse(req());
+    assert.equal(drafts, 3, 'no cap → every iteration debates');
   });
 });
 
