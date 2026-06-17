@@ -399,6 +399,25 @@ test('verify strategy: tool-routing drafts ship as-is (no slot spent); the answe
   });
 });
 
+test('verify strategy: a structured draft with empty reply (workflow step) ships as-is — no checker, no slot', async () => {
+  await withEnv({ CLEMMY_DEBATE_MODE: 'all', CLEMMY_FUSION_STRATEGY: 'verify' }, async () => {
+    let checkerCalls = 0;
+    const stepDraft: any = { output: [{ type: 'message', content: JSON.stringify({ reply: '', summary: 'step done', done: true }) }], responseId: 'rw', usage: {} };
+    const answerDraft: any = { output: [{ type: 'message', content: JSON.stringify({ reply: 'Here is your answer.', summary: 's', done: true }) }], responseId: 'ra', usage: {} };
+    let call = 0;
+    const b = brains({
+      passthrough: model({ getResponse: async () => (call++ === 0 ? stepDraft : answerDraft) }),
+      judge: model({ getResponse: async () => { checkerCalls += 1; return msg('CHECKED'); } }),
+    });
+    const m = dm(b, { maxPerTurn: 1 });
+    const r1 = await m.getResponse(req()); // empty reply → ship as-is, no checker, no slot
+    const r2 = await m.getResponse(req()); // real reply → checked (slot preserved)
+    assert.equal(JSON.parse((r1.output[0] as any).content).reply, '', 'empty-reply step shipped as-is');
+    assert.equal((r2.output[0] as any).content, 'CHECKED', 'the turn with a real reply got checked');
+    assert.equal(checkerCalls, 1, 'checker ran only on the turn with a non-empty reply');
+  });
+});
+
 test('verify strategy: checker failure pre-content ships the executor draft (conformant, no crash)', async () => {
   await withEnv({ CLEMMY_DEBATE_MODE: 'all', CLEMMY_FUSION_STRATEGY: 'verify' }, async () => {
     const b = brains({

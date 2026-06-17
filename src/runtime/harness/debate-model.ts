@@ -438,7 +438,7 @@ export class DebateModel implements Model {
     // Only spend a checker call on a real USER-FACING answer (not a tool-routing
     // step like focus_get), and only while under the per-message cap — so the
     // fusion budget lands on the answer, never on plumbing iterations.
-    if (!extractAssistantText(draft.output).trim() || !this.spendFusionSlot()) {
+    if (!hasUserFacingAnswer(draft.output) || !this.spendFusionSlot()) {
       return draft;
     }
     try {
@@ -473,7 +473,7 @@ export class DebateModel implements Model {
     // Only spend a checker call on a real USER-FACING answer + under the cap —
     // otherwise ship the executor's draft as-is, so the fusion budget is never
     // wasted on tool-routing (focus_get) or other non-answer iterations.
-    if (!extractAssistantText(draft.output).trim() || !this.spendFusionSlot()) {
+    if (!hasUserFacingAnswer(draft.output) || !this.spendFusionSlot()) {
       yield* streamResponseAsEvents(draft);
       return;
     }
@@ -685,6 +685,27 @@ export function summarizeOutput(output: unknown): string {
     // reasoning / other item types are intentionally omitted from the digest.
   }
   return parts.join('\n').trim();
+}
+
+/** Is this draft a USER-FACING answer worth a checker pass? It needs assistant
+ *  text, and — when that text is the orchestrator's structured decision — a
+ *  non-empty `reply`. This skips tool-routing (no text), workflow-step results
+ *  (reply ""), and other non-user-facing structured emissions, so the verify
+ *  budget lands only on a turn the user actually reads. Plain-prose answers
+ *  (non-JSON) are always user-facing. */
+function hasUserFacingAnswer(output: unknown): boolean {
+  const text = extractAssistantText(output).trim();
+  if (!text) return false;
+  try {
+    const obj = JSON.parse(text);
+    if (obj && typeof obj === 'object' && !Array.isArray(obj) && 'reply' in obj) {
+      const r = (obj as { reply?: unknown }).reply;
+      return typeof r === 'string' && r.trim().length > 0;
+    }
+  } catch {
+    /* not JSON → plain-prose answer; treat as user-facing */
+  }
+  return true;
 }
 
 /** Assistant text only (for replaying a single surviving draft to the user). */
