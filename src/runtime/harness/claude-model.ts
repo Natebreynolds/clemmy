@@ -28,6 +28,9 @@ import type { Model, ModelProvider } from '@openai/agents-core';
 import { loadFreshClaudeAccessToken } from '../claude-oauth.js';
 import { getClaudeBrainModel, getRuntimeEnv } from '../../config.js';
 import { withResilience } from './resilient-model.js';
+import { withModelFallback, type FallbackTarget } from './fallback-model.js';
+import { CodexModelProvider } from './codex-model.js';
+import { getStoredCodexOAuthTokens } from '../auth-store.js';
 import { resolveModelCapability, estimateTokens, modelParityEnabled, restoreLegacyInstructionOrder, CACHE_BREAK_SENTINEL, type ModelCapability } from './model-wire-registry.js';
 import pino from 'pino';
 
@@ -505,12 +508,40 @@ function isClaudeModelId(id: string | undefined): boolean {
   return Boolean(id && /claude|opus|sonnet|haiku/i.test(id));
 }
 
+/** Overload-fallback (Opus -> Sonnet -> Codex-if-installed) on a 529. Default on;
+ *  CLEMMY_CLAUDE_OVERLOAD_FALLBACK=off keeps a single brain (retry + surface). */
+export function overloadFallbackEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_CLAUDE_OVERLOAD_FALLBACK', 'on') || 'on').trim().toLowerCase() !== 'off';
+}
+
+const SONNET_FALLBACK_ID = 'claude-sonnet-4-6';
+
+/** A Codex fallback target — ONLY if a Codex login exists (different provider, so
+ *  it survives an Anthropic-wide overload). null when Codex isn't installed. */
+function codexFallbackTarget(): FallbackTarget | null {
+  try {
+    if (!getStoredCodexOAuthTokens()?.accessToken) return null;
+    return { label: 'codex', getModel: () => new CodexModelProvider().getModel() };
+  } catch {
+    return null;
+  }
+}
+
 export class ClaudeModelProvider implements ModelProvider {
   getModel(modelName?: string): Model {
     // A claude-* id is used verbatim; any other id (e.g. a gpt-5* tier name) maps
     // to the configured Claude brain model so the whole harness runs on Claude.
     const id = isClaudeModelId(modelName) ? (modelName as string) : getClaudeBrainModel();
-    return getClaudeModel(id);
+    const primary = getClaudeModel(id);
+    if (!overloadFallbackEnabled()) return primary;
+    // Overload chain: primary -> Sonnet (unless already Sonnet) -> Codex (if any).
+    const chain: FallbackTarget[] = [{ label: id, getModel: () => primary }];
+    if (id !== SONNET_FALLBACK_ID) {
+      chain.push({ label: SONNET_FALLBACK_ID, getModel: () => getClaudeModel(SONNET_FALLBACK_ID) });
+    }
+    const codex = codexFallbackTarget();
+    if (codex) chain.push(codex);
+    return withModelFallback(chain);
   }
 }
 
