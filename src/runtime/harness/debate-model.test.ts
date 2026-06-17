@@ -373,6 +373,27 @@ test('verify strategy (streamed): executor draft → checker streams refined; on
   });
 });
 
+test('verify strategy: tool-routing drafts ship as-is (no slot spent); the answer still gets checked', async () => {
+  await withEnv({ CLEMMY_DEBATE_MODE: 'all', CLEMMY_FUSION_STRATEGY: 'verify' }, async () => {
+    let executorCall = 0;
+    let checkerCalls = 0;
+    const drafts: any[] = [
+      { output: [{ type: 'function_call', name: 'focus_get', arguments: {} }], responseId: 'r1', usage: {} }, // tool-routing (no answer text)
+      { output: [{ type: 'message', content: 'THE ANSWER' }], responseId: 'r2', usage: {} },                  // user-facing answer
+    ];
+    const b = brains({
+      passthrough: model({ getResponse: async () => drafts[executorCall++] }),
+      judge: model({ getResponse: async () => { checkerCalls += 1; return msg('CHECKED'); } }),
+    });
+    const m = new DebateModel(b, { maxPerTurn: 1 }); // cap of ONE
+    const r1 = await m.getResponse(req()); // tool-routing → ship as-is, no checker, no slot
+    const r2 = await m.getResponse(req()); // answer → checked (the slot was preserved)
+    assert.equal((r1.output[0] as any).type, 'function_call', 'tool-routing draft shipped as-is');
+    assert.equal((r2.output[0] as any).content, 'CHECKED', 'the answer got checked');
+    assert.equal(checkerCalls, 1, 'checker ran exactly once — only on the user-facing answer');
+  });
+});
+
 test('verify strategy: checker failure pre-content ships the executor draft (conformant, no crash)', async () => {
   await withEnv({ CLEMMY_DEBATE_MODE: 'all', CLEMMY_FUSION_STRATEGY: 'verify' }, async () => {
     const b = brains({

@@ -209,16 +209,17 @@ export class DebateModel implements Model {
   /** Debates already spent this message (instance is resolved once per run). */
   private debatesThisTurn = 0;
 
-  /** Debate THIS iteration? The mode/stakes gate AND the per-message cap.
-   *  Commits a debate slot (increments) only when it returns true, so the cap
-   *  bounds the multi-model spend per user message. */
-  private wantsDebate(request: ModelRequest): boolean {
-    if (!shouldDebate(request)) return false;
+  /** Try to claim a per-message fusion slot (debate or verify). Returns false when
+   *  the per-message cap is already spent; increments + returns true otherwise.
+   *  Keyed off the active turn (survives across loop iterations regardless of
+   *  model-instance lifetime); per-instance fallback in tests. The mode/stakes
+   *  gate (shouldDebate) is checked separately, and verify only calls this AFTER
+   *  it confirms the draft is a user-facing answer — so slots are never wasted on
+   *  tool-routing (focus_get) or internal sub-calls. */
+  private spendFusionSlot(): boolean {
     const cap = this.opts.maxPerTurn ?? maxDebatesPerTurn();
     if (cap <= 0) { this.debatesThisTurn += 1; return true; } // unlimited (legacy)
 
-    // Prefer the per-message key (survives across loop iterations regardless of
-    // model-instance lifetime); fall back to the per-instance counter in tests.
     const key = activeTurnKey();
     if (key) {
       const n = debateCountByTurn.get(key) ?? 0;
@@ -240,8 +241,9 @@ export class DebateModel implements Model {
   }
 
   async getResponse(request: ModelRequest): Promise<ModelResponse> {
-    if (!this.wantsDebate(request)) return this.brains.passthrough.getResponse(request);
+    if (!shouldDebate(request)) return this.brains.passthrough.getResponse(request);
     if (fusionStrategy() === 'verify') return this.verifyResponse(request);
+    if (!this.spendFusionSlot()) return this.brains.passthrough.getResponse(request);
     const { a, b } = await this.draftBoth(request);
     if (!a || !b) {
       const survivor = a ?? b;
@@ -271,15 +273,21 @@ export class DebateModel implements Model {
   }
 
   async *getStreamedResponse(request: ModelRequest): AsyncIterable<StreamEvent> {
-    if (!this.wantsDebate(request)) {
-      // Not a debate turn (mode/stakes gate or per-message cap reached): forward
-      // the normal brain verbatim (response_started, deltas, response_done).
+    if (!shouldDebate(request)) {
+      // Not a debate turn (mode/stakes gate): forward the normal brain verbatim.
       yield* this.brains.passthrough.getStreamedResponse(request);
       return;
     }
 
     if (fusionStrategy() === 'verify') {
+      // verify claims its slot AFTER drafting (only for a user-facing answer).
       yield* this.verifyStreamed(request);
+      return;
+    }
+
+    if (!this.spendFusionSlot()) {
+      // Per-message debate cap reached → run single-brain for the rest.
+      yield* this.brains.passthrough.getStreamedResponse(request);
       return;
     }
 
@@ -413,8 +421,14 @@ export class DebateModel implements Model {
     if (!draft) {
       // Executor failed → the checker answers the original request directly.
       logger.warn('fusion verify: executor draft failed — checker answers directly');
-      recordDebateTrace({ path: 'verify', n: this.debatesThisTurn, outcome: 'executor-failed' });
+      recordDebateTrace({ path: 'verify', outcome: 'executor-failed' });
       return this.brains.judge.getResponse(request);
+    }
+    // Only spend a checker call on a real USER-FACING answer (not a tool-routing
+    // step like focus_get), and only while under the per-message cap — so the
+    // fusion budget lands on the answer, never on plumbing iterations.
+    if (!extractAssistantText(draft.output).trim() || !this.spendFusionSlot()) {
+      return draft;
     }
     try {
       const final = await this.brains.judge.getResponse(buildVerifyRequest(request, draft));
@@ -440,8 +454,16 @@ export class DebateModel implements Model {
 
     if (!draft) {
       logger.warn('fusion verify: executor draft failed — checker streams the answer directly');
-      recordDebateTrace({ path: 'verify', n: this.debatesThisTurn, outcome: 'executor-failed' });
+      recordDebateTrace({ path: 'verify', outcome: 'executor-failed' });
       yield* dropResponseStarted(this.brains.judge.getStreamedResponse(request));
+      return;
+    }
+
+    // Only spend a checker call on a real USER-FACING answer + under the cap —
+    // otherwise ship the executor's draft as-is, so the fusion budget is never
+    // wasted on tool-routing (focus_get) or other non-answer iterations.
+    if (!extractAssistantText(draft.output).trim() || !this.spendFusionSlot()) {
+      yield* streamResponseAsEvents(draft);
       return;
     }
 
