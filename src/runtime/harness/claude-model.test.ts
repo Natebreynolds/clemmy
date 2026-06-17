@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { applyClaudeEnvelope, withIdentityPrefix, ClaudeModelProvider } from './claude-model.js';
+import { applyClaudeEnvelope, withIdentityPrefix, ClaudeModelProvider, sanitizeClaudeInput, aisdkAcceptsReasoning, withClaudeInputSanitizer } from './claude-model.js';
 
 const ID = "You are Claude Code, Anthropic's official CLI for Claude.".replace('Claude', 'Claude'); // exact identity
 const IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude.";
@@ -53,6 +53,54 @@ test('ClaudeModelProvider: constructs a Model; non-claude ids map to the brain m
   // a gpt-5* tier name still yields a (Claude) Model — the whole harness runs on Claude
   const m2 = p.getModel('gpt-5.4');
   assert.equal(typeof (m2 as { getStreamedResponse?: unknown }).getStreamedResponse, 'function');
+});
+
+test('aisdkAcceptsReasoning: only string-text content is accepted (matches the adapter guard)', () => {
+  assert.equal(aisdkAcceptsReasoning({ content: [{ text: 'I should…' }] }), true);
+  assert.equal(aisdkAcceptsReasoning({ content: [] }), false, 'Codex reasoning: empty content array');
+  assert.equal(aisdkAcceptsReasoning({}), false, 'no content at all');
+  assert.equal(aisdkAcceptsReasoning({ content: [{ text: 42 }] }), false, 'non-string text');
+});
+
+test('sanitizeClaudeInput: drops ONLY the Codex-shaped reasoning that would crash the aisdk adapter', () => {
+  const input = [
+    { type: 'message', role: 'user', content: 'hi' },
+    { type: 'reasoning', content: [], encrypted_content: 'opaque' }, // Codex — would throw
+    { type: 'reasoning', content: [{ text: 'visible thought' }] },   // well-formed — keep
+    { type: 'function_call', name: 'focus_get', arguments: '{}' },
+  ];
+  const out = sanitizeClaudeInput(input) as Array<{ type: string }>;
+  assert.equal(out.length, 3, 'one empty-content reasoning item dropped');
+  assert.deepEqual(out.map((i) => i.type), ['message', 'reasoning', 'function_call']);
+  // the surviving reasoning is the well-formed one
+  const keptReasoning = out.find((i) => i.type === 'reasoning') as { content: Array<{ text: string }> };
+  assert.equal(keptReasoning.content[0].text, 'visible thought');
+});
+
+test('sanitizeClaudeInput: a string input and a clean array are returned UNCHANGED (same reference)', () => {
+  assert.equal(sanitizeClaudeInput('plain string input'), 'plain string input');
+  const clean = [{ type: 'message', role: 'user', content: 'hi' }];
+  assert.equal(sanitizeClaudeInput(clean), clean, 'no reasoning to strip → same array reference (no churn)');
+});
+
+test('withClaudeInputSanitizer: forwards SANITIZED input to the inner model on both paths', async () => {
+  const seen: { getResponse?: unknown; getStreamed?: unknown } = {};
+  const inner = {
+    getResponse: async (req: { input?: unknown }) => { seen.getResponse = req.input; return { output: [], usage: {} } as never; },
+    // eslint-disable-next-line require-yield
+    getStreamedResponse: async function* (req: { input?: unknown }) { seen.getStreamed = req.input; },
+  };
+  const wrapped = withClaudeInputSanitizer(inner as never);
+  const dirty = [
+    { type: 'reasoning', content: [] },
+    { type: 'message', role: 'user', content: 'go' },
+  ];
+  await wrapped.getResponse({ input: dirty } as never);
+  for await (const _ of wrapped.getStreamedResponse({ input: dirty } as never)) { void _; }
+  const r = seen.getResponse as Array<{ type: string }>;
+  const s = seen.getStreamed as Array<{ type: string }>;
+  assert.deepEqual(r.map((i) => i.type), ['message'], 'getResponse received sanitized input');
+  assert.deepEqual(s.map((i) => i.type), ['message'], 'getStreamedResponse received sanitized input');
 });
 
 void ID;

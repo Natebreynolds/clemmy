@@ -24,7 +24,8 @@
 import { aisdk } from '@openai/agents-extensions/ai-sdk';
 import { createAnthropic } from '@ai-sdk/anthropic';
 import { Agent } from 'undici';
-import type { Model, ModelProvider } from '@openai/agents-core';
+import type { Model, ModelProvider, ModelRequest, ModelResponse } from '@openai/agents-core';
+import type { StreamEvent } from '@openai/agents-core/types';
 import { loadFreshClaudeAccessToken } from '../claude-oauth.js';
 import { getClaudeBrainModel, getRuntimeEnv } from '../../config.js';
 import { withResilience } from './resilient-model.js';
@@ -485,11 +486,69 @@ function getProvider(): ReturnType<typeof createAnthropic> {
   return provider;
 }
 
+/** Does the aisdk Anthropic adapter accept this `reasoning` item, or will it
+ *  throw `UserError: Unknown item type: reasoning`? The adapter
+ *  (@openai/agents-extensions/ai-sdk) only handles a reasoning item whose
+ *  `content[0].text` is a string; anything else falls through to its
+ *  `throw new UserError('Unknown item type: reasoning')`. */
+export function aisdkAcceptsReasoning(item: { content?: unknown }): boolean {
+  const content = item?.content;
+  return Array.isArray(content) && content.length > 0 && typeof (content[0] as { text?: unknown })?.text === 'string';
+}
+
+/** Strip the cross-model items the aisdk Anthropic adapter cannot serialize.
+ *
+ *  Why this exists (live failure): Codex emits `reasoning` items with an EMPTY
+ *  `content` array — the actual trace lives in encrypted providerData scoped to
+ *  the OpenAI provider. When a Claude brain CONSUMES input produced by Codex, the
+ *  adapter hits that empty-content reasoning item and throws `Unknown item type:
+ *  reasoning`, crashing the whole turn. This happens on every Codex->Claude
+ *  boundary: the fusion judge/checker (executor=Codex, checker=Claude) and the
+ *  overload fallback (Codex draft -> Claude). Fixing it at the Claude model
+ *  boundary covers ALL of those paths (the general class), not one call site.
+ *
+ *  We drop ONLY the reasoning items the adapter would reject. Well-formed
+ *  reasoning (string text — e.g. Claude's own extended-thinking blocks carrying
+ *  signatures the Anthropic API needs echoed back) is preserved, so thinking
+ *  continuity is never broken. Reasoning is intermediate scratch; the user-facing
+ *  answer and the harness's `role:system` context packet (focus/memory/goal) are
+ *  untouched — only an array input is filtered, a string input is passed through. */
+export function sanitizeClaudeInput(input: unknown): unknown {
+  if (!Array.isArray(input)) return input;
+  let dropped = 0;
+  const out = input.filter((it) => {
+    const item = it as { type?: string; content?: unknown };
+    if (item?.type === 'reasoning' && !aisdkAcceptsReasoning(item)) { dropped += 1; return false; }
+    return true;
+  });
+  if (dropped > 0) logger.debug({ dropped }, 'sanitized cross-model reasoning items the Anthropic adapter cannot serialize');
+  return dropped > 0 ? out : input;
+}
+
+/** Innermost Claude-model decorator: sanitize request.input before it reaches the
+ *  aisdk adapter, so a Codex-shaped reasoning item can never crash a Claude turn.
+ *  Wraps the bare adapter so retries (withResilience) see sanitized input too. */
+class ClaudeInputSanitizingModel implements Model {
+  constructor(private readonly inner: Model) {}
+  getResponse(request: ModelRequest): Promise<ModelResponse> {
+    return this.inner.getResponse({ ...request, input: sanitizeClaudeInput((request as { input?: unknown }).input) } as ModelRequest);
+  }
+  getStreamedResponse(request: ModelRequest): AsyncIterable<StreamEvent> {
+    return this.inner.getStreamedResponse({ ...request, input: sanitizeClaudeInput((request as { input?: unknown }).input) } as ModelRequest);
+  }
+}
+
+export function withClaudeInputSanitizer(inner: Model): Model {
+  return new ClaudeInputSanitizingModel(inner);
+}
+
 const modelCache = new Map<string, Model>();
 export function getClaudeModel(modelId: string): Model {
   const cached = modelCache.get(modelId);
   if (cached) return cached;
-  let model: Model = aisdk(getProvider()(modelId));
+  // Sanitize cross-model input FIRST (innermost), so a Codex-shaped reasoning
+  // item can't crash the aisdk adapter — on the primary call OR any retry.
+  let model: Model = withClaudeInputSanitizer(aisdk(getProvider()(modelId)));
   // Parity layer: provider-agnostic resilience (retry/empty/401) + reasoning
   // translation (effort -> output_config.effort). Wrap BEFORE caching so the
   // cache hands back the resilient model, not the bare passthrough.
