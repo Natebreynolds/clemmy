@@ -94,6 +94,16 @@ test('classifyTool: local-side-effect tools never gate on approval', () => {
   assert.equal(classifyTool('workflow_run'), 'read');
 });
 
+test('classifyTool: memory_review_instructions is a READ (the confirm-first gate forces this call — it must not self-park for approval)', () => {
+  // Regression for the 2026-06-17 double-approval on an outbound email batch:
+  // the confirm-first gate requires the model to call memory_review_instructions
+  // as the recovery for a batch of same-shape external writes, but the tool was
+  // falling through to the conservative 'write' default and PARKING for approval,
+  // injecting a spurious interrupt into the "surface a plan" flow. It mutates
+  // nothing — it returns the standing instructions to show the user.
+  assert.equal(classifyTool('memory_review_instructions'), 'read');
+});
+
 test('classifyTool: write prefixes', () => {
   assert.equal(classifyTool('write_file'), 'write');
   assert.equal(classifyTool('remember'), 'write');

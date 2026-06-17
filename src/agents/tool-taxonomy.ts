@@ -173,6 +173,16 @@ const ALWAYS_READ = new Set<string>([
   'memory_read',
   'memory_recall',
   'memory_search',
+  // 2026-06-17: memory_review_instructions is a PURE READ — it returns the
+  // standing instructions in play (relevance-sorted text) so Clem can show the
+  // user what she's following before a batch write. It mutates nothing. It was
+  // falling through to the conservative 'write' default and PARKING FOR APPROVAL
+  // — which is doubly wrong: the confirm-first gate (confirm-first-gate.ts)
+  // REQUIRES the model to call this tool as the prescribed recovery for a batch
+  // of same-shape external writes, so the misclassification injected a spurious
+  // approval interrupt right in the middle of the "surface a plan" flow (a real
+  // user-observed double-approval on an outbound email batch, 2026-06-17).
+  'memory_review_instructions',
   'task_list',
   'execution_list',
   'execution_get',
