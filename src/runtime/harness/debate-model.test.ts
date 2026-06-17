@@ -339,6 +339,53 @@ test('getStreamedResponse: judge failure AFTER content rethrows (cannot duplicat
   });
 });
 
+// --- 'verify' strategy: Codex drives (executor=passthrough), Claude checks (judge) ---
+
+test('verify strategy: executor drafts, checker verifies → returns the checker final', async () => {
+  await withEnv({ CLEMMY_DEBATE_MODE: 'all', CLEMMY_FUSION_STRATEGY: 'verify' }, async () => {
+    let executorCalls = 0;
+    let checkerSawDraft = '';
+    const b = brains({
+      passthrough: model({ getResponse: async () => { executorCalls += 1; return msg('CODEX-DRAFT'); } }),
+      judge: model({ getResponse: async (r: any) => { checkerSawDraft = r.systemInstructions; return msg('CLAUDE-REFINED'); } }),
+    });
+    const res = await new DebateModel(b).getResponse(req());
+    assert.equal((res.output[0] as any).content, 'CLAUDE-REFINED');
+    assert.equal(executorCalls, 1, 'executor drafted exactly once (2 calls total, not 3)');
+    assert.match(checkerSawDraft, /CODEX-DRAFT/, 'checker received the executor draft');
+    assert.match(checkerSawDraft, /VERIFY & REFINE/);
+  });
+});
+
+test('verify strategy (streamed): executor draft → checker streams refined; one response_started', async () => {
+  await withEnv({ CLEMMY_DEBATE_MODE: 'all', CLEMMY_FUSION_STRATEGY: 'verify' }, async () => {
+    const b = brains({
+      passthrough: model({ getResponse: async () => msg('CODEX-DRAFT') }),
+      judge: model({ getStreamedResponse: async function* () {
+        yield { type: 'response_started' } as any;
+        yield { type: 'output_text_delta', delta: 'REFINED' } as any;
+        yield { type: 'response_done', response: { output: [{ type: 'message', content: 'REFINED' }] } } as any;
+      } }),
+    });
+    const evs = await collect(new DebateModel(b, { heartbeatMs: 0 }).getStreamedResponse(req()));
+    assert.equal(evs.filter((e) => e.type === 'response_started').length, 1);
+    assert.ok(evs.some((e) => e.type === 'output_text_delta' && e.delta === 'REFINED'));
+  });
+});
+
+test('verify strategy: checker failure pre-content ships the executor draft (conformant, no crash)', async () => {
+  await withEnv({ CLEMMY_DEBATE_MODE: 'all', CLEMMY_FUSION_STRATEGY: 'verify' }, async () => {
+    const b = brains({
+      passthrough: model({ getResponse: async () => ({ output: [{ type: 'message', content: 'CODEX-SOLO' }], responseId: 'r9', usage: { inputTokens: 1, outputTokens: 1 } } as any) }),
+      judge: model({ getStreamedResponse: async function* () { throw new Error('checker down'); } }),
+    });
+    const evs = await collect(new DebateModel(b, { heartbeatMs: 0 }).getStreamedResponse(req()));
+    assert.ok(evs.some((e) => e.type === 'output_text_delta' && e.delta === 'CODEX-SOLO'), 'shipped the executor draft');
+    const done: any = evs.find((e) => e.type === 'response_done');
+    assert.ok(done && done.response.id && typeof done.response.usage.totalTokens === 'number');
+  });
+});
+
 test('per-message cap: debate runs at most maxPerTurn times across iterations, then passes through', async () => {
   await withEnv({ CLEMMY_DEBATE_MODE: 'all' }, async () => {
     let drafts = 0;

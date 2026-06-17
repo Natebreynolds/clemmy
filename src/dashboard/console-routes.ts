@@ -188,7 +188,7 @@ import { parseApprovalIntent, parseHarnessCommand } from '../channels/discord-ha
 import { buildOrchestratorAgent } from '../agents/orchestrator.js';
 import { configureHarnessRuntime, resetHarnessRuntimeConfig } from '../runtime/harness/codex-client.js';
 import { resetByoModelCache } from '../runtime/harness/byo-model.js';
-import { debateMode, judgeChoice, debateBrainsAvailable, readRecentDebateTraces } from '../runtime/harness/debate-model.js';
+import { debateMode, judgeChoice, fusionStrategy, debateBrainsAvailable, readRecentDebateTraces } from '../runtime/harness/debate-model.js';
 import { summarizeApprovalAction } from '../runtime/approval-summary.js';
 import {
   appendRecallTranscriptSegment,
@@ -3476,6 +3476,7 @@ export function registerConsoleRoutes(
       const fusion = {
         mode: debateMode(),
         judge: judgeChoice(),
+        strategy: fusionStrategy(),
         brainsAvailable: fusionBrains,
         active: debateMode() !== 'off' && fusionBrains.claude && fusionBrains.codex,
       };
@@ -6561,15 +6562,18 @@ export function registerConsoleRoutes(
   app.patch('/api/console/settings/fusion', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
-      const body = (req.body ?? {}) as { mode?: unknown; judge?: unknown };
+      const body = (req.body ?? {}) as { mode?: unknown; judge?: unknown; strategy?: unknown };
       const rawMode = typeof body.mode === 'string' ? body.mode.trim().toLowerCase() : '';
       const mode = rawMode === 'all' ? 'all' : rawMode === 'high' ? 'high' : 'off';
       const judge = typeof body.judge === 'string' && body.judge.trim().toLowerCase() === 'codex' ? 'codex' : 'claude';
+      const strategy = typeof body.strategy === 'string' && body.strategy.trim().toLowerCase() === 'verify' ? 'verify' : 'debate';
 
       updateEnvKey('CLEMMY_DEBATE_MODE', mode);
       process.env.CLEMMY_DEBATE_MODE = mode;
       updateEnvKey('CLEMMY_DEBATE_JUDGE', judge);
       process.env.CLEMMY_DEBATE_JUDGE = judge;
+      updateEnvKey('CLEMMY_FUSION_STRATEGY', strategy);
+      process.env.CLEMMY_FUSION_STRATEGY = strategy;
 
       // Re-register the provider next turn so debate wrapping flips on/off live.
       resetHarnessRuntimeConfig();
@@ -6579,6 +6583,7 @@ export function registerConsoleRoutes(
         fusion: {
           mode: debateMode(),
           judge: judgeChoice(),
+          strategy: fusionStrategy(),
           brainsAvailable: brains,
           active: mode !== 'off' && brains.claude && brains.codex,
         },
@@ -6602,6 +6607,7 @@ export function registerConsoleRoutes(
         fusion: {
           mode: debateMode(),
           judge: judgeChoice(),
+          strategy: fusionStrategy(),
           brainsAvailable: brains,
           active: debateMode() !== 'off' && brains.claude && brains.codex,
         },

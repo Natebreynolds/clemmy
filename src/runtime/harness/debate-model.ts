@@ -102,6 +102,19 @@ function maxDebatesPerTurn(): number {
   return Number.isFinite(raw) && raw >= 0 ? raw : 2;
 }
 
+export type FusionStrategy = 'debate' | 'verify';
+/** How a fused turn spends its two brains:
+ *  - 'debate' (default): both flagships draft independently, a judge reconciles (3 calls).
+ *  - 'verify' ("Codex drives, Claude checks"): the EXECUTOR (the passthrough/active
+ *    brain) drafts once, then the CHECKER (the judge brain) verifies/refines into the
+ *    final answer (2 calls). Cheaper, and the research-optimal verify-over-redraft
+ *    pattern. Pair with active-brain=Codex + judge=Claude for the recommended play. */
+export function fusionStrategy(): FusionStrategy {
+  return (getRuntimeEnv('CLEMMY_FUSION_STRATEGY', 'debate') || 'debate').trim().toLowerCase() === 'verify'
+    ? 'verify'
+    : 'debate';
+}
+
 // Per-message debate counts keyed by the ACTIVE TURN's counter object (a fresh
 // ToolCallsCounter per runTurn, installed in AsyncLocalStorage around the SDK's
 // run() and shared across all of that message's internal loop iterations). This
@@ -228,6 +241,7 @@ export class DebateModel implements Model {
 
   async getResponse(request: ModelRequest): Promise<ModelResponse> {
     if (!this.wantsDebate(request)) return this.brains.passthrough.getResponse(request);
+    if (fusionStrategy() === 'verify') return this.verifyResponse(request);
     const { a, b } = await this.draftBoth(request);
     if (!a || !b) {
       const survivor = a ?? b;
@@ -261,6 +275,11 @@ export class DebateModel implements Model {
       // Not a debate turn (mode/stakes gate or per-message cap reached): forward
       // the normal brain verbatim (response_started, deltas, response_done).
       yield* this.brains.passthrough.getStreamedResponse(request);
+      return;
+    }
+
+    if (fusionStrategy() === 'verify') {
+      yield* this.verifyStreamed(request);
       return;
     }
 
@@ -385,6 +404,70 @@ export class DebateModel implements Model {
     if (!aDone) logger.warn({ graceMs: grace }, 'debate draft A overran the grace window — aborted, proceeding without it');
     if (!bDone) logger.warn({ graceMs: grace }, 'debate draft B overran the grace window — aborted, proceeding without it');
     return { a, b };
+  }
+
+  // --- 'verify' strategy: executor (passthrough) drafts, checker (judge) verifies ---
+
+  private async verifyResponse(request: ModelRequest): Promise<ModelResponse> {
+    const draft = await this.brains.passthrough.getResponse(request).catch(() => null);
+    if (!draft) {
+      // Executor failed → the checker answers the original request directly.
+      logger.warn('fusion verify: executor draft failed — checker answers directly');
+      recordDebateTrace({ path: 'verify', n: this.debatesThisTurn, outcome: 'executor-failed' });
+      return this.brains.judge.getResponse(request);
+    }
+    try {
+      const final = await this.brains.judge.getResponse(buildVerifyRequest(request, draft));
+      recordDebateTrace({ path: 'verify', n: this.debatesThisTurn, judge: judgeChoice(), executor: capText(summarizeOutput(draft.output)), final: capText(extractAssistantText(final.output)) });
+      return final;
+    } catch (err) {
+      // Checker failed → ship the executor's draft rather than lose the turn.
+      logger.warn({ err: errText(err) }, 'fusion verify: checker failed — shipping the executor draft');
+      recordDebateTrace({ path: 'verify', n: this.debatesThisTurn, outcome: 'checker-failed-ship-draft' });
+      return draft;
+    }
+  }
+
+  private async *verifyStreamed(request: ModelRequest): AsyncIterable<StreamEvent> {
+    // ONE response_started for the whole turn (the checker's is dropped below).
+    yield { type: 'response_started', providerData: { fusion: 'verify' } } as unknown as StreamEvent;
+
+    // Executor (the active/passthrough brain — Codex in the recommended setup)
+    // drafts, buffered; the silent window is bridged with keep-alives.
+    const draftP = this.brains.passthrough.getResponse(request).then((r) => r, () => null);
+    yield* heartbeatsUntil(draftP, this.hb, this.sleep);
+    const draft = await draftP;
+
+    if (!draft) {
+      logger.warn('fusion verify: executor draft failed — checker streams the answer directly');
+      recordDebateTrace({ path: 'verify', n: this.debatesThisTurn, outcome: 'executor-failed' });
+      yield* dropResponseStarted(this.brains.judge.getStreamedResponse(request));
+      return;
+    }
+
+    const da = summarizeOutput(draft.output);
+    let finalText = '';
+    let checkerOutput: unknown;
+    let checkerYieldedContent = false;
+    try {
+      for await (const ev of this.brains.judge.getStreamedResponse(buildVerifyRequest(request, draft))) {
+        const e = ev as { type?: string; delta?: string; response?: { output?: unknown } };
+        if (e.type === 'response_started') continue;
+        if (e.type === 'output_text_delta' && typeof e.delta === 'string') { finalText += e.delta; checkerYieldedContent = true; }
+        if (e.type === 'response_done' && e.response) checkerOutput = e.response.output;
+        yield ev;
+      }
+    } catch (err) {
+      // Checker failed pre-content → ship the executor's draft (SDK-conformant).
+      if (checkerYieldedContent) throw err;
+      logger.warn({ err: errText(err) }, 'fusion verify: checker failed pre-content — shipping the executor draft');
+      recordDebateTrace({ path: 'verify', n: this.debatesThisTurn, outcome: 'checker-failed-ship-draft' });
+      yield* streamResponseAsEvents(draft);
+      return;
+    }
+    const finalForTrace = finalText || extractAssistantText(checkerOutput);
+    logger.info({ path: 'verify', n: this.debatesThisTurn, executorLen: da.length, finalLen: finalForTrace.length, judge: judgeChoice() }, 'fusion verify reconciled');
+    recordDebateTrace({ path: 'verify', n: this.debatesThisTurn, judge: judgeChoice(), executor: capText(da), final: capText(finalForTrace) });
   }
 }
 
@@ -521,6 +604,35 @@ export function buildJudgeRequest(request: ModelRequest, a: ModelResponse, b: Mo
     '--- DRAFT B ---',
     draftB || '(empty)',
     '=== END DEBATE DRAFTS ===',
+  ].join('\n');
+  return { ...request, systemInstructions: block } as ModelRequest;
+}
+
+const VERIFY_PREAMBLE = [
+  'A first model (the EXECUTOR) produced the DRAFT below in response to the user',
+  'request above. You are the CHECKER: verify the draft against the request and the',
+  'context — correct any factual or logical errors, fill gaps, and tighten it — then',
+  'produce the single best FINAL response. If the draft is already correct, confirm',
+  'and refine it. Speak directly to the user as one voice; do NOT mention the draft,',
+  'the executor, or this verification. PRESERVE any local-state or side-effecting',
+  'tool call the draft proposed (focus_* / memory_remember / execution_*) unless you',
+  'have a concrete reason to drop it.',
+].join(' ');
+
+/** Build the checker's request for the 'verify' strategy: the original request
+ *  UNCHANGED (tools/outputType/input preserved — same invariant as the judge), with
+ *  the executor's single draft appended to the system instructions to verify+refine. */
+export function buildVerifyRequest(request: ModelRequest, draft: ModelResponse): ModelRequest {
+  const base = ((request as { systemInstructions?: string }).systemInstructions ?? '').toString();
+  const block = [
+    base,
+    '',
+    '=== EXECUTOR DRAFT — VERIFY & REFINE ===',
+    VERIFY_PREAMBLE,
+    '',
+    '--- DRAFT ---',
+    summarizeOutput(draft.output) || '(empty)',
+    '=== END DRAFT ===',
   ].join('\n');
   return { ...request, systemInstructions: block } as ModelRequest;
 }

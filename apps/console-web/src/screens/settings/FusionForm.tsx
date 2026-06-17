@@ -6,9 +6,9 @@ import { Button } from '@/components/ui/Button';
 import { Field, Select } from '@/components/ui/Field';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { usePoll } from '@/lib/poll';
-import { getSettings, setActiveBrain, patchFusion, type FusionMode, type ActiveBrain } from '@/lib/settings';
+import { getSettings, setActiveBrain, patchFusion, type FusionMode, type FusionStrategy, type ActiveBrain } from '@/lib/settings';
 
-type FormState = { brain: ActiveBrain; mode: FusionMode; judge: 'claude' | 'codex' };
+type FormState = { brain: ActiveBrain; mode: FusionMode; judge: 'claude' | 'codex'; strategy: FusionStrategy };
 
 const MODES: { id: FusionMode; label: string; icon: typeof Cpu; blurb: string }[] = [
   { id: 'off', label: 'Single brain', icon: Cpu, blurb: 'Your primary flagship answers every turn. The default.' },
@@ -28,7 +28,12 @@ export function FusionForm() {
 
   useEffect(() => {
     if (fusion && !form) {
-      setForm({ brain: activeBrain === 'claude_oauth' ? 'claude_oauth' : 'codex_oauth', mode: fusion.mode, judge: fusion.judge });
+      setForm({
+        brain: activeBrain === 'claude_oauth' ? 'claude_oauth' : 'codex_oauth',
+        mode: fusion.mode,
+        judge: fusion.judge,
+        strategy: fusion.strategy ?? 'debate',
+      });
     }
   }, [fusion, activeBrain, form]);
 
@@ -47,7 +52,7 @@ export function FusionForm() {
       // Primary brain first (it preflights the Claude token and may error with a
       // sign-in prompt), then the live fusion mode/judge.
       await setActiveBrain(form.brain);
-      await patchFusion({ mode: form.mode, judge: form.judge });
+      await patchFusion({ mode: form.mode, judge: form.judge, strategy: form.strategy });
       setSaved(true);
       void qc.invalidateQueries({ queryKey: ['settings'] });
     } catch (err) {
@@ -60,9 +65,22 @@ export function FusionForm() {
   return (
     <Card className="p-5">
       <h3 className="mb-1 text-h3 text-fg">Fusion — multi-model</h3>
-      <p className="mb-4 text-small text-muted">
-        Pick your flagship, or run both in tandem. In fusion mode Claude (Opus) and Codex (GPT-5.x) each draft the turn and a judge reconciles them into one answer — higher accuracy on the turns that matter. Applies live on the next message; no restart.
+      <p className="mb-3 text-small text-muted">
+        Pick your flagship, or run both in tandem. In fusion mode the two flagships
+        collaborate on the turns that matter — higher accuracy where it counts.
+        Applies live on the next message; no restart.
       </p>
+
+      <div className="mb-4 flex flex-wrap items-center gap-2">
+        <Button
+          variant="secondary"
+          size="sm"
+          onClick={() => { setForm({ brain: 'codex_oauth', mode: 'high', judge: 'claude', strategy: 'verify' }); setSaved(false); setError(null); }}
+        >
+          Use “Codex drives, Claude checks” (recommended)
+        </Button>
+        <span className="text-caption text-muted">Cheapest: Codex runs the bulk; Claude verifies the key turns.</span>
+      </div>
 
       <div className="mb-4 grid gap-x-4 sm:grid-cols-2">
         <Field label="Primary brain" hint="Runs every single-model turn, and is the fallback when fusion can't run.">{(id) => (
@@ -71,10 +89,16 @@ export function FusionForm() {
             <option value="claude_oauth">Claude — Opus</option>
           </Select>
         )}</Field>
-        <Field label="Judge" hint="Reconciles the two drafts in fusion mode.">{(id) => (
+        <Field label="Judge / checker" hint="The brain that reconciles drafts (debate) or verifies the executor's draft (verify).">{(id) => (
           <Select id={id} value={form.judge} onChange={(e) => set('judge', e.target.value as 'claude' | 'codex')}>
             <option value="claude">Claude</option>
             <option value="codex">Codex</option>
+          </Select>
+        )}</Field>
+        <Field label="Strategy" hint="verify = executor drafts, checker refines (2 calls, cheaper). debate = both draft + judge (3 calls).">{(id) => (
+          <Select id={id} value={form.strategy} onChange={(e) => set('strategy', e.target.value as FusionStrategy)}>
+            <option value="verify">verify — one drafts, the other checks (cheaper)</option>
+            <option value="debate">debate — both draft, a judge reconciles</option>
           </Select>
         )}</Field>
       </div>

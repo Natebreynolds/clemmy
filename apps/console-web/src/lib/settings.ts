@@ -114,11 +114,13 @@ export const setActiveBrain = (brain: ActiveBrain) =>
 // toggle: mode/judge apply on the next message, no restart. Needs BOTH a Claude
 // and a Codex login; otherwise Clementine runs single-brain on the primary.
 export type FusionMode = 'off' | 'high' | 'all';
+export type FusionStrategy = 'debate' | 'verify';
 export interface FusionSettings {
   mode: FusionMode;
   judge: 'claude' | 'codex';
+  strategy: FusionStrategy;
   brainsAvailable: { claude: boolean; codex: boolean };
   active: boolean;
 }
-export const patchFusion = (p: { mode: FusionMode; judge: 'claude' | 'codex' }) =>
+export const patchFusion = (p: { mode: FusionMode; judge: 'claude' | 'codex'; strategy?: FusionStrategy }) =>
   patch<{ fusion: FusionSettings }>('/api/console/settings/fusion', p);
