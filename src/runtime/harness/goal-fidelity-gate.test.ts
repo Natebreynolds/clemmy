@@ -120,6 +120,37 @@ test('gatherGoalText: composes from user_input_received events', () => {
   assert.match(gatherGoalText(sess.id), /per-firm SEO research/);
 });
 
+test('gatherGoalText: prefers the BLESSED contract over re-derivation; falls back to events when no contract (Step 3)', async () => {
+  resetEventLog();
+  const { surfacePlan, approvePlanProposal } = await import('../../agents/plan-proposals.js');
+  const sess = createSession({ kind: 'chat' });
+  // A misleading raw message that re-derivation WOULD pick up…
+  seedGoal(sess.id, 'idk just do whatever you think is best');
+  // …but the user then blessed a SPECIFIC plan. The gate must judge against THAT.
+  const proposal = surfacePlan({
+    plan: {
+      objective: 'Send a personalized outreach email to EACH of the 8 firms — one per firm.',
+      steps: [{ n: 1, action: 'send the emails', rationale: 'the ask', verification: null }],
+      successCriteria: ['8 emails sent', 'each references a firm-specific finding'],
+      stages: null, risks: [], estimatedComplexity: 'moderate', recommendsTrackedExecution: false,
+      needsUserInput: [], appliedInstructions: [], externalSends: null,
+    } as never,
+    originatingRequest: 'send the 8 outreach emails',
+    sessionId: sess.id,
+  });
+  approvePlanProposal(proposal.id);
+
+  const text = gatherGoalText(sess.id);
+  assert.match(text, /personalized outreach email to EACH of the 8 firms/, 'uses the blessed objective');
+  assert.match(text, /each references a firm-specific finding/, 'includes the blessed success criteria');
+  assert.doesNotMatch(text, /just do whatever you think is best/, 'NOT the re-derived raw message');
+
+  // Branch B: a session with NO contract still re-derives from events (unchanged).
+  const sess2 = createSession({ kind: 'chat' });
+  seedGoal(sess2.id, 'Pull my unread emails and summarize them.');
+  assert.match(gatherGoalText(sess2.id), /unread emails/, 'goal-less session re-derives from events');
+});
+
 test('buildGoalFidelityPrompt: includes goal, skill, evidence, payload, and the fail-open rubric', () => {
   const p = buildGoalFidelityPrompt({
     goal: 'Email a personalized note',

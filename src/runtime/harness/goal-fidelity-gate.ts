@@ -51,6 +51,7 @@ import { classifyExternalWrite } from './confirm-first-gate.js';
 import { extractTargetKeys, renderPayloadForJudge } from './grounding-gate.js';
 import { gatherSessionSkills, skillBodyExecutionShortfall, type SessionSkill } from './skill-execution.js';
 import { composeJudgedObjective } from './objective-judge.js';
+import { getActiveGoalForSession } from '../../agents/plan-proposals.js';
 
 // ─────────────────────────────────────────────────────────────────
 // Config
@@ -72,6 +73,15 @@ export function isGoalFidelityDraftInformEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_GOAL_FIDELITY_DRAFT_INFORM', 'on') ?? 'on').toLowerCase() !== 'off';
 }
 
+/** Gate-unification Step 3: judge write-time fidelity against the BLESSED goal
+ *  contract (the same objective+successCriteria the completion validator uses)
+ *  instead of a goal RE-DERIVED from raw events — so a send can't be blocked
+ *  against a "goal" the user never approved. Default-on; =off reverts to
+ *  re-derivation. Fails open to re-derivation for goal-less sessions either way. */
+function goalFidelityUsesContractEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_GOAL_FIDELITY_USE_CONTRACT', 'on') ?? 'on').toLowerCase() !== 'off';
+}
+
 // ─────────────────────────────────────────────────────────────────
 // Goal assembly (mirrors loop.ts feeding the completion judge)
 // ─────────────────────────────────────────────────────────────────
@@ -85,6 +95,26 @@ export function isGoalFidelityDraftInformEnabled(): boolean {
  */
 export function gatherGoalText(sessionId: string): string {
   try {
+    // Prefer the BLESSED goal contract the user actually approved — the SAME
+    // objective+successCriteria the completion validator judges against
+    // (loop.ts) — over a goal RE-DERIVED from raw events. This removes the
+    // contradiction where a write was blocked against a "goal" the user never
+    // blessed while satisfying the one they did. Re-derivation (below) is the
+    // fallback ONLY for goal-less sessions, so behavior is unchanged there.
+    if (goalFidelityUsesContractEnabled()) {
+      const contract = getActiveGoalForSession(sessionId);
+      const plan = contract?.approvedPlan ?? contract?.plan;
+      if (plan) {
+        const objective = (plan.objective ?? '').trim();
+        const criteria = (plan.successCriteria ?? []).filter((c) => typeof c === 'string' && c.trim());
+        if (objective || criteria.length > 0) {
+          return [
+            objective,
+            ...(criteria.length ? ['Success criteria:', ...criteria.map((c) => `- ${c}`)] : []),
+          ].filter(Boolean).join('\n').trim();
+        }
+      }
+    }
     const inputs = listEvents(sessionId, { types: ['user_input_received'] })
       .map((ev) => String((ev.data as { text?: string } | undefined)?.text ?? ''))
       .filter((t) => t.trim().length > 0);
