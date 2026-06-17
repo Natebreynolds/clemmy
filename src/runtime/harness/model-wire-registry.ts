@@ -99,7 +99,12 @@ export interface ModelCapability {
   apiShape: ApiShape;
   /** Total context window (tokens). Budgeting / clamp use only — advisory. */
   contextWindow: number;
-  /** Max output tokens the model accepts. */
+  /** Max output tokens the model accepts. ADVISORY / budgeting-only — the wire
+   *  max_tokens clamp lives in @ai-sdk/anthropic's OWN per-model table, not here
+   *  (the harness leaves maxTokens unset, so the SDK's default governs). Setting
+   *  this does NOT change the request. NOTE: an unrecognized claude-* id the SDK
+   *  hasn't shipped support for is silently capped at 4096 output tokens by the
+   *  SDK even though a broad /claude-/ family row here may claim more. */
   maxOutput: number;
   /** True when the model accepts a reasoning-effort knob at all. */
   supportsEffort: boolean;
@@ -185,11 +190,15 @@ const REGISTRY: RegistryRow[] = [
     },
   },
   {
+    // Haiku 4.5 has NO effort knob — it 400s on output_config.effort at every
+    // level (live-verified: "This model does not support the effort parameter").
+    // Opus/Sonnet accept it, so the bug is invisible on the default Opus brain.
     idMatch: /claude-haiku-4-5|claude-haiku/i,
     cap: {
       family: 'claude-haiku-4.5', apiShape: 'anthropic_messages',
-      contextWindow: 200_000, maxOutput: 32_000, supportsEffort: true,
-      effortMap: ANTHROPIC_EFFORT_MAP, thinkingMode: 'effort',
+      contextWindow: 200_000, maxOutput: 32_000, supportsEffort: false,
+      effortMap: { none: null, minimal: null, low: null, medium: null, high: null },
+      thinkingMode: 'none',
       supportsPromptCache: true, cacheMinTokens: 4096, retryClass: 'anthropic',
     },
   },

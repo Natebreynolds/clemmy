@@ -177,6 +177,51 @@ function isEmptyResponse(res: ModelResponse): boolean {
   return !res || !Array.isArray(res.output) || res.output.length === 0;
 }
 
+// The aisdk adapter emits a leading `{type:'model', event:{type:'stream-start'}}`
+// (and a trailing `finish` / `response-metadata`) around the real content. These
+// METADATA frames must NOT count as "committed real content" — otherwise an
+// empty completion (stream-start, finish, response_done{output:[]}) looks
+// committed and the empty-completion retry never fires (G5). Only actual content
+// parts (text/reasoning/tool deltas) commit us.
+const METADATA_PART_TYPES = new Set(['stream-start', 'response-metadata', 'finish']);
+
+/** True for a stream event that is pure metadata (safe to buffer + discard on a
+ *  pre-content retry) — response_started, or a `model` frame wrapping a
+ *  stream-start / finish / response-metadata part. */
+function isBufferableMetadata(ev: unknown): boolean {
+  const e = ev as { type?: string; event?: { type?: string } };
+  if (e.type === 'response_started') return true;
+  if (e.type === 'model' && e.event && METADATA_PART_TYPES.has(e.event.type ?? '')) return true;
+  return false;
+}
+
+/** A model that 400s specifically because it doesn't accept the effort param
+ *  (e.g. Haiku 4.5 — verified). Caught so the wrapper can strip effort and retry
+ *  ONCE rather than hard-failing the turn: defense-in-depth for the whole
+ *  "registry mis-tagged a model as effort-capable" class. */
+export function isEffortRejection(err: unknown): boolean {
+  const e = err as { statusCode?: number; status?: number; message?: unknown; responseBody?: unknown };
+  const status = typeof e?.statusCode === 'number' ? e.statusCode : e?.status;
+  if (status !== 400) return false;
+  const text = `${typeof e?.message === 'string' ? e.message : ''} ${typeof e?.responseBody === 'string' ? e.responseBody : ''}`;
+  return /does not support the effort parameter|not support(ed)?\b[^.]*\beffort|\beffort\b[^.]*not support/i.test(text);
+}
+
+/** Return a copy of the request with any `providerOptions.anthropic.effort`
+ *  stripped (used to recover from an effort-rejection 400). */
+export function stripEffortFromRequest(request: ModelRequest): ModelRequest {
+  const ms = request.modelSettings ?? {};
+  const pd = (ms.providerData ?? {}) as Record<string, unknown>;
+  const po = (pd.providerOptions ?? {}) as Record<string, unknown>;
+  const anthropic = (po.anthropic ?? {}) as Record<string, unknown>;
+  if (anthropic.effort == null) return request;
+  const { effort: _dropped, ...restAnthropic } = anthropic;
+  return {
+    ...request,
+    modelSettings: { ...ms, providerData: { ...pd, providerOptions: { ...po, anthropic: restAnthropic } } },
+  } as ModelRequest;
+}
+
 export class ResilientModel implements Model {
   constructor(private readonly inner: Model, private readonly policy: ResiliencePolicy) {}
 
@@ -225,8 +270,9 @@ export class ResilientModel implements Model {
   }
 
   async getResponse(request: ModelRequest): Promise<ModelResponse> {
-    const req = translateSettings(request, this.policy.capability);
+    let req = translateSettings(request, this.policy.capability);
     const authRefreshed = { value: false };
+    let effortStripped = false;
     for (let attempt = 0; ; attempt++) {
       try {
         const res = await this.inner.getResponse(req);
@@ -247,6 +293,12 @@ export class ResilientModel implements Model {
         return res;
       } catch (err) {
         if (err instanceof BoundaryError) throw err;
+        if (!effortStripped && isEffortRejection(err)) {
+          effortStripped = true;
+          req = stripEffortFromRequest(req);
+          logger.warn({ label: this.policy.label, path: 'getResponse' }, 'model rejected the effort parameter — stripping effort and retrying');
+          continue;
+        }
         if (await this.handleAttemptFailure(err, attempt, authRefreshed, 'getResponse')) continue;
         throw err;
       }
@@ -254,8 +306,9 @@ export class ResilientModel implements Model {
   }
 
   async *getStreamedResponse(request: ModelRequest): AsyncIterable<StreamEvent> {
-    const req = translateSettings(request, this.policy.capability);
+    let req = translateSettings(request, this.policy.capability);
     const authRefreshed = { value: false };
+    let effortStripped = false;
 
     for (let attempt = 0; ; attempt++) {
       // Stream events to the Runner AS THEY ARRIVE so the loop's stream-stall
@@ -268,18 +321,19 @@ export class ResilientModel implements Model {
       // real has been yielded yet. The single buffered frame is response_started,
       // held just long enough to discard cleanly on a pre-content blip / empty
       // completion.
-      let startEvent: StreamEvent | undefined;
-      let committed = false; // a REAL part (reasoning / tool-call / text) was yielded
+      // Buffer ONLY metadata frames (response_started + the adapter's
+      // stream-start/finish/response-metadata `model` frames) until the first
+      // REAL content part. Committing on metadata (the prior bug) made an empty
+      // completion look committed -> the empty-completion retry never fired, and
+      // a transport drop after stream-start but before content couldn't retry.
+      const pending: StreamEvent[] = [];
+      let committed = false; // a REAL content part (text / reasoning / tool) was yielded
       let sawDone = false;
       let doneEmpty = false;
 
       try {
         for await (const ev of this.inner.getStreamedResponse(req)) {
           const e = ev as { type?: string; response?: { output?: unknown[] } };
-          if (e.type === 'response_started') {
-            if (committed) yield ev; else startEvent = ev; // hold the lone start frame
-            continue;
-          }
           if (e.type === 'response_done') {
             sawDone = true;
             const emptyOutput = !Array.isArray(e.response?.output) || e.response!.output!.length === 0;
@@ -287,19 +341,26 @@ export class ResilientModel implements Model {
             // Empty completion before any real content — bail WITHOUT yielding so
             // the post-loop handler retries OR throws (never a clean empty turn).
             if (doneEmpty) break;
-            if (!committed) { if (startEvent) { yield startEvent; startEvent = undefined; } committed = true; }
+            if (!committed) { yield* drain(pending); committed = true; }
             yield ev;
             continue;
           }
-          // The first REAL part commits us (the Runner now holds live output, so a
-          // retry would duplicate it). Flush the buffered start frame in order,
-          // then stream this and every later event straight through.
-          if (!committed) { if (startEvent) { yield startEvent; startEvent = undefined; } committed = true; }
+          if (!committed && isBufferableMetadata(ev)) { pending.push(ev); continue; }
+          // First REAL content commits us (the Runner now holds live output, so a
+          // retry would duplicate it). Flush the buffered metadata in order, then
+          // stream this and every later event straight through.
+          if (!committed) { yield* drain(pending); committed = true; }
           yield ev;
         }
       } catch (err) {
-        if (committed) throw err; // user already saw text — cannot safely retry
+        if (committed) throw err; // real content already escaped — cannot safely retry
         if (err instanceof BoundaryError) throw err;
+        if (!effortStripped && isEffortRejection(err)) {
+          effortStripped = true;
+          req = stripEffortFromRequest(req);
+          logger.warn({ label: this.policy.label, path: 'getStreamedResponse' }, 'model rejected the effort parameter — stripping effort and retrying');
+          continue;
+        }
         if (await this.handleAttemptFailure(err, attempt, authRefreshed, 'getStreamedResponse')) continue;
         throw err;
       }
@@ -340,6 +401,12 @@ export class ResilientModel implements Model {
       return; // committed + drained, or done emitted
     }
   }
+}
+
+/** Yield + clear a buffered run of metadata stream events, in order. */
+function* drain(buffer: StreamEvent[]): Generator<StreamEvent> {
+  for (const ev of buffer) yield ev;
+  buffer.length = 0;
 }
 
 /** Wrap any SDK Model with the provider-agnostic resilience + translation layer. */

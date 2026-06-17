@@ -219,6 +219,58 @@ test('getResponse: a 401 arriving AFTER the transient-retry budget is exhausted 
   assert.equal(res.output.length, 1);
 });
 
+test('getStreamedResponse: empty completion WITH the adapter stream-start/finish frames still retries (real-adapter shape, G5)', async () => {
+  // Regression for the bug where committing on the stream-start metadata frame
+  // made doneEmpty always false -> empty turn yielded clean instead of retried.
+  let calls = 0;
+  let yieldedDone = false;
+  const inner = makeModel({
+    getStreamedResponse: async function* () {
+      calls += 1;
+      yield { type: 'response_started' } as any;
+      yield { type: 'model', event: { type: 'stream-start' } } as any; // metadata — must NOT commit
+      yield { type: 'model', event: { type: 'finish' } } as any; // metadata
+      yield { type: 'response_done', response: { output: [] } } as any; // empty
+    },
+  });
+  await assert.rejects(
+    async () => {
+      for await (const e of withResilience(inner, policy({ maxRetries: 1 })).getStreamedResponse(req())) {
+        if ((e as any).type === 'response_done') yieldedDone = true;
+      }
+    },
+    (e: unknown) => e instanceof BoundaryError && e.kind === 'model.empty_completion',
+  );
+  assert.equal(calls, 2, 'metadata frames did not falsely commit — empty completion retried then threw');
+  assert.equal(yieldedDone, false, 'never yielded a clean empty response_done');
+});
+
+test('effort: an effort-rejection 400 strips effort and retries instead of hard-failing', async () => {
+  let calls = 0;
+  let effortOnRetry: unknown = 'unset';
+  const inner = makeModel({
+    getResponse: async (r: any) => {
+      calls += 1;
+      const effort = r?.modelSettings?.providerData?.providerOptions?.anthropic?.effort;
+      if (calls === 1) throw { statusCode: 400, message: 'This model does not support the effort parameter.' };
+      effortOnRetry = effort;
+      return resp([{ type: 'message' }]);
+    },
+  });
+  const r = req({ modelSettings: { reasoning: { effort: 'high' } } }); // translateSettings adds the anthropic.effort
+  const res = await withResilience(inner, policy()).getResponse(r);
+  assert.equal(calls, 2);
+  assert.equal(effortOnRetry, undefined, 'effort stripped on the retry');
+  assert.equal(res.output.length, 1);
+});
+
+test('isEffortRejection: matches the Anthropic effort-400, not other 400s', async () => {
+  const { isEffortRejection } = await import('./resilient-model.js');
+  assert.equal(isEffortRejection({ statusCode: 400, message: 'This model does not support the effort parameter.' }), true);
+  assert.equal(isEffortRejection({ statusCode: 400, message: 'messages.0: invalid' }), false);
+  assert.equal(isEffortRejection({ statusCode: 429 }), false);
+});
+
 // --- helpers ---------------------------------------------------------------
 
 function resp(output: unknown[]): ModelResponse {

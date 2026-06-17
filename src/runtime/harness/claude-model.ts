@@ -378,6 +378,15 @@ export function makeClaudeFetch(): typeof fetch {
       body,
       ...(dispatcher ? { dispatcher } : {}),
     } as RequestInit & { dispatcher?: unknown });
+    // ALWAYS persist a 4xx trace (request body + error) to disk — the Codex path
+    // does this, the Claude path didn't, and Anthropic has MORE wire-shape rules
+    // (system placement, effort, cache_control, empty blocks). Opus silently
+    // tolerates malformations other models 400 on, so without a durable trace
+    // each model-compat failure is a blind debugging session. Best-effort; reads
+    // a clone so the SDK still gets the original error body.
+    if (res.status >= 400 && res.status < 500) {
+      void persistClaude4xxTrace(res.clone(), body, res.status);
+    }
     // Diagnostics only: tee the body so we can read usage without disturbing the
     // stream the SDK consumes. Entirely skipped when the debug flag is off.
     if (debug && res.ok && res.body) {
@@ -391,6 +400,40 @@ export function makeClaudeFetch(): typeof fetch {
     }
     return res;
   }) as typeof fetch;
+}
+
+/** Persist a Claude 4xx (request body + response detail) to
+ *  BASE_DIR/state/claude-4xx-trace so a model-compat rejection is diagnosable.
+ *  Mirrors the Codex 4xx-trace pattern. Best-effort — never throws, never blocks
+ *  the error path. */
+async function persistClaude4xxTrace(res: Response, requestBody: BodyInit | null | undefined, status: number): Promise<void> {
+  try {
+    const detail = await res.text().catch(() => '');
+    const { atomicJsonMutate } = await import('../atomic-json.js');
+    const path = await import('node:path');
+    const { BASE_DIR } = await import('../../config.js');
+    let reqParsed: unknown;
+    let model: unknown;
+    if (typeof requestBody === 'string') {
+      try { reqParsed = JSON.parse(requestBody); model = (reqParsed as { model?: unknown } | null)?.model; } catch { /* keep raw */ }
+    }
+    const tracePath = path.join(BASE_DIR, 'state', 'claude-4xx-trace', `claude-${Date.now()}.json`);
+    await atomicJsonMutate(
+      tracePath,
+      () => ({
+        ts: new Date().toISOString(),
+        source: 'claude-model',
+        status,
+        model: model ?? null,
+        responseBody: detail.slice(0, 4096),
+        requestBody: reqParsed ?? requestBody ?? null,
+      }),
+      {} as Record<string, unknown>,
+    );
+    logger.warn({ status, model: model ?? null, tracePath, responsePreview: detail.slice(0, 240) }, '[claude-wire] 4xx — request trace persisted');
+  } catch {
+    // best-effort: a trace-write failure must never affect the request path
+  }
 }
 
 /** Drop the cached subscription token so the next request re-reads (and
