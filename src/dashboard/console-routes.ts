@@ -14,6 +14,8 @@ import {
   DEFAULT_MODELS,
   LOCAL_MCP_ENABLED,
   MODEL_ENV_KEYS,
+  MODEL_PRESETS,
+  CLAUDE_MODEL_PRESETS,
   getModelSettingsSnapshot,
   getOpenAiApiKey,
   getRuntimeEnv,
@@ -188,6 +190,8 @@ import { parseApprovalIntent, parseHarnessCommand } from '../channels/discord-ha
 import { buildOrchestratorAgent } from '../agents/orchestrator.js';
 import { configureHarnessRuntime, resetHarnessRuntimeConfig } from '../runtime/harness/codex-client.js';
 import { resetByoModelCache } from '../runtime/harness/byo-model.js';
+import { resolveRoleModel, readDurableBindings, type ModelRole, type RoleBinding } from '../runtime/harness/model-roles.js';
+import { resolveProvider } from '../runtime/harness/model-wire-registry.js';
 import { debateMode, judgeChoice, fusionStrategy, debateBrainsAvailable, readRecentDebateTraces } from '../runtime/harness/debate-model.js';
 import { summarizeApprovalAction } from '../runtime/approval-summary.js';
 import {
@@ -3452,6 +3456,32 @@ export function registerConsoleRoutes(
 
   // ─── Settings ──────────────────────────────────────────────────
 
+  // Role→model registry snapshot for the Models panel: the resolved model +
+  // source for each role, the durable bindings, and the available models grouped
+  // by CONNECTED provider (so the pickers only offer what you're logged into).
+  const buildModelRolesSnapshot = () => {
+    const brains = debateBrainsAvailable();
+    const byo = getByoBackendConfig();
+    const available: Array<{ provider: string; label: string; models: Array<{ id: string; label: string }> }> = [];
+    if (brains.codex) available.push({ provider: 'codex', label: 'Codex', models: [...MODEL_PRESETS] });
+    if (brains.claude) available.push({ provider: 'claude', label: 'Claude', models: [...CLAUDE_MODEL_PRESETS] });
+    if (byo.configured) {
+      const byoModels = [{ id: byo.primaryId, label: byo.primaryId }];
+      if (byo.judgeId && byo.judgeId !== byo.primaryId) byoModels.push({ id: byo.judgeId, label: byo.judgeId });
+      available.push({ provider: 'byo', label: byo.providerLabel || 'Custom', models: byoModels });
+    }
+    return {
+      roles: {
+        brain: resolveRoleModel('brain'),
+        worker: resolveRoleModel('worker'),
+        judge: resolveRoleModel('judge'),
+      },
+      bindings: readDurableBindings(),
+      available,
+      activeBrain: getActiveAuthMode(),
+    };
+  };
+
   app.get('/api/console/settings', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
@@ -3480,7 +3510,7 @@ export function registerConsoleRoutes(
         brainsAvailable: fusionBrains,
         active: debateMode() !== 'off' && fusionBrains.claude && fusionBrains.codex,
       };
-      res.json({ profile, proactivity, auth, memory, models, runtimeBudget, modelBackend, claudeAuth: getClaudeAuthSnapshot(), activeBrain: getActiveAuthMode(), fusion });
+      res.json({ profile, proactivity, auth, memory, models, runtimeBudget, modelBackend, claudeAuth: getClaudeAuthSnapshot(), activeBrain: getActiveAuthMode(), fusion, modelRoles: buildModelRolesSnapshot() });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -6546,6 +6576,55 @@ export function registerConsoleRoutes(
       clearAutonomyAgentCache();
 
       res.json({ activeBrain: getActiveAuthMode(), claudeAuth: getClaudeAuthSnapshot() });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // Role→model binding write path (worker + judge). The BRAIN is a provider
+  // LOGIN switch — set it via /settings/active-brain — so this route handles the
+  // model-within bindings that live in CLEMMY_MODEL_ROLES. Clearing (no modelId
+  // or clear:true) reverts the role to its provider-derived default. The judge
+  // also keeps the claude-vs-codex branch (CLEMMY_DEBATE_JUDGE) in sync with the
+  // chosen model's provider so resolveDebateBrains actually routes there.
+  app.patch('/api/console/settings/models/roles', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const body = (req.body ?? {}) as { role?: unknown; modelId?: unknown; whenIntent?: unknown; clear?: unknown };
+      const role = (body.role === 'worker' || body.role === 'judge') ? (body.role as ModelRole) : '';
+      if (!role) {
+        res.status(400).json({ error: 'role must be "worker" or "judge" (set the brain via /settings/active-brain)' });
+        return;
+      }
+      const cleanId = (v: unknown): string => {
+        const s = typeof v === 'string' ? v.trim() : '';
+        return /^[A-Za-z0-9._:/-]*$/.test(s) ? s : '';
+      };
+      const modelId = cleanId(body.modelId);
+      const clear = body.clear === true || modelId === '';
+      if (!clear && !modelId) { res.status(400).json({ error: 'modelId required (or clear:true to reset to default)' }); return; }
+
+      // Upsert the role-wide binding (intent-scoped bindings arrive with chat routing).
+      const current = readDurableBindings();
+      const next: RoleBinding[] = current.filter((b) => !(b.role === role && !b.whenIntent));
+      if (!clear) next.push({ role, modelId, scope: 'durable', source: 'settings' });
+      updateEnvKey('CLEMMY_MODEL_ROLES', JSON.stringify(next));
+
+      if (role === 'judge') {
+        // Keep the fusion judge BRANCH aligned with the model's provider.
+        const prov = clear ? 'claude' : resolveProvider(modelId);
+        const branch = prov === 'codex' ? 'codex' : 'claude';
+        updateEnvKey('CLEMMY_DEBATE_JUDGE', branch);
+        process.env.CLEMMY_DEBATE_JUDGE = branch;
+      }
+
+      // Re-resolve next turn (no restart).
+      resetHarnessRuntimeConfig();
+      resetClaudeModelCache();
+      resetByoModelCache();
+      clearAutonomyAgentCache();
+
+      res.json({ modelRoles: buildModelRolesSnapshot() });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
