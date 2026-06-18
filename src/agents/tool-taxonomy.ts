@@ -88,6 +88,11 @@ const NEVER_GATE_LOCAL_MEMORY = new Set<string>([
   'tool_choice_recall',
   'tool_choice_remember',
   'tool_choice_invalidate',
+  // Model-role routing — local CLEMMY_MODEL_ROLES binding (reversible, no
+  // external surface). "use DeepSeek for the workers" shouldn't pause for
+  // approval; it's a local setting the user just asked for in chat.
+  'set_model_role',
+  'clear_model_role',
   // Durable facts + working memory.
   'memory_remember',
   'source_map_upsert',

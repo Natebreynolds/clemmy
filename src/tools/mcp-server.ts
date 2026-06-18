@@ -24,6 +24,7 @@ import { registerSpaceTools } from './space-tools.js';
 import { isSpacesEnabled } from '../spaces/store.js';
 import { registerMcpStatusTools } from './mcp-status-tools.js';
 import { registerToolChoiceTools } from './tool-choice-tools.js';
+import { registerModelRoleTools } from './model-role-tools.js';
 import { ensureToolDirectories, textResult } from './shared.js';
 import { loadPlugins } from '../plugins/loader.js';
 import type { PluginTool } from '../plugins/types.js';
@@ -51,6 +52,7 @@ registerWorkflowScheduleTools(server);
 if (isSpacesEnabled()) registerSpaceTools(server);
 registerMcpStatusTools(server);
 registerToolChoiceTools(server);
+registerModelRoleTools(server);
 registerDynamicTools(server);
 
 server.tool('ping', 'Basic health-check tool for the local MCP server.', {}, async () => textResult('pong'));

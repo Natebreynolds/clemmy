@@ -12,6 +12,7 @@ import { registerCapabilityTools } from './capability-tools.js';
 import { registerCliTools } from './cli-tools.js';
 import { registerSkillTools } from './skill-tools.js';
 import { registerToolChoiceTools } from './tool-choice-tools.js';
+import { registerModelRoleTools } from './model-role-tools.js';
 import { registerWorkflowScheduleTools } from './workflow-schedule-tools.js';
 import { registerSpaceTools } from './space-tools.js';
 import { isSpacesEnabled } from '../spaces/store.js';
@@ -140,6 +141,7 @@ function captureLocalTools(): CapturedLocalTool[] {
   registerCliTools(server);
   registerSkillTools(server);
   registerToolChoiceTools(server);
+  registerModelRoleTools(server);
   registerWorkflowScheduleTools(server);
   if (isSpacesEnabled()) registerSpaceTools(server);
   registerBrowserHarnessTools(server);
