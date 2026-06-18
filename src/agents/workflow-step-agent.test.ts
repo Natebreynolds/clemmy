@@ -10,7 +10,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { WORKFLOW_STEP_BLOCKED_TOOL_NAMES, filterToolsForStep } from './workflow-step-agent.js';
+import { WORKFLOW_STEP_BLOCKED_TOOL_NAMES, filterToolsForStep, buildWorkflowStepAgent } from './workflow-step-agent.js';
 
 // A representative slice of the orchestrator's tool pool, including the
 // work tools whose removal broke outlook-triage-hourly.
@@ -110,4 +110,11 @@ test('A4: a prefix family (composio_*) keeps the gateway for a composio-locked s
   assert.ok(kept.has('composio_status'));
   assert.ok(kept.has('workflow_step_result'));
   assert.ok(!kept.has('run_shell_command'));
+});
+
+test('buildWorkflowStepAgent: per-step model override is honored (intent routing seam)', async () => {
+  const dflt = await buildWorkflowStepAgent({});
+  const routed = await buildWorkflowStepAgent({ model: 'claude-opus-4-8' });
+  assert.equal(routed.model, 'claude-opus-4-8', 'an intent-routed step runs on the resolved model');
+  assert.notEqual(dflt.model, 'claude-opus-4-8', 'unrouted step stays on the brain/primary');
 });

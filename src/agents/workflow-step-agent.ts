@@ -166,6 +166,10 @@ export interface BuildWorkflowStepAgentOptions {
    *  the agent's tool list is pruned to that family + the structural baseline,
    *  so a bound step can't drift onto composio. Omit / `['*']` → full surface. */
   lockTools?: string[] | null;
+  /** Per-step model override (the intent-routed worker model). Omit ⇒ the
+   *  primary brain tier, byte-identical to before. The registered
+   *  RouterModelProvider dispatches the id to its provider (Codex/Claude/BYO). */
+  model?: string;
 }
 
 export async function buildWorkflowStepAgent(
@@ -180,9 +184,10 @@ export async function buildWorkflowStepAgent(
     name: 'WorkflowStep',
     instructions: harnessInstructions(STEP_INSTRUCTIONS),
     // Step orchestration (OrchestratorDecisionSchema, multi-tool) stays on the
-    // brain/primary tier — Codex in worker mode. Only forEach per-item fan-out
-    // labor routes to the cheap worker model (see workflow-runner forEach path).
-    model: MODELS.primary,
+    // brain/primary tier unless the step carries an intent-routed model override
+    // (see workflow-runner runStepViaHarness). The RouterModelProvider dispatches
+    // the id to its provider.
+    model: options.model ?? MODELS.primary,
     outputType: normalizeZodForCodexStrict(OrchestratorDecisionSchema) as typeof OrchestratorDecisionSchema,
     tools: tools.map((t) => wrapToolForHarness(t as unknown as WrappableTool) as unknown as Tool<RuntimeContextValue>),
     mcpServers: [getOrCreateExternalMcpServers(options.mcpToolScope)],

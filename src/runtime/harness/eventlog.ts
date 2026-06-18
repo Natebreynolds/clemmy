@@ -147,6 +147,10 @@ export const EVENT_TYPES = [
   // selected for this turn's model call and why. gpt-5.x reasons before emitting
   // tokens, so this is the main per-turn latency lever — recorded for observability.
   'reasoning_effort',
+  // A fan-out item was routed to a per-task model by an intent rule (model
+  // role registry) — records the attempted intent, whether it matched, and the
+  // resolved model/provider, so a trace can show "ran on Opus because 'design'".
+  'worker_model_routed',
 ] as const;
 export type EventType = (typeof EVENT_TYPES)[number];
 const EVENT_TYPE_SET: ReadonlySet<string> = new Set(EVENT_TYPES);

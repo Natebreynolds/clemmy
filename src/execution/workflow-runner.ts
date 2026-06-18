@@ -5,6 +5,8 @@ import path from 'node:path';
 import pino from 'pino';
 import type { ClementineAssistant } from '../assistant/core.js';
 import { MODELS, getRuntimeEnv, getWorkerModel } from '../config.js';
+import { resolveRoleModel } from '../runtime/harness/model-roles.js';
+import { appendEvent as appendHarnessEvent } from '../runtime/harness/eventlog.js';
 import { runBoundedPool } from './bounded-pool.js';
 import { bindStepInputs } from './step-binding.js';
 import { addNotification, loadNotifications } from '../runtime/notifications.js';
@@ -960,6 +962,12 @@ function workflowHarnessEnabled(step: WorkflowStepInput): boolean {
   return process.env.WORKFLOW_USE_HARNESS !== 'off';
 }
 
+/** Intent-routed per-step model (default on). off ⇒ steps ignore step.intent and
+ *  run on the brain/explicit model — byte-identical to before. */
+function workerIntentRoutingEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_WORKER_INTENT_ROUTING', 'on') || 'on').trim().toLowerCase() !== 'off';
+}
+
 function workflowAutoApprovalTools(workflow: WorkflowDefinition, step: WorkflowStepInput): string[] {
   if (step.allowedTools && step.allowedTools.length > 0) {
     return step.allowedTools;
@@ -1138,9 +1146,32 @@ async function runStepViaHarness(
     // structured output via workflow_step_result and CANNOT re-trigger
     // workflows (no recursion). Default off → the full orchestrator +
     // prose capture, byte-identical to prior behavior.
+    // Intent-routed per-step model (CLEMMY_WORKER_INTENT_ROUTING, default on):
+    // a step tagged with a user category word ("design") runs on the model the
+    // user bound for it (worker role), e.g. Claude Opus — while untagged steps
+    // stay on the brain. An explicit step.model still wins. The registered
+    // RouterModelProvider dispatches the resolved id to its provider.
+    let stepModel: string | undefined = step.model || undefined;
+    if (!stepModel && workerIntentRoutingEnabled() && step.intent) {
+      const routed = resolveRoleModel('worker', step.intent);
+      stepModel = routed.modelId;
+      try {
+        appendHarnessEvent({
+          sessionId: realSessionId,
+          turn: 0,
+          role: 'system',
+          type: 'worker_model_routed',
+          data: {
+            seam: 'workflow', stepId: step.id, attemptedIntent: step.intent,
+            matchedIntent: routed.matchedIntent ?? null, modelId: routed.modelId,
+            provider: routed.provider, source: routed.source,
+          },
+        });
+      } catch { /* trace is best-effort */ }
+    }
     const agent = useWorkflowStepAgent()
-      ? await buildWorkflowStepAgent({ userInput: message, sessionId: realSessionId, lockTools: step.allowedTools })
-      : await buildOrchestratorAgent({ userInput: message, sessionId: realSessionId });
+      ? await buildWorkflowStepAgent({ userInput: message, sessionId: realSessionId, lockTools: step.allowedTools, model: stepModel })
+      : await buildOrchestratorAgent({ userInput: message, sessionId: realSessionId, model: stepModel });
     let result: RunConversationResult;
     if (session.loadInterruptState() || approvalRegistry.hasPending(realSessionId)) {
       result = {

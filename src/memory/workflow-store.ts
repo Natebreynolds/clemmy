@@ -41,6 +41,12 @@ export interface WorkflowStepInput {
    *  automatically, so new workflows should omit this. */
   orderingOnlyDeps?: string[];
   model?: string;
+  /** Free-form intent tag (the user's OWN category word, e.g. "design") that
+   *  routes this step's labor to the model the user bound for that category via
+   *  the role→model registry — "use Claude Opus for design" sends an
+   *  intent:"design" step to Opus while the rest stays on the brain/Codex.
+   *  `model` (an explicit per-step model) still wins over the intent. */
+  intent?: string;
   tier?: number;
   maxTurns?: number;
   /**
@@ -413,6 +419,7 @@ export function readWorkflowDefinitionFile(filePath: string): WorkflowDefinition
       if (Array.isArray(step.dependsOn)) result.dependsOn = step.dependsOn.map(String);
       if (Array.isArray(step.orderingOnlyDeps)) result.orderingOnlyDeps = step.orderingOnlyDeps.map(String);
       if (typeof step.model === 'string') result.model = step.model;
+      if (typeof step.intent === 'string') result.intent = step.intent;
       if (typeof step.tier === 'number') result.tier = step.tier;
       if (typeof step.maxTurns === 'number') result.maxTurns = step.maxTurns;
       if (typeof step.useHarness === 'boolean') result.useHarness = step.useHarness;
