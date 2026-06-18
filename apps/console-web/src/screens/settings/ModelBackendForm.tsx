@@ -45,7 +45,7 @@ function fromSnapshot(b: ModelBackend | undefined): FormState {
   };
 }
 
-export function ModelBackendForm() {
+export function ModelBackendForm({ embedded = false }: { embedded?: boolean } = {}) {
   const qc = useQueryClient();
   const settings = usePoll(['settings'], getSettings, 0);
   const snap = settings.data?.modelBackend;
@@ -56,7 +56,10 @@ export function ModelBackendForm() {
 
   useEffect(() => { if (snap && !form) setForm(fromSnapshot(snap)); }, [snap, form]);
 
-  if (settings.isLoading || !form) return <Card className="p-5"><Skeleton className="h-40 w-full" /></Card>;
+  if (settings.isLoading || !form) {
+    const sk = <Skeleton className="h-40 w-full" />;
+    return embedded ? sk : <Card className="p-5">{sk}</Card>;
+  }
 
   const set = <K extends keyof FormState>(k: K, v: FormState[K]) => { setForm((f) => (f ? { ...f, [k]: v } : f)); setSaved(false); setError(null); };
 
@@ -102,8 +105,8 @@ export function ModelBackendForm() {
 
   const activeMode = MODES.find((m) => m.id === form.mode)!;
 
-  return (
-    <Card className="p-5">
+  const body = (
+    <>
       <h3 className="mb-1 text-h3 text-fg">Model backend</h3>
       <p className="mb-4 text-small text-muted">
         Run the grunt work on a cheaper, large-context model (MiniMax, DeepSeek, or any OpenAI-compatible endpoint) while Codex stays the brain. Additive and reversible — “Codex only” is exactly today’s behavior.
@@ -186,6 +189,7 @@ export function ModelBackendForm() {
         {saved && <span className="inline-flex items-center gap-1 text-small text-success"><Check className="h-4 w-4" aria-hidden /> Saved — applies to new runs</span>}
         {error && <span className="text-small text-danger">{error}</span>}
       </div>
-    </Card>
+    </>
   );
+  return embedded ? body : <Card className="p-5">{body}</Card>;
 }

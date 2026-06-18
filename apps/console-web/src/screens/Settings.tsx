@@ -5,11 +5,7 @@ import { Button } from '@/components/ui/Button';
 import { useTheme, type ThemeChoice } from '@/lib/theme';
 import { ProfileForm } from './settings/ProfileForm';
 import { NotificationsEditor } from './settings/NotificationsEditor';
-import { ModelsForm } from './settings/ModelsForm';
-import { ModelBackendForm } from './settings/ModelBackendForm';
-import { FusionForm } from './settings/FusionForm';
-import { ModelRolesCard } from './settings/ModelRolesCard';
-import { ClaudeLoginForm } from './settings/ClaudeLoginForm';
+import { ModelsRoutingSection } from './settings/ModelsRoutingSection';
 import { cn } from '@/lib/cn';
 
 const THEMES: { key: ThemeChoice; label: string; icon: typeof Sun }[] = [
@@ -60,15 +56,7 @@ export function Settings() {
 
         <NotificationsEditor />
 
-        <ModelsForm />
-
-        <FusionForm />
-
-        <ModelRolesCard />
-
-        <ModelBackendForm />
-
-        <ClaudeLoginForm />
+        <ModelsRoutingSection />
 
         <ClassicRow title="Sign-in & credentials" desc="Codex/OpenAI sign-in and stored keys (in Connect → Keys)." />
       </div>

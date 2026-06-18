@@ -54,7 +54,7 @@ function RoleRow({
   );
 }
 
-export function ModelRolesCard() {
+export function ModelRolesCard({ embedded = false }: { embedded?: boolean } = {}) {
   const qc = useQueryClient();
   const settings = usePoll(['settings'], getSettings, 0);
   const mr = settings.data?.modelRoles;
@@ -62,7 +62,10 @@ export function ModelRolesCard() {
   const [saved, setSaved] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  if (settings.isLoading || !mr) return <Card className="p-5"><Skeleton className="h-44 w-full" /></Card>;
+  if (settings.isLoading || !mr) {
+    const sk = <Skeleton className="h-44 w-full" />;
+    return embedded ? sk : <Card className="p-5">{sk}</Card>;
+  }
 
   const refresh = () => { void qc.invalidateQueries({ queryKey: ['settings'] }); };
   const workerOptions = mr.roleOptions?.worker ?? mr.available;
@@ -86,14 +89,18 @@ export function ModelRolesCard() {
   const onRole = (role: 'worker' | 'judge', v: string) =>
     run(role, () => patchModelRole(v === '__default__' ? { role, clear: true } : { role, modelId: v }));
 
-  return (
-    <Card className="p-5">
-      <h3 className="mb-1 text-h3 text-fg">Models — who does what</h3>
-      <p className="mb-4 text-small text-muted">
-        Pick the active brain provider and which connected models serve workers and judge/checker.
-        You can also just tell Clementine in chat — “use DeepSeek for the workers”,
-        “make the judge Opus”. Applies on the next message; no restart.
-      </p>
+  const body = (
+    <>
+      {!embedded && (
+        <>
+          <h3 className="mb-1 text-h3 text-fg">Models — who does what</h3>
+          <p className="mb-4 text-small text-muted">
+            Pick the active brain provider and which connected models serve workers and judge/checker.
+            You can also just tell Clementine in chat — “use DeepSeek for the workers”,
+            “make the judge Opus”. Applies on the next message; no restart.
+          </p>
+        </>
+      )}
 
       <div className="space-y-3">
         <RoleRow icon={BrainCircuit} label="Brain" hint="Runs every turn (a provider login switch)." resolved={mr.roles.brain}>
@@ -131,8 +138,9 @@ export function ModelRolesCard() {
       <div className="mt-4 flex items-center gap-3">
         {saved && <span className="inline-flex items-center gap-1 text-small text-success"><Check className="h-4 w-4" aria-hidden /> Saved — applies on the next message</span>}
         {error && <span className="text-small text-danger">{error}</span>}
-        {mr.available.length === 0 && <span className="text-small text-muted">No models connected yet — log in under Claude login / Codex / Model backend below.</span>}
+        {mr.available.length === 0 && <span className="text-small text-muted">No models connected yet — open “Connect more models” below.</span>}
       </div>
-    </Card>
+    </>
   );
+  return embedded ? body : <Card className="p-5">{body}</Card>;
 }

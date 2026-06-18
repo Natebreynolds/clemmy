@@ -13,7 +13,7 @@ import { getSettings, beginClaudeLogin, completeClaudeLogin, setActiveBrain, typ
  * code → we exchange it for an oat01 subscription token (stored in our vault,
  * decoupled from Claude Code). Billed to the Claude plan, never an API key.
  */
-export function ClaudeLoginForm() {
+export function ClaudeLoginForm({ embedded = false }: { embedded?: boolean } = {}) {
   const qc = useQueryClient();
   const settings = usePoll(['settings'], getSettings, 0);
   const claude = settings.data?.claudeAuth;
@@ -62,8 +62,8 @@ export function ClaudeLoginForm() {
 
   const cancel = () => { setFlowId(null); setAuthorizeUrl(null); setCode(''); setError(null); };
 
-  return (
-    <Card className="p-5">
+  const body = (
+    <>
       <div className="mb-1 flex items-center gap-2">
         <h3 className="text-h3 text-fg">Claude (Anthropic) brain</h3>
         {runningOnClaude && (
@@ -118,7 +118,7 @@ export function ClaudeLoginForm() {
               </p>
               <p className="mt-0.5 text-small text-muted">
                 {runningOnClaude
-                  ? 'Every reply uses your Claude subscription. The Model backend card above is paused while Claude is the brain.'
+                  ? 'Every reply uses your Claude subscription. The alternative model backend is paused while Claude is the brain.'
                   : 'Switch the brain to Claude — applies on your next message, no restart needed.'}
               </p>
             </div>
@@ -144,6 +144,7 @@ export function ClaudeLoginForm() {
           )}
         </div>
       )}
-    </Card>
+    </>
   );
+  return embedded ? body : <Card className="p-5">{body}</Card>;
 }

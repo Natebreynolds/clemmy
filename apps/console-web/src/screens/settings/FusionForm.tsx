@@ -6,9 +6,9 @@ import { Button } from '@/components/ui/Button';
 import { Field, Select } from '@/components/ui/Field';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { usePoll } from '@/lib/poll';
-import { getSettings, setActiveBrain, patchFusion, type FusionMode, type FusionStrategy, type ActiveBrain } from '@/lib/settings';
+import { getSettings, patchFusion, type FusionMode, type FusionStrategy } from '@/lib/settings';
 
-type FormState = { brain: ActiveBrain; mode: FusionMode; judge: 'claude' | 'codex'; strategy: FusionStrategy };
+type FormState = { mode: FusionMode; judge: 'claude' | 'codex'; strategy: FusionStrategy };
 
 const MODES: { id: FusionMode; label: string; icon: typeof Cpu; blurb: string }[] = [
   { id: 'off', label: 'Single brain', icon: Cpu, blurb: 'Your primary flagship answers every turn. The default.' },
@@ -16,7 +16,7 @@ const MODES: { id: FusionMode; label: string; icon: typeof Cpu; blurb: string }[
   { id: 'all', label: 'Every turn', icon: Users, blurb: 'Both flagships debate every turn — most accurate, but 2-3× tokens & latency.' },
 ];
 
-export function FusionForm() {
+export function FusionForm({ embedded = false }: { embedded?: boolean } = {}) {
   const qc = useQueryClient();
   const settings = usePoll(['settings'], getSettings, 0);
   const fusion = settings.data?.fusion;
@@ -29,15 +29,17 @@ export function FusionForm() {
   useEffect(() => {
     if (fusion && !form) {
       setForm({
-        brain: activeBrain === 'claude_oauth' ? 'claude_oauth' : 'codex_oauth',
         mode: fusion.mode,
         judge: fusion.judge,
         strategy: fusion.strategy ?? 'debate',
       });
     }
-  }, [fusion, activeBrain, form]);
+  }, [fusion, form]);
 
-  if (settings.isLoading || !form || !fusion) return <Card className="p-5"><Skeleton className="h-40 w-full" /></Card>;
+  if (settings.isLoading || !form || !fusion) {
+    const sk = <Skeleton className="h-40 w-full" />;
+    return embedded ? sk : <Card className="p-5">{sk}</Card>;
+  }
 
   const set = <K extends keyof FormState>(k: K, v: FormState[K]) => { setForm((f) => (f ? { ...f, [k]: v } : f)); setSaved(false); setError(null); };
 
@@ -46,7 +48,7 @@ export function FusionForm() {
   const willDebateButCant = form.mode !== 'off' && !bothPresent;
   // In verify, the executor IS the primary brain; a judge == primary means the
   // brain checks itself (no second opinion) — warn so it isn't set by accident.
-  const primaryBrainKind = form.brain === 'claude_oauth' ? 'claude' : 'codex';
+  const primaryBrainKind = activeBrain === 'claude_oauth' ? 'claude' : 'codex';
   const effectiveJudge = fusion.judgeRole;
   const effectiveJudgeProvider = effectiveJudge?.source === 'default' ? form.judge : (effectiveJudge?.provider ?? form.judge);
   const verifySelfCheck = form.mode !== 'off' && form.strategy === 'verify' && effectiveJudgeProvider !== 'byo' && effectiveJudgeProvider === primaryBrainKind;
@@ -60,22 +62,9 @@ export function FusionForm() {
       }`;
 
   const save = async () => {
+    // The primary brain is owned by the routing rows above (a single source of
+    // truth); fusion only persists WHEN the second model joins and HOW.
     setSaving(true); setError(null);
-    // Primary brain first (it preflights the Claude token and can 409 with a
-    // sign-in prompt). Keep the two calls' failures distinct so we never leave
-    // the brain switched while fusion silently didn't save.
-    try {
-      await setActiveBrain(form.brain);
-    } catch (err) {
-      const e = err as { status?: number; body?: { needsLogin?: boolean }; message?: string };
-      setError(
-        e?.body?.needsLogin || e?.status === 409
-          ? 'Switching to Claude needs a Claude Code (Max/Pro) login first — sign in under “Claude login” below, then Save again.'
-          : `Brain switch failed: ${e?.message ?? String(err)}`,
-      );
-      setSaving(false);
-      return;
-    }
     try {
       const res = await patchFusion({ mode: form.mode, judge: form.judge, strategy: form.strategy });
       setSaved(true);
@@ -85,40 +74,33 @@ export function FusionForm() {
       }
       void qc.invalidateQueries({ queryKey: ['settings'] });
     } catch (err) {
-      // Brain already switched — be explicit that fusion did NOT save.
-      setError(`Brain switched, but fusion mode/judge did NOT save: ${(err as Error)?.message ?? String(err)}. Click Save again.`);
+      setError(`Fusion mode/judge did NOT save: ${(err as Error)?.message ?? String(err)}. Click Save again.`);
     } finally {
       setSaving(false);
     }
   };
 
-  return (
-    <Card className="p-5">
+  const body = (
+    <>
       <h3 className="mb-1 text-h3 text-fg">Fusion — multi-model</h3>
       <p className="mb-3 text-small text-muted">
-        Pick your flagship, or run both in tandem. In fusion mode the two flagships
-        collaborate on the turns that matter — higher accuracy where it counts.
-        Applies live on the next message; no restart.
+        Run both flagships in tandem on the turns that matter — higher accuracy where it counts.
+        The primary brain is set above in the routing rows; here you choose <em>when</em> the second
+        model joins and <em>how</em> they collaborate. Applies live on the next message; no restart.
       </p>
 
       <div className="mb-4 flex flex-wrap items-center gap-2">
         <Button
           variant="secondary"
           size="sm"
-          onClick={() => { setForm({ brain: 'codex_oauth', mode: 'high', judge: 'claude', strategy: 'verify' }); setSaved(false); setError(null); }}
+          onClick={() => { setForm({ mode: 'high', judge: 'claude', strategy: 'verify' }); setSaved(false); setError(null); }}
         >
-          Use “Codex drives, Claude checks” (recommended)
+          Use recommended (high-stakes · verify · Claude checks)
         </Button>
-        <span className="text-caption text-muted">Cheapest: Codex runs the bulk; Claude verifies the key turns.</span>
+        <span className="text-caption text-muted">Your primary brain runs the bulk; the checker verifies the key turns.</span>
       </div>
 
       <div className="mb-4 grid gap-x-4 sm:grid-cols-2">
-        <Field label="Primary brain" hint="Runs every single-model turn, and is the fallback when fusion can't run.">{(id) => (
-          <Select id={id} value={form.brain} onChange={(e) => set('brain', e.target.value as ActiveBrain)}>
-            <option value="codex_oauth">Codex — GPT-5.x</option>
-            <option value="claude_oauth">Claude — Opus</option>
-          </Select>
-        )}</Field>
         <Field label="Judge / checker" hint="The brain that reconciles drafts (debate) or verifies the executor's draft (verify).">{(id) => (
           <Select id={id} value={form.judge} onChange={(e) => set('judge', e.target.value as 'claude' | 'codex')}>
             <option value="claude">Claude</option>
@@ -168,7 +150,7 @@ export function FusionForm() {
         <div className="mb-4 flex items-start gap-2 rounded-lg border border-warning bg-warning-tint p-3">
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-warning" aria-hidden />
           <p className="text-caption text-muted">
-            The judge is pinned to <span className="text-fg">{effectiveJudge.modelId}</span> in Models - who does what. The selector above only changes the Claude/Codex default; clear the judge role there to use it again.
+            The judge is pinned to <span className="text-fg">{effectiveJudge.modelId}</span> in the routing rows above. The selector here only changes the Claude/Codex default; clear the judge role there to use it again.
           </p>
         </div>
       )}
@@ -196,6 +178,7 @@ export function FusionForm() {
         {saved && <span className="inline-flex items-center gap-1 text-small text-success"><Check className="h-4 w-4" aria-hidden /> Saved — applies on the next message</span>}
         {error && <span className="text-small text-danger">{error}</span>}
       </div>
-    </Card>
+    </>
   );
+  return embedded ? body : <Card className="p-5">{body}</Card>;
 }
