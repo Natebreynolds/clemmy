@@ -261,6 +261,34 @@ export function resolveModelCapability(modelId: string | undefined | null): Mode
   return DEFAULT_CAPABILITY;
 }
 
+/** The PROVIDER class that serves a model. Derived from the model's wire shape,
+ *  the single source of truth already in this registry. */
+export type ModelProviderClass = 'codex' | 'claude' | 'byo';
+
+/**
+ * Which provider class serves a model id — anthropic_messages → claude,
+ * codex_responses → codex, everything else (and unknown ids) → byo
+ * (OpenAI-compatible). The role→model registry (model-roles.ts) uses this so a
+ * resolved role model carries its provider without a second hardcoded id table.
+ * Non-warning (unlike resolveModelCapability): an unrecognized id is a perfectly
+ * legitimate BYO model, not a misconfiguration.
+ */
+export function resolveProvider(modelId: string | undefined | null): ModelProviderClass {
+  const id = (modelId ?? '').trim();
+  if (id) {
+    for (const row of REGISTRY) {
+      if (row.idMatch.test(id)) {
+        switch (row.cap.apiShape) {
+          case 'anthropic_messages': return 'claude';
+          case 'codex_responses': return 'codex';
+          default: return 'byo';
+        }
+      }
+    }
+  }
+  return 'byo';
+}
+
 /** Rough token estimate (chars/4) for cache-min gating. Intentionally cheap +
  *  conservative — only used to decide whether a cache breakpoint is worth it. */
 export function estimateTokens(text: string): number {

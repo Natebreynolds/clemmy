@@ -172,6 +172,16 @@ export function getDebateCheckerModel(): string {
   return (getRuntimeEnv('CLEMMY_DEBATE_CHECKER_MODEL', '') || '').trim() || 'claude-sonnet-4-6';
 }
 
+/** Which brain JUDGES/CHECKS a fusion turn: the Claude checker (default) or
+ *  Codex. Lives here (config) so the role→model registry can read it without a
+ *  circular import through debate-model.ts; re-exported from debate-model for
+ *  back-compat. */
+export function judgeChoice(): 'claude' | 'codex' {
+  return (getRuntimeEnv('CLEMMY_DEBATE_JUDGE', 'claude') || 'claude').trim().toLowerCase() === 'codex'
+    ? 'codex'
+    : 'claude';
+}
+
 export const CLAUDE_MODEL_PRESETS = [
   { id: 'claude-opus-4-8', label: 'Claude Opus 4.8 (flagship)' },
   { id: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6' },

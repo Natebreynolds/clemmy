@@ -1,6 +1,7 @@
 import { Agent } from '@openai/agents';
 import type { Handoff, Tool } from '@openai/agents';
-import { MODELS, getRuntimeEnv, getWorkerModel } from '../config.js';
+import { MODELS, getRuntimeEnv } from '../config.js';
+import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { getCoreToolsAsync } from '../tools/registry.js';
 import { WORKFLOW_STEP_BLOCKED_TOOL_NAMES } from './workflow-step-agent.js';
 import { getOrCreateExternalMcpServers } from '../runtime/mcp-servers.js';
@@ -145,10 +146,11 @@ export async function buildWorkerAgent(options: { mcpToolScope?: McpToolScope } 
       }
       return baseInstructions;
     },
-    // Worker = delegated grunt-work labor. Routes to the BYO model when
-    // MODEL_ROUTING_MODE is worker/all_in; otherwise getWorkerModel()
-    // returns MODELS.primary (Codex) — byte-identical to the old default.
-    model: getWorkerModel(),
+    // Worker = delegated grunt-work labor. The role→model registry resolves the
+    // worker model (a UI/chat binding wins; else the provider-derived default,
+    // which delegates to getWorkerModel() → MODELS.primary, byte-identical to
+    // the old behavior). The registered provider still routes the resulting id.
+    model: resolveRoleModel('worker').modelId,
     tools: wrapTools(tools),
     // External MCP servers (DataForSEO, Supabase, browsermcp, etc.)
     // the user has configured. Tools surface as `<server>__<tool>`.

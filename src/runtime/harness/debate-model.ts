@@ -36,9 +36,10 @@
  */
 import type { Model, ModelProvider, ModelRequest, ModelResponse } from '@openai/agents-core';
 import type { StreamEvent } from '@openai/agents-core/types';
-import { getRuntimeEnv, getActiveAuthMode, getClaudeBrainModel, getDebateCheckerModel } from '../../config.js';
+import { getRuntimeEnv, getActiveAuthMode, getClaudeBrainModel, judgeChoice } from '../../config.js';
 import { ClaudeModelProvider } from './claude-model.js';
 import { CodexModelProvider } from './codex-model.js';
+import { resolveRoleModel } from './model-roles.js';
 import { getStoredCodexOAuthTokens } from '../auth-store.js';
 import { getStoredClaudeTokens } from '../claude-oauth.js';
 import { harnessRunContextStorage } from './brackets.js';
@@ -64,11 +65,9 @@ export function isDebateModeEnabled(): boolean {
 }
 
 /** Which brain reconciles the two drafts. Default Claude — a strong synthesizer. */
-export function judgeChoice(): 'claude' | 'codex' {
-  return (getRuntimeEnv('CLEMMY_DEBATE_JUDGE', 'claude') || 'claude').trim().toLowerCase() === 'codex'
-    ? 'codex'
-    : 'claude';
-}
+// judgeChoice now lives in config.ts (so the role→model registry can read it
+// without a circular import); re-exported here for existing consumers.
+export { judgeChoice };
 
 /** Keep-alive cadence for the silent drafting window (ms). Well under the 75s
  *  pre-content stall ceiling, so a pathologically slow draft can't be abandoned. */
@@ -659,16 +658,17 @@ export class DebateModel implements Model {
     // checker produced usable content; 'checker-empty' = it returned without
     // throwing but with nothing usable (an overloaded/empty completion).
     const outcome = finalForTrace ? 'checker-refined' : 'checker-empty';
-    // Observability: which Claude tier actually checked (Sonnet by default — a
-    // fast, low-contention checker; see getDebateCheckerModel), and on an empty
+    // Observability: which model actually checked (the registry-resolved judge —
+    // Sonnet by default, or whatever a UI/chat binding set), and on an empty
     // return, the shape the checker emitted so a regression is diagnosable.
+    const checkerModelId = resolveRoleModel('judge').modelId;
     if (!finalForTrace) {
       logger.warn({
-        checkerModel: getDebateCheckerModel(),
+        checkerModel: checkerModelId,
         outputItemTypes: Array.isArray(checkerOutput) ? (checkerOutput as Array<{ type?: string }>).map((o) => o?.type) : typeof checkerOutput,
       }, 'fusion verify: checker returned EMPTY — shipping the executor draft');
     }
-    logger.info({ path: 'verify', n: this.debatesThisTurn, outcome, executorLen: da.length, finalLen: finalForTrace.length, judge: judgeChoice(), checkerModel: getDebateCheckerModel() }, 'fusion verify reconciled');
+    logger.info({ path: 'verify', n: this.debatesThisTurn, outcome, executorLen: da.length, finalLen: finalForTrace.length, judge: judgeChoice(), checkerModel: checkerModelId }, 'fusion verify reconciled');
     recordDebateTrace({ path: 'verify', n: this.debatesThisTurn, outcome, judge: judgeChoice(), executor: capText(da), final: capText(finalForTrace) });
   }
 }
@@ -762,7 +762,11 @@ export function resolveDebateBrains(passthrough: ModelProvider, modelName?: stri
   // the flagship's depth, and Opus-as-checker hung past the deadline so the check
   // shipped the unchecked draft. The DEBATE DRAFTER (draftA) keeps the full
   // flagship brain. Override the checker via CLEMMY_DEBATE_CHECKER_MODEL.
-  const checkerModelId = getDebateCheckerModel();
+  // The CHECKER model id comes from the role→model registry (a UI/chat binding
+  // wins; else the provider-derived default = getDebateCheckerModel(), so this is
+  // byte-identical when unbound). judgeChoice() still selects the claude-vs-codex
+  // branch; the registry only sources the Claude checker's model id.
+  const checkerModelId = resolveRoleModel('judge').modelId;
   const claudeChecker: Model = checkerModelId && checkerModelId !== getClaudeBrainModel()
     ? new ClaudeModelProvider().getModel(checkerModelId)
     : claude;
