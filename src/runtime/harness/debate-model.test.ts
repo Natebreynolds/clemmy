@@ -643,6 +643,26 @@ test('verify strategy: checker failure pre-content ships the executor draft (con
   });
 });
 
+test('verify strategy: an EMPTY checker response_done ships the executor draft, not an empty turn', async () => {
+  await withEnv({ CLEMMY_DEBATE_MODE: 'all', CLEMMY_FUSION_STRATEGY: 'verify' }, async () => {
+    const b = brains({
+      passthrough: model({ getResponse: async () => ({ output: [{ type: 'message', content: 'CODEX-SOLO' }], responseId: 'r11', usage: { inputTokens: 1, outputTokens: 1 } } as any) }),
+      // Checker opens the stream then returns an EMPTY completion with nothing
+      // streamed (overloaded/empty). Without the backstop this would ship an
+      // empty response_done; with it, the executor draft is shipped instead.
+      judge: model({ getStreamedResponse: async function* () {
+        yield { type: 'response_started' } as any;
+        yield { type: 'response_done', response: { output: [] } } as any;
+      } }),
+    });
+    const evs = await collect(dm(b, { heartbeatMs: 0 }).getStreamedResponse(req()));
+    assert.ok(evs.some((e) => e.type === 'output_text_delta' && e.delta === 'CODEX-SOLO'), 'shipped the executor draft on an empty checker done');
+    const dones = evs.filter((e) => e.type === 'response_done');
+    assert.equal(dones.length, 1, 'exactly one terminal response_done (no empty duplicate)');
+    assert.ok((dones[0] as any).response.output.length > 0, 'final done carries the non-empty executor draft');
+  });
+});
+
 test('per-message cap: debate runs at most maxPerTurn times across iterations, then passes through', async () => {
   await withEnv({ CLEMMY_DEBATE_MODE: 'all' }, async () => {
     let drafts = 0;

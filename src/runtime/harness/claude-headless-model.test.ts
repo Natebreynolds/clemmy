@@ -20,6 +20,8 @@ const {
   normalizeClaudeHeadlessOutputText,
   resetClaudeHeadlessModelCache,
   setClaudeHeadlessSpawnForTest,
+  claudeHeadlessCliAvailable,
+  setClaudeHeadlessCliAvailableForTest,
 } = mod;
 
 const STATE_DIR = path.join(TMP_HOME, 'state');
@@ -221,4 +223,31 @@ test('ClaudeHeadlessModel.getResponse normalizes fenced JSON for structured cont
   } as any);
 
   assert.equal((response.output[0] as any).content[0].text, '{"reply":"ok"}');
+});
+
+test('claudeHeadlessCliAvailable: test override forces the value; null restores the real PATH scan', () => {
+  setClaudeHeadlessCliAvailableForTest(true);
+  assert.equal(claudeHeadlessCliAvailable(), true);
+  setClaudeHeadlessCliAvailableForTest(false);
+  assert.equal(claudeHeadlessCliAvailable(), false);
+  setClaudeHeadlessCliAvailableForTest(null);
+});
+
+test('claudeHeadlessCliAvailable: real PATH scan finds (and misses) a `claude` binary', () => {
+  setClaudeHeadlessCliAvailableForTest(null);
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'clemmy-claude-bin-'));
+  const emptyDir = mkdtempSync(path.join(os.tmpdir(), 'clemmy-empty-bin-'));
+  const claudeBin = path.join(binDir, process.platform === 'win32' ? 'claude.cmd' : 'claude');
+  writeFileSync(claudeBin, '#!/bin/sh\necho stub', { mode: 0o755 });
+  const prevPath = process.env.PATH;
+  try {
+    process.env.PATH = binDir;
+    assert.equal(claudeHeadlessCliAvailable(), true, 'finds claude on PATH');
+    process.env.PATH = emptyDir;
+    assert.equal(claudeHeadlessCliAvailable(), false, 'absent when PATH lacks claude');
+  } finally {
+    process.env.PATH = prevPath;
+    rmSync(binDir, { recursive: true, force: true });
+    rmSync(emptyDir, { recursive: true, force: true });
+  }
 });

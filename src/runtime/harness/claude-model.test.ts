@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { applyClaudeEnvelope, withIdentityPrefix, ClaudeModelProvider, sanitizeClaudeInput, aisdkAcceptsReasoning, withClaudeInputSanitizer } from './claude-model.js';
+import { applyClaudeEnvelope, withIdentityPrefix, ClaudeModelProvider, sanitizeClaudeInput, aisdkAcceptsReasoning, withClaudeInputSanitizer, getClaudeModel, resetClaudeModelCache } from './claude-model.js';
+import { ClaudeHeadlessModel, setClaudeHeadlessCliAvailableForTest } from './claude-headless-model.js';
 
 const ID = "You are Claude Code, Anthropic's official CLI for Claude.".replace('Claude', 'Claude'); // exact identity
 const IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude.";
@@ -101,6 +102,32 @@ test('withClaudeInputSanitizer: forwards SANITIZED input to the inner model on b
   const s = seen.getStreamed as Array<{ type: string }>;
   assert.deepEqual(r.map((i) => i.type), ['message'], 'getResponse received sanitized input');
   assert.deepEqual(s.map((i) => i.type), ['message'], 'getStreamedResponse received sanitized input');
+});
+
+test('getClaudeModel: headless transport falls back to the raw_messages adapter when the `claude` CLI is missing', () => {
+  const prevTransport = process.env.CLEMMY_CLAUDE_TRANSPORT;
+  process.env.CLEMMY_CLAUDE_TRANSPORT = 'headless';
+  try {
+    // CLI present → headless transport (claude -p print mode).
+    setClaudeHeadlessCliAvailableForTest(true);
+    resetClaudeModelCache();
+    const headless = getClaudeModel('claude-opus-4-8');
+    assert.ok(headless instanceof ClaudeHeadlessModel, 'CLI present → headless transport');
+
+    // CLI missing → must NOT commit to headless (every turn would spawn ENOENT
+    // with no auto-recovery); fall back to the raw Messages adapter, which uses
+    // the same oat01 subscription token.
+    setClaudeHeadlessCliAvailableForTest(false);
+    resetClaudeModelCache();
+    const fallback = getClaudeModel('claude-opus-4-8');
+    assert.ok(!(fallback instanceof ClaudeHeadlessModel), 'CLI missing → raw_messages fallback, not headless');
+    assert.equal(typeof (fallback as { getStreamedResponse?: unknown }).getStreamedResponse, 'function', 'fallback is a valid streaming Model');
+  } finally {
+    setClaudeHeadlessCliAvailableForTest(null);
+    resetClaudeModelCache();
+    if (prevTransport === undefined) delete process.env.CLEMMY_CLAUDE_TRANSPORT;
+    else process.env.CLEMMY_CLAUDE_TRANSPORT = prevTransport;
+  }
 });
 
 void ID;

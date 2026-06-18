@@ -29,7 +29,7 @@ import { withModelFallback, type FallbackTarget } from './fallback-model.js';
 import { CodexModelProvider } from './codex-model.js';
 import { getStoredCodexOAuthTokens } from '../auth-store.js';
 import { resolveModelCapability, estimateTokens, modelParityEnabled, restoreLegacyInstructionOrder, CACHE_BREAK_SENTINEL, type ModelCapability } from './model-wire-registry.js';
-import { claudeSubscriptionTransport, getClaudeHeadlessModel, resetClaudeHeadlessModelCache } from './claude-headless-model.js';
+import { claudeSubscriptionTransport, claudeHeadlessCliAvailable, getClaudeHeadlessModel, resetClaudeHeadlessModelCache } from './claude-headless-model.js';
 import pino from 'pino';
 
 const logger = pino({ name: 'clementine.claude-model' });
@@ -544,9 +544,16 @@ export function getClaudeModel(modelId: string): Model {
   const cached = modelCache.get(modelId);
   if (cached) return cached;
   if (claudeSubscriptionTransport() === 'headless') {
-    const model = getClaudeHeadlessModel(modelId);
-    modelCache.set(modelId, model);
-    return model;
+    if (claudeHeadlessCliAvailable()) {
+      const model = getClaudeHeadlessModel(modelId);
+      modelCache.set(modelId, model);
+      return model;
+    }
+    // Headless was selected but the `claude` CLI isn't on PATH. Rather than
+    // fail every Claude-brain turn with an unrecoverable spawn ENOENT, fall
+    // through to the raw Messages adapter below — it serves the SAME oat01
+    // subscription token, so billing + behavior stay correct.
+    logger.warn('Claude headless transport selected but `claude` CLI not found on PATH — falling back to raw_messages adapter (same subscription token).');
   }
   // Sanitize cross-model input FIRST (innermost), so a Codex-shaped reasoning
   // item can't crash the aisdk adapter — on the primary call OR any retry.

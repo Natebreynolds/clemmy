@@ -657,10 +657,28 @@ export class DebateModel implements Model {
         const e = ev as { type?: string; delta?: string; response?: { output?: unknown } };
         if (e.type !== 'response_started') {
           if (e.type === 'output_text_delta' && typeof e.delta === 'string') { finalText += e.delta; checkerYieldedContent = true; }
-          const outEv = e.type === 'response_done' ? normalizeResponseDoneEvent(ev, 'debate-checker') : ev;
-          const out = outEv as { type?: string; response?: { output?: unknown } };
-          if (out.type === 'response_done') { sawDone = true; if (out.response) checkerOutput = out.response.output; }
-          yield outEv;
+          if (e.type === 'response_done') {
+            const outEv = normalizeResponseDoneEvent(ev, 'debate-checker');
+            const doneOutput = (outEv as { response?: { output?: unknown } }).response?.output;
+            // An empty completion with NOTHING streamed → don't ship an empty
+            // turn; ship the executor (Codex) draft instead. We must intercept
+            // BEFORE yielding the empty done (yielding it then the draft would
+            // emit two terminal events). The resilient layer normally throws on
+            // an empty completion before we get here; this is the in-loop
+            // backstop for when it doesn't (e.g. CLEMMY_MODEL_PARITY=off).
+            if (!checkerYieldedContent && !extractAssistantText(doneOutput)) {
+              void it.return?.().catch(() => {});
+              logger.warn({ checkerModel: resolveRoleModel('judge').modelId }, 'fusion verify: checker returned an EMPTY response_done — shipping the executor draft');
+              recordDebateTrace({ path: 'verify', n: this.debatesThisTurn, outcome: 'checker-empty-ship-draft' });
+              yield* streamResponseAsEvents(draft);
+              return;
+            }
+            sawDone = true;
+            checkerOutput = doneOutput;
+            yield outEv;
+          } else {
+            yield ev;
+          }
         }
         res = await it.next();
       }

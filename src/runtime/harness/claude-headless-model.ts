@@ -1,5 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import path from 'node:path';
+import { existsSync } from 'node:fs';
 import { Usage } from '@openai/agents-core';
 import type { AgentInputItem, AgentOutputItem, Model, ModelRequest, ModelResponse } from '@openai/agents-core';
 import type { StreamEvent } from '@openai/agents-core/types';
@@ -14,6 +16,33 @@ let spawnImpl: SpawnLike = spawn;
 
 export function setClaudeHeadlessSpawnForTest(fn: SpawnLike | null): void {
   spawnImpl = fn ?? spawn;
+}
+
+let cliAvailableOverride: boolean | null = null;
+/** Test seam — force claudeHeadlessCliAvailable() to a fixed value (null = real PATH scan). */
+export function setClaudeHeadlessCliAvailableForTest(value: boolean | null): void {
+  cliAvailableOverride = value;
+}
+
+/** Whether the `claude` CLI is resolvable on PATH. The headless transport
+ *  spawns it directly (`claude -p …`); if it's absent the caller must fall back
+ *  to the raw Messages adapter (same oat01 subscription token) instead of
+ *  hard-failing every Claude-brain turn with spawn ENOENT — which is NOT a
+ *  fallover error, so nothing auto-recovers from it. */
+export function claudeHeadlessCliAvailable(): boolean {
+  if (cliAvailableOverride !== null) return cliAvailableOverride;
+  const exts = process.platform === 'win32' ? ['.cmd', '.exe', '.bat', ''] : [''];
+  for (const dir of (process.env.PATH || '').split(path.delimiter)) {
+    if (!dir) continue;
+    for (const ext of exts) {
+      try {
+        if (existsSync(path.join(dir, `claude${ext}`))) return true;
+      } catch {
+        /* unreadable PATH entry — keep scanning */
+      }
+    }
+  }
+  return false;
 }
 
 export type ClaudeSubscriptionTransport = 'headless' | 'raw_messages';
