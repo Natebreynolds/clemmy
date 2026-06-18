@@ -453,8 +453,10 @@ export class DebateModel implements Model {
         const e = ev as { type?: string; delta?: string; response?: { output?: unknown } };
         if (e.type === 'response_started') continue;
         if (e.type === 'output_text_delta' && typeof e.delta === 'string') { finalText += e.delta; judgeYieldedContent = true; }
-        if (e.type === 'response_done') { sawDone = true; if (e.response) judgeFinalOutput = e.response.output; }
-        yield ev;
+        const outEv = e.type === 'response_done' ? normalizeResponseDoneEvent(ev, 'debate-judge') : ev;
+        const out = outEv as { type?: string; response?: { output?: unknown } };
+        if (out.type === 'response_done') { sawDone = true; if (out.response) judgeFinalOutput = out.response.output; }
+        yield outEv;
       }
     } catch (err) {
       // Recover ONLY if nothing was committed — neither a text delta NOR a
@@ -644,8 +646,10 @@ export class DebateModel implements Model {
         const e = ev as { type?: string; delta?: string; response?: { output?: unknown } };
         if (e.type !== 'response_started') {
           if (e.type === 'output_text_delta' && typeof e.delta === 'string') { finalText += e.delta; checkerYieldedContent = true; }
-          if (e.type === 'response_done') { sawDone = true; if (e.response) checkerOutput = e.response.output; }
-          yield ev;
+          const outEv = e.type === 'response_done' ? normalizeResponseDoneEvent(ev, 'debate-checker') : ev;
+          const out = outEv as { type?: string; response?: { output?: unknown } };
+          if (out.type === 'response_done') { sawDone = true; if (out.response) checkerOutput = out.response.output; }
+          yield outEv;
         }
         res = await it.next();
       }
@@ -1029,6 +1033,146 @@ function conformantUsage(u: unknown): { inputTokens: number; outputTokens: numbe
   return { inputTokens, outputTokens, totalTokens };
 }
 
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v);
+}
+
+function validStatus(v: unknown): 'in_progress' | 'completed' | 'incomplete' {
+  return v === 'in_progress' || v === 'incomplete' || v === 'completed' ? v : 'completed';
+}
+
+function normalizeAssistantContent(content: unknown): Array<Record<string, unknown>> {
+  if (typeof content === 'string') return [{ type: 'output_text', text: content }];
+  if (!Array.isArray(content)) return [];
+  const out: Array<Record<string, unknown>> = [];
+  for (const part of content) {
+    if (!isRecord(part)) continue;
+    const text = typeof part.text === 'string' ? part.text : undefined;
+    if ((part.type === 'output_text' || part.type === 'input_text' || part.type === 'text' || part.type === undefined) && text !== undefined) {
+      out.push({ ...part, type: 'output_text', text });
+    } else if (part.type === 'refusal' && typeof part.refusal === 'string') {
+      out.push(part);
+    } else if (part.type === 'image' && typeof part.image === 'string') {
+      out.push(part);
+    } else if (part.type === 'audio' && part.audio !== undefined) {
+      out.push(part);
+    } else if (text !== undefined) {
+      out.push({ type: 'output_text', text });
+    }
+  }
+  return out;
+}
+
+function normalizeInputContent(content: unknown): Array<Record<string, unknown>> {
+  if (typeof content === 'string') return [{ type: 'input_text', text: content }];
+  if (!Array.isArray(content)) return [];
+  const out: Array<Record<string, unknown>> = [];
+  for (const part of content) {
+    if (!isRecord(part)) continue;
+    const text = typeof part.text === 'string' ? part.text : undefined;
+    if ((part.type === 'input_text' || part.type === 'output_text' || part.type === 'text' || part.type === undefined) && text !== undefined) {
+      out.push({ ...part, type: 'input_text', text });
+    } else if (part.type === 'input_image' || part.type === 'input_file' || part.type === 'audio') {
+      out.push(part);
+    } else if (text !== undefined) {
+      out.push({ type: 'input_text', text });
+    }
+  }
+  return out;
+}
+
+function normalizeReasoningRawContent(content: unknown): Array<Record<string, unknown>> | undefined {
+  if (!Array.isArray(content)) return undefined;
+  const out: Array<Record<string, unknown>> = [];
+  for (const part of content) {
+    if (!isRecord(part)) continue;
+    const text = typeof part.text === 'string' ? part.text : undefined;
+    if ((part.type === 'reasoning_text' || part.type === 'output_text' || part.type === 'input_text' || part.type === 'text' || part.type === undefined) && text !== undefined) {
+      out.push({ ...part, type: 'reasoning_text', text });
+    }
+  }
+  return out.length ? out : undefined;
+}
+
+function normalizeToolOutput(output: unknown): unknown {
+  if (Array.isArray(output)) return normalizeInputContent(output);
+  if (isRecord(output) && output.type === 'output_text' && typeof output.text === 'string') {
+    return { ...output, type: 'text' };
+  }
+  return output;
+}
+
+function stableStringify(value: unknown): string {
+  if (typeof value === 'string') return value;
+  try {
+    return JSON.stringify(value ?? {});
+  } catch {
+    return '{}';
+  }
+}
+
+function normalizeOutputItem(item: unknown): Record<string, unknown> {
+  if (!isRecord(item)) return { type: 'unknown', providerData: { raw: item } };
+  const typ = item.type;
+  if (typ === 'message' || typ === undefined || item.role === 'assistant' || item.role === 'user' || item.role === 'system') {
+    return {
+      ...item,
+      type: 'message',
+      role: 'assistant',
+      status: validStatus(item.status),
+      content: normalizeAssistantContent(item.content),
+    };
+  }
+  if (typ === 'reasoning') {
+    const rawContent = normalizeReasoningRawContent(item.rawContent);
+    return {
+      ...item,
+      content: normalizeInputContent(item.content),
+      ...(rawContent ? { rawContent } : {}),
+    };
+  }
+  if (typ === 'function_call') {
+    return {
+      ...item,
+      callId: typeof item.callId === 'string' && item.callId ? item.callId : typeof item.call_id === 'string' && item.call_id ? item.call_id : typeof item.id === 'string' && item.id ? item.id : 'debate-tool-call',
+      name: typeof item.name === 'string' && item.name ? item.name : 'tool',
+      arguments: stableStringify(item.arguments),
+      ...(item.status === undefined ? {} : { status: validStatus(item.status) }),
+    };
+  }
+  if (typ === 'function_call_result') {
+    return {
+      ...item,
+      callId: typeof item.callId === 'string' && item.callId ? item.callId : typeof item.call_id === 'string' && item.call_id ? item.call_id : 'debate-tool-call',
+      name: typeof item.name === 'string' && item.name ? item.name : 'tool',
+      status: validStatus(item.status),
+      output: normalizeToolOutput(item.output),
+    };
+  }
+  return item;
+}
+
+function normalizeResponseOutput(output: unknown): Array<Record<string, unknown>> {
+  if (!Array.isArray(output)) return [];
+  return output.map(normalizeOutputItem);
+}
+
+function normalizeResponseDoneEvent(ev: StreamEvent, fallbackId: string): StreamEvent {
+  const e = ev as { type?: string; response?: Record<string, unknown>; providerData?: unknown };
+  if (e.type !== 'response_done') return ev;
+  const response = isRecord(e.response) ? e.response : {};
+  const id = typeof response.id === 'string' && response.id ? response.id : fallbackId;
+  return {
+    ...e,
+    response: {
+      ...response,
+      id,
+      output: normalizeResponseOutput(response.output),
+      usage: conformantUsage(response.usage),
+    },
+  } as unknown as StreamEvent;
+}
+
 /** Replay a buffered ModelResponse as a stream (text delta + a SDK-CONFORMANT
  *  response_done carrying the full output, a non-empty id, and numeric usage).
  *  Used for the single-survivor / judge-failed fallback. No response_started —
@@ -1042,7 +1186,7 @@ export function* streamResponseAsEvents(resp: ModelResponse): Generator<StreamEv
     type: 'response_done',
     response: {
       id: responseIdOf(resp) || 'debate-fallback',
-      output: resp.output,
+      output: normalizeResponseOutput(resp.output),
       usage: conformantUsage((resp as { usage?: unknown }).usage),
     },
   } as unknown as StreamEvent;
@@ -1065,7 +1209,7 @@ export function* synthesizeTerminalDone(output: unknown, text: string): Generato
     response: {
       id: 'debate-synth',
       output: hasOutput
-        ? output
+        ? normalizeResponseOutput(output)
         : text
         ? [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text }] }]
         : [],
@@ -1086,8 +1230,10 @@ async function* forwardWithDoneBackstop(stream: AsyncIterable<StreamEvent>): Asy
     const e = ev as { type?: string; delta?: string; response?: { output?: unknown } };
     if (e.type === 'response_started') continue;
     if (e.type === 'output_text_delta' && typeof e.delta === 'string') finalText += e.delta;
-    if (e.type === 'response_done') { sawDone = true; if (e.response) finalOutput = e.response.output; }
-    yield ev;
+    const outEv = e.type === 'response_done' ? normalizeResponseDoneEvent(ev, 'debate-forward') : ev;
+    const out = outEv as { type?: string; response?: { output?: unknown } };
+    if (out.type === 'response_done') { sawDone = true; if (out.response) finalOutput = out.response.output; }
+    yield outEv;
   }
   if (!sawDone) yield* synthesizeTerminalDone(finalOutput, finalText);
 }

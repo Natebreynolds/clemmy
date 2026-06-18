@@ -4,6 +4,7 @@ import { mkdtempSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { Model, ModelRequest, ModelResponse } from '@openai/agents-core';
+import { StreamEventResponseCompleted } from '@openai/agents-core/types';
 import type { DebateBrains } from './debate-model.js';
 
 // Isolate from the host's ~/.clementine-next/.env: getRuntimeEnv() falls back to
@@ -61,6 +62,9 @@ function dm(b: DebateBrains, opts: Record<string, unknown> = {}) {
   return new DebateModel(b, { fuseNonStreamed: true, ...opts } as any);
 }
 const noSleep = () => Promise.resolve();
+function assertSdkDone(done: unknown) {
+  assert.doesNotThrow(() => StreamEventResponseCompleted.parse(done));
+}
 
 function withEnv(env: Record<string, string | undefined>, fn: () => void | Promise<void>) {
   const prev: Record<string, string | undefined> = {};
@@ -331,7 +335,8 @@ test('streamResponseAsEvents: text delta then a response_done carrying the outpu
   assert.ok(evs.some((e) => e.type === 'output_text_delta' && e.delta === 'SOLO'));
   const done = evs.find((e) => e.type === 'response_done');
   assert.ok(done, 'response_done present');
-  assert.equal((done.response.output[0] as any).content, 'SOLO');
+  assert.equal((done.response.output[0] as any).content[0].text, 'SOLO');
+  assertSdkDone(done);
 });
 
 // --- P0 regression: SDK-conformant response_done on the fail-open paths -------
@@ -347,6 +352,26 @@ test('streamResponseAsEvents: response_done is SDK-conformant (non-empty id + nu
   assert.equal(typeof done.response.usage.inputTokens, 'number');
   assert.equal(typeof done.response.usage.outputTokens, 'number');
   assert.equal(typeof done.response.usage.totalTokens, 'number');
+  assertSdkDone(done);
+});
+
+test('streamResponseAsEvents: normalizes legacy model output into SDK response_done content parts', async () => {
+  const resp = {
+    output: [
+      { type: 'message', content: 'LEGACY-STRING' },
+      { type: 'message', role: 'user', status: 'completed', content: [{ type: 'output_text', text: 'WRONG-ROLE-PART' }] },
+      { type: 'reasoning', content: [{ type: 'output_text', text: 'REASONING' }] },
+    ],
+    usage: {},
+  } as any;
+  const evs = await collect((async function* () { yield* streamResponseAsEvents(resp); })());
+  const done: any = evs.find((e) => e.type === 'response_done');
+  assertSdkDone(done);
+  assert.equal(done.response.output[0].role, 'assistant');
+  assert.equal(done.response.output[0].content[0].type, 'output_text');
+  assert.equal(done.response.output[1].role, 'assistant');
+  assert.equal(done.response.output[1].content[0].type, 'output_text');
+  assert.equal(done.response.output[2].content[0].type, 'input_text');
 });
 
 test('streamResponseAsEvents: preserves a real responseId + sums usage when present', async () => {
@@ -447,6 +472,32 @@ test('verify: checker commits response_done (structured) then throws → NO dupl
     const got: any[] = [];
     await assert.rejects(async () => { for await (const e of dm(b, { heartbeatMs: 0 }).getStreamedResponse(req())) got.push(e); });
     assert.equal(got.filter((e) => e.type === 'response_done').length, 1, 'only the committed response_done — no draft-replay duplicate');
+  });
+});
+
+test('verify: forwarded checker response_done is normalized before the SDK parses it', async () => {
+  await withEnv({ CLEMMY_DEBATE_MODE: 'all', CLEMMY_FUSION_STRATEGY: 'verify' }, async () => {
+    const b = brains({
+      passthrough: model({ getResponse: async () => msg('DRAFT-PROSE') }),
+      judge: model({ getStreamedResponse: async function* () {
+        yield {
+          type: 'response_done',
+          response: {
+            output: [
+              { type: 'message', role: 'user', status: 'completed', content: [{ type: 'output_text', text: 'FINAL' }] },
+              { type: 'reasoning', content: [{ type: 'output_text', text: 'THINK' }] },
+            ],
+            usage: {},
+          },
+        } as any;
+      } }),
+    });
+    const evs = await collect(dm(b, { heartbeatMs: 0 }).getStreamedResponse(req()));
+    const done: any = evs.find((e) => e.type === 'response_done');
+    assertSdkDone(done);
+    assert.equal(done.response.output[0].role, 'assistant');
+    assert.equal(done.response.output[0].content[0].type, 'output_text');
+    assert.equal(done.response.output[1].content[0].type, 'input_text');
   });
 });
 
