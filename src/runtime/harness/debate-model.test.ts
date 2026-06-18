@@ -106,6 +106,9 @@ function userTurn(userText: string, ...sys: unknown[]) {
 test('shouldDebate: off never, all always; high (v2) reads the USER message + goal, not the context packet', () => {
   withEnv({ CLEMMY_DEBATE_MODE: 'off' }, () => assert.equal(shouldDebate(req()), false));
   withEnv({ CLEMMY_DEBATE_MODE: 'all' }, () => assert.equal(shouldDebate(req()), true));
+  withEnv({ CLEMMY_DEBATE_MODE: 'all' }, () => {
+    assert.equal(shouldDebate(req({ outputType: { type: 'object' } })), false, 'structured-output contracts never fuse');
+  });
   withEnv({ CLEMMY_DEBATE_MODE: 'high', CLEMMY_DEBATE_STAKES_V2: 'on' }, () => {
     // REGRESSION for the over-fire bug: a packet-sized role:system context ALONE
     // (terse user, no action verb, no goal) must NOT fire — even though the
@@ -216,6 +219,24 @@ test('getStreamedResponse: non-debate turn forwards passthrough verbatim', async
     const evs = await collect(dm(b).getStreamedResponse(req()));
     assert.ok(evs.some((e) => e.type === 'output_text_delta' && e.delta === 'PASSTHRU'));
     assert.equal(evs.filter((e) => e.type === 'response_started').length, 1);
+  });
+});
+
+test('getStreamedResponse: structured-output requests skip fusion even when enabled', async () => {
+  await withEnv({ CLEMMY_DEBATE_MODE: 'all', CLEMMY_FUSION_STRATEGY: 'verify' }, async () => {
+    let judged = 0;
+    const b = brains({
+      passthrough: model({ getStreamedResponse: async function* () {
+        yield { type: 'response_started', providerData: { passthrough: true } } as any;
+        yield { type: 'output_text_delta', delta: '{"reply":"ok"}' } as any;
+        yield { type: 'response_done', response: { id: 'pass', output: [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: '{"reply":"ok"}' }] }], usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } } } as any;
+      } }),
+      judge: model({ getStreamedResponse: async function* () { judged++; yield { type: 'response_done', response: { output: [] } } as any; } }),
+    });
+    const evs = await collect(dm(b).getStreamedResponse(req({ outputType: { type: 'object' } })));
+    assert.equal(judged, 0, 'checker/judge was not called');
+    assert.equal(evs.filter((e) => e.type === 'response_started').length, 1);
+    assert.ok(evs.some((e) => e.type === 'response_started' && e.providerData?.passthrough === true), 'passthrough stream was forwarded verbatim');
   });
 });
 

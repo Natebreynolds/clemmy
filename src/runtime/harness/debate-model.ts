@@ -241,10 +241,21 @@ function isHighStakes(request: ModelRequest): boolean {
 }
 
 export function shouldDebate(request: ModelRequest): boolean {
+  // Structured-output turns are machine contracts (planner/orchestrator
+  // decisions, gates, classifiers). A fusion checker/judge can improve prose,
+  // but if it rewrites a schema-bound JSON answer into natural language the SDK
+  // rejects the turn as "Invalid output type". Keep these on the provider's
+  // native structured-output path; fuse only user-facing prose/tool turns.
+  if (isStructuredOutputRequest(request)) return false;
   const mode = debateMode();
   if (mode === 'off') return false;
   if (mode === 'all') return true;
   return isHighStakes(request);
+}
+
+function isStructuredOutputRequest(request: ModelRequest): boolean {
+  const outputType = (request as { outputType?: unknown }).outputType;
+  return outputType !== undefined && outputType !== null && outputType !== 'text';
 }
 
 /** LEGACY high-stakes proxy (CLEMMY_DEBATE_STAKES_V2=off only): flatten ALL input
