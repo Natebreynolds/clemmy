@@ -9,6 +9,7 @@ import {
   type RoleBinding,
 } from '../runtime/harness/model-roles.js';
 import { resolveProvider } from '../runtime/harness/model-wire-registry.js';
+import { validateRoleModelBinding } from '../runtime/harness/model-role-options.js';
 import { resetHarnessRuntimeConfig } from '../runtime/harness/codex-client.js';
 import { resetClaudeModelCache } from '../runtime/harness/claude-model.js';
 import { resetByoModelCache } from '../runtime/harness/byo-model.js';
@@ -65,11 +66,14 @@ export function registerModelRoleTools(server: McpServer): void {
     },
     async ({ role, modelId }) => {
       if (!chatModelRoutingEnabled()) return textResult('Chat model routing is disabled (CLEMMY_CHAT_MODEL_ROUTING=off).');
-      applyRoleBinding(role as ModelRole, modelId.trim(), false);
+      const clean = modelId.trim();
+      const validation = validateRoleModelBinding(role as ModelRole, clean);
+      if (!validation.ok) return textResult(`I can't set that model role: ${validation.reason}`);
+      applyRoleBinding(role as ModelRole, clean, false);
       const w = resolveRoleModel('worker');
       const j = resolveRoleModel('judge');
       return textResult(
-        `Done — ${role} now routes to ${modelId.trim()}.\n` +
+        `Done — ${role} now routes to ${clean}.\n` +
           `Current roles: worker=${w.modelId} (${w.provider}), judge=${j.modelId} (${j.provider}).`,
       );
     },

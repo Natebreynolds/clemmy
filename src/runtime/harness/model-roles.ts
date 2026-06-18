@@ -97,15 +97,29 @@ export function readDurableBindings(): RoleBinding[] {
  * the user isn't on (a Codex-only user resolves all-Codex).
  */
 export function defaultForRole(role: ModelRole): string {
+  const byo = getByoBackendConfig();
+  const mode = getModelRoutingMode();
+
+  // In all-in BYO mode the registered provider routes every role to the BYO
+  // backend, even if a legacy caller still asks for a gpt-* tier. Make the role
+  // snapshot say the same thing the wire will actually do.
+  if (mode === 'all_in' && byo.configured) {
+    if (role === 'judge') return byo.judgeId || byo.primaryId;
+    if (role === 'worker') {
+      // getWorkerModel() never returns empty (falls back to MODELS.primary, a
+      // gpt-* id). In all_in the router collapses any codex-class id to the BYO
+      // primary, so report what the wire actually sends; a real BYO worker id is kept.
+      const w = getWorkerModel();
+      return resolveProvider(w) === 'codex' ? byo.primaryId : w;
+    }
+    return byo.primaryId;
+  }
+
   switch (role) {
     case 'brain': {
       // claude_oauth ⇒ the Claude brain; all_in+byo ⇒ the BYO primary; else the
       // Codex primary — exactly the configureHarnessRuntime outcomes.
       if (getActiveAuthMode() === 'claude_oauth') return getClaudeBrainModel();
-      if (getModelRoutingMode() === 'all_in') {
-        const byo = getByoBackendConfig();
-        if (byo.configured) return byo.primaryId;
-      }
       return MODELS.primary;
     }
     case 'judge':
@@ -114,7 +128,12 @@ export function defaultForRole(role: ModelRole): string {
       return judgeChoice() === 'claude' ? getDebateCheckerModel() : MODELS.primary;
     case 'worker':
     default:
-      return getWorkerModel();
+      // Default workers follow the active brain unless the legacy worker-offload
+      // backend is enabled. This matches the provider dispatch path and keeps the
+      // "Default (follow the brain)" UI truthful.
+      if (getActiveAuthMode() === 'claude_oauth') return getClaudeBrainModel();
+      if (mode === 'worker' && byo.configured) return getWorkerModel();
+      return MODELS.primary;
   }
 }
 

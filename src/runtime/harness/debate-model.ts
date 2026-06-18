@@ -36,9 +36,10 @@
  */
 import type { Model, ModelProvider, ModelRequest, ModelResponse } from '@openai/agents-core';
 import type { StreamEvent } from '@openai/agents-core/types';
-import { getRuntimeEnv, getActiveAuthMode, getClaudeBrainModel, judgeChoice } from '../../config.js';
+import { getRuntimeEnv, getActiveAuthMode, getClaudeBrainModel, getByoBackendConfig, judgeChoice } from '../../config.js';
 import { ClaudeModelProvider } from './claude-model.js';
 import { CodexModelProvider } from './codex-model.js';
+import { getByoModel } from './byo-model.js';
 import { resolveRoleModel } from './model-roles.js';
 import { getStoredCodexOAuthTokens } from '../auth-store.js';
 import { getStoredClaudeTokens } from '../claude-oauth.js';
@@ -265,6 +266,11 @@ function renderRequestText(request: ModelRequest): string {
   return input.map(extractItemText).join(' ');
 }
 
+function judgeTraceLabel(): string {
+  const r = resolveRoleModel('judge');
+  return `${r.provider}:${r.modelId}`;
+}
+
 /** Some ModelProviders may return Model | Promise<Model>; every in-repo provider
  *  (Claude/Codex/Router) resolves synchronously, which debate relies on. */
 function resolveSync(m: Model | Promise<Model>): Model {
@@ -377,8 +383,9 @@ export class DebateModel implements Model {
     const div = divergence(da, db);
     try {
       const final = await this.brains.judge.getResponse(buildJudgeRequest(request, a, b));
-      logger.info({ path: 'getResponse', divergence: div, draftAlen: da.length, draftBlen: db.length, judge: judgeChoice() }, 'debate turn reconciled');
-      recordDebateTrace({ path: 'getResponse', n: this.debatesThisTurn, divergence: div, judge: judgeChoice(), draftA: capText(da), draftB: capText(db), final: capText(extractAssistantText(final.output)) });
+      const judge = judgeTraceLabel();
+      logger.info({ path: 'getResponse', divergence: div, draftAlen: da.length, draftBlen: db.length, judge }, 'debate turn reconciled');
+      recordDebateTrace({ path: 'getResponse', n: this.debatesThisTurn, divergence: div, judge, draftA: capText(da), draftB: capText(db), final: capText(extractAssistantText(final.output)) });
       return final;
     } catch (err) {
       // The judge failed AFTER two valid drafts — don't lose the turn; answer
@@ -465,8 +472,9 @@ export class DebateModel implements Model {
     // FIX6: structured-output turns carry the answer in response_done.output, not
     // text deltas — fall back to that so the trace isn't under-reported.
     const finalForTrace = finalText || extractAssistantText(judgeFinalOutput);
-    logger.info({ path: 'stream', divergence: div, draftAlen: da.length, draftBlen: db.length, finalLen: finalForTrace.length, judge: judgeChoice() }, 'debate turn reconciled');
-    recordDebateTrace({ path: 'stream', n: this.debatesThisTurn, divergence: div, judge: judgeChoice(), draftA: capText(da), draftB: capText(db), final: capText(finalForTrace) });
+    const judge = judgeTraceLabel();
+    logger.info({ path: 'stream', divergence: div, draftAlen: da.length, draftBlen: db.length, finalLen: finalForTrace.length, judge }, 'debate turn reconciled');
+    recordDebateTrace({ path: 'stream', n: this.debatesThisTurn, divergence: div, judge, draftA: capText(da), draftB: capText(db), final: capText(finalForTrace) });
   }
 
   /** Draft on both brains in parallel, but DON'T let a slow/flaky brain hold the
@@ -554,7 +562,7 @@ export class DebateModel implements Model {
     }
     try {
       const final = await this.brains.judge.getResponse(buildVerifyRequest(request, draft));
-      recordDebateTrace({ path: 'verify', n: this.debatesThisTurn, judge: judgeChoice(), executor: capText(summarizeOutput(draft.output)), final: capText(extractAssistantText(final.output)) });
+      recordDebateTrace({ path: 'verify', n: this.debatesThisTurn, judge: judgeTraceLabel(), executor: capText(summarizeOutput(draft.output)), final: capText(extractAssistantText(final.output)) });
       return final;
     } catch (err) {
       // Checker failed → ship the executor's draft rather than lose the turn.
@@ -668,8 +676,9 @@ export class DebateModel implements Model {
         outputItemTypes: Array.isArray(checkerOutput) ? (checkerOutput as Array<{ type?: string }>).map((o) => o?.type) : typeof checkerOutput,
       }, 'fusion verify: checker returned EMPTY — shipping the executor draft');
     }
-    logger.info({ path: 'verify', n: this.debatesThisTurn, outcome, executorLen: da.length, finalLen: finalForTrace.length, judge: judgeChoice(), checkerModel: checkerModelId }, 'fusion verify reconciled');
-    recordDebateTrace({ path: 'verify', n: this.debatesThisTurn, outcome, judge: judgeChoice(), executor: capText(da), final: capText(finalForTrace) });
+    const judge = judgeTraceLabel();
+    logger.info({ path: 'verify', n: this.debatesThisTurn, outcome, executorLen: da.length, finalLen: finalForTrace.length, judge, checkerModel: checkerModelId }, 'fusion verify reconciled');
+    recordDebateTrace({ path: 'verify', n: this.debatesThisTurn, outcome, judge, executor: capText(da), final: capText(finalForTrace) });
   }
 }
 
@@ -764,13 +773,22 @@ export function resolveDebateBrains(passthrough: ModelProvider, modelName?: stri
   // flagship brain. Override the checker via CLEMMY_DEBATE_CHECKER_MODEL.
   // The CHECKER model id comes from the role→model registry (a UI/chat binding
   // wins; else the provider-derived default = getDebateCheckerModel(), so this is
-  // byte-identical when unbound). judgeChoice() still selects the claude-vs-codex
-  // branch; the registry only sources the Claude checker's model id.
-  const checkerModelId = resolveRoleModel('judge').modelId;
-  const claudeChecker: Model = checkerModelId && checkerModelId !== getClaudeBrainModel()
-    ? new ClaudeModelProvider().getModel(checkerModelId)
-    : claude;
-  const judge: Model = judgeChoice() === 'codex' ? codex : claudeChecker;
+  // byte-identical when unbound). A binding can now point at Claude, Codex, or a
+  // configured BYO model; dispatch by the derived provider so the role snapshot
+  // and the actual judge cannot diverge.
+  const checker = resolveRoleModel('judge');
+  let judge: Model;
+  if (checker.provider === 'codex') {
+    judge = codex;
+  } else if (checker.provider === 'byo') {
+    const byo = getByoBackendConfig();
+    if (!byo.configured) return null;
+    judge = getByoModel(checker.modelId, byo);
+  } else {
+    judge = checker.modelId && checker.modelId !== getClaudeBrainModel()
+      ? new ClaudeModelProvider().getModel(checker.modelId)
+      : claude;
+  }
 
   return {
     passthrough: resolveSync(passthrough.getModel(modelName)),
@@ -1167,6 +1185,6 @@ export function maybeWrapDebate(passthrough: ModelProvider, opts: DebateOptions 
     return passthrough;
   }
   void getActiveAuthMode(); // (auth mode currently informational; passthrough already encodes it)
-  logger.info({ mode: debateMode(), judge: judgeChoice() }, 'fusion debate ENABLED — Claude+Codex draft, judge reconciles');
+  logger.info({ mode: debateMode(), judge: judgeTraceLabel() }, 'fusion debate ENABLED — Claude+Codex draft, judge reconciles');
   return new DebateModelProvider(passthrough, opts);
 }

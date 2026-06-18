@@ -1,11 +1,9 @@
 /**
  * Run: npx tsx --test src/runtime/harness/model-roles.test.ts
  *
- * GOLDEN CHARACTERIZATION: the Phase-1 invariant is that resolveRoleModel('X')
- * with no bindings returns the BYTE-IDENTICAL model id the legacy getter would,
- * on every auth/routing permutation. We assert EQUALITY between resolveRoleModel
- * and the legacy expression (both read the same live env), so the test proves the
- * delegation never diverges regardless of the host .env.
+ * CHARACTERIZATION: with no bindings, resolveRoleModel('X') must report the
+ * model id the registered provider will actually dispatch for that role.
+ * Defaults follow the active brain, except explicit BYO worker/all-in modes.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -61,11 +59,15 @@ test('resolveProvider: claude-* → claude, gpt-5/o# → codex, byo families + u
   assert.equal(resolveProvider(''), 'byo');
 });
 
-test('GOLDEN: worker resolves to getWorkerModel() across an override and the default', () => {
-  withEnv({ MODEL_ROUTING_MODE: undefined, OPENAI_MODEL_WORKER: undefined }, () => {
-    assert.equal(resolveRoleModel('worker').modelId, getWorkerModel(), 'default worker == MODELS.primary');
+test('worker default follows the active brain unless worker BYO offload is enabled', () => {
+  withEnv({ AUTH_MODE: 'codex_oauth', MODEL_ROUTING_MODE: undefined, OPENAI_MODEL_WORKER: undefined, CLEMMY_MODEL_ROLES: undefined }, () => {
+    assert.equal(resolveRoleModel('worker').modelId, MODELS.primary, 'codex default worker == codex primary');
   });
-  withEnv({ OPENAI_MODEL_WORKER: 'deepseek-chat' }, () => {
+  withEnv({ AUTH_MODE: 'claude_oauth', CLAUDE_MODEL: 'claude-sonnet-4-6', MODEL_ROUTING_MODE: undefined, OPENAI_MODEL_WORKER: undefined, CLEMMY_MODEL_ROLES: undefined }, () => {
+    assert.equal(resolveRoleModel('worker').modelId, 'claude-sonnet-4-6', 'claude default worker follows the claude brain');
+    assert.equal(resolveRoleModel('worker').provider, 'claude');
+  });
+  withEnv({ AUTH_MODE: 'codex_oauth', MODEL_ROUTING_MODE: 'worker', BYO_MODEL_BASE_URL: 'https://api.example.test', BYO_MODEL_API_KEY: 'k', BYO_MODEL_ID: 'deepseek-chat', OPENAI_MODEL_WORKER: 'deepseek-chat', CLEMMY_MODEL_ROLES: undefined }, () => {
     assert.equal(resolveRoleModel('worker').modelId, getWorkerModel());
     assert.equal(resolveRoleModel('worker').modelId, 'deepseek-chat');
     assert.equal(resolveRoleModel('worker').provider, 'byo');
@@ -103,6 +105,43 @@ test('GOLDEN: brain resolves to the Codex primary (api_key/codex) or the Claude 
   });
 });
 
+test('all_in BYO defaults report the BYO models the router will actually use', () => {
+  withEnv({
+    AUTH_MODE: 'api_key',
+    MODEL_ROUTING_MODE: 'all_in',
+    BYO_MODEL_BASE_URL: 'https://api.example.test',
+    BYO_MODEL_API_KEY: 'k',
+    BYO_MODEL_ID: 'deepseek-chat',
+    BYO_MODEL_JUDGE_ID: 'minimax-judge',
+    OPENAI_MODEL_WORKER: 'deepseek-worker',
+    CLEMMY_MODEL_ROLES: undefined,
+  }, () => {
+    assert.equal(resolveRoleModel('brain').modelId, 'deepseek-chat');
+    assert.equal(resolveRoleModel('worker').modelId, 'deepseek-worker');
+    assert.equal(resolveRoleModel('judge').modelId, 'minimax-judge');
+    assert.equal(resolveRoleModel('brain').provider, 'byo');
+    assert.equal(resolveRoleModel('worker').provider, 'byo');
+    assert.equal(resolveRoleModel('judge').provider, 'byo');
+  });
+});
+
+test('all_in BYO with an UNSET worker reports the BYO primary, not a phantom gpt id (BUG 2)', () => {
+  withEnv({
+    AUTH_MODE: 'api_key',
+    MODEL_ROUTING_MODE: 'all_in',
+    BYO_MODEL_BASE_URL: 'https://api.example.test',
+    BYO_MODEL_API_KEY: 'k',
+    BYO_MODEL_ID: 'deepseek-chat',
+    OPENAI_MODEL_WORKER: undefined, // getWorkerModel() falls back to a gpt-* id…
+    CLEMMY_MODEL_ROLES: undefined,
+  }, () => {
+    // …but the router collapses it to the BYO primary in all_in, so the snapshot
+    // must report what the wire actually sends.
+    assert.equal(resolveRoleModel('worker').modelId, 'deepseek-chat');
+    assert.equal(resolveRoleModel('worker').provider, 'byo');
+  });
+});
+
 test('a durable role-wide binding overrides the default and carries the derived provider', () => {
   withEnv({ CLEMMY_MODEL_ROLES_REGISTRY: 'on', CLEMMY_MODEL_ROLES: JSON.stringify([{ role: 'worker', modelId: 'minimax-01', scope: 'durable', source: 'settings' }]) }, () => {
     const r = resolveRoleModel('worker');
@@ -112,18 +151,18 @@ test('a durable role-wide binding overrides the default and carries the derived 
   });
 });
 
-test('kill-switch off: bindings ignored, pure default (byte-identical to legacy)', () => {
-  withEnv({ CLEMMY_MODEL_ROLES_REGISTRY: 'off', CLEMMY_MODEL_ROLES: JSON.stringify([{ role: 'worker', modelId: 'minimax-01', scope: 'durable', source: 'settings' }]) }, () => {
+test('kill-switch off: bindings ignored, pure default', () => {
+  withEnv({ AUTH_MODE: 'codex_oauth', MODEL_ROUTING_MODE: undefined, CLEMMY_MODEL_ROLES_REGISTRY: 'off', CLEMMY_MODEL_ROLES: JSON.stringify([{ role: 'worker', modelId: 'minimax-01', scope: 'durable', source: 'settings' }]) }, () => {
     assert.equal(modelRolesRegistryEnabled(), false);
-    assert.equal(resolveRoleModel('worker').modelId, getWorkerModel(), 'binding ignored → legacy default');
+    assert.equal(resolveRoleModel('worker').modelId, MODELS.primary, 'binding ignored → default');
     assert.equal(resolveRoleModel('worker').source, 'default');
   });
 });
 
 test('bad/empty CLEMMY_MODEL_ROLES → no bindings → pure defaults (never throws)', () => {
   for (const bad of ['', 'not json', '{}', '[{"role":"nope"}]', '[42]']) {
-    withEnv({ CLEMMY_MODEL_ROLES_REGISTRY: 'on', CLEMMY_MODEL_ROLES: bad }, () => {
-      assert.equal(resolveRoleModel('worker').modelId, getWorkerModel());
+    withEnv({ AUTH_MODE: 'codex_oauth', MODEL_ROUTING_MODE: undefined, CLEMMY_MODEL_ROLES_REGISTRY: 'on', CLEMMY_MODEL_ROLES: bad }, () => {
+      assert.equal(resolveRoleModel('worker').modelId, MODELS.primary);
       assert.equal(resolveRoleModel('worker').source, 'default');
     });
   }

@@ -14,8 +14,6 @@ import {
   DEFAULT_MODELS,
   LOCAL_MCP_ENABLED,
   MODEL_ENV_KEYS,
-  MODEL_PRESETS,
-  CLAUDE_MODEL_PRESETS,
   getModelSettingsSnapshot,
   getOpenAiApiKey,
   getRuntimeEnv,
@@ -192,6 +190,7 @@ import { configureHarnessRuntime, resetHarnessRuntimeConfig } from '../runtime/h
 import { resetByoModelCache } from '../runtime/harness/byo-model.js';
 import { resolveRoleModel, readDurableBindings, type ModelRole, type RoleBinding } from '../runtime/harness/model-roles.js';
 import { resolveProvider } from '../runtime/harness/model-wire-registry.js';
+import { connectedModelGroups, validateRoleModelBinding } from '../runtime/harness/model-role-options.js';
 import { debateMode, judgeChoice, fusionStrategy, debateBrainsAvailable, readRecentDebateTraces } from '../runtime/harness/debate-model.js';
 import { summarizeApprovalAction } from '../runtime/approval-summary.js';
 import {
@@ -3460,16 +3459,6 @@ export function registerConsoleRoutes(
   // source for each role, the durable bindings, and the available models grouped
   // by CONNECTED provider (so the pickers only offer what you're logged into).
   const buildModelRolesSnapshot = () => {
-    const brains = debateBrainsAvailable();
-    const byo = getByoBackendConfig();
-    const available: Array<{ provider: string; label: string; models: Array<{ id: string; label: string }> }> = [];
-    if (brains.codex) available.push({ provider: 'codex', label: 'Codex', models: [...MODEL_PRESETS] });
-    if (brains.claude) available.push({ provider: 'claude', label: 'Claude', models: [...CLAUDE_MODEL_PRESETS] });
-    if (byo.configured) {
-      const byoModels = [{ id: byo.primaryId, label: byo.primaryId }];
-      if (byo.judgeId && byo.judgeId !== byo.primaryId) byoModels.push({ id: byo.judgeId, label: byo.judgeId });
-      available.push({ provider: 'byo', label: byo.providerLabel || 'Custom', models: byoModels });
-    }
     return {
       roles: {
         brain: resolveRoleModel('brain'),
@@ -3477,7 +3466,7 @@ export function registerConsoleRoutes(
         judge: resolveRoleModel('judge'),
       },
       bindings: readDurableBindings(),
-      available,
+      available: connectedModelGroups(),
       activeBrain: getActiveAuthMode(),
     };
   };
@@ -6600,9 +6589,15 @@ export function registerConsoleRoutes(
         const s = typeof v === 'string' ? v.trim() : '';
         return /^[A-Za-z0-9._:/-]*$/.test(s) ? s : '';
       };
+      const rawModelId = typeof body.modelId === 'string' ? body.modelId.trim() : '';
       const modelId = cleanId(body.modelId);
-      const clear = body.clear === true || modelId === '';
+      if (rawModelId && !modelId) { res.status(400).json({ error: 'modelId contains unsupported characters.' }); return; }
+      const clear = body.clear === true || rawModelId === '';
       if (!clear && !modelId) { res.status(400).json({ error: 'modelId required (or clear:true to reset to default)' }); return; }
+      if (!clear) {
+        const validation = validateRoleModelBinding(role, modelId);
+        if (!validation.ok) { res.status(400).json({ error: validation.reason }); return; }
+      }
 
       // Upsert the role-wide binding (intent-scoped bindings arrive with chat routing).
       const current = readDurableBindings();
@@ -6653,6 +6648,24 @@ export function registerConsoleRoutes(
       process.env.CLEMMY_DEBATE_JUDGE = judge;
       updateEnvKey('CLEMMY_FUSION_STRATEGY', strategy);
       process.env.CLEMMY_FUSION_STRATEGY = strategy;
+
+      // Reconcile ONLY the old claude↔codex Fusion judge control. If the role
+      // card/chat pinned the judge to the OTHER flagship, drop that binding so
+      // this control stays truthful; KEEP a same-provider model pin (e.g. Opus
+      // over default Sonnet). NEVER drop a BYO judge binding — it isn't
+      // representable by this 2-valued control, and resolveDebateBrains
+      // dispatches it by its own provider regardless of CLEMMY_DEBATE_JUDGE.
+      // (Before this guard, every FusionForm Save silently destroyed it.)
+      const bindings = readDurableBindings();
+      const nextBindings = bindings.filter((b) => {
+        if (!(b.role === 'judge' && !b.whenIntent)) return true;
+        const prov = resolveProvider(b.modelId);
+        if (prov === 'byo') return true;
+        return prov === judge;
+      });
+      if (nextBindings.length !== bindings.length) {
+        updateEnvKey('CLEMMY_MODEL_ROLES', JSON.stringify(nextBindings));
+      }
 
       // Re-register the provider next turn so debate wrapping flips on/off live.
       resetHarnessRuntimeConfig();

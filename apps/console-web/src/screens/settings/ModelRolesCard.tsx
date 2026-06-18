@@ -58,7 +58,6 @@ export function ModelRolesCard() {
 
   const refresh = () => { void qc.invalidateQueries({ queryKey: ['settings'] }); };
   const flat = mr.available.flatMap((p) => p.models.map((m) => ({ ...m, provider: p.provider })));
-  const claudeCodex = flat.filter((m) => m.provider === 'claude' || m.provider === 'codex');
   const connected = (prov: string) => mr.available.some((p) => p.provider === prov);
 
   const run = async (key: string, fn: () => Promise<unknown>) => {
@@ -80,10 +79,9 @@ export function ModelRolesCard() {
     <Card className="p-5">
       <h3 className="mb-1 text-h3 text-fg">Models — who does what</h3>
       <p className="mb-4 text-small text-muted">
-        Pick which model you're logged into serves each role. The brain runs your turns,
-        workers do delegated/grunt labor, the judge checks fusion turns. You can also just tell
-        Clementine in chat — “use DeepSeek for the workers”, “make the judge Opus”. Applies on
-        the next message; no restart.
+        Pick the active brain provider and which connected models serve workers and judge/checker.
+        You can also just tell Clementine in chat — “use DeepSeek for the workers”,
+        “make the judge Opus”. Applies on the next message; no restart.
       </p>
 
       <div className="space-y-3">
@@ -103,17 +101,17 @@ export function ModelRolesCard() {
             <Select id={id} disabled={busy === 'worker'} value={mr.roles.worker.source === 'default' ? '__default__' : mr.roles.worker.modelId}
               onChange={(e) => onRole('worker', e.target.value)}>
               <option value="__default__">Default (follow the brain)</option>
-              {flat.map((m) => <option key={`w-${m.id}`} value={m.id}>{m.label} · {m.provider}</option>)}
+              {flat.map((m) => <option key={`w-${m.provider}-${m.id}`} value={m.id}>{m.label} · {m.provider}</option>)}
             </Select>
           )}
         </RoleRow>
 
-        <RoleRow icon={Scale} label="Judge / checker" hint="Verifies the fusion turn (Claude or Codex)." resolved={mr.roles.judge}>
+        <RoleRow icon={Scale} label="Judge / checker" hint="Verifies the fusion turn." resolved={mr.roles.judge}>
           {(id) => (
             <Select id={id} disabled={busy === 'judge'} value={mr.roles.judge.source === 'default' ? '__default__' : mr.roles.judge.modelId}
               onChange={(e) => onRole('judge', e.target.value)}>
               <option value="__default__">Default</option>
-              {claudeCodex.map((m) => <option key={`j-${m.id}`} value={m.id}>{m.label} · {m.provider}</option>)}
+              {flat.map((m) => <option key={`j-${m.provider}-${m.id}`} value={m.id}>{m.label} · {m.provider}</option>)}
             </Select>
           )}
         </RoleRow>
