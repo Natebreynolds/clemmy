@@ -12,6 +12,7 @@ process.env.CLEMENTINE_HOME = home;
 
 const {
   connectedModelGroups,
+  connectedModelGroupsForRole,
   validateRoleModelBinding,
 } = await import('./model-role-options.js');
 
@@ -56,11 +57,11 @@ function blockClaudeKeychainFallback(): void {
 test('validateRoleModelBinding rejects roles when no providers are connected', () => {
   blockClaudeKeychainFallback();
   withEnv({
-    BYO_MODEL_BASE_URL: undefined,
-    BYO_MODEL_API_KEY: undefined,
-    BYO_MODEL_ID: undefined,
-    BYO_MODEL_JUDGE_ID: undefined,
-    OPENAI_MODEL_WORKER: undefined,
+    BYO_MODEL_BASE_URL: '',
+    BYO_MODEL_API_KEY: '',
+    BYO_MODEL_ID: '',
+    BYO_MODEL_JUDGE_ID: '',
+    OPENAI_MODEL_WORKER: '',
   }, () => {
     assert.deepEqual(connectedModelGroups(), []);
     const v = validateRoleModelBinding('worker', 'deepseek-chat');
@@ -84,8 +85,22 @@ test('connected model catalog includes authenticated Codex/Claude and configured
     assert.equal(ids.has('minimax-judge'), true);
     assert.equal(ids.has('qwen-worker'), true);
 
+    const workerIds = new Set(connectedModelGroupsForRole('worker').flatMap((g) => g.models.map((m) => m.id)));
+    const judgeIds = new Set(connectedModelGroupsForRole('judge').flatMap((g) => g.models.map((m) => m.id)));
+    assert.equal(workerIds.has('deepseek-chat'), true);
+    assert.equal(workerIds.has('qwen-worker'), true);
+    assert.equal(workerIds.has('minimax-judge'), false);
+    assert.equal(judgeIds.has('deepseek-chat'), true);
+    assert.equal(judgeIds.has('minimax-judge'), true);
+    assert.equal(judgeIds.has('qwen-worker'), false);
+
     assert.deepEqual(validateRoleModelBinding('worker', 'claude-sonnet-4-6'), { ok: true, provider: 'claude' });
+    assert.deepEqual(validateRoleModelBinding('worker', 'deepseek-chat'), { ok: true, provider: 'byo' });
+    assert.deepEqual(validateRoleModelBinding('worker', 'qwen-worker'), { ok: true, provider: 'byo' });
     assert.deepEqual(validateRoleModelBinding('judge', 'minimax-judge'), { ok: true, provider: 'byo' });
+    assert.deepEqual(validateRoleModelBinding('judge', 'deepseek-chat'), { ok: true, provider: 'byo' });
+    assert.equal(validateRoleModelBinding('worker', 'minimax-judge').ok, false);
+    assert.equal(validateRoleModelBinding('judge', 'qwen-worker').ok, false);
     assert.equal(validateRoleModelBinding('judge', 'not-connected').ok, false);
   });
 });

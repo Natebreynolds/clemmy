@@ -1,7 +1,8 @@
 import { Agent, tool } from '@openai/agents';
 import type { Handoff } from '@openai/agents';
 import { z } from 'zod';
-import { MODELS, getRuntimeEnv } from '../config.js';
+import { getRuntimeEnv } from '../config.js';
+import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import type { RuntimeContextValue } from '../types.js';
 import { buildPlannerTool } from './planner.js';
 // Phase 3 (v0.5.16): single-agent mode — Clem completes the user's
@@ -71,7 +72,7 @@ export const OrchestratorDecisionSchema = z.object({
   reply: z
     .string()
     .nullish()
-    .describe('The natural-language message to show the user IN THIS TURN. Write this FIRST. REQUIRED whenever you answer directly without handing off (e.g. greetings, simple questions, confirmations). Pass null ONLY when you are handing off, asking for approval, or otherwise not the one producing the user-visible text. Without a reply here, the chat surface renders nothing and the user sees an empty bubble.'),
+    .describe('The natural-language message to show the user IN THIS TURN. Write this FIRST. REQUIRED on every turn where you produce the user-visible text (greetings, questions, confirmations, results). Pass null ONLY when nextAction is awaiting_approval or awaiting_user_input — that approval/question text is already in front of the user. There is no separate executor, so "I am handing off" is NEVER a reason to pass null. Without a reply here, the chat surface renders nothing and the user sees an empty bubble.'),
   summary: z
     .string()
     .min(8)
@@ -89,7 +90,7 @@ export const OrchestratorDecisionSchema = z.object({
       'completed',
       'abandoned',
     ])
-    .describe('What the harness should expect next.'),
+    .describe('What the harness should expect next. `completed` = request fully handled (or you are awaiting the user/approval). `awaiting_user_input` = you called ask_user_question. `awaiting_approval` = a mutating tool paused. `abandoned` = genuinely impossible. Do NOT use `awaiting_handoff_result` to "acknowledge now and act next turn" — there is no separate executor to hand off to. If you have more tool calls to make, make them in THIS turn; never reply "running it now" / "on it" and defer with no tool call (that wastes a full round-trip and the harness will force the action anyway).'),
   reason: z.string().nullable().describe('Free-form context for the next caller.'),
 });
 export type OrchestratorDecision = z.infer<typeof OrchestratorDecisionSchema>;
@@ -118,11 +119,9 @@ export interface BuildOrchestratorAgentOptions {
   excludeToolNames?: string[];
   /**
    * Per-call model override. When provided, the agent runs on this model instead
-   * of MODELS.primary — needed so workflow-step lanes that route grunt-work to a
-   * cheaper worker model (forEach fan-out) can ride the gated harness loop
-   * without losing that routing. Absent ⇒ MODELS.primary (byte-identical). No
-   * current caller passes it, so this is a dormant capability until the
-   * workflow-step conversion wires it through.
+   * of the role-registry brain default — needed so workflow-step lanes that
+   * route grunt-work to a cheaper worker model (forEach fan-out) can ride the
+   * gated harness loop without losing that routing.
    */
   model?: string;
 }
@@ -838,7 +837,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     instructions: harnessInstructions(ORCHESTRATOR_INSTRUCTIONS),
     // Per-call override (dormant — no caller passes it yet) so worker-model
     // routing survives a workflow-step conversion onto the harness loop.
-    model: options.model ?? MODELS.primary,
+    model: options.model ?? resolveRoleModel('brain').modelId,
     // Dynamic per-turn reasoning effort needs the SDK to honor agent.modelSettings,
     // which it only does when modelSettings was passed at CONSTRUCTION (it sets a
     // private `_modelSettingsExplicitlyConfigured` flag then). So we seed the

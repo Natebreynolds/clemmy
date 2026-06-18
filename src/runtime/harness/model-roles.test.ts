@@ -142,12 +142,42 @@ test('all_in BYO with an UNSET worker reports the BYO primary, not a phantom gpt
   });
 });
 
-test('a durable role-wide binding overrides the default and carries the derived provider', () => {
-  withEnv({ CLEMMY_MODEL_ROLES_REGISTRY: 'on', CLEMMY_MODEL_ROLES: JSON.stringify([{ role: 'worker', modelId: 'minimax-01', scope: 'durable', source: 'settings' }]) }, () => {
+test('a durable role-wide binding overrides the default while its provider is live', () => {
+  withEnv({
+    BYO_MODEL_BASE_URL: 'https://api.example.test',
+    BYO_MODEL_API_KEY: 'k',
+    BYO_MODEL_ID: 'minimax-01',
+    OPENAI_MODEL_WORKER: 'minimax-01',
+    CLEMMY_MODEL_ROLES_REGISTRY: 'on',
+    CLEMMY_MODEL_ROLES: JSON.stringify([{ role: 'worker', modelId: 'minimax-01', scope: 'durable', source: 'settings' }]),
+  }, () => {
     const r = resolveRoleModel('worker');
     assert.equal(r.modelId, 'minimax-01');
     assert.equal(r.provider, 'byo');
     assert.equal(r.source, 'settings');
+    assert.equal(r.inactiveBinding, undefined);
+  });
+});
+
+test('a stale role-wide binding falls back to default and reports the inactive binding', () => {
+  withEnv({
+    AUTH_MODE: 'codex_oauth',
+    MODEL_ROUTING_MODE: 'off',
+    BYO_MODEL_BASE_URL: '',
+    BYO_MODEL_API_KEY: '',
+    BYO_MODEL_ID: 'deepseek-chat',
+    OPENAI_MODEL_WORKER: 'deepseek-chat',
+    CLEMMY_MODEL_ROLES_REGISTRY: 'on',
+    CLEMMY_MODEL_ROLES: JSON.stringify([{ role: 'worker', modelId: 'deepseek-chat', scope: 'durable', source: 'settings' }]),
+  }, () => {
+    const r = resolveRoleModel('worker');
+    assert.equal(r.modelId, MODELS.primary);
+    assert.equal(r.provider, 'codex');
+    assert.equal(r.source, 'default');
+    assert.equal(r.inactiveBinding?.modelId, 'deepseek-chat');
+    assert.equal(r.inactiveBinding?.provider, 'byo');
+    assert.equal(r.inactiveBinding?.source, 'settings');
+    assert.match(r.inactiveBinding?.reason ?? '', /No BYO backend is configured/);
   });
 });
 

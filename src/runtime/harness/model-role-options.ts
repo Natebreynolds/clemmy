@@ -18,6 +18,10 @@ export interface AvailableModelGroup {
   models: Array<{ id: string; label: string }>;
 }
 
+export type RoleModelCapability =
+  | { ok: true; provider: ModelProviderClass }
+  | { ok: false; reason: string };
+
 const CLAUDE_OAT_PREFIX = 'sk-ant-oat01';
 
 function pushUnique(models: Array<{ id: string; label: string }>, id: string, label = id): void {
@@ -76,26 +80,65 @@ export function connectedModelGroups(): AvailableModelGroup[] {
   return groups;
 }
 
+export function connectedModelGroupsForRole(role: ModelRole): AvailableModelGroup[] {
+  if (role === 'brain') return [];
+  return connectedModelGroups()
+    .map((group) => {
+      const models = group.models.filter((model) => roleModelCapability(role, model.id).ok);
+      return { ...group, models };
+    })
+    .filter((group) => group.models.length > 0);
+}
+
 export function modelIdsAvailableForRole(role: ModelRole): Set<string> {
   const ids = new Set<string>();
-  if (role === 'brain') return ids;
-  for (const group of connectedModelGroups()) {
+  for (const group of connectedModelGroupsForRole(role)) {
     for (const model of group.models) ids.add(model.id);
   }
   return ids;
 }
 
-export function validateRoleModelBinding(
-  role: ModelRole,
-  modelId: string,
-): { ok: true; provider: ModelProviderClass } | { ok: false; reason: string } {
+export function roleModelCapability(role: ModelRole, modelId: string): RoleModelCapability {
   if (role === 'brain') {
     return { ok: false, reason: 'The brain is set through the active-brain provider switch for now.' };
   }
   const clean = modelId.trim();
   if (!clean) return { ok: false, reason: 'modelId is required.' };
+  const provider = resolveProvider(clean);
+
+  if (provider === 'byo') {
+    const byo = getByoBackendConfig();
+    if (!byo.configured) return { ok: false, reason: 'No BYO backend is configured.' };
+
+    const workerIds = new Set([
+      byo.primaryId,
+      getRuntimeEnv('OPENAI_MODEL_WORKER', '') || '',
+    ].filter(Boolean));
+    const judgeIds = new Set([
+      byo.primaryId,
+      byo.judgeId,
+    ].filter(Boolean));
+    const allowed = role === 'judge' ? judgeIds : workerIds;
+    if (!allowed.has(clean)) {
+      return {
+        ok: false,
+        reason:
+          role === 'judge'
+            ? `BYO model ${clean} is not configured as a judge-capable model. Use BYO_MODEL_ID or BYO_MODEL_JUDGE_ID.`
+            : `BYO model ${clean} is not configured as a worker-capable model. Use BYO_MODEL_ID or OPENAI_MODEL_WORKER.`,
+      };
+    }
+  }
+
+  return { ok: true, provider };
+}
+
+export function validateRoleModelBinding(role: ModelRole, modelId: string): RoleModelCapability {
+  const capability = roleModelCapability(role, modelId);
+  if (!capability.ok) return capability;
 
   const allowed = modelIdsAvailableForRole(role);
+  const clean = modelId.trim();
   if (!allowed.has(clean)) {
     const available = [...allowed].sort();
     return {
@@ -106,5 +149,5 @@ export function validateRoleModelBinding(
     };
   }
 
-  return { ok: true, provider: resolveProvider(clean) };
+  return capability;
 }

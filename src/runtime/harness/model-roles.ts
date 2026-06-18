@@ -15,13 +15,12 @@
  *     enum (intent-scoped bindings land in a later phase, mirroring
  *     tool-choice-store's free-form slugs).
  *
- * Phase 1 invariant: with NO bindings written (CLEMMY_MODEL_ROLES unset) the
- * resolved model id is BYTE-IDENTICAL to the legacy getter for every role, on
- * every auth/routing permutation — because the default path delegates straight
- * to those getters. The default is provider-DERIVED: it never names a provider
- * the user isn't logged into, so a Codex-only user resolves all-Codex with no
- * "wanted Claude but logged out" state. Kill-switch CLEMMY_MODEL_ROLES_REGISTRY
- * (default on; off ⇒ defaults only, bindings ignored).
+ * Invariant: with NO bindings written (CLEMMY_MODEL_ROLES unset), each role
+ * reports the model id the registered provider will actually dispatch. Defaults
+ * are provider-derived, and saved bindings are live-checked at read time so a
+ * disconnected backend falls back instead of dispatching a dead model. Kill-
+ * switch CLEMMY_MODEL_ROLES_REGISTRY (default on; off ⇒ defaults only, bindings
+ * ignored).
  */
 import {
   getRuntimeEnv,
@@ -34,6 +33,7 @@ import {
   judgeChoice,
   MODELS,
 } from '../../config.js';
+import { validateRoleModelBinding } from './model-role-options.js';
 import { resolveProvider, type ModelProviderClass } from './model-wire-registry.js';
 
 /** Fixed internal role seam. brain = the active orchestrator model; worker =
@@ -54,10 +54,18 @@ export interface RoleBinding {
   source: 'settings' | 'chat-rule';
 }
 
+export interface InactiveRoleBinding {
+  modelId: string;
+  provider: ModelProviderClass;
+  source: 'settings' | 'chat-rule' | 'session';
+  reason: string;
+}
+
 export interface ResolvedRoleModel {
   modelId: string;
   provider: ModelProviderClass;
   source: 'default' | 'settings' | 'chat-rule' | 'session';
+  inactiveBinding?: InactiveRoleBinding;
 }
 
 /** Kill-switch. off ⇒ resolveRoleModel returns ONLY the provider-derived default
@@ -147,7 +155,23 @@ export function resolveRoleModel(role: ModelRole, _intent?: string): ResolvedRol
   const bindings = readDurableBindings();
   const match = bindings.find((b) => b.role === role && !b.whenIntent);
   if (match) {
-    return { modelId: match.modelId, provider: resolveProvider(match.modelId), source: match.source };
+    const validation = validateRoleModelBinding(role, match.modelId);
+    if (validation.ok) {
+      return { modelId: match.modelId, provider: validation.provider, source: match.source };
+    }
+
+    const modelId = defaultForRole(role);
+    return {
+      modelId,
+      provider: resolveProvider(modelId),
+      source: 'default',
+      inactiveBinding: {
+        modelId: match.modelId,
+        provider: resolveProvider(match.modelId),
+        source: match.source,
+        reason: validation.reason,
+      },
+    };
   }
   const modelId = defaultForRole(role);
   return { modelId, provider: resolveProvider(modelId), source: 'default' };

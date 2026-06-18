@@ -88,11 +88,21 @@ export interface ResolvedRole {
   modelId: string;
   provider: 'codex' | 'claude' | 'byo';
   source: 'default' | 'settings' | 'chat-rule' | 'session';
+  inactiveBinding?: {
+    modelId: string;
+    provider: 'codex' | 'claude' | 'byo';
+    source: 'settings' | 'chat-rule' | 'session';
+    reason: string;
+  };
 }
 export interface ModelRolesSnapshot {
   roles: { brain: ResolvedRole; worker: ResolvedRole; judge: ResolvedRole };
   bindings: { role: ModelRoleName; modelId: string; whenIntent?: string; source: string }[];
   available: { provider: string; label: string; models: { id: string; label: string }[] }[];
+  roleOptions?: {
+    worker: { provider: string; label: string; models: { id: string; label: string }[] }[];
+    judge: { provider: string; label: string; models: { id: string; label: string }[] }[];
+  };
   activeBrain: ActiveBrain;
 }
 // Set (or clear) a worker/judge role model. Brain is a provider login switch
@@ -138,6 +148,7 @@ export type FusionStrategy = 'debate' | 'verify';
 export interface FusionSettings {
   mode: FusionMode;
   judge: 'claude' | 'codex';
+  judgeRole?: ResolvedRole;
   strategy: FusionStrategy;
   brainsAvailable: { claude: boolean; codex: boolean };
   active: boolean;

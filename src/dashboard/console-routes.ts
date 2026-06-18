@@ -190,7 +190,7 @@ import { configureHarnessRuntime, resetHarnessRuntimeConfig } from '../runtime/h
 import { resetByoModelCache } from '../runtime/harness/byo-model.js';
 import { resolveRoleModel, readDurableBindings, type ModelRole, type RoleBinding } from '../runtime/harness/model-roles.js';
 import { resolveProvider } from '../runtime/harness/model-wire-registry.js';
-import { connectedModelGroups, validateRoleModelBinding } from '../runtime/harness/model-role-options.js';
+import { connectedModelGroups, connectedModelGroupsForRole, validateRoleModelBinding } from '../runtime/harness/model-role-options.js';
 import { debateMode, judgeChoice, fusionStrategy, debateBrainsAvailable, readRecentDebateTraces } from '../runtime/harness/debate-model.js';
 import { summarizeApprovalAction } from '../runtime/approval-summary.js';
 import {
@@ -3467,6 +3467,10 @@ export function registerConsoleRoutes(
       },
       bindings: readDurableBindings(),
       available: connectedModelGroups(),
+      roleOptions: {
+        worker: connectedModelGroupsForRole('worker'),
+        judge: connectedModelGroupsForRole('judge'),
+      },
       activeBrain: getActiveAuthMode(),
     };
   };
@@ -3495,6 +3499,7 @@ export function registerConsoleRoutes(
       const fusion = {
         mode: debateMode(),
         judge: judgeChoice(),
+        judgeRole: resolveRoleModel('judge'),
         strategy: fusionStrategy(),
         brainsAvailable: fusionBrains,
         active: debateMode() !== 'off' && fusionBrains.claude && fusionBrains.codex,
@@ -6675,6 +6680,7 @@ export function registerConsoleRoutes(
         fusion: {
           mode: debateMode(),
           judge: judgeChoice(),
+          judgeRole: resolveRoleModel('judge'),
           strategy: fusionStrategy(),
           brainsAvailable: brains,
           active: mode !== 'off' && brains.claude && brains.codex,
@@ -6699,6 +6705,7 @@ export function registerConsoleRoutes(
         fusion: {
           mode: debateMode(),
           judge: judgeChoice(),
+          judgeRole: resolveRoleModel('judge'),
           strategy: fusionStrategy(),
           brainsAvailable: brains,
           active: debateMode() !== 'off' && brains.claude && brains.codex,

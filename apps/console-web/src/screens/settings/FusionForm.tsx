@@ -47,7 +47,9 @@ export function FusionForm() {
   // In verify, the executor IS the primary brain; a judge == primary means the
   // brain checks itself (no second opinion) — warn so it isn't set by accident.
   const primaryBrainKind = form.brain === 'claude_oauth' ? 'claude' : 'codex';
-  const verifySelfCheck = form.mode !== 'off' && form.strategy === 'verify' && form.judge === primaryBrainKind;
+  const effectiveJudge = fusion.judgeRole;
+  const effectiveJudgeProvider = effectiveJudge?.source === 'default' ? form.judge : (effectiveJudge?.provider ?? form.judge);
+  const verifySelfCheck = form.mode !== 'off' && form.strategy === 'verify' && effectiveJudgeProvider !== 'byo' && effectiveJudgeProvider === primaryBrainKind;
   // Strategy-aware description (the mode sets WHEN; the strategy sets HOW).
   const howItWorks = form.mode === 'off'
     ? 'Single brain — no second model is consulted.'
@@ -156,8 +158,20 @@ export function FusionForm() {
           <li>{brains.claude ? '🟢' : '⚪️'} Claude (Max/Pro) login → {brains.claude ? 'connected' : 'not connected'}</li>
           <li>{brains.codex ? '🟢' : '⚪️'} Codex login → {brains.codex ? 'connected' : 'not connected'}</li>
           <li>{fusion.active ? '⚡️ Fusion ACTIVE — both flagships debating' : (fusion.mode !== 'off' ? '◦ fusion configured but inactive (a flagship login is missing)' : '○ single brain')}</li>
+          {effectiveJudge && (
+            <li>Effective judge → {effectiveJudge.modelId} ({effectiveJudge.provider}, {effectiveJudge.source === 'default' ? 'default' : 'pinned'})</li>
+          )}
         </ul>
       </div>
+
+      {effectiveJudge?.provider === 'byo' && (
+        <div className="mb-4 flex items-start gap-2 rounded-lg border border-warning bg-warning-tint p-3">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-warning" aria-hidden />
+          <p className="text-caption text-muted">
+            The judge is pinned to <span className="text-fg">{effectiveJudge.modelId}</span> in Models - who does what. The selector above only changes the Claude/Codex default; clear the judge role there to use it again.
+          </p>
+        </div>
+      )}
 
       {willDebateButCant && (
         <div className="mb-4 flex items-start gap-2 rounded-lg border border-warning bg-warning-tint p-3">

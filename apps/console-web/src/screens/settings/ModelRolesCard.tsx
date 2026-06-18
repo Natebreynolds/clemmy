@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { Check, BrainCircuit, Users, Scale } from 'lucide-react';
+import { AlertTriangle, Check, BrainCircuit, Users, Scale } from 'lucide-react';
 import { Card } from '@/components/ui/Card';
 import { Field, Select } from '@/components/ui/Field';
 import { Skeleton } from '@/components/ui/Skeleton';
@@ -36,11 +36,19 @@ function RoleRow({
   return (
     <div className="grid items-center gap-2 sm:grid-cols-[1fr_1.2fr] sm:gap-4">
       <Field label={label} hint={hint}>{children}</Field>
-      <div className="flex items-center gap-2 pb-1 text-small text-muted">
-        <Icon className="h-4 w-4 shrink-0 text-muted" aria-hidden />
-        <span className="text-fg">{resolved.modelId}</span>
-        <span className="rounded bg-canvas px-1.5 py-0.5 text-caption text-muted">{resolved.provider}</span>
-        <span className="text-caption text-muted">· {SOURCE_LABEL[resolved.source]}</span>
+      <div className="min-w-0 pb-1">
+        <div className="flex min-w-0 items-center gap-2 text-small text-muted">
+          <Icon className="h-4 w-4 shrink-0 text-muted" aria-hidden />
+          <span className="truncate text-fg" title={resolved.modelId}>{resolved.modelId}</span>
+          <span className="shrink-0 rounded bg-canvas px-1.5 py-0.5 text-caption text-muted">{resolved.provider}</span>
+          <span className="shrink-0 text-caption text-muted">· {SOURCE_LABEL[resolved.source]}</span>
+        </div>
+        {resolved.inactiveBinding && (
+          <div className="mt-1 flex min-w-0 items-center gap-1.5 text-caption text-warning" title={resolved.inactiveBinding.reason}>
+            <AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden />
+            <span className="truncate">Saved {resolved.inactiveBinding.modelId} is unavailable; using default.</span>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -57,7 +65,10 @@ export function ModelRolesCard() {
   if (settings.isLoading || !mr) return <Card className="p-5"><Skeleton className="h-44 w-full" /></Card>;
 
   const refresh = () => { void qc.invalidateQueries({ queryKey: ['settings'] }); };
-  const flat = mr.available.flatMap((p) => p.models.map((m) => ({ ...m, provider: p.provider })));
+  const workerOptions = mr.roleOptions?.worker ?? mr.available;
+  const judgeOptions = mr.roleOptions?.judge ?? mr.available;
+  const workerFlat = workerOptions.flatMap((p) => p.models.map((m) => ({ ...m, provider: p.provider })));
+  const judgeFlat = judgeOptions.flatMap((p) => p.models.map((m) => ({ ...m, provider: p.provider })));
   const connected = (prov: string) => mr.available.some((p) => p.provider === prov);
 
   const run = async (key: string, fn: () => Promise<unknown>) => {
@@ -101,7 +112,7 @@ export function ModelRolesCard() {
             <Select id={id} disabled={busy === 'worker'} value={mr.roles.worker.source === 'default' ? '__default__' : mr.roles.worker.modelId}
               onChange={(e) => onRole('worker', e.target.value)}>
               <option value="__default__">Default (follow the brain)</option>
-              {flat.map((m) => <option key={`w-${m.provider}-${m.id}`} value={m.id}>{m.label} · {m.provider}</option>)}
+              {workerFlat.map((m) => <option key={`w-${m.provider}-${m.id}`} value={m.id}>{m.label} · {m.provider}</option>)}
             </Select>
           )}
         </RoleRow>
@@ -111,7 +122,7 @@ export function ModelRolesCard() {
             <Select id={id} disabled={busy === 'judge'} value={mr.roles.judge.source === 'default' ? '__default__' : mr.roles.judge.modelId}
               onChange={(e) => onRole('judge', e.target.value)}>
               <option value="__default__">Default</option>
-              {flat.map((m) => <option key={`j-${m.provider}-${m.id}`} value={m.id}>{m.label} · {m.provider}</option>)}
+              {judgeFlat.map((m) => <option key={`j-${m.provider}-${m.id}`} value={m.id}>{m.label} · {m.provider}</option>)}
             </Select>
           )}
         </RoleRow>
