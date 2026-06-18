@@ -36,7 +36,7 @@
  */
 import type { Model, ModelProvider, ModelRequest, ModelResponse } from '@openai/agents-core';
 import type { StreamEvent } from '@openai/agents-core/types';
-import { getRuntimeEnv, getActiveAuthMode, getClaudeBrainModel } from '../../config.js';
+import { getRuntimeEnv, getActiveAuthMode, getClaudeBrainModel, getDebateCheckerModel } from '../../config.js';
 import { ClaudeModelProvider } from './claude-model.js';
 import { CodexModelProvider } from './codex-model.js';
 import { getStoredCodexOAuthTokens } from '../auth-store.js';
@@ -659,7 +659,16 @@ export class DebateModel implements Model {
     // checker produced usable content; 'checker-empty' = it returned without
     // throwing but with nothing usable (an overloaded/empty completion).
     const outcome = finalForTrace ? 'checker-refined' : 'checker-empty';
-    logger.info({ path: 'verify', n: this.debatesThisTurn, outcome, executorLen: da.length, finalLen: finalForTrace.length, judge: judgeChoice() }, 'fusion verify reconciled');
+    // Observability: which Claude tier actually checked (Sonnet by default — a
+    // fast, low-contention checker; see getDebateCheckerModel), and on an empty
+    // return, the shape the checker emitted so a regression is diagnosable.
+    if (!finalForTrace) {
+      logger.warn({
+        checkerModel: getDebateCheckerModel(),
+        outputItemTypes: Array.isArray(checkerOutput) ? (checkerOutput as Array<{ type?: string }>).map((o) => o?.type) : typeof checkerOutput,
+      }, 'fusion verify: checker returned EMPTY — shipping the executor draft');
+    }
+    logger.info({ path: 'verify', n: this.debatesThisTurn, outcome, executorLen: da.length, finalLen: finalForTrace.length, judge: judgeChoice(), checkerModel: getDebateCheckerModel() }, 'fusion verify reconciled');
     recordDebateTrace({ path: 'verify', n: this.debatesThisTurn, outcome, judge: judgeChoice(), executor: capText(da), final: capText(finalForTrace) });
   }
 }
@@ -748,7 +757,16 @@ export function resolveDebateBrains(passthrough: ModelProvider, modelName?: stri
   // rather than taking the turn down. (CLEMMY_CLAUDE_OVERLOAD_FALLBACK=off opts out.)
   const claude: Model = new ClaudeModelProvider().getModel();
   const codex: Model = new CodexModelProvider().getModel();
-  const judge: Model = judgeChoice() === 'codex' ? codex : claude;
+  // The CHECKER/judge runs on a fast, low-contention Claude tier (Sonnet by
+  // default) — a verify pass refines an already-drafted answer and does not need
+  // the flagship's depth, and Opus-as-checker hung past the deadline so the check
+  // shipped the unchecked draft. The DEBATE DRAFTER (draftA) keeps the full
+  // flagship brain. Override the checker via CLEMMY_DEBATE_CHECKER_MODEL.
+  const checkerModelId = getDebateCheckerModel();
+  const claudeChecker: Model = checkerModelId && checkerModelId !== getClaudeBrainModel()
+    ? new ClaudeModelProvider().getModel(checkerModelId)
+    : claude;
+  const judge: Model = judgeChoice() === 'codex' ? codex : claudeChecker;
 
   return {
     passthrough: resolveSync(passthrough.getModel(modelName)),
@@ -859,7 +877,13 @@ export function buildVerifyRequest(request: ModelRequest, draft: ModelResponse):
     summarizeOutput(draft.output) || '(empty)',
     '=== END DRAFT ===',
   ].join('\n');
-  return withThinkingDisabled({ ...request, systemInstructions: block } as ModelRequest);
+  // Strip tools/handoffs: the checker is REFINING an already-user-facing text
+  // answer (verify only runs when hasUserFacingAnswer is true), so it must emit
+  // the refined reply, not wander into a tool call. Leaving the executor's full
+  // toolset on the request let the checker (esp. Sonnet) answer with a
+  // function_call instead of text → no assistant text → 'checker-empty' (ship
+  // the unchecked draft). A verify checker never needs tools.
+  return withThinkingDisabled({ ...request, systemInstructions: block, tools: [], handoffs: [] } as ModelRequest);
 }
 
 /** Render a draft's output items into compact text for the judge to weigh. */

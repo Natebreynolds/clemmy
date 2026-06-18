@@ -157,6 +157,21 @@ export function getClaudeBrainModel(): string {
   return (getRuntimeEnv('CLAUDE_MODEL', '') || '').trim() || 'claude-opus-4-8';
 }
 
+/**
+ * The Claude model used as the fusion VERIFY CHECKER (and debate judge). Defaults
+ * to Sonnet 4.6 — a fast, low-contention "minimal checker": a verify pass only
+ * confirms/refines an already-drafted answer, so it does not need the flagship's
+ * depth, and Opus 4.8 (the most contended tier on Max/Pro) routinely hung past
+ * the checker deadline → the check silently shipped the unchecked draft. Keeping
+ * the checker on Sonnet makes the check actually complete, fast, while a full
+ * single-brain Claude run (getClaudeBrainModel) stays on Opus. Override with
+ * CLEMMY_DEBATE_CHECKER_MODEL (e.g. claude-opus-4-8 to check with the flagship,
+ * or claude-haiku-4-5 for the lightest pass).
+ */
+export function getDebateCheckerModel(): string {
+  return (getRuntimeEnv('CLEMMY_DEBATE_CHECKER_MODEL', '') || '').trim() || 'claude-sonnet-4-6';
+}
+
 export const CLAUDE_MODEL_PRESETS = [
   { id: 'claude-opus-4-8', label: 'Claude Opus 4.8 (flagship)' },
   { id: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6' },

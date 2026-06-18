@@ -21,6 +21,7 @@ const {
   heartbeatsUntil,
   streamResponseAsEvents,
 } = await import('./debate-model.js');
+const { getDebateCheckerModel } = await import('../../config.js');
 
 // --- fixtures ---------------------------------------------------------------
 
@@ -286,6 +287,32 @@ test('buildVerifyRequest / buildJudgeRequest DISABLE extended thinking (effort=n
     assert.equal(built.modelSettings.reasoning.effort, 'none', 'reasoning effort forced to none');
     assert.equal(built.modelSettings.providerData.providerOptions.anthropic.effort, undefined, 'pre-translated anthropic effort stripped');
     assert.equal(built.modelSettings.temperature, 0.3, 'other modelSettings preserved');
+  }
+});
+
+test('buildVerifyRequest: STRIPS tools/handoffs so the checker emits a text reply, not a tool call', () => {
+  // The checker refines an already-user-facing answer; leaving the executor's
+  // toolset on the request let Sonnet answer with a function_call instead of text
+  // → no assistant text → 'checker-empty' (ship the unchecked draft). A verify
+  // checker never needs tools. (Contrast buildJudgeRequest, which PRESERVES them.)
+  const r = req({ tools: [{ name: 't' }], handoffs: [{ name: 'h' }], modelSettings: { temperature: 0.3 } });
+  const vr = buildVerifyRequest(r, msg('DRAFT')) as any;
+  assert.deepEqual(vr.tools, [], 'tools stripped');
+  assert.deepEqual(vr.handoffs, [], 'handoffs stripped');
+  assert.equal(vr.modelSettings.temperature, 0.3, 'other modelSettings preserved');
+  assert.match(vr.systemInstructions, /DRAFT/, 'the draft is included for verification');
+});
+
+test('getDebateCheckerModel: defaults to Sonnet (fast, low-contention checker); env overrides', () => {
+  const prev = process.env.CLEMMY_DEBATE_CHECKER_MODEL;
+  try {
+    delete process.env.CLEMMY_DEBATE_CHECKER_MODEL;
+    assert.equal(getDebateCheckerModel(), 'claude-sonnet-4-6', 'default checker is Sonnet, not the Opus brain');
+    process.env.CLEMMY_DEBATE_CHECKER_MODEL = 'claude-opus-4-8';
+    assert.equal(getDebateCheckerModel(), 'claude-opus-4-8', 'override honored');
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_DEBATE_CHECKER_MODEL;
+    else process.env.CLEMMY_DEBATE_CHECKER_MODEL = prev;
   }
 });
 
